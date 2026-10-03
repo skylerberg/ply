@@ -1,17 +1,18 @@
 //! What this binary ships: a function of the binary alone, so reading it keeps a test det.
 
 use ply_eval::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
-use ply_eval::{Diagnostic, Value as PlyValue};
+use ply_eval::{Diagnostic, Value as PlyValue, codes};
 use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 5] = [
+const OPERATIONS: [(&str, &str); 6] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
     ("version", "ply_machine::shipped::version"),
     ("stamps", "ply_machine::shipped::stamps"),
     ("runtime", "ply_machine::shipped::runtime"),
+    ("runnable", "ply_machine::shipped::runnable"),
 ];
 
 /// Empty in a process the launcher did not start.
@@ -56,6 +57,18 @@ impl HostHandler for Shipped {
             ("version", []) => PlyValue::str(env!("CARGO_PKG_VERSION")),
             ("stamps", []) => PlyValue::str(STAMPS.get().map_or("", String::as_str)),
             ("runtime", []) => runtime(),
+            ("runnable", [entry, files, dump, unit]) => {
+                let entry = entry.as_str(span, "an entry point's name")?;
+                let unit = unit.as_bytes(span, "the program's unit")?;
+                let bytes = crate::runnable::encode(entry, files, dump, unit).map_err(|why| {
+                    Diagnostic::error(
+                        codes::INTERNAL_ERROR,
+                        format!("the program does not encode as a runnable: {why}"),
+                    )
+                    .primary(span, "this is Ply's fault")
+                })?;
+                PlyValue::bytes(bytes)
+            }
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
         };
         Ok(HostAnswer::Value(value))

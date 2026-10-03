@@ -1256,7 +1256,7 @@ rather than raised.
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
 | `PLY_C_CACHE=DIR` | compiled objects, and the emitter's answers, each kept under the emitter, the runtime and what it was asked (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's committed `ply` program is behind its sources, the load of those sources and the rows that seed the next one (default under the temp directory) |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's committed builder or `ply` program is behind its sources, the one the builder made of them and the rows that seed its next build (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
@@ -3356,7 +3356,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
-| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2), `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
+| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
@@ -3375,7 +3375,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | emits the front end as the bundle the runtime builds it from: `unit.c.gz` beside `SOURCES.digest`; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on, and for the builder the bundle the runtime's emitter is built from (`unit.c.gz` beside `SOURCES.digest`); `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
@@ -3392,10 +3392,18 @@ the machine is lent to the program as an effect: `ply run`, `ply test` and
 `ply cache` are answered what a run would bind and what the store holds, and
 `ply replace` is lent the text it puts in a definition's place, from
 `--with FILE` or stdin. The program emits the C of every unit a command runs,
-and of the bundle `ply bootstrap` writes, itself: the emitter's answer for a
+and of what `ply bootstrap` writes, itself: the emitter's answer for a
 definition is kept under the toolchain's cache and read back while the
 definition, the emitter and the runtime are the ones it was made by, and the
-machine compiles the C it is handed and loads it. `ply std`
+machine compiles the C it is handed and loads it. The launcher enters `ply`
+from a runnable — its front end's answer, its sources and its unit's C, which
+reading runs no compiler: the committed one when it was built from the
+binary's own sources, else one the builder made of them for an earlier run.
+The builder is the compiler's own `build.main`, entered the same way: it
+checks a program's sources, seeded with the rows its last build of that program
+kept, emits its unit with the emitter's answers kept, and writes the runnable.
+A builder behind the shelf the binary ships first builds the shelf's, keeping
+no answers, since its emitter is not the one they would be filed under. `ply std`
 needs no project: it reads the shipped modules off a second, read-only root.
 `--count-allocs=PATH` is the launcher's own flag rather than the program's: it is
 taken out of the line before the program parses it, and the run writes what the
@@ -3420,9 +3428,11 @@ names the ones it means, so `machine` — which drives another machine — is
 granted on purpose and not by accident. A program lent `machine` hands it a
 program as a front end's answer and the C of its unit: `compiler.load`'s
 `load[r](root)` reads the `.ply` files under `root` through the `fs` root `r`,
-checks them against the shipped modules and emits their unit afresh, so a run of
-it is granted `--fs r=PATH` and `--allow shipped`, and `machine.load` compiles
-the C it is handed and runs no front end of its own.
+the path dependencies its `ply.pkg` names and what its modules embed, checks
+them against the shipped modules and emits their unit afresh, so a run of it is
+granted `--fs r=PATH` and `--allow shipped`, and `machine.load` compiles the C
+it is handed and runs no front end of its own. A git dependency is `ply`'s to
+fetch, and `compiler.load` refuses one.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. A command
@@ -3455,8 +3465,8 @@ is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
 read — the name and bytes of every module the walk read, the root's manifest,
 each dependency's key, manifest and modules, what the modules embed, the root's
 absolute path, the `ply`
-program and the modules it ships as the launcher gates them (so `PLY_C_EMITTER`
-too), the binary's version, and `--config-schema`. A later run whose walk hashes
+program and the modules it ships as the launcher gates them, the binary's
+version, and `--config-schema`. A later run whose walk hashes
 the same takes that answer and runs neither the front end nor the promise check,
 which the filed load passed; it binds, grants (`--allow`, `--exec`, `--fs`) and
 picks its entry anew, and reports exactly what a run that built the answer
