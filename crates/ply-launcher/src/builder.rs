@@ -6,7 +6,7 @@
 
 use ply_codegen::c::{bundle, producer, sweep};
 use ply_eval::{Diagnostic, Span, Value, codes};
-use ply_machine::artifact::{self, Binds};
+use ply_machine::enter::{self, Binds};
 use ply_machine::runnable::{self, Runnable};
 use std::path::{Path, PathBuf};
 
@@ -190,7 +190,7 @@ fn build_with(
         }
         .to_string(),
     ];
-    let opened = artifact::opened_runnable(builder, Path::new(ROOT))?;
+    let opened = enter::opened_runnable(builder, Path::new(ROOT))?;
     let root_named = |name: &str, path: PathBuf| ply_host::fs::RootSpec {
         name: name.to_string(),
         path,
@@ -207,7 +207,7 @@ fn build_with(
     let entered = std::thread::Builder::new()
         .name("ply builder".to_string())
         .stack_size(STACK)
-        .spawn(move || ply_codegen::rt::unbounded(|| artifact::enter_runnable(opened, argv, binds)))
+        .spawn(move || ply_codegen::rt::unbounded(|| enter::enter_runnable(opened, argv, binds)))
         .map(|thread| thread.join());
     match entered {
         Ok(Ok(ended)) => match ended.into_parts().0 {
