@@ -54,8 +54,12 @@ pub type Linear = { base: Option<Base>, k: Int }
 pub type Term =
   // Exactly this; a place with `k == 0` is the place itself, at any type.
   | Exactly(Linear)
-  // A part of the place: smaller than it, however deep.
+  // A part of the place reached through elements and fields alone: smaller than it and, where the
+  // place is a list, no larger than the element it lies in.
   | Below(Place)
+  // A part of the place reached through a list's tail: smaller than it, though not than its
+  // elements.
+  | Inside(Place)
   // A value each of whose elements and fields is a part of the place: neither it nor, for a list
   // rebuilt of parts, its tail need be smaller.
   | PartsOf(Place)
@@ -89,9 +93,9 @@ pub type Group = {
   summary_of: (Bytes) -> Option<Summary>,
 }
 
-// The group's ending, which is each member's since they reach one another, and each member's
-// summary.
-pub type Verdict = { ending: Ending, summaries: List<Summary> }
+// Each member's ending, which is its group's since they reach one another, told first by its own
+// call out of the group by which it may not return; and each member's summary.
+pub type Verdict = { endings: List<Ending>, summaries: List<Summary> }
 
 // Filed with a definition's rows, so a stub, whose body is a blank, still answers what its own did.
 derive bin for Ending
@@ -134,6 +138,8 @@ type MemberContext = { group: Group, me: Int }
 // measure a `decreases` states, which every call between two members stating one is owed to shrink.
 type Measure =
   | SizeMeasure(Place)
+  // The size of the largest element of the list a parameter is, none for an empty one.
+  | ElementMeasure(Place)
   | DifferenceMeasure({ hi: Option<Base>, lo: Option<Base> })
   | StatedMeasure
 
@@ -159,13 +165,16 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
       }
     },
   };
+  let out = |e: Ending, o: Outside|
+    weaker(e, match (g.ending_of)(o.name) {
+      Diverges(_) -> Diverges({ at: o.span, through: Some(o.name) }),
+      other -> other,
+    });
+  let settled = match own { Diverges(_) -> Ends, other -> other };
   {
-    ending: fold(seen, own, |acc: Ending, x: Seen|
-      fold(x.outside, acc, |e: Ending, o: Outside|
-        weaker(e, match (g.ending_of)(o.name) {
-          Diverges(_) -> Diverges({ at: o.span, through: Some(o.name) }),
-          other -> other,
-        }))),
+    endings: map(range(0, len(g.defs)), |i: Int|
+      fold(seen, weaker(fold(at(seen, i).outside, settled, out), own), |e: Ending, x: Seen|
+        fold(x.outside, e, out))),
     summaries: map(range(0, len(g.defs)), |i: Int| summary({ group: g, me: i }, at(seen, i))),
   }
 }
@@ -276,8 +285,11 @@ fn measures_of(
   calls: List<Call>,
   stated: Bool,
 ) -> List<Measure> / {abort.raise} = {
-  let sized = map(range(0, len(at(g.defs, me).params)), |i: Int|
-    SizeMeasure({ param: i, path: [] }));
+  let sized = fold(range(0, len(at(g.defs, me).params)), [], |acc: List<Measure>, i: Int| {
+    let p = { param: i, path: [] };
+    let size = push(acc, SizeMeasure(p));
+    if listed(g, me, p) { push(size, ElementMeasure(p)) } else { size }
+  });
   let params = match at(g.defs, me).decreases {
     Some(_) -> if stated { push(sized, StatedMeasure) } else { sized },
     None -> sized,
@@ -293,13 +305,10 @@ fn with_difference(xs: List<Measure>, hi: Option<Base>, lo: Option<Base>) -> Lis
   if hi == lo || remains(hi) || remains(lo) { xs }
   else { with_measure(xs, DifferenceMeasure({ hi: hi, lo: lo })) }
 
-fn remains(b: Option<Base>) -> Bool =
-  match b {
-    None -> false,
-    Some(RemainderBase(_)) -> true,
-    Some(QuotientBase(q)) -> remains(Some(q.of)),
-    Some(_) -> false,
-  }
+fn remains(b: Option<Base>) -> Bool = match b { Some(x) -> remainder_in(x), None -> false }
+
+fn remainder_in(b: Base) -> Bool =
+  match b { RemainderBase(_) -> true, QuotientBase(q) -> remainder_in(q.of), _ -> false }
 
 // A difference a member's guard bounds, carried back along every call into it that hands it the
 // same difference of the caller's own, so a loop through members that test nothing still reads it.
@@ -323,6 +332,7 @@ fn spread(calls: List<List<Call>>, ms: List<List<Measure>>) -> List<List<Measure
 fn deeper_places(acc: List<Measure>, t: Term) -> List<Measure> =
   match t {
     Below(p) -> if len(p.path) == 0 { acc } else { with_measure(acc, SizeMeasure(p)) },
+    Inside(p) -> if len(p.path) == 0 { acc } else { with_measure(acc, SizeMeasure(p)) },
     RecordTerm(r) -> {
       let based = match r.base { Some(b) -> deeper_places(acc, b), None -> acc };
       fold(r.fields, based, |a: List<Measure>, f: { name: Bytes, term: Term }|
@@ -356,12 +366,14 @@ fn call_graph(g: Group, measures: List<List<Measure>>, me: Int, c: Call) -> Grap
 // A callee's measure at the call, in the caller's terms.
 type Valued =
   | SizeValue(Term)
+  | ElementValue(Term)
   | DifferenceValue({ hi: Option<Linear>, lo: Option<Linear> })
   | StatedValue
 
 fn measured(c: Call, m: Measure) -> Valued =
   match m {
     SizeMeasure(q) -> SizeValue(along(arg(c, q.param), q.path)),
+    ElementMeasure(q) -> ElementValue(along(arg(c, q.param), q.path)),
     DifferenceMeasure(d) ->
       DifferenceValue({ hi: substituted(c.args, d.hi), lo: substituted(c.args, d.lo) }),
     StatedMeasure -> StatedValue,
@@ -423,6 +435,13 @@ fn relation(
   match mine {
     SizeMeasure(p) -> match value {
       SizeValue(t) -> size_relation(t, p, place_type(g, me, p)),
+      ElementValue(t) -> elements_below(t, p),
+      _ -> None,
+    },
+    ElementMeasure(p) -> match value {
+      // A part of a list reached through elements and fields lies in one of its elements.
+      SizeValue(t) -> match t { Below(q) -> if q == p { Some(false) } else { None }, _ -> None },
+      ElementValue(t) -> element_relation(t, p),
       _ -> None,
     },
     DifferenceMeasure(d) -> match value {
@@ -443,6 +462,36 @@ fn relation(
       _ -> None,
     },
     StatedMeasure -> match value { StatedValue -> Some(true), _ -> None },
+  }
+
+// Every element of the list is smaller than the place: the list is the place, a part of it, or
+// made of its parts, or it has no elements.
+fn elements_below(t: Term, p: Place) -> Option<Bool> =
+  match t {
+    Exactly(l) -> match l.base {
+      Some(PlaceBase(q)) -> if l.k == 0 && (q == p || within(q, p)) { Some(true) } else { None },
+      _ -> None,
+    },
+    NoParts -> Some(true),
+    _ -> match place_of(t) {
+      Some(q) -> if q == p || within(q, p) { Some(true) } else { None },
+      None -> None,
+    },
+  }
+
+// A list's elements against the largest of the list `p`'s: its own, or its tail's, are no larger,
+// and those of a list lying in one of its elements are smaller. One rebuilt of parts may hold a
+// tail, so it is not read.
+fn element_relation(t: Term, p: Place) -> Option<Bool> =
+  match t {
+    Exactly(l) -> match l.base {
+      Some(PlaceBase(q)) -> if l.k == 0 && q == p { Some(false) } else { None },
+      _ -> None,
+    },
+    Inside(q) -> if q == p { Some(false) } else { None },
+    Below(q) -> if q == p { Some(true) } else { None },
+    NoParts -> Some(false),
+    _ -> None,
   }
 
 // A quotient by more than one, or a remainder by the measure itself, is below a measure the facts
@@ -490,6 +539,7 @@ fn size_relation(t: Term, p: Place, ty: Option<Type>) -> Option<Bool> / {abort.r
       _ -> None,
     },
     Below(q) -> if q == p || within(q, p) { Some(true) } else { None },
+    Inside(q) -> if q == p || within(q, p) { Some(true) } else { None },
     RecordTerm(r) -> match ty {
       Some(TyRecord(fs)) -> record_relation(r.base, r.fields, fs, p),
       _ -> None,
@@ -583,6 +633,13 @@ fn integer_place(g: Group, me: Int, p: Place) -> Bool / {abort.raise} =
     _ -> false,
   }
 
+// The place holds a list, whose elements a measure may size.
+fn listed(g: Group, me: Int, p: Place) -> Bool / {abort.raise} =
+  match place_type(g, me, p) {
+    Some(TyCon(c)) -> len(c.args) == 1 && (c.name == b"List" || c.name == b"Array"),
+    _ -> false,
+  }
+
 fn function_param(g: Group, me: Int, i: Int) -> Bool / {abort.raise} =
   match list_at(at(g.params, me), i) { Some(TyFn(_)) -> true, _ -> false }
 
@@ -596,6 +653,7 @@ fn project(t: Term, field: Bytes) -> Term =
       _ -> UnknownTerm,
     },
     Below(p) -> Below(p),
+    Inside(p) -> Below(p),
     PartsOf(p) -> Below(p),
     RecordTerm(r) -> match field_term(r.fields, field) {
       Some(x) -> x,
@@ -606,7 +664,7 @@ fn project(t: Term, field: Bytes) -> Term =
     UnknownTerm -> UnknownTerm,
   }
 
-// An element or a field of the value.
+// An element or a field of the value, or one of theirs: of a list's tail, an element of the list.
 fn below(t: Term) -> Term =
   match t {
     Exactly(l) -> match l.base {
@@ -614,19 +672,21 @@ fn below(t: Term) -> Term =
       _ -> UnknownTerm,
     },
     Below(p) -> Below(p),
+    Inside(p) -> Below(p),
     PartsOf(p) -> Below(p),
     _ -> UnknownTerm,
   }
 
-// Any part of the value, such as a list's tail, which for a list rebuilt of a place's parts is
+// A list's tail, or a part of the value reached through one: of a list rebuilt of a place's parts,
 // no part of the place.
 fn tail(t: Term) -> Term =
   match t {
     Exactly(l) -> match l.base {
-      Some(PlaceBase(p)) -> if l.k == 0 { Below(p) } else { UnknownTerm },
+      Some(PlaceBase(p)) -> if l.k == 0 { Inside(p) } else { UnknownTerm },
       _ -> UnknownTerm,
     },
-    Below(p) -> Below(p),
+    Below(p) -> Inside(p),
+    Inside(p) -> Inside(p),
     PartsOf(p) -> PartsOf(p),
     _ -> UnknownTerm,
   }
@@ -640,6 +700,7 @@ fn made_of(t: Term) -> Term =
       _ -> UnknownTerm,
     },
     Below(p) -> PartsOf(p),
+    Inside(p) -> PartsOf(p),
     NoParts -> NoParts,
     _ -> UnknownTerm,
   }
@@ -652,6 +713,7 @@ fn parts(t: Term) -> Term =
       _ -> UnknownTerm,
     },
     Below(p) -> PartsOf(p),
+    Inside(p) -> PartsOf(p),
     PartsOf(p) -> PartsOf(p),
     NoParts -> NoParts,
     _ -> UnknownTerm,
@@ -677,12 +739,12 @@ fn element(context: MemberContext, s: Scope, list: Expr) -> Term / {abort.raise}
 fn parts_of(ts: List<Term>) -> Term =
   if len(ts) == 0 { NoParts } else {
     let widest = fold(ts, None, |acc: Option<Place>, t: Term|
-      match t {
-        Below(p) -> match acc {
+      match part_place(t) {
+        Some(p) -> match acc {
           Some(q) -> if within(q, p) { Some(p) } else { acc },
           None -> Some(p),
         },
-        _ -> acc,
+        None -> acc,
       });
     match widest {
       Some(p) -> if fold(ts, true, |ok: Bool, x: Term| ok && part_of(x, p)) { PartsOf(p) }
@@ -696,9 +758,9 @@ fn with_part(xs: Term, x: Term) -> Term =
   if xs == NoParts { parts_of([x]) } else {
     match parts(xs) {
       PartsOf(p) -> if part_of(x, p) { PartsOf(p) } else {
-        match x {
-          Below(q) -> if within(p, q) { PartsOf(q) } else { UnknownTerm },
-          _ -> UnknownTerm,
+        match part_place(x) {
+          Some(q) -> if within(p, q) { PartsOf(q) } else { UnknownTerm },
+          None -> UnknownTerm,
         }
       },
       _ -> UnknownTerm,
@@ -743,10 +805,13 @@ fn mapped(context: MemberContext, s: Scope, xs: Expr, f: Expr) -> Term / {abort.
 
 fn part_of(t: Term, p: Place) -> Bool =
   match t {
-    Below(q) -> q == p || within(q, p),
     Exactly(l) -> match l.base { Some(PlaceBase(q)) -> l.k == 0 && within(q, p), _ -> false },
-    _ -> false,
+    _ -> match part_place(t) { Some(q) -> q == p || within(q, p), None -> false },
   }
+
+// The place a part of either kind is a part of.
+fn part_place(t: Term) -> Option<Place> =
+  match t { Below(p) -> Some(p), Inside(p) -> Some(p), _ -> None }
 
 fn local(s: Scope, name: Bytes) -> Option<Local> = map_get(s.locals, name)
 
@@ -812,6 +877,8 @@ fn term(context: MemberContext, s: Scope, e: Expr) -> Term / {abort.raise} =
         fields: field_terms(context, s, r.fields),
       }),
     EApp(a) -> applied_term(context, s, a.func, a.args, a.named),
+    EIf(_) -> match answered(context, s, e) { Some(t) -> t, None -> UnknownTerm },
+    EMatch(_) -> match answered(context, s, e) { Some(t) -> t, None -> UnknownTerm },
     EBlock(b) -> {
       let r = block_scope(context, s, b.stmts);
       match b.tail {
@@ -970,7 +1037,8 @@ fn translated(context: MemberContext, t: Term, args: List<Term>) -> Term / {abor
         None -> UnknownTerm,
       },
     },
-    Below(p) -> tail(along(actual(args, p.param), p.path)),
+    Below(p) -> below(along(actual(args, p.param), p.path)),
+    Inside(p) -> tail(along(actual(args, p.param), p.path)),
     PartsOf(p) -> made_of(along(actual(args, p.param), p.path)),
     RecordTerm(r) ->
       RecordTerm({
@@ -1041,21 +1109,31 @@ fn joined(a: Option<Term>, b: Option<Term>) -> Option<Term> =
   match a { None -> b, Some(x) -> match b { None -> a, Some(y) -> Some(join(x, y)) } }
 
 // A value either term may be: its parts are parts of a place both are, or are parts of, whatever
-// a term with no parts adds.
+// a term with no parts adds. Two parts are a part of the wider place, of the looser kind.
 fn join(a: Term, b: Term) -> Term =
   if a == b { a }
   else if a == NoParts { widened(b) }
   else if b == NoParts { widened(a) } else {
     match place_of(a) {
       Some(p) -> match place_of(b) {
-        Some(q) -> if p == q || within(q, p) { PartsOf(p) }
-        else if within(p, q) { PartsOf(q) }
-        else { UnknownTerm },
+        Some(q) -> {
+          let wide = if p == q || within(q, p) { Some(p) }
+          else if within(p, q) { Some(q) }
+          else { None };
+          match wide {
+            None -> UnknownTerm,
+            Some(w) -> if part_place(a) == None || part_place(b) == None { PartsOf(w) }
+            else if is_below(a) && is_below(b) { Below(w) }
+            else { Inside(w) },
+          }
+        },
         None -> UnknownTerm,
       },
       None -> UnknownTerm,
     }
   }
+
+fn is_below(t: Term) -> Bool = match t { Below(_) -> true, _ -> false }
 
 fn widened(t: Term) -> Term = match place_of(t) { Some(p) -> PartsOf(p), None -> UnknownTerm }
 
@@ -1067,6 +1145,7 @@ fn place_of(t: Term) -> Option<Place> =
       _ -> None,
     },
     Below(p) -> Some(p),
+    Inside(p) -> Some(p),
     PartsOf(p) -> Some(p),
     _ -> None,
   }
