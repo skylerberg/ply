@@ -21,7 +21,7 @@ of it next.
 | path | holds |
 | --- | --- |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
-| `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
+| `crates/ply-codegen` | the C backend: emits C, builds it and loads it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its builder, committed as a runnable (`bootstrap/`) |
 | `crates/ply-store` | what `ply` keeps under `.ply-cache`, as the `store` package in `ply/`; not a cargo crate |
 | `crates/ply-test` | what a test run decides, as the `suite` package in `ply/`; not a cargo crate |

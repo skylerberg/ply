@@ -1,5 +1,5 @@
 use ply_eval::{Diagnostic, Pending, Span, Value, codes};
-use ply_host::pool::{Done, FS_FIRST_TOKEN, Inbox, NET_FIRST_TOKEN, Pool};
+use ply_host::pool::{FS_FIRST_TOKEN, Inbox, JobOutput, NET_FIRST_TOKEN, Pool};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ fn submitted(pool: &Pool, answer: i64) -> Pending {
         Span::DUMMY,
         "test",
         "a test job",
-        Box::new(move || Done::Int(answer)),
+        Box::new(move || JobOutput::Int(answer)),
     )
     .expect("the pool takes the job")
 }

@@ -1,4 +1,4 @@
-//! The helpers the machines share: backend selection, the compiled tier over a load, schema
+//! The helpers the machines share: backend selection, the C backend over a load, schema
 //! materialisation, and `plural`.
 
 use ply_eval::{Diagnostic, SourceMap, Span, codes};
@@ -13,10 +13,10 @@ fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
         "compiled code is the only evaluator, so a run without a backend would be reported green \
          over a seam nothing reached",
     )
-    .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
+    .note("the C backend shells out to `cc`; `PLY_CC` names another compiler")
 }
 
-/// Fixes the emitted C tier's toolchain before anything compiles; not part of the cache key,
+/// Fixes the emitted C backend's toolchain before anything compiles; not part of the cache key,
 /// because both profiles must answer identically.
 pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     let Some(profile) = ply_codegen::Profile::parse(flag) else {
