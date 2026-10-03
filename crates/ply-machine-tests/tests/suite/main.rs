@@ -29,11 +29,11 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Front, unit: Bytes) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
-  read filed[m](front: Front) -> Bytes
-  read reload[m](front: Front) -> Result<Target, Refusal>
+  read filed[m](front: Front, unit: Bytes) -> Option<Bytes>
+  read reload[m](front: Front, unit: Bytes) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -132,8 +132,8 @@ type Ended = {
   hosts: Json,
 }
 
-fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front)) {
+fn main(root: String, front: Front, unit: Bytes) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+  match machine.load[m](root, front, unit) {
     Ok(_t) -> {
       match machine.bound[m]("inner.main", unconfigured()) {
         Ok(_b) -> {
@@ -207,6 +207,7 @@ fn driven(outer: &str, inner: &str, options: ply_machine::drive::RunOptions) -> 
             vec![
                 Value::str(project.path().display().to_string()),
                 crate::fixture::handed(project.path()),
+                crate::fixture::unit(project.path()),
             ],
             Span::DUMMY,
         )
@@ -314,11 +315,11 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Front, unit: Bytes) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
-  read filed[m](front: Front) -> Bytes
-  read reload[m](front: Front) -> Result<Target, Refusal>
+  read filed[m](front: Front, unit: Bytes) -> Option<Bytes>
+  read reload[m](front: Front, unit: Bytes) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -366,8 +367,8 @@ type Diag = {
 type Raised = { diag: Diag, values: List<Value> }
 type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
-fn main(root: String, front: Front) -> Called / {machine.load[m], machine.bound[m], machine.call[m], machine.drop[m]} = {
-  let _loaded = machine.load[m](root, Some(front));
+fn main(root: String, front: Front, unit: Bytes) -> Called / {machine.load[m], machine.bound[m], machine.call[m], machine.drop[m]} = {
+  let _loaded = machine.load[m](root, front, unit);
   let _bound = machine.bound[m]("inner.main", unconfigured());
   let called = machine.call[m]("inner.main", []);
   machine.drop[m]();
@@ -451,12 +452,14 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
     let binding = registry.bind(&front.check).expect("the machine ops bind");
     machine.set_host_binding(Arc::new(binding));
     let project = project("fn main() -> Int = unknown_name\n");
+    // A program that does not check has no unit: the front's refusal comes first.
     let raised = machine
         .call(
             "m.main",
             vec![
                 Value::str(project.path().display().to_string()),
                 crate::fixture::handed(project.path()),
+                Value::bytes(b""),
             ],
             Span::DUMMY,
         )
@@ -473,11 +476,11 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Front, unit: Bytes) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
-  read filed[m](front: Front) -> Bytes
-  read reload[m](front: Front) -> Result<Target, Refusal>
+  read filed[m](front: Front, unit: Bytes) -> Option<Bytes>
+  read reload[m](front: Front, unit: Bytes) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -562,13 +565,13 @@ fn once() -> Option<Value> / {machine.bound[m], machine.enter[m]} = {
   (machine.enter[m]()).value
 }
 
-fn main(root: String, front: Front) -> Option<Value> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
-  let _loaded = machine.load[m](root, Some(front));
+fn main(root: String, front: Front, unit: Bytes) -> Option<Value> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
+  let _loaded = machine.load[m](root, front, unit);
   once()
 }
 
-fn again(front: Front) -> Option<Value> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
-  let _again = machine.reload[m](front);
+fn again(front: Front, unit: Bytes) -> Option<Value> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+  let _again = machine.reload[m](front, unit);
   let value = once();
   machine.drop[m]();
   value
@@ -601,7 +604,11 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     let root = project.path().display().to_string();
     let first = call(
         "m.main",
-        vec![Value::str(root), crate::fixture::handed(project.path())],
+        vec![
+            Value::str(root),
+            crate::fixture::handed(project.path()),
+            crate::fixture::unit(project.path()),
+        ],
     );
     assert_eq!(option_value(&first), Some(&vint(1)));
     assert!(
@@ -610,7 +617,13 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     );
 
     std::fs::write(&inner, "fn main() -> Int = 2\n").unwrap();
-    let second = call("m.again", vec![crate::fixture::handed(project.path())]);
+    let second = call(
+        "m.again",
+        vec![
+            crate::fixture::handed(project.path()),
+            crate::fixture::unit(project.path()),
+        ],
+    );
     assert_eq!(
         option_value(&second),
         Some(&vint(2)),
@@ -628,11 +641,11 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Front, unit: Bytes) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
-  read filed[m](front: Front) -> Bytes
-  read reload[m](front: Front) -> Result<Target, Refusal>
+  read filed[m](front: Front, unit: Bytes) -> Option<Bytes>
+  read reload[m](front: Front, unit: Bytes) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -772,9 +785,9 @@ fn opts(host: Bool) -> Options =
     argv: [],
   }
 
-fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+fn main(root: String, front: Front, unit: Bytes) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   machine.configure[m](opts(true));
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, front, unit) {
     Err(_) -> false,
     Ok(_t) -> {
       let bound = machine.bound[m]("inner.main", unconfigured());
@@ -790,10 +803,10 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
   }
 }
 
-fn forgotten(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.drop[m]} = {
+fn forgotten(root: String, front: Front, unit: Bytes) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.drop[m]} = {
   machine.configure[m](opts(true));
   machine.drop[m]();
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, front, unit) {
     Err(_) -> false,
     Ok(_t) -> {
       let bound = machine.bound[m]("inner.main", unconfigured());
@@ -824,6 +837,7 @@ fn forgotten(root: String, front: Front) -> Bool / {machine.configure[m], machin
                 vec![
                     Value::str(project.path().display().to_string()),
                     crate::fixture::handed(project.path()),
+                    crate::fixture::unit(project.path()),
                 ],
                 Span::DUMMY,
             )
@@ -853,11 +867,11 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Front, unit: Bytes) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
-  read filed[m](front: Front) -> Bytes
-  read reload[m](front: Front) -> Result<Target, Refusal>
+  read filed[m](front: Front, unit: Bytes) -> Option<Bytes>
+  read reload[m](front: Front, unit: Bytes) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -906,8 +920,8 @@ type Raised = { diag: Diag, values: List<Value> }
 type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
-fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front)) {
+fn main(root: String, front: Front, unit: Bytes) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
+  match machine.load[m](root, front, unit) {
     Ok(_) -> match machine.bound[m]("inner.main", unconfigured()) {
       Ok(_) -> {
         let doubled = machine.call[m]("inner.double", [VInt(21)]);
@@ -966,6 +980,7 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
             vec![
                 Value::str(project.path().display().to_string()),
                 crate::fixture::handed(project.path()),
+                crate::fixture::unit(project.path()),
             ],
             Span::DUMMY,
         )
@@ -1010,11 +1025,11 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Front, unit: Bytes) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
-  read filed[m](front: Front) -> Bytes
-  read reload[m](front: Front) -> Result<Target, Refusal>
+  read filed[m](front: Front, unit: Bytes) -> Option<Bytes>
+  read reload[m](front: Front, unit: Bytes) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -1068,8 +1083,8 @@ fn spent() -> Int / {machine.accounting[m]} = (machine.accounting[m]()).steps
 fn answered(c: Called) -> Int =
   match c.answer { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
 
-fn main(root: String, front: Front) -> Spent / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  let _loaded = machine.load[m](root, Some(front));
+fn main(root: String, front: Front, unit: Bytes) -> Spent / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
+  let _loaded = machine.load[m](root, front, unit);
   let _bound = machine.bound[m]("inner.main", unconfigured());
   let first = answered(machine.call[m]("inner.constant", []));
   let ran = spent();
@@ -1119,6 +1134,7 @@ fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
             vec![
                 Value::str(project.path().display().to_string()),
                 crate::fixture::handed(project.path()),
+                crate::fixture::unit(project.path()),
             ],
             Span::DUMMY,
         )

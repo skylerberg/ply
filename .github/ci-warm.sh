@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# ci-warm.sh PLY        the `ply` program and the emitter, built or found once, before a job's tests
-#                       and corpus lanes start several processes that would each build them at once.
-#                       A test of a scratch project is the cheapest run that compiles a unit, so it
-#                       is the one that reaches the emitter; nothing in it is cached. The emitter's
-#                       line says which way it came.
+# ci-warm.sh PLY        the `ply` program, built or found once, before a job's tests and corpus
+#                       lanes start several processes that would each build it at once. A test of a
+#                       scratch project is the cheapest run that emits and compiles a unit; nothing
+#                       in it is cached. The emitter's lines say what it read back and was asked.
 # ci-warm.sh used MARK  the C cache and the stages cut to what the `ply`s since MARK used: a load
 #                       marks what it reads, so the rest is what earlier runs left that this one
 #                       did not read, and every job after would restore it for nothing.
@@ -42,6 +41,6 @@ case "${1:-}" in
       cat "$dir/out" "$dir/err" >&2
       exit 1
     }
-    grep '^phases: emitter' "$dir/err" || echo "no emitter was built: the test compiled nothing" >&2
+    grep '^phases: emitter' "$dir/err" || echo "the emitter was asked nothing: the test compiled nothing" >&2
     ;;
 esac
