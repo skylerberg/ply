@@ -110,6 +110,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `1.5`, `1e9`, `2.5e-3` | `Float` | IEEE-754 binary64. |
 | `1.50m`, `0m` | `Decimal` | Exact base 10; up to 28 fractional digits, 96-bit mantissa; keeps its written scale. |
 | `"text"` | `String` | UTF-8; no line breaks. |
+| `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.value.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
@@ -125,6 +126,14 @@ written as a literal; use `i8_of_int(-128)`.
 String and character escapes are `\n` `\t` `\r` `\0` `\\` `\"` `\'` and `\u{...}`, one to six hex
 digits naming a Unicode scalar value (a surrogate or a value past `10FFFF` is `E0211`). Byte
 strings add `\xNN`, refuse `\u{...}` and refuse source characters above `U+007F`.
+
+An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ " b"`, with
+`std.value`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
+writes it (§13.35). The two spellings are one definition with one hash. A hole is any expression,
+strings and braces included, and `{{` and `}}` are braces of the text; a lone `}` is `E0001`. A
+hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Cell` or a `Task` in one
+is `E0206`. A module that interpolates imports `std.value` itself, under a name no source can
+write, so `std.value` and the modules it imports cannot interpolate.
 
 A map literal is the call `map_of_entries([{key: k, value: v}, ..])` and a set literal the same
 with `()` for each value, so either spelling is one definition with one hash; `ply fmt` keeps the
@@ -1266,6 +1275,7 @@ derive json for Line
 | `eq` | `<snake_case(T)>_eq` | `{eq: (T, T) -> Bool}` |
 | `ord` | `<snake_case(T)>_ord` | `{compare: (T, T) -> Ordering}` |
 | `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
+| `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.value.show` does |
 
 There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
 `HttpRequest` both give `http_request`) is `E0105`. A `derive` must be in the
@@ -1286,10 +1296,10 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 plain values: `json::decode_bytes(body, order_json())`.
 
 `E0206` names the field that blocks a derivation: function types, `Cell` and
-`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`, `bin`);
+`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`, `bin`, `show`);
 `Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin` need their
 module imported (`import std.json`, `import std.bin`), or the `derive` is
-`E0206`.
+`E0206`; `show` imports `std.value` itself.
 
 ## 12. Builtins
 
@@ -1308,6 +1318,7 @@ authority when this page and it disagree.
 | `panic<a>(message: String) -> a` | `E0502` |
 | `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
+| `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
 | `min`, `max` `(a: Int, b: Int) -> Int` | |
 | `cell_get<a>(c: Cell<a>) -> a` | |
 | `cell_set<a>(c: Cell<a>, v: a) -> Unit` | |
@@ -2678,6 +2689,7 @@ pub type Value =
   | VFixed(String, U128) | VChar(Char) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
   | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
   | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
+  | VArray(List<Value>)
 pub type Field = { name: String, value: Value }
 pub type Entry = { key: Value, value: Value }
 pub type Fun =
@@ -2685,6 +2697,8 @@ pub type Fun =
   | FProject({ arity: Int, index: Int })
   | FTable({ arity: Int, entries: List<Entry>, default: Value })
 pub fn render(v: Value) -> String
+pub fn show<a>(x: a) -> String where derivable(show, a)
+pub fn display<a>(x: a) -> String where derivable(show, a)
 pub fn filled(text: String, values: List<Value>) -> String
 pub fn order(a: Value, b: Value) -> Ordering
 pub fn map_of(entries: List<Entry>) -> Value
@@ -2694,9 +2708,14 @@ pub fn shown_depth() -> Int
 
 A value of any type as data: what `machine.call` takes and answers, what a
 runtime diagnostic carries, and what a counterexample binds. `render` is the one
-way a value is shown, in the language's own spelling. A list or map past
-`shown_items` items counts the rest, nesting past `shown_depth` shows as `…`,
-and a credential shows as `Secret(****)`. A fixed width holds the bit pattern it
+way a value is shown, in the language's own spelling: a constructor by the name
+its module declares, an array as `array_of_list([..])`. In a diagnostic, a list
+or map past `shown_items` items counts the rest, nesting past `shown_depth`
+shows as `…`, and a credential shows as `Secret(****)`. `show` writes any value
+of a program the same way, every item at every depth (`reflect`, §12.1, is the
+value as data), and `display` writes a `String` or a `Char` as itself and
+anything else as `show` does: it is what an interpolated string's holes are
+(§2.3). A fixed width holds the bit pattern it
 reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
 a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
 and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each

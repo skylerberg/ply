@@ -1039,7 +1039,7 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
         ),
         (
             "value",
-            option(o.value.as_ref().map(crate::payload::plain_value)),
+            option(o.value.as_ref().map(ply_eval::reflect::value_of)),
         ),
         (
             "raised",
@@ -1086,7 +1086,7 @@ pub fn called_value(called: Ended<ply_eval::Plain>) -> PlyValue {
         (
             "answer",
             match answer {
-                Ok(plain) => PlyValue::ctor("Ok", vec![crate::payload::plain_value(&plain)]),
+                Ok(plain) => PlyValue::ctor("Ok", vec![ply_eval::reflect::value_of(&plain)]),
                 Err(d) => PlyValue::ctor("Err", vec![crate::payload::raised_value(&d)]),
             },
         ),
