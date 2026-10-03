@@ -18,18 +18,18 @@ import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar,
                OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
                atoms_union, atoms_contains, atoms_difference, resource_covers, row_empty, row_open,
                row_closed, row_singleton, row_is_pure, row_union, row_without, row_without_covered,
-               atom_conflicts, con, con1, t_int, t_bool, t_string, t_bytes, t_float, t_decimal,
-               t_unit, t_list, t_option, t_map, t_iter, t_secret, t_fn, mono, fields_sorted,
-               field_get, mentions_secret, at, set_at, take, drop, append, contains_int,
-               contains_bytes, ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var,
-               fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row,
-               is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row,
-               occurs_ty, solve_continuation_row, free_vars, unify, unify_row, covariant_con,
-               env_new, env_push, env_pop, env_bind, env_bind_global, env_remove_global, env_lookup,
-               env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme, generalize,
-               region_prefix, region_of, label_type, label_of, resolve_atom, atom_text, atoms_text,
-               resource_text, scheme_text, type_text, row_text, Printer, printer_new,
-               printer_naming, print_ty, print_row)
+               atom_conflicts, atom_covers, con, con1, t_int, t_bool, t_string, t_bytes, t_float,
+               t_decimal, t_unit, t_list, t_option, t_map, t_iter, t_secret, t_fn, mono,
+               fields_sorted, field_get, mentions_secret, at, set_at, take, drop, append,
+               contains_int, contains_bytes, ints_insert, ints_union, ints_difference, fresh_new,
+               fresh_ty_var, fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty,
+               mark_rigid_row, is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail,
+               resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
+               covariant_con, env_new, env_push, env_pop, env_bind, env_bind_global,
+               env_remove_global, env_lookup, env_depth_of, env_locals, instantiate_with,
+               instantiate, rename_scheme, generalize, region_prefix, region_of, label_type,
+               label_of, resolve_atom, atom_text, atoms_text, resource_text, scheme_text, type_text,
+               row_text, Printer, printer_new, printer_naming, print_ty, print_row)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit,
                 Fix, with_fix, insertion, Ns, NValue, NType, NEffect, resolve_modules, Resolved_,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
@@ -86,7 +86,6 @@ pub type DefInfo = {
   row_aliases: List<Bytes>,
   constraints: List<DefConstraint>,
   spec: List<SpecInfo>,
-  internally_effectful: Bool,
   at: Loc,
 }
 pub type TestInfo = {
@@ -245,14 +244,9 @@ type Shared = { labels: List<Int>, rows: List<Int> }
 // The rows the driver hands in for definitions whose hash has not moved, and test footprints, one
 // slot per `test`. The rest of a published interface is the written signature, which is on hand.
 pub type KnownDef = { footprint: List<Atom>, performed: List<Atom> }
-// `effectful` is a compiled package's word for definitions whose bodies here are blanks.
-pub type Known = {
-  defs: Map<Bytes, KnownDef>,
-  tests: Map<Bytes, List<Option<List<Atom>>>>,
-  effectful: Map<Bytes, Bool>,
-}
+pub type Known = { defs: Map<Bytes, KnownDef>, tests: Map<Bytes, List<Option<List<Atom>>>> }
 
-pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), effectful: map_new() }
+pub fn no_known() -> Known = { defs: map_new(), tests: map_new() }
 
 type Cx = {
   r: Resolved,
@@ -1169,17 +1163,20 @@ fn lookup_failure(cx: Cx, ns: Ns, q: QName) -> Cx =
                     name,
                     b"` above the first item",
                   ]),
-                None -> if len(scope.modules) == 0 {
-                  bytes_concat_all([
-                    b"`",
-                    scope.module,
-                    b"` imports no modules; add `import <module>` above the first item",
-                  ])
-                } else {
-                  bytes_concat(
-                    b"modules imported here: ",
-                    backticked(map(scope.modules, |mb: ModBind| mb.binder), b", "),
-                  )
+                None -> {
+                  let imported = filter(scope.modules, written_binder);
+                  if len(imported) == 0 {
+                    bytes_concat_all([
+                      b"`",
+                      scope.module,
+                      b"` imports no modules; add `import <module>` above the first item",
+                    ])
+                  } else {
+                    bytes_concat(
+                      b"modules imported here: ",
+                      backticked(map(imported, |mb: ModBind| mb.binder), b", "),
+                    )
+                  }
                 },
               };
               err1(cx, b"E0106", binder.span, message, label, [note])
@@ -2233,12 +2230,13 @@ fn signature_sharing(cx0: Cx, def: FnDef, shared: Shared) -> { cx: Cx, sig: Sig 
       },
   );
   let ret = match def.ret { Some(t) -> conv_type(params.cx, t), None -> new_ty(params.cx) };
+  // A function's row is what its signature writes: with no `/`, the empty one.
   let declared: { cx: Cx, r: Option<Row> } = match def.effects {
     Some(r) -> {
       let o: WithRow = conv_row(ret.cx, r);
       { cx: o.cx, r: Some(o.r) }
     },
-    None -> { cx: ret.cx, r: None },
+    None -> { cx: ret.cx, r: Some(row_empty()) },
   };
   let row: WithRow = match declared.r {
     Some(r) -> { cx: declared.cx, r: r },
@@ -4401,14 +4399,20 @@ fn resolve_op(
 }
 
 // The effect as this module can write it, so a suggestion parses.
-fn as_written(cx: Cx, eff: Bytes) -> Bytes = {
-  let scope = scope_of(cx);
-  match fold(scope.bound.effects, None, |acc: Option<Bytes>, b: Binding|
-      match acc { Some(_) -> acc, None -> if b.qualified == eff { Some(b.name) } else { None } }) {
-    Some(n) -> n,
-    None -> {
-      let simple = match effect_of(cx, eff) { Some(info) -> info.simple_name, None -> eff };
-      match fold(scope.modules, None, |acc: Option<Bytes>, mb: ModBind|
+// How this module's source names an effect: by its imported name or through a module binder; none
+// when it names it neither way, and a row it writes must import it first.
+fn written_as(cx: Cx, eff: Bytes) -> Option<Bytes> =
+  if is_prelude_effect(eff) || eff == cell() { Some(eff) } else {
+    let scope = scope_of(cx);
+    match fold(scope.bound.effects, None, |acc: Option<Bytes>, b: Binding|
+        match acc {
+          Some(_) -> acc,
+          None -> if b.qualified == eff { Some(b.name) } else { None },
+        }) {
+      Some(n) -> Some(n),
+      None -> {
+        let simple = match effect_of(cx, eff) { Some(info) -> info.simple_name, None -> eff };
+        fold(filter(scope.modules, written_binder), None, |acc: Option<Bytes>, mb: ModBind|
           match acc {
             Some(_) -> acc,
             None -> match dlookup(at(cx.r.declarations, mb.target), NEffect, simple) {
@@ -4417,13 +4421,20 @@ fn as_written(cx: Cx, eff: Bytes) -> Bytes = {
               } else { None },
               None -> None,
             },
-          }) {
-        Some(w) -> w,
-        None -> simple,
-      }
-    },
+          })
+      },
+    }
   }
-}
+
+// A binder an import wrote; one the resolver added for a spliced default or an expanded set has no
+// span, and no source can spell it.
+fn written_binder(mb: ModBind) -> Bool = mb.span.end > mb.span.start
+
+fn as_written(cx: Cx, eff: Bytes) -> Bytes =
+  match written_as(cx, eff) {
+    Some(w) -> w,
+    None -> match effect_of(cx, eff) { Some(info) -> info.simple_name, None -> eff },
+  }
 
 fn resource_for(
   cx: Cx,
@@ -5327,9 +5338,9 @@ fn infer_simulate(cx: Cx, span: Span, body: Expr) -> Inferred = {
 
 // --- Definitions ----------------------------------------------------------------------------------
 
-type Refs = { names: List<QName>, effects: Bool }
+type Refs = { names: List<QName> }
 
-fn refs_of(e: Expr) -> Refs = collect_refs(e, { names: [], effects: false })
+fn refs_of(e: Expr) -> Refs = collect_refs(e, { names: [] })
 
 fn collect_refs(e: Expr, out: Refs) -> Refs =
   match e {
@@ -5360,10 +5371,9 @@ fn collect_refs(e: Expr, out: Refs) -> Refs =
     EField(f) -> collect_refs(f.base, out),
     ETry(t) -> collect_refs(t.operand, out),
     EList(l) -> fold(l.items, out, |acc: Refs, x: Expr| collect_refs(x, acc)),
-    EPerform(p) ->
-      fold(p.args, { ..out, effects: true }, |acc: Refs, x: Expr| collect_refs(x, acc)),
+    EPerform(p) -> fold(p.args, out, |acc: Refs, x: Expr| collect_refs(x, acc)),
     EHandle(h) -> {
-      let b = collect_refs(h.body, { ..out, effects: true });
+      let b = collect_refs(h.body, out);
       let cs = fold(h.clauses, b, |acc: Refs, c: HandleClause| collect_refs(c.body, acc));
       match h.ret { Some(rc) -> collect_refs(rc.body, cs), None -> cs }
     },
@@ -5756,16 +5766,23 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
   fold(range(0, len(comp)), removed, |c: Cx, slot: Int| {
     let def = at(fns, at(comp, slot));
     let sig = at(sigs.sigs, slot);
-    let g: Generalized = generalize(c.subst, c.env, sig.fn_ty);
+    let body_row = resolve_r(c, at(bodies.rows, slot));
+    // An unwritten row the body overran is reported already; its callers are checked against what
+    // the body performs, so one check names every row the program has to write.
+    let overran = match def.effects {
+      Some(_) -> false,
+      None -> len(body_row.atoms) > 0 || body_row.tail != None,
+    };
+    let fn_ty = if overran { t_fn(sig.params, sig.ret, body_row) } else { sig.fn_ty };
+    let g: Generalized = generalize(c.subst, c.env, fn_ty);
     let sc: Scheme = split_labels(g.sc, def, sig);
-    let row = resolve_r(c, sig.published_row);
+    let row = if overran { body_row } else { resolve_r(c, sig.published_row) };
     let bound: Cx = {
       ..c,
       env: env_bind_global(g.e, at(qualified, slot), sc),
       ty_params: sig.ty_params,
     };
     let constraints = published_constraints(bound, def, sc);
-    let performed = resolve_r(bound, at(bodies.rows, slot));
     set_def(
       {
         ..bound,
@@ -5778,11 +5795,10 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
         simple_name: def.name.name,
         scheme: sc,
         footprint: row.atoms,
-        performed: performed.atoms,
+        performed: body_row.atoms,
         row_aliases: row_aliases(def),
         constraints: constraints,
         spec: [],
-        internally_effectful: true,
         at: here(bound, def.span),
       },
     )
@@ -5954,7 +5970,175 @@ fn row_edit(cx: Cx, r: RowExpr, text: Bytes) -> Edit =
     } else { insertion(cx.module, r.span.start + 1, bytes_concat(text, b", ")) },
   }
 
-fn check_upper_bound(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx = {
+fn joined_bytes(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  match xs {
+    [] -> b"",
+    [x, ..rest] -> fold(rest, x, |acc: Bytes, y: Bytes| bytes_concat_all([acc, sep, y])),
+  }
+
+fn check_upper_bound(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx =
+  match def.effects {
+    None -> check_unwritten(cx, def, inferred),
+    Some(_) -> check_written(cx, def, declared, inferred),
+  }
+
+// The name a forwarded row variable is written under: the signature's own row parameter.
+fn row_param_named(cx: Cx, v: Int) -> Option<Bytes> =
+  map_fold(cx.row_params, None, |found: Option<Bytes>, name: Bytes, w: Int|
+    match found { Some(_) -> found, None -> if w == v { Some(name) } else { None } })
+
+// A set this module can name, as it names it, and the atoms it stands for.
+type Nameable = { name: Bytes, atoms: List<Atom> }
+
+// The atoms of `owner`'s set `name`, resolved where they were written; none when one does not resolve.
+fn set_atoms_of(cx: Cx, owner: Int, name: Bytes) -> Option<List<Atom>> =
+  match list_at(cx.mods, owner) {
+    None -> None,
+    Some(md) ->
+      fold(md.module.items, None, |found: Option<List<Atom>>, it: Item|
+        match found {
+          Some(_) -> found,
+          None -> match it {
+            IEffectSet(d) -> if d.name.name == name {
+              let there: Cx = { ..cx, module: owner, label_params: map_new(), diags: [] };
+              fold(d.expansion, Some([]), |acc: Option<List<Atom>>, a: AtomExpr|
+                match acc {
+                  None -> None,
+                  Some(xs) -> match conv_atom(there, a).atom {
+                    Some(atom) -> Some(push(xs, atom)),
+                    None -> None,
+                  },
+                })
+            } else { None },
+            _ -> None,
+          },
+        }),
+  }
+
+// Every set this module names: its own and those it imports by name, then those of each module it
+// imports, through the binder.
+fn nameable_sets(cx: Cx) -> List<Nameable> = {
+  let scope = scope_of(cx);
+  let bound = fold(scope.bound.sets, [], |acc: List<Nameable>, b: Binding|
+    match set_atoms_of(cx, b.owner, b.name) {
+      Some(xs) -> push(acc, { name: b.name, atoms: xs }),
+      None -> acc,
+    });
+  fold(filter(scope.modules, written_binder), bound, |acc: List<Nameable>, mb: ModBind|
+    fold(at(cx.r.declarations, mb.target).sets, acc, |a: List<Nameable>, d: Declared|
+      if !d.public { a } else {
+        match set_atoms_of(cx, mb.target, d.name) {
+          Some(xs) -> push(a, { name: bytes_concat_all([mb.binder, b"::", d.name]), atoms: xs }),
+          None -> a,
+        }
+      }))
+}
+
+fn set_before(a: Nameable, b: Nameable) -> Bool =
+  len(a.atoms) > len(b.atoms)
+    || (len(a.atoms) == len(b.atoms)
+    && (match compare(a.name, b.name) { Less -> true, _ -> false }))
+
+// The sets a written row can name in place of `atoms`: each set every atom of which the row holds,
+// the largest first, and one only when it holds an atom no earlier one does; and the atoms nothing
+// else written covers.
+fn folded(cx: Cx, atoms: List<Atom>) -> { sets: List<Bytes>, rest: List<Atom> } = {
+  let fits = filter(nameable_sets(cx), |c: Nameable|
+    len(c.atoms) > 0 && fold(c.atoms, true, |all: Bool, a: Atom| all && atoms_contains(atoms, a)));
+  let sorted = fold(fits, [], |acc: List<Nameable>, c: Nameable| {
+    let n = len(acc);
+    let i = fold(range(0, n), n, |at_: Int, j: Int|
+      if at_ < n { at_ } else if set_before(c, at(acc, j)) { j } else { at_ });
+    fold(range(i, n), push(take(acc, i), c), |out: List<Nameable>, j: Int| push(out, at(acc, j)))
+  });
+  let picked = fold(
+    sorted,
+    { sets: [], covered: [] },
+    |acc: { sets: List<Bytes>, covered: List<Atom> }, c: Nameable|
+      if fold(c.atoms, true, |all: Bool, a: Atom| all && atoms_covered(acc.covered, a)) { acc }
+      else { { sets: push(acc.sets, c.name), covered: append(acc.covered, c.atoms) } },
+  );
+  let rest = filter(atoms, |a: Atom| !atoms_covered(picked.covered, a));
+  {
+    sets: picked.sets,
+    rest: filter(rest, |a: Atom|
+      !fold(rest, false, |hit: Bool, x: Atom| hit || (x != a && atom_covers(x, a)))),
+  }
+}
+
+// With no `/` the row is empty: what the body performs or forwards is reported at once, with the
+// row that would write it, naming a set wherever the module can.
+fn check_unwritten(cx0: Cx, def: FnDef, inferred: Row) -> Cx = {
+  let inf0 = resolve_r(cx0, inferred);
+  // A tail nothing constrains closes on the empty row; only a row parameter is forwarded.
+  let closed: { cx: Cx, forwarded: Bool } = match inf0.tail {
+    None -> { cx: cx0, forwarded: false },
+    Some(v) -> {
+      let u = unify_row(cx0.subst, cx0.fresh, row_empty(), row_open(v));
+      match u.err {
+        Some(_) -> { cx: cx0, forwarded: true },
+        None -> { cx: with_unified(cx0, u), forwarded: false },
+      }
+    },
+  };
+  let cx = closed.cx;
+  let inf = resolve_r(cx, inferred);
+  let forwarded = closed.forwarded;
+  if len(inf.atoms) == 0 && !forwarded { cx } else {
+    let fold_ = folded(cx, inf.atoms);
+    let atoms = append(fold_.sets, map(fold_.rest, |a: Atom| atom_written(cx, a)));
+    let tail: Option<Bytes> = match inf.tail { None -> None, Some(v) -> row_param_named(cx, v) };
+    let row = if len(atoms) == 0 { match tail { Some(name) -> name, None -> b"e" } } else {
+      bytes_concat_all([
+        b"{",
+        joined_bytes(atoms, b", "),
+        match tail { Some(name) -> bytes_concat(b" | ", name), None -> b"" },
+        b"}",
+      ])
+    };
+    let sites = fold(offences(cx, [], inf.atoms), [], |acc: List<Label>, o: Offence|
+      match o.site {
+        Some(s) -> push(acc, lab(s.module, s.span, true, site_label([], s))),
+        None -> acc,
+      });
+    let primaries = if len(sites) == 0 {
+      [lab(cx.module, expr_span(def.body), true, bytes_concat(b"body has row ", row_text(inf)))]
+    } else { sites };
+    let d: Diag = diag(
+      b"E0302",
+      bytes_concat_all([
+        b"`",
+        def.name.name,
+        b"` writes no `/`, so its row is empty, and its body ",
+        if forwarded && len(atoms) == 0 { b"forwards a row" } else { b"performs effects" },
+      ]),
+      push(primaries, lab(cx.module, def.name.span, false, b"no `/` written: the row is empty")),
+      [
+        bytes_concat_all([
+          b"a function performs only what its signature writes: write `/ ",
+          row,
+          b"` after the return type, or handle the effects inside `",
+          def.name.name,
+          b"`",
+        ]),
+      ],
+    );
+    let nameable = fold(fold_.rest, true, |all: Bool, a: Atom|
+      all && written_as(cx, a.effect) != None);
+    let fixable = nameable && (!forwarded || tail != None);
+    let fixed: Diag = match def.ret {
+      Some(t) -> if fixable {
+        with_fix(d, bytes_concat_all([b"write the row `/ ", row, b"`"]), [
+          insertion(cx.module, ty_span(t).end, bytes_concat(b" / ", row)),
+        ])
+      } else { d },
+      None -> d,
+    };
+    report(cx, fixed)
+  }
+}
+
+fn check_written(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx = {
   let ann_span = match def.effects { Some(r) -> r.span, None -> def.span };
   let inf = resolve_r(cx, inferred);
   let dec = resolve_r(cx, declared);
@@ -6002,14 +6186,16 @@ fn check_upper_bound(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx = {
         )
       } else { notes },
     );
+    // An atom this module cannot name has no text that would parse, so it gets no fix.
     let fixed: Diag = match def.effects {
       Some(r) ->
-        fold(extra, d, |acc: Diag, o: Offence| {
-          let text = atom_written(cx, o.atom);
-          with_fix(acc, bytes_concat_all([b"add `", text, b"` to the row"]), [
-            row_edit(cx, r, text),
-          ])
-        }),
+        fold(extra, d, |acc: Diag, o: Offence|
+          if written_as(cx, o.atom.effect) == None { acc } else {
+            let text = atom_written(cx, o.atom);
+            with_fix(acc, bytes_concat_all([b"add `", text, b"` to the row"]), [
+              row_edit(cx, r, text),
+            ])
+          }),
       None -> d,
     };
     report(cx, fixed)
@@ -8121,101 +8307,6 @@ fn check_region_handoffs(cx: Cx, site: RegionSite) -> Cx =
     }
   })
 
-// --- Internal effects ---------------------------------------------------------------------------------
-
-fn mark_internal_effects(cx: Cx) -> Cx = {
-  // The list and its index are built in one pass; scanning the list per definition and per call edge is quadratic.
-  let indexed = fold(
-    range(0, len(cx.mods)),
-    { names: [], index: map_new() },
-    |acc: { names: List<Bytes>, index: Map<Bytes, Int> }, mi: Int|
-      fold(
-        at(cx.mods, mi).module.items,
-        acc,
-        |a: { names: List<Bytes>, index: Map<Bytes, Int> }, it: Item|
-          match it {
-            IFn(def) -> {
-              let nm = qualify(module_name(cx, mi), def.name.name);
-              match map_get(a.index, nm) {
-                Some(_) -> a,
-                None -> { names: push(a.names, nm), index: map_insert(a.index, nm, len(a.names)) },
-              }
-            },
-            _ -> a,
-          },
-      ),
-  );
-  let names = indexed.names;
-  let index = indexed.index;
-  let n = len(names);
-  let seeded = fold(
-    range(0, len(cx.mods)),
-    { cx: cx, effects: map(range(0, n), |i: Int| false), callers: map(range(0, n), |i: Int| []) },
-    |acc: { cx: Cx, effects: List<Bool>, callers: List<List<Int>> }, mi: Int| {
-      let c: Cx = { ..acc.cx, module: mi };
-      fold(
-        at(c.mods, mi).module.items,
-        { ..acc, cx: c },
-        |a: { cx: Cx, effects: List<Bool>, callers: List<List<Int>> }, it: Item|
-          match it {
-            IFn(def) -> {
-              let at_ = match map_get(index, qualify(module_name(a.cx, mi), def.name.name)) {
-                Some(i) -> i,
-                None -> 0 - 1,
-              };
-              if at_ < 0 { a } else {
-                let refs = refs_of(def.body);
-                let named = qualify(module_name(a.cx, mi), def.name.name);
-                let flagged = if refs.effects || map_contains(a.cx.known.effectful, named) {
-                  set_at(a.effects, at_, true)
-                } else { a.effects };
-                let params = map(def.params, |p: Param| p.name.name);
-                let callers = fold(refs.names, a.callers, |cs: List<List<Int>>, q: QName|
-                  if is_bare(q) && contains_bytes(params, q.name.name) { cs } else {
-                    match declared_value(a.cx, q) {
-                      None -> cs,
-                      Some(callee) -> {
-                        let to = match map_get(index, callee) { Some(i) -> i, None -> 0 - 1 };
-                        if to < 0 { cs } else { set_at(cs, to, push(at(cs, to), at_)) }
-                      },
-                    }
-                  });
-                { cx: a.cx, effects: flagged, callers: callers }
-              }
-            },
-            _ -> a,
-          },
-      )
-    },
-  );
-  let propagated = iterate(
-    { effects: seeded.effects, pending: filter(range(0, n), |i: Int| at(seeded.effects, i)) },
-    n * n + n + 2,
-    |st: { effects: List<Bool>, pending: List<Int> }|
-      if len(st.pending) == 0 { Stop(st.effects) } else {
-        let node = at(st.pending, len(st.pending) - 1);
-        let rest = take(st.pending, len(st.pending) - 1);
-        let out = fold(
-          at(seeded.callers, node),
-          { effects: st.effects, pending: rest },
-          |a: { effects: List<Bool>, pending: List<Int> }, caller: Int|
-            if at(a.effects, caller) { a }
-            else { { effects: set_at(a.effects, caller, true), pending: push(a.pending, caller) } },
-        );
-        Continue(out)
-      },
-  );
-  let c: Cx = seeded.cx;
-  fold(range(0, n), c, |cc: Cx, i: Int|
-    match def_of(cc, at(names, i)) {
-      Some(d) -> {
-        let info: DefInfo = d;
-        set_def(cc, { ..info, internally_effectful: at(propagated, i) })
-      },
-      None -> cc,
-    })
-}
-
 // --- `check_program` --------------------------------------------------------------------------------------
 
 fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
@@ -8469,8 +8560,7 @@ pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked
   let solved: Cx = check_parallels(
     check_regions(check_simulations(attribute_generated(check_derives(constrained)))),
   );
-  let marked: Cx = mark_internal_effects(solved);
-  { cx: marked, ok: !any_error(marked.diags) }
+  { cx: solved, ok: !any_error(solved.diags) }
 }
 
 // --- The dump -----------------------------------------------------------------------------------------------
@@ -8500,8 +8590,6 @@ fn dump_def(d: DefInfo) -> Bytes =
       map(d.constraints, |c: DefConstraint| bytes_concat(deriver_text(c.deriver), n(c.param))),
       b",",
     ),
-    b";",
-    flag(d.internally_effectful),
     b";",
   ])
 
@@ -8599,7 +8687,7 @@ pub fn check_dump(sources: List<Source>) -> String = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
-    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let x = expand(r.node, r.p.diags);
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
   });
@@ -8641,7 +8729,7 @@ fn known_of(cx: Cx) -> Known = {
       { next: slots.next, tests: map_insert(acc.tests, m.name, slots.slots) }
     },
   );
-  { defs: defs, tests: walked.tests, effectful: map_new() }
+  { defs: defs, tests: walked.tests }
 }
 
 // The program checked twice, the second time from what the first published.
@@ -8649,7 +8737,7 @@ pub fn check_dump_known(sources: List<Source>) -> String = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
-    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let x = expand(r.node, r.p.diags);
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
   });
@@ -8680,7 +8768,7 @@ test "a definition's scheme is generalized and its footprint inferred" {
   ]);
   assert_eq(
     dump,
-    "K;1;F;m.id;<a>(a) -> a;;;;0;F;m.two;() -> Int;;;;0;F;m.say;(Bytes) -> Unit / {m.log.write};m.log.write;m.log.emit;;1;E;m.log;0;emit:write:0:Bytes:Unit;",
+    "K;1;F;m.id;<a>(a) -> a;;;;F;m.two;() -> Int;;;;F;m.say;(Bytes) -> Unit / {m.log.write};m.log.write;m.log.emit;;E;m.log;0;emit:write:0:Bytes:Unit;",
   )
 }
 
@@ -8693,8 +8781,8 @@ test "a definition may be generic over a resource label, and a call fills it" {
   ]);
   assert_eq(
     dump,
-    "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;1;"
-      ++ "F;m.go;(Bytes) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;1;"
+    "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;"
+      ++ "F;m.go;(Bytes) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;"
       ++ "E;m.net;0;send:write:1:Bytes:Unit;",
   )
 }
@@ -8708,8 +8796,8 @@ test "an argument's row fills a label the call does not write" {
   ]);
   assert_eq(
     dump,
-    "K;1;F;m.relay;<[l]>(() -> Unit / {m.net.send[l]}) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;0;"
-      ++ "F;m.go;(() -> Unit / {m.net.send[conn]}) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;0;"
+    "K;1;F;m.relay;<[l]>(() -> Unit / {m.net.send[l]}) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;"
+      ++ "F;m.go;(() -> Unit / {m.net.send[conn]}) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;"
       ++ "E;m.net;0;send:write:1:Bytes:Unit;",
   )
 }
@@ -8723,8 +8811,8 @@ test "a clause on a label parameter discharges what the generic body performs" {
   ]);
   assert_eq(
     dump,
-    "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;1;"
-      ++ "F;m.quiet;<[l]>(Bytes) -> Unit;;;;1;"
+    "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;"
+      ++ "F;m.quiet;<[l]>(Bytes) -> Unit;;;;"
       ++ "E;m.net;0;send:write:1:Bytes:Unit;",
   )
 }
@@ -8786,7 +8874,7 @@ test "two label parameters stay apart, and each names its own atom" {
   ]);
   assert_eq(
     dump,
-    "K;1;F;m.pipe;<[l], [m]>(Bytes) -> Unit / {m.net.send[l], m.net.send[m]};<[l],[m]>m.net.send[l],m.net.send[m];<[l],[m]>m.net.send[l],m.net.send[m];;1;"
+    "K;1;F;m.pipe;<[l], [m]>(Bytes) -> Unit / {m.net.send[l], m.net.send[m]};<[l],[m]>m.net.send[l],m.net.send[m];<[l],[m]>m.net.send[l],m.net.send[m];;"
       ++ "E;m.net;0;send:write:1:Bytes:Unit;",
   )
 }
@@ -8914,10 +9002,10 @@ test "two callbacks that perform different things fill one row variable with bot
     b"effect a { write x() -> Unit }\n",
     b"effect b { write y() -> Unit }\n",
     b"fn both<|e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e = { f(); g() }\n",
-    b"fn fa() -> Unit = a.x()\n",
-    b"fn go() -> Unit = both(|| a.x(), || b.y())\n",
-    b"fn named() -> Unit = both(fa, || ())\n",
-    b"fn apart() -> (Unit, Unit) = parallel { both(|| a.x(), || a.x()), b.y() }",
+    b"fn fa() -> Unit / {a.x} = a.x()\n",
+    b"fn go() -> Unit / {a.x, b.y} = both(|| a.x(), || b.y())\n",
+    b"fn named() -> Unit / {a.x} = both(fa, || ())\n",
+    b"fn apart() -> (Unit, Unit) / {a.x, b.y} = parallel { both(|| a.x(), || a.x()), b.y() }",
   ]);
   assert_eq(check_codes(src), []);
   let dump = check_dump([{ name: b"m", src: src }]);
@@ -8928,7 +9016,7 @@ test "two callbacks that perform different things fill one row variable with bot
     b"effect a { write x() -> Unit }\n",
     b"effect b { write y() -> Unit }\n",
     b"fn both<|e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e = { f(); g() }\n",
-    b"fn shared() -> (Unit, Unit) = parallel { both(|| a.x(), || b.y()), b.y() }",
+    b"fn shared() -> (Unit, Unit) / {a.x, b.y} = parallel { both(|| a.x(), || b.y()), b.y() }",
   ]);
   assert_eq(check_codes(clash), [b"E0309"])
 }
@@ -8936,11 +9024,11 @@ test "two callbacks that perform different things fill one row variable with bot
 test "a callback may perform less than its parameter's row permits, and nothing it does not permit" {
   let ops = b"effect a { write x() -> Unit\n write z() -> Unit }\n";
   let run = bytes_concat(ops, b"fn run(k: () -> Unit / {a.x, a.z}) -> Unit / {a.x, a.z} = k()\n");
-  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit = run(|| a.x())")), []);
-  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit = run(|| ())")), []);
+  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit / {a.x, a.z} = run(|| a.x())")), []);
+  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit / {a.x, a.z} = run(|| ())")), []);
   let narrow = bytes_concat(
     ops,
-    b"fn run(k: () -> Unit / {a.x}) -> Unit / {a.x} = k()\nfn go() -> Unit = run(|| a.z())",
+    b"fn run(k: () -> Unit / {a.x}) -> Unit / {a.x} = k()\nfn go() -> Unit / {a.x} = run(|| a.z())",
   );
   let diags = check_diags(narrow);
   assert_eq(map(diags, |dg: Diag| dg.code), [b"E0302"]);
@@ -8981,8 +9069,8 @@ test "a list, a branch, a return, an annotation and a value's fields take functi
     b"effect b { write y() -> Unit }\n",
     b"fn each<|e>(fs: List<() -> Unit / e>) -> Unit / e = ()\n",
     b"fn pair<|e>(h: { ok: () -> Unit / e, err: () -> Unit / e }) -> Unit / e = ()\n",
-    b"fn listed() -> Unit = each([|| a.x(), || b.y()])\n",
-    b"fn paired() -> Unit = pair({ ok: || a.x(), err: || b.y() })\n",
+    b"fn listed() -> Unit / {a.x, b.y} = each([|| a.x(), || b.y()])\n",
+    b"fn paired() -> Unit / {a.x, b.y} = pair({ ok: || a.x(), err: || b.y() })\n",
     b"fn branched(c: Bool) -> () -> Unit / {a.x, b.y} = if c { || a.x() } else { || b.y() }\n",
     b"fn matched(n: Int) -> () -> Unit / {a.x, b.y} = match n { 0 -> || a.x(), _ -> || b.y() }\n",
     b"fn fell(o: Option<Int>) -> () -> Unit / {a.x, b.y} = { let Some(_) = o else { || b.y() }; || a.x() }\n",
@@ -9084,14 +9172,14 @@ test "a call inside a recursive group cannot instantiate a type parameter" {
 test "a unit pattern covers its type" {
   assert_eq(
     check_dump([{ name: b"m", src: b"fn f(u: Unit) -> Int = match u { () -> 1 }" }]),
-    "K;1;F;m.f;(Unit) -> Int;;;;0;",
+    "K;1;F;m.f;(Unit) -> Int;;;;",
   )
 }
 
 // A one-module program's diagnostics, in order; empty when it checks.
 fn check_diags(src: Bytes) -> List<Diag> = {
   let r = parse(src);
-  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  let x = expand(r.node, r.p.diags);
   let d: Expansion = expand_derives(0, b"m", x.module);
   match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
     Failed(ds) -> ds,
@@ -9239,7 +9327,7 @@ test "a handle must have a clause for every operation its body performs on an at
 }
 
 test "the operations a called definition performs count, through any number of calls" {
-  let calls = b"fn push_all(p: Bytes) -> Unit = net.send[c](p)\nfn relay(p: Bytes) -> Unit = push_all(p)\n";
+  let calls = b"fn push_all(p: Bytes) -> Unit / {net.send[c]} = net.send[c](p)\nfn relay(p: Bytes) -> Unit / {net.send[c]} = push_all(p)\n";
   assert_eq(
     check_codes(
       net_src(
@@ -9389,7 +9477,7 @@ test "a callee written with a mode atom may perform any of its operations, so ev
       net_src(
         bytes_concat(
           calls,
-          b"fn f() -> Int = handle { relay(b\"x\"); 1 } with { net.peek[c]() -> 1 }",
+          b"fn f() -> Int / {net.write[c]} = handle { relay(b\"x\"); 1 } with { net.peek[c]() -> 1 }",
         ),
       ),
     ),
@@ -9469,6 +9557,71 @@ test "an operation the written row does not name is refused by name, with the at
   ])
 }
 
+test "a function that writes no `/` performs nothing, and one whose body does is given its row" {
+  let src = net_src(b"fn f() -> Bytes = net.recv[c](4)");
+  let diags = check_diags(src);
+  assert_eq(map(diags, |dg: Diag| dg.message), [
+    b"`f` writes no `/`, so its row is empty, and its body performs effects",
+  ]);
+  let fixes = fixes_of(diags);
+  assert_eq(map(fixes, |f: Fix| f.title), [b"write the row `/ {net.recv[c]}`"]);
+  let written = net_src(b"fn f() -> Bytes / {net.recv[c]} = net.recv[c](4)");
+  assert_eq(map(fixes, |f: Fix| fixed_by(src, f)), [written]);
+  assert_eq(check_codes(written), []);
+  let forwards = b"fn apply<| e>(f: () -> Int / e) -> Int = f()";
+  let forwarded = check_diags(forwards);
+  assert_eq(map(forwarded, |dg: Diag| dg.message), [
+    b"`apply` writes no `/`, so its row is empty, and its body forwards a row",
+  ]);
+  assert_eq(map(fixes_of(forwarded), |f: Fix| fixed_by(forwards, f)), [
+    b"fn apply<| e>(f: () -> Int / e) -> Int / e = f()",
+  ])
+}
+
+test "the row a fix writes names a set wherever the row holds the whole of it" {
+  let src = net_src(
+    b"effect set Io = {net.send[c], net.peek[c]}\nfn a() -> Int / {Io} = 1\nfn b() -> Int = a()\nfn c() -> Int = net.peek[c]()",
+  );
+  assert_eq(map(fixes_of(check_diags(src)), |f: Fix| f.title), [
+    b"write the row `/ {Io}`",
+    b"write the row `/ {net.peek[c]}`",
+  ]);
+  // An operation a named set's mode atom covers is not written again.
+  let modes = net_src(
+    b"effect set Wire = {net.write[c], net.read[c]}\nfn a() -> Int / {Wire} = 1\nfn b() -> Int = { net.send[c](b\"x\"); a() }",
+  );
+  assert_eq(map(fixes_of(check_diags(modes)), |f: Fix| f.title), [b"write the row `/ {Wire}`"]);
+  let covered = net_src(
+    b"fn a() -> Int / {net.write[c]} = 1\nfn b() -> Int = { net.send[c](b\"x\"); a() }",
+  );
+  assert_eq(map(fixes_of(check_diags(covered)), |f: Fix| f.title), [
+    b"write the row `/ {net.write[c]}`",
+  ])
+}
+
+test "a row variable nothing constrains closes on an unwritten row, and only a parameter is forwarded" {
+  assert_eq(check_codes(b"fn two(x: Int) -> Int = one(x) + 1"), [b"E0101"]);
+  assert_eq(check_codes(b"fn h() -> Int = { let f = |x: Int| x; f(1) }"), [])
+}
+
+test "a caller is checked against what an overrunning body performs, so one check names each row" {
+  let src = net_src(
+    b"fn leaf() -> Bytes = net.recv[c](4)\nfn mid() -> Bytes = leaf()\nfn top() -> Bytes / {net.recv[c]} = mid()",
+  );
+  let diags = check_diags(src);
+  assert_eq(map(diags, |dg: Diag| dg.message), [
+    b"`leaf` writes no `/`, so its row is empty, and its body performs effects",
+    b"`mid` writes no `/`, so its row is empty, and its body performs effects",
+  ]);
+  // The later fix first, so the earlier one's offset still points where it did.
+  let fixes = fixes_of(diags);
+  let n = len(fixes);
+  assert_eq(
+    check_codes(fold(range(0, n), src, |s: Bytes, i: Int| fixed_by(s, at(fixes, n - 1 - i)))),
+    [],
+  )
+}
+
 test "a caller's mode atom covers a callee's operation atom, and not the reverse" {
   let narrow = b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n";
   let wide = b"fn f() -> Unit / {net.write[c]} = net.send[c](b\"x\")\n";
@@ -9480,7 +9633,12 @@ test "a caller's mode atom covers a callee's operation atom, and not the reverse
   ]);
   assert_eq(
     check_codes(
-      net_src(bytes_concat(narrow, b"fn g() -> Unit = f()\nfn h() -> Unit / {net.write[c]} = g()")),
+      net_src(
+        bytes_concat(
+          narrow,
+          b"fn g() -> Unit / {net.send[c]} = f()\nfn h() -> Unit / {net.write[c]} = g()",
+        ),
+      ),
     ),
     [],
   );
@@ -9584,25 +9742,25 @@ test "a cell leaving its region is reported at the exit, under the code its form
 test "a cell reaches a task only where the scheduler cannot outlive the region" {
   assert_eq(
     check_codes(
-      b"fn leak() -> Int = { let t = with_cell[s](0) { c -> task.spawn(|| cell_get(c)) }; 0 }",
+      b"fn leak() -> Int / {task.spawn} = { let t = with_cell[s](0) { c -> task.spawn(|| cell_get(c)) }; 0 }",
     ),
     [b"E0446"],
   );
   assert_eq(
     check_codes(
-      b"fn joined() -> Int = simulate { with_cell[s](0) { c -> { let t = task.spawn(|| cell_get(c)); task.join(t) } } }",
+      b"fn joined() -> Int / {sim.read} = simulate { with_cell[s](0) { c -> { let t = task.spawn(|| cell_get(c)); task.join(t) } } }",
     ),
     [b"E0446"],
   );
   assert_eq(
     check_codes(
-      b"fn inside() -> Int = with_cell[s](0) { c -> simulate { let t = task.spawn(|| cell_get(c)); task.join(t) } }",
+      b"fn inside() -> Int / {sim.read} = with_cell[s](0) { c -> simulate { let t = task.spawn(|| cell_get(c)); task.join(t) } }",
     ),
     [],
   );
   assert_eq(
     check_codes(
-      b"fn data() -> Int = simulate { with_cell[s](0) { c -> { let t = task.spawn(|| 1); cell_get(c) + task.join(t) } } }",
+      b"fn data() -> Int / {sim.read} = simulate { with_cell[s](0) { c -> { let t = task.spawn(|| 1); cell_get(c) + task.join(t) } } }",
     ),
     [],
   )
@@ -9651,7 +9809,7 @@ test "a `Task` in a parameter or a type argument is left to the escape check" {
   );
   assert_eq(
     check_codes(
-      b"type Box<a> = Box(a)\nfn spawned() -> Box<Task<Int>> = simulate { Box(task.spawn(|| 1)) }",
+      b"type Box<a> = Box(a)\nfn spawned() -> Box<Task<Int>> / {sim.read} = simulate { Box(task.spawn(|| 1)) }",
     ),
     [b"E0413"],
   )
@@ -9660,14 +9818,14 @@ test "a `Task` in a parameter or a type argument is left to the escape check" {
 test "a closure that captured a task leaves its `simulate` region by its row, and not otherwise" {
   assert_eq(
     refusals(
-      b"fn spawned() -> () -> Int / {task.join} = simulate { let t = task.spawn(|| 1); || task.join(t) }",
+      b"fn spawned() -> () -> Int / {task.join} / {sim.read} = simulate { let t = task.spawn(|| 1); || task.join(t) }",
     ),
     [[b"E0413", b"a task escapes the `simulate` region that spawned it", b"|| task.join(t)"]],
   );
   // The region the closure opens is entered by the task as well.
   assert_eq(
     refusals(
-      b"fn later() -> () -> Int / {sim.read} = simulate { let t = task.spawn(|| 1); || simulate { task.join(t) } }",
+      b"fn later() -> () -> Int / {sim.read} / {sim.read} = simulate { let t = task.spawn(|| 1); || simulate { task.join(t) } }",
     ),
     [
       [b"E0413", b"a task enters a `simulate` region that did not spawn it", b"t"],
@@ -9680,7 +9838,7 @@ test "a closure that captured a task leaves its `simulate` region by its row, an
   );
   assert_eq(
     check_codes(
-      b"fn joined() -> Int = simulate { let t = task.spawn(|| 1); let f = || task.join(t); f() }",
+      b"fn joined() -> Int / {sim.read} = simulate { let t = task.spawn(|| 1); let f = || task.join(t); f() }",
     ),
     [],
   )
@@ -9689,7 +9847,7 @@ test "a closure that captured a task leaves its `simulate` region by its row, an
 test "a task stored in a cell older than its `simulate` region is refused, and in a younger one kept" {
   assert_eq(
     refusals(
-      b"fn stored() -> Option<Task<Int>> = with_cell[r](None) { c -> { simulate { cell_set(c, Some(task.spawn(|| 1))); 0 }; cell_get(c) } }",
+      b"fn stored() -> Option<Task<Int>> / {sim.read} = with_cell[r](None) { c -> { simulate { cell_set(c, Some(task.spawn(|| 1))); 0 }; cell_get(c) } }",
     ),
     [
       [
@@ -9701,43 +9859,44 @@ test "a task stored in a cell older than its `simulate` region is refused, and i
   );
   assert_eq(
     check_codes(
-      b"fn nothing() -> Option<Task<Int>> = None\nfn kept() -> Int = with_cell[r](nothing()) { c -> { let keep = |t: Task<Int>| cell_set(c, Some(t)); simulate { keep(task.spawn(|| 1)); 0 } } }",
+      b"fn nothing() -> Option<Task<Int>> = None\nfn kept() -> Int / {sim.read} = with_cell[r](nothing()) { c -> { let keep = |t: Task<Int>| cell_set(c, Some(t)); simulate { keep(task.spawn(|| 1)); 0 } } }",
     ),
     [b"E0446"],
   );
   assert_eq(
     check_codes(
-      b"fn inside() -> Int = simulate { with_cell[r](None) { c -> { cell_set(c, Some(task.spawn(|| 1))); match cell_get(c) { Some(t) -> task.join(t), None -> 0 } } } }",
+      b"fn inside() -> Int / {sim.read} = simulate { with_cell[r](None) { c -> { cell_set(c, Some(task.spawn(|| 1))); match cell_get(c) { Some(t) -> task.join(t), None -> 0 } } } }",
     ),
     [],
   );
   assert_eq(
     check_codes(
-      b"fn listed() -> Int = { let none = []; let wait = |t| task.join(t); simulate { fold(push(none, task.spawn(|| 1)), 0, |n: Int, t: Task<Int>| n + wait(t)) } }",
+      b"fn listed() -> Int / {sim.read} = { let none = []; let wait = |t| task.join(t); simulate { fold(push(none, task.spawn(|| 1)), 0, |n: Int, t: Task<Int>| n + wait(t)) } }",
     ),
     [],
   )
 }
 
 test "a task from outside a `simulate` region is refused where the region names it or reads it" {
-  assert_eq(refusals(b"fn joined(t: Task<Int>) -> Int = simulate { task.join(t) }"), [
-    [b"E0413", b"a task enters a `simulate` region that did not spawn it", b"t"],
-  ]);
+  assert_eq(
+    refusals(b"fn joined(t: Task<Int>) -> Int / {sim.read} = simulate { task.join(t) }"),
+    [[b"E0413", b"a task enters a `simulate` region that did not spawn it", b"t"]],
+  );
   assert_eq(
     check_codes(
-      b"fn captured(t: Task<Int>) -> Int = simulate { let wait = || task.join(t); wait() }",
+      b"fn captured(t: Task<Int>) -> Int / {sim.read} = simulate { let wait = || task.join(t); wait() }",
     ),
     [b"E0413"],
   );
   assert_eq(
     check_codes(
-      b"fn listed(ts: List<Task<Int>>) -> Int = simulate { fold(ts, 0, |n: Int, t: Task<Int>| n + task.join(t)) }",
+      b"fn listed(ts: List<Task<Int>>) -> Int / {sim.read} = simulate { fold(ts, 0, |n: Int, t: Task<Int>| n + task.join(t)) }",
     ),
     [b"E0413"],
   );
   assert_eq(
     refusals(
-      b"fn read(t: Task<Int>) -> Int = with_cell[r](Some(t)) { c -> simulate { match cell_get(c) { Some(x) -> task.join(x), None -> 0 } } }",
+      b"fn read(t: Task<Int>) -> Int / {sim.read} = with_cell[r](Some(t)) { c -> simulate { match cell_get(c) { Some(x) -> task.join(x), None -> 0 } } }",
     ),
     [[b"E0413", b"a task enters a `simulate` region that did not spawn it", b"cell_get(c)"]],
   )
@@ -9745,18 +9904,20 @@ test "a task from outside a `simulate` region is refused where the region names 
 
 test "a `simulate` region keeps its own tasks, a name it shadows, and a function that only takes one" {
   assert_eq(
-    check_codes(b"fn own() -> Int = simulate { let t = task.spawn(|| 1); task.join(t) }"),
-    [],
-  );
-  assert_eq(
     check_codes(
-      b"fn shadowed(t: Task<Int>) -> Int = task.join(t) + simulate { let t = task.spawn(|| 1); task.join(t) }",
+      b"fn own() -> Int / {sim.read} = simulate { let t = task.spawn(|| 1); task.join(t) }",
     ),
     [],
   );
   assert_eq(
     check_codes(
-      b"fn handed(wait: (Task<Int>) -> Int / {task.join}) -> Int = simulate { wait(task.spawn(|| 1)) }",
+      b"fn shadowed(t: Task<Int>) -> Int / {sim.read, task.join} = task.join(t) + simulate { let t = task.spawn(|| 1); task.join(t) }",
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"fn handed(wait: (Task<Int>) -> Int / {task.join}) -> Int / {sim.read} = simulate { wait(task.spawn(|| 1)) }",
     ),
     [],
   )
@@ -9782,7 +9943,7 @@ test "a task reaching a younger region's cell through a handler around its spawn
   assert_eq(
     check_codes(
       noted(
-        b"fn cycle() -> Int = simulate { with_cell[s](5) { c -> handle { task.join(task.spawn(|| work())) } with { note.say() -> cell_get(c) } } }",
+        b"fn cycle() -> Int / {sim.read} = simulate { with_cell[s](5) { c -> handle { task.join(task.spawn(|| work())) } with { note.say() -> cell_get(c) } } }",
       ),
     ),
     [b"E0446"],
@@ -9809,7 +9970,7 @@ test "a handler around a spawn may answer from a cell the task cannot outlive, o
   assert_eq(
     check_codes(
       noted(
-        b"fn inside() -> Int = with_cell[s](5) { c -> simulate { handle { task.join(task.spawn(|| work())) } with { note.say() -> cell_get(c) } } }",
+        b"fn inside() -> Int / {sim.read} = with_cell[s](5) { c -> simulate { handle { task.join(task.spawn(|| work())) } with { note.say() -> cell_get(c) } } }",
       ),
     ),
     [],
@@ -9835,29 +9996,43 @@ test "a call instantiating a constrained parameter with a function is refused at
   assert_eq(dump, "K;1;X;D;1;!E0206:0:78:82:2:1;=0:78:82:1;=0:0:56:0;")
 }
 
-// The code of each error a program raises, in the order the checker reports them.
-fn codes_across(sources: List<Source>) -> List<Bytes> = {
+// Each error a program raises, in the order the checker reports them.
+fn errors_across(sources: List<Source>) -> List<Diag> = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
-    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let x = expand(r.node, r.p.diags);
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
   });
   let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
-  if len(early) > 0 { map(early, |g: Diag| g.code) } else {
+  if len(early) > 0 { early } else {
     match resolve_modules(
         map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived }),
       ) {
-      Failed(ds) -> map(ds, |g: Diag| g.code),
+      Failed(ds) -> ds,
       Resolved_(x) ->
-        map(
-          filter(dedup_diags(check_program(x.r, x.mods).cx.diags), |g: Diag|
-            g.severity == b"error"),
-          |g: Diag| g.code,
-        ),
+        filter(dedup_diags(check_program(x.r, x.mods).cx.diags), |g: Diag| g.severity == b"error"),
     }
   }
+}
+
+fn codes_across(sources: List<Source>) -> List<Bytes> =
+  map(errors_across(sources), |g: Diag| g.code)
+
+test "a fix spells only what the module can name, so a row it cannot write gets none" {
+  let ds = errors_across([
+    {
+      name: b"base",
+      src: b"pub effect net { write send[c](p: Bytes) -> Unit }\npub fn push() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n",
+    },
+    {
+      name: b"app",
+      src: b"import base (push)\nfn run() -> Unit / {clock.read} = push()\nfn quiet() -> Unit = push()",
+    },
+  ]);
+  assert_eq(map(ds, |d: Diag| d.code), [b"E0302", b"E0302"]);
+  assert_eq(fixes_of(ds), [])
 }
 
 test "a record update takes its shape from the base's inferred type, not from where it was written" {
@@ -9957,7 +10132,7 @@ test "`++` joins two Strings or two Bytes, and refuses one of each" {
 // The label of each `E0205` a one-module program raises.
 fn not_covered(src: Bytes) -> List<Bytes> = {
   let r = parse(src);
-  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  let x = expand(r.node, r.p.diags);
   let d: Expansion = expand_derives(0, b"m", x.module);
   match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
     Failed(_) -> [b"does not resolve"],

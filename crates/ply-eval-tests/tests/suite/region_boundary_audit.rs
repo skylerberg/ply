@@ -217,7 +217,7 @@ const HANDED: &str = r#"
 fn simulated<| e>(on: (Task<Int>) -> Unit / e) -> Unit / {sim.read | e} =
   simulate { on(task.spawn(|| 1)) }
 
-fn spawned() -> Option<Task<Int>> = with_cell[slot](None) { kept -> {
+fn spawned() -> Option<Task<Int>> / {sim.read} = with_cell[slot](None) { kept -> {
   simulated(|t: Task<Int>| cell_set(kept, Some(t)));
   cell_get(kept)
 } }
@@ -252,7 +252,7 @@ fn joined<a>(x: a, wait: (a) -> Int / {task.join}) -> Int / {sim.read} =
     wait(x) + task.join(mine)
   }
 
-pub fn rejoined() -> Int = match spawned() {
+pub fn rejoined() -> Int / {sim.read} = match spawned() {
   Some(t) -> joined(t, |h: Task<Int>| task.join(h)),
   None -> 0,
 }
