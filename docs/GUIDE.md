@@ -1777,6 +1777,7 @@ character), `instant_json` and `duration_json` (nanoseconds), and combinators
 ```ply
 pub nondet effect db {
   read  query[t](s: Stmt, ps: List<Param>)      -> Answer
+  read  batch[t](s: Stmt, each: List<List<Param>>) -> List<Answer>
   write execute[t](s: Stmt, ps: List<Param>)    -> Answer
   write returning[t](s: Stmt, ps: List<Param>)  -> Answer
   write begin(level: Isolation, access: Access) -> Answer
@@ -1815,7 +1816,7 @@ runtime-error code, because a library has no raise of its own to name a code
 with.
 
 A `db` effect is served by `serve`: `with_server(url, size, body)` reads a
-connection string (`server_of`), draws a nonce, and answers the six operations
+connection string (`server_of`), draws a nonce, and answers the seven operations
 over `std.pg` — the pool, the transaction scope and the text of every value are
 the language's, and the host is left with `net`. The effect is nominal, so a
 program that wants a server handles it: `with_server` is how, and
@@ -1838,6 +1839,19 @@ nothing but its own statements. One that waits on anything else — `task.yield`
 between statements while other tasks run, so an operation from a task with no
 transaction is taken for its own, and one performed while two transactions are
 between statements is raised.
+
+`batched(xs, lookup)` answers what `map(xs, lookup)` would, asking the store
+less: each lookup runs until it performs `db.query`, the asks of a round that
+share a statement become one `db.batch`, and the lookups resume with their
+answers, round after round, the way a dataloader does. A lookup's row is
+`{db.query[t]}`, reads alone, which is what lets its asks be answered together
+and in any order. `db.batch` answers each parameter list as its own `db.query`
+would: `serve` sends the statement once per list, joined with `union all` and
+each row marked with the list it answers, inside a savepoint when a transaction
+is open, and asks each list alone when the lists cannot share a statement or
+the server refuses the joined one, so a failure is the one that query would have
+met. A handler that answers `db.query` itself answers `db.batch` too, by asking
+each list in turn when it can do no better.
 
 A connection that fails is class `08`: `08001` it could not be opened, `08006`
 it broke, `08P01` a reply could not be read, `08003` the transaction's
