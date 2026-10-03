@@ -7,9 +7,10 @@
 
 import cli.ply (main)
 import cli.paths
-import cli.program (timed_uncached)
+import cli.program (pkgs_of)
+import cli.sources
+import compiler.pkg
 import compiler.pkg (Supplied)
-import compiler.resolve (Pkg)
 import cli.bootstrap (archive)
 import cli.builder (builder, hermetic_builder)
 import cli.claims (prover, hermetic_prover)
@@ -274,40 +275,37 @@ pub fn seeding_at(dir: String) -> Seeding / {Reached, Shelf} = {
   { seeded: int(at(d, "seeded")), checked: int(at(d, "checked")) }
 }
 
-// A package as the front end publishes it: its prefix and the prefixes it depends on.
+// A package as its manifest declares it: its prefix and the prefixes it depends on.
 pub type Package = { prefix: String, deps: List<String> }
 
-// A load of a package's directory: the package closure it resolves, the root first, and the
-// directory each package of it was read from, the root's first.
+// The package closure of a directory, the root first, and the directory each package of it was
+// read from, the root's first.
 pub type Closure = { packages: List<Package>, dirs: List<String> }
 
-// `dir` loaded as `ply` loads it.
-pub fn loaded_closure(dir: String) -> Closure / {Reached, Shelf} = {
+// `dir`'s packages as `ply` walks them and the compiler's manifest rules settle them, no module
+// checked.
+pub fn loaded_closure(dir: String) -> Closure / {Reached} = {
   let pwd = working();
   handle {
-    let program = timed_uncached([paths::resolve(dir)]).program;
-    match program.whole {
-      Some(w) ->
-        {
-          packages: map(w.packages, |p: Pkg|
-            { prefix: string_of_bytes(p.prefix), deps: map(p.deps, string_of_bytes) }),
-          dirs: fold(
-            program.pkgs.supplied,
-            [string_of_bytes(program.pkgs.root)],
-            |acc: List<String>, s: Supplied| push(acc, string_of_bytes(s.root)),
-          ),
-        },
-      None -> panic("`" ++ dir ++ "` does not load"),
+    let project = sources::load_resolved([paths::resolve(dir)]);
+    let pkgs = pkgs_of(project);
+    let settled = pkg::closure(
+      pkgs,
+      map(project.files, |f: sources::File| bytes_of_string(f.module)),
+    );
+    {
+      packages: map(settled.packages, |p: pkg::Package|
+        { prefix: string_of_bytes(p.prefix), deps: map(p.deps, string_of_bytes) }),
+      dirs: fold(pkgs.supplied, [string_of_bytes(pkgs.root)], |acc: List<String>, s: Supplied|
+        push(acc, string_of_bytes(s.root))),
     }
   } with {
     env.pwd[sys]() -> pwd,
-    fs.list_dir[shelf](_) -> shelf_names(),
-    fs.read_file[shelf](name) -> shelf_file(name),
   }
 }
 
-// The package closure a load of `dir` resolves, the root first.
-pub fn closure_of(dir: String) -> List<Package> / {Reached, Shelf} = loaded_closure(dir).packages
+// The package closure of `dir`, the root first.
+pub fn closure_of(dir: String) -> List<Package> / {Reached} = loaded_closure(dir).packages
 
 // --- The shipped modules -----------------------------------------------------
 
@@ -327,15 +325,38 @@ pub fn shelved() -> List<Source> / {Shelf} =
   map(shipped.names(), |n: String|
     {
       path: n ++ ".ply",
-      text: match shipped.module(n) { Some(b) -> string_of_bytes(b), None -> "" },
+      text: match shelf_module(n) { Some(b) -> string_of_bytes(b), None -> "" },
     })
 
 // This binary's stamps, so a store filed in process and one a spawned `ply` files agree.
 fn shelf_file(name: String) -> Option<Bytes> / {Shelf} =
   if name == "stamps" { Some(bytes_of_string(shipped.stamps())) }
   else if string_ends_with(name, ".ply") {
-    shipped.module(string_slice(name, 0, string_len(name) - 4))
+    shelf_module(string_slice(name, 0, string_len(name) - 4))
   } else { None }
+
+// The shelf's std is served from the tree so a pass is keyed on its bytes: `shipped` reaches no key.
+fn std_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../ply-std/ply")
+
+fn shelf_module(name: String) -> Option<Bytes> / {Shelf} =
+  if string_starts_with(name, "std.") {
+    let file = string_slice(name, 4, string_len(name)) ++ ".ply";
+    match filter(std_tree(), |f: { name: String, bytes: Bytes }| f.name == file) {
+      [f, ..] -> Some(f.bytes),
+      [] -> None,
+    }
+  } else { shipped.module(name) }
+
+// Each `std.` module the binary ships other than as its tree holds it, and each it lacks.
+pub fn std_drift() -> List<String> / {Shelf} = {
+  let named = filter(shipped.names(), |n: String| string_starts_with(n, "std."));
+  let unshipped = filter(std_tree(), |f: { name: String, bytes: Bytes }|
+    len(filter(named, |n: String| n ++ ".ply" == "std." ++ f.name)) == 0);
+  concatenated(
+    filter(named, |n: String| shipped.module(n) != shelf_module(n)),
+    map(unshipped, |f: { name: String, bytes: Bytes }| "std." ++ f.name),
+  )
+}
 
 pub fn version() -> String / {Shelf} = shipped.version()
 
@@ -363,7 +384,7 @@ pub fn in_process_digest() -> String / {Shelf} =
             bytes_concat_all([
               bytes_of_string(n),
               b"\0",
-              bytes_blake3(match shipped.module(n) { Some(b) -> b, None -> b"" }),
+              bytes_blake3(match shelf_module(n) { Some(b) -> b, None -> b"" }),
             ])),
           bytes_of_string(shipped.version()),
         ),
