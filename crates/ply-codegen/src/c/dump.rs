@@ -19,11 +19,6 @@ const ANSWER: &str = "the front end's answer";
 /// The module index of a span outside every module.
 const NO_MODULE: u32 = u32::MAX;
 
-/// A table under its name, or under the name the checked-in builder's answer still gives it.
-fn renamed<'v>(d: AnswerValue<'v>, name: &str, was: &str) -> Result<AnswerValue<'v>, Error> {
-    d.field(name).or_else(|_| d.field(was))
-}
-
 /// `sources[i]` is the source a module index `i` names: the program's own modules, the shipped
 /// ones pulled after them, then any manifest the answer places past those.
 pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
@@ -51,7 +46,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
             digest: p.field("digest")?.utf8()?.to_string(),
         })
     })?;
-    front.module_packages = renamed(d, "module_packages", "mod_pkg")?.items(|i| i.number())?;
+    front.module_packages = d.field("module_packages")?.items(|i| i.number())?;
     // The committed emitter answering for a stage may predate embeds, and embedded nothing.
     if let Ok(embeds) = d.field("embeds")
         && embeds.list()?.len() > 0
@@ -114,7 +109,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
             k.field("key")?.utf8()?.to_string(),
         );
     }
-    front.emitter_roots = renamed(d, "emitter_roots", "emit_roots")?.items(|e| {
+    front.emitter_roots = d.field("emitter_roots")?.items(|e| {
         Ok(EmitterRoot {
             root: Symbol::new(e.field("root")?.utf8()?),
             arity: e.field("arity")?.number()?,
@@ -125,7 +120,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
             witnesses: e.field("witnesses")?.items(|w| w.number())?,
         })
     })?;
-    for k in renamed(d, "emitter_ctors", "emit_ctors")?.list()? {
+    for k in d.field("emitter_ctors")?.list()? {
         let name = Symbol::new(k.field("name")?.utf8()?);
         front
             .ctor_carries
