@@ -11,8 +11,9 @@ import compiler.front (DefInterface, KnownTestRow, Filing, FiledModule, FiledEnt
                        def_interface_bin, decl_interface_bin, known_test_row_bin)
 import compiler.hash (Prior, hex, prior_bin)
 import compiler.resolve (Diag)
-import compiler.unit (emitter_identity)
+import compiler.unit (identity_of, unit_roots)
 import paths
+import semantics
 import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
 import store.tables (Cache, Stamps, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind,
                      KFn, KType, KEffect, Package, Body, open_cache, flush_cache, fingerprint,
@@ -67,31 +68,53 @@ pub fn place_of(paths: List<paths::Resolved>, stamps: Stamps) -> Place =
     None -> { label: "cwd", dir: ".ply-cache", root: ".", stamps: stamps },
   }
 
-// The launcher lays `stamps` beside the shelf as `name digest` lines. A pass is also the emitter's
-// that compiled what ran, which the shelf alone says, so the runtime stamp takes in its identity.
-pub fn shelf_stamps() -> Stamps / {fs.list_dir[shelf], fs.read_file[shelf], abort.raise} =
-  match fs.read_file[shelf]("stamps") {
-    None -> panic("the shelf carries no stamps; the launcher lays them out beside the modules"),
-    Some(b) -> {
-      let launched = stamps_of(string_of_bytes_lossy(b));
-      let emitter = emitter_identity(shelf_names(), |n: String| fs.read_file[shelf](n ++ ".ply"));
-      {
-        ..launched,
-        runtime: string_of_bytes(
-          hex(blake3(bytes_concat_all([bytes_of_string(launched.runtime), b"\x00", emitter]))),
-        ),
-      }
-    },
+// The definitions a front-end entry is a function of besides its own key: the analysis that
+// answers it, what the front end files of one, and the load that reads and files the store.
+fn front_roots() -> List<Bytes> =
+  [b"front.analyse_pulling_std_with", b"front.filing", b"loads.known", b"loads.file"]
+
+// The definitions a pass or a claim's evidence is a function of besides its own key: the runs that
+// decide and file them, and what makes the unit they run in.
+fn verdict_roots() -> List<Bytes> =
+  fold(
+    unit_roots(),
+    [b"tests.selected", b"prove.run", b"review.run"],
+    |acc: List<Bytes>, r: Bytes| push(acc, r),
+  )
+
+// The launcher lays two files beside the shelf: `stamps`, the runtime's side of each group as
+// `name digest` lines, and `definitions`, each definition of this program and its hash.
+pub fn shelf_stamps() -> Stamps / {fs.read_file[shelf], abort.raise} =
+  match ((fs.read_file[shelf]("stamps"), fs.read_file[shelf]("definitions"))) {
+    (Some(stamps), Some(definitions)) ->
+      stamped(stamps_of(string_of_bytes_lossy(stamps)), definitions),
+    _ ->
+      panic(
+        "the shelf carries no stamps or no definitions; the launcher lays both out beside the modules",
+      ),
   }
 
-// The modules the shelf lays out, by name.
-fn shelf_names() -> List<String> / {fs.list_dir[shelf], abort.raise} =
-  match fs.list_dir[shelf](".") {
-    None -> [],
-    Some(files) ->
-      map(filter(files, |f: String| string_ends_with(f, ".ply")), |f: String|
-        string_slice(f, 0, string_len(f) - 4)),
+// A group's stamp: the runtime's side of it and the program's, which is the definitions that
+// compute what the group holds. A pass is also what its test's hash means.
+pub fn stamped(launched: Stamps, definitions: Bytes) -> Stamps / {abort.raise} = {
+  let over = |parts: List<Bytes>|
+    string_of_bytes(
+      hex(blake3(bytes_concat_all(map(parts, |part: Bytes| bytes_concat(part, b"\x00"))))),
+    );
+  {
+    frontend: over([
+      b"ply.stamp.frontend.4",
+      bytes_of_string(launched.frontend),
+      identity_of(definitions, front_roots()),
+    ]),
+    runtime: over([
+      b"ply.stamp.runtime.4",
+      bytes_of_string(launched.runtime),
+      identity_of(definitions, verdict_roots()),
+      bytes_of_string(semantics::version()),
+    ]),
   }
+}
 
 pub fn stamps_of(text: String) -> Stamps / {abort.raise} =
   fold(string_split(text, "\n"), { frontend: "", runtime: "" }, |s: Stamps, line: String|
@@ -427,6 +450,35 @@ pub fn file<[r]>(
 }
 
 // --- Tests ------------------------------------------------------------------
+
+// Every root a stamp names and one definition none does, each under a hash of its own, with
+// `moved` under another.
+fn definitions_with(moved: Bytes) -> Bytes / {abort.raise} = {
+  let roots = fold(verdict_roots(), front_roots(), |acc: List<Bytes>, r: Bytes| push(acc, r));
+  fold(push(roots, b"other.unrelated"), b"", |acc: Bytes, root: Bytes|
+    bytes_concat_all([
+      acc,
+      root,
+      b" ",
+      if root == moved { b"moved" } else { hex(blake3(root)) },
+      b"\n",
+    ]))
+}
+
+test "a group's stamp moves with a definition that computes what it holds, and with no other" {
+  let launched = { frontend: "evaluator", runtime: "runtime" };
+  let now = stamped(launched, definitions_with(b""));
+  assert_eq(stamped(launched, definitions_with(b"other.unrelated")), now);
+  let filing = stamped(launched, definitions_with(b"front.filing"));
+  assert(filing.frontend != now.frontend, Some("a front-end root moved and its stamp did not"));
+  assert_eq(filing.runtime, now.runtime);
+  let deciding = stamped(launched, definitions_with(b"tests.selected"));
+  assert_eq(deciding.frontend, now.frontend);
+  assert(deciding.runtime != now.runtime, Some("a verdict's root moved and its stamp did not"));
+  let another = stamped({ frontend: "evaluator", runtime: "another" }, definitions_with(b""));
+  assert_eq(another.frontend, now.frontend);
+  assert(another.runtime != now.runtime, Some("the runtime moved and its stamp did not"))
+}
 
 test "the shelf's stamps are read a name to a line, and a line naming nothing is passed over" {
   assert_eq(stamps_of("frontend aa\nruntime bb\n"), { frontend: "aa", runtime: "bb" });
