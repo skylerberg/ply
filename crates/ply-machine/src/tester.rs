@@ -9,12 +9,12 @@
 
 use crate::hosts::{self, Hosts, Lent};
 use crate::payload::{count, diags_value, field_of, json, option, raised_value, record, strings};
-use crate::support::{build_backend_over, module_texts, select_profile};
+use crate::support::{select_profile, unit_of};
 use crate::testrun::{
     Executed, Executor, Hosting, Interleaved, Use, executed, interleaved, status_word,
 };
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
-use ply_eval::{DefHash, Diagnostic, Seed, Span, Value as PlyValue, codes};
+use ply_eval::{Diagnostic, Seed, Span, Value as PlyValue, codes};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
@@ -100,7 +100,6 @@ impl Session {
             hermetic,
             options: Mutex::new(TestOptions::default()),
             run: RwLock::new(Run::default()),
-            warm: Mutex::new(None),
         }))
     }
 
@@ -137,15 +136,6 @@ struct Site {
     options: Mutex<TestOptions>,
     /// The run in progress, which every thread the program runs a test on reads.
     run: RwLock<Run>,
-    /// The compiled program the last run's first unit was, kept for a later run over the same
-    /// definitions: a `--watch` save that moved nothing compiles nothing.
-    warm: Mutex<Option<Warm>>,
-}
-
-struct Warm {
-    /// [`ply_eval::Front::hashes_digest`], which a machine checks the unit against.
-    key: DefHash,
-    provider: &'static dyn ply_eval::Provider,
 }
 
 #[derive(Default)]
@@ -181,7 +171,9 @@ impl HostHandler for Site {
             }
             "unit" => self.unit(
                 arg(req, 0)?,
-                arg(req, 1)?.as_bool(span, "whether to build")?,
+                crate::payload::option_of(arg(req, 1)?, "the unit's C", span)?
+                    .map(|c| c.as_bytes(span, "the unit's C").map(|b| &b[..]))
+                    .transpose()?,
                 arg(req, 2)?.as_bool(span, "whether the unit reaches the binding")?,
                 span,
             )?,
@@ -241,12 +233,13 @@ fn err(value: PlyValue) -> PlyValue {
 // --- The units and the binding -------------------------------------------------
 
 impl Site {
-    /// A program the CLI ran the front end over, made a unit tests can run in: the loaded program,
-    /// a mutant of it, or a mixture of two of its eras.
+    /// A program the CLI ran the front end over and produced the C of, made a unit tests can run
+    /// in: the loaded program, a mutant of it, or a mixture of two of its eras. `None` builds
+    /// nothing, for a run that executes nothing.
     fn unit(
         &self,
         front: &PlyValue,
-        build: bool,
+        unit: Option<&[u8]>,
         hosted: bool,
         span: Span,
     ) -> Result<PlyValue, Diagnostic> {
@@ -269,20 +262,10 @@ impl Site {
             Ok(loaded) => loaded,
             Err(refused) => return Ok(err(diags_value(&refused.diagnostics))),
         };
-        let first = self
-            .run
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .units
-            .is_empty();
         // Compiled outside the lock: a test of an earlier unit may be running meanwhile.
-        let provider = if !build {
-            None
-        } else {
-            match self.provider(&loaded, first) {
-                Ok(provider) => Some(provider),
-                Err(diagnostic) => return Ok(err(diags_value(&[diagnostic]))),
-            }
+        let provider = match unit.map(|text| unit_of(&loaded.front, text)).transpose() {
+            Ok(provider) => provider,
+            Err(diagnostic) => return Ok(err(diags_value(&[diagnostic]))),
         };
         let mut run = self.run.write().unwrap_or_else(|e| e.into_inner());
         run.units.push(Arc::new(Unit {
@@ -291,34 +274,6 @@ impl Site {
             hosted,
         }));
         Ok(ok(count(run.units.len() - 1)))
-    }
-
-    /// The first unit of a run reuses the last run's compiled program when no definition moved.
-    fn provider(
-        &self,
-        loaded: &crate::load::Loaded,
-        first: bool,
-    ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-        if self.hermetic {
-            return build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources));
-        }
-        let mut warm = lock(&self.warm);
-        if first
-            && let Some(held) = warm.as_ref()
-            && held.key == loaded.front.hashes_digest
-            && held.provider.relocate(&loaded.front, &loaded.sources)
-        {
-            return Ok(held.provider);
-        }
-        let provider =
-            build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources))?;
-        if first {
-            *warm = Some(Warm {
-                key: loaded.front.hashes_digest,
-                provider,
-            });
-        }
-        Ok(provider)
     }
 
     /// The host binding over the first unit: the configuration, the programs `--exec` names, the
