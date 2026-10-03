@@ -22,6 +22,7 @@ const MAP: u8 = 10;
 const RECORD: u8 = 11;
 const CTOR: u8 = 12;
 const CHAR: u8 = 13;
+const ARRAY: u8 = 14;
 
 pub fn encode(v: &Value) -> Result<Vec<u8>, String> {
     let mut e = Encoder {
@@ -95,6 +96,13 @@ impl<'v> Encoder<'v> {
             }
             Value::List(items) => {
                 self.out.push(LIST);
+                self.varint(items.len() as u64);
+                for item in items.iter() {
+                    self.value(item)?;
+                }
+            }
+            Value::Array(items) => {
+                self.out.push(ARRAY);
                 self.varint(items.len() as u64);
                 for item in items.iter() {
                     self.value(item)?;
@@ -206,6 +214,14 @@ impl Decoder<'_> {
                     items.push(self.value()?);
                 }
                 Value::List(List::from(items))
+            }
+            ARRAY => {
+                let n = self.count()?;
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.value()?);
+                }
+                Value::array(items)
             }
             MAP => {
                 let n = self.count()?;
