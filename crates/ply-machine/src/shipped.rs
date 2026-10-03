@@ -65,6 +65,7 @@ impl HostHandler for Shipped {
                         crate::payload::record(vec![
                             ("name", PlyValue::bytes(b.name())),
                             ("arity", PlyValue::Int(b.arity().1 as i64)),
+                            ("raises", PlyValue::Bool(b.raises())),
                         ])
                     })
                     .collect(),

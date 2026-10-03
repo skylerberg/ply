@@ -186,9 +186,12 @@ Loosest to tightest; all binary operators are left-associative:
   by scalar value; order anything else with `compare`. Arithmetic on a `Char` is
   `E0201`: go through `int_of_char`.
 * Both operands have one type; there is no widening (`U8 + U16` is `E0201`).
-* Arithmetic is checked: overflow, division by zero, and a shift count that is
-  negative or not less than the type's width raise `E0502`. `<<` discards
-  shifted-out bits; `wrap_*` wrap (§12.3).
+* Arithmetic is checked. A `/` or `%` whose divisor is zero raises (§6.8), so
+  either puts `abort.raise` in the row unless its divisor is a literal other
+  than zero or its operands are `Float`s. Overflow and a shift count that is
+  negative or not less than the type's width are the machine's limit, as the
+  call ceiling is: they end the run (`E0502`) and are in no row. `<<` discards
+  shifted-out bits; `wrap_*` wrap and `checked_*` answer `None` (§12.3).
 * `/` on `Decimal` is `E0209`; use `decimal_div`. `%` is allowed.
 * `&&`/`||` short-circuit. `&` `|` `^` `~` are integer-only and act at the
   type's own width (`~0u8` is `255u8`). `>>` is arithmetic, `>>>` logical.
@@ -412,7 +415,7 @@ There is no numeric tower. An operator's operand type is settled from the whole
 definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
 operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
 code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12.3). `u32_of_int` and its
-siblings raise when the value does not fit (mask to truncate:
+siblings raise (§6.8) when the value does not fit (mask to truncate:
 `u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
@@ -510,7 +513,8 @@ comparisons: `+`, `-`, `*`, `%`, unary `-`, `<` and the rest, and
 bit operators. A call fills `a` with one of the numeric types — `Int`, the
 fixed-width integers, `Float` and `Decimal` (`integer`: the first two) — or with
 a parameter of its own the same constraint is on; any other type is `E0201`.
-Each operator raises where it raises at that type, a width's overflow included:
+Each operator fails where it fails at that type: a `/` or `%` by zero raises
+(§6.8), and a width's overflow ends the run:
 
 ```ply
 fn sum<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)
@@ -559,9 +563,10 @@ checks see it.
 
 ### 4.7 Function types, and what is written
 
-`(A, B) -> C` is pure; `(A) -> B / {db.read[users]}` and `(A) -> B / e` carry
-rows. With no `/` the row is empty, in a signature as in a declared type. A
-function value may perform less than the type it meets says (§6.2).
+`(A, B) -> C` is pure and cannot raise; `(A) -> B / {abort.raise}`,
+`(A) -> B / {db.read[users]}` and `(A) -> B / e` carry rows. With no `/` the row
+is empty, in a signature as in a declared type. A function value may perform less
+than the type it meets says (§6.2).
 Functions cannot be compared, encoded, ordered or used as map keys.
 
 * **Written:** every parameter and return type of a top-level `fn` (`E0126`),
@@ -600,7 +605,7 @@ fn sum_two(input: Bytes) -> Int = {
 ```
 
 A record pattern names every field or ends with `..` (`E0201`). A `let` whose
-pattern does not match raises; `let <pattern> = <expr> else { .. };` says what
+pattern does not match raises (§6.8); `let <pattern> = <expr> else { .. };` says what
 happens instead. Where the pattern misses, the `else` block is the value of the
 block the statement is in, and the statements after it do not run; it has that
 block's type and sees none of the pattern's names. `?` in the `else` exits as it
@@ -1089,12 +1094,25 @@ fn digit_or(b: Int, fallback: Int) -> Int / {} =
 
 The prelude declares `effect abort { read raise<a>(message: String) -> a }`.
 `abort.raise(m)` puts `abort.raise` in the row as any perform does, and does not
-come back. A clause for it has the `handle`'s type: its value is the `handle`'s,
-`return` is not applied to it, and it cannot bind `resume` (`E0201`). It runs
-outside its `handle`, once the body is abandoned and the regions the body opened
-are closed, so a raise in another clause goes to a `handle` further out than the
-one whose clause raised. A raise no clause answers ends the run, as `panic`
-does (`E0502`).
+come back. So does everything else that can fail on a value it is given: `panic`,
+`assert` and `assert_eq`, a builtin outside what it is defined for (§12), a `/`
+or `%` by zero (§2.4), a `let` whose pattern misses (§5.1), an `iterate` past
+its budget, a `task.join` of a cancelled task, a `task.channel` of a negative
+capacity and a `random.below` of a bound below one (§9). What a literal argument
+settles does not raise: a divisor other than zero, a capacity or bound in range,
+and a narrowing such as `u8_of_int(200)` of a value its type holds. A signature
+that leaves `abort.raise` out of its row where its body can raise is `E0302`,
+which names the operation and offers the row to write. Overflow, the call
+ceiling and a spent step budget end the run whatever the row says.
+
+A clause for `abort.raise` has the `handle`'s type: its value is the `handle`'s,
+`return` is not applied to it, and it cannot bind `resume` (`E0201`). Its
+parameter is the message: `panic`'s argument, or what the run would otherwise
+have reported, a value it names told by its kind. The clause runs outside its
+`handle`, once the body is abandoned and the regions the body opened are closed,
+so a raise in another clause goes to a `handle` further out than the one whose
+clause raised. A raise no clause answers ends the run: `E0501` for an assertion
+and `E0502` for anything else.
 
 A `parallel` branch's raise is answered around the block. A task's raise goes
 to the task's own `handle`s and then to those around its `simulate` region,
@@ -1205,7 +1223,8 @@ effect, or write `test/nondet "label" { ... }`, which is never cached.
 
 Tests whose footprints do not conflict run concurrently, under `parallel`
 blocks (§5.9) on one thread per core; a test whose effects are all discharged in
-a region conflicts with nothing. `--jobs N`/`-j` deals them into `N` lanes, each
+a region conflicts with nothing. A raise is in no footprint, since the run
+answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, each
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.
 
@@ -1331,7 +1350,7 @@ it waits on is let go, and it performs nothing more but the `release` of each
 it holds. The cancel answers `false` for a task that had
 already ended and leaves its answer alone. `task.await(t)` is a join that answers
 `Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
-cancelled task has nothing to answer and raises `E0502`. A task cannot cancel
+cancelled task has nothing to answer and raises (§6.8). A task cannot cancel
 itself or the region's body. A deadline is the two together: one task sleeps and
 cancels the other, which a third awaits. Every step a cancelled task took is read
 against the cancel, so the search tries cancelling it earlier and later.
@@ -1343,7 +1362,7 @@ handed over, and a receive waits while it is empty and answers the oldest value
 sent. `task.close(c)` ends sending: a waiting receiver hears `None` and a waiting
 sender `false`, a later send answers `false` without sending, and receives take
 what was queued before the close, then `None`. Closing twice changes nothing,
-and a negative capacity raises `E0502`. Cancelling a task that waits on a
+and a negative capacity raises (§6.8). Cancelling a task that waits on a
 channel lets go of its wait, and a value it was sending is dropped. Every
 operation on one channel is ordered against every other on it, so the search
 tries each order two senders or two receivers could take. A race is one channel:
@@ -1542,7 +1561,8 @@ the `derive` is `E0206`; `show` imports `std.show` itself.
 
 In scope everywhere; a module may shadow any except `compare_values` and
 `map_of_entries`, which the map and set literals are written in (`E0105`).
-Out-of-range indexes and slices raise `E0502` unless noted; nothing is clamped.
+Out-of-range indexes and slices raise (§6.8) unless noted; nothing is clamped, and
+a builtin that can raise carries `abort.raise` in its row.
 `ply doc NAME` prints any of these from the compiler's own table, which is the
 authority when this page and it disagree.
 
@@ -1552,13 +1572,13 @@ authority when this page and it disagree.
 | --- | --- |
 | `assert(cond: Bool, message: Option<String> = None) -> Unit` | `E0501` |
 | `assert_eq<a>(actual: a, expected: a) -> Unit` | `E0501` |
-| `panic<a>(message: String) -> a` | `E0502`; no `handle` answers it, unlike `abort.raise` (§6.8) |
+| `panic<a>(message: String) -> a` | raises `message` (§6.8); unanswered, `E0502` |
 | `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
 | `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
 | `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
 | `min<a>(a: a, b: a) -> a`, `max` | in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)` |
-| `numeric_of_int<a>(n: Int) -> a` | `n` at the `numeric` type the call is at (§4.5); `E0502` past a width's range |
+| `numeric_of_int<a>(n: Int) -> a` | `n` at the `numeric` type the call is at (§4.5); raises past a width's range, which a literal in `0..=127` never is |
 | `cell_get<a>(c: Cell<a>) -> a` | |
 | `cell_set<a>(c: Cell<a>, v: a) -> Unit` | |
 | `cell_update<a \| e>(c: Cell<a>, f: (a) -> a / e) -> Unit / e` | the cell is unreadable while `f` runs |
@@ -2760,8 +2780,8 @@ pub fn ilog2(n: Int) -> Int
 ```
 
 `min` and `max` are prelude builtins and stay there. `abs`, `sign`, `clamp`,
-`sum` and `product` take any numeric type (§4.5) and raise where its operators
-raise, so `abs(min_int())` and a width's overflowing `sum` raise; an empty
+`sum` and `product` take any numeric type (§4.5) and cannot raise:
+`abs(min_int())` and a width's overflowing `sum` end the run (§2.4); an empty
 list's `sum` is zero and its `product` one. The rest is `Int`. `gcd` and `lcm`
 are never negative, and `gcd(0, 0)` is `0`. `is_prime` says no for zero, one and
 every negative, `factorial` is `1` at and below one, `isqrt` is the greatest
@@ -3378,7 +3398,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest, with no module parsed or checked; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |

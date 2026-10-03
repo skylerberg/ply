@@ -8,8 +8,7 @@ use ply_machine::driver::{LoadedAnalysis, loaded_analysis_of};
 use ply_machine::reused::{self, Walked};
 use std::path::Path;
 
-const PULLING: &str =
-    "import std.json (Null, to_string)\n\nfn main() -> Int = string_len(to_string(Null))\n";
+const PULLING: &str = "import std.json (Null, to_string)\n\nfn main() -> Int / {abort.raise} = string_len(to_string(Null))\n";
 
 /// The C a load that held was handed, filed beside its front.
 const UNIT: &[u8] = b"/* the unit */\n";

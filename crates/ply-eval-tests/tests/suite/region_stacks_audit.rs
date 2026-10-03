@@ -13,7 +13,7 @@ effect gen {
   write give(v: Int) -> Unit
 }
 
-effect abort {
+effect halt {
   write stop(code: Int) -> Int
 }
 
@@ -28,7 +28,7 @@ pub fn raised(n: Int) -> Int =
     handle {
       with_cell[acc](n) { c -> {
         gen.step();
-        abort.stop(cell_get(c))
+        halt.stop(cell_get(c))
       } }
     } with {
       gen.step() resume k -> {
@@ -37,10 +37,10 @@ pub fn raised(n: Int) -> Int =
       },
     }
   } with {
-    abort.stop(code) resume k -> code,
+    halt.stop(code) resume k -> code,
   }
 
-pub fn escaped(n: Int) -> Int / {sim.read} =
+pub fn escaped(n: Int) -> Int / {sim.read, abort.raise} =
   with_cell[opened](0) { opened -> handle {
     simulate {
       let t = task.spawn(|| with_cell[mine](1) { a -> {
@@ -52,10 +52,10 @@ pub fn escaped(n: Int) -> Int / {sim.read} =
         task.yield();
         Continue(i + 1)
       });
-      abort.stop(n) + task.join(t)
+      halt.stop(n) + task.join(t)
     }
   } with {
-    abort.stop(code) resume k -> code,
+    halt.stop(code) resume k -> code,
   } }
 
 pub fn stopped(n: Int) -> Int =
@@ -85,7 +85,7 @@ pub fn resumed(n: Int) -> Int =
     } },
   }
 
-pub fn handshake(n: Int) -> Int / {sim.read} =
+pub fn handshake(n: Int) -> Int / {sim.read, abort.raise} =
   with_cell[opened](0) { opened -> with_cell[closed](0) { closed -> simulate {
     let held = with_cell[root](n) { b -> {
       let t = task.spawn(|| with_cell[mine](1) { a -> {
@@ -106,7 +106,7 @@ pub fn handshake(n: Int) -> Int / {sim.read} =
     held.own + task.join(held.task)
   } } }
 
-pub fn unwound(n: Int) -> Int / {sim.read} =
+pub fn unwound(n: Int) -> Int / {sim.read, abort.raise} =
   with_cell[go](0) { go -> with_cell[opened](0) { opened -> with_cell[closed](0) { closed -> simulate {
     let t = task.spawn(|| {
       iterate(0, 1000, |n: Int| if cell_get(go) == 1 { Stop(n) } else {
@@ -128,9 +128,9 @@ pub fn unwound(n: Int) -> Int / {sim.read} =
         task.yield();
         Continue(n + 1)
       });
-      with_cell[gone](n) { g -> abort.stop(cell_get(g)) }
+      with_cell[gone](n) { g -> halt.stop(cell_get(g)) }
     } with {
-      abort.stop(code) resume k -> code,
+      halt.stop(code) resume k -> code,
     };
     cell_set(closed, 1);
     got + task.join(t)
@@ -223,7 +223,7 @@ pub fn nested(n: Int) -> Int / {cell.read[log], cell.write[slot]} = with_cell[sl
   n + first + second
 } }
 
-pub fn tasked(n: Int) -> Int / {sim.read} = with_cell[slot](Nothing) { s -> {
+pub fn tasked(n: Int) -> Int / {sim.read, abort.raise} = with_cell[slot](Nothing) { s -> {
   let first = with_cell[log](41) { c -> simulate {
     let t = task.spawn(|| handle {
       let b = amb.flip();

@@ -15,7 +15,7 @@ import std.db (db, serve, server_of, stmt, transaction, is_retryable, Rows, Coun
 
 // The driver over the same script: what a connection string asks of every connection it opens.
 pub fn told(url: String) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match server_of(url) {
     Err(why) -> Err(why),
     Ok(cfg) ->
@@ -28,7 +28,7 @@ pub fn told(url: String) -> Result<String, String>
   }
 
 pub fn ask(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
@@ -41,7 +41,7 @@ pub fn ask(host: String, port: Int) -> Result<String, String>
   }
 
 pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match extended_query[link](session, "select $1", [Some(value)], default_client()) {
@@ -55,7 +55,7 @@ pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String
 
 // A transaction the server refuses to commit, run again while the refusal says to.
 pub fn retried(url: String) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match server_of(url) {
     Err(why) -> Err(why),
     Ok(cfg) -> Ok(serve(cfg, 1, "test-nonce", || attempts(3, ""))),
@@ -75,7 +75,7 @@ fn attempts(left: Int, seen: String) -> String / {db.execute[items], db.abort, d
 // A refusal is not the end of the connection: the second query runs on the session the first
 // one came back with.
 pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select nope", default_client()) {
@@ -99,7 +99,7 @@ pub fn ask_scram(
   user: String,
   password: String,
   nonce: String,
-) -> Result<String, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+) -> Result<String, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match connect[link](host, port, user, "ply", [], Some(password), nonce, default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
@@ -111,7 +111,7 @@ pub fn ask_scram(
     },
   }
 
-fn first_text(answer: Answer) -> String =
+fn first_text(answer: Answer) -> String / {abort.raise} =
   match answer.rows {
     [] -> "no rows",
     [row, ..tail] -> match row {
