@@ -1802,9 +1802,16 @@ fn option(v: Option<Value>) -> Value {
     }
 }
 
-/// Every NaN a float function answers is this one, so its bits are the same on every machine.
+/// The NaN every float function answers, whatever NaN the machine produced.
+pub const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+
+/// Decided on the bits: the compiler may treat any NaN as any other, so a float-level choice
+/// between two NaNs can be folded away and an x86 sqrt's negative NaN kept.
 fn canonical(x: f64) -> f64 {
-    if x.is_nan() { f64::NAN } else { x }
+    let bits = x.to_bits();
+    let nan =
+        bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && bits & 0x000F_FFFF_FFFF_FFFF != 0;
+    f64::from_bits(if nan { CANONICAL_NAN_BITS } else { bits })
 }
 
 fn float1(x: &Value, span: Span, what: &str, f: fn(f64) -> f64) -> Result<Value, Diagnostic> {

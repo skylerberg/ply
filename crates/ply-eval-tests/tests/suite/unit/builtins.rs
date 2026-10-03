@@ -947,7 +947,13 @@ fn the_float_functions_answer_the_bits_the_compiled_tier_pins() {
         (Builtin::Asin, &[0.5], 0x3FE0_C152_382D_7366),
         (Builtin::Log10, &[2.0], 0x3FD3_4413_509F_79FF),
         (Builtin::Log2, &[10.0], 0x400A_934F_0979_A371),
-        (Builtin::Sqrt, &[-1.0], f64::NAN.to_bits()),
+        (Builtin::Sqrt, &[-1.0], CANONICAL_NAN_BITS),
+        (Builtin::Ln, &[-1.0], CANONICAL_NAN_BITS),
+        (
+            Builtin::Pow,
+            &[f64::from_bits(0xFFF8_0000_0000_0001), 2.0],
+            CANONICAL_NAN_BITS,
+        ),
         (Builtin::Ceil, &[-0.5], (-0.0f64).to_bits()),
     ];
     for (b, args, want) in cases {
