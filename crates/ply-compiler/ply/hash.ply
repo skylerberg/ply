@@ -1766,7 +1766,31 @@ fn slots(order: List<Int>) -> Map<Int, Int> =
   fold(range(0, len(order)), map_new(), |acc: Map<Int, Int>, i: Int|
     map_insert(acc, at(order, i), i))
 
-// Two passes: the first yields the references that fix the effect enumeration, the second writes the bytes.
+// The effect enumeration an item is written under, fixed by the references a pass with nothing known
+// yields.
+fn slots_of(index: Index, module: Int, scc: Sccs, encode: (Encoder) -> Encoder) -> Map<Int, Int> =
+  slots(
+    effect_order(
+      index,
+      finish(encode(new_encoder(index, module, map_new(), map_new(), map_new()))).refs,
+      scc,
+      None,
+      [],
+    ),
+  )
+
+fn encode_slotted(
+  index: Index,
+  module: Int,
+  hashes: Map<Int, Bytes>,
+  effects: Map<Int, Int>,
+  by_name: Bool,
+  encode: (Encoder) -> Encoder,
+) -> Finished = {
+  let z: Encoder = new_encoder(index, module, hashes, map_new(), effects);
+  finish(encode({ ..z, by_name: by_name }))
+}
+
 fn encode_item(
   index: Index,
   module: Int,
@@ -1774,12 +1798,8 @@ fn encode_item(
   hashes: Map<Int, Bytes>,
   by_name: Bool,
   encode: (Encoder) -> Encoder,
-) -> Finished = {
-  let first: Finished = finish(encode(new_encoder(index, module, map_new(), map_new(), map_new())));
-  let effects = slots(effect_order(index, first.refs, scc, None, []));
-  let z: Encoder = new_encoder(index, module, hashes, map_new(), effects);
-  finish(encode({ ..z, by_name: by_name }))
-}
+) -> Finished =
+  encode_slotted(index, module, hashes, slots_of(index, module, scc, encode), by_name, encode)
 
 fn sketch_lt(a: Bytes, ia: Int, b: Bytes, ib: Int) -> Bool = bytes_lt(a, b) || (a == b && ia < ib)
 
@@ -2105,10 +2125,10 @@ fn hashed_over(
     index.laws,
     { hashes: [], refs: [], texts: [] },
     |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, l: LawNode| {
-      let f: Finished = encode_item(index, l.module, scc, hashes, false, |encoder: Encoder|
-        law_def(encoder, l.def));
-      let text: Finished = encode_item(index, l.module, scc, hashes, true, |encoder: Encoder|
-        law_def(encoder, l.def));
+      let law = |encoder: Encoder| law_def(encoder, l.def);
+      let effects = slots_of(index, l.module, scc, law);
+      let f: Finished = encode_slotted(index, l.module, hashes, effects, false, law);
+      let text: Finished = encode_slotted(index, l.module, hashes, effects, true, law);
       {
         hashes: push(acc.hashes, blake3(f.bytes)),
         refs: push(acc.refs, f.refs),
@@ -2127,7 +2147,7 @@ fn hashed_over(
             Some(f) -> fixed_forms(acc, node.name, f),
             None -> {
               let view = viewed_refs(index, g, held, packages, hashes, cut, v).view;
-              unfixed_forms(index, scc, hashes, view, cut.checks, acc, v, node)
+              unfixed_forms(index, scc, hashes, view, cut.checks, acc, v, node, at(first, v).refs)
             },
           }
         },
@@ -2320,6 +2340,7 @@ fn fixed_forms(acc: Forms, name: Bytes, fixed: Fixed) -> Forms = {
   }
 }
 
+// `refs` are the node's references with nothing known, as the first pass found them.
 fn unfixed_forms(
   index: Index,
   scc: Sccs,
@@ -2329,11 +2350,18 @@ fn unfixed_forms(
   acc: Forms,
   v: Int,
   node: Node,
+  refs: List<Int>,
 ) -> Forms =
   match node.body {
     NodeFn(def) -> {
-      let form: Finished = encode_item(index, node.module, scc, hashes, true, |encoder: Encoder|
-        normalize_node(encoder, NodeFn(def)));
+      let form: Finished = encode_slotted(
+        index,
+        node.module,
+        hashes,
+        slots(effect_order(index, refs, scc, None, [])),
+        true,
+        |encoder: Encoder| normalize_node(encoder, NodeFn(def)),
+      );
       let owned: Forms = {
         ..acc,
         own: push(acc.own, { name: node.name, hash: own_hash(form.bytes) }),
@@ -2342,36 +2370,21 @@ fn unfixed_forms(
         match map_get(hashes, v) {
           None -> owned,
           Some(owner) -> {
-            let clauses = map(range(0, len(def.spec)), |i: Int| {
-              let c = at(def.spec, i);
-              spec_hash(
-                owner,
-                spec_tag(c.kind),
-                i,
-                encode_item(index, node.module, scc, hashes, false, |encoder: Encoder|
-                  spec_clause(encoder, def, c)).bytes,
-              )
+            let written = map(def.spec, |c: SpecClause| {
+              let clause = |encoder: Encoder| spec_clause(encoder, def, c);
+              { clause: clause, effects: slots_of(index, node.module, scc, clause) }
             });
-            let texts = map(range(0, len(def.spec)), |i: Int| {
-              let c = at(def.spec, i);
-              spec_text_hash(
-                spec_tag(c.kind),
-                i,
-                encode_item(index, node.module, scc, hashes, true, |encoder: Encoder|
-                  spec_clause(encoder, def, c)).bytes,
-              )
-            });
+            let encoded = |i: Int, table: Map<Int, Bytes>, by_name: Bool| {
+              let w = at(written, i);
+              encode_slotted(index, node.module, table, w.effects, by_name, w.clause).bytes
+            };
+            let clauses = map(range(0, len(def.spec)), |i: Int|
+              spec_hash(owner, spec_tag(at(def.spec, i).kind), i, encoded(i, hashes, false)));
+            let texts = map(range(0, len(def.spec)), |i: Int|
+              spec_text_hash(spec_tag(at(def.spec, i).kind), i, encoded(i, hashes, true)));
             let cut_owner = match map_get(checks, v) { Some(k) -> k, None -> owner };
-            let cuts = map(range(0, len(def.spec)), |i: Int| {
-              let c = at(def.spec, i);
-              spec_hash(
-                cut_owner,
-                spec_tag(c.kind),
-                i,
-                encode_item(index, node.module, scc, view, false, |encoder: Encoder|
-                  spec_clause(encoder, def, c)).bytes,
-              )
-            });
+            let cuts = map(range(0, len(def.spec)), |i: Int|
+              spec_hash(cut_owner, spec_tag(at(def.spec, i).kind), i, encoded(i, view, false)));
             {
               ..owned,
               specs: push(owned.specs, { name: node.name, hashes: clauses }),
