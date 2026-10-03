@@ -283,7 +283,7 @@ impl HostHandler for Site {
                 // runtime values do not cross threads.
                 let args: Vec<ply_eval::Plain> = args
                     .iter()
-                    .map(|a| crate::payload::value_plain(a, span))
+                    .map(|a| ply_eval::reflect::plain_of(a, span))
                     .collect::<Result<_, _>>()?;
                 let called: ply_eval::Ended<ply_eval::Plain> =
                     self.ask(&label, span, |reply| Go::Call { name, args, reply })?;
