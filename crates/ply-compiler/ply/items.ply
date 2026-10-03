@@ -19,8 +19,8 @@ import type_syntax (TypeExpr, RowExpr, AtomExpr, Mode, Generics, RowMember, MRea
                     RMSet, ty, ty_span, no_ty, mode, generics, row, row_member, no_generics,
                     dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
-import exprs (Expr, Param, expr, scrutinee, block_expr, expr_span, no_expr, fn_param, dump_expr,
-              dump_param, shown_binder)
+import exprs (Expr, Param, expr, scrutinee, block_expr, expr_span, no_expr, fn_param, param,
+              dump_expr, dump_param, shown_binder)
 
 // --- The tree ---------------------------------------------------------------
 
@@ -152,6 +152,18 @@ pub type EffectSetDef = {
   span: Span,
 }
 
+// `extern fn`: a function the runtime implements, with no body to check. The prelude declares
+// every one; a module that writes one is refused.
+pub type ExternDef = {
+  name: Ident,
+  generics: Generics,
+  params: List<Param>,
+  ret: TypeExpr,
+  effects: Option<RowExpr>,
+  constraints: List<Constraint>,
+  span: Span,
+}
+
 pub type Item =
   | IFn(FnDef)
   | IType(TypeDef)
@@ -160,6 +172,7 @@ pub type Item =
   | ILaw(LawDef)
   | IDerive(DeriveDef)
   | IEffectSet(EffectSetDef)
+  | IExtern(ExternDef)
 
 pub type Module = { imports: List<ImportDecl>, items: List<Item> }
 
@@ -243,6 +256,7 @@ pub fn item_span(item: Item) -> Span =
     ILaw(d) -> d.span,
     IDerive(d) -> d.span,
     IEffectSet(d) -> d.span,
+    IExtern(d) -> d.span,
   }
 
 // --- Item starts ------------------------------------------------------------
@@ -261,7 +275,12 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_derive_start(input, parser)
     || at_reuse_start(input, parser)
     || at_transparent_start(input, parser)
+    || at_extern_start(input, parser)
 }
+
+// `extern` is contextual: it opens an item only when `fn` follows.
+pub fn at_extern_start(input: Input, parser: Parser) -> Bool =
+  at_ident_text(input, parser, b"extern") && token_kind_at(input, parser, 1) == keyword_fn()
 
 // `law` is contextual: it opens an item only before a quoted label or `/host`, so `fn law(..)` keeps its meaning.
 pub fn at_law_start(input: Input, parser: Parser) -> Bool =
@@ -737,6 +756,74 @@ pub fn fn_def(
       decreases: dec,
       body: body,
       span: span_to(st.node, expr_span(body)),
+    },
+  })
+}
+
+// --- `extern fn` ------------------------------------------------------------
+
+// A declaration is all there is of one, so every parameter's type and the answer's are written.
+fn extern_param(input: Input, parser: Parser) -> Result<Parsed<Param>, Parser> / {abort.raise} = {
+  let { parser, node: p } = param(input, parser)?;
+  match p.ty {
+    Some(_) -> Ok({ parser: parser, node: p }),
+    None ->
+      Err(
+        push_diag(
+          parser,
+          error_at(
+            unexpected(),
+            p.span,
+            bytes_concat_all([b"the parameter `", p.name.name, b"` of an `extern fn` has no type"]),
+            b"write its type",
+            [b"an `extern fn` has no body a type could be inferred from"],
+          ),
+        ),
+      ),
+  }
+}
+
+pub fn extern_def(
+  input: Input,
+  parser: Parser,
+) -> Result<Parsed<ExternDef>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let { parser, .. } = expect(input, st.parser, keyword_fn(), b"`fn` after `extern`")?;
+  let { parser, node: name } = expect_ident(input, parser, b"a function name after `extern fn`")?;
+  let { parser, node: g } = opt_generics(input, parser)?;
+  let { parser, node: o } = expect(
+    input,
+    parser,
+    token_lparen(),
+    b"`(` to start the parameter list",
+  )?;
+  let { parser, node: ps } = comma_list(input, parser, token_rparen(), extern_param)?;
+  let { parser, .. } = expect_close(
+    input,
+    parser,
+    token_rparen(),
+    o,
+    b"`)` to close the parameter list",
+  )?;
+  let { parser, .. } = expect(
+    input,
+    parser,
+    token_arrow(),
+    b"`->` and the type an `extern fn` answers",
+  )?;
+  let { parser, node: ret } = ty(input, parser)?;
+  let { parser, node: eff } = opt_row(input, parser)?;
+  let { parser, node: cs } = where_clause(input, parser)?;
+  Ok({
+    parser: parser,
+    node: {
+      name: name,
+      generics: g,
+      params: ps,
+      ret: ret,
+      effects: eff,
+      constraints: cs,
+      span: span_to(st.node, previous_span(input, parser)),
     },
   })
 }
@@ -1299,6 +1386,14 @@ pub fn item_at(
       ]),
     )?;
     Ok({ parser: d.parser, node: IDerive(d.node) })
+  } else if at_extern_start(input, parser) {
+    let d = extern_def(
+      input,
+      no_pub(parser, unexpected(), pub_span, b"an `extern fn` cannot be `pub`", [
+        b"what the prelude declares is in reach of every module already",
+      ]),
+    )?;
+    Ok({ parser: d.parser, node: IExtern(d.node) })
   } else {
     Err(
       error_here(
@@ -1548,6 +1643,17 @@ pub fn dump_effect_set(d: EffectSetDef) -> Bytes / {abort.raise} =
     dump_list(d.expansion, dump_atom),
   ])
 
+pub fn dump_extern(d: ExternDef) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    dump_node(d.span, b"ext"),
+    dump_ident(d.name),
+    dump_generics(d.generics),
+    dump_list(d.params, dump_param),
+    dump_ty(d.ret),
+    dump_opt(d.effects, dump_row),
+    dump_list(d.constraints, dump_constraint),
+  ])
+
 pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
   match item {
     IFn(d) -> dump_fn(d),
@@ -1557,6 +1663,7 @@ pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
     ILaw(d) -> dump_law(d),
     IDerive(d) -> dump_derive(d),
     IEffectSet(d) -> dump_effect_set(d),
+    IExtern(d) -> dump_extern(d),
   }
 
 pub fn dump_module(module: Module) -> Bytes / {abort.raise} =
@@ -1736,4 +1843,33 @@ test "a line string is an expression, and never a pattern or a test's label" {
 
 test "`derive` needs a name after it before it opens an item" {
   assert_eq(dump(b"derive + 1\n"), "#0;#0;#1;!E0001:0:6:1:0;=0:6:1;")
+}
+
+test "an `extern fn` is a declaration: generics, parameters, an answer, a row and a `where`, and no body" {
+  let r = parse(
+    b"extern fn map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e\n  where derivable(eq, a)\n\nfn g() -> Int = 1\n",
+  );
+  assert_eq(len(r.parser.diags), 0);
+  match r.node.items {
+    [IExtern(d), IFn(g)] -> {
+      assert_eq(d.name.name, b"map");
+      assert_eq(map(d.generics.types, |i: Ident| i.name), [b"a", b"b"]);
+      assert_eq(map(d.generics.effects, |i: Ident| i.name), [b"e"]);
+      assert_eq(map(d.params, |p: Param| p.name.name), [b"xs", b"f"]);
+      assert_eq(len(d.constraints), 1);
+      assert_eq(d.span, { start: 0, end: 93 });
+      assert_eq(g.name.name, b"g")
+    },
+    _ -> panic("an `extern fn`, then a `fn`"),
+  }
+}
+
+test "`extern` stays a name where no `fn` follows it" {
+  assert_eq(len(parse(b"fn extern(extern: Int) -> Int = extern\n").parser.diags), 0)
+}
+
+test "an `extern fn` writes every type and is never `pub`" {
+  assert(len(parse(b"extern fn f(x) -> Int\n").parser.diags) > 0);
+  assert(len(parse(b"extern fn f(x: Int)\n").parser.diags) > 0);
+  assert(len(parse(b"pub extern fn f(x: Int) -> Int\n").parser.diags) > 0)
 }
