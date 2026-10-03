@@ -77,7 +77,7 @@ fn other(k: Int) -> Int / {db.read[orders]} = db.get[orders](k)
 
 fn store(k: Int) -> Int / {db.write[orders]} = db.put[orders](k, 1)
 
-fn stamp() -> Int / {clock.read} = clock.now()
+fn stamp() -> Instant / {clock.read} = clock.now()
 "#;
 
 fn check(source: &str) -> CheckOutput {

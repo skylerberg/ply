@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 /// The prelude's two effects the seeded handlers answer, plus a hand-written handler.
 const SOURCE: &str = r#"
 nondet effect clock {
-  read now() -> Int
-  write sleep(Int) -> Unit
+  read now() -> Instant
+  write sleep(Duration) -> Unit
 }
 
 nondet effect random {
@@ -21,13 +21,13 @@ nondet effect random {
 }
 
 fn work() -> Int / {clock.read, clock.write, random.write} = {
-  let started = clock.now();
-  clock.sleep(40);
+  let started = match clock.now() { Instant(n) -> n };
+  clock.sleep(Duration(40));
   started + random.next() + random.below(6)
 }
 
 fn stub() -> Int = handle work() with {
-  clock.now() -> 0,
+  clock.now() -> Instant(0),
   clock.sleep(nanos) -> (),
   random.next() -> 7,
   random.below(bound) -> 0,
@@ -96,6 +96,7 @@ fn type_of(value: &Value) -> Option<&'static str> {
     match value {
         Value::Int(_) => Some("Int"),
         Value::Unit => Some("Unit"),
+        Value::Ctor { name, .. } if name.as_str() == "Instant" => Some("Instant"),
         _ => None,
     }
 }
@@ -141,10 +142,11 @@ fn what_the_handlers_answer_has_the_declared_type() {
         let (params, ret) = &declared[&format!("sig.{sig}")];
         let args: Vec<Value> = params
             .iter()
-            .map(|param| {
-                assert_eq!(param, "Int", "`{sig}` takes something else now");
+            .map(|param| match param.as_str() {
                 // Positive: `random.below` cannot answer below zero, and a zero sleep is a yield.
-                Value::Int(3)
+                "Int" => Value::Int(3),
+                "Duration" => Value::ctor("Duration", vec![Value::Int(3)]),
+                other => panic!("`{sig}` takes a `{other}` now"),
             })
             .collect();
         match handlers.dispatch(sig, TaskId(0), &args, span()) {
@@ -231,7 +233,7 @@ fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
         let text = whole.split("#[cfg(test)]").next().unwrap_or(&whole);
         for banned in [
             "SystemTime",
-            "Instant",
+            "Instant::now",
             "std::time",
             "rand::",
             "thread_rng",

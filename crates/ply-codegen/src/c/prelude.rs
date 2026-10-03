@@ -197,6 +197,8 @@ helpers![
     (rt_inc_shared, 1, false),
     (rt_dec_shared, 1, false),
     (rt_parallel, 2, false),
+    (rt_array_set, 3, true),
+    (rt_array_lookup, 2, true),
 ];
 
 /// The line that opens the runtime's definitions: everything from it on is the unit's tail, the

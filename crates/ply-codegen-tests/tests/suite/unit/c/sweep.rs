@@ -34,6 +34,15 @@ fn a_cache_inside_its_budget_is_left_alone() {
 }
 
 #[test]
+fn a_kept_answer_is_swept_with_the_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = ["answers/old", "emit/b.body", "answers/new"];
+    stock(dir.path(), &names, 100);
+    assert_eq!(sweep(dir.path(), 200), 100);
+    assert_eq!(present(dir.path(), &names), ["emit/b.body", "answers/new"]);
+}
+
+#[test]
 fn the_oldest_entries_go_until_the_rest_fits() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["emit/a.body", "emit/b.body", "emit/c.body", "d.dylib"];

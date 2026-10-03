@@ -242,6 +242,7 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
 
         Value::Int(_)
         | Value::Fixed(_)
+        | Value::Char(_)
         | Value::Bool(_)
         | Value::Float(_)
         | Value::Decimal(_)
@@ -253,6 +254,14 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
             items.iter().enumerate().find_map(|(i, v)| {
                 let handle = find(v, route)?;
                 route.push(format!("item {i}"));
+                Some(handle)
+            })
+        }),
+
+        Value::Array(items) => grow(|| {
+            items.iter().enumerate().find_map(|(i, v)| {
+                let handle = find(v, route)?;
+                route.push(format!("element {i}"));
                 Some(handle)
             })
         }),

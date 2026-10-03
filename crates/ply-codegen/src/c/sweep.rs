@@ -103,6 +103,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
     walk(root);
     walk(&root.join("emit"));
     walk(&root.join("obj"));
+    walk(&root.join("answers"));
     if total <= budget {
         return 0;
     }

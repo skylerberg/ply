@@ -173,15 +173,20 @@ fn run(root: u64, script: &[(&str, &str, Vec<Value>)]) -> (Vec<Answer>, i64, u64
     (answers, now, drawn)
 }
 
+/// The prelude's `Duration(n)`, which `clock.sleep` takes.
+fn duration(nanos: i64) -> Value {
+    Value::ctor("Duration", vec![Value::Int(nanos)])
+}
+
 fn script() -> Vec<(&'static str, &'static str, Vec<Value>)> {
     vec![
         ("clock", "now", vec![]),
         ("random", "next", vec![]),
         ("random", "below", vec![Value::Int(6)]),
-        ("clock", "sleep", vec![Value::Int(0)]),
+        ("clock", "sleep", vec![duration(0)]),
         ("random", "next", vec![]),
         ("clock", "now", vec![]),
-        ("clock", "sleep", vec![Value::Int(500)]),
+        ("clock", "sleep", vec![duration(500)]),
     ]
 }
 
@@ -208,12 +213,7 @@ fn the_clock_is_not_drawn_from_the_seed() {
         let mut times = Vec::new();
         for nanos in [0, 40, 0] {
             let answer = handlers
-                .dispatch(
-                    sig("clock", "sleep"),
-                    TaskId(0),
-                    &[Value::Int(nanos)],
-                    span(),
-                )
+                .dispatch(sig("clock", "sleep"), TaskId(0), &[duration(nanos)], span())
                 .expect("a well-typed sleep");
             times.push(transcript(&[answer]).remove(0));
             handlers.clock_mut().advance();
@@ -371,7 +371,14 @@ fn the_table_names_each_operation_once_and_answers_all_of_them() {
         seen.push((sig.effect, sig.op));
         assert!(SEEDED_EFFECTS.contains(&sig.effect));
 
-        let args: Vec<Value> = sig.params.iter().map(|_| Value::Int(1)).collect();
+        let args: Vec<Value> = sig
+            .params
+            .iter()
+            .map(|p| match p {
+                SimTy::Duration => duration(1),
+                _ => Value::Int(1),
+            })
+            .collect();
         let answer = Handlers::new(0)
             .dispatch(sig, TaskId(0), &args, span())
             .expect("the table's own arguments are well typed");
@@ -426,7 +433,7 @@ fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
         "FxHashMap",
         "FxHashSet",
         "SystemTime",
-        "Instant",
+        "Instant::now",
         "thread::",
         "rayon",
         "as_ptr",
