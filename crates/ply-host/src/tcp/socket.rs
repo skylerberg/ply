@@ -80,11 +80,11 @@ pub struct TcpHost {
     /// What `net.listen_tls` resolves a credential name against.
     credentials: Credentials,
     handshakes: Arc<Handshakes>,
-    /// Set by phase 2 of the drain.
+    /// Set at the stop.
     stopping: Arc<AtomicBool>,
     /// `accept` operations parked on a pool thread.
     accepts: Arc<AtomicUsize>,
-    /// Where the listeners phase 2 closed were bound.
+    /// Where the listeners the stop closed were bound.
     closed_at: Mutex<Vec<SocketAddr>>,
     /// The tokens a machine parks on when this host is itself its runtime.
     inbox: Arc<Inbox>,
