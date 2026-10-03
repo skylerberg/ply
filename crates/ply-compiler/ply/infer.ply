@@ -6802,7 +6802,7 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
     EParallel(v) -> fold(v.branches, out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
   }
 
-// Tarjan's components; the goldens fix the order they come out in.
+// Tarjan's components in completion order, so the checker solves a callee before its callers.
 type Tarjan = {
   index: List<Int>,
   low: List<Int>,
@@ -12467,6 +12467,77 @@ test "a body that performs more than its signature permits is refused" {
     },
   ]);
   assert_eq(dump, "K;1;X;D;1;!E0302:0:67:81:2:1;=0:67:81:1;=0:62:64:0;")
+}
+
+test "a function that performs is refused where a pure one is expected" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"effect log { write emit(Bytes) -> Unit }\nfn noisy(x: Int) -> Int / { log.write } = { log.emit(b\"x\"); x }\nfn apply(f: (Int) -> Int) -> Int = f(1)\nfn go() -> Int = apply(noisy)",
+    },
+  ]);
+  assert_eq(dump, "K;1;X;D;1;!E0302:0:168:173:1:1;=0:168:173:1;")
+}
+
+test "an operator over a lambda parameter nothing types is refused" {
+  let dump = check_dump([{ name: b"m", src: b"fn f() -> Bool = { let g = |x| x + x; true }" }]);
+  assert_eq(dump, "K;1;X;D;1;!E0210:0:31:36:1:3;=0:31:36:1;")
+}
+
+test "a test's footprint holds the row of what it calls and the operation it performs itself" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"effect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"a test performs through a call\" { say(b\"x\") }\ntest \"a test performs directly\" { log.emit(b\"y\") }",
+    },
+  ]);
+  assert_eq(
+    dump,
+    "K;1;F;m.say;(Bytes) -> Unit / {m.log.write};m.log.write;m.log.emit;;"
+      ++ "T;m.a test performs through a call;0;m.log.write;T;m.a test performs directly;0;m.log.emit;"
+      ++ "E;m.log;0;emit:write:0:Bytes:Unit;",
+  )
+}
+
+test "a function parameter's types and row generalize" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"pub fn twice<a, b>(f: (a) -> b, x: a) -> b = f(x)\npub fn each<a | e>(f: (a) -> Unit / e, xs: List<a>) -> Unit / e = fold(xs, (), |acc: Unit, x: a| f(x))",
+    },
+  ]);
+  assert_eq(
+    dump,
+    "K;1;F;m.twice;<a, b>((a) -> b, a) -> b;;;;F;m.each;<a | e>((a) -> Unit / e, List<a>) -> Unit / e;;;;",
+  )
+}
+
+test "a derivable constraint is published on the type parameter it names" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"pub fn show<a>(x: a) -> Int where derivable(eq, a) = 1\npub fn keyed<k, v>(m: Map<k, v>) -> Int where derivable(ord, k) = map_len(m)\nfn used() -> Int = show(2) + keyed(map_new())",
+    },
+  ]);
+  assert_eq(
+    dump,
+    "K;1;F;m.show;<a>(a) -> Int;;;eq0;F;m.keyed;<a, b>(Map<a, b>) -> Int;;;ord0;F;m.used;() -> Int;;;;",
+  )
+}
+
+test "an atom a row writes twice is published once" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"effect log { write emit(Bytes) -> Unit }\neffect audit { write note(Bytes) -> Unit }\nfn twice() -> Unit / { log.write, log.write } = log.emit(b\"x\")\nfn both() -> Unit / { audit.write, log.write, audit.write } = { log.emit(b\"x\"); audit.note(b\"y\") }",
+    },
+  ]);
+  assert_eq(
+    dump,
+    "K;1;F;m.twice;() -> Unit / {m.log.write};m.log.write;m.log.emit;;"
+      ++ "F;m.both;() -> Unit / {m.audit.write, m.log.write};m.audit.write,m.log.write;m.audit.note,m.log.emit;;"
+      ++ "E;m.log;0;emit:write:0:Bytes:Unit;E;m.audit;0;note:write:0:Bytes:Unit;",
+  )
 }
 
 test "a program checked from its own published interfaces publishes the same thing" {
