@@ -9,7 +9,7 @@ use ply_host::config::{Entry, Snapshot};
 use ply_host::signal::{Accepting, Bounds, Shutdown, Signal};
 use ply_host::tcp::{Net, TcpHost};
 use ply_host::trace::sink::Recording;
-use ply_host::trace::{Clock, Kept, Kind, Level, Op, Outcome, Sink, Trace};
+use ply_host::trace::{Clock, Level, Op, Outcome, OwnedRecord, RecordKind, Sink, Trace};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
@@ -145,7 +145,7 @@ impl Driver {
         .expect("`trace.event` never refuses")
     }
 
-    fn records(&self) -> Vec<Kept> {
+    fn records(&self) -> Vec<OwnedRecord> {
         self.sink.records()
     }
 }
@@ -228,7 +228,7 @@ fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
     // An `Abandoned` here would mean one entry point's exit swept up the other's.
     let outcomes: Vec<&Outcome> = records
         .iter()
-        .filter(|r| r.kind == Kind::Exit)
+        .filter(|r| r.kind == RecordKind::Exit)
         .map(|r| &r.outcome)
         .collect();
     assert_eq!(outcomes, [&Outcome::Ok, &Outcome::Ok]);

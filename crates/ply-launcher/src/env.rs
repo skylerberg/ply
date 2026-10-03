@@ -29,23 +29,23 @@ const OPERATIONS: [(&str, &str); 9] = [
 
 /// The ops and the handler, lent with the binary's version.
 pub fn registrations(version: &str) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    let site: Arc<dyn HostHandler> = Arc::new(Site {
+    let handler: Arc<dyn HostHandler> = Arc::new(EnvHandler {
         version: version.to_string(),
     });
     OPERATIONS
         .into_iter()
         .map(|(op, path)| {
             let op = ply_machine::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
-            (op, Arc::clone(&site))
+            (op, Arc::clone(&handler))
         })
         .collect()
 }
 
-struct Site {
+struct EnvHandler {
     version: String,
 }
 
-impl HostHandler for Site {
+impl HostHandler for EnvHandler {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let value = match (req.op.op.as_str(), req.args) {
             ("var", [name]) => {

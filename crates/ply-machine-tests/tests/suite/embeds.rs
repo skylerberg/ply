@@ -1,5 +1,5 @@
 //! A program the builder makes embeds as `ply`'s own load does: each path read beside the module
-//! that asks, written into it as a literal, and handed to the compiled tier with the answer.
+//! that asks, written into it as a literal, and handed to the C backend with the answer.
 
 use crate::fixture::{backend, loaded, scratch, write};
 use ply_machine::testrun::{self, Executor, Hosting};

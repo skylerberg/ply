@@ -97,7 +97,7 @@ impl Compiled {
         port_errors(&[(module, source)])
     }
 
-    /// A machine on the tier compiled from this program.
+    /// A machine on the backend compiled from this program.
     pub fn machine(&self) -> Machine<'_> {
         self.machine_on(self.unit().attach())
     }

@@ -3,7 +3,7 @@
 //! are, and what their judgements come to, is the program's.
 
 use crate::load::Loaded;
-use ply_eval::decode::{At, Error as DecodeError};
+use ply_eval::decode::{AnswerValue, Error as DecodeError};
 use ply_eval::host::HostBinding;
 use ply_eval::{
     Analysis, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, LawInfo, Machine, Seed, SourceId, Span,
@@ -54,13 +54,13 @@ pub enum Strategy {
 
 /// The obligations a `proof.world.World` owes, in the order the program listed them, which is the
 /// order it names them by.
-pub fn obligations_of(world: At<'_>) -> Result<Vec<Obligation>, DecodeError> {
+pub fn obligations_of(world: AnswerValue<'_>) -> Result<Vec<Obligation>, DecodeError> {
     world.field("obligations")?.items(obligation_of)
 }
 
-fn obligation_of(at: At<'_>) -> Result<Obligation, DecodeError> {
+fn obligation_of(at: AnswerValue<'_>) -> Result<Obligation, DecodeError> {
     let kind = at.field("kind")?.ctor()?;
-    let span = |s: At<'_>| -> Result<Span, DecodeError> {
+    let span = |s: AnswerValue<'_>| -> Result<Span, DecodeError> {
         Ok(Span::new(
             SourceId(s.field("module")?.number()?),
             s.field("start")?.number()?,
@@ -228,8 +228,9 @@ impl Prover {
         }
     }
 
-    /// What every entry a claim makes goes through, its owner's call included: this thread's tier,
-    /// bound to the run's host and a reactor for this thread when the claim is a `law/host`.
+    /// What every entry a claim makes goes through, its owner's call included: this thread's
+    /// backend, bound to the run's host and a reactor for this thread when the claim is a
+    /// `law/host`.
     fn machine(&self, obligation: &Obligation) -> Result<Machine<'_>, Diagnostic> {
         let mut machine =
             Machine::new(&self.front, self.compiled())?.with_max_calls(DEFAULT_MAX_CALLS);

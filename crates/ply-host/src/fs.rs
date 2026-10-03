@@ -1,6 +1,6 @@
 //! The filesystem, as operations confined to roots the run names.
 
-use crate::pool::{Bell, Done, FS_FIRST_TOKEN, Inbox, Pool};
+use crate::pool::{Bell, FS_FIRST_TOKEN, Inbox, JobOutput, Pool};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
@@ -364,25 +364,25 @@ fn run(
     second: Second,
     held: &Mutex<BTreeSet<PathBuf>>,
     span: Span,
-) -> Done {
+) -> JobOutput {
     let target = match confine(root, path, span) {
         Ok(target) => target,
-        Err(refusal) => return Done::Refused(refusal),
+        Err(refusal) => return JobOutput::Refused(refusal),
     };
     match op {
         Op::ReadFile => match std::fs::metadata(&target) {
-            Err(_) => Done::MaybeBytes(None),
-            Ok(meta) if !meta.is_file() => Done::MaybeBytes(None),
+            Err(_) => JobOutput::MaybeBytes(None),
+            Ok(meta) if !meta.is_file() => JobOutput::MaybeBytes(None),
             Ok(meta) if meta.len() > MAX_READ_BYTES => {
-                Done::Refused(too_large(meta.len(), path, span))
+                JobOutput::Refused(too_large(meta.len(), path, span))
             }
             Ok(_) => match std::fs::read(&target) {
-                Ok(bytes) => Done::MaybeBytes(Some(bytes)),
-                Err(_) => Done::MaybeBytes(None),
+                Ok(bytes) => JobOutput::MaybeBytes(Some(bytes)),
+                Err(_) => JobOutput::MaybeBytes(None),
             },
         },
         Op::ListDir => match std::fs::read_dir(&target) {
-            Err(_) => Done::MaybeStrings(None),
+            Err(_) => JobOutput::MaybeStrings(None),
             Ok(entries) => {
                 let mut names: Vec<String> = entries
                     .filter_map(|e| e.ok())
@@ -390,11 +390,11 @@ fn run(
                     .collect();
                 // Read order is a fact about the filesystem, not the directory's contents.
                 names.sort();
-                Done::MaybeStrings(Some(names))
+                JobOutput::MaybeStrings(Some(names))
             }
         },
         // `symlink_metadata` does not follow, so a symlink is reported as one rather than as its target.
-        Op::Kind => Done::Ctor(match std::fs::symlink_metadata(&target) {
+        Op::Kind => JobOutput::Ctor(match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_symlink() => "std.fs.Symlink",
             Ok(meta) if meta.is_dir() => "std.fs.Dir",
             Ok(meta) if meta.is_file() => "std.fs.File",
@@ -402,19 +402,19 @@ fn run(
         }),
         // `metadata` follows, so this answers what the path resolves to. `confine` has already
         // refused a target that resolves outside the root, so following one cannot leave it.
-        Op::Resolved => Done::Ctor(match std::fs::metadata(&target) {
+        Op::Resolved => JobOutput::Ctor(match std::fs::metadata(&target) {
             Ok(meta) if meta.is_dir() => "std.fs.Dir",
             Ok(meta) if meta.is_file() => "std.fs.File",
             _ => "std.fs.Missing",
         }),
-        Op::Exists => Done::Bool(std::fs::symlink_metadata(&target).is_ok()),
-        Op::FileSize => Done::MaybeInt(
+        Op::Exists => JobOutput::Bool(std::fs::symlink_metadata(&target).is_ok()),
+        Op::FileSize => JobOutput::MaybeInt(
             std::fs::metadata(&target)
                 .ok()
                 .filter(|m| m.is_file())
                 .and_then(|m| i64::try_from(m.len()).ok()),
         ),
-        Op::ModifiedMs => Done::MaybeInt(
+        Op::ModifiedMs => JobOutput::MaybeInt(
             std::fs::metadata(&target)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -422,77 +422,79 @@ fn run(
                 .and_then(|d| i64::try_from(d.as_millis()).ok()),
         ),
         Op::WriteFile => match second {
-            Second::Body(body) => Done::Bool(std::fs::write(&target, &body[..]).is_ok()),
-            _ => Done::Failed("a write with no body reached the pool".into()),
+            Second::Body(body) => JobOutput::Bool(std::fs::write(&target, &body[..]).is_ok()),
+            _ => JobOutput::Failed("a write with no body reached the pool".into()),
         },
         // Idempotent, so a cache writer need not check first and race with itself.
-        Op::CreateDir => Done::Bool(std::fs::create_dir_all(&target).is_ok()),
+        Op::CreateDir => JobOutput::Bool(std::fs::create_dir_all(&target).is_ok()),
         // One file, or one empty directory.
         Op::Remove => match std::fs::symlink_metadata(&target) {
-            Err(_) => Done::Bool(false),
-            Ok(meta) if meta.is_dir() => Done::Bool(std::fs::remove_dir(&target).is_ok()),
-            Ok(_) => Done::Bool(std::fs::remove_file(&target).is_ok()),
+            Err(_) => JobOutput::Bool(false),
+            Ok(meta) if meta.is_dir() => JobOutput::Bool(std::fs::remove_dir(&target).is_ok()),
+            Ok(_) => JobOutput::Bool(std::fs::remove_file(&target).is_ok()),
         },
         Op::Rename => match second {
             Second::Path(to) => match confine(root, &to, span) {
                 // Both paths are under one label, which makes this the atomic cache write.
-                Err(refusal) => Done::Refused(refusal),
-                Ok(destination) => Done::Bool(std::fs::rename(&target, &destination).is_ok()),
+                Err(refusal) => JobOutput::Refused(refusal),
+                Ok(destination) => JobOutput::Bool(std::fs::rename(&target, &destination).is_ok()),
             },
-            _ => Done::Failed("a rename with no destination reached the pool".into()),
+            _ => JobOutput::Failed("a rename with no destination reached the pool".into()),
         },
         Op::ReadAt => match second {
-            Second::Range { offset, len } => Done::MaybeBytes(read_range(&target, offset, len)),
-            _ => Done::Failed("a ranged read with no range reached the pool".into()),
+            Second::Range { offset, len } => {
+                JobOutput::MaybeBytes(read_range(&target, offset, len))
+            }
+            _ => JobOutput::Failed("a ranged read with no range reached the pool".into()),
         },
         Op::Append => match second {
-            Second::Body(body) => Done::MaybeInt(append_to(&target, &body)),
-            _ => Done::Failed("an append with no body reached the pool".into()),
+            Second::Body(body) => JobOutput::MaybeInt(append_to(&target, &body)),
+            _ => JobOutput::Failed("an append with no body reached the pool".into()),
         },
-        Op::Sync => Done::Bool(sync_path(&target)),
-        Op::Lock => Done::Bool(take_lock(&target, held)),
-        Op::Unlock => Done::Bool(drop_lock(&target, held)),
+        Op::Sync => JobOutput::Bool(sync_path(&target)),
+        Op::Lock => JobOutput::Bool(take_lock(&target, held)),
+        Op::Unlock => JobOutput::Bool(drop_lock(&target, held)),
         Op::Copy => match second {
             Second::Path(to) => match confine(root, &to, span) {
-                Err(refusal) => Done::Refused(refusal),
-                Ok(destination) => Done::Bool(copy_file(&target, &destination)),
+                Err(refusal) => JobOutput::Refused(refusal),
+                Ok(destination) => JobOutput::Bool(copy_file(&target, &destination)),
             },
-            _ => Done::Failed("a copy with no destination reached the pool".into()),
+            _ => JobOutput::Failed("a copy with no destination reached the pool".into()),
         },
-        Op::RemoveTree => Done::Bool(names_below_root(path) && remove_tree(&target)),
+        Op::RemoveTree => JobOutput::Bool(names_below_root(path) && remove_tree(&target)),
         Op::TempDir => match second {
-            Second::Name(prefix) => Done::MaybeString(temp_dir(path, &target, &prefix)),
-            _ => Done::Failed("a temporary directory with no prefix reached the pool".into()),
+            Second::Name(prefix) => JobOutput::MaybeString(temp_dir(path, &target, &prefix)),
+            _ => JobOutput::Failed("a temporary directory with no prefix reached the pool".into()),
         },
-        Op::Canonical => Done::MaybeString(
+        Op::Canonical => JobOutput::MaybeString(
             std::fs::canonicalize(&target)
                 .ok()
                 .and_then(|real| real.to_str().map(str::to_string)),
         ),
-        Op::Mode => Done::MaybeMode(mode_of(&target)),
+        Op::Mode => JobOutput::MaybeMode(mode_of(&target)),
         Op::SetMode => match second {
-            Second::Mode(bits) => Done::Bool(set_mode(&target, bits)),
-            _ => Done::Failed("a mode change with no mode reached the pool".into()),
+            Second::Mode(bits) => JobOutput::Bool(set_mode(&target, bits)),
+            _ => JobOutput::Failed("a mode change with no mode reached the pool".into()),
         },
         Op::Symlink => match second {
             Second::Target(to) => match link_stays(root, path, &to, span) {
-                Err(refusal) => Done::Refused(refusal),
-                Ok(()) => Done::Bool(std::os::unix::fs::symlink(&to, &target).is_ok()),
+                Err(refusal) => JobOutput::Refused(refusal),
+                Ok(()) => JobOutput::Bool(std::os::unix::fs::symlink(&to, &target).is_ok()),
             },
-            _ => Done::Failed("a link with no target reached the pool".into()),
+            _ => JobOutput::Failed("a link with no target reached the pool".into()),
         },
-        Op::ReadLink => Done::MaybeString(
+        Op::ReadLink => JobOutput::MaybeString(
             std::fs::read_link(&target)
                 .ok()
                 .and_then(|to| to.to_str().map(str::to_string)),
         ),
         Op::Walk => match walk(path, &target) {
-            Ok(entries) => Done::MaybeEntries(entries),
-            Err(bytes) => Done::Refused(walk_too_large(bytes, path, span)),
+            Ok(entries) => JobOutput::MaybeEntries(entries),
+            Err(bytes) => JobOutput::Refused(walk_too_large(bytes, path, span)),
         },
         Op::SetModified => match second {
-            Second::Millis(ms) => Done::Bool(set_modified(&target, ms)),
-            _ => Done::Failed("a stamp with no time reached the pool".into()),
+            Second::Millis(ms) => JobOutput::Bool(set_modified(&target, ms)),
+            _ => JobOutput::Failed("a stamp with no time reached the pool".into()),
         },
     }
 }

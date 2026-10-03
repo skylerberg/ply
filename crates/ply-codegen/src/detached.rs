@@ -195,7 +195,7 @@ pub(crate) unsafe fn resume(
                 codes::RUNTIME_ERROR,
                 "a continuation was resumed while a later stop of its body is still suspended",
             )
-            .note("the compiled tier runs a body on one stack, and restoring an earlier point would overwrite the frames the later stop waits to return into");
+            .note("the C backend runs a body on one stack, and restoring an earlier point would overwrite the frames the later stop waits to return into");
             return c.fail(dg);
         }
         (State::Done, Some(k)) => {

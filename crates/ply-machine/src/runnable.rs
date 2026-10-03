@@ -4,7 +4,7 @@
 
 use crate::driver::{LoadedAnalysis, LoadedFile};
 use crate::payload::record;
-use ply_eval::decode::At;
+use ply_eval::decode::AnswerValue;
 use ply_eval::{SourceId, Value};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ fn value_of(bytes: &[u8]) -> Result<Value, String> {
 /// The front end's answer `bytes` hold, as the value a program hands `machine.load`.
 pub fn front_value(bytes: &[u8]) -> Result<Value, String> {
     let value = value_of(bytes)?;
-    let at = At::new("a runnable", &value);
+    let at = AnswerValue::new("a runnable", &value);
     let field = |name: &str| {
         at.field(name)
             .map(|f| f.value().clone())
@@ -66,7 +66,7 @@ pub fn front_value(bytes: &[u8]) -> Result<Value, String> {
 pub fn decode(bytes: &[u8]) -> Result<Runnable, String> {
     let started = Instant::now();
     let value = value_of(bytes)?;
-    let at = At::new("a runnable", &value);
+    let at = AnswerValue::new("a runnable", &value);
     let read = || -> Result<Runnable, ply_eval::decode::Error> {
         if at.field("format")?.str()? != FORMAT {
             return Err(at.error("a runnable of another format"));

@@ -39,7 +39,7 @@ pub enum Field {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
+pub enum RecordKind {
     Event,
     Enter,
     Exit,
@@ -48,15 +48,15 @@ pub enum Kind {
     Time,
 }
 
-impl Kind {
+impl RecordKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::Event => "event",
-            Kind::Enter => "enter",
-            Kind::Exit => "exit",
-            Kind::Count => "count",
-            Kind::Gauge => "gauge",
-            Kind::Time => "time",
+            RecordKind::Event => "event",
+            RecordKind::Enter => "enter",
+            RecordKind::Exit => "exit",
+            RecordKind::Count => "count",
+            RecordKind::Gauge => "gauge",
+            RecordKind::Time => "time",
         }
     }
 }
@@ -82,7 +82,7 @@ impl Outcome {
 pub struct Record<'a> {
     /// Epoch microseconds, stamped by the driver.
     pub ts: i64,
-    pub kind: Kind,
+    pub kind: RecordKind,
     pub level: Level,
     pub channel: &'a str,
     pub name: &'a str,
@@ -228,7 +228,7 @@ impl Sink for Text {
         if record.parent != 0 {
             let _ = write!(line, " parent={}", record.parent);
         }
-        if record.kind == Kind::Exit {
+        if record.kind == RecordKind::Exit {
             let _ = write!(line, " {}", record.outcome.as_str());
             if let Outcome::Failed(why) = record.outcome {
                 let _ = write!(line, "({why})");
@@ -257,9 +257,9 @@ impl Sink for Text {
 
 /// One record a [`Recording`] kept, owned so that nothing a `Value` holds crosses a thread.
 #[derive(Clone, PartialEq, Debug)]
-pub struct Kept {
+pub struct OwnedRecord {
     pub ts: i64,
-    pub kind: Kind,
+    pub kind: RecordKind,
     pub level: Level,
     pub channel: String,
     pub name: String,
@@ -273,7 +273,7 @@ pub struct Kept {
 
 pub struct Recording {
     level: Level,
-    kept: Mutex<Vec<Kept>>,
+    kept: Mutex<Vec<OwnedRecord>>,
     flushes: AtomicU64,
 }
 
@@ -292,7 +292,7 @@ impl Recording {
         }
     }
 
-    pub fn records(&self) -> Vec<Kept> {
+    pub fn records(&self) -> Vec<OwnedRecord> {
         lock(&self.kept).clone()
     }
 
@@ -341,7 +341,7 @@ impl Sink for Recording {
     }
 
     fn write(&self, record: &Record<'_>) {
-        lock(&self.kept).push(Kept {
+        lock(&self.kept).push(OwnedRecord {
             ts: record.ts,
             kind: record.kind,
             level: record.level,
@@ -380,7 +380,7 @@ pub fn write_json(out: &mut String, record: &Record<'_>) {
         ",\"span\":{},\"parent\":{}",
         record.span, record.parent
     );
-    if record.kind == Kind::Exit {
+    if record.kind == RecordKind::Exit {
         let _ = write!(out, ",\"outcome\":\"{}\"", record.outcome.as_str());
         if let Outcome::Failed(why) = record.outcome {
             out.push_str(",\"reason\":");
@@ -389,7 +389,7 @@ pub fn write_json(out: &mut String, record: &Record<'_>) {
     }
     if let Some(amount) = record.amount {
         let key = match record.kind {
-            Kind::Count => "delta",
+            RecordKind::Count => "delta",
             _ => "micros",
         };
         let _ = write!(out, ",\"{key}\":{amount}");

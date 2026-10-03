@@ -5,7 +5,8 @@ pub mod spans;
 mod value;
 
 pub use sink::{
-    Clock, DISCARD_PATH, Discard, Field, HostClock, Json, Kept, Kind, Outcome, Record, Sink, Text,
+    Clock, DISCARD_PATH, Discard, Field, HostClock, Json, Outcome, OwnedRecord, Record, RecordKind,
+    Sink, Text,
 };
 pub use spans::{Owner, Spans};
 
@@ -54,14 +55,14 @@ operations! {
 }
 
 impl Op {
-    fn kind(self) -> Kind {
+    fn kind(self) -> RecordKind {
         match self {
-            Op::Event => Kind::Event,
-            Op::Enter => Kind::Enter,
-            Op::Exit => Kind::Exit,
-            Op::Count => Kind::Count,
-            Op::Gauge => Kind::Gauge,
-            Op::Time => Kind::Time,
+            Op::Event => RecordKind::Event,
+            Op::Enter => RecordKind::Enter,
+            Op::Exit => RecordKind::Exit,
+            Op::Count => RecordKind::Count,
+            Op::Gauge => RecordKind::Gauge,
+            Op::Time => RecordKind::Time,
         }
     }
 
@@ -179,7 +180,7 @@ impl Trace {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.sink.write(&Record {
             ts,
-            kind: Kind::Exit,
+            kind: RecordKind::Exit,
             level: Level::Info,
             channel: spans::label(&closing.open.channel),
             name: &closing.open.name,
@@ -298,7 +299,7 @@ impl Operation {
             self.trace.events.fetch_add(1, Ordering::Relaxed);
             self.trace.sink.write(&Record {
                 ts: started.unwrap_or_default(),
-                kind: Kind::Enter,
+                kind: RecordKind::Enter,
                 level: Level::Info,
                 channel: spans::label(channel),
                 name: &opened.name,
