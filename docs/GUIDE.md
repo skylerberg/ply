@@ -2905,11 +2905,13 @@ A library is published to a registry and depended on from it (§3.3). A registry
 is a directory of files behind an HTTP server, laid out statically:
 
 ```
-GET  /<name>/index.json                  every version of <name>, newest last
-GET  /<name>/<version>/package.plyz      the library's `.plyz`, as `ply build` writes it
-GET  /<name>/<version>/package.plyz.b3   its digest, one `b3:<hex>` line
-PUT  /<name>/<version>                   publish: the `.plyz` as the body
-POST /<name>/<version>/yank              mark the version yanked
+GET  /<name>/index.json                      every version of <name>, newest last
+GET  /<name>/<version>/package.plyz          the library's `.plyz`, as `ply build` writes it
+GET  /<name>/<version>/package.plyz.b3       its digest, one `b3:<hex>` line
+GET  /<name>/<version>/interface/<semantics> the interface its publisher cut under <semantics>
+PUT  /<name>/<version>                       publish: the `.plyz` as the body
+PUT  /<name>/<version>/interface/<semantics> the interface beside it
+POST /<name>/<version>/yank                  mark the version yanked
 ```
 
 `index.json` is `{"name": .., "versions": [{"version": "0.2.0", "digest":
@@ -2928,11 +2930,37 @@ sends it to the registry `PLY_REGISTRY` names, under the token
 dependencies are all `Registry` ones, since whoever depends on it resolves them
 from the registry alone; a program, the anonymous package or a path or git
 dependency is `E0145`, as is a `ply yank` name or version that is not one. The
-registry recomputes the digest from the body and refuses a mismatch, refuses a
-version it already lists — a published version never changes, and the fix is a
-new version — and refuses an archive whose manifest is not the package and
-version it was sent as, names an entry, or depends on anything but the
-registry; each refusal is `E0144` with the registry's reason.
+registry recomputes the digest from the body and refuses a mismatch, refuses
+other bytes under a version it already lists — a published version never
+changes, and the fix is a new version; the same bytes again are the publish it
+holds — and refuses an archive whose manifest is not the package and version it
+was sent as, names an entry, or depends on anything but the registry; each
+refusal is `E0144` with the registry's reason.
+
+A version is held to what it changes. `ply publish` compares the contract of
+every public definition — its signature and specifications, and its body when
+it is `transparent`; a type's or effect's whole declaration — with those of the
+highest unyanked version published below it, each derived from its archive by
+this `ply` as a consumer reads it: a patch moves no contract, a minor only adds
+definitions, and a major may change or remove any. A version that bumps less
+than its changes need is `E0150`, naming what moved and the least version that
+says so, before anything is sent; 0.x versions follow the same places.
+`ply contracts NAME FROM TO` lists what moved between two published versions.
+
+After the archive, `ply publish` sends the package's **interface**: what a load
+of it as a dependency cuts (§16), each module's stub keyed by the sources and
+manifests its analysis read, framed with the semantics version of the `ply` that
+cut it and the archive's digest. The registry keeps one per version and
+semantics and refuses a frame that names another archive or semantics; the same
+bytes again are the one it holds, so a publish whose interface was refused runs
+again whole. The **semantics version** names what a definition's hashes, its
+checked rows and a claim's verdict mean — `ply publish --json` reports it — and
+moves only when one of them does, so a `ply` that changes nothing they mean
+reads an interface another cut. `ply resolve` fetches the interface beside each
+archive into the dependency's slot, and the first load reads the dependency
+through it rather than analysing its source. `--verify-deps` (`check`, `test`,
+`prove`) reads every dependency from source instead and refuses one whose
+interface does not re-derive from it, `E0149`.
 `ply yank NAME VERSION` sets the version's `yanked` field under the same token:
 a new resolution passes it over and a lock that pins it keeps it, and its archive
 is served exactly as before. Nothing is ever deleted.
@@ -2994,10 +3022,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance), `--workspace` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, host, simulation |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets and provenance), `--workspace`, `--verify-deps` |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, host, trace, prove, simulation |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
@@ -3007,11 +3035,12 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY` |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface published for it under this `ply`'s semantics when there is one (`interface` in `--json`) |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
-| `ply publish [path]` | build this library's `.plyz` and upload it to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN` (§15.1) |
+| `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
 | `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
+| `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
@@ -3071,7 +3100,10 @@ every definition's hash, references, effects and specifications, which the
 front end takes as they are. A module whose source or package manifest moved
 since, or that imports one that did, is read from source, as is one the package
 lacks, and the package is cut again from the load's own analysis, so a package
-costs no analysis of its own; a project keeps one per `ply`. A run about the
+costs no analysis of its own; a project keeps one per semantics version (§15.1),
+so a `ply` that changes nothing a hash or a row means reads the one another
+kept. A registry dependency's first load reads it through the interface its
+publisher sent. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
 read and file neither, and a program's own `machine.load` of a program runs the
@@ -3200,6 +3232,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0146` | an embed whose file or directory could not be read |
 | `E0147` | an embed whose path is not a string literal |
 | `E0148` | a `returns` clause the body does not keep |
+| `E0149` | a dependency's published interface that does not re-derive from its source |
+| `E0150` | a version whose changes need a larger bump than it makes |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
