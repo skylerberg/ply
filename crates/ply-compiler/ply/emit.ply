@@ -82,7 +82,7 @@ fn as_num(v: V, w: Width) -> Bytes =
 // An emitted value: the kind it is held at and the C expression naming it.
 pub type V = { k: Kind, c: Bytes, ty: Ty }
 
-pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList
+pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArray
 
 // The type the checker settled an operator's operands at, which alone decides what the operator
 // means; how an operand happens to be held only decides how it is read. `OWord` is read by the
@@ -2548,8 +2548,9 @@ fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
   if name == b"bytes_at" && len(args) == 2 { inline_at(em, args, params, false, span) }
   else if name == b"bytes_u32_le" && len(args) == 2 { inline_at(em, args, params, true, span) }
   else if name == b"bytes_concat_all" && len(args) == 1 { inline_join(em, args, params, span) }
+  else if name == b"array_get" && len(args) == 2 { inline_get(em, args, params, span) }
   else if len(args) != 1 { None }
-  else if name != b"len" && name != b"bytes_len" { None } else {
+  else if name != b"len" && name != b"bytes_len" && name != b"array_len" { None } else {
     match list_at(args, 0) {
       None -> None,
       Some(x) -> match expr(notail(em), x, params) {
@@ -2559,6 +2560,7 @@ fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
           let fits = match o.v.ty {
             TyList -> name == b"len",
             TyBytes -> name == b"bytes_len",
+            TyArray -> name == b"array_len",
             _ -> false,
           };
           if !fits { Some(kind_tested(o.em, name, o.v, None)) } else {
@@ -2855,7 +2857,7 @@ fn kind_tested(em: Em, name: Bytes, v: V, index: Option<V>) -> Out = {
   let out = fresh(t.em);
   let o1 = line(out.em, bytes_concat_all([b"int64_t ", out.name, b" = 0;"]));
   let ok = fresh(o1);
-  let kind = if name == b"len" { b"5" } else { b"10" };
+  let kind = if name == b"len" { b"5" } else if name == b"array_len" { b"15" } else { b"10" };
   let o2 = line(
     ok.em,
     bytes_concat_all([
@@ -3092,6 +3094,66 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool, span: Span) 
     },
   }
 
+// Over an array of known kind, a bounds-tested load; anything else is the runtime's call.
+fn inline_get(em: Em, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
+  match list_at(args, 0) {
+    None -> None,
+    Some(a0) -> match list_at(args, 1) {
+      None -> None,
+      Some(i0) -> match expr(notail(em), a0, params) {
+        None -> None,
+        Some(av0) -> if av0.v.ty != TyArray { None } else {
+          // The array is read before the index and bound after, as `inline_at` reads its bytes.
+          let av = secure_across(av0.em, av0.v, i0, params);
+          match expr(notail(av.em), i0, params) {
+            None -> None,
+            Some(iv0) -> {
+              let t = bind(site(iv0.em, span), KBoxed, as_word(av.v));
+              let idx = bind(t.em, KInt, as_int(iv0.v));
+              let bi = builtin_of(idx.em, b"array_get");
+              let g = line(
+                bi.em,
+                bytes_concat_all([
+                  b"if ((uint64_t)",
+                  idx.v.c,
+                  b" >= (uint64_t)ply_obj(",
+                  t.v.c,
+                  b")->len) { Word a[2]; a[0] = ",
+                  t.v.c,
+                  b"; ply_inc(a[0]); a[1] = (ply_fits_imm(",
+                  idx.v.c,
+                  b") ? ply_imm(",
+                  idx.v.c,
+                  b") : rt_box_int_p(ctx, ",
+                  idx.v.c,
+                  b")); rt_builtin_p(ctx, @@b",
+                  num(bi.i),
+                  b"@@, (Word)(intptr_t)a, 2); return 0; }",
+                ]),
+              );
+              let r = fresh(g);
+              let loaded = line(
+                r.em,
+                bytes_concat_all([
+                  b"Word ",
+                  r.name,
+                  b" = ply_words(",
+                  t.v.c,
+                  b")[",
+                  idx.v.c,
+                  b"]; ply_inc(",
+                  r.name,
+                  b");",
+                ]),
+              );
+              Some({ em: note_holder(loaded, r.name), v: { k: KBoxed, c: r.name, ty: TyOpen } })
+            },
+          }
+        },
+      },
+    },
+  }
+
 fn is_inlined(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
     || name == b"bytes_concat_all"
@@ -3166,6 +3228,7 @@ fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
   else if name == b"bytes_scan_until" && args == 4 { Some(b"rt_bytes_scan_until_p") }
   else if name == b"list_at" && args == 2 { Some(b"rt_list_index_p") }
   else if name == b"list_set" && args == 3 { Some(b"rt_list_set_p") }
+  else if name == b"array_set" && args == 3 { Some(b"rt_array_set_p") }
   // `fold` is absent: it is fused into the body (`fused_fold`).
   else if name == b"map" && args == 2 { Some(b"rt_map_p") }
   else if name == b"filter" && args == 2 { Some(b"rt_filter_p") }
@@ -5575,6 +5638,7 @@ fn lookup_of(
       NVar(fv) -> if fv.slot != None || len(a.args) != 2 || len(xs) != 2
           || fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) { None } else {
         match if fv.name == b"list_at" { Some(b"rt_list_lookup_p") }
+          else if fv.name == b"array_at" { Some(b"rt_array_lookup_p") }
           else if fv.name == b"map_get" { Some(b"rt_map_lookup_p") }
           else { None } {
           None -> None,
@@ -6661,9 +6725,10 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
       if c.name.module != None { Some({ k: KBoxed, ty: TyOpen }) }
       else if c.name.name.name == b"Int" && len(c.args) == 0 { Some({ k: KInt, ty: TyOpen }) }
       else if c.name.name.name == b"Bool" && len(c.args) == 0 { Some({ k: KBool, ty: TyOpen }) }
-      // The inline builtins ask about these two: with the kind known the read is a plain load.
+      // The inline builtins ask about these: with the kind known the read is a plain load.
       else if c.name.name.name == b"Bytes" && len(c.args) == 0 { Some({ k: KBoxed, ty: TyBytes }) }
       else if c.name.name.name == b"List" && len(c.args) == 1 { Some({ k: KBoxed, ty: TyList }) }
+      else if c.name.name.name == b"Array" && len(c.args) == 1 { Some({ k: KBoxed, ty: TyArray }) }
       // A width below 64 bits is carried in a register; the wider ones are the runtime's own words.
       else if len(c.args) == 0 && width_named(c.name.name.name) != None {
         match width_named(c.name.name.name) {

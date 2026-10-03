@@ -417,9 +417,13 @@ constraint: each signature that uses it promises what its expansion needs,
 `where derivable(ord, a)` here, and one that does not is `E0206` where it names
 the alias.
 
-### 4.3 Lists and maps
+### 4.3 Lists, arrays and maps
 
-`List<a>` is an immutable homogeneous sequence `[a, b, c]` (§5.6). `Map<k, v>`
+`List<a>` is an immutable homogeneous sequence `[a, b, c]` (§5.6). `Array<a>`
+is a fixed number of elements laid out one after another, so reading or
+replacing one by its index is a load or a store; it is a value like a list,
+compared, ordered and derived element by element, and has no literal: build it
+with `array_new` or `array_of_list` (§12.1). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
 written `#[a, b]`. It iterates in `compare` order. Its key type
@@ -640,13 +644,15 @@ the checker infers for it, wherever that type was declared — another module's
 `list_at(xs, len(xs) - 1)`). `list_set(xs, i, v)` raises `E0502` out of range.
 
 `push(xs, x)` appends in place when the caller holds the last reference, and
-otherwise copies one path of the list's trie. A copy is caused by a second
-owner: a binding read again after the `push`, a closure capture, a value read
-out with `cell_get`/`map_get` (use `cell_update`/`map_update`), or a caller that
-keeps using what it passed. `ply check --costs` reports every copying `push` in
-the run's own modules with its cause and fix. A `reuse fn` there turns that into
-an error, `E0127`; a dependency's, the shipped modules' included, is checked
-when that package is the one checked:
+otherwise copies one path of the list's trie; `list_set` is the same, and
+`array_set` copies the whole array. A copy is caused by a second owner: a
+binding read again after the update, a closure capture, a value read out with
+`cell_get`/`map_get`/`list_at`/`array_get` (use `cell_update`/`map_update`), or
+a caller that keeps using what it passed. `ply check --costs` reports every
+copying `push`, `list_set` and `array_set` in the run's own modules with its
+cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
+dependency's, the shipped modules' included, is checked when that package is
+the one checked:
 
 ```ply
 reuse fn collect(xs: List<Int>, n: Int) -> List<Int> =
@@ -654,7 +660,7 @@ reuse fn collect(xs: List<Int>, n: Int) -> List<Int> =
 
 reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
   let ys = push(xs, n);
-  if len(xs) < 0 { xs } else { ys }                       // E0127: xs is read again after the append
+  if len(xs) < 0 { xs } else { ys }                       // E0127: xs is read again after the update
 }
 ```
 
@@ -802,8 +808,8 @@ A function value may perform less than the type it meets says, though not more
 written return type or a `let` annotation, and as one of the elements of a list
 or the branches of an `if`, a `match` or a `let ... else`, which meet each
 other; so does any function such a value holds in a record, a tuple, a `List`,
-an `Option`, a `Result`, a `Map` or an `Iter`, and the function a function
-returns. So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`,
+an `Array`, an `Option`, a `Result`, a `Map` or an `Iter`, and the function a
+function returns. So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`,
 a callback whose row names `net.send[conn]` is one a row written
 `/ {net.write[conn]}` admits, and two callbacks fill one row variable with both
 their rows: given `fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e`,
@@ -1313,6 +1319,13 @@ authority when this page and it disagree.
 | `push<a>(xs: List<a>, x: a) -> List<a>` | |
 | `list_at<a>(xs: List<a>, i: Int) -> Option<a>` | `None` if negative or past the end |
 | `list_set<a>(xs: List<a>, i: Int, v: a) -> List<a>` | |
+| `array_new<a>(n: Int, x: a) -> Array<a>` | `n` of `x`; `E0502` if `n` is negative or past `2^26` |
+| `array_of_list<a>(xs: List<a>) -> Array<a>` | |
+| `array_to_list<a>(xs: Array<a>) -> List<a>` | |
+| `array_len<a>(xs: Array<a>) -> Int` | |
+| `array_at<a>(xs: Array<a>, i: Int) -> Option<a>` | `None` if negative or past the end |
+| `array_get<a>(xs: Array<a>, i: Int) -> a` | `E0502` if negative or past the end |
+| `array_set<a>(xs: Array<a>, i: Int, v: a) -> Array<a>` | in place when the caller holds the last reference (§5.6); `E0502` out of range |
 | `map<a, b \| e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e` | |
 | `filter<a \| e>(xs: List<a>, f: (a) -> Bool / e) -> List<a> / e` | |
 | `fold<a, b \| e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e` | |
@@ -3094,7 +3107,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0124` | positional argument after a named one |
 | `E0125` | parameter left unfilled by a call that used a name |
 | `E0126` | top-level `fn` missing a parameter or return type |
-| `E0127` | `reuse fn` with an append that cannot reuse its list |
+| `E0127` | `reuse fn` with an update that cannot happen in place |
 | `E0128` | `ply replace` refused: the result would not check or would move another definition |
 | `E0129` | a `ply.pkg` that is not exactly one `fn package` returning `Manifest` |
 | `E0130` | a manifest body that runs rather than being a value |
@@ -3208,7 +3221,8 @@ Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
 `handle` names is found only when it reaches the host boundary at run time
 (`E0424`), unless its effect is `nondet` in a deterministic test (`E0412`); a
 record update needs the base's type to be known where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
-`string_find` and `list_set` raise where `list_at` answers `None`.
+`string_find`, `list_set`, `array_get` and `array_set` raise where `list_at` and
+`array_at` answer `None`.
 
 ## 19. Examples
 

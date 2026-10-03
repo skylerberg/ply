@@ -2,13 +2,13 @@
 //! argument owns it, one that reads leaves its count alone, and every answer is the caller's.
 
 use crate::heap::{
-    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
-    KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Word, bridged, bytes_of, is_unique, obj,
-    set_word, str_of, word_at,
+    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
+    KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Word, bridged, bytes_of,
+    is_unique, obj, set_word, str_of, word_at,
 };
-use crate::list;
 use crate::map;
 use crate::stack::{Stack, switch};
+use crate::{array, list};
 use ply_eval::arena::{Owner, RegionId, Slot};
 use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::region::StepSite;
@@ -86,6 +86,7 @@ pub enum Identity {
     Str(usize),
     Bytes(usize),
     List(usize, usize, usize, usize),
+    Array(usize),
 }
 
 fn identity(v: &Value) -> Option<Identity> {
@@ -97,6 +98,7 @@ fn identity(v: &Value) -> Option<Identity> {
             let (tail, root, len, start) = items.identity();
             Identity::List(tail, root, len, start)
         }
+        Value::Array(items) => Identity::Array(Arc::as_ptr(items) as usize),
         _ => return None,
     })
 }
@@ -163,6 +165,11 @@ impl Tables {
                 .enumerate()
                 .map(|(i, part)| (list::get(o, i), part))
                 .collect(),
+            Value::Array(items) if items.len() <= PARTS_LIMIT => items
+                .iter()
+                .enumerate()
+                .map(|(i, part)| (unsafe { word_at(o, i) }, part))
+                .collect(),
             _ => Vec::new(),
         };
         for (part_word, part) in parts.into_iter().take(PARTS_LIMIT) {
@@ -222,6 +229,7 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
         Value::Task(_) => Some("a Task"),
         Value::Closure(_) => Some("a Closure"),
         Value::List(items) => items.iter().find_map(holds_a_handle),
+        Value::Array(items) => items.iter().find_map(holds_a_handle),
         Value::Map(entries) => entries
             .iter()
             .find_map(|(k, v)| holds_a_handle(k).or_else(|| holds_a_handle(v))),
@@ -1686,6 +1694,67 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 return None;
             }
             Some(ctx.heap.list_set(*xs, index, *v))
+        }
+        (Builtin::ArrayLen, [xs]) if heap::kind(*xs) == KIND_ARRAY => {
+            let n = array::len(obj(*xs)) as i64;
+            heap::dec(*xs);
+            Some(heap::imm(n))
+        }
+        (Builtin::ArrayGet, [xs, i]) if heap::kind(*xs) == KIND_ARRAY => {
+            let index = usize::try_from(heap::as_int(*i)?).ok()?;
+            let item = *array::items(obj(*xs)).get(index)?;
+            heap::inc(item);
+            heap::dec(*xs);
+            Some(item)
+        }
+        (Builtin::ArrayAt, [xs, i]) if heap::kind(*xs) == KIND_ARRAY => {
+            let index = heap::as_int(*i)?;
+            let some = ctx.tables.layouts.some?;
+            let none = ctx.tables.layouts.none?;
+            let held = usize::try_from(index)
+                .ok()
+                .and_then(|at| array::items(obj(*xs)).get(at).copied());
+            let answer = match held {
+                Some(item) => {
+                    heap::inc(item);
+                    let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
+                    unsafe { set_word(c, 0, item) };
+                    c as Word
+                }
+                None => ctx.nullary(none),
+            };
+            heap::dec(*xs);
+            Some(answer)
+        }
+        (Builtin::ArraySet, [xs, i, v]) if heap::kind(*xs) == KIND_ARRAY => {
+            let index = usize::try_from(heap::as_int(*i)?).ok()?;
+            if index >= array::len(obj(*xs)) {
+                return None;
+            }
+            Some(ctx.heap.array_set(*xs, index, *v))
+        }
+        (Builtin::ArrayNew, [n, x]) => {
+            let n = heap::as_int(*n)?;
+            if !(0..=ply_eval::builtins::MAX_ARRAY_LEN).contains(&n) {
+                return None;
+            }
+            Some(ctx.heap.array_new(n as usize, *x))
+        }
+        (Builtin::ArrayOfList, [xs]) if heap::kind(*xs) == KIND_LIST => {
+            let items = list::to_vec(obj(*xs));
+            for w in &items {
+                heap::inc(*w);
+            }
+            heap::dec(*xs);
+            Some(ctx.heap.array_from(&items))
+        }
+        (Builtin::ArrayToList, [xs]) if heap::kind(*xs) == KIND_ARRAY => {
+            let items = array::items(obj(*xs)).to_vec();
+            for w in &items {
+                heap::inc(*w);
+            }
+            heap::dec(*xs);
+            Some(ctx.heap.list_from(&items))
         }
         (Builtin::Range, [lo, hi]) => {
             let (a, b) = (heap::as_int(*lo)?, heap::as_int(*hi)?);
@@ -3289,6 +3358,29 @@ pub unsafe extern "C" fn rt_list_index(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
 
 pub unsafe extern "C" fn rt_list_set(ctx: *mut Ctx, xs: i64, i: i64, v: i64) -> i64 {
     builtin(unsafe { &mut *ctx }, Builtin::ListSet, &[xs, i, v])
+}
+
+pub unsafe extern "C" fn rt_array_set(ctx: *mut Ctx, xs: i64, i: i64, v: i64) -> i64 {
+    builtin(unsafe { &mut *ctx }, Builtin::ArraySet, &[xs, i, v])
+}
+
+/// `array_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].
+pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    if heap::kind(xs) == KIND_ARRAY
+        && let Some(index) = heap::as_int(i)
+    {
+        let held = usize::try_from(index)
+            .ok()
+            .and_then(|at| array::items(obj(xs)).get(at).copied());
+        if let Some(item) = held {
+            heap::inc(item);
+        }
+        heap::dec(xs);
+        return held.unwrap_or(0);
+    }
+    let answer = builtin_over_values(ctx, Builtin::ArrayAt, &[xs, i]);
+    unwrapped(ctx, answer)
 }
 
 /// `list_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].
