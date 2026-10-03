@@ -797,7 +797,8 @@ cmd_give_back() {
 
 # A family only this run's entry replaces, so a job that wrote nothing keeps what it had; of a family
 # keyed by content, the newest entry on the ref; and what an earlier run on the ref parked for its own
-# jobs, which a cancelled run never gave back. A ref runs one run at a time.
+# jobs, which a cancelled run never gave back. A ref runs one run at a time. On main, every entry of
+# a pull request that is closed, which no run reads again.
 cmd_supersede() {
   local run=${1:?usage: ci-shards.sh supersede RUN_ID REF} ref=${2:?a ref} prefix listing current key id
   for prefix in "${SUPERSEDED[@]}"; do
@@ -826,6 +827,21 @@ cmd_supersede() {
       gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
     done < <(awk '{ family = $1; sub(/[0-9a-f]+$/, "", family); if (seen[family]++) print }' <<< "$listing")
   done
+  [[ $ref == refs/heads/main ]] || return 0
+  local pull last= number state=
+  while read -r pull id; do
+    [[ -n $id ]] || continue
+    if [[ $pull != "$last" ]]; then
+      last=$pull
+      number=${pull#refs/pull/}
+      number=${number%/merge}
+      state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" -q .state 2> /dev/null || echo open)
+    fi
+    [[ $state == closed ]] || continue
+    gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null &&
+      echo "gave back cache $id of closed pull request #$number"
+  done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
+    -q '.actions_caches[] | select(.ref | startswith("refs/pull/")) | "\(.ref) \(.id)"' | sort)
 }
 
 cmd_solo_matrix() {
