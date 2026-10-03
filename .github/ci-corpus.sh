@@ -234,7 +234,7 @@ marked() {
 }
 
 # The emitter's answers `ply` wrote or read since the mark, into DIR.
-kept_c() {
+kept_answers() {
   local dir=$1
   rm -rf "$dir"
   mkdir -p "$dir"
@@ -298,14 +298,14 @@ case "${1:-}" in
   keep)
     dir=${2:?a directory}
     marked || exit 2
-    kept_c "$dir" || exit 1
+    kept_answers "$dir" || exit 1
     du -sh "$dir"
     ;;
   pack)
     tar_out=${2:?a tar file}
     marked || exit 2
     work=$(mktemp -d)
-    kept_c "$work/c" || exit 1
+    kept_answers "$work/c" || exit 1
     # A store is one file set: it travels whole, from the partition that wrote it.
     for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache; do
       [ -d "$store" ] && [ -n "$(find "$store" -type f -newer "$mark" -print -quit)" ] || continue

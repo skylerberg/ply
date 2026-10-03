@@ -1451,7 +1451,7 @@ it reaches, is part of what its dependents are checked and proved against.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
-values. A proposition that raises is a gap in the claim; one the compiled tier
+values. A proposition that raises is a gap in the claim; one the C backend
 declines, or any other failure that is Ply's own, is a `defect` reported under
 Ply's code (`E0505`), as `ply test` reports one. Under `--json` a gap carries
 its sentence as `gap` and its kind as `gap_kind` (`unhandled_effect`,
@@ -1616,7 +1616,7 @@ authority when this page and it disagree.
 | `map_merge<k, v>(a: Map<k, v>, b: Map<k, v>) -> Map<k, v>` | `b` wins |
 | `map_fold<k, v, c \| e>(m: Map<k, v>, init: c, f: (c, k, v) -> c / e) -> c / e` | key order |
 | `map_update<k, v \| e>(m: Map<k, v>, key: k, f: (v) -> v / e) -> Map<k, v> / e` | no-op if absent |
-| `observe<a>(v: a) -> a` | the identity, through a call the C tier cannot see into: a pure computation whose value is only observed still runs |
+| `observe<a>(v: a) -> a` | the identity, through a call the C backend cannot see into: a pure computation whose value is only observed still runs |
 
 ### 12.2 Strings and bytes
 
@@ -3452,8 +3452,8 @@ one in `sampled_every` is walked, with the rows scaled back up, so they read in
 the totals' units and their sum is near the total rather than equal to it.
 `--count-alloc-sites-exact=PATH` walks every allocation instead, for a census
 that is exact and slower.
-A run whose work is interpreted has no such frames: its allocations are the
-interpreter's, and they are what the totals are made of.
+An allocation with no `ply_*` frame on its stack is counted under the site
+`<no ply frame>`.
 What a host may lend is a policy with names, one family each:
 `machine` (load, bind, enter and call a nested program), `tester`, `claims`,
 `builder`, `hosts`, `edit` and `shipped`, each with a summary a
@@ -3668,7 +3668,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0444` | artifact built by another compiler or for another runtime |
 | `E0445` | `trace.exit` of a span not open on this task |
 | `E0446` | value outlives its region |
-| `E0448` | definition the compiled tier cannot compile |
+| `E0448` | definition the C backend cannot compile |
 | `E0449` | region handle or continuation reaching a runtime boundary |
 | `E0450` | compiled backend cannot be attached |
 | `E0451` | `fs` label with no root bound |

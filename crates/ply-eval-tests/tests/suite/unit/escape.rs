@@ -27,7 +27,7 @@ fn closure(kind: ClosureKind) -> Value {
 }
 
 /// Assembled, since only the C backend has a continuation's code; its captures are numbers, as
-/// the tier's are.
+/// the backend's are.
 fn continuation() -> Value {
     closure(ClosureKind::Continuation {
         code: 0,

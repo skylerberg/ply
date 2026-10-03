@@ -103,7 +103,7 @@ fn a_reset_closes_a_region_the_last_entry_point_abandoned() {
     assert_eq!(regions.live(), 0);
 }
 
-/// The tier's store, whose floor holds no cell, renews once its entry's regions are closed; a
+/// The backend's store, whose floor holds no cell, renews once its entry's regions are closed; a
 /// fixture's cells are named by its handle, so a store holding them is never renewed.
 #[test]
 fn only_a_store_whose_floor_holds_no_cell_renews() {

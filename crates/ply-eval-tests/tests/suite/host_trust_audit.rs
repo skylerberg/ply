@@ -17,7 +17,7 @@ impl Compiled {
             registry.register(op, handler);
         }
         let binding = registry.bind(&self.front.check).expect("the fixture binds");
-        let mut machine = self.machine_on_tier();
+        let mut machine = self.machine_on_backend();
         machine.set_host_binding(Arc::new(binding));
         machine
     }
@@ -489,7 +489,7 @@ fn helper(k: Int) -> Int / {{net.write[socket]}} = net.send[socket](k)
         let mut registry = HostRegistry::new();
         registry.register(any("net", "send"), handler.clone());
 
-        let mut machine = compiled.machine_on_tier();
+        let mut machine = compiled.machine_on_backend();
         machine.set_host_binding(Arc::new(HostBinding::hermetic_with(registry)));
         let d = diagnostic(machine.eval_test(0));
         assert_eq!(
@@ -526,7 +526,7 @@ test/nondet "a socket inside a region" { simulate { assert_eq(helper(1), 1) } }
         let handler = Arc::new(Mutates::default());
         let mut registry = HostRegistry::new();
         registry.register(any("net", "send"), handler.clone());
-        let mut machine = compiled.machine_on_tier();
+        let mut machine = compiled.machine_on_backend();
         machine.set_host_binding(Arc::new(if bound {
             registry.bind(&compiled.front.check).expect("binds")
         } else {
@@ -664,7 +664,7 @@ test/nondet "a handler that lies about why" { assert_eq(net.send[socket](1), 1) 
             "nothing names the handler the failure came from: {:?}",
             d.notes
         );
-        // No span assertion: the tier hands a host handler `Span::DUMMY`.
+        // No span assertion: the backend hands a host handler `Span::DUMMY`.
     }
 }
 

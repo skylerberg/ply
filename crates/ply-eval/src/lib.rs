@@ -67,9 +67,9 @@ pub use host::{
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{
-    Analysis, BlankedSpan, CheckOutput, DefInfo, DefWritten, EffectInfo, EmitterRoot, LawInfo,
-    ModuleInfo, ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility,
-    WrittenParam, is_ident, is_ident_continue, is_ident_start,
+    Analysis, CheckOutput, DefInfo, DefWritten, EffectInfo, EmitterRoot, LawInfo, ModuleInfo,
+    ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility, WrittenParam,
+    is_ident, is_ident_continue, is_ident_start,
 };
 pub use rc::RcStats;
 pub use region::{Interleaving, SimId, Verdict};
@@ -77,7 +77,7 @@ pub use sched::TaskHandle;
 pub use semantics::strict_binary;
 pub use sim::{
     Access, Answer, Clock, Domain, Handlers, OpSignature, Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed,
-    SimTy, Sleep, StepFootprint, Stream, TaskId, Wake,
+    SimType, Sleep, StepFootprint, Stream, TaskId, Wakeup,
 };
 pub use span::{
     Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Sparse, Symbol,
