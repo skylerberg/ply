@@ -7,18 +7,18 @@
 // printed by one printer that names each variable by its number, so `Var(1)` is `b` both in the text
 // a report prints and in the sort the runtime reasons with.
 
-import compiler.diag (parse_all)
-import compiler.front (Whole, Analysed, Refused, analyse, literals_of)
+import compiler.diagnostics (parse_all)
+import compiler.front (Analysis, Analysed, Refused, analyse, literals_of)
 import compiler.infer (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo)
 import compiler.items (Item, IFn, ILaw, SEnsures, SRequires, SpecClause)
 import compiler.exprs (Expr, Param, expr_span)
 import compiler.hash (HashOutput, hex)
-import compiler.resolve (Diag, Mod, diag1, qualify)
-import compiler.spine (Span)
-import compiler.tycore (Atom, Field, Printer, Type, TyCon, TyFn, TyRecord, TyVar, at, contains_int,
-                        field_get, print_resource, print_row, print_ty, printer_naming, printer_new,
-                        reserve_atoms, row_is_pure, tuple_arity, ty_letter)
-import compiler.types (MWrite)
+import compiler.resolve (Diag, ParsedModule, error_at, qualify)
+import compiler.parsing (Span)
+import compiler.types (Atom, Field, Printer, Type, TyCon, TyFn, TyRecord, TyVar, at, contains_int,
+                       field_get, print_resource, print_row, print_ty, printer_naming, printer_new,
+                       reserve_atoms, row_is_pure, tuple_arity, ty_letter)
+import compiler.type_syntax (MWrite)
 import domain (Cases, Con, Decl, Domain, Fn, Record, Scalar, Shape, Ty, Var, Variant, finite,
                name_of)
 import obligation (Def, Ensures, Frame, Kind, Law, Pure, Writes, Written)
@@ -92,7 +92,7 @@ pub type Built = { world: World, defs: List<Def>, laws: List<Written>, warnings:
 
 // Every declared type and signature, and the obligations of the modules `owned` answers for: every
 // definition's `ensures` clauses in the checker's order, then every law.
-pub fn world_of(w: Whole, owned: (Bytes) -> Bool) -> Built = {
+pub fn world_of(w: Analysis, owned: (Bytes) -> Bool) -> Built = {
   let decls = decls_of(w.checked.ctors);
   let written = written_params(w.mods);
   let wheres = law_guards(w.mods);
@@ -265,7 +265,10 @@ fn binders_of(named: List<Named>) -> Printed = {
     { p: numbered(vars), out: [] },
     |acc: { p: Printer, out: List<Binder> }, b: Named| {
       let o = print_ty(acc.p, b.ty);
-      { p: o.p, out: push(acc.out, { name: text(b.name), ty: ty_of(b.ty, vars), text: text(o.s) }) }
+      {
+        p: o.printer,
+        out: push(acc.out, { name: text(b.name), ty: ty_of(b.ty, vars), text: text(o.text) }),
+      }
     },
   );
   { binders: printed.out, variables: map(range(0, len(vars)), |i: Int| text(ty_letter(i))) }
@@ -333,8 +336,8 @@ fn at_of(module: Int, s: Span) -> { module: Int, start: Int, end: Int } =
   }
 
 // Each definition's parameters as its signature wrote them, by program-wide name.
-fn written_params(mods: List<Mod>) -> Map<Bytes, List<Bytes>> =
-  fold(mods, map_new(), |acc: Map<Bytes, List<Bytes>>, m: Mod|
+fn written_params(mods: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
+  fold(mods, map_new(), |acc: Map<Bytes, List<Bytes>>, m: ParsedModule|
     fold(m.module.items, acc, |a: Map<Bytes, List<Bytes>>, it: Item|
       match it {
         IFn(d) ->
@@ -343,8 +346,8 @@ fn written_params(mods: List<Mod>) -> Map<Bytes, List<Bytes>> =
       }))
 
 // Each definition's `requires` expressions, in order, by program-wide name.
-fn requires_of(mods: List<Mod>) -> Map<Bytes, List<Expr>> =
-  fold(mods, map_new(), |acc: Map<Bytes, List<Expr>>, m: Mod|
+fn requires_of(mods: List<ParsedModule>) -> Map<Bytes, List<Expr>> =
+  fold(mods, map_new(), |acc: Map<Bytes, List<Expr>>, m: ParsedModule|
     fold(m.module.items, acc, |a: Map<Bytes, List<Expr>>, it: Item|
       match it {
         IFn(d) ->
@@ -357,8 +360,8 @@ fn requires_of(mods: List<Mod>) -> Map<Bytes, List<Expr>> =
       }))
 
 // Each law's `where`, by program-wide name.
-fn law_guards(mods: List<Mod>) -> Map<Bytes, Expr> =
-  fold(mods, map_new(), |acc: Map<Bytes, Expr>, m: Mod|
+fn law_guards(mods: List<ParsedModule>) -> Map<Bytes, Expr> =
+  fold(mods, map_new(), |acc: Map<Bytes, Expr>, m: ParsedModule|
     fold(m.module.items, acc, |a: Map<Bytes, Expr>, it: Item|
       match it {
         ILaw(d) -> match d.guard {
@@ -378,9 +381,9 @@ fn frame_of(footprint: List<Atom>) -> Frame = {
       { p: reserve_atoms(printer_new(), writes), texts: [] },
       |acc: { p: Printer, texts: List<String> }, a: Atom| {
         let r = print_resource(acc.p, a.resource);
-        let written = text(bytes_concat(a.effect, r.s));
+        let written = text(bytes_concat(a.effect, r.text));
         {
-          p: r.p,
+          p: r.printer,
           texts: if fold(acc.texts, false, |seen: Bool, x: String| seen || x == written) {
             acc.texts
           } else { push(acc.texts, written) },
@@ -394,12 +397,12 @@ fn frame_of(footprint: List<Atom>) -> Frame = {
 // A row as a report prints it, its labels named apart from the resources it names.
 fn footprint_text(atoms: List<Atom>) -> Option<String> =
   if len(atoms) == 0 { None } else {
-    Some(text(print_row(reserve_atoms(printer_new(), atoms), { atoms: atoms, tail: None }).s))
+    Some(text(print_row(reserve_atoms(printer_new(), atoms), { atoms: atoms, tail: None }).text))
   }
 
 // A claim with no key was never hashed, so nothing may be filed or read under one for it.
 fn unhashed(name: Bytes, module: Int, s: Span) -> Diag = {
-  let d: Diag = diag1(
+  let d: Diag = error_at(
     b"W0602",
     module,
     s,
@@ -512,7 +515,7 @@ fn law_of(
 
 // --- Tests ---------------------------------------------------------------------------
 
-fn whole_of(src: Bytes) -> Whole =
+fn whole_of(src: Bytes) -> Analysis =
   match analyse(parse_all([{ name: b"m", src: src }])) {
     Refused(_) -> panic("the fixture checks"),
     Analysed(w) -> w,

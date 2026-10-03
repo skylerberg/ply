@@ -647,7 +647,7 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
-/// Each builtin's parameter count in the scheme the port's checker binds it to: its `tycore.Type`,
+/// Each builtin's parameter count in the scheme the port's checker binds it to: its `types.Type`,
 /// which is a `TyFn` whose `params` are the parameters, and ahead of them the witnesses the
 /// elaboration passes for a `numeric` or `integer` constraint.
 fn prelude_arities() -> std::collections::BTreeMap<String, usize> {

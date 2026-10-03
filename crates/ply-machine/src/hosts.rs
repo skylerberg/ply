@@ -727,7 +727,7 @@ impl HostHandler for Facility {
         let value = match (req.op.op.as_str(), req.args) {
             ("schema", [path, front, unit, name]) => {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
-                let front = crate::driver::handed_front_of(front, span)?;
+                let front = crate::driver::loaded_analysis_of(front, span)?;
                 let unit = unit.as_bytes(span, "the program's unit")?;
                 let name = name.as_str(span, "a definition's name")?;
                 crate::config::schema_answer(schema(&path, &front, unit, name, self.hermetic))
@@ -736,7 +736,7 @@ impl HostHandler for Facility {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
                 let mut options = crate::drive::run_options_of(options, span)?;
                 options.hermetic = self.hermetic;
-                let front = crate::driver::handed_front_of(front, span)?;
+                let front = crate::driver::loaded_analysis_of(front, span)?;
                 let configuration = Configuration::of(config, span)?;
                 Assembled::of(&path, &options, &front, configuration).preview(&self.module)
             }
@@ -750,7 +750,7 @@ impl HostHandler for Facility {
 /// for it alone: this command runs nothing else.
 fn schema(
     path: &std::path::Path,
-    front: &crate::driver::HandedFront,
+    front: &crate::driver::LoadedAnalysis,
     unit: &[u8],
     name: &str,
     hermetic: bool,
@@ -785,7 +785,7 @@ impl Assembled {
     fn of(
         path: &std::path::Path,
         options: &crate::drive::RunOptions,
-        front: &crate::driver::HandedFront,
+        front: &crate::driver::LoadedAnalysis,
         configuration: Configuration,
     ) -> Assembled {
         let loaded = match loaded_over(path, front, options.hermetic) {
@@ -882,13 +882,13 @@ type Refusal = (&'static str, Vec<Diagnostic>);
 /// The root is decided lexically when nothing may be read off the disk.
 fn loaded_over(
     path: &std::path::Path,
-    front: &crate::driver::HandedFront,
+    front: &crate::driver::LoadedAnalysis,
     hermetic: bool,
 ) -> Result<crate::load::Loaded, crate::load::LoadError> {
     if hermetic {
-        crate::driver::load_over_front_in(crate::load::tidy(path), front)
+        crate::driver::load_over_analysis_in(crate::load::tidy(path), front)
     } else {
-        crate::driver::load_over_front(path, front)
+        crate::driver::load_over_analysis(path, front)
     }
 }
 

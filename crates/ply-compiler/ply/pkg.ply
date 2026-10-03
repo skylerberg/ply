@@ -3,11 +3,11 @@
 // one §3.1 states for parameter defaults: a literal, a constructor applied to literals, a
 // record or a list.
 
-import spine (Span, PDiag, diag1, dummy_span)
+import parsing (Span, ParseDiag, error_at, dummy_span)
 import items (Module, IFn, FnDef, item_span, parse)
 import exprs (Expr, ELit, EVar, EApp, ERecord, EList, RecField, expr_span)
 import patterns (LInt, LBool, LStr, LUnit)
-import types (TCon, ty_span)
+import type_syntax (TCon, ty_span)
 import hash (hex, sort_bytes)
 import resolve (Source)
 import embed (EmbedAt, EmbedFile)
@@ -15,18 +15,18 @@ import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, 
 import std.hash (blake3)
 import std.pkg (Manifest, Version, Dep, Path, Git, Registry, manifest_json, prefix_of)
 
-pub type Checked = { manifest: Option<Manifest>, diags: List<PDiag> }
+pub type Checked = { manifest: Option<Manifest>, diags: List<ParseDiag> }
 
 pub fn check_source(src: Bytes) -> Checked = {
   let r = parse(src);
-  if len(r.p.diags) > 0 { { manifest: None, diags: r.p.diags } } else { check(r.node) }
+  if len(r.parser.diags) > 0 { { manifest: None, diags: r.parser.diags } } else { check(r.node) }
 }
 
 fn at<a>(xs: List<a>, i: Int) -> a =
   match list_at(xs, i) { Some(x) -> x, None -> panic("an index the tables do not hold") }
 
-pub fn check(m: Module) -> Checked =
-  match m.items {
+pub fn check(module: Module) -> Checked =
+  match module.items {
     [one] -> match one {
       IFn(d) -> if d.name.name == b"package" { check_fn(d) }
       else { refused(shape(d.name.span, b"a manifest's one definition is named `package`")) },
@@ -37,22 +37,22 @@ pub fn check(m: Module) -> Checked =
       refused(shape(item_span(two), b"a manifest defines `package` and nothing else")),
   }
 
-fn refused(d: PDiag) -> Checked = { manifest: None, diags: [d] }
+fn refused(diag: ParseDiag) -> Checked = { manifest: None, diags: [diag] }
 
-fn shape(here: Span, message: Bytes) -> PDiag =
-  diag1(b"E0129", here, message, b"not the shape a manifest takes", [
+fn shape(here: Span, message: Bytes) -> ParseDiag =
+  error_at(b"E0129", here, message, b"not the shape a manifest takes", [
     b"a `ply.pkg` file is exactly `fn package() -> Manifest = ...`, with std.pkg's Manifest",
   ])
 
-fn cat(xs: List<PDiag>, ys: List<PDiag>) -> List<PDiag> =
-  fold(ys, xs, |acc: List<PDiag>, y: PDiag| push(acc, y))
+fn cat(xs: List<ParseDiag>, ys: List<ParseDiag>) -> List<ParseDiag> =
+  fold(ys, xs, |acc: List<ParseDiag>, diag: ParseDiag| push(acc, diag))
 
-fn check_fn(d: FnDef) -> Checked = {
-  let ret_diags = match d.ret {
+fn check_fn(def: FnDef) -> Checked = {
+  let ret_diags = match def.ret {
     None ->
       [
         shape_msg(
-          d.name.span,
+          def.name.span,
           b"`package` declares its return type, std.pkg's `Manifest`",
           b"no return type written",
         ),
@@ -71,29 +71,29 @@ fn check_fn(d: FnDef) -> Checked = {
         ],
     },
   };
-  let param_diags = if len(d.params) == 0 { [] } else {
+  let param_diags = if len(def.params) == 0 { [] } else {
     [
       shape_msg(
-        d.name.span,
+        def.name.span,
         b"`package` takes no parameters",
         b"a manifest is data; nothing is passed in",
       ),
     ]
   };
   let diags = cat(ret_diags, param_diags);
-  if len(diags) > 0 { { manifest: None, diags: diags } } else { check_body(d) }
+  if len(diags) > 0 { { manifest: None, diags: diags } } else { check_body(def) }
 }
 
-fn shape_msg(here: Span, message: Bytes, label: Bytes) -> PDiag =
-  diag1(b"E0129", here, message, label, [])
+fn shape_msg(here: Span, message: Bytes, label: Bytes) -> ParseDiag =
+  error_at(b"E0129", here, message, label, [])
 
-fn check_body(d: FnDef) -> Checked =
-  match literal_json(d.body) {
+fn check_body(def: FnDef) -> Checked =
+  match literal_json(def.body) {
     Err(s) ->
       {
         manifest: None,
         diags: [
-          diag1(
+          error_at(
             b"E0130",
             s,
             b"a manifest is a value, not something that runs",
@@ -107,22 +107,22 @@ fn check_body(d: FnDef) -> Checked =
         {
           manifest: None,
           diags: [
-            diag1(
+            error_at(
               b"E0131",
-              expr_span(d.body),
+              expr_span(def.body),
               bytes_of_string(error_to_string(e)),
               b"the manifest does not decode",
               [],
             ),
           ],
         },
-      Ok(m) -> validate(m, expr_span(d.body)),
+      Ok(m) -> validate(m, expr_span(def.body)),
     },
   }
 
 // `None` and `Some` encode the way the json derive encodes `Option`: null and the bare value.
-fn literal_json(e: Expr) -> Result<Json, Span> =
-  match e {
+fn literal_json(expr: Expr) -> Result<Json, Span> =
+  match expr {
     ELit(v) -> match v.lit {
       LInt(n) -> Ok(Number(decimal_of_int(n))),
       LBool(b) -> Ok(Bool(b)),
@@ -141,7 +141,7 @@ fn literal_json(e: Expr) -> Result<Json, Span> =
     EVar(v) -> if v.name.name.name == b"None" { Ok(Null) }
     else if is_ctor(v.name.name.name) { Ok(variant(string_of_bytes(v.name.name.name), [])) }
     else { Err(v.span) },
-    _ -> Err(expr_span(e)),
+    _ -> Err(expr_span(expr)),
   }
 
 fn ctor_json(here: Span, tag: Bytes, args: List<Expr>) -> Result<Json, Span> =
@@ -152,8 +152,8 @@ fn ctor_json(here: Span, tag: Bytes, args: List<Expr>) -> Result<Json, Span> =
     }
   }
 
-fn items_json(xs: List<Expr>, acc: List<Json>) -> Result<List<Json>, Span> =
-  match xs {
+fn items_json(exprs: List<Expr>, acc: List<Json>) -> Result<List<Json>, Span> =
+  match exprs {
     [] -> Ok(acc),
     [x, ..rest] -> match literal_json(x) {
       Err(s) -> Err(s),
@@ -161,8 +161,8 @@ fn items_json(xs: List<Expr>, acc: List<Json>) -> Result<List<Json>, Span> =
     },
   }
 
-fn fields_json(fs: List<RecField>, acc: List<Member>) -> Result<Json, Span> =
-  match fs {
+fn fields_json(fields: List<RecField>, acc: List<Member>) -> Result<Json, Span> =
+  match fields {
     [] -> Ok(object(acc)),
     [f, ..rest] -> match literal_json(f.value) {
       Err(s) -> Err(s),
@@ -173,38 +173,38 @@ fn fields_json(fs: List<RecField>, acc: List<Member>) -> Result<Json, Span> =
 fn is_ctor(name: Bytes) -> Bool =
   bytes_len(name) > 0 && bytes_at(name, 0) >= 65 && bytes_at(name, 0) <= 90
 
-fn validate(m: Manifest, here: Span) -> Checked = {
+fn validate(manifest: Manifest, here: Span) -> Checked = {
   let bad = field_diag(here);
-  let name_diags = if bytes_len(bytes_of_string(m.name)) == 0 {
+  let name_diags = if bytes_len(bytes_of_string(manifest.name)) == 0 {
     [bad(b"a manifest's `name` must not be empty")]
-  } else if !is_dotted_path(m.name) {
+  } else if !is_dotted_path(manifest.name) {
     [bad(b"a manifest's `name` is lower-case identifier segments joined by dots")]
   } else { [] };
-  let prefix_diags = match m.prefix {
+  let prefix_diags = match manifest.prefix {
     None -> [],
     Some(p) -> if is_dotted_path(p) { [] }
     else { [bad(b"a manifest's `prefix` is lower-case identifier segments joined by dots")] },
   };
-  let version_diags = if version_ok(m.version) { [] }
+  let version_diags = if version_ok(manifest.version) { [] }
   else { [bad(b"a manifest's `version` counts up from zero, never below")] };
   let base = cat(name_diags, cat(prefix_diags, version_diags));
   {
-    manifest: if len(base) == 0 { Some(m) } else { None },
-    diags: deps_ok(m.dependencies, [], base, bad),
+    manifest: if len(base) == 0 { Some(manifest) } else { None },
+    diags: deps_ok(manifest.dependencies, [], base, bad),
   }
 }
 
-fn field_diag(here: Span) -> (Bytes) -> PDiag =
-  |message: Bytes| diag1(b"E0131", here, message, b"not a field a manifest accepts", [])
+fn field_diag(here: Span) -> (Bytes) -> ParseDiag =
+  |message: Bytes| error_at(b"E0131", here, message, b"not a field a manifest accepts", [])
 
 fn version_ok(v: Version) -> Bool = v.major >= 0 && v.minor >= 0 && v.patch >= 0
 
 fn deps_ok(
   deps: List<Dep>,
   seen: List<Bytes>,
-  diags: List<PDiag>,
-  bad: (Bytes) -> PDiag,
-) -> List<PDiag> =
+  diags: List<ParseDiag>,
+  bad: (Bytes) -> ParseDiag,
+) -> List<ParseDiag> =
   match deps {
     [] -> diags,
     [d, ..rest] -> {
@@ -362,7 +362,7 @@ fn a_registry_dep(name: String, floor: Int) -> String =
     ++ ", patch: 0}, source: Registry}"
 
 fn codes_of(clo: Closure) -> List<Bytes> =
-  map(clo.diags, |d: { slot: Int, diag: PDiag }| d.diag.code)
+  map(clo.diags, |d: { slot: Int, diag: ParseDiag }| d.diag.code)
 
 test "a registry dependency is wanted at the root's cache, whichever package declares it" {
   let app = supplied_at("/x/app", "app", [a_registry_dep("orders", 1), a_dep("lib", 0, "../lib")]);
@@ -375,14 +375,14 @@ test "a registry dependency is wanted at the root's cache, whichever package dec
 }
 
 test "a registry dependency at or above its floor is the package its slot holds" {
-  let pkgs: Pkgs = {
+  let pkgs: PackageSources = {
     root: b"/x/app",
     manifest: Some(a_manifest("app", [a_registry_dep("orders", 1)])),
     supplied: [supplied_at("/x/app/.ply-cache/registry/orders", "orders", [])],
   };
   let clo = closure(pkgs, []);
   assert_eq(clo.diags, []);
-  assert_eq(map(clo.packages, |p: Package| p.prefix), [b"app", b"orders"]);
+  assert_eq(map(clo.packages, |package: Package| package.prefix), [b"app", b"orders"]);
   assert_eq(at(clo.packages, 0).deps, [b"orders"])
 }
 
@@ -437,7 +437,7 @@ test "a package two others depend on is not a cycle" {
 }
 
 test "a diamond of one version is what a closure pins: both requesters, one package" {
-  let pkgs: Pkgs = {
+  let pkgs: PackageSources = {
     root: b"/x/app",
     manifest: Some(a_manifest("app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")])),
     supplied: [
@@ -448,11 +448,11 @@ test "a diamond of one version is what a closure pins: both requesters, one pack
   };
   let clo = closure(pkgs, []);
   assert_eq(clo.diags, []);
-  assert_eq(map(clo.packages, |p: Package| p.prefix), [b"app", b"b", b"c", b"d"])
+  assert_eq(map(clo.packages, |package: Package| package.prefix), [b"app", b"b", b"c", b"d"])
 }
 
 test "a package of one version at two places has no version to pick" {
-  let pkgs: Pkgs = {
+  let pkgs: PackageSources = {
     root: b"/x/app",
     manifest: Some(a_manifest("app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")])),
     supplied: [
@@ -463,7 +463,7 @@ test "a package of one version at two places has no version to pick" {
     ],
   };
   let clo = closure(pkgs, []);
-  let codes = map(clo.diags, |d: { slot: Int, diag: PDiag }| d.diag.code);
+  let codes = map(clo.diags, |d: { slot: Int, diag: ParseDiag }| d.diag.code);
   assert_eq(codes, [b"E0137"]);
   let text = string_of_bytes_lossy(at(clo.diags, 0).diag.message);
   assert(string_contains(text, "`b` wants `/x/d1`"));
@@ -471,13 +471,13 @@ test "a package of one version at two places has no version to pick" {
 }
 
 test "a dependency below the floor its importer asks for is named with both versions" {
-  let pkgs: Pkgs = {
+  let pkgs: PackageSources = {
     root: b"/x/app",
     manifest: Some(a_manifest("app", [a_dep("b", 9, "../b")])),
     supplied: [supplied_at("/x/b", "b", [])],
   };
   let clo = closure(pkgs, []);
-  let codes = map(clo.diags, |d: { slot: Int, diag: PDiag }| d.diag.code);
+  let codes = map(clo.diags, |d: { slot: Int, diag: ParseDiag }| d.diag.code);
   assert_eq(codes, [b"E0136"]);
   let text = string_of_bytes_lossy(at(clo.diags, 0).diag.message);
   assert(string_contains(text, "is version 0.1.0"));
@@ -527,7 +527,7 @@ pub type Supplied = { root: Bytes, manifest: Option<Bytes>, modules: List<Source
 
 // The packages one load is made of: the root's own manifest (`None` is the anonymous
 // package) and everything the walk reached from it.
-pub type Pkgs = { root: Bytes, manifest: Option<Bytes>, supplied: List<Supplied> }
+pub type PackageSources = { root: Bytes, manifest: Option<Bytes>, supplied: List<Supplied> }
 
 // One package of the settled closure: its granted module prefix, the prefixes it declares,
 // and its decoded manifest (`None` when the root held none or the text did not check).
@@ -541,7 +541,7 @@ pub type Closure = {
   modules: List<{ pkg: Int, src: Source }>,
   // Diagnostics by the slot the manifest's text takes after every module (0-based); a
   // negative slot points at the module `-(slot) - 1` of the program instead.
-  diags: List<{ slot: Int, diag: PDiag }>,
+  diags: List<{ slot: Int, diag: ParseDiag }>,
 }
 
 fn head_of<a>(xs: List<a>, n: Int) -> List<a> = map(range(0, n), |i: Int| at(xs, i))
@@ -647,11 +647,11 @@ fn slot_of(manifests: List<Option<Bytes>>, i: Int) -> Int = {
 // manifest texts before it, so the front end can place it after every module.
 fn checked_manifests(
   texts: List<Option<Bytes>>,
-) -> { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: PDiag }> } =
+) -> { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: ParseDiag }> } =
   fold(
     range(0, len(texts)),
     { manifests: [], diags: [] },
-    |acc: { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: PDiag }> }, i: Int|
+    |acc: { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: ParseDiag }> }, i: Int|
       match at(texts, i) {
         None -> { ..acc, manifests: push(acc.manifests, None) },
         Some(src) -> {
@@ -659,29 +659,36 @@ fn checked_manifests(
           let slot = slot_of(texts, i);
           {
             manifests: push(acc.manifests, c.manifest),
-            diags: fold(c.diags, acc.diags, |ds: List<{ slot: Int, diag: PDiag }>, d: PDiag|
-              push(ds, { slot: slot, diag: d })),
+            diags: fold(
+              c.diags,
+              acc.diags,
+              |ds: List<{ slot: Int, diag: ParseDiag }>, diag: ParseDiag|
+                push(ds, { slot: slot, diag: diag }),
+            ),
           }
         },
       },
   )
 
-fn pkg_diag(slot: Int, code: Bytes, message: Bytes) -> { slot: Int, diag: PDiag } =
-  { slot: slot, diag: diag1(code, dummy_span(), message, b"in this package's manifest", []) }
+fn manifest_diag(slot: Int, code: Bytes, message: Bytes) -> { slot: Int, diag: ParseDiag } =
+  { slot: slot, diag: error_at(code, dummy_span(), message, b"in this package's manifest", []) }
 
 // The packages of one load, judged: dependencies usable, prefixes unique, the graph acyclic,
 // and the dependency modules named. `root_modules` are the root package's own module names,
 // whose first segments may not squat on a dependency's prefix.
-pub fn empty() -> Pkgs = { root: b"", manifest: None, supplied: [] }
+pub fn empty() -> PackageSources = { root: b"", manifest: None, supplied: [] }
 
-pub fn closure(pkgs: Pkgs, root_modules: List<Bytes>) -> Closure = {
+pub fn closure(pkgs: PackageSources, root_modules: List<Bytes>) -> Closure = {
   let texts: List<Option<Bytes>> = fold(
     pkgs.supplied,
     [pkgs.manifest],
-    |acc: List<Option<Bytes>>, s: Supplied| push(acc, s.manifest),
+    |acc: List<Option<Bytes>>, supplied: Supplied| push(acc, supplied.manifest),
   );
-  let roots: List<Bytes> = fold(pkgs.supplied, [pkgs.root], |acc: List<Bytes>, s: Supplied|
-    push(acc, s.root));
+  let roots: List<Bytes> = fold(
+    pkgs.supplied,
+    [pkgs.root],
+    |acc: List<Bytes>, supplied: Supplied| push(acc, supplied.root),
+  );
   let checked = checked_manifests(texts);
   let packages = map(range(0, len(roots)), |i: Int| {
     let m = at(checked.manifests, i);
@@ -712,14 +719,21 @@ fn name_modules(
     let p = at(packages, i);
     let named = match p.manifest {
       None ->
-        fold(at(supplied, i - 1).modules, out, |o: List<{ pkg: Int, src: Source }>, s: Source|
-          push(o, { pkg: i, src: s })),
+        fold(
+          at(supplied, i - 1).modules,
+          out,
+          |o: List<{ pkg: Int, src: Source }>, source: Source| push(o, { pkg: i, src: source }),
+        ),
       Some(_) ->
-        fold(at(supplied, i - 1).modules, out, |o: List<{ pkg: Int, src: Source }>, s: Source|
-          push(o, {
-            pkg: i,
-            src: { name: bytes_concat_all([p.prefix, b".", s.name]), src: s.src },
-          })),
+        fold(
+          at(supplied, i - 1).modules,
+          out,
+          |o: List<{ pkg: Int, src: Source }>, source: Source|
+            push(o, {
+              pkg: i,
+              src: { name: bytes_concat_all([p.prefix, b".", source.name]), src: source.src },
+            }),
+        ),
     };
     name_modules(packages, supplied, i + 1, named)
   }
@@ -755,7 +769,10 @@ fn package_digest(pkg: Int, clo: Closure, embeds: List<EmbedAt>) -> Bytes = {
     bytes_concat_all([m.src.name, b"\0", m.src.src, b"\0"]));
   let names = fold(mine, map_new(), |acc: Map<Bytes, Bool>, m: { pkg: Int, src: Source }|
     map_insert(acc, m.src.name, true));
-  let embedded = map(filter(embeds, |e: EmbedAt| map_contains(names, e.module)), embed_part);
+  let embedded = map(
+    filter(embeds, |embed: EmbedAt| map_contains(names, embed.module)),
+    embed_part,
+  );
   let modules = bytes_concat_all(sort_bytes(parts));
   // A package that embeds nothing keeps the digest its modules alone give it.
   let tail = if len(embedded) == 0 { b"" }
@@ -763,16 +780,17 @@ fn package_digest(pkg: Int, clo: Closure, embeds: List<EmbedAt>) -> Bytes = {
   bytes_concat(b"b3:", hex(blake3(bytes_concat_all([digest_domain(), modules, tail]))))
 }
 
-fn embed_part(e: EmbedAt) -> Bytes =
+fn embed_part(embed: EmbedAt) -> Bytes =
   bytes_concat_all([
-    e.module,
+    embed.module,
     b"\0",
-    e.key,
+    embed.key,
     b"\0",
-    match e.read {
+    match embed.read {
       Ok(files) ->
         bytes_concat_all(
-          map(files, |f: EmbedFile| bytes_concat_all([f.name, b"\0", hex(blake3(f.bytes)), b"\0"])),
+          map(files, |file: EmbedFile|
+            bytes_concat_all([file.name, b"\0", hex(blake3(file.bytes)), b"\0"])),
         ),
       Err(why) -> bytes_concat_all([b"\x01", why, b"\0"]),
     },
@@ -780,11 +798,11 @@ fn embed_part(e: EmbedAt) -> Bytes =
 
 // --- The graph's judgments ------------------------------------------------------
 
-type Judged = { packages: List<Package>, diags: List<{ slot: Int, diag: PDiag }> }
+type Judged = { packages: List<Package>, diags: List<{ slot: Int, diag: ParseDiag }> }
 
 type Pending = {
   packages: List<Package>,
-  diags: List<{ slot: Int, diag: PDiag }>,
+  diags: List<{ slot: Int, diag: ParseDiag }>,
   edges: List<{ from: Int, target: Int }>,
 }
 
@@ -801,7 +819,7 @@ fn judge(
   manifests: List<Option<Manifest>>,
   packages: List<Package>,
   root_modules: List<Bytes>,
-  diags: List<{ slot: Int, diag: PDiag }>,
+  diags: List<{ slot: Int, diag: ParseDiag }>,
 ) -> Judged = {
   let built = fold(
     range(0, len(packages)),
@@ -820,7 +838,7 @@ fn judge(
     Some(c) ->
       push(collided, {
         slot: slot_of(texts, at(c, 0)),
-        diag: diag1(
+        diag: error_at(
           b"E0134",
           dummy_span(),
           bytes_concat_all([b"packages depend on one another in a cycle: ", cycle_text(roots, c)]),
@@ -846,10 +864,10 @@ fn version_judgments(
   roots: List<Bytes>,
   packages: List<Package>,
   edges: List<{ from: Int, target: Int }>,
-  diags: List<{ slot: Int, diag: PDiag }>,
-) -> List<{ slot: Int, diag: PDiag }> = {
+  diags: List<{ slot: Int, diag: ParseDiag }>,
+) -> List<{ slot: Int, diag: ParseDiag }> = {
   let named = |p: Package| match p.manifest { None -> "", Some(m) -> m.name };
-  fold(range(0, len(packages)), diags, |acc: List<{ slot: Int, diag: PDiag }>, i: Int| {
+  fold(range(0, len(packages)), diags, |acc: List<{ slot: Int, diag: ParseDiag }>, i: Int| {
     let p = at(packages, i);
     if p.manifest == None { acc } else {
       // The packages before this one with the same name: a name is what a closure pins, so a
@@ -866,7 +884,7 @@ fn version_judgments(
         Some(j) ->
           push(acc, {
             slot: slot_of(texts, requester_of(edges, i)),
-            diag: diag1(
+            diag: error_at(
               b"E0137",
               dummy_span(),
               bytes_concat_all([
@@ -1080,12 +1098,12 @@ fn push_diag_notes(
     ..acc,
     diags: push(acc.diags, {
       slot: slot,
-      diag: diag1(code, dummy_span(), message, b"in this package's manifest", notes),
+      diag: error_at(code, dummy_span(), message, b"in this package's manifest", notes),
     }),
   }
 
 fn push_diag_text(acc: Pending, slot: Int, code: Bytes, message: Bytes) -> Pending =
-  { ..acc, diags: push(acc.diags, pkg_diag(slot, code, message)) }
+  { ..acc, diags: push(acc.diags, manifest_diag(slot, code, message)) }
 
 // Every granted prefix is unique and neither reserved root, and no root module squats on one.
 fn prefix_judgments(
@@ -1093,18 +1111,18 @@ fn prefix_judgments(
   roots: List<Bytes>,
   packages: List<Package>,
   root_modules: List<Bytes>,
-  diags: List<{ slot: Int, diag: PDiag }>,
-) -> List<{ slot: Int, diag: PDiag }> = {
+  diags: List<{ slot: Int, diag: ParseDiag }>,
+) -> List<{ slot: Int, diag: ParseDiag }> = {
   let reserved = fold(
     range(0, len(packages)),
     diags,
-    |acc: List<{ slot: Int, diag: PDiag }>, i: Int| {
+    |acc: List<{ slot: Int, diag: ParseDiag }>, i: Int| {
       let p = at(packages, i);
       if p.manifest == None || bytes_len(p.prefix) == 0 { acc } else {
         let with_reserved = if p.prefix == b"std" || p.prefix == b"compiler" {
           push(acc, {
             slot: slot_of(texts, i),
-            diag: diag1(
+            diag: error_at(
               b"E0133",
               dummy_span(),
               bytes_concat_all([
@@ -1122,13 +1140,13 @@ fn prefix_judgments(
         fold(
           range(i + 1, len(packages)),
           with_reserved,
-          |acc2: List<{ slot: Int, diag: PDiag }>, j: Int| {
+          |acc2: List<{ slot: Int, diag: ParseDiag }>, j: Int| {
             let q = at(packages, j);
             if q.manifest == None || p.prefix != q.prefix { acc2 }
             else if package_name(p) == package_name(q) { acc2 } else {
               push(acc2, {
                 slot: slot_of(texts, j),
-                diag: diag1(
+                diag: error_at(
                   b"E0133",
                   dummy_span(),
                   bytes_concat_all([
@@ -1150,14 +1168,14 @@ fn prefix_judgments(
       }
     },
   );
-  fold(root_modules, reserved, |acc: List<{ slot: Int, diag: PDiag }>, m: Bytes| {
+  fold(root_modules, reserved, |acc: List<{ slot: Int, diag: ParseDiag }>, m: Bytes| {
     let seg = first_segment(m);
     match find_prefix(packages, seg, 1) {
       None -> acc,
       Some(j) ->
         push(acc, {
           slot: slot_of(texts, j),
-          diag: diag1(
+          diag: error_at(
             b"E0133",
             dummy_span(),
             bytes_concat_all([
@@ -1177,7 +1195,8 @@ fn prefix_judgments(
   })
 }
 
-fn package_name(p: Package) -> String = match p.manifest { None -> "", Some(m) -> m.name }
+fn package_name(package: Package) -> String =
+  match package.manifest { None -> "", Some(m) -> m.name }
 
 fn first_segment(name: Bytes) -> Bytes =
   match bytes_index_of(name, b".") { None -> name, Some(i) -> bytes_slice(name, 0, i) }

@@ -81,7 +81,7 @@ fn stamp() -> Instant / {clock.read} = clock.now()
 "#;
 
 fn check(source: &str) -> CheckOutput {
-    producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
+    producer::checked_analysis(&[(String::new(), source.to_string())], &[SourceId(0)])
         .expect("the fixture typechecks")
         .check
 }

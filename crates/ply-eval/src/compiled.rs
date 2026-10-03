@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub trait Compiled {
-    /// Whether this was built over the program [`crate::Front::hashes_digest`] names.
+    /// Whether this was built over the program [`crate::Analysis::hashes_digest`] names.
     fn describes(&self, program: DefHash) -> bool;
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.

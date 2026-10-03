@@ -309,7 +309,7 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
 }
 
 fn check(source: &str) -> ply_eval::CheckOutput {
-    ply_codegen::c::producer::checked_front(
+    ply_codegen::c::producer::checked_analysis(
         &[("m".to_string(), source.to_string())],
         &[SourceId(0)],
     )

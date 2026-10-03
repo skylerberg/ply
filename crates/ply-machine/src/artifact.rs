@@ -7,7 +7,7 @@ use crate::payload::record;
 use crate::runnable::Runnable;
 use ply_eval::decode::{self, At};
 use ply_eval::{
-    DefHash, DefInfo, Diagnostic, Ended, Front, ModuleName, Severity, SourceMap, Span, Symbol,
+    Analysis, DefHash, DefInfo, Diagnostic, Ended, ModuleName, Severity, SourceMap, Span, Symbol,
     Value, codes,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -468,7 +468,7 @@ pub fn library_unit(loaded: &Loaded, names: &[String]) -> Result<LibraryUnit, Ve
 }
 
 /// Whether the module that holds `name` exports it; a prelude effect has no entry and is public.
-fn exports(front: &Front, name: &str) -> bool {
+fn exports(front: &Analysis, name: &str) -> bool {
     let symbol = Symbol::new(name);
     if let Some(written) = front.defs_written.get(&symbol) {
         return written.vis.is_public();
@@ -484,7 +484,7 @@ fn exports(front: &Front, name: &str) -> bool {
 
 fn closure_texts(
     artifact: &Artifact,
-    front: &Front,
+    front: &Analysis,
 ) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
     let bodies: Vec<&[u8]> = artifact.bodies.values().map(StoredBody::as_bytes).collect();
     let names: Vec<ply_codegen::c::producer::PrintedName<'_>> = artifact
@@ -777,7 +777,7 @@ pub fn unreadable(path: &Path) -> Diagnostic {
 
 pub struct Opened {
     pub sources: SourceMap,
-    pub front: Front,
+    pub front: Analysis,
     /// The name the entry point answers to in this program.
     pub entry: Symbol,
 }
@@ -813,7 +813,7 @@ fn front_failed(why: String) -> Vec<Diagnostic> {
 
 /// What the port answered, kept whole so it can be filed and rebuilt without asking again.
 struct Answered {
-    front: Front,
+    front: Analysis,
     modules: Vec<String>,
     dump: ply_eval::Value,
 }
@@ -844,7 +844,7 @@ fn place_and_read(
     dump: &ply_eval::Value,
     ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
-) -> Result<Front, Vec<Diagnostic>> {
+) -> Result<Analysis, Vec<Diagnostic>> {
     for module in modules {
         let name = ModuleName::from_dotted(module);
         let text = crate::shelf::source(&name).ok_or_else(|| {
@@ -871,7 +871,7 @@ fn place_and_read(
 /// key that is the artifact's own bytes but for its unit, plus what reads them.
 ///
 /// An artifact's digest covers what it holds, not what it was built against: the shipped library
-/// it closed over sits outside the hashed ranges. A reopened `Front` is an answer over that
+/// it closed over sits outside the hashed ranges. A reopened `Analysis` is an answer over that
 /// library, so the key names it rather than relying on where the file happens to sit.
 ///
 /// The unit is emitted from the front after `build` reopens the closure, so leaving it out is what
@@ -893,7 +893,7 @@ pub fn front_cache(artifact: &Artifact) -> PathBuf {
 }
 
 /// The pulled module names and the dump, as `front.answer_pulling_std_with` answers them: the two
-/// halves a `Front` is rebuilt from in process.
+/// halves a `Analysis` is rebuilt from in process.
 fn file_front(at: &Path, modules: &[String], dump: &ply_eval::Value) {
     let Some(parent) = at.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
@@ -917,14 +917,14 @@ fn file_front(at: &Path, modules: &[String], dump: &ply_eval::Value) {
     let _ = ply_eval::files::write_atomically(at, &bytes);
 }
 
-/// The `Front` an earlier run answered for this very artifact. A hit skips the check below that
+/// The `Analysis` an earlier run answered for this very artifact. A hit skips the check below that
 /// the closure rebuilds the artifact's bodies: the key is the digest of those very bytes, and the
 /// file is only ever written after that check passed on this machine.
 fn cached_front(
     at: &Path,
     ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
-) -> Option<Front> {
+) -> Option<Analysis> {
     let answer = ply_eval::codec::decode(&std::fs::read(at).ok()?).ok()?;
     let filed = ply_eval::decode::At::new("a filed front end", &answer);
     let modules = filed
@@ -1015,7 +1015,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
 fn entered(
     artifact: &Artifact,
     sources: SourceMap,
-    front: Front,
+    front: Analysis,
 ) -> Result<Opened, Vec<Diagnostic>> {
     let entry = artifact
         .entry_name()
@@ -1065,7 +1065,7 @@ pub struct OpenedRunnable {
 pub fn opened_runnable(runnable: Runnable, root: &Path) -> Result<OpenedRunnable, Diagnostic> {
     let Runnable { entry, front, unit } = runnable;
     let loaded =
-        crate::driver::load_over_front_taken(root.to_path_buf(), front).map_err(|err| {
+        crate::driver::load_over_analysis_taken(root.to_path_buf(), front).map_err(|err| {
             err.diagnostics.into_iter().next().unwrap_or_else(|| {
                 Diagnostic::error(
                     codes::INTERNAL_ERROR,

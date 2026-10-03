@@ -23,7 +23,7 @@ fn repository() -> tempfile::TempDir {
         &r.join("compiler/front.ply"),
         "import spine (s)\npub fn f() -> Int = 1\n",
     );
-    write(&r.join("compiler/spine.ply"), "pub fn s() -> Int = 1\n");
+    write(&r.join("compiler/parsing.ply"), "pub fn s() -> Int = 1\n");
     write(&r.join("compiler/emit.ply"), "pub fn e() -> Int = 1\n");
     write(
         &r.join("cli/ply.pkg"),
@@ -74,7 +74,7 @@ fn a_root_reaches_what_it_imports_and_nothing_else() {
             "cli/results.ply",
             "cli/tests.ply",
             "compiler/front.ply",
-            "compiler/spine.ply",
+            "compiler/parsing.ply",
             "dep/decide.ply",
             "dep/keys.ply",
             "dep/ply.pkg",

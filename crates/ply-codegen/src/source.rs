@@ -1,14 +1,14 @@
 //! The program a unit compiles out of: the front end's answer over it, and each module's text.
-//! Every table here is read from a [`Front`].
+//! Every table here is read from a [`Analysis`].
 
-use ply_eval::{EmitterRoot, Front, SourceId, SourceMap, Span, Symbol};
+use ply_eval::{Analysis, EmitterRoot, SourceId, SourceMap, Span, Symbol};
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
 /// A checked program, borrowed for as long as the unit compiled from it lives.
 pub struct Source {
-    pub front: &'static Front,
-    /// [`Front::check`].
+    pub front: &'static Analysis,
+    /// [`Analysis::check`].
     tables: Tables,
     /// Each root's definition span where failures are reported: `tables.spans` until relocated.
     placed: RwLock<HashMap<String, Span>>,
@@ -36,7 +36,7 @@ struct Tables {
     ctors: Vec<(Symbol, usize)>,
     roots: Vec<String>,
     arities: HashMap<String, usize>,
-    /// Each root's place in [`Front::emitter_roots`].
+    /// Each root's place in [`Analysis::emitter_roots`].
     rows: HashMap<String, usize>,
     /// Roots the compiler published pure.
     pures: HashSet<String>,
@@ -48,7 +48,7 @@ struct Tables {
 }
 
 impl Tables {
-    fn of(front: &Front) -> Tables {
+    fn of(front: &Analysis) -> Tables {
         let mut t = Tables {
             ctors: ctors_of(front),
             roots: front
@@ -112,12 +112,12 @@ impl Tables {
 
 /// The prelude's constructors, then each module's in program order, as the compiler emits them:
 /// not the checker's dependency order, or emitted tags would move with the import graph.
-fn ctors_of(front: &Front) -> Vec<(Symbol, usize)> {
+fn ctors_of(front: &Analysis) -> Vec<(Symbol, usize)> {
     front.emitter_ctors.clone()
 }
 
 impl Source {
-    pub fn from_front(front: &'static Front) -> Source {
+    pub fn from_analysis(front: &'static Analysis) -> Source {
         let keys: HashMap<String, String> = front
             .keys
             .iter()
@@ -162,7 +162,7 @@ impl Source {
 
     /// Places every root where `front` has it, if each definition's text in `sources` is the one
     /// this was emitted over: a site is an offset into that text, so any other edit needs a rebuild.
-    pub fn relocate(&self, front: &Front, sources: &SourceMap) -> bool {
+    pub fn relocate(&self, front: &Analysis, sources: &SourceMap) -> bool {
         let now = Tables::of(front);
         let unchanged = now.roots == self.tables.roots
             && now.spans.len() == self.tables.spans.len()
@@ -196,7 +196,7 @@ impl Source {
 
     /// The row the compiler published for `name`, which says how its values read.
     pub fn row(&self, name: &str) -> Option<&'static EmitterRoot> {
-        let front: &'static Front = self.front;
+        let front: &'static Analysis = self.front;
         self.tables.rows.get(name).map(|&i| &front.emitter_roots[i])
     }
 

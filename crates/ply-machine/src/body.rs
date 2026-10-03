@@ -105,7 +105,7 @@ impl StoredBody {
 /// back, so `key()` re-derives the hash the definition is filed under rather than being told it. A
 /// name declared in two namespaces has two bodies and one entry per hash, which is the case
 /// `verify` settles.
-pub fn of_front(front: &ply_eval::Front) -> BodySet {
+pub fn of_front(front: &ply_eval::Analysis) -> BodySet {
     let hashes = &front.hashes;
     let mut by_name: std::collections::BTreeMap<&Symbol, Vec<StoredBody>> = Default::default();
     for (name, bytes) in &front.bodies {
