@@ -1230,6 +1230,15 @@ answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, eac
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.
 
+The report is printed as the run goes. Before a test runs come what was selected
+and how it will run: the groups and workers, isolation, the host binding, and
+what `--explain` says of the selection. Each group's results follow as that
+group finishes, in the order the groups ran, so a long run shows its progress
+and its first failure. Then come the run's own figures (handshakes, the backend,
+the simulation, and with `--explain` where its time went), the summary, and each
+failure's diagnosis. `--json` writes its one object when the run ends, and
+`--workspace` prints each package's heading before it runs.
+
 `--steps N` is the calls each test may make (default 1000000000; `0` is no
 bound); a test past it fails with `E0503`, which is a program error like any
 other, and is recorded as one, because the count is a property of the program.
