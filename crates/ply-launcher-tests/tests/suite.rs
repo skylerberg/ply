@@ -277,3 +277,33 @@ fn the_sample_does_not_fall_on_one_period_of_the_window() {
         "no sites walks none"
     );
 }
+
+// --- The program this tree's own builder makes --------------------------------
+
+/// A binary enters the `ply` program the committed builder made, so this is where the builder
+/// these sources make is seen to build the whole program, and that program to compile a unit and
+/// run its test.
+#[test]
+fn the_builder_these_sources_make_builds_the_program_and_it_runs() {
+    let runnable = ply_launcher::shipped::program_by_own_builder()
+        .unwrap_or_else(|d| panic!("this tree's builder builds the program: {d}"));
+    let project = tempfile::tempdir().expect("a scratch directory");
+    std::fs::write(
+        project.path().join("m.ply"),
+        "test \"a unit is compiled\" {\n  assert(1 + 1 == 2)\n}\n",
+    )
+    .expect("the project is written");
+    let program = ply_launcher::Program {
+        runnable,
+        shelf: ply_machine::shelf::sources().to_vec(),
+        stage: ply_launcher::shipped::own_stage_name(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let binds = ply_machine::enter::Binds {
+        lent: ply_machine::policy::all(),
+        ..ply_machine::enter::Binds::default()
+    };
+    let argv = vec!["test".to_string(), project.path().display().to_string()];
+    let (answer, _) = ply_launcher::run(program, project.path(), argv, binds, None).into_parts();
+    assert_eq!(answer.unwrap_or_else(|d| panic!("the program ran: {d}")), 0);
+}
