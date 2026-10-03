@@ -32,6 +32,8 @@ pub const KIND_BRANCH: u8 = 12;
 /// A map's tree nodes: a leaf of `len` sorted pairs, a branch of `len` children and max keys.
 pub const KIND_MLEAF: u8 = 13;
 pub const KIND_MBRANCH: u8 = 14;
+/// `len` elements, a word each.
+pub const KIND_ARRAY: u8 = 15;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -525,7 +527,7 @@ pub fn swap_current(heap: *mut Heap) -> *mut Heap {
 unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
-            KIND_RECORD | KIND_CTOR | KIND_CLOSURE | KIND_INT => (*o).len as usize * 8,
+            KIND_RECORD | KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_ARRAY => (*o).len as usize * 8,
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
@@ -1112,6 +1114,14 @@ impl Heap {
                 let words: Vec<Word> = items.iter().map(|x| self.to_word(layouts, x)).collect();
                 self.list_from(&words)
             }
+            Value::Array(items) if u32::try_from(items.len()).is_ok() => {
+                let o = self.alloc(KIND_ARRAY, 0, items.len() as u32, 0);
+                for (i, x) in items.iter().enumerate() {
+                    let w = self.to_word(layouts, x);
+                    unsafe { set_word(o, i, w) };
+                }
+                o as Word
+            }
             // The interpreter iterates in key order, which is the tree's order too.
             Value::Map(entries) => {
                 let words: Vec<(Word, Word)> = entries
@@ -1215,6 +1225,14 @@ impl Heap {
                         list::to_vec(o)
                             .into_iter()
                             .map(|x| Heap::read(layouts, x, &item, ctors, walked))
+                            .collect(),
+                    )
+                }
+                KIND_ARRAY => {
+                    let item = carry.item();
+                    Value::array(
+                        (0..(*o).len as usize)
+                            .map(|i| Heap::read(layouts, word_at(o, i), &item, ctors, walked))
                             .collect(),
                     )
                 }
@@ -1414,6 +1432,7 @@ fn crosses_threads(v: &Value) -> bool {
             _ => true,
         },
         Value::List(items) => items.iter().all(crosses_threads),
+        Value::Array(items) => items.iter().all(crosses_threads),
         Value::Map(entries) => entries
             .iter()
             .all(|(k, v)| crosses_threads(k) && crosses_threads(v)),
@@ -1490,7 +1509,9 @@ unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
     unsafe {
         match (*o).kind {
             KIND_RECORD | KIND_CTOR if (*o).flags & FLAT != 0 => [(0, 0), (0, 0)],
-            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => [(0, (*o).len as usize), (0, 0)],
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
+                [(0, (*o).len as usize), (0, 0)]
+            }
             KIND_MLEAF => [(0, 2 * (*o).len as usize), (0, 0)],
             // The root when there is one, then the tail.
             KIND_LIST => [(0, list::TAIL + list::tail_len(o)), (0, 0)],
@@ -1574,7 +1595,7 @@ pub fn mark_immortal(w: Word) {
             }
             (*o).rc = IMMORTAL;
             match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
+                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
                     for i in 0..(*o).len as usize {
                         pending.push(word_at(o, i));
                     }
@@ -1610,7 +1631,7 @@ pub fn world_independent(w: Word) -> bool {
         let o = obj(w);
         unsafe {
             match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
+                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
                     for i in 0..(*o).len as usize {
                         pending.push(word_at(o, i));
                     }
@@ -1664,7 +1685,7 @@ pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
         let o = obj(w);
         unsafe {
             match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
+                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
                     for i in 0..(*o).len as usize {
                         pending.push(word_at(o, i));
                     }
@@ -1773,6 +1794,7 @@ fn rank(w: Word) -> u8 {
             KIND_RECORD => 9,
             KIND_CTOR => 10,
             KIND_CLOSURE => 11,
+            KIND_ARRAY => 17,
             KIND_BRIDGE => match bridged(o) {
                 Value::Unit => 0,
                 Value::Bool(_) => 1,
@@ -1791,6 +1813,7 @@ fn rank(w: Word) -> u8 {
                 Value::Secret(_) => 14,
                 Value::Fixed(_) => 15,
                 Value::Char(_) => 16,
+                Value::Array(_) => 17,
             },
             other => panic!("a word of kind {other} was ordered after its object died"),
         }
@@ -1837,6 +1860,17 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
                     }
                 }
                 xs.len().cmp(&ys.len())
+            }
+            KIND_ARRAY => {
+                let (x, y) = (obj(a), obj(b));
+                let (n, m) = ((*x).len as usize, (*y).len as usize);
+                for i in 0..n.min(m) {
+                    let c = cmp_words(layouts, word_at(x, i), word_at(y, i));
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                }
+                n.cmp(&m)
             }
             KIND_MAP => {
                 let (xs, ys) = (map::to_vec(obj(a)), map::to_vec(obj(b)));
@@ -1901,7 +1935,7 @@ pub fn native_key(w: Word) -> bool {
                 bridged(o),
                 Value::Str(_) | Value::Bytes(_) | Value::Fixed(_)
             ),
-            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
                 (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
             }
             KIND_LIST => list::children(o).all(native_key),

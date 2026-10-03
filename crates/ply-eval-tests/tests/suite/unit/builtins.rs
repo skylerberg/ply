@@ -775,6 +775,71 @@ fn list_set_replaces_one_element_keeps_the_original_and_raises_outside_the_list(
     }
 }
 
+fn array(xs: &[i64]) -> Value {
+    Value::array(xs.iter().copied().map(Value::Int).collect())
+}
+
+#[test]
+fn an_array_is_read_by_index_and_written_through_its_last_holder() {
+    assert_eq!(
+        found(Builtin::ArrayNew, vec![Value::Int(3), Value::Int(7)]),
+        array(&[7, 7, 7])
+    );
+    let xs = found(Builtin::ArrayOfList, vec![ints(&[10, 20, 30])]);
+    assert_eq!(xs, array(&[10, 20, 30]));
+    assert_eq!(
+        found(Builtin::ArrayToList, vec![xs.clone()]),
+        ints(&[10, 20, 30])
+    );
+    assert_eq!(found(Builtin::ArrayLen, vec![xs.clone()]), Value::Int(3));
+    assert_eq!(
+        found(Builtin::ArrayGet, vec![xs.clone(), Value::Int(2)]),
+        Value::Int(30)
+    );
+    assert_eq!(
+        found(Builtin::ArrayAt, vec![xs.clone(), Value::Int(1)]),
+        some(20)
+    );
+    for i in [-1, 3, i64::MAX] {
+        assert_eq!(
+            found(Builtin::ArrayAt, vec![xs.clone(), Value::Int(i)]),
+            none()
+        );
+    }
+
+    let ys = found(
+        Builtin::ArraySet,
+        vec![xs.clone(), Value::Int(1), Value::Int(99)],
+    );
+    assert_eq!(ys, array(&[10, 99, 30]));
+    assert_eq!(
+        xs,
+        array(&[10, 20, 30]),
+        "a held array is copied, not written"
+    );
+
+    for (b, args) in [
+        (Builtin::ArrayGet, vec![xs.clone(), Value::Int(3)]),
+        (Builtin::ArrayGet, vec![xs.clone(), Value::Int(-1)]),
+        (
+            Builtin::ArraySet,
+            vec![xs.clone(), Value::Int(3), Value::Int(0)],
+        ),
+    ] {
+        let d = done(b, args).unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR, "{}", b.name());
+        assert!(
+            d.message.contains("outside a value of 3 elements"),
+            "{}",
+            d.message
+        );
+    }
+    for n in [-1, MAX_ARRAY_LEN + 1] {
+        let d = done(Builtin::ArrayNew, vec![Value::Int(n), Value::Unit]).unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR, "array_new({n})");
+    }
+}
+
 #[test]
 fn rotr32_turns_the_low_word_and_answers_it_non_negative() {
     let cases: &[(i64, i64, i64)] = &[
