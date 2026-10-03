@@ -350,6 +350,7 @@ fn describe(
         builtins: unit.builtins,
         shapes: unit.shapes,
         lambdas: unit.lambdas,
+        buckets: Vec::new(),
     }
 }
 
@@ -474,8 +475,10 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         builtins,
         shapes,
         lambdas,
+        buckets,
     } = exports;
     bind(&lib)?;
+    filled(&lib, &buckets)?;
     let Some(unit) = Unit::from_tables(ctors.clone(), consts, fields, builtins, shapes, lambdas)
     else {
         bail!("a unit's shapes do not intern to the ids its C was emitted against");
@@ -775,6 +778,22 @@ fn prototype(symbol: &str, arity: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("Word {symbol}({params});\n")
+}
+
+/// Each bucket's table, written before any of its C runs: the unit's position of every key the
+/// bucket's C names by its own.
+fn filled(lib: &Library, buckets: &[(u8, Vec<u32>)]) -> Result<()> {
+    for (id, places) in buckets {
+        let name = format!("ply_bk_{id:02x}");
+        let Some(p) = lib.symbol(&name) else {
+            bail!("the unit the C tier built has no `{name}`");
+        };
+        let table = p as *mut u32;
+        for (j, place) in places.iter().enumerate() {
+            unsafe { table.add(j).write(*place) };
+        }
+    }
+    Ok(())
 }
 
 fn bind(lib: &Library) -> Result<()> {
