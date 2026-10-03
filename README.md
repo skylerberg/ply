@@ -68,9 +68,10 @@ beside `build.digest`: a runnable, the front end's answer and the unit's C, whic
 launcher enters without running a compiler. A binary whose `ply`
 (`crates/ply-cli/bootstrap/ply.run`) is behind its sources has the committed
 builder build it once and keeps it under the stages, so every such build reads
-back what the builds before it kept. So the program's packages, the compiler and
-the shipped modules they import cannot use a language rule or a builtin the same
-change introduces; a shipped module none of them imports can. Likewise the
+back what the builds before it kept. Where the program needs a rule the
+committed builder lacks, that builder builds the sources' own builder, and it
+builds `ply`. So the compiler and the shipped modules it imports cannot use a
+language rule the same change introduces; the rest of the standard library can. Likewise the
 runtime reads the front end's answer the committed builder carries, so it can come
 to require a field of one only once main's builder writes it. Never commit the
 runnables: CI rebuilds them on main after each merge.

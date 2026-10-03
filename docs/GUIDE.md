@@ -1311,7 +1311,7 @@ rather than raised.
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
 | `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, and the cost checker's report on a program, kept under the checker's hash and the program's text (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one the committed builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
@@ -3467,13 +3467,14 @@ definition, the emitter and the runtime are the ones it was made by, and the
 machine compiles the C it is handed and loads it. The launcher enters `ply`
 from a runnable — its front end's answer, its sources and its unit's C, which
 reading runs no compiler: the committed one when it was built from the
-binary's own sources, else one the committed builder made of them for an
-earlier run, or makes now.
+binary's own sources, else one a builder made of them for an earlier run, or
+makes now.
 The builder is the compiler's own `build.main`, entered the same way: it
 checks a program's sources, seeded with the rows its last build of that program
 kept, emits its unit with the emitter's answers kept, and writes the runnable.
-It is the compiler as the binary's tree last committed it, so `ply`'s own
-sources use no language rule or builtin newer than that. `ply std`
+The committed builder builds `ply`, so each build reads back what the ones
+before it kept; where `ply`'s sources need a rule that builder lacks, it builds
+the builder of the binary's own compiler first, and that one builds `ply`. `ply std`
 needs no project: it reads the shipped modules off a second, read-only root.
 `--count-allocs=PATH` is the launcher's own flag rather than the program's: it is
 taken out of the line before the program parses it, and the run writes what the

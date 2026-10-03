@@ -112,8 +112,10 @@ pub fn committed() -> PathBuf {
     Path::new(DIR).join(RUNNABLE)
 }
 
-/// The `ply` program: the committed runnable when it was built from these very sources, else the
-/// one the committed builder made of them for an earlier process, else one it makes now. A binary
+/// The `ply` program: the committed runnable when it was built from these very sources, else one
+/// a builder made of them for an earlier process, else one it makes now. The committed builder
+/// makes it, since every build since main's last refresh shares its rows and bodies; where these
+/// sources need a rule that builder lacks and it refuses them, this tree's own does. A binary
 /// whose committed runnable is behind its sources therefore runs the sources, never the runnable.
 pub fn program() -> Result<Runnable, Diagnostic> {
     if committed_digest().as_deref() == Some(identity().as_str())
@@ -124,30 +126,48 @@ pub fn program() -> Result<Runnable, Diagnostic> {
     }
     let stage = stage();
     let staged = stage.join(RUNNABLE);
-    if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
+    let found = || ply_machine::builds::staged_at(&stage, &staged).or_else(staged_by_own_builder);
+    if let Some(program) = found() {
         return Ok(program);
     }
     ply_machine::builds::alone(&stage, || {
-        if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
+        if let Some(program) = found() {
             return Ok(program);
         }
-        ply_machine::builds::build(&laid_out()?, ROOT, ENTRY, &staged, ROWS)?;
-        read_back(&staged)
+        match ply_machine::builds::build(&laid_out()?, ROOT, ENTRY, &staged, ROWS) {
+            Ok(()) => read_back(&staged),
+            Err(_) => {
+                eprintln!(
+                    "ply: the committed builder does not build this tree's `ply`, so this \
+                     tree's own builder builds it"
+                );
+                program_by_own_builder()
+            }
+        }
     })
 }
 
-/// The `ply` program as this tree's own builder makes it, where `program` is the committed
-/// builder's: what shows the compiler these sources hold builds the program they hold.
+fn own_stage() -> PathBuf {
+    stage::stage_dir(&own_stage_name())
+}
+
+fn staged_by_own_builder() -> Option<Runnable> {
+    let stage = own_stage();
+    ply_machine::builds::staged_at(&stage, &stage.join(RUNNABLE))
+}
+
+/// The `ply` program as this tree's own builder makes it: what shows the compiler these sources
+/// hold builds the program they hold.
 pub fn program_by_own_builder() -> Result<Runnable, Diagnostic> {
-    let stage = stage::stage_dir(&own_stage_name());
-    let staged = stage.join(RUNNABLE);
-    if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
+    if let Some(program) = staged_by_own_builder() {
         return Ok(program);
     }
+    let stage = own_stage();
     ply_machine::builds::alone(&stage, || {
-        if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
+        if let Some(program) = staged_by_own_builder() {
             return Ok(program);
         }
+        let staged = stage.join(RUNNABLE);
         ply_machine::builds::build_by_own(&laid_out()?, ROOT, ENTRY, &staged, ROWS)?;
         read_back(&staged)
     })
@@ -196,8 +216,5 @@ fn unbuilt(why: String) -> Diagnostic {
         format!("the `ply` program could not be built: {why}"),
     )
     .primary(Span::DUMMY, "this is Ply's fault, not the program's")
-    .note(
-        "the program is `crates/ply-cli/ply`, built by the committed builder: main's compiler \
-         as of its last refresh, which reads no language rule or builtin newer than that",
-    )
+    .note("the program is `crates/ply-cli/ply`, built from the compiler this binary ships")
 }
