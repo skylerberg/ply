@@ -67,9 +67,9 @@ pub use host::{
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{
-    Analysis, BlankedSpan, CheckOutput, DefInfo, DefWritten, EffectInfo, EmitterRoot, LawInfo,
-    ModuleInfo, ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility,
-    WrittenParam, is_ident, is_ident_continue, is_ident_start,
+    Analysis, CheckOutput, DefInfo, DefWritten, EffectInfo, EmitterRoot, LawInfo, ModuleInfo,
+    ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility, WrittenParam,
+    is_ident, is_ident_continue, is_ident_start,
 };
 pub use rc::Stats as RcStats;
 pub use region::{Interleaving, SimId, Verdict};
