@@ -19,7 +19,7 @@ pub struct Hosting {
 }
 
 pub struct Executor<'a> {
-    pub front: &'a ply_eval::Front,
+    pub front: &'a ply_eval::Analysis,
     pub hosting: Hosting,
     pub provider: &'static dyn ply_eval::Provider,
 }
@@ -227,7 +227,7 @@ pub fn interleaved(
 
 fn panic_diagnostic(
     payload: Box<dyn Any + Send>,
-    front: &ply_eval::Front,
+    front: &ply_eval::Analysis,
     index: usize,
 ) -> Diagnostic {
     let message = if let Some(s) = payload.downcast_ref::<&'static str>() {
