@@ -10,7 +10,7 @@ use crate::config::Configuration;
 use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
-use crate::support::{prover_backend, select_profile};
+use crate::support::{select_profile, unit_of};
 use ply_eval::{
     CheckOutput, Diagnostic, Ended, Front, ModuleName, SourceMap, Span, Symbol, Value as PlyValue,
     codes,
@@ -25,9 +25,10 @@ use std::time::Instant;
 /// program parsed converts into this.
 #[derive(Clone, Debug)]
 pub struct RunOptions {
-    /// The front end the CLI ran. A run without one is refused rather than loading again: the
-    /// CLI walks the tree and runs the compiler, and this side reads the answer.
+    /// The front end the CLI ran and the C of the unit it emitted from it: the CLI walks the tree,
+    /// runs the compiler and emits, and this side reads the answer and compiles the C.
     pub front: Option<crate::driver::HandedFront>,
+    pub unit: Option<Vec<u8>>,
     /// The target's argument vector: what its `process.args` answers.
     pub argv: Vec<String>,
     /// `--json` promises stdout to the one object, so the program's own lines go to stderr.
@@ -53,6 +54,7 @@ impl Default for RunOptions {
     fn default() -> RunOptions {
         RunOptions {
             front: None,
+            unit: None,
             argv: Vec::new(),
             json: false,
             steps: 0,
@@ -73,9 +75,10 @@ impl Default for RunOptions {
 
 // --- The target ---------------------------------------------------------------
 
-/// A program the front end loaded, or an artifact opened from its bytes.
+/// A program the front end loaded, with the C of the unit the program emitted for it, or an
+/// artifact opened from its bytes.
 pub enum Target {
-    Project(Box<Loaded>),
+    Project(Box<Loaded>, Vec<u8>),
     Deployed(Box<Deployment>),
 }
 
@@ -97,10 +100,12 @@ pub struct Refused {
 }
 
 impl Target {
-    /// `front` is `None` when a program loads a tree of its own.
+    /// The program the caller loaded and emitted: its front end, read here rather than repeated,
+    /// and the C of its unit, compiled here when the run first enters it.
     pub fn open(
         path: &std::path::Path,
         front: Option<&crate::driver::HandedFront>,
+        unit: Option<&[u8]>,
         hermetic: bool,
     ) -> Result<Target, Refused> {
         if let Some(refused) = library(path) {
@@ -109,39 +114,25 @@ impl Target {
         if path.extension().is_some_and(|e| e == artifact::EXTENSION) {
             return Err(unhanded(path));
         }
-        // A front end handed over is the CLI's own load, read here rather than repeated. A load with
-        // none is a *program* loading a program of its own, at a root it chose while running: nobody
-        // could have handed one, so the compiler is lent for that load and that load only.
-        let loaded = match (front, hermetic) {
-            (Some(front), false) => crate::driver::load_over_front(path, front),
-            (Some(front), true) => {
-                crate::driver::load_over_front_in(crate::load::tidy(path), front)
-            }
-            (None, false) => crate::load::load(path),
-            (None, true) => return Err(hermetic_load(path)),
+        let (Some(front), Some(unit)) = (front, unit) else {
+            return Err(unemitted(path));
+        };
+        let loaded = if hermetic {
+            crate::driver::load_over_front_in(crate::load::tidy(path), front)
+        } else {
+            crate::driver::load_over_front(path, front)
         }
         .map_err(|err| Refused {
             diagnostics: err.diagnostics,
             sources: err.sources,
             artifact: None,
         })?;
-        // The program that ran a front end it hands over checked its `reuse fn` promises with it.
-        if front.is_some() {
-            return Ok(Target::Project(Box::new(loaded)));
-        }
-        match crate::costs::broken_promises(&loaded) {
-            Some(err) => Err(Refused {
-                diagnostics: err.diagnostics,
-                sources: err.sources,
-                artifact: None,
-            }),
-            None => Ok(Target::Project(Box::new(loaded))),
-        }
+        Ok(Target::Project(Box::new(loaded), unit.to_vec()))
     }
 
     pub fn front(&self) -> &Front {
         match self {
-            Target::Project(loaded) => &loaded.front,
+            Target::Project(loaded, _) => &loaded.front,
             Target::Deployed(d) => &d.opened.front,
         }
     }
@@ -153,7 +144,7 @@ impl Target {
     /// A closure's positions are in text printed at build time, which no reader wrote.
     pub fn sources(&self) -> SourceMap {
         match self {
-            Target::Project(loaded) => loaded.sources.clone(),
+            Target::Project(loaded, _) => loaded.sources.clone(),
             Target::Deployed(_) => SourceMap::new(),
         }
     }
@@ -162,7 +153,7 @@ impl Target {
     /// on the calling thread from this.
     pub fn found_data(&self) -> FoundData {
         match self {
-            Target::Project(loaded) => FoundData::Project {
+            Target::Project(loaded, _) => FoundData::Project {
                 root: loaded.root.display().to_string(),
                 files: loaded.file_names(),
                 places: loaded
@@ -200,7 +191,7 @@ impl Target {
             select_profile(&options.profile)?;
         }
         match self {
-            Target::Project(loaded) => prover_backend(loaded),
+            Target::Project(loaded, unit) => unit_of(&loaded.front, unit),
             Target::Deployed(d) => artifact::tier(&d.opened, d.unit.clone()),
         }
     }
@@ -243,17 +234,17 @@ fn unhanded(path: &std::path::Path) -> Refused {
     }
 }
 
-fn hermetic_load(path: &std::path::Path) -> Refused {
+fn unemitted(path: &std::path::Path) -> Refused {
     Refused {
         diagnostics: vec![
             Diagnostic::error(
-                codes::CAPABILITY_UNDECLARED,
+                codes::INTERNAL_ERROR,
                 format!(
-                    "`hermetic_machine` loads what it is handed, and `{}` came with no front end",
+                    "`{}` came with no front end or no unit, and a machine loads what it is handed",
                     path.display()
                 ),
             )
-            .note("a program that loads sources of its own reads the disk, and performs `machine`"),
+            .note("the program that drives a machine runs the compiler and emits; this side compiles the C it is handed"),
         ],
         sources: SourceMap::new(),
         artifact: None,
@@ -330,7 +321,12 @@ pub struct Drive {
 impl Drive {
     /// Load the target at `path`; the answer a `load` op hands back.
     pub fn open(options: RunOptions, path: &std::path::Path) -> Result<Drive, Refused> {
-        let target = Target::open(path, options.front.as_ref(), options.hermetic)?;
+        let target = Target::open(
+            path,
+            options.front.as_ref(),
+            options.unit.as_deref(),
+            options.hermetic,
+        )?;
         Ok(Drive::over(options, target))
     }
 
@@ -361,12 +357,16 @@ impl Drive {
     ///
     /// The front end comes with the asking: the tree moved, so the one the load was handed is the
     /// tree as it *was*, and whoever noticed the move re-ran the compiler for this one.
-    pub fn reload(&mut self, front: &crate::driver::HandedFront) -> Result<(), Refused> {
+    pub fn reload(
+        &mut self,
+        front: &crate::driver::HandedFront,
+        unit: &[u8],
+    ) -> Result<(), Refused> {
         let path = std::path::PathBuf::from(match &self.target {
-            Target::Project(loaded) => loaded.root.display().to_string(),
+            Target::Project(loaded, _) => loaded.root.display().to_string(),
             Target::Deployed(d) => d.path.clone(),
         });
-        self.target = Target::open(&path, Some(front), self.options.hermetic)?;
+        self.target = Target::open(&path, Some(front), Some(unit), self.options.hermetic)?;
         self.tier = None;
         self.bound = None;
         Ok(())
@@ -1190,6 +1190,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let trace_v = get("trace")?;
     Ok(RunOptions {
         front: None,
+        unit: None,
         hermetic: false,
         argv: str_list("argv")?,
         allow: str_list("allow")?,

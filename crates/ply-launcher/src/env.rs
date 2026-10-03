@@ -1,6 +1,6 @@
 //! The environment a launched program runs in, as a lent effect: the variables, whether the
-//! streams are terminals, the working directory, the binary's own version and shipped digest, and
-//! the directory `ply run` files the fronts it reuses in.
+//! streams are terminals, the working directory, the binary's own version and shipped digest, the
+//! directory `ply run` files the fronts it reuses in, and the one the emitter's answers are kept in.
 //! Bound by the launcher for the program it enters — user programs read configuration, not the
 //! environment.
 //!
@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 7] = [
+const OPERATIONS: [(&str, &str); 8] = [
     ("var", "ply_launcher::env::var"),
     ("vars", "ply_launcher::env::vars"),
     ("terminal", "ply_launcher::env::terminal"),
@@ -23,6 +23,7 @@ const OPERATIONS: [(&str, &str); 7] = [
     ("pwd", "ply_launcher::env::pwd"),
     ("shipped_digest", "ply_launcher::env::shipped_digest"),
     ("fronts", "ply_launcher::env::fronts"),
+    ("bodies", "ply_launcher::env::bodies"),
 ];
 
 /// The ops and the handler, lent with the binary's version.
@@ -86,6 +87,8 @@ impl HostHandler for Site {
                     .display()
                     .to_string(),
             ),
+            // Where the emitter's answers are kept between runs, under the toolchain's sweep.
+            ("bodies", []) => Value::str(ply_codegen::c::bodies_dir().display().to_string()),
             // The working directory the `cwd` root is bound to, as the program resolves paths.
             ("pwd", []) => Value::str(
                 std::env::current_dir()

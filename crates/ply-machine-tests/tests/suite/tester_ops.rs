@@ -14,7 +14,7 @@ import std.value (Value)
 
 nondet effect tester {
   write configure[r](options: Options) -> Unit
-  write unit[r](front: Front, build: Bool, hosted: Bool) -> Result<Int, List<Diag>>
+  write unit[r](front: Front, unit: Option<Bytes>, hosted: Bool) -> Result<Int, List<Diag>>
   read schema[r](name: String) -> Result<Value, List<Diag>>
   write bound[r](config: Configured) -> Result<Unit, List<Diag>>
   read hosted[r]() -> Hosted
@@ -117,12 +117,12 @@ fn options(root: String) -> Options =
 
 /// One run over a project: its tests and the binding.
 const ONE_RUN: &str = r#"
-fn main(root: String, front: Front) -> String / {
+fn main(root: String, front: Front, unit: Bytes) -> String / {
   tester.configure[r], tester.unit[r], tester.bound[r], tester.hosted[r], tester.ended[r],
   tester.executed[r],
 } = {
   tester.configure[r](options(root));
-  match tester.unit[r](front, true, true) {
+  match tester.unit[r](front, Some(unit), true) {
     Err(_) -> "no unit",
     Ok(u) -> match tester.bound[r]({ values: [], schema: None, opened: false }) {
       Err(_) -> "unbound",
@@ -143,19 +143,26 @@ fn main(root: String, front: Front) -> String / {
 
 /// Two runs over two projects, neither ended: each one's unit and its first test.
 const TWO_RUNS: &str = r#"
-fn first_of(root: String, front: Front) -> String / {
+fn first_of(root: String, front: Front, unit: Bytes) -> String / {
   tester.configure[r], tester.unit[r], tester.executed[r],
 } = {
   tester.configure[r](options(root));
-  match tester.unit[r](front, true, false) {
+  match tester.unit[r](front, Some(unit), false) {
     Err(_) -> "no unit",
     Ok(u) -> int_to_string(u) ++ " " ++ tester.executed[r](u, 0).status,
   }
 }
 
-fn main(root: String, front: Front, other: String, other_front: Front) -> String / {
+fn main(
+  root: String,
+  front: Front,
+  unit: Bytes,
+  other: String,
+  other_front: Front,
+  other_unit: Bytes,
+) -> String / {
   tester.configure[r], tester.unit[r], tester.executed[r],
-} = first_of(root, front) ++ " | " ++ first_of(other, other_front)
+} = first_of(root, front, unit) ++ " | " ++ first_of(other, other_front, other_unit)
 "#;
 
 const PROJECT: &str = r#"
@@ -205,10 +212,11 @@ fn driving(main: &str) -> Machine<'static> {
     machine
 }
 
-fn root_and_front(project: &tempfile::TempDir) -> [Value; 2] {
+fn root_and_front(project: &tempfile::TempDir) -> [Value; 3] {
     [
         Value::str(project.path().display().to_string()),
         crate::fixture::handed(project.path()),
+        crate::fixture::unit(project.path()),
     ]
 }
 

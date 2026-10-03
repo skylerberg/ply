@@ -190,13 +190,14 @@ impl Unit {
         self as *const Unit as usize
     }
 
-    /// An artifact's unit, produced elsewhere, loaded once: the first backend on this thread takes
-    /// that load, and one that does not serve this runtime is an [`crate::c::Unserved`].
-    pub fn embedded(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
+    /// A unit produced elsewhere, its C handed over whole, loaded once: the first backend on this
+    /// thread takes that load, and one that does not serve this runtime is an
+    /// [`crate::c::Unserved`].
+    pub fn handed(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
         let identity = front.hashes_digest;
         let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::from_front(front)));
-        let (native, refused) = crate::c::load_unit(&text, Some(source), "artifact")?;
+        let (native, refused) = crate::c::load_unit(&text, Some(source), "unit")?;
         let compiled = native.names();
         let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
         let unit = Unit {
@@ -272,7 +273,7 @@ impl Unit {
         });
         let native = match (preflown, &self.embedded) {
             (Some(native), _) => native,
-            (None, Some(text)) => crate::c::load_unit(text, Some(self.source), "artifact")?.0,
+            (None, Some(text)) => crate::c::load_unit(text, Some(self.source), "unit")?.0,
             // The same set as the pre-flight, so the unit key matches and the unit is read back.
             (None, None) => {
                 let candidates = self.source.functions();
