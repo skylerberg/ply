@@ -37,12 +37,6 @@ pub const FAMILIES: &[Family] = &[
         summary: "discharge a project's obligations",
     },
     Family {
-        name: "builder",
-        effect: "builder",
-        hermetic: Some("hermetic_builder"),
-        summary: "read back the program a build is of",
-    },
-    Family {
         name: "hosts",
         effect: "tcb",
         hermetic: Some("hermetic_tcb"),
@@ -84,9 +78,8 @@ fn own(effect: &str) -> String {
 pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
     Some(match family {
         "machine" => {
-            let mut ops =
-                crate::registrations_in(&declared("machine"), crate::drive::RunOptions::default());
-            ops.extend(crate::hermetic_registrations_in(&declared("machine")));
+            let mut ops = crate::registrations_with(crate::drive::RunOptions::default());
+            ops.extend(crate::hermetic_registrations());
             ops
         }
         "tester" => {
@@ -95,7 +88,6 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
             ops
         }
         "claims" => crate::claims::lent(&declared("prover")),
-        "builder" => crate::builder::lent(),
         "hosts" => crate::hosts::lent(&declared("tcb")),
         "shipped" => crate::shipped::lent(),
         _ => return None,

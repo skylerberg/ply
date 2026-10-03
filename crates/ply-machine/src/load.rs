@@ -3,7 +3,7 @@
 use crate::driver::FrontEnd;
 use ply_eval::{
     Analysis, CheckOutput, DefInfo, Diagnostic, HashOutput, ModuleInfo, ModuleName, SourceId,
-    SourceMap, Symbol, TestInfo, codes,
+    SourceMap, TestInfo,
 };
 use std::path::{Component, Path, PathBuf};
 
@@ -33,13 +33,6 @@ pub struct Loaded {
 pub struct LoadError {
     pub sources: SourceMap,
     pub diagnostics: Vec<Diagnostic>,
-}
-
-/// A module and the file it was read from, which the AST does not record.
-pub struct ModuleView<'a> {
-    pub name: &'a ModuleName,
-    pub info: &'a ModuleInfo,
-    pub path: &'a Path,
 }
 
 impl Loaded {
@@ -75,18 +68,6 @@ impl Loaded {
         self.check.modules.len()
     }
 
-    pub fn modules(&self) -> Vec<ModuleView<'_>> {
-        self.check
-            .modules
-            .values()
-            .map(|info| ModuleView {
-                name: &info.name,
-                info,
-                path: self.path_of(info.source),
-            })
-            .collect()
-    }
-
     pub fn path_of(&self, source: SourceId) -> &Path {
         self.sources
             .get(source)
@@ -110,65 +91,6 @@ impl Loaded {
             .enumerate()
             .filter(|(_, t)| &t.module == module)
             .collect()
-    }
-
-    /// The one `main` this program declares. Which entry `ply run` takes, and what a program
-    /// with none or two of them is told, is `crates/ply-cli/ply/run.ply`'s; this is for the `ply`
-    /// program itself, which declares exactly one.
-    pub fn sole_entry_point(&self) -> Result<&DefInfo, Diagnostic> {
-        let mut candidates = self.entry_points();
-        match candidates.len() {
-            1 => Ok(candidates.remove(0)),
-            n => Err(Diagnostic::error(
-                codes::AMBIGUOUS_ENTRY_POINT,
-                format!("{n} definitions are named `main`, and exactly one was wanted"),
-            )),
-        }
-    }
-
-    /// Every root-package definition named `main`. A dependency's `main` is its own business:
-    /// only the package being loaded offers an entry point.
-    pub fn entry_points(&self) -> Vec<&DefInfo> {
-        let main = Symbol::new("main");
-        let root = self.root_package();
-        self.check
-            .defs
-            .values()
-            .filter(|d| d.simple_name == main && root.contains(&d.module))
-            .collect()
-    }
-
-    /// Which modules are the package being loaded, rather than a dependency or the shelf: what a
-    /// run offers as an entry point and what a test run tests. A project without packages is every
-    /// module the toolchain does not ship.
-    pub fn root_package(&self) -> RootPackage {
-        let packaged = !self.front.packages.is_empty();
-        RootPackage {
-            modules: packaged.then(|| {
-                self.front
-                    .ordinals
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| self.front.module_packages.get(*i) == Some(&0))
-                    .map(|(_, (module, _))| module.to_string())
-                    .collect()
-            }),
-        }
-    }
-}
-
-/// The modules of the package being loaded.
-pub struct RootPackage {
-    /// `None` for a project without packages.
-    modules: Option<std::collections::HashSet<String>>,
-}
-
-impl RootPackage {
-    pub fn contains(&self, module: &ModuleName) -> bool {
-        match &self.modules {
-            Some(modules) => modules.contains(module.as_str()),
-            None => !crate::shelf::is_shipped(module),
-        }
     }
 }
 

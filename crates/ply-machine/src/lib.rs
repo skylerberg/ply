@@ -10,7 +10,6 @@
 //! forgets what the label was configured with. The run flow itself — targets, bindings, teardown —
 //! is `crate::drive`.
 
-pub mod builder;
 pub mod builds;
 pub mod claims;
 pub mod config;
@@ -83,34 +82,20 @@ const STACK: usize = 256 << 20;
 
 /// The ops and the one handler serving them, configured as the run being lent is configured.
 pub fn registrations_with(options: drive::RunOptions) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    registrations_in(EFFECT, options)
-}
-
-/// The machine for a program that declares `machine` in `module`, which is where `Target` is
-/// declared too: what a load answers crosses under that module's name.
-pub fn registrations_in(
-    module: &str,
-    options: drive::RunOptions,
-) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    lent_by(module, options, false)
+    lent_by(options, false)
 }
 
 /// A machine that loads only what it is handed, binds no host and reads no clock.
-pub fn hermetic_registrations_in(module: &str) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+pub fn hermetic_registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let options = drive::RunOptions {
         hermetic: true,
         ..drive::RunOptions::default()
     };
-    lent_by(module, options, true)
+    lent_by(options, true)
 }
 
-fn lent_by(
-    module: &str,
-    options: drive::RunOptions,
-    hermetic: bool,
-) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+fn lent_by(options: drive::RunOptions, hermetic: bool) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let handler: Arc<dyn HostHandler> = Arc::new(MachineHandler {
-        module: module.to_string(),
         hermetic,
         options,
         labels: Mutex::new(HashMap::new()),
@@ -167,7 +152,6 @@ fn refused_value(refused: &drive::Refused) -> Value {
 // --- The handler ------------------------------------------------------------------
 
 struct MachineHandler {
-    module: String,
     hermetic: bool,
     options: drive::RunOptions,
     labels: Mutex<HashMap<String, MachineThread>>,
@@ -254,7 +238,7 @@ impl HostHandler for MachineHandler {
                 let answer: Result<drive::FoundData, drive::Refused> =
                     self.ask(&label, span, |reply| Request::Reload { reply, front, unit })?;
                 match answer {
-                    Ok(found) => ok(drive::found_value(&found, &self.module)),
+                    Ok(found) => ok(drive::found_value(&found)),
                     Err(refused) => refused_value(&refused),
                 }
             }
@@ -394,7 +378,7 @@ impl MachineHandler {
             drive::Drive::open(options, &path)
         })?;
         Ok(match found {
-            Ok(found) => ok(drive::found_value(&found, &self.module)),
+            Ok(found) => ok(drive::found_value(&found)),
             Err(refused) => refused_value(&refused),
         })
     }
@@ -450,10 +434,7 @@ impl MachineHandler {
             Ok(found) => {
                 // A load that opens consumes its label's configuration.
                 self.taken(label);
-                Ok(payload::option(Some(drive::found_value(
-                    &found,
-                    &self.module,
-                ))))
+                Ok(payload::option(Some(drive::found_value(&found))))
             }
             Err(_) => Ok(payload::option(None)),
         }
