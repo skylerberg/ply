@@ -1,6 +1,7 @@
 // The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import spine (Span, Ident, QName, span_to, dummy_span, num, span_key, push_front)
+import spine (Span, Ident, QName, span_to, dummy_span, num, span_key, push_front, span_bin)
+import std.bin
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
               MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
@@ -37,7 +38,8 @@ import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
                 diag, diag1, diag2, lab, is_bare, is_ctor_name, backticked, ns_describe,
                 private_name)
-import rewrite (expand, expand_record_updates, expand_witnesses, Witness, WType, WParam)
+import rewrite (expand, expand_record_updates, expand_witnesses, Witness, WType, WParam,
+                witness_bin)
 import derive (Why, WFunction, WHandle, WFloat, WUnconstrained, WNullInsideOption, WSecret,
                ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name,
                Expansion, expand_derives, refusal_note, secret_reason, float_reason,
@@ -327,6 +329,8 @@ type Cx = {
   derived: Option<Derived>,
   known: Known,
   seeded: List<Bytes>,
+  // The tests published from the rows handed in, by key.
+  seeded_tests: List<Bytes>,
   assumed: List<Assumed>,
 }
 
@@ -6780,7 +6784,11 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
         ITest(def) -> {
           let c: Cx = { ..acc.cx, scope: acc.cx.scope + 1 };
           let footprint: WithAtoms = match known_test(c, m.name, acc.position) {
-            Some(cached) -> { cx: c, atoms: settled_row(c, cached).atoms },
+            Some(cached) ->
+              {
+                cx: { ..c, seeded_tests: push(c.seeded_tests, qualify(m.name, def.name)) },
+                atoms: settled_row(c, cached).atoms,
+              },
             None -> {
               let c1: Cx = {
                 ..c,
@@ -9064,6 +9072,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
     derived: None,
     known: known,
     seeded: [],
+    seeded_tests: [],
     assumed: [],
   })
 
@@ -9096,6 +9105,10 @@ pub type Front = {
   ctors: List<CtorInfo>,
   // The definitions published from the rows handed in rather than from a walk of their bodies.
   seeded: List<Bytes>,
+  // The same for tests, by key.
+  seeded_tests: List<Bytes>,
+  // What the emitter reads of the bodies walked, so a body it lowers is not walked again.
+  facts: EmitFacts,
 }
 
 pub fn check_front(r: Resolved, mods: List<Mod>) -> Front = check_front_with(r, mods, no_known())
@@ -9112,6 +9125,8 @@ pub fn check_front_with(r: Resolved, mods: List<Mod>, known: Known) -> Front = {
     effects: out.cx.effects,
     ctors: out.cx.ctors,
     seeded: out.cx.seeded,
+    seeded_tests: out.cx.seeded_tests,
+    facts: facts_of(out.cx),
   }
 }
 
@@ -9152,6 +9167,17 @@ fn elaboration_of(cx: Cx) -> Elaboration =
     orders: cx.witness_orders,
   }
 
+// The facts cross from the program that checked to the one that lowers as bytes: a constructor's
+// name is each program's own, its index in its type is not.
+derive bin for UpdateShape
+derive bin for LabelSite
+derive bin for OperandSite
+derive bin for WitnessOp
+derive bin for WitnessRef
+derive bin for WitnessOrder
+derive bin for Elaboration
+derive bin for EmitFacts
+
 // What the checker answers a lowering: the facts it asked for, or the diagnostics that stopped it.
 // The caller is the one that reports them, so the caller is the one that gets them.
 pub type CheckedFacts = | Facts(EmitFacts) | Refuses(List<Diag>)
@@ -9160,17 +9186,18 @@ pub type CheckedFacts = | Facts(EmitFacts) | Refuses(List<Diag>)
 // so the caller seeds only what it will not lower.
 pub fn emit_facts(r: Resolved, mods: List<Mod>, known: Known) -> CheckedFacts = {
   let out = check_program_with(r, mods, known);
-  if !out.ok { Refuses(out.cx.diags) } else {
-    Facts({
-      pure: fold(out.cx.defs, [], |acc: List<Bytes>, d: DefInfo|
-        if published_pure(d) { push(acc, d.name) } else { acc }),
-      label_sites: out.cx.label_sites,
-      elaboration: elaboration_of(out.cx),
-      operands: map(out.cx.operands, |o: OperandAt|
-        { module: o.module, span: o.span, ty: operand_name(resolve(out.cx, o.ty)) }),
-    })
-  }
+  if !out.ok { Refuses(out.cx.diags) } else { Facts(facts_of(out.cx)) }
 }
+
+fn facts_of(cx: Cx) -> EmitFacts =
+  {
+    pure: fold(cx.defs, [], |acc: List<Bytes>, d: DefInfo|
+      if published_pure(d) { push(acc, d.name) } else { acc }),
+    label_sites: cx.label_sites,
+    elaboration: elaboration_of(cx),
+    operands: map(cx.operands, |o: OperandAt|
+      { module: o.module, span: o.span, ty: operand_name(resolve(cx, o.ty)) }),
+  }
 
 fn operand_name(t: Type) -> Bytes =
   match t { TyCon(k) -> if len(k.args) == 0 { k.name } else { b"" }, _ -> b"" }
