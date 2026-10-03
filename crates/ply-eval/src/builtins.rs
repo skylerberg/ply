@@ -160,7 +160,7 @@ pub enum Builtin {
     ArrayGet,
     /// In place while the array has one holder; raises out of range.
     ArraySet,
-    /// The value as a `std.value.Value`, whole: what `std.value.show` renders.
+    /// The value as a `std.value.Value`, whole: what `std.show.show` renders.
     Reflect,
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
     Digest,
