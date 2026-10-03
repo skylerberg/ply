@@ -286,7 +286,7 @@ impl Synth {
 impl Closure {
     pub fn arity(&self) -> usize {
         match &self.kind {
-            ClosureKind::Builtin(b) => b.arity().0,
+            ClosureKind::Builtin(b) => b.arity(),
             ClosureKind::Ctor { arity, .. }
             | ClosureKind::Native { arity, .. }
             | ClosureKind::Continuation { arity, .. }
