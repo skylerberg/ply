@@ -258,6 +258,14 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
             })
         }),
 
+        Value::Array(items) => grow(|| {
+            items.iter().enumerate().find_map(|(i, v)| {
+                let handle = find(v, route)?;
+                route.push(format!("element {i}"));
+                Some(handle)
+            })
+        }),
+
         Value::Map(entries) => grow(|| {
             entries.iter().find_map(|(k, v)| {
                 if let Some(handle) = find(k, route) {

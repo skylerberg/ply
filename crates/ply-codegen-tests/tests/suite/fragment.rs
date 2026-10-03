@@ -167,6 +167,20 @@ fn lent_per_step(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + 
 fn read_by_step(acc: Pair, i: Int) -> Int = acc.x + i
 
 fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, |acc: Int, i: Int| acc + read_by_step(p, i)) + p.y }
+
+fn filled(n: Int) -> Int = { let a = fold(range(0, n), array_new(n, 0), |acc: Array<Int>, i: Int| array_set(acc, i, i * i)); fold(range(0, n), 0, |s: Int, i: Int| s + array_get(a, i)) }
+
+fn set_beside(n: Int) -> Int = { let a = array_new(n, 1); let b = array_set(a, 0, 100); array_get(a, 0) * 1000 + array_get(b, 0) }
+
+fn arrayed_at(n: Int, i: Int) -> Int = match array_at(array_of_list(range(0, n)), i) { Some(v) -> v * 10, None -> 0 - 1 }
+
+fn got(a: Array<Int>, i: Int) -> Int = array_get(a, i)
+
+fn got_at(n: Int, i: Int) -> Int = got(array_new(n, 7), i)
+
+fn counted_in(a: Array<Int>) -> Int = array_len(a)
+
+fn arrayed_back(n: Int) -> Int = fold(array_to_list(array_of_list(range(0, n))), 0, |s: Int, x: Int| s + x)
 "#;
 
 pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
@@ -529,6 +543,56 @@ fn list_set_answers_the_replaced_list_and_declines_outside_it() {
     assert_eq!(
         call(unit, "m.replaced_at", &[Value::Int(3), Value::Int(-1)]),
         None
+    );
+}
+
+#[test]
+fn an_array_reads_and_writes_by_index_and_raises_outside_it() {
+    let (_, unit) = unit(SHAPES);
+    for n in [3, 40] {
+        let squares: i64 = (0..n).map(|i| i * i).sum();
+        assert_eq!(
+            call(unit, "m.filled", &[Value::Int(n)]),
+            Some(Value::Int(squares)),
+            "filled({n})"
+        );
+        assert_eq!(
+            call(unit, "m.set_beside", &[Value::Int(n)]),
+            Some(Value::Int(1_100)),
+            "set_beside({n}): the held array keeps its element"
+        );
+        assert_eq!(
+            call(unit, "m.arrayed_back", &[Value::Int(n)]),
+            Some(Value::Int(n * (n - 1) / 2)),
+            "arrayed_back({n})"
+        );
+    }
+    for (i, want) in [(2, 20), (5, -1), (-1, -1)] {
+        assert_eq!(
+            call(unit, "m.arrayed_at", &[Value::Int(5), Value::Int(i)]),
+            Some(Value::Int(want)),
+            "arrayed_at(5, {i})"
+        );
+    }
+    assert_eq!(
+        call(unit, "m.got_at", &[Value::Int(3), Value::Int(2)]),
+        Some(Value::Int(7))
+    );
+    for i in [3, -1] {
+        let d = raised(unit, "m.got_at", &[Value::Int(3), Value::Int(i)]);
+        assert!(
+            d.message.contains("outside a value of 3 elements"),
+            "{}",
+            d.message
+        );
+    }
+    assert_eq!(
+        call(
+            unit,
+            "m.counted_in",
+            &[Value::array(vec![Value::Int(1); 4])]
+        ),
+        Some(Value::Int(4))
     );
 }
 

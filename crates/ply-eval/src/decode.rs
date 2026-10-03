@@ -301,6 +301,10 @@ fn find<'v>(from: &'v Value, target: &Value, steps: &mut Vec<Step<'v>>) -> bool 
             .iter()
             .enumerate()
             .any(|(i, v)| descend(Step::Item(i), v, target, steps)),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .any(|(i, v)| descend(Step::Item(i), v, target, steps)),
         Value::Ctor { name, args } => args.iter().enumerate().any(|(index, v)| {
             let step = Step::Arg {
                 ctor: simple(name.as_str()),
@@ -339,6 +343,7 @@ fn sketch(v: &Value) -> String {
         ),
         Value::Ctor { name, args } => format!("`{name}` holding {} argument(s)", args.len()),
         Value::List(items) => format!("a list of {}", items.len()),
+        Value::Array(items) => format!("an array of {}", items.len()),
         Value::Map(m) => format!("a map of {}", m.size()),
         Value::Str(text) => format!("a `String` of {} characters", text.chars().count()),
         Value::Bytes(b) => format!("a `Bytes` of {} bytes", b.len()),

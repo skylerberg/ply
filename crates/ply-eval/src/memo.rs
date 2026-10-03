@@ -19,6 +19,7 @@ pub fn world_independent(value: &Value) -> bool {
             | Value::Unit => {}
             Value::Cell(_) | Value::Task(_) => return false,
             Value::List(items) => pending.extend(items.iter()),
+            Value::Array(items) => pending.extend(items.iter()),
             Value::Map(map) => {
                 for (k, v) in map.iter() {
                     pending.push(k);
