@@ -26,6 +26,7 @@ pub mod payload;
 pub mod policy;
 pub mod recording;
 pub mod reused;
+pub mod runnable;
 pub mod shelf;
 pub mod shipped;
 pub mod support;

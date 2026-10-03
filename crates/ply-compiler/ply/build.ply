@@ -1,0 +1,148 @@
+// The builder: what the launcher enters to make a program it ships out of that program's sources.
+// It reads the program below the root it is handed, checks it seeded with the rows its last build
+// of the program kept, emits its unit, keeping the emitter's answers between builds when told its
+// own compiler is the one the shelf holds, and writes what the launcher enters.
+
+import load (SourceFile, checked, every_root)
+import front (Rows, no_rows, rows_bin)
+import resolve (Diag, Label)
+import unit (shipped, emitted, held, read_kept, shelf_identity, write_kept)
+import std.bin
+import std.fs (fs)
+import std.process (process)
+import std.random (entropy)
+import std.time (time)
+
+fn usage() -> String =
+  "the builder takes ROOT ENTRY OUT ROWS KEPT PHASES: the program below the `src` root, the definition it enters, where its runnable and the rows that seed its next build go below `out` (no rows: an empty ROWS), `kept` to keep the emitter's answers below `bodies` (else `fresh`), and `phases` to say what each step took (else `quiet`)"
+
+// The rows a last build of the program kept, or none when there are none to read.
+fn kept_rows(path: String) -> Rows / {fs.read_file[out]} =
+  if path == "" { no_rows() } else {
+    match fs.read_file[out](path) {
+      None -> no_rows(),
+      Some(bytes) -> match bin::decode(bytes, rows_bin()) { Ok(rows) -> rows, Err(_) -> no_rows() },
+    }
+  }
+
+// The line and column of byte `at` of `text`, from one.
+fn line_col(text: Bytes, at: Int) -> String = {
+  let before = bytes_slice(text, 0, if at > bytes_len(text) { bytes_len(text) } else { at });
+  let lines = bytes_split(before, b"\n");
+  int_to_string(len(lines)) ++ ":"
+    ++ int_to_string(match list_at(lines, len(lines) - 1) {
+      Some(l) -> bytes_len(l) + 1,
+      None -> 1,
+    })
+}
+
+// Where a diagnostic points: its first primary label's file, line and column, when it has one.
+fn place(d: Diag, files: List<SourceFile>) -> String =
+  match filter(d.labels, |l: Label| l.primary) {
+    [l, ..] -> match list_at(files, l.module) {
+      Some(f) -> f.path ++ ":" ++ line_col(f.text, l.start) ++ ": ",
+      None -> "",
+    },
+    [] -> "",
+  }
+
+fn told(diags: List<Diag>, files: List<SourceFile>) -> Unit / {process.err[proc]} =
+  fold(diags, (), |_: Unit, d: Diag|
+    process.err[proc](
+      place(d, files) ++ string_of_bytes_lossy(d.code) ++ ": " ++ string_of_bytes_lossy(d.message),
+    ))
+
+fn texts(files: List<SourceFile>) -> List<Bytes> = map(files, |f: SourceFile| f.text)
+
+// The program below `root` built into `out`: 0 when it was written, 1 when the program was refused,
+// and 2 when what was built could not be written.
+fn ms(from: Int, to: Int) -> String = int_to_string(to - from) ++ "ms"
+
+pub fn built(
+  root: String,
+  entry: String,
+  out: String,
+  rows: String,
+  kept: Bool,
+  phases: Bool,
+) -> Int / {fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read_file[out], fs.write_file[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.runtime, shipped.runnable, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc]} = {
+  let started = time.elapsed_ms();
+  let seed = kept_rows(rows);
+  let seeding = time.elapsed_ms();
+  match checked[src](root, seed) {
+    Err(u) -> {
+      told(u.diags, u.files);
+      1
+    },
+    Ok(c) -> {
+      let checking = time.elapsed_ms();
+      if rows != "" {
+        fs.write_file[out](rows, bin::encode(c.rows, rows_bin()));
+        ()
+      };
+      let keeping = time.elapsed_ms();
+      let offered = every_root(c.front);
+      let emission = if kept {
+        emitted(
+          shipped.runtime(),
+          c.front.dump,
+          texts(c.front.files),
+          offered,
+          shelf_identity(),
+          |key: Bytes| read_kept[bodies](".", key),
+          |key: Bytes, bytes: Bytes| write_kept[bodies](".", key, bytes),
+        )
+      } else {
+        emitted(
+          shipped.runtime(),
+          c.front.dump,
+          texts(c.front.files),
+          offered,
+          b"",
+          |_: Bytes| None,
+          |_: Bytes, _: Bytes| (),
+        )
+      };
+      let emitting = time.elapsed_ms();
+      match held(c.front.dump, offered, emission) {
+        Err(diags) -> {
+          told(diags, c.front.files);
+          1
+        },
+        Ok(unit) -> {
+          let bytes = shipped.runnable(entry, c.front.files, c.front.dump, unit);
+          let encoding = time.elapsed_ms();
+          let wrote = fs.write_file[out](out, bytes);
+          if phases {
+            process.err[proc](
+              "phases: " ++ entry ++ " rows read " ++ ms(started, seeding) ++ ", checked "
+                ++ ms(seeding, checking)
+                ++ ", rows kept "
+                ++ ms(checking, keeping)
+                ++ ", emitted "
+                ++ ms(keeping, emitting)
+                ++ ", encoded "
+                ++ ms(emitting, encoding)
+                ++ ", written "
+                ++ ms(encoding, time.elapsed_ms()),
+            )
+          };
+          if wrote { 0 } else {
+            process.err[proc]("the runnable could not be written to `" ++ out ++ "`");
+            2
+          }
+        },
+      }
+    },
+  }
+}
+
+pub fn main() -> Unit / {process.args[proc], process.err[proc], process.exit[proc], fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read_file[out], fs.write_file[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.runtime, shipped.runnable, entropy.next, time.now_ms, time.elapsed_ms} =
+  match process.args[proc]() {
+    [root, entry, out, rows, kept, phases] ->
+      process.exit[proc](built(root, entry, out, rows, kept == "kept", phases == "phases")),
+    _ -> {
+      process.err[proc](usage());
+      process.exit[proc](2)
+    },
+  }

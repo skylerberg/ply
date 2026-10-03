@@ -4,6 +4,7 @@
 use crate::body::StoredBody;
 use crate::load::Loaded;
 use crate::payload::record;
+use crate::runnable::Runnable;
 use ply_eval::decode::{self, At};
 use ply_eval::{
     DefHash, DefInfo, Diagnostic, Ended, Front, ModuleName, Severity, SourceMap, Span, Symbol,
@@ -348,23 +349,6 @@ struct Emission {
     refused: Vec<(String, String)>,
     entry_compiled: bool,
     warnings: Vec<Diagnostic>,
-}
-
-/// What a build of a program is a function of, as one digest: its sources (already digested),
-/// the shelf, the compiler and the runtime a decode refuses a mismatch of. The launcher gates the
-/// committed CLI artifact on this: behind the sources, a binary runs the sources instead.
-pub fn toolchain_stamp(program_digest: &str) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for part in [
-        program_digest.as_bytes(),
-        ply_codegen::c::producer::digest_of(crate::shelf::sources()).as_bytes(),
-        &compiler(),
-        &runtime(),
-    ] {
-        hasher.update(part);
-        hasher.update(&[0]);
-    }
-    hasher.finalize().to_hex()[..16].to_string()
 }
 
 pub fn build(
@@ -1065,18 +1049,56 @@ pub const EXIT_OK: i32 = 0;
 /// caller's to report.
 pub fn enter(artifact: &Artifact, opened: &Opened, argv: Vec<String>, binds: Binds) -> Ended<i32> {
     match artifact.unit.as_ref().map(served_text).transpose() {
-        Ok(text) => entered_with(text.flatten(), opened, argv, binds),
+        Ok(text) => entered_with(tier(opened, text.flatten()), opened, argv, binds),
         Err(refused) => Ended::refused(refused),
     }
 }
 
-/// [`enter`] for a program no artifact carries: its own load, compiled here from the body cache.
-pub fn enter_loaded(opened: &Opened, argv: Vec<String>, binds: Binds) -> Ended<i32> {
-    entered_with(None, opened, argv, binds)
+/// A runnable opened as an artifact is, with the C it is entered on.
+pub struct OpenedRunnable {
+    pub opened: Opened,
+    unit: String,
+}
+
+/// The program a runnable holds, opened as an artifact's is: its front end's answer read back over
+/// its own sources, rooted at `root`, taking the runnable rather than copying out of it.
+pub fn opened_runnable(runnable: Runnable, root: &Path) -> Result<OpenedRunnable, Diagnostic> {
+    let Runnable { entry, front, unit } = runnable;
+    let loaded =
+        crate::driver::load_over_front_taken(root.to_path_buf(), front).map_err(|err| {
+            err.diagnostics.into_iter().next().unwrap_or_else(|| {
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    "the runnable's front end did not read, and nothing said why",
+                )
+            })
+        })?;
+    Ok(OpenedRunnable {
+        opened: Opened {
+            sources: loaded.sources,
+            front: std::sync::Arc::try_unwrap(loaded.front).unwrap_or_else(|f| (*f).clone()),
+            entry: Symbol::new(&entry),
+        },
+        unit,
+    })
+}
+
+/// [`enter`] for a program its runnable holds: the unit's C it carries, compiled here.
+pub fn enter_runnable(program: OpenedRunnable, argv: Vec<String>, binds: Binds) -> Ended<i32> {
+    let OpenedRunnable { opened, unit } = program;
+    let tier = ply_codegen::Unit::handed(&opened.front, unit)
+        .map(|unit| unit as &'static dyn ply_eval::Provider)
+        .map_err(|e| {
+            Diagnostic::error(
+                codes::BACKEND_UNAVAILABLE,
+                format!("the program's unit could not be compiled: {e:#}"),
+            )
+        });
+    entered_with(tier, &opened, argv, binds)
 }
 
 fn entered_with(
-    unit: Option<String>,
+    tier: Result<&'static dyn ply_eval::Provider, Diagnostic>,
     opened: &Opened,
     argv: Vec<String>,
     binds: Binds,
@@ -1093,7 +1115,7 @@ fn entered_with(
         .defs
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
-    let tier = match tier(opened, unit) {
+    let tier = match tier {
         Ok(tier) => tier,
         Err(refused) => return Ended::refused(refused),
     };
