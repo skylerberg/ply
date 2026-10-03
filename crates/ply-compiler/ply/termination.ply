@@ -11,7 +11,7 @@ import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, L
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
-              RecField)
+              RecField, expr_span)
 import items (FnDef)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, Field, at, contains_bytes)
 import std.bin
@@ -119,8 +119,7 @@ type Local =
   // A lambda bound by `let`, walked where it is called, in the scope it was written in.
   | LetLambda({ params: List<Param>, body: Expr, locals: Map<Bytes, Local> })
 
-// `depth` counts the lambdas inlined on the way here.
-type Scope = { locals: Map<Bytes, Local>, facts: List<Fact>, depth: Int }
+type Scope = { locals: Map<Bytes, Local>, facts: List<Fact> }
 
 type Call = { callee: Int, args: List<Term>, facts: List<Fact>, span: Span }
 
@@ -130,9 +129,12 @@ type Use = { param: Int, args: Option<List<Term>> }
 // A definition outside the group that a body calls, or hands on as a value.
 type Outside = { name: Bytes, span: Span }
 
-type Seen = { calls: List<Call>, uses: List<Use>, outside: List<Outside> }
+// `lost` is a lambda's body nested too deep in others to be read, so the group is not read as
+// ending.
+type Seen = { calls: List<Call>, uses: List<Use>, outside: List<Outside>, lost: Option<Span> }
 
-type MemberContext = { group: Group, me: Int }
+// `depth` counts the lambdas whose bodies the walk is reading within one another.
+type MemberContext = { group: Group, me: Int, depth: Int }
 
 // The structural size of a place; `hi - lo`, which a shrinking call must find bounded below; or the
 // measure a `decreases` states, which every call between two members stating one is owed to shrink.
@@ -152,17 +154,23 @@ type Graph = { from: Int, to: Int, arcs: List<Arc>, span: Span }
 // --- The verdict ----------------------------------------------------------------------------------
 
 pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
-  let seen = map(range(0, len(g.defs)), |i: Int| seen_of({ group: g, me: i }, at(g.defs, i)));
+  let seen = map(range(0, len(g.defs)), |i: Int|
+    seen_of({ group: g, me: i, depth: 0 }, at(g.defs, i)));
   let calls = map(seen, |x: Seen| x.calls);
   let stating = fold(g.defs, false, |acc: Bool, d: FnDef|
     acc || (match d.decreases { Some(_) -> true, None -> false }));
-  let own = match looping(g, calls, false) {
-    None -> Ends,
-    Some(at_) -> if !stating { Diverges({ at: at_, through: None }) } else {
-      match looping(g, calls, true) {
-        None -> Stated,
-        Some(again) -> Diverges({ at: again, through: None }),
-      }
+  let lost = fold(seen, None, |acc: Option<Span>, x: Seen|
+    match acc { Some(_) -> acc, None -> x.lost });
+  let own = match lost {
+    Some(span) -> Diverges({ at: span, through: None }),
+    None -> match looping(g, calls, false) {
+      None -> Ends,
+      Some(first) -> if !stating { Diverges({ at: first, through: None }) } else {
+        match looping(g, calls, true) {
+          None -> Stated,
+          Some(again) -> Diverges({ at: again, through: None }),
+        }
+      },
     },
   };
   let out = |e: Ending, o: Outside|
@@ -175,7 +183,8 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
     endings: map(range(0, len(g.defs)), |i: Int|
       fold(seen, weaker(fold(at(seen, i).outside, settled, out), own), |e: Ending, x: Seen|
         fold(x.outside, e, out))),
-    summaries: map(range(0, len(g.defs)), |i: Int| summary({ group: g, me: i }, at(seen, i))),
+    summaries: map(range(0, len(g.defs)), |i: Int|
+      summary({ group: g, me: i, depth: 0 }, at(seen, i))),
   }
 }
 
@@ -530,6 +539,18 @@ fn bounded(facts: List<Fact>, hi: Option<Base>, lo: Option<Base>) -> Bool =
   fold(facts, false, |found: Bool, f: Fact| found || (f.hi.base == hi && f.lo.base == lo))
 
 fn size_relation(t: Term, p: Place, ty: Option<Type>) -> Option<Bool> / {abort.raise} =
+  match ty { Some(x) -> typed_relation(t, p, x), None -> place_relation(t, p) }
+
+fn typed_relation(t: Term, p: Place, ty: Type) -> Option<Bool> / {abort.raise} =
+  match t {
+    RecordTerm(r) -> match ty {
+      TyRecord(fs) -> record_relation(r.base, r.fields, fs, p),
+      _ -> None,
+    },
+    _ -> place_relation(t, p),
+  }
+
+fn place_relation(t: Term, p: Place) -> Option<Bool> =
   match t {
     Exactly(l) -> match l.base {
       Some(PlaceBase(q)) -> if l.k != 0 { None }
@@ -540,10 +561,6 @@ fn size_relation(t: Term, p: Place, ty: Option<Type>) -> Option<Bool> / {abort.r
     },
     Below(q) -> if q == p || within(q, p) { Some(true) } else { None },
     Inside(q) -> if q == p || within(q, p) { Some(true) } else { None },
-    RecordTerm(r) -> match ty {
-      Some(TyRecord(fs)) -> record_relation(r.base, r.fields, fs, p),
-      _ -> None,
-    },
     _ -> None,
   }
 
@@ -562,7 +579,7 @@ fn record_relation(
         Some(x) -> x,
         None -> match base { Some(b) -> project(b, f.name), None -> UnknownTerm },
       };
-      let here = match size_relation(value, { ..p, path: push(p.path, f.name) }, Some(f.ty)) {
+      let here = match typed_relation(value, { ..p, path: push(p.path, f.name) }, f.ty) {
         Some(s) -> Some(s),
         None -> if atomic(f.ty) { Some(false) } else { None },
       };
@@ -877,8 +894,8 @@ fn term(context: MemberContext, s: Scope, e: Expr) -> Term / {abort.raise} =
         fields: field_terms(context, s, r.fields),
       }),
     EApp(a) -> applied_term(context, s, a.func, a.args, a.named),
-    EIf(_) -> match answered(context, s, e) { Some(t) -> t, None -> UnknownTerm },
-    EMatch(_) -> match answered(context, s, e) { Some(t) -> t, None -> UnknownTerm },
+    EIf(i) -> match branches_of_if(context, s, i) { Some(t) -> t, None -> UnknownTerm },
+    EMatch(m) -> match branches_of_match(context, s, m) { Some(t) -> t, None -> UnknownTerm },
     EBlock(b) -> {
       let r = block_scope(context, s, b.stmts);
       match b.tail {
@@ -1072,25 +1089,8 @@ fn linear(context: MemberContext, s: Scope, e: Expr) -> Option<Linear> / {abort.
 // What a body answers: the terms its branches answer joined, a branch that never answers apart.
 fn answered(context: MemberContext, s: Scope, e: Expr) -> Option<Term> / {abort.raise} =
   match e {
-    EIf(i) ->
-      joined(
-        answered(context, assume(context, s, i.cond, true), i.then_branch),
-        answered(context, assume(context, s, i.cond, false), i.else_branch),
-      ),
-    EMatch(m) -> {
-      let t = term(context, s, m.scrutinee);
-      fold(m.arms, None, |acc: Option<Term>, arm: MatchArm| {
-        let inside = bind(s, arm.pat, t);
-        joined(
-          acc,
-          answered(
-            context,
-            match arm.guard { Some(g) -> assume(context, inside, g, true), None -> inside },
-            arm.body,
-          ),
-        )
-      })
-    },
+    EIf(i) -> branches_of_if(context, s, i),
+    EMatch(m) -> branches_of_match(context, s, m),
     EBlock(b) -> {
       let r = block_scope(context, s, b.stmts);
       joined(r.falls, match b.tail {
@@ -1104,6 +1104,35 @@ fn answered(context: MemberContext, s: Scope, e: Expr) -> Option<Term> / {abort.
     },
     _ -> Some(term(context, s, e)),
   }
+
+fn branches_of_if(
+  context: MemberContext,
+  s: Scope,
+  i: { span: Span, cond: Expr, then_branch: Expr, else_branch: Expr },
+) -> Option<Term> / {abort.raise} =
+  joined(
+    answered(context, assume(context, s, i.cond, true), i.then_branch),
+    answered(context, assume(context, s, i.cond, false), i.else_branch),
+  )
+
+fn branches_of_match(
+  context: MemberContext,
+  s: Scope,
+  m: { span: Span, scrutinee: Expr, arms: List<MatchArm> },
+) -> Option<Term> / {abort.raise} = {
+  let t = term(context, s, m.scrutinee);
+  fold(m.arms, None, |acc: Option<Term>, arm: MatchArm| {
+    let inside = bind(s, arm.pat, t);
+    joined(
+      acc,
+      answered(
+        context,
+        match arm.guard { Some(g) -> assume(context, inside, g, true), None -> inside },
+        arm.body,
+      ),
+    )
+  })
+}
 
 fn joined(a: Option<Term>, b: Option<Term>) -> Option<Term> =
   match a { None -> b, Some(x) -> match b { None -> a, Some(y) -> Some(join(x, y)) } }
@@ -1162,7 +1191,6 @@ fn entry_scope(context: MemberContext, def: FnDef) -> Scope / {abort.raise} =
         else { KnownTerm(Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 })) },
       )),
     facts: [],
-    depth: 0,
   }
 
 fn bound(s: Scope, name: Bytes, t: Term) -> Scope =
@@ -1351,8 +1379,11 @@ fn compared(op: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> = {
 
 fn seen_of(context: MemberContext, def: FnDef) -> Seen / {abort.raise} = {
   let s = entry_scope(context, def);
-  let defaults = fold(def.params, { calls: [], uses: [], outside: [] }, |acc: Seen, p: Param|
-    match p.default { Some(d) -> walk(context, s, acc, d), None -> acc });
+  let defaults = fold(
+    def.params,
+    { calls: [], uses: [], outside: [], lost: None },
+    |acc: Seen, p: Param| match p.default { Some(d) -> walk(context, s, acc, d), None -> acc },
+  );
   walk(context, s, defaults, def.body)
 }
 
@@ -1525,7 +1556,7 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
     EBad(_) -> acc,
   }
 
-// Lambdas inlined within one another past this many are walked with their parameters unknown.
+// Past this many lambdas' bodies read within one another, a body is not read.
 fn inline_bound() -> Int = 8
 
 // A `let` lambda called here with these arguments: its body, walked in the scope it was written in
@@ -1537,13 +1568,13 @@ fn inlined(
   f: { params: List<Param>, body: Expr, locals: Map<Bytes, Local> },
   args: List<Term>,
 ) -> Seen / {abort.raise} =
-  if s.depth >= inline_bound() { lambda_escapes(context, s, acc, f) } else {
+  if context.depth >= inline_bound() { too_deep(acc, f.body) } else {
     let inside = fold(
       range(0, len(f.params)),
-      { locals: f.locals, facts: s.facts, depth: s.depth + 1 },
+      { locals: f.locals, facts: s.facts },
       |sc: Scope, i: Int| bound(sc, at(f.params, i).name.name, actual(args, i)),
     );
-    walk(context, inside, acc, f.body)
+    walk({ ..context, depth: context.depth + 1 }, inside, acc, f.body)
   }
 
 fn lambda_escapes(
@@ -1552,12 +1583,17 @@ fn lambda_escapes(
   acc: Seen,
   f: { params: List<Param>, body: Expr, locals: Map<Bytes, Local> },
 ) -> Seen / {abort.raise} =
-  walk(
-    context,
-    unknown_params({ locals: f.locals, facts: s.facts, depth: s.depth + 1 }, f.params),
-    acc,
-    f.body,
-  )
+  if context.depth >= inline_bound() { too_deep(acc, f.body) } else {
+    walk(
+      { ..context, depth: context.depth + 1 },
+      unknown_params({ locals: f.locals, facts: s.facts }, f.params),
+      acc,
+      f.body,
+    )
+  }
+
+fn too_deep(acc: Seen, body: Expr) -> Seen =
+  match acc.lost { Some(_) -> acc, None -> { ..acc, lost: Some(expr_span(body)) } }
 
 fn applied(
   context: MemberContext,
