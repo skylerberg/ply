@@ -6,8 +6,9 @@ import parsing (int_to_bytes)
 import hash (hex)
 import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, answer_bin,
-             emit_roots_answer, module_of_root)
+             tables_bin, emit_roots_answer, module_of_root)
 import front (Dump, EmitRoot, EmitCtor, KeyRow, ModuleRow, OrdinalRow)
+import infer (sccs)
 import interface (stubbed)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
 import std.bin
@@ -175,8 +176,13 @@ pub type Ctor = { name: Bytes, arity: Int }
 // does not take.
 pub type Dropped = { function: Bytes, construct: Bytes, missing: Option<Bytes> }
 
-// A unit's C, the roots it takes, and what it dropped, in the order it dropped them.
-pub type Produced = { text: Bytes, taken: List<Bytes>, dropped: List<Dropped> }
+// What a unit's C was made of: its bodies, before the unit placed them, and its roots as they were
+// offered, which decide how the unit places each.
+pub type Made = { bodies: List<UnitBody>, offered: List<Offered> }
+
+// A unit's C, the roots it takes, what it dropped, in the order it dropped them, and what it was
+// made of.
+pub type Produced = { text: Bytes, taken: List<Bytes>, dropped: List<Dropped>, made: Made }
 
 // A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
 // the offered roots each covered.
@@ -211,7 +217,7 @@ fn positions(keys: List<Bytes>) -> Map<Bytes, Int> / {abort.raise} =
 // --- The fixpoint ---------------------------------------------------------------
 
 // A body the unit holds once: a group's under its first member.
-type UnitBody = { name: Bytes, text: Bytes, tables: Tables }
+pub type UnitBody = { name: Bytes, text: Bytes, tables: Tables }
 
 type Round = { bodies: List<UnitBody>, symbols: Map<Bytes, Defined>, out: List<Dropped> }
 
@@ -875,7 +881,73 @@ pub fn produce(
     ),
     taken: s.taken,
     dropped: s.dropped,
+    made: { bodies: s.bodies, offered: offered },
   }
+}
+
+// --- What a root runs ----------------------------------------------------------
+
+// The names a body answers for: a group's members, or its own.
+fn answered(b: UnitBody) -> List<Bytes> =
+  if len(b.tables.members) == 0 { [b.name] } else { b.tables.members }
+
+// How a body's roots were offered, which places them: a constant is held rather than called.
+fn offered_as(roots: Map<Bytes, Offered>, b: UnitBody) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    map(answered(b), |name: Bytes|
+      match map_get(roots, name) {
+        Some(o) ->
+          bytes_concat_all([
+            name,
+            b" ",
+            int_to_bytes(o.arity),
+            if o.constant { b" constant\n" } else { b"\n" },
+          ]),
+        None -> bytes_concat(name, b" unoffered\n"),
+      }),
+  )
+
+// What each root of a unit runs, as one digest: its own body and every body it can call, whatever
+// the calls' cycles. A body is digested as the unit keeps it, before placing, so a root that two
+// compilers or two units made into the same code is named alike by both.
+pub fn codes(made: Made) -> Map<Bytes, Bytes> / {abort.raise} = {
+  let bodies = made.bodies;
+  let n = len(bodies);
+  let index = fold(range(0, n), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    fold(answered(at(bodies, i)), acc, |m: Map<Bytes, Int>, name: Bytes| map_insert(m, name, i)));
+  let roots = fold(made.offered, map_new(), |acc: Map<Bytes, Offered>, o: Offered|
+    map_insert(acc, o.name, o));
+  let own = map(bodies, |b: UnitBody|
+    blake3(
+      bytes_concat_all([
+        blake3(b.name),
+        blake3(b.text),
+        blake3(bin::encode(b.tables, tables_bin())),
+        blake3(offered_as(roots, b)),
+      ]),
+    ));
+  let adj = map(bodies, |b: UnitBody|
+    fold(b.tables.calls, [], |acc: List<Int>, c: Bytes|
+      match map_get(index, c) { Some(j) -> push(acc, j), None -> acc }));
+  // Components come callees first, so each folds in the digests of those it reaches.
+  let reached = fold(sccs(n, adj), map_new(), |done: Map<Int, Bytes>, comp: List<Int>| {
+    let inside = fold(comp, map_new(), |m: Map<Int, Bool>, i: Int| map_insert(m, i, true));
+    let below = fold(comp, [], |acc: List<Bytes>, i: Int|
+      fold(at(adj, i), acc, |a: List<Bytes>, j: Int|
+        if map_contains(inside, j) { a }
+        else { match map_get(done, j) { Some(d) -> push(a, d), None -> a } }));
+    let digest = blake3(
+      bytes_concat_all(append(ordered(map(comp, |i: Int| at(own, i))), ordered(below))),
+    );
+    fold(comp, done, |m: Map<Int, Bytes>, i: Int| map_insert(m, i, digest))
+  });
+  fold(range(0, n), map_new(), |acc: Map<Bytes, Bytes>, i: Int| {
+    let code = blake3(
+      bytes_concat(at(own, i), match map_get(reached, i) { Some(d) -> d, None -> b"" }),
+    );
+    fold(answered(at(bodies, i)), acc, |m: Map<Bytes, Bytes>, name: Bytes|
+      map_insert(m, name, code))
+  })
 }
 
 // --- Emitting what no earlier run kept --------------------------------------------
@@ -1375,6 +1447,86 @@ fn one_body(name: Bytes, calls: List<Bytes>) -> Answer =
       symbols: [{ symbol: bytes_concat(b"f_", name), entry: bytes_concat(b"e_", name) }],
     },
   })
+
+// `one_body` with other text, as an edit to its definition would make it.
+fn edited_body(name: Bytes) -> Answer =
+  match one_body(name, []) {
+    Body(b) -> Body({ ..b, text: bytes_concat(b.text, b"\n/* edited */") }),
+    other -> other,
+  }
+
+// The codes of a unit over `answers`, offering `constants` as constants and the rest as calls.
+fn codes_over(
+  answers: List<{ key: Bytes, value: Answer }>,
+  offered: List<Bytes>,
+  constants: List<Bytes>,
+) -> Map<Bytes, Bytes> / {abort.raise} =
+  codes(
+    produce(
+      { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" },
+      [],
+      map(offered, |n: Bytes|
+        { name: n, arity: 0, constant: len(filter(constants, |c: Bytes| c == n)) > 0 }),
+      1,
+      map_of_entries(answers),
+    ).made,
+  )
+
+test "a root's code moves with every body it can call, and with no other" {
+  let program = |g: Answer|
+    codes_over(
+      [
+        { key: b"m.f", value: one_body(b"m.f", [b"m.g"]) },
+        { key: b"m.g", value: g },
+        { key: b"m.h", value: one_body(b"m.h", []) },
+      ],
+      [b"m.f", b"m.g", b"m.h"],
+      [],
+    );
+  let before = program(one_body(b"m.g", []));
+  let after = program(edited_body(b"m.g"));
+  assert(map_get(before, b"m.f") != map_get(after, b"m.f"), None);
+  assert(map_get(before, b"m.g") != map_get(after, b"m.g"), None);
+  assert_eq(map_get(before, b"m.h"), map_get(after, b"m.h"));
+  assert(map_get(before, b"m.f") != map_get(before, b"m.h"), None)
+}
+
+// The checker decides which roots are constants, and the unit holds a constant where it would call
+// a root, so the same bodies offered otherwise are other code.
+test "a root's code moves with how it and its callees were offered" {
+  let program = |constants: List<Bytes>|
+    codes_over(
+      [
+        { key: b"m.f", value: one_body(b"m.f", [b"m.g"]) },
+        { key: b"m.g", value: one_body(b"m.g", []) },
+        { key: b"m.h", value: one_body(b"m.h", []) },
+      ],
+      [b"m.f", b"m.g", b"m.h"],
+      constants,
+    );
+  let called = program([]);
+  let held = program([b"m.g"]);
+  assert(map_get(called, b"m.g") != map_get(held, b"m.g"), None);
+  assert(map_get(called, b"m.f") != map_get(held, b"m.f"), None);
+  assert_eq(map_get(called, b"m.h"), map_get(held, b"m.h"))
+}
+
+test "a cycle is digested whole, whatever order the unit holds its roots in" {
+  let cycle = |b: Answer, order: List<Bytes>|
+    codes_over(
+      [{ key: b"m.a", value: one_body(b"m.a", [b"m.b"]) }, { key: b"m.b", value: b }],
+      order,
+      [],
+    );
+  let one = cycle(one_body(b"m.b", [b"m.a"]), [b"m.a", b"m.b"]);
+  assert_eq(cycle(one_body(b"m.b", [b"m.a"]), [b"m.b", b"m.a"]), one);
+  assert(map_get(one, b"m.a") != map_get(one, b"m.b"), None);
+  let edited = match edited_body(b"m.b") {
+    Body(b) -> Body({ ..b, tables: { ..b.tables, calls: [b"m.a"] } }),
+    other -> other,
+  };
+  assert(map_get(cycle(edited, [b"m.a", b"m.b"]), b"m.a") != map_get(one, b"m.a"), None)
+}
 
 // A body names a constructor's tag by the constructor, so the same answer serves programs whose
 // tables differ, and each unit writes the position its own table gives.

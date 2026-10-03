@@ -4,7 +4,7 @@
 // be keyed at all, and a stored failure is never trusted.
 //
 import std.bytes (bytes_of_hex, hex_of)
-import keys (filed_keys, plan_digest, result_key, seed_bytes, seed_key, writes_seed_keys)
+import keys (code_key, filed_keys, plan_digest, result_key, seed_bytes, seed_key, writes_seed_keys)
 
 // The keys are computed here, from the test's own hash and the search it is keyed on; the runtime
 // answers what the store holds under each of them and writes a pass under the ones it is handed.
@@ -85,7 +85,7 @@ pub fn case_of(
     owed: owed,
   }
 
-pub type Reason = | New | Nondet | PreviousFailure | Cached | Unhashed
+pub type Reason = | New | Nondet | PreviousFailure | Cached | SameCode | Unhashed
 
 // One test's answer: what was decided, and whether it therefore runs.
 pub type Decision = { case: Case, reason: Reason }
@@ -93,7 +93,11 @@ pub type Decision = { case: Case, reason: Reason }
 fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
   match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
 
-pub fn runs(d: Decision) -> Bool = match d.reason { Cached -> false, _ -> true }
+// Whether a pass already answers for the test: one filed under its own key, or under the code it
+// compiles to.
+pub fn passed_before(r: Reason) -> Bool = match r { Cached -> true, SameCode -> true, _ -> false }
+
+pub fn runs(d: Decision) -> Bool = !passed_before(d.reason)
 
 // `test/nondet` answers first: it never consults the store, so a stale result cannot silence a
 // search that has to be re-run. A test with no hash cannot be keyed, so it always runs. A stored
@@ -174,6 +178,65 @@ pub fn filed(
     })
 }
 
+/// The key each test is filed under by the code its unit made of it, `codes` being each test's code by
+/// index: what a later run answers it by when nothing was filed under its own key. `test/nondet` and
+/// a test with no hash are filed by neither key.
+pub fn code_keys(
+  decisions: List<Decision>,
+  codes: Map<Int, String>,
+  s: Search,
+) -> Map<Int, String> / {abort.raise} = {
+  let digest = digest_of(s);
+  fold(decisions, map_new(), |acc: Map<Int, String>, d: Decision|
+    if d.case.nondet || d.case.hash == None { acc } else {
+      match map_get(codes, d.case.index) {
+        None -> acc,
+        Some(code) ->
+          map_insert(
+            acc,
+            d.case.index,
+            hex_of(code_key(bytes_of_hex(code), d.case.seeded, digest)),
+          ),
+      }
+    })
+}
+
+/// The code keys the store is asked about: a new test's, since a stored failure runs again and a
+/// cached test is answered already.
+pub fn asked_by_code(
+  decisions: List<Decision>,
+  keys: Map<Int, String>,
+) -> List<{ index: Int, key: String }> =
+  fold(decisions, [], |acc: List<{ index: Int, key: String }>, d: Decision|
+    if d.reason != New { acc } else {
+      match map_get(keys, d.case.index) {
+        Some(k) -> push(acc, { index: d.case.index, key: k }),
+        None -> acc,
+      }
+    })
+
+/// What answering by code decided: a new test whose code passed before is cached, and the keys it
+/// would have been filed under had it run, which the store is told so the next run answers it by
+/// them without asking for its code.
+pub type ByCode = { decisions: List<Decision>, refiled: List<String> }
+
+pub fn by_code(
+  decisions: List<Decision>,
+  passed: Map<Int, Bool>,
+  s: Search,
+) -> ByCode / {abort.raise} = {
+  let hit = |d: Decision| d.reason == New && map_contains(passed, d.case.index);
+  {
+    decisions: map(decisions, |d: Decision| if hit(d) { { ..d, reason: SameCode } } else { d }),
+    refiled: fold(
+      filed(filter(decisions, hit), s),
+      [],
+      |acc: List<String>, e: { index: Int, keys: List<String> }|
+        fold(e.keys, acc, |a: List<String>, k: String| push(a, k)),
+    ),
+  }
+}
+
 // The tests to run, in index order.
 pub fn to_run(decisions: List<Decision>) -> List<Int> =
   fold(decisions, [], |acc: List<Int>, d: Decision|
@@ -183,7 +246,8 @@ pub fn to_run(decisions: List<Decision>) -> List<Int> =
 // would have had.
 pub fn reused(decisions: List<Decision>) -> List<{ index: Int, outcome: String }> =
   fold(decisions, [], |acc: List<{ index: Int, outcome: String }>, d: Decision|
-    if d.reason == Cached { push(acc, { index: d.case.index, outcome: "passed" }) } else { acc })
+    if passed_before(d.reason) { push(acc, { index: d.case.index, outcome: "passed" }) }
+    else { acc })
 
 // The word `--explain` prints for a reason, which is also the word the JSON carries.
 pub fn word(r: Reason) -> String =
@@ -192,6 +256,7 @@ pub fn word(r: Reason) -> String =
     Nondet -> "nondet",
     PreviousFailure -> "previous failure",
     Cached -> "cached",
+    SameCode -> "same code",
     Unhashed -> "unhashed",
   }
 
@@ -242,6 +307,48 @@ test "a test with no hash runs, because there is no key to have an answer under"
   assert(!answers_per_root(row, random(4)))
 }
 
+fn sevens() -> String = "7777777777777777777777777777777777777777777777777777777777777777"
+
+test "a new test is answered by its code, and filed again under its own key; nothing else is" {
+  let decisions = decide([
+    a_case(0, None),
+    a_case(1, Some("failed")),
+    a_case(2, None),
+    { ..a_case(3, None), nondet: true },
+    { ..a_case(4, None), hash: None, cache_key: None },
+  ]);
+  let codes = fold(range(0, 5), map_new(), |m: Map<Int, String>, i: Int|
+    map_insert(m, i, sevens()));
+  let keys = code_keys(decisions, codes, dpor());
+  // A nondet test and an unhashed one are filed by no key, their code's included.
+  assert_eq(map_keys(keys), [0, 1, 2]);
+  // Two tests that ran the same code share its key: what passed as that code passes again.
+  assert_eq(map_get(keys, 0), map_get(keys, 2));
+  // A stored failure runs again whatever its code did before.
+  assert_eq(map(asked_by_code(decisions, keys), |a: { index: Int, key: String }| a.index), [0, 2]);
+  let answered = by_code(decisions, map_insert(map_new(), 0, true), dpor());
+  assert_eq(map(answered.decisions, |d: Decision| d.reason), [
+    SameCode,
+    PreviousFailure,
+    New,
+    Nondet,
+    Unhashed,
+  ]);
+  assert_eq(answered.refiled, [a_hash()]);
+  assert_eq(to_run(answered.decisions), [1, 2, 3, 4]);
+  assert_eq(reused(answered.decisions), [{ index: 0, outcome: "passed" }])
+}
+
+test "a seeded test's code key is its code and its plan" {
+  let seeded = decide([{ ..a_case(0, None), seeded: true }]);
+  let codes = map_insert(map_new(), 0, sevens());
+  assert(code_keys(seeded, codes, dpor()) != code_keys(seeded, codes, random(4)), None);
+  assert(
+    code_keys(seeded, codes, dpor()) != code_keys(decide([a_case(0, None)]), codes, dpor()),
+    None,
+  )
+}
+
 test "`test/nondet` opts out of the cache in both directions" {
   assert_eq(reason_of({ ..a_case(0, Some("passed")), nondet: true }), Nondet);
   assert_eq(reason_of({ ..a_case(0, Some("failed")), nondet: true }), Nondet);
@@ -276,6 +383,7 @@ test "every reason has the word the report prints" {
   assert_eq(word(Nondet), "nondet");
   assert_eq(word(PreviousFailure), "previous failure");
   assert_eq(word(Cached), "cached");
+  assert_eq(word(SameCode), "same code");
   assert_eq(word(Unhashed), "unhashed")
 }
 

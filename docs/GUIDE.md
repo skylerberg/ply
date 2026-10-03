@@ -66,8 +66,11 @@ definitions that analyse a program and file the answer hash as they did, and a
 pass or a discharged obligation only by one whose runtime is the same and whose
 definitions that make a unit and decide a verdict hash as they did: another
 build files them again (`W0603`), and an upstream answers only builds of its
-runtime. A hash covers what its definition reaches and no comment or layout
-(§8.2), so the rest of `ply`, its other commands among it, is in neither. A dependency's own
+runtime. A pass is filed as well under the code its test compiled to, believed by a build
+whose runtime and definitions that run a test and file its pass hash as they did,
+so a compiler change that leaves a test's code as it was does not run it again.
+A hash covers what its definition reaches and no comment or
+layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
@@ -1205,10 +1208,12 @@ A cost law (§10) states how `steps` grows with a size instead of pinning it.
 
 A definition's hash covers its normalized form: names, comments, formatting,
 imports, `pub`, specs and test labels are erased, and references are replaced by
-their referent's hash. A test runs exactly when its hash has no recorded pass,
-so renames and comment edits run nothing. `ply hash` prints the hashes.
+their referent's hash. A test runs exactly when neither its hash nor the code it compiles to has a
+recorded pass, so renames and comment edits run nothing, and neither does an edit or a new `ply`
+that compiles a test to the same code; the selection line counts those `by code` (`by_code` in
+`--json`, reason `same code`). `ply hash` prints the hashes.
 `--explain` says why each test was selected, what a pass is filed under (the
-test's hash and the runtime stamp, `filed_under` in `--json`), which of a test's
+test's hash and the runtime stamp, `filed_under` in `--json`, and the code it ran), which of a test's
 atoms are answers this binary gives from what it ships (`shipped`), which no key
 covers (`unkeyed`), and where the run's time went, phase by phase from the
 process's start (`phases` in the `--json` report);
