@@ -12,11 +12,12 @@
 #       own, out of the report.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 #   ci-corpus.sh mark                  the moment `keep` gathers from
-#   ci-corpus.sh keep DIR              the C `ply` emitted, compiled or read since `mark`, into DIR
-#                                      for a later run: a body is keyed by its definition, the emitter
-#                                      and the runtime's sources, so another tree reuses what still
-#                                      applies. The stages are build-ply's to ship, and the packages'
-#                                      stores are carried apart.
+#   ci-corpus.sh keep DIR              the C and the compiler's answers `ply` emitted, compiled or
+#                                      read since `mark`, into DIR for a later run: a body is keyed by
+#                                      its definition, the emitter and the runtime's sources, and an
+#                                      answer by the emitter and its question, so another tree reuses
+#                                      what still applies. The stages are build-ply's to ship, and the
+#                                      packages' stores are carried apart.
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
 #   ci-corpus.sh compact               every package's store compacted before a job saves them: a
 #                                      store only grows, and every later job restores what one saves
