@@ -22,7 +22,7 @@ of it next.
 | --- | --- |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
 | `crates/ply-codegen` | the C backend: emits C, builds it and loads it |
-| `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its builder, committed as a runnable (`bootstrap/`) |
+| `crates/ply-compiler` | the compiler written in Ply (`ply/`), the builtins it declares (`prelude.ply`) and its builder, committed as a runnable (`bootstrap/`) |
 | `crates/ply-store` | what `ply` keeps under `.ply-cache`, as the `store` package in `ply/`; not a cargo crate |
 | `crates/ply-test` | what a test run decides, as the `suite` package in `ply/`; not a cargo crate |
 | `crates/ply-prove` | specification obligations and their discharge, as the `prove` package in `ply/`; not a cargo crate |
@@ -65,11 +65,13 @@ name a server.
 The compiler is Ply source under `crates/ply-compiler/ply`. Its builder, the
 compiler's own `build.main`, is committed as `crates/ply-compiler/bootstrap/build.run`
 beside `build.digest`: a runnable, the front end's answer and the unit's C, which the
-launcher enters without running a compiler. A binary whose builder is behind its
-sources has the committed builder build theirs once, keeps it under the stages,
-and builds `ply` (`crates/ply-cli/bootstrap/ply.run`) with it when that is behind
-too. So the compiler and the shipped modules it imports cannot use a language rule
-the same change introduces; the rest of the standard library can. Likewise the
+launcher enters without running a compiler. A binary whose `ply`
+(`crates/ply-cli/bootstrap/ply.run`) is behind its sources has the committed
+builder build it once and keeps it under the stages, so every such build reads
+back what the builds before it kept. Where the program needs a rule the
+committed builder lacks, that builder builds the sources' own builder, and it
+builds `ply`. So the compiler and the shipped modules it imports cannot use a
+language rule the same change introduces; the rest of the standard library can. Likewise the
 runtime reads the front end's answer the committed builder carries, so it can come
 to require a field of one only once main's builder writes it. Never commit the
 runnables: CI rebuilds them on main after each merge.
