@@ -133,6 +133,8 @@ impl<'a> IntoIterator for &'a Fields {
 pub enum Value {
     Int(i64),
     Fixed(Fixed),
+    /// A Unicode scalar value: what a `String` is a sequence of.
+    Char(char),
     Bool(bool),
     Float(f64),
     Decimal(Decimal),
@@ -141,6 +143,8 @@ pub enum Value {
     #[default]
     Unit,
     List(List),
+    /// Fixed length; a write is in place while this is the only holder.
+    Array(Arc<Vec<Value>>),
     /// Iterated in ascending key order by [`Value::cmp`], always.
     Map(Map),
     Record(Arc<Fields>),
@@ -257,6 +261,11 @@ impl Value {
         Value::List(List::from(items))
     }
 
+    #[inline(never)]
+    pub fn array(items: Vec<Value>) -> Value {
+        Value::Array(Arc::new(items))
+    }
+
     pub fn empty_map() -> Value {
         Value::Map(Map::new())
     }
@@ -307,6 +316,7 @@ impl Value {
         match self {
             Value::Int(_) => "Int",
             Value::Fixed(f) => f.ty.name(),
+            Value::Char(_) => "Char",
             Value::Bool(_) => "Bool",
             Value::Float(_) => "Float",
             Value::Decimal(_) => "Decimal",
@@ -314,6 +324,7 @@ impl Value {
             Value::Bytes(_) => "Bytes",
             Value::Unit => "Unit",
             Value::List(_) => "List",
+            Value::Array(_) => "Array",
             Value::Map(_) => "Map",
             Value::Record(_) => "record",
             Value::Ctor { .. } => "variant",
@@ -339,6 +350,13 @@ impl Value {
         match self {
             Value::Fixed(f) => Ok(*f),
             other => Err(type_error(span, what, "a fixed-width integer", other)),
+        }
+    }
+
+    pub fn as_char(&self, span: Span, what: &str) -> Result<char, Diagnostic> {
+        match self {
+            Value::Char(c) => Ok(*c),
+            other => Err(type_error(span, what, "Char", other)),
         }
     }
 
@@ -381,6 +399,13 @@ impl Value {
         match self {
             Value::List(xs) => Ok(xs),
             other => Err(type_error(span, what, "List", other)),
+        }
+    }
+
+    pub fn as_array(&self, span: Span, what: &str) -> Result<&Arc<Vec<Value>>, Diagnostic> {
+        match self {
+            Value::Array(xs) => Ok(xs),
+            other => Err(type_error(span, what, "Array", other)),
         }
     }
 
@@ -435,6 +460,7 @@ impl Drop for Value {
 fn nests(v: &Value) -> bool {
     match v {
         Value::List(xs) => !xs.is_empty(),
+        Value::Array(xs) => !xs.is_empty(),
         Value::Map(m) => !m.is_empty(),
         Value::Record(fields) => !fields.is_empty(),
         Value::Ctor { args, .. } => !args.is_empty(),
@@ -450,7 +476,7 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             xs.drain_unique(&mut items);
             out.extend(items.into_iter().filter(nests));
         }
-        Value::Ctor { args: xs, .. } => {
+        Value::Ctor { args: xs, .. } | Value::Array(xs) => {
             if let Some(items) = Arc::get_mut(xs) {
                 out.extend(items.drain(..).filter(nests));
             }
@@ -639,6 +665,8 @@ fn discriminant(v: &Value) -> u8 {
         Value::Task(_) => 13,
         Value::Secret(_) => 14,
         Value::Fixed(_) => 15,
+        Value::Char(_) => 16,
+        Value::Array(_) => 17,
     }
 }
 
@@ -655,6 +683,7 @@ impl Ord for Value {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
             // By value rather than by bits, so `I8` orders `-1` below `0`.
             (Value::Fixed(x), Value::Fixed(y)) => x.ty.cmp(&y.ty).then_with(|| x.value_cmp(*y)),
+            (Value::Char(x), Value::Char(y)) => x.cmp(y),
             (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
             // By numeric value, so `1.50m` and `1.5m` are one key.
             (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
@@ -662,6 +691,7 @@ impl Ord for Value {
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
             // Grows the stack instead of bounding: `cmp` cannot refuse, and `Equal` merges keys.
             (Value::List(x), Value::List(y)) => grow(|| x.iter().cmp(y.iter())),
+            (Value::Array(x), Value::Array(y)) => grow(|| x.iter().cmp(y.iter())),
             (Value::Map(x), Value::Map(y)) => grow(|| x.iter().cmp(y.iter())),
             (Value::Record(x), Value::Record(y)) => grow(|| x.iter().cmp(y.iter())),
             (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 }) => {
@@ -710,6 +740,7 @@ fn is_canonical(v: &Value) -> bool {
         // Minimal scale is unique per numeric value, so it is canonical.
         Value::Decimal(d) => d.serialize() == d.normalize().serialize(),
         Value::List(items) => grow(|| items.iter().all(is_canonical)),
+        Value::Array(items) => grow(|| items.iter().all(is_canonical)),
         Value::Map(entries) => grow(|| {
             entries
                 .iter()
@@ -725,6 +756,7 @@ fn canonicalize(v: &Value) -> Value {
     match v {
         Value::Decimal(d) => Value::Decimal(d.normalize()),
         Value::List(items) => grow(|| Value::list(items.iter().map(canonicalize).collect())),
+        Value::Array(items) => grow(|| Value::array(items.iter().map(canonicalize).collect())),
         Value::Map(entries) => grow(|| {
             let mut out = Map::new();
             for (k, val) in entries.iter() {
@@ -798,6 +830,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Fixed(x), Value::Fixed(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         // IEEE `==`, so `NaN != NaN` and `0.0 == -0.0`.
         (Value::Float(x), Value::Float(y)) => x == y,
@@ -807,6 +840,19 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
         (Value::Unit, Value::Unit) => true,
         (Value::List(x), Value::List(y)) => {
+            if x.len() != y.len() {
+                return Ok(false);
+            }
+            return descend(span, depth, || {
+                for (p, q) in x.iter().zip(y.iter()) {
+                    if !equal_at(p, q, span, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            });
+        }
+        (Value::Array(x), Value::Array(y)) => {
             if x.len() != y.len() {
                 return Ok(false);
             }
@@ -929,6 +975,12 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
         };
         match (actual, expected) {
             (Value::List(a), Value::List(e)) if a.len() == e.len() => grow(|| {
+                a.iter()
+                    .zip(e.iter())
+                    .enumerate()
+                    .find_map(|(i, (x, y))| within(Step::Index(i), x, y, path))
+            }),
+            (Value::Array(a), Value::Array(e)) if a.len() == e.len() => grow(|| {
                 a.iter()
                     .zip(e.iter())
                     .enumerate()

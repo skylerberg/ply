@@ -12,12 +12,16 @@
 #       own, out of the report.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 #   ci-corpus.sh mark                  the moment `keep` gathers from
-#   ci-corpus.sh keep DIR              the C `ply` emitted, compiled or read since `mark`, into DIR
-#                                      for a later run: a body is keyed by its definition, the emitter
-#                                      and the runtime's sources, so another tree reuses what still
-#                                      applies. The stages are build-ply's to ship, and the packages'
-#                                      stores are carried apart.
+#   ci-corpus.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
+#                                      since `mark`, into DIR for a later run: a body is keyed by its
+#                                      definition, the emitter and the runtime's sources, and an answer
+#                                      by the emitter and its question, so another tree reuses what
+#                                      still applies. Objects stay out: one compiles from its bodies in
+#                                      seconds, and they were most of what a lane kept. The stages are
+#                                      build-ply's to ship, and the packages' stores are carried apart.
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
+#   ci-corpus.sh compact               every package's store compacted before a job saves them: a
+#                                      store only grows, and every later job restores what one saves
 #   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
 #   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
 #   ci-corpus.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
@@ -223,14 +227,25 @@ case "${1:-}" in
     [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; exit 2; }
     rm -rf "$dir"
     mkdir -p "$dir"
-    (cd "$caches" && find ply-c-cache -type f -newer "$mark" -print0 2>/dev/null |
-      tar --null -T - -cf -) | tar -xf - -C "$dir" || exit 1
+    kept=()
+    for sub in emit answers; do [ -d "$caches/ply-c-cache/$sub" ] && kept+=("ply-c-cache/$sub"); done
+    if [ "${#kept[@]}" -gt 0 ]; then
+      (cd "$caches" && find "${kept[@]}" -type f -newer "$mark" ! -name '*.tmp' -print0 |
+        tar --null -T - -cf -) | tar -xf - -C "$dir" || exit 1
+    fi
     du -sh "$dir"
     ;;
   restore)
     dir=${2:?a directory}
     [ -d "$dir" ] || exit 0
     tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
+    ;;
+  compact)
+    for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks; do
+      [ -f "$dir/.ply-cache/store.idx" ] || continue
+      echo "=== ${dir#"$root"/}"
+      "$ply" cache compact "$dir" || echo "the store under ${dir#"$root"/} was not compacted" >&2
+    done
     ;;
   upstream-mark)
     mkdir -p "$upstream"

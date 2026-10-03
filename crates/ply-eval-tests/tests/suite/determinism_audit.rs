@@ -175,8 +175,8 @@ test "two tasks waking at one deadline" {
   with_cell[n](0) { c ->
     handle {
       simulate {
-        let a = task.spawn(|| { clock.sleep(50); bump() });
-        let b = task.spawn(|| { clock.sleep(50); bump() });
+        let a = task.spawn(|| { clock.sleep(Duration(50)); bump() });
+        let b = task.spawn(|| { clock.sleep(Duration(50)); bump() });
         task.join(a);
         task.join(b);
         assert(counter.get[n]() >= 1)

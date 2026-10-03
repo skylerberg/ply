@@ -3,14 +3,14 @@
 
 use crate::heap::{self, Word};
 use crate::rt::{
-    Ctx, FAILED_ABORT, FAILED_UNWIND, Frames, HandlerFrame, call_value, drop_frame, inherit_frames,
-    values_taken,
+    Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_UNWIND, Frames, HandlerFrame, call_value,
+    drop_frame, inherit_frames, values_taken,
 };
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
 use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, TaskHandle, Turn};
-use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, signature};
-use ply_eval::{Diagnostic, SimId, Span, Symbol, Unbound, Value, codes};
+use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, liveness, signature};
+use ply_eval::{Diagnostic, Mode, SimId, Span, Symbol, Unbound, Value, codes};
 use std::collections::BTreeMap;
 
 pub struct Simulation {
@@ -51,11 +51,15 @@ enum Request {
     /// The body, and the stack the spawn was performed on.
     Spawn(Word, usize),
     Join(TaskHandle),
+    Await(TaskHandle),
+    Cancel(TaskHandle),
     Yield,
     Seeded(&'static OpSignature, Vec<Value>),
     Park(Pending),
     Finished(Word),
     Failed,
+    /// The task unwound after a cancel.
+    Cancelled,
 }
 
 impl Simulation {
@@ -295,6 +299,16 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
                 sim.answer = w;
                 k
             }
+            // The task's perform answers nothing and finds the context failed, so every frame
+            // returns, releasing what it holds, back to its entry.
+            Resumption::Cancel { k } => {
+                c.failed = FAILED_CANCELLED;
+                k
+            }
+            Resumption::Raise { k, failure } => {
+                c.fail(failure);
+                k
+            }
         };
         let c = unsafe { &mut *ctx };
         let sim = c.sims.last_mut().expect("a region is running");
@@ -338,6 +352,33 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             sim.sched.suspend(k, Value::Task(handle))
         }
         Request::Join(target) => sim.sched.join(k, &target, site),
+        Request::Await(target) => sim.sched.await_task(k, &target, site),
+        Request::Cancel(target) => {
+            let clock = match sim.policy {
+                Policy::Seeded => Some(sim.handlers.clock_mut()),
+                Policy::Host => None,
+            };
+            match sim.sched.cancel(k, &target, site, clock) {
+                Err(d) => Err(d),
+                Ok(unstarted) => {
+                    let region = target.region();
+                    let id = target.id();
+                    let records = sim.sched.records_steps();
+                    if let Some(body) = unstarted {
+                        heap::dec(body);
+                        release(c, id);
+                        recycle(c, id);
+                    }
+                    // A cancel writes the task's liveness and each step it took reads it, so the
+                    // search tries cancelling earlier and later.
+                    if records {
+                        c.record_access(liveness(id, Mode::Write));
+                        c.trail.mark_steps_of(region, id, liveness(id, Mode::Read));
+                    }
+                    Ok(())
+                }
+            }
+        }
         Request::Yield => sim.sched.suspend(k, Value::Unit),
         Request::Park(pending) => match &runtime {
             Some(rt) => sim.sched.park_on_host(k, pending, site, rt.as_ref()),
@@ -355,6 +396,13 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             heap::dec(word);
             let sim = c.sims.last_mut().expect("a region is running");
             sim.sched.finish(value)
+        }
+        Request::Cancelled => {
+            release(c, task);
+            recycle(c, task);
+            c.failed = 0;
+            let sim = c.sims.last_mut().expect("a region is running");
+            sim.sched.finish_cancelled()
         }
         Request::Failed => {
             release(c, task);
@@ -435,7 +483,9 @@ extern "C" fn task_entry(arg: usize) {
     let sim = c.sims.last_mut().expect("a region is running");
     sim.request = Some((
         me,
-        if c.failed != 0 {
+        if c.failed == FAILED_CANCELLED {
+            Request::Cancelled
+        } else if c.failed != 0 {
             Request::Failed
         } else {
             Request::Finished(r)
@@ -457,6 +507,20 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
             heap::dec(args[0]);
             match handle.as_task(c.site(), "`task.join`") {
                 Ok(target) => Request::Join(target.clone()),
+                Err(d) => return c.fail(d),
+            }
+        }
+        ("task", "await") | ("task", "cancel") => {
+            let handle = c.value(args[0]);
+            heap::dec(args[0]);
+            let what = if op.as_str() == "await" {
+                "`task.await`"
+            } else {
+                "`task.cancel`"
+            };
+            match handle.as_task(c.site(), what) {
+                Ok(target) if op.as_str() == "await" => Request::Await(target.clone()),
+                Ok(target) => Request::Cancel(target.clone()),
                 Err(d) => return c.fail(d),
             }
         }

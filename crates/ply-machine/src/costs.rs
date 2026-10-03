@@ -17,10 +17,12 @@ enum Verdict {
 
 struct Site {
     span: Span,
+    /// `push`, `list_set` or `array_set`.
+    op: String,
     verdict: Verdict,
     reason: String,
     fix: Option<String>,
-    /// `Some(k)` when the list is parameter `k` at its last use.
+    /// `Some(k)` when the updated value is parameter `k` at its last use.
     param: Option<usize>,
 }
 
@@ -30,7 +32,7 @@ struct Definition {
     sites: Vec<Site>,
 }
 
-/// Only definitions with an append.
+/// Only definitions with an update.
 struct Report {
     defs: Vec<Definition>,
 }
@@ -47,7 +49,7 @@ pub fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError> {
     })
 }
 
-/// Each `reuse fn`'s appends must reuse, except onto its own parameter; else E0127.
+/// Each `reuse fn`'s updates must reuse, except of its own parameter; else E0127.
 pub fn promises(loaded: &Loaded) -> Vec<Diagnostic> {
     if !loaded.promised {
         return Vec::new();
@@ -65,24 +67,29 @@ pub fn promises(loaded: &Loaded) -> Vec<Diagnostic> {
             if site.verdict == Verdict::Reuses || site.param.is_some() {
                 continue;
             }
+            let held = if site.op == "array_set" {
+                "array"
+            } else {
+                "list"
+            };
             let what = match site.verdict {
-                Verdict::Copies => "copies its list",
-                _ => "cannot be shown to reuse its list",
+                Verdict::Copies => format!("copies its {held}"),
+                _ => format!("cannot be shown to reuse its {held}"),
             };
             let d = Diagnostic::error(
                 codes::REUSE_BROKEN,
                 format!(
-                    "`{}` is a `reuse fn`, and this append {what}: {}",
-                    def.name, site.reason
+                    "`{}` is a `reuse fn`, and this `{}` {what}: {}",
+                    def.name, site.op, site.reason
                 ),
             )
-            .primary(site.span, "this append")
+            .primary(site.span, "this update")
             .secondary(promise, "the promise");
             out.push(match &site.fix {
                 Some(fix) => d.note(format!("fix: {fix}")),
                 None => d.note(
                     "no edit inside this body removes the copy; the promise cannot be kept as \
-                     written, so either restructure the append or drop `reuse`",
+                     written, so either restructure the update or drop `reuse`",
                 ),
             });
         }
@@ -107,6 +114,8 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
     }
     let (packages, mod_pkg, shelf) =
         ply_codegen::c::producer::package_tables(&loaded.front.packages, &loaded.front.mod_pkg);
+    let embeds = ply_codegen::c::producer::embeds_of(&loaded.front)
+        .map_err(|e| failed(&format!("{e:#}")))?;
     let answer = ply_codegen::c::producer::call(
         ENTRY,
         &[
@@ -115,6 +124,7 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
             packages,
             mod_pkg,
             shelf,
+            embeds,
         ],
     )
     .map_err(|e| failed(&format!("{e:#}")))?;
@@ -125,11 +135,11 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
 fn failed(why: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("the compiler could not say where this program's appends copy: {why}"),
+        format!("the compiler could not say where this program's updates copy: {why}"),
     )
     .primary(
         Span::DUMMY,
-        "no append was costed, so no promise is claimed kept",
+        "no update was costed, so no promise is claimed kept",
     )
     .note("this is Ply's fault: the compiler's own `costs.ply` is what failed here")
 }
@@ -163,6 +173,7 @@ fn read(answer: At<'_>, sources: &HashMap<String, SourceId>) -> Result<Report, d
                 let param = site.field("param")?;
                 Ok(Site {
                     span: span(id, site)?,
+                    op: site.field("op")?.utf8()?.to_string(),
                     verdict: match verdict.utf8()? {
                         "reuses" => Verdict::Reuses,
                         "copies" => Verdict::Copies,

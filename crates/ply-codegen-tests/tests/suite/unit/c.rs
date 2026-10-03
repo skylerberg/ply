@@ -1,3 +1,4 @@
+mod answers;
 mod cache;
 mod dump;
 mod sweep;
@@ -24,15 +25,31 @@ fn every_declared_helper_has_an_address() {
 /// entering one argument too few read past that array and took the process down, and what the
 /// caller got was a segfault rather than a diagnostic naming the entry.
 #[test]
-fn an_entry_entered_with_the_wrong_arity_is_refused_rather_than_read_past() {
+fn an_entry_entered_with_too_few_arguments_is_refused_rather_than_read_past() {
     ply_codegen::c::producer::ensure_default();
     let err = ply_codegen::c::producer::call("emit.emit_roots_answer", &[])
-        .expect_err("`emit.emit_roots_answer` takes seven arguments");
+        .expect_err("`emit.emit_roots_answer` takes eight arguments");
     let text = err.to_string();
     assert!(
-        text.contains("`emit.emit_roots_answer` takes 7 arguments and was entered with 0"),
+        text.contains("`emit.emit_roots_answer` takes 8 arguments and was entered with 0"),
         "the refusal names the entry and both counts: {text}"
     );
+}
+
+/// The committed emitter, emitting a stage for sources that gave an entry another argument, is
+/// handed that argument too, and takes the ones it was compiled with.
+#[test]
+fn an_entry_takes_the_leading_arguments_it_was_compiled_with() {
+    use ply_eval::{Fields, Symbol, Value};
+    ply_codegen::c::producer::ensure_default();
+    let want = Value::Record(std::sync::Arc::new(Fields::from_unsorted(vec![
+        (Symbol::new("path"), Value::bytes(b"data")),
+        (Symbol::new("dir"), Value::Bool(true)),
+    ])));
+    let key = |args: &[Value]| {
+        ply_codegen::c::producer::call("embed.embed_key", args).expect("the entry answers")
+    };
+    assert_eq!(key(&[want.clone(), Value::Int(7)]), key(&[want]));
 }
 
 #[test]
@@ -1857,8 +1874,8 @@ pub fn narrowed(k: Int) -> U32 = narrow(7u32, k)
 #[test]
 fn a_recursive_group_holding_a_handle_is_emitted_per_definition() {
     let source = r#"
-fn a(n: Int) -> Int = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> 7, } } else { b(n - 1) }
-fn b(n: Int) -> Int = if n == 0 { clock.now() } else { a(n - 1) }
+fn a(n: Int) -> Int = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> Instant(7), } } else { b(n - 1) }
+fn b(n: Int) -> Int = if n == 0 { match clock.now() { Instant(t) -> t } } else { a(n - 1) }
 "#;
     let Some(loaded) = tests_support::keyed(source) else {
         return;

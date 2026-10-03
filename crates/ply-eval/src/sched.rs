@@ -15,8 +15,23 @@ pub const ROOT: TaskId = TaskId(0);
 
 pub enum Resumption<K, B> {
     Enter,
-    Start { body: B, span: Span },
-    Resume { k: K, value: Value },
+    Start {
+        body: B,
+        span: Span,
+    },
+    Resume {
+        k: K,
+        value: Value,
+    },
+    /// Resume `k` only to unwind it: the task was cancelled and performs nothing more.
+    Cancel {
+        k: K,
+    },
+    /// Resume `k` failing with `failure`, as a join of a cancelled task does.
+    Raise {
+        k: K,
+        failure: Diagnostic,
+    },
 }
 
 pub enum Turn<K, B> {
@@ -105,6 +120,11 @@ enum Wait {
         task: TaskId,
         span: Span,
     },
+    /// A join that answers `None` rather than failing when the task is cancelled.
+    Await {
+        task: TaskId,
+        span: Span,
+    },
     /// The [`Clock`] owns the timer; `until` is kept so a diagnostic can name it after it fires.
     Timer {
         until: i64,
@@ -119,9 +139,14 @@ enum Wait {
 enum TaskState<K, B> {
     Ready(Resumption<K, B>),
     Running,
-    Blocked { wait: Wait, k: K },
+    Blocked {
+        wait: Wait,
+        k: K,
+    },
     Done(Value),
     Failed,
+    /// Stopped by `task.cancel` before it finished: it answers nothing.
+    Cancelled,
 }
 
 struct Task<K, B> {
@@ -595,6 +620,7 @@ impl<K, B> Scheduler<K, B> {
         let done = match self.tasks.get(&target).map(|t| &t.state) {
             None => return Err(err_unknown_task(span, target)),
             Some(TaskState::Done(value)) => Some(value.clone()),
+            Some(TaskState::Cancelled) => return Err(err_joined_cancelled(span, target)),
             Some(_) => None,
         };
         match done {
@@ -612,6 +638,162 @@ impl<K, B> Scheduler<K, B> {
         }
         self.current = None;
         Ok(())
+    }
+
+    /// A join answering `Some` of what the task answered, or `None` once it is cancelled.
+    pub fn await_task(&mut self, k: K, target: &TaskHandle, span: Span) -> Result<(), Diagnostic> {
+        let task = self.running()?;
+        if target.region() != self.region {
+            return Err(err_foreign_task(span, target.id()));
+        }
+        let target = target.id();
+        let settled = match self.tasks.get(&target).map(|t| &t.state) {
+            None => return Err(err_unknown_task(span, target)),
+            Some(TaskState::Done(value)) => Some(some(value.clone())),
+            Some(TaskState::Cancelled) => Some(none()),
+            Some(_) => None,
+        };
+        match settled {
+            Some(value) => {
+                self.absorb(task, target);
+                self.make_ready(task, Resumption::Resume { k, value });
+            }
+            None => {
+                self.task_mut(target)?.joiners.push(task);
+                self.task_mut(task)?.state = TaskState::Blocked {
+                    wait: Wait::Await { task: target, span },
+                    k,
+                };
+            }
+        }
+        self.current = None;
+        Ok(())
+    }
+
+    /// Stops `target` where it stands: whatever it waits on is let go, and when it next runs it
+    /// only unwinds. Answers whether it stopped anything, and a body never started, for the caller
+    /// to release; a task that already ended, or is already unwinding, answers `false`.
+    pub fn cancel(
+        &mut self,
+        k: K,
+        target: &TaskHandle,
+        span: Span,
+        clock: Option<&mut Clock>,
+    ) -> Result<Option<B>, Diagnostic> {
+        let task = self.running()?;
+        if target.region() != self.region {
+            return Err(err_foreign_task(span, target.id()));
+        }
+        let target = target.id();
+        if target == task || target == ROOT {
+            return Err(Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                format!("{target} cannot be cancelled from {task}"),
+            )
+            .primary(span, "cancelled here")
+            .note("a task cancels another one: the region's own body, and a task itself, are not cancelled"));
+        }
+        let state = match self.tasks.get_mut(&target) {
+            None => return Err(err_unknown_task(span, target)),
+            Some(t) => std::mem::replace(&mut t.state, TaskState::Cancelled),
+        };
+        let (stopped, body) = match state {
+            TaskState::Ready(Resumption::Start { body, .. }) => {
+                self.ready.remove(&target);
+                self.settle_cancelled(target)?;
+                (true, Some(body))
+            }
+            TaskState::Ready(Resumption::Resume { k, .. }) => {
+                self.task_mut(target)?.state = TaskState::Ready(Resumption::Cancel { k });
+                (true, None)
+            }
+            TaskState::Blocked { wait, k } => {
+                match wait {
+                    Wait::Timer { .. } => {
+                        if let Some(clock) = clock {
+                            clock.cancel(target);
+                        }
+                    }
+                    Wait::Join { task: on, .. } | Wait::Await { task: on, .. } => {
+                        if let Some(t) = self.tasks.get_mut(&on) {
+                            t.joiners.retain(|j| *j != target);
+                        }
+                    }
+                    Wait::Host { pending, .. } => {
+                        self.parked.remove(&pending.token);
+                    }
+                }
+                self.make_ready(target, Resumption::Cancel { k });
+                (true, None)
+            }
+            other @ (TaskState::Done(_)
+            | TaskState::Failed
+            | TaskState::Cancelled
+            | TaskState::Ready(Resumption::Cancel { .. } | Resumption::Raise { .. })) => {
+                self.task_mut(target)?.state = other;
+                (false, None)
+            }
+            other @ (TaskState::Running | TaskState::Ready(Resumption::Enter)) => {
+                self.task_mut(target)?.state = other;
+                return Err(self.internal(format!("{target} was cancelled while running")));
+            }
+        };
+        if stopped {
+            self.absorb(target, task);
+        }
+        self.make_ready(
+            task,
+            Resumption::Resume {
+                k,
+                value: Value::Bool(stopped),
+            },
+        );
+        self.current = None;
+        Ok(body)
+    }
+
+    /// The running task finished unwinding after a cancel.
+    pub fn finish_cancelled(&mut self) -> Result<(), Diagnostic> {
+        let done = self.running()?;
+        self.task_mut(done)?.state = TaskState::Cancelled;
+        self.settle_cancelled(done)?;
+        self.current = None;
+        Ok(())
+    }
+
+    /// `task` answers nothing: an `await` of it hears `None`, and a `join` of it fails.
+    fn settle_cancelled(&mut self, task: TaskId) -> Result<(), Diagnostic> {
+        let t = self.task_mut(task)?;
+        let joiners = std::mem::take(&mut t.joiners);
+        let unheld = t.unheld;
+        self.unfinished -= 1;
+        for joiner in joiners {
+            let resumption = match self.waiting_on(joiner) {
+                Some(Wait::Await { .. }) => {
+                    let k = self.unblock(joiner)?;
+                    Resumption::Resume { k, value: none() }
+                }
+                Some(Wait::Join { span, .. }) => {
+                    let failure = err_joined_cancelled(*span, task);
+                    let k = self.unblock(joiner)?;
+                    Resumption::Raise { k, failure }
+                }
+                _ => return Err(self.internal(format!("{joiner} waited on {task} without a join"))),
+            };
+            self.absorb(joiner, task);
+            self.make_ready(joiner, resumption);
+        }
+        if unheld {
+            release(&self.released, task);
+        }
+        Ok(())
+    }
+
+    fn waiting_on(&self, task: TaskId) -> Option<&Wait> {
+        match self.tasks.get(&task).map(|t| &t.state) {
+            Some(TaskState::Blocked { wait, .. }) => Some(wait),
+            _ => None,
+        }
     }
 
     /// Blocks until virtual time reaches `deadline`; the [`Clock`] already holds the timer.
@@ -645,15 +827,13 @@ impl<K, B> Scheduler<K, B> {
         let unheld = task.unheld;
         self.unfinished -= 1;
         for joiner in joiners {
+            let answer = match self.waiting_on(joiner) {
+                Some(Wait::Await { .. }) => some(value.clone()),
+                _ => value.clone(),
+            };
             let k = self.unblock(joiner)?;
             self.absorb(joiner, done);
-            self.make_ready(
-                joiner,
-                Resumption::Resume {
-                    k,
-                    value: value.clone(),
-                },
-            );
+            self.make_ready(joiner, Resumption::Resume { k, value: answer });
         }
         if unheld {
             release(&self.released, done);
@@ -801,7 +981,7 @@ impl<K, B> Scheduler<K, B> {
         .primary(self.span, "no task in this region can make progress");
         for (id, wait, origin) in &blocked {
             let (span, message) = match wait {
-                Wait::Join { task, span } => {
+                Wait::Join { task, span } | Wait::Await { task, span } => {
                     (*span, format!("{id} waits here for {task} to finish"))
                 }
                 // Unreachable while the clock has a timer: time would have advanced instead.
@@ -835,7 +1015,7 @@ impl<K, B> Scheduler<K, B> {
         .primary(self.span, "no task in this region can make progress");
         for (id, wait, origin) in self.blocked() {
             let (span, message) = match wait {
-                Wait::Join { task, span } => {
+                Wait::Join { task, span } | Wait::Await { task, span } => {
                     (*span, format!("{id} waits here for {task} to finish"))
                 }
                 Wait::Timer { until, span } => (*span, format!("{id} sleeps here until {until}ns")),
@@ -984,4 +1164,25 @@ fn err_unknown_task(span: Span, task: TaskId) -> Diagnostic {
     .primary(span, "this handle outlived the region that created it")
     .note("a `Task` is a key into its region's scheduler, and the scheduler ends with the region")
     .note("join the task inside the `simulate` region that spawned it")
+}
+
+#[cold]
+#[inline(never)]
+fn err_joined_cancelled(span: Span, task: TaskId) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{task}` was cancelled, so it has nothing to join"),
+    )
+    .primary(span, "joined here")
+    .note(
+        "`task.await` answers `None` for a cancelled task, where `task.join` has no answer to give",
+    )
+}
+
+fn some(value: Value) -> Value {
+    Value::ctor("Some", vec![value])
+}
+
+fn none() -> Value {
+    Value::ctor("None", vec![])
 }
