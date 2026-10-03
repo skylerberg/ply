@@ -187,6 +187,41 @@ impl Carry {
         }
     }
 
+    /// The first value `value`, a value of the type `self` stands for, holds where `self` names
+    /// variable `var`.
+    pub fn value_at<'v>(
+        &self,
+        var: usize,
+        value: &'v Value,
+        ctors: &CtorCarries,
+    ) -> Option<&'v Value> {
+        match (self, value) {
+            (Carry::Var(n), _) => (*n == var).then_some(value),
+            (Carry::List(item), Value::List(items)) => {
+                items.iter().find_map(|x| item.value_at(var, x, ctors))
+            }
+            (Carry::List(item), Value::Array(items)) => {
+                items.iter().find_map(|x| item.value_at(var, x, ctors))
+            }
+            (Carry::Map(key, val), Value::Map(entries)) => entries.iter().find_map(|(k, v)| {
+                key.value_at(var, k, ctors)
+                    .or_else(|| val.value_at(var, v, ctors))
+            }),
+            (Carry::Record(fields), Value::Record(record)) => fields
+                .iter()
+                .find_map(|(name, c)| record.get(name).and_then(|x| c.value_at(var, x, ctors))),
+            (Carry::Sum(params), Value::Ctor { name, args }) => {
+                ctors.get(name).and_then(|fields| {
+                    fields
+                        .iter()
+                        .zip(args.iter())
+                        .find_map(|(field, x)| field.instantiate(params).value_at(var, x, ctors))
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// What `value` shows of its own type, as far as it holds values to show it.
     pub fn of(value: &Value, ctors: &CtorCarries) -> Carry {
         match value {
