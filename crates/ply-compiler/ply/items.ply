@@ -42,6 +42,10 @@ pub type SpecKind = | SRequires | SEnsures
 
 pub type SpecClause = { kind: SpecKind, expr: Expr, span: Span }
 
+// `returns fresh`, or `returns xs`: what the answer may share with the arguments. The cost checker
+// shows it of the body, and a caller in another package reads it in place of the body.
+pub type Returns = | ReturnsFresh(Span) | ReturnsParam(Ident)
+
 pub type FnDef = {
   vis: Vis,
   name: Ident,
@@ -51,8 +55,11 @@ pub type FnDef = {
   effects: Option<RowExpr>,
   constraints: List<Constraint>,
   spec: List<SpecClause>,
+  returns: Option<Returns>,
   // The span of a `reuse` before `fn`.
   reuse: Option<Span>,
+  // The span of a `transparent` before `fn`: its body is part of what another package reads of it.
+  transparent: Option<Span>,
   body: Expr,
   span: Span,
 }
@@ -150,7 +157,9 @@ pub fn no_fn() -> FnDef =
     effects: None,
     constraints: [],
     spec: [],
+    returns: None,
     reuse: None,
+    transparent: None,
     body: no_expr(),
     span: dummy_span(),
   }
@@ -208,6 +217,7 @@ pub fn at_item_start(c: Ctx, p: P) -> Bool = {
     || at_law_start(c, p)
     || at_derive_start(c, p)
     || at_reuse_start(c, p)
+    || at_transparent_start(c, p)
 }
 
 // `law` is contextual: it opens an item only before a quoted label or `/host`, so `fn law(..)` keeps its meaning.
@@ -222,6 +232,11 @@ pub fn at_derive_start(c: Ctx, p: P) -> Bool =
 // `reuse` is contextual: it opens an item only when `fn` follows.
 pub fn at_reuse_start(c: Ctx, p: P) -> Bool =
   at_ident_text(c, p, b"reuse") && kind_at(c, p, 1) == k_fn()
+
+// `transparent` is contextual too: it opens an item only before `fn` or `reuse fn`.
+pub fn at_transparent_start(c: Ctx, p: P) -> Bool =
+  at_ident_text(c, p, b"transparent")
+    && (kind_at(c, p, 1) == k_fn() || at_reuse_start(c, advance(c, p).p))
 
 // `set` is contextual: only a third identifier opens a set, so `effect set { .. }` is an effect named `set`.
 pub fn at_effect_set_start(c: Ctx, p: P) -> Bool =
@@ -436,6 +451,35 @@ pub fn spec_kind_at(c: Ctx, p: P) -> Option<SpecKind> =
   else if at_ident_text(c, p, b"ensures") { Some(SEnsures) }
   else { None }
 
+// `returns` is contextual: it opens the clause only before a name.
+fn at_returns(c: Ctx, p: P) -> Bool =
+  at_ident_text(c, p, b"returns") && tok_is_ident(kind_at(c, p, 1))
+
+// A name that is no parameter is reported, and the clause dropped.
+fn opt_returns(c: Ctx, p: P, params: List<Param>) -> Result<R<Option<Returns>>, P> =
+  if !at_returns(c, p) { Ok({ p: p, node: None }) } else {
+    let a = advance(c, p);
+    let { p, node: name } = expect_ident(c, a.p, b"`fresh` or a parameter's name after `returns`")?;
+    if name.name == b"fresh" { Ok({ p: p, node: Some(ReturnsFresh(span_to(a.node, name.span))) }) }
+    else if fold(params, false, |b: Bool, x: Param| b || x.name.name == name.name) {
+      Ok({ p: p, node: Some(ReturnsParam(name)) })
+    } else {
+      Ok({
+        p: push_diag(
+          p,
+          diag1(
+            b"E0101",
+            name.span,
+            bytes_concat_all([b"`returns` names `", name.name, b"`, which is no parameter"]),
+            b"not a parameter of this function",
+            [b"write `returns fresh`, or the name of the parameter the answer may share"],
+          ),
+        ),
+        node: None,
+      })
+    }
+  }
+
 pub fn spec_clauses(c: Ctx, p: P) -> Result<R<List<SpecClause>>, P> =
   iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<SpecClause>|
     match spec_kind_at(c, s.p) {
@@ -481,7 +525,13 @@ fn opt_row(c: Ctx, p: P) -> Result<R<Option<RowExpr>>, P> = {
   }
 }
 
-pub fn fn_def(c: Ctx, p: P, vis: Vis, reuse: Option<Span>) -> Result<R<FnDef>, P> = {
+pub fn fn_def(
+  c: Ctx,
+  p: P,
+  vis: Vis,
+  reuse: Option<Span>,
+  transparent: Option<Span>,
+) -> Result<R<FnDef>, P> = {
   let st = advance(c, p);
   let { p, node: name } = expect_ident(c, st.p, b"a function name after `fn`")?;
   let { p, node: g } = opt_generics(c, p)?;
@@ -491,6 +541,7 @@ pub fn fn_def(c: Ctx, p: P, vis: Vis, reuse: Option<Span>) -> Result<R<FnDef>, P
   let { p, node: ret } = opt_ret(c, p)?;
   let { p, node: eff } = opt_row(c, p)?;
   let { p, node: cs } = where_clause(c, p)?;
+  let { p, node: rt } = opt_returns(c, p, ps)?;
   let { p, node: sp } = spec_clauses(c, p)?;
   let { p, node: body } = fn_body(c, p)?;
   Ok({
@@ -504,7 +555,9 @@ pub fn fn_def(c: Ctx, p: P, vis: Vis, reuse: Option<Span>) -> Result<R<FnDef>, P
       effects: eff,
       constraints: cs,
       spec: sp,
+      returns: rt,
       reuse: reuse,
+      transparent: transparent,
       body: body,
       span: span_to(st.node, expr_span(body)),
     },
@@ -864,12 +917,22 @@ pub fn no_pub(p: P, code: Bytes, s: Option<Span>, message: Bytes, notes: List<By
   match s { Some(sp) -> push_diag(p, diag1(code, sp, message, b"remove `pub`", notes)), None -> p }
 
 pub fn item_at(c: Ctx, p: P, vis: Vis, pub_span: Option<Span>) -> Result<R<Item>, P> =
-  if at_reuse_start(c, p) {
+  if at_transparent_start(c, p) {
+    let t = advance(c, p);
+    if at_reuse_start(c, t.p) {
+      let a = advance(c, t.p);
+      let d = fn_def(c, a.p, vis, Some(a.node), Some(t.node))?;
+      Ok({ p: d.p, node: IFn(d.node) })
+    } else {
+      let d = fn_def(c, t.p, vis, None, Some(t.node))?;
+      Ok({ p: d.p, node: IFn(d.node) })
+    }
+  } else if at_reuse_start(c, p) {
     let a = advance(c, p);
-    let d = fn_def(c, a.p, vis, Some(a.node))?;
+    let d = fn_def(c, a.p, vis, Some(a.node), None)?;
     Ok({ p: d.p, node: IFn(d.node) })
   } else if at(c, p, k_fn()) {
-    let d = fn_def(c, p, vis, None)?;
+    let d = fn_def(c, p, vis, None, None)?;
     Ok({ p: d.p, node: IFn(d.node) })
   } else if at(c, p, k_type()) {
     let d = type_def(c, p, vis)?;
@@ -990,11 +1053,21 @@ pub fn dump_spec(x: SpecClause) -> Bytes =
 
 pub fn dump_reuse(s: Span) -> Bytes = rec(s, b"reu")
 
+pub fn dump_transparent(s: Span) -> Bytes = rec(s, b"trn")
+
+pub fn dump_returns(r: Returns) -> Bytes =
+  match r {
+    ReturnsFresh(s) -> rec(s, b"rfr"),
+    ReturnsParam(x) -> bytes_concat(word(b"rpm"), dump_ident(x)),
+  }
+
 pub fn dump_fn(d: FnDef) -> Bytes =
   bytes_concat_all([
     rec(d.span, b"fn"),
     dump_vis(d.vis),
     dump_opt(d.reuse, dump_reuse),
+    dump_opt(d.transparent, dump_transparent),
+    dump_opt(d.returns, dump_returns),
     dump_ident(d.name),
     dump_generics(d.generics),
     dump_list(d.params, dump_param),
@@ -1116,7 +1189,7 @@ test "an import binds a module, an alias or a list of names" {
 test "a function carries generics, a row, a where clause and a spec" {
   assert_eq(
     dump(b"pub fn f<a | e>(x: a) -> a / {io.read} where derivable(json, a) requires x { x }\n"),
-    "#0;#1;4:80:fn;%pub;?0;7:8:ident;@66;%gen;#1;9:10:ident;@61;#1;13:14:ident;@65;#0;#1;16:20:prm;16:17:ident;@78;?1;19:20:tvar;19:20:ident;@61;?0;?1;25:26:tvar;25:26:ident;@61;?1;29:38:row;#1;30:37:atm;30:32:qname;?0;30:32:ident;@696f;%read;?0;#0;?0;#1;45:63:cst;%json;55:59:dsp;61:62:ident;@61;#1;64:74:spc;%requires;73:74:evar;73:74:qname;?0;73:74:ident;@78;75:80:eblk;#0;?1;77:78:evar;77:78:qname;?0;77:78:ident;@78;#0;",
+    "#0;#1;4:80:fn;%pub;?0;?0;?0;7:8:ident;@66;%gen;#1;9:10:ident;@61;#1;13:14:ident;@65;#0;#1;16:20:prm;16:17:ident;@78;?1;19:20:tvar;19:20:ident;@61;?0;?1;25:26:tvar;25:26:ident;@61;?1;29:38:row;#1;30:37:atm;30:32:qname;?0;30:32:ident;@696f;%read;?0;#0;?0;#1;45:63:cst;%json;55:59:dsp;61:62:ident;@61;#1;64:74:spc;%requires;73:74:evar;73:74:qname;?0;73:74:ident;@78;75:80:eblk;#0;?1;77:78:evar;77:78:qname;?0;77:78:ident;@78;#0;",
   )
 }
 
@@ -1129,12 +1202,35 @@ test "a function may bind a label and name it in its row" {
 test "a reuse fn keeps the marker's span, and reuse stays a name elsewhere" {
   assert_eq(
     dump(b"pub reuse fn f(x: Int) -> Int = x\n"),
-    "#0;#1;10:33:fn;%pub;?1;4:9:reu;13:14:ident;@66;%gen;#0;#0;#0;#1;15:21:prm;15:16:ident;@78;?1;18:21:tcon;18:21:qname;?0;18:21:ident;@496e74;#0;?0;?1;26:29:tcon;26:29:qname;?0;26:29:ident;@496e74;#0;?0;#0;#0;32:33:evar;32:33:qname;?0;32:33:ident;@78;#0;",
+    "#0;#1;10:33:fn;%pub;?1;4:9:reu;?0;?0;13:14:ident;@66;%gen;#0;#0;#0;#1;15:21:prm;15:16:ident;@78;?1;18:21:tcon;18:21:qname;?0;18:21:ident;@496e74;#0;?0;?1;26:29:tcon;26:29:qname;?0;26:29:ident;@496e74;#0;?0;#0;#0;32:33:evar;32:33:qname;?0;32:33:ident;@78;#0;",
   );
   assert_eq(
     dump(b"fn reuse(x: Int) -> Int = x\n"),
-    "#0;#1;0:27:fn;%priv;?0;3:8:ident;@7265757365;%gen;#0;#0;#0;#1;9:15:prm;9:10:ident;@78;?1;12:15:tcon;12:15:qname;?0;12:15:ident;@496e74;#0;?0;?1;20:23:tcon;20:23:qname;?0;20:23:ident;@496e74;#0;?0;#0;#0;26:27:evar;26:27:qname;?0;26:27:ident;@78;#0;",
+    "#0;#1;0:27:fn;%priv;?0;?0;?0;3:8:ident;@7265757365;%gen;#0;#0;#0;#1;9:15:prm;9:10:ident;@78;?1;12:15:tcon;12:15:qname;?0;12:15:ident;@496e74;#0;?0;?1;20:23:tcon;20:23:qname;?0;20:23:ident;@496e74;#0;?0;#0;#0;26:27:evar;26:27:qname;?0;26:27:ident;@78;#0;",
   )
+}
+
+test "a transparent fn keeps the marker's span, before a reuse or alone, and transparent stays a name elsewhere" {
+  let marked = dump(b"pub transparent fn f(x: Int) -> Int = x\n");
+  assert(string_contains(marked, ":fn;%pub;?0;?1;4:15:trn;?0;19:20:ident;@66;"));
+  let both = dump(b"transparent reuse fn f(x: Int) -> Int = x\n");
+  assert(string_contains(both, ":fn;%priv;?1;12:17:reu;?1;0:11:trn;?0;21:22:ident;@66;"));
+  let named = dump(b"fn transparent(x: Int) -> Int = x\n");
+  assert(string_contains(named, ":fn;%priv;?0;?0;?0;3:14:ident;@7472616e73706172656e74;"))
+}
+
+test "a `returns` clause names `fresh` or a parameter, and naming anything else is refused" {
+  assert(string_contains(dump(b"fn f(xs: List<Int>) -> List<Int> returns fresh = xs\n"), "rfr;"));
+  assert(
+    string_contains(
+      dump(b"fn f(xs: List<Int>) -> List<Int> returns xs = xs\n"),
+      "%rpm;41:43:ident;@7873;",
+    ),
+  );
+  let other = dump(b"fn f(xs: List<Int>) -> List<Int> returns ys = xs\n");
+  assert(string_contains(other, "%priv;?0;?0;?0;3:4:ident"));
+  assert(string_contains(other, "!E0101:41:43:"));
+  assert(string_contains(dump(b"fn returns(fresh: Int) -> Int = fresh\n"), "@72657475726e73;"))
 }
 
 test "a type with one uppercase name and no payload is an alias, not a sum" {
@@ -1182,28 +1278,28 @@ test "a law carries a host flag, binders, a guard and a body" {
 test "a failed item is abandoned and the next one still parses" {
   assert_eq(
     dump(b"type T = { , }\nfn g() = 2\n"),
-    "#0;#1;15:25:fn;%priv;?0;18:19:ident;@67;%gen;#0;#0;#0;#0;?0;?0;#0;#0;24:25:elit;%int;@32;#1;!E0001:11:12:1:0;=11:12:1;",
+    "#0;#1;15:25:fn;%priv;?0;?0;?0;18:19:ident;@67;%gen;#0;#0;#0;#0;?0;?0;#0;#0;24:25:elit;%int;@32;#1;!E0001:11:12:1:0;=11:12:1;",
   )
 }
 
 test "recovery stops at the item start it is already on" {
   assert_eq(
     dump(b"effect E {\nfn h() = 3\n"),
-    "#0;#1;11:21:fn;%priv;?0;14:15:ident;@68;%gen;#0;#0;#0;#0;?0;?0;#0;#0;20:21:elit;%int;@33;#1;!E0001:11:13:1:0;=11:13:1;",
+    "#0;#1;11:21:fn;%priv;?0;?0;?0;14:15:ident;@68;%gen;#0;#0;#0;#0;?0;?0;#0;#0;20:21:elit;%int;@33;#1;!E0001:11:13:1:0;=11:13:1;",
   )
 }
 
 test "recovery skips a whole bracketed run before resynchronising" {
   assert_eq(
     dump(b"fn f(a: (fn)) = 1\nfn g() = 2\n"),
-    "#0;#1;18:28:fn;%priv;?0;21:22:ident;@67;%gen;#0;#0;#0;#0;?0;?0;#0;#0;27:28:elit;%int;@32;#2;!E0001:9:11:1:0;=9:11:1;!E0001:11:12:1:0;=11:12:1;",
+    "#0;#1;18:28:fn;%priv;?0;?0;?0;21:22:ident;@67;%gen;#0;#0;#0;#0;?0;?0;#0;#0;27:28:elit;%int;@32;#2;!E0001:9:11:1:0;=9:11:1;!E0001:11:12:1:0;=11:12:1;",
   )
 }
 
 test "an `import` after a definition is reported and still collected" {
   assert_eq(
     dump(b"fn f() = 1\nimport a\n"),
-    "#1;11:19:imp;#1;18:19:ident;@61;%mod;#1;0:10:fn;%priv;?0;3:4:ident;@66;%gen;#0;#0;#0;#0;?0;?0;#0;#0;9:10:elit;%int;@31;#1;!E0001:11:17:2:1;=11:17:1;=0:10:0;",
+    "#1;11:19:imp;#1;18:19:ident;@61;%mod;#1;0:10:fn;%priv;?0;?0;?0;3:4:ident;@66;%gen;#0;#0;#0;#0;?0;?0;#0;#0;9:10:elit;%int;@31;#1;!E0001:11:17:2:1;=11:17:1;=0:10:0;",
   )
 }
 
@@ -1221,7 +1317,7 @@ test "an unknown deriver names the deriver's own span" {
 test "recovery counts brackets, so an item keyword inside them is not one" {
   assert_eq(
     dump(b"type T = 9 ( fn ) \nfn g() = 2\n"),
-    "#0;#1;19:29:fn;%priv;?0;22:23:ident;@67;%gen;#0;#0;#0;#0;?0;?0;#0;#0;28:29:elit;%int;@32;#1;!E0001:9:10:1:0;=9:10:1;",
+    "#0;#1;19:29:fn;%priv;?0;?0;?0;22:23:ident;@67;%gen;#0;#0;#0;#0;?0;?0;#0;#0;28:29:elit;%int;@32;#1;!E0001:9:10:1:0;=9:10:1;",
   )
 }
 
