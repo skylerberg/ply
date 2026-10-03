@@ -42,14 +42,15 @@ enters to build `ply` itself. The Rust crates are the runtime and the launcher.
   the nextest shards and the corpus partitions from the durations CI measured.
 - Never commit `crates/ply-compiler/bootstrap` or `crates/ply-cli/bootstrap` in a pull request:
   CI regenerates both on `main` after each merge (the `refresh` job), and a pull request's `ply`
-  program is built by the checked-in builder.
-- The checked-in builder builds the `ply` program: `crates/ply-cli/ply`, the packages it depends
-  on, the compiler, and the shipped modules those import. None of them can use a language rule or
-  call a builtin the same pull request introduces; they can once `refresh` has committed a builder
-  that knows it. A shipped module none of them imports can, and so can
-  `crates/ply-compiler/prelude.ply`, which declares the builtins: the compiler embeds its text and
-  parses it itself. The runtime reads the front end's answer the committed builder wrote, so a
-  field it comes to require of one lands after main's builder writes it.
+  program is built by the checked-in builder, or by the builder that one builds of the pull
+  request's compiler where the program needs a rule the checked-in one lacks.
+- The builder carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
+  project's are (`grep '^import std' crates/ply-compiler/ply/*.ply` and what those import), so
+  only those cannot use a language rule the same pull request introduces. The rest of
+  `crates/ply-std/ply` can, and so can `crates/ply-compiler/prelude.ply`, which declares the
+  builtins: the compiler embeds its text and parses it itself. The runtime reads the front end's
+  answer the committed builder wrote, so a field it comes to require of one lands after main's
+  builder writes it.
 - `crates/ply-cli` is the CLI as a Ply program plus the runnable `ply bootstrap` makes of it
   (`bootstrap/ply.run`); it is not a cargo crate. The `refresh` job rebuilds both runnables on
   main by driving the released binary, so the checkout can rebuild itself without cargo.

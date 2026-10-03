@@ -3,9 +3,11 @@
 #                         lanes start several processes that would each build it at once. A test of a
 #                         scratch project is the cheapest run that emits and compiles a unit; nothing
 #                         in it is cached. The emitter's lines say what it read back and was asked.
-# ci-warm.sh program PLY  the run's first `ply`, which has the committed builder build the `ply`
-#                         program when the committed one is behind its sources. The build's lines
-#                         say what its steps took; none means it was committed or staged already.
+# ci-warm.sh program PLY  the run's first `ply`, which builds the `ply` program when the committed
+#                         one is behind its sources: by the committed builder, or where that
+#                         refuses the sources, by the builder it builds of this tree's compiler.
+#                         Each build's lines say what its steps took, and a refusal what it was;
+#                         none means the program was committed or staged already.
 # ci-warm.sh used MARK    the C cache and the stages cut to what the `ply`s since MARK used: a load
 #                         marks what it reads, so the rest is what earlier runs left that this one
 #                         did not read, and every job after would restore it for nothing.
@@ -65,7 +67,7 @@ case "${1:-}" in
     ply=${2:?usage: ci-warm.sh program PLY}
     err=$(mktemp)
     PLY_C_PHASES=1 "$ply" --version 2> "$err" || { cat "$err" >&2; exit 1; }
-    grep '^phases:' "$err" || echo "nothing was built: the program was committed or staged"
+    grep -v -e '^entry:' -e '^  ' "$err" | grep . || echo "nothing was built: the program was committed or staged"
     rm -f "$err"
     ;;
   pack)
