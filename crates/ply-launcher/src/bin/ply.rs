@@ -33,10 +33,10 @@ fn main() {
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // Every command family's ops are lent unconfigured to the `ply` program, which is this
     // binary's own; the program configures what it drives.
-    let binds = ply_machine::artifact::Binds {
+    let binds = ply_machine::enter::Binds {
         lent: ply_machine::policy::all(),
         trust: ply_launcher::trust(),
-        ..ply_machine::artifact::Binds::default()
+        ..ply_machine::enter::Binds::default()
     };
     let (answer, warnings) = ply_launcher::run(program, &root, argv, binds, count).into_parts();
     for warning in warnings {

@@ -1,12 +1,14 @@
 // `ply build` — a deployable artifact, or what a build changes against a deployed one. The front
-// end is this program's own load, handed to the Rust side; the emitter is the Rust side's: a
-// compiled unit is not a value a program can hold. Everything below decides which entry is built,
-// what the container carries, where it lands, and what both forms say. The container itself is
+// end is this program's own load and `deployed` makes the artifact of it; everything below decides
+// which entry is built, where the artifact lands, and what both forms say. The container itself is
 // `compiler.plyx`, which owns the magic, the header and the section table.
 
 import args (Flags, no_flags, style_of)
-import builder (Compiled, Loaded, Made, Named, Previous, Reach, Refusal)
+import builder (Loaded, Refusal)
 import builder (builder)
+import deployed (Compiled, Made, Named, Previous, Reach, artifacts, deploying)
+import units (emit)
+import compiler.unit (shipped)
 import cache (Front)
 import config_schema
 import lock
@@ -379,11 +381,11 @@ fn built_json(p: Loaded, m: Made, x: Sealed, out: String, signer: Option<String>
     { key: "format", value: num(format()) },
     { key: "definitions", value: num(m.definitions) },
     { key: "names", value: num(len(m.names)) },
-    { key: "unit", value: Bool(m.unit) },
+    { key: "unit", value: Bool(true) },
     { key: "artifact_bytes", value: num(bytes_len(x.bytes)) },
     { key: "binary_bytes", value: opt_num(p.binary_bytes) },
     { key: "signed_by", value: signer_json(signer) },
-    { key: "diagnostics", value: all_to_json(m.warnings, p.places) },
+    { key: "diagnostics", value: all_to_json([], p.places) },
   ])
 
 // `--digest` is the one line a deployment pins: not the report, and no file.
@@ -632,7 +634,7 @@ fn written(
               built_lines(s, p, m, x, out),
               |acc: List<String>, l: String| push(acc, l),
             ),
-            errs: all_to_text(s, m.warnings, p.places),
+            errs: [],
             code: ok_code(),
           },
       },
@@ -646,8 +648,8 @@ fn differed(
   m: Made,
   x: Sealed,
   old: String,
-) -> Answer / {builder.previous[build], fs.read_file[cwd], fs.read_file[abs]} =
-  match builder.previous[build](old, paths::read_file(paths::spelled(old))) {
+) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs]} =
+  match artifacts.previous(old, paths::read_file(paths::spelled(old))) {
     Err(why) -> reported(s, "build", why.diags, why.places),
     Ok(was) -> {
       let d = compared(was.names, m.names, m.reaches);
@@ -675,7 +677,7 @@ fn delivered(
   p: Loaded,
   m: Made,
   x: Sealed,
-) -> Answer / {builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} =
+) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} =
   match flags.diff {
     Some(old) -> differed(s, p, m, x, old),
     None -> if flags.digest {
@@ -691,10 +693,11 @@ fn assembled(
   s: Style,
   flags: Flags,
   p: Loaded,
+  front: Front,
   entry: String,
   startup: List<String>,
-) -> Answer / {builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} =
-  match builder.made[build](entry, startup, is_diffed(flags)) {
+) -> Answer / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} =
+  match artifacts.made(front, entry, startup, is_diffed(flags)) {
     Err(why) -> reported(s, "build", why.diags, p.places),
     Ok(m) -> match seal(encode(m.head, m.sections)) {
       Err(why) -> reported(s, "build", why.diags, p.places),
@@ -707,28 +710,32 @@ fn chosen(
   flags: Flags,
   loaded: Program,
   p: Loaded,
+  front: Front,
   defs: List<Def>,
   startup: Result<List<String>, Diag>,
-) -> Answer / {builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} =
+) -> Answer / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} =
   match entry_of(p, defs, flags) {
     // Nothing to build as a program. A library — a package that names no entry and declares no
     // `main` — is built as the package itself; anything else keeps the entry point's refusal.
-    Err(d) -> if flags.entry == None && len(p.mains) == 0 { library(s, flags, loaded, p, defs, d) }
-    else { reported(s, "build", [d], p.places) },
+    Err(d) -> if flags.entry == None && len(p.mains) == 0 {
+      library(s, flags, loaded, p, front, defs, d)
+    } else { reported(s, "build", [d], p.places) },
     Ok(entry) -> match startup {
       Err(d) -> reported(s, "build", [d], p.places),
-      Ok(roots) -> assembled(s, flags, p, entry, roots),
+      Ok(roots) -> assembled(s, flags, p, front, entry, roots),
     },
   }
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], builder.loaded[build], builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, time.elapsed_us} = {
+) -> Answer / {builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.runtime, shipped.runnable, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, time.elapsed_us} = {
   let s: Style = style_of(flags);
   let t: Timed = timed_uncached(flags.paths);
   match t.program.whole {
     None -> refused(s, "build", t.program.diags, t.program.places),
-    Some(w) -> built_over(s, flags, t.program, defs_of(w), startup_of(w, flags), front_of(t, w)),
+    Some(w) ->
+      deploying(||
+        built_over(s, flags, t.program, defs_of(w), startup_of(w, flags), front_of(t, w))),
   }
 }
 
@@ -741,7 +748,7 @@ fn built_over(
   defs: List<Def>,
   startup: Result<List<String>, Diag>,
   front: Front,
-) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} = {
+) -> Answer / {builder.loaded[build], artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs]} = {
   let r = resolved_root(flags);
   let locked: Result<Option<lock::Lock>, String> = lock::read(r);
   match builder.loaded[build](root_of(flags), front) {
@@ -751,7 +758,7 @@ fn built_over(
       Ok(existing) -> match pinned_ok(r, existing, p) {
         Some(d) -> reported(s, "build", [d], p.places),
         None -> {
-          let answer = chosen(s, flags, loaded, p, defs, startup);
+          let answer = chosen(s, flags, loaded, p, front, defs, startup);
           if answer.code == ok_code() { pinned(r, existing, p) };
           answer
         },
@@ -806,9 +813,10 @@ fn library(
   flags: Flags,
   loaded: Program,
   p: Loaded,
+  front: Front,
   defs: List<Def>,
   refused: Diag,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs]} =
+) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs]} =
   match loaded.whole {
     // The load behind this report found no entry point; a package that cannot be read keeps that.
     None -> reported(s, "build", [refused], p.places),
@@ -816,7 +824,7 @@ fn library(
       // An anonymous directory is not a library: there is no package to write down.
       None -> reported(s, "build", [refused], p.places),
       Some(m) -> if m.entry != None { reported(s, "build", [refused], p.places) }
-      else { library_writing(s, flags, p, loaded, defs, m) },
+      else { library_writing(s, flags, p, loaded, front, defs, m) },
     },
   }
 
@@ -825,10 +833,14 @@ pub type Packed = { own: List<Def>, unit: Compiled, x: Sealed }
 
 /// The archive a library ships as: what `ply build` writes and `ply publish` uploads, one function
 /// so the two are the same bytes.
-pub fn packed(loaded: Program, defs: List<Def>) -> Result<Packed, Refusal> / {builder.unit[build]} = {
+pub fn packed(
+  front: Front,
+  loaded: Program,
+  defs: List<Def>,
+) -> Result<Packed, Refusal> / {artifacts.unit} = {
   let owned = map(loaded.files, |f: File| f.module);
   let own = filter(defs, |d: Def| member(owned, d.module));
-  match builder.unit[build](map(own, |d: Def| d.name)) {
+  match artifacts.unit(front, map(own, |d: Def| d.name)) {
     Err(why) -> Err(why),
     Ok(compiled) -> {
       let manifest = match loaded.pkgs.manifest { Some(text) -> text, None -> b"" };
@@ -850,10 +862,11 @@ fn library_writing(
   flags: Flags,
   p: Loaded,
   loaded: Program,
+  front: Front,
   defs: List<Def>,
   m: Manifest,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs]} =
-  match packed(loaded, defs) {
+) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs]} =
+  match packed(front, loaded, defs) {
     Err(why) -> reported(s, "build", why.diags, p.places),
     Ok(k) -> {
       let out = library_output(flags, m.name);
@@ -969,9 +982,7 @@ fn a_made() -> Made =
     sections: [{ name: b"bodies", count: 1, payload: b"AA" }],
     definitions: 1,
     names: [{ name: "m.main", hash: "aa" }],
-    unit: true,
     reaches: [],
-    warnings: [],
   }
 
 fn flags_of(json: Bool) -> Flags = { ..no_flags(), json: json }
@@ -1148,8 +1159,8 @@ fn answered_over(
     built_over(style_of(flags), flags, no_program(), some_defs(), Ok([]), no_front())
   } with {
     builder.loaded[build](root, front) -> p,
-    builder.made[build](entry, startup, reaches) -> m,
-    builder.previous[build](path, bytes) -> was,
+    artifacts.made(front, entry, startup, reaches) -> m,
+    artifacts.previous(path, bytes) -> was,
     // A test's project has whatever lockfile it says it has, and a build writes the one that
     // records the load's pins.
     fs.read_file[cwd](path) -> lockfile(path),
@@ -1161,12 +1172,12 @@ fn answered_over(
     // The fixture is checked out nowhere, so its provenance names no commit.
     fs.kind[abs](path) -> Missing,
     // A library's path is only reached by a test that means it: the fixture is a program.
-    builder.unit[build](names) -> no_unit(names),
+    artifacts.unit(front, names) -> no_unit(),
   }
 
 // The fixture has no library to compile: a test that asks for a unit is asking about a path the
 // fixture does not take, and the answer says so rather than inventing one.
-fn no_unit(names: List<String>) -> Result<Compiled, Refusal> = Err({ diags: [], places: [] })
+fn no_unit() -> Result<Compiled, Refusal> = Err({ diags: [], places: [] })
 
 // The lockfile a test's project holds: none, so a build pins what it loaded.
 fn lockfile(path: String) -> Option<Bytes> = None
