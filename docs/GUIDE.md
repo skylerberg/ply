@@ -2055,15 +2055,16 @@ pub fn blake3(input: Bytes) -> Bytes
 pub fn sha256(input: Bytes) -> Bytes
 pub fn hmac_sha256(key: Bytes, message: Bytes) -> Bytes
 pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes
+pub fn sha512(input: Bytes) -> Bytes
 ```
 
-`blake3` and `sha256` answer 32 bytes. `hmac_sha256` is HMAC over SHA-256 as RFC
+`blake3` and `sha256` answer 32 bytes, `sha512` 64. `hmac_sha256` is HMAC over SHA-256 as RFC
 2104 defines it, and `pbkdf2_sha256` is its single-block PBKDF2: thirty-two
 bytes, which is the salted password SCRAM asks for and the only length anything
 here needs.
 
-`blake3` is the `bytes_blake3` builtin. The SHA-256 family is written in Ply, and
-the vectors the SHA-256 standard and RFC 4231 publish are the tests. It is slow —
+`blake3` is the `bytes_blake3` builtin. The SHA family is written in Ply, and
+the vectors the SHA standards and RFC 4231 publish are the tests. It is slow —
 a compression round walks a list of words rather than living in scalars — so use
 it for small inputs: a key, a proof, a nonce, not a file.
 
@@ -2826,6 +2827,39 @@ pub fn display<a>(x: a) -> String where derivable(show, a)
 `display` writes a `String` or a `Char` as itself and anything else as `show`
 does: it is what an interpolated string's holes are (§2.3).
 
+### 13.39 `std.ed25519`
+
+```ply
+pub fn public_key(seed: Bytes) -> Bytes
+pub fn sign(seed: Bytes, message: Bytes) -> Bytes
+pub fn verify(public: Bytes, message: Bytes, signature: Bytes) -> Bool
+```
+
+Ed25519 as RFC 8032 defines it, in Ply: a 32-byte seed is a secret key,
+`public_key` its 32-byte public key, `sign` a 64-byte signature, and `verify`
+whether one holds, refusing a key off the curve and an `S` not below the group
+order. RFC 8032's vectors are the tests. Nothing in it is constant time; it signs
+on the machine that holds the key, which is what `ply build --sign` does (§15.2).
+
+### 13.40 `std.signed`
+
+```ply
+pub type Signature = { signer: Bytes, signature: Bytes }
+pub type Signed = { payload: Bytes, signatures: List<Signature> }
+pub fn signed_bytes(s: Signed) -> Bytes
+pub fn signed_of(b: Bytes) -> Option<Signed>
+pub fn signature_by(seed: Bytes, payload: Bytes) -> Signature
+pub fn holds(s: Signature, payload: Bytes) -> Bool
+pub fn countersigned(s: Signed, seed: Bytes) -> Signed
+pub fn vouched_by(s: Signed, trusted: List<Bytes>) -> Option<Bytes>
+```
+
+A signed document: a payload and the Ed25519 signatures over it, each under a
+domain of its own so it is never a signature over another protocol's message.
+`countersigned` adds a seed's signature in place of any earlier one by the same
+signer, and `vouched_by` names the first trusted public key whose signature
+holds. `ply build --sign` writes one beside an artifact (§15.2).
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -2991,6 +3025,35 @@ Like every Ply listener it binds `127.0.0.1`: another machine reaches it through
 proxy in front of it, one that passes TLS through to a `--tls` registry or
 terminates it for a plain one.
 
+### 15.2 Signing
+
+```
+$ ply keygen release.key                       # release.key and release.key.pub
+$ ply build . -o app.plyx --sign release.key   # app.plyx and app.plyx.sig
+$ ply run app.plyx --require-signer release.key.pub
+$ ply build . -o app.plyx --verify             # compare, write nothing
+```
+
+`ply keygen PATH` writes an Ed25519 key pair (§13.39): the secret key at `PATH`,
+readable by its owner alone, and the public key at `PATH.pub`, each one line
+naming what it holds and 64 hex digits. It never writes over a file, and a key
+file that cannot be read, decoded or written is `E0462`.
+
+`ply build --sign KEY` signs what it writes, a program or a library, in
+`<artifact>.sig` beside it. A signature is detached, so the artifact's digest
+is the same whoever signs it, and signing the same build again with another key
+adds a signature beside the first. What is signed is the artifact's provenance:
+its kind and name, its full digest, the `ply` that built it, the semantics
+version (§15.1), and the commit `HEAD` named when its sources were in a git
+repository. `ply run ARTIFACT --require-signer KEY` runs a built artifact only
+when one of the public keys named (the flag repeats) signed that provenance for
+the artifact's own digest; an artifact with no signatures, signatures for other
+bytes, or none by a trusted key is `E0460`, before anything of it is loaded.
+`ply build --verify` builds in memory and holds the file `-o` names to what these
+sources build, and every signature beside it to that build; it writes nothing and
+answers which keys signed. A file that is not that build, or a signature that does
+not hold, is `E0461`.
+
 ## 16. The `ply` command
 
 `ply [--color auto|always|never] <command> [path] [options]`. `--color` is
@@ -3024,10 +3087,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets and provenance), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
-| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
+| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
-| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
+| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2), `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
@@ -3040,6 +3103,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
 | `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
+| `ply keygen PATH` | an Ed25519 key pair: the secret key at `PATH`, the public key at `PATH.pub` (§15.2); no path |
 | `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
@@ -3295,6 +3359,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0457` | `--exec` path that cannot be executed |
 | `E0458` | captured output over the bound |
 | `E0459` | `--allow` family the program does not declare |
+| `E0460` | artifact `--require-signer` refuses: unsigned, signed for other bytes, or by no trusted key |
+| `E0461` | `ply build --verify`: a file or signature that is not what these sources build |
+| `E0462` | key file that cannot be read, decoded or written |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

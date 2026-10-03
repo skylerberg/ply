@@ -1,0 +1,74 @@
+// Signed documents: a payload and the Ed25519 signatures over it, in one encoding whoever writes
+// it. A signature is over the payload under a domain of its own, so it is never one over a message
+// of another protocol, and a document holds one signature a signer.
+
+import std.bin
+import std.ed25519
+
+/// One signer's signature: its public key, and what it signed with the matching seed.
+pub type Signature = { signer: Bytes, signature: Bytes }
+
+/// A payload and every signature over it.
+pub type Signed = { payload: Bytes, signatures: List<Signature> }
+
+derive bin for Signature
+
+derive bin for Signed
+
+fn magic() -> Bytes = b"PLYSIG01"
+
+// A signature over a payload is never one over a definition hash or a message of another protocol.
+fn domain() -> Bytes = b"ply.signed.1\x00"
+
+pub fn signed_bytes(s: Signed) -> Bytes = bytes_concat(magic(), bin::encode(s, signed_bin()))
+
+pub fn signed_of(b: Bytes) -> Option<Signed> =
+  if !bytes_starts_with(b, magic()) { None } else {
+    match bin::decode(bytes_slice(b, bytes_len(magic()), bytes_len(b)), signed_bin()) {
+      Ok(s) -> Some(s),
+      Err(_) -> None,
+    }
+  }
+
+pub fn signature_by(seed: Bytes, payload: Bytes) -> Signature =
+  {
+    signer: ed25519::public_key(seed),
+    signature: ed25519::sign(seed, bytes_concat(domain(), payload)),
+  }
+
+pub fn holds(s: Signature, payload: Bytes) -> Bool =
+  ed25519::verify(s.signer, bytes_concat(domain(), payload), s.signature)
+
+/// `s` with `seed`'s signature, in place of any earlier one by the same signer.
+pub fn countersigned(s: Signed, seed: Bytes) -> Signed = {
+  let mine = signature_by(seed, s.payload);
+  { ..s, signatures: push(filter(s.signatures, |x: Signature| x.signer != mine.signer), mine) }
+}
+
+/// The first of `trusted` whose signature over the payload holds.
+pub fn vouched_by(s: Signed, trusted: List<Bytes>) -> Option<Bytes> =
+  fold(s.signatures, None, |found: Option<Bytes>, x: Signature|
+    match found {
+      Some(_) -> found,
+      None -> if fold(trusted, false, |t: Bool, k: Bytes| t || k == x.signer)
+          && holds(x, s.payload) { Some(x.signer) }
+      else { None },
+    })
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_seed(n: Int) -> Bytes =
+  bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int((i + n) % 256)))
+
+test "a signature holds over its payload alone, and a document keeps every signer once" {
+  let one = countersigned({ payload: b"what was built", signatures: [] }, a_seed(1));
+  let both = countersigned(countersigned(one, a_seed(2)), a_seed(1));
+  assert_eq(len(both.signatures), 2);
+  assert_eq(signed_of(signed_bytes(both)), Some(both));
+  let first = ed25519::public_key(a_seed(1));
+  let second = ed25519::public_key(a_seed(2));
+  assert_eq(vouched_by(both, [second]), Some(second));
+  assert_eq(vouched_by(both, [ed25519::public_key(a_seed(3))]), None);
+  assert_eq(vouched_by({ ..both, payload: b"something else" }, [first, second]), None);
+  assert_eq(signed_of(b"not signatures"), None)
+}
