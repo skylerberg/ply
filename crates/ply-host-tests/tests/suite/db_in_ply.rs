@@ -177,7 +177,7 @@ pub fn serialized(url: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
   with_server(url, 1, || contended(url, 3, ""))
 
-fn contended(url: String, left: Int, seen: String) -> String =
+fn contended(url: String, left: Int, seen: String) -> String / {db.query[ledger], db.execute[ledger], db.abort, db.begin, db.commit, db.rollback, net.close[link], net.connect[link], net.recv[link], net.send[link], entropy.next} =
   match transaction(Serializable, ReadWrite, || {
       db.query[ledger](stmt("select n from ledger where id = $1"), [PInt(1)]);
       if seen == "" {
@@ -204,7 +204,7 @@ pub fn deadlocked(url: String) -> Result<String, String>
   Ok(task.join(a) ++ " " ++ task.join(b))
 }
 
-fn crossing(url: String, first: Int, second: Int) -> String =
+fn crossing(url: String, first: Int, second: Int) -> String / {net.close[link], net.connect[link], net.recv[link], net.send[link], entropy.next} =
   match with_server(url, 1, || ended(transaction(ReadCommitted, ReadWrite, || {
       bump(first, 1);
       both_written(400);
@@ -215,7 +215,7 @@ fn crossing(url: String, first: Int, second: Int) -> String =
   }
 
 // Until both transactions have written, when each holds a transaction id of its own.
-fn both_written(left: Int) -> Unit =
+fn both_written(left: Int) -> Unit / {db.query[pg_locks]} =
   if left <= 0 { () } else {
     match db.query[pg_locks](
         stmt("select count(*) as n from pg_locks where locktype = 'transactionid' and granted"),
