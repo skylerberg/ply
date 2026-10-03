@@ -918,3 +918,38 @@ fn a_wrapping_builtin_refuses_a_non_int_and_nothing_else() {
     assert_eq!(d.code, codes::RUNTIME_ERROR);
     assert!(d.message.contains("wrap_add"), "{}", d.message);
 }
+
+fn float_bits(b: Builtin, args: &[f64]) -> u64 {
+    match found(b, args.iter().map(|x| Value::Float(*x)).collect()) {
+        Value::Float(x) => x.to_bits(),
+        other => panic!("`{}` answered {other:?}, not a Float", b.name()),
+    }
+}
+
+/// The bits `tests/lang/floats` pins for the compiled tier, answered here by the builtins
+/// themselves: the float functions are one implementation, whichever tier asks.
+#[test]
+fn the_float_functions_answer_the_bits_the_compiled_tier_pins() {
+    let cases: &[(Builtin, &[f64], u64)] = &[
+        (Builtin::Sin, &[1.0], 0x3FEA_ED54_8F09_0CEE),
+        (Builtin::Cos, &[1.0], 0x3FE1_4A28_0FB5_068C),
+        (Builtin::Tan, &[1.0], 0x3FF8_EB24_5CBE_E3A6),
+        (Builtin::Exp, &[1.0], 0x4005_BF0A_8B14_576A),
+        (Builtin::Ln, &[2.0], 0x3FE6_2E42_FEFA_39EF),
+        (Builtin::Pow, &[2.0, 0.5], 0x3FF6_A09E_667F_3BCD),
+        (Builtin::Atan2, &[1.0, 2.0], 0x3FDD_AC67_0561_BB4F),
+        (Builtin::Asin, &[0.5], 0x3FE0_C152_382D_7366),
+        (Builtin::Log10, &[2.0], 0x3FD3_4413_509F_79FF),
+        (Builtin::Log2, &[10.0], 0x400A_934F_0979_A371),
+        (Builtin::Sqrt, &[-1.0], f64::NAN.to_bits()),
+        (Builtin::Ceil, &[-0.5], (-0.0f64).to_bits()),
+    ];
+    for (b, args, want) in cases {
+        assert_eq!(
+            float_bits(*b, args),
+            *want,
+            "`{}{args:?}` answered other bits",
+            b.name()
+        );
+    }
+}
