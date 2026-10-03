@@ -426,18 +426,28 @@ fn exports(index: Index, qual: Option<Bytes>, node: Int) -> Bool / {abort.raise}
     },
   }
 
-fn exported(index: Index, qual: Option<Bytes>, node: Option<Int>) -> Option<Int> / {abort.raise} =
-  match node { None -> None, Some(v) -> if exports(index, qual, v) { Some(v) } else { None } }
+// A default copied back into its own module names it, and reaches what it keeps, as the checker does.
+fn exported(
+  index: Index,
+  qual: Option<Bytes>,
+  from: Int,
+  node: Option<Int>,
+) -> Option<Int> / {abort.raise} =
+  match node {
+    None -> None,
+    Some(v) -> if at(index.nodes, v).module == from || exports(index, qual, v) { Some(v) }
+    else { None },
+  }
 
 fn value_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> / {abort.raise} =
   match target(index, module, 0, qualifier(qname), qname.name.name) {
     None -> None,
     Some(t) -> {
       let items = at(index.items, t.owner);
-      match exported(index, qualifier(qname), map_get(items.fns, t.name)) {
+      match exported(index, qualifier(qname), module, map_get(items.fns, t.name)) {
         Some(node) -> Some(FnTarget(node)),
         // A variant is exported exactly when the type that declares it is.
-        None -> match exported(index, qualifier(qname), map_get(items.ctors, t.name)) {
+        None -> match exported(index, qualifier(qname), module, map_get(items.ctors, t.name)) {
           Some(owner) -> Some(CtorTarget({ owner: owner, name: t.name })),
           None -> None,
         },
@@ -451,6 +461,7 @@ fn ctor_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> /
     Some(t) -> match exported(
         index,
         qualifier(qname),
+        module,
         map_get(at(index.items, t.owner).ctors, t.name),
       ) {
       Some(owner) -> Some(CtorTarget({ owner: owner, name: t.name })),
@@ -466,13 +477,14 @@ fn type_target(
 ) -> Option<Int> / {abort.raise} =
   match target(index, module, 1, qual, name) {
     None -> None,
-    Some(t) -> exported(index, qual, map_get(at(index.items, t.owner).types, t.name)),
+    Some(t) -> exported(index, qual, module, map_get(at(index.items, t.owner).types, t.name)),
   }
 
 fn effect_target(index: Index, module: Int, qname: QName) -> Option<Int> / {abort.raise} =
   match target(index, module, 2, qualifier(qname), qname.name.name) {
     None -> None,
-    Some(t) -> exported(index, qualifier(qname), map_get(at(index.items, t.owner).effects, t.name)),
+    Some(t) ->
+      exported(index, qualifier(qname), module, map_get(at(index.items, t.owner).effects, t.name)),
   }
 
 // Tarjan's components, iterative: completion order, each component's members as they left the stack.
@@ -871,7 +883,7 @@ fn push_generics(encoder: Encoder, def: FnDef) -> Encoder =
   }
 
 fn fn_def(encoder: Encoder, def: FnDef) -> Encoder / {abort.raise} = {
-  let z1: Encoder = push_generics(
+  let generic: Encoder = push_generics(
     put_u32(
       put_u32(
         put_u32(put_tag(encoder, tag_fn()), len(def.generics.types)),
@@ -882,20 +894,24 @@ fn fn_def(encoder: Encoder, def: FnDef) -> Encoder / {abort.raise} = {
     def,
   );
   // Before the parameter names reach `values`: a default is closed.
-  let z2: Encoder = fold(def.params, put_u32(z1, len(def.params)), |acc: Encoder, param: Param|
-    match param.default {
-      Some(dflt) -> expr(opt_type(put_tag(acc, tag_param_default()), param.ty), dflt),
-      None -> opt_type(acc, param.ty),
-    });
-  let z3: Encoder = returns(
-    constraints(opt_row(opt_type(z2, def.ret), def.effects), def.constraints),
+  let with_params: Encoder = fold(
+    def.params,
+    put_u32(generic, len(def.params)),
+    |acc: Encoder, param: Param|
+      match param.default {
+        Some(dflt) -> expr(opt_type(put_tag(acc, tag_param_default()), param.ty), dflt),
+        None -> opt_type(acc, param.ty),
+      },
+  );
+  let signature: Encoder = returns(
+    constraints(opt_row(opt_type(with_params, def.ret), def.effects), def.constraints),
     def,
   );
-  let z4: Encoder = {
-    ..z3,
-    values: append(z3.values, map(def.params, |param: Param| param.name.name)),
+  let bound: Encoder = {
+    ..signature,
+    values: append(signature.values, map(def.params, |param: Param| param.name.name)),
   };
-  expr(z4, def.body)
+  expr(bound, def.body)
 }
 
 // A `returns` clause names a parameter by its position, so renaming one moves nothing.
@@ -949,18 +965,18 @@ fn insert_pair(
 // in place, so two aliases of one expansion are one type there and must be one type here. The name
 // is the simple one: a module path is no part of an identity, so vendoring a module moves nothing.
 fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
-  let z0: Encoder = put_tag(encoder, tag_type());
-  let z1: Encoder = {
-    ..z0,
-    ty_params: append(z0.ty_params, map(d.params, |ident: Ident| ident.name)),
+  let tagged: Encoder = put_tag(encoder, tag_type());
+  let bound: Encoder = {
+    ..tagged,
+    ty_params: append(tagged.ty_params, map(d.params, |ident: Ident| ident.name)),
   };
-  let z2: Encoder = put_u32(z1, len(d.params));
+  let counted: Encoder = put_u32(bound, len(d.params));
   match d.body {
-    TDAlias(t) -> type_expr(put_tag(z2, tag_type_alias()), t),
+    TDAlias(t) -> type_expr(put_tag(counted, tag_type_alias()), t),
     TDSum(variants) ->
       fold(
         variants,
-        put_u32(put_text(put_tag(z2, tag_type_sum()), d.name.name), len(variants)),
+        put_u32(put_text(put_tag(counted, tag_type_sum()), d.name.name), len(variants)),
         |acc: Encoder, variant: VariantDef|
           fold(
             variant.fields,
@@ -977,19 +993,21 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
 // a published row names its atoms' effects, and nothing else would make a hash pin those names.
 // The name is the simple one: a module path is no part of an identity here, so the same declaration
 // vendored under another path is still that declaration.
-fn effect_def(z: Encoder, d: EffectDef) -> Encoder / {abort.raise} = {
-  let named: Encoder = put_text(put_tag(z, tag_effect()), d.name.name);
-  let z1: Encoder = put_bool(named, d.is_nondet);
+fn effect_def(encoder: Encoder, d: EffectDef) -> Encoder / {abort.raise} = {
+  let header: Encoder = put_bool(
+    put_text(put_tag(encoder, tag_effect()), d.name.name),
+    d.is_nondet,
+  );
   let ops = fold(
     d.ops,
-    { z: z1, encoded: [] },
-    |acc: { z: Encoder, encoded: List<Bytes> }, op: OpDef| {
-      let c: Captured = capture(acc.z, |x: Encoder| op_def(x, op));
-      { z: c.encoder, encoded: push(acc.encoded, c.bytes) }
+    { encoder: header, encoded: [] },
+    |acc: { encoder: Encoder, encoded: List<Bytes> }, op: OpDef| {
+      let captured: Captured = capture(acc.encoder, |x: Encoder| op_def(x, op));
+      { encoder: captured.encoder, encoded: push(acc.encoded, captured.bytes) }
     },
   );
   let sorted = sort_bytes(ops.encoded);
-  fold(sorted, put_u32(ops.z, len(sorted)), |acc: Encoder, b: Bytes| put_bytes(acc, b))
+  fold(sorted, put_u32(ops.encoder, len(sorted)), |acc: Encoder, b: Bytes| put_bytes(acc, b))
 }
 
 fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare_values(a, b) { Less -> true, _ -> false }
@@ -1004,7 +1022,7 @@ pub fn sort_bytes(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
 
 // An effect's operations share one encoder, so each one's type parameters go out of scope after it.
 fn op_def(encoder: Encoder, op: OpDef) -> Encoder / {abort.raise} = {
-  let z1: Encoder = put_u32(
+  let header: Encoder = put_u32(
     put_bool(
       put_bytes(put_text(put_tag(encoder, tag_op()), op.name.name), byte_of(mode_byte(op.mode))),
       op.resource_param,
@@ -1012,8 +1030,8 @@ fn op_def(encoder: Encoder, op: OpDef) -> Encoder / {abort.raise} = {
     len(op.ty_params),
   );
   let bound: Encoder = {
-    ..z1,
-    ty_params: append(z1.ty_params, map(op.ty_params, |p: Ident| p.name)),
+    ..header,
+    ty_params: append(header.ty_params, map(op.ty_params, |p: Ident| p.name)),
   };
   let encoded: Encoder = type_expr(
     fold(op.params, put_u32(bound, len(op.params)), |acc: Encoder, p: TypeExpr| type_expr(acc, p)),
@@ -1027,21 +1045,21 @@ pub fn test_def(encoder: Encoder, d: TestDef) -> Encoder / {abort.raise} =
 
 // A law's binder types are part of its identity; their names are levels like any other binder.
 pub fn law_def(encoder: Encoder, d: LawDef) -> Encoder / {abort.raise} = {
-  let z1: Encoder = fold(
+  let typed: Encoder = fold(
     d.binders,
     put_u32(put_bool(put_tag(encoder, tag_law()), d.host), len(d.binders)),
     |acc: Encoder, binder: Binder| type_expr(acc, binder.ty),
   );
-  let z2: Encoder = {
-    ..z1,
-    values: append(z1.values, map(d.binders, |binder: Binder| binder.name.name)),
+  let bound: Encoder = {
+    ..typed,
+    values: append(typed.values, map(d.binders, |binder: Binder| binder.name.name)),
   };
-  expr(opt_expr(z2, d.guard), d.body)
+  expr(opt_expr(bound, d.guard), d.body)
 }
 
 // In its owner's scope: generics, parameters, and `result` for an `ensures`. Parameter defaults are not written.
 pub fn spec_clause(encoder: Encoder, owner: FnDef, clause: SpecClause) -> Encoder / {abort.raise} = {
-  let z1: Encoder = push_generics(
+  let generic: Encoder = push_generics(
     put_u32(
       put_u32(
         put_u32(
@@ -1054,26 +1072,26 @@ pub fn spec_clause(encoder: Encoder, owner: FnDef, clause: SpecClause) -> Encode
     ),
     owner,
   );
-  let counted: Encoder = put_u32(z1, len(owner.params));
-  let z2: Encoder = {
+  let counted: Encoder = put_u32(generic, len(owner.params));
+  let bound: Encoder = {
     ..counted,
     values: append(counted.values, map(owner.params, |param: Param| param.name.name)),
   };
-  let z3: Encoder = match clause.kind {
-    SEnsures -> { ..z2, values: push(z2.values, b"result") },
-    SRequires -> z2,
+  let in_scope: Encoder = match clause.kind {
+    SEnsures -> { ..bound, values: push(bound.values, b"result") },
+    SRequires -> bound,
   };
-  expr(z3, clause.expr)
+  expr(in_scope, clause.expr)
 }
 
-fn type_expr(z: Encoder, t: TypeExpr) -> Encoder / {abort.raise} =
+fn type_expr(encoder: Encoder, t: TypeExpr) -> Encoder / {abort.raise} =
   match t {
-    TVar(name) -> put_u32(type_ref(put_tag(z, tag_ty_con()), None, name.name), 0),
+    TVar(name) -> put_u32(type_ref(put_tag(encoder, tag_ty_con()), None, name.name), 0),
     TCon(c) ->
       fold(
         c.args,
         put_u32(
-          type_ref(put_tag(z, tag_ty_con()), qualifier(c.name), c.name.name.name),
+          type_ref(put_tag(encoder, tag_ty_con()), qualifier(c.name), c.name.name.name),
           len(c.args),
         ),
         |acc: Encoder, a: TypeExpr| type_expr(acc, a),
@@ -1083,7 +1101,7 @@ fn type_expr(z: Encoder, t: TypeExpr) -> Encoder / {abort.raise} =
         type_expr(
           fold(
             f.params,
-            put_u32(put_tag(z, tag_ty_fn()), len(f.params)),
+            put_u32(put_tag(encoder, tag_ty_fn()), len(f.params)),
             |acc: Encoder, p: TypeExpr| type_expr(acc, p),
           ),
           f.ret,
@@ -1094,42 +1112,44 @@ fn type_expr(z: Encoder, t: TypeExpr) -> Encoder / {abort.raise} =
     TRecord(r) -> {
       let fields = fold(
         r.fields,
-        { z: put_tag(z, tag_ty_record()), encoded: [] },
-        |acc: { z: Encoder, encoded: List<Bytes> }, f: { name: Ident, ty: TypeExpr }| {
-          let c: Captured = capture(acc.z, |x: Encoder| type_expr(put_text(x, f.name.name), f.ty));
-          { z: c.encoder, encoded: push(acc.encoded, c.bytes) }
+        { encoder: put_tag(encoder, tag_ty_record()), encoded: [] },
+        |acc: { encoder: Encoder, encoded: List<Bytes> }, f: { name: Ident, ty: TypeExpr }| {
+          let captured: Captured = capture(acc.encoder, |x: Encoder|
+            type_expr(put_text(x, f.name.name), f.ty));
+          { encoder: captured.encoder, encoded: push(acc.encoded, captured.bytes) }
         },
       );
       let sorted = sort_bytes(fields.encoded);
-      fold(sorted, put_u32(fields.z, len(sorted)), |acc: Encoder, b: Bytes| put_bytes(acc, b))
+      fold(sorted, put_u32(fields.encoder, len(sorted)), |acc: Encoder, b: Bytes| put_bytes(acc, b))
     },
-    TUnit(_) -> put_tag(z, tag_ty_unit()),
-    TBad(_) -> put_tag(z, tag_ty_unit()),
+    TUnit(_) -> put_tag(encoder, tag_ty_unit()),
+    TBad(_) -> put_tag(encoder, tag_ty_unit()),
   }
 
 type AtomEncoding = { bytes: Bytes, tie: Bytes, held: List<Int> }
 
 // A row is a set: atoms sorted by encoding, then by the effect's declaration, and deduplicated.
 // Every atom is mentioned, including one the dedup drops.
-fn row_expr(z: Encoder, row: RowExpr) -> Encoder / {abort.raise} = {
-  let z0: Encoder = put_tag(z, tag_row());
+fn row_expr(encoder: Encoder, row: RowExpr) -> Encoder / {abort.raise} = {
+  let tagged: Encoder = put_tag(encoder, tag_row());
   let atoms = fold(
     row.atoms,
-    { z: z0, encoded: [] },
-    |acc: { z: Encoder, encoded: List<AtomEncoding> }, a: AtomExpr| {
-      let outer = acc.z.deferred;
-      let c: Captured = capture({ ..acc.z, deferred: Some([]) }, |x: Encoder| atom(x, a));
-      let held = match c.encoder.deferred { Some(h) -> h, None -> [] };
-      let tie = match effect_target(acc.z.index, acc.z.module, a.eff) {
-        Some(node) -> match map_get(acc.z.index.effect_sketches, node) {
+    { encoder: tagged, encoded: [] },
+    |acc: { encoder: Encoder, encoded: List<AtomEncoding> }, a: AtomExpr| {
+      let outer = acc.encoder.deferred;
+      let captured: Captured = capture({ ..acc.encoder, deferred: Some([]) }, |x: Encoder|
+        atom(x, a));
+      let held = match captured.encoder.deferred { Some(h) -> h, None -> [] };
+      let tie = match effect_target(acc.encoder.index, acc.encoder.module, a.eff) {
+        Some(node) -> match map_get(acc.encoder.index.effect_sketches, node) {
           Some(s) -> s,
           None -> b"",
         },
         None -> b"",
       };
       {
-        z: { ..c.encoder, deferred: outer },
-        encoded: push(acc.encoded, { bytes: c.bytes, tie: tie, held: held }),
+        encoder: { ..captured.encoder, deferred: outer },
+        encoded: push(acc.encoded, { bytes: captured.bytes, tie: tie, held: held }),
       }
     },
   );
@@ -1137,12 +1157,16 @@ fn row_expr(z: Encoder, row: RowExpr) -> Encoder / {abort.raise} = {
     insert_atom(acc, x));
   let distinct = fold(range(0, len(sorted)), 0, |acc: Int, i: Int|
     if i == 0 || at(sorted, i - 1).bytes != at(sorted, i).bytes { acc + 1 } else { acc });
-  let written = fold(range(0, len(sorted)), put_u32(atoms.z, distinct), |acc: Encoder, i: Int| {
-    let x = at(sorted, i);
-    let mentioned: Encoder = fold(x.held, acc, |a: Encoder, node: Int| mention(a, node));
-    if i > 0 && at(sorted, i - 1).bytes == x.bytes { mentioned }
-    else { put_bytes(mentioned, x.bytes) }
-  });
+  let written = fold(
+    range(0, len(sorted)),
+    put_u32(atoms.encoder, distinct),
+    |acc: Encoder, i: Int| {
+      let x = at(sorted, i);
+      let mentioned: Encoder = fold(x.held, acc, |a: Encoder, node: Int| mention(a, node));
+      if i > 0 && at(sorted, i - 1).bytes == x.bytes { mentioned }
+      else { put_bytes(mentioned, x.bytes) }
+    },
+  );
   let tailed: Encoder = match row.tail {
     None -> put_tag(written, tag_none()),
     Some(t) -> match rposition(written.row_params, t.name) {
@@ -1199,16 +1223,16 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
     EUnary(u) ->
       expr(put_bytes(put_tag(encoder, tag_e_unary()), byte_of(unop_byte(u.op))), u.operand),
     ELambda(l) -> {
-      let z1: Encoder = fold(
+      let typed: Encoder = fold(
         l.params,
         put_u32(put_tag(encoder, tag_e_lambda()), len(l.params)),
         |acc: Encoder, p: Param| opt_type(acc, p.ty),
       );
       let inner: Encoder = expr(
-        { ..z1, values: append(z1.values, map(l.params, |p: Param| p.name.name)) },
+        { ..typed, values: append(typed.values, map(l.params, |p: Param| p.name.name)) },
         l.body,
       );
-      { ..inner, values: z1.values }
+      { ..inner, values: typed.values }
     },
     EApp(a) -> {
       let called: Encoder = fold(
@@ -1321,8 +1345,8 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
 
 fn block(encoder: Encoder, stmts: List<Stmt>, tail: Option<Expr>) -> Encoder / {abort.raise} = {
   let head: Encoder = put_u32(put_tag(encoder, tag_e_block()), len(stmts));
-  let ordered: { z: Encoder, order: List<Int> } = stmt_order(head, stmts);
-  let walked: Encoder = fold(ordered.order, ordered.z, |acc: Encoder, i: Int|
+  let ordered: { encoder: Encoder, order: List<Int> } = stmt_order(head, stmts);
+  let walked: Encoder = fold(ordered.order, ordered.encoder, |acc: Encoder, i: Int|
     stmt(acc, at(stmts, i)));
   let tailed: Encoder = opt_expr(walked, tail);
   { ..tailed, values: head.values }
@@ -1332,36 +1356,44 @@ fn block(encoder: Encoder, stmts: List<Stmt>, tail: Option<Expr>) -> Encoder / {
 fn stmt_order(
   encoder: Encoder,
   stmts: List<Stmt>,
-) -> { z: Encoder, order: List<Int> } / {abort.raise} = {
+) -> { encoder: Encoder, order: List<Int> } / {abort.raise} = {
   let n = len(stmts);
   let walked = iterate(
-    { z: encoder, i: 0, order: [] },
+    { encoder: encoder, i: 0, order: [] },
     n + 2,
-    |s: { z: Encoder, i: Int, order: List<Int> }|
+    |s: { encoder: Encoder, i: Int, order: List<Int> }|
       if s.i >= n { Stop(s) } else {
         let run = commutable_run(stmts, s.i);
         if run < 2 { Continue({ ..s, i: s.i + 1, order: push(s.order, s.i) }) } else {
-          let sorted: { z: Encoder, order: List<Int> } = sorted_run(s.z, stmts, s.i, s.i + run);
-          Continue({ z: sorted.z, i: s.i + run, order: append(s.order, sorted.order) })
+          let sorted: { encoder: Encoder, order: List<Int> } = sorted_run(
+            s.encoder,
+            stmts,
+            s.i,
+            s.i + run,
+          );
+          Continue({ encoder: sorted.encoder, i: s.i + run, order: append(s.order, sorted.order) })
         }
       },
   );
-  { z: walked.z, order: walked.order }
+  { encoder: walked.encoder, order: walked.order }
 }
 
 // The members of the run, ordered by their encodings; ties keep their source order.
 fn sorted_run(
-  z: Encoder,
+  encoder: Encoder,
   stmts: List<Stmt>,
   from: Int,
   to: Int,
-) -> { z: Encoder, order: List<Int> } / {abort.raise} = {
+) -> { encoder: Encoder, order: List<Int> } / {abort.raise} = {
   let keyed = fold(
     range(from, to),
-    { z: z, keys: [] },
-    |acc: { z: Encoder, keys: List<{ key: Bytes, i: Int }> }, i: Int| {
-      let c: Captured = capture(acc.z, |x: Encoder| stmt(x, at(stmts, i)));
-      { z: { ..c.encoder, values: acc.z.values }, keys: push(acc.keys, { key: c.bytes, i: i }) }
+    { encoder: encoder, keys: [] },
+    |acc: { encoder: Encoder, keys: List<{ key: Bytes, i: Int }> }, i: Int| {
+      let captured: Captured = capture(acc.encoder, |x: Encoder| stmt(x, at(stmts, i)));
+      {
+        encoder: { ..captured.encoder, values: acc.encoder.values },
+        keys: push(acc.keys, { key: captured.bytes, i: i }),
+      }
     },
   );
   let sorted = fold(
@@ -1369,15 +1401,15 @@ fn sorted_run(
     [],
     |acc: List<{ key: Bytes, i: Int }>, x: { key: Bytes, i: Int }| {
       let n = len(acc);
-      let at_ = fold(range(0, n), n, |p: Int, j: Int|
+      let i = fold(range(0, n), n, |p: Int, j: Int|
         if p < n { p } else {
           let y = at(acc, j);
           if bytes_lt(x.key, y.key) || (x.key == y.key && x.i < y.i) { j } else { p }
         });
-      append(push(take(acc, at_), x), map(range(at_, n), |j: Int| at(acc, j)))
+      append(push(take(acc, i), x), map(range(i, n), |j: Int| at(acc, j)))
     },
   );
-  { z: keyed.z, order: map(sorted, |x: { key: Bytes, i: Int }| x.i) }
+  { encoder: keyed.encoder, order: map(sorted, |x: { key: Bytes, i: Int }| x.i) }
 }
 
 fn stmt(encoder: Encoder, s: Stmt) -> Encoder / {abort.raise} =
@@ -1823,8 +1855,8 @@ fn encode_slotted<| e>(
   by_name: Bool,
   encode: (Encoder) -> Encoder / e,
 ) -> Finished / {abort.raise | e} = {
-  let z: Encoder = new_encoder(index, module, hashes, map_new(), effects);
-  finish(encode({ ..z, by_name: by_name }))
+  let encoder: Encoder = new_encoder(index, module, hashes, map_new(), effects);
+  finish(encode({ ..encoder, by_name: by_name }))
 }
 
 fn encode_item<| e>(
@@ -4172,10 +4204,10 @@ fn print_expr(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.
   } else if t.value == tag_e_with_cell() {
     let r = read_text(e);
     let init: Decoded = print_expr(printer, r.decoder, depth);
-    let at_ = init.decoder.values;
-    let body: Decoded = print_expr(printer, { ..init.decoder, values: at_ + 1 }, inner);
+    let level = init.decoder.values;
+    let body: Decoded = print_expr(printer, { ..init.decoder, values: level + 1 }, inner);
     {
-      decoder: { ..body.decoder, values: at_ },
+      decoder: { ..body.decoder, values: level },
       text: bytes_concat_all([
         b"with_cell[",
         r.text,
@@ -4183,7 +4215,7 @@ fn print_expr(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.
         init.text,
         b") {",
         line_break(inner),
-        local_name(at_),
+        local_name(level),
         b" -> ",
         body.text,
         line_break(depth),
@@ -5504,4 +5536,13 @@ test "a stored body is keyed by its own bytes, and bytes no envelope holds by no
   assert_eq(body_key(b""), None);
   assert_eq(body_key(b"\x07rest"), None);
   assert_eq(body_key(b"\x01\x00"), None)
+}
+
+test "a call that leaves an argument to a default naming what its module keeps hashes as one that writes it" {
+  let left = b"fn triple(x: Int) -> Int = x * 3\nfn inner(x: Int, f: (Int) -> Int = triple) -> Int = f(x)\nfn caller() -> Int = inner(1)";
+  let written = swapped(left, b"inner(1)", b"inner(1, triple)");
+  assert_eq(
+    dumped_hash(hash_dump([{ name: b"m", src: left }]), b"m.caller"),
+    dumped_hash(hash_dump([{ name: b"m", src: written }]), b"m.caller"),
+  )
 }

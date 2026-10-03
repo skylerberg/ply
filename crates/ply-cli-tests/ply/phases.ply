@@ -1,0 +1,344 @@
+// The compiler's phases over the inputs under `crates/ply-cli-tests/phases` -- the parser's
+// fixtures and corpora mined from the Rust reference's tests -- and over the standard library and
+// the compiler. Each test holds what every answer must be, never a record of an earlier one.
+
+import compiler.code
+import compiler.derive
+import compiler.hash
+import compiler.infer
+import compiler.items
+import compiler.lexer
+import compiler.resolve
+import compiler.resolve (Source)
+import compiler.rewrite
+import harness (compiler_tree, example_files, phase_files, std_tree)
+import std.bytes
+import std.list (any, find, flatten, last, take)
+import std.string
+
+type File = { name: String, bytes: Bytes }
+
+// --- The inputs -----------------------------------------------------------------
+
+// An input a phase reads alone, and a program a phase reads whole.
+type Input = { name: String, src: Bytes }
+
+type Program = { name: String, modules: List<Source> }
+
+fn is_ply(f: File) -> Bool / {abort.raise} = string_ends_with(f.name, ".ply")
+
+// Each `.ply` file directly in an embedded tree, and none in a directory below it.
+fn top_level(files: List<File>) -> List<File> / {abort.raise} =
+  filter(files, |f: File| is_ply(f) && !string_contains(f.name, "/"))
+
+fn stem(name: String) -> String / {abort.raise} = string_slice(name, 0, string_len(name) - 4)
+
+// Each `.ply` file directly in a tree as the module `prefix` and its stem name.
+fn modules_of(files: List<File>, prefix: String) -> List<Source> / {abort.raise} =
+  map(top_level(files), |f: File| { name: bytes_of_string(prefix ++ stem(f.name)), src: f.bytes })
+
+fn phases_file(name: String) -> Bytes / {abort.raise} =
+  match filter(phase_files(), |f: File| f.name == name) {
+    [f, ..] -> f.bytes,
+    [] -> panic("`crates/ply-cli-tests/phases` holds no `" ++ name ++ "`"),
+  }
+
+type Cut = { done: List<Bytes>, open: Option<List<Bytes>> }
+
+// A bundle's records: what follows each `%%` line up to the next, the last one's final newline
+// dropped. What comes before the first is the bundle's header.
+fn bundle(text: Bytes) -> List<Bytes> / {abort.raise} = {
+  let cut = fold(bytes_split(text, b"\n"), { done: [], open: None }, |c: Cut, line: Bytes|
+    if line == b"%%" {
+      {
+        done: match c.open {
+          Some(lines) -> push(c.done, bytes::join(lines, b"\n")),
+          None -> c.done,
+        },
+        open: Some([]),
+      }
+    } else {
+      match c.open { Some(lines) -> { done: c.done, open: Some(push(lines, line)) }, None -> c }
+    });
+  match cut.open {
+    Some(lines) -> push(cut.done, without_final_newline(bytes::join(lines, b"\n"))),
+    None -> cut.done,
+  }
+}
+
+fn without_final_newline(b: Bytes) -> Bytes / {abort.raise} =
+  if bytes_ends_with(b, b"\n") { bytes_slice(b, 0, bytes_len(b) - 1) } else { b }
+
+// A bundle's records as inputs, each named `<file>#<index>`.
+fn bundled(file: String) -> List<Input> / {abort.raise} = {
+  let records = bundle(phases_file(file));
+  map(range(0, len(records)), |i: Int|
+    {
+      name: file ++ "#" ++ int_to_string(i),
+      src: match list_at(records, i) { Some(r) -> r, None -> b"" },
+    })
+}
+
+// A bundle's records as programs of the one module `module`.
+fn bundled_modules(file: String, module: Bytes) -> List<Program> / {abort.raise} =
+  map(bundled(file), |i: Input| { name: i.name, modules: [{ name: module, src: i.src }] })
+
+// Programs, each after a `%%%` line, their modules split at `%%` lines, each module's first line
+// its name. What comes before the first is the bundle's header.
+fn programs(file: String) -> List<Program> / {abort.raise} = {
+  let chunks = match bytes_split(phases_file(file), b"\n%%%\n") { [_, ..rest] -> rest, [] -> [] };
+  let found = fold(chunks, [], |acc: List<List<Source>>, chunk: Bytes| {
+    let c = after_newlines(chunk);
+    if string_trim(string_of_bytes_lossy(c)) == "" { acc }
+    else { push(acc, map(bytes_split(c, b"\n%%\n"), module_of)) }
+  });
+  map(range(0, len(found)), |i: Int|
+    {
+      name: file ++ "#" ++ int_to_string(i),
+      modules: match list_at(found, i) { Some(p) -> p, None -> [] },
+    })
+}
+
+fn after_newlines(b: Bytes) -> Bytes / {abort.raise} =
+  match bytes_position(b, 0, |c: Int| c != 10) {
+    Some(i) -> bytes_slice(b, i, bytes_len(b)),
+    None -> b"",
+  }
+
+fn module_of(m: Bytes) -> Source / {abort.raise} =
+  match bytes_index_of_byte(m, 10) {
+    Some(i) -> { name: trimmed(bytes_slice(m, 0, i)), src: bytes_slice(m, i + 1, bytes_len(m)) },
+    None -> { name: trimmed(m), src: b"" },
+  }
+
+fn trimmed(b: Bytes) -> Bytes = bytes_of_string(string_trim(string_of_bytes_lossy(b)))
+
+// The mined programs, which the resolver, the checker and the hasher each read whole.
+fn corpus_programs() -> List<Program> / {abort.raise} =
+  flatten([
+    programs("reference-programs.corpus"),
+    bundled_modules("reference-checks.corpus", b"m"),
+    bundled_modules("reference-hashes.corpus", b"m"),
+  ])
+
+// --- Records ----------------------------------------------------------------------
+
+// A dump's `;`-terminated records.
+fn records(dump: Bytes) -> List<Bytes> / {abort.raise} =
+  match bytes_split(dump, b";") {
+    [] -> [],
+    parts -> if last(parts) == Some(b"") { take(parts, len(parts) - 1) } else { parts },
+  }
+
+type Span = { start: Int, end: Int }
+
+// The span a record of the lexer's or the parser's dump carries: a token's and a node's lead with
+// it, a diagnostic's follows its code, and a label's follows its `=`.
+fn span_of(r: Bytes) -> Option<Span> / {abort.raise} = {
+  let fields = bytes_split(r, b":");
+  let int_at = |k: Int|
+    match list_at(fields, k) {
+      Some(f) -> string::int_of_string(string_of_bytes_lossy(f)),
+      None -> None,
+    };
+  let from = |k: Int|
+    match int_at(k) {
+      Some(s) -> match int_at(k + 1) { Some(e) -> Some({ start: s, end: e }), None -> None },
+      None -> None,
+    };
+  if bytes_len(r) == 0 { None }
+  else if bytes_at(r, 0) >= 48 && bytes_at(r, 0) <= 57 { from(0) }
+  else if bytes_at(r, 0) == 33 { from(1) }
+  else if bytes_at(r, 0) == 61 { from_label(fields) }
+  else { None }
+}
+
+fn from_label(fields: List<Bytes>) -> Option<Span> / {abort.raise} =
+  match fields {
+    [s, e, ..] -> match string::int_of_string(
+        string_of_bytes_lossy(bytes_slice(s, 1, bytes_len(s))),
+      ) {
+      Some(start) -> match string::int_of_string(string_of_bytes_lossy(e)) {
+        Some(end) -> Some({ start: start, end: end }),
+        None -> None,
+      },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+// Whether every span `dump` carries lies inside a source of `n` bytes.
+fn spans_inside(dump: Bytes, n: Int) -> Bool / {abort.raise} =
+  !any(records(dump), |r: Bytes|
+    match span_of(r) { Some(s) -> s.start < 0 || s.start > s.end || s.end > n, None -> false })
+
+type Walk = { end: Int, ordered: Bool, last: Bytes }
+
+// Whether the lexer's tokens come in order, none over another, and end with the end of the input.
+// A diagnostic's record is `start:end:!:code`.
+fn tokens_in_order(dump: Bytes, n: Int) -> Bool / {abort.raise} = {
+  let tokens = filter(records(dump), |r: Bytes| list_at(bytes_split(r, b":"), 2) != Some(b"!"));
+  let walk = fold(tokens, { end: 0, ordered: true, last: b"" }, |w: Walk, r: Bytes|
+    match span_of(r) {
+      Some(s) -> { end: s.end, ordered: w.ordered && s.start >= w.end, last: r },
+      None -> { ..w, ordered: false },
+    });
+  walk.ordered && walk.last == bytes_of_string(int_to_string(n) ++ ":" ++ int_to_string(n) ++ ":e")
+}
+
+// --- The lexer, the parser and the rewrites ------------------------------------------
+
+type Read = { phase: String, ok: Bool }
+
+test "the lexer, the parser and the rewrites answer every input inside its bytes" {
+  let mined = bundled("reference-tests.corpus");
+  assert(
+    len(mined) > 700,
+    Some("the mined bundle holds " ++ int_to_string(len(mined)) ++ " inputs; some have been lost"),
+  );
+  let fixtures = map(filter(phase_files(), is_ply), |f: File| { name: f.name, src: f.bytes });
+  let wrong = fold(flatten([fixtures, mined]), [], |acc: List<String>, i: Input| {
+    let n = bytes_len(i.src);
+    let lexed = bytes_of_string(lexer::dump(i.src));
+    let reads = [
+      { phase: "the lexer", ok: spans_inside(lexed, n) && tokens_in_order(lexed, n) },
+      { phase: "the parser", ok: spans_inside(bytes_of_string(items::dump(i.src)), n) },
+      {
+        phase: "the rewrites",
+        ok: spans_inside(bytes_of_string(rewrite::dump_expanded(i.src)), n),
+      },
+    ];
+    fold(reads, acc, |a: List<String>, read: Read|
+      if read.ok { a } else { push(a, read.phase ++ " over " ++ i.name) })
+  });
+  assert(
+    wrong == [],
+    Some(
+      "a span outside the input, or tokens out of order: " ++ string::join(take(wrong, 10), ", "),
+    ),
+  );
+  let raised = fold(top_level(phase_files()), 0, |count: Int, f: File|
+    count
+      + len(
+        filter(records(bytes_of_string(items::dump(f.bytes))), |r: Bytes|
+          bytes_starts_with(r, b"!")),
+      ));
+  assert(
+    raised >= 40,
+    Some(
+      "the fixtures raise " ++ int_to_string(raised)
+        ++ " diagnostics; they exist to exercise the parser's recovery and something has stopped them reaching it",
+    ),
+  )
+}
+
+// --- The deriver, the resolver and the hasher ------------------------------------------
+
+test "the deriver, the resolver and the hasher answer every program" {
+  let underived = filter(bundled_modules("derive-programs.corpus", b"t"), |p: Program|
+    !string_starts_with(derive::derive_dump(p.modules), "M;"));
+  // Each answer opens with the count of the modules it read.
+  let head = |letter: String, p: Program| letter ++ ";" ++ int_to_string(len(p.modules)) ++ ";";
+  let unanswered = filter(corpus_programs(), |p: Program|
+    !string_starts_with(resolve::resolve_dump(p.modules), head("R", p))
+      || !string_starts_with(hash::hash_dump(p.modules), head("K", p)));
+  let named = |ps: List<Program>| string::join(map(take(ps, 10), |p: Program| p.name), ", ");
+  assert(underived == [], Some("the deriver did not answer " ++ named(underived)));
+  assert(
+    unanswered == [],
+    Some("the resolver or the hasher did not answer the whole of " ++ named(unanswered)),
+  )
+}
+
+// --- The checker ----------------------------------------------------------------------
+
+// The first record two dumps disagree on, with the run-up to it from each.
+fn first_difference(walked: Bytes, seeded: Bytes) -> String / {abort.raise} = {
+  let a = array_of_list(records(walked));
+  let b = array_of_list(records(seeded));
+  let n = max(array_len(a), array_len(b));
+  match find(range(0, n), |i: Int| array_at(a, i) != array_at(b, i)) {
+    None -> "every record agrees, so they differ only in trailing bytes",
+    Some(i) -> {
+      let around = |t: Array<Bytes>|
+        string::join(
+          map(range(max(0, i - 6), min(i + 8, array_len(t))), |k: Int|
+            "    " ++ string_of_bytes_lossy(match array_at(t, k) { Some(r) -> r, None -> b"" })),
+          "\n",
+        );
+      "record " ++ int_to_string(i) ++ " differs\n  walked:\n" ++ around(a) ++ "\n  seeded:\n"
+        ++ around(b)
+    },
+  }
+}
+
+// What a definition-granular cache is built on: a program checked again from the interfaces its
+// first check published answers as walking the bodies did, diagnostics included.
+test "a mined program checked from its own interfaces answers as its walked bodies do" {
+  match find(corpus_programs(), |p: Program|
+      infer::check_dump_known(p.modules) != infer::check_dump(p.modules)) {
+    None -> (),
+    Some(p) ->
+      panic(
+        p.name ++ " checks otherwise from its own interfaces:\n"
+          ++ first_difference(
+            bytes_of_string(infer::check_dump(p.modules)),
+            bytes_of_string(infer::check_dump_known(p.modules)),
+          ),
+      ),
+  }
+}
+
+// The same seam over the largest program there is.
+test "the checker seeded from its own interfaces agrees on the compiler and the library" {
+  let program = flatten([modules_of(std_tree(), "std."), modules_of(compiler_tree(), "")]);
+  let head = bytes_of_string("K;" ++ int_to_string(len(program)) ++ ";");
+  let walked = bytes_of_string(infer::check_dump(program));
+  assert(
+    bytes_starts_with(walked, head)
+      && !bytes_starts_with(bytes_slice(walked, bytes_len(head), bytes_len(walked)), b"X;"),
+    Some(
+      "the standard library and the compiler do not check as one program:\n"
+        ++ string_of_bytes_lossy(bytes_slice(walked, 0, min(4000, bytes_len(walked)))),
+    ),
+  );
+  let seeded = bytes_of_string(infer::check_dump_known(program));
+  assert(
+    seeded == walked,
+    Some(
+      "over " ++ int_to_string(len(program))
+        ++ " modules, a definition published from its stored interface does not answer as the walked body did:\n"
+        ++ first_difference(walked, seeded),
+    ),
+  )
+}
+
+// --- Effects ---------------------------------------------------------------------------------
+
+// What this arms is the corpus, not a backend: if the last `handle` or the last `with cell` left
+// it, effect work in the C backend would have nothing to be checked against. Counted on the
+// lowering rather than the surface text: `with cell` reaches a `cell(` node its spelling does not
+// contain, and `$` is how the lowering spells a resource a label parameter names.
+test "the corpus still exercises every effect construct a backend has to carry" {
+  let inputs = flatten([
+    top_level(std_tree()),
+    top_level(example_files()),
+    top_level(phase_files()),
+  ]);
+  let bodies = flatten(
+    map(inputs, |f: File|
+      match bytes_split(bytes_of_string(code::lower_dump(f.bytes)), b"f:") {
+        [_, ..rest] -> rest,
+        [] -> [],
+      }),
+  );
+  let reached = |tag: Bytes| any(bodies, |b: Bytes| bytes_index_of(b, tag) != None);
+  let lost = filter([b"perform(", b"handle(", b"cell(", b"$"], |tag: Bytes| !reached(tag));
+  assert(
+    lost == [],
+    Some(
+      "no body in the corpus reaches " ++ string_of_bytes(bytes::join(lost, b", "))
+        ++ " any more, so nothing checks the C backend's implementation of it",
+    ),
+  )
+}
