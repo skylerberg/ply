@@ -137,8 +137,9 @@ type Outside = { name: Bytes, span: Span }
 // ending.
 type Seen = { calls: List<Call>, uses: List<Use>, outside: List<Outside>, lost: Option<Span> }
 
-// `depth` counts the lambdas whose bodies the walk is reading within one another.
-type MemberContext = { group: Group, me: Int, depth: Int }
+// `depth` counts the lambdas whose bodies the walk is reading within one another; `results` is what
+// each member of the group is known to answer, or `None` where it is not known to answer at all.
+type MemberContext = { group: Group, me: Int, depth: Int, results: List<Option<Term>> }
 
 // The structural size of a place; `hi - lo`, which a shrinking call must find bounded below; or the
 // measure a `decreases` states, which every call between two members stating one is owed to shrink.
@@ -158,8 +159,9 @@ type Graph = { from: Int, to: Int, arcs: List<Arc>, calls: List<Span> }
 // --- The verdict ----------------------------------------------------------------------------------
 
 pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
+  let results = settled_results(g);
   let seen = map(range(0, len(g.defs)), |i: Int|
-    seen_of({ group: g, me: i, depth: 0 }, at(g.defs, i)));
+    seen_of({ group: g, me: i, depth: 0, results: results }, at(g.defs, i)));
   let calls = map(seen, |x: Seen| x.calls);
   let stating = fold(g.defs, false, |acc: Bool, d: FnDef|
     acc || (match d.decreases { Some(_) -> true, None -> false }));
@@ -184,9 +186,33 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
       fold(seen, weaker(fold(at(seen, i).outside, settled, out), own), |e: Ending, x: Seen|
         fold(x.outside, e, out))),
     summaries: map(range(0, len(g.defs)), |i: Int|
-      summary({ group: g, me: i, depth: 0 }, at(seen, i))),
+      summary({ group: g, me: i, depth: 0, results: results }, at(seen, i))),
   }
 }
+
+// What each member answers: from none known, each member's answer read again with what the others
+// are known to answer, until a round changes nothing, which every answer then holds of. A call that
+// returned answered what its callee is known to, so a later call reads it soundly. Past a number of
+// rounds nothing is known.
+fn settled_results(g: Group) -> List<Option<Term>> / {abort.raise} = {
+  let n = len(g.defs);
+  let round = |rs: List<Option<Term>>|
+    map(range(0, n), |i: Int| {
+      let context = { group: g, me: i, depth: 0, results: rs };
+      answered(context, entry_scope(context, at(g.defs, i)), at(g.defs, i).body)
+    });
+  iterate(
+    { rs: map(range(0, n), |i: Int| None), k: 0 },
+    result_rounds() + 2,
+    |st: { rs: List<Option<Term>>, k: Int }|
+      if st.k >= result_rounds() { Stop(map(range(0, n), |i: Int| Some(UnknownTerm))) } else {
+        let next = round(st.rs);
+        if next == st.rs { Stop(st.rs) } else { Continue({ rs: next, k: st.k + 1 }) }
+      },
+  )
+}
+
+fn result_rounds() -> Int = 6
 
 fn looped(u: Unending) -> Ending = Diverges({ at: u.at, through: None, loop: u.loop })
 
@@ -1086,6 +1112,10 @@ fn applied_term(
         Some(sum) -> translated(context, sum.result, actuals(context, s, sum.names, args, named)),
         None -> UnknownTerm,
       },
+      GroupMember(t) -> match list_at(context.results, t) {
+        Some(Some(r)) -> translated(context, r, arguments(context, s, t, args, named)),
+        _ -> UnknownTerm,
+      },
       _ -> UnknownTerm,
     },
     _ -> UnknownTerm,
@@ -1146,9 +1176,17 @@ fn answered(context: MemberContext, s: Scope, e: Expr) -> Option<Term> / {abort.
         Some(t) -> answered(context, r.s, t),
       })
     },
-    EApp(a) -> match builtin(context, s, a.func) {
-      Some(name) -> if name == b"panic" { None } else { Some(term(context, s, e)) },
-      None -> Some(term(context, s, e)),
+    EApp(a) -> match a.func {
+      EVar(v) -> match callee_of(context, s, v.name) {
+        BuiltinCallee(name) -> if name == b"panic" { None } else { Some(term(context, s, e)) },
+        // A member not yet known to answer has not answered here either.
+        GroupMember(t) -> match list_at(context.results, t) {
+          Some(None) -> None,
+          _ -> Some(term(context, s, e)),
+        },
+        _ -> Some(term(context, s, e)),
+      },
+      _ -> Some(term(context, s, e)),
     },
     _ -> Some(term(context, s, e)),
   }
@@ -1545,10 +1583,7 @@ fn summary(context: MemberContext, x: Seen) -> Summary / {abort.raise} = {
             }
           })
       }),
-    result: match answered(context, entry_scope(context, def), def.body) {
-      Some(t) -> t,
-      None -> UnknownTerm,
-    },
+    result: match list_at(context.results, context.me) { Some(Some(t)) -> t, _ -> UnknownTerm },
   }
 }
 
