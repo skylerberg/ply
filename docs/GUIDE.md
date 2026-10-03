@@ -3517,6 +3517,19 @@ safe. `ply run --explain` says `reused` or `built`, the key, and what reading,
 the front end, filing into `.ply-cache` and the machine's load each took, on
 stderr before the entry runs, or as `front_end` in the `--json` document.
 
+`ply check` takes its own answer back the same way. A check the front end
+answered whole is filed in `run-fronts/` under the walk's key, the interface
+each registry dependency's slot holds, the paths its reports name, and the flags
+that shape what it prints (`--types`, `--costs`, `--json`, `--verify-deps`,
+color). What the front-end cache said of itself (`W0601`, `W0602`, `W0603`,
+`W0605`) is left out of what is filed, since a check that does not read the cache
+has nothing to say about it. A later check whose key matches prints that answer
+and exits with its code without running the front end, so a tree unchanged since
+its last check is answered in the time its walk takes. `--explain` always checks
+afresh, since what it reports is this run's. In the `--json` document,
+`front_end` carries `reused` and `key`: beside the phases of a check that ran,
+and alone for an answer taken back.
+
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
