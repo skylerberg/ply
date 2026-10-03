@@ -74,6 +74,9 @@ pub struct EmitterRoot {
     pub params: Vec<Carry>,
     /// How its answer reads back out of compiled code.
     pub answer: Carry,
+    /// The type variables whose witnesses lead `params`: an entry from outside passes each the
+    /// type its arguments show for it.
+    pub witnesses: Vec<usize>,
 }
 
 impl EmitterRoot {

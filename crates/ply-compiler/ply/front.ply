@@ -2,7 +2,8 @@
 
 import spine (Span, Ident, QName, PDiag, dummy_span, num, pdiag, plabel)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
-              SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder)
+              SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder,
+              is_predicate)
 import types (Mode, MRead, MWrite, MBad, AtomExpr)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -14,16 +15,16 @@ import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecor
 import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
                atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
                print_ty, Field, at, append, take, contains_bytes, contains_int, canonical_atoms,
-               canonical_scheme, canonical_type, t_bool, t_unit)
+               canonical_scheme, canonical_type, t_bool, t_int, t_unit)
 import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEffect,
                 resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
 import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index,
              hash_index_pinned, hex, digest, unused, Pin, Fixed, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
-              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes,
-              update_shapes_with, expanded_mods, check_front_with, is_prelude_effect,
-              builtin_schemes, builtin_docs, find_doc, published_pure)
+              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaboration,
+              elaboration_with, updated_mods, check_front_with, is_prelude_effect, builtin_schemes,
+              builtin_docs, builtin_constraints, find_doc, published_pure)
 import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
 import pkg (Pkgs, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
@@ -723,7 +724,8 @@ fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
 // One root the emitter offers: a definition, a spec clause, a test or a law part, with the arity
 // its body is emitted at. `pure` is a definition's published purity, which lets a memo answer for
 // it; any other root runs each time. `params` and `answer` say how what it is entered with and
-// answers read at the seam.
+// answers read at the seam. `witnesses` are the type variables whose witnesses lead `params`, which
+// an entry from outside fills from what its arguments show of each.
 pub type EmitRoot = {
   root: Bytes,
   arity: Int,
@@ -731,6 +733,7 @@ pub type EmitRoot = {
   at: At,
   params: List<Carry>,
   answer: Carry,
+  witnesses: List<Int>,
 }
 
 // The span of a root the tables do not place: a test or law whose check output has no row.
@@ -918,29 +921,40 @@ fn emit_signature(t: Type) -> { params: List<Type>, ret: Type } =
 fn emit_root(
   cr: Carrier,
   vars: List<Int>,
+  witnesses: List<Int>,
   root: Bytes,
   params: List<Type>,
   answer: Type,
   labels: Int,
   pure: Bool,
   place: At,
-) -> EmitRoot =
+) -> EmitRoot = {
+  let taken = append(map(witnesses, |w: Int| t_int()), params);
   {
     root: root,
-    arity: len(params) + labels,
+    arity: len(taken) + labels,
     pure: pure,
     at: place,
-    params: carries(cr, vars, params),
+    params: carries(cr, vars, taken),
     answer: carry(cr, vars, answer),
+    witnesses: witnesses,
   }
+}
 
 fn emit_proposition(
   cr: Carrier,
   vars: List<Int>,
+  witnesses: List<Int>,
   root: Bytes,
   params: List<Type>,
   place: At,
-) -> EmitRoot = emit_root(cr, vars, root, params, t_bool(), 0, false, place)
+) -> EmitRoot = emit_root(cr, vars, witnesses, root, params, t_bool(), 0, false, place)
+
+// The type variables a definition's `numeric` and `integer` constraints are about, by its scheme's
+// numbering and in its order: the witnesses it takes ahead of its parameters, as its clauses do.
+fn witness_vars(def: DefInfo) -> List<Int> =
+  fold(def.constraints, [], |acc: List<Int>, c: DefConstraint|
+    if !is_predicate(c.deriver) || contains_int(acc, c.param) { acc } else { push(acc, c.param) })
 
 // Every root the emitter offers: the functions in source order, then the tests, then the spec
 // clauses and law parts. A label parameter is a trailing `Word` of the emitted body, so an
@@ -962,10 +976,12 @@ fn emit_roots(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitRoot> = {
               Some(def) -> {
                 let sig = emit_signature(def.scheme.ty);
                 let vars = def.scheme.ty_vars;
+                let witnesses = witness_vars(def);
                 let place = span_at(def.at.module, def.at.span);
                 let fn_row = emit_root(
                   cr,
                   vars,
+                  witnesses,
                   name,
                   sig.params,
                   sig.ret,
@@ -980,7 +996,7 @@ fn emit_roots(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitRoot> = {
                     match at(d.spec, i).kind {
                       SRequires -> {
                         let root = key_clause_root(name, b"requires", b.requires);
-                        let row = emit_proposition(cr, vars, root, sig.params, place);
+                        let row = emit_proposition(cr, vars, witnesses, root, sig.params, place);
                         { rows: push(b.rows, row), requires: b.requires + 1, ensures: b.ensures }
                       },
                       // `ensures` also takes `result`.
@@ -989,6 +1005,7 @@ fn emit_roots(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitRoot> = {
                         let row = emit_proposition(
                           cr,
                           vars,
+                          witnesses,
                           root,
                           push(sig.params, sig.ret),
                           place,
@@ -1008,7 +1025,7 @@ fn emit_roots(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitRoot> = {
               None -> no_at(),
             };
             let root = qualify(m.name, key_test_root(a.ordinal));
-            let row = emit_root(cr, [], root, [], t_unit(), 0, false, place);
+            let row = emit_root(cr, [], [], root, [], t_unit(), 0, false, place);
             { ..a, tests: push(a.tests, row), ordinal: a.ordinal + 1 }
           },
           ILaw(d) -> {
@@ -1022,6 +1039,7 @@ fn emit_roots(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitRoot> = {
               emit_proposition(
                 cr,
                 vars,
+                [],
                 qualify(m.name, key_law_root(a.law_ordinal, part)),
                 binders,
                 place,
@@ -1790,17 +1808,22 @@ pub fn dump_of(a: Analysis) -> Dump =
       ),
   }
 
-// A builtin as the checker binds it, and the names its parameters are documented under.
-pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes> }
+// A builtin as the checker binds it, the names its parameters are documented under, and the
+// witnesses a `numeric` or `integer` constraint has the elaboration pass ahead of them.
+pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes>, witnesses: Int }
 
 // Every builtin, in the prelude's order.
 pub fn builtin_rows() -> List<BuiltinRow> = {
   let docs = builtin_docs();
+  let constrained = builtin_constraints();
   map(builtin_schemes(0, 1, 2, 0), |x: { name: Bytes, sc: Scheme }|
     {
       name: x.name,
       scheme: x.sc,
       params: match find_doc(docs, x.name) { Some(d) -> d.params, None -> [] },
+      witnesses: fold(constrained, 0, |n: Int, b: { name: Bytes, cs: List<DefConstraint> }|
+        if b.name != x.name { n }
+        else { len(filter(b.cs, |c: DefConstraint| is_predicate(c.deriver))) }),
     })
 }
 
@@ -2019,9 +2042,9 @@ pub fn claims(
       packaged.shelf,
     ) {
     Failed(_) -> panic("a program the front end checked does not resolve"),
-    Resolved_(x) -> match update_shapes(x.r, x.mods) {
+    Resolved_(x) -> match elaboration(x.r, x.mods) {
       None -> panic("a program the front end checked does not check"),
-      Some(shapes) -> claims_of(expanded_mods(x.mods, shapes), x.r),
+      Some(shapes) -> claims_of(updated_mods(x.mods, shapes), x.r),
     },
   }
 }
@@ -2054,10 +2077,10 @@ pub fn claims_in(
     filter(rows.defs, |r: KnownDefRow| !map_contains(walked, r.name)),
     rows.tests,
   );
-  match update_shapes_with(w.r, w.mods, known) {
+  match elaboration_with(w.r, w.mods, known) {
     None -> panic("a program the front end checked does not check"),
     Some(shapes) ->
-      claims_of_modules(expanded_mods(w.mods, shapes), w.r, wanted, |m: Bytes|
+      claims_of_modules(updated_mods(w.mods, shapes), w.r, wanted, |m: Bytes|
         map_contains(stubs, m) || !owned(m)),
   }
 }
