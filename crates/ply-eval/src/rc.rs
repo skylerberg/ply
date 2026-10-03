@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct Stats {
+pub struct RcStats {
     /// Updates that answer a compound argument with one element changed.
     pub updates: u64,
     pub updates_in_place: u64,
@@ -16,7 +16,7 @@ pub struct Stats {
     pub cycles: u64,
 }
 
-impl Stats {
+impl RcStats {
     pub fn in_place(&self) -> Option<f64> {
         if self.updates == 0 {
             return None;
@@ -26,7 +26,7 @@ impl Stats {
 }
 
 thread_local! {
-    static COUNTERS: RefCell<Stats> = const { RefCell::new(Stats {
+    static COUNTERS: RefCell<RcStats> = const { RefCell::new(RcStats {
         updates: 0,
         updates_in_place: 0,
         elements_copied: 0,
@@ -71,17 +71,17 @@ pub fn sites() -> Vec<(Span, SiteCount)> {
         .unwrap_or_default()
 }
 
-fn bump(f: impl FnOnce(&mut Stats)) {
+fn bump(f: impl FnOnce(&mut RcStats)) {
     let _ = COUNTERS.try_with(|c| f(&mut c.borrow_mut()));
 }
 
 /// What this thread has counted since the last [`reset`].
-pub fn stats() -> Stats {
+pub fn stats() -> RcStats {
     COUNTERS.try_with(|c| *c.borrow()).unwrap_or_default()
 }
 
 pub fn reset() {
-    let _ = COUNTERS.try_with(|c| *c.borrow_mut() = Stats::default());
+    let _ = COUNTERS.try_with(|c| *c.borrow_mut() = RcStats::default());
     let _ = SITES.try_with(|c| c.borrow_mut().clear());
     let _ = CYCLES.try_with(|c| c.borrow_mut().clear());
     let _ = SEEN.try_with(|c| c.borrow_mut().clear());

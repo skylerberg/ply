@@ -1,6 +1,6 @@
 //! Children that run beside the program: started, fed, read, signalled and reaped by handle.
 
-use super::{MAX_CAPTURE_BYTES, Sink, Stream};
+use super::{MAX_CAPTURE_BYTES, OutputSink, Stream};
 use crate::pool::{Ended, Finished, Heard};
 use ply_eval::Resource;
 use std::collections::{BTreeMap, VecDeque};
@@ -107,7 +107,7 @@ impl Children {
     }
 
     /// The handle of a child now running, or why it could not be started.
-    pub(super) fn start(&self, launch: &Launch<'_>, sink: &Arc<Sink>) -> Result<i64, String> {
+    pub(super) fn start(&self, launch: &Launch<'_>, sink: &Arc<OutputSink>) -> Result<i64, String> {
         let (out, err) = destinations(launch, sink)?;
         let mut command = super::command(launch.program, launch.args, launch.dir, launch.env);
         command
@@ -354,7 +354,7 @@ impl State {
         }
     }
 
-    fn take(&mut self, stream: Stream, chunk: &[u8], sink: &Sink) {
+    fn take(&mut self, stream: Stream, chunk: &[u8], sink: &OutputSink) {
         let held = self.held(stream);
         held.written += chunk.len();
         match held.collect {
@@ -382,7 +382,7 @@ impl State {
     }
 
     /// The last line of a stream need not end in a newline.
-    fn close(&mut self, stream: Stream, sink: &Sink) {
+    fn close(&mut self, stream: Stream, sink: &OutputSink) {
         let held = self.held(stream);
         held.open = false;
         if held.bytes.is_empty() {
@@ -512,7 +512,7 @@ fn text_of(line: &[u8]) -> String {
 }
 
 /// A sink that refuses a line has nowhere else to put it, and the child is not the one to tell.
-fn forward(sink: &Sink, to: Stream, line: &[u8]) {
+fn forward(sink: &OutputSink, to: Stream, line: &[u8]) {
     let _ = sink.write(to, &text_of(line));
 }
 
@@ -521,7 +521,10 @@ struct Destination {
     collect: Collect,
 }
 
-fn destinations(launch: &Launch<'_>, sink: &Sink) -> Result<(Destination, Destination), String> {
+fn destinations(
+    launch: &Launch<'_>,
+    sink: &OutputSink,
+) -> Result<(Destination, Destination), String> {
     // One file named for both streams is opened once, so the two interleave as `2>&1` does.
     if let (Output::File(out), Output::File(err)) = (&launch.io.out, &launch.io.err)
         && out == err
@@ -551,7 +554,7 @@ fn destination(
     output: &Output,
     stream: Stream,
     dir: &str,
-    sink: &Sink,
+    sink: &OutputSink,
 ) -> Result<Destination, String> {
     let piped = |collect| Destination {
         stdio: Stdio::piped(),
@@ -569,11 +572,11 @@ fn destination(
             collect: Collect::Nothing,
         },
         Output::Inherit => match sink {
-            Sink::Real { out } => Destination {
+            OutputSink::Real { out } => Destination {
                 stdio: inherited(stream, *out),
                 collect: Collect::Nothing,
             },
-            Sink::Captured(_) => piped(Collect::Forward(stream)),
+            OutputSink::Captured(_) => piped(Collect::Forward(stream)),
         },
     })
 }
@@ -602,7 +605,7 @@ fn attend(
     child: &Arc<Child>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
-    sink: &Arc<Sink>,
+    sink: &Arc<OutputSink>,
 ) -> std::io::Result<()> {
     let watched = Arc::clone(child);
     helper(format!("ply-host-child-{}", child.pid), move || {
@@ -703,7 +706,7 @@ fn deliver(process: &mut std::process::Child, _: u32, signal: Signal) -> std::io
     }
 }
 
-fn drain(child: &Child, stream: Stream, mut pipe: impl Read, sink: &Sink) {
+fn drain(child: &Child, stream: Stream, mut pipe: impl Read, sink: &OutputSink) {
     let mut chunk = vec![0; CHUNK];
     loop {
         let n = match pipe.read(&mut chunk) {

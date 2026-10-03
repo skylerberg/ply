@@ -28,7 +28,7 @@ impl HostRuntime for Nothing {
 fn host(argv: &[&str]) -> Arc<ProcessHost> {
     Arc::new(ProcessHost::new(
         argv.iter().map(|a| (*a).to_string()).collect(),
-        Sink::captured(),
+        OutputSink::captured(),
     ))
 }
 
@@ -242,7 +242,7 @@ fn spawning(label: &str, program: &str) -> Arc<ProcessHost> {
     executables
         .bind(label, std::path::Path::new(program), Span::DUMMY)
         .expect("the program binds");
-    Arc::new(ProcessHost::new(Vec::new(), Sink::captured()).executing(executables))
+    Arc::new(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables))
 }
 
 fn variable(name: &str, value: &str) -> Value {
@@ -984,7 +984,8 @@ fn a_child_is_used_under_the_label_it_was_started_as() {
             .bind(label, std::path::Path::new(SH), Span::DUMMY)
             .expect("a shell is a program");
     }
-    let host = Arc::new(ProcessHost::new(Vec::new(), Sink::captured()).executing(executables));
+    let host =
+        Arc::new(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables));
     let child = start(
         &host,
         "exec sleep 60",
@@ -1117,7 +1118,7 @@ fn the_runs_teardown_ends_the_children_it_leaves() {
         .bind("sh", std::path::Path::new(SH), Span::DUMMY)
         .expect("a shell is a program");
     let facilities = ply_host::Host::new()
-        .with_process(ProcessHost::new(Vec::new(), Sink::captured()).executing(executables));
+        .with_process(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables));
     let host = facilities.process().expect("a process host").clone();
     let (_, pid) = sleeper(&host);
     let _ = facilities.runtime().shutdown();
@@ -1134,7 +1135,7 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         .bind("sh", std::path::Path::new(SH), Span::DUMMY)
         .expect("a shell is a program");
     let facilities = ply_host::Host::new()
-        .with_process(ProcessHost::new(Vec::new(), Sink::captured()).executing(executables));
+        .with_process(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables));
     let host = facilities.process().expect("a process host").clone();
     let net = facilities.net();
     let at = Resource::Named(Symbol::new("listener"));

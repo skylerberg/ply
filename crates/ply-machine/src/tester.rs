@@ -11,7 +11,7 @@ use crate::hosts::{self, Hosts, LentOp};
 use crate::payload::{count, diags_value, field_of, json, option, raised_value, record, strings};
 use crate::support::{select_profile, unit_of};
 use crate::testrun::{
-    Executed, Executor, Hosting, Interleaved, Use, executed, interleaved, status_word,
+    Executed, Executor, Hosting, Interleaved, Usage, executed, interleaved, status_word,
 };
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
 use ply_eval::{Diagnostic, Seed, Span, Value as PlyValue, codes};
@@ -505,7 +505,7 @@ fn compiled_value(provider: Option<&'static dyn ply_eval::Provider>, hermetic: b
     ])
 }
 
-fn use_value(usage: &Use) -> PlyValue {
+fn use_value(usage: &Usage) -> PlyValue {
     let tally = |n: u64| PlyValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
     record(vec![
         (
@@ -628,8 +628,8 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
 // --- Small things -------------------------------------------------------------
 
 /// The wall clock is the machine's, not the program's.
-fn unmeasured(usage: Use) -> Use {
-    Use {
+fn unmeasured(usage: Usage) -> Usage {
+    Usage {
         duration: std::time::Duration::ZERO,
         ..usage
     }

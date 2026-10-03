@@ -186,7 +186,7 @@ pub enum Reclaim {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Stats {
+pub struct ArenaStats {
     /// Chunks taken from the global allocator over the arena's whole life.
     pub chunks_allocated: usize,
     pub allocations: u64,
@@ -197,7 +197,7 @@ pub struct Stats {
     pub element: usize,
 }
 
-impl Stats {}
+impl ArenaStats {}
 
 /// Slots in chunks and regions nesting per owner, over interpreter values or the C backend's heap
 /// words.
@@ -221,7 +221,7 @@ pub struct Arena<V = Value> {
     depth: usize,
     /// [`Pin`]s handed out and not yet given back; a parked region holds at least one.
     pins: usize,
-    stats: Stats,
+    stats: ArenaStats,
     /// Slots a `cell_update` has taken out; touching one meanwhile is refused.
     taken: Vec<Slot>,
 }
@@ -246,15 +246,15 @@ impl<V: Clone + Default> Arena<V> {
             owners: Vec::new(),
             depth: 0,
             pins: 0,
-            stats: Stats {
+            stats: ArenaStats {
                 element: std::mem::size_of::<V>(),
-                ..Stats::default()
+                ..ArenaStats::default()
             },
             taken: Vec::new(),
         }
     }
 
-    pub fn stats(&self) -> Stats {
+    pub fn stats(&self) -> ArenaStats {
         self.stats
     }
 
