@@ -1,5 +1,5 @@
-use ply_codegen::c::producer::{imported_closure, module_of_root};
-use ply_eval::{Front, ModuleInfo, ModuleName, SourceId, Symbol};
+use ply_codegen::c::producer::{imported_closure, module_of_root, stubbed};
+use ply_eval::{Cut, Front, ModuleInfo, ModuleName, SourceId, Symbol};
 use std::collections::HashSet;
 
 /// The emitter reads roots the same way: `emit.module_of_root`'s test holds the same cases.
@@ -31,6 +31,7 @@ fn the_emitter_is_handed_the_lowered_modules_and_what_they_import_transitively()
                 source: SourceId(at as u32),
                 items: Vec::new(),
                 imports: imports.into_iter().map(ModuleName::from_dotted).collect(),
+                cuts: Vec::new(),
             },
         );
     }
@@ -41,4 +42,32 @@ fn the_emitter_is_handed_the_lowered_modules_and_what_they_import_transitively()
         imported_closure(&front, ["d"]),
         names(&["a", "b", "c", "d"])
     );
+}
+
+/// The front end's `stub_module` blanks a compiled package's modules the same way.
+#[test]
+fn a_stub_keeps_every_offset_and_a_body_s_braces() {
+    let text = "fn f() -> Int = {\n  1 + 2\n}\ntest \"t\" { f() }\nfn g() -> Int = 3\n";
+    let body = text.find('{').unwrap();
+    let test = text.find("test").unwrap();
+    let stub = stubbed(
+        text,
+        &[
+            Cut {
+                start: body,
+                end: text.find("}\n").unwrap() + 1,
+                braced: true,
+            },
+            Cut {
+                start: test,
+                end: text.find("g()").unwrap() - 4,
+                braced: false,
+            },
+        ],
+    );
+    assert_eq!(
+        stub,
+        "fn f() -> Int = {\n       \n}\n                \nfn g() -> Int = 3\n"
+    );
+    assert_eq!(stub.len(), text.len());
 }
