@@ -1,15 +1,15 @@
 // The item parser, and all of the parser's error recovery.
 
 import spine (Span, Ident, QName, Ctx, P, R, Acc, PDiag, Label, Ate, Start, span_to, dummy_span,
-              no_ident, no_qname, bare, qualified, unexpected, unknown_deriver, unknown_effect_set,
-              diag1, diag2, push_diag, error_here, unclosed, kind, kind_at, cur_span, span_at,
-              prev_span, at, at_eof, at_ident_text, is_ident, is_str, starts_upper, advance, bump,
-              eat, expect, expect_close, expect_ident, expect_gt, with_no_brace, with_depth,
-              with_sets, fresh_item, start, qname, comma_list, settle, failed, t_lparen, t_rparen,
-              t_lbrace, t_rbrace, t_lbracket, t_rbracket, t_comma, t_colon, t_dot, t_eq, t_lt, t_gt,
-              t_underscore, t_ge, t_pipe, t_slash, t_arrow, k_pub, k_fn, k_type, k_effect, k_nondet,
-              k_test, k_import, num, hex, rec, nlist, opt, payload, word, dump_bool, dump_list,
-              dump_opt, dump_ident, dump_qname, dump_diags)
+              no_ident, no_qname, bare, qualified, unexpected, unknown_deriver, diag1, diag2,
+              push_diag, error_here, unclosed, kind, kind_at, cur_span, span_at, prev_span, at,
+              at_eof, at_ident_text, is_ident, is_str, starts_upper, advance, bump, eat, expect,
+              expect_close, expect_ident, expect_gt, with_no_brace, with_depth, fresh_item, start,
+              qname, comma_list, settle, failed, t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket,
+              t_rbracket, t_comma, t_colon, t_dot, t_eq, t_lt, t_gt, t_underscore, t_ge, t_pipe,
+              t_slash, t_arrow, k_pub, k_fn, k_type, k_effect, k_nondet, k_test, k_import, num, hex,
+              rec, nlist, opt, payload, word, dump_bool, dump_list, dump_opt, dump_ident,
+              dump_qname, dump_diags)
 import lexer (Tok, Token, TIdent, TStr, TFHead, TKw, TPunct, TEof)
 import types (TypeExpr, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead, MWrite, RMAtom, RMSet,
               ty, ty_span, no_ty, mode, generics, row, row_member, no_generics, dump_ty, dump_row,
@@ -103,8 +103,10 @@ pub type DeriveDef = { deriver: Deriver, deriver_span: Span, target: Ident, span
 // Which `derive` generated a definition; kept beside the module rather than on the `FnDef`.
 pub type Derived = { deriver: Deriver, target: Bytes, span: Span }
 
+// `expansion` is every atom the set stands for, as its own module writes them; the resolver fills it.
 pub type EffectSetDef = {
   name: Ident,
+  vis: Vis,
   atoms: List<AtomExpr>,
   includes: List<QName>,
   expansion: List<AtomExpr>,
@@ -185,7 +187,7 @@ pub fn no_derive_def() -> DeriveDef =
   { deriver: DJson, deriver_span: dummy_span(), target: no_ident(), span: dummy_span() }
 
 pub fn no_effect_set() -> EffectSetDef =
-  { name: no_ident(), atoms: [], includes: [], expansion: [], span: dummy_span() }
+  { name: no_ident(), vis: VPriv, atoms: [], includes: [], expansion: [], span: dummy_span() }
 
 pub fn no_item() -> Item = IFn(no_fn())
 
@@ -774,9 +776,9 @@ pub fn set_members(c: Ctx, p: P, open: Span) -> Result<RSetMembers, P> =
       }
     })
 
-// `effect set Web = {..}`; `rewrite` fills `expansion`.
-pub fn effect_set_def(c: Ctx, p: P) -> Result<R<EffectSetDef>, P> = {
-  let st = advance(c, with_sets(p));
+// `effect set Web = {..}`.
+pub fn effect_set_def(c: Ctx, p: P, vis: Vis) -> Result<R<EffectSetDef>, P> = {
+  let st = advance(c, p);
   let sk = advance(c, st.p);
   let { p, node: name } = expect_ident(c, sk.p, b"a name for the effect set, after `effect set`")?;
   let { p, .. } = expect(c, p, t_eq(), b"`=` after the effect set's name")?;
@@ -803,6 +805,7 @@ pub fn effect_set_def(c: Ctx, p: P) -> Result<R<EffectSetDef>, P> = {
       p: p,
       node: {
         name: name,
+        vis: vis,
         atoms: ms.atoms,
         includes: ms.includes,
         expansion: [],
@@ -880,13 +883,7 @@ pub fn item_at(c: Ctx, p: P, vis: Vis, pub_span: Option<Span>) -> Result<R<Item>
     let d = type_def(c, p, vis)?;
     Ok({ p: d.p, node: IType(d.node) })
   } else if at_effect_set_start(c, p) {
-    let d = effect_set_def(
-      c,
-      no_pub(p, unknown_effect_set(), pub_span, b"an `effect set` cannot be `pub`", [
-        b"an `effect set` may only be used in the module that declares it, so there is nothing for `pub` to publish",
-        b"a set expanding across a module boundary would let an edit in the declaring module leave a stale published row behind in a file whose bytes never moved",
-      ]),
-    )?;
+    let d = effect_set_def(c, p, vis)?;
     Ok({ p: d.p, node: IEffectSet(d.node) })
   } else if at(c, p, k_effect()) || at(c, p, k_nondet()) {
     let d = effect_def(c, p, vis)?;
@@ -1124,6 +1121,7 @@ pub fn dump_derive(d: DeriveDef) -> Bytes =
 pub fn dump_effect_set(d: EffectSetDef) -> Bytes =
   bytes_concat_all([
     rec(d.span, b"set"),
+    dump_vis(d.vis),
     dump_ident(d.name),
     dump_list(d.atoms, dump_atom),
     dump_list(d.includes, dump_qname),
@@ -1214,7 +1212,7 @@ test "an operation lists its type parameters between its resource and its parame
 test "an effect set collects atoms and the sets it includes" {
   assert_eq(
     dump(b"effect set S = {a.read[k], Other}\n"),
-    "#0;#1;0:33:set;11:12:ident;@53;#1;16:25:atm;16:17:qname;?0;16:17:ident;@61;%read;?1;23:24:ident;@6b;#1;27:32:qname;?0;27:32:ident;@4f74686572;#0;#0;",
+    "#0;#1;0:33:set;%priv;11:12:ident;@53;#1;16:25:atm;16:17:qname;?0;16:17:ident;@61;%read;?1;23:24:ident;@6b;#1;27:32:qname;?0;27:32:ident;@4f74686572;#0;#0;",
   )
 }
 
