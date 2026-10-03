@@ -515,7 +515,7 @@ fn until_phase_two(shutdown: &Arc<Shutdown>) {
     }
     assert!(
         shutdown.stopped_accepting(),
-        "the phase machine never reached phase 2"
+        "the shutdown never reached its stop"
     );
 }
 
@@ -725,7 +725,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
     assert_eq!(
         net.stopped.load(Ordering::Acquire),
         1,
-        "phase 2 never told the socket table to stop"
+        "the stop never told the socket table to stop"
     );
 
     // The banner, printed after the entry point returned while the coordinator still dials.
