@@ -43,7 +43,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Jobs of corpus lanes, and jobs of nextest. Apart, so a lane never shares a runner with
-# nextest's threads, and nextest, which needs only the archive, starts before `build-ply` ends.
+# nextest's threads.
 PARTITIONS=8
 NEXTEST_SHARDS=2
 
