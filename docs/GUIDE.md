@@ -1506,7 +1506,9 @@ implicitly (`normalize_path` is explicit).
 `Decimal`; objects are maps, so key order is canonical. A codec is
 `JsonCodec<a> = {encode: (a) -> Json, decode: (Json) -> Result<a, DecodeError>}`.
 Codecs: `int_json`, `string_json`, `bool_json`, `decimal_json`, `float_json`,
-`bytes_json`, `unit_json`, `json_json`, and combinators `list_json`,
+`bytes_json`, `unit_json`, `json_json`, `char_json` (a string of one
+character), `instant_json` and `duration_json` (nanoseconds), and combinators
+`list_json`,
 `option_json`, `result_json`, `map_json`, `string_map_json`. Entry points:
 `decode_bytes`, `decode_string`, `encode_bytes`, `encode_string`, `parse`,
 `parse_string`, `to_bytes`, `to_string`. `error_to_string` gives
@@ -2728,8 +2730,9 @@ A compact encoding for bytes both ends read with the same type, which is what
 order and a variant is its constructor's index, then its fields. `Int`, counts,
 lengths and the 16- to 128-bit widths are varints (signed ones zigzagged);
 `U8`/`I8` are one byte, `Float` its eight IEEE bytes (a `NaN` keeps its
-payload), `Decimal` its text, and `Unit` one zero byte, so every value takes at
-least a byte. `put` appends a value to the bytes it is given and `take` reads one
+payload), `Decimal` its text, `Char` its scalar value and `Instant` and
+`Duration` their nanoseconds as varints, and `Unit` one zero byte, so every value
+takes at least a byte. `put` appends a value to the bytes it is given and `take` reads one
 at an offset. `decode` refuses bytes that end inside the value, bytes left over,
 and anything no value writes: a constructor index past the type's, a count past
 the bytes left, a map's keys out of order, an overlong varint, text that is not
@@ -2741,8 +2744,9 @@ by it. A recursive type finishes: a reference back into a sum being digested is
 named rather than entered.
 
 Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
-`string_bin`, `bytes_bin`, `u8_bin` … `u128_bin`, `i8_bin` … `i128_bin`,
-`ordering_bin`, `rounding_bin`, and combinators `list_bin`, `option_bin`,
+`string_bin`, `bytes_bin`, `char_bin`, `u8_bin` … `u128_bin`, `i8_bin` …
+`i128_bin`, `instant_bin`, `duration_bin`, `ordering_bin`, `rounding_bin`, and
+combinators `list_bin`, `option_bin`,
 `result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*` and `take_*` are
 public too.
 
