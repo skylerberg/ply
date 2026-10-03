@@ -1,7 +1,7 @@
 use crate::fixture::Compiled;
 use ply_eval::rc;
 
-fn passes(source: &str, test: &str) -> rc::Stats {
+fn passes(source: &str, test: &str) -> rc::RcStats {
     let compiled = Compiled::new(source);
     let index = compiled.index_of(test);
     let before = rc::stats();
@@ -9,7 +9,7 @@ fn passes(source: &str, test: &str) -> rc::Stats {
         panic!("{test:?} must pass: {d:#?}");
     }
     let after = rc::stats();
-    rc::Stats {
+    rc::RcStats {
         updates: after.updates - before.updates,
         updates_in_place: after.updates_in_place - before.updates_in_place,
         ..after

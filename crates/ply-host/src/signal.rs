@@ -34,24 +34,24 @@ const WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 const WAKE_BUDGET: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Signal {
+pub enum ShutdownSignal {
     Interrupt,
     Terminate,
 }
 
-impl Signal {
+impl ShutdownSignal {
     pub fn name(self) -> &'static str {
         match self {
-            Signal::Interrupt => "INT",
-            Signal::Terminate => "TERM",
+            ShutdownSignal::Interrupt => "INT",
+            ShutdownSignal::Terminate => "TERM",
         }
     }
 
     /// What a second signal exits with: `128 + n`, as if the signal had not been caught.
     pub fn exit_code(self) -> i32 {
         match self {
-            Signal::Interrupt => 130,
-            Signal::Terminate => 143,
+            ShutdownSignal::Interrupt => 130,
+            ShutdownSignal::Terminate => 143,
         }
     }
 }
@@ -87,7 +87,7 @@ pub trait Accepting: Send + Sync {
 
 #[derive(Default)]
 struct State {
-    signal: Option<Signal>,
+    signal: Option<ShutdownSignal>,
     at: Option<Instant>,
     deadline: Option<Instant>,
     listeners_closed: usize,
@@ -105,7 +105,7 @@ pub struct Shutdown {
     state: Mutex<State>,
     /// Signalled on the request and each phase end, so an idle park wakes before its bound.
     woke: Condvar,
-    signals: Vec<Signal>,
+    signals: Vec<ShutdownSignal>,
     net: Mutex<Option<Arc<dyn Accepting>>>,
     /// Weak, so the children still go when their host does.
     children: Mutex<Option<Weak<Children>>>,
@@ -130,7 +130,7 @@ impl Shutdown {
         self.bounds
     }
 
-    pub fn signals(&self) -> &[Signal] {
+    pub fn signals(&self) -> &[ShutdownSignal] {
         &self.signals
     }
 
@@ -201,7 +201,7 @@ impl Shutdown {
         lock(&self.state).at.map(|at| at.elapsed())
     }
 
-    pub fn signal(&self) -> Option<Signal> {
+    pub fn signal(&self) -> Option<ShutdownSignal> {
         lock(&self.state).signal
     }
 
@@ -218,7 +218,7 @@ impl Shutdown {
     }
 
     /// Request a stop; `false` when one was already requested.
-    pub fn request(self: &Arc<Shutdown>, signal: Signal) -> bool {
+    pub fn request(self: &Arc<Shutdown>, signal: ShutdownSignal) -> bool {
         if self.requested.swap(true, Ordering::AcqRel) {
             self.second.store(true, Ordering::Release);
             self.woke.notify_all();
@@ -289,12 +289,12 @@ fn wake_parked_accepts(net: &dyn Accepting) {
 }
 
 #[cfg(unix)]
-fn signals_of_this_platform() -> Vec<Signal> {
-    vec![Signal::Interrupt, Signal::Terminate]
+fn signals_of_this_platform() -> Vec<ShutdownSignal> {
+    vec![ShutdownSignal::Interrupt, ShutdownSignal::Terminate]
 }
 
 #[cfg(not(unix))]
-fn signals_of_this_platform() -> Vec<Signal> {
+fn signals_of_this_platform() -> Vec<ShutdownSignal> {
     vec![Signal::Interrupt]
 }
 
@@ -317,7 +317,7 @@ pub fn listen(shutdown: &Arc<Shutdown>) -> Result<(), Diagnostic> {
 }
 
 /// One thread and one current-thread `tokio` runtime per signal.
-fn deliver(shutdown: Arc<Shutdown>, which: Signal) {
+fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -329,8 +329,8 @@ fn deliver(shutdown: Arc<Shutdown>, which: Signal) {
         {
             use tokio::signal::unix::{SignalKind, signal};
             let kind = match which {
-                Signal::Interrupt => SignalKind::interrupt(),
-                Signal::Terminate => SignalKind::terminate(),
+                ShutdownSignal::Interrupt => SignalKind::interrupt(),
+                ShutdownSignal::Terminate => SignalKind::terminate(),
             };
             let Ok(mut stream) = signal(kind) else {
                 return;
@@ -358,7 +358,7 @@ fn deliver(shutdown: Arc<Shutdown>, which: Signal) {
     });
 }
 
-fn exit_now(shutdown: &Arc<Shutdown>, which: Signal) -> ! {
+fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
     let connections = lock(&shutdown.net)
         .as_ref()
         .map_or(0, |net| net.connections_in_flight());

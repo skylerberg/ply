@@ -172,7 +172,7 @@ pub fn registry_over(trace: Arc<trace::Trace>) -> HostRegistry {
         .stopping_on(Shutdown::new(signal::Bounds::default()))
         .with_process(process::ProcessHost::new(
             Vec::new(),
-            process::Sink::Real {
+            process::OutputSink::Real {
                 out: process::Stream::Out,
             },
         ))
