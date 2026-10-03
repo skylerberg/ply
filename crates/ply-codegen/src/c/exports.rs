@@ -1,7 +1,7 @@
 //! What a compiled unit says about itself, embedded in its C so loading reads no source. Helpers
 //! bind by position, so a unit serves while the runtime's helper table starts with the unit's.
 
-use super::cache::{count, decode_tables, encode_tables, line};
+use super::encoding::{count, decode_tables, encode_tables, line};
 use super::load::Library;
 use super::prelude::HELPERS;
 use super::tables::Defined;

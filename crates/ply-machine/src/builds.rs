@@ -1,13 +1,12 @@
-//! The builder this binary makes the programs it ships with: the compiler's own `build.main`, a
+//! The builder this binary carries, and what it builds: the compiler's own `build.main`, a
 //! runnable like any other. It is the committed one when that was built for this binary's shelf
 //! and runtime, else the one an earlier process staged, else one the committed builder builds now
-//! from the shelf's compiler. A checkout with no builder committed yet builds its first one with
-//! the compiler this binary carries as a library.
+//! from the shelf's compiler.
 
-use ply_codegen::c::{bundle, producer, sweep};
-use ply_eval::{Diagnostic, Span, Value, codes};
-use ply_machine::enter::{self, Binds};
-use ply_machine::runnable::{self, Runnable};
+use crate::enter::{self, Binds};
+use crate::runnable::{self, Runnable};
+use ply_codegen::c::{stage, sweep};
+use ply_eval::{Diagnostic, Span, codes};
 use std::path::{Path, PathBuf};
 
 /// Where the compiler's package sits in a stage laid out from the shelf, as `ply bootstrap` reads
@@ -21,6 +20,76 @@ const RUNNABLE: &str = "builder.run";
 /// The front end and emitter recurse once per node on the native stack.
 const STACK: usize = 256 << 20;
 
+/// What the builder is asked for: a program to ship, refused when it does not check or compile,
+/// or whatever the front end and the emitter made of it.
+#[derive(Clone, Copy)]
+enum Asked {
+    Ship,
+    Answer,
+}
+
+/// What a set of modules is, as `(path, text)` pairs in any order.
+pub fn digest_of(modules: &[(String, String)]) -> String {
+    let mut sorted: Vec<&(String, String)> = modules.iter().collect();
+    sorted.sort();
+    let mut h = blake3::Hasher::new();
+    for (name, text) in sorted {
+        h.update(name.as_bytes());
+        h.update(&[0]);
+        h.update(text.as_bytes());
+        h.update(&[0]);
+    }
+    h.finalize().to_hex()[..16].to_string()
+}
+
+/// The emitter's program: the compiler's modules and the shipped modules they import, transitively,
+/// read off their import lines, since its identity is needed before any compiler runs.
+pub fn emitter_program() -> Vec<(String, String)> {
+    let mut program: Vec<(String, String)> = ply_compiler::sources()
+        .map(|(m, t)| (m.to_string(), t.to_string()))
+        .collect();
+    let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: Vec<String> = program
+        .iter()
+        .flat_map(|(_, text)| imports_of(text))
+        .collect();
+    while let Some(name) = frontier.pop() {
+        if let Some(text) = ply_std::source(&name)
+            && wanted.insert(name)
+        {
+            frontier.extend(imports_of(text));
+        }
+    }
+    program.extend(
+        ply_std::sources()
+            .filter(|(name, _)| wanted.contains(*name))
+            .map(|(name, text)| (name.to_string(), text.to_string())),
+    );
+    program
+}
+
+/// What the emitter is a function of, so a shipped module the compiler never reads moves nothing
+/// kept under it.
+pub fn emitter() -> String {
+    static EMITTER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EMITTER
+        .get_or_init(|| digest_of(&emitter_program()))
+        .clone()
+}
+
+/// The module each `import` line of `text` opens with.
+fn imports_of(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("import "))
+        .map(|rest| {
+            rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect()
+}
+
 /// What a builder is a function of: the shelf it is built from, the compiler among it, and the
 /// runtime its unit is compiled against.
 pub fn identity() -> String {
@@ -29,7 +98,7 @@ pub fn identity() -> String {
         .get_or_init(|| {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"ply builder 1\0");
-            hasher.update(producer::digest_of(ply_machine::shelf::sources()).as_bytes());
+            hasher.update(digest_of(crate::shelf::sources()).as_bytes());
             hasher.update(&[0]);
             hasher.update(ply_codegen::c::runtime_digest().as_bytes());
             hasher.finalize().to_hex()[..16].to_string()
@@ -38,39 +107,49 @@ pub fn identity() -> String {
 }
 
 fn stage() -> PathBuf {
-    bundle::stage_dir(&format!("builder-{}", identity()))
+    stage::stage_dir(&format!("builder-{}", identity()))
 }
 
 /// Where the rows a build of `program` published are kept: under the builder that published them,
 /// since another compiler's rows seed nothing.
 fn rows(program: &str) -> PathBuf {
-    bundle::stage_dir(&format!("rows-{}", identity())).join(program)
+    stage::stage_dir(&format!("rows-{}", identity())).join(program)
 }
 
-/// The builder: committed, staged, or built now and staged.
+/// The builder: committed, staged, or built now by the committed one and staged.
 pub fn builder() -> Result<Runnable, Diagnostic> {
-    let committed = ply_compiler::bootstrap::BUILDER;
-    if !committed.is_empty()
-        && ply_compiler::bootstrap::BUILDER_DIGEST.trim() == identity()
-        && let Ok(builder) = runnable::decode(committed)
-    {
-        return Ok(builder);
-    }
+    let current = ply_compiler::bootstrap::BUILDER_DIGEST.trim() == identity();
     let staged = stage().join(RUNNABLE);
-    if let Ok(bytes) = std::fs::read(&staged)
+    if !current
+        && let Ok(bytes) = std::fs::read(&staged)
         && let Ok(builder) = runnable::decode(&bytes)
     {
         sweep::used(&stage());
         return Ok(builder);
     }
+    let committed = runnable::decode(ply_compiler::bootstrap::BUILDER).map_err(|why| {
+        unbuilt(format!(
+            "the committed builder does not read: {why}; a field the runtime requires of a front \
+             end's answer lands after main's builder writes it"
+        ))
+    })?;
+    if current {
+        return Ok(committed);
+    }
     let src = laid_out()?;
     let fresh = staged.with_extension(format!("run.{}", std::process::id()));
-    match runnable::decode(committed) {
-        // Behind the shelf: its emitter is not the one a kept answer would be filed under, so it
-        // keeps none.
-        Ok(behind) => build_with(behind, &src, ROOT, ENTRY, &fresh, None, false)?,
-        Err(_) => first(&src, &fresh)?,
-    }
+    // Behind the shelf: its emitter is not the one a kept answer would be filed under, so it keeps
+    // none.
+    build_with(
+        committed,
+        &src,
+        ROOT,
+        ENTRY,
+        &fresh,
+        None,
+        false,
+        Asked::Ship,
+    )?;
     landed(&fresh, &staged)
 }
 
@@ -95,6 +174,7 @@ pub fn build(
         &fresh,
         Some(&rows(rows_of)),
         true,
+        Asked::Ship,
     )?;
     let built = started.elapsed();
     landed(&fresh, out)?;
@@ -107,6 +187,65 @@ pub fn build(
         );
     }
     Ok(())
+}
+
+/// What the front end and the emitter make of `files`, one package of `(path, text)` held in
+/// memory: the runnable the builder writes of it, a refusal's diagnostics and no unit included.
+/// Kept under the stage by what it is a function of, so a second asking reads it back.
+pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ply answered 1\0");
+    hasher.update(identity().as_bytes());
+    for (path, text) in files {
+        hasher.update(&[0]);
+        hasher.update(path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(text.as_bytes());
+    }
+    let key = hasher.finalize().to_hex()[..32].to_string();
+    let at = stage::stage_dir(sweep::ANSWERED).join(format!("{key}.run"));
+    if let Ok(bytes) = std::fs::read(&at)
+        && runnable::decode(&bytes).is_ok()
+    {
+        sweep::used(&at);
+        return Ok(bytes);
+    }
+    let src = stage::stage_dir(sweep::ANSWERED).join(format!("{key}.src.{}", std::process::id()));
+    let written = files.iter().try_for_each(|(path, text)| {
+        let file = src.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(file, text)
+    });
+    written.map_err(|e| {
+        unbuilt(format!(
+            "the sources could not be placed in `{}`: {e}",
+            src.display()
+        ))
+    })?;
+    let fresh = at.with_extension(format!("run.{}", std::process::id()));
+    let built = build_with(builder()?, &src, ".", "", &fresh, None, true, Asked::Answer);
+    let _ = std::fs::remove_dir_all(&src);
+    built?;
+    landed(&fresh, &at)?;
+    std::fs::read(&at).map_err(|e| unbuilt(format!("`{}` could not be read: {e}", at.display())))
+}
+
+/// The shipped operations `front` declares: a builder behind this binary's shelf was built before
+/// any added since, and is lent only those it names.
+fn lent_to(front: &ply_eval::Analysis) -> Vec<crate::hosts::Lent> {
+    let declared: std::collections::HashSet<&str> = front
+        .check
+        .effects
+        .values()
+        .filter(|effect| effect.name.as_str().rsplit('.').next() == Some("shipped"))
+        .flat_map(|effect| effect.ops.keys().map(|op| op.as_str()))
+        .collect();
+    crate::shipped::lent()
+        .into_iter()
+        .filter(|(op, _)| declared.contains(op.op.as_str()))
+        .collect()
 }
 
 /// `fresh` renamed into place at `at` and read back: another process that landed one first wins,
@@ -153,6 +292,7 @@ fn laid_out() -> Result<PathBuf, Diagnostic> {
 /// The program below `root` of `src` built by `builder` into `out`: the builder entered on a thread
 /// of its own, with the sources, the stages and the emitter's kept answers as the roots it reads
 /// and writes.
+#[allow(clippy::too_many_arguments)]
 fn build_with(
     builder: Runnable,
     src: &Path,
@@ -161,8 +301,9 @@ fn build_with(
     out: &Path,
     rows: Option<&Path>,
     kept: bool,
+    asked: Asked,
 ) -> Result<(), Diagnostic> {
-    let stages = bundle::stage_root();
+    let stages = stage::stage_root();
     let below = |path: &Path| -> Result<String, Diagnostic> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -190,7 +331,13 @@ fn build_with(
         }
         .to_string(),
     ];
+    let argv = match asked {
+        // A builder behind the shelf is only ever asked to ship, in the words it was built to read.
+        Asked::Ship => argv,
+        Asked::Answer => [argv, vec!["answer".to_string()]].concat(),
+    };
     let opened = enter::opened_runnable(builder, Path::new(ROOT))?;
+    let lent = lent_to(&opened.opened.front);
     let root_named = |name: &str, path: PathBuf| ply_host::fs::RootSpec {
         name: name.to_string(),
         path,
@@ -201,7 +348,7 @@ fn build_with(
             root_named("out", stages),
             root_named("bodies", bodies),
         ],
-        lent: ply_machine::shipped::lent(),
+        lent,
         ..Binds::default()
     };
     let entered = std::thread::Builder::new()
@@ -220,63 +367,6 @@ fn build_with(
             "the builder could not be started on a thread of its own: {e}"
         ))),
     }
-}
-
-/// The first builder of a checkout that commits none: its front end and unit made by the compiler
-/// this binary carries as a library, and written as the runnable a committed builder would be.
-fn first(src: &Path, out: &Path) -> Result<(), Diagnostic> {
-    let seeded = ply_machine::load::load_seeded(&src.join(ROOT), producer::KnownRows::default())
-        .map_err(|err| match err.diagnostics.first() {
-            Some(d) => unbuilt(format!(
-                "it does not check:\n{}",
-                d.clone().placed(&err.sources)
-            )),
-            None => unbuilt("it does not check, and nothing said why".to_string()),
-        })?;
-    let kept = seeded
-        .front
-        .ok_or_else(|| unbuilt("its front end's answer does not encode".to_string()))?;
-    let answer = ply_eval::codec::decode(&kept).map_err(unbuilt)?;
-    let at = ply_eval::decode::At::new("a kept front", &answer);
-    let files = at
-        .field("files")
-        .and_then(|files| {
-            files.items(|file| {
-                Ok(ply_machine::payload::record(vec![
-                    ("path", Value::str(file.field("path")?.str()?)),
-                    ("name", Value::str(file.field("name")?.str()?)),
-                    ("text", Value::bytes(file.field("text")?.str()?.as_bytes())),
-                ]))
-            })
-        })
-        .map_err(|e| unbuilt(format!("its front end's answer does not read: {e}")))?;
-    let dump = at
-        .field("dump")
-        .map_err(|e| unbuilt(format!("its front end's answer does not read: {e}")))?
-        .value();
-    producer::ensure_default();
-    let loaded = &seeded.loaded;
-    let produced = ply_codegen::Unit::over_front(
-        &loaded.front,
-        ply_machine::support::module_texts(&loaded.check, &loaded.sources),
-    )
-    .and_then(|unit| {
-        let names: Vec<&str> = unit.compiled().iter().map(String::as_str).collect();
-        unit.produce(&names)
-    })
-    .map_err(|e| unbuilt(format!("its unit could not be produced: {e:#}")))?;
-    let bytes = runnable::encode(ENTRY, &Value::list(files), dump, produced.text.as_bytes())
-        .map_err(unbuilt)?;
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| unbuilt(format!("`{}` could not be made: {e}", parent.display())))?;
-    }
-    ply_eval::files::write_atomically(out, &bytes).map_err(|e| {
-        unbuilt(format!(
-            "it could not be written to `{}`: {e}",
-            out.display()
-        ))
-    })
 }
 
 #[cold]

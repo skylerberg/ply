@@ -1,6 +1,6 @@
 use ply_eval::{
     Bound, CheckOutput, Diagnostic, EffectAtom, HostAnswer, HostBinding, HostRequest, HostRuntime,
-    Linearity, Mode, Pending, Resource, SourceId, Span, Symbol, Value, codes,
+    Linearity, Mode, Pending, Resource, Span, Symbol, Value, codes,
 };
 use ply_host::tcp::*;
 use std::io::{Read, Write};
@@ -34,20 +34,23 @@ fn int_or_zero(answer: Option<Int>) -> Int =
   match answer { Some(n) -> n, None -> 0 }
 "#;
 
-/// Under its shipped name: anonymously it declares `net`, not `std.net.net`, and cannot bind.
+/// The driver over the shipped `std.net`: only its declaration binds the shipped handlers, and a
+/// program reaches it by importing it.
 fn fixture() -> String {
-    format!("{DECLARATION}{DRIVER}")
+    format!("import std.net (net)\n{DRIVER}")
 }
 
 fn check(source: &str) -> CheckOutput {
-    ply_codegen::c::producer::checked_analysis(
-        &[(MODULE.to_string(), source.to_string())],
-        &[SourceId(0)],
-    )
-    .expect("the declaration typechecks")
-    .check
+    crate::support::answered::checked("app", source).check
 }
 
+/// The shipped declaration as the binder reads it, which a test may change as no source can.
+fn declared(check: &mut CheckOutput) -> &mut ply_eval::EffectInfo {
+    check
+        .effects
+        .get_mut(&Symbol::new(EFFECT))
+        .expect("the program declares `std.net.net`")
+}
 fn bind(net: Arc<dyn Net>) -> HostBinding {
     registry(net)
         .bind(&check(&fixture()))
@@ -231,9 +234,10 @@ fn only_reading_a_port_is_repeatable() {
 
 #[test]
 fn a_declaration_without_nondet_refuses_the_handler() {
-    let weakened = fixture().replacen("nondet effect net", "effect net", 1);
+    let mut weakened = check(&fixture());
+    declared(&mut weakened).nondet = false;
     let diagnostics = registry(Arc::new(TcpHost::new()))
-        .bind(&check(&weakened))
+        .bind(&weakened)
         .expect_err("a socket cannot sit behind an effect that is not `nondet`");
     assert!(
         diagnostics
@@ -245,10 +249,16 @@ fn a_declaration_without_nondet_refuses_the_handler() {
 }
 
 #[test]
-fn an_operation_renamed_in_the_source_is_refused_at_bind_time() {
-    let renamed = fixture().replace("recv", "read_bytes");
+fn an_operation_renamed_in_the_declaration_is_refused_at_bind_time() {
+    let mut renamed = check(&fixture());
+    let net = declared(&mut renamed);
+    let recv = net
+        .ops
+        .shift_remove(&Symbol::new("recv"))
+        .expect("`net.recv` is declared");
+    net.ops.insert(Symbol::new("read_bytes"), recv);
     let diagnostics = registry(Arc::new(TcpHost::new()))
-        .bind(&check(&renamed))
+        .bind(&renamed)
         .expect_err("`net.recv` is no longer declared");
     assert!(
         diagnostics
@@ -1002,7 +1012,7 @@ fn unwrap_int(answer: Option<Int>) -> Int =
 "#;
 
 fn tls_fixture() -> String {
-    format!("{DECLARATION}{TLS_DRIVER}")
+    format!("import std.net (net)\n{TLS_DRIVER}")
 }
 
 fn bind_tls(net: Arc<dyn Net>) -> HostBinding {

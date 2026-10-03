@@ -1,22 +1,8 @@
-//! A program a running program loads embeds as `ply`'s own load does: each path read beside the
-//! module that asks, written into it as a literal, and handed to the compiled tier with the answer.
+//! A program the builder makes embeds as `ply`'s own load does: each path read beside the module
+//! that asks, written into it as a literal, and handed to the compiled tier with the answer.
 
-use crate::fixture::{scratch, write};
-use ply_machine::load::{Loaded, load};
+use crate::fixture::{backend, loaded, scratch, write};
 use ply_machine::testrun::{self, Executor, Hosting};
-use std::collections::HashMap;
-
-fn texts(loaded: &Loaded) -> HashMap<String, String> {
-    loaded
-        .check
-        .modules
-        .values()
-        .filter_map(|m| {
-            let file = loaded.sources.get(m.source)?;
-            Some((m.name.to_string(), file.text.to_string()))
-        })
-        .collect()
-}
 
 #[test]
 fn a_program_loaded_from_nothing_runs_what_it_embedded() {
@@ -37,14 +23,11 @@ fn a_program_loaded_from_nothing_runs_what_it_embedded() {
     write(dir.path(), "sub/files/deeper/c.txt", "C");
     write(dir.path(), "sub/files/.cache/d.txt", "not read");
     write(dir.path(), "sub/files/.hidden", "not read");
-    let loaded =
-        load(dir.path()).unwrap_or_else(|e| panic!("the program loads: {:?}", e.diagnostics));
-    let unit = ply_codegen::Unit::over_front(&loaded.front, texts(&loaded))
-        .expect("this host has a C compiler");
+    let loaded = loaded(dir.path());
     let executor = Executor {
         front: &loaded.front,
         hosting: Hosting::default(),
-        provider: unit,
+        provider: backend(&loaded),
     };
     let ran = testrun::executed(&executor, 0);
     assert!(ran.failure.is_none(), "the test passes: {:?}", ran.failure);
@@ -58,10 +41,7 @@ fn an_embed_nothing_can_be_read_for_refuses_the_load() {
         "m.ply",
         "fn gone() -> Bytes = embed(\"missing.txt\")\n",
     );
-    let refused = match load(dir.path()) {
-        Ok(_) => panic!("a missing file cannot be embedded"),
-        Err(e) => e.diagnostics,
-    };
+    let refused = crate::fixture::refusal(dir.path());
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0].code, "E0146");
     assert_eq!(refused[0].message, "`missing.txt` could not be embedded");

@@ -44,7 +44,7 @@ pub fn once() {
             .name("ply-cache-sweep".to_string())
             .spawn(move || {
                 sweep(&root, budget);
-                sweep_stages(&super::bundle::stage_root(), budget, SystemTime::now());
+                sweep_stages(&super::stage::stage_root(), budget, SystemTime::now());
             })
             .ok();
     });
@@ -126,15 +126,16 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
 /// Where a stage records its last use, since a directory's own time moves only when it is written.
 pub const USED: &str = ".used";
 
-/// The stage-directory entry holding one file per opened artifact, each swept on its own.
-pub const FRONTS: &str = "artifact-fronts";
+/// The stage-directory entry holding one runnable per program the builder answered for in memory,
+/// each swept on its own.
+pub const ANSWERED: &str = "answered";
 
 /// The stage-directory entry holding one file per closure `ply run` loaded, each swept on its own.
 pub const RUNS: &str = "run-fronts";
 
 /// The stage-directory entries that hold files swept one by one, where any other is a stage swept
 /// whole.
-const BY_FILE: [&str; 2] = [FRONTS, RUNS];
+const BY_FILE: [&str; 2] = [ANSWERED, RUNS];
 
 /// An entry used within this long is never swept: a run may still be reading it.
 const RECENT: Duration = Duration::from_secs(3600);

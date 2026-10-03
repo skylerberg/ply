@@ -8,7 +8,7 @@
 import compiler.load (LoadedAnalysis)
 import args (Flags, from_argv, kept, style_of)
 import units (emit)
-import appends (broken_promises)
+import appends (broken_promises, priced)
 import builder (builder)
 import env (env)
 import loads (shelf_stamps)
@@ -41,12 +41,12 @@ import mutants (Coverage, Judged, Mutants, Mutation, Queue, Survivor, built, cov
 import paths
 import program (Timed, front_of, is_shelved, is_shipped, modules_of, outside, timed_over,
                 timed_uncached_over, unmoved)
-import report (Answer, ind, ok_code, compile_error, count_of, plural, refused, warned_lines)
+import report (Answer, indent, ok_code, compile_error, count_of, plural, refused, warned_lines)
 import sources (Embed, load_resolved, shelf)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string)
 import style (Style, plain, bold, dim, green, red, yellow)
-import tester (tester, ledger, Executed, Fell, Filed, Hosted, Options, Use, use_both, use_none,
-               unit_over)
+import tester (tester, ledger, Executed, InterleavingFailure, Filed, Hosted, Options, Use, use_both,
+               use_none, unit_over)
 import trials (Bench, Evident, Tried, diagnosed, trial)
 import trials
 import walk
@@ -165,34 +165,35 @@ pub type Decided = {
   parallelism: Parallelism,
 }
 
-fn reason_of(d: Decided, index: Int) -> Reason =
-  match filter(d.reasons, |e: { index: Int, reason: Reason }| e.index == index) {
+fn reason_of(decided: Decided, index: Int) -> Reason =
+  match filter(decided.reasons, |e: { index: Int, reason: Reason }| e.index == index) {
     [] -> Cached,
     hits -> at(hits, 0, { index: index, reason: Cached }).reason,
   }
 
-fn runs_test(d: Decided, index: Int) -> Bool = contains_int(d.runs, index)
+fn runs_test(decided: Decided, index: Int) -> Bool = contains_int(decided.runs, index)
 
 fn contains_int(xs: List<Int>, x: Int) -> Bool =
   fold(xs, false, |found: Bool, y: Int| found || y == x)
 
 // The same over the tests this run reports on, which `--filter` may have narrowed.
-fn selected_count(p: Program, d: Decided) -> Int =
-  len(filter(p.cases, |c: Case| contains_int(d.runs, c.index)))
+fn selected_count(program: Program, decided: Decided) -> Int =
+  len(filter(program.cases, |case: Case| contains_int(decided.runs, case.index)))
 
-fn cached_count(p: Program, d: Decided) -> Int = len(p.cases) - selected_count(p, d)
+fn cached_count(program: Program, decided: Decided) -> Int =
+  len(program.cases) - selected_count(program, decided)
 
 // What the program decided about the conflict graph: the classes it coloured, the summary over
 // them, and which class each test landed in — which is only the tests that run, since a class is
 // what a test *shares a worker* with.
-fn group_of(d: Decided, index: Int) -> Option<Int> =
-  match filter(d.at, |e: { index: Int, group: Int }| e.index == index) {
+fn group_of(decided: Decided, index: Int) -> Option<Int> =
+  match filter(decided.at, |e: { index: Int, group: Int }| e.index == index) {
     [] -> None,
     hits -> Some(at(hits, 0, { index: index, group: 0 }).group),
   }
 
-fn owed_of(d: Decided, index: Int) -> Int =
-  match filter(d.owed, |e: { index: Int, owed: Int }| e.index == index) {
+fn owed_of(decided: Decided, index: Int) -> Int =
+  match filter(decided.owed, |e: { index: Int, owed: Int }| e.index == index) {
     [] -> 0,
     hits -> at(hits, 0, { index: index, owed: 0 }).owed,
   }
@@ -210,52 +211,60 @@ fn group_of_class(w: Analysis, class: List<Int>) -> Group =
   }
 
 // The footprint's atoms, unprinted.
-fn atoms_of(c: Case) -> List<Atom> = map(c.atoms, |x: Printed| x.atom)
+fn atoms_of(case: Case) -> List<Atom> = map(case.atoms, |printed: Printed| printed.atom)
 
 // The atoms another test could contend over, printed.
-fn shared_texts(c: Case) -> List<String> =
-  map(filter(c.atoms, |x: Printed| len(shared([x.atom])) > 0), |x: Printed| x.text)
+fn shared_texts(case: Case) -> List<String> =
+  map(filter(case.atoms, |printed: Printed| len(shared([printed.atom])) > 0), |printed: Printed|
+    printed.text)
 
 // The shared footprint, as the printer spells a footprint.
-fn shared_of(c: Case) -> String = "{" ++ joined(shared_texts(c), ", ") ++ "}"
+fn shared_of(case: Case) -> String = "{" ++ joined(shared_texts(case), ", ") ++ "}"
 
 // Families this binary answers from what it ships rather than from what it is asked: the same on
 // every run of one build, and in no pass key, which is the test's hash under the runtime stamp.
 fn binary_families() -> List<String> = ["shipped"]
 
 // The atoms of a test's footprint whose answers no pass key covers, printed.
-fn unkeyed_texts(c: Case) -> List<String> =
-  map(filter(c.atoms, |x: Printed| said(binary_families(), x.atom.effect)), |x: Printed| x.text)
+fn unkeyed_texts(case: Case) -> List<String> =
+  map(
+    filter(case.atoms, |printed: Printed| said(binary_families(), printed.atom.effect)),
+    |printed: Printed| printed.text,
+  )
 
 /// The classes the named tests share, coloured from the atoms each row carries.
-fn classes_of(p: Program, runs: List<Int>) -> List<List<Int>> =
+fn classes_of(program: Program, runs: List<Int>) -> List<List<Int>> =
   group_by_conflict(
-    map(filter(p.cases, |c: Case| contains_int(runs, c.index)), |c: Case|
-      { index: c.index, contends: shared(atoms_of(c)) }),
+    map(filter(program.cases, |case: Case| contains_int(runs, case.index)), |case: Case|
+      { index: case.index, contends: shared(atoms_of(case)) }),
   )
 
 // The classes over every test the run reports on, when a pass will re-run any of them: only a
 // mutation does, so a run without one colours nothing it will not use.
-fn every_of(p: Program, options: Options) -> List<List<Int>> =
-  match options.mutate { None -> [], Some(_) -> classes_of(p, map(p.cases, |c: Case| c.index)) }
+fn every_of(program: Program, options: Options) -> List<List<Int>> =
+  match options.mutate {
+    None -> [],
+    Some(_) -> classes_of(program, map(program.cases, |case: Case| case.index)),
+  }
 
 // What the binding reaching some tests makes of each test the run reports on.
-fn reported(r: Ran, c: Case) -> { atoms: List<Atom>, host: Bool } =
-  { atoms: atoms_of(c), host: covers(r.reaches, c.index) }
+fn reported(r: Ran, case: Case) -> { atoms: List<Atom>, host: Bool } =
+  { atoms: atoms_of(case), host: covers(r.reaches, case.index) }
 
-fn counts_of(p: Program, r: Ran) -> Counts = counts(map(p.cases, |c: Case| reported(r, c)))
+fn counts_of(program: Program, r: Ran) -> Counts =
+  counts(map(program.cases, |case: Case| reported(r, case)))
 
 /// The whole decision, as the report reads it: a reason per test, what each seeded one still owes,
 /// which tests run, and the classes they share.
 fn decided_of(
-  p: Program,
+  program: Program,
   decisions: List<Decision>,
   search: Search,
   sim: Json,
   groups: List<Group>,
   classes: List<List<Int>>,
 ) -> Decided = {
-  let runs = filter(to_run(decisions), |i: Int| case_of(p, i) != None);
+  let runs = filter(to_run(decisions), |i: Int| case_of(program, i) != None);
   {
     search: search,
     sim: sim,
@@ -271,9 +280,9 @@ fn decided_of(
     at: flattened(classes),
     classes: groups,
     parallelism: parallelism(
-      map(p.cases, |c: Case| shared(atoms_of(c))),
-      map(filter(p.cases, |c: Case| contains_int(runs, c.index)), |c: Case|
-        { index: c.index, contends: shared(atoms_of(c)) }),
+      map(program.cases, |case: Case| shared(atoms_of(case))),
+      map(filter(program.cases, |case: Case| contains_int(runs, case.index)), |case: Case|
+        { index: case.index, contends: shared(atoms_of(case)) }),
       classes,
     ),
   }
@@ -565,15 +574,15 @@ fn fixed(scaled: Int, digits: Int) -> String = {
   else { int_to_string(whole) ++ "." ++ zeroed(int_to_string(scaled - whole * unit), digits) }
 }
 
-fn ms1(us: Int) -> String = fixed((us + 50) / 100, 1)
+fn ms_tenths(us: Int) -> String = fixed((us + 50) / 100, 1)
 
-fn ms2(us: Int) -> String = fixed((us + 5) / 10, 2)
+fn ms_hundredths(us: Int) -> String = fixed((us + 5) / 10, 2)
 
-fn ms3(us: Int) -> String = fixed(us, 3)
+fn ms_thousandths(us: Int) -> String = fixed(us, 3)
 
-fn secs2(us: Int) -> String = fixed((us + 5000) / 10000, 2)
+fn secs_hundredths(us: Int) -> String = fixed((us + 5000) / 10000, 2)
 
-fn nanos_ms1(ns: Int) -> String = fixed((ns + 50000) / 100000, 1)
+fn ns_as_ms_tenths(ns: Int) -> String = fixed((ns + 50000) / 100000, 1)
 
 // Per mille is tenths of a percent, so one division answers both digits.
 fn share(part: Int, total: Int) -> String =
@@ -582,12 +591,13 @@ fn share(part: Int, total: Int) -> String =
 fn decimal(text: String) -> Decimal =
   match decimal_of_string(text) { Some(d) -> d, None -> decimal_of_int(0) }
 
-fn millis(us: Int) -> Json = Number(decimal(ms3(us)))
+fn millis(us: Int) -> Json = Number(decimal(ms_thousandths(us)))
 
 // --- Naming and placing -----------------------------------------------------
 
 // The label in a single-module run, `<module>.<label>` otherwise.
-fn display_of(p: Program, c: Case) -> String = if len(p.modules) > 1 { c.key } else { c.name }
+fn display_of(program: Program, case: Case) -> String =
+  if len(program.modules) > 1 { case.key } else { case.name }
 
 fn short_of(hash: Option<String>) -> String =
   match hash { Some(h) -> string_slice(h, 0, 12), None -> repeated("-", 12) }
@@ -604,23 +614,26 @@ fn located(places: List<Place>, a: At) -> Option<String> =
     }
   }
 
-fn dim_place(s: Style, places: List<Place>, a: Option<At>) -> String =
+fn dim_place(style: Style, places: List<Place>, a: Option<At>) -> String =
   match a {
     None -> "",
-    Some(spot) -> match located(places, spot) { Some(text) -> "   " ++ dim(s, text), None -> "" },
+    Some(spot) -> match located(places, spot) {
+      Some(text) -> "   " ++ dim(style, text),
+      None -> "",
+    },
   }
 
-fn primary_of(d: Diag) -> Option<Label> =
-  fold(d.labels, None, |acc: Option<Label>, l: Label|
-    match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } })
+fn primary_of(diag: Diag) -> Option<Label> =
+  fold(diag.labels, None, |acc: Option<Label>, label: Label|
+    match acc { Some(_) -> acc, None -> if label.primary { Some(label) } else { None } })
 
-fn label_at(l: Label) -> At = { module: l.module, start: l.start, end: l.end }
+fn label_at(label: Label) -> At = { module: label.module, start: label.start, end: label.end }
 
-fn location_json(places: List<Place>, d: Diag) -> Json =
-  match primary_of(d) { None -> Null, Some(l) -> place_json(places, label_at(l)) }
+fn location_json(places: List<Place>, diag: Diag) -> Json =
+  match primary_of(diag) { None -> Null, Some(l) -> place_json(places, label_at(l)) }
 
-fn one_diagnostic(d: Diag, places: List<Place>) -> Json =
-  match all_to_json([d], places) { Array(xs) -> at(xs, 0, Null), other -> other }
+fn one_diagnostic(diag: Diag, places: List<Place>) -> Json =
+  match all_to_json([diag], places) { Array(xs) -> at(xs, 0, Null), other -> other }
 
 // --- What the selection decided ---------------------------------------------
 
@@ -638,47 +651,53 @@ fn why(reason: String) -> String =
 
 // `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is
 // neither isolated nor cached.
-fn isolated_as(r: Ran, c: Case) -> String = isolation_word(isolation_of(reported(r, c)))
+fn isolated_as(r: Ran, case: Case) -> String = isolation_word(isolation_of(reported(r, case)))
 
 // --- The head ---------------------------------------------------------------
 
-fn selected_line(s: Style, p: Program, d: Decided) -> String =
-  ind() ++ bold(s, "selected") ++ " " ++ bold(s, int_to_string(selected_count(p, d))) ++ " of "
-    ++ int_to_string(len(p.cases))
+fn selected_line(style: Style, program: Program, decided: Decided) -> String =
+  indent() ++ bold(style, "selected") ++ " "
+    ++ bold(style, int_to_string(selected_count(program, decided)))
+    ++ " of "
+    ++ int_to_string(len(program.cases))
     ++ " ("
-    ++ int_to_string(cached_count(p, d))
+    ++ int_to_string(cached_count(program, decided))
     ++ " cached)"
 
-fn group_line(d: Decided, r: Ran) -> List<String> =
-  if len(d.classes) == 0 { [] }
-  else { [ind() ++ count_of(len(d.classes), "group") ++ " · " ++ count_of(r.workers, "worker")] }
+fn group_line(decided: Decided, r: Ran) -> List<String> =
+  if len(decided.classes) == 0 { [] } else {
+    [indent() ++ count_of(len(decided.classes), "group") ++ " · " ++ count_of(r.workers, "worker")]
+  }
 
-fn isolated_line(s: Style, c: Counts) -> List<String> =
+fn isolated_line(style: Style, c: Counts) -> List<String> =
   if c.total == 0 { [] } else {
     let contending = if c.shared == 0 { "" }
-    else { dim(s, " · " ++ count_of(c.shared, "test") ++ " can contend") };
+    else { dim(style, " · " ++ count_of(c.shared, "test") ++ " can contend") };
     [
-      ind() ++ bold(s, "isolated") ++ " " ++ bold(s, int_to_string(c.isolated)) ++ " of "
+      indent() ++ bold(style, "isolated") ++ " " ++ bold(style, int_to_string(c.isolated)) ++ " of "
         ++ int_to_string(c.total)
         ++ contending,
     ]
   }
 
-fn binding_lines(s: Style, r: Ran, c: Counts) -> List<String> =
+fn binding_lines(style: Style, r: Ran, c: Counts) -> List<String> =
   if r.hermetic { [] } else {
     let head = [
-      ind() ++ bold(s, "host") ++ " " ++ bold(s, int_to_string(c.host)) ++ " of "
+      indent() ++ bold(style, "host") ++ " " ++ bold(style, int_to_string(c.host)) ++ " of "
         ++ int_to_string(c.total)
         ++ " · "
-        ++ dim(s, "not cached"),
-      ind()
-        ++ dim(s, "binding host · " ++ count_of(r.operations, "operation") ++ " · " ++ r.digest),
+        ++ dim(style, "not cached"),
+      indent()
+        ++ dim(
+          style,
+          "binding host · " ++ count_of(r.operations, "operation") ++ " · " ++ r.digest,
+        ),
     ];
-    appended(head, map(r.handshakes, |line: String| ind() ++ dim(s, line)))
+    appended(head, map(r.handshakes, |line: String| indent() ++ dim(style, line)))
   }
 
 // `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`.
-fn simulation_line(s: Style, r: Ran) -> List<String> =
+fn simulation_line(style: Style, r: Ran) -> List<String> =
   if r.simulation.simulated == 0 { [] } else {
     let c = r.simulation;
     let head = "simulated: " ++ int_to_string(c.simulated) ++ " of " ++ int_to_string(c.total)
@@ -688,34 +707,34 @@ fn simulation_line(s: Style, r: Ran) -> List<String> =
     else { head ++ " · " ++ int_to_string(c.exhaustive) ++ " exhaustive" };
     let spent = if c.exhausted == 0 { thorough }
     else { thorough ++ " · " ++ int_to_string(c.exhausted) ++ " budget spent, not cached" };
-    [ind() ++ bold(s, spent)]
+    [indent() ++ bold(style, spent)]
   }
 
 // Apart from the entry counts: analysis is paid once, code generation per worker.
-fn compiled_line(s: Style, b: Backend) -> List<String> =
+fn compiled_line(style: Style, b: Backend) -> List<String> =
   match b.units {
     None -> [],
     Some(units) ->
       [
-        ind()
+        indent()
           ++ dim(
-            s,
+            style,
             "compiled " ++ int_to_string(units) ++ " unit(s) in "
-              ++ nanos_ms1(match b.codegen_nanos { Some(n) -> n, None -> 0 })
+              ++ ns_as_ms_tenths(match b.codegen_nanos { Some(n) -> n, None -> 0 })
               ++ "ms, after "
-              ++ nanos_ms1(match b.analysis_nanos { Some(n) -> n, None -> 0 })
+              ++ ns_as_ms_tenths(match b.analysis_nanos { Some(n) -> n, None -> 0 })
               ++ "ms deciding what to compile",
           ),
       ],
   }
 
-fn backend_lines(s: Style, r: Ran) -> List<String> =
+fn backend_lines(style: Style, r: Ran) -> List<String> =
   match r.backend {
     None -> [],
     Some(b) ->
       appended(
         [
-          ind() ++ bold(s, "backend") ++ " " ++ bold(s, b.name) ++ " · "
+          indent() ++ bold(style, "backend") ++ " " ++ bold(style, b.name) ++ " · "
             ++ int_to_string(b.entered)
             ++ " of "
             ++ int_to_string(b.offered)
@@ -725,35 +744,44 @@ fn backend_lines(s: Style, r: Ran) -> List<String> =
             ++ int_to_string(b.fragment)
             ++ " in the fragment",
         ],
-        compiled_line(s, b),
+        compiled_line(style, b),
       ),
   }
 
-fn bypass_lines(s: Style, flags: Flags) -> List<String> =
+fn bypass_lines(style: Style, flags: Flags) -> List<String> =
   if !flags.no_cache { [] }
-  else { [ind() ++ dim(s, "--no-cache: results were neither read nor recorded")] }
+  else { [indent() ++ dim(style, "--no-cache: results were neither read nor recorded")] }
 
-fn filtered_lines(s: Style, p: Program) -> List<String> =
-  if p.filtered_out == 0 { [] }
-  else { [ind() ++ dim(s, "--filter hid " ++ count_of(p.filtered_out, "test"))] }
+fn filtered_lines(style: Style, program: Program) -> List<String> =
+  if program.filtered_out == 0 { [] }
+  else { [indent() ++ dim(style, "--filter hid " ++ count_of(program.filtered_out, "test"))] }
 
-fn head_lines(s: Style, flags: Flags, p: Program, r: Ran, d: Decided) -> List<String> = {
-  let c = counts_of(p, r);
+fn head_lines(
+  style: Style,
+  flags: Flags,
+  program: Program,
+  r: Ran,
+  decided: Decided,
+) -> List<String> = {
+  let c = counts_of(program, r);
   appended(
     appended(
       appended(
         appended(
           appended(
-            appended(appended([selected_line(s, p, d)], group_line(d, r)), isolated_line(s, c)),
-            binding_lines(s, r, c),
+            appended(
+              appended([selected_line(style, program, decided)], group_line(decided, r)),
+              isolated_line(style, c),
+            ),
+            binding_lines(style, r, c),
           ),
-          simulation_line(s, r),
+          simulation_line(style, r),
         ),
-        backend_lines(s, r),
+        backend_lines(style, r),
       ),
-      bypass_lines(s, flags),
+      bypass_lines(style, flags),
     ),
-    filtered_lines(s, p),
+    filtered_lines(style, program),
   )
 }
 
@@ -766,34 +794,34 @@ fn ordered(rows: List<Phase>) -> List<Phase> =
   fold(rows, [], |acc: List<Phase>, p: Phase|
     appended(push(filter(acc, |q: Phase| q.us >= p.us), p), filter(acc, |q: Phase| q.us < p.us)))
 
-fn phase_rows(f: Phases) -> List<Phase> =
+fn phase_rows(phases: Phases) -> List<Phase> =
   ordered([
-    { label: "read", us: f.read_us },
-    { label: "front", us: f.front_us },
-    { label: "write back", us: f.write_back_us },
+    { label: "read", us: phases.read_us },
+    { label: "front", us: phases.front_us },
+    { label: "write back", us: phases.write_back_us },
   ])
 
-fn phase_total(f: Phases) -> Int = f.read_us + f.front_us + f.write_back_us
+fn phase_total(phases: Phases) -> Int = phases.read_us + phases.front_us + phases.write_back_us
 
-fn phase_line(s: Style, p: Phase, total: Int) -> String =
-  ind() ++ "  " ++ padded(p.label, 11) ++ " " ++ aligned(ms2(p.us), 8) ++ "ms "
-    ++ dim(s, share(p.us, total))
+fn phase_line(style: Style, phase: Phase, total: Int) -> String =
+  indent() ++ "  " ++ padded(phase.label, 11) ++ " " ++ aligned(ms_hundredths(phase.us), 8) ++ "ms "
+    ++ dim(style, share(phase.us, total))
 
-fn phase_lines(s: Style, f: Phases) -> List<String> = {
-  let total = phase_total(f);
+fn phase_lines(style: Style, phases: Phases) -> List<String> = {
+  let total = phase_total(phases);
   appended(
     appended(
-      ["", ind() ++ bold(s, "front-end time")],
-      map(phase_rows(f), |p: Phase| phase_line(s, p, total)),
+      ["", indent() ++ bold(style, "front-end time")],
+      map(phase_rows(phases), |phase: Phase| phase_line(style, phase, total)),
     ),
-    [ind() ++ "  " ++ padded("total", 11) ++ " " ++ aligned(ms2(total), 8) ++ "ms"],
+    [indent() ++ "  " ++ padded("total", 11) ++ " " ++ aligned(ms_hundredths(total), 8) ++ "ms"],
   )
 }
 
-fn run_rows(f: Phases, x: Spent) -> List<Phase> =
+fn run_rows(phases: Phases, x: Spent) -> List<Phase> =
   [
     { label: "before", us: x.before_us },
-    { label: "load", us: phase_total(f) },
+    { label: "load", us: phase_total(phases) },
     { label: "promises", us: x.promises_us },
     { label: "store", us: x.store_us },
     { label: "selection", us: x.selection_us },
@@ -804,141 +832,149 @@ fn run_rows(f: Phases, x: Spent) -> List<Phase> =
     { label: "conclude", us: x.conclude_us },
   ]
 
-fn run_total(f: Phases, x: Spent) -> Int = fold(run_rows(f, x), 0, |n: Int, p: Phase| n + p.us)
+fn run_total(phases: Phases, x: Spent) -> Int =
+  fold(run_rows(phases, x), 0, |n: Int, phase: Phase| n + phase.us)
 
-fn run_phase_lines(s: Style, f: Phases, x: Spent) -> List<String> = {
-  let total = run_total(f, x);
+fn run_phase_lines(style: Style, phases: Phases, x: Spent) -> List<String> = {
+  let total = run_total(phases, x);
   appended(
     appended(
-      ["", ind() ++ bold(s, "run time")],
-      map(ordered(run_rows(f, x)), |p: Phase| phase_line(s, p, total)),
+      ["", indent() ++ bold(style, "run time")],
+      map(ordered(run_rows(phases, x)), |phase: Phase| phase_line(style, phase, total)),
     ),
-    [ind() ++ "  " ++ padded("total", 11) ++ " " ++ aligned(ms2(total), 8) ++ "ms"],
+    [indent() ++ "  " ++ padded("total", 11) ++ " " ++ aligned(ms_hundredths(total), 8) ++ "ms"],
   )
 }
 
-fn run_phases_json(f: Phases, x: Spent) -> Json =
+fn run_phases_json(phases: Phases, x: Spent) -> Json =
   object(
-    push(map(run_rows(f, x), |p: Phase| { key: p.label, value: millis(p.us) }), {
+    push(map(run_rows(phases, x), |phase: Phase| { key: phase.label, value: millis(phase.us) }), {
       key: "total",
-      value: millis(run_total(f, x)),
+      value: millis(run_total(phases, x)),
     }),
   )
 
 // --- `--explain` ------------------------------------------------------------
 
-fn explain_atoms(iso: String, c: Case) -> String =
-  if iso == "region" { "" }
-  else if contends_only_over_regions(atoms_of(c)) { " " ++ shared_of(c) ++ " (region labels)" }
-  else { " " ++ shared_of(c) }
+fn explain_atoms(iso: String, case: Case) -> String =
+  if iso == "region" { "" } else if contends_only_over_regions(atoms_of(case)) {
+    " " ++ shared_of(case) ++ " (region labels)"
+  } else { " " ++ shared_of(case) }
 
-fn case_line(s: Style, p: Program, r: Ran, c: Case, d: Decided) -> String = {
-  let iso = isolated_as(r, c);
-  let reason = word(reason_of(d, c.index));
-  let verb = if runs_test(d, c.index) { bold(s, "run ") } else { dim(s, "skip") };
-  ind() ++ verb ++ " " ++ dim(s, short_of(c.hash)) ++ " " ++ padded(reason, 16) ++ " "
-    ++ padded(display_of(p, c), 40)
+fn case_line(style: Style, program: Program, r: Ran, case: Case, decided: Decided) -> String = {
+  let iso = isolated_as(r, case);
+  let reason = word(reason_of(decided, case.index));
+  let verb = if runs_test(decided, case.index) { bold(style, "run ") } else { dim(style, "skip") };
+  indent() ++ verb ++ " " ++ dim(style, short_of(case.hash)) ++ " " ++ padded(reason, 16) ++ " "
+    ++ padded(display_of(program, case), 40)
     ++ " "
     ++ dim(
-      s,
-      "isolation: " ++ iso ++ explain_atoms(iso, c) ++ (if c.seeded { " · searched" } else { "" })
-        ++ unkeyed_note(c),
+      style,
+      "isolation: " ++ iso ++ explain_atoms(iso, case)
+        ++ (if case.seeded { " · searched" } else { "" })
+        ++ unkeyed_note(case),
     )
 }
 
-fn unkeyed_note(c: Case) -> String =
-  match unkeyed_texts(c) { [] -> "", xs -> " · outside its key: {" ++ joined(xs, ", ") ++ "}" }
+fn unkeyed_note(case: Case) -> String =
+  match unkeyed_texts(case) { [] -> "", xs -> " · outside its key: {" ++ joined(xs, ", ") ++ "}" }
 
 // What a pass is filed under, and the tests that read what no key covers.
-fn key_lines(s: Style, p: Program) -> List<String> = {
-  let filed = match p.filed_under {
+fn key_lines(style: Style, program: Program) -> List<String> = {
+  let filed = match program.filed_under {
     Some(stamp) ->
       "a pass is filed under its test's hash and the runtime stamp " ++ short_of(Some(stamp)),
     None -> "no pass is filed: `--no-cache` reads and writes none",
   };
-  let reading = len(filter(p.cases, |c: Case| len(unkeyed_texts(c)) > 0));
-  appended(["", ind() ++ dim(s, "key"), ind() ++ "  " ++ dim(s, filed)], if reading == 0 { [] }
-  else {
-    [
-      ind() ++ "  "
-        ++ dim(
-          s,
-          count_of(reading, "test") ++ " read what this binary ships ("
-            ++ joined(binary_families(), ", ")
-            ++ "), which is in no key: a change to it reruns none of them",
-        ),
-    ]
-  })
+  let reading = len(filter(program.cases, |case: Case| len(unkeyed_texts(case)) > 0));
+  appended(
+    ["", indent() ++ dim(style, "key"), indent() ++ "  " ++ dim(style, filed)],
+    if reading == 0 { [] } else {
+      [
+        indent() ++ "  "
+          ++ dim(
+            style,
+            count_of(reading, "test") ++ " read what this binary ships ("
+              ++ joined(binary_families(), ", ")
+              ++ "), which is in no key: a change to it reruns none of them",
+          ),
+      ]
+    },
+  )
 }
 
-fn reasons_seen(p: Program, d: Decided) -> List<String> =
-  fold(p.cases, [], |acc: List<String>, c: Case| {
-    let reason = word(reason_of(d, c.index));
+fn reasons_seen(program: Program, decided: Decided) -> List<String> =
+  fold(program.cases, [], |acc: List<String>, case: Case| {
+    let reason = word(reason_of(decided, case.index));
     if said(acc, reason) { acc } else { push(acc, reason) }
   })
 
-fn why_lines(s: Style, p: Program, d: Decided) -> List<String> = {
-  let seen = reasons_seen(p, d);
+fn why_lines(style: Style, program: Program, decided: Decided) -> List<String> = {
+  let seen = reasons_seen(program, decided);
   if len(seen) == 0 { [] } else {
     appended(
-      ["", ind() ++ dim(s, "why")],
-      map(seen, |reason: String| ind() ++ "  " ++ padded(reason, 16) ++ " " ++ dim(s, why(reason))),
+      ["", indent() ++ dim(style, "why")],
+      map(seen, |reason: String|
+        indent() ++ "  " ++ padded(reason, 16) ++ " " ++ dim(style, why(reason))),
     )
   }
 }
 
-fn owed_line(s: Style, p: Program, c: Case, d: Decided) -> List<String> =
-  if owed_of(d, c.index) == len(d.search.roots) { [] } else {
+fn owed_line(style: Style, program: Program, case: Case, decided: Decided) -> List<String> =
+  if owed_of(decided, case.index) == len(decided.search.roots) { [] } else {
     [
-      ind() ++ "  "
+      indent() ++ "  "
         ++ dim(
-          s,
-          display_of(p, c) ++ ": " ++ int_to_string(owed_of(d, c.index)) ++ " of "
-            ++ count_of(len(d.search.roots), "seed")
+          style,
+          display_of(program, case) ++ ": " ++ int_to_string(owed_of(decided, case.index)) ++ " of "
+            ++ count_of(len(decided.search.roots), "seed")
             ++ " still owed; the rest already passed on their own",
         ),
     ]
   }
 
 // What the seeded tests will search, and what each of them still owes.
-fn search_lines(s: Style, p: Program, d: Decided) -> List<String> = {
-  let seeded = filter(p.cases, |c: Case| c.seeded);
+fn search_lines(style: Style, program: Program, decided: Decided) -> List<String> = {
+  let seeded = filter(program.cases, |case: Case| case.seeded);
   if len(seeded) == 0 { [] } else {
     let head = [
       "",
-      ind() ++ dim(s, "search"),
-      ind() ++ "  "
+      indent() ++ dim(style, "search"),
+      indent() ++ "  "
         ++ dim(
-          s,
-          d.search.mode ++ " · " ++ count_of(len(d.search.roots), "seed") ++ " · budget "
-            ++ int_to_string(d.search.budget)
+          style,
+          decided.search.mode ++ " · " ++ count_of(len(decided.search.roots), "seed")
+            ++ " · budget "
+            ++ int_to_string(decided.search.budget)
             ++ " · steps "
-            ++ int_to_string(d.search.steps),
+            ++ int_to_string(decided.search.steps),
         ),
-      ind() ++ "  "
+      indent() ++ "  "
         ++ dim(
-          s,
-          int_to_string(len(seeded)) ++ " of " ++ count_of(len(p.cases), "test")
+          style,
+          int_to_string(len(seeded)) ++ " of " ++ count_of(len(program.cases), "test")
             ++ " keyed on this plan and never on their bare hash",
         ),
     ];
-    fold(seeded, head, |acc: List<String>, c: Case| appended(acc, owed_line(s, p, c, d)))
+    fold(seeded, head, |acc: List<String>, case: Case|
+      appended(acc, owed_line(style, program, case, decided)))
   }
 }
 
 // Grouped like any other test, but a host-backed test is never free.
-fn group_tally(s: Style, c: Counts, d: Decided) -> String = {
+fn group_tally(style: Style, c: Counts, decided: Decided) -> String = {
   let hosted = if c.host == 0 { "" }
   else { " · " ++ int_to_string(c.host) ++ " host-backed and never free" };
-  let regioned = if d.parallelism.region_contended == 0 { "" } else {
-    " · " ++ int_to_string(d.parallelism.region_contended) ++ " of them only over a region label"
+  let regioned = if decided.parallelism.region_contended == 0 { "" } else {
+    " · " ++ int_to_string(decided.parallelism.region_contended)
+      ++ " of them only over a region label"
   };
-  ind() ++ "  "
+  indent() ++ "  "
     ++ dim(
-      s,
+      style,
       int_to_string(c.isolated) ++ " of " ++ int_to_string(c.total)
         ++ " region-isolated and free · "
-        ++ count_of(d.parallelism.shared_groups, "group")
+        ++ count_of(decided.parallelism.shared_groups, "group")
         ++ " for the "
         ++ int_to_string(c.shared)
         ++ " shared "
@@ -948,44 +984,51 @@ fn group_tally(s: Style, c: Counts, d: Decided) -> String = {
     )
 }
 
-fn named_of(p: Program, index: Int) -> String =
-  fold(p.cases, "", |acc: String, c: Case| if c.index == index { display_of(p, c) } else { acc })
+fn named_of(program: Program, index: Int) -> String =
+  fold(program.cases, "", |acc: String, case: Case|
+    if case.index == index { display_of(program, case) } else { acc })
 
-fn group_block(s: Style, p: Program, d: Decided, lines: List<String>, i: Int) -> List<String> = {
-  let g: Group = at(d.classes, i, no_group());
+fn group_block(
+  style: Style,
+  program: Program,
+  decided: Decided,
+  lines: List<String>,
+  i: Int,
+) -> List<String> = {
+  let g: Group = at(decided.classes, i, no_group());
   let head = push(
     lines,
-    ind() ++ "  group " ++ int_to_string(i) ++ " · " ++ count_of(len(g.tests), "test") ++ " · "
-      ++ dim(s, g.footprint),
+    indent() ++ "  group " ++ int_to_string(i) ++ " · " ++ count_of(len(g.tests), "test") ++ " · "
+      ++ dim(style, g.footprint),
   );
   fold(g.tests, head, |acc: List<String>, index: Int| {
-    let named = named_of(p, index);
-    if named == "" { acc } else { push(acc, ind() ++ "    " ++ named) }
+    let named = named_of(program, index);
+    if named == "" { acc } else { push(acc, indent() ++ "    " ++ named) }
   })
 }
 
-fn concurrency_lines(s: Style, p: Program, c: Counts, d: Decided) -> List<String> =
-  if len(d.classes) == 0 { [] } else {
+fn concurrency_lines(style: Style, program: Program, c: Counts, decided: Decided) -> List<String> =
+  if len(decided.classes) == 0 { [] } else {
     fold(
-      range(0, len(d.classes)),
-      ["", ind() ++ dim(s, "concurrency groups"), group_tally(s, c, d)],
-      |acc: List<String>, i: Int| group_block(s, p, d, acc, i),
+      range(0, len(decided.classes)),
+      ["", indent() ++ dim(style, "concurrency groups"), group_tally(style, c, decided)],
+      |acc: List<String>, i: Int| group_block(style, program, decided, acc, i),
     )
   }
 
-fn explain_lines(s: Style, p: Program, r: Ran, dec: Decided) -> List<String> =
+fn explain_lines(style: Style, program: Program, r: Ran, dec: Decided) -> List<String> =
   appended(
     appended(
       appended(
         appended(
-          appended([""], map(p.cases, |c: Case| case_line(s, p, r, c, dec))),
-          appended(why_lines(s, p, dec), key_lines(s, p)),
+          appended([""], map(program.cases, |case: Case| case_line(style, program, r, case, dec))),
+          appended(why_lines(style, program, dec), key_lines(style, program)),
         ),
-        search_lines(s, p, dec),
+        search_lines(style, program, dec),
       ),
-      concurrency_lines(s, p, counts_of(p, r), dec),
+      concurrency_lines(style, program, counts_of(program, r), dec),
     ),
-    appended(phase_lines(s, p.phases), run_phase_lines(s, p.phases, r.spent)),
+    appended(phase_lines(style, program.phases), run_phase_lines(style, program.phases, r.spent)),
   )
 
 // --- One test's line --------------------------------------------------------
@@ -1002,34 +1045,35 @@ fn word_of(status: String) -> String =
   else if status == "panicked" { "PANIC" }
   else { "GAVE UP" }
 
-fn painted_glyph(s: Style, status: String) -> String = {
+fn painted_glyph(style: Style, status: String) -> String = {
   let glyph = glyph_of(status);
-  if status == "passed" { green(s, glyph) }
-  else if status == "failed" { red(s, glyph) }
-  else if status == "panicked" { yellow(s, glyph) }
-  else { dim(s, glyph) }
+  if status == "passed" { green(style, glyph) }
+  else if status == "failed" { red(style, glyph) }
+  else if status == "panicked" { yellow(style, glyph) }
+  else { dim(style, glyph) }
 }
 
 // A styled mark is one glyph wide whatever escapes it carries, so the column is measured over the
 // word rather than over the paint.
-fn marked(s: Style, status: String) -> String =
-  if s.styled { painted_glyph(s, status) } else { padded(word_of(status), 7) }
+fn marked(style: Style, status: String) -> String =
+  if style.styled { painted_glyph(style, status) } else { padded(word_of(status), 7) }
 
-fn result_name(p: Program, o: Outcome) -> String =
-  fold(p.cases, o.name, |acc: String, c: Case|
-    if c.index == o.index { display_of(p, c) } else { acc })
+fn result_name(program: Program, outcome: Outcome) -> String =
+  fold(program.cases, outcome.name, |acc: String, case: Case|
+    if case.index == outcome.index { display_of(program, case) } else { acc })
 
-fn name_column(p: Program, r: Ran) -> Int = {
-  let widest = fold(r.results, 0, |acc: Int, o: Outcome| {
-    let n = string_len(result_name(p, o));
+fn name_column(program: Program, r: Ran) -> Int = {
+  let widest = fold(r.results, 0, |acc: Int, outcome: Outcome| {
+    let n = string_len(result_name(program, outcome));
     if n > acc { n } else { acc }
   });
   if widest < 24 { 24 } else if widest > 64 { 64 } else { widest }
 }
 
-fn result_line(s: Style, p: Program, o: Outcome, width: Int) -> String =
-  ind() ++ marked(s, o.status) ++ " " ++ padded(result_name(p, o), width) ++ " "
-    ++ aligned(ms1(o.duration_us), 8)
+fn result_line(style: Style, program: Program, outcome: Outcome, width: Int) -> String =
+  indent() ++ marked(style, outcome.status) ++ " " ++ padded(result_name(program, outcome), width)
+    ++ " "
+    ++ aligned(ms_tenths(outcome.duration_us), 8)
     ++ "ms"
 
 // A bounded naive count makes the ratio a lower bound.
@@ -1052,13 +1096,13 @@ fn search_parts(e: Explored) -> List<String> = {
   }
 }
 
-fn result_lines(s: Style, p: Program, r: Ran) -> List<String> = {
-  let width = name_column(p, r);
-  fold(r.results, [], |acc: List<String>, o: Outcome| {
-    let listed = push(acc, result_line(s, p, o, width));
-    match o.search {
+fn result_lines(style: Style, program: Program, r: Ran) -> List<String> = {
+  let width = name_column(program, r);
+  fold(r.results, [], |acc: List<String>, outcome: Outcome| {
+    let listed = push(acc, result_line(style, program, outcome, width));
+    match outcome.search {
       None -> listed,
-      Some(e) -> push(listed, ind() ++ "    " ++ dim(s, joined(search_parts(e), " · "))),
+      Some(e) -> push(listed, indent() ++ "    " ++ dim(style, joined(search_parts(e), " · "))),
     }
   })
 }
@@ -1066,178 +1110,191 @@ fn result_lines(s: Style, p: Program, r: Ran) -> List<String> = {
 // --- The summary ------------------------------------------------------------
 
 // `host` sits beside `cached` so "0 cached" is not misread as selection working.
-fn summary_line(s: Style, r: Ran, counted: Counts) -> String = {
+fn summary_line(style: Style, r: Ran, counted: Counts) -> String = {
   let c = r.summary;
   let failures = int_to_string(c.failed) ++ " failed";
   let passes = int_to_string(c.passed) ++ " passed";
   let hosted = if counted.host == 0 { "" }
-  else { dim(s, ", " ++ int_to_string(counted.host) ++ " host-backed and not cached") };
+  else { dim(style, ", " ++ int_to_string(counted.host) ++ " host-backed and not cached") };
   let given_up = if c.abandoned == 0 { "" }
-  else { yellow(s, ", " ++ int_to_string(c.abandoned) ++ " abandoned") };
-  ind() ++ (if c.failed > 0 { red(s, failures) } else { dim(s, failures) }) ++ ", "
-    ++ (if c.passed > 0 { green(s, passes) } else { dim(s, passes) })
+  else { yellow(style, ", " ++ int_to_string(c.abandoned) ++ " abandoned") };
+  indent() ++ (if c.failed > 0 { red(style, failures) } else { dim(style, failures) }) ++ ", "
+    ++ (if c.passed > 0 { green(style, passes) } else { dim(style, passes) })
     ++ ", "
     ++ int_to_string(c.cached)
     ++ " cached"
     ++ hosted
     ++ given_up
     ++ " ("
-    ++ secs2(c.duration_us)
+    ++ secs_hundredths(c.duration_us)
     ++ "s)"
 }
 
 // --- One failure ------------------------------------------------------------
 
-fn culprit_line(s: Style, places: List<Place>, c: Culprit, first: Bool) -> String =
-  "  " ++ red(s, if first { "culprit:" } else { "        " }) ++ " " ++ joined(c.names, " + ")
-    ++ dim_place(s, places, c.at)
+fn culprit_line(style: Style, places: List<Place>, c: Culprit, first: Bool) -> String =
+  "  " ++ red(style, if first { "culprit:" } else { "        " }) ++ " " ++ joined(c.names, " + ")
+    ++ dim_place(style, places, c.at)
 
 // The culprit before the diff: the culprit is the answer.
-fn bisect_lines(s: Style, places: List<Place>, b: Bisect) -> List<String> =
+fn bisect_lines(style: Style, places: List<Place>, b: Bisect) -> List<String> =
   if b.conclusive {
     push(
       fold(range(0, len(b.culprits)), [], |acc: List<String>, i: Int|
-        push(acc, culprit_line(s, places, at(b.culprits, i, no_culprit()), i == 0))),
-      "    " ++ dim(s, b.reason),
+        push(acc, culprit_line(style, places, at(b.culprits, i, no_culprit()), i == 0))),
+      "    " ++ dim(style, b.reason),
     )
   }
   // Silent when no bisection was asked for.
   else if !b.requested { [] }
-  else { ["  " ++ dim(s, "no culprit:") ++ " " ++ b.reason] }
+  else { ["  " ++ dim(style, "no culprit:") ++ " " ++ b.reason] }
 
-fn note_lines(s: Style, d: Diag) -> List<String> =
-  map(d.notes_text, |n: Bytes| "  " ++ dim(s, "=") ++ " " ++ string_of_bytes_lossy(n))
+fn note_lines(style: Style, diag: Diag) -> List<String> =
+  map(diag.notes_text, |n: Bytes| "  " ++ dim(style, "=") ++ " " ++ string_of_bytes_lossy(n))
 
 // A deadlock's cycle lives only in its secondary labels.
-fn secondary_lines(s: Style, places: List<Place>, d: Diag) -> List<String> =
-  map(filter(d.labels, |l: Label| !l.primary), |l: Label|
-    "    " ++ string_of_bytes_lossy(l.text) ++ dim_place(s, places, Some(label_at(l))))
+fn secondary_lines(style: Style, places: List<Place>, diag: Diag) -> List<String> =
+  map(filter(diag.labels, |label: Label| !label.primary), |label: Label|
+    "    " ++ string_of_bytes_lossy(label.text) ++ dim_place(style, places, Some(label_at(label))))
 
-fn at_lines(s: Style, places: List<Place>, d: Diag) -> List<String> =
-  match primary_of(d) {
+fn at_lines(style: Style, places: List<Place>, diag: Diag) -> List<String> =
+  match primary_of(diag) {
     None -> [],
     Some(l) -> match located(places, label_at(l)) {
       None -> [],
-      Some(text) -> ["    at " ++ dim(s, text)],
+      Some(text) -> ["    at " ++ dim(style, text)],
     },
   }
 
-fn site_line(s: Style, places: List<Place>, site: Site, first: Bool) -> String =
-  "  " ++ yellow(s, if first { "race:" } else { "     " }) ++ " " ++ site.task ++ "  "
+fn site_line(style: Style, places: List<Place>, site: Site, first: Bool) -> String =
+  "  " ++ yellow(style, if first { "race:" } else { "     " }) ++ " " ++ site.task ++ "  "
     ++ (match site.definition { Some(d) -> d, None -> "-" })
     ++ "   "
     ++ site.access
-    ++ dim_place(s, places, site.at)
+    ++ dim_place(style, places, site.at)
 
-fn race_lines(s: Style, places: List<Place>, f: Fault) -> List<String> =
-  match f.race {
+fn race_lines(style: Style, places: List<Place>, fault: Fault) -> List<String> =
+  match fault.race {
     None -> [],
-    Some(race) -> [site_line(s, places, race.left, true), site_line(s, places, race.right, false)],
+    Some(race) ->
+      [site_line(style, places, race.left, true), site_line(style, places, race.right, false)],
   }
 
-fn replay_lines(s: Style, f: Fault) -> List<String> =
-  match f.replay { None -> [], Some(command) -> ["  " ++ dim(s, "replay:") ++ " " ++ command] }
+fn replay_lines(style: Style, fault: Fault) -> List<String> =
+  match fault.replay {
+    None -> [],
+    Some(command) -> ["  " ++ dim(style, "replay:") ++ " " ++ command],
+  }
 
 // The repro, which is a seed rather than a stack trace.
-fn seed_lines(s: Style, places: List<Place>, f: Fault) -> List<String> =
-  match f.seed {
+fn seed_lines(style: Style, places: List<Place>, fault: Fault) -> List<String> =
+  match fault.seed {
     None -> [],
     Some(seed) ->
       appended(
-        appended(["  " ++ dim(s, "seed:") ++ " " ++ seed], race_lines(s, places, f)),
-        replay_lines(s, f),
+        appended(["  " ++ dim(style, "seed:") ++ " " ++ seed], race_lines(style, places, fault)),
+        replay_lines(style, fault),
       ),
   }
 
 fn described(x: Suspect) -> String =
   match x.change { Some(c) -> x.name ++ " (" ++ kind_word(c) ++ ")", None -> x.name }
 
-fn suspect_lines(s: Style, f: Fault) -> List<String> = {
-  let rest = map(filter(f.suspects, |x: Suspect| !x.culprit), described);
-  if len(rest) > 0 { ["  " ++ yellow(s, "suspects:") ++ " " ++ joined(rest, ", ")] }
-  else if f.unchanged {
-    ["  " ++ dim(s, "suspects: none — nothing in this test's closure changed")]
+fn suspect_lines(style: Style, fault: Fault) -> List<String> = {
+  let rest = map(filter(fault.suspects, |x: Suspect| !x.culprit), described);
+  if len(rest) > 0 { ["  " ++ yellow(style, "suspects:") ++ " " ++ joined(rest, ", ")] }
+  else if fault.unchanged {
+    ["  " ++ dim(style, "suspects: none — nothing in this test's closure changed")]
   } else { [] }
 }
 
-fn failure_lines(s: Style, places: List<Place>, f: Fault) -> List<String> =
+fn failure_lines(style: Style, places: List<Place>, fault: Fault) -> List<String> =
   appended(
     appended(
       appended(
         appended(
           appended(
-            appended(appended([bold(s, f.key)], bisect_lines(s, places, f.bisect)), [
-              "  " ++ string_of_bytes_lossy(f.diagnostic.message),
-            ]),
-            at_lines(s, places, f.diagnostic),
+            appended(
+              appended([bold(style, fault.key)], bisect_lines(style, places, fault.bisect)),
+              ["  " ++ string_of_bytes_lossy(fault.diagnostic.message)],
+            ),
+            at_lines(style, places, fault.diagnostic),
           ),
-          secondary_lines(s, places, f.diagnostic),
+          secondary_lines(style, places, fault.diagnostic),
         ),
-        note_lines(s, f.diagnostic),
+        note_lines(style, fault.diagnostic),
       ),
-      seed_lines(s, places, f),
+      seed_lines(style, places, fault),
     ),
-    suspect_lines(s, f),
+    suspect_lines(style, fault),
   )
 
-fn failure_blocks(s: Style, p: Program, faults: List<Fault>) -> List<String> =
-  fold(faults, [], |acc: List<String>, f: Fault|
-    appended(push(acc, ""), map(failure_lines(s, p.places, f), |l: String| ind() ++ l)))
+fn failure_blocks(style: Style, program: Program, faults: List<Fault>) -> List<String> =
+  fold(faults, [], |acc: List<String>, fault: Fault|
+    appended(
+      push(acc, ""),
+      map(failure_lines(style, program.places, fault), |l: String| indent() ++ l),
+    ))
 
 // A test the clock stopped: no culprit, no suspects, nothing to bisect — the machine ran out of
 // patience, and what the test would have decided is still unknown.
-fn abandoned_lines(s: Style, places: List<Place>, o: Outcome) -> List<String> = {
-  let head = [bold(s, o.name) ++ " " ++ yellow(s, "abandoned")];
-  match o.diagnostic {
+fn abandoned_lines(style: Style, places: List<Place>, outcome: Outcome) -> List<String> = {
+  let head = [bold(style, outcome.name) ++ " " ++ yellow(style, "abandoned")];
+  match outcome.diagnostic {
     None -> head,
     Some(r) -> {
       let d = shown(r);
       appended(
-        appended(push(head, "  " ++ string_of_bytes_lossy(d.message)), at_lines(s, places, d)),
-        note_lines(s, d),
+        appended(push(head, "  " ++ string_of_bytes_lossy(d.message)), at_lines(style, places, d)),
+        note_lines(style, d),
       )
     },
   }
 }
 
-fn abandoned_blocks(s: Style, p: Program, r: Ran) -> List<String> =
+fn abandoned_blocks(style: Style, program: Program, r: Ran) -> List<String> =
   fold(
-    filter(r.results, |o: Outcome| o.status == "abandoned"),
+    filter(r.results, |outcome: Outcome| outcome.status == "abandoned"),
     [],
-    |acc: List<String>, o: Outcome|
-      appended(push(acc, ""), map(abandoned_lines(s, p.places, o), |l: String| ind() ++ l)),
+    |acc: List<String>, outcome: Outcome|
+      appended(
+        push(acc, ""),
+        map(abandoned_lines(style, program.places, outcome), |l: String| indent() ++ l),
+      ),
   )
 
 // --- Coverage and mutants ---------------------------------------------------
 
-fn unreached_lines(s: Style, names: List<String>) -> List<String> =
-  map(names, |n: String| ind() ++ ind() ++ dim(s, n ++ ": no test reaches it"))
+fn unreached_lines(style: Style, names: List<String>) -> List<String> =
+  map(names, |n: String| indent() ++ indent() ++ dim(style, n ++ ": no test reaches it"))
 
-fn coverage_lines(s: Style, r: Ran) -> List<String> =
+fn coverage_lines(style: Style, r: Ran) -> List<String> =
   match r.coverage {
     None -> [],
     Some(c) ->
       appended(
         [
-          ind() ++ bold(s, "coverage") ++ " " ++ int_to_string(c.definitions - len(c.unreached))
+          indent() ++ bold(style, "coverage") ++ " "
+            ++ int_to_string(c.definitions - len(c.unreached))
             ++ " of "
             ++ int_to_string(c.definitions)
             ++ " definitions reached by a test",
         ],
-        unreached_lines(s, c.unreached),
+        unreached_lines(style, c.unreached),
       ),
   }
 
-fn survivor_line(s: Style, places: List<Place>, m: Survivor) -> String = {
+fn survivor_line(style: Style, places: List<Place>, m: Survivor) -> String = {
   let spot = match m.at {
     None -> "",
     Some(a) -> match located(places, a) { Some(text) -> text, None -> "" },
   };
-  ind() ++ ind() ++ red(s, m.definition) ++ " survives `" ++ m.from ++ "` -> `" ++ m.to ++ "` at "
-    ++ dim(s, spot)
+  indent() ++ indent() ++ red(style, m.definition) ++ " survives `" ++ m.from ++ "` -> `" ++ m.to
+    ++ "` at "
+    ++ dim(style, spot)
 }
 
-fn mutant_lines(s: Style, p: Program, r: Ran) -> List<String> =
+fn mutant_lines(style: Style, program: Program, r: Ran) -> List<String> =
   match r.mutants {
     None -> [],
     Some(m) -> {
@@ -1248,44 +1305,44 @@ fn mutant_lines(s: Style, p: Program, r: Ran) -> List<String> =
         ++ (if m.budget_spent { ", budget spent" } else { "" });
       appended(
         appended(
-          [ind() ++ bold(s, "mutants") ++ " " ++ bold(s, tally)],
-          unreached_lines(s, m.unreached),
+          [indent() ++ bold(style, "mutants") ++ " " ++ bold(style, tally)],
+          unreached_lines(style, m.unreached),
         ),
-        map(m.survivors, |x: Survivor| survivor_line(s, p.places, x)),
+        map(m.survivors, |x: Survivor| survivor_line(style, program.places, x)),
       )
     },
   }
 
-fn no_tests_note(flags: Flags, p: Program) -> String =
-  if p.declared == 0 { "no `test` items in this program" } else if len(flags.filters) > 0 {
+fn no_tests_note(flags: Flags, program: Program) -> String =
+  if program.declared == 0 { "no `test` items in this program" } else if len(flags.filters) > 0 {
     "no test key contains a `--filter` substring; nothing was verified"
   } else { "nothing to report" }
 
 // --- The document -----------------------------------------------------------
 
-fn case_json(r: Ran, c: Case, d: Decided) -> Json =
+fn case_json(r: Ran, case: Case, decided: Decided) -> Json =
   object([
-    { key: "index", value: num(c.index) },
-    { key: "key", value: Str(c.key) },
-    { key: "name", value: Str(c.name) },
-    { key: "module", value: Str(c.module) },
-    { key: "hash", value: opt_str(c.hash) },
-    { key: "nondet", value: Bool(c.nondet) },
-    { key: "selected", value: Bool(runs_test(d, c.index)) },
-    { key: "reason", value: Str(keyed(word(reason_of(d, c.index)))) },
-    { key: "why", value: Str(why(word(reason_of(d, c.index)))) },
-    { key: "group", value: opt_num(group_of(d, c.index)) },
-    { key: "footprint", value: Str(c.footprint) },
-    { key: "isolation", value: Str(isolated_as(r, c)) },
+    { key: "index", value: num(case.index) },
+    { key: "key", value: Str(case.key) },
+    { key: "name", value: Str(case.name) },
+    { key: "module", value: Str(case.module) },
+    { key: "hash", value: opt_str(case.hash) },
+    { key: "nondet", value: Bool(case.nondet) },
+    { key: "selected", value: Bool(runs_test(decided, case.index)) },
+    { key: "reason", value: Str(keyed(word(reason_of(decided, case.index)))) },
+    { key: "why", value: Str(why(word(reason_of(decided, case.index)))) },
+    { key: "group", value: opt_num(group_of(decided, case.index)) },
+    { key: "footprint", value: Str(case.footprint) },
+    { key: "isolation", value: Str(isolated_as(r, case)) },
     // Whether this test reaches the binding, and so always runs uncached.
-    { key: "host", value: Bool(covers(r.reaches, c.index)) },
-    { key: "shared_atoms", value: strings(shared_texts(c)) },
+    { key: "host", value: Bool(covers(r.reaches, case.index)) },
+    { key: "shared_atoms", value: strings(shared_texts(case)) },
     // The same atoms unprinted, as the scheduler compares them, and whether the test is handed a
     // seed: what a program re-colouring the run needs, without parsing a printed atom.
-    { key: "contends", value: Array(map(shared(atoms_of(c)), atom_json)) },
-    { key: "seeded", value: Bool(c.seeded) },
+    { key: "contends", value: Array(map(shared(atoms_of(case)), atom_json)) },
+    { key: "seeded", value: Bool(case.seeded) },
     // Footprint atoms this binary answers from what it ships, which no pass key covers.
-    { key: "unkeyed", value: strings(unkeyed_texts(c)) },
+    { key: "unkeyed", value: strings(unkeyed_texts(case)) },
   ])
 
 fn atom_json(a: Atom) -> Json =
@@ -1295,8 +1352,8 @@ fn atom_json(a: Atom) -> Json =
     { key: "writes", value: Bool(a.writes) },
   ])
 
-fn group_json(d: Decided, i: Int) -> Json = {
-  let g: Group = at(d.classes, i, no_group());
+fn group_json(decided: Decided, i: Int) -> Json = {
+  let g: Group = at(decided.classes, i, no_group());
   object([
     { key: "index", value: num(i) },
     { key: "tests", value: Array(map(g.tests, |x: Int| num(x))) },
@@ -1331,29 +1388,32 @@ fn search_json(e: Explored) -> Json =
     { key: "failing_seed", value: opt_str(e.failing_seed) },
   ])
 
-fn case_of(p: Program, index: Int) -> Option<Case> =
-  fold(p.cases, None, |acc: Option<Case>, c: Case|
-    match acc { Some(_) -> acc, None -> if c.index == index { Some(c) } else { None } })
+fn case_of(program: Program, index: Int) -> Option<Case> =
+  fold(program.cases, None, |acc: Option<Case>, case: Case|
+    match acc { Some(_) -> acc, None -> if case.index == index { Some(case) } else { None } })
 
-fn outcome_json(p: Program, o: Outcome, d: Decided) -> Json = {
-  let named = case_of(p, o.index);
+fn outcome_json(program: Program, outcome: Outcome, d: Decided) -> Json = {
+  let named = case_of(program, outcome.index);
   object([
-    { key: "index", value: num(o.index) },
+    { key: "index", value: num(outcome.index) },
     { key: "key", value: match named { Some(c) -> Str(c.key), None -> Null } },
-    { key: "name", value: Str(match named { Some(c) -> c.name, None -> o.name }) },
+    { key: "name", value: Str(match named { Some(c) -> c.name, None -> outcome.name }) },
     { key: "module", value: match named { Some(c) -> Str(c.module), None -> Null } },
-    { key: "hash", value: opt_str(o.hash) },
-    { key: "group", value: num(match group_of(d, o.index) { Some(g) -> g, None -> 0 }) },
-    { key: "status", value: Str(o.status) },
-    { key: "duration_ms", value: millis(o.duration_us) },
+    { key: "hash", value: opt_str(outcome.hash) },
+    { key: "group", value: num(match group_of(d, outcome.index) { Some(g) -> g, None -> 0 }) },
+    { key: "status", value: Str(outcome.status) },
+    { key: "duration_ms", value: millis(outcome.duration_us) },
     {
       key: "diagnostic",
-      value: match o.diagnostic { Some(r) -> one_diagnostic(shown(r), p.places), None -> Null },
+      value: match outcome.diagnostic {
+        Some(r) -> one_diagnostic(shown(r), program.places),
+        None -> Null,
+      },
     },
     // Absent, never zeroed, when no region was reached.
-    { key: "simulation", value: match o.search { Some(e) -> search_json(e), None -> Null } },
-    { key: "cached", value: opt_bool(o.cached) },
-    { key: "performs", value: num(o.performs) },
+    { key: "simulation", value: match outcome.search { Some(e) -> search_json(e), None -> Null } },
+    { key: "cached", value: opt_bool(outcome.cached) },
+    { key: "performs", value: num(outcome.performs) },
   ])
 }
 
@@ -1390,25 +1450,25 @@ fn race_json(v: Option<Race>) -> Json =
 
 // The failure artifact: what failed and where, whether it is Ply's fault, how to replay it, and the
 // cause this program decided, led by the culprit.
-fn fault_json(p: Program, f: Fault) -> Json =
+fn fault_json(program: Program, fault: Fault) -> Json =
   object([
-    { key: "key", value: Str(f.key) },
-    { key: "name", value: Str(f.name) },
-    { key: "diagnostic", value: one_diagnostic(f.diagnostic, p.places) },
+    { key: "key", value: Str(fault.key) },
+    { key: "name", value: Str(fault.name) },
+    { key: "diagnostic", value: one_diagnostic(fault.diagnostic, program.places) },
     // Whether to go and read the program or go and report a bug in Ply.
-    { key: "defect", value: Bool(f.defect) },
-    { key: "seed", value: opt_str(f.seed) },
-    { key: "replay", value: opt_str(f.replay) },
+    { key: "defect", value: Bool(fault.defect) },
+    { key: "seed", value: opt_str(fault.seed) },
+    { key: "replay", value: opt_str(fault.replay) },
     // Only when the search actually observed the flip.
-    { key: "race", value: race_json(f.race) },
-    { key: "culprit", value: culprit_json(f.bisect) },
-    { key: "suspects", value: Array(map(f.suspects, suspect_json)) },
-    { key: "module", value: opt_str(f.module) },
-    { key: "test_hash", value: opt_str(f.test_hash) },
-    { key: "nondet", value: opt_bool(f.nondet) },
-    { key: "status", value: opt_str(f.status) },
-    { key: "location", value: location_json(p.places, f.diagnostic) },
-    { key: "footprint", value: object([{ key: "declared", value: opt_strings(f.declared) }]) },
+    { key: "race", value: race_json(fault.race) },
+    { key: "culprit", value: culprit_json(fault.bisect) },
+    { key: "suspects", value: Array(map(fault.suspects, suspect_json)) },
+    { key: "module", value: opt_str(fault.module) },
+    { key: "test_hash", value: opt_str(fault.test_hash) },
+    { key: "nondet", value: opt_bool(fault.nondet) },
+    { key: "status", value: opt_str(fault.status) },
+    { key: "location", value: location_json(program.places, fault.diagnostic) },
+    { key: "footprint", value: object([{ key: "declared", value: opt_strings(fault.declared) }]) },
   ])
 
 // The verdict as the document carries it: what to change, how sure the system is, and how it
@@ -1462,29 +1522,32 @@ fn parallelism_json(v: Parallelism) -> Json =
     { key: "shared_groups", value: num(v.shared_groups) },
   ])
 
-fn phases_json(f: Phases) -> Json =
+fn phases_json(phases: Phases) -> Json =
   object([
-    { key: "read", value: millis(f.read_us) },
-    { key: "front", value: millis(f.front_us) },
-    { key: "write_back", value: millis(f.write_back_us) },
-    { key: "total", value: millis(phase_total(f)) },
+    { key: "read", value: millis(phases.read_us) },
+    { key: "front", value: millis(phases.front_us) },
+    { key: "write_back", value: millis(phases.write_back_us) },
+    { key: "total", value: millis(phase_total(phases)) },
   ])
 
-fn selection_json(p: Program, r: Ran, d: Decided) -> Json = {
-  let c = counts_of(p, r);
+fn selection_json(program: Program, r: Ran, decided: Decided) -> Json = {
+  let c = counts_of(program, r);
   object([
-    { key: "total", value: num(len(p.cases)) },
-    { key: "selected", value: num(selected_count(p, d)) },
-    { key: "cached", value: num(cached_count(p, d)) },
-    { key: "filtered_out", value: num(p.filtered_out) },
-    { key: "filed_under", value: opt_str(p.filed_under) },
-    { key: "groups", value: Array(map(range(0, len(d.classes)), |i: Int| group_json(d, i))) },
+    { key: "total", value: num(len(program.cases)) },
+    { key: "selected", value: num(selected_count(program, decided)) },
+    { key: "cached", value: num(cached_count(program, decided)) },
+    { key: "filtered_out", value: num(program.filtered_out) },
+    { key: "filed_under", value: opt_str(program.filed_under) },
+    {
+      key: "groups",
+      value: Array(map(range(0, len(decided.classes)), |i: Int| group_json(decided, i))),
+    },
     // A host-backed test counts only under `host`, since it is not isolated.
     { key: "isolated", value: num(c.isolated) },
     { key: "shared", value: num(c.shared) },
     { key: "host", value: num(c.host) },
-    { key: "parallelism", value: parallelism_json(d.parallelism) },
-    { key: "tests", value: Array(map(p.cases, |x: Case| case_json(r, x, d))) },
+    { key: "parallelism", value: parallelism_json(decided.parallelism) },
+    { key: "tests", value: Array(map(program.cases, |case: Case| case_json(r, case, decided))) },
   ])
 }
 
@@ -1536,12 +1599,12 @@ fn artifact_schema() -> Int = 6
 
 fn document(
   flags: Flags,
-  p: Program,
+  program: Program,
   r: Ran,
   faults: List<Fault>,
   warnings: List<Diag>,
   ok: Bool,
-  d: Decided,
+  decided: Decided,
 ) -> Json =
   object(
     appended(
@@ -1551,19 +1614,19 @@ fn document(
         {
           key: "front_end",
           value: object([
-            { key: "incremental", value: Bool(p.incremental) },
-            { key: "phases", value: phases_json(p.phases) },
+            { key: "incremental", value: Bool(program.incremental) },
+            { key: "phases", value: phases_json(program.phases) },
           ]),
         },
-        { key: "phases", value: run_phases_json(p.phases, r.spent) },
+        { key: "phases", value: run_phases_json(program.phases, r.spent) },
         { key: "ok", value: Bool(ok) },
         { key: "exit_code", value: num(if ok { ok_code() } else { run_failed() }) },
-        { key: "root", value: Str(p.root) },
-        { key: "files", value: strings(p.files) },
+        { key: "root", value: Str(program.root) },
+        { key: "files", value: strings(program.files) },
         {
           key: "modules",
           value: Array(
-            map(p.modules, |m: ModuleView|
+            map(program.modules, |m: ModuleView|
               object([{ key: "name", value: Str(m.name) }, { key: "file", value: Str(m.file) }])),
           ),
         },
@@ -1572,16 +1635,19 @@ fn document(
         { key: "binding", value: Str(r.label) },
         { key: "hosts", value: r.hosts },
         { key: "workers", value: num(r.workers) },
-        { key: "options", value: with_sim(p.options, d.sim) },
+        { key: "options", value: with_sim(program.options, decided.sim) },
         { key: "simulation", value: simulated_json(r.simulation) },
         { key: "backend", value: backend_json(r) },
-        { key: "selection", value: selection_json(p, r, d) },
+        { key: "selection", value: selection_json(program, r, decided) },
         { key: "summary", value: summary_json(r.summary) },
-        { key: "results", value: Array(map(r.results, |o: Outcome| outcome_json(p, o, d))) },
-        { key: "failures", value: Array(map(faults, |f: Fault| fault_json(p, f))) },
+        {
+          key: "results",
+          value: Array(map(r.results, |outcome: Outcome| outcome_json(program, outcome, decided))),
+        },
+        { key: "failures", value: Array(map(faults, |f: Fault| fault_json(program, f))) },
         // Not a warning: every later run believes an escaped entry.
-        { key: "diagnostics", value: all_to_json(r.escapes, p.places) },
-        { key: "warnings", value: all_to_json(warnings, p.places) },
+        { key: "diagnostics", value: all_to_json(r.escapes, program.places) },
+        { key: "warnings", value: all_to_json(warnings, program.places) },
       ],
       extra_documents(r),
     ),
@@ -1597,23 +1663,29 @@ fn survived(r: Ran) -> Bool = match r.mutants { Some(m) -> m.survived > 0, None 
 fn green_run(r: Ran) -> Bool =
   r.summary.failed == 0 && r.summary.abandoned == 0 && len(r.escapes) == 0 && !survived(r)
 
-fn explained(s: Style, flags: Flags, p: Program, r: Ran, d: Decided) -> List<String> =
-  if !flags.explain { [] } else { explain_lines(s, p, r, d) }
+fn explained(
+  style: Style,
+  flags: Flags,
+  program: Program,
+  r: Ran,
+  decided: Decided,
+) -> List<String> = if !flags.explain { [] } else { explain_lines(style, program, r, decided) }
 
-fn listed(s: Style, p: Program, r: Ran) -> List<String> =
-  if len(r.results) == 0 { [] } else { appended([""], result_lines(s, p, r)) }
+fn listed(style: Style, program: Program, r: Ran) -> List<String> =
+  if len(r.results) == 0 { [] } else { appended([""], result_lines(style, program, r)) }
 
-fn nothing_lines(s: Style, flags: Flags, p: Program) -> List<String> =
-  if len(p.cases) > 0 { [] } else { ["", ind() ++ dim(s, no_tests_note(flags, p))] }
+fn nothing_lines(style: Style, flags: Flags, program: Program) -> List<String> =
+  if len(program.cases) > 0 { [] }
+  else { ["", indent() ++ dim(style, no_tests_note(flags, program))] }
 
 fn lines_of(
-  s: Style,
+  style: Style,
   flags: Flags,
-  p: Program,
+  program: Program,
   r: Ran,
   faults: List<Fault>,
   warnings: List<Diag>,
-  d: Decided,
+  decided: Decided,
 ) -> List<String> =
   appended(
     appended(
@@ -1623,44 +1695,54 @@ fn lines_of(
             appended(
               appended(
                 appended(
-                  appended(head_lines(s, flags, p, r, d), explained(s, flags, p, r, d)),
-                  listed(s, p, r),
+                  appended(
+                    head_lines(style, flags, program, r, decided),
+                    explained(style, flags, program, r, decided),
+                  ),
+                  listed(style, program, r),
                 ),
-                ["", summary_line(s, r, counts_of(p, r))],
+                ["", summary_line(style, r, counts_of(program, r))],
               ),
-              warned_lines(s, r.escapes),
+              warned_lines(style, r.escapes),
             ),
-            failure_blocks(s, p, faults),
+            failure_blocks(style, program, faults),
           ),
-          abandoned_blocks(s, p, r),
+          abandoned_blocks(style, program, r),
         ),
-        nothing_lines(s, flags, p),
+        nothing_lines(style, flags, program),
       ),
-      warned_lines(s, warnings),
+      warned_lines(style, warnings),
     ),
-    appended(coverage_lines(s, r), mutant_lines(s, p, r)),
+    appended(coverage_lines(style, r), mutant_lines(style, program, r)),
   )
 
 // A lazy read and a later flush can each report the same unreadable file.
-fn collected(p: Program, r: Ran) -> List<Diag> =
-  fold(appended(p.warnings, r.warnings), [], |acc: List<Diag>, d: Diag|
+fn collected(program: Program, r: Ran) -> List<Diag> =
+  fold(appended(program.warnings, r.warnings), [], |acc: List<Diag>, d: Diag|
     if len(filter(acc, |x: Diag| x.code == d.code && x.message == d.message)) > 0 { acc }
     else { push(acc, d) })
 
-fn answered(s: Style, flags: Flags, p: Program, r: Ran, faults: List<Fault>, d: Decided) -> Answer = {
-  let warnings = collected(p, r);
+fn answered(
+  style: Style,
+  flags: Flags,
+  program: Program,
+  r: Ran,
+  faults: List<Fault>,
+  decided: Decided,
+) -> Answer = {
+  let warnings = collected(program, r);
   let ok = green_run(r);
   {
-    json: document(flags, p, r, faults, warnings, ok, d),
-    lines: lines_of(s, flags, p, r, faults, warnings, d),
+    json: document(flags, program, r, faults, warnings, ok, decided),
+    lines: lines_of(style, flags, program, r, faults, warnings, decided),
     errs: [],
     code: if ok { ok_code() } else { run_failed() },
   }
 }
 
 // A registration that does not match the program is a start-up failure: nothing ran.
-fn unbound(s: Style, refusal: Refusal) -> Answer = {
-  let tally = ind() ++ red(s, "no host handler was bound") ++ " ("
+fn unbound(style: Style, refusal: Refusal) -> Answer = {
+  let tally = indent() ++ red(style, "no host handler was bound") ++ " ("
     ++ count_of(len(refusal.diags), "error")
     ++ ")";
   {
@@ -1672,7 +1754,7 @@ fn unbound(s: Style, refusal: Refusal) -> Answer = {
       { key: "diagnostics", value: all_to_json(refusal.diags, refusal.places) },
     ]),
     lines: [],
-    errs: push(all_to_text(s, refusal.diags, refusal.places), tally),
+    errs: push(all_to_text(style, refusal.diags, refusal.places), tally),
     code: compile_error(),
   }
 }
@@ -1686,7 +1768,7 @@ pub type Iteration = { answer: Answer, held: Option<Timed>, embeds: List<Embed> 
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit} =
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report} =
   iterated(flags, options, None).answer
 
 // A save that changed no file's text is the last report's load again, with nothing re-derived.
@@ -1714,7 +1796,7 @@ pub fn iterated(
   flags: Flags,
   options: Options,
   held: Option<Timed>,
-) -> Iteration / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit} = {
+) -> Iteration / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report} = {
   let s: Style = style_of(flags);
   let begun = time.elapsed_us();
   let t: Timed = loaded(flags, options, held);
@@ -1753,11 +1835,11 @@ pub fn stamped(
   let found = walk::sweep(rs);
   if len(found.errors) > 0 { None } else {
     Some(
-      map_fold(found.files, [], |acc: List<String>, shown: String, at: paths::Rooted|
+      map_fold(found.files, [], |acc: List<String>, shown: String, rooted: paths::Rooted|
         push(
           acc,
-          shown ++ " " ++ stamp_part(paths::modified_ms(at)) ++ " "
-            ++ stamp_part(paths::file_size(at)),
+          shown ++ " " ++ stamp_part(paths::modified_ms(rooted)) ++ " "
+            ++ stamp_part(paths::file_size(rooted)),
         )),
     )
   }
@@ -1782,19 +1864,19 @@ fn root_of(rs: List<paths::Resolved>) -> String / {fs.kind[cwd], fs.kind[abs]} =
 
 fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
 
-fn test_at(w: Analysis, i: Int) -> Option<TestInfo> = list_at(w.checked.tests, i)
+fn test_at(analysis: Analysis, i: Int) -> Option<TestInfo> = list_at(analysis.checked.tests, i)
 
-fn hash_at(w: Analysis, i: Int) -> Option<String> =
-  match list_at(w.hashes.tests, i) { Some(h) -> Some(hex_of(h)), None -> None }
+fn hash_at(analysis: Analysis, i: Int) -> Option<String> =
+  match list_at(analysis.hashes.tests, i) { Some(h) -> Some(hex_of(h)), None -> None }
 
 // Something in its closure entered a `simulate` region, so it reads a seed and is searched.
 fn seeded_of(atoms: List<types::Atom>) -> Bool =
   fold(atoms, false, |found: Bool, a: types::Atom| found || a.effect == b"sim")
 
 // One test the tree declares, as the selector keys it.
-fn rows_of(w: Analysis) -> List<Row> =
-  fold(range(0, len(w.checked.tests)), [], |acc: List<Row>, i: Int|
-    match test_at(w, i) {
+fn rows_of(analysis: Analysis) -> List<Row> =
+  fold(range(0, len(analysis.checked.tests)), [], |acc: List<Row>, i: Int|
+    match test_at(analysis, i) {
       None -> acc,
       Some(t) ->
         push(acc, {
@@ -1802,7 +1884,7 @@ fn rows_of(w: Analysis) -> List<Row> =
           label: text(t.name),
           name: text(t.key),
           module: text(t.module),
-          hash: hash_at(w, i),
+          hash: hash_at(analysis, i),
           seeded: seeded_of(t.footprint),
           nondet: t.nondet,
         }),
@@ -1852,16 +1934,16 @@ fn footprint_text(atoms: List<types::Atom>) -> String =
 
 fn mode_writes(m: type_syntax::Mode) -> Bool = match m { MWrite -> true, _ -> false }
 
-fn case_view(w: Analysis, i: Int, t: TestInfo) -> Case = {
-  let atoms = canonical(t.footprint);
+fn case_view(analysis: Analysis, i: Int, test_info: TestInfo) -> Case = {
+  let atoms = canonical(test_info.footprint);
   let texts = atom_texts(atoms);
   {
     index: i,
-    key: text(t.key),
-    name: text(t.name),
-    module: text(t.module),
-    nondet: t.nondet,
-    hash: hash_at(w, i),
+    key: text(test_info.key),
+    name: text(test_info.name),
+    module: text(test_info.module),
+    nondet: test_info.nondet,
+    hash: hash_at(analysis, i),
     footprint: footprint_text(atoms),
     atoms: map(range(0, len(atoms)), |j: Int|
       match list_at(atoms, j) {
@@ -1876,7 +1958,7 @@ fn case_view(w: Analysis, i: Int, t: TestInfo) -> Case = {
           },
         None -> { atom: { effect: "", resource: "", writes: false }, text: "" },
       }),
-    seeded: seeded_of(t.footprint),
+    seeded: seeded_of(test_info.footprint),
   }
 }
 
@@ -1885,25 +1967,25 @@ fn case_view(w: Analysis, i: Int, t: TestInfo) -> Case = {
 // contain one of its substrings.
 type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
 
-fn root_modules(w: Analysis) -> Map<String, Bool> =
-  fold(range(0, len(w.mods)), map_new(), |acc: Map<String, Bool>, i: Int|
-    match ((list_at(w.mods, i), list_at(w.mod_pkg, i))) {
+fn root_modules(analysis: Analysis) -> Map<String, Bool> =
+  fold(range(0, len(analysis.mods)), map_new(), |acc: Map<String, Bool>, i: Int|
+    match ((list_at(analysis.mods, i), list_at(analysis.mod_pkg, i))) {
       (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, text(m.name), true) } else { acc },
       _ -> acc,
     })
 
-fn scope_of(w: Analysis, options: Options) -> Scope = {
-  let packaged = len(w.packages) > 0;
-  let root = root_modules(w);
+fn scope_of(analysis: Analysis, options: Options) -> Scope = {
+  let packaged = len(analysis.packages) > 0;
+  let root = root_modules(analysis);
   let in_scope = |t: TestInfo|
     (if packaged { map_contains(root, text(t.module)) } else { !is_shipped(text(t.module)) })
       || (options.std && is_shipped(text(t.module)));
   let matches = |t: TestInfo| kept(options.filters, text(t.key));
   fold(
-    range(0, len(w.checked.tests)),
+    range(0, len(analysis.checked.tests)),
     { visible: [], out: [], filtered_out: 0 },
     |acc: Scope, i: Int|
-      match test_at(w, i) {
+      match test_at(analysis, i) {
         None -> acc,
         Some(t) -> if !in_scope(t) { { ..acc, out: push(acc.out, i) } }
         else if matches(t) { { ..acc, visible: push(acc.visible, i) } }
@@ -1914,10 +1996,10 @@ fn scope_of(w: Analysis, options: Options) -> Scope = {
 
 // A diagnostic raised inside a module that ships with `ply` is its maintainers', not this
 // program's.
-fn in_shipped(w: Analysis, d: Diag) -> Bool =
-  match primary_of(d) {
+fn in_shipped(analysis: Analysis, diag: Diag) -> Bool =
+  match primary_of(diag) {
     None -> false,
-    Some(l) -> match list_at(w.mods, l.module) {
+    Some(l) -> match list_at(analysis.mods, l.module) {
       Some(m) -> is_shipped(text(m.name)),
       None -> false,
     },
@@ -1926,8 +2008,8 @@ fn in_shipped(w: Analysis, d: Diag) -> Bool =
 // What the report says about the load, the tests in scope, and the options it ran under.
 fn program_of(
   options: Options,
-  t: Timed,
-  w: Analysis,
+  timed: Timed,
+  analysis: Analysis,
   root: String,
   scope: Scope,
   opened: List<Diag>,
@@ -1936,24 +2018,27 @@ fn program_of(
   {
     root: root,
     filed_under: filed_under,
-    files: map(t.program.places, |pl: Place| pl.path),
-    places: t.program.places,
-    modules: map(modules_of(t.program, w), |m: { name: String, path: String }|
+    files: map(timed.program.places, |place: Place| place.path),
+    places: timed.program.places,
+    modules: map(modules_of(timed.program, analysis), |m: { name: String, path: String }|
       { name: m.name, file: m.path }),
-    incremental: t.cached,
+    incremental: timed.cached,
     phases: {
-      read_us: t.read_ms * 1000,
-      front_us: t.front_ms * 1000,
-      write_back_us: t.file_ms * 1000,
+      read_us: timed.read_ms * 1000,
+      front_us: timed.front_ms * 1000,
+      write_back_us: timed.file_ms * 1000,
     },
     declared: len(scope.visible) + scope.filtered_out,
     cases: fold(scope.visible, [], |acc: List<Case>, i: Int|
-      match test_at(w, i) {
-        Some(test_info) -> push(acc, case_view(w, i, test_info)),
+      match test_at(analysis, i) {
+        Some(test_info) -> push(acc, case_view(analysis, i, test_info)),
         None -> acc,
       }),
     filtered_out: scope.filtered_out,
-    warnings: appended(opened, filter(t.program.diags, |d: Diag| !in_shipped(w, d))),
+    warnings: appended(
+      opened,
+      filter(timed.program.diags, |diag: Diag| !in_shipped(analysis, diag)),
+    ),
     options: object([
       {
         key: "bisect",
@@ -1969,35 +2054,35 @@ fn program_of(
 // checker cannot show stops it as under `ply check`; both refuse before anything runs.
 fn tests_over(
   flags: Flags,
-  s: Style,
+  style: Style,
   options: Options,
-  t: Timed,
+  timed: Timed,
   w: Analysis,
   begun: Int,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report} = {
   let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
     Some(query) -> match targets(w, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
     None -> Ok(None),
   };
   match aimed {
-    Err(d) -> refused(s, "test", [d], t.program.places),
+    Err(d) -> refused(style, "test", [d], timed.program.places),
     Ok(targeted) -> {
       let loaded_at = time.elapsed_us();
-      let broken = broken_promises(t.program, w);
+      let broken = broken_promises(timed.program, w);
       let promised_at = time.elapsed_us();
       let spent = { ..no_spent(), before_us: begun, promises_us: promised_at - loaded_at };
-      if len(broken) > 0 { refused(s, "test", broken, t.program.places) }
-      else { selected(flags, s, options, t, w, targeted, spent) }
+      if len(broken) > 0 { refused(style, "test", broken, timed.program.places) }
+      else { selected(flags, style, options, timed, w, targeted, spent) }
     },
   }
 }
 
 fn selected(
   flags: Flags,
-  s: Style,
+  style: Style,
   options: Options,
-  t: Timed,
-  w: Analysis,
+  timed: Timed,
+  analysis: Analysis,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
 ) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit} = {
@@ -2006,14 +2091,14 @@ fn selected(
   results::with_ledger(results::kept_at(flags.paths, options.no_cache), || {
     let opened = if options.no_cache { [] } else { ledger.opened() };
     let selecting = time.elapsed_us();
-    let scope = scope_of(w, options);
+    let scope = scope_of(analysis, options);
     let filed_under = if options.no_cache { None } else { Some(shelf_stamps().runtime) };
-    let p = program_of(options, t, w, root_of(flags.paths), scope, opened, filed_under);
+    let p = program_of(options, timed, analysis, root_of(flags.paths), scope, opened, filed_under);
     // Which tests run is the program's to say, and so is every key the store is asked about or a
     // pass is filed under: the runtime answers what the store holds and does what it is told.
     let searching = machine::sim_plan_of(options.sim);
     let search = search_of(searching);
-    let decisions = decide(cases_of(rows_of(w), search, options.no_cache));
+    let decisions = decide(cases_of(rows_of(analysis), search, options.no_cache));
     // Which tests may share a worker is the program's to say, from the atoms each row carries.
     let visible = set_of(scope.visible);
     let classes = classes_of(p, filter(to_run(decisions), |i: Int| map_contains(visible, i)));
@@ -2022,18 +2107,18 @@ fn selected(
       decisions,
       search,
       sim_json(searching, options.sim),
-      map(classes, |class: List<Int>| group_of_class(w, class)),
+      map(classes, |class: List<Int>| group_of_class(analysis, class)),
       classes,
     );
     // A run that executes nothing builds no unit, unless a schema has constants to enter.
     let build = len(decided.runs) > 0 || options.config.schema != None;
     let handing = time.elapsed_us();
-    let handed = front_of(t, w);
+    let handed = front_of(timed, analysis);
     let building = time.elapsed_us();
     match unit_over(handed, build, true) {
       Err(diags) -> {
         tester.ended[corpus]();
-        unbound(s, { diags: diags, places: p.places })
+        unbound(style, { diags: diags, places: p.places })
       },
       Ok(_) -> {
         let binding = time.elapsed_us();
@@ -2041,22 +2126,22 @@ fn selected(
             tester.schema[corpus](name)) {
           Err(diags) -> {
             tester.ended[corpus]();
-            unbound(s, { diags: diags, places: p.places })
+            unbound(style, { diags: diags, places: p.places })
           },
           Ok(r) -> match tester.bound[corpus](configuration::configured(r.configuration)) {
             Err(diags) -> {
               tester.ended[corpus]();
-              unbound(s, { diags: diags, places: p.places })
+              unbound(style, { diags: diags, places: p.places })
             },
             Ok(_) -> {
               let bound = time.elapsed_us();
               let answer = concluded_run(
                 flags,
-                s,
+                style,
                 options,
                 p,
-                t,
-                w,
+                timed,
+                analysis,
                 scope,
                 decisions,
                 decided,
@@ -2086,11 +2171,11 @@ fn selected(
 // run, and the cause of every failure.
 fn concluded_run(
   flags: Flags,
-  s: Style,
+  style: Style,
   options: Options,
-  p: Program,
-  t: Timed,
-  w: Analysis,
+  program: Program,
+  timed: Timed,
+  analysis: Analysis,
   scope: Scope,
   decisions: List<Decision>,
   decided: Decided,
@@ -2106,18 +2191,18 @@ fn concluded_run(
   };
   let narrowing = narrowed(decisions, decided.search.roots);
   let started = time.elapsed_us();
-  let done = flat_map(decided.classes, |g: Group|
-    ran_class(map(g.tests, |i: Int| job_of(p, 0, i, narrowing, searching)), asked));
+  let done = flat_map(decided.classes, |group: Group|
+    ran_class(map(group.tests, |i: Int| job_of(program, 0, i, narrowing, searching)), asked));
   let elapsed = time.elapsed_us() - started;
   let hosted = tester.hosted[corpus]();
-  let h = hashes_of(w);
+  let h = hashes_of(analysis);
   let running = set_of(decided.runs);
   let by_test = fold(done, map_new(), |acc: Map<Int, Done>, d: Done| map_insert(acc, d.test, d));
   let c: Concluded<Raised> = conclude::concluded(
-    conclude_tests(w),
+    conclude_tests(analysis),
     h,
     {
-      groups: map(decided.classes, |g: Group| g.tests),
+      groups: map(decided.classes, |group: Group| group.tests),
       filed: fold(
         filed(decisions, decided.search),
         map_new(),
@@ -2139,16 +2224,27 @@ fn concluded_run(
     )
   };
   let r = mutated(
-    t,
-    w,
-    p,
-    ran_of(options, p, w, h, decided, hosted, c, by_test, elapsed, appended(configured, stored)),
+    timed,
+    analysis,
+    program,
+    ran_of(
+      options,
+      program,
+      analysis,
+      h,
+      decided,
+      hosted,
+      c,
+      by_test,
+      elapsed,
+      appended(configured, stored),
+    ),
     options,
     asked,
     targeted,
   );
   // After the run is filed, since a pass recorded now is a valid baseline for another's failure.
-  let found = diagnosed_all(options, t, w, c, by_test, r.failures);
+  let found = diagnosed_all(options, timed, analysis, c, by_test, r.failures);
   let cause = decided_faults({ ..r, failures: found.failures }, found.benches, diagnosing(options));
   let proved = if options.no_cache || len(cause.proved) == 0 { [] } else {
     filing_said(
@@ -2160,9 +2256,9 @@ fn concluded_run(
   let lazily = if options.no_cache { [] } else { ledger.opened() };
   let concluding = time.elapsed_us() - started - elapsed;
   answered(
-    s,
+    style,
     flags,
-    p,
+    program,
     {
       ..r,
       failures: found.failures,
@@ -2192,7 +2288,7 @@ fn search_of(p: plan::Plan) -> Search =
   }
 
 // The whole plan, as the document's options carry it: every field is in a seeded test's key.
-fn sim_json(p: plan::Plan, sim: machine::SimOpts) -> Json =
+fn sim_json(p: plan::Plan, sim: machine::SimulationOptions) -> Json =
   object([
     { key: "budget", value: num(p.budget) },
     { key: "measure_reduction", value: Bool(sim.measure_reduction) },
@@ -2234,7 +2330,7 @@ type Done = {
 
 // A seeded test searches the roots it still owes; any other runs once.
 fn job_of(
-  p: Program,
+  program: Program,
   unit: Int,
   index: Int,
   narrowing: List<{ index: Int, roots: List<Int> }>,
@@ -2243,7 +2339,7 @@ fn job_of(
   {
     unit: unit,
     test: index,
-    search: match case_of(p, index) {
+    search: match case_of(program, index) {
       Some(c) -> if !c.seeded { None } else {
         match filter(narrowing, |n: { index: Int, roots: List<Int> }| n.index == index) {
           [owed, ..] -> Some({ ..searching, roots: map(owed.roots, |r: Int| u64_of_int(r)) }),
@@ -2350,7 +2446,7 @@ fn spanned(span: { module: Int, start: Int, end: Int }, said: String) -> Label =
 
 // Why a search stopped at a seed, as the diagnostic a report prints: the run's own failure, or the
 // defect a recording that names no schedule, or a replay that took another, is.
-fn stopped(fl: Failure<Fell>) -> Raised =
+fn stopped(fl: Failure<InterleavingFailure>) -> Raised =
   match search::ran_failure(fl) {
     Some(fell) -> { ..fell.failure, diag: noted(fell.failure.diag, fl.notes) },
     None -> {
@@ -2388,23 +2484,23 @@ fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<String, String> =
   fold(xs, map_new(), |acc: Map<String, String>, x: { name: Bytes, hash: Bytes }|
     map_insert(acc, text(x.name), hex_of(x.hash)))
 
-fn hashes_of(w: Analysis) -> Hashes =
+fn hashes_of(analysis: Analysis) -> Hashes =
   {
-    defs: by_name(w.hashes.defs),
-    decls: by_name(w.hashes.decls),
+    defs: by_name(analysis.hashes.defs),
+    decls: by_name(analysis.hashes.decls),
     closure: |keys: List<String>|
-      map(map_keys(closure_of(w.hashes, map(keys, |k: String| bytes_of_string(k)))), text),
+      map(map_keys(closure_of(analysis.hashes, map(keys, |k: String| bytes_of_string(k)))), text),
   }
 
-fn conclude_tests(w: Analysis) -> List<conclude::Test> =
-  fold(range(0, len(w.checked.tests)), [], |acc: List<conclude::Test>, i: Int|
-    match test_at(w, i) {
+fn conclude_tests(analysis: Analysis) -> List<conclude::Test> =
+  fold(range(0, len(analysis.checked.tests)), [], |acc: List<conclude::Test>, i: Int|
+    match test_at(analysis, i) {
       Some(t) ->
         push(acc, {
           index: i,
           key: text(t.key),
           seeded: seeded_of(t.footprint),
-          hash: hash_at(w, i),
+          hash: hash_at(analysis, i),
         }),
       None -> acc,
     })
@@ -2487,23 +2583,31 @@ fn site_of(x: search::RaceSite) -> Site =
     at: if x.span.module == outside() { None } else { Some(x.span) },
   }
 
-fn outcome_of(w: Analysis, done: Map<Int, Done>, o: conclude::Outcome<Raised>) -> Outcome = {
-  let d = done_at(done, o.index);
+fn outcome_of(w: Analysis, done: Map<Int, Done>, outcome: conclude::Outcome<Raised>) -> Outcome = {
+  let d = done_at(done, outcome.index);
   {
-    index: o.index,
-    name: match test_at(w, o.index) { Some(t) -> text(t.name), None -> "" },
-    hash: hash_at(w, o.index),
+    index: outcome.index,
+    name: match test_at(w, outcome.index) { Some(t) -> text(t.name), None -> "" },
+    hash: hash_at(w, outcome.index),
     duration_us: match d { Some(x) -> x.usage.duration_us, None -> 0 },
-    status: o.status,
-    diagnostic: o.failure,
-    search: match exploration_of(done, o.index) { Some(e) -> Some(explored_of(e)), None -> None },
-    cached: match o.recorded { Some(rec) -> Some(written(rec)), None -> None },
+    status: outcome.status,
+    diagnostic: outcome.failure,
+    search: match exploration_of(done, outcome.index) {
+      Some(e) -> Some(explored_of(e)),
+      None -> None,
+    },
+    cached: match outcome.recorded { Some(rec) -> Some(written(rec)), None -> None },
     performs: match d { Some(x) -> x.usage.performs, None -> 0 },
   }
 }
 
-fn failed_of(w: Analysis, h: Hashes, done: Map<Int, Done>, f: conclude::Failed<Raised>) -> Failed = {
-  let t = test_at(w, f.index);
+fn failed_of(
+  analysis: Analysis,
+  h: Hashes,
+  done: Map<Int, Done>,
+  f: conclude::Failed<Raised>,
+) -> Failed = {
+  let t = test_at(analysis, f.index);
   let e = exploration_of(done, f.index);
   {
     key: f.key,
@@ -2530,7 +2634,7 @@ fn failed_of(w: Analysis, h: Hashes, done: Map<Int, Done>, f: conclude::Failed<R
       None -> None,
     },
     module: match t { Some(x) -> Some(text(x.module)), None -> None },
-    test_hash: hash_at(w, f.index),
+    test_hash: hash_at(analysis, f.index),
     nondet: match t { Some(x) -> Some(x.nondet), None -> None },
     status: match done_at(done, f.index) { Some(d) -> Some(d.status), None -> None },
     declared: match t { Some(x) -> Some(atom_texts(canonical(x.footprint))), None -> None },
@@ -2542,15 +2646,15 @@ fn failed_of(w: Analysis, h: Hashes, done: Map<Int, Done>, f: conclude::Failed<R
 fn escapes_of(hosted: Hosted, w: Analysis, c: Concluded<Raised>) -> List<Diag> = {
   let reached = set_of(hosted.reaches);
   let filed_host = if hosted.hermetic { [] } else {
-    fold(c.outcomes, [], |acc: List<Diag>, o: conclude::Outcome<Raised>| {
-      let wrote = match o.recorded { Some(rec) -> written(rec), None -> false };
-      if !wrote || !map_contains(reached, o.index) { acc } else {
+    fold(c.outcomes, [], |acc: List<Diag>, outcome: conclude::Outcome<Raised>| {
+      let wrote = match outcome.recorded { Some(rec) -> written(rec), None -> false };
+      if !wrote || !map_contains(reached, outcome.index) { acc } else {
         push(
           acc,
           diag_of(
             "error",
             "E0505",
-            "`" ++ (match test_at(w, o.index) { Some(t) -> text(t.name), None -> "" })
+            "`" ++ (match test_at(w, outcome.index) { Some(t) -> text(t.name), None -> "" })
               ++ "` can reach the host binding, and its pass was written to the result cache",
             [],
             [
@@ -2608,8 +2712,8 @@ fn notice_of(n: conclude::Notice) -> Diag =
 
 fn ran_of(
   options: Options,
-  p: Program,
-  w: Analysis,
+  program: Program,
+  analysis: Analysis,
   h: Hashes,
   decided: Decided,
   hosted: Hosted,
@@ -2618,8 +2722,8 @@ fn ran_of(
   elapsed: Int,
   said: List<Diag>,
 ) -> Ran = {
-  let ordered = fold(c.outcomes, [], |acc: List<Done>, o: conclude::Outcome<Raised>|
-    match done_at(done, o.index) { Some(d) -> push(acc, d), None -> acc });
+  let ordered = fold(c.outcomes, [], |acc: List<Done>, outcome: conclude::Outcome<Raised>|
+    match done_at(done, outcome.index) { Some(d) -> push(acc, d), None -> acc });
   let teardown = fold(ordered, [], |acc: List<Diag>, d: Done| appended(acc, d.usage.teardown));
   let b = hosted.backend;
   {
@@ -2629,7 +2733,7 @@ fn ran_of(
     digest: hosted.digest,
     handshakes: hosted.handshakes,
     hosts: hosted.hosts,
-    reaches: filter(hosted.reaches, |i: Int| case_of(p, i) != None),
+    reaches: filter(hosted.reaches, |i: Int| case_of(program, i) != None),
     workers: match options.jobs {
       Some(n) -> if n > 0 { n } else { hosted.cores },
       None -> hosted.cores,
@@ -2646,29 +2750,30 @@ fn ran_of(
       analysis_nanos: b.analysis_nanos,
       codegen_nanos: b.codegen_nanos,
     }),
-    results: map(c.outcomes, |o: conclude::Outcome<Raised>| outcome_of(w, done, o)),
-    failures: map(c.failures, |f: conclude::Failed<Raised>| failed_of(w, h, done, f)),
+    results: map(c.outcomes, |outcome: conclude::Outcome<Raised>|
+      outcome_of(analysis, done, outcome)),
+    failures: map(c.failures, |f: conclude::Failed<Raised>| failed_of(analysis, h, done, f)),
     summary: {
       passed: c.passed,
       failed: c.failed,
       abandoned: c.abandoned,
-      cached: cached_count(p, decided),
+      cached: cached_count(program, decided),
       duration_us: elapsed,
     },
     simulation: c.simulation,
-    escapes: escapes_of(hosted, w, c),
+    escapes: escapes_of(hosted, analysis, c),
     warnings: appended(appended(teardown, map(c.notices, notice_of)), said),
     mutants: None,
-    coverage: if options.coverage { Some(coverage(w)) } else { None },
+    coverage: if options.coverage { Some(coverage(analysis)) } else { None },
     spent: no_spent(),
   }
 }
 
 // A green run's mutants, judged up to the budget; a red run's survivors would say nothing.
 fn mutated(
-  t: Timed,
-  w: Analysis,
-  p: Program,
+  timed: Timed,
+  analysis: Analysis,
+  program: Program,
   r: Ran,
   options: Options,
   asked: Asked,
@@ -2677,15 +2782,21 @@ fn mutated(
   match targeted {
     None -> r,
     Some(defs) -> if !green_run(r) { r } else {
-      let queue = queued(t.program.places, w, defs);
+      let queue = queued(timed.program.places, analysis, defs);
       let shelved = shelf();
-      let every = every_of(p, options);
+      let every = every_of(program, options);
       let judged = map(range(0, min(options.mutate_budget, len(queue.mutants))), |id: Int|
-        judged_mutant(t, w, p, shelved, queue, id, every, asked));
+        judged_mutant(timed, analysis, program, shelved, queue, id, every, asked));
       {
         ..r,
         mutants: Some(
-          mutants(t.program.places, w, queue, judged, len(queue.mutants) > options.mutate_budget),
+          mutants(
+            timed.program.places,
+            analysis,
+            queue,
+            judged,
+            len(queue.mutants) > options.mutate_budget,
+          ),
         ),
       }
     },
@@ -2694,9 +2805,9 @@ fn mutated(
 // The tests that reach a mutant, in the classes every test the run reports on was coloured into: a
 // subset of a class shares nothing either. Every seed of the plan is owed, and nothing is filed.
 fn judged_mutant(
-  t: Timed,
-  w: Analysis,
-  p: Program,
+  timed: Timed,
+  analysis: Analysis,
+  program: Program,
   shelved: List<Source>,
   queue: Queue,
   id: Int,
@@ -2706,7 +2817,7 @@ fn judged_mutant(
   match list_at(queue.mutants, id) {
     None ->
       { id: id, verdict: "unresolved", why: "no mutant " ++ int_to_string(id) ++ " was queued" },
-    Some(m) -> match built(t.program, w, shelved, m.mutation) {
+    Some(m) -> match built(timed.program, analysis, shelved, m.mutation) {
       Err(j) -> { ..j, id: id },
       Ok(unit) -> {
         let classes = filter(
@@ -2715,7 +2826,7 @@ fn judged_mutant(
         );
         let statuses = flat_map(classes, |class: List<Int>|
           map(
-            ran_class(map(class, |i: Int| job_of(p, unit, i, [], asked.plan)), {
+            ran_class(map(class, |i: Int| job_of(program, unit, i, [], asked.plan)), {
               ..asked,
               measuring: false,
             }),
@@ -2782,8 +2893,8 @@ fn no_row() -> Row =
 // that never passed, or a run that bypassed the cache, has no baseline and so no facts.
 fn diagnosed_all(
   options: Options,
-  t: Timed,
-  w: Analysis,
+  timed: Timed,
+  analysis: Analysis,
   c: Concluded<Raised>,
   done: Map<Int, Done>,
   failures: List<Failed>,
@@ -2795,7 +2906,7 @@ fn diagnosed_all(
     if fold(records, true, |none: Bool, r: Option<conclude::PassRecord>| none && r == None) {
       { failures: failures, benches: map(failures, |f: Failed| None) }
     } else {
-      let tree = trials::program_of(t.program, w);
+      let tree = trials::program_of(timed.program, analysis);
       fold(
         range(0, len(failures)),
         { failures: [], benches: [] },
@@ -3015,11 +3126,11 @@ fn a_case(index: Int, name: String) -> Case =
 /// The decision a fixture's keys imply: the reasons come from `decide`, so a fixture that wants a
 /// cached test says its key was answered rather than naming the reason. The classes are the ones the
 /// decision's own runs make, with a placeholder rendering — a fixture reads the shape, not the atoms.
-fn a_decided(p: Program, keys: List<select::Case>) -> Decided = {
+fn a_decided(program: Program, keys: List<select::Case>) -> Decided = {
   let decisions = decide(keys);
-  let classes = classes_of(p, to_run(decisions));
+  let classes = classes_of(program, to_run(decisions));
   decided_of(
-    p,
+    program,
     decisions,
     a_search(),
     Null,
@@ -3071,9 +3182,9 @@ fn a_run(results: List<Outcome>, failed: Int) -> Ran =
     results: results,
     failures: [],
     summary: {
-      passed: len(filter(results, |o: Outcome| o.status == "passed")),
+      passed: len(filter(results, |outcome: Outcome| outcome.status == "passed")),
       failed: failed,
-      abandoned: len(filter(results, |o: Outcome| o.status == "abandoned")),
+      abandoned: len(filter(results, |outcome: Outcome| outcome.status == "abandoned")),
       cached: 0,
       duration_us: 20000,
     },
@@ -3576,7 +3687,7 @@ test "the simulation line counts the searches and says a spent budget out loud" 
     failed: 0,
   };
   assert_eq(simulation_line(plain(), { ..quiet, simulation: counted }), [
-    ind() ++ "simulated: 3 of 47 · 61 interleavings · 3 exhaustive",
+    indent() ++ "simulated: 3 of 47 · 61 interleavings · 3 exhaustive",
   ]);
   let spent = {
     ..counted,
@@ -3587,7 +3698,7 @@ test "the simulation line counts the searches and says a spent budget out loud" 
     exhausted: 1,
   };
   assert_eq(simulation_line(plain(), { ..quiet, simulation: spent }), [
-    ind() ++ "simulated: 1 of 1 · 256 interleavings · 1 budget spent, not cached",
+    indent() ++ "simulated: 1 of 1 · 256 interleavings · 1 budget spent, not cached",
   ])
 }
 
@@ -3668,7 +3779,7 @@ test "`--explain` names and counts the tests that contend only over a region lab
   let r = a_run([], 0);
   assert_eq(
     group_tally(plain(), counts_of(p, r), a_decided(p, keys)),
-    ind()
+    indent()
       ++ "  1 of 3 region-isolated and free · 1 group for the 2 shared tests · 1 of them only over a region label",
   )
 }
@@ -3824,13 +3935,16 @@ fn cases_of_whole(w: Analysis) -> List<Case> =
     match test_at(w, i) { Some(t) -> push(acc, case_view(w, i, t)), None -> acc })
 
 // The classes every test of a program is coloured into, as a run that executes them all colours them.
-fn coloured(w: Analysis) -> List<List<Int>> = {
-  let cases = cases_of_whole(w);
-  classes_of(a_program(cases), map(cases, |c: Case| c.index))
+fn coloured(analysis: Analysis) -> List<List<Int>> = {
+  let cases = cases_of_whole(analysis);
+  classes_of(a_program(cases), map(cases, |case: Case| case.index))
 }
 
-fn texts_of_case(w: Analysis, i: Int) -> List<String> =
-  match list_at(cases_of_whole(w), i) { Some(c) -> map(c.atoms, |x: Printed| x.text), None -> [] }
+fn texts_of_case(analysis: Analysis, i: Int) -> List<String> =
+  match list_at(cases_of_whole(analysis), i) {
+    Some(c) -> map(c.atoms, |printed: Printed| printed.text),
+    None -> [],
+  }
 
 fn a_store() -> String =
   "effect store {\n  read  all[r]() -> Int\n  write save[r](n: Int) -> Unit\n}\n"
@@ -3902,7 +4016,7 @@ test "a test whose regions discharge their cells contends over nothing" {
   let w = compiled(
     "test \"users cell\" { with_cell[users](1) { c -> assert_eq(cell_get(c), 1) } }\ntest \"orders cell\" { with_cell[orders](2) { c -> assert_eq(cell_get(c), 2) } }\ntest \"pure\" { assert_eq(1, 1) }\n",
   );
-  assert_eq(map(cases_of_whole(w), |c: Case| c.footprint), ["{}", "{}", "{}"]);
+  assert_eq(map(cases_of_whole(w), |case: Case| case.footprint), ["{}", "{}", "{}"]);
   assert_eq(coloured(w), [[0, 1, 2]])
 }
 
@@ -3931,8 +4045,8 @@ test "a test that reads a seed is searched, and one that does not runs once" {
   let w = compiled(
     "test \"once\" { assert_eq(1, 1) }\ntest \"searched\" { let n = simulate { task.join(task.spawn(|| 1)) }; assert_eq(n, 1) }\n",
   );
-  assert_eq(map(cases_of_whole(w), |c: Case| c.seeded), [false, true]);
-  assert_eq(map(rows_of(w), |r: Row| r.seeded), [false, true])
+  assert_eq(map(cases_of_whole(w), |case: Case| case.seeded), [false, true]);
+  assert_eq(map(rows_of(w), |row: Row| row.seeded), [false, true])
 }
 
 test "a run reports on the tests `--filter` keeps, and counts the ones it hid" {
