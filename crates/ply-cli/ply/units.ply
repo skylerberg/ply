@@ -4,19 +4,16 @@
 // it was not handed.
 
 import cache (Front)
-import compiler.front (EmitRoot)
-import compiler.hash (hex)
+import compiler.load (every_root)
 import compiler.resolve (Diag)
-import compiler.unit (Dropped, Emission, shipped, compiled, emitted, held)
+import compiler.unit (Dropped, Emission, shipped, compiled, emitted, held, read_kept,
+                      shelf_identity, write_kept)
 import env (env)
 import sources (under_abs)
-import std.bytes (hex_of)
 import std.fs (fs)
 import std.process (process)
-import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
-import store.engine (fresh_nonce)
 
 // A command asks for the unit a run enters; what answers is `emitting`'s, which `main` runs every
 // command under, or a handler of the asker's own. The C is a function of what is asked, so the
@@ -28,121 +25,9 @@ pub effect emit {
 // What emitting a unit here reaches: the runtime it is compiled against, the shelf the emitter was
 // built from, the answers kept between runs under the toolchain's cache, and what the environment
 // asks to be told of it.
-pub effect set Emits = {shipped.runtime, env.bodies[sys], env.var[sys], fs.list_dir[shelf], fs.read_file[shelf], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc]}
-
-// Every root the program's answer offers: each `fn` in source order, then its tests, laws and
-// clauses.
-pub fn every_root(front: Front) -> List<Bytes> = map(front.dump.emit_roots, |r: EmitRoot| r.root)
-
-// The emitter answering here is this program's own compiler, built from the modules the shelf
-// holds: its own and the shipped ones they import, so a shipped module the compiler never reads
-// moves no kept answer.
-fn emitter() -> Bytes / {fs.list_dir[shelf], fs.read_file[shelf], abort.raise} =
-  match fs.list_dir[shelf](".") {
-    None -> b"",
-    Some(names) -> {
-      let texts = fold(names, map_new(), |acc: Map<String, Bytes>, n: String|
-        match fs.read_file[shelf](n) { Some(text) -> map_insert(acc, n, text), None -> acc });
-      let reached = reached_from(
-        texts,
-        filter(names, |n: String| string_starts_with(n, "compiler.")),
-        map_new(),
-      );
-      hex(
-        blake3(
-          bytes_concat_all(
-            map(filter(names, |n: String| map_contains(reached, n)), |n: String|
-              bytes_concat_all([
-                bytes_of_string(n),
-                b"\x00",
-                match map_get(texts, n) { Some(text) -> blake3(text), None -> b"" },
-                b"\x00",
-              ])),
-          ),
-        ),
-      )
-    },
-  }
-
-// Every shelf file `frontier` reaches through the `import` lines its modules open with.
-fn reached_from(
-  texts: Map<String, Bytes>,
-  frontier: List<String>,
-  seen: Map<String, Bool>,
-) -> Map<String, Bool> / {abort.raise} =
-  match list_at(frontier, 0) {
-    None -> seen,
-    Some(file) -> {
-      let rest = drop_first(frontier);
-      if map_contains(seen, file) { reached_from(texts, rest, seen) } else {
-        let opened = match map_get(texts, file) { Some(text) -> imported_files(text), None -> [] };
-        reached_from(
-          texts,
-          fold(opened, rest, |acc: List<String>, f: String| push(acc, f)),
-          map_insert(seen, file, true),
-        )
-      }
-    },
-  }
-
-fn drop_first(xs: List<String>) -> List<String> =
-  fold(range(1, len(xs)), [], |acc: List<String>, i: Int|
-    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })
-
-// The shelf files a module's `import` lines name: a compiler module names a sibling bare, and every
-// module names a shipped one by its `std.` name.
-fn imported_files(text: Bytes) -> List<String> / {abort.raise} =
-  fold(bytes_split(text, b"\n"), [], |acc: List<String>, line: Bytes|
-    if !bytes_starts_with(line, b"import ") { acc } else {
-      let rest = bytes_slice(line, 7, bytes_len(line));
-      let name = string_of_bytes_lossy(bytes_slice(rest, 0, name_end(rest)));
-      push(acc, if string_starts_with(name, "std.") || string_starts_with(name, "compiler.") {
-        name ++ ".ply"
-      } else { "compiler." ++ name ++ ".ply" })
-    })
-
-fn name_end(rest: Bytes) -> Int / {abort.raise} = {
-  let space = match bytes_index_of_byte(rest, 32) { Some(i) -> i, None -> bytes_len(rest) };
-  match bytes_index_of_byte(rest, 40) {
-    Some(i) -> if i < space { i } else { space },
-    None -> space,
-  }
-}
+pub effect set Emits = {shipped.runtime, shipped.names, shipped.module, env.bodies[sys], env.var[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc]}
 
 fn kept_dir() -> String / {env.bodies[sys], abort.raise} = under_abs(env.bodies[sys]())
-
-fn kept_at(key: Bytes) -> String / {env.bodies[sys], abort.raise} =
-  kept_dir() ++ "/" ++ string_of_bytes(key)
-
-// An answer read is an answer used, which is what keeps it from the toolchain's sweep.
-fn read_kept(
-  key: Bytes,
-) -> Option<Bytes> / {env.bodies[sys], fs.read[abs], fs.write[abs], time.now_ms, abort.raise} = {
-  let path = kept_at(key);
-  match fs.read_file[abs](path) {
-    None -> None,
-    Some(bytes) -> {
-      fs.set_modified[abs](path, time.now_ms());
-      Some(bytes)
-    },
-  }
-}
-
-// Written beside itself and renamed into place, so a reader finds a whole answer or none. An answer
-// that cannot be written is left unwritten.
-fn write_kept(
-  key: Bytes,
-  bytes: Bytes,
-) -> Unit / {env.bodies[sys], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
-  let path = kept_at(key);
-  let temp = path ++ "." ++ hex_of(fresh_nonce()) ++ ".tmp";
-  if fs.create_dir[abs](kept_dir()) && fs.write_file[abs](temp, bytes) {
-    if !fs.rename[abs](temp, path) {
-      fs.remove[abs](temp);
-      ()
-    }
-  }
-}
 
 fn texts(front: Front) -> List<Bytes> =
   map(front.files, |f: { path: String, name: String, text: Bytes }| f.text)
@@ -213,7 +98,8 @@ fn told(
 fn unit_of(front: Front, offered: List<Bytes>) -> Result<Bytes, List<Diag>> / {Emits, abort.raise} = {
   let k = knobs();
   let wanted = narrowed(k, offered);
-  let identity = emitter();
+  let identity = shelf_identity();
+  let dir = kept_dir();
   let started = time.elapsed_ms();
   let emission = emitted(
     shipped.runtime(),
@@ -221,8 +107,8 @@ fn unit_of(front: Front, offered: List<Bytes>) -> Result<Bytes, List<Diag>> / {E
     texts(front),
     wanted,
     identity,
-    read_kept,
-    write_kept,
+    |key: Bytes| read_kept[abs](dir, key),
+    |key: Bytes, bytes: Bytes| write_kept[abs](dir, key, bytes),
   );
   told(k, len(wanted), emission, identity, time.elapsed_ms() - started);
   held(front.dump, wanted, emission)

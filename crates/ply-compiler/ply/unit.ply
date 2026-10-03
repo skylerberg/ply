@@ -11,8 +11,12 @@ import front (Dump, EmitRoot, EmitCtor, KeyRow, ModuleRow, OrdinalRow)
 import interface (stubbed)
 import resolve (Pkg, Diag, Label, diag)
 import std.bin
-import std.bytes (u32_at)
+import std.list (take)
+import std.bytes (hex_of, u32_at, u64_le)
+import std.fs (fs)
 import std.hash (blake3)
+import std.random (entropy)
+import std.time (time)
 
 fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
   match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
@@ -43,6 +47,110 @@ pub effect shipped {
   read version() -> String
   read stamps() -> String
   read runtime() -> Runtime
+  // A program as this binary's launcher enters it: the entry it runs, its front end's answer over
+  // every source that answer's indices run over, in their order, and the C of its unit.
+  read runnable(entry: String, files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, unit: Bytes) -> Bytes
+}
+
+// What an emitter built from the shelf answers is a function of: the compiler's modules and the
+// shipped ones they import, so a shipped module the compiler never reads moves no kept answer.
+pub fn shelf_identity() -> Bytes / {shipped.names, shipped.module} = {
+  let names = shipped.names();
+  let texts = fold(names, map_new(), |acc: Map<String, Bytes>, n: String|
+    match shipped.module(n) { Some(text) -> map_insert(acc, n, text), None -> acc });
+  let reached = reached_from(
+    texts,
+    filter(names, |n: String| string_starts_with(n, "compiler.")),
+    map_new(),
+  );
+  hex(
+    blake3(
+      bytes_concat_all(
+        map(filter(names, |n: String| map_contains(reached, n)), |n: String|
+          bytes_concat_all([
+            bytes_of_string(n),
+            b"\x00",
+            match map_get(texts, n) { Some(text) -> blake3(text), None -> b"" },
+            b"\x00",
+          ])),
+      ),
+    ),
+  )
+}
+
+// Every shipped module `frontier` reaches through the `import` lines its modules open with.
+fn reached_from(
+  texts: Map<String, Bytes>,
+  frontier: List<String>,
+  seen: Map<String, Bool>,
+) -> Map<String, Bool> =
+  match frontier {
+    [] -> seen,
+    [module, ..rest] -> if map_contains(seen, module) { reached_from(texts, rest, seen) } else {
+      let opened = match map_get(texts, module) { Some(text) -> imports_of(text), None -> [] };
+      reached_from(texts, append(rest, opened), map_insert(seen, module, true))
+    },
+  }
+
+// The shipped modules a module's `import` lines name: a compiler module names a sibling bare, and
+// every module names a standard one by its `std.` name.
+fn imports_of(text: Bytes) -> List<String> =
+  fold(bytes_split(text, b"\n"), [], |acc: List<String>, line: Bytes|
+    if !bytes_starts_with(line, b"import ") { acc } else {
+      let rest = bytes_slice(line, 7, bytes_len(line));
+      let name = string_of_bytes_lossy(bytes_slice(rest, 0, name_end(rest)));
+      push(acc, if string_starts_with(name, "std.") || string_starts_with(name, "compiler.") {
+        name
+      } else { "compiler." ++ name })
+    })
+
+fn name_end(rest: Bytes) -> Int = {
+  let space = match bytes_index_of_byte(rest, 32) { Some(i) -> i, None -> bytes_len(rest) };
+  match bytes_index_of_byte(rest, 40) {
+    Some(i) -> if i < space { i } else { space },
+    None -> space,
+  }
+}
+
+fn kept_at(dir: String, key: Bytes) -> String =
+  if dir == "" || dir == "." { string_of_bytes(key) } else { dir ++ "/" ++ string_of_bytes(key) }
+
+// An answer kept between runs under `dir`. A read is a use, which keeps it from the toolchain's
+// sweep.
+pub fn read_kept<[r]>(
+  dir: String,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], fs.write[r], time.now_ms} = {
+  let path = kept_at(dir, key);
+  match fs.read_file[r](path) {
+    None -> None,
+    Some(bytes) -> {
+      fs.set_modified[r](path, time.now_ms());
+      Some(bytes)
+    },
+  }
+}
+
+// Written beside itself and renamed into place, so a reader finds a whole answer or none. An answer
+// that cannot be written is left unwritten.
+pub fn write_kept<[r]>(
+  dir: String,
+  key: Bytes,
+  bytes: Bytes,
+) -> Unit / {fs.write[r], entropy.next, time.now_ms} = {
+  let path = kept_at(dir, key);
+  let nonce = bytes_slice(
+    blake3(bytes_concat(u64_le(entropy.next()), u64_le(time.now_ms()))),
+    0,
+    8,
+  );
+  let temp = path ++ "." ++ hex_of(nonce) ++ ".tmp";
+  if fs.create_dir[r](if dir == "" { "." } else { dir }) && fs.write_file[r](temp, bytes) {
+    if !fs.rename[r](temp, path) {
+      fs.remove[r](temp);
+      ()
+    }
+  }
 }
 
 // A root a unit is offered: its arity, and whether it is pure and takes nothing, which the unit
@@ -74,28 +182,6 @@ pub fn answers_of(rows: List<RootAnswer>) -> Map<Bytes, Answer> =
     })
 
 // --- Order --------------------------------------------------------------------
-
-fn before(a: Bytes, b: Bytes) -> Bool = match compare_values(a, b) { Greater -> false, _ -> true }
-
-fn merged(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  iterate({ i: 0, j: 0, out: [] }, len(a) + len(b) + 1, |s: { i: Int, j: Int, out: List<Bytes> }|
-    if s.i >= len(a) {
-      Stop(fold(range(s.j, len(b)), s.out, |acc: List<Bytes>, k: Int| push(acc, at(b, k))))
-    } else if s.j >= len(b) {
-      Stop(fold(range(s.i, len(a)), s.out, |acc: List<Bytes>, k: Int| push(acc, at(a, k))))
-    } else if before(at(a, s.i), at(b, s.j)) {
-      Continue({ ..s, i: s.i + 1, out: push(s.out, at(a, s.i)) })
-    } else { Continue({ ..s, j: s.j + 1, out: push(s.out, at(b, s.j)) }) })
-
-fn slice<a>(xs: List<a>, from: Int, to: Int) -> List<a> / {abort.raise} =
-  fold(range(from, to), [], |acc: List<a>, i: Int| push(acc, at(xs, i)))
-
-// Ascending by byte, duplicates kept, as `Vec::sort` leaves names.
-fn sorted(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  if len(xs) <= 1 { xs } else {
-    let half = len(xs) / 2;
-    merged(sorted(slice(xs, 0, half)), sorted(slice(xs, half, len(xs))))
-  }
 
 // Ascending by byte, each once.
 fn ordered(xs: List<Bytes>) -> List<Bytes> =
@@ -327,7 +413,7 @@ fn pools_of(
     map_insert(map_new(), shape_key(entry_fields()), entry_fields()),
     |acc: Map<Bytes, List<Bytes>>, t: Tables|
       fold(t.shapes, acc, |into: Map<Bytes, List<Bytes>>, names: List<Bytes>| {
-        let s = sorted(names);
+        let s = ordered(names);
         map_insert(into, shape_key(s), s)
       }),
   );
@@ -394,7 +480,7 @@ fn indexed(t: Tables, lines: List<Bytes>, p: Placed) -> Indexed / {abort.raise} 
     consts: map(lines, |l: Bytes| place(p.consts, l)),
     fields: map(t.fields, |f: Bytes| place(p.fields, f)),
     builtins: map(t.builtins, |b: Bytes| place(p.builtins, b)),
-    shapes: map(t.shapes, |s: List<Bytes>| place(p.shapes, shape_key(sorted(s)))),
+    shapes: map(t.shapes, |s: List<Bytes>| place(p.shapes, shape_key(ordered(s)))),
     lambdas: map(t.lambdas, |l: Bytes| place(p.lambdas, l)),
   }
 
@@ -541,7 +627,7 @@ fn literal_lines(line: Bytes) -> Bytes / {abort.raise} = {
 fn split_lines(text: Bytes) -> List<Bytes> / {abort.raise} = {
   let parts = bytes_split(text, b"\n");
   let whole = if len(parts) > 0 && bytes_len(at(parts, len(parts) - 1)) == 0 {
-    slice(parts, 0, len(parts) - 1)
+    take(parts, len(parts) - 1)
   } else { parts };
   map(whole, |l: Bytes|
     if bytes_len(l) > 0 && bytes_at(l, bytes_len(l) - 1) == 13 {
@@ -630,7 +716,7 @@ pub fn produce(
 ) -> Produced / {abort.raise} = {
   let arity = fold(offered, map_new(), |acc: Map<Bytes, Offered>, o: Offered|
     map_insert(acc, o.name, o));
-  let s = settle(answers, sorted(map(offered, |o: Offered| o.name)), []);
+  let s = settle(answers, ordered(map(offered, |o: Offered| o.name)), []);
   let published = |n: Bytes|
     match map_get(s.symbols, n) {
       Some(d) -> d,
@@ -799,7 +885,7 @@ pub fn emitted<| e>(
     runtime.identity,
     emitter,
   ];
-  let fragment = kept_key(sorted(offered));
+  let fragment = kept_key(ordered(offered));
   let body_key = |m: Bytes| kept_key(append(common, [b"body", m]));
   let refusal_key = |m: Bytes| kept_key(append(common, [b"refusal", fragment, m]));
   let looked = fold(offered, map_new(), |acc: Map<Bytes, Answer>, n: Bytes|

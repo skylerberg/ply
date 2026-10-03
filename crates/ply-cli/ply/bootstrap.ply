@@ -1,19 +1,26 @@
-// `ply bootstrap` — the compiler written out as the bundle the runtime builds its emitter from: its
-// unit's C gzipped as `unit.c.gz`, beside the `SOURCES.digest` of the modules it came from. The
-// front end, the emission and the unit are this program's, and so is what `--verify` makes of them.
+// `ply bootstrap` — a program this binary ships written out as its launcher enters it: the builder
+// (`build.main`, the compiler's own) or `ply` itself (`ply.main`), each as `<stem>.run` beside the
+// `<stem>.digest` the launcher gates it on. The builder's unit is also written as the bundle the
+// runtime's emitter library is built from: `unit.c.gz` beside the `SOURCES.digest` of the modules it
+// came from. The front end, the emission and the runnable are this program's, and so is what
+// `--verify` makes of them.
 
 import args (Flags, style_of)
+import build (Def, defs_of)
 import cache (Front)
 import builder (builder)
 import diagnostic (Place)
+import env (env)
 import paths (Rooted, child, create_dir, read_file, spelled, write_file)
 import program (Timed, front_of, outside, timed_load)
 import report (Answer, ok_code, compile_error, refused, reported)
 import style (Style, plain)
-import units (emit, every_root, whole)
-import compiler.front (ModuleRow)
+import units (emit, whole)
+import compiler.front (ModuleRow, Whole)
 import compiler.hash (hex)
+import compiler.load (every_root)
 import compiler.resolve (Diag, diag1)
+import compiler.unit (shipped)
 import std.fs (fs)
 import std.hash (blake3)
 import std.json (Json, Str, Bool, Number, Array, object)
@@ -23,36 +30,49 @@ import std.time (time)
 // What `ply bootstrap` is configured with, as the program parses it.
 pub type Options = { out: String, verify: Bool }
 
-// The two digests an archive is described by: over the sources it came from, and over the
-// gzipped C it holds.
-pub type Described = { source: String, artifact: String }
+// A program this binary ships: the definition it enters, and the name its files go by.
+pub type Shipped = { entry: String, stem: String }
+
+pub fn programs() -> List<Shipped> =
+  [{ entry: "build.main", stem: "build" }, { entry: "ply.main", stem: "ply" }]
+
+// The two digests a runnable is described by: the one its launcher gates it on, and over its bytes.
+pub type Described = { digest: String, runnable: String }
 
 pub type Emitted = {
-  // Over the module texts, sorted: the version the archive is of, which `SOURCES.digest` holds.
-  source: String,
-  // Over `unit.c.gz`, which is what `--verify` checks.
-  artifact: String,
+  program: Shipped,
+  // What the launcher gates the program on, which `<stem>.digest` holds.
+  digest: String,
+  // Over `<stem>.run`, which is what `--verify` checks.
+  runnable: String,
   definitions: Int,
   bytes: Int,
-  // Where the bundle lives, whether or not one is there.
+  // Where the files go, whether or not they are there.
   at: String,
-  // The bundle on disk as `--verify` read it; `None` when there is none, and on a run that wrote.
+  // The files on disk as `--verify` read them; `None` when there are none, and on a run that wrote.
   recorded: Option<Described>,
 }
 
 fn described(e: Emitted) -> Json =
-  object([{ key: "source", value: Str(e.source) }, { key: "artifact", value: Str(e.artifact) }])
+  object([{ key: "digest", value: Str(e.digest) }, { key: "runnable", value: Str(e.runnable) }])
 
 fn described_json(d: Described) -> Json =
-  object([{ key: "source", value: Str(d.source) }, { key: "artifact", value: Str(d.artifact) }])
+  object([{ key: "digest", value: Str(d.digest) }, { key: "runnable", value: Str(d.runnable) }])
 
 // --- Refusals -----------------------------------------------------------------
 
 fn nowhere(message: String, label: Bytes) -> Diag =
   diag1(b"E0502", outside(), { start: 0, end: 0 }, bytes_of_string(message), label, [])
 
-fn no_archive(at: String) -> Diag =
-  nowhere("no archive at " ++ at, b"`--verify` compares against an archive already written")
+fn no_runnable(at: String) -> Diag =
+  nowhere("no runnable at " ++ at, b"`--verify` compares against a runnable already written")
+
+fn not_shipped(found: List<Shipped>) -> Diag =
+  nowhere(
+    if len(found) == 0 { "this is no program this binary ships" }
+    else { "this is more than one program this binary ships" },
+    b"`ply bootstrap` writes the builder (`build.main`) or `ply` itself (`ply.main`); `ply build` builds any other program",
+  )
 
 fn refusing(s: Style, d: Diag) -> Answer / {abort.raise} = reported(s, "bootstrap", [d], [])
 
@@ -66,7 +86,7 @@ fn agrees(e: Emitted) -> Answer =
       { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
       { key: "verified", value: described(e) },
     ]),
-    lines: ["the archive describes this tree: " ++ e.source],
+    lines: ["the runnable describes this tree: " ++ e.digest],
     errs: [],
     code: ok_code(),
   }
@@ -82,21 +102,21 @@ fn differs(e: Emitted, recorded: Described) -> Answer =
     ]),
     lines: [],
     errs: [
-      "the archive does not describe this tree:",
-      "  recorded " ++ recorded.source ++ " " ++ recorded.artifact,
-      "  emitted  " ++ e.source ++ " " ++ e.artifact,
+      "the runnable does not describe this tree:",
+      "  recorded " ++ recorded.digest ++ " " ++ recorded.runnable,
+      "  emitted  " ++ e.digest ++ " " ++ e.runnable,
     ],
     code: compile_error(),
   }
 
 fn verified(s: Style, e: Emitted) -> Answer / {abort.raise} =
   match e.recorded {
-    None -> refusing(s, no_archive(e.at)),
-    Some(d) -> if d.source == e.source && d.artifact == e.artifact { agrees(e) }
+    None -> refusing(s, no_runnable(e.at)),
+    Some(d) -> if d.digest == e.digest && d.runnable == e.runnable { agrees(e) }
     else { differs(e, d) },
   }
 
-// --- The archive a run writes -------------------------------------------------------
+// --- What a run writes ----------------------------------------------------------
 
 pub fn wrote(e: Emitted) -> Answer =
   {
@@ -104,26 +124,29 @@ pub fn wrote(e: Emitted) -> Answer =
       { key: "command", value: Str("bootstrap") },
       { key: "ok", value: Bool(true) },
       { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
+      { key: "entry", value: Str(e.program.entry) },
       { key: "wrote", value: Str(e.at) },
-      { key: "archive", value: described(e) },
+      { key: "runnable", value: described(e) },
     ]),
     lines: [
-      int_to_string(e.definitions) ++ " definitions, " ++ int_to_string(e.bytes) ++ " bytes of C",
-      "source   " ++ e.source,
-      "artifact " ++ e.artifact,
+      e.program.entry ++ ": " ++ int_to_string(e.definitions) ++ " definitions, "
+        ++ int_to_string(e.bytes)
+        ++ " bytes of C",
+      "digest   " ++ e.digest,
+      "runnable " ++ e.runnable,
       "wrote    " ++ e.at,
     ],
     errs: [],
     code: ok_code(),
   }
 
-fn unit_file() -> String = "unit.c.gz"
+fn runnable_file(p: Shipped) -> String = p.stem ++ ".run"
 
-fn sources_file() -> String = "SOURCES.digest"
+fn digest_file(p: Shipped) -> String = p.stem ++ ".digest"
 
-// The version an archive is of: every module the program was built from, its own and the shipped
-// ones it pulled, by name, as the runtime digests the emitter it embeds.
-fn sources_digest(front: Front) -> String / {abort.raise} = {
+// The version the emitter library is of: every module the builder was built from, its own and the
+// shipped ones it pulled, by name, as the runtime digests the emitter it embeds.
+fn sources_digest(front: Front) -> String = {
   let named = map_values(
     fold(front.dump.modules, map_new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
       map_insert(
@@ -141,102 +164,121 @@ fn sources_digest(front: Front) -> String / {abort.raise} = {
 }
 
 fn unwritable(at: String) -> Diag =
-  nowhere("could not write the archive at " ++ at, b"the archive could not be written")
+  nowhere("could not write the runnable at " ++ at, b"the runnable could not be written")
 
 fn recorded_at(
   out: Rooted,
-) -> Option<Described> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  match read_file(child(out, sources_file())) {
+  p: Shipped,
+) -> Option<Described> / {fs.read_file[cwd], fs.read_file[abs]} =
+  match read_file(child(out, digest_file(p))) {
     None -> None,
-    Some(digest) -> match read_file(child(out, unit_file())) {
+    Some(digest) -> match read_file(child(out, runnable_file(p))) {
       None -> None,
-      Some(unit) ->
+      Some(bytes) ->
         Some({
-          source: string_trim(string_of_bytes(digest)),
-          artifact: string_of_bytes(hex(blake3(unit))),
+          digest: string_trim(string_of_bytes(digest)),
+          runnable: string_of_bytes(hex(blake3(bytes))),
         }),
     },
   }
 
+// The runnable and its digest, and for the builder the emitter library's bundle too.
 fn landed(
   out: Rooted,
-  packed: Bytes,
-  source: String,
+  e: Emitted,
+  bytes: Bytes,
+  unit: Bytes,
+  front: Front,
 ) -> Bool / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs]} =
-  create_dir(out) && write_file(child(out, unit_file()), packed)
-    && write_file(child(out, sources_file()), bytes_of_string(source ++ "\n"))
+  create_dir(out) && write_file(child(out, runnable_file(e.program)), bytes)
+    && write_file(child(out, digest_file(e.program)), bytes_of_string(e.digest ++ "\n"))
+    && (e.program.stem != "build"
+    || (write_file(child(out, "unit.c.gz"), bytes_gzip(unit))
+    && write_file(child(out, "SOURCES.digest"), bytes_of_string(sources_digest(front) ++ "\n"))))
+
+// Which program this binary ships the tree is, by the definition it holds that one of them enters.
+fn shipped_of(w: Whole) -> List<Shipped> = {
+  let names = map(defs_of(w), |d: Def| d.name);
+  filter(programs(), |p: Shipped| len(filter(names, |n: String| n == p.entry)) > 0)
+}
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, abort.raise} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, env.shipped_digest[sys], env.builder_digest[sys], shipped.runnable} = {
   let s = style_of(flags);
   let options = options_of(flags);
   let t: Timed = timed_load(flags.paths, false, false);
   match t.program.whole {
     None -> refused(s, "bootstrap", t.program.diags, t.program.places),
-    Some(w) -> {
-      let front = front_of(t, w);
-      match whole(front) {
-        Err(diags) -> reported(s, "bootstrap", diags, t.program.places),
-        Ok(text) -> {
-          let packed = bytes_gzip(text);
-          let out = spelled(options.out);
-          let emitted = {
-            source: sources_digest(front),
-            artifact: string_of_bytes(hex(blake3(packed))),
-            definitions: len(every_root(front)),
-            bytes: bytes_len(text),
-            at: options.out,
-            recorded: None,
-          };
-          if options.verify { verified(s, { ..emitted, recorded: recorded_at(out) }) }
-          else if landed(out, packed, emitted.source) { wrote(emitted) }
-          else { refusing(s, unwritable(options.out)) }
-        },
-      }
+    Some(w) -> match shipped_of(w) {
+      [p] -> {
+        let front = front_of(t, w);
+        match whole(front) {
+          Err(diags) -> reported(s, "bootstrap", diags, t.program.places),
+          Ok(unit) -> {
+            let bytes = shipped.runnable(p.entry, front.files, front.dump, unit);
+            let out = spelled(options.out);
+            let emitted = {
+              program: p,
+              digest: if p.stem == "build" { env.builder_digest[sys]() }
+              else { env.shipped_digest[sys]() },
+              runnable: string_of_bytes(hex(blake3(bytes))),
+              definitions: len(every_root(front)),
+              bytes: bytes_len(unit),
+              at: options.out,
+              recorded: None,
+            };
+            if options.verify { verified(s, { ..emitted, recorded: recorded_at(out, p) }) }
+            else if landed(out, emitted, bytes, unit, front) { wrote(emitted) }
+            else { refusing(s, unwritable(options.out)) }
+          },
+        }
+      },
+      found -> refusing(s, not_shipped(found)),
     },
   }
 }
 
-// The options the archive is written under, from the parsed line.
+// The options the runnable is written under, from the parsed line.
 fn options_of(flags: Flags) -> Options =
   { out: match flags.out { Some(o) -> o, None -> "bootstrap" }, verify: flags.action == "verify" }
 
 // --- Tests ------------------------------------------------------------------
 
-fn an_archive() -> Emitted =
+fn a_runnable() -> Emitted =
   {
-    source: "1a2b",
-    artifact: "3c4d",
+    program: { entry: "ply.main", stem: "ply" },
+    digest: "1a2b",
+    runnable: "3c4d",
     definitions: 12,
     bytes: 4096,
     at: "bootstrap",
     recorded: None,
   }
 
-test "a run that wrote the archive reports both digests and where it landed" {
-  let answer = wrote(an_archive());
+test "a run that wrote the runnable reports both digests and where it landed" {
+  let answer = wrote(a_runnable());
   assert_eq(answer.code, 0);
   assert_eq(answer.lines, [
-    "12 definitions, 4096 bytes of C",
-    "source   1a2b",
-    "artifact 3c4d",
+    "ply.main: 12 definitions, 4096 bytes of C",
+    "digest   1a2b",
+    "runnable 3c4d",
     "wrote    bootstrap",
   ])
 }
 
-test "`--verify` takes an archive that says what this tree emits, and refuses one that does not" {
+test "`--verify` takes a runnable that says what this tree builds, and refuses one that does not" {
   let s = plain();
-  let same = verified(s, { ..an_archive(), recorded: Some({ source: "1a2b", artifact: "3c4d" }) });
+  let same = verified(s, { ..a_runnable(), recorded: Some({ digest: "1a2b", runnable: "3c4d" }) });
   assert_eq(same.code, 0);
-  assert_eq(same.lines, ["the archive describes this tree: 1a2b"]);
-  let moved = verified(s, { ..an_archive(), recorded: Some({ source: "ffff", artifact: "3c4d" }) });
+  assert_eq(same.lines, ["the runnable describes this tree: 1a2b"]);
+  let moved = verified(s, { ..a_runnable(), recorded: Some({ digest: "ffff", runnable: "3c4d" }) });
   assert_eq(moved.code, 2);
-  assert_eq(list_at(moved.errs, 0), Some("the archive does not describe this tree:"))
+  assert_eq(list_at(moved.errs, 0), Some("the runnable does not describe this tree:"))
 }
 
-test "`--verify` with no archive to compare against says where it looked" {
-  let answer = verified(plain(), an_archive());
+test "`--verify` with no runnable to compare against says where it looked" {
+  let answer = verified(plain(), a_runnable());
   assert_eq(answer.code, 2);
   assert(answer.errs != [])
 }

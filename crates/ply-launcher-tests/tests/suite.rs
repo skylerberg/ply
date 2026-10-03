@@ -20,6 +20,7 @@ nondet effect env {
   read binary_version[e]() -> String
   read pwd[e]() -> String
   read shipped_digest[e]() -> String
+  read builder_digest[e]() -> String
   read fronts[e]() -> String
   read bodies[e]() -> String
 }

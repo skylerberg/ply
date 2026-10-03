@@ -22,7 +22,7 @@ of it next.
 | --- | --- |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
-| `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its bootstrap bundle (`bootstrap/`) |
+| `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its builder, committed as a runnable (`bootstrap/`) |
 | `crates/ply-store` | what `ply` keeps under `.ply-cache`, as the `store` package in `ply/`; not a cargo crate |
 | `crates/ply-test` | what a test run decides, as the `suite` package in `ply/`; not a cargo crate |
 | `crates/ply-prove` | specification obligations and their discharge, as the `prove` package in `ply/`; not a cargo crate |
@@ -30,7 +30,7 @@ of it next.
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
 | `crates/ply-machine` | the nested-entry capability: a program loading and entering another program; and the runtime `ply test` and `ply prove` drive |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
-| `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the artifact it builds (`bootstrap/`); not a cargo crate |
+| `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the runnable it is built into (`bootstrap/`); not a cargo crate |
 | `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-launcher` | the `ply` binary: enters the program the artifact holds |
 | `crates/ply-corpus` | the benchmark corpus as a Ply program (`ply/`), the checks that run it end to end (`checks/`) and the programs it measures (`fixtures/`); not a cargo crate |
@@ -64,11 +64,13 @@ name a server.
 
 ## The compiler bootstrap
 
-The compiler is Ply source under `crates/ply-compiler/ply`, compiled to C and
-committed as `crates/ply-compiler/bootstrap/unit.c.gz` beside `SOURCES.digest`, a
-digest of those sources and of the shipped modules they import, which the compiler
-pulls from `crates/ply-std/ply` the way it pulls a project's. A binary whose bundle is behind its sources has the bundle's emitter emit
-them once, keeps that stage under the unit cache, and runs the sources from then on.
-So the compiler and what it imports cannot use a language rule the same change
-introduces; the rest of the standard library can. Never commit the bundle: CI
-rebuilds it on main after each merge.
+The compiler is Ply source under `crates/ply-compiler/ply`. Its builder, the
+compiler's own `build.main`, is committed as `crates/ply-compiler/bootstrap/build.run`
+beside `build.digest`: a runnable, the front end's answer and the unit's C, which the
+launcher enters without running a compiler; `unit.c.gz` beside `SOURCES.digest` holds the same
+unit as the library the runtime's emitter is built from. A binary whose builder is behind its
+sources has the committed builder build theirs once, keeps it under the stages,
+and builds `ply` (`crates/ply-cli/bootstrap/ply.run`) with it when that is behind
+too. So the compiler and the shipped modules it imports cannot use a language rule
+the same change introduces; the rest of the standard library can. Never commit the
+runnables: CI rebuilds them on main after each merge.
