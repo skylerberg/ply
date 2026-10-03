@@ -648,7 +648,8 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
 }
 
 /// Each builtin's parameter count in the scheme the port's checker binds it to: its `tycore.Type`,
-/// which is a `TyFn` whose `params` are the parameters.
+/// which is a `TyFn` whose `params` are the parameters, and ahead of them the witnesses the
+/// elaboration passes for a `numeric` or `integer` constraint.
 fn prelude_arities() -> std::collections::BTreeMap<String, usize> {
     ply_codegen::c::producer::ensure_default();
     let answer = ply_codegen::c::producer::call("front.builtin_rows", &[])
@@ -674,7 +675,11 @@ fn prelude_arities() -> std::collections::BTreeMap<String, usize> {
             documented, params,
             "`{name}` is documented with {documented} parameter names for {params} parameters"
         );
-        let twice = out.insert(name.to_string(), params).is_some();
+        let witnesses = row
+            .field("witnesses")
+            .and_then(|w| w.number::<usize>())
+            .unwrap();
+        let twice = out.insert(name.to_string(), witnesses + params).is_some();
         assert!(!twice, "the prelude binds `{name}` twice");
     }
     out
@@ -716,10 +721,11 @@ fn the_runtime_implements_exactly_the_builtins_the_prelude_types() {
     assert_eq!(names, unique, "`Builtin::all()` lists a builtin twice");
 
     let prelude = prelude_arities();
+    // A name no source can spell is the elaboration's to write, never a program's to call.
     let untyped: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|n| !prelude.contains_key(*n))
+        .filter(|n| !prelude.contains_key(*n) && !n.starts_with('?'))
         .collect();
     assert!(
         untyped.is_empty(),
