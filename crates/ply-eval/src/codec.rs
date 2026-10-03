@@ -21,6 +21,8 @@ const LIST: u8 = 9;
 const MAP: u8 = 10;
 const RECORD: u8 = 11;
 const CTOR: u8 = 12;
+const CHAR: u8 = 13;
+const ARRAY: u8 = 14;
 
 pub fn encode(v: &Value) -> Result<Vec<u8>, String> {
     let mut e = Encoder {
@@ -80,6 +82,10 @@ impl<'v> Encoder<'v> {
                     self.varint((f.bits() >> 64) as u64);
                 }
             }
+            &Value::Char(c) => {
+                self.out.push(CHAR);
+                self.varint(u64::from(u32::from(c)));
+            }
             Value::Str(s) => {
                 self.out.push(STR);
                 self.blob(s.as_bytes());
@@ -90,6 +96,13 @@ impl<'v> Encoder<'v> {
             }
             Value::List(items) => {
                 self.out.push(LIST);
+                self.varint(items.len() as u64);
+                for item in items.iter() {
+                    self.value(item)?;
+                }
+            }
+            Value::Array(items) => {
+                self.out.push(ARRAY);
                 self.varint(items.len() as u64);
                 for item in items.iter() {
                     self.value(item)?;
@@ -183,6 +196,12 @@ impl Decoder<'_> {
                 };
                 Value::Fixed(Fixed::new(ty, high | low))
             }
+            CHAR => Value::Char(
+                u32::try_from(self.varint()?)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or("a character that is not a Unicode scalar value")?,
+            ),
             STR => {
                 let b = self.blob()?;
                 Value::str(std::str::from_utf8(b).map_err(|_| "a string that is not UTF-8")?)
@@ -195,6 +214,14 @@ impl Decoder<'_> {
                     items.push(self.value()?);
                 }
                 Value::List(List::from(items))
+            }
+            ARRAY => {
+                let n = self.count()?;
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.value()?);
+                }
+                Value::array(items)
             }
             MAP => {
                 let n = self.count()?;

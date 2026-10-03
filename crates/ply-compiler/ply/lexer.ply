@@ -39,6 +39,8 @@ pub type Tok =
   // A line string's lines, joined: a value like a `TStr`'s, which only an expression may be.
   | TLines(Bytes)
   | TBytes(Bytes)
+  // A character literal's Unicode scalar value.
+  | TChar(Int)
   | TKw(Bytes)
   | TPunct(Bytes)
   | TEof
@@ -152,7 +154,7 @@ fn token_at(src: Bytes, s: Scan, start: Int) -> Scan = {
   else if is_ident_start(c) { ident(src, s, start) }
   else if c == 34 { string_lit(src, s, start, start + 1, b"") }
   else if c == 92 && at(src, start + 1) == 92 { line_string(src, s, start, start, []) }
-  else if c >= 128 {
+  else if c == 39 { char_lit(src, s, start) } else if c >= 128 {
     // With no Unicode table, any non-ASCII character outside a literal is refused as `X0001`.
     err(
       seek(s, start + utf8_len(c)),
@@ -690,18 +692,182 @@ fn string_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Sc
   else if c == 114 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\r")) }
   else if c == 48 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\x00")) }
   else if c == 92 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\\")) }
-  else if c == 34 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\"")) } else {
+  else if c == 34 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\"")) }
+  else if c == 39 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"'")) }
+  else if c == 117 {
+    let u = unicode_escape(src, stop);
+    if u.point < 0 { string_lit(src, refused(s, stop, u), open, u.end, so_far) }
+    else { string_lit(src, s, open, u.end, bytes_concat(so_far, utf8_of(u.point))) }
+  } else {
     // Reported, and the whole character is kept.
     let w = utf8_len(c);
     string_lit(
       src,
-      unknown_escape(src, s, stop, w, b"valid escapes are \\n \\t \\r \\0 \\\\ and \\\""),
+      unknown_escape(src, s, stop, w, valid_escapes()),
       open,
       stop + 1 + w,
       bytes_concat(so_far, bytes_slice(src, stop + 1, stop + 1 + w)),
     )
   }
 }
+
+fn valid_escapes() -> Bytes = b"valid escapes are \\n \\t \\r \\0 \\\\ \\\" \\' and \\u{...}"
+
+// --- Escapes shared by strings and characters --------------------------------
+
+// What an escape names: a Unicode scalar value, or `-1` with the refusal in `code` and `message`.
+type Esc = { point: Int, end: Int, code: Bytes, message: Bytes, label: Bytes }
+
+fn esc(point: Int, end: Int) -> Esc =
+  { point: point, end: end, code: b"", message: b"", label: b"" }
+
+fn bad_esc(end: Int, code: Bytes, message: Bytes, label: Bytes) -> Esc =
+  { point: -1, end: end, code: code, message: message, label: label }
+
+fn refused(s: Scan, at_backslash: Int, e: Esc) -> Scan =
+  err(s, at_backslash, e.end, e.code, e.message, e.label)
+
+fn hex_chars() -> Bytes = b"0123456789abcdefABCDEF"
+
+// `\u{1F600}` at the backslash `i`: one to six hex digits between braces, naming a Unicode scalar
+// value. Only the braces and digits present are consumed, so a closing quote survives a malformed one.
+fn unicode_escape(src: Bytes, i: Int) -> Esc =
+  if at(src, i + 2) != 123 {
+    bad_esc(
+      i + 2,
+      unexpected(),
+      b"`\\u` takes its character's hex digits in braces",
+      b"write it as `\\u{1F600}`",
+    )
+  } else {
+    let first = i + 3;
+    let stop = scan(src, first, hex_chars());
+    let closed = at(src, stop) == 125;
+    if stop == first || stop - first > 6 || !closed {
+      bad_esc(
+        if closed { stop + 1 } else { stop },
+        unexpected(),
+        b"`\\u{...}` holds one to six hex digits and a closing `}`",
+        b"as in `\\u{e9}` or `\\u{1F600}`",
+      )
+    } else {
+      let v = fold(range(first, stop), 0, |acc: Int, k: Int| acc * 16 + hex_digit(at(src, k)));
+      if v > 1114111 || (v >= 55296 && v <= 57343) {
+        bad_esc(
+          stop + 1,
+          out_of_range(),
+          b"`\\u{...}` names no character",
+          b"a surrogate, `D800` to `DFFF`, or a value past `10FFFF` is not a Unicode scalar value",
+        )
+      } else { esc(v, stop + 1) }
+    }
+  }
+
+// The escape at the backslash `i` inside a character literal.
+fn char_escape(src: Bytes, i: Int) -> Esc = {
+  let c = at(src, i + 1);
+  if c == 110 { esc(10, i + 2) }
+  else if c == 116 { esc(9, i + 2) }
+  else if c == 114 { esc(13, i + 2) }
+  else if c == 48 { esc(0, i + 2) }
+  else if c == 92 { esc(92, i + 2) }
+  else if c == 39 { esc(39, i + 2) }
+  else if c == 34 { esc(34, i + 2) }
+  else if c == 117 { unicode_escape(src, i) } else if c < 0 || c == 10 {
+    bad_esc(i + 1, unterminated(), b"unterminated character literal", b"add a closing `'`")
+  } else {
+    let w = utf8_len(c);
+    bad_esc(
+      i + 1 + w,
+      unexpected(),
+      bytes_concat_all([b"unknown escape sequence `\\", bytes_slice(src, i + 1, i + 1 + w), b"`"]),
+      valid_escapes(),
+    )
+  }
+}
+
+// A scalar value as its UTF-8 bytes.
+pub fn utf8_of(v: Int) -> Bytes =
+  if v < 128 { byte_of(v) }
+  else if v < 2048 { bytes_concat(byte_of(192 | v >> 6), byte_of(128 | v & 63)) }
+  else if v < 65536 {
+    bytes_concat_all([byte_of(224 | v >> 12), byte_of(128 | v >> 6 & 63), byte_of(128 | v & 63)])
+  } else {
+    bytes_concat_all([
+      byte_of(240 | v >> 18),
+      byte_of(128 | v >> 12 & 63),
+      byte_of(128 | v >> 6 & 63),
+      byte_of(128 | v & 63),
+    ])
+  }
+
+// The scalar value of the `w`-byte UTF-8 sequence at `i`; the source is UTF-8 by the time it is lexed.
+fn utf8_point(src: Bytes, i: Int, w: Int) -> Int =
+  if w == 1 { at(src, i) }
+  else if w == 2 { (at(src, i) & 31) << 6 | at(src, i + 1) & 63 }
+  else if w == 3 { (at(src, i) & 15) << 12 | (at(src, i + 1) & 63) << 6 | at(src, i + 2) & 63 }
+  else {
+    (at(src, i) & 7) << 18 | (at(src, i + 1) & 63) << 12 | (at(src, i + 2) & 63) << 6
+      | at(src, i + 3) & 63
+  }
+
+// --- Character literals -----------------------------------------------------
+
+// `'a'`, `'\n'` or `'\u{1F600}'`: exactly one character between single quotes.
+fn char_lit(src: Bytes, s: Scan, open: Int) -> Scan = {
+  let c = at(src, open + 1);
+  if c < 0 || c == 10 { unterminated_char(s, open, open + 1, 0) } else if c == 39 {
+    emit(
+      err(
+        s,
+        open,
+        open + 2,
+        unexpected(),
+        b"an empty character literal",
+        b"a character literal holds exactly one character",
+      ),
+      open,
+      open + 2,
+      TChar(0),
+    )
+  } else if c == 92 {
+    let e = char_escape(src, open + 1);
+    if e.point < 0 { char_close(src, refused(s, open + 1, e), open, e.end, 0) }
+    else { char_close(src, s, open, e.end, e.point) }
+  } else {
+    let w = utf8_len(c);
+    char_close(src, s, open, open + 1 + w, utf8_point(src, open + 1, w))
+  }
+}
+
+// The closing quote after the one character; more before it is refused, and so is none on the line.
+fn char_close(src: Bytes, s: Scan, open: Int, i: Int, point: Int) -> Scan =
+  if at(src, i) == 39 { emit(s, open, i + 1, TChar(point)) } else {
+    let close = scan_until(src, i, b"'\n");
+    if at(src, close) == 39 {
+      emit(
+        err(
+          s,
+          open,
+          close + 1,
+          unexpected(),
+          b"a character literal holds one character",
+          b"write a string, `\"...\"`, for more than one",
+        ),
+        open,
+        close + 1,
+        TChar(point),
+      )
+    } else { unterminated_char(s, open, close, point) }
+  }
+
+fn unterminated_char(s: Scan, open: Int, stop: Int, point: Int) -> Scan =
+  emit(
+    err(s, open, stop, unterminated(), b"unterminated character literal", b"add a closing `'`"),
+    open,
+    stop,
+    TChar(point),
+  )
 
 // --- Line strings -----------------------------------------------------------
 
@@ -815,7 +981,24 @@ fn bytes_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Sca
   else if c == 48 { bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\x00")) }
   else if c == 92 { bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\\")) }
   else if c == 34 { bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\"")) }
-  else if c == 120 { hex_escape(src, s, open, stop, so_far) } else {
+  else if c == 120 { hex_escape(src, s, open, stop, so_far) } else if c == 117 {
+    // Consumed whole, so what follows reads as the literal's next bytes.
+    let u = unicode_escape(src, stop);
+    bytes_body(
+      src,
+      err(
+        s,
+        stop,
+        u.end,
+        unexpected(),
+        b"`\\u{...}` names a character, and a byte string holds bytes",
+        b"write the character's UTF-8 bytes as `\\xNN` escapes",
+      ),
+      open,
+      u.end,
+      so_far,
+    )
+  } else {
     // Unlike a string's unknown escape, this one contributes no byte.
     let w = utf8_len(c);
     bytes_body(
@@ -887,7 +1070,19 @@ fn punct(src: Bytes, s: Scan, start: Int, c: Int) -> Scan =
   // `<<` and `>>` are not lexed, so `Map<Int, List<Int>>` closes; the parser joins touching `<`s and `>`s.
   else if c == 38 { pair(s, src, start, 38, b"ampamp", b"amp") }
   else if c == 94 { emit(s, start, start + 1, TPunct(b"caret")) }
-  else if c == 126 { emit(s, start, start + 1, TPunct(b"tilde")) } else {
+  else if c == 126 { emit(s, start, start + 1, TPunct(b"tilde")) }
+  else if c == 35 && at(src, start + 1) == 123 { emit(s, start, start + 2, TPunct(b"hashbrace")) }
+  else if c == 35 && at(src, start + 1) == 91 { emit(s, start, start + 2, TPunct(b"hashbracket")) }
+  else if c == 35 {
+    err(
+      seek(s, start + 1),
+      start,
+      start + 1,
+      unexpected(),
+      b"unexpected character `#`",
+      b"`#` opens a map literal, `#{k: v}`, or a set literal, `#[a, b]`, and nothing else",
+    )
+  } else {
     err(
       seek(s, start + 1),
       start,
@@ -934,6 +1129,7 @@ fn body(t: Tok) -> Bytes =
     TStr(b) -> bytes_concat(b"s:", hex(b)),
     TLines(b) -> bytes_concat(b"l:", hex(b)),
     TBytes(b) -> bytes_concat(b"b:", hex(b)),
+    TChar(v) -> bytes_concat(b"c:", num(v)),
     TKw(b) -> bytes_concat(b"k:", b),
     TPunct(b) -> bytes_concat(b"p:", b),
     TEof -> b"e",
@@ -1106,4 +1302,39 @@ test "a comment is recorded from its slashes to the end of its line, and none is
   assert_eq(len(lx.toks), 3);
   assert_eq(lx.comments, [{ start: 2, end: 8 }, { start: 11, end: 15 }]);
   assert_eq(lex(b"\"//\"").comments, [])
+}
+
+test "a character literal is its one character's scalar value" {
+  assert_eq(dump(b"'a'"), "0:3:c:97;3:3:e;");
+  assert_eq(dump(b"'\xc3\xa9'"), "0:4:c:233;4:4:e;");
+  assert_eq(
+    dump(b"'\\n' '\\'' '\\\"' '\\u{1F600}'"),
+    "0:4:c:10;5:9:c:39;10:14:c:34;15:26:c:128512;26:26:e;",
+  )
+}
+
+test "a character literal holds exactly one character" {
+  assert_eq(dump(b"''"), "0:2:c:0;2:2:e;0:2:!:E0001;");
+  assert_eq(dump(b"'ab'"), "0:4:c:97;4:4:e;0:4:!:E0001;");
+  assert_eq(dump(b"'a"), "0:2:c:97;2:2:e;0:2:!:E0002;")
+}
+
+test "a string's \\u escape writes its character as UTF-8" {
+  assert_eq(dump(b"\"\\u{e9}\\u{1F600}\""), "0:17:s:c3a9f09f9880;17:17:e;");
+  assert_eq(dump(b"\"\\'\""), "0:4:s:27;4:4:e;")
+}
+
+test "a \\u escape that names no character is refused" {
+  assert_eq(dump(b"\"\\u{D800}\""), "0:10:s:;10:10:e;1:9:!:E0211;");
+  assert_eq(dump(b"\"\\u{110000}\""), "0:12:s:;12:12:e;1:11:!:E0211;");
+  assert_eq(dump(b"\"\\u{}\""), "0:6:s:;6:6:e;1:5:!:E0001;");
+  assert_eq(dump(b"\"\\u41\""), "0:6:s:3431;6:6:e;1:3:!:E0001;")
+}
+
+test "a byte string refuses a \\u escape and keeps what follows it" {
+  assert_eq(dump(b"b\"\\u{41}z\""), "0:10:b:7a;10:10:e;2:8:!:E0001;")
+}
+
+test "a map and a set literal open with their own two-character tokens" {
+  assert_eq(dump(b"#{#[#"), "0:2:p:hashbrace;2:4:p:hashbracket;5:5:e;4:5:!:E0001;")
 }

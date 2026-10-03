@@ -9,6 +9,7 @@ pub type Value =
   | VDecimal(Decimal)
   // The width's name and the pattern it reads, with nothing above the width: `-1i8` is `0xFFu128`.
   | VFixed(String, U128)
+  | VChar(Char)
   | VStr(String)
   | VBytes(Bytes)
   | VList(List<Value>)
@@ -25,6 +26,7 @@ pub type Value =
   // What a diagnostic's snapshot left out: that many more items of a list or map, or with 0,
   // everything nested deeper.
   | VElided(Int)
+  | VArray(List<Value>)
 
 pub type Field = { name: String, value: Value }
 
@@ -56,9 +58,12 @@ fn rendered(v: Value, depth: Int) -> String =
       VFloat(f) -> float_to_string(f),
       VDecimal(d) -> decimal_to_string(d),
       VFixed(ty, bits) -> fixed_text(ty, bits),
+      VChar(c) -> "'" ++ char_escaped(c) ++ "'",
       VStr(s) -> "\"" ++ escaped(s) ++ "\"",
       VBytes(b) -> bytes_text(b),
       VList(items) -> "[" ++ items_text(map(items, |x: Value| rendered(x, depth + 1))) ++ "]",
+      VArray(items) ->
+        "array_of_list([" ++ items_text(map(items, |x: Value| rendered(x, depth + 1))) ++ "])",
       VRecord(fields) -> record_text(fields, depth),
       VCtor(name, args) -> if len(args) == 0 { name }
       else { name ++ "(" ++ joined(map(args, |x: Value| rendered(x, depth + 1)), ", ") ++ ")" },
@@ -209,9 +214,11 @@ pub fn order(a: Value, b: Value) -> Ordering = {
         let widths = compare(width_rank(tx), width_rank(ty));
         if widths != Equal { widths } else { compare(signed_key(tx, x), signed_key(ty, y)) }
       },
+      (VChar(x), VChar(y)) -> compare(x, y),
       (VStr(x), VStr(y)) -> compare(x, y),
       (VBytes(x), VBytes(y)) -> compare(x, y),
       (VList(xs), VList(ys)) -> ordered(xs, ys, order),
+      (VArray(xs), VArray(ys)) -> ordered(xs, ys, order),
       (VMap(xs), VMap(ys)) ->
         ordered(xs, ys, |p: Entry, q: Entry| {
           let keys = order(p.key, q.key);
@@ -251,7 +258,9 @@ fn rank(v: Value) -> Int =
     VTask(_) -> 13,
     VSecret -> 14,
     VFixed(_, _) -> 15,
-    VElided(_) -> 16,
+    VChar(_) -> 16,
+    VArray(_) -> 17,
+    VElided(_) -> 18,
   }
 
 // IEEE 754's total order as a signed integer: a negative float's magnitude bits are flipped.
@@ -328,6 +337,19 @@ fn escaped(s: String) -> String =
       else { None }),
   )
 
+// As a character literal is written: a quote of its own kind is the one escaped.
+fn char_escaped(c: Char) -> String =
+  string_of_bytes(
+    escape_each(bytes_of_string(string_of_chars([c])), |b: Int|
+      if b == 10 { Some(b"\\n") }
+      else if b == 9 { Some(b"\\t") }
+      else if b == 13 { Some(b"\\r") }
+      else if b == 0 { Some(b"\\0") }
+      else if b == 92 { Some(b"\\\\") }
+      else if b == 39 { Some(b"\\'") }
+      else { None }),
+  )
+
 // Only ASCII is replaced, so UTF-8 stays whole.
 fn escape_each(b: Bytes, swap: (Int) -> Option<Bytes>) -> Bytes =
   bytes_concat_all(
@@ -384,8 +406,23 @@ test "text is quoted and escaped, and bytes past the first 32 are counted" {
   )
 }
 
+test "a character shows as its literal, its own quote and the control characters escaped" {
+  assert_eq(render(VChar('a')), "'a'");
+  assert_eq(render(VChar('\u{e9}')), "'\u{e9}'");
+  assert_eq(render(VChar('\n')), "'\\n'");
+  assert_eq(render(VChar('\'')), "'\\''");
+  assert_eq(render(VChar('"')), "'\"'")
+}
+
+test "characters order by scalar value, after every fixed width" {
+  assert_eq(order(VChar('a'), VChar('b')), Less);
+  assert_eq(order(VChar('\u{1F600}'), VChar('z')), Greater);
+  assert_eq(order(VFixed("U8", 255u128), VChar('a')), Less)
+}
+
 test "containers nest, a tuple shows as one, and a list past 32 items is counted" {
   assert_eq(render(VList([VInt(1), VInt(2)])), "[1, 2]");
+  assert_eq(render(VArray([VInt(1), VInt(2)])), "array_of_list([1, 2])");
   assert_eq(
     render(VRecord([{ name: "a", value: VInt(1) }, { name: "b", value: VStr("x") }])),
     "{a: 1, b: \"x\"}",
@@ -454,6 +491,8 @@ test "values order by kind first, then as their payloads compare" {
   assert_eq(order(VInt(5), VStr("a")), Less);
   assert_eq(order(VStr("b"), VStr("ab")), Greater);
   assert_eq(order(VList([VInt(1)]), VList([VInt(1), VInt(0)])), Less);
+  assert_eq(order(VArray([VInt(2)]), VArray([VInt(1), VInt(0)])), Greater);
+  assert_eq(order(VChar('z'), VArray([])), Less);
   assert_eq(order(VCtor("m.A", [VInt(9)]), VCtor("m.B", [])), Less);
   // A signed width orders by value, so `-1i8` is below `0i8`; an unsigned one by pattern.
   assert_eq(order(VFixed("I8", 255u128), VFixed("I8", 0u128)), Less);

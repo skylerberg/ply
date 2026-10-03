@@ -3,7 +3,7 @@
 //! it here, from nothing.
 
 use crate::load::{
-    Discovered, Found, LoadError, Loaded, anchor, discover, project_root, unreadable,
+    Discovered, Found, LoadError, Loaded, anchor, discover, project_root, tidy, unreadable,
 };
 use ply_codegen::c::producer;
 use ply_eval::{Diagnostic, Front, ModuleName, SourceId, SourceMap, Span, codes};
@@ -264,6 +264,110 @@ fn walk_packages(
     }
 }
 
+/// What `modules` of the package at `root` embed, each read relative to its module's own file. Only
+/// a module whose text names `embed` is parsed for it.
+fn read_embeds(
+    root: &str,
+    modules: &[(&Path, String, &str)],
+) -> Result<Vec<producer::ReadEmbed>, String> {
+    let named: Vec<(String, String)> = modules
+        .iter()
+        .filter(|(_, _, text)| text.contains("embed"))
+        .map(|(_, name, text)| (name.clone(), text.to_string()))
+        .collect();
+    if named.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(producer::embeds_wanted(root, &named)
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .map(|(module, path, dir)| {
+            let read = match modules.iter().find(|(_, name, _)| *name == module) {
+                Some((file, _, _)) => read_embed(
+                    &tidy(&file.parent().unwrap_or(Path::new("")).join(&path)),
+                    dir,
+                ),
+                None => Err("its module's file was not read".to_string()),
+            };
+            producer::ReadEmbed {
+                root: root.to_string(),
+                module,
+                path,
+                dir,
+                read,
+            }
+        })
+        .collect())
+}
+
+type EmbedRead = Result<Vec<(String, Vec<u8>)>, String>;
+
+fn unread(path: &Path, what: &str) -> EmbedRead {
+    Err(format!("`{}` {what}", path.display()))
+}
+
+fn read_embed(target: &Path, dir: bool) -> EmbedRead {
+    match std::fs::symlink_metadata(target) {
+        Err(_) => unread(target, "does not exist"),
+        Ok(meta) if meta.is_dir() && !dir => {
+            unread(target, "is a directory, and `embed` takes a file")
+        }
+        Ok(meta) if meta.is_file() && dir => {
+            unread(target, "is a file, and `embed_dir` takes a directory")
+        }
+        Ok(_) if dir => read_dir(target),
+        Ok(_) => match std::fs::read(target) {
+            Ok(bytes) => Ok(vec![(String::new(), bytes)]),
+            Err(_) => unread(target, "could not be read"),
+        },
+    }
+}
+
+/// Every file under `dir`, by its path below it and in that order; nothing under a name starting
+/// with `.` is read.
+fn read_dir(dir: &Path) -> EmbedRead {
+    let mut found = std::collections::BTreeMap::new();
+    listed(dir, "", &mut found)?;
+    let mut files = Vec::with_capacity(found.len());
+    for (name, path) in found {
+        match std::fs::read(&path) {
+            Ok(bytes) => files.push((name, bytes)),
+            Err(_) => return unread(&path, "could not be read"),
+        }
+    }
+    Ok(files)
+}
+
+fn listed(
+    dir: &Path,
+    below: &str,
+    found: &mut std::collections::BTreeMap<String, PathBuf>,
+) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Err(format!("`{}` could not be listed", dir.display()));
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = dir.join(&name);
+        let name = if below.is_empty() {
+            name
+        } else {
+            format!("{below}/{name}")
+        };
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            listed(&path, &name, found)?;
+        } else {
+            found.insert(name, path);
+        }
+    }
+    Ok(())
+}
+
 fn timed<T>(slot: &mut Duration, f: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     let value = f();
@@ -430,8 +534,12 @@ impl Driver {
                 })
                 .collect(),
         };
-        let pulled = ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &packages)
-            .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        let embeds = self
+            .embeds(&packages.root)
+            .map_err(|e| self.seam_failed(&e))?;
+        let pulled =
+            ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &packages, &embeds)
+                .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
         self.place(&pulled.modules);
         // The front end parses the root's modules, then the dependency modules in walk order,
         // then the pulled shelf; the manifest slots follow them all.
@@ -513,6 +621,24 @@ impl Driver {
                 .iter()
                 .any(|f| f.shipped && f.source == span.source)
         })
+    }
+
+    /// What the root's modules and each dependency's embed, read as `ply`'s own load reads them.
+    fn embeds(&self, root: &str) -> Result<Vec<producer::ReadEmbed>, String> {
+        let own: Vec<(&Path, String, &str)> = self.files[..self.own()]
+            .iter()
+            .map(|f| (f.path.as_path(), f.module.to_string(), &*f.text))
+            .collect();
+        let mut out = read_embeds(root, &own)?;
+        for package in &self.packages {
+            let files: Vec<(&Path, String, &str)> = package
+                .files
+                .iter()
+                .map(|(path, name, text)| (path.as_path(), name.clone(), &**text))
+                .collect();
+            out.extend(read_embeds(&package.root, &files)?);
+        }
+        Ok(out)
     }
 
     /// This compiler failing, rather than the program.

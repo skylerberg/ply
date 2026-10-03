@@ -12,6 +12,9 @@ use rust_decimal::prelude::ToPrimitive;
 /// A list this long is a runaway `range`, not an intent.
 const MAX_RANGE_LEN: i64 = 10_000_000;
 
+/// An array this long is a runaway length, not an intent: half a gigabyte of words.
+pub const MAX_ARRAY_LEN: i64 = 1 << 26;
+
 /// `Decimal`'s scale bound, the type's rather than a policy.
 const MAX_DECIMAL_SCALE: u32 = 28;
 
@@ -143,6 +146,20 @@ pub enum Builtin {
     CheckedSub,
     CheckedMul,
     CheckedNeg,
+    /// `None` for a surrogate or past `U+10FFFF`, which no `Char` is.
+    CharOfInt,
+    IntOfChar,
+    StringChars,
+    StringOfChars,
+    ArrayNew,
+    ArrayOfList,
+    ArrayToList,
+    ArrayLen,
+    ArrayAt,
+    /// Raises where `array_at` answers `None`.
+    ArrayGet,
+    /// In place while the array has one holder; raises out of range.
+    ArraySet,
 }
 
 impl Builtin {
@@ -248,6 +265,17 @@ impl Builtin {
             "checked_sub" => Builtin::CheckedSub,
             "checked_mul" => Builtin::CheckedMul,
             "checked_neg" => Builtin::CheckedNeg,
+            "char_of_int" => Builtin::CharOfInt,
+            "int_of_char" => Builtin::IntOfChar,
+            "string_chars" => Builtin::StringChars,
+            "string_of_chars" => Builtin::StringOfChars,
+            "array_new" => Builtin::ArrayNew,
+            "array_of_list" => Builtin::ArrayOfList,
+            "array_to_list" => Builtin::ArrayToList,
+            "array_len" => Builtin::ArrayLen,
+            "array_at" => Builtin::ArrayAt,
+            "array_get" => Builtin::ArrayGet,
+            "array_set" => Builtin::ArraySet,
             _ => return None,
         })
     }
@@ -368,6 +396,17 @@ impl Builtin {
             Builtin::CheckedSub => "checked_sub",
             Builtin::CheckedMul => "checked_mul",
             Builtin::CheckedNeg => "checked_neg",
+            Builtin::CharOfInt => "char_of_int",
+            Builtin::IntOfChar => "int_of_char",
+            Builtin::StringChars => "string_chars",
+            Builtin::StringOfChars => "string_of_chars",
+            Builtin::ArrayNew => "array_new",
+            Builtin::ArrayOfList => "array_of_list",
+            Builtin::ArrayToList => "array_to_list",
+            Builtin::ArrayLen => "array_len",
+            Builtin::ArrayAt => "array_at",
+            Builtin::ArrayGet => "array_get",
+            Builtin::ArraySet => "array_set",
         }
     }
 
@@ -425,6 +464,13 @@ impl Builtin {
             | Builtin::U128OfString
             | Builtin::I128OfString
             | Builtin::CheckedNeg
+            | Builtin::CharOfInt
+            | Builtin::IntOfChar
+            | Builtin::StringChars
+            | Builtin::StringOfChars
+            | Builtin::ArrayOfList
+            | Builtin::ArrayToList
+            | Builtin::ArrayLen
             | Builtin::IntOfU8
             | Builtin::IntOfU16
             | Builtin::IntOfU32
@@ -473,10 +519,14 @@ impl Builtin {
             | Builtin::WrapMul
             | Builtin::Rotr32
             | Builtin::Rotr
-            | Builtin::Range => (2, 2),
+            | Builtin::Range
+            | Builtin::ArrayNew
+            | Builtin::ArrayAt
+            | Builtin::ArrayGet => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
             | Builtin::ListSet
+            | Builtin::ArraySet
             | Builtin::BytesSlice
             | Builtin::BytesIndexOfFrom
             | Builtin::BytesPosition
@@ -643,6 +693,17 @@ impl Builtin {
             Builtin::CheckedSub,
             Builtin::CheckedMul,
             Builtin::CheckedNeg,
+            Builtin::CharOfInt,
+            Builtin::IntOfChar,
+            Builtin::StringChars,
+            Builtin::StringOfChars,
+            Builtin::ArrayNew,
+            Builtin::ArrayOfList,
+            Builtin::ArrayToList,
+            Builtin::ArrayLen,
+            Builtin::ArrayAt,
+            Builtin::ArrayGet,
+            Builtin::ArraySet,
         ]
     }
 }
@@ -672,6 +733,24 @@ fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     };
     let copied = list.set(at, v);
     crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
+    Ok(xs)
+}
+
+/// `array_set`, taking the array out of its arguments so the last holder writes in place.
+fn array_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
+    let v = args.pop().expect("arity checked");
+    let index = args.pop().expect("arity checked");
+    let mut xs = args.pop().expect("arity checked");
+    let Value::Array(items) = &mut xs else {
+        return Err(type_error(span, "`array_set`", "Array", &xs));
+    };
+    let i = index.as_int(span, "`array_set`")?;
+    let Some(at) = usize::try_from(i).ok().filter(|at| *at < items.len()) else {
+        return Err(out_of_range(span, "array_set", i, items.len(), "elements"));
+    };
+    let in_place = std::sync::Arc::get_mut(items).is_some();
+    crate::rc::note_update_of(in_place, if in_place { 0 } else { items.len() }, span);
+    std::sync::Arc::make_mut(items)[at] = v;
     Ok(xs)
 }
 
@@ -1097,9 +1176,83 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::str(String::from_utf8_lossy(b)))
         }
 
+        Builtin::CharOfInt => {
+            let n = args[0].as_int(span, "`char_of_int`")?;
+            Ok(option(
+                u32::try_from(n)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(Value::Char),
+            ))
+        }
+
+        Builtin::IntOfChar => Ok(Value::Int(i64::from(u32::from(
+            args[0].as_char(span, "`int_of_char`")?,
+        )))),
+
+        Builtin::StringChars => Ok(Value::list(
+            args[0]
+                .as_str(span, "`string_chars`")?
+                .chars()
+                .map(Value::Char)
+                .collect(),
+        )),
+
+        Builtin::StringOfChars => {
+            let items = args[0].as_list(span, "`string_of_chars`")?;
+            let mut out = String::with_capacity(items.len());
+            for c in items.iter() {
+                out.push(c.as_char(span, "`string_of_chars`")?);
+            }
+            Ok(Value::str(out))
+        }
+
         Builtin::StringLen => Ok(Value::Int(
             args[0].as_str(span, "`string_len`")?.chars().count() as i64,
         )),
+
+        Builtin::ArrayNew => {
+            let n = args[0].as_int(span, "`array_new`")?;
+            if !(0..=MAX_ARRAY_LEN).contains(&n) {
+                return Err(array_length(span, n));
+            }
+            Ok(Value::array(vec![args[1].clone(); n as usize]))
+        }
+
+        Builtin::ArrayOfList => Ok(Value::array(
+            args[0]
+                .as_list(span, "`array_of_list`")?
+                .iter()
+                .cloned()
+                .collect(),
+        )),
+
+        Builtin::ArrayToList => Ok(Value::list(
+            args[0].as_array(span, "`array_to_list`")?.to_vec(),
+        )),
+
+        Builtin::ArrayLen => Ok(Value::Int(
+            args[0].as_array(span, "`array_len`")?.len() as i64
+        )),
+
+        Builtin::ArrayAt => {
+            let xs = args[0].as_array(span, "`array_at`")?;
+            let i = args[1].as_int(span, "`array_at`")?;
+            Ok(option(
+                usize::try_from(i).ok().and_then(|i| xs.get(i)).cloned(),
+            ))
+        }
+
+        Builtin::ArrayGet => {
+            let xs = args[0].as_array(span, "`array_get`")?;
+            let i = args[1].as_int(span, "`array_get`")?;
+            match usize::try_from(i).ok().and_then(|at| xs.get(at)) {
+                Some(x) => Ok(x.clone()),
+                None => Err(out_of_range(span, "array_get", i, xs.len(), "elements")),
+            }
+        }
+
+        Builtin::ArraySet => array_set(args, span),
 
         Builtin::StringSlice => {
             let s = args[0].as_str(span, "`string_slice`")?;
@@ -1636,6 +1789,14 @@ fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
 }
 
 #[cold]
+pub fn array_length(span: Span, n: i64) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`array_new` of {n} elements is outside `0` to `{MAX_ARRAY_LEN}`"),
+    )
+    .primary(span, "no array has this length")
+}
+
 fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
