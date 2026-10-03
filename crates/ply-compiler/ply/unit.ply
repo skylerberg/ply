@@ -478,68 +478,88 @@ pub fn bucket_of(name: Bytes) -> Int / {abort.raise} = root_id(name) >>> 57
 fn bucket_mark(id: Int) -> Bytes / {abort.raise} =
   bytes_concat_all([b"/* --- bucket ", hex_digit(id / 16), hex_digit(id % 16), b" --- */"])
 
-type Indexed = {
-  consts: List<Int>,
-  fields: List<Int>,
-  builtins: List<Int>,
-  shapes: List<Int>,
-  lambdas: List<Int>,
-}
-
-fn indexed(t: Tables, lines: List<Bytes>, placed: Placed) -> Indexed / {abort.raise} =
-  {
-    consts: map(lines, |l: Bytes| place(placed.consts, l)),
-    fields: map(t.fields, |f: Bytes| place(placed.fields, f)),
-    builtins: map(t.builtins, |b: Bytes| place(placed.builtins, b)),
-    shapes: map(t.shapes, |s: List<Bytes>| place(placed.shapes, shape_key(ordered(s)))),
-    lambdas: map(t.lambdas, |l: Bytes| place(placed.lambdas, l)),
-  }
-
 fn digits_of(b: Bytes) -> Int / {abort.raise} =
   fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int| acc * 10 + bytes_at(b, i) - 48)
 
-// A body's `@@kN@@` placeholders, rewritten from its own table positions to the unit's: `@@r@@` is
-// the body's own root, `@@rN@@` a group's `N`th member, and `@@T<name>@@` a constructor's tag, the
-// position `tags` gives its name in the unit's table.
+// A placeholder in a body's C, `@@kN@@`: where it opens and closes, its kind byte, and what
+// follows the kind.
+type Hole = { open: Int, close: Int, kind: Int, digits: Bytes }
+
+fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
+  iterate({ from: 0, out: [] }, bytes_len(text) + 1, |s: { from: Int, out: List<Hole> }|
+    match bytes_index_of_from(text, b"@@", s.from) {
+      None -> Stop(s.out),
+      Some(open) -> match bytes_index_of_from(text, b"@@", open + 2) {
+        None -> panic("an emitted placeholder always closes"),
+        Some(close) ->
+          Continue({
+            from: close + 2,
+            out: push(s.out, {
+              open: open,
+              close: close,
+              kind: bytes_at(text, open + 2),
+              digits: bytes_slice(text, open + 3, close),
+            }),
+          }),
+      },
+    })
+
+// What a placeholder names in the unit's tables, its kind leading so a bucket's table sorts by
+// kind; `None` for a root, written as its id. `lines` is the body's constants as the pool holds them.
+fn hole_key(h: Hole, t: Tables, lines: List<Bytes>) -> Option<Bytes> / {abort.raise} =
+  if h.kind == 84 { Some(bytes_concat(b"T", h.digits)) }
+  else if h.kind == 114 { None } else {
+    let i = digits_of(h.digits);
+    if h.kind == 99 { Some(bytes_concat(b"c", at(lines, i))) }
+    else if h.kind == 98 { Some(bytes_concat(b"b", at(t.builtins, i))) }
+    else if h.kind == 102 { Some(bytes_concat(b"f", at(t.fields, i))) }
+    else if h.kind == 115 { Some(bytes_concat(b"s", shape_key(ordered(at(t.shapes, i))))) }
+    else if h.kind == 108 { Some(bytes_concat(b"l", at(t.lambdas, i))) }
+    else { panic("an emitted placeholder of no kind the unit resolves") }
+  }
+
+// A key's position in the unit's table of its kind, which is what the loader writes for it.
+fn unit_place(key: Bytes, p: Placed, tags: Map<Bytes, Int>) -> Int / {abort.raise} = {
+  let kind = bytes_at(key, 0);
+  let rest = bytes_slice(key, 1, bytes_len(key));
+  if kind == 84 { place(tags, rest) }
+  else if kind == 99 { place(p.consts, rest) }
+  else if kind == 98 { place(p.builtins, rest) }
+  else if kind == 102 { place(p.fields, rest) }
+  else if kind == 115 { place(p.shapes, rest) }
+  else { place(p.lambdas, rest) }
+}
+
+// The table a bucket's C reads the unit's positions from, which the loader fills.
+fn bucket_table(id: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all([b"ply_bk_", hex_digit(id / 16), hex_digit(id % 16)])
+
+// A body's C with each placeholder written as its bucket names it: a root as its id, and the rest
+// as a position in the bucket's own table, so the C reads the same whatever else the unit holds.
 fn resolved(
   text: Bytes,
+  hs: List<Hole>,
+  keys: List<Option<Bytes>>,
   t: Tables,
   name: Bytes,
-  at_unit: Indexed,
-  tags: Map<Bytes, Int>,
+  table: Bytes,
+  local: Map<Bytes, Int>,
 ) -> Bytes / {abort.raise} = {
-  let value = |kind: Int, digits: Bytes|
-    if kind == 84 { place(tags, digits) } else if kind == 114 {
-      if bytes_len(digits) == 0 { root_id(name) } else { root_id(at(t.members, digits_of(digits))) }
-    } else {
-      let i = digits_of(digits);
-      if kind == 99 { at(at_unit.consts, i) }
-      else if kind == 98 { at(at_unit.builtins, i) }
-      else if kind == 102 { at(at_unit.fields, i) }
-      else if kind == 115 { at(at_unit.shapes, i) }
-      else if kind == 108 { at(at_unit.lambdas, i) }
-      else { panic("an emitted placeholder of no kind the unit resolves") }
-    };
-  let pieces = iterate(
+  let walked = fold(
+    range(0, len(hs)),
     { from: 0, out: [] },
-    bytes_len(text) + 1,
-    |s: { from: Int, out: List<Bytes> }|
-      match bytes_index_of_from(text, b"@@", s.from) {
-        None -> Stop(push(s.out, bytes_slice(text, s.from, bytes_len(text)))),
-        Some(open) -> match bytes_index_of_from(text, b"@@", open + 2) {
-          None -> panic("an emitted placeholder always closes"),
-          Some(close) ->
-            Continue({
-              from: close + 2,
-              out: push(
-                push(s.out, bytes_slice(text, s.from, open)),
-                int_to_bytes(value(bytes_at(text, open + 2), bytes_slice(text, open + 3, close))),
-              ),
-            }),
-        },
-      },
+    |s: { from: Int, out: List<Bytes> }, i: Int| {
+      let h = at(hs, i);
+      let value = match at(keys, i) {
+        None ->
+          int_to_bytes(if bytes_len(h.digits) == 0 { root_id(name) }
+          else { root_id(at(t.members, digits_of(h.digits))) }),
+        Some(k) -> bytes_concat_all([table, b"[", int_to_bytes(place(local, k)), b"]"]),
+      };
+      { from: h.close + 2, out: push(push(s.out, bytes_slice(text, s.from, h.open)), value) }
+    },
   );
-  bytes_concat_all(pieces)
+  bytes_concat_all(push(walked.out, bytes_slice(text, walked.from, bytes_len(text))))
 }
 
 // --- What the unit says about itself ---------------------------------------------
@@ -553,6 +573,9 @@ fn counted(label: Bytes, n: Int) -> Bytes = bytes_concat_all([label, b" ", int_t
 fn lines(label: Bytes, xs: List<Bytes>) -> Bytes =
   bytes_concat_all(append([counted(label, len(xs))], map(xs, |x: Bytes| bytes_concat(x, b"\n"))))
 
+// Each bucket's table as the loader fills it: the unit's position for each of the bucket's keys.
+type BucketRow = { id: Int, places: List<Int> }
+
 fn exports_text(
   helpers: List<Helper>,
   ctors: List<Ctor>,
@@ -561,6 +584,7 @@ fn exports_text(
   modules: Int,
   dropped: List<Dropped>,
   p: Pools,
+  buckets: List<BucketRow>,
 ) -> Bytes / {abort.raise} =
   bytes_concat_all([
     lines(
@@ -590,6 +614,14 @@ fn exports_text(
           if i == 0 { at(names, i) } else { bytes_concat_all([acc, b" ", at(names, i)]) })),
     ),
     lines(b"lambdas", p.lambdas),
+    lines(
+      b"buckets",
+      map(buckets, |r: BucketRow|
+        bytes_concat_all(
+          fold(r.places, [int_to_bytes(r.id)], |acc: List<Bytes>, n: Int|
+            push(push(acc, b" "), int_to_bytes(n))),
+        )),
+    ),
   ])
 
 fn octal(b: Int) -> Bytes =
@@ -661,6 +693,9 @@ fn embedded(exports: Bytes) -> Bytes / {abort.raise} =
 
 type Placing = { name: Bytes, bucket: Int, text: Bytes, reaches: List<Bytes> }
 
+// A body's placeholders and what each names, which its bucket's table is made of.
+type Marked = { kept: Kept, holes: List<Hole>, keys: List<Option<Bytes>> }
+
 // What a body's C names of the unit's definitions: its own, a group's every member, and its calls.
 fn reaches_of(name: Bytes, t: Tables) -> List<Bytes> =
   ordered(append(t.calls, if len(t.members) == 0 { [name] } else { t.members }))
@@ -677,12 +712,13 @@ fn prototype(symbol: Bytes, arity: Int) -> Bytes =
 fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
   bytes_concat_all([hex_digit(p.bucket / 16), hex_digit(p.bucket % 16), b"\x00", p.name])
 
-// The header, then a marked bucket per class of names opening with the prototypes of what its
-// bodies reach, then the runtime's definitions and the table: one translation unit that the loader
-// also compiles in parts, cut on the marks.
+// The header, then a marked bucket per class of names opening with its table and the prototypes
+// of what its bodies reach, then the runtime's definitions and the unit's own table: one
+// translation unit that the loader also compiles in parts, cut on the marks.
 fn assembled(
   runtime: Runtime,
   bodies: List<Placing>,
+  sizes: Map<Int, Int>,
   taken: Map<Bytes, Taken>,
   exports: Bytes,
 ) -> Bytes / {abort.raise} = {
@@ -701,6 +737,18 @@ fn assembled(
         bytes_concat_all([
           bucket_mark(at(group, 0).bucket),
           b"\n",
+          match map_get(sizes, at(group, 0).bucket) {
+            Some(n) -> if n == 0 { b"" } else {
+              bytes_concat_all([
+                b"uint32_t ",
+                bucket_table(at(group, 0).bucket),
+                b"[",
+                int_to_bytes(n),
+                b"];\n",
+              ])
+            },
+            None -> b"",
+          },
           bytes_concat_all(
             map(
               ordered(fold(group, [], |acc: List<Bytes>, p: Placing| append(acc, p.reaches))),
@@ -750,20 +798,68 @@ pub fn produce(
       entry: d.entry,
     }
   });
-  let bodies = map(range(0, len(s.kept)), |i: Int| {
+  let marked = map(range(0, len(s.kept)), |i: Int| {
     let k = at(s.kept, i);
+    let hs = holes(k.text);
+    { kept: k, holes: hs, keys: map(hs, |h: Hole| hole_key(h, k.tables, at(lines, i))) }
+  });
+  // Each bucket's table: every key its bodies' placeholders name, once, in byte order.
+  let keyed = fold(marked, map_new(), |acc: Map<Int, Map<Bytes, Bool>>, m: Marked| {
+    let b = bucket_of(m.kept.name);
+    map_insert(
+      acc,
+      b,
+      fold(
+        m.keys,
+        match map_get(acc, b) { Some(x) -> x, None -> map_new() },
+        |ks: Map<Bytes, Bool>, k: Option<Bytes>|
+          match k { Some(key) -> map_insert(ks, key, true), None -> ks },
+      ),
+    )
+  });
+  let locals = map_fold(
+    keyed,
+    map_new(),
+    |acc: Map<Int, Map<Bytes, Int>>, b: Int, ks: Map<Bytes, Bool>|
+      map_insert(acc, b, positions(map_keys(ks))),
+  );
+  let bodies = map(marked, |m: Marked| {
+    let b = bucket_of(m.kept.name);
     {
-      name: k.name,
-      bucket: bucket_of(k.name),
-      text: resolved(k.text, k.tables, k.name, indexed(k.tables, at(lines, i), placed), tags),
-      reaches: reaches_of(k.name, k.tables),
+      name: m.kept.name,
+      bucket: b,
+      text: resolved(
+        m.kept.text,
+        m.holes,
+        m.keys,
+        m.kept.tables,
+        m.kept.name,
+        bucket_table(b),
+        match map_get(locals, b) { Some(l) -> l, None -> map_new() },
+      ),
+      reaches: reaches_of(m.kept.name, m.kept.tables),
     }
   });
-  let exports = exports_text(runtime.helpers, ctors, taken, constants, modules, s.dropped, pools);
+  let rows = map_fold(keyed, [], |acc: List<BucketRow>, b: Int, ks: Map<Bytes, Bool>|
+    if map_len(ks) == 0 { acc } else {
+      push(acc, { id: b, places: map(map_keys(ks), |k: Bytes| unit_place(k, placed, tags)) })
+    });
+  let exports = exports_text(
+    runtime.helpers,
+    ctors,
+    taken,
+    constants,
+    modules,
+    s.dropped,
+    pools,
+    rows,
+  );
   {
     text: assembled(
       runtime,
       bodies,
+      map_fold(keyed, map_new(), |acc: Map<Int, Int>, b: Int, ks: Map<Bytes, Bool>|
+        map_insert(acc, b, map_len(ks))),
       fold(taken, map_new(), |acc: Map<Bytes, Taken>, t: Taken| map_insert(acc, t.name, t)),
       exports,
     ),
@@ -1098,7 +1194,7 @@ fn refused_reach(dump: Dump, dropped: List<Dropped>) -> Diag / {abort.raise} = {
   error_with_labels(
     b"E0448",
     bytes_concat_all([
-      b"the compiled tier cannot compile ",
+      b"the C backend cannot compile ",
       int_to_bytes(len(dropped)),
       b" of the definitions this program reaches",
     ]),
@@ -1233,7 +1329,7 @@ fn one_body(name: Bytes, calls: List<Bytes>) -> Answer =
 
 // A body names a constructor's tag by the constructor, so the same answer serves programs whose
 // tables differ, and each unit writes the position its own table gives.
-test "a constructor's tag resolves to the position the unit's own table gives its name" {
+test "a constructor's tag is its bucket's to read, at the position the unit's own table gives it" {
   let runtime = { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" };
   let answer = Body({
     text: b"Word f_m.f(PlyCtx *ctx) { return @@Tm.Line@@ + @@TNone@@; }",
@@ -1270,8 +1366,53 @@ test "a constructor's tag resolves to the position the unit's own table gives it
     { name: b"m.Dot", arity: 0 },
     { name: b"m.Line", arity: 1 },
   ]);
-  assert(bytes_index_of(alone, b"{ return 2 + 0; }") != None, None);
-  assert(bytes_index_of(beside, b"{ return 4 + 0; }") != None, None)
+  let table = bucket_table(bucket_of(b"m.f"));
+  let body = bytes_concat_all([b"{ return ", table, b"[1] + ", table, b"[0]; }"]);
+  assert(bytes_index_of(alone, body) != None, None);
+  assert(bytes_index_of(beside, body) != None, None);
+  let row = |places: Bytes|
+    bytes_concat_all([b"\"", int_to_bytes(bucket_of(b"m.f")), places, b"\\n\""]);
+  assert(bytes_index_of(alone, row(b" 0 2")) != None, None);
+  assert(bytes_index_of(beside, row(b" 0 4")) != None, None)
+}
+
+// A bucket's part of a unit's C: from its mark to the next part's.
+fn bucket_part(unit: Bytes, id: Int) -> Bytes / {abort.raise} =
+  match bytes_index_of(unit, bucket_mark(id)) {
+    None -> b"",
+    Some(start) -> match bytes_index_of_from(unit, b"/* --- ", start + 1) {
+      Some(end) -> bytes_slice(unit, start, end),
+      None -> bytes_slice(unit, start, bytes_len(unit)),
+    },
+  }
+
+test "a bucket's C reads the same whatever another bucket adds to the unit's tables" {
+  let runtime = {
+    head: b"/* head */\n",
+    tail: b"/* --- the runtime --- */\n",
+    helpers: [],
+    builtins: [],
+    identity: b"r",
+  };
+  let other = fold(range(0, 4096), b"", |found: Bytes, i: Int| {
+    let n = bytes_concat(b"a.other", int_to_bytes(i));
+    if found == b"" && bucket_of(n) != bucket_of(b"m.f") { n } else { found }
+  });
+  let unit = |names: List<Bytes>|
+    produce(
+      runtime,
+      [{ name: b"None", arity: 0 }],
+      map(names, |n: Bytes| { name: n, arity: 0, constant: false }),
+      1,
+      fold(names, map_new(), |acc: Map<Bytes, Answer>, n: Bytes|
+        map_insert(acc, n, one_body(n, []))),
+    ).text;
+  let alone = unit([b"m.f"]);
+  let beside = unit([b"m.f", other]);
+  assert(bucket_part(alone, bucket_of(b"m.f")) != b"", None);
+  assert_eq(bucket_part(beside, bucket_of(b"m.f")), bucket_part(alone, bucket_of(b"m.f")));
+  // What moved is the unit's own table: `other`'s constant sorts first, so `m.f`'s is the second.
+  assert(alone != beside, None)
 }
 
 // A name in `name`'s bucket that is not `name`, for a test that wants two roots to share one.
@@ -1362,7 +1503,18 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
   );
   assert_eq(p.taken, [b"m.f"]);
   assert_eq(map(p.dropped, |d: Dropped| d.function), [b"m.g"]);
-  assert(bytes_index_of(p.text, b"Word f_m.f(PlyCtx *ctx) { return 0 + ") != None, None);
+  assert(
+    bytes_index_of(
+        p.text,
+        bytes_concat_all([
+          b"Word f_m.f(PlyCtx *ctx) { return ",
+          bucket_table(bucket_of(b"m.f")),
+          b"[0] + ",
+        ]),
+      )
+      != None,
+    None,
+  );
   assert(bytes_index_of(p.text, b"Word f_m.f(PlyCtx*);\n") != None, None);
   assert(
     bytes_index_of(p.text, b"/* tail */\n\n/* --- what this unit says about itself") != None,

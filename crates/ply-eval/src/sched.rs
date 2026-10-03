@@ -81,9 +81,9 @@ impl HostPolicy {
 
 /// A `Task` value: its region and its id, counted so a production region can retire it once unheld.
 #[derive(Clone)]
-pub struct TaskHandle(Rc<Held>);
+pub struct TaskHandle(Rc<HeldTask>);
 
-struct Held {
+struct HeldTask {
     /// Every region numbers its own tasks, so an id alone names a task only in its own region.
     region: SimId,
     id: TaskId,
@@ -97,7 +97,7 @@ type Released = Cell<Vec<TaskId>>;
 impl TaskHandle {
     /// A handle to `id` of `region` that no region counts toward retiring the task.
     pub fn unowned(region: SimId, id: TaskId) -> TaskHandle {
-        TaskHandle(Rc::new(Held {
+        TaskHandle(Rc::new(HeldTask {
             region,
             id,
             released: Weak::new(),
@@ -113,7 +113,7 @@ impl TaskHandle {
     }
 }
 
-impl Drop for Held {
+impl Drop for HeldTask {
     fn drop(&mut self) {
         if let Some(released) = self.released.upgrade() {
             release(&released, self.id);
@@ -598,7 +598,7 @@ impl<K, B> Scheduler<K, B> {
             Policy::Host => Rc::downgrade(&self.released),
             Policy::Seeded => Weak::new(),
         };
-        TaskHandle(Rc::new(Held {
+        TaskHandle(Rc::new(HeldTask {
             region: self.region,
             id,
             released,

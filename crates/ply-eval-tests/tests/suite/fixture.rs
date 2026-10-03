@@ -102,15 +102,15 @@ impl Compiled {
         self.machine_on(self.unit().attach())
     }
 
-    /// The unit compiled from this program; each [`Provider::attach`] is a tier of its own.
+    /// The unit compiled from this program; each [`Provider::attach`] is a backend of its own.
     pub fn unit(&self) -> &'static ply_codegen::Unit {
         ply_codegen::Unit::handed(&self.front, self.unit.clone())
             .expect("this host has a C compiler")
     }
 
-    /// A machine on `tier`, attached from [`Compiled::unit`].
-    pub fn machine_on(&self, tier: Rc<dyn ply_eval::Compiled>) -> Machine<'_> {
-        Machine::new(&self.front, tier).expect("the tier was compiled from this program")
+    /// A machine on `backend`, attached from [`Compiled::unit`].
+    pub fn machine_on(&self, backend: Rc<dyn ply_eval::Compiled>) -> Machine<'_> {
+        Machine::new(&self.front, backend).expect("the backend was compiled from this program")
     }
 
     /// The unit over every definition, loaded bare, so a test enters its bodies without a machine.
@@ -123,14 +123,14 @@ impl Compiled {
             .0
     }
 
-    pub fn machine_on_tier(&self) -> Machine<'_> {
+    pub fn machine_on_backend(&self) -> Machine<'_> {
         self.machine()
     }
 
-    /// [`Compiled::machine`], and the tier it runs on, which counts what it declined and why.
-    pub fn machine_and_tier(&self) -> (Machine<'_>, Rc<ply_codegen::Bodies>) {
-        let tier = self.unit().bodies().expect("the unit builds");
-        (self.machine_on(tier.clone()), tier)
+    /// [`Compiled::machine`], and the backend it runs on, which counts what it declined and why.
+    pub fn machine_and_backend(&self) -> (Machine<'_>, Rc<ply_codegen::Bodies>) {
+        let backend = self.unit().bodies().expect("the unit builds");
+        (self.machine_on(backend.clone()), backend)
     }
 
     pub fn index_of(&self, name: &str) -> usize {

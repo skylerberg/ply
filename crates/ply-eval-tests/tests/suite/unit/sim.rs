@@ -375,7 +375,7 @@ fn the_table_names_each_operation_once_and_answers_all_of_them() {
             .params
             .iter()
             .map(|p| match p {
-                SimTy::Duration => duration(1),
+                SimType::Duration => duration(1),
                 _ => Value::Int(1),
             })
             .collect();
@@ -384,7 +384,7 @@ fn the_table_names_each_operation_once_and_answers_all_of_them() {
             .expect("the table's own arguments are well typed");
         match answer {
             // A woken sleeper resumes with `clock.sleep`'s declared return.
-            Answer::Sleeping { .. } => assert_eq!(sig.ret, SimTy::Unit),
+            Answer::Sleeping { .. } => assert_eq!(sig.ret, SimType::Unit),
             Answer::Value(v) => assert!(
                 sig.ret.holds(&v),
                 "`{sig}` promises {} and answered {v:?}",

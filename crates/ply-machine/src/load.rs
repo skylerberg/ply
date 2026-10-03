@@ -149,7 +149,7 @@ impl Loaded {
                     .ordinals
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| self.front.mod_pkg.get(*i) == Some(&0))
+                    .filter(|(i, _)| self.front.module_packages.get(*i) == Some(&0))
                     .map(|(_, (module, _))| module.to_string())
                     .collect()
             }),
