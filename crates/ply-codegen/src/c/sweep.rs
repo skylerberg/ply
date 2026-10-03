@@ -1,5 +1,5 @@
-//! Keeping the content-addressed C cache and the stage directory to a size, gated by a stamp
-//! and run on a background thread so no build waits on it. Both go least recently used first: a
+//! Keeping the content-addressed C cache and the stage directory to a size, gated by a stamp a
+//! sweep leaves when it finishes and run on a background thread so no build waits on it. Both go least recently used first: a
 //! read of an entry is recorded by [`used`], since an entry every run reads is written only once.
 
 use std::path::{Path, PathBuf};
@@ -24,20 +24,28 @@ pub fn budget() -> Option<u64> {
     }
 }
 
-/// How long a sweep stands for.
-const INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long a finished sweep stands for.
+const INTERVAL: Duration = Duration::from_secs(600);
 
-/// The stamp whose age gates the walk; touched before sweeping so concurrent processes skip it.
+/// How long a sweep that began is given before another process may begin one: the process that
+/// began it may have exited mid-walk, which finishes nothing.
+const LEASE: Duration = Duration::from_secs(120);
+
+/// Written when a sweep finishes; its age gates the next.
 pub const STAMP: &str = ".swept";
+
+/// Touched when a sweep begins, so processes starting together do not all walk.
+pub const BEGUN: &str = ".sweeping";
 
 static SWEPT: Once = Once::new();
 
-/// Sweep both roots down to their budget in the background, at most once per process and interval.
+/// Sweep both roots down to their budget in the background, at most once per process, when the
+/// last sweep to finish is an interval old and none began within the lease.
 pub fn once() {
     SWEPT.call_once(|| {
         let Some(budget) = budget() else { return };
         let root = super::load::cache_dir();
-        if !claim(&root, INTERVAL) {
+        if !due(&root, INTERVAL) || !claim(&root, LEASE) {
             return;
         }
         std::thread::Builder::new()
@@ -45,26 +53,37 @@ pub fn once() {
             .spawn(move || {
                 sweep(&root, budget);
                 sweep_stages(&super::stage::stage_root(), budget, SystemTime::now());
+                finished(&root);
             })
             .ok();
     });
 }
 
-/// Whether this process should sweep: the stamp is missing or stale, and it is now refreshed.
-pub fn claim(root: &std::path::Path, interval: std::time::Duration) -> bool {
-    let stamp = root.join(STAMP);
-    if let Ok(meta) = std::fs::metadata(&stamp)
-        && let Ok(age) = meta
-            .modified()
-            .and_then(|m| m.elapsed().map_err(std::io::Error::other))
-        && age < interval
-    {
+fn younger(mark: &Path, than: Duration) -> bool {
+    std::fs::metadata(mark)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age < than)
+}
+
+/// Whether a sweep is owed: none has finished, or the last to finish is `interval` old.
+pub fn due(root: &Path, interval: Duration) -> bool {
+    !younger(&root.join(STAMP), interval)
+}
+
+/// Whether this process may begin a sweep: none began within `lease`, and this one now has.
+pub fn claim(root: &Path, lease: Duration) -> bool {
+    let begun = root.join(BEGUN);
+    if younger(&begun, lease) || std::fs::create_dir_all(root).is_err() {
         return false;
     }
-    if std::fs::create_dir_all(root).is_err() {
-        return false;
-    }
-    std::fs::write(&stamp, b"").is_ok()
+    std::fs::write(&begun, b"").is_ok()
+}
+
+/// Records that a sweep ran to its end.
+pub fn finished(root: &Path) {
+    let _ = std::fs::write(root.join(STAMP), b"");
 }
 
 struct Entry {
@@ -84,8 +103,12 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
         };
         for e in read.flatten() {
             let path = e.path();
-            // A half-written entry belongs to a running process about to rename it.
-            if path.extension().is_some_and(|x| x == "tmp") {
+            // A half-written entry belongs to a running process about to rename it, and the
+            // sweep's own marks are not entries.
+            if path.extension().is_some_and(|x| x == "tmp")
+                || e.file_name() == STAMP
+                || e.file_name() == BEGUN
+            {
                 continue;
             }
             let Ok(meta) = e.metadata() else { continue };
@@ -131,9 +154,13 @@ pub const ANSWERED: &str = "answered";
 /// The stage-directory entry holding one file per closure `ply run` loaded, each swept on its own.
 pub const RUNS: &str = "run-fronts";
 
+/// The stage-directory entry holding the rows each build of a program published, a file per
+/// program and front end that published them, each swept on its own.
+pub const ROWS: &str = "rows";
+
 /// The stage-directory entries that hold files swept one by one, where any other is a stage swept
 /// whole.
-const BY_FILE: [&str; 2] = [ANSWERED, RUNS];
+const BY_FILE: [&str; 3] = [ANSWERED, RUNS, ROWS];
 
 /// An entry used within this long is never swept: a run may still be reading it.
 const RECENT: Duration = Duration::from_secs(3600);

@@ -22,8 +22,9 @@ case "${1:-}" in
       for dir in "$stage"/*/; do
         [ -d "$dir" ] || continue
         case "$(basename "$dir")" in
-          # Files swept one by one, each a front of its own.
-          answered | run-fronts) find "$dir" -type f ! -newer "$mark" -delete ;;
+          # Files swept one by one: each a front of its own, or a build's rows under the front end
+          # that published them.
+          answered | run-fronts | rows) find "$dir" -type f ! -newer "$mark" -delete ;;
           # A stage goes whole: its `.used` stamp is what a load writes.
           *) [ -n "$(find "$dir" -type f -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
         esac
