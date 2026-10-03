@@ -3,7 +3,6 @@ use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sched::{ChanHandle, TaskHandle};
 use crate::{Diagnostic, IntTy, Span, Symbol, codes};
-use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
 use std::cell::RefCell;
 
@@ -11,12 +10,63 @@ thread_local! {
     static NO_ARGS: Arc<Vec<Value>> = Arc::new(Vec::new());
 }
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
 pub use crate::list::List;
 
-pub type Map = RedBlackTreeMap<Value, Value>;
+/// In ascending key order, shared until written.
+#[derive(Clone, Default)]
+pub struct Map(Arc<BTreeMap<Value, Value>>);
+
+impl Map {
+    pub fn new() -> Map {
+        Map::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, k: &Value) -> Option<&Value> {
+        self.0.get(k)
+    }
+
+    pub fn contains_key(&self, k: &Value) -> bool {
+        self.0.contains_key(k)
+    }
+
+    /// Replaces an equal key's entry, key and value both.
+    pub fn insert(&mut self, k: Value, v: Value) {
+        let entries = Arc::make_mut(&mut self.0);
+        entries.remove(&k);
+        entries.insert(k, v);
+    }
+
+    pub fn remove(&mut self, k: &Value) -> Option<Value> {
+        if !self.0.contains_key(k) {
+            return None;
+        }
+        Arc::make_mut(&mut self.0).remove(k)
+    }
+
+    pub fn keys(&self) -> std::collections::btree_map::Keys<'_, Value, Value> {
+        self.0.keys()
+    }
+
+    pub fn values(&self) -> std::collections::btree_map::Values<'_, Value, Value> {
+        self.0.values()
+    }
+
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, Value, Value> {
+        self.0.iter()
+    }
+}
 
 thread_local! {
     /// Indexed by [`Builtin`]'s discriminant.
@@ -495,10 +545,11 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
                 out.extend(std::mem::take(map).into_values().filter(nests));
             }
         }
-        // `rpds` has no owned iterator, and cloning entries out would rewalk the tree per level.
         Value::Map(m) => {
-            let taken = std::mem::replace(m, Map::new());
-            grow(move || drop(taken));
+            if let Some(entries) = Arc::get_mut(&mut m.0) {
+                let taken = std::mem::take(entries);
+                out.extend(taken.into_iter().flat_map(|(k, v)| [k, v]).filter(nests));
+            }
         }
         Value::Secret(inner) => {
             if let Some(v) = Arc::get_mut(inner) {
@@ -735,7 +786,7 @@ impl Eq for Value {}
 
 /// The one place a key enters a [`Map`] from Rust, so keys are always canonical.
 pub(crate) fn insert_key(m: &mut Map, k: Value, v: Value) {
-    m.insert_mut(canonical_key(&k).unwrap_or(k), v);
+    m.insert(canonical_key(&k).unwrap_or(k), v);
 }
 
 /// The canonical member of `v`'s class under [`Value::cmp`], or `None` when `v` already is.
@@ -877,7 +928,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             });
         }
         (Value::Map(x), Value::Map(y)) => {
-            if x.size() != y.size() {
+            if x.len() != y.len() {
                 return Ok(false);
             }
             return descend(span, depth, || {
@@ -999,7 +1050,7 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
                     .find_map(|(i, (x, y))| within(PathStep::Index(i), x, y, path))
             }),
             // Only when key sets agree, so a differing shape reports the whole maps.
-            (Value::Map(a), Value::Map(e)) if a.size() == e.size() && a.keys().eq(e.keys()) => {
+            (Value::Map(a), Value::Map(e)) if a.len() == e.len() && a.keys().eq(e.keys()) => {
                 grow(|| {
                     a.iter()
                         .zip(e.values())

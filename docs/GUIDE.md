@@ -1252,6 +1252,15 @@ answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, eac
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.
 
+The report is printed as the run goes. Before a test runs come what was selected
+and how it will run: the groups and workers, isolation, the host binding, and
+what `--explain` says of the selection. Each group's results follow as that
+group finishes, in the order the groups ran, so a long run shows its progress
+and its first failure. Then come the run's own figures (handshakes, the backend,
+the simulation, and with `--explain` where its time went), the summary, and each
+failure's diagnosis. `--json` writes its one object when the run ends, and
+`--workspace` prints each package's heading before it runs.
+
 `--steps N` is the calls each test may make (default 1000000000; `0` is no
 bound); a test past it fails with `E0503`, which is a program error like any
 other, and is recorded as one, because the count is a property of the program.
@@ -3529,7 +3538,7 @@ picks its entry anew, and reports exactly what a run that built the answer
 reports. Any edit to a module, a dependency or a manifest, another schema or
 another `ply` is a new key, and the front end runs again; `ply.lock` is not
 read by a run and is not in the key. A single `.ply` file keys that one module.
-The answers live under the stage root (`PLY_C_STAGE`, §8.6) in `run-fronts/`,
+The answers live under the stage root (`PLY_C_STAGE`, §8.6) in `reused/`,
 one file per key, each written beside itself and renamed into place, so two runs
 of one package never read half of one; an entry that does not read is rebuilt
 and written over. They are swept with the stages, least recently used first, down to
@@ -3539,7 +3548,7 @@ the front end, filing into `.ply-cache` and the machine's load each took, on
 stderr before the entry runs, or as `front_end` in the `--json` document.
 
 `ply check` takes its own answer back the same way. A check the front end
-answered whole is filed in `run-fronts/` under the walk's key, the interface
+answered whole is filed in `reused/` under the walk's key, the interface
 each registry dependency's slot holds, the paths its reports name, and the flags
 that shape what it prints (`--types`, `--costs`, `--json`, `--verify-deps`,
 color). What the front-end cache said of itself (`W0601`, `W0602`, `W0603`,
@@ -3548,8 +3557,10 @@ has nothing to say about it. A later check whose key matches prints that answer
 and exits with its code without running the front end, so a tree unchanged since
 its last check is answered in the time its walk takes. `--explain` always checks
 afresh, since what it reports is this run's. In the `--json` document,
-`front_end` carries `reused` and `key`: beside the phases of a check that ran,
-and alone for an answer taken back.
+`front_end` carries `reused` and `key`: alone for an answer taken back, and
+beside the phases of a check that ran, with `filed`, whether the next check can
+take its answer back (false for a refused load, or when the entry could not be
+written).
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed

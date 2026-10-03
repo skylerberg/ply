@@ -6,7 +6,8 @@
 import std.bin
 import std.bytes (bytes_of_hex, hex_of)
 import std.ed25519
-import std.fs (fs, Dir, File)
+import std.fs (fs, Dir, File, MemFs, mem_kind, mem_of, mem_read)
+import std.path (resolve)
 import std.random (entropy)
 import compiler.resolve (Diag, error_at)
 
@@ -125,10 +126,11 @@ fn repo_of(
       Dir -> Some({ git: dot, common: dot }),
       File -> match text_at(dot) {
         Some(line) -> if !string_starts_with(line, "gitdir: ") { None } else {
-          let git = string_slice(line, 8, string_len(line));
+          // Either may be relative, and `abs` reads neither a relative path nor one through `..`.
+          let git = resolve(dir, string_slice(line, 8, string_len(line)));
           let common = match text_at(git ++ "/commondir") {
             None -> git,
-            Some(c) -> if string_starts_with(c, "/") { c } else { git ++ "/" ++ c },
+            Some(c) -> resolve(git, c),
           };
           Some({ git: git, common: common })
         },
@@ -204,4 +206,34 @@ test "a fresh seed is thirty-two bytes of seven-byte draws" {
   assert_eq(bytes_at(drawn, 0), 1);
   assert_eq(bytes_at(drawn, 7), 2);
   assert_eq(bytes_at(drawn, 14), 3)
+}
+
+fn commit_on(disk: MemFs, dir: String) -> String / {abort.raise} =
+  handle {
+    head_commit(dir)
+  } with {
+    fs.kind[abs](p) -> mem_kind(disk, p),
+    fs.read_file[abs](p) -> mem_read(disk, p),
+  }
+
+test "a linked worktree's commit is read from the repository its commondir names" {
+  let disk = mem_of([
+    { path: "repo/.git/HEAD", body: b"ref: refs/heads/main\n" },
+    { path: "repo/.git/refs/heads/main", body: b"1111\n" },
+    { path: "repo/.git/refs/heads/topic", body: b"2222\n" },
+    { path: "repo/.git/worktrees/topic/HEAD", body: b"ref: refs/heads/topic\n" },
+    { path: "repo/.git/worktrees/topic/commondir", body: b"../..\n" },
+    { path: "trees/topic/.git", body: b"gitdir: /repo/.git/worktrees/topic\n" },
+  ]);
+  assert_eq(commit_on(disk, "/repo"), "1111");
+  assert_eq(commit_on(disk, "/trees/topic"), "2222");
+  assert_eq(commit_on(disk, "/trees"), "")
+}
+
+test "a relative gitdir is read from the checkout that names it" {
+  let disk = mem_of([
+    { path: "app/.git/modules/lib/HEAD", body: b"3333\n" },
+    { path: "app/lib/.git", body: b"gitdir: ../.git/modules/lib\n" },
+  ]);
+  assert_eq(commit_on(disk, "/app/lib/src"), "3333")
 }
