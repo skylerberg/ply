@@ -44,6 +44,10 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
             "task.yield[..]",
             "task.cancel[..]",
             "task.await[..]",
+            "task.channel[..]",
+            "task.send[..]",
+            "task.recv[..]",
+            "task.close[..]",
             // Every draw is independent of every other, so a run may take as many as it likes.
             "std.random.entropy.next[..]",
             "std.random.entropy.below[..]",
