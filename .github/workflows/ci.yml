@@ -381,15 +381,13 @@ jobs:
 
       # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
       # every other shard: a test the durations do not name runs there, and only there.
-      # The awk strips colour first: nextest colours its summary line. A golden that moved is
-      # blessed rather than failed: the diff goes to the job summary, and `refresh` commits it on main.
+      # The awk strips colour first: nextest colours its summary line.
       - name: cargo nextest run
         id: run
         env:
           SHARD: ${{ matrix.shard }}
           OF: ${{ matrix.of }}
           SHARDS: ${{ needs.plan.outputs.shards }}
-          PLY_DIFF_BLESS: "1"
         run: |
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
@@ -450,20 +448,6 @@ jobs:
         with:
           path: /tmp/ply-c-nextest
           key: ply-c-nextest-${{ matrix.shard }}-${{ github.run_id }}
-
-      - name: Goldens that moved
-        if: always()
-        run: |
-          set -euo pipefail
-          git add -N crates/ply-codegen-tests/fixtures/goldens
-          git diff --quiet -- crates/ply-codegen-tests/fixtures/goldens && exit 0
-          {
-            echo "### Goldens this partition re-blessed"
-            echo '```'
-            git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
 
   # The corpus runs a partition takes, each lane a process beside the others.
   lanes:
@@ -557,6 +541,21 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+      # What the CLI suite's `goldens` tests this partition ran wrote: nothing fails on a golden that
+      # moved, so it is listed here, and `refresh` commits it on main.
+      - name: Goldens that moved
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          git add -N crates/ply-cli-tests/goldens
+          git diff --quiet -- crates/ply-cli-tests/goldens && exit 0
+          {
+            echo "### Goldens this partition wrote"
+            echo '```'
+            git diff --stat -- crates/ply-cli-tests/goldens
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git diff --stat -- crates/ply-cli-tests/goldens
       # Even from a red job: a pass is a fact about its test.
       - name: The passes this partition published
         if: ${{ !cancelled() }}
@@ -776,17 +775,13 @@ jobs:
         with:
           name: ply
           path: target/release
-      - name: Emit the builder and the `ply` program, and bless the goldens
+      - name: Emit the builder and the `ply` program, and write the goldens
         run: |
           set -euo pipefail
           chmod +x target/release/ply
           target/release/ply bootstrap crates/ply-compiler/ply --out crates/ply-compiler/bootstrap
           target/release/ply bootstrap crates/ply-cli/ply --out crates/ply-cli/bootstrap
-          PLY_DIFF_BLESS=1 cargo-nextest nextest run \
-            --binaries-metadata target/nextest/binaries-metadata.json \
-            --cargo-metadata target/nextest/cargo-metadata.json \
-            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast -E 'binary_id(ply-codegen-tests::goldens)'
+          .github/ci-corpus.sh run cli-goldens
       # The digest covers everything the build reads, so bytes that moved under it are a build that
       # is not a function of its sources, which committing them would hide.
       - name: The programs moved only with their digests
@@ -802,7 +797,7 @@ jobs:
       - name: Commit what moved
         run: |
           set -euo pipefail
-          git add crates/ply-compiler/bootstrap crates/ply-cli/bootstrap crates/ply-codegen-tests/fixtures/goldens
+          git add crates/ply-compiler/bootstrap crates/ply-cli/bootstrap crates/ply-cli-tests/goldens
           git diff --cached --quiet && { echo "the bundle, the program and the goldens already match main"; exit 0; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -813,11 +808,10 @@ jobs:
           git push origin HEAD:main || echo "main moved; the next run refreshes"
 
   # Tests that must be seen to run: the tree checks, by name.
-  # The gate tests, then the host packages, whose tests bind sockets and processes, then each solo
-  # test, which takes every test thread: one runner after another rather than a runner each, beside
-  # the lanes that wait for runners.
+  # The gate tests, then the host packages, whose tests bind sockets and processes: one runner after
+  # another rather than a runner each, beside the lanes that wait for runners.
   gates:
-    name: test gates, the host packages and the solo tests
+    name: test gates and the host packages
     needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -877,25 +871,6 @@ jobs:
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --success-output immediate -E "$filter"
-
-      - name: cargo nextest run, each solo test alone
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          for id in $(.github/ci-shards.sh solo-matrix | jq -r '.include[].id'); do
-            filter=$(.github/ci-shards.sh solo-filter "$id")
-            cargo-nextest nextest run \
-              --binaries-metadata target/nextest/binaries-metadata.json \
-              --cargo-metadata target/nextest/cargo-metadata.json \
-              --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-              -E "$filter" 2>&1 | tee /tmp/solo.log
-            ran=$(awk '
-              { gsub(/\033\[[0-9;]*m/, "") }
-              /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
-              END { print n + 0 }
-            ' /tmp/solo.log)
-            [ "$ran" -eq 1 ] || { echo "solo test '$id' selected $ran tests rather than one: the table names a test the binary does not have" >&2; exit 1; }
-          done
 
   # The Ply runs that would starve a partition, on runners of their own (`ci-shards.sh corpus-matrix`):
   # the corpus's checks that start desks under load, cut by duration over the `desks-<k>` runners,

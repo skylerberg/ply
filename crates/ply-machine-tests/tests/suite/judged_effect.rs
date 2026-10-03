@@ -189,27 +189,12 @@ law "doubling is tripling"
 const THE_LAW: (&str, &[&str]) = ("m.doubling is tripling", &["n"]);
 
 fn front_of(source: &str) -> Analysis {
-    ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_analysis_with_std(&[(
-        "proof.obligation".to_string(),
-        source.to_string(),
-    )])
-    .expect("the judging program checks")
-    .front
+    crate::fixture::built("proof.obligation", source).0
 }
 
 /// The program checked with the standard library it imports, and compiled.
 fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
-    ply_codegen::c::producer::ensure_default();
-    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
-        "proof.obligation".to_string(),
-        source.to_string(),
-    )])
-    .expect("the judging program checks");
-    let unit =
-        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
-            .expect("this host has a C toolchain");
-    (answered.front, unit)
+    crate::fixture::built("proof.obligation", source)
 }
 
 /// The fixture's answer, from one entered call.

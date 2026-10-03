@@ -962,12 +962,13 @@ fn nearest_effect(wanted: &Symbol, check: &CheckOutput) -> Option<Symbol> {
     {
         return Some(name.name.clone());
     }
+    // A declared effect is program-wide, `<module>.<name>`, so it is near by its own name.
     check
         .effects
         .keys()
-        .map(|name| (shared_prefix(name.as_str(), wanted.as_str()), name))
+        .map(|name| (shared_prefix(simple_name(name.as_str()), simple), name))
         .filter(|(shared, name)| {
-            let shortest = name.as_str().len().min(wanted.as_str().len());
+            let shortest = simple_name(name.as_str()).len().min(simple.len());
             *shared >= 2 && *shared * 2 >= shortest
         })
         .max_by_key(|(shared, name)| (*shared, std::cmp::Reverse((*name).clone())))

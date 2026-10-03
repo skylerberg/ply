@@ -188,16 +188,8 @@ test "peeks" {
 
 /// A machine over `DECLARED` and `main`, bound to the tester operations the program declares.
 fn driving(main: &str) -> Machine<'static> {
-    ply_codegen::c::producer::ensure_default();
-    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
-        "m".to_string(),
-        format!("{DECLARED}{main}"),
-    )])
-    .expect("the driving program checks");
-    let unit =
-        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
-            .expect("this host has a C toolchain");
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(answered.front));
+    let (front, unit) = crate::fixture::built("m", &format!("{DECLARED}{main}"));
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
     let mut machine = Machine::new(front, unit.attach()).expect("the unit is this program's");
     let mut registry = HostRegistry::new();
     // Only what this program declares: a family's operation the program does not declare is a
