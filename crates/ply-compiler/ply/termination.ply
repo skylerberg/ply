@@ -152,7 +152,7 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
     acc || (match d.decreases { Some(_) -> true, None -> false }));
   let own = match looping(g, calls, false) {
     None -> Ends,
-    Some(at_) -> if !stating { Diverges({ at: at_, through: None }) } else {
+    Some(span) -> if !stating { Diverges({ at: span, through: None }) } else {
       match looping(g, calls, true) {
         None -> Stated,
         Some(again) -> Diverges({ at: again, through: None }),
@@ -659,18 +659,18 @@ fn parts(t: Term) -> Term =
 
 // An element of a list a builtin makes of a map: a key or a value is a part of the map, and an
 // entry is made of one of each, so it is smaller than anything the map is a part of.
-fn element(context: MemberContext, s: Scope, list: Expr) -> Term / {abort.raise} =
+fn element(context: MemberContext, scope: Scope, list: Expr) -> Term / {abort.raise} =
   match list {
-    EApp(a) -> match builtin(context, s, a.func) {
-      Some(name) -> if len(a.args) != 1 { below(term(context, s, list)) }
+    EApp(a) -> match builtin(context, scope, a.func) {
+      Some(name) -> if len(a.args) != 1 { below(term(context, scope, list)) }
       else if name == b"map_keys" || name == b"map_values" {
-        below(term(context, s, at(a.args, 0)))
+        below(term(context, scope, at(a.args, 0)))
       } else if name == b"map_entries" {
-        match term(context, s, at(a.args, 0)) { Below(p) -> Below(p), other -> parts(other) }
-      } else { below(term(context, s, list)) },
-      None -> below(term(context, s, list)),
+        match term(context, scope, at(a.args, 0)) { Below(p) -> Below(p), other -> parts(other) }
+      } else { below(term(context, scope, list)) },
+      None -> below(term(context, scope, list)),
     },
-    _ -> below(term(context, s, list)),
+    _ -> below(term(context, scope, list)),
   }
 
 // The place every argument is a part of, which a constructor or a list of them is made of.
@@ -707,20 +707,26 @@ fn with_part(xs: Term, x: Term) -> Term =
 
 // What `fold` answers when its lambda answers its accumulator or parts: the start joined with what
 // a round answers, so long as a second round answers nothing the first did not.
-fn folded(context: MemberContext, s: Scope, xs: Expr, init: Expr, f: Expr) -> Term / {abort.raise} =
+fn folded(
+  context: MemberContext,
+  scope: Scope,
+  xs: Expr,
+  init: Expr,
+  f: Expr,
+) -> Term / {abort.raise} =
   match f {
     ELambda(l) -> match l.params {
       [acc, x] -> {
         let round = |r: Term|
           match answered(
               context,
-              bound(bound(s, acc.name.name, r), x.name.name, element(context, s, xs)),
+              bound(bound(scope, acc.name.name, r), x.name.name, element(context, scope, xs)),
               l.body,
             ) {
             Some(t) -> join(r, t),
             None -> r,
           };
-        let once = round(term(context, s, init));
+        let once = round(term(context, scope, init));
         if round(once) == once { once } else { UnknownTerm }
       },
       _ -> UnknownTerm,
@@ -729,10 +735,14 @@ fn folded(context: MemberContext, s: Scope, xs: Expr, init: Expr, f: Expr) -> Te
   }
 
 // What `map` answers when the lambda it is given answers a part of each element.
-fn mapped(context: MemberContext, s: Scope, xs: Expr, f: Expr) -> Term / {abort.raise} =
+fn mapped(context: MemberContext, scope: Scope, xs: Expr, f: Expr) -> Term / {abort.raise} =
   match f {
     ELambda(l) -> match l.params {
-      [p] -> match answered(context, bound(s, p.name.name, element(context, s, xs)), l.body) {
+      [p] -> match answered(
+          context,
+          bound(scope, p.name.name, element(context, scope, xs)),
+          l.body,
+        ) {
         Some(t) -> parts_of([t]),
         None -> UnknownTerm,
       },
@@ -748,7 +758,7 @@ fn part_of(t: Term, p: Place) -> Bool =
     _ -> false,
   }
 
-fn local(s: Scope, name: Bytes) -> Option<Local> = map_get(s.locals, name)
+fn local(scope: Scope, name: Bytes) -> Option<Local> = map_get(scope.locals, name)
 
 fn term(context: MemberContext, s: Scope, e: Expr) -> Term / {abort.raise} =
   match e {
@@ -843,10 +853,10 @@ fn block_scope(
 
 fn field_terms(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   fs: List<RecField>,
 ) -> List<{ name: Bytes, term: Term }> / {abort.raise} =
-  map(fs, |f: RecField| { name: f.name.name, term: term(context, s, f.value) })
+  map(fs, |field: RecField| { name: field.name.name, term: term(context, scope, field.value) })
 
 fn offset(context: MemberContext, a: Term, b: Term) -> Term / {abort.raise} =
   match b {
@@ -916,16 +926,16 @@ fn length_builtin(name: Bytes) -> Bool =
 // parts, or what a summarized definition answers.
 fn applied_term(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   func: Expr,
   args: List<Expr>,
   named: List<NamedArg>,
 ) -> Term / {abort.raise} =
   match func {
-    EVar(v) -> match callee_of(context, s, v.name) {
+    EVar(v) -> match callee_of(context, scope, v.name) {
       BuiltinCallee(name) -> if len(args) == 0 { UnknownTerm }
       else if length_builtin(name) && len(args) == 1 {
-        match term(context, s, at(args, 0)) {
+        match term(context, scope, at(args, 0)) {
           Exactly(l) -> match l.base {
             Some(PlaceBase(p)) -> if l.k == 0 {
               Exactly({ base: Some(LengthBase({ name: name, of: p })), k: 0 })
@@ -935,24 +945,26 @@ fn applied_term(
           _ -> UnknownTerm,
         }
       } else if name == b"list_at" || name == b"map_get" || name == b"filter" {
-        parts(term(context, s, at(args, 0)))
+        parts(term(context, scope, at(args, 0)))
       } else if name == b"push" && len(args) == 2 {
-        with_part(term(context, s, at(args, 0)), term(context, s, at(args, 1)))
+        with_part(term(context, scope, at(args, 0)), term(context, scope, at(args, 1)))
       } else if name == b"list_set" && len(args) == 3 {
-        let xs = term(context, s, at(args, 0));
-        match with_part(xs, term(context, s, at(args, 2))) {
+        let xs = term(context, scope, at(args, 0));
+        match with_part(xs, term(context, scope, at(args, 2))) {
           UnknownTerm -> same_length(xs),
           t -> t,
         }
       } else if name == b"array_set" && len(args) == 3 {
-        same_length(term(context, s, at(args, 0)))
-      } else if name == b"map" && len(args) == 2 { mapped(context, s, at(args, 0), at(args, 1)) }
-      else if name == b"fold" && len(args) == 3 {
-        folded(context, s, at(args, 0), at(args, 1), at(args, 2))
+        same_length(term(context, scope, at(args, 0)))
+      } else if name == b"map" && len(args) == 2 {
+        mapped(context, scope, at(args, 0), at(args, 1))
+      } else if name == b"fold" && len(args) == 3 {
+        folded(context, scope, at(args, 0), at(args, 1), at(args, 2))
       } else { UnknownTerm },
-      ConstructorCallee -> parts_of(map(args, |x: Expr| term(context, s, x))),
+      ConstructorCallee -> parts_of(map(args, |x: Expr| term(context, scope, x))),
       DefinedCallee(n) -> match context.group.summary_of(n) {
-        Some(sum) -> translated(context, sum.result, actuals(context, s, sum.names, args, named)),
+        Some(sum) ->
+          translated(context, sum.result, actuals(context, scope, sum.names, args, named)),
         None -> UnknownTerm,
       },
       _ -> UnknownTerm,
@@ -995,8 +1007,8 @@ fn same_length(t: Term) -> Term =
   }
 
 // An integer-valued term, the only kind a fact relates.
-fn linear(context: MemberContext, s: Scope, e: Expr) -> Option<Linear> / {abort.raise} =
-  match term(context, s, e) {
+fn linear(context: MemberContext, scope: Scope, e: Expr) -> Option<Linear> / {abort.raise} =
+  match term(context, scope, e) {
     Exactly(l) -> if integer(context, l) { Some(l) } else { None },
     _ -> None,
   }
@@ -1086,8 +1098,8 @@ fn entry_scope(context: MemberContext, def: FnDef) -> Scope / {abort.raise} =
     depth: 0,
   }
 
-fn bound(s: Scope, name: Bytes, t: Term) -> Scope =
-  { ..s, locals: map_insert(s.locals, name, KnownTerm(t)) }
+fn bound(scope: Scope, name: Bytes, t: Term) -> Scope =
+  { ..scope, locals: map_insert(scope.locals, name, KnownTerm(t)) }
 
 fn unknown_params(s: Scope, ps: List<Param>) -> Scope =
   fold(ps, s, |sc: Scope, p: Param| bound(sc, p.name.name, UnknownTerm))
@@ -1144,92 +1156,93 @@ fn append_names(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
   fold(b, a, |acc: List<Bytes>, x: Bytes| push(acc, x))
 
 // A `let` of a lambda keeps the lambda, walked where it is called.
-fn statement_scope(context: MemberContext, s: Scope, x: Stmt) -> Scope / {abort.raise} =
+fn statement_scope(context: MemberContext, scope: Scope, x: Stmt) -> Scope / {abort.raise} =
   match x {
     SLet(l) -> match l.pat {
       PVar(v) -> match l.value {
         ELambda(f) ->
           {
-            ..s,
+            ..scope,
             locals: map_insert(
-              s.locals,
+              scope.locals,
               v.name.name,
-              LetLambda({ params: f.params, body: f.body, locals: s.locals }),
+              LetLambda({ params: f.params, body: f.body, locals: scope.locals }),
             ),
           },
-        _ -> bind(s, l.pat, term(context, s, l.value)),
+        _ -> bind(scope, l.pat, term(context, scope, l.value)),
       },
-      _ -> bind(s, l.pat, term(context, s, l.value)),
+      _ -> bind(scope, l.pat, term(context, scope, l.value)),
     },
-    SLetElse(l) -> bind(s, l.pat, term(context, s, l.value)),
-    SExpr(_) -> s,
+    SLetElse(l) -> bind(scope, l.pat, term(context, scope, l.value)),
+    SExpr(_) -> scope,
   }
 
 // What holds where `e` evaluated to `truth`.
-fn assume(context: MemberContext, s: Scope, e: Expr, truth: Bool) -> Scope / {abort.raise} =
+fn assume(context: MemberContext, scope: Scope, e: Expr, truth: Bool) -> Scope / {abort.raise} =
   match e {
-    EUnary(u) -> if u.op == b"not" { assume(context, s, u.operand, !truth) } else { s },
+    EUnary(u) -> if u.op == b"not" { assume(context, scope, u.operand, !truth) } else { scope },
     EBinary(b) -> if b.op == b"and" {
-      if truth { assume(context, assume(context, s, b.lhs, true), b.rhs, true) } else { s }
+      if truth { assume(context, assume(context, scope, b.lhs, true), b.rhs, true) } else { scope }
     } else if b.op == b"or" {
-      if truth { s } else { assume(context, assume(context, s, b.lhs, false), b.rhs, false) }
+      if truth { scope }
+      else { assume(context, assume(context, scope, b.lhs, false), b.rhs, false) }
     } else {
-      match linear(context, s, b.lhs) {
-        None -> s,
-        Some(l) -> match linear(context, s, b.rhs) {
-          None -> s,
-          Some(r) -> { ..s, facts: append_facts(s.facts, compared(b.op, l, r, truth)) },
+      match linear(context, scope, b.lhs) {
+        None -> scope,
+        Some(l) -> match linear(context, scope, b.rhs) {
+          None -> scope,
+          Some(r) -> { ..scope, facts: append_facts(scope.facts, compared(b.op, l, r, truth)) },
         },
       }
     },
-    EBlock(b) -> if len(b.stmts) > 0 { s }
-    else { match b.tail { Some(t) -> assume(context, s, t, truth), None -> s } },
-    _ -> s,
+    EBlock(b) -> if len(b.stmts) > 0 { scope }
+    else { match b.tail { Some(t) -> assume(context, scope, t, truth), None -> scope } },
+    _ -> scope,
   }
 
 // `list_at(xs, i)` or `array_at(xs, i)` answering `Some` puts `i` below the length, and a
 // condition matched against `true` or `false` holds or fails as an `if` would.
 fn found_at(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   scrutinee: Expr,
   p: Pattern,
 ) -> Scope / {abort.raise} =
   match p {
-    PLit(l) -> match l.lit { LBool(b) -> assume(context, s, scrutinee, b), _ -> s },
-    PCtor(k) -> if k.name.name.name != b"Some" { s } else {
+    PLit(l) -> match l.lit { LBool(b) -> assume(context, scope, scrutinee, b), _ -> scope },
+    PCtor(k) -> if k.name.name.name != b"Some" { scope } else {
       match scrutinee {
-        EApp(a) -> match builtin(context, s, a.func) {
-          Some(name) -> if (name != b"list_at" && name != b"array_at") || len(a.args) != 2 { s }
+        EApp(a) -> match builtin(context, scope, a.func) {
+          Some(name) -> if (name != b"list_at" && name != b"array_at") || len(a.args) != 2 { scope }
           else {
             let length = if name == b"list_at" { b"len" } else { b"array_len" };
-            match term(context, s, at(a.args, 0)) {
+            match term(context, scope, at(a.args, 0)) {
               Exactly(l) -> match l.base {
-                Some(PlaceBase(xs)) -> if l.k != 0 { s } else {
-                  match linear(context, s, at(a.args, 1)) {
+                Some(PlaceBase(xs)) -> if l.k != 0 { scope } else {
+                  match linear(context, scope, at(a.args, 1)) {
                     Some(i) ->
                       {
-                        ..s,
-                        facts: push(s.facts, {
+                        ..scope,
+                        facts: push(scope.facts, {
                           lo: i,
                           hi: { base: Some(LengthBase({ name: length, of: xs })), k: 0 },
                           strict: true,
                         }),
                       },
-                    None -> s,
+                    None -> scope,
                   }
                 },
-                _ -> s,
+                _ -> scope,
               },
-              _ -> s,
+              _ -> scope,
             }
           },
-          None -> s,
+          None -> scope,
         },
-        _ -> s,
+        _ -> scope,
       }
     },
-    _ -> s,
+    _ -> scope,
   }
 
 // The facts `after` holds past those `before` did, which it extends.
@@ -1310,18 +1323,18 @@ fn reached(acc: Seen, name: Bytes, span: Span) -> Seen =
   { ..acc, outside: push(acc.outside, { name: name, span: span }) }
 
 // What a free name names; a name the walk bound is its own.
-fn callee_of(context: MemberContext, s: Scope, q: QName) -> Callee / {abort.raise} =
+fn callee_of(context: MemberContext, scope: Scope, q: QName) -> Callee / {abort.raise} =
   match q.module {
-    None -> match local(s, q.name.name) {
+    None -> match local(scope, q.name.name) {
       Some(_) -> OtherCallee,
       None -> context.group.resolve(q),
     },
     Some(_) -> context.group.resolve(q),
   }
 
-fn builtin(context: MemberContext, s: Scope, func: Expr) -> Option<Bytes> / {abort.raise} =
+fn builtin(context: MemberContext, scope: Scope, func: Expr) -> Option<Bytes> / {abort.raise} =
   match func {
-    EVar(v) -> match callee_of(context, s, v.name) { BuiltinCallee(n) -> Some(n), _ -> None },
+    EVar(v) -> match callee_of(context, scope, v.name) { BuiltinCallee(n) -> Some(n), _ -> None },
     _ -> None,
   }
 
@@ -1469,20 +1482,20 @@ fn inlined(
 
 fn lambda_escapes(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   acc: Seen,
   f: { params: List<Param>, body: Expr, locals: Map<Bytes, Local> },
 ) -> Seen / {abort.raise} =
   walk(
     context,
-    unknown_params({ locals: f.locals, facts: s.facts, depth: s.depth + 1 }, f.params),
+    unknown_params({ locals: f.locals, facts: scope.facts, depth: scope.depth + 1 }, f.params),
     acc,
     f.body,
   )
 
 fn applied(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   acc: Seen,
   func: Expr,
   args: List<Expr>,
@@ -1490,90 +1503,103 @@ fn applied(
   span: Span,
 ) -> Seen / {abort.raise} = {
   let walk_args = |a: Seen|
-    fold(named, fold(args, a, |x: Seen, y: Expr| walk(context, s, x, y)), |x: Seen, n: NamedArg|
-      walk(context, s, x, n.value));
+    fold(
+      named,
+      fold(args, a, |x: Seen, y: Expr| walk(context, scope, x, y)),
+      |x: Seen, n: NamedArg| walk(context, scope, x, n.value),
+    );
   match func {
-    EVar(v) -> match local_of(s, v.name) {
+    EVar(v) -> match local_of(scope, v.name) {
       Some(LetLambda(f)) ->
-        inlined(context, s, walk_args(acc), f, map(args, |x: Expr| term(context, s, x))),
+        inlined(context, scope, walk_args(acc), f, map(args, |x: Expr| term(context, scope, x))),
       Some(FunctionParam(i)) ->
-        used(walk_args(acc), { param: i, args: Some(map(args, |x: Expr| term(context, s, x))) }),
+        used(walk_args(acc), {
+          param: i,
+          args: Some(map(args, |x: Expr| term(context, scope, x))),
+        }),
       Some(KnownTerm(_)) -> walk_args(acc),
-      None -> match callee_of(context, s, v.name) {
+      None -> match callee_of(context, scope, v.name) {
         GroupMember(t) ->
           called(walk_args(acc), {
             callee: t,
-            args: arguments(context, s, t, args, named),
-            facts: s.facts,
+            args: arguments(context, scope, t, args, named),
+            facts: scope.facts,
             span: span,
           }),
         BuiltinCallee(name) -> match element_callback(name) {
-          Some(shape) -> iterated(context, s, acc, args, named, shape),
+          Some(shape) -> iterated(context, scope, acc, args, named, shape),
           None -> walk_args(acc),
         },
         DefinedCallee(n) -> match context.group.summary_of(n) {
-          Some(sum) -> passed(context, s, reached(acc, n, v.span), sum, args, named),
+          Some(sum) -> passed(context, scope, reached(acc, n, v.span), sum, args, named),
           None -> walk_args(reached(acc, n, v.span)),
         },
         _ -> walk_args(acc),
       },
     },
-    _ -> walk(context, s, walk_args(acc), func),
+    _ -> walk(context, scope, walk_args(acc), func),
   }
 }
 
 // A call's arguments by the callee's parameters; one left to its default is unknown.
 fn arguments(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   t: Int,
   args: List<Expr>,
   named: List<NamedArg>,
 ) -> List<Term> / {abort.raise} =
-  actuals(context, s, map(at(context.group.defs, t).params, |p: Param| p.name.name), args, named)
+  actuals(
+    context,
+    scope,
+    map(at(context.group.defs, t).params, |p: Param| p.name.name),
+    args,
+    named,
+  )
 
 fn actuals(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   names: List<Bytes>,
   args: List<Expr>,
   named: List<NamedArg>,
 ) -> List<Term> / {abort.raise} =
   map(range(0, len(names)), |i: Int|
     match list_at(args, i) {
-      Some(x) -> term(context, s, x),
+      Some(x) -> term(context, scope, x),
       None ->
         fold(named, UnknownTerm, |found: Term, n: NamedArg|
-          if n.name.name == at(names, i) { term(context, s, n.value) } else { found }),
+          if n.name.name == at(names, i) { term(context, scope, n.value) } else { found }),
     })
 
 // A call of a summarized definition: each function it is handed is called as the summary says.
 fn passed(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   acc: Seen,
   sum: Summary,
   args: List<Expr>,
   named: List<NamedArg>,
 ) -> Seen / {abort.raise} = {
-  let terms = actuals(context, s, sum.names, args, named);
-  let at_param = |i: Int, a: Seen, x: Expr|
+  let terms = actuals(context, scope, sum.names, args, named);
+  let at_param = |i: Int, seen: Seen, x: Expr|
     match list_at(sum.params, i) {
       Some(CalledWith(calls)) ->
         handed(
           context,
-          s,
-          a,
+          scope,
+          seen,
           x,
           map(calls, |call: List<Term>| map(call, |t: Term| translated(context, t, terms))),
         ),
-      _ -> walk(context, s, a, x),
+      _ -> walk(context, scope, seen, x),
     };
-  let positional = fold(range(0, len(args)), acc, |a: Seen, i: Int| at_param(i, a, at(args, i)));
-  fold(named, positional, |a: Seen, n: NamedArg|
+  let positional = fold(range(0, len(args)), acc, |seen: Seen, i: Int|
+    at_param(i, seen, at(args, i)));
+  fold(named, positional, |seen: Seen, n: NamedArg|
     match index_of(sum.names, n.name.name) {
-      Some(i) -> at_param(i, a, n.value),
-      None -> walk(context, s, a, n.value),
+      Some(i) -> at_param(i, seen, n.value),
+      None -> walk(context, scope, seen, n.value),
     })
 }
 
@@ -1591,21 +1617,21 @@ fn handed(
 ) -> Seen / {abort.raise} =
   match x {
     ELambda(l) ->
-      fold(calls, acc, |a: Seen, call: List<Term>| {
+      fold(calls, acc, |seen: Seen, call: List<Term>| {
         let inside = fold(range(0, len(l.params)), s, |sc: Scope, j: Int|
           bound(sc, at(l.params, j).name.name, actual(call, j)));
-        walk(context, inside, a, l.body)
+        walk(context, inside, seen, l.body)
       }),
     EVar(v) -> match local_of(s, v.name) {
       Some(LetLambda(f)) ->
-        fold(calls, acc, |a: Seen, call: List<Term>| inlined(context, s, a, f, call)),
+        fold(calls, acc, |seen: Seen, call: List<Term>| inlined(context, s, seen, f, call)),
       Some(FunctionParam(i)) ->
-        fold(calls, acc, |a: Seen, call: List<Term>| used(a, { param: i, args: Some(call) })),
+        fold(calls, acc, |seen: Seen, call: List<Term>| used(seen, { param: i, args: Some(call) })),
       Some(KnownTerm(_)) -> acc,
       None -> match callee_of(context, s, v.name) {
         GroupMember(t) ->
-          fold(calls, acc, |a: Seen, call: List<Term>|
-            called(a, { callee: t, args: call, facts: s.facts, span: v.span })),
+          fold(calls, acc, |seen: Seen, call: List<Term>|
+            called(seen, { callee: t, args: call, facts: s.facts, span: v.span })),
         _ -> walk(context, s, acc, x),
       },
     },
@@ -1623,21 +1649,22 @@ fn element_callback(name: Bytes) -> Option<Iterates> =
 
 fn iterated(
   context: MemberContext,
-  s: Scope,
+  scope: Scope,
   acc: Seen,
   args: List<Expr>,
   named: List<NamedArg>,
   shape: Iterates,
 ) -> Seen / {abort.raise} = {
-  let others = fold(named, acc, |a: Seen, n: NamedArg| walk(context, s, a, n.value));
+  let others = fold(named, acc, |seen: Seen, n: NamedArg| walk(context, scope, seen, n.value));
   let element = match list_at(args, shape.list) {
-    Some(x) -> element(context, s, x),
+    Some(x) -> element(context, scope, x),
     None -> UnknownTerm,
   };
   let call = map(range(0, shape.arity), |j: Int|
     if j == shape.param { element } else { UnknownTerm });
-  fold(range(0, len(args)), others, |a: Seen, i: Int| {
+  fold(range(0, len(args)), others, |seen: Seen, i: Int| {
     let x = at(args, i);
-    if i != shape.callback { walk(context, s, a, x) } else { handed(context, s, a, x, [call]) }
+    if i != shape.callback { walk(context, scope, seen, x) }
+    else { handed(context, scope, seen, x, [call]) }
   })
 }
