@@ -7,7 +7,7 @@
 //! how the run concludes, why a failure happened, the mutants and mixtures that are tried and
 //! everything said about all of it are the program's.
 
-use crate::hosts::{self, Hosts, Lent};
+use crate::hosts::{self, Hosts, LentOp};
 use crate::payload::{count, diags_value, field_of, json, option, raised_value, record, strings};
 use crate::support::{select_profile, unit_of};
 use crate::testrun::{
@@ -83,7 +83,7 @@ impl Default for TestOptions {
 
 /// One process's tester: every iteration of a watching run is lent the same one, so the cache and
 /// the last compiled program outlive the report that opened them.
-pub struct Session(Arc<Site>);
+pub struct Session(Arc<TesterHandler>);
 
 impl Session {
     pub fn new() -> Session {
@@ -96,15 +96,15 @@ impl Session {
     }
 
     fn of(hermetic: bool) -> Session {
-        Session(Arc::new(Site {
+        Session(Arc::new(TesterHandler {
             hermetic,
             options: Mutex::new(TestOptions::default()),
             run: RwLock::new(Run::default()),
         }))
     }
 
-    pub fn lent(&self) -> Vec<Lent> {
-        let site: Arc<dyn HostHandler> = Arc::clone(&self.0) as Arc<dyn HostHandler>;
+    pub fn lent(&self) -> Vec<LentOp> {
+        let handler: Arc<dyn HostHandler> = Arc::clone(&self.0) as Arc<dyn HostHandler>;
         let (effect, operations) = if self.0.hermetic {
             (HERMETIC, HERMETIC_OPERATIONS)
         } else {
@@ -119,7 +119,7 @@ impl Session {
                 } else {
                     crate::hosts::privileged_op(effect, op, Linearity::Repeatable, path)
                 };
-                (op, Arc::clone(&site))
+                (op, Arc::clone(&handler))
             })
             .collect()
     }
@@ -131,7 +131,7 @@ impl Default for Session {
     }
 }
 
-struct Site {
+struct TesterHandler {
     hermetic: bool,
     options: Mutex<TestOptions>,
     /// The run in progress, which every thread the program runs a test on reads.
@@ -158,7 +158,7 @@ struct Bound {
     hosting: Hosting,
 }
 
-impl HostHandler for Site {
+impl HostHandler for TesterHandler {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match req.op.op.as_str() {
@@ -232,7 +232,7 @@ fn err(value: PlyValue) -> PlyValue {
 
 // --- The units and the binding -------------------------------------------------
 
-impl Site {
+impl TesterHandler {
     /// A program the CLI ran the front end over and produced the C of, made a unit tests can run
     /// in: the loaded program, a mutant of it, or a mixture of two of its eras. `None` builds
     /// nothing, for a run that executes nothing.

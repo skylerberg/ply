@@ -58,10 +58,10 @@ impl Drop for Library {
         unsafe { dlclose(self.handle) };
         // The object is not deleted: it lives in the cache, and the next run that emits the same
         // source loads it rather than compiling it again. `PLY_C_KEEP` says where it is, which is
-        // how the emitted code is read -- this tier's output is a file a disassembler can open,
-        // and the other tier's is not. `PLY_C_CACHE` names the directory.
+        // how the emitted code is read: it is a file a disassembler can open. `PLY_C_CACHE` names
+        // the directory.
         if std::env::var("PLY_C_KEEP").is_ok() {
-            eprintln!("c tier kept {}", self.path.display());
+            eprintln!("C backend kept {}", self.path.display());
         }
     }
 }
@@ -70,16 +70,16 @@ impl Drop for Library {
 // holds the `Bodies` it belongs to.
 unsafe impl Send for Library {}
 
-/// The C compiler this tier shells out to. `cc` rather than a pinned name: the dependency should be
-/// the one every machine already has. Which one, and on what flag, is the profile's answer -- see
-/// `toolchain.rs`.
+/// The C compiler this backend shells out to. `cc` rather than a pinned name: the dependency should
+/// be the one every machine already has. Which one, and on what flag, is the profile's answer --
+/// see `toolchain.rs`.
 fn compiler() -> String {
     super::toolchain::Profile::current().compiler()
 }
 
 /// Where compiled units are kept between runs. `PLY_C_CACHE` names another directory; the default
 /// is under the system's temporary directory. Images sit at its root, bucket objects under
-/// `obj/`, emitted bodies under `emit/`.
+/// `obj/`, the emitter's answers under `bodies/`.
 ///
 /// **Nothing about that directory bounds it**: an entry is keyed by its content, so a changed
 /// definition writes a new one beside the old rather than replacing it, and the system's own
@@ -223,7 +223,7 @@ pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Librar
     let level = opt_level();
     let ext = ext();
     // A unit already compiled from this source, by this compiler, on these flags is this object:
-    // load it rather than spend the process again. The emitted tier's compile is what keeps it off
+    // load it rather than spend the process again. The C backend's compile is what keeps it off
     // the loop's path, and for the self-hosted front end it is tens of seconds -- every invocation,
     // because `crates/ply-codegen` persisted nothing across runs.
     let cache = cache_dir();
@@ -269,7 +269,7 @@ pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Librar
         .map_err(|e| anyhow!("could not run {cc}: {e}"))?;
     if !out.status.success() {
         bail!(
-            "the C tier's linker refused the unit's objects ({}):\n{}",
+            "the C backend's linker refused the unit's objects ({}):\n{}",
             so.display(),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -397,7 +397,7 @@ fn compile_one(
     };
     if !out.status.success() {
         bail!(
-            "the C tier's compiler refused the unit it emitted ({}):\n{}",
+            "the C backend's compiler refused the unit it emitted ({}):\n{}",
             c.display(),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -475,7 +475,7 @@ impl Library {
                     .to_string_lossy()
                     .to_string()
             };
-            bail!("could not load the unit the C tier built: {message}");
+            bail!("could not load the unit the C backend built: {message}");
         }
         Ok(Library {
             handle,

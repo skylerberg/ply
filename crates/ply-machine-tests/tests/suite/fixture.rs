@@ -119,7 +119,7 @@ pub fn unit(path: &Path) -> ply_eval::Value {
     ply_eval::Value::bytes(unit_text(path))
 }
 
-/// The compiled tier over `loaded`, from the C handed over as the CLI hands it.
+/// The C backend over `loaded`, from the C handed over as the CLI hands it.
 pub fn backend(loaded: &ply_machine::load::Loaded) -> &'static dyn ply_eval::Provider {
     ply_machine::support::unit_of(&loaded.front, &unit_text(&loaded.root))
         .unwrap_or_else(|d| panic!("the unit compiles: {}", d.message))

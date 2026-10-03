@@ -1,4 +1,4 @@
-//! The engine: entry points and tests run on the compiled tier; performed atoms go to one
+//! The engine: entry points and tests run on the C backend; performed atoms go to one
 //! [`Trace`].
 
 use crate::compiled::{Compiled, Entered};
@@ -75,10 +75,10 @@ impl<T> Ended<T> {
 }
 
 impl<'a> Machine<'a> {
-    /// Refuses a tier built from another program, whose bodies would answer for that one.
+    /// Refuses a backend built from another program, whose bodies would answer for that one.
     pub fn new(front: &'a Analysis, compiled: Rc<dyn Compiled>) -> Result<Machine<'a>, Diagnostic> {
         if !compiled.describes(front.hashes_digest) {
-            return Err(err_foreign_tier(front.hashes_digest));
+            return Err(err_foreign_backend(front.hashes_digest));
         }
         let machine = Machine {
             id: MachineId::next(),
@@ -99,7 +99,7 @@ impl<'a> Machine<'a> {
             declared: None,
             re_executed: false,
         };
-        // A tier may be shared by several machines, so it takes this one's hermetic defaults.
+        // A backend may be shared by several machines, so it takes this one's hermetic defaults.
         machine.share_host();
         Ok(machine)
     }
@@ -162,7 +162,7 @@ impl<'a> Machine<'a> {
         &self.trace
     }
 
-    /// Entries the tier ran, and entries it declined, over this machine's life.
+    /// Entries the backend ran, and entries it declined, over this machine's life.
     pub fn compiled_counts(&self) -> (u64, u64) {
         (self.compiled_entries, self.compiled_declines)
     }
@@ -192,12 +192,12 @@ impl<'a> Machine<'a> {
             .filter(|t| t.module == test.module)
             .count();
         self.begin_entry();
-        self.tier_test(&test.module, ordinal, test.span)
+        self.compiled_test(&test.module, ordinal, test.span)
     }
 
     /// The compiled front end is the authority: unit passes, a raise fails, and a missing body or
     /// any other answer is Ply's defect.
-    fn tier_test(&mut self, module: &ModuleName, ordinal: usize, span: Span) -> Ended<()> {
+    fn compiled_test(&mut self, module: &ModuleName, ordinal: usize, span: Span) -> Ended<()> {
         let root = module.qualify(&Symbol::new(format!("test#{ordinal}")));
         self.compiled.set_seed(self.seed.clone(), self.sim_steps);
         let entered = self.compiled.enter_test(&root, self.max_calls);
@@ -238,10 +238,10 @@ impl<'a> Machine<'a> {
             }
         }
         self.begin_entry();
-        self.tier_call(&sym, args, span)
+        self.compiled_call(&sym, args, span)
     }
 
-    fn tier_call(&mut self, sym: &Symbol, args: Vec<Value>, span: Span) -> Ended<Value> {
+    fn compiled_call(&mut self, sym: &Symbol, args: Vec<Value>, span: Span) -> Ended<Value> {
         self.compiled.set_seed(self.seed.clone(), self.sim_steps);
         let entered = self.compiled.enter_whole(sym, &args, self.max_calls);
         self.record_compiled_atoms();
@@ -294,9 +294,9 @@ impl<'a> Machine<'a> {
 pub fn err_not_compiled(name: &Symbol, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("the compiled tier declined to enter `{name}`"),
+        format!("the C backend declined to enter `{name}`"),
     )
-    .primary(span, "the compiled tier declined this")
+    .primary(span, "the C backend declined this")
     .note(
         "a body the emitter cannot compile is `E0448` where the program is built, so this is the \
          seam rather than the body: a unit that failed to build, a signature the boundary does \
@@ -315,10 +315,7 @@ fn err_test_answered(root: &Symbol, value: &Value, span: Span) -> Diagnostic {
             crate::slot(0)
         ),
     )
-    .primary(
-        span,
-        "the compiled tier ran this test and it answered a value",
-    )
+    .primary(span, "the C backend ran this test and it answered a value")
     .note(
         "the checker refuses a test whose body is not `Unit` with E0201, so no test can answer one",
     )
@@ -328,10 +325,10 @@ fn err_test_answered(root: &Symbol, value: &Value, span: Span) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-fn err_foreign_tier(program: DefHash) -> Diagnostic {
+fn err_foreign_backend(program: DefHash) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("a machine for program {program} was handed a compiled tier built from another"),
+        format!("a machine for program {program} was handed a C backend built from another"),
     )
     .primary(Span::DUMMY, "nothing was run")
     .note("a unit's bodies answer for the program it was compiled from, never for another")

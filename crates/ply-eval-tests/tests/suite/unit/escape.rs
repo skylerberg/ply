@@ -26,7 +26,7 @@ fn closure(kind: ClosureKind) -> Value {
     Value::Closure(Arc::new(Closure { name: None, kind }))
 }
 
-/// Assembled, since only the compiled tier has a continuation's code; its captures are numbers, as
+/// Assembled, since only the C backend has a continuation's code; its captures are numbers, as
 /// the tier's are.
 fn continuation() -> Value {
     closure(ClosureKind::Continuation {

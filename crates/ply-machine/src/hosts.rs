@@ -18,7 +18,7 @@ pub fn registry() -> HostRegistry {
 }
 
 /// One host operation and the handler that serves it, as a caller lends it to an entry.
-pub type Lent = (HostOp, Arc<dyn HostHandler>);
+pub type LentOp = (HostOp, Arc<dyn HostHandler>);
 
 /// One operation of a privileged family. Each family reads the world, a tree, a clock, a cache, a
 /// toolchain or the process environment, so none is a function of program state; each answers
@@ -115,7 +115,7 @@ impl Hosts {
         trace: &crate::trace::TraceOptions,
         shutdown: Option<Arc<ply_host::signal::Shutdown>>,
         process: Option<ply_host::process::ProcessHost>,
-        lent: Vec<Lent>,
+        lent: Vec<LentOp>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
             let mut registry = registry_for(None);
@@ -687,13 +687,13 @@ const HERMETIC_OPERATIONS: [(&str, &str); 2] = [
 ];
 
 /// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
-pub fn lent(module: &str) -> Vec<Lent> {
+pub fn lent(module: &str) -> Vec<LentOp> {
     let mut ops = lent_by(module, false);
     ops.extend(lent_by(module, true));
     ops
 }
 
-fn lent_by(module: &str, hermetic: bool) -> Vec<Lent> {
+fn lent_by(module: &str, hermetic: bool) -> Vec<LentOp> {
     let facility: Arc<dyn HostHandler> = Arc::new(Facility {
         module: module.to_string(),
         hermetic,

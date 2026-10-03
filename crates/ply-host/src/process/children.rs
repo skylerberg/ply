@@ -1,7 +1,7 @@
 //! Children that run beside the program: started, fed, read, signalled and reaped by handle.
 
 use super::{MAX_CAPTURE_BYTES, Sink, Stream};
-use crate::pool::{Ended, Exit, Heard};
+use crate::pool::{Ended, Finished, Heard};
 use ply_eval::Resource;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
@@ -133,8 +133,8 @@ impl Children {
                 process,
                 ended: None,
                 stdin,
-                out: Held::new(out.collect),
-                err: Held::new(err.collect),
+                out: CollectedStream::new(out.collect),
+                err: CollectedStream::new(err.collect),
                 lines: VecDeque::new(),
                 spent: false,
             }),
@@ -216,7 +216,7 @@ impl Child {
     /// Once the child has ended and every stream the host collects has ended too, its ending and
     /// what those streams hold; `None` at the deadline, and no deadline waits for as long as it
     /// takes.
-    pub(super) fn wait(&self, deadline: Option<Instant>) -> Result<Option<Exit>, Refusal> {
+    pub(super) fn wait(&self, deadline: Option<Instant>) -> Result<Option<Finished>, Refusal> {
         let mut state = self.lock();
         loop {
             if state.spent {
@@ -236,7 +236,7 @@ impl Child {
                 }
                 let out = state.collected(Stream::Out);
                 let err = state.collected(Stream::Err);
-                return Ok(Some(Exit { ended, out, err }));
+                return Ok(Some(Finished { ended, out, err }));
             }
             state = match until(&self.changed, state, deadline) {
                 Some(state) => state,
@@ -339,15 +339,15 @@ struct State {
     /// Set once the child is reaped, and only under this lock.
     ended: Option<Result<Ended, String>>,
     stdin: Option<Arc<ChildStdin>>,
-    out: Held,
-    err: Held,
+    out: CollectedStream,
+    err: CollectedStream,
     /// Lines the `Lines` streams took and no `output_line` has answered, in the order they arrived.
     lines: VecDeque<(Stream, Vec<u8>)>,
     spent: bool,
 }
 
 impl State {
-    fn held(&mut self, stream: Stream) -> &mut Held {
+    fn held(&mut self, stream: Stream) -> &mut CollectedStream {
         match stream {
             Stream::Out => &mut self.out,
             Stream::Err => &mut self.err,
@@ -451,7 +451,7 @@ enum Collect {
 }
 
 /// One output stream, as the host collects it.
-struct Held {
+struct CollectedStream {
     collect: Collect,
     /// Its drain has not reached the end of the stream.
     open: bool,
@@ -465,9 +465,9 @@ struct Held {
     overflowed: bool,
 }
 
-impl Held {
-    fn new(collect: Collect) -> Held {
-        Held {
+impl CollectedStream {
+    fn new(collect: Collect) -> CollectedStream {
+        CollectedStream {
             collect,
             open: collect != Collect::Nothing,
             bytes: Vec::new(),

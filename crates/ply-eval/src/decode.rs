@@ -23,16 +23,16 @@ impl std::error::Error for Error {}
 
 /// One value of an answer, beside the answer it is in.
 #[derive(Clone, Copy)]
-pub struct At<'v> {
+pub struct AnswerValue<'v> {
     answer: &'v str,
     root: &'v Value,
     value: &'v Value,
 }
 
-impl<'v> At<'v> {
+impl<'v> AnswerValue<'v> {
     /// `answer` names the whole value in every error, as in "`costs.costs`' answer".
-    pub fn new(answer: &'v str, value: &'v Value) -> At<'v> {
-        At {
+    pub fn new(answer: &'v str, value: &'v Value) -> AnswerValue<'v> {
+        AnswerValue {
             answer,
             root: value,
             value,
@@ -43,8 +43,8 @@ impl<'v> At<'v> {
         self.value
     }
 
-    fn inner(self, value: &'v Value) -> At<'v> {
-        At { value, ..self }
+    fn inner(self, value: &'v Value) -> AnswerValue<'v> {
+        AnswerValue { value, ..self }
     }
 
     /// The path is searched for only when a read fails, so a read that succeeds pays nothing for it.
@@ -71,7 +71,7 @@ impl<'v> At<'v> {
         self.error(format!("expected {what}, found {}", sketch(self.value)))
     }
 
-    pub fn field(self, name: &str) -> Result<At<'v>, Error> {
+    pub fn field(self, name: &str) -> Result<AnswerValue<'v>, Error> {
         let Value::Record(fields) = self.value else {
             return Err(self.expected(&format!("a record with a `{name}` field")));
         };
@@ -87,9 +87,9 @@ impl<'v> At<'v> {
         }
     }
 
-    pub fn list(self) -> Result<Items<'v>, Error> {
+    pub fn list(self) -> Result<AnswerItems<'v>, Error> {
         match self.value {
-            Value::List(items) => Ok(Items {
+            Value::List(items) => Ok(AnswerItems {
                 at: self,
                 items: items.iter(),
             }),
@@ -98,21 +98,26 @@ impl<'v> At<'v> {
     }
 
     /// Every item of a list, each read by `read`.
-    pub fn items<T>(self, read: impl FnMut(At<'v>) -> Result<T, Error>) -> Result<Vec<T>, Error> {
+    pub fn items<T>(
+        self,
+        read: impl FnMut(AnswerValue<'v>) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
         self.list()?.map(read).collect()
     }
 
     /// A map's entries, in its key order.
-    pub fn entries(self) -> Result<impl Iterator<Item = (At<'v>, At<'v>)>, Error> {
+    pub fn entries(
+        self,
+    ) -> Result<impl Iterator<Item = (AnswerValue<'v>, AnswerValue<'v>)>, Error> {
         match self.value {
             Value::Map(m) => Ok(m.iter().map(move |(k, v)| (self.inner(k), self.inner(v)))),
             _ => Err(self.expected("a map")),
         }
     }
 
-    pub fn ctor(self) -> Result<Ctor<'v>, Error> {
+    pub fn ctor(self) -> Result<AnswerCtor<'v>, Error> {
         match self.value {
-            Value::Ctor { name, args } => Ok(Ctor {
+            Value::Ctor { name, args } => Ok(AnswerCtor {
                 at: self,
                 name: simple(name.as_str()),
                 args: args.as_slice(),
@@ -121,7 +126,7 @@ impl<'v> At<'v> {
         }
     }
 
-    pub fn option(self) -> Result<Option<At<'v>>, Error> {
+    pub fn option(self) -> Result<Option<AnswerValue<'v>>, Error> {
         if let Value::Ctor { name, args } = self.value {
             match (simple(name.as_str()), args.as_slice()) {
                 ("Some", [x]) => return Ok(Some(self.inner(x))),
@@ -132,7 +137,7 @@ impl<'v> At<'v> {
         Err(self.expected("an `Option`"))
     }
 
-    pub fn result(self) -> Result<Result<At<'v>, At<'v>>, Error> {
+    pub fn result(self) -> Result<Result<AnswerValue<'v>, AnswerValue<'v>>, Error> {
         if let Value::Ctor { name, args } = self.value {
             match (simple(name.as_str()), args.as_slice()) {
                 ("Ok", [x]) => return Ok(Ok(self.inner(x))),
@@ -195,22 +200,22 @@ impl<'v> At<'v> {
     }
 }
 
-impl fmt::Debug for At<'_> {
+impl fmt::Debug for AnswerValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.place(), sketch(self.value))
     }
 }
 
 /// A list's items, each beside the answer.
-pub struct Items<'v> {
-    at: At<'v>,
+pub struct AnswerItems<'v> {
+    at: AnswerValue<'v>,
     items: crate::list::Iter<'v>,
 }
 
-impl<'v> Iterator for Items<'v> {
-    type Item = At<'v>;
+impl<'v> Iterator for AnswerItems<'v> {
+    type Item = AnswerValue<'v>;
 
-    fn next(&mut self) -> Option<At<'v>> {
+    fn next(&mut self) -> Option<AnswerValue<'v>> {
         self.items.next().map(|v| self.at.inner(v))
     }
 
@@ -219,24 +224,24 @@ impl<'v> Iterator for Items<'v> {
     }
 }
 
-impl ExactSizeIterator for Items<'_> {}
+impl ExactSizeIterator for AnswerItems<'_> {}
 
 /// A constructor, read by its simple name.
 #[derive(Clone, Copy)]
-pub struct Ctor<'v> {
-    at: At<'v>,
+pub struct AnswerCtor<'v> {
+    at: AnswerValue<'v>,
     name: &'v str,
     args: &'v [Value],
 }
 
-impl<'v> Ctor<'v> {
+impl<'v> AnswerCtor<'v> {
     /// The name after the last `.`: one type's constructors are qualified by the program that built
     /// the value, `emit.Body` in the bundle and `compiler.emit.Body` in a program importing it.
     pub fn name(self) -> &'v str {
         self.name
     }
 
-    pub fn arg(self, i: usize) -> Result<At<'v>, Error> {
+    pub fn arg(self, i: usize) -> Result<AnswerValue<'v>, Error> {
         match self.args.get(i) {
             Some(value) => Ok(self.at.inner(value)),
             None => Err(self.at.error(format!(

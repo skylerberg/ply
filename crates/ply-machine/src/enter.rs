@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub struct Binds {
     pub roots: Vec<ply_host::fs::RootSpec>,
     pub executables: ply_host::process::Executables,
-    pub lent: Vec<crate::hosts::Lent>,
+    pub lent: Vec<crate::hosts::LentOp>,
     /// Certificates its `net.connect_tls` accepts beside the built-in roots, as `--trust` names them.
     pub trust: Vec<PathBuf>,
 }
@@ -63,7 +63,7 @@ pub fn opened_runnable(runnable: Runnable, root: &Path) -> Result<OpenedRunnable
 /// for a raise; what the entry ended with is the caller's to report.
 pub fn enter_runnable(program: OpenedRunnable, argv: Vec<String>, binds: Binds) -> Ended<i32> {
     let OpenedRunnable { opened, unit } = program;
-    let tier = ply_codegen::Unit::handed(&opened.front, unit)
+    let provider = ply_codegen::Unit::handed(&opened.front, unit)
         .map(|unit| unit as &'static dyn ply_eval::Provider)
         .map_err(|e| {
             Diagnostic::error(
@@ -71,11 +71,11 @@ pub fn enter_runnable(program: OpenedRunnable, argv: Vec<String>, binds: Binds) 
                 format!("the program's unit could not be compiled: {e:#}"),
             )
         });
-    entered_with(tier, &opened, argv, binds)
+    entered_with(provider, &opened, argv, binds)
 }
 
 fn entered_with(
-    tier: Result<&'static dyn ply_eval::Provider, Diagnostic>,
+    provider: Result<&'static dyn ply_eval::Provider, Diagnostic>,
     opened: &Opened,
     argv: Vec<String>,
     binds: Binds,
@@ -92,8 +92,8 @@ fn entered_with(
         .defs
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
-    let tier = match tier {
-        Ok(tier) => tier,
+    let provider = match provider {
+        Ok(provider) => provider,
         Err(refused) => return Ended::refused(refused),
     };
     let process = ply_host::process::ProcessHost::new(
@@ -127,7 +127,7 @@ fn entered_with(
         .get(&opened.entry)
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
-    let ended = evaluate(opened, span, &hosts, declared.as_ref(), tier);
+    let ended = evaluate(opened, span, &hosts, declared.as_ref(), provider);
     let _ = crate::drive::teardown(&hosts);
     let requested = hosts.requested_exit();
     ended.map(|answer| match requested {
@@ -150,9 +150,9 @@ fn evaluate(
     span: Span,
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_eval::Footprint>,
-    tier: &'static dyn ply_eval::Provider,
+    provider: &'static dyn ply_eval::Provider,
 ) -> Ended<ply_eval::Value> {
-    let mut machine = match ply_eval::Machine::new(&opened.front, tier.attach()) {
+    let mut machine = match ply_eval::Machine::new(&opened.front, provider.attach()) {
         Ok(machine) => machine,
         Err(refused) => return Ended::refused(refused),
     };

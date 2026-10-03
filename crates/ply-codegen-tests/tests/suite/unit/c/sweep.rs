@@ -27,59 +27,56 @@ fn present(dir: &Path, names: &[&str]) -> Vec<String> {
 #[test]
 fn a_cache_inside_its_budget_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["emit/a.body", "emit/b.body", "c.dylib"];
+    let names = ["bodies/a", "bodies/b", "c.dylib"];
     stock(dir.path(), &names, 100);
     assert_eq!(sweep(dir.path(), 1_000), 0);
     assert_eq!(present(dir.path(), &names).len(), 3);
 }
 
 #[test]
-fn a_kept_answer_is_swept_with_the_bodies() {
+fn an_answer_is_swept_with_the_objects() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["answers/old", "emit/b.body", "answers/new"];
+    let names = ["bodies/old", "obj/b.o", "bodies/new"];
     stock(dir.path(), &names, 100);
     assert_eq!(sweep(dir.path(), 200), 100);
-    assert_eq!(present(dir.path(), &names), ["emit/b.body", "answers/new"]);
+    assert_eq!(present(dir.path(), &names), ["obj/b.o", "bodies/new"]);
 }
 
 #[test]
 fn the_oldest_entries_go_until_the_rest_fits() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["emit/a.body", "emit/b.body", "emit/c.body", "d.dylib"];
+    let names = ["bodies/a", "bodies/b", "bodies/c", "d.dylib"];
     stock(dir.path(), &names, 100);
     // Four hundred bytes, and room for two.
     let freed = sweep(dir.path(), 200);
     assert_eq!(freed, 200, "two of the four should have gone");
     assert_eq!(
         present(dir.path(), &names),
-        vec!["emit/c.body".to_string(), "d.dylib".to_string()],
+        vec!["bodies/c".to_string(), "d.dylib".to_string()],
         "the two written longest ago are the two that go"
     );
 }
 
 #[test]
-fn an_object_is_as_removable_as_a_body() {
+fn an_object_is_as_removable_as_an_answer() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["old.dylib", "obj/older.o", "emit/new.body"];
+    let names = ["old.dylib", "obj/older.o", "bodies/new"];
     stock(dir.path(), &names, 100);
     sweep(dir.path(), 100);
-    assert_eq!(
-        present(dir.path(), &names),
-        vec!["emit/new.body".to_string()]
-    );
+    assert_eq!(present(dir.path(), &names), vec!["bodies/new".to_string()]);
 }
 
 /// An object every run loads was written once, long ago: its use, not its writing, is its age.
 #[test]
 fn an_object_used_lately_outlives_one_written_later() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["loaded.dylib", "obj/later.o", "emit/latest.body"];
+    let names = ["loaded.dylib", "obj/later.o", "bodies/latest"];
     stock(dir.path(), &names, 100);
     used(&dir.path().join("loaded.dylib"));
     sweep(dir.path(), 200);
     assert_eq!(
         present(dir.path(), &names),
-        vec!["loaded.dylib".to_string(), "emit/latest.body".to_string()]
+        vec!["loaded.dylib".to_string(), "bodies/latest".to_string()]
     );
 }
 
@@ -110,9 +107,9 @@ fn a_recent_mark_stands_and_an_old_one_is_renewed() {
 fn a_temporary_is_never_swept() {
     let dir = tempfile::tempdir().unwrap();
     let names = [
-        "emit/a.body.1234.0.tmp",
+        "bodies/a.1234.0.tmp",
         "obj/c.o.1234.1.tmp",
-        "emit/b.body",
+        "bodies/b",
         "obj/d.o",
     ];
     stock(dir.path(), &names, 100);
@@ -120,7 +117,7 @@ fn a_temporary_is_never_swept() {
     assert_eq!(
         present(dir.path(), &names),
         vec![
-            "emit/a.body.1234.0.tmp".to_string(),
+            "bodies/a.1234.0.tmp".to_string(),
             "obj/c.o.1234.1.tmp".to_string()
         ]
     );
@@ -158,7 +155,7 @@ fn the_stamp_is_marked_by_taking_the_claim_not_by_finishing_the_sweep() {
 #[test]
 fn the_stamp_survives_a_sweep_that_empties_the_cache() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["emit/a.body", "emit/b.body"];
+    let names = ["bodies/a", "bodies/b"];
     stock(dir.path(), &names, 100);
     assert!(claim(dir.path(), Duration::from_secs(600)));
     sweep(dir.path(), 0);
