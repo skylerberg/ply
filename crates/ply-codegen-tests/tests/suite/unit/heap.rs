@@ -564,7 +564,7 @@ fn nested_cases() -> [(&'static str, Vec<Word>, bool); 2] {
 /// entry alone holds; an ordinary closure over an immediate is kept.
 #[test]
 fn a_continuation_however_deep_in_a_word_leaves_it_to_its_entry() {
-    let Some((_source, native)) = super::c::tests_support::unit(NESTED) else {
+    let Some((_source, native)) = crate::fixture::unit(NESTED) else {
         return;
     };
     let mut ctx = native.context();
@@ -585,7 +585,7 @@ fn a_continuation_however_deep_in_a_word_leaves_it_to_its_entry() {
 /// a word and through a bridge.
 #[test]
 fn a_continuation_word_converts_to_a_value_that_says_it_is_one() {
-    let Some((_source, native)) = super::c::tests_support::unit(NESTED) else {
+    let Some((_source, native)) = crate::fixture::unit(NESTED) else {
         return;
     };
     let layouts = &native.tables().layouts;

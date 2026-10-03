@@ -115,7 +115,7 @@ fn machine_over(
 
 #[test]
 fn a_test_hands_back_what_its_body_and_its_entry_point_warned_of_as_it_ended() {
-    let front = port_front(&[("", PROGRAM)]);
+    let front = port_front(&[("m", PROGRAM)]);
     let (mut machine, _) = machine_over(&front, || Entered::Answered(Value::Unit));
     let (answer, warnings) = machine.eval_test(0).into_parts();
     assert!(answer.is_ok(), "{answer:?}");
@@ -128,7 +128,7 @@ fn a_test_hands_back_what_its_body_and_its_entry_point_warned_of_as_it_ended() {
 
 #[test]
 fn each_call_hands_back_its_own_warnings_and_none_of_the_entry_before_it() {
-    let front = port_front(&[("", PROGRAM)]);
+    let front = port_front(&[("m", PROGRAM)]);
     let (mut machine, ended) = machine_over(&front, || Entered::Answered(Value::Int(3)));
     for entry in 1..=2 {
         let (answer, warnings) = machine.call("main", Vec::new(), Span::DUMMY).into_parts();
@@ -142,7 +142,7 @@ fn each_call_hands_back_its_own_warnings_and_none_of_the_entry_before_it() {
 /// are most worth the warning.
 #[test]
 fn a_raise_hands_back_its_warnings_beside_the_diagnostic() {
-    let front = port_front(&[("", PROGRAM)]);
+    let front = port_front(&[("m", PROGRAM)]);
     let (mut machine, _) = machine_over(&front, || {
         Entered::Raised(Diagnostic::error(codes::RUNTIME_ERROR, "the body gave up"))
     });
@@ -156,7 +156,7 @@ fn a_raise_hands_back_its_warnings_beside_the_diagnostic() {
 
 #[test]
 fn an_entry_refused_before_it_ran_ended_nothing_and_warns_of_nothing() {
-    let front = port_front(&[("", PROGRAM)]);
+    let front = port_front(&[("m", PROGRAM)]);
     let (mut machine, ended) = machine_over(&front, || panic!("a refused entry reached the tier"));
     let (answer, warnings) = machine.eval_test(7).into_parts();
     assert_eq!(

@@ -7,8 +7,7 @@
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Analysis, Machine, Provider, SourceId, Span};
-use std::collections::HashMap;
+use ply_eval::{Analysis, Machine, Provider, Span};
 use std::sync::Arc;
 
 /// A program that asks the environment everything it knows to ask.
@@ -39,18 +38,23 @@ fn main() -> String / {env.var[e], env.vars[e], env.terminal[e], env.binary_vers
 }
 "#;
 
-fn front_of(source: &str) -> Analysis {
-    let named = vec![("m".to_string(), source.to_string())];
-    let ids = vec![SourceId(0)];
-    ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_analysis(&named, &ids).expect("the program checks")
+/// The program the builder makes of `source`: its front end's answer and its unit.
+fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
+    let files = [("m.ply".to_string(), source.to_string())];
+    let bytes = ply_machine::builds::answered(&files).expect("the builder answers");
+    let answer = ply_machine::runnable::decode(&bytes).expect("the answer reads");
+    let front = answer.front.answer;
+    assert!(
+        !front.has_error(),
+        "the program checks: {:?}",
+        front.diagnostics
+    );
+    let unit = ply_codegen::Unit::handed(&front, answer.unit).expect("this host has a C toolchain");
+    (front, unit)
 }
 
 fn ask() -> ply_eval::Value {
-    let front = front_of(ASKER);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), ASKER.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(ASKER);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();

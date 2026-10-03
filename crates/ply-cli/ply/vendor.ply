@@ -14,7 +14,7 @@ import builder (builder)
 import lock
 import paths (Resolved, here)
 import program (Program, load_program)
-import report (Answer, ind, ok_code, count_of, refused, reported)
+import report (Answer, indent, ok_code, count_of, refused, reported)
 import sources (index_path, tree_of, under_abs)
 import style (Style, green)
 import compiler.front (Analysis)
@@ -166,31 +166,35 @@ pub fn run(
 }
 
 fn pinned(
-  r: Resolved,
-  w: Analysis,
-) -> Option<Diag> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  match lock::read(r) {
-    Err(why) -> Some(lock::refused(r, why)),
+  resolved: Resolved,
+  analysis: Analysis,
+) -> Option<Diag> / {fs.read_file[cwd], fs.read_file[abs]} =
+  match lock::read(resolved) {
+    Err(why) -> Some(lock::refused(resolved, why)),
     Ok(None) -> None,
-    Ok(Some(existing)) -> match lock::verified(r, existing, lock::from_front(w.pins)) {
+    Ok(Some(existing)) -> match lock::verified(
+        resolved,
+        existing,
+        lock::from_front(analysis.pins),
+      ) {
       Ok(_) -> None,
       Err(d) -> Some(d),
     },
   }
 
 fn copied(
-  s: Style,
+  style: Style,
   flags: Flags,
-  r: Resolved,
+  resolved: Resolved,
   loaded: Program,
-  w: Analysis,
-) -> Answer / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
-  match place(r, layout(w, loaded)) {
-    Err(why) -> reported(s, "vendor", [trouble(r.display, why)], loaded.places),
+  analysis: Analysis,
+) -> Answer / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  match place(resolved, layout(analysis, loaded)) {
+    Err(why) -> reported(style, "vendor", [trouble(resolved.display, why)], loaded.places),
     Ok(rows) ->
       {
-        json: json_of(rows, r.display, ok_code()),
-        lines: if flags.json { [] } else { vendored_lines(s, r, rows) },
+        json: json_of(rows, resolved.display, ok_code()),
+        lines: if flags.json { [] } else { vendored_lines(style, resolved, rows) },
         errs: [],
         code: ok_code(),
       },
@@ -200,7 +204,7 @@ fn copied(
 // is the package's own name unless a manifest aliases it — and `E0133` refuses an alias that is not.
 // The closure's table runs on into the toolchain's own packages, and vendoring those would copy the
 // compiler into every project: the dependencies are exactly the packages the walk supplied.
-fn layout(w: Analysis, loaded: Program) -> List<{ want: String, dir: String }> / {abort.raise} =
+fn layout(analysis: Analysis, loaded: Program) -> List<{ want: String, dir: String }> =
   fold(
     range(1, len(loaded.pkgs.supplied) + 1),
     [],
@@ -209,22 +213,22 @@ fn layout(w: Analysis, loaded: Program) -> List<{ want: String, dir: String }> /
         None -> "",
         Some(s) -> string_of_bytes_lossy(s.root),
       };
-      push(acc, { want: want, dir: join("vendor", prefix_of(nth(w.packages, i))) })
+      push(acc, { want: want, dir: join("vendor", prefix_of(nth(analysis.packages, i))) })
     },
   )
 
 fn prefix_of(p: PackageDeps) -> String = string_of_bytes_lossy(p.prefix)
 
 fn place(
-  r: Resolved,
+  resolved: Resolved,
   rows: List<{ want: String, dir: String }>,
-) -> Result<List<{ want: String, dir: String }>, String> / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
-  match each(r, rows) {
+) -> Result<List<{ want: String, dir: String }>, String> / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  match each(resolved, rows) {
     Err(why) -> Err(why),
     Ok(_) -> {
       // The index lives in a directory the copy may have made and a project with no dependencies
       // has not: `create_dir` makes the vendor directory itself, whatever is in it.
-      let path = index_path(r.absolute);
+      let path = index_path(resolved.absolute);
       if !fs.create_dir[abs](under_abs(parent(path))) {
         Err("could not make `" ++ parent(path) ++ "`")
       } else if fs.write_file[abs](under_abs(path), bytes_of_string(index_text(rows))) { Ok(rows) }
@@ -233,7 +237,7 @@ fn place(
   }
 
 fn each(
-  r: Resolved,
+  resolved: Resolved,
   rows: List<{ want: String, dir: String }>,
 ) -> Result<Unit, String> / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
   fold(rows, Ok(()), |acc: Result<Unit, String>, row: { want: String, dir: String }|
@@ -242,27 +246,27 @@ fn each(
       // The tree is what the walk reads *without* the index: a project that is already vendored must
       // not copy its own vendor directory into itself, and re-vendoring must copy what the fetch has
       // now rather than what the last vendor wrote.
-      Ok(_) -> copy(fresh(r, row.want), join(r.absolute, row.dir)),
+      Ok(_) -> copy(fresh(resolved, row.want), join(resolved.absolute, row.dir)),
     })
 
-fn fresh(r: Resolved, want: String) -> String / {builder.git[vcs]} =
-  match tree_of(r.absolute, [], bytes_of_string(want)) {
+fn fresh(resolved: Resolved, want: String) -> String / {builder.git[vcs]} =
+  match tree_of(resolved.absolute, [], bytes_of_string(want)) {
     Some(dir) -> dir,
     // A want nothing can read is reported by the copy that follows: it fails on its first file.
-    None -> join(r.absolute, join("vendor", want)),
+    None -> join(resolved.absolute, join("vendor", want)),
   }
 
 fn vendored_lines(
-  s: Style,
-  r: Resolved,
+  style: Style,
+  resolved: Resolved,
   rows: List<{ want: String, dir: String }>,
 ) -> List<String> / {abort.raise} = {
   let head = [
-    ind() ++ green(s, "vendored") ++ " " ++ count_of(len(rows), "package") ++ " · "
-      ++ join(r.display, "vendor"),
+    indent() ++ green(style, "vendored") ++ " " ++ count_of(len(rows), "package") ++ " · "
+      ++ join(resolved.display, "vendor"),
   ];
   fold(rows, head, |acc: List<String>, row: { want: String, dir: String }|
-    push(acc, ind() ++ "  " ++ row.dir))
+    push(acc, indent() ++ "  " ++ row.dir))
 }
 
 fn json_of(rows: List<{ want: String, dir: String }>, root: String, code: Int) -> Json =

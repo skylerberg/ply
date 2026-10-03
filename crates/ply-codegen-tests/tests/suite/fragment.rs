@@ -1,32 +1,14 @@
+use crate::fixture;
 use ply_codegen::Unit;
-use ply_eval::{Provider, Symbol, Value};
-use std::collections::HashMap;
+use ply_eval::{Analysis, Provider, Symbol, Value};
 
-pub struct Loaded {
-    pub front: &'static ply_eval::Analysis,
-    /// Each module's text by name: what the Ply emitter re-parses to produce.
-    pub texts: HashMap<String, String>,
-}
-
-/// `source` as a module named `m`, with the standard library pulled as the built-in package.
-fn load(source: &str) -> Loaded {
-    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
-        "m".to_string(),
-        source.to_string(),
-    )])
-    .expect("the corpus checks");
-    Loaded {
-        front: Box::leak(Box::new(answered.front)),
-        texts: answered.modules.into_iter().collect(),
-    }
-}
-
-pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
-    let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
-    let unit =
-        Unit::over_front(loaded.front, loaded.texts.clone()).expect("this host has a C compiler");
+/// `source` as a module named `m`, and the unit the builder made of it, every root offered.
+pub fn unit(source: &str) -> (&'static Analysis, &'static Unit) {
+    let answer = fixture::answered(&[("m", source)]);
+    let front: &'static Analysis = Box::leak(Box::new(answer.front.answer));
+    let unit = Unit::handed(front, answer.unit).expect("this host has a C compiler");
     let _ = unit.bodies();
-    (loaded, unit)
+    (front, unit)
 }
 
 const ARITHMETIC: &str = r#"
@@ -775,33 +757,19 @@ fn an_overflow_declines_rather_than_wrapping() {
 /// A bisection builds programs whose definitions reuse the names they replace, so a registry keyed on a name answers for the wrong body.
 #[test]
 fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
-    let (loaded, unit) = unit(ARITHMETIC);
+    let (front, unit) = unit(ARITHMETIC);
     let edited = ARITHMETIC.replace("x * 2", "x * 3");
     assert_ne!(edited, ARITHMETIC, "the fixture spells `double`'s body");
-    let other = load(&edited);
+    let other = fixture::answered(&[("m", &edited)]).front.answer;
     let backend = unit.attach();
-    assert!(backend.describes(loaded.front.hashes_digest));
-    assert!(!backend.describes(other.front.hashes_digest));
-}
-
-#[test]
-fn the_compiled_set_is_closed_under_calls() {
-    let (loaded, unit) = unit(ARITHMETIC);
-    let source = ply_codegen::Source::from_analysis(loaded.front).with_texts(loaded.texts.clone());
-    let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
-    let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
-    assert!(
-        refusals.is_empty(),
-        "the fixpoint returned a set that still refuses: {refusals:?}"
-    );
+    assert!(backend.describes(front.hashes_digest));
+    assert!(!backend.describes(other.hashes_digest));
 }
 
 #[test]
 fn the_census_over_the_standard_library() {
-    let (loaded, unit) = unit(ARITHMETIC);
-    let functions = ply_codegen::Source::from_analysis(loaded.front)
-        .functions()
-        .len();
+    let (front, unit) = unit(ARITHMETIC);
+    let functions = front.emitter_roots.len();
     let mut by_construct: std::collections::BTreeMap<&str, usize> = Default::default();
     for (_, construct) in unit.refusals() {
         *by_construct.entry(construct.as_str()).or_default() += 1;

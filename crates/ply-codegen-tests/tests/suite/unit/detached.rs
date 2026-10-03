@@ -42,7 +42,7 @@ fn carried_out(native: &Native, ctx: &mut Ctx, kept: &mut Heap) -> Word {
 /// was captured in its own.
 #[test]
 fn a_continuation_resumed_after_its_entry_fails_that_entry_as_plys_fault() {
-    let Some((_source, native)) = super::c::tests_support::unit(PARKED) else {
+    let Some((_source, native)) = crate::fixture::unit(PARKED) else {
         return;
     };
     let layouts = &native.tables().layouts;
