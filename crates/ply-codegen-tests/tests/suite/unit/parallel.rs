@@ -30,7 +30,7 @@ pub fn lengths(n: Int) -> Int = {
   p._0 + p._1 + len(words)
 }
 
-pub fn failing(n: Int) -> Int = {
+pub fn failing(n: Int) -> Int / {abort.raise} = {
   let p = parallel { if fib(n) > 0 { panic("the left branch") } else { 0 }, panic("the right branch") };
   p._0 + p._1
 }

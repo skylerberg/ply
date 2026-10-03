@@ -50,7 +50,7 @@ effect amb { read flip[coin]() -> Bool }
 
 type Saved = Nothing | Just((Bool) -> Int)
 
-fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
+fn parked() -> Saved / {abort.raise} = with_cell[slot](Nothing) { s -> {
   let inner = with_cell[log](41) { c ->
     handle {
       let b = amb.flip[coin]();
@@ -63,7 +63,7 @@ fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
 
 fn resume_it(s: Saved) -> Int = match s { Just(k) -> k(true), Nothing -> 0 }
 
-pub fn resumed(n: Int) -> Int = n + resume_it(parked())
+pub fn resumed(n: Int) -> Int / {abort.raise} = n + resume_it(parked())
 
 fn identity(n: Int) -> Int = n
 
@@ -246,13 +246,13 @@ fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
 /// A type parameter hides the task `spawned` let out from the next region, which numbers a task of
 /// its own `@1` as well: joined there by id alone, the handle would answer that task's `2`.
 const REJOINED: &str = r#"
-fn joined<a>(x: a, wait: (a) -> Int / {task.join}) -> Int / {sim.read} =
+fn joined<a>(x: a, wait: (a) -> Int / {task.join, abort.raise}) -> Int / {sim.read, abort.raise} =
   simulate {
     let mine = task.spawn(|| 2);
     wait(x) + task.join(mine)
   }
 
-pub fn rejoined() -> Int / {sim.read} = match spawned() {
+pub fn rejoined() -> Int / {sim.read, abort.raise} = match spawned() {
   Some(t) -> joined(t, |h: Task<Int>| task.join(h)),
   None -> 0,
 }

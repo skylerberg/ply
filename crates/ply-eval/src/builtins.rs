@@ -199,6 +199,52 @@ pub enum Builtin {
 }
 
 impl Builtin {
+    /// Whether a failure of this builtin is a raise of `abort.raise`, which the prelude's scheme
+    /// for it carries in its row: one a `handle` answers, not a fault that ends the run.
+    pub fn raises(self) -> bool {
+        matches!(
+            self,
+            Builtin::Assert
+                | Builtin::AssertEq
+                | Builtin::ListSet
+                | Builtin::ArrayNew
+                | Builtin::ArrayGet
+                | Builtin::ArraySet
+                | Builtin::Iterate
+                | Builtin::U8OfInt
+                | Builtin::U16OfInt
+                | Builtin::U32OfInt
+                | Builtin::U64OfInt
+                | Builtin::I8OfInt
+                | Builtin::I16OfInt
+                | Builtin::I32OfInt
+                | Builtin::I64OfInt
+                | Builtin::U128OfInt
+                | Builtin::I128OfInt
+                | Builtin::NumericOfInt
+                | Builtin::IntOfU64
+                | Builtin::IntOfU128
+                | Builtin::IntOfI128
+                | Builtin::ByteOfInt
+                | Builtin::BytesAt
+                | Builtin::BytesU32Le
+                | Builtin::BytesSlice
+                | Builtin::BytesIndexOfFrom
+                | Builtin::BytesIndexOfByte
+                | Builtin::BytesSplit
+                | Builtin::BytesScan
+                | Builtin::BytesScanUntil
+                | Builtin::BytesPosition
+                | Builtin::StringOfBytes
+                | Builtin::StringSlice
+                | Builtin::StringSplit
+                | Builtin::StringFind
+                | Builtin::DecimalDiv
+                | Builtin::DecimalRound
+                | Builtin::Panic
+        )
+    }
+
     pub fn from_name(name: &str) -> Option<Builtin> {
         if let Some(t) = IntTy::of_int_from_name(name) {
             return Some(Builtin::of_int(t));
