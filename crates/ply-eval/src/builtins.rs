@@ -164,6 +164,8 @@ pub enum Builtin {
     Reflect,
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
     Digest,
+    /// `bracket(acquire, release, body)`: `release` runs on every exit from `body` but a failure.
+    Bracket,
     /// An operator over a `numeric` or `integer` type parameter: `?numeric_binary(op, witness, x,
     /// y)`, its operands read as the type the witness names. No source can spell it; the
     /// elaboration writes it.
@@ -289,6 +291,7 @@ impl Builtin {
             "array_set" => Builtin::ArraySet,
             "reflect" => Builtin::Reflect,
             "digest" => Builtin::Digest,
+            "bracket" => Builtin::Bracket,
             "?numeric_binary" => Builtin::NumericBinary,
             "?numeric_unary" => Builtin::NumericUnary,
             "numeric_of_int" => Builtin::NumericOfInt,
@@ -425,6 +428,7 @@ impl Builtin {
             Builtin::ArraySet => "array_set",
             Builtin::Reflect => "reflect",
             Builtin::Digest => "digest",
+            Builtin::Bracket => "bracket",
             Builtin::NumericBinary => "?numeric_binary",
             Builtin::NumericUnary => "?numeric_unary",
             Builtin::NumericOfInt => "numeric_of_int",
@@ -549,6 +553,7 @@ impl Builtin {
             | Builtin::ArrayGet => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
+            | Builtin::Bracket
             | Builtin::ListSet
             | Builtin::ArraySet
             | Builtin::NumericUnary
@@ -734,6 +739,7 @@ impl Builtin {
             Builtin::ArraySet,
             Builtin::Reflect,
             Builtin::Digest,
+            Builtin::Bracket,
             Builtin::NumericBinary,
             Builtin::NumericUnary,
             Builtin::NumericOfInt,
@@ -913,7 +919,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::MapFold
         | Builtin::CellGet
         | Builtin::CellSet
-        | Builtin::CellUpdate => Err(answered_by_the_tier(b, span)),
+        | Builtin::CellUpdate
+        | Builtin::Bracket => Err(answered_by_the_tier(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
