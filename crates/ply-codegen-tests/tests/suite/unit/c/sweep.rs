@@ -1,5 +1,5 @@
 use ply_codegen::c::sweep::{
-    ANSWERED, BEGUN, RUNS, STAMP, USED, claim, due, finished, sweep, sweep_stages, used,
+    ANSWERED, BEGUN, REUSED, STAMP, USED, claim, due, finished, sweep, sweep_stages, used,
 };
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -296,21 +296,21 @@ fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
     assert!(root.path().join(STAMP).exists());
 }
 
-/// A closure `ply run` filed goes on its own, like an artifact's front, and never as one stage
-/// holding every run: the least recently used go first, and the directory stays.
+/// An answer `ply run` or `ply check` filed goes on its own, like an artifact's front, and never as
+/// one stage holding every answer: the least recently used go first, and the directory stays.
 #[test]
-fn a_runs_front_goes_on_its_own_least_recently_used_first() {
+fn a_reused_answer_goes_on_its_own_least_recently_used_first() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
-    filed(root.path(), RUNS, "old", 100, now, 6 * HOUR);
+    filed(root.path(), REUSED, "old", 100, now, 6 * HOUR);
     front(root.path(), "front.mid", 100, now, 4 * HOUR);
     stage(root.path(), "stage-a", 100, now, 2 * HOUR);
-    filed(root.path(), RUNS, "fresh", 100, now, HOUR / 4);
+    filed(root.path(), REUSED, "fresh", 100, now, HOUR / 4);
     assert_eq!(sweep_stages(root.path(), 250, now), 200);
-    let runs = root.path().join(RUNS);
+    let reused = root.path().join(REUSED);
     assert!(
-        !runs.join("old").exists(),
-        "the run used longest ago goes first"
+        !reused.join("old").exists(),
+        "the answer used longest ago goes first"
     );
     assert!(!root.path().join(ANSWERED).join("front.mid").exists());
     assert!(
@@ -318,22 +318,22 @@ fn a_runs_front_goes_on_its_own_least_recently_used_first() {
         "the rest fits once two have gone"
     );
     assert!(
-        runs.join("fresh").exists(),
-        "a run used within the hour stays"
+        reused.join("fresh").exists(),
+        "an answer used within the hour stays"
     );
 }
 
-/// A run's front half written belongs to a run still writing it, and the directory is no stage to
+/// An answer half written belongs to a run still writing it, and the directory is no stage to
 /// remove whole however far over budget its files are.
 #[test]
-fn a_runs_front_being_written_is_never_swept() {
+fn a_reused_answer_being_written_is_never_swept() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
-    filed(root.path(), RUNS, "k.1234.0.tmp", 100, now, 5 * HOUR);
-    filed(root.path(), RUNS, "k", 100, now, 5 * HOUR);
+    filed(root.path(), REUSED, "k.1234.0.tmp", 100, now, 5 * HOUR);
+    filed(root.path(), REUSED, "k", 100, now, 5 * HOUR);
     assert_eq!(sweep_stages(root.path(), 0, now), 100);
-    let runs = root.path().join(RUNS);
-    assert!(runs.join("k.1234.0.tmp").exists());
-    assert!(!runs.join("k").exists());
-    assert!(runs.is_dir());
+    let reused = root.path().join(REUSED);
+    assert!(reused.join("k.1234.0.tmp").exists());
+    assert!(!reused.join("k").exists());
+    assert!(reused.is_dir());
 }

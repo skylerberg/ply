@@ -151,8 +151,9 @@ pub const USED: &str = ".used";
 /// each swept on its own.
 pub const ANSWERED: &str = "answered";
 
-/// The stage-directory entry holding one file per closure `ply run` loaded, each swept on its own.
-pub const RUNS: &str = "run-fronts";
+/// The stage-directory entry holding one file per answer a command takes back over an unchanged walk
+/// (`ply run`'s front end, `ply check`'s answer), each swept on its own.
+pub const REUSED: &str = "reused";
 
 /// The stage-directory entry holding the rows each build of a program published, a file per
 /// program and front end that published them, each swept on its own.
@@ -160,7 +161,7 @@ pub const ROWS: &str = "rows";
 
 /// The stage-directory entries that hold files swept one by one, where any other is a stage swept
 /// whole.
-const BY_FILE: [&str; 3] = [ANSWERED, RUNS, ROWS];
+const BY_FILE: [&str; 3] = [ANSWERED, REUSED, ROWS];
 
 /// An entry used within this long is never swept: a run may still be reading it.
 const RECENT: Duration = Duration::from_secs(3600);
@@ -208,10 +209,10 @@ pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
             continue;
         }
         if BY_FILE.iter().any(|name| e.file_name() == *name) {
-            let Ok(fronts) = std::fs::read_dir(&path) else {
+            let Ok(files) = std::fs::read_dir(&path) else {
                 continue;
             };
-            for f in fronts.flatten() {
+            for f in files.flatten() {
                 let path = f.path();
                 if path.extension().is_some_and(|x| x == "tmp") {
                     continue;
