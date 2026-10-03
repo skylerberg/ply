@@ -5,8 +5,9 @@ import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr
               MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
-              Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, deriver_text, deriver_tag,
-              SpecKind, SRequires, SEnsures, SpecClause, Derived, DeriveDef, parse)
+              Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger,
+              is_predicate, deriver_text, deriver_tag, SpecKind, SRequires, SEnsures, SpecClause,
+              Derived, DeriveDef, parse)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
@@ -36,7 +37,7 @@ import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
                 diag, diag1, diag2, lab, is_bare, is_ctor_name, backticked, ns_describe,
                 private_name, pattern_binders)
-import rewrite (expand, expand_record_updates)
+import rewrite (expand, expand_record_updates, expand_witnesses, Witness, WType, WParam)
 import derive (Why, WFunction, WHandle, WFloat, WUnconstrained, WNullInsideOption, WSecret,
                ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name,
                Expansion, expand_derives, refusal_note, secret_reason, float_reason,
@@ -117,7 +118,21 @@ type PerformSite = { atom: Atom, module: Int, span: Span, source: Src }
 type OpKey = { effect: Bytes, op: Bytes, res: Resource }
 type Numeric = { span: Span, op: Bytes, ty: Type }
 // A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
-type BitOp = { span: Span, what: Bytes, ty: Type }
+type BitOp = { span: Span, what: Bytes, ty: Type, builtin: Bool }
+// A type parameter a `numeric` or `integer` constraint makes the witness of: a hidden argument each
+// call fills with the type it instantiates the parameter at.
+type Witnessed = { param: Bytes, integer: Bool }
+// An operator over a witnessed parameter, which the elaboration rewrites to read the witness.
+pub type WitnessOp = { module: Int, span: Span, param: Bytes }
+// `params` are the callee's type parameters the witnesses are for, so one constrained twice is
+// passed once.
+pub type WitnessRef = { module: Int, span: Span, witnesses: List<Witness>, params: List<Int> }
+// A definition's witnessed type parameters in its scheme's order, which is the order a call passes
+// their witnesses in.
+pub type WitnessOrder = { module: Int, name: Bytes, params: List<Bytes> }
+// A reference to a member of the group being walked, whose witnesses are known once the group is;
+// `caller` is the member whose body holds it.
+type GroupRef = { module: Int, span: Span, callee: Bytes, caller: Bytes, called: Bool }
 // The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
 type ConcatSite = { module: Int, span: Span, ty: Type }
 // A written field of `{..b, f: e}` with the type its value inferred to.
@@ -223,11 +238,13 @@ type ConstraintSite = {
   module: Int,
   span: Span,
   deriver: Deriver,
+  param: Int,
   ty: Type,
   callee: Bytes,
   callee_at: Loc,
   assumed: List<Int>,
   params: List<RigidParam>,
+  called: Bool,
 }
 type SpecEnv = {
   name: Bytes,
@@ -286,6 +303,10 @@ type Cx = {
   numerics: List<Numeric>,
   bit_ops: List<BitOp>,
   operands: List<OperandAt>,
+  witnessed: Map<Int, Witnessed>,
+  witness_refs: List<WitnessRef>,
+  witness_orders: List<WitnessOrder>,
+  group_refs: List<GroupRef>,
   concats: List<ConcatSite>,
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
@@ -370,6 +391,8 @@ fn what_of(d: Deriver) -> Bytes =
     DBin -> b"binary encoding",
     DShow -> b"rendering",
     DHash -> b"content hash",
+    DNumeric -> b"arithmetic",
+    DInteger -> b"integer arithmetic",
   }
 
 fn row_aliases(def: FnDef) -> List<Bytes> =
@@ -719,6 +742,7 @@ pub fn builtin_schemes(
     { name: b"array_set", sc: poly_fn([a], [], [array_ty, t_int(), ta], array_ty, abort_row()) },
     { name: b"reflect", sc: poly_fn([a], [], [ta], con(b"std.value.Value"), row_empty()) },
     { name: b"digest", sc: poly_fn([a], [], [ta], t_bytes(), row_empty()) },
+    { name: b"numeric_of_int", sc: poly_fn([a], [], [t_int()], ta, abort_row()) },
     { name: b"map", sc: poly_fn([a, b], [e], [t_list(ta), t_fn([ta], tb, re)], t_list(tb), re) },
     {
       name: b"filter",
@@ -728,6 +752,16 @@ pub fn builtin_schemes(
     {
       name: b"iterate",
       sc: poly_fn([a, b], [e], [ta, t_int(), t_fn([ta], t_iter(ta, tb), re)], tb, raising(re)),
+    },
+    {
+      name: b"bracket",
+      sc: poly_fn(
+        [a, b],
+        [e],
+        [t_fn([], ta, re), t_fn([ta], t_unit(), re), t_fn([ta], tb, re)],
+        tb,
+        re,
+      ),
     },
     { name: b"range", sc: mono_fn([t_int(), t_int()], t_list(t_int())) },
     // The wrapping family is `forall a. (a, a) -> a`; `infer_app` attaches the integer obligation at each call.
@@ -764,8 +798,8 @@ pub fn builtin_schemes(
     { name: b"i128_to_string", sc: mono_fn([con(b"I128")], t_string()) },
     { name: b"u128_of_string", sc: mono_fn([t_string()], t_option(con(b"U128"))) },
     { name: b"i128_of_string", sc: mono_fn([t_string()], t_option(con(b"I128"))) },
-    { name: b"min", sc: mono_fn([t_int(), t_int()], t_int()) },
-    { name: b"max", sc: mono_fn([t_int(), t_int()], t_int()) },
+    { name: b"min", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
+    { name: b"max", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
     { name: b"byte_of_int", sc: poly_fn([], [], [t_int()], t_bytes(), abort_row()) },
     { name: b"int_to_string", sc: mono_fn([t_int()], t_string()) },
     { name: b"float_to_string", sc: mono_fn([t_float()], t_string()) },
@@ -930,6 +964,11 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
       [b"seed", b"budget", b"step"],
       b"`step` answers `Continue(next)` or `Stop(result)`; the budget bounds the steps",
     ),
+    bdoc(
+      b"bracket",
+      [b"acquire", b"release", b"body"],
+      b"what `body` answers for what `acquire` answered, with `release` run on it however `body` ends but a failure",
+    ),
     bdoc(b"range", [b"lo", b"hi"], b"`[lo, hi)`"),
     bdoc(b"wrap_add", [b"a", b"b"], b"any integer type; wraps at its width"),
     bdoc(b"wrap_sub", [b"a", b"b"], b"any integer type; wraps at its width"),
@@ -968,8 +1007,16 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
       [b"s"],
       b"an optional `-` and decimal digits; `None` otherwise or out of range",
     ),
-    bdoc(b"min", [b"a", b"b"], b""),
-    bdoc(b"max", [b"a", b"b"], b""),
+    bdoc(
+      b"min",
+      [b"a", b"b"],
+      b"in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)`",
+    ),
+    bdoc(
+      b"max",
+      [b"a", b"b"],
+      b"in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)`",
+    ),
     bdoc(b"byte_of_int", [b"n"], b"one byte; raises outside `0..=255`"),
     bdoc(b"int_to_string", [b"n"], b""),
     bdoc(b"float_to_string", [b"f"], b"shortest round-trip; `Infinity` and `NaN`"),
@@ -1022,6 +1069,11 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
     bdoc(b"string_of_chars", [b"cs"], b""),
     bdoc(b"compare", [b"x", b"y"], b"a total order; needs `derivable(ord, a)`"),
     bdoc(b"compare_values", [b"x", b"y"], b"`compare` under a name no module may shadow"),
+    bdoc(
+      b"numeric_of_int",
+      [b"n"],
+      b"`n` as the `numeric` type the call is at; raises past a width's range",
+    ),
     bdoc(
       b"digest",
       [b"x"],
@@ -1082,6 +1134,17 @@ test "every builtin is documented with one name per parameter" {
     })
 }
 
+// The constraints the prelude's builtins carry, checked at a call as a definition's are.
+pub fn builtin_constraints() -> List<{ name: Bytes, cs: List<DefConstraint> }> =
+  [
+    { name: b"compare", cs: [{ deriver: DOrd, param: 0 }] },
+    { name: b"compare_values", cs: [{ deriver: DOrd, param: 0 }] },
+    { name: b"min", cs: [{ deriver: DOrd, param: 0 }] },
+    { name: b"max", cs: [{ deriver: DOrd, param: 0 }] },
+    { name: b"digest", cs: [{ deriver: DHash, param: 0 }] },
+    { name: b"numeric_of_int", cs: [{ deriver: DNumeric, param: 0 }] },
+  ]
+
 // The builtin signatures use the first three type variables and the first row variable, so `fresh` starts past them.
 fn install_prelude(cx0: Cx) -> Cx / {abort.raise} = {
   let cx = install_prelude_adts(cx0);
@@ -1094,13 +1157,13 @@ fn install_prelude(cx0: Cx) -> Cx / {abort.raise} = {
     e.cx,
     |c2: Cx, x: { name: Bytes, sc: Scheme }| { ..c2, env: env_bind_global(c2.env, x.name, x.sc) },
   );
-  let ord = [{ deriver: DOrd, param: 0 }];
   let constrained: Cx = {
     ..bound,
-    constraints: map_insert(
-      map_insert(map_insert(bound.constraints, b"compare", ord), b"compare_values", ord),
-      b"digest",
-      [{ deriver: DHash, param: 0 }],
+    constraints: fold(
+      builtin_constraints(),
+      bound.constraints,
+      |m: Map<Bytes, List<DefConstraint>>, b: { name: Bytes, cs: List<DefConstraint> }|
+        map_insert(m, b.name, b.cs),
     ),
   };
   fold(prelude_effects(), constrained, |c2: Cx, ef: EffectInfo| add_effect(c2, ef))
@@ -2301,7 +2364,10 @@ fn signature_sharing(cx0: Cx, def: FnDef, shared: Shared) -> { cx: Cx, sig: Sig 
         }
       },
     });
-  let assumed: Cx = { ..labels, assumed: constraints_in_force(labels, def.constraints) };
+  let assumed: Cx = witnessing(
+    { ..labels, assumed: constraints_in_force(labels, def.constraints) },
+    def.constraints,
+  );
   let checked: Cx = check_where(assumed, def);
   let params = fold(
     def.params,
@@ -2582,7 +2648,7 @@ fn expect(
 
 // A bit operand's type is often still a variable here, so the obligation waits for `settle_bit_ops`.
 fn note_bits(cx: Cx, span: Span, found: Type, what: Bytes) -> Cx =
-  { ..cx, bit_ops: push(cx.bit_ops, { span: span, what: what, ty: found }) }
+  { ..cx, bit_ops: push(cx.bit_ops, { span: span, what: what, ty: found, builtin: false }) }
 
 // Resolved once the whole program is checked, so a variable here is read as what it settled to.
 fn note_operand(cx: Cx, span: Span, ty: Type) -> Cx =
@@ -2592,22 +2658,34 @@ fn settle_bit_ops(cx: Cx) -> Cx / {abort.raise} = {
   let entries = cx.bit_ops;
   fold(entries, { ..cx, bit_ops: [] }, |c: Cx, entry: BitOp| {
     let ty = resolve(c, entry.ty);
-    match ty {
-      TyVar(_) ->
-        err1(
-          c,
-          b"E0210",
-          entry.span,
-          bytes_concat_all([b"the integer type of ", entry.what, b" is not determined"]),
-          b"nothing here says which integer type this is",
-          [
-            b"`Int` and the eight fixed-width types are the integer types",
-            b"annotate the operand, or write a literal that pins it",
-          ],
-        ),
-      TyCon(k) -> if len(k.args) == 0 && is_int_name(k.name) { c }
-      else { bits_mismatch(c, entry, ty) },
-      _ -> bits_mismatch(c, entry, ty),
+    let witnessed = match ty {
+      TyVar(v) -> match map_get(c.witnessed, v) {
+        Some(w) -> w.integer && !entry.builtin,
+        None -> false,
+      },
+      _ -> false,
+    };
+    if witnessed { c } else {
+      match ty {
+        TyVar(_) ->
+          err1(
+            c,
+            b"E0210",
+            entry.span,
+            bytes_concat_all([b"the integer type of ", entry.what, b" is not determined"]),
+            b"nothing here says which integer type this is",
+            [
+              b"`Int` and the eight fixed-width types are the integer types",
+              b"annotate the operand, or write a literal that pins it",
+              if entry.builtin {
+                b"a builtin over an integer type needs the type written where it is called, not a type parameter"
+              } else { b"a type parameter takes the bit operators under `where integer(a)`" },
+            ],
+          ),
+        TyCon(k) -> if len(k.args) == 0 && is_int_name(k.name) { c }
+        else { bits_mismatch(c, entry, ty) },
+        _ -> bits_mismatch(c, entry, ty),
+      }
     }
   })
 }
@@ -3073,12 +3151,24 @@ fn infer_var(cx: Cx, q: QName) -> Inferred / {abort.raise} = {
         Some(sc) -> {
           let inst = instantiate_with(sc, k.cx.fresh);
           let c: Cx = crossed({ ..k.cx, fresh: inst.f }, key.name, q.span);
-          let noted: Cx = note_constraints(
+          let constrained: Cx = note_constraints(
             note_map_keys(c, q.span, inst.ty),
             q.span,
             key.name,
             inst.args,
           );
+          let noted: Cx = if !group_member(constrained, key.name) { constrained } else {
+            {
+              ..constrained,
+              group_refs: push(constrained.group_refs, {
+                module: constrained.module,
+                span: q.span,
+                callee: key.name,
+                caller: b"",
+                called: false,
+              }),
+            }
+          };
           let group = group_label_vars(noted, key.name);
           let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) } else { inst.labels };
           { cx: note_labels(noted, q.span, key.name, ls), ty: inst.ty, row: row_empty() }
@@ -3357,6 +3447,65 @@ fn infer_app(
     },
     _ -> infer_app_general(cx, span, func, args, labels),
   }
+
+// The prelude name a bare callee resolves to, or nothing for one the program declares.
+// A narrowing of a literal its type holds cannot fail, so it raises nothing.
+fn narrows_a_literal_it_holds(cx: Cx, func: Expr, args: List<Expr>) -> Bool / {abort.raise} =
+  match args {
+    [a] -> match literal_value(a) {
+      Some(v) -> literal_fits(prelude_named(cx, func), v),
+      None -> false,
+    },
+    _ -> false,
+  }
+
+fn literal_value(e: Expr) -> Option<Int> =
+  match e {
+    ELit(l) -> match l.lit { LInt(v) -> Some(v), _ -> None },
+    EUnary(u) -> if u.op != b"neg" { None }
+    else { match literal_value(u.operand) { Some(v) -> Some(0 - v), None -> None } },
+    _ -> None,
+  }
+
+// `numeric_of_int` holds what every numeric type holds.
+fn literal_fits(name: Bytes, v: Int) -> Bool =
+  if name == b"u8_of_int" || name == b"byte_of_int" { v >= 0 && v <= 255 }
+  else if name == b"u16_of_int" { v >= 0 && v <= 65535 }
+  else if name == b"u32_of_int" { v >= 0 && v <= 4294967295 }
+  else if name == b"u64_of_int" || name == b"u128_of_int" { v >= 0 }
+  else if name == b"i8_of_int" { v >= 0 - 128 && v <= 127 }
+  else if name == b"i16_of_int" { v >= 0 - 32768 && v <= 32767 }
+  else if name == b"i32_of_int" { v >= 0 - 2147483648 && v <= 2147483647 }
+  else if name == b"i64_of_int" || name == b"i128_of_int" { true }
+  else if name == b"numeric_of_int" { v >= 0 && v <= 127 }
+  else { false }
+
+fn prelude_named(cx: Cx, func: Expr) -> Bytes / {abort.raise} =
+  match func {
+    EVar(v) -> if !is_bare(v.name) { b"" } else {
+      match value_key(cx, v.name).key {
+        Some(k) -> if k.prelude { k.name } else { b"" },
+        None -> b"",
+      }
+    },
+    _ -> b"",
+  }
+
+// The closures `bracket` is handed run as one, so each is taken to perform what all of them do: a
+// body generic over its caller's row still admits the release's operations.
+fn joined_callbacks(
+  cx: Cx,
+  span: Span,
+  tys: List<Type>,
+) -> { cx: Cx, tys: List<Type> } / {abort.raise} = {
+  let j: WithRow = fold(tys, { cx: cx, r: row_empty() }, |acc: WithRow, t: Type|
+    match resolve(acc.cx, t) { TyFn(f) -> join(acc.cx, span, acc.r, f.effects), _ -> acc });
+  {
+    cx: j.cx,
+    tys: map(tys, |t: Type|
+      match resolve(j.cx, t) { TyFn(f) -> TyFn({ ..f, effects: j.r }), _ -> t }),
+  }
+}
 
 fn group_label_vars(cx: Cx, name: Bytes) -> List<Int> =
   fold(cx.group_defs, [], |acc: List<Int>, g: GroupDef| if g.name == name { g.labels } else { acc })
@@ -3850,7 +3999,12 @@ fn infer_app_general(
   let f0: Inferred = infer(cx, func);
   // Before the arguments, so a written label is what an argument's row is checked against.
   let f: Inferred = {
-    cx: fill_labels(f0.cx, span, labels, callee_labels(f0.cx, expr_span(func))),
+    cx: fill_labels(
+      called(f0.cx, expr_span(func)),
+      span,
+      labels,
+      callee_labels(f0.cx, expr_span(func)),
+    ),
     ty: f0.ty,
     row: f0.row,
   };
@@ -3887,18 +4041,27 @@ fn infer_app_general(
     } else {
       let source = callee_source(c, func);
       let callee: Option<Bytes> = group_callee(c, source);
-      let checked: Cx = expect_arguments(c, fn_.params, as_.tys, |cc: Cx, i: Int|
-        expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(as_.tys, i), callee));
+      let handed: { cx: Cx, tys: List<Type> } = if prelude_named(c, func) == b"bracket" {
+        joined_callbacks(c, span, as_.tys)
+      } else { { cx: c, tys: as_.tys } };
+      let checked: Cx = expect_arguments(handed.cx, fn_.params, handed.tys, |cc: Cx, i: Int|
+        expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(handed.tys, i), callee));
       // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
       let obliged: Cx = if is_int_builtin(func) && len(fn_.params) > 0 {
-        note_bits(
-          checked,
-          span,
-          at(fn_.params, 0),
-          bytes_concat_all([b"`", int_builtin_name(func), b"`"]),
-        )
+        {
+          ..checked,
+          bit_ops: push(checked.bit_ops, {
+            span: span,
+            what: bytes_concat_all([b"`", int_builtin_name(func), b"`"]),
+            ty: at(fn_.params, 0),
+            builtin: true,
+          }),
+        }
       } else { checked };
-      let effects = resolve_r(obliged, fn_.effects);
+      let resolved = resolve_r(obliged, fn_.effects);
+      let effects = if narrows_a_literal_it_holds(obliged, func, args) {
+        { ..resolved, atoms: without_abort(resolved.atoms) }
+      } else { resolved };
       let recorded: Cx = fold(effects.atoms, obliged, |cc: Cx, a: Atom|
         record_site(cc, a, span, source));
       let j: WithRow = join(recorded, span, j0.r, effects);
@@ -6052,8 +6215,18 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx / {a
           { cx: { ..o.cx, derived: None }, row: o.row }
         },
       };
+      let refs = stepped.cx.group_refs;
+      let tagged: Cx = {
+        ..stepped.cx,
+        group_refs: fold(
+          range(len(acc.cx.group_refs), len(refs)),
+          refs,
+          |rs: List<GroupRef>, i: Int|
+            list_set(rs, i, { ..at(rs, i), caller: at(qualified, slot) }),
+        ),
+      };
       {
-        cx: record_spec_env(stepped.cx, def, at(qualified, slot), sig),
+        cx: record_spec_env(tagged, def, at(qualified, slot), sig),
         rows: push(acc.rows, stepped.row),
       }
     },
@@ -6068,7 +6241,7 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx / {a
   let closed: Cx = fold(sigs.sigs, required, |c: Cx, s: Sig| close_unreachable_row(c, s));
   let removed: Cx = fold(qualified, closed, |c: Cx, name: Bytes|
     { ..c, env: env_remove_global(c.env, name) });
-  fold(range(0, len(comp)), removed, |c: Cx, slot: Int| {
+  let published: Cx = fold(range(0, len(comp)), removed, |c: Cx, slot: Int| {
     let def = at(fns, at(comp, slot));
     let sig = at(sigs.sigs, slot);
     let body_row = resolve_r(c, at(bodies.rows, slot));
@@ -6088,11 +6261,12 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx / {a
       ty_params: sig.ty_params,
     };
     let constraints = published_constraints(bound, def, sc);
+    let ordered: Cx = witness_order(bound, def, sc);
     set_def(
       {
-        ..bound,
+        ..ordered,
         ty_params: map_new(),
-        constraints: map_insert(bound.constraints, at(qualified, slot), constraints),
+        constraints: map_insert(ordered.constraints, at(qualified, slot), constraints),
       },
       {
         name: at(qualified, slot),
@@ -6107,8 +6281,69 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx / {a
         at: here(bound, def.span),
       },
     )
-  })
+  });
+  group_witnesses(published)
 }
+
+// A call to a member of the group just walked passes the witnesses the member now has an order
+// for, which only its own body holds: a recursive call passes its caller's own.
+fn group_witnesses(cx: Cx) -> Cx / {abort.raise} =
+  fold(cx.group_refs, { ..cx, group_refs: [] }, |c: Cx, g: GroupRef| {
+    let callee = simple_name_of(g.callee);
+    let order = fold(c.witness_orders, None, |acc: Option<List<Bytes>>, o: WitnessOrder|
+      if o.module == g.module && o.name == callee { Some(o.params) } else { acc });
+    match order {
+      None -> c,
+      Some(ws) -> if !g.called {
+        err1(
+          { ..c, module: g.module },
+          b"E0310",
+          g.span,
+          bytes_concat_all([b"`", callee, b"` must be called directly"]),
+          b"used as a value",
+          [
+            bytes_concat_all([
+              b"`",
+              callee,
+              b"` takes the types its `numeric` and `integer` constraints are about as hidden arguments each call fills",
+            ]),
+            b"wrap it in a lambda that calls it",
+          ],
+        )
+      } else if g.caller != g.callee {
+        err1(
+          { ..c, module: g.module },
+          b"E0310",
+          g.span,
+          bytes_concat_all([
+            b"a call to `",
+            callee,
+            b"` inside its own recursive group cannot pass the type `",
+            at(ws, 0),
+            b"` is",
+          ]),
+          bytes_concat_all([b"called from `", simple_name_of(g.caller), b"`"]),
+          [
+            bytes_concat_all([
+              b"only `",
+              callee,
+              b"`'s own body holds the type its `numeric` or `integer` constraint is about; call it from outside the group",
+            ]),
+          ],
+        )
+      } else {
+        {
+          ..c,
+          witness_refs: push(c.witness_refs, {
+            module: g.module,
+            span: g.span,
+            witnesses: map(ws, |w: Bytes| WParam(w)),
+            params: range(0, len(ws)),
+          }),
+        }
+      },
+    }
+  })
 
 // The signature's label parameters generalize among the type variables; they belong in their own
 // list, in the order the generic list wrote them, and a phantom one is still a parameter.
@@ -6140,6 +6375,73 @@ fn published_constraints(cx: Cx, def: FnDef, sc: Scheme) -> List<DefConstraint> 
   )
 }
 
+// The parameters a definition's `numeric` and `integer` constraints are about, in its scheme's
+// order. One its signature never mentions is refused: no call fixes it, so none could pass it.
+fn witness_order(cx: Cx, def: FnDef, sc: Scheme) -> Cx / {abort.raise} = {
+  let found = fold(
+    def.constraints,
+    { cx: cx, ranked: [] },
+    |acc: { cx: Cx, ranked: List<{ at: Int, name: Bytes }> }, c: Constraint|
+      if !is_predicate(c.deriver)
+          || fold(acc.ranked, false, |b: Bool, r: { at: Int, name: Bytes }|
+            b || r.name == c.param.name) { acc } else {
+        match map_get(acc.cx.ty_params, c.param.name) {
+          Some(TyVar(v)) -> {
+            let at_ = fold(range(0, len(sc.ty_vars)), 0 - 1, |p: Int, i: Int|
+              if p >= 0 { p } else if at(sc.ty_vars, i) == v { i } else { p });
+            if at_ >= 0 {
+              let n = len(acc.ranked);
+              let i = fold(range(0, n), n, |k: Int, j: Int|
+                if k < n { k } else if at_ < at(acc.ranked, j).at { j } else { k });
+              {
+                cx: acc.cx,
+                ranked: append(
+                  push(take(acc.ranked, i), { at: at_, name: c.param.name }),
+                  drop(acc.ranked, i),
+                ),
+              }
+            } else {
+              {
+                cx: err1(
+                  acc.cx,
+                  b"E0310",
+                  c.param.span,
+                  bytes_concat_all([
+                    b"`",
+                    c.param.name,
+                    b"` appears in no parameter or answer of `",
+                    def.name.name,
+                    b"`",
+                  ]),
+                  bytes_concat_all([
+                    b"`",
+                    deriver_text(c.deriver),
+                    b"` is about a type each call fixes",
+                  ]),
+                  [
+                    b"a call passes the type its arguments or answer give the parameter, and nothing here gives it one",
+                  ],
+                ),
+                ranked: acc.ranked,
+              }
+            }
+          },
+          _ -> acc,
+        }
+      },
+  );
+  if len(found.ranked) == 0 { found.cx } else {
+    {
+      ..found.cx,
+      witness_orders: push(found.cx.witness_orders, {
+        module: found.cx.module,
+        name: def.name.name,
+        params: map(found.ranked, |r: { at: Int, name: Bytes }| r.name),
+      }),
+    }
+  }
+}
+
 fn constraint_lt(a: DefConstraint, b: DefConstraint) -> Bool =
   a.param < b.param || (a.param == b.param && deriver_tag(a.deriver) < deriver_tag(b.deriver))
 
@@ -6169,7 +6471,10 @@ fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } / {abort
     performs: [],
     declared_atoms: match sig.declared { Some(r) -> resolve_r(cx0, r).atoms, None -> [] },
   };
-  let assumed: Cx = { ..cx, assumed: constraints_in_force(cx, def.constraints) };
+  let assumed: Cx = witnessing(
+    { ..cx, assumed: constraints_in_force(cx, def.constraints) },
+    def.constraints,
+  );
   let defaults: Cx = fold(range(0, len(def.params)), assumed, |c: Cx, i: Int|
     match at(def.params, i).default {
       None -> c,
@@ -6546,18 +6851,41 @@ fn settle_numerics(cx: Cx) -> Cx / {abort.raise} = {
     let ty = resolve(c, entry.ty);
     let what = if is_ordered(entry.op) { b"ordered comparison" } else { b"arithmetic" };
     match ty {
-      TyVar(_) ->
-        err1(
-          c,
-          b"E0210",
-          entry.span,
-          bytes_concat_all([b"the numeric type of this ", what, b" is not determined"]),
-          b"nothing here says which numeric type this is",
-          [
-            b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`, and there is no tower",
-            b"annotate the operand, or write a literal that pins it (`1`, `1.0`, `1m`)",
-          ],
-        ),
+      TyVar(v) -> match map_get(c.witnessed, v) {
+        Some(w) -> if entry.op == b"div" && !w.integer {
+          err1(
+            c,
+            b"E0209",
+            entry.span,
+            bytes_concat_all([
+              b"`/` is not defined on every `numeric` type, so not on `",
+              w.param,
+              b"`",
+            ]),
+            b"divided here",
+            [
+              bytes_concat_all([
+                b"`integer(",
+                w.param,
+                b")` admits `/`; a `Decimal` has no `/`, since its exact quotient is not a decimal",
+              ]),
+            ],
+          )
+        } else { c },
+        None ->
+          err1(
+            c,
+            b"E0210",
+            entry.span,
+            bytes_concat_all([b"the numeric type of this ", what, b" is not determined"]),
+            b"nothing here says which numeric type this is",
+            [
+              b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`, and there is no tower",
+              b"annotate the operand, or write a literal that pins it (`1`, `1.0`, `1m`)",
+              b"a type parameter takes arithmetic under `where numeric(a)`, and `/`, `%` and the bit operators under `where integer(a)`",
+            ],
+          ),
+      },
       TyCon(k) -> if len(k.args) != 0 { numeric_mismatch(c, entry, ty, what) }
       else if is_int_name(k.name) || k.name == b"Float" { c }
       // Characters order by scalar value, which is what a range test such as `c >= 'a'` reads.
@@ -7323,7 +7651,12 @@ fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> WithAto
     performs: [],
     declared_atoms: [],
   };
-  let pushed: Cx = { ..c0, env: env_push(c0.env) };
+  // A clause assumes what the body does: its definition's constraints.
+  let assumed: Cx = witnessing(
+    { ..c0, assumed: constraints_in_force(c0, def.constraints) },
+    def.constraints,
+  );
+  let pushed: Cx = { ..assumed, env: env_push(assumed.env) };
   let bound: Cx = fold(range(0, len(def.params)), pushed, |c: Cx, i: Int|
     if i >= len(env.params) { c }
     else { { ..c, env: env_bind(c.env, at(def.params, i).name.name, mono(at(env.params, i))) } });
@@ -7344,7 +7677,7 @@ fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> WithAto
   let row = resolve_r(c1, o.row);
   {
     cx: check_spec_purity(
-      c1,
+      { ..c1, assumed: cx.assumed },
       match clause.kind { SRequires -> SSRequires, SEnsures -> SSEnsures },
       [],
       clause.span,
@@ -7554,9 +7887,13 @@ fn rigid_params(cx: Cx) -> List<RigidParam> =
   map_fold(cx.ty_params, [], |acc: List<RigidParam>, k: Bytes, t: Type|
     match t { TyVar(v) -> push(acc, { name: k, v: v }), _ -> acc })
 
-fn assumed_for(cx: Cx, d: Deriver) -> List<Int> =
+// `integer(a)` implies `numeric(a)`, so a numeric obligation also holds of an integer parameter.
+fn assumed_for(cx: Cx, d: Deriver) -> List<Int> / {abort.raise} =
   fold(cx.assumed, [], |acc: List<Int>, a: Assumed|
-    if same_deriver(a.deriver, d) { a.vars } else { acc })
+    if same_deriver(a.deriver, d)
+        || (same_deriver(d, DNumeric) && same_deriver(a.deriver, DInteger)) {
+      fold(a.vars, acc, |b: List<Int>, v: Int| ints_insert(b, v))
+    } else { acc })
 
 fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
   match t {
@@ -7624,16 +7961,57 @@ fn note_constraints(cx: Cx, span: Span, callee: Bytes, args: List<Type>) -> Cx /
             module: cx.module,
             span: span,
             deriver: c.deriver,
+            param: c.param,
             ty: at(args, c.param),
             callee: callee,
             callee_at: callee_at,
             assumed: assumed_for(cx, c.deriver),
             params: params,
+            called: false,
           })
         });
       { ..cx, constrained_uses: append(cx.constrained_uses, sites) }
     },
   }
+
+// The reference a call applies was a call, not a value: its constraint sites, the last ones
+// recorded, say so.
+fn called(cx: Cx, span: Span) -> Cx / {abort.raise} = {
+  let n = len(cx.constrained_uses);
+  let marked = iterate(
+    { i: n - 1, uses: cx.constrained_uses },
+    n + 1,
+    |s: { i: Int, uses: List<ConstraintSite> }|
+      match list_at(s.uses, s.i) {
+        Some(u) -> if u.module == cx.module && u.span == span {
+          Continue({ i: s.i - 1, uses: list_set(s.uses, s.i, { ..u, called: true }) })
+        } else { Stop(s) },
+        None -> Stop(s),
+      },
+  );
+  let g = len(cx.group_refs);
+  let refs = match list_at(cx.group_refs, g - 1) {
+    Some(r) -> if r.module == cx.module && r.span == span {
+      list_set(cx.group_refs, g - 1, { ..r, called: true })
+    } else { cx.group_refs },
+    None -> cx.group_refs,
+  };
+  { ..cx, constrained_uses: marked.uses, group_refs: refs }
+}
+
+// The type parameters a definition's `numeric` and `integer` constraints make witnesses of.
+fn witnessing(cx: Cx, cs: List<Constraint>) -> Cx =
+  fold(cs, cx, |c: Cx, k: Constraint|
+    if !is_predicate(k.deriver) { c } else {
+      match map_get(c.ty_params, k.param.name) {
+        Some(TyVar(v)) -> {
+          let integer = same_deriver(k.deriver, DInteger)
+            || (match map_get(c.witnessed, v) { Some(w) -> w.integer, None -> false });
+          { ..c, witnessed: map_insert(c.witnessed, v, { param: k.param.name, integer: integer }) }
+        },
+        _ -> c,
+      }
+    })
 
 fn check_map_keys(cx: Cx) -> Cx / {abort.raise} = {
   let adts = adt_shapes(cx);
@@ -7695,54 +8073,190 @@ fn check_constraints(cx: Cx) -> Cx / {abort.raise} = {
     { cx: { ..cx, constrained_uses: [] }, seen: [] },
     |acc: { cx: Cx, seen: List<{ span: Span, text: Bytes, tag: Int }> }, site: ConstraintSite| {
       let ty = resolve(acc.cx, site.ty);
-      match derivable(site.deriver, ty, adts, site.assumed, []) {
-        None -> acc,
-        Some(blocked) -> if skipped_flexible(acc.cx, blocked) { acc } else {
-          let pr = print_ty(printer_new(), ty);
-          let rendered = pr.s;
-          let tag = deriver_tag(site.deriver);
-          let dup = fold(acc.seen, false, |b: Bool, s: { span: Span, text: Bytes, tag: Int }|
-            b || (s.span == site.span && s.text == rendered && s.tag == tag));
-          if dup { acc } else {
-            let blocker = print_ty(pr.p, blocked.ty).s;
-            let callee = default_binder(site.callee);
-            let dv = deriver_text(site.deriver);
-            {
-              cx: err_labels(
-                acc.cx,
-                b"E0206",
-                bytes_concat_all([b"`", rendered, b"` cannot be derived for `", dv, b"`"]),
-                [
-                  lab(
-                    site.module,
-                    site.span,
-                    true,
-                    bytes_concat_all([
-                      b"`",
-                      callee,
-                      b"` requires `derivable(",
-                      dv,
-                      b", \xc2\xb7)` here",
-                    ]),
+      if is_predicate(site.deriver) { { cx: check_predicate(acc.cx, site, ty), seen: acc.seen } }
+      else {
+        match derivable(site.deriver, ty, adts, site.assumed, []) {
+          None -> acc,
+          Some(blocked) -> if skipped_flexible(acc.cx, blocked) { acc } else {
+            let pr = print_ty(printer_new(), ty);
+            let rendered = pr.s;
+            let tag = deriver_tag(site.deriver);
+            let dup = fold(acc.seen, false, |b: Bool, s: { span: Span, text: Bytes, tag: Int }|
+              b || (s.span == site.span && s.text == rendered && s.tag == tag));
+            if dup { acc } else {
+              let blocker = print_ty(pr.p, blocked.ty).s;
+              let callee = default_binder(site.callee);
+              let dv = deriver_text(site.deriver);
+              {
+                cx: err_labels(
+                  acc.cx,
+                  b"E0206",
+                  bytes_concat_all([b"`", rendered, b"` cannot be derived for `", dv, b"`"]),
+                  [
+                    lab(
+                      site.module,
+                      site.span,
+                      true,
+                      bytes_concat_all([
+                        b"`",
+                        callee,
+                        b"` requires `derivable(",
+                        dv,
+                        b", \xc2\xb7)` here",
+                      ]),
+                    ),
+                    lab(
+                      site.callee_at.module,
+                      site.callee_at.span,
+                      false,
+                      bytes_concat_all([
+                        b"`",
+                        callee,
+                        b"` declares the constraint on its signature",
+                      ]),
+                    ),
+                  ],
+                  why_notes_for_constraint(
+                    blocked.why,
+                    site.deriver,
+                    blocked,
+                    blocker,
+                    site.params,
                   ),
-                  lab(
-                    site.callee_at.module,
-                    site.callee_at.span,
-                    false,
-                    bytes_concat_all([b"`", callee, b"` declares the constraint on its signature"]),
-                  ),
-                ],
-                why_notes_for_constraint(blocked.why, site.deriver, blocked, blocker, site.params),
-              ),
-              seen: push(acc.seen, { span: site.span, text: rendered, tag: tag }),
+                ),
+                seen: push(acc.seen, { span: site.span, text: rendered, tag: tag }),
+              }
             }
-          }
-        },
+          },
+        }
       }
     },
   );
   walked.cx
 }
+
+// What `numeric(a)` or `integer(a)` was instantiated at, as the witness the call passes.
+fn predicate_witness(site: ConstraintSite, ty: Type) -> Option<Witness> =
+  match ty {
+    TyCon(k) -> if len(k.args) != 0 { None }
+    else if is_int_name(k.name) { Some(WType(k.name)) }
+    else if same_deriver(site.deriver, DNumeric) && (k.name == b"Float" || k.name == b"Decimal") {
+      Some(WType(k.name))
+    } else { None },
+    TyVar(v) -> if !contains_int(site.assumed, v) { None } else {
+      match fold(site.params, None, |acc: Option<Bytes>, r: RigidParam|
+          if r.v == v { Some(r.name) } else { acc }) {
+        Some(name) -> Some(WParam(name)),
+        None -> None,
+      }
+    },
+    _ -> None,
+  }
+
+// A predicate's site: the callee is called, the type admits the predicate, and the witness it
+// passes joins the others the same call passes, in the callee's order and once per parameter.
+fn check_predicate(cx: Cx, site: ConstraintSite, ty: Type) -> Cx / {abort.raise} = {
+  let callee = default_binder(site.callee);
+  let dv = deriver_text(site.deriver);
+  if !site.called {
+    if fold(cx.diags, false, |b: Bool, d: Diag| b || (d.code == b"E0310" && primary_is(d, site))) {
+      cx
+    } else {
+      err1(
+        { ..cx, module: site.module },
+        b"E0310",
+        site.span,
+        bytes_concat_all([b"`", callee, b"` must be called directly"]),
+        b"used as a value",
+        [
+          bytes_concat_all([
+            b"`",
+            callee,
+            b"` takes the type its `",
+            dv,
+            b"` constraint is about as a hidden argument each call fills",
+          ]),
+          b"wrap it in a lambda that calls it",
+        ],
+      )
+    }
+  } else {
+    match predicate_witness(site, ty) {
+      Some(w) -> {
+        let n = len(cx.witness_refs);
+        let fresh = { module: site.module, span: site.span, witnesses: [w], params: [site.param] };
+        match list_at(cx.witness_refs, n - 1) {
+          Some(r) -> if r.module == site.module && r.span == site.span {
+            if contains_int(r.params, site.param) { cx } else {
+              {
+                ..cx,
+                witness_refs: list_set(cx.witness_refs, n - 1, {
+                  ..r,
+                  witnesses: push(r.witnesses, w),
+                  params: push(r.params, site.param),
+                }),
+              }
+            }
+          } else { { ..cx, witness_refs: push(cx.witness_refs, fresh) } },
+          None -> { ..cx, witness_refs: push(cx.witness_refs, fresh) },
+        }
+      },
+      None -> match ty {
+        TyVar(v) -> if is_rigid_ty(cx.subst, v) {
+          err1(
+            { ..cx, module: site.module },
+            b"E0201",
+            site.span,
+            bytes_concat_all([
+              b"`",
+              callee,
+              b"` needs `",
+              dv,
+              b"(\xc2\xb7)` of a type parameter that has none",
+            ]),
+            bytes_concat_all([b"`", callee, b"` requires `", dv, b"(\xc2\xb7)` here"]),
+            [b"add the constraint to this signature's `where`; the body may then assume it"],
+          )
+        } else {
+          err1(
+            { ..cx, module: site.module },
+            b"E0210",
+            site.span,
+            bytes_concat_all([b"the numeric type `", callee, b"` is called at is not determined"]),
+            b"nothing here says which numeric type this is",
+            [b"annotate an argument, or write a literal that pins it (`1`, `1.0`, `1m`)"],
+          )
+        },
+        _ ->
+          err1(
+            { ..cx, module: site.module },
+            b"E0201",
+            site.span,
+            bytes_concat_all([
+              b"`",
+              type_text(ty),
+              if same_deriver(site.deriver, DInteger) { b"` is not an integer type" }
+              else { b"` is not a numeric type" },
+            ]),
+            bytes_concat_all([b"`", callee, b"` requires `", dv, b"(\xc2\xb7)` here"]),
+            [
+              if same_deriver(site.deriver, DInteger) {
+                b"the integer types are `Int` and the eight fixed-width integers"
+              } else {
+                b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`"
+              },
+            ],
+          ),
+      },
+    }
+  }
+}
+
+fn primary_is(d: Diag, site: ConstraintSite) -> Bool =
+  fold(d.labels, false, |b: Bool, l: Label|
+    b
+      || (l.primary && l.module == site.module && l.start == site.span.start
+      && l.end == site.span.end))
 
 // --- The two passes that read what expansion produced --------------------------------------------
 
@@ -8738,6 +9252,10 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx / {abort.raise} =
     numerics: [],
     bit_ops: [],
     operands: [],
+    witnessed: map_new(),
+    witness_refs: [],
+    witness_orders: [],
+    group_refs: [],
     concats: [],
     updates: [],
     update_shapes: [],
@@ -8816,9 +9334,33 @@ pub fn published_pure(d: DefInfo) -> Bool =
 pub type EmitFacts = {
   pure: List<Bytes>,
   label_sites: List<LabelSite>,
-  updates: List<UpdateShape>,
+  elaboration: Elaboration,
   operands: List<OperandSite>,
 }
+
+// What lowering reads that only the checker knows: the shape of every record update, and where a
+// `numeric` or `integer` parameter's witness is read and what each call passes for it.
+pub type Elaboration = {
+  updates: List<UpdateShape>,
+  ops: List<WitnessOp>,
+  refs: List<WitnessRef>,
+  orders: List<WitnessOrder>,
+}
+
+fn elaboration_of(cx: Cx) -> Elaboration / {abort.raise} =
+  {
+    updates: cx.update_shapes,
+    ops: fold(cx.operands, [], |acc: List<WitnessOp>, o: OperandAt|
+      match resolve(cx, o.ty) {
+        TyVar(v) -> match map_get(cx.witnessed, v) {
+          Some(w) -> push(acc, { module: o.module, span: o.span, param: w.param }),
+          None -> acc,
+        },
+        _ -> acc,
+      }),
+    refs: cx.witness_refs,
+    orders: cx.witness_orders,
+  }
 
 // What the checker answers a lowering: the facts it asked for, or the diagnostics that stopped it.
 // The caller is the one that reports them, so the caller is the one that gets them.
@@ -8831,7 +9373,7 @@ pub fn emit_facts(r: Resolved, mods: List<Mod>) -> CheckedFacts / {abort.raise} 
       pure: fold(out.cx.defs, [], |acc: List<Bytes>, d: DefInfo|
         if published_pure(d) { push(acc, d.name) } else { acc }),
       label_sites: out.cx.label_sites,
-      updates: out.cx.update_shapes,
+      elaboration: elaboration_of(out.cx),
       operands: map(out.cx.operands, |o: OperandAt|
         { module: o.module, span: o.span, ty: operand_name(resolve(out.cx, o.ty)) }),
     })
@@ -8842,20 +9384,20 @@ fn operand_name(t: Type) -> Bytes =
   match t { TyCon(k) -> if len(k.args) == 0 { k.name } else { b"" }, _ -> b"" }
 
 // The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
-pub fn update_shapes(r: Resolved, mods: List<Mod>) -> Option<List<UpdateShape>> / {abort.raise} = {
+pub fn elaboration(r: Resolved, mods: List<Mod>) -> Option<Elaboration> / {abort.raise} = {
   let out = check_program(r, mods);
-  if any_error(out.cx.diags) { None } else { Some(out.cx.update_shapes) }
+  if any_error(out.cx.diags) { None } else { Some(elaboration_of(out.cx)) }
 }
 
 // The same, with the definitions `known` holds rows for published from them rather than walked: only
 // a walked body's updates are shaped.
-pub fn update_shapes_with(
+pub fn elaboration_with(
   r: Resolved,
   mods: List<Mod>,
   known: Known,
-) -> Option<List<UpdateShape>> / {abort.raise} = {
+) -> Option<Elaboration> / {abort.raise} = {
   let out = check_program_with(r, mods, known);
-  if any_error(out.cx.diags) { None } else { Some(out.cx.update_shapes) }
+  if any_error(out.cx.diags) { None } else { Some(elaboration_of(out.cx)) }
 }
 
 // One module's shapes, keyed by the update's span, as `expand_record_updates` reads them.
@@ -8863,17 +9405,56 @@ fn shapes_in(all: List<UpdateShape>, module: Int) -> Map<Bytes, List<Bytes>> =
   fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, s: UpdateShape|
     if s.module != module { acc } else { map_insert(acc, span_key(s.span), s.names) })
 
-// The modules with every record update written out as the literal it stands for: what the lowering
-// reads, and what only the checker knows.
-pub fn expanded_mods(mods: List<Mod>, shapes: List<UpdateShape>) -> List<Mod> / {abort.raise} =
+// The modules with every record update written out as the literal it stands for, and every
+// `numeric` or `integer` parameter's witness passed and read: what the emitter lowers, and what
+// only the checker knows.
+pub fn expanded_mods(mods: List<Mod>, e: Elaboration) -> List<Mod> / {abort.raise} =
   map(range(0, len(mods)), |i: Int| {
     let m: Mod = at(mods, i);
     {
       name: m.name,
-      module: expand_record_updates(m.module, shapes_in(shapes, i)),
+      module: expand_witnesses(
+        expand_record_updates(m.module, shapes_in(e.updates, i)),
+        ops_in(e.ops, i),
+        refs_in(e.refs, i),
+        orders_in(e.orders, i),
+      ),
       derived: m.derived,
     }
   })
+
+// The modules with every record update written out and no witness passed: what a claim lowers,
+// since the prover draws every type parameter as `Int` and reads an operator over one as `Int`'s.
+pub fn updated_mods(mods: List<Mod>, e: Elaboration) -> List<Mod> / {abort.raise} =
+  map(range(0, len(mods)), |i: Int| {
+    let m: Mod = at(mods, i);
+    {
+      name: m.name,
+      module: expand_record_updates(m.module, shapes_in(e.updates, i)),
+      derived: m.derived,
+    }
+  })
+
+fn ops_in(all: List<WitnessOp>, module: Int) -> Map<Bytes, Bytes> =
+  fold(all, map_new(), |acc: Map<Bytes, Bytes>, o: WitnessOp|
+    if o.module != module { acc } else { map_insert(acc, span_key(o.span), o.param) })
+
+// A call's witnesses in its callee's scheme order, the order its witness parameters take.
+fn refs_in(all: List<WitnessRef>, module: Int) -> Map<Bytes, List<Witness>> / {abort.raise} =
+  fold(all, map_new(), |acc: Map<Bytes, List<Witness>>, r: WitnessRef|
+    if r.module != module { acc } else {
+      let ranked = fold(range(0, len(r.params)), [], |sorted: List<Int>, k: Int| {
+        let n = len(sorted);
+        let i = fold(range(0, n), n, |p: Int, j: Int|
+          if p < n { p } else if at(r.params, k) < at(r.params, at(sorted, j)) { j } else { p });
+        append(push(take(sorted, i), k), drop(sorted, i))
+      });
+      map_insert(acc, span_key(r.span), map(ranked, |k: Int| at(r.witnesses, k)))
+    })
+
+fn orders_in(all: List<WitnessOrder>, module: Int) -> Map<Bytes, List<Bytes>> =
+  fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, o: WitnessOrder|
+    if o.module != module { acc } else { map_insert(acc, o.name, o.params) })
 
 // Every use of a label-generic definition is a call, and every call fills its labels.
 fn check_label_apps(cx0: Cx) -> Cx / {abort.raise} = {
@@ -9575,6 +10156,86 @@ test "a unit pattern covers its type" {
   )
 }
 
+test "a numeric constraint is refused where no call could pass its type" {
+  assert_eq(check_codes(b"fn twice<a>(x: a) -> a where numeric(a) = x + x"), []);
+  let phantom = check_diags(b"fn f<a>(n: Int) -> Int where numeric(a) = n");
+  assert_eq(map(phantom, |dg: Diag| dg.code), [b"E0310"]);
+  assert_eq(map(phantom, |dg: Diag| dg.message), [b"`a` appears in no parameter or answer of `f`"]);
+  assert_eq(
+    check_codes(b"fn twice<a>(x: a) -> a where numeric(a) = x + x\nfn g() -> (Int) -> Int = twice"),
+    [b"E0310"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn d<a>(x: a, n: Int) -> a where numeric(a) = if n == 0 { x } else { let f = d; f(x, n - 1) }",
+    ),
+    [b"E0310"],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat_all([
+        b"fn ping<b>(n: Int) -> b where numeric(b) =\n",
+        b"  if n == 0 { numeric_of_int(0) } else { let _ = pong(n - 1); numeric_of_int(1) }\n",
+        b"fn pong(n: Int) -> Int = { let _ = ping(n); n }",
+      ]),
+    ),
+    [b"E0310"],
+  )
+}
+
+test "a definition's witnesses take its scheme's order, which its calls pass them in" {
+  let cx = checked_cx(
+    bytes_concat_all([
+      b"fn mixed<a, b>(x: a, y: b) -> a where numeric(b), numeric(a) = x\n",
+      b"fn deep<a>(x: a, n: Int) -> a where numeric(a) = if n == 0 { x } else { deep(x, n - 1) }\n",
+      b"fn go() -> U8 = mixed(1u8, 2.5)",
+    ]),
+  );
+  assert_eq(map(cx.witness_orders, |o: WitnessOrder| { name: o.name, params: o.params }), [
+    { name: b"mixed", params: [b"a", b"b"] },
+    { name: b"deep", params: [b"a"] },
+  ]);
+  let passed = map_values(refs_in(cx.witness_refs, 0));
+  assert_eq(len(passed), 2);
+  assert(
+    fold(passed, false, |b: Bool, ws: List<Witness>| b || ws == [WType(b"U8"), WType(b"Float")]),
+  );
+  assert(fold(passed, false, |b: Bool, ws: List<Witness>| b || ws == [WParam(b"a")]))
+}
+
+// A one-module program as the checker leaves it.
+fn checked_cx(src: Bytes) -> Cx / {abort.raise} = {
+  let r = parse(src);
+  let x = expand(r.node, r.p.diags);
+  let d: Expansion = expand_derives(0, b"m", x.module);
+  match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
+    Failed(_) -> panic("a source the test wrote does not resolve"),
+    Resolved_(y) -> check_program(y.r, y.mods).cx,
+  }
+}
+
+test "a bracket's closures run as one, so a body generic over its row admits the release's" {
+  let effect_io = b"effect io { write close(h: Int) -> Unit }\n";
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        effect_io,
+        b"fn served<| e>(h: Int, app: () -> Unit / e) -> Unit / {io.close | e} = bracket(|| h, |x: Int| io.close(x), |x: Int| app())",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        effect_io,
+        b"fn served<| e>(h: Int, app: () -> Unit / e) -> Unit / e = bracket(|| h, |x: Int| io.close(x), |x: Int| app())",
+      ),
+    ),
+    [b"E0302"],
+  )
+}
+
 // A one-module program's diagnostics, in order; empty when it checks.
 fn check_diags(src: Bytes) -> List<Diag> / {abort.raise} = {
   let r = parse(src);
@@ -10146,6 +10807,17 @@ test "a partial builtin, a division that may meet zero and a refutable let raise
   assert_eq(check_codes(b"fn f(a: U8, b: U8) -> U8 / {} = a % b"), [b"E0302"]);
   assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int / {} = { let [x, ..] = xs; x }"), [b"E0302"]);
   assert_eq(check_codes(b"fn f(n: Int) -> U8 / {} = u8_of_int(n)"), [b"E0302"])
+}
+
+test "a narrowing of a literal its type holds does not raise, and one of any other value does" {
+  assert_eq(check_codes(b"fn f() -> U8 / {} = u8_of_int(200)"), []);
+  assert_eq(check_codes(b"fn f() -> I8 / {} = i8_of_int(-128)"), []);
+  assert_eq(check_codes(b"fn f() -> U8 / {} = u8_of_int(300)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn f() -> U16 / {} = u16_of_int(-1)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn f<a>(x: a) -> a / {} where numeric(a) = x + numeric_of_int(1)"), []);
+  assert_eq(check_codes(b"fn f<a>(x: a) -> a / {} where numeric(a) = x + numeric_of_int(128)"), [
+    b"E0302",
+  ])
 }
 
 test "a channel's capacity and a draw's bound raise, unless a literal is in range" {

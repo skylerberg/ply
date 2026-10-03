@@ -1,0 +1,217 @@
+// Keys, and what a build's signature vouches for. A key is an Ed25519 seed in a file and its
+// public half in another. A signature is `std.signed`'s, detached in a file beside what it vouches
+// for, so an artifact's digest is the same whoever signs it and however many do; a registry's
+// attestation is signed the same way.
+
+import std.bin
+import std.bytes (bytes_of_hex, hex_of)
+import std.ed25519
+import std.fs (fs, Dir, File)
+import std.random (entropy)
+import compiler.resolve (Diag, diag1)
+
+// --- Key files ----------------------------------------------------------------------
+// One line: what the key is, and its 32 bytes in hex. The words keep a public key from being taken
+// for a secret one, and a secret one from being handed out as public.
+
+fn secret_word() -> String = "ply-ed25519-secret"
+
+fn public_word() -> String = "ply-ed25519-public"
+
+pub fn secret_text(seed: Bytes) -> String / {abort.raise} =
+  secret_word() ++ " " ++ hex_of(seed) ++ "\n"
+
+pub fn public_text(public: Bytes) -> String / {abort.raise} =
+  public_word() ++ " " ++ hex_of(public) ++ "\n"
+
+fn is_hex(text: String) -> Bool =
+  fold(string_chars(text), true, |ok: Bool, c: Char|
+    ok && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+
+fn key_of(text: String, word: String) -> Result<Bytes, String> / {abort.raise} =
+  match string_split(string_trim(text), " ") {
+    [w, hex] -> if w != word { Err("it is not a `" ++ word ++ "` key") }
+    else if string_len(hex) != 64 || !is_hex(hex) { Err("its key is not 64 lower-case hex digits") }
+    else { Ok(bytes_of_hex(hex)) },
+    _ -> Err("it is not one `" ++ word ++ " <hex>` line"),
+  }
+
+pub fn seed_of(text: String) -> Result<Bytes, String> / {abort.raise} = key_of(text, secret_word())
+
+pub fn public_of(text: String) -> Result<Bytes, String> / {abort.raise} =
+  key_of(text, public_word())
+
+/// Thirty-two bytes the operating system drew: seven of each 63-bit draw.
+pub fn fresh_seed() -> Bytes / {entropy.next, abort.raise} =
+  bytes_slice(
+    bytes_concat_all(
+      map(range(0, 5), |_i: Int| {
+        let n = entropy.next();
+        bytes_concat_all(map(range(0, 7), |k: Int| byte_of_int(n >>> 8 * k & 255)))
+      }),
+    ),
+    0,
+    32,
+  )
+
+fn outside() -> Int = 4294967295
+
+/// A key file that cannot be read, decoded or written.
+pub fn unkeyed(path: String, why: String) -> Diag =
+  diag1(
+    b"E0462",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string("the key file `" ++ path ++ "` " ++ why),
+    b"a key file is one line `ply keygen` writes",
+    [b"`ply keygen PATH` writes a secret key to PATH and its public key to PATH.pub"],
+  )
+
+// --- What a build vouches for --------------------------------------------------------
+
+/// What a signature over a build says: what was built, its digest, the `ply` and semantics that
+/// built it, and the commit its sources were checked out at, when they were in a repository.
+pub type Provenance = {
+  kind: String,
+  name: String,
+  digest: String,
+  builder: String,
+  semantics: String,
+  commit: String,
+}
+
+derive bin for Provenance
+
+pub fn provenance_bytes(p: Provenance) -> Bytes / {abort.raise} = bin::encode(p, provenance_bin())
+
+pub fn provenance_of(b: Bytes) -> Option<Provenance> / {abort.raise} =
+  match bin::decode(b, provenance_bin()) { Ok(p) -> Some(p), Err(_) -> None }
+
+/// Where an artifact's signatures are kept: beside it.
+pub fn signatures_path(artifact: String) -> String = artifact ++ ".sig"
+
+// --- The commit a tree was checked out at ---------------------------------------------
+
+fn under_abs(path: String) -> String / {abort.raise} =
+  if string_starts_with(path, "/") { string_slice(path, 1, string_len(path)) } else { path }
+
+fn parent(path: String) -> Option<String> / {abort.raise} =
+  match string_split(path, "/") {
+    [] -> None,
+    parts -> if len(parts) <= 2 { None } else {
+      Some(
+        fold(range(1, len(parts) - 1), "", |acc: String, i: Int|
+          acc ++ "/" ++ (match list_at(parts, i) { Some(p) -> p, None -> "" })),
+      )
+    },
+  }
+
+fn text_at(path: String) -> Option<String> / {fs.read_file[abs], abort.raise} =
+  match fs.read_file[abs](under_abs(path)) {
+    Some(b) -> Some(string_trim(string_of_bytes_lossy(b))),
+    None -> None,
+  }
+
+// The repository directory holding `dir`'s checkout, and the one its refs live in.
+type Repo = { git: String, common: String }
+
+fn repo_of(
+  dir: String,
+  depth: Int,
+) -> Option<Repo> / {fs.kind[abs], fs.read_file[abs], abort.raise} =
+  if depth > 64 { None } else {
+    let dot = dir ++ "/.git";
+    match fs.kind[abs](under_abs(dot)) {
+      Dir -> Some({ git: dot, common: dot }),
+      File -> match text_at(dot) {
+        Some(line) -> if !string_starts_with(line, "gitdir: ") { None } else {
+          let git = string_slice(line, 8, string_len(line));
+          let common = match text_at(git ++ "/commondir") {
+            None -> git,
+            Some(c) -> if string_starts_with(c, "/") { c } else { git ++ "/" ++ c },
+          };
+          Some({ git: git, common: common })
+        },
+        None -> None,
+      },
+      _ -> match parent(dir) { Some(up) -> repo_of(up, depth + 1), None -> None },
+    }
+  }
+
+fn packed_ref(common: String, name: String) -> Option<String> / {fs.read_file[abs], abort.raise} =
+  match text_at(common ++ "/packed-refs") {
+    None -> None,
+    Some(text) ->
+      fold(string_split(text, "\n"), None, |found: Option<String>, line: String|
+        match found {
+          Some(_) -> found,
+          None -> match string_split(line, " ") {
+            [hash, n] -> if n == name { Some(hash) } else { None },
+            _ -> None,
+          },
+        }),
+  }
+
+/// The commit `HEAD` names in the repository holding `dir`, or `""` outside one.
+pub fn head_commit(dir: String) -> String / {fs.kind[abs], fs.read_file[abs], abort.raise} =
+  match repo_of(dir, 0) {
+    None -> "",
+    Some(r) -> match text_at(r.git ++ "/HEAD") {
+      None -> "",
+      Some(head) -> if !string_starts_with(head, "ref: ") { head } else {
+        let name = string_slice(head, 5, string_len(head));
+        match text_at(r.git ++ "/" ++ name) {
+          Some(hash) -> hash,
+          None -> match text_at(r.common ++ "/" ++ name) {
+            Some(hash) -> hash,
+            None -> match packed_ref(r.common, name) { Some(hash) -> hash, None -> "" },
+          },
+        }
+      },
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_seed(n: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int((i + n) % 256)))
+
+fn a_provenance() -> Provenance =
+  {
+    kind: "program",
+    name: "app.main",
+    digest: "b3:00",
+    builder: "ply 0.0.0",
+    semantics: "s",
+    commit: "",
+  }
+
+test "a key file names what it holds, and the other kind is refused" {
+  let seed = a_seed(7);
+  assert_eq(seed_of(secret_text(seed)), Ok(seed));
+  let public = ed25519::public_key(seed);
+  assert_eq(public_of(public_text(public)), Ok(public));
+  assert(match public_of(secret_text(seed)) { Err(_) -> true, Ok(_) -> false });
+  assert(match seed_of(public_text(public)) { Err(_) -> true, Ok(_) -> false });
+  assert(match seed_of("ply-ed25519-secret 00") {
+    Err(why) -> string_contains(why, "64"),
+    Ok(_) -> false,
+  })
+}
+
+test "a fresh seed is thirty-two bytes of seven-byte draws" {
+  let drawn = with_cell[n](0) { c ->
+    handle {
+      fresh_seed()
+    } with {
+      entropy.next() -> {
+        cell_set(c, cell_get(c) + 1);
+        cell_get(c)
+      },
+    }
+  };
+  assert_eq(bytes_len(drawn), 32);
+  assert_eq(bytes_at(drawn, 0), 1);
+  assert_eq(bytes_at(drawn, 7), 2);
+  assert_eq(bytes_at(drawn, 14), 3)
+}

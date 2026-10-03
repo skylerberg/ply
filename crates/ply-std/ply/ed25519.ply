@@ -1,0 +1,435 @@
+// Ed25519 signatures, as RFC 8032 defines them and publishes vectors for: a 32-byte seed is a
+// secret key, `public_key` its 32-byte public key, and `sign` a 64-byte signature `verify` checks.
+//
+// A field element is sixteen `Int` limbs of sixteen bits, least significant first, after TweetNaCl:
+// a product of two limbs and the sum of a row of them stay far inside an `Int`, and a carry pass
+// brings each limb back below 2^16. A point is in extended coordinates. Nothing here is constant
+// time; it signs what a toolchain builds, on the machine that holds the key.
+
+import std.bytes (bytes_of_hex)
+import std.hash (sha512)
+
+// --- The field, modulo 2^255 - 19 -----------------------------------------------------
+
+fn limb(a: List<Int>, i: Int) -> Int = match list_at(a, i) { Some(x) -> x, None -> 0 }
+
+fn fe_zero() -> List<Int> = map(range(0, 16), |_i: Int| 0)
+
+fn fe_one() -> List<Int> = map(range(0, 16), |i: Int| if i == 0 { 1 } else { 0 })
+
+// Each limb below 2^16, the carry out of the top one folded back in as 38 times itself.
+fn carried(o: List<Int>) -> List<Int> / {abort.raise} = {
+  let swept = fold(
+    range(0, 16),
+    { out: [], carry: 0 },
+    |s: { out: List<Int>, carry: Int }, i: Int| {
+      let v = limb(o, i) + s.carry + 65536;
+      let c = v >> 16;
+      { out: push(s.out, v - (c << 16)), carry: c - 1 }
+    },
+  );
+  list_set(swept.out, 0, limb(swept.out, 0) + 38 * swept.carry)
+}
+
+fn fe_add(a: List<Int>, b: List<Int>) -> List<Int> =
+  map(range(0, 16), |i: Int| limb(a, i) + limb(b, i))
+
+fn fe_sub(a: List<Int>, b: List<Int>) -> List<Int> =
+  map(range(0, 16), |i: Int| limb(a, i) - limb(b, i))
+
+fn fe_mul(a: List<Int>, b: List<Int>) -> List<Int> / {abort.raise} = {
+  let t = map(range(0, 31), |k: Int|
+    fold(
+      range(if k > 15 { k - 15 } else { 0 }, if k < 15 { k + 1 } else { 16 }),
+      0,
+      |acc: Int, i: Int| acc + limb(a, i) * limb(b, k - i),
+    ));
+  carried(carried(map(range(0, 16), |i: Int| limb(t, i) + 38 * limb(t, i + 16))))
+}
+
+fn fe_square(a: List<Int>) -> List<Int> / {abort.raise} = fe_mul(a, a)
+
+// a^(p - 2), the inverse, by the addition chain of the exponent's bits.
+fn fe_invert(a: List<Int>) -> List<Int> / {abort.raise} =
+  fold(range(0, 254), a, |c: List<Int>, k: Int| {
+    let bit = 253 - k;
+    let squared = fe_square(c);
+    if bit != 2 && bit != 4 { fe_mul(squared, a) } else { squared }
+  })
+
+// a^((p - 5) / 8), the step of a square root.
+fn fe_pow2523(a: List<Int>) -> List<Int> / {abort.raise} =
+  fold(range(0, 251), a, |c: List<Int>, k: Int| {
+    let bit = 250 - k;
+    let squared = fe_square(c);
+    if bit != 1 { fe_mul(squared, a) } else { squared }
+  })
+
+// The canonical 32 bytes: fully reduced, little-endian.
+fn fe_pack(n: List<Int>) -> Bytes / {abort.raise} = {
+  let reduced = fold(range(0, 2), carried(carried(carried(n))), |t: List<Int>, _k: Int| {
+    let m0 = limb(t, 0) - 0xFFED;
+    let lower = fold(
+      range(1, 15),
+      { out: [], prev: m0 },
+      |s: { out: List<Int>, prev: Int }, i: Int| {
+        let mi = limb(t, i) - 0xFFFF - (s.prev >> 16 & 1);
+        { out: push(s.out, s.prev & 0xFFFF), prev: mi }
+      },
+    );
+    let m15 = limb(t, 15) - 0x7FFF - (lower.prev >> 16 & 1);
+    let m = push(push(lower.out, lower.prev & 0xFFFF), m15);
+    if m15 >> 16 & 1 == 0 { m } else { t }
+  });
+  bytes_concat_all(
+    map(reduced, |x: Int| bytes_concat(byte_of_int(x & 0xFF), byte_of_int(x >> 8 & 0xFF))),
+  )
+}
+
+fn fe_unpack(b: Bytes) -> List<Int> / {abort.raise} =
+  map(range(0, 16), |i: Int| {
+    let x = bytes_at(b, 2 * i) + (bytes_at(b, 2 * i + 1) << 8);
+    if i == 15 { x & 0x7FFF } else { x }
+  })
+
+fn fe_parity(a: List<Int>) -> Int / {abort.raise} = bytes_at(fe_pack(a), 0) & 1
+
+fn fe_equal(a: List<Int>, b: List<Int>) -> Bool / {abort.raise} = fe_pack(a) == fe_pack(b)
+
+// -121665/121666, twice it, the base point's coordinates, and sqrt(-1).
+fn curve_d() -> List<Int> =
+  [
+    0x78A3,
+    0x1359,
+    0x4DCA,
+    0x75EB,
+    0xD8AB,
+    0x4141,
+    0x0A4D,
+    0x0070,
+    0xE898,
+    0x7779,
+    0x4079,
+    0x8CC7,
+    0xFE73,
+    0x2B6F,
+    0x6CEE,
+    0x5203,
+  ]
+
+fn curve_d2() -> List<Int> =
+  [
+    0xF159,
+    0x26B2,
+    0x9B94,
+    0xEBD6,
+    0xB156,
+    0x8283,
+    0x149A,
+    0x00E0,
+    0xD130,
+    0xEEF3,
+    0x80F2,
+    0x198E,
+    0xFCE7,
+    0x56DF,
+    0xD9DC,
+    0x2406,
+  ]
+
+fn base_x() -> List<Int> =
+  [
+    0xD51A,
+    0x8F25,
+    0x2D60,
+    0xC956,
+    0xA7B2,
+    0x9525,
+    0xC760,
+    0x692C,
+    0xDC5C,
+    0xFDD6,
+    0xE231,
+    0xC0A4,
+    0x53FE,
+    0xCD6E,
+    0x36D3,
+    0x2169,
+  ]
+
+fn base_y() -> List<Int> = map(range(0, 16), |i: Int| if i == 0 { 0x6658 } else { 0x6666 })
+
+fn sqrt_m1() -> List<Int> =
+  [
+    0xA0B0,
+    0x4A0E,
+    0x1B27,
+    0xC4EE,
+    0xE478,
+    0xAD2F,
+    0x1806,
+    0x2F43,
+    0xD7A7,
+    0x3DFB,
+    0x0099,
+    0x2B4D,
+    0xDF0B,
+    0x4FC1,
+    0x2480,
+    0x2B83,
+  ]
+
+// --- The curve ----------------------------------------------------------------------
+
+type Point = { x: List<Int>, y: List<Int>, z: List<Int>, t: List<Int> }
+
+fn identity() -> Point = { x: fe_zero(), y: fe_one(), z: fe_one(), t: fe_zero() }
+
+fn base() -> Point / {abort.raise} =
+  { x: base_x(), y: base_y(), z: fe_one(), t: fe_mul(base_x(), base_y()) }
+
+// The unified addition, which doubles as well.
+fn point_add(p: Point, q: Point) -> Point / {abort.raise} = {
+  let a = fe_mul(fe_sub(p.y, p.x), fe_sub(q.y, q.x));
+  let b = fe_mul(fe_add(p.x, p.y), fe_add(q.x, q.y));
+  let c = fe_mul(fe_mul(p.t, q.t), curve_d2());
+  let d0 = fe_mul(p.z, q.z);
+  let d = fe_add(d0, d0);
+  let e = fe_sub(b, a);
+  let f = fe_sub(d, c);
+  let g = fe_add(d, c);
+  let h = fe_add(b, a);
+  { x: fe_mul(e, f), y: fe_mul(h, g), z: fe_mul(g, f), t: fe_mul(e, h) }
+}
+
+// `s`, a little-endian 32-byte scalar, times `q`, from the top bit down.
+fn times(q: Point, s: Bytes) -> Point / {abort.raise} =
+  fold(range(0, 256), identity(), |acc: Point, k: Int| {
+    let i = 255 - k;
+    let doubled = point_add(acc, acc);
+    if bytes_at(s, i / 8) >> i % 8 & 1 == 1 { point_add(doubled, q) } else { doubled }
+  })
+
+fn point_pack(p: Point) -> Bytes / {abort.raise} = {
+  let zi = fe_invert(p.z);
+  let y = fe_pack(fe_mul(p.y, zi));
+  let top = bytes_at(y, 31) ^ fe_parity(fe_mul(p.x, zi)) << 7;
+  bytes_concat(bytes_slice(y, 0, 31), byte_of_int(top))
+}
+
+// The negation of the point `b` encodes, or nothing when `b` is not on the curve.
+fn negated_unpack(b: Bytes) -> Option<Point> / {abort.raise} = {
+  let y = fe_unpack(b);
+  let z = fe_one();
+  let y2 = fe_square(y);
+  let num = fe_sub(y2, z);
+  let den = fe_add(z, fe_mul(y2, curve_d()));
+  let den2 = fe_square(den);
+  let den4 = fe_square(den2);
+  let den6 = fe_mul(den4, den2);
+  let t0 = fe_pow2523(fe_mul(fe_mul(den6, num), den));
+  let x0 = fe_mul(fe_mul(fe_mul(fe_mul(t0, num), den), den), den);
+  let checked = |x: List<Int>| fe_equal(fe_mul(fe_square(x), den), num);
+  let x1 = if checked(x0) { x0 } else { fe_mul(x0, sqrt_m1()) };
+  if !checked(x1) { None } else {
+    let x = if fe_parity(x1) == bytes_at(b, 31) >> 7 { fe_sub(fe_zero(), x1) } else { x1 };
+    Some({ x: x, y: y, z: z, t: fe_mul(x, y) })
+  }
+}
+
+// --- Scalars, modulo the group order L ------------------------------------------------
+
+fn order() -> List<Int> =
+  [
+    0xED,
+    0xD3,
+    0xF5,
+    0x5C,
+    0x1A,
+    0x63,
+    0x12,
+    0x58,
+    0xD6,
+    0x9C,
+    0xF7,
+    0xA2,
+    0xDE,
+    0xF9,
+    0xDE,
+    0x14,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0x10,
+  ]
+
+// Sixty-four signed byte-sized digits, least significant first, reduced to 32 bytes below L.
+fn mod_order(digits: List<Int>) -> Bytes / {abort.raise} = {
+  let l = order();
+  let high = fold(range(0, 32), digits, |x: List<Int>, k: Int| {
+    let i = 63 - k;
+    let xi = limb(x, i);
+    let walked = fold(
+      range(i - 32, i - 12),
+      { x: x, carry: 0 },
+      |s: { x: List<Int>, carry: Int }, j: Int| {
+        let v = limb(s.x, j) + s.carry - 16 * xi * limb(l, j - (i - 32));
+        let c = v + 128 >> 8;
+        { x: list_set(s.x, j, v - (c << 8)), carry: c }
+      },
+    );
+    list_set(list_set(walked.x, i - 12, limb(walked.x, i - 12) + walked.carry), i, 0)
+  });
+  let low = fold(range(0, 32), { x: high, carry: 0 }, |s: { x: List<Int>, carry: Int }, j: Int| {
+    let v = limb(s.x, j) + s.carry - (limb(s.x, 31) >> 4) * limb(l, j);
+    { x: list_set(s.x, j, v & 255), carry: v >> 8 }
+  });
+  let lowered = fold(range(0, 32), low.x, |x: List<Int>, j: Int|
+    list_set(x, j, limb(x, j) - low.carry * limb(l, j)));
+  let settled = fold(range(0, 32), lowered, |x: List<Int>, i: Int|
+    list_set(x, i + 1, limb(x, i + 1) + (limb(x, i) >> 8)));
+  bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int(limb(settled, i) & 255)))
+}
+
+fn digits_of(b: Bytes) -> List<Int> / {abort.raise} =
+  map(range(0, 64), |i: Int| if i < bytes_len(b) { bytes_at(b, i) } else { 0 })
+
+fn reduced(b: Bytes) -> Bytes / {abort.raise} = mod_order(digits_of(b))
+
+// Whether a 32-byte little-endian scalar is below L, as a signature's `S` must be.
+fn below_order(s: Bytes) -> Bool / {abort.raise} = {
+  let l = order();
+  fold(range(0, 32), 0, |verdict: Int, k: Int| {
+      let i = 31 - k;
+      if verdict != 0 { verdict }
+      else if bytes_at(s, i) < limb(l, i) { 0 - 1 }
+      else if bytes_at(s, i) > limb(l, i) { 1 }
+      else { 0 }
+    })
+    < 0
+}
+
+// --- Keys and signatures --------------------------------------------------------------
+
+// The secret scalar's bytes, clamped, and the prefix a signature's nonce is drawn from.
+fn expanded(seed: Bytes) -> { scalar: Bytes, prefix: Bytes } / {abort.raise} = {
+  let h = sha512(seed);
+  let first = bytes_at(h, 0) & 248;
+  let last = bytes_at(h, 31) & 127 | 64;
+  {
+    scalar: bytes_concat_all([byte_of_int(first), bytes_slice(h, 1, 31), byte_of_int(last)]),
+    prefix: bytes_slice(h, 32, 64),
+  }
+}
+
+/// The public key of a 32-byte seed.
+pub fn public_key(seed: Bytes) -> Bytes / {abort.raise} =
+  point_pack(times(base(), expanded(seed).scalar))
+
+/// The 64-byte signature of `message` under the 32-byte seed `seed`.
+pub fn sign(seed: Bytes, message: Bytes) -> Bytes / {abort.raise} = {
+  let e = expanded(seed);
+  let public = point_pack(times(base(), e.scalar));
+  let r = reduced(sha512(bytes_concat(e.prefix, message)));
+  let big_r = point_pack(times(base(), r));
+  let h = reduced(sha512(bytes_concat_all([big_r, public, message])));
+  let x = fold(range(0, 32), digits_of(r), |acc: List<Int>, i: Int|
+    fold(range(0, 32), acc, |a: List<Int>, j: Int|
+      list_set(a, i + j, limb(a, i + j) + bytes_at(h, i) * bytes_at(e.scalar, j))));
+  bytes_concat(big_r, mod_order(x))
+}
+
+/// Whether `signature` is `message` signed by the key `public` names.
+pub fn verify(public: Bytes, message: Bytes, signature: Bytes) -> Bool / {abort.raise} =
+  if bytes_len(public) != 32 || bytes_len(signature) != 64 { false } else {
+    let big_r = bytes_slice(signature, 0, 32);
+    let s = bytes_slice(signature, 32, 64);
+    if !below_order(s) { false } else {
+      match negated_unpack(public) {
+        None -> false,
+        Some(minus_a) -> {
+          let h = reduced(sha512(bytes_concat_all([big_r, public, message])));
+          point_pack(point_add(times(minus_a, h), times(base(), s))) == big_r
+        },
+      }
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn hex(text: String) -> Bytes / {abort.raise} = bytes_of_hex(text)
+
+type Vector = { seed: String, public: String, message: String, signature: String }
+
+// RFC 8032 §7.1, tests 1 to 3.
+fn vectors() -> List<Vector> =
+  [
+    {
+      seed: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      public: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      message: "",
+      signature: "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    },
+    {
+      seed: "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      public: "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      message: "72",
+      signature: "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+    },
+    {
+      seed: "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+      public: "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+      message: "af82",
+      signature: "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+    },
+  ]
+
+test "a seed's public key and signature are RFC 8032's, and the signature verifies" {
+  fold(vectors(), (), |_u: Unit, v: Vector| {
+    assert_eq(public_key(hex(v.seed)), hex(v.public));
+    assert_eq(sign(hex(v.seed), hex(v.message)), hex(v.signature));
+    assert(verify(hex(v.public), hex(v.message), hex(v.signature)))
+  })
+}
+
+test "a signature over other bytes, under another key, or altered does not verify" {
+  let v = match list_at(vectors(), 1) { Some(x) -> x, None -> panic("a vector") };
+  let other = match list_at(vectors(), 2) { Some(x) -> x, None -> panic("a vector") };
+  assert(!verify(hex(v.public), hex("73"), hex(v.signature)));
+  assert(!verify(hex(other.public), hex(v.message), hex(v.signature)));
+  let flipped = bytes_concat(
+    bytes_slice(hex(v.signature), 0, 63),
+    byte_of_int(bytes_at(hex(v.signature), 63) ^ 1),
+  );
+  assert(!verify(hex(v.public), hex(v.message), flipped));
+  assert(!verify(hex(v.public), hex(v.message), bytes_slice(hex(v.signature), 0, 63)))
+}
+
+test "a signature whose S is not below the group order is refused" {
+  let v = match list_at(vectors(), 0) { Some(x) -> x, None -> panic("a vector") };
+  let sig = hex(v.signature);
+  // S + L encodes the same scalar mod L, which a strict verifier refuses.
+  let l = order();
+  let s = bytes_slice(sig, 32, 64);
+  let summed = fold(
+    range(0, 32),
+    { out: b"", carry: 0 },
+    |acc: { out: Bytes, carry: Int }, i: Int| {
+      let t = bytes_at(s, i) + limb(l, i) + acc.carry;
+      { out: bytes_concat(acc.out, byte_of_int(t & 255)), carry: t >> 8 }
+    },
+  );
+  assert(!verify(hex(v.public), hex(v.message), bytes_concat(bytes_slice(sig, 0, 32), summed.out)))
+}

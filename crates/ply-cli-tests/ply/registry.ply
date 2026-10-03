@@ -11,6 +11,7 @@ import compiler.interface (CompiledPackage, compiled_package_bin, envelope_of, e
 import std.bin
 import std.certgen (certgen)
 import std.fs (fs)
+import std.time (time)
 import std.json
 import std.json (Json)
 import std.net
@@ -30,7 +31,14 @@ type Registry = { server: Server, url: String, trust: Option<String> }
 type Tls = { certificate: String, key: String }
 
 // Over plain HTTP, or over `--tls` with the certificate and key files `tls` names.
-fn start(tls: Option<Tls>) -> Registry / {Wire, Spawned, Clock, Here, Repo, abort.raise} = {
+fn start(tls: Option<Tls>) -> Registry / {Wire, Spawned, Clock, Here, Repo, abort.raise} =
+  start_with(tls, |_url: String| [])
+
+// As `start`, with more of the registry's command line, given the URL it will be reached at.
+fn start_with(
+  tls: Option<Tls>,
+  more: (String) -> List<String>,
+) -> Registry / {Wire, Spawned, Clock, Here, Repo, abort.raise} = {
   let port = reserve();
   if !fs.create_dir[cwd]("store") { panic("the store is made") };
   write("tokens.conf", "token.orders=" ++ token() ++ "\n");
@@ -46,16 +54,22 @@ fn start(tls: Option<Tls>) -> Registry / {Wire, Spawned, Clock, Here, Repo, abor
     "--config",
     here ++ "/tokens.conf",
   ];
-  let argv = match tls {
-    None -> plain,
-    Some(t) ->
-      concatenated(plain, [
-        "--tls",
-        "registry=" ++ here ++ "/" ++ t.certificate ++ "," ++ here ++ "/" ++ t.key,
-        "--set",
-        "tls=registry",
-      ]),
-  };
+  let secure_url = match tls { Some(_) -> true, None -> false };
+  let url_of = if secure_url { "https://localhost:" ++ int_to_string(port) }
+  else { "http://127.0.0.1:" ++ int_to_string(port) };
+  let argv = concatenated(
+    match tls {
+      None -> plain,
+      Some(t) ->
+        concatenated(plain, [
+          "--tls",
+          "registry=" ++ here ++ "/" ++ t.certificate ++ "," ++ here ++ "/" ++ t.key,
+          "--set",
+          "tls=registry",
+        ]),
+    },
+    more(url_of),
+  );
   let server = serving(argv, [], port);
   let secure = match tls { Some(_) -> true, None -> false };
   // Over plain HTTP, the registry's own answer for a package nobody published proves the port is
@@ -330,6 +344,99 @@ test/nondet "a version is held to the bump its changes need, and `contracts` lis
   assert_eq(map(items(at(j, "added")), str), ["orders.lib.triple"]);
   assert_eq(str(at(j, "needs")), "major");
   assert(truth(at(j, "kept")), Some(said(listed)));
+  stop(registry.server)
+}
+
+// Whether the file at `p` appeared before `ms` milliseconds passed.
+fn appeared(p: String, ms: Int) -> Bool / {fs.exists[cwd], Clock, abort.raise} = {
+  let until = time.elapsed_ms() + ms;
+  iterate((), ms / 100 + 1, |_u: Unit|
+    if fs.exists[cwd](p) { Stop(true) }
+    else if time.elapsed_ms() >= until { Stop(false) } else {
+      time.sleep_ms(100);
+      Continue(())
+    })
+}
+
+fn public_hex() -> String / {Here, abort.raise} =
+  match read("attester.key.pub") {
+    Some(text) -> match string::split_once(string_trim(text), " ") {
+      Some(parts) -> parts.tail,
+      None -> panic("a public key file is one line"),
+    },
+    None -> panic("`ply keygen` wrote the attester's public key"),
+  }
+
+test/nondet "a version is attested by the registry's attester, and a consumer reports what was attested" {
+  fresh();
+  ok(on_disk(["keygen", "attester.key"]));
+  let here = working();
+  let attester = public_hex();
+  let binary = repo() ++ "/target/debug/ply";
+  let registry = start_with(None, |url: String|
+    [
+      "--exec",
+      "attest=" ++ binary,
+      "--set",
+      "attester=" ++ attester,
+      "--set",
+      "attest.key=" ++ here ++ "/attester.key",
+      "--set",
+      "url=" ++ url,
+    ]);
+  ok(on_disk(["new", "orders", "--lib"]));
+  let out = asking(registry, true, ["publish", "orders", "--json"]);
+  ok(out);
+  let semantics = str(at(json_of(out), "semantics"));
+  assert(
+    appeared("store/orders/0.1.0/attestation/" ++ semantics, 240000),
+    Some("the attester kept no attestation of orders 0.1.0"),
+  );
+
+  // A second version whose law does not hold is published, and attested as not holding.
+  write(
+    "orders/lib.ply",
+    "pub fn double(n: Int) -> Int = n * 2\n\nlaw \"doubling is tripling\" forall (n: Int) where n > 0 && n < 9 { double(n) == n * 3 }\n",
+  );
+  replaced(
+    "orders/ply.pkg",
+    "version: { major: 0, minor: 1, patch: 0 }",
+    "version: { major: 0, minor: 2, patch: 0 }",
+  );
+  ok(asking(registry, true, ["publish", "orders"]));
+  assert(
+    appeared("store/orders/0.2.0/attestation/" ++ semantics, 240000),
+    Some("the attester kept no attestation of orders 0.2.0"),
+  );
+
+  an_app();
+  let trusting = [
+    { name: "PLY_REGISTRY", value: registry.url },
+    { name: "PLY_ATTESTERS", value: here ++ "/attester.key.pub" },
+  ];
+  let first = on_disk_with(["resolve", "app", "--json"], trusting, None);
+  ok(first);
+  let a = at(nth(at(json_of(first), "packages"), 0), "attestation");
+  assert(truth(at(a, "attested")), Some(said(first)));
+  assert(int(path(a, ["tests", "passed"])) >= 1, Some(said(first)));
+  // Without the attester's key named, an attestation is reported and never believed.
+  let unnamed = asking(registry, false, ["resolve", "app", "--json"]);
+  ok(unnamed);
+  let untrusted = at(nth(at(json_of(unnamed), "packages"), 0), "attestation");
+  assert(
+    !truth(at(untrusted, "trusted")) && !truth(at(untrusted, "attested")),
+    Some(said(unnamed)),
+  );
+
+  replaced(
+    "app/ply.pkg",
+    "min: {major: 0, minor: 1, patch: 0}",
+    "min: {major: 0, minor: 2, patch: 0}",
+  );
+  let second = on_disk_with(["resolve", "app", "--json"], trusting, None);
+  ok(second);
+  let b = at(nth(at(json_of(second), "packages"), 0), "attestation");
+  assert(!truth(at(b, "attested")) && int(path(b, ["proofs", "refuted"])) >= 1, Some(said(second)));
   stop(registry.server)
 }
 
