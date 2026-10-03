@@ -15,7 +15,8 @@ import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
 import store.tables (Cache, Stamps, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind,
                      KFn, KType, KEffect, Package, Body, open_cache, flush_cache, fingerprint,
                      put_fingerprint, def_of, put_def, put_decl, put_body, prune, source_key,
-                     source_keys, shipped_digest, put_shipped_digest, warnings)
+                     source_keys, shipped_digest, put_shipped_digest, warnings, filed_load,
+                     put_filed_load)
 import store.twin (on_twin)
 
 // One file a load read: where from, the module it is, and its bytes. The store keys it by its path,
@@ -35,11 +36,15 @@ pub type StdlibMoved = { was: String, now: String, entries: List<ShippedEntry> }
 
 // What the store holds for the files a load reads: every definition's and test's filed rows,
 // whatever hash each was filed under, and what opening and reading the store degraded past.
+// `intact` holds the paths whose every row is there, decodes, and was filed for the file's text;
+// `filed_load` is the digest the last filing was filed under.
 pub type Recorded = {
   defs: List<DefInterface>,
   tests: List<KnownTestRow>,
   stdlib: Option<StdlibMoved>,
   warnings: List<Diag>,
+  intact: Map<String, Bool>,
+  filed_load: Option<Bytes>,
 }
 
 // Where a load keeps its store: `.ply-cache` in the project root, under the root's own label, with
@@ -162,6 +167,7 @@ type Gathered = {
   cache: Cache,
   defs: List<DefInterface>,
   tests: List<KnownTestRow>,
+  intact: Map<String, Bool>,
   unread: Option<String>,
 }
 
@@ -186,7 +192,7 @@ fn decoded<a>(
 // takes a row only where the hash it was filed under is still the item's.
 fn gathered<[r]>(g0: Gathered, f: SourceFile) -> Gathered / {fs.read[r]} =
   match source_key(g0.cache, f.path) {
-    None -> g0,
+    None -> { ..g0, intact: map_insert(g0.intact, f.path, true) },
     Some(key) -> {
       let got = fingerprint[r](g0.cache, key);
       match got.value {
@@ -203,10 +209,15 @@ fn gathered<[r]>(g0: Gathered, f: SourceFile) -> Gathered / {fs.read[r]} =
                 },
               }
             });
-          fold(fp.tests, withdefs, |g: Gathered, t: TestEntry| {
+          let g = fold(fp.tests, withdefs, |g: Gathered, t: TestEntry| {
             let d = decoded(g, t.row, known_test_row_bin());
             match d.value { Some(v) -> { ..d.g, tests: push(d.g.tests, v) }, None -> d.g }
-          })
+          });
+          let fns = len(filter(fp.defs, |e: DefEntry| e.kind == KFn));
+          if fp.content == blake3(f.text) && len(g.defs) == len(g0.defs) + fns
+              && len(g.tests) == len(g0.tests) + len(fp.tests) {
+            { ..g, intact: map_insert(g.intact, f.path, true) }
+          } else { g }
         },
       }
     },
@@ -250,18 +261,21 @@ fn moved<[r]>(
 pub fn known<[r]>(place: Place, sources: Sources, now: String) -> Recorded / {fs.read[r]} = {
   let g = fold(
     sources.files,
-    { cache: opened[r](place, sources), defs: [], tests: [], unread: None },
+    { cache: opened[r](place, sources), defs: [], tests: [], intact: map_new(), unread: None },
     |acc: Gathered, f: SourceFile| gathered[r](acc, f),
   );
   let m = moved[r](g.cache, now);
+  let last = filed_load[r](m.cache);
   {
     defs: g.defs,
     tests: g.tests,
     stdlib: m.moved,
-    warnings: push_all(diags_of(warnings(m.cache)), match g.unread {
+    warnings: push_all(diags_of(warnings(last.cache)), match g.unread {
       Some(why) -> [unreadable_value(why)],
       None -> [],
     }),
+    intact: g.intact,
+    filed_load: last.value,
   }
 }
 
@@ -320,6 +334,7 @@ pub fn file<[r]>(
   filing: Filing,
   whole: Bool,
   now: String,
+  load: Bytes,
 ) -> List<Diag> / {fs.read[r], fs.write[r], entropy.next, time.now_ms} = {
   let c0 = opened[r](place, sources);
   let c1 = fold(filing.modules, c0, |c: Cache, m: FiledModule|
@@ -349,7 +364,7 @@ pub fn file<[r]>(
   } else { c4 };
   let was = shipped_digest[r](c5);
   let c6 = if was.value == Some(now) { was.cache } else { put_shipped_digest(was.cache, now) };
-  let kept = diags_of(warnings(flush_cache[r](c6)));
+  let kept = diags_of(warnings(flush_cache[r](put_filed_load[r](c6, load))));
   fold(retired[r](place), kept, |diags: List<Diag>, d: Diag| push(diags, d))
 }
 
@@ -398,9 +413,77 @@ fn told(was: String, now: String) -> { before: Option<StdlibMoved>, after: Optio
       { modules: [], defs: [], decls: [], bodies: [] },
       false,
       now,
+      b"load",
     );
     { before: before, after: known[mem](a_place(), shipped_sources(), now).stdlib }
   }).value
+
+fn one_fn() -> Filing = {
+  let check = blake3(b"f.check");
+  {
+    modules: [
+      {
+        name: b"m",
+        source: 0,
+        entries: [
+          {
+            name: b"m.f",
+            hash: blake3(b"f"),
+            check: check,
+            kind: b"fn",
+            span: { start: 0, end: 1 },
+            members: [],
+          },
+        ],
+        tests: [],
+      },
+    ],
+    defs: [
+      {
+        name: b"m.f",
+        hash: check,
+        interface: {
+          row: {
+            name: b"m.f",
+            hash: check,
+            effect_hashes: [],
+            footprint: b"",
+            performed: b"",
+            scaling: b"",
+            repeats: [],
+          },
+          scheme: b"Int",
+        },
+      },
+    ],
+    decls: [],
+    bodies: [],
+  }
+}
+
+// What a store `filing` was filed into for `m.ply` holding `was` says once it holds `now`.
+fn reread(filing: Filing, was: Bytes, now: Bytes) -> Recorded =
+  on_twin(mem_empty(), || {
+    let holding = |text: Bytes|
+      {
+        files: [
+          { path: "m.ply", name: "m", text: text },
+          { path: "../out.ply", name: "o", text: b"" },
+        ],
+        packages: [],
+      };
+    let filed = file[mem](a_place(), holding(was), filing, true, "b3:now", b"load");
+    known[mem](a_place(), holding(now), "b3:now")
+  }).value
+
+test "a file's rows are intact while it holds the text they were filed for and each reads back" {
+  let same = reread(one_fn(), b"f", b"f");
+  assert_eq(map_keys(same.intact), ["../out.ply", "m.ply"]);
+  assert_eq(same.filed_load, Some(b"load"));
+  assert_eq(map_keys(reread(one_fn(), b"f", b"g").intact), ["../out.ply"]);
+  assert_eq(map_keys(reread({ ..one_fn(), defs: [] }, b"f", b"f").intact), ["../out.ply"]);
+  assert_eq(map_keys(reread({ ..one_fn(), modules: [] }, b"f", b"f").intact), ["../out.ply"])
+}
 
 test "a store filed under other shipped modules says what it held for them, until it is filed again" {
   let t = told("b3:old", "b3:new");
