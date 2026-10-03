@@ -17,7 +17,7 @@ import compiler.hash (HashOutput, Prior, hex)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, TestInfo, LawInfo, Location)
-import compiler.termination (Ends)
+import compiler.termination (Ends, unknown_summary)
 import compiler.resolve (Source, ParsedModule, Diag, Label, error_at, qualify)
 import compiler.types (TyCon, TyFn)
 import diagnostic (Place, spot_of)
@@ -31,16 +31,23 @@ import loads (Sources, SourceFile, SourcePackage, Recorded, StdlibMoved, Shipped
 import std.random (entropy)
 
 // `whole` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
+// `cache_warnings` is what the front-end cache said of itself, which a run that never read the cache
+// has no part of; `diags` is the program's own.
 // `pkgs` and `through` are kept so a re-analysis (`ply replace`, a mutant) reads what the load did.
 pub type Program = {
   files: List<File>,
   places: List<Place>,
   diags: List<Diag>,
+  cache_warnings: List<Diag>,
   whole: Option<Analysis>,
   pkgs: PackageSources,
   through: List<CompiledPackage>,
   embeds: List<Embed>,
 }
+
+// Every diagnostic a load reports: what the front-end cache said of itself, then the program's.
+pub fn load_diagnostics(program: Program) -> List<Diag> =
+  appended(program.cache_warnings, program.diags)
 
 pub type ModuleView = { name: String, path: String }
 
@@ -57,15 +64,7 @@ pub type ModuleFacts = {
 // A load with the clock read between its phases, for the command that reports where the time went:
 // the walk, the shelf and the cache read; the front end; and filing its answer. `cached` says
 // whether the load read and filed the front-end cache at all.
-// `own`: the diagnostics the program earned, without what the front-end cache said of itself.
-pub type Timed = {
-  program: Program,
-  read_ms: Int,
-  front_ms: Int,
-  file_ms: Int,
-  cached: Bool,
-  own: List<Diag>,
-}
+pub type Timed = { program: Program, read_ms: Int, front_ms: Int, file_ms: Int, cached: Bool }
 
 // --- Where a shipped module's text is said to live ------------------------------
 
@@ -99,6 +98,7 @@ fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
     files: project.files,
     places: places,
     diags: diags,
+    cache_warnings: [],
     whole: None,
     pkgs: pkgs_of(project),
     through: [],
@@ -225,6 +225,7 @@ fn analysed(
         files: project.files,
         places: places,
         diags: w.warnings,
+        cache_warnings: [],
         whole: Some(w),
         pkgs: pkgs,
         through: through,
@@ -514,7 +515,7 @@ fn filed(
   program: Program,
 ) -> Program / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
   match program.whole {
-    None -> { ..program, diags: appended(k.warnings, program.diags) },
+    None -> { ..program, cache_warnings: k.warnings },
     Some(w) -> {
       let place = loads::place_of(paths, stamps);
       let sources = { files: placed_sources(program, w), packages: packages_of(program.pkgs) };
@@ -535,8 +536,8 @@ fn filed(
       } else { loads::file[abs](place, sources, filing(w), whole, now, load, w.hashes.priors) };
       {
         ..program,
-        diags: appended(
-          appended(appended(k.warnings, stdlib_notice(k.stdlib, w.hashes)), program.diags),
+        cache_warnings: appended(
+          appended(k.warnings, stdlib_notice(k.stdlib, w.hashes)),
           unsaid(k.warnings, more),
         ),
       }
@@ -602,7 +603,7 @@ pub fn load_uncached(
 // load's warnings, the cache's among them, so a command the machine reports for says them too.
 pub fn front_of(timed: Timed, analysis: Analysis) -> LoadedAnalysis / {abort.raise} =
   {
-    dump: dump_of(Analysed({ ..analysis, warnings: timed.program.diags })),
+    dump: dump_of(Analysed({ ..analysis, warnings: load_diagnostics(timed.program) })),
     files: placed_sources(timed.program, analysis),
     read_ms: timed.read_ms,
     front_ms: timed.front_ms,
@@ -656,7 +657,6 @@ pub fn timed_over(
     front_ms: front_done - read_done,
     file_ms: time.elapsed_ms() - front_done,
     cached: true,
-    own: p.diags,
   }
 }
 
@@ -690,7 +690,6 @@ pub fn timed_uncached_over(
     front_ms: time.elapsed_ms() - read_done,
     file_ms: 0,
     cached: false,
-    own: p.diags,
   }
 }
 
@@ -745,7 +744,7 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
 // Another package's definitions are claimed by their specs: that package's own run proves them.
 pub fn owned_of(analysis: Analysis, std: Bool) -> (Bytes) -> Bool = {
   let roots = fold(range(0, len(analysis.mods)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
-    match ((list_at(analysis.mods, i), list_at(analysis.mod_pkg, i))) {
+    match ((list_at(analysis.mods, i), list_at(analysis.module_packages, i))) {
       (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, m.name, true) } else { acc },
       _ -> acc,
     });
@@ -960,6 +959,7 @@ fn named(name: Bytes, simple: Bytes) -> DefInfo =
     bounded: [],
     tail_bounded: false,
     ending: Ends,
+    summary: unknown_summary(),
     row_aliases: [],
     constraints: [],
     spec: [],
@@ -1061,6 +1061,7 @@ test "a span outside every module has no place and no location" {
     files: [],
     places: [{ path: "m.ply", text: b"fn f() -> Int = 1\n" }],
     diags: [],
+    cache_warnings: [],
     whole: None,
     pkgs: { root: b"", manifest: None, supplied: [] },
     through: [],

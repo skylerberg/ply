@@ -24,7 +24,7 @@ import diagnostic (Place, all_to_json, all_to_text)
 import entry (Main, Module, entry_point, marked)
 import env (env)
 import sources (File)
-import program (Program, Timed, front_of, is_shipped, no_front, timed_uncached)
+import program (Program, Timed, load_diagnostics, front_of, is_shipped, no_front, timed_uncached)
 import plyz
 import report (Answer, indent, ok_code, count_of, plural, refused, reported, warning_lines)
 import std.fs (fs, Missing)
@@ -367,25 +367,25 @@ fn startup_line(style: Style, roots: List<String>) -> String / {abort.raise} =
 fn built_lines(
   style: Style,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
   out: String,
 ) -> List<String> / {abort.raise} =
   [
-    indent() ++ green(style, "built") ++ " " ++ m.entry ++ " · " ++ sealed.digest,
-    indent() ++ bold(style, "artifact") ++ " " ++ int_to_string(m.definitions) ++ " "
-      ++ plural(m.definitions, "definition")
+    indent() ++ green(style, "built") ++ " " ++ made.entry ++ " · " ++ sealed.digest,
+    indent() ++ bold(style, "artifact") ++ " " ++ int_to_string(made.definitions) ++ " "
+      ++ plural(made.definitions, "definition")
       ++ " · "
       ++ human(bytes_len(sealed.bytes))
       ++ " · "
       ++ out,
     binary_line(style, loaded),
-    startup_line(style, m.startup),
+    startup_line(style, made.startup),
   ]
 
 fn built_json(
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
   out: String,
   signer: Option<String>,
@@ -395,14 +395,14 @@ fn built_json(
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: num(ok_code()) },
     { key: "root", value: Str(loaded.root) },
-    { key: "entry", value: Str(m.entry) },
-    { key: "entry_hash", value: Str(m.entry_hash) },
-    { key: "startup", value: strings(m.startup) },
+    { key: "entry", value: Str(made.entry) },
+    { key: "entry_hash", value: Str(made.entry_hash) },
+    { key: "startup", value: strings(made.startup) },
     { key: "artifact", value: Str(out) },
     { key: "digest", value: Str(sealed.digest) },
     { key: "format", value: num(format()) },
-    { key: "definitions", value: num(m.definitions) },
-    { key: "names", value: num(len(m.names)) },
+    { key: "definitions", value: num(made.definitions) },
+    { key: "names", value: num(len(made.names)) },
     { key: "unit", value: Bool(true) },
     { key: "artifact_bytes", value: num(bytes_len(sealed.bytes)) },
     { key: "binary_bytes", value: opt_num(loaded.binary_bytes) },
@@ -411,12 +411,12 @@ fn built_json(
   ])
 
 // `--digest` is the one line a deployment pins: not the report, and no file.
-fn digest_json(m: Made, sealed: Sealed) -> Json =
+fn digest_json(made: Made, sealed: Sealed) -> Json =
   object([
     { key: "command", value: Str("build") },
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: num(ok_code()) },
-    { key: "entry", value: Str(m.entry) },
+    { key: "entry", value: Str(made.entry) },
     { key: "digest", value: Str(sealed.digest) },
   ])
 
@@ -654,10 +654,10 @@ fn written(
   style: Style,
   flags: Flags,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
 ) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
-  let out = match flags.out { Some(v) -> v, None -> default_output(m.entry) };
+  let out = match flags.out { Some(v) -> v, None -> default_output(made.entry) };
   match signing_key(flags) {
     Err(d) -> reported(style, "build", [d], loaded.places),
     Ok(seed) -> match stored(out, sealed.bytes) {
@@ -665,15 +665,15 @@ fn written(
       Ok(_) -> match signed(
           seed,
           out,
-          built_provenance(flags, loaded, "program", m.entry, sealed),
+          built_provenance(flags, loaded, "program", made.entry, sealed),
         ) {
         Err(d) -> reported(style, "build", [d], loaded.places),
         Ok(signer) ->
           {
-            json: built_json(loaded, m, sealed, out, signer),
+            json: built_json(loaded, made, sealed, out, signer),
             lines: fold(
               signer_lines(style, signer),
-              built_lines(style, loaded, m, sealed, out),
+              built_lines(style, loaded, made, sealed, out),
               |acc: List<String>, l: String| push(acc, l),
             ),
             errs: [],
@@ -687,17 +687,17 @@ fn written(
 fn differed(
   style: Style,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
   old: String,
 ) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match artifacts.previous(old, paths::read_file(paths::spelled(old))) {
     Err(why) -> reported(style, "build", why.diags, why.places),
     Ok(was) -> {
-      let d = compared(was.names, m.names, m.reaches);
+      let d = compared(was.names, made.names, made.reaches);
       {
         json: diff_json(
-          m.entry,
+          made.entry,
           old,
           was.digest,
           sealed.digest,
@@ -706,7 +706,7 @@ fn differed(
           loaded.binary_bytes,
           was.warnings,
         ),
-        lines: diff_lines(style, m.entry, was.digest, sealed.digest, d, was.warnings),
+        lines: diff_lines(style, made.entry, was.digest, sealed.digest, d, was.warnings),
         errs: [],
         code: ok_code(),
       }
@@ -714,25 +714,25 @@ fn differed(
   }
 
 fn delivered(
-  s: Style,
+  style: Style,
   flags: Flags,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
 ) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match flags.diff {
-    Some(old) -> differed(s, loaded, m, sealed, old),
+    Some(old) -> differed(style, loaded, made, sealed, old),
     None -> if flags.digest {
-      { json: digest_json(m, sealed), lines: [sealed.digest], errs: [], code: ok_code() }
+      { json: digest_json(made, sealed), lines: [sealed.digest], errs: [], code: ok_code() }
     } else if flags.action == "verify" {
       verified(
-        s,
+        style,
         loaded,
-        match flags.out { Some(v) -> v, None -> default_output(m.entry) },
+        match flags.out { Some(v) -> v, None -> default_output(made.entry) },
         sealed,
         domain(),
       )
-    } else { written(s, flags, loaded, m, sealed) },
+    } else { written(style, flags, loaded, made, sealed) },
   }
 
 fn is_diffed(flags: Flags) -> Bool = match flags.diff { Some(_) -> true, None -> false }
@@ -780,7 +780,7 @@ pub fn run(
   let s: Style = style_of(flags);
   let t: Timed = timed_uncached(flags.paths);
   match t.program.whole {
-    None -> refused(s, "build", t.program.diags, t.program.places),
+    None -> refused(s, "build", load_diagnostics(t.program), t.program.places),
     Some(w) ->
       deploying(||
         built_over(s, flags, t.program, defs_of(w), startup_of(w, flags), front_of(t, w))),
@@ -1190,6 +1190,7 @@ fn no_program() -> Program =
     files: [],
     places: [],
     diags: [],
+    cache_warnings: [],
     whole: None,
     pkgs: { root: b"", manifest: None, supplied: [] },
     through: [],

@@ -167,8 +167,8 @@ fn groups(was: Stamps, now: Stamps) -> List<Group> =
 fn emptied(s: Store, g: Group) -> Store / {abort.raise} =
   fold(g.tables, s, |s1: Store, t: Int| fold(keys(s1, t), s1, |s2: Store, k: Bytes| drop(s2, t, k)))
 
-fn restamped(s: Store, now: Stamps) -> Store / {abort.raise} =
-  put(s, t_stamps(), stamps_key(), bin::encode(now, stamps_bin()))
+fn restamped(store: Store, now: Stamps) -> Store / {abort.raise} =
+  put(store, t_stamps(), stamps_key(), bin::encode(now, stamps_bin()))
 
 fn short_stamp(stamp: String) -> String / {abort.raise} =
   if string_len(stamp) > 12 { "b3:" ++ string_slice(stamp, 0, 12) } else { stamp }
@@ -210,16 +210,16 @@ fn stamped<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} = {
 // Passes published there answer here; what this run learns is published back unless `publish` is
 // off. The upstream is reached under a label of its own, since it is rarely under the project.
 pub fn with_upstream<[u]>(
-  c: Cache,
+  cache: Cache,
   root: String,
   publish: Bool,
 ) -> Cache / {fs.read[u], abort.raise} = {
   let under = |stamp: String|
     { root: root, schema: digest(schema() ++ bytes_of_string(stamp)), publish: publish };
-  let up = under(c.stamps.runtime);
-  let code_up = under(c.stamps.code);
+  let up = under(cache.stamps.runtime);
+  let code_up = under(cache.stamps.code);
   {
-    ..c,
+    ..cache,
     upstream: Some(up),
     shared: published_keys[u](up, t_passed()),
     code_upstream: Some(code_up),
@@ -238,8 +238,8 @@ fn published_failures(n: Int, root: String) -> String =
     ++ root
     ++ "`; this run is unaffected"
 
-fn puts_in(s: Store, tables: List<Int>) -> List<Put> / {abort.raise} =
-  map_fold(s.puts, [], |acc: List<Put>, sl: Bytes, payload: Bytes|
+fn puts_in(store: Store, tables: List<Int>) -> List<Put> / {abort.raise} =
+  map_fold(store.puts, [], |acc: List<Put>, sl: Bytes, payload: Bytes|
     if fold(tables, false, |hit: Bool, t: Int| hit || t == bytes_at(sl, 0)) {
       push(acc, {
         table: bytes_at(sl, 0),
@@ -249,18 +249,19 @@ fn puts_in(s: Store, tables: List<Int>) -> List<Put> / {abort.raise} =
     } else { acc })
 
 pub fn flush_cache<[r]>(
-  c: Cache,
+  cache: Cache,
 ) -> Cache / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
   {
-    ..c,
-    store: flush[r](if pending(c.store) == 0 { c.store } else { current[r](c.store, c.stamps) }),
+    ..cache,
+    store: flush[r](if pending(cache.store) == 0 { cache.store }
+    else { current[r](cache.store, cache.stamps) }),
   }
 
 // Whatever a flush writes goes under this build's stamps.
-fn current<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} =
-  match get[r](s, t_stamps(), stamps_key()) {
-    Hit(b) -> if b == bin::encode(now, stamps_bin()) { s } else { restamped(s, now) },
-    _ -> restamped(s, now),
+fn current<[r]>(store: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} =
+  match get[r](store, t_stamps(), stamps_key()) {
+    Hit(b) -> if b == bin::encode(now, stamps_bin()) { store } else { restamped(store, now) },
+    _ -> restamped(store, now),
   }
 
 type Published = { failed: Int, known: Map<Bytes, Bool> }
@@ -283,12 +284,12 @@ fn published_to<[u]>(
 
 // The local write comes first, so an upstream that cannot be reached never costs a run its own record.
 pub fn flush_shared<[r], [u]>(
-  c: Cache,
+  cache: Cache,
 ) -> Cache / {fs.read[r], fs.write[r], fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} = {
-  let shared = puts_in(c.store, [t_passed(), t_evidence()]);
-  let coded = puts_in(c.store, [t_code_passes()]);
-  let flushed = flush_cache[r](c);
-  match ((c.upstream, c.code_upstream)) {
+  let shared = puts_in(cache.store, [t_passed(), t_evidence()]);
+  let coded = puts_in(cache.store, [t_code_passes()]);
+  let flushed = flush_cache[r](cache);
+  match ((cache.upstream, cache.code_upstream)) {
     (Some(up), Some(code_up)) -> if !up.publish { flushed } else {
       let a = published_to[u](up, shared, flushed.shared, t_passed());
       let b = published_to[u](code_up, coded, flushed.code_shared, t_code_passes());
@@ -304,9 +305,9 @@ pub fn flush_shared<[r], [u]>(
   }
 }
 
-pub fn warnings(c: Cache) -> List<Warning> = c.store.warnings
+pub fn warnings(cache: Cache) -> List<Warning> = cache.store.warnings
 
-fn noted(c: Cache, why: String) -> Cache = { ..c, store: warn(c.store, Corrupt, why) }
+fn noted(cache: Cache, why: String) -> Cache = { ..cache, store: warn(cache.store, Corrupt, why) }
 
 fn digest(b: Bytes) -> Bytes = bytes_blake3(b)
 
@@ -316,18 +317,18 @@ fn named_key(name: String) -> Bytes = digest(bytes_of_string(name))
 pub type Read<a> = { value: Option<a>, cache: Cache }
 
 fn read<a, [r]>(
-  c: Cache,
+  cache: Cache,
   table: Int,
   key: Bytes,
   codec: bin::BinCodec<a>,
   what: String,
 ) -> Read<a> / {fs.read[r], abort.raise} =
-  match get[r](c.store, table, key) {
-    Miss -> { value: None, cache: c },
-    Bad(why) -> { value: None, cache: noted(c, damaged(what, why)) },
+  match get[r](cache.store, table, key) {
+    Miss -> { value: None, cache: cache },
+    Bad(why) -> { value: None, cache: noted(cache, damaged(what, why)) },
     Hit(bytes) -> match bin::decode(bytes, codec) {
-      Ok(v) -> { value: Some(v), cache: c },
-      Err(e) -> { value: None, cache: noted(c, damaged(what, bin::error_to_string(e))) },
+      Ok(v) -> { value: Some(v), cache: cache },
+      Err(e) -> { value: None, cache: noted(cache, damaged(what, bin::error_to_string(e))) },
     },
   }
 
@@ -335,25 +336,26 @@ fn damaged(what: String, why: String) -> String =
   "a stored " ++ what ++ " is damaged (" ++ why ++ "); it is treated as absent"
 
 fn write<a>(
-  c: Cache,
+  cache: Cache,
   table: Int,
   key: Bytes,
   codec: bin::BinCodec<a>,
   value: a,
-) -> Cache / {abort.raise} = { ..c, store: put(c.store, table, key, bin::encode(value, codec)) }
+) -> Cache / {abort.raise} =
+  { ..cache, store: put(cache.store, table, key, bin::encode(value, codec)) }
 
 // A write of what is already there is no write, so a run that changed nothing flushes nothing.
 fn renew<a, [r]>(
-  c: Cache,
+  cache: Cache,
   table: Int,
   key: Bytes,
   codec: bin::BinCodec<a>,
   value: a,
 ) -> Cache / {fs.read[r], abort.raise} =
-  match get[r](c.store, table, key) {
-    Hit(old) -> if old == bin::encode(value, codec) { c }
-    else { write(c, table, key, codec, value) },
-    _ -> write(c, table, key, codec, value),
+  match get[r](cache.store, table, key) {
+    Hit(old) -> if old == bin::encode(value, codec) { cache }
+    else { write(cache, table, key, codec, value) },
+    _ -> write(cache, table, key, codec, value),
   }
 
 // --- Keying -----------------------------------------------------------------
@@ -384,8 +386,8 @@ fn key_of(parts: List<String>) -> Option<String> =
 
 // A dependency's file is keyed by the package's identity, so its entry holds wherever the package
 // is checked out; the project's own by its path inside the root, or as written when it is relative.
-pub fn source_key(c: Cache, path: String) -> Option<String> / {abort.raise} =
-  match fold(c.packages, None, |acc: Option<Option<String>>, p: Package|
+pub fn source_key(cache: Cache, path: String) -> Option<String> / {abort.raise} =
+  match fold(cache.packages, None, |acc: Option<Option<String>>, p: Package|
       match acc {
         Some(_) -> acc,
         None -> match inside(p.root, path) {
@@ -395,7 +397,7 @@ pub fn source_key(c: Cache, path: String) -> Option<String> / {abort.raise} =
         },
       }) {
     Some(k) -> k,
-    None -> match inside(c.root, path) {
+    None -> match inside(cache.root, path) {
       Some(parts) -> key_of(parts),
       None -> if string_starts_with(path, "/") { None } else { key_of(segments(path)) },
     },
@@ -403,25 +405,28 @@ pub fn source_key(c: Cache, path: String) -> Option<String> / {abort.raise} =
 
 // --- The front end ----------------------------------------------------------
 
-pub fn fingerprint<[r]>(c: Cache, key: String) -> Read<Fingerprint> / {fs.read[r], abort.raise} = {
-  let got = read[r](c, t_sources(), named_key(key), fingerprint_bin(), "fingerprint");
+pub fn fingerprint<[r]>(
+  cache: Cache,
+  key: String,
+) -> Read<Fingerprint> / {fs.read[r], abort.raise} = {
+  let got = read[r](cache, t_sources(), named_key(key), fingerprint_bin(), "fingerprint");
   match got.value {
     Some(f) -> if f.key == key { got } else { { value: None, cache: got.cache } },
     None -> got,
   }
 }
 
-pub fn put_fingerprint<[r]>(c: Cache, f: Fingerprint) -> Cache / {fs.read[r], abort.raise} =
-  renew[r](c, t_sources(), named_key(f.key), fingerprint_bin(), f)
+pub fn put_fingerprint<[r]>(cache: Cache, f: Fingerprint) -> Cache / {fs.read[r], abort.raise} =
+  renew[r](cache, t_sources(), named_key(f.key), fingerprint_bin(), f)
 
-pub fn forget_source(c: Cache, key: String) -> Cache / {abort.raise} =
-  { ..c, store: drop(c.store, t_sources(), named_key(key)) }
+pub fn forget_source(cache: Cache, key: String) -> Cache / {abort.raise} =
+  { ..cache, store: drop(cache.store, t_sources(), named_key(key)) }
 
 // Every source key the store holds, ascending, read from the fingerprints themselves.
-pub fn source_keys<[r]>(c: Cache) -> Read<List<String>> / {fs.read[r], abort.raise} = {
+pub fn source_keys<[r]>(cache: Cache) -> Read<List<String>> / {fs.read[r], abort.raise} = {
   let walked = fold(
-    keys(c.store, t_sources()),
-    { found: map_new(), cache: c },
+    keys(cache.store, t_sources()),
+    { found: map_new(), cache: cache },
     |acc: { found: Map<String, Bool>, cache: Cache }, k: Bytes| {
       let got = read[r](acc.cache, t_sources(), k, fingerprint_bin(), "fingerprint");
       match got.value {
@@ -438,56 +443,60 @@ pub fn source_keys<[r]>(c: Cache) -> Read<List<String>> / {fs.read[r], abort.rai
 fn pair_key(hash: Bytes, name: String) -> Bytes = digest(hash ++ bytes_of_string(name))
 
 fn interface_of<[r]>(
-  c: Cache,
+  cache: Cache,
   table: Int,
   hash: Bytes,
   name: String,
 ) -> Read<Bytes> / {fs.read[r], abort.raise} =
-  match get[r](c.store, table, pair_key(hash, name)) {
-    Miss -> { value: None, cache: c },
-    Bad(why) -> { value: None, cache: noted(c, damaged("interface", why)) },
-    Hit(bytes) -> { value: Some(bytes), cache: c },
+  match get[r](cache.store, table, pair_key(hash, name)) {
+    Miss -> { value: None, cache: cache },
+    Bad(why) -> { value: None, cache: noted(cache, damaged("interface", why)) },
+    Hit(bytes) -> { value: Some(bytes), cache: cache },
   }
 
 fn put_interface<[r]>(
-  c: Cache,
+  cache: Cache,
   table: Int,
   hash: Bytes,
   name: String,
   value: Bytes,
 ) -> Cache / {fs.read[r], abort.raise} = {
   let k = pair_key(hash, name);
-  match get[r](c.store, table, k) {
-    Hit(old) -> if old == value { c } else { { ..c, store: put(c.store, table, k, value) } },
-    _ -> { ..c, store: put(c.store, table, k, value) },
+  match get[r](cache.store, table, k) {
+    Hit(old) -> if old == value { cache }
+    else { { ..cache, store: put(cache.store, table, k, value) } },
+    _ -> { ..cache, store: put(cache.store, table, k, value) },
   }
 }
 
-pub fn def_of<[r]>(c: Cache, hash: Bytes, name: String) -> Read<Bytes> / {fs.read[r], abort.raise} =
-  interface_of[r](c, t_defs(), hash, name)
+pub fn def_of<[r]>(
+  cache: Cache,
+  hash: Bytes,
+  name: String,
+) -> Read<Bytes> / {fs.read[r], abort.raise} = interface_of[r](cache, t_defs(), hash, name)
 
 pub fn decl_of<[r]>(
-  c: Cache,
+  cache: Cache,
   hash: Bytes,
   name: String,
-) -> Read<Bytes> / {fs.read[r], abort.raise} = interface_of[r](c, t_decls(), hash, name)
+) -> Read<Bytes> / {fs.read[r], abort.raise} = interface_of[r](cache, t_decls(), hash, name)
 
 pub fn put_def<[r]>(
-  c: Cache,
+  cache: Cache,
   hash: Bytes,
   name: String,
   value: Bytes,
-) -> Cache / {fs.read[r], abort.raise} = put_interface[r](c, t_defs(), hash, name, value)
+) -> Cache / {fs.read[r], abort.raise} = put_interface[r](cache, t_defs(), hash, name, value)
 
 pub fn put_decl<[r]>(
-  c: Cache,
+  cache: Cache,
   hash: Bytes,
   name: String,
   value: Bytes,
-) -> Cache / {fs.read[r], abort.raise} = put_interface[r](c, t_decls(), hash, name, value)
+) -> Cache / {fs.read[r], abort.raise} = put_interface[r](cache, t_decls(), hash, name, value)
 
-pub fn body<[r]>(c: Cache, hash: Bytes) -> Read<Body> / {fs.read[r], abort.raise} = {
-  let got = read[r](c, t_bodies(), hash, body_bin(), "body");
+pub fn body<[r]>(cache: Cache, hash: Bytes) -> Read<Body> / {fs.read[r], abort.raise} = {
+  let got = read[r](cache, t_bodies(), hash, body_bin(), "body");
   match got.value {
     Some(b) -> if body_key(b.bytes) == Some(hash) { got } else {
       { value: None, cache: noted(got.cache, damaged("body", "its envelope names another hash")) }
@@ -499,64 +508,69 @@ pub fn body<[r]>(c: Cache, hash: Bytes) -> Read<Body> / {fs.read[r], abort.raise
 // A body whose envelope does not name `hash` is not filed: it could never be read back.
 // A body is keyed by a digest of itself, so a different body already there means its encoding
 // depends on something the hash does not cover: the one stored is kept and the run warned.
-pub fn put_body<[r]>(c: Cache, hash: Bytes, b: Body) -> Cache / {fs.read[r], abort.raise} =
-  if body_key(b.bytes) != Some(hash) { c } else {
-    match get[r](c.store, t_bodies(), hash) {
-      Hit(old) -> if old == bin::encode(b, body_bin()) { c } else {
+pub fn put_body<[r]>(cache: Cache, hash: Bytes, b: Body) -> Cache / {fs.read[r], abort.raise} =
+  if body_key(b.bytes) != Some(hash) { cache } else {
+    match get[r](cache.store, t_bodies(), hash) {
+      Hit(old) -> if old == bin::encode(b, body_bin()) { cache } else {
         noted(
-          c,
+          cache,
           "two different bodies were stored for definition `" ++ string_slice(hex_of(hash), 0, 12)
             ++ "`; the one already stored is kept",
         )
       },
-      _ -> write(c, t_bodies(), hash, body_bin(), b),
+      _ -> write(cache, t_bodies(), hash, body_bin(), b),
     }
   }
 
 // --- Test results -----------------------------------------------------------
 
 fn passed_in<[r]>(
-  c: Cache,
+  cache: Cache,
   table: Int,
   shared: Map<Bytes, Bool>,
   key: Bytes,
 ) -> Read<Bool> / {fs.read[r], abort.raise} =
-  match get[r](c.store, table, key) {
-    Hit(_) -> { value: Some(true), cache: c },
-    Miss -> { value: Some(map_contains(shared, key)), cache: c },
-    Bad(why) -> { value: Some(map_contains(shared, key)), cache: noted(c, damaged("result", why)) },
+  match get[r](cache.store, table, key) {
+    Hit(_) -> { value: Some(true), cache: cache },
+    Miss -> { value: Some(map_contains(shared, key)), cache: cache },
+    Bad(why) ->
+      { value: Some(map_contains(shared, key)), cache: noted(cache, damaged("result", why)) },
   }
 
-fn keys_in(c: Cache, table: Int, shared: Map<Bytes, Bool>) -> List<Bytes> / {abort.raise} =
+fn keys_in(cache: Cache, table: Int, shared: Map<Bytes, Bool>) -> List<Bytes> / {abort.raise} =
   map_keys(
-    fold(keys(c.store, table), shared, |m: Map<Bytes, Bool>, k: Bytes| map_insert(m, k, true)),
+    fold(keys(cache.store, table), shared, |m: Map<Bytes, Bool>, k: Bytes| map_insert(m, k, true)),
   )
 
-pub fn passed<[r]>(c: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
-  passed_in[r](c, t_passed(), c.shared, key)
+pub fn passed<[r]>(cache: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
+  passed_in[r](cache, t_passed(), cache.shared, key)
 
-pub fn put_passed(c: Cache, key: Bytes) -> Cache / {abort.raise} =
-  { ..c, store: put(c.store, t_passed(), key, b"") }
+pub fn put_passed(cache: Cache, key: Bytes) -> Cache / {abort.raise} =
+  { ..cache, store: put(cache.store, t_passed(), key, b"") }
 
 // Every key a pass is filed under here or in the upstream, read from the index alone.
-pub fn passed_keys(c: Cache) -> List<Bytes> / {abort.raise} = keys_in(c, t_passed(), c.shared)
+pub fn passed_keys(cache: Cache) -> List<Bytes> / {abort.raise} =
+  keys_in(cache, t_passed(), cache.shared)
 
 // A pass filed under the code its test ran, here or in the upstream.
-pub fn passed_code<[r]>(c: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
-  passed_in[r](c, t_code_passes(), c.code_shared, key)
+pub fn passed_code<[r]>(cache: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
+  passed_in[r](cache, t_code_passes(), cache.code_shared, key)
 
-pub fn put_passed_code(c: Cache, key: Bytes) -> Cache / {abort.raise} =
-  { ..c, store: put(c.store, t_code_passes(), key, b"") }
+pub fn put_passed_code(cache: Cache, key: Bytes) -> Cache / {abort.raise} =
+  { ..cache, store: put(cache.store, t_code_passes(), key, b"") }
 
-pub fn passed_code_keys(c: Cache) -> List<Bytes> / {abort.raise} =
-  keys_in(c, t_code_passes(), c.code_shared)
+pub fn passed_code_keys(cache: Cache) -> List<Bytes> / {abort.raise} =
+  keys_in(cache, t_code_passes(), cache.code_shared)
 
 // Every definition hash this store has seen pass, read from the index alone.
-pub fn seen_keys(c: Cache) -> List<Bytes> / {abort.raise} = keys(c.store, t_seen())
+pub fn seen_keys(cache: Cache) -> List<Bytes> / {abort.raise} = keys(cache.store, t_seen())
 
-pub fn pass_record<[r]>(c: Cache, label: String) -> Read<PassRecord> / {fs.read[r], abort.raise} = {
+pub fn pass_record<[r]>(
+  cache: Cache,
+  label: String,
+) -> Read<PassRecord> / {fs.read[r], abort.raise} = {
   let got = read[r](
-    c,
+    cache,
     t_pass_records(),
     named_key(label),
     named_bin(pass_record_bin()),
@@ -569,35 +583,35 @@ pub fn pass_record<[r]>(c: Cache, label: String) -> Read<PassRecord> / {fs.read[
 }
 
 pub fn put_pass_record<[r]>(
-  c: Cache,
+  cache: Cache,
   label: String,
   record: PassRecord,
 ) -> Cache / {fs.read[r], abort.raise} =
-  renew[r](c, t_pass_records(), named_key(label), named_bin(pass_record_bin()), {
+  renew[r](cache, t_pass_records(), named_key(label), named_bin(pass_record_bin()), {
     name: label,
     value: record,
   })
 
-pub fn knows_definition<[r]>(c: Cache, hash: Bytes) -> Bool / {fs.read[r], abort.raise} =
-  match get[r](c.store, t_seen(), hash) { Hit(_) -> true, _ -> false }
+pub fn knows_definition<[r]>(cache: Cache, hash: Bytes) -> Bool / {fs.read[r], abort.raise} =
+  match get[r](cache.store, t_seen(), hash) { Hit(_) -> true, _ -> false }
 
-pub fn observe_definition(c: Cache, hash: Bytes) -> Cache / {abort.raise} =
-  { ..c, store: put(c.store, t_seen(), hash, b"") }
+pub fn observe_definition(cache: Cache, hash: Bytes) -> Cache / {abort.raise} =
+  { ..cache, store: put(cache.store, t_seen(), hash, b"") }
 
 // --- The prover -------------------------------------------------------------
 
-pub fn evidence<[r]>(c: Cache, key: Bytes) -> Read<Bytes> / {fs.read[r], abort.raise} =
-  read[r](c, t_evidence(), key, bin::bytes_bin(), "evidence")
+pub fn evidence<[r]>(cache: Cache, key: Bytes) -> Read<Bytes> / {fs.read[r], abort.raise} =
+  read[r](cache, t_evidence(), key, bin::bytes_bin(), "evidence")
 
 // The local entry, or else the upstream's.
 pub fn evidence_shared<[r], [u]>(
-  c: Cache,
+  cache: Cache,
   key: Bytes,
 ) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} = {
-  let local = evidence[r](c, key);
+  let local = evidence[r](cache, key);
   match local.value {
     Some(_) -> local,
-    None -> match c.upstream {
+    None -> match cache.upstream {
       None -> local,
       Some(up) -> match read_entry[u](up, t_evidence(), key) {
         Hit(payload) -> match bin::decode(payload, bin::bytes_bin()) {
@@ -615,29 +629,29 @@ pub fn evidence_shared<[r], [u]>(
   }
 }
 
-pub fn put_evidence(c: Cache, key: Bytes, encoded: Bytes) -> Cache / {abort.raise} =
-  write(c, t_evidence(), key, bin::bytes_bin(), encoded)
+pub fn put_evidence(cache: Cache, key: Bytes, encoded: Bytes) -> Cache / {abort.raise} =
+  write(cache, t_evidence(), key, bin::bytes_bin(), encoded)
 
-pub fn review<[r]>(c: Cache, def: String) -> Read<Review> / {fs.read[r], abort.raise} = {
-  let got = read[r](c, t_reviews(), named_key(def), named_bin(review_bin()), "review");
+pub fn review<[r]>(cache: Cache, def: String) -> Read<Review> / {fs.read[r], abort.raise} = {
+  let got = read[r](cache, t_reviews(), named_key(def), named_bin(review_bin()), "review");
   match got.value {
     Some(n) -> { value: if n.name == def { Some(n.value) } else { None }, cache: got.cache },
     None -> { value: None, cache: got.cache },
   }
 }
 
-pub fn put_review(c: Cache, def: String, r: Review) -> Cache / {abort.raise} =
-  write(c, t_reviews(), named_key(def), named_bin(review_bin()), { name: def, value: r })
+pub fn put_review(cache: Cache, def: String, r: Review) -> Cache / {abort.raise} =
+  write(cache, t_reviews(), named_key(def), named_bin(review_bin()), { name: def, value: r })
 
 // --- The shipped modules ----------------------------------------------------
 
 fn shipped_key() -> Bytes = named_key("shipped")
 
-pub fn shipped_digest<[r]>(c: Cache) -> Read<String> / {fs.read[r], abort.raise} =
-  read[r](c, t_shipped(), shipped_key(), bin::string_bin(), "shipped modules' digest")
+pub fn shipped_digest<[r]>(cache: Cache) -> Read<String> / {fs.read[r], abort.raise} =
+  read[r](cache, t_shipped(), shipped_key(), bin::string_bin(), "shipped modules' digest")
 
-pub fn put_shipped_digest(c: Cache, d: String) -> Cache / {abort.raise} =
-  write(c, t_shipped(), shipped_key(), bin::string_bin(), d)
+pub fn put_shipped_digest(cache: Cache, d: String) -> Cache / {abort.raise} =
+  write(cache, t_shipped(), shipped_key(), bin::string_bin(), d)
 
 // --- The last filing ------------------------------------------------------------
 
@@ -645,21 +659,21 @@ fn load_key() -> Bytes = named_key("load")
 
 // The digest of everything the last filing's load read: a load that reads the same has nothing new
 // to file.
-pub fn filed_load<[r]>(c: Cache) -> Read<Bytes> / {fs.read[r], abort.raise} =
-  read[r](c, t_loads(), load_key(), bin::bytes_bin(), "last filing's load")
+pub fn filed_load<[r]>(cache: Cache) -> Read<Bytes> / {fs.read[r], abort.raise} =
+  read[r](cache, t_loads(), load_key(), bin::bytes_bin(), "last filing's load")
 
-pub fn put_filed_load<[r]>(c: Cache, digest: Bytes) -> Cache / {fs.read[r], abort.raise} =
-  renew[r](c, t_loads(), load_key(), bin::bytes_bin(), digest)
+pub fn put_filed_load<[r]>(cache: Cache, digest: Bytes) -> Cache / {fs.read[r], abort.raise} =
+  renew[r](cache, t_loads(), load_key(), bin::bytes_bin(), digest)
 
 fn priors_key() -> Bytes = named_key("priors")
 
 // What the last filing's hashing answered for each node it hashed, as the front end encodes it,
 // with the bodies left to the bodies table: a later load hashes a node again only where it moved.
-pub fn filed_priors<[r]>(c: Cache) -> Read<Bytes> / {fs.read[r], abort.raise} =
-  read[r](c, t_priors(), priors_key(), bin::bytes_bin(), "last filing's hashing")
+pub fn filed_priors<[r]>(cache: Cache) -> Read<Bytes> / {fs.read[r], abort.raise} =
+  read[r](cache, t_priors(), priors_key(), bin::bytes_bin(), "last filing's hashing")
 
-pub fn put_filed_priors<[r]>(c: Cache, encoded: Bytes) -> Cache / {fs.read[r], abort.raise} =
-  renew[r](c, t_priors(), priors_key(), bin::bytes_bin(), encoded)
+pub fn put_filed_priors<[r]>(cache: Cache, encoded: Bytes) -> Cache / {fs.read[r], abort.raise} =
+  renew[r](cache, t_priors(), priors_key(), bin::bytes_bin(), encoded)
 
 // --- Upkeep -----------------------------------------------------------------
 
@@ -675,17 +689,17 @@ pub type Counts = {
   reviews: Int,
 }
 
-pub fn counts(c: Cache) -> Counts / {abort.raise} =
+pub fn counts(cache: Cache) -> Counts / {abort.raise} =
   {
-    sources: len(keys(c.store, t_sources())),
-    defs: len(keys(c.store, t_defs())),
-    decls: len(keys(c.store, t_decls())),
-    bodies: len(keys(c.store, t_bodies())),
-    passed: len(keys(c.store, t_passed())),
-    pass_records: len(keys(c.store, t_pass_records())),
-    seen: len(keys(c.store, t_seen())),
-    evidence: len(keys(c.store, t_evidence())),
-    reviews: len(keys(c.store, t_reviews())),
+    sources: len(keys(cache.store, t_sources())),
+    defs: len(keys(cache.store, t_defs())),
+    decls: len(keys(cache.store, t_decls())),
+    bodies: len(keys(cache.store, t_bodies())),
+    passed: len(keys(cache.store, t_passed())),
+    pass_records: len(keys(cache.store, t_pass_records())),
+    seen: len(keys(cache.store, t_seen())),
+    evidence: len(keys(cache.store, t_evidence())),
+    reviews: len(keys(cache.store, t_reviews())),
   }
 
 pub type Pruned = { sources: Int, defs: Int, decls: Int, bodies: Int }
@@ -707,22 +721,22 @@ fn reached(live: Live, names: Map<String, Bytes>) -> Live =
 // Drops the fingerprints of files outside `keep` and every interface and body that neither a
 // surviving fingerprint nor a pass record reaches. Call only once every file of the program is known.
 pub fn prune<[r]>(
-  c: Cache,
+  cache: Cache,
   keep: List<String>,
 ) -> { pruned: Pruned, cache: Cache } / {fs.read[r], abort.raise} = {
   let kept = fold(keep, map_new(), |m: Map<String, Bool>, k: String| map_insert(m, k, true));
   let kept_keys = map_fold(kept, map_new(), |m: Map<Bytes, Bool>, k: String, v: Bool|
     map_insert(m, named_key(k), true));
-  let stray = fold(keys(c.store, t_sources()), false, |any: Bool, k: Bytes|
+  let stray = fold(keys(cache.store, t_sources()), false, |any: Bool, k: Bytes|
     any || !map_contains(kept_keys, k));
-  let refiled = map_fold(c.store.puts, false, |any: Bool, sl: Bytes, p: Bytes|
+  let refiled = map_fold(cache.store.puts, false, |any: Bool, sl: Bytes, p: Bytes|
     any || bytes_at(sl, 0) == t_sources());
   // Nothing can have become unreachable when every file was kept and none was filed again.
-  if !stray && !refiled { { pruned: { sources: 0, defs: 0, decls: 0, bodies: 0 }, cache: c } }
+  if !stray && !refiled { { pruned: { sources: 0, defs: 0, decls: 0, bodies: 0 }, cache: cache } }
   else {
     let walked = fold(
-      keys(c.store, t_sources()),
-      { live: { hashes: map_new(), pairs: map_new() }, cache: c, dropped: 0 },
+      keys(cache.store, t_sources()),
+      { live: { hashes: map_new(), pairs: map_new() }, cache: cache, dropped: 0 },
       |acc: Walk, k: Bytes| {
         let got = read[r](acc.cache, t_sources(), k, fingerprint_bin(), "fingerprint");
         match got.value {
@@ -776,7 +790,7 @@ pub fn prune<[r]>(
         {
           cache: {
             ..acc.cache,
-            store: fold(dead, acc.cache.store, |s: Store, k: Bytes| drop(s, t, k)),
+            store: fold(dead, acc.cache.store, |store: Store, k: Bytes| drop(store, t, k)),
           },
           gone: push(acc.gone, len(dead)),
         }
@@ -812,11 +826,11 @@ fn hash_matches(hash: Bytes, prefix: Option<String>) -> Bool / {abort.raise} =
   match prefix { Some(p) -> string_starts_with(hex_of(hash), p), None -> false }
 
 // A program-wide name, a name as its module wrote it, or a prefix of a hash's hex.
-pub fn lookup<[r]>(c: Cache, query: String) -> Read<List<Match>> / {fs.read[r], abort.raise} = {
+pub fn lookup<[r]>(cache: Cache, query: String) -> Read<List<Match>> / {fs.read[r], abort.raise} = {
   let prefix = hex_prefix(query);
   fold(
-    keys(c.store, t_sources()),
-    { value: Some([]), cache: c },
+    keys(cache.store, t_sources()),
+    { value: Some([]), cache: cache },
     |acc: Read<List<Match>>, k: Bytes| {
       let got = read[r](acc.cache, t_sources(), k, fingerprint_bin(), "fingerprint");
       let held = match acc.value { Some(xs) -> xs, None -> [] };
@@ -840,15 +854,15 @@ pub fn lookup<[r]>(c: Cache, query: String) -> Read<List<Match>> / {fs.read[r], 
 
 pub type Usage = { counts: Counts, data_bytes: Int, live_bytes: Int }
 
-pub fn usage(c: Cache) -> Usage / {abort.raise} = {
-  let s = stats(c.store);
-  { counts: counts(c), data_bytes: s.data_bytes, live_bytes: s.live_bytes }
+pub fn usage(cache: Cache) -> Usage / {abort.raise} = {
+  let s = stats(cache.store);
+  { counts: counts(cache), data_bytes: s.data_bytes, live_bytes: s.live_bytes }
 }
 
 pub fn compact_cache<[r]>(
-  c: Cache,
+  cache: Cache,
 ) -> Cache / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  { ..c, store: compact[r](c.store) }
+  { ..cache, store: compact[r](cache.store) }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -958,8 +972,8 @@ test "prune keeps what the kept files and the pass records reach, and drops the 
       print("gone.ply", ["m.gone"]),
     );
     let c2 = put_pass_record(c1, "m.t", record(["m.passed"]));
-    let c3 = fold(["m.a", "m.gone", "m.passed", "m.orphan"], c2, |c: Cache, n: String|
-      put_def[mem](c, h(n), n, b"v"));
+    let c3 = fold(["m.a", "m.gone", "m.passed", "m.orphan"], c2, |cache: Cache, n: String|
+      put_def[mem](cache, h(n), n, b"v"));
     let c4 = put_body(c3, key_of_body(solo(b"orphan")), solo(b"orphan"));
     let p = prune[mem](flush_cache[mem](c4), ["a.ply"]);
     let after = open_cache[mem]("cache", "", [], built());

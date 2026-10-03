@@ -24,8 +24,8 @@ fn main() -> Unit = assert_eq(greeting(), "hello from ply")
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a project root, defaulting to `.`.
 `ply check --types` prints every definition's inferred signature, each atom of
-its row marked with how many times a call performs it (§6.2), and `div` on one
-whose calls may not return (§5.10).
+its row marked with how many times a call performs it (§6.2), and `diverges` on
+one whose calls may not return (§5.10).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
 `demo/main.ply` — a manifest (§3.3), a `main` and one test — and `cd demo &&
@@ -314,8 +314,9 @@ root package squatting on a dependency's prefix — and a cycle of packages is
 package root: `rev` may be a commit, a tag or a branch, and a branch means what
 it means the day it is fetched — the fetched tree is reused without asking the
 remote again, so a cleared cache is what picks up a moved branch, and `ply.lock`'s
-digest is what catches it when that happens. A fetch that git cannot do is
-`E0140`.
+digest is what catches it when that happens. The fetch runs the `git` on
+`PATH`, with the run's own environment. A fetch that git cannot do, or a run
+with no `git` to do it, leaves a dependency that was not fetched (`E0135`).
 
 A `Registry` dependency is the package of that `name` from the registry
 `PLY_REGISTRY` names (§15.1), at least `min`; its `name` must be a package name
@@ -838,24 +839,46 @@ fn halves(n: Int) -> Int
 The checker reads each recursive group, mutual recursion included, for a
 measure that every loop of calls back into the group lowers (size-change
 termination): a part of an argument — a constructor's field, a record's field,
-a list's element or tail, at any depth, and an element `map`, `filter` or
-`fold` hands a callback — or an integer moving toward a bound that a guard on
-the way to the call holds it beyond, as `down` does, or as
-`if i >= len(xs) { .. } else { walk(xs, i + 1) }` does. A loop may lower
-different measures at different calls, as Ackermann's function does. A guard
-of `n == 0` bounds nothing: from `-1`, `n - 1` never meets it. A member of the
-group handed as a value to anything but those builtins is called with nothing
-known, and so is one inside a lambda, whose parameters are unknown.
+a list's element or tail, a map's key, value or entry, at any depth — or an
+integer moving toward a bound that a guard on the way to the call holds it
+beyond, as `down` does, or as `if i >= len(xs) { .. } else { walk(xs, i + 1) }`
+does. A quotient by a literal greater than one, a shift right by one, and a
+remainder by the measure itself lower an integer the guard holds at one or
+more. A loop may lower different measures at different calls, as Ackermann's
+function does, and a guard in one member of a group bounds the loops through
+the others. A guard of `n == 0` bounds nothing: from `-1`, `n - 1` never
+meets it.
+
+A guard is a condition on the way to the call: an `if`, a `match` arm's guard,
+the failed guard of an earlier arm whose pattern always matches, a condition
+matched against `true` or `false`, or `list_at` or `array_at` answering
+`Some`, which holds the index below the length. `list_set` and `array_set`
+keep the length. A list written of parts, one they are pushed onto, one
+`filter` keeps, one `map` makes of a part of each element, and what `fold`
+answers when each step answers the accumulator or a part (a lookup that starts
+at `None`) are made of parts: each element is a part, though neither the list
+nor its tail need be smaller than what its parts are parts of.
+
+A function handed to `map`, `filter` or `fold` is called with each element; one
+handed to a definition outside the group is called as that definition calls
+it, with the parts of its arguments it hands on; and a lambda bound by `let` is
+read where it is called. A member of the group handed anywhere else, or one
+called from a lambda whose calls the checker cannot see, is called with nothing
+known.
 
 A definition whose group descends ends, and so does one calling only
-definitions that end. `ply check --types` marks `div` on any other: its group
-is not seen to descend, or it calls a definition that may not return.
+definitions that end. `ply check --types` marks `diverges` on any other and
+says why, at the call's place: its own recursion is not seen to descend there,
+or it calls there a definition, which it names, that may not return. `ply check
+--json` gives each definition's `ending`: its `kind` (`ends`, `stated` or
+`diverges`) and, for one that diverges, `through` and `at`.
 
 `decreases <measure>`, after the other clauses, states an `Int` over the
 parameters that every call the group makes back into itself lowers while it
 stays non-negative; a group that descends with its stated measures counted is
 read as ending, and the checker takes the measure at its word. It is pure, as a
-clause is (`E0417`), and writing one moves no hash.
+clause is (`E0417`), and part of the definition's hash, since it decides what
+the definition is read to do.
 
 ## 6. Effects and handlers
 
@@ -875,7 +898,7 @@ nondet effect clock {
 Each operation is `read` or `write`. `[r]` makes it resource-parameterized: a
 perform must supply a label (`E0304`). `nondet` marks results that are not a
 function of program state (§8.3). Effects are nominal. `task`, `clock`,
-`random`, `sim`, `abort`, `div` and `cell` are taken (`E0105`).
+`random`, `sim`, `abort`, `diverges` and `cell` are taken (`E0105`).
 
 An operation's type parameters sit just before its parameters,
 `read take[r]<a>(key: Int) -> a`, and are its only type variables: its
@@ -891,7 +914,7 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `/ {store::db.read[users]}`. An atom may instead name an operation,
 `net.send[conn]`, which the mode atom of the same effect and resource
 (`net.write[conn]`) covers; naming an operation the effect does not declare is
-`E0104`. `div`, written bare, is the atom of a call that may not return
+`E0104`. `diverges`, written bare, is the atom of a call that may not return
 (§5.10); it names no operation, and nothing handles it.
 
 An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
@@ -1235,6 +1258,15 @@ answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, eac
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.
 
+The report is printed as the run goes. Before a test runs come what was selected
+and how it will run: the groups and workers, isolation, the host binding, and
+what `--explain` says of the selection. Each group's results follow as that
+group finishes, in the order the groups ran, so a long run shows its progress
+and its first failure. Then come the run's own figures (handshakes, the backend,
+the simulation, and with `--explain` where its time went), the summary, and each
+failure's diagnosis. `--json` writes its one object when the run ends, and
+`--workspace` prints each package's heading before it runs.
+
 `--steps N` is the calls each test may make (default 1000000000; `0` is no
 bound); a test past it fails with `E0503`, which is a program error like any
 other, and is recorded as one, because the count is a property of the program.
@@ -1289,7 +1321,8 @@ rather than raised.
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
-| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, and allocation counts |
+| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, and allocation counts by kind |
+| `PLY_HEAP_CENSUS=1` | count allocations by constructor, record shape and length class as well, which `PLY_C_PHASES` then prints; a map insert per allocation |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 
@@ -3168,7 +3201,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`), `edit` or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3460,7 +3493,7 @@ An allocation with no `ply_*` frame on its stack is counted under the site
 `<no ply frame>`.
 What a host may lend is a policy with names, one family each:
 `machine` (load, bind, enter and call a nested program), `tester`, `claims`,
-`builder`, `hosts`, `edit` and `shipped`, each with a summary a
+`builder`, `hosts` and `shipped`, each with a summary a
 reviewer can read. The launcher lends its own program every family; another host
 names the ones it means, so `machine` — which drives another machine — is
 granted on purpose and not by accident. A program lent `machine` hands it a
@@ -3512,7 +3545,7 @@ picks its entry anew, and reports exactly what a run that built the answer
 reports. Any edit to a module, a dependency or a manifest, another schema or
 another `ply` is a new key, and the front end runs again; `ply.lock` is not
 read by a run and is not in the key. A single `.ply` file keys that one module.
-The answers live under the stage root (`PLY_C_STAGE`, §8.6) in `run-fronts/`,
+The answers live under the stage root (`PLY_C_STAGE`, §8.6) in `reused/`,
 one file per key, each written beside itself and renamed into place, so two runs
 of one package never read half of one; an entry that does not read is rebuilt
 and written over. They are swept with the stages, least recently used first, down to
@@ -3522,7 +3555,7 @@ the front end, filing into `.ply-cache` and the machine's load each took, on
 stderr before the entry runs, or as `front_end` in the `--json` document.
 
 `ply check` takes its own answer back the same way. A check the front end
-answered whole is filed in `run-fronts/` under the walk's key, the interface
+answered whole is filed in `reused/` under the walk's key, the interface
 each registry dependency's slot holds, the paths its reports name, and the flags
 that shape what it prints (`--types`, `--costs`, `--json`, `--verify-deps`,
 color). What the front-end cache said of itself (`W0601`, `W0602`, `W0603`,
@@ -3531,8 +3564,10 @@ has nothing to say about it. A later check whose key matches prints that answer
 and exits with its code without running the front end, so a tree unchanged since
 its last check is answered in the time its walk takes. `--explain` always checks
 afresh, since what it reports is this run's. In the `--json` document,
-`front_end` carries `reused` and `key`: beside the phases of a check that ran,
-and alone for an answer taken back.
+`front_end` carries `reused` and `key`: alone for an answer taken back, and
+beside the phases of a check that ran, with `filed`, whether the next check can
+take its answer back (false for a refused load, or when the entry could not be
+written).
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
@@ -3624,7 +3659,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0137` | one package reached at two places, where a closure pins one version |
 | `E0138` | a dependency whose sources are not what `ply.lock` pinned |
 | `E0139` | a `ply.lock` that does not decode or is from another format |
-| `E0140` | a git dependency that could not be fetched |
 | `E0141` | a registry that could not be asked: unset, malformed or not answering |
 | `E0142` | a registry archive that is not the one the lock pins or the index lists |
 | `E0143` | a registry dependency no published version satisfies |

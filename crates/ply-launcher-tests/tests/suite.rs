@@ -20,7 +20,7 @@ nondet effect env {
   read pwd[e]() -> String
   read shipped_digest[e]() -> String
   read builder_digest[e]() -> String
-  read fronts[e]() -> String
+  read reused[e]() -> String
   read bodies[e]() -> String
 }
 

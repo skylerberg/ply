@@ -1,7 +1,7 @@
 //! The evaluator, and the runtime's vocabulary: spans, diagnostics and their codes, and the
 //! program record the compiler answers with.
 
-// `Value` mixes `Arc` payloads with `Rc`-backed persistent maps, so it is never `Send` by design.
+// `Value` mixes `Arc` payloads with a task handle's `Rc`, so it is never `Send` by design.
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod arena;
@@ -67,9 +67,9 @@ pub use host::{
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{
-    Analysis, CheckOutput, DefInfo, DefWritten, EffectInfo, EmitterRoot, LawInfo, ModuleInfo,
-    ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility, WrittenParam,
-    is_ident, is_ident_continue, is_ident_start,
+    Analysis, CheckOutput, DefInfo, EffectInfo, EmitterRoot, LawInfo, ModuleInfo, ModuleName,
+    OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility, is_ident, is_ident_continue,
+    is_ident_start,
 };
 pub use rc::RcStats;
 pub use region::{Interleaving, SimId, Verdict};
