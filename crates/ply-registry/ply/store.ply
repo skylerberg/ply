@@ -1,9 +1,11 @@
 // The registry's tree, under the root `--fs store=DIR` binds: a directory per package holding its
-// `index.json`, and a directory per version holding the archive and the line naming its digest.
+// `index.json`, and a directory per version holding the archive, the line naming its digest, and
+// the interface its publisher cut under each semantics.
 //
 //   <name>/index.json
 //   <name>/<version>/package.plyz
 //   <name>/<version>/package.plyz.b3
+//   <name>/<version>/interface/<semantics>
 //
 // Every write goes through here, and a version is published by the index write that lists it: an
 // archive the index does not list is one a publish did not finish, and the next publish of that
@@ -21,6 +23,11 @@ pub fn archive_path(name: String, version: String) -> String =
   name ++ "/" ++ version ++ "/package.plyz"
 
 pub fn digest_path(name: String, version: String) -> String = archive_path(name, version) ++ ".b3"
+
+fn interface_dir(name: String, version: String) -> String = name ++ "/" ++ version ++ "/interface"
+
+pub fn interface_path(name: String, version: String, semantics: String) -> String =
+  interface_dir(name, version) ++ "/" ++ semantics
 
 // Beside the index, so a lock never needs a directory of its own; no route reads it.
 fn lock_path(name: String) -> String = name ++ "/index.lock"
@@ -77,12 +84,13 @@ fn locked<a | e>(
   }
 
 /// A version published: the archive and its digest line written, then the index that lists it.
-/// A version the index already lists is refused, whatever the bytes: a version never changes.
+/// A version the index already lists is refused unless it is these bytes again, which is the
+/// publish it already holds: a version never changes. `fresh` says whether this one wrote it.
 pub fn published(
   name: String,
   r: Release,
   archive: Bytes,
-) -> Result<Index, Trouble> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store]} =
+) -> Result<{ index: Index, fresh: Bool }, Trouble> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store]} =
   locked(name, || {
     let version = render_version(r.version);
     match index_of(name) {
@@ -90,7 +98,8 @@ pub fn published(
       Ok(held) -> {
         let before = match held { Some(x) -> x, None -> { name: name, versions: [] } };
         match release_of(before, r.version) {
-          Some(_) -> Err(Exists),
+          Some(listed) -> if listed.digest == r.digest { Ok({ index: before, fresh: false }) }
+          else { Err(Exists) },
           None -> {
             let after = appended(before, r);
             if !fs.create_dir[store](name ++ "/" ++ version) {
@@ -101,12 +110,40 @@ pub fn published(
               Err(Unwritten(digest_path(name, version)))
             } else if !replaced(index_path(name), to_bytes(index_json().encode(after))) {
               Err(Unwritten(index_path(name)))
-            } else { Ok(after) }
+            } else { Ok({ index: after, fresh: true }) }
           },
         }
       },
     }
   })
+
+/// The interface of a published version under one semantics. It is a function of the archive and
+/// the semantics, so the same bytes again are the one it holds and other bytes are refused.
+pub fn interfaced(
+  name: String,
+  v: Version,
+  semantics: String,
+  body: Bytes,
+) -> Result<Bool, Trouble> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store]} =
+  locked(name, ||
+    match index_of(name) {
+      Err(why) -> Err(Unreadable(why)),
+      Ok(None) -> Err(Absent),
+      Ok(Some(x)) -> match release_of(x, v) {
+        None -> Err(Absent),
+        Some(_) -> {
+          let version = render_version(v);
+          let path = interface_path(name, version, semantics);
+          match fs.read_file[store](path) {
+            Some(held) -> if held == body { Ok(false) } else { Err(Exists) },
+            None -> if !fs.create_dir[store](interface_dir(name, version)) {
+              Err(Unwritten(interface_dir(name, version)))
+            } else if replaced(path, body) { Ok(true) }
+            else { Err(Unwritten(path)) },
+          }
+        },
+      },
+    })
 
 /// A version yanked. Yanking one already yanked is the same answer, and the archive is untouched.
 pub fn yank(
@@ -150,7 +187,10 @@ test "a publish writes the archive and its digest line, and the index lists it n
     (first, second)
   });
   match ran.value {
-    (Ok(_), Ok(x)) -> assert_eq(versions_of(x), ["0.2.0", "0.1.1"]),
+    (Ok(_), Ok(x)) -> {
+      assert_eq(versions_of(x.index), ["0.2.0", "0.1.1"]);
+      assert(x.fresh)
+    },
     _ -> panic("two new versions were refused"),
   };
   assert_eq(fs::mem_read(ran.tree, "orders/0.2.0/package.plyz"), Some(b"two"));
@@ -161,17 +201,40 @@ test "a publish writes the archive and its digest line, and the index lists it n
   }
 }
 
-test "a version is published once, and a second publish of it changes nothing" {
+test "a version is published once: the same bytes again are what it holds, other bytes are refused" {
   let ran = twin::over(fs::mem_empty(), || {
     let first = published("orders", a_release("0.2.0"), b"two");
-    let again = published("orders", { ..a_release("0.2.0"), digest: "b3:other" }, b"other");
-    (first, again)
+    let same = published("orders", a_release("0.2.0"), b"two");
+    let other = published("orders", { ..a_release("0.2.0"), digest: "b3:other" }, b"other");
+    (first, same, other)
   });
   match ran.value {
-    (Ok(_), Err(Exists)) -> (),
+    (Ok(a), Ok(b), Err(Exists)) -> {
+      assert(a.fresh);
+      assert(!b.fresh);
+      assert_eq(a.index, b.index)
+    },
     _ -> panic("a published version was published again"),
   };
   assert_eq(fs::mem_read(ran.tree, "orders/0.2.0/package.plyz"), Some(b"two"))
+}
+
+test "an interface is kept beside a published version, once per semantics" {
+  let ran = twin::over(fs::mem_empty(), || {
+    let unpublished = interfaced("orders", at_version("0.2.0"), "s1", b"iface");
+    published("orders", a_release("0.2.0"), b"two");
+    let first = interfaced("orders", at_version("0.2.0"), "s1", b"iface");
+    let same = interfaced("orders", at_version("0.2.0"), "s1", b"iface");
+    let other = interfaced("orders", at_version("0.2.0"), "s1", b"other");
+    let later = interfaced("orders", at_version("0.2.0"), "s2", b"later");
+    (unpublished, first, same, other, later)
+  });
+  match ran.value {
+    (Err(Absent), Ok(true), Ok(false), Err(Exists), Ok(true)) -> (),
+    _ -> panic("an interface was not kept as it should be"),
+  };
+  assert_eq(fs::mem_read(ran.tree, "orders/0.2.0/interface/s1"), Some(b"iface"));
+  assert_eq(fs::mem_read(ran.tree, "orders/0.2.0/interface/s2"), Some(b"later"))
 }
 
 test "a yank sets one field and keeps the archive; a version never published cannot be yanked" {

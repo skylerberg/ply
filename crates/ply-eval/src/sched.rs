@@ -3,11 +3,11 @@
 use crate::host::{HostBinding, HostRuntime, MachineId, Pending};
 use crate::region::SimId;
 use crate::region::{StepSite, Trail};
-use crate::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
+use crate::sim::{Access, ChanId, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use crate::value::Value;
 use crate::{Diagnostic, Span, codes};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::{Rc, Weak};
 
 /// The task a `simulate` region's own body runs as.
@@ -109,6 +109,23 @@ impl Drop for Held {
     }
 }
 
+/// A `Chan` value: its region and its id, since every region numbers its own channels.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ChanHandle {
+    pub region: SimId,
+    pub id: ChanId,
+}
+
+/// A bounded queue between tasks. A blocked sender's value waits in its [`Wait::Send`].
+struct Channel {
+    capacity: usize,
+    /// Sent and not yet received, each with its sender's vector clock as of the send.
+    queue: VecDeque<(Value, Stamp)>,
+    senders: VecDeque<TaskId>,
+    receivers: VecDeque<TaskId>,
+    closed: bool,
+}
+
 fn release(released: &Released, id: TaskId) {
     let mut ids = released.take();
     ids.push(id);
@@ -132,6 +149,16 @@ enum Wait {
     },
     Host {
         pending: Pending,
+        span: Span,
+    },
+    /// A send to a full channel, holding what it sends until a receive makes room.
+    Send {
+        chan: ChanId,
+        value: Value,
+        span: Span,
+    },
+    Recv {
+        chan: ChanId,
         span: Span,
     },
 }
@@ -215,9 +242,12 @@ pub struct Scheduler<K, B> {
     ready: BTreeSet<TaskId>,
     /// Each host token a task waits on, and the task.
     parked: BTreeMap<u64, TaskId>,
+    channels: BTreeMap<ChanId, Channel>,
     unfinished: usize,
     /// The next spawn's id: ids are never reused, so host state keyed on one never passes on.
     next_id: u64,
+    /// The next channel's id. One past a channel not in `channels` is spent: closed and empty.
+    next_chan: u64,
     released: Rc<Released>,
     /// The machine whose host state a retired task ends; `None` for a seeded region.
     machine: Option<MachineId>,
@@ -261,8 +291,10 @@ impl<K, B> Scheduler<K, B> {
             )]),
             ready: BTreeSet::from([ROOT]),
             parked: BTreeMap::new(),
+            channels: BTreeMap::new(),
             unfinished: 1,
             next_id: ROOT.0 + 1,
+            next_chan: 0,
             released: Rc::new(Cell::new(Vec::new())),
             machine,
             max_steps,
@@ -722,6 +754,16 @@ impl<K, B> Scheduler<K, B> {
                     Wait::Host { pending, .. } => {
                         self.parked.remove(&pending.token);
                     }
+                    Wait::Send { chan, .. } => {
+                        if let Some(ch) = self.channels.get_mut(&chan) {
+                            ch.senders.retain(|t| *t != target);
+                        }
+                    }
+                    Wait::Recv { chan, .. } => {
+                        if let Some(ch) = self.channels.get_mut(&chan) {
+                            ch.receivers.retain(|t| *t != target);
+                        }
+                    }
                 }
                 self.make_ready(target, Resumption::Cancel { k });
                 (true, None)
@@ -787,6 +829,268 @@ impl<K, B> Scheduler<K, B> {
             release(&self.released, task);
         }
         Ok(())
+    }
+
+    /// A channel holding up to `capacity` values no receiver has taken; `0` is a rendezvous.
+    pub fn channel(&mut self, k: K, capacity: i64, span: Span) -> Result<(), Diagnostic> {
+        let task = self.running()?;
+        let Ok(capacity) = usize::try_from(capacity) else {
+            return Err(Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                format!("a channel cannot hold {capacity} values"),
+            )
+            .primary(span, "made here")
+            .note(
+                "a capacity is how many sent values may wait for a receiver; `0` is a rendezvous",
+            ));
+        };
+        let id = ChanId(self.next_chan);
+        self.next_chan += 1;
+        self.channels.insert(
+            id,
+            Channel {
+                capacity,
+                queue: VecDeque::new(),
+                senders: VecDeque::new(),
+                receivers: VecDeque::new(),
+                closed: false,
+            },
+        );
+        let handle = ChanHandle {
+            region: self.region,
+            id,
+        };
+        self.answer(task, k, Value::Chan(handle))
+    }
+
+    /// Hands `value` to the longest-waiting receiver, or queues it while there is room; otherwise
+    /// the task waits for a receive to make room. Answers `false`, sending nothing, once closed.
+    pub fn send(
+        &mut self,
+        k: K,
+        chan: &ChanHandle,
+        value: Value,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let task = self.running()?;
+        let id = self.channel_of(chan, span)?;
+        let stamp = self.stamp_of(task);
+        let Some(ch) = self.channels.get_mut(&id) else {
+            return self.answer(task, k, Value::Bool(false));
+        };
+        if ch.closed {
+            return self.answer(task, k, Value::Bool(false));
+        }
+        if let Some(receiver) = ch.receivers.pop_front() {
+            let kr = self.unblock(receiver)?;
+            self.absorb(receiver, task);
+            self.make_ready(
+                receiver,
+                Resumption::Resume {
+                    k: kr,
+                    value: some(value),
+                },
+            );
+            return self.answer(task, k, Value::Bool(true));
+        }
+        if ch.queue.len() < ch.capacity {
+            ch.queue.push_back((value, stamp));
+            return self.answer(task, k, Value::Bool(true));
+        }
+        ch.senders.push_back(task);
+        self.task_mut(task)?.state = TaskState::Blocked {
+            wait: Wait::Send {
+                chan: id,
+                value,
+                span,
+            },
+            k,
+        };
+        self.current = None;
+        Ok(())
+    }
+
+    /// Takes the oldest value sent, `None` once the channel is closed and empty; otherwise the task
+    /// waits for a send.
+    pub fn recv(&mut self, k: K, chan: &ChanHandle, span: Span) -> Result<(), Diagnostic> {
+        let task = self.running()?;
+        let id = self.channel_of(chan, span)?;
+        enum Taken {
+            Queued(Value, Stamp),
+            From(TaskId),
+            Closed,
+            Waits,
+        }
+        let taken = match self.channels.get_mut(&id) {
+            None => Taken::Closed,
+            Some(ch) => {
+                if let Some((value, stamp)) = ch.queue.pop_front() {
+                    Taken::Queued(value, stamp)
+                } else if let Some(sender) = ch.senders.pop_front() {
+                    Taken::From(sender)
+                } else if ch.closed {
+                    Taken::Closed
+                } else {
+                    ch.receivers.push_back(task);
+                    Taken::Waits
+                }
+            }
+        };
+        match taken {
+            Taken::Queued(value, stamp) => {
+                self.absorb_stamp(task, &stamp);
+                // The room this made takes the longest-waiting sender's value.
+                let waiting = self
+                    .channels
+                    .get_mut(&id)
+                    .and_then(|ch| ch.senders.pop_front());
+                if let Some(sender) = waiting {
+                    let (ks, sent) = self.unblock_sender(sender)?;
+                    let sent_at = self.stamp_of(sender);
+                    if let Some(ch) = self.channels.get_mut(&id) {
+                        ch.queue.push_back((sent, sent_at));
+                    }
+                    self.absorb(sender, task);
+                    self.make_ready(
+                        sender,
+                        Resumption::Resume {
+                            k: ks,
+                            value: Value::Bool(true),
+                        },
+                    );
+                }
+                self.retire_if_spent(id);
+                self.answer(task, k, some(value))
+            }
+            Taken::From(sender) => {
+                let (ks, sent) = self.unblock_sender(sender)?;
+                self.absorb(task, sender);
+                self.absorb(sender, task);
+                self.make_ready(
+                    sender,
+                    Resumption::Resume {
+                        k: ks,
+                        value: Value::Bool(true),
+                    },
+                );
+                self.answer(task, k, some(sent))
+            }
+            Taken::Closed => self.answer(task, k, none()),
+            Taken::Waits => {
+                self.task_mut(task)?.state = TaskState::Blocked {
+                    wait: Wait::Recv { chan: id, span },
+                    k,
+                };
+                self.current = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Ends sending: each waiting receiver hears `None` and each waiting sender `false`, while
+    /// what was queued before stays to be received. Closing a closed channel changes nothing.
+    pub fn close(&mut self, k: K, chan: &ChanHandle, span: Span) -> Result<(), Diagnostic> {
+        let task = self.running()?;
+        let id = self.channel_of(chan, span)?;
+        let (receivers, senders) = match self.channels.get_mut(&id) {
+            None => (VecDeque::new(), VecDeque::new()),
+            Some(ch) => {
+                ch.closed = true;
+                (
+                    std::mem::take(&mut ch.receivers),
+                    std::mem::take(&mut ch.senders),
+                )
+            }
+        };
+        for receiver in receivers {
+            let kr = self.unblock(receiver)?;
+            self.absorb(receiver, task);
+            self.make_ready(
+                receiver,
+                Resumption::Resume {
+                    k: kr,
+                    value: none(),
+                },
+            );
+        }
+        for sender in senders {
+            let (ks, _) = self.unblock_sender(sender)?;
+            self.absorb(sender, task);
+            self.make_ready(
+                sender,
+                Resumption::Resume {
+                    k: ks,
+                    value: Value::Bool(false),
+                },
+            );
+        }
+        self.retire_if_spent(id);
+        self.answer(task, k, Value::Unit)
+    }
+
+    /// The channel a handle names in this region, which may be spent.
+    fn channel_of(&self, chan: &ChanHandle, span: Span) -> Result<ChanId, Diagnostic> {
+        if chan.region != self.region {
+            return Err(err_foreign_channel(span, chan.id));
+        }
+        if chan.id.0 >= self.next_chan {
+            return Err(self.internal(format!("{} is not a channel of this region", chan.id)));
+        }
+        Ok(chan.id)
+    }
+
+    /// A closed channel with nothing queued and nobody waiting answers as a spent one does.
+    fn retire_if_spent(&mut self, id: ChanId) {
+        if self.channels.get(&id).is_some_and(|ch| {
+            ch.closed && ch.queue.is_empty() && ch.senders.is_empty() && ch.receivers.is_empty()
+        }) {
+            self.channels.remove(&id);
+        }
+    }
+
+    /// A sender waiting on a full channel, resumed: its continuation and the value it held.
+    fn unblock_sender(&mut self, task: TaskId) -> Result<(K, Value), Diagnostic> {
+        let t = self.task_mut(task)?;
+        match std::mem::replace(&mut t.state, TaskState::Running) {
+            TaskState::Blocked {
+                wait: Wait::Send { value, .. },
+                k,
+            } => Ok((k, value)),
+            other => {
+                t.state = other;
+                Err(self.internal(format!("{task} was taken as a sender but was not sending")))
+            }
+        }
+    }
+
+    /// Readies the running task with `value` and gives control back.
+    fn answer(&mut self, task: TaskId, k: K, value: Value) -> Result<(), Diagnostic> {
+        self.make_ready(task, Resumption::Resume { k, value });
+        self.current = None;
+        Ok(())
+    }
+
+    fn stamp_of(&self, task: TaskId) -> Stamp {
+        self.tasks
+            .get(&task)
+            .map(|t| t.stamp.clone())
+            .unwrap_or_default()
+    }
+
+    /// `into` has observed the step whose clock `stamp` is.
+    fn absorb_stamp(&mut self, into: TaskId, stamp: &Stamp) {
+        if self.policy != Policy::Seeded {
+            return;
+        }
+        let Some(target) = self.tasks.get_mut(&into) else {
+            return;
+        };
+        if target.stamp.len() < stamp.len() {
+            target.stamp.resize(stamp.len(), 0);
+        }
+        for (slot, seen) in target.stamp.iter_mut().zip(stamp) {
+            *slot = (*slot).max(*seen);
+        }
     }
 
     fn waiting_on(&self, task: TaskId) -> Option<&Wait> {
@@ -994,6 +1298,14 @@ impl<K, B> Scheduler<K, B> {
                     *span,
                     format!("{id} waits here on host operation {pending}"),
                 ),
+                Wait::Send { chan, span, .. } => (
+                    *span,
+                    format!("{id} waits here to send on channel {chan}, which is full"),
+                ),
+                Wait::Recv { chan, span } => (
+                    *span,
+                    format!("{id} waits here to receive from channel {chan}, which is empty"),
+                ),
             };
             diagnostic =
                 diagnostic.secondary(if span.is_dummy() { *origin } else { span }, message);
@@ -1022,6 +1334,14 @@ impl<K, B> Scheduler<K, B> {
                 Wait::Host { pending, span } => (
                     *span,
                     format!("{id} waits here on host operation {pending}"),
+                ),
+                Wait::Send { chan, span, .. } => (
+                    *span,
+                    format!("{id} waits here to send on channel {chan}, which is full"),
+                ),
+                Wait::Recv { chan, span } => (
+                    *span,
+                    format!("{id} waits here to receive from channel {chan}, which is empty"),
                 ),
             };
             diagnostic = diagnostic.secondary(if span.is_dummy() { origin } else { span }, message);
@@ -1138,6 +1458,18 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 pub const FRUITLESS_PARKS: u32 = 1024;
+
+#[cold]
+#[inline(never)]
+fn err_foreign_channel(span: Span, chan: ChanId) -> Diagnostic {
+    Diagnostic::error(
+        codes::TASK_ESCAPES_SCOPE,
+        format!("`{chan}` is a channel of another region"),
+    )
+    .primary(span, "this handle was made by another region's scheduler")
+    .note("every region numbers its own channels, so here the handle's id names another channel, or none")
+    .note("use a channel inside the region that made it")
+}
 
 #[cold]
 #[inline(never)]

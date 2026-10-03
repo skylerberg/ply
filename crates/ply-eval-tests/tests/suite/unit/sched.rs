@@ -2,7 +2,7 @@ use ply_eval::arena::Slot;
 use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::region::{StepSite, Trail};
 use ply_eval::sched::*;
-use ply_eval::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
+use ply_eval::sim::{Access, ChanId, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use ply_eval::sim::{Answer, Handlers, signature};
 use ply_eval::{
     Diagnostic, EffectAtom, Mode, Resource, SimId, SourceId, Span, Symbol, TaskHandle, Value, codes,
@@ -28,6 +28,11 @@ enum Act {
     /// Serve `rand` without ending the step, so runs with and without draws share a step structure.
     Draw,
     Fail,
+    /// Make a channel of this capacity; the region numbers channels from 0.
+    Channel(i64),
+    Send(u64, i64),
+    Recv(u64),
+    Close(u64),
 }
 
 /// A whole program: script 0 is the region's body and every other script is something spawned.
@@ -59,6 +64,15 @@ struct Run {
     steps: Vec<(u64, Vec<u64>, u16)>,
     /// `(task, stamp)` per step, which the search reads to decide whether two steps could reorder.
     stamps: Vec<(TaskId, Stamp)>,
+    /// `(task, answer)` for each send and receive, in the order the tasks heard them.
+    heard: Vec<(u64, Value)>,
+}
+
+fn chan(n: u64) -> ChanHandle {
+    ChanHandle {
+        region: SimId(0),
+        id: ChanId(n),
+    }
 }
 
 fn run(program: &Program, seed: Seed) -> Result<Run, Diagnostic> {
@@ -72,9 +86,12 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
     let mut sched = Scheduler::new(SimId(0), Span::DUMMY).with_step_budget(budget);
     let mut handlers = Handlers::new(root);
     let mut marks = Vec::new();
-    // Which script each task runs, and how far into it that task has got.
+    let mut heard = Vec::new();
+    // Which script each task runs, how far into it that task has got, and whether it waits on an
+    // answer from a channel.
     let mut script: Vec<usize> = vec![0];
     let mut pc: Vec<usize> = vec![0];
+    let mut asked: Vec<bool> = vec![false];
 
     loop {
         match sched.next(handlers.clock_mut(), &mut trail)? {
@@ -99,6 +116,7 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                         .iter()
                         .map(|s| (s.task, s.stamp.clone()))
                         .collect(),
+                    heard,
                 });
             }
             Turn::Run { task, resumption } => {
@@ -113,6 +131,15 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                         pc.push(0);
                     }
                     script[at] = index;
+                }
+                while asked.len() <= at {
+                    asked.push(false);
+                }
+                if let Resumption::Resume { value, .. } = &resumption
+                    && asked[at]
+                {
+                    heard.push((task.0, value.clone()));
+                    asked[at] = false;
                 }
                 // One step: act until something suspends this task.
                 loop {
@@ -163,6 +190,18 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                                 }
                             }
                         }
+                        Act::Channel(capacity) => {
+                            sched.channel(suspended(), capacity, Span::DUMMY)?
+                        }
+                        Act::Send(n, x) => {
+                            asked[at] = true;
+                            sched.send(suspended(), &chan(n), Value::Int(x), Span::DUMMY)?
+                        }
+                        Act::Recv(n) => {
+                            asked[at] = true;
+                            sched.recv(suspended(), &chan(n), Span::DUMMY)?
+                        }
+                        Act::Close(n) => sched.close(suspended(), &chan(n), Span::DUMMY)?,
                         Act::Fail => {
                             return Err(sched.fail(
                                 Diagnostic::error(codes::RUNTIME_ERROR, "the task failed")
@@ -413,6 +452,146 @@ fn a_task_that_joins_itself_deadlocks_rather_than_hanging() {
             .iter()
             .any(|l| l.message.contains("@0 waits here for @0"))
     );
+}
+
+fn received(run: &Run, task: u64) -> Vec<Value> {
+    run.heard
+        .iter()
+        .filter(|(t, _)| *t == task)
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+fn some_int(n: i64) -> Value {
+    Value::ctor("Some", vec![Value::Int(n)])
+}
+
+#[test]
+fn a_receiver_takes_every_value_in_the_order_it_was_sent() {
+    for capacity in [0, 1, 3] {
+        let program: Program = vec![
+            vec![
+                Act::Channel(capacity),
+                Act::Spawn(1),
+                Act::Recv(0),
+                Act::Recv(0),
+                Act::Recv(0),
+                Act::Recv(0),
+                Act::Join(1),
+            ],
+            vec![
+                Act::Send(0, 1),
+                Act::Send(0, 2),
+                Act::Send(0, 3),
+                Act::Close(0),
+            ],
+        ];
+        for root in 0..8 {
+            let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+            assert_eq!(
+                received(&run, 0),
+                vec![
+                    some_int(1),
+                    some_int(2),
+                    some_int(3),
+                    Value::ctor("None", vec![])
+                ],
+                "capacity {capacity}, seed {root}"
+            );
+            assert_eq!(
+                received(&run, 1),
+                vec![Value::Bool(true); 3],
+                "capacity {capacity}, seed {root}"
+            );
+        }
+    }
+}
+
+#[test]
+fn closing_wakes_a_waiting_receiver_with_none_and_a_waiting_sender_with_false() {
+    let program: Program = vec![
+        vec![
+            Act::Channel(0),
+            Act::Spawn(1),
+            Act::Spawn(2),
+            Act::Yield,
+            Act::Close(0),
+            Act::Join(1),
+            Act::Join(2),
+        ],
+        vec![Act::Recv(0)],
+        vec![Act::Send(0, 7)],
+    ];
+    for root in 0..16 {
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+        let (r, s) = (received(&run, 1), received(&run, 2));
+        // Either the two met before the close, or the close reached each of them.
+        assert!(
+            (r == vec![some_int(7)] && s == vec![Value::Bool(true)])
+                || (r == vec![Value::ctor("None", vec![])] && s == vec![Value::Bool(false)]),
+            "seed {root}: the receiver heard {r:?} and the sender {s:?}"
+        );
+    }
+}
+
+#[test]
+fn a_value_sent_orders_its_send_before_the_receive_that_takes_it() {
+    let program: Program = vec![
+        vec![Act::Channel(1), Act::Spawn(1), Act::Recv(0), Act::Join(1)],
+        vec![Act::Mark("before"), Act::Send(0, 5), Act::Yield],
+    ];
+    for root in 0..8 {
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+        assert_eq!(received(&run, 0), vec![some_int(5)], "seed {root}");
+        let send = run
+            .stamps
+            .iter()
+            .position(|(t, _)| t.0 == 1)
+            .expect("the sender takes a step");
+        // The root's fourth step is the one its receive answered, before it joins anything.
+        let after = run
+            .stamps
+            .iter()
+            .enumerate()
+            .filter(|(_, (t, _))| t.0 == 0)
+            .nth(3)
+            .map(|(i, _)| i)
+            .expect("the root steps after its receive");
+        assert!(
+            happens_before(&run.stamps[send].1, TaskId(1), &run.stamps[after].1),
+            "seed {root}: the send is not ordered before the receive"
+        );
+    }
+}
+
+#[test]
+fn a_receive_nobody_answers_is_a_deadlock_naming_the_channel() {
+    let program: Program = vec![vec![Act::Channel(0), Act::Recv(0)]];
+    let err = run(&program, Seed::at(0, Vec::new())).expect_err("nothing sends");
+    assert_eq!(err.code, codes::DEADLOCK);
+    assert!(
+        err.labels.iter().any(|l| l
+            .message
+            .contains("@0 waits here to receive from channel #0")),
+        "{:?}",
+        err.labels
+    );
+    let full: Program = vec![vec![Act::Channel(1), Act::Send(0, 1), Act::Send(0, 2)]];
+    let err = run(&full, Seed::at(0, Vec::new())).expect_err("nothing receives");
+    assert!(
+        err.labels.iter().any(|l| l
+            .message
+            .contains("@0 waits here to send on channel #0, which is full")),
+        "{:?}",
+        err.labels
+    );
+}
+
+#[test]
+fn a_negative_capacity_is_refused() {
+    let program: Program = vec![vec![Act::Channel(-1)]];
+    let err = run(&program, Seed::at(0, Vec::new())).expect_err("no channel holds -1 values");
+    assert_eq!(err.code, codes::RUNTIME_ERROR);
 }
 
 /// A livelock shares the deadlock's code, with a different message.

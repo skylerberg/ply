@@ -40,6 +40,7 @@ pub enum Plain {
         generation: u32,
     },
     Task(u64),
+    Chan(u64),
     /// A credential, whose payload is never copied out.
     Secret,
     /// What a bounded snapshot left out: `n` more items of a list or map, or with `0`, all
@@ -127,6 +128,7 @@ impl Plain {
             }
             Plain::Cell { .. } => return Err("a cell, which only its own region can hold"),
             Plain::Task(_) => return Err("a task, which only its own run can hold"),
+            Plain::Chan(_) => return Err("a channel, which only its own run can hold"),
             Plain::Secret => return Err("a credential, whose payload never leaves the runtime"),
             Plain::Elided(_) => return Err("a value a diagnostic cut short"),
         })
@@ -152,6 +154,7 @@ impl Plain {
             Plain::Fn(_) => "a function",
             Plain::Cell { .. } => "a `Cell`",
             Plain::Task(_) => "a `Task`",
+            Plain::Chan(_) => "a `Chan`",
             Plain::Secret => "a `Secret`",
             Plain::Elided(_) => "a value",
         }
@@ -257,6 +260,7 @@ fn snapshot(v: &Value, bound: Option<(usize, usize)>, depth: usize) -> Plain {
             generation: slot.generation(),
         },
         Value::Task(handle) => Plain::Task(handle.id().0),
+        Value::Chan(handle) => Plain::Chan(handle.id.0),
         Value::Secret(_) => Plain::Secret,
     }
 }
