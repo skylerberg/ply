@@ -4,17 +4,29 @@
 //   GET  /<name>/<version>/package.plyz         the archive
 //   GET  /<name>/<version>/package.plyz.b3      its digest, one `b3:<hex>` line
 //   GET  /<name>/<version>/interface/<sem>      the interface cut under the semantics <sem>
+//   GET  /<name>/<version>/attestation/<sem>    what the registry's attester found of it
 //   PUT  /<name>/<version>                      publish: the archive as the body
 //   PUT  /<name>/<version>/interface/<sem>      the interface beside it
+//   PUT  /<name>/<version>/attestation/<sem>    an attestation the attester's key signed
 //   POST /<name>/<version>/yank                 mark the version yanked
 //
+// With `attester` the attester's public key, `attest.key` its secret key file, `url` where it
+// reaches the registry and `--exec attest=` a `ply`, every version published is attested in turn by
+// that `ply` between connections.
 // A write carries `Authorization: Bearer <token>`, and the token is the one `token.<name>` maps the
 // package to in the run's configuration. It is served over `--tls` when `tls` names a credential,
 // and as plain HTTP otherwise: behind a proxy that terminates TLS, or on this machine alone.
 
 import compiler.interface (enveloped)
+import std.bin
+import std.bytes (hex_of)
+import std.ed25519
+import std.pkg (Attestation, attestation_bin)
+import std.signed (countersigned, signed_bytes)
 import compiler.pkg (is_dotted_path)
+import std.bytes (bytes_of_hex)
 import std.config (config)
+import std.process (process, Discard, Var)
 import std.fs
 import std.fs (fs)
 import std.http
@@ -25,12 +37,22 @@ import std.json (decode_bytes)
 import std.pkg (Index, Release, Version, index_json, parse_version, render_version)
 import std.router
 import std.router (Found, Literal, MethodNotAllowed, NotFound, Param, Route, param)
-import store (Absent, Busy, Exists, Trouble, Unreadable, Unwritten, archive_path, digest_path,
-              index_of, index_path, interface_path, interfaced, published, release_of, served, yank)
+import store (Absent, Busy, Exists, Pending, Trouble, Unreadable, Unwritten, archive_path,
+              attestation_kept, attestation_path, digest_path, index_of, index_path, interface_path,
+              interfaced, marked, pending, published, release_of, served, unmarked, yank)
 import twin
-import upload (Refusal, allowed, is_semantics, judged, judged_interface)
+import upload (Refusal, allowed, is_semantics, judged, judged_attestation, judged_interface)
 
-type Endpoint = | IndexOf | ArchiveOf | DigestOf | InterfaceOf | Publish | Interface | Yank
+type Endpoint =
+  | IndexOf
+  | ArchiveOf
+  | DigestOf
+  | InterfaceOf
+  | AttestationOf
+  | Publish
+  | Interface
+  | Attest
+  | Yank
 
 fn table() -> List<Route<Endpoint>> =
   [
@@ -50,6 +72,16 @@ fn table() -> List<Route<Endpoint>> =
       path: [Param("name"), Param("version"), Literal("interface"), Param("semantics")],
       endpoint: InterfaceOf,
     },
+    {
+      method: Get,
+      path: [Param("name"), Param("version"), Literal("attestation"), Param("semantics")],
+      endpoint: AttestationOf,
+    },
+    {
+      method: Put,
+      path: [Param("name"), Param("version"), Literal("attestation"), Param("semantics")],
+      endpoint: Attest,
+    },
     { method: Put, path: [Param("name"), Param("version")], endpoint: Publish },
     {
       method: Put,
@@ -62,7 +94,7 @@ fn table() -> List<Route<Endpoint>> =
 /// One request, answered from the store and the run's configuration and from nothing else.
 pub fn answer(
   req: Request,
-) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], abort.raise} =
+) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], abort.raise} =
   match router::route(table(), req.method, req.path) {
     NotFound -> text_response(404, "no such resource\n"),
     MethodNotAllowed(ms) -> method_not_allowed(ms),
@@ -97,6 +129,18 @@ pub fn answer(
                 served(interface_path(name, render_version(v), semantics)),
                 "application/octet-stream",
               ),
+          },
+          AttestationOf -> match version {
+            None -> not_a_version(),
+            Some(v) ->
+              file(
+                served(attestation_path(name, render_version(v), semantics)),
+                "application/octet-stream",
+              ),
+          },
+          Attest -> match version {
+            None -> not_a_version(),
+            Some(v) -> attestation(req, name, v, semantics),
           },
           Publish -> match version { None -> not_a_version(), Some(v) -> publish(req, name, v) },
           Interface -> match version {
@@ -142,7 +186,7 @@ fn publish(
   req: Request,
   name: String,
   v: Version,
-) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], abort.raise} =
+) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], abort.raise} =
   match allowed(name, req.headers) {
     Err(r) -> refusal(r),
     Ok(_) -> match judged(name, v, http::header(req.headers, "x-ply-digest"), req.body) {
@@ -150,6 +194,7 @@ fn publish(
       Ok(release) -> match published(name, release, req.body) {
         Err(t) -> trouble(t, name, v),
         Ok(kept) -> if kept.fresh {
+          let _ = config.get[server]("attest.key") != None && marked(name, render_version(v));
           text_response(
             201,
             "published `" ++ name ++ "` " ++ render_version(v) ++ " as " ++ release.digest ++ "\n",
@@ -203,6 +248,43 @@ fn interface(
     },
   }
 
+fn attestation(
+  req: Request,
+  name: String,
+  v: Version,
+  semantics: String,
+) -> Response / {config.get[server], fs.read_file[store], fs.create_dir[store], fs.lock[store], fs.rename[store], fs.unlock[store], fs.write_file[store], abort.raise} =
+  match config.get[server]("attester") {
+    None -> text_response(403, "this registry keeps no attestations: it names no `attester`\n"),
+    Some(hex) -> match index_of(name) {
+      Err(why) -> text_response(500, why ++ "\n"),
+      Ok(None) -> trouble(Absent, name, v),
+      Ok(Some(x)) -> match release_of(x, v) {
+        None -> trouble(Absent, name, v),
+        Some(r) -> match judged_attestation(
+            name,
+            v,
+            semantics,
+            r.digest,
+            bytes_of_hex(hex),
+            req.body,
+          ) {
+          Err(refused) -> refusal(refused),
+          Ok(_) -> match attestation_kept(name, v, semantics, req.body) {
+            Err(t) -> trouble(t, name, v),
+            Ok(_) ->
+              text_response(
+                201,
+                "the attestation of `" ++ name ++ "` " ++ render_version(v) ++ " under "
+                  ++ semantics
+                  ++ " is kept\n",
+              ),
+          },
+        },
+      },
+    },
+  }
+
 fn yanked(
   req: Request,
   name: String,
@@ -234,22 +316,62 @@ fn port() -> Int / {config.get[server], abort.raise} =
   }
 
 // Every connection, one at a time, until accepting stops: a signal to the run ends it there.
+// Between two, the attester that ran is reaped and the next version waiting for one is started.
 fn accepting(
   listener: Int,
-) -> Unit / {net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], abort.raise} = {
+  running: Option<Int>,
+) -> Unit / {config.get[server], config.secret[tokens], fs.read_file[store], fs.create_dir[store], fs.lock[store], fs.rename[store], fs.unlock[store], fs.write_file[store], net.close[conn], net.recv[conn], net.send[conn], net.accept[listener], process.wait[attest], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], config.get[env], abort.raise} = {
   let c = net.accept[listener](listener);
   if c == 0 { () } else {
     http::serve_connection[conn](c, limits(), answer);
-    accepting(listener)
+    accepting(listener, attended(running))
   }
 }
 
-fn main() -> Unit / {config.get[server], config.secret[tokens], net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], abort.raise} = {
+// What a `ply` started for the attester inherits of the registry's environment, beside where it
+// reaches the registry.
+fn inherited() -> List<String> = ["PATH", "HOME", "TMPDIR"]
+
+fn attester_env(url: String) -> List<Var> / {config.get[server], config.get[env]} =
+  fold(inherited(), [{ name: "PLY_REGISTRY", value: url }], |acc: List<Var>, name: String|
+    match config.get[env](name) { Some(v) -> push(acc, { name: name, value: v }), None -> acc })
+
+fn attended(
+  running: Option<Int>,
+) -> Option<Int> / {config.get[server], process.wait[attest], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], config.get[env], abort.raise} =
+  match running {
+    Some(child) -> match process.wait[attest](child, 0) { None -> running, Some(_) -> started() },
+    None -> started(),
+  }
+
+fn started() -> Option<Int> / {config.get[server], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], config.get[env], abort.raise} =
+  match ((config.get[server]("attest.key"), config.get[server]("url"))) {
+    (Some(key), Some(url)) -> if !process.bound[attest]() { None } else {
+      match pending() {
+        [] -> None,
+        [p, ..] -> {
+          unmarked(p);
+          match process.start[attest](
+              ["attest", p.name, p.version, "--sign", key, "--json"],
+              "",
+              attester_env(url),
+              { input: false, out: Discard, err: Discard },
+            ) {
+            Ok(child) -> Some(child),
+            Err(_) -> None,
+          }
+        },
+      }
+    },
+    _ -> None,
+  }
+
+fn main() -> Unit / {config.get[server], config.secret[tokens], net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.get[env], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], process.wait[attest], abort.raise} = {
   let listener = match config.get[server]("tls") {
     None -> net.listen[listener](port()),
     Some(credential) -> net.listen_tls[listener](port(), credential),
   };
-  accepting(listener);
+  accepting(listener, None);
   net.close[listener](listener)
 }
 
@@ -323,6 +445,86 @@ test "an interface is kept beside its version under its semantics, and served ba
       ]));
   assert_eq(statuses(ran.value), [404, 201, 401, 201, 200, 200, 409, 422, 404, 404]);
   assert_eq(nth(ran.value, 4).body, framed(b"one"))
+}
+
+fn a_seed(n: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int((i + n) % 256)))
+
+fn an_attestation(digest: String) -> Attestation =
+  {
+    name: "orders",
+    version: { major: 0, minor: 2, patch: 0 },
+    archive: digest,
+    semantics: "ab12",
+    builder: "ply 0.0.0",
+    checked: true,
+    promises: true,
+    tests: { passed: 1, failed: 0 },
+    proofs: { proved: 0, property: 0, example: 0, refuted: 0, unattempted: 0 },
+  }
+
+fn signed_by(seed: Bytes, a: Attestation) -> Bytes / {abort.raise} =
+  signed_bytes(countersigned({ payload: bin::encode(a, attestation_bin()), signatures: [] }, seed))
+
+test "an attestation is kept when the registry's attester signed it, and a publish waits for one" {
+  let body = twin::archive(twin::library("orders", 2));
+  let d = twin::digest(body);
+  let attester = hex_of(ed25519::public_key(a_seed(1)));
+  let ran = twin::over(fs::mem_empty(), ||
+    twin::configured_with(
+      [{ key: "attester", value: attester }, { key: "attest.key", value: "attester.key" }],
+      ||
+        [
+          answer(written(Put, "/orders/0.2.0", "t0k", d, body)),
+          answer(
+            written(
+              Put,
+              "/orders/0.2.0/attestation/ab12",
+              "",
+              d,
+              signed_by(a_seed(2), an_attestation(d)),
+            ),
+          ),
+          answer(
+            written(
+              Put,
+              "/orders/0.2.0/attestation/ab12",
+              "",
+              d,
+              signed_by(a_seed(1), an_attestation("b3:other")),
+            ),
+          ),
+          answer(
+            written(
+              Put,
+              "/orders/0.2.0/attestation/ab12",
+              "",
+              d,
+              signed_by(a_seed(1), an_attestation(d)),
+            ),
+          ),
+          answer(get("/orders/0.2.0/attestation/ab12")),
+        ],
+    ));
+  assert_eq(statuses(ran.value), [201, 403, 422, 201, 200]);
+  assert_eq(nth(ran.value, 4).body, signed_by(a_seed(1), an_attestation(d)));
+  assert_eq(fs::mem_read(ran.tree, ".attest/orders@0.2.0"), Some(b""));
+  let bare = twin::over(fs::mem_empty(), ||
+    twin::configured(||
+      [
+        answer(written(Put, "/orders/0.2.0", "t0k", d, body)),
+        answer(
+          written(
+            Put,
+            "/orders/0.2.0/attestation/ab12",
+            "",
+            d,
+            signed_by(a_seed(1), an_attestation(d)),
+          ),
+        ),
+      ]));
+  assert_eq(statuses(bare.value), [201, 403]);
+  assert_eq(fs::mem_read(bare.tree, ".attest/orders@0.2.0"), None)
 }
 
 test "a write without a token, under another's, or with a digest its body does not seal changes nothing" {

@@ -1612,9 +1612,22 @@ fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
         (Builtin::Panic, Some(Value::Str(s))) => Some(s.to_string()),
         _ => None,
     };
+    // An operator over an `integer` parameter raises for a zero divisor, as one written at its
+    // type does; its overflow, like theirs, ends the run.
+    let divides_by_zero = match (b, values.as_slice()) {
+        (Builtin::NumericBinary, [Value::Int(op), _, _, divisor]) => {
+            matches!(
+                usize::try_from(*op)
+                    .ok()
+                    .and_then(|i| ply_eval::builtins::NUMERIC_OPS.get(i)),
+                Some(BinOp::Div | BinOp::Rem)
+            ) && is_zero(divisor)
+        }
+        _ => false,
+    };
     match ply_eval::builtins::call(b, values, site) {
         Ok(v) => ctx.word(&v),
-        Err(d) if b.raises() => {
+        Err(d) if b.raises() || divides_by_zero => {
             let message = panicked.unwrap_or_else(|| raised_message(&d));
             ctx.raise(d, message)
         }
@@ -1687,6 +1700,43 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
     }
     unsafe { (*out).len = total as u32 };
     out as Word
+}
+
+/// A witnessed operator over two immediates, when the witness is `Int` or a width compiled code
+/// holds as its `Int`: the answer, or `None` for the value path to give, or to raise, instead.
+fn narrow_binary(op: i64, w: i64, a: i64, b: i64) -> Option<Word> {
+    let range = if w == ply_eval::builtins::INT_WITNESS {
+        None
+    } else {
+        let t = *ply_eval::INT_TYPES.get(usize::try_from(w).ok()?)?;
+        if t.bits() >= 64 {
+            return None;
+        }
+        Some((
+            i64::try_from(ply_eval::IntTy::min(t)).ok()?,
+            i64::try_from(ply_eval::IntTy::max(t)).ok()?,
+        ))
+    };
+    let op = ply_eval::builtins::NUMERIC_OPS.get(usize::try_from(op).ok()?)?;
+    let n = match op {
+        BinOp::Add => a.checked_add(b)?,
+        BinOp::Sub => a.checked_sub(b)?,
+        BinOp::Mul => a.checked_mul(b)?,
+        BinOp::Div => a.checked_div(b)?,
+        BinOp::Rem => a.checked_rem(b)?,
+        BinOp::BitAnd => a & b,
+        BinOp::BitOr => a | b,
+        BinOp::BitXor => a ^ b,
+        BinOp::Lt => return Some(heap::bool(a < b)),
+        BinOp::Le => return Some(heap::bool(a <= b)),
+        BinOp::Gt => return Some(heap::bool(a > b)),
+        BinOp::Ge => return Some(heap::bool(a >= b)),
+        _ => return None,
+    };
+    match range {
+        Some((lo, hi)) if n < lo || n > hi => None,
+        _ => heap::fits_imm(n).then(|| heap::imm(n)),
+    }
 }
 
 /// The cell a word names, when it is one.
@@ -1793,6 +1843,12 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Iterate, [seed, budget, f]) => {
             Some(unsafe { rt_iterate(std::ptr::from_mut(ctx), *seed, *budget, *f) })
         }
+        (Builtin::Bracket, [acquire, release, body]) => Some(rt_bracket(
+            std::ptr::from_mut(ctx),
+            *acquire,
+            *release,
+            *body,
+        )),
         (Builtin::MapUpdate, [m, k, f]) => Some(map_update(ctx, *m, *k, *f)),
         (Builtin::BytesPosition, [b, from, p]) => Some(bytes_position(ctx, *b, *from, *p)),
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
@@ -1880,6 +1936,24 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             }
             heap::dec(*xs);
             Some(ctx.heap.list_from(&items))
+        }
+        (Builtin::NumericBinary, [op, w, x, y])
+            if heap::is_imm(*op) && heap::is_imm(*w) && heap::is_imm(*x) && heap::is_imm(*y) =>
+        {
+            narrow_binary(
+                heap::imm_value(*op),
+                heap::imm_value(*w),
+                heap::imm_value(*x),
+                heap::imm_value(*y),
+            )
+        }
+        (Builtin::Min | Builtin::Max, [x, y]) if heap::is_imm(*x) && heap::is_imm(*y) => {
+            let (a, b) = (heap::imm_value(*x), heap::imm_value(*y));
+            Some(heap::imm(if (a <= b) == (which == Builtin::Min) {
+                a
+            } else {
+                b
+            }))
         }
         (Builtin::Range, [lo, hi]) => {
             let (a, b) = (heap::as_int(*lo)?, heap::as_int(*hi)?);
@@ -3246,6 +3320,54 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
             }
         }
     }
+}
+
+/// `bracket(acquire, release, body)`: what `body` answers for what `acquire` answered, with
+/// `release` run on it however `body` ends: by returning, by a raise or a clause that did not
+/// resume it unwinding through, or by a cancel. It runs where the bracket stands, with the
+/// handlers around it, and a failure in it replaces whatever was unwinding. A runtime failure ends
+/// the entry, so nothing more runs then.
+fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
+    let held = call_value(ctx, acquire, &[]);
+    heap::dec(acquire);
+    let c = unsafe { &mut *ctx };
+    if c.failed != 0 {
+        heap::dec(release);
+        heap::dec(body);
+        return 0;
+    }
+    heap::inc(held);
+    let answer = call_value(ctx, body, &[held]);
+    heap::dec(body);
+    let c = unsafe { &mut *ctx };
+    let ending = c.failed;
+    if ending != 0
+        && ending != FAILED_UNWIND
+        && ending != FAILED_CANCELLED
+        && ending != FAILED_ABORT
+    {
+        heap::dec(held);
+        heap::dec(release);
+        return 0;
+    }
+    let unwinding = c.unwind.take();
+    let raising = c.aborting.take();
+    c.failed = 0;
+    let released = call_value(ctx, release, &[held]);
+    heap::dec(release);
+    let c = unsafe { &mut *ctx };
+    if c.failed != 0 {
+        if let Some((_, _, carried)) = unwinding {
+            heap::dec(carried);
+        }
+        heap::dec(answer);
+        return 0;
+    }
+    heap::dec(released);
+    c.failed = ending;
+    c.unwind = unwinding;
+    c.aborting = raising;
+    answer
 }
 
 /// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a bad step

@@ -26,6 +26,8 @@ pub const DB: &str = include_str!("../ply/db.ply");
 
 pub const DECIMAL: &str = include_str!("../ply/decimal.ply");
 
+pub const ED25519: &str = include_str!("../ply/ed25519.ply");
+
 pub const FLOAT: &str = include_str!("../ply/float.ply");
 
 pub const FS: &str = include_str!("../ply/fs.ply");
@@ -69,6 +71,8 @@ pub const ROUTER: &str = include_str!("../ply/router.ply");
 pub const SET: &str = include_str!("../ply/set.ply");
 pub const SHOW: &str = include_str!("../ply/show.ply");
 
+pub const SIGNED: &str = include_str!("../ply/signed.ply");
+
 pub const TRACE: &str = include_str!("../ply/trace.ply");
 
 pub const SIGNAL: &str = include_str!("../ply/signal.ply");
@@ -94,6 +98,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.csv", CSV),
     ("std.db", DB),
     ("std.decimal", DECIMAL),
+    ("std.ed25519", ED25519),
     ("std.float", FLOAT),
     ("std.fs", FS),
     ("std.hash", HASH),
@@ -117,6 +122,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.set", SET),
     ("std.show", SHOW),
     ("std.signal", SIGNAL),
+    ("std.signed", SIGNED),
     ("std.string", STRING),
     ("std.time", TIME),
     ("std.trace", TRACE),

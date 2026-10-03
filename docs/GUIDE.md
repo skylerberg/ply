@@ -502,6 +502,27 @@ need the callee's type parameter at another type is polymorphic recursion, which
 Ply does not infer. That is `E0308` as well: break the cycle so the callee is
 checked on its own before the call, or monomorphise it.
 
+`where numeric(a)` lets a type parameter take arithmetic and the ordered
+comparisons: `+`, `-`, `*`, `%`, unary `-`, `<` and the rest, and
+`numeric_of_int(n)` writes a constant at it. `where integer(a)` adds `/` and the
+bit operators. A call fills `a` with one of the numeric types — `Int`, the
+fixed-width integers, `Float` and `Decimal` (`integer`: the first two) — or with
+a parameter of its own the same constraint is on; any other type is `E0201`.
+Each operator fails where it fails at that type: a `/` or `%` by zero raises
+(§6.8), and a width's overflow ends the run:
+
+```ply
+fn sum<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)
+```
+
+The type a call fills a constrained parameter with is passed as a hidden
+argument, so such a definition must be called directly; used as a value it is
+`E0310`, and a lambda that calls it is the value. A call can only fill a
+parameter its signature's parameters or answer mention, and inside a recursive
+group only the definition itself holds the type, so a constrained parameter the
+signature never mentions, or a call from another member of the group, is
+`E0310` too. A spec clause assumes its definition's constraints.
+
 ### 4.6 Types the language declares
 
 In scope everywhere; redeclaring one is `E0105`:
@@ -971,6 +992,14 @@ continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
 except a clause for `abort.raise` (§6.8).
 
+A clause that binds `resume` and never calls it abandons the body where it stood,
+and `bracket(acquire, release, body)` is how a body that holds something lets it
+go anyway: `release` runs on what `acquire` answered when `body` returns, when a
+clause unwinds through it this way or a raise does (§6.8), and when its task is
+cancelled (§9), where the bracket stands and with the handlers around it. A `release` that fails
+replaces whatever was unwinding. A runtime failure ends the run, so nothing more
+runs then, `release` included. Nested brackets release innermost first.
+
 ### 6.7 Unhandled effects
 
 `E0302`: the body performs an atom, or an operation, its written row does not
@@ -996,11 +1025,12 @@ come back. So does everything else that can fail on a value it is given: `panic`
 `assert` and `assert_eq`, a builtin outside what it is defined for (§12), a `/`
 or `%` by zero (§2.4), a `let` whose pattern misses (§5.1), an `iterate` past
 its budget, a `task.join` of a cancelled task, a `task.channel` of a negative
-capacity and a `random.below` of a bound below one (§9); a capacity or bound
-written as a literal in range does not raise. A signature that leaves
-`abort.raise` out of its row where its body can raise is `E0302`, which names
-the operation and offers the row to write. Overflow, the call ceiling and a
-spent step budget end the run whatever the row says.
+capacity and a `random.below` of a bound below one (§9). What a literal argument
+settles does not raise: a divisor other than zero, a capacity or bound in range,
+and a narrowing such as `u8_of_int(200)` of a value its type holds. A signature
+that leaves `abort.raise` out of its row where its body can raise is `E0302`,
+which names the operation and offers the row to write. Overflow, the call
+ceiling and a spent step budget end the run whatever the row says.
 
 A clause for `abort.raise` has the `handle`'s type: its value is the `handle`'s,
 `return` is not applied to it, and it cannot bind `resume` (`E0201`). Its
@@ -1222,8 +1252,9 @@ effect sim           { read  seed() -> Int }
   region's schedule is drawn from its entry's seed in the order regions open.
 
 `task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
-it waits on is let go, and it performs nothing more. When it next runs it only
-unwinds, releasing what it holds. The cancel answers `false` for a task that had
+it waits on is let go, and it performs nothing more but the `release` of each
+`bracket` it stands in (§6.6). When it next runs it only unwinds, releasing what
+it holds. The cancel answers `false` for a task that had
 already ended and leaves its answer alone. `task.await(t)` is a join that answers
 `Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
 cancelled task has nothing to answer and raises (§6.8). A task cannot cancel
@@ -1418,7 +1449,8 @@ authority when this page and it disagree.
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
 | `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
 | `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
-| `min`, `max` `(a: Int, b: Int) -> Int` | |
+| `min<a>(a: a, b: a) -> a`, `max` | in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)` |
+| `numeric_of_int<a>(n: Int) -> a` | `n` at the `numeric` type the call is at (§4.5); raises past a width's range, which a literal in `0..=127` never is |
 | `cell_get<a>(c: Cell<a>) -> a` | |
 | `cell_set<a>(c: Cell<a>, v: a) -> Unit` | |
 | `cell_update<a \| e>(c: Cell<a>, f: (a) -> a / e) -> Unit / e` | the cell is unreadable while `f` runs |
@@ -1441,6 +1473,7 @@ authority when this page and it disagree.
 | `fold<a, b \| e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e` | |
 | `range(lo: Int, hi: Int) -> List<Int>` | `[lo, hi)` |
 | `iterate<a, b \| e>(seed: a, budget: Int, step: (a) -> Iter<a, b> / e) -> b / e` | |
+| `bracket<a, b \| e>(acquire: () -> a / e, release: (a) -> Unit / e, body: (a) -> b / e) -> b / e` | what `body` answers; `release` runs on what `acquire` answered however `body` ends but a failure (§6.6); the three run as one, so each may perform what the others do |
 | `map_new<k, v>() -> Map<k, v>` | |
 | `map_insert<k, v>(m: Map<k, v>, key: k, value: v) -> Map<k, v>` | |
 | `map_get<k, v>(m: Map<k, v>, key: k) -> Option<v>` | |
@@ -1603,7 +1636,9 @@ Types: `Method`, `Version`, `Headers`, `Request`, `Response`, `Limits`,
 `encode`, `encode_chunked_head`, `encode_chunk`, `last_chunk`,
 `continue_response`, `read_head`, `read_body`, `serve_connection`, `serve`,
 `listen_and_serve`, `request_to`, `encode_request`, `parse_response_head`,
-`request`. `request[upstream](host, port, req, limits)` opens one connection,
+`request`. Every connection the module opens or accepts is closed however
+serving it ends, an `app` a clause unwinds out of included (§6.6).
+`request[upstream](host, port, req, limits)` opens one connection,
 sends the request with `Connection: close`, reads the answer and closes; a
 response without a length field is `UntilClose` and read until the server
 closes, up to `max_body`. A malformed response is `Malformed` with a 502 refusal. No
@@ -1631,8 +1666,8 @@ implicitly (`normalize_path` is explicit).
 Codecs: `int_json`, `string_json`, `bool_json`, `decimal_json`, `float_json`,
 `bytes_json`, `unit_json`, `json_json`, `char_json` (a string of one
 character), `instant_json` and `duration_json` (nanoseconds), and combinators
-`list_json`,
-`option_json`, `result_json`, `map_json`, `string_map_json`. Entry points:
+`list_json`, `array_json` (a JSON array, as a list is), `option_json`,
+`result_json`, `map_json`, `string_map_json`. Entry points:
 `decode_bytes`, `decode_string`, `encode_bytes`, `encode_string`, `parse`,
 `parse_string`, `to_bytes`, `to_string`. `error_to_string` gives
 `$.lines[2].unit_price: expected a number, found a string`.
@@ -1655,7 +1690,9 @@ The resource label is a table (`db.query[items]` is `db.read[items]`).
 Transaction control is on the singleton resource, so transactions conflict.
 `transaction` handles `rollback`; a `rollback` performed in its body still
 reaches the caller's row through `e`, so a handler around a transaction names
-it too. SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
+it too. A transaction that ends short of its commit, by a `rollback`, by a clause
+unwinding out of it or by a cancel, is aborted on the way out, and a `sandbox`
+always is (§6.6). SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
 `constraint` the constraint a violation names, and `detail` the server's message
 and detail. `is_retryable(e)` is true for a serialization failure (`40001`) and
 a deadlock (`40P01`). `MemDb` is an in-memory twin (`open`, `step`,
@@ -2118,15 +2155,16 @@ pub fn blake3(input: Bytes) -> Bytes
 pub fn sha256(input: Bytes) -> Bytes
 pub fn hmac_sha256(key: Bytes, message: Bytes) -> Bytes
 pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes
+pub fn sha512(input: Bytes) -> Bytes
 ```
 
-`blake3` and `sha256` answer 32 bytes. `hmac_sha256` is HMAC over SHA-256 as RFC
+`blake3` and `sha256` answer 32 bytes, `sha512` 64. `hmac_sha256` is HMAC over SHA-256 as RFC
 2104 defines it, and `pbkdf2_sha256` is its single-block PBKDF2: thirty-two
 bytes, which is the salted password SCRAM asks for and the only length anything
 here needs.
 
-`blake3` is the `bytes_blake3` builtin. The SHA-256 family is written in Ply, and
-the vectors the SHA-256 standard and RFC 4231 publish are the tests. It is slow —
+`blake3` is the `bytes_blake3` builtin. The SHA family is written in Ply, and
+the vectors the SHA standards and RFC 4231 publish are the tests. It is slow —
 a compression round walks a list of words rather than living in scalars — so use
 it for small inputs: a key, a proof, a nonce, not a file.
 
@@ -2186,6 +2224,12 @@ type Manifest = {
 }
 type Release = { version: Version, digest: String, yanked: Bool, runtime: Version }
 type Index = { name: String, versions: List<Release> }
+type Attestation = {
+  name: String, version: Version, archive: String, semantics: String, builder: String,
+  checked: Bool, promises: Bool,
+  tests: { passed: Int, failed: Int },
+  proofs: { proved: Int, property: Int, example: Int, refuted: Int, unattempted: Int },
+}
 ```
 
 The package manifest as typed data: a `ply.pkg` file is one literal of
@@ -2197,7 +2241,9 @@ version dotted and `parse_version` reads one back (three counts, no leading
 zero, nothing else). `Index` is a registry's `index.json` (§15.1): every
 published `Release` of one package, newest last, read and written by
 `index_json` (`release_json` for one entry), with each version as its dotted
-text.
+text. An `Attestation` is what an attester found of one published version
+(§15.1), derived `bin`; `attested` is whether it checks, keeps its promises,
+failed no test and had no claim refuted.
 
 ### 13.16 `std.pg` — the postgres wire protocol
 
@@ -2557,9 +2603,11 @@ becomes the one a caller names.
 ```ply
 pub fn min_int() -> Int
 pub fn max_int() -> Int
-pub fn abs(n: Int) -> Int
-pub fn sign(n: Int) -> Int
-pub fn clamp(n: Int, lo: Int, hi: Int) -> Int
+pub fn abs<a>(n: a) -> a where numeric(a)
+pub fn sign<a>(n: a) -> Int where numeric(a)
+pub fn clamp<a>(n: a, lo: a, hi: a) -> a where numeric(a)
+pub fn sum<a>(xs: List<a>) -> a where numeric(a)
+pub fn product<a>(xs: List<a>) -> a where numeric(a)
 pub fn even(n: Int) -> Bool
 pub fn odd(n: Int) -> Bool
 pub fn gcd(a: Int, b: Int) -> Int
@@ -2570,14 +2618,13 @@ pub fn factorial(n: Int) -> Int
 pub fn isqrt(n: Int) -> Int
 ```
 
-`min` and `max` are prelude builtins and stay there. Everything here is `Int`,
-which is `i64`, and the arithmetic wraps at that width rather than raising, so
-`pow` and `abs(min_int())` answer a wrapped value — a checked variant would have
-to say what it answers instead, and that belongs with `B10`'s numeric
-predicates. `gcd` and `lcm` are never negative, and `gcd(0, 0)` is `0`.
-`is_prime` says no for zero, one and every negative, `factorial` is `1` at and
-below one, and `isqrt` is the greatest `r` with `r * r <= n` — `0` for a negative
-`n`, which has none.
+`min` and `max` are prelude builtins and stay there. `abs`, `sign`, `clamp`,
+`sum` and `product` take any numeric type (§4.5) and raise where its operators
+raise, so `abs(min_int())` and a width's overflowing `sum` raise; an empty
+list's `sum` is zero and its `product` one. The rest is `Int`. `gcd` and `lcm`
+are never negative, and `gcd(0, 0)` is `0`. `is_prime` says no for zero, one and
+every negative, `factorial` is `1` at and below one, and `isqrt` is the greatest
+`r` with `r * r <= n` — `0` for a negative `n`, which has none.
 
 ### 13.29 `std.list`
 
@@ -2873,9 +2920,9 @@ named rather than entered.
 Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
 `string_bin`, `bytes_bin`, `char_bin`, `u8_bin` … `u128_bin`, `i8_bin` …
 `i128_bin`, `instant_bin`, `duration_bin`, `ordering_bin`, `rounding_bin`, and
-combinators `list_bin`, `option_bin`,
-`result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*` and `take_*` are
-public too.
+combinators `list_bin`, `array_bin` (written as a list is, under a shape of its
+own), `option_bin`, `result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*`
+and `take_*` are public too.
 
 ### 13.38 `std.show`
 
@@ -2888,6 +2935,39 @@ pub fn display<a>(x: a) -> String where derivable(show, a)
 §12.1, is the value as data), and `derive show` (§11) writes what it does.
 `display` writes a `String` or a `Char` as itself and anything else as `show`
 does: it is what an interpolated string's holes are (§2.3).
+
+### 13.39 `std.ed25519`
+
+```ply
+pub fn public_key(seed: Bytes) -> Bytes
+pub fn sign(seed: Bytes, message: Bytes) -> Bytes
+pub fn verify(public: Bytes, message: Bytes, signature: Bytes) -> Bool
+```
+
+Ed25519 as RFC 8032 defines it, in Ply: a 32-byte seed is a secret key,
+`public_key` its 32-byte public key, `sign` a 64-byte signature, and `verify`
+whether one holds, refusing a key off the curve and an `S` not below the group
+order. RFC 8032's vectors are the tests. Nothing in it is constant time; it signs
+on the machine that holds the key, which is what `ply build --sign` does (§15.2).
+
+### 13.40 `std.signed`
+
+```ply
+pub type Signature = { signer: Bytes, signature: Bytes }
+pub type Signed = { payload: Bytes, signatures: List<Signature> }
+pub fn signed_bytes(s: Signed) -> Bytes
+pub fn signed_of(b: Bytes) -> Option<Signed>
+pub fn signature_by(seed: Bytes, payload: Bytes) -> Signature
+pub fn holds(s: Signature, payload: Bytes) -> Bool
+pub fn countersigned(s: Signed, seed: Bytes) -> Signed
+pub fn vouched_by(s: Signed, trusted: List<Bytes>) -> Option<Bytes>
+```
+
+A signed document: a payload and the Ed25519 signatures over it, each under a
+domain of its own so it is never a signature over another protocol's message.
+`countersigned` adds a seed's signature in place of any earlier one by the same
+signer, and `vouched_by` names the first trusted public key whose signature
+holds. `ply build --sign` writes one beside an artifact (§15.2).
 
 ## 14. The host boundary
 
@@ -2972,8 +3052,10 @@ GET  /<name>/index.json                      every version of <name>, newest las
 GET  /<name>/<version>/package.plyz          the library's `.plyz`, as `ply build` writes it
 GET  /<name>/<version>/package.plyz.b3       its digest, one `b3:<hex>` line
 GET  /<name>/<version>/interface/<semantics> the interface its publisher cut under <semantics>
+GET  /<name>/<version>/attestation/<semantics> what the registry's attester found of it
 PUT  /<name>/<version>                       publish: the `.plyz` as the body
 PUT  /<name>/<version>/interface/<semantics> the interface beside it
+PUT  /<name>/<version>/attestation/<semantics> an attestation its attester's key signed
 POST /<name>/<version>/yank                  mark the version yanked
 ```
 
@@ -3024,6 +3106,25 @@ archive into the dependency's slot, and the first load reads the dependency
 through it rather than analysing its source. `--verify-deps` (`check`, `test`,
 `prove`) reads every dependency from source instead and refuses one whose
 interface does not re-derive from it, `E0149`.
+
+A registry with an **attester** vouches for what it serves. `ply attest NAME
+VERSION` lays the published version out as a project of its own, fetched and
+checked as a resolve fetches it, and runs `ply test` and `ply prove` over it:
+whether it checks, whether its `reuse fn` and `returns` promises are kept, its
+tests and the tier each claim was discharged at, under this `ply`'s semantics.
+With `--sign KEY` the answer, a `std.pkg.Attestation`, is signed as §15.2 signs
+a build and sent back; the registry keeps it only when its `attester`'s public key
+signed it, for the version's own archive and the semantics the path names.
+Without `--sign` nothing is sent, which is how anyone runs an attestation again.
+A registry run with `--set attester=<public key hex>`, `--set attest.key=<secret
+key file>`, `--set url=<where the attester reaches it>` and `--exec
+attest=<a ply>` attests every version published, one at a time between
+connections, with that `ply`. A version whose tests fail or whose claim is refuted
+is published all the same, and its attestation says so. `ply resolve` fetches
+each dependency's attestation and believes it only when a key `PLY_ATTESTERS`
+names (public key files, separated as `PATH` separates directories) signed it for
+the archive the lock pins; `--json` reports each one as `attestation`
+(`attested`, `trusted`, `signer`, and what was run).
 `ply yank NAME VERSION` sets the version's `yanked` field under the same token:
 a new resolution passes it over and a lock that pins it keeps it, and its archive
 is served exactly as before. Nothing is ever deleted.
@@ -3053,6 +3154,35 @@ lock around every write, so two registries over one store never interleave one.
 Like every Ply listener it binds `127.0.0.1`: another machine reaches it through a
 proxy in front of it, one that passes TLS through to a `--tls` registry or
 terminates it for a plain one.
+
+### 15.2 Signing
+
+```
+$ ply keygen release.key                       # release.key and release.key.pub
+$ ply build . -o app.plyx --sign release.key   # app.plyx and app.plyx.sig
+$ ply run app.plyx --require-signer release.key.pub
+$ ply build . -o app.plyx --verify             # compare, write nothing
+```
+
+`ply keygen PATH` writes an Ed25519 key pair (§13.39): the secret key at `PATH`,
+readable by its owner alone, and the public key at `PATH.pub`, each one line
+naming what it holds and 64 hex digits. It never writes over a file, and a key
+file that cannot be read, decoded or written is `E0462`.
+
+`ply build --sign KEY` signs what it writes, a program or a library, in
+`<artifact>.sig` beside it. A signature is detached, so the artifact's digest
+is the same whoever signs it, and signing the same build again with another key
+adds a signature beside the first. What is signed is the artifact's provenance:
+its kind and name, its full digest, the `ply` that built it, the semantics
+version (§15.1), and the commit `HEAD` named when its sources were in a git
+repository. `ply run ARTIFACT --require-signer KEY` runs a built artifact only
+when one of the public keys named (the flag repeats) signed that provenance for
+the artifact's own digest; an artifact with no signatures, signatures for other
+bytes, or none by a trusted key is `E0460`, before anything of it is loaded.
+`ply build --verify` builds in memory and holds the file `-o` names to what these
+sources build, and every signature beside it to that build; it writes nothing and
+answers which keys signed. A file that is not that build, or a signature that does
+not hold, is `E0461`.
 
 ## 16. The `ply` command
 
@@ -3087,10 +3217,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets and provenance), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
-| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
+| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
-| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
+| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2), `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
@@ -3098,11 +3228,13 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface published for it under this `ply`'s semantics when there is one (`interface` in `--json`) |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
 | `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
+| `ply attest NAME VERSION` | run a published version's tests, claims and promises over what the registry serves and report the attestation; `--sign KEY` signs it and sends it to the registry (§15.1); no path |
+| `ply keygen PATH` | an Ed25519 key pair: the secret key at `PATH`, the public key at `PATH.pub` (§15.2); no path |
 | `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
@@ -3319,6 +3451,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0307` | mutually recursive definitions binding different label or row parameters |
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
+| `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, a parameter its signature never mentions, or a call from another member of its recursive group |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` or `Chan` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
@@ -3358,6 +3491,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0457` | `--exec` path that cannot be executed |
 | `E0458` | captured output over the bound |
 | `E0459` | `--allow` family the program does not declare |
+| `E0460` | artifact `--require-signer` refuses: unsigned, signed for other bytes, or by no trusted key |
+| `E0461` | `ply build --verify`: a file or signature that is not what these sources build |
+| `E0462` | key file that cannot be read, decoded or written |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

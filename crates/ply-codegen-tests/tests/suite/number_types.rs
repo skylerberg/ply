@@ -93,6 +93,8 @@ law "no byte is seven" forall (b: Byte) { match b { Byte(x) -> int_of_u8(x) != 7
 fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
 fn made<a>(make: () -> a) -> a = make()
 fn applied<a, b>(f: (a) -> b, x: a) -> b = f(x)
+fn total<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)
+fn halved<a>(x: a) -> a / {abort.raise} where integer(a) = x / numeric_of_int(2)
 "#;
 
 #[test]
@@ -422,6 +424,37 @@ fn an_answer_no_argument_types_is_declined_rather_than_guessed() {
         call(unit, "m.applied", &[generated, Value::Int(0)]),
         Some(u8(5))
     );
+}
+
+/// A `numeric` parameter entered from outside is passed the type its arguments show, and `Int`
+/// where none does, as the prover draws it; the answer reads as that type.
+#[test]
+fn a_witness_entered_from_outside_is_the_type_the_arguments_show() {
+    let (_, unit) = unit(CROSSES);
+    for (name, args, want) in [
+        ("m.total", vec![Value::list(vec![u8(200), u8(55)])], u8(255)),
+        (
+            "m.total",
+            vec![Value::list(vec![Value::Float(0.5), Value::Float(0.25)])],
+            Value::Float(0.75),
+        ),
+        (
+            "m.total",
+            vec![Value::list(vec![Value::Int(2), Value::Int(3)])],
+            Value::Int(5),
+        ),
+        ("m.total", vec![Value::list(vec![])], Value::Int(0)),
+        ("m.halved", vec![fixed(IntTy::I8, -9)], fixed(IntTy::I8, -4)),
+    ] {
+        let got = call(unit, name, &args);
+        assert_eq!(
+            got.as_ref(),
+            Some(&want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
+        );
+    }
+    let raise = raised(unit, "m.total", &[Value::list(vec![u8(200), u8(56)])]);
+    assert!(raise.message.contains("overflow"), "{raise:?}");
 }
 
 /// Operands whose `+`, `-` and `*` leave the width, each with what the wrapping builtin of the

@@ -32,6 +32,12 @@ import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
 import std.pkg (Manifest, render_version)
 import compiler.front (Whole, Analysed, Refused, analyse)
 import style (Style, plain, bold, green, red)
+import semantics
+import signing (Provenance, head_commit, provenance_bytes, provenance_of, seed_of, signatures_path,
+                unkeyed)
+import std.signed
+import std.signed (Signature, countersigned, signed_bytes, signed_of)
+import std.bytes (hex_of)
 
 // The container with its digest written into the field no range of the digest covers: `digest`
 // is the short form a report prints, and `full` the digest itself.
@@ -366,7 +372,13 @@ fn built_lines(
     startup_line(s, m.startup),
   ]
 
-fn built_json(p: Loaded, m: Made, x: Sealed, out: String) -> Json / {abort.raise} =
+fn built_json(
+  p: Loaded,
+  m: Made,
+  x: Sealed,
+  out: String,
+  signer: Option<String>,
+) -> Json / {abort.raise} =
   object([
     { key: "command", value: Str("build") },
     { key: "ok", value: Bool(true) },
@@ -383,6 +395,7 @@ fn built_json(p: Loaded, m: Made, x: Sealed, out: String) -> Json / {abort.raise
     { key: "unit", value: Bool(m.unit) },
     { key: "artifact_bytes", value: num(bytes_len(x.bytes)) },
     { key: "binary_bytes", value: opt_num(p.binary_bytes) },
+    { key: "signed_by", value: signer_json(signer) },
     { key: "diagnostics", value: all_to_json(m.warnings, p.places) },
   ])
 
@@ -395,6 +408,199 @@ fn digest_json(m: Made, x: Sealed) -> Json =
     { key: "entry", value: Str(m.entry) },
     { key: "digest", value: Str(x.digest) },
   ])
+
+// --- Signing and verifying what a build writes ---------------------------------------
+// A signature is detached, in `<artifact>.sig`: the artifact's digest is the same whoever signs it,
+// and a second signer of the same build adds a signature beside the first.
+
+fn signing_key(
+  flags: Flags,
+) -> Result<Option<Bytes>, Diag> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match flags.sign {
+    None -> Ok(None),
+    Some(path) -> match paths::read_file(paths::spelled(path)) {
+      None -> Err(unkeyed(path, "cannot be read")),
+      Some(b) -> match seed_of(string_of_bytes_lossy(b)) {
+        Ok(seed) -> Ok(Some(seed)),
+        Err(why) -> Err(unkeyed(path, "does not hold a secret key: " ++ why)),
+      },
+    },
+  }
+
+fn built_provenance(
+  flags: Flags,
+  p: Loaded,
+  kind: String,
+  name: String,
+  x: Sealed,
+) -> Provenance / {fs.kind[abs], fs.read_file[abs], abort.raise} =
+  {
+    kind: kind,
+    name: name,
+    digest: digest_text(x.full),
+    builder: "ply " ++ p.version,
+    semantics: semantics::version(),
+    commit: head_commit(resolved_root(flags).absolute),
+  }
+
+// The signatures beside `out` with this key's among them: kept while they vouch for this build,
+// started again when they vouch for another.
+fn signed(
+  seed: Option<Bytes>,
+  out: String,
+  what: Provenance,
+) -> Result<Option<String>, Diag> / {fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
+  match seed {
+    None -> Ok(None),
+    Some(key) -> {
+      let at = paths::spelled(signatures_path(out));
+      let payload = provenance_bytes(what);
+      let held = match paths::read_file(at) {
+        None -> None,
+        Some(b) -> match signed_of(b) {
+          Some(x) -> if x.payload == payload { Some(x) } else { None },
+          None -> None,
+        },
+      };
+      let next = countersigned(
+        match held { Some(x) -> x, None -> { payload: payload, signatures: [] } },
+        key,
+      );
+      if write_file(at, signed_bytes(next)) {
+        Ok(
+          Some(
+            hex_of(match list_at(next.signatures, len(next.signatures) - 1) {
+              Some(g) -> g.signer,
+              None -> b"",
+            }),
+          ),
+        )
+      } else { Err(unstored(signatures_path(out))) }
+    },
+  }
+
+fn signer_json(signer: Option<String>) -> Json = match signer { Some(h) -> Str(h), None -> Null }
+
+fn signer_lines(s: Style, signer: Option<String>) -> List<String> / {abort.raise} =
+  match signer { Some(h) -> [ind() ++ bold(s, "signed") ++ " " ++ h], None -> [] }
+
+fn unverified(path: String, why: String) -> Diag =
+  diag1(
+    b"E0461",
+    no_module(),
+    { start: 0, end: 0 },
+    bytes_of_string("`" ++ path ++ "` " ++ why),
+    b"not what these sources build",
+    [b"`ply build --verify` builds in memory and writes nothing; `ply build` writes what it built"],
+  )
+
+// `--verify`: the file `out` holds, held to what these sources build, and every signature beside
+// it to the build it says it vouches for.
+fn verified(
+  s: Style,
+  p: Loaded,
+  out: String,
+  x: Sealed,
+  into: Bytes,
+) -> Answer / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match paths::read_file(paths::spelled(out)) {
+    None -> reported(s, "build", [unverified(out, "cannot be read")], p.places),
+    Some(held) -> if held != x.bytes {
+      let sealed = match digest_of(into, held) { Some(d) -> digest_text(d), None -> "no digest" };
+      reported(
+        s,
+        "build",
+        [
+          unverified(
+            out,
+            "seals " ++ sealed ++ ", and these sources build " ++ digest_text(x.full),
+          ),
+        ],
+        p.places,
+      )
+    } else {
+      let sig = signatures_path(out);
+      match paths::read_file(paths::spelled(sig)) {
+        None -> verified_answer(s, out, x, [], None),
+        Some(b) -> match signed_of(b) {
+          None -> reported(s, "build", [unverified(sig, "does not read as signatures")], p.places),
+          Some(g) -> match provenance_of(g.payload) {
+            None ->
+              reported(s, "build", [unverified(sig, "says nothing a build vouches for")], p.places),
+            Some(what) -> if what.digest != digest_text(x.full) {
+              reported(s, "build", [unverified(sig, "vouches for " ++ what.digest)], p.places)
+            } else {
+              match filter(g.signatures, |one: Signature| !signed::holds(one, g.payload)) {
+                [] ->
+                  verified_answer(
+                    s,
+                    out,
+                    x,
+                    map(g.signatures, |one: Signature| hex_of(one.signer)),
+                    Some(what),
+                  ),
+                [bad, ..] ->
+                  reported(
+                    s,
+                    "build",
+                    [
+                      unverified(
+                        sig,
+                        "holds a signature by " ++ hex_of(bad.signer) ++ " that does not verify",
+                      ),
+                    ],
+                    p.places,
+                  ),
+              }
+            },
+          },
+        },
+      }
+    },
+  }
+
+fn verified_answer(
+  s: Style,
+  out: String,
+  x: Sealed,
+  signers: List<String>,
+  what: Option<Provenance>,
+) -> Answer / {abort.raise} =
+  {
+    json: object([
+      { key: "command", value: Str("build") },
+      { key: "ok", value: Bool(true) },
+      { key: "exit_code", value: num(ok_code()) },
+      { key: "verified", value: Bool(true) },
+      { key: "artifact", value: Str(out) },
+      { key: "digest", value: Str(digest_text(x.full)) },
+      { key: "signers", value: strings(signers) },
+      {
+        key: "provenance",
+        value: match what {
+          None -> Null,
+          Some(v) ->
+            object([
+              { key: "kind", value: Str(v.kind) },
+              { key: "name", value: Str(v.name) },
+              { key: "builder", value: Str(v.builder) },
+              { key: "semantics", value: Str(v.semantics) },
+              { key: "commit", value: Str(v.commit) },
+            ]),
+        },
+      },
+    ]),
+    lines: fold(
+      map(signers, |h: String| ind() ++ "  " ++ bold(s, "signed") ++ " " ++ h),
+      [
+        ind() ++ green(s, "verified") ++ " " ++ out ++ " · " ++ x.digest ++ " · "
+          ++ (if len(signers) == 0 { "unsigned" } else { count_of(len(signers), "signature") }),
+      ],
+      |acc: List<String>, l: String| push(acc, l),
+    ),
+    errs: [],
+    code: ok_code(),
+  }
 
 // --- The command ------------------------------------------------------------
 
@@ -449,17 +655,27 @@ fn written(
   p: Loaded,
   m: Made,
   x: Sealed,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], abort.raise} = {
+) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let out = match flags.out { Some(v) -> v, None -> default_output(m.entry) };
-  match stored(out, x.bytes) {
-    Err(why) -> reported(s, "build", why.diags, p.places),
-    Ok(_) ->
-      stamped(s, flags, p, {
-        json: built_json(p, m, x, out),
-        lines: built_lines(s, p, m, x, out),
-        errs: all_to_text(s, m.warnings, p.places),
-        code: ok_code(),
-      }),
+  match signing_key(flags) {
+    Err(d) -> reported(s, "build", [d], p.places),
+    Ok(seed) -> match stored(out, x.bytes) {
+      Err(why) -> reported(s, "build", why.diags, p.places),
+      Ok(_) -> match signed(seed, out, built_provenance(flags, p, "program", m.entry, x)) {
+        Err(d) -> reported(s, "build", [d], p.places),
+        Ok(signer) ->
+          stamped(s, flags, p, {
+            json: built_json(p, m, x, out, signer),
+            lines: fold(
+              signer_lines(s, signer),
+              built_lines(s, p, m, x, out),
+              |acc: List<String>, l: String| push(acc, l),
+            ),
+            errs: all_to_text(s, m.warnings, p.places),
+            code: ok_code(),
+          }),
+      },
+    },
   }
 }
 
@@ -498,11 +714,13 @@ fn delivered(
   p: Loaded,
   m: Made,
   x: Sealed,
-) -> Answer / {builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
+) -> Answer / {builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match flags.diff {
     Some(old) -> differed(s, p, m, x, old),
     None -> if flags.digest {
       { json: digest_json(m, x), lines: [x.digest], errs: [], code: ok_code() }
+    } else if flags.action == "verify" {
+      verified(s, p, match flags.out { Some(v) -> v, None -> default_output(m.entry) }, x, domain())
     } else { written(s, flags, p, m, x) },
   }
 
@@ -514,7 +732,7 @@ fn assembled(
   p: Loaded,
   entry: String,
   startup: List<String>,
-) -> Answer / {builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
+) -> Answer / {builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match builder.made[build](entry, startup, is_diffed(flags)) {
     Err(why) -> reported(s, "build", why.diags, p.places),
     Ok(m) -> match seal(encode(m.head, m.sections)) {
@@ -530,7 +748,7 @@ fn chosen(
   p: Loaded,
   defs: List<Def>,
   startup: Result<List<String>, Diag>,
-) -> Answer / {builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
+) -> Answer / {builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match entry_of(p, defs, flags) {
     // Nothing to build as a program. A library — a package that names no entry and declares no
     // `main` — is built as the package itself; anything else keeps the entry point's refusal.
@@ -562,7 +780,7 @@ fn built_over(
   defs: List<Def>,
   startup: Result<List<String>, Diag>,
   front: Front,
-) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], env.shipped_digest[sys], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], abort.raise} = {
+) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], env.shipped_digest[sys], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
   let r = resolved_root(flags);
   let locked: Result<Option<lock::Lock>, String> = lock::read(r);
   match builder.loaded[build](root_of(flags), front) {
@@ -629,7 +847,7 @@ fn library(
   p: Loaded,
   defs: List<Def>,
   refused: Diag,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
+) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match loaded.whole {
     // The load behind this report found no entry point; a package that cannot be read keeps that.
     None -> reported(s, "build", [refused], p.places),
@@ -676,20 +894,36 @@ fn library_writing(
   loaded: Program,
   defs: List<Def>,
   m: Manifest,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
+) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], builder.unit[build], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match packed(loaded, defs) {
     Err(why) -> reported(s, "build", why.diags, p.places),
     Ok(k) -> {
       let out = library_output(flags, m.name);
-      match stored(out, k.x.bytes) {
-        Err(why) -> reported(s, "build", why.diags, p.places),
-        Ok(_) ->
-          {
-            json: library_json(p, m, k.own, k.unit, k.x, out),
-            lines: library_lines(s, m, len(loaded.files), k.own, k.unit, k.x, out),
-            errs: [],
-            code: ok_code(),
+      if flags.action == "verify" { verified(s, p, out, k.x, library_domain()) } else {
+        match signing_key(flags) {
+          Err(d) -> reported(s, "build", [d], p.places),
+          Ok(seed) -> match stored(out, k.x.bytes) {
+            Err(why) -> reported(s, "build", why.diags, p.places),
+            Ok(_) -> match signed(
+                seed,
+                out,
+                built_provenance(flags, p, "library", library_name(m), k.x),
+              ) {
+              Err(d) -> reported(s, "build", [d], p.places),
+              Ok(signer) ->
+                {
+                  json: library_json(p, m, k.own, k.unit, k.x, out, signer),
+                  lines: fold(
+                    signer_lines(s, signer),
+                    library_lines(s, m, len(loaded.files), k.own, k.unit, k.x, out),
+                    |acc: List<String>, l: String| push(acc, l),
+                  ),
+                  errs: [],
+                  code: ok_code(),
+                },
+            },
           },
+        }
       }
     },
   }
@@ -719,6 +953,7 @@ fn library_json(
   unit: Compiled,
   x: Sealed,
   out: String,
+  signer: Option<String>,
 ) -> Json / {abort.raise} =
   object([
     { key: "command", value: Str("build") },
@@ -734,6 +969,7 @@ fn library_json(
     { key: "format", value: num(format()) },
     { key: "unit", value: Bool(bytes_len(unit.payload) > 0) },
     { key: "artifact_bytes", value: num(bytes_len(x.bytes)) },
+    { key: "signed_by", value: signer_json(signer) },
     { key: "diagnostics", value: all_to_json([], p.places) },
   ])
 
@@ -965,6 +1201,8 @@ fn answered_over(
     fs.create_dir[abs](path) -> stores,
     fs.write_file[cwd](path, body) -> stores || string_ends_with(path, "ply.lock"),
     fs.write_file[abs](path, body) -> stores || string_ends_with(path, "ply.lock"),
+    // The fixture is checked out nowhere, so its provenance names no commit.
+    fs.kind[abs](path) -> Missing,
     // A library's path is only reached by a test that means it: the fixture is a program.
     builder.unit[build](names) -> no_unit(names),
   }
