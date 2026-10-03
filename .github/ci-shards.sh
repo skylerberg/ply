@@ -52,7 +52,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PARTITIONS=8
 NEXTEST_SHARDS=2
 
-# What the partitions of the last run measured, restored from the cache by the `plan` job.
+# What the last run whose test jobs all passed measured, restored from the cache by the `plan` job.
 TIMINGS=/tmp/ply-test-timings/timings.tsv
 
 TAB=$'\t'
@@ -82,14 +82,13 @@ CORPUS_DESKS=(serving database)
 DESK_RUNNERS=3
 # Runs that take a runner each: the compiler's own tests on the tier take every core.
 CORPUS_ALONE=(cli-compiler_on_the_tier)
-# Placed a test at a time rather than a module at a time: a whole module would outlast a lane. Not
-# `registry`, whose tests share one cold build of the server: split, each lane pays for it.
+# Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
+# would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental lang_fixtures)
-# Corpus processes a partition runs beside nextest, each a lane of the cut: its runs of one package go
-# in one `ply test`, which loads the package's closure once. Two, measured against one: a partition's
-# runs include the program's and the packages' own `ply test`s, each with a front end and C of its own,
-# which a single lane takes in turn and outlasts nextest's extra thread.
+# Corpus processes a partition runs side by side, each a lane of the cut: a lane's runs of one package
+# go in one `ply test`, which loads the package's closure once. Two, so the program's and the packages'
+# own `ply test`s, each with a front end and C of its own, are not all one lane's to take in turn.
 CORPUS_LANES=2
 # Packages whose own suites run as corpus entries too, as `id:path`: each failing test is named in
 # the log, where a Rust test wrapping the run would report one failure for all of them.
@@ -138,7 +137,7 @@ declare -a PROBE_JOBS=(
 # What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
 # the archive every partition unpacks, the emitter's stage, and the shard cut. No later run can
 # name one, so a green run gives them back, and the repository's 10 GB cache stays for what does
-# outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache.
+# outlive a run: the stage under `ply-c-stage-sources-`, the kept C, the stores and the passes.
 GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
 
 # `<family>-<run id>` entries only the newest of which is ever restored.
@@ -216,7 +215,8 @@ cmd_solo_filter() {
 
 # One entry id a line: `program`, `fixture-<name>` per fixture, `package-<id>` per package suite,
 # every checks module that declares a test, then every such module of the CLI's suite under `cli-`;
-# each module as `module`, or, for one placed a test at a time, `module:N` for its Nth test.
+# each module as `module`, or, for one placed a test at a time, `module:<id>` per test, the id a hash
+# of its label, so a duration measured for a test stays with it however the module's tests move.
 corpus_entries() {
   local entry file
   printf 'program\n'
@@ -226,21 +226,34 @@ corpus_entries() {
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
 }
 
-# `PREFIX<module>` per module of the package at DIR that declares a test, or `PREFIX<module>:N` per
-# test of a module the rest of the arguments place a test at a time.
+# `PREFIX<module>` per module of the package at DIR that declares a test, or `PREFIX<module>:<id>` per
+# test of a module the rest of the arguments place a test at a time, in the order it declares them.
 module_entries() {
-  local dir=$1 prefix=$2 file module count i
+  local dir=$1 prefix=$2 file module
   shift 2
   for file in "$root/$dir"/*.ply; do
     grep -qE '^test(/[a-z]+)? "' "$file" || continue
     module=$(basename "$file" .ply)
     if named_in "$module" "$@"; then
-      count=$(corpus_test_names "$file" | grep -c .)
-      for ((i = 1; i <= count; i++)); do printf '%s%s:%d\n' "$prefix" "$module" "$i"; done
+      corpus_test_names "$file" | label_ids | cut -f1 | sed "s/^/$prefix$module:/"
     else
       printf '%s%s\n' "$prefix" "$module"
     fi
   done
+}
+
+# `id<TAB>label` per label on stdin: a polynomial hash of the label's bytes in base 36. Arithmetic on
+# numbers below 2^41 alone, which every awk holds exactly, so the runner's ids are a developer's.
+label_ids() {
+  LC_ALL=C awk '
+    BEGIN { for (i = 1; i < 256; i++) code[sprintf("%c", i)] = i; digits = "0123456789abcdefghijklmnopqrstuvwxyz" }
+    {
+      h = 0
+      for (i = 1; i <= length($0); i++) h = (h * 131 + code[substr($0, i, 1)]) % 4294967291
+      id = ""
+      do { id = substr(digits, h % 36 + 1, 1) id; h = int(h / 36) } while (h > 0)
+      printf "%s\t%s\n", id, $0
+    }'
 }
 
 named_in() {
@@ -266,7 +279,7 @@ package_path() {
   return 1
 }
 
-# The names of a checks module's tests, in the order it declares them.
+# The labels of a module's tests, in the order it declares them.
 corpus_test_names() {
   sed -nE 's/^test(\/[a-z]+)? "([^"]*)".*/\2/p' "$1"
 }
@@ -344,7 +357,7 @@ cmd_corpus_for_partition() {
 }
 
 # `path filter`: the program's entry takes every test of its package, a module's its own, and
-# `module:N` its Nth test by the qualified name `ply test --filter` matches.
+# `module:<id>` the test whose label hashes to it, by the qualified name `ply test --filter` matches.
 cmd_corpus_line() {
   local entry entries
   # Read whole before the loop can return, so the lister never writes into a closed pipe.
@@ -368,12 +381,12 @@ cmd_corpus_line() {
   return 1
 }
 
-# `path filter` of the run `module` or `module:N` of the package at DIR.
+# `path filter` of the run `module` or `module:<id>` of the package at DIR.
 module_line() {
-  local dir=$1 module=${2%%:*} n name
+  local dir=$1 module=${2%%:*} name
   if [[ $2 == *:* ]]; then
-    n=${2##*:}
-    name=$(corpus_test_names "$root/$dir/$module.ply" | sed -n "${n}p")
+    name=$(corpus_test_names "$root/$dir/$module.ply" | label_ids | awk -F"$TAB" -v id="${2##*:}" '$1 == id { print $2; exit }')
+    [[ -n $name ]] || { echo "no test of $dir/$module.ply has the id '${2##*:}'" >&2; return 1; }
     printf '%s %s.%s\n' "$dir" "$module" "$name"
   else
     printf '%s %s.\n' "$dir" "$module"
@@ -550,8 +563,9 @@ living_durations() {
   [[ $dropped -eq 0 ]] || echo "$dropped measured row(s) name binaries or corpus runs the tree no longer has; left to the catch-all" >&2
 }
 
-# One `shard-<i>.toml` per partition: the tests it runs as its profile's `default-filter`, and the
-# order to start them in. 3 when there is nothing measured to cut, so the caller slices by count.
+# One `shard-<i>.toml` per nextest shard: the tests it runs as its profile's `default-filter`, and
+# the order to start them in, then the corpus and desk cuts. 3 when there is nothing measured to cut,
+# so the caller slices by count.
 shard_configs() {
   local dir=$1 timings=$2 tmp catchall first i
   if [[ ! -s $timings ]]; then
@@ -661,10 +675,13 @@ desk_cut() {
   '
 }
 
-# The corpus runs the partitions take, longest first onto the lane of every partition's that would
-# end soonest with it, as `corpus-<k>.txt` of `lane entry` lines; the lanes are taken partition by
-# partition, so the first runs placed land on different runners. A lane pays each package's startup
-# once. A run nothing measured counts as the median of those that were, and is placed after them.
+# The corpus runs the partitions take, as `corpus-<k>.txt` of `lane entry` lines. The tests of a module
+# placed a test at a time go in as runs of neighbours, one run while the module fits a lane and as few
+# as it needs once it does not, so a cold start its tests share is paid once a run rather than once a
+# test. Runs and the other entries go longest first onto the lane of every partition's that would end
+# soonest with it; the lanes are taken partition by partition, so the first placed land on different
+# runners. A lane pays each package's startup once. An entry nothing measured counts as the median
+# of those that were.
 corpus_cut() {
   local dir=$1 rows=$2 k
   for ((k = 1; k <= PARTITIONS; k++)); do : > "$dir/corpus-$k.txt"; done
@@ -675,6 +692,10 @@ corpus_cut() {
       if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
       return checks
     }
+    function module_of(id) { return index(id, ":") ? substr(id, 1, index(id, ":") - 1) : "" }
+    # A new unit holding nothing yet, of the package `id` is tested in.
+    function unit(id) { u++; size[u] = 0; cost[u] = 0; pkg[u] = package(id) }
+    function hold(id) { member[u, ++size[u]] = id; cost[u] += ms[id] }
     BEGIN {
       FS = "\t"
       while ((getline line < rows) > 0) {
@@ -686,30 +707,60 @@ corpus_cut() {
     }
     { ids[++n] = $1 }
     END {
-      for (i = 1; i <= n; i++) if (ids[i] in ms) { m++; order[m] = ids[i] }
-      # Longest first, ties in entry order.
+      for (i = 1; i <= n; i++) if (ids[i] in ms) measured[++m] = ms[ids[i]]
       for (i = 2; i <= m; i++) {
+        x = measured[i]
+        for (j = i - 1; j >= 1 && measured[j] > x; j--) measured[j + 1] = measured[j]
+        measured[j + 1] = x
+      }
+      median = m ? measured[int((m + 1) / 2)] : 60000
+      for (i = 1; i <= n; i++) {
+        if (!(ids[i] in ms)) ms[ids[i]] = median
+        total += ms[ids[i]]
+      }
+      lanes = p * l
+      target = total / lanes
+      # A module placed a test at a time lists its tests together, in the order it declares them.
+      for (i = 1; i <= n; ) {
+        mod = module_of(ids[i])
+        if (mod == "") { unit(ids[i]); hold(ids[i]); i++; continue }
+        sum = 0
+        for (j = i; j <= n && module_of(ids[j]) == mod; j++) sum += ms[ids[j]]
+        runs = int(sum / target)
+        if (runs * target < sum) runs++
+        if (runs > j - i) runs = j - i
+        if (runs < 1) runs = 1
+        share = sum / runs
+        unit(ids[i])
+        for (x = i; x < j; x++) {
+          if (size[u] > 0 && runs > 1 && cost[u] + ms[ids[x]] / 2 > share) { unit(ids[x]); runs-- }
+          hold(ids[x])
+        }
+        i = j
+      }
+      # Longest first, ties in entry order.
+      for (i = 1; i <= u; i++) order[i] = i
+      for (i = 2; i <= u; i++) {
         x = order[i]
-        for (j = i - 1; j >= 1 && ms[order[j]] < ms[x]; j--) order[j + 1] = order[j]
+        for (j = i - 1; j >= 1 && cost[order[j]] < cost[x]; j--) order[j + 1] = order[j]
         order[j + 1] = x
       }
-      median = m ? ms[order[int((m + 1) / 2)]] : 60000
-      for (i = 1; i <= n; i++) if (!(ids[i] in ms)) { order[++m] = ids[i]; ms[ids[i]] = median }
-      lanes = p * l
       # About two minutes unmeasured; a program or package suite row holds its startup whole.
       start[checks] = (checks in start) ? start[checks] : 120000
       start[cli] = (cli in start) ? start[cli] : 120000
-      for (i = 1; i <= m; i++) {
-        pkg = package(order[i])
+      for (i = 1; i <= u; i++) {
+        x = order[i]
         best = 0
         for (j = 1; j <= lanes; j++) {
-          end = load[j] + ms[order[i]] + ((j SUBSEP pkg) in loads ? 0 : start[pkg])
+          end = load[j] + cost[x] + ((j SUBSEP pkg[x]) in loads ? 0 : start[pkg[x]])
           if (best == 0 || end < bestend) { best = j; bestend = end }
         }
         load[best] = bestend
-        loads[best, pkg] = 1
-        held[best]++
-        printf "%d %s\n", int((best - 1) / p) + 1, order[i] >> (dir "/corpus-" ((best - 1) % p + 1) ".txt")
+        loads[best, pkg[x]] = 1
+        for (k = 1; k <= size[x]; k++) {
+          held[best]++
+          printf "%d %s\n", int((best - 1) / p) + 1, member[x, k] >> (dir "/corpus-" ((best - 1) % p + 1) ".txt")
+        }
       }
       for (j = 1; j <= lanes; j++)
         printf "corpus %d.%d: %d runs, %.1fs\n", (j - 1) % p + 1, int((j - 1) / p) + 1, held[j], load[j] / 1000
@@ -916,7 +967,7 @@ cmd_cache_payloads() {
 }
 
 # Deletes this run's entries under the keys above. A GitHub key is immutable, so an entry no later
-# run reads holds the repository's cache budget against the object cache, which does outlive a run.
+# run reads holds the repository's cache budget against the caches that do outlive a run.
 cmd_give_back() {
   local run=${1:?usage: ci-shards.sh give-back RUN_ID} key listing size id
   for key in ${GIVE_BACK[@]+"${GIVE_BACK[@]}"}; do
@@ -1039,7 +1090,7 @@ check_shards() {
   shard_configs "$dir" "$timings" > /dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     rm -rf "$tmp"
-    # A measured table too small to fill the partitions is the fallback, not a failure.
+    # A measured table too small to fill the shards is the fallback, not a failure.
     if [[ $rc -eq 3 && $what == measured ]]; then
       return 0
     fi
@@ -1093,6 +1144,62 @@ check_shards() {
   done | LC_ALL=C sort > "$tmp/desks-cut"
   if ! cmp -s "$tmp/desks-cut" <(desk_placed | LC_ALL=C sort); then
     echo "FAIL: the $what cut's desk runs are not every desk run, each once" >&2
+    bad=1
+  fi
+  rm -rf "$tmp"
+  return "$bad"
+}
+
+# Whether the corpus cut over the nextest rows in $1 and invented corpus costs keeps a module placed
+# a test at a time on one lane while it fits one, and splits one that outgrows a lane into runs of
+# neighbouring tests, each on a lane of its own.
+check_runs() {
+  local nextest=$1 tmp fits outgrows module most count k bad=0
+  tmp=$(mktemp -d)
+  most=0
+  for module in "${CLI_BY_TEST[@]}"; do
+    count=$(corpus_placed | grep -c "^cli-$module:" || true)
+    if [[ $count -gt $most ]]; then most=$count; fits=cli-$module; fi
+  done
+  most=0
+  for module in "${CORPUS_BY_TEST[@]}"; do
+    count=$(corpus_placed | grep -c "^$module:" || true)
+    if [[ $count -gt $most ]]; then most=$count; outgrows=$module; fi
+  done
+  if [[ -z ${fits:-} || -z ${outgrows:-} || $most -lt 3 ]]; then
+    echo "FAIL: no module placed a test at a time has the tests the corpus cut's check needs" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  cp "$nextest" "$tmp/timings.tsv"
+  corpus_placed | awk -v fits="$fits:" -v outgrows="$outgrows:" -v OFS='\t' '
+    { ms = index($1, fits) == 1 ? 1 : index($1, outgrows) == 1 ? 30000 : 5000; print "corpus", $1, ms }
+  ' >> "$tmp/timings.tsv"
+  shard_configs "$tmp/cut" "$tmp/timings.tsv" > /dev/null || {
+    echo "FAIL: the corpus cut's check cut nothing" >&2
+    rm -rf "$tmp"
+    return 1
+  }
+  corpus_placed > "$tmp/order"
+  # `lane position` per test of the module, its position its place in the order the module declares.
+  for module in "$fits" "$outgrows"; do
+    for ((k = 1; k <= PARTITIONS; k++)); do
+      awk -v k="$k" -v m="$module:" 'index($2, m) == 1 { print k "." $1, $2 }' "$tmp/cut/corpus-$k.txt"
+    done | awk -v m="$module:" '
+      NR == FNR { if (index($1, m) == 1) at[$1] = ++n; next }
+      { print $1, at[$2] }
+    ' "$tmp/order" - | sort -k2,2n > "$tmp/$module.lanes"
+  done
+  if [[ $(cut -d' ' -f1 "$tmp/$fits.lanes" | sort -u | grep -c .) -ne 1 ]]; then
+    echo "FAIL: the corpus cut split $fits over lanes though its tests fit one" >&2
+    bad=1
+  fi
+  if [[ $(cut -d' ' -f1 "$tmp/$outgrows.lanes" | sort -u | grep -c .) -lt 2 ]]; then
+    echo "FAIL: the corpus cut kept $outgrows on one lane though it outgrows one" >&2
+    bad=1
+  fi
+  if [[ $(cut -d' ' -f1 "$tmp/$outgrows.lanes" | uniq | grep -c .) -ne $(cut -d' ' -f1 "$tmp/$outgrows.lanes" | sort -u | grep -c .) ]]; then
+    echo "FAIL: the corpus cut gave a lane tests of $outgrows that are not neighbours" >&2
     bad=1
   fi
   rm -rf "$tmp"
@@ -1252,6 +1359,7 @@ cmd_verify() {
       done < <(awk '/^#\[test\]/ { t = 1; next } t && match($0, /^fn [a-z0-9_]+\(/) { print substr($0, 4, RLENGTH - 4); t = 0 }' "$made_up_file")
     done
     check_shards made-up "$made_up/timings.tsv" || failures=$((failures + 1))
+    check_runs "$made_up/timings.tsv" || failures=$((failures + 1))
     rm -rf "$made_up"
     if [[ -s $TIMINGS ]]; then
       check_shards measured "$TIMINGS" || failures=$((failures + 1))
@@ -1369,13 +1477,18 @@ cmd_verify() {
     fi
   done
   for module in "${CORPUS_DESKS[@]}"; do
-    if ! grep -qx "$module:1" <<< "$entries"; then
+    if ! grep -q "^$module:" <<< "$entries"; then
       echo "FAIL: '$module' runs on the desk runners and $CORPUS_CHECKS/$module.ply declares no test" >&2
       failures=$((failures + 1))
     fi
   done
   if [[ $DESK_RUNNERS -lt 1 ]]; then
     echo "FAIL: DESK_RUNNERS is $DESK_RUNNERS, so the desk runs run nowhere" >&2
+    failures=$((failures + 1))
+  fi
+  # The ids a developer's awk derives are the ones the runner's cut and lanes use.
+  if [[ $(printf 'ä — non-ascii\n' | label_ids | cut -f1) != ebwzok ]]; then
+    echo "FAIL: this awk hashes a label to another id than every other awk does" >&2
     failures=$((failures + 1))
   fi
   # A run is picked out by a substring of its tests' qualified names: a module's by `<module>.`, which
@@ -1399,6 +1512,10 @@ cmd_verify() {
         continue
       fi
       names=$(corpus_test_names "$root/$dir/$module.ply")
+      if [[ -n $(label_ids <<< "$names" | cut -f1 | sort | uniq -d) ]]; then
+        echo "FAIL: two tests of $dir/$module.ply hash to one id, so one run would take both" >&2
+        failures=$((failures + 1))
+      fi
       while IFS= read -r name; do
         [[ -n $name ]] || continue
         if [[ $(grep -cF -- "$name" <<< "$names") -gt 1 ]]; then
