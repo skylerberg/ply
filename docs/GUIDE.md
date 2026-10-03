@@ -1524,6 +1524,13 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 `where derivable(D, p)` goes after the row and before any `requires`. Codecs are
 plain values: `json::decode_bytes(body, order_json())`.
 
+A `json` or `bin` codec whose type reaches itself, directly or through the
+other types the module derives, is two definitions: `tree_json()` starts
+`tree_json_at(json::max_depth())`, and each level hands the next one less, so
+the recursion is seen to end (§5.10). Past the bound, a decode is an error and an
+encode panics. `json`'s bound is 128 levels, as deep as `parse` reads, and
+`bin`'s is 10,000, as deep as calls nest (§5.7).
+
 `E0206` names the field that blocks a derivation: function types, `Cell`, `Task`
 and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
 `bin`, `show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json`
@@ -1786,7 +1793,9 @@ character), `instant_json` and `duration_json` (nanoseconds), and combinators
 `result_json`, `map_json`, `string_map_json`. Entry points:
 `decode_bytes`, `decode_string`, `encode_bytes`, `encode_string`, `parse`,
 `parse_string`, `to_bytes`, `to_string`. `error_to_string` gives
-`$.lines[2].unit_price: expected a number, found a string`.
+`$.lines[2].unit_price: expected a number, found a string`. `max_depth()` is
+the nesting `parse` reads and `to_bytes` writes, 128; `too_deep()` is the codec
+a derived one becomes past it (§11).
 
 ### 13.5 `std.db` — PostgreSQL
 
@@ -3058,7 +3067,8 @@ Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
 `i128_bin`, `instant_bin`, `duration_bin`, `ordering_bin`, `rounding_bin`, and
 combinators `list_bin`, `array_bin` (written as a list is, under a shape of its
 own), `option_bin`, `result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*`
-and `take_*` are public too.
+and `take_*` are public too. `max_depth()`, 10,000, bounds a derived codec over a
+recursive type, and `too_deep()` is the codec it becomes past it (§11).
 
 ### 13.38 `std.show`
 

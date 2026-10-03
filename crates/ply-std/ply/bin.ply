@@ -27,13 +27,31 @@ pub type BinCodec<a> = {
   shape: Shape,
 }
 
+// The deepest a derived codec over a recursive type nests, which is as deep as calls nest.
+pub fn max_depth() -> Int = 10000
+
+// A derived codec over a recursive type, past `max_depth` levels of it.
+pub fn too_deep<a>() -> BinCodec<a> =
+  {
+    put: |_w: Bytes, _x: a| panic(nested_too_deep()),
+    take: |_d: Bytes, at: Int| Err(refused(at, nested_too_deep())),
+    shape: |_s: Shapes| panic(nested_too_deep()),
+  }
+
+fn nested_too_deep() -> String = "nested deeper than " ++ int_to_string(max_depth()) ++ " levels"
+
 // --- Varints ----------------------------------------------------------------
 
 // Seven bits a byte, low first, the high bit set on every byte but the last; `n` is read as its
 // 64 unsigned bits.
+// A negative value's first shift leaves it non-negative, and from there each shift lowers it.
 pub fn put_varint(w: Bytes, n: Int) -> Bytes =
-  if n >= 0 && n < 128 { w ++ byte_of_int(n) }
-  else { put_varint(w ++ byte_of_int(n & 127 | 128), n >>> 7) }
+  if n >= 0 { unsigned_varint(w, n) }
+  else { unsigned_varint(w ++ byte_of_int(n & 127 | 128), n >>> 7) }
+
+fn unsigned_varint(w: Bytes, n: Int) -> Bytes =
+  if n < 128 { w ++ byte_of_int(n) }
+  else { unsigned_varint(w ++ byte_of_int(n & 127 | 128), n >>> 7) }
 
 pub fn take_varint(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> = {
   let b = byte_at(d, at);
@@ -49,13 +67,13 @@ fn varint_from(
   shift: Int,
   acc: Int,
 ) -> Result<Taken<Int>, BinError> = {
-  let b = byte_at(d, at);
-  if b < 0 { Err(short(at)) }
-  else if shift == 63 && b > 1 { Err(refused(start, "a varint wider than 64 bits")) }
-  else if b < 128 {
-    if b == 0 && shift > 0 { Err(refused(start, "a varint with a redundant last byte")) }
-    else { Ok({ value: acc | b << shift, at: at + 1 }) }
-  } else { varint_from(d, start, at + 1, shift + 7, acc | (b & 127) << shift) }
+  if at >= bytes_len(d) { Err(short(at)) } else {
+    let b = bytes_at(d, at);
+    if shift == 63 && b > 1 { Err(refused(start, "a varint wider than 64 bits")) } else if b < 128 {
+      if b == 0 && shift > 0 { Err(refused(start, "a varint with a redundant last byte")) }
+      else { Ok({ value: acc | b << shift, at: at + 1 }) }
+    } else { varint_from(d, start, at + 1, shift + 7, acc | (b & 127) << shift) }
+  }
 }
 
 fn zig(n: Int) -> Int = n << 1 ^ n >> 63
@@ -284,21 +302,26 @@ fn u128_from(
   shift: Int,
   acc: U128,
 ) -> Result<Taken<U128>, BinError> = {
-  let b = byte_at(d, at);
-  if b < 0 { Err(short(at)) }
-  else if shift == 126 && b > 3 { Err(refused(start, "a varint wider than 128 bits")) }
-  else if b < 128 {
-    if b == 0 && shift > 0 { Err(refused(start, "a varint with a redundant last byte")) }
-    else { t_ok(acc | u128_of_int(b) << shift, at + 1) }
-  } else { u128_from(d, start, at + 1, shift + 7, acc | u128_of_int(b & 127) << shift) }
+  if at >= bytes_len(d) { Err(short(at)) } else {
+    let b = bytes_at(d, at);
+    if shift == 126 && b > 3 { Err(refused(start, "a varint wider than 128 bits")) }
+    else if b < 128 {
+      if b == 0 && shift > 0 { Err(refused(start, "a varint with a redundant last byte")) }
+      else { t_ok(acc | u128_of_int(b) << shift, at + 1) }
+    } else { u128_from(d, start, at + 1, shift + 7, acc | u128_of_int(b & 127) << shift) }
+  }
 }
 
 // Zigzagged in its own width, then written as its 128 unsigned bits.
 pub fn put_i128(w: Bytes, n: I128) -> Bytes = i128_bits(w, n << 1 ^ n >> 127)
 
 fn i128_bits(w: Bytes, z: I128) -> Bytes =
-  if z >= 0i128 && z < 128i128 { w ++ byte_of_int(int_of_i128(z)) }
-  else { i128_bits(w ++ byte_of_int(int_of_i128(z & 127i128) | 128), z >>> 7) }
+  if z >= 0i128 { unsigned_i128_bits(w, z) }
+  else { unsigned_i128_bits(w ++ byte_of_int(int_of_i128(z & 127i128) | 128), z >>> 7) }
+
+fn unsigned_i128_bits(w: Bytes, z: I128) -> Bytes =
+  if z < 128i128 { w ++ byte_of_int(int_of_i128(z)) }
+  else { unsigned_i128_bits(w ++ byte_of_int(int_of_i128(z & 127i128) | 128), z >>> 7) }
 
 pub fn take_i128(d: Bytes, at: Int) -> Result<Taken<I128>, BinError> =
   i128_from(d, at, at, 0, 0i128)
@@ -310,15 +333,16 @@ fn i128_from(
   shift: Int,
   acc: I128,
 ) -> Result<Taken<I128>, BinError> = {
-  let b = byte_at(d, at);
-  if b < 0 { Err(short(at)) }
-  else if shift == 126 && b > 3 { Err(refused(start, "a varint wider than 128 bits")) }
-  else if b < 128 {
-    if b == 0 && shift > 0 { Err(refused(start, "a varint with a redundant last byte")) } else {
-      let z = acc | i128_of_int(b) << shift;
-      t_ok(z >>> 1 ^ 0i128 - (z & 1i128), at + 1)
-    }
-  } else { i128_from(d, start, at + 1, shift + 7, acc | i128_of_int(b & 127) << shift) }
+  if at >= bytes_len(d) { Err(short(at)) } else {
+    let b = bytes_at(d, at);
+    if shift == 126 && b > 3 { Err(refused(start, "a varint wider than 128 bits")) }
+    else if b < 128 {
+      if b == 0 && shift > 0 { Err(refused(start, "a varint with a redundant last byte")) } else {
+        let z = acc | i128_of_int(b) << shift;
+        t_ok(z >>> 1 ^ 0i128 - (z & 1i128), at + 1)
+      }
+    } else { i128_from(d, start, at + 1, shift + 7, acc | i128_of_int(b & 127) << shift) }
+  }
 }
 
 // --- Shapes -----------------------------------------------------------------
@@ -479,7 +503,7 @@ fn take_items<a>(
   take: (Bytes, Int) -> Result<Taken<a>, BinError>,
   acc: List<a>,
 ) -> Result<Taken<List<a>>, BinError> =
-  if left == 0 { t_ok(acc, at) } else {
+  if left <= 0 { t_ok(acc, at) } else {
     match take(d, at) {
       Err(e) -> Err(e),
       Ok(t) -> take_items(d, t.at, left - 1, take, push(acc, t.value)),
@@ -513,7 +537,7 @@ fn take_entries<k, v>(
 ) -> Result<Taken<Map<k, v>>, BinError>
   where derivable(ord, k)
 =
-  if left == 0 { t_ok(acc, at) } else {
+  if left <= 0 { t_ok(acc, at) } else {
     match (key.take)(d, at) {
       Err(e) -> Err(e),
       Ok(x) -> {
@@ -787,15 +811,19 @@ test "a shape tells types apart by structure and by name, and a recursive one fi
 }
 
 // A hand-written recursive codec, as `derive bin` writes one: the shape names the type again.
-fn tree() -> BinCodec<List<Int>> =
-  {
-    put: |w: Bytes, xs: List<Int>| w,
-    take: |d: Bytes, at: Int| t_ok([], at),
-    shape: |s: Shapes|
-      sum_shape(s, "t.Tree", "Tree", [], [
-        { name: "Leaf", fields: [] },
-        { name: "Node", fields: [tree().shape, tree().shape] },
-      ]),
+fn tree() -> BinCodec<List<Int>> = tree_at(max_depth())
+
+fn tree_at(depth: Int) -> BinCodec<List<Int>> =
+  if depth <= 0 { too_deep() } else {
+    {
+      put: |w: Bytes, xs: List<Int>| w,
+      take: |d: Bytes, at: Int| t_ok([], at),
+      shape: |s: Shapes|
+        sum_shape(s, "t.Tree", "Tree", [], [
+          { name: "Leaf", fields: [] },
+          { name: "Node", fields: [tree_at(depth - 1).shape, tree_at(depth - 1).shape] },
+        ]),
+    }
   }
 
 // --- Laws -------------------------------------------------------------------
