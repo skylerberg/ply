@@ -15,13 +15,14 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 8] = [
+const OPERATIONS: [(&str, &str); 9] = [
     ("var", "ply_launcher::env::var"),
     ("vars", "ply_launcher::env::vars"),
     ("terminal", "ply_launcher::env::terminal"),
     ("binary_version", "ply_launcher::env::binary_version"),
     ("pwd", "ply_launcher::env::pwd"),
     ("shipped_digest", "ply_launcher::env::shipped_digest"),
+    ("builder_digest", "ply_launcher::env::builder_digest"),
     ("fronts", "ply_launcher::env::fronts"),
     ("bodies", "ply_launcher::env::bodies"),
 ];
@@ -81,6 +82,8 @@ impl HostHandler for Site {
             // The digest the committed CLI artifact is gated on: the build of the program's own
             // sources writes it beside the artifact.
             ("shipped_digest", []) => Value::str(crate::shipped::identity()),
+            // The digest the committed builder is gated on: `ply bootstrap` writes it beside it.
+            ("builder_digest", []) => Value::str(crate::builder::identity()),
             // Under the stage root, where `sweep` keeps them to the cache's budget.
             ("fronts", []) => Value::str(
                 ply_codegen::c::bundle::stage_dir(ply_codegen::c::sweep::RUNS)

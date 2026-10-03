@@ -1,8 +1,8 @@
 # AGENTS.md
 
 Ply is a general-purpose programming language. Its compiler is written in Ply
-(`crates/ply-compiler/ply`), compiled to C and committed as a bootstrap bundle. The Rust crates are
-the runtime and the CLI.
+(`crates/ply-compiler/ply`), and its builder (`build.main`) is committed as a runnable the launcher
+enters to build `ply` itself. The Rust crates are the runtime and the launcher.
 
 ## Prose
 
@@ -42,15 +42,15 @@ the runtime and the CLI.
   the nextest shards and the corpus partitions from the durations CI measured.
 - Never commit `crates/ply-compiler/bootstrap`, `crates/ply-cli/bootstrap` or
   `crates/ply-codegen-tests/fixtures/goldens` in a pull request: CI regenerates all three on
-  `main` after each merge (the `refresh` job), and a pull request runs its sources through the
-  checked-in bundle as a stage. A golden that moved is listed in the nextest job's summary;
-  read it, since nothing fails on it.
-- The bundle carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
+  `main` after each merge (the `refresh` job), and a pull request's sources are built by the
+  checked-in builder, which first builds the pull request's own. A golden that moved is listed in
+  the nextest job's summary; read it, since nothing fails on it.
+- The builder carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
   project's are (`grep '^import std' crates/ply-compiler/ply/*.ply` and what those import), so
   only those cannot use a language rule the same pull request introduces. The rest of
   `crates/ply-std/ply` can.
-- `crates/ply-cli` is the CLI as a Ply program plus the artifact `ply build` makes of it
-  (`bootstrap/ply.plyx`); it is not a cargo crate. The `refresh` job rebuilds the artifact on
+- `crates/ply-cli` is the CLI as a Ply program plus the runnable `ply bootstrap` makes of it
+  (`bootstrap/ply.run`); it is not a cargo crate. The `refresh` job rebuilds both runnables on
   main by driving the released binary, so the checkout can rebuild itself without cargo.
 - `docs/GUIDE.md` is the user manual. A change to syntax, types, builtins, the standard library,
   CLI commands, flags or exit codes, or diagnostic codes updates it in the same PR.
