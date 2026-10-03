@@ -1096,18 +1096,32 @@ pub const EXIT_OK: i32 = 0;
 /// else `0` for a value returned and the diagnostic for a raise; what the entry ended with is the
 /// caller's to report.
 pub fn enter(artifact: &Artifact, opened: &Opened, argv: Vec<String>, binds: Binds) -> Ended<i32> {
-    let Binds {
-        roots,
-        executables,
-        lent,
-        trust,
-    } = binds;
     // A unit built for another runtime is left aside and the bodies serve.
     let unit = if servable(artifact) {
         artifact.unit.as_ref()
     } else {
         None
     };
+    entered_with(unit, opened, argv, binds)
+}
+
+/// [`enter`] for a program no artifact carries: its own load, compiled here from the body cache.
+pub fn enter_loaded(opened: &Opened, argv: Vec<String>, binds: Binds) -> Ended<i32> {
+    entered_with(None, opened, argv, binds)
+}
+
+fn entered_with(
+    unit: Option<&EmbeddedUnit>,
+    opened: &Opened,
+    argv: Vec<String>,
+    binds: Binds,
+) -> Ended<i32> {
+    let Binds {
+        roots,
+        executables,
+        lent,
+        trust,
+    } = binds;
     let declared = opened
         .front
         .check

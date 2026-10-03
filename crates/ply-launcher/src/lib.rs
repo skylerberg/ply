@@ -6,16 +6,16 @@
 //! bindings, and the exit code.
 
 use ply_eval::{Diagnostic, Ended, codes};
-use ply_machine::artifact::{self, Binds};
+use ply_machine::artifact::{self, Artifact, Binds, Opened};
 use std::path::{Path, PathBuf};
 
 /// The front end and emitter recurse once per node on the native stack.
 const STACK: usize = 256 << 20;
 
-/// What a launched program is: its artifact, the shelf its modules lay out as, the root its `cwd`
-/// names, and the binary's version for the environment it may ask about.
+/// What a launched program is: what it is entered from, the shelf its modules lay out as, the root
+/// its `cwd` names, and the binary's version for the environment it may ask about.
 pub struct Program {
-    pub artifact: Vec<u8>,
+    pub image: shipped::Image,
     pub artifact_name: String,
     pub shelf: Vec<(String, String)>,
     /// The stage's identity: the shelf lands beside the unit cache under it.
@@ -118,32 +118,21 @@ fn lay_out(dir: &Path, sources: &[(String, String)], stamps: &str) -> std::io::R
 /// for, with what the entry ended with. `binds` lends whatever the caller's command configured on
 /// top of the launcher's own.
 pub fn run(
-    program: &Program,
+    program: Program,
     root: &Path,
     argv: Vec<String>,
     mut binds: Binds,
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
-    let shelf = match shelf(program) {
+    let shelf = match shelf(&program) {
         Ok(shelf) => shelf,
         Err(refused) => return Ended::refused(refused),
     };
     ply_machine::shipped::stamp(stamps());
-    let path = PathBuf::from(&program.artifact_name);
-    let artifact = match artifact::decode(&program.artifact, &path) {
-        Ok((artifact, _)) => artifact,
-        Err(refused) => return Ended::refused(refused),
-    };
-    let opened = match artifact::open(&artifact, &path) {
+    let version = program.version.clone();
+    let (artifact, opened) = match opened(program) {
         Ok(opened) => opened,
-        Err(diagnostics) => {
-            return Ended::refused(diagnostics.into_iter().next().unwrap_or_else(|| {
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    "the program did not open, and nothing said why",
-                )
-            }));
-        }
+        Err(refused) => return Ended::refused(refused),
     };
     let mut roots = vec![
         ply_host::fs::RootSpec {
@@ -163,9 +152,7 @@ pub fn run(
     ];
     roots.append(&mut binds.roots);
     binds.roots = roots;
-    binds
-        .lent
-        .extend(crate::env::registrations(&program.version));
+    binds.lent.extend(crate::env::registrations(&version));
     // The program is the tool's own work rather than a program under test, so the budgets a run
     // gives a program are not its. The entry runs on a thread of its own, with the stack a front
     // end's recursion wants.
@@ -178,7 +165,7 @@ pub fn run(
                     let (answer, counted, sites) = crate::count::window_sampled(
                         || {
                             ply_codegen::rt::unbounded(|| {
-                                artifact::enter(&artifact, &opened, argv, binds)
+                                entered(artifact.as_ref(), &opened, argv, binds)
                             })
                         },
                         asked.every(),
@@ -195,7 +182,7 @@ pub fn run(
                     answer
                 }
                 None => {
-                    ply_codegen::rt::unbounded(|| artifact::enter(&artifact, &opened, argv, binds))
+                    ply_codegen::rt::unbounded(|| entered(artifact.as_ref(), &opened, argv, binds))
                 }
             }
         });
@@ -211,6 +198,51 @@ pub fn run(
             )
             .primary(ply_eval::Span::DUMMY, "this is Ply's fault"),
         ),
+    }
+}
+
+/// The program opened from its image: the committed artifact decoded and opened, or the sources'
+/// load as it stands.
+fn opened(program: Program) -> Result<(Option<Artifact>, Opened), Diagnostic> {
+    match program.image {
+        shipped::Image::Committed(bytes) => {
+            let path = PathBuf::from(&program.artifact_name);
+            let (artifact, _) = artifact::decode(&bytes, &path)?;
+            let opened = artifact::open(&artifact, &path).map_err(|diagnostics| {
+                diagnostics.into_iter().next().unwrap_or_else(|| {
+                    Diagnostic::error(
+                        codes::INTERNAL_ERROR,
+                        "the program did not open, and nothing said why",
+                    )
+                })
+            })?;
+            Ok((Some(artifact), opened))
+        }
+        shipped::Image::Loaded(loaded) => {
+            let entry = loaded.sole_entry_point()?.name.clone();
+            let loaded = *loaded;
+            let front = std::sync::Arc::try_unwrap(loaded.front).unwrap_or_else(|f| (*f).clone());
+            Ok((
+                None,
+                Opened {
+                    sources: loaded.sources,
+                    front,
+                    entry,
+                },
+            ))
+        }
+    }
+}
+
+fn entered(
+    artifact: Option<&Artifact>,
+    opened: &Opened,
+    argv: Vec<String>,
+    binds: Binds,
+) -> Ended<i32> {
+    match artifact {
+        Some(artifact) => artifact::enter(artifact, opened, argv, binds),
+        None => artifact::enter_loaded(opened, argv, binds),
     }
 }
 
