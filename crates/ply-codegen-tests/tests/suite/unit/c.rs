@@ -247,6 +247,20 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
     assert!(ply_codegen::c::Exports::from_text("int main(void) { return 0; }").is_none());
 }
 
+/// Each bucket's table reads back as the loader fills it, and a table whose C writes the unit's
+/// positions itself names none.
+#[test]
+fn a_units_bucket_tables_read_back_and_a_table_without_them_names_none() {
+    let tables = "helpers 0\nctors 0\ntaken 0\nconstants 0\nmodules 0\nrefused 0\n\
+                  consts 0\nbuiltins 0\nfields 0\nshapes 0\nlambdas 0\n";
+    let with = format!("{tables}buckets 2\n3 0 2\n58 1\n");
+    let read = ply_codegen::c::Exports::decode(&with).expect("the table reads");
+    assert_eq!(read.buckets, vec![(3, vec![0, 2]), (58, vec![1])]);
+    assert_eq!(read.encode(), with);
+    let without = ply_codegen::c::Exports::decode(tables).expect("the table reads");
+    assert!(without.buckets.is_empty());
+}
+
 /// A unit handed over is loaded once, to read what it holds; the first backend on that thread takes
 /// that load rather than mapping the image again, and a later one maps it anew.
 #[test]
@@ -741,6 +755,19 @@ mod numbering_support {
         &body[..body.find("\n}\n").map_or(body.len(), |end| end + 3)]
     }
 
+    /// The unit's position of each literal a body reads, through its bucket's table.
+    pub fn literal_places(produced: &super::Produced, body: &str) -> Vec<u32> {
+        body.match_indices("rt_lit_p(ctx, ply_bk_")
+            .filter_map(|(at, read)| {
+                let rest = &body[at + read.len()..];
+                let id = u8::from_str_radix(rest.get(..2)?, 16).ok()?;
+                let slot: usize = rest.get(3..rest.find(']')?)?.parse().ok()?;
+                let (_, places) = produced.exports.buckets.iter().find(|(b, _)| *b == id)?;
+                places.get(slot).copied()
+            })
+            .collect()
+    }
+
     /// The C the unit published for `name`; a test reads a symbol rather than spelling one.
     pub fn symbol(produced: &super::Produced, name: &str) -> String {
         produced
@@ -813,7 +840,7 @@ pub fn two(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"two" }
         let symbol = numbering_support::symbol(&produced, name);
         let body = numbering_support::body(&produced.text, &symbol);
         assert!(
-            body.contains(&format!("rt_lit_p(ctx, {at})")),
+            numbering_support::literal_places(&produced, body).contains(&(*at as u32)),
             "`{name}` does not read the shared constant from its one entry:\n{body}"
         );
     }
