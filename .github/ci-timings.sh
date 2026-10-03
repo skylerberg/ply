@@ -7,6 +7,8 @@
 #                                            decided when it ended, and, with NAME, their steps
 #   .github/ci-timings.sh why [RUN] [NAME]   one job: its steps, what the actions inside it did,
 #                                            the cache entries it found and wrote, its pauses
+#   .github/ci-timings.sh tests [RUN] [N]    the N slowest tests of RUN (default 40), from the
+#                                            `test-durations` artifact its `passes` job uploads
 #   .github/ci-timings.sh --self-test        the timestamp arithmetic, against fixtures
 #
 # RUN is a run id, a run URL, or a branch with a run; with none, the newest run of `CI`. NAME is a
@@ -290,6 +292,18 @@ steps_for() {
     "$tmp/jobs.json")
 }
 
+cmd_tests() {
+  local run=$1 n=$2
+  [ -n "$run" ] || die "no run of CI to read"
+  gh run download "$run" -n test-durations -D "$tmp/durations" >/dev/null ||
+    die "run $run has no test-durations artifact: an older run, or one whose passes job did not finish"
+  awk -F'\t' -v n="$n" '
+    NR <= n { printf "%8.1fs  %-32s %s\n", $1 / 1000, $2, $3 }
+    { t += $1 }
+    END { printf "%d tests, %.0f s in all\n", NR, t / 1000 }
+  ' "$tmp/durations/tests.tsv"
+}
+
 cmd_why() {
   local run=$1 pattern=${2:-} id name started completed status rows count
   fetch "$run"
@@ -380,7 +394,7 @@ LOG
   echo "self-test: the epochs, a duration, an action's own time, a pause and a cache line all hold"
 }
 
-[ $# -gt 0 ] || die "usage: ci-timings.sh {runs [N]|jobs [RUN] [NAME]|why [RUN] [NAME]|--self-test}"
+[ $# -gt 0 ] || die "usage: ci-timings.sh {runs [N]|jobs [RUN] [NAME]|why [RUN] [NAME]|tests [RUN] [N]|--self-test}"
 if [ "$1" = "--self-test" ]; then self_test; exit 0; fi
 
 tmp=$(mktemp -d)
@@ -390,5 +404,6 @@ case "$1" in
   runs) cmd_runs "${2:-5}" ;;
   jobs) cmd_jobs "$(resolve_run "${2:-}")" "${3:-}" ;;
   why) cmd_why "$(resolve_run "${2:-}")" "${3:-}" ;;
-  *) die "unknown mode: $1 (runs, jobs, why, --self-test)" ;;
+  tests) cmd_tests "$(resolve_run "${2:-}")" "${3:-40}" ;;
+  *) die "unknown mode: $1 (runs, jobs, why, tests, --self-test)" ;;
 esac
