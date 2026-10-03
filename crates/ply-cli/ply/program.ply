@@ -11,6 +11,7 @@ import compiler.front (Refused, Analysed, Whole, Pulled, Rows, DefInterface,
 import compiler.pkg (Pkgs, Supplied)
 import compiler.interface (CompiledPackage, Original, merged_interfaces)
 import interfaces
+import compiler.hash
 import compiler.hash (HashOutput, hex)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
@@ -405,21 +406,10 @@ pub fn stdlib_notice(moved: Option<StdlibMoved>, h: HashOutput) -> List<Diag> =
         };
         if now == Some(e.hash) { acc } else { map_insert(acc, e.name, true) }
       });
-      let closures = fold(
-        h.closure,
-        map_new(),
-        |acc: Map<Bytes, Map<Bytes, Bool>>, c: { name: Bytes, names: Map<Bytes, Bool> }|
-          map_insert(acc, c.name, c.names),
-      );
-      let reaches = |name: Bytes|
-        match map_get(closures, name) {
-          Some(names) ->
-            map_fold(names, false, |acc: Bool, k: Bytes, v: Bool| acc || map_contains(changed, k)),
-          None -> false,
-        };
+      let reached = hash::reaching(h, changed);
       let counted = |xs: List<{ name: Bytes, hash: Bytes }>|
         fold(xs, 0, |n: Int, x: { name: Bytes, hash: Bytes }|
-          if reaches(x.name) { n + 1 } else { n });
+          if map_contains(reached, x.name) { n + 1 } else { n });
       [stdlib_changed(m.was, m.now, counted(h.defs) + counted(h.decls))]
     },
   }
@@ -741,13 +731,14 @@ pub fn unknown_def(query: String, names: List<String>) -> Diag =
 pub fn noted(d: Diag, note: Bytes) -> Diag =
   { ..d, notes: d.notes + 1, notes_text: push(d.notes_text, note) }
 
-// The hash tables the dump writes as lists, indexed once so a lookup is not a scan.
+// The hash tables the dump writes as lists, indexed once so a lookup is not a scan, and the
+// hashing itself, which a closure is walked over when one is asked for.
 pub type Tables = {
   defs: Map<Bytes, Bytes>,
   own: Map<Bytes, Bytes>,
   deps: Map<Bytes, List<Bytes>>,
-  closure: Map<Bytes, List<Bytes>>,
   specs: Map<Bytes, Int>,
+  hashes: HashOutput,
 }
 
 pub fn tables_of(h: HashOutput) -> Tables =
@@ -762,22 +753,13 @@ pub fn tables_of(h: HashOutput) -> Tables =
       |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
         map_insert(acc, x.name, x.names),
     ),
-    closure: fold(
-      h.closure,
-      map_new(),
-      |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: Map<Bytes, Bool> }|
-        map_insert(
-          acc,
-          x.name,
-          map_fold(x.names, [], |ns: List<Bytes>, k: Bytes, v: Bool| push(ns, k)),
-        ),
-    ),
     specs: fold(
       h.specs,
       map_new(),
       |acc: Map<Bytes, Int>, x: { name: Bytes, hashes: List<Bytes> }|
         map_insert(acc, x.name, len(x.hashes)),
     ),
+    hashes: h,
   }
 
 // A definition's hash as `ply hash` prints it: sixty-four hex characters, or nothing when the
@@ -795,10 +777,12 @@ pub fn deps_of(t: Tables, name: Bytes) -> List<String> =
   }
 
 pub fn closure_of(t: Tables, name: Bytes) -> List<String> =
-  match map_get(t.closure, name) {
-    Some(ns) -> map(ns, |n: Bytes| string_of_bytes_lossy(n)),
-    None -> [],
-  }
+  map(map_keys(hash::closure_of(t.hashes, [name])), |n: Bytes| string_of_bytes_lossy(n))
+
+// Every name and key whose closure holds `name`, but `name` itself.
+pub fn reached_from(t: Tables, name: Bytes) -> List<Bytes> =
+  filter(map_keys(hash::reaching(t.hashes, map_insert(map_new(), name, true))), |key: Bytes|
+    key != name)
 
 pub fn specs_of(t: Tables, name: Bytes) -> Int =
   match map_get(t.specs, name) { Some(n) -> n, None -> 0 }
@@ -871,29 +855,20 @@ test "a name nothing declares is `E0101`, and an ambiguous one says which" {
   assert_eq(noted(many, b"and one more").notes, 2)
 }
 
-fn closed_over(names: List<Bytes>) -> Map<Bytes, Bool> =
-  fold(names, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true))
-
 fn two_defs() -> HashOutput =
   {
+    ..hash::no_hashes(),
     defs: [{ name: b"app.reads", hash: b"r1" }, { name: b"app.pure", hash: b"p1" }],
-    own: [],
     decls: [{ name: b"std.net.net", hash: b"n2" }],
-    tests: [],
-    laws: [],
-    specs: [],
-    spec_texts: [],
-    law_texts: [],
-    deps: [],
-    closure: [
-      { name: b"app.reads", names: closed_over([b"app.reads", b"std.net.net"]) },
-      { name: b"app.pure", names: closed_over([b"app.pure"]) },
-      { name: b"std.net.net", names: closed_over([b"std.net.net"]) },
-    ],
-    bodies: [],
-    test_bodies: [],
-    checks: [],
-    spec_checks: [],
+    refs: {
+      names: [b"app.reads", b"app.pure", b"std.net.net"],
+      edges: [[2], [], []],
+      starts: map_of_entries([
+        { key: b"app.reads", value: [0] },
+        { key: b"app.pure", value: [1] },
+        { key: b"std.net.net", value: [2] },
+      ]),
+    },
   }
 
 test "a moved stdlib is said once, counting what reaches a shipped definition that moved" {
