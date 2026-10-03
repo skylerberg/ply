@@ -11,6 +11,9 @@
 #       run's milliseconds are appended to TIMINGS as `corpus <run> <ms>`: a module's are its tests'
 #       own, out of the report. Each `ply test` adds `cached <what> <n>`, the tests it took from the
 #       cache, which tells `ci-shards.sh timings` whether the run's costs are a cold run's.
+#   ci-corpus.sh desks K TIMINGS CUT [ARG...]
+#       the desk runs runner K takes (`ci-shards.sh desks-for-runner K CUT`, round robin when CUT is
+#       empty) in one `ply test` with ARGs added, their milliseconds onto TIMINGS as a partition's
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 #   ci-corpus.sh mark                  the moment `keep` gathers from
 #   ci-corpus.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
@@ -132,14 +135,21 @@ run_one() {
   rm -f "$out"
 }
 
-# The runs IDs, all of one package, in one `ply test`: each run's milliseconds are the summed
-# durations of the tests whose `<module>.<label>` key its filter holds, and a run whose filter
-# selected none fails.
+# The runs IDs, all of one package, in one `ply test` with the ARGs after `--` added: each run's
+# milliseconds are the summed durations of the tests whose `<module>.<label>` key its filter holds,
+# and a run whose filter selected none fails.
 run_modules() {
   local timings=$1 id line path filter status=0 out bad=0 n ms i
-  local -a filters=() ids=() args=()
+  local -a filters=() ids=() args=() extra=()
   shift
-  for id in "$@"; do
+  while [ $# -gt 0 ]; do
+    if [ "$1" = -- ]; then
+      shift
+      extra=("$@")
+      break
+    fi
+    id=$1
+    shift
     line=$("$shards" corpus-line "$id") || return 2
     read -r path filter <<< "$line"
     ids+=("$id")
@@ -148,7 +158,7 @@ run_modules() {
   done
   out=$(mktemp)
   started=$(date +%s%3N)
-  tested "$path" "${args[@]}" > "$out" || status=$?
+  tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} > "$out" || status=$?
   wall=$(($(date +%s%3N) - started))
   listed "$out"
   spent "$out" "$wall"
@@ -245,6 +255,24 @@ case "${1:-}" in
       cat "$work/lane-$l.tsv" >> "$timings"
     done
     rm -rf "$work"
+    exit "$failed"
+    ;;
+  desks)
+    k=${2:?a desk runner}
+    timings=${3:?a file for the durations}
+    [ $# -ge 4 ] || { echo "usage: ci-corpus.sh desks K TIMINGS CUT [ARG...], CUT empty for none" >&2; exit 2; }
+    taken=$("$shards" desks-for-runner "$k" "$4") || exit 2
+    shift 4
+    : > "$timings"
+    if [ -z "$taken" ]; then
+      echo "desk runner $k takes no run: there are more runners than desk tests"
+      exit 0
+    fi
+    read -ra runs <<< "$(tr '\n' ' ' <<< "$taken")"
+    echo "::group::corpus desks ${runs[*]}"
+    failed=0
+    run_modules "$timings" "${runs[@]}" -- "$@" || failed=1
+    echo "::endgroup::"
     exit "$failed"
     ;;
   run)
@@ -344,7 +372,7 @@ case "${1:-}" in
     find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
     ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...] | mark | keep DIR | pack TAR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | desks K TIMINGS CUT [ARG...] | run ID [ARG...] | mark | keep DIR | pack TAR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
     exit 2
     ;;
 esac

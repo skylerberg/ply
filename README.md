@@ -56,8 +56,9 @@ cut from the durations its last run measured.
 Tests that must run alone are `SOLO` in `.github/ci-shards.sh`, run after the gates; run one
 with `cargo nextest run --workspace -E "$(.github/ci-shards.sh solo-filter <id>)"`.
 The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
-each `lanes` job runs a partition of them, apart from the `nextest` jobs, and the `corpus` job runs
-`serving` and `database` against a postgres. `.github/ci-corpus.sh run <id>` runs one with the grants CI passes.
+each `lanes` job runs a partition of them, apart from the `nextest` jobs, and the `corpus` jobs `desks-<k>`
+run the tests of `serving` and `database`, cut by duration, against a postgres. `.github/ci-corpus.sh run <id>`
+runs one with the grants CI passes.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
 name a server.
 
