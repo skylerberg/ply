@@ -43,6 +43,9 @@ pub const PLYX: &str = include_str!("../ply/plyx.ply");
 
 pub const EMIT: &str = include_str!("../ply/emit.ply");
 
+/// `embed` and `embed_dir`, written out as the literals the driver read for them.
+pub const EMBED: &str = include_str!("../ply/embed.ply");
+
 /// `ply fmt`: the tree printed back as source.
 pub const FMT: &str = include_str!("../ply/fmt.ply");
 
@@ -52,6 +55,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("costs", COSTS),
     ("derive", DERIVE),
     ("diag", DIAG),
+    ("embed", EMBED),
     ("emit", EMIT),
     ("exprs", EXPRS),
     ("fmt", FMT),

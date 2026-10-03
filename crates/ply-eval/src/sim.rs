@@ -1,6 +1,6 @@
 //! Deterministic simulation: seeds, the steps a run records, and seeded `clock`/`random`.
 
-use crate::{Diagnostic, EffectAtom, Mode, Span, codes};
+use crate::{Diagnostic, EffectAtom, Mode, Span, Symbol, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -222,21 +222,43 @@ impl StepFootprint {
 pub enum SimTy {
     Int,
     Unit,
+    /// The prelude's `Instant(Int)`, nanoseconds on the region's clock.
+    Instant,
+    /// The prelude's `Duration(Int)`, nanoseconds between two instants.
+    Duration,
 }
 
 impl SimTy {
     pub fn holds(self, value: &Value) -> bool {
-        matches!(
-            (self, value),
-            (SimTy::Int, Value::Int(_)) | (SimTy::Unit, Value::Unit)
-        )
+        match (self, value) {
+            (SimTy::Int, Value::Int(_)) | (SimTy::Unit, Value::Unit) => true,
+            (SimTy::Instant | SimTy::Duration, Value::Ctor { name, args }) => {
+                name.as_str() == self.as_str() && matches!(args.as_slice(), [Value::Int(_)])
+            }
+            _ => false,
+        }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             SimTy::Int => "Int",
             SimTy::Unit => "Unit",
+            SimTy::Instant => "Instant",
+            SimTy::Duration => "Duration",
         }
+    }
+}
+
+/// The nanoseconds an `Instant(n)` or a `Duration(n)` holds.
+pub fn nanos_of(value: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
+    match value {
+        Value::Ctor { args, .. } if args.len() == 1 => args[0].as_int(span, what),
+        other => Err(crate::value::type_error(
+            span,
+            what,
+            "an `Instant` or a `Duration`",
+            other,
+        )),
     }
 }
 
@@ -259,12 +281,12 @@ pub const SEEDED_OPS: &[OpSignature] = &[
         effect: "clock",
         op: "now",
         params: &[],
-        ret: SimTy::Int,
+        ret: SimTy::Instant,
     },
     OpSignature {
         effect: "clock",
         op: "sleep",
-        params: &[SimTy::Int],
+        params: &[SimTy::Duration],
         ret: SimTy::Unit,
     },
     OpSignature {
@@ -291,7 +313,18 @@ pub fn signature(effect: &str, op: &str) -> Option<&'static OpSignature> {
 }
 
 /// Answered by the scheduler, not [`Handlers`]: they are polymorphic and use scheduler state.
-pub const TASK_OPS: &[&str] = &["spawn", "join", "yield"];
+pub const TASK_OPS: &[&str] = &["spawn", "join", "yield", "cancel", "await"];
+
+/// What a cancel writes and every step of the cancelled task reads, so the search sees that
+/// cancelling earlier or later is a different run.
+pub fn liveness(task: TaskId, mode: Mode) -> Access {
+    Access::Atom(EffectAtom {
+        effect: Symbol::new("task.alive"),
+        resource: crate::footprint::Resource::Named(Symbol::new(format!("@{}", task.0))),
+        mode,
+        op: None,
+    })
+}
 
 /// Whether a `simulate` region's delimiter answers this operation.
 pub fn is_scheduled(effect: &str, op: &str) -> bool {
@@ -369,6 +402,11 @@ impl Clock {
 
     pub fn sleepers(&self) -> usize {
         self.timers.len()
+    }
+
+    /// Drops a cancelled sleeper's timer, so time no longer advances on its account.
+    pub fn cancel(&mut self, task: TaskId) {
+        self.timers.retain(|&(_, t)| t != task);
     }
 
     pub fn advance(&mut self) -> Option<Wake> {
@@ -478,9 +516,12 @@ impl Handlers {
             ));
         }
         match (sig.effect, sig.op) {
-            ("clock", "now") => Ok(Answer::Value(Value::Int(self.clock.now()))),
+            ("clock", "now") => Ok(Answer::Value(Value::ctor(
+                "Instant",
+                vec![Value::Int(self.clock.now())],
+            ))),
             ("clock", "sleep") => {
-                let nanos = args[0].as_int(span, "`clock.sleep`")?;
+                let nanos = nanos_of(&args[0], span, "`clock.sleep`")?;
                 match self.clock.sleep(task, nanos, span)? {
                     Sleep::Yield => Ok(Answer::Value(Value::Unit)),
                     Sleep::Until(deadline) => Ok(Answer::Sleeping { deadline }),
