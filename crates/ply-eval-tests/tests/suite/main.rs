@@ -11,7 +11,7 @@ mod host_boundary;
 mod host_linearity_audit;
 mod host_trust_audit;
 mod map_order;
-mod position_invariance_g1;
+mod position_invariance;
 mod record_update_reuse;
 mod reference_cycles;
 mod region_boundary_audit;
