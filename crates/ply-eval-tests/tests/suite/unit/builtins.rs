@@ -841,6 +841,29 @@ fn an_array_is_read_by_index_and_written_through_its_last_holder() {
 }
 
 #[test]
+fn a_digest_agrees_with_equality_and_refuses_what_has_no_hash() {
+    let digest = |v: Value| found(Builtin::Digest, vec![v]);
+    let decimal = |s: &str| Value::Decimal(s.parse().unwrap());
+    assert_eq!(digest(decimal("1.50")), digest(decimal("1.5")));
+    let narrow = ply_eval::Fixed::of(ply_eval::IntTy::U8, 7).unwrap();
+    assert_eq!(
+        digest(Value::Fixed(narrow)),
+        digest(Value::Int(7)),
+        "compiled code holds a narrow width as the Int it reads as"
+    );
+    assert_eq!(
+        digest(Value::ctor("orders.Shipped", vec![Value::Int(1)])),
+        digest(Value::ctor("app.orders.Shipped", vec![Value::Int(1)])),
+        "where a module stands is no part of a value"
+    );
+    assert_ne!(digest(ints(&[1, 2])), digest(ints(&[2, 1])));
+    for v in [Value::Float(1.0), Value::secret(Value::str("pw"))] {
+        let d = done(Builtin::Digest, vec![v]).unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+    }
+}
+
+#[test]
 fn rotr32_turns_the_low_word_and_answers_it_non_negative() {
     let cases: &[(i64, i64, i64)] = &[
         (1, 1, 0x8000_0000),

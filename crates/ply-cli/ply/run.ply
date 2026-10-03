@@ -39,6 +39,10 @@ import std.json (Json, Null, Str, Bool, Number, Array, Member, Object, object, t
 import std.value (Value, VInt, VUnit, render)
 import std.process (process, Captured, captured, out_step, err_step)
 import style (Style, dim, plain, red)
+import signing (provenance_of, public_of, signatures_path, unkeyed)
+import std.signed (signed_of, vouched_by)
+import compiler.plyx (digest_of, digest_text, domain, library_domain)
+import compiler.resolve (diag1)
 
 // The machine the run drives is the runtime's; the effect is `machine`'s. The `root` it loads is
 // the path the line named, or `.`.
@@ -528,10 +532,14 @@ pub fn run(
   if is_artifact(root_of(flags)) {
     match config_schema::misspelled(options.config.schema) {
       Some(d) -> unbound(s, { diags: [d], places: [], artifact: None }),
-      None -> {
-        machine.configure[run](options);
-        let target = machine.opened[run](root_of(flags), artifact_bytes(flags));
-        over(s, flags, target, configured_over(target, options))
+      None -> match signer_refusal(flags) {
+        Some(d) ->
+          unread(s, root_of(flags), { diags: [d], places: [], artifact: Some(root_of(flags)) }),
+        None -> {
+          machine.configure[run](options);
+          let target = machine.opened[run](root_of(flags), artifact_bytes(flags));
+          over(s, flags, target, configured_over(target, options))
+        },
       },
     }
   } else { sourced(s, flags, options) }
@@ -540,6 +548,90 @@ pub fn run(
 // Read here, so the machine reads no file of its own.
 fn artifact_bytes(flags: Flags) -> Option<Bytes> / {fs.read_file[cwd], fs.read_file[abs]} =
   match list_at(flags.paths, 0) { Some(r) -> paths::read_file(paths::rooted(r)), None -> None }
+
+// --- `--require-signer` ---------------------------------------------------------------
+
+fn unsigned(path: String, why: String) -> Diag =
+  diag1(
+    b"E0460",
+    4294967295,
+    { start: 0, end: 0 },
+    bytes_of_string("the artifact `" ++ path ++ "` " ++ why),
+    b"not signed by a key `--require-signer` trusts",
+    [
+      b"`ply build --sign KEY` signs what it builds, in `<artifact>.sig` beside it; `--require-signer` names the public key files a run trusts",
+    ],
+  )
+
+fn trusted_keys(
+  files: List<String>,
+) -> Result<List<Bytes>, Diag> / {fs.read_file[cwd], fs.read_file[abs]} =
+  fold(files, Ok([]), |acc: Result<List<Bytes>, Diag>, path: String|
+    match acc {
+      Err(d) -> Err(d),
+      Ok(keys) -> match paths::read_file(paths::spelled(path)) {
+        None -> Err(unkeyed(path, "cannot be read")),
+        Some(b) -> match public_of(string_of_bytes_lossy(b)) {
+          Ok(k) -> Ok(push(keys, k)),
+          Err(why) -> Err(unkeyed(path, "does not hold a public key: " ++ why)),
+        },
+      },
+    })
+
+fn signatures_of(flags: Flags) -> Option<Bytes> / {fs.read_file[cwd], fs.read_file[abs]} =
+  match list_at(flags.paths, 0) {
+    Some(r) -> {
+      let at = paths::rooted(r);
+      paths::read_file({ ..at, path: signatures_path(at.path) })
+    },
+    None -> None,
+  }
+
+// An artifact `--require-signer` holds to its keys runs only when one of them signed its digest.
+fn signer_refusal(flags: Flags) -> Option<Diag> / {fs.read_file[cwd], fs.read_file[abs]} =
+  if len(flags.signers) == 0 { None } else {
+    let path = root_of(flags);
+    match trusted_keys(flags.signers) {
+      Err(d) -> Some(d),
+      Ok(keys) -> match artifact_bytes(flags) {
+        // The machine refuses a file it cannot read, as it would without a signer to ask for.
+        None -> None,
+        Some(bytes) -> {
+          let into = if string_ends_with(path, ".plyz") { library_domain() } else { domain() };
+          let digest = match digest_of(into, bytes) { Some(d) -> digest_text(d), None -> "" };
+          match signatures_of(flags) {
+            None ->
+              Some(
+                unsigned(
+                  path,
+                  "carries no signatures: `" ++ signatures_path(path) ++ "` is not there",
+                ),
+              ),
+            Some(b) -> match signed_of(b) {
+              None -> Some(unsigned(path, "has signatures beside it that do not read")),
+              Some(g) -> match provenance_of(g.payload) {
+                None ->
+                  Some(unsigned(path, "has signatures beside it over nothing a build vouches for")),
+                Some(what) -> if what.digest != digest {
+                  Some(
+                    unsigned(
+                      path,
+                      "is " ++ digest ++ ", and its signatures vouch for " ++ what.digest,
+                    ),
+                  )
+                } else {
+                  match vouched_by(g, keys) {
+                    Some(_) -> None,
+                    None -> Some(unsigned(path, "is signed by no key `--require-signer` names")),
+                  }
+                },
+              },
+            },
+          }
+        },
+      },
+    }
+  }
 
 /// Whether a path names a built artifact rather than sources. `ply build` writes them, and the
 /// container they hold is `compiler.plyx`'s, so the spelling lives beside the writer.

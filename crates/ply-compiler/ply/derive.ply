@@ -10,7 +10,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
               ReturnClause, RecField, shown_binder)
 import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TDAlias, TDSum,
-              VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, deriver_text,
+              VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, deriver_text,
               deriver_tag, ImportDecl, ImportKind, IModule, IAlias, INames, Vis, VPub, VPriv,
               Derived, Constraint, SpecClause, parse)
 import rewrite (expand)
@@ -18,22 +18,16 @@ import resolve (Diag, Source, diag1, diag2, is_bare, dump_diags)
 
 // --- Rules ---------------------------------------------------------------------------------------
 
-pub type Why =
-  | WFunction
-  | WHandle
-  | WFloatIsNotOrdered
-  | WUnconstrained(Int)
-  | WNullInsideOption
-  | WSecret
+pub type Why = | WFunction | WHandle | WFloat | WUnconstrained(Int) | WNullInsideOption | WSecret
 pub type ConShape = | Leaf | Structural | Refused(Why) | Nominal
 
 // The one table the deriver and the checker's `derivable` both read, so the two cannot disagree.
 pub fn con_shape(d: Deriver, name: Bytes) -> ConShape =
   if name == b"Int" || name == b"Bool" || name == b"String" || name == b"Bytes" || name == b"Unit"
       || name == b"Decimal"
-      || name == b"Char" { Leaf }
-  else if name == b"Float" { match d { DOrd -> Refused(WFloatIsNotOrdered), _ -> Leaf } }
-  else if name == b"List" || name == b"Array" || name == b"Option" || name == b"Map"
+      || name == b"Char" { Leaf } else if name == b"Float" {
+    match d { DOrd -> Refused(WFloat), DHash -> Refused(WFloat), _ -> Leaf }
+  } else if name == b"List" || name == b"Array" || name == b"Option" || name == b"Map"
       || name == b"Result"
       || name == b"Ordering"
       || name == b"Rounding"
@@ -41,7 +35,7 @@ pub fn con_shape(d: Deriver, name: Bytes) -> ConShape =
       || name == b"Duration" { Structural }
   else if same_deriver(d, DBin) && is_fixed_width(name) { Leaf }
   else if same_deriver(d, DBin) && name == b"Iter" { Structural }
-  else if name == b"Cell" || name == b"Task" { Refused(WHandle) }
+  else if name == b"Cell" || name == b"Task" || name == b"Chan" { Refused(WHandle) }
   else if name == b"Secret" { match d { DEq -> Leaf, _ -> Refused(WSecret) } }
   else { Nominal }
 
@@ -133,14 +127,22 @@ fn function_refusal(d: Deriver) -> Bytes =
     DOrd -> b"functions cannot be ordered",
     DBin -> b"a function has no binary encoding",
     DShow -> b"a function has no rendering to derive",
+    DHash -> b"a function has no content to hash",
   }
 
 pub fn refusal_reason(w: Why, d: Deriver, simple: Bytes) -> Bytes =
   match w {
-    WFloatIsNotOrdered -> b"`Float` is not ordered: `NaN != NaN`",
+    WFloat -> float_reason(d),
     WHandle -> bytes_concat_all([b"a `", simple, b"` names a location rather than a value"]),
     WSecret -> secret_reason(d),
     _ -> b"",
+  }
+
+pub fn float_reason(d: Deriver) -> Bytes =
+  match d {
+    DHash ->
+      b"`Float` has no hash that agrees with `==`: `NaN != NaN`, and `0.0 == -0.0` in different bits",
+    _ -> b"`Float` is not ordered: `NaN != NaN`",
   }
 
 pub fn secret_reason(d: Deriver) -> Bytes =
@@ -150,6 +152,7 @@ pub fn secret_reason(d: Deriver) -> Bytes =
     DEq -> b"a credential has no structural equality to derive",
     DBin -> b"a derived codec would write the credential into the bytes",
     DShow -> b"a derived rendering would write the credential out",
+    DHash -> b"a hash of a credential is something to test guesses against",
   }
 
 pub fn refusal_note(w: Why, d: Deriver) -> Option<Bytes> =
@@ -162,6 +165,10 @@ pub fn refusal_note(w: Why, d: Deriver) -> Option<Bytes> =
       DShow ->
         Some(
           b"a credential is never shown, in an interpolated string or anywhere else; show what the `Secret` guards or names instead",
+        ),
+      DHash ->
+        Some(
+          b"hash what the `Secret` guards or names instead; a password wants `std.password`, not a content hash",
         ),
       _ ->
         Some(
@@ -315,6 +322,7 @@ fn dict_type(e: Emitter, arg: Bytes) -> Bytes =
     DJson -> bytes_concat_all([e.rt, b"JsonCodec<", arg, b">"]),
     DBin -> bytes_concat_all([e.rt, b"BinCodec<", arg, b">"]),
     DShow -> bytes_concat_all([b"{show: (", arg, b") -> String}"]),
+    DHash -> bytes_concat_all([b"{hash: (", arg, b") -> Bytes}"]),
     DEq -> bytes_concat_all([b"{eq: (", arg, b", ", arg, b") -> Bool}"]),
     DOrd -> bytes_concat_all([b"{compare: (", arg, b", ", arg, b") -> Ordering}"]),
   }
@@ -355,6 +363,7 @@ fn dictionary(e: Emitter, def: TypeDef, target: Bytes) -> Bytes =
       ]),
     DShow ->
       bytes_concat_all([b"{show: |", e.b, b"a: ", target, b"| ", e.rt, b"show(", e.b, b"a)}"]),
+    DHash -> bytes_concat_all([b"{hash: |", e.b, b"a: ", target, b"| digest(", e.b, b"a)}"]),
     DJson -> match def.body {
       TDAlias(body) -> codec(e, body, target),
       TDSum(variants) -> json_sum(e, variants, target),
