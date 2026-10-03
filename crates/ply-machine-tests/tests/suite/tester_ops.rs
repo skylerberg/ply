@@ -42,7 +42,7 @@ type Diag = {
   fixes: List<Fix>,
 }
 type Raised = { diag: Diag, values: List<Value> }
-type Use = {
+type Usage = {
   duration_us: Int,
   host: Bool,
   entries: Int,
@@ -50,7 +50,7 @@ type Use = {
   performs: Int,
   teardown: List<Diag>,
 }
-type Executed = { status: String, failure: Option<Raised>, usage: Use }
+type Executed = { status: String, failure: Option<Raised>, usage: Usage }
 type Compiled = {
   name: String,
   fragment: Int,

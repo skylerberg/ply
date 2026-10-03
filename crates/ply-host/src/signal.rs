@@ -30,7 +30,7 @@ pub const DRAIN_POLL: Duration = Duration::from_millis(20);
 /// How long a wake connection waits for this process's own listener.
 const WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How long phase 2 spends waking parked `accept`s before leaving them to the drain deadline.
+/// How long the stop spends waking parked `accept`s before leaving them to the drain deadline.
 const WAKE_BUDGET: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,7 +91,7 @@ struct State {
     at: Option<Instant>,
     deadline: Option<Instant>,
     listeners_closed: usize,
-    /// Connections open when phase 2 finished; the banner reports these as in flight.
+    /// Connections open at the stop; the banner reports these as in flight.
     in_flight_at_stop: usize,
 }
 
@@ -99,7 +99,7 @@ pub struct Shutdown {
     bounds: Bounds,
     /// The whole of what a signal handler touches.
     requested: AtomicBool,
-    /// Set once phase 2 has run, so a later `net.accept` answers `0` even if the table is rebuilt.
+    /// Set at the stop, so a later `net.accept` answers `0` even if the table is rebuilt.
     stopped_accepting: AtomicBool,
     second: AtomicBool,
     state: Mutex<State>,
@@ -205,7 +205,7 @@ impl Shutdown {
         lock(&self.state).signal
     }
 
-    /// What phase 2 found: listeners closed, and connections open.
+    /// What the stop found: listeners closed, and connections open.
     pub fn at_stop(&self) -> (usize, usize) {
         let state = lock(&self.state);
         (state.listeners_closed, state.in_flight_at_stop)
@@ -234,9 +234,9 @@ impl Shutdown {
         let coordinator = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("ply-host-drain".to_string())
-            .spawn(move || coordinator.run_phases());
+            .spawn(move || coordinator.lead_then_stop());
         if spawned.is_err() {
-            self.run_phases();
+            self.lead_then_stop();
         }
         true
     }
@@ -245,8 +245,8 @@ impl Shutdown {
         self.second.load(Ordering::Acquire)
     }
 
-    /// Phase 1 waits out the lead; phase 2 stops accepting and starts the drain.
-    fn run_phases(&self) {
+    /// Waits out the lead, then stops accepting and starts the drain.
+    fn lead_then_stop(&self) {
         if !self.bounds.lead.is_zero() {
             let state = lock(&self.state);
             let _ = self.woke.wait_timeout(state, self.bounds.lead);
