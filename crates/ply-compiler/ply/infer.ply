@@ -19,20 +19,21 @@ import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar,
                TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
                OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
                atoms_union, atoms_contains, atoms_difference, resource_covers, row_empty, row_open,
-               row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_abort,
-               row_union, row_without, row_without_covered, atom_conflicts, atom_covers, con, con1,
-               t_int, t_bool, t_string, t_bytes, t_float, t_decimal, t_unit, t_list, t_option,
-               t_map, t_iter, t_secret, t_fn, mono, fields_sorted, field_get, mentions_secret, at,
-               set_at, take, drop, append, contains_int, contains_bytes, ints_insert, ints_union,
-               ints_difference, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var, fresh_row,
-               subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty, is_rigid_row, shallow,
-               resolve_ty, resolved_tail, resolve_row, occurs_ty, solve_continuation_row, free_vars,
-               unify, unify_row, covariant_con, env_new, env_push, env_pop, env_bind,
-               env_bind_global, env_remove_global, env_lookup, env_depth_of, env_locals,
-               instantiate_with, instantiate, rename_scheme, generalize, region_prefix, region_of,
-               label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
-               scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
-               print_row)
+               row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_abort, is_div,
+               div_atom, row_union, row_without, row_without_covered, atom_conflicts, atom_covers,
+               con, con1, t_int, t_bool, t_string, t_bytes, t_float, t_decimal, t_unit, t_list,
+               t_option, t_map, t_iter, t_secret, t_fn, mono, fields_sorted, field_get,
+               mentions_secret, at, set_at, take, drop, append, contains_int, contains_bytes,
+               ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var, fresh_ty,
+               fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty,
+               is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
+               solve_continuation_row, free_vars, unify, unify_row, covariant_con, env_new,
+               env_push, env_pop, env_bind, env_bind_global, env_remove_global, env_lookup,
+               env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme, generalize,
+               region_prefix, region_of, label_type, label_of, resolve_atom, atom_text, atoms_text,
+               resource_text, scheme_text, type_text, row_text, Printer, printer_new,
+               printer_naming, print_ty, print_row)
+import termination (Callee, CMember, CBuiltin, CDefined, COther, Ending, Ends, Diverges, ending)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit,
                 Fix, with_fix, insertion, Ns, NValue, NType, NEffect, resolve_modules, Resolved_,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
@@ -94,6 +95,8 @@ pub type DefInfo = {
   // What the written row promises bounded, which is all a caller in another package reads.
   bounded: List<Atom>,
   tail_bounded: Bool,
+  // Whether its calls are known to return (`div` where they may not).
+  ending: Ending,
   row_aliases: List<Bytes>,
   constraints: List<DefConstraint>,
   spec: List<SpecInfo>,
@@ -479,7 +482,7 @@ fn with_unified(cx: Cx, u: Unified) -> Cx = { ..cx, subst: u.s, fresh: u.f }
 
 // --- The prelude ----------------------------------------------------------------------
 
-fn prelude_effect_names() -> List<Bytes> = [b"task", b"clock", b"random", b"sim", b"abort"]
+fn prelude_effect_names() -> List<Bytes> = [b"task", b"clock", b"random", b"sim", b"abort", b"div"]
 pub fn is_prelude_effect(name: Bytes) -> Bool = contains_bytes(prelude_effect_names(), name)
 fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
 
@@ -739,6 +742,8 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       at: none,
       ops: [prelude_op(b"raise", MRead, [0], [], [t_string()], ta, row_empty())],
     },
+    // Divergence names no operation: nothing performs it, and nothing handles it.
+    { name: b"div", module: b"", simple_name: b"div", nondet: false, at: none, ops: [] },
   ]
 }
 
@@ -6150,6 +6155,16 @@ fn component_params(cx0: Cx, fns: List<FnDef>, comp: List<Int>) -> { cx: Cx, sha
   { cx: rows.cx, shared: { labels: labels.vars, rows: rows.vars } }
 }
 
+// What a name the termination walk leaves free refers to.
+fn group_callee_kind(cx: Cx, qualified: List<Bytes>, q: QName) -> Callee =
+  match declared_value(cx, q) {
+    Some(n) ->
+      fold(range(0, len(qualified)), CDefined(n), |acc: Callee, i: Int|
+        if at(qualified, i) == n { CMember(i) } else { acc }),
+    None -> if is_bare(q) && env_depth_of(cx.env, q.name.name) == Some(0) { CBuiltin(q.name.name) }
+    else { COther },
+  }
+
 fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
   let qualified = map(comp, |i: Int| qualify(m.name, at(fns, i).name.name));
   let params: { cx: Cx, shared: Shared } = component_params(cx, fns, comp);
@@ -6271,6 +6286,12 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
       }
     },
   );
+  let verdict: Ending = ending({
+    defs: map(comp, |i: Int| at(fns, i)),
+    params: map(sigs.sigs, |s: Sig| map(s.params, |t: Type| resolve(bodies.cx, t))),
+    resolve: |q: QName| group_callee_kind(bodies.cx, qualified, q),
+    ending_of: |n: Bytes| match def_of(bodies.cx, n) { Some(d) -> d.ending, None -> Ends },
+  });
   let settled: Cx = settle_bit_ops(
     settle_numerics(
       settle_concats(settle_updates({ ..bodies.cx, group_defs: [], group_rows: [] })),
@@ -6337,6 +6358,7 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
         repeats: counted.repeats,
         bounded: bounded,
         tail_bounded: sig.tail_bounded,
+        ending: verdict,
         row_aliases: row_aliases(def),
         constraints: constraints,
         spec: [],
@@ -6788,12 +6810,14 @@ fn narrowed_by_row(dec: List<Atom>, o: Offence) -> Bool =
   match o.site { Some(s) -> narrowed_site(dec, s), None -> false }
 
 fn atom_written(cx: Cx, a: Atom) -> Bytes =
-  bytes_concat_all([
-    as_written(cx, a.effect),
-    b".",
-    match a.op { Some(op) -> op, None -> mode_key(a.mode) },
-    resource_text(a.resource),
-  ])
+  if is_div(a) { b"div" } else {
+    bytes_concat_all([
+      as_written(cx, a.effect),
+      b".",
+      match a.op { Some(op) -> op, None -> mode_key(a.mode) },
+      resource_text(a.resource),
+    ])
+  }
 
 // Where an atom joins a written row: before `}`, after `{` when a tail follows, or braces around a bare variable.
 fn row_edit(cx: Cx, r: RowExpr, text: Bytes) -> Edit =
@@ -7749,12 +7773,13 @@ fn ungeneratable(cx: Cx, ty: Type, seen: List<Bytes>) -> Option<Bytes> =
     TyRecord(fs) -> first_reason(fs, |f: Field| ungeneratable(cx, f.ty, seen)),
   }
 
-type SpecSite = | SSRequires | SSEnsures | SSWhere | SSLawBody
+type SpecSite = | SSRequires | SSEnsures | SSDecreases | SSWhere | SSLawBody
 
 fn site_phrase(s: SpecSite) -> Bytes =
   match s {
     SSRequires -> b"a `requires` clause",
     SSEnsures -> b"an `ensures` clause",
+    SSDecreases -> b"a `decreases` measure",
     SSWhere -> b"a `where` guard",
     SSLawBody -> b"a law body",
   }
@@ -7763,6 +7788,7 @@ fn site_short(s: SpecSite) -> Bytes =
   match s {
     SSRequires -> b"`requires`",
     SSEnsures -> b"`ensures`",
+    SSDecreases -> b"`decreases` measure",
     SSWhere -> b"`where` guard",
     SSLawBody -> b"law body",
   }
@@ -7848,8 +7874,11 @@ fn check_spec_purity(cx: Cx, site: SpecSite, allowed: List<Atom>, at_: Span, row
 // --- Spec clauses ------------------------------------------------------------------------------
 // Typed after the whole module is published: a clause may name anything the module can reach.
 
+fn has_spec(def: FnDef) -> Bool =
+  len(def.spec) > 0 || (match def.decreases { Some(_) -> true, None -> false })
+
 fn record_spec_env(cx: Cx, def: FnDef, name: Bytes, sig: Sig) -> Cx =
-  if len(def.spec) == 0 { cx } else {
+  if !has_spec(def) { cx } else {
     {
       ..cx,
       spec_envs: push(cx.spec_envs, {
@@ -7869,7 +7898,7 @@ fn spec_env_of(cx: Cx, name: Bytes) -> Option<SpecEnv> =
 fn check_specs(cx: Cx, m: Mod) -> Cx = {
   let walked: Cx = fold(m.module.items, cx, |c: Cx, it: Item|
     match it {
-      IFn(def) -> if len(def.spec) == 0 { c } else {
+      IFn(def) -> if !has_spec(def) { c } else {
         let name = qualify(m.name, def.name.name);
         match spec_env_of(c, name) {
           None -> c,
@@ -7892,12 +7921,16 @@ fn check_specs(cx: Cx, m: Mod) -> Cx = {
                 }
               },
             );
-            match def_of(walked.cx, name) {
+            let measured: Cx = match def.decreases {
+              Some(e) -> check_measure(walked.cx, def, e, env),
+              None -> walked.cx,
+            };
+            match def_of(measured, name) {
               Some(d) -> {
                 let info: DefInfo = d;
-                set_def(walked.cx, { ..info, spec: walked.specs })
+                set_def(measured, { ..info, spec: walked.specs })
               },
-              None -> walked.cx,
+              None -> measured,
             }
           },
         }
@@ -7907,7 +7940,8 @@ fn check_specs(cx: Cx, m: Mod) -> Cx = {
   { ..walked, ty_params: map_new(), row_params: map_new() }
 }
 
-fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> WithAtoms = {
+// A clause's scope: the parameters, and what the body assumes, its definition's constraints.
+fn spec_scope(cx: Cx, def: FnDef, env: SpecEnv) -> Cx = {
   let c0: Cx = {
     ..cx,
     ty_params: env.ty_params,
@@ -7915,15 +7949,31 @@ fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> WithAto
     performs: [],
     declared_atoms: [],
   };
-  // A clause assumes what the body does: its definition's constraints.
   let assumed: Cx = witnessing(
     { ..c0, assumed: constraints_in_force(c0, def.constraints) },
     def.constraints,
   );
   let pushed: Cx = { ..assumed, env: env_push(assumed.env) };
-  let bound: Cx = fold(range(0, len(def.params)), pushed, |c: Cx, i: Int|
+  fold(range(0, len(def.params)), pushed, |c: Cx, i: Int|
     if i >= len(env.params) { c }
-    else { { ..c, env: env_bind(c.env, at(def.params, i).name.name, mono(at(env.params, i))) } });
+    else { { ..c, env: env_bind(c.env, at(def.params, i).name.name, mono(at(env.params, i))) } })
+}
+
+fn check_measure(cx: Cx, def: FnDef, e: Expr, env: SpecEnv) -> Cx = {
+  let o: Inferred = infer(spec_scope(cx, def, env), e);
+  let popped: Cx = { ..o.cx, env: env_pop(o.cx.env) };
+  let c1: Cx = expect(popped, expr_span(e), t_int(), o.ty, b"a `decreases` measure is an `Int`").cx;
+  check_spec_purity(
+    { ..c1, assumed: cx.assumed },
+    SSDecreases,
+    [],
+    expr_span(e),
+    resolve_r(c1, o.row),
+  )
+}
+
+fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> WithAtoms = {
+  let bound: Cx = spec_scope(cx, def, env);
   let with_result: Cx = match clause.kind {
     SEnsures -> { ..bound, env: env_bind(bound.env, result_name(), mono(env.ret)) },
     SRequires -> bound,
@@ -9665,6 +9715,20 @@ pub fn elaboration(r: Resolved, mods: List<Mod>) -> Option<Elaboration> = {
   let out = check_program(r, mods);
   if any_error(out.cx.diags) { None } else { Some(elaboration_of(out.cx)) }
 }
+
+// The elaboration, and the definitions whose calls the checker saw end, which are the recursive
+// ones a proof may unroll.
+pub type Elaborated = { elaboration: Elaboration, ends: Map<Bytes, Bool> }
+
+pub fn elaborated(r: Resolved, mods: List<Mod>) -> Option<Elaborated> = {
+  let out = check_program(r, mods);
+  if any_error(out.cx.diags) { None }
+  else { Some({ elaboration: elaboration_of(out.cx), ends: ended(out.cx.defs) }) }
+}
+
+pub fn ended(defs: List<DefInfo>) -> Map<Bytes, Bool> =
+  fold(defs, map_new(), |acc: Map<Bytes, Bool>, d: DefInfo|
+    match d.ending { Ends -> map_insert(acc, d.name, true), _ -> acc })
 
 // The same, with the definitions `known` holds rows for published from them rather than walked: only
 // a walked body's updates are shaped.
@@ -11942,5 +12006,91 @@ test "a row's `bounded` promise is held to the body, and only a definition's own
       db_src(b"fn take(f: () -> Int / {db.query[conn] bounded}) -> Int / {db.query[conn]} = f()\n"),
     ),
     [b"E0466"],
+  )
+}
+
+fn diverges(src: Bytes, name: Bytes) -> Bool =
+  match def_of(checked_cx(src), bytes_concat(b"m.", name)) {
+    Some(d) -> match d.ending { Diverges(_) -> true, _ -> false },
+    None -> panic("the definition the test names"),
+  }
+
+test "recursion on a part of an argument terminates, and recursion on the argument itself may not" {
+  assert(
+    !diverges(
+      b"fn count(xs: List<Int>) -> Int = match xs { [] -> 0, [x, ..rest] -> 1 + count(rest) }\n",
+      b"count",
+    ),
+  );
+  let tree = b"type T = | Leaf | Node(T, Int, T)\n";
+  assert(
+    !diverges(
+      bytes_concat(
+        tree,
+        b"fn size(t: T) -> Int = match t { Leaf -> 0, Node(l, v, r) -> size(l) + 1 + size(r) }\n",
+      ),
+      b"size",
+    ),
+  );
+  assert(diverges(b"fn spin(n: Int) -> Int = spin(n)\n", b"spin"));
+  assert(
+    diverges(
+      b"fn keep(xs: List<Int>) -> Int = match xs { [] -> 0, [x, ..rest] -> keep(xs) }\n",
+      b"keep",
+    ),
+  );
+  // A field of a record the call rebuilds is a measure of its own.
+  assert(
+    !diverges(
+      b"fn drain(s: { todo: List<Int>, done: List<Int> }) -> List<Int> = match s.todo { [] -> s.done, [x, ..rest] -> drain({ todo: rest, done: push(s.done, x) }) }\n",
+      b"drain",
+    ),
+  )
+}
+
+test "an integer terminates descending toward a bound a guard holds it above" {
+  assert(!diverges(b"fn down(n: Int) -> Int = if n <= 0 { 0 } else { down(n - 1) }\n", b"down"));
+  // `n == 0` holds nothing below: from `-1` the descent never meets it.
+  assert(diverges(b"fn down(n: Int) -> Int = if n == 0 { 0 } else { down(n - 1) }\n", b"down"));
+  assert(
+    !diverges(
+      b"fn walk(xs: List<Int>, i: Int) -> Int = if i >= len(xs) { 0 } else { walk(xs, i + 1) }\n",
+      b"walk",
+    ),
+  );
+  assert(
+    diverges(
+      b"fn climb(xs: List<Int>, i: Int) -> Int = if i >= len(xs) { 0 } else { climb(push(xs, i), i + 1) }\n",
+      b"climb",
+    ),
+  );
+  assert(
+    !diverges(
+      b"fn ack(m: Int, n: Int) -> Int = if m <= 0 { n + 1 } else if n <= 0 { ack(m - 1, 1) } else { ack(m - 1, ack(m, n - 1)) }\n",
+      b"ack",
+    ),
+  )
+}
+
+test "a group terminates when every loop through it descends, through a builtin's callback too" {
+  let src = b"type T = | Node(Int, List<T>)\nfn size(t: T) -> Int = match t { Node(v, kids) -> v + total(sizes(kids)) }\nfn sizes(ts: List<T>) -> List<Int> = map(ts, size)\nfn total(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, x: Int| a + x)\nfn deep(t: T) -> Int = match t { Node(v, kids) -> fold(kids, v, |a: Int, k: T| a + deep(k)) }\n";
+  assert(!diverges(src, b"size"));
+  assert(!diverges(src, b"sizes"));
+  assert(!diverges(src, b"deep"));
+  // A map's entries are made of its parts.
+  let doc = b"type J = | Leaf | Obj(Map<String, J>)\nfn count(j: J) -> Int = match j { Leaf -> 1, Obj(m) -> fold(map_entries(m), 0, |n: Int, e: { key: String, value: J }| n + count(e.value)) }\n";
+  assert(!diverges(doc, b"count"));
+  // Handed to a function the check does not read, a member is called with nothing known.
+  assert(
+    diverges(
+      b"fn twice(f: (Int) -> Int, n: Int) -> Int = f(f(n))\nfn down(n: Int) -> Int = if n <= 0 { 0 } else { twice(down, n - 1) }\n",
+      b"down",
+    ),
+  );
+  assert(
+    diverges(
+      b"fn ping(n: Int) -> Int = pong(n)\nfn pong(n: Int) -> Int = if n <= 0 { 0 } else { ping(n) }\n",
+      b"ping",
+    ),
   )
 }
