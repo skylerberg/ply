@@ -52,13 +52,7 @@ pub(crate) fn insert(mut m: Value, k: Value, v: Value, span: Span) -> Result<Val
 pub fn take(mut m: Value, k: &Value, span: Span) -> Result<(Value, Option<Value>), Diagnostic> {
     key(k, "map_update", span)?;
     let taken = match &mut m {
-        Value::Map(out) => {
-            let taken = out.get(k).cloned();
-            if taken.is_some() {
-                out.remove_mut(k);
-            }
-            taken
-        }
+        Value::Map(out) => out.remove(k),
         other => return Err(crate::value::type_error(span, "`map_update`", "Map", other)),
     };
     Ok((m, taken))
@@ -84,7 +78,7 @@ pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagn
     key(k, "map_remove", span)?;
     match &mut m {
         Value::Map(out) => {
-            out.remove_mut(k);
+            out.remove(k);
         }
         other => return Err(crate::value::type_error(span, "`map_remove`", "Map", other)),
     }
@@ -92,7 +86,7 @@ pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagn
 }
 
 pub(crate) fn len(m: &Value, span: Span) -> Result<Value, Diagnostic> {
-    Ok(Value::Int(m.as_map(span, "`map_len`")?.size() as i64))
+    Ok(Value::Int(m.as_map(span, "`map_len`")?.len() as i64))
 }
 
 pub(crate) fn keys(m: &Value, span: Span) -> Result<Value, Diagnostic> {

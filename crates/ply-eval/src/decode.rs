@@ -349,7 +349,7 @@ fn sketch(v: &Value) -> String {
         Value::Ctor { name, args } => format!("`{name}` holding {} argument(s)", args.len()),
         Value::List(items) => format!("a list of {}", items.len()),
         Value::Array(items) => format!("an array of {}", items.len()),
-        Value::Map(m) => format!("a map of {}", m.size()),
+        Value::Map(m) => format!("a map of {}", m.len()),
         Value::Str(text) => format!("a `String` of {} characters", text.chars().count()),
         Value::Bytes(b) => format!("a `Bytes` of {} bytes", b.len()),
         other => format!("a `{}`", other.type_name()),

@@ -82,11 +82,6 @@ fn a_real_answer_reads_to_the_program_it_describes() {
             "emit"
         )])
     );
-    assert_eq!(front.defs_written[&named("m.say")].vis, Visibility::Public);
-    assert_eq!(
-        front.defs_written[&named("m.positive")].vis,
-        Visibility::Private
-    );
 
     let pick = &front.check.defs[&named("m.pick")];
     assert!(pick.footprint.is_empty());
@@ -102,19 +97,18 @@ fn a_real_answer_reads_to_the_program_it_describes() {
     let emit = &log.ops[&named("emit")];
     assert_eq!(emit.mode, Mode::Write);
     assert!(!emit.resource_param);
-    assert_eq!(front.effects_written[&named("m.log")], Visibility::Public);
 
     for ctor in [(named("m.Dot"), 0), (named("m.Line"), 1)] {
         assert!(front.emitter_ctors.contains(&ctor), "{ctor:?}");
     }
-    assert_eq!(front.types[&named("m.Shape")].arity, 0);
+    let shape = &front.types[&named("m.Shape")];
+    assert_eq!((shape.arity, shape.vis), (0, Visibility::Public));
 
     for def in ["m.say", "m.pick", "m.positive"] {
         assert!(front.hashes.defs.contains_key(&named(def)), "{def}");
     }
     assert_eq!(front.hashes.tests.len(), 1);
     assert!(front.hashes.deps.contains_key(&named("m.picks the first")));
-    assert_eq!(front.test_bodies.len(), 1);
 
     assert_eq!(
         front.ordinals,
@@ -359,9 +353,12 @@ fn a_malformed_answer_names_the_path_to_what_is_wrong() {
     let ids = [SourceId(0)];
     dump::read(&good, &ids).unwrap_or_else(|e| panic!("{e}"));
 
-    let def = with(&first(field(&good, "defs")), "params", Value::Int(7));
+    let def = with(&first(field(&good, "defs")), "footprint", Value::Int(7));
     let err = dump::read(&with(&good, "defs", Value::list(vec![def])), &ids).unwrap_err();
-    assert_eq!(err.path, "the front end's answer.defs[0].params", "{err}");
+    assert_eq!(
+        err.path, "the front end's answer.defs[0].footprint",
+        "{err}"
+    );
     assert!(err.message.contains("expected a list"), "{err}");
 
     let short = with(&good, "hashes_digest", Value::bytes([0u8; 31]));
@@ -548,11 +545,8 @@ fn holding(footprint: Value) -> Value {
         ("name", Value::bytes("m.f")),
         ("module", Value::bytes("m")),
         ("simple_name", Value::bytes("f")),
-        ("public", Value::Bool(true)),
-        ("reuse", Value::Bool(false)),
         ("footprint", footprint.clone()),
         ("performed", footprint),
-        ("params", empty()),
         ("at", nowhere()),
     ]);
     let mut tables: Vec<(&str, Value)> = [
@@ -566,12 +560,9 @@ fn holding(footprint: Value) -> Value {
         "laws",
         "effects",
         "hashes",
-        "keys",
         "emit_roots",
         "emit_ctors",
         "ordinals",
-        "bodies",
-        "test_bodies",
     ]
     .into_iter()
     .map(|name| (name, empty()))
