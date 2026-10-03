@@ -431,6 +431,7 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Cell", arity: 1 },
     { name: b"Secret", arity: 1 },
     { name: b"Task", arity: 1 },
+    { name: b"Chan", arity: 1 },
     { name: b"Option", arity: 1 },
     { name: b"Result", arity: 2 },
     { name: b"Ordering", arity: 0 },
@@ -589,6 +590,7 @@ fn prelude_effects() -> List<EffectInfo> = {
   let ta = TyVar(0);
   let body = t_fn([], ta, row_open(0));
   let task = con1(b"Task", ta);
+  let chan = con1(b"Chan", ta);
   let none = { module: 0, span: dummy_span() };
   [
     {
@@ -605,6 +607,12 @@ fn prelude_effects() -> List<EffectInfo> = {
         prelude_op(b"cancel", MWrite, [0], [], [task], t_bool(), row_empty()),
         // A join that answers `None` for a cancelled task.
         prelude_op(b"await", MWrite, [0], [], [task], t_option(ta), row_empty()),
+        prelude_op(b"channel", MWrite, [0], [], [t_int()], chan, row_empty()),
+        // `false` once the channel is closed.
+        prelude_op(b"send", MWrite, [0], [], [chan, ta], t_bool(), row_empty()),
+        // `None` once the channel is closed and empty.
+        prelude_op(b"recv", MWrite, [0], [], [chan], t_option(ta), row_empty()),
+        prelude_op(b"close", MWrite, [0], [], [chan], t_unit(), row_empty()),
       ],
     },
     {
@@ -1852,10 +1860,10 @@ fn record_type(cx: Cx, m: Mod, def: TypeDef) -> Cx = {
 fn collect_types(cx: Cx, m: Mod) -> Cx =
   fold(m.module.items, cx, |c: Cx, it: Item| match it { IType(d) -> record_type(c, m, d), _ -> c })
 
-// The first `Cell` or `Task` in `t`: either is a key into the region that made it.
+// The first `Cell`, `Task` or `Chan` in `t`: each is a key into the region that made it.
 fn region_brand(t: Type) -> Option<Bytes> =
   match t {
-    TyCon(c) -> if c.name == b"Cell" || c.name == b"Task" { Some(c.name) }
+    TyCon(c) -> if c.name == b"Cell" || scheduler_handle(c.name) { Some(c.name) }
     else { first_reason(c.args, region_brand) },
     TyFn(f) -> match first_reason(f.params, region_brand) {
       Some(b) -> Some(b),
@@ -6807,6 +6815,8 @@ fn ungeneratable(cx: Cx, ty: Type, seen: List<Bytes>) -> Option<Bytes> =
       Some(b"a `Cell` is created by `with_cell` and exists only inside its region")
     } else if c.name == b"Task" {
       Some(b"a `Task` is a key into the scheduler of the `simulate` region that spawned it")
+    } else if c.name == b"Chan" {
+      Some(b"a `Chan` is a key into the scheduler of the `simulate` region that made it")
     } else if c.name == b"Secret" {
       Some(
         b"a `Secret` is a credential: quantifying over one would have the generator mint credentials and the shrinker print counterexamples",
@@ -7772,18 +7782,66 @@ fn check_simulations(cx: Cx) -> Cx = {
   })
 }
 
+// A task and a channel are keys into the scheduler of the region that made them.
+fn scheduler_handle(name: Bytes) -> Bool = name == b"Task" || name == b"Chan"
+
 // A closure's captures are not in its type, and a cell's contents enter a region only when read.
 fn holds_task(t: Type) -> Bool =
   match t {
     TyCon(c) ->
-      c.name == b"Task"
+      scheduler_handle(c.name)
         || (c.name != b"Cell" && fold(c.args, false, |b: Bool, a: Type| b || holds_task(a))),
     TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || holds_task(f.ty)),
     TyFn(_) -> false,
     TyVar(_) -> false,
   }
 
-fn entered() -> Bytes = b"a task enters a `simulate` region that did not spawn it"
+// What a refusal says of the scheduler key `t` holds: a task, or else a channel.
+type Keyed = { noun: Bytes, made: Bytes, numbered: Bytes, kept: Bytes }
+
+fn keyed(t: Type) -> Keyed =
+  if holds_con(t, b"Task") || !holds_con(t, b"Chan") {
+    {
+      noun: b"task",
+      made: b"spawned",
+      numbered: b"a `Task` is a key into the scheduler that spawned it, and this region's scheduler numbers its own tasks, so the key names one of them or none",
+      kept: b"`join` the task inside the region and return its value instead",
+    }
+  } else {
+    {
+      noun: b"channel",
+      made: b"made",
+      numbered: b"a `Chan` is a key into the scheduler that made it, and this region's scheduler numbers its own channels, so the key names one of them or none",
+      kept: b"receive from the channel inside the region and return what it held instead",
+    }
+  }
+
+// Whether `t` holds a `name`, in its shape or as the operations a closure's row shows for one.
+fn holds_con(t: Type, name: Bytes) -> Bool =
+  match t {
+    TyCon(c) -> c.name == name || fold(c.args, false, |b: Bool, a: Type| b || holds_con(a, name)),
+    TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || holds_con(f.ty, name)),
+    TyFn(f) ->
+      fold(
+        if name == b"Task" { [b"join", b"await", b"cancel"] } else { [b"send", b"recv", b"close"] },
+        fold(f.params, holds_con(f.ret, name), |b: Bool, p: Type| b || holds_con(p, name)),
+        |b: Bool, op: Bytes| b || atoms_covered(f.effects.atoms, task_op(op)),
+      ),
+    TyVar(_) -> false,
+  }
+
+fn entered(t: Type) -> Bytes = {
+  let k = keyed(t);
+  bytes_concat_all([
+    b"a ",
+    k.noun,
+    b" enters a `simulate` region that did not ",
+    made_verb(k),
+    b" it",
+  ])
+}
+
+fn made_verb(k: Keyed) -> Bytes = if k.noun == b"task" { b"spawn" } else { b"make" }
 
 fn own_scheduler(site: Simulation) -> Label =
   lab(
@@ -7793,15 +7851,12 @@ fn own_scheduler(site: Simulation) -> Label =
     b"the `simulate` region opens here, with a scheduler of its own",
   )
 
-fn numbered_apart() -> Bytes =
-  b"a `Task` is a key into the scheduler that spawned it, and this region's scheduler numbers its own tasks, so the key names one of them or none"
-
 fn check_entering(cx: Cx, site: Simulation) -> Cx =
   fold(site.entering, cx, |c: Cx, x: { name: Bytes, span: Span, ty: Type }|
     err_labels(
       c,
       b"E0413",
-      entered(),
+      entered(x.ty),
       [
         lab(
           site.module,
@@ -7818,8 +7873,10 @@ fn check_entering(cx: Cx, site: Simulation) -> Cx =
         own_scheduler(site),
       ],
       [
-        numbered_apart(),
-        b"spawn the task inside the region, or join it where it was spawned and pass in what it answers",
+        keyed(x.ty).numbered,
+        if keyed(x.ty).noun == b"task" {
+          b"spawn the task inside the region, or join it where it was spawned and pass in what it answers"
+        } else { b"make the channel inside the region, or pass in what was received from it" },
       ],
     ))
 
@@ -7835,7 +7892,7 @@ fn check_older_reads(cx: Cx, site: Simulation) -> Cx =
             err_labels(
               c,
               b"E0413",
-              entered(),
+              entered(b.ty),
               [
                 lab(
                   site.module,
@@ -7863,9 +7920,13 @@ fn check_older_reads(cx: Cx, site: Simulation) -> Cx =
                 bytes_concat_all([
                   b"`",
                   o.name,
-                  b"` outlives the region, so a task its cells hold was spawned outside it",
+                  b"` outlives the region, so a ",
+                  keyed(b.ty).noun,
+                  b" its cells hold was ",
+                  keyed(b.ty).made,
+                  b" outside it",
                 ]),
-                numbered_apart(),
+                keyed(b.ty).numbered,
                 b"open the cell inside the `simulate` region, or keep what the tasks answered in it instead of the tasks",
               ],
             ),
@@ -7876,17 +7937,22 @@ fn check_older_reads(cx: Cx, site: Simulation) -> Cx =
 fn check_simulation_exits(cx: Cx, site: Simulation) -> Cx = {
   let ty = resolve(cx, site.body_ty);
   if !brand_in(ty, Tasks) { cx } else {
-    let key = b"a `Task` is a key into the region's scheduler, and the scheduler ends with the region";
-    let fix = b"`join` the task inside the region and return its value instead";
+    let k = keyed(ty);
+    let key = if k.noun == b"task" {
+      b"a `Task` is a key into the region's scheduler, and the scheduler ends with the region"
+    } else {
+      b"a `Chan` is a key into the region's scheduler, and the scheduler ends with the region"
+    };
+    let fix = k.kept;
     err_labels(
       cx,
       b"E0413",
-      b"a task escapes the `simulate` region that spawned it",
+      bytes_concat_all([b"a ", k.noun, b" escapes the `simulate` region that ", k.made, b" it"]),
       exit_labels(site.module, site.exits, site.body_span, ty),
       if carries_brand_in_row(ty, Tasks) {
         [
           key,
-          b"the closure's row still carries `task.join` or `sim.read`, so calling it after the region can join a task whose scheduler has ended",
+          b"the closure's row still carries a `task` operation or `sim.read`, so calling it after the region reaches a scheduler that has ended",
           fix,
         ]
       } else { [key, fix] },
@@ -7905,7 +7971,13 @@ fn check_older_writes(cx: Cx, site: Simulation) -> Cx =
           err_labels(
             c,
             b"E0446",
-            b"a task spawned in a `simulate` region is stored where it outlives the region",
+            bytes_concat_all([
+              b"a ",
+              keyed(b.ty).noun,
+              b" ",
+              keyed(b.ty).made,
+              b" in a `simulate` region is stored where it outlives the region",
+            ]),
             [
               lab(
                 site.module,
@@ -7938,9 +8010,13 @@ fn check_older_writes(cx: Cx, site: Simulation) -> Cx =
               bytes_concat_all([
                 b"`",
                 o.name,
-                b"` outlives the region's scheduler, so what the region stores in its cells may not mention a `Task`",
+                b"` outlives the region's scheduler, so what the region stores in its cells may not mention a `Task` or a `Chan`",
               ]),
-              b"open the cell inside the `simulate` region, or join the task there and store what it answers",
+              if keyed(b.ty).noun == b"task" {
+                b"open the cell inside the `simulate` region, or join the task there and store what it answers"
+              } else {
+                b"open the cell inside the `simulate` region, or receive from the channel there and store what it gives"
+              },
             ],
           ),
       },
@@ -8023,17 +8099,19 @@ fn nested_simulation(cx: Cx, site: Simulation, sites: List<Simulation>) -> Cx = 
 fn task_op(op: Bytes) -> Atom =
   { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(op) }
 
-// A cell is reached by atoms naming its region; a task only by a join, an await or a cancel, or a
-// `simulate` around one.
+// A cell is reached by atoms naming its region; a task only by a join, an await or a cancel, a
+// channel by a send, a receive or a close, and either by a `simulate` around one.
 fn row_brands(row: Row, brand: Brand) -> Bool =
   match brand {
     CellsOf(r) ->
       fold(row.atoms, false, |b: Bool, a: Atom|
         b || (a.effect == cell() && a.resource == RNamed(r))),
     Tasks ->
-      atoms_covered(row.atoms, task_op(b"join")) || atoms_covered(row.atoms, task_op(b"await"))
-        || atoms_covered(row.atoms, task_op(b"cancel"))
-        || atoms_covered(row.atoms, seed_atom()),
+      fold(
+        [b"join", b"await", b"cancel", b"send", b"recv", b"close"],
+        atoms_covered(row.atoms, seed_atom()),
+        |b: Bool, op: Bytes| b || atoms_covered(row.atoms, task_op(op)),
+      ),
   }
 
 // Whether a resolved type carries a region's brand, by either route a brand travels.
@@ -8041,7 +8119,7 @@ fn brand_in(t: Type, brand: Brand) -> Bool =
   match t {
     TyVar(_) -> false,
     TyCon(c) ->
-      (match brand { CellsOf(r) -> region_of(t) == Some(r), Tasks -> c.name == b"Task" })
+      (match brand { CellsOf(r) -> region_of(t) == Some(r), Tasks -> scheduler_handle(c.name) })
         || fold(c.args, false, |b: Bool, a: Type| b || brand_in(a, brand)),
     TyFn(f) ->
       row_brands(f.effects, brand)
@@ -9875,6 +9953,50 @@ test "a task stored in a cell older than its `simulate` region is refused, and i
     ),
     [],
   )
+}
+
+test "a channel keeps to its `simulate` region as a task does" {
+  assert_eq(refusals(b"fn made() -> Chan<Int> / {sim.read} = simulate { task.channel(1) }"), [
+    [b"E0413", b"a channel escapes the `simulate` region that made it", b"task.channel(1)"],
+  ]);
+  assert_eq(
+    refusals(
+      b"fn sender() -> (Int) -> Bool / {task.send} / {sim.read} = simulate { let c = task.channel(1); |x: Int| task.send(c, x) }",
+    ),
+    [
+      [
+        b"E0413",
+        b"a channel escapes the `simulate` region that made it",
+        b"|x: Int| task.send(c, x)",
+      ],
+    ],
+  );
+  assert_eq(
+    refusals(b"fn taken(c: Chan<Int>) -> Option<Int> / {sim.read} = simulate { task.recv(c) }"),
+    [[b"E0413", b"a channel enters a `simulate` region that did not make it", b"c"]],
+  );
+  assert_eq(
+    refusals(
+      b"fn stored() -> Option<Chan<Int>> / {sim.read} = with_cell[r](None) { c -> { simulate { cell_set(c, Some(task.channel(0))); 0 }; cell_get(c) } }",
+    ),
+    [
+      [
+        b"E0446",
+        b"a channel made in a `simulate` region is stored where it outlives the region",
+        b"cell_set(c, Some(task.channel(0)))",
+      ],
+    ],
+  );
+  assert_eq(refusals(b"type Mailbox = Mailbox(Chan<Int>)"), [
+    [b"E0446", b"`Mailbox`'s field 1 mentions a `Chan`", b"Chan<Int>"],
+  ]);
+  assert_eq(
+    check_codes(
+      b"fn own() -> Option<Int> / {sim.read} = simulate { let c = task.channel(1); task.send(c, 1); task.recv(c) }",
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn keyed(m: Map<Chan<Int>, Int>) -> Int = map_len(m)"), [b"E0206"])
 }
 
 test "a task from outside a `simulate` region is refused where the region names it or reads it" {

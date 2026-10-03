@@ -394,7 +394,11 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
         vec![
             "task.await",
             "task.cancel",
+            "task.channel",
+            "task.close",
             "task.join",
+            "task.recv",
+            "task.send",
             "task.spawn",
             "task.yield"
         ]
