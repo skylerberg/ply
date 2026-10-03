@@ -8,8 +8,13 @@ use crate::rt::{
 };
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
-use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, TaskHandle, Turn};
-use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, liveness, signature};
+use ply_eval::sched::{
+    ChanHandle, HostPolicy, Policy, ROOT, Resumption, Scheduler, TaskHandle, Turn,
+};
+use ply_eval::sim::{
+    Access, Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, liveness,
+    signature,
+};
 use ply_eval::{Diagnostic, Mode, SimId, Span, Symbol, Unbound, Value, codes};
 use std::collections::BTreeMap;
 
@@ -53,6 +58,10 @@ enum Request {
     Join(TaskHandle),
     Await(TaskHandle),
     Cancel(TaskHandle),
+    Channel(i64),
+    Send(ChanHandle, Value),
+    Recv(ChanHandle),
+    Close(ChanHandle),
     Yield,
     Seeded(&'static OpSignature, Vec<Value>),
     Park(Pending),
@@ -380,6 +389,38 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
                 }
             }
         }
+        Request::Channel(capacity) => {
+            let records = sim.sched.records_steps();
+            let applied = sim.sched.channel(k, capacity, site);
+            if records {
+                c.record_access(channel_made());
+            }
+            applied
+        }
+        Request::Send(chan, value) => {
+            let records = sim.sched.records_steps();
+            let applied = sim.sched.send(k, &chan, value, site);
+            if records {
+                c.record_access(channel_access(chan.id));
+            }
+            applied
+        }
+        Request::Recv(chan) => {
+            let records = sim.sched.records_steps();
+            let applied = sim.sched.recv(k, &chan, site);
+            if records {
+                c.record_access(channel_access(chan.id));
+            }
+            applied
+        }
+        Request::Close(chan) => {
+            let records = sim.sched.records_steps();
+            let applied = sim.sched.close(k, &chan, site);
+            if records {
+                c.record_access(channel_access(chan.id));
+            }
+            applied
+        }
         Request::Yield => sim.sched.suspend(k, Value::Unit),
         Request::Park(pending) => match &runtime {
             Some(rt) => sim.sched.park_on_host(k, pending, site, rt.as_ref()),
@@ -522,6 +563,38 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
             match handle.as_task(c.site(), what) {
                 Ok(target) if op.as_str() == "await" => Request::Await(target.clone()),
                 Ok(target) => Request::Cancel(target.clone()),
+                Err(d) => return c.fail(d),
+            }
+        }
+        ("task", "channel") => {
+            let capacity = c.value(args[0]);
+            heap::dec(args[0]);
+            match capacity.as_int(c.site(), "`task.channel`") {
+                Ok(n) => Request::Channel(n),
+                Err(d) => return c.fail(d),
+            }
+        }
+        ("task", "send") => {
+            let handle = c.value(args[0]);
+            heap::dec(args[0]);
+            let value = c.value(args[1]);
+            heap::dec(args[1]);
+            match handle.as_chan(c.site(), "`task.send`") {
+                Ok(chan) => Request::Send(chan, value),
+                Err(d) => return c.fail(d),
+            }
+        }
+        ("task", "recv") | ("task", "close") => {
+            let handle = c.value(args[0]);
+            heap::dec(args[0]);
+            let what = if op.as_str() == "recv" {
+                "`task.recv`"
+            } else {
+                "`task.close`"
+            };
+            match handle.as_chan(c.site(), what) {
+                Ok(chan) if op.as_str() == "recv" => Request::Recv(chan),
+                Ok(chan) => Request::Close(chan),
                 Err(d) => return c.fail(d),
             }
         }

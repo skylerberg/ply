@@ -1,0 +1,379 @@
+// What a package promises the packages that depend on it, definition by definition, and what moved
+// between two of its versions. `ply publish` holds a version to the bump its changes need: a patch
+// moves no contract, a minor only adds, a major may change anything. `ply contracts NAME OLD NEW`
+// lists what moved between two published versions.
+
+import args (Flags, style_of)
+import cmdline (Parsed, nth_of)
+import env (env)
+import paths (Resolved, here)
+import registry (Base, base_of, unasked, unset, untakeable, variable)
+import remote (Consumed, consumed, index_of)
+import report (Answer, ind, ok_code, count_of, reported)
+import sources (shelf)
+import style (Style, bold, green, yellow)
+import builder (builder)
+import compiler.front (Analysed, Refused, Whole, Embedded, analyse_pulling_std_with, no_interfaces)
+import compiler.hash (Contract, public_contracts)
+import compiler.pkg (Pkgs, Supplied, is_dotted_path)
+import compiler.resolve (Diag, Source, diag1)
+import std.fs (fs)
+import std.json (Json, Array, Bool, Number, Str, object)
+import std.net (net)
+import std.pkg (Index, Manifest, Release, Version, parse_version, prefix_of, render_version)
+
+// --- A package as its consumers read it ------------------------------------------------
+// A root of no modules that depends on the package from the registry, whose slot holds its sources:
+// the package's modules are named as every consumer names them, and nothing of the root reaches
+// what its analysis answers.
+
+fn version_text(v: Version) -> String =
+  "{ major: " ++ int_to_string(v.major) ++ ", minor: " ++ int_to_string(v.minor) ++ ", patch: "
+    ++ int_to_string(v.patch)
+    ++ " }"
+
+// A root name no package calls itself by: an identifier no registry name carries.
+fn consumer_name() -> String = "consumer_of_a_published_package"
+
+fn consumer_manifest(m: Manifest) -> Bytes =
+  bytes_of_string(
+    "import std.pkg (Manifest)\nfn package() -> Manifest = { name: \"" ++ consumer_name()
+      ++ "\", version: { major: 0, minor: 0, patch: 0 }, prefix: None, runtime: "
+      ++ version_text(m.runtime)
+      ++ ", dependencies: [{ name: \""
+      ++ m.name
+      ++ "\", prefix: "
+      ++ (match m.prefix { None -> "None", Some(p) -> "Some(\"" ++ p ++ "\")" })
+      ++ ", min: "
+      ++ version_text(m.version)
+      ++ ", source: Registry }], entry: None }\n",
+  )
+
+/// The package `own` under `root`'s slot for it, beside `deps`, as a consumer's load analyses it.
+pub type Consumer = { pkgs: Pkgs, whole: Whole, modules: List<Bytes> }
+
+pub fn as_consumed(
+  root: Bytes,
+  m: Manifest,
+  own: Supplied,
+  deps: List<Supplied>,
+  shelved: List<Source>,
+  embeds: List<Embedded>,
+) -> Result<Consumer, List<Diag>> / {abort.raise} = {
+  let pkgs: Pkgs = {
+    root: root,
+    manifest: Some(consumer_manifest(m)),
+    supplied: fold(deps, [own], |acc: List<Supplied>, s: Supplied| push(acc, s)),
+  };
+  match analyse_pulling_std_with([], shelved, [], [], pkgs, no_interfaces(), embeds).out {
+    Refused(ds) -> Err(ds),
+    Analysed(w) -> {
+      let prefix = bytes_of_string(prefix_of(m));
+      Ok({
+        pkgs: pkgs,
+        whole: w,
+        modules: map(own.modules, |s: Source| bytes_concat_all([prefix, b".", s.name])),
+      })
+    },
+  }
+}
+
+/// What the consumed package promises: each public definition's contract and each public
+/// declaration's hash.
+pub fn promised(c: Consumer) -> List<Contract> / {abort.raise} = {
+  let mine = fold(c.modules, map_new(), |acc: Map<Bytes, Bool>, m: Bytes| map_insert(acc, m, true));
+  public_contracts(c.whole.index, c.whole.hashes, |m: Bytes| map_contains(mine, m))
+}
+
+// --- What moved -----------------------------------------------------------------
+
+pub type Moved = { added: List<String>, changed: List<String>, removed: List<String> }
+
+fn keyed(cs: List<Contract>) -> Map<Bytes, Contract> =
+  fold(cs, map_new(), |acc: Map<Bytes, Contract>, c: Contract|
+    map_insert(acc, bytes_concat(if c.decl { b"t " } else { b"v " }, c.name), c))
+
+fn shown_name(c: Contract) -> String = string_of_bytes_lossy(c.name)
+
+pub fn moved(was: List<Contract>, now: List<Contract>) -> Moved = {
+  let before = keyed(was);
+  let after = keyed(now);
+  {
+    added: map(
+      filter(now, |c: Contract|
+        !map_contains(before, bytes_concat(if c.decl { b"t " } else { b"v " }, c.name))),
+      shown_name,
+    ),
+    changed: map(
+      filter(now, |c: Contract|
+        match map_get(before, bytes_concat(if c.decl { b"t " } else { b"v " }, c.name)) {
+          Some(b) -> b.hash != c.hash,
+          None -> false,
+        }),
+      shown_name,
+    ),
+    removed: map(
+      filter(was, |c: Contract|
+        !map_contains(after, bytes_concat(if c.decl { b"t " } else { b"v " }, c.name))),
+      shown_name,
+    ),
+  }
+}
+
+pub type Bump = | Patch | Minor | Major
+
+fn rank(b: Bump) -> Int = match b { Patch -> 0, Minor -> 1, Major -> 2 }
+
+pub fn bump_word(b: Bump) -> String =
+  match b { Patch -> "patch", Minor -> "minor", Major -> "major" }
+
+/// The least bump a version's moves need.
+pub fn needed(m: Moved) -> Bump =
+  if len(m.changed) > 0 || len(m.removed) > 0 { Major }
+  else if len(m.added) > 0 { Minor }
+  else { Patch }
+
+/// Which place of the version moved from `was` to `now`, which is above it.
+pub fn bumped(was: Version, now: Version) -> Bump =
+  if now.major != was.major { Major } else if now.minor != was.minor { Minor } else { Patch }
+
+/// The least version above `was` a bump of `b` makes.
+fn least(was: Version, b: Bump) -> Version =
+  match b {
+    Major -> { major: was.major + 1, minor: 0, patch: 0 },
+    Minor -> { major: was.major, minor: was.minor + 1, patch: 0 },
+    Patch -> { major: was.major, minor: was.minor, patch: was.patch + 1 },
+  }
+
+/// The version a new one is held to: the highest published below it that is not yanked.
+pub fn previous(index: Index, now: Version) -> Option<Release> =
+  fold(index.versions, None, |best: Option<Release>, r: Release|
+    if r.yanked || compare(r.version, now) != Less { best } else {
+      match best {
+        None -> Some(r),
+        Some(b) -> if compare(b.version, r.version) == Less { Some(r) } else { best },
+      }
+    })
+
+fn outside() -> Int = 4294967295
+
+fn listed(names: List<String>) -> String =
+  fold(names, "", |acc: String, n: String|
+    if acc == "" { "`" ++ n ++ "`" } else { acc ++ ", `" ++ n ++ "`" })
+
+fn what_moved(m: Moved, b: Bump) -> String =
+  if b == Minor { "adds " ++ listed(m.added) } else {
+    match ((m.changed, m.removed)) {
+      ([], removed) -> "removes " ++ listed(removed),
+      (changed, []) -> "changes what " ++ listed(changed) ++ " promises",
+      (changed, removed) ->
+        "changes what " ++ listed(changed) ++ " promises and removes " ++ listed(removed),
+    }
+  }
+
+/// Why `now` cannot follow `was` as `name`'s next version, when its moves need a larger bump.
+pub fn refusal(name: String, was: Version, now: Version, m: Moved) -> Option<Diag> = {
+  let need = needed(m);
+  let made = bumped(was, now);
+  if rank(made) >= rank(need) { None } else {
+    Some(
+      diag1(
+        b"E0150",
+        outside(),
+        { start: 0, end: 0 },
+        bytes_of_string(
+          "`" ++ name ++ "` " ++ render_version(now) ++ " is a " ++ bump_word(made) ++ " of "
+            ++ render_version(was)
+            ++ ", and it "
+            ++ what_moved(m, need),
+        ),
+        b"a version must say what its changes are",
+        [
+          b"a patch moves no definition's contract, a minor only adds definitions, and a major may change anything",
+          bytes_of_string("publish it as " ++ render_version(least(was, need)) ++ " or later"),
+        ],
+      ),
+    )
+  }
+}
+
+// --- `ply contracts NAME OLD NEW` ------------------------------------------------------
+
+pub type Opts = { name: String, from: String, to: String }
+
+pub fn options_from(p: Parsed) -> Opts =
+  {
+    name: nth_of(p.positionals, 0, ""),
+    from: nth_of(p.positionals, 1, ""),
+    to: nth_of(p.positionals, 2, ""),
+  }
+
+fn version_of(text: String) -> Result<Version, Diag> / {abort.raise} =
+  match parse_version(text) {
+    Some(v) -> Ok(v),
+    None -> Err(untakeable("`" ++ text ++ "` is not a version", [b"a version reads like `0.2.0`"])),
+  }
+
+fn release_at(index: Index, v: Version) -> Option<Release> =
+  fold(index.versions, None, |found: Option<Release>, r: Release|
+    match found { Some(_) -> found, None -> if r.version == v { Some(r) } else { None } })
+
+fn unpublished(name: String, v: Version) -> Diag =
+  diag1(
+    b"E0143",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string("the registry holds no `" ++ name ++ "` " ++ render_version(v)),
+    b"no such published version",
+    [],
+  )
+
+/// The contracts of one published version, analysed as a consumer reads it.
+pub fn published_promises(
+  base: Base,
+  root: String,
+  name: String,
+  index: Index,
+  v: Version,
+) -> Result<List<Contract>, List<Diag>> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} =
+  match release_at(index, v) {
+    None -> Err([unpublished(name, v)]),
+    Some(r) -> match consumed(base, root, name, r) {
+      Err(d) -> Err([d]),
+      Ok(c) -> match as_consumed(bytes_of_string(root), c.manifest, c.own, c.deps, shelf(), []) {
+        Err(ds) -> Err(ds),
+        Ok(x) -> Ok(promised(x)),
+      },
+    },
+  }
+
+fn root_of(flags: Flags) -> Resolved =
+  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
+
+pub fn run(
+  flags: Flags,
+  opts: Opts,
+) -> Answer / {builder.git[vcs], env.var[sys], fs.list_dir[shelf], fs.read_file[shelf], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
+  let s = style_of(flags);
+  if !is_dotted_path(opts.name) {
+    reported(s, "contracts", [untakeable("`" ++ opts.name ++ "` is not a package name", [])], [])
+  } else {
+    match ((version_of(opts.from), version_of(opts.to))) {
+      (Err(d), _) -> reported(s, "contracts", [d], []),
+      (_, Err(d)) -> reported(s, "contracts", [d], []),
+      (Ok(from), Ok(to)) -> match env.var[sys](variable()) {
+        None ->
+          reported(s, "contracts", [unset(variable(), "the versions are read from a registry")], [
+          ]),
+        Some(text) -> match base_of(text) {
+          Err(why) -> reported(s, "contracts", [unasked(why, [])], []),
+          Ok(base) -> match index_of(base, opts.name) {
+            Err(d) -> reported(s, "contracts", [d], []),
+            Ok(index) -> {
+              let root = root_of(flags).absolute;
+              match published_promises(base, root, opts.name, index, from) {
+                Err(ds) -> reported(s, "contracts", ds, []),
+                Ok(was) -> match published_promises(base, root, opts.name, index, to) {
+                  Err(ds) -> reported(s, "contracts", ds, []),
+                  Ok(now) -> answered(s, opts, from, to, moved(was, now)),
+                },
+              }
+            },
+          },
+        },
+      },
+    }
+  }
+}
+
+fn answered(s: Style, opts: Opts, from: Version, to: Version, m: Moved) -> Answer / {abort.raise} = {
+  let need = needed(m);
+  let kept = compare(from, to) == Less && rank(bumped(from, to)) >= rank(need);
+  let rows = |word: String, names: List<String>|
+    map(names, |n: String| ind() ++ "  " ++ word ++ " " ++ n);
+  {
+    json: object([
+      { key: "command", value: Str("contracts") },
+      { key: "ok", value: Bool(true) },
+      { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
+      { key: "name", value: Str(opts.name) },
+      { key: "from", value: Str(render_version(from)) },
+      { key: "to", value: Str(render_version(to)) },
+      { key: "added", value: Array(map(m.added, |n: String| Str(n))) },
+      { key: "changed", value: Array(map(m.changed, |n: String| Str(n))) },
+      { key: "removed", value: Array(map(m.removed, |n: String| Str(n))) },
+      { key: "needs", value: Str(bump_word(need)) },
+      { key: "kept", value: Bool(kept) },
+    ]),
+    lines: fold(
+      [rows("changed", m.changed), rows("removed", m.removed), rows("added  ", m.added)],
+      [
+        ind() ++ bold(s, opts.name) ++ " " ++ render_version(from) ++ " → " ++ render_version(to)
+          ++ " · "
+          ++ (if kept { green(s, "a " ++ bump_word(need) ++ " is what it needs") }
+          else { yellow(s, "its changes need a " ++ bump_word(need)) }),
+      ],
+      |acc: List<String>, more: List<String>|
+        fold(more, acc, |a: List<String>, x: String| push(a, x)),
+    ),
+    errs: [],
+    code: ok_code(),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn v(text: String) -> Version / {abort.raise} =
+  match parse_version(text) { Some(x) -> x, None -> panic("a fixture's version") }
+
+fn c(name: String, hash: Bytes) -> Contract =
+  { name: bytes_of_string(name), decl: false, hash: hash }
+
+test "what moved is each definition added, changed or removed, by name and namespace" {
+  let was = [c("m.a", b"1"), c("m.b", b"2"), { ..c("m.T", b"3"), decl: true }];
+  let now = [c("m.a", b"1"), c("m.b", b"9"), c("m.T", b"4"), c("m.d", b"5")];
+  assert_eq(moved(was, now), { added: ["m.T", "m.d"], changed: ["m.b"], removed: ["m.T"] });
+  assert_eq(moved(was, was), { added: [], changed: [], removed: [] })
+}
+
+test "a patch moves nothing, a minor only adds, and a major may change anything" {
+  let none = { added: [], changed: [], removed: [] };
+  let adds = { ..none, added: ["m.d"] };
+  let changes = { ..none, changed: ["m.b"] };
+  assert_eq(refusal("orders", v("0.1.0"), v("0.1.1"), none), None);
+  assert_eq(refusal("orders", v("0.1.0"), v("0.2.0"), adds), None);
+  assert_eq(refusal("orders", v("0.1.0"), v("1.0.0"), changes), None);
+  match refusal("orders", v("0.1.0"), v("0.1.1"), changes) {
+    None -> panic("a patch that changes a contract was taken"),
+    Some(d) -> {
+      assert_eq(d.code, b"E0150");
+      assert(string_contains(string_of_bytes_lossy(d.message), "changes what `m.b` promises"));
+      assert(
+        fold(d.notes_text, false, |hit: Bool, n: Bytes|
+          hit || n == b"publish it as 1.0.0 or later"),
+      )
+    },
+  };
+  match refusal("orders", v("0.1.0"), v("0.1.1"), adds) {
+    None -> panic("a patch that adds was taken"),
+    Some(d) -> assert(string_contains(string_of_bytes_lossy(d.message), "adds `m.d`")),
+  }
+}
+
+test "a version is held to the highest one published below it that is not yanked" {
+  let r = |text: String, yanked: Bool|
+    { version: v(text), digest: "b3:" ++ text, yanked: yanked, runtime: v("0.16.0") };
+  let index = {
+    name: "orders",
+    versions: [r("0.1.0", false), r("0.3.0", false), r("0.2.0", true), r("0.2.1", false)],
+  };
+  assert_eq(
+    match previous(index, v("0.2.5")) { Some(x) -> render_version(x.version), None -> "" },
+    "0.2.1",
+  );
+  assert_eq(
+    match previous(index, v("0.2.1")) { Some(x) -> render_version(x.version), None -> "" },
+    "0.1.0",
+  );
+  assert_eq(previous(index, v("0.1.0")), None)
+}

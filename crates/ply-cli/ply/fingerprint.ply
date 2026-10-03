@@ -1,0 +1,164 @@
+// What the semantics `semantics::version` names come to over a corpus: the head of this
+// fingerprint is the version, so a change to what a hash, a checked answer, an interface or a
+// verdict means fails here until the version moves with it.
+
+import std.bin
+import std.bytes (hex_of)
+import compiler.diag (parse_all)
+import compiler.front (Analysed, Refused, Whole, analyse, filing, Filing, FiledDecl, FiledDef,
+                       FiledEntry, FiledModule, FiledTest, def_interface_bin, decl_interface_bin,
+                       known_test_row_bin)
+import compiler.interface (Original, compile_package, compiled_package_bin)
+import compiler.resolve (Source)
+import proof.decide (Certified, GuardRefuted, Static, Undecided, Unwitnessed)
+import proof.goal (default_prove_budget)
+import proof.statics (claims_for, modules_of, prover_of, settled)
+import proof.world (Every, Drawn, Hosted, Interleave, Obligation, Points, Run, Static, Strategy,
+                    Unhandled, world_of)
+import semantics
+
+// A program reaching each thing a hash, a checked answer, an interface and a verdict are made of.
+fn corpus() -> List<Source> =
+  [
+    {
+      name: b"shapes",
+      src: b"pub type Shape = | Circle(Int) | Rect(Int, Int)\n\npub type Point = { x: Int, y: Int }\n\npub fn area(s: Shape) -> Int = match s { Circle(r) -> 3 * r * r, Rect(w, h) -> w * h }\n\npub fn moved(p: Point, dx: Int) -> Point = { ..p, x: p.x + dx }\n\npub fn total(xs: List<Int>) -> Int = fold(xs, 0, |acc: Int, x: Int| acc + x)\n\npub fn apply<a, b | e>(x: a, f: (a) -> b / e) -> b / e = f(x)\n\npub fn bump(x: Int) -> Int\n  requires x < 100\n  ensures result > x\n= x + 1\n\npub fn same(x: Int) -> Int ensures result == x = x\n\npub transparent fn double(x: Int) -> Int = x + x\n\npub fn digits(n: Int) -> List<Int>\n  returns fresh\n= range(0, n)\n\npub fn kept(xs: List<Int>) -> List<Int>\n  returns xs\n= xs\n\ntest \"area\" { assert_eq(area(Rect(2, 3)), 6) }\n\nlaw \"bump grows\" forall (x: Int) where x < 100 { bump(x) > x }\n\nlaw \"a small total\" forall (b: Bool) { total(if b { [1] } else { [] }) <= 1 }\n",
+    },
+    {
+      name: b"store",
+      src: b"import shapes\n\npub effect db {\n  read get[t](k: Int) -> Int\n  write put[t](k: Int, v: Int) -> Unit\n}\n\npub effect set Users = {db.read[users], db.write[users]}\n\npub fn lookup(k: Int) -> Int / {db.get[users]} = db.get[users](k)\n\npub fn stored(k: Int, v: Int) -> Unit / {Users} = db.put[users](k, v)\n\npub fn relay<[l]>(k: Int) -> Int / {db.get[l]} = db.get[l](k)\n\npub fn handled(k: Int) -> Int =\n  handle { lookup(k) } with { db.get[users](q) -> q + shapes::bump(1) }\n",
+    },
+  ]
+
+fn line(parts: List<Bytes>) -> Bytes =
+  bytes_concat(
+    fold(parts, b"", |acc: Bytes, p: Bytes|
+      if bytes_len(acc) == 0 { p } else { bytes_concat_all([acc, b" ", p]) }),
+    b"\n",
+  )
+
+fn hex(b: Bytes) -> Bytes / {abort.raise} = bytes_of_string(hex_of(b))
+
+// What the store files of each definition, declaration and test, short of where it is written and
+// how a body prints.
+fn filed(f: Filing) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    bytes_concat_all(
+      map(f.modules, |m: FiledModule|
+        bytes_concat_all([
+          line([b"module", m.name]),
+          bytes_concat_all(
+            map(m.entries, |e: FiledEntry| line([e.kind, e.name, hex(e.hash), hex(e.check)])),
+          ),
+          bytes_concat_all(
+            map(m.tests, |t: FiledTest|
+              line([
+                b"test",
+                t.name,
+                hex(t.hash),
+                if t.nondet { b"nondet" } else { b"det" },
+                hex(bin::encode(t.row, known_test_row_bin())),
+              ])),
+          ),
+        ])),
+    ),
+    bytes_concat_all(
+      map(f.defs, |d: FiledDef|
+        line([b"def", d.name, hex(d.hash), hex(bin::encode(d.interface, def_interface_bin()))])),
+    ),
+    bytes_concat_all(
+      map(f.decls, |d: FiledDecl|
+        line([b"decl", d.name, hex(d.hash), hex(bin::encode(d.interface, decl_interface_bin()))])),
+    ),
+  ])
+
+fn points_word(p: Points) -> Bytes =
+  match p { Every(_, what) -> bytes_of_string(what), Drawn -> b"drawn" }
+
+fn strategy_word(s: Strategy) -> Bytes =
+  match s {
+    Interleave(p) -> bytes_concat(b"interleave:", points_word(p)),
+    Hosted -> b"hosted",
+    Static(Unhandled(row)) -> bytes_concat(b"static:unhandled:", bytes_of_string(row)),
+    Static(Run(p)) -> bytes_concat(b"static:run:", points_word(p)),
+  }
+
+fn verdict_word(s: Static) -> Bytes =
+  match s {
+    Certified(_) -> b"certified",
+    Unwitnessed(_) -> b"unwitnessed",
+    GuardRefuted -> b"guard-refuted",
+    Undecided -> b"undecided",
+  }
+
+// Each claim's keys, how it is discharged, and what the static prover answers of it.
+fn verdicts(w: Whole) -> Bytes / {abort.raise} = {
+  let built = world_of(w, |m: Bytes| true);
+  let os = built.world.obligations;
+  let p = prover_of(claims_for(w, modules_of(w, os)), built.world, default_prove_budget());
+  bytes_concat_all(
+    map(os, |o: Obligation|
+      line([
+        bytes_of_string(o.owner),
+        bytes_of_string(o.key),
+        bytes_of_string(o.run_key),
+        strategy_word(o.strategy),
+        verdict_word(settled(p, o)),
+      ])),
+  )
+}
+
+pub fn fingerprint(sources: List<Source>) -> Bytes / {abort.raise} =
+  match analyse(parse_all(sources)) {
+    Refused(_) -> panic("the corpus a fingerprint is taken over checks"),
+    Analysed(w) ->
+      bytes_blake3(
+        bytes_concat_all([
+          filed(filing(w)),
+          bytes_concat_all(map(w.hashes.laws, |h: Bytes| line([b"law", hex(h)]))),
+          bytes_concat_all(
+            map(w.hashes.specs, |s: { name: Bytes, hashes: List<Bytes> }|
+              line(push(map(s.hashes, hex), s.name))),
+          ),
+          bin::encode(
+            compile_package(
+              map(sources, |s: Source| { name: s.name, src: s.src, manifest: None }),
+              w,
+              map(sources, |s: Source| s.name),
+            ),
+            compiled_package_bin(),
+          ),
+          verdicts(w),
+        ]),
+      ),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+test "the version is the head of the fingerprint the semantics answer" {
+  let now = hex_of(fingerprint(corpus()));
+  assert(
+    string_starts_with(now, semantics::version()),
+    Some(
+      "a hash, a checked answer, an interface or a verdict means something else now, so `semantics::version` is "
+        ++ string_slice(now, 0, 16),
+    ),
+  )
+}
+
+fn edited(src: Bytes, was: Bytes, now: Bytes) -> Bytes / {abort.raise} =
+  match bytes_index_of(src, was) {
+    Some(i) ->
+      bytes_concat_all([
+        bytes_slice(src, 0, i),
+        now,
+        bytes_slice(src, i + bytes_len(was), bytes_len(src)),
+      ]),
+    None -> panic("the corpus writes what the edit replaces"),
+  }
+
+test "a fingerprint moves with what a body means" {
+  let moved = map(corpus(), |s: Source|
+    if s.name == b"shapes" { { ..s, src: edited(s.src, b"x + 1", b"x + 2") } } else { s });
+  assert(fingerprint(moved) != fingerprint(corpus()))
+}

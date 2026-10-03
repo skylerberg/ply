@@ -116,6 +116,7 @@ pub fn value_of(p: &Plain) -> PlyValue {
             ])],
         ),
         Plain::Task(id) => value_ctor("VTask", vec![PlyValue::Int(*id as i64)]),
+        Plain::Chan(id) => value_ctor("VChan", vec![PlyValue::Int(*id as i64)]),
         Plain::Secret => value_ctor("VSecret", vec![]),
         Plain::Elided(n) => value_ctor("VElided", vec![PlyValue::Int(*n as i64)]),
     }
@@ -271,6 +272,7 @@ pub fn plain_of(v: &PlyValue, span: Span) -> Result<Plain, Diagnostic> {
                 .map_err(|_| bad("names no cell"))?,
         },
         "VTask" => Plain::Task(u64::try_from(int(arg(0)?)?).map_err(|_| bad("names no task"))?),
+        "VChan" => Plain::Chan(u64::try_from(int(arg(0)?)?).map_err(|_| bad("names no channel"))?),
         "VSecret" => Plain::Secret,
         "VElided" => {
             Plain::Elided(u64::try_from(int(arg(0)?)?).map_err(|_| bad("elides a negative count"))?)

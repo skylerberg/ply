@@ -1,24 +1,31 @@
 // The compiled package a project's loads read their dependencies and the shipped modules through. A
 // load reads what still stands of the package the last one kept, and where it read a module from
 // source it cuts the package again from its own analysis, so keeping it costs no analysis of its own.
+// A package is kept under the semantics its hashes and rows mean, so a `ply` that means the same
+// reads the package another kept.
 
-import std.fs (fs)
+import std.fs (fs, mem_empty)
 import std.bin
 import std.random (entropy)
 import std.time (time)
 import std.bytes (hex_of)
-import compiler.front (Whole)
-import compiler.interface (CompiledPackage, CompiledModule, Original, compile_package, valid_part,
-                           module_key, compiled_package_bin)
-import compiler.pkg (Pkgs, closure)
-import compiler.resolve (Source)
+import compiler.diag (parse_all)
+import compiler.front (Analysed, Refused, Whole, KnownDefRow, analyse)
+import compiler.hash (Fixed)
+import compiler.interface (CompiledPackage, CompiledModule, Envelope, Original, compile_package,
+                           valid_part, module_key, module_of, compiled_package_bin, envelope_of,
+                           enveloped)
+import compiler.pkg (Pkgs, closure, registry_dir)
+import compiler.resolve (Diag, Source, diag1)
 import store.engine (fresh_nonce)
+import store.twin (on_twin)
 import loads (Place)
+import semantics
 
 fn interfaces_dir(place: Place) -> String = place.dir ++ "/interfaces"
 
-// One per project and build: each module's own key says whether its stub still stands.
-fn package_name(place: Place) -> String / {abort.raise} = string_slice(place.stamps.frontend, 0, 16)
+// One per project and semantics: each module's own key says whether its stub still stands.
+fn package_name() -> String = semantics::version()
 
 // Discards every package kept for the project; false only when one is left behind.
 pub fn cleared<[r]>(place: Place) -> Bool / {fs.read[r], fs.write[r]} =
@@ -45,7 +52,7 @@ pub fn read_through<[r]>(
   place: Place,
   found: List<Original>,
 ) -> List<CompiledPackage> / {fs.read[r], abort.raise} =
-  match fs.read_file[r](interfaces_dir(place) ++ "/" ++ package_name(place)) {
+  match fs.read_file[r](interfaces_dir(place) ++ "/" ++ package_name()) {
     None -> [],
     Some(bytes) -> match bin::decode(bytes, compiled_package_bin()) {
       Err(_) -> [],
@@ -78,7 +85,7 @@ pub fn refreshed<[r]>(
   if fold(held, true, |all: Bool, n: Bytes| all && map_contains(covered, n)) { () } else {
     kept[r](
       place,
-      package_name(place),
+      package_name(),
       bin::encode(compile_package(found, w, held, through), compiled_package_bin()),
     )
   }
@@ -106,4 +113,192 @@ fn kept<[r]>(
     fs.rename[r](temp, path);
     ()
   } else { () }
+}
+
+// --- Published interfaces --------------------------------------------------------------
+// `ply resolve` leaves the interface a registry published for a dependency in the dependency's slot,
+// under the semantics it was cut with, where a walk never reads a module.
+
+pub fn slot_interface(slot: String) -> String = slot ++ "/.interface/" ++ semantics::version()
+
+// The slots among the roots of a walk's packages: its registry dependencies.
+pub fn slots(root_key: String, roots: List<String>) -> List<String> / {abort.raise} = {
+  let dir = string_of_bytes_lossy(registry_dir(bytes_of_string(root_key))) ++ "/";
+  filter(roots, |r: String| string_starts_with(r, dir))
+}
+
+// `abs` takes paths relative to the filesystem's root.
+fn under_abs(path: String) -> String / {abort.raise} =
+  if string_starts_with(path, "/") { string_slice(path, 1, string_len(path)) } else { path }
+
+fn keys_of(found: List<Original>) -> Map<Bytes, Bytes> =
+  fold(found, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
+    map_insert(acc, o.name, module_key(o)))
+
+// A published interface as it stands against what the walk found, when it was cut under these
+// semantics and anything of it stands.
+fn standing_of(bytes: Bytes, keys: Map<Bytes, Bytes>) -> Option<CompiledPackage> / {abort.raise} =
+  match envelope_of(bytes) {
+    None -> None,
+    Some(e) -> if e.semantics != bytes_of_string(semantics::version()) { None } else {
+      match bin::decode(e.payload, compiled_package_bin()) {
+        Err(_) -> None,
+        Ok(p) -> {
+          let standing = valid_part(p, keys);
+          if len(standing.modules) == 0 { None } else { Some(standing) }
+        },
+      }
+    },
+  }
+
+fn slot_read(slot: String) -> Option<Bytes> / {fs.read_file[abs], abort.raise} =
+  fs.read_file[abs](under_abs(slot_interface(slot)))
+
+// What the registry dependencies' published interfaces hold that still stands.
+pub fn published(
+  slots: List<String>,
+  found: List<Original>,
+) -> List<CompiledPackage> / {fs.read_file[abs], abort.raise} = {
+  let keys = keys_of(found);
+  fold(slots, [], |acc: List<CompiledPackage>, slot: String|
+    match slot_read(slot) {
+      None -> acc,
+      Some(bytes) -> match standing_of(bytes, keys) { Some(p) -> push(acc, p), None -> acc },
+    })
+}
+
+fn without(p: CompiledPackage, held: Map<Bytes, Bool>) -> CompiledPackage / {abort.raise} = {
+  let theirs = |name: Bytes| !map_contains(held, module_of(name));
+  {
+    modules: filter(p.modules, |m: CompiledModule| !map_contains(held, m.name)),
+    defs: filter(p.defs, |r: KnownDefRow| theirs(r.name)),
+    fixed: filter(p.fixed, |f: Fixed| theirs(f.name)),
+  }
+}
+
+// The project's own package first; a published one adds only the modules it lacks.
+pub fn beside(
+  own: List<CompiledPackage>,
+  more: List<CompiledPackage>,
+) -> List<CompiledPackage> / {abort.raise} = {
+  let held = fold(own, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
+    fold(p.modules, acc, |a: Map<Bytes, Bool>, m: CompiledModule| map_insert(a, m.name, true)));
+  fold(more, own, |acc: List<CompiledPackage>, p: CompiledPackage| {
+    let rest = without(p, held);
+    if len(rest.modules) == 0 { acc } else { push(acc, rest) }
+  })
+}
+
+// --- Re-deriving a published interface -------------------------------------------------
+
+fn outside() -> Int = 4294967295
+
+fn underived_diag(slot: String, what: String) -> Diag / {abort.raise} =
+  diag1(
+    b"E0149",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string(
+      "the interface published for `" ++ last_segment(slot)
+        ++ "` does not re-derive from its source: "
+        ++ what
+        ++ " differs",
+    ),
+    b"not what the package's source makes",
+    [
+      b"the registry that served it, or the slot `ply resolve` left it in, holds what no analysis of the package cuts",
+      b"the load read every dependency from source, so nothing it answered relies on the interface",
+    ],
+  )
+
+fn last_segment(path: String) -> String / {abort.raise} =
+  match list_at(string_split(path, "/"), len(string_split(path, "/")) - 1) {
+    Some(s) -> s,
+    None -> path,
+  }
+
+fn first_some<a>(xs: List<a>, f: (a) -> Option<String>) -> Option<String> =
+  fold(xs, None, |found: Option<String>, x: a| match found { Some(_) -> found, None -> f(x) })
+
+// What `published` holds that `own`, the same modules cut from this load's analysis, does not.
+fn difference(published: CompiledPackage, own: CompiledPackage) -> Option<String> = {
+  let modules = fold(
+    own.modules,
+    map_new(),
+    |acc: Map<Bytes, CompiledModule>, m: CompiledModule| map_insert(acc, m.name, m),
+  );
+  let defs = fold(own.defs, map_new(), |acc: Map<Bytes, KnownDefRow>, r: KnownDefRow|
+    map_insert(acc, r.name, r));
+  let fixed = fold(own.fixed, map_new(), |acc: Map<Bytes, Fixed>, f: Fixed|
+    map_insert(acc, bytes_concat(if f.decl { b"t:" } else { b"v:" }, f.name), f));
+  let named = |b: Bytes| "`" ++ string_of_bytes_lossy(b) ++ "`";
+  match first_some(published.modules, |m: CompiledModule|
+      if map_get(modules, m.name) == Some(m) { None } else { Some(named(m.name) ++ "'s stub") }) {
+    Some(what) -> Some(what),
+    None -> match first_some(published.defs, |r: KnownDefRow|
+        if map_get(defs, r.name) == Some(r) { None } else { Some(named(r.name) ++ "'s row") }) {
+      Some(what) -> Some(what),
+      None ->
+        first_some(published.fixed, |f: Fixed|
+          if map_get(fixed, bytes_concat(if f.decl { b"t:" } else { b"v:" }, f.name)) == Some(f) {
+            None
+          } else { Some(named(f.name) ++ "'s hash") }),
+    },
+  }
+}
+
+// Each published interface that stands, against what this load's own analysis cuts of the same
+// modules. The load read every dependency from source, so `w` is the interface's own derivation.
+pub fn underived(
+  slots: List<String>,
+  found: List<Original>,
+  w: Whole,
+) -> List<Diag> / {fs.read_file[abs], abort.raise} = {
+  let keys = keys_of(found);
+  fold(slots, [], |acc: List<Diag>, slot: String|
+    match slot_read(slot) {
+      None -> acc,
+      Some(bytes) -> match standing_of(bytes, keys) {
+        None -> acc,
+        Some(p) -> match difference(
+            p,
+            compile_package(found, w, map(p.modules, |m: CompiledModule| m.name)),
+          ) {
+          None -> acc,
+          Some(what) -> push(acc, underived_diag(slot, what)),
+        },
+      },
+    })
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_build(frontend: String) -> Place =
+  { label: "mem", dir: "cache", root: "", stamps: { frontend: frontend, runtime: "runtime" } }
+
+fn lib() -> Original = { name: b"lib", src: b"pub fn one() -> Int = 1\n", manifest: None }
+
+fn a_package() -> CompiledPackage / {abort.raise} =
+  match analyse(parse_all([{ name: lib().name, src: lib().src }])) {
+    Refused(_) -> panic("the module checks"),
+    Analysed(w) -> compile_package([lib()], w, [lib().name]),
+  }
+
+test "a build reads the package another build kept when their semantics agree" {
+  let read = on_twin(mem_empty(), || {
+    kept[mem](a_build("one"), package_name(), bin::encode(a_package(), compiled_package_bin()));
+    read_through[mem](a_build("two"), [lib()])
+  }).value;
+  assert_eq(read, [a_package()])
+}
+
+test "a package kept under other semantics is never read, and the next one kept sweeps it" {
+  let t = on_twin(mem_empty(), || {
+    kept[mem](a_build("one"), "elsewhere", bin::encode(a_package(), compiled_package_bin()));
+    let read = read_through[mem](a_build("one"), [lib()]);
+    kept[mem](a_build("one"), package_name(), bin::encode(a_package(), compiled_package_bin()));
+    { read: read, left: fs.list_dir[mem]("cache/interfaces") }
+  }).value;
+  assert_eq(t.read, []);
+  assert_eq(t.left, Some([package_name()]))
 }

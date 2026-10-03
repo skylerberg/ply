@@ -132,7 +132,7 @@ An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ 
 `std.show`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
 writes it (§13.38). The two spellings are one definition with one hash. A hole is any expression,
 strings and braces included, and `{{` and `}}` are braces of the text; a lone `}` is `E0001`. A
-hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Cell` or a `Task` in one
+hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Cell`, a `Task` or a `Chan` in one
 is `E0206`. A module that interpolates imports `std.show` itself, under a name no source can
 write, so `std.show` and the modules it imports cannot interpolate.
 
@@ -447,8 +447,8 @@ with `array_new` or `array_of_list` (§12.1). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
 written `#[a, b]`. It iterates in `compare` order. Its key type
-must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell` and
-`Task` are refused (`E0206`).
+must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
+`Task` and `Chan` are refused (`E0206`).
 
 ### 4.4 Sum types
 
@@ -528,10 +528,10 @@ A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
 ordered, and reaches a host operation only if that operation's registration
 allows it (`E0439`).
 
-**`Cell<a>`** (§7) and **`Task<a>`** (§9) are branded by their region and cannot
-outlive it; the brand prints as `Cell[users]<Int>`. A declaration is outside
-every region, so a variant's field or an operation's parameter or result that
-mentions either, at any depth, is `E0446`. Take it as a type parameter instead,
+**`Cell<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are branded by their
+region and cannot outlive it; the brand prints as `Cell[users]<Int>`. A
+declaration is outside every region, so a variant's field or an operation's
+parameter or result that mentions any of them, at any depth, is `E0446`. Take it as a type parameter instead,
 `type Held<t> = Held(t)`: the type argument carries the brand where the escape
 checks see it.
 
@@ -853,9 +853,9 @@ their rows: given `fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / 
 `both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`, and
 `[|| a.x(), || b.y()]` is a `List<() -> Unit / {a.x, b.y}>`.
 
-Inside a function's parameter, a `Cell`, a `Task` or a sum type the program
-declares, rows must match exactly, because a function held there can be handed
-what its own type does not admit: a parameter typed
+Inside a function's parameter, a `Cell`, a `Task`, a `Chan` or a sum type the
+program declares, rows must match exactly, because a function held there can be
+handed what its own type does not admit: a parameter typed
 `() -> Unit / {net.send[conn]}` is not one typed `() -> Unit / {net.write[conn]}`,
 in either direction.
 
@@ -1042,24 +1042,24 @@ clause answering an operation the task performs runs on the task's behalf, so
 under an older scheduler it may not touch the region's cells either. This judges
 the spawns a body performs itself, not those of a function it calls.
 
-A task, in turn, may be kept only in a cell younger than the `simulate` region
-that spawned it. A `simulate` region may not write a cell of a region opened
-around it while that cell can hold a `Task`, whether it writes the cell itself
-or calls a function whose row writes it: keep the task in a cell opened inside
-the region, or join it there and store what it answers. Nor may a task come in
-from outside: the region may not name a binding from outside it whose value
-holds a `Task` (a parameter, or a local, whether the body or a closure inside it
-names it), nor read a cell of a region opened around it while that cell can hold
-one (`E0413`, §9).
+A task or a channel, in turn, may be kept only in a cell younger than the
+`simulate` region that made it. A `simulate` region may not write a cell of a
+region opened around it while that cell can hold a `Task` or a `Chan`, whether it
+writes the cell itself or calls a function whose row writes it: keep the handle in
+a cell opened inside the region, or finish with it there and store what it gave.
+Nor may one come in from outside: the region may not name a binding from outside
+it whose value holds a `Task` or a `Chan` (a parameter, or a local, whether the
+body or a closure inside it names it), nor read a cell of a region opened around
+it while that cell can hold one (`E0413`, §9).
 
 * `E0201`: the cell escapes its `with_cell[r]` region.
 * `E0446`: a value branded by the region outlives it (stored in an older
   binding, handed to an operation, or reached by a task whose scheduler is
   older than the region, through the closure it runs or a handler around its
   spawn), a task is stored in a cell older than its `simulate` region, or a
-  declared type's field or an operation's signature mentions a `Cell` or a
-  `Task` (§4.6).
-* `E0449`: a region handle (a cell, a task, or the continuation a clause's
+  declared type's field or an operation's signature mentions a `Cell`, a
+  `Task` or a `Chan` (§4.6).
+* `E0449`: a region handle (a cell, a task, a channel, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
   function's, so this is the one check that sees it.
@@ -1181,7 +1181,11 @@ nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write join<a>(t: Task<a>) -> a
                        write yield() -> Unit
                        write cancel<a>(t: Task<a>) -> Bool
-                       write await<a>(t: Task<a>) -> Option<a> }
+                       write await<a>(t: Task<a>) -> Option<a>
+                       write channel<a>(capacity: Int) -> Chan<a>
+                       write send<a>(c: Chan<a>, x: a) -> Bool
+                       write recv<a>(c: Chan<a>) -> Option<a>
+                       write close<a>(c: Chan<a>) -> Unit }
 nondet effect clock  { read  now() -> Instant
                        write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
@@ -1195,16 +1199,18 @@ effect sim           { read  seed() -> Int }
 * A task performs against the handlers around its `task.spawn`, so a clause it
   reaches touches only the cells the task itself may (§7); a clause that binds
   `resume` is unreachable from a task (`E0502`).
-* `E0413`: a `Task` escapes in the region's answer: directly, inside a value,
-  or inside a closure that captured it. A closure's type shows a captured task
-  only as the `task.join` in its row, or the `sim.read` of a `simulate` it opens
-  to join one, so a function whose row carries either may not leave the region.
-  A task from outside may not come in either: the region may not name a binding
-  from outside it whose value holds a `Task`, nor read one from a cell older
-  than the region (§7). Every region numbers its own tasks, so a handle that
+* `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
+  inside a value, or inside a closure that captured it. A closure's type shows a
+  captured task only as the `task.join`, `task.await` or `task.cancel` in its
+  row, a captured channel as its `task.send`, `task.recv` or `task.close`, and
+  either as the `sim.read` of a `simulate` it opens to use one, so a function
+  whose row carries any of these may not leave the region. A task or channel
+  from outside may not come in either: the region may not name a binding from
+  outside it whose value holds one, nor read one from a cell older than the
+  region (§7). Every region numbers its own tasks and channels, so a handle that
   reaches another region past the checker, in a closure or through a type
   parameter, fails there at run time with `E0413` rather than name one of that
-  region's tasks. `E0446`: a task is stored in a cell older than the region
+  region's. `E0446`: a task is stored in a cell older than the region
   (§7). `E0414`: no progress, or a spent step budget. `E0416`: nested
   `simulate`. `E0425`: a host operation inside the region, refused before the
   handler runs and whether or not it is bound; the region answers `task`,
@@ -1222,6 +1228,20 @@ cancelled task has nothing to answer and raises (§6.8). A task cannot cancel
 itself or the region's body. A deadline is the two together: one task sleeps and
 cancels the other, which a third awaits. Every step a cancelled task took is read
 against the cancel, so the search tries cancelling it earlier and later.
+
+`task.channel(n)` makes a channel holding up to `n` values no receiver has taken;
+`0` is a rendezvous, where a send waits for the receive that takes it. A send
+waits while the channel is full and answers `true` once its value is queued or
+handed over, and a receive waits while it is empty and answers the oldest value
+sent. `task.close(c)` ends sending: a waiting receiver hears `None` and a waiting
+sender `false`, a later send answers `false` without sending, and receives take
+what was queued before the close, then `None`. Closing twice changes nothing,
+and a negative capacity raises `E0502`. Cancelling a task that waits on a
+channel lets go of its wait, and a value it was sending is dropped. Every
+operation on one channel is ordered against every other on it, so the search
+tries each order two senders or two receivers could take. A race is one channel:
+each worker sends what it answers, the first receive wins, and cancelling the
+others stops them.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -1350,6 +1370,7 @@ derive json for Line
 | `ord` | `<snake_case(T)>_ord` | `{compare: (T, T) -> Ordering}` |
 | `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
 | `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
+| `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
 
 There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
 `HttpRequest` both give `http_request`) is `E0105`. A `derive` must be in the
@@ -1369,11 +1390,11 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 `where derivable(D, p)` goes after the row and before any `requires`. Codecs are
 plain values: `json::decode_bytes(body, order_json())`.
 
-`E0206` names the field that blocks a derivation: function types, `Cell` and
-`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`, `bin`, `show`);
-`Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin` need their
-module imported (`import std.json`, `import std.bin`), or the `derive` is
-`E0206`; `show` imports `std.show` itself.
+`E0206` names the field that blocks a derivation: function types, `Cell`, `Task`
+and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
+`bin`, `show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json`
+and `bin` need their module imported (`import std.json`, `import std.bin`), or
+the `derive` is `E0206`; `show` imports `std.show` itself.
 
 ## 12. Builtins
 
@@ -1393,6 +1414,7 @@ authority when this page and it disagree.
 | `panic<a>(message: String) -> a` | raises `message` (§6.8); unanswered, `E0502` |
 | `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
+| `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
 | `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
 | `min`, `max` `(a: Int, b: Int) -> Int` | |
 | `cell_get<a>(c: Cell<a>) -> a` | |
@@ -2766,7 +2788,7 @@ pub type Value =
   | VFixed(String, U128) | VChar(Char) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
   | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
   | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
-  | VArray(List<Value>)
+  | VArray(List<Value>) | VChan(Int)
 pub type Field = { name: String, value: Value }
 pub type Entry = { key: Value, value: Value }
 pub type Fun =
@@ -2944,11 +2966,13 @@ A library is published to a registry and depended on from it (§3.3). A registry
 is a directory of files behind an HTTP server, laid out statically:
 
 ```
-GET  /<name>/index.json                  every version of <name>, newest last
-GET  /<name>/<version>/package.plyz      the library's `.plyz`, as `ply build` writes it
-GET  /<name>/<version>/package.plyz.b3   its digest, one `b3:<hex>` line
-PUT  /<name>/<version>                   publish: the `.plyz` as the body
-POST /<name>/<version>/yank              mark the version yanked
+GET  /<name>/index.json                      every version of <name>, newest last
+GET  /<name>/<version>/package.plyz          the library's `.plyz`, as `ply build` writes it
+GET  /<name>/<version>/package.plyz.b3       its digest, one `b3:<hex>` line
+GET  /<name>/<version>/interface/<semantics> the interface its publisher cut under <semantics>
+PUT  /<name>/<version>                       publish: the `.plyz` as the body
+PUT  /<name>/<version>/interface/<semantics> the interface beside it
+POST /<name>/<version>/yank                  mark the version yanked
 ```
 
 `index.json` is `{"name": .., "versions": [{"version": "0.2.0", "digest":
@@ -2967,11 +2991,37 @@ sends it to the registry `PLY_REGISTRY` names, under the token
 dependencies are all `Registry` ones, since whoever depends on it resolves them
 from the registry alone; a program, the anonymous package or a path or git
 dependency is `E0145`, as is a `ply yank` name or version that is not one. The
-registry recomputes the digest from the body and refuses a mismatch, refuses a
-version it already lists — a published version never changes, and the fix is a
-new version — and refuses an archive whose manifest is not the package and
-version it was sent as, names an entry, or depends on anything but the
-registry; each refusal is `E0144` with the registry's reason.
+registry recomputes the digest from the body and refuses a mismatch, refuses
+other bytes under a version it already lists — a published version never
+changes, and the fix is a new version; the same bytes again are the publish it
+holds — and refuses an archive whose manifest is not the package and version it
+was sent as, names an entry, or depends on anything but the registry; each
+refusal is `E0144` with the registry's reason.
+
+A version is held to what it changes. `ply publish` compares the contract of
+every public definition — its signature and specifications, and its body when
+it is `transparent`; a type's or effect's whole declaration — with those of the
+highest unyanked version published below it, each derived from its archive by
+this `ply` as a consumer reads it: a patch moves no contract, a minor only adds
+definitions, and a major may change or remove any. A version that bumps less
+than its changes need is `E0150`, naming what moved and the least version that
+says so, before anything is sent; 0.x versions follow the same places.
+`ply contracts NAME FROM TO` lists what moved between two published versions.
+
+After the archive, `ply publish` sends the package's **interface**: what a load
+of it as a dependency cuts (§16), each module's stub keyed by the sources and
+manifests its analysis read, framed with the semantics version of the `ply` that
+cut it and the archive's digest. The registry keeps one per version and
+semantics and refuses a frame that names another archive or semantics; the same
+bytes again are the one it holds, so a publish whose interface was refused runs
+again whole. The **semantics version** names what a definition's hashes, its
+checked rows and a claim's verdict mean — `ply publish --json` reports it — and
+moves only when one of them does, so a `ply` that changes nothing they mean
+reads an interface another cut. `ply resolve` fetches the interface beside each
+archive into the dependency's slot, and the first load reads the dependency
+through it rather than analysing its source. `--verify-deps` (`check`, `test`,
+`prove`) reads every dependency from source instead and refuses one whose
+interface does not re-derive from it, `E0149`.
 `ply yank NAME VERSION` sets the version's `yanked` field under the same token:
 a new resolution passes it over and a lock that pins it keeps it, and its archive
 is served exactly as before. Nothing is ever deleted.
@@ -3033,10 +3083,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance), `--workspace` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, host, simulation |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets and provenance), `--workspace`, `--verify-deps` |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, host, trace, prove, simulation |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
@@ -3046,11 +3096,12 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY` |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface published for it under this `ply`'s semantics when there is one (`interface` in `--json`) |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
-| `ply publish [path]` | build this library's `.plyz` and upload it to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN` (§15.1) |
+| `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
 | `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
+| `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
@@ -3110,7 +3161,10 @@ every definition's hash, references, effects and specifications, which the
 front end takes as they are. A module whose source or package manifest moved
 since, or that imports one that did, is read from source, as is one the package
 lacks, and the package is cut again from the load's own analysis, so a package
-costs no analysis of its own; a project keeps one per `ply`. A run about the
+costs no analysis of its own; a project keeps one per semantics version (§15.1),
+so a `ply` that changes nothing a hash or a row means reads the one another
+kept. A registry dependency's first load reads it through the interface its
+publisher sent. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
 read and file neither, and a program's own `machine.load` of a program runs the
@@ -3239,6 +3293,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0146` | an embed whose file or directory could not be read |
 | `E0147` | an embed whose path is not a string literal |
 | `E0148` | a `returns` clause the body does not keep |
+| `E0149` | a dependency's published interface that does not re-derive from its source |
+| `E0150` | a version whose changes need a larger bump than it makes |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -3262,7 +3318,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0412` | nondeterministic effect in a deterministic test |
-| `E0413` | `Task` escapes its region, or enters another |
+| `E0413` | `Task` or `Chan` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
 | `E0415` | replay did not reproduce the schedule (Ply's fault) |
 | `E0416` | nested `simulate` |

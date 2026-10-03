@@ -3,7 +3,8 @@
 // settles on unpacked into the project's cache. Only `ply resolve` asks the registry; a check, a
 // build or a run reads what the last resolve left there.
 
-import compiler.pkg (check_source, registry_dir, registry_key)
+import compiler.interface (envelope_of)
+import compiler.pkg (Supplied, check_source, registry_dir, registry_key)
 import compiler.plyx (digest_of, digest_text, encode_named, library_domain, library_magic,
                       off_digest)
 import builder (builder)
@@ -12,8 +13,10 @@ import env (env)
 import lock (Archived, Lock, entry_of)
 import plyz
 import plyz (Module, Unpacked, unpacked)
-import registry (Base, archive_target, base_of, exchange, get, index_target, said, unasked, unset,
-                 variable)
+import registry (Base, archive_target, base_of, exchange, get, index_target, interface_target, said,
+                 unasked, unset, variable)
+import interfaces (slot_interface)
+import semantics
 import sources (DepPackage, File, Project, Vendored, from_vendor, under_abs, vendored)
 import std.fs (fs, Dir)
 import std.json (decode_bytes, error_to_string)
@@ -35,6 +38,9 @@ pub fn slot_of(root: String, name: String) -> String / {abort.raise} =
 
 fn archive_path(root: String, name: String, version: String) -> String / {abort.raise} =
   join(cache_dir(root), name ++ "@" ++ version ++ ".plyz")
+
+fn interface_path(root: String, name: String, version: String) -> String / {abort.raise} =
+  join(cache_dir(root), name ++ "@" ++ version ++ "." ++ semantics::version() ++ ".interface")
 
 /// Every registry dependency the root package and the packages the walk read declare. The
 /// registry's own packages are left out: what they ask for is read from the archives this resolve
@@ -111,7 +117,14 @@ fn pinned_archive(lock: Option<Lock>, name: String, version: String) -> Option<S
 // on the highest version reached. The order requirements are met in changes none of that.
 
 /// One version the walk reached: what the index says of it, and what its archive holds.
-pub type Node = { name: String, release: Release, archive: Unpacked, deps: List<Requirement> }
+// `interface`: what the registry published of the version under these semantics, framed.
+pub type Node = {
+  name: String,
+  release: Release,
+  archive: Unpacked,
+  deps: List<Requirement>,
+  interface: Option<Bytes>,
+}
 
 type Walk = { indexes: Map<String, Index>, nodes: Map<String, Node>, queue: List<Requirement> }
 
@@ -332,7 +345,54 @@ fn node_of(name: String, r: Release, u: Unpacked) -> Result<Node, Diag> / {abort
           [],
         ),
       )
-    } else { Ok({ name: name, release: r, archive: u, deps: asked(m) }) },
+    } else { Ok({ name: name, release: r, archive: u, deps: asked(m), interface: None }) },
+  }
+}
+
+// --- Published interfaces ----------------------------------------------------------
+// What the registry published of a settled version under these semantics, from the cache when it
+// holds one framed for exactly this archive. An interface is an analysis saved, never one trusted
+// over the source: a version without one, or one the registry will not serve, is read from source.
+
+fn framed(bytes: Bytes, archive: String) -> Bool / {abort.raise} =
+  match envelope_of(bytes) {
+    None -> false,
+    Some(e) ->
+      e.semantics == bytes_of_string(semantics::version()) && e.archive == bytes_of_string(archive),
+  }
+
+fn with_interface(
+  ctx: Ctx,
+  n: Node,
+) -> Node / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
+  let version = render_version(n.release.version);
+  let path = interface_path(ctx.root, n.name, version);
+  let archive = digest_text(n.archive.digest);
+  match fs.read_file[abs](under_abs(path)) {
+    Some(bytes) -> if framed(bytes, archive) { { ..n, interface: Some(bytes) } }
+    else { served_interface(ctx, n, path, archive) },
+    None -> served_interface(ctx, n, path, archive),
+  }
+}
+
+fn served_interface(
+  ctx: Ctx,
+  n: Node,
+  path: String,
+  archive: String,
+) -> Node / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
+  let target = interface_target(
+    ctx.base,
+    n.name,
+    render_version(n.release.version),
+    semantics::version(),
+  );
+  match exchange(ctx.base, get(ctx.base, target)) {
+    Err(_) -> n,
+    Ok(answer) -> if answer.status == 200 && framed(answer.body, archive) {
+      kept(path, answer.body);
+      { ..n, interface: Some(answer.body) }
+    } else { n },
   }
 }
 
@@ -354,17 +414,18 @@ pub fn settled(nodes: List<Node>) -> List<Node> = {
 // `vendor/` and nothing else — to the vendored copy as well, so what a resolve pins is what the
 // next walk reads.
 
+// The interface goes to the cache's slot alone: a vendored copy is the package's sources.
 fn placed(
   root: String,
   items: List<Vendored>,
   n: Node,
 ) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
   let slot = slot_of(root, n.name);
-  match replaced(slot, n) {
+  match replaced(slot, n, n.interface) {
     Err(d) -> Err(d),
     Ok(_) -> match from_vendor(root, items, bytes_of_string(slot)) {
       None -> Ok(()),
-      Some(dir) -> replaced(dir, n),
+      Some(dir) -> replaced(dir, n, None),
     },
   }
 }
@@ -372,10 +433,19 @@ fn placed(
 fn replaced(
   dir: String,
   n: Node,
+  interface: Option<Bytes>,
 ) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
   let staging = dir ++ "@" ++ render_version(n.release.version);
   cleared(staging, 0);
-  if !unpacked_into(staging, n.archive) { Err(unwritable(staging)) } else {
+  let written = unpacked_into(staging, n.archive)
+    && (match interface {
+      None -> true,
+      Some(bytes) -> {
+        let at = slot_interface(staging);
+        fs.create_dir[abs](under_abs(parent(at))) && fs.write_file[abs](under_abs(at), bytes)
+      },
+    });
+  if !written { Err(unwritable(staging)) } else {
     cleared(dir, 0);
     if fs.rename[abs](under_abs(staging), under_abs(dir)) { Ok(()) } else { Err(unwritable(dir)) }
   }
@@ -433,7 +503,13 @@ pub fn resolved(
           match walk(lock, reqs, |name: String| indexed(base, name), |name: String, r: Release|
               fetched(ctx, name, r)) {
             Err(d) -> Err(d),
-            Ok(nodes) -> placed_all(ctx.root, vendored(ctx.root), settled(nodes), []),
+            Ok(nodes) ->
+              placed_all(
+                ctx.root,
+                vendored(ctx.root),
+                map(settled(nodes), |n: Node| with_interface(ctx, n)),
+                [],
+              ),
           }
         },
       },
@@ -459,10 +535,68 @@ fn placed_all(
             name: n.name,
             version: render_version(n.release.version),
             archive: digest_text(n.archive.digest),
+            interface: n.interface != None,
           }),
         ),
     },
   }
+
+// --- A published version, as a consumer is supplied it ------------------------------------
+
+/// A version's archive and those of the closure its manifest selects, fetched and checked as a
+/// resolve fetches them into `root`'s cache, each as the package a load is supplied at its slot.
+pub type Consumed = { manifest: Manifest, own: Supplied, deps: List<Supplied> }
+
+fn supplied_of(root: String, n: Node) -> Supplied / {abort.raise} =
+  {
+    root: registry_key(bytes_of_string(root), bytes_of_string(n.name)),
+    manifest: Some(n.archive.manifest),
+    modules: map(n.archive.modules, |m: Module| { name: bytes_of_string(m.name), src: m.text }),
+  }
+
+/// The registry's index of `name`: every version published under it.
+pub fn index_of(
+  base: Base,
+  name: String,
+) -> Result<Index, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} =
+  indexed(base, name)
+
+pub fn consumed(
+  base: Base,
+  root: String,
+  name: String,
+  r: Release,
+) -> Result<Consumed, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
+  let ctx: Ctx = { base: base, root: root, lock: None };
+  match fetched(ctx, name, r) {
+    Err(d) -> Err(d),
+    Ok(n) -> match checked(n.archive.manifest) {
+      None ->
+        Err(
+          untrue(
+            "the manifest in the registry's archive of `" ++ name ++ "` "
+              ++ render_version(r.version)
+              ++ " does not check",
+            [],
+          ),
+        ),
+      Some(m) -> match walk(
+          None,
+          n.deps,
+          |x: String| indexed(base, x),
+          |x: String, at: Release| fetched(ctx, x, at),
+        ) {
+        Err(d) -> Err(d),
+        Ok(nodes) ->
+          Ok({
+            manifest: m,
+            own: supplied_of(root, n),
+            deps: map(settled(nodes), |x: Node| supplied_of(root, x)),
+          }),
+      },
+    },
+  }
+}
 
 // --- Refusals -----------------------------------------------------------------------
 
@@ -585,6 +719,7 @@ fn a_node(name: String, version: String) -> Node / {abort.raise} =
     release: rel(version, false),
     archive: { digest: b"", manifest: b"", modules: [] },
     deps: [],
+    interface: None,
   }
 
 test "each name settles on the highest version the walk reached" {

@@ -13,6 +13,7 @@ pub mod codec;
 pub mod codes;
 pub mod compiled;
 pub mod decode;
+pub mod digest;
 pub mod escape;
 pub mod expr;
 pub mod files;

@@ -9,14 +9,18 @@ import items (Item, IFn, ITest, ILaw, FnDef, Derived)
 import resolve (Source, Mod)
 import diag (parse_all)
 import pkg (Pkgs)
-import hash (Fixed, fixed_nodes, fixed_bin)
+import hash (Contract, Fixed, fixed_nodes, fixed_bin, public_contracts)
 import front (Whole, Analysis, Analysed, Refused, Interfaces, no_interfaces, rows_of, KnownDefRow,
               EmitRoot, KeyRow, analyse, analyse_with, dump_of, known_def_row_bin)
 
 import tycore (at, append, take)
 
-// `key` is what the stub stands for (`module_key`); `imports` are the modules the stub's own stand on.
-pub type CompiledModule = { name: Bytes, stub: Bytes, key: Bytes, imports: List<Bytes> }
+// A module another one's analysis read, with the key it had then.
+pub type Reached = { name: Bytes, key: Bytes }
+
+// `key` is what the stub stands for (`module_key`); `reaches` is every module it imports, directly
+// or not, so the stub stands wherever each of them still has its key, in whatever package.
+pub type CompiledModule = { name: Bytes, stub: Bytes, key: Bytes, reaches: List<Reached> }
 
 // A module as a package is cut from it: its source and, for a dependency's, its package's manifest,
 // which decides what its imports name.
@@ -28,9 +32,31 @@ pub type CompiledPackage = {
   fixed: List<Fixed>,
 }
 
+derive bin for Reached
+
 derive bin for CompiledModule
 
 derive bin for CompiledPackage
+
+// A package's interface as a registry serves it beside a version's archive: the semantics it was
+// cut under, the archive it was cut from, and the package. A registry reads the frame whatever
+// semantics wrote the payload.
+pub type Envelope = { semantics: Bytes, archive: Bytes, payload: Bytes }
+
+derive bin for Envelope
+
+fn envelope_magic() -> Bytes = b"PLYIFC01"
+
+pub fn enveloped(e: Envelope) -> Bytes / {abort.raise} =
+  bytes_concat(envelope_magic(), bin::encode(e, envelope_bin()))
+
+pub fn envelope_of(b: Bytes) -> Option<Envelope> / {abort.raise} =
+  if !bytes_starts_with(b, envelope_magic()) { None } else {
+    match bin::decode(bytes_slice(b, bytes_len(envelope_magic()), bytes_len(b)), envelope_bin()) {
+      Ok(e) -> Some(e),
+      Err(_) -> None,
+    }
+  }
 
 // --- Stubs ------------------------------------------------------------------
 
@@ -102,7 +128,7 @@ pub fn stub_module(src: Bytes, m: Mod) -> Bytes / {abort.raise} = {
 // --- Compiling ----------------------------------------------------------------
 
 // The module a qualified name belongs to: its name without the final segment.
-fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
+pub fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
   let i = last_dot(name, bytes_len(name));
   if i < 0 { b"" } else { bytes_slice(name, 0, i) }
 }
@@ -120,14 +146,23 @@ pub fn module_key(o: Original) -> Bytes =
     ]),
   )
 
-fn distinct(xs: List<Bytes>) -> List<Bytes> =
-  fold(
-    xs,
-    { seen: map_new(), out: [] },
-    |acc: { seen: Map<Bytes, Bool>, out: List<Bytes> }, x: Bytes|
-      if map_contains(acc.seen, x) { acc }
-      else { { seen: map_insert(acc.seen, x, true), out: push(acc.out, x) } },
-  ).out
+// Every module `from` imports, directly or not, ascending.
+fn reach(imports: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
+  let seen = iterate(
+    { seen: map_new(), stack: at(imports, from) },
+    len(imports) * len(imports) + 1,
+    |s: { seen: Map<Int, Bool>, stack: List<Int> }|
+      match s.stack {
+        [] -> Stop(s.seen),
+        [i, ..rest] -> if map_contains(s.seen, i) || i == from {
+          Continue({ seen: s.seen, stack: rest })
+        } else {
+          Continue({ seen: map_insert(s.seen, i, true), stack: append(at(imports, i), rest) })
+        },
+      },
+  );
+  filter(range(0, len(imports)), |i: Int| map_contains(seen, i))
+}
 
 // A module `w` read through `through` keeps that package's stub and edges, its body here a blank;
 // one `w` never reached is carried over whole, since what a package fixes of a module is its own.
@@ -147,7 +182,11 @@ pub fn compile_package(
     map_insert(acc, o.name, o));
   let index = fold(range(0, len(w.mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
     map_insert(acc, at(w.mods, i).name, i));
-  let imports_of = |i: Int| distinct(map(at(w.r.imports, i), |j: Int| at(w.mods, j).name));
+  let reached = |i: Int|
+    map(reach(w.r.imports, i), |j: Int| {
+      let name = at(w.mods, j).name;
+      { name: name, key: match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" } }
+    });
   let implemented = fold(
     w.hashes.defs,
     map_new(),
@@ -163,7 +202,7 @@ pub fn compile_package(
               name: name,
               stub: stub_module(o.src, at(w.mods, i)),
               key: module_key(o),
-              imports: imports_of(i),
+              reaches: reached(i),
             },
           _ -> panic("a module the package cuts is in the analysis, with its source in hand"),
         },
@@ -202,26 +241,20 @@ pub fn compile_package(
 // --- Loading ----------------------------------------------------------------
 
 // The part of `p` that still stands, given each module's current key: a module whose key moved,
-// or that imports one that no longer stands, is read from its source again.
+// or that reaches one whose key moved, is read from its source again.
 pub fn valid_part(p: CompiledPackage, keys: Map<Bytes, Bytes>) -> CompiledPackage / {abort.raise} = {
-  let current = fold(p.modules, map_new(), |acc: Map<Bytes, Bool>, m: CompiledModule|
-    if map_get(keys, m.name) == Some(m.key) { map_insert(acc, m.name, true) } else { acc });
-  let standing = settled(p.modules, current);
+  let stands = |name: Bytes, key: Bytes| map_get(keys, name) == Some(key);
+  let standing = fold(p.modules, map_new(), |acc: Map<Bytes, Bool>, m: CompiledModule|
+    if stands(m.name, m.key)
+        && fold(m.reaches, true, |all: Bool, r: Reached| all && stands(r.name, r.key)) {
+      map_insert(acc, m.name, true)
+    } else { acc });
   let here = |name: Bytes| map_contains(standing, module_of(name));
   {
     modules: filter(p.modules, |m: CompiledModule| map_contains(standing, m.name)),
     defs: filter(p.defs, |r: KnownDefRow| here(r.name)),
     fixed: filter(p.fixed, |f: Fixed| here(f.name)),
   }
-}
-
-fn settled(modules: List<CompiledModule>, standing: Map<Bytes, Bool>) -> Map<Bytes, Bool> = {
-  let next = fold(modules, standing, |acc: Map<Bytes, Bool>, m: CompiledModule|
-    if map_contains(acc, m.name)
-        && !fold(m.imports, true, |all: Bool, i: Bytes| all && map_contains(acc, i)) {
-      map_remove(acc, m.name)
-    } else { acc });
-  if map_len(next) == map_len(standing) { next } else { settled(modules, next) }
 }
 
 pub fn merged_interfaces(packages: List<CompiledPackage>) -> Interfaces =
@@ -522,6 +555,31 @@ test "a dependency's body edit moves no check key of the package that reads it, 
   assert(spec_keys(promised.spec_checks, b"app.four") != spec_keys(before.spec_checks, b"app.four"))
 }
 
+test "a stub cut alone stands on the keys of the modules it reaches, wherever they are read from" {
+  let a: Source = { name: b"a", src: b"pub fn one() -> Int = 1\n" };
+  let b: Source = { name: b"b", src: b"import a (one)\npub fn two() -> Int = one() + one()\n" };
+  let c: Source = { name: b"c", src: b"import b (two)\npub fn four() -> Int = two() + two()\n" };
+  let full = whole_of(analyse(parse_all([a, b, c])));
+  let p = compile_package([original(a), original(b), original(c)], full, [b"c"]);
+  let keyed = |xs: List<Original>|
+    fold(xs, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
+      map_insert(acc, o.name, module_key(o)));
+  assert_eq(map(of_module(p, b"c").modules, |m: CompiledModule| m.reaches), [
+    [{ name: b"a", key: module_key(original(a)) }, { name: b"b", key: module_key(original(b)) }],
+  ]);
+  assert_eq(valid_part(p, keyed([original(a), original(b), original(c)])), p);
+  // `c` imports `b` alone, and `b`'s analysis read `a`.
+  let edited: Original = { name: b"a", src: b"pub fn one() -> Int = 2\n", manifest: None };
+  assert_eq(valid_part(p, keyed([edited, original(b), original(c)])).modules, [])
+}
+
+test "an envelope carries its frame and payload whole, and nothing else reads as one" {
+  let e: Envelope = { semantics: b"s1", archive: b"b3:ab", payload: b"\x00\x01payload" };
+  assert_eq(envelope_of(enveloped(e)), Some(e));
+  assert_eq(envelope_of(b"PLYIFC01"), None);
+  assert_eq(envelope_of(bytes_slice(enveloped(e), 1, bytes_len(enveloped(e)))), None)
+}
+
 test "a `transparent` definition's body is part of its contract, and its stub keeps it" {
   let app: Source = {
     name: b"app",
@@ -558,4 +616,36 @@ test "a `returns` clause is part of a definition's contract" {
     keyed_by(hashes(lib(b" returns fresh")).checks, b"app.three")
       != keyed_by(hashes(lib(b"")).checks, b"app.three"),
   )
+}
+
+fn contracts_of(src: Bytes) -> List<Contract> / {abort.raise} = {
+  let w = whole_of(analyse(parse_all([{ name: b"lib", src: src }])));
+  public_contracts(w.index, w.hashes, |m: Bytes| m == b"lib")
+}
+
+fn contract_named(cs: List<Contract>, name: Bytes) -> Bytes / {abort.raise} =
+  match filter(cs, |c: Contract| c.name == name) {
+    [c] -> c.hash,
+    _ -> panic("one contract of the name"),
+  }
+
+test "a public definition's contract moves with its signature and specification, never its body" {
+  let lib = |body: Bytes, spec: Bytes, variants: Bytes|
+    bytes_concat_all([
+      b"pub type T = ",
+      variants,
+      b"\npub fn f(x: Int) -> Int",
+      spec,
+      b" = ",
+      body,
+      b"\nfn hidden() -> Int = 1\n",
+    ]);
+  let base = contracts_of(lib(b"x + 1", b"", b"| A | B"));
+  assert_eq(map(base, |c: Contract| c.name), [b"lib.T", b"lib.f"]);
+  assert_eq(contracts_of(lib(b"x + 2", b"", b"| A | B")), base);
+  let specified = contracts_of(lib(b"x + 1", b" ensures result > x", b"| A | B"));
+  assert(contract_named(specified, b"lib.f") != contract_named(base, b"lib.f"));
+  assert_eq(contract_named(specified, b"lib.T"), contract_named(base, b"lib.T"));
+  let widened = contracts_of(lib(b"x + 1", b"", b"| A | B | C"));
+  assert(contract_named(widened, b"lib.T") != contract_named(base, b"lib.T"))
 }
