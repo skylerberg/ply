@@ -57,8 +57,11 @@ fn blank(text: Bytes) -> Bytes / {abort.raise} = {
   )
 }
 
-// Walked even when seeded (rows cannot carry a row tail or a label), so its body stays in the stub.
-fn walked(d: FnDef) -> Bool = len(d.generics.effects) > 0 || len(d.generics.labels) > 0
+// Walked even when seeded (rows cannot carry a row tail or a label), or `transparent`, which another
+// package's proofs unfold: its body stays in the stub.
+fn kept(d: FnDef) -> Bool =
+  len(d.generics.effects) > 0 || len(d.generics.labels) > 0
+    || (match d.transparent { Some(_) -> true, None -> false })
 
 // A generated definition carries its `derive` item's span, and the item regenerates it.
 fn cuts_of(m: Mod) -> List<Cut> = {
@@ -66,7 +69,7 @@ fn cuts_of(m: Mod) -> List<Cut> = {
     map_insert(acc, span_key(d.span), true));
   fold(m.module.items, [], |acc: List<Cut>, it: Item|
     match it {
-      IFn(d) -> if map_contains(generated, span_key(d.span)) || walked(d) { acc } else {
+      IFn(d) -> if map_contains(generated, span_key(d.span)) || kept(d) { acc } else {
         let b = expr_span(d.body);
         if b.end - b.start < 2 { acc }
         else { push(acc, { start: b.start, end: b.end, braced: true }) }
@@ -517,4 +520,42 @@ test "a dependency's body edit moves no check key of the package that reads it, 
   // The contract moved: the dependent is checked and proved again.
   assert(keyed_by(promised.checks, b"app.three") != keyed_by(before.checks, b"app.three"));
   assert(spec_keys(promised.spec_checks, b"app.four") != spec_keys(before.spec_checks, b"app.four"))
+}
+
+test "a `transparent` definition's body is part of its contract, and its stub keeps it" {
+  let app: Source = {
+    name: b"app",
+    src: b"import base.lib (one, two)\npub fn three() -> Int = two(one()) + 1\n",
+  };
+  let lib = |two_body: Bytes|
+    bytes_concat_all([
+      b"pub fn one() -> Int = 0 + 1\npub transparent fn two(x: Int) -> Int = ",
+      two_body,
+      b"\n",
+    ]);
+  let hashes = |src: Bytes| whole_of(analyse_with(parse_all([app]), [], [], over_base(src))).hashes;
+  let before = hashes(lib(b"x + one()"));
+  let edited = hashes(lib(b"x + one() + 0"));
+  assert(
+    keyed_by(edited.checks, b"app.three") != keyed_by(before.checks, b"app.three"),
+    Some("the body is read"),
+  );
+  let source = lib(b"x + one()");
+  let stub = stub_module(source, at(parse_all([{ name: b"base.lib", src: source }]), 0).module);
+  assert(bytes_index_of(stub, b"= x + one()") != None, Some(string_of_bytes(stub)));
+  assert(bytes_index_of(stub, b"0 + 1") == None, Some(string_of_bytes(stub)))
+}
+
+test "a `returns` clause is part of a definition's contract" {
+  let app: Source = {
+    name: b"app",
+    src: b"import base.lib (made)\npub fn three() -> List<Int> = made(3)\n",
+  };
+  let lib = |clause: Bytes|
+    bytes_concat_all([b"pub fn made(n: Int) -> List<Int>", clause, b" = range(0, n)\n"]);
+  let hashes = |src: Bytes| whole_of(analyse_with(parse_all([app]), [], [], over_base(src))).hashes;
+  assert(
+    keyed_by(hashes(lib(b" returns fresh")).checks, b"app.three")
+      != keyed_by(hashes(lib(b"")).checks, b"app.three"),
+  )
 }

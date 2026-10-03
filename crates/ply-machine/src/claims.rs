@@ -244,7 +244,7 @@ fn points_of(value: &PlyValue, span: Span) -> Result<Vec<Vec<ply_eval::Plain>>, 
     for point in value.as_list(span, "the points")? {
         let mut values = Vec::new();
         for v in point.as_list(span, "a point")? {
-            values.push(crate::payload::value_plain(v, span)?);
+            values.push(ply_eval::reflect::plain_of(v, span)?);
         }
         out.push(values);
     }
@@ -755,7 +755,7 @@ fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
         diagnostic
             .values
             .iter()
-            .map(crate::payload::plain_value)
+            .map(ply_eval::reflect::value_of)
             .collect(),
     )
 }

@@ -9,7 +9,11 @@
 #       process beside the others. A lane's runs of one package go in one `ply test` with a
 #       `--filter` each, so the package's closure is loaded once a lane rather than once a run. Each
 #       run's milliseconds are appended to TIMINGS as `corpus <run> <ms>`: a module's are its tests'
-#       own, out of the report.
+#       own, out of the report. Each `ply test` adds `cached <what> <n>`, the tests it took from the
+#       cache, which tells `ci-shards.sh timings` whether the run's costs are a cold run's.
+#   ci-corpus.sh desks K TIMINGS CUT [ARG...]
+#       the desk runs runner K takes (`ci-shards.sh desks-for-runner K CUT`, round robin when CUT is
+#       empty) in one `ply test` with ARGs added, their milliseconds onto TIMINGS as a partition's
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 #   ci-corpus.sh mark                  the moment `keep` gathers from
 #   ci-corpus.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
@@ -19,6 +23,11 @@
 #                                      still applies. Objects stay out: one compiles from its bodies in
 #                                      seconds, and they were most of what a lane kept. The stages are
 #                                      build-ply's to ship, and the packages' stores are carried apart.
+#   ci-corpus.sh pack TAR              what a partition leaves the next run: `keep`'s C, and each package
+#                                      store its runs wrote since `mark`, compacted
+#   ci-corpus.sh unpack DIR C          every partition's TAR under DIR as one: their C merged into C,
+#                                      and each store written over the checkout's, so a later partition
+#                                      finds every package's whichever partition the cut gave it
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
 #   ci-corpus.sh compact               every package's store compacted before a job saves them: a
 #                                      store only grows, and every later job restores what one saves
@@ -77,9 +86,15 @@ red() {
   ' "$1" 2>/dev/null || cat "$1"
 }
 
-# Each test a run ran, with how it ended, and each it took from the cache.
+# Each test a run ran, with how it ended and its seconds, and each it took from the cache.
 listed() {
-  jq -r '(.results[]? | "\(.status)\t\(.key // .name)"), (.selection.tests[]? | select(.reason == "cached") | "cached\t\(.key)")' "$1" 2>/dev/null
+  jq -r '(.results[]? | "\(.status)\t\(((.duration_ms // 0) / 100 | floor) / 10)s\t\(.key // .name)"), (.selection.tests[]? | select(.reason == "cached") | "cached\t\t\(.key)")' "$1" 2>/dev/null
+}
+
+# The row saying how many tests the report at $1 took from the cache, under $2, onto $3 if one is named.
+cached_row() {
+  [[ -n $3 ]] || return 0
+  printf 'cached\t%s\t%s\n' "$2" "$(jq -s 'map(.summary.cached // 0) | add // 0' "$1" 2>/dev/null || echo 0)" >> "$3"
 }
 
 # Where a `ply test` spent its wall clock WALL (ms), from its report: the phases its clock, which
@@ -92,9 +107,10 @@ spent() {
   ' "$1" 2>/dev/null
 }
 
+# The run ID with ARGs added, its `cached` row onto TIMINGS when that is not empty.
 run_one() {
-  local id=$1 line path filter status=0 selected out started
-  shift
+  local timings=$1 id=$2 line path filter status=0 selected out started
+  shift 2
   line=$("$shards" corpus-line "$id") || return 2
   read -r path filter <<< "$line"
   out=$(mktemp)
@@ -108,6 +124,7 @@ run_one() {
   fi
   listed "$out"
   spent "$out" "$(($(date +%s%3N) - started))"
+  cached_row "$out" "$id" "$timings"
   selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
     [ "$selected" -gt 0 ] || echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
@@ -118,14 +135,21 @@ run_one() {
   rm -f "$out"
 }
 
-# The runs IDs, all of one package, in one `ply test`: each run's milliseconds are the summed
-# durations of the tests whose `<module>.<label>` key its filter holds, and a run whose filter
-# selected none fails.
+# The runs IDs, all of one package, in one `ply test` with the ARGs after `--` added: each run's
+# milliseconds are the summed durations of the tests whose `<module>.<label>` key its filter holds,
+# and a run whose filter selected none fails.
 run_modules() {
   local timings=$1 id line path filter status=0 out bad=0 n ms i
-  local -a filters=() ids=() args=()
+  local -a filters=() ids=() args=() extra=()
   shift
-  for id in "$@"; do
+  while [ $# -gt 0 ]; do
+    if [ "$1" = -- ]; then
+      shift
+      extra=("$@")
+      break
+    fi
+    id=$1
+    shift
     line=$("$shards" corpus-line "$id") || return 2
     read -r path filter <<< "$line"
     ids+=("$id")
@@ -134,10 +158,11 @@ run_modules() {
   done
   out=$(mktemp)
   started=$(date +%s%3N)
-  tested "$path" "${args[@]}" > "$out" || status=$?
+  tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} > "$out" || status=$?
   wall=$(($(date +%s%3N) - started))
   listed "$out"
   spent "$out" "$wall"
+  cached_row "$out" "$path" "$timings"
   # The startup the cut charges a lane once per package.
   ran=$(jq '(.summary.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   printf 'startup\t%s\t%s\n' "$path" "$((wall > ran ? wall - ran : 0))" >> "$timings"
@@ -171,7 +196,7 @@ lane() {
       program | package-* | fixture-*)
         echo "::group::corpus $id"
         started=$(date +%s%3N)
-        run_one "$id" || failed=1
+        run_one "$timings" "$id" || failed=1
         printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
         echo "::endgroup::"
         ;;
@@ -190,6 +215,22 @@ lane() {
     echo "::endgroup::"
   fi
   return "$failed"
+}
+
+marked() {
+  [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; return 1; }
+}
+
+# The bodies and answers `ply` emitted or read since the mark, into DIR.
+kept_c() {
+  local dir=$1 sub
+  local -a kept=()
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  for sub in emit answers; do [ -d "$caches/ply-c-cache/$sub" ] && kept+=("ply-c-cache/$sub"); done
+  [ "${#kept[@]}" -gt 0 ] || return 0
+  (cd "$caches" && find "${kept[@]}" -type f -newer "$mark" ! -name '*.tmp' -print0 |
+    tar --null -T - -cf -) | tar -xf - -C "$dir"
 }
 
 case "${1:-}" in
@@ -216,23 +257,73 @@ case "${1:-}" in
     rm -rf "$work"
     exit "$failed"
     ;;
+  desks)
+    k=${2:?a desk runner}
+    timings=${3:?a file for the durations}
+    [ $# -ge 4 ] || { echo "usage: ci-corpus.sh desks K TIMINGS CUT [ARG...], CUT empty for none" >&2; exit 2; }
+    taken=$("$shards" desks-for-runner "$k" "$4") || exit 2
+    shift 4
+    : > "$timings"
+    if [ -z "$taken" ]; then
+      echo "desk runner $k takes no run: there are more runners than desk tests"
+      exit 0
+    fi
+    read -ra runs <<< "$(tr '\n' ' ' <<< "$taken")"
+    echo "::group::corpus desks ${runs[*]}"
+    failed=0
+    run_modules "$timings" "${runs[@]}" -- "$@" || failed=1
+    echo "::endgroup::"
+    exit "$failed"
+    ;;
   run)
-    run_one "${2:?a corpus entry}" "${@:3}"
+    run_one "" "${2:?a corpus entry}" "${@:3}"
     ;;
   mark)
     touch "$mark"
     ;;
   keep)
     dir=${2:?a directory}
-    [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; exit 2; }
+    marked || exit 2
+    kept_c "$dir" || exit 1
+    du -sh "$dir"
+    ;;
+  pack)
+    tar_out=${2:?a tar file}
+    marked || exit 2
+    work=$(mktemp -d)
+    kept_c "$work/c" || exit 1
+    # A store is one file set: it travels whole, from the partition that wrote it.
+    for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache; do
+      [ -d "$store" ] && [ -n "$(find "$store" -type f -newer "$mark" -print -quit)" ] || continue
+      rel=${store#"$root"/}
+      "$ply" cache compact "${store%/.ply-cache}" > /dev/null ||
+        echo "the store under ${rel%/.ply-cache} was not compacted" >&2
+      mkdir -p "$work/stores/${rel%/.ply-cache}"
+      cp -R "$store" "$work/stores/$rel"
+      echo "packed the store under ${rel%/.ply-cache}"
+    done
+    tar -C "$work" -cf "$tar_out" .
+    rm -rf "$work"
+    du -h "$tar_out"
+    ;;
+  unpack)
+    parts=${2:?a directory of packed tars}
+    dir=${3:?a directory for the C}
     rm -rf "$dir"
     mkdir -p "$dir"
-    kept=()
-    for sub in emit answers; do [ -d "$caches/ply-c-cache/$sub" ] && kept+=("ply-c-cache/$sub"); done
-    if [ "${#kept[@]}" -gt 0 ]; then
-      (cd "$caches" && find "${kept[@]}" -type f -newer "$mark" ! -name '*.tmp' -print0 |
-        tar --null -T - -cf -) | tar -xf - -C "$dir" || exit 1
-    fi
+    while IFS= read -r part; do
+      work=$(mktemp -d)
+      tar -C "$work" -xf "$part" || { rm -rf "$work"; exit 1; }
+      [ -d "$work/c" ] && { tar -C "$work/c" -cf - . | tar -C "$dir" --skip-old-files -xf -; }
+      while IFS= read -r store; do
+        rel=${store#"$work/stores/"}
+        rm -rf "${root:?}/$rel"
+        mkdir -p "$(dirname "$root/$rel")"
+        cp -R "$store" "$root/$rel"
+        echo "the store under ${rel%/.ply-cache} from ${part#"$parts"/}"
+      done < <([ -d "$work/stores" ] && find "$work/stores" -type d -name .ply-cache)
+      rm -rf "$work"
+    done < <(find "$parts" -type f -name '*.tar' | sort)
     du -sh "$dir"
     ;;
   restore)
@@ -281,7 +372,7 @@ case "${1:-}" in
     find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
     ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...] | mark | keep DIR | restore DIR | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | desks K TIMINGS CUT [ARG...] | run ID [ARG...] | mark | keep DIR | pack TAR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
     exit 2
     ;;
 esac

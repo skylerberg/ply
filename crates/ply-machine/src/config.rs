@@ -119,7 +119,7 @@ pub fn schema_of(
 /// What a `schema` operation answers: `Result<Value, List<Diag>>`.
 pub fn schema_answer(evaluated: Result<ply_eval::Plain, Diagnostic>) -> PlyValue {
     match evaluated {
-        Ok(plain) => PlyValue::ctor("Ok", vec![crate::payload::plain_value(&plain)]),
+        Ok(plain) => PlyValue::ctor("Ok", vec![ply_eval::reflect::value_of(&plain)]),
         Err(diagnostic) => PlyValue::ctor("Err", vec![crate::payload::diags_value(&[diagnostic])]),
     }
 }

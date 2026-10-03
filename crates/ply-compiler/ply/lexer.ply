@@ -40,6 +40,10 @@ pub type Tok =
   // A line string's lines, joined: a value like a `TStr`'s, which only an expression may be.
   | TLines(Bytes)
   | TBytes(Bytes)
+  // An interpolated string's text: up to its first hole, between two holes, and after its last.
+  | TFHead(Bytes)
+  | TFMid(Bytes)
+  | TFTail(Bytes)
   // A character literal's Unicode scalar value.
   | TChar(Int)
   | TKw(Bytes)
@@ -55,17 +59,27 @@ pub type Comment = { start: Int, end: Int }
 pub type Lexed = { toks: List<Token>, diags: List<Diag>, comments: List<Comment> }
 
 // `toks` must stay the last field in every `Scan` literal: anywhere earlier, `push` copies the list (quadratic).
-type Scan = { pos: Int, diags: List<Diag>, toks: List<Token> }
+// `holes` is, per interpolated string open around the scan, the braces opened inside its hole.
+type Scan = { pos: Int, diags: List<Diag>, holes: List<Int>, toks: List<Token> }
 
 fn emit(s: Scan, start: Int, fin: Int, t: Tok) -> Scan =
-  { pos: fin, diags: s.diags, toks: push(s.toks, { start: start, end: fin, tok: t }) }
+  {
+    pos: fin,
+    diags: s.diags,
+    holes: s.holes,
+    toks: push(s.toks, { start: start, end: fin, tok: t }),
+  }
 
 fn err(s: Scan, start: Int, fin: Int, code: Bytes, message: Bytes, label: Bytes) -> Scan =
   {
     pos: s.pos,
+    holes: s.holes,
     toks: s.toks,
     diags: push(s.diags, { start: start, end: fin, code: code, message: message, label: label }),
   }
+
+fn with_holes(s: Scan, holes: List<Int>) -> Scan =
+  { pos: s.pos, diags: s.diags, holes: holes, toks: s.toks }
 
 fn bad_suffix(s: Scan, start: Int, fin: Int, suffix: Bytes) -> Scan =
   err(
@@ -77,7 +91,7 @@ fn bad_suffix(s: Scan, start: Int, fin: Int, suffix: Bytes) -> Scan =
     b"the suffixes are `m` for a `Decimal` and a width \xe2\x80\x94 `u8`, `i32` and the six others; separate a name with a space",
   )
 
-fn seek(s: Scan, p: Int) -> Scan = { pos: p, diags: s.diags, toks: s.toks }
+fn seek(s: Scan, p: Int) -> Scan = { pos: p, diags: s.diags, holes: s.holes, toks: s.toks }
 
 fn unexpected() -> Bytes = b"E0001"
 
@@ -118,10 +132,20 @@ fn skip_trivia(src: Bytes, i: Int) -> Int / {abort.raise} = {
 
 pub fn lex(src: Bytes) -> Lexed / {abort.raise} = {
   let n = bytes_len(src);
-  let start = { pos: 0, diags: [], toks: [] };
+  let start = { pos: 0, diags: [], holes: [], toks: [] };
   // Every step that has work left consumes at least one byte, so `n + 1` steps suffice.
   let done = fold(range(0, n + 1), start, |s: Scan, i: Int| one(src, s));
-  let with_eof = emit(done, n, n, TEof);
+  let closed = if len(done.holes) == 0 { done } else {
+    err(
+      done,
+      n,
+      n,
+      unterminated(),
+      b"an interpolated string's `{` is never closed",
+      b"close the hole with `}` and the string with `\"`",
+    )
+  };
+  let with_eof = emit(closed, n, n, TEof);
   { diags: with_eof.diags, toks: with_eof.toks, comments: comments(src, with_eof.toks) }
 }
 
@@ -157,6 +181,7 @@ fn token_at(src: Bytes, s: Scan, start: Int) -> Scan / {abort.raise} = {
   let c = bytes_at(src, start);
   if is_digit(c) { number(src, s, start) }
   else if c == 98 && at(src, start + 1) == 34 { bytes_body(src, s, start, start + 2, b"") }
+  else if c == 102 && at(src, start + 1) == 34 { fstr_piece(src, s, start, start + 2, b"", true) }
   else if is_ident_start(c) { ident(src, s, start) }
   else if c == 34 { string_lit(src, s, start, start + 1, b"") }
   else if c == 92 && at(src, start + 1) == 92 { line_string(src, s, start, start, []) }
@@ -686,37 +711,122 @@ fn unknown_escape(src: Bytes, s: Scan, stop: Int, w: Int, valid: Bytes) -> Scan 
 
 fn string_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Scan / {abort.raise} = {
   let n = bytes_len(src);
-  let c = at(src, stop + 1);
-  if c < 0 {
+  if at(src, stop + 1) < 0 {
     emit(
       err(s, open, n, unterminated(), b"unterminated string literal", b"add a closing `\"`"),
       open,
       n,
       TStr(so_far),
     )
-  } else if c == 110 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\n")) }
-  else if c == 116 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\t")) }
-  else if c == 114 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\r")) }
-  else if c == 48 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\x00")) }
-  else if c == 92 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\\")) }
-  else if c == 34 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\"")) }
-  else if c == 39 { string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"'")) }
-  else if c == 117 {
-    let u = unicode_escape(src, stop);
-    if u.point < 0 { string_lit(src, refused(s, stop, u), open, u.end, so_far) }
-    else { string_lit(src, s, open, u.end, bytes_concat(so_far, utf8_of(u.point))) }
   } else {
-    // Reported, and the whole character is kept.
+    let e = text_escape(src, s, stop);
+    string_lit(src, e.s, open, e.next, bytes_concat(so_far, e.text))
+  }
+}
+
+// The escape at the backslash `stop` of a string's text, which is not the last byte: the bytes it
+// stands for and where the text goes on. An unknown escape is reported and its character kept.
+fn text_escape(
+  src: Bytes,
+  s: Scan,
+  stop: Int,
+) -> { s: Scan, text: Bytes, next: Int } / {abort.raise} = {
+  let c = at(src, stop + 1);
+  if c == 110 { { s: s, text: b"\n", next: stop + 2 } }
+  else if c == 116 { { s: s, text: b"\t", next: stop + 2 } }
+  else if c == 114 { { s: s, text: b"\r", next: stop + 2 } }
+  else if c == 48 { { s: s, text: b"\x00", next: stop + 2 } }
+  else if c == 92 { { s: s, text: b"\\", next: stop + 2 } }
+  else if c == 34 { { s: s, text: b"\"", next: stop + 2 } }
+  else if c == 39 { { s: s, text: b"'", next: stop + 2 } } else if c == 117 {
+    let u = unicode_escape(src, stop);
+    if u.point < 0 { { s: refused(s, stop, u), text: b"", next: u.end } }
+    else { { s: s, text: utf8_of(u.point), next: u.end } }
+  } else {
     let w = utf8_len(c);
-    string_lit(
-      src,
-      unknown_escape(src, s, stop, w, valid_escapes()),
+    {
+      s: unknown_escape(src, s, stop, w, valid_escapes()),
+      text: bytes_slice(src, stop + 1, stop + 1 + w),
+      next: stop + 1 + w,
+    }
+  }
+}
+
+// --- Interpolated strings ---------------------------------------------------
+
+// `f"a {x} b"` is `TFHead("a ")`, the tokens of `x`, then `TFTail(" b")`; the text between two
+// holes is a `TFMid`. One with no hole is a plain `TStr`. `{{` and `}}` are braces of the text.
+fn fstr_stops() -> Bytes = b"\"\\\n{}"
+
+// `open` is where the piece's token starts: the `f` of a head, otherwise the `}` closing a hole.
+fn fstr_piece(
+  src: Bytes,
+  s: Scan,
+  open: Int,
+  i: Int,
+  acc: Bytes,
+  head: Bool,
+) -> Scan / {abort.raise} = {
+  let n = bytes_len(src);
+  let stop = scan_until(src, i, fstr_stops());
+  let so_far = bytes_concat(acc, bytes_slice(src, i, stop));
+  let c = at(src, stop);
+  let last = if head { TStr(so_far) } else { TFTail(so_far) };
+  if c < 0 || c == 10 || (c == 92 && at(src, stop + 1) < 0) {
+    emit(
+      err(
+        s,
+        open,
+        if c == 92 { n } else { stop },
+        unterminated(),
+        b"unterminated string literal",
+        b"add a closing `\"`; a string may not span a line break",
+      ),
       open,
-      stop + 1 + w,
-      bytes_concat(so_far, bytes_slice(src, stop + 1, stop + 1 + w)),
+      if c == 92 { n } else { stop },
+      last,
+    )
+  } else if c == 34 { emit(s, open, stop + 1, last) } else if c == 92 {
+    let e = text_escape(src, s, stop);
+    fstr_piece(src, e.s, open, e.next, bytes_concat(so_far, e.text), head)
+  } else if at(src, stop + 1) == c {
+    fstr_piece(src, s, open, stop + 2, bytes_concat(so_far, bytes_slice(src, stop, stop + 1)), head)
+  } else if c == 123 {
+    let t = if head { TFHead(so_far) } else { TFMid(so_far) };
+    emit(with_holes(s, push(s.holes, 0)), open, stop + 1, t)
+  } else {
+    fstr_piece(
+      src,
+      err(
+        s,
+        stop,
+        stop + 1,
+        unexpected(),
+        b"a lone `}` in an interpolated string",
+        b"write `}}` for a brace in the text",
+      ),
+      open,
+      stop + 1,
+      so_far,
+      head,
     )
   }
 }
+
+// A brace opened or closed inside the innermost hole; outside every hole there is nothing to count.
+fn nest(s: Scan, d: Int) -> Scan =
+  match list_at(s.holes, len(s.holes) - 1) {
+    None -> s,
+    Some(k) -> with_holes(s, push(drop_last(s.holes), k + d)),
+  }
+
+// A `}` with no brace of its own open inside the innermost hole ends that hole.
+fn closes_hole(s: Scan) -> Bool =
+  match list_at(s.holes, len(s.holes) - 1) { Some(k) -> k == 0, None -> false }
+
+fn drop_last(xs: List<Int>) -> List<Int> =
+  fold(range(0, len(xs) - 1), [], |acc: List<Int>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })
 
 fn valid_escapes() -> Bytes = b"valid escapes are \\n \\t \\r \\0 \\\\ \\\" \\' and \\u{...}"
 
@@ -1061,8 +1171,10 @@ fn hex_digit(c: Int) -> Int =
 fn punct(src: Bytes, s: Scan, start: Int, c: Int) -> Scan / {abort.raise} =
   if c == 40 { emit(s, start, start + 1, TPunct(b"lparen")) }
   else if c == 41 { emit(s, start, start + 1, TPunct(b"rparen")) }
-  else if c == 123 { emit(s, start, start + 1, TPunct(b"lbrace")) }
-  else if c == 125 { emit(s, start, start + 1, TPunct(b"rbrace")) }
+  else if c == 123 { emit(nest(s, 1), start, start + 1, TPunct(b"lbrace")) }
+  else if c == 125 && closes_hole(s) {
+    fstr_piece(src, with_holes(s, drop_last(s.holes)), start, start + 1, b"", false)
+  } else if c == 125 { emit(nest(s, -1), start, start + 1, TPunct(b"rbrace")) }
   else if c == 91 { emit(s, start, start + 1, TPunct(b"lbracket")) }
   else if c == 93 { emit(s, start, start + 1, TPunct(b"rbracket")) }
   else if c == 44 { emit(s, start, start + 1, TPunct(b"comma")) }
@@ -1084,9 +1196,11 @@ fn punct(src: Bytes, s: Scan, start: Int, c: Int) -> Scan / {abort.raise} =
   else if c == 38 { pair(s, src, start, 38, b"ampamp", b"amp") }
   else if c == 94 { emit(s, start, start + 1, TPunct(b"caret")) }
   else if c == 126 { emit(s, start, start + 1, TPunct(b"tilde")) }
-  else if c == 35 && at(src, start + 1) == 123 { emit(s, start, start + 2, TPunct(b"hashbrace")) }
-  else if c == 35 && at(src, start + 1) == 91 { emit(s, start, start + 2, TPunct(b"hashbracket")) }
-  else if c == 35 {
+  else if c == 35 && at(src, start + 1) == 123 {
+    emit(nest(s, 1), start, start + 2, TPunct(b"hashbrace"))
+  } else if c == 35 && at(src, start + 1) == 91 {
+    emit(s, start, start + 2, TPunct(b"hashbracket"))
+  } else if c == 35 {
     err(
       seek(s, start + 1),
       start,
@@ -1149,6 +1263,9 @@ fn body(t: Tok) -> Bytes / {abort.raise} =
     TStr(b) -> bytes_concat(b"s:", hex(b)),
     TLines(b) -> bytes_concat(b"l:", hex(b)),
     TBytes(b) -> bytes_concat(b"b:", hex(b)),
+    TFHead(b) -> bytes_concat(b"F:", hex(b)),
+    TFMid(b) -> bytes_concat(b"M:", hex(b)),
+    TFTail(b) -> bytes_concat(b"T:", hex(b)),
     TChar(v) -> bytes_concat(b"c:", num(v)),
     TKw(b) -> bytes_concat(b"k:", b),
     TPunct(b) -> bytes_concat(b"p:", b),
@@ -1337,6 +1454,27 @@ test "a character literal holds exactly one character" {
   assert_eq(dump(b"''"), "0:2:c:0;2:2:e;0:2:!:E0001;");
   assert_eq(dump(b"'ab'"), "0:4:c:97;4:4:e;0:4:!:E0001;");
   assert_eq(dump(b"'a"), "0:2:c:97;2:2:e;0:2:!:E0002;")
+}
+
+test "an interpolated string is its text pieces around the tokens of each hole" {
+  assert_eq(dump(b"f\"a {x} b\""), "0:5:F:6120;5:6:i:x;6:10:T:2062;10:10:e;");
+  assert_eq(dump(b"f\"{a}-{b}\""), "0:3:F:;3:4:i:a;4:7:M:2d;7:8:i:b;8:10:T:;10:10:e;");
+  assert_eq(dump(b"f\"\\n{x}\""), "0:5:F:0a;5:6:i:x;6:8:T:;8:8:e;")
+}
+
+test "an interpolated string with no hole is a string, its doubled braces single" {
+  assert_eq(dump(b"f\"plain {{x}}\""), "0:14:s:706c61696e207b787d;14:14:e;")
+}
+
+test "a brace inside a hole nests, and only the one that balances the hole closes it" {
+  assert_eq(dump(b"f\"{ {1} }\""), "0:3:F:;4:5:p:lbrace;5:6:n:1;6:7:p:rbrace;8:10:T:;10:10:e;");
+  assert_eq(dump(b"f\"{f\"{x}\"}\""), "0:3:F:;3:6:F:;6:7:i:x;7:9:T:;9:11:T:;11:11:e;");
+  assert_eq(dump(b"f\"{#{}}\""), "0:3:F:;3:5:p:hashbrace;5:6:p:rbrace;6:8:T:;8:8:e;")
+}
+
+test "a lone closing brace and a hole never closed are reported" {
+  assert_eq(dump(b"f\"a}b\""), "0:6:s:6162;6:6:e;3:4:!:E0001;");
+  assert_eq(dump(b"f\"{x"), "0:3:F:;3:4:i:x;4:4:e;4:4:!:E0002;")
 }
 
 test "a string's \\u escape writes its character as UTF-8" {

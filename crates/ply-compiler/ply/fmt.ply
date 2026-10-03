@@ -3,11 +3,12 @@
 // printing the output again changes nothing.
 
 import spine (Span, Ident, QName, PDiag, primary_span_of)
-import lexer (Comment, lex)
+import lexer (Comment, Token, TFHead, TFTail, lex)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, ImportDecl,
               IModule, IAlias, INames, FnDef, TypeDef, TDAlias, TDSum, VariantDef, EffectDef, OpDef,
               TestDef, LawDef, Binder, Deriver, deriver_text, Constraint, SpecClause, SpecKind,
-              SRequires, SEnsures, Vis, VPub, VPriv, item_span, parse, dump_module)
+              SRequires, SEnsures, ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, item_span, parse,
+              dump_module, is_written)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
               MWrite, MBad, Generics, ty_span)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
@@ -740,7 +741,60 @@ fn flat_clauses(
   if len(all) == 0 { Some(b"{}") } else { cat([Some(b"{ "), sep(all, b", "), Some(b" }")]) }
 }
 
+// The parser expands an interpolated string into a concatenation spanning it, which the source
+// still opens with `f"`: its text is kept as written and each hole printed flat.
+fn interpolated(p: Pr, e: Expr) -> Option<Bytes> / {abort.raise} =
+  match e {
+    ELit(_) -> None,
+    _ -> if !one_interpolation(p, expr_span(e)) { None }
+    else { cat([Some(b"f\""), cat(map(pieces(e, []), |x: Expr| piece(p, x))), Some(b"\"")]) },
+  }
+
+// A concatenation the program wrote may open with an interpolated string too, so the span must be
+// exactly one: the `"` closing its first `f"` is the span's last token.
+fn one_interpolation(p: Pr, sp: Span) -> Bool / {abort.raise} =
+  if bytes_slice(p.src, sp.start, sp.start + 2) != b"f\"" { false } else {
+    let toks = lex(bytes_slice(p.src, sp.start, sp.end)).toks;
+    let walked = fold(
+      toks,
+      { open: 0, closed: -1, i: 0 },
+      |acc: { open: Int, closed: Int, i: Int }, t: Token| {
+        let open = match t.tok {
+          TFHead(_) -> acc.open + 1,
+          TFTail(_) -> acc.open - 1,
+          _ -> acc.open,
+        };
+        {
+          open: open,
+          closed: if acc.closed < 0 && acc.open > 0 && open == 0 { acc.i } else { acc.closed },
+          i: acc.i + 1,
+        }
+      },
+    );
+    walked.closed == len(toks) - 2
+  }
+
+fn pieces(e: Expr, acc: List<Expr>) -> List<Expr> =
+  match e {
+    EBinary(v) -> if v.op == b"concat" { pieces(v.rhs, pieces(v.lhs, acc)) } else { push(acc, e) },
+    _ -> push(acc, e),
+  }
+
+// A text piece's token runs from the `f"` or `}` before it to the `{` or `"` after it.
+fn piece(p: Pr, e: Expr) -> Option<Bytes> / {abort.raise} =
+  match e {
+    ELit(v) -> {
+      let lead = if bytes_slice(p.src, v.span.start, v.span.start + 2) == b"f\"" { 2 } else { 1 };
+      Some(bytes_slice(p.src, v.span.start + lead, v.span.end - 1))
+    },
+    EApp(v) -> match v.args { [x] -> cat([Some(b"{"), flat_expr(p, x), Some(b"}")]), _ -> None },
+    _ -> None,
+  }
+
 fn flat_expr(p: Pr, e: Expr) -> Option<Bytes> / {abort.raise} =
+  match interpolated(p, e) { Some(text) -> Some(text), None -> flat_node(p, e) }
+
+fn flat_node(p: Pr, e: Expr) -> Option<Bytes> / {abort.raise} =
   match e {
     ELit(v) -> if is_lines(p, e) { None } else { Some(lit_text(p, v.span, v.lit)) },
     EVar(v) -> Some(qname_text(v.name)),
@@ -905,6 +959,12 @@ fn chain_operand(
   else { laid(p, st, e, cont, cont, after) }
 
 fn broken(p: Pr, st: St, e: Expr, indent: Int, cont: Int, after: Int) -> St / {abort.raise} =
+  match interpolated(p, e) {
+    Some(text) -> emit(st, text),
+    None -> broken_node(p, st, e, indent, cont, after),
+  }
+
+fn broken_node(p: Pr, st: St, e: Expr, indent: Int, cont: Int, after: Int) -> St / {abort.raise} =
   match e {
     ELit(v) -> match v.lit {
       LStr(value) -> if is_lines(p, e) { line_string(st, value, indent, cont) }
@@ -1388,7 +1448,7 @@ fn cell_expr(
 
 fn module(p: Pr, m: Module) -> Bytes / {abort.raise} = {
   let st0 = { ci: 0, col: 0, prev_end: 0, pending: [], closed: -1, parts: [] };
-  let s1 = fold(m.imports, st0, |s: St, d: ImportDecl| import_decl(p, s, d));
+  let s1 = fold(filter(m.imports, is_written), st0, |s: St, d: ImportDecl| import_decl(p, s, d));
   let s2 = fold(m.items, s1, |s: St, it: Item| item(p, s, it));
   finish(flush_comments(p, s2, bytes_len(p.src) + 1, 0, true))
 }
@@ -1482,8 +1542,10 @@ fn param(p: Pr, st: St, x: Param, indent: Int) -> St / {abort.raise} = {
 
 fn fn_def(p: Pr, st: St, d: FnDef) -> St / {abort.raise} = {
   let reuse_kw = match d.reuse { Some(_) -> b"reuse ", None -> b"" };
+  let transparent_kw = match d.transparent { Some(_) -> b"transparent ", None -> b"" };
   let head = bytes_concat_all([
     vis_text(d.vis),
+    transparent_kw,
     reuse_kw,
     b"fn ",
     d.name.name,
@@ -1491,7 +1553,7 @@ fn fn_def(p: Pr, st: St, d: FnDef) -> St / {abort.raise} = {
   ]);
   let ret = match d.ret { Some(t) -> bytes_concat(b" -> ", type_text(p, t)), None -> b"" };
   let tail = bytes_concat(ret, row_suffix(p, d.effects));
-  let clauses = len(d.constraints) > 0 || len(d.spec) > 0;
+  let clauses = len(d.constraints) > 0 || len(d.spec) > 0 || d.returns != None;
   let params_end = match list_at(d.params, len(d.params) - 1) {
     Some(x) -> x.span.end,
     None -> d.name.span.end,
@@ -1518,7 +1580,12 @@ fn fn_def(p: Pr, st: St, d: FnDef) -> St / {abort.raise} = {
       bytes_concat(b"where ", join(map(d.constraints, constraint_text), b", ")),
     )
   };
-  let s4 = fold(d.spec, s3, |s: St, c: SpecClause| {
+  let s35 = match d.returns {
+    None -> s3,
+    Some(ReturnsFresh(_)) -> emit(nl(s3, 2, false), b"returns fresh"),
+    Some(ReturnsParam(x)) -> emit(nl(s3, 2, false), bytes_concat(b"returns ", x.name)),
+  };
+  let s4 = fold(d.spec, s35, |s: St, c: SpecClause| {
     let o = emit(
       open_line(p, s, c.span.start, 2, false),
       bytes_concat(spec_kind_text(c.kind), b" "),
@@ -1753,10 +1820,14 @@ fn line_start(src: Bytes, i: Int) -> Int / {abort.raise} =
 fn line_end(src: Bytes, i: Int) -> Int / {abort.raise} =
   match bytes_index_of_from(src, b"\n", i) { Some(j) -> j + 1, None -> bytes_len(src) }
 
-// Where the item's own text starts: at its `pub` or `reuse` when it has one, else its keyword.
+// Where the item's own text starts: at its `pub`, `transparent` or `reuse` when it has one, else its
+// keyword.
 fn head_start(src: Bytes, it: Item) -> Int / {abort.raise} = {
   let kw = match it {
-    IFn(d) -> match d.reuse { Some(s) -> s.start, None -> d.span.start },
+    IFn(d) -> match d.transparent {
+      Some(t) -> t.start,
+      None -> match d.reuse { Some(s) -> s.start, None -> d.span.start },
+    },
     _ -> item_span(it).start,
   };
   let published = match it {
@@ -1773,7 +1844,7 @@ fn head_start(src: Bytes, it: Item) -> Int / {abort.raise} = {
 
 // The end of the last item or import that ends at or before `pos`.
 fn floor_before(m: Module, pos: Int) -> Int = {
-  let imported = fold(m.imports, 0, |acc: Int, d: ImportDecl|
+  let imported = fold(filter(m.imports, is_written), 0, |acc: Int, d: ImportDecl|
     if d.span.end <= pos && d.span.end > acc { d.span.end } else { acc });
   fold(m.items, imported, |acc: Int, it: Item| {
     let e = item_span(it).end;
@@ -1783,7 +1854,7 @@ fn floor_before(m: Module, pos: Int) -> Int = {
 
 // The start of the first item or import that starts at or after `pos`, else the end of the text.
 fn ceiling_after(src: Bytes, m: Module, pos: Int) -> Int / {abort.raise} = {
-  let imported = fold(m.imports, bytes_len(src), |acc: Int, d: ImportDecl|
+  let imported = fold(filter(m.imports, is_written), bytes_len(src), |acc: Int, d: ImportDecl|
     if d.span.start >= pos && d.span.start < acc { d.span.start } else { acc });
   fold(m.items, imported, |acc: Int, it: Item| {
     let s = head_start(src, it);
@@ -1846,8 +1917,9 @@ pub fn replace_item(src: Bytes, name: Bytes, item: Bytes) -> Result<Bytes, Bytes
     Some(d) -> Err(bytes_concat(b"the replacement does not parse: ", render_diag(item, d))),
     None -> {
       let m = r.node;
-      if len(m.imports) > 0 { Err(b"the replacement holds an import; it must be one item") }
-      else if len(m.items) != 1 {
+      if len(filter(m.imports, is_written)) > 0 {
+        Err(b"the replacement holds an import; it must be one item")
+      } else if len(m.items) != 1 {
         Err(
           bytes_concat_all([
             b"the replacement holds ",
@@ -2291,6 +2363,10 @@ test "every item kind prints back to the same tree" {
     b"effect set Persist = {db.read[users], Other, db.write[users]}\n",
     b"pub reuse fn f<a | e>(x: a, g: (a) -> a / e, n: Int = 1) -> a / {db.read[users] | e} where derivable(json, a) requires n > 0 ensures true = g(x)\n",
     b"fn h(t: (Int, Bool)) -> (Bool, Int) = match t { (n, b) -> (b, n) }\n",
+    b"pub transparent fn k(x: Int) -> Int = x\n",
+    b"transparent reuse fn q(xs: List<Int>) -> List<Int> = xs\n",
+    b"fn r(xs: List<Int>, n: Int) -> List<Int>\n  returns xs\n  requires n > 0\n= xs\n",
+    b"fn s() -> List<Int>\n  returns fresh\n= []\n",
     b"derive json for P\n",
     b"test/nondet \"t\" { assert(true) }\n",
     b"law/host \"l\" forall (n: Int) where n > 0 { n == n }\n",
@@ -2365,6 +2441,15 @@ test "literal spelling survives, and a grouped literal loses only its parenthese
   assert_eq(
     formatted(src),
     b"fn f() -> Int = 0xFF_FF + 1_000 + 7\nfn g() -> Float = 1.50e-3\nfn h() -> Bytes = b\"a\\x0d\"\n",
+  );
+  assert(stable(src))
+}
+
+test "an interpolated string keeps its text as written and prints each hole flat" {
+  let src = b"fn h(x: Int) -> String =   f\"x = {x   +   1} {{y}} \\n {f\"in {x}\"}\"\nfn k(a: Int, b: Int) -> String = f\"{a}\" ++ f\"{b}\"\n";
+  assert_eq(
+    formatted(src),
+    b"fn h(x: Int) -> String = f\"x = {x + 1} {{y}} \\n {f\"in {x}\"}\"\nfn k(a: Int, b: Int) -> String = f\"{a}\" ++ f\"{b}\"\n",
   );
   assert(stable(src))
 }
