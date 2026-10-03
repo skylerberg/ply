@@ -96,7 +96,7 @@ fn call_of(own: List<Bytes>, expr: Expr) -> Option<Call> =
 pub fn wants_of(module: Module) -> List<EmbedWant> = {
   let own = own_names(module);
   let found = walk_module(module, { own: own, read: map_new(), diags: [], wants: [] }, false);
-  found.st.wants
+  found.state.wants
 }
 
 // The module with every embed written out as what was read for it; a path that is not a literal,
@@ -111,7 +111,7 @@ pub fn embedded(
     { own: own_names(module), read: read, diags: diags, wants: [] },
     true,
   );
-  { module: walked.m, diags: walked.st.diags }
+  { module: walked.module, diags: walked.state.diags }
 }
 
 type EmbedState = {
@@ -126,10 +126,10 @@ fn noted(state: EmbedState, w: EmbedWant) -> EmbedState =
       acc || (x.path == w.path && x.dir == w.dir)) { state }
   else { { ..state, wants: push(state.wants, w) } }
 
-fn written(state: EmbedState, call: Call) -> { st: EmbedState, e: Expr } =
+fn written(state: EmbedState, call: Call) -> { state: EmbedState, expr: Expr } =
   if !call.literal {
     {
-      st: {
+      state: {
         ..state,
         diags: push(
           state.diags,
@@ -142,12 +142,12 @@ fn written(state: EmbedState, call: Call) -> { st: EmbedState, e: Expr } =
           ),
         ),
       },
-      e: EBad({ span: call.span }),
+      expr: EBad({ span: call.span }),
     }
   } else {
     let unread = |why: Bytes|
       {
-        st: {
+        state: {
           ..state,
           diags: push(
             state.diags,
@@ -160,20 +160,20 @@ fn written(state: EmbedState, call: Call) -> { st: EmbedState, e: Expr } =
             ),
           ),
         },
-        e: EBad({ span: call.span }),
+        expr: EBad({ span: call.span }),
       };
     match map_get(state.read, embed_key(call.want)) {
       None -> unread(b"nothing was read for it"),
       Some(Err(why)) -> unread(why),
       Some(Ok(files)) -> if !call.want.dir {
         match files {
-          [file, ..] -> { st: state, e: ELit({ span: call.span, lit: LBytes(file.bytes) }) },
+          [file, ..] -> { state: state, expr: ELit({ span: call.span, lit: LBytes(file.bytes) }) },
           [] -> unread(b"nothing was read for it"),
         }
       } else {
         {
-          st: state,
-          e: EList({
+          state: state,
+          expr: EList({
             span: call.span,
             items: map(files, |file: EmbedFile|
               ERecord({
@@ -199,86 +199,94 @@ fn written(state: EmbedState, call: Call) -> { st: EmbedState, e: Expr } =
 // Every expression a module holds, children first; `writing` rewrites the embeds it meets, and
 // otherwise it only notes what they ask for.
 
-type Out = { st: EmbedState, e: Expr }
+type Out = { state: EmbedState, expr: Expr }
 
-fn walk_module(module: Module, state: EmbedState, writing: Bool) -> { st: EmbedState, m: Module } = {
+fn walk_module(
+  module: Module,
+  state: EmbedState,
+  writing: Bool,
+) -> { state: EmbedState, module: Module } = {
   let w = fold(
     module.items,
-    { st: state, items: [] },
-    |acc: { st: EmbedState, items: List<Item> }, item: Item| {
-      let o = walk_item(acc.st, item, writing);
-      { st: o.st, items: push(acc.items, o.it) }
+    { state: state, items: [] },
+    |acc: { state: EmbedState, items: List<Item> }, item: Item| {
+      let o = walk_item(acc.state, item, writing);
+      { state: o.state, items: push(acc.items, o.item) }
     },
   );
-  { st: w.st, m: { imports: module.imports, items: w.items } }
+  { state: w.state, module: { imports: module.imports, items: w.items } }
 }
 
-fn walk_item(state: EmbedState, item: Item, writing: Bool) -> { st: EmbedState, it: Item } =
+fn walk_item(state: EmbedState, item: Item, writing: Bool) -> { state: EmbedState, item: Item } =
   match item {
     IFn(d) -> {
       let b = walk(state, d.body, writing);
       let s = fold(
         d.spec,
-        { st: b.st, xs: [] },
-        |acc: { st: EmbedState, xs: List<SpecClause> }, clause: SpecClause| {
-          let o = walk(acc.st, clause.expr, writing);
-          { st: o.st, xs: push(acc.xs, { ..clause, expr: o.e }) }
+        { state: b.state, xs: [] },
+        |acc: { state: EmbedState, xs: List<SpecClause> }, clause: SpecClause| {
+          let o = walk(acc.state, clause.expr, writing);
+          { state: o.state, xs: push(acc.xs, { ..clause, expr: o.expr }) }
         },
       );
-      let p = walk_params(s.st, d.params, writing);
-      { st: p.st, it: IFn({ ..d, body: b.e, spec: s.xs, params: p.xs }) }
+      let p = walk_params(s.state, d.params, writing);
+      { state: p.state, item: IFn({ ..d, body: b.expr, spec: s.xs, params: p.xs }) }
     },
     ITest(d) -> {
       let b = walk(state, d.body, writing);
-      { st: b.st, it: ITest({ ..d, body: b.e }) }
+      { state: b.state, item: ITest({ ..d, body: b.expr }) }
     },
     ILaw(d) -> {
       let b = walk(state, d.body, writing);
       match d.guard {
-        None -> { st: b.st, it: ILaw({ ..d, body: b.e }) },
+        None -> { state: b.state, item: ILaw({ ..d, body: b.expr }) },
         Some(g) -> {
-          let o = walk(b.st, g, writing);
-          { st: o.st, it: ILaw({ ..d, body: b.e, guard: Some(o.e) }) }
+          let o = walk(b.state, g, writing);
+          { state: o.state, item: ILaw({ ..d, body: b.expr, guard: Some(o.expr) }) }
         },
       }
     },
-    other -> { st: state, it: other },
+    other -> { state: state, item: other },
   }
 
 fn walk_params(
   state: EmbedState,
   params: List<Param>,
   writing: Bool,
-) -> { st: EmbedState, xs: List<Param> } =
-  fold(params, { st: state, xs: [] }, |acc: { st: EmbedState, xs: List<Param> }, param: Param|
-    match param.default {
-      None -> { st: acc.st, xs: push(acc.xs, param) },
-      Some(v) -> {
-        let o = walk(acc.st, v, writing);
-        { st: o.st, xs: push(acc.xs, { ..param, default: Some(o.e) }) }
+) -> { state: EmbedState, xs: List<Param> } =
+  fold(
+    params,
+    { state: state, xs: [] },
+    |acc: { state: EmbedState, xs: List<Param> }, param: Param|
+      match param.default {
+        None -> { state: acc.state, xs: push(acc.xs, param) },
+        Some(v) -> {
+          let o = walk(acc.state, v, writing);
+          { state: o.state, xs: push(acc.xs, { ..param, default: Some(o.expr) }) }
+        },
       },
-    })
+  )
 
 fn walk_all(
   state: EmbedState,
   exprs: List<Expr>,
   writing: Bool,
-) -> { st: EmbedState, xs: List<Expr> } =
-  fold(exprs, { st: state, xs: [] }, |acc: { st: EmbedState, xs: List<Expr> }, expr: Expr| {
-    let o = walk(acc.st, expr, writing);
-    { st: o.st, xs: push(acc.xs, o.e) }
+) -> { state: EmbedState, xs: List<Expr> } =
+  fold(exprs, { state: state, xs: [] }, |acc: { state: EmbedState, xs: List<Expr> }, expr: Expr| {
+    let o = walk(acc.state, expr, writing);
+    { state: o.state, xs: push(acc.xs, o.expr) }
   })
 
 fn walk_opt(
   state: EmbedState,
   expr: Option<Expr>,
   writing: Bool,
-) -> { st: EmbedState, x: Option<Expr> } =
+) -> { state: EmbedState, x: Option<Expr> } =
   match expr {
-    None -> { st: state, x: None },
+    None -> { state: state, x: None },
     Some(v) -> {
       let o = walk(state, v, writing);
-      { st: o.st, x: Some(o.e) }
+      { state: o.state, x: Some(o.expr) }
     },
   }
 
@@ -286,20 +294,20 @@ fn walk_fields(
   state: EmbedState,
   fields: List<RecField>,
   writing: Bool,
-) -> { st: EmbedState, xs: List<RecField> } =
+) -> { state: EmbedState, xs: List<RecField> } =
   fold(
     fields,
-    { st: state, xs: [] },
-    |acc: { st: EmbedState, xs: List<RecField> }, field: RecField| {
-      let o = walk(acc.st, field.value, writing);
-      { st: o.st, xs: push(acc.xs, { ..field, value: o.e }) }
+    { state: state, xs: [] },
+    |acc: { state: EmbedState, xs: List<RecField> }, field: RecField| {
+      let o = walk(acc.state, field.value, writing);
+      { state: o.state, xs: push(acc.xs, { ..field, value: o.expr }) }
     },
   )
 
 fn walk(state: EmbedState, expr: Expr, writing: Bool) -> Out =
   match call_of(state.own, expr) {
     Some(c) -> if writing { written(state, c) }
-    else { { st: if c.literal { noted(state, c.want) } else { state }, e: expr } },
+    else { { state: if c.literal { noted(state, c.want) } else { state }, expr: expr } },
     None -> walk_children(state, expr, writing),
   }
 
@@ -307,132 +315,135 @@ fn walk_children(state: EmbedState, expr: Expr, writing: Bool) -> Out =
   match expr {
     EBinary(b) -> {
       let l = walk(state, b.lhs, writing);
-      let r = walk(l.st, b.rhs, writing);
-      { st: r.st, e: EBinary({ ..b, lhs: l.e, rhs: r.e }) }
+      let r = walk(l.state, b.rhs, writing);
+      { state: r.state, expr: EBinary({ ..b, lhs: l.expr, rhs: r.expr }) }
     },
     EUnary(u) -> {
       let o = walk(state, u.operand, writing);
-      { st: o.st, e: EUnary({ ..u, operand: o.e }) }
+      { state: o.state, expr: EUnary({ ..u, operand: o.expr }) }
     },
     ELambda(l) -> {
       let b = walk(state, l.body, writing);
-      let p = walk_params(b.st, l.params, writing);
-      { st: p.st, e: ELambda({ ..l, body: b.e, params: p.xs }) }
+      let p = walk_params(b.state, l.params, writing);
+      { state: p.state, expr: ELambda({ ..l, body: b.expr, params: p.xs }) }
     },
     EApp(a) -> {
       let f = walk(state, a.func, writing);
-      let xs = walk_all(f.st, a.args, writing);
+      let xs = walk_all(f.state, a.args, writing);
       let n = fold(
         a.named,
-        { st: xs.st, xs: [] },
-        |acc: { st: EmbedState, xs: List<NamedArg> }, x: NamedArg| {
-          let o = walk(acc.st, x.value, writing);
-          { st: o.st, xs: push(acc.xs, { ..x, value: o.e }) }
+        { state: xs.state, xs: [] },
+        |acc: { state: EmbedState, xs: List<NamedArg> }, x: NamedArg| {
+          let o = walk(acc.state, x.value, writing);
+          { state: o.state, xs: push(acc.xs, { ..x, value: o.expr }) }
         },
       );
-      { st: n.st, e: EApp({ ..a, func: f.e, args: xs.xs, named: n.xs }) }
+      { state: n.state, expr: EApp({ ..a, func: f.expr, args: xs.xs, named: n.xs }) }
     },
     EIf(i) -> {
       let c = walk(state, i.cond, writing);
-      let t = walk(c.st, i.then_branch, writing);
-      let x = walk(t.st, i.else_branch, writing);
-      { st: x.st, e: EIf({ ..i, cond: c.e, then_branch: t.e, else_branch: x.e }) }
+      let t = walk(c.state, i.then_branch, writing);
+      let x = walk(t.state, i.else_branch, writing);
+      { state: x.state, expr: EIf({ ..i, cond: c.expr, then_branch: t.expr, else_branch: x.expr }) }
     },
     EMatch(m) -> {
       let s = walk(state, m.scrutinee, writing);
       let arms = fold(
         m.arms,
-        { st: s.st, xs: [] },
-        |acc: { st: EmbedState, xs: List<MatchArm> }, arm: MatchArm| {
-          let g = walk_opt(acc.st, arm.guard, writing);
-          let b = walk(g.st, arm.body, writing);
-          { st: b.st, xs: push(acc.xs, { ..arm, guard: g.x, body: b.e }) }
+        { state: s.state, xs: [] },
+        |acc: { state: EmbedState, xs: List<MatchArm> }, arm: MatchArm| {
+          let g = walk_opt(acc.state, arm.guard, writing);
+          let b = walk(g.state, arm.body, writing);
+          { state: b.state, xs: push(acc.xs, { ..arm, guard: g.x, body: b.expr }) }
         },
       );
-      { st: arms.st, e: EMatch({ ..m, scrutinee: s.e, arms: arms.xs }) }
+      { state: arms.state, expr: EMatch({ ..m, scrutinee: s.expr, arms: arms.xs }) }
     },
     EBlock(b) -> {
       let stmts = fold(
         b.stmts,
-        { st: state, xs: [] },
-        |acc: { st: EmbedState, xs: List<Stmt> }, s: Stmt|
+        { state: state, xs: [] },
+        |acc: { state: EmbedState, xs: List<Stmt> }, s: Stmt|
           match s {
             SLet(l) -> {
-              let o = walk(acc.st, l.value, writing);
-              { st: o.st, xs: push(acc.xs, SLet({ ..l, value: o.e })) }
+              let o = walk(acc.state, l.value, writing);
+              { state: o.state, xs: push(acc.xs, SLet({ ..l, value: o.expr })) }
             },
             SLetElse(l) -> {
-              let v = walk(acc.st, l.value, writing);
-              let f = walk(v.st, l.fallback, writing);
-              { st: f.st, xs: push(acc.xs, SLetElse({ ..l, value: v.e, fallback: f.e })) }
+              let v = walk(acc.state, l.value, writing);
+              let f = walk(v.state, l.fallback, writing);
+              {
+                state: f.state,
+                xs: push(acc.xs, SLetElse({ ..l, value: v.expr, fallback: f.expr })),
+              }
             },
             SExpr(x) -> {
-              let o = walk(acc.st, x, writing);
-              { st: o.st, xs: push(acc.xs, SExpr(o.e)) }
+              let o = walk(acc.state, x, writing);
+              { state: o.state, xs: push(acc.xs, SExpr(o.expr)) }
             },
           },
       );
-      let t = walk_opt(stmts.st, b.tail, writing);
-      { st: t.st, e: EBlock({ ..b, stmts: stmts.xs, tail: t.x }) }
+      let t = walk_opt(stmts.state, b.tail, writing);
+      { state: t.state, expr: EBlock({ ..b, stmts: stmts.xs, tail: t.x }) }
     },
     ERecord(r) -> {
       let f = walk_fields(state, r.fields, writing);
-      { st: f.st, e: ERecord({ ..r, fields: f.xs }) }
+      { state: f.state, expr: ERecord({ ..r, fields: f.xs }) }
     },
     ERecordUpdate(r) -> {
       let b = walk(state, r.base, writing);
-      let f = walk_fields(b.st, r.fields, writing);
-      { st: f.st, e: ERecordUpdate({ ..r, base: b.e, fields: f.xs }) }
+      let f = walk_fields(b.state, r.fields, writing);
+      { state: f.state, expr: ERecordUpdate({ ..r, base: b.expr, fields: f.xs }) }
     },
     ETry(t) -> {
       let o = walk(state, t.operand, writing);
-      { st: o.st, e: ETry({ ..t, operand: o.e }) }
+      { state: o.state, expr: ETry({ ..t, operand: o.expr }) }
     },
     EField(f) -> {
       let o = walk(state, f.base, writing);
-      { st: o.st, e: EField({ ..f, base: o.e }) }
+      { state: o.state, expr: EField({ ..f, base: o.expr }) }
     },
     EList(l) -> {
       let xs = walk_all(state, l.items, writing);
-      { st: xs.st, e: EList({ ..l, items: xs.xs }) }
+      { state: xs.state, expr: EList({ ..l, items: xs.xs }) }
     },
     EPerform(p) -> {
       let xs = walk_all(state, p.args, writing);
-      { st: xs.st, e: EPerform({ ..p, args: xs.xs }) }
+      { state: xs.state, expr: EPerform({ ..p, args: xs.xs }) }
     },
     EHandle(h) -> {
       let b = walk(state, h.body, writing);
       let cs = fold(
         h.clauses,
-        { st: b.st, xs: [] },
-        |acc: { st: EmbedState, xs: List<HandleClause> }, c: HandleClause| {
-          let o = walk(acc.st, c.body, writing);
-          { st: o.st, xs: push(acc.xs, { ..c, body: o.e }) }
+        { state: b.state, xs: [] },
+        |acc: { state: EmbedState, xs: List<HandleClause> }, c: HandleClause| {
+          let o = walk(acc.state, c.body, writing);
+          { state: o.state, xs: push(acc.xs, { ..c, body: o.expr }) }
         },
       );
       match h.ret {
-        None -> { st: cs.st, e: EHandle({ ..h, body: b.e, clauses: cs.xs }) },
+        None -> { state: cs.state, expr: EHandle({ ..h, body: b.expr, clauses: cs.xs }) },
         Some(rc) -> {
-          let o = walk(cs.st, rc.body, writing);
+          let o = walk(cs.state, rc.body, writing);
           {
-            st: o.st,
-            e: EHandle({ ..h, body: b.e, clauses: cs.xs, ret: Some({ ..rc, body: o.e }) }),
+            state: o.state,
+            expr: EHandle({ ..h, body: b.expr, clauses: cs.xs, ret: Some({ ..rc, body: o.expr }) }),
           }
         },
       }
     },
     EWithCell(c) -> {
       let i = walk(state, c.init, writing);
-      let b = walk(i.st, c.body, writing);
-      { st: b.st, e: EWithCell({ ..c, init: i.e, body: b.e }) }
+      let b = walk(i.state, c.body, writing);
+      { state: b.state, expr: EWithCell({ ..c, init: i.expr, body: b.expr }) }
     },
     ESimulate(s) -> {
       let o = walk(state, s.body, writing);
-      { st: o.st, e: ESimulate({ ..s, body: o.e }) }
+      { state: o.state, expr: ESimulate({ ..s, body: o.expr }) }
     },
     EParallel(p) -> {
       let xs = walk_all(state, p.branches, writing);
-      { st: xs.st, e: EParallel({ ..p, branches: xs.xs }) }
+      { state: xs.state, expr: EParallel({ ..p, branches: xs.xs }) }
     },
-    other -> { st: state, e: other },
+    other -> { state: state, expr: other },
   }
