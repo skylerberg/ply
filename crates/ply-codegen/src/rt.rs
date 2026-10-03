@@ -1255,7 +1255,18 @@ pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i6
         Span::DUMMY,
     ) {
         Ok(v) => ctx.word(&v),
+        Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&vals[1]) => raise_error(ctx, d),
         Err(d) => ctx.fail(d),
+    }
+}
+
+/// A divisor `/` and `%` raise on rather than overflow.
+fn is_zero(v: &Value) -> bool {
+    match v {
+        Value::Int(n) => *n == 0,
+        Value::Fixed(f) => f.raw() == 0,
+        Value::Decimal(d) => d.is_zero(),
+        _ => false,
     }
 }
 
@@ -1466,12 +1477,11 @@ pub unsafe extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64
         Some(n) => n,
         None => {
             // The machine's own words, so a failure reads the same on either engine.
-            let d = if op != 0 && b == 0 {
-                error(format!("{what} by zero"))
+            if op != 0 && b == 0 {
+                raise_error(ctx, error(format!("{what} by zero")))
             } else {
-                error(format!("integer overflow in {what}"))
-            };
-            ctx.fail(d)
+                ctx.fail(error(format!("integer overflow in {what}")))
+            }
         }
     }
 }
@@ -1493,7 +1503,7 @@ pub unsafe extern "C" fn rt_no_match(ctx: *mut Ctx) {
 pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("`let` pattern did not match the bound value");
-    ctx.fail(d);
+    raise_error(ctx, d);
 }
 
 /// `what` is `emit.ply`'s `overflow_code`.
@@ -1520,7 +1530,7 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
         t.min(),
         t.max()
     ));
-    ctx.fail(d);
+    raise_error(ctx, d);
 }
 
 /// `==` beyond two `Int`s or `Bool`s, deferring to the evaluator's comparison. Reads both.
@@ -1586,10 +1596,35 @@ fn builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
 fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
     let site = ctx.site();
+    let panicked = match (b, values.first()) {
+        (Builtin::Panic, Some(Value::Str(s))) => Some(s.to_string()),
+        _ => None,
+    };
     match ply_eval::builtins::call(b, values, site) {
         Ok(v) => ctx.word(&v),
+        Err(d) if b.raises() => {
+            let message = panicked.unwrap_or_else(|| raised_message(&d));
+            ctx.raise(d, message)
+        }
         Err(d) => ctx.fail(d),
     }
+}
+
+/// A runtime error's message as a clause for `abort.raise` is given it, each value the text names
+/// told by its kind: nothing in Rust renders one.
+fn raised_message(d: &Diagnostic) -> String {
+    d.values
+        .iter()
+        .enumerate()
+        .fold(d.message.clone(), |text, (i, v)| {
+            text.replace(&ply_eval::slot(i), v.describe())
+        })
+}
+
+/// [`Ctx::raise`] for a runtime error that is the program's to answer.
+fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
+    let message = raised_message(&d);
+    ctx.raise(d, message)
 }
 
 /// `bytes_concat_all` over a list literal's pieces, without building the list. Takes the pieces.
@@ -2332,7 +2367,7 @@ fn first_accepted(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Option<Option<
         Some(n) => {
             let site = ctx.site();
             let d = ply_eval::builtins::start_outside(n, bytes.len(), site, "bytes_position");
-            ctx.fail(d);
+            raise_error(ctx, d);
             return None;
         }
         None => {
@@ -3084,7 +3119,7 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
             let d = error(format!(
                 "`iterate` needs a budget of at least 1, and this is {n}"
             ));
-            return c.fail(d);
+            return raise_error(c, d);
         }
         None => {
             let d = error(format!(
@@ -3104,7 +3139,7 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
             let d = error(format!(
                 "`iterate` did not stop within its budget of {budget}"
             ));
-            return c.fail(d);
+            return raise_error(c, d);
         }
         left -= 1;
         let r = call_value(ctx, f, &[state]);
@@ -3144,21 +3179,26 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
 /// answer `n`, which it takes.
 pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
     let ctx = unsafe { &mut *ctx };
-    let d = match what {
-        0 => error(format!(
-            "`iterate` needs a budget of at least 1, and this is {n}"
-        )),
-        1 => error(format!("`iterate` did not stop within its budget of {n}")),
+    match what {
+        0 => raise_error(
+            ctx,
+            error(format!(
+                "`iterate` needs a budget of at least 1, and this is {n}"
+            )),
+        ),
+        1 => raise_error(
+            ctx,
+            error(format!("`iterate` did not stop within its budget of {n}")),
+        ),
         _ => {
             let d = error(format!(
                 "the step given to `iterate` answered {}, not `Continue` or `Stop`",
                 ctx.type_name(n)
             ));
             heap::dec(n);
-            d
+            ctx.fail(d)
         }
     };
-    ctx.fail(d);
 }
 
 /// A shift count outside the word; `which` indexes [`ply_eval::INT_TYPES`], or is `-1` for `Int`.

@@ -84,14 +84,14 @@ pub type RowError = { column: String, expected: String, found: String }
 
 pub type RowCodec<a> = {
   columns: List<String>,
-  decode: (db::Row) -> Result<a, RowError>,
-  params: (a) -> List<db::Param>,
+  decode: (db::Row) -> Result<a, RowError> / {abort.raise},
+  params: (a) -> List<db::Param> / {abort.raise},
 }
 
-fn row_and_then<a, b>(
+fn row_and_then<a, b | e>(
   r: Result<a, RowError>,
-  f: (a) -> Result<b, RowError>,
-) -> Result<b, RowError> = match r { Ok(x) -> f(x), Err(e) -> Err(e) }
+  f: (a) -> Result<b, RowError> / e,
+) -> Result<b, RowError> / e = match r { Ok(x) -> f(x), Err(e) -> Err(e) }
 
 fn wrong(k: String, want: String) -> RowError = { column: k, expected: want, found: "another type" }
 
@@ -371,13 +371,15 @@ fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> No
 // A SQLSTATE the desk has no answer for.
 fn unavailable(e: db::DbError) -> http::Response = problem(503, "the store is unavailable", e.code)
 
-fn shelf() -> Result<List<Item>, http::Response> / {db.query[items]} =
+fn shelf() -> Result<List<Item>, http::Response> / {db.query[items], abort.raise} =
   rows_of(db.query[items](items_all(), []), item_row())
 
-fn book() -> Result<List<Order>, http::Response> / {db.query[orders]} =
+fn book() -> Result<List<Order>, http::Response> / {db.query[orders], abort.raise} =
   rows_of(db.query[orders](orders_all(), []), order_row())
 
-fn order_row_of(id: Int) -> Result<Option<Order>, http::Response> / {db.query[orders]} = {
+fn order_row_of(
+  id: Int,
+) -> Result<Option<Order>, http::Response> / {db.query[orders], abort.raise} = {
   let os = rows_of(db.query[orders](order_by_id(), [db::PInt(id)]), order_row())?;
   Ok(head_of(os))
 }
@@ -515,7 +517,7 @@ pub fn health() -> http::Response =
   json_body(200, { service: "parts desk", routes: len(table()) }, health_json())
 
 // 503 while draining, 503 while the store is unreachable, 200 otherwise.
-pub fn ready() -> http::Response / {db.query[items], signal.stopping} =
+pub fn ready() -> http::Response / {db.query[items], signal.stopping, abort.raise} =
   if signal.stopping() { unready("draining", true) } else {
     match db.query[items](store_reachable(), []) {
       db::Rows(_) ->
@@ -551,17 +553,17 @@ pub fn docs(params: Map<String, String>) -> http::Response =
     },
   }
 
-pub fn list_items() -> http::Response / {db.query[items]} =
+pub fn list_items() -> http::Response / {db.query[items], abort.raise} =
   match shelf() { Err(r) -> r, Ok(rows) -> json_body(200, rows, json::list_json(item_json())) }
 
 // Everything the shelf is short of.
-pub fn featured() -> http::Response / {db.query[items]} =
+pub fn featured() -> http::Response / {db.query[items], abort.raise} =
   match rows_of(db.query[items](items_in_stock(), [db::PInt(0)]), item_row()) {
     Err(r) -> r,
     Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
   }
 
-pub fn get_item(params: Map<String, String>) -> http::Response / {db.query[items]} =
+pub fn get_item(params: Map<String, String>) -> http::Response / {db.query[items], abort.raise} =
   match map_get(params, "sku") {
     None -> problem(400, "bad request", "no sku was captured"),
     Some(sku) -> match rows_of(db.query[items](item_by_sku(), [db::PText(sku)]), item_row()) {
@@ -573,10 +575,10 @@ pub fn get_item(params: Map<String, String>) -> http::Response / {db.query[items
     },
   }
 
-pub fn list_orders() -> http::Response / {db.query[orders]} =
+pub fn list_orders() -> http::Response / {db.query[orders], abort.raise} =
   match book() { Err(r) -> r, Ok(rows) -> json_body(200, rows, json::list_json(order_json())) }
 
-pub fn get_order(params: Map<String, String>) -> http::Response / {db.query[orders]} =
+pub fn get_order(params: Map<String, String>) -> http::Response / {db.query[orders], abort.raise} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) -> match order_row_of(id) {
@@ -598,7 +600,7 @@ fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response> =
 
 // --- The two that are transactions --------------------------------------------------
 
-pub fn place_order(body: Bytes) -> http::Response / {Desk} =
+pub fn place_order(body: Bytes) -> http::Response / {Desk, abort.raise} =
   match json::decode_bytes(body, placement_json()) {
     Err(e) -> problem(400, "malformed body", json::error_to_string(e)),
     Ok(p) -> placed(p),
@@ -606,7 +608,7 @@ pub fn place_order(body: Bytes) -> http::Response / {Desk} =
 
 // The two refusals that need no database are answered before one is opened, so a malformed order
 // costs no connection and no `BEGIN`.
-fn placed(p: Placement) -> http::Response / {Desk} =
+fn placed(p: Placement) -> http::Response / {Desk, abort.raise} =
   if len(p.lines) == 0 { problem(422, "empty order", "an order needs at least one line") }
   else if bad_qty(p.lines) {
     problem(422, "bad quantity", "every line needs a quantity above zero")
@@ -616,7 +618,7 @@ fn placed(p: Placement) -> http::Response / {Desk} =
 
 // The span that shows where a placement's time went, and the one place in this file where a span is
 // *not* closed by the program.
-fn placing(p: Placement) -> http::Response / {Desk} = {
+fn placing(p: Placement) -> http::Response / {Desk, abort.raise} = {
   let span = trace.enter[orders](
     "reserving",
     map_of_entries([text_field("customer", p.customer), int_field("lines", len(p.lines))]),
@@ -631,7 +633,11 @@ fn placing(p: Placement) -> http::Response / {Desk} = {
   out
 }
 
-fn recorded(p: Placement, stock: List<Item>, total: Decimal) -> http::Response / {Desk} =
+fn recorded(
+  p: Placement,
+  stock: List<Item>,
+  total: Decimal,
+) -> http::Response / {Desk, abort.raise} =
   match rows_of(
       db.returning[orders](order_insert(), [
         db::PText(p.customer),
@@ -712,7 +718,7 @@ fn settled(out: Result<http::Response, db::Rollback>, error: String) -> http::Re
   }
 
 // `Serializable`, and it is the only endpoint that asks for it.
-pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk} =
+pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk, abort.raise} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) ->
@@ -722,7 +728,7 @@ pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk} =
       ),
   }
 
-fn cancelling(id: Int) -> http::Response / {Desk} =
+fn cancelling(id: Int) -> http::Response / {Desk, abort.raise} =
   match order_row_of(id) {
     Err(r) -> r,
     Ok(found) -> match found {
@@ -737,7 +743,7 @@ fn cancelling(id: Int) -> http::Response / {Desk} =
 // A `DELETE` that raced another one and lost affects no row here, because the order it read is gone
 // from under it; that answers 409 without a rollback — nothing had been written, so there is
 // nothing to discard and committing an empty transaction is the honest end of it.
-fn cancelled_now(o: Order) -> http::Response / {Desk} =
+fn cancelled_now(o: Order) -> http::Response / {Desk, abort.raise} =
   match db.execute[orders](order_cancel(), [state_param(Cancelled), db::PInt(o.id)]) {
     db::Count(n) -> if n == 1 { restocked(o) }
     else { problem(409, "already cancelled", int_to_string(o.id)) },
@@ -745,7 +751,7 @@ fn cancelled_now(o: Order) -> http::Response / {Desk} =
     _ -> problem(500, "unreadable answer", "an update returned rows"),
   }
 
-fn restocked(o: Order) -> http::Response / {Desk} =
+fn restocked(o: Order) -> http::Response / {Desk, abort.raise} =
   match shelf() {
     Err(r) -> r,
     Ok(stock) -> {
@@ -822,7 +828,9 @@ fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
 // A buffered answer, or a head and a cursor the connection pulls.
 pub type Reply = | Buffered(http::Response) | Stream({ head: http::Response, cursor: Cursor })
 
-pub fn receipt(params: Map<String, String>) -> Reply / {db.query[items], db.query[orders]} =
+pub fn receipt(
+  params: Map<String, String>,
+) -> Reply / {db.query[items], db.query[orders], abort.raise} =
   match order_wanted(params) {
     Err(r) -> Buffered(r),
     Ok(id) -> match order_row_of(id) {
@@ -838,14 +846,18 @@ pub fn receipt(params: Map<String, String>) -> Reply / {db.query[items], db.quer
 // than out of the database: a receipt of ten thousand lines costs one query and holds one line at a
 // time, and a chunk producer that queried per line would put the database inside `next_chunk`'s row
 // and inside the connection's write loop.
-fn streamed(o: Order) -> Reply / {db.query[items]} =
+fn streamed(o: Order) -> Reply / {db.query[items], abort.raise} =
   match shelf() {
     Err(r) -> Buffered(r),
     Ok(stock) -> Stream({ head: text(200, b""), cursor: cursor_for(o, stock) }),
   }
 
 // --- The request span, and the credential ----------------------------------------
-pub fn dispatch(e: Endpoint, req: http::Request, params: Map<String, String>) -> Reply / {Serving} = {
+pub fn dispatch(
+  e: Endpoint,
+  req: http::Request,
+  params: Map<String, String>,
+) -> Reply / {Serving, abort.raise} = {
   let span = trace.enter[http](
     "dispatch",
     map_of_entries([
@@ -870,7 +882,11 @@ fn outcome_of(r: Reply) -> trace::Outcome =
   }
 
 // The API-key check, and the only place in this repository a `Secret<a>` is used end to end.
-fn guarded(e: Endpoint, req: http::Request, params: Map<String, String>) -> Reply / {Serving} =
+fn guarded(
+  e: Endpoint,
+  req: http::Request,
+  params: Map<String, String>,
+) -> Reply / {Serving, abort.raise} =
   match e {
     PlaceOrder -> if authorized(config.secret[credentials](api_key()), presented(req)) {
       dispatched(e, req, params)
@@ -919,7 +935,7 @@ fn dispatched(
   e: Endpoint,
   req: http::Request,
   params: Map<String, String>,
-) -> Reply / {Desk, signal.stopping} =
+) -> Reply / {Desk, signal.stopping, abort.raise} =
   match e {
     Health -> Buffered(health()),
     Ready -> Buffered(ready()),
@@ -934,7 +950,7 @@ fn dispatched(
     Receipt -> receipt(params),
   }
 
-pub fn answer(req: http::Request) -> Reply / {Serving} =
+pub fn answer(req: http::Request) -> Reply / {Serving, abort.raise} =
   if req.target == "*" {
     // `OPTIONS *` asks about the server rather than about a path, so it is not routed.
     Buffered(server_options())
@@ -983,7 +999,7 @@ fn method_not_allowed(ms: List<http::Method>) -> http::Response =
 
 // Every route, buffered — the shape a test drives and the shape `http::serve` would take as its
 // `app`.
-pub fn app(req: http::Request) -> http::Response / {Serving} = collapse(answer(req))
+pub fn app(req: http::Request) -> http::Response / {Serving, abort.raise} = collapse(answer(req))
 
 pub fn collapse(r: Reply) -> http::Response =
   match r {
@@ -1020,7 +1036,7 @@ pub fn limits() -> http::Limits =
 pub fn serve_connection(
   c: Int,
   l: http::Limits,
-) -> Unit / {Serving, net.recv[conn], net.send[conn], net.close[conn]} = {
+) -> Unit / {Serving, net.recv[conn], net.send[conn], net.close[conn], abort.raise} = {
   // A limit that is zero or negative is a configuration nobody meant, and it is refused here rather
   // than turning into a service that answers 413 to everything.
   http::check_limits(l);
@@ -1034,7 +1050,7 @@ fn turn(
   carried: Bytes,
   left: Int,
   reused: Bool,
-) -> Unit / {Serving, net.recv[conn], net.send[conn]} =
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} =
   if left <= 0 { () } else {
     match http::read_head[conn](c, carried, l, reused) {
       // The peer went away. There is nothing to answer and nothing to say.
@@ -1061,7 +1077,7 @@ fn heard(
   buf: Bytes,
   complete: Bool,
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn]} =
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} =
   match http::parse_head(buf, l) {
     // The head stopped mid-way with nothing more coming, or it ran past the bound without a
     // terminator.
@@ -1097,7 +1113,7 @@ fn continued(
   h: http::Head,
   buf: Bytes,
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn]} = {
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} = {
   // A client that waits for a `100` it never gets is a hang, and a hang is the failure shape with
   // nothing to read.
   let told = if h.expects_continue {
@@ -1121,7 +1137,7 @@ fn with_body(
   h: http::Head,
   body: http::BodyResult,
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn]} =
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} =
   match body {
     http::BodyTimedOut ->
       write_out(
@@ -1144,7 +1160,7 @@ fn answered(
   h: http::Head,
   got: { bytes: Bytes, rest: Bytes, trailers: http::Headers },
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn]} = {
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} = {
   let keep = h.keep_alive && left > 1;
   let reply = answer(whole(h, got.bytes, got.trailers));
   let wrote = match streamable(h.request.method, reply) {
@@ -1192,7 +1208,7 @@ fn write_out(
   v: http::Version,
   keep: Bool,
   r: http::Response,
-) -> Unit / {net.send[conn]} = {
+) -> Unit / {net.send[conn], abort.raise} = {
   send_all[conn](c, http::encode(m, v, keep, r), l.write_timeout_ms);
   ()
 }
@@ -1203,7 +1219,7 @@ pub fn serve(
   listener: Int,
   l: http::Limits,
   count: Int,
-) -> Int / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+) -> Int / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
   one_at_a_time(listener, l, count, 0)
 
 fn one_at_a_time(
@@ -1211,7 +1227,7 @@ fn one_at_a_time(
   l: http::Limits,
   left: Int,
   served: Int,
-) -> Int / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+) -> Int / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
   if left <= 0 { served } else {
     let c = net.accept[listener](listener);
     if c == 0 { served } else {
@@ -1227,7 +1243,7 @@ pub fn serve_each(
   listener: Int,
   l: http::Limits,
   count: Int,
-) -> Int / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+) -> Int / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
   joined(spawned(listener, l, count, []))
 
 fn spawned(
@@ -1235,7 +1251,7 @@ fn spawned(
   l: http::Limits,
   left: Int,
   running: List<Task<Unit>>,
-) -> List<Task<Unit>> / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+) -> List<Task<Unit>> / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
   if left <= 0 { running } else {
     let c = net.accept[listener](listener);
     if c == 0 { running }
@@ -1251,7 +1267,7 @@ fn joined(tasks: List<Task<Unit>>) -> Int / {task.write} =
 pub fn listen_and_serve(
   port: Int,
   count: Int,
-) -> Int / {Serving, net.listen[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn]} = {
+) -> Int / {Serving, net.listen[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} = {
   let listener = net.listen[listener](port);
   let served = serve(listener, limits(), count);
   net.close[listener](listener);
@@ -1263,7 +1279,7 @@ pub fn listen_and_serve(
 // port 0 is found.
 pub fn listening(
   s: Settings,
-) -> Int / {task.write, Serving, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], process.out[proc]} = {
+) -> Int / {task.write, Serving, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], process.out[proc], abort.raise} = {
   let listener = match s.tls {
     None -> net.listen[listener](s.port),
     Some(credential) -> net.listen_tls[listener](s.port, credential),
@@ -1287,7 +1303,7 @@ pub fn run_memory(
   port: Int,
   api: Option<Secret<String>>,
   count: Int,
-) -> Int / {net.listen[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+) -> Int / {net.listen[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
   twin(api, || listen_and_serve(port, count))
 
 // The API key the *tests* drive the twin with.
@@ -1295,7 +1311,10 @@ pub fn twin_key() -> String = "twin-key-not-a-credential"
 
 // The desk over a database that is a value, a sink that is a value and a stop flag that is a value:
 // every operation `Serving` names is answered here, and the credential from `api`.
-pub fn twin<a | e>(api: Option<Secret<String>>, body: () -> a / {Serving | e}) -> a / e =
+pub fn twin<a | e>(
+  api: Option<Secret<String>>,
+  body: () -> a / {Serving | e},
+) -> a / {abort.raise | e} =
   with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
     with_cell[sink](trace::sink()) { t -> {
       with_cell[stop](signal::running()) { s -> {
@@ -1367,7 +1386,7 @@ pub fn twin<a | e>(api: Option<Secret<String>>, body: () -> a / {Serving | e}) -
 
 // The entry point: the settings, read once, and the store they name. Where to reach the database
 // is a setting too, and every `db` operation is answered from here rather than by a host.
-fn main() -> Int / {Running} = {
+fn main() -> Int / {Running, abort.raise} = {
   let key = config.secret[credentials](api_key());
   let s = configured(
     settings_of(
@@ -1384,7 +1403,11 @@ fn main() -> Int / {Running} = {
   }
 }
 
-fn postgres(url: Option<String>, s: Settings, key: Option<Secret<String>>) -> Int / {Running} =
+fn postgres(
+  url: Option<String>,
+  s: Settings,
+  key: Option<Secret<String>>,
+) -> Int / {Running, abort.raise} =
   handle {
     match with_server(configured_url(url), s.connections, || listening(s)) {
       Ok(served) -> served,
@@ -1607,7 +1630,7 @@ fn against<a | e>(
   d: db::MemDb,
   values: config::Values,
   body: () -> a / {Serving | e},
-) -> Ran<a> / {signal.stopping | e} =
+) -> Ran<a> / {abort.raise, signal.stopping | e} =
   with_cell[store](d) { c -> {
     with_cell[sink](trace::sink()) { t -> {
       let step = |q: db::Stmt, ps: List<db::Param>| {
@@ -1680,7 +1703,7 @@ fn against<a | e>(
   } }
 
 // The desk as `examples/desk.sql` seeds it, with a key configured and nobody asking it to stop.
-fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / e =
+fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / {abort.raise | e} =
   handle {
     against(d, config::one_secret(api_key(), twin_key()), body)
   } with {

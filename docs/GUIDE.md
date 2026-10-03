@@ -162,9 +162,12 @@ Loosest to tightest; all binary operators are left-associative:
   IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work only on numeric types; order
   anything else with `compare`.
 * Both operands have one type; there is no widening (`U8 + U16` is `E0201`).
-* Arithmetic is checked: overflow, division by zero, and a shift count that is
-  negative or not less than the type's width raise `E0502`. `<<` discards
-  shifted-out bits; `wrap_*` wrap (§12.3).
+* Arithmetic is checked. A `/` or `%` whose divisor is zero raises (§6.8), so
+  either puts `abort.raise` in the row unless its divisor is a literal other
+  than zero or its operands are `Float`s. Overflow and a shift count that is
+  negative or not less than the type's width are the machine's limit, as the
+  call ceiling is: they end the run (`E0502`) and are in no row. `<<` discards
+  shifted-out bits; `wrap_*` wrap and `checked_*` answer `None` (§12.3).
 * `/` on `Decimal` is `E0209`; use `decimal_div`. `%` is allowed.
 * `&&`/`||` short-circuit. `&` `|` `^` `~` are integer-only and act at the
   type's own width (`~0u8` is `255u8`). `>>` is arithmetic, `>>>` logical.
@@ -361,7 +364,7 @@ There is no numeric tower. An operator's operand type is settled from the whole
 definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
 operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
 code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12.3). `u32_of_int` and its
-siblings raise when the value does not fit (mask to truncate:
+siblings raise (§6.8) when the value does not fit (mask to truncate:
 `u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
@@ -471,7 +474,8 @@ checks see it.
 
 ### 4.7 Function types, and what is written
 
-`(A, B) -> C` is pure; `(A) -> B / {db.read[users]}` and `(A) -> B / e` carry
+`(A, B) -> C` is pure and cannot raise; `(A) -> B / {abort.raise}`,
+`(A) -> B / {db.read[users]}` and `(A) -> B / e` carry
 rows. With no `/`, the row is inferred in a signature and empty in a declared
 type. A function value may perform less than the type it meets says (§6.2).
 Functions cannot be compared, encoded, ordered or used as map keys.
@@ -509,7 +513,7 @@ fn sum_two(input: Bytes) -> Int = {
 ```
 
 A record pattern names every field or ends with `..` (`E0201`). A `let` whose
-pattern does not match raises; `let <pattern> = <expr> else { .. };` says what
+pattern does not match raises (§6.8); `let <pattern> = <expr> else { .. };` says what
 happens instead. Where the pattern misses, the `else` block is the value of the
 block the statement is in, and the statements after it do not run; it has that
 block's type and sees none of the pattern's names. `?` in the `else` exits as it
@@ -903,12 +907,22 @@ fn digit_or(b: Int, fallback: Int) -> Int / {} =
 
 The prelude declares `effect abort { read raise<a>(message: String) -> a }`.
 `abort.raise(m)` puts `abort.raise` in the row as any perform does, and does not
-come back. A clause for it has the `handle`'s type: its value is the `handle`'s,
-`return` is not applied to it, and it cannot bind `resume` (`E0201`). It runs
-outside its `handle`, once the body is abandoned and the regions the body opened
-are closed, so a raise in another clause goes to a `handle` further out than the
-one whose clause raised. A raise no clause answers ends the run, as `panic`
-does (`E0502`).
+come back. So does everything else that can fail on a value it is given: `panic`,
+`assert` and `assert_eq`, a builtin outside what it is defined for (§12), a `/`
+or `%` by zero (§2.4), a `let` whose pattern misses (§5.1) and an `iterate` past
+its budget. A row that omits `abort.raise` on a body that can raise is `E0302`,
+which names the operation; `ply check --types` shows it on every definition
+that can raise. Overflow, the call ceiling and a spent step budget end the run
+whatever the row says.
+
+A clause for `abort.raise` has the `handle`'s type: its value is the `handle`'s,
+`return` is not applied to it, and it cannot bind `resume` (`E0201`). Its
+parameter is the message: `panic`'s argument, or what the run would otherwise
+have reported, a value it names told by its kind. The clause runs outside its
+`handle`, once the body is abandoned and the regions the body opened are closed,
+so a raise in another clause goes to a `handle` further out than the one whose
+clause raised. A raise no clause answers ends the run: `E0501` for an assertion
+and `E0502` for anything else.
 
 A `parallel` branch's raise is answered around the block. A task's raise goes
 to the task's own `handle`s and then to those around its `simulate` region,
@@ -1260,7 +1274,8 @@ module imported (`import std.json`, `import std.bin`), or the `derive` is
 ## 12. Builtins
 
 In scope everywhere; a module may shadow any except `compare_values` (`E0105`).
-Out-of-range indexes and slices raise `E0502` unless noted; nothing is clamped.
+Out-of-range indexes and slices raise (§6.8) unless noted; nothing is clamped, and
+a builtin that can raise carries `abort.raise` in its row.
 `ply doc NAME` prints any of these from the compiler's own table, which is the
 authority when this page and it disagree.
 
@@ -1270,7 +1285,7 @@ authority when this page and it disagree.
 | --- | --- |
 | `assert(cond: Bool, message: Option<String> = None) -> Unit` | `E0501` |
 | `assert_eq<a>(actual: a, expected: a) -> Unit` | `E0501` |
-| `panic<a>(message: String) -> a` | `E0502`; no `handle` answers it, unlike `abort.raise` (§6.8) |
+| `panic<a>(message: String) -> a` | raises `message` (§6.8); unanswered, `E0502` |
 | `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
 | `min`, `max` `(a: Int, b: Int) -> Int` | |
