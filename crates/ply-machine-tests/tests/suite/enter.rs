@@ -1,7 +1,7 @@
 //! What the launcher enters a built program with: the label is the capability, the code is the
 //! program's, and a span its entry left open comes back beside it.
 
-use crate::fixture::{handed, loaded, project, unit_text};
+use crate::fixture::{handed, project, unit_text};
 use ply_eval::{Ended, Span, Value, codes};
 use ply_host::process::Executables;
 use ply_machine::enter::{self, Binds};
@@ -15,7 +15,7 @@ fn entered(source: &str, binds: Binds) -> Ended<i32> {
     let front = handed(dir.path());
     let files: &Value = field_of(&front, "files", Span::DUMMY).expect("a front's files");
     let dump = field_of(&front, "dump", Span::DUMMY).expect("a front's dump");
-    let unit = unit_text(&loaded(dir.path()));
+    let unit = unit_text(dir.path());
     let bytes = runnable::encode("m.main", files, dump, &unit).expect("the runnable encodes");
     let program = runnable::decode(&bytes).expect("the runnable reads back");
     let opened = enter::opened_runnable(program, dir.path()).expect("it opens");

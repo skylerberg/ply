@@ -1,6 +1,5 @@
 use ply_codegen::Unit;
-use ply_eval::{Machine, SourceId, Span, Symbol, Value};
-use std::collections::HashMap;
+use ply_eval::{Analysis, Machine, Span, Symbol, Value};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -11,11 +10,12 @@ fn fixtures() -> PathBuf {
 }
 
 pub struct Loaded {
-    pub front: ply_eval::Analysis,
-    /// Each module's text by name: what the Ply emitter re-parses to produce.
-    pub texts: HashMap<String, String>,
+    pub front: Analysis,
+    /// The unit's C, every root offered.
+    unit: String,
 }
 
+/// The `.ply` files in `dir`, each a module named by its stem, as the builder answers for them.
 fn load(dir: &Path) -> Result<Loaded, Vec<ply_eval::Diagnostic>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
@@ -24,37 +24,21 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_eval::Diagnostic>> {
         .collect();
     files.sort();
 
-    let mut user = Vec::new();
-    for path in &files {
-        let stem = path.file_stem().and_then(|s| s.to_str()).expect("a stem");
-        let text: &'static str = Box::leak(
-            std::fs::read_to_string(path)
-                .expect("the fixture is readable")
-                .into_boxed_str(),
-        );
-        user.push((stem.to_string(), text.to_string()));
-    }
-    let shipped: Vec<(String, String)> = ply_std::sources()
-        .map(|(module, text)| (module.to_string(), text.to_string()))
-        .collect();
-    let pulled =
-        ply_codegen::c::producer::front_pulling_std(&user, &shipped).expect("the port answers");
-    let mut modules = user
+    let files: Vec<(String, String)> = files
         .iter()
-        .map(|(name, text)| (name.clone(), text.clone()))
-        .collect::<Vec<_>>();
-    for name in &pulled.modules {
-        let text = ply_std::source(name).expect("it ships");
-        modules.push((name.clone(), text.to_string()));
-    }
-    let ids: Vec<_> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let front = ply_codegen::c::dump::read(&pulled.dump, &ids).expect("the dump reads");
-    if front.has_error() {
-        return Err(front.diagnostics);
+        .map(|path| {
+            let name = path.file_name().and_then(|s| s.to_str()).expect("a name");
+            let text = std::fs::read_to_string(path).expect("the fixture is readable");
+            (name.to_string(), text)
+        })
+        .collect();
+    let answer = crate::fixture::made(&files);
+    if answer.front.answer.has_error() {
+        return Err(answer.front.answer.diagnostics);
     }
     Ok(Loaded {
-        front,
-        texts: modules.into_iter().collect(),
+        front: answer.front.answer,
+        unit: answer.unit,
     })
 }
 
@@ -72,7 +56,7 @@ struct Harness {
 
 fn harness(loaded: &'static Loaded) -> Harness {
     let unit: &'static Unit =
-        Unit::over_front(&loaded.front, loaded.texts.clone()).expect("this host has a C compiler");
+        Unit::handed(&loaded.front, loaded.unit.clone()).expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
     let machine = Machine::new(&loaded.front, bodies.clone())
         .expect("the unit was compiled from this program");

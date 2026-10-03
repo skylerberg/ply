@@ -1,10 +1,8 @@
-mod answers;
-mod cache;
 mod dump;
-mod producer;
 mod sweep;
 mod toolchain;
-mod upgrade;
+
+use crate::fixture;
 
 use ply_codegen::c::tables::{BUCKETS, bucket_of};
 use ply_codegen::c::{
@@ -20,37 +18,6 @@ fn every_declared_helper_has_an_address() {
     for (h, a) in HELPERS.iter().zip(&addrs) {
         assert!(!a.is_null(), "`{}` has no address", h.name);
     }
-}
-
-/// A foreign caller builds the argument array, so the count is checked against the unit's own:
-/// entering one argument too few read past that array and took the process down, and what the
-/// caller got was a segfault rather than a diagnostic naming the entry.
-#[test]
-fn an_entry_entered_with_too_few_arguments_is_refused_rather_than_read_past() {
-    ply_codegen::c::producer::ensure_default();
-    let err = ply_codegen::c::producer::call("emit.emit_roots_answer", &[])
-        .expect_err("`emit.emit_roots_answer` takes ten arguments");
-    let text = err.to_string();
-    assert!(
-        text.contains("`emit.emit_roots_answer` takes 10 arguments and was entered with 0"),
-        "the refusal names the entry and both counts: {text}"
-    );
-}
-
-/// The committed emitter, emitting a stage for sources that gave an entry another argument, is
-/// handed that argument too, and takes the ones it was compiled with.
-#[test]
-fn an_entry_takes_the_leading_arguments_it_was_compiled_with() {
-    use ply_eval::{Fields, Symbol, Value};
-    ply_codegen::c::producer::ensure_default();
-    let want = Value::Record(std::sync::Arc::new(Fields::from_unsorted(vec![
-        (Symbol::new("path"), Value::bytes(b"data")),
-        (Symbol::new("dir"), Value::Bool(true)),
-    ])));
-    let key = |args: &[Value]| {
-        ply_codegen::c::producer::call("embed.embed_key", args).expect("the entry answers")
-    };
-    assert_eq!(key(&[want.clone(), Value::Int(7)]), key(&[want]));
 }
 
 #[test]
@@ -132,7 +99,7 @@ pub fn width(a: Int, b: Int) -> Int =
   int_of_u32(wrap_add(u32_of_int(a), u32_of_int(b)) ^ rotr(u32_of_int(b), 8))
 pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
 "#;
-    let Some((loaded, native)) = tests_support::unit(source) else {
+    let Some((loaded, native)) = fixture::unit(source) else {
         return;
     };
     let cases: &[(&str, Vec<i64>, i64)] = &[
@@ -171,7 +138,7 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
 fn a_recursion_past_what_the_stack_holds_grows_onto_another_and_answers() {
     const LADDER: &str = "fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }";
     const DEEP: i64 = 20_000;
-    let Some((_loaded, native)) = tests_support::unit(LADDER) else {
+    let Some((_loaded, native)) = fixture::unit(LADDER) else {
         return;
     };
     let entry: ply_codegen::rt::Entry = native.entry("m.ladder").expect("`m.ladder` compiled");
@@ -198,7 +165,7 @@ fn a_recursion_past_what_the_stack_holds_grows_onto_another_and_answers() {
 #[test]
 fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     const SPIN: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)";
-    let Some((_loaded, native)) = tests_support::unit(SPIN) else {
+    let Some((_loaded, native)) = fixture::unit(SPIN) else {
         return;
     };
     let entry: ply_codegen::rt::Entry = native.entry("m.spin").expect("`m.spin` compiled");
@@ -219,27 +186,44 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     assert!(raised.contains("bound on nested calls"), "{raised}");
 }
 
-/// `PLY_C_CACHE`, `PLY_C_SKIP` and `cache::UNITS_REUSED` are process-wide: a test that changes or counts them takes this for writing, every other build for reading.
-pub(super) static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
+/// A unit the builder made: its C, and what it says about itself.
+pub struct Produced {
+    pub text: String,
+    pub exports: ply_codegen::c::Exports,
+}
+
+impl Produced {
+    fn of(answer: &ply_machine::runnable::Runnable) -> Produced {
+        let exports =
+            ply_codegen::c::Exports::from_text(&answer.unit).expect("a unit says what it holds");
+        Produced {
+            text: answer.unit.clone(),
+            exports,
+        }
+    }
+}
+
+/// The unit the builder makes of `modules`, every root offered.
+fn produced_of(modules: &[(&str, &str)]) -> Produced {
+    Produced::of(&fixture::answered(modules))
+}
+
+/// Module `m` built over every root of `text`, or nothing where no C compiler runs.
+fn built(text: &str) -> Option<Native> {
+    let (_, native, refused) = fixture::with_refusals(text)?;
+    assert!(refused.is_empty(), "{refused:?}");
+    Some(native)
+}
 
 /// What a unit says about itself reads back from its text as it was embedded, so whether it serves
 /// this runtime is known before anything is compiled.
 #[test]
 fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
-    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
-        "m".to_string(),
+    let produced = produced_of(&[(
+        "m",
         "pub type Shape = | Dot | Line(Int)\nfn double(x: Int) -> Int = x * 2\n\
-         fn named(s: Shape) -> Bytes = match s { Dot -> b\"dot\", Line(_) -> b\"a \\\"line\\\"?\" }\n"
-            .to_string(),
-    )])
-    .expect("the program checks");
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(answered.front));
-    let source: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_analysis(front)
-            .with_texts(answered.modules.into_iter().collect()),
-    ));
-    let produced =
-        ply_codegen::c::produce(source, &["m.double", "m.named"]).expect("the unit emits");
+         fn named(s: Shape) -> Bytes = match s { Dot -> b\"dot\", Line(_) -> b\"a \\\"line\\\"?\" }\n",
+    )]);
     let read = ply_codegen::c::Exports::from_text(&produced.text).expect("the table reads back");
     assert_eq!(read.encode(), produced.exports.encode());
     assert!(read.unserved().is_none());
@@ -263,90 +247,29 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
     assert!(ply_codegen::c::Exports::from_text("int main(void) { return 0; }").is_none());
 }
 
-/// A pre-flight loads the unit it decides the set from; the first backend on its thread takes that
-/// unit rather than mapping the object again, and a later one reads it back from the cache.
+/// A unit handed over is loaded once, to read what it holds; the first backend on that thread takes
+/// that load rather than mapping the image again, and a later one maps it anew.
 #[test]
-fn the_first_backend_on_the_preflights_thread_takes_the_unit_it_loaded() {
+fn the_first_backend_on_the_handing_thread_takes_the_unit_it_loaded() {
     use ply_eval::{Provider, Symbol, Value};
     use std::sync::atomic::Ordering::Relaxed;
-    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
-        "m".to_string(),
-        "fn double(x: Int) -> Int = x * 2\n".to_string(),
-    )])
-    .expect("the program checks");
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(answered.front));
-    // Writing: `UNITS_REUSED` below counts every build in the process.
-    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
-    let unit = ply_codegen::Unit::over_front(front, answered.modules.into_iter().collect())
-        .expect("this host has a C compiler");
-    let reused = || ply_codegen::c::cache::UNITS_REUSED.load(Relaxed);
-    let before = reused();
+    let answer = fixture::answered(&[("m", "fn double(x: Int) -> Int = x * 2\n")]);
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(answer.front.answer));
+    // Writing: `UNITS_MAPPED` below counts every load in the process.
+    let _config = fixture::CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let unit = ply_codegen::Unit::handed(front, answer.unit).expect("this host has a C compiler");
+    let mapped = || ply_codegen::c::UNITS_MAPPED.load(Relaxed);
+    let before = mapped();
     let first = unit.attach();
-    assert_eq!(reused(), before, "the first backend loaded the unit again");
+    assert_eq!(mapped(), before, "the first backend mapped the unit again");
     let second = unit.attach();
-    assert_eq!(reused(), before + 1, "a later backend reads the unit back");
+    assert_eq!(mapped(), before + 1, "a later backend maps the unit anew");
     assert_eq!(unit.compilation().units, 2);
     for backend in [&first, &second] {
         assert_eq!(
             backend.enter(&Symbol::new("m.double"), &[Value::Int(21)], 10_000),
             Some(Value::Int(42))
         );
-    }
-}
-
-pub mod tests_support {
-    use ply_codegen::c::Native;
-    use ply_codegen::source::Source;
-    use ply_eval::SourceId;
-    use std::collections::HashMap;
-
-    pub fn unit(text: &str) -> Option<(&'static Source, Native)> {
-        with_refusals(text).map(|(s, n, _)| (s, n))
-    }
-
-    fn front(text: &str) -> &'static ply_eval::Analysis {
-        Box::leak(Box::new(
-            ply_codegen::c::producer::checked_analysis(
-                &[("m".to_string(), text.to_string())],
-                &[SourceId(0)],
-            )
-            .expect("checks"),
-        ))
-    }
-
-    /// Keyed on the text, not the name: two tests defining `m.f` would otherwise share an emit-cache entry.
-    pub fn keyed(text: &str) -> Option<&'static Source> {
-        let mut front = front(text).clone();
-        let stamp = blake3::hash(text.as_bytes()).to_hex();
-        front.keys = front
-            .keys
-            .keys()
-            .map(|n| (n.clone(), format!("h-{n}-{}", &stamp[..16])))
-            .collect();
-        let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
-        Some(Box::leak(Box::new(
-            Source::from_analysis(front).with_texts(texts(text)),
-        )))
-    }
-
-    pub fn with_refusals(
-        text: &str,
-    ) -> Option<(&'static Source, Native, Vec<ply_codegen::c::Refused>)> {
-        let source: &'static Source = Box::leak(Box::new(
-            Source::from_analysis(front(text)).with_texts(texts(text)),
-        ));
-        let names = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
-        match ply_codegen::c::build(source, &refs) {
-            Ok((native, refused)) => Some((source, native, refused)),
-            Err(e) if e.to_string().contains("could not run") => None,
-            Err(e) => panic!("{e}"),
-        }
-    }
-
-    fn texts(text: &str) -> HashMap<String, String> {
-        HashMap::from([("m".to_string(), text.to_string())])
     }
 }
 
@@ -380,7 +303,7 @@ pub fn looped(n: Int) -> Int =
     if s.i >= n { Stop(int_of_u32(s.q.a ^ s.q.b ^ s.q.c ^ s.q.d)) }
     else { Continue({i: s.i + 1, q: g(s.q, u32_of_int(s.i))}) })
 "#;
-    let Some((_, native)) = tests_support::unit(source) else {
+    let Some((_, native)) = fixture::unit(source) else {
         return;
     };
     let int = ply_eval::Value::Int;
@@ -435,7 +358,7 @@ pub fn wide(n: Int) -> Int = {
 }
 pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 2654435761u32), 7))
 "#;
-    let Some((_, native, _)) = tests_support::with_refusals(source) else {
+    let Some((_, native, _)) = fixture::with_refusals(source) else {
         return;
     };
     // `None` raises: `_of_int` refuses a value outside its width rather than truncating it.
@@ -527,7 +450,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
 "#
         );
         eprintln!("--- shape: {which}");
-        let Some((_, native)) = tests_support::unit(&source) else {
+        let Some((_, native)) = fixture::unit(&source) else {
             return;
         };
         let args = [ply_eval::Value::Int(4)];
@@ -553,7 +476,7 @@ fn two_definitions_that_say_the_same_thing_get_their_own_bodies() {
 pub fn one(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
 pub fn two(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
 "#;
-    let Some((_, native)) = tests_support::unit(source) else {
+    let Some((_, native)) = fixture::unit(source) else {
         return;
     };
     assert!(native.entry("m.one").is_some(), "`one` has no body");
@@ -575,7 +498,7 @@ pub fn round(n: Int) -> Int = code(TNum(n))
 pub fn eof() -> Int = code(TEof)
 pub fn named(b: Bytes) -> Int = code(TName(b))
 "#;
-    let Some((_, native, refused)) = tests_support::with_refusals(source) else {
+    let Some((_, native, refused)) = fixture::with_refusals(source) else {
         return;
     };
     assert!(
@@ -619,7 +542,7 @@ pub fn by_name(xs: List<Int>) -> Int = fold(map(xs, |x: Int| x + 1), 0, add)
 pub fn adder(n: Int) -> (Int) -> Int = |x: Int| x + n
 pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
 "#;
-    let Some((_, native, refused)) = tests_support::with_refusals(source) else {
+    let Some((_, native, refused)) = fixture::with_refusals(source) else {
         return;
     };
     assert!(
@@ -659,226 +582,6 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
     }
 }
 
-/// Refusals are cached by the digest of the offered set, so the digest must be taken after any filter narrows it.
-#[test]
-fn a_narrower_run_does_not_poison_a_wider_one() {
-    let source = r#"
-fn twice(n: Int) -> Int = n * 2
-fn thrice(n: Int) -> Int = if n <= 0 { 0 } else { 3 + thrice(n - 1) }
-pub fn both(n: Int) -> Int = twice(n) + thrice(n)
-pub fn alone(n: Int) -> Int = twice(n)
-"#;
-    let dir = std::env::temp_dir().join(format!("ply-c-poison-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    // `CONFIG` for writing: this run needs its own cache, and every build in the process reads that variable.
-    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
-    let restore = std::env::var("PLY_C_CACHE").ok();
-    unsafe { std::env::set_var("PLY_C_CACHE", &dir) };
-
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let all: Vec<String> = loaded.functions();
-    let all: Vec<&str> = all.iter().map(String::as_str).collect();
-
-    let answer = |native: &Native, name: &str, n: i64| -> Option<i64> {
-        let entry: ply_codegen::rt::Entry = native.entry(name)?;
-        let mut ctx = native.context();
-        ctx.fuel = 10_000;
-        let words = [ply_codegen::heap::imm(n)];
-        let w = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised");
-        Some(ply_codegen::heap::imm_value(w))
-    };
-
-    let (wide, _) = ply_codegen::c::build(loaded, &all).expect("builds");
-    assert_eq!(answer(&wide, "m.both", 5), Some(25));
-    drop(wide);
-
-    // Narrowed by the instrument: `names` is unchanged, so a digest taken before the filter would be the wider run's key.
-    unsafe { std::env::set_var("PLY_C_SKIP", "m.thrice") };
-    let (narrowed, refused) = ply_codegen::c::build(loaded, &all).expect("builds");
-    assert!(
-        refused.iter().any(|r| r.function == "m.both"),
-        "`m.both` calls a definition this build was not offered: {refused:?}"
-    );
-    // The knob keeps working because the callee it took away is what excuses the refusal: offer
-    // that callee and the same refusal is a build error.
-    assert!(
-        !ply_codegen::c::fatal_refusals(&all, &refused).is_empty(),
-        "a refusal the offer did not cause would have been raised: {refused:?}"
-    );
-    assert_eq!(answer(&narrowed, "m.alone", 5), Some(10));
-    drop(narrowed);
-
-    unsafe { std::env::remove_var("PLY_C_SKIP") };
-    let (again, refused) = ply_codegen::c::build(loaded, &all).expect("builds");
-    assert!(
-        refused.is_empty(),
-        "the wider build was served the narrower one's refusals: {refused:?}"
-    );
-    assert_eq!(answer(&again, "m.both", 5), Some(25));
-    let _ = std::fs::remove_dir_all(&dir);
-    // Restore the shared cache before the write lock goes, so the builds waiting on it read the usual directory.
-    unsafe {
-        match &restore {
-            Some(had) => std::env::set_var("PLY_C_CACHE", had),
-            None => std::env::remove_var("PLY_C_CACHE"),
-        }
-    }
-}
-
-/// A refusal that survives the fixpoint is a definition nothing can ever enter, so it fails the
-/// build — unless a narrowed offer took its callee out from under it, which is what the debugging
-/// knobs do, transitively.
-#[test]
-fn a_refusal_the_offer_did_not_cause_is_what_fails_the_build() {
-    let refusal = |function: &str, construct: &str, missing: Option<&str>| ply_codegen::Refused {
-        function: function.to_string(),
-        construct: construct.to_string(),
-        missing: missing.map(str::to_string),
-    };
-    let refusals = [
-        refusal(
-            "m.lost_a_callee",
-            "`m.never_offered`, which is not in this compiled unit",
-            Some("m.never_offered"),
-        ),
-        refusal(
-            "m.lost_that_one",
-            "`m.lost_a_callee`, which is not in this compiled unit",
-            Some("m.lost_a_callee"),
-        ),
-        refusal(
-            "m.uncompilable",
-            "a construct this port does not emit",
-            None,
-        ),
-        refusal(
-            "m.calls_it",
-            "`m.uncompilable`, which is not in this compiled unit",
-            Some("m.uncompilable"),
-        ),
-    ];
-    let offered = [
-        "m.lost_a_callee",
-        "m.lost_that_one",
-        "m.uncompilable",
-        "m.calls_it",
-    ];
-    let fatal: Vec<&str> = ply_codegen::c::fatal_refusals(&offered, &refusals)
-        .iter()
-        .map(|r| r.function.as_str())
-        .collect();
-    assert_eq!(fatal, ["m.uncompilable", "m.calls_it"]);
-    // Offer the callee the first two lost and nothing is excused any more.
-    let whole = ["m.never_offered"]
-        .into_iter()
-        .chain(offered)
-        .collect::<Vec<&str>>();
-    assert_eq!(ply_codegen::c::fatal_refusals(&whole, &refusals).len(), 4);
-}
-
-/// The failure is reported where the program is built, against the definition's own place, so
-/// nothing is left for the entry that would find no body.
-#[test]
-fn the_build_error_names_each_refused_definition_and_where_it_sits() {
-    let Some(loaded) = tests_support::keyed("pub fn one() -> Int = 1\n") else {
-        return;
-    };
-    let refusals = [ply_codegen::Refused {
-        function: "m.one".to_string(),
-        construct: "a construct this port does not emit".to_string(),
-        missing: None,
-    }];
-    let borrowed: Vec<&ply_codegen::Refused> = refusals.iter().collect();
-    let diagnostic = ply_codegen::c::Refusals::over(loaded, &borrowed).into_diagnostic();
-    assert_eq!(diagnostic.code, ply_eval::codes::DEFINITION_REFUSED);
-    let label = diagnostic.labels.first().expect("the refusal is placed");
-    assert!(label.primary);
-    assert_eq!(label.message, "a construct this port does not emit");
-    assert_eq!(Some(label.span), loaded.span_of("m.one"));
-    assert!(
-        diagnostic
-            .notes
-            .iter()
-            .any(|n| n.contains("`m.one` (a construct this port does not emit)")),
-        "{:?}",
-        diagnostic.notes
-    );
-}
-
-/// Shape ids are baked into the C, so a unit read back must intern them in recorded order; the nonce makes the first build a miss.
-#[test]
-fn a_unit_read_back_from_the_cache_answers_what_it_answered_when_built() {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let source = format!(
-        r#"
-type Shape = {{ wide: Int, tall: Int }}
-type Tag = TA | TB(Int)
-fn area(s: Shape) -> Int = s.wide * s.tall
-fn label(t: Tag) -> Int = match t {{ TA -> 0, TB(n) -> n }}
-pub fn nonce() -> Int = {}
-pub fn both(w: Int, h: Int) -> Int = area({{ wide: w, tall: h }}) + label(TB(w)) + nonce() - nonce()
-pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
-"#,
-        nonce % 1_000_000
-    );
-
-    let Some(loaded) = tests_support::keyed(&source) else {
-        return;
-    };
-    let names: Vec<String> = loaded.functions();
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let ask = |native: &Native, name: &str, args: &[i64]| -> i64 {
-        let entry = native
-            .entry(name)
-            .unwrap_or_else(|| panic!("`{name}` was refused"));
-        let mut ctx = native.context();
-        ctx.fuel = 10_000;
-        let words: Vec<ply_codegen::heap::Word> =
-            args.iter().map(|a| ply_codegen::heap::imm(*a)).collect();
-        let w = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised");
-        ply_codegen::heap::imm_value(w)
-    };
-
-    // Writing: `UNITS_REUSED` below counts every build in the process, not just these two.
-    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
-    let (built, _) = ply_codegen::c::build(loaded, &names).expect("the first build");
-    let first = (
-        ask(&built, "m.both", &[3, 4]),
-        ask(&built, "m.tagged", &[7]),
-        ask(&built, "m.tagged", &[0]),
-    );
-    assert_eq!(
-        first,
-        (15, 7, 0),
-        "the built unit is wrong before the cache is even involved"
-    );
-    drop(built);
-
-    let reused = ply_codegen::c::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
-    let (again, _) = ply_codegen::c::build(loaded, &names).expect("the second build");
-    assert_eq!(
-        ply_codegen::c::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed),
-        reused + 1,
-        "the second build emitted a unit instead of reading back the one the first build wrote"
-    );
-    assert_eq!(
-        (
-            ask(&again, "m.both", &[3, 4]),
-            ask(&again, "m.tagged", &[7]),
-            ask(&again, "m.tagged", &[0])
-        ),
-        first,
-        "the unit read back from the cache does not answer what the one that wrote it did"
-    );
-}
-
 /// Nanoseconds now: a definition whose text carries it is in no earlier process's cache.
 fn nonce() -> u128 {
     std::time::SystemTime::now()
@@ -886,204 +589,6 @@ fn nonce() -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0)
         % 1_000_000_000_000_000
-}
-
-/// Module `m` keyed as a command keys it, on the front end's hashes; `suffix` turns every key, so a
-/// source keyed apart from the others is built cold.
-fn keyed_by_hash(text: &str, suffix: &str) -> &'static ply_codegen::Source {
-    let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
-    let id = ply_eval::SourceId(0);
-    let mut front =
-        ply_codegen::c::producer::checked_analysis(&[("m".to_string(), owned.to_string())], &[id])
-            .expect("checks");
-    for key in front.keys.values_mut() {
-        key.push_str(suffix);
-    }
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
-    Box::leak(Box::new(
-        ply_codegen::Source::from_analysis(front).with_texts(std::collections::HashMap::from([(
-            "m".to_string(),
-            owned.to_string(),
-        )])),
-    ))
-}
-
-/// The unit over every root of `source`, body by body: `produce` never reads a whole unit back.
-fn produced(source: &'static ply_codegen::Source) -> ply_codegen::c::Produced {
-    let names = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let produced = ply_codegen::c::produce(source, &refs).expect("the program emits");
-    assert!(produced.refused.is_empty(), "{:?}", produced.refused);
-    produced
-}
-
-/// `spare`'s nonce makes the second build miss the unit cache and ask body by body.
-#[test]
-fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now_is() {
-    let nonce = nonce();
-    let main = "fn main() -> Int = 1 / 0\n";
-    let moved = format!("fn spare() -> Int = {nonce}\n\n\n{main}");
-    let hashed = |text: &str| keyed_by_hash(text, "");
-    let failure = |source: &'static ply_codegen::Source| -> Option<ply_eval::Span> {
-        let names = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let native = match ply_codegen::c::build(source, &refs) {
-            Ok((native, _)) => native,
-            Err(e) if e.to_string().contains("could not run") => return None,
-            Err(e) => panic!("{e}"),
-        };
-        let entry = native.entry("m.main").expect("`main` was refused");
-        let mut ctx = native.context();
-        ctx.fuel = 10_000;
-        let _ = unsafe { entry(&mut ctx, std::ptr::null()) };
-        assert_ne!(ctx.failed, 0, "`main` divided by zero and answered");
-        let d = ctx.take_failure().expect("a failed entry has a diagnostic");
-        let label = d
-            .labels
-            .iter()
-            .find(|l| l.primary)
-            .expect("a primary label");
-        Some(label.span)
-    };
-    let asked = || ply_codegen::c::producer::with_current(|p| p.counts().0).unwrap_or(0);
-
-    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-    let (first, second) = (hashed(main), hashed(&moved));
-    let key = first.keys.get("m.main").expect("`main` is keyed");
-    assert_eq!(
-        second.keys.get("m.main"),
-        Some(key),
-        "moving `main` changed its key"
-    );
-    let Some(before) = failure(first) else {
-        return;
-    };
-    let asked_before = asked();
-    let Some(after) = failure(second) else {
-        return;
-    };
-    assert_eq!(
-        asked() - asked_before,
-        1,
-        "`main` was emitted again rather than served from the cache"
-    );
-    let shift = moved.find(main).expect("`main` is in the moved text") as u32;
-    assert!(!before.is_dummy(), "the failure names no place");
-    assert_eq!(
-        (after.start, after.end),
-        (before.start + shift, before.end + shift),
-        "the failure is placed where `main` was, not where it is"
-    );
-    assert_eq!(moved[..after.start as usize].matches('\n').count() + 1, 4);
-}
-
-/// The nonce keeps both definitions out of any earlier process's cache.
-#[test]
-fn an_edited_definition_alone_is_asked_of_the_emitter_and_the_unit_is_the_one_a_cold_build_emits() {
-    let nonce = nonce();
-    let program = |k: u128| {
-        let steady = format!("pub fn steady(x: Int) -> Int = x + {nonce}\n");
-        format!("{steady}pub fn changed(x: Int) -> Int = x * {k}\n")
-    };
-
-    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-    let first = produced(keyed_by_hash(&program(nonce + 1), ""));
-    let edited_text = program(nonce + 2);
-    ply_codegen::c::producer::reset_census();
-    let edited = produced(keyed_by_hash(&edited_text, ""));
-    assert_eq!(
-        ply_codegen::c::producer::census().wanted,
-        vec![vec!["m.changed".to_string()]],
-        "the emitter was not entered once, for the edited definition alone"
-    );
-    assert_ne!(first.text, edited.text, "the edit did not reach the unit");
-    let cold = produced(keyed_by_hash(&edited_text, "-cold"));
-    assert_eq!(
-        edited.text, cold.text,
-        "a unit with one body served from the cache is not the one a cold build emits"
-    );
-}
-
-/// `caller`'s C reads only `leaf`'s signature, which a body edit keeps, so its key holds and its
-/// body is served from the cache; the nonce in `caller` keeps it out of an earlier process's.
-#[test]
-fn editing_a_body_asks_the_emitter_for_that_definition_and_not_its_callers() {
-    let nonce = nonce();
-    let program = |k: u128| {
-        format!(
-            "pub fn leaf(x: Int) -> Int = x + {k}\n\
-             pub fn caller(x: Int) -> Int = leaf(x) * 2 + {nonce}\n"
-        )
-    };
-
-    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-    let before = keyed_by_hash(&program(nonce + 1), "");
-    let after = keyed_by_hash(&program(nonce + 2), "");
-    assert_ne!(
-        before.keys.get("m.leaf"),
-        after.keys.get("m.leaf"),
-        "editing `leaf`'s body kept its key"
-    );
-    assert_eq!(
-        before.keys.get("m.caller"),
-        after.keys.get("m.caller"),
-        "editing `leaf`'s body turned `caller`'s key"
-    );
-    let first = produced(before);
-    ply_codegen::c::producer::reset_census();
-    let edited = produced(after);
-    assert_eq!(
-        ply_codegen::c::producer::census().wanted,
-        vec![vec!["m.leaf".to_string()]],
-        "the emitter was not entered once, for `leaf` alone"
-    );
-    assert_ne!(first.text, edited.text, "the edit did not reach the unit");
-    let cold = produced(keyed_by_hash(&program(nonce + 2), "-cold"));
-    assert_eq!(
-        edited.text, cold.text,
-        "a unit with `caller` served from the cache is not the one a cold build emits"
-    );
-}
-
-/// `caller` opens `leaf`'s answer by the kind its signature declares, so a new answer type turns
-/// `caller`'s key too; `len` takes a list of either, so `caller` reads the same both times.
-#[test]
-fn changing_a_signature_asks_the_emitter_for_the_definition_and_its_callers() {
-    let nonce = nonce();
-    let program =
-        |leaf: &str| format!("{leaf}\npub fn caller(x: Int) -> Int = len([leaf(x)]) + {nonce}\n");
-    let as_int = program(&format!("pub fn leaf(x: Int) -> Int = x + {nonce}"));
-    let as_bool = program(&format!("pub fn leaf(x: Int) -> Bool = x > {nonce}"));
-
-    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-    let before = keyed_by_hash(&as_int, "");
-    let after = keyed_by_hash(&as_bool, "");
-    assert_ne!(
-        before.keys.get("m.caller"),
-        after.keys.get("m.caller"),
-        "retyping `leaf` kept `caller`'s key"
-    );
-    let _ = produced(before);
-    ply_codegen::c::producer::reset_census();
-    let retyped = produced(after);
-    let wanted: Vec<Vec<String>> = ply_codegen::c::producer::census()
-        .wanted
-        .into_iter()
-        .map(|mut entry| {
-            entry.sort();
-            entry
-        })
-        .collect();
-    assert_eq!(
-        wanted,
-        vec![vec!["m.caller".to_string(), "m.leaf".to_string()]],
-        "the emitter was not entered once, for `leaf` and its caller"
-    );
-    let cold = produced(keyed_by_hash(&as_bool, "-cold"));
-    assert_eq!(
-        retyped.text, cold.text,
-        "the unit is not the one a cold build emits"
-    );
 }
 
 /// Counted in calls, never timed: whatever a pure nullary root answers, reads ask the runtime for it.
@@ -1102,7 +607,7 @@ pub fn reads_a_bool(n: Int) -> Int =
   fold(range(0, n), 0, |acc: Int, _x: Int| if a_bool() { acc + 1 } else { acc })
 pub fn reads_a_u8(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + int_of_u8(a_u8()))
 "#;
-    let Some((loaded, native)) = tests_support::unit(source) else {
+    let Some((loaded, native)) = fixture::unit(source) else {
         return;
     };
     // An entry's answer and the calls it made; entering a root itself leaves its memo slot alone.
@@ -1172,7 +677,7 @@ fn wide(s: S, x: Int) -> S = {..s, i: s.i + x}
 pub fn with_narrow(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, narrow).i
 pub fn with_wide(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, wide).i
 "#;
-    let Some((loaded, native)) = tests_support::unit(source) else {
+    let Some((loaded, native)) = fixture::unit(source) else {
         return;
     };
     let rounds = 500i64;
@@ -1204,13 +709,7 @@ fn a_helper_answer_handed_to_a_helper_is_not_counted_again() {
     let source = r#"
 pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
 "#;
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let produced = {
-        let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-        ply_codegen::c::produce(loaded, &["m.wrap"]).expect("`wrap` emits")
-    };
+    let produced = produced_of(&[("m", source)]);
     let text = numbering_support::body(
         &produced.text,
         &numbering_support::symbol(&produced, "m.wrap"),
@@ -1243,24 +742,13 @@ mod numbering_support {
     }
 
     /// The C the unit published for `name`; a test reads a symbol rather than spelling one.
-    pub fn symbol(produced: &ply_codegen::c::Produced, name: &str) -> String {
+    pub fn symbol(produced: &super::Produced, name: &str) -> String {
         produced
             .exports
             .taken_by_name(name)
             .unwrap_or_else(|| panic!("the unit does not take `{name}`"))
             .symbol
             .clone()
-    }
-
-    pub fn produce(
-        source: &'static ply_codegen::Source,
-        names: &[String],
-    ) -> ply_codegen::c::Produced {
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
-        let produced = ply_codegen::c::produce(source, &refs).expect("the program emits");
-        assert!(produced.refused.is_empty(), "{:?}", produced.refused);
-        produced
     }
 }
 
@@ -1277,12 +765,8 @@ pub fn named(p: Pair) -> Bytes = if p.left > p.right { b"alpha" } else { b"beta"
         "{base}pub fn zz(xs: List<Int>) -> Bytes = \
          if fold(xs, many(xs), |a: Int, x: Int| a + x) > 0 {{ b\"~tilde\" }} else {{ b\"alpha\" }}\n"
     );
-    let (Some(small), Some(large)) = (tests_support::keyed(base), tests_support::keyed(&grown))
-    else {
-        return;
-    };
-    let small = numbering_support::produce(small, &small.functions());
-    let large = numbering_support::produce(large, &large.functions());
+    let small = produced_of(&[("m", base)]);
+    let large = produced_of(&[("m", &grown)]);
     let kept: std::collections::HashSet<&str> =
         numbering_support::code(&large.text).lines().collect();
     let moved: Vec<&str> = numbering_support::code(&small.text)
@@ -1313,10 +797,7 @@ fn a_constant_two_definitions_share_is_one_entry_of_the_pool() {
 pub fn one(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"one" }
 pub fn two(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"two" }
 "#;
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let produced = numbering_support::produce(loaded, &loaded.functions());
+    let produced = produced_of(&[("m", source)]);
     let shared: Vec<usize> = produced
         .exports
         .consts
@@ -1338,30 +819,6 @@ pub fn two(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"two" }
     }
 }
 
-#[test]
-fn a_unit_is_the_same_bytes_however_its_definitions_are_offered() {
-    let source = r#"
-type Pair = { left: Int, right: Int }
-fn key(x: Int) -> Int = x + 1
-pub fn sum(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
-pub fn pick(p: Pair) -> Bytes = if p.left > p.right { b"left" } else { b"right" }
-pub fn steady() -> Int = 7
-"#;
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let forward = loaded.functions();
-    let mut backward = forward.clone();
-    backward.reverse();
-    assert!(forward.len() > 1 && forward != backward);
-    let first = numbering_support::produce(loaded, &forward);
-    let second = numbering_support::produce(loaded, &backward);
-    assert_eq!(
-        first.text, second.text,
-        "the order the definitions were offered in reached the unit"
-    );
-}
-
 /// The unit is one translation unit that is also a partition: its parts concatenate back to it,
 /// and each body sits once, in the bucket its name alone decides.
 #[test]
@@ -1374,10 +831,7 @@ pub fn pick(p: Pair) -> Bytes = if p.left > p.right { b"left" } else { b"right" 
 pub fn steady() -> Int = 7
 pub fn twice(x: Int) -> Int = key(key(x))
 "#;
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let produced = numbering_support::produce(loaded, &loaded.functions());
+    let produced = produced_of(&[("m", source)]);
     let parts = split(&produced.text).expect("the unit splits on its marks");
     let joined: String = std::iter::once(parts.header)
         .chain(parts.buckets.iter().map(|(_, text)| *text))
@@ -1393,7 +847,7 @@ pub fn twice(x: Int) -> Int = key(key(x))
     for (id, _) in &parts.buckets {
         assert!(u64::from(*id) < BUCKETS);
     }
-    for name in loaded.functions() {
+    for name in produced.exports.taken.iter().map(|t| t.name.clone()) {
         let definition = format!(
             "Word {}(PlyCtx *ctx",
             numbering_support::symbol(&produced, &name)
@@ -1434,16 +888,17 @@ fn editing_one_body_compiles_its_bucket_alone_and_links_the_rest_from_the_cache(
              pub fn {edited}(x: Int) -> Int = x * {k}\n"
         )
     };
+    // Answered before the cache moves, so the builder's own objects stay where they are.
+    let (three, five) = (
+        fixture::answered(&[("m", &program(3))]),
+        fixture::answered(&[("m", &program(5))]),
+    );
     in_own_cache(|cache| {
-        // Emitted first, so the emitter this thread builds for it lands its own objects in this
-        // cache before the counts are taken, and the unit says how many parts a cold build
-        // compiles.
-        let unit = produced(keyed_by_hash(&program(3), ""));
-        let parts = split(&unit.text).expect("the unit splits on its marks");
+        let parts = split(&three.unit).expect("the unit splits on its marks");
         assert_eq!(parts.buckets.len(), 2, "two names in two buckets");
         let expected = parts.buckets.len() + 1;
         let (cold_compiled, cold_objects) = (compiled(), objects(cache));
-        let Some(first) = built(&program(3)) else {
+        let Some((_, first, _)) = fixture::load(three) else {
             return;
         };
         assert_eq!(
@@ -1452,7 +907,7 @@ fn editing_one_body_compiles_its_bucket_alone_and_links_the_rest_from_the_cache(
             "a cold build compiles every bucket and the runtime's object"
         );
         let (before_compiled, before_objects) = (compiled(), objects(cache));
-        let second = built(&program(5)).expect("the compiler ran once already");
+        let (_, second, _) = fixture::load(five).expect("the compiler ran once already");
         assert_eq!(
             (
                 compiled() - before_compiled,
@@ -1485,8 +940,12 @@ fn adding_a_definition_compiles_its_bucket_and_the_runtime_object_alone() {
     let added = apart_from_steady();
     let base = format!("pub fn steady(x: Int) -> Int = x + {nonce}\n");
     let grown = format!("{base}pub fn {added}(x: Int) -> Int = x * 3\n");
+    let (small, large) = (
+        fixture::answered(&[("m", &base)]),
+        fixture::answered(&[("m", &grown)]),
+    );
     in_own_cache(|cache| {
-        let steadys = |unit: &ply_codegen::c::Produced| -> String {
+        let steadys = |unit: &Produced| -> String {
             let parts = split(&unit.text).expect("the unit splits on its marks");
             parts
                 .buckets
@@ -1495,18 +954,16 @@ fn adding_a_definition_compiles_its_bucket_and_the_runtime_object_alone() {
                 .map(|(_, text)| text.to_string())
                 .expect("`steady` has a bucket")
         };
-        let small = produced(keyed_by_hash(&base, ""));
-        let large = produced(keyed_by_hash(&grown, ""));
         assert_eq!(
-            steadys(&small),
-            steadys(&large),
+            steadys(&Produced::of(&small)),
+            steadys(&Produced::of(&large)),
             "adding `{added}` changed the bucket holding `steady`"
         );
-        let Some(first) = built(&base) else {
+        let Some((_, first, _)) = fixture::load(small) else {
             return;
         };
         let before = (compiled(), reused(), objects(cache));
-        let second = built(&grown).expect("the compiler ran once already");
+        let (_, second, _) = fixture::load(large).expect("the compiler ran once already");
         assert_eq!(
             (
                 compiled() - before.0,
@@ -1540,7 +997,7 @@ fn apart_from_steady() -> &'static str {
 /// count every build in the process.
 fn in_own_cache(test: impl FnOnce(&std::path::Path)) {
     let dir = tempfile::tempdir().expect("a scratch directory");
-    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let _config = fixture::CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let restore = std::env::var("PLY_C_CACHE").ok();
     unsafe { std::env::set_var("PLY_C_CACHE", dir.path()) };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(dir.path())));
@@ -1556,11 +1013,11 @@ fn in_own_cache(test: impl FnOnce(&std::path::Path)) {
 }
 
 fn compiled() -> usize {
-    ply_codegen::c::cache::BUCKETS_COMPILED.load(std::sync::atomic::Ordering::Relaxed)
+    ply_codegen::c::BUCKETS_COMPILED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn reused() -> usize {
-    ply_codegen::c::cache::BUCKETS_REUSED.load(std::sync::atomic::Ordering::Relaxed)
+    ply_codegen::c::BUCKETS_REUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The objects under `cache`'s `obj/`.
@@ -1575,21 +1032,6 @@ fn objects(cache: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Module `m` built over every root of `text`, or nothing where no C compiler runs.
-fn built(text: &str) -> Option<Native> {
-    let source = keyed_by_hash(text, "");
-    let names = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    match ply_codegen::c::build(source, &refs) {
-        Ok((native, refused)) => {
-            assert!(refused.is_empty(), "{refused:?}");
-            Some(native)
-        }
-        Err(e) if e.to_string().contains("could not run") => None,
-        Err(e) => panic!("{e}"),
-    }
-}
-
 fn answer(native: &Native, name: &str, x: i64) -> i64 {
     let entry: ply_codegen::rt::Entry = native.entry(name).expect("compiled");
     let mut ctx = native.context();
@@ -1600,32 +1042,15 @@ fn answer(native: &Native, name: &str, x: i64) -> i64 {
     ply_codegen::heap::imm_value(w)
 }
 
-/// Several modules of one program, keyed as a command keys them.
-fn keyed_modules(modules: &[(&str, &str)]) -> &'static ply_codegen::Source {
-    let owned: Vec<(String, String)> = modules
-        .iter()
-        .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
-        .collect();
-    let ids: Vec<ply_eval::SourceId> = (0..owned.len())
-        .map(|i| ply_eval::SourceId(i as u32))
-        .collect();
-    let front = ply_codegen::c::producer::checked_analysis(&owned, &ids).expect("checks");
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
-    Box::leak(Box::new(
-        ply_codegen::Source::from_analysis(front).with_texts(owned.into_iter().collect()),
-    ))
-}
-
 /// A module's name is its path, so `m_a/b.ply` and `m/a_b.ply` are a program apart; a symbol that
 /// turned a dot into `_` spelled both of them `ply_m_a_b`, and the unit held one definition of it.
 #[test]
 fn two_definitions_a_dot_apart_answer_as_themselves() {
-    let source = keyed_modules(&[
+    let made = fixture::answered(&[
         ("m_a", "pub fn b(x: Int) -> Int = x + 1\n"),
         ("m", "pub fn a_b(x: Int) -> Int = x + 2\n"),
     ]);
-    let names = source.functions();
-    let produced = numbering_support::produce(source, &names);
+    let produced = Produced::of(&made);
     let apart = produced
         .exports
         .taken_by_name("m_a.b")
@@ -1638,14 +1063,8 @@ fn two_definitions_a_dot_apart_answer_as_themselves() {
         apart.symbol, together.symbol,
         "`m_a.b` and `m.a_b` are emitted as one C function"
     );
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = {
-        let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-        match ply_codegen::c::build(source, &refs) {
-            Ok(built) => built,
-            Err(e) if e.to_string().contains("could not run") => return,
-            Err(e) => panic!("{e}"),
-        }
+    let Some((_, native, refused)) = fixture::loaded(made) else {
+        return;
     };
     assert!(refused.is_empty(), "{refused:?}");
     assert_eq!(answer(&native, "m_a.b", 10), 11);
@@ -1656,7 +1075,7 @@ fn two_definitions_a_dot_apart_answer_as_themselves() {
 /// defines, and no two definitions may share one.
 #[test]
 fn a_unit_publishes_the_symbols_its_c_defines() {
-    let source = keyed_modules(&[
+    let produced = produced_of(&[
         ("m_a", "pub fn b(x: Int) -> Int = x + 1\n"),
         (
             "m",
@@ -1669,7 +1088,6 @@ pub fn steady() -> Int = 7
 "#,
         ),
     ]);
-    let produced = numbering_support::produce(source, &source.functions());
     let code = numbering_support::code(&produced.text);
     let mut spelled: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for taken in &produced.exports.taken {
@@ -1709,10 +1127,7 @@ fn ping(n: Int, acc: Int) -> Int = if n == 0 { acc } else { pong(n - 1, acc + 1)
 fn pong(n: Int, acc: Int) -> Int = if n == 0 { acc } else { ping(n - 1, acc + 2) }
 pub fn volley(n: Int) -> Int = ping(n, 0)
 "#;
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let produced = numbering_support::produce(loaded, &loaded.functions());
+    let produced = produced_of(&[("m", source)]);
     let parts = split(&produced.text).expect("the unit splits on its marks");
     let group = ["m.ping", "m.pong"]
         .into_iter()
@@ -1800,7 +1215,7 @@ pub fn {caller}(x: Int) -> Int =
   handle {{ relay[conn](x) }} with {{ net.send[conn](p) -> p + 1 }}
 "#
     );
-    let emitted = produced(keyed_by_hash(&source, ""));
+    let emitted = produced_of(&[("m", &source)]);
     let relay = emitted
         .exports
         .taken_by_name("m.relay")
@@ -1859,7 +1274,7 @@ fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
 fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
 pub fn parity(n: Int) -> Bool = even(n)
 "#;
-    let Some((loaded, native)) = tests_support::unit(source) else {
+    let Some((loaded, native)) = fixture::unit(source) else {
         return;
     };
     let answer = |name: &str, n: i64| -> ply_codegen::heap::Word {
@@ -1898,11 +1313,10 @@ pub fn down(k: Int) -> Int = countdown(4611686018427387904, k)
 pub fn toggled(k: Int) -> Bool = flip(true, k)
 pub fn narrowed(k: Int) -> U32 = narrow(7u32, k)
 "#;
-    let Some((loaded, native)) = tests_support::unit(source) else {
+    let Some((_, native)) = fixture::unit(source) else {
         return;
     };
-    let names = loaded.functions();
-    let produced = numbering_support::produce(loaded, &names);
+    let produced = produced_of(&[("m", source)]);
     let code = numbering_support::code(&produced.text);
     // Every prologue conversion -- `Int`, `Bool` and a sized integer alike -- leaves a raw word the
     // loop no longer reads, and each is released once, on the way out.
@@ -1953,11 +1367,7 @@ fn a_recursive_group_holding_a_handle_is_emitted_per_definition() {
 fn a(n: Int) -> Int / {clock.now} = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> Instant(7), } } else { b(n - 1) }
 fn b(n: Int) -> Int / {clock.now} = if n == 0 { match clock.now() { Instant(t) -> t } } else { a(n - 1) }
 "#;
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let names = loaded.functions();
-    let produced = numbering_support::produce(loaded, &names);
+    let produced = produced_of(&[("m", source)]);
     let code = numbering_support::code(&produced.text);
     assert!(
         !code.contains("_group(PlyCtx *ctx, int which"),
@@ -1966,10 +1376,8 @@ fn b(n: Int) -> Int / {clock.now} = if n == 0 { match clock.now() { Instant(t) -
     for name in ["m.a", "m.b"] {
         let _ = numbering_support::body(code, &numbering_support::symbol(&produced, name));
     }
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = {
-        let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-        ply_codegen::c::build(loaded, &refs).expect("builds")
+    let Some((_, native, refused)) = fixture::with_refusals(source) else {
+        return;
     };
     assert!(refused.is_empty(), "{refused:?}");
     let entry: ply_codegen::rt::Entry = native.entry("m.a").expect("`a` was not compiled");
@@ -1979,44 +1387,6 @@ fn b(n: Int) -> Int / {clock.now} = if n == 0 { match clock.now() { Instant(t) -
     let w = unsafe { entry(&mut ctx, args.as_ptr()) };
     assert_eq!(ctx.failed, 0, "`a` raised");
     assert_eq!(ply_codegen::heap::imm_value(w), 7);
-}
-
-/// A group's body serves every member and is placed once; the second build reads it from the
-/// cache under each member's key.
-#[test]
-fn a_unit_holding_a_group_is_the_same_bytes_however_its_definitions_are_offered() {
-    let source = r#"
-fn ping(n: Int, acc: Int) -> Int = if n == 0 { acc } else { pong(n - 1, acc + 1) }
-fn pong(n: Int, acc: Int) -> Int = if n == 0 { acc } else { ping(n - 1, acc + 2) }
-pub fn volley(n: Int) -> Int = ping(n, 0)
-pub fn steady() -> Int = 7
-"#;
-    let Some(loaded) = tests_support::keyed(source) else {
-        return;
-    };
-    let forward = loaded.functions();
-    let mut backward = forward.clone();
-    backward.reverse();
-    let first = numbering_support::produce(loaded, &forward);
-    let second = numbering_support::produce(loaded, &backward);
-    assert_eq!(
-        first.text, second.text,
-        "the order the definitions were offered in reached the unit"
-    );
-    let code = numbering_support::code(&first.text);
-    assert_eq!(
-        code.matches("_group(PlyCtx *ctx, int which").count(),
-        1,
-        "the group's body is placed once:\n{code}"
-    );
-    assert_eq!(
-        code.matches("goto ply_loop;").count(),
-        2,
-        "each member's tail call into the group jumps:\n{code}"
-    );
-    for name in ["m.ping", "m.pong", "m.volley"] {
-        let _ = numbering_support::body(code, &numbering_support::symbol(&first, name));
-    }
 }
 
 /// A pure computation whose value is only observed is still run. `observe` goes through a helper
@@ -2033,7 +1403,7 @@ fn bench(n: Int) -> Int = {
   0
 }
 "#;
-    let Some((_source, native)) = tests_support::unit(SOURCE) else {
+    let Some((_source, native)) = fixture::unit(SOURCE) else {
         return;
     };
     let entry: ply_codegen::rt::Entry = native.entry("m.bench").expect("`m.bench` compiled");

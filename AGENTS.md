@@ -38,17 +38,19 @@ enters to build `ply` itself. The Rust crates are the runtime and the launcher.
   touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
 - The CLI's tests are the Ply package `crates/ply-cli-tests/ply`; `.github/ci-corpus.sh run
   cli-<module>` runs one module with the grants CI gives it.
-- CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its solo and gate tables and cuts
+- CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its gate tables and cuts
   the nextest shards and the corpus partitions from the durations CI measured.
 - Never commit `crates/ply-compiler/bootstrap`, `crates/ply-cli/bootstrap` or
-  `crates/ply-codegen-tests/fixtures/goldens` in a pull request: CI regenerates all three on
-  `main` after each merge (the `refresh` job), and a pull request's sources are built by the
-  checked-in builder, which first builds the pull request's own. A golden that moved is listed in
-  the nextest job's summary; read it, since nothing fails on it.
+  `crates/ply-cli-tests/goldens` in a pull request: CI regenerates all three on `main` after each
+  merge (the `refresh` job), and a pull request's sources are built by the checked-in builder,
+  which first builds the pull request's own. The CLI suite's `goldens` module writes the goldens,
+  and a golden that moved is listed in the summary of the `lanes` job that ran it; read it, since
+  nothing fails on it.
 - The builder carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
   project's are (`grep '^import std' crates/ply-compiler/ply/*.ply` and what those import), so
   only those cannot use a language rule the same pull request introduces. The rest of
-  `crates/ply-std/ply` can.
+  `crates/ply-std/ply` can. The runtime reads the front end's answer the committed builder wrote,
+  so a field it comes to require of one lands after main's builder writes it.
 - `crates/ply-cli` is the CLI as a Ply program plus the runnable `ply bootstrap` makes of it
   (`bootstrap/ply.run`); it is not a cargo crate. The `refresh` job rebuilds both runnables on
   main by driving the released binary, so the checkout can rebuild itself without cargo.

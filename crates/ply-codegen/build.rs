@@ -1,27 +1,22 @@
 //! Two digests of the runtime. `PLY_RUNTIME_DIGEST` is every file under `src/` of this crate and of
-//! the workspace crates it links: what a body Rust emits and an answer Rust asks of the compiler are
-//! a function of, since all of it can run while they are made. `PLY_SEMANTICS_DIGEST` leaves out
-//! the files that only compile, keep, sweep and load C, and Rust's own asking of the compiler: what
-//! an answer the program's own emitter gives, running inside a loaded unit, is a function of.
-//! `ply-std` and `ply-compiler` are left out of both: what they hold is Ply sources and the bundle,
-//! which a body's key already names through its definition's key and the emitter's identity.
+//! the workspace crates it links. `PLY_SEMANTICS_DIGEST` leaves out the files that only compile,
+//! keep, sweep and load C and read the compiler's answers: what an answer the program's own
+//! emitter gives, running inside a loaded unit, is a function of. `ply-std` and `ply-compiler` are
+//! left out of both: what they hold is Ply sources and the builder, which a body's key already
+//! names through its definition's key and the emitter's identity.
 
 use std::path::{Path, PathBuf};
 
 const CRATES: &[&str] = &["ply-codegen", "ply-eval"];
 
-/// Under `crates/`: how C is compiled, kept and swept, and how Rust asks the compiler for an answer.
-/// None of it runs while a loaded unit computes.
+/// Under `crates/`: how C is compiled, kept and swept, and how the compiler's answer is read. None
+/// of it runs while a loaded unit computes.
 const OUTSIDE_SEMANTICS: &[&str] = &[
-    "ply-codegen/src/c/answers.rs",
-    "ply-codegen/src/c/bundle.rs",
-    "ply-codegen/src/c/cache.rs",
     "ply-codegen/src/c/dump.rs",
     "ply-codegen/src/c/load.rs",
-    "ply-codegen/src/c/producer.rs",
+    "ply-codegen/src/c/stage.rs",
     "ply-codegen/src/c/sweep.rs",
     "ply-codegen/src/c/toolchain.rs",
-    "ply-codegen/src/c/upgrade.rs",
     "ply-codegen/src/source.rs",
 ];
 
