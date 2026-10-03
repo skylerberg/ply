@@ -7,33 +7,33 @@ use std::sync::Arc;
 
 /// `Int` signatures over bodies that compute in widths, as `std.hash` does.
 const WIDTHS: &str = r#"
-fn add_u8(a: Int, b: Int) -> Int = int_of_u8(u8_of_int(a) + u8_of_int(b))
-fn wrap_u8(a: Int, b: Int) -> Int = int_of_u8(wrap_add(u8_of_int(a), u8_of_int(b)))
-fn wrap_u32(a: Int, b: Int) -> Int = int_of_u32(wrap_add(u32_of_int(a), u32_of_int(b)))
-fn mul_u16(a: Int, b: Int) -> Int = int_of_u16(u16_of_int(a) * u16_of_int(b))
-fn div_i8(a: Int, b: Int) -> Int = int_of_i8(i8_of_int(a) / i8_of_int(b))
-fn rem_u32(a: Int, b: Int) -> Int = int_of_u32(u32_of_int(a) % u32_of_int(b))
-fn neg_i16(a: Int) -> Int = int_of_i16(-i16_of_int(a))
+fn add_u8(a: Int, b: Int) -> Int / {abort.raise} = int_of_u8(u8_of_int(a) + u8_of_int(b))
+fn wrap_u8(a: Int, b: Int) -> Int / {abort.raise} = int_of_u8(wrap_add(u8_of_int(a), u8_of_int(b)))
+fn wrap_u32(a: Int, b: Int) -> Int / {abort.raise} = int_of_u32(wrap_add(u32_of_int(a), u32_of_int(b)))
+fn mul_u16(a: Int, b: Int) -> Int / {abort.raise} = int_of_u16(u16_of_int(a) * u16_of_int(b))
+fn div_i8(a: Int, b: Int) -> Int / {abort.raise} = int_of_i8(i8_of_int(a) / i8_of_int(b))
+fn rem_u32(a: Int, b: Int) -> Int / {abort.raise} = int_of_u32(u32_of_int(a) % u32_of_int(b))
+fn neg_i16(a: Int) -> Int / {abort.raise} = int_of_i16(-i16_of_int(a))
 
-fn xor_u32(a: Int, b: Int) -> Int = int_of_u32(u32_of_int(a) ^ u32_of_int(b))
-fn not_u8(a: Int) -> Int = int_of_u8(~u8_of_int(a))
-fn shl_u8(a: Int, n: Int) -> Int = int_of_u8(u8_of_int(a) << n)
-fn shr_i8(a: Int, n: Int) -> Int = int_of_i8(i8_of_int(a) >> n)
-fn ushr_i8(a: Int, n: Int) -> Int = int_of_i8(i8_of_int(a) >>> n)
-fn rotr_u32(a: Int, n: Int) -> Int = int_of_u32(rotr(u32_of_int(a), n))
-fn rotr_u8(a: Int, n: Int) -> Int = int_of_u8(rotr(u8_of_int(a), n))
+fn xor_u32(a: Int, b: Int) -> Int / {abort.raise} = int_of_u32(u32_of_int(a) ^ u32_of_int(b))
+fn not_u8(a: Int) -> Int / {abort.raise} = int_of_u8(~u8_of_int(a))
+fn shl_u8(a: Int, n: Int) -> Int / {abort.raise} = int_of_u8(u8_of_int(a) << n)
+fn shr_i8(a: Int, n: Int) -> Int / {abort.raise} = int_of_i8(i8_of_int(a) >> n)
+fn ushr_i8(a: Int, n: Int) -> Int / {abort.raise} = int_of_i8(i8_of_int(a) >>> n)
+fn rotr_u32(a: Int, n: Int) -> Int / {abort.raise} = int_of_u32(rotr(u32_of_int(a), n))
+fn rotr_u8(a: Int, n: Int) -> Int / {abort.raise} = int_of_u8(rotr(u8_of_int(a), n))
 
-fn lt_u8(a: Int, b: Int) -> Bool = u8_of_int(a) < u8_of_int(b)
-fn lt_i8(a: Int, b: Int) -> Bool = i8_of_int(a) < i8_of_int(b)
-fn eq_u32(a: Int, b: Int) -> Bool = u32_of_int(a) == u32_of_int(b)
+fn lt_u8(a: Int, b: Int) -> Bool / {abort.raise} = u8_of_int(a) < u8_of_int(b)
+fn lt_i8(a: Int, b: Int) -> Bool / {abort.raise} = i8_of_int(a) < i8_of_int(b)
+fn eq_u32(a: Int, b: Int) -> Bool / {abort.raise} = u32_of_int(a) == u32_of_int(b)
 
 fn from_literal() -> Int = int_of_u32(0x6A09_E667u32)
-fn literal_arithmetic(a: Int) -> Int = int_of_u8(wrap_add(u8_of_int(a), 200u8))
+fn literal_arithmetic(a: Int) -> Int / {abort.raise} = int_of_u8(wrap_add(u8_of_int(a), 200u8))
 
 // `bytes_u32_le` over bytes whose kind the emitter cannot see: a value bound by a pattern,
 // whose type the emitter does not read. The read goes through the runtime rather than an
 // inline load.
-fn first_word(x: Bytes) -> Int = match [x] { [b, ..] -> int_of_u32(bytes_u32_le(b, 0)), [] -> 0 }
+fn first_word(x: Bytes) -> Int / {abort.raise} = match [x] { [b, ..] -> int_of_u32(bytes_u32_le(b, 0)), [] -> 0 }
 
 // A record whose fields are `U32`, which is the shape the integer kernel threads through a round:
 // the widths are held in the fields and the seam never sees one.
@@ -47,7 +47,7 @@ fn quarter(q: Quad, mx: U32) -> Quad = {
   {a: a1, b: b1, c: c1, d: d1}
 }
 
-fn round_trip(seed: Int) -> Int = {
+fn round_trip(seed: Int) -> Int / {abort.raise} = {
   let w = u32_of_int(seed);
   let q = quarter({a: w, b: wrap_add(w, 1u32), c: 0x3C6E_F372u32, d: 0xA54F_F53Au32}, w);
   int_of_u32(q.a ^ q.b ^ q.c ^ q.d)
@@ -64,7 +64,7 @@ fn flags(i: Int, last: Bool, is_root: Bool) -> Int =
     | (if last && is_root { 8u32 } else { 0u32 }))
 
 // A loop over the widths, so the fused-loop path carries them too.
-fn mixed(n: Int) -> Int =
+fn mixed(n: Int) -> Int / {abort.raise} =
   int_of_u32(fold(range(0, n), 0u32, |acc: U32, i: Int| rotr(acc ^ u32_of_int(i), 7)))
 "#;
 
@@ -74,17 +74,17 @@ type Byte = | Byte(U8)
 type Word = { w: U32 }
 type Sample = { level: I16, label: String }
 
-fn narrows(n: Int) -> U32 requires n >= 0 ensures int_of_u32(result) == n = u32_of_int(n)
+fn narrows(n: Int) -> U32 / {abort.raise} requires n >= 0 ensures int_of_u32(result) == n = u32_of_int(n)
 fn widens(w: U32) -> Int requires int_of_u32(w) > 0 = int_of_u32(w)
-fn boxed(n: Int) -> Word = {w: u32_of_int(n)}
+fn boxed(n: Int) -> Word / {abort.raise} = {w: u32_of_int(n)}
 law "no word is seven" forall (w: U32) { int_of_u32(w) != 7 }
 
 fn negated(b: I8) -> I8 = -b
 fn doubled(w: U32) -> U32 = wrap_add(w, w)
 fn flipped(w: U64) -> U64 = w ^ 1u64
-fn bytes(n: Int) -> List<U8> = map(range(0, n), |i: Int| u8_of_int(i * 100 % 256))
+fn bytes(n: Int) -> List<U8> / {abort.raise} = map(range(0, n), |i: Int| u8_of_int(i * 100 % 256))
 fn summed(xs: List<U8>) -> Int = fold(xs, 0, |acc: Int, x: U8| acc + int_of_u8(x))
-fn sample(n: Int) -> Sample = {level: i16_of_int(n), label: "s"}
+fn sample(n: Int) -> Sample / {abort.raise} = {level: i16_of_int(n), label: "s"}
 fn level(s: Sample) -> I16 = s.level
 fn wrap(b: U8) -> Byte = Byte(b)
 fn unwrap(b: Byte) -> U8 = match b { Byte(x) -> x }
@@ -94,7 +94,7 @@ fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None
 fn made<a>(make: () -> a) -> a = make()
 fn applied<a, b>(f: (a) -> b, x: a) -> b = f(x)
 fn total<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)
-fn halved<a>(x: a) -> a where integer(a) = x / numeric_of_int(2)
+fn halved<a>(x: a) -> a / {abort.raise} where integer(a) = x / numeric_of_int(2)
 "#;
 
 #[test]
@@ -523,21 +523,21 @@ fn binders() -> String {
             "
 type Pair{ty} = | Pair{ty}({ty}, {ty})
 fn listed_{t}(xs: List<{ty}>, op: Int) -> Int = match xs {{ [a, b, ..] -> {op}, _ -> 0 }}
-fn list_{t}(x: Int, y: Int, op: Int) -> Int = listed_{t}([{t}_of_int(x), {t}_of_int(y)], op)
+fn list_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = listed_{t}([{t}_of_int(x), {t}_of_int(y)], op)
 fn tupled_{t}(p: ({ty}, {ty}), op: Int) -> Int = match p {{ (a, b) -> {op} }}
-fn tuple_{t}(x: Int, y: Int, op: Int) -> Int = tupled_{t}(({t}_of_int(x), {t}_of_int(y)), op)
+fn tuple_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = tupled_{t}(({t}_of_int(x), {t}_of_int(y)), op)
 fn fielded_{t}(r: {{ left: {ty}, right: {ty} }}, op: Int) -> Int = match r {{ {{ left: a, right: b }} -> {op} }}
-fn field_{t}(x: Int, y: Int, op: Int) -> Int = fielded_{t}({{ left: {t}_of_int(x), right: {t}_of_int(y) }}, op)
+fn field_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = fielded_{t}({{ left: {t}_of_int(x), right: {t}_of_int(y) }}, op)
 fn constructed_{t}(p: Pair{ty}, op: Int) -> Int = match p {{ Pair{ty}(a, b) -> {op} }}
-fn ctor_{t}(x: Int, y: Int, op: Int) -> Int = constructed_{t}(Pair{ty}({t}_of_int(x), {t}_of_int(y)), op)
-fn answered_{t}(f: (Int) -> {ty}, x: Int, y: Int, op: Int) -> Int = {{ let a = f(x); let b = f(y); {op} }}
-fn answer_{t}(x: Int, y: Int, op: Int) -> Int = answered_{t}(|n: Int| {t}_of_int(n), x, y, op)
+fn ctor_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = constructed_{t}(Pair{ty}({t}_of_int(x), {t}_of_int(y)), op)
+fn answered_{t}(f: (Int) -> {ty} / {{abort.raise}}, x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = {{ let a = f(x); let b = f(y); {op} }}
+fn answer_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = answered_{t}(|n: Int| {t}_of_int(n), x, y, op)
 fn captured_{t}(a: {ty}, b: {ty}, op: Int) -> Int = {{ let f = |k: Int| {k}; f(op) }}
-fn capture_{t}(x: Int, y: Int, op: Int) -> Int = captured_{t}({t}_of_int(x), {t}_of_int(y), op)
-fn chosen_{t}(xs: List<{ty}>, op: Int) -> Int = {{ let a = nth(xs, 0, {t}_of_int(0)); let b = nth(xs, 1, {t}_of_int(0)); {op} }}
-fn generic_{t}(x: Int, y: Int, op: Int) -> Int = chosen_{t}([{t}_of_int(x), {t}_of_int(y)], op)
+fn capture_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = captured_{t}({t}_of_int(x), {t}_of_int(y), op)
+fn chosen_{t}(xs: List<{ty}>, op: Int) -> Int / {{abort.raise}} = {{ let a = nth(xs, 0, {t}_of_int(0)); let b = nth(xs, 1, {t}_of_int(0)); {op} }}
+fn generic_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = chosen_{t}([{t}_of_int(x), {t}_of_int(y)], op)
 fn valued_{t}(m: Map<Int, {ty}>, op: Int) -> Int = match map_get(m, 0) {{ Some(a) -> match map_get(m, 1) {{ Some(b) -> {op}, None -> 0 }}, None -> 0 }}
-fn map_{t}(x: Int, y: Int, op: Int) -> Int = valued_{t}(map_insert(map_insert(map_new(), 0, {t}_of_int(x)), 1, {t}_of_int(y)), op)
+fn map_{t}(x: Int, y: Int, op: Int) -> Int / {{abort.raise}} = valued_{t}(map_insert(map_insert(map_new(), 0, {t}_of_int(x)), 1, {t}_of_int(y)), op)
 "
         ));
     }
@@ -579,21 +579,21 @@ fn a_width_is_read_at_its_type_through_every_binder() {
 /// The comparisons, shifts, bit operators, negation and division over bound widths; the 64-bit
 /// widths, which are the runtime's own words; and width builtins passed as values.
 const WORDS: &str = r#"
-fn lt_i8(x: Int, y: Int) -> Bool = match [i8_of_int(x), i8_of_int(y)] { [a, b] -> a < b, _ -> false }
-fn ge_u32(x: Int, y: Int) -> Bool = match [u32_of_int(x), u32_of_int(y)] { [a, b] -> a >= b, _ -> false }
-fn shl_u8(x: Int, n: Int) -> Int = match [u8_of_int(x)] { [a] -> int_of_u8(a << n), _ -> 0 }
-fn ushr_i8(x: Int, n: Int) -> Int = match [i8_of_int(x)] { [a] -> int_of_i8(a >>> n), _ -> 0 }
-fn not_u8(x: Int) -> Int = match [u8_of_int(x)] { [a] -> int_of_u8(~a), _ -> 0 }
-fn neg_i8(x: Int) -> Int = match [i8_of_int(x)] { [a] -> int_of_i8(-a), _ -> 0 }
-fn div_i8(x: Int, y: Int) -> Int = match [i8_of_int(x), i8_of_int(y)] { [a, b] -> int_of_i8(a / b), _ -> 0 }
-fn rotr_u8(x: Int, n: Int) -> Int = match [u8_of_int(x)] { [a] -> int_of_u8(rotr(a, n)), _ -> 0 }
-fn shl_u64(x: Int, n: Int) -> Int = match [u64_of_int(x)] { [a] -> int_of_u64(a << n), _ -> 0 }
-fn ushr_i64(x: Int, n: Int) -> Int = match [i64_of_int(x)] { [a] -> int_of_i64(a >>> n), _ -> 0 }
-fn not_i64(x: Int) -> Int = match [i64_of_int(x)] { [a] -> int_of_i64(~a), _ -> 0 }
+fn lt_i8(x: Int, y: Int) -> Bool / {abort.raise} = match [i8_of_int(x), i8_of_int(y)] { [a, b] -> a < b, _ -> false }
+fn ge_u32(x: Int, y: Int) -> Bool / {abort.raise} = match [u32_of_int(x), u32_of_int(y)] { [a, b] -> a >= b, _ -> false }
+fn shl_u8(x: Int, n: Int) -> Int / {abort.raise} = match [u8_of_int(x)] { [a] -> int_of_u8(a << n), _ -> 0 }
+fn ushr_i8(x: Int, n: Int) -> Int / {abort.raise} = match [i8_of_int(x)] { [a] -> int_of_i8(a >>> n), _ -> 0 }
+fn not_u8(x: Int) -> Int / {abort.raise} = match [u8_of_int(x)] { [a] -> int_of_u8(~a), _ -> 0 }
+fn neg_i8(x: Int) -> Int / {abort.raise} = match [i8_of_int(x)] { [a] -> int_of_i8(-a), _ -> 0 }
+fn div_i8(x: Int, y: Int) -> Int / {abort.raise} = match [i8_of_int(x), i8_of_int(y)] { [a, b] -> int_of_i8(a / b), _ -> 0 }
+fn rotr_u8(x: Int, n: Int) -> Int / {abort.raise} = match [u8_of_int(x)] { [a] -> int_of_u8(rotr(a, n)), _ -> 0 }
+fn shl_u64(x: Int, n: Int) -> Int / {abort.raise} = match [u64_of_int(x)] { [a] -> int_of_u64(a << n), _ -> 0 }
+fn ushr_i64(x: Int, n: Int) -> Int / {abort.raise} = match [i64_of_int(x)] { [a] -> int_of_i64(a >>> n), _ -> 0 }
+fn not_i64(x: Int) -> Int / {abort.raise} = match [i64_of_int(x)] { [a] -> int_of_i64(~a), _ -> 0 }
 fn shifted(w: U64, n: Int) -> U64 = w << n
-fn shl_u64_param(x: Int, n: Int) -> Int = int_of_u64(shifted(u64_of_int(x), n))
-fn folded_u8(x: Int, y: Int) -> Int = int_of_u8(fold([u8_of_int(x), u8_of_int(y)], 0u8, wrap_add))
-fn narrowed(x: Int) -> Int = fold(map(map([x], u8_of_int), int_of_u8), 0, |acc: Int, v: Int| acc + v)
+fn shl_u64_param(x: Int, n: Int) -> Int / {abort.raise} = int_of_u64(shifted(u64_of_int(x), n))
+fn folded_u8(x: Int, y: Int) -> Int / {abort.raise} = int_of_u8(fold([u8_of_int(x), u8_of_int(y)], 0u8, wrap_add))
+fn narrowed(x: Int) -> Int / {abort.raise} = fold(map(map([x], u8_of_int), int_of_u8), 0, |acc: Int, v: Int| acc + v)
 fn folded_int(x: Int, y: Int) -> Int = fold([x, y], 0, wrap_add)
 "#;
 
