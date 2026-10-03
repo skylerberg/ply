@@ -114,14 +114,14 @@ fn a_region_in_a_law_body_reports_its_escape() {
 fn a_cell_handed_to_a_task_the_region_outlives_is_refused_statically() {
     for src in [
         r#"
-pub fn attack() -> Int = simulate {
+pub fn attack() -> Int / {sim.read} = simulate {
   { let t = with_cell[s](11) { c -> task.spawn(|| cell_get(c)) };
     task.join(t) }
 }
 "#,
         // A join inside the region does not license it: no type records the join.
         r#"
-pub fn attack() -> Int = simulate {
+pub fn attack() -> Int / {sim.read} = simulate {
   with_cell[s](11) { c -> { let t = task.spawn(|| cell_get(c)); task.join(t) } }
 }
 "#,
@@ -141,7 +141,7 @@ pub fn attack() -> Int = simulate {
     // The remedy: a scheduler opened inside the region cannot outlive the cell.
     Compiled::new(
         r#"
-pub fn guarded() -> Int =
+pub fn guarded() -> Int / {sim.read} =
   with_cell[s](11) { c -> simulate { task.join(task.spawn(|| cell_get(c))) } }
 "#,
     );

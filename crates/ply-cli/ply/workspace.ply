@@ -1,0 +1,131 @@
+// `--workspace`: a run of the package at a path and of every package it reaches by a path
+// dependency, each as its own root with its own cache, dependencies first, reported together. A
+// fetched or vendored dependency is another project's to run.
+
+import compiler.pkg (Package, closure)
+import compiler.resolve (Source)
+import sources (Project, DepPackage)
+import program (pkgs_of)
+import report (Answer, ind, schema_version)
+import style (Style, bold)
+import std.json (Json, Str, Bool, Number, Array, object)
+
+// A package read in place from the directory it names: neither fetched, nor a registry's, nor a
+// vendored copy.
+fn in_place(d: DepPackage) -> Bool =
+  d.dir == d.root && !string_starts_with(d.root, "git+")
+    && !string_contains(d.root, "/.ply-cache/registry/")
+
+fn index_of(packages: List<Package>, prefix: Bytes) -> Option<Int> =
+  fold(range(0, len(packages)), None, |found: Option<Int>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> match list_at(packages, i) {
+        Some(p) -> if p.prefix == prefix && i > 0 { Some(i) } else { None },
+        None -> None,
+      },
+    })
+
+type Order = { seen: Map<Int, Bool>, out: List<Int> }
+
+fn visited(packages: List<Package>, o: Order, i: Int) -> Order =
+  if map_contains(o.seen, i) { o } else {
+    let marked = { ..o, seen: map_insert(o.seen, i, true) };
+    let below = match list_at(packages, i) {
+      None -> marked,
+      Some(p) ->
+        fold(p.deps, marked, |acc: Order, prefix: Bytes|
+          match index_of(packages, prefix) { Some(j) -> visited(packages, acc, j), None -> acc }),
+    };
+    { ..below, out: push(below.out, i) }
+  }
+
+// The directories of the packages `project` reaches by a path dependency, each after everything it
+// depends on; the project itself is not among them.
+pub fn path_packages(project: Project) -> List<String> = {
+  let clo = closure(pkgs_of(project), map(project.sources, |s: Source| s.name));
+  let order = visited(clo.packages, { seen: map_new(), out: [] }, 0).out;
+  let by_root = fold(project.packages, map_new(), |acc: Map<String, DepPackage>, d: DepPackage|
+    map_insert(acc, d.root, d));
+  fold(order, [], |acc: List<String>, i: Int|
+    if i == 0 { acc } else {
+      match list_at(clo.packages, i) {
+        None -> acc,
+        Some(p) -> match map_get(by_root, string_of_bytes_lossy(p.root)) {
+          Some(d) -> if in_place(d) { push(acc, d.dir) } else { acc },
+          None -> acc,
+        },
+      }
+    })
+}
+
+pub type Run = { display: String, answer: Answer }
+
+fn worst(runs: List<Run>) -> Int = fold(runs, 0, |acc: Int, r: Run| max(acc, r.answer.code))
+
+pub fn combined(s: Style, command: String, runs: List<Run>) -> Answer = {
+  let code = worst(runs);
+  {
+    json: object([
+      { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
+      { key: "command", value: Str(command) },
+      { key: "workspace", value: Bool(true) },
+      { key: "ok", value: Bool(code == 0) },
+      { key: "exit_code", value: Number(decimal_of_int(code)) },
+      {
+        key: "packages",
+        value: Array(
+          map(runs, |r: Run|
+            object([
+              { key: "root", value: Str(r.display) },
+              { key: "answer", value: r.answer.json },
+            ])),
+        ),
+      },
+    ]),
+    lines: fold(range(0, len(runs)), [], |acc: List<String>, i: Int|
+      match list_at(runs, i) {
+        None -> acc,
+        Some(r) -> {
+          let headed = push(if i == 0 { acc } else { push(acc, "") }, ind() ++ bold(s, r.display));
+          fold(r.answer.lines, headed, |out: List<String>, l: String| push(out, l))
+        },
+      }),
+    errs: fold(runs, [], |acc: List<String>, r: Run|
+      fold(r.answer.errs, acc, |out: List<String>, l: String| push(out, l))),
+    code: code,
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn an_answer(code: Int, line: String) -> Answer =
+  {
+    json: object([{ key: "code", value: Number(decimal_of_int(code)) }]),
+    lines: [line],
+    errs: [],
+    code: code,
+  }
+
+test "a workspace run answers with its worst run, each under its package" {
+  let a = combined({ styled: false }, "check", [
+    { display: "../lib", answer: an_answer(0, "lib's report") },
+    { display: ".", answer: an_answer(2, "app's report") },
+  ]);
+  assert_eq(a.code, 2);
+  assert_eq(a.lines, ["   ../lib", "lib's report", "", "   .", "app's report"])
+}
+
+test "a package is run in place only when the walk read it from the directory it names" {
+  let d: DepPackage = { root: "/x/lib", dir: "/x/lib", manifest: None, files: [] };
+  assert(in_place(d));
+  assert(!in_place({ ..d, dir: "/x/app/vendor/lib" }));
+  assert(!in_place({ ..d, root: "git+https://h/lib@v1", dir: "/x/app/.ply-cache/git/lib" }));
+  assert(
+    !in_place({
+      ..d,
+      root: "/x/app/.ply-cache/registry/lib",
+      dir: "/x/app/.ply-cache/registry/lib",
+    }),
+  )
+}
