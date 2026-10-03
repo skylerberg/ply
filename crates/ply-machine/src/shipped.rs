@@ -6,13 +6,14 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 6] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
     ("version", "ply_machine::shipped::version"),
     ("stamps", "ply_machine::shipped::stamps"),
     ("runtime", "ply_machine::shipped::runtime"),
     ("runnable", "ply_machine::shipped::runnable"),
+    ("builtins", "ply_machine::shipped::builtins"),
 ];
 
 /// Empty in a process the launcher did not start.
@@ -57,6 +58,18 @@ impl HostHandler for Shipped {
             ("version", []) => PlyValue::str(env!("CARGO_PKG_VERSION")),
             ("stamps", []) => PlyValue::str(STAMPS.get().map_or("", String::as_str)),
             ("runtime", []) => runtime(),
+            ("builtins", []) => PlyValue::list(
+                ply_eval::Builtin::all()
+                    .iter()
+                    .map(|b| {
+                        crate::payload::record(vec![
+                            ("name", PlyValue::bytes(b.name())),
+                            ("arity", PlyValue::Int(b.arity().1 as i64)),
+                            ("raises", PlyValue::Bool(b.raises())),
+                        ])
+                    })
+                    .collect(),
+            ),
             ("runnable", [entry, files, dump, unit]) => {
                 let entry = entry.as_str(span, "an entry point's name")?;
                 let unit = unit.as_bytes(span, "the program's unit")?;

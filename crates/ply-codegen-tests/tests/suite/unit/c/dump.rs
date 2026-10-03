@@ -1,4 +1,4 @@
-use ply_codegen::c::{dump, producer};
+use ply_codegen::c::dump;
 use ply_eval::{
     Carry, Edit, EffectAtom, Fields, Fix, Footprint, IntTy, Mode, Ordinal, Resource, Severity,
     SourceId, Span, Symbol, Value, Visibility, codes,
@@ -45,15 +45,17 @@ fn first(list: &Value) -> Value {
     items.iter().next().expect("a first item").clone()
 }
 
-/// The front end's answer over modules that import nothing shipped.
+/// The front end's answer over modules that import nothing shipped, as the builder writes it.
 fn answer(modules: &[(&str, &str)]) -> Value {
-    let user: Vec<(String, String)> = modules
+    let files: Vec<(String, String)> = modules
         .iter()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .map(|(name, text)| (format!("{}.ply", name.replace('.', "/")), text.to_string()))
         .collect();
-    producer::front_pulling_std(&user, &[])
-        .expect("the front end answers")
-        .dump
+    let bytes = ply_machine::builds::answered(&files)
+        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
+    let answer = ply_machine::runnable::front_value(&bytes)
+        .unwrap_or_else(|why| panic!("the answer reads: {why}"));
+    field(&answer, "dump").clone()
 }
 
 const PROGRAM: &str = "pub effect log { write emit(Bytes) -> Unit }\n\
@@ -304,6 +306,7 @@ fn constructors_variables_and_operations_read_their_published_carries() {
     );
 }
 
+/// Each `.ply` file in `dir` as `(file name, text)`.
 fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
@@ -314,41 +317,44 @@ fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
     paths
         .into_iter()
         .map(|p| {
-            let stem = p.file_stem().unwrap().to_string_lossy().to_string();
-            (stem, std::fs::read_to_string(&p).unwrap())
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            (name, std::fs::read_to_string(&p).unwrap())
         })
         .collect()
 }
 
-/// Every row the front end answers, over the examples and the compiler, reads, and reads to one
-/// structure however often it is read.
+/// Every row the front end answers, over the compiler, as the committed builder carries it, and over
+/// the examples, reads, and reads to one structure however often it is read.
 #[test]
 fn an_answer_over_the_examples_and_the_compiler_reads_whole() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut user = ply_files(&root.join("examples"));
-    user.extend(ply_files(&root.join("crates/ply-compiler/ply")));
-    let shipped: Vec<(String, String)> = ply_std::sources()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .collect();
-    let pulled = producer::front_pulling_std(&user, &shipped)
-        .unwrap_or_else(|e| panic!("the corpus does not answer: {e:#}"));
-    let ids: Vec<SourceId> = (0..user.len() + pulled.modules.len())
-        .map(|i| SourceId(i as u32))
-        .collect();
-
-    let once = dump::read(&pulled.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
-    assert!(
-        !once.has_error(),
-        "the corpus does not check: {:?}",
-        once.diagnostics
-    );
-    assert!(!once.check.defs.is_empty() && !once.hashes.defs.is_empty());
-    assert_eq!(once.check.tests.len(), once.hashes.tests.len());
-    let again = dump::read(&pulled.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
-    assert!(
-        format!("{again:?}") == format!("{once:?}"),
-        "one answer read twice reads to two structures"
-    );
+    let examples = ply_machine::builds::answered(&ply_files(&root.join("examples")))
+        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
+    for (what, bytes) in [
+        ("the committed builder", ply_compiler::bootstrap::BUILDER),
+        ("the examples", examples.as_slice()),
+    ] {
+        let answer = ply_machine::runnable::front_value(bytes)
+            .unwrap_or_else(|why| panic!("{what}: the answer reads: {why}"));
+        let Value::List(files) = field(&answer, "files") else {
+            panic!("{what}: the answer lists no files");
+        };
+        let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
+        let dump = field(&answer, "dump");
+        let once = dump::read(dump, &ids).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            !once.has_error(),
+            "{what} does not check: {:?}",
+            once.diagnostics
+        );
+        assert!(!once.check.defs.is_empty() && !once.hashes.defs.is_empty());
+        assert_eq!(once.check.tests.len(), once.hashes.tests.len());
+        let again = dump::read(dump, &ids).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            format!("{again:?}") == format!("{once:?}"),
+            "{what}: one answer read twice reads to two structures"
+        );
+    }
 }
 
 #[test]

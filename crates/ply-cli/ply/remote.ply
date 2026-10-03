@@ -49,9 +49,9 @@ fn interface_path(root: String, name: String, version: String) -> String / {abor
 pub fn requirements(project: Project) -> List<Requirement> / {abort.raise} = {
   let cached = cache_dir(project.root_key) ++ "/";
   let own = match project.manifest { Some(f) -> [f.text], None -> [] };
-  let texts = fold(project.packages, own, |acc: List<Bytes>, p: DepPackage|
-    if string_starts_with(p.root, cached) { acc }
-    else { match p.manifest { Some(t) -> push(acc, t), None -> acc } });
+  let texts = fold(project.packages, own, |acc: List<Bytes>, package: DepPackage|
+    if string_starts_with(package.root, cached) { acc }
+    else { match package.manifest { Some(t) -> push(acc, t), None -> acc } });
   fold(texts, [], |acc: List<Requirement>, t: Bytes|
     match checked(t) { None -> acc, Some(m) -> appended(acc, asked(m)) })
 }
@@ -61,8 +61,8 @@ fn checked(text: Bytes) -> Option<Manifest> / {abort.raise} = {
   if len(c.diags) > 0 { None } else { c.manifest }
 }
 
-fn asked(m: Manifest) -> List<Requirement> =
-  fold(m.dependencies, [], |acc: List<Requirement>, d: Dep|
+fn asked(manifest: Manifest) -> List<Requirement> =
+  fold(manifest.dependencies, [], |acc: List<Requirement>, d: Dep|
     match d.source { Registry -> push(acc, { name: d.name, floor: d.min }), _ -> acc })
 
 fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
@@ -91,9 +91,12 @@ pub fn select(index: Index, floor: Version, pinned: Option<Version>) -> Option<R
   }
 }
 
-fn release_of(index: Index, v: Version) -> Option<Release> =
-  fold(index.versions, None, |found: Option<Release>, r: Release|
-    match found { Some(_) -> found, None -> if r.version == v { Some(r) } else { None } })
+fn release_of(index: Index, version: Version) -> Option<Release> =
+  fold(index.versions, None, |found: Option<Release>, release: Release|
+    match found {
+      Some(_) -> found,
+      None -> if release.version == version { Some(release) } else { None },
+    })
 
 fn pinned_version(lock: Option<Lock>, name: String) -> Option<Version> / {abort.raise} =
   match lock {
@@ -190,7 +193,7 @@ fn visited<| e>(
   }
 }
 
-type Ctx = { base: Base, root: String, lock: Option<Lock> }
+type RegistryContext = { base: Base, root: String, lock: Option<Lock> }
 
 // A package's index, asked once per resolve: it is what says which versions exist and which are
 // yanked, so a resolve never selects from a stale one. Its row is the walk's whole row, since the
@@ -228,15 +231,15 @@ fn indexed(
 // else from the registry — checked either way against the index and the lock before anything in it
 // is read, and kept in the cache once it has passed.
 fn fetched(
-  ctx: Ctx,
+  ctx: RegistryContext,
   name: String,
-  r: Release,
-) -> Result<Node, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
-  let version = render_version(r.version);
+  release: Release,
+) -> Result<Node, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let version = render_version(release.version);
   let pinned = pinned_archive(ctx.lock, name, version);
   let path = archive_path(ctx.root, name, version);
-  match cached(path, r.digest, pinned) {
-    Some(u) -> node_of(name, r, u),
+  match cached(path, release.digest, pinned) {
+    Some(u) -> node_of(name, release, u),
     None -> {
       let target = archive_target(ctx.base, name, version);
       match exchange(ctx.base, get(ctx.base, target)) {
@@ -244,9 +247,9 @@ fn fetched(
         Ok(answer) -> if answer.status != 200 {
           Err(answered(ctx.base, target, answer.status, said(answer)))
         } else {
-          match vouched(name, version, answer.body, r.digest, pinned) {
+          match vouched(name, version, answer.body, release.digest, pinned) {
             Err(d) -> Err(d),
-            Ok(u) -> match node_of(name, r, u) {
+            Ok(u) -> match node_of(name, release, u) {
               Err(d) -> Err(d),
               Ok(node) -> if kept(path, answer.body) { Ok(node) } else { Err(unwritable(path)) },
             },
@@ -328,8 +331,8 @@ fn kept(
 
 // A version reached is the package and version its archive's manifest names, or the registry has
 // answered for something it was not asked.
-fn node_of(name: String, r: Release, u: Unpacked) -> Result<Node, Diag> / {abort.raise} = {
-  let version = render_version(r.version);
+fn node_of(name: String, release: Release, u: Unpacked) -> Result<Node, Diag> = {
+  let version = render_version(release.version);
   match checked(u.manifest) {
     None ->
       Err(
@@ -339,7 +342,7 @@ fn node_of(name: String, r: Release, u: Unpacked) -> Result<Node, Diag> / {abort
           [],
         ),
       ),
-    Some(m) -> if m.name != name || m.version != r.version {
+    Some(m) -> if m.name != name || m.version != release.version {
       Err(
         untrue(
           "the registry's archive of `" ++ name ++ "` " ++ version ++ " holds `" ++ m.name ++ "` "
@@ -348,7 +351,14 @@ fn node_of(name: String, r: Release, u: Unpacked) -> Result<Node, Diag> / {abort
         ),
       )
     } else {
-      Ok({ name: name, release: r, archive: u, deps: asked(m), interface: None, attestation: None })
+      Ok({
+        name: name,
+        release: release,
+        archive: u,
+        deps: asked(m),
+        interface: None,
+        attestation: None,
+      })
     },
   }
 }
@@ -366,37 +376,37 @@ fn framed(bytes: Bytes, archive: String) -> Bool / {abort.raise} =
   }
 
 fn with_interface(
-  ctx: Ctx,
-  n: Node,
-) -> Node / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
-  let version = render_version(n.release.version);
-  let path = interface_path(ctx.root, n.name, version);
-  let archive = digest_text(n.archive.digest);
+  ctx: RegistryContext,
+  node: Node,
+) -> Node / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let version = render_version(node.release.version);
+  let path = interface_path(ctx.root, node.name, version);
+  let archive = digest_text(node.archive.digest);
   match fs.read_file[abs](under_abs(path)) {
-    Some(bytes) -> if framed(bytes, archive) { { ..n, interface: Some(bytes) } }
-    else { served_interface(ctx, n, path, archive) },
-    None -> served_interface(ctx, n, path, archive),
+    Some(bytes) -> if framed(bytes, archive) { { ..node, interface: Some(bytes) } }
+    else { served_interface(ctx, node, path, archive) },
+    None -> served_interface(ctx, node, path, archive),
   }
 }
 
 fn served_interface(
-  ctx: Ctx,
-  n: Node,
+  ctx: RegistryContext,
+  node: Node,
   path: String,
   archive: String,
 ) -> Node / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
   let target = interface_target(
     ctx.base,
-    n.name,
-    render_version(n.release.version),
+    node.name,
+    render_version(node.release.version),
     semantics::version(),
   );
   match exchange(ctx.base, get(ctx.base, target)) {
-    Err(_) -> n,
+    Err(_) -> node,
     Ok(answer) -> if answer.status == 200 && framed(answer.body, archive) {
       kept(path, answer.body);
-      { ..n, interface: Some(answer.body) }
-    } else { n },
+      { ..node, interface: Some(answer.body) }
+    } else { node },
   }
 }
 
@@ -404,28 +414,29 @@ fn served_interface(
 // on every resolve, since an attester may run a version again, and believed only as far as a key
 // the consumer trusts signed it.
 fn with_attestation(
-  ctx: Ctx,
-  n: Node,
-) -> Node / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} = {
+  ctx: RegistryContext,
+  node: Node,
+) -> Node / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]} = {
   let target = attestation_target(
     ctx.base,
-    n.name,
-    render_version(n.release.version),
+    node.name,
+    render_version(node.release.version),
     semantics::version(),
   );
   match exchange(ctx.base, get(ctx.base, target)) {
-    Err(_) -> n,
-    Ok(answer) -> if answer.status == 200 { { ..n, attestation: Some(answer.body) } } else { n },
+    Err(_) -> node,
+    Ok(answer) -> if answer.status == 200 { { ..node, attestation: Some(answer.body) } }
+    else { node },
   }
 }
 
 // Each name at the highest version the walk reached: one version of a name serves the closure.
 pub fn settled(nodes: List<Node>) -> List<Node> = {
-  let best = fold(nodes, map_new(), |acc: Map<String, Node>, n: Node|
-    match map_get(acc, n.name) {
-      None -> map_insert(acc, n.name, n),
-      Some(held) -> if compare(held.release.version, n.release.version) == Less {
-        map_insert(acc, n.name, n)
+  let best = fold(nodes, map_new(), |acc: Map<String, Node>, node: Node|
+    match map_get(acc, node.name) {
+      None -> map_insert(acc, node.name, node),
+      Some(held) -> if compare(held.release.version, node.release.version) == Less {
+        map_insert(acc, node.name, node)
       } else { acc },
     });
   map_values(best)
@@ -440,14 +451,14 @@ pub fn settled(nodes: List<Node>) -> List<Node> = {
 fn placed(
   root: String,
   items: List<Vendored>,
-  n: Node,
-) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
-  let slot = slot_of(root, n.name);
-  match replaced(slot, n, true) {
+  node: Node,
+) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let slot = slot_of(root, node.name);
+  match replaced(slot, node, true) {
     Err(d) -> Err(d),
     Ok(_) -> match from_vendor(root, items, bytes_of_string(slot)) {
       None -> Ok(()),
-      Some(dir) -> replaced(dir, n, false),
+      Some(dir) -> replaced(dir, node, false),
     },
   }
 }
@@ -456,10 +467,10 @@ fn placed(
 // package's sources.
 fn replaced(
   dir: String,
-  n: Node,
+  node: Node,
   published: Bool,
-) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
-  let staging = dir ++ "@" ++ render_version(n.release.version);
+) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let staging = dir ++ "@" ++ render_version(node.release.version);
   cleared(staging, 0);
   let beside = |at: String, held: Option<Bytes>|
     match held {
@@ -469,8 +480,9 @@ fn replaced(
           || (fs.create_dir[abs](under_abs(parent(at)))
           && fs.write_file[abs](under_abs(at), bytes)),
     };
-  let written = unpacked_into(staging, n.archive) && beside(slot_interface(staging), n.interface)
-    && beside(slot_attestation(staging), n.attestation);
+  let written = unpacked_into(staging, node.archive)
+    && beside(slot_interface(staging), node.interface)
+    && beside(slot_attestation(staging), node.attestation);
   if !written { Err(unwritable(staging)) } else {
     cleared(dir, 0);
     if fs.rename[abs](under_abs(staging), under_abs(dir)) { Ok(()) } else { Err(unwritable(dir)) }
@@ -483,9 +495,9 @@ fn unpacked_into(
 ) -> Bool / {fs.create_dir[abs], fs.write_file[abs], abort.raise} =
   fs.create_dir[abs](under_abs(dir))
     && fs.write_file[abs](under_abs(join(dir, "ply.pkg")), u.manifest)
-    && fold(u.modules, true, |ok: Bool, m: Module|
-      ok && fs.create_dir[abs](under_abs(parent(join(dir, m.path))))
-        && fs.write_file[abs](under_abs(join(dir, m.path)), m.text))
+    && fold(u.modules, true, |ok: Bool, module: Module|
+      ok && fs.create_dir[abs](under_abs(parent(join(dir, module.path))))
+        && fs.write_file[abs](under_abs(join(dir, module.path)), module.text))
 
 // Everything under `dir`, then `dir` itself. A package's tree is a few levels deep; the bound is
 // only there so a symlink loop cannot keep this going.
@@ -525,15 +537,19 @@ pub fn resolved(
       Some(text) -> match base_of(text) {
         Err(why) -> Err(unasked(why, [])),
         Ok(base) -> {
-          let ctx: Ctx = { base: base, root: project.root_key, lock: lock };
-          match walk(lock, reqs, |name: String| indexed(base, name), |name: String, r: Release|
-              fetched(ctx, name, r)) {
+          let ctx: RegistryContext = { base: base, root: project.root_key, lock: lock };
+          match walk(
+              lock,
+              reqs,
+              |name: String| indexed(base, name),
+              |name: String, release: Release| fetched(ctx, name, release),
+            ) {
             Err(d) -> Err(d),
             Ok(nodes) ->
               placed_all(
                 ctx.root,
                 vendored(ctx.root),
-                map(settled(nodes), |n: Node| with_attestation(ctx, with_interface(ctx, n))),
+                map(settled(nodes), |node: Node| with_attestation(ctx, with_interface(ctx, node))),
                 [],
               ),
           }
@@ -574,11 +590,12 @@ fn placed_all(
 /// resolve fetches them into `root`'s cache, each as the package a load is supplied at its slot.
 pub type Consumed = { manifest: Manifest, own: Supplied, deps: List<Supplied> }
 
-fn supplied_of(root: String, n: Node) -> Supplied / {abort.raise} =
+fn supplied_of(root: String, node: Node) -> Supplied =
   {
-    root: registry_key(bytes_of_string(root), bytes_of_string(n.name)),
-    manifest: Some(n.archive.manifest),
-    modules: map(n.archive.modules, |m: Module| { name: bytes_of_string(m.name), src: m.text }),
+    root: registry_key(bytes_of_string(root), bytes_of_string(node.name)),
+    manifest: Some(node.archive.manifest),
+    modules: map(node.archive.modules, |module: Module|
+      { name: bytes_of_string(module.name), src: module.text }),
   }
 
 /// The registry's index of `name`: every version published under it.
@@ -594,7 +611,7 @@ pub fn consumed(
   name: String,
   r: Release,
 ) -> Result<Consumed, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
-  let ctx: Ctx = { base: base, root: root, lock: None };
+  let ctx: RegistryContext = { base: base, root: root, lock: None };
   match fetched(ctx, name, r) {
     Err(d) -> Err(d),
     Ok(n) -> match checked(n.archive.manifest) {
@@ -634,7 +651,7 @@ pub fn staged(
   name: String,
   r: Release,
 ) -> Result<String, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
-  let ctx: Ctx = { base: base, root: dir, lock: None };
+  let ctx: RegistryContext = { base: base, root: dir, lock: None };
   let package = join(dir, "package");
   match fetched(ctx, name, r) {
     Err(d) -> Err(d),
@@ -693,7 +710,8 @@ fn no_package(base: Base, name: String) -> Diag =
   )
 
 fn unsatisfied(req: Requirement, index: Index) -> Diag = {
-  let above = filter(index.versions, |r: Release| compare(r.version, req.floor) != Less);
+  let above = filter(index.versions, |release: Release|
+    compare(release.version, req.floor) != Less);
   let floor = render_version(req.floor);
   if len(above) == 0 {
     nowhere(
@@ -715,8 +733,8 @@ fn unsatisfied(req: Requirement, index: Index) -> Diag = {
 
 fn shown(rs: List<Release>) -> String =
   if len(rs) == 0 { "nothing" } else {
-    fold(rs, "", |acc: String, r: Release| {
-      let one = render_version(r.version) ++ (if r.yanked { " (yanked)" } else { "" });
+    fold(rs, "", |acc: String, release: Release| {
+      let one = render_version(release.version) ++ (if release.yanked { " (yanked)" } else { "" });
       if acc == "" { one } else { acc ++ ", " ++ one }
     })
   }
@@ -731,11 +749,16 @@ fn unwritable(path: String) -> Diag =
 
 // --- Tests ------------------------------------------------------------------
 
-fn v(text: String) -> Version / {abort.raise} =
+fn version_of(text: String) -> Version / {abort.raise} =
   match parse_version(text) { Some(x) -> x, None -> panic("a fixture's version") }
 
-fn rel(version: String, yanked: Bool) -> Release / {abort.raise} =
-  { version: v(version), digest: "b3:" ++ version, yanked: yanked, runtime: v("0.16.0") }
+fn rel(version: String, yanked: Bool) -> Release =
+  {
+    version: version_of(version),
+    digest: "b3:" ++ version,
+    yanked: yanked,
+    runtime: version_of("0.16.0"),
+  }
 
 fn an_index(releases: List<Release>) -> Index = { name: "orders", versions: releases }
 
@@ -744,27 +767,27 @@ fn chosen(r: Option<Release>) -> String =
 
 test "a floor selects the lowest version at or above it that is not yanked" {
   let index = an_index([rel("0.1.0", false), rel("0.3.0", false), rel("0.2.0", false)]);
-  assert_eq(chosen(select(index, v("0.1.0"), None)), "0.1.0");
-  assert_eq(chosen(select(index, v("0.1.5"), None)), "0.2.0");
-  assert_eq(chosen(select(index, v("0.3.0"), None)), "0.3.0");
-  assert_eq(chosen(select(index, v("0.4.0"), None)), "none")
+  assert_eq(chosen(select(index, version_of("0.1.0"), None)), "0.1.0");
+  assert_eq(chosen(select(index, version_of("0.1.5"), None)), "0.2.0");
+  assert_eq(chosen(select(index, version_of("0.3.0"), None)), "0.3.0");
+  assert_eq(chosen(select(index, version_of("0.4.0"), None)), "none")
 }
 
 test "a yanked version is refused to a new resolution and served to a lock that pins it" {
   let index = an_index([rel("0.1.0", false), rel("0.2.0", true), rel("0.2.1", false)]);
-  assert_eq(chosen(select(index, v("0.2.0"), None)), "0.2.1");
-  assert_eq(chosen(select(index, v("0.2.0"), Some(v("0.2.0")))), "0.2.0");
+  assert_eq(chosen(select(index, version_of("0.2.0"), None)), "0.2.1");
+  assert_eq(chosen(select(index, version_of("0.2.0"), Some(version_of("0.2.0")))), "0.2.0");
   let only = an_index([rel("0.2.0", true)]);
-  assert_eq(chosen(select(only, v("0.1.0"), None)), "none");
-  assert_eq(unsatisfied({ name: "orders", floor: v("0.1.0") }, only).code, b"E0143")
+  assert_eq(chosen(select(only, version_of("0.1.0"), None)), "none");
+  assert_eq(unsatisfied({ name: "orders", floor: version_of("0.1.0") }, only).code, b"E0143")
 }
 
 test "a lock's version holds while the floor allows it, and a raised floor moves past it" {
   let index = an_index([rel("0.1.0", false), rel("0.2.0", false), rel("0.3.0", false)]);
-  assert_eq(chosen(select(index, v("0.1.0"), Some(v("0.2.0")))), "0.2.0");
-  assert_eq(chosen(select(index, v("0.3.0"), Some(v("0.2.0")))), "0.3.0");
+  assert_eq(chosen(select(index, version_of("0.1.0"), Some(version_of("0.2.0")))), "0.2.0");
+  assert_eq(chosen(select(index, version_of("0.3.0"), Some(version_of("0.2.0")))), "0.3.0");
   // A pin the index no longer lists is not a version to select.
-  assert_eq(chosen(select(index, v("0.1.0"), Some(v("0.9.0")))), "0.1.0")
+  assert_eq(chosen(select(index, version_of("0.1.0"), Some(version_of("0.9.0")))), "0.1.0")
 }
 
 fn a_node(name: String, version: String) -> Node / {abort.raise} =
@@ -784,7 +807,8 @@ test "each name settles on the highest version the walk reached" {
     a_node("orders", "0.3.0"),
     a_node("orders", "0.2.0"),
   ];
-  let got = map(settled(nodes), |n: Node| n.name ++ " " ++ render_version(n.release.version));
+  let got = map(settled(nodes), |node: Node|
+    node.name ++ " " ++ render_version(node.release.version));
   assert_eq(got, ["money 1.0.0", "orders 0.3.0"])
 }
 
@@ -806,9 +830,9 @@ fn a_registry() -> Map<String, Index> / {abort.raise} =
   ])
 
 fn deps_of(name: String, version: String) -> List<Requirement> / {abort.raise} =
-  if name == "orders" && version == "0.1.0" { [{ name: "money", floor: v("1.0.0") }] }
-  else if name == "orders" && version == "0.2.0" { [{ name: "money", floor: v("1.1.0") }] }
-  else if name == "billing" { [{ name: "orders", floor: v("0.2.0") }] }
+  if name == "orders" && version == "0.1.0" { [{ name: "money", floor: version_of("1.0.0") }] }
+  else if name == "orders" && version == "0.2.0" { [{ name: "money", floor: version_of("1.1.0") }] }
+  else if name == "billing" { [{ name: "orders", floor: version_of("0.2.0") }] }
   else { [] }
 
 fn over_table(
@@ -837,29 +861,37 @@ fn over_table(
               ),
             ),
         },
-      |name: String, r: Release|
+      |name: String, release: Release|
         Ok({
-          ..a_node(name, render_version(r.version)),
-          deps: deps_of(name, render_version(r.version)),
+          ..a_node(name, render_version(release.version)),
+          deps: deps_of(name, render_version(release.version)),
         }),
     ) {
     Err(d) -> Err(d),
     Ok(nodes) ->
-      Ok(map(settled(nodes), |n: Node| n.name ++ " " ++ render_version(n.release.version))),
+      Ok(
+        map(settled(nodes), |node: Node| node.name ++ " " ++ render_version(node.release.version)),
+      ),
   }
 }
 
 test "minimal version selection takes the highest floor anything reached asks for" {
   // `billing` raises `orders` to 0.2.0, which raises `money` to 1.1.0; nothing asks for 1.2.0.
   let got = over_table(
-    [{ name: "orders", floor: v("0.1.0") }, { name: "billing", floor: v("0.1.0") }],
+    [
+      { name: "orders", floor: version_of("0.1.0") },
+      { name: "billing", floor: version_of("0.1.0") },
+    ],
     None,
   );
   assert_eq(got, Ok(["billing 0.1.0", "money 1.1.0", "orders 0.2.0"]));
   // The same closure asked in the other order settles the same way.
   assert_eq(
     over_table(
-      [{ name: "billing", floor: v("0.1.0") }, { name: "orders", floor: v("0.1.0") }],
+      [
+        { name: "billing", floor: version_of("0.1.0") },
+        { name: "orders", floor: version_of("0.1.0") },
+      ],
       None,
     ),
     got,
@@ -867,11 +899,11 @@ test "minimal version selection takes the highest floor anything reached asks fo
 }
 
 test "a package the registry does not hold, or a floor it cannot meet, is refused" {
-  match over_table([{ name: "absent", floor: v("0.1.0") }], None) {
+  match over_table([{ name: "absent", floor: version_of("0.1.0") }], None) {
     Ok(_) -> panic("a package nobody published was selected"),
     Err(d) -> assert_eq(d.code, b"E0143"),
   };
-  match over_table([{ name: "orders", floor: v("0.9.0") }], None) {
+  match over_table([{ name: "orders", floor: version_of("0.9.0") }], None) {
     Ok(_) -> panic("a floor above every version was met"),
     Err(d) -> {
       assert_eq(d.code, b"E0143");
@@ -886,7 +918,7 @@ test "a lock keeps the versions it pins while the floors allow them" {
     packages: [{ name: "money", version: "1.2.0", digest: "b3:m", archive: Some("b3:1.2.0") }],
   };
   assert_eq(
-    over_table([{ name: "orders", floor: v("0.2.0") }], Some(lock)),
+    over_table([{ name: "orders", floor: version_of("0.2.0") }], Some(lock)),
     Ok(["money 1.2.0", "orders 0.2.0"]),
   )
 }
@@ -937,7 +969,7 @@ test "an archive is believed only when its bytes seal the digest listed and the 
   let d = digest_of_archive(bytes);
   match vouched("orders", "0.2.0", bytes, d, Some(d)) {
     Err(_) -> panic("the archive the index lists and the lock pins was refused"),
-    Ok(u) -> assert_eq(map(u.modules, |m: Module| m.path), ["core.ply"]),
+    Ok(u) -> assert_eq(map(u.modules, |module: Module| module.path), ["core.ply"]),
   };
   match vouched("orders", "0.2.0", bytes, "b3:00", None) {
     Ok(_) -> panic("an archive the index does not list was believed"),

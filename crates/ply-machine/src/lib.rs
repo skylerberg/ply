@@ -11,6 +11,7 @@
 //! is `crate::drive`.
 
 pub mod builder;
+pub mod builds;
 pub mod claims;
 pub mod config;
 pub mod drive;

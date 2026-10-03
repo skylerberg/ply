@@ -20,7 +20,7 @@ import registry (Base, base_of, exchange, interface_target, put, refused_by, rel
 import interfaces
 import semantics
 import sources (Embed, File, shelf)
-import report (Answer, ind, ok_code, count_of, refused, reported)
+import report (Answer, indent, ok_code, count_of, refused, reported)
 import style (Style, green)
 import contracts (as_consumed, moved, previous, promised, published_promises, refusal)
 import remote
@@ -44,8 +44,8 @@ fn resolved_root(flags: Flags) -> Resolved =
 
 // --- What may be published -----------------------------------------------------------
 
-fn a_program(m: Manifest, why: String) -> Diag =
-  untakeable("`" ++ m.name ++ "` is a program: " ++ why, [
+fn a_program(manifest: Manifest, why: String) -> Diag =
+  untakeable("`" ++ manifest.name ++ "` is a program: " ++ why, [
     b"only a library is published: a package with no entry whose modules declare no `main`",
   ])
 
@@ -59,16 +59,16 @@ fn elsewhere(d: Dep) -> Option<String> =
 
 /// Why a package cannot be published, when it cannot: a program, or one whose dependencies are not
 /// all the registry's own, since whoever depends on it resolves them from the registry alone.
-pub fn unpublishable(m: Manifest, mains: Int) -> Option<Diag> =
-  match m.entry {
-    Some(e) -> Some(a_program(m, "its manifest names the entry `" ++ e ++ "`")),
-    None -> if mains > 0 { Some(a_program(m, "its modules declare `main`")) } else {
-      match fold(m.dependencies, None, |found: Option<String>, d: Dep|
+pub fn unpublishable(manifest: Manifest, mains: Int) -> Option<Diag> =
+  match manifest.entry {
+    Some(e) -> Some(a_program(manifest, "its manifest names the entry `" ++ e ++ "`")),
+    None -> if mains > 0 { Some(a_program(manifest, "its modules declare `main`")) } else {
+      match fold(manifest.dependencies, None, |found: Option<String>, d: Dep|
           match found { Some(_) -> found, None -> elsewhere(d) }) {
         None -> None,
         Some(why) ->
           Some(
-            untakeable("`" ++ m.name ++ "` cannot be published: the dependency " ++ why, [
+            untakeable("`" ++ manifest.name ++ "` cannot be published: the dependency " ++ why, [
               b"a published package depends only on the registry, which is where whoever depends on it resolves its dependencies from",
             ]),
           ),
@@ -86,19 +86,20 @@ type Cut = { envelope: Bytes, promised: List<Contract> }
 // differs reads those modules from source instead.
 fn cut_of(
   loaded: Program,
-  m: Manifest,
+  manifest: Manifest,
   archive: String,
-) -> Result<Cut, List<Diag>> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], abort.raise} = {
-  let slot = registry_key(loaded.pkgs.root, bytes_of_string(m.name));
+) -> Result<Cut, List<Diag>> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let slot = registry_key(loaded.pkgs.root, bytes_of_string(manifest.name));
   let mine: Supplied = {
     root: slot,
     manifest: loaded.pkgs.manifest,
-    modules: map(loaded.files, |f: File| { name: bytes_of_string(f.module), src: f.text }),
+    modules: map(loaded.files, |file: File| { name: bytes_of_string(file.module), src: file.text }),
   };
   let shelved = shelf();
-  let embeds = map(loaded.embeds, |e: Embed|
-    if e.embedded.root == loaded.pkgs.root { { ..e.embedded, root: slot } } else { e.embedded });
-  match as_consumed(loaded.pkgs.root, m, mine, loaded.pkgs.supplied, shelved, embeds) {
+  let embeds = map(loaded.embeds, |embed: Embed|
+    if embed.embedded.root == loaded.pkgs.root { { ..embed.embedded, root: slot } }
+    else { embed.embedded });
+  match as_consumed(loaded.pkgs.root, manifest, mine, loaded.pkgs.supplied, shelved, embeds) {
     Err(ds) -> Err(ds),
     Ok(c) ->
       Ok({
@@ -120,18 +121,23 @@ fn cut_of(
 fn bump_refusal(
   base: Base,
   root: String,
-  m: Manifest,
+  manifest: Manifest,
   now: List<Contract>,
-) -> Option<List<Diag>> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} =
-  match remote::index_of(base, m.name) {
+) -> Option<List<Diag>> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} =
+  match remote::index_of(base, manifest.name) {
     Err(d) -> if d.code == b"E0143" { None } else { Some([d]) },
-    Ok(index) -> if fold(index.versions, false, |held: Bool, r: Release|
-        held || r.version == m.version) { None } else {
-      match previous(index, m.version) {
+    Ok(index) -> if fold(index.versions, false, |held: Bool, release: Release|
+        held || release.version == manifest.version) { None } else {
+      match previous(index, manifest.version) {
         None -> None,
-        Some(was) -> match published_promises(base, root, m.name, index, was.version) {
+        Some(was) -> match published_promises(base, root, manifest.name, index, was.version) {
           Err(ds) -> Some(ds),
-          Ok(before) -> match refusal(m.name, was.version, m.version, moved(before, now)) {
+          Ok(before) -> match refusal(
+              manifest.name,
+              was.version,
+              manifest.version,
+              moved(before, now),
+            ) {
             None -> None,
             Some(d) -> Some([d]),
           },
@@ -167,25 +173,25 @@ pub fn run(
 }
 
 // What is published is what a build of it would ship, so it is held to the same lock.
-fn pinned_ok(r: Resolved, existing: Option<lock::Lock>, p: Loaded) -> Option<Diag> =
+fn pinned_ok(r: Resolved, existing: Option<lock::Lock>, loaded: Loaded) -> Option<Diag> =
   match existing {
     None -> None,
-    Some(l) -> match lock::verified(r, l, p.pins) { Ok(_) -> None, Err(d) -> Some(d) },
+    Some(l) -> match lock::verified(r, l, loaded.pins) { Ok(_) -> None, Err(d) -> Some(d) },
   }
 
 fn checked(
-  s: Style,
+  style: Style,
   root: String,
   loaded: Program,
   p: Loaded,
   front: LoadedAnalysis,
 ) -> Answer / {builder.git[vcs], artifacts.unit, fs.list_dir[shelf], fs.read_file[shelf], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} =
   match loaded.whole {
-    None -> refused(s, "publish", loaded.diags, loaded.places),
+    None -> refused(style, "publish", loaded.diags, loaded.places),
     Some(w) -> match w.manifest {
       None ->
         reported(
-          s,
+          style,
           "publish",
           [
             untakeable("this is the anonymous package: there is no `ply.pkg` to publish", [
@@ -195,12 +201,12 @@ fn checked(
           p.places,
         ),
       Some(m) -> match unpublishable(m, len(p.mains)) {
-        Some(d) -> reported(s, "publish", [d], p.places),
+        Some(d) -> reported(style, "publish", [d], p.places),
         None -> match packed(front, loaded, defs_of(w)) {
-          Err(why) -> reported(s, "publish", why.diags, p.places),
-          Ok(k) -> match cut_of(loaded, m, digest_text(k.x.full)) {
-            Err(ds) -> reported(s, "publish", ds, p.places),
-            Ok(cut) -> sent(s, root, m, k, cut),
+          Err(why) -> reported(style, "publish", why.diags, p.places),
+          Ok(k) -> match cut_of(loaded, m, digest_text(k.sealed.full)) {
+            Err(ds) -> reported(style, "publish", ds, p.places),
+            Ok(cut) -> sent(style, root, m, k, cut),
           },
         },
       },
@@ -208,57 +214,70 @@ fn checked(
   }
 
 fn sent(
-  s: Style,
+  style: Style,
   root: String,
-  m: Manifest,
+  manifest: Manifest,
   k: Packed,
   cut: Cut,
 ) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} =
   match env.var[sys](variable()) {
     None ->
-      reported(s, "publish", [unset(variable(), "a publish needs a registry to send to")], []),
+      reported(style, "publish", [unset(variable(), "a publish needs a registry to send to")], []),
     Some(text) -> match base_of(text) {
-      Err(why) -> reported(s, "publish", [unasked(why, [])], []),
+      Err(why) -> reported(style, "publish", [unasked(why, [])], []),
       Ok(base) -> match env.var[sys](token_variable()) {
         None ->
-          reported(s, "publish", [unset(token_variable(), "a publish is made under a token")], []),
-        Some(token) -> match bump_refusal(base, root, m, cut.promised) {
-          Some(ds) -> reported(s, "publish", ds, []),
-          None -> uploaded(s, base, token, m, k, cut.envelope),
+          reported(
+            style,
+            "publish",
+            [unset(token_variable(), "a publish is made under a token")],
+            [],
+          ),
+        Some(token) -> match bump_refusal(base, root, manifest, cut.promised) {
+          Some(ds) -> reported(style, "publish", ds, []),
+          None -> uploaded(style, base, token, manifest, k, cut.envelope),
         },
       },
     },
   }
 
 fn uploaded(
-  s: Style,
+  style: Style,
   base: Base,
   token: String,
-  m: Manifest,
+  manifest: Manifest,
   k: Packed,
   iface: Bytes,
-) -> Answer / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} = {
-  let version = render_version(m.version);
-  let digest = digest_text(k.x.full);
-  let target = release_target(base, m.name, version);
-  match exchange(base, put(base, target, token, digest, k.x.bytes)) {
-    Err(d) -> reported(s, "publish", [d], []),
+) -> Answer / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]} = {
+  let version = render_version(manifest.version);
+  let digest = digest_text(k.sealed.full);
+  let target = release_target(base, manifest.name, version);
+  match exchange(base, put(base, target, token, digest, k.sealed.bytes)) {
+    Err(d) -> reported(style, "publish", [d], []),
     Ok(answer) -> if answer.status == 201 || answer.status == 200 {
       let held = answer.status == 200;
-      let at = interface_target(base, m.name, version, semantics::version());
+      let at = interface_target(base, manifest.name, version, semantics::version());
       match exchange(base, put(base, at, token, digest, iface)) {
-        Err(d) -> reported(s, "publish", [d], []),
+        Err(d) -> reported(style, "publish", [d], []),
         Ok(sent) -> if sent.status == 201 || sent.status == 200 {
           {
-            json: json_of(m.name, version, digest, base.url, bytes_len(k.x.bytes), held),
+            json: json_of(
+              manifest.name,
+              version,
+              digest,
+              base.url,
+              bytes_len(k.sealed.bytes),
+              held,
+            ),
             lines: [
-              ind() ++ green(s, if held { "already published" } else { "published" }) ++ " "
-                ++ m.name
+              indent() ++ green(style, if held { "already published" } else { "published" }) ++ " "
+                ++ manifest.name
                 ++ " "
                 ++ version
                 ++ " · "
                 ++ digest,
-              ind() ++ "  " ++ count_of(bytes_len(k.x.bytes), "byte") ++ " and its interface · "
+              indent() ++ "  " ++ count_of(bytes_len(k.sealed.bytes), "byte")
+                ++ " and its interface · "
                 ++ base.url,
             ],
             errs: [],
@@ -266,18 +285,18 @@ fn uploaded(
           }
         } else {
           reported(
-            s,
+            style,
             "publish",
-            [interface_refused(m.name ++ "` " ++ version, sent.status, said(sent))],
+            [interface_refused(manifest.name ++ "` " ++ version, sent.status, said(sent))],
             [],
           )
         },
       }
     } else {
       reported(
-        s,
+        style,
         "publish",
-        [refused_by("publish `" ++ m.name ++ "` " ++ version, answer.status, said(answer))],
+        [refused_by("publish `" ++ manifest.name ++ "` " ++ version, answer.status, said(answer))],
         [],
       )
     },

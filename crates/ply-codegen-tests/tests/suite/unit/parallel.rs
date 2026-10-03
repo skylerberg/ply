@@ -1,29 +1,12 @@
-use ply_codegen::Source;
 use ply_codegen::c::Native;
 use ply_codegen::heap::{Heap, Word, imm};
-use ply_eval::{Analysis, SourceId, Symbol, Value, codes};
-use std::collections::HashMap;
+use ply_eval::{Analysis, Symbol, Value, codes};
 
 /// The front and the unit over `text`, module `m`; `None` on a host with no C compiler.
 fn built(text: &str) -> Option<(&'static Analysis, Native)> {
-    let named = [("m".to_string(), text.to_string())];
-    let front: &'static Analysis = Box::leak(Box::new(
-        ply_codegen::c::producer::checked_analysis(&named, &[SourceId(0)]).expect("checks"),
-    ));
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(front).with_texts(HashMap::from(named)),
-    ));
-    let names = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let _config = super::c::CONFIG.read().unwrap_or_else(|e| e.into_inner());
-    match ply_codegen::c::build(source, &refs) {
-        Ok((native, refused)) => {
-            assert!(refused.is_empty(), "{refused:?}");
-            Some((front, native))
-        }
-        Err(e) if e.to_string().contains("could not run") => None,
-        Err(e) => panic!("{e}"),
-    }
+    let (source, native, refused) = crate::fixture::with_refusals(text)?;
+    assert!(refused.is_empty(), "{refused:?}");
+    Some((source.front, native))
 }
 
 const PROGRAM: &str = r#"
