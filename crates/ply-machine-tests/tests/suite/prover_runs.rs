@@ -1,7 +1,7 @@
 //! The claims family over more than one run: every `configure` begins a run of its own, whatever
 //! the last one was left doing, and each run's static tier answers for that run's claims.
 
-use crate::fixture::{handed, int_laws, project};
+use crate::fixture::{handed, int_laws, project, unit};
 use ply_eval::host::{
     HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, MachineId, Pending,
 };
@@ -173,6 +173,7 @@ fn a_second_configuration_is_a_second_run_over_its_own_project() {
                 "the second run collected the first project"
             );
         }
+        ok(ask(&lent, "compiled", vec![unit(dir.path())]));
         ok(ask(
             &lent,
             "prepared",

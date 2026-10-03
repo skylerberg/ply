@@ -29,8 +29,6 @@ pub struct Loaded {
     /// [`Front::hashes`].
     pub hashes: HashOutput,
     pub frontend: FrontEnd,
-    /// Whether any module declares a `reuse fn`, so the promise check can be skipped.
-    pub promised: bool,
 }
 
 /// Carries the [`SourceMap`]: a parse error is useless without the text its spans point into.

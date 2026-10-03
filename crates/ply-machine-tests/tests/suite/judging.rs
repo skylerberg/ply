@@ -2,7 +2,7 @@
 //! interleavings searched at the points its guard kept. Which points those are, and what their
 //! judgements come to, is `proof.property`'s, pinned by its own tests.
 
-use crate::fixture::{loaded, project};
+use crate::fixture::{backend, loaded, project};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId, Pending,
@@ -74,8 +74,7 @@ fn capped(index: usize) -> Obligation {
 fn with_prover<R>(f: impl FnOnce(&Prover) -> R) -> R {
     let dir = project(SOURCE);
     let loaded = loaded(dir.path());
-    let backend =
-        ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier");
+    let backend = backend(&loaded);
     f(&Prover::new(&loaded, backend))
 }
 
@@ -337,9 +336,7 @@ fn a_hosted_claim_reaches_the_host_and_hands_back_what_its_entries_ended_with() 
         counter.clone(),
     );
     let binding = registry.bind(&loaded.check).expect("the counter binds");
-    let backend =
-        ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier");
-    let prover = Prover::new(&loaded, backend).with_hosting(Hosting {
+    let prover = Prover::new(&loaded, backend(&loaded)).with_hosting(Hosting {
         binding: Arc::new(binding),
         runtime: Some(Arc::new(|| Rc::new(Warns) as Rc<dyn HostRuntime>)),
     });
