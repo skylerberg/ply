@@ -538,7 +538,7 @@ effect amb { read flip[coin]() -> Bool }
 
 type Saved = Nothing | Just((Bool) -> Int)
 
-fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
+fn parked() -> Saved / {abort.raise} = with_cell[slot](Nothing) { s -> {
   let inner = handle {
     if amb.flip[coin]() { 41 } else { 0 }
   } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 } };
@@ -546,7 +546,7 @@ fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
   cell_get(s)
 } }
 
-pub fn continuation_inside() -> { saved: List<Saved> } = { saved: [Nothing, parked()] }
+pub fn continuation_inside() -> { saved: List<Saved> } / {abort.raise} = { saved: [Nothing, parked()] }
 
 pub fn closure_inside(n: Int) -> { saved: List<Saved> } =
   { saved: [Nothing, Just(|b: Bool| if b { n } else { 0 })] }

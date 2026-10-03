@@ -149,7 +149,7 @@ effect counter {
   read peek() -> Int
 }
 
-effect abort {
+effect halt {
   write stop(code: Int) -> Int
 }
 
@@ -172,9 +172,9 @@ fn nested(seed: Int) -> Int =
 
 fn guarded(n: Int) -> Int =
   handle {
-    if n > 10 { abort.stop(n) } else { n * 2 }
+    if n > 10 { halt.stop(n) } else { n * 2 }
   } with {
-    abort.stop(code) resume k -> 0 - code,
+    halt.stop(code) resume k -> 0 - code,
     return x -> x + 1000,
   }
 "#;
@@ -484,7 +484,7 @@ fn work(n: Int) -> Int / {clock.read, clock.write} {
   t + n
 }
 
-fn ordered(seed: Int) -> Int / {sim.read} =
+fn ordered(seed: Int) -> Int / {sim.read, abort.raise} =
   simulate {
     let a = task.spawn(|| work(seed));
     let b = task.spawn(|| work(seed * 2));
@@ -498,7 +498,7 @@ fn timed(n: Int) -> Int / {sim.read} = simulate {
 
 fn drawn(bound: Int) -> Int / {sim.read} = simulate { random.below(bound) * 7 + random.below(bound) }
 
-fn racing(n: Int) -> Int / {sim.read} =
+fn racing(n: Int) -> Int / {sim.read, abort.raise} =
   with_cell[r](0) { c ->
     simulate {
       let t = task.spawn(|| {
@@ -732,7 +732,7 @@ fn siblings(seed: Int) -> Int =
     return x -> x
   }
 
-fn across(seed: Int) -> Int / {cell.read[n], cell.write[n], sim.read} =
+fn across(seed: Int) -> Int / {cell.read[n], cell.write[n], sim.read, abort.raise} =
   with_cell[n](seed) { c -> {
     handle {
       simulate {
@@ -850,9 +850,9 @@ effect slow {
   write fetch(n: Int) -> Int
 }
 
-fn spawned(n: Int) -> Int / {task.write} = { let t = task.spawn(|| n * 2); task.join(t) + 1 }
+fn spawned(n: Int) -> Int / {task.write, abort.raise} = { let t = task.spawn(|| n * 2); task.join(t) + 1 }
 
-fn parked(n: Int) -> Int / {slow.write, task.write} = {
+fn parked(n: Int) -> Int / {slow.write, task.write, abort.raise} = {
   let t = task.spawn(|| slow.fetch(n));
   task.join(t) + slow.fetch(n + 1)
 }

@@ -118,7 +118,7 @@ type Answer = { failed: Int, held: Int, rejected: Int, first: String }
 /// The points judged: `n` from zero, one batch each, so a failing point ends only its own batch.
 fn cases() -> Int = 64
 
-fn judged_at(index: Int) -> Answer / {prover.judged[claims]} = {
+fn judged_at(index: Int) -> Answer / {prover.judged[claims], abort.raise} = {
   let points = map(range(0, cases()), |n: Int| [VInt(n)]);
   let answers = prover.judged[claims](map(points, |p: List<Value>| { claim: index, points: [p], mode: MWhole }));
   fold(range(0, len(answers)), { failed: 0, held: 0, rejected: 0, first: "" }, |seen: Answer, i: Int|
@@ -134,7 +134,7 @@ fn judged_at(index: Int) -> Answer / {prover.judged[claims]} = {
     })
 }
 
-fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.prepared[claims], prover.judged[claims]} = {
+fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.prepared[claims], prover.judged[claims], abort.raise} = {
   prover.configure[claims]({
     path: root,
     no_incremental: false,
