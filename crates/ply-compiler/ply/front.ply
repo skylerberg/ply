@@ -2506,6 +2506,44 @@ pub fn analyse_pulling_std_with(
   }
 }
 
+// What a load of `user` pins, and nothing more of it: each dependency's name, version and digest,
+// read off the package closure and the embeds the driver read, so no module is parsed. A closure
+// that is refused answers its diagnostics, placed past the program's own modules where a load
+// places its manifests.
+pub fn pins_pulling(
+  user: List<Source>,
+  pkgs: PackageSources,
+  embeds: List<Embedded>,
+) -> Result<List<Pinned>, List<Diag>> = {
+  let clo = closure(pkgs, map(user, |source: Source| source.name));
+  let sources = append(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
+  if len(clo.diags) > 0 {
+    Err(
+      map(clo.diags, |sd: { slot: Int, diag: ParseDiag }|
+        if sd.slot < 0 { placed(0 - sd.slot - 1, sd.diag) }
+        else { placed(len(sources) + sd.slot, sd.diag) }),
+    )
+  } else {
+    let slots = own_names(pkgs, user);
+    let tables = embed_reads(embeds);
+    let read = fold(range(0, len(sources)), [], |acc: List<EmbedAt>, i: Int| {
+      let source = at(sources, i);
+      match list_at(slots, i) {
+        Some(slot) -> if !names_embed(source.src) { acc } else {
+          match map_get(tables, slot) {
+            Some(table) ->
+              map_fold(table, acc, |a: List<EmbedAt>, key: Bytes, read: EmbedRead|
+                push(a, { module: source.name, key: key, read: read })),
+            None -> acc,
+          }
+        },
+        None -> acc,
+      }
+    });
+    Ok(pins_of(clo, read))
+  }
+}
+
 // --- Embeds ----------------------------------------------------------------------------------
 
 // What the driver read for one embed: the module by its package's root key and its own name in that
@@ -2538,17 +2576,21 @@ fn own_names(pkgs: PackageSources, user: List<Source>) -> List<Bytes> =
 
 // Every module that names `embed` with its embeds written out, a read that failed as its
 // diagnostic, and the reads by each module's name in the program.
+// What the driver read, by each module's slot and each embed's key.
+fn embed_reads(embeds: List<Embedded>) -> Map<Bytes, Map<Bytes, EmbedRead>> =
+  fold(embeds, map_new(), |acc: Map<Bytes, Map<Bytes, EmbedRead>>, embed: Embedded| {
+    let slot = embed_slot(embed.root, embed.module);
+    let was = match map_get(acc, slot) { Some(t) -> t, None -> map_new() };
+    map_insert(acc, slot, map_insert(was, embed_key(embed.want), embed.read))
+  })
+
 fn embedded_all(
   parsed: List<ParsedSource>,
   slots: List<Bytes>,
   mentions: List<Bool>,
   embeds: List<Embedded>,
 ) -> { parsed: List<ParsedSource>, at: List<EmbedAt> } = {
-  let tables = fold(embeds, map_new(), |acc: Map<Bytes, Map<Bytes, EmbedRead>>, embed: Embedded| {
-    let slot = embed_slot(embed.root, embed.module);
-    let was = match map_get(acc, slot) { Some(t) -> t, None -> map_new() };
-    map_insert(acc, slot, map_insert(was, embed_key(embed.want), embed.read))
-  });
+  let tables = embed_reads(embeds);
   fold(
     range(0, len(parsed)),
     { parsed: [], at: [] },
@@ -4725,6 +4767,36 @@ test "a rehash writes the embeds the answer carries" {
     embedding_in({ root: b"r", manifest: None, supplied: [] }, sources, [a_file(b"one")]),
   );
   assert(len(rehash(sources, [], w.packages, w.mod_pkg, len(w.packages), w.embeds).nodes) > 0)
+}
+
+test "the pins read off the closure are the pins an analysis answers, embeds included" {
+  let user = [{ name: b"main", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let pkgs = with_lib(user);
+  let lib = at(pkgs.supplied, 0);
+  let embedding = {
+    ..pkgs,
+    supplied: [
+      {
+        ..lib,
+        modules: [
+          { name: b"answer", src: b"pub fn answer() -> Int = bytes_len(embed(\"n.txt\"))" },
+        ],
+      },
+    ],
+  };
+  let reads = [
+    {
+      root: b"lib",
+      module: b"answer",
+      want: { path: b"n.txt", dir: false },
+      read: Ok([{ name: b"", bytes: b"one" }]),
+    },
+  ];
+  let analysed = checked_analysis(
+    analyse_pulling_std_with(user, [], [], [], embedding, no_interfaces(), reads).out,
+  ).pins;
+  assert_eq(len(analysed), 1);
+  assert_eq(pins_pulling(user, embedding, reads), Ok(analysed))
 }
 
 test "a dependency is pinned by what its modules embed as well as by their text" {
