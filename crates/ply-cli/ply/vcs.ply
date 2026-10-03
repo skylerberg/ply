@@ -1,0 +1,181 @@
+// A dependency that lives in a git repository: fetched once per project, then read like any other
+// package root. The front end judges it by the key its fetch is named under, `git+<url>@<rev>`, so
+// where a tree lands reaches no package judgment. A `rev` may be a branch or a tag, and a branch
+// that moved is caught by the lockfile, whose digest of the fetched sources is checked before a
+// build writes anything.
+
+import builder (builder)
+import env (env)
+import paths
+import std.bytes (hex_of)
+import std.fs (fs, Dir, Missing)
+import std.path (join, parent)
+import std.process (process, exit_code, var, Finished, Exited)
+
+// What a fetch reaches: the `git` the run binds, given the run's own environment, and the
+// project's cache.
+pub effect set Fetches = {process.bound[git], process.spawn[git], env.vars[sys], fs.kind[cwd], fs.kind[abs], fs.create_dir[cwd], fs.create_dir[abs], abort.raise}
+
+// `body` with every git dependency it meets fetched here.
+pub fn fetching<a | e>(body: () -> a / {builder.git[vcs] | e}) -> a / {Fetches | e} =
+  handle { body() } with { builder.git[vcs](root, key) -> fetched(root, key) }
+
+type Remote = { url: String, rev: String }
+
+// The url and revision a key names, read from the last `@`: a url may hold one of its own
+// (`git@host:path`), and a revision never does.
+fn remote(key: String) -> Option<Remote> / {abort.raise} =
+  if !string_starts_with(key, "git+") { None } else {
+    let parts = string_split(string_slice(key, 4, string_len(key)), "@");
+    let last = len(parts) - 1;
+    match list_at(parts, last) {
+      None -> None,
+      Some(rev) -> {
+        let url = fold(range(0, last), "", |acc: String, i: Int|
+          match list_at(parts, i) {
+            Some(p) -> if i == 0 { p } else { acc ++ "@" ++ p },
+            None -> acc,
+          });
+        if url == "" || rev == "" { None } else { Some({ url: url, rev: rev }) }
+      },
+    }
+  }
+
+// The directory a key is fetched into: under the project's own cache, named by the key, so two
+// projects never share a tree and one key is one directory.
+fn tree(root: String, key: String) -> String / {abort.raise} =
+  join(join(join(root, ".ply-cache"), "git"), hex_of(bytes_blake3(bytes_of_string(key))))
+
+fn git(args: List<String>) -> Finished / {process.spawn[git], env.vars[sys]} =
+  process.spawn[git](
+    args,
+    "",
+    map(env.vars[sys](), |v: { name: String, value: String }| var(v.name, v.value)),
+  )
+
+fn ran(args: List<String>) -> Bool / {process.spawn[git], env.vars[sys]} =
+  exit_code(git(args)) == Some(0)
+
+// The commit a revision names. A branch is looked up as the local ref a checkout would make or as
+// the remote-tracking one a clone makes, and a commit or tag resolves as itself.
+fn commit(dir: String, rev: String) -> Option<String> / {process.spawn[git], env.vars[sys]} =
+  fold([rev, "origin/" ++ rev], None, |found: Option<String>, name: String|
+    match found {
+      Some(_) -> found,
+      None -> {
+        let f = git(["-C", dir, "rev-parse", "--verify", "--quiet", name ++ "^{commit}"]);
+        if exit_code(f) == Some(0) { Some(string_trim(string_of_bytes_lossy(f.out))) } else { None }
+      },
+    })
+
+fn checkout(dir: String, commit: String) -> Bool / {process.spawn[git], env.vars[sys]} =
+  ran(["-C", dir, "checkout", "--quiet", "--force", commit])
+
+// A tree the cache already holds is used as it is: fetching again would ask the remote what a
+// branch means today, and a load that has the sources should not need the network. So a cleared
+// cache is what picks up a moved branch, and the lockfile's digest is what catches it.
+fn checked_out(dir: String, rev: String) -> Bool / {process.spawn[git], env.vars[sys]} =
+  match commit(dir, rev) {
+    Some(c) -> checkout(dir, c),
+    // `--all --tags`: a revision may be any reachable commit, on a branch the clone did not take.
+    None ->
+      ran(["-C", dir, "fetch", "--quiet", "--all", "--tags"])
+        && (match commit(dir, rev) { Some(c) -> checkout(dir, c), None -> false }),
+  }
+
+// The tree `key` names, fetched when the cache does not hold it; `None` when it could not be,
+// which the front end reports as a dependency that was not fetched.
+fn fetched(root: String, key: String) -> Option<String> / {Fetches} =
+  if !process.bound[git]() { None } else {
+    match remote(key) {
+      None -> None,
+      Some(r) -> {
+        let dir = tree(root, key);
+        let held = paths::kind(paths::spelled(join(dir, ".git"))) != Missing;
+        let there = held
+          || (paths::create_dir(paths::spelled(parent(dir)))
+          && ran(["clone", "--quiet", "--no-checkout", r.url, dir]));
+        if there && checked_out(dir, r.rev) { Some(dir) } else { None }
+      },
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+test "a key's url and revision part at the last `@`" {
+  assert_eq(
+    remote("git+https://host/lib.git@v1"),
+    Some({ url: "https://host/lib.git", rev: "v1" }),
+  );
+  assert_eq(remote("git+git@host:lib.git@main"), Some({ url: "git@host:lib.git", rev: "main" }));
+  assert_eq(remote("git+https://host/lib.git"), None);
+  assert_eq(remote("git+@main"), None);
+  assert_eq(remote("git+https://host/lib.git@"), None);
+  assert_eq(remote("https://host/lib.git@v1"), None)
+}
+
+// What the handler spawned, each as its arguments joined, and what it answered.
+fn fetch_over(
+  held: Bool,
+  bound: Bool,
+  answers: (List<String>) -> Int,
+) -> { answer: Option<String>, ran: List<String> } / {abort.raise} =
+  with_cell[log]([]) { log -> {
+    let answer = handle {
+      fetching(|| builder.git[vcs]("app", "git+https://host/lib.git@main"))
+    } with {
+      process.bound[git]() -> bound,
+      process.spawn[git](args, dir, env) -> {
+        cell_set(log, push(cell_get(log), spaced(args)));
+        { ended: Exited(answers(args)), out: b"0123abc\n", err: b"" }
+      },
+      env.vars[sys]() -> [{ name: "HOME", value: "/home" }],
+      fs.kind[cwd](p) -> if held { Dir } else { Missing },
+      fs.kind[abs](p) -> panic("the project is under the working directory"),
+      fs.create_dir[cwd](p) -> true,
+      fs.create_dir[abs](p) -> panic("the project is under the working directory"),
+    };
+    { answer: answer, ran: cell_get(log) }
+  } }
+
+fn spaced(args: List<String>) -> String =
+  fold(range(0, len(args)), "", |acc: String, i: Int|
+    match list_at(args, i) { Some(a) -> if i == 0 { a } else { acc ++ " " ++ a }, None -> acc })
+
+fn where() -> String / {abort.raise} =
+  "app/.ply-cache/git/" ++ hex_of(bytes_blake3(b"git+https://host/lib.git@main"))
+
+test "a tree the cache does not hold is cloned, then checked out at the commit its revision names" {
+  let f = fetch_over(false, true, |args: List<String>| 0);
+  assert_eq(f.answer, Some(where()));
+  assert_eq(f.ran, [
+    "clone --quiet --no-checkout https://host/lib.git " ++ where(),
+    "-C " ++ where() ++ " rev-parse --verify --quiet main^{commit}",
+    "-C " ++ where() ++ " checkout --quiet --force 0123abc",
+  ])
+}
+
+test "a tree the cache holds is neither cloned nor fetched while it has the revision" {
+  let f = fetch_over(true, true, |args: List<String>| 0);
+  assert_eq(f.answer, Some(where()));
+  assert_eq(len(f.ran), 2)
+}
+
+test "a revision the tree does not have is fetched for, and one no fetch brings is not fetched" {
+  let f = fetch_over(true, true, |args: List<String>|
+    if list_at(args, 2) == Some("rev-parse") { 1 } else { 0 });
+  assert_eq(f.answer, None);
+  assert_eq(f.ran, [
+    "-C " ++ where() ++ " rev-parse --verify --quiet main^{commit}",
+    "-C " ++ where() ++ " rev-parse --verify --quiet origin/main^{commit}",
+    "-C " ++ where() ++ " fetch --quiet --all --tags",
+    "-C " ++ where() ++ " rev-parse --verify --quiet main^{commit}",
+    "-C " ++ where() ++ " rev-parse --verify --quiet origin/main^{commit}",
+  ])
+}
+
+test "a run that binds no `git` fetches nothing" {
+  let f = fetch_over(false, false, |args: List<String>| 0);
+  assert_eq(f.answer, None);
+  assert_eq(f.ran, [])
+}
