@@ -186,7 +186,7 @@ fn a_declined_entry_counts_no_steps() {
 const REGION: &str = r#"
 pub fn constant() -> Int = 7
 
-pub fn raced() -> Int / {sim.read} = simulate {
+pub fn raced() -> Int / {sim.read, abort.raise} = simulate {
   let a = task.spawn(|| 1);
   let b = task.spawn(|| 2);
   task.join(a) + task.join(b)
