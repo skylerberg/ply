@@ -1674,7 +1674,7 @@ fn slots_read(c: Code) -> List<Int> =
         match b.tail { Some(t) -> slots_read(t), None -> [] },
       ),
     NList(l) -> all_read(l.items),
-    NRecord(r) -> all_read(map(r.fields, |f: CField| f.value)),
+    NRecord(r) -> fields_read(r.fields, []),
     NMatch(m) ->
       concat(
         slots_read(m.scrutinee),
@@ -1684,7 +1684,7 @@ fn slots_read(c: Code) -> List<Int> =
             concat(match a.guard { Some(g) -> slots_read(g), None -> [] }, slots_read(a.body)),
           )),
       ),
-    NUpd(u) -> concat(slots_read(u.base), all_read(map(u.sets, |f: CField| f.value))),
+    NUpd(u) -> fields_read(u.sets, slots_read(u.base)),
     NLabel(_) -> [],
     NPerform(p) -> concat(match p.label { Some(x) -> slots_read(x), None -> [] }, all_read(p.args)),
     NCell(c2) -> concat(slots_read(c2.init), slots_read(c2.body)),
@@ -1708,6 +1708,9 @@ fn slots_read(c: Code) -> List<Int> =
 
 fn all_read(xs: List<Code>) -> List<Int> =
   fold(xs, [], |acc: List<Int>, x: Code| concat(acc, slots_read(x)))
+
+fn fields_read(fs: List<CField>, before: List<Int>) -> List<Int> =
+  fold(fs, before, |acc: List<Int>, f: CField| concat(acc, slots_read(f.value)))
 
 fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
   fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
@@ -6733,10 +6736,14 @@ fn param_kind_record(
     _ -> param_kind(t),
   }
 
+// Only a missing annotation is refused.
 pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
+  match t { Some(x) -> type_kind(x), None -> None }
+
+fn type_kind(t: TypeExpr) -> Option<{ k: Kind, ty: Ty }> =
   match t {
     // The prologue opens `Int` and `Bool`; everything else arrives and is read as a word.
-    Some(TCon(c)) ->      // Another module's type is a word of unknown shape.
+    TCon(c) ->      // Another module's type is a word of unknown shape.
       if c.name.module != None { Some({ k: KBoxed, ty: TyOpen }) }
       else if c.name.name.name == b"Int" && len(c.args) == 0 { Some({ k: KInt, ty: TyOpen }) }
       else if c.name.name.name == b"Bool" && len(c.args) == 0 { Some({ k: KBool, ty: TyOpen }) }
@@ -6753,22 +6760,21 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
         }
       } else { Some({ k: KBoxed, ty: TyOpen }) },
     // Field order is the checker's (sorted by name), not the declaration's.
-    Some(TRecord(r)) -> if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
-        acc || param_kind(Some(f.ty)) == None) { None } else {
+    TRecord(r) -> if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
+        acc || type_kind(f.ty) == None) { None } else {
       Some({
         k: KBoxed,
         ty: TyRec(
           map(r.fields, |f: { name: Ident, ty: TypeExpr }|
-            match param_kind(Some(f.ty)) {
+            match type_kind(f.ty) {
               Some(x) -> { name: f.name.name, k: x.k, ty: x.ty },
               None -> { name: f.name.name, k: KBoxed, ty: TyOpen },
             }),
         ),
       })
     },
-    // Any other written type is a word; only a missing annotation is refused.
-    Some(_) -> Some({ k: KBoxed, ty: TyOpen }),
-    None -> None,
+    // Any other written type is a word.
+    _ -> Some({ k: KBoxed, ty: TyOpen }),
   }
 
 pub fn emit_fn(
@@ -8428,25 +8434,22 @@ fn has_handle(c: Code) -> Bool = {
     NField(f) -> has_handle(f.base),
     NApp(a) -> within(push(a.args, a.func)),
     NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
-    NBlock(b) -> {
-      let tail = match b.tail { Some(t) -> [t], None -> [] };
-      within(
-        fold(b.stmts, tail, |acc: List<Code>, st: CStmt|
-          match st {
-            CLet(l) -> push(acc, l.value),
-            CLetPat(l) -> push(acc, l.value),
-            CDo(d) -> push(acc, d.code),
-          }),
-      )
-    },
+    NBlock(b) ->
+      (match b.tail { Some(t) -> has_handle(t), None -> false })
+        || fold(b.stmts, false, |acc: Bool, st: CStmt|
+          acc
+            || (match st {
+              CLet(l) -> has_handle(l.value),
+              CLetPat(l) -> has_handle(l.value),
+              CDo(d) -> has_handle(d.code),
+            })),
     NList(l) -> within(l.items),
     NRecord(r) -> within(map(r.fields, |f: CField| f.value)),
     NUpd(u) -> within(push(map(u.sets, |f: CField| f.value), u.base)),
     NMatch(m) ->
-      within(
-        fold(m.arms, [m.scrutinee], |acc: List<Code>, a: CArm|
-          match a.guard { Some(g) -> push(push(acc, g), a.body), None -> push(acc, a.body) }),
-      ),
+      has_handle(m.scrutinee)
+        || fold(m.arms, false, |acc: Bool, a: CArm|
+          acc || (match a.guard { Some(g) -> has_handle(g), None -> false }) || has_handle(a.body)),
     NPerform(p) -> within(p.args),
     NCell(c2) -> within([c2.init, c2.body]),
     NLambda(l) -> has_handle(l.body),
