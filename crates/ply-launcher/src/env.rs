@@ -1,6 +1,7 @@
 //! The environment a launched program runs in, as a lent effect: the variables, whether the
 //! streams are terminals, the working directory, the binary's own version and shipped digest, the
-//! directory `ply run` files the fronts it reuses in, and the one the emitter's answers are kept in.
+//! directory `ply run` and `ply check` file what they reuse in, and the one the emitter's answers
+//! are kept in.
 //! Bound by the launcher for the program it enters — user programs read configuration, not the
 //! environment.
 //!
