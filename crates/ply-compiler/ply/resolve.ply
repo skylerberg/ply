@@ -958,7 +958,8 @@ pub fn find(
           qname.name.name,
         ) {
         None -> None,
-        Some(d) -> if !d.public { None }
+        // Only a default copied back into its module binds that module, which sees what it keeps.
+        Some(d) -> if !d.public && mb.target != module { None }
         else { lookup(at(resolved.declared, mb.target), namespace, qname.name.name) },
       },
     },
@@ -3480,5 +3481,172 @@ test "a set is refused where it is named when nothing declares it, its module ke
       },
     ]),
     [b"E0105"],
+  )
+}
+
+fn lib_and_app(lib: Bytes, app: Bytes) -> List<Source> =
+  [{ name: b"lib", src: lib }, { name: b"app", src: app }]
+
+test "a missing module, an import cycle and two modules of one name are refused" {
+  assert_eq(
+    refused_codes([
+      { name: b"app", src: b"import nowhere\nimport std.nowhere\nfn f() -> Int = 1" },
+    ]),
+    [b"E0106", b"E0106"],
+  );
+  assert_eq(refused_codes([{ name: b"me", src: b"import me\nfn f() -> Int = 1" }]), [b"E0109"]);
+  assert_eq(
+    refused_codes([
+      { name: b"a", src: b"import b\npub fn fa() -> Int = 1" },
+      { name: b"b", src: b"import c\npub fn fb() -> Int = 1" },
+      { name: b"c", src: b"import a\npub fn fc() -> Int = 1" },
+    ]),
+    [b"E0109"],
+  );
+  assert_eq(
+    refused_codes([
+      { name: b"twin", src: b"pub fn x() -> Int = 1" },
+      { name: b"twin", src: b"pub fn y() -> Int = 2" },
+    ]),
+    [b"E0105"],
+  )
+}
+
+test "an imported name is refused when its module keeps or lacks it, the importer declares it, or another import binds it" {
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        b"fn secret() -> Int = 1\npub fn shown() -> Int = 2",
+        b"import lib (secret, shown, absent)\nfn f() -> Int = shown()",
+      ),
+    ),
+    [b"E0107", b"E0101"],
+  );
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        b"type Hidden = | H1 | H2\npub type Shown = | S1 | S2",
+        b"import lib (H1, S1)\nfn f() -> Int = 1",
+      ),
+    ),
+    [b"E0107"],
+  );
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        b"pub fn place() -> Int = 1\npub type Order = { id: Int }",
+        b"import lib (place, Order)\nfn place() -> Int = 2\ntype Order = { id: Bytes }\nfn f() -> Int = place()",
+      ),
+    ),
+    [b"E0108", b"E0108"],
+  );
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        b"pub fn a() -> Int = 1",
+        b"import lib\nimport lib\nimport lib as lib\nfn f() -> Int = lib::a()",
+      ),
+    ),
+    [b"E0110", b"E0110"],
+  );
+  assert_eq(
+    refused_codes([
+      { name: b"lib", src: b"pub fn a() -> Int = 1" },
+      { name: b"other", src: b"pub fn a() -> Int = 2" },
+      { name: b"app", src: b"import lib (a)\nimport other (a)\nfn f() -> Int = a()" },
+    ]),
+    [b"E0110"],
+  )
+}
+
+test "a module imported whole and by name resolves both ways, its type bringing the constructors" {
+  assert_eq(
+    refused_codes([
+      {
+        name: b"base",
+        src: b"pub fn one() -> Int = 1\npub type Shape = | Circle(Int) | Square(Int)\npub effect log { write emit(Bytes) -> Unit }\nfn hidden() -> Int = 2",
+      },
+      {
+        name: b"app",
+        src: b"import base\nimport base (one, Shape, log)\nfn two() -> Int = one() + base::one()\nfn s(x: Shape) -> Int = match x { Circle(r) -> r, Square(w) -> w }",
+      },
+    ]),
+    [],
+  )
+}
+
+fn defaults_lib() -> Bytes =
+  b"pub type Mode = | Fast | Slow\npub fn greet(name: Bytes = b\"world\", times: Int = 1) -> Bytes = name\npub fn run(m: Mode = Fast, n: Int = 0) -> Int = n\npub fn scale(v: Int, by: Int = 2) -> Int = v * by"
+
+test "a call resolves with its parameters left to their defaults, and a local of a callee's name shadows it" {
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        defaults_lib(),
+        b"import lib (greet, scale, run)\nfn a() -> Bytes = greet()\nfn b() -> Bytes = greet(b\"x\")\nfn c() -> Bytes = greet(times: 2)\nfn d() -> Bytes = greet(b\"x\", times: 2)\nfn e() -> Bytes = greet(times: 2, name: b\"y\")\nfn f() -> Int = scale(2)\nfn h() -> Int = run()\nfn i() -> Int = run(n: 4)\nfn j() -> Bool = assert(true)\nfn k() -> Int = { let greet = |x: Int| x; greet(1) }\nfn l() -> Int = { let run = 3; run }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a named argument is refused when it names no parameter or one twice, or leaves one unfilled" {
+  assert_eq(
+    refused_codes(
+      lib_and_app(defaults_lib(), b"import lib (greet)\nfn e() -> Bytes = greet(nope: 1)"),
+    ),
+    [b"E0123"],
+  );
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        defaults_lib(),
+        b"import lib (greet)\nfn d() -> Bytes = greet(b\"x\", times: 2, name: b\"y\")",
+      ),
+    ),
+    [b"E0123"],
+  );
+  assert_eq(
+    refused_codes(lib_and_app(defaults_lib(), b"import lib (scale)\nfn g() -> Int = scale(by: 3)")),
+    [b"E0125"],
+  );
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        defaults_lib(),
+        b"import lib (scale)\nfn h() -> Int = scale(2, 3, 4)\nfn k() -> Int = Some(x: 1)\nfn j() -> Int = { let scale = |x: Int| x; scale(x: 1) }",
+      ),
+    ),
+    [b"E0123", b"E0123"],
+  )
+}
+
+test "a default is refused when it calls, names a parameter, or names what its module keeps" {
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        b"pub fn f(n: Int = g(1)) -> Int = n\npub fn g(n: Int) -> Int = n",
+        b"import lib (f)\nfn a() -> Int = f()",
+      ),
+    ),
+    [b"E0121"],
+  );
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        b"pub fn h(n: Int, m: Int = n) -> Int = m",
+        b"import lib (h)\nfn b() -> Int = h(1)",
+      ),
+    ),
+    [b"E0121"],
+  );
+  assert_eq(
+    refused_codes(
+      lib_and_app(
+        b"fn helper() -> Int = 3\npub fn leaky(n: Int = helper) -> Int = n",
+        b"import lib (leaky)\nfn a() -> Int = leaky()",
+      ),
+    ),
+    [b"E0122"],
   )
 }
