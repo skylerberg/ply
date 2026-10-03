@@ -515,14 +515,14 @@ pub struct Ctx {
     pub site_end: i64,
     /// Calls this entry has made: the prologue counts one, and so does every pass of a loop.
     pub ticks: i64,
-    /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
-    /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
-    pub charged: Cost,
     /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
     /// nor the clock bounds this entry, so nothing calls back at all.
     pub next_tick: i64,
     /// The calls this entry may make; 0 is no bound.
     step_budget: i64,
+    /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
+    /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
+    pub charged: Cost,
     /// Stacks this entry has been given beyond the one it started on, so growing is observable.
     pub grown: u64,
     /// When the running entry's time budget is spent, if it has one.
