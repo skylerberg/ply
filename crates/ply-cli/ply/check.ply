@@ -8,8 +8,8 @@ import builder (builder)
 import args (Flags, style_of, no_flags)
 import appends (costs_of, priced, promised, promises, report_lines, unresolved)
 import diagnostic (Place, all_to_json)
-import program (Program, Timed, ModuleFacts, timed_over, module_facts, published, is_shelved,
-                own_tests, placed_of)
+import program (Program, Timed, load_diagnostics, ModuleFacts, timed_over, module_facts, published,
+                is_shelved, own_tests, placed_of)
 import reused (Toolchain, entry_at, file, key_of, touched)
 import env (env)
 import paths
@@ -487,7 +487,7 @@ fn checked(
       timed,
       analysis,
       r,
-      filter(timed.program.diags, |diag: Diag| !is_shelved(timed.program, diag)),
+      filter(load_diagnostics(timed.program), |diag: Diag| !is_shelved(timed.program, diag)),
     )
   }
 }
@@ -591,15 +591,17 @@ fn with_front(a: Answer, front: (Json) -> Json) -> Answer =
     _ -> a,
   }
 
-fn reuse_said(front: Json, reused: Bool, key: String) -> Json =
+fn reuse_said(front: Json, said: List<Member>) -> Json =
   match front {
     Object(members) ->
-      Object(map_insert(map_insert(members, "reused", Bool(reused)), "key", Str(key))),
-    _ -> object([{ key: "reused", value: Bool(reused) }, { key: "key", value: Str(key) }]),
+      Object(
+        fold(said, members, |acc: Map<String, Json>, m: Member| map_insert(acc, m.key, m.value)),
+      ),
+    _ -> object(said),
   }
 
 // A check run now, and the answer a later check may take back: one the front end answered whole,
-// without what the front-end cache said of itself, which a run that does not read it never says.
+// without the cache's warnings, which a run that never reads the cache does not say.
 fn checked_now(
   flags: Flags,
   project: Project,
@@ -608,11 +610,15 @@ fn checked_now(
   let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps);
   match t.program.whole {
     None ->
-      { answer: refused(style_of(flags), "check", t.program.diags, t.program.places), filed: None },
+      {
+        answer: refused(style_of(flags), "check", load_diagnostics(t.program), t.program.places),
+        filed: None,
+      },
     Some(w) -> {
       let answer = checked(style_of(flags), flags, t, w);
-      let own = if len(t.own) == len(t.program.diags) { answer }
-      else { checked(style_of(flags), flags, { ..t, program: { ..t.program, diags: t.own } }, w) };
+      let own = if len(t.program.cache_warnings) == 0 { answer } else {
+        checked(style_of(flags), flags, { ..t, program: { ..t.program, cache_warnings: [] } }, w)
+      };
       { answer: answer, filed: Some(own) }
     },
   }
@@ -620,7 +626,7 @@ fn checked_now(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, env.binary_version[sys], env.shipped_digest[sys], env.fronts[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, env.binary_version[sys], env.shipped_digest[sys], env.reused[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise} = {
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
   // `--explain` says what this run's own phases took, which no filed answer knows.
@@ -630,14 +636,22 @@ pub fn run(
     match replayed(entry_at(key)) {
       Some(answer) -> {
         touched(key);
-        if flags.json { with_front(answer, |_: Json| reuse_said(object([]), true, key)) }
-        else { answer }
+        if !flags.json { answer } else {
+          with_front(answer, |_: Json|
+            object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(key) }]))
+        }
       },
       None -> {
         let now = checked_now(flags, project, started);
-        match now.filed { Some(own) -> file(key, filed_answer(own)), None -> () };
-        if flags.json { with_front(now.answer, |front: Json| reuse_said(front, false, key)) }
-        else { now.answer }
+        let filed = match now.filed { Some(own) -> file(key, filed_answer(own)), None -> false };
+        if !flags.json { now.answer } else {
+          with_front(now.answer, |front: Json|
+            reuse_said(front, [
+              { key: "reused", value: Bool(false) },
+              { key: "key", value: Str(key) },
+              { key: "filed", value: Bool(filed) },
+            ]))
+        }
       },
     }
   }
@@ -697,6 +711,7 @@ test "the longest phase is printed first, and the total accounts for all three" 
       files: [],
       places: [],
       diags: [],
+      cache_warnings: [],
       whole: None,
       pkgs: { root: b"", manifest: None, supplied: [] },
       through: [],
@@ -706,7 +721,6 @@ test "the longest phase is printed first, and the total accounts for all three" 
     front_ms: 90,
     file_ms: 8,
     cached: true,
-    own: [],
   });
   assert_eq(lines, [
     "",
