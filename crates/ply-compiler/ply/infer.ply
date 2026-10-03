@@ -323,6 +323,9 @@ type Cx = {
   group_rows: List<Int>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
+  // Each parameterless alias as an expansion made it where no label or row parameter was in scope,
+  // and the `Map` keys that expansion noted.
+  aliases: Map<Bytes, { t: Type, keys: List<MapKeySite> }>,
   refused_atoms: List<Span>,
   performs: List<PerformSite>,
   // The iteration around the expression being inferred, as `PerformSite.over` reads.
@@ -1719,35 +1722,60 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
                     ),
                   )
                 } else {
-                  let saved = g.cx.ty_params;
-                  let bound: Map<Bytes, Type> = fold(
-                    range(0, len(decl.params)),
-                    map_new(),
-                    |m: Map<Bytes, Type>, i: Int|
-                      map_insert(m, at(decl.params, i), at(converted.ts, i)),
-                  );
                   let outermost = len(g.cx.alias_stack) == 0;
                   let before = len(g.cx.map_keys);
-                  let inner: Cx = {
-                    ..g.cx,
-                    ty_params: bound,
-                    alias_stack: push(g.cx.alias_stack, qualified),
-                    module: decl.owner,
-                  };
-                  let o: WithTy = conv_type(inner, alias);
                   // A `Map` key's order is the using signature's to promise, so a refusal names the use.
-                  let keys = if outermost {
-                    relocated_keys(o.cx.map_keys, before, g.cx.module, span, name.name.name)
-                  } else { o.cx.map_keys };
-                  {
-                    cx: {
-                      ..o.cx,
-                      ty_params: saved,
-                      alias_stack: take(o.cx.alias_stack, len(o.cx.alias_stack) - 1),
-                      module: g.cx.module,
-                      map_keys: keys,
+                  let placed = |sites: List<MapKeySite>|
+                    if outermost {
+                      relocated_keys(sites, before, g.cx.module, span, name.name.name)
+                    } else { sites };
+                  // An atom's label and a row's tail name the using definition's parameters.
+                  let memo = len(decl.params) == 0 && map_len(g.cx.label_params) == 0
+                    && map_len(g.cx.row_params) == 0;
+                  match if memo { map_get(g.cx.aliases, qualified) } else { None } {
+                    Some(m) -> {
+                      let assumed = assumed_for(g.cx, DOrd);
+                      let keys = map(m.keys, |s: MapKeySite|
+                        { ..s, scope: g.cx.scope, assumed: assumed });
+                      { cx: { ..g.cx, map_keys: placed(append(g.cx.map_keys, keys)) }, t: m.t }
                     },
-                    t: o.t,
+                    None -> {
+                      let saved = g.cx.ty_params;
+                      let bound: Map<Bytes, Type> = fold(
+                        range(0, len(decl.params)),
+                        map_new(),
+                        |m: Map<Bytes, Type>, i: Int|
+                          map_insert(m, at(decl.params, i), at(converted.ts, i)),
+                      );
+                      let inner: Cx = {
+                        ..g.cx,
+                        ty_params: bound,
+                        alias_stack: push(g.cx.alias_stack, qualified),
+                        module: decl.owner,
+                      };
+                      let o: WithTy = conv_type(inner, alias);
+                      // Kept only when the expansion touched nothing but the keys it noted: a
+                      // fresh variable, a diagnostic or a refused atom belongs to the one use.
+                      let kept = memo && o.cx.fresh == g.cx.fresh
+                        && len(o.cx.diags) == len(g.cx.diags)
+                        && len(o.cx.refused_atoms) == len(g.cx.refused_atoms);
+                      {
+                        cx: {
+                          ..o.cx,
+                          ty_params: saved,
+                          alias_stack: take(o.cx.alias_stack, len(o.cx.alias_stack) - 1),
+                          module: g.cx.module,
+                          map_keys: placed(o.cx.map_keys),
+                          aliases: if kept {
+                            map_insert(o.cx.aliases, qualified, {
+                              t: o.t,
+                              keys: from_index(o.cx.map_keys, before),
+                            })
+                          } else { o.cx.aliases },
+                        },
+                        t: o.t,
+                      }
+                    },
                   }
                 },
               }
@@ -8246,6 +8274,9 @@ fn note_map_keys(cx: Cx, span: Span, ty: Type) -> Cx = {
   }
 }
 
+fn from_index(sites: List<MapKeySite>, from: Int) -> List<MapKeySite> =
+  fold(range(from, len(sites)), [], |acc: List<MapKeySite>, i: Int| push(acc, at(sites, i)))
+
 // The sites an alias expansion recorded from `from` on, moved to where the alias was named.
 fn relocated_keys(
   sites: List<MapKeySite>,
@@ -9547,6 +9578,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
     group_rows: [],
     auto_ty_params: false,
     alias_stack: [],
+    aliases: map_new(),
     refused_atoms: [],
     performs: [],
     over: None,
@@ -10590,6 +10622,32 @@ fn check_diags(src: Bytes) -> List<Diag> = {
 }
 
 fn check_codes(src: Bytes) -> List<Bytes> = map(check_diags(src), |dg: Diag| dg.code)
+
+test "a parameterless alias reads as if written out at each use, a label in it the user's own" {
+  let uses = |t: Bytes|
+    bytes_concat_all([
+      b"effect net { write send[r](Bytes) -> Unit }\ntype Sender = (Bytes) -> Unit / {net.send[l]}\n",
+      b"pub fn plain(f: ",
+      t,
+      b") -> Int = 1\npub fn relay<[l]>(f: ",
+      t,
+      b") -> Int = 1\npub fn again(f: ",
+      t,
+      b") -> Int = 1",
+    ]);
+  assert_eq(
+    check_dump([{ name: b"m", src: uses(b"Sender") }]),
+    check_dump([{ name: b"m", src: uses(b"(Bytes) -> Unit / {net.send[l]}") }]),
+  )
+}
+
+test "a `Map` key an alias leaves unordered is refused at every signature naming the alias" {
+  let src = b"type Keyed = Map<(Int) -> Int, Int>\nfn first(m: Keyed) -> Int = map_len(m)\nfn second(m: Keyed) -> Int = map_len(m)";
+  let primary = |d: Diag|
+    fold(d.labels, b"", |acc: Bytes, l: Label|
+      if l.primary { bytes_slice(src, l.start, l.end) } else { acc });
+  assert_eq(map(check_diags(src), primary), [b"Keyed", b"Keyed"])
+}
 
 fn fixes_of(diags: List<Diag>) -> List<Fix> =
   fold(diags, [], |acc: List<Fix>, dg: Diag| append(acc, dg.fixes))
