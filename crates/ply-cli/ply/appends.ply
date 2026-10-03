@@ -1,23 +1,41 @@
 // Where an update (`push`, `list_set`, `array_set`) copies, before the program runs: `ply check
 // --costs` reads it out, and a `reuse fn` whose body copies is refused with it.
 
-import compiler.costs (Report, Costed, Site, Unkept, costs)
+import compiler.costs (Report, Costed, Site, Unkept, costs, report_bin)
+import compiler.embed (EmbedAt, EmbedFile)
 import compiler.front (Analysis)
+import compiler.hash (hex)
 import compiler.items (Item, IFn)
-import compiler.resolve (Source, ParsedModule, Diag, error_at, error_at_and)
+import compiler.resolve (Source, ParsedModule, Diag, PackageDeps, error_at, error_at_and)
 import compiler.parsing (Span)
+import compiler.unit (read_kept, shelf_identity, shipped, write_kept)
 import diagnostic (Place, spot_of)
+import env (env)
 import program (Program, sourced)
 import report (ind, plural)
+import sources (under_abs)
 import style (Style, bold, dim, red, green, yellow)
+import std.bin
+import std.fs (fs)
+import std.hash (blake3)
+import std.random (entropy)
+import std.time (time)
 
 // Where the verdict column starts: wide enough for `stdlib.ply:1234:56`.
 fn location_width() -> Int = 22
 
+// A command asks for the cost checker's report on a program; what answers is `pricing`'s, which
+// `main` runs every command under, or a handler of the asker's own. The report is a function of the
+// program's text and of the checker, so the effect is a deterministic one, whatever the answering
+// keeps.
+pub effect priced {
+  read report(names: List<Bytes>, srcs: List<Bytes>, pkgs: List<PackageDeps>, mod_pkg: List<Int>, shelf: Int, embeds: List<EmbedAt>) -> Report
+}
+
 // Only the run's own updates: a dependency's are costed when it is the package checked.
-pub fn costs_of(p: Program, w: Analysis) -> Report = {
+pub fn costs_of(p: Program, w: Analysis) -> Report / {priced.report} = {
   let srcs: List<Source> = sourced(p, w);
-  let r = costs(
+  let r = priced.report(
     map(srcs, |s: Source| s.name),
     map(srcs, |s: Source| s.src),
     w.packages,
@@ -31,11 +49,107 @@ pub fn costs_of(p: Program, w: Analysis) -> Report = {
 // A `reuse fn` whose promise the cost checker cannot show, and a `returns` clause it cannot show of
 // its body, as the diagnostics a run is refused with; nothing at all when none of the run's own
 // modules writes either.
-pub fn broken_promises(p: Program, w: Analysis) -> List<Diag> =
+pub fn broken_promises(p: Program, w: Analysis) -> List<Diag> / {priced.report} =
   if !promised(p, w) { [] } else {
     let r = costs_of(p, w);
     if !r.ok { [unresolved()] }
     else { fold(r.unkept, promises(r), |acc: List<Diag>, u: Unkept| push(acc, unkept_returns(u))) }
+  }
+
+// What a report is a function of beyond the checker, `identity`: every module's name and text, the
+// packages and which each module is in, and what each module embeds.
+fn costs_key(
+  identity: Bytes,
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  pkgs: List<PackageDeps>,
+  mod_pkg: List<Int>,
+  shelf: Int,
+  embeds: List<EmbedAt>,
+) -> Bytes = {
+  let n = |i: Int| bytes_of_string(int_to_string(i));
+  let read = |e: EmbedAt|
+    match e.read {
+      Ok(files) ->
+        bytes_concat_all(
+          map(files, |f: EmbedFile| bytes_concat_all([f.name, b"\x00", blake3(f.bytes)])),
+        ),
+      Err(why) -> bytes_concat(b"!", why),
+    };
+  hex(
+    blake3(
+      bytes_concat_all([
+        b"ply.costs.1\x00",
+        hex(bin::shape_digest(report_bin())),
+        b"\x00",
+        identity,
+        b"\x00",
+        bytes_concat_all(
+          map(range(0, len(names)), |i: Int|
+            bytes_concat_all([
+              match list_at(names, i) { Some(x) -> x, None -> b"" },
+              b"\x00",
+              match list_at(srcs, i) { Some(x) -> blake3(x), None -> b"" },
+            ])),
+        ),
+        b"\x00",
+        bytes_concat_all(
+          map(pkgs, |p: PackageDeps|
+            bytes_concat_all([
+              p.prefix,
+              b"(",
+              bytes_concat_all(map(p.deps, |d: Bytes| bytes_concat(d, b","))),
+              b")",
+            ])),
+        ),
+        b"\x00",
+        bytes_concat_all(map(mod_pkg, |k: Int| bytes_concat(n(k), b","))),
+        b"\x00",
+        n(shelf),
+        b"\x00",
+        bytes_concat_all(
+          map(embeds, |e: EmbedAt|
+            bytes_concat_all([e.module, b"\x00", e.key, b"\x00", read(e), b"\x00"])),
+        ),
+      ]),
+    ),
+  )
+}
+
+// `body` with every cost report it asks for kept under the toolchain's cache, as the emitter's
+// answers are.
+pub fn pricing<a | e>(
+  body: () -> a / {priced.report | e},
+) -> a / {shipped.names, shipped.module, env.bodies[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  handle {
+    body()
+  } with {
+    priced.report(names, srcs, pkgs, mod_pkg, shelf, embeds) -> {
+      let dir = under_abs(env.bodies[sys]());
+      let key = costs_key(shelf_identity(), names, srcs, pkgs, mod_pkg, shelf, embeds);
+      let kept = match read_kept[abs](dir, key) {
+        Some(bytes) -> match bin::decode(bytes, report_bin()) { Ok(r) -> Some(r), Err(_) -> None },
+        None -> None,
+      };
+      match kept {
+        Some(r) -> r,
+        None -> {
+          let r = costs(names, srcs, pkgs, mod_pkg, shelf, embeds);
+          write_kept[abs](dir, key, bin::encode(r, report_bin()));
+          r
+        },
+      }
+    },
+  }
+
+// `body` with every cost report worked out afresh and kept nowhere: for a program that drives
+// another and has no toolchain cache of its own.
+pub fn pricing_fresh<a | e>(body: () -> a / {priced.report | e}) -> a / e =
+  handle {
+    body()
+  } with {
+    priced.report(names, srcs, pkgs, mod_pkg, shelf, embeds) ->
+      costs(names, srcs, pkgs, mod_pkg, shelf, embeds),
   }
 
 // Whether one of the run's own modules writes a `reuse fn` or a `returns` clause, so the promise
@@ -220,6 +334,20 @@ pub fn promises(r: Report) -> List<Diag> =
     })
 
 // --- Tests ------------------------------------------------------------------
+
+test "a cost report's key moves with the checker, a module's text, the packages and an embed" {
+  let srcs = [b"fn f() -> Int = 1", b"fn g() -> Int = 2"];
+  let embedded = |bytes: Bytes|
+    [{ module: b"m", key: b"file:x", read: Ok([{ name: b"", bytes: bytes }]) }];
+  let key = |identity: Bytes, texts: List<Bytes>, mod_pkg: List<Int>, embeds: List<EmbedAt>|
+    costs_key(identity, [b"m", b"n"], texts, [], mod_pkg, 1, embeds);
+  let base = key(b"c", srcs, [0, 0], []);
+  assert_eq(key(b"c", srcs, [0, 0], []), base);
+  assert(key(b"d", srcs, [0, 0], []) != base, None);
+  assert(key(b"c", [b"fn f() -> Int = 1", b"fn g() -> Int = 3"], [0, 0], []) != base, None);
+  assert(key(b"c", srcs, [0, 1], []) != base, None);
+  assert(key(b"c", srcs, [0, 0], embedded(b"1")) != key(b"c", srcs, [0, 0], embedded(b"2")), None)
+}
 
 fn place() -> List<Place> = [{ path: "src/m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }]
 
