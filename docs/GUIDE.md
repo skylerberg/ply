@@ -852,7 +852,8 @@ matched against `true` or `false`, or `list_at` or `array_at` answering
 keep the length. A list written of parts, one they are pushed onto, one
 `filter` keeps, one `map` makes of a part of each element, and what `fold`
 answers when each step answers the accumulator or a part (a lookup that starts
-at `None`) are made of parts.
+at `None`) are made of parts: each element is a part, though neither the list
+nor its tail need be smaller than what its parts are parts of.
 
 A function handed to `map`, `filter` or `fold` is called with each element; one
 handed to a definition outside the group is called as that definition calls
@@ -863,8 +864,10 @@ known.
 
 A definition whose group descends ends, and so does one calling only
 definitions that end. `ply check --types` marks `diverges` on any other and
-says why: its own recursion is not seen to descend, or it calls a definition,
-which it names, that may not return.
+says why, at the call's place: its own recursion is not seen to descend there,
+or it calls there a definition, which it names, that may not return. `ply check
+--json` gives each definition's `ending`: its `kind` (`ends`, `stated` or
+`diverges`) and, for one that diverges, `through` and `at`.
 
 `decreases <measure>`, after the other clauses, states an `Int` over the
 parameters that every call the group makes back into itself lowers while it

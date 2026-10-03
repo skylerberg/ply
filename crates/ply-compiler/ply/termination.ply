@@ -39,11 +39,12 @@ pub type Ending =
 pub type Place = { param: Int, path: List<Bytes> }
 
 // What an integer is offset from: a place; a length the place decides; a quotient by a literal
-// greater than one; or a remainder, which only its divisor bounds.
+// greater than one, under the operator that took it, since `/`, `>>` and `>>>` part below zero;
+// or a remainder, which only its divisor bounds, so it names no one value and is never measured.
 pub type Base =
   | PlaceBase(Place)
   | LengthBase({ name: Bytes, of: Place })
-  | QuotientBase({ of: Base, by: Int })
+  | QuotientBase({ of: Base, by: Int, op: Bytes })
   | RemainderBase({ by: Base })
 
 // `base + k`; no base is the constant `k`.
@@ -55,7 +56,8 @@ pub type Term =
   | Exactly(Linear)
   // A part of the place: smaller than it, however deep.
   | Below(Place)
-  // A value whose every part is a part of the place, though it need not be smaller itself.
+  // A value each of whose elements and fields is a part of the place: neither it nor, for a list
+  // rebuilt of parts, its tail need be smaller.
   | PartsOf(Place)
   // A record written out, its unwritten fields those of `base`.
   | RecordTerm({ base: Option<Term>, fields: List<{ name: Bytes, term: Term }> })
@@ -283,10 +285,21 @@ fn measures_of(
   let deep = fold(calls, params, |acc: List<Measure>, c: Call|
     fold(c.args, acc, |a: List<Measure>, t: Term| deeper_places(a, t)));
   fold(calls, deep, |acc: List<Measure>, c: Call|
-    fold(c.facts, acc, |a: List<Measure>, f: Fact|
-      if f.hi.base == f.lo.base { a }
-      else { with_measure(a, DifferenceMeasure({ hi: f.hi.base, lo: f.lo.base })) }))
+    fold(c.facts, acc, |a: List<Measure>, f: Fact| with_difference(a, f.hi.base, f.lo.base)))
 }
+
+// `hi - lo` as a measure, unless it is no distance or a remainder names no one value.
+fn with_difference(xs: List<Measure>, hi: Option<Base>, lo: Option<Base>) -> List<Measure> =
+  if hi == lo || remains(hi) || remains(lo) { xs }
+  else { with_measure(xs, DifferenceMeasure({ hi: hi, lo: lo })) }
+
+fn remains(b: Option<Base>) -> Bool =
+  match b {
+    None -> false,
+    Some(RemainderBase(_)) -> true,
+    Some(QuotientBase(q)) -> remains(Some(q.of)),
+    Some(_) -> false,
+  }
 
 // A difference a member's guard bounds, carried back along every call into it that hands it the
 // same difference of the caller's own, so a loop through members that test nothing still reads it.
@@ -299,8 +312,7 @@ fn spread(calls: List<List<Call>>, ms: List<List<Measure>>) -> List<List<Measure
           match measured(c, x) {
             DifferenceValue(v) -> match v.hi {
               Some(hi) -> match v.lo {
-                Some(lo) -> if hi.base == lo.base { m }
-                else { with_measure(m, DifferenceMeasure({ hi: hi.base, lo: lo.base })) },
+                Some(lo) -> with_difference(m, hi.base, lo.base),
                 None -> m,
               },
               None -> m,
@@ -385,7 +397,7 @@ fn base_at(args: List<Term>, b: Base) -> Option<Term> =
     QuotientBase(q) -> match base_at(args, q.of) {
       Some(Exactly(l)) -> match l.base {
         Some(x) -> if l.k != 0 { None }
-        else { Some(Exactly({ base: Some(QuotientBase({ of: x, by: q.by })), k: 0 })) },
+        else { Some(Exactly({ base: Some(QuotientBase({ ..q, of: x })), k: 0 })) },
         None -> None,
       },
       _ -> None,
@@ -594,7 +606,7 @@ fn project(t: Term, field: Bytes) -> Term =
     UnknownTerm -> UnknownTerm,
   }
 
-// A part of the value: a constructor's field, or a list's element or tail.
+// An element or a field of the value.
 fn below(t: Term) -> Term =
   match t {
     Exactly(l) -> match l.base {
@@ -606,7 +618,33 @@ fn below(t: Term) -> Term =
     _ -> UnknownTerm,
   }
 
-// A value made of parts of the value: what `list_at` finds in a list.
+// Any part of the value, such as a list's tail, which for a list rebuilt of a place's parts is
+// no part of the place.
+fn tail(t: Term) -> Term =
+  match t {
+    Exactly(l) -> match l.base {
+      Some(PlaceBase(p)) -> if l.k == 0 { Below(p) } else { UnknownTerm },
+      _ -> UnknownTerm,
+    },
+    Below(p) -> Below(p),
+    PartsOf(p) -> PartsOf(p),
+    _ -> UnknownTerm,
+  }
+
+// A value whose elements and fields are parts of the value, so parts of the place it is, or is a
+// part of; a list rebuilt of parts has tails that are neither.
+fn made_of(t: Term) -> Term =
+  match t {
+    Exactly(l) -> match l.base {
+      Some(PlaceBase(p)) -> if l.k == 0 { PartsOf(p) } else { UnknownTerm },
+      _ -> UnknownTerm,
+    },
+    Below(p) -> PartsOf(p),
+    NoParts -> NoParts,
+    _ -> UnknownTerm,
+  }
+
+// A value made of elements or fields of the value: what `list_at` finds in a list.
 fn parts(t: Term) -> Term =
   match t {
     Exactly(l) -> match l.base {
@@ -747,13 +785,20 @@ fn term(context: MemberContext, s: Scope, e: Expr) -> Term / {abort.raise} =
         },
         _ -> UnknownTerm,
       }
-    } else if b.op == b"div" { quotient(context, term(context, s, b.lhs), term(context, s, b.rhs)) }
+    } else if b.op == b"div" {
+      quotient(context, term(context, s, b.lhs), term(context, s, b.rhs), b.op)
+    }
     // At one or more, either shift by `k` is the quotient by `2^k`, which is all a shrinking step
     // reads of it.
     else if b.op == b"shr" || b.op == b"ushr" {
       match term(context, s, b.rhs) {
         Exactly(r) -> if r.base == None && r.k >= 1 && r.k <= 62 {
-          quotient(context, term(context, s, b.lhs), Exactly({ base: None, k: power_of_two(r.k) }))
+          quotient(
+            context,
+            term(context, s, b.lhs),
+            Exactly({ base: None, k: power_of_two(r.k) }),
+            b.op,
+          )
         } else { UnknownTerm },
         _ -> UnknownTerm,
       }
@@ -767,13 +812,34 @@ fn term(context: MemberContext, s: Scope, e: Expr) -> Term / {abort.raise} =
         fields: field_terms(context, s, r.fields),
       }),
     EApp(a) -> applied_term(context, s, a.func, a.args, a.named),
-    EBlock(b) -> match b.tail {
-      None -> UnknownTerm,
-      Some(t) ->
-        term(context, fold(b.stmts, s, |sc: Scope, x: Stmt| statement_scope(context, sc, x)), t),
+    EBlock(b) -> {
+      let r = block_scope(context, s, b.stmts);
+      match b.tail {
+        None -> UnknownTerm,
+        Some(t) -> match joined(r.falls, Some(term(context, r.s, t))) {
+          Some(x) -> x,
+          None -> UnknownTerm,
+        },
+      }
     },
     _ -> UnknownTerm,
   }
+
+// The scope past a block's statements, and what the block answers where a `let ... else` fails,
+// since its fallback is then the block's value.
+fn block_scope(
+  context: MemberContext,
+  s: Scope,
+  stmts: List<Stmt>,
+) -> { s: Scope, falls: Option<Term> } / {abort.raise} =
+  fold(stmts, { s: s, falls: None }, |acc: { s: Scope, falls: Option<Term> }, x: Stmt|
+    {
+      s: statement_scope(context, acc.s, x),
+      falls: match x {
+        SLetElse(l) -> joined(acc.falls, answered(context, acc.s, l.fallback)),
+        _ -> acc.falls,
+      },
+    })
 
 fn field_terms(
   context: MemberContext,
@@ -803,13 +869,13 @@ fn shifted(context: MemberContext, t: Term, k: Int) -> Term / {abort.raise} =
     _ -> UnknownTerm,
   }
 
-fn quotient(context: MemberContext, a: Term, b: Term) -> Term / {abort.raise} =
+fn quotient(context: MemberContext, a: Term, b: Term, op: Bytes) -> Term / {abort.raise} =
   match a {
     Exactly(l) -> match l.base {
       Some(x) -> if l.k != 0 || !integer(context, l) { UnknownTerm } else {
         match b {
           Exactly(r) -> if r.base == None && r.k >= 2 {
-            Exactly({ base: Some(QuotientBase({ of: x, by: r.k })), k: 0 })
+            Exactly({ base: Some(QuotientBase({ of: x, by: r.k, op: op })), k: 0 })
           } else { UnknownTerm },
           _ -> UnknownTerm,
         }
@@ -904,8 +970,8 @@ fn translated(context: MemberContext, t: Term, args: List<Term>) -> Term / {abor
         None -> UnknownTerm,
       },
     },
-    Below(p) -> below(along(actual(args, p.param), p.path)),
-    PartsOf(p) -> parts(along(actual(args, p.param), p.path)),
+    Below(p) -> tail(along(actual(args, p.param), p.path)),
+    PartsOf(p) -> made_of(along(actual(args, p.param), p.path)),
     RecordTerm(r) ->
       RecordTerm({
         base: match r.base { Some(b) -> Some(translated(context, b, args)), None -> None },
@@ -957,14 +1023,12 @@ fn answered(context: MemberContext, s: Scope, e: Expr) -> Option<Term> / {abort.
         )
       })
     },
-    EBlock(b) -> match b.tail {
-      None -> Some(UnknownTerm),
-      Some(t) ->
-        answered(
-          context,
-          fold(b.stmts, s, |sc: Scope, x: Stmt| statement_scope(context, sc, x)),
-          t,
-        ),
+    EBlock(b) -> {
+      let r = block_scope(context, s, b.stmts);
+      joined(r.falls, match b.tail {
+        None -> Some(UnknownTerm),
+        Some(t) -> answered(context, r.s, t),
+      })
     },
     EApp(a) -> match builtin(context, s, a.func) {
       Some(name) -> if name == b"panic" { None } else { Some(term(context, s, e)) },
@@ -1040,7 +1104,7 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
     PList(l) -> {
       let items = fold(l.items, s, |sc: Scope, x: Pattern| bind(sc, x, below(t)));
       match l.rest {
-        Some(r) -> bind(items, r, if len(l.items) > 0 { below(t) } else { t }),
+        Some(r) -> bind(items, r, if len(l.items) > 0 { tail(t) } else { t }),
         None -> items,
       }
     },
