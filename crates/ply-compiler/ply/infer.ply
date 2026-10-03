@@ -5,7 +5,7 @@ import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr
               MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
-              Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, deriver_text, deriver_tag,
+              Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, deriver_text, deriver_tag,
               SpecKind, SRequires, SEnsures, SpecClause, Derived, DeriveDef, parse)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -36,10 +36,10 @@ import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry,
                 diag, diag1, diag2, lab, is_bare, is_ctor_name, backticked, ns_describe,
                 private_name)
 import rewrite (expand, expand_record_updates)
-import derive (Why, WFunction, WHandle, WFloatIsNotOrdered, WUnconstrained, WNullInsideOption,
-               WSecret, ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name,
-               Expansion, expand_derives, refusal_note, secret_reason, null_in_option_note,
-               same_deriver)
+import derive (Why, WFunction, WHandle, WFloat, WUnconstrained, WNullInsideOption, WSecret,
+               ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name,
+               Expansion, expand_derives, refusal_note, secret_reason, float_reason,
+               null_in_option_note, same_deriver)
 
 // --- What the checker keeps ----------------------------------------------------------
 
@@ -368,6 +368,7 @@ fn what_of(d: Deriver) -> Bytes =
     DOrd -> b"order",
     DBin -> b"binary encoding",
     DShow -> b"rendering",
+    DHash -> b"content hash",
   }
 
 fn row_aliases(def: FnDef) -> List<Bytes> =
@@ -686,6 +687,7 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
     { name: b"array_get", sc: poly_fn([a], [], [array_ty, t_int()], ta, row_empty()) },
     { name: b"array_set", sc: poly_fn([a], [], [array_ty, t_int(), ta], array_ty, row_empty()) },
     { name: b"reflect", sc: poly_fn([a], [], [ta], con(b"std.value.Value"), row_empty()) },
+    { name: b"digest", sc: poly_fn([a], [], [ta], t_bytes(), row_empty()) },
     { name: b"map", sc: poly_fn([a, b], [e], [t_list(ta), t_fn([ta], tb, re)], t_list(tb), re) },
     {
       name: b"filter",
@@ -965,6 +967,11 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
     bdoc(b"string_of_chars", [b"cs"], b""),
     bdoc(b"compare", [b"x", b"y"], b"a total order; needs `derivable(ord, a)`"),
     bdoc(b"compare_values", [b"x", b"y"], b"`compare` under a name no module may shadow"),
+    bdoc(
+      b"digest",
+      [b"x"],
+      b"BLAKE3 of the value's canonical encoding: equal values, equal digests; needs `derivable(hash, a)`",
+    ),
     bdoc(b"map_new", [], b""),
     bdoc(b"map_insert", [b"m", b"key", b"value"], b"replaces"),
     bdoc(b"map_update", [b"m", b"key", b"f"], b"no-op if `key` is absent"),
@@ -1035,7 +1042,11 @@ fn install_prelude(cx0: Cx) -> Cx = {
   let ord = [{ deriver: DOrd, param: 0 }];
   let constrained: Cx = {
     ..bound,
-    constraints: map_insert(map_insert(bound.constraints, b"compare", ord), b"compare_values", ord),
+    constraints: map_insert(
+      map_insert(map_insert(bound.constraints, b"compare", ord), b"compare_values", ord),
+      b"digest",
+      [{ deriver: DHash, param: 0 }],
+    ),
   };
   fold(prelude_effects(), constrained, |c2: Cx, ef: EffectInfo| add_effect(c2, ef))
 }
@@ -7178,7 +7189,7 @@ fn why_notes_for_map_key(
   params: List<RigidParam>,
 ) -> List<Bytes> =
   match w {
-    WFloatIsNotOrdered ->
+    WFloat ->
       [
         b"`Float` has no total order: `NaN` is not equal to itself, so a key would have no position the next lookup could find it at",
         b"use `Decimal` for exact numbers, or key on something else",
@@ -7222,11 +7233,7 @@ fn why_notes_for_constraint(
           b"` names a location rather than a value, so it has no encoding",
         ]),
       ],
-    WFloatIsNotOrdered ->
-      [
-        b"`Float` has no total order: `NaN` is not equal to itself",
-        b"use `Decimal` for exact numbers",
-      ],
+    WFloat -> [float_reason(d), b"use `Decimal` for exact numbers"],
     WNullInsideOption ->
       [
         bytes_concat_all([b"`", blocker, b"` writes `None` and its payload alike"]),
@@ -7485,7 +7492,7 @@ fn why_notes_for_derive(w: Why, d: Deriver, b: Blocked, blocker: Bytes) -> List<
         bytes_concat_all([b"`", blocker, b"` writes `None` and its payload alike"]),
         null_in_option_note(),
       ],
-    WFloatIsNotOrdered -> [b"`Float` has no total order: `NaN` is not equal to itself"],
+    WFloat -> [float_reason(d)],
     WFunction -> [b"a function has no encoding to derive"],
     WHandle ->
       [
