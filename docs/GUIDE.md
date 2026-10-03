@@ -966,6 +966,14 @@ In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site.
 
+A clause that binds `resume` and never calls it abandons the body where it stood,
+and `bracket(acquire, release, body)` is how a body that holds something lets it
+go anyway: `release` runs on what `acquire` answered when `body` returns, when a
+clause unwinds through it this way, and when its task is cancelled (§9), where
+the bracket stands and with the handlers around it. A `release` that fails
+replaces whatever was unwinding. A runtime failure ends the run, so nothing more
+runs then, `release` included. Nested brackets release innermost first.
+
 ### 6.7 Unhandled effects
 
 `E0302`: the body performs an atom, or an operation, its written row does not
@@ -1181,8 +1189,9 @@ effect sim           { read  seed() -> Int }
   region's schedule is drawn from its entry's seed in the order regions open.
 
 `task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
-it waits on is let go, and it performs nothing more. When it next runs it only
-unwinds, releasing what it holds. The cancel answers `false` for a task that had
+it waits on is let go, and it performs nothing more but the `release` of each
+`bracket` it stands in (§6.6). When it next runs it only unwinds, releasing what
+it holds. The cancel answers `false` for a task that had
 already ended and leaves its answer alone. `task.await(t)` is a join that answers
 `Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
 cancelled task has nothing to answer and raises `E0502`. A task cannot cancel
@@ -1398,6 +1407,7 @@ authority when this page and it disagree.
 | `fold<a, b \| e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e` | |
 | `range(lo: Int, hi: Int) -> List<Int>` | `[lo, hi)` |
 | `iterate<a, b \| e>(seed: a, budget: Int, step: (a) -> Iter<a, b> / e) -> b / e` | |
+| `bracket<a, b \| e>(acquire: () -> a / e, release: (a) -> Unit / e, body: (a) -> b / e) -> b / e` | what `body` answers; `release` runs on what `acquire` answered however `body` ends but a failure (§6.6); the three run as one, so each may perform what the others do |
 | `map_new<k, v>() -> Map<k, v>` | |
 | `map_insert<k, v>(m: Map<k, v>, key: k, value: v) -> Map<k, v>` | |
 | `map_get<k, v>(m: Map<k, v>, key: k) -> Option<v>` | |
@@ -1560,7 +1570,9 @@ Types: `Method`, `Version`, `Headers`, `Request`, `Response`, `Limits`,
 `encode`, `encode_chunked_head`, `encode_chunk`, `last_chunk`,
 `continue_response`, `read_head`, `read_body`, `serve_connection`, `serve`,
 `listen_and_serve`, `request_to`, `encode_request`, `parse_response_head`,
-`request`. `request[upstream](host, port, req, limits)` opens one connection,
+`request`. Every connection the module opens or accepts is closed however
+serving it ends, an `app` a clause unwinds out of included (§6.6).
+`request[upstream](host, port, req, limits)` opens one connection,
 sends the request with `Connection: close`, reads the answer and closes; a
 response without a length field is `UntilClose` and read until the server
 closes, up to `max_body`. A malformed response is `Malformed` with a 502 refusal. No
@@ -1612,7 +1624,9 @@ The resource label is a table (`db.query[items]` is `db.read[items]`).
 Transaction control is on the singleton resource, so transactions conflict.
 `transaction` handles `rollback`; a `rollback` performed in its body still
 reaches the caller's row through `e`, so a handler around a transaction names
-it too. SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
+it too. A transaction that ends short of its commit, by a `rollback`, by a clause
+unwinding out of it or by a cancel, is aborted on the way out, and a `sandbox`
+always is (§6.6). SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
 `constraint` the constraint a violation names, and `detail` the server's message
 and detail. `is_retryable(e)` is true for a serialization failure (`40001`) and
 a deadlock (`40P01`). `MemDb` is an in-memory twin (`open`, `step`,
