@@ -36,5 +36,5 @@ if command -v pg_config >/dev/null; then
   execs+=(--exec "pg_floor=$bin/pg-floor")
 fi
 
-exec "$bin/ply" run "$root/crates/ply-corpus/ply" --host --allow machine --allow claims \
+exec "$bin/ply" run "$root/crates/ply-corpus/ply" --host --allow machine --allow claims --allow shipped \
   "${execs[@]}" --fs work=. --fs "repo=$root" -- "$@"

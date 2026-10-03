@@ -142,9 +142,15 @@ fn load_in(dir: &Path) -> Result<Loaded, Diagnostic> {
     let seeded = ply_machine::load::load_seeded(dir, producer::kept_rows(ROWS)).map_err(|err| {
         // With where it happened: this program is only ever built from sources in the tree, so
         // a refusal is a defect someone has to find, not a user's mistake to summarise.
-        unbuilt(match err.diagnostics.first() {
-            Some(d) => format!("it does not check:\n{}", d.clone().placed(&err.sources)),
-            None => "it does not check, and nothing said why".to_string(),
+        unbuilt(if err.diagnostics.is_empty() {
+            "it does not check, and nothing said why".to_string()
+        } else {
+            let said: Vec<String> = err
+                .diagnostics
+                .iter()
+                .map(|d| d.clone().placed(&err.sources).to_string())
+                .collect();
+            format!("it does not check:\n{}", said.join("\n"))
         })
     })?;
     seeded

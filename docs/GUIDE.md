@@ -1255,14 +1255,13 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled unit cache, and the compiler's answers to what the runtime asks it, each kept under the emitter, the entry and the question (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, and the emitter's answers, each kept under the emitter, the runtime and what it was asked (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's committed `ply` program is behind its sources, the load of those sources and the rows that seed the next one (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
-| `PLY_C_DUMP=NAME` | print one body's emitted C, or `*` for the unit's largest bodies |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
-| `PLY_C_PHASES=1` | print compile phases, body-cache hits and misses, and allocation counts |
+| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, and allocation counts |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 | `PLY_C_EMITTER=ply:DIR` | use emitter sources from `DIR` instead of the built-in ones |
@@ -1617,6 +1616,8 @@ Strings are indexed by character, bytes by byte.
 | `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | `a ++ b` |
 | `bytes_concat_all(bs: List<Bytes>) -> Bytes` | one allocation |
 | `bytes_blake3(b: Bytes) -> Bytes` | the 32-byte BLAKE3 digest |
+| `bytes_gzip(b: Bytes) -> Bytes` | gzip at the best level, the same bytes on every machine |
+| `bytes_gunzip(b: Bytes) -> Option<Bytes>` | `None` when `b` is not gzip |
 | `byte_of_int(n: Int) -> Bytes` | raises outside `0..=255` |
 | `bytes_of_string(s: String) -> Bytes` | |
 | `string_of_bytes(b: Bytes) -> String` | raises on invalid UTF-8 |
@@ -3132,7 +3133,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `bootstrap` (`archive`), `hosts` (`tcb`), `edit` or `shipped` (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules and version this binary ships |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`), `edit` or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version and the C runtime this binary ships |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3374,7 +3375,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes the front end as the bundle the runtime builds it from: `unit.c.gz` beside `SOURCES.digest`; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
+| `ply bootstrap <path>` | emits the front end as the bundle the runtime builds it from: `unit.c.gz` beside `SOURCES.digest`; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
@@ -3387,10 +3388,14 @@ refusals, and resolves the paths it is given against the working directory — a
 relative path reads under it, an absolute one reads where it points. The binary
 answers with the code the program asked to exit with. What a command needs of
 the machine is lent to the program as an effect: `ply run`, `ply test` and
-`ply prove` drive a nested program on a machine of their own, `ply hosts`,
-`ply cache` and `ply bootstrap` are answered what a run would bind, what the
-store holds and the bundle the emitter produced, and `ply replace` is lent the
-text it puts in a definition's place, from `--with FILE` or stdin. `ply std`
+`ply prove` drive a nested program on a machine of their own, `ply hosts` and
+`ply cache` are answered what a run would bind and what the store holds, and
+`ply replace` is lent the text it puts in a definition's place, from
+`--with FILE` or stdin. The program emits the C of every unit a command runs,
+and of the bundle `ply bootstrap` writes, itself: the emitter's answer for a
+definition is kept under the toolchain's cache and read back while the
+definition, the emitter and the runtime are the ones it was made by, and the
+machine compiles the C it is handed and loads it. `ply std`
 needs no project: it reads the shipped modules off a second, read-only root.
 `--count-allocs=PATH` is the launcher's own flag rather than the program's: it is
 taken out of the line before the program parses it, and the run writes what the
@@ -3409,10 +3414,15 @@ A run whose work is interpreted has no such frames: its allocations are the
 interpreter's, and they are what the totals are made of.
 What a host may lend is a policy with names, one family each:
 `machine` (load, bind, enter and call a nested program), `tester`, `claims`,
-`builder`, `bootstrap`, `hosts` and `edit`, each with a summary a
+`builder`, `hosts`, `edit` and `shipped`, each with a summary a
 reviewer can read. The launcher lends its own program every family; another host
 names the ones it means, so `machine` — which drives another machine — is
-granted on purpose and not by accident.
+granted on purpose and not by accident. A program lent `machine` hands it a
+program as a front end's answer and the C of its unit: `compiler.load`'s
+`load[r](root)` reads the `.ply` files under `root` through the `fs` root `r`,
+checks them against the shipped modules and emits their unit afresh, so a run of
+it is granted `--fs r=PATH` and `--allow shipped`, and `machine.load` compiles
+the C it is handed and runs no front end of its own.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. A command
@@ -3436,8 +3446,7 @@ kept. A registry dependency's first load reads it through the interface its
 publisher sent. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
-read and file neither, and a program's own `machine.load` of a program runs the
-whole front end. A cache that will not read
+read and file neither, and neither does `compiler.load`. A cache that will not read
 is a warning and a cold check, never a failure; the run that files over one
 filed by a compiler whose shipped modules differed says so once, as `W0605`.
 

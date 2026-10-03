@@ -1,0 +1,203 @@
+// A program made into the unit the runtime compiles and enters. The emitter's answers kept between
+// runs are read from the toolchain's cache, the rest are asked of the emitter here, in this
+// program, and the C is assembled over all of them: the runtime is handed C and compiles nothing
+// it was not handed.
+
+import cache (Front)
+import compiler.front (EmitRoot)
+import compiler.hash (hex)
+import compiler.resolve (Diag)
+import compiler.unit (Dropped, Emission, shipped, compiled, emitted, held)
+import env (env)
+import sources (under_abs)
+import std.bytes (hex_of)
+import std.fs (fs)
+import std.process (process)
+import std.hash (blake3)
+import std.random (entropy)
+import std.time (time)
+import store.engine (fresh_nonce)
+
+// A command asks for the unit a run enters; what answers is `emitting`'s, which `main` runs every
+// command under, or a handler of the asker's own. The C is a function of what is asked, so the
+// effect is a deterministic one, whatever the answering keeps.
+pub effect emit {
+  read unit(front: Front, offered: List<Bytes>) -> Result<Bytes, List<Diag>>
+}
+
+// What emitting a unit here reaches: the runtime it is compiled against, the shelf the emitter was
+// built from, the answers kept between runs under the toolchain's cache, and what the environment
+// asks to be told of it.
+pub effect set Emits = {shipped.runtime, env.bodies[sys], env.var[sys], fs.list_dir[shelf], fs.read_file[shelf], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc]}
+
+// Every root the program's answer offers: each `fn` in source order, then its tests, laws and
+// clauses.
+pub fn every_root(front: Front) -> List<Bytes> = map(front.dump.emit_roots, |r: EmitRoot| r.root)
+
+// The emitter answering here is this program's own compiler, built from the modules the shelf
+// holds: the launcher gates this program on exactly those, so they name what the emitter answers.
+fn emitter() -> Bytes / {fs.list_dir[shelf], fs.read_file[shelf]} =
+  match fs.list_dir[shelf](".") {
+    None -> b"",
+    Some(names) ->
+      hex(
+        blake3(
+          bytes_concat_all(
+            map(names, |n: String|
+              bytes_concat_all([
+                bytes_of_string(n),
+                b"\x00",
+                match fs.read_file[shelf](n) { Some(text) -> blake3(text), None -> b"" },
+                b"\x00",
+              ])),
+          ),
+        ),
+      ),
+  }
+
+fn kept_dir() -> String / {env.bodies[sys]} = under_abs(env.bodies[sys]())
+
+fn kept_at(key: Bytes) -> String / {env.bodies[sys]} = kept_dir() ++ "/" ++ string_of_bytes(key)
+
+// An answer read is an answer used, which is what keeps it from the toolchain's sweep.
+fn read_kept(
+  key: Bytes,
+) -> Option<Bytes> / {env.bodies[sys], fs.read[abs], fs.write[abs], time.now_ms} = {
+  let path = kept_at(key);
+  match fs.read_file[abs](path) {
+    None -> None,
+    Some(bytes) -> {
+      fs.set_modified[abs](path, time.now_ms());
+      Some(bytes)
+    },
+  }
+}
+
+// Written beside itself and renamed into place, so a reader finds a whole answer or none. An answer
+// that cannot be written is left unwritten.
+fn write_kept(
+  key: Bytes,
+  bytes: Bytes,
+) -> Unit / {env.bodies[sys], fs.write[abs], entropy.next, time.now_ms} = {
+  let path = kept_at(key);
+  let temp = path ++ "." ++ hex_of(fresh_nonce()) ++ ".tmp";
+  if fs.create_dir[abs](kept_dir()) && fs.write_file[abs](temp, bytes) {
+    if !fs.rename[abs](temp, path) {
+      fs.remove[abs](temp);
+      ()
+    }
+  }
+}
+
+fn texts(front: Front) -> List<Bytes> =
+  map(front.files, |f: { path: String, name: String, text: Bytes }| f.text)
+
+// What a developer asks of emission through the environment: `PLY_C_ONLY` and `PLY_C_SKIP` narrow
+// what is offered, `PLY_C_REFUSALS` says what the unit took and refused, and `PLY_C_PHASES` what
+// the emitter was asked and what was read back.
+type Knobs = { only: Option<List<String>>, skip: List<String>, refusals: Bool, phases: Bool }
+
+fn listed(text: String) -> List<String> = filter(string_split(text, ","), |s: String| s != "")
+
+fn knobs() -> Knobs / {env.var[sys]} =
+  {
+    only: match env.var[sys]("PLY_C_ONLY") { Some(t) -> Some(listed(t)), None -> None },
+    skip: match env.var[sys]("PLY_C_SKIP") { Some(t) -> listed(t), None -> [] },
+    refusals: env.var[sys]("PLY_C_REFUSALS") != None,
+    phases: env.var[sys]("PLY_C_PHASES") != None,
+  }
+
+// `offered` with only the definitions `PLY_C_ONLY` names, and none under a prefix `PLY_C_SKIP` names.
+fn narrowed(k: Knobs, offered: List<Bytes>) -> List<Bytes> =
+  filter(offered, |n: Bytes| {
+    let name = string_of_bytes(n);
+    let wanted = match k.only {
+      None -> true,
+      Some(names) -> len(filter(names, |w: String| w == name)) > 0,
+    };
+    wanted && len(filter(k.skip, |prefix: String| string_starts_with(name, prefix))) == 0
+  })
+
+fn told(
+  k: Knobs,
+  offered: Int,
+  emission: Result<Emission, Bytes>,
+  identity: Bytes,
+  ms: Int,
+) -> Unit / {process.err[proc]} =
+  match emission {
+    Err(_) -> (),
+    Ok(e) -> {
+      if k.refusals {
+        fold(e.produced.dropped, (), |_: Unit, d: Dropped|
+          process.err[proc](
+            "c tier refused `" ++ string_of_bytes(d.function) ++ "`: "
+              ++ string_of_bytes(d.construct),
+          ));
+        process.err[proc](
+          "c tier took " ++ int_to_string(len(e.produced.taken)) ++ " of " ++ int_to_string(offered)
+            ++ " definitions",
+        )
+      };
+      if k.phases {
+        process.err[proc](
+          "phases: emitter " ++ string_of_bytes(identity) ++ ", " ++ int_to_string(e.kept)
+            ++ " answers read back, "
+            ++ int_to_string(e.asked)
+            ++ " asked of it, "
+            ++ int_to_string(ms)
+            ++ "ms",
+        )
+      }
+    },
+  }
+
+// The unit over `offered`, its C as the runtime compiles it, with the emitter's answers kept under
+// the toolchain's cache.
+fn unit_of(front: Front, offered: List<Bytes>) -> Result<Bytes, List<Diag>> / {Emits} = {
+  let k = knobs();
+  let wanted = narrowed(k, offered);
+  let identity = emitter();
+  let started = time.elapsed_ms();
+  let emission = emitted(
+    shipped.runtime(),
+    front.dump,
+    texts(front),
+    wanted,
+    identity,
+    read_kept,
+    write_kept,
+  );
+  told(k, len(wanted), emission, identity, time.elapsed_ms() - started);
+  held(front.dump, wanted, emission)
+}
+
+// The whole program's unit, every root it offers, as the runtime compiles it.
+pub fn whole(front: Front) -> Result<Bytes, List<Diag>> / {emit.unit} =
+  emit.unit(front, every_root(front))
+
+// The unit a run executes in, or none for a run that executes nothing.
+pub fn wanted(front: Front, build: Bool) -> Result<Option<Bytes>, List<Diag>> / {emit.unit} =
+  if !build { Ok(None) }
+  else { match whole(front) { Ok(text) -> Ok(Some(text)), Err(diags) -> Err(diags) } }
+
+// `body` with every unit it asks for emitted here, the emitter's answers kept under the
+// toolchain's cache.
+pub fn emitting<a | e>(body: () -> a / {emit.unit | e}) -> a / {Emits | e} =
+  handle { body() } with { emit.unit(front, offered) -> unit_of(front, offered) }
+
+// `body` with every unit it asks for emitted afresh and kept nowhere: for a program that drives
+// another and has no toolchain cache of its own.
+pub fn emitting_fresh<a | e>(body: () -> a / {emit.unit | e}) -> a / {shipped.runtime | e} =
+  handle { body() } with { emit.unit(front, offered) -> fresh(front, offered) }
+
+fn fresh(front: Front, offered: List<Bytes>) -> Result<Bytes, List<Diag>> / {shipped.runtime} =
+  compiled(
+    shipped.runtime(),
+    front.dump,
+    texts(front),
+    offered,
+    b"",
+    |_: Bytes| None,
+    |_: Bytes, _: Bytes| (),
+  )

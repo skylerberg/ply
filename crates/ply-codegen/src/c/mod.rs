@@ -142,6 +142,27 @@ pub fn refused_in(error: &anyhow::Error) -> Option<&Refusals> {
     error.downcast_ref::<Refusals>()
 }
 
+/// Where the emitter's answers are kept between runs, beside the objects they compile to and under
+/// the same sweep.
+pub fn bodies_dir() -> std::path::PathBuf {
+    load::cache_dir().join("bodies")
+}
+
+/// What every unit's C opens with, up to its first bucket: the prelude and the runtime declared.
+pub fn unit_head() -> String {
+    format!("{PRELUDE}{}\n", runtime_header())
+}
+
+/// What a unit emitted against this runtime is a function of on the runtime's side: the sources
+/// that run while the emitter emits, and the helper table its C binds by position.
+pub fn runtime_identity() -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(env!("PLY_RUNTIME_DIGEST").as_bytes());
+    h.update(&[0]);
+    h.update(exports::helpers_digest().as_bytes());
+    h.finalize().to_hex().to_string()
+}
+
 /// The addresses the loaded unit binds, in [`HELPERS`]' order.
 pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
     HELPERS
