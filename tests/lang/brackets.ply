@@ -1,0 +1,105 @@
+// `bracket(acquire, release, body)` runs `body` on what `acquire` answered, then `release` on it,
+// however `body` ends: by returning, by a clause that does not resume unwinding through it, or by a
+// cancel. `release` runs where the bracket stands, with the handlers around it.
+
+effect log {
+  write note[l](s: String) -> Unit
+}
+
+effect stop {
+  write now() -> Unit
+}
+
+fn opened(name: String) -> String / {log.write[l]} = {
+  log.note[l]("open " ++ name);
+  name
+}
+
+fn closed(name: String) -> Unit / {log.write[l]} = log.note[l]("close " ++ name)
+
+test "release runs after a body that returns, and the body's answer is the bracket's" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      let n = bracket(|| opened("a"), closed, |h: String| {
+        log.note[l]("use " ++ h);
+        string_len(h)
+      });
+      assert_eq(n, 1)
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), ["open a", "use a", "close a"])
+  } }
+}
+
+test "release runs when a clause that does not resume unwinds through the body" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      let answered = handle {
+        bracket(|| opened("a"), closed, |h: String| {
+          stop.now();
+          log.note[l]("never");
+          1
+        })
+      } with {
+        stop.now() resume k -> 0,
+      };
+      assert_eq(answered, 0)
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), ["open a", "close a"])
+  } }
+}
+
+test "release runs with the handlers around the bracket, not those inside the body" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      bracket(|| opened("a"), closed, |h: String|
+        handle { log.note[l]("muted") } with { log.note[l](s) -> () })
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), ["open a", "close a"])
+  } }
+}
+
+test "brackets nest, and the inner one releases first" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      handle {
+        bracket(|| opened("outer"), closed, |o: String|
+          bracket(|| opened("inner"), closed, |i: String| {
+            stop.now();
+            ()
+          }))
+      } with {
+        stop.now() resume k -> (),
+      }
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), ["open outer", "open inner", "close inner", "close outer"])
+  } }
+}
+
+test "a cancelled task releases what it holds, in every interleaving" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      simulate {
+        let t = task.spawn(||
+          bracket(|| opened("a"), closed, |h: String| {
+            clock.sleep(Duration(10));
+            log.note[l]("done");
+            h
+          }));
+        clock.sleep(Duration(5));
+        assert(task.cancel(t));
+        assert_eq(task.await(t), None)
+      }
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), ["open a", "close a"])
+  } }
+}
