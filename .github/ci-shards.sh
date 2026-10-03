@@ -74,7 +74,7 @@ CORPUS_ALONE=(cli-compiler_compiled)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations goldens incremental)
+CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
 # Corpus processes a partition runs side by side, each a lane of the cut: a lane's runs of one package
 # go in one `ply test`, which loads the package's closure once. Two, so the program's and the packages'
 # own `ply test`s, each with a front end and C of its own, are not all one lane's to take in turn.
