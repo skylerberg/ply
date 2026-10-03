@@ -38,10 +38,11 @@ import diagnostic (Place, Raised, Spot, diag_of, noted, place_json, placeless, s
 import mutants (Coverage, Judged, Mutants, Mutation, Queue, Survivor, built, coverage, mutants,
                 queued, targets)
 import paths
-import program (Timed, front_of, is_shelved, is_shipped, modules_of, outside, timed_over,
-                timed_uncached_over, unmoved)
+import program (Timed, load_diagnostics, front_of, is_shelved, is_shipped, modules_of, outside,
+                timed_over, timed_uncached_over, unmoved)
 import report (Answer, indent, ok_code, compile_error, count_of, plural, refused, warned_lines)
 import sources (Embed, load_resolved, shelf)
+import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string)
 import style (Style, plain, bold, dim, green, red, yellow)
 import tester (tester, ledger, Executed, InterleavingFailure, Filed, Hosted, Options, Usage,
@@ -247,11 +248,11 @@ fn every_of(program: Program, options: Options) -> List<List<Int>> / {abort.rais
   }
 
 // What the binding reaching some tests makes of each test the run reports on.
-fn reported(report: RunReport, case: Case) -> { atoms: List<Atom>, host: Bool } =
-  { atoms: atoms_of(case), host: covers(report.reaches, case.index) }
+fn reported(reaches: List<Int>, case: Case) -> { atoms: List<Atom>, host: Bool } =
+  { atoms: atoms_of(case), host: covers(reaches, case.index) }
 
-fn counts_of(program: Program, report: RunReport) -> Counts =
-  counts(map(program.cases, |case: Case| reported(report, case)))
+fn counts_of(program: Program, reaches: List<Int>) -> Counts =
+  counts(map(program.cases, |case: Case| reported(reaches, case)))
 
 /// The whole decision, as the report reads it: a reason per test, what each seeded one still owes,
 /// which tests run, and the classes they share.
@@ -651,10 +652,26 @@ fn why(reason: String) -> String =
 
 // `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is
 // neither isolated nor cached.
-fn isolated_as(report: RunReport, case: Case) -> String =
-  isolation_word(isolation_of(reported(report, case)))
+fn isolated_as(reaches: List<Int>, case: Case) -> String =
+  isolation_word(isolation_of(reported(reaches, case)))
 
 // --- The head ---------------------------------------------------------------
+// Printed before a test runs, so it says only what the selection and the binding decided.
+
+// What the binding says before a test runs: which tests it reaches, and how many run at once.
+type Opening = { hermetic: Bool, operations: Int, digest: String, reaches: List<Int>, workers: Int }
+
+fn workers_of(options: Options, hosted: Hosted) -> Int =
+  match options.jobs { Some(n) -> if n > 0 { n } else { hosted.cores }, None -> hosted.cores }
+
+fn opening_of(options: Options, program: Program, hosted: Hosted) -> Opening =
+  {
+    hermetic: hosted.hermetic,
+    operations: hosted.operations,
+    digest: hosted.digest,
+    reaches: filter(hosted.reaches, |i: Int| case_of(program, i) != None),
+    workers: workers_of(options, hosted),
+  }
 
 fn selected_line(style: Style, program: Program, decided: Decided) -> String / {abort.raise} =
   indent() ++ bold(style, "selected") ++ " "
@@ -665,12 +682,9 @@ fn selected_line(style: Style, program: Program, decided: Decided) -> String / {
     ++ int_to_string(cached_count(program, decided))
     ++ " cached)"
 
-fn group_line(decided: Decided, report: RunReport) -> List<String> / {abort.raise} =
+fn group_line(decided: Decided, workers: Int) -> List<String> / {abort.raise} =
   if len(decided.classes) == 0 { [] } else {
-    [
-      indent() ++ count_of(len(decided.classes), "group") ++ " · "
-        ++ count_of(report.workers, "worker"),
-    ]
+    [indent() ++ count_of(len(decided.classes), "group") ++ " · " ++ count_of(workers, "worker")]
   }
 
 fn isolated_line(style: Style, c: Counts) -> List<String> / {abort.raise} =
@@ -684,9 +698,9 @@ fn isolated_line(style: Style, c: Counts) -> List<String> / {abort.raise} =
     ]
   }
 
-fn binding_lines(style: Style, report: RunReport, c: Counts) -> List<String> / {abort.raise} =
-  if report.hermetic { [] } else {
-    let head = [
+fn binding_lines(style: Style, o: Opening, c: Counts) -> List<String> / {abort.raise} =
+  if o.hermetic { [] } else {
+    [
       indent() ++ bold(style, "host") ++ " " ++ bold(style, int_to_string(c.host)) ++ " of "
         ++ int_to_string(c.total)
         ++ " · "
@@ -694,11 +708,15 @@ fn binding_lines(style: Style, report: RunReport, c: Counts) -> List<String> / {
       indent()
         ++ dim(
           style,
-          "binding host · " ++ count_of(report.operations, "operation") ++ " · " ++ report.digest,
+          "binding host · " ++ count_of(o.operations, "operation") ++ " · " ++ o.digest,
         ),
-    ];
-    appended(head, map(report.handshakes, |line: String| indent() ++ dim(style, line)))
+    ]
   }
+
+// What the tests' connections came to, which only the run itself knows.
+fn handshake_lines(style: Style, report: RunReport) -> List<String> / {abort.raise} =
+  if report.hermetic { [] }
+  else { map(report.handshakes, |line: String| indent() ++ dim(style, line)) }
 
 // `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`.
 fn simulation_line(style: Style, report: RunReport) -> List<String> / {abort.raise} =
@@ -764,30 +782,47 @@ fn head_lines(
   style: Style,
   flags: Flags,
   program: Program,
-  report: RunReport,
   decided: Decided,
+  o: Opening,
 ) -> List<String> / {abort.raise} = {
-  let c = counts_of(program, report);
+  let c = counts_of(program, o.reaches);
   appended(
     appended(
       appended(
         appended(
-          appended(
-            appended(
-              appended([selected_line(style, program, decided)], group_line(decided, report)),
-              isolated_line(style, c),
-            ),
-            binding_lines(style, report, c),
-          ),
-          simulation_line(style, report),
+          appended([selected_line(style, program, decided)], group_line(decided, o.workers)),
+          isolated_line(style, c),
         ),
-        backend_lines(style, report),
+        binding_lines(style, o, c),
       ),
       bypass_lines(style, flags),
     ),
     filtered_lines(style, program),
   )
 }
+
+// The report as far as it goes before a test runs: the head, what `--explain` can say of the
+// selection, and the blank line the results follow.
+fn opening_lines(
+  style: Style,
+  flags: Flags,
+  program: Program,
+  decided: Decided,
+  o: Opening,
+) -> List<String> / {abort.raise} =
+  appended(
+    appended(head_lines(style, flags, program, decided, o), if flags.explain {
+      explain_lines(style, program, o.reaches, decided)
+    } else { [] }),
+    if len(decided.classes) == 0 { [] } else { [""] },
+  )
+
+// What the run itself came to, under its results: the connections, the backend and the search.
+fn run_lines(style: Style, report: RunReport) -> List<String> / {abort.raise} =
+  appended(
+    appended(handshake_lines(style, report), backend_lines(style, report)),
+    simulation_line(style, report),
+  )
 
 // --- Where the time went ----------------------------------------------------
 
@@ -868,11 +903,11 @@ fn explain_atoms(iso: String, case: Case) -> String =
 fn case_line(
   style: Style,
   program: Program,
-  report: RunReport,
+  reaches: List<Int>,
   case: Case,
   decided: Decided,
 ) -> String / {abort.raise} = {
-  let iso = isolated_as(report, case);
+  let iso = isolated_as(reaches, case);
   let reason = word(reason_of(decided, case.index));
   let verb = if runs_test(decided, case.index) { bold(style, "run ") } else { dim(style, "skip") };
   indent() ++ verb ++ " " ++ dim(style, short_of(case.hash)) ++ " " ++ padded(reason, 16) ++ " "
@@ -1039,7 +1074,7 @@ fn concurrency_lines(
 fn explain_lines(
   style: Style,
   program: Program,
-  report: RunReport,
+  reaches: List<Int>,
   dec: Decided,
 ) -> List<String> / {abort.raise} =
   appended(
@@ -1048,18 +1083,15 @@ fn explain_lines(
         appended(
           appended(
             [""],
-            map(program.cases, |case: Case| case_line(style, program, report, case, dec)),
+            map(program.cases, |case: Case| case_line(style, program, reaches, case, dec)),
           ),
           appended(why_lines(style, program, dec), key_lines(style, program)),
         ),
         search_lines(style, program, dec),
       ),
-      concurrency_lines(style, program, counts_of(program, report), dec),
+      concurrency_lines(style, program, counts_of(program, reaches), dec),
     ),
-    appended(
-      phase_lines(style, program.phases),
-      run_phase_lines(style, program.phases, report.spent),
-    ),
+    phase_lines(style, program.phases),
   )
 
 // --- One test's line --------------------------------------------------------
@@ -1093,11 +1125,13 @@ fn result_name(program: Program, outcome: Outcome) -> String =
   fold(program.cases, outcome.name, |acc: String, case: Case|
     if case.index == outcome.index { display_of(program, case) } else { acc })
 
-fn name_column(program: Program, report: RunReport) -> Int = {
-  let widest = fold(report.results, 0, |acc: Int, outcome: Outcome| {
-    let n = string_len(result_name(program, outcome));
-    if n > acc { n } else { acc }
-  });
+// Over the tests the run will run, since their lines are printed as their groups finish.
+fn name_column(program: Program, decided: Decided) -> Int = {
+  let widest = fold(decided.classes, 0, |acc: Int, g: Group|
+    fold(g.tests, acc, |most: Int, index: Int| {
+      let n = string_len(named_of(program, index));
+      if n > most { n } else { most }
+    }));
   if widest < 24 { 24 } else if widest > 64 { 64 } else { widest }
 }
 
@@ -1132,16 +1166,19 @@ fn search_parts(e: Explored) -> List<String> / {abort.raise} = {
   }
 }
 
-fn result_lines(style: Style, program: Program, report: RunReport) -> List<String> / {abort.raise} = {
-  let width = name_column(program, report);
-  fold(report.results, [], |acc: List<String>, outcome: Outcome| {
+fn result_lines(
+  style: Style,
+  program: Program,
+  outcomes: List<Outcome>,
+  width: Int,
+) -> List<String> / {abort.raise} =
+  fold(outcomes, [], |acc: List<String>, outcome: Outcome| {
     let listed = push(acc, result_line(style, program, outcome, width));
     match outcome.search {
       None -> listed,
       Some(e) -> push(listed, indent() ++ "    " ++ dim(style, joined(search_parts(e), " · "))),
     }
   })
-}
 
 // --- The summary ------------------------------------------------------------
 
@@ -1386,7 +1423,7 @@ fn case_json(report: RunReport, case: Case, decided: Decided) -> Json / {abort.r
     { key: "why", value: Str(why(word(reason_of(decided, case.index)))) },
     { key: "group", value: opt_num(group_of(decided, case.index)) },
     { key: "footprint", value: Str(case.footprint) },
-    { key: "isolation", value: Str(isolated_as(report, case)) },
+    { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
     // Whether this test reaches the binding, and so always runs uncached.
     { key: "host", value: Bool(covers(report.reaches, case.index)) },
     { key: "shared_atoms", value: strings(shared_texts(case)) },
@@ -1584,7 +1621,7 @@ fn phases_json(phases: Phases) -> Json / {abort.raise} =
   ])
 
 fn selection_json(program: Program, report: RunReport, decided: Decided) -> Json / {abort.raise} = {
-  let c = counts_of(program, report);
+  let c = counts_of(program, report.reaches);
   object([
     { key: "total", value: num(len(program.cases)) },
     { key: "selected", value: num(selected_count(program, decided)) },
@@ -1729,58 +1766,38 @@ fn green_run(report: RunReport) -> Bool =
   report.summary.failed == 0 && report.summary.abandoned == 0 && len(report.escapes) == 0
     && !survived(report)
 
-fn explained(
-  style: Style,
-  flags: Flags,
-  program: Program,
-  report: RunReport,
-  decided: Decided,
-) -> List<String> / {abort.raise} =
-  if !flags.explain { [] } else { explain_lines(style, program, report, decided) }
-
-fn listed(style: Style, program: Program, report: RunReport) -> List<String> / {abort.raise} =
-  if len(report.results) == 0 { [] } else { appended([""], result_lines(style, program, report)) }
+fn printed(lines: List<String>) -> Unit / {process.out[proc]} =
+  fold(lines, (), |_: Unit, line: String| process.out[proc](line))
 
 fn nothing_lines(style: Style, flags: Flags, program: Program) -> List<String> / {abort.raise} =
   if len(program.cases) > 0 { [] }
   else { ["", indent() ++ dim(style, no_tests_note(flags, program))] }
 
-fn lines_of(
+// The report after its results, which were printed as their groups finished.
+fn closing_lines(
   style: Style,
   flags: Flags,
   program: Program,
   report: RunReport,
   faults: List<Fault>,
   warnings: List<Diag>,
-  decided: Decided,
 ) -> List<String> / {abort.raise} =
-  appended(
-    appended(
-      appended(
-        appended(
-          appended(
-            appended(
-              appended(
-                appended(
-                  appended(
-                    head_lines(style, flags, program, report, decided),
-                    explained(style, flags, program, report, decided),
-                  ),
-                  listed(style, program, report),
-                ),
-                ["", summary_line(style, report, counts_of(program, report))],
-              ),
-              warned_lines(style, report.escapes),
-            ),
-            failure_blocks(style, program, faults),
-          ),
-          abandoned_blocks(style, program, report),
-        ),
-        nothing_lines(style, flags, program),
-      ),
+  fold(
+    [
+      if flags.explain { run_phase_lines(style, program.phases, report.spent) } else { [] },
+      [""],
+      run_lines(style, report),
+      [summary_line(style, report, counts_of(program, report.reaches))],
+      warned_lines(style, report.escapes),
+      failure_blocks(style, program, faults),
+      abandoned_blocks(style, program, report),
+      nothing_lines(style, flags, program),
       warned_lines(style, warnings),
-    ),
-    appended(coverage_lines(style, report), mutant_lines(style, program, report)),
+      coverage_lines(style, report),
+      mutant_lines(style, program, report),
+    ],
+    [],
+    |acc: List<String>, part: List<String>| appended(acc, part),
   )
 
 // A lazy read and a later flush can each report the same unreadable file.
@@ -1801,7 +1818,7 @@ fn answered(
   let ok = green_run(report);
   {
     json: document(flags, program, report, faults, warnings, ok, decided),
-    lines: lines_of(style, flags, program, report, faults, warnings, decided),
+    lines: closing_lines(style, flags, program, report, faults, warnings),
     errs: [],
     code: if ok { ok_code() } else { run_failed() },
   }
@@ -1835,7 +1852,7 @@ pub type Iteration = { answer: Answer, held: Option<Timed>, embeds: List<Embed> 
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise} =
+) -> Answer / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise} =
   iterated(flags, options, None).answer
 
 // A save that changed no file's text is the last report's load again, with nothing re-derived.
@@ -1863,7 +1880,7 @@ pub fn iterated(
   flags: Flags,
   options: Options,
   held: Option<Timed>,
-) -> Iteration / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise} = {
+) -> Iteration / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise} = {
   let s: Style = style_of(flags);
   let begun = time.elapsed_us();
   let t: Timed = loaded(flags, options, held);
@@ -1872,7 +1889,7 @@ pub fn iterated(
     // filter a successful load applies to warnings is not applied here.
     None ->
       {
-        answer: refused(s, "test", t.program.diags, t.program.places),
+        answer: refused(s, "test", load_diagnostics(t.program), t.program.places),
         held: None,
         embeds: t.program.embeds,
       },
@@ -2036,7 +2053,7 @@ type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
 
 fn root_modules(analysis: Analysis) -> Map<String, Bool> =
   fold(range(0, len(analysis.mods)), map_new(), |acc: Map<String, Bool>, i: Int|
-    match ((list_at(analysis.mods, i), list_at(analysis.mod_pkg, i))) {
+    match ((list_at(analysis.mods, i), list_at(analysis.module_packages, i))) {
       (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, text(m.name), true) } else { acc },
       _ -> acc,
     })
@@ -2104,7 +2121,7 @@ fn program_of(
     filtered_out: scope.filtered_out,
     warnings: appended(
       opened,
-      filter(timed.program.diags, |diag: Diag| !in_shipped(analysis, diag)),
+      filter(load_diagnostics(timed.program), |diag: Diag| !in_shipped(analysis, diag)),
     ),
     options: object([
       {
@@ -2126,7 +2143,7 @@ fn tests_over(
   timed: Timed,
   analysis: Analysis,
   begun: Int,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise} = {
+) -> Answer / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise} = {
   let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
     Some(query) -> match targets(analysis, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
     None -> Ok(None),
@@ -2152,7 +2169,7 @@ fn selected(
   analysis: Analysis,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, abort.raise} = {
+) -> Answer / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, abort.raise} = {
   let configuring = time.elapsed_us();
   tester.configure[corpus](options);
   results::with_ledger(results::store_for(flags.paths, options.no_cache), || {
@@ -2250,16 +2267,39 @@ fn concluded_run(
   configured: List<Diag>,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
-) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.outcomes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed, emit.unit, abort.raise} = {
+) -> Answer / {process.out[proc], builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.outcomes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed, emit.unit, abort.raise} = {
   let asked = {
     plan: searching,
     measuring: options.sim.measure_reduction,
     lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
   };
   let narrowing = narrowed(decisions, decided.search.roots);
+  // The head and each group's results are printed as they are known, so a long run shows its
+  // progress and its first failure; the document `--json` writes waits for the whole run.
+  let shown = !flags.json;
+  let width = name_column(program, decided);
+  if shown {
+    printed(
+      opening_lines(
+        style,
+        flags,
+        program,
+        decided,
+        opening_of(options, program, tester.hosted[corpus]()),
+      ),
+    )
+  };
   let started = time.elapsed_us();
-  let done = flat_map(decided.classes, |group: Group|
-    ran_class(map(group.tests, |i: Int| job_of(program, 0, i, narrowing, searching)), asked));
+  let done = flat_map(decided.classes, |group: Group| {
+    let ran = ran_class(
+      map(group.tests, |i: Int| job_of(program, 0, i, narrowing, searching)),
+      asked,
+    );
+    if shown {
+      printed(result_lines(style, program, map(ran, |d: Done| ran_outcome(analysis, d)), width))
+    };
+    ran
+  });
   let elapsed = time.elapsed_us() - started;
   let hosted = tester.hosted[corpus]();
   let h = hashes_of(analysis);
@@ -2648,6 +2688,21 @@ fn site_of(x: search::RaceSite) -> Site =
     definition: x.definition,
     access: x.access,
     at: if x.span.module == outside() { None } else { Some(x.span) },
+  }
+
+// A test as its group ran it, which is all its result line says; the conclusion adds the failure
+// and what was filed.
+fn ran_outcome(analysis: Analysis, d: Done) -> Outcome / {abort.raise} =
+  {
+    index: d.test,
+    name: match test_at(analysis, d.test) { Some(t) -> text(t.name), None -> "" },
+    hash: hash_at(analysis, d.test),
+    duration_us: d.usage.duration_us,
+    status: d.status,
+    diagnostic: None,
+    search: match d.searched { Some(x) -> Some(explored_of(x.exploration)), None -> None },
+    cached: None,
+    performs: d.usage.performs,
   }
 
 fn outcome_of(
@@ -3213,6 +3268,8 @@ fn a_decided(program: Program, keys: List<select::Case>) -> Decided / {abort.rai
   )
 }
 
+fn an_opening() -> Opening = { hermetic: true, operations: 0, digest: "", reaches: [], workers: 4 }
+
 fn a_program(cases: List<Case>) -> Program =
   {
     root: "/p",
@@ -3384,9 +3441,16 @@ fn caused(f: Failed) -> Bisect / {abort.raise} =
 fn taking_b_fails(keys: List<DefKey>) -> Trial =
   if len(filter(keys, |k: DefKey| k.name == "m.b")) > 0 { a_failure() } else { a_pass() }
 
-test "a green run is exit 0, and the head says what was selected of what" {
+test "a green run is exit 0, and the head says what was selected of what before a test runs" {
   let p = a_program([a_case(0, "one"), a_case(1, "two")]);
   let keys = [a_key(0, "one", false, false, false), a_key(1, "two", true, false, false)];
+  let opening = opening_lines(plain(), from_argv("test", []), p, a_decided(p, keys), an_opening());
+  assert_eq(opening, [
+    "   selected 1 of 2 (1 cached)",
+    "   1 group · 4 workers",
+    "   isolated 2 of 2",
+    "",
+  ]);
   let answer = answered(
     plain(),
     from_argv("test", []),
@@ -3396,8 +3460,9 @@ test "a green run is exit 0, and the head says what was selected of what" {
     a_decided(p, keys),
   );
   assert_eq(answer.code, 0);
-  assert_eq(at(answer.lines, 0, ""), "   selected 1 of 2 (1 cached)");
-  assert_eq(at(answer.lines, 1, ""), "   1 group · 4 workers");
+  // The head and the results went out as the run went; the answer is what follows them.
+  assert(!said(answer.lines, "   selected 1 of 2 (1 cached)"));
+  assert_eq(filter(answer.lines, |l: String| string_starts_with(l, "   ok ")), []);
   assert_eq(answer.errs, [])
 }
 
@@ -3530,21 +3595,39 @@ test "a result line pads the name to the column and the reading to one decimal" 
 }
 
 // The column never narrows below 24 and never widens past 64, so long names still line up.
-test "the name column is the widest name, clamped" {
-  let p = a_program([]);
-  assert_eq(name_column(p, a_run([], 0)), 24);
-  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 30), "passed")], 0)), 30);
-  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 90), "passed")], 0)), 64)
+test "the name column is the widest name the run will run, clamped" {
+  let column = |names: List<String>| {
+    let p = a_program(map(range(0, len(names)), |i: Int| a_case(i, at(names, i, ""))));
+    name_column(
+      p,
+      a_decided(
+        p,
+        map(range(0, len(names)), |i: Int| a_key(i, at(names, i, ""), false, false, false)),
+      ),
+    )
+  };
+  assert_eq(column([]), 24);
+  assert_eq(column(["short", repeated("x", 30)]), 30);
+  assert_eq(column([repeated("x", 90)]), 64);
+  let p = a_program([a_case(0, repeated("x", 40)), a_case(1, "two")]);
+  let cached_long = a_decided(p, [
+    a_key(0, repeated("x", 40), true, false, false),
+    a_key(1, "two", false, false, false),
+  ]);
+  assert_eq(name_column(p, cached_long), 24)
 }
 
 test "the summary counts what was decided and how long it took" {
   let p = a_program([a_case(0, "one")]);
   let r = a_run([an_outcome(0, "one", "passed")], 0);
-  assert_eq(summary_line(plain(), r, counts_of(p, r)), "   0 failed, 1 passed, 0 cached (0.02s)");
+  assert_eq(
+    summary_line(plain(), r, counts_of(p, r.reaches)),
+    "   0 failed, 1 passed, 0 cached (0.02s)",
+  );
   let hosted = { ..r, reaches: [0] };
   assert(
     string_contains(
-      summary_line(plain(), hosted, counts_of(p, hosted)),
+      summary_line(plain(), hosted, counts_of(p, hosted.reaches)),
       "1 host-backed and not cached",
     ),
   )
@@ -3560,7 +3643,7 @@ test "a reason is spaced in the line and joined in the document" {
 test "`--explain` says why each test ran, once per reason, and how the groups formed" {
   let p = a_program([a_case(0, "one"), a_case(1, "two")]);
   let keys = [a_key(0, "one", false, false, false), a_key(1, "two", true, false, false)];
-  let lines = explain_lines(plain(), p, a_run([], 0), a_decided(p, keys));
+  let lines = explain_lines(plain(), p, [], a_decided(p, keys));
   assert(string_contains(at(lines, 1, ""), "run  abcdef012345 new "));
   assert(string_contains(at(lines, 1, ""), "isolation: region"));
   assert(string_contains(at(lines, 2, ""), "skip abcdef012345 cached "));
@@ -3579,7 +3662,7 @@ test "`--explain` says what a pass is filed under and names what no key covers" 
   };
   let p = a_program([reads, a_case(1, "two")]);
   let keys = [a_key(0, "one", false, false, false), a_key(1, "two", false, false, false)];
-  let lines = explain_lines(plain(), p, a_run([], 0), a_decided(p, keys));
+  let lines = explain_lines(plain(), p, [], a_decided(p, keys));
   assert(string_contains(at(lines, 1, ""), " · outside its key: {shipped.read}"));
   assert(!string_contains(at(lines, 2, ""), "outside its key"));
   assert(said(lines, "   key"));
@@ -3592,12 +3675,7 @@ test "`--explain` says what a pass is filed under and names what no key covers" 
       "     1 test read what this binary ships (shipped), which is in no key: a change to it reruns none of them",
     ),
   );
-  let uncached = explain_lines(
-    plain(),
-    { ..p, filed_under: None },
-    a_run([], 0),
-    a_decided(p, keys),
-  );
+  let uncached = explain_lines(plain(), { ..p, filed_under: None }, [], a_decided(p, keys));
   assert(said(uncached, "     no pass is filed: `--no-cache` reads and writes none"));
   let text = to_string(
     answered(plain(), from_argv("test", ["--json"]), p, a_run([], 0), [], a_decided(p, keys)).json,
@@ -3813,8 +3891,8 @@ test "a run's time is its load and every phase after it, longest first" {
 test "a test the binding can reach is host rather than isolated" {
   let c = a_case(0, "one");
   let hermetic = a_run([], 0);
-  assert_eq(isolated_as(hermetic, c), "region");
-  assert_eq(isolated_as({ ..hermetic, reaches: [0] }, c), "host");
+  assert_eq(isolated_as(hermetic.reaches, c), "region");
+  assert_eq(isolated_as([0], c), "host");
   // A test is shared exactly when one of the atoms the row carries can be contended over, and a
   // seed it reads is not one of them.
   let fs_write = {
@@ -3822,8 +3900,8 @@ test "a test the binding can reach is host rather than isolated" {
     text: "fs.write[/tmp/x]",
   };
   let seed = { atom: { effect: "sim", resource: "", writes: false }, text: "sim.read" };
-  assert_eq(isolated_as(hermetic, { ..c, atoms: [seed] }), "region");
-  assert_eq(isolated_as(hermetic, { ..c, atoms: [seed, fs_write] }), "shared");
+  assert_eq(isolated_as(hermetic.reaches, { ..c, atoms: [seed] }), "region");
+  assert_eq(isolated_as(hermetic.reaches, { ..c, atoms: [seed, fs_write] }), "shared");
   assert_eq(shared_of({ ..c, atoms: [seed, fs_write] }), "{fs.write[/tmp/x]}")
 }
 
@@ -3852,7 +3930,7 @@ test "`--explain` names and counts the tests that contend only over a region lab
   ];
   let r = a_run([], 0);
   assert_eq(
-    group_tally(plain(), counts_of(p, r), a_decided(p, keys)),
+    group_tally(plain(), counts_of(p, r.reaches), a_decided(p, keys)),
     indent()
       ++ "  1 of 3 region-isolated and free · 1 group for the 2 shared tests · 1 of them only over a region label",
   )
@@ -3875,22 +3953,21 @@ test "classes over every test are coloured only for a mutation" {
   assert_eq(every_of(p, { ..options, mutate: Some("*") }), [[0, 2], [1]])
 }
 
-test "a bound run says how many tests reach the host, what it bound and what it shook hands on" {
+test "a bound run says how many tests reach the host and what it bound, and after the run what it shook hands on" {
+  let o = { ..an_opening(), hermetic: false, operations: 7, digest: "b3:aabbccddeeff" };
+  let c = { total: 3, isolated: 1, shared: 0, host: 2 };
+  assert_eq(binding_lines(plain(), o, c), [
+    "   host 2 of 3 · not cached",
+    "   binding host · 7 operations · b3:aabbccddeeff",
+  ]);
+  assert_eq(binding_lines(plain(), an_opening(), c), []);
   let bound = {
     ..a_run([], 0),
     hermetic: false,
-    label: "host",
-    operations: 7,
-    digest: "b3:aabbccddeeff",
     handshakes: ["handshakes: 1 completed, 0 refused"],
   };
-  let c = { total: 3, isolated: 1, shared: 0, host: 2 };
-  assert_eq(binding_lines(plain(), bound, c), [
-    "   host 2 of 3 · not cached",
-    "   binding host · 7 operations · b3:aabbccddeeff",
-    "   handshakes: 1 completed, 0 refused",
-  ]);
-  assert_eq(binding_lines(plain(), a_run([], 0), c), [])
+  assert_eq(handshake_lines(plain(), bound), ["   handshakes: 1 completed, 0 refused"]);
+  assert_eq(handshake_lines(plain(), a_run([], 0)), [])
 }
 
 test "a label is bare in a single-module run and qualified across several" {

@@ -553,15 +553,15 @@ fn holding(footprint: Value) -> Value {
         "diags",
         "packages",
         "pins",
-        "mod_pkg",
+        "module_packages",
         "modules",
         "types",
         "tests",
         "laws",
         "effects",
         "hashes",
-        "emit_roots",
-        "emit_ctors",
+        "emitter_roots",
+        "emitter_ctors",
         "ordinals",
     ]
     .into_iter()
