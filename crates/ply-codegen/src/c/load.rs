@@ -232,11 +232,9 @@ pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Librar
         UNITS_MAPPED.fetch_add(1, Relaxed);
         return Ok((library, Duration::ZERO));
     }
-    // A directory of its own per build, not per process. A run compiles the unit once per worker
-    // plus a pre-flight, all in one process, so a path keyed on the process id alone had every
-    // worker writing the same `unit.c` and loading the same object while its neighbour was still
-    // writing it. What that looked like was not a crash: the losers failed to build, declined
-    // every call they were offered, and the run went quietly on with the interpreter.
+    // A directory of its own per build, not per process: a run compiles the unit once per worker
+    // plus a pre-flight, all in one process, and on a path keyed by the process id alone each
+    // worker would write the same `unit.c` and load an object a neighbour is still writing.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Relaxed);
     let dir = std::env::temp_dir().join(format!("ply-c-{}-{stem}-{n}", std::process::id()));
