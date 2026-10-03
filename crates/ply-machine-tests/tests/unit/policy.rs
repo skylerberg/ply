@@ -113,7 +113,7 @@ fn a_familys_values_are_named_by_the_module_the_program_declares_it_in() {
             "the same operations, named differently"
         );
     }
-    let found = ply_machine::drive::FoundData::Project {
+    let found = ply_machine::drive::FoundData {
         root: String::new(),
         files: Vec::new(),
         places: Vec::new(),

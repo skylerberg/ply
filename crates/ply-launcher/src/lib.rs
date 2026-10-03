@@ -6,7 +6,7 @@
 //! bindings, and the exit code.
 
 use ply_eval::{Diagnostic, Ended, codes};
-use ply_machine::artifact::{self, Binds};
+use ply_machine::enter::{self, Binds};
 use ply_machine::runnable::Runnable;
 use std::path::{Path, PathBuf};
 
@@ -132,7 +132,7 @@ pub fn run(
     };
     ply_machine::shipped::stamp(stamps());
     let version = program.version.clone();
-    let opened = match artifact::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
+    let opened = match enter::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
         Ok(opened) => opened,
         Err(refused) => return Ended::refused(refused),
     };
@@ -167,7 +167,7 @@ pub fn run(
                     let (answer, counted, sites) = crate::count::window_sampled(
                         || {
                             ply_codegen::rt::unbounded(|| {
-                                artifact::enter_runnable(opened, argv, binds)
+                                enter::enter_runnable(opened, argv, binds)
                             })
                         },
                         asked.every(),
@@ -183,9 +183,7 @@ pub fn run(
                     }
                     answer
                 }
-                None => {
-                    ply_codegen::rt::unbounded(|| artifact::enter_runnable(opened, argv, binds))
-                }
+                None => ply_codegen::rt::unbounded(|| enter::enter_runnable(opened, argv, binds)),
             }
         });
     match work {
