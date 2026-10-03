@@ -9,7 +9,7 @@
 #                                            the cache entries it found and wrote, its pauses
 #   .github/ci-timings.sh tests [RUN] [N]    the N slowest tests of RUN (default 40), from the
 #                                            `test-durations` artifact its `passes` job uploads
-#   .github/ci-timings.sh --self-test        the timestamp arithmetic, against fixtures
+#   .github/ci-timings.sh --self-test        the timestamp arithmetic and the chain, against fixtures
 #
 # RUN is a run id, a run URL, or a branch with a run; with none, the newest run of `CI`. NAME is a
 # case-insensitive substring of a job's name; with none, `why` explains the run's longest job.
@@ -82,12 +82,14 @@ resolve_run() {
   esac
 }
 
-# The run and its jobs, read once into $tmp however many questions a mode asks of them.
+# The run and its jobs, read once into $tmp however many questions a mode asks of them. A skipped
+# job ran nothing, and a re-run stamps it as ending before it starts.
 fetch() {
   gh api "repos/{owner}/{repo}/actions/runs/$1" > "$tmp/run.json" ||
     die "no run $1 in this repository"
   gh api --paginate "repos/{owner}/{repo}/actions/runs/$1/jobs?per_page=100" |
-    jq -s '{jobs: [.[].jobs[] | {id, name, status, conclusion, started_at, completed_at, steps}]}' \
+    jq -s '{jobs: [.[].jobs[] | select(.conclusion != "skipped")
+                   | {id, name, status, conclusion, started_at, completed_at, steps}]}' \
       > "$tmp/jobs.json"
   local started
   started=$(jq '[.jobs[] | select(.started_at != null)] | length' "$tmp/jobs.json")
@@ -216,7 +218,8 @@ cmd_runs() {
           (if (.conclusion // "") == "" then .status else .conclusion end), .createdAt] | @tsv' |
   while IFS=$'\t' read -r id branch event conclusion created; do
     jobs=$(gh api --paginate "repos/{owner}/{repo}/actions/runs/$id/jobs?per_page=100" \
-      --jq '.jobs[] | [.started_at, .completed_at] | @tsv' 2>/dev/null || true)
+      --jq '.jobs[] | select(.conclusion != "skipped") | [.started_at, .completed_at] | @tsv' \
+      2>/dev/null || true)
     read -r first last <<< "$(printf '%s\n' "$jobs" | awk_time '
       { if ($1 == "" || $1 == "null") next
         s = epoch($1)
@@ -236,17 +239,46 @@ cmd_runs() {
   done
 }
 
+# The jobs that decided when the run ended, first to last, from `jobs_tsv` rows on stdin: each is
+# the job that ended last before the one after it began.
+chain() {                                          # $1 the run's first start, $2 its last end
+  awk -F'\t' -v first="$1" -v last="$2" '
+    # Stamped as ending before it started: it ran nothing.
+    $2 > 0 && $2 < $1 { next }
+    { n++; s[n] = $1 + 0; e[n] = $2 + 0; name[n] = $3 }
+    END {
+      cur = 0
+      # `>=`: of jobs that ended in the same second, the one that ended the run is the last one
+      # the API lists, which is the `ci` gate.
+      for (i = 1; i <= n; i++) if (e[i] >= e[cur]) cur = i
+      # A link ends before the one after it does, so the walk only moves back: a job that took no
+      # time is not its own predecessor. A chain has at most one link a job.
+      while (cur != 0 && k < n) {
+        k++; link[k] = name[cur]; dur[k] = e[cur] - s[cur]
+        prev = 0
+        for (i = 1; i <= n; i++)
+          if (e[i] > 0 && e[i] <= s[cur] && e[i] < e[cur] && (prev == 0 || e[i] > e[prev])) prev = i
+        cur = prev
+      }
+      total = 0
+      for (i = k; i >= 1; i--) { total += dur[i]; printf "  %8ds  %s\n", dur[i], link[i] }
+      printf "  %8ds  not on the chain: queue, gaps between jobs, and the jobs it overlaps\n", last - first - total
+    }'
+}
+
 cmd_jobs() {
-  local run=$1 pattern=${2:-} branch event conclusion first last span
+  local run=$1 pattern=${2:-} branch event conclusion attempt again="" first last span
   fetch "$run"
   # `-` for a run that has not ended: an empty field would collapse and shift the rest.
-  IFS=$'\t' read -r branch event conclusion < <(jq -r '
-    [.head_branch, .event, (if (.conclusion // "") == "" then .status else .conclusion end)] | @tsv' \
-    "$tmp/run.json")
+  IFS=$'\t' read -r branch event conclusion attempt < <(jq -r '
+    [.head_branch, .event, (if (.conclusion // "") == "" then .status else .conclusion end),
+     .run_attempt] | @tsv' "$tmp/run.json")
   read -r first last < <(span_tsv)
   # A job still running has no completion, so a run younger than its first job has no span yet.
   span=$((last > first ? last - first : 0))
-  echo "run $run · $branch · $event · $conclusion · $(spell "$span") from the first step to the last job"
+  # A re-run lists each job's latest execution: a late start may be a job run again, not a queue.
+  if [ "$attempt" -gt 1 ]; then again=" · attempt $attempt"; fi
+  echo "run $run · $branch · $event · $conclusion$again · $(spell "$span") from the first step to the last job"
   echo
   echo "jobs, longest first"
   jobs_tsv | awk -F'\t' -v OFS='\t' -v first="$first" '
@@ -257,23 +289,7 @@ cmd_jobs() {
           ($2 < 0 ? "-" : sprintf("+%d:%02d", $2 / 60, $2 % 60)), $3 }'
   echo
   echo "the chain that decided when the run ended: each link was still running when the next began"
-  jobs_tsv | awk -F'\t' -v first="$first" -v last="$last" '
-    { n++; s[n] = $1 + 0; e[n] = $2 + 0; name[n] = $3 }
-    END {
-      cur = 0
-      # `>=`: of jobs that ended in the same second, the one that ended the run is the last one
-      # the API lists, which is the `ci` gate.
-      for (i = 1; i <= n; i++) if (e[i] >= e[cur]) cur = i
-      while (cur != 0) {
-        k++; link[k] = name[cur]; dur[k] = e[cur] - s[cur]
-        prev = 0
-        for (i = 1; i <= n; i++) if (e[i] > 0 && e[i] <= s[cur] && (prev == 0 || e[i] > e[prev])) prev = i
-        cur = prev
-      }
-      total = 0
-      for (i = k; i >= 1; i--) { total += dur[i]; printf "  %8ds  %s\n", dur[i], link[i] }
-      printf "  %8ds  not on the chain: queue, gaps between jobs, and the jobs it overlaps\n", last - first - total
-    }'
+  jobs_tsv | chain "$first" "$last"
   if [ -n "$pattern" ]; then
     echo
     steps_for "$pattern"
@@ -317,7 +333,7 @@ cmd_why() {
     rows=$(jq -r --arg n "$name" '.jobs[] | select(.name == $n) | [.id, .name] | @tsv' "$tmp/jobs.json")
     echo "(no job named: the longest, \"$name\")"
   fi
-  count=$(printf '%s\n' "$rows" | grep -c .)
+  count=$(printf '%s\n' "$rows" | grep -c . || true)
   if [ "$count" -eq 0 ]; then
     die "no job of run $run matches \"$pattern\""
   fi
@@ -390,8 +406,13 @@ LOG
     "12.0 Cache restored from key: fixture-key" "a cache line and its offset"
   rm -f "$fixture"
 
+  check "$(printf '%s\t%s\t%s\n' 0 100 build 103 500 lanes 600 101 refresh 602 700 desks 705 705 gate |
+    chain 0 705 | awk '{ printf "%s%s %s", sep, $1, $2; sep = ", " }')" \
+    "100s build, 397s lanes, 98s desks, 0s gate, 110s not" \
+    "the chain past a job stamped as ending before it starts and one that took no time"
+
   [ "$fail" -eq 0 ] || exit 1
-  echo "self-test: the epochs, a duration, an action's own time, a pause and a cache line all hold"
+  echo "self-test: the epochs, a duration, an action's own time, a pause, a cache line and the chain all hold"
 }
 
 [ $# -gt 0 ] || die "usage: ci-timings.sh {runs [N]|jobs [RUN] [NAME]|why [RUN] [NAME]|tests [RUN] [N]|--self-test}"
