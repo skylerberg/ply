@@ -1,7 +1,6 @@
 use crate::counting::charge;
 use ply_eval::arena::{Owner, Slot};
 use ply_eval::{Fixture, TaskRegions, Value};
-use rpds::RedBlackTreeMap;
 
 fn charged<T>(f: impl FnOnce() -> T) -> (usize, usize, T) {
     let (out, allocs, bytes) = charge(f);
@@ -16,35 +15,18 @@ fn filled(n: usize) -> (TaskRegions, Vec<Slot>) {
     (regions, slots)
 }
 
-/// The persistent map the region store replaced, as the baseline the comparisons read.
-fn persistent(n: usize) -> RedBlackTreeMap<u32, Value> {
-    let mut map = RedBlackTreeMap::new();
-    for i in 0..n {
-        map.insert_mut(i as u32, Value::Int(i as i64));
-    }
-    map
-}
-
 #[test]
 fn a_cell_write_into_the_region_store_costs_nothing() {
-    println!("\n  cells   region allocs/write   map allocs/write   region allocs/read");
+    println!("\n  cells   region allocs/write   region allocs/read");
     let mut region_at_ten_thousand = 0.0;
-    let mut map_at_ten_thousand = 0.0;
     for n in [1usize, 8, 64, 512, 4_096, 10_000] {
         let (mut regions, slots) = filled(n);
         let target = slots[n / 2];
-        let mut map = persistent(n);
-        let key = (n / 2) as u32;
 
         const WRITES: usize = 1_000;
         let (writes, _, _) = charged(|| {
             for i in 0..WRITES {
                 assert!(regions.set(target, Value::Int(i as i64)));
-            }
-        });
-        let (map_writes, _, _) = charged(|| {
-            for i in 0..WRITES {
-                map.insert_mut(key, Value::Int(i as i64));
             }
         });
         let (reads, _, _) = charged(|| {
@@ -54,14 +36,12 @@ fn a_cell_write_into_the_region_store_costs_nothing() {
         });
 
         let per_write = writes as f64 / WRITES as f64;
-        let map_per_write = map_writes as f64 / WRITES as f64;
         println!(
-            "  {n:>5}   {per_write:>18.2}   {map_per_write:>16.2}   {:>18.2}",
+            "  {n:>5}   {per_write:>18.2}   {:>18.2}",
             reads as f64 / WRITES as f64
         );
         if n == 10_000 {
             region_at_ten_thousand = per_write;
-            map_at_ten_thousand = map_per_write;
         }
     }
 
@@ -72,11 +52,6 @@ fn a_cell_write_into_the_region_store_costs_nothing() {
     assert_eq!(
         region_at_ten_thousand, 0.0,
         "a slot write is an indexed store and must not reach the allocator"
-    );
-    assert!(
-        map_at_ten_thousand > 0.0,
-        "the persistent map allocated {map_at_ten_thousand} per write, so it is \
-         not the baseline this comparison needs"
     );
 }
 
@@ -96,20 +71,11 @@ fn allocating_a_cell_is_a_bump_once_the_arena_is_warm() {
             regions.alloc_cell(Value::Int(i as i64));
         }
     });
-    let (map_build, map_bytes, _) = charged(|| persistent(CELLS));
 
-    println!(
-        "\n  {CELLS} cells: region {warm} allocations / {warm_bytes} bytes; \
-         persistent map {map_build} allocations / {map_bytes} bytes"
-    );
     assert_eq!(
         (warm, warm_bytes),
         (0, 0),
         "a warm arena builds a region's cells without touching the allocator"
-    );
-    assert!(
-        map_build >= CELLS,
-        "the persistent map allocated {map_build} times for {CELLS} cells"
     );
 }
 
