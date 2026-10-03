@@ -1,7 +1,6 @@
 use crate::counting::charge;
 use ply_eval::Value;
 use ply_eval::arena::{Arena, Owner, RegionKind};
-use rpds::RedBlackTreeMap;
 
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, usize, R) {
     let (out, allocs, bytes) = charge(f);
@@ -184,23 +183,8 @@ fn renewing_a_warm_store_costs_the_allocator_nothing() {
 }
 
 #[test]
-fn a_region_against_the_persistent_map_it_replaced() {
+fn a_warm_region_builds_writes_and_closes_without_the_allocator() {
     const CELLS: usize = 10_000;
-
-    // Reserved before arming, so the count is the store's cost and not the test's bookkeeping.
-    let mut map: RedBlackTreeMap<u32, Value> = RedBlackTreeMap::new();
-    let mut ids = Vec::with_capacity(CELLS);
-    let (world_build, world_bytes, ()) = counted(|| {
-        for i in 0..CELLS {
-            map.insert_mut(i as u32, Value::Int(i as i64));
-            ids.push(i as u32);
-        }
-    });
-    let (world_write, _, ()) = counted(|| {
-        for id in &ids {
-            map.insert_mut(*id, Value::Int(-1));
-        }
-    });
 
     let mut arena = Arena::new();
     // Warm first: the claim is about the steady state.
@@ -227,25 +211,10 @@ fn a_region_against_the_persistent_map_it_replaced() {
         arena.close(region);
     });
 
-    println!(
-        "\n  {CELLS} cells\n    map:    build {world_build} allocations, {world_bytes} bytes; \
-         {world_write} allocations to write every cell\n    region: build {region_build} \
-         allocations, {region_bytes} bytes; {region_write} allocations to write every cell; \
-         {region_close} to close"
-    );
-
     assert_eq!(
         (region_build, region_bytes),
         (0, 0),
         "a warm region builds ten thousand cells without touching the allocator"
     );
     assert_eq!((region_write, region_close), (0, 0));
-    assert!(
-        world_build > CELLS,
-        "the persistent map allocates at least once per cell, and it took {world_build}"
-    );
-    assert!(
-        world_write > 0,
-        "a persistent write copies the path it rewrites"
-    );
 }
