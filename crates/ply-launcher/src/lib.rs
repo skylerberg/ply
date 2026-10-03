@@ -42,8 +42,6 @@ pub fn trust() -> Vec<PathBuf> {
 /// Not a `.ply` file, so the program's own listing passes over it.
 const STAMPS: &str = "stamps";
 
-const EVALUATOR_SOURCES: &str = env!("PLY_EVALUATOR_SOURCES");
-
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
 const FRONT_CODE: &str = env!("PLY_FRONT_CODE");
@@ -67,7 +65,11 @@ pub fn stamps() -> String {
         ply_codegen::c::producer::identity_of(&ply_codegen::c::producer::Sources::Embedded);
     format!(
         "frontend {}\nruntime {}\n",
-        stamp(&["ply.stamp.frontend.2", EVALUATOR_SOURCES, FRONT_CODE]),
+        stamp(&[
+            "ply.stamp.frontend.3",
+            ply_codegen::c::semantics_digest(),
+            FRONT_CODE
+        ]),
         stamp(&[
             "ply.stamp.runtime.2",
             RUNTIME_SOURCES,
