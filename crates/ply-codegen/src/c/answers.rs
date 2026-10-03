@@ -2,6 +2,7 @@
 //! gave it, the runtime it ran on, the entry and its arguments, so the same question asked of the
 //! same compiler is read back rather than worked out again.
 
+use super::RUNTIME;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -9,9 +10,6 @@ use ply_eval::Value;
 use ply_eval::files::write_atomically;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-
-/// The sources of the runtime the emitter runs on, as `build.rs` digests them.
-const RUNTIME: &str = env!("PLY_RUNTIME_DIGEST");
 
 pub(super) fn dir() -> PathBuf {
     super::load::cache_dir().join("answers")
