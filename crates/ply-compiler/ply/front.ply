@@ -22,7 +22,7 @@ import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEff
 import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index,
              hash_index_pinned, hex, digest, unused, Pin, Fixed, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
-              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaboration,
+              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaborated, ended,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, builtin_schemes,
               builtin_docs, builtin_constraints, find_doc, published_pure, measure_ty, EmitFacts,
               emit_facts_bin, written_counts)
@@ -2034,11 +2034,11 @@ fn named(r: Resolved, m: Int, c: Code) -> Code = {
   { own: c.own, node: node, span: c.span }
 }
 
-// What the prover reads of a program: each `fn`'s lowered body and clauses, each sum type's
-// variant count, and each law. A body the lowering does not take is `None`, which reads as
-// unreached.
+// What the prover reads of a program: each `fn`'s lowered body and clauses, and whether the checker
+// saw its calls end; each sum type's variant count; and each law. A body the lowering does not take
+// is `None`, which reads as unreached.
 pub type Claim =
-  | ClaimDef({ name: Bytes, params: Int, body: Option<Code>, spec: List<ClaimClause> })
+  | ClaimDef({ name: Bytes, params: Int, body: Option<Code>, spec: List<ClaimClause>, ends: Bool })
   | ClaimSum({ name: Bytes, variants: Int })
   | ClaimLaw({ key: Bytes, guard: Option<Lowered>, body: Option<Code> })
 
@@ -2055,10 +2055,11 @@ fn lowered_at(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Lowered =
 
 // `result` takes the slot after the parameters, as the obligation's binders place it. An opaque
 // definition is claimed by its spec alone: what it promises, not how it is written.
-fn def_claim(r: Resolved, m: Int, module: Bytes, d: FnDef, opaque: Bool) -> Claim = {
+fn def_claim(r: Resolved, m: Int, module: Bytes, d: FnDef, opaque: Bool, ends: Bool) -> Claim = {
   let params = map(d.params, |p: Param| p.name.name);
   ClaimDef({
     name: qualify(module, d.name.name),
+    ends: ends,
     params: len(params),
     // A `transparent` definition's body is part of what other modules read of it.
     body: if opaque && d.transparent == None { None } else { lowered(r, m, params, d.body) },
@@ -2084,20 +2085,21 @@ fn law_claim(r: Resolved, m: Int, module: Bytes, d: LawDef) -> Claim = {
   })
 }
 
-fn claims_of(mods: List<Mod>, r: Resolved) -> List<Claim> =
-  claims_of_modules(mods, r, range(0, len(mods)), |m: Bytes| false)
-
 fn claims_of_modules(
   mods: List<Mod>,
   r: Resolved,
   wanted: List<Int>,
   opaque: (Bytes) -> Bool,
+  ends: Map<Bytes, Bool>,
 ) -> List<Claim> =
   fold(wanted, [], |acc: List<Claim>, i: Int| {
     let m = at(mods, i);
     fold(m.module.items, acc, |a: List<Claim>, it: Item|
       match it {
-        IFn(d) -> push(a, def_claim(r, i, m.name, d, opaque(m.name))),
+        IFn(d) -> {
+          let name = qualify(m.name, d.name.name);
+          push(a, def_claim(r, i, m.name, d, opaque(m.name), map_contains(ends, name)))
+        },
         // A split over a type is sound only with every variant in hand.
         IType(d) -> match d.body {
           TDSum(vs) -> push(a, ClaimSum({ name: qualify(m.name, d.name.name), variants: len(vs) })),
@@ -2127,9 +2129,16 @@ pub fn claims(
       packaged.shelf,
     ) {
     Failed(_) -> panic("a program the front end checked does not resolve"),
-    Resolved_(x) -> match elaboration(x.r, x.mods) {
+    Resolved_(x) -> match elaborated(x.r, x.mods) {
       None -> panic("a program the front end checked does not check"),
-      Some(shapes) -> claims_of(updated_mods(x.mods, shapes), x.r),
+      Some(e) ->
+        claims_of_modules(
+          updated_mods(x.mods, e.elaboration),
+          x.r,
+          range(0, len(x.mods)),
+          |m: Bytes| false,
+          e.ends,
+        ),
     },
   }
 }
@@ -2167,8 +2176,13 @@ pub fn claims_in(
   match elaboration_with(w.r, w.mods, known) {
     None -> panic("a program the front end checked does not check"),
     Some(shapes) ->
-      claims_of_modules(updated_mods(w.mods, shapes), w.r, wanted, |m: Bytes|
-        map_contains(stubs, m) || !owned(m)),
+      claims_of_modules(
+        updated_mods(w.mods, shapes),
+        w.r,
+        wanted,
+        |m: Bytes| map_contains(stubs, m) || !owned(m),
+        ended(w.checked.defs),
+      ),
   }
 }
 
