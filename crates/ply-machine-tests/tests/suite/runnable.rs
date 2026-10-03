@@ -42,3 +42,36 @@ fn bytes_that_are_no_runnable_are_refused() {
     let (bytes, _) = written("fn main() -> Int = 1\n");
     assert!(runnable::decode(&bytes[..bytes.len() / 2]).is_err());
 }
+
+/// What `shipped.definitions` tells a program of itself.
+#[test]
+fn a_programs_definitions_are_each_fn_under_the_hash_that_covers_what_it_reaches() {
+    let definitions = |source: &str| {
+        let (bytes, _) = written(source);
+        let program = runnable::decode(&bytes).expect("the runnable reads back");
+        ply_machine::shipped::definitions(&program.front.answer)
+    };
+    let line = |text: &str, name: &str| {
+        text.lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("`{name}` has a line in:\n{text}"))
+            .to_string()
+    };
+    let before =
+        definitions("fn leaf() -> Int = 1\n\nfn other() -> Int = 2\n\nfn main() -> Int = leaf()\n");
+    let after = definitions(
+        "// A comment moves no hash.\nfn leaf() -> Int = 3\n\nfn other() -> Int = 2\n\nfn main() -> Int = leaf()\n",
+    );
+    let names: Vec<&str> = before
+        .lines()
+        .map(|l| l.split(' ').next().expect("a line names a definition"))
+        .collect();
+    assert_eq!(names, ["m.leaf", "m.main", "m.other"], "in name order");
+    assert_eq!(line(&before, "m.other"), line(&after, "m.other"));
+    assert_ne!(line(&before, "m.leaf"), line(&after, "m.leaf"));
+    assert_ne!(
+        line(&before, "m.main"),
+        line(&after, "m.main"),
+        "a caller's hash covers what it calls"
+    );
+}

@@ -61,11 +61,13 @@ reach: the passes and discharged obligations found there count here, and this
 run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads only). Entries
 are keyed by content and by the shape of what is stored, so nothing
 machine-specific is ever shared; `--no-cache` ignores it. What the front end
-filed is believed only by a `ply` whose evaluator and loading code are the same,
-and a pass or a discharged obligation only by one whose runtime, emitter and
-code that decides a verdict are the same too: another build files them again
-(`W0603`), and an upstream answers only builds of its runtime. The rest of
-`ply`, its other commands among it, is in neither. A dependency's own
+filed is believed only by a `ply` whose evaluator is the same and whose own
+definitions that analyse a program and file the answer hash as they did, and a
+pass or a discharged obligation only by one whose runtime is the same and whose
+definitions that make a unit and decide a verdict hash as they did: another
+build files them again (`W0603`), and an upstream answers only builds of its
+runtime. A hash covers what its definition reaches and no comment or layout
+(§8.2), so the rest of `ply`, its other commands among it, is in neither. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
@@ -1276,8 +1278,8 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the emitter, the runtime and what it was asked, and the cost checker's report on a program, kept under the compiler and the program's text (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's committed builder or `ply` program is behind its sources, the one the builder made of them and the rows that seed its next build (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, and the cost checker's report on a program, kept under the checker's hash and the program's text (default under the temp directory) |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's committed builder or `ply` program is behind its sources, the one the builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
