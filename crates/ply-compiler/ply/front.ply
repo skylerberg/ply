@@ -26,9 +26,8 @@ import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOut
              rehash_index)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaborated, ended,
-              elaboration_with, updated_mods, check_front_with, is_prelude_effect, builtin_schemes,
-              builtin_docs, builtin_constraints, find_doc, published_pure, measure_ty, EmitFacts,
-              emit_facts_bin, written_counts)
+              elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
+              builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
@@ -2050,19 +2049,14 @@ pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
 pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes>, witnesses: Int }
 
 // Every builtin, in the prelude's order.
-pub fn builtin_rows() -> List<BuiltinRow> / {abort.raise} = {
-  let docs = builtin_docs();
-  let constrained = builtin_constraints();
-  map(builtin_schemes(0, 1, 2, 0), |x: { name: Bytes, sc: Scheme }|
+pub fn builtin_rows() -> List<BuiltinRow> / {abort.raise} =
+  map(builtins(), |b: Builtin|
     {
-      name: x.name,
-      scheme: x.sc,
-      params: match find_doc(docs, x.name) { Some(d) -> d.params, None -> [] },
-      witnesses: fold(constrained, 0, |n: Int, b: { name: Bytes, cs: List<DefConstraint> }|
-        if b.name != x.name { n }
-        else { len(filter(b.cs, |c: DefConstraint| is_predicate(c.deriver))) }),
+      name: b.name,
+      scheme: b.scheme,
+      params: b.params,
+      witnesses: len(filter(b.constraints, |c: DefConstraint| is_predicate(c.deriver))),
     })
-}
 
 fn global_name(r: Resolved, module: Int, written: Bytes) -> Bytes / {abort.raise} = {
   let q: QName = match bytes_index_of(written, b"::") {
@@ -2507,11 +2501,42 @@ fn pull_round(
   })
 }
 
-type Pull = { parsed: List<ParsedSource>, pulled: List<Bytes>, diags: List<Diag> }
+fn without_last(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  fold(range(0, len(xs) - 1), [], |acc: List<Bytes>, i: Int| push(acc, at(xs, i)))
 
+// The shelf's name for what sits at `path` beside the shipped module `module`. The shelf holds a
+// package, and what lies beside its directory, under the package's one root: `../prelude.ply`
+// beside `compiler.infer` is `compiler.prelude`.
+fn shelved_name(module: Bytes, path: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let walked = fold(
+    bytes_split(path, b"/"),
+    without_last(bytes_split(module, b".")),
+    |dir: List<Bytes>, part: Bytes|
+      if part == b"" || part == b"." { dir }
+      else if part == b".." { if len(dir) > 1 { without_last(dir) } else { dir } }
+      else { push(dir, part) },
+  );
+  match list_at(walked, len(walked) - 1) {
+    None -> None,
+    Some(file) -> if len(walked) < 2 || !bytes_ends_with(file, b".ply") { None } else {
+      Some(joined(push(without_last(walked), bytes_slice(file, 0, bytes_len(file) - 4)), b"."))
+    },
+  }
+}
+
+type Pull = {
+  parsed: List<ParsedSource>,
+  pulled: List<Bytes>,
+  embeds: List<EmbedAt>,
+  diags: List<Diag>,
+}
+
+// `shipped` is each shelved module as the analysis reads it, a stub where it has one, and `whole` the
+// shelf as it stands.
 fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
+  whole: Map<Bytes, Bytes>,
   listed: List<Bytes>,
   x: Pull,
 ) -> Pull / {abort.raise} = {
@@ -2523,14 +2548,61 @@ fn pulling(
       pulling(
         users,
         shipped,
+        whole,
         listed,
-        map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes|
+        map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes| {
+          let o = shelf_embedded(whole, len(acc.parsed), { name: name, src: src });
           {
             ..acc,
-            parsed: push(acc.parsed, parse_at(len(acc.parsed), { name: name, src: src })),
+            parsed: push(acc.parsed, o.parsed),
             pulled: push(acc.pulled, name),
-          }),
+            embeds: append(acc.embeds, o.embeds),
+          }
+        }),
       )
+    }
+  }
+}
+
+fn shelf_read(
+  whole: Map<Bytes, Bytes>,
+  module: Bytes,
+  want: EmbedWant,
+) -> EmbedRead / {abort.raise} =
+  if want.dir { Err(b"a shipped module embeds a file the shelf holds, never a directory") } else {
+    match shelved_name(module, want.path) {
+      None -> Err(bytes_concat_all([b"`", want.path, b"` names nothing a shelf could hold"])),
+      Some(name) -> match map_get(whole, name) {
+        Some(text) -> Ok([{ name: b"", bytes: text }]),
+        None -> Err(bytes_concat_all([b"`", want.path, b"` is not on the shelf"])),
+      },
+    }
+  }
+
+// A pulled module parsed, with what it embeds written out from the shelf: no driver reads beside a
+// module that has no file. What it embeds is asked of its text as the shelf holds it: read as a
+// stub it has no body left to ask, and the emitter may still lower the whole of it.
+fn shelf_embedded(
+  whole: Map<Bytes, Bytes>,
+  index: Int,
+  source: Source,
+) -> { parsed: ParsedSource, embeds: List<EmbedAt> } / {abort.raise} = {
+  let p = parse_at(index, source);
+  let text = match map_get(whole, source.name) { Some(t) -> t, None -> source.src };
+  if !names_embed(text) { { parsed: p, embeds: [] } } else {
+    let wants = if text == source.src { wants_of(p.module.module) }
+    else { wants_of(parse(text).node) };
+    let table = fold(wants, map_new(), |acc: Map<Bytes, EmbedRead>, want: EmbedWant|
+      map_insert(acc, embed_key(want), shelf_read(whole, source.name, want)));
+    let r = embedded(p.module.module, table, []);
+    {
+      parsed: {
+        ..p,
+        module: { ..p.module, module: r.module },
+        diags: append(p.diags, map(r.diags, |diag: ParseDiag| placed(index, diag))),
+      },
+      embeds: map_fold(table, [], |acc: List<EmbedAt>, key: Bytes, read: EmbedRead|
+        push(acc, { module: source.name, key: key, read: read })),
     }
   }
 }
@@ -2575,9 +2647,12 @@ pub fn analyse_pulling_std_with(
   let toolchain = fold(user, true, |acc: Bool, s: Source| acc && is_std(s.name))
     && fold(shipped, true, |acc: Bool, s: Source|
       acc && (!is_std(s.name) || has(map(user, |u: Source| u.name), s.name)));
-  let x = pulling(len(assembled), texts, map(shipped, |s: Source| s.name), {
+  let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let x = pulling(len(assembled), texts, whole, map(shipped, |s: Source| s.name), {
     parsed: assembled,
     pulled: [],
+    embeds: [],
     diags: [],
   });
   {
@@ -2591,7 +2666,7 @@ pub fn analyse_pulling_std_with(
         len(user),
         toolchain,
         ifaces,
-        written.at,
+        append(written.at, x.embeds),
         priors,
       )
     },
@@ -2642,15 +2717,17 @@ pub fn pins_pulling(
 // package, what it asked for, and what was read.
 pub type Embedded = { root: Bytes, module: Bytes, want: EmbedWant, read: EmbedRead }
 
-// Whether `src` may call `embed` or `embed_dir`: the name whole, then spaces, then `(`, or a `/` that
-// may open a comment before it. Only a module that may is parsed for what it embeds.
+// Whether `src` may call `embed` or `embed_dir`: the name whole and no import's module, then spaces,
+// then `(`, or a `/` that may open a comment before it. Only a module that may is parsed for what
+// it embeds.
 fn names_embed(src: Bytes) -> Bool / {abort.raise} = calls_embed_from(src, 0)
 
 fn calls_embed_from(src: Bytes, from: Int) -> Bool / {abort.raise} =
   match bytes_index_of_from(src, b"embed", from) {
     None -> false,
     Some(i) -> {
-      let whole = i == 0 || !ident_byte(bytes_at(src, i - 1));
+      let whole = (i == 0 || !ident_byte(bytes_at(src, i - 1)))
+        && !(i >= 7 && bytes_slice(src, i - 7, i) == b"import ");
       let end = if i + 9 < bytes_len(src) { i + 9 } else { bytes_len(src) };
       let named = if bytes_slice(src, i + 5, end) == b"_dir" { i + 9 } else { i + 5 };
       let next = past_spaces(src, named);
@@ -4875,6 +4952,7 @@ test "only a module that may call `embed` is parsed for what it embeds" {
   assert(names_embed(b"fn f() -> Bytes = embed_dir (\"x\")"));
   assert(names_embed(b"fn f() -> Bytes = embed\n  // why\n  (\"x\")"));
   assert(!names_embed(b"fn embeds() -> Int = 1"));
+  assert(!names_embed(b"import embed (EmbedAt, wants_of)\n"));
   assert(!names_embed(b"let embedded = an_embed(1)"));
   assert(!names_embed(b"// what the embed reads"));
   assert(!names_embed(b"x embed"))
@@ -5006,4 +5084,53 @@ test "a dependency is pinned by what its modules embed as well as by their text"
     )
   };
   assert(embedding_lib(Some(b"one")) != embedding_lib(Some(b"two")))
+}
+
+test "what sits beside a shipped module, or beside its package, is shelved under the package's root" {
+  assert_eq(shelved_name(b"compiler.infer", b"../prelude.ply"), Some(b"compiler.prelude"));
+  assert_eq(shelved_name(b"std.a", b"b.ply"), Some(b"std.b"));
+  assert_eq(shelved_name(b"std.a", b"./deep/b.ply"), Some(b"std.deep.b"));
+  assert_eq(shelved_name(b"std.deep.a", b"../b.ply"), Some(b"std.b"));
+  assert_eq(shelved_name(b"std.a", b"../../b.ply"), Some(b"std.b"));
+  assert_eq(shelved_name(b"std.a", b".."), None);
+  assert_eq(shelved_name(b"std.a", b"notes.txt"), None)
+}
+
+test "a shipped module embeds what the shelf holds beside it, and other bytes are another definition" {
+  let user = [{ name: b"m", src: b"import std.a\npub fn f() -> Bytes = a::text()" }];
+  let embedding = { name: b"std.a", src: b"pub fn text() -> Bytes = embed(\"../note.ply\")" };
+  let over = |note: Bytes|
+    answer_pulling_std_with(user, [embedding, { name: b"std.note", src: note }], [], []);
+  let one = over(b"one");
+  assert_eq(one.dump.diags, []);
+  assert_eq(one.pulled, [b"std.a"]);
+  assert_eq(one.dump.embeds, [
+    { module: b"std.a", key: b"file:../note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
+  ]);
+  assert(one.dump.hashes_digest != over(b"two").dump.hashes_digest)
+}
+
+test "a shipped module read as its stub still answers what the shelf's text of it embeds" {
+  let whole = fold(
+    [
+      { name: b"std.a", src: b"pub fn text() -> Bytes = embed(\"note.ply\")" },
+      { name: b"std.note", src: b"one" },
+    ],
+    map_new(),
+    |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src),
+  );
+  let stub = shelf_embedded(whole, 0, { name: b"std.a", src: b"pub fn text() -> Bytes = b\"\"" });
+  assert_eq(stub.embeds, [
+    { module: b"std.a", key: b"file:note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
+  ])
+}
+
+test "a shipped module that embeds what the shelf does not hold is refused" {
+  let a = answer_pulling_std_with(
+    [{ name: b"m", src: b"import std.a\npub fn f() -> Bytes = a::text()" }],
+    [{ name: b"std.a", src: b"pub fn text() -> Bytes = embed(\"gone.ply\")" }],
+    [],
+    [],
+  );
+  assert_eq(map(a.dump.diags, |d: Diag| d.code), [b"E0146"])
 }
