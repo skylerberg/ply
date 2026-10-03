@@ -51,9 +51,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # What the partitions of the last run measured, this branch's own or main's. A first run, an
-      # evicted entry or a fork with no access leaves nothing here, and the partitions are cut by
-      # test count instead.
+      # What the last run's test jobs measured, this branch's own or main's. A first run, an evicted
+      # entry or a fork with no access leaves nothing here: the shards are then sliced by test count
+      # and the corpus runs dealt round robin.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/ply-test-timings
@@ -89,7 +89,7 @@ jobs:
         with:
           path: /tmp/ply-shards
           key: test-shards-${{ github.run_id }}
-      # A save that cannot reserve its key only warns; fail here rather than in every partition.
+      # A save that cannot reserve its key only warns; fail here rather than in every job that reads it.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.cut.outputs.shards == 'true'
         with:
@@ -342,10 +342,9 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # Nextest needs the archive and nothing `build-ply` makes, so it starts once `build` ends, on
-  # runners of its own: the corpus lanes have theirs to themselves.
-  # After `build-ply`, whose stage it restores: a run that changed the compiler would otherwise have
-  # each shard emit the emitter's stage itself, minutes of a runner the lanes are queued for.
+  # On runners of its own, so the corpus lanes have theirs to themselves. After `build-ply`, whose
+  # stage it restores: a run that changed the compiler would otherwise have each shard emit the
+  # emitter's stage itself, minutes of a runner the lanes are queued for.
   nextest:
     name: nextest ${{ matrix.shard }}/${{ matrix.of }}
     needs: [plan, build, build-ply]
@@ -365,8 +364,8 @@ jobs:
           key: test-shards-${{ github.run_id }}
           fail-on-cache-miss: true
       - uses: ./.github/actions/suite
-      # What this shard's tests compiled and asked of the compiler on its last run: bodies, objects
-      # and answers are each kept under what decides them, so one still current is read back.
+      # What this shard's tests compiled and asked of the compiler on its last run: bodies and
+      # answers are each kept under what decides them, so one still current is read back.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/ply-c-nextest
@@ -469,9 +468,9 @@ jobs:
   # The corpus runs a partition takes, each lane a process beside the others.
   lanes:
     name: lanes ${{ matrix.shard }}/${{ matrix.of }}
-    # The stage is a cache, not an input: a partition restores the emitter's own key from
-    # `build-ply`, so it does not wait the emitter's whole stage out. On a pull request, where
-    # `refresh` does not run, this is the run's critical path.
+    # After `build-ply`, whose stage it restores: a run that changed the compiler would otherwise
+    # have each lane emit the emitter's stage itself. On a pull request, where `refresh` does not
+    # run, this is the run's critical path.
     needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -548,6 +547,13 @@ jobs:
         with:
           name: timings-lanes-${{ matrix.shard }}
           path: /tmp/timings-lanes-${{ matrix.shard }}.tsv
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: durations-lanes-${{ matrix.shard }}
+          path: /tmp/ply-test-durations.tsv
           retention-days: 1
           if-no-files-found: error
 
@@ -689,6 +695,49 @@ jobs:
         with:
           path: /tmp/ply-test-timings
           key: test-timings-${{ github.run_id }}
+
+      # What each test cost, slowest first, whichever jobs went red: the Ply tests' own durations and
+      # nextest's, with the table the next run is cut by when this run wrote one.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ !cancelled() }}
+        with:
+          pattern: durations-*
+          path: /tmp/durations-parts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ !cancelled() }}
+        with:
+          pattern: timings-nextest-*
+          merge-multiple: true
+          path: /tmp/nextest-parts
+      - name: What each test cost
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          out=/tmp/test-durations
+          mkdir -p "$out" /tmp/durations-parts /tmp/nextest-parts
+          {
+            find /tmp/durations-parts -name '*.tsv' -exec cat {} +
+            find /tmp/nextest-parts -name '*.tsv' -exec awk -F'\t' -v OFS='\t' '{ print $3, "nextest " $1, $2 }' {} +
+          } | LC_ALL=C sort -t$'\t' -k1,1nr -k2,2 -k3,3 > "$out/tests.tsv"
+          if [ -f /tmp/ply-test-timings/timings.tsv ]; then cp /tmp/ply-test-timings/timings.tsv "$out/"; fi
+          tests=$(grep -c . "$out/tests.tsv" || true)
+          [ "$tests" -gt 0 ] || { echo "no job reported what its tests cost" >&2; exit 1; }
+          {
+            echo "### The slowest tests"
+            echo
+            echo "| seconds | suite | test |"
+            echo "| ---: | --- | --- |"
+            head -30 "$out/tests.tsv" | awk -F'\t' '{ gsub(/\|/, "\\|", $3); printf "| %.1f | %s | %s |\n", $1 / 1000, $2, $3 }'
+            echo
+            awk -F'\t' -v n="$tests" '{ t += $1 } END { printf "%d tests, %.0f s in all; every row is in the `test-durations` artifact.\n", n, t / 1000 }' "$out/tests.tsv"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: test-durations
+          path: /tmp/test-durations
+          retention-days: 14
+          if-no-files-found: error
 
       # Whatever the table came to: a family keeps its entries unless this run saved one.
       - name: The entries this run's replaced
@@ -959,6 +1008,13 @@ jobs:
           path: /tmp/timings-${{ matrix.id }}.tsv
           retention-days: 1
           if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: durations-corpus-${{ matrix.id }}
+          path: /tmp/ply-test-durations.tsv
+          retention-days: 1
+          if-no-files-found: error
       - name: The passes this job published
         if: ${{ !cancelled() }}
         run: .github/ci-corpus.sh upstream-new "/tmp/upstream-corpus-${{ matrix.id }}.tar"
@@ -997,7 +1053,7 @@ jobs:
 
   # The one check that says a run is green. What a run parks in the cache for its own jobs -- the archive every
   # partition unpacks, the emitter's stage, the shard cut -- is keyed by the run id, so no later run
-  # can read it, and left behind it evicts the object cache that does outlive a run. A green run
+  # can read it, and left behind it evicts the caches that do outlive a run. A green run
   # gives them back here, after every job that reads them; a red one keeps them, because the next
   # thing that happens to it is a re-run, and a job re-run on its own cannot rebuild the archive.
   ci:
