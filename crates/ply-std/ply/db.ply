@@ -92,7 +92,7 @@ fn attempt<a | e>(body: () -> a / e) -> Result<a, Rollback> / {db.abort | e} =
   }
 
 // A transaction that always rolls back, whatever the body did.
-pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.begin, db.abort | e} = {
+pub fn sandbox<a | e>(body: () -> a / e) -> a / {abort.raise, db.begin, db.abort | e} = {
   assert(opened(db.begin(ReadCommitted, ReadWrite)));
   let value = body();
   db.abort();
@@ -4938,7 +4938,7 @@ fn run_checked(
   ps: List<Param>,
   rows: Bool,
   cfg: Server,
-) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link]} =
+) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link], abort.raise} =
   match pg::extended_query[link](session, s.sql, map(ps, |p: Param| param_text(p)), cfg.client) {
     Err(e) -> Err(e),
     Ok(reply) ->
@@ -4954,14 +4954,14 @@ fn control(
   session: pg::Session,
   sql: String,
   cfg: Server,
-) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link]} =
+) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link], abort.raise} =
   pg::simple_query[link](session, sql, cfg.client)
 
 fn linked(
   cfg: Server,
   nonce: String,
   c: Claim,
-) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match c {
     Idle(l) -> Ok(l),
     Fresh(n) -> match pg::connect[link](
@@ -4981,7 +4981,11 @@ fn linked(
 
 // An exchange outside any transaction that failed: a refusal leaves the server talking on the
 // connection, and anything else ends it.
-fn let_go(l: Link, e: pg::ClientError, cfg: Server) -> Left / {net.send[link], net.close[link]} =
+fn let_go(
+  l: Link,
+  e: pg::ClientError,
+  cfg: Server,
+) -> Left / {net.send[link], net.close[link], abort.raise} =
   match e {
     pg::Rejected(session, server) ->
       {
@@ -5008,7 +5012,7 @@ fn failed_within(
   e: pg::ClientError,
   cfg: Server,
   deeper: Int,
-) -> Left / {net.send[link], net.close[link]} =
+) -> Left / {net.send[link], net.close[link], abort.raise} =
   match e {
     pg::Rejected(after, server) ->
       {
@@ -5035,7 +5039,7 @@ fn statement_outside(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match run_checked(l.session, s, ps, rows, cfg) {
@@ -5057,7 +5061,7 @@ fn statement_within(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   match run_checked(session, s, ps, rows, cfg) {
     Ok(ran) ->
       { answer: ran.answer, n: scope.n, scope: Some(kept(scope, ran.session, 0)), freed: None },
@@ -5070,7 +5074,7 @@ fn opening(
   c: Claim,
   level: Isolation,
   access: Access,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match control(
@@ -5100,7 +5104,7 @@ fn nesting(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   match control(session, "savepoint " ++ savepoint_name(scope.depth + 1), cfg) {
     Ok(reply) ->
       { answer: Count(0), n: scope.n, scope: Some(kept(scope, reply.session, 1)), freed: None },
@@ -5117,7 +5121,7 @@ fn committing(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   if scope.depth > 1 {
     match control(session, "release savepoint " ++ savepoint_name(scope.depth), cfg) {
       Ok(reply) ->
@@ -5143,7 +5147,7 @@ fn aborting(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   if scope.depth > 1 {
     // A savepoint outlives a rollback to it, so it is released too.
     let name = savepoint_name(scope.depth);
@@ -5170,7 +5174,7 @@ pub fn serve<a | e>(
   size: Int,
   nonce: String,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> a / {net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
+) -> a / {abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
   with_cell[dbpool]({ idle: [], opened: 0, made: 0, open: [] }) { pool -> {
     let taken = |d: Decided| {
       cell_set(pool, d.pool);
@@ -5227,7 +5231,7 @@ pub fn serve<a | e>(
 
 // Every connection the pool still holds once its body has returned, told it is done and closed:
 // the idle ones, and one a body returned from inside its transaction, which the server rolls back.
-fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link]} = {
+fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link], abort.raise} = {
   fold(p.idle, (), |done: Unit, l: Link| pg::finish[link](l.session, cfg.client));
   fold(p.open, (), |done: Unit, scope: Scope|
     match scope.session { Some(session) -> pg::finish[link](session, cfg.client), None -> () })
@@ -5462,7 +5466,7 @@ pub fn with_server<a | e>(
   url: String,
   size: Int,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> Result<a, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
+) -> Result<a, String> / {abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
   match server_of(url) { Err(why) -> Err(why), Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)) }
 
 // --- Tests ------------------------------------------------------------------
@@ -6237,7 +6241,7 @@ fn over_script<a | e>(
   size: Int,
   refusals: List<Refusal>,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> Scripted<a> / {task.yield | e} =
+) -> Scripted<a> / {abort.raise, task.yield | e} =
   with_cell[wire]({ wires: [], refusals: refusals }) { fake -> {
     let value = handle {
       serve(server("db", 5432, "ply", "ply", None), size, "t", body)

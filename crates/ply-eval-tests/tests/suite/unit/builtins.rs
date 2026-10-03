@@ -706,6 +706,49 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
     }
 }
 
+/// Whether each builtin's scheme in the port's prelude carries `abort.raise` in its row.
+fn prelude_raises() -> std::collections::BTreeMap<String, bool> {
+    ply_codegen::c::producer::ensure_default();
+    let answer = ply_codegen::c::producer::call("front.builtin_rows", &[])
+        .expect("the port publishes its builtins");
+    let rows = ply_eval::decode::At::new("`front.builtin_rows`' answer", &answer);
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows.list().unwrap() {
+        let name = row.field("name").and_then(|n| n.utf8()).unwrap();
+        let raises = row
+            .field("scheme")
+            .and_then(|s| s.field("ty"))
+            .and_then(|t| t.ctor())
+            .and_then(|f| f.arg(0))
+            .and_then(|f| f.field("effects"))
+            .and_then(|r| r.field("atoms"))
+            .and_then(|a| a.list())
+            .unwrap()
+            .any(|a| a.field("effect").and_then(|e| e.utf8()).unwrap() == "abort");
+        out.insert(name.to_string(), raises);
+    }
+    out
+}
+
+/// A failure of a builtin whose row says it may raise is one a `handle` answers; any other ends
+/// the run. The runtime decides by `Builtin::raises`, so it has to say what the scheme says.
+#[test]
+fn a_builtin_raises_exactly_when_its_scheme_says_it_may() {
+    let prelude = prelude_raises();
+    for b in Builtin::all() {
+        if let Some(&typed) = prelude.get(b.name()) {
+            assert_eq!(
+                b.raises(),
+                typed,
+                "`{}` {} in its scheme but `Builtin::raises` says {}",
+                b.name(),
+                if typed { "raises" } else { "does not raise" },
+                b.raises()
+            );
+        }
+    }
+}
+
 /// A builtin with no scheme cannot be called; a scheme with no builtin checks and then fails.
 #[test]
 fn the_runtime_implements_exactly_the_builtins_the_prelude_types() {
