@@ -348,7 +348,6 @@ fn def_row(d: DefInfo, w: Written) -> DefRow =
     footprint: canonical_atoms(d.footprint),
     performed: canonical_atoms(d.performed),
     constraints: d.constraints,
-    internally_effectful: d.internally_effectful,
     row_aliases: d.row_aliases,
     params: map(w.params, |p: Param| { name: p.name.name, at: span_at(d.at.module, p.span) }),
     spec: map(d.spec, |s: SpecInfo|
@@ -1202,14 +1201,11 @@ fn taken(
   h: HashOutput,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
-  effectful: List<Bytes> = [],
 ) -> Known =
-  if len(defs) == 0 && len(tests) == 0 && len(effectful) == 0 { no_known() } else {
+  if len(defs) == 0 && len(tests) == 0 { no_known() } else {
     {
-      defs: known_defs(by_name_one(h.defs), by_name_one(h.decls), defs),
+      defs: known_defs(by_name_one(h.checks), by_name_one(h.decls), defs),
       tests: known_tests(test_hashes(index, h), by_name_one(h.decls), mods, tests),
-      effectful: fold(effectful, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
-        map_insert(acc, n, true)),
     }
   }
 
@@ -1249,7 +1245,7 @@ pub type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow> }
 
 // What an analysis publishes, as the rows the next one is handed, each under the hash it has now.
 pub fn rows_of(w: Whole) -> Rows = {
-  let hashed = by_name_one(w.hashes.defs);
+  let hashed = by_name_one(w.hashes.checks);
   let decls = by_name_one(w.hashes.decls);
   {
     defs: fold(w.checked.defs, [], |acc: List<KnownDefRow>, d: DefInfo|
@@ -1296,9 +1292,11 @@ pub type FiledDecl = { name: Bytes, hash: Bytes, interface: DeclInterface }
 pub type FiledMember = { name: Bytes, span: FiledSpan }
 
 // `kind` is `fn`, `type` or `effect`: a name declared in two namespaces has an entry in each.
+// `check` is what a `fn`'s interface is filed under; a declaration's is its hash.
 pub type FiledEntry = {
   name: Bytes,
   hash: Bytes,
+  check: Bytes,
   kind: Bytes,
   span: FiledSpan,
   members: List<FiledMember>,
@@ -1347,6 +1345,7 @@ type Filers = {
   effects: Map<Bytes, EffectInfo>,
   ctors: List<CtorInfo>,
   hashed: Map<Bytes, Bytes>,
+  checked: Map<Bytes, Bytes>,
   decls: Map<Bytes, Bytes>,
 }
 
@@ -1355,7 +1354,20 @@ fn fn_entries(f: Filers, name: Bytes) -> List<FiledEntry> =
     None -> [],
     Some(d) -> match map_get(f.hashed, name) {
       None -> [],
-      Some(h) -> [{ name: name, hash: h, kind: b"fn", span: filed_span(d.at.span), members: [] }],
+      Some(h) -> match map_get(f.checked, name) {
+        None -> [],
+        Some(k) ->
+          [
+            {
+              name: name,
+              hash: h,
+              check: k,
+              kind: b"fn",
+              span: filed_span(d.at.span),
+              members: [],
+            },
+          ],
+      },
     },
   }
 
@@ -1368,6 +1380,7 @@ fn decl_entries(f: Filers, name: Bytes) -> List<FiledEntry> =
           {
             name: name,
             hash: h,
+            check: h,
             kind: b"type",
             span: { start: t.at.start, end: t.at.end },
             members: map(ctors_of_type(f.ctors, name), |k: CtorInfo|
@@ -1381,6 +1394,7 @@ fn decl_entries(f: Filers, name: Bytes) -> List<FiledEntry> =
             {
               name: name,
               hash: h,
+              check: h,
               kind: b"effect",
               span: filed_span(e.at.span),
               members: map(e.ops, |o: OpInfo| { name: o.name, span: filed_span(o.at.span) }),
@@ -1470,6 +1484,7 @@ fn filed_bodies(h: HashOutput) -> List<FiledBody> = {
 // Everything the front-end cache files after an analysis, as plain data.
 pub fn filing(w: Whole) -> Filing = {
   let hashed = by_name_one(w.hashes.defs);
+  let checked = by_name_one(w.hashes.checks);
   let decls = by_name_one(w.hashes.decls);
   let types = type_rows(w.mods);
   let f: Filers = {
@@ -1478,6 +1493,7 @@ pub fn filing(w: Whole) -> Filing = {
     effects: map_of_entries(map(w.checked.effects, |e: EffectInfo| { key: e.name, value: e })),
     ctors: w.checked.ctors,
     hashed: hashed,
+    checked: checked,
     decls: decls,
   };
   let tests = tests_by_module(w.checked.tests, w.hashes.tests, decls);
@@ -1508,8 +1524,10 @@ pub fn filing(w: Whole) -> Filing = {
         tests: match map_get(tests, m.name) { Some(ts) -> ts, None -> [] },
       }
     }),
+    // A definition's interface holds while its check key does, which a body edit in a package it
+    // depends on leaves alone.
     defs: fold(w.checked.defs, [], |acc: List<FiledDef>, d: DefInfo|
-      match map_get(hashed, d.name) {
+      match map_get(checked, d.name) {
         None -> acc,
         Some(h) ->
           push(acc, {
@@ -1539,14 +1557,16 @@ pub fn filing(w: Whole) -> Filing = {
 }
 
 // What a load takes from compiled packages in place of their modules' bodies, which are blanks.
-pub type Interfaces = {
-  modules: List<Bytes>,
-  defs: List<KnownDefRow>,
-  fixed: List<Fixed>,
-  effectful: List<Bytes>,
-}
+// A stub stands in for the module of its name wherever a dependency or the shelf supplies one.
+pub type Interfaces = { stubs: List<Source>, defs: List<KnownDefRow>, fixed: List<Fixed> }
 
-pub fn no_interfaces() -> Interfaces = { modules: [], defs: [], fixed: [], effectful: [] }
+pub fn no_interfaces() -> Interfaces = { stubs: [], defs: [], fixed: [] }
+
+fn stubbed(ifaces: Interfaces) -> Map<Bytes, Bytes> =
+  fold(ifaces.stubs, map_new(), |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src))
+
+fn read_as(stubs: Map<Bytes, Bytes>, s: Source) -> Source =
+  match map_get(stubs, s.name) { Some(stub) -> { name: s.name, src: stub }, None -> s }
 
 pub fn analyse(parsed: List<Parsed>) -> Analysis = analyse_with(parsed, [], [])
 
@@ -1555,11 +1575,12 @@ pub fn analyse_with(
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
-  ifaces: Interfaces = { modules: [], defs: [], fixed: [], effectful: [] },
+  ifaces: Interfaces = { stubs: [], defs: [], fixed: [] },
 ) -> Analysis = {
   let clo = closure(pkgs, map(parsed, |p: Parsed| p.name));
+  let stubs = stubbed(ifaces);
   let all = fold(clo.modules, parsed, |acc: List<Parsed>, m: { pkg: Int, src: Source }|
-    push(acc, parse_at(len(acc), m.src)));
+    push(acc, parse_at(len(acc), read_as(stubs, m.src))));
   // The toolchain's own tree loads without its implicit self; this path has no shelf list to
   // check the coverage half of that against, and only the toolchain's listings use it.
   let toolchain = fold(parsed, true, |acc: Bool, p: Parsed| acc && is_std(p.name));
@@ -1655,7 +1676,7 @@ fn analyse_closure(
   tests: List<KnownTestRow>,
   root_count: Int,
   toolchain: Bool,
-  ifaces: Interfaces = { modules: [], defs: [], fixed: [], effectful: [] },
+  ifaces: Interfaces = { stubs: [], defs: [], fixed: [] },
   embeds: List<EmbedAt> = [],
 ) -> Analysis = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
@@ -1688,11 +1709,11 @@ fn analyse_closure(
           let built = build_index(x.mods, x.r);
           if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
             // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
-            let hashes: HashOutput = hash_index_pinned(built.index, ifaces.fixed);
+            let hashes: HashOutput = hash_index_pinned(built.index, ifaces.fixed, tables.mod_pkg);
             let checked: Front = check_front_with(
               x.r,
               x.mods,
-              taken(x.mods, built.index, hashes, defs, tests, ifaces.effectful),
+              taken(x.mods, built.index, hashes, defs, tests),
             );
             if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
               Analysed({
@@ -1701,12 +1722,22 @@ fn analyse_closure(
                 checked: checked,
                 index: built.index,
                 hashes: hashes,
-                warnings: map(unused(built.index, ifaces.fixed), outside_every_module),
+                // A dependency's unused definitions are its own package's to report.
+                warnings: map(
+                  filter(unused(built.index, ifaces.fixed), |d: Diag|
+                    fold(
+                      d.labels,
+                      false,
+                      |b: Bool, l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+                        b || (l.primary && l.module < root_count),
+                    )),
+                  outside_every_module,
+                ),
                 manifest: at(clo.packages, 0).manifest,
                 packages: tables.pkgs,
                 pins: pins_of(clo, embeds),
                 mod_pkg: tables.mod_pkg,
-                stubs: ifaces.modules,
+                stubs: map(ifaces.stubs, |s: Source| s.name),
                 embeds: embeds,
               })
             }
@@ -2195,16 +2226,18 @@ pub fn analyse_pulling_std_with(
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
-  ifaces: Interfaces = { modules: [], defs: [], fixed: [], effectful: [] },
+  ifaces: Interfaces = { stubs: [], defs: [], fixed: [] },
   embeds: List<Embedded> = [],
 ) -> Pulled = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
+  let stubs = stubbed(ifaces);
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
-    map_insert(acc, s.name, s.src));
+    map_insert(acc, s.name, read_as(stubs, s).src));
   let parsed = fold(
     clo.modules,
     parse_all(user),
-    |acc: List<Parsed>, m: { pkg: Int, src: Source }| push(acc, parse_at(len(acc), m.src)),
+    |acc: List<Parsed>, m: { pkg: Int, src: Source }|
+      push(acc, parse_at(len(acc), read_as(stubs, m.src))),
   );
   let mentions = append(
     map(user, |s: Source| names_embed(s.src)),
@@ -2363,7 +2396,6 @@ pub type DefRow = {
   footprint: List<Atom>,
   performed: List<Atom>,
   constraints: List<DefConstraint>,
-  internally_effectful: Bool,
   row_aliases: List<Bytes>,
   params: List<ParamRow>,
   spec: List<SpecRow>,
@@ -2675,7 +2707,6 @@ test "a definition's row holds its scheme, footprint, parameters and span" {
   assert_eq(scheme_text(say.scheme), b"(Bytes) -> Unit / {m.log.write}");
   assert_eq(atoms_text(say.footprint, b","), b"m.log.write");
   assert_eq(atoms_text(say.performed, b","), b"m.log.emit");
-  assert(say.internally_effectful);
   assert_eq(say.params, [{ name: b"b", at: { module: 0, start: 79, end: 87 } }]);
   assert_eq(say.at, { module: 0, start: 72, end: 126 })
 }
@@ -2811,14 +2842,12 @@ fn specified() -> List<Source> =
 test "a definition's row holds its row aliases and each clause with its kind, index and span" {
   let d = dump_of(analyse(parse_all(specified())));
   let say = def_named(d, b"m.say");
-  assert(say.internally_effectful);
   assert_eq(say.row_aliases, [b"Io"]);
   assert_eq(say.params, [{ name: b"b", at: { module: 0, start: 76, end: 84 } }]);
   assert_eq(say.at, { module: 0, start: 69, end: 114 });
   let inc = def_named(d, b"m.inc");
   assert_eq(scheme_text(inc.scheme), b"(Int) -> Int");
   assert_eq(inc.footprint, []);
-  assert(!inc.internally_effectful);
   assert_eq(inc.params, [{ name: b"x", at: { module: 0, start: 122, end: 128 } }]);
   assert_eq(inc.spec, [
     { kind: b"requires", index: 0, footprint: [], at: { module: 0, start: 137, end: 151 } },
@@ -2877,7 +2906,6 @@ fn written() -> List<Source> =
 test "a definition's row holds its visibility, its reuse marker and its parameters as written" {
   let keep = def_named(dump_of(analyse(parse_all(written()))), b"m.keep");
   assert(keep.public && keep.reuse);
-  assert(!keep.internally_effectful);
   assert_eq(keep.params, [{ name: b"xs", at: { module: 0, start: 104, end: 117 } }])
 }
 
@@ -3212,7 +3240,7 @@ fn effectful() -> List<Source> =
     },
     {
       name: b"app",
-      src: b"import base\nfn twice(b: Bytes) -> Unit = base::say(b)\ntest \"says\" { twice(b\"x\") }",
+      src: b"import base\nfn twice(b: Bytes) -> Unit / {base::log.write} = base::say(b)\ntest \"says\" { twice(b\"x\") }",
     },
   ]
 
@@ -3269,7 +3297,7 @@ fn renamed() -> List<Source> =
     },
     {
       name: b"app",
-      src: b"import base\nfn twice(b: Bytes) -> Unit = base::say(b)\ntest \"says\" { twice(b\"x\") }",
+      src: b"import base\nfn twice(b: Bytes) -> Unit / {base::trace.write} = base::say(b)\ntest \"says\" { twice(b\"x\") }",
     },
   ]
 
@@ -3324,7 +3352,15 @@ fn footprint_of(a: Analysis, name: Bytes) -> Bytes =
         if d.name == name { atoms_text(d.footprint, b",") } else { acc }),
   }
 
-// `say` writes its row and `quiet` leaves its inferred, so one row handed in can unify and the
+fn performed_of(a: Analysis, name: Bytes) -> Bytes =
+  match a {
+    Refused(_) -> b"<refused>",
+    Analysed(w) ->
+      fold(w.checked.defs, b"", |acc: Bytes, d: DefInfo|
+        if d.name == name { atoms_text(d.performed, b",") } else { acc }),
+  }
+
+// `say` writes its row and `quiet` writes none, so neither row handed in unifies and the
 // other cannot, in one program and one run.
 fn two_effects() -> List<Source> =
   [
@@ -3355,13 +3391,13 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> =
 test "a row that will not unify walks the body rather than reporting" {
   let sources = two_effects();
   let seeded = analyse_with(parse_all(sources), wrong_rows(sources), []);
-  // The guards passed both rows: `quiet` leaves its row inferred, so the one handed in is taken.
-  assert_eq(footprint_of(seeded, b"m.quiet"), b"m.other.write");
-  // `say` writes `{log.write}`, which the handed row contradicts. Walking it is the whole answer.
+  // Both handed rows contradict what the signatures write, `quiet` writing no `/` and so the empty
+  // row. Walking each is the whole answer.
+  assert_eq(footprint_of(seeded, b"m.quiet"), b"");
   assert_eq(footprint_of(seeded, b"m.say"), b"m.log.write");
   assert_eq(footprint_of(seeded, b"m.say"), footprint_of(analyse(parse_all(sources)), b"m.say"));
   // A row that was walked past is not counted as one that seeded.
-  assert_eq(seeded_of(seeded), [b"m.quiet"])
+  assert_eq(seeded_of(seeded), [])
 }
 
 fn filed_tests(f: Filing) -> List<KnownTestRow> =
@@ -3394,7 +3430,7 @@ test "an analysis seeded from its own filing answers exactly what a fresh one do
   assert_eq(test_footprint_of(seeded, b"app.says"), b"base.log.write")
 }
 
-// A row nothing performs, so a definition published from its row is told from a walked one.
+// A performed row no body here performs, so a definition published from its row is told from a walked one.
 fn probed(body: Bytes) -> List<Source> =
   [
     {
@@ -3413,12 +3449,14 @@ fn probed(body: Bytes) -> List<Source> =
 
 fn sentinel_rows(w: Whole) -> List<KnownDefRow> = {
   let probe = held(by_name_one(w.hashes.decls), b"base.probe");
+  let written = fold(w.checked.defs, map_new(), |acc: Map<Bytes, Bytes>, d: DefInfo|
+    map_insert(acc, d.name, atoms_text(d.footprint, b",")));
   map(w.hashes.defs, |x: { name: Bytes, hash: Bytes }|
     {
       name: x.name,
       hash: x.hash,
       witness: [{ name: b"base.probe", hash: probe }],
-      footprint: b"base.probe.read",
+      footprint: held(written, x.name),
       performed: b"base.probe.read",
     })
 }
@@ -3427,7 +3465,7 @@ test "an edit walks the definitions that depend on it and no others" {
   let rows = sentinel_rows(whole_of(probed(b"1")));
   let kept = analyse_with(parse_all(probed(b"1")), rows, []);
   assert_eq(len(seeded_of(kept)), len(rows));
-  assert_eq(footprint_of(kept, b"base.one"), b"base.probe.read");
+  assert_eq(performed_of(kept, b"base.one"), b"base.probe.read");
   // One body edited: `one` moves, and with it everything that reaches it, and nothing else.
   let after = analyse_with(parse_all(probed(b"11")), rows, []);
   let seeded = seeded_of(after);
@@ -3435,10 +3473,10 @@ test "an edit walks the definitions that depend on it and no others" {
   assert(contains_bytes(seeded, b"base.two"));
   assert(contains_bytes(seeded, b"app.five"));
   assert_eq(len(seeded), 3);
-  assert_eq(footprint_of(after, b"base.one"), b"");
-  assert_eq(footprint_of(after, b"base.three"), b"");
-  assert_eq(footprint_of(after, b"app.four"), b"");
-  assert_eq(footprint_of(after, b"app.five"), b"base.probe.read")
+  assert_eq(performed_of(after, b"base.one"), b"");
+  assert_eq(performed_of(after, b"base.three"), b"");
+  assert_eq(performed_of(after, b"app.four"), b"");
+  assert_eq(performed_of(after, b"app.five"), b"base.probe.read")
 }
 
 test "seeded from the last answer's filing, an edited program answers what a fresh check does" {
@@ -3711,9 +3749,12 @@ test "names shared, declarations alike and tests edited leave a seeded answer th
   let peel = b"pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
   let shared = [{ name: b"a", src: peel }, { name: b"b", src: peel }];
   let look = b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / {db.read[t]} = db.get[t](k)\n";
+  // The capability `pick` does not handle is the one its row writes.
   let pick = |m: Bytes|
     bytes_concat_all([
-      b"import x\nimport y\npub fn pick(k: Int) -> Int =\n  handle x::look(k) + y::look(k) with { ",
+      b"import x\nimport y\npub fn pick(k: Int) -> Int / {",
+      if m == b"x" { b"y" } else { b"x" },
+      b"::db.read[t]} =\n  handle x::look(k) + y::look(k) with { ",
       m,
       b"::db.get[t](j) -> j, }\n",
     ]);
@@ -3948,23 +3989,27 @@ test "a shuffle of module states leaves a seeded answer the fresh one at every s
   assert_eq(disagreements(map(states, |s: List<Source>| step(b"a shuffle step", s))), [])
 }
 
-fn chain_lib(base: Bytes) -> Bytes =
+fn chain_lib(label: Bytes) -> Bytes =
   bytes_concat_all([
-    b"pub effect log { write note[r](msg: String) -> Int }\npub fn base(n: Int) -> Int = ",
-    base,
-    b"\npub fn mid(n: Int) -> Int = base(n) + 1\n",
+    b"pub effect log { write note[r](msg: String) -> Int }\npub fn base(n: Int) -> Int / {log.note[",
+    label,
+    b"]} = log.note[",
+    label,
+    b"](\"n\") + n\npub fn mid(n: Int) -> Int / {log.note[",
+    label,
+    b"]} = base(n) + 1\n",
   ])
 
 test "a row that moves under a caller leaves a seeded answer the fresh one" {
   let before = [
-    { name: b"lib", src: chain_lib(b"log.note[a](\"n\") + n") },
+    { name: b"lib", src: chain_lib(b"a") },
     {
       name: b"top",
       src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[a]} = lib::mid(n) + 1\n",
     },
   ];
   let after = [
-    { name: b"lib", src: chain_lib(b"log.note[b](\"n\") + n") },
+    { name: b"lib", src: chain_lib(b"b") },
     {
       name: b"top",
       src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[b]} = lib::mid(n) + 2\n",
@@ -3974,17 +4019,18 @@ test "a row that moves under a caller leaves a seeded answer the fresh one" {
     disagreements([step(b"cold", before), step(b"the row moved under a checked caller", after)]),
     [],
   );
-  let open = [
-    { name: b"lib", src: chain_lib(b"log.note[a](\"n\") + n") },
-    { name: b"top", src: b"import lib\npub fn top(n: Int) -> Int = lib::mid(n) + 1\n" },
+  // A caller whose written row the moved one outgrows is refused, seeded as it is fresh.
+  let stale = [
+    { name: b"lib", src: chain_lib(b"a") },
+    {
+      name: b"top",
+      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.note[a]} = lib::mid(n) + 1\n",
+    },
   ];
-  let moved = with_module(open, b"lib", chain_lib(b"log.note[b](\"n\") + n"));
-  assert_eq(
-    disagreements([step(b"cold", open), step(b"the edited body performs elsewhere", moved)]),
-    [],
-  );
-  let seeded = analyse_with(parse_all(moved), filed_rows(filing(whole_of(open))).defs, []);
-  assert_eq(footprint_of(seeded, b"top.top"), b"lib.log.note[b]")
+  let moved = with_module(stale, b"lib", chain_lib(b"b"));
+  assert_eq(disagreements([step(b"cold", stale), step(b"the callee's row moved", moved)]), []);
+  let seeded = analyse_with(parse_all(moved), filed_rows(filing(whole_of(stale))).defs, []);
+  assert(match seeded { Refused(_) -> true, Analysed(_) -> false })
 }
 
 test "an unused selectively imported name deleted is refused seeded as it is fresh" {
