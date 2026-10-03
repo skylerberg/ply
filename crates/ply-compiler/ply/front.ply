@@ -1,9 +1,9 @@
 // The front end's answer for the driver: the errors, or else the warnings and every table it reads, as values.
 
-import spine (Span, Ident, QName, PDiag, dummy_span, num, pdiag, plabel)
+import spine (Span, Ident, QName, PDiag, dummy_span, num, pdiag, plabel, span_key)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
               SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder,
-              is_predicate)
+              is_predicate, Derived)
 import types (Mode, MRead, MWrite, MBad, AtomExpr)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -24,7 +24,8 @@ import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index,
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaboration,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, builtin_schemes,
-              builtin_docs, builtin_constraints, find_doc, published_pure, measure_ty)
+              builtin_docs, builtin_constraints, find_doc, published_pure, measure_ty, EmitFacts,
+              emit_facts_bin, written_counts)
 import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
 import pkg (Pkgs, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
@@ -351,7 +352,37 @@ fn module_row(
     if fold(acc, false, |b: Bool, x: Bytes| b || x == name) { acc } else { push(acc, name) }
   });
   let sets = effect_sets_of(r, effects, i, m);
-  { name: m.name, index: i, items: items, imports: imports, sets: sets }
+  { name: m.name, index: i, items: items, imports: imports, sets: sets, cuts: cuts_of(m) }
+}
+
+// --- Stubs ------------------------------------------------------------------
+// A module with its bodies blanked, every byte of a cut but a newline a space, so every offset
+// holds: what a compiled package ships, and what the emitter reads of a module it does not lower.
+
+// A braced cut keeps `{` and `}` at its ends: an empty block over exactly the body's own span.
+pub type Cut = { start: Int, end: Int, braced: Bool }
+
+// Walked even when seeded (rows cannot carry a row tail or a label), or `transparent`, which another
+// package's proofs unfold: its body stays in the stub.
+fn kept(d: FnDef) -> Bool =
+  len(d.generics.effects) > 0 || len(d.generics.labels) > 0
+    || (match d.transparent { Some(_) -> true, None -> false })
+
+// A generated definition carries its `derive` item's span, and the item regenerates it.
+pub fn cuts_of(m: Mod) -> List<Cut> = {
+  let generated = fold(m.derived, map_new(), |acc: Map<Bytes, Bool>, d: Derived|
+    map_insert(acc, span_key(d.span), true));
+  fold(m.module.items, [], |acc: List<Cut>, it: Item|
+    match it {
+      IFn(d) -> if map_contains(generated, span_key(d.span)) || kept(d) { acc } else {
+        let b = expr_span(d.body);
+        if b.end - b.start < 2 { acc }
+        else { push(acc, { start: b.start, end: b.end, braced: true }) }
+      },
+      ITest(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false }),
+      ILaw(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false }),
+      _ -> acc,
+    })
 }
 
 fn def_row(d: DefInfo, w: Written) -> DefRow / {abort.raise} =
@@ -1131,6 +1162,7 @@ fn tables(
     test_bodies: h.test_bodies,
     embeds: embeds,
     rows: rows_from(c, h),
+    walked: bin::encode(walked_of(mods, c), walked_bin()),
   }
 }
 
@@ -1172,6 +1204,8 @@ pub type KnownDefRow = {
   witness: List<Witness>,
   footprint: Bytes,
   performed: Bytes,
+  scaling: Bytes,
+  repeats: List<Int>,
 }
 pub type KnownTestRow = { key: Bytes, hash: Bytes, witness: List<Witness>, footprint: Bytes }
 
@@ -1188,13 +1222,15 @@ fn known_defs(
 ) -> Map<Bytes, KnownDef> / {abort.raise} =
   fold(rows, map_new(), |acc: Map<Bytes, KnownDef>, r: KnownDefRow|
     if !still_hashed(now, r.name, r.hash) || !witnessed(decls, r.witness) { acc } else {
-      match read_atoms(r.footprint) {
-        None -> acc,
-        Some(footprint) -> match read_atoms(r.performed) {
-          None -> acc,
-          Some(performed) ->
-            map_insert(acc, r.name, { footprint: footprint, performed: performed }),
-        },
+      match ((read_atoms(r.footprint), read_atoms(r.performed), read_atoms(r.scaling))) {
+        (Some(footprint), Some(performed), Some(scaling)) ->
+          map_insert(acc, r.name, {
+            footprint: footprint,
+            performed: performed,
+            scaling: scaling,
+            repeats: r.repeats,
+          }),
+        _ -> acc,
       }
     })
 
@@ -1237,11 +1273,13 @@ fn taken(
   h: HashOutput,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
+  root: Int,
 ) -> Known / {abort.raise} =
-  if len(defs) == 0 && len(tests) == 0 { no_known() } else {
+  if len(defs) == 0 && len(tests) == 0 { { ..no_known(), root: root } } else {
     {
       defs: known_defs(by_name_one(h.checks), by_name_one(h.decls), defs),
       tests: known_tests(test_hashes(index, h), by_name_one(h.decls), mods, tests),
+      root: root,
     }
   }
 
@@ -1267,6 +1305,8 @@ fn def_known_row(decls: Map<Bytes, Bytes>, d: DefInfo, hash: Bytes) -> KnownDefR
     witness: row_witness(decls, append(d.footprint, d.performed)),
     footprint: atoms_text(d.footprint, b","),
     performed: atoms_text(d.performed, b","),
+    scaling: atoms_text(d.scaling, b","),
+    repeats: d.repeats,
   }
 
 fn test_known_row(
@@ -1286,6 +1326,33 @@ pub type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow> }
 // What an analysis publishes, as the rows the next one is handed, each under the hash it has now.
 pub fn rows_of(w: Whole) -> Rows / {abort.raise} = rows_from(w.checked, w.hashes)
 
+// The modules the checker walked whole, by name, and what it read of every body it walked, its
+// module indices into `modules`.
+pub type Walked = { modules: List<Bytes>, whole: List<Bytes>, facts: EmitFacts }
+
+derive bin for Walked
+
+fn walked_of(mods: List<Mod>, c: Front) -> Walked = {
+  let named = |xs: List<Bytes>|
+    fold(xs, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+  let seeded = named(c.seeded);
+  let seeded_tests = named(c.seeded_tests);
+  let whole = |m: Mod|
+    fold(m.module.items, true, |acc: Bool, it: Item|
+      acc
+        && (match it {
+          IFn(d) -> !map_contains(seeded, qualify(m.name, d.name.name)),
+          ITest(d) -> !map_contains(seeded_tests, qualify(m.name, d.name)),
+          _ -> true,
+        }));
+  {
+    modules: map(mods, |m: Mod| m.name),
+    whole: fold(mods, [], |acc: List<Bytes>, m: Mod|
+      if whole(m) { push(acc, m.name) } else { acc }),
+    facts: c.facts,
+  }
+}
+
 fn rows_from(c: Front, h: HashOutput) -> Rows / {abort.raise} = {
   let hashed = by_name_one(h.checks);
   let decls = by_name_one(h.decls);
@@ -1298,6 +1365,21 @@ fn rows_from(c: Front, h: HashOutput) -> Rows / {abort.raise} = {
     tests: map(range(0, len(c.tests)), |i: Int|
       test_known_row(decls, at(c.tests, i), at(h.tests, i))),
   }
+}
+
+// The rows a compiled package carries: each definition's counts as its row writes them, which is
+// how any other package reads it, so the interface re-derives the same wherever it is cut.
+pub fn contracted_rows_of(w: Whole) -> List<KnownDefRow> / {abort.raise} = {
+  let infos = fold(w.checked.defs, map_new(), |acc: Map<Bytes, DefInfo>, d: DefInfo|
+    map_insert(acc, d.name, d));
+  map(rows_of(w).defs, |r: KnownDefRow|
+    match map_get(infos, r.name) {
+      Some(d) -> {
+        let c = written_counts(d.scheme.ty, d.footprint, d.bounded, d.tail_bounded);
+        { ..r, scaling: atoms_text(c.scaling, b","), repeats: c.repeats }
+      },
+      None -> r,
+    })
 }
 
 pub type FiledSpan = { start: Int, end: Int }
@@ -1755,7 +1837,7 @@ fn analyse_closure(
             let checked: Front = check_front_with(
               x.r,
               x.mods,
-              taken(x.mods, built.index, hashes, defs, tests),
+              taken(x.mods, built.index, hashes, defs, tests, root_count),
             );
             if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
               Analysed({
@@ -1817,6 +1899,7 @@ pub fn dump_of(a: Analysis) -> Dump / {abort.raise} =
         test_bodies: [],
         embeds: [],
         rows: { defs: [], tests: [] },
+        walked: b"",
       },
     Analysed(w) ->
       tables(
@@ -2095,12 +2178,14 @@ pub fn claims_in(
       })
   });
   let rows = rows_of(w);
+  // The analysis held every promise already, so this check of it holds none again.
   let known = taken(
     w.mods,
     w.index,
     w.hashes,
     filter(rows.defs, |r: KnownDefRow| !map_contains(walked, r.name)),
     rows.tests,
+    0,
   );
   match elaboration_with(w.r, w.mods, known) {
     None -> panic("a program the front end checked does not check"),
@@ -2434,6 +2519,7 @@ pub type ModuleRow = {
   items: List<Bytes>,
   imports: List<Bytes>,
   sets: List<SetView>,
+  cuts: List<Cut>,
 }
 
 pub type ParamRow = { name: Bytes, at: At }
@@ -2581,6 +2667,9 @@ pub type Dump = {
   // What every definition and test published, which spares the emitter a walk of the bodies it
   // does not lower.
   rows: Rows,
+  // A `Walked`, in the encoding both programs read with the type: the emitter lowers a body the
+  // checker walked without walking it again.
+  walked: Bytes,
 }
 
 pub fn has_error(ds: List<Diag>) -> Bool =
@@ -2735,6 +2824,8 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       items: [b"m.log", b"m.Shape", b"m.Dot", b"m.Line", b"m.say"],
       imports: [],
       sets: [],
+      // `say`'s body and the whole test, which a stub of the module blanks.
+      cuts: [{ start: 115, end: 126, braced: true }, { start: 127, end: 152, braced: false }],
     },
   ])
 }
@@ -3305,7 +3396,8 @@ fn effectful() -> List<Source> =
 
 // The rows an analysis publishes, which number their variables as their texts name them: a seeded
 // row and a walked one are then alike, however the checker numbered each.
-fn published(a: Analysis) -> Dump / {abort.raise} = dump_of(a)
+// What a load answers, all but what its check walked: a seeded load walks less by design.
+fn published(a: Analysis) -> Dump / {abort.raise} = { ..dump_of(a), walked: b"" }
 
 // The same definition, with a module of generics checked ahead of it in one of the two programs:
 // the checker numbers its variables apart in the two, and the rows do not.
@@ -3443,6 +3535,8 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> / {abort.raise} =
           witness: witness,
           footprint: b"m.other.write",
           performed: b"m.other.write",
+          scaling: b"",
+          repeats: [],
         })
     },
   }
@@ -3517,6 +3611,8 @@ fn sentinel_rows(w: Whole) -> List<KnownDefRow> / {abort.raise} = {
       witness: [{ name: b"base.probe", hash: probe }],
       footprint: held(written, x.name),
       performed: b"base.probe.read",
+      scaling: b"",
+      repeats: [],
     })
 }
 

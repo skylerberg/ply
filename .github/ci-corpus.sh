@@ -46,6 +46,9 @@ mark=$caches/ply-c-corpus.mark
 upstream=$caches/ply-upstream
 upstream_mark=$caches/ply-upstream.mark
 export PLY_CACHE_UPSTREAM=$upstream
+# `ms<TAB>package<TAB>key` per test this job ran, which the job uploads for the run's table of what
+# each test cost. A lane writes its own beside its timings, and `partition` gathers them here.
+durations=$caches/ply-test-durations.tsv
 
 # What a checks run is given after `ply test PATH`.
 grants=(--host --timeout 900000 --steps 0 --json
@@ -86,6 +89,11 @@ red() {
   ' "$1" 2>/dev/null || cat "$1"
 }
 
+# `ms<TAB>package<TAB>key` per test the report at $1, a run of the package at $2, ran.
+timed() {
+  jq -r --arg p "$2" '.results[]? | "\((.duration_ms // 0) | floor)\t\($p)\t\(.key // .name)"' "$1" 2>/dev/null
+}
+
 # Each test a run ran, with how it ended and its seconds, and each it took from the cache.
 listed() {
   jq -r '(.results[]? | "\(.status)\t\(((.duration_ms // 0) / 100 | floor) / 10)s\t\(.key // .name)"), (.selection.tests[]? | select(.reason == "cached") | "cached\t\t\(.key)")' "$1" 2>/dev/null
@@ -123,6 +131,7 @@ run_one() {
     tested "$path" ${filter:+--filter "$filter"} "$@" > "$out" || status=$?
   fi
   listed "$out"
+  timed "$out" "$path" >> "$durations"
   spent "$out" "$(($(date +%s%3N) - started))"
   cached_row "$out" "$id" "$timings"
   selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
@@ -161,6 +170,7 @@ run_modules() {
   tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} > "$out" || status=$?
   wall=$(($(date +%s%3N) - started))
   listed "$out"
+  timed "$out" "$path" >> "$durations"
   spent "$out" "$wall"
   cached_row "$out" "$path" "$timings"
   # The startup the cut charges a lane once per package.
@@ -188,9 +198,11 @@ run_modules() {
 # `ply test` of their own, every checks run in one, and every run of the CLI's suite in one.
 lane() {
   local timings=$1 id started failed=0
+  local durations=${1%.tsv}.durations
   local -a checks=() cli=()
   shift
   : > "$timings"
+  : > "$durations"
   for id in "$@"; do
     case "$id" in
       program | package-* | fixture-*)
@@ -239,6 +251,7 @@ case "${1:-}" in
     timings=${3:?a file for the durations}
     runs=$("$shards" corpus-for-partition "$shard" "${4:-}") || exit 2
     : > "$timings"
+    : > "$durations"
     work=$(mktemp -d)
     lanes=$(cut -d' ' -f1 <<< "$runs" | sort -un)
     pids=()
@@ -253,6 +266,7 @@ case "${1:-}" in
       echo "=== corpus lane $l"
       cat "$work/lane-$l.log"
       cat "$work/lane-$l.tsv" >> "$timings"
+      cat "$work/lane-$l.durations" >> "$durations"
     done
     rm -rf "$work"
     exit "$failed"
@@ -264,6 +278,7 @@ case "${1:-}" in
     taken=$("$shards" desks-for-runner "$k" "$4") || exit 2
     shift 4
     : > "$timings"
+    : > "$durations"
     if [ -z "$taken" ]; then
       echo "desk runner $k takes no run: there are more runners than desk tests"
       exit 0
@@ -276,6 +291,7 @@ case "${1:-}" in
     exit "$failed"
     ;;
   run)
+    : > "$durations"
     run_one "" "${2:?a corpus entry}" "${@:3}"
     ;;
   mark)

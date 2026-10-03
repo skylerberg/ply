@@ -67,7 +67,7 @@ pub use host::{
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{
-    CheckOutput, DefInfo, DefWritten, EffectInfo, EmitterRoot, Front, LawInfo, ModuleInfo,
+    CheckOutput, Cut, DefInfo, DefWritten, EffectInfo, EmitterRoot, Front, LawInfo, ModuleInfo,
     ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility, WrittenParam,
     is_ident, is_ident_continue, is_ident_start,
 };
