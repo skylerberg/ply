@@ -40,16 +40,12 @@ fn main() -> String / {env.var[e], env.vars[e], env.terminal[e], env.binary_vers
 
 /// The program the builder makes of `source`: its front end's answer and its unit.
 fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
-    let files = [("m.ply".to_string(), source.to_string())];
-    let bytes = ply_machine::builds::answered(&files).expect("the builder answers");
-    let answer = ply_machine::runnable::decode(&bytes).expect("the answer reads");
-    let front = answer.front.answer;
-    assert!(
-        !front.has_error(),
-        "the program checks: {:?}",
-        front.diagnostics
-    );
-    let unit = ply_codegen::Unit::handed(&front, answer.unit).expect("this host has a C toolchain");
+    let files = ply_machine::builds::module_files(&[("m", source)]);
+    let program = ply_machine::builds::checked_program(&files)
+        .unwrap_or_else(|d| panic!("the program checks: {d}"));
+    let front = program.front.answer;
+    let unit =
+        ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C toolchain");
     (front, unit)
 }
 
