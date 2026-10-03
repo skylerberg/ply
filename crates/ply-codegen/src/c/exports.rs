@@ -269,6 +269,39 @@ impl Exports {
         out
     }
 
+    /// The table [`Exports::embed`] wrote into a unit's C, read from the text without compiling it.
+    pub fn from_text(c: &str) -> Option<Exports> {
+        let head = format!("const char {SYMBOL}[] =\n");
+        let start = c.rfind(&head)? + head.len();
+        let mut encoded: Vec<u8> = Vec::new();
+        for line in c[start..].lines() {
+            if line == ";" {
+                return Exports::decode(&String::from_utf8(encoded).ok()?);
+            }
+            let piece = line.strip_prefix('"')?.strip_suffix('"')?.as_bytes();
+            let mut i = 0;
+            while i < piece.len() {
+                if piece[i] != b'\\' {
+                    encoded.push(piece[i]);
+                    i += 1;
+                    continue;
+                }
+                match *piece.get(i + 1)? {
+                    b'n' => encoded.push(b'\n'),
+                    b @ (b'"' | b'\\') => encoded.push(b),
+                    _ => {
+                        let octal = std::str::from_utf8(piece.get(i + 1..i + 4)?).ok()?;
+                        encoded.push(u8::from_str_radix(octal, 8).ok()?);
+                        i += 4;
+                        continue;
+                    }
+                }
+                i += 2;
+            }
+        }
+        None
+    }
+
     pub fn read(lib: &Library) -> Result<Exports> {
         let Some(p) = lib.symbol(SYMBOL) else {
             return Err(anyhow!(
