@@ -418,9 +418,15 @@ pub fn flush<[r]>(
   } else {
     sweep[r](s.dir);
     let written = locked_flush[r](s);
-    if fs.unlock[r](path(s.dir, lock_name())) { written }
-    else { warn(written, Unreadable, "the store's lock could not be released") }
+    // Every stamp change leaves the old entries behind, and past the read cap each lookup is a
+    // read of its own, so a data file mostly unreachable is rewritten while the lock is held.
+    let kept = if pending(written) == 0 && wasteful(stats(written)) { locked_compact[r](written) }
+    else { written };
+    if fs.unlock[r](path(s.dir, lock_name())) { kept }
+    else { warn(kept, Unreadable, "the store's lock could not be released") }
   }
+
+fn wasteful(st: Stats) -> Bool = (st.data_bytes - st.live_bytes) * 2 > st.data_bytes
 
 // Every temp file is stale under the lock: only its holder writes one.
 fn sweep<[r]>(dir: String) -> Unit / {fs.read[r], fs.write[r]} =
@@ -862,6 +868,20 @@ test "compaction keeps the live frames, reclaims the rest, and sweeps a stale te
     assert_eq(hit(get[mem](s4, 1, k("a"))), b"second");
     assert(missed(get[mem](s4, 1, k("b"))));
     all([s3.warnings, s4.warnings])
+  });
+  assert_eq(run.value, [])
+}
+
+test "a flush that leaves most of the data file unreachable compacts it" {
+  let run = on_twin(mem_empty(), || {
+    let big = bytes_concat_all(map(range(0, 64), |i: Int| b"0123456789abcdef"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), big));
+    let s2 = flush[mem](put(s1, 1, k("a"), b"small"));
+    assert_eq(stats(s2).data_bytes, stats(s2).live_bytes);
+    assert(s2.nonce != s1.nonce);
+    let s3 = open[mem]("cache", schema_a());
+    assert_eq(hit(get[mem](s3, 1, k("a"))), b"small");
+    all([s2.warnings, s3.warnings])
   });
   assert_eq(run.value, [])
 }
