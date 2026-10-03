@@ -1758,6 +1758,12 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Iterate, [seed, budget, f]) => {
             Some(unsafe { rt_iterate(std::ptr::from_mut(ctx), *seed, *budget, *f) })
         }
+        (Builtin::Bracket, [acquire, release, body]) => Some(rt_bracket(
+            std::ptr::from_mut(ctx),
+            *acquire,
+            *release,
+            *body,
+        )),
         (Builtin::MapUpdate, [m, k, f]) => Some(map_update(ctx, *m, *k, *f)),
         (Builtin::BytesPosition, [b, from, p]) => Some(bytes_position(ctx, *b, *from, *p)),
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
@@ -3211,6 +3217,48 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
             }
         }
     }
+}
+
+/// `bracket(acquire, release, body)`: what `body` answers for what `acquire` answered, with
+/// `release` run on it however `body` ends: by returning, by a clause that did not resume it
+/// unwinding through, or by a cancel. It runs where the bracket stands, with the handlers around it,
+/// and a failure in it replaces whatever was unwinding. A runtime failure ends the entry, so
+/// nothing more runs then.
+fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
+    let held = call_value(ctx, acquire, &[]);
+    heap::dec(acquire);
+    let c = unsafe { &mut *ctx };
+    if c.failed != 0 {
+        heap::dec(release);
+        heap::dec(body);
+        return 0;
+    }
+    heap::inc(held);
+    let answer = call_value(ctx, body, &[held]);
+    heap::dec(body);
+    let c = unsafe { &mut *ctx };
+    let ending = c.failed;
+    if ending != 0 && ending != FAILED_UNWIND && ending != FAILED_CANCELLED {
+        heap::dec(held);
+        heap::dec(release);
+        return 0;
+    }
+    let unwinding = c.unwind.take();
+    c.failed = 0;
+    let released = call_value(ctx, release, &[held]);
+    heap::dec(release);
+    let c = unsafe { &mut *ctx };
+    if c.failed != 0 {
+        if let Some((_, _, carried)) = unwinding {
+            heap::dec(carried);
+        }
+        heap::dec(answer);
+        return 0;
+    }
+    heap::dec(released);
+    c.failed = ending;
+    c.unwind = unwinding;
+    answer
 }
 
 /// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a bad step
