@@ -9,8 +9,7 @@
 //! needs the *files*, and the meaning of a manifest is the front end's (`crates/ply-compiler/ply/
 //! pkg.ply`), which this deliberately does not duplicate.
 //!
-//! The store stamps digest sources, not the binary, so both build profiles file the same: the Rust
-//! of what runs a front end or a verdict, and the Ply of `ply` that decides and files each.
+//! The runtime's stamp digests sources, not the binary, so both build profiles file the same.
 
 #[path = "src/code.rs"]
 mod code;
@@ -22,20 +21,9 @@ use std::path::{Path, PathBuf};
 /// nothing a store keeps reached it, which `ply-host-tests` holds it to.
 const RUNTIME: &[&str] = &["ply-eval", "ply-codegen", "ply-machine"];
 
-/// The modules of `ply` whose closures load and file a front-end entry, and decide and file a pass
-/// or a claim's evidence.
-const FRONT: &[&str] = &["program"];
-const VERDICT: &[&str] = &["tests", "prove"];
-
 fn main() {
     let repo = code::normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
     let root = repo.join("crates/ply-cli/ply");
-    let std_dir = repo.join("crates/ply-std/ply");
-    let compiler_dir = repo.join("crates/ply-compiler/ply");
-    let shelf = code::Shelf {
-        std: &std_dir,
-        compiler: &compiler_dir,
-    };
     let lock = std::fs::read_to_string(repo.join("Cargo.lock")).expect("Cargo.lock reads");
     println!(
         "cargo:rerun-if-changed={}",
@@ -48,14 +36,6 @@ fn main() {
             &crate_files(&repo, RUNTIME),
             &[code::lock_closure(&lock, RUNTIME).as_bytes()]
         )
-    );
-    println!(
-        "cargo:rustc-env=PLY_FRONT_CODE={}",
-        digest(&repo, &code::closure(&shelf, &root, FRONT), &[])
-    );
-    println!(
-        "cargo:rustc-env=PLY_VERDICT_CODE={}",
-        digest(&repo, &code::closure(&shelf, &root, VERDICT), &[])
     );
     let packages = closure(&root);
 

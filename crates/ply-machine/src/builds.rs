@@ -62,10 +62,10 @@ fn stage() -> PathBuf {
     stage::stage_dir(&format!("builder-{}", identity()))
 }
 
-/// Where the rows a build of `program` published are kept: under the builder that published them,
-/// since another compiler's rows seed nothing.
+/// Where the rows builds of `program` published are kept. The builder names each file for the front
+/// end that published it, since another's rows seed nothing.
 fn rows(program: &str) -> PathBuf {
-    stage::stage_dir(&format!("rows-{}", identity())).join(program)
+    stage::stage_dir(sweep::ROWS).join(program)
 }
 
 /// The builder: committed, staged, or built now by the committed one and staged.
@@ -90,16 +90,19 @@ pub fn builder() -> Result<Runnable, Diagnostic> {
     }
     let src = laid_out()?;
     let fresh = staged.with_extension(format!("run.{}", std::process::id()));
-    // Behind the shelf: its emitter is not the one a kept answer would be filed under, so it keeps
-    // none.
+    // Behind the shelf. A builder that files what it keeps under its own definitions keeps and
+    // seeds as it does anywhere; one from before that would file under this shelf's, so it keeps
+    // nothing.
+    let own = declared(&committed.front.answer).contains("definitions");
+    let seeds = rows("builder");
     build_with(
         committed,
         &src,
         ROOT,
         ENTRY,
         &fresh,
-        None,
-        false,
+        own.then_some(seeds.as_path()),
+        own,
         Asked::Ship,
     )?;
     landed(&fresh, &staged)
@@ -225,16 +228,21 @@ pub fn module_files(modules: &[(&str, &str)]) -> Vec<(String, String)> {
 /// The shipped operations `front` declares: a builder behind this binary's shelf was built before
 /// any added since, and is lent only those it names.
 fn lent_to(front: &ply_eval::Analysis) -> Vec<crate::hosts::LentOp> {
-    let declared: std::collections::HashSet<&str> = front
+    let declared = declared(front);
+    crate::shipped::lent_over(front)
+        .into_iter()
+        .filter(|(op, _)| declared.contains(op.op.as_str()))
+        .collect()
+}
+
+/// The shipped operations a program's own `shipped` effect names.
+fn declared(front: &ply_eval::Analysis) -> std::collections::HashSet<&str> {
+    front
         .check
         .effects
         .values()
         .filter(|effect| effect.name.as_str().rsplit('.').next() == Some("shipped"))
         .flat_map(|effect| effect.ops.keys().map(|op| op.as_str()))
-        .collect();
-    crate::shipped::lent()
-        .into_iter()
-        .filter(|(op, _)| declared.contains(op.op.as_str()))
         .collect()
 }
 
