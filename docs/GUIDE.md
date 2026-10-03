@@ -970,8 +970,8 @@ except a clause for `abort.raise` (§6.8).
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it
 go anyway: `release` runs on what `acquire` answered when `body` returns, when a
-clause unwinds through it this way, and when its task is cancelled (§9), where
-the bracket stands and with the handlers around it. A `release` that fails
+clause unwinds through it this way or a raise does (§6.8), and when its task is
+cancelled (§9), where the bracket stands and with the handlers around it. A `release` that fails
 replaces whatever was unwinding. A runtime failure ends the run, so nothing more
 runs then, `release` included. Nested brackets release innermost first.
 
