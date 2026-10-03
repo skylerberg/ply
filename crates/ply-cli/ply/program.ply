@@ -231,18 +231,41 @@ fn interfaced_for(interfaced: Bool, project: Project, shelved: List<Source>) -> 
 fn originals_of(project: Project, shelved: List<Source>) -> List<Original> =
   interfaces::originals(pkgs_of(project), map(project.sources, |s: Source| s.name), shelved)
 
+// A verifying load reads no compiled package, which may carry a published interface over whole.
 fn through_of(
   paths: List<paths::Resolved>,
   project: Project,
   shelved: List<Source>,
   stamps: Stamps,
   interfaced: Bool,
+  verify: Bool,
 ) -> List<CompiledPackage> / {fs.read[cwd], fs.read[abs]} =
-  if !interfaced_for(interfaced, project, shelved) { [] } else {
+  if verify || !interfaced_for(interfaced, project, shelved) { [] } else {
     let place = loads::place_of(paths, stamps);
     let found = originals_of(project, shelved);
-    if place.label == "cwd" { interfaces::read_through[cwd](place, found) }
-    else { interfaces::read_through[abs](place, found) }
+    let own = if place.label == "cwd" { interfaces::read_through[cwd](place, found) }
+    else { interfaces::read_through[abs](place, found) };
+    interfaces::beside(own, interfaces::published(slots_of(project), found))
+  }
+
+fn slots_of(project: Project) -> List<String> =
+  interfaces::slots(project.root_key, map(project.packages, |p: DepPackage| p.root))
+
+// Each published interface against what this load cut from source; one that differs refuses the load.
+fn verified(
+  project: Project,
+  shelved: List<Source>,
+  verify: Bool,
+  p: Program,
+) -> Program / {fs.read_file[abs]} =
+  match p.whole {
+    None -> p,
+    Some(w) -> if !verify { p } else {
+      match interfaces::underived(slots_of(project), originals_of(project, shelved), w) {
+        [] -> p,
+        refused -> { ..p, diags: appended(p.diags, refused), whole: None },
+      }
+    },
   }
 
 fn refreshing(
@@ -431,17 +454,25 @@ fn filed(
   }
 
 // `interfaced` is false for a run whose scope takes in the shipped modules: it reads their source.
+// `verify` seeds nothing and reads every dependency from source, then holds each published interface
+// to that reading.
 pub fn load_program(
   paths: List<paths::Resolved>,
   interfaced: Bool = true,
+  verify: Bool = false,
 ) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let project: Project = load_resolved(paths);
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let stamps = loads::shelf_stamps();
   let k: Recorded = recorded_for(paths, project, shelved, stamps);
-  let rows = rows_recorded(k);
-  let through = through_of(paths, project, shelved, stamps, interfaced);
-  let p: Program = assembled(project, shelved, paths, rows, through);
+  let rows = if verify { no_rows() } else { rows_recorded(k) };
+  let through = through_of(paths, project, shelved, stamps, interfaced, verify);
+  let p: Program = verified(
+    project,
+    shelved,
+    verify,
+    assembled(project, shelved, paths, rows, through),
+  );
   refreshing(paths, project, shelved, stamps, interfaced, through, p);
   filed(paths, shelved, stamps, k, p)
 }
@@ -479,9 +510,10 @@ pub fn no_front() -> Front =
 pub fn timed_load(
   paths: List<paths::Resolved>,
   interfaced: Bool = true,
+  verify: Bool = false,
 ) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let started = time.elapsed_ms();
-  timed_over(paths, load_resolved(paths), started, interfaced)
+  timed_over(paths, load_resolved(paths), started, interfaced, verify)
 }
 
 // [`timed_load`] over a walk already made, with the clock as it read before the walk.
@@ -490,14 +522,20 @@ pub fn timed_over(
   project: Project,
   started: Int,
   interfaced: Bool = true,
+  verify: Bool = false,
 ) -> Timed / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let stamps = loads::shelf_stamps();
   let k: Recorded = recorded_for(paths, project, shelved, stamps);
-  let rows = rows_recorded(k);
-  let through = through_of(paths, project, shelved, stamps, interfaced);
+  let rows = if verify { no_rows() } else { rows_recorded(k) };
+  let through = through_of(paths, project, shelved, stamps, interfaced, verify);
   let read_done = time.elapsed_ms();
-  let p: Program = assembled(project, shelved, paths, rows, through);
+  let p: Program = verified(
+    project,
+    shelved,
+    verify,
+    assembled(project, shelved, paths, rows, through),
+  );
   let front_done = time.elapsed_ms();
   refreshing(paths, project, shelved, stamps, interfaced, through, p);
   let kept: Program = filed(paths, shelved, stamps, k, p);
@@ -513,9 +551,10 @@ pub fn timed_over(
 // [`timed_load`], neither reading nor filing the front-end cache.
 pub fn timed_uncached(
   paths: List<paths::Resolved>,
+  verify: Bool = false,
 ) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us} = {
   let started = time.elapsed_ms();
-  timed_uncached_over(paths, load_resolved(paths), started)
+  timed_uncached_over(paths, load_resolved(paths), started, verify)
 }
 
 // [`timed_uncached`] over a walk already made, with the clock as it read before the walk.
@@ -523,10 +562,16 @@ pub fn timed_uncached_over(
   paths: List<paths::Resolved>,
   project: Project,
   started: Int,
-) -> Timed / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms} = {
+  verify: Bool = false,
+) -> Timed / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, fs.read_file[abs]} = {
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let read_done = time.elapsed_ms();
-  let p: Program = assembled(project, shelved, paths, no_rows());
+  let p: Program = verified(
+    project,
+    shelved,
+    verify,
+    assembled(project, shelved, paths, no_rows()),
+  );
   {
     program: p,
     read_ms: read_done - started,
