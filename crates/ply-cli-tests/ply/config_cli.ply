@@ -1,8 +1,8 @@
 // Configuration under `--host`: `--set` over `--config` files over the environment over a default,
 // each source refused by name when it is malformed, and a secret that reaches no stream.
 
-import harness (scratch, Ran, program, write, on_disk, spawned, said, stdout, stderr, json_of, at,
-                path, items, str, int, truth, shown, concatenated, Spawned)
+import harness (scratch, Ran, program, write, on_disk, on_disk_with, spawned, said, stdout, stderr,
+                json_of, at, path, items, str, int, truth, shown, concatenated, Reached, Shelf)
 import std.json (Json, Null)
 import std.process (Var)
 import std.string
@@ -51,9 +51,13 @@ fn secret_main() -> String =
 
 fn env(name: String, value: String) -> Var = { name: name, value: value }
 
+// `ply` in the test's directory with `vars` for its environment.
+fn with_env(argv: List<String>, vars: List<Var>) -> Ran / {Reached, Shelf, abort.raise} =
+  on_disk_with(argv, vars, None)
+
 // Its whole output is the resolved configuration, so precedence is read from it.
-fn hosts(extra: List<String>, vars: List<Var>) -> Ran / {Spawned, abort.raise} =
-  spawned(concatenated(["hosts", "--host", "--json"], extra), vars)
+fn hosts(extra: List<String>, vars: List<Var>) -> Ran / {Reached, Shelf, abort.raise} =
+  with_env(concatenated(["hosts", "--host", "--json"], extra), vars)
 
 fn key_of(report: Json, name: String) -> Json / {abort.raise} =
   match filter(items(path(report, ["configuration", "keys"])), |k: Json|
@@ -64,156 +68,177 @@ fn key_of(report: Json, name: String) -> Json / {abort.raise} =
 
 fn region_of(r: Ran) -> Json / {abort.raise} = key_of(json_of(r), "DESK_REGION")
 
-test/nondet "precedence is set, then file, then environment, then default" {
-  program(desk());
-  write("deploy.env", "DESK_REGION=file\n");
-  let schema = ["--config-schema", "m.spec", "--set", "DESK_PORT=8137"];
-  let everything = [env("DESK_REGION", "environment"), env("DESK_API_KEY", "k")];
+test "precedence is set, then file, then environment, then default" {
+  scratch(|| {
+    program(desk());
+    write("deploy.env", "DESK_REGION=file\n");
+    let schema = ["--config-schema", "m.spec", "--set", "DESK_PORT=8137"];
+    let everything = [env("DESK_REGION", "environment"), env("DESK_API_KEY", "k")];
 
-  let all = region_of(
-    hosts(concatenated(schema, ["--set", "DESK_REGION=set", "--config", "deploy.env"]), everything),
-  );
-  assert_eq(str(at(all, "value")), "set");
-  assert_eq(str(at(all, "source")), "--set");
+    let all = region_of(
+      hosts(
+        concatenated(schema, ["--set", "DESK_REGION=set", "--config", "deploy.env"]),
+        everything,
+      ),
+    );
+    assert_eq(str(at(all, "value")), "set");
+    assert_eq(str(at(all, "source")), "--set");
 
-  let no_set = region_of(hosts(concatenated(schema, ["--config", "deploy.env"]), everything));
-  assert_eq(str(at(no_set, "value")), "file");
-  assert_eq(str(at(no_set, "source")), "deploy.env");
+    let no_set = region_of(hosts(concatenated(schema, ["--config", "deploy.env"]), everything));
+    assert_eq(str(at(no_set, "value")), "file");
+    assert_eq(str(at(no_set, "source")), "deploy.env");
 
-  let no_files = region_of(hosts(schema, everything));
-  assert_eq(str(at(no_files, "value")), "environment");
-  assert_eq(str(at(no_files, "source")), "env");
+    let no_files = region_of(hosts(schema, everything));
+    assert_eq(str(at(no_files, "value")), "environment");
+    assert_eq(str(at(no_files, "source")), "env");
 
-  let nothing = region_of(hosts(schema, [env("DESK_API_KEY", "k")]));
-  assert_eq(str(at(nothing, "value")), "us");
-  assert_eq(str(at(nothing, "source")), "default")
+    let nothing = region_of(hosts(schema, [env("DESK_API_KEY", "k")]));
+    assert_eq(str(at(nothing, "value")), "us");
+    assert_eq(str(at(nothing, "source")), "default")
+  })
 }
 
 // The environment supplies a value and never causes a binding.
-test/nondet "without host no source is opened and the flags are refused" {
-  program(desk());
-  let report = json_of(spawned(["hosts", "--json"], [env("DESK_REGION", "environment")]));
-  assert(str(at(report, "binding")) == "hermetic", Some(shown(report)));
-  assert(
-    at(report, "configuration") == Null,
-    Some("a hermetic run has no configuration block: " ++ shown(report)),
-  );
-  let refused = on_disk(["hosts", "--set", "DESK_REGION=eu"]);
-  assert(refused.code != 0, Some(said(refused)));
-  assert(string_contains(stderr(refused), "--host"), Some(stderr(refused)))
+test "without host no source is opened and the flags are refused" {
+  scratch(|| {
+    program(desk());
+    let report = json_of(with_env(["hosts", "--json"], [env("DESK_REGION", "environment")]));
+    assert(str(at(report, "binding")) == "hermetic", Some(shown(report)));
+    assert(
+      at(report, "configuration") == Null,
+      Some("a hermetic run has no configuration block: " ++ shown(report)),
+    );
+    let refused = on_disk(["hosts", "--set", "DESK_REGION=eu"]);
+    assert(refused.code != 0, Some(said(refused)));
+    assert(string_contains(stderr(refused), "--host"), Some(stderr(refused)))
+  })
 }
 
-test/nondet "a malformed config file is E0440 naming the file and line" {
-  program(desk());
-  fold(
-    [
-      { contents: "DESK_REGION=eu\nno equals here\n", expected: "no `=`" },
-      { contents: "DESK_REGION=eu\n=8137\n", expected: "empty key" },
-      { contents: "DESK_REGION=eu\nDESK-PORT=8137\n", expected: "contains" },
-    ],
-    (),
-    |u: Unit, c: { contents: String, expected: String }| {
-      write("bad.env", c.contents);
-      let r = on_disk(["hosts", "--host", "--config", "bad.env"]);
-      let text = stderr(r);
-      assert(r.code != 0, Some(text));
-      assert(string_contains(text, "E0440"), Some(text));
-      assert(string_contains(text, "bad.env"), Some(text));
-      assert(string_contains(text, "line 2"), Some(text));
-      assert(string_contains(text, c.expected), Some(text))
-    },
-  )
+test "a malformed config file is E0440 naming the file and line" {
+  scratch(|| {
+    program(desk());
+    fold(
+      [
+        { contents: "DESK_REGION=eu\nno equals here\n", expected: "no `=`" },
+        { contents: "DESK_REGION=eu\n=8137\n", expected: "empty key" },
+        { contents: "DESK_REGION=eu\nDESK-PORT=8137\n", expected: "contains" },
+      ],
+      (),
+      |u: Unit, c: { contents: String, expected: String }| {
+        write("bad.env", c.contents);
+        let r = on_disk(["hosts", "--host", "--config", "bad.env"]);
+        let text = stderr(r);
+        assert(r.code != 0, Some(text));
+        assert(string_contains(text, "E0440"), Some(text));
+        assert(string_contains(text, "bad.env"), Some(text));
+        assert(string_contains(text, "line 2"), Some(text));
+        assert(string_contains(text, c.expected), Some(text))
+      },
+    )
+  })
 }
 
-test/nondet "an unreadable config file is E0440" {
-  program(desk());
-  let r = on_disk(["hosts", "--host", "--config", "absent.env"]);
-  assert(r.code != 0, Some(said(r)));
-  assert(string_contains(stderr(r), "E0440"), Some(stderr(r)));
-  assert(string_contains(stderr(r), "absent.env"), Some(stderr(r)))
+test "an unreadable config file is E0440" {
+  scratch(|| {
+    program(desk());
+    let r = on_disk(["hosts", "--host", "--config", "absent.env"]);
+    assert(r.code != 0, Some(said(r)));
+    assert(string_contains(stderr(r), "E0440"), Some(stderr(r)));
+    assert(string_contains(stderr(r), "absent.env"), Some(stderr(r)))
+  })
 }
 
-test/nondet "a required key nothing supplies is E0441 at startup" {
-  program(desk());
-  let r = spawned(["run", "--host", "--config-schema", "m.spec"], []);
-  let text = stderr(r);
-  assert(r.code != 0, Some(text));
-  assert(string_contains(text, "E0441"), Some(text));
-  assert(string_contains(text, "DESK_PORT"), Some(text));
-  assert(string_contains(text, "DESK_API_KEY"), Some(text));
-  assert(string_contains(text, "environment variable"), Some(text));
-  assert(
-    !string_contains(text, "binding host"),
-    Some("the refusal comes before anything is bound: " ++ text),
-  )
+test "a required key nothing supplies is E0441 at startup" {
+  scratch(|| {
+    program(desk());
+    let r = with_env(["run", "--host", "--config-schema", "m.spec"], []);
+    let text = stderr(r);
+    assert(r.code != 0, Some(text));
+    assert(string_contains(text, "E0441"), Some(text));
+    assert(string_contains(text, "DESK_PORT"), Some(text));
+    assert(string_contains(text, "DESK_API_KEY"), Some(text));
+    assert(string_contains(text, "environment variable"), Some(text));
+    assert(
+      !string_contains(text, "binding host"),
+      Some("the refusal comes before anything is bound: " ++ text),
+    )
+  })
 }
 
-test/nondet "a value that is not of its shape is E0442 naming the source" {
-  program(desk());
-  let r = spawned(["run", "--host", "--config-schema", "m.spec", "--set", "DESK_PORT=eight"], [
-    env("DESK_API_KEY", "k"),
-  ]);
-  let text = stderr(r);
-  assert(r.code != 0, Some(text));
-  assert(string_contains(text, "E0442"), Some(text));
-  assert(string_contains(text, "DESK_PORT"), Some(text));
-  assert(string_contains(text, "--set"), Some(text));
-  assert(string_contains(text, "eight"), Some("a plain value is shown: " ++ text))
+test "a value that is not of its shape is E0442 naming the source" {
+  scratch(|| {
+    program(desk());
+    let r = with_env(["run", "--host", "--config-schema", "m.spec", "--set", "DESK_PORT=eight"], [
+      env("DESK_API_KEY", "k"),
+    ]);
+    let text = stderr(r);
+    assert(r.code != 0, Some(text));
+    assert(string_contains(text, "E0442"), Some(text));
+    assert(string_contains(text, "DESK_PORT"), Some(text));
+    assert(string_contains(text, "--set"), Some(text));
+    assert(string_contains(text, "eight"), Some("a plain value is shown: " ++ text))
+  })
 }
 
 // The one refusal that must not quote what it refused.
-test/nondet "a malformed secret is E0442 and prints no value" {
-  program(desk());
-  let r = spawned(
-    [
-      "run",
-      "--host",
-      "--config-schema",
-      "m.spec",
-      "--set",
-      "DESK_PORT=8137",
-      "--set",
-      "DESK_API_KEY=",
-    ],
-    [],
-  );
-  let text = stderr(r);
-  assert(r.code != 0, Some(text));
-  assert(string_contains(text, "E0442"), Some(text));
-  assert(string_contains(text, "DESK_API_KEY"), Some(text));
-  assert(string_contains(text, "not printed"), Some(text))
+test "a malformed secret is E0442 and prints no value" {
+  scratch(|| {
+    program(desk());
+    let r = with_env(
+      [
+        "run",
+        "--host",
+        "--config-schema",
+        "m.spec",
+        "--set",
+        "DESK_PORT=8137",
+        "--set",
+        "DESK_API_KEY=",
+      ],
+      [],
+    );
+    let text = stderr(r);
+    assert(r.code != 0, Some(text));
+    assert(string_contains(text, "E0442"), Some(text));
+    assert(string_contains(text, "DESK_API_KEY"), Some(text));
+    assert(string_contains(text, "not printed"), Some(text))
+  })
 }
 
-test/nondet "an undeclared set warns and an undeclared environment key does not" {
-  program(desk());
-  let r = spawned(
-    [
-      "hosts",
-      "--host",
-      "--config-schema",
-      "m.spec",
-      "--set",
-      "DESK_PORT=8137",
-      "--set",
-      "DESK_PROT=8138",
-    ],
-    [env("DESK_API_KEY", "k"), env("AWS_PROFILE", "nothing to do with this program")],
-  );
-  assert(r.code == 0, Some(stderr(r)));
-  assert(string_contains(said(r), "W0607"), Some(said(r)));
-  assert(string_contains(said(r), "DESK_PROT"), Some(said(r)));
-  assert(
-    !string_contains(said(r), "AWS_PROFILE"),
-    Some("an environment name is not a typo somebody made in this run: " ++ said(r)),
-  )
+test "an undeclared set warns and an undeclared environment key does not" {
+  scratch(|| {
+    program(desk());
+    let r = with_env(
+      [
+        "hosts",
+        "--host",
+        "--config-schema",
+        "m.spec",
+        "--set",
+        "DESK_PORT=8137",
+        "--set",
+        "DESK_PROT=8138",
+      ],
+      [env("DESK_API_KEY", "k"), env("AWS_PROFILE", "nothing to do with this program")],
+    );
+    assert(r.code == 0, Some(stderr(r)));
+    assert(string_contains(said(r), "W0607"), Some(said(r)));
+    assert(string_contains(said(r), "DESK_PROT"), Some(said(r)));
+    assert(
+      !string_contains(said(r), "AWS_PROFILE"),
+      Some("an environment name is not a typo somebody made in this run: " ++ said(r)),
+    )
+  })
 }
 
-test/nondet "a config schema naming no definition lists what the program has" {
-  program(desk());
-  let r = on_disk(["hosts", "--host", "--config-schema", "m.confg"]);
-  assert(r.code != 0, Some(said(r)));
-  assert(string_contains(stderr(r), "E0440"), Some(stderr(r)));
-  assert(string_contains(stderr(r), "m.spec"), Some(stderr(r)))
+test "a config schema naming no definition lists what the program has" {
+  scratch(|| {
+    program(desk());
+    let r = on_disk(["hosts", "--host", "--config-schema", "m.confg"]);
+    assert(r.code != 0, Some(said(r)));
+    assert(string_contains(stderr(r), "E0440"), Some(stderr(r)));
+    assert(string_contains(stderr(r), "m.spec"), Some(stderr(r)))
+  })
 }
 
 test/nondet "get cannot read a key the schema declares secret" {
@@ -259,14 +284,16 @@ test/nondet "a secret arrives as a secret and appears in no stream" {
     ))
 }
 
-test/nondet "the JSON report carries a secret's key and source and not its value" {
-  program(secret_main());
-  let r = hosts(["--config-schema", "m.spec"], [env("DESK_API_KEY", "correct-horse")]);
-  let key = key_of(json_of(r), "DESK_API_KEY");
-  assert_eq(str(at(key, "value")), "****");
-  assert_eq(str(at(key, "source")), "env");
-  assert(truth(at(key, "secret")), Some(shown(key)));
-  assert(!string_contains(stdout(r), "correct-horse"), Some(stdout(r)))
+test "the JSON report carries a secret's key and source and not its value" {
+  scratch(|| {
+    program(secret_main());
+    let r = hosts(["--config-schema", "m.spec"], [env("DESK_API_KEY", "correct-horse")]);
+    let key = key_of(json_of(r), "DESK_API_KEY");
+    assert_eq(str(at(key, "value")), "****");
+    assert_eq(str(at(key, "source")), "env");
+    assert(truth(at(key, "secret")), Some(shown(key)));
+    assert(!string_contains(stdout(r), "correct-horse"), Some(stdout(r)))
+  })
 }
 
 test "a test supplying configuration is hermetic, det and cached" {
@@ -286,36 +313,40 @@ test "a test supplying configuration is hermetic, det and cached" {
 }
 
 // With `--host` and without it, because the effect is `nondet`.
-test/nondet "an unhandled config read in a det test is E0412" {
-  program(
-    \\import std.config
-    \\import std.config (config)
-    \\
-    \\pub fn region() -> Option<String> / {config.read[server]} =
-    \\  config.get[server]("DESK_REGION")
-    \\
-    \\test "reaches the environment" {
-    \\  assert_eq(region(), None)
-    \\}
-    \\
-  );
-  fold([["test"], ["test", "--host"]], (), |u: Unit, argv: List<String>| {
-    let r = on_disk(argv);
-    let shown_as = string::join(argv, " ");
-    assert(r.code != 0, Some(shown_as ++ ": " ++ stderr(r)));
-    assert(string_contains(stderr(r), "E0412"), Some(shown_as ++ ": " ++ stderr(r)))
+test "an unhandled config read in a det test is E0412" {
+  scratch(|| {
+    program(
+      \\import std.config
+      \\import std.config (config)
+      \\
+      \\pub fn region() -> Option<String> / {config.read[server]} =
+      \\  config.get[server]("DESK_REGION")
+      \\
+      \\test "reaches the environment" {
+      \\  assert_eq(region(), None)
+      \\}
+      \\
+    );
+    fold([["test"], ["test", "--host"]], (), |u: Unit, argv: List<String>| {
+      let r = on_disk(argv);
+      let shown_as = string::join(argv, " ");
+      assert(r.code != 0, Some(shown_as ++ ": " ++ stderr(r)));
+      assert(string_contains(stderr(r), "E0412"), Some(shown_as ++ ": " ++ stderr(r)))
+    })
   })
 }
 
-test/nondet "a hermetic run that reaches config is E0424 naming the handler" {
-  program(desk());
-  let r = spawned(["run"], [env("DESK_REGION", "environment")]);
-  let text = stderr(r);
-  assert(r.code != 0, Some(text));
-  assert(string_contains(text, "E0424"), Some(text));
-  assert(string_contains(text, "ply_host::config::get"), Some(text));
-  assert(
-    !string_contains(text, "environment"),
-    Some("a hermetic run must not have read the environment at all: " ++ text),
-  )
+test "a hermetic run that reaches config is E0424 naming the handler" {
+  scratch(|| {
+    program(desk());
+    let r = with_env(["run"], [env("DESK_REGION", "environment")]);
+    let text = stderr(r);
+    assert(r.code != 0, Some(text));
+    assert(string_contains(text, "E0424"), Some(text));
+    assert(string_contains(text, "ply_host::config::get"), Some(text));
+    assert(
+      !string_contains(text, "environment"),
+      Some("a hermetic run must not have read the environment at all: " ++ text),
+    )
+  })
 }
