@@ -1019,7 +1019,7 @@ use std::sync::Arc;
 fn binding() -> HostBinding {
     let source = "nondet effect db { read get[r](k: Int) -> Int }\n\
                   fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)";
-    let check = crate::fixture::port_check(&[("", source)]);
+    let check = crate::fixture::port_check(&[("m", source)]);
     let mut registry = HostRegistry::new();
     registry.register(
         HostOp {

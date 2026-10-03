@@ -83,10 +83,10 @@ impl HostHandler for Site {
             // beside the runnable.
             ("shipped_digest", []) => Value::str(crate::shipped::identity()),
             // The digest the committed builder is gated on: `ply bootstrap` writes it beside it.
-            ("builder_digest", []) => Value::str(crate::builder::identity()),
+            ("builder_digest", []) => Value::str(ply_machine::builds::identity()),
             // Under the stage root, where `sweep` keeps them to the cache's budget.
             ("fronts", []) => Value::str(
-                ply_codegen::c::bundle::stage_dir(ply_codegen::c::sweep::RUNS)
+                ply_codegen::c::stage::stage_dir(ply_codegen::c::sweep::RUNS)
                     .display()
                     .to_string(),
             ),

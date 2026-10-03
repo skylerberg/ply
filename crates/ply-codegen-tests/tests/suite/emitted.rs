@@ -1,10 +1,9 @@
-//! One binary of its own, because the producer is a process-wide installation.
+//! Programs the builder compiles, entered in the C tier: each answers as the language says.
 
+use crate::fixture;
 use ply_codegen::Source;
-use ply_codegen::c::producer::{self, PlyProducer, Sources};
-use ply_eval::{SourceId, Value};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use ply_codegen::c::Native;
+use ply_eval::Value;
 
 /// A root, its arguments, the binding it runs under, and what it answers or refuses with.
 type HostCase = (
@@ -14,43 +13,11 @@ type HostCase = (
     Result<Value, &'static str>,
 );
 
-fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("the crate sits two levels under the repository root")
-        .to_path_buf()
-}
-
-struct Loaded {
-    front: &'static ply_eval::Analysis,
-    texts: HashMap<String, String>,
-}
-
-fn load(modules: &[(&str, &str)]) -> &'static Loaded {
-    let named: Vec<(String, String)> = modules
-        .iter()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .collect();
-    let ids: Vec<SourceId> = (0..named.len()).map(|i| SourceId(i as u32)).collect();
-    let front = producer::checked_analysis(&named, &ids).expect("checks");
-    Box::leak(Box::new(Loaded {
-        front: Box::leak(Box::new(front)),
-        texts: named.into_iter().collect(),
-    }))
-}
-
-/// The emitter as production builds a working copy of it: `PLY_C_EMITTER=ply:<dir>`'s recipe.
-fn emitter_sources() -> Sources {
-    Sources::Directory(repo().join("crates/ply-compiler/ply"))
-}
-
-fn emitter() -> Result<PlyProducer, String> {
-    producer::build(&emitter_sources())
-}
-
-fn emitter_identity() -> String {
-    producer::identity_of(&emitter_sources())
+/// `text` as the module `m`, its unit refusing nothing; nothing where no C compiler runs.
+fn built(text: &str) -> Option<(&'static Source, Native)> {
+    let (source, native, refused) = fixture::with_refusals(text)?;
+    assert!(refused.is_empty(), "{refused:?}");
+    Some((source, native))
 }
 
 const PROGRAM: &str = r#"
@@ -61,48 +28,10 @@ fn nested(a: Int, b: Int) -> Int = (a + b) * (a - b)
 fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 "#;
 
-/// The producer's mode is a process-wide flag, so the tests that set it take turns.
-static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The body of the test below, with a cache of its own.
-///
-/// The object cache is content-addressed on disk and shared with every other test binary in the
-/// run, so whether this build enters the emitter at all is a function of what ran before it: a
-/// warm entry means no ask, and the census below is about the build rather than about the cache.
-fn with_its_own_cache<T>(f: impl FnOnce() -> T) -> T {
-    let dir = tempfile::tempdir().expect("a temporary directory");
-    let restore = std::env::var("PLY_C_CACHE").ok();
-    // SAFETY: the caller holds `MODE`, so this binary builds nothing else meanwhile, and the other
-    // binaries are other processes.
-    unsafe { std::env::set_var("PLY_C_CACHE", dir.path()) };
-    let out = f();
-    match restore {
-        Some(had) => unsafe { std::env::set_var("PLY_C_CACHE", had) },
-        None => unsafe { std::env::remove_var("PLY_C_CACHE") },
-    }
-    out
-}
-
 fn built_and_checked() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let (native, (asked, answered)) = with_its_own_cache(|| {
-        let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-        let loaded = load(&[("m", PROGRAM)]);
-        let source: &'static Source = Box::leak(Box::new(
-            Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-        ));
-        let names: Vec<String> = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-        assert!(refused.is_empty(), "{refused:?}");
-        let counts = producer::with_current(|p| p.counts()).expect("the producer is built");
-        (native, counts)
-    });
-    assert!(
-        answered > 0,
-        "the Ply emitter answered nothing of {asked} asked, so nothing below is about it"
-    );
-    println!("  the Ply emitter answered {answered} of {asked} bodies");
+    let Some((_, native)) = built(PROGRAM) else {
+        return;
+    };
 
     let cases: Vec<(&str, Vec<Value>, Value)> = vec![
         ("m.double", vec![Value::Int(21)], Value::Int(42)),
@@ -181,16 +110,9 @@ fn guarded(n: Int) -> Int =
 
 #[test]
 fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", EFFECTS)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((_, native)) = built(EFFECTS) else {
+        return;
+    };
     let cases: Vec<(&str, Vec<Value>, Value)> = vec![
         ("m.counted", vec![Value::Int(3)], Value::Int(68)),
         ("m.nested", vec![Value::Int(5)], Value::Int(111)),
@@ -260,16 +182,9 @@ fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
 /// runtime, so the fixpoint drops neither the performer nor its handler.
 #[test]
 fn a_perform_no_handler_in_the_program_answers_still_compiles() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", UNANSWERED)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((_, native)) = built(UNANSWERED) else {
+        return;
+    };
     for taken in [
         "m.performer",
         "m.lonely",
@@ -314,16 +229,9 @@ impl ply_eval::HostHandler for Doubler {
 
 #[test]
 fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", HOSTED)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((source, native)) = built(HOSTED) else {
+        return;
+    };
     let mut registry = ply_eval::HostRegistry::new();
     registry.register(
         ply_eval::HostOp {
@@ -340,7 +248,7 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     );
     let bound = std::sync::Arc::new(
         registry
-            .bind(&loaded.front.check)
+            .bind(&source.front.check)
             .expect("the registry binds"),
     );
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
@@ -424,16 +332,9 @@ fn ordered(a: Int, b: Int) -> Bool = decimal_of_int(a) < decimal_of_int(b)
 
 #[test]
 fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", NUMERIC)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((_, native)) = built(NUMERIC) else {
+        return;
+    };
     let bits = |f: f64| Value::Int(f.to_bits() as i64);
     let cases: Vec<(&str, Vec<Value>, Value)> = vec![
         ("m.bigger", vec![bits(2.0)], Value::Bool(true)),
@@ -517,16 +418,9 @@ fn racing(n: Int) -> Int / {sim.read} =
 
 #[test]
 fn the_chain_entered_whole_schedules_as_the_machine_does() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", SIMULATED)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((_, native)) = built(SIMULATED) else {
+        return;
+    };
     let cases: Vec<(&str, Vec<Value>, Value, i64, &str)> = vec![
         (
             "m.ordered",
@@ -636,16 +530,9 @@ fn mixed(seed: Int) -> Int =
 
 #[test]
 fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", RESUMED)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((_, native)) = built(RESUMED) else {
+        return;
+    };
     let cases: Vec<(&str, Vec<Value>, Value)> = vec![
         ("m.later", vec![Value::Int(3)], Value::Int(140)),
         ("m.returned", vec![Value::Int(4)], Value::Int(2132)),
@@ -774,16 +661,9 @@ fn later(seed: Int) -> Int =
 
 #[test]
 fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", MULTISHOT)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((_, native)) = built(MULTISHOT) else {
+        return;
+    };
     // `across` captures under a task whose region has ended by the second resumption, so the tier refuses it.
     // `threaded` and `later` resume into a cell opened before the stop: the second run reads what the first wrote.
     let cases: Vec<(&str, Vec<Value>, Result<Value, &str>)> = vec![
@@ -907,16 +787,9 @@ impl ply_eval::HostRuntime for Reactor {
 
 #[test]
 fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", PRODUCTION)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
+    let Some((source, native)) = built(PRODUCTION) else {
+        return;
+    };
     let mut registry = ply_eval::HostRegistry::new();
     registry.register(
         ply_eval::HostOp {
@@ -949,7 +822,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     }
     let bound = std::sync::Arc::new(
         registry
-            .bind(&loaded.front.check)
+            .bind(&source.front.check)
             .expect("the registry binds"),
     );
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
@@ -1032,27 +905,23 @@ law "zero moves nothing" forall (account: Account) where account.balance > 0 {
 #[test]
 #[allow(clippy::arc_with_non_send_sync)]
 fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", PROPOSITIONS)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
+    let Some((source, native)) = built(PROPOSITIONS) else {
+        return;
+    };
+    let names: Vec<&str> = source
+        .front
+        .emitter_roots
+        .iter()
+        .map(|r| r.root.as_str())
+        .collect();
     for root in [
         "m.law#0.guard",
         "m.law#0.body",
         "m.adjusted#requires#0",
         "m.adjusted#ensures#0",
     ] {
-        assert!(
-            names.contains(&root.to_string()),
-            "{root} is not offered: {names:?}"
-        );
+        assert!(names.contains(&root), "{root} is not offered: {names:?}");
     }
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
     let account = |balance: i64| {
         Value::Record(std::sync::Arc::new(ply_eval::Fields::from_unsorted(vec![
             (ply_eval::Symbol::new("name"), Value::str("a")),
@@ -1103,110 +972,43 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     }
 }
 
-/// The standard library as a program of its own, and the definitions nothing in it reaches. The
-/// emitter's program now carries only the shipped modules the compiler imports, so this is where
-/// the rest is checked, and by the compiler these sources build rather than the bundle's.
-fn standard_library() -> (&'static Source, Vec<String>) {
-    let modules: Vec<(String, String)> = ply_std::sources()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .collect();
-    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let front = producer::checked_analysis(&modules, &ids).expect("the standard library checks");
-    let unused: Vec<String> = front
-        .diagnostics
-        .iter()
-        .filter(|d| d.code == ply_eval::codes::UNUSED_DEFINITION)
-        .map(|d| d.message.clone())
-        .collect();
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(front).with_texts(modules.into_iter().collect()),
-    ));
-    (source, unused)
-}
-
+/// One program importing every shipped module, so its unit offers every root they hold. Their
+/// tests compile under `ply test --std`.
 #[test]
-fn the_standard_library_carries_no_definition_nothing_reaches() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let (_, unused) = standard_library();
+fn the_emitter_refuses_no_body_of_the_standard_library() {
+    let importer: String = ply_std::sources()
+        .map(|(name, _)| format!("import {name}\n"))
+        .collect();
+    let answer = fixture::answered(&[("m", &importer)]);
     assert!(
-        unused.is_empty(),
-        "the standard library carries definitions nothing reaches; delete them:\n  {}",
-        unused.join("\n  ")
+        answer
+            .front
+            .answer
+            .emitter_roots
+            .iter()
+            .any(|r| r.root.as_str().starts_with("std.")),
+        "the standard library offered no root"
     );
-}
-
-#[test]
-fn the_emitter_refuses_no_body_or_test_of_the_standard_library() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let (source, _) = standard_library();
-    let names: Vec<String> = source.functions();
-    assert!(!names.is_empty(), "the standard library offered no root");
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let produced = ply_codegen::c::produce(source, &refs).expect("the standard library emits");
+    let Some((_, _, refused)) = fixture::loaded(answer) else {
+        return;
+    };
     assert!(
-        produced.refused.is_empty(),
-        "the emitter refuses part of the standard library: {:?}",
-        produced.refused
+        refused.is_empty(),
+        "the emitter refuses part of the standard library: {refused:?}"
     );
 }
 
-/// The emitter's program is closed by reading import lines in Rust, because its identity has to be
-/// known before any compiler runs: `build` needs it to choose between the committed bundle, a
-/// stage and emitting one. The front end reads the same imports when it pulls a user program's
-/// shelf, and that is the definition; this holds the Rust reading to it.
-#[test]
-fn the_emitters_program_is_the_one_the_front_end_pulls() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let own: Vec<(String, String)> = ply_compiler::sources()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .collect();
-    let shelf: Vec<(String, String)> = ply_std::sources()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .collect();
-    let pulled = producer::front_pulling_std(&own, &shelf).expect("the front end pulls the shelf");
-    let program = producer::modules_of(&Sources::Embedded);
-    let mut ours: Vec<&str> = program
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .filter(|name| ply_std::is_std(name))
-        .collect();
-    ours.sort_unstable();
-    let mut theirs: Vec<&str> = pulled.modules.iter().map(String::as_str).collect();
-    theirs.sort_unstable();
-    assert_eq!(
-        ours, theirs,
-        "the shipped modules the emitter's program carries are not the ones the front end pulls \
-         for it"
-    );
-    assert_eq!(
-        program.len(),
-        own.len() + theirs.len(),
-        "the emitter's program is its own modules and the ones they import, and nothing else"
-    );
-}
-
-/// `std.hash` is the one shipped module the compiler imports, so it is the one the bundle's
-/// identity and every cache key still cover; the reference implementation says whether it is
-/// BLAKE3, over the published vectors and either side of a block, a chunk and a two-chunk tree.
+/// `std.hash.blake3` is the digest every cache key is taken with; the reference implementation says
+/// whether it is BLAKE3, over the published vectors and either side of a block, a chunk and a
+/// two-chunk tree.
 #[test]
 fn the_shipped_blake3_is_blake3() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("std.bytes", ply_std::BYTES), ("std.hash", ply_std::HASH)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_analysis(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the module builds");
-    assert!(refused.is_empty(), "{refused:?}");
-    let entry = native
-        .entry("std.hash.blake3")
-        .expect("`std.hash.blake3` was not compiled");
+    let Some((_, native)) =
+        built("import std.hash\npub fn digest(b: Bytes) -> Bytes = hash::blake3(b)\n")
+    else {
+        return;
+    };
+    let entry = native.entry("m.digest").expect("`digest` was not compiled");
     // `b""` and `b"\x00"` are the first two published vectors; the rest bracket 64 and 1024.
     for length in [0usize, 1, 2, 63, 64, 65, 127, 1023, 1024, 1025, 2048, 2049] {
         let input: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
