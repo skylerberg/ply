@@ -44,7 +44,6 @@ jobs:
     outputs:
       partitions: ${{ steps.tables.outputs.partitions }}
       nextest: ${{ steps.tables.outputs.nextest }}
-      solo: ${{ steps.tables.outputs.solo }}
       corpus: ${{ steps.tables.outputs.corpus }}
       shards: ${{ steps.cut.outputs.shards }}
     steps:
@@ -104,7 +103,6 @@ jobs:
         run: |
           echo "partitions=$(.github/ci-shards.sh partitions)" >> "$GITHUB_OUTPUT"
           echo "nextest=$(.github/ci-shards.sh nextest-shards)" >> "$GITHUB_OUTPUT"
-          echo "solo=$(.github/ci-shards.sh solo-matrix)" >> "$GITHUB_OUTPUT"
           echo "corpus=$(.github/ci-shards.sh corpus-matrix)" >> "$GITHUB_OUTPUT"
 
   clippy:
@@ -494,15 +492,23 @@ jobs:
       # The C the lanes compiled and read last run (`ci-corpus.sh keep`), this partition's first:
       # without it a lane's first `ply test` emits its package's whole unit before its first test.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: lanes-c
         with:
-          path: /tmp/ply-c-corpus
+          path: /tmp/ply-c-lanes
           key: ply-c-lanes-${{ matrix.shard }}-${{ github.run_id }}
           restore-keys: |
             ply-c-lanes-${{ matrix.shard }}-
             ply-c-lanes-
-            ply-c-corpus-
+      # A partition no run has kept C for starts from what main's corpus jobs kept.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.lanes-c.outputs.cache-matched-key == ''
+        with:
+          path: /tmp/ply-c-corpus
+          key: ply-c-corpus-
+          restore-keys: ply-c-corpus-
       - name: The lanes' compiled C, merged under the stage
         run: |
+          .github/ci-corpus.sh restore /tmp/ply-c-lanes
           .github/ci-corpus.sh restore /tmp/ply-c-corpus
           .github/ci-corpus.sh mark
       # Passes earlier runs published, each filed under the runtime stamp that earned it.
@@ -657,39 +663,6 @@ jobs:
           fi
           .github/ci-shards.sh supersede "${{ github.run_id }}" "${{ github.ref }}"
 
-  solo:
-    name: test ${{ matrix.id }}
-    needs: [plan, build, build-ply]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.solo) }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/suite
-
-      - name: cargo nextest run
-        env:
-          ID: ${{ matrix.id }}
-        run: |
-          set -euo pipefail
-          filter=$(.github/ci-shards.sh solo-filter "$ID")
-          cargo-nextest nextest run \
-            --binaries-metadata target/nextest/binaries-metadata.json \
-            --cargo-metadata target/nextest/cargo-metadata.json \
-            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            -E "$filter" 2>&1 | tee /tmp/solo.log
-          ran=$(awk '
-            { gsub(/\033\[[0-9;]*m/, "") }
-            /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
-            END { print n + 0 }
-          ' /tmp/solo.log)
-          [ "$ran" -eq 1 ] || { echo "solo test '$ID' selected $ran tests rather than one: the table names a test the binary does not have" >&2; exit 1; }
-
-
   # On main only: the bundle the sources are a fixpoint of, the `ply fmt` program they build, and
   # the goldens they produce are committed back, so no pull request carries any of them and two of
   # them never conflict on them.
@@ -739,8 +712,11 @@ jobs:
           git push origin HEAD:main || echo "main moved; the next run refreshes"
 
   # Tests that must be seen to run: the tree checks, by name.
+  # The gate tests, then the host packages, whose tests bind sockets and processes, then each solo
+  # test, which takes every test thread: one runner after another rather than a runner each, beside
+  # the lanes that wait for runners.
   gates:
-    name: test gates
+    name: test gates, the host packages and the solo tests
     needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -790,22 +766,8 @@ jobs:
           for lock in $locks; do target/debug/ply resolve "$(dirname "$lock")" >/dev/null; done
           git diff --exit-code -- $locks || { echo "a ply.lock does not pin these sources: run 'ply resolve' on it" >&2; exit 1; }
 
-  test-hosts:
-    name: test the host packages
-    needs: [build, build-ply]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-
-    # The packages the shards leave out, because their tests bind a host — sockets and processes —
-    # run here, so the suite still covers them. They once needed a postgres server too, which the
-    # database retirement took away; the name went with it.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/suite
-
-      - name: cargo nextest run
+      - name: cargo nextest run, the host packages
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           filter=$(.github/ci-shards.sh host-filter)
@@ -814,6 +776,25 @@ jobs:
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --success-output immediate -E "$filter"
+
+      - name: cargo nextest run, each solo test alone
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          for id in $(.github/ci-shards.sh solo-matrix | jq -r '.include[].id'); do
+            filter=$(.github/ci-shards.sh solo-filter "$id")
+            cargo-nextest nextest run \
+              --binaries-metadata target/nextest/binaries-metadata.json \
+              --cargo-metadata target/nextest/cargo-metadata.json \
+              --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+              -E "$filter" 2>&1 | tee /tmp/solo.log
+            ran=$(awk '
+              { gsub(/\033\[[0-9;]*m/, "") }
+              /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
+              END { print n + 0 }
+            ' /tmp/solo.log)
+            [ "$ran" -eq 1 ] || { echo "solo test '$id' selected $ran tests rather than one: the table names a test the binary does not have" >&2; exit 1; }
+          done
 
   # The Ply runs that would starve a partition, a runner each (`ci-shards.sh corpus-matrix`): the
   # corpus's checks that start desks under load, which spawn this run's `ply` over desks and floors
@@ -951,7 +932,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, nextest, lanes, solo, gates, test-hosts, corpus, refresh]
+    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, corpus, refresh]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

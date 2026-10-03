@@ -53,7 +53,7 @@ cargo nextest run --workspace
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.
-Tests that need a runner of their own are `SOLO` in `.github/ci-shards.sh`; run one
+Tests that must run alone are `SOLO` in `.github/ci-shards.sh`, run after the gates; run one
 with `cargo nextest run --workspace -E "$(.github/ci-shards.sh solo-filter <id>)"`.
 The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
 each `lanes` job runs a partition of them, apart from the `nextest` jobs, and the `corpus` job runs
