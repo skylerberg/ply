@@ -291,7 +291,10 @@ effect served {
 
 fn hosted(n: Int) -> Int / {served.write} = served.ping(n) * 10
 
-fn ticking() -> Int / {clock.read} = clock.now() + 1
+fn ticking() -> Int / {clock.read} = {
+  let t = match clock.now() { Instant(n) -> n };
+  t + 1
+}
 "#;
 
 struct Doubler;
@@ -476,8 +479,9 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
 
 const SIMULATED: &str = r#"
 fn work(n: Int) -> Int / {clock.read, clock.write} {
-  clock.sleep(n);
-  clock.now() + n
+  clock.sleep(Duration(n));
+  let t = match clock.now() { Instant(at) -> at };
+  t + n
 }
 
 fn ordered(seed: Int) -> Int / {sim.read} =
@@ -487,7 +491,10 @@ fn ordered(seed: Int) -> Int / {sim.read} =
     task.join(a) * 1000 + task.join(b)
   }
 
-fn timed(n: Int) -> Int / {sim.read} = simulate { clock.sleep(n); clock.now() }
+fn timed(n: Int) -> Int / {sim.read} = simulate {
+  clock.sleep(Duration(n));
+  match clock.now() { Instant(at) -> at }
+}
 
 fn drawn(bound: Int) -> Int / {sim.read} = simulate { random.below(bound) * 7 + random.below(bound) }
 

@@ -494,7 +494,13 @@ Result<a, e>  = Ok(a) | Err(e)
 Ordering      = Less | Equal | Greater
 Rounding      = HalfEven | HalfUp | Down | Up | Ceiling | Floor
 Iter<s, r>    = Continue(s) | Stop(r)
+Instant       = Instant(Int)
+Duration      = Duration(Int)
 ```
+
+`Instant` is a reading of a clock and `Duration` the span between two, both in
+nanoseconds; they are separate types so a deadline cannot be added to a byte
+count. `std.time` builds and reads them (§13.10).
 
 A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
 `None` loses `?`; one that declares its own `Stop` loses `iterate`.
@@ -1074,7 +1080,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled unit cache (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled unit cache, and the compiler's answers to what the runtime asks it, each kept under the emitter, the entry and the question (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them, and the front-end answers `ply run` files (§16) (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -1104,9 +1110,11 @@ scheduler:
 ```ply
 nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write join<a>(t: Task<a>) -> a
-                       write yield() -> Unit }
-nondet effect clock  { read  now() -> Int
-                       write sleep(nanos: Int) -> Unit }
+                       write yield() -> Unit
+                       write cancel<a>(t: Task<a>) -> Bool
+                       write await<a>(t: Task<a>) -> Option<a> }
+nondet effect clock  { read  now() -> Instant
+                       write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
                        write below(bound: Int) -> Int }
 effect sim           { read  seed() -> Int }
@@ -1135,6 +1143,16 @@ effect sim           { read  seed() -> Int }
 * A `parallel` block (§5.9) inside a region runs its branches in turn, so the
   scheduler sees nothing of it. A branch may not open a region (`E0309`): a
   region's schedule is drawn from its entry's seed in the order regions open.
+
+`task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
+it waits on is let go, and it performs nothing more. When it next runs it only
+unwinds, releasing what it holds. The cancel answers `false` for a task that had
+already ended and leaves its answer alone. `task.await(t)` is a join that answers
+`Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
+cancelled task has nothing to answer and raises `E0502`. A task cannot cancel
+itself or the region's body. A deadline is the two together: one task sleeps and
+cancels the other, which a third awaits. Every step a cancelled task took is read
+against the cancel, so the search tries cancelling it earlier and later.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -1771,7 +1789,20 @@ pub nondet effect time {
 pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms}
 pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms}
 pub fn since(started: Int) -> Int / {time.elapsed_ms}
+
+pub fn nanos(n: Int) -> Duration        // also micros, millis, seconds, minutes, hours
+pub fn as_nanos(d: Duration) -> Int     // also as_micros, as_millis, as_seconds, toward zero
+pub fn plus(a: Duration, b: Duration) -> Duration
+pub fn minus(a: Duration, b: Duration) -> Duration
+pub fn scaled(d: Duration, k: Int) -> Duration
+pub fn nanos_at(i: Instant) -> Int
+pub fn after(i: Instant, d: Duration) -> Instant
+pub fn between(earlier: Instant, later: Instant) -> Duration
 ```
+
+The prelude's `Instant` and `Duration` (§4.6) are what the simulation's `clock`
+reads and sleeps in, and these build and read them; every conversion is checked
+arithmetic.
 
 The host's real time, in two readings and a wait, none of them a function of the
 program state, so a definition that takes one is `nondet` and a `test` over it
@@ -3191,7 +3222,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   moves between OS threads; only a `parallel` block's branches run on threads
   of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
-  between calls; no cancellation or backpressure; no migrations or live schema
+  between calls; no backpressure; no migrations or live schema
   check; HTTP/1.1 only; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no

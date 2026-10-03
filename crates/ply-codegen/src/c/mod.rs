@@ -1,6 +1,7 @@
 //! The compiled tier: the machine's lowered `Code`, emitted as C and handed to `cc`.
 //! `PLY_C_*`, `PLY_CC*` and `PLY_HEAP_*` knobs never change a program's meaning.
 
+pub mod answers;
 mod build;
 pub mod bundle;
 pub mod cache;

@@ -389,7 +389,16 @@ fn a_production_region_answers_task_and_not_the_clock() {
 fn the_task_registrations_are_what_ply_hosts_prints() {
     let listing = bound().listing().clone();
     let rows: Vec<String> = listing.rows.iter().map(|r| r.to_string()).collect();
-    assert_eq!(rows, vec!["task.join", "task.spawn", "task.yield"]);
+    assert_eq!(
+        rows,
+        vec![
+            "task.await",
+            "task.cancel",
+            "task.join",
+            "task.spawn",
+            "task.yield"
+        ]
+    );
     for row in &listing.rows {
         assert_eq!(row.atom.to_string(), row.to_string());
         assert_eq!(row.atom.mode, ply_eval::Mode::Write);
