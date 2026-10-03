@@ -8,9 +8,9 @@ import builder (builder)
 import args (Flags, style_of)
 import program (Program, ModuleView, Tables, load_program, published, tables_of, modules_of,
                 deps_of, closure_of, hash_of, short_of, own_tests)
-import report (Answer, ok_code, count_of, ind, refused)
+import report (Answer, ok_code, count_of, indent, refused)
 import style (Style, bold, dim)
-import compiler.front (Whole)
+import compiler.front (Analysis)
 import compiler.hash (hex, no_hashes)
 import compiler.infer (DefInfo, TestInfo)
 import std.fs (fs)
@@ -27,45 +27,45 @@ fn opt_str(v: Option<String>) -> Json = match v { Some(s) -> Str(s), None -> Nul
 fn names_json(names: List<String>) -> Json = Array(map(names, |n: String| Str(n)))
 
 fn edges(
-  t: Tables,
+  tables: Tables,
   deps: Bool,
   key: Bytes,
   entry: List<{ key: String, value: Json }>,
 ) -> List<{ key: String, value: Json }> =
   if !deps { entry } else {
-    push(push(entry, { key: "deps", value: names_json(deps_of(t, key)) }), {
+    push(push(entry, { key: "deps", value: names_json(deps_of(tables, key)) }), {
       key: "closure",
-      value: names_json(closure_of(t, key)),
+      value: names_json(closure_of(tables, key)),
     })
   }
 
-fn definition_json(t: Tables, deps: Bool, d: DefInfo) -> Json = {
-  let hash = hash_of(t, d.name);
+fn definition_json(tables: Tables, deps: Bool, def_info: DefInfo) -> Json = {
+  let hash = hash_of(tables, def_info.name);
   object(
-    edges(t, deps, d.name, [
-      { key: "name", value: Str(string_of_bytes_lossy(d.name)) },
-      { key: "module", value: Str(string_of_bytes_lossy(d.module)) },
-      { key: "simple_name", value: Str(string_of_bytes_lossy(d.simple_name)) },
+    edges(tables, deps, def_info.name, [
+      { key: "name", value: Str(string_of_bytes_lossy(def_info.name)) },
+      { key: "module", value: Str(string_of_bytes_lossy(def_info.module)) },
+      { key: "simple_name", value: Str(string_of_bytes_lossy(def_info.simple_name)) },
       { key: "hash", value: opt_str(hash) },
       { key: "short", value: opt_str(match hash { Some(h) -> Some(short_of(h)), None -> None }) },
     ]),
   )
 }
 
-fn test_hash(w: Whole, index: Int) -> Option<String> =
-  match list_at(w.hashes.tests, index) {
+fn test_hash(analysis: Analysis, index: Int) -> Option<String> =
+  match list_at(analysis.hashes.tests, index) {
     Some(h) -> Some(string_of_bytes_lossy(hex(h))),
     None -> None,
   }
 
-fn test_json(w: Whole, t: Tables, deps: Bool, x: TestInfo) -> Json =
+fn test_json(analysis: Analysis, tables: Tables, deps: Bool, test_info: TestInfo) -> Json =
   object(
-    edges(t, deps, x.key, [
-      { key: "index", value: Number(decimal_of_int(x.index)) },
-      { key: "key", value: Str(string_of_bytes_lossy(x.key)) },
-      { key: "name", value: Str(string_of_bytes_lossy(x.name)) },
-      { key: "module", value: Str(string_of_bytes_lossy(x.module)) },
-      { key: "hash", value: opt_str(test_hash(w, x.index)) },
+    edges(tables, deps, test_info.key, [
+      { key: "index", value: Number(decimal_of_int(test_info.index)) },
+      { key: "key", value: Str(string_of_bytes_lossy(test_info.key)) },
+      { key: "name", value: Str(string_of_bytes_lossy(test_info.name)) },
+      { key: "module", value: Str(string_of_bytes_lossy(test_info.module)) },
+      { key: "hash", value: opt_str(test_hash(analysis, test_info.index)) },
     ]),
   )
 
@@ -74,13 +74,17 @@ fn module_json(mo: ModuleView) -> Json =
 
 // --- The listing ------------------------------------------------------------
 
-fn edge_lines(s: Style, t: Tables, key: Bytes, lines: List<String>) -> List<String> = {
-  let named = deps_of(t, key);
-  let reached = closure_of(t, key);
-  let with_deps = if len(named) == 0 { lines }
-  else { push(lines, ind() ++ "                " ++ dim(s, "deps:") ++ " " ++ commas(named)) };
+fn edge_lines(style: Style, tables: Tables, key: Bytes, lines: List<String>) -> List<String> = {
+  let named = deps_of(tables, key);
+  let reached = closure_of(tables, key);
+  let with_deps = if len(named) == 0 { lines } else {
+    push(lines, indent() ++ "                " ++ dim(style, "deps:") ++ " " ++ commas(named))
+  };
   if len(reached) == 0 { with_deps } else {
-    push(with_deps, ind() ++ "                " ++ dim(s, "closure:") ++ " " ++ commas(reached))
+    push(
+      with_deps,
+      indent() ++ "                " ++ dim(style, "closure:") ++ " " ++ commas(reached),
+    )
   }
 }
 
@@ -90,85 +94,97 @@ fn commas(names: List<String>) -> String =
 
 fn quoted(name: String) -> String = "\"" ++ name ++ "\""
 
-fn def_lines(s: Style, t: Tables, deps: Bool, lines: List<String>, d: DefInfo) -> List<String> = {
-  let hash = match hash_of(t, d.name) { Some(h) -> short_of(h), None -> blank() };
-  let said = push(
-    lines,
-    ind() ++ "  " ++ dim(s, hash) ++ "  " ++ string_of_bytes_lossy(d.simple_name),
-  );
-  if deps { edge_lines(s, t, d.name, said) } else { said }
-}
-
-fn test_lines(
-  s: Style,
-  w: Whole,
+fn def_lines(
+  style: Style,
   t: Tables,
   deps: Bool,
   lines: List<String>,
-  x: TestInfo,
+  def_info: DefInfo,
 ) -> List<String> = {
-  let hash = match test_hash(w, x.index) { Some(h) -> short_of(h), None -> blank() };
+  let hash = match hash_of(t, def_info.name) { Some(h) -> short_of(h), None -> blank() };
   let said = push(
     lines,
-    ind() ++ "  " ++ dim(s, hash) ++ "  " ++ dim(s, "test") ++ " "
-      ++ quoted(string_of_bytes_lossy(x.name)),
+    indent() ++ "  " ++ dim(style, hash) ++ "  " ++ string_of_bytes_lossy(def_info.simple_name),
   );
-  if deps { edge_lines(s, t, x.key, said) } else { said }
+  if deps { edge_lines(style, t, def_info.name, said) } else { said }
+}
+
+fn test_lines(
+  style: Style,
+  w: Analysis,
+  tables: Tables,
+  deps: Bool,
+  lines: List<String>,
+  test_info: TestInfo,
+) -> List<String> = {
+  let hash = match test_hash(w, test_info.index) { Some(h) -> short_of(h), None -> blank() };
+  let said = push(
+    lines,
+    indent() ++ "  " ++ dim(style, hash) ++ "  " ++ dim(style, "test") ++ " "
+      ++ quoted(string_of_bytes_lossy(test_info.name)),
+  );
+  if deps { edge_lines(style, tables, test_info.key, said) } else { said }
 }
 
 fn module_lines(
-  s: Style,
-  w: Whole,
-  t: Tables,
+  style: Style,
+  analysis: Analysis,
+  tables: Tables,
   deps: Bool,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
   lines: List<String>,
   mo: ModuleView,
 ) -> List<String> = {
-  let head = push(push(lines, ""), ind() ++ bold(s, mo.name) ++ " " ++ dim(s, mo.path));
-  let mine = filter(defs, |d: DefInfo| string_of_bytes_lossy(d.module) == mo.name);
-  let after_defs = fold(mine, head, |acc: List<String>, d: DefInfo| def_lines(s, t, deps, acc, d));
-  let its_tests = filter(tests, |x: TestInfo| string_of_bytes_lossy(x.module) == mo.name);
-  fold(its_tests, after_defs, |acc: List<String>, x: TestInfo| test_lines(s, w, t, deps, acc, x))
+  let head = push(push(lines, ""), indent() ++ bold(style, mo.name) ++ " " ++ dim(style, mo.path));
+  let mine = filter(defs, |def_info: DefInfo| string_of_bytes_lossy(def_info.module) == mo.name);
+  let after_defs = fold(mine, head, |acc: List<String>, def_info: DefInfo|
+    def_lines(style, tables, deps, acc, def_info));
+  let its_tests = filter(tests, |test_info: TestInfo|
+    string_of_bytes_lossy(test_info.module) == mo.name);
+  fold(its_tests, after_defs, |acc: List<String>, test_info: TestInfo|
+    test_lines(style, analysis, tables, deps, acc, test_info))
 }
 
-fn tally(s: Style, w: Whole, defs: Int, tests: Int) -> List<String> = {
-  let modules = len(w.mods);
+fn tally(style: Style, analysis: Analysis, defs: Int, tests: Int) -> List<String> = {
+  let modules = len(analysis.mods);
   [
     "",
-    ind() ++ count_of(defs, "definition") ++ " · " ++ count_of(tests, "test") ++ " · "
+    indent() ++ count_of(defs, "definition") ++ " · " ++ count_of(tests, "test") ++ " · "
       ++ count_of(modules, "module"),
-    ind() ++ dim(s, note()),
+    indent() ++ dim(style, note()),
   ]
 }
 
-fn answered(s: Style, flags: Flags, p: Program, w: Whole) -> Answer = {
-  let t: Tables = tables_of(w.hashes);
-  let defs = published(w);
-  let views = modules_of(p, w);
-  let own = own_tests(p, w);
+fn answered(style: Style, flags: Flags, program: Program, analysis: Analysis) -> Answer = {
+  let t: Tables = tables_of(analysis.hashes);
+  let defs = published(analysis);
+  let views = modules_of(program, analysis);
+  let own = own_tests(program, analysis);
   let listed = fold(views, [], |acc: List<String>, mo: ModuleView|
-    module_lines(s, w, t, flags.deps, defs, own, acc, mo));
+    module_lines(style, analysis, t, flags.deps, defs, own, acc, mo));
   {
     json: object([
       { key: "command", value: Str("hash") },
       { key: "ok", value: Bool(true) },
       { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
       { key: "root", value: Str(flags.root) },
-      { key: "files", value: Array(map(p.files, |f: File| Str(f.path))) },
+      { key: "files", value: Array(map(program.files, |file: File| Str(file.path))) },
       { key: "modules", value: Array(map(views, module_json)) },
       { key: "module_is_hashed", value: Bool(false) },
       { key: "note", value: Str(note()) },
       {
         key: "definitions",
-        value: Array(map(defs, |d: DefInfo| definition_json(t, flags.deps, d))),
+        value: Array(map(defs, |def_info: DefInfo| definition_json(t, flags.deps, def_info))),
       },
-      { key: "tests", value: Array(map(own, |x: TestInfo| test_json(w, t, flags.deps, x))) },
+      {
+        key: "tests",
+        value: Array(map(own, |test_info: TestInfo| test_json(analysis, t, flags.deps, test_info))),
+      },
       { key: "diagnostics", value: Array([]) },
     ]),
     lines: fold(
-      tally(s, w, len(w.hashes.defs), len(own)),
+      tally(style, analysis, len(analysis.hashes.defs), len(own)),
       listed,
       |acc: List<String>, l: String| push(acc, l),
     ),

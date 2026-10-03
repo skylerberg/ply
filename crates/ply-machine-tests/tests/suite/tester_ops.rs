@@ -14,7 +14,7 @@ import std.value (Value)
 
 nondet effect tester {
   write configure[r](options: Options) -> Unit
-  write unit[r](front: Front, unit: Option<Bytes>, hosted: Bool) -> Result<Int, List<Diag>>
+  write unit[r](front: LoadedAnalysis, unit: Option<Bytes>, hosted: Bool) -> Result<Int, List<Diag>>
   read schema[r](name: String) -> Result<Value, List<Diag>>
   write bound[r](config: Configured) -> Result<Unit, List<Diag>>
   read hosted[r]() -> Hosted
@@ -73,7 +73,7 @@ type Hosted = {
   cores: Int,
   backend: Compiled,
 }
-type Front = {
+type LoadedAnalysis = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
   read_ms: Int,
@@ -117,7 +117,7 @@ fn options(root: String) -> Options =
 
 /// One run over a project: its tests and the binding.
 const ONE_RUN: &str = r#"
-fn main(root: String, front: Front, unit: Bytes) -> String / {
+fn main(root: String, front: LoadedAnalysis, unit: Bytes) -> String / {
   tester.configure[r], tester.unit[r], tester.bound[r], tester.hosted[r], tester.ended[r],
   tester.executed[r],
 } = {
@@ -143,7 +143,7 @@ fn main(root: String, front: Front, unit: Bytes) -> String / {
 
 /// Two runs over two projects, neither ended: each one's unit and its first test.
 const TWO_RUNS: &str = r#"
-fn first_of(root: String, front: Front, unit: Bytes) -> String / {
+fn first_of(root: String, front: LoadedAnalysis, unit: Bytes) -> String / {
   tester.configure[r], tester.unit[r], tester.executed[r],
 } = {
   tester.configure[r](options(root));
@@ -155,10 +155,10 @@ fn first_of(root: String, front: Front, unit: Bytes) -> String / {
 
 fn main(
   root: String,
-  front: Front,
+  front: LoadedAnalysis,
   unit: Bytes,
   other: String,
-  other_front: Front,
+  other_front: LoadedAnalysis,
   other_unit: Bytes,
 ) -> String / {
   tester.configure[r], tester.unit[r], tester.executed[r],
@@ -188,16 +188,8 @@ test "peeks" {
 
 /// A machine over `DECLARED` and `main`, bound to the tester operations the program declares.
 fn driving(main: &str) -> Machine<'static> {
-    ply_codegen::c::producer::ensure_default();
-    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
-        "m".to_string(),
-        format!("{DECLARED}{main}"),
-    )])
-    .expect("the driving program checks");
-    let unit =
-        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
-            .expect("this host has a C toolchain");
-    let front: &'static ply_eval::Front = Box::leak(Box::new(answered.front));
+    let (front, unit) = crate::fixture::built("m", &format!("{DECLARED}{main}"));
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
     let mut machine = Machine::new(front, unit.attach()).expect("the unit is this program's");
     let mut registry = HostRegistry::new();
     // Only what this program declares: a family's operation the program does not declare is a

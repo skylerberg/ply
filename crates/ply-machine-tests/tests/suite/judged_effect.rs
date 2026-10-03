@@ -5,7 +5,7 @@
 
 use crate::fixture::project;
 use ply_eval::host::HostRegistry;
-use ply_eval::{Front, Machine, Provider, Span, Value};
+use ply_eval::{Analysis, Machine, Provider, Span, Value};
 use std::sync::Arc;
 
 /// The judging program. Every operation of the effect is declared, as the run that binds it
@@ -14,7 +14,7 @@ const JUDGING: &str = r#"
 import std.value (Value, VInt, render)
 
 nondet effect prover {
-  write configure[claims](options: Options, front: Front, world: World) -> Unit
+  write configure[claims](options: Options, front: LoadedAnalysis, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
   write compiled[claims](unit: Bytes) -> Result<Unit, List<Diag>>
   read schema[claims](name: String) -> Result<Value, List<Diag>>
@@ -97,7 +97,7 @@ type Seed = Unit
 type LawRun = Unit
 type Baseline = Unit
 type Accepted = Unit
-type Front = {
+type LoadedAnalysis = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
   read_ms: Int,
@@ -137,7 +137,7 @@ fn judged_at(index: Int) -> Answer / {prover.judged[claims]} = {
     })
 }
 
-fn main(root: String, index: Int, front: Front, unit: Bytes, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.prepared[claims], prover.judged[claims]} = {
+fn main(root: String, index: Int, front: LoadedAnalysis, unit: Bytes, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.prepared[claims], prover.judged[claims]} = {
   prover.configure[claims]({
     path: root,
     no_incremental: false,
@@ -188,28 +188,13 @@ law "doubling is tripling"
 /// That law as `proof.world` would hand it over.
 const THE_LAW: (&str, &[&str]) = ("m.doubling is tripling", &["n"]);
 
-fn front_of(source: &str) -> Front {
-    ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_front_with_std(&[(
-        "proof.obligation".to_string(),
-        source.to_string(),
-    )])
-    .expect("the judging program checks")
-    .front
+fn front_of(source: &str) -> Analysis {
+    crate::fixture::built("proof.obligation", source).0
 }
 
 /// The program checked with the standard library it imports, and compiled.
-fn built(source: &str) -> (Front, &'static ply_codegen::Unit) {
-    ply_codegen::c::producer::ensure_default();
-    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
-        "proof.obligation".to_string(),
-        source.to_string(),
-    )])
-    .expect("the judging program checks");
-    let unit =
-        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
-            .expect("this host has a C toolchain");
-    (answered.front, unit)
+fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
+    crate::fixture::built("proof.obligation", source)
 }
 
 /// The fixture's answer, from one entered call.

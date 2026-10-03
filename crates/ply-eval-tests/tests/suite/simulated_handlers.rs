@@ -1,5 +1,4 @@
 use crate::fixture::port_check;
-use ply_codegen::c::producer;
 use ply_eval::decode::At;
 use ply_eval::{
     Answer, CheckOutput, EffectInfo, Handlers, SEEDED_OPS, SimTy, SourceId, Span, Symbol, TaskId,
@@ -45,24 +44,41 @@ fn effect<'a>(check: &'a CheckOutput, simple: &str) -> &'a EffectInfo {
         .unwrap_or_else(|| panic!("`{simple}` is declared"))
 }
 
-/// Each declared operation's parameter and answer types as the compiler prints them, by its
-/// program-wide `effect.op`: what a seeded handler's signature has to agree with.
+/// A declared operation's type as the compiler prints one: a constructor and its arguments.
+fn printed(t: At<'_>) -> String {
+    let ty = t.ctor().expect("a type is a constructor of `types.Type`");
+    assert_eq!(
+        ty.name(),
+        "TyCon",
+        "a seeded operation's types are named types"
+    );
+    let con = ty.arg(0).expect("`TyCon` holds its name and arguments");
+    let name = con
+        .field("name")
+        .and_then(|n| n.utf8())
+        .expect("a named type has a name")
+        .to_string();
+    let args = con
+        .field("args")
+        .and_then(|a| a.items(|t| Ok(printed(t))))
+        .expect("a named type lists its arguments");
+    if args.is_empty() {
+        name
+    } else {
+        format!("{name}<{}>", args.join(", "))
+    }
+}
+
+/// Each operation `sig` declares, with its parameter and answer types as the compiler answered
+/// them, by its program-wide `effect.op`: what a seeded handler's signature has to agree with.
 fn declared() -> HashMap<String, (Vec<String>, String)> {
-    producer::ensure_default();
-    let dump = producer::front_pulling_std(&[("sig".to_string(), SOURCE.to_string())], &[])
-        .expect("the front end answers")
-        .dump;
-    let printed = |t: At<'_>| -> String {
-        let text = producer::call("tycore.type_text", &[t.value().clone()])
-            .expect("the compiler prints a type");
-        At::new("a printed type", &text)
-            .utf8()
-            .expect("a type prints as text")
-            .to_string()
-    };
+    let files = [("sig.ply".to_string(), SOURCE.to_string())];
+    let bytes = ply_machine::builds::answered(&files).expect("the builder answers");
+    let front = ply_machine::runnable::front_value(&bytes).expect("the answer reads");
     let mut out = HashMap::new();
-    let effects = At::new("the answer", &dump)
-        .field("effects")
+    let effects = At::new("the answer", &front)
+        .field("dump")
+        .and_then(|d| d.field("effects"))
         .and_then(|e| e.list())
         .expect("the answer declares effects");
     for effect in effects {
@@ -70,6 +86,9 @@ fn declared() -> HashMap<String, (Vec<String>, String)> {
             .field("name")
             .and_then(|n| n.utf8())
             .expect("an effect is named");
+        if !effect_name.starts_with("sig.") {
+            continue;
+        }
         for op in effect
             .field("ops")
             .and_then(|o| o.list())

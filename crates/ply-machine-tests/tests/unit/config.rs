@@ -1,4 +1,4 @@
-use ply_eval::{SourceId, Span, Symbol, Value, codes};
+use ply_eval::{Span, Symbol, Value, codes};
 use ply_machine::config::*;
 use std::sync::Arc;
 
@@ -169,9 +169,7 @@ fn a_run_with_no_schema_contributes_nothing_to_the_digest() {
 }
 
 fn check(source: &str) -> ply_eval::CheckOutput {
-    ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
-        .expect("the fixture typechecks")
-        .check
+    crate::answered::checked("m", source).check
 }
 
 /// An artifact built without the schema carries none, and a definition no tier can enter has no
@@ -188,7 +186,7 @@ fn a_schema_the_program_does_not_carry_or_cannot_evaluate_is_refused() {
         absent.message
     );
 
-    let failed = schema_of(&program, None, "config").expect_err("no tier enters it");
+    let failed = schema_of(&program, None, "m.config").expect_err("no tier enters it");
     assert_eq!(failed.code, codes::CONFIG_UNAVAILABLE);
     assert!(
         failed.message.contains("could not be evaluated"),

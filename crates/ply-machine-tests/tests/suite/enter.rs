@@ -1,25 +1,25 @@
 //! What the launcher enters a built program with: the label is the capability, the code is the
 //! program's, and a span its entry left open comes back beside it.
 
-use crate::fixture::project;
-use ply_eval::{Span, codes};
+use crate::fixture::{handed, project, unit_text};
+use ply_eval::{Ended, Span, Value, codes};
 use ply_host::process::Executables;
-use ply_machine::artifact::{self, Artifact, Binds, Opened};
-use ply_machine::load::load;
+use ply_machine::enter::{self, Binds};
+use ply_machine::payload::field_of;
+use ply_machine::runnable;
 use std::path::Path;
-use tempfile::TempDir;
 
-fn opened(source: &str) -> (TempDir, Artifact, Opened) {
+/// `source`'s `main`, written as a runnable, read back and entered with `binds`.
+fn entered(source: &str, binds: Binds) -> Ended<i32> {
     let dir = project(source);
-    let loaded = load(dir.path()).expect("the program loads");
-    let entry = loaded
-        .sole_entry_point()
-        .expect("`main` is the entry point");
-    let artifact = artifact::build(&loaded, entry, &[])
-        .expect("the closure builds")
-        .artifact;
-    let opened = artifact::open(&artifact, Path::new("t.plyx")).expect("it opens");
-    (dir, artifact, opened)
+    let front = handed(dir.path());
+    let files: &Value = field_of(&front, "files", Span::DUMMY).expect("a front's files");
+    let dump = field_of(&front, "dump", Span::DUMMY).expect("a front's dump");
+    let unit = unit_text(dir.path());
+    let bytes = runnable::encode("m.main", files, dump, &unit).expect("the runnable encodes");
+    let program = runnable::decode(&bytes).expect("the runnable reads back");
+    let opened = enter::opened_runnable(program, dir.path()).expect("it opens");
+    enter::enter_runnable(opened, Vec::new(), binds)
 }
 
 fn binding_cc() -> Binds {
@@ -49,17 +49,14 @@ fn main() -> Unit / {process.spawn[cc], process.exit[proc]} = {
 
 #[test]
 fn an_entered_program_cannot_spawn_a_label_nothing_bound() {
-    let (_dir, artifact, opened) = opened(SPAWNS);
-    let (entered, _) =
-        artifact::enter(&artifact, &opened, Vec::new(), Binds::default()).into_parts();
+    let (entered, _) = entered(SPAWNS, Binds::default()).into_parts();
     let refused = entered.expect_err("`cc` is bound to nothing");
     assert_eq!(refused.code, codes::PROCESS_EXEC_UNBOUND);
 }
 
 #[test]
 fn an_entered_program_starts_what_its_caller_bound_to_the_label() {
-    let (_dir, artifact, opened) = opened(SPAWNS);
-    let (entered, _) = artifact::enter(&artifact, &opened, Vec::new(), binding_cc()).into_parts();
+    let (entered, _) = entered(SPAWNS, binding_cc()).into_parts();
     let code = entered.expect("the program runs");
     assert_eq!(code, 7, "the child's own code is what came back");
 }
@@ -77,10 +74,8 @@ fn main() -> Int / {trace.write[orders]} = {
 
 #[test]
 fn an_entered_program_hands_back_the_span_it_left_open_beside_its_code() {
-    let (_dir, artifact, opened) = opened(LEAVES_A_SPAN);
-    let (code, warnings) =
-        artifact::enter(&artifact, &opened, Vec::new(), Binds::default()).into_parts();
-    assert_eq!(code.expect("the program runs"), artifact::EXIT_OK);
+    let (code, warnings) = entered(LEAVES_A_SPAN, Binds::default()).into_parts();
+    assert_eq!(code.expect("the program runs"), enter::EXIT_OK);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert_eq!(warnings[0].code, codes::SPAN_ABANDONED, "{warnings:?}");
     assert!(
@@ -100,9 +95,8 @@ fn main() -> Unit / {process.bound[cc], process.exit[proc]} =
 
 #[test]
 fn an_entered_program_asks_whether_its_caller_bound_the_label_it_would_start() {
-    let (_dir, artifact, opened) = opened(ASKS_FOR_CC);
     for (binds, code) in [(Binds::default(), 9), (binding_cc(), 7)] {
-        let (entered, _) = artifact::enter(&artifact, &opened, Vec::new(), binds).into_parts();
+        let (entered, _) = entered(ASKS_FOR_CC, binds).into_parts();
         assert_eq!(entered.expect("the program runs"), code);
     }
 }

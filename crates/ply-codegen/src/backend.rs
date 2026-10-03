@@ -2,7 +2,7 @@
 
 use crate::rt::Entry;
 use crate::source::Source;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use ply_eval::{
     Carry, Compilation, Counters, CtorCarries, DefHash, Diagnostic, Entered, Provider, Symbol,
     Value,
@@ -131,7 +131,7 @@ thread_local! {
 
 /// One run's compiled unit, shared by every worker's backend.
 pub struct Unit {
-    /// [`ply_eval::Front::hashes_digest`] of the program this was built over, for
+    /// [`ply_eval::Analysis::hashes_digest`] of the program this was built over, for
     /// `Compiled::describes`.
     identity: DefHash,
     source: &'static Source,
@@ -142,50 +142,15 @@ pub struct Unit {
     /// Definitions the emitter refused, with the construct that refused each.
     refusals: Vec<(String, String)>,
     counters: Counters,
-    /// Nanoseconds the pre-flight build took, paid once; workers read the unit back.
-    analysis_nanos: u64,
     codegen_nanos: AtomicU64,
     compiles: AtomicU64,
-    /// Workers whose build failed after the pre-flight in [`Unit::over_front`] succeeded.
+    /// Workers whose load failed after the first in [`Unit::handed`] succeeded.
     poisoned: AtomicU64,
-    /// An artifact's self-describing C, loaded rather than built.
-    embedded: Option<String>,
+    /// The unit's self-describing C, which a worker that finds no load on its thread loads again.
+    text: String,
 }
 
 impl Unit {
-    /// `texts` is each module's source by name, which the cache keys cover.
-    pub fn over_front(
-        front: &ply_eval::Front,
-        texts: HashMap<String, String>,
-    ) -> Result<&'static Unit> {
-        let identity = front.hashes_digest;
-        let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
-        let source: &'static Source =
-            Box::leak(Box::new(Source::from_front(front).with_texts(texts)));
-        let candidates = source.functions();
-        let started = std::time::Instant::now();
-        // The pre-flight decides the compiled set and leaves the unit every worker reads back.
-        let ((compiled, refusals), native) = closed(source, &candidates)?;
-        let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
-        let analysis_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let unit = Unit {
-            identity,
-            source,
-            compiled,
-            members,
-            refusals,
-            counters: Counters::default(),
-            analysis_nanos,
-            codegen_nanos: AtomicU64::new(0),
-            compiles: AtomicU64::new(0),
-            poisoned: AtomicU64::new(0),
-            embedded: None,
-        };
-        let unit: &'static Unit = Box::leak(Box::new(unit));
-        PREFLIGHT.with(|slot| *slot.borrow_mut() = Some((unit.address(), native)));
-        Ok(unit)
-    }
-
     fn address(&'static self) -> usize {
         self as *const Unit as usize
     }
@@ -193,10 +158,10 @@ impl Unit {
     /// A unit produced elsewhere, its C handed over whole, loaded once: the first backend on this
     /// thread takes that load, and one that does not serve this runtime is an
     /// [`crate::c::Unserved`].
-    pub fn handed(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
+    pub fn handed(front: &ply_eval::Analysis, text: String) -> Result<&'static Unit> {
         let identity = front.hashes_digest;
-        let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
-        let source: &'static Source = Box::leak(Box::new(Source::from_front(front)));
+        let front: &'static ply_eval::Analysis = Box::leak(Box::new(front.clone()));
+        let source: &'static Source = Box::leak(Box::new(Source::from_analysis(front)));
         let (native, refused) = crate::c::load_unit(&text, Some(source), "unit")?;
         let compiled = native.names();
         let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
@@ -210,20 +175,14 @@ impl Unit {
                 .map(|r| (r.function, r.construct))
                 .collect(),
             counters: Counters::default(),
-            analysis_nanos: 0,
             codegen_nanos: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
-            embedded: Some(text),
+            text,
         };
         let unit: &'static Unit = Box::leak(Box::new(unit));
         PREFLIGHT.with(|slot| *slot.borrow_mut() = Some((unit.address(), native)));
         Ok(unit)
-    }
-
-    /// The whole unit over `names`, produced and not compiled: what `ply build` embeds.
-    pub fn produce(&'static self, names: &[&str]) -> Result<crate::c::Produced> {
-        crate::c::produce(self.source, names)
     }
 
     /// The constructor table a unit over this program is emitted against.
@@ -249,7 +208,7 @@ impl Unit {
     /// What this unit has spent compiling, in its two halves.
     pub fn compilation(&self) -> Compilation {
         Compilation {
-            analysis_nanos: self.analysis_nanos,
+            analysis_nanos: 0,
             codegen_nanos: self.codegen_nanos.load(Ordering::Relaxed),
             units: self.compiles.load(Ordering::Relaxed),
         }
@@ -271,15 +230,9 @@ impl Unit {
                 }
             }
         });
-        let native = match (preflown, &self.embedded) {
-            (Some(native), _) => native,
-            (None, Some(text)) => crate::c::load_unit(text, Some(self.source), "unit")?.0,
-            // The same set as the pre-flight, so the unit key matches and the unit is read back.
-            (None, None) => {
-                let candidates = self.source.functions();
-                let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
-                crate::c::build(self.source, &names)?.0
-            }
+        let native = match preflown {
+            Some(native) => native,
+            None => crate::c::load_unit(&self.text, Some(self.source), "unit")?.0,
         };
         self.codegen_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -323,10 +276,6 @@ impl Provider for Unit {
 
     fn unbuilt(&self) -> u64 {
         self.poisoned()
-    }
-
-    fn relocate(&self, front: &ply_eval::Front, sources: &ply_eval::SourceMap) -> bool {
-        self.source.relocate(front, sources)
     }
 }
 
@@ -715,28 +664,3 @@ impl ply_eval::Compiled for Bodies {
             .unwrap_or_default()
     }
 }
-
-/// The largest subset of `candidates` the emitter compiles as one unit, and what it dropped.
-pub fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed> {
-    closed(source, candidates).map(|(closed, _)| closed)
-}
-
-/// [`closure`], with the unit it loaded.
-fn closed(source: &'static Source, candidates: &[String]) -> Result<(Closed, crate::c::Native)> {
-    let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
-    let (native, refused) =
-        crate::c::build(source, &names).context("compiling the fragment of this program")?;
-    let set: Vec<String> = candidates
-        .iter()
-        .filter(|name| native.entry(name).is_some())
-        .cloned()
-        .collect();
-    let lost = refused
-        .into_iter()
-        .map(|r| (r.function, r.construct))
-        .collect();
-    Ok(((set, lost), native))
-}
-
-/// The surviving set, and every function that was dropped with the reason.
-pub type Closed = (Vec<String>, Vec<(String, String)>);

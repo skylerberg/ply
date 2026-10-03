@@ -25,15 +25,9 @@ pub fn write(dir: &Path, name: &str, text: &str) {
     std::fs::write(path, text).expect("the fixture is written");
 }
 
-/// The front end the CLI would hand a machine: the file, or the project walked, the compiler run
-/// once over it, and both marshalled into the record the effects take.
-///
-/// A test that drives an effect directly has no CLI to do this for it, and every effect that reads a
-/// program now takes one. The fixture's module mirrors the package's, so what the machine names has
-/// to be what this declares -- `replay`'s own check says so for the payload.
-pub fn handed(path: &Path) -> ply_eval::Value {
-    use ply_codegen::c::producer::{self, Packages};
-    producer::ensure_default();
+/// The runnable the builder writes of the file, or the project walked, at `path`: its front end's
+/// answer, a refusal's included, and its unit, every definition offered.
+fn answered(path: &Path) -> Vec<u8> {
     let root = ply_machine::load::project_root(path);
     let mut paths = Vec::new();
     if path.is_file() {
@@ -42,60 +36,27 @@ pub fn handed(path: &Path) -> ply_eval::Value {
         collect(path, &mut paths);
     }
     paths.sort();
-    let mut files: Vec<(String, String, String)> = Vec::new();
-    for path in paths {
-        let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-        let module = ply_eval::ModuleName::from_relative_path(&relative)
-            .expect("a fixture's file is a module");
-        let text = std::fs::read_to_string(&path).expect("the fixture is read");
-        files.push((path.display().to_string(), module.to_string(), text));
-    }
-    let own: Vec<(String, String)> = files
+    let files: Vec<(String, String)> = paths
         .iter()
-        .map(|(_, name, text)| (name.clone(), text.clone()))
+        .map(|p| {
+            (
+                p.strip_prefix(&root).unwrap_or(p).display().to_string(),
+                std::fs::read_to_string(p).expect("the fixture is read"),
+            )
+        })
         .collect();
-    let packages = Packages {
-        root: root.display().to_string(),
-        manifest: None,
-        supplied: Vec::new(),
-    };
-    let pulled =
-        producer::front_pulling_std_with(&own, ply_machine::shelf::sources(), &packages, &[])
-            .expect("the front end runs");
-    for name in &pulled.modules {
-        let module = ply_eval::ModuleName::from_dotted(name);
-        if let Some(text) = ply_machine::shelf::source(&module) {
-            files.push((
-                ply_machine::shelf::pseudo_path(&module)
-                    .display()
-                    .to_string(),
-                name.clone(),
-                text.to_string(),
-            ));
-        }
-    }
-    let file = |(path, name, text): (String, String, String)| {
-        ply_machine::payload::record(vec![
-            ("path", ply_eval::Value::str(&path)),
-            ("name", ply_eval::Value::str(&name)),
-            ("text", ply_eval::Value::bytes(text.as_bytes())),
-        ])
-    };
-    ply_machine::payload::record(vec![
-        ("dump", pulled.dump),
-        (
-            "files",
-            ply_eval::Value::list(files.into_iter().map(file).collect()),
-        ),
-        ("read_ms", ply_eval::Value::Int(0)),
-        ("front_ms", ply_eval::Value::Int(0)),
-        ("file_ms", ply_eval::Value::Int(0)),
-        ("cached", ply_eval::Value::Bool(false)),
-    ])
+    ply_machine::builds::answered(&files)
+        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message))
 }
 
-/// Every `.ply` file under `root`, a directory whose name starts with `.` passed over as a walk
-/// passes it.
+/// The front end the CLI would hand a machine for the file, or the project, at `path`, as the record
+/// the effects take.
+pub fn handed(path: &Path) -> ply_eval::Value {
+    ply_machine::runnable::front_value(&answered(path))
+        .unwrap_or_else(|why| panic!("the front end's answer reads: {why}"))
+}
+
+/// Every file under `root`, a directory whose name starts with `.` passed over as a walk passes it.
 fn collect(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -103,11 +64,12 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         if path.is_dir() {
-            if !entry.file_name().to_string_lossy().starts_with('.') {
-                collect(&path, out);
-            }
-        } else if path.extension().is_some_and(|e| e == "ply") {
+            collect(&path, out);
+        } else {
             out.push(path);
         }
     }
@@ -115,9 +77,9 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) {
 
 /// The file or project at `path` loaded as the CLI hands one to a machine.
 pub fn loaded(path: &Path) -> ply_machine::load::Loaded {
-    let front = ply_machine::driver::handed_front_of(&handed(path), ply_eval::Span::DUMMY)
+    let front = ply_machine::driver::loaded_analysis_of(&handed(path), ply_eval::Span::DUMMY)
         .unwrap_or_else(|d| panic!("the front end is handed over: {}", d.message));
-    ply_machine::driver::load_over_front(path, &front).unwrap_or_else(|e| {
+    ply_machine::driver::load_over_analysis(path, &front).unwrap_or_else(|e| {
         panic!(
             "`{}` did not compile: {:?}",
             path.display(),
@@ -129,29 +91,37 @@ pub fn loaded(path: &Path) -> ply_machine::load::Loaded {
     })
 }
 
-/// The C of `loaded`'s unit, every definition offered: what the CLI's emitter hands a machine.
-pub fn unit_text(loaded: &ply_machine::load::Loaded) -> Vec<u8> {
-    ply_codegen::c::producer::ensure_default();
-    let unit = ply_codegen::Unit::over_front(
-        &loaded.front,
-        ply_machine::support::module_texts(&loaded.check, &loaded.sources),
-    )
-    .expect("the program compiles to a tier");
-    let names: Vec<&str> = unit.compiled().iter().map(String::as_str).collect();
-    unit.produce(&names)
-        .expect("the unit is produced")
-        .text
+/// The errors the front end refused the program at `path` with.
+pub fn refusal(path: &Path) -> Vec<ply_eval::Diagnostic> {
+    let front = ply_machine::runnable::decode(&answered(path))
+        .unwrap_or_else(|why| panic!("the runnable reads: {why}"))
+        .front
+        .answer;
+    assert!(front.has_error(), "the program was not refused");
+    front
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.severity == ply_eval::Severity::Error)
+        .collect()
+}
+
+/// The C of the unit of the program at `path`, every definition offered: what the CLI's emitter
+/// hands a machine.
+pub fn unit_text(path: &Path) -> Vec<u8> {
+    ply_machine::runnable::decode(&answered(path))
+        .unwrap_or_else(|why| panic!("the runnable reads: {why}"))
+        .unit
         .into_bytes()
 }
 
 /// The C of the unit of the program at `path`, as the value a program hands `machine.load`.
 pub fn unit(path: &Path) -> ply_eval::Value {
-    ply_eval::Value::bytes(unit_text(&loaded(path)))
+    ply_eval::Value::bytes(unit_text(path))
 }
 
 /// The compiled tier over `loaded`, from the C handed over as the CLI hands it.
 pub fn backend(loaded: &ply_machine::load::Loaded) -> &'static dyn ply_eval::Provider {
-    ply_machine::support::unit_of(&loaded.front, &unit_text(loaded))
+    ply_machine::support::unit_of(&loaded.front, &unit_text(&loaded.root))
         .unwrap_or_else(|d| panic!("the unit compiles: {}", d.message))
 }
 
@@ -225,4 +195,30 @@ pub fn int_laws(laws: &[(&str, &[&str])]) -> ply_eval::Value {
             Value::list(laws.iter().enumerate().map(law).collect()),
         ),
     ])
+}
+
+/// What the builder makes of `source`, the module `module` names.
+#[track_caller]
+pub fn answer_for(module: &str, source: &str) -> ply_machine::runnable::Runnable {
+    let files = [(
+        format!("{}.ply", module.replace('.', "/")),
+        source.to_string(),
+    )];
+    let bytes = ply_machine::builds::answered(&files)
+        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
+    ply_machine::runnable::decode(&bytes).unwrap_or_else(|why| panic!("the answer reads: {why}"))
+}
+
+/// The front end's answer for `source`, which has to check, and the unit compiled from it.
+#[track_caller]
+pub fn built(module: &str, source: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+    let answer = answer_for(module, source);
+    let front = answer.front.answer;
+    assert!(
+        !front.has_error(),
+        "the fixture checks: {:?}",
+        front.diagnostics
+    );
+    let unit = ply_codegen::Unit::handed(&front, answer.unit).expect("this host has a C toolchain");
+    (front, unit)
 }

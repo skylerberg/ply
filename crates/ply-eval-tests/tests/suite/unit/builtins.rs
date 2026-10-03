@@ -647,100 +647,24 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
-/// Each builtin's parameter count in the scheme the port's checker binds it to: its `tycore.Type`,
-/// which is a `TyFn` whose `params` are the parameters, and ahead of them the witnesses the
-/// elaboration passes for a `numeric` or `integer` constraint.
-fn prelude_arities() -> std::collections::BTreeMap<String, usize> {
-    ply_codegen::c::producer::ensure_default();
-    let answer = ply_codegen::c::producer::call("front.builtin_rows", &[])
-        .expect("the port publishes its builtins");
-    let rows = ply_eval::decode::At::new("`front.builtin_rows`' answer", &answer);
-    let mut out = std::collections::BTreeMap::new();
-    for row in rows.list().unwrap() {
-        let name = row.field("name").and_then(|n| n.utf8()).unwrap();
-        let documented = row.field("params").and_then(|p| p.list()).unwrap().len();
-        let ty = row
-            .field("scheme")
-            .and_then(|s| s.field("ty"))
-            .and_then(|t| t.ctor())
-            .unwrap();
-        assert_eq!(ty.name(), "TyFn", "`{name}`'s scheme is not a function");
-        let params = ty
-            .arg(0)
-            .and_then(|f| f.field("params"))
-            .and_then(|p| p.list())
-            .unwrap()
-            .len();
-        assert_eq!(
-            documented, params,
-            "`{name}` is documented with {documented} parameter names for {params} parameters"
-        );
-        let witnesses = row
-            .field("witnesses")
-            .and_then(|w| w.number::<usize>())
-            .unwrap();
-        let twice = out.insert(name.to_string(), witnesses + params).is_some();
-        assert!(!twice, "the prelude binds `{name}` twice");
-    }
-    out
-}
-
+/// Every call passes a fixed number of words: a call that leaves an argument out is filled by the
+/// front end's defaults pass before anything here sees it. That the prelude's schemes agree is the
+/// CLI suite's `prelude` module's to hold, where both sides are in hand.
 #[test]
-fn every_builtin_agrees_on_its_arity_everywhere() {
-    let prelude = prelude_arities();
+fn every_builtin_takes_one_number_of_arguments() {
     for b in Builtin::all() {
         let (min, max) = b.arity();
-        assert_eq!(
-            min,
-            max,
-            "`{}` has a variable arity; every builtin is exactly applied, and a call \
-             that leaves an argument out is filled by the front end's defaults pass \
-             before anything here sees it",
-            b.name()
-        );
-
-        if let Some(&typed) = prelude.get(b.name()) {
-            assert_eq!(
-                typed,
-                max,
-                "`{}` takes {max} arguments here and {typed} in the prelude's scheme. \
-                 Whichever is larger, the extra arm is unreachable from source.",
-                b.name()
-            );
-        }
+        assert_eq!(min, max, "`{}` has a variable arity", b.name());
     }
 }
 
-/// A builtin with no scheme cannot be called; a scheme with no builtin checks and then fails.
 #[test]
-fn the_runtime_implements_exactly_the_builtins_the_prelude_types() {
+fn no_builtin_is_listed_twice() {
     let mut names: Vec<&str> = Builtin::all().iter().map(|b| b.name()).collect();
     names.sort_unstable();
     let mut unique = names.clone();
     unique.dedup();
     assert_eq!(names, unique, "`Builtin::all()` lists a builtin twice");
-
-    let prelude = prelude_arities();
-    // A name no source can spell is the elaboration's to write, never a program's to call.
-    let untyped: Vec<&str> = names
-        .iter()
-        .copied()
-        .filter(|n| !prelude.contains_key(*n) && !n.starts_with('?'))
-        .collect();
-    assert!(
-        untyped.is_empty(),
-        "builtins with no scheme in the prelude, so no program can call them: {untyped:?}"
-    );
-    let unimplemented: Vec<&String> = prelude
-        .keys()
-        .filter(|n| names.binary_search(&n.as_str()).is_err())
-        .collect();
-    assert!(
-        unimplemented.is_empty(),
-        "prelude schemes `Builtin::all()` has no builtin for: a call checks and then fails, \
-         or `all()` is missing an enum variant and every table driven by it skips it: \
-         {unimplemented:?}"
-    );
 }
 
 #[test]

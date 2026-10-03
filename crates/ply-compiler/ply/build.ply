@@ -1,10 +1,12 @@
 // The builder: what the launcher enters to make a program it ships out of that program's sources.
 // It reads the program below the root it is handed, checks it seeded with the rows its last build
 // of the program kept, emits its unit, keeping the emitter's answers between builds when told its
-// own compiler is the one the shelf holds, and writes what the launcher enters.
+// own compiler is the one the shelf holds, and writes what the launcher enters. Asked for the
+// answer rather than a program to ship, it writes whatever the front end answered, a refusal
+// included, and whatever unit the emitter made of it.
 
 import load (SourceFile, checked, every_root)
-import front (Rows, no_rows, rows_bin)
+import front (Refused, Rows, dump_of, no_rows, rows_bin, shipped_dump)
 import resolve (Diag, Label)
 import unit (shipped, emitted, held, read_kept, shelf_identity, write_kept)
 import std.bin
@@ -14,7 +16,7 @@ import std.random (entropy)
 import std.time (time)
 
 fn usage() -> String =
-  "the builder takes ROOT ENTRY OUT ROWS KEPT PHASES: the program below the `src` root, the definition it enters, where its runnable and the rows that seed its next build go below `out` (no rows: an empty ROWS), `kept` to keep the emitter's answers below `bodies` (else `fresh`), and `phases` to say what each step took (else `quiet`)"
+  "the builder takes ROOT ENTRY OUT ROWS KEPT PHASES [answer]: the program below the `src` root, the definition it enters, where its runnable and the rows that seed its next build go below `out` (no rows: an empty ROWS), `kept` to keep the emitter's answers below `bodies` (else `fresh`), `phases` to say what each step took (else `quiet`), and `answer` to write what the front end and the emitter made of a program that does not check or compile rather than refuse it"
 
 // The rows a last build of the program kept, or none when there are none to read.
 fn kept_rows(path: String) -> Rows / {fs.read_file[out]} =
@@ -37,27 +39,29 @@ fn line_col(text: Bytes, at: Int) -> String = {
 }
 
 // Where a diagnostic points: its first primary label's file, line and column, when it has one.
-fn place(d: Diag, files: List<SourceFile>) -> String =
-  match filter(d.labels, |l: Label| l.primary) {
-    [l, ..] -> match list_at(files, l.module) {
-      Some(f) -> f.path ++ ":" ++ line_col(f.text, l.start) ++ ": ",
+fn place(diag: Diag, files: List<SourceFile>) -> String =
+  match filter(diag.labels, |label: Label| label.primary) {
+    [label, ..] -> match list_at(files, label.module) {
+      Some(f) -> f.path ++ ":" ++ line_col(f.text, label.start) ++ ": ",
       None -> "",
     },
     [] -> "",
   }
 
 fn told(diags: List<Diag>, files: List<SourceFile>) -> Unit / {process.err[proc]} =
-  fold(diags, (), |_: Unit, d: Diag|
+  fold(diags, (), |_: Unit, diag: Diag|
     process.err[proc](
-      place(d, files) ++ string_of_bytes_lossy(d.code) ++ ": " ++ string_of_bytes_lossy(d.message),
+      place(diag, files) ++ string_of_bytes_lossy(diag.code) ++ ": "
+        ++ string_of_bytes_lossy(diag.message),
     ))
 
 fn texts(files: List<SourceFile>) -> List<Bytes> = map(files, |f: SourceFile| f.text)
 
-// The program below `root` built into `out`: 0 when it was written, 1 when the program was refused,
-// and 2 when what was built could not be written.
 fn ms(from: Int, to: Int) -> String = int_to_string(to - from) ++ "ms"
 
+// The program below `root` built into `out`: 0 when it was written, 1 when the program was refused,
+// and 2 when what was built could not be written. `answering` writes a refusal too, with no unit,
+// and whatever unit the emitter made, whatever it refused.
 pub fn built(
   root: String,
   entry: String,
@@ -65,12 +69,15 @@ pub fn built(
   rows: String,
   kept: Bool,
   phases: Bool,
+  answering: Bool,
 ) -> Int / {fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read_file[out], fs.write_file[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.runtime, shipped.runnable, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc]} = {
   let started = time.elapsed_ms();
   let seed = kept_rows(rows);
   let seeding = time.elapsed_ms();
   match checked[src](root, seed) {
-    Err(u) -> {
+    Err(u) -> if answering {
+      written(out, shipped.runnable(entry, u.files, dump_of(Refused(u.diags)), b""))
+    } else {
       told(u.diags, u.files);
       1
     },
@@ -104,15 +111,21 @@ pub fn built(
         )
       };
       let emitting = time.elapsed_ms();
-      match held(c.front.dump, offered, emission) {
+      let unit = match emission {
+        Ok(e) -> if answering { Ok(e.produced.text) }
+        else { held(c.front.dump, offered, emission) },
+        Err(_) -> held(c.front.dump, offered, emission),
+      };
+      match unit {
         Err(diags) -> {
           told(diags, c.front.files);
           1
         },
         Ok(unit) -> {
-          let bytes = shipped.runnable(entry, c.front.files, c.front.dump, unit);
+          let dump = if answering { c.front.dump } else { shipped_dump(c.front.dump) };
+          let bytes = shipped.runnable(entry, c.front.files, dump, unit);
           let encoding = time.elapsed_ms();
-          let wrote = fs.write_file[out](out, bytes);
+          let wrote = written(out, bytes);
           if phases {
             process.err[proc](
               "phases: " ++ entry ++ " rows read " ++ ms(started, seeding) ++ ", checked "
@@ -127,20 +140,25 @@ pub fn built(
                 ++ ms(encoding, time.elapsed_ms()),
             )
           };
-          if wrote { 0 } else {
-            process.err[proc]("the runnable could not be written to `" ++ out ++ "`");
-            2
-          }
+          wrote
         },
       }
     },
   }
 }
 
+fn written(out: String, bytes: Bytes) -> Int / {fs.write_file[out], process.err[proc]} =
+  if fs.write_file[out](out, bytes) { 0 } else {
+    process.err[proc]("the runnable could not be written to `" ++ out ++ "`");
+    2
+  }
+
 pub fn main() -> Unit / {process.args[proc], process.err[proc], process.exit[proc], fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read_file[out], fs.write_file[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.runtime, shipped.runnable, entropy.next, time.now_ms, time.elapsed_ms} =
   match process.args[proc]() {
     [root, entry, out, rows, kept, phases] ->
-      process.exit[proc](built(root, entry, out, rows, kept == "kept", phases == "phases")),
+      process.exit[proc](built(root, entry, out, rows, kept == "kept", phases == "phases", false)),
+    [root, entry, out, rows, kept, phases, "answer"] ->
+      process.exit[proc](built(root, entry, out, rows, kept == "kept", phases == "phases", true)),
     _ -> {
       process.err[proc](usage());
       process.exit[proc](2)

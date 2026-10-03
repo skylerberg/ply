@@ -97,7 +97,7 @@ pub struct Job {
     pub path: PathBuf,
     /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
     /// prove` and `ply review` start one and hand its answer over.
-    pub front: Option<crate::driver::HandedFront>,
+    pub front: Option<crate::driver::LoadedAnalysis>,
     /// The obligations the program owes, as it built them.
     pub obligations: Vec<Obligation>,
     /// What `--host` binds, which a `law/host` is discharged against; `None` without it, which
@@ -185,7 +185,7 @@ impl HostHandler for Site {
             ("configure", [options, front, world]) => {
                 let mut job = job_of(options, span)?;
                 job.hermetic = self.hermetic;
-                job.front = Some(crate::driver::handed_front_of(front, span)?);
+                job.front = Some(crate::driver::loaded_analysis_of(front, span)?);
                 job.obligations =
                     crate::engine::obligations_of(ply_eval::decode::At::new("the world", world))
                         .map_err(|e| unread_world(&e, span))?;
@@ -575,9 +575,9 @@ fn load(job: &Job) -> Result<Loaded, LoadError> {
         });
     };
     if job.hermetic {
-        crate::driver::load_over_front_in(crate::load::tidy(&job.path), front)
+        crate::driver::load_over_analysis_in(crate::load::tidy(&job.path), front)
     } else {
-        crate::driver::load_over_front(&job.path, front)
+        crate::driver::load_over_analysis(&job.path, front)
     }
 }
 

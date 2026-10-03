@@ -1,6 +1,6 @@
 //! What this binary ships: the `ply` program built from `crates/ply-cli/ply`.
 
-use ply_codegen::c::{bundle, producer};
+use ply_codegen::c::stage;
 use ply_eval::{Diagnostic, Span, codes};
 use ply_machine::runnable::{self, Runnable};
 use std::path::{Path, PathBuf};
@@ -60,8 +60,8 @@ pub fn identity() -> String {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"ply program 1\0");
             for part in [
-                producer::digest_of(&program_sources()),
-                producer::digest_of(ply_machine::shelf::sources()),
+                ply_machine::builds::digest_of(&program_sources()),
+                ply_machine::builds::digest_of(ply_machine::shelf::sources()),
                 ply_codegen::c::runtime_digest().to_string(),
             ] {
                 hasher.update(part.as_bytes());
@@ -75,7 +75,7 @@ pub fn identity() -> String {
 /// Where what `identity` names is kept between runs, beside the emitter's own stages: the sources
 /// laid out, and the runnable the builder made of them when no committed one serves.
 pub fn stage() -> PathBuf {
-    bundle::stage_dir(&format!("cli-{}", identity()))
+    stage::stage_dir(&format!("cli-{}", identity()))
 }
 
 /// The digest the committed program was built from, when one is committed at all.
@@ -106,7 +106,7 @@ pub fn program() -> Result<Runnable, Diagnostic> {
         ply_codegen::c::sweep::used(&stage());
         return Ok(program);
     }
-    crate::builder::build(&laid_out()?, ROOT, "ply.main", &staged, "cli")?;
+    ply_machine::builds::build(&laid_out()?, ROOT, "ply.main", &staged, "cli")?;
     let started = std::time::Instant::now();
     let bytes = std::fs::read(&staged)
         .map_err(|e| unbuilt(format!("what the builder made could not be read: {e}")))?;
