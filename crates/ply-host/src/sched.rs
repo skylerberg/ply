@@ -37,6 +37,10 @@ fn path_of(op: &str) -> &'static str {
         "join" => "ply_host::sched::join",
         "await" => "ply_host::sched::await",
         "cancel" => "ply_host::sched::cancel",
+        "channel" => "ply_host::sched::channel",
+        "send" => "ply_host::sched::send",
+        "recv" => "ply_host::sched::recv",
+        "close" => "ply_host::sched::close",
         _ => "ply_host::sched::yield",
     }
 }

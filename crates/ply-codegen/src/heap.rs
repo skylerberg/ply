@@ -1422,10 +1422,10 @@ pub fn share(words: &[Word]) -> bool {
 }
 
 /// Whether a bridged value may be held by another thread: a cell is a slot of this entry's arena,
-/// and a task a handle into this thread's scheduler.
+/// and a task or a channel a handle into this thread's scheduler.
 fn crosses_threads(v: &Value) -> bool {
     match v {
-        Value::Cell(_) | Value::Task(_) => false,
+        Value::Cell(_) | Value::Task(_) | Value::Chan(_) => false,
         Value::Secret(inner) => crosses_threads(inner),
         Value::Closure(c) => match &c.kind {
             ClosureKind::Native { captured, .. } => captured.iter().all(crosses_threads),
@@ -1810,6 +1810,7 @@ fn rank(w: Word) -> u8 {
                 Value::Closure(_) => 11,
                 Value::Cell(_) => 12,
                 Value::Task(_) => 13,
+                Value::Chan(_) => 18,
                 Value::Secret(_) => 14,
                 Value::Fixed(_) => 15,
                 Value::Char(_) => 16,

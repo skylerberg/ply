@@ -132,7 +132,7 @@ An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ 
 `std.show`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
 writes it (§13.38). The two spellings are one definition with one hash. A hole is any expression,
 strings and braces included, and `{{` and `}}` are braces of the text; a lone `}` is `E0001`. A
-hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Cell` or a `Task` in one
+hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Cell`, a `Task` or a `Chan` in one
 is `E0206`. A module that interpolates imports `std.show` itself, under a name no source can
 write, so `std.show` and the modules it imports cannot interpolate.
 
@@ -444,8 +444,8 @@ with `array_new` or `array_of_list` (§12.1). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
 written `#[a, b]`. It iterates in `compare` order. Its key type
-must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell` and
-`Task` are refused (`E0206`).
+must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
+`Task` and `Chan` are refused (`E0206`).
 
 ### 4.4 Sum types
 
@@ -525,10 +525,10 @@ A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
 ordered, and reaches a host operation only if that operation's registration
 allows it (`E0439`).
 
-**`Cell<a>`** (§7) and **`Task<a>`** (§9) are branded by their region and cannot
-outlive it; the brand prints as `Cell[users]<Int>`. A declaration is outside
-every region, so a variant's field or an operation's parameter or result that
-mentions either, at any depth, is `E0446`. Take it as a type parameter instead,
+**`Cell<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are branded by their
+region and cannot outlive it; the brand prints as `Cell[users]<Int>`. A
+declaration is outside every region, so a variant's field or an operation's
+parameter or result that mentions any of them, at any depth, is `E0446`. Take it as a type parameter instead,
 `type Held<t> = Held(t)`: the type argument carries the brand where the escape
 checks see it.
 
@@ -849,9 +849,9 @@ their rows: given `fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / 
 `both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`, and
 `[|| a.x(), || b.y()]` is a `List<() -> Unit / {a.x, b.y}>`.
 
-Inside a function's parameter, a `Cell`, a `Task` or a sum type the program
-declares, rows must match exactly, because a function held there can be handed
-what its own type does not admit: a parameter typed
+Inside a function's parameter, a `Cell`, a `Task`, a `Chan` or a sum type the
+program declares, rows must match exactly, because a function held there can be
+handed what its own type does not admit: a parameter typed
 `() -> Unit / {net.send[conn]}` is not one typed `() -> Unit / {net.write[conn]}`,
 in either direction.
 
@@ -1003,24 +1003,24 @@ clause answering an operation the task performs runs on the task's behalf, so
 under an older scheduler it may not touch the region's cells either. This judges
 the spawns a body performs itself, not those of a function it calls.
 
-A task, in turn, may be kept only in a cell younger than the `simulate` region
-that spawned it. A `simulate` region may not write a cell of a region opened
-around it while that cell can hold a `Task`, whether it writes the cell itself
-or calls a function whose row writes it: keep the task in a cell opened inside
-the region, or join it there and store what it answers. Nor may a task come in
-from outside: the region may not name a binding from outside it whose value
-holds a `Task` (a parameter, or a local, whether the body or a closure inside it
-names it), nor read a cell of a region opened around it while that cell can hold
-one (`E0413`, §9).
+A task or a channel, in turn, may be kept only in a cell younger than the
+`simulate` region that made it. A `simulate` region may not write a cell of a
+region opened around it while that cell can hold a `Task` or a `Chan`, whether it
+writes the cell itself or calls a function whose row writes it: keep the handle in
+a cell opened inside the region, or finish with it there and store what it gave.
+Nor may one come in from outside: the region may not name a binding from outside
+it whose value holds a `Task` or a `Chan` (a parameter, or a local, whether the
+body or a closure inside it names it), nor read a cell of a region opened around
+it while that cell can hold one (`E0413`, §9).
 
 * `E0201`: the cell escapes its `with_cell[r]` region.
 * `E0446`: a value branded by the region outlives it (stored in an older
   binding, handed to an operation, or reached by a task whose scheduler is
   older than the region, through the closure it runs or a handler around its
   spawn), a task is stored in a cell older than its `simulate` region, or a
-  declared type's field or an operation's signature mentions a `Cell` or a
-  `Task` (§4.6).
-* `E0449`: a region handle (a cell, a task, or the continuation a clause's
+  declared type's field or an operation's signature mentions a `Cell`, a
+  `Task` or a `Chan` (§4.6).
+* `E0449`: a region handle (a cell, a task, a channel, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
   function's, so this is the one check that sees it.
@@ -1142,7 +1142,11 @@ nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write join<a>(t: Task<a>) -> a
                        write yield() -> Unit
                        write cancel<a>(t: Task<a>) -> Bool
-                       write await<a>(t: Task<a>) -> Option<a> }
+                       write await<a>(t: Task<a>) -> Option<a>
+                       write channel<a>(capacity: Int) -> Chan<a>
+                       write send<a>(c: Chan<a>, x: a) -> Bool
+                       write recv<a>(c: Chan<a>) -> Option<a>
+                       write close<a>(c: Chan<a>) -> Unit }
 nondet effect clock  { read  now() -> Instant
                        write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
@@ -1156,16 +1160,18 @@ effect sim           { read  seed() -> Int }
 * A task performs against the handlers around its `task.spawn`, so a clause it
   reaches touches only the cells the task itself may (§7); a clause that binds
   `resume` is unreachable from a task (`E0502`).
-* `E0413`: a `Task` escapes in the region's answer: directly, inside a value,
-  or inside a closure that captured it. A closure's type shows a captured task
-  only as the `task.join` in its row, or the `sim.read` of a `simulate` it opens
-  to join one, so a function whose row carries either may not leave the region.
-  A task from outside may not come in either: the region may not name a binding
-  from outside it whose value holds a `Task`, nor read one from a cell older
-  than the region (§7). Every region numbers its own tasks, so a handle that
+* `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
+  inside a value, or inside a closure that captured it. A closure's type shows a
+  captured task only as the `task.join`, `task.await` or `task.cancel` in its
+  row, a captured channel as its `task.send`, `task.recv` or `task.close`, and
+  either as the `sim.read` of a `simulate` it opens to use one, so a function
+  whose row carries any of these may not leave the region. A task or channel
+  from outside may not come in either: the region may not name a binding from
+  outside it whose value holds one, nor read one from a cell older than the
+  region (§7). Every region numbers its own tasks and channels, so a handle that
   reaches another region past the checker, in a closure or through a type
   parameter, fails there at run time with `E0413` rather than name one of that
-  region's tasks. `E0446`: a task is stored in a cell older than the region
+  region's. `E0446`: a task is stored in a cell older than the region
   (§7). `E0414`: no progress, or a spent step budget. `E0416`: nested
   `simulate`. `E0425`: a host operation inside the region, refused before the
   handler runs and whether or not it is bound; the region answers `task`,
@@ -1183,6 +1189,20 @@ cancelled task has nothing to answer and raises `E0502`. A task cannot cancel
 itself or the region's body. A deadline is the two together: one task sleeps and
 cancels the other, which a third awaits. Every step a cancelled task took is read
 against the cancel, so the search tries cancelling it earlier and later.
+
+`task.channel(n)` makes a channel holding up to `n` values no receiver has taken;
+`0` is a rendezvous, where a send waits for the receive that takes it. A send
+waits while the channel is full and answers `true` once its value is queued or
+handed over, and a receive waits while it is empty and answers the oldest value
+sent. `task.close(c)` ends sending: a waiting receiver hears `None` and a waiting
+sender `false`, a later send answers `false` without sending, and receives take
+what was queued before the close, then `None`. Closing twice changes nothing,
+and a negative capacity raises `E0502`. Cancelling a task that waits on a
+channel lets go of its wait, and a value it was sending is dropped. Every
+operation on one channel is ordered against every other on it, so the search
+tries each order two senders or two receivers could take. A race is one channel:
+each worker sends what it answers, the first receive wins, and cancelling the
+others stops them.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -1330,11 +1350,11 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 `where derivable(D, p)` goes after the row and before any `requires`. Codecs are
 plain values: `json::decode_bytes(body, order_json())`.
 
-`E0206` names the field that blocks a derivation: function types, `Cell` and
-`Task` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`, `bin`,
-`show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json` and
-`bin` need their module imported (`import std.json`, `import std.bin`), or the
-`derive` is `E0206`; `show` imports `std.show` itself.
+`E0206` names the field that blocks a derivation: function types, `Cell`, `Task`
+and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
+`bin`, `show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json`
+and `bin` need their module imported (`import std.json`, `import std.bin`), or
+the `derive` is `E0206`; `show` imports `std.show` itself.
 
 ## 12. Builtins
 
@@ -2727,7 +2747,7 @@ pub type Value =
   | VFixed(String, U128) | VChar(Char) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
   | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
   | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
-  | VArray(List<Value>)
+  | VArray(List<Value>) | VChan(Int)
 pub type Field = { name: String, value: Value }
 pub type Entry = { key: Value, value: Value }
 pub type Fun =
@@ -3257,7 +3277,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0412` | nondeterministic effect in a deterministic test |
-| `E0413` | `Task` escapes its region, or enters another |
+| `E0413` | `Task` or `Chan` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
 | `E0415` | replay did not reproduce the schedule (Ply's fault) |
 | `E0416` | nested `simulate` |
