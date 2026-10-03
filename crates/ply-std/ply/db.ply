@@ -61,7 +61,9 @@ pub type Answer = | Rows(List<Row>) | Count(Int) | Failed(DbError)
 
 pub type Rollback = { reason: String, error: Option<DbError> }
 
-// A `db.rollback` anywhere inside the body, however deep, discards the rest of it.
+// A `db.rollback` anywhere inside the body, however deep, discards the rest of it, and the
+// transaction is aborted however the body ends short of its commit: a clause unwinding out of it, or
+// a cancel, included.
 pub fn transaction<a | e>(
   level: Isolation,
   access: Access,
@@ -69,34 +71,37 @@ pub fn transaction<a | e>(
 ) -> Result<a, Rollback> / {db.begin, db.commit, db.abort | e} =
   match db.begin(level, access) {
     Failed(err) -> Err({ reason: "begin", error: Some(err) }),
-    _ -> match attempt(body) {
-      Err(rolled) -> Err(rolled),
-      Ok(value) -> match db.commit() {
-        Failed(err) -> Err({ reason: "commit", error: Some(err) }),
-        _ -> Ok(value),
-      },
+    _ -> with_cell[settled](false) { committing ->
+      bracket(|| (), |u: Unit| if !cell_get(committing) { aborted() }, |u: Unit|
+        match attempt(body) {
+          Err(rolled) -> Err(rolled),
+          Ok(value) -> {
+            cell_set(committing, true);
+            match db.commit() {
+              Failed(err) -> Err({ reason: "commit", error: Some(err) }),
+              _ -> Ok(value),
+            }
+          },
+        })
     },
   }
 
-fn attempt<a | e>(body: () -> a / e) -> Result<a, Rollback> / {db.abort | e} =
-  match handle {
-      Ok(body())
-    } with {
-      db.rollback(reason) resume k -> Err({ reason: reason, error: None }),
-    } {
-    Err(rolled) -> {
-      db.abort();
-      Err(rolled)
-    },
-    Ok(value) -> Ok(value),
+fn attempt<a | e>(body: () -> a / e) -> Result<a, Rollback> / e =
+  handle {
+    Ok(body())
+  } with {
+    db.rollback(reason) resume k -> Err({ reason: reason, error: None }),
   }
 
 // A transaction that always rolls back, whatever the body did.
-pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.begin, db.abort | e} = {
-  assert(opened(db.begin(ReadCommitted, ReadWrite)));
-  let value = body();
+pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.begin, db.abort | e} =
+  bracket(|| assert(opened(db.begin(ReadCommitted, ReadWrite))), |u: Unit| aborted(), |u: Unit|
+    body())
+
+// Whatever the server said, the transaction is over: its answer is a warning at most.
+fn aborted() -> Unit / {db.abort} = {
   db.abort();
-  value
+  ()
 }
 
 fn opened(a: Answer) -> Bool = match a { Failed(_) -> false, _ -> true }
@@ -435,8 +440,9 @@ test "a sandbox nested in a transaction keeps the transaction's rollback" {
           2
         }));
       assert_eq(out, Err({ reason: "give up", error: None }));
-      // The sandbox's own abort was part of the discarded continuation.
-      assert_eq(cell_get(j), ["begin", "begin", "insert one", "abort"])
+      // The rollback unwinds through the sandbox, which aborts on its way out, then the
+      // transaction's own abort follows.
+      assert_eq(cell_get(j), ["begin", "begin", "insert one", "abort", "abort"])
     } with {
       db.begin(level, access) -> {
         cell_set(j, push(cell_get(j), "begin"));

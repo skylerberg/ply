@@ -164,6 +164,8 @@ pub enum Builtin {
     Reflect,
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
     Digest,
+    /// `bracket(acquire, release, body)`: `release` runs on every exit from `body` but a failure.
+    Bracket,
     FloatOfInt,
     /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
     IntOfFloat,
@@ -302,6 +304,7 @@ impl Builtin {
             "array_set" => Builtin::ArraySet,
             "reflect" => Builtin::Reflect,
             "digest" => Builtin::Digest,
+            "bracket" => Builtin::Bracket,
             "float_of_int" => Builtin::FloatOfInt,
             "int_of_float" => Builtin::IntOfFloat,
             "floor" => Builtin::Floor,
@@ -454,6 +457,7 @@ impl Builtin {
             Builtin::ArraySet => "array_set",
             Builtin::Reflect => "reflect",
             Builtin::Digest => "digest",
+            Builtin::Bracket => "bracket",
             Builtin::FloatOfInt => "float_of_int",
             Builtin::IntOfFloat => "int_of_float",
             Builtin::Floor => "floor",
@@ -612,6 +616,7 @@ impl Builtin {
             | Builtin::ArrayGet => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
+            | Builtin::Bracket
             | Builtin::ListSet
             | Builtin::ArraySet
             | Builtin::BytesSlice
@@ -793,6 +798,7 @@ impl Builtin {
             Builtin::ArraySet,
             Builtin::Reflect,
             Builtin::Digest,
+            Builtin::Bracket,
             Builtin::FloatOfInt,
             Builtin::IntOfFloat,
             Builtin::Floor,
@@ -924,7 +930,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::MapFold
         | Builtin::CellGet
         | Builtin::CellSet
-        | Builtin::CellUpdate => Err(answered_by_the_tier(b, span)),
+        | Builtin::CellUpdate
+        | Builtin::Bracket => Err(answered_by_the_tier(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
