@@ -100,24 +100,33 @@ pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, Load
 
 /// [`load_over_front`] with the root decided, so nothing on disk is read.
 pub fn load_over_front_in(root: PathBuf, handed: &HandedFront) -> Result<Loaded, LoadError> {
+    load_over_front_taken(root, handed.clone())
+}
+
+/// [`load_over_front_in`] taking the front it is handed, so nothing in it is copied.
+pub fn load_over_front_taken(root: PathBuf, handed: HandedFront) -> Result<Loaded, LoadError> {
     let mut sources = SourceMap::new();
     let mut states = Vec::with_capacity(handed.files.len());
-    for file in &handed.files {
+    for file in handed.files {
         let path = PathBuf::from(&file.path);
         let module = ModuleName::from_dotted(&file.name);
-        let source = sources.add(&path, file.text.clone());
+        let source = sources.add(&path, file.text);
+        let text = sources
+            .get(source)
+            .map(|f| f.text.clone())
+            .unwrap_or_else(|| "".into());
         states.push(FileState {
             path,
-            module: module.clone(),
-            source,
-            text: Arc::from(file.text.as_str()),
             shipped: crate::shelf::source(&module).is_some(),
+            module,
+            source,
+            text,
         });
     }
     Driver {
         root,
         incremental: handed.cached,
-        answer: Some(handed.answer.clone()),
+        answer: Some(handed.answer),
         project: SourceMap::new(),
         manifest: None,
         packages: Vec::new(),

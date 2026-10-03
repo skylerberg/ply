@@ -1,15 +1,13 @@
 // `induct` — induction over an `Int` or `List` binder, for a claim about self-recursive definitions.
 //
-// Each recursive definition the claim reaches is first shown to terminate: some `Int` parameter is
-// non-negative and strictly smaller at every self call (or some list parameter is a tail of the one
-// it was entered with), under the conditions on the way to it. Such a definition is total, so its
-// calls are values and its body may be unrolled with `f(x̄) == body(x̄)` in hand. The claim is then
+// Each recursive definition the claim reaches must be one the checker saw end: every call it makes
+// of itself descends a measure. Such a definition is total, so its calls are values and its body may
+// be unrolled with `f(x̄) == body(x̄)` in hand. The claim is then
 // proved at the base case, and at the step from its own instance one down, whose recursive calls are
 // left as they are so the unrolled conclusion meets them by congruence.
 
 import compiler.code (Code)
-import context (Context, signature, self_recursive)
-import domain (Ty, Fn)
+import context (Context, self_recursive)
 import goal (Goal, Binder, Limits, Proof, Assertion, Ran, run, conjunction, domain_inhabited,
              uninterpreted_sorts, int_ranges, ranges_of, set_of, with_true, appended)
 import lower (Lowering, L, Blocker, RecursiveCall, Induction, lowering, bind_symbolic, lower_root,
@@ -37,31 +35,25 @@ pub fn attempt(
   if len(recursive) == 0 { { proof: None, blockers: blockers } } else {
     let checked = fold(
       recursive,
-      { ok: true, budget: budget, spent: spent, blockers: blockers },
-      |st: { ok: Bool, budget: Int, spent: Int, blockers: List<Blocker> }, name: String|
+      { ok: true, blockers: blockers },
+      |st: { ok: Bool, blockers: List<Blocker> }, name: String|
         if !st.ok { st } else {
-          match terminating(cx, name, limits, st.budget) {
+          match self_recursive(cx, name) {
             None ->
               {
-                ..st,
                 ok: false,
                 blockers: declined(
                   st.blockers,
                   "`" ++ name ++ "` is not a pure definition calling only itself",
                 ),
               },
-            Some(t) -> {
-              let after = { ..st, spent: st.spent + t.used, budget: st.budget - t.used };
-              if t.terminates { after } else {
-                {
-                  ..after,
-                  ok: false,
-                  blockers: declined(
-                    after.blockers,
-                    "no `Int` argument of `" ++ name
-                      ++ "` is non-negative and smaller at every self call",
-                  ),
-                }
+            Some(def) -> if def.ends { st } else {
+              {
+                ok: false,
+                blockers: declined(
+                  st.blockers,
+                  "the checker does not see every call `" ++ name ++ "` makes of itself descend",
+                ),
               }
             },
           }
@@ -71,13 +63,7 @@ pub fn attempt(
       let result_slot = match g.result { Some(_) -> len(g.binders) - 1, None -> 0 - 1 };
       let walked = fold(
         range(0, len(g.binders)),
-        {
-          done: false,
-          proof: None,
-          budget: checked.budget,
-          spent: checked.spent,
-          blockers: checked.blockers,
-        },
+        { done: false, proof: None, budget: budget, spent: spent, blockers: checked.blockers },
         |st: { done: Bool, proof: Option<Proof>, budget: Int, spent: Int, blockers: List<Blocker> }, slot: Int|
           if st.done { st } else {
             match list_at(g.binders, slot) {
@@ -122,87 +108,6 @@ pub fn attempt(
     }
   }
 }
-
-// Whether `name` terminates by some `Int` or list parameter decreasing at every self call, and the
-// budget it took to decide; `None` when the definition is not one induction unrolls.
-fn terminating(
-  cx: Context,
-  name: String,
-  limits: Limits,
-  budget: Int,
-) -> Option<{ terminates: Bool, used: Int }> / {abort.raise} =
-  match self_recursive(cx, name) {
-    None -> None,
-    Some(def) -> match signature(cx, name) {
-      None -> None,
-      Some(s) -> match s.ty {
-        Fn(params, _, _) -> if len(params) != def.params { None } else {
-          Some(
-            without_done(
-              fold(
-                range(0, len(params)),
-                { terminates: false, used: 0, done: false },
-                |st: { terminates: Bool, used: Int, done: Bool }, slot: Int|
-                  if st.done { st } else {
-                    match list_at(params, slot) {
-                      None -> st,
-                      Some(ty) -> if !(is_con(ty, "Int") || list_elem(ty) != None)
-                          || budget <= st.used { st } else {
-                        let bound = fold(
-                          params,
-                          { lw: lowering(no_rules(), limits.unfold_depth), ids: [] },
-                          |acc: { lw: Lowering, ids: List<Int> }, p: Ty| {
-                            let r = bind_symbolic(acc.lw, p, cx);
-                            { lw: r.lw, ids: push(acc.ids, r.id) }
-                          },
-                        );
-                        let measured = {
-                          ..bound.lw,
-                          measure: Some({
-                            def: name,
-                            slot: slot,
-                            bound: match list_at(bound.ids, slot) { Some(t) -> t, None -> 0 },
-                          }),
-                        };
-                        let body = lower_root(measured, cx, def.body, bound.ids);
-                        // Only the measure: whether the body raises is judged where it is unrolled.
-                        if body.lw.float || len(body.lw.measures) == 0 {
-                          { terminates: false, used: st.used, done: true }
-                        } else {
-                          let all = conjunction(body.lw.ts, body.lw.measures);
-                          match all.id {
-                            None -> st,
-                            Some(a) -> {
-                              let ranges = int_ranges(all.ts, None, map_new());
-                              let r = run(
-                                ranges.ts,
-                                cx,
-                                body.lw.rules,
-                                budget - st.used,
-                                limits,
-                                push(ranges.out, { term: a, polarity: false }),
-                              );
-                              let used = st.used + (budget - st.used - r.left);
-                              if r.answer == Closed { { terminates: true, used: used, done: true } }
-                              else { { terminates: false, used: used, done: false } }
-                            },
-                          }
-                        }
-                      },
-                    }
-                  },
-              ),
-            ),
-          )
-        },
-        _ -> None,
-      },
-    },
-  }
-
-fn without_done(
-  st: { terminates: Bool, used: Int, done: Bool },
-) -> { terminates: Bool, used: Int } = { terminates: st.terminates, used: st.used }
 
 type Inducted = { proof: Option<Proof>, used: Int, blockers: List<Blocker> }
 
