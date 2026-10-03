@@ -1,4 +1,4 @@
-//! `simulate` and production regions in the compiled tier: each task runs on its own stack and
+//! `simulate` and production regions in the C backend: each task runs on its own stack and
 //! switches back to the machine's scheduler loop to perform `task`, `clock` or `random`.
 
 use crate::heap::{self, Word};

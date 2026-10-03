@@ -145,7 +145,7 @@ fn a_pinned_region_parked_and_reopened_costs_the_allocator_nothing_once_warm() {
     assert_eq!((arena.total_depth(), arena.live()), (0, 0));
 }
 
-/// Renewing between entries, as the tier does, keeps what earlier entries warmed: the chunks, the
+/// Renewing between entries, as the backend does, keeps what earlier entries warmed: the chunks, the
 /// heap of free indices and the list of taken slots.
 #[test]
 fn renewing_a_warm_store_costs_the_allocator_nothing() {

@@ -77,7 +77,7 @@ pub use sched::TaskHandle;
 pub use semantics::strict_binary;
 pub use sim::{
     Access, Answer, Clock, Domain, Handlers, OpSignature, Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed,
-    SimTy, Sleep, StepFootprint, Stream, TaskId, Wake,
+    SimType, Sleep, StepFootprint, Stream, TaskId, Wakeup,
 };
 pub use span::{
     Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Sparse, Symbol,
