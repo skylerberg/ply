@@ -10,6 +10,7 @@ import appends (broken_promises)
 import builder (builder)
 import cache (Front)
 import env (env)
+import loads (shelf_stamps)
 import results
 import std.random (entropy)
 import std.fs (fs, File, mem_kind, mem_list, mem_modified, mem_of, mem_size)
@@ -215,6 +216,14 @@ fn shared_texts(c: Case) -> List<String> =
 // The shared footprint, as the printer spells a footprint.
 fn shared_of(c: Case) -> String = "{" ++ joined(shared_texts(c), ", ") ++ "}"
 
+// Families this binary answers from what it ships rather than from what it is asked: the same on
+// every run of one build, and in no pass key, which is the test's hash under the runtime stamp.
+fn binary_families() -> List<String> = ["shipped"]
+
+// The atoms of a test's footprint whose answers no pass key covers, printed.
+fn unkeyed_texts(c: Case) -> List<String> =
+  map(filter(c.atoms, |x: Printed| said(binary_families(), x.atom.effect)), |x: Printed| x.text)
+
 /// The classes the named tests share, coloured from the atoms each row carries.
 fn classes_of(p: Program, runs: List<Int>) -> List<List<Int>> =
   group_by_conflict(
@@ -309,6 +318,8 @@ pub type Program = {
   warnings: List<Diag>,
   // What the machine was configured with, placed under the key this report gives it.
   options: Json,
+  // The runtime stamp a pass is filed under beside its test's hash; `None` when the run files none.
+  filed_under: Option<String>,
 }
 
 pub type Backend = {
@@ -827,8 +838,34 @@ fn case_line(s: Style, p: Program, r: Ran, c: Case, d: Decided) -> String = {
     ++ " "
     ++ dim(
       s,
-      "isolation: " ++ iso ++ explain_atoms(iso, c) ++ (if c.seeded { " · searched" } else { "" }),
+      "isolation: " ++ iso ++ explain_atoms(iso, c) ++ (if c.seeded { " · searched" } else { "" })
+        ++ unkeyed_note(c),
     )
+}
+
+fn unkeyed_note(c: Case) -> String =
+  match unkeyed_texts(c) { [] -> "", xs -> " · outside its key: {" ++ joined(xs, ", ") ++ "}" }
+
+// What a pass is filed under, and the tests that read what no key covers.
+fn key_lines(s: Style, p: Program) -> List<String> = {
+  let filed = match p.filed_under {
+    Some(stamp) ->
+      "a pass is filed under its test's hash and the runtime stamp " ++ short_of(Some(stamp)),
+    None -> "no pass is filed: `--no-cache` reads and writes none",
+  };
+  let reading = len(filter(p.cases, |c: Case| len(unkeyed_texts(c)) > 0));
+  appended(["", ind() ++ dim(s, "key"), ind() ++ "  " ++ dim(s, filed)], if reading == 0 { [] }
+  else {
+    [
+      ind() ++ "  "
+        ++ dim(
+          s,
+          count_of(reading, "test") ++ " read what this binary ships ("
+            ++ joined(binary_families(), ", ")
+            ++ "), which is in no key: a change to it reruns none of them",
+        ),
+    ]
+  })
 }
 
 fn reasons_seen(p: Program, d: Decided) -> List<String> =
@@ -939,7 +976,7 @@ fn explain_lines(s: Style, p: Program, r: Ran, dec: Decided) -> List<String> =
       appended(
         appended(
           appended([""], map(p.cases, |c: Case| case_line(s, p, r, c, dec))),
-          why_lines(s, p, dec),
+          appended(why_lines(s, p, dec), key_lines(s, p)),
         ),
         search_lines(s, p, dec),
       ),
@@ -1244,6 +1281,8 @@ fn case_json(r: Ran, c: Case, d: Decided) -> Json =
     // seed: what a program re-colouring the run needs, without parsing a printed atom.
     { key: "contends", value: Array(map(shared(atoms_of(c)), atom_json)) },
     { key: "seeded", value: Bool(c.seeded) },
+    // Footprint atoms this binary answers from what it ships, which no pass key covers.
+    { key: "unkeyed", value: strings(unkeyed_texts(c)) },
   ])
 
 fn atom_json(a: Atom) -> Json =
@@ -1435,6 +1474,7 @@ fn selection_json(p: Program, r: Ran, d: Decided) -> Json = {
     { key: "selected", value: num(selected_count(p, d)) },
     { key: "cached", value: num(cached_count(p, d)) },
     { key: "filtered_out", value: num(p.filtered_out) },
+    { key: "filed_under", value: opt_str(p.filed_under) },
     { key: "groups", value: Array(map(range(0, len(d.classes)), |i: Int| group_json(d, i))) },
     // A host-backed test counts only under `host`, since it is not isolated.
     { key: "isolated", value: num(c.isolated) },
@@ -1888,9 +1928,11 @@ fn program_of(
   root: String,
   scope: Scope,
   opened: List<Diag>,
+  filed_under: Option<String>,
 ) -> Program =
   {
     root: root,
+    filed_under: filed_under,
     files: map(t.program.places, |pl: Place| pl.path),
     places: t.program.places,
     modules: map(modules_of(t.program, w), |m: { name: String, path: String }|
@@ -1962,7 +2004,8 @@ fn selected(
     let opened = if options.no_cache { [] } else { ledger.opened() };
     let selecting = time.elapsed_us();
     let scope = scope_of(w, options);
-    let p = program_of(options, t, w, root_of(flags.paths), scope, opened);
+    let filed_under = if options.no_cache { None } else { Some(shelf_stamps().runtime) };
+    let p = program_of(options, t, w, root_of(flags.paths), scope, opened, filed_under);
     // Which tests run is the program's to say, and so is every key the store is asked about or a
     // pass is filed under: the runtime answers what the store holds and does what it is told.
     let searching = machine::sim_plan_of(options.sim);
@@ -2999,6 +3042,7 @@ fn a_program(cases: List<Case>) -> Program =
     filtered_out: 0,
     warnings: [],
     options: Null,
+    filed_under: Some("aabbccddeeff00112233"),
   }
 
 fn an_outcome(index: Int, name: String, status: String) -> Outcome =
@@ -3341,6 +3385,41 @@ test "`--explain` says why each test ran, once per reason, and how the groups fo
   // One class, holding the one test that runs: a cached test shares a worker with nobody.
   assert(said(lines, "     group 0 · 1 test · {}"));
   assert(said(lines, "       one"))
+}
+
+// What `shipped` answers is the binary's, so a test reading it is cached across a change to it.
+test "`--explain` says what a pass is filed under and names what no key covers" {
+  let reads = {
+    ..a_case(0, "one"),
+    atoms: [{ atom: { effect: "shipped", resource: "", writes: false }, text: "shipped.read" }],
+  };
+  let p = a_program([reads, a_case(1, "two")]);
+  let keys = [a_key(0, "one", false, false, false), a_key(1, "two", false, false, false)];
+  let lines = explain_lines(plain(), p, a_run([], 0), a_decided(p, keys));
+  assert(string_contains(at(lines, 1, ""), " · outside its key: {shipped.read}"));
+  assert(!string_contains(at(lines, 2, ""), "outside its key"));
+  assert(said(lines, "   key"));
+  assert(
+    said(lines, "     a pass is filed under its test's hash and the runtime stamp aabbccddeeff"),
+  );
+  assert(
+    said(
+      lines,
+      "     1 test read what this binary ships (shipped), which is in no key: a change to it reruns none of them",
+    ),
+  );
+  let uncached = explain_lines(
+    plain(),
+    { ..p, filed_under: None },
+    a_run([], 0),
+    a_decided(p, keys),
+  );
+  assert(said(uncached, "     no pass is filed: `--no-cache` reads and writes none"));
+  let text = to_string(
+    answered(plain(), from_argv("test", ["--json"]), p, a_run([], 0), [], a_decided(p, keys)).json,
+  );
+  assert(string_contains(text, "\"filed_under\":\"aabbccddeeff00112233\""));
+  assert(string_contains(text, "\"unkeyed\":[\"shipped.read\"]"))
 }
 
 test "the document keys off `command` and `exit_code` and names the schema it publishes" {

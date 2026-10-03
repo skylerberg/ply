@@ -3,7 +3,8 @@
 
 import compiler.tycore (Atom, Row, RNamed, RSingleton, Type, TyVar, TyCon, TyFn, Scheme, Printer,
                         printer_new, reserve_atoms, print_atom_list, print_row, print_scheme,
-                        atom_text, atom_covers, row_empty, row_closed, row_is_pure, append)
+                        atom_text, atom_covers, atoms_covered, row_empty, row_closed, row_is_pure,
+                        append)
 import compiler.types (Mode, MRead, MWrite)
 import compiler.infer (DefInfo)
 import compiler.front (SetView)
@@ -103,16 +104,58 @@ pub fn fill(
     push(out.lines, trim_end(out.line))
   }
 
-// `/ {a, b, c}`, wrapped, with continuations aligned inside the brace.
-fn row_lines(indent: Int, gutter: String, r: RowText) -> List<String> =
+// `/ {a, b, c}`, wrapped, with continuations aligned inside the brace. A last atom too long to take
+// the row variable beside it leaves the variable a line of its own.
+fn row_lines(indent: Int, gutter: String, r: RowText) -> List<String> = {
+  let room = width() - indent;
   match r.tail {
-    Some(t) -> if len(r.atoms) == 0 { [gutter ++ "/ " ++ t] }
-    else { fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, " | " ++ t ++ "}", width() - indent) },
-    None -> fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, "}", width() - indent),
+    Some(t) -> if len(r.atoms) == 0 { [gutter ++ "/ " ++ t] } else {
+      let tailed = fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, " | " ++ t ++ "}", room);
+      if fold(tailed, true, |fits: Bool, l: String| fits && string_len(l) <= room) { tailed } else {
+        push(
+          fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, "", room),
+          gutter ++ "   | " ++ t ++ "}",
+        )
+      }
+    },
+    None -> fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, "}", room),
   }
+}
 
-pub fn definition_lines(indent: Int, label_width: Int, label: String, sc: Scheme) -> List<String> = {
-  let sp: Split = split(sc);
+pub fn definition_lines(indent: Int, label_width: Int, label: String, sc: Scheme) -> List<String> =
+  split_lines(indent, label_width, label, split(sc))
+
+// The signature with each atom of its row, and its row variable, marked with how many times a call
+// performs it: `bounded`, or `scaling` with the input.
+pub fn counted_lines(indent: Int, label_width: Int, label: String, d: DefInfo) -> List<String> = {
+  let sp: Split = split(d.scheme);
+  let marked = match ((sp.row, d.scheme.ty)) {
+    (Some(r), TyFn(f)) ->
+      {
+        ..sp,
+        row: Some({
+          atoms: map(range(0, len(r.atoms)), |i: Int|
+            nth(r.atoms, i) ++ " "
+              ++ (match list_at(f.effects.atoms, i) {
+                Some(a) -> class_of(atoms_covered(d.scaling, a)),
+                None -> "",
+              })),
+          tail: match r.tail {
+            Some(t) -> Some(t ++ " " ++ class_of(len(d.repeats) > 0)),
+            None -> None,
+          },
+        }),
+      },
+    _ -> sp,
+  };
+  split_lines(indent, label_width, label, marked)
+}
+
+fn class_of(scaling: Bool) -> String = if scaling { "scaling" } else { "bounded" }
+
+fn nth(xs: List<String>, i: Int) -> String = match list_at(xs, i) { Some(x) -> x, None -> "" }
+
+fn split_lines(indent: Int, label_width: Int, label: String, sp: Split) -> List<String> = {
   let head = pad_right(label, label_width) ++ " : " ++ sp.head;
   match sp.row {
     None -> [head],
@@ -268,6 +311,39 @@ test "a type variable keeps its letter across the split" {
   assert_eq(definition_lines(5, 2, "id", sc), ["id : <a | e>(a) -> a", "     / {log.write | e}"])
 }
 
+fn counted_def(row: Row, scaling: List<Atom>, repeats: List<Int>) -> DefInfo =
+  {
+    ..def_of([], row.atoms, row.atoms),
+    scheme: fn_scheme(row, match row.tail { Some(v) -> [v], None -> [] }),
+    scaling: scaling,
+    repeats: repeats,
+  }
+
+test "each atom and the row variable print with how many times a call performs them" {
+  let query = named(b"db", MRead, Some(b"orders"));
+  let log = named(b"log", MWrite, None);
+  let row: Row = { atoms: [query, log], tail: Some(3) };
+  assert_eq(counted_lines(5, 4, "find", counted_def(row, [query], [0])), [
+    "find : <| e>(Request) -> Response",
+    "       / {db.read[orders] scaling, log.write bounded | e scaling}",
+  ]);
+  assert_eq(counted_lines(5, 4, "find", counted_def(row, [], [])), [
+    "find : <| e>(Request) -> Response",
+    "       / {db.read[orders] bounded, log.write bounded | e bounded}",
+  ])
+}
+
+// The variable is glued to the last atom unless that runs past the column, where it takes a line.
+test "a row variable too wide to sit beside the last atom takes a line of its own" {
+  let long = named(b"a_very_long_effect_name_that_fills_a_line", MWrite, Some(b"a_long_label"));
+  let row: Row = { atoms: [long], tail: Some(3) };
+  assert_eq(counted_lines(5, 4, "wide", counted_def(row, [long], [0])), [
+    "wide : <| e>(Request) -> Response",
+    "       / {a_very_long_effect_name_that_fills_a_line.write[a_long_label] scaling",
+    "          | e scaling}",
+  ])
+}
+
 test "filling never splits an item, even when one item is too wide" {
   let wide = fold(range(0, 90), "", |acc: String, i: Int| acc ++ "a");
   assert_eq(fill("[", " ", [wide, "b"], "]", 20), ["[" ++ wide ++ ",", " b]"]);
@@ -308,6 +384,10 @@ fn def_of(aliases: List<Bytes>, declared: List<Atom>, performed: List<Atom>) -> 
     scheme: fn_scheme(row_empty(), []),
     footprint: declared,
     performed: performed,
+    scaling: [],
+    repeats: [],
+    bounded: [],
+    tail_bounded: false,
     row_aliases: aliases,
     constraints: [],
     spec: [],

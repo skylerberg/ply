@@ -13,12 +13,14 @@ import gen (Types, Generated, generate, generatable, by_name, types_of)
 import obligation (Outcome, Held, Refuted, Vacuous, Unattempted, Defect, Gap, UnhandledEffect,
                    Ungeneratable, Raised, GuardNotSampled, ReachesHost, Evidence, Proof, Sampled,
                    Certificate, Cases, Instantiation, Binding, Tier, Proved, Property, Example,
-                   Vacuity, Unsatisfiable, NoCaseKept, Counter, Fault, Judged, JHeld, JFailed,
-                   JRejected, JRaised, JFaulted, NotDrawn, Law, Pure)
+                   Fitted, Vacuity, Unsatisfiable, NoCaseKept, Counter, Fault, Judged, JHeld,
+                   JFailed, JRejected, JRaised, JFaulted, JMeasured, JSpent, Measured, NotDrawn,
+                   Law, Pure, Outgrown, Unfitted, fit_tier)
+import fit (Fit, sizes, size_limit, fitted, min_fit_sizes, outgrown)
 import rules (Rule, GroundEvaluation, ExhaustiveEnumeration, ExhaustiveInterleaving)
 import shrink (Target, Falsifies, Raises, descend)
 import world (Obligation, World, Binder, Strategy, Interleave, Hosted, Static, Unhandled, Run,
-              Every, Drawn, Points, unsettled, walks)
+              Every, Drawn, Fitting, Points, unsettled, walks)
 import sim.plan
 import sim.plan (Seed, Dpor, seed_text)
 import sim.recording (Interleaving, Step, Passed, Failed, ACell)
@@ -31,9 +33,10 @@ pub type Asked = { claim: Int, obligation: Obligation, settled: Static }
 // Points the runtime judges for one claim, in order, and how.
 pub type Batch = { claim: Int, points: List<List<Value>>, mode: Mode }
 
-// The whole claim until a point settles it; the guard alone until it admits a point; or the guard
-// alone at every point until it raises.
-pub type Mode = | MWhole | MWitness | MDomain
+// The whole claim until a point settles it; the guard alone until it admits a point; the guard
+// alone at every point until it raises; or a cost law's sizes in order, each within so many steps,
+// until one raises or takes more.
+pub type Mode = | MWhole | MWitness | MDomain | MCost(Int)
 
 // What a law over interleavings was searched at, as its evidence says it.
 pub type Searched =
@@ -86,7 +89,7 @@ pub fn discharged<| e>(
         push(acc, {
           claim: a.claim,
           points: p.points,
-          mode: if p.kind == KLaw { MDomain } else { MWhole },
+          mode: match p.kind { KLaw -> MDomain, KCost -> MCost(size_limit()), _ -> MWhole },
         }),
       _ -> acc,
     });
@@ -130,7 +133,7 @@ fn normalized(roots: List<Int>) -> List<Int> =
   })
 
 // What drawing a claim's points was for.
-type Kind = | KSample | KEnum | KHost | KLaw
+type Kind = | KSample | KEnum | KHost | KLaw | KCost
 
 // One claim's points, where each was drawn from, the gap that stopped the draw short, the certificate
 // a kept point would stand, and the domain an enumeration walked.
@@ -171,6 +174,7 @@ fn planned(a: Asked, ts: Types, plan: Plan, host: Bool) -> Work = {
       Some(g) -> WDone(Unattempted(g)),
       None -> WPoints(drawn_for(o, ts, plan, points, KLaw, None)),
     },
+    Fitting -> WPoints(sized()),
     Hosted -> if !host {
       WDone(Unattempted(ReachesHost(match o.footprint { Some(f) -> f, None -> "" })))
     } else {
@@ -197,6 +201,20 @@ fn planned(a: Asked, ts: Types, plan: Plan, host: Bool) -> Work = {
         },
       }
     },
+  }
+}
+
+// A cost law's points: its sizes, smallest first.
+fn sized() -> Pointed = {
+  let points = map(sizes(), |n: Int| [VInt(n)]);
+  {
+    kind: KCost,
+    points: points,
+    at: map(range(0, len(points)), |i: Int| { root: 0, case: i }),
+    stop: None,
+    witness: None,
+    domain: None,
+    generated: len(points),
   }
 }
 
@@ -430,6 +448,7 @@ fn walked(
 fn judged_points(a: Asked, p: Pointed, js: List<Judged>, plan: Plan) -> Judging =
   match p.kind {
     KLaw -> law_kept(a.obligation, p, js),
+    KCost -> measured(a.obligation, p, js),
     KEnum -> enumerated(a.obligation, p, js),
     _ -> sampled(a.obligation, p, js, plan),
   }
@@ -499,6 +518,83 @@ fn enumerated(o: Obligation, p: Pointed, js: List<Judged>) -> Judging = {
       },
   }
 }
+
+// A cost law's sizes in order: each its guard kept is measured, until a run raises, or takes more
+// steps than one size may, which ends the measuring short of a verdict on that size. A raise is the
+// law's gap, as any law's is.
+fn measured(o: Obligation, p: Pointed, js: List<Judged>) -> Judging = {
+  let w = fold(
+    range(0, len(js)),
+    { fit: { measures: [], spent: None }, stop: None },
+    |acc: { fit: Fit, stop: Option<Judging> }, i: Int|
+      match ((acc.stop, acc.fit.spent, list_at(js, i), list_at(p.points, i))) {
+        (None, None, Some(JMeasured(m)), Some(values)) ->
+          {
+            ..acc,
+            fit: {
+              ..acc.fit,
+              measures: push(acc.fit.measures, {
+                size: size_of(values),
+                steps: m.steps,
+                bound: m.bound,
+              }),
+            },
+          },
+        (None, None, Some(JSpent(limit)), Some(values)) ->
+          { ..acc, fit: { ..acc.fit, spent: Some({ size: size_of(values), limit: limit }) } },
+        (None, None, Some(JRejected), _) -> acc,
+        (None, None, Some(JRaised(r)), Some(values)) ->
+          {
+            ..acc,
+            stop: Some(
+              JudgedDone(
+                Unattempted(
+                  Raised({ message: r.message, values: r.values, bindings: bindings(o, values) }),
+                ),
+              ),
+            ),
+          },
+        (None, None, Some(JFaulted(f)), Some(values)) ->
+          {
+            ..acc,
+            stop: Some(
+              JudgedDone(
+                Defect({
+                  code: f.code,
+                  message: f.message,
+                  notes: f.notes,
+                  values: f.values,
+                  bindings: bindings(o, values),
+                }),
+              ),
+            ),
+          },
+        (None, None, Some(_), Some(values)) ->
+          { ..acc, stop: Some(JudgedDone(unmeasured(bindings(o, values)))) },
+        _ -> acc,
+      },
+  );
+  match w.stop { Some(j) -> j, None -> JudgedDone(fit_outcome(w.fit)) }
+}
+
+fn size_of(values: List<Value>) -> Int = match values { [VInt(n)] -> n, _ -> 0 }
+
+// What a cost law's sizes come to: a trend too short to read is a gap, steps that outgrew the bound
+// over the last two spans refute it, and anything else holds at the tier its sizes earn.
+pub fn fit_outcome(f: Fit) -> Outcome =
+  if len(fitted(f)) < min_fit_sizes() { Unattempted(Unfitted(f)) }
+  else if outgrown(f) { Outgrown(f) }
+  else { Held({ tier: fit_tier(f), evidence: Measured(f) }) }
+
+// A cost law's size answered with a proposition's verdict: Ply disagreeing with itself.
+fn unmeasured(bs: List<Binding>) -> Outcome =
+  Defect({
+    code: "E0505",
+    message: "the runtime answered a cost law's size with a verdict rather than a measure",
+    notes: ["a cost law's body is a measure, which `proof.property` and the runtime read alike"],
+    values: [],
+    bindings: bs,
+  })
 
 // The points a law's guard admitted, judged one at a time: a raise is the law's own gap.
 fn law_kept(o: Obligation, p: Pointed, js: List<Judged>) -> Judging = {
@@ -1564,4 +1660,89 @@ test "a domain the guard emptied is vacuous, and not proved" {
     Vacuous(v) -> assert_eq(v.why, NoCaseKept(4)),
     _ -> panic("not vacuous"),
   }
+}
+
+// --- Cost laws ------------------------------------------------------------------
+
+fn cost_law() -> Obligation = claim_of([int_binder("n")], Fitting)
+
+// A runtime that measures each size by `steps` and `bound`, spending a size that takes more than the
+// mode allows, as the runtime does.
+fn measuring(steps: (Int) -> Int, bound: (Int) -> Int) -> (Ask) -> Reply =
+  judging(|m: Mode, p: List<Value>|
+    match m {
+      MCost(limit) -> {
+        let n = int_of(p);
+        if steps(n) > limit { JSpent(limit) }
+        else { JMeasured({ steps: steps(n), bound: bound(n) }) }
+      },
+      _ -> panic("a cost law's sizes are measured"),
+    })
+
+fn fit_of(o: Outcome) -> Fit =
+  match o {
+    Held(h) -> match h.evidence { Measured(f) -> f, _ -> panic("a fit") },
+    Outgrown(f) -> f,
+    Unattempted(Unfitted(f)) -> f,
+    _ -> panic("a fit"),
+  }
+
+fn last_measure(f: Fit) -> { size: Int, steps: Int, bound: Int } =
+  match list_at(f.measures, len(f.measures) - 1) {
+    Some(m) -> m,
+    None -> panic("a size was measured"),
+  }
+
+test "a cost law whose steps keep its bound's pace holds, fitted over every size" {
+  let o = run_one(cost_law(), Undecided, a_plan(10), measuring(|n: Int| 3 * n + 7, |n: Int| n));
+  assert(match o { Held(h) -> h.tier == Fitted, _ -> false });
+  let f = fit_of(o);
+  assert_eq(len(f.measures), 13);
+  assert_eq(f.spent, None);
+  assert_eq(last_measure(f), { size: 4096, steps: 12295, bound: 4096 })
+}
+
+test "a quadratic cost law under a linear bound is outgrown, with the sizes that show it" {
+  let o = run_one(cost_law(), Undecided, a_plan(10), measuring(|n: Int| n * n, |n: Int| n));
+  assert(match o { Outgrown(_) -> true, _ -> false });
+  let f = fit_of(o);
+  // 4096 squared is past what one size may take, so the measuring stopped short of it.
+  assert_eq(len(f.measures), 12);
+  assert_eq(f.spent, Some({ size: 4096, limit: size_limit() }));
+  assert_eq(last_measure(f), { size: 2048, steps: 4194304, bound: 2048 })
+}
+
+test "a size that takes more steps than one may ends the measuring, and the rest are fitted" {
+  let cubic = run_one(
+    cost_law(),
+    Undecided,
+    a_plan(10),
+    measuring(|n: Int| n * n * n, |n: Int| n * n * n),
+  );
+  assert(match cubic { Held(h) -> h.tier == Fitted, _ -> false });
+  assert_eq(fit_of(cubic).spent, Some({ size: 256, limit: size_limit() }));
+  assert_eq(last_measure(fit_of(cubic)).size, 128);
+  // Four sizes are a trend too short to be more than an example.
+  let heavy = run_one(
+    cost_law(),
+    Undecided,
+    a_plan(10),
+    measuring(|n: Int| 1000000 * n, |n: Int| n),
+  );
+  assert(match heavy { Held(h) -> h.tier == Example, _ -> false });
+  assert_eq(len(fit_of(heavy).measures), 4)
+}
+
+test "a guard that keeps too few sizes leaves a cost law unfitted, and a raise is its gap" {
+  let narrow = judging(|m: Mode, p: List<Value>|
+    if int_of(p) < 2048 { JRejected } else { JMeasured({ steps: int_of(p), bound: int_of(p) }) });
+  let o = run_one(cost_law(), Undecided, a_plan(10), narrow);
+  assert(match o { Unattempted(Unfitted(f)) -> len(f.measures) == 2, _ -> false });
+  let raising = judging(|m: Mode, p: List<Value>|
+    if int_of(p) == 64 { JRaised({ message: "boom", values: [] }) }
+    else { JMeasured({ steps: int_of(p), bound: int_of(p) }) });
+  assert(match run_one(cost_law(), Undecided, a_plan(10), raising) {
+    Unattempted(Raised(r)) -> binding_values(r.bindings) == [VInt(64)],
+    _ -> false,
+  })
 }

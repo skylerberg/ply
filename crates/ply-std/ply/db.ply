@@ -9,6 +9,8 @@ import std.string
 
 pub nondet effect db {
   read query[t](s: Stmt, ps: List<Param>) -> Answer
+  // The statement once for each parameter list, each answer what its own `query` would have had.
+  read batch[t](s: Stmt, each: List<List<Param>>) -> List<Answer>
   write execute[t](s: Stmt, ps: List<Param>) -> Answer
   write returning[t](s: Stmt, ps: List<Param>) -> Answer
   // Transaction control takes no resource, so its atom is the singleton `db.write`.
@@ -68,7 +70,7 @@ pub fn transaction<a | e>(
   level: Isolation,
   access: Access,
   body: () -> a / e,
-) -> Result<a, Rollback> / {db.begin, db.commit, db.abort | e} =
+) -> Result<a, Rollback> / {db.begin bounded, db.commit bounded, db.abort bounded | e bounded} =
   match db.begin(level, access) {
     Failed(err) -> Err({ reason: "begin", error: Some(err) }),
     _ -> with_cell[settled](false) { committing ->
@@ -94,7 +96,7 @@ fn attempt<a | e>(body: () -> a / e) -> Result<a, Rollback> / e =
   }
 
 // A transaction that always rolls back, whatever the body did.
-pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.begin, db.abort | e} =
+pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.begin bounded, db.abort bounded | e bounded} =
   bracket(|| assert(opened(db.begin(ReadCommitted, ReadWrite))), |u: Unit| aborted(), |u: Unit|
     body())
 
@@ -108,6 +110,89 @@ fn opened(a: Answer) -> Bool = match a { Failed(_) -> false, _ -> true }
 
 // A serialization failure or a deadlock: the server is asking the program to retry.
 pub fn is_retryable(e: DbError) -> Bool = e.code == "40001" || e.code == "40P01"
+
+// --- Batching ----------------------------------------------------------------------
+
+// A lookup stepped to the ask it waits on, and what it does with the answer.
+type Pending<b> = | Looked(b) | Asking({ s: Stmt, ps: List<Param>, next: (Answer) -> Pending<b> })
+
+// `lookup` over each of `xs`, answering what `map` would. Each lookup runs until it asks the store,
+// and the asks of one round that share a statement are one `db.batch`. A lookup only reads, so its
+// asks may be answered in any order, and each answer is the one its own `db.query` would have had.
+pub fn batched<a, b, [t]>(
+  xs: List<a>,
+  lookup: (a) -> b / {db.query[t]},
+) -> List<b> / {db.query[t], db.batch[t]} = rounds[t](map(xs, |x: a| stepped[t](|| lookup(x))))
+
+fn stepped<b, [t]>(go: () -> b / {db.query[t]}) -> Pending<b> =
+  handle { Looked(go()) } with { db.query[t](s, ps) resume k -> Asking({ s: s, ps: ps, next: k }) }
+
+fn rounds<b, [t]>(ps: List<Pending<b>>) -> List<b> / {db.query[t], db.batch[t]} = {
+  let waiting = filter(range(0, len(ps)), |i: Int|
+    match list_at(ps, i) { Some(Asking(_)) -> true, _ -> false });
+  if len(waiting) == 0 {
+    fold(ps, [], |acc: List<b>, p: Pending<b>| match p { Looked(v) -> push(acc, v), _ -> acc })
+  } else {
+    let answers = asked[t](ps, waiting);
+    rounds[t](
+      map(range(0, len(ps)), |i: Int|
+        match list_at(ps, i) {
+          Some(Asking(a)) ->
+            (a.next)(match map_get(answers, i) {
+              Some(answer) -> answer,
+              None -> Failed(db_error("XX000", "", "a batched ask went unanswered")),
+            }),
+          Some(done) -> done,
+          None -> Looked(panic("an index the round holds")),
+        }),
+    )
+  }
+}
+
+// One round's asks answered, by their place: a statement asked once is a `db.query`, and one asked
+// more is a `db.batch` of all its parameter lists, in the order the asks were made.
+fn asked<b, [t]>(
+  ps: List<Pending<b>>,
+  waiting: List<Int>,
+) -> Map<Int, Answer> / {db.query[t], db.batch[t]} = {
+  let groups = fold(waiting, [], |acc: List<{ s: Stmt, at: List<Int> }>, i: Int|
+    match list_at(ps, i) {
+      Some(Asking(a)) -> match fold(range(0, len(acc)), None, |found: Option<Int>, g: Int|
+          match found {
+            Some(_) -> found,
+            None -> match list_at(acc, g) {
+              Some(x) -> if x.s == a.s { Some(g) } else { None },
+              None -> None,
+            },
+          }) {
+        Some(g) -> match list_at(acc, g) {
+          Some(x) -> list_set(acc, g, { ..x, at: push(x.at, i) }),
+          None -> acc,
+        },
+        None -> push(acc, { s: a.s, at: [i] }),
+      },
+      _ -> acc,
+    });
+  let params = |i: Int| match list_at(ps, i) { Some(Asking(a)) -> a.ps, _ -> [] };
+  fold(groups, map_new(), |acc: Map<Int, Answer>, g: { s: Stmt, at: List<Int> }|
+    match g.at {
+      [only] -> map_insert(acc, only, db.query[t](g.s, params(only))),
+      _ -> {
+        let answers = db.batch[t](g.s, map(g.at, params));
+        fold(range(0, len(g.at)), acc, |m: Map<Int, Answer>, k: Int|
+          match ((list_at(g.at, k), list_at(answers, k))) {
+            (Some(i), Some(answer)) -> map_insert(m, i, answer),
+            (Some(i), None) ->
+              map_insert(
+                m,
+                i,
+                Failed(db_error("XX000", "", "a batch answered fewer asks than it was given")),
+              ),
+            _ -> m,
+          })
+      },
+    })
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -5196,12 +5281,61 @@ pub fn serve<a | e>(
       cell_set(pool, d.pool);
       d.closing
     };
+    let alone = |s: Stmt, each: List<List<Param>>|
+      map(each, |ps: List<Param>| statement(s, ps, true, "`db.batch`"));
+    let shared = |s: Stmt, each: List<List<Param>>|
+      match coalesced(s, each) {
+        None -> None,
+        Some(c) -> match statement(c.s, c.ps, true, "`db.batch`") {
+          Rows(rows) -> Some(split_asks(rows, len(each))),
+          _ -> None,
+        },
+      };
+    // The savepoint a batch inside a transaction runs under, let go or rolled back to.
+    let ended_savepoint = |kept: Bool|
+      match closing(for_close(cell_get(pool), "`db.batch`", Count(0))) {
+        Settled(_) -> (),
+        Closes(scope, session) -> {
+          settled(if kept { committing(cfg, scope, session) }
+          else { aborting(cfg, scope, session) });
+          ()
+        },
+      };
+    // A batch's asks as one statement; inside a transaction, under a savepoint, so that a refusal
+    // leaves the transaction as asking each alone would have. A statement the asks cannot share,
+    // or one the server refuses, is asked once for each.
+    let batch = |s: Stmt, each: List<List<Param>>|
+      if len(each) < 2 { alone(s, each) } else {
+        match route(cell_get(pool).open) {
+          Own(scope) -> match taken(for_begin(cell_get(pool), size, scope.level, scope.access)) {
+            Within(inner, session) -> match settled(nesting(cfg, inner, session)) {
+              Failed(_) -> alone(s, each),
+              _ -> match shared(s, each) {
+                Some(answers) -> {
+                  ended_savepoint(true);
+                  answers
+                },
+                None -> {
+                  ended_savepoint(false);
+                  alone(s, each)
+                },
+              },
+            },
+            _ -> alone(s, each),
+          },
+          _ -> match shared(s, each) { Some(answers) -> answers, None -> alone(s, each) },
+        }
+      };
     let answer = handle {
       body()
     } with {
       db.query[*t](s, ps) -> {
         check_statement(s, true, t);
         statement(s, ps, true, "`db.query`")
+      },
+      db.batch[*t](s, each) -> {
+        check_statement(s, true, t);
+        batch(s, each)
       },
       db.execute[*t](s, ps) -> {
         check_statement(s, false, t);
@@ -5230,6 +5364,94 @@ pub fn serve<a | e>(
     finished(cell_get(pool), cfg);
     answer
   } }
+
+// --- One statement for a batch -----------------------------------------------------
+
+// The statement once for each ask, joined with `union all`: each arm's placeholders numbered on
+// from the asks before it, and each row marked with the ask it answers and its place among that
+// ask's rows, so the answers come apart in order. `None` when the asks cannot share one statement:
+// text the reader cannot take apart, an ask whose parameters are not the placeholders', or more
+// parameters than one statement may carry.
+fn coalesced(s: Stmt, each: List<List<Param>>) -> Option<{ s: Stmt, ps: List<Param> }> =
+  match tokenize(s.sql) {
+    Err(_) -> None,
+    Ok(ts) -> match statement_body(s.sql, ts) {
+      None -> None,
+      Some(body) -> {
+        let places = filter(ts, |t: SqlTokAt| match t.tok { SqlPlaceholder -> true, _ -> false });
+        let width = fold(places, 0, |m: Int, t: SqlTokAt| max(m, placeholder_number(t.text)));
+        let fits = fold(each, true, |ok: Bool, ps: List<Param>| ok && len(ps) == width);
+        if !fits || width * len(each) > 65535 { None } else {
+          let arms = map(range(0, len(each)), |i: Int|
+            "select " ++ int_to_string(i)
+              ++ " as \"ply.ask\", row_number() over () as \"ply.row\", \"ply.arm\".* from ("
+              ++ renumbered(body, places, i * width)
+              ++ ") as \"ply.arm\"");
+          Some({
+            s: stmt(
+              "select * from (" ++ string::join(arms, " union all ")
+                ++ ") as \"ply.batch\" order by \"ply.ask\", \"ply.row\"",
+            ),
+            ps: fold(each, [], |acc: List<Param>, ps: List<Param>| fold(ps, acc, push)),
+          })
+        }
+      },
+    },
+  }
+
+// The statement's text short of a closing `;`; `None` when a `;` comes before its end.
+fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> = {
+  let semis = filter(range(0, len(ts)), |i: Int|
+    match list_at(ts, i) { Some(t) -> sql_is_semi(t.tok), None -> false });
+  match semis {
+    [] -> Some(sql),
+    [i] -> if i == len(ts) - 1 {
+      match list_at(ts, i) {
+        Some(t) -> Some(string_of_bytes(bytes_slice(bytes_of_string(sql), 0, t.at))),
+        None -> None,
+      }
+    } else { None },
+    _ -> None,
+  }
+}
+
+fn placeholder_number(text: String) -> Int =
+  match string::int_of_string(string_slice(text, 1, string_len(text))) { Some(n) -> n, None -> 0 }
+
+// Each placeholder `$k` of `body` written `$(k + by)`.
+fn renumbered(body: String, places: List<SqlTokAt>, by: Int) -> String = {
+  let b = bytes_of_string(body);
+  let walked = fold(places, { at: 0, out: b"" }, |acc: { at: Int, out: Bytes }, t: SqlTokAt|
+    if t.at < acc.at || t.at >= bytes_len(b) { acc } else {
+      {
+        at: t.at + bytes_len(bytes_of_string(t.text)),
+        out: bytes_concat_all([
+          acc.out,
+          bytes_slice(b, acc.at, t.at),
+          bytes_of_string("$" ++ int_to_string(placeholder_number(t.text) + by)),
+        ]),
+      }
+    });
+  string_of_bytes(bytes_concat(walked.out, bytes_slice(b, walked.at, bytes_len(b))))
+}
+
+// The rows of a batch's statement, each ask's in order and without the batch's own columns.
+fn split_asks(rows: List<Row>, asks: Int) -> List<Answer> = {
+  let held = fold(rows, map_new(), |acc: Map<Int, List<Row>>, r: Row|
+    match map_get(r, "ply.ask") {
+      Some(CInt(i)) ->
+        map_insert(
+          acc,
+          i,
+          push(
+            match map_get(acc, i) { Some(xs) -> xs, None -> [] },
+            map_remove(map_remove(r, "ply.ask"), "ply.row"),
+          ),
+        ),
+      _ -> acc,
+    });
+  map(range(0, asks), |i: Int| Rows(match map_get(held, i) { Some(xs) -> xs, None -> [] }))
+}
 
 // Every connection the pool still holds once its body has returned, told it is done and closed:
 // the idle ones, and one a body returned from inside its transaction, which the server rolls back.
@@ -6543,4 +6765,95 @@ test "a connection lost inside a transaction fails the rest of it, and nothing o
     ]);
     assert_eq(map(r.wires, |w: Wire| w.open), [false, false])
   }
+}
+
+// --- Batching's own tests --------------------------------------------------------
+
+// A store of `id * 10` for every id, answering each ask alone, counting what it was asked.
+fn tens<a>(
+  go: () -> a / {db.query[items], db.batch[items]},
+) -> { value: a, queries: Int, batches: Int } =
+  with_cell[asked]({ queries: 0, batches: 0 }) { counts -> {
+    let row = |ps: List<Param>|
+      match ps {
+        [PInt(id)] -> Rows([map_insert(map_new(), "v", CInt(id * 10))]),
+        _ -> Failed(db_error("08P01", "", "one id")),
+      };
+    let value = handle {
+      go()
+    } with {
+      db.query[items](s, ps) -> {
+        cell_set(counts, { ..cell_get(counts), queries: cell_get(counts).queries + 1 });
+        row(ps)
+      },
+      db.batch[items](s, each) -> {
+        cell_set(counts, { ..cell_get(counts), batches: cell_get(counts).batches + 1 });
+        map(each, row)
+      },
+    };
+    { value: value, queries: cell_get(counts).queries, batches: cell_get(counts).batches }
+  } }
+
+fn ten_of(id: Int) -> Int / {db.query[items]} =
+  match db.query[items](stmt("select v from items where id = $1"), [PInt(id)]) {
+    Rows([r]) -> match map_get(r, "v") { Some(CInt(v)) -> v, _ -> 0 - 1 },
+    _ -> 0 - 1,
+  }
+
+test "a lookup mapped over its ids asks the store once, and answers what each ask alone would" {
+  let ids = [3, 1, 4, 1, 5];
+  let alone = tens(|| map(ids, ten_of));
+  let together = tens(|| batched[items](ids, ten_of));
+  assert_eq(together.value, alone.value);
+  assert_eq({ queries: alone.queries, batches: alone.batches }, { queries: 5, batches: 0 });
+  assert_eq({ queries: together.queries, batches: together.batches }, { queries: 0, batches: 1 })
+}
+
+test "a lookup that asks twice is answered in two rounds, and a lone ask is a query" {
+  let twice = |id: Int| ten_of(id) + ten_of(id + 100);
+  let r = tens(|| batched[items]([1, 2, 3], twice));
+  assert_eq(r.value, [1020, 1040, 1060]);
+  assert_eq({ queries: r.queries, batches: r.batches }, { queries: 0, batches: 2 });
+  let one = tens(|| batched[items]([7], ten_of));
+  assert_eq({ value: one.value, queries: one.queries, batches: one.batches }, {
+    value: [70],
+    queries: 1,
+    batches: 0,
+  })
+}
+
+test "a batch is the statement once per ask, its placeholders numbered on and its rows marked" {
+  let c = coalesced(stmt("select v from items where id = $1 and kind = $2;"), [
+    [PInt(1), PText("a")],
+    [PInt(2), PText("b")],
+  ]);
+  assert_eq(
+    match c { Some(x) -> x.s.sql, None -> "" },
+    "select * from (select 0 as \"ply.ask\", row_number() over () as \"ply.row\", \"ply.arm\".* from (select v from items where id = $1 and kind = $2) as \"ply.arm\" union all select 1 as \"ply.ask\", row_number() over () as \"ply.row\", \"ply.arm\".* from (select v from items where id = $3 and kind = $4) as \"ply.arm\") as \"ply.batch\" order by \"ply.ask\", \"ply.row\"",
+  );
+  assert_eq(match c { Some(x) -> x.ps, None -> [] }, [PInt(1), PText("a"), PInt(2), PText("b")]);
+  // An ask whose parameters are not the placeholders' would answer another's: it is asked alone.
+  assert_eq(coalesced(stmt("select v from items where id = $1"), [[PInt(1)], []]), None);
+  // A placeholder inside text is text.
+  assert_eq(
+    match coalesced(stmt("select '$1' as t from items where id = $1"), [[PInt(1)], [PInt(2)]]) {
+      Some(x) -> string_contains(x.s.sql, "select '$1' as t from items where id = $2"),
+      None -> false,
+    },
+    true,
+  )
+}
+
+test "a batch's rows come apart by the ask they answer, in order, without the batch's columns" {
+  let marked = |ask: Int, place: Int, v: Int|
+    map_insert(
+      map_insert(map_insert(map_new(), "ply.ask", CInt(ask)), "ply.row", CInt(place)),
+      "v",
+      CInt(v),
+    );
+  assert_eq(split_asks([marked(0, 1, 5), marked(0, 2, 6), marked(2, 1, 7)], 3), [
+    Rows([map_insert(map_new(), "v", CInt(5)), map_insert(map_new(), "v", CInt(6))]),
+    Rows([]),
+    Rows([map_insert(map_new(), "v", CInt(7))]),
+  ])
 }

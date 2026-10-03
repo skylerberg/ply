@@ -534,6 +534,10 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     }
     let mut tables = tables_of(unit, &ctors);
     tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
+    tables.memo_costs = functions
+        .iter()
+        .map(|_| (AtomicI64::new(0), AtomicI64::new(0)))
+        .collect();
     tables.functions = functions;
     tables.roots = roots;
     Ok(Native {
@@ -843,6 +847,7 @@ fn tables_of(mut unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
         builtins: unit.builtins,
         functions: Vec::new(),
         memo: Default::default(),
+        memo_costs: Default::default(),
         immortals: std::sync::Mutex::new(immortals),
         bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries,
