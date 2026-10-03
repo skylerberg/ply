@@ -185,17 +185,13 @@ fn set(path: &Path, when: SystemTime) {
         .unwrap();
 }
 
-/// A stage directory as a run leaves it: `size` bytes of unit, last used `ago` before `now`.
+/// A stage directory as a run leaves it: `size` bytes of builder, last used `ago` before `now`.
 fn stage(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
     let dir = root.join(name);
-    std::fs::create_dir_all(dir.join("shelf")).unwrap();
-    std::fs::write(dir.join("shelf").join("unit.c.gz"), vec![b'x'; size]).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("builder.run"), vec![b'x'; size]).unwrap();
     std::fs::write(dir.join(USED), b"").unwrap();
-    for path in [
-        dir.join("shelf").join("unit.c.gz"),
-        dir.join("shelf"),
-        dir.join(USED),
-    ] {
+    for path in [dir.join("builder.run"), dir.join(USED)] {
         set(&path, now - ago);
     }
     set(&dir, now - ago);
