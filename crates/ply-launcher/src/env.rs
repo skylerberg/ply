@@ -24,7 +24,7 @@ const OPERATIONS: [(&str, &str); 9] = [
     ("pwd", "ply_launcher::env::pwd"),
     ("shipped_digest", "ply_launcher::env::shipped_digest"),
     ("builder_digest", "ply_launcher::env::builder_digest"),
-    ("fronts", "ply_launcher::env::fronts"),
+    ("reused", "ply_launcher::env::reused"),
     ("bodies", "ply_launcher::env::bodies"),
 ];
 
@@ -86,8 +86,8 @@ impl HostHandler for EnvHandler {
             // The digest the committed builder is gated on: `ply bootstrap` writes it beside it.
             ("builder_digest", []) => Value::str(ply_machine::builds::identity()),
             // Under the stage root, where `sweep` keeps them to the cache's budget.
-            ("fronts", []) => Value::str(
-                ply_codegen::c::stage::stage_dir(ply_codegen::c::sweep::RUNS)
+            ("reused", []) => Value::str(
+                ply_codegen::c::stage::stage_dir(ply_codegen::c::sweep::REUSED)
                     .display()
                     .to_string(),
             ),
