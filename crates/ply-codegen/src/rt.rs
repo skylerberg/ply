@@ -3220,10 +3220,10 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
 }
 
 /// `bracket(acquire, release, body)`: what `body` answers for what `acquire` answered, with
-/// `release` run on it however `body` ends: by returning, by a clause that did not resume it
-/// unwinding through, or by a cancel. It runs where the bracket stands, with the handlers around it,
-/// and a failure in it replaces whatever was unwinding. A runtime failure ends the entry, so
-/// nothing more runs then.
+/// `release` run on it however `body` ends: by returning, by a raise or a clause that did not
+/// resume it unwinding through, or by a cancel. It runs where the bracket stands, with the
+/// handlers around it, and a failure in it replaces whatever was unwinding. A runtime failure ends
+/// the entry, so nothing more runs then.
 fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     let held = call_value(ctx, acquire, &[]);
     heap::dec(acquire);
@@ -3238,12 +3238,17 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     heap::dec(body);
     let c = unsafe { &mut *ctx };
     let ending = c.failed;
-    if ending != 0 && ending != FAILED_UNWIND && ending != FAILED_CANCELLED {
+    if ending != 0
+        && ending != FAILED_UNWIND
+        && ending != FAILED_CANCELLED
+        && ending != FAILED_ABORT
+    {
         heap::dec(held);
         heap::dec(release);
         return 0;
     }
     let unwinding = c.unwind.take();
+    let raising = c.aborting.take();
     c.failed = 0;
     let released = call_value(ctx, release, &[held]);
     heap::dec(release);
@@ -3258,6 +3263,7 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     heap::dec(released);
     c.failed = ending;
     c.unwind = unwinding;
+    c.aborting = raising;
     answer
 }
 
