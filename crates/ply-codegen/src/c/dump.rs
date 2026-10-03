@@ -1,15 +1,15 @@
 //! The front end's answer, a `front.Dump` as `crates/ply-compiler/ply/front.ply` builds it, read
-//! into a [`Front`]. No type is read: the runtime reasons about none, and a value's words read back
+//! into a [`Analysis`]. No type is read: the runtime reasons about none, and a value's words read back
 //! as the carries the compiler published. A footprint is read from the checker's own atoms, its
 //! label variables numbered where they first appear, so an answer reads to one structure however
 //! the checker happened to number them.
 
 use ply_eval::decode::{At, Error};
 use ply_eval::{
-    Carry, DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo, EmitterRoot,
-    Fix, Footprint, Front, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo, ModuleName,
-    OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo,
-    TypeDecl, Value, Visibility, WrittenParam, intern_code,
+    Analysis, Carry, DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo,
+    EmitterRoot, Fix, Footprint, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo,
+    ModuleName, OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecKind, Symbol,
+    TestInfo, TypeDecl, Value, Visibility, WrittenParam, intern_code,
 };
 use std::collections::BTreeMap;
 
@@ -21,12 +21,12 @@ const NO_MODULE: u32 = u32::MAX;
 
 /// `sources[i]` is the source a module index `i` names: the program's own modules, the shipped
 /// ones pulled after them, then any manifest the answer places past those.
-pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
+pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
     let d = At::new(ANSWER, dump);
     let r = Reader { sources };
-    let mut front = Front {
+    let mut front = Analysis {
         diagnostics: d.field("diags")?.items(|x| r.diagnostic(x))?,
-        ..Front::default()
+        ..Analysis::default()
     };
     // An error is the whole answer: a refused program has no rows to read.
     if front.has_error() {
@@ -167,7 +167,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
 
 /// The hasher's rows in its item order. A test's or a law's row is numbered by the item it is
 /// about, so the tests and laws are read before them.
-fn hashes(rows: At<'_>, front: &mut Front) -> Result<(), Error> {
+fn hashes(rows: At<'_>, front: &mut Analysis) -> Result<(), Error> {
     let tests = front.check.tests.len();
     let laws = front.check.laws.len();
     let mut test_hashes: Vec<Option<DefHash>> = vec![None; tests];
@@ -546,7 +546,7 @@ fn resource(r: At<'_>, labels: &mut Vec<i64>) -> Result<Resource, Error> {
 }
 
 /// Every row and footprint names an operation without its mode; the declaration gives it one.
-fn resolve_op_modes(front: &mut Front) {
+fn resolve_op_modes(front: &mut Analysis) {
     let modes: BTreeMap<(Symbol, Symbol), Mode> = front
         .check
         .effects

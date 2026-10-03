@@ -8,7 +8,7 @@ use crate::sim::{DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::Value;
 use crate::{
-    DefHash, Diagnostic, EffectAtom, Footprint, Front, ModuleName, Span, Symbol, codes, region,
+    Analysis, DefHash, Diagnostic, EffectAtom, Footprint, ModuleName, Span, Symbol, codes, region,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ pub struct Machine<'a> {
     /// With the performing task, the key a host handler scopes its state by.
     id: MachineId,
     /// Its tests are [`Machine::eval_test`]'s indices; its hashes name the unit it may enter.
-    front: &'a Front,
+    front: &'a Analysis,
     trace: Trace,
     max_calls: usize,
     /// Seed and per-interleaving step budget for the next entry point's `simulate` regions.
@@ -76,7 +76,7 @@ impl<T> Ended<T> {
 
 impl<'a> Machine<'a> {
     /// Refuses a tier built from another program, whose bodies would answer for that one.
-    pub fn new(front: &'a Front, compiled: Rc<dyn Compiled>) -> Result<Machine<'a>, Diagnostic> {
+    pub fn new(front: &'a Analysis, compiled: Rc<dyn Compiled>) -> Result<Machine<'a>, Diagnostic> {
         if !compiled.describes(front.hashes_digest) {
             return Err(err_foreign_tier(front.hashes_digest));
         }

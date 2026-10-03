@@ -3,7 +3,7 @@
 
 use crate::fixture::{handed, loaded, project, unit_text};
 use ply_eval::{Span, Value};
-use ply_machine::artifact::{self, Binds};
+use ply_machine::enter::{self, Binds};
 use ply_machine::payload::field_of;
 use ply_machine::runnable;
 
@@ -30,9 +30,9 @@ fn a_runnable_reads_back_as_the_program_it_was_written_from_and_enters() {
         program.front.files.iter().any(|f| f.name == "m"),
         "the program's own module is among the files it carries"
     );
-    let opened = artifact::opened_runnable(program, std::path::Path::new("."))
+    let opened = enter::opened_runnable(program, std::path::Path::new("."))
         .expect("its front end's answer reads back over its own files");
-    let ended = artifact::enter_runnable(opened, Vec::new(), Binds::default());
+    let ended = enter::enter_runnable(opened, Vec::new(), Binds::default());
     assert_eq!(ended.into_parts().0.expect("the entry ran"), 7);
 }
 

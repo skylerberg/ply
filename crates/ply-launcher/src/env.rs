@@ -79,8 +79,8 @@ impl HostHandler for Site {
                 Value::Bool(terminal)
             }
             ("binary_version", []) => Value::str(&self.version),
-            // The digest the committed CLI artifact is gated on: the build of the program's own
-            // sources writes it beside the artifact.
+            // The digest the committed `ply` runnable is gated on: `ply bootstrap` writes it
+            // beside the runnable.
             ("shipped_digest", []) => Value::str(crate::shipped::identity()),
             // The digest the committed builder is gated on: `ply bootstrap` writes it beside it.
             ("builder_digest", []) => Value::str(crate::builder::identity()),

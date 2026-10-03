@@ -10,8 +10,6 @@
 //! forgets what the label was configured with. The run flow itself — targets, bindings, teardown —
 //! is `crate::drive`.
 
-pub mod artifact;
-pub mod body;
 pub mod builder;
 pub mod claims;
 pub mod config;
@@ -19,6 +17,7 @@ pub mod drive;
 pub mod driver;
 pub mod edit;
 pub mod engine;
+pub mod enter;
 pub mod hosts;
 pub mod load;
 pub mod options;
@@ -224,7 +223,7 @@ enum Go {
         reply: Sender<drive::Measured>,
     },
     Reload {
-        front: Box<crate::driver::HandedFront>,
+        front: Box<crate::driver::LoadedAnalysis>,
         unit: Vec<u8>,
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
@@ -237,11 +236,21 @@ impl HostHandler for Site {
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
             ("load", [root, front, unit]) => self.load(&label, root, front, unit, span)?,
-            ("opened", [path, bytes]) => self.opened(&label, path, bytes, span)?,
+            ("opened", [path, runnable, entry, closure, names]) => self.opened(
+                &label,
+                &[
+                    path.clone(),
+                    runnable.clone(),
+                    entry.clone(),
+                    closure.clone(),
+                    names.clone(),
+                ],
+                span,
+            )?,
             ("reuse", [root, walked, entry]) => self.reuse(&label, root, walked, entry, span)?,
             ("filed", [front, unit]) => filed(front, unit, span)?,
             ("reload", [front, unit]) => {
-                let front = Box::new(crate::driver::handed_front_of(front, span)?);
+                let front = Box::new(crate::driver::loaded_analysis_of(front, span)?);
                 let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
                 let answer: Result<drive::FoundData, drive::Refused> =
                     self.ask(&label, span, |reply| Go::Reload { reply, front, unit })?;
@@ -376,7 +385,7 @@ impl Site {
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
-        let handed = crate::driver::handed_front_of(front, span)?;
+        let handed = crate::driver::loaded_analysis_of(front, span)?;
         let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
         let mut options = self.taken(label);
         options.front = Some(handed);
@@ -451,24 +460,56 @@ impl Site {
         }
     }
 
-    /// `bytes` is `None` when nothing could be read at `path`.
-    fn opened(
-        &self,
-        label: &str,
-        path: &Value,
-        bytes: &Value,
-        span: Span,
-    ) -> Result<Value, Diagnostic> {
+    /// The program the artifact at `path` holds, from the parts of it the caller read out of the
+    /// container and checked: its runnable, the entry its namespace names, the closure it prints
+    /// and the hash it files each name under.
+    fn opened(&self, label: &str, args: &[Value; 5], span: Span) -> Result<Value, Diagnostic> {
+        let [path, runnable, entry, closure, names] = args;
         let path = PathBuf::from(path.as_str(span, "the artifact's path")?);
-        let bytes = crate::payload::option_of(bytes, "the artifact's bytes", span)?
-            .map(|b| b.as_bytes(span, "the artifact's bytes").map(|b| b.to_vec()))
-            .transpose()?;
+        let runnable = runnable.as_bytes(span, "the artifact's runnable")?.to_vec();
+        let entry = entry.as_str(span, "the artifact's entry")?.to_string();
+        let closure = closure
+            .as_list(span, "the artifact's closure")?
+            .iter()
+            .map(|file| {
+                Ok(drive::Closed {
+                    path: crate::payload::field_of(file, "path", span)?
+                        .as_str(span, "a module's path")?
+                        .to_string(),
+                    text: String::from_utf8_lossy(
+                        crate::payload::field_of(file, "text", span)?
+                            .as_bytes(span, "a module's text")?,
+                    )
+                    .into_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, Diagnostic>>()?;
+        let names = names
+            .as_list(span, "the artifact's names")?
+            .iter()
+            .map(|named| {
+                let hash = crate::payload::field_of(named, "hash", span)?
+                    .as_bytes(span, "a name's hash")?;
+                Ok(drive::Hashed {
+                    name: crate::payload::field_of(named, "name", span)?
+                        .as_str(span, "a name")?
+                        .to_string(),
+                    hash: ply_eval::DefHash(hash[..].try_into().map_err(|_| {
+                        Diagnostic::error(
+                            ply_eval::codes::RUNTIME_ERROR,
+                            "a name's hash is not 32 bytes",
+                        )
+                        .primary(span, "handed here")
+                    })?),
+                })
+            })
+            .collect::<Result<Vec<_>, Diagnostic>>()?;
         let options = self.taken(label);
         let found = self.open(label, options, span, move |options| {
-            drive::Drive::open_artifact(options, &path, bytes.as_deref())
+            drive::Drive::open_deployed(options, &path, &runnable, &entry, &closure, &names)
         })?;
         Ok(match found {
-            Ok(found) => ok(drive::found_value(&found, &self.module)),
+            Ok(_) => ok(Value::Unit),
             Err(refused) => refused_value(&refused),
         })
     }

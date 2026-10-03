@@ -3173,20 +3173,23 @@ declare no `main` — is built as the package itself: `ply build` writes a
 its own, holding every module's source, the package's `ply.pkg` text, and a
 compiled unit of every definition those modules declare (a library has no entry
 to prune against, so nothing is left out). `-o FILE` names it; the default is
-`<name>.plyz`. A consumer compiles those sources — always correct — or reuses
-the unit when the runtime matches, the `E0444` gate. It is a package and never
-a program: `ply run lib.plyz` refuses it (`E0443`) rather than reading a
+`<name>.plyz`. A consumer compiles those sources. It is a package and never a
+program: `ply run lib.plyz` refuses it (`E0443`) rather than reading a
 container as text.
 
 `ply build` writes the closure of one entry point (default `main`) as a `.plyx`
-file (default `<entry module>.plyx`): its definitions, printed back to source
-without tests, laws, comments or anything unreached, and the compiled unit. The
-BLAKE3 digest covers those and the entry point, so an edit nothing reaches
+file (default `<entry module>.plyx`): its definitions by hash, the same
+definitions printed back to source without tests, laws, comments or anything
+unreached, and the runnable `ply run` loads — that source checked again, its
+front end's answer and its compiled unit — so a run of it runs no front end.
+The BLAKE3 digest covers those and the entry point, so an edit nothing reaches
 leaves it unchanged; a failure raised by a run of it carries no line number. A
-body or closure that fails verification is `E0443`, as is a build whose closure
-holds two identical declarations it cannot tell apart (two effects, or two
-members of one recursive group); an artifact built by another compiler, or
-compiled for another runtime, is `E0444`: rebuild it with this `ply`.
+part that does not agree with the rest — a body under a hash that does not name
+it, a name with no body, a closure or runnable that is not the one these
+definitions make — is `E0443`, as is a build whose closure holds two identical
+declarations it cannot tell apart (two effects, or two members of one recursive
+group); an artifact built by another compiler, or compiled for another runtime,
+is `E0444`: rebuild it with this `ply`.
 `--config-schema` ships that function too, resolved as a run resolves it: a name
 that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 

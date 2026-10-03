@@ -7,14 +7,14 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, MachineId, Pending,
 };
-use ply_eval::{Diagnostic, Front, Resource, Seed, SourceId, Span, Symbol, Value, codes};
+use ply_eval::{Analysis, Diagnostic, Resource, Seed, SourceId, Span, Symbol, Value, codes};
 use ply_machine::testrun::{self, Executor, Hosting};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Compiled {
-    front: Front,
+    front: Analysis,
     unit: &'static ply_codegen::Unit,
 }
 
@@ -23,7 +23,7 @@ impl Compiled {
     fn new(src: &str) -> Compiled {
         ply_codegen::c::producer::ensure_default();
         let sources = vec![("m".to_string(), src.to_string())];
-        let front = ply_codegen::c::producer::checked_front(&sources, &[SourceId(0)])
+        let front = ply_codegen::c::producer::checked_analysis(&sources, &[SourceId(0)])
             .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"));
         let unit = ply_codegen::Unit::over_front(&front, sources.into_iter().collect())
             .expect("this host has a C compiler");

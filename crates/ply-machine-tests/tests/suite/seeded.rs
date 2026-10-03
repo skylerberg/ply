@@ -3,7 +3,7 @@
 
 use crate::fixture::{scratch, write};
 use ply_codegen::c::producer::KnownRows;
-use ply_machine::driver::{kept_front, load_over_front_in};
+use ply_machine::driver::{kept_front, load_over_analysis_in};
 use ply_machine::load::{Loaded, load, load_seeded};
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -101,7 +101,7 @@ fn a_kept_front_reads_back_as_the_load_that_kept_it() {
     let seeded = load_seeded(&app, KnownRows::default()).expect("the program loads");
     let bytes = seeded.front.as_ref().expect("the load kept its front");
     let handed = kept_front(bytes).expect("the kept front reads back");
-    let reloaded = load_over_front_in(app.clone(), &handed).expect("it loads");
+    let reloaded = load_over_analysis_in(app.clone(), &handed).expect("it loads");
     same(&reloaded, &seeded.loaded);
 }
 
