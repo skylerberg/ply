@@ -100,6 +100,8 @@ fn join(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
     if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
 
+fn has(xs: List<Bytes>, x: Bytes) -> Bool = fold(xs, false, |found: Bool, y: Bytes| found || y == x)
+
 // --- The syntactic half of `derivable(D, t)` ---------------------------------------------------
 
 // `reason` completes the label at `span`; `note` is the advice only a `Secret` refusal carries.
@@ -264,8 +266,16 @@ fn check_te(d: Deriver, te: TypeExpr) -> Option<Blocker> =
 
 type Alias = { name: Bytes, body: TypeExpr }
 
-// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the module's.
-type Emitter = { d: Deriver, rt: Bytes, b: Bytes, aliases: List<Alias>, path: Bytes }
+// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the
+// module's; `cycle` holds the types whose codecs call the target's and are called back by it.
+type Emitter = {
+  d: Deriver,
+  rt: Bytes,
+  b: Bytes,
+  aliases: List<Alias>,
+  path: Bytes,
+  cycle: List<Bytes>,
+}
 
 fn emitter(
   d: Deriver,
@@ -273,12 +283,13 @@ fn emitter(
   params: List<Ident>,
   aliases: List<Alias>,
   path: Bytes,
+  cycle: List<Bytes>,
 ) -> Emitter = {
   let b = iterate(b"d", len(params) + 2, |x: Bytes|
     if fold(params, false, |acc: Bool, p: Ident| acc || bytes_starts_with(p.name, x)) {
       Continue(bytes_concat(x, b"_"))
     } else { Stop(x) });
-  { d: d, rt: rt, b: b, aliases: aliases, path: path }
+  { d: d, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle }
 }
 
 fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
@@ -290,27 +301,49 @@ pub fn target_type(def: TypeDef) -> Bytes =
     bytes_concat_all([def.name.name, b"<", join(map(def.params, |p: Ident| p.name), b", "), b">"])
   }
 
+// A codec on a cycle is two definitions: the named one starts `_at` at the runtime's `max_depth`, and
+// `_at` hands its cycle one less, so its recursion is seen to end.
 fn emit_item(e: Emitter, def: TypeDef) -> Bytes = {
   let name = generated_name(e.d, def.name.name);
   let target = target_type(def);
   let ps = map(def.params, |p: Ident| p.name);
   let generics = if len(ps) == 0 { b"" } else { bytes_concat_all([b"<", join(ps, b", "), b">"]) };
-  let dicts = join(map(ps, |p: Bytes| bytes_concat_all([p, b": ", dict_type(e, p)])), b", ");
+  let dicts = map(ps, |p: Bytes| bytes_concat_all([p, b": ", dict_type(e, p)]));
   let constraints = if len(ps) == 0 { b"" }
   else { bytes_concat(b" where ", join(map(ps, |p: Bytes| constraint_written(e.d, p)), b", ")) };
-  bytes_concat_all([
-    match def.vis { VPub -> b"pub ", VPriv -> b"" },
-    b"fn ",
-    name,
-    generics,
-    b"(",
-    dicts,
-    b") -> ",
-    dict_type(e, target),
-    constraints,
-    b" = ",
-    dictionary(e, def, target),
-  ])
+  let head = |fname: Bytes, params: List<Bytes>|
+    bytes_concat_all([
+      b"fn ",
+      fname,
+      generics,
+      b"(",
+      join(params, b", "),
+      b") -> ",
+      dict_type(e, target),
+      constraints,
+      b" = ",
+    ]);
+  let vis = match def.vis { VPub -> b"pub ", VPriv -> b"" };
+  if len(e.cycle) == 0 { bytes_concat_all([vis, head(name, dicts), dictionary(e, def, target)]) }
+  else {
+    let at_name = bytes_concat(name, b"_at");
+    bytes_concat_all([
+      vis,
+      head(name, dicts),
+      at_name,
+      b"(",
+      join(push(ps, bytes_concat(e.rt, b"max_depth()")), b", "),
+      b")\n",
+      head(at_name, push(dicts, bytes_concat(e.b, b"depth: Int"))),
+      b"if ",
+      e.b,
+      b"depth <= 0 {",
+      e.rt,
+      b"too_deep()} else {",
+      dictionary(e, def, target),
+      b"}",
+    ])
+  }
 }
 
 // `JsonCodec<a>` and `BinCodec<a>` ship with their runtime modules; `EqDict` and `OrdDict` are structural.
@@ -405,7 +438,16 @@ fn codec(e: Emitter, te: TypeExpr, annotation: Bytes) -> Bytes =
         match con_shape(e.d, simple) {
           Nominal -> match c.name.module {
             Some(m) -> bytes_concat_all([m.name, b"::", call]),
-            None -> call,
+            None -> if has(e.cycle, simple) {
+              bytes_concat_all([
+                snake_case(simple),
+                b"_",
+                deriver_text(e.d),
+                b"_at(",
+                join(push(codecs, bytes_concat(e.b, b"depth - 1")), b", "),
+                b")",
+              ])
+            } else { call },
           },
           _ -> bytes_concat(e.rt, call),
         }
@@ -579,12 +621,16 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes = {
           ])
         },
       );
+      // A call, not `==`: the emitter keys an operator's settled type by span, and every
+      // operator here is on the `derive` item's one span, beside the `Int` ones of a depth.
       bytes_concat_all([
         b"if ",
+        e.rt,
+        b"has_tag(",
         e.b,
-        b"t.tag == \"",
+        b"t, \"",
         v.name.name,
-        b"\" {",
+        b"\") {",
         built,
         b"} else {",
         acc,
@@ -1104,7 +1150,7 @@ fn retarget_pat(p: Pattern, s: Span) -> Pattern =
 
 type Runtime = { wanted: Bytes, prefix: Bytes, added: Option<ImportDecl> }
 type Claimed = { name: Bytes, def: DeriveDef }
-type Generated = { source: Bytes, def: FnDef, derived: Derived }
+type Generated = { source: Bytes, defs: List<FnDef>, derived: Derived }
 type Ex = {
   m: Int,
   path: Bytes,
@@ -1213,19 +1259,20 @@ fn one(ex: Ex, def: DeriveDef) -> Ex =
             match rt.prefix {
               None -> ex1,
               Some(prefix) -> {
+                let cycle = cycle_of(codec_calls(ex1, def.deriver), def.target.name);
                 let source = emit_item(
-                  emitter(def.deriver, prefix, target.params, ex1.aliases, ex1.path),
+                  emitter(def.deriver, prefix, target.params, ex1.aliases, ex1.path, cycle),
                   target,
                 );
-                match parse_generated(source, def.span) {
+                match parse_generated(source, def.span, if len(cycle) == 0 { 1 } else { 2 }) {
                   None -> internal(ex1, def, source),
-                  Some(generated) ->
+                  Some(defs) ->
                     {
                       ..ex1,
                       claimed: push(ex1.claimed, { name: name, def: def }),
                       generated: push(ex1.generated, {
                         source: source,
-                        def: generated,
+                        defs: defs,
                         derived: { deriver: def.deriver, target: def.target.name, span: def.span },
                       }),
                     },
@@ -1239,12 +1286,73 @@ fn one(ex: Ex, def: DeriveDef) -> Ex =
   }
 
 // Parsing what was just printed is the deriver's own round-trip check.
-fn parse_generated(source: Bytes, span: Span) -> Option<FnDef> = {
+fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>> = {
   let r = parse(source);
   let x = expand(r.node, r.p.diags);
-  if len(x.diags) > 0 || len(x.module.items) != 1 { None }
-  else { match at(x.module.items, 0) { IFn(d) -> Some(retarget_fn(d, span)), _ -> None } }
+  let defs = fold(x.module.items, [], |acc: List<FnDef>, it: Item|
+    match it { IFn(d) -> push(acc, retarget_fn(d, span)), _ -> acc });
+  if len(x.diags) > 0 || len(x.module.items) != count || len(defs) != count { None }
+  else { Some(defs) }
 }
+
+// --- Codecs on a cycle ---------------------------------------------------------------------------
+
+// A type this module derives with a codec deriver, and the derived types its codec calls by name.
+type Calls = { name: Bytes, calls: List<Bytes> }
+
+fn codec_calls(ex: Ex, d: Deriver) -> List<Calls> =
+  match d { DJson -> derived_calls(ex, d), DBin -> derived_calls(ex, d), _ -> [] }
+
+fn derived_calls(ex: Ex, d: Deriver) -> List<Calls> = {
+  let targets = fold(ex.module.items, [], |acc: List<TypeDef>, it: Item|
+    match it {
+      IDerive(def) -> if !same_deriver(def.deriver, d) { acc }
+      else { match find_type(ex.types, def.target.name) { Some(t) -> push(acc, t), None -> acc } },
+      _ -> acc,
+    });
+  let names = map(targets, |t: TypeDef| t.name.name);
+  map(targets, |t: TypeDef|
+    { name: t.name.name, calls: filter(named_in_def(d, t), |n: Bytes| has(names, n)) })
+}
+
+fn named_in_def(d: Deriver, t: TypeDef) -> List<Bytes> =
+  match t.body {
+    TDAlias(body) -> named_in(d, body),
+    TDSum(variants) ->
+      fold(variants, [], |acc: List<Bytes>, v: VariantDef|
+        fold(v.fields, acc, |inner: List<Bytes>, f: TypeExpr| append(inner, named_in(d, f)))),
+  }
+
+// The types `codec` composes through by a name of this module's.
+fn named_in(d: Deriver, te: TypeExpr) -> List<Bytes> =
+  match te {
+    TCon(c) -> {
+      let inner = fold(c.args, [], |acc: List<Bytes>, a: TypeExpr| append(acc, named_in(d, a)));
+      match con_shape(d, c.name.name.name) {
+        Nominal -> if is_bare(c.name) { push(inner, c.name.name.name) } else { inner },
+        _ -> inner,
+      }
+    },
+    TRecord(r) ->
+      fold(r.fields, [], |acc: List<Bytes>, f: { name: Ident, ty: TypeExpr }|
+        append(acc, named_in(d, f.ty))),
+    _ -> [],
+  }
+
+fn callees(calls: List<Calls>, name: Bytes) -> List<Bytes> =
+  fold(calls, [], |acc: List<Bytes>, c: Calls|
+    if c.name == name { append(acc, c.calls) } else { acc })
+
+// Every type a chain of one or more calls leads to from `from`: no chain is longer than the types.
+fn reached(calls: List<Calls>, from: Bytes) -> List<Bytes> =
+  fold(range(0, len(calls)), callees(calls, from), |seen: List<Bytes>, _: Int|
+    fold(seen, seen, |acc: List<Bytes>, n: Bytes|
+      fold(callees(calls, n), acc, |more: List<Bytes>, m: Bytes|
+        if has(more, m) { more } else { push(more, m) })))
+
+// Empty unless `target`'s codec calls itself, through any of the others.
+fn cycle_of(calls: List<Calls>, target: Bytes) -> List<Bytes> =
+  filter(reached(calls, target), |n: Bytes| has(reached(calls, n), target))
 
 // How this module writes a name that lives in the deriver's runtime module.
 fn runtime_prefix(ex: Ex, def: DeriveDef) -> WithPrefix =
@@ -1458,7 +1566,8 @@ pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion =
     {
       module: {
         imports: append(module.imports, added),
-        items: append(module.items, map(ex.generated, |g: Generated| IFn(g.def))),
+        items: fold(ex.generated, module.items, |acc: List<Item>, g: Generated|
+          append(acc, map(g.defs, |d: FnDef| IFn(d)))),
       },
       derived: map(ex.generated, |g: Generated| g.derived),
       diags: ex.diags,
@@ -1521,7 +1630,7 @@ test "the generated form is pinned to the reference's golden output" {
   );
   assert_eq(
     at(out, 3),
-    b"fn status_json() -> json::JsonCodec<Status> = {encode: |dv: Status| match dv {Placed -> json::variant(\"Placed\", []), Shipped(d0) -> json::variant(\"Shipped\", [(json::int_json().encode)(d0)])}, decode: |dj: json::Json| match json::variant_of(dj) {Err(de) -> Err(de), Ok(dt) -> if dt.tag == \"Placed\" {Ok(Placed)} else {if dt.tag == \"Shipped\" {match json::decode_and_then(json::variant_value(dt, 0), json::int_json().decode) {Err(de) -> Err(de), Ok(d0) -> Ok(Shipped(d0))}} else {json::unknown_variant(dt.tag, [\"Placed\", \"Shipped\"])}}}}",
+    b"fn status_json() -> json::JsonCodec<Status> = {encode: |dv: Status| match dv {Placed -> json::variant(\"Placed\", []), Shipped(d0) -> json::variant(\"Shipped\", [(json::int_json().encode)(d0)])}, decode: |dj: json::Json| match json::variant_of(dj) {Err(de) -> Err(de), Ok(dt) -> if json::has_tag(dt, \"Placed\") {Ok(Placed)} else {if json::has_tag(dt, \"Shipped\") {match json::decode_and_then(json::variant_value(dt, 0), json::int_json().decode) {Err(de) -> Err(de), Ok(d0) -> Ok(Shipped(d0))}} else {json::unknown_variant(dt.tag, [\"Placed\", \"Shipped\"])}}}}",
   )
 }
 
@@ -1535,8 +1644,30 @@ test "the bin form writes scalars straight, composes the rest, and keys a sum by
   );
   assert_eq(
     at(out, 1),
-    b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = {put: |dw: Bytes, dv: Tree<a>| match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)((tree_bin(a).put)(bin::put_tag(dw, 1), d0), d1)}, take: |dd: Bytes, dn: Int| match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match (tree_bin(a).take)(dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}, shape: |ds: bin::Shapes| bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [tree_bin(a).shape, a.shape]}])}",
+    b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = tree_bin_at(a, bin::max_depth())\nfn tree_bin_at<a>(a: bin::BinCodec<a>, ddepth: Int) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = if ddepth <= 0 {bin::too_deep()} else {{put: |dw: Bytes, dv: Tree<a>| match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)((tree_bin_at(a, ddepth - 1).put)(bin::put_tag(dw, 1), d0), d1)}, take: |dd: Bytes, dn: Int| match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match (tree_bin_at(a, ddepth - 1).take)(dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}, shape: |ds: bin::Shapes| bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [tree_bin_at(a, ddepth - 1).shape, a.shape]}])}}",
   )
+}
+
+test "a codec on a cycle hands the cycle one depth less, and calls a codec off it as written" {
+  let src = b"import std.json\ntype Expr = Num(Int) | Block(List<Stmt>) | Lit(Literal)\ntype Stmt = Bare(Expr) | Let({name: String, value: Expr})\ntype Literal = Text(String)\nderive json for Expr\nderive json for Stmt\nderive json for Literal\nderive eq for Expr";
+  let out = preview(b"t", parse(src).node);
+  assert_eq(len(out), 4);
+  let expr = at(out, 0);
+  assert(
+    bytes_starts_with(
+      expr,
+      b"fn expr_json() -> json::JsonCodec<Expr> = expr_json_at(json::max_depth())\nfn expr_json_at(ddepth: Int) -> json::JsonCodec<Expr> = if ddepth <= 0 {json::too_deep()} else {{encode:",
+    ),
+  );
+  assert(bytes_index_of(expr, b"json::list_json(stmt_json_at(ddepth - 1))") != None);
+  assert(bytes_index_of(expr, b"(literal_json().encode)") != None);
+  assert(bytes_index_of(at(out, 1), b"(expr_json_at(ddepth - 1).encode)(dv.value)") != None);
+  assert(bytes_index_of(at(out, 2), b"_at") == None);
+  assert(bytes_index_of(at(out, 3), b"_at") == None);
+  let x = expand_derives(0, b"t", parse(src).node);
+  assert_eq(len(x.diags), 0);
+  assert_eq(len(x.derived), 4);
+  assert_eq(len(x.module.items), 7 + 2 + 2 + 1 + 1)
 }
 
 test "a selective import of std.json still writes a module binder, stepping around a taken name" {
