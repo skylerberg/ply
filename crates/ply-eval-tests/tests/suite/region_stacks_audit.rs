@@ -40,7 +40,7 @@ pub fn raised(n: Int) -> Int =
     abort.stop(code) resume k -> code,
   }
 
-pub fn escaped(n: Int) -> Int =
+pub fn escaped(n: Int) -> Int / {sim.read} =
   with_cell[opened](0) { opened -> handle {
     simulate {
       let t = task.spawn(|| with_cell[mine](1) { a -> {
@@ -85,7 +85,7 @@ pub fn resumed(n: Int) -> Int =
     } },
   }
 
-pub fn handshake(n: Int) -> Int =
+pub fn handshake(n: Int) -> Int / {sim.read} =
   with_cell[opened](0) { opened -> with_cell[closed](0) { closed -> simulate {
     let held = with_cell[root](n) { b -> {
       let t = task.spawn(|| with_cell[mine](1) { a -> {
@@ -106,7 +106,7 @@ pub fn handshake(n: Int) -> Int =
     held.own + task.join(held.task)
   } } }
 
-pub fn unwound(n: Int) -> Int =
+pub fn unwound(n: Int) -> Int / {sim.read} =
   with_cell[go](0) { go -> with_cell[opened](0) { opened -> with_cell[closed](0) { closed -> simulate {
     let t = task.spawn(|| {
       iterate(0, 1000, |n: Int| if cell_get(go) == 1 { Stop(n) } else {
@@ -200,7 +200,7 @@ pub fn dropped(n: Int) -> Int = with_cell[slot](Nothing) { s -> {
   first + 1
 } }
 
-pub fn nested(n: Int) -> Int = with_cell[slot](Nothing) { s -> {
+pub fn nested(n: Int) -> Int / {cell.read[log], cell.write[slot]} = with_cell[slot](Nothing) { s -> {
   let first = with_cell[log](41) { c ->
     handle {
       handle {
@@ -223,7 +223,7 @@ pub fn nested(n: Int) -> Int = with_cell[slot](Nothing) { s -> {
   n + first + second
 } }
 
-pub fn tasked(n: Int) -> Int = with_cell[slot](Nothing) { s -> {
+pub fn tasked(n: Int) -> Int / {sim.read} = with_cell[slot](Nothing) { s -> {
   let first = with_cell[log](41) { c -> simulate {
     let t = task.spawn(|| handle {
       let b = amb.flip();

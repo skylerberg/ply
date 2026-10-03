@@ -7,7 +7,7 @@ effect db {
   write put[r](key: Int, value: Int) -> Unit
 }
 
-fn total(keys: List<Int>) -> Int =
+fn total(keys: List<Int>) -> Int / {db.get[users]} =
   fold(keys, 0, |acc, k| acc + db.get[users](k))
 
 test "a cell-backed handler stands in for the database" {
