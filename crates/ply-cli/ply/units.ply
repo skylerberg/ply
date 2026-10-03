@@ -5,8 +5,8 @@
 
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.resolve (Diag)
-import compiler.unit (Dropped, Emission, shipped, compiled, emitted, emitter_identity, held,
-                      read_kept, write_kept)
+import compiler.unit (Dropped, Emission, Made, shipped, emitted, emitter_identity, held, read_kept,
+                      write_kept)
 import env (env)
 import sources (under_abs)
 import std.fs (fs)
@@ -14,12 +14,29 @@ import std.process (process)
 import std.random (entropy)
 import std.time (time)
 
+// A unit's C as the runtime compiles it, and what it was made of, which says what each root runs.
+pub type Emitted = { text: Bytes, made: Made }
+
 // A command asks for the unit a run enters; what answers is `emitting`'s, which `main` runs every
 // command under, or a handler of the asker's own. The C is a function of what is asked, so the
 // effect is a deterministic one, whatever the answering keeps.
 pub effect emit {
-  read unit(front: LoadedAnalysis, offered: List<Bytes>) -> Result<Bytes, List<Diag>>
+  read unit(front: LoadedAnalysis, offered: List<Bytes>) -> Result<Emitted, List<Diag>>
 }
+
+fn emitted_of(
+  front: LoadedAnalysis,
+  offered: List<Bytes>,
+  emission: Result<Emission, Bytes>,
+) -> Result<Emitted, List<Diag>> / {abort.raise} =
+  match held(front.dump, offered, emission) {
+    Err(diags) -> Err(diags),
+    Ok(text) ->
+      Ok({
+        text: text,
+        made: match emission { Ok(e) -> e.produced.made, Err(_) -> { bodies: [], offered: [] } },
+      }),
+  }
 
 // What emitting a unit here reaches: the runtime it is compiled against, this program's own
 // definitions, the emitter's among them, the answers kept between runs under the toolchain's cache,
@@ -98,7 +115,7 @@ fn told(
 fn unit_of(
   front: LoadedAnalysis,
   offered: List<Bytes>,
-) -> Result<Bytes, List<Diag>> / {Emits, abort.raise} = {
+) -> Result<Emitted, List<Diag>> / {Emits, abort.raise} = {
   let k = knobs();
   let wanted = narrowed(k, offered);
   let identity = emitter_identity(shipped.definitions());
@@ -114,12 +131,20 @@ fn unit_of(
     |key: Bytes, bytes: Bytes| write_kept[abs](dir, key, bytes),
   );
   told(k, len(wanted), emission, identity, time.elapsed_ms() - started);
-  held(front.dump, wanted, emission)
+  emitted_of(front, wanted, emission)
 }
 
-// The whole program's unit, every root it offers, as the runtime compiles it.
-pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit} =
+// A unit's C alone, for whoever only enters it.
+pub fn text_of(r: Result<Emitted, List<Diag>>) -> Result<Bytes, List<Diag>> =
+  match r { Ok(e) -> Ok(e.text), Err(diags) -> Err(diags) }
+
+// The whole program's unit, every root it offers, and what it was made of.
+pub fn whole_emitted(front: LoadedAnalysis) -> Result<Emitted, List<Diag>> / {emit.unit} =
   emit.unit(front, every_root(front))
+
+// The whole program's unit, as the runtime compiles it.
+pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit} =
+  text_of(whole_emitted(front))
 
 // The unit a run executes in, or none for a run that executes nothing.
 pub fn wanted(
@@ -144,13 +169,17 @@ pub fn emitting_fresh<a | e>(
 fn fresh(
   front: LoadedAnalysis,
   offered: List<Bytes>,
-) -> Result<Bytes, List<Diag>> / {shipped.runtime, abort.raise} =
-  compiled(
-    shipped.runtime(),
-    front.dump,
-    texts(front),
+) -> Result<Emitted, List<Diag>> / {shipped.runtime, abort.raise} =
+  emitted_of(
+    front,
     offered,
-    b"",
-    |_: Bytes| None,
-    |_: Bytes, _: Bytes| (),
+    emitted(
+      shipped.runtime(),
+      front.dump,
+      texts(front),
+      offered,
+      b"",
+      |_: Bytes| None,
+      |_: Bytes, _: Bytes| (),
+    ),
   )

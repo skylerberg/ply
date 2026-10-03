@@ -10,7 +10,7 @@ import compiler.front (body_key)
 import engine (Store, Found, Hit, Miss, Bad, Warning, Trouble, Corrupt, Unreadable, OtherVersion,
                open, get, put, drop, keys, flush, compact, stats, warn, messages, pending)
 import twin (on_twin)
-import upstream (Upstream, read_entry, entry_keys, publish)
+import upstream (Upstream, read_entry, entry_keys, publish, mark_live)
 
 // --- Tables -----------------------------------------------------------------
 
@@ -27,6 +27,7 @@ fn t_shipped() -> Int = 10
 fn t_stamps() -> Int = 11
 fn t_loads() -> Int = 12
 fn t_priors() -> Int = 13
+fn t_code_passes() -> Int = 14
 
 // --- Records ----------------------------------------------------------------
 
@@ -73,8 +74,9 @@ type Named<a> = { name: String, value: a }
 // What a human last accepted for a definition: its hash, and its own clauses' and laws' keys.
 pub type Review = { def: Bytes, specs: List<Bytes> }
 
-// The build the versioned groups were filed by: its front end's digest and its runtime's.
-pub type Stamps = { frontend: String, runtime: String }
+// The build the versioned groups were filed by: its front end's digest, its runtime's, and the one
+// a pass filed under the code its test ran answers to, which no compiler change moves.
+pub type Stamps = { frontend: String, runtime: String, code: String }
 
 derive bin for FileSpan
 derive bin for DefKind
@@ -105,7 +107,8 @@ pub fn schema() -> Bytes / {abort.raise} =
 pub type Package = { root: String, identity: String }
 
 // One run's view of the store: the engine's, how this run's paths are keyed, and the upstream it
-// shares passes and evidence with, whose passes it read when it attached.
+// shares passes and evidence with, whose passes it read when it attached; passes filed under code
+// are shared under a schema of their own, which a compiler change leaves where it was.
 pub type Cache = {
   store: Store,
   root: String,
@@ -113,6 +116,8 @@ pub type Cache = {
   stamps: Stamps,
   upstream: Option<Upstream>,
   shared: Map<Bytes, Bool>,
+  code_upstream: Option<Upstream>,
+  code_shared: Map<Bytes, Bool>,
 }
 
 pub fn open_cache<[r]>(
@@ -128,6 +133,8 @@ pub fn open_cache<[r]>(
     stamps: stamps,
     upstream: None,
     shared: map_new(),
+    code_upstream: None,
+    code_shared: map_new(),
   }
 
 fn stamps_key() -> Bytes = named_key("stamps")
@@ -148,6 +155,12 @@ fn groups(was: Stamps, now: Stamps) -> List<Group> =
       was: was.runtime,
       now: now.runtime,
       tables: [t_passed(), t_pass_records(), t_seen(), t_evidence()],
+    },
+    {
+      what: "the passes filed under the code their tests ran",
+      was: was.code,
+      now: now.code,
+      tables: [t_code_passes()],
     },
   ]
 
@@ -201,18 +214,21 @@ pub fn with_upstream<[u]>(
   root: String,
   publish: Bool,
 ) -> Cache / {fs.read[u], abort.raise} = {
-  let up = {
-    root: root,
-    schema: digest(schema() ++ bytes_of_string(c.stamps.runtime)),
-    publish: publish,
-  };
+  let under = |stamp: String|
+    { root: root, schema: digest(schema() ++ bytes_of_string(stamp)), publish: publish };
+  let up = under(c.stamps.runtime);
+  let code_up = under(c.stamps.code);
   {
     ..c,
     upstream: Some(up),
-    shared: fold(entry_keys[u](up, t_passed()), map_new(), |m: Map<Bytes, Bool>, k: Bytes|
-      map_insert(m, k, true)),
+    shared: published_keys[u](up, t_passed()),
+    code_upstream: Some(code_up),
+    code_shared: published_keys[u](code_up, t_code_passes()),
   }
 }
+
+fn published_keys<[u]>(up: Upstream, table: Int) -> Map<Bytes, Bool> / {fs.read[u], abort.raise} =
+  fold(entry_keys[u](up, table), map_new(), |m: Map<Bytes, Bool>, k: Bytes| map_insert(m, k, true))
 
 type Put = { table: Int, key: Bytes, payload: Bytes }
 
@@ -247,24 +263,44 @@ fn current<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} =
     _ -> restamped(s, now),
   }
 
+type Published = { failed: Int, known: Map<Bytes, Bool> }
+
+// Each of `puts` the upstream does not hold, published there; `known` is what it holds of `passes`.
+fn published_to<[u]>(
+  up: Upstream,
+  puts: List<Put>,
+  known: Map<Bytes, Bool>,
+  passes: Int,
+) -> Published / {fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} = {
+  let fresh = filter(puts, |p: Put| p.table != passes || !map_contains(known, p.key));
+  {
+    failed: fold(fresh, 0, |n: Int, p: Put|
+      if publish[u](up, p.table, p.key, p.payload) { n } else { n + 1 }),
+    known: fold(fresh, known, |m: Map<Bytes, Bool>, p: Put|
+      if p.table == passes { map_insert(m, p.key, true) } else { m }),
+  }
+}
+
 // The local write comes first, so an upstream that cannot be reached never costs a run its own record.
 pub fn flush_shared<[r], [u]>(
   c: Cache,
 ) -> Cache / {fs.read[r], fs.write[r], fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} = {
   let shared = puts_in(c.store, [t_passed(), t_evidence()]);
+  let coded = puts_in(c.store, [t_code_passes()]);
   let flushed = flush_cache[r](c);
-  match c.upstream {
-    None -> flushed,
-    Some(up) -> if !up.publish { flushed } else {
-      let fresh = filter(shared, |p: Put| p.table != t_passed() || !map_contains(c.shared, p.key));
-      let failed = fold(fresh, 0, |n: Int, p: Put|
-        if publish[u](up, p.table, p.key, p.payload) { n } else { n + 1 });
-      let known = fold(fresh, flushed.shared, |m: Map<Bytes, Bool>, p: Put|
-        if p.table == t_passed() { map_insert(m, p.key, true) } else { m });
-      let out = { ..flushed, shared: known };
+  match ((c.upstream, c.code_upstream)) {
+    (Some(up), Some(code_up)) -> if !up.publish { flushed } else {
+      let a = published_to[u](up, shared, flushed.shared, t_passed());
+      let b = published_to[u](code_up, coded, flushed.code_shared, t_code_passes());
+      // A merge keeps the schemas runs published under, so one this run read from stays too.
+      let _live = mark_live[u](up);
+      let _code_live = mark_live[u](code_up);
+      let out = { ..flushed, shared: a.known, code_shared: b.known };
+      let failed = a.failed + b.failed;
       if failed == 0 { out }
       else { { ..out, store: warn(out.store, Unreadable, published_failures(failed, up.root)) } }
     },
+    _ -> flushed,
   }
 }
 
@@ -479,23 +515,41 @@ pub fn put_body<[r]>(c: Cache, hash: Bytes, b: Body) -> Cache / {fs.read[r], abo
 
 // --- Test results -----------------------------------------------------------
 
-pub fn passed<[r]>(c: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
-  match get[r](c.store, t_passed(), key) {
+fn passed_in<[r]>(
+  c: Cache,
+  table: Int,
+  shared: Map<Bytes, Bool>,
+  key: Bytes,
+) -> Read<Bool> / {fs.read[r], abort.raise} =
+  match get[r](c.store, table, key) {
     Hit(_) -> { value: Some(true), cache: c },
-    Miss -> { value: Some(map_contains(c.shared, key)), cache: c },
-    Bad(why) ->
-      { value: Some(map_contains(c.shared, key)), cache: noted(c, damaged("result", why)) },
+    Miss -> { value: Some(map_contains(shared, key)), cache: c },
+    Bad(why) -> { value: Some(map_contains(shared, key)), cache: noted(c, damaged("result", why)) },
   }
+
+fn keys_in(c: Cache, table: Int, shared: Map<Bytes, Bool>) -> List<Bytes> / {abort.raise} =
+  map_keys(
+    fold(keys(c.store, table), shared, |m: Map<Bytes, Bool>, k: Bytes| map_insert(m, k, true)),
+  )
+
+pub fn passed<[r]>(c: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
+  passed_in[r](c, t_passed(), c.shared, key)
 
 pub fn put_passed(c: Cache, key: Bytes) -> Cache / {abort.raise} =
   { ..c, store: put(c.store, t_passed(), key, b"") }
 
 // Every key a pass is filed under here or in the upstream, read from the index alone.
-pub fn passed_keys(c: Cache) -> List<Bytes> / {abort.raise} =
-  map_keys(
-    fold(keys(c.store, t_passed()), c.shared, |m: Map<Bytes, Bool>, k: Bytes|
-      map_insert(m, k, true)),
-  )
+pub fn passed_keys(c: Cache) -> List<Bytes> / {abort.raise} = keys_in(c, t_passed(), c.shared)
+
+// A pass filed under the code its test ran, here or in the upstream.
+pub fn passed_code<[r]>(c: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
+  passed_in[r](c, t_code_passes(), c.code_shared, key)
+
+pub fn put_passed_code(c: Cache, key: Bytes) -> Cache / {abort.raise} =
+  { ..c, store: put(c.store, t_code_passes(), key, b"") }
+
+pub fn passed_code_keys(c: Cache) -> List<Bytes> / {abort.raise} =
+  keys_in(c, t_code_passes(), c.code_shared)
 
 // Every definition hash this store has seen pass, read from the index alone.
 pub fn seen_keys(c: Cache) -> List<Bytes> / {abort.raise} = keys(c.store, t_seen())
@@ -800,7 +854,7 @@ pub fn compact_cache<[r]>(
 
 fn h(name: String) -> Bytes = bytes_blake3(bytes_of_string(name))
 
-fn built() -> Stamps = { frontend: "frontend", runtime: "runtime" }
+fn built() -> Stamps = { frontend: "frontend", runtime: "runtime", code: "code" }
 
 fn span() -> FileSpan = { start: 0, end: 4 }
 
@@ -954,6 +1008,8 @@ test "a project's file is keyed by its path inside the root, a dependency's by i
     stamps: built(),
     upstream: None,
     shared: map_new(),
+    code_upstream: None,
+    code_shared: map_new(),
   };
   assert_eq(source_key(c, "proj/src/./a.ply"), Some("src/a.ply"));
   assert_eq(source_key(c, "proj/vendor/lib/x.ply"), Some("b3:lib/x.ply"));
@@ -1033,6 +1089,57 @@ test "an upstream's passes and evidence answer here, and what this run learns is
     ]
   });
   assert_eq(run.value, [true, true, true, true, true])
+}
+
+test "a pass filed under the code its test ran outlives another runtime stamp, and goes with its own" {
+  let run = on_twin(mem_empty(), || {
+    let a = open_cache[mem]("cache", "", [], built());
+    let _filed = flush_cache[mem](put_passed_code(put_passed(a, h("result")), h("code")));
+    let moved = open_cache[mem]("cache", "", [], { ..built(), runtime: "another" });
+    let recoded = open_cache[mem]("cache", "", [], {
+      ..built(),
+      runtime: "another",
+      code: "another",
+    });
+    [
+      passed[mem](moved, h("result")).value,
+      passed_code[mem](moved, h("code")).value,
+      passed_code[mem](recoded, h("code")).value,
+    ]
+  });
+  assert_eq(run.value, [Some(false), Some(true), Some(false)])
+}
+
+test "a pass filed under its code is shared under a schema of its own, which another runtime reads" {
+  let run = on_twin(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
+    let _published = flush_shared[mem, mem](put_passed_code(put_passed(a, h("pass")), h("code")));
+    let b = with_upstream[mem](
+      open_cache[mem]("two/cache", "two", [], { ..built(), runtime: "another" }),
+      "shared",
+      true,
+    );
+    [passed[mem](b, h("pass")).value, passed_code[mem](b, h("code")).value]
+  });
+  assert_eq(run.value, [Some(false), Some(true)])
+}
+
+test "a publishing run marks every schema it used live, and a read-only one marks none" {
+  let lives = |publish: Bool|
+    on_twin(mem_empty(), || {
+      let a = with_upstream[mem](
+        open_cache[mem]("one/cache", "one", [], built()),
+        "shared",
+        publish,
+      );
+      let _flushed = flush_shared[mem, mem](a);
+      match fs.list_dir[mem]("shared/v2") {
+        Some(dirs) -> len(filter(dirs, |d: String| fs.exists[mem]("shared/v2/" ++ d ++ "/live"))),
+        None -> 0,
+      }
+    }).value;
+  assert_eq(lives(true), 2);
+  assert_eq(lives(false), 0)
 }
 
 test "a read-only upstream answers and is not written" {

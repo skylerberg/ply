@@ -84,6 +84,18 @@ fn outcomes_over<[r]>(
     }
   })
 
+fn code_outcomes_over<[r]>(
+  c0: tables::Cache,
+  keys: List<String>,
+) -> StoreRead<List<Option<String>>> / {fs.read[r], abort.raise} =
+  fold(keys, { value: [], cache: c0 }, |acc: StoreRead<List<Option<String>>>, key: String| {
+    let got = tables::passed_code[r](acc.cache, bytes_of_hex(key));
+    {
+      value: push(acc.value, if got.value == Some(true) { Some("passed") } else { None }),
+      cache: got.cache,
+    }
+  })
+
 fn seen_over<[r]>(
   c: tables::Cache,
   hashes: List<String>,
@@ -159,9 +171,15 @@ fn interfaces_over<[r]>(
 // What a filing puts, before anything is flushed: a pass or a sighting already kept is not put again.
 fn noted<[r]>(c0: tables::Cache, f: Filing) -> tables::Cache / {fs.read[r], abort.raise} = {
   let passed = hex_set(tables::passed_keys(c0));
+  let coded = hex_set(tables::passed_code_keys(c0));
   let seen = hex_set(tables::seen_keys(c0));
-  let c1 = fold(f.passes, c0, |c: tables::Cache, key: String|
-    if map_contains(passed, key) { c } else { tables::put_passed(c, bytes_of_hex(key)) });
+  let c1 = fold(
+    f.codes,
+    fold(f.passes, c0, |c: tables::Cache, key: String|
+      if map_contains(passed, key) { c } else { tables::put_passed(c, bytes_of_hex(key)) }),
+    |c: tables::Cache, key: String|
+      if map_contains(coded, key) { c } else { tables::put_passed_code(c, bytes_of_hex(key)) },
+  );
   let c2 = fold(f.records, c1, |c: tables::Cache, e: { key: String, record: PassRecord }|
     tables::put_pass_record[r](c, e.key, {
       test_hash: bytes_of_hex(e.record.test),
@@ -187,7 +205,7 @@ fn said(c: tables::Cache) -> List<Diag> = loads::diags_of(tables::warnings(c))
 // `ply test`'s reads and writes, over the store a run opened, each said once.
 pub fn with_ledger<a | e>(
   kept: Option<OpenStore>,
-  go: () -> a / {ledger.opened, ledger.outcomes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed | e},
+  go: () -> a / {ledger.opened, ledger.outcomes, ledger.code_outcomes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
   with_cell[books](kept) { held -> {
     let read = |k: OpenStore, c: tables::Cache| cell_set(held, Some({ ..k, cache: c }));
@@ -206,6 +224,15 @@ pub fn with_ledger<a | e>(
         Some(k) -> {
           let o = if k.place.label == "cwd" { outcomes_over[cwd](k.cache, keys) }
           else { outcomes_over[abs](k.cache, keys) };
+          read(k, o.cache);
+          o.value
+        },
+      },
+      ledger.code_outcomes(keys) -> match cell_get(held) {
+        None -> map(keys, |key: String| None),
+        Some(k) -> {
+          let o = if k.place.label == "cwd" { code_outcomes_over[cwd](k.cache, keys) }
+          else { code_outcomes_over[abs](k.cache, keys) };
           read(k, o.cache);
           o.value
         },
@@ -408,6 +435,7 @@ fn solo(payload: String) -> { hash: Bytes, body: Bytes } / {abort.raise} = {
 fn a_filing() -> Filing / {abort.raise} =
   {
     passes: [hash_hex("t key")],
+    codes: [hash_hex("t code")],
     records: [
       {
         key: "m.t",
@@ -417,12 +445,13 @@ fn a_filing() -> Filing / {abort.raise} =
     seen: [hash_hex("f")],
   }
 
-fn built() -> tables::Stamps = { frontend: "frontend", runtime: "runtime" }
+fn built() -> tables::Stamps = { frontend: "frontend", runtime: "runtime", code: "code" }
 
-// What a later run reads back of a filing, beside a body filed before it.
+// What a later run reads back of a filing, beside a body filed before it, and what one whose
+// runtime stamp moved reads of its code keys.
 fn read_back(
   f: Filing,
-) -> { outcomes: List<Option<String>>, seen: List<Bool>, baselines: List<Option<PassRecord>>, bodies: List<Option<Bytes>> } / {abort.raise} = {
+) -> { outcomes: List<Option<String>>, codes: List<Option<String>>, moved: List<Option<String>>, seen: List<Bool>, baselines: List<Option<PassRecord>>, bodies: List<Option<Bytes>> } / {abort.raise} = {
   let b = solo("old f");
   on_twin(mem_empty(), || {
     let c0 = tables::put_body[mem](tables::open_cache[mem]("cache", "", [], built()), b.hash, {
@@ -431,8 +460,15 @@ fn read_back(
     });
     let c1 = tables::flush_cache[mem](noted[mem](c0, f));
     let r = tables::open_cache[mem]("cache", "", [], built());
+    let moved = tables::open_cache[mem]("cache", "", [], { ..built(), runtime: "another" });
     {
       outcomes: outcomes_over[mem](r, [hash_hex("t key"), hash_hex("other")]).value,
+      codes: code_outcomes_over[mem](r, [hash_hex("t code"), hash_hex("t key")]).value,
+      moved: fold(
+        code_outcomes_over[mem](moved, [hash_hex("t code")]).value,
+        outcomes_over[mem](moved, [hash_hex("t key")]).value,
+        |acc: List<Option<String>>, o: Option<String>| push(acc, o),
+      ),
       seen: seen_over[mem](r, [hash_hex("f"), hash_hex("g")]),
       baselines: pass_records_over[mem](r, ["m.t", "m.u"]).value,
       bodies: bodies_over[mem](r, [hex_of(b.hash), hash_hex("missing")]).value,
@@ -443,6 +479,9 @@ fn read_back(
 test "a run's passes, baselines and sightings are kept, and read back by key" {
   let back = read_back(a_filing());
   assert_eq(back.outcomes, [Some("passed"), None]);
+  assert_eq(back.codes, [Some("passed"), None]);
+  // Another runtime stamp drops the passes keyed by test, and keeps the ones keyed by code.
+  assert_eq(back.moved, [None, Some("passed")]);
   assert_eq(back.seen, [true, false]);
   assert_eq(back.baselines, [
     Some({ test: hash_hex("t"), closure: [{ name: "m.f", hash: hash_hex("f") }], decls: [] }),
@@ -452,7 +491,7 @@ test "a run's passes, baselines and sightings are kept, and read back by key" {
 }
 
 test "a filing of nothing keeps nothing" {
-  let back = read_back({ passes: [], records: [], seen: [] });
+  let back = read_back({ passes: [], codes: [], records: [], seen: [] });
   assert_eq(back.outcomes, [None, None]);
   assert_eq(back.seen, [false, false]);
   assert_eq(back.baselines, [None, None])
