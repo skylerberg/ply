@@ -30,6 +30,12 @@ pub fn runtime_digest() -> &'static str {
     RUNTIME
 }
 
+/// The runtime's sources less how C is compiled, kept, swept and loaded and how Rust asks the
+/// compiler: what an answer computed inside a loaded unit is a function of.
+pub fn semantics_digest() -> &'static str {
+    env!("PLY_SEMANTICS_DIGEST")
+}
+
 /// What the emitter refused, and where.
 #[derive(Debug)]
 pub struct Refused {
@@ -154,10 +160,11 @@ pub fn unit_head() -> String {
 }
 
 /// What a unit emitted against this runtime is a function of on the runtime's side: the sources
-/// that run while the emitter emits, and the helper table its C binds by position.
+/// that run while the emitter emits inside a loaded unit, and the helper table its C binds by
+/// position.
 pub fn runtime_identity() -> String {
     let mut h = blake3::Hasher::new();
-    h.update(env!("PLY_RUNTIME_DIGEST").as_bytes());
+    h.update(semantics_digest().as_bytes());
     h.update(&[0]);
     h.update(exports::helpers_digest().as_bytes());
     h.finalize().to_hex().to_string()

@@ -191,10 +191,14 @@ fn emit_all(
     );
     let bodies: Vec<Body> = {
         let positions = unit.positions();
+        let mut tags: HashMap<&str, usize> = HashMap::new();
+        for (i, (ctor, _)) in ctors.iter().enumerate() {
+            tags.entry(ctor.as_str()).or_insert(i);
+        }
         emitted
             .into_iter()
             .map(|(name, text, tables)| {
-                let text = resolve(&text, &tables, &name, &positions);
+                let text = resolve(&text, &tables, &name, &positions, &tags);
                 let reaches = reaches_of(&name, &tables);
                 Body {
                     name,
@@ -665,12 +669,13 @@ fn reaches_of(name: &str, tables: &super::tables::Tables) -> Vec<String> {
 
 /// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's, which
 /// holds everything the body names; `@@r@@` is the body's own root, `@@rN@@` a group's `N`th
-/// member.
+/// member, and `@@T<name>@@` a constructor's tag, the position `tags` gives its name.
 fn resolve(
     text: &str,
     tables: &super::tables::Tables,
     name: &str,
     positions: &Positions<'_>,
+    tags: &HashMap<&str, usize>,
 ) -> String {
     let named = "the unit's tables hold everything its bodies name";
     let consts: Vec<usize> = tables
@@ -709,6 +714,7 @@ fn resolve(
         let (kind, digits) = body[..end].split_at(1);
         let i = || -> usize { digits.parse().expect("an emitted placeholder is numbered") };
         let resolved: u64 = match kind {
+            "T" => *tags.get(digits).expect(named) as u64,
             "r" if digits.is_empty() => root_id(name),
             "r" => root_id(&tables.members[i()]),
             "c" => consts[i()] as u64,
@@ -716,7 +722,7 @@ fn resolve(
             "f" => fields[i()] as u64,
             "s" => shapes[i()] as u64,
             "l" => lambdas[i()] as u64,
-            other => unreachable!("an emitted placeholder is one of six kinds, not `{other}`"),
+            other => unreachable!("an emitted placeholder is one of seven kinds, not `{other}`"),
         };
         out.push_str(&resolved.to_string());
         rest = &body[end + 2..];
