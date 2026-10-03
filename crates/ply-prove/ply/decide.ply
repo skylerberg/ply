@@ -29,51 +29,56 @@ pub fn decision_word(d: Decision) -> String =
 
 pub type Diagnosed = { decision: Decision, blockers: List<Blocker> }
 
-pub fn decide(cx: Context, g: Goal, limits: Limits) -> Decision / {abort.raise} =
-  decide_and_diagnose(cx, g, limits).decision
+pub fn decide(context: Context, g: Goal, limits: Limits) -> Decision / {abort.raise} =
+  decide_and_diagnose(context, g, limits).decision
 
 fn inconclusive(a: Answer) -> Option<Reason> =
   match a { Closed -> None, Exhausted -> Some(BudgetSpent), _ -> Some(Open) }
 
-pub fn decide_and_diagnose(cx: Context, g: Goal, limits: Limits) -> Diagnosed / {abort.raise} = {
+pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnosed / {abort.raise} = {
   let start = lowering(no_rules(), limits.unfold_depth);
   let bound = fold(
     g.binders,
-    { lw: start, ids: [] },
-    |acc: { lw: Lowering, ids: List<Int> }, b: Binder| {
-      let r = bind_symbolic(acc.lw, b.ty, cx);
-      { lw: r.lw, ids: push(acc.ids, r.id) }
+    { lowering: start, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, b: Binder| {
+      let r = bind_symbolic(acc.lowering, b.ty, context);
+      { lowering: r.lowering, ids: push(acc.ids, r.id) }
     },
   );
   // The evaluator stops at the first false `requires`, so a later one may assume the earlier.
   let guarded = fold(
     g.guards,
-    { lw: bound.lw, ids: [] },
-    |acc: { lw: Lowering, ids: List<Int> }, guard: Option<Code>| {
-      let r = lower_root(acc.lw, cx, guard, bound.ids);
-      { lw: assume(r.lw, r.id), ids: push(acc.ids, r.id) }
+    { lowering: bound.lowering, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(acc.lowering, context, guard, bound.ids);
+      { lowering: assume(r.lowering, r.id), ids: push(acc.ids, r.id) }
     },
   );
   // Requirements before this mark decide the guard, so they may not assume it.
-  let guard_mark = len(guarded.lw.requirements);
+  let guard_mark = len(guarded.lowering.requirements);
   let defined = match g.result {
-    Some(result_body) -> if len(bound.ids) == 0 { { lw: guarded.lw, def: None } } else {
-      let r = lower_root(guarded.lw, cx, result_body, take(bound.ids, len(bound.ids) - 1));
+    Some(result_body) -> if len(bound.ids) == 0 { { lowering: guarded.lowering, def: None } } else {
+      let r = lower_root(
+        guarded.lowering,
+        context,
+        result_body,
+        take(bound.ids, len(bound.ids) - 1),
+      );
       {
-        lw: r.lw,
+        lowering: r.lowering,
         def: Some({
           symbol: match list_at(bound.ids, len(bound.ids) - 1) { Some(t) -> t, None -> 0 },
           value: r.id,
         }),
       }
     },
-    None -> { lw: guarded.lw, def: None },
+    None -> { lowering: guarded.lowering, def: None },
   };
-  let body = lower_root(defined.lw, cx, g.body, bound.ids);
-  let lw = body.lw;
-  let blockers = lw.blockers;
+  let body = lower_root(defined.lowering, context, g.body, bound.ids);
+  let lowering = body.lowering;
+  let blockers = lowering.blockers;
   // `Float` is refused before any solver runs, so no proof or certificate can be built.
-  if lw.float || float_in(cx, lw.ts) {
+  if lowering.float || float_in(context, lowering.terms) {
     {
       decision: Unknown({ reason: Open, steps: 0 }),
       blockers: if fold(blockers, false, |f: Bool, b: Blocker| f || b == FloatTerm) { blockers }
@@ -82,30 +87,31 @@ pub fn decide_and_diagnose(cx: Context, g: Goal, limits: Limits) -> Diagnosed / 
   } else {
     let definition = match defined.def {
       Some(d) -> {
-        let m = eq(lw.ts, d.symbol, d.value);
-        { ts: m.ts, eq: Some(m.id), symbol: Some(d.symbol) }
+        let m = eq(lowering.terms, d.symbol, d.value);
+        { terms: m.terms, eq: Some(m.id), symbol: Some(d.symbol) }
       },
-      None -> { ts: lw.ts, eq: None, symbol: None },
+      None -> { terms: lowering.terms, eq: None, symbol: None },
     };
     let guards = map(guarded.ids, |t: Int| { term: t, polarity: true });
-    let ranges = int_ranges(definition.ts, definition.symbol, map_new());
-    let guard_needs = take(lw.requirements, guard_mark);
-    let body_needs = drop_front(lw.requirements, guard_mark);
+    let ranges = int_ranges(definition.terms, definition.symbol, map_new());
+    let guard_needs = take(lowering.requirements, guard_mark);
+    let body_needs = drop_front(lowering.requirements, guard_mark);
     // A guard that can raise has no domain, so the obligation is not decided at any tier.
-    let needed = conjunction(ranges.ts, guard_needs);
+    let needed = conjunction(ranges.terms, guard_needs);
     let checked = match needed.id {
-      None -> { ts: needed.ts, rules: lw.rules, budget: limits.steps, spent: 0, stop: None },
+      None ->
+        { terms: needed.terms, rules: lowering.rules, budget: limits.steps, spent: 0, stop: None },
       Some(conjoined) -> {
         let r = run(
-          needed.ts,
-          cx,
-          lw.rules,
+          needed.terms,
+          context,
+          lowering.rules,
           limits.steps,
           limits,
           push(ranges.out, { term: conjoined, polarity: false }),
         );
         {
-          ts: r.ts,
+          terms: r.terms,
           rules: r.rules,
           budget: r.left,
           spent: limits.steps - r.left,
@@ -118,11 +124,11 @@ pub fn decide_and_diagnose(cx: Context, g: Goal, limits: Limits) -> Diagnosed / 
         { decision: Unknown({ reason: reason, steps: checked.spent }), blockers: blockers },
       None -> {
         let vacuity = if len(guards) == 0 {
-          { ts: checked.ts, budget: checked.budget, spent: checked.spent, vacuous: false }
+          { terms: checked.terms, budget: checked.budget, spent: checked.spent, vacuous: false }
         } else {
-          let r = run(checked.ts, cx, no_rules(), checked.budget, limits, guards);
+          let r = run(checked.terms, context, no_rules(), checked.budget, limits, guards);
           {
-            ts: r.ts,
+            terms: r.terms,
             budget: r.left,
             spent: checked.spent + (checked.budget - r.left),
             vacuous: r.answer == Closed,
@@ -130,13 +136,13 @@ pub fn decide_and_diagnose(cx: Context, g: Goal, limits: Limits) -> Diagnosed / 
         };
         if vacuity.vacuous { { decision: GuardUnsatisfiable(vacuity.spent), blockers: blockers } }
         else {
-          let needs = conjunction(vacuity.ts, body_needs);
+          let needs = conjunction(vacuity.terms, body_needs);
           let claim = match needs.id {
             Some(n) -> {
-              let m = and(needs.ts, body.id, n);
-              { ts: m.ts, id: m.id }
+              let m = and(needs.terms, body.id, n);
+              { terms: m.terms, id: m.id }
             },
-            None -> { ts: needs.ts, id: body.id },
+            None -> { terms: needs.terms, id: body.id },
           };
           let assertions = push(
             appended(appended(ranges.out, guards), match definition.eq {
@@ -145,11 +151,11 @@ pub fn decide_and_diagnose(cx: Context, g: Goal, limits: Limits) -> Diagnosed / 
             }),
             { term: claim.id, polarity: false },
           );
-          let r = run(claim.ts, cx, checked.rules, vacuity.budget, limits, assertions);
+          let r = run(claim.terms, context, checked.rules, vacuity.budget, limits, assertions);
           let spent = vacuity.spent + (vacuity.budget - r.left);
           match inconclusive(r.answer) {
             Some(reason) -> {
-              let tried = attempt(cx, g, limits, r.left, spent, blockers);
+              let tried = attempt(context, g, limits, r.left, spent, blockers);
               match tried.proof {
                 Some(p) -> { decision: Proved(p), blockers: tried.blockers },
                 None ->
@@ -157,13 +163,14 @@ pub fn decide_and_diagnose(cx: Context, g: Goal, limits: Limits) -> Diagnosed / 
               }
             },
             None -> {
-              let sat = if !domain_inhabited(cx, g.binders) { { ok: false, spent: spent } } else {
-                let all = conjunction(r.ts, guarded.ids);
+              let sat = if !domain_inhabited(context, g.binders) { { ok: false, spent: spent } }
+              else {
+                let all = conjunction(r.terms, guarded.ids);
                 match all.id {
                   None -> { ok: true, spent: spent },
                   // A valid guard over a non-empty domain admits a value.
                   Some(a) -> {
-                    let v = run(all.ts, cx, no_rules(), r.left, limits, [
+                    let v = run(all.terms, context, no_rules(), r.left, limits, [
                       { term: a, polarity: false },
                     ]);
                     { ok: v.answer == Closed, spent: spent + (r.left - v.left) }
