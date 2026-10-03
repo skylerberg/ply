@@ -1568,6 +1568,43 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
     out as Word
 }
 
+/// A witnessed operator over two immediates, when the witness is `Int` or a width compiled code
+/// holds as its `Int`: the answer, or `None` for the value path to give, or to raise, instead.
+fn narrow_binary(op: i64, w: i64, a: i64, b: i64) -> Option<Word> {
+    let range = if w == ply_eval::builtins::INT_WITNESS {
+        None
+    } else {
+        let t = *ply_eval::INT_TYPES.get(usize::try_from(w).ok()?)?;
+        if t.bits() >= 64 {
+            return None;
+        }
+        Some((
+            i64::try_from(ply_eval::IntTy::min(t)).ok()?,
+            i64::try_from(ply_eval::IntTy::max(t)).ok()?,
+        ))
+    };
+    let op = ply_eval::builtins::NUMERIC_OPS.get(usize::try_from(op).ok()?)?;
+    let n = match op {
+        BinOp::Add => a.checked_add(b)?,
+        BinOp::Sub => a.checked_sub(b)?,
+        BinOp::Mul => a.checked_mul(b)?,
+        BinOp::Div => a.checked_div(b)?,
+        BinOp::Rem => a.checked_rem(b)?,
+        BinOp::BitAnd => a & b,
+        BinOp::BitOr => a | b,
+        BinOp::BitXor => a ^ b,
+        BinOp::Lt => return Some(heap::bool(a < b)),
+        BinOp::Le => return Some(heap::bool(a <= b)),
+        BinOp::Gt => return Some(heap::bool(a > b)),
+        BinOp::Ge => return Some(heap::bool(a >= b)),
+        _ => return None,
+    };
+    match range {
+        Some((lo, hi)) if n < lo || n > hi => None,
+        _ => heap::fits_imm(n).then(|| heap::imm(n)),
+    }
+}
+
 /// The cell a word names, when it is one.
 fn cell_of(w: Word) -> Option<Slot> {
     if heap::kind(w) != crate::heap::KIND_BRIDGE {
@@ -1762,6 +1799,24 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             }
             heap::dec(*xs);
             Some(ctx.heap.list_from(&items))
+        }
+        (Builtin::NumericBinary, [op, w, x, y])
+            if heap::is_imm(*op) && heap::is_imm(*w) && heap::is_imm(*x) && heap::is_imm(*y) =>
+        {
+            narrow_binary(
+                heap::imm_value(*op),
+                heap::imm_value(*w),
+                heap::imm_value(*x),
+                heap::imm_value(*y),
+            )
+        }
+        (Builtin::Min | Builtin::Max, [x, y]) if heap::is_imm(*x) && heap::is_imm(*y) => {
+            let (a, b) = (heap::imm_value(*x), heap::imm_value(*y));
+            Some(heap::imm(if (a <= b) == (which == Builtin::Min) {
+                a
+            } else {
+                b
+            }))
         }
         (Builtin::Range, [lo, hi]) => {
             let (a, b) = (heap::as_int(*lo)?, heap::as_int(*hi)?);

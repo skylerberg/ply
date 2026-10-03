@@ -499,6 +499,26 @@ need the callee's type parameter at another type is polymorphic recursion, which
 Ply does not infer. That is `E0308` as well: break the cycle so the callee is
 checked on its own before the call, or monomorphise it.
 
+`where numeric(a)` lets a type parameter take arithmetic and the ordered
+comparisons: `+`, `-`, `*`, `%`, unary `-`, `<` and the rest, and
+`numeric_of_int(n)` writes a constant at it. `where integer(a)` adds `/` and the
+bit operators. A call fills `a` with one of the numeric types — `Int`, the
+fixed-width integers, `Float` and `Decimal` (`integer`: the first two) — or with
+a parameter of its own the same constraint is on; any other type is `E0201`.
+Each operator raises where it raises at that type, a width's overflow included:
+
+```ply
+fn sum<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)
+```
+
+The type a call fills a constrained parameter with is passed as a hidden
+argument, so such a definition must be called directly; used as a value it is
+`E0310`, and a lambda that calls it is the value. A call can only fill a
+parameter its signature's parameters or answer mention, and inside a recursive
+group only the definition itself holds the type, so a constrained parameter the
+signature never mentions, or a call from another member of the group, is
+`E0310` too. A spec clause assumes its definition's constraints.
+
 ### 4.6 Types the language declares
 
 In scope everywhere; redeclaring one is `E0105`:
@@ -1384,7 +1404,8 @@ authority when this page and it disagree.
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
 | `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
 | `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
-| `min`, `max` `(a: Int, b: Int) -> Int` | |
+| `min<a>(a: a, b: a) -> a`, `max` | in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)` |
+| `numeric_of_int<a>(n: Int) -> a` | `n` at the `numeric` type the call is at (§4.5); `E0502` past a width's range |
 | `cell_get<a>(c: Cell<a>) -> a` | |
 | `cell_set<a>(c: Cell<a>, v: a) -> Unit` | |
 | `cell_update<a \| e>(c: Cell<a>, f: (a) -> a / e) -> Unit / e` | the cell is unreadable while `f` runs |
@@ -2537,9 +2558,11 @@ becomes the one a caller names.
 ```ply
 pub fn min_int() -> Int
 pub fn max_int() -> Int
-pub fn abs(n: Int) -> Int
-pub fn sign(n: Int) -> Int
-pub fn clamp(n: Int, lo: Int, hi: Int) -> Int
+pub fn abs<a>(n: a) -> a where numeric(a)
+pub fn sign<a>(n: a) -> Int where numeric(a)
+pub fn clamp<a>(n: a, lo: a, hi: a) -> a where numeric(a)
+pub fn sum<a>(xs: List<a>) -> a where numeric(a)
+pub fn product<a>(xs: List<a>) -> a where numeric(a)
 pub fn even(n: Int) -> Bool
 pub fn odd(n: Int) -> Bool
 pub fn gcd(a: Int, b: Int) -> Int
@@ -2550,14 +2573,13 @@ pub fn factorial(n: Int) -> Int
 pub fn isqrt(n: Int) -> Int
 ```
 
-`min` and `max` are prelude builtins and stay there. Everything here is `Int`,
-which is `i64`, and the arithmetic wraps at that width rather than raising, so
-`pow` and `abs(min_int())` answer a wrapped value — a checked variant would have
-to say what it answers instead, and that belongs with `B10`'s numeric
-predicates. `gcd` and `lcm` are never negative, and `gcd(0, 0)` is `0`.
-`is_prime` says no for zero, one and every negative, `factorial` is `1` at and
-below one, and `isqrt` is the greatest `r` with `r * r <= n` — `0` for a negative
-`n`, which has none.
+`min` and `max` are prelude builtins and stay there. `abs`, `sign`, `clamp`,
+`sum` and `product` take any numeric type (§4.5) and raise where its operators
+raise, so `abs(min_int())` and a width's overflowing `sum` raise; an empty
+list's `sum` is zero and its `product` one. The rest is `Int`. `gcd` and `lcm`
+are never negative, and `gcd(0, 0)` is `0`. `is_prime` says no for zero, one and
+every negative, `factorial` is `1` at and below one, and `isqrt` is the greatest
+`r` with `r * r <= n` — `0` for a negative `n`, which has none.
 
 ### 13.29 `std.list`
 
@@ -3384,6 +3406,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0307` | mutually recursive definitions binding different label or row parameters |
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
+| `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, a parameter its signature never mentions, or a call from another member of its recursive group |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` or `Chan` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
