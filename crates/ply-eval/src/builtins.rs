@@ -173,6 +173,26 @@ pub enum Builtin {
     NumericUnary,
     /// `numeric_of_int(n)`, called with the witness the elaboration passes first.
     NumericOfInt,
+    FloatOfInt,
+    /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
+    IntOfFloat,
+    Floor,
+    Ceil,
+    Round,
+    Sqrt,
+    Pow,
+    Exp,
+    Ln,
+    Log2,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Hypot,
 }
 
 impl Builtin {
@@ -341,6 +361,25 @@ impl Builtin {
             "?numeric_binary" => Builtin::NumericBinary,
             "?numeric_unary" => Builtin::NumericUnary,
             "numeric_of_int" => Builtin::NumericOfInt,
+            "float_of_int" => Builtin::FloatOfInt,
+            "int_of_float" => Builtin::IntOfFloat,
+            "floor" => Builtin::Floor,
+            "ceil" => Builtin::Ceil,
+            "round" => Builtin::Round,
+            "sqrt" => Builtin::Sqrt,
+            "pow" => Builtin::Pow,
+            "exp" => Builtin::Exp,
+            "ln" => Builtin::Ln,
+            "log2" => Builtin::Log2,
+            "log10" => Builtin::Log10,
+            "sin" => Builtin::Sin,
+            "cos" => Builtin::Cos,
+            "tan" => Builtin::Tan,
+            "asin" => Builtin::Asin,
+            "acos" => Builtin::Acos,
+            "atan" => Builtin::Atan,
+            "atan2" => Builtin::Atan2,
+            "hypot" => Builtin::Hypot,
             _ => return None,
         })
     }
@@ -478,6 +517,25 @@ impl Builtin {
             Builtin::NumericBinary => "?numeric_binary",
             Builtin::NumericUnary => "?numeric_unary",
             Builtin::NumericOfInt => "numeric_of_int",
+            Builtin::FloatOfInt => "float_of_int",
+            Builtin::IntOfFloat => "int_of_float",
+            Builtin::Floor => "floor",
+            Builtin::Ceil => "ceil",
+            Builtin::Round => "round",
+            Builtin::Sqrt => "sqrt",
+            Builtin::Pow => "pow",
+            Builtin::Exp => "exp",
+            Builtin::Ln => "ln",
+            Builtin::Log2 => "log2",
+            Builtin::Log10 => "log10",
+            Builtin::Sin => "sin",
+            Builtin::Cos => "cos",
+            Builtin::Tan => "tan",
+            Builtin::Asin => "asin",
+            Builtin::Acos => "acos",
+            Builtin::Atan => "atan",
+            Builtin::Atan2 => "atan2",
+            Builtin::Hypot => "hypot",
         }
     }
 
@@ -486,6 +544,20 @@ impl Builtin {
         match self {
             Builtin::MapNew => (0, 0),
             Builtin::Len
+            | Builtin::FloatOfInt
+            | Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Sqrt
+            | Builtin::Exp
+            | Builtin::Ln
+            | Builtin::Log2
+            | Builtin::Log10
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
             | Builtin::IntToString
             | Builtin::FloatToString
             | Builtin::ByteOfInt
@@ -596,6 +668,11 @@ impl Builtin {
             | Builtin::NumericOfInt
             | Builtin::ArrayNew
             | Builtin::ArrayAt
+            | Builtin::IntOfFloat
+            | Builtin::Round
+            | Builtin::Pow
+            | Builtin::Atan2
+            | Builtin::Hypot
             | Builtin::ArrayGet => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
@@ -789,6 +866,25 @@ impl Builtin {
             Builtin::NumericBinary,
             Builtin::NumericUnary,
             Builtin::NumericOfInt,
+            Builtin::FloatOfInt,
+            Builtin::IntOfFloat,
+            Builtin::Floor,
+            Builtin::Ceil,
+            Builtin::Round,
+            Builtin::Sqrt,
+            Builtin::Pow,
+            Builtin::Exp,
+            Builtin::Ln,
+            Builtin::Log2,
+            Builtin::Log10,
+            Builtin::Sin,
+            Builtin::Cos,
+            Builtin::Tan,
+            Builtin::Asin,
+            Builtin::Acos,
+            Builtin::Atan,
+            Builtin::Atan2,
+            Builtin::Hypot,
         ]
     }
 }
@@ -1469,6 +1565,32 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 }),
             }
         }
+        Builtin::FloatOfInt => Ok(Value::Float(args[0].as_int(span, "`float_of_int`")? as f64)),
+        Builtin::IntOfFloat => {
+            let x = args[0].as_float(span, "`int_of_float`")?;
+            let r = rounded(x, rounding(&args[1], span, "int_of_float")?);
+            Ok(option(int_of_whole(r).map(Value::Int)))
+        }
+        Builtin::Round => {
+            let x = args[0].as_float(span, "`round`")?;
+            Ok(Value::Float(rounded(x, rounding(&args[1], span, "round")?)))
+        }
+        Builtin::Floor => float1(&args[0], span, "`floor`", f64::floor),
+        Builtin::Ceil => float1(&args[0], span, "`ceil`", f64::ceil),
+        Builtin::Sqrt => float1(&args[0], span, "`sqrt`", f64::sqrt),
+        Builtin::Exp => float1(&args[0], span, "`exp`", libm::exp),
+        Builtin::Ln => float1(&args[0], span, "`ln`", libm::log),
+        Builtin::Log2 => float1(&args[0], span, "`log2`", libm::log2),
+        Builtin::Log10 => float1(&args[0], span, "`log10`", libm::log10),
+        Builtin::Sin => float1(&args[0], span, "`sin`", libm::sin),
+        Builtin::Cos => float1(&args[0], span, "`cos`", libm::cos),
+        Builtin::Tan => float1(&args[0], span, "`tan`", libm::tan),
+        Builtin::Asin => float1(&args[0], span, "`asin`", libm::asin),
+        Builtin::Acos => float1(&args[0], span, "`acos`", libm::acos),
+        Builtin::Atan => float1(&args[0], span, "`atan`", libm::atan),
+        Builtin::Pow => float2(args, span, "`pow`", libm::pow),
+        Builtin::Atan2 => float2(args, span, "`atan2`", libm::atan2),
+        Builtin::Hypot => float2(args, span, "`hypot`", libm::hypot),
 
         Builtin::StringSlice => {
             let s = args[0].as_str(span, "`string_slice`")?;
@@ -1724,6 +1846,55 @@ fn option(v: Option<Value>) -> Value {
         Some(v) => Value::ctor("Some", vec![v]),
         None => Value::ctor("None", Vec::new()),
     }
+}
+
+/// The NaN every float function answers, whatever NaN the machine produced.
+pub const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+
+/// Decided on the bits: the compiler may treat any NaN as any other, so a float-level choice
+/// between two NaNs can be folded away and an x86 sqrt's negative NaN kept.
+fn canonical(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let nan =
+        bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && bits & 0x000F_FFFF_FFFF_FFFF != 0;
+    f64::from_bits(if nan { CANONICAL_NAN_BITS } else { bits })
+}
+
+fn float1(x: &Value, span: Span, what: &str, f: fn(f64) -> f64) -> Result<Value, Diagnostic> {
+    Ok(Value::Float(canonical(f(x.as_float(span, what)?))))
+}
+
+fn float2(
+    args: &[Value],
+    span: Span,
+    what: &str,
+    f: fn(f64, f64) -> f64,
+) -> Result<Value, Diagnostic> {
+    let x = args[0].as_float(span, what)?;
+    let y = args[1].as_float(span, what)?;
+    Ok(Value::Float(canonical(f(x, y))))
+}
+
+/// `x` at a whole number, chosen as `mode` chooses a decimal's last digit.
+fn rounded(x: f64, mode: RoundingStrategy) -> f64 {
+    if !x.is_finite() {
+        return canonical(x);
+    }
+    match mode {
+        RoundingStrategy::MidpointAwayFromZero => x.round(),
+        RoundingStrategy::ToZero => x.trunc(),
+        RoundingStrategy::AwayFromZero if x.fract() != 0.0 => x.trunc() + x.signum(),
+        RoundingStrategy::AwayFromZero => x,
+        RoundingStrategy::ToPositiveInfinity => x.ceil(),
+        RoundingStrategy::ToNegativeInfinity => x.floor(),
+        _ => x.round_ties_even(),
+    }
+}
+
+/// A whole float as an `Int`, when one holds it.
+fn int_of_whole(x: f64) -> Option<i64> {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    (x.is_finite() && (-LIMIT..LIMIT).contains(&x)).then_some(x as i64)
 }
 
 fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagnostic> {
