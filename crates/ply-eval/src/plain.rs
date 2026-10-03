@@ -216,11 +216,11 @@ fn snapshot(v: &Value, bound: Option<(usize, usize)>, depth: usize) -> Plain {
         Value::Map(entries) => {
             let mut out: Vec<(Plain, Plain)> = entries
                 .iter()
-                .take(kept(entries.size()))
+                .take(kept(entries.len()))
                 .map(|(k, x)| (inner(k), inner(x)))
                 .collect();
-            if out.len() < entries.size() {
-                let more = (entries.size() - out.len()) as u64;
+            if out.len() < entries.len() {
+                let more = (entries.len() - out.len()) as u64;
                 out.push((Plain::Elided(more), Plain::Elided(more)));
             }
             Plain::Map(out)

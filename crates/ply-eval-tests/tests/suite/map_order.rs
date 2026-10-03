@@ -181,7 +181,7 @@ fn signed_zeros_are_two_keys_and_are_one_value() {
     // A lookup for `-0.0` would miss what `0.0` inserted.
     let m = map_of(vec![(pos, Value::Int(1)), (neg, Value::Int(2))]);
     let Value::Map(inner) = &m else { panic!() };
-    assert_eq!(inner.size(), 2);
+    assert_eq!(inner.len(), 2);
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn two_nans_are_one_key_and_are_not_equal() {
     // Why `Float` is not an ordered key type: this map holds a key the language's `==` cannot find.
     let m = map_of(vec![(nan, Value::Int(1))]);
     let Value::Map(m) = &m else { panic!() };
-    assert_eq!(m.size(), 1);
+    assert_eq!(m.len(), 1);
 }
 
 /// The two places IEEE `==` and a total order cannot both be right.
@@ -372,7 +372,7 @@ fn a_large_map_iterates_ascending() {
     rng.shuffle(&mut pairs);
     let m = map_of(pairs);
     let Value::Map(inner) = &m else { panic!() };
-    assert_eq!(inner.size(), 10_000);
+    assert_eq!(inner.len(), 10_000);
     let mut expected = 0i64;
     for (k, v) in inner.iter() {
         assert_eq!(*k, Value::Int(expected));
@@ -401,7 +401,7 @@ fn a_deep_chain_of_maps_drops_without_aborting() {
     let mut v = Value::empty_map();
     for i in 0..20_000i64 {
         let mut m = Map::new();
-        m.insert_mut(Value::Int(i), v);
+        m.insert(Value::Int(i), v);
         v = Value::Map(m);
     }
     drop(v);
