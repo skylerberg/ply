@@ -40,19 +40,13 @@ pub const FAMILIES: &[Family] = &[
         name: "builder",
         effect: "builder",
         hermetic: Some("hermetic_builder"),
-        summary: "build an artifact and stamp it",
+        summary: "read back the program a build is of",
     },
     Family {
         name: "hosts",
         effect: "tcb",
         hermetic: Some("hermetic_tcb"),
         summary: "preview what a run would bind",
-    },
-    Family {
-        name: "edit",
-        effect: "edit",
-        hermetic: None,
-        summary: "replace one item of a file with another",
     },
     Family {
         name: "shipped",
@@ -80,7 +74,6 @@ fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
         "tcb" => "hosts",
-        "edit" => "replace",
         "shipped" => "compiler.unit",
         other => other,
     }
@@ -104,7 +97,6 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),
         "hosts" => crate::hosts::lent(&declared("tcb")),
-        "edit" => crate::edit::lent(),
         "shipped" => crate::shipped::lent(),
         _ => return None,
     })

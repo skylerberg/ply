@@ -35,6 +35,7 @@ fn main() {
     // binary's own; the program configures what it drives.
     let binds = ply_machine::enter::Binds {
         lent: ply_machine::policy::all(),
+        executables: ply_launcher::executables(),
         trust: ply_launcher::trust(),
         ..ply_machine::enter::Binds::default()
     };
