@@ -11,7 +11,7 @@ import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow)
 import interface (stubbed)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
 import std.bin
-import std.list (take)
+import std.list (sort_by, take)
 import std.bytes (hex_of, u32_at, u64_le)
 import std.fs (fs)
 import std.hash (blake3)
@@ -1094,6 +1094,61 @@ fn emitter_answers(
   )
 }
 
+// How many calls the emitter's work is dealt over, whatever threads there are to take them.
+fn pieces() -> Int = 8
+
+type Piece = { weight: Int, roots: List<Bytes> }
+
+// `missed` as at most `pieces()` lists that lower about as much each: the longest module first onto
+// the lightest list, and a module's roots together, since the emitter groups what one call wants.
+fn dealt(p: Program, missed: List<Bytes>) -> List<List<Bytes>> / {abort.raise} = {
+  let by_module = fold(missed, map_new(), |acc: Map<Bytes, List<Bytes>>, n: Bytes| {
+    let m = module_of_root(n);
+    map_insert(acc, m, push(match map_get(acc, m) { Some(xs) -> xs, None -> [] }, n))
+  });
+  let lengths = fold(p.modules, map_new(), |acc: Map<Bytes, Int>, m: ModuleRow|
+    map_insert(acc, m.name, match text_at(p, m.index) { Some(t) -> bytes_len(t), None -> 0 }));
+  let weighed = map_fold(by_module, [], |acc: List<Piece>, m: Bytes, roots: List<Bytes>|
+    push(acc, { weight: match map_get(lengths, m) { Some(n) -> n, None -> 0 }, roots: roots }));
+  let longest_first = sort_by(weighed, |a: Piece, b: Piece| a.weight >= b.weight);
+  let dealt = fold(longest_first, [], |acc: List<Piece>, m: Piece|
+    if len(acc) < pieces() { push(acc, m) } else {
+      let lightest = fold(range(0, len(acc)), 0, |best: Int, i: Int|
+        if at(acc, i).weight < at(acc, best).weight { i } else { best });
+      map(range(0, len(acc)), |i: Int| {
+        let piece = at(acc, i);
+        if i == lightest { { weight: piece.weight + m.weight, roots: append(piece.roots, m.roots) } }
+        else { piece }
+      })
+    });
+  map(dealt, |piece: Piece| piece.roots)
+}
+
+// What the emitter answers for every list of `pieces` from `lo` up to `hi`, each list a call of its
+// own and the calls at once: a root's answer is the same whichever call asks for it.
+fn answers_at_once(
+  runtime: Runtime,
+  dump: Dump,
+  p: Program,
+  ctors: List<Ctor>,
+  pieces: List<List<Bytes>>,
+  lo: Int,
+  hi: Int,
+) -> List<RootAnswer> / {abort.raise} =
+  if hi - lo <= 1 {
+    match list_at(pieces, lo) {
+      Some(roots) -> emitter_answers(runtime, dump, p, ctors, roots),
+      None -> [],
+    }
+  } else {
+    let mid = lo + (hi - lo) / 2;
+    let halves = parallel {
+      answers_at_once(runtime, dump, p, ctors, pieces, lo, mid),
+      answers_at_once(runtime, dump, p, ctors, pieces, mid, hi),
+    };
+    append(halves._0, halves._1)
+  }
+
 // The unit over `offered`: each root's answer taken from what an earlier run kept where it stands,
 // the emitter entered once for the rest, what it answered kept for the next run, and the unit
 // produced over all of it. `emitter` is what the emitter's answers are a function of on its side,
@@ -1144,7 +1199,10 @@ pub fn emitted<| e>(
     decoded(read(refusal_key(m))));
   let kept = standing(looked, asked);
   let missed = filter(offered, |n: Bytes| !map_contains(kept, n));
-  let fresh = if len(missed) == 0 { [] } else { emitter_answers(runtime, dump, p, ctors, missed) };
+  let fresh = if len(missed) == 0 { [] } else {
+    let pieces = dealt(p, missed);
+    answers_at_once(runtime, dump, p, ctors, pieces, 0, len(pieces))
+  };
   if len(missed) > 0 && len(fresh) == 0 {
     Err(
       bytes_concat_all([
