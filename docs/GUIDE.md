@@ -24,7 +24,8 @@ fn main() -> Unit = assert_eq(greeting(), "hello from ply")
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a project root, defaulting to `.`.
 `ply check --types` prints every definition's inferred signature, each atom of
-its row marked with how many times a call performs it (§6.2).
+its row marked with how many times a call performs it (§6.2), and `div` on one
+whose calls may not return (§5.10).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
 `demo/main.ply` — a manifest (§3.3), a `main` and one test — and `cd demo &&
@@ -810,6 +811,40 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
 
 `std.parallel` (§13.36) splits a list across nested blocks.
 
+### 5.10 Termination
+
+```ply
+fn count(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }
+
+fn down(n: Int) -> Int = if n <= 0 { 0 } else { down(n - 1) }
+
+fn halves(n: Int) -> Int
+  decreases n
+  = if n <= 1 { 0 } else { 1 + halves(n / 2) }
+```
+
+The checker reads each recursive group, mutual recursion included, for a
+measure that every loop of calls back into the group lowers (size-change
+termination): a part of an argument — a constructor's field, a record's field,
+a list's element or tail, at any depth, and an element `map`, `filter` or
+`fold` hands a callback — or an integer moving toward a bound that a guard on
+the way to the call holds it beyond, as `down` does, or as
+`if i >= len(xs) { .. } else { walk(xs, i + 1) }` does. A loop may lower
+different measures at different calls, as Ackermann's function does. A guard
+of `n == 0` bounds nothing: from `-1`, `n - 1` never meets it. A member of the
+group handed as a value to anything but those builtins is called with nothing
+known, and so is one inside a lambda, whose parameters are unknown.
+
+A definition whose group descends ends, and so does one calling only
+definitions that end. `ply check --types` marks `div` on any other: its group
+is not seen to descend, or it calls a definition that may not return.
+
+`decreases <measure>`, after the other clauses, states an `Int` over the
+parameters that every call the group makes back into itself lowers while it
+stays non-negative; a group that descends with its stated measures counted is
+read as ending, and the checker takes the measure at its word. It is pure, as a
+clause is (`E0417`), and writing one moves no hash.
+
 ## 6. Effects and handlers
 
 ### 6.1 Declaring an effect
@@ -828,7 +863,7 @@ nondet effect clock {
 Each operation is `read` or `write`. `[r]` makes it resource-parameterized: a
 perform must supply a label (`E0304`). `nondet` marks results that are not a
 function of program state (§8.3). Effects are nominal. `task`, `clock`,
-`random`, `sim`, `abort` and `cell` are taken (`E0105`).
+`random`, `sim`, `abort`, `div` and `cell` are taken (`E0105`).
 
 An operation's type parameters sit just before its parameters,
 `read take[r]<a>(key: Int) -> a`, and are its only type variables: its
@@ -844,7 +879,8 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `/ {store::db.read[users]}`. An atom may instead name an operation,
 `net.send[conn]`, which the mode atom of the same effect and resource
 (`net.write[conn]`) covers; naming an operation the effect does not declare is
-`E0104`.
+`E0104`. `div`, written bare, is the atom of a call that may not return
+(§5.10); it names no operation, and nothing handles it.
 
 An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
 a call adds the callee's row as written (a mode atom stays a mode atom), and a
@@ -1383,13 +1419,11 @@ law "a credit and a matching debit leave an account exactly as it was"
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
 injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
-induction on an `Int` binder: a definition that calls only itself with some
-`Int` argument non-negative and smaller at every self call is unrolled, and the
-claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; and
-induction on a `List` binder: a definition whose self calls take a tail its
-list patterns exposed is unrolled, and the claim is proved at `[]` and then at
-`[h, ..t]` from itself at `t`, with `len` and `push` reduced over the spine in
-view and `len` known to lie below `i64::MAX`. A definition of another package
+induction: a definition that calls only itself, and that the checker reads as
+ending without a `decreases` (§5.10), is unrolled. On an `Int` binder the claim
+is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; on a `List`
+binder at `[]` and then at `[h, ..t]` from itself at `t`, with `len` and `push`
+reduced over the spine in view and `len` known to lie below `i64::MAX`. A definition of another package
 — a dependency's, or outside `--std` a shipped module's — is claimed by its
 `requires` and `ensures` alone: a proof may use what it promises and never
 unfolds its body, which that package's own run proves. A `transparent fn` is
