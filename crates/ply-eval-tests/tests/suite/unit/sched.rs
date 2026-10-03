@@ -191,7 +191,7 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                             }
                         }
                         Act::Channel(capacity) => {
-                            sched.channel(suspended(), capacity, Span::DUMMY)?
+                            sched.channel(suspended(), capacity_of(capacity, Span::DUMMY)?)?
                         }
                         Act::Send(n, x) => {
                             asked[at] = true;

@@ -511,7 +511,7 @@ fn a_region_answers_the_operations_it_schedules_even_when_they_are_bound() {
     let compiled = Compiled::named(
         "t",
         r#"
-fn outside() -> Int / {task.write, clock.read, clock.write, random.write} = {
+fn outside() -> Int / {task.write, clock.read, clock.write, random.write, abort.raise} = {
   let t = task.spawn(|| clock.now());
   clock.sleep(Duration(1));
   let at = match task.join(t) { Instant(n) -> n };
@@ -570,7 +570,7 @@ fn a_spawn_inside_a_region_reaches_the_seeded_scheduler_even_when_task_is_bound(
     let compiled = Compiled::named(
         "t",
         r#"
-fn detached() -> Int / {task.write} = {
+fn detached() -> Int / {task.write, abort.raise} = {
   let t = task.spawn(|| 1);
   task.join(t)
 }
@@ -1138,7 +1138,7 @@ fn tasks_bound(source: &str) -> ply_eval::Machine<'static> {
 fn hundreds_of_tasks_come_and_go_and_every_join_answers_its_own_task() {
     let mut machine = tasks_bound(
         r#"
-fn churn(n: Int) -> Int / {task.write} =
+fn churn(n: Int) -> Int / {task.write, abort.raise} =
   fold(range(0, n), 0, |sum: Int, i: Int| {
     task.spawn(|| i);
     let t = task.spawn(|| i * 2);
@@ -1162,7 +1162,7 @@ test/nondet "every join answers its own task" {
 fn a_task_whose_handle_the_program_keeps_answers_every_join() {
     let mut machine = tasks_bound(
         r#"
-fn kept(n: Int) -> Int / {task.write} = {
+fn kept(n: Int) -> Int / {task.write, abort.raise} = {
   let held = fold(range(0, n), [], |tasks: List<Task<Int>>, i: Int| push(tasks, task.spawn(|| i)));
   task.yield();
   fold(held, 0, |sum: Int, t: Task<Int>| sum + task.join(t) + task.join(t))
@@ -1185,7 +1185,7 @@ test/nondet "every join of a kept task answers" {
 fn a_handle_inside_a_finished_tasks_answer_keeps_its_task() {
     let mut machine = tasks_bound(
         r#"
-fn relayed() -> Int / {task.write} = {
+fn relayed() -> Int / {task.write, abort.raise} = {
   let outer = task.spawn(|| task.spawn(|| 21));
   task.yield();
   task.yield();

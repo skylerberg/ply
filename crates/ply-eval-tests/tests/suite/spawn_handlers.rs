@@ -13,18 +13,18 @@ effect ask {
   read get() -> Int
 }
 
-effect abort {
+effect halt {
   write stop(code: Int) -> Int
 }
 
-fn abandoned(n: Int) -> Int / {sim.read} =
+fn abandoned(n: Int) -> Int / {sim.read, abort.raise} =
   handle {
     simulate {
       let t = handle { task.spawn(|| ask.get()) } with { ask.get() -> n };
-      abort.stop(n) + task.join(t)
+      halt.stop(n) + task.join(t)
     }
   } with {
-    abort.stop(code) resume k -> code,
+    halt.stop(code) resume k -> code,
   }
 
 test "the handle around the spawn has ended" {
