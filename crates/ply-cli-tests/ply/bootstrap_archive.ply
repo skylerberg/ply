@@ -1,65 +1,80 @@
-// `ply bootstrap`: the archive it writes holds the program it was made from and verifies against
-// that tree, and stops describing it once the tree moves.
+// `ply bootstrap`: what it writes of a program this binary ships holds the program it was made from
+// and verifies against that tree, and stops describing it once the tree moves; any other program it
+// refuses.
 
-import harness (on_disk, program, write, working, stderr, json_of, at, str, truth, shown)
+import harness (on_disk, program, project, write, working, stderr, json_of, at, str, truth, shown)
 import cli.gzip (gunzip)
 import std.bytes (hex_of)
 import std.fs (fs)
 
-fn source() -> String =
+// A builder as `ply bootstrap` knows one: a `build` module entered at `main`.
+fn builder() -> String =
   \\type Shape = { wide: Int, tall: Int }
   \\pub fn area(s: Shape) -> Int = s.wide * s.tall
   \\pub fn twice(n: Int) -> Int = area({ wide: n, tall: 2 })
+  \\pub fn main() -> Unit = ()
   \\
 
-fn archive() -> String / {fs.read[cwd], fs.write[cwd]} = working() ++ "/archive"
+fn out() -> String / {fs.read[cwd], fs.write[cwd]} = working() ++ "/out"
 
-test/nondet "an archive is written and verifies against the tree it came from" {
-  program(source());
-  let first = on_disk(["bootstrap", working(), "--out", archive(), "--json"]);
+fn read(path: String) -> Bytes / {fs.read[cwd]} =
+  match fs.read_file[cwd](path) { Some(b) -> b, None -> panic("`" ++ path ++ "` was not written") }
+
+test/nondet "a builder is written as its launcher enters it, with the bundle, and verifies against its tree" {
+  project([{ path: "build.ply", text: builder() }]);
+  let first = on_disk(["bootstrap", working(), "--out", out(), "--json"]);
   assert(first.code == 0, Some(stderr(first)));
   let wrote = json_of(first);
   assert(truth(at(wrote, "ok")), Some(shown(wrote)));
-  let unit = match fs.read_file[cwd]("archive/unit.c.gz") {
-    Some(b) -> b,
-    None -> panic("no bundle was written"),
-  };
-  assert(fs.exists[cwd]("archive/SOURCES.digest"), Some("no sources digest was written"));
+  assert(str(at(wrote, "entry")) == "build.main", Some(shown(wrote)));
+  let runnable = read("out/build.run");
+  assert(
+    string_trim(string_of_bytes(read("out/build.digest"))) != "",
+    Some("no digest was written"),
+  );
+  assert(
+    str(at(at(wrote, "runnable"), "runnable")) == hex_of(bytes_blake3(runnable)),
+    Some("the report does not describe the runnable beside it: " ++ shown(wrote)),
+  );
+  assert(fs.exists[cwd]("out/SOURCES.digest"), Some("no sources digest was written"));
   // The C is the program, so it has to contain the definitions rather than merely exist.
-  let text = match gunzip(unit) {
+  let text = match gunzip(read("out/unit.c.gz")) {
     Ok(c) -> string_of_bytes(c),
     Err(why) -> panic("the unit unpacks: " ++ why),
   };
   // The symbol as the unit's own table publishes it: `<name> <arity> <symbol> <entry>`.
   let symbol = match filter(string_split(text, "\n"), |l: String|
-      string_starts_with(l, "\"m.area ")) {
+      string_starts_with(l, "\"build.area ")) {
     [line, ..] -> match list_at(string_split(line, " "), 2) {
       Some(s) -> s,
       None -> panic("the table names no symbol"),
     },
-    [] -> panic("the artifact says what it calls `m.area`"),
+    [] -> panic("the unit says what it calls `build.area`"),
   };
   assert(
     string_contains(text, "Word " ++ symbol ++ "(PlyCtx *ctx") && string_contains(text, "ply_bind"),
-    Some("the artifact does not hold the program it was made from"),
+    Some("the unit does not hold the program it was made from"),
   );
-  assert(
-    str(at(at(wrote, "archive"), "artifact")) == hex_of(bytes_blake3(unit)),
-    Some("the report does not describe the bundle beside it: " ++ shown(wrote)),
-  );
-  let verify = on_disk(["bootstrap", working(), "--out", archive(), "--verify"]);
+  let verify = on_disk(["bootstrap", working(), "--out", out(), "--verify"]);
   assert(
     verify.code == 0,
-    Some("the archive did not verify against the tree that wrote it:\n" ++ stderr(verify)),
+    Some("the runnable did not verify against the tree that wrote it:\n" ++ stderr(verify)),
   )
 }
 
-test/nondet "an archive stops describing a tree that moved" {
-  program(source());
-  assert_eq(on_disk(["bootstrap", working(), "--out", archive()]).code, 0);
-  write("m.ply", source() ++ "\npub fn added(n: Int) -> Int = n + 1\n");
+test/nondet "a runnable stops describing a tree that moved" {
+  project([{ path: "build.ply", text: builder() }]);
+  assert_eq(on_disk(["bootstrap", working(), "--out", out()]).code, 0);
+  write("build.ply", builder() ++ "\npub fn added(n: Int) -> Int = n + 1\n");
   assert(
-    on_disk(["bootstrap", working(), "--out", archive(), "--verify"]).code != 0,
-    Some("a definition was added and the archive still claimed to describe the tree"),
+    on_disk(["bootstrap", working(), "--out", out(), "--verify"]).code != 0,
+    Some("a definition was added and the runnable still claimed to describe the tree"),
   )
+}
+
+test/nondet "a program this binary does not ship is refused" {
+  program("pub fn main() -> Unit = ()\n");
+  let r = on_disk(["bootstrap", working(), "--out", out()]);
+  assert(r.code != 0, Some("a program that is neither the builder nor `ply` was written"));
+  assert(string_contains(stderr(r), "no program this binary ships"), Some(stderr(r)))
 }

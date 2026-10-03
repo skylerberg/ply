@@ -1,13 +1,19 @@
 // A program read from a directory, checked and emitted: what a program that drives another hands
-// the machine, which compiles the C it is handed and loads no source of its own. Its modules are
-// the `.ply` files below the root, named by their paths; the shipped modules they import come off
-// the binary's own shelf.
+// the machine, which compiles the C it is handed and loads no source of its own, and what the
+// builder makes a program the launcher ships from. Its modules are the `.ply` files below the
+// root, named by their paths; a `ply.pkg` there names the packages it depends on, each read from
+// the directory its manifest names; what a module embeds is read beside it; the shipped modules
+// they import come off the binary's own shelf.
 
-import front (Dump, EmitRoot, Analysed, Refused, analyse_pulling_std_with, dump_of, module_of)
+import front (Dump, EmitRoot, Embedded, Analysed, Refused, Rows, analyse_pulling_std_with, dump_of,
+              embeds_wanted, module_of, no_interfaces, rows_of)
+import embed (EmbedRead, EmbedFile)
+import pkg (Supplied, git_spec, wants)
 import resolve (Source, Diag, diag1)
 import unit (Runtime, shipped, compiled)
 import std.fs
-import std.fs (fs, File, Dir)
+import std.fs (fs, File, Dir, Missing, Symlink)
+import std.path (is_absolute, join, normalize, parent)
 
 fn at<a>(xs: List<a>, i: Int) -> a =
   match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
@@ -31,6 +37,15 @@ pub type Front = {
 // A program a machine can load: its front end's answer and the C of its unit.
 pub type Loaded = { front: Front, unit: Bytes }
 
+// A program's front end, and the rows it published, which seed the next load of the same program.
+pub type Checked = { front: Front, rows: Rows }
+
+// Why a program did not load, with every source its diagnostics' module indices run over, as far as
+// the load got.
+pub type Unloaded = { diags: List<Diag>, files: List<SourceFile> }
+
+fn unloaded(diags: List<Diag>) -> Unloaded = { diags: diags, files: [] }
+
 // A directory a walk does not enter: a hidden one holds caches and VCS metadata, and `target`
 // build output.
 pub fn skipped(name: String) -> Bool = string_starts_with(name, ".") || name == "target"
@@ -38,28 +53,184 @@ pub fn skipped(name: String) -> Bool = string_starts_with(name, ".") || name == 
 fn joined(dir: String, name: String) -> String =
   if dir == "" || dir == "." { name } else if name == "" { dir } else { dir ++ "/" ++ name }
 
-fn sorted(xs: List<String>) -> List<String> =
-  map_keys(fold(xs, map_new(), |acc: Map<String, Bool>, x: String| map_insert(acc, x, true)))
+fn outside() -> Int = 4294967295
 
-// Every `.ply` file below `dir`, by its path below it, in path order; a symlink is not followed.
-fn below<[r]>(dir: String, under: String) -> List<String> / {fs.list_dir[r], fs.kind[r]} =
+fn nowhere(message: String) -> Diag =
+  diag1(b"E0502", outside(), { start: 0, end: 0 }, bytes_of_string(message), b"nothing to load", [])
+
+// --- Reading -------------------------------------------------------------------
+
+// Every `.ply` file below `dir`, by its path below it: keyed, so a walk reads them in path order as
+// `ply` reads a project. A symlink is not followed.
+fn below<[r]>(
+  dir: String,
+  under: String,
+  found: Map<String, Bool>,
+) -> Map<String, Bool> / {fs.list_dir[r], fs.kind[r]} =
   match fs.list_dir[r](joined(dir, under)) {
-    None -> [],
+    None -> found,
     Some(names) ->
-      fold(sorted(names), [], |acc: List<String>, name: String| {
+      fold(names, found, |acc: Map<String, Bool>, name: String| {
         let path = joined(under, name);
         match fs.kind[r](joined(dir, path)) {
-          Dir -> if skipped(name) { acc } else { append(acc, below[r](dir, path)) },
-          File -> if string_ends_with(name, ".ply") { push(acc, path) } else { acc },
+          Dir -> if skipped(name) { acc } else { below[r](dir, path, acc) },
+          File -> if string_ends_with(name, ".ply") { map_insert(acc, path, true) } else { acc },
           _ -> acc,
         }
       }),
   }
 
-fn outside() -> Int = 4294967295
+// One package as it lies below its root: its manifest when it holds one, and its modules, each
+// named by its path below the root.
+type Package = { root: String, manifest: Option<Bytes>, files: List<SourceFile> }
 
-fn nowhere(message: String) -> Diag =
-  diag1(b"E0502", outside(), { start: 0, end: 0 }, bytes_of_string(message), b"nothing to load", [])
+fn package_at<[r]>(
+  root: String,
+) -> Result<Package, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} = {
+  let read = fold(
+    map_keys(below[r](root, "", map_new())),
+    Ok([]),
+    |acc: Result<List<SourceFile>, List<Diag>>, p: String|
+      match acc {
+        Err(e) -> Err(e),
+        Ok(done) -> match module_of(p) {
+          Err(why) -> Err([nowhere("`" ++ joined(root, p) ++ "` cannot be a module: " ++ why)]),
+          Ok(name) -> match fs.read_file[r](joined(root, p)) {
+            None -> Err([nowhere("could not read `" ++ joined(root, p) ++ "`")]),
+            Some(text) -> Ok(push(done, { path: joined(root, p), name: name, text: text })),
+          },
+        },
+      },
+  );
+  match read {
+    Err(diags) -> Err(diags),
+    Ok(files) ->
+      Ok({ root: root, manifest: fs.read_file[r](joined(root, "ply.pkg")), files: files }),
+  }
+}
+
+fn sources_of(files: List<SourceFile>) -> List<Source> =
+  map(files, |f: SourceFile| { name: bytes_of_string(f.name), src: f.text })
+
+fn supplied_of(p: Package) -> Supplied =
+  { root: bytes_of_string(p.root), manifest: p.manifest, modules: sources_of(p.files) }
+
+fn unfetched(key: Bytes) -> Diag =
+  nowhere(
+    "`" ++ string_of_bytes_lossy(key)
+      ++ "` is a git dependency, which `ply` fetches; a program's own load reads path dependencies",
+  )
+
+// Every package the root's manifest reaches, round by round as `wants` names them, in the order
+// they were read: what the front end judges the graph from.
+fn packages_of<[r]>(
+  root: Package,
+) -> Result<List<Package>, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
+  iterate(Ok([]), 4096, |acc: Result<List<Package>, List<Diag>>|
+    match acc {
+      Err(e) -> Stop(Err(e)),
+      Ok(read) -> {
+        let known = map(push(read, root), |p: Package| bytes_of_string(p.root));
+        match wants(known, map(append([root], read), supplied_of)) {
+          [] -> Stop(Ok(read)),
+          next ->
+            Continue(
+              fold(next, Ok(read), |got: Result<List<Package>, List<Diag>>, key: Bytes|
+                match got {
+                  Err(e) -> Err(e),
+                  Ok(so_far) -> match git_spec(key) {
+                    Some(_) -> Err([unfetched(key)]),
+                    None -> match package_at[r](string_of_bytes(key)) {
+                      Err(e) -> Err(e),
+                      Ok(p) -> Ok(push(so_far, p)),
+                    },
+                  },
+                }),
+            ),
+        }
+      },
+    })
+
+// A path an embed names, relative to the directory of the module's own file.
+fn embed_target(file: String, path: String) -> String = normalize(join(parent(file), path))
+
+fn unread(target: String, what: String) -> EmbedRead =
+  Err(bytes_of_string("`" ++ target ++ "` " ++ what))
+
+// Every file under `dir`, by its path below it and in that order; nothing under a name starting
+// with `.` is read.
+fn listed<[r]>(
+  dir: String,
+  under: String,
+  found: Map<String, String>,
+) -> Result<Map<String, String>, Bytes> / {fs.list_dir[r], fs.kind[r]} =
+  match fs.list_dir[r](joined(dir, under)) {
+    None -> Err(bytes_of_string("`" ++ joined(dir, under) ++ "` could not be listed")),
+    Some(names) ->
+      fold(names, Ok(found), |acc: Result<Map<String, String>, Bytes>, n: String|
+        match acc {
+          Err(_) -> acc,
+          Ok(m) -> if string_starts_with(n, ".") { acc } else {
+            let path = joined(under, n);
+            match fs.kind[r](joined(dir, path)) {
+              Dir -> listed[r](dir, path, m),
+              _ -> Ok(map_insert(m, path, joined(dir, path))),
+            }
+          },
+        }),
+  }
+
+fn read_dir<[r]>(dir: String) -> EmbedRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
+  match listed[r](dir, "", map_new()) {
+    Err(why) -> Err(why),
+    Ok(found) ->
+      map_fold(found, Ok([]), |acc: EmbedRead, name: String, path: String|
+        match acc {
+          Err(_) -> acc,
+          Ok(files) -> match fs.read_file[r](path) {
+            Some(b) -> Ok(push(files, { name: bytes_of_string(name), bytes: b })),
+            None -> unread(path, "could not be read"),
+          },
+        }),
+  }
+
+fn read_embed<[r]>(
+  file: String,
+  path: String,
+  dir: Bool,
+) -> EmbedRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
+  if is_absolute(path) {
+    unread(path, "is absolute, and a program's own load reads below its root")
+  } else {
+    let target = embed_target(file, path);
+    match fs.kind[r](target) {
+      Missing -> unread(target, "does not exist"),
+      Dir -> if dir { read_dir[r](target) }
+      else { unread(target, "is a directory, and `embed` takes a file") },
+      File -> if dir { unread(target, "is a file, and `embed_dir` takes a directory") } else {
+        match fs.read_file[r](target) {
+          Some(b) -> Ok([{ name: b"", bytes: b }]),
+          None -> unread(target, "could not be read"),
+        }
+      },
+      Symlink -> unread(target, "is a symlink, which a load does not follow"),
+    }
+  }
+
+// What each module of the package asks to embed, read.
+fn embeds_of<[r]>(p: Package) -> List<Embedded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
+  fold(p.files, [], |acc: List<Embedded>, f: SourceFile|
+    fold(
+      embeds_wanted(bytes_of_string(p.root), [{ name: bytes_of_string(f.name), src: f.text }]),
+      acc,
+      |a: List<Embedded>, e: Embedded|
+        push(a, {
+          ..e,
+          read: read_embed[r](f.path, string_of_bytes_lossy(e.want.path), e.want.dir),
+        }),
+    ))
+
+// --- The front end --------------------------------------------------------------
 
 // `std.json` is `<std>/json.ply`, as a rendered span names a module the shelf holds.
 fn shelf_path(name: String) -> String = {
@@ -74,78 +245,110 @@ fn shelf_path(name: String) -> String = {
   }
 }
 
-// The program below `root`: read, checked, and emitted afresh. A file that cannot be a module, a
-// program that does not check, and a definition the emitter refuses are each a refusal.
-pub fn load<[r]>(
+// Every source the answer's module indices run over, in their order: the root package's modules,
+// each dependency's in the order they were read, the shelf it pulled, then the manifests.
+fn placed(
+  own: Package,
+  deps: List<Package>,
+  pulled: List<Bytes>,
+  shelf: Map<Bytes, Bytes>,
+) -> List<SourceFile> = {
+  let modules = fold(deps, own.files, |acc: List<SourceFile>, p: Package| append(acc, p.files));
+  let shelved = append(
+    modules,
+    map(pulled, |n: Bytes|
+      {
+        path: shelf_path(string_of_bytes(n)),
+        name: string_of_bytes(n),
+        text: match map_get(shelf, n) { Some(t) -> t, None -> b"" },
+      }),
+  );
+  fold(append([own], deps), shelved, |acc: List<SourceFile>, p: Package|
+    match p.manifest {
+      None -> acc,
+      Some(text) -> push(acc, { path: joined(p.root, "ply.pkg"), name: "pkg", text: text }),
+    })
+}
+
+// The program below `root` read and checked, seeded with the rows a last load of it published. A
+// file that cannot be a module, a dependency `ply` would have to fetch, and a program that does not
+// check are each a refusal.
+pub fn checked<[r]>(
   root: String,
-) -> Result<Loaded, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, shipped.runtime} = {
-  let paths = below[r](root, "");
-  let named = fold(paths, Ok([]), |acc: Result<List<SourceFile>, List<Diag>>, p: String|
-    match acc {
-      Err(e) -> Err(e),
-      Ok(done) -> match module_of(p) {
-        Err(why) -> Err([nowhere("`" ++ joined(root, p) ++ "` cannot be a module: " ++ why)]),
-        Ok(name) -> match fs.read_file[r](joined(root, p)) {
-          None -> Err([nowhere("could not read `" ++ joined(root, p) ++ "`")]),
-          Some(text) -> Ok(push(done, { path: joined(root, p), name: name, text: text })),
-        },
-      },
-    });
-  match named {
-    Err(diags) -> Err(diags),
-    Ok([]) -> Err([nowhere("no `.ply` files under `" ++ root ++ "`")]),
-    Ok(own) -> {
-      let shelf = map(shipped.names(), |n: String|
-        { name: bytes_of_string(n), src: match shipped.module(n) { Some(t) -> t, None -> b"" } });
-      let texts = fold(shelf, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
-        map_insert(acc, s.name, s.src));
-      let pulled = analyse_pulling_std_with(
-        map(own, |f: SourceFile| { name: bytes_of_string(f.name), src: f.text }),
-        shelf,
-        [],
-        [],
-      );
-      match pulled.out {
-        Refused(diags) -> Err(diags),
-        Analysed(w) -> {
-          let dump = dump_of(Analysed(w));
-          let files = append(
-            own,
-            map(pulled.pulled, |n: Bytes|
-              {
-                path: shelf_path(string_of_bytes(n)),
-                name: string_of_bytes(n),
-                text: match map_get(texts, n) { Some(t) -> t, None -> b"" },
-              }),
+  rows: Rows,
+) -> Result<Checked, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module} =
+  match package_at[r](root) {
+    Err(diags) -> Err(unloaded(diags)),
+    Ok(own) -> if len(own.files) == 0 {
+      Err(unloaded([nowhere("no `.ply` files under `" ++ root ++ "`")]))
+    } else {
+      match packages_of[r](own) {
+        Err(diags) -> Err(unloaded(diags)),
+        Ok(deps) -> {
+          let shelf = map(shipped.names(), |n: String|
+            {
+              name: bytes_of_string(n),
+              src: match shipped.module(n) { Some(t) -> t, None -> b"" },
+            });
+          let texts = fold(shelf, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+            map_insert(acc, s.name, s.src));
+          let pulled = analyse_pulling_std_with(
+            sources_of(own.files),
+            shelf,
+            rows.defs,
+            rows.tests,
+            {
+              root: bytes_of_string(own.root),
+              manifest: own.manifest,
+              supplied: map(deps, supplied_of),
+            },
+            no_interfaces(),
+            fold(deps, embeds_of[r](own), |acc: List<Embedded>, p: Package|
+              append(acc, embeds_of[r](p))),
           );
-          match compiled(
-              shipped.runtime(),
-              dump,
-              map(files, |f: SourceFile| f.text),
-              map(dump.emit_roots, |e: EmitRoot| e.root),
-              b"",
-              |_: Bytes| None,
-              |_: Bytes, _: Bytes| (),
-            ) {
-            Err(diags) -> Err(diags),
-            Ok(unit) ->
+          match pulled.out {
+            Refused(diags) -> Err({ diags: diags, files: placed(own, deps, pulled.pulled, texts) }),
+            Analysed(w) ->
               Ok({
                 front: {
-                  dump: dump,
-                  files: files,
+                  dump: dump_of(Analysed(w)),
+                  files: placed(own, deps, pulled.pulled, texts),
                   read_ms: 0,
                   front_ms: 0,
                   file_ms: 0,
                   cached: false,
                 },
-                unit: unit,
+                rows: rows_of(w),
               }),
           }
         },
       }
     },
   }
-}
+
+// Every root a program's answer offers: each `fn` in source order, then its tests, laws and clauses.
+pub fn every_root(front: Front) -> List<Bytes> = map(front.dump.emit_roots, |r: EmitRoot| r.root)
+
+// The program below `root`: read, checked, and emitted afresh. A definition the emitter refuses is
+// a refusal too.
+pub fn load<[r]>(
+  root: String,
+) -> Result<Loaded, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, shipped.runtime} =
+  match checked[r](root, { defs: [], tests: [] }) {
+    Err(u) -> Err(u.diags),
+    Ok(c) -> match compiled(
+        shipped.runtime(),
+        c.front.dump,
+        map(c.front.files, |f: SourceFile| f.text),
+        every_root(c.front),
+        b"",
+        |_: Bytes| None,
+        |_: Bytes, _: Bytes| (),
+      ) {
+      Err(diags) -> Err(diags),
+      Ok(unit) -> Ok({ front: c.front, unit: unit }),
+    },
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -169,6 +372,9 @@ fn loaded_from(files: List<{ path: String, body: Bytes }>) -> Result<Loaded, Lis
 fn codes(r: Result<Loaded, List<Diag>>) -> List<Bytes> =
   match r { Ok(_) -> [], Err(diags) -> map(diags, |d: Diag| d.code) }
 
+fn said(diags: List<Diag>) -> String =
+  string_of_bytes(fold(diags, b"", |acc: Bytes, d: Diag| bytes_concat(acc, d.message)))
+
 test "a program is the `.ply` files below its root, in path order, each the module its path names" {
   match loaded_from([
       { path: "p/b.ply", body: b"import a.c (two)\n\nfn main() -> Int = two()\n" },
@@ -177,13 +383,66 @@ test "a program is the `.ply` files below its root, in path order, each the modu
       { path: "p/target/y.ply", body: b"not ply" },
       { path: "p/notes.txt", body: b"not ply" },
     ]) {
-    Err(diags) ->
-      panic(string_of_bytes(fold(diags, b"", |acc: Bytes, d: Diag| bytes_concat(acc, d.message)))),
+    Err(diags) -> panic(said(diags)),
     Ok(l) -> {
       assert_eq(map(l.front.files, |f: SourceFile| f.path), ["p/a/c.ply", "p/b.ply"]);
       assert_eq(map(l.front.files, |f: SourceFile| f.name), ["a.c", "b"]);
       assert(bytes_len(l.unit) > 0)
     },
+  }
+}
+
+test "a module's path sorts before a directory's that it prefixes, as `ply` reads a project" {
+  match loaded_from([
+      { path: "p/a/b.ply", body: b"pub fn two() -> Int = 2\n" },
+      { path: "p/a.ply", body: b"import a.b (two)\n\nfn main() -> Int = two()\n" },
+    ]) {
+    Err(diags) -> panic(said(diags)),
+    Ok(l) -> assert_eq(map(l.front.files, |f: SourceFile| f.path), ["p/a.ply", "p/a/b.ply"]),
+  }
+}
+
+fn manifest(name: String, deps: String) -> Bytes =
+  bytes_of_string(
+    "import std.pkg (Manifest)\n\nfn package() -> Manifest = {\n  name: \"" ++ name
+      ++ "\",\n  version: { major: 0, minor: 1, patch: 0 },\n  prefix: None,\n  runtime: { major: 0, minor: 16, patch: 0 },\n  dependencies: ["
+      ++ deps
+      ++ "],\n  entry: None,\n}\n",
+  )
+
+fn path_dep(name: String, path: String) -> String =
+  "{ name: \"" ++ name ++ "\", prefix: None, min: { major: 0, minor: 1, patch: 0 }, source: Path(\""
+    ++ path
+    ++ "\") }"
+
+test "a path dependency is read from the directory its manifest names, its modules placed after the root's" {
+  match loaded_from([
+      { path: "p/ply.pkg", body: manifest("app", path_dep("lib", "../lib")) },
+      { path: "p/m.ply", body: b"import lib.deep (seven)\n\nfn main() -> Int = seven()\n" },
+      { path: "lib/ply.pkg", body: manifest("lib", "") },
+      { path: "lib/deep.ply", body: b"pub fn seven() -> Int = 7\n" },
+    ]) {
+    Err(diags) -> panic(said(diags)),
+    Ok(l) ->
+      assert_eq(map(l.front.files, |f: SourceFile| f.path), [
+        "p/m.ply",
+        "lib/deep.ply",
+        "p/ply.pkg",
+        "lib/ply.pkg",
+      ]),
+  }
+}
+
+test "a module embeds a file beside it" {
+  match loaded_from([
+      {
+        path: "p/m.ply",
+        body: b"fn greeting() -> Bytes = embed(\"hello.txt\")\n\nfn main() -> Int = bytes_len(greeting())\n",
+      },
+      { path: "p/hello.txt", body: b"hello" },
+    ]) {
+    Err(diags) -> panic(said(diags)),
+    Ok(l) -> assert(bytes_len(l.unit) > 0),
   }
 }
 
