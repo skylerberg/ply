@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 /// it in a checkout.
 const ROOT: &str = "crates/ply-compiler/ply";
 
+/// Beside [`ROOT`], where the compiler's `embed("../prelude.ply")` reads it.
+const PRELUDE_FILE: &str = "prelude.ply";
+
 const ENTRY: &str = "build.main";
 
 const RUNNABLE: &str = "builder.run";
@@ -270,11 +273,13 @@ fn laid_out() -> Result<PathBuf, Diagnostic> {
     }
     let aside = stage().join(format!("src.{}", std::process::id()));
     let package = aside.join(ROOT);
-    let written = std::fs::create_dir_all(&package).and_then(|()| {
-        ply_compiler::MODULES
-            .iter()
-            .try_for_each(|(name, text)| std::fs::write(package.join(format!("{name}.ply")), text))
-    });
+    let written = std::fs::create_dir_all(&package)
+        .and_then(|()| {
+            ply_compiler::MODULES.iter().try_for_each(|(name, text)| {
+                std::fs::write(package.join(format!("{name}.ply")), text)
+            })
+        })
+        .and_then(|()| std::fs::write(package.with_file_name(PRELUDE_FILE), ply_compiler::PRELUDE));
     written.map_err(|e| {
         unbuilt(format!(
             "the compiler's sources could not be placed in `{}`: {e}",

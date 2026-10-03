@@ -313,7 +313,7 @@ it means the day it is fetched — the fetched tree is reused without asking the
 remote again, so a cleared cache is what picks up a moved branch, and `ply.lock`'s
 digest is what catches it when that happens. The fetch runs the `git` on
 `PATH`, with the run's own environment. A fetch that git cannot do, or a run
-with no `git` to do it, is `E0140`.
+with no `git` to do it, leaves a dependency that was not fetched (`E0135`).
 
 A `Registry` dependency is the package of that `name` from the registry
 `PLY_REGISTRY` names (§15.1), at least `min`; its `name` must be a package name
@@ -853,7 +853,8 @@ matched against `true` or `false`, or `list_at` or `array_at` answering
 keep the length. A list written of parts, one they are pushed onto, one
 `filter` keeps, one `map` makes of a part of each element, and what `fold`
 answers when each step answers the accumulator or a part (a lookup that starts
-at `None`) are made of parts.
+at `None`) are made of parts: each element is a part, though neither the list
+nor its tail need be smaller than what its parts are parts of.
 
 A function handed to `map`, `filter` or `fold` is called with each element; one
 handed to a definition outside the group is called as that definition calls
@@ -864,8 +865,10 @@ known.
 
 A definition whose group descends ends, and so does one calling only
 definitions that end. `ply check --types` marks `diverges` on any other and
-says why: its own recursion is not seen to descend, or it calls a definition,
-which it names, that may not return.
+says why, at the call's place: its own recursion is not seen to descend there,
+or it calls there a definition, which it names, that may not return. `ply check
+--json` gives each definition's `ending`: its `kind` (`ends`, `stated` or
+`diverges`) and, for one that diverges, `through` and `at`.
 
 `decreases <measure>`, after the other clauses, states an `Int` over the
 parameters that every call the group makes back into itself lowers while it
@@ -1313,7 +1316,8 @@ rather than raised.
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
-| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, and allocation counts |
+| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, and allocation counts by kind |
+| `PLY_HEAP_CENSUS=1` | count allocations by constructor, record shape and length class as well, which `PLY_C_PHASES` then prints; a map insert per allocation |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 
@@ -1594,8 +1598,11 @@ In scope everywhere; a module may shadow any except `compare_values` and
 `map_of_entries`, which the map and set literals are written in (`E0105`).
 Out-of-range indexes and slices raise (§6.8) unless noted; nothing is clamped, and
 a builtin that can raise carries `abort.raise` in its row.
-`ply doc NAME` prints any of these from the compiler's own table, which is the
-authority when this page and it disagree.
+Each is declared in the compiler's prelude as an `extern fn`: a signature the
+runtime implements, with a row and a `where` like any other and no body.
+`ply doc NAME` prints any of these from that declaration, which is the
+authority when this page and it disagree. Only the prelude declares one; an
+`extern fn` in a module is `E0151`.
 
 ### 12.1 Core, lists and maps
 
@@ -3650,7 +3657,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0137` | one package reached at two places, where a closure pins one version |
 | `E0138` | a dependency whose sources are not what `ply.lock` pinned |
 | `E0139` | a `ply.lock` that does not decode or is from another format |
-| `E0140` | a git dependency that could not be fetched |
 | `E0141` | a registry that could not be asked: unset, malformed or not answering |
 | `E0142` | a registry archive that is not the one the lock pins or the index lists |
 | `E0143` | a registry dependency no published version satisfies |
@@ -3661,6 +3667,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0148` | a `returns` clause the body does not keep |
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
+| `E0151` | an `extern fn` outside the prelude |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -3751,7 +3758,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 * No loops, `break` or `return` (`?` is the only early exit, and `abort.raise`
   the only one past the caller, §6.8); no mutable variables; no exceptions
   outside the row; no typeclasses, implicits or method syntax; no
-  modules-as-values or first-class effects; no `unsafe` or FFI.
+  modules-as-values or first-class effects; no `unsafe` or FFI: what a program
+  reaches outside itself is an effect a handler answers, and the builtins are the
+  only functions the runtime implements (§12).
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads; only a `parallel` block's branches run on threads
   of the runtime's own.

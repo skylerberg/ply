@@ -88,7 +88,7 @@ pub enum Identity {
     Record(usize),
     Str(usize),
     Bytes(usize),
-    List(usize, usize, usize, usize),
+    List(usize),
     Array(usize),
 }
 
@@ -97,10 +97,7 @@ fn identity(v: &Value) -> Option<Identity> {
         Value::Record(fields) => Identity::Record(Arc::as_ptr(fields) as usize),
         Value::Str(s) => Identity::Str(Arc::as_ptr(s) as *const u8 as usize),
         Value::Bytes(b) => Identity::Bytes(Arc::as_ptr(b) as *const u8 as usize),
-        Value::List(items) => {
-            let (tail, root, len, start) = items.identity();
-            Identity::List(tail, root, len, start)
-        }
+        Value::List(items) => Identity::List(items.identity()),
         Value::Array(items) => Identity::Array(Arc::as_ptr(items) as usize),
         _ => return None,
     })

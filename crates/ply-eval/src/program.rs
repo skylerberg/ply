@@ -20,23 +20,6 @@ pub enum Ordinal {
     Law(Symbol),
 }
 
-/// A parameter as the source wrote it, which a spec clause's binders are named and placed by.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct WrittenParam {
-    pub name: Symbol,
-    pub span: Span,
-}
-
-/// What a `fn`'s source says and [`DefInfo`] does not.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct DefWritten {
-    pub vis: Visibility,
-    /// A `reuse fn`, which a gate has to know without a parse.
-    pub reuse: bool,
-    /// In source order.
-    pub params: Vec<WrittenParam>,
-}
-
 /// A `type`; no table of [`CheckOutput`] holds its arity, visibility or span.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TypeDecl {
@@ -102,8 +85,6 @@ pub struct Analysis {
     pub hashes: HashOutput,
     /// The digest of [`hashes`](Analysis::hashes), as the compiler computed it.
     pub hashes_digest: DefHash,
-    /// The emitter's root cache keys, by root name, as the compiler computed them.
-    pub keys: IndexMap<Symbol, String>,
     /// Every root the emitter offers, with the arity its body is emitted at.
     pub emitter_roots: Vec<EmitterRoot>,
     /// The emitter's constructors, in the order the emitted C names tags by.
@@ -112,25 +93,8 @@ pub struct Analysis {
     pub ctor_carries: CtorCarries,
     /// Per module in program order, its keyable items in source order.
     pub ordinals: Vec<(Symbol, Vec<Ordinal>)>,
-    /// Every `fn`'s, `type`'s and `effect`'s stored body, in the hasher's item order.
-    pub bodies: Vec<(Symbol, Vec<u8>)>,
-    /// Parallel to `CheckOutput::tests`.
-    pub test_bodies: Vec<Vec<u8>>,
-    /// What each `fn`'s source wrote, by program-wide name: one entry per `CheckOutput::defs`.
-    pub defs_written: IndexMap<Symbol, DefWritten>,
     /// Every `type` the source declares, by program-wide name, in program order.
     pub types: IndexMap<Symbol, TypeDecl>,
-    /// Whether each `effect` was written `pub`; a prelude effect has no entry and is public.
-    pub effects_written: IndexMap<Symbol, Visibility>,
-    /// What the front end embedded, its `List<embed.EmbedAt>` as [`crate::codec`] encodes it and
-    /// empty when nothing was: every pass that parses the program's text again is handed it back.
-    pub embeds: Vec<u8>,
-    /// What every definition and test published, its `front.Rows` as [`crate::codec`] encodes it
-    /// and empty when the answer carried none: the emitter walks only the bodies it lowers.
-    pub rows: Vec<u8>,
-    /// What the front end's check read of the bodies it walked, a `front.WalkedFacts` in the encoding
-    /// `std.bin` reads it with, empty when the answer carried none.
-    pub walked: Vec<u8>,
 }
 
 impl Analysis {
