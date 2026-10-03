@@ -17,6 +17,7 @@ nondet effect env {
   read vars[e]() -> List<{ name: String, value: String }>
   read terminal[e](stream: String) -> Bool
   read binary_version[e]() -> String
+  read binary_bytes[e]() -> Option<Int>
   read pwd[e]() -> String
   read shipped_digest[e]() -> String
   read builder_digest[e]() -> String
