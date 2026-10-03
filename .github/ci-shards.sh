@@ -32,7 +32,8 @@
 #                                the desk runs runner K takes, likewise
 #   ci-shards.sh corpus-line ID  the package one run tests and its filter
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the gates
-#                                job: the host packages
+#                                job: the host packages, and the tree check it
+#                                runs alone
 #   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
 #   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
@@ -110,6 +111,12 @@ TREE_CHECKS=(
   "ply-eval-tests:suite:armed::ambiguous_enum_names_are_declared"
 )
 
+# The tree check the shards leave to the gates job, as a tree check is written: it builds the `ply`
+# program with this tree's own builder, and on main the gates job keeps what that build filed.
+GATES_ALONE=(
+  "ply-launcher-tests:suite:the_builder_these_sources_make_builds_the_program_and_it_runs"
+)
+
 # Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
 # table asserts it is still declared there: a check that stops being declared reports nothing.
 CLI_TREE_CHECKS=(
@@ -134,7 +141,7 @@ SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(ply-c-stage-sources- ply-c-corpus-)
+NEWEST=(ply-c-stage-sources- ply-c-stage-own- ply-c-corpus-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -168,7 +175,7 @@ triples() {
   done
 }
 
-cmd_tree_checks() { triples "${TREE_CHECKS[@]}"; }
+cmd_tree_checks() { triples "${TREE_CHECKS[@]}" "${GATES_ALONE[@]}"; }
 
 # `(binary_id(=..) & test(=..)) | ...` over `package target test` lines on stdin.
 filter_of() {
@@ -378,7 +385,9 @@ cmd_tree_check_filter() {
 
 cmd_gate_filter() { cmd_tree_check_filter; }
 
-cmd_exclude_filter() { cmd_host_filter; }
+cmd_exclude_filter() {
+  printf '%s | %s\n' "$(cmd_host_filter)" "$(triples "${GATES_ALONE[@]}" | filter_of)"
+}
 
 cmd_partitions() { matrix "$PARTITIONS"; }
 

@@ -13,7 +13,7 @@ fn main() {
         Ok(runnable) => Program {
             runnable,
             shelf: ply_machine::shelf::sources().to_vec(),
-            stage: format!("cli-{}", ply_launcher::shipped::identity()),
+            stage: ply_launcher::shipped::stage_name(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         Err(diagnostic) => {

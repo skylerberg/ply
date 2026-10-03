@@ -1,7 +1,8 @@
 //! The builder this binary carries, and what it builds: the compiler's own `build.main`, a
-//! runnable like any other. It is the committed one when that was built for this binary's shelf
-//! and runtime, else the one an earlier process staged, else one the committed builder builds now
-//! from the shelf's compiler.
+//! runnable like any other. The committed one builds the `ply` program. The one a program held in
+//! memory is answered by is this tree's own: the committed one when that was built for this
+//! binary's shelf and runtime, else the one an earlier process staged, else one the committed
+//! builder builds now from the shelf's compiler.
 
 use crate::enter::{self, Binds};
 use crate::runnable::{self, Runnable};
@@ -68,48 +69,99 @@ fn rows(program: &str) -> PathBuf {
     stage::stage_dir(sweep::ROWS).join(program)
 }
 
-/// The builder: committed, staged, or built now by the committed one and staged.
-pub fn builder() -> Result<Runnable, Diagnostic> {
-    let current = ply_compiler::bootstrap::BUILDER_DIGEST.trim() == identity();
-    let staged = stage().join(RUNNABLE);
-    if !current
-        && let Ok(bytes) = std::fs::read(&staged)
-        && let Ok(builder) = runnable::decode(&bytes)
-    {
-        sweep::used(&stage());
-        return Ok(builder);
-    }
-    let committed = runnable::decode(ply_compiler::bootstrap::BUILDER).map_err(|why| {
+/// The digest of the shelf and runtime the committed builder was built for.
+pub fn committed_digest() -> &'static str {
+    ply_compiler::bootstrap::BUILDER_DIGEST.trim()
+}
+
+/// The builder main last refreshed.
+fn committed() -> Result<Runnable, Diagnostic> {
+    runnable::decode(ply_compiler::bootstrap::BUILDER).map_err(|why| {
         unbuilt(format!(
             "the committed builder does not read: {why}; a field the runtime requires of a front \
              end's answer lands after main's builder writes it"
         ))
-    })?;
-    if current {
-        return Ok(committed);
+    })
+}
+
+/// A runnable an earlier process left at `staged`, under `stage`.
+pub fn staged_at(stage: &Path, staged: &Path) -> Option<Runnable> {
+    let bytes = std::fs::read(staged).ok()?;
+    let found = runnable::decode(&bytes).ok()?;
+    sweep::used(stage);
+    Some(found)
+}
+
+/// `work` with no other process in it for `stage`: one builds what the stage holds while the rest
+/// wait here, and then find it there.
+pub fn alone<T>(
+    stage: &Path,
+    work: impl FnOnce() -> Result<T, Diagnostic>,
+) -> Result<T, Diagnostic> {
+    let held = std::fs::create_dir_all(stage)
+        .and_then(|()| std::fs::File::create(stage.join("building")))
+        .and_then(|file| file.lock().map(|()| file))
+        .map_err(|e| {
+            unbuilt(format!(
+                "`{}` could not be held for one build: {e}",
+                stage.display()
+            ))
+        })?;
+    let made = work();
+    drop(held);
+    made
+}
+
+/// This tree's own builder: the committed one when it was built for this shelf and runtime, else
+/// staged, else built now by the committed one and staged.
+pub fn builder() -> Result<Runnable, Diagnostic> {
+    if committed_digest() == identity() {
+        return committed();
     }
-    let src = laid_out()?;
-    let fresh = staged.with_extension(format!("run.{}", std::process::id()));
-    // Behind the shelf. A builder that files what it keeps under its own definitions keeps and
-    // seeds as it does anywhere; one from before that would file under this shelf's, so it keeps
-    // nothing.
+    let staged = stage().join(RUNNABLE);
+    if let Some(builder) = staged_at(&stage(), &staged) {
+        return Ok(builder);
+    }
+    alone(&stage(), || {
+        if let Some(builder) = staged_at(&stage(), &staged) {
+            return Ok(builder);
+        }
+        let src = laid_out()?;
+        let fresh = staged.with_extension(format!("run.{}", std::process::id()));
+        build_by_committed(&src, ROOT, ENTRY, &fresh, "builder")?;
+        landed(&fresh, &staged)
+    })
+}
+
+/// `root` below `src` built by the committed builder into `out`, seeded with the rows its last
+/// build of `rows_of` kept and keeping the emitter's answers.
+fn build_by_committed(
+    src: &Path,
+    root: &str,
+    entry: &str,
+    out: &Path,
+    rows_of: &str,
+) -> Result<(), Diagnostic> {
+    let committed = committed()?;
+    // A builder that files what it keeps under its own definitions keeps and seeds as it does
+    // anywhere; one from before that would file under this shelf's, so it keeps nothing.
     let own = declared(&committed.front.answer).contains("definitions");
-    let seeds = rows("builder");
+    let seeds = rows(rows_of);
     build_with(
         committed,
-        &src,
-        ROOT,
-        ENTRY,
-        &fresh,
+        src,
+        root,
+        entry,
+        out,
         own.then_some(seeds.as_path()),
         own,
         Asked::Ship,
-    )?;
-    landed(&fresh, &staged)
+    )
 }
 
-/// `program`'s root below `src` built by the builder into `out`, seeded with the rows its last
-/// build of `rows_of` kept and keeping the emitter's answers.
+/// `program`'s root below `src` built into `out` by the committed builder, so a program's build
+/// reads back what every build since main's last refresh kept: a compiler this tree changed
+/// would file its answers under itself, and find none.
 pub fn build(
     src: &Path,
     root: &str,
@@ -118,11 +170,32 @@ pub fn build(
     rows_of: &str,
 ) -> Result<(), Diagnostic> {
     let started = std::time::Instant::now();
-    let builder = builder()?;
-    let ready = started.elapsed();
+    let fresh = out.with_extension(format!("run.{}", std::process::id()));
+    build_by_committed(src, root, entry, &fresh, rows_of)?;
+    let built = started.elapsed();
+    landed(&fresh, out)?;
+    if std::env::var_os("PLY_C_PHASES").is_some() {
+        eprintln!(
+            "phases: built {entry} {}ms, read back {}ms",
+            built.as_millis(),
+            (started.elapsed() - built).as_millis()
+        );
+    }
+    Ok(())
+}
+
+/// `program`'s root below `src` built into `out` by this tree's own builder, as `build` builds it
+/// by the committed one: the build that shows this tree's compiler builds the program.
+pub fn build_by_own(
+    src: &Path,
+    root: &str,
+    entry: &str,
+    out: &Path,
+    rows_of: &str,
+) -> Result<(), Diagnostic> {
     let fresh = out.with_extension(format!("run.{}", std::process::id()));
     build_with(
-        builder,
+        builder()?,
         src,
         root,
         entry,
@@ -131,17 +204,7 @@ pub fn build(
         true,
         Asked::Ship,
     )?;
-    let built = started.elapsed();
-    landed(&fresh, out)?;
-    if std::env::var_os("PLY_C_PHASES").is_some() {
-        eprintln!(
-            "phases: builder ready {}ms, built {entry} {}ms, read back {}ms",
-            ready.as_millis(),
-            (built - ready).as_millis(),
-            (started.elapsed() - built).as_millis()
-        );
-    }
-    Ok(())
+    landed(&fresh, out).map(|_| ())
 }
 
 /// What the front end and the emitter make of `files`, one package of `(path, text)` held in

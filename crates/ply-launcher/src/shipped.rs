@@ -20,6 +20,11 @@ pub const DIGEST: &str = "ply.digest";
 /// because the keys below are the repository's own paths.
 pub const ROOT: &str = "crates/ply-cli/ply";
 
+const ENTRY: &str = "ply.main";
+
+/// The name the rows of the program's builds are kept under.
+const ROWS: &str = "cli";
+
 /// The whole closure as the port takes it: `(path, text)`, which `digest_of` sorts. A package's own
 /// modules and its manifest are keyed by the path they have in the repository, so nothing about the
 /// program is a function of where this binary happens to be.
@@ -72,10 +77,28 @@ pub fn identity() -> String {
         .clone()
 }
 
-/// Where what `identity` names is kept between runs, beside the emitter's own stages: the sources
-/// laid out, and the runnable the builder made of them when no committed one serves.
+/// The stage of the program the committed builder makes of these sources: a function of both.
+pub fn stage_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(identity().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(ply_machine::builds::committed_digest().as_bytes());
+        format!("cli-{}", &hasher.finalize().to_hex()[..16])
+    })
+    .clone()
+}
+
+/// Where that stage is kept between runs, beside the emitter's own: the sources laid out, and the
+/// runnable the committed builder made of them when no committed one serves.
 pub fn stage() -> PathBuf {
-    stage::stage_dir(&format!("cli-{}", identity()))
+    stage::stage_dir(&stage_name())
+}
+
+/// The stage of the program this tree's own builder makes of these sources.
+pub fn own_stage_name() -> String {
+    format!("self-{}", identity())
 }
 
 /// The digest the committed program was built from, when one is committed at all.
@@ -90,8 +113,8 @@ pub fn committed() -> PathBuf {
 }
 
 /// The `ply` program: the committed runnable when it was built from these very sources, else the
-/// one the builder made of them for an earlier process, else one it makes now. A binary whose
-/// committed runnable is behind its sources therefore runs the sources, never the runnable.
+/// one the committed builder made of them for an earlier process, else one it makes now. A binary
+/// whose committed runnable is behind its sources therefore runs the sources, never the runnable.
 pub fn program() -> Result<Runnable, Diagnostic> {
     if committed_digest().as_deref() == Some(identity().as_str())
         && let Ok(bytes) = std::fs::read(committed())
@@ -99,16 +122,40 @@ pub fn program() -> Result<Runnable, Diagnostic> {
     {
         return Ok(program);
     }
-    let staged = stage().join(RUNNABLE);
-    if let Ok(bytes) = std::fs::read(&staged)
-        && let Ok(program) = runnable::decode(&bytes)
-    {
-        ply_codegen::c::sweep::used(&stage());
+    let stage = stage();
+    let staged = stage.join(RUNNABLE);
+    if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
         return Ok(program);
     }
-    ply_machine::builds::build(&laid_out()?, ROOT, "ply.main", &staged, "cli")?;
+    ply_machine::builds::alone(&stage, || {
+        if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
+            return Ok(program);
+        }
+        ply_machine::builds::build(&laid_out()?, ROOT, ENTRY, &staged, ROWS)?;
+        read_back(&staged)
+    })
+}
+
+/// The `ply` program as this tree's own builder makes it, where `program` is the committed
+/// builder's: what shows the compiler these sources hold builds the program they hold.
+pub fn program_by_own_builder() -> Result<Runnable, Diagnostic> {
+    let stage = stage::stage_dir(&own_stage_name());
+    let staged = stage.join(RUNNABLE);
+    if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
+        return Ok(program);
+    }
+    ply_machine::builds::alone(&stage, || {
+        if let Some(program) = ply_machine::builds::staged_at(&stage, &staged) {
+            return Ok(program);
+        }
+        ply_machine::builds::build_by_own(&laid_out()?, ROOT, ENTRY, &staged, ROWS)?;
+        read_back(&staged)
+    })
+}
+
+fn read_back(staged: &Path) -> Result<Runnable, Diagnostic> {
     let started = std::time::Instant::now();
-    let bytes = std::fs::read(&staged)
+    let bytes = std::fs::read(staged)
         .map_err(|e| unbuilt(format!("what the builder made could not be read: {e}")))?;
     let program = runnable::decode(&bytes)
         .map_err(|why| unbuilt(format!("what the builder made does not read: {why}")))?;
@@ -149,5 +196,8 @@ fn unbuilt(why: String) -> Diagnostic {
         format!("the `ply` program could not be built: {why}"),
     )
     .primary(Span::DUMMY, "this is Ply's fault, not the program's")
-    .note("the program is `crates/ply-cli/ply`, built from the compiler this binary ships")
+    .note(
+        "the program is `crates/ply-cli/ply`, built by the committed builder: main's compiler \
+         as of its last refresh, which reads no language rule or builtin newer than that",
+    )
 }
