@@ -82,10 +82,10 @@ CORPUS_DESKS=(serving database)
 DESK_RUNNERS=3
 # Runs that take a runner each: the compiler's own tests on the tier take every core.
 CORPUS_ALONE=(cli-compiler_on_the_tier)
-# Placed a test at a time rather than a module at a time: a whole module on one partition would
-# outlast the partition's nextest shard.
+# Placed a test at a time rather than a module at a time: a whole module would outlast a lane. Not
+# `registry`, whose tests share one cold build of the server: split, each lane pays for it.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental lang_fixtures registry)
+CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental lang_fixtures)
 # Corpus processes a partition runs beside nextest, each a lane of the cut: its runs of one package go
 # in one `ply test`, which loads the package's closure once. Two, measured against one: a partition's
 # runs include the program's and the packages' own `ply test`s, each with a front end and C of its own,
