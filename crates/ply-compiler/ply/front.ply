@@ -25,7 +25,7 @@ import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, L
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaboration,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, builtin_schemes,
               builtin_docs, builtin_constraints, find_doc, published_pure, measure_ty, EmitFacts,
-              emit_facts_bin)
+              emit_facts_bin, written_counts)
 import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
 import pkg (Pkgs, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
@@ -1198,6 +1198,8 @@ pub type KnownDefRow = {
   witness: List<Witness>,
   footprint: Bytes,
   performed: Bytes,
+  scaling: Bytes,
+  repeats: List<Int>,
 }
 pub type KnownTestRow = { key: Bytes, hash: Bytes, witness: List<Witness>, footprint: Bytes }
 
@@ -1214,13 +1216,15 @@ fn known_defs(
 ) -> Map<Bytes, KnownDef> =
   fold(rows, map_new(), |acc: Map<Bytes, KnownDef>, r: KnownDefRow|
     if !still_hashed(now, r.name, r.hash) || !witnessed(decls, r.witness) { acc } else {
-      match read_atoms(r.footprint) {
-        None -> acc,
-        Some(footprint) -> match read_atoms(r.performed) {
-          None -> acc,
-          Some(performed) ->
-            map_insert(acc, r.name, { footprint: footprint, performed: performed }),
-        },
+      match ((read_atoms(r.footprint), read_atoms(r.performed), read_atoms(r.scaling))) {
+        (Some(footprint), Some(performed), Some(scaling)) ->
+          map_insert(acc, r.name, {
+            footprint: footprint,
+            performed: performed,
+            scaling: scaling,
+            repeats: r.repeats,
+          }),
+        _ -> acc,
       }
     })
 
@@ -1263,11 +1267,13 @@ fn taken(
   h: HashOutput,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
+  root: Int,
 ) -> Known =
-  if len(defs) == 0 && len(tests) == 0 { no_known() } else {
+  if len(defs) == 0 && len(tests) == 0 { { ..no_known(), root: root } } else {
     {
       defs: known_defs(by_name_one(h.checks), by_name_one(h.decls), defs),
       tests: known_tests(test_hashes(index, h), by_name_one(h.decls), mods, tests),
+      root: root,
     }
   }
 
@@ -1293,6 +1299,8 @@ fn def_known_row(decls: Map<Bytes, Bytes>, d: DefInfo, hash: Bytes) -> KnownDefR
     witness: row_witness(decls, append(d.footprint, d.performed)),
     footprint: atoms_text(d.footprint, b","),
     performed: atoms_text(d.performed, b","),
+    scaling: atoms_text(d.scaling, b","),
+    repeats: d.repeats,
   }
 
 fn test_known_row(decls: Map<Bytes, Bytes>, t: TestInfo, hash: Bytes) -> KnownTestRow =
@@ -1347,6 +1355,21 @@ fn rows_from(c: Front, h: HashOutput) -> Rows = {
     tests: map(range(0, len(c.tests)), |i: Int|
       test_known_row(decls, at(c.tests, i), at(h.tests, i))),
   }
+}
+
+// The rows a compiled package carries: each definition's counts as its row writes them, which is
+// how any other package reads it, so the interface re-derives the same wherever it is cut.
+pub fn contracted_rows_of(w: Whole) -> List<KnownDefRow> = {
+  let infos = fold(w.checked.defs, map_new(), |acc: Map<Bytes, DefInfo>, d: DefInfo|
+    map_insert(acc, d.name, d));
+  map(rows_of(w).defs, |r: KnownDefRow|
+    match map_get(infos, r.name) {
+      Some(d) -> {
+        let c = written_counts(d.scheme.ty, d.footprint, d.bounded, d.tail_bounded);
+        { ..r, scaling: atoms_text(c.scaling, b","), repeats: c.repeats }
+      },
+      None -> r,
+    })
 }
 
 pub type FiledSpan = { start: Int, end: Int }
@@ -1804,7 +1827,7 @@ fn analyse_closure(
             let checked: Front = check_front_with(
               x.r,
               x.mods,
-              taken(x.mods, built.index, hashes, defs, tests),
+              taken(x.mods, built.index, hashes, defs, tests, root_count),
             );
             if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
               Analysed({
@@ -2145,12 +2168,14 @@ pub fn claims_in(
       })
   });
   let rows = rows_of(w);
+  // The analysis held every promise already, so this check of it holds none again.
   let known = taken(
     w.mods,
     w.index,
     w.hashes,
     filter(rows.defs, |r: KnownDefRow| !map_contains(walked, r.name)),
     rows.tests,
+    0,
   );
   match elaboration_with(w.r, w.mods, known) {
     None -> panic("a program the front end checked does not check"),
@@ -3495,6 +3520,8 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> =
           witness: witness,
           footprint: b"m.other.write",
           performed: b"m.other.write",
+          scaling: b"",
+          repeats: [],
         })
     },
   }
@@ -3569,6 +3596,8 @@ fn sentinel_rows(w: Whole) -> List<KnownDefRow> = {
       witness: [{ name: b"base.probe", hash: probe }],
       footprint: held(written, x.name),
       performed: b"base.probe.read",
+      scaling: b"",
+      repeats: [],
     })
 }
 
