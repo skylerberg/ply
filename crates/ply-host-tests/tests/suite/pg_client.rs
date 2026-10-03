@@ -61,7 +61,7 @@ pub fn retried(url: String) -> Result<String, String>
     Ok(cfg) -> Ok(serve(cfg, 1, "test-nonce", || attempts(3, ""))),
   }
 
-fn attempts(left: Int, seen: String) -> String =
+fn attempts(left: Int, seen: String) -> String / {db.execute[items], db.abort, db.begin, db.commit} =
   match transaction(Serializable, ReadWrite, ||
       db.execute[items](stmt("insert into items (id) values (1)"), [])) {
     Ok(_) -> seen ++ "committed",

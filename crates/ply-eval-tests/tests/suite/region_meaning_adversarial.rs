@@ -6,7 +6,7 @@ fn a_general_clause_inside_a_region_carries_that_regions_atoms_out_of_it() {
     let src = r#"
 effect amb { read flip[coin]() -> Bool }
 
-fn leaks(n: Int) -> Int =
+fn leaks(n: Int) -> Int / {cell.read[t], cell.write[t]} =
   with_cell[t](n) { c ->
     handle { let b = amb.flip[coin](); cell_set(c, cell_get(c) + 1); cell_get(c) }
     with { amb.flip[coin]() resume k -> k(true), return x -> x }

@@ -17,7 +17,7 @@ effect abort {
   write stop(code: Int) -> Int
 }
 
-fn abandoned(n: Int) -> Int =
+fn abandoned(n: Int) -> Int / {sim.read} =
   handle {
     simulate {
       let t = handle { task.spawn(|| ask.get()) } with { ask.get() -> n };

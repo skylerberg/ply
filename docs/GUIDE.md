@@ -46,8 +46,8 @@ makes its parent the root and loads only that file.
 filed for each file, the tests' passes and baselines, the discharged
 obligations and the review baselines, in one data file (`store.dat`) found
 through one index (`store.idx`) — the compiled package the project's loads
-read the shipped modules through (`interfaces/`, §16), and the git dependencies
-that were fetched;
+read their dependencies and the shipped modules through (`interfaces/`, §16),
+and the git dependencies that were fetched;
 `vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
 not reach the network carries. It is safe to delete (`ply cache clear` discards
 the store and the compiled package); add it to `.gitignore`.
@@ -350,8 +350,14 @@ NAME` says how a package got here: the path from the root package to it through
 the packages that declare it, then the version and digest it resolved to.
 
 A command acts on the root package, the one whose tree it was given: a
-dependency's `main` is no entry point, and `ply test` runs the root package's
-tests and never a dependency's, which are that package's own to run.
+dependency's `main` is no entry point; `ply test` runs the root package's tests
+and never a dependency's, which are that package's own to run; and `ply prove`
+discharges the root package's obligations, claiming a dependency's definitions
+by their `requires` and `ensures` (§10). A dependency's unused definitions and
+`reuse fn` promises are its own run's to report too. `--workspace` (`ply
+check`, `ply test`, `ply prove`) runs the command for every package the path
+reaches by a path dependency as well, each as its own root with its own cache,
+dependencies first; a fetched or vendored dependency is never one of them.
 
 ### 3.4 Embedding files
 
@@ -521,20 +527,23 @@ checks see it.
 ### 4.7 Function types, and what is written
 
 `(A, B) -> C` is pure and cannot raise; `(A) -> B / {abort.raise}`,
-`(A) -> B / {db.read[users]}` and `(A) -> B / e` carry
-rows. With no `/`, the row is inferred in a signature and empty in a declared
-type. A function value may perform less than the type it meets says (§6.2).
+`(A) -> B / {db.read[users]}` and `(A) -> B / e` carry rows. With no `/` the row
+is empty, in a signature as in a declared type. A function value may perform less
+than the type it meets says (§6.2).
 Functions cannot be compared, encoded, ordered or used as map keys.
 
 * **Written:** every parameter and return type of a top-level `fn` (`E0126`),
-  and every `forall` binder type.
-* **Inferred:** effect rows. A written row is an upper bound; the inferred row
-  must fit inside it (`E0302`), and it may be wider than the body needs. Each
-  written atom covers what it names: the mode atom `net.write[conn]` covers
-  every `write` operation of `net` on `conn`, the operation atom
-  `net.send[conn]` covers `send` alone (§6.2).
-* **Inferred inside bodies:** lambda binders, `let`s, everything else. A local
-  `let` is monomorphic, so `let f = |x| x;` used at two types is `E0201`.
+  every `forall` binder type, and every top-level `fn`'s effect row, so a
+  caller, in this package or another, is checked against the signature and never
+  against the body. The row is an upper bound: what the body performs must fit
+  inside it (`E0302`, with the row to write, naming an `effect set` wherever the
+  module can), and it may be wider than the body needs. Each written atom covers
+  what it names: the mode atom `net.write[conn]` covers every `write` operation
+  of `net` on `conn`, the operation atom `net.send[conn]` covers `send` alone
+  (§6.2).
+* **Inferred inside bodies:** lambda binders and rows, `let`s, everything else.
+  A local `let` is monomorphic, so `let f = |x| x;` used at two types is
+  `E0201`.
 
 ## 5. Expressions
 
@@ -855,12 +864,16 @@ atom to the enclosing definition's row. A written row such as
 ### 6.4 Effect sets
 
 ```ply
-effect set Persist = {store.read[db], store.write[db]}
-effect set Full    = {Persist, log.write[app]}
+pub effect set Persist = {store.read[db], store.write[db]}
+effect set Full        = {Persist, log.write[app]}
 ```
 
-Sets are module-local (`pub` or `::` is `E0114`), may nest (a cycle is `E0115`),
-and may not hold a row variable.
+A set stands for its atoms wherever a row names it. `pub` exports it: another
+module imports it by name (`import storage (Persist)`) or names it through the
+module (`/ {storage::Persist}`), and each atom means what it means in the module
+that declared the set, so the importer need not import the effects. Sets may
+nest, across modules too (a cycle is `E0115`), and may not hold a row variable.
+A set nothing declares is `E0114`; one its module keeps private is `E0107`.
 
 ### 6.5 Handlers
 
@@ -1259,10 +1272,10 @@ claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; and
 induction on a `List` binder: a definition whose self calls take a tail its
 list patterns exposed is unrolled, and the claim is proved at `[]` and then at
 `[h, ..t]` from itself at `t`, with `len` and `push` reduced over the spine in
-view and `len` known to lie below `i64::MAX`. Outside `--std` a shipped module's
-definition is claimed by its `requires` and `ensures` alone: a proof may use
-what it promises and never unfolds its body, which the toolchain's own run
-proves.
+view and `len` known to lie below `i64::MAX`. A definition of another package
+— a dependency's, or outside `--std` a shipped module's — is claimed by its
+`requires` and `ensures` alone: a proof may use what it promises and never
+unfolds its body, which that package's own run proves.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
@@ -1280,7 +1293,11 @@ its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
-number keys the cached result, so more budget is a stronger claim). `--reach`
+number keys the cached result, so more budget is a stronger claim). A `proved`
+obligation is cached under its claim's hash, which reads another package's
+definitions by their contracts, so it stands across an edit to a dependency's
+body; a sampled one is cached under the hash of every implementation its cases
+run, and is drawn again. `--reach`
 asks the static tier alone about every obligation the run reports on, cached or
 not, and under `--json` each then carries `reach`: what it decided (`proved`,
 `guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
@@ -2972,10 +2989,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance) |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, host, simulation |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance), `--workspace` |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, host, trace, prove, simulation |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
@@ -3039,14 +3056,18 @@ that loads a program reads the front-end cache under `.ply-cache` before it
 analyses and files what it answered after: a definition whose hash has not moved
 since it was filed is taken from its filed rows, so a run checks what an edit
 moved and what reaches it, and a definition generic over an effect row or a
-label every time. The shipped modules a load pulls are read through the
-compiled package an earlier load kept in `.ply-cache/interfaces/`: each module
-with its function bodies cut out, beside every definition's hash, references,
-effects and specifications, which the front end takes as they are. A load that
-pulls a module the package lacks reads that one from source and grows the
-package from its own analysis, so a package costs no analysis of its own; a
-project keeps one, for the `ply` and the shelf that cut it. A run about the shipped
-modules — `--std`, or a project whose own modules ship — reads them from
+label every time. The hash it is filed under reads a definition of another
+package by its contract, its signature and specifications, so an edit to a
+dependency's body checks that package's definitions again and leaves its
+dependents' rows standing. A load reads its dependencies and the shipped modules it
+pulls through the compiled package an earlier load kept in
+`.ply-cache/interfaces/`: each module with its function bodies cut out, beside
+every definition's hash, references, effects and specifications, which the
+front end takes as they are. A module whose source or package manifest moved
+since, or that imports one that did, is read from source, as is one the package
+lacks, and the package is cut again from the load's own analysis, so a package
+costs no analysis of its own; a project keeps one per `ply`. A run about the
+shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
 read and file neither, and a program's own `machine.load` of a program runs the
 whole front end. A cache that will not read
@@ -3139,7 +3160,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0110` | duplicate import |
 | `E0111` | file path that cannot name a module |
 | `E0112` | ambiguous entry point |
-| `E0114` | unknown `effect set`, including a `pub` or qualified one |
+| `E0114` | unknown `effect set` |
 | `E0115` | `effect set` cycle |
 | `E0116` | record update base that is not a record of a known type |
 | `E0117` | record update naming a field the base lacks |
