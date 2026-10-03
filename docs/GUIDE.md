@@ -1114,8 +1114,11 @@ A definition's hash covers its normalized form: names, comments, formatting,
 imports, `pub`, specs and test labels are erased, and references are replaced by
 their referent's hash. A test runs exactly when its hash has no recorded pass,
 so renames and comment edits run nothing. `ply hash` prints the hashes.
-`--explain` says why each test was selected and where the run's time went, phase
-by phase from the process's start (`phases` in the `--json` report);
+`--explain` says why each test was selected, what a pass is filed under (the
+test's hash and the runtime stamp, `filed_under` in `--json`), which of a test's
+atoms are answers this binary gives from what it ships (`shipped`), which no key
+covers (`unkeyed`), and where the run's time went, phase by phase from the
+process's start (`phases` in the `--json` report);
 `--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
 any of them matches; `--no-cache` bypasses both the result and the front-end
 cache.
