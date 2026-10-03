@@ -52,46 +52,6 @@ impl IntTy {
         INT_TYPES.into_iter().find(|t| t.name() == name)
     }
 
-    /// `u32_of_int`, and its siblings.
-    pub fn of_int_name(self) -> &'static str {
-        match self {
-            IntTy::U8 => "u8_of_int",
-            IntTy::U16 => "u16_of_int",
-            IntTy::U32 => "u32_of_int",
-            IntTy::U64 => "u64_of_int",
-            IntTy::I8 => "i8_of_int",
-            IntTy::I16 => "i16_of_int",
-            IntTy::I32 => "i32_of_int",
-            IntTy::I64 => "i64_of_int",
-            IntTy::U128 => "u128_of_int",
-            IntTy::I128 => "i128_of_int",
-        }
-    }
-
-    /// `int_of_u32`, and its siblings.
-    pub fn to_int_name(self) -> &'static str {
-        match self {
-            IntTy::U8 => "int_of_u8",
-            IntTy::U16 => "int_of_u16",
-            IntTy::U32 => "int_of_u32",
-            IntTy::U64 => "int_of_u64",
-            IntTy::I8 => "int_of_i8",
-            IntTy::I16 => "int_of_i16",
-            IntTy::I32 => "int_of_i32",
-            IntTy::I64 => "int_of_i64",
-            IntTy::U128 => "int_of_u128",
-            IntTy::I128 => "int_of_i128",
-        }
-    }
-
-    pub fn of_int_from_name(name: &str) -> Option<IntTy> {
-        INT_TYPES.into_iter().find(|t| t.of_int_name() == name)
-    }
-
-    pub fn to_int_from_name(name: &str) -> Option<IntTy> {
-        INT_TYPES.into_iter().find(|t| t.to_int_name() == name)
-    }
-
     pub fn bits(self) -> u32 {
         match self {
             IntTy::U8 | IntTy::I8 => 8,

@@ -5,7 +5,6 @@ use super::Refused;
 use super::exports::{Exports, Taken};
 use super::load::{Library, compile_and_load};
 use super::tables::{UnitTables, root_id};
-use super::{HELPERS, helper_addresses};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
 use crate::rt::{Ctx, Root, Tables};
@@ -66,14 +65,19 @@ pub fn load_unit(
     source: Option<&Source>,
     stem: &str,
 ) -> Result<(Native, Vec<Refused>)> {
-    finish_unit(compile_and_load(text, stem)?, source)
+    finish_unit(compile_and_load(text, stem)?, text, source)
 }
 
-/// A unit's object, however it was compiled, finished against what it says about itself.
-pub(super) fn finish_unit(lib: Library, source: Option<&Source>) -> Result<(Native, Vec<Refused>)> {
+/// A unit's object, however it was compiled, finished against what it says about itself and the
+/// C it was compiled from.
+pub(super) fn finish_unit(
+    lib: Library,
+    text: &str,
+    source: Option<&Source>,
+) -> Result<(Native, Vec<Refused>)> {
     let exports = Exports::read(&lib)?;
     let refused = refused_of(&exports);
-    let native = finish(lib, exports, source)?;
+    let native = finish(lib, exports, text, source)?;
     Ok((native, refused))
 }
 
@@ -90,11 +94,8 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
 
 /// A loaded object plus its `Exports`, made into an enterable `Native`; `source` places its sites.
 /// Invariant: every field of `UnitTables` must be recorded in `Exports`, or the ids move.
-fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Native> {
-    // Before binding: the C reads the first `n` helpers of the table it is handed.
-    if let Some(why) = exports.unserved() {
-        return Err(why.into());
-    }
+fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -> Result<Native> {
+    let helpers = exports.bound(text)?;
     let Exports {
         helpers: _,
         ctors,
@@ -109,7 +110,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         lambdas,
         buckets,
     } = exports;
-    bind(&lib)?;
+    bind(&lib, &helpers)?;
     filled(&lib, &buckets)?;
     let Some(unit) =
         UnitTables::from_tables(ctors.clone(), consts, fields, builtins, shapes, lambdas)
@@ -207,15 +208,14 @@ fn filled(lib: &Library, buckets: &[(u8, Vec<u32>)]) -> Result<()> {
     Ok(())
 }
 
-fn bind(lib: &Library) -> Result<()> {
+/// `helpers` are the addresses the unit's own table binds, in its order.
+fn bind(lib: &Library, helpers: &[*mut std::ffi::c_void]) -> Result<()> {
     let Some(p) = lib.symbol("ply_bind") else {
         bail!("the unit the C backend built has no `ply_bind`");
     };
     let bind: unsafe extern "C" fn(*const *mut std::ffi::c_void) =
         unsafe { std::mem::transmute(p) };
-    let addrs = helper_addresses();
-    debug_assert_eq!(addrs.len(), HELPERS.len());
-    unsafe { bind(addrs.as_ptr()) };
+    unsafe { bind(helpers.as_ptr()) };
     let Some(p) = lib.symbol("ply_bind_singletons") else {
         bail!("the unit the C backend built has no `ply_bind_singletons`");
     };

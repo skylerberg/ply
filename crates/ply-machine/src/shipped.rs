@@ -109,7 +109,7 @@ impl HostHandler for Shipped {
                     .map(|b| {
                         crate::payload::record(vec![
                             ("name", PlyValue::bytes(b.name())),
-                            ("arity", PlyValue::Int(b.arity().1 as i64)),
+                            ("arity", PlyValue::Int(b.arity() as i64)),
                             ("raises", PlyValue::Bool(b.raises())),
                         ])
                     })

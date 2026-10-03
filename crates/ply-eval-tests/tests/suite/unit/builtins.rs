@@ -647,17 +647,6 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
-/// Every call passes a fixed number of words: a call that leaves an argument out is filled by the
-/// front end's defaults pass before anything here sees it. That the prelude's schemes agree is the
-/// CLI suite's `prelude` module's to hold, where both sides are in hand.
-#[test]
-fn every_builtin_takes_one_number_of_arguments() {
-    for b in Builtin::all() {
-        let (min, max) = b.arity();
-        assert_eq!(min, max, "`{}` has a variable arity", b.name());
-    }
-}
-
 #[test]
 fn no_builtin_is_listed_twice() {
     let mut names: Vec<&str> = Builtin::all().iter().map(|b| b.name()).collect();
