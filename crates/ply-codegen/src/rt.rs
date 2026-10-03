@@ -1564,7 +1564,7 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
     let t = ply_eval::INT_TYPES[which as usize];
     let d = error(format!(
         "`{}` was given {value}: `{t}` holds {} to {}",
-        t.of_int_name(),
+        Builtin::of_int(t).name(),
         t.min(),
         t.max()
     ));
@@ -1614,6 +1614,71 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];
     builtin(ctx, b, args_of(args, n))
+}
+
+macro_rules! builtin_helper {
+    ($variant:ident 0) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[])
+        }
+    };
+    ($variant:ident 1) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a])
+        }
+    };
+    ($variant:ident 2) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b])
+        }
+    };
+    ($variant:ident 3) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64, c: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c])
+        }
+    };
+    ($variant:ident 4) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64, c: i64, d: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d])
+        }
+    };
+}
+
+macro_rules! builtin_helpers {
+    ($($variant:ident $name:literal $arity:tt;)*) => {
+        /// Each builtin as compiled code calls it: its words in, each one the callee's, and its
+        /// answer out.
+        #[allow(non_snake_case)]
+        mod called {
+            use super::{Builtin, Ctx, builtin};
+            $( builtin_helper!($variant $arity); )*
+        }
+
+        fn called(b: Builtin) -> *const () {
+            match b {
+                $( Builtin::$variant => called::$variant as *const (), )*
+            }
+        }
+    };
+}
+
+ply_eval::each_builtin!(builtin_helpers);
+
+/// What a unit binds a builtin's helper to: the builtin's own road past the dispatch where it has
+/// one, else its call through [`builtin`].
+pub fn builtin_address(b: Builtin) -> *const () {
+    match b {
+        Builtin::Push => rt_push as *const (),
+        Builtin::MapInsert => rt_map_insert as *const (),
+        Builtin::MapContains => rt_map_contains as *const (),
+        Builtin::ByteOfInt => rt_byte_of_int as *const (),
+        Builtin::Map => rt_map as *const (),
+        Builtin::Filter => rt_filter as *const (),
+        Builtin::Fold => rt_fold as *const (),
+        Builtin::MapFold => rt_map_fold as *const (),
+        Builtin::Iterate => rt_iterate as *const (),
+        _ => called(b),
+    }
 }
 
 /// Every call of a builtin, whether named or called through a value: natively over words where it
