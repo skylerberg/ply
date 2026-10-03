@@ -7,7 +7,7 @@ import hash (hex)
 import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, answer_bin,
              emit_roots_answer, module_of_root)
-import front (Dump, EmitRoot, EmitCtor, KeyRow, ModuleRow, OrdinalRow)
+import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow)
 import interface (stubbed)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
 import std.bin
@@ -124,7 +124,7 @@ pub fn unit_roots() -> List<Bytes> = [b"unit.emitted", b"unit.held", b"front.dum
 // The definitions a program's analysis and its unit are a function of besides its sources.
 pub fn compiler_roots() -> List<Bytes> = push(unit_roots(), b"front.analyse_pulling_std_with")
 
-fn kept_at(dir: String, key: Bytes) -> String / {abort.raise} =
+fn kept_path(dir: String, key: Bytes) -> String / {abort.raise} =
   if dir == "" || dir == "." { string_of_bytes(key) } else { dir ++ "/" ++ string_of_bytes(key) }
 
 // An answer kept between runs under `dir`. A read is a use, which keeps it from the toolchain's
@@ -133,7 +133,7 @@ pub fn read_kept<[r]>(
   dir: String,
   key: Bytes,
 ) -> Option<Bytes> / {fs.read[r], fs.write[r], time.now_ms, abort.raise} = {
-  let path = kept_at(dir, key);
+  let path = kept_path(dir, key);
   match fs.read_file[r](path) {
     None -> None,
     Some(bytes) -> {
@@ -150,7 +150,7 @@ pub fn write_kept<[r]>(
   key: Bytes,
   bytes: Bytes,
 ) -> Unit / {fs.write[r], entropy.next, time.now_ms, abort.raise} = {
-  let path = kept_at(dir, key);
+  let path = kept_path(dir, key);
   let nonce = bytes_slice(
     blake3(bytes_concat(u64_le(entropy.next()), u64_le(time.now_ms()))),
     0,
@@ -428,22 +428,22 @@ fn pools_of(
 ) -> Pools / {abort.raise} = {
   let ts = map(bodies, |k: UnitBody| k.tables);
   let all = |pick: (Tables) -> List<Bytes>|
-    fold(ts, [], |acc: List<Bytes>, t: Tables| append(acc, pick(t)));
+    fold(ts, [], |acc: List<Bytes>, tables: Tables| append(acc, pick(tables)));
   let shapes = fold(
     ts,
     map_insert(map_new(), shape_key(entry_fields()), entry_fields()),
-    |acc: Map<Bytes, List<Bytes>>, t: Tables|
-      fold(t.shapes, acc, |into: Map<Bytes, List<Bytes>>, names: List<Bytes>| {
+    |acc: Map<Bytes, List<Bytes>>, tables: Tables|
+      fold(tables.shapes, acc, |into: Map<Bytes, List<Bytes>>, names: List<Bytes>| {
         let s = ordered(names);
         map_insert(into, shape_key(s), s)
       }),
   );
   {
     consts: ordered(fold(lines, [], |acc: List<Bytes>, ls: List<Bytes>| append(acc, ls))),
-    fields: ordered(all(|t: Tables| t.fields)),
-    builtins: ordered(all(|t: Tables| t.builtins)),
+    fields: ordered(all(|tables: Tables| tables.fields)),
+    builtins: ordered(all(|tables: Tables| tables.builtins)),
     shapes: map_values(shapes),
-    lambdas: ordered(append(constant_entries, all(|t: Tables| t.lambdas))),
+    lambdas: ordered(append(constant_entries, all(|tables: Tables| tables.lambdas))),
   }
 }
 
@@ -516,15 +516,15 @@ fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
 
 // What a placeholder names in the unit's tables, its kind leading so a bucket's table sorts by
 // kind; `None` for a root, written as its id. `lines` is the body's constants as the pool holds them.
-fn hole_key(h: Hole, t: Tables, lines: List<Bytes>) -> Option<Bytes> / {abort.raise} =
+fn hole_key(h: Hole, tables: Tables, lines: List<Bytes>) -> Option<Bytes> / {abort.raise} =
   if h.kind == 84 { Some(bytes_concat(b"T", h.digits)) }
   else if h.kind == 114 { None } else {
     let i = digits_of(h.digits);
     if h.kind == 99 { Some(bytes_concat(b"c", at(lines, i))) }
-    else if h.kind == 98 { Some(bytes_concat(b"b", at(t.builtins, i))) }
-    else if h.kind == 102 { Some(bytes_concat(b"f", at(t.fields, i))) }
-    else if h.kind == 115 { Some(bytes_concat(b"s", shape_key(ordered(at(t.shapes, i))))) }
-    else if h.kind == 108 { Some(bytes_concat(b"l", at(t.lambdas, i))) }
+    else if h.kind == 98 { Some(bytes_concat(b"b", at(tables.builtins, i))) }
+    else if h.kind == 102 { Some(bytes_concat(b"f", at(tables.fields, i))) }
+    else if h.kind == 115 { Some(bytes_concat(b"s", shape_key(ordered(at(tables.shapes, i))))) }
+    else if h.kind == 108 { Some(bytes_concat(b"l", at(tables.lambdas, i))) }
     else { panic("an emitted placeholder of no kind the unit resolves") }
   }
 
@@ -883,7 +883,7 @@ pub fn produce(
 // What the front end's answer says the emitter works over: each root, the modules in program order,
 // and what each module imports.
 type Program = {
-  roots: Map<Bytes, EmitRoot>,
+  roots: Map<Bytes, EmitterRoot>,
   keys: Map<Bytes, Bytes>,
   modules: List<ModuleRow>,
   imports: Map<Bytes, List<Bytes>>,
@@ -894,7 +894,7 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
   let by_name = fold(dump.modules, map_new(), |acc: Map<Bytes, ModuleRow>, m: ModuleRow|
     map_insert(acc, m.name, m));
   {
-    roots: fold(dump.emit_roots, map_new(), |acc: Map<Bytes, EmitRoot>, root: EmitRoot|
+    roots: fold(dump.emitter_roots, map_new(), |acc: Map<Bytes, EmitterRoot>, root: EmitterRoot|
       map_insert(acc, root.root, root)),
     keys: fold(dump.keys, map_new(), |acc: Map<Bytes, Bytes>, k: KeyRow|
       map_insert(acc, k.root, k.key)),
@@ -1085,8 +1085,9 @@ fn emitter_answers(
     runtime.builtins,
     missed,
     if len(dump.packages) == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
-    if len(dump.packages) == 0 { map(names, |_: Bytes| 0) }
-    else { map(placed, |i: Int| match list_at(dump.mod_pkg, i) { Some(k) -> k, None -> 0 }) },
+    if len(dump.packages) == 0 { map(names, |_: Bytes| 0) } else {
+      map(placed, |i: Int| match list_at(dump.module_packages, i) { Some(k) -> k, None -> 0 })
+    },
     dump.embeds,
     dump.rows,
     dump.walked,
@@ -1107,7 +1108,7 @@ pub fn emitted<| e>(
   write: (Bytes, Bytes) -> Unit / e,
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
-  let ctors = map(dump.emit_ctors, |c: EmitCtor| { name: c.name, arity: c.arity });
+  let ctors = map(dump.emitter_ctors, |c: EmitterCtor| { name: c.name, arity: c.arity });
   let asked = fold(offered, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
   // No constructor table: a body names each tag by its constructor, which its key's read
   // declarations already cover, so one answer serves every program that holds the root.
@@ -1190,9 +1191,9 @@ fn outside() -> Int = 4294967295
 
 fn place_of(dump: Dump, name: Bytes) -> { module: Int, start: Int, end: Int } =
   fold(
-    dump.emit_roots,
+    dump.emitter_roots,
     { module: outside(), start: 0, end: 0 },
-    |acc: { module: Int, start: Int, end: Int }, root: EmitRoot|
+    |acc: { module: Int, start: Int, end: Int }, root: EmitterRoot|
       if root.root == name { { module: root.at.module, start: root.at.start, end: root.at.end } }
       else { acc },
   )
