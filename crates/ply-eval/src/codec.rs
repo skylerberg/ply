@@ -132,7 +132,11 @@ impl<'v> Encoder<'v> {
                     self.value(arg)?;
                 }
             }
-            Value::Closure(_) | Value::Cell(_) | Value::Task(_) | Value::Secret(_) => {
+            Value::Closure(_)
+            | Value::Cell(_)
+            | Value::Task(_)
+            | Value::Chan(_)
+            | Value::Secret(_) => {
                 return Err(format!("a {} is not plain data", v.type_name()));
             }
         }
