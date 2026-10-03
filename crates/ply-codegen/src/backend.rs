@@ -24,6 +24,7 @@ struct Admitted {
     memo: Memo,
     params: &'static [Carry],
     answer: &'static Carry,
+    witnesses: &'static [usize],
 }
 
 /// The carry of a root the compiler published none for.
@@ -31,16 +32,55 @@ static UNPUBLISHED: Carry = Carry::Open;
 
 impl Admitted {
     /// How this entry's answer reads: its type, each variable bound by what the arguments show of
-    /// it. What no argument shows stays open, since only a value of that type could show it.
+    /// it. What no argument shows stays open, since only a value of that type could show it, except
+    /// a witnessed variable, which [`Admitted::entered_with`] passed as `Int`.
     fn reading(&self, args: &[Value], ctors: &CtorCarries) -> Cow<'static, Carry> {
         if !self.answer.mentions_var() {
             return Cow::Borrowed(self.answer);
         }
         let mut vars = Vec::new();
-        for (param, arg) in self.params.iter().zip(args) {
+        for (param, arg) in self.written().iter().zip(args) {
             param.bind(arg, &mut vars, ctors);
         }
+        for &var in self.witnesses {
+            if vars.len() <= var {
+                vars.resize(var + 1, Carry::Open);
+            }
+            if vars[var] == Carry::Open {
+                vars[var] = Carry::Plain;
+            }
+        }
         Cow::Owned(self.answer.instantiate(&vars))
+    }
+
+    /// The parameters a caller from outside passes: those after the witnesses.
+    fn written(&self) -> &'static [Carry] {
+        self.params.get(self.witnesses.len()..).unwrap_or(&[])
+    }
+
+    /// `args` behind the witness of each variable it is entered with: the type the arguments show
+    /// for it, or `Int`'s when none does.
+    fn entered_with<'a>(&self, args: &'a [Value], ctors: &CtorCarries) -> Cow<'a, [Value]> {
+        if self.witnesses.is_empty() {
+            return Cow::Borrowed(args);
+        }
+        let shown = |var: usize| {
+            self.written()
+                .iter()
+                .zip(args)
+                .find_map(|(param, arg)| param.value_at(var, arg, ctors))
+                .map_or(
+                    ply_eval::builtins::INT_WITNESS,
+                    ply_eval::builtins::witness_of,
+                )
+        };
+        Cow::Owned(
+            self.witnesses
+                .iter()
+                .map(|&var| Value::Int(shown(var)))
+                .chain(args.iter().cloned())
+                .collect(),
+        )
     }
 }
 
@@ -339,6 +379,7 @@ impl Bodies {
                     memo,
                     params: row.map_or(&[], |r| r.params.as_slice()),
                     answer: row.map_or(&UNPUBLISHED, |r| &r.answer),
+                    witnesses: row.map_or(&[], |r| r.witnesses.as_slice()),
                 },
             );
         }
@@ -399,12 +440,13 @@ impl Bodies {
         let Some(admitted) = self.admitted.get(name) else {
             return self.decline(|d| d.not_compiled += 1);
         };
-        if admitted.arity != args.len() {
+        if admitted.arity != admitted.witnesses.len() + args.len() {
             return self.decline(|d| d.arity += 1);
         }
         let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
             return self.decline(|d| d.reentered += 1);
         };
+        let filled = admitted.entered_with(args, &self.unit.source.front.ctor_carries);
 
         let tables = std::sync::Arc::clone(&ctx.tables);
         if let Memo::Constant(index) = admitted.memo
@@ -421,8 +463,8 @@ impl Bodies {
         let mut handles = [0i64; MAX_ARITY];
         let before = ctx.heap.allocated();
         // A call whose arguments are all memoized words is itself memoized.
-        let mut all_memo = matches!(admitted.memo, Memo::Calls) && !args.is_empty();
-        for (slot, value) in handles.iter_mut().zip(args) {
+        let mut all_memo = matches!(admitted.memo, Memo::Calls) && !filled.is_empty();
+        for (slot, value) in handles.iter_mut().zip(filled.iter()) {
             *slot = match tables.memo_word(value) {
                 Some(w) => w,
                 None => {
@@ -431,7 +473,7 @@ impl Bodies {
                 }
             };
         }
-        let words = &handles[..args.len()];
+        let words = &handles[..filled.len()];
         if all_memo && let Some(value) = tables.memo_call(name, words) {
             ctx.end();
             drop(ctx);

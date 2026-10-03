@@ -110,6 +110,12 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
             span: r.span(e.field("at")?)?,
             params: carries(e.field("params")?)?,
             answer: carry(e.field("answer")?)?,
+            // The committed bundle that stages a pull request's compiler may predate witnesses,
+            // and nothing is entered over its answer.
+            witnesses: match e.field("witnesses") {
+                Ok(w) => w.items(|x| x.number())?,
+                Err(_) => Vec::new(),
+            },
         })
     })?;
     for k in d.field("emit_ctors")?.list()? {
