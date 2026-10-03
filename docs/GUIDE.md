@@ -995,7 +995,9 @@ The prelude declares `effect abort { read raise<a>(message: String) -> a }`.
 come back. So does everything else that can fail on a value it is given: `panic`,
 `assert` and `assert_eq`, a builtin outside what it is defined for (§12), a `/`
 or `%` by zero (§2.4), a `let` whose pattern misses (§5.1), an `iterate` past
-its budget and a `task.join` of a cancelled task (§9). A signature that leaves
+its budget, a `task.join` of a cancelled task, a `task.channel` of a negative
+capacity and a `random.below` of a bound below one (§9); a capacity or bound
+written as a literal in range does not raise. A signature that leaves
 `abort.raise` out of its row where its body can raise is `E0302`, which names
 the operation and offers the row to write. Overflow, the call ceiling and a
 spent step budget end the run whatever the row says.
@@ -1236,7 +1238,7 @@ handed over, and a receive waits while it is empty and answers the oldest value
 sent. `task.close(c)` ends sending: a waiting receiver hears `None` and a waiting
 sender `false`, a later send answers `false` without sending, and receives take
 what was queued before the close, then `None`. Closing twice changes nothing,
-and a negative capacity raises `E0502`. Cancelling a task that waits on a
+and a negative capacity raises (§6.8). Cancelling a task that waits on a
 channel lets go of its wait, and a value it was sending is dropped. Every
 operation on one channel is ordered against every other on it, so the search
 tries each order two senders or two receivers could take. A race is one channel:

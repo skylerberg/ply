@@ -1634,7 +1634,7 @@ fn raised_message(d: &Diagnostic) -> String {
 }
 
 /// [`Ctx::raise`] for a runtime error that is the program's to answer.
-fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
+pub(crate) fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
     let message = raised_message(&d);
     ctx.raise(d, message)
 }

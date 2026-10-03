@@ -34,6 +34,18 @@ pub enum Resumption<K, B> {
     },
 }
 
+/// What `task.channel(capacity)` may hold, or the raise a negative capacity is.
+pub fn capacity_of(capacity: i64, span: Span) -> Result<usize, Diagnostic> {
+    usize::try_from(capacity).map_err(|_| {
+        Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("a channel cannot hold {capacity} values"),
+        )
+        .primary(span, "made here")
+        .note("a capacity is how many sent values may wait for a receiver; `0` is a rendezvous")
+    })
+}
+
 pub enum Turn<K, B> {
     Run {
         task: TaskId,
@@ -832,18 +844,8 @@ impl<K, B> Scheduler<K, B> {
     }
 
     /// A channel holding up to `capacity` values no receiver has taken; `0` is a rendezvous.
-    pub fn channel(&mut self, k: K, capacity: i64, span: Span) -> Result<(), Diagnostic> {
+    pub fn channel(&mut self, k: K, capacity: usize) -> Result<(), Diagnostic> {
         let task = self.running()?;
-        let Ok(capacity) = usize::try_from(capacity) else {
-            return Err(Diagnostic::error(
-                codes::RUNTIME_ERROR,
-                format!("a channel cannot hold {capacity} values"),
-            )
-            .primary(span, "made here")
-            .note(
-                "a capacity is how many sent values may wait for a receiver; `0` is a rendezvous",
-            ));
-        };
         let id = ChanId(self.next_chan);
         self.next_chan += 1;
         self.channels.insert(
