@@ -462,9 +462,9 @@ pub(crate) fn drop_frame(f: HandlerFrame) {
 }
 
 /// A heap word a cell holds; clone and drop are counts, so the arena drops before the heap.
-pub struct Held(pub Word);
+pub struct HeldWord(pub Word);
 
-impl Held {
+impl HeldWord {
     fn into_word(self) -> Word {
         let w = self.0;
         std::mem::forget(self);
@@ -472,28 +472,28 @@ impl Held {
     }
 }
 
-impl Clone for Held {
-    fn clone(&self) -> Held {
+impl Clone for HeldWord {
+    fn clone(&self) -> HeldWord {
         heap::inc(self.0);
-        Held(self.0)
+        HeldWord(self.0)
     }
 }
 
-impl Drop for Held {
+impl Drop for HeldWord {
     fn drop(&mut self) {
         heap::dec(self.0);
     }
 }
 
-impl Default for Held {
-    fn default() -> Held {
-        Held(heap::unit())
+impl Default for HeldWord {
+    fn default() -> HeldWord {
+        HeldWord(heap::unit())
     }
 }
 
-impl std::fmt::Debug for Held {
+impl std::fmt::Debug for HeldWord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Held({:#x})", self.0)
+        write!(f, "HeldWord({:#x})", self.0)
     }
 }
 
@@ -530,7 +530,7 @@ pub struct Ctx {
     time_budget_ms: u64,
     /// The cells, holding heap words: declared before the heap, so their counts go back first.
     /// Each stack in `stacks` owns the regions it opens, under the index that names it.
-    pub(crate) cells: ply_eval::TaskRegions<Held>,
+    pub(crate) cells: ply_eval::TaskRegions<HeldWord>,
     /// The arena's `(total depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
     cells_baseline: (usize, usize),
     pub heap: Heap,
@@ -764,7 +764,7 @@ impl Ctx {
         }
         self.detached.clear();
         self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        // No cell outlives its entry, so each entry can name its cells as a fresh tier would.
+        // No cell outlives its entry, so each entry can name its cells as a fresh backend would.
         let renewed = self.cells.renew();
         debug_assert!(
             renewed,
@@ -1168,7 +1168,7 @@ pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let owner = ctx.owner();
     let slot = ctx
         .cells
-        .alloc(owner, Held(init))
+        .alloc(owner, HeldWord(init))
         .expect("a `with_cell` allocates in the region its stack just opened");
     ctx.heap.bridge(Value::Cell(slot))
 }
@@ -1827,7 +1827,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if heap::reaches_cell(*v, slot) {
                 ply_eval::rc::note_cell_cycle(slot, site);
             }
-            let stored = ctx.cells.arena_mut().set(slot, Held(*v));
+            let stored = ctx.cells.arena_mut().set(slot, HeldWord(*v));
             heap::dec(*c);
             if !stored {
                 return Some(ctx.fail(no_such_cell(site, slot)));
@@ -1853,8 +1853,8 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let updated = call_value(std::ptr::from_mut(ctx), *f, &[current.into_word()]);
             let held = match kept {
                 Some(old) if ctx.failed == FAILED_ABORT => old,
-                _ if ctx.failed != 0 => Held::default(),
-                _ => Held(updated),
+                _ if ctx.failed != 0 => HeldWord::default(),
+                _ => HeldWord(updated),
             };
             ctx.cells.arena_mut().put_back(slot, held);
             heap::dec(*c);

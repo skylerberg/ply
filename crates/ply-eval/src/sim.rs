@@ -229,7 +229,7 @@ impl StepFootprint {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SimTy {
+pub enum SimType {
     Int,
     Unit,
     /// The prelude's `Instant(Int)`, nanoseconds on the region's clock.
@@ -238,11 +238,11 @@ pub enum SimTy {
     Duration,
 }
 
-impl SimTy {
+impl SimType {
     pub fn holds(self, value: &Value) -> bool {
         match (self, value) {
-            (SimTy::Int, Value::Int(_)) | (SimTy::Unit, Value::Unit) => true,
-            (SimTy::Instant | SimTy::Duration, Value::Ctor { name, args }) => {
+            (SimType::Int, Value::Int(_)) | (SimType::Unit, Value::Unit) => true,
+            (SimType::Instant | SimType::Duration, Value::Ctor { name, args }) => {
                 name.as_str() == self.as_str() && matches!(args.as_slice(), [Value::Int(_)])
             }
             _ => false,
@@ -251,10 +251,10 @@ impl SimTy {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            SimTy::Int => "Int",
-            SimTy::Unit => "Unit",
-            SimTy::Instant => "Instant",
-            SimTy::Duration => "Duration",
+            SimType::Int => "Int",
+            SimType::Unit => "Unit",
+            SimType::Instant => "Instant",
+            SimType::Duration => "Duration",
         }
     }
 }
@@ -276,8 +276,8 @@ pub fn nanos_of(value: &Value, span: Span, what: &str) -> Result<i64, Diagnostic
 pub struct OpSignature {
     pub effect: &'static str,
     pub op: &'static str,
-    pub params: &'static [SimTy],
-    pub ret: SimTy,
+    pub params: &'static [SimType],
+    pub ret: SimType,
 }
 
 impl fmt::Display for OpSignature {
@@ -291,25 +291,25 @@ pub const SEEDED_OPS: &[OpSignature] = &[
         effect: "clock",
         op: "now",
         params: &[],
-        ret: SimTy::Instant,
+        ret: SimType::Instant,
     },
     OpSignature {
         effect: "clock",
         op: "sleep",
-        params: &[SimTy::Duration],
-        ret: SimTy::Unit,
+        params: &[SimType::Duration],
+        ret: SimType::Unit,
     },
     OpSignature {
         effect: "random",
         op: "next",
         params: &[],
-        ret: SimTy::Int,
+        ret: SimType::Int,
     },
     OpSignature {
         effect: "random",
         op: "below",
-        params: &[SimTy::Int],
-        ret: SimTy::Int,
+        params: &[SimType::Int],
+        ret: SimType::Int,
     },
 ];
 
@@ -374,7 +374,7 @@ pub enum Sleep {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Wake {
+pub struct Wakeup {
     pub now: i64,
     /// Every task whose deadline was exactly `now`, ascending by id.
     pub woken: Vec<TaskId>,
@@ -440,7 +440,7 @@ impl Clock {
         self.timers.retain(|&(_, t)| t != task);
     }
 
-    pub fn advance(&mut self) -> Option<Wake> {
+    pub fn advance(&mut self) -> Option<Wakeup> {
         let deadline = self.next_deadline()?;
         let mut woken = Vec::new();
         while let Some(&entry) = self.timers.first() {
@@ -451,7 +451,7 @@ impl Clock {
             woken.push(entry.1);
         }
         self.now = deadline;
-        Some(Wake {
+        Some(Wakeup {
             now: deadline,
             woken,
         })

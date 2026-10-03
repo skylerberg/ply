@@ -120,9 +120,9 @@ fn boxed() -> Boxed = with_cell[log](41) { c -> Wrap(|| cell_get(c)) }
 /// The body reads a cell of the region enclosing its `handle`, and is resumed only once that region
 /// has closed: the region's cell outlives its close for as long as the body can run.
 #[test]
-fn the_parked_continuation_runs_on_the_tier_and_reads_its_regions_cell() {
+fn the_parked_continuation_runs_on_the_backend_and_reads_its_regions_cell() {
     let compiled = Compiled::new(PARKED);
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
     let test = compiled.index_of("the parked continuation still reads its region's cell");
 
     machine
@@ -131,15 +131,15 @@ fn the_parked_continuation_runs_on_the_tier_and_reads_its_regions_cell() {
         .0
         .expect("the resumed body reads 41 from the closed region's cell");
 
-    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(backend.declines().total(), 0, "{:?}", backend.declines());
 }
 
 /// `parked` is pure and nullary, so the memo is offered its answer; a `k` it kept would name a
 /// body only the first entry held, and the second entry would resume nothing.
 #[test]
-fn two_entries_on_one_tier_each_resume_the_continuation_they_parked() {
+fn two_entries_on_one_backend_each_resume_the_continuation_they_parked() {
     let compiled = Compiled::new(PARKED);
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
 
     for name in [
         "the parked continuation still reads its region's cell",
@@ -152,7 +152,7 @@ fn two_entries_on_one_tier_each_resume_the_continuation_they_parked() {
             .unwrap_or_else(|d| panic!("{name}: {d:#?}"));
     }
 
-    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(backend.declines().total(), 0, "{:?}", backend.declines());
 }
 
 /// `Saved`'s field is an ordinary function type, so the checker lets `k` reach `parked`'s answer,
@@ -160,7 +160,7 @@ fn two_entries_on_one_tier_each_resume_the_continuation_they_parked() {
 #[test]
 fn a_continuation_in_an_entrys_answer_is_the_programs_error_and_no_decline() {
     let compiled = Compiled::new(PARKED);
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
 
     let d = machine
         .call("m.parked", vec![], Span::DUMMY)
@@ -183,7 +183,7 @@ fn a_continuation_in_an_entrys_answer_is_the_programs_error_and_no_decline() {
         .expect("the refusal is placed")
         .span;
     assert!(PARKED[at.range()].starts_with("fn parked()"), "{d:#?}");
-    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(backend.declines().total(), 0, "{:?}", backend.declines());
     assert_eq!(machine.compiled_counts(), (1, 0));
 }
 
@@ -192,17 +192,17 @@ fn a_continuation_in_an_entrys_answer_is_the_programs_error_and_no_decline() {
 #[test]
 fn a_constant_the_seam_refuses_keeps_no_continuation_for_the_next_entry() {
     let compiled = Compiled::new(PARKED);
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
 
     for entry in 0..2 {
         let d = machine
             .call("m.parked", vec![], Span::DUMMY)
             .into_parts()
             .0
-            .expect_err("a continuation does not cross out of the tier");
+            .expect_err("a continuation does not cross out of the backend");
         assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "entry {entry}");
     }
-    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(backend.declines().total(), 0, "{:?}", backend.declines());
 
     machine
         .eval_test(compiled.index_of("the parked continuation still reads its region's cell"))
@@ -226,7 +226,7 @@ fn spawned() -> Option<Task<Int>> / {sim.read} = with_cell[slot](None) { kept ->
 #[test]
 fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
     let compiled = Compiled::new(HANDED);
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
 
     let d = machine
         .call("m.spawned", vec![], Span::DUMMY)
@@ -240,7 +240,7 @@ fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
         "{}",
         d.message
     );
-    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(backend.declines().total(), 0, "{:?}", backend.declines());
 }
 
 /// A type parameter hides the task `spawned` let out from the next region, which numbers a task of
@@ -261,7 +261,7 @@ pub fn rejoined() -> Int / {sim.read, abort.raise} = match spawned() {
 #[test]
 fn a_task_carried_into_another_region_fails_its_join_rather_than_answering_a_stranger() {
     let compiled = Compiled::new(&format!("{HANDED}{REJOINED}"));
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
 
     let d = machine
         .call("m.rejoined", vec![], Span::DUMMY)
@@ -271,7 +271,7 @@ fn a_task_carried_into_another_region_fails_its_join_rather_than_answering_a_str
 
     assert_eq!(d.code, codes::TASK_ESCAPES_SCOPE, "{d:#?}");
     assert!(d.message.contains("another region"), "{}", d.message);
-    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(backend.declines().total(), 0, "{:?}", backend.declines());
 }
 
 #[test]

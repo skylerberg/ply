@@ -1015,7 +1015,7 @@ fn array_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
 }
 
 /// A builtin over values. One that calls back into the program, or reads a cell, is the compiled
-/// tier's to answer, since only it can enter a closure or reach a cell.
+/// backend's to answer, since only it can enter a closure or reach a cell.
 pub fn call(b: Builtin, mut args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let out = call_with(b, &mut args, span);
     args.clear();
@@ -1078,7 +1078,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::CellGet
         | Builtin::CellSet
         | Builtin::CellUpdate
-        | Builtin::Bracket => Err(answered_by_the_tier(b, span)),
+        | Builtin::Bracket => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
@@ -2305,9 +2305,9 @@ pub fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     .note("please report this: a cell value escaped the region that allocated it")
 }
 
-/// The compiled tier answers every builtin that calls back into the program or reads a cell.
+/// The C backend answers every builtin that calls back into the program or reads a cell.
 #[cold]
-fn answered_by_the_tier(b: Builtin, span: Span) -> Diagnostic {
+fn answered_by_the_backend(b: Builtin, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!(
@@ -2316,5 +2316,5 @@ fn answered_by_the_tier(b: Builtin, span: Span) -> Diagnostic {
         ),
     )
     .primary(span, "it calls back into the program or reads a cell")
-    .note("this is Ply's fault: the compiled tier answers this builtin over its own words")
+    .note("this is Ply's fault: the C backend answers this builtin over its own words")
 }

@@ -9,7 +9,7 @@ struct Transcript {
     verdict: String,
     virtual_time: i64,
     steps: Vec<String>,
-    /// The operations the tier reports the run performed, handled ones included.
+    /// The operations the backend reports the run performed, handled ones included.
     performed: String,
 }
 
@@ -27,29 +27,29 @@ fn render_step(step: &Step) -> String {
     )
 }
 
-/// A program and the one tier every run of it goes to in turn, as one worker's runs do.
+/// A program and the one backend every run of it goes to in turn, as one worker's runs do.
 struct Audited {
     compiled: Compiled,
-    tier: Rc<dyn ply_eval::Compiled>,
+    backend: Rc<dyn ply_eval::Compiled>,
 }
 
 impl Audited {
     fn new(source: &str) -> Audited {
         let compiled = Compiled::named("t", source);
-        let tier = compiled.unit().attach();
-        Audited { compiled, tier }
+        let backend = compiled.unit().attach();
+        Audited { compiled, backend }
     }
 
-    /// Test `index` at `seed`, run by the tier through the `simulate` region every fixture here
+    /// Test `index` at `seed`, run by the backend through the `simulate` region every fixture here
     /// opens: a transcript of anything else would compare nothing the program did.
     fn run(&self, index: usize, seed: &Seed) -> (Machine<'_>, Result<(), Diagnostic>) {
-        let mut machine = self.compiled.machine_on(Rc::clone(&self.tier));
+        let mut machine = self.compiled.machine_on(Rc::clone(&self.backend));
         machine.set_seed(seed.clone(), 100_000);
         let (outcome, _) = machine.eval_test(index).into_parts();
         assert_eq!(
             machine.compiled_counts(),
             (1, 0),
-            "test {index} at seed {seed} was not run by the tier: {outcome:?}"
+            "test {index} at seed {seed} was not run by the backend: {outcome:?}"
         );
         if let Err(d) = &outcome {
             assert_ne!(
@@ -256,10 +256,10 @@ fn an_edit_that_changes_no_hash_changes_no_interleaving() {
     }
 }
 
-/// A mixture's run, on a tier of its own, reproduces a failure only if its message matches the one
-/// the worker's tier reported.
+/// A mixture's run, on a backend of its own, reproduces a failure only if its message matches the one
+/// the worker's backend reported.
 #[test]
-fn every_entry_of_one_tier_names_a_failures_cell_alike() {
+fn every_entry_of_one_backend_names_a_failures_cell_alike() {
     let compiled = Compiled::named(
         "t",
         r#"
@@ -268,10 +268,10 @@ test "an update that reads the cell it holds" {
 }
 "#,
     );
-    let tier = compiled.unit().attach();
+    let backend = compiled.unit().attach();
     for _ in 0..3 {
         let d = compiled
-            .machine_on(Rc::clone(&tier))
+            .machine_on(Rc::clone(&backend))
             .eval_test(0)
             .into_parts()
             .0

@@ -43,18 +43,18 @@ fn call(machine: &mut ply_eval::Machine<'_>, name: &str, args: Vec<Value>) -> Va
         .unwrap_or_else(|d| panic!("`{name}` raised: {d:#?}"))
 }
 
-/// A tier's steps are the last entry's calls, and an entry the memo answers makes none.
+/// A backend's steps are the last entry's calls, and an entry the memo answers makes none.
 #[test]
 fn a_pure_root_over_memo_words_is_answered_from_the_memo() {
     let compiled = Compiled::named("t", SOURCE);
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
     let table = call(&mut machine, "t.table", Vec::new());
 
     let first = call(&mut machine, "t.weigh", vec![table.clone()]);
-    assert!(tier.steps() > 0, "the first entry did not run the body");
+    assert!(backend.steps() > 0, "the first entry did not run the body");
     let second = call(&mut machine, "t.weigh", vec![table]);
     assert_eq!(second, first);
-    assert_eq!(tier.steps(), 0, "the second entry ran the body again");
+    assert_eq!(backend.steps(), 0, "the second entry ran the body again");
 }
 
 #[test]
@@ -76,14 +76,14 @@ fn an_effectful_root_over_memo_words_performs_every_time_it_is_entered() {
         counter.clone(),
     );
     let binding = registry.bind(&compiled.front.check).expect("binds");
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
     machine.set_host_binding(Arc::new(binding));
     let table = call(&mut machine, "t.table", Vec::new());
 
     // The arguments are memo words: a pure root over them is answered from the memo.
     call(&mut machine, "t.weigh", vec![table.clone()]);
     call(&mut machine, "t.weigh", vec![table.clone()]);
-    assert_eq!(tier.steps(), 0, "`table` did not answer memo words");
+    assert_eq!(backend.steps(), 0, "`table` did not answer memo words");
 
     for ordinal in 1..=2 {
         let sent = call(&mut machine, "t.post", vec![table.clone()]);
