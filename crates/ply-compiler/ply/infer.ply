@@ -698,6 +698,16 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
       name: b"iterate",
       sc: poly_fn([a, b], [e], [ta, t_int(), t_fn([ta], t_iter(ta, tb), re)], tb, re),
     },
+    {
+      name: b"bracket",
+      sc: poly_fn(
+        [a, b],
+        [e],
+        [t_fn([], ta, re), t_fn([ta], t_unit(), re), t_fn([ta], tb, re)],
+        tb,
+        re,
+      ),
+    },
     { name: b"range", sc: mono_fn([t_int(), t_int()], t_list(t_int())) },
     // The wrapping family is `forall a. (a, a) -> a`; `infer_app` attaches the integer obligation at each call.
     { name: b"wrap_add", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
@@ -874,6 +884,11 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
       b"iterate",
       [b"seed", b"budget", b"step"],
       b"`step` answers `Continue(next)` or `Stop(result)`; the budget bounds the steps",
+    ),
+    bdoc(
+      b"bracket",
+      [b"acquire", b"release", b"body"],
+      b"what `body` answers for what `acquire` answered, with `release` run on it however `body` ends but a failure",
     ),
     bdoc(b"range", [b"lo", b"hi"], b"`[lo, hi)`"),
     bdoc(b"wrap_add", [b"a", b"b"], b"any integer type; wraps at its width"),
@@ -3216,6 +3231,30 @@ fn infer_app(cx: Cx, span: Span, func: Expr, args: List<Expr>, labels: List<Iden
     _ -> infer_app_general(cx, span, func, args, labels),
   }
 
+// The prelude name a bare callee resolves to, or nothing for one the program declares.
+fn prelude_named(cx: Cx, func: Expr) -> Bytes =
+  match func {
+    EVar(v) -> if !is_bare(v.name) { b"" } else {
+      match value_key(cx, v.name).key {
+        Some(k) -> if k.prelude { k.name } else { b"" },
+        None -> b"",
+      }
+    },
+    _ -> b"",
+  }
+
+// The closures `bracket` is handed run as one, so each is taken to perform what all of them do: a
+// body generic over its caller's row still admits the release's operations.
+fn joined_callbacks(cx: Cx, span: Span, tys: List<Type>) -> { cx: Cx, tys: List<Type> } = {
+  let j: WithRow = fold(tys, { cx: cx, r: row_empty() }, |acc: WithRow, t: Type|
+    match resolve(acc.cx, t) { TyFn(f) -> join(acc.cx, span, acc.r, f.effects), _ -> acc });
+  {
+    cx: j.cx,
+    tys: map(tys, |t: Type|
+      match resolve(j.cx, t) { TyFn(f) -> TyFn({ ..f, effects: j.r }), _ -> t }),
+  }
+}
+
 fn group_label_vars(cx: Cx, name: Bytes) -> List<Int> =
   fold(cx.group_defs, [], |acc: List<Int>, g: GroupDef| if g.name == name { g.labels } else { acc })
 
@@ -3707,8 +3746,11 @@ fn infer_app_general(
     } else {
       let source = callee_source(c, func);
       let callee: Option<Bytes> = group_callee(c, source);
-      let checked: Cx = expect_arguments(c, fn_.params, as_.tys, |cc: Cx, i: Int|
-        expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(as_.tys, i), callee));
+      let handed: { cx: Cx, tys: List<Type> } = if prelude_named(c, func) == b"bracket" {
+        joined_callbacks(c, span, as_.tys)
+      } else { { cx: c, tys: as_.tys } };
+      let checked: Cx = expect_arguments(handed.cx, fn_.params, handed.tys, |cc: Cx, i: Int|
+        expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(handed.tys, i), callee));
       // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
       let obliged: Cx = if is_int_builtin(func) && len(fn_.params) > 0 {
         note_bits(
@@ -9258,6 +9300,28 @@ test "a unit pattern covers its type" {
   assert_eq(
     check_dump([{ name: b"m", src: b"fn f(u: Unit) -> Int = match u { () -> 1 }" }]),
     "K;1;F;m.f;(Unit) -> Int;;;;",
+  )
+}
+
+test "a bracket's closures run as one, so a body generic over its row admits the release's" {
+  let effect_io = b"effect io { write close(h: Int) -> Unit }\n";
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        effect_io,
+        b"fn served<| e>(h: Int, app: () -> Unit / e) -> Unit / {io.close | e} = bracket(|| h, |x: Int| io.close(x), |x: Int| app())",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        effect_io,
+        b"fn served<| e>(h: Int, app: () -> Unit / e) -> Unit / e = bracket(|| h, |x: Int| io.close(x), |x: Int| app())",
+      ),
+    ),
+    [b"E0302"],
   )
 }
 
