@@ -648,11 +648,10 @@ fn prefix(a: List<Bytes>, b: List<Bytes>) -> Bool =
     [x, ..rest] -> match b { [y, ..more] -> x == y && prefix(rest, more), [] -> false },
   }
 
+// The first field of the name.
 fn field_term(fs: List<{ name: Bytes, term: Term }>, name: Bytes) -> Option<Term> =
-  match fs {
-    [] -> None,
-    [f, ..rest] -> if f.name == name { Some(f.term) } else { field_term(rest, name) },
-  }
+  fold(fs, None, |found: Option<Term>, f: { name: Bytes, term: Term }|
+    match found { Some(_) -> found, None -> if f.name == name { Some(f.term) } else { None } })
 
 // A value of this type has one size whatever it holds.
 fn atomic(t: Type) -> Bool =
@@ -1187,34 +1186,93 @@ fn joined(a: Option<Term>, b: Option<Term>) -> Option<Term> =
   match a { None -> b, Some(x) -> match b { None -> a, Some(y) -> Some(join(x, y)) } }
 
 // A value either term may be: its parts are parts of a place both are, or are parts of, whatever
-// a term with no parts adds. Two parts are a part of the wider place, of the looser kind, and two
-// constructors of one field one whose field is either.
-fn join(a: Term, b: Term) -> Term =
-  if a == b { a } else {
+// a term with no parts adds. Two parts are a part of the wider place, of the looser kind; two
+// constructors of one field one whose field is either; and two records one whose fields are.
+fn join(a: Term, b: Term) -> Term = joined_within(a, b, join_depth())
+
+// Records and constructors nested past this many deep are joined as nothing known, which is always
+// a join.
+fn join_depth() -> Int = 8
+
+fn joined_within(a: Term, b: Term, room: Int) -> Term =
+  if a == b { a }
+  else if room <= 0 { UnknownTerm } else {
     match a {
-      Wrapped(x) -> match b { Wrapped(y) -> Wrapped(join(x, y)), NoParts -> a, _ -> UnknownTerm },
+      Wrapped(x) -> match b {
+        Wrapped(y) -> Wrapped(joined_within(x, y, room - 1)),
+        NoParts -> a,
+        _ -> UnknownTerm,
+      },
+      RecordTerm(r) -> match b {
+        RecordTerm(q) -> record_join(r, q, room - 1),
+        _ -> match r.base {
+          Some(base) -> if base == b { record_join(r, { base: Some(b), fields: [] }, room - 1) }
+          else { UnknownTerm },
+          None -> UnknownTerm,
+        },
+      },
       _ -> match b {
         Wrapped(_) -> if a == NoParts { b } else { UnknownTerm },
+        RecordTerm(q) -> match q.base {
+          Some(base) -> if base == a { record_join({ base: Some(a), fields: [] }, q, room - 1) }
+          else { UnknownTerm },
+          None -> UnknownTerm,
+        },
         _ -> joined_parts(a, b),
       },
     }
   }
 
+// Two records over one base, or both written out whole, field by field: each field is either's.
+fn record_join(
+  a: { base: Option<Term>, fields: List<{ name: Bytes, term: Term }> },
+  b: { base: Option<Term>, fields: List<{ name: Bytes, term: Term }> },
+  room: Int,
+) -> Term =
+  if a.base != b.base { UnknownTerm } else {
+    let named = fold(
+      b.fields,
+      map(a.fields, |f: { name: Bytes, term: Term }| f.name),
+      |acc: List<Bytes>, f: { name: Bytes, term: Term }|
+        if contains_bytes(acc, f.name) { acc } else { push(acc, f.name) },
+    );
+    RecordTerm({
+      base: a.base,
+      fields: map(named, |n: Bytes|
+        {
+          name: n,
+          term: match record_field(a, n) {
+            Some(x) -> match record_field(b, n) {
+              Some(y) -> joined_within(x, y, room),
+              None -> UnknownTerm,
+            },
+            None -> UnknownTerm,
+          },
+        }),
+    })
+  }
+
+fn record_field(
+  r: { base: Option<Term>, fields: List<{ name: Bytes, term: Term }> },
+  name: Bytes,
+) -> Option<Term> =
+  match field_term(r.fields, name) {
+    Some(t) -> Some(t),
+    None -> match r.base { Some(b) -> Some(project(b, name)), None -> None },
+  }
+
+// Over the nearest place both lie in: two parts of it are a part of it, of the looser kind, and
+// anything else made of its parts is made of its parts.
 fn joined_parts(a: Term, b: Term) -> Term =
   if a == NoParts { widened(b) }
   else if b == NoParts { widened(a) } else {
     match place_of(a) {
       Some(p) -> match place_of(b) {
-        Some(q) -> {
-          let wide = if p == q || within(q, p) { Some(p) }
-          else if within(p, q) { Some(q) }
-          else { None };
-          match wide {
-            None -> UnknownTerm,
-            Some(w) -> if part_place(a) == None || part_place(b) == None { PartsOf(w) }
-            else if is_below(a) && is_below(b) { Below(w) }
-            else { Inside(w) },
-          }
+        Some(q) -> if p.param != q.param { UnknownTerm } else {
+          let c = { param: p.param, path: common_prefix(p.path, q.path) };
+          if !(proper_part(a, c) && proper_part(b, c)) { PartsOf(c) }
+          else if below_kind(a) && below_kind(b) { Below(c) }
+          else { Inside(c) }
         },
         None -> UnknownTerm,
       },
@@ -1222,7 +1280,29 @@ fn joined_parts(a: Term, b: Term) -> Term =
     }
   }
 
-fn is_below(t: Term) -> Bool = match t { Below(_) -> true, _ -> false }
+fn common_prefix(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
+  fold(
+    range(0, len(a)),
+    { same: true, out: [] },
+    |acc: { same: Bool, out: List<Bytes> }, i: Int|
+      if !acc.same { acc } else {
+        match list_at(a, i) {
+          None -> acc,
+          Some(x) -> if list_at(b, i) == Some(x) { { same: true, out: push(acc.out, x) } }
+          else { { same: false, out: acc.out } },
+        }
+      },
+  ).out
+
+// Strictly smaller than the place: a part of it or of a field of it, or a field of it.
+fn proper_part(t: Term, c: Place) -> Bool =
+  match t {
+    Exactly(l) -> match l.base { Some(PlaceBase(q)) -> l.k == 0 && within(q, c), _ -> false },
+    _ -> match part_place(t) { Some(q) -> q == c || within(q, c), None -> false },
+  }
+
+// Reached through elements and fields alone.
+fn below_kind(t: Term) -> Bool = match t { Below(_) -> true, Exactly(_) -> true, _ -> false }
 
 fn widened(t: Term) -> Term = match place_of(t) { Some(p) -> PartsOf(p), None -> UnknownTerm }
 
