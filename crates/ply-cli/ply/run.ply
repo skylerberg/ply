@@ -5,9 +5,9 @@
 // Everything below decides which entry runs, what is disclosed and when, what both forms say,
 // and the code the run exits with.
 //
-// A deployed artifact runs out of its own verified definitions rather than a source tree, so it
-// is a second shape of the same report: the same keys wherever the two agree, the file and its
-// digest where they do not.
+// A deployed artifact runs the program its runnable holds once every part of it agrees, rather
+// than a source tree, so it is a second shape of the same report: the same keys wherever the two
+// agree, the file and its digest where they do not.
 //
 // A run of sources walks them first and hashes what it read: when an earlier run of the same
 // closure filed its front end's answer under that key, the machine takes it, and this run runs no
@@ -17,7 +17,7 @@
 import std.random (entropy)
 import appends (broken_promises)
 import args (Flags, from_argv, style_of)
-import compiler.front (Whole)
+import compiler.front (Analysis)
 import config_schema
 import configuration
 import configuration (Configuration, Resolution)
@@ -44,7 +44,9 @@ import style (Style, dim, plain, red)
 import signing (provenance_of, public_of, signatures_path, unkeyed)
 import std.signed (signed_of, vouched_by)
 import compiler.plyx (digest_of, digest_text, domain, library_domain)
-import compiler.resolve (diag1)
+import compiler.resolve (error_at)
+import compiler.unit (shipped)
+import deployed
 
 // The machine the run drives is the runtime's; the effect is `machine`'s. The `root` it loads is
 // the path the line named, or `.`.
@@ -89,7 +91,8 @@ fn module_of(name: String) -> String = {
 // nothing.
 fn places_of(t: Target) -> List<Place> = match t { Project(p) -> p.places, Deployed(_) -> [] }
 
-// What opening the target itself had to say: a container from another version, a unit left aside.
+// What opening the target itself had to say, such as that it was built against another standard
+// library.
 fn told_of(t: Target) -> List<Diag> = match t { Project(_) -> [], Deployed(a) -> a.warnings }
 
 // --- Which entry runs -------------------------------------------------------
@@ -128,9 +131,7 @@ fn program_lines(s: Style, t: Target) -> List<String> =
         ind()
           ++ dim(
             s,
-            "program " ++ a.digest ++ " · " ++ int_to_string(a.definitions) ++ " definitions · "
-              ++ (if a.unit { "compiled unit embedded" }
-              else { "no compiled unit: compiled from its bodies at each run" }),
+            "program " ++ a.digest ++ " · " ++ int_to_string(a.definitions) ++ " definitions",
           ),
       ],
   }
@@ -526,7 +527,7 @@ fn configured_over(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.fronts[sys], machine.filed[run]} = {
+) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.fronts[sys], machine.filed[run], shipped.names, shipped.module, shipped.runtime} = {
   let s: Style = style_of(flags);
   // An artifact is not a program to analyse: what it holds is its own definitions, and the front
   // end never sees it. Only sources are a load this side runs, so only their schema is resolved
@@ -539,13 +540,56 @@ pub fn run(
           unread(s, root_of(flags), { diags: [d], places: [], artifact: Some(root_of(flags)) }),
         None -> {
           machine.configure[run](options);
-          let target = machine.opened[run](root_of(flags), artifact_bytes(flags));
+          let target = deployed_target(root_of(flags), artifact_bytes(flags));
           over(s, flags, target, configured_over(target, options))
         },
       },
     }
   } else { sourced(s, flags, options) }
 }
+
+// An artifact read back and held to itself here, and the program its runnable holds loaded by the
+// machine. A library is a package to depend on, and nothing to run.
+fn deployed_target(
+  path: String,
+  bytes: Option<Bytes>,
+) -> Result<Target, Refusal> / {machine.opened[run], shipped.names, shipped.module, shipped.runtime} =
+  if string_ends_with(path, ".plyz") {
+    Err({ diags: [a_library(path)], places: [], artifact: None })
+  } else {
+    match bytes {
+      None -> Err({ diags: [deployed::unreadable(path)], places: [], artifact: Some(path) }),
+      Some(b) -> match deployed::opened(path, b) {
+        Err(d) -> Err({ diags: [d], places: [], artifact: Some(path) }),
+        Ok(o) -> match machine.opened[run](path, o.runnable, o.entry, o.closure, o.names) {
+          Err(why) -> Err(why),
+          Ok(_) ->
+            Ok(
+              Deployed({
+                path: path,
+                digest: o.digest,
+                entry: o.entry,
+                definitions: o.definitions,
+                warnings: o.warnings,
+              }),
+            ),
+        },
+      },
+    }
+  }
+
+fn a_library(path: String) -> Diag =
+  error_at(
+    b"E0443",
+    no_module(),
+    { start: 0, end: 0 },
+    bytes_of_string("`" ++ path ++ "` is a library, and nothing to run"),
+    b"not a program",
+    [
+      b"a `.plyz` is a package: declare it in a `ply.pkg` and depend on it",
+      b"`ply build` writes a program's artifact as a `.plyx`",
+    ],
+  )
 
 // Read here, so the machine reads no file of its own.
 fn artifact_bytes(flags: Flags) -> Option<Bytes> / {fs.read_file[cwd], fs.read_file[abs]} =
@@ -554,7 +598,7 @@ fn artifact_bytes(flags: Flags) -> Option<Bytes> / {fs.read_file[cwd], fs.read_f
 // --- `--require-signer` ---------------------------------------------------------------
 
 fn unsigned(path: String, why: String) -> Diag =
-  diag1(
+  error_at(
     b"E0460",
     4294967295,
     { start: 0, end: 0 },
@@ -708,7 +752,7 @@ fn loaded_built(
   flags: Flags,
   options: Options,
   t: Timed,
-  w: Whole,
+  w: Analysis,
   key: String,
 ) -> Answer / {time.elapsed_ms, machine.load[run], machine.schema[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, env.fronts[sys], machine.filed[run], fs.write[abs], entropy.next, time.now_ms} = {
   let asked = time.elapsed_ms();
@@ -837,7 +881,6 @@ fn an_artifact() -> Target =
     digest: "b3:1f2e3d4c5b6a",
     entry: "m.main",
     definitions: 3,
-    unit: true,
     warnings: [],
   })
 
@@ -1132,7 +1175,7 @@ test "a raise that left spans open is said first, and the spans after where it w
 
 test "an artifact says which file it ran, its digest, and what it carries" {
   let ran = ran_over(bare(), Ok(an_artifact()), Ok(hermetic()), answered_with(VInt(42)));
-  assert_eq(ran.out, ["   program b3:1f2e3d4c5b6a · 3 definitions · compiled unit embedded"]);
+  assert_eq(ran.out, ["   program b3:1f2e3d4c5b6a · 3 definitions"]);
   let text = to_string(
     ran_over(as_json(), Ok(an_artifact()), Ok(hermetic()), answered_with(VInt(42))).answer.json,
   );
@@ -1142,22 +1185,20 @@ test "an artifact says which file it ran, its digest, and what it carries" {
   assert(string_contains(text, "\"entry\":\"m.main\""))
 }
 
-test "an artifact whose unit this runtime cannot enter says so and still runs" {
-  let aside = a_diag(b"E0444", b"the artifact's compiled unit was built for another runtime", []);
-  let stale = Deployed({
+test "what opening an artifact warned of is said before it runs" {
+  let other = a_diag(b"W0605", b"the artifact was built against a different standard library", []);
+  let warned = Deployed({
     path: "m.plyx",
     digest: "b3:aaa",
     entry: "m.main",
     definitions: 1,
-    unit: false,
-    warnings: [{ ..aside, severity: b"warning" }],
+    warnings: [{ ..other, severity: b"warning" }],
   });
-  let ran = ran_over(bare(), Ok(stale), Ok(hermetic()), answered_with(VInt(42)));
+  let ran = ran_over(bare(), Ok(warned), Ok(hermetic()), answered_with(VInt(42)));
   assert_eq(
     nth(ran.out, 0),
-    "   warning: the artifact's compiled unit was built for another runtime",
+    "   warning: the artifact was built against a different standard library",
   );
-  assert(string_contains(nth(ran.out, 1), "no compiled unit"));
   assert_eq(ran.answer.code, 0)
 }
 

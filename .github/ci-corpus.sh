@@ -239,7 +239,7 @@ kept_c() {
   local -a kept=()
   rm -rf "$dir"
   mkdir -p "$dir"
-  for sub in emit answers; do [ -d "$caches/ply-c-cache/$sub" ] && kept+=("ply-c-cache/$sub"); done
+  for sub in emit answers bodies; do [ -d "$caches/ply-c-cache/$sub" ] && kept+=("ply-c-cache/$sub"); done
   [ "${#kept[@]}" -gt 0 ] || return 0
   (cd "$caches" && find "${kept[@]}" -type f -newer "$mark" ! -name '*.tmp' -print0 |
     tar --null -T - -cf -) | tar -xf - -C "$dir"

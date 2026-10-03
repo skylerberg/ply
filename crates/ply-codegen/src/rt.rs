@@ -558,7 +558,7 @@ pub struct Ctx {
     pub(crate) binding: Arc<ply_eval::HostBinding>,
     /// The program this context's entries run, whose declarations say how a host operation's
     /// arguments read; `None` for one entered without its program's answer.
-    pub(crate) program: Option<&'static ply_eval::Front>,
+    pub(crate) program: Option<&'static ply_eval::Analysis>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
     /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of.
     pub(crate) runtime_factory: Option<ply_eval::RuntimeFactory>,

@@ -3,29 +3,29 @@
 // the front-end cache before it analyses and files the answer after, so a run checks what moved
 // since the last one and takes the rest from its rows.
 
+import compiler.load (LoadedAnalysis)
 import std.fs (fs)
 import std.time (time)
-import compiler.front (Refused, Analysed, Whole, Pulled, Rows, DefInterface,
+import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface,
                        analyse_pulling_std_with, dump_of, filing, module_items, module_imports,
                        no_rows, rows_of)
-import compiler.pkg (Pkgs, Supplied)
+import compiler.pkg (PackageSources, Supplied)
 import compiler.interface (CompiledPackage, Original, merged_interfaces)
 import interfaces
 import compiler.hash
 import compiler.hash (HashOutput, hex)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
-import compiler.infer (DefInfo, TestInfo, LawInfo, Loc)
+import compiler.infer (DefInfo, TestInfo, LawInfo, Location)
 import compiler.termination (Ends)
-import compiler.resolve (Source, Mod, Diag, Label, diag1, qualify)
-import compiler.tycore (TyCon, TyFn)
+import compiler.resolve (Source, ParsedModule, Diag, Label, error_at, qualify)
+import compiler.types (TyCon, TyFn)
 import diagnostic (Place, spot_of)
 import paths
 import sources (File, Project, DepPackage, Embed, load_resolved, shelf, nothing_here, is_std,
                 is_compiler, shipped_digest_of)
 import store.tables (Stamps)
 import builder (builder)
-import cache (Front)
 import loads
 import loads (Sources, SourceFile, SourcePackage, Recorded, StdlibMoved, ShippedEntry)
 import std.random (entropy)
@@ -36,8 +36,8 @@ pub type Program = {
   files: List<File>,
   places: List<Place>,
   diags: List<Diag>,
-  whole: Option<Whole>,
-  pkgs: Pkgs,
+  whole: Option<Analysis>,
+  pkgs: PackageSources,
   through: List<CompiledPackage>,
   embeds: List<Embed>,
 }
@@ -99,7 +99,7 @@ fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
 
 // What a load of this project is made of: its root key and manifest text, and every dependency
 // the walk read. The front end takes this as its package closure.
-pub fn pkgs_of(project: Project) -> Pkgs =
+pub fn pkgs_of(project: Project) -> PackageSources =
   {
     root: bytes_of_string(project.root_key),
     manifest: match project.manifest { None -> None, Some(f) -> Some(f.text) },
@@ -152,7 +152,7 @@ fn front_end(
   sources: List<Source>,
   shelved: List<Source>,
   rows: Rows,
-  pkgs: Pkgs,
+  pkgs: PackageSources,
   through: List<CompiledPackage>,
   embeds: List<Embed>,
 ) -> Pulled =
@@ -169,10 +169,10 @@ fn front_end(
 // Seeded with what the load published, so only what the splice moved is walked again.
 pub fn reanalysed(
   p: Program,
-  w: Whole,
+  w: Analysis,
   sources: List<Source>,
   shelved: List<Source>,
-  pkgs: Pkgs,
+  pkgs: PackageSources,
 ) -> Pulled = front_end(sources, shelved, rows_of(w), pkgs, p.through, p.embeds)
 
 fn analysed(
@@ -183,7 +183,7 @@ fn analysed(
 ) -> Program = {
   let texts = fold(shelved, map_new(), |acc: Map<String, Bytes>, s: Source|
     map_insert(acc, string_of_bytes_lossy(s.name), s.src));
-  let pkgs: Pkgs = pkgs_of(project);
+  let pkgs: PackageSources = pkgs_of(project);
   let pulled: Pulled = front_end(project.sources, shelved, rows, pkgs, through, project.embeds);
   let shelved_places = map(pulled.pulled, |n: Bytes| shelf_place(texts, string_of_bytes_lossy(n)));
   let own = placed_of(project);
@@ -302,7 +302,7 @@ fn whole_project(paths: List<paths::Resolved>) -> Bool =
 
 // A package's manifest digest is the identity the store files its sources under: blake3 of the
 // manifest text. A package with no manifest has no modules.
-fn packages_of(pkgs: Pkgs) -> List<SourcePackage> =
+fn packages_of(pkgs: PackageSources) -> List<SourcePackage> =
   fold(pkgs.supplied, [], |acc: List<SourcePackage>, s: Supplied|
     match s.manifest {
       None -> acc,
@@ -337,7 +337,7 @@ fn read_sources(project: Project, shelved: List<Source>) -> Sources =
 // source id it answers under, so one entry per place is what keeps the ids of everything after it
 // where the machine's reader expects them. A manifest carries no module, and the runtime files one
 // under `pkg`.
-fn placed_sources(p: Program, w: Whole) -> List<SourceFile> = {
+fn placed_sources(p: Program, w: Analysis) -> List<SourceFile> = {
   let named = modules_of(p, w);
   map(range(0, len(p.places)), |i: Int|
     {
@@ -478,7 +478,7 @@ pub fn load_uncached(
 
 // What the load answered, for the machine to read rather than load again. The dump carries the
 // load's warnings, the cache's among them, so a command the machine reports for says them too.
-pub fn front_of(t: Timed, w: Whole) -> Front =
+pub fn front_of(t: Timed, w: Analysis) -> LoadedAnalysis =
   {
     dump: dump_of(Analysed({ ..w, warnings: t.program.diags })),
     files: placed_sources(t.program, w),
@@ -491,7 +491,7 @@ pub fn front_of(t: Timed, w: Whole) -> Front =
 // The front end a command's test hands an effect that takes one: these tests read what a report
 // says about what they were given, so nothing loads, and the record exists only because the
 // effect takes one.
-pub fn no_front() -> Front =
+pub fn no_front() -> LoadedAnalysis =
   { dump: dump_of(Refused([])), files: [], read_ms: 0, front_ms: 0, file_ms: 0, cached: false }
 
 // The same load, with the readings a `--explain` run prints: what the walk, the shelf and the cache
@@ -578,7 +578,7 @@ pub fn unmoved(project: Project, p: Program) -> Bool =
 
 // --- Reading the tables ----------------------------------------------------------
 
-pub fn modules_of(p: Program, w: Whole) -> List<ModuleView> =
+pub fn modules_of(p: Program, w: Analysis) -> List<ModuleView> =
   map(range(0, len(w.mods)), |i: Int|
     {
       name: match list_at(w.mods, i) { Some(mo) -> string_of_bytes_lossy(mo.name), None -> "" },
@@ -587,7 +587,7 @@ pub fn modules_of(p: Program, w: Whole) -> List<ModuleView> =
 
 fn texts(bs: List<Bytes>) -> List<String> = map(bs, |b: Bytes| string_of_bytes_lossy(b))
 
-pub fn module_facts(p: Program, w: Whole) -> List<ModuleFacts> =
+pub fn module_facts(p: Program, w: Analysis) -> List<ModuleFacts> =
   map(range(0, len(w.mods)), |i: Int|
     match list_at(w.mods, i) {
       None -> { index: i, name: "", path: "", imports: [], items: [] },
@@ -603,7 +603,7 @@ pub fn module_facts(p: Program, w: Whole) -> List<ModuleFacts> =
 
 // The modules as the front end took them: the project's own files first, then the shelf it pulled,
 // in the order the label indices count.
-pub fn sourced(p: Program, w: Whole) -> List<Source> =
+pub fn sourced(p: Program, w: Analysis) -> List<Source> =
   map(range(0, len(w.mods)), |i: Int|
     {
       name: match list_at(w.mods, i) { Some(mo) -> mo.name, None -> b"" },
@@ -616,7 +616,7 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
 
 // What a run answers for: its root package's modules, and the shipped ones when it asks for them.
 // Another package's definitions are claimed by their specs: that package's own run proves them.
-pub fn owned_of(w: Whole, std: Bool) -> (Bytes) -> Bool = {
+pub fn owned_of(w: Analysis, std: Bool) -> (Bytes) -> Bool = {
   let roots = fold(range(0, len(w.mods)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
     match ((list_at(w.mods, i), list_at(w.mod_pkg, i))) {
       (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, m.name, true) } else { acc },
@@ -627,10 +627,10 @@ pub fn owned_of(w: Whole, std: Bool) -> (Bytes) -> Bool = {
 
 // A diagnostic raised inside a module the project did not write, which is the shelf's business.
 // A run reports its own modules' tests and laws, however its dependencies were read.
-pub fn own_tests(p: Program, w: Whole) -> List<TestInfo> =
+pub fn own_tests(p: Program, w: Analysis) -> List<TestInfo> =
   filter(w.checked.tests, |x: TestInfo| x.at.module < len(p.files))
 
-pub fn own_laws(p: Program, w: Whole) -> List<LawInfo> =
+pub fn own_laws(p: Program, w: Analysis) -> List<LawInfo> =
   filter(w.checked.laws, |x: LawInfo| x.at.module < len(p.files))
 
 pub fn is_shelved(p: Program, d: Diag) -> Bool =
@@ -639,11 +639,11 @@ pub fn is_shelved(p: Program, d: Diag) -> Bool =
 // The module index a span outside every module carries.
 pub fn outside() -> Int = 4294967295
 
-pub fn place_of(p: Program, at: Loc) -> Option<Place> =
+pub fn place_of(p: Program, at: Location) -> Option<Place> =
   if at.module == outside() { None } else { list_at(p.places, at.module) }
 
 // `path:line:col`, one-based, as every other command prints a place.
-pub fn location_of(p: Program, at: Loc) -> Option<String> =
+pub fn location_of(p: Program, at: Location) -> Option<String> =
   match place_of(p, at) {
     None -> None,
     Some(place) -> {
@@ -663,16 +663,16 @@ fn pick(acc: Picking, by_name: Map<Bytes, DefInfo>, name: Bytes) -> Picking =
     },
   }
 
-fn module_fns(acc: List<Bytes>, mo: Mod) -> List<Bytes> =
+fn module_fns(acc: List<Bytes>, mo: ParsedModule) -> List<Bytes> =
   fold(mo.module.items, acc, |a: List<Bytes>, it: Item|
     match it { IFn(d) -> push(a, qualify(mo.name, d.name.name)), _ -> a })
 
 // Every definition in the order its file declares it, module by module, as `ply defs` lists them
 // and as the driver's `published_order` orders them; anything the tree does not name follows.
-pub fn published(w: Whole) -> List<DefInfo> = {
+pub fn published(w: Analysis) -> List<DefInfo> = {
   let by_name = fold(w.checked.defs, map_new(), |acc: Map<Bytes, DefInfo>, d: DefInfo|
     map_insert(acc, d.name, d));
-  let named = fold(w.mods, [], |acc: List<Bytes>, mo: Mod| module_fns(acc, mo));
+  let named = fold(w.mods, [], |acc: List<Bytes>, mo: ParsedModule| module_fns(acc, mo));
   let first: Picking = fold(named, { seen: map_new(), out: [] }, |acc: Picking, name: Bytes|
     pick(acc, by_name, name));
   let all: Picking = fold(w.checked.defs, first, |acc: Picking, d: DefInfo|
@@ -706,7 +706,7 @@ pub fn resolve_def(defs: List<DefInfo>, query: String) -> Result<DefInfo, List<S
 // What [`resolve_def`] refused, as a diagnostic: nothing of that name, or more than one.
 pub fn unknown_def(query: String, names: List<String>) -> Diag =
   if len(names) == 0 {
-    diag1(
+    error_at(
       b"E0101",
       outside(),
       { start: 0, end: 0 },
@@ -717,7 +717,7 @@ pub fn unknown_def(query: String, names: List<String>) -> Diag =
       ],
     )
   } else {
-    diag1(
+    error_at(
       b"E0101",
       outside(),
       { start: 0, end: 0 },

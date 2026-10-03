@@ -146,7 +146,7 @@ struct Run {
 }
 
 struct Unit {
-    front: Arc<ply_eval::Front>,
+    front: Arc<ply_eval::Analysis>,
     /// `None` when the run decided to execute nothing and so built nothing to run a test on.
     provider: Option<&'static dyn ply_eval::Provider>,
     /// Whether its tests reach the binding: a mixture is run hermetically, whatever it mixes.
@@ -252,13 +252,13 @@ impl Site {
             return Ok(err(diags_value(&[diagnostic])));
         }
         // Read on this thread: a `Value` may not cross to another.
-        let handed = crate::driver::handed_front_of(front, span)?;
+        let handed = crate::driver::loaded_analysis_of(front, span)?;
         let root = if self.hermetic {
             crate::load::tidy(&path)
         } else {
             crate::load::project_root(&path)
         };
-        let loaded = match crate::driver::load_over_front_in(root, &handed) {
+        let loaded = match crate::driver::load_over_analysis_in(root, &handed) {
             Ok(loaded) => loaded,
             Err(refused) => return Ok(err(diags_value(&refused.diagnostics))),
         };

@@ -1,19 +1,23 @@
 // Expressions: the tree, the grammar and the dump. Record updates, `?` and named arguments are
 // kept as parsed; later passes expand them.
 
-import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, Start, PDiag,
-              span_to, dummy_span, no_ident, bare, unexpected, diag1, diag2, push_diag, error_here,
-              unclosed, settle, failed, default_not_allowed, unknown_argument_name, argument_order,
-              kind, kind_at, cur_span, prev_span, at, at_eof, at_ident_text, advance, bump, eat,
-              expect, expect_close, expect_ident, expect_binder, expect_field_name,
-              keyword_pun_refusal, with_no_brace, deeper, shallower, start, qname, comma_list,
-              t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket, t_comma, t_semi,
-              t_colon, t_dot, t_dotdot, t_arrow, t_eq, t_pipe, t_pipepipe, t_question, t_star,
-              k_let, k_if, k_else, k_with, rec, nlist, opt, word, dump_list, dump_opt, dump_ident,
-              dump_qname, dump_diags, with_no_pipe, advance_n, tok_at, t_gt, t_lt)
-import lexer (Tok, TIdent, TInt, TFixed, TWide, TFloat, TDec, TStr, TLines, TBytes, TFHead, TFMid,
-              TFTail, TChar, TKw, TPunct, TEof)
-import types (TypeExpr, ty, ty_span, dump_ty)
+import parsing (push_front, positional, Span, Ident, QName, Input, Parser, Parsed, Eaten, SoFar,
+                ParseStart, ParseDiag, span_to, dummy_span, no_ident, bare, unexpected, error_at,
+                error_at_and, push_diag, error_here, unclosed, parsed_or, failed,
+                default_not_allowed, unknown_argument_name, argument_order, token_kind,
+                token_kind_at, current_span, previous_span, at_token, at_eof, at_ident_text,
+                advance, bump, eat, expect, expect_close, expect_ident, expect_binder,
+                expect_field_name, keyword_pun_refusal, with_no_brace, deeper, shallower, start,
+                qname, comma_list, token_lparen, token_rparen, token_lbrace, token_rbrace,
+                token_lbracket, token_rbracket, token_comma, token_semi, token_colon, token_dot,
+                token_dotdot, token_arrow, token_eq, token_pipe, token_pipepipe, token_question,
+                token_star, keyword_let, keyword_if, keyword_else, keyword_with, dump_node,
+                dump_count, dump_presence, dump_word, dump_list, dump_opt, dump_ident, dump_qname,
+                dump_diags, with_no_pipe, advance_n, token_at, token_gt, token_lt)
+import lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLiteral, FloatLiteral,
+              DecimalLiteral, StringLiteral, LineString, BytesLiteral, InterpolatedHead,
+              InterpolatedMiddle, InterpolatedTail, CharLiteral, Keyword, Punctuation, EndOfInput)
+import type_syntax (TypeExpr, ty, ty_span, dump_ty)
 import patterns (Pattern, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
                  pattern, pat_span, no_pattern, dump_pattern, dump_lit)
 
@@ -53,7 +57,7 @@ pub type Param = { name: Ident, ty: Option<TypeExpr>, default: Option<Expr>, spa
 
 pub type Stmt =
   | SLet({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr })
-  // `let p = v else { .. };`: where `p` does not match, the `else` block is the enclosing block's
+  // `let p = v else { .. };`: where `parser` does not match, the `else` block is the enclosing block's
   // value and the statements after this one do not run.
   | SLetElse({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr, fallback: Expr })
   | SExpr(Expr)
@@ -81,8 +85,8 @@ pub type ReturnClause = { binder: Ident, body: Expr, span: Span }
 // A variant of its own rather than `()`, so a placeholder that reaches the dump is visible.
 pub fn no_expr() -> Expr = EBad({ span: dummy_span() })
 
-pub fn expr_span(e: Expr) -> Span =
-  match e {
+pub fn expr_span(expr: Expr) -> Span =
+  match expr {
     ELit(v) -> v.span,
     EVar(v) -> v.span,
     EBinary(v) -> v.span,
@@ -105,35 +109,36 @@ pub fn expr_span(e: Expr) -> Span =
     EBad(v) -> v.span,
   }
 
-fn set_span(e: Expr, s: Span) -> Expr =
-  match e {
-    ELit(v) -> ELit({ span: s, lit: v.lit }),
-    EVar(v) -> EVar({ span: s, name: v.name }),
-    EBinary(v) -> EBinary({ span: s, op: v.op, lhs: v.lhs, rhs: v.rhs }),
-    EUnary(v) -> EUnary({ span: s, op: v.op, operand: v.operand }),
-    ELambda(v) -> ELambda({ span: s, body: v.body, params: v.params, ret: v.ret }),
-    EApp(v) -> EApp({ span: s, func: v.func, named: v.named, args: v.args, labels: v.labels }),
+fn set_span(expr: Expr, span: Span) -> Expr =
+  match expr {
+    ELit(v) -> ELit({ span: span, lit: v.lit }),
+    EVar(v) -> EVar({ span: span, name: v.name }),
+    EBinary(v) -> EBinary({ span: span, op: v.op, lhs: v.lhs, rhs: v.rhs }),
+    EUnary(v) -> EUnary({ span: span, op: v.op, operand: v.operand }),
+    ELambda(v) -> ELambda({ span: span, body: v.body, params: v.params, ret: v.ret }),
+    EApp(v) -> EApp({ span: span, func: v.func, named: v.named, args: v.args, labels: v.labels }),
     EIf(v) ->
-      EIf({ span: s, cond: v.cond, then_branch: v.then_branch, else_branch: v.else_branch }),
-    EMatch(v) -> EMatch({ span: s, scrutinee: v.scrutinee, arms: v.arms }),
-    EBlock(v) -> EBlock({ span: s, tail: v.tail, stmts: v.stmts }),
-    ERecord(v) -> ERecord({ span: s, fields: v.fields }),
-    ERecordUpdate(v) -> ERecordUpdate({ span: s, base: v.base, fields: v.fields }),
-    ETry(v) -> ETry({ span: s, operand: v.operand }),
-    EField(v) -> EField({ span: s, base: v.base, field: v.field }),
-    EList(v) -> EList({ span: s, items: v.items }),
-    EPerform(v) -> EPerform({ span: s, eff: v.eff, op: v.op, resource: v.resource, args: v.args }),
-    EHandle(v) -> EHandle({ span: s, body: v.body, ret: v.ret, clauses: v.clauses }),
+      EIf({ span: span, cond: v.cond, then_branch: v.then_branch, else_branch: v.else_branch }),
+    EMatch(v) -> EMatch({ span: span, scrutinee: v.scrutinee, arms: v.arms }),
+    EBlock(v) -> EBlock({ span: span, tail: v.tail, stmts: v.stmts }),
+    ERecord(v) -> ERecord({ span: span, fields: v.fields }),
+    ERecordUpdate(v) -> ERecordUpdate({ span: span, base: v.base, fields: v.fields }),
+    ETry(v) -> ETry({ span: span, operand: v.operand }),
+    EField(v) -> EField({ span: span, base: v.base, field: v.field }),
+    EList(v) -> EList({ span: span, items: v.items }),
+    EPerform(v) ->
+      EPerform({ span: span, eff: v.eff, op: v.op, resource: v.resource, args: v.args }),
+    EHandle(v) -> EHandle({ span: span, body: v.body, ret: v.ret, clauses: v.clauses }),
     EWithCell(v) ->
-      EWithCell({ span: s, resource: v.resource, init: v.init, binder: v.binder, body: v.body }),
-    ESimulate(v) -> ESimulate({ span: s, body: v.body }),
-    EParallel(v) -> EParallel({ span: s, branches: v.branches }),
-    EBad(v) -> EBad({ span: s }),
+      EWithCell({ span: span, resource: v.resource, init: v.init, binder: v.binder, body: v.body }),
+    ESimulate(v) -> ESimulate({ span: span, body: v.body }),
+    EParallel(v) -> EParallel({ span: span, branches: v.branches }),
+    EBad(v) -> EBad({ span: span }),
   }
 
 // Ends in `}`, so it may stand as a statement without `;` and as a match arm without `,`.
-pub fn is_block_like(e: Expr) -> Bool =
-  match e {
+pub fn is_block_like(expr: Expr) -> Bool =
+  match expr {
     EBlock(v) -> true,
     EIf(v) -> true,
     EMatch(v) -> true,
@@ -148,9 +153,9 @@ pub fn is_block_like(e: Expr) -> Bool =
 // `width` is how many tokens the operator spans: a shift is touching `<`s or `>`s, as `>>` is not lexed.
 type Op = { op: Bytes, bp: Int, width: Int }
 
-fn bin_op(k: Tok) -> Option<Op> =
-  match k {
-    TPunct(s) -> if s == b"pipepipe" { Some({ op: b"or", bp: 1, width: 1 }) }
+fn bin_op(kind: TokenKind) -> Option<Op> =
+  match kind {
+    Punctuation(s) -> if s == b"pipepipe" { Some({ op: b"or", bp: 1, width: 1 }) }
     else if s == b"ampamp" { Some({ op: b"and", bp: 2, width: 1 }) }
     else if s == b"eqeq" { Some({ op: b"eq", bp: 3, width: 1 }) }
     else if s == b"bangeq" { Some({ op: b"ne", bp: 3, width: 1 }) }
@@ -171,50 +176,56 @@ fn bin_op(k: Tok) -> Option<Op> =
     _ -> None,
   }
 
-fn touching(c: Ctx, p: P, i: Int) -> Bool =
-  kind_at(c, p, i) == kind(c, p) && tok_at(c, p, i).start == tok_at(c, p, i - 1).end
+fn touching(input: Input, parser: Parser, i: Int) -> Bool =
+  token_kind_at(input, parser, i) == token_kind(input, parser)
+    && token_at(input, parser, i).start == token_at(input, parser, i - 1).end
 
-fn joined(c: Ctx, p: P, n: Int) -> Bool =
-  if n == 1 { touching(c, p, 1) } else { touching(c, p, 1) && touching(c, p, 2) }
+fn joined(input: Input, parser: Parser, n: Int) -> Bool =
+  if n == 1 { touching(input, parser, 1) }
+  else { touching(input, parser, 1) && touching(input, parser, 2) }
 
 // `>>>` must be tried before `>>`.
-fn peek_bin_op(c: Ctx, p: P) -> Option<Op> =
-  if p.no_pipe && at(c, p, t_pipe()) { None }
-  else if at(c, p, t_gt()) && joined(c, p, 2) { Some({ op: b"ushr", bp: 7, width: 3 }) }
-  else if at(c, p, t_gt()) && joined(c, p, 1) { Some({ op: b"shr", bp: 7, width: 2 }) }
-  else if at(c, p, t_lt()) && joined(c, p, 1) { Some({ op: b"shl", bp: 7, width: 2 }) }
-  else { bin_op(kind(c, p)) }
+fn peek_bin_op(input: Input, parser: Parser) -> Option<Op> =
+  if parser.no_pipe && at_token(input, parser, token_pipe()) { None }
+  else if at_token(input, parser, token_gt()) && joined(input, parser, 2) {
+    Some({ op: b"ushr", bp: 7, width: 3 })
+  } else if at_token(input, parser, token_gt()) && joined(input, parser, 1) {
+    Some({ op: b"shr", bp: 7, width: 2 })
+  } else if at_token(input, parser, token_lt()) && joined(input, parser, 1) {
+    Some({ op: b"shl", bp: 7, width: 2 })
+  } else { bin_op(token_kind(input, parser)) }
 
-fn src_over(c: Ctx, s: Span) -> Bytes = bytes_slice(c.src, s.start, s.end)
+fn src_over(input: Input, span: Span) -> Bytes = bytes_slice(input.source, span.start, span.end)
 
 // --- The grammar ------------------------------------------------------------
 
-pub fn expr(c: Ctx, p: P) -> Result<R<Expr>, P> = bin_expr(c, p, 1)
+pub fn expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> =
+  bin_expr(input, parser, 1)
 
 // In a scrutinee a `{` opens the arm block, never a record or a block expression — except at the
 // very start, where nothing else can stand and the arms are the `{` after it.
-pub fn scrutinee(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let saved = p.no_brace;
-  match expr(c, with_no_brace(p, !at(c, p, t_lbrace()))) {
+pub fn scrutinee(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_brace;
+  match expr(input, with_no_brace(parser, !at_token(input, parser, token_lbrace()))) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
 // The left spine is one `iterate`; the right operand recurses at `bp + 1`, so depth is bounded
 // by the number of binding powers rather than by the input's length.
-fn bin_expr(c: Ctx, p: P, min_bp: Int) -> Result<R<Expr>, P> = {
-  let lhs = unary_expr(c, p)?;
-  iterate(lhs, c.ntok - lhs.p.pos + 1, |s: R<Expr>|
-    match peek_bin_op(c, s.p) {
+fn bin_expr(input: Input, parser: Parser, min_bp: Int) -> Result<Parsed<Expr>, Parser> = {
+  let lhs = unary_expr(input, parser)?;
+  iterate(lhs, input.token_count - lhs.parser.pos + 1, |s: Parsed<Expr>|
+    match peek_bin_op(input, s.parser) {
       None -> Stop(Ok(s)),
       Some(o) -> if o.bp < min_bp { Stop(Ok(s)) } else {
-        let a = advance_n(c, s.p, o.width);
-        match bin_expr(c, a, o.bp + 1) {
+        let a = advance_n(input, s.parser, o.width);
+        match bin_expr(input, a, o.bp + 1) {
           Err(q) -> Stop(Err(q)),
           Ok(rhs) ->
             Continue({
-              p: rhs.p,
+              parser: rhs.parser,
               node: EBinary({
                 span: span_to(expr_span(s.node), expr_span(rhs.node)),
                 op: o.op,
@@ -227,41 +238,41 @@ fn bin_expr(c: Ctx, p: P, min_bp: Int) -> Result<R<Expr>, P> = {
     })
 }
 
-fn unary_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let d = deeper(c, p)?;
-  match unary_body(c, d) {
+fn unary_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let d = deeper(input, parser)?;
+  match unary_body(input, d) {
     Err(q) -> Err(shallower(q)),
-    Ok(r) -> Ok({ p: shallower(r.p), node: r.node }),
+    Ok(r) -> Ok({ parser: shallower(r.parser), node: r.node }),
   }
 }
 
-fn unary_body(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let op = match kind(c, p) {
-    TPunct(s) -> if s == b"minus" { b"neg" }
+fn unary_body(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let op = match token_kind(input, parser) {
+    Punctuation(s) -> if s == b"minus" { b"neg" }
     else if s == b"bang" { b"not" }
     else if s == b"tilde" { b"bitnot" }
     else { b"" },
     _ -> b"",
   };
-  if op == b"" { postfix_expr(c, p) } else {
-    let st = advance(c, p);
-    let { p, node: operand } = unary_expr(c, st.p)?;
+  if op == b"" { postfix_expr(input, parser) } else {
+    let st = advance(input, parser);
+    let { parser, node: operand } = unary_expr(input, st.parser)?;
     Ok({
-      p: p,
+      parser: parser,
       node: EUnary({ span: span_to(st.node, expr_span(operand)), op: op, operand: operand }),
     })
   }
 }
 
-fn postfix_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let first = primary_expr(c, p)?;
-  iterate(first, c.ntok - first.p.pos + 1, |s: R<Expr>|
-    if at(c, s.p, t_lparen()) {
-      match call_args(c, s.p) {
+fn postfix_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let first = primary_expr(input, parser)?;
+  iterate(first, input.token_count - first.parser.pos + 1, |s: Parsed<Expr>|
+    if at_token(input, s.parser, token_lparen()) {
+      match call_args(input, s.parser) {
         Err(q) -> Stop(Err(q)),
         Ok(a) ->
           Continue({
-            p: a.p,
+            parser: a.parser,
             node: EApp({
               span: span_to(expr_span(s.node), a.close),
               func: s.node,
@@ -271,44 +282,45 @@ fn postfix_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
             }),
           }),
       }
-    } else if at_label_args(c, s) {
-      match label_call(c, s) { Err(q) -> Stop(Err(q)), Ok(r) -> Continue(r) }
-    } else if at(c, s.p, t_dot()) {
-      match postfix_dot(c, s) { Err(q) -> Stop(Err(q)), Ok(r) -> Continue(r) }
-    } else if at(c, s.p, t_question()) {
+    } else if at_label_args(input, s) {
+      match label_call(input, s) { Err(q) -> Stop(Err(q)), Ok(r) -> Continue(r) }
+    } else if at_token(input, s.parser, token_dot()) {
+      match postfix_dot(input, s) { Err(q) -> Stop(Err(q)), Ok(r) -> Continue(r) }
+    } else if at_token(input, s.parser, token_question()) {
       // `?` binds tightest, with calls and fields: `f(x)?.g` is `(f(x)?).g` and `-x?` is `-(x?)`.
-      let q = advance(c, s.p);
+      let q = advance(input, s.parser);
       Continue({
-        p: q.p,
+        parser: q.parser,
         node: ETry({ span: span_to(expr_span(s.node), q.node), operand: s.node }),
       })
     } else { Stop(Ok(s)) })
 }
 
 // A name, `.`, a name, then `[` or `(` is a perform; anything else is a field read.
-fn postfix_dot(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
+fn postfix_dot(input: Input, s: Parsed<Expr>) -> Result<Parsed<Expr>, Parser> = {
   let is_perform = match s.node {
-    EVar(v) -> match kind_at(c, s.p, 1) {
-      TIdent(n) -> at(c, s.p, t_dot()) && follows_op(kind_at(c, s.p, 2)),
+    EVar(v) -> match token_kind_at(input, s.parser, 1) {
+      Identifier(n) ->
+        at_token(input, s.parser, token_dot()) && follows_op(token_kind_at(input, s.parser, 2)),
       _ -> false,
     },
     _ -> false,
   };
-  let dot = advance(c, s.p);
+  let dot = advance(input, s.parser);
   if !is_perform {
-    let { p, node: f } = expect_field_name(c, dot.p, b"a field name after `.`")?;
+    let { parser, node: f } = expect_field_name(input, dot.parser, b"a field name after `.`")?;
     Ok({
-      p: p,
+      parser: parser,
       node: EField({ span: span_to(expr_span(s.node), f.name.span), base: s.node, field: f.name }),
     })
   } else {
     let eff = match s.node { EVar(v) -> v.name, _ -> bare(no_ident()) };
-    let { p, node: op } = expect_ident(c, dot.p, b"an operation name")?;
-    let { p, node: res } = opt_resource(c, p)?;
-    let a = call_args(c, p)?;
+    let { parser, node: op } = expect_ident(input, dot.parser, b"an operation name")?;
+    let { parser, node: res } = opt_resource(input, parser)?;
+    let a = call_args(input, parser)?;
     // An operation takes no named arguments: each is refused and dropped.
     Ok({
-      p: refuse_named(a.p, eff, op, a.named),
+      parser: refuse_named(a.parser, eff, op, a.named),
       node: EPerform({
         span: span_to(expr_span(s.node), a.close),
         eff: eff,
@@ -320,27 +332,35 @@ fn postfix_dot(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
   }
 }
 
-fn follows_op(k: Tok) -> Bool = k == t_lbracket() || k == t_lparen()
+fn follows_op(kind: TokenKind) -> Bool = kind == token_lbracket() || kind == token_lparen()
 
 // `relay[conn](c)`: a `[` after a name, holding names, then `(`, fills the callee's label parameters.
-fn at_label_args(c: Ctx, s: R<Expr>) -> Bool =
-  match s.node { EVar(v) -> at(c, s.p, t_lbracket()) && label_args_ahead(c, s.p), _ -> false }
+fn at_label_args(input: Input, s: Parsed<Expr>) -> Bool =
+  match s.node {
+    EVar(v) -> at_token(input, s.parser, token_lbracket()) && label_args_ahead(input, s.parser),
+    _ -> false,
+  }
 
-fn label_args_ahead(c: Ctx, p: P) -> Bool =
-  iterate(1, c.ntok - p.pos + 1, |i: Int|
-    match kind_at(c, p, i) {
-      TIdent(n) -> if kind_at(c, p, i + 1) == t_comma() { Continue(i + 2) }
-      else { Stop(kind_at(c, p, i + 1) == t_rbracket() && kind_at(c, p, i + 2) == t_lparen()) },
+fn label_args_ahead(input: Input, parser: Parser) -> Bool =
+  iterate(1, input.token_count - parser.pos + 1, |i: Int|
+    match token_kind_at(input, parser, i) {
+      Identifier(n) -> if token_kind_at(input, parser, i + 1) == token_comma() { Continue(i + 2) }
+      else {
+        Stop(
+          token_kind_at(input, parser, i + 1) == token_rbracket()
+            && token_kind_at(input, parser, i + 2) == token_lparen(),
+        )
+      },
       _ -> Stop(false),
     })
 
-fn label_call(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
-  let o = advance(c, s.p);
-  let { p, node: ls } = comma_list(c, o.p, t_rbracket(), label_name)?;
-  let { p, .. } = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
-  let a = call_args(c, p)?;
+fn label_call(input: Input, s: Parsed<Expr>) -> Result<Parsed<Expr>, Parser> = {
+  let o = advance(input, s.parser);
+  let { parser, node: ls } = comma_list(input, o.parser, token_rbracket(), label_name)?;
+  let { parser, .. } = expect_close(input, parser, token_rbracket(), o.node, b"`]`")?;
+  let a = call_args(input, parser)?;
   Ok({
-    p: a.p,
+    parser: a.parser,
     node: EApp({
       span: span_to(expr_span(s.node), a.close),
       func: s.node,
@@ -351,15 +371,15 @@ fn label_call(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
   })
 }
 
-fn label_name(c: Ctx, p: P) -> Result<R<Ident>, P> =
-  expect_ident(c, p, b"a label name inside `[..]`")
+fn label_name(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> =
+  expect_ident(input, parser, b"a label name inside `[..]`")
 
-fn opt_resource(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
-  if !at(c, p, t_lbracket()) { Ok({ p: p, node: None }) } else {
-    let o = advance(c, p);
-    let { p, node: r } = expect_ident(c, o.p, b"a resource name inside `[..]`")?;
-    let { p, .. } = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
-    Ok({ p: p, node: Some(r) })
+fn opt_resource(input: Input, parser: Parser) -> Result<Parsed<Option<Ident>>, Parser> =
+  if !at_token(input, parser, token_lbracket()) { Ok({ parser: parser, node: None }) } else {
+    let o = advance(input, parser);
+    let { parser, node: r } = expect_ident(input, o.parser, b"a resource name inside `[..]`")?;
+    let { parser, .. } = expect_close(input, parser, token_rbracket(), o.node, b"`]`")?;
+    Ok({ parser: parser, node: Some(r) })
   }
 
 // A clause's resource: `[name]`, `[*]` for every label, `[*t]` for every label with the one the
@@ -367,24 +387,25 @@ fn opt_resource(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
 // so only a clause gets the `*` forms.
 type ClauseResource = { every: Bool, name: Option<Ident>, binder: Option<Ident> }
 
-fn clause_resource(c: Ctx, p: P) -> Result<R<ClauseResource>, P> =
-  if !at(c, p, t_lbracket()) { Ok({ p: p, node: { every: false, name: None, binder: None } }) }
-  else {
-    let o = advance(c, p);
-    if at(c, o.p, t_star()) {
-      let st = advance(c, o.p);
+fn clause_resource(input: Input, parser: Parser) -> Result<Parsed<ClauseResource>, Parser> =
+  if !at_token(input, parser, token_lbracket()) {
+    Ok({ parser: parser, node: { every: false, name: None, binder: None } })
+  } else {
+    let o = advance(input, parser);
+    if at_token(input, o.parser, token_star()) {
+      let st = advance(input, o.parser);
       // `[*t]` binds the label: the clause answers every label, and reads the one it answered.
-      let binder = match kind(c, st.p) {
-        TIdent(n) -> {
-          let b = advance(c, st.p);
-          Some({ p: b.p, node: { name: n, span: b.node } })
+      let binder = match token_kind(input, st.parser) {
+        Identifier(n) -> {
+          let b = advance(input, st.parser);
+          Some({ parser: b.parser, node: { name: n, span: b.node } })
         },
         _ -> None,
       };
-      let at_after = match binder { Some(b) -> b.p, None -> st.p };
-      let { p, .. } = expect_close(c, at_after, t_rbracket(), o.node, b"`]`")?;
+      let at_after = match binder { Some(b) -> b.parser, None -> st.parser };
+      let { parser, .. } = expect_close(input, at_after, token_rbracket(), o.node, b"`]`")?;
       Ok({
-        p: p,
+        parser: parser,
         node: {
           every: true,
           name: None,
@@ -392,84 +413,104 @@ fn clause_resource(c: Ctx, p: P) -> Result<R<ClauseResource>, P> =
         },
       })
     } else {
-      let { p, node: r } = expect_ident(c, o.p, b"a resource name or `*` inside `[..]`")?;
-      let { p, .. } = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
-      Ok({ p: p, node: { every: false, name: Some(r), binder: None } })
+      let { parser, node: r } = expect_ident(
+        input,
+        o.parser,
+        b"a resource name or `*` inside `[..]`",
+      )?;
+      let { parser, .. } = expect_close(input, parser, token_rbracket(), o.node, b"`]`")?;
+      Ok({ parser: parser, node: { every: false, name: Some(r), binder: None } })
     }
   }
 
-type RArgs = { p: P, close: Span, named: List<NamedArg>, args: List<Expr> }
+type RArgs = { parser: Parser, close: Span, named: List<NamedArg>, args: List<Expr> }
 
-fn refuse_named(p: P, eff: QName, op: Ident, named: List<NamedArg>) -> P = {
+fn refuse_named(parser: Parser, eff: QName, ident: Ident, named: List<NamedArg>) -> Parser = {
   let written = match eff.module {
     Some(m) -> bytes_concat_all([m.name, b"::", eff.name.name]),
     None -> eff.name.name,
   };
-  fold(named, p, |q: P, n: NamedArg|
+  fold(named, parser, |q: Parser, arg: NamedArg|
     push_diag(
       q,
-      diag1(
+      error_at(
         unknown_argument_name(),
-        n.span,
-        bytes_concat_all([b"`", written, b".", op.name, b"` takes no named arguments"]),
+        arg.span,
+        bytes_concat_all([b"`", written, b".", ident.name, b"` takes no named arguments"]),
         b"named",
         [b"an effect operation's arguments are positional"],
       ),
     ))
 }
 
-fn call_args(c: Ctx, p: P) -> Result<RArgs, P> = {
-  let saved = p.no_brace;
-  match call_args_inner(c, with_no_brace(p, false)) {
+fn call_args(input: Input, parser: Parser) -> Result<RArgs, Parser> = {
+  let saved = parser.no_brace;
+  match call_args_inner(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(a) -> Ok({ p: with_no_brace(a.p, saved), close: a.close, named: a.named, args: a.args }),
+    Ok(a) ->
+      Ok({ parser: with_no_brace(a.parser, saved), close: a.close, named: a.named, args: a.args }),
   }
 }
 
-fn call_args_inner(c: Ctx, p: P) -> Result<RArgs, P> = {
-  let { p, node: o } = expect(c, p, t_lparen(), b"`(` to start the argument list")?;
-  let { p, node: parsed } = comma_list(c, p, t_rparen(), call_arg)?;
-  let { p, node: cl } = expect_close(c, p, t_rparen(), o, b"`)` to close the arguments")?;
-  let sp = split_args(p, parsed);
-  Ok({ p: sp.p, close: cl, named: sp.named, args: sp.args })
+fn call_args_inner(input: Input, parser: Parser) -> Result<RArgs, Parser> = {
+  let { parser, node: o } = expect(
+    input,
+    parser,
+    token_lparen(),
+    b"`(` to start the argument list",
+  )?;
+  let { parser, node: parsed } = comma_list(input, parser, token_rparen(), call_arg)?;
+  let { parser, node: cl } = expect_close(
+    input,
+    parser,
+    token_rparen(),
+    o,
+    b"`)` to close the arguments",
+  )?;
+  let sp = split_args(parser, parsed);
+  Ok({ parser: sp.parser, close: cl, named: sp.named, args: sp.args })
 }
 
-fn call_arg(c: Ctx, p: P) -> Result<R<Arg>, P> =
-  match kind(c, p) {
-    TIdent(n) -> if kind_at(c, p, 1) == t_colon() { named_arg(c, p, n) }
-    else { positional_arg(c, p) },
-    _ -> positional_arg(c, p),
+fn call_arg(input: Input, parser: Parser) -> Result<Parsed<Arg>, Parser> =
+  match token_kind(input, parser) {
+    Identifier(n) -> if token_kind_at(input, parser, 1) == token_colon() {
+      named_arg(input, parser, n)
+    } else { positional_arg(input, parser) },
+    _ -> positional_arg(input, parser),
   }
 
-fn positional_arg(c: Ctx, p: P) -> Result<R<Arg>, P> = {
-  let { p, node: e } = expr(c, p)?;
-  Ok({ p: p, node: APos(e) })
+fn positional_arg(input: Input, parser: Parser) -> Result<Parsed<Arg>, Parser> = {
+  let { parser, node: e } = expr(input, parser)?;
+  Ok({ parser: parser, node: APos(e) })
 }
 
-fn named_arg(c: Ctx, p: P, text: Bytes) -> Result<R<Arg>, P> = {
-  let name = { name: text, span: cur_span(c, p) };
-  let a = advance(c, p);
-  let b = advance(c, a.p);
-  let { p, node: v } = expr(c, b.p)?;
-  Ok({ p: p, node: ANamed({ name: name, value: v, span: span_to(name.span, expr_span(v)) }) })
+fn named_arg(input: Input, parser: Parser, text: Bytes) -> Result<Parsed<Arg>, Parser> = {
+  let name = { name: text, span: current_span(input, parser) };
+  let a = advance(input, parser);
+  let b = advance(input, a.parser);
+  let { parser, node: v } = expr(input, b.parser)?;
+  Ok({
+    parser: parser,
+    node: ANamed({ name: name, value: v, span: span_to(name.span, expr_span(v)) }),
+  })
 }
 
 // The parser's only rule about names is ordering; `first` is the first named argument's span, for the label.
-type Split = { p: P, first: Option<Span>, named: List<NamedArg>, args: List<Expr> }
+type Split = { parser: Parser, first: Option<Span>, named: List<NamedArg>, args: List<Expr> }
 
-fn split_args(p: P, parsed: List<Arg>) -> Split =
-  fold(parsed, { p: p, first: None, named: [], args: [] }, |s: Split, a: Arg|
+fn split_args(parser: Parser, parsed: List<Arg>) -> Split =
+  fold(parsed, { parser: parser, first: None, named: [], args: [] }, |s: Split, a: Arg|
     match a {
       APos(e) ->
         {
           first: s.first,
           named: s.named,
-          p: match s.first {
-            None -> s.p,
+          parser: match s.first {
+            None -> s.parser,
             Some(f) ->
               push_diag(
-                s.p,
-                diag2(
+                s.parser,
+                error_at_and(
                   argument_order(),
                   expr_span(e),
                   b"a positional argument cannot follow a named one",
@@ -486,87 +527,90 @@ fn split_args(p: P, parsed: List<Arg>) -> Split =
         },
       ANamed(n) ->
         {
-          p: s.p,
+          parser: s.parser,
           args: s.args,
           first: match s.first { None -> Some(n.span), Some(f) -> Some(f) },
           named: push(s.named, n),
         },
     })
 
-fn lit_expr(c: Ctx, p: P, l: Lit) -> Result<R<Expr>, P> = {
-  let a = advance(c, p);
-  Ok({ p: a.p, node: ELit({ span: a.node, lit: l }) })
+fn lit_expr(input: Input, parser: Parser, literal: Lit) -> Result<Parsed<Expr>, Parser> = {
+  let a = advance(input, parser);
+  Ok({ parser: a.parser, node: ELit({ span: a.node, lit: literal }) })
 }
 
-fn primary_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = cur_span(c, p);
-  match kind(c, p) {
-    TInt(v) -> lit_expr(c, p, LInt(v)),
-    TFixed(ty, v) -> lit_expr(c, p, LFixed(ty, v)),
-    TWide(ty, high, low) -> lit_expr(c, p, LWide(ty, high, low)),
+fn primary_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = current_span(input, parser);
+  match token_kind(input, parser) {
+    IntLiteral(v) -> lit_expr(input, parser, LInt(v)),
+    FixedLiteral(ty, v) -> lit_expr(input, parser, LFixed(ty, v)),
+    WideLiteral(ty, high, low) -> lit_expr(input, parser, LWide(ty, high, low)),
     // Float and decimal literals keep their source text.
-    TFloat(f) -> lit_expr(c, p, LFloat(src_over(c, st))),
-    TDec(m, sc) -> lit_expr(c, p, LDec(src_over(c, st))),
-    TStr(s) -> lit_expr(c, p, LStr(s)),
-    TLines(s) -> lit_expr(c, p, LStr(s)),
-    TBytes(b) -> lit_expr(c, p, LBytes(b)),
-    TFHead(t) -> interpolated(c, p, t),
-    TChar(v) -> lit_expr(c, p, LChar(v)),
-    TKw(k) -> if k == b"true" { lit_expr(c, p, LBool(true)) }
-    else if k == b"false" { lit_expr(c, p, LBool(false)) }
-    else if k == b"if" { if_expr(c, p) }
-    else if k == b"match" { match_expr(c, p) }
-    else if k == b"handle" { handle_expr(c, p) }
-    else { Err(error_here(c, p, b"an expression")) },
-    TIdent(n) -> primary_ident(c, p, n),
-    TPunct(s) -> if s == b"lparen" { primary_paren(c, p) }
-    else if s == b"lbracket" { primary_list(c, p) }
-    else if s == b"hashbrace" { map_literal(c, p, false) }
-    else if s == b"hashbracket" { map_literal(c, p, true) } else if s == b"lbrace" && !p.no_brace {
-      if at_record_literal(c, p) { record_expr(c, p) } else { block_expr(c, p) }
-    } else if s == b"pipe" || s == b"pipepipe" { lambda_expr(c, p) }
-    else { Err(error_here(c, p, b"an expression")) },
-    _ -> Err(error_here(c, p, b"an expression")),
+    FloatLiteral(f) -> lit_expr(input, parser, LFloat(src_over(input, st))),
+    DecimalLiteral(m, sc) -> lit_expr(input, parser, LDec(src_over(input, st))),
+    StringLiteral(s) -> lit_expr(input, parser, LStr(s)),
+    LineString(s) -> lit_expr(input, parser, LStr(s)),
+    BytesLiteral(b) -> lit_expr(input, parser, LBytes(b)),
+    InterpolatedHead(t) -> interpolated(input, parser, t),
+    CharLiteral(v) -> lit_expr(input, parser, LChar(v)),
+    Keyword(k) -> if k == b"true" { lit_expr(input, parser, LBool(true)) }
+    else if k == b"false" { lit_expr(input, parser, LBool(false)) }
+    else if k == b"if" { if_expr(input, parser) }
+    else if k == b"match" { match_expr(input, parser) }
+    else if k == b"handle" { handle_expr(input, parser) }
+    else { Err(error_here(input, parser, b"an expression")) },
+    Identifier(n) -> primary_ident(input, parser, n),
+    Punctuation(s) -> if s == b"lparen" { primary_paren(input, parser) }
+    else if s == b"lbracket" { primary_list(input, parser) }
+    else if s == b"hashbrace" { map_literal(input, parser, false) }
+    else if s == b"hashbracket" { map_literal(input, parser, true) }
+    else if s == b"lbrace" && !parser.no_brace {
+      if at_record_literal(input, parser) { record_expr(input, parser) }
+      else { block_expr(input, parser) }
+    } else if s == b"pipe" || s == b"pipepipe" { lambda_expr(input, parser) }
+    else { Err(error_here(input, parser, b"an expression")) },
+    _ -> Err(error_here(input, parser, b"an expression")),
   }
 }
 
 // Contextual, not reserved. `simulate` and `parallel` defer to `no_brace`, so `if simulate { .. }`
 // is a name and a block.
-fn primary_ident(c: Ctx, p: P, name: Bytes) -> Result<R<Expr>, P> =
-  if name == b"with_cell" && kind_at(c, p, 1) == t_lbracket() { with_cell_expr(c, p) }
-  else if name == b"simulate" && !p.no_brace && kind_at(c, p, 1) == t_lbrace() {
-    simulate_expr(c, p)
-  } else if name == b"parallel" && !p.no_brace && kind_at(c, p, 1) == t_lbrace() {
-    parallel_expr(c, p)
-  } else {
-    let { p, node: q } = qname(c, p, b"an expression")?;
-    Ok({ p: p, node: EVar({ span: q.span, name: q }) })
+fn primary_ident(input: Input, parser: Parser, name: Bytes) -> Result<Parsed<Expr>, Parser> =
+  if name == b"with_cell" && token_kind_at(input, parser, 1) == token_lbracket() {
+    with_cell_expr(input, parser)
+  } else if name == b"simulate" && !parser.no_brace
+      && token_kind_at(input, parser, 1) == token_lbrace() { simulate_expr(input, parser) }
+  else if name == b"parallel" && !parser.no_brace
+      && token_kind_at(input, parser, 1) == token_lbrace() { parallel_expr(input, parser) } else {
+    let { parser, node: q } = qname(input, parser, b"an expression")?;
+    Ok({ parser: parser, node: EVar({ span: q.span, name: q }) })
   }
 
-fn primary_paren(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let saved = p.no_brace;
-  match primary_paren_inner(c, with_no_brace(p, false)) {
+fn primary_paren(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_brace;
+  match primary_paren_inner(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-fn primary_paren_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let o = advance(c, p);
-  if at(c, o.p, t_rparen()) {
-    let cl = advance(c, o.p);
-    Ok({ p: cl.p, node: ELit({ span: span_to(o.node, cl.node), lit: LUnit }) })
+fn primary_paren_inner(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let o = advance(input, parser);
+  if at_token(input, o.parser, token_rparen()) {
+    let cl = advance(input, o.parser);
+    Ok({ parser: cl.parser, node: ELit({ span: span_to(o.node, cl.node), lit: LUnit }) })
   } else {
-    let inner = expr(c, o.p)?;
-    if at(c, inner.p, t_comma()) {
+    let inner = expr(input, o.parser)?;
+    if at_token(input, inner.parser, token_comma()) {
       // A comma makes a tuple: the record `{_0: a, _1: b}`.
-      let rest = comma_list(c, advance(c, inner.p).p, t_rparen(), expr)?;
-      let cl = expect_close(c, rest.p, t_rparen(), o.node, b"`)` to close the tuple")?;
+      let rest = comma_list(input, advance(input, inner.parser).parser, token_rparen(), expr)?;
+      let cl = expect_close(input, rest.parser, token_rparen(), o.node, b"`)` to close the tuple")?;
       let items = push_front(inner.node, rest.node);
-      if len(items) == 1 { Ok({ p: cl.p, node: set_span(inner.node, span_to(o.node, cl.node)) }) }
-      else {
+      if len(items) == 1 {
+        Ok({ parser: cl.parser, node: set_span(inner.node, span_to(o.node, cl.node)) })
+      } else {
         Ok({
-          p: cl.p,
+          parser: cl.parser,
           node: ERecord({
             span: span_to(o.node, cl.node),
             fields: map(range(0, len(items)), |i: Int| -> RecField {
@@ -579,47 +623,61 @@ fn primary_paren_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
         })
       }
     } else {
-      let close = expect_close(c, inner.p, t_rparen(), o.node, b"`)` to close the group")?;
-      Ok({ p: close.p, node: set_span(inner.node, span_to(o.node, close.node)) })
+      let close = expect_close(
+        input,
+        inner.parser,
+        token_rparen(),
+        o.node,
+        b"`)` to close the group",
+      )?;
+      Ok({ parser: close.parser, node: set_span(inner.node, span_to(o.node, close.node)) })
     }
   }
 }
 
-fn primary_list(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let saved = p.no_brace;
-  match primary_list_inner(c, with_no_brace(p, false)) {
+fn primary_list(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_brace;
+  match primary_list_inner(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-fn primary_list_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let o = advance(c, p);
-  let { p, node: items } = comma_list(c, o.p, t_rbracket(), expr)?;
-  let { p, node: cl } = expect_close(c, p, t_rbracket(), o.node, b"`]` to close the list")?;
-  Ok({ p: p, node: EList({ span: span_to(o.node, cl), items: items }) })
+fn primary_list_inner(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let o = advance(input, parser);
+  let { parser, node: items } = comma_list(input, o.parser, token_rbracket(), expr)?;
+  let { parser, node: cl } = expect_close(
+    input,
+    parser,
+    token_rbracket(),
+    o.node,
+    b"`]` to close the list",
+  )?;
+  Ok({ parser: parser, node: EList({ span: span_to(o.node, cl), items: items }) })
 }
 
 // `#{k: v, ..}` is `map_of_entries([{key: k, value: v}, ..])` and `#[a, ..]` the same with `()` for
 // each value, built at the parse so the literal and the call are one definition and one hash.
 // `ply fmt` reads which spelling it was back from the source.
-fn map_literal(c: Ctx, p: P, set: Bool) -> Result<R<Expr>, P> = {
-  let saved = p.no_brace;
-  match map_literal_inner(c, with_no_brace(p, false), set) {
+fn map_literal(input: Input, parser: Parser, set: Bool) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_brace;
+  match map_literal_inner(input, with_no_brace(parser, false), set) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-fn map_literal_inner(c: Ctx, p: P, set: Bool) -> Result<R<Expr>, P> = {
-  let o = advance(c, p);
-  let closer = if set { t_rbracket() } else { t_rbrace() };
-  let { p, node: entries } = comma_list(c, o.p, closer, if set { set_entry } else { map_entry })?;
-  let { p, node: cl } = expect_close(c, p, closer, o.node, if set { b"`]` to close the set" }
-  else { b"`}` to close the map" })?;
+fn map_literal_inner(input: Input, parser: Parser, set: Bool) -> Result<Parsed<Expr>, Parser> = {
+  let o = advance(input, parser);
+  let closer = if set { token_rbracket() } else { token_rbrace() };
+  let { parser, node: entries } = comma_list(input, o.parser, closer, if set { set_entry }
+  else { map_entry })?;
+  let { parser, node: cl } = expect_close(input, parser, closer, o.node, if set {
+    b"`]` to close the set"
+  } else { b"`}` to close the map" })?;
   let sp = span_to(o.node, cl);
   Ok({
-    p: p,
+    parser: parser,
     node: EApp({
       span: sp,
       func: EVar({ span: o.node, name: bare({ name: b"map_of_entries", span: o.node }) }),
@@ -636,34 +694,42 @@ fn map_literal_inner(c: Ctx, p: P, set: Bool) -> Result<R<Expr>, P> = {
 pub fn shown_binder() -> Bytes = b"?show"
 
 // `f"a {x} b"` is `"a " ++ display(x) ++ " b"`, `display` being `std.show`'s.
-fn interpolated(c: Ctx, p: P, head: Bytes) -> Result<R<Expr>, P> = {
-  let saved = p.no_brace;
-  let first = cur_span(c, p);
-  match holes(c, with_no_brace(p, false), first, [ELit({ span: first, lit: LStr(head) })]) {
+fn interpolated(input: Input, parser: Parser, head: Bytes) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_brace;
+  let first = current_span(input, parser);
+  match holes(input, with_no_brace(parser, false), first, [
+      ELit({ span: first, lit: LStr(head) }),
+    ]) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-// At a `TFHead` or a `TFMid`: the hole after it, and the text that closes the hole.
-fn holes(c: Ctx, p: P, first: Span, parts: List<Expr>) -> Result<R<Expr>, P> = {
-  let opened = advance(c, p);
-  let { p, node: e } = expr(c, opened.p)?;
+// At a `InterpolatedHead` or a `InterpolatedMiddle`: the hole after it, and the text that closes the hole.
+fn holes(
+  input: Input,
+  parser: Parser,
+  first: Span,
+  parts: List<Expr>,
+) -> Result<Parsed<Expr>, Parser> = {
+  let opened = advance(input, parser);
+  let { parser, node: e } = expr(input, opened.parser)?;
   let shown = push(parts, displayed(e));
-  let sp = cur_span(c, p);
-  match kind(c, p) {
-    TFMid(t) -> holes(c, p, first, push(shown, ELit({ span: sp, lit: LStr(t) }))),
-    TFTail(t) -> {
-      let closed = advance(c, p);
+  let sp = current_span(input, parser);
+  match token_kind(input, parser) {
+    InterpolatedMiddle(t) ->
+      holes(input, parser, first, push(shown, ELit({ span: sp, lit: LStr(t) }))),
+    InterpolatedTail(t) -> {
+      let closed = advance(input, parser);
       let all = push(shown, ELit({ span: sp, lit: LStr(t) }));
-      Ok({ p: closed.p, node: concatenated(span_to(first, closed.node), all) })
+      Ok({ parser: closed.parser, node: concatenated(span_to(first, closed.node), all) })
     },
-    _ -> Err(error_here(c, p, b"`}` to close the interpolated value")),
+    _ -> Err(error_here(input, parser, b"`}` to close the interpolated value")),
   }
 }
 
-fn displayed(e: Expr) -> Expr = {
-  let sp = expr_span(e);
+fn displayed(expr: Expr) -> Expr = {
+  let sp = expr_span(expr);
   EApp({
     span: sp,
     func: EVar({
@@ -675,14 +741,14 @@ fn displayed(e: Expr) -> Expr = {
       },
     }),
     named: [],
-    args: [e],
+    args: [expr],
     labels: [],
   })
 }
 
 // The pieces concatenated, empty text dropped; the outermost node spans the whole literal.
 fn concatenated(span: Span, parts: List<Expr>) -> Expr = {
-  let kept = filter(parts, |e: Expr| match e { ELit(l) -> l.lit != LStr(b""), _ -> true });
+  let kept = filter(parts, |expr: Expr| match expr { ELit(l) -> l.lit != LStr(b""), _ -> true });
   let chained = fold(range(1, len(kept)), at_expr(kept, 0), |acc: Expr, i: Int| {
     let x = at_expr(kept, i);
     EBinary({ span: span_to(expr_span(acc), expr_span(x)), op: b"concat", lhs: acc, rhs: x })
@@ -693,16 +759,16 @@ fn concatenated(span: Span, parts: List<Expr>) -> Expr = {
 fn at_expr(xs: List<Expr>, i: Int) -> Expr =
   match list_at(xs, i) { Some(x) -> x, None -> ELit({ span: dummy_span(), lit: LStr(b"") }) }
 
-fn map_entry(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let { p, node: key } = expr(c, p)?;
-  let { p, .. } = expect(c, p, t_colon(), b"`:` between a key and its value")?;
-  let { p, node: value } = expr(c, p)?;
-  Ok({ p: p, node: entry_record(key, value) })
+fn map_entry(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let { parser, node: key } = expr(input, parser)?;
+  let { parser, .. } = expect(input, parser, token_colon(), b"`:` between a key and its value")?;
+  let { parser, node: value } = expr(input, parser)?;
+  Ok({ parser: parser, node: entry_record(key, value) })
 }
 
-fn set_entry(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let { p, node: key } = expr(c, p)?;
-  Ok({ p: p, node: entry_record(key, ELit({ span: expr_span(key), lit: LUnit })) })
+fn set_entry(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let { parser, node: key } = expr(input, parser)?;
+  Ok({ parser: parser, node: entry_record(key, ELit({ span: expr_span(key), lit: LUnit })) })
 }
 
 fn entry_record(key: Expr, value: Expr) -> Expr = {
@@ -718,31 +784,41 @@ fn entry_record(key: Expr, value: Expr) -> Expr = {
 }
 
 // `{x: e}`, `{x, y}` and `{..b}` are records; `{x}` is a block whose value is `x`.
-fn at_record_literal(c: Ctx, p: P) -> Bool =
-  if kind_at(c, p, 1) == t_dotdot() { true } else {
-    match kind_at(c, p, 1) {
-      TIdent(n) -> kind_at(c, p, 2) == t_colon() || kind_at(c, p, 2) == t_comma(),
-      TKw(k) -> kind_at(c, p, 2) == t_colon() || kind_at(c, p, 2) == t_comma(),
+fn at_record_literal(input: Input, parser: Parser) -> Bool =
+  if token_kind_at(input, parser, 1) == token_dotdot() { true } else {
+    match token_kind_at(input, parser, 1) {
+      Identifier(n) ->
+        token_kind_at(input, parser, 2) == token_colon()
+          || token_kind_at(input, parser, 2) == token_comma(),
+      Keyword(k) ->
+        token_kind_at(input, parser, 2) == token_colon()
+          || token_kind_at(input, parser, 2) == token_comma(),
       _ -> false,
     }
   }
 
-fn record_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let saved = p.no_brace;
-  match record_expr_inner(c, with_no_brace(p, false)) {
+fn record_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_brace;
+  match record_expr_inner(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-fn record_expr_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let o = advance(c, p);
-  let { p, node: base } = record_base(c, o.p)?;
-  let { p, node: fields } = comma_list(c, p, t_rbrace(), record_field)?;
-  let { p, node: cl } = expect_close(c, p, t_rbrace(), o.node, b"`}` to close the record")?;
+fn record_expr_inner(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let o = advance(input, parser);
+  let { parser, node: base } = record_base(input, o.parser)?;
+  let { parser, node: fields } = comma_list(input, parser, token_rbrace(), record_field)?;
+  let { parser, node: cl } = expect_close(
+    input,
+    parser,
+    token_rbrace(),
+    o.node,
+    b"`}` to close the record",
+  )?;
   let sp = span_to(o.node, cl);
   Ok({
-    p: p,
+    parser: parser,
     node: match base {
       None -> ERecord({ span: sp, fields: fields }),
       Some(b) -> ERecordUpdate({ span: sp, base: b, fields: fields }),
@@ -750,26 +826,31 @@ fn record_expr_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   })
 }
 
-fn record_base(c: Ctx, p: P) -> Result<R<Option<Expr>>, P> =
-  if !at(c, p, t_dotdot()) { Ok({ p: p, node: None }) } else {
-    let { p, node: b } = record_update_base(c, p)?;
-    if at(c, p, t_rbrace()) { Ok({ p: p, node: Some(b) }) } else {
-      let { p, .. } = expect(c, p, t_comma(), b"`,` after the record being updated")?;
-      Ok({ p: p, node: Some(b) })
+fn record_base(input: Input, parser: Parser) -> Result<Parsed<Option<Expr>>, Parser> =
+  if !at_token(input, parser, token_dotdot()) { Ok({ parser: parser, node: None }) } else {
+    let { parser, node: b } = record_update_base(input, parser)?;
+    if at_token(input, parser, token_rbrace()) { Ok({ parser: parser, node: Some(b) }) } else {
+      let { parser, .. } = expect(
+        input,
+        parser,
+        token_comma(),
+        b"`,` after the record being updated",
+      )?;
+      Ok({ parser: parser, node: Some(b) })
     }
   }
 
 // A path, or one call of it: the expansion writes `base.f` once per field it copies, and binds a
 // call first so it runs once.
-fn record_update_base(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let dots = advance(c, p);
-  if at(c, dots.p, t_dot()) {
+fn record_update_base(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let dots = advance(input, parser);
+  if at_token(input, dots.parser, token_dot()) {
     Err(
       push_diag(
-        dots.p,
-        diag1(
+        dots.parser,
+        error_at(
           unexpected(),
-          span_to(dots.node, cur_span(c, dots.p)),
+          span_to(dots.node, current_span(input, dots.parser)),
           b"a record update is spelled `..`, not `...`",
           b"one dot too many",
           [b"`..` is the same token the record *pattern* `{a, ..}` uses"],
@@ -777,18 +858,18 @@ fn record_update_base(c: Ctx, p: P) -> Result<R<Expr>, P> = {
       ),
     )
   } else {
-    let { p, node: name } = qname(c, dots.p, b"the record being updated")?;
+    let { parser, node: name } = qname(input, dots.parser, b"the record being updated")?;
     let path = iterate(
-      { p: p, node: EVar({ span: name.span, name: name }) },
-      c.ntok - p.pos + 1,
-      |s: R<Expr>|
-        if !at(c, s.p, t_dot()) { Stop(Ok(s)) } else {
-          let d = advance(c, s.p);
-          match expect_field_name(c, d.p, b"a field name") {
+      { parser: parser, node: EVar({ span: name.span, name: name }) },
+      input.token_count - parser.pos + 1,
+      |s: Parsed<Expr>|
+        if !at_token(input, s.parser, token_dot()) { Stop(Ok(s)) } else {
+          let d = advance(input, s.parser);
+          match expect_field_name(input, d.parser, b"a field name") {
             Err(q) -> Stop(Err(q)),
             Ok(f) ->
               Continue({
-                p: f.p,
+                parser: f.parser,
                 node: EField({
                   span: span_to(expr_span(s.node), f.node.name.span),
                   base: s.node,
@@ -798,10 +879,10 @@ fn record_update_base(c: Ctx, p: P) -> Result<R<Expr>, P> = {
           }
         },
     )?;
-    if at(c, path.p, t_lparen()) {
-      let a = call_args(c, path.p)?;
+    if at_token(input, path.parser, token_lparen()) {
+      let a = call_args(input, path.parser)?;
       Ok({
-        p: a.p,
+        parser: a.parser,
         node: EApp({
           span: span_to(expr_span(path.node), a.close),
           func: path.node,
@@ -814,164 +895,197 @@ fn record_update_base(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   }
 }
 
-fn record_field(c: Ctx, p: P) -> Result<R<RecField>, P> =
-  if at(c, p, t_dotdot()) {
+fn record_field(input: Input, parser: Parser) -> Result<Parsed<RecField>, Parser> =
+  if at_token(input, parser, token_dotdot()) {
     Err(
       push_diag(
-        p,
-        diag1(
+        parser,
+        error_at(
           unexpected(),
-          cur_span(c, p),
+          current_span(input, parser),
           b"a record update has one base, written first",
           b"a second `..` here",
           [b"write `{..b, x: 1, y: 2}`; two bases have no defined order of fields"],
         ),
       ),
     )
-  } else { record_field_named(c, p) }
+  } else { record_field_named(input, parser) }
 
-fn record_field_named(c: Ctx, p: P) -> Result<R<RecField>, P> = {
-  let { p, node: f } = expect_field_name(c, p, b"a field name")?;
+fn record_field_named(input: Input, parser: Parser) -> Result<Parsed<RecField>, Parser> = {
+  let { parser, node: f } = expect_field_name(input, parser, b"a field name")?;
   let name = f.name;
-  let colon = eat(c, p, t_colon());
+  let colon = eat(input, parser, token_colon());
   if colon.ok {
-    let { p, node: v } = expr(c, colon.p)?;
-    Ok({ p: p, node: { name: name, value: v } })
-  } else if f.keyword { Err(keyword_pun_refusal(colon.p, name)) } else {
-    Ok({ p: colon.p, node: { name: name, value: EVar({ span: name.span, name: bare(name) }) } })
+    let { parser, node: v } = expr(input, colon.parser)?;
+    Ok({ parser: parser, node: { name: name, value: v } })
+  } else if f.keyword { Err(keyword_pun_refusal(colon.parser, name)) } else {
+    Ok({
+      parser: colon.parser,
+      node: { name: name, value: EVar({ span: name.span, name: bare(name) }) },
+    })
   }
 }
 
-pub fn block_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let saved = p.no_brace;
-  match block_inner(c, with_no_brace(p, false)) {
+pub fn block_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_brace;
+  match block_inner(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-type BlockAcc = { p: P, tail: Option<Expr>, stmts: List<Stmt> }
+type BlockAcc = { parser: Parser, tail: Option<Expr>, stmts: List<Stmt> }
 
-fn block_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let { p, node: o } = expect(c, p, t_lbrace(), b"`{` to start a block")?;
-  let body = iterate({ p: p, tail: None, stmts: [] }, c.ntok - p.pos + 1, |s: BlockAcc|
-    if at(c, s.p, t_rbrace()) { Stop(Ok(s)) }
-    else if at_eof(c, s.p) { Stop(Err(unclosed(c, s.p, o, b"`}` to close the block"))) }
-    else if at(c, s.p, k_let()) {
-      match let_stmt(c, s.p) {
-        Err(q) -> Stop(Err(q)),
-        Ok(st) -> Continue({ p: st.p, tail: s.tail, stmts: push(s.stmts, st.node) }),
-      }
-    } else { block_step(c, s, o) })?;
-  let { p, node: cl } = expect_close(c, body.p, t_rbrace(), o, b"`}` to close the block")?;
-  Ok({ p: p, node: EBlock({ span: span_to(o, cl), tail: body.tail, stmts: body.stmts }) })
+fn block_inner(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let { parser, node: o } = expect(input, parser, token_lbrace(), b"`{` to start a block")?;
+  let body = iterate(
+    { parser: parser, tail: None, stmts: [] },
+    input.token_count - parser.pos + 1,
+    |s: BlockAcc|
+      if at_token(input, s.parser, token_rbrace()) { Stop(Ok(s)) } else if at_eof(input, s.parser) {
+        Stop(Err(unclosed(input, s.parser, o, b"`}` to close the block")))
+      } else if at_token(input, s.parser, keyword_let()) {
+        match let_stmt(input, s.parser) {
+          Err(q) -> Stop(Err(q)),
+          Ok(st) -> Continue({ parser: st.parser, tail: s.tail, stmts: push(s.stmts, st.node) }),
+        }
+      } else { block_step(input, s, o) },
+  )?;
+  let { parser, node: cl } = expect_close(
+    input,
+    body.parser,
+    token_rbrace(),
+    o,
+    b"`}` to close the block",
+  )?;
+  Ok({ parser: parser, node: EBlock({ span: span_to(o, cl), tail: body.tail, stmts: body.stmts }) })
 }
 
-fn block_step(c: Ctx, s: BlockAcc, open: Span) -> Iter<BlockAcc, Result<BlockAcc, P>> =
-  match expr(c, s.p) {
+fn block_step(input: Input, s: BlockAcc, open: Span) -> Iter<BlockAcc, Result<BlockAcc, Parser>> =
+  match expr(input, s.parser) {
     Err(q) -> Stop(Err(q)),
     Ok(e) -> {
-      let semi = eat(c, e.p, t_semi());
-      if semi.ok { Continue({ p: semi.p, tail: s.tail, stmts: push(s.stmts, SExpr(e.node)) }) }
-      else if at(c, semi.p, t_rbrace()) {
-        Continue({ p: semi.p, tail: Some(e.node), stmts: s.stmts })
+      let semi = eat(input, e.parser, token_semi());
+      if semi.ok {
+        Continue({ parser: semi.parser, tail: s.tail, stmts: push(s.stmts, SExpr(e.node)) })
+      } else if at_token(input, semi.parser, token_rbrace()) {
+        Continue({ parser: semi.parser, tail: Some(e.node), stmts: s.stmts })
       } else if is_block_like(e.node) {
-        Continue({ p: semi.p, tail: s.tail, stmts: push(s.stmts, SExpr(e.node)) })
-      } else if at_eof(c, semi.p) {
-        Stop(Err(unclosed(c, semi.p, open, b"`}` to close the block")))
+        Continue({ parser: semi.parser, tail: s.tail, stmts: push(s.stmts, SExpr(e.node)) })
+      } else if at_eof(input, semi.parser) {
+        Stop(Err(unclosed(input, semi.parser, open, b"`}` to close the block")))
       } else {
-        Stop(Err(error_here(c, semi.p, b"`;` to end the statement, or `}` to end the block")))
+        Stop(
+          Err(error_here(input, semi.parser, b"`;` to end the statement, or `}` to end the block")),
+        )
       }
     },
   }
 
 // Its own function so `?` sits in return position: `?` in an `if` branch bound by `let` is `E0119`.
-fn let_ty(c: Ctx, p: P) -> Result<R<Option<TypeExpr>>, P> = {
-  let colon = eat(c, p, t_colon());
-  if !colon.ok { Ok({ p: colon.p, node: None }) } else {
-    let { p, node: x } = ty(c, colon.p)?;
-    Ok({ p: p, node: Some(x) })
+fn let_ty(input: Input, parser: Parser) -> Result<Parsed<Option<TypeExpr>>, Parser> = {
+  let colon = eat(input, parser, token_colon());
+  if !colon.ok { Ok({ parser: colon.parser, node: None }) } else {
+    let { parser, node: x } = ty(input, colon.parser)?;
+    Ok({ parser: parser, node: Some(x) })
   }
 }
 
-fn let_stmt(c: Ctx, p: P) -> Result<R<Stmt>, P> = {
-  let st = advance(c, p);
-  let { p, node: pat } = pattern(c, st.p)?;
-  let { p, node: t } = let_ty(c, p)?;
-  let { p, .. } = expect(c, p, t_eq(), b"`=` and an initializer")?;
-  let { p, node: value } = expr(c, p)?;
-  let els = eat(c, p, k_else());
-  if els.ok { let_else(c, els.p, st.node, pat, t, value) }
-  else { let_end(c, p, st.node, pat, t, value) }
+fn let_stmt(input: Input, parser: Parser) -> Result<Parsed<Stmt>, Parser> = {
+  let st = advance(input, parser);
+  let { parser, node: pat } = pattern(input, st.parser)?;
+  let { parser, node: t } = let_ty(input, parser)?;
+  let { parser, .. } = expect(input, parser, token_eq(), b"`=` and an initializer")?;
+  let { parser, node: value } = expr(input, parser)?;
+  let els = eat(input, parser, keyword_else());
+  if els.ok { let_else(input, els.parser, st.node, pat, t, value) }
+  else { let_end(input, parser, st.node, pat, t, value) }
 }
 
 fn let_end(
-  c: Ctx,
-  p: P,
-  st: Span,
+  input: Input,
+  parser: Parser,
+  span: Span,
   pat: Pattern,
-  t: Option<TypeExpr>,
+  ty: Option<TypeExpr>,
   value: Expr,
-) -> Result<R<Stmt>, P> = {
-  let { p, node: semi } = expect(c, p, t_semi(), b"`;` to end the `let`")?;
-  Ok({ p: p, node: SLet({ span: span_to(st, semi), pat: pat, ty: t, value: value }) })
+) -> Result<Parsed<Stmt>, Parser> = {
+  let { parser, node: semi } = expect(input, parser, token_semi(), b"`;` to end the `let`")?;
+  Ok({ parser: parser, node: SLet({ span: span_to(span, semi), pat: pat, ty: ty, value: value }) })
 }
 
 fn let_else(
-  c: Ctx,
-  p: P,
-  st: Span,
+  input: Input,
+  parser: Parser,
+  span: Span,
   pat: Pattern,
-  t: Option<TypeExpr>,
+  ty: Option<TypeExpr>,
   value: Expr,
-) -> Result<R<Stmt>, P> = {
-  let { p, node: fallback } = else_block(c, p)?;
-  let { p, node: semi } = expect(c, p, t_semi(), b"`;` to end the `let ... else`")?;
+) -> Result<Parsed<Stmt>, Parser> = {
+  let { parser, node: fallback } = else_block(input, parser)?;
+  let { parser, node: semi } = expect(
+    input,
+    parser,
+    token_semi(),
+    b"`;` to end the `let ... else`",
+  )?;
   Ok({
-    p: p,
-    node: SLetElse({ span: span_to(st, semi), pat: pat, ty: t, value: value, fallback: fallback }),
+    parser: parser,
+    node: SLetElse({
+      span: span_to(span, semi),
+      pat: pat,
+      ty: ty,
+      value: value,
+      fallback: fallback,
+    }),
   })
 }
 
-fn else_block(c: Ctx, p: P) -> Result<R<Expr>, P> =
-  if at(c, p, t_lbrace()) { block_expr(c, p) }
-  else { Err(error_here(c, p, b"`{` to open the `else` block of a `let ... else`")) }
+fn else_block(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> =
+  if at_token(input, parser, token_lbrace()) { block_expr(input, parser) }
+  else { Err(error_here(input, parser, b"`{` to open the `else` block of a `let ... else`")) }
 
-pub fn fn_param(c: Ctx, p: P) -> Result<R<Param>, P> = param_inner(c, p, true)
+pub fn fn_param(input: Input, parser: Parser) -> Result<Parsed<Param>, Parser> =
+  param_inner(input, parser, true)
 
 // A lambda parameter, which may not carry a default.
-pub fn param(c: Ctx, p: P) -> Result<R<Param>, P> = param_inner(c, p, false)
+pub fn param(input: Input, parser: Parser) -> Result<Parsed<Param>, Parser> =
+  param_inner(input, parser, false)
 
-fn param_inner(c: Ctx, p: P, allow_default: Bool) -> Result<R<Param>, P> = {
-  let { p, node: n } = expect_binder(c, p, b"a parameter name")?;
-  let { p, node: t } = param_ty(c, p)?;
-  let { p, node: d } = param_default(c, p, allow_default)?;
+fn param_inner(input: Input, parser: Parser, allow_default: Bool) -> Result<Parsed<Param>, Parser> = {
+  let { parser, node: n } = expect_binder(input, parser, b"a parameter name")?;
+  let { parser, node: t } = param_ty(input, parser)?;
+  let { parser, node: d } = param_default(input, parser, allow_default)?;
   // A refused default is `None`, so the span stops before the `= 1` that was read.
   let end = match d {
     Some(e) -> expr_span(e),
     None -> match t { Some(x) -> ty_span(x), None -> n.span },
   };
-  Ok({ p: p, node: { name: n, ty: t, default: d, span: span_to(n.span, end) } })
+  Ok({ parser: parser, node: { name: n, ty: t, default: d, span: span_to(n.span, end) } })
 }
 
-fn param_ty(c: Ctx, p: P) -> Result<R<Option<TypeExpr>>, P> = {
-  let co = eat(c, p, t_colon());
-  if !co.ok { Ok({ p: co.p, node: None }) } else {
-    let { p, node: t } = ty(c, co.p)?;
-    Ok({ p: p, node: Some(t) })
+fn param_ty(input: Input, parser: Parser) -> Result<Parsed<Option<TypeExpr>>, Parser> = {
+  let co = eat(input, parser, token_colon());
+  if !co.ok { Ok({ parser: co.parser, node: None }) } else {
+    let { parser, node: t } = ty(input, co.parser)?;
+    Ok({ parser: parser, node: Some(t) })
   }
 }
 
 // Parsed either way, so a default on a lambda is refused with the reason rather than a syntax error.
-fn param_default(c: Ctx, p: P, allow: Bool) -> Result<R<Option<Expr>>, P> =
-  if !at(c, p, t_eq()) { Ok({ p: p, node: None }) } else {
-    let eq = advance(c, p);
-    let { p, node: e } = expr(c, eq.p)?;
-    if allow { Ok({ p: p, node: Some(e) }) } else {
+fn param_default(
+  input: Input,
+  parser: Parser,
+  allow: Bool,
+) -> Result<Parsed<Option<Expr>>, Parser> =
+  if !at_token(input, parser, token_eq()) { Ok({ parser: parser, node: None }) } else {
+    let eq = advance(input, parser);
+    let { parser, node: e } = expr(input, eq.parser)?;
+    if allow { Ok({ parser: parser, node: Some(e) }) } else {
       Ok({
-        p: push_diag(
-          p,
-          diag1(
+        parser: push_diag(
+          parser,
+          error_at(
             default_not_allowed(),
             span_to(eq.node, expr_span(e)),
             b"a lambda parameter cannot have a default",
@@ -989,34 +1103,44 @@ fn param_default(c: Ctx, p: P, allow: Bool) -> Result<R<Option<Expr>>, P> =
 pub fn no_param() -> Param = { name: no_ident(), ty: None, default: None, span: dummy_span() }
 
 // `||` is one token: the empty parameter list.
-fn lambda_params(c: Ctx, p: P) -> Result<R<List<Param>>, P> = {
-  let empty = eat(c, p, t_pipepipe());
-  if empty.ok { Ok({ p: empty.p, node: [] }) } else {
-    let bar = advance(c, empty.p);
+fn lambda_params(input: Input, parser: Parser) -> Result<Parsed<List<Param>>, Parser> = {
+  let empty = eat(input, parser, token_pipepipe());
+  if empty.ok { Ok({ parser: empty.parser, node: [] }) } else {
+    let bar = advance(input, empty.parser);
     // Inside the list a `|` closes it and is never bit-or; restored on both paths.
-    let saved = bar.p.no_pipe;
-    let { p, node: ps } = (match comma_list(c, with_no_pipe(bar.p, true), t_pipe(), param) {
+    let saved = bar.parser.no_pipe;
+    let { parser, node: ps } = (match comma_list(
+        input,
+        with_no_pipe(bar.parser, true),
+        token_pipe(),
+        param,
+      ) {
       Err(q) -> Err(with_no_pipe(q, saved)),
-      Ok(r) -> Ok({ p: with_no_pipe(r.p, saved), node: r.node }),
+      Ok(r) -> Ok({ parser: with_no_pipe(r.parser, saved), node: r.node }),
     })?;
-    let { p, .. } = expect(c, p, t_pipe(), b"`|` to close the lambda parameters")?;
-    Ok({ p: p, node: ps })
+    let { parser, .. } = expect(
+      input,
+      parser,
+      token_pipe(),
+      b"`|` to close the lambda parameters",
+    )?;
+    Ok({ parser: parser, node: ps })
   }
 }
 
 // A written return type requires a block body.
-fn lambda_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = cur_span(c, p);
-  let { p, node: params } = lambda_params(c, p)?;
-  let arrow = eat(c, p, t_arrow());
+fn lambda_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = current_span(input, parser);
+  let { parser, node: params } = lambda_params(input, parser)?;
+  let arrow = eat(input, parser, token_arrow());
   if arrow.ok {
-    let { p, node: ret } = ty(c, arrow.p)?;
-    if !at(c, p, t_lbrace()) {
-      Err(error_here(c, p, b"`{` to open the body of a lambda with a written return type"))
+    let { parser, node: ret } = ty(input, arrow.parser)?;
+    if !at_token(input, parser, token_lbrace()) {
+      Err(error_here(input, parser, b"`{` to open the body of a lambda with a written return type"))
     } else {
-      let { p, node: body } = lambda_body(c, p, true)?;
+      let { parser, node: body } = lambda_body(input, parser, true)?;
       Ok({
-        p: p,
+        parser: parser,
         node: ELambda({
           span: span_to(st, expr_span(body)),
           body: body,
@@ -1026,41 +1150,41 @@ fn lambda_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
       })
     }
   } else {
-    let { p, node: body } = lambda_body(c, p, false)?;
+    let { parser, node: body } = lambda_body(input, parser, false)?;
     Ok({
-      p: p,
+      parser: parser,
       node: ELambda({ span: span_to(st, expr_span(body)), body: body, params: params, ret: None }),
     })
   }
 }
 
 // The body reads `|` as bit-or again whatever list encloses the lambda; restored on both paths.
-fn lambda_body(c: Ctx, p: P, braced: Bool) -> Result<R<Expr>, P> = {
-  let saved = p.no_pipe;
-  let inner = with_no_pipe(p, false);
-  match if braced { block_expr(c, inner) } else { expr(c, inner) } {
+fn lambda_body(input: Input, parser: Parser, braced: Bool) -> Result<Parsed<Expr>, Parser> = {
+  let saved = parser.no_pipe;
+  let inner = with_no_pipe(parser, false);
+  match if braced { block_expr(input, inner) } else { expr(input, inner) } {
     Err(q) -> Err(with_no_pipe(q, saved)),
-    Ok(r) -> Ok({ p: with_no_pipe(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_pipe(r.parser, saved), node: r.node }),
   }
 }
 
-fn else_branch(c: Ctx, p: P, then_branch: Expr) -> Result<R<Expr>, P> = {
-  let els = eat(c, p, k_else());
+fn else_branch(input: Input, parser: Parser, then_branch: Expr) -> Result<Parsed<Expr>, Parser> = {
+  let els = eat(input, parser, keyword_else());
   if !els.ok {
     // No `else`: a `()` over the empty span at the end of the `then` block.
     let end = expr_span(then_branch).end;
-    Ok({ p: els.p, node: ELit({ span: { start: end, end: end }, lit: LUnit }) })
-  } else if at(c, els.p, k_if()) { if_expr(c, els.p) }
-  else { block_expr(c, els.p) }
+    Ok({ parser: els.parser, node: ELit({ span: { start: end, end: end }, lit: LUnit }) })
+  } else if at_token(input, els.parser, keyword_if()) { if_expr(input, els.parser) }
+  else { block_expr(input, els.parser) }
 }
 
-fn if_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = advance(c, p);
-  let { p, node: cond } = scrutinee(c, st.p)?;
-  let { p, node: then_b } = block_expr(c, p)?;
-  let { p, node: else_b } = else_branch(c, p, then_b)?;
+fn if_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = advance(input, parser);
+  let { parser, node: cond } = scrutinee(input, st.parser)?;
+  let { parser, node: then_b } = block_expr(input, parser)?;
+  let { parser, node: else_b } = else_branch(input, parser, then_b)?;
   Ok({
-    p: p,
+    parser: parser,
     node: EIf({
       span: span_to(st.node, expr_span(else_b)),
       cond: cond,
@@ -1070,52 +1194,62 @@ fn if_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   })
 }
 
-fn match_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = advance(c, p);
-  let { p, node: scrut } = scrutinee(c, st.p)?;
-  let saved = p.no_brace;
-  match match_arms(c, with_no_brace(p, false)) {
+fn match_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = advance(input, parser);
+  let { parser, node: scrut } = scrutinee(input, st.parser)?;
+  let saved = parser.no_brace;
+  match match_arms(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
     Ok(arms) ->
       Ok({
-        p: with_no_brace(arms.p, saved),
+        parser: with_no_brace(arms.parser, saved),
         node: EMatch({ span: span_to(st.node, arms.close), scrutinee: scrut, arms: arms.arms }),
       }),
   }
 }
 
-type RArms = { p: P, close: Span, arms: List<MatchArm> }
+type RArms = { parser: Parser, close: Span, arms: List<MatchArm> }
 
-fn match_arms(c: Ctx, p: P) -> Result<RArms, P> = {
-  let { p, node: o } = expect(c, p, t_lbrace(), b"`{` to start the match arms")?;
-  let body = iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: Acc<MatchArm>|
-    if at(c, s.p, t_rbrace()) { Stop(Ok(s)) }
-    else if at_eof(c, s.p) { Stop(Err(unclosed(c, s.p, o, b"`}` to close the match arms"))) }
-    else { match_arm_step(c, s, o) })?;
-  let { p, node: cl } = expect_close(c, body.p, t_rbrace(), o, b"`}` to close the match arms")?;
-  Ok({ p: p, close: cl, arms: body.out })
+fn match_arms(input: Input, parser: Parser) -> Result<RArms, Parser> = {
+  let { parser, node: o } = expect(input, parser, token_lbrace(), b"`{` to start the match arms")?;
+  let body = iterate(
+    { parser: parser, out: [] },
+    input.token_count - parser.pos + 1,
+    |s: SoFar<MatchArm>|
+      if at_token(input, s.parser, token_rbrace()) { Stop(Ok(s)) } else if at_eof(input, s.parser) {
+        Stop(Err(unclosed(input, s.parser, o, b"`}` to close the match arms")))
+      } else { match_arm_step(input, s, o) },
+  )?;
+  let { parser, node: cl } = expect_close(
+    input,
+    body.parser,
+    token_rbrace(),
+    o,
+    b"`}` to close the match arms",
+  )?;
+  Ok({ parser: parser, close: cl, arms: body.out })
 }
 
-fn arm_guard(c: Ctx, p: P) -> Result<R<Option<Expr>>, P> = {
-  let gif = eat(c, p, k_if());
-  if !gif.ok { Ok({ p: gif.p, node: None }) } else {
-    let { p, node: g } = expr(c, gif.p)?;
-    Ok({ p: p, node: Some(g) })
+fn arm_guard(input: Input, parser: Parser) -> Result<Parsed<Option<Expr>>, Parser> = {
+  let gif = eat(input, parser, keyword_if());
+  if !gif.ok { Ok({ parser: gif.parser, node: None }) } else {
+    let { parser, node: g } = expr(input, gif.parser)?;
+    Ok({ parser: parser, node: Some(g) })
   }
 }
 
 fn match_arm_step(
-  c: Ctx,
-  s: Acc<MatchArm>,
+  input: Input,
+  s: SoFar<MatchArm>,
   open: Span,
-) -> Iter<Acc<MatchArm>, Result<Acc<MatchArm>, P>> =
-  match pattern(c, s.p) {
+) -> Iter<SoFar<MatchArm>, Result<SoFar<MatchArm>, Parser>> =
+  match pattern(input, s.parser) {
     Err(q) -> Stop(Err(q)),
-    Ok(pat) -> match arm_guard(c, pat.p) {
+    Ok(pat) -> match arm_guard(input, pat.parser) {
       Err(q) -> Stop(Err(q)),
-      Ok(guard) -> match expect(c, guard.p, t_arrow(), b"`->` and the arm body") {
+      Ok(guard) -> match expect(input, guard.parser, token_arrow(), b"`->` and the arm body") {
         Err(q) -> Stop(Err(q)),
-        Ok(arrow) -> match expr(c, arrow.p) {
+        Ok(arrow) -> match expr(input, arrow.parser) {
           Err(q) -> Stop(Err(q)),
           Ok(body) -> {
             let arm = {
@@ -1125,60 +1259,88 @@ fn match_arm_step(
               span: span_to(pat_span(pat.node), expr_span(body.node)),
             };
             // The comma is eaten before the `}` test, whichever way the test goes.
-            let comma = eat(c, body.p, t_comma());
-            if comma.ok || at(c, comma.p, t_rbrace()) {
-              Continue({ p: comma.p, out: push(s.out, arm) })
-            } else if at_eof(c, comma.p) {
-              Stop(Err(unclosed(c, comma.p, open, b"`}` to close the match arms")))
+            let comma = eat(input, body.parser, token_comma());
+            if comma.ok || at_token(input, comma.parser, token_rbrace()) {
+              Continue({ parser: comma.parser, out: push(s.out, arm) })
+            } else if at_eof(input, comma.parser) {
+              Stop(Err(unclosed(input, comma.parser, open, b"`}` to close the match arms")))
             } else if !is_block_like(arm.body) {
-              Stop(Err(error_here(c, comma.p, b"`,` between match arms, or `}` to end the match")))
-            } else { Continue({ p: comma.p, out: push(s.out, arm) }) }
+              Stop(
+                Err(
+                  error_here(
+                    input,
+                    comma.parser,
+                    b"`,` between match arms, or `}` to end the match",
+                  ),
+                ),
+              )
+            } else { Continue({ parser: comma.parser, out: push(s.out, arm) }) }
           },
         },
       },
     },
   }
 
-fn handle_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = advance(c, p);
-  let saved = st.p.no_brace;
-  match handle_rest(c, with_no_brace(st.p, false), st.node) {
+fn handle_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = advance(input, parser);
+  let saved = st.parser.no_brace;
+  match handle_rest(input, with_no_brace(st.parser, false), st.node) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-type HAcc = { p: P, ret: Option<ReturnClause>, clauses: List<HandleClause> }
+type HAcc = { parser: Parser, ret: Option<ReturnClause>, clauses: List<HandleClause> }
 
-fn handle_rest(c: Ctx, p: P, st: Span) -> Result<R<Expr>, P> = {
-  let { p, node: body } = expr(c, p)?;
-  let { p, .. } = expect(c, p, k_with(), b"`with` and then the handler clauses")?;
-  let { p, node: o } = expect(c, p, t_lbrace(), b"`{` to start the handler clauses")?;
-  let acc = iterate({ p: p, ret: None, clauses: [] }, c.ntok - p.pos + 1, |s: HAcc|
-    if at(c, s.p, t_rbrace()) { Stop(Ok(s)) }
-    else if at_eof(c, s.p) { Stop(Err(unclosed(c, s.p, o, b"`}` to close the handler"))) }
-    else { handle_step(c, s) })?;
-  let { p, node: cl } = expect_close(c, acc.p, t_rbrace(), o, b"`}` to close the handler")?;
+fn handle_rest(input: Input, parser: Parser, span: Span) -> Result<Parsed<Expr>, Parser> = {
+  let { parser, node: body } = expr(input, parser)?;
+  let { parser, .. } = expect(
+    input,
+    parser,
+    keyword_with(),
+    b"`with` and then the handler clauses",
+  )?;
+  let { parser, node: o } = expect(
+    input,
+    parser,
+    token_lbrace(),
+    b"`{` to start the handler clauses",
+  )?;
+  let acc = iterate(
+    { parser: parser, ret: None, clauses: [] },
+    input.token_count - parser.pos + 1,
+    |s: HAcc|
+      if at_token(input, s.parser, token_rbrace()) { Stop(Ok(s)) } else if at_eof(input, s.parser) {
+        Stop(Err(unclosed(input, s.parser, o, b"`}` to close the handler")))
+      } else { handle_step(input, s) },
+  )?;
+  let { parser, node: cl } = expect_close(
+    input,
+    acc.parser,
+    token_rbrace(),
+    o,
+    b"`}` to close the handler",
+  )?;
   Ok({
-    p: p,
-    node: EHandle({ span: span_to(st, cl), body: body, ret: acc.ret, clauses: acc.clauses }),
+    parser: parser,
+    node: EHandle({ span: span_to(span, cl), body: body, ret: acc.ret, clauses: acc.clauses }),
   })
 }
 
 // `return` is contextual here too: it is a clause only when a name follows it.
-fn handle_step(c: Ctx, s: HAcc) -> Iter<HAcc, Result<HAcc, P>> =
-  if at_ident_text(c, s.p, b"return") && is_ident_at(c, s.p, 1) {
-    match return_clause(c, s.p) {
+fn handle_step(input: Input, s: HAcc) -> Iter<HAcc, Result<HAcc, Parser>> =
+  if at_ident_text(input, s.parser, b"return") && is_ident_at(input, s.parser, 1) {
+    match return_clause(input, s.parser) {
       Err(q) -> Stop(Err(q)),
       Ok(rc) -> {
         let next = match s.ret {
-          None -> { p: rc.p, clauses: s.clauses, ret: Some(rc.node) },
+          None -> { parser: rc.parser, clauses: s.clauses, ret: Some(rc.node) },
           // A duplicate `return` is reported and dropped; the parse carries on.
           Some(prev) ->
             {
-              p: push_diag(
-                rc.p,
-                diag2(
+              parser: push_diag(
+                rc.parser,
+                error_at_and(
                   unexpected(),
                   rc.node.span,
                   b"a handler may have only one `return` clause",
@@ -1192,44 +1354,55 @@ fn handle_step(c: Ctx, s: HAcc) -> Iter<HAcc, Result<HAcc, P>> =
               ret: s.ret,
             },
         };
-        let comma = eat(c, next.p, t_comma());
-        Continue({ p: comma.p, ret: next.ret, clauses: next.clauses })
+        let comma = eat(input, next.parser, token_comma());
+        Continue({ parser: comma.parser, ret: next.ret, clauses: next.clauses })
       },
     }
   } else {
-    match handle_clause(c, s.p) {
+    match handle_clause(input, s.parser) {
       Err(q) -> Stop(Err(q)),
       Ok(cl) -> {
-        let comma = eat(c, cl.p, t_comma());
-        Continue({ p: comma.p, ret: s.ret, clauses: push(s.clauses, cl.node) })
+        let comma = eat(input, cl.parser, token_comma());
+        Continue({ parser: comma.parser, ret: s.ret, clauses: push(s.clauses, cl.node) })
       },
     }
   }
 
-fn is_ident_at(c: Ctx, p: P, n: Int) -> Bool =
-  match kind_at(c, p, n) { TIdent(x) -> true, _ -> false }
+fn is_ident_at(input: Input, parser: Parser, n: Int) -> Bool =
+  match token_kind_at(input, parser, n) { Identifier(x) -> true, _ -> false }
 
 // `resume` is a keyword only between a clause's `)` and its `->`.
-fn clause_resume(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
-  if !at_ident_text(c, p, b"resume") { Ok({ p: p, node: None }) } else {
-    let a = advance(c, p);
-    let { p, node: n } = expect_ident(c, a.p, b"a name to bind the continuation to")?;
-    Ok({ p: p, node: Some(n) })
+fn clause_resume(input: Input, parser: Parser) -> Result<Parsed<Option<Ident>>, Parser> =
+  if !at_ident_text(input, parser, b"resume") { Ok({ parser: parser, node: None }) } else {
+    let a = advance(input, parser);
+    let { parser, node: n } = expect_ident(input, a.parser, b"a name to bind the continuation to")?;
+    Ok({ parser: parser, node: Some(n) })
   }
 
-fn handle_clause(c: Ctx, p: P) -> Result<R<HandleClause>, P> = {
-  let { p, node: eff } = qname(c, p, b"an effect name, or `return`")?;
-  let { p, .. } = expect(c, p, t_dot(), b"`.` and the operation name")?;
-  let { p, node: op } = expect_ident(c, p, b"an operation name")?;
-  let { p, node: res } = clause_resource(c, p)?;
-  let { p, node: o } = expect(c, p, t_lparen(), b"`(` to start the clause parameters")?;
-  let { p, node: params } = comma_list(c, p, t_rparen(), clause_param)?;
-  let { p, .. } = expect_close(c, p, t_rparen(), o, b"`)` to close the clause parameters")?;
-  let { p, node: resume } = clause_resume(c, p)?;
-  let { p, .. } = expect(c, p, t_arrow(), b"`->` and the clause body")?;
-  let { p, node: body } = expr(c, p)?;
+fn handle_clause(input: Input, parser: Parser) -> Result<Parsed<HandleClause>, Parser> = {
+  let { parser, node: eff } = qname(input, parser, b"an effect name, or `return`")?;
+  let { parser, .. } = expect(input, parser, token_dot(), b"`.` and the operation name")?;
+  let { parser, node: op } = expect_ident(input, parser, b"an operation name")?;
+  let { parser, node: res } = clause_resource(input, parser)?;
+  let { parser, node: o } = expect(
+    input,
+    parser,
+    token_lparen(),
+    b"`(` to start the clause parameters",
+  )?;
+  let { parser, node: params } = comma_list(input, parser, token_rparen(), clause_param)?;
+  let { parser, .. } = expect_close(
+    input,
+    parser,
+    token_rparen(),
+    o,
+    b"`)` to close the clause parameters",
+  )?;
+  let { parser, node: resume } = clause_resume(input, parser)?;
+  let { parser, .. } = expect(input, parser, token_arrow(), b"`->` and the clause body")?;
+  let { parser, node: body } = expr(input, parser)?;
   Ok({
-    p: p,
+    parser: parser,
     node: {
       eff: eff,
       op: op,
@@ -1244,42 +1417,77 @@ fn handle_clause(c: Ctx, p: P) -> Result<R<HandleClause>, P> = {
   })
 }
 
-fn clause_param(c: Ctx, p: P) -> Result<R<Ident>, P> =
-  expect_binder(c, p, b"a clause parameter name")
+fn clause_param(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> =
+  expect_binder(input, parser, b"a clause parameter name")
 
-fn return_clause(c: Ctx, p: P) -> Result<R<ReturnClause>, P> = {
-  let st = advance(c, p);
-  let { p, node: binder } = expect_ident(c, st.p, b"a binder after `return`")?;
-  let { p, .. } = expect(c, p, t_arrow(), b"`->` and the `return` body")?;
-  let { p, node: body } = expr(c, p)?;
-  Ok({ p: p, node: { binder: binder, body: body, span: span_to(st.node, expr_span(body)) } })
+fn return_clause(input: Input, parser: Parser) -> Result<Parsed<ReturnClause>, Parser> = {
+  let st = advance(input, parser);
+  let { parser, node: binder } = expect_ident(input, st.parser, b"a binder after `return`")?;
+  let { parser, .. } = expect(input, parser, token_arrow(), b"`->` and the `return` body")?;
+  let { parser, node: body } = expr(input, parser)?;
+  Ok({
+    parser: parser,
+    node: { binder: binder, body: body, span: span_to(st.node, expr_span(body)) },
+  })
 }
 
-fn with_cell_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = advance(c, p);
-  let { p, node: br } = expect(c, st.p, t_lbracket(), b"`[` and a resource name")?;
-  let { p, node: resource } = expect_ident(c, p, b"a resource name inside `[..]`")?;
-  let { p, .. } = expect_close(c, p, t_rbracket(), br, b"`]`")?;
-  let saved = p.no_brace;
-  match with_cell_rest(c, with_no_brace(p, false), st.node, resource) {
+fn with_cell_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = advance(input, parser);
+  let { parser, node: br } = expect(
+    input,
+    st.parser,
+    token_lbracket(),
+    b"`[` and a resource name",
+  )?;
+  let { parser, node: resource } = expect_ident(input, parser, b"a resource name inside `[..]`")?;
+  let { parser, .. } = expect_close(input, parser, token_rbracket(), br, b"`]`")?;
+  let saved = parser.no_brace;
+  match with_cell_rest(input, with_no_brace(parser, false), st.node, resource) {
     Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-fn with_cell_rest(c: Ctx, p: P, st: Span, resource: Ident) -> Result<R<Expr>, P> = {
-  let { p, node: paren } = expect(c, p, t_lparen(), b"`(` and the cell's initial value")?;
-  let { p, node: init } = expr(c, p)?;
-  let { p, .. } = expect_close(c, p, t_rparen(), paren, b"`)` after the initial value")?;
-  let { p, node: brace } = expect(c, p, t_lbrace(), b"`{` to start the cell's region")?;
-  let { p, node: binder } = expect_ident(c, p, b"a name to bind the cell to")?;
-  let { p, .. } = expect(c, p, t_arrow(), b"`->` and the region body")?;
-  let { p, node: body } = expr(c, p)?;
-  let { p, node: cl } = expect_close(c, p, t_rbrace(), brace, b"`}` to close the cell's region")?;
+fn with_cell_rest(
+  input: Input,
+  parser: Parser,
+  span: Span,
+  resource: Ident,
+) -> Result<Parsed<Expr>, Parser> = {
+  let { parser, node: paren } = expect(
+    input,
+    parser,
+    token_lparen(),
+    b"`(` and the cell's initial value",
+  )?;
+  let { parser, node: init } = expr(input, parser)?;
+  let { parser, .. } = expect_close(
+    input,
+    parser,
+    token_rparen(),
+    paren,
+    b"`)` after the initial value",
+  )?;
+  let { parser, node: brace } = expect(
+    input,
+    parser,
+    token_lbrace(),
+    b"`{` to start the cell's region",
+  )?;
+  let { parser, node: binder } = expect_ident(input, parser, b"a name to bind the cell to")?;
+  let { parser, .. } = expect(input, parser, token_arrow(), b"`->` and the region body")?;
+  let { parser, node: body } = expr(input, parser)?;
+  let { parser, node: cl } = expect_close(
+    input,
+    parser,
+    token_rbrace(),
+    brace,
+    b"`}` to close the cell's region",
+  )?;
   Ok({
-    p: p,
+    parser: parser,
     node: EWithCell({
-      span: span_to(st, cl),
+      span: span_to(span, cl),
       resource: resource,
       init: init,
       binder: binder,
@@ -1288,27 +1496,33 @@ fn with_cell_rest(c: Ctx, p: P, st: Span, resource: Ident) -> Result<R<Expr>, P>
   })
 }
 
-fn simulate_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = advance(c, p);
-  let { p, node: body } = block_expr(c, st.p)?;
-  Ok({ p: p, node: ESimulate({ span: span_to(st.node, expr_span(body)), body: body }) })
+fn simulate_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = advance(input, parser);
+  let { parser, node: body } = block_expr(input, st.parser)?;
+  Ok({ parser: parser, node: ESimulate({ span: span_to(st.node, expr_span(body)), body: body }) })
 }
 
-fn parallel_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
-  let st = advance(c, p);
-  let saved = st.p.no_brace;
-  let { p, node: brace } = expect(
-    c,
-    with_no_brace(st.p, false),
-    t_lbrace(),
+fn parallel_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> = {
+  let st = advance(input, parser);
+  let saved = st.parser.no_brace;
+  let { parser, node: brace } = expect(
+    input,
+    with_no_brace(st.parser, false),
+    token_lbrace(),
     b"`{` to start the branches",
   )?;
-  let { p, node: branches } = comma_list(c, p, t_rbrace(), expr)?;
+  let { parser, node: branches } = comma_list(input, parser, token_rbrace(), expr)?;
   // One branch would be a tuple of one, which Ply has none of.
-  if len(branches) < 2 { Err(error_here(c, p, b"`,` and a second branch")) } else {
-    let { p, node: cl } = expect_close(c, p, t_rbrace(), brace, b"`}` to close the branches")?;
+  if len(branches) < 2 { Err(error_here(input, parser, b"`,` and a second branch")) } else {
+    let { parser, node: cl } = expect_close(
+      input,
+      parser,
+      token_rbrace(),
+      brace,
+      b"`}` to close the branches",
+    )?;
     Ok({
-      p: with_no_brace(p, saved),
+      parser: with_no_brace(parser, saved),
       node: EParallel({ span: span_to(st.node, cl), branches: branches }),
     })
   }
@@ -1316,23 +1530,29 @@ fn parallel_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
 
 // --- The dump ---------------------------------------------------------------
 
-pub fn dump_expr(e: Expr) -> Bytes =
-  match e {
-    ELit(v) -> bytes_concat(rec(v.span, b"elit"), dump_lit(v.lit)),
-    EVar(v) -> bytes_concat(rec(v.span, b"evar"), dump_qname(v.name)),
+pub fn dump_expr(expr: Expr) -> Bytes =
+  match expr {
+    ELit(v) -> bytes_concat(dump_node(v.span, b"elit"), dump_lit(v.lit)),
+    EVar(v) -> bytes_concat(dump_node(v.span, b"evar"), dump_qname(v.name)),
     EBinary(v) ->
-      bytes_concat_all([rec(v.span, b"ebin"), word(v.op), dump_expr(v.lhs), dump_expr(v.rhs)]),
-    EUnary(v) -> bytes_concat_all([rec(v.span, b"eun"), word(v.op), dump_expr(v.operand)]),
+      bytes_concat_all([
+        dump_node(v.span, b"ebin"),
+        dump_word(v.op),
+        dump_expr(v.lhs),
+        dump_expr(v.rhs),
+      ]),
+    EUnary(v) ->
+      bytes_concat_all([dump_node(v.span, b"eun"), dump_word(v.op), dump_expr(v.operand)]),
     ELambda(v) ->
       bytes_concat_all([
-        rec(v.span, b"elam"),
+        dump_node(v.span, b"elam"),
         dump_list(v.params, dump_param),
         dump_opt(v.ret, dump_ty),
         dump_expr(v.body),
       ]),
     EApp(v) ->
       bytes_concat_all([
-        rec(v.span, b"eapp"),
+        dump_node(v.span, b"eapp"),
         dump_expr(v.func),
         dump_list(v.args, dump_expr),
         dump_list(v.named, dump_named),
@@ -1340,28 +1560,37 @@ pub fn dump_expr(e: Expr) -> Bytes =
       ]),
     EIf(v) ->
       bytes_concat_all([
-        rec(v.span, b"eif"),
+        dump_node(v.span, b"eif"),
         dump_expr(v.cond),
         dump_expr(v.then_branch),
         dump_expr(v.else_branch),
       ]),
     EMatch(v) ->
-      bytes_concat_all([rec(v.span, b"emat"), dump_expr(v.scrutinee), dump_list(v.arms, dump_arm)]),
+      bytes_concat_all([
+        dump_node(v.span, b"emat"),
+        dump_expr(v.scrutinee),
+        dump_list(v.arms, dump_arm),
+      ]),
     EBlock(v) ->
       bytes_concat_all([
-        rec(v.span, b"eblk"),
+        dump_node(v.span, b"eblk"),
         dump_list(v.stmts, dump_stmt),
         dump_opt(v.tail, dump_expr),
       ]),
-    ERecord(v) -> bytes_concat(rec(v.span, b"erec"), dump_list(v.fields, dump_field)),
+    ERecord(v) -> bytes_concat(dump_node(v.span, b"erec"), dump_list(v.fields, dump_field)),
     ERecordUpdate(v) ->
-      bytes_concat_all([rec(v.span, b"erup"), dump_expr(v.base), dump_list(v.fields, dump_field)]),
-    ETry(v) -> bytes_concat(rec(v.span, b"etry"), dump_expr(v.operand)),
-    EField(v) -> bytes_concat_all([rec(v.span, b"efld"), dump_expr(v.base), dump_ident(v.field)]),
-    EList(v) -> bytes_concat(rec(v.span, b"elst"), dump_list(v.items, dump_expr)),
+      bytes_concat_all([
+        dump_node(v.span, b"erup"),
+        dump_expr(v.base),
+        dump_list(v.fields, dump_field),
+      ]),
+    ETry(v) -> bytes_concat(dump_node(v.span, b"etry"), dump_expr(v.operand)),
+    EField(v) ->
+      bytes_concat_all([dump_node(v.span, b"efld"), dump_expr(v.base), dump_ident(v.field)]),
+    EList(v) -> bytes_concat(dump_node(v.span, b"elst"), dump_list(v.items, dump_expr)),
     EPerform(v) ->
       bytes_concat_all([
-        rec(v.span, b"eprf"),
+        dump_node(v.span, b"eprf"),
         dump_qname(v.eff),
         dump_ident(v.op),
         dump_opt(v.resource, dump_ident),
@@ -1369,108 +1598,113 @@ pub fn dump_expr(e: Expr) -> Bytes =
       ]),
     EHandle(v) ->
       bytes_concat_all([
-        rec(v.span, b"ehnd"),
+        dump_node(v.span, b"ehnd"),
         dump_expr(v.body),
         dump_list(v.clauses, dump_clause),
         dump_opt(v.ret, dump_return),
       ]),
     EWithCell(v) ->
       bytes_concat_all([
-        rec(v.span, b"ecel"),
+        dump_node(v.span, b"ecel"),
         dump_ident(v.resource),
         dump_expr(v.init),
         dump_ident(v.binder),
         dump_expr(v.body),
       ]),
-    ESimulate(v) -> bytes_concat(rec(v.span, b"esim"), dump_expr(v.body)),
-    EParallel(v) -> bytes_concat(rec(v.span, b"epar"), dump_list(v.branches, dump_expr)),
-    EBad(v) -> rec(v.span, b"ebad"),
+    ESimulate(v) -> bytes_concat(dump_node(v.span, b"esim"), dump_expr(v.body)),
+    EParallel(v) -> bytes_concat(dump_node(v.span, b"epar"), dump_list(v.branches, dump_expr)),
+    EBad(v) -> dump_node(v.span, b"ebad"),
   }
 
-fn dump_field(f: RecField) -> Bytes = bytes_concat(dump_ident(f.name), dump_expr(f.value))
+fn dump_field(field: RecField) -> Bytes =
+  bytes_concat(dump_ident(field.name), dump_expr(field.value))
 
-fn dump_named(n: NamedArg) -> Bytes =
-  bytes_concat_all([rec(n.span, b"narg"), dump_ident(n.name), dump_expr(n.value)])
+fn dump_named(arg: NamedArg) -> Bytes =
+  bytes_concat_all([dump_node(arg.span, b"narg"), dump_ident(arg.name), dump_expr(arg.value)])
 
-pub fn dump_param(pa: Param) -> Bytes =
+pub fn dump_param(param: Param) -> Bytes =
   bytes_concat_all([
-    rec(pa.span, b"prm"),
-    dump_ident(pa.name),
-    dump_opt(pa.ty, dump_ty),
-    dump_opt(pa.default, dump_expr),
+    dump_node(param.span, b"prm"),
+    dump_ident(param.name),
+    dump_opt(param.ty, dump_ty),
+    dump_opt(param.default, dump_expr),
   ])
 
-pub fn dump_stmt(s: Stmt) -> Bytes =
-  match s {
+pub fn dump_stmt(stmt: Stmt) -> Bytes =
+  match stmt {
     SLet(v) ->
       bytes_concat_all([
-        rec(v.span, b"slet"),
+        dump_node(v.span, b"slet"),
         dump_pattern(v.pat),
         dump_opt(v.ty, dump_ty),
         dump_expr(v.value),
       ]),
     SLetElse(v) ->
       bytes_concat_all([
-        rec(v.span, b"slete"),
+        dump_node(v.span, b"slete"),
         dump_pattern(v.pat),
         dump_opt(v.ty, dump_ty),
         dump_expr(v.value),
         dump_expr(v.fallback),
       ]),
-    SExpr(e) -> bytes_concat(rec(expr_span(e), b"sexp"), dump_expr(e)),
+    SExpr(e) -> bytes_concat(dump_node(expr_span(e), b"sexp"), dump_expr(e)),
   }
 
-pub fn dump_arm(m: MatchArm) -> Bytes =
+pub fn dump_arm(arm: MatchArm) -> Bytes =
   bytes_concat_all([
-    rec(m.span, b"arm"),
-    dump_pattern(m.pat),
-    dump_opt(m.guard, dump_expr),
-    dump_expr(m.body),
+    dump_node(arm.span, b"arm"),
+    dump_pattern(arm.pat),
+    dump_opt(arm.guard, dump_expr),
+    dump_expr(arm.body),
   ])
 
-pub fn dump_clause(h: HandleClause) -> Bytes =
+pub fn dump_clause(clause: HandleClause) -> Bytes =
   bytes_concat_all([
-    rec(h.span, b"hcl"),
-    dump_qname(h.eff),
-    dump_ident(h.op),
-    dump_opt(h.resource, dump_ident),
-    dump_opt(h.label_binder, dump_ident),
-    dump_list(h.params, dump_ident),
-    dump_opt(h.resume, dump_ident),
-    dump_expr(h.body),
+    dump_node(clause.span, b"hcl"),
+    dump_qname(clause.eff),
+    dump_ident(clause.op),
+    dump_opt(clause.resource, dump_ident),
+    dump_opt(clause.label_binder, dump_ident),
+    dump_list(clause.params, dump_ident),
+    dump_opt(clause.resume, dump_ident),
+    dump_expr(clause.body),
   ])
 
-pub fn dump_return(r: ReturnClause) -> Bytes =
-  bytes_concat_all([rec(r.span, b"rcl"), dump_ident(r.binder), dump_expr(r.body)])
+pub fn dump_return(clause: ReturnClause) -> Bytes =
+  bytes_concat_all([
+    dump_node(clause.span, b"rcl"),
+    dump_ident(clause.binder),
+    dump_expr(clause.body),
+  ])
 
 // --- The area's own entry point ---------------------------------------------
 // One expression, then end of input; on failure the dump is the diagnostics alone.
 pub fn dump_expr_of(src: Bytes) -> String = {
   let s = start(src);
-  let r = expr(s.c, s.p);
-  let v = settle(r, no_expr());
+  let r = expr(s.input, s.parser);
+  let v = parsed_or(r, no_expr());
   let bad = failed(r);
-  let fin = if bad || at_eof(s.c, v.p) { v.p }
-  else { error_here(s.c, v.p, b"end of input after the expression") };
-  let tree = if bad || !at_eof(s.c, v.p) { b"" } else { dump_expr(v.node) };
+  let fin = if bad || at_eof(s.input, v.parser) { v.parser }
+  else { error_here(s.input, v.parser, b"end of input after the expression") };
+  let tree = if bad || !at_eof(s.input, v.parser) { b"" } else { dump_expr(v.node) };
   string_of_bytes(bytes_concat(tree, dump_diags(fin.diags)))
 }
 
 pub fn dump_param_of(src: Bytes) -> String = {
   let s = start(src);
-  let r = settle(param(s.c, s.p), no_param());
-  string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.p.diags)))
+  let r = parsed_or(param(s.input, s.parser), no_param());
+  string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.parser.diags)))
 }
 
 pub fn dump_fn_param_of(src: Bytes) -> String = {
   let s = start(src);
-  let r = settle(fn_param(s.c, s.p), no_param());
-  string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.p.diags)))
+  let r = parsed_or(fn_param(s.input, s.parser), no_param());
+  string_of_bytes(bytes_concat(dump_param(r.node), dump_diags(r.parser.diags)))
 }
 
 // Total on purpose: a probe uses it to touch the whole tree.
-pub fn node_count(e: Expr) -> Int =
-  match e {
+pub fn node_count(expr: Expr) -> Int =
+  match expr {
     ELit(v) -> 1,
     EVar(v) -> 1,
     EBinary(v) -> 1 + node_count(v.lhs) + node_count(v.rhs),
@@ -1478,22 +1712,26 @@ pub fn node_count(e: Expr) -> Int =
     ELambda(v) -> 1 + count_params(v.params) + node_count(v.body),
     EApp(v) ->
       1 + node_count(v.func) + count_all(v.args)
-        + fold(v.named, 0, |n: Int, a: NamedArg| n + 1 + node_count(a.value)),
+        + fold(v.named, 0, |n: Int, arg: NamedArg| n + 1 + node_count(arg.value)),
     EIf(v) -> 1 + node_count(v.cond) + node_count(v.then_branch) + node_count(v.else_branch),
     EMatch(v) ->
       1 + node_count(v.scrutinee)
-        + fold(v.arms, 0, |n: Int, m: MatchArm| n + 1 + count_opt(m.guard) + node_count(m.body)),
-    EBlock(v) -> 1 + fold(v.stmts, 0, |n: Int, s: Stmt| n + count_stmt(s)) + count_opt(v.tail),
-    ERecord(v) -> 1 + fold(v.fields, 0, |n: Int, f: RecField| n + 1 + node_count(f.value)),
+        + fold(v.arms, 0, |n: Int, arm: MatchArm|
+          n + 1 + count_opt(arm.guard) + node_count(arm.body)),
+    EBlock(v) ->
+      1 + fold(v.stmts, 0, |n: Int, stmt: Stmt| n + count_stmt(stmt)) + count_opt(v.tail),
+    ERecord(v) -> 1 + fold(v.fields, 0, |n: Int, field: RecField| n + 1 + node_count(field.value)),
     ERecordUpdate(v) ->
-      1 + node_count(v.base) + fold(v.fields, 0, |n: Int, f: RecField| n + 1 + node_count(f.value)),
+      1 + node_count(v.base)
+        + fold(v.fields, 0, |n: Int, field: RecField| n + 1 + node_count(field.value)),
     ETry(v) -> 1 + node_count(v.operand),
     EField(v) -> 1 + node_count(v.base),
     EList(v) -> 1 + count_all(v.items),
     EPerform(v) -> 1 + count_all(v.args),
     EHandle(v) ->
       1 + node_count(v.body)
-        + fold(v.clauses, 0, |n: Int, h: HandleClause| n + 1 + len(h.params) + node_count(h.body))
+        + fold(v.clauses, 0, |n: Int, clause: HandleClause|
+          n + 1 + len(clause.params) + node_count(clause.body))
         + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) }),
     EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
     ESimulate(v) -> 1 + node_count(v.body),
@@ -1501,15 +1739,15 @@ pub fn node_count(e: Expr) -> Int =
     EBad(v) -> 1,
   }
 
-fn count_all(xs: List<Expr>) -> Int = fold(xs, 0, |n: Int, x: Expr| n + node_count(x))
+fn count_all(exprs: List<Expr>) -> Int = fold(exprs, 0, |n: Int, expr: Expr| n + node_count(expr))
 
-pub fn count_params(ps: List<Param>) -> Int =
-  fold(ps, 0, |n: Int, pa: Param| n + 1 + count_opt(pa.default))
+pub fn count_params(params: List<Param>) -> Int =
+  fold(params, 0, |n: Int, param: Param| n + 1 + count_opt(param.default))
 
-fn count_opt(o: Option<Expr>) -> Int = match o { None -> 0, Some(x) -> node_count(x) }
+fn count_opt(expr: Option<Expr>) -> Int = match expr { None -> 0, Some(x) -> node_count(x) }
 
-fn count_stmt(s: Stmt) -> Int =
-  match s {
+fn count_stmt(stmt: Stmt) -> Int =
+  match stmt {
     SLet(v) -> 1 + node_count(v.value),
     SLetElse(v) -> 1 + node_count(v.value) + node_count(v.fallback),
     SExpr(e) -> 1 + node_count(e),
@@ -1517,13 +1755,13 @@ fn count_stmt(s: Stmt) -> Int =
 
 pub fn parse_count(src: Bytes) -> Int = {
   let s = start(src);
-  node_count(settle(expr(s.c, s.p), no_expr()).node)
+  node_count(parsed_or(expr(s.input, s.parser), no_expr()).node)
 }
 
 // Parses and reads only the final position, to price parsing without the walk.
 pub fn parse_pos(src: Bytes) -> Int = {
   let s = start(src);
-  settle(expr(s.c, s.p), no_expr()).p.pos
+  parsed_or(expr(s.input, s.parser), no_expr()).parser.pos
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -1717,11 +1955,11 @@ test "precedence binds the tighter operator first and stays left-associative" {
 test "a long left-associative chain is one iterate and adds no frames" {
   let whole = bytes_concat(bytes_concat_all(map(range(0, 400), |i: Int| b"1 + ")), b"1");
   let s = start(whole);
-  let rr = expr(s.c, s.p);
+  let rr = expr(s.input, s.parser);
   assert(!failed(rr));
-  let r = settle(rr, no_expr());
-  assert_eq(len(r.p.diags), 0);
-  assert_eq(r.p.depth, 0);
+  let r = parsed_or(rr, no_expr());
+  assert_eq(len(r.parser.diags), 0);
+  assert_eq(r.parser.depth, 0);
   assert_eq(node_count(r.node), 801);
 }
 
@@ -1936,9 +2174,9 @@ test "an unclosed group reports against the opener as a secondary label" {
 
 test "one offset raises one diagnostic, which is `Parser::push`'s dedup rule" {
   let s = start(b"*");
-  let r = expr(s.c, s.p);
+  let r = expr(s.input, s.parser);
   assert(failed(r));
-  assert_eq(len(settle(r, no_expr()).p.diags), 1);
+  assert_eq(len(parsed_or(r, no_expr()).parser.diags), 1);
 }
 
 test "the node count walks every node of a small tree" {
@@ -1953,9 +2191,9 @@ test "past MAX_DEPTH the parser reports rather than overflowing" {
     bytes_concat(b"1", bytes_concat_all(map(range(0, n), |i: Int| b")"))),
   );
   let s = start(deep);
-  let r = expr(s.c, s.p);
+  let r = expr(s.input, s.parser);
   assert(failed(r));
-  assert_eq(len(settle(r, no_expr()).p.diags), 1);
+  assert_eq(len(parsed_or(r, no_expr()).parser.diags), 1);
 }
 
 test "just under MAX_DEPTH it does not" {
@@ -1965,9 +2203,9 @@ test "just under MAX_DEPTH it does not" {
     bytes_concat(b"1", bytes_concat_all(map(range(0, n), |i: Int| b")"))),
   );
   let s = start(deep);
-  let r = expr(s.c, s.p);
+  let r = expr(s.input, s.parser);
   assert(!failed(r));
-  assert_eq(len(settle(r, no_expr()).p.diags), 0);
+  assert_eq(len(parsed_or(r, no_expr()).parser.diags), 0);
 }
 
 test "`parallel` is contextual, takes two or more branches, and nests" {

@@ -4,7 +4,7 @@
 //! an entry lives, and when it is written, are the program's; an entry that does not read is no
 //! entry.
 
-use crate::driver::{FrontFile, HandedFront};
+use crate::driver::{LoadedAnalysis, LoadedFile};
 use crate::payload::record;
 use ply_eval::decode::{At, Error};
 use ply_eval::{ModuleName, SourceId, Value};
@@ -31,7 +31,7 @@ pub fn front(
     entry: &[u8],
     modules: Vec<Walked>,
     manifests: Vec<Walked>,
-) -> Option<(HandedFront, Vec<u8>)> {
+) -> Option<(LoadedAnalysis, Vec<u8>)> {
     let started = Instant::now();
     let mut encoded = Vec::new();
     flate2::read::GzDecoder::new(entry)
@@ -51,11 +51,11 @@ pub fn front(
             let file = walked.next()?;
             (file.path, file.text)
         };
-        files.push(FrontFile { path, name, text });
+        files.push(LoadedFile { path, name, text });
     }
     let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
     let answer = ply_codegen::c::dump::read(filed.dump, &ids).ok()?;
-    let front = HandedFront {
+    let front = LoadedAnalysis {
         answer,
         files,
         read: Duration::ZERO,

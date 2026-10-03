@@ -3,10 +3,14 @@
 // interface a consumer reads it through. The registry recomputes that digest and refuses a
 // mismatch, and a version it already holds is never replaced.
 
+import compiler.load (LoadedAnalysis)
 import args (Flags, style_of)
 import builder (Loaded)
 import builder (builder)
 import build (Packed, defs_of, packed)
+import deployed (artifacts, deploying)
+import units (emit)
+import compiler.unit (shipped)
 import env (env)
 import lock
 import paths (Resolved, here)
@@ -24,7 +28,7 @@ import compiler.hash (Contract)
 import compiler.interface (compile_package, compiled_package_bin, enveloped)
 import compiler.pkg (Supplied, registry_key)
 import compiler.plyx (digest_text)
-import compiler.resolve (Diag, diag1)
+import compiler.resolve (Diag, error_at)
 import std.bin
 import std.fs (fs)
 import std.json (Json, Bool, Number, Str, object, to_string)
@@ -140,21 +144,24 @@ fn bump_refusal(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], builder.loaded[build], builder.unit[build], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us} = {
+) -> Answer / {builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.runtime, shipped.runnable, env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us} = {
   let s = style_of(flags);
   let r = resolved_root(flags);
   let t: Timed = timed_uncached(flags.paths);
   match t.program.whole {
     None -> refused(s, "publish", t.program.diags, t.program.places),
-    Some(w) -> match builder.loaded[build](root_of(flags), front_of(t, w)) {
-      Err(why) -> refused(s, "publish", why.diags, why.places),
-      Ok(p) -> match lock::read(r) {
-        Err(why) -> reported(s, "publish", [lock::refused(r, why)], p.places),
-        Ok(existing) -> match pinned_ok(r, existing, p) {
-          Some(d) -> reported(s, "publish", [d], p.places),
-          None -> checked(s, r.absolute, t.program, p),
+    Some(w) -> {
+      let front = front_of(t, w);
+      match builder.loaded[build](root_of(flags), front) {
+        Err(why) -> refused(s, "publish", why.diags, why.places),
+        Ok(p) -> match lock::read(r) {
+          Err(why) -> reported(s, "publish", [lock::refused(r, why)], p.places),
+          Ok(existing) -> match pinned_ok(r, existing, p) {
+            Some(d) -> reported(s, "publish", [d], p.places),
+            None -> deploying(|| checked(s, r.absolute, t.program, p, front)),
+          },
         },
-      },
+      }
     },
   }
 }
@@ -171,7 +178,8 @@ fn checked(
   root: String,
   loaded: Program,
   p: Loaded,
-) -> Answer / {builder.git[vcs], builder.unit[build], fs.list_dir[shelf], fs.read_file[shelf], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} =
+  front: LoadedAnalysis,
+) -> Answer / {builder.git[vcs], artifacts.unit, fs.list_dir[shelf], fs.read_file[shelf], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} =
   match loaded.whole {
     None -> refused(s, "publish", loaded.diags, loaded.places),
     Some(w) -> match w.manifest {
@@ -188,7 +196,7 @@ fn checked(
         ),
       Some(m) -> match unpublishable(m, len(p.mains)) {
         Some(d) -> reported(s, "publish", [d], p.places),
-        None -> match packed(loaded, defs_of(w)) {
+        None -> match packed(front, loaded, defs_of(w)) {
           Err(why) -> reported(s, "publish", why.diags, p.places),
           Ok(k) -> match cut_of(loaded, m, digest_text(k.x.full)) {
             Err(ds) -> reported(s, "publish", ds, p.places),
@@ -279,7 +287,7 @@ fn uploaded(
 // `already`: the registry held this version as these bytes before the publish.
 // What the registry would not keep beside a version it holds: the version stands either way.
 fn interface_refused(what: String, status: Int, why: String) -> Diag =
-  diag1(
+  error_at(
     b"E0144",
     4294967295,
     { start: 0, end: 0 },

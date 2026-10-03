@@ -111,6 +111,8 @@ fn the_hasher_matches_its_golden_on_every_example_with_the_standard_library(
 
 #[test]
 fn the_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_1_of_2() {
+    // Built first, so the census counts the hashing and not the build of the emitter it runs on.
+    ply_codegen::c::producer::with_current(|_| ());
     ply_codegen::c::producer::reset_census();
     the_hasher_matches_its_golden_on_every_example_with_the_standard_library(0, 2);
     // The standard library is counted once per program, as it is hashed once per program.
