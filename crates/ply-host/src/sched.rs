@@ -35,6 +35,8 @@ fn path_of(op: &str) -> &'static str {
     match op {
         "spawn" => "ply_host::sched::spawn",
         "join" => "ply_host::sched::join",
+        "await" => "ply_host::sched::await",
+        "cancel" => "ply_host::sched::cancel",
         _ => "ply_host::sched::yield",
     }
 }
