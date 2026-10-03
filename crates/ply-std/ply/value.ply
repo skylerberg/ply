@@ -47,10 +47,15 @@ pub fn shown_items() -> Int = 32
 // Nesting past this shows as `…`.
 pub fn shown_depth() -> Int = 16
 
-pub fn render(v: Value) -> String = rendered(v, 0)
+// What a diagnostic shows: past `shown_items` and `shown_depth`, the rest is counted or elided.
+pub fn render(v: Value) -> String = rendered(v, 0, true)
 
-fn rendered(v: Value, depth: Int) -> String =
-  if depth > shown_depth() { "…" } else {
+// What a program shows (`std.show`): every item at every depth, in `render`'s format.
+pub fn render_all(v: Value) -> String = rendered(v, 0, false)
+
+fn rendered(v: Value, depth: Int, bounded: Bool) -> String =
+  if bounded && depth > shown_depth() { "…" } else {
+    let inner = |x: Value| rendered(x, depth + 1, bounded);
     match v {
       VUnit -> "()",
       VBool(b) -> if b { "true" } else { "false" },
@@ -60,14 +65,14 @@ fn rendered(v: Value, depth: Int) -> String =
       VFixed(ty, bits) -> fixed_text(ty, bits),
       VChar(c) -> "'" ++ char_escaped(c) ++ "'",
       VStr(s) -> "\"" ++ escaped(s) ++ "\"",
-      VBytes(b) -> bytes_text(b),
-      VList(items) -> "[" ++ items_text(map(items, |x: Value| rendered(x, depth + 1))) ++ "]",
-      VArray(items) ->
-        "array_of_list([" ++ items_text(map(items, |x: Value| rendered(x, depth + 1))) ++ "])",
-      VRecord(fields) -> record_text(fields, depth),
-      VCtor(name, args) -> if len(args) == 0 { name }
-      else { name ++ "(" ++ joined(map(args, |x: Value| rendered(x, depth + 1)), ", ") ++ ")" },
-      VMap(entries) -> "{" ++ items_text(map(entries, |e: Entry| entry_text(e, depth))) ++ "}",
+      VBytes(b) -> bytes_text(b, bounded),
+      VList(items) -> "[" ++ items_text(map(items, inner), bounded) ++ "]",
+      VArray(items) -> "array_of_list([" ++ items_text(map(items, inner), bounded) ++ "])",
+      VRecord(fields) -> record_text(fields, depth, bounded),
+      VCtor(name, args) -> if len(args) == 0 { simple(name) }
+      else { simple(name) ++ "(" ++ joined(map(args, inner), ", ") ++ ")" },
+      VMap(entries) ->
+        "{" ++ items_text(map(entries, |e: Entry| entry_text(e, depth, bounded)), bounded) ++ "}",
       VFn(f) -> "<fn" ++ fun_text(f) ++ ">",
       VCell(c) -> "<cell @" ++ int_to_string(c.index) ++ "." ++ int_to_string(c.generation) ++ ">",
       VTask(id) -> "<task @" ++ int_to_string(id) ++ ">",
@@ -76,17 +81,25 @@ fn rendered(v: Value, depth: Int) -> String =
     }
   }
 
+// A constructor shows by the name its module declares it under, as source writes it there: where
+// the module stands is no part of the value.
+fn simple(name: String) -> String =
+  match list_at(string_split(name, "."), len(string_split(name, ".")) - 1) {
+    Some(last) -> last,
+    None -> name,
+  }
+
 fn elided(n: Int) -> String = if n == 0 { "…" } else { "… " ++ int_to_string(n) ++ " more" }
 
-fn entry_text(e: Entry, depth: Int) -> String =
+fn entry_text(e: Entry, depth: Int, bounded: Bool) -> String =
   match e.key {
     VElided(n) -> elided(n),
-    k -> rendered(k, depth + 1) ++ ": " ++ rendered(e.value, depth + 1),
+    k -> rendered(k, depth + 1, bounded) ++ ": " ++ rendered(e.value, depth + 1, bounded),
   }
 
 // Past `shown_items`, the rest is counted; a snapshot already cut short says so itself.
-fn items_text(parts: List<String>) -> String =
-  if len(parts) <= shown_items() { joined(parts, ", ") }
+fn items_text(parts: List<String>, bounded: Bool) -> String =
+  if !bounded || len(parts) <= shown_items() { joined(parts, ", ") }
   else { joined(push(take(parts, shown_items()), elided(len(parts) - shown_items())), ", ") }
 
 fn take(xs: List<String>, n: Int) -> List<String> =
@@ -97,11 +110,16 @@ fn joined(parts: List<String>, sep: String) -> String =
     match list_at(parts, i) { Some(p) -> if i == 0 { p } else { acc ++ sep ++ p }, None -> acc })
 
 // A tuple is the record `{_0: a, _1: b}` and shows as one.
-fn record_text(fields: List<Field>, depth: Int) -> String =
+fn record_text(fields: List<Field>, depth: Int, bounded: Bool) -> String =
   if is_tuple(fields) {
-    "(" ++ joined(map(range(0, len(fields)), |i: Int| tuple_item(fields, i, depth)), ", ") ++ ")"
+    "(" ++ joined(map(range(0, len(fields)), |i: Int| tuple_item(fields, i, depth, bounded)), ", ")
+      ++ ")"
   } else {
-    "{" ++ joined(map(fields, |f: Field| f.name ++ ": " ++ rendered(f.value, depth + 1)), ", ")
+    "{"
+      ++ joined(
+        map(fields, |f: Field| f.name ++ ": " ++ rendered(f.value, depth + 1, bounded)),
+        ", ",
+      )
       ++ "}"
   }
 
@@ -114,9 +132,9 @@ fn field_named(fields: List<Field>, name: String) -> Option<Value> =
   fold(fields, None, |acc: Option<Value>, f: Field|
     if f.name == name { Some(f.value) } else { acc })
 
-fn tuple_item(fields: List<Field>, i: Int, depth: Int) -> String =
+fn tuple_item(fields: List<Field>, i: Int, depth: Int, bounded: Bool) -> String =
   match field_named(fields, "_" ++ int_to_string(i)) {
-    Some(v) -> rendered(v, depth + 1),
+    Some(v) -> rendered(v, depth + 1, bounded),
     None -> "",
   }
 
@@ -357,9 +375,10 @@ fn escape_each(b: Bytes, swap: (Int) -> Option<Bytes>) -> Bytes =
       match swap(bytes_at(b, i)) { Some(r) -> r, None -> bytes_slice(b, i, i + 1) }),
   )
 
-fn bytes_text(b: Bytes) -> String = {
+fn bytes_text(b: Bytes, bounded: Bool) -> String = {
   let n = bytes_len(b);
-  let head = if n > shown_items() { bytes_slice(b, 0, shown_items()) } else { b };
+  let cut = bounded && n > shown_items();
+  let head = if cut { bytes_slice(b, 0, shown_items()) } else { b };
   let body = escape_each(head, |c: Int|
     if c == 10 { Some(b"\\n") }
     else if c == 9 { Some(b"\\t") }
@@ -368,7 +387,7 @@ fn bytes_text(b: Bytes) -> String = {
     else if c == 34 { Some(b"\\\"") }
     else if c >= 32 && c <= 126 { None }
     else { Some(bytes_concat(b"\\x", hex2(c))) });
-  let more = if n > shown_items() { " " ++ elided(n - shown_items()) } else { "" };
+  let more = if cut { " " ++ elided(n - shown_items()) } else { "" };
   "b\"" ++ string_of_bytes(body) ++ "\"" ++ more
 }
 
@@ -438,6 +457,21 @@ test "containers nest, a tuple shows as one, and a list past 32 items is counted
     render(VList(map(range(0, 34), |i: Int| VInt(i)))),
     "[" ++ joined(map(range(0, 32), |i: Int| int_to_string(i)), ", ") ++ ", … 2 more]",
   )
+}
+
+test "a constructor shows under the name its module declares, not where the module stands" {
+  assert_eq(render(VCtor("orders.Shipped", [VInt(3)])), "Shipped(3)");
+  assert_eq(render(VCtor("app.models.Red", [])), "Red")
+}
+
+test "render_all writes what render does, every item at every depth" {
+  let long = VList(map(range(0, 40), |i: Int| VInt(i)));
+  assert_eq(
+    render_all(long),
+    "[" ++ joined(map(range(0, 40), |i: Int| int_to_string(i)), ", ") ++ "]",
+  );
+  assert(render(long) != render_all(long));
+  assert_eq(render_all(VCtor("m.Shipped", [VInt(2)])), "Shipped(2)")
 }
 
 test "a snapshot cut short shows where it was cut" {

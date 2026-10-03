@@ -15,7 +15,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, SpecKind, SRequires,
-              SEnsures, SpecClause, Derived, Vis, VPub, VPriv, parse)
+              SEnsures, SpecClause, ReturnsFresh, ReturnsParam, Derived, Vis, VPub, VPriv, parse)
 import rewrite (expand)
 import resolve (Mod, Source, Resolved, Scope, Binding, Bindings, ModBind, Diag, Outcome, Resolved_,
                 Failed, resolve_modules, diag2, lab, is_bare, dump_diags, qualify, default_binder,
@@ -624,6 +624,8 @@ fn t_arm() -> Int = 92
 fn t_clause() -> Int = 93
 fn t_return_clause() -> Int = 94
 fn t_constraint() -> Int = 95
+fn t_returns_fresh() -> Int = 101
+fn t_returns_param() -> Int = 102
 
 // An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -837,10 +839,23 @@ fn fn_def(z: Nz, d: FnDef) -> Nz = {
       Some(dflt) -> expr(opt_type(tag(acc, t_param_default()), p.ty), dflt),
       None -> opt_type(acc, p.ty),
     });
-  let z3: Nz = constraints(opt_row(opt_type(z2, d.ret), d.effects), d.constraints);
+  let z3: Nz = returns(constraints(opt_row(opt_type(z2, d.ret), d.effects), d.constraints), d);
   let z4: Nz = { ..z3, values: append(z3.values, map(d.params, |p: Param| p.name.name)) };
   expr(z4, d.body)
 }
+
+// A `returns` clause names a parameter by its position, so renaming one moves nothing.
+fn returns(z: Nz, d: FnDef) -> Nz =
+  match d.returns {
+    None -> z,
+    Some(ReturnsFresh(_)) -> tag(z, t_returns_fresh()),
+    Some(ReturnsParam(x)) ->
+      u32v(
+        tag(z, t_returns_param()),
+        fold(range(0, len(d.params)), 0, |acc: Int, i: Int|
+          if at(d.params, i).name.name == x.name { i } else { acc }),
+      ),
+  }
 
 // Sorted and deduplicated: the same two constraints in the other order are one definition.
 fn constraints(z: Nz, cs: List<Constraint>) -> Nz = {
@@ -1969,7 +1984,8 @@ fn contract_domain() -> Bytes = b"ply.contract.1"
 fn package_of(index: Index, packages: List<Int>, v: Int) -> Int =
   match list_at(packages, at(index.nodes, v).module) { Some(p) -> p, None -> 0 }
 
-// What another package reads of a definition: its signature and specifications, its body a unit.
+// What another package reads of a definition: its signature and specifications, and its body only
+// when it is `transparent`.
 fn contract_of(index: Index, g: Graph, hashes: Map<Int, Bytes>, v: Int) -> Bytes = {
   let node = at(index.nodes, v);
   match node.body {
@@ -1979,7 +1995,13 @@ fn contract_of(index: Index, g: Graph, hashes: Map<Int, Bytes>, v: Int) -> Bytes
       // Normalizing erases the specifications, which a dependent is owed as much as the types.
       let clauses = map(d.spec, |c: SpecClause|
         encode_item(index, node.module, g.scc, hashes, false, |z: Nz| spec_clause(z, d, c)).bytes);
-      blake3(bytes_concat_all([contract_domain(), signature, bytes_concat_all(clauses)]))
+      // A `transparent` body is read too, so the contract holds the hash of it and all it reaches.
+      let body = match d.transparent {
+        Some(_) ->
+          bytes_concat(b"transparent", match map_get(hashes, v) { Some(h) -> h, None -> b"" }),
+        None -> b"",
+      };
+      blake3(bytes_concat_all([contract_domain(), signature, bytes_concat_all(clauses), body]))
     },
     _ -> match map_get(hashes, v) { Some(h) -> h, None -> b"" },
   }
@@ -4252,6 +4274,19 @@ test "renaming a definition does not move its hash, and a change to a callee doe
   assert(dumped_hash(a, b"m.f") != dumped_hash(c, b"m.f"))
 }
 
+test "an interpolated string hashes as the concatenation it stands for" {
+  let shown = { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" };
+  let a = hash_dump([shown, { name: b"m", src: b"fn f(x: Int) -> String = f\"a {x} b\"" }]);
+  let b = hash_dump([
+    shown,
+    {
+      name: b"m",
+      src: b"import std.show\nfn f(x: Int) -> String = \"a \" ++ show::display(x) ++ \" b\"",
+    },
+  ]);
+  assert_eq(dumped_hash(a, b"m.f"), dumped_hash(b, b"m.f"))
+}
+
 test "a record update of another module's record hashes stably, and follows that module's type" {
   let app = b"import shapes\npub fn bumped() -> shapes::P = { let p = shapes::mk(); {..p, a: 3} }";
   let narrow = [
@@ -4390,12 +4425,13 @@ test "every deriver a constraint names prints back and hashes back to what it wa
     indexed([
       {
         name: b"app",
-        src: b"pub fn j<a>(x: a) -> a where derivable(json, a) = x\npub fn e<a>(x: a) -> a where derivable(eq, a) = x\npub fn o<a>(x: a) -> a where derivable(ord, a) = x\npub fn b<a>(x: a) -> a where derivable(bin, a) = x",
+        src: b"pub fn j<a>(x: a) -> a where derivable(json, a) = x\npub fn e<a>(x: a) -> a where derivable(eq, a) = x\npub fn o<a>(x: a) -> a where derivable(ord, a) = x\npub fn b<a>(x: a) -> a where derivable(bin, a) = x\npub fn s<a>(x: a) -> a where derivable(show, a) = x",
       },
     ]),
   );
   let ms = printed_of(out, []);
   assert(holds_text(at(ms, 0).text, b"derivable(bin, "));
+  assert(holds_text(at(ms, 0).text, b"derivable(show, "));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
