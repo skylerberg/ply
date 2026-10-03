@@ -2,7 +2,7 @@
 //! source that answer's indices run over, and the C of its unit, in the value codec this runtime
 //! reads, compressed. A program writes one through `shipped.runnable`; reading one runs no compiler.
 
-use crate::driver::{FrontFile, HandedFront};
+use crate::driver::{LoadedAnalysis, LoadedFile};
 use crate::payload::record;
 use ply_eval::decode::At;
 use ply_eval::{SourceId, Value};
@@ -15,19 +15,19 @@ const FORMAT: &str = "ply runnable 1";
 /// A program read back from its runnable.
 pub struct Runnable {
     pub entry: String,
-    pub front: HandedFront,
+    pub front: LoadedAnalysis,
     /// The unit's C.
     pub unit: String,
 }
 
 /// The runnable of the program `entry` enters: `files` and `dump` as its front end answered them,
-/// and `unit`, its C. Two builds of one program write the same bytes.
+/// and `unit`, its C. The same arguments write the same bytes.
 pub fn encode(entry: &str, files: &Value, dump: &Value, unit: &[u8]) -> Result<Vec<u8>, String> {
     let encoded = ply_eval::codec::encode(&record(vec![
         ("format", Value::str(FORMAT)),
         ("entry", Value::str(entry)),
         ("files", files.clone()),
-        ("dump", canonical(dump)),
+        ("dump", dump.clone()),
         ("unit", Value::bytes(unit)),
     ]))?;
     let mut packed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -35,43 +35,44 @@ pub fn encode(entry: &str, files: &Value, dump: &Value, unit: &[u8]) -> Result<V
     packed.finish().map_err(|e| e.to_string())
 }
 
-/// The front end's answer as a runnable holds it. What a load walked and what it warned of are
-/// functions of the caches it read as much as of the program, and a program that checked runs
-/// without either, so a runnable keeps neither.
-fn canonical(dump: &Value) -> Value {
-    let Value::Record(fields) = dump else {
-        return dump.clone();
+fn value_of(bytes: &[u8]) -> Result<Value, String> {
+    let mut encoded = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_end(&mut encoded)
+        .map_err(|e| format!("it is not compressed as a runnable is: {e}"))?;
+    ply_eval::codec::decode(&encoded)
+}
+
+/// The front end's answer `bytes` hold, as the value a program hands `machine.load`.
+pub fn front_value(bytes: &[u8]) -> Result<Value, String> {
+    let value = value_of(bytes)?;
+    let at = At::new("a runnable", &value);
+    let field = |name: &str| {
+        at.field(name)
+            .map(|f| f.value().clone())
+            .map_err(|e| e.to_string())
     };
-    record(
-        fields
-            .iter()
-            .map(|(name, value)| {
-                let kept = match name.as_str() {
-                    "walked" => Value::bytes(b""),
-                    "diags" => Value::list(Vec::new()),
-                    _ => value.clone(),
-                };
-                (name.as_str(), kept)
-            })
-            .collect(),
-    )
+    Ok(record(vec![
+        ("dump", field("dump")?),
+        ("files", field("files")?),
+        ("read_ms", Value::Int(0)),
+        ("front_ms", Value::Int(0)),
+        ("file_ms", Value::Int(0)),
+        ("cached", Value::Bool(false)),
+    ]))
 }
 
 /// The program `bytes` hold, or why they hold none.
 pub fn decode(bytes: &[u8]) -> Result<Runnable, String> {
     let started = Instant::now();
-    let mut encoded = Vec::new();
-    flate2::read::GzDecoder::new(bytes)
-        .read_to_end(&mut encoded)
-        .map_err(|e| format!("it is not compressed as a runnable is: {e}"))?;
-    let value = ply_eval::codec::decode(&encoded)?;
+    let value = value_of(bytes)?;
     let at = At::new("a runnable", &value);
     let read = || -> Result<Runnable, ply_eval::decode::Error> {
         if at.field("format")?.str()? != FORMAT {
             return Err(at.error("a runnable of another format"));
         }
         let files = at.field("files")?.items(|file| {
-            Ok(FrontFile {
+            Ok(LoadedFile {
                 path: file.field("path")?.str()?.to_string(),
                 name: file.field("name")?.str()?.to_string(),
                 text: String::from_utf8_lossy(file.field("text")?.bytes()?).into_owned(),
@@ -84,7 +85,7 @@ pub fn decode(bytes: &[u8]) -> Result<Runnable, String> {
             .map_err(|_| at.error("its unit's C is not UTF-8"))?;
         Ok(Runnable {
             entry: at.field("entry")?.str()?.to_string(),
-            front: HandedFront {
+            front: LoadedAnalysis {
                 answer,
                 files,
                 read: Duration::ZERO,

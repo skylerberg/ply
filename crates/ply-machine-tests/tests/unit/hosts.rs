@@ -1,7 +1,6 @@
 use self::fixture::{op, receives_secrets, registry};
-use ply_codegen::c::producer;
 use ply_eval::host::{HostListing, HostRegistry, HostResource, Linearity};
-use ply_eval::{CheckOutput, Footprint, Resource, SourceId, Symbol};
+use ply_eval::{CheckOutput, Footprint, Resource, Symbol};
 use ply_host::tls;
 use ply_machine::config::Configuration;
 use ply_machine::hosts::*;
@@ -81,9 +80,7 @@ fn stamp() -> Instant / {clock.read} = clock.now()
 "#;
 
 fn check(source: &str) -> CheckOutput {
-    producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
-        .expect("the fixture typechecks")
-        .check
+    crate::answered::checked("m", source).check
 }
 
 fn full() -> HostRegistry {
@@ -127,9 +124,9 @@ fn the_listing_names_every_resource_an_any_handler_got() {
         triples,
         [
             "clock.now",
-            "db.get[orders]",
-            "db.get[users]",
-            "db.put[orders]"
+            "m.db.get[orders]",
+            "m.db.get[users]",
+            "m.db.put[orders]"
         ]
     );
     assert_eq!(listing.handlers, 3);

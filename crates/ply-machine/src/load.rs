@@ -1,11 +1,9 @@
-//! Turning a path into the front end's checked answer.
+//! A program as a machine holds it: the front end's checked answer over the sources it names.
 
 use crate::driver::FrontEnd;
-pub use crate::driver::Seeded;
-use ply_codegen::c::producer::KnownRows;
 use ply_eval::{
-    CheckOutput, DefInfo, Diagnostic, Front, HashOutput, ModuleInfo, ModuleName, SourceId,
-    SourceMap, Span, Symbol, TestInfo, codes,
+    Analysis, CheckOutput, DefInfo, Diagnostic, HashOutput, ModuleInfo, ModuleName, SourceId,
+    SourceMap, Symbol, TestInfo, codes,
 };
 use std::path::{Component, Path, PathBuf};
 
@@ -22,11 +20,10 @@ pub struct Loaded {
     /// One entry per module, sorted.
     pub files: Vec<Found>,
     pub sources: SourceMap,
-    /// Handed to `ply_codegen::Unit::over_front` so one invocation runs one front end.
-    pub front: std::sync::Arc<Front>,
-    /// [`Front::check`].
+    pub front: std::sync::Arc<Analysis>,
+    /// [`Analysis::check`].
     pub check: CheckOutput,
-    /// [`Front::hashes`].
+    /// [`Analysis::hashes`].
     pub hashes: HashOutput,
     pub frontend: FrontEnd,
 }
@@ -36,15 +33,6 @@ pub struct Loaded {
 pub struct LoadError {
     pub sources: SourceMap,
     pub diagnostics: Vec<Diagnostic>,
-}
-
-impl LoadError {
-    pub(crate) fn bare(diagnostics: Vec<Diagnostic>) -> LoadError {
-        LoadError {
-            sources: SourceMap::new(),
-            diagnostics,
-        }
-    }
 }
 
 /// A module and the file it was read from, which the AST does not record.
@@ -196,93 +184,6 @@ pub fn project_root(path: &Path) -> PathBuf {
     }
 }
 
-/// A program's load of a program of its own, from scratch: no cache is read and none is written.
-pub fn load(path: &Path) -> Result<Loaded, LoadError> {
-    crate::driver::run(path)
-}
-
-/// [`load`] seeded with the rows an earlier load of the same program published, answering what the
-/// next process takes in its place: the rows this one published and the front it answered.
-pub fn load_seeded(path: &Path, known: KnownRows) -> Result<Seeded, LoadError> {
-    crate::driver::run_seeded(path, known)
-}
-
-pub(crate) struct Discovered {
-    pub(crate) path: PathBuf,
-    /// Relative to the project root; names the module.
-    pub(crate) relative: PathBuf,
-}
-
-pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Diagnostic>> {
-    let meta = std::fs::metadata(path).map_err(|e| vec![unreadable(path, &e)])?;
-
-    if meta.is_file() {
-        let root = project_root(path);
-        let path = tidy(path);
-        let relative = path
-            .file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.clone());
-        return Ok((root, vec![Discovered { path, relative }]));
-    }
-
-    let mut files = Vec::new();
-    collect(path, &mut files).map_err(|e| vec![unreadable(path, &e)])?;
-    files.sort();
-
-    if files.is_empty() {
-        return Err(vec![
-            Diagnostic::error(
-                codes::RUNTIME_ERROR,
-                format!("no `.ply` files under `{}`", path.display()),
-            )
-            .primary(Span::DUMMY, "nothing to compile")
-            .note("name a `.ply` file, or a directory that contains one")
-            .note("directories whose name starts with `.` are not searched"),
-        ]);
-    }
-
-    let root = tidy(path);
-    let discovered = files
-        .into_iter()
-        .map(|path| {
-            let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-            Discovered { path, relative }
-        })
-        .collect();
-    Ok((root, discovered))
-}
-
-/// Every `.ply` file under `root`, sorted.
-pub fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect(root, &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-/// Skips hidden directories, which keeps `.ply-cache` and VCS metadata out.
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = tidy(&entry.path());
-        let file_type = entry.file_type()?;
-
-        if file_type.is_dir() {
-            let hidden = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'));
-            if !hidden {
-                collect(&path, out)?;
-            }
-        } else if file_type.is_file() && path.extension().is_some_and(|e| e == "ply") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// A path with every `.` component dropped, which is how it is recorded, rendered in a span and
 /// keyed in the cache: `./m.ply` and `m.ply` are one file, and only one of them is a spelling a
 /// reader can compare. A path that is nothing but `.` keeps it — the empty path names no
@@ -299,36 +200,4 @@ pub fn tidy(path: &Path) -> PathBuf {
         return PathBuf::from(".");
     }
     out
-}
-
-/// [`ModuleName::from_relative_path`] has no source to point at.
-pub(crate) fn anchor(
-    mut diagnostic: Diagnostic,
-    sources: &SourceMap,
-    source: SourceId,
-) -> Diagnostic {
-    let end = sources
-        .get(source)
-        .map(|f| f.text.find('\n').unwrap_or(f.text.len()) as u32)
-        .unwrap_or(0);
-    let span = Span::new(source, 0, end);
-    for label in &mut diagnostic.labels {
-        if label.span.is_dummy() {
-            label.span = span;
-        }
-    }
-    diagnostic
-}
-
-pub(crate) fn unreadable(path: &Path, e: &std::io::Error) -> Diagnostic {
-    let mut diag = Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("could not read `{}`: {e}", path.display()),
-    )
-    .primary(Span::DUMMY, "this path could not be loaded");
-
-    if e.kind() == std::io::ErrorKind::NotFound {
-        diag = diag.note("pass a `.ply` file or a directory containing one; the default is `.`");
-    }
-    diag
 }

@@ -2,11 +2,11 @@
 // that takes the flag resolves it here, over the program it loaded, before it configures a machine,
 // and `ply build` ships what it resolves; the machine only evaluates the definition.
 
-import compiler.diag (parse_all)
-import compiler.front (Whole, Analysed, Refused, analyse, module_of)
+import compiler.diagnostics (parse_all)
+import compiler.front (Analysis, Analysed, Refused, analyse, module_of)
 import compiler.infer (DefInfo)
-import compiler.resolve (Diag, diag1)
-import compiler.tycore (Type, TyCon, TyFn, TyRecord, field_get, row_text, type_text)
+import compiler.resolve (Diag, error_at)
+import compiler.types (Type, TyCon, TyFn, TyRecord, field_get, row_text, type_text)
 import entry (no_module)
 import report (count_of)
 import std.list (sort)
@@ -17,7 +17,7 @@ fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
 fn flag(name: String) -> String = "`--config-schema " ++ name ++ "`"
 
 fn refused(message: String, notes: List<Bytes>) -> Diag =
-  diag1(
+  error_at(
     b"E0440",
     no_module(),
     { start: 0, end: 0 },
@@ -59,28 +59,31 @@ fn returns_spec(t: Type) -> Bool =
     _ -> false,
   }
 
-// Why `d` cannot be a schema, when it cannot: a schema is called with nothing, answers a spec, and
+// Why `def_info` cannot be a schema, when it cannot: a schema is called with nothing, answers a spec, and
 // performs nothing, since it is read before anything is bound.
-fn unfit(d: DefInfo) -> Option<String> =
-  match d.scheme.ty {
+fn unfit(def_info: DefInfo) -> Option<String> =
+  match def_info.scheme.ty {
     TyFn(f) -> if len(f.params) > 0 {
       Some(
         "it takes " ++ count_of(len(f.params), "argument") ++ ", and the run has nothing to pass",
       )
     } else if !returns_spec(f.ret) {
       Some("it returns `" ++ text(type_text(f.ret)) ++ "` rather than a `ConfigSpec`")
-    } else if len(d.footprint) > 0 {
+    } else if len(def_info.footprint) > 0 {
       Some(
-        "its row is `" ++ text(row_text({ atoms: d.footprint, tail: None }))
+        "its row is `" ++ text(row_text({ atoms: def_info.footprint, tail: None }))
           ++ "`, and the schema is read before anything is bound, so it must be pure",
       )
     } else { None },
     _ -> Some("it is not a function, and a schema is materialised by calling one"),
   }
 
-fn unknown(w: Whole, name: String) -> Diag = {
+fn unknown(analysis: Analysis, name: String) -> Diag = {
   let found = sort(
-    map(filter(w.checked.defs, |d: DefInfo| unfit(d) == None), |d: DefInfo| text(d.name)),
+    map(
+      filter(analysis.checked.defs, |def_info: DefInfo| unfit(def_info) == None),
+      |def_info: DefInfo| text(def_info.name),
+    ),
   );
   let notes = if len(found) == 0 {
     [
@@ -99,21 +102,24 @@ fn not_a_schema(name: String, why: String) -> Diag =
   ])
 
 fn defined(defs: List<DefInfo>, name: String) -> Option<DefInfo> =
-  fold(defs, None, |found: Option<DefInfo>, d: DefInfo|
-    match found { Some(_) -> found, None -> if text(d.name) == name { Some(d) } else { None } })
+  fold(defs, None, |found: Option<DefInfo>, def_info: DefInfo|
+    match found {
+      Some(_) -> found,
+      None -> if text(def_info.name) == name { Some(def_info) } else { None },
+    })
 
 // The definition the flag names, checked to be one a schema is materialised from.
-pub fn resolved(w: Whole, name: String) -> Result<String, Diag> =
+pub fn resolved(analysis: Analysis, name: String) -> Result<String, Diag> =
   match spelled(name) {
     Err(d) -> Err(d),
-    Ok(_) -> match defined(w.checked.defs, name) {
-      None -> Err(unknown(w, name)),
+    Ok(_) -> match defined(analysis.checked.defs, name) {
+      None -> Err(unknown(analysis, name)),
       Some(d) -> match unfit(d) { Some(why) -> Err(not_a_schema(name, why)), None -> Ok(name) },
     },
   }
 
 // What a command refuses before it configures a machine over `w`: nothing when no schema is named.
-pub fn refusal(w: Whole, named: Option<String>) -> Option<Diag> =
+pub fn refusal(w: Analysis, named: Option<String>) -> Option<Diag> =
   match named {
     None -> None,
     Some(name) -> match resolved(w, name) { Ok(_) -> None, Err(d) -> Some(d) },
@@ -128,13 +134,13 @@ pub fn misspelled(named: Option<String>) -> Option<Diag> =
 
 // --- Tests ------------------------------------------------------------------
 
-fn whole_of(src: Bytes) -> Whole =
+fn whole_of(src: Bytes) -> Analysis =
   match analyse(parse_all([{ name: b"m", src: src }])) {
     Refused(_) -> panic("the fixture checks"),
     Analysed(w) -> w,
   }
 
-fn specs() -> Whole =
+fn specs() -> Analysis =
   whole_of(
     b"type Shape = | SText | SInt | SBool | SSecret\ntype Key = { name: String, shape: Shape, required: Bool, default: Option<String> }\ntype ConfigSpec = { keys: List<Key> }\neffect log { write emit(Bytes) -> Unit }\nfn config() -> ConfigSpec = { keys: [] }\nfn two(a: Int) -> ConfigSpec = { keys: [] }\nfn number() -> Int = 1\nfn loud() -> ConfigSpec / {log.write} = { log.emit(b\"x\"); config() }\n",
   )

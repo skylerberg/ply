@@ -53,8 +53,6 @@ cargo nextest run --workspace
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.
-Tests that must run alone are `SOLO` in `.github/ci-shards.sh`, run after the gates; run one
-with `cargo nextest run --workspace -E "$(.github/ci-shards.sh solo-filter <id>)"`.
 The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
 each `lanes` job runs a partition of them, apart from the `nextest` jobs, and the `corpus` jobs `desks-<k>`
 run the tests of `serving` and `database`, cut by duration, against a postgres. `.github/ci-corpus.sh run <id>`
@@ -67,10 +65,11 @@ name a server.
 The compiler is Ply source under `crates/ply-compiler/ply`. Its builder, the
 compiler's own `build.main`, is committed as `crates/ply-compiler/bootstrap/build.run`
 beside `build.digest`: a runnable, the front end's answer and the unit's C, which the
-launcher enters without running a compiler; `unit.c.gz` beside `SOURCES.digest` holds the same
-unit as the library the runtime's emitter is built from. A binary whose builder is behind its
+launcher enters without running a compiler. A binary whose builder is behind its
 sources has the committed builder build theirs once, keeps it under the stages,
 and builds `ply` (`crates/ply-cli/bootstrap/ply.run`) with it when that is behind
 too. So the compiler and the shipped modules it imports cannot use a language rule
-the same change introduces; the rest of the standard library can. Never commit the
+the same change introduces; the rest of the standard library can. Likewise the
+runtime reads the front end's answer the committed builder carries, so it can come
+to require a field of one only once main's builder writes it. Never commit the
 runnables: CI rebuilds them on main after each merge.

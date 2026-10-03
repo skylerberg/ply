@@ -3,6 +3,7 @@
 // drives it, and a connection pool is not something a program can hold. Everything below decides
 // what that value says.
 
+import compiler.load (LoadedAnalysis)
 import args (Flags, no_flags, style_of)
 import config_schema
 import configuration
@@ -11,12 +12,11 @@ import env (env)
 import std.value (Value)
 import program (Timed, front_of, no_front, timed_uncached)
 import builder (builder)
-import cache (Front)
 import std.fs (fs, Missing)
 import std.time (time)
 import compiler.resolve (Diag)
 import diagnostic (Place, all_to_json, all_to_text)
-import report (Answer, schema_version, ok_code, compile_error, ind, count_of, refused)
+import report (Answer, schema_version, ok_code, compile_error, indent, count_of, refused)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string)
 import machine
 import units
@@ -26,14 +26,14 @@ import style (Style, plain, red)
 // The trusted computing base, as the Rust side assembles it under the host flags.
 pub nondet effect tcb {
   // The value of the nullary definition `--config-schema` names, entered on the program's unit.
-  read schema[r](root: String, front: Front, unit: Bytes, name: String) -> Result<Value, List<Diag>>
-  read preview[r](root: String, options: machine::Options, front: Front, config: machine::Configured) -> Previewed
+  read schema[r](root: String, front: LoadedAnalysis, unit: Bytes, name: String) -> Result<Value, List<Diag>>
+  read preview[r](root: String, options: machine::Options, front: LoadedAnalysis, config: machine::Configured) -> Previewed
 }
 
 // `tcb` answered from what it is handed alone: a preview that reads a credential is refused.
 pub effect hermetic_tcb {
-  read schema[r](root: String, front: Front, unit: Bytes, name: String) -> Result<Value, List<Diag>>
-  read preview[r](root: String, options: machine::Options, front: Front, config: machine::Configured) -> Previewed
+  read schema[r](root: String, front: LoadedAnalysis, unit: Bytes, name: String) -> Result<Value, List<Diag>>
+  read preview[r](root: String, options: machine::Options, front: LoadedAnalysis, config: machine::Configured) -> Previewed
 }
 
 // --- What the Rust side answers with ----------------------------------------
@@ -187,14 +187,14 @@ fn abbreviate(fingerprint: String) -> String = {
 
 fn headers() -> List<String> = ["OPERATION", "HANDLER", "DET", "LINEAR", "BLOCKING", "SECRETS"]
 
-fn cells(r: Row) -> List<String> =
+fn cells(row: Row) -> List<String> =
   [
-    r.triple,
-    r.handler,
-    yes_no(r.deterministic),
-    linear_text(r.linear),
-    yes_no(r.blocking),
-    yes_no(r.secrets),
+    row.triple,
+    row.handler,
+    yes_no(row.deterministic),
+    linear_text(row.linear),
+    yes_no(row.blocking),
+    yes_no(row.secrets),
   ]
 
 fn widths(rows: List<List<String>>) -> List<Int> =
@@ -251,37 +251,38 @@ fn filesystem_lines(f: Filesystem) -> List<String> =
   if len(f.roots) == 0 {
     ["", "filesystem", "none — an `fs` operation is E0451 until `--fs NAME=PATH` binds its label"]
   } else {
-    let width = fold(f.roots, 0, |acc: Int, r: machine::Named| wider(acc, string_len(r.name)));
-    fold(f.roots, ["", "filesystem"], |acc: List<String>, r: machine::Named|
-      push(acc, padded(r.name, width) ++ "  " ++ r.path))
+    let width = fold(f.roots, 0, |acc: Int, named: machine::Named|
+      wider(acc, string_len(named.name)));
+    fold(f.roots, ["", "filesystem"], |acc: List<String>, named: machine::Named|
+      push(acc, padded(named.name, width) ++ "  " ++ named.path))
   }
 
-fn config_schema_line(c: Report) -> String =
-  match c.schema {
+fn config_schema_line(report: Report) -> String =
+  match report.schema {
     None ->
       "schema     none — without `--config-schema` a missing key is a `None` at the call site, later and per key",
     Some(v) ->
       "schema     " ++ v.function ++ " · " ++ count_of(len(v.keys), "key") ++ " · "
-        ++ int_to_string(c.resolved)
+        ++ int_to_string(report.resolved)
         ++ " resolved · "
-        ++ int_to_string(c.secret)
+        ++ int_to_string(report.secret)
         ++ " secret",
   }
 
-fn configuration_lines(c: Report) -> List<String> = {
+fn configuration_lines(report: Report) -> List<String> = {
   let head = [
     "",
     "configuration",
-    "sources    --set " ++ int_to_string(c.sets) ++ " · --config "
-      ++ count_of(len(c.files), "file")
+    "sources    --set " ++ int_to_string(report.sets) ++ " · --config "
+      ++ count_of(len(report.files), "file")
       ++ " · environment "
-      ++ int_to_string(c.environment)
+      ++ int_to_string(report.environment)
       ++ " · defaults "
-      ++ int_to_string(c.defaults),
-    config_schema_line(c),
+      ++ int_to_string(report.defaults),
+    config_schema_line(report),
   ];
-  if c.resolved == 0 { head } else {
-    let keys = map(c.keys, |k: ReportKey| k.name ++ "=" ++ k.value ++ " (" ++ k.source ++ ")");
+  if report.resolved == 0 { head } else {
+    let keys = map(report.keys, |k: ReportKey| k.name ++ "=" ++ k.value ++ " (" ++ k.source ++ ")");
     push(head, "keys       " ++ joined(keys, " · "))
   }
 }
@@ -308,50 +309,50 @@ fn shutdown_lines(t: Stopping) -> List<String> =
       ++ "ms · second signal exits 130/143",
   ]
 
-fn disclosure_lines(p: Preview) -> List<String> = {
-  let after_transport = optional([], p.transport, transport_lines);
-  let after_fs = optional(after_transport, p.filesystem, filesystem_lines);
-  let after_config = optional(after_fs, p.configuration, configuration_lines);
-  let after_trace = optional(after_config, p.observability, observability_lines);
-  optional(after_trace, p.shutdown, shutdown_lines)
+fn disclosure_lines(preview: Preview) -> List<String> = {
+  let after_transport = optional([], preview.transport, transport_lines);
+  let after_fs = optional(after_transport, preview.filesystem, filesystem_lines);
+  let after_config = optional(after_fs, preview.configuration, configuration_lines);
+  let after_trace = optional(after_config, preview.observability, observability_lines);
+  optional(after_trace, preview.shutdown, shutdown_lines)
 }
 
 // --- The two listings -------------------------------------------------------
 
-fn listing_lines(p: Preview) -> List<String> = {
+fn listing_lines(preview: Preview) -> List<String> = {
   let head = [
-    count_of(p.handlers, "host handler") ++ " · " ++ count_of(len(p.rows), "operation")
+    count_of(preview.handlers, "host handler") ++ " · " ++ count_of(len(preview.rows), "operation")
       ++ " · trusted computing base",
     "",
   ];
-  let body = if len(p.rows) == 0 { push(head, empty_note(p.handlers)) }
-  else { appended(head, table(p.rows)) };
-  push(push(appended(body, disclosure_lines(p)), ""), "digest: " ++ p.digest)
+  let body = if len(preview.rows) == 0 { push(head, empty_note(preview.handlers)) }
+  else { appended(head, table(preview.rows)) };
+  push(push(appended(body, disclosure_lines(preview)), ""), "digest: " ++ preview.digest)
 }
 
-fn would_bind(p: Preview) -> String =
-  if len(p.rows) == 0 { empty_note(p.handlers) } else {
-    count_of(len(p.rows), "operation")
+fn would_bind(preview: Preview) -> String =
+  if len(preview.rows) == 0 { empty_note(preview.handlers) } else {
+    count_of(len(preview.rows), "operation")
       ++ " would bind under `--host`; run `ply hosts --host` to list them"
   }
 
-fn hermetic_lines(p: Preview) -> List<String> =
-  ["hermetic — no host handler is bound", "", would_bind(p)]
+fn hermetic_lines(preview: Preview) -> List<String> =
+  ["hermetic — no host handler is bound", "", would_bind(preview)]
 
 // --- The JSON ---------------------------------------------------------------
 
-fn row_json(r: Row) -> Json =
+fn row_json(row: Row) -> Json =
   object([
-    { key: "effect", value: Str(r.effect) },
-    { key: "operation", value: Str(r.op) },
-    { key: "resource", value: opt_str(r.resource) },
-    { key: "triple", value: Str(r.triple) },
-    { key: "handler", value: Str(r.handler) },
-    { key: "deterministic", value: Bool(r.deterministic) },
-    { key: "linearity", value: Str(linear_json(r.linear)) },
-    { key: "blocking", value: Bool(r.blocking) },
-    { key: "secrets", value: Bool(r.secrets) },
-    { key: "declared_nondet", value: Bool(r.declared_nondet) },
+    { key: "effect", value: Str(row.effect) },
+    { key: "operation", value: Str(row.op) },
+    { key: "resource", value: opt_str(row.resource) },
+    { key: "triple", value: Str(row.triple) },
+    { key: "handler", value: Str(row.handler) },
+    { key: "deterministic", value: Bool(row.deterministic) },
+    { key: "linearity", value: Str(linear_json(row.linear)) },
+    { key: "blocking", value: Bool(row.blocking) },
+    { key: "secrets", value: Bool(row.secrets) },
+    { key: "declared_nondet", value: Bool(row.declared_nondet) },
   ])
 
 fn transport_json(t: Transport) -> Json =
@@ -387,8 +388,11 @@ fn filesystem_json(f: Filesystem) -> Json =
     {
       key: "roots",
       value: Array(
-        map(f.roots, |r: machine::Named|
-          object([{ key: "name", value: Str(r.name) }, { key: "path", value: Str(r.path) }])),
+        map(f.roots, |named: machine::Named|
+          object([
+            { key: "name", value: Str(named.name) },
+            { key: "path", value: Str(named.path) },
+          ])),
       ),
     },
   ])
@@ -408,56 +412,57 @@ fn shutdown_json(t: Stopping) -> Json =
     { key: "drain_ms", value: num(t.drain_ms) },
   ])
 
-fn report_json(p: Preview) -> Json = {
+fn report_json(preview: Preview) -> Json = {
   let head: List<Member> = [
     { key: "command", value: Str("hosts") },
     { key: "schema_version", value: num(schema_version()) },
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: num(ok_code()) },
-    { key: "root", value: Str(p.root) },
-    { key: "binding", value: Str(if p.hermetic { "hermetic" } else { "host" }) },
-    { key: "handlers", value: num(p.handlers) },
-    { key: "operations", value: num(len(p.rows)) },
-    { key: "digest", value: Str(p.digest) },
-    { key: "hosts", value: Array(map(p.rows, row_json)) },
+    { key: "root", value: Str(preview.root) },
+    { key: "binding", value: Str(if preview.hermetic { "hermetic" } else { "host" }) },
+    { key: "handlers", value: num(preview.handlers) },
+    { key: "operations", value: num(len(preview.rows)) },
+    { key: "digest", value: Str(preview.digest) },
+    { key: "hosts", value: Array(map(preview.rows, row_json)) },
   ];
-  let after_transport = block(head, "transport", mapped(p.transport, transport_json));
-  let after_fs = block(after_transport, "filesystem", mapped(p.filesystem, filesystem_json));
+  let after_transport = block(head, "transport", mapped(preview.transport, transport_json));
+  let after_fs = block(after_transport, "filesystem", mapped(preview.filesystem, filesystem_json));
   let after_config = block(
     after_fs,
     "configuration",
-    mapped(p.configuration, configuration::report_json),
+    mapped(preview.configuration, configuration::report_json),
   );
   let after_trace = block(
     after_config,
     "observability",
-    mapped(p.observability, observability_json),
+    mapped(preview.observability, observability_json),
   );
-  let stopping = block(after_trace, "shutdown", mapped(p.shutdown, shutdown_json));
-  object(push(stopping, { key: "diagnostics", value: all_to_json(p.diags, p.places) }))
+  let stopping = block(after_trace, "shutdown", mapped(preview.shutdown, shutdown_json));
+  object(push(stopping, { key: "diagnostics", value: all_to_json(preview.diags, preview.places) }))
 }
 
 // --- The three refusals -----------------------------------------------------
 
 // A registration that does not resolve against the program: nothing bound and nothing ran.
-fn unresolved(s: Style, p: Preview) -> Answer =
+fn unresolved(style: Style, preview: Preview) -> Answer =
   {
     json: object([
       { key: "command", value: Str("hosts") },
       { key: "schema_version", value: num(schema_version()) },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: num(compile_error()) },
-      { key: "root", value: Str(p.root) },
-      { key: "diagnostics", value: all_to_json(p.diags, p.places) },
+      { key: "root", value: Str(preview.root) },
+      { key: "diagnostics", value: all_to_json(preview.diags, preview.places) },
     ]),
     lines: [],
-    errs: all_to_text(s, p.diags, p.places),
+    errs: all_to_text(style, preview.diags, preview.places),
     code: compile_error(),
   }
 
 // A facility the flags named that could not be opened: the same, with the tally under it.
-fn unbound(s: Style, diags: List<Diag>, places: List<Place>) -> Answer = {
-  let tally = ind() ++ red(s, "no host handler was bound") ++ " (" ++ count_of(len(diags), "error")
+fn unbound(style: Style, diags: List<Diag>, places: List<Place>) -> Answer = {
+  let tally = indent() ++ red(style, "no host handler was bound") ++ " ("
+    ++ count_of(len(diags), "error")
     ++ ")";
   {
     json: object([
@@ -468,7 +473,7 @@ fn unbound(s: Style, diags: List<Diag>, places: List<Place>) -> Answer = {
       { key: "diagnostics", value: all_to_json(diags, places) },
     ]),
     lines: [],
-    errs: push(all_to_text(s, diags, places), tally),
+    errs: push(all_to_text(style, diags, places), tally),
     code: compile_error(),
   }
 }
@@ -476,19 +481,19 @@ fn unbound(s: Style, diags: List<Diag>, places: List<Place>) -> Answer = {
 // --- The command ------------------------------------------------------------
 
 fn indented(lines: List<String>) -> List<String> =
-  map(lines, |l: String| if l == "" { "" } else { ind() ++ l })
+  map(lines, |l: String| if l == "" { "" } else { indent() ++ l })
 
 // The listing opens on a blank line, as every other report does.
-fn text_lines(p: Preview) -> List<String> = {
-  let body = if p.hermetic { hermetic_lines(p) } else { listing_lines(p) };
+fn text_lines(preview: Preview) -> List<String> = {
+  let body = if preview.hermetic { hermetic_lines(preview) } else { listing_lines(preview) };
   appended([""], indented(body))
 }
 
 // `--digest` is the one line a CI check pins: not the listing, and not the warnings under it.
-fn answered(s: Style, flags: Flags, p: Preview) -> Answer = {
-  let lines = if flags.digest { [p.digest] } else { text_lines(p) };
-  let errs = if flags.digest { [] } else { all_to_text(s, p.diags, p.places) };
-  { json: report_json(p), lines: lines, errs: errs, code: ok_code() }
+fn answered(style: Style, flags: Flags, preview: Preview) -> Answer = {
+  let lines = if flags.digest { [preview.digest] } else { text_lines(preview) };
+  let errs = if flags.digest { [] } else { all_to_text(style, preview.diags, preview.places) };
+  { json: report_json(preview), lines: lines, errs: errs, code: ok_code() }
 }
 
 pub fn run(
@@ -508,7 +513,7 @@ pub fn run(
 
 // The preview the Rust side assembled, with the configuration this side resolved: shown only when a
 // source was read, and its warnings the binding's.
-fn shown(p: Previewed, r: Resolution) -> Preview =
+fn shown(p: Previewed, resolution: Resolution) -> Preview =
   {
     stage: p.stage,
     root: p.root,
@@ -518,22 +523,22 @@ fn shown(p: Previewed, r: Resolution) -> Preview =
     hermetic: p.hermetic,
     transport: p.transport,
     filesystem: p.filesystem,
-    configuration: if configuration::opened(r.configuration) {
-      Some(configuration::report(r.configuration))
+    configuration: if configuration::opened(resolution.configuration) {
+      Some(configuration::report(resolution.configuration))
     } else { None },
     observability: p.observability,
     shutdown: p.shutdown,
-    diags: appended(r.warnings, p.diags),
+    diags: appended(resolution.warnings, p.diags),
     places: p.places,
   }
 
 // The binding, over the front end `run` loaded: its configuration first, whose schema the program's
 // own unit enters, then what the host flags open.
 fn binding_over(
-  s: Style,
+  style: Style,
   flags: Flags,
   options: machine::Options,
-  front: Front,
+  front: LoadedAnalysis,
   places: List<Place>,
 ) -> Answer / {tcb.schema[host], tcb.preview[host], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit} =
   match configuration::opened_by(options.host, options.config, |name: String|
@@ -541,7 +546,7 @@ fn binding_over(
         Err(diags) -> Err(diags),
         Ok(unit) -> tcb.schema[host](root_of(flags), front, unit, name),
       }) {
-    Err(diags) -> unbound(s, diags, places),
+    Err(diags) -> unbound(style, diags, places),
     Ok(r) -> {
       let p = shown(
         tcb.preview[host](
@@ -553,10 +558,10 @@ fn binding_over(
         r,
       );
       match p.stage {
-        NotLoaded -> refused(s, "hosts", p.diags, p.places),
-        NotResolved -> unresolved(s, p),
-        NotBound -> unbound(s, p.diags, p.places),
-        Bound -> answered(s, flags, p),
+        NotLoaded -> refused(style, "hosts", p.diags, p.places),
+        NotResolved -> unresolved(style, p),
+        NotBound -> unbound(style, p.diags, p.places),
+        Bound -> answered(style, flags, p),
       }
     },
   }
@@ -768,31 +773,31 @@ test "the configuration block counts its sources and never prints a secret's val
 
 // What the Rust side answers for a preview a test builds: the report's own, less the
 // configuration this side resolves.
-fn previewed(p: Preview) -> Previewed =
+fn previewed(preview: Preview) -> Previewed =
   {
-    stage: p.stage,
-    root: p.root,
-    handlers: p.handlers,
-    rows: p.rows,
-    digest: p.digest,
-    hermetic: p.hermetic,
-    transport: p.transport,
-    filesystem: p.filesystem,
-    observability: p.observability,
-    shutdown: p.shutdown,
-    diags: p.diags,
-    places: p.places,
+    stage: preview.stage,
+    root: preview.root,
+    handlers: preview.handlers,
+    rows: preview.rows,
+    digest: preview.digest,
+    hermetic: preview.hermetic,
+    transport: preview.transport,
+    filesystem: preview.filesystem,
+    observability: preview.observability,
+    shutdown: preview.shutdown,
+    diags: preview.diags,
+    places: preview.places,
   }
 
 // The run's own answer, over a preview the test hands it in place of the Rust side. Without
 // `--host` nothing is read, so the environment and the tree answer nothing.
-fn answered_over(p: Preview, flags: Flags) -> Answer =
+fn answered_over(preview: Preview, flags: Flags) -> Answer =
   handle {
     binding_over(plain(), flags, machine::default_options(), no_front(), [])
   } with {
     emit.unit(front, offered) -> Ok(b""),
     tcb.schema[host](root, front, unit, name) -> Err([]),
-    tcb.preview[host](root, options, front, config) -> previewed(p),
+    tcb.preview[host](root, options, front, config) -> previewed(preview),
     env.vars[sys]() -> [],
     env.pwd[sys]() -> "/w",
     fs.resolved[cwd](path) -> Missing,
@@ -807,10 +812,10 @@ test "the listing opens on a blank line and every other line is indented" {
   assert_eq(at(answer.lines, 0, "?"), "");
   assert_eq(
     at(answer.lines, 1, ""),
-    ind() ++ "3 host handlers · 4 operations · trusted computing base",
+    indent() ++ "3 host handlers · 4 operations · trusted computing base",
   );
   assert_eq(at(answer.lines, 2, "?"), "");
-  assert_eq(at(answer.lines, len(answer.lines) - 1, ""), ind() ++ "digest: b3:1f2e3d4c5b6a")
+  assert_eq(at(answer.lines, len(answer.lines) - 1, ""), indent() ++ "digest: b3:1f2e3d4c5b6a")
 }
 
 test "`--digest` writes the one line a CI check pins and nothing else" {
@@ -822,7 +827,7 @@ test "`--digest` writes the one line a CI check pins and nothing else" {
 
 test "a hermetic run lists nothing and says what would bind" {
   let answer = answered_over({ ..listed(), hermetic: true }, flags_of(false, false));
-  assert_eq(at(answer.lines, 1, ""), ind() ++ "hermetic — no host handler is bound");
+  assert_eq(at(answer.lines, 1, ""), indent() ++ "hermetic — no host handler is bound");
   assert_eq(len(answer.lines), 4)
 }
 
@@ -854,7 +859,7 @@ test "a binding that could not be opened is exit 2 with the tally under it" {
   assert_eq(answer.lines, []);
   assert_eq(answer.errs, [
     "Error[E0454]: `--fs src=./x` does not resolve",
-    ind() ++ "no host handler was bound (1 error)",
+    indent() ++ "no host handler was bound (1 error)",
   ])
 }
 
@@ -889,7 +894,10 @@ test "a program that does not load is the load's own refusal" {
   let unloadable: Preview = { ..nothing(), stage: NotLoaded, diags: [broken] };
   let answer = answered_over(unloadable, flags_of(false, false));
   assert_eq(answer.code, 2);
-  assert_eq(answer.errs, ["Error[E0201]: type mismatch", ind() ++ "compilation failed (1 error)"])
+  assert_eq(answer.errs, [
+    "Error[E0201]: type mismatch",
+    indent() ++ "compilation failed (1 error)",
+  ])
 }
 
 // The path the listing answers about, resolved, or the working directory.

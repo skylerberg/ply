@@ -1,13 +1,43 @@
-use ply_eval::{CheckOutput, Diagnostic, Front, Machine, ModuleName, Provider, SourceId};
-use std::collections::HashMap;
+use ply_eval::{Analysis, CheckOutput, Diagnostic, Machine, Provider};
 use std::rc::Rc;
 
-/// `sources[i]` is `(module name, text)` for `SourceId(i)`.
+/// What the builder makes of `sources`, `(module name, text)` each written to the file its name
+/// spells: the front end's answer, a refusal's included, and the unit's C.
 #[track_caller]
-pub fn port_front(sources: &[(&str, &str)]) -> Front {
-    let (named, ids) = inputs(sources);
-    ply_codegen::c::producer::checked_front(&named, &ids)
-        .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
+fn answered(sources: &[(&str, &str)]) -> ply_machine::runnable::Runnable {
+    let files: Vec<(String, String)> = sources
+        .iter()
+        .map(|(name, src)| {
+            (
+                format!("{}.ply", name.replace('.', "/")),
+                (*src).to_string(),
+            )
+        })
+        .collect();
+    let bytes = ply_machine::builds::answered(&files)
+        .unwrap_or_else(|d| panic!("the builder answers for the fixture: {}", d.message));
+    ply_machine::runnable::decode(&bytes)
+        .unwrap_or_else(|why| panic!("the builder's answer reads: {why}"))
+}
+
+#[track_caller]
+fn accepted(sources: &[(&str, &str)]) -> ply_machine::runnable::Runnable {
+    let answer = answered(sources);
+    let errors: Vec<String> = answer
+        .front
+        .answer
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == ply_eval::Severity::Error)
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect();
+    assert!(errors.is_empty(), "the fixture must typecheck: {errors:?}");
+    answer
+}
+
+#[track_caller]
+pub fn port_front(sources: &[(&str, &str)]) -> Analysis {
+    accepted(sources).front.answer
 }
 
 #[track_caller]
@@ -18,10 +48,7 @@ pub fn port_check(sources: &[(&str, &str)]) -> CheckOutput {
 /// Every diagnostic when any is an error, as a refusing checker answers; empty otherwise.
 #[track_caller]
 pub fn port_errors(sources: &[(&str, &str)]) -> Vec<Diagnostic> {
-    let (named, ids) = inputs(sources);
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&named, &ids)
-        .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+    let front = answered(sources).front.answer;
     if front.has_error() {
         front.diagnostics
     } else {
@@ -29,24 +56,10 @@ pub fn port_errors(sources: &[(&str, &str)]) -> Vec<Diagnostic> {
     }
 }
 
-fn inputs(sources: &[(&str, &str)]) -> (Vec<(String, String)>, Vec<SourceId>) {
-    let named = sources
-        .iter()
-        .map(|(name, src)| {
-            (
-                ModuleName::from_dotted(name).to_string(),
-                (*src).to_string(),
-            )
-        })
-        .collect();
-    let ids = (0..sources.len()).map(|i| SourceId(i as u32)).collect();
-    (named, ids)
-}
-
 pub struct Compiled {
-    pub front: Front,
-    /// Keyed by `m.name.to_string()`: the Ply emitter re-parses source text, not the AST.
-    pub texts: HashMap<String, String>,
+    pub front: Analysis,
+    /// The unit's C, every definition offered.
+    unit: String,
 }
 
 impl Compiled {
@@ -62,20 +75,14 @@ impl Compiled {
         Compiled::modules(&[(module, source)])
     }
 
-    /// Several modules, each one's `SourceId` its position in `sources`.
+    /// Several modules.
     #[track_caller]
     pub fn modules(sources: &[(&str, &str)]) -> Compiled {
-        let front = port_front(sources);
-        let texts = sources
-            .iter()
-            .map(|(name, src)| {
-                (
-                    ModuleName::from_dotted(name).to_string(),
-                    (*src).to_string(),
-                )
-            })
-            .collect();
-        Compiled { front, texts }
+        let answer = accepted(sources);
+        Compiled {
+            front: answer.front.answer,
+            unit: answer.unit,
+        }
     }
 
     /// The port's diagnostics, empty if it accepted.
@@ -97,8 +104,7 @@ impl Compiled {
 
     /// The unit compiled from this program; each [`Provider::attach`] is a tier of its own.
     pub fn unit(&self) -> &'static ply_codegen::Unit {
-        ply_codegen::c::producer::ensure_default();
-        ply_codegen::Unit::over_front(&self.front, self.texts.clone())
+        ply_codegen::Unit::handed(&self.front, self.unit.clone())
             .expect("this host has a C compiler")
     }
 
@@ -109,15 +115,11 @@ impl Compiled {
 
     /// The unit over every definition, loaded bare, so a test enters its bodies without a machine.
     pub fn native(&self) -> ply_codegen::c::Native {
-        ply_codegen::c::producer::ensure_default();
-        let front: &'static Front = Box::leak(Box::new(self.front.clone()));
-        let source: &'static ply_codegen::Source = Box::leak(Box::new(
-            ply_codegen::Source::from_front(front).with_texts(self.texts.clone()),
-        ));
-        let names = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        ply_codegen::c::build(source, &refs)
-            .expect("the unit builds")
+        let front: &'static Analysis = Box::leak(Box::new(self.front.clone()));
+        let source: &'static ply_codegen::Source =
+            Box::leak(Box::new(ply_codegen::Source::from_analysis(front)));
+        ply_codegen::c::load_unit(&self.unit, Some(source), "unit")
+            .expect("the unit loads")
             .0
     }
 

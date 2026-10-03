@@ -4,7 +4,7 @@ use ply_eval::sched::{Policy, Resumption, Turn};
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
     Diagnostic, EffectAtom, HostBinding, HostRegistry, HostRequest, HostRuntime, Mode, Pending,
-    Resource, SimId, SourceId, Span, Symbol, TaskHandle, TaskId, Value, codes,
+    Resource, SimId, Span, Symbol, TaskHandle, TaskId, Value, codes,
 };
 use ply_host::sched::*;
 use ply_host::trace::sink::Recording;
@@ -309,14 +309,8 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
 }
 
 fn check(source: &str) -> ply_eval::CheckOutput {
-    ply_codegen::c::producer::checked_front(
-        &[("m".to_string(), source.to_string())],
-        &[SourceId(0)],
-    )
-    .expect("the fixture typechecks")
-    .check
+    crate::support::answered::checked("m", source).check
 }
-
 /// Its footprint contains `task.write`, so the `Any` registrations have an atom to resolve against.
 const SPAWNS: &str = r#"
 fn spin() -> Unit / {task.write} = task.yield()

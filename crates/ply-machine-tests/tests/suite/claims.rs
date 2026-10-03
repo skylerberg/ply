@@ -10,6 +10,14 @@ fn cli_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ply-cli/ply")
 }
 
+/// The CLI as the launcher enters it: the front end's answer over the program this binary ships.
+fn cli() -> ply_machine::load::Loaded {
+    let program = ply_launcher::shipped::program()
+        .unwrap_or_else(|d| panic!("the CLI is built: {}", d.message));
+    ply_machine::driver::load_over_analysis_taken(cli_root(), program.front)
+        .unwrap_or_else(|e| panic!("the CLI loads: {:?}", e.diagnostics))
+}
+
 /// Every row has to name a module that declares the type, and every case it builds.
 ///
 /// The tag this side builds is `<module>.<constructor>` and the program matches it against the name
@@ -19,7 +27,7 @@ fn cli_root() -> PathBuf {
 /// rather than about the program.
 #[test]
 fn every_marshalled_type_is_declared_where_this_side_says() {
-    let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
+    let loaded = cli();
     for (home, ty, cases) in MARSHALLED {
         assert!(
             declares(&loaded, home, ty),
@@ -54,7 +62,7 @@ fn declares(loaded: &ply_machine::load::Loaded, module: &str, ty: &str) -> bool 
 /// declare its `Refusal` there too.
 #[test]
 fn the_refusal_is_declared_beside_the_effect_it_is_named_by() {
-    let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
+    let loaded = cli();
     let prover = loaded
         .check
         .effects

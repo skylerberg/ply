@@ -1,8 +1,8 @@
 use ply_codegen::Unit;
-use ply_eval::{ModuleName, Provider, Symbol, Value};
+use ply_eval::{Provider, Symbol, Value};
 
 /// As `ply test benches/kernel` loads it: the project's own `.ply` files, and no standard library.
-fn kernel() -> (&'static ply_eval::Front, &'static Unit) {
+fn kernel() -> (&'static ply_eval::Analysis, &'static Unit) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -15,28 +15,22 @@ fn kernel() -> (&'static ply_eval::Front, &'static Unit) {
         .collect();
     files.sort();
     assert_eq!(files.len(), 2, "benches/kernel changed shape: {files:?}");
-
-    let mut sources = ply_eval::SourceMap::new();
-    let mut inputs = Vec::new();
-    for path in &files {
-        let stem = path.file_stem().and_then(|s| s.to_str()).expect("a stem");
-        let text: &'static str = Box::leak(
-            std::fs::read_to_string(path)
-                .expect("the kernel is readable")
-                .into_boxed_str(),
-        );
-        let id = sources.add(path.clone(), text.to_string());
-        inputs.push((id, ModuleName::from_dotted(stem), text));
-    }
-    let named: Vec<(String, String)> = inputs
+    let files: Vec<(String, String)> = files
         .iter()
-        .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
+        .map(|path| {
+            let name = path.file_name().and_then(|s| s.to_str()).expect("a name");
+            let text = std::fs::read_to_string(path).expect("the kernel is readable");
+            (name.to_string(), text)
+        })
         .collect();
-    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
-    let front = ply_codegen::c::producer::checked_front(&named, &ids).expect("the kernel checks");
-    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
-    let unit =
-        Unit::over_front(front, named.into_iter().collect()).expect("this host has a C compiler");
+    let answer = crate::fixture::made(&files);
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(answer.front.answer));
+    assert!(
+        !front.has_error(),
+        "the kernel checks: {:?}",
+        front.diagnostics
+    );
+    let unit = Unit::handed(front, answer.unit).expect("this host has a C compiler");
     (front, unit)
 }
 

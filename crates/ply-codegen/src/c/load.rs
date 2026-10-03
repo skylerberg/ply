@@ -11,6 +11,16 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Buckets the compiles in this process built.
+pub static BUCKETS_COMPILED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Buckets the compiles in this process found already built.
+pub static BUCKETS_REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Unit images this process mapped, whether the cache held one or it was linked now.
+pub static UNITS_MAPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -116,27 +126,6 @@ fn key_over(cc: &str, level: &str, pieces: &[&str]) -> String {
     }
     h.update(&[0]);
     h.finalize().to_hex().to_string()
-}
-
-/// The object a key names, if it is already built and loadable.
-///
-/// The whole-unit cache reaches this without the source: the source is a function of the same
-/// inputs the unit key is taken over, so a worker that finds a unit entry has no reason to build
-/// twenty-nine megabytes of C to discover the name of an object it already has.
-pub(super) fn open_by_key(key: &str) -> Option<Library> {
-    let path = cache_dir().join(format!("{key}.{}", ext()));
-    let library = path
-        .is_file()
-        .then(|| Library::open(&path).ok())
-        .flatten()?;
-    super::sweep::used(&path);
-    Some(library)
-}
-
-/// The key an assembled source and the current compiler settle on, so it can be recorded beside
-/// the unit that produced it.
-pub(super) fn object_key(source: &str) -> String {
-    key_of(&compiler(), source, &opt_level())
 }
 
 /// The optimisation flag, in one place: three callers ask, and one of them asking differently
@@ -248,6 +237,7 @@ pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Librar
         && let Ok(library) = Library::open(&cached)
     {
         super::sweep::used(&cached);
+        UNITS_MAPPED.fetch_add(1, Relaxed);
         return Ok((library, Duration::ZERO));
     }
     // A directory of its own per build, not per process. A run compiles the unit once per worker
@@ -310,6 +300,7 @@ pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Librar
         )),
         false => e,
     })?;
+    UNITS_MAPPED.fetch_add(1, Relaxed);
     Ok((library, compiling))
 }
 
@@ -349,7 +340,7 @@ fn objects_of(
         }
         objects.push(target);
     }
-    super::cache::BUCKETS_REUSED.fetch_add(texts.len() - missing.len(), Relaxed);
+    BUCKETS_REUSED.fetch_add(texts.len() - missing.len(), Relaxed);
     let landed: Mutex<Vec<(usize, Result<PathBuf>)>> = Mutex::new(Vec::new());
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -369,7 +360,7 @@ fn objects_of(
     for (at, built) in landed.into_inner().unwrap_or_else(|e| e.into_inner()) {
         objects[at] = built?;
     }
-    super::cache::BUCKETS_COMPILED.fetch_add(missing.len(), Relaxed);
+    BUCKETS_COMPILED.fetch_add(missing.len(), Relaxed);
     Ok(objects)
 }
 

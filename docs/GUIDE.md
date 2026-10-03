@@ -1257,7 +1257,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, and the emitter's answers, each kept under the emitter, the runtime and what it was asked (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the emitter, the runtime and what it was asked, and the cost checker's report on a program, kept under the compiler and the program's text (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's committed builder or `ply` program is behind its sources, the one the builder made of them and the rows that seed its next build (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -1266,7 +1266,6 @@ rather than raised.
 | `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, and allocation counts |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
-| `PLY_C_EMITTER=ply:DIR` | use emitter sources from `DIR` instead of the built-in ones |
 
 ## 9. Simulation
 
@@ -3145,7 +3144,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`), `edit` or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version and the C runtime this binary ships |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`), `edit` or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3173,20 +3172,23 @@ declare no `main` — is built as the package itself: `ply build` writes a
 its own, holding every module's source, the package's `ply.pkg` text, and a
 compiled unit of every definition those modules declare (a library has no entry
 to prune against, so nothing is left out). `-o FILE` names it; the default is
-`<name>.plyz`. A consumer compiles those sources — always correct — or reuses
-the unit when the runtime matches, the `E0444` gate. It is a package and never
-a program: `ply run lib.plyz` refuses it (`E0443`) rather than reading a
+`<name>.plyz`. A consumer compiles those sources. It is a package and never a
+program: `ply run lib.plyz` refuses it (`E0443`) rather than reading a
 container as text.
 
 `ply build` writes the closure of one entry point (default `main`) as a `.plyx`
-file (default `<entry module>.plyx`): its definitions, printed back to source
-without tests, laws, comments or anything unreached, and the compiled unit. The
-BLAKE3 digest covers those and the entry point, so an edit nothing reaches
+file (default `<entry module>.plyx`): its definitions by hash, the same
+definitions printed back to source without tests, laws, comments or anything
+unreached, and the runnable `ply run` loads — that source checked again, its
+front end's answer and its compiled unit — so a run of it runs no front end.
+The BLAKE3 digest covers those and the entry point, so an edit nothing reaches
 leaves it unchanged; a failure raised by a run of it carries no line number. A
-body or closure that fails verification is `E0443`, as is a build whose closure
-holds two identical declarations it cannot tell apart (two effects, or two
-members of one recursive group); an artifact built by another compiler, or
-compiled for another runtime, is `E0444`: rebuild it with this `ply`.
+part that does not agree with the rest — a body under a hash that does not name
+it, a name with no body, a closure or runnable that is not the one these
+definitions make — is `E0443`, as is a build whose closure holds two identical
+declarations it cannot tell apart (two effects, or two members of one recursive
+group); an artifact built by another compiler, or compiled for another runtime,
+is `E0444`: rebuild it with this `ply`.
 `--config-schema` ships that function too, resolved as a run resolves it: a name
 that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 
@@ -3387,7 +3389,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on, and for the builder the bundle the runtime's emitter is built from (`unit.c.gz` beside `SOURCES.digest`); `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 

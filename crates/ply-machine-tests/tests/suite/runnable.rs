@@ -1,9 +1,9 @@
 //! A program as the launcher enters it: written from a front end's answer and the C of its unit,
 //! read back with no compiler, and entered.
 
-use crate::fixture::{handed, loaded, project, unit_text};
-use ply_eval::{Span, Value};
-use ply_machine::artifact::{self, Binds};
+use crate::fixture::{handed, project, unit_text};
+use ply_eval::Span;
+use ply_machine::enter::{self, Binds};
 use ply_machine::payload::field_of;
 use ply_machine::runnable;
 
@@ -15,7 +15,7 @@ fn written(source: &str) -> (Vec<u8>, Vec<u8>) {
     let front = handed(dir.path());
     let files = field_of(&front, "files", Span::DUMMY).expect("a front's files");
     let dump = field_of(&front, "dump", Span::DUMMY).expect("a front's dump");
-    let unit = unit_text(&loaded(dir.path()));
+    let unit = unit_text(dir.path());
     let bytes = runnable::encode("m.main", files, dump, &unit).expect("the runnable encodes");
     (bytes, unit)
 }
@@ -30,40 +30,10 @@ fn a_runnable_reads_back_as_the_program_it_was_written_from_and_enters() {
         program.front.files.iter().any(|f| f.name == "m"),
         "the program's own module is among the files it carries"
     );
-    let opened = artifact::opened_runnable(program, std::path::Path::new("."))
+    let opened = enter::opened_runnable(program, std::path::Path::new("."))
         .expect("its front end's answer reads back over its own files");
-    let ended = artifact::enter_runnable(opened, Vec::new(), Binds::default());
+    let ended = enter::enter_runnable(opened, Vec::new(), Binds::default());
     assert_eq!(ended.into_parts().0.expect("the entry ran"), 7);
-}
-
-#[test]
-fn what_a_load_walked_and_warned_of_is_no_part_of_a_runnable() {
-    let dir = project(EXITS_SEVEN);
-    let front = handed(dir.path());
-    let files = field_of(&front, "files", Span::DUMMY).expect("a front's files");
-    let dump = field_of(&front, "dump", Span::DUMMY).expect("a front's dump");
-    let Value::Record(fields) = dump else {
-        panic!("a dump is a record");
-    };
-    let other = ply_machine::payload::record(
-        fields
-            .iter()
-            .map(|(name, value)| {
-                let changed = match name.as_str() {
-                    "walked" => Value::bytes(b"another walk"),
-                    "diags" => Value::list(vec![Value::str("a cache's warning")]),
-                    _ => value.clone(),
-                };
-                (name.as_str(), changed)
-            })
-            .collect(),
-    );
-    let unit = unit_text(&loaded(dir.path()));
-    assert_eq!(
-        runnable::encode("m.main", files, dump, &unit).expect("the runnable encodes"),
-        runnable::encode("m.main", files, &other, &unit).expect("the runnable encodes"),
-        "two loads of one program write one runnable"
-    );
 }
 
 #[test]

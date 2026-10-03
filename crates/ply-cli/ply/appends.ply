@@ -1,55 +1,173 @@
 // Where an update (`push`, `list_set`, `array_set`) copies, before the program runs: `ply check
 // --costs` reads it out, and a `reuse fn` whose body copies is refused with it.
 
-import compiler.costs (Report, Costed, Site, Unkept, costs)
-import compiler.front (Whole)
+import compiler.costs (Report, Costed, Site, Unkept, costs, report_bin)
+import compiler.embed (EmbedAt, EmbedFile)
+import compiler.front (Analysis)
+import compiler.hash (hex)
 import compiler.items (Item, IFn)
-import compiler.resolve (Source, Mod, Diag, diag1, diag2)
-import compiler.spine (Span)
+import compiler.resolve (Source, ParsedModule, Diag, PackageDeps, error_at, error_at_and)
+import compiler.parsing (Span)
+import compiler.unit (read_kept, shelf_identity, shipped, write_kept)
 import diagnostic (Place, spot_of)
+import env (env)
 import program (Program, sourced)
-import report (ind, plural)
+import report (indent, plural)
+import sources (under_abs)
 import style (Style, bold, dim, red, green, yellow)
+import std.bin
+import std.fs (fs)
+import std.hash (blake3)
+import std.random (entropy)
+import std.time (time)
 
 // Where the verdict column starts: wide enough for `stdlib.ply:1234:56`.
 fn location_width() -> Int = 22
 
+// A command asks for the cost checker's report on a program; what answers is `pricing`'s, which
+// `main` runs every command under, or a handler of the asker's own. The report is a function of the
+// program's text and of the checker, so the effect is a deterministic one, whatever the answering
+// keeps.
+pub effect priced {
+  read report(names: List<Bytes>, srcs: List<Bytes>, pkgs: List<PackageDeps>, mod_pkg: List<Int>, shelf: Int, embeds: List<EmbedAt>) -> Report
+}
+
 // Only the run's own updates: a dependency's are costed when it is the package checked.
-pub fn costs_of(p: Program, w: Whole) -> Report = {
-  let srcs: List<Source> = sourced(p, w);
-  let r = costs(
-    map(srcs, |s: Source| s.name),
-    map(srcs, |s: Source| s.src),
-    w.packages,
-    w.mod_pkg,
-    len(w.packages),
-    w.embeds,
+pub fn costs_of(program: Program, analysis: Analysis) -> Report / {priced.report} = {
+  let srcs: List<Source> = sourced(program, analysis);
+  let r = priced.report(
+    map(srcs, |source: Source| source.name),
+    map(srcs, |source: Source| source.src),
+    analysis.packages,
+    analysis.mod_pkg,
+    len(analysis.packages),
+    analysis.embeds,
   );
-  { ..r, defs: filter(r.defs, |d: Costed| d.module < len(p.files)) }
+  { ..r, defs: filter(r.defs, |d: Costed| d.module < len(program.files)) }
 }
 
 // A `reuse fn` whose promise the cost checker cannot show, and a `returns` clause it cannot show of
 // its body, as the diagnostics a run is refused with; nothing at all when none of the run's own
 // modules writes either.
-pub fn broken_promises(p: Program, w: Whole) -> List<Diag> =
-  if !promised(p, w) { [] } else {
-    let r = costs_of(p, w);
+pub fn broken_promises(program: Program, analysis: Analysis) -> List<Diag> / {priced.report} =
+  if !promised(program, analysis) { [] } else {
+    let r = costs_of(program, analysis);
     if !r.ok { [unresolved()] }
     else { fold(r.unkept, promises(r), |acc: List<Diag>, u: Unkept| push(acc, unkept_returns(u))) }
   }
 
+// What a report is a function of beyond the checker, `identity`: every module's name and text, the
+// packages and which each module is in, and what each module embeds.
+fn costs_key(
+  identity: Bytes,
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  pkgs: List<PackageDeps>,
+  mod_pkg: List<Int>,
+  shelf: Int,
+  embeds: List<EmbedAt>,
+) -> Bytes = {
+  let n = |i: Int| bytes_of_string(int_to_string(i));
+  let read = |e: EmbedAt|
+    match e.read {
+      Ok(files) ->
+        bytes_concat_all(
+          map(files, |f: EmbedFile| bytes_concat_all([f.name, b"\x00", blake3(f.bytes)])),
+        ),
+      Err(why) -> bytes_concat(b"!", why),
+    };
+  hex(
+    blake3(
+      bytes_concat_all([
+        b"ply.costs.1\x00",
+        hex(bin::shape_digest(report_bin())),
+        b"\x00",
+        identity,
+        b"\x00",
+        bytes_concat_all(
+          map(range(0, len(names)), |i: Int|
+            bytes_concat_all([
+              match list_at(names, i) { Some(x) -> x, None -> b"" },
+              b"\x00",
+              match list_at(srcs, i) { Some(x) -> blake3(x), None -> b"" },
+            ])),
+        ),
+        b"\x00",
+        bytes_concat_all(
+          map(pkgs, |p: PackageDeps|
+            bytes_concat_all([
+              p.prefix,
+              b"(",
+              bytes_concat_all(map(p.deps, |d: Bytes| bytes_concat(d, b","))),
+              b")",
+            ])),
+        ),
+        b"\x00",
+        bytes_concat_all(map(mod_pkg, |k: Int| bytes_concat(n(k), b","))),
+        b"\x00",
+        n(shelf),
+        b"\x00",
+        bytes_concat_all(
+          map(embeds, |e: EmbedAt|
+            bytes_concat_all([e.module, b"\x00", e.key, b"\x00", read(e), b"\x00"])),
+        ),
+      ]),
+    ),
+  )
+}
+
+// `body` with every cost report it asks for kept under the toolchain's cache, as the emitter's
+// answers are.
+pub fn pricing<a | e>(
+  body: () -> a / {priced.report | e},
+) -> a / {shipped.names, shipped.module, env.bodies[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  handle {
+    body()
+  } with {
+    priced.report(names, srcs, pkgs, mod_pkg, shelf, embeds) -> {
+      let dir = under_abs(env.bodies[sys]());
+      let key = costs_key(shelf_identity(), names, srcs, pkgs, mod_pkg, shelf, embeds);
+      let kept = match read_kept[abs](dir, key) {
+        Some(bytes) -> match bin::decode(bytes, report_bin()) { Ok(r) -> Some(r), Err(_) -> None },
+        None -> None,
+      };
+      match kept {
+        Some(r) -> r,
+        None -> {
+          let r = costs(names, srcs, pkgs, mod_pkg, shelf, embeds);
+          write_kept[abs](dir, key, bin::encode(r, report_bin()));
+          r
+        },
+      }
+    },
+  }
+
+// `body` with every cost report worked out afresh and kept nowhere: for a program that drives
+// another and has no toolchain cache of its own.
+pub fn pricing_fresh<a | e>(body: () -> a / {priced.report | e}) -> a / e =
+  handle {
+    body()
+  } with {
+    priced.report(names, srcs, pkgs, mod_pkg, shelf, embeds) ->
+      costs(names, srcs, pkgs, mod_pkg, shelf, embeds),
+  }
+
 // Whether one of the run's own modules writes a `reuse fn` or a `returns` clause, so the promise
 // check can be skipped.
-pub fn promised(p: Program, w: Whole) -> Bool =
-  fold(w.mods, { i: 0, any: false }, |acc: { i: Int, any: Bool }, m: Mod|
-    { i: acc.i + 1, any: acc.any || (acc.i < len(p.files) && promises_reuse(m)) }).any
+pub fn promised(program: Program, analysis: Analysis) -> Bool =
+  fold(
+    analysis.mods,
+    { i: 0, any: false },
+    |acc: { i: Int, any: Bool }, parsed: ParsedModule|
+      { i: acc.i + 1, any: acc.any || (acc.i < len(program.files) && promises_reuse(parsed)) },
+  ).any
 
-fn promises_reuse(m: Mod) -> Bool =
-  fold(m.module.items, false, |a: Bool, it: Item|
+fn promises_reuse(parsed: ParsedModule) -> Bool =
+  fold(parsed.module.items, false, |a: Bool, it: Item|
     match it { IFn(d) -> a || d.reuse != None || d.returns != None, _ -> a })
 
 fn unkept_returns(u: Unkept) -> Diag =
-  diag1(
+  error_at(
     b"E0148",
     u.module,
     { start: u.start, end: u.end },
@@ -103,13 +221,13 @@ fn tally(d: Costed) -> String =
 fn kind_of(d: Costed) -> String =
   if d.kind == b"test" { " (test)" } else if d.kind == b"law" { " (law)" } else { "" }
 
-fn painted(s: Style, verdict: Bytes) -> String =
-  if verdict == b"reuses" { green(s, "reuses ") }
-  else if verdict == b"copies" { red(s, "COPIES ") }
-  else { yellow(s, "unknown") }
+fn painted(style: Style, verdict: Bytes) -> String =
+  if verdict == b"reuses" { green(style, "reuses ") }
+  else if verdict == b"copies" { red(style, "COPIES ") }
+  else { yellow(style, "unknown") }
 
 fn site_lines(
-  s: Style,
+  style: Style,
   places: List<Place>,
   d: Costed,
   lines: List<String>,
@@ -119,50 +237,53 @@ fn site_lines(
   let pad = if string_len(at) >= location_width() { 0 } else { location_width() - string_len(at) };
   let said = push(
     lines,
-    "    " ++ at ++ spaces(pad) ++ "  " ++ painted(s, site.verdict) ++ "  "
+    "    " ++ at ++ spaces(pad) ++ "  " ++ painted(style, site.verdict) ++ "  "
       ++ string_of_bytes_lossy(site.reason),
   );
   if bytes_len(site.fix) == 0 { said } else {
     push(
       said,
       "    " ++ spaces(location_width()) ++ "  " ++ spaces(7) ++ "  "
-        ++ dim(s, "fix: " ++ string_of_bytes_lossy(site.fix)),
+        ++ dim(style, "fix: " ++ string_of_bytes_lossy(site.fix)),
     )
   }
 }
 
-fn def_lines(s: Style, places: List<Place>, lines: List<String>, d: Costed) -> List<String> = {
+fn def_lines(style: Style, places: List<Place>, lines: List<String>, d: Costed) -> List<String> = {
   let head = push(
     push(lines, ""),
-    "  " ++ bold(s, string_of_bytes_lossy(d.label)) ++ dim(s, kind_of(d)) ++ "  "
-      ++ dim(s, tally(d)),
+    "  " ++ bold(style, string_of_bytes_lossy(d.label)) ++ dim(style, kind_of(d)) ++ "  "
+      ++ dim(style, tally(d)),
   );
-  fold(d.sites, head, |acc: List<String>, site: Site| site_lines(s, places, d, acc, site))
+  fold(d.sites, head, |acc: List<String>, site: Site| site_lines(style, places, d, acc, site))
 }
 
-fn total(r: Report, verdict: Bytes) -> Int =
-  fold(r.defs, 0, |acc: Int, d: Costed| acc + counted(d, verdict))
+fn total(report: Report, verdict: Bytes) -> Int =
+  fold(report.defs, 0, |acc: Int, d: Costed| acc + counted(d, verdict))
 
-fn summary(r: Report) -> String = {
-  let reuses = total(r, b"reuses");
-  let copies = total(r, b"copies");
-  let undecided = total(r, b"unknown");
+fn summary(report: Report) -> String = {
+  let reuses = total(report, b"reuses");
+  let copies = total(report, b"copies");
+  let undecided = total(report, b"unknown");
   int_to_string(reuses + copies + undecided) ++ " updates: " ++ int_to_string(reuses) ++ " reuse, "
     ++ int_to_string(copies)
     ++ " copy, "
     ++ int_to_string(undecided)
     ++ " undecided — "
-    ++ int_to_string(r.rounds)
+    ++ int_to_string(report.rounds)
     ++ " "
-    ++ plural(r.rounds, "round")
+    ++ plural(report.rounds, "round")
 }
 
 // The whole report, or the one line a program that updates nothing gets.
-pub fn report_lines(s: Style, places: List<Place>, r: Report) -> List<String> =
-  if len(r.defs) == 0 { ["", ind() ++ dim(s, "no updates: nothing to cost")] } else {
+pub fn report_lines(style: Style, places: List<Place>, report: Report) -> List<String> =
+  if len(report.defs) == 0 { ["", indent() ++ dim(style, "no updates: nothing to cost")] } else {
     push(
-      push(fold(r.defs, [""], |acc: List<String>, d: Costed| def_lines(s, places, acc, d)), ""),
-      "  " ++ dim(s, summary(r)),
+      push(
+        fold(report.defs, [""], |acc: List<String>, d: Costed| def_lines(style, places, acc, d)),
+        "",
+      ),
+      "  " ++ dim(style, summary(report)),
     )
   }
 
@@ -170,7 +291,7 @@ pub fn report_lines(s: Style, places: List<Place>, r: Report) -> List<String> =
 
 // The program resolved once for the front end, so a pass that cannot resolve it is Ply's fault.
 pub fn unresolved() -> Diag =
-  diag1(
+  error_at(
     b"E0505",
     4294967295,
     { start: 0, end: 0 },
@@ -186,7 +307,7 @@ fn unkept(d: Costed, promise: Span, site: Site) -> Diag = {
   let note = if bytes_len(site.fix) == 0 {
     b"no edit inside this body removes the copy; the promise cannot be kept as written, so either restructure the update or drop `reuse`"
   } else { bytes_concat(b"fix: ", site.fix) };
-  diag2(
+  error_at_and(
     b"E0127",
     d.module,
     { start: site.start, end: site.end },
@@ -209,17 +330,31 @@ fn unkept(d: Costed, promise: Span, site: Site) -> Diag = {
 }
 
 // Each `reuse fn`'s updates must reuse, except of its own parameter.
-pub fn promises(r: Report) -> List<Diag> =
-  fold(r.defs, [], |acc: List<Diag>, d: Costed|
+pub fn promises(report: Report) -> List<Diag> =
+  fold(report.defs, [], |acc: List<Diag>, d: Costed|
     match d.reuse {
       None -> acc,
       Some(promise) ->
-        fold(d.sites, acc, |a: List<Diag>, site: Site|
-          if site.verdict == b"reuses" || site.param >= 0 { a }
-          else { push(a, unkept(d, promise, site)) }),
+        fold(d.sites, acc, |diags: List<Diag>, site: Site|
+          if site.verdict == b"reuses" || site.param >= 0 { diags }
+          else { push(diags, unkept(d, promise, site)) }),
     })
 
 // --- Tests ------------------------------------------------------------------
+
+test "a cost report's key moves with the checker, a module's text, the packages and an embed" {
+  let srcs = [b"fn f() -> Int = 1", b"fn g() -> Int = 2"];
+  let embedded = |bytes: Bytes|
+    [{ module: b"m", key: b"file:x", read: Ok([{ name: b"", bytes: bytes }]) }];
+  let key = |identity: Bytes, texts: List<Bytes>, mod_pkg: List<Int>, embeds: List<EmbedAt>|
+    costs_key(identity, [b"m", b"n"], texts, [], mod_pkg, 1, embeds);
+  let base = key(b"c", srcs, [0, 0], []);
+  assert_eq(key(b"c", srcs, [0, 0], []), base);
+  assert(key(b"d", srcs, [0, 0], []) != base, None);
+  assert(key(b"c", [b"fn f() -> Int = 1", b"fn g() -> Int = 3"], [0, 0], []) != base, None);
+  assert(key(b"c", srcs, [0, 1], []) != base, None);
+  assert(key(b"c", srcs, [0, 0], embedded(b"1")) != key(b"c", srcs, [0, 0], embedded(b"2")), None)
+}
 
 fn place() -> List<Place> = [{ path: "src/m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }]
 

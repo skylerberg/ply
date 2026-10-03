@@ -230,16 +230,9 @@ fn both_written(left: Int) -> Unit / {db.query[pg_locks]} =
   }
 "#;
 
-fn tiered(service: &str) -> (ply_eval::Front, &'static ply_codegen::Unit) {
-    let answered =
-        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), service.to_string())])
-            .unwrap_or_else(|e| panic!("they check: {e:#}"));
-    let front = answered.front;
-    let unit = ply_codegen::Unit::over_front(&front, answered.modules.into_iter().collect())
-        .expect("this host has a C compiler");
-    (front, unit)
+fn tiered(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+    crate::support::answered::tiered("m", service)
 }
-
 /// The entry, over the real network: the host's only part in this is the socket and the entropy.
 fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_eval::Diagnostic> {
     let host = std::sync::Arc::new(ply_host::Host::new());

@@ -6,7 +6,7 @@
 //! bindings, and the exit code.
 
 use ply_eval::{Diagnostic, Ended, codes};
-use ply_machine::artifact::{self, Binds};
+use ply_machine::enter::{self, Binds};
 use ply_machine::runnable::Runnable;
 use std::path::{Path, PathBuf};
 
@@ -61,8 +61,7 @@ pub fn stamps() -> String {
         }
         h.finalize().to_hex().to_string()
     };
-    let emitter =
-        ply_codegen::c::producer::identity_of(&ply_codegen::c::producer::Sources::Embedded);
+    let emitter = ply_machine::builds::emitter();
     format!(
         "frontend {}\nruntime {}\n",
         stamp(&[
@@ -82,12 +81,12 @@ pub fn stamps() -> String {
 /// Each file lands by a rename and the marker last, so a run that finds the marker finds it whole.
 pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
-    let dir = ply_codegen::c::bundle::stage_dir(&program.stage).join(format!(
+    let dir = ply_codegen::c::stage::stage_dir(&program.stage).join(format!(
         "shelf-{}",
         &blake3::hash(stamps.as_bytes()).to_hex()[..16]
     ));
     if dir.join(SHELF_MARKER).exists() {
-        ply_codegen::c::sweep::used(&ply_codegen::c::bundle::stage_dir(&program.stage));
+        ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(&program.stage));
         return Ok(dir);
     }
     lay_out(&dir, &program.shelf, &stamps).map_err(|e| {
@@ -132,7 +131,7 @@ pub fn run(
     };
     ply_machine::shipped::stamp(stamps());
     let version = program.version.clone();
-    let opened = match artifact::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
+    let opened = match enter::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
         Ok(opened) => opened,
         Err(refused) => return Ended::refused(refused),
     };
@@ -167,7 +166,7 @@ pub fn run(
                     let (answer, counted, sites) = crate::count::window_sampled(
                         || {
                             ply_codegen::rt::unbounded(|| {
-                                artifact::enter_runnable(opened, argv, binds)
+                                enter::enter_runnable(opened, argv, binds)
                             })
                         },
                         asked.every(),
@@ -183,9 +182,7 @@ pub fn run(
                     }
                     answer
                 }
-                None => {
-                    ply_codegen::rt::unbounded(|| artifact::enter_runnable(opened, argv, binds))
-                }
+                None => ply_codegen::rt::unbounded(|| enter::enter_runnable(opened, argv, binds)),
             }
         });
     match work {
@@ -203,7 +200,6 @@ pub fn run(
     }
 }
 
-pub mod builder;
 pub mod code;
 pub mod count;
 pub mod env;
