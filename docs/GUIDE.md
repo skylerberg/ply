@@ -967,6 +967,14 @@ continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
 except a clause for `abort.raise` (§6.8).
 
+A clause that binds `resume` and never calls it abandons the body where it stood,
+and `bracket(acquire, release, body)` is how a body that holds something lets it
+go anyway: `release` runs on what `acquire` answered when `body` returns, when a
+clause unwinds through it this way, and when its task is cancelled (§9), where
+the bracket stands and with the handlers around it. A `release` that fails
+replaces whatever was unwinding. A runtime failure ends the run, so nothing more
+runs then, `release` included. Nested brackets release innermost first.
+
 ### 6.7 Unhandled effects
 
 `E0302`: the body performs an atom, or an operation, its written row does not
@@ -1206,8 +1214,9 @@ effect sim           { read  seed() -> Int }
   region's schedule is drawn from its entry's seed in the order regions open.
 
 `task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
-it waits on is let go, and it performs nothing more. When it next runs it only
-unwinds, releasing what it holds. The cancel answers `false` for a task that had
+it waits on is let go, and it performs nothing more but the `release` of each
+`bracket` it stands in (§6.6). When it next runs it only unwinds, releasing what
+it holds. The cancel answers `false` for a task that had
 already ended and leaves its answer alone. `task.await(t)` is a join that answers
 `Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
 cancelled task has nothing to answer and raises `E0502`. A task cannot cancel
@@ -1424,6 +1433,7 @@ authority when this page and it disagree.
 | `fold<a, b \| e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e` | |
 | `range(lo: Int, hi: Int) -> List<Int>` | `[lo, hi)` |
 | `iterate<a, b \| e>(seed: a, budget: Int, step: (a) -> Iter<a, b> / e) -> b / e` | |
+| `bracket<a, b \| e>(acquire: () -> a / e, release: (a) -> Unit / e, body: (a) -> b / e) -> b / e` | what `body` answers; `release` runs on what `acquire` answered however `body` ends but a failure (§6.6); the three run as one, so each may perform what the others do |
 | `map_new<k, v>() -> Map<k, v>` | |
 | `map_insert<k, v>(m: Map<k, v>, key: k, value: v) -> Map<k, v>` | |
 | `map_get<k, v>(m: Map<k, v>, key: k) -> Option<v>` | |
@@ -1586,7 +1596,9 @@ Types: `Method`, `Version`, `Headers`, `Request`, `Response`, `Limits`,
 `encode`, `encode_chunked_head`, `encode_chunk`, `last_chunk`,
 `continue_response`, `read_head`, `read_body`, `serve_connection`, `serve`,
 `listen_and_serve`, `request_to`, `encode_request`, `parse_response_head`,
-`request`. `request[upstream](host, port, req, limits)` opens one connection,
+`request`. Every connection the module opens or accepts is closed however
+serving it ends, an `app` a clause unwinds out of included (§6.6).
+`request[upstream](host, port, req, limits)` opens one connection,
 sends the request with `Connection: close`, reads the answer and closes; a
 response without a length field is `UntilClose` and read until the server
 closes, up to `max_body`. A malformed response is `Malformed` with a 502 refusal. No
@@ -1614,8 +1626,8 @@ implicitly (`normalize_path` is explicit).
 Codecs: `int_json`, `string_json`, `bool_json`, `decimal_json`, `float_json`,
 `bytes_json`, `unit_json`, `json_json`, `char_json` (a string of one
 character), `instant_json` and `duration_json` (nanoseconds), and combinators
-`list_json`,
-`option_json`, `result_json`, `map_json`, `string_map_json`. Entry points:
+`list_json`, `array_json` (a JSON array, as a list is), `option_json`,
+`result_json`, `map_json`, `string_map_json`. Entry points:
 `decode_bytes`, `decode_string`, `encode_bytes`, `encode_string`, `parse`,
 `parse_string`, `to_bytes`, `to_string`. `error_to_string` gives
 `$.lines[2].unit_price: expected a number, found a string`.
@@ -1638,7 +1650,9 @@ The resource label is a table (`db.query[items]` is `db.read[items]`).
 Transaction control is on the singleton resource, so transactions conflict.
 `transaction` handles `rollback`; a `rollback` performed in its body still
 reaches the caller's row through `e`, so a handler around a transaction names
-it too. SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
+it too. A transaction that ends short of its commit, by a `rollback`, by a clause
+unwinding out of it or by a cancel, is aborted on the way out, and a `sandbox`
+always is (§6.6). SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
 `constraint` the constraint a violation names, and `detail` the server's message
 and detail. `is_retryable(e)` is true for a serialization failure (`40001`) and
 a deadlock (`40P01`). `MemDb` is an in-memory twin (`open`, `step`,
@@ -2170,6 +2184,12 @@ type Manifest = {
 }
 type Release = { version: Version, digest: String, yanked: Bool, runtime: Version }
 type Index = { name: String, versions: List<Release> }
+type Attestation = {
+  name: String, version: Version, archive: String, semantics: String, builder: String,
+  checked: Bool, promises: Bool,
+  tests: { passed: Int, failed: Int },
+  proofs: { proved: Int, property: Int, example: Int, refuted: Int, unattempted: Int },
+}
 ```
 
 The package manifest as typed data: a `ply.pkg` file is one literal of
@@ -2181,7 +2201,9 @@ version dotted and `parse_version` reads one back (three counts, no leading
 zero, nothing else). `Index` is a registry's `index.json` (§15.1): every
 published `Release` of one package, newest last, read and written by
 `index_json` (`release_json` for one entry), with each version as its dotted
-text.
+text. An `Attestation` is what an attester found of one published version
+(§15.1), derived `bin`; `attested` is whether it checks, keeps its promises,
+failed no test and had no claim refuted.
 
 ### 13.16 `std.pg` — the postgres wire protocol
 
@@ -2857,9 +2879,9 @@ named rather than entered.
 Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
 `string_bin`, `bytes_bin`, `char_bin`, `u8_bin` … `u128_bin`, `i8_bin` …
 `i128_bin`, `instant_bin`, `duration_bin`, `ordering_bin`, `rounding_bin`, and
-combinators `list_bin`, `option_bin`,
-`result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*` and `take_*` are
-public too.
+combinators `list_bin`, `array_bin` (written as a list is, under a shape of its
+own), `option_bin`, `result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*`
+and `take_*` are public too.
 
 ### 13.38 `std.show`
 
@@ -2989,8 +3011,10 @@ GET  /<name>/index.json                      every version of <name>, newest las
 GET  /<name>/<version>/package.plyz          the library's `.plyz`, as `ply build` writes it
 GET  /<name>/<version>/package.plyz.b3       its digest, one `b3:<hex>` line
 GET  /<name>/<version>/interface/<semantics> the interface its publisher cut under <semantics>
+GET  /<name>/<version>/attestation/<semantics> what the registry's attester found of it
 PUT  /<name>/<version>                       publish: the `.plyz` as the body
 PUT  /<name>/<version>/interface/<semantics> the interface beside it
+PUT  /<name>/<version>/attestation/<semantics> an attestation its attester's key signed
 POST /<name>/<version>/yank                  mark the version yanked
 ```
 
@@ -3041,6 +3065,25 @@ archive into the dependency's slot, and the first load reads the dependency
 through it rather than analysing its source. `--verify-deps` (`check`, `test`,
 `prove`) reads every dependency from source instead and refuses one whose
 interface does not re-derive from it, `E0149`.
+
+A registry with an **attester** vouches for what it serves. `ply attest NAME
+VERSION` lays the published version out as a project of its own, fetched and
+checked as a resolve fetches it, and runs `ply test` and `ply prove` over it:
+whether it checks, whether its `reuse fn` and `returns` promises are kept, its
+tests and the tier each claim was discharged at, under this `ply`'s semantics.
+With `--sign KEY` the answer, a `std.pkg.Attestation`, is signed as §15.2 signs
+a build and sent back; the registry keeps it only when its `attester`'s public key
+signed it, for the version's own archive and the semantics the path names.
+Without `--sign` nothing is sent, which is how anyone runs an attestation again.
+A registry run with `--set attester=<public key hex>`, `--set attest.key=<secret
+key file>`, `--set url=<where the attester reaches it>` and `--exec
+attest=<a ply>` attests every version published, one at a time between
+connections, with that `ply`. A version whose tests fail or whose claim is refuted
+is published all the same, and its attestation says so. `ply resolve` fetches
+each dependency's attestation and believes it only when a key `PLY_ATTESTERS`
+names (public key files, separated as `PATH` separates directories) signed it for
+the archive the lock pins; `--json` reports each one as `attestation`
+(`attested`, `trusted`, `signer`, and what was run).
 `ply yank NAME VERSION` sets the version's `yanked` field under the same token:
 a new resolution passes it over and a lock that pins it keeps it, and its archive
 is served exactly as before. Nothing is ever deleted.
@@ -3144,11 +3187,12 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface published for it under this `ply`'s semantics when there is one (`interface` in `--json`) |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
 | `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
+| `ply attest NAME VERSION` | run a published version's tests, claims and promises over what the registry serves and report the attestation; `--sign KEY` signs it and sends it to the registry (§15.1); no path |
 | `ply keygen PATH` | an Ed25519 key pair: the secret key at `PATH`, the public key at `PATH.pub` (§15.2); no path |
 | `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |

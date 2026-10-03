@@ -1,0 +1,351 @@
+// `ply attest NAME VERSION` — what a published version's own tests, claims and promises come to,
+// run by this `ply` over the version laid out from the registry as a project of its own. With
+// `--sign KEY`, the answer is signed and sent back to the registry, which keeps it as the
+// version's attestation under this `ply`'s semantics; without it nothing is sent, which is how a
+// consumer runs an attestation again for itself.
+
+import args (Flags, style_of)
+import builder (builder)
+import tester
+import args
+import cmdline (Parsed, nth_of)
+import cmdline
+import claims
+import env (env)
+import paths (Resolved, here)
+import paths
+import prove
+import registry (Base, attestation_target, base_of, exchange, put, refused_by, said, unasked, unset,
+                 variable)
+import remote (index_of, staged)
+import contracts (release_at, unpublished)
+import report (Answer, ind, ok_code, reported)
+import semantics
+import signing (seed_of, unkeyed)
+import surface (spec)
+import style (Style, bold, green, yellow)
+import tests
+import yank (malformed)
+import compiler.plyx (digest_text)
+import compiler.resolve (Diag, diag1)
+import std.bin
+import std.json (Json, Null, Array, Bool, Number, Object, Str, int_json, object)
+import std.pkg (Attestation, Index, Release, Version, attestation_bin, attested, parse_version,
+                render_version)
+import std.signed (countersigned, signed_bytes)
+import std.fs (fs)
+import std.net (net)
+import std.random (entropy)
+import std.time (time)
+
+pub type Opts = { name: String, version: String }
+
+pub fn options_from(p: Parsed) -> Opts =
+  { name: nth_of(p.positionals, 0, ""), version: nth_of(p.positionals, 1, "") }
+
+// --- Reading what the commands answered -----------------------------------------------
+
+fn member(j: Json, key: String) -> Json =
+  match j { Object(m) -> match map_get(m, key) { Some(v) -> v, None -> Null }, _ -> Null }
+
+fn count(j: Json, keys: List<String>) -> Int = {
+  let at = fold(keys, j, |acc: Json, k: String| member(acc, k));
+  match int_json().decode(at) { Ok(n) -> n, Err(_) -> 0 }
+}
+
+fn codes(answer: Json) -> List<String> =
+  match member(answer, "diagnostics") {
+    Array(ds) -> map(ds, |d: Json| match member(d, "code") { Str(c) -> c, _ -> "" }),
+    _ -> [],
+  }
+
+fn has(xs: List<String>, x: String) -> Bool = fold(xs, false, |hit: Bool, y: String| hit || y == x)
+
+// --- Running the version ----------------------------------------------------------
+
+// A command line the attester runs over the staged package, as `ply` would parse it.
+fn line(argv: List<String>) -> Parsed =
+  match cmdline::parse(spec("attest"), argv) {
+    cmdline::Run(p) -> p,
+    _ -> panic("the attester's own command lines parse"),
+  }
+
+fn flags_for(p: Parsed, at: Resolved) -> Flags = args::from_parsed(p, false, at.display, [at], None)
+
+// `ply test` refuses a version whose promises are not kept before it runs a test, so a refusal
+// for those codes alone is a version that checks.
+fn found(
+  name: String,
+  v: Version,
+  archive: String,
+  builder: String,
+  tested: Answer,
+  proved: Answer,
+) -> Attestation = {
+  let refusals = codes(tested.json);
+  let promises = !has(refusals, "E0127") && !has(refusals, "E0148");
+  let ran = member(tested.json, "summary") != Null;
+  {
+    name: name,
+    version: v,
+    archive: archive,
+    semantics: semantics::version(),
+    builder: builder,
+    checked: ran || !promises,
+    promises: promises,
+    tests: {
+      passed: count(tested.json, ["summary", "passed"]),
+      failed: count(tested.json, ["summary", "failed"])
+        + count(tested.json, ["summary", "abandoned"]),
+    },
+    proofs: {
+      proved: count(proved.json, ["summary", "proved"]),
+      property: count(proved.json, ["summary", "property"]),
+      example: count(proved.json, ["summary", "example"]),
+      refuted: count(proved.json, ["summary", "refuted"])
+        + count(proved.json, ["summary", "defect"]),
+      unattempted: count(proved.json, ["summary", "unattempted"]),
+    },
+  }
+}
+
+// --- The command ----------------------------------------------------------------
+
+fn signing_key(
+  path: Option<String>,
+) -> Result<Option<Bytes>, Diag> / {fs.read_file[cwd], fs.read_file[abs]} =
+  match path {
+    None -> Ok(None),
+    Some(p) -> match paths::read_file(paths::spelled(p)) {
+      None -> Err(unkeyed(p, "cannot be read")),
+      Some(b) -> match seed_of(string_of_bytes_lossy(b)) {
+        Ok(seed) -> Ok(Some(seed)),
+        Err(why) -> Err(unkeyed(p, "does not hold a secret key: " ++ why)),
+      },
+    },
+  }
+
+fn root_of(flags: Flags) -> Resolved =
+  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
+
+pub fn run(
+  flags: Flags,
+  opts: Opts,
+) -> Answer / {env.var[sys], env.var[sys], claims::prover.collected[claims], claims::prover.ended[claims], claims::prover.interleaved[claims], claims::prover.judged[claims], claims::prover.prepared[claims], claims::prover.schema[claims], claims::prover.configure[claims], env.binary_version[sys], env.pwd[sys], env.vars[sys], fs.read[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.resolved[abs], fs.write[abs], fs.create_dir[abs], fs.remove[abs], fs.rename[abs], fs.write_file[abs], fs.read[cwd], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.resolved[cwd], fs.write[cwd], fs.list_dir[shelf], fs.read_file[shelf], net.close[registry], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], builder.git[vcs], entropy.next, time.elapsed_ms, time.elapsed_us, time.now_ms, tester::tester.executed[corpus], tester::tester.hosted[corpus], tester::tester.interleaved[corpus], tester::tester.schema[corpus], tester::tester.bound[corpus], tester::tester.configure[corpus], tester::tester.ended[corpus], tester::tester.unit[corpus]} = {
+  let s = style_of(flags);
+  match malformed({ name: opts.name, version: opts.version }) {
+    Some(d) -> reported(s, "attest", [d], []),
+    None -> match signing_key(flags.sign) {
+      Err(d) -> reported(s, "attest", [d], []),
+      Ok(seed) -> match env.var[sys](variable()) {
+        None ->
+          reported(
+            s,
+            "attest",
+            [unset(variable(), "an attestation runs what a registry serves")],
+            [],
+          ),
+        Some(text) -> match base_of(text) {
+          Err(why) -> reported(s, "attest", [unasked(why, [])], []),
+          Ok(base) -> attesting(s, flags, opts, base, seed),
+        },
+      },
+    },
+  }
+}
+
+fn attesting(
+  s: Style,
+  flags: Flags,
+  opts: Opts,
+  base: Base,
+  seed: Option<Bytes>,
+) -> Answer / {env.var[sys], claims::prover.collected[claims], claims::prover.ended[claims], claims::prover.interleaved[claims], claims::prover.judged[claims], claims::prover.prepared[claims], claims::prover.schema[claims], claims::prover.configure[claims], env.binary_version[sys], env.pwd[sys], env.vars[sys], fs.read[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.resolved[abs], fs.write[abs], fs.create_dir[abs], fs.remove[abs], fs.rename[abs], fs.write_file[abs], fs.read[cwd], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.resolved[cwd], fs.write[cwd], fs.list_dir[shelf], fs.read_file[shelf], net.close[registry], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], builder.git[vcs], entropy.next, time.elapsed_ms, time.elapsed_us, time.now_ms, tester::tester.executed[corpus], tester::tester.hosted[corpus], tester::tester.interleaved[corpus], tester::tester.schema[corpus], tester::tester.bound[corpus], tester::tester.configure[corpus], tester::tester.ended[corpus], tester::tester.unit[corpus]} = {
+  let v = match parse_version(opts.version) {
+    Some(x) -> x,
+    None -> { major: 0, minor: 0, patch: 0 },
+  };
+  match index_of(base, opts.name) {
+    Err(d) -> reported(s, "attest", [d], []),
+    Ok(index) -> match release_at(index, v) {
+      None -> reported(s, "attest", [unpublished(opts.name, v)], []),
+      Some(r) -> {
+        let work = root_of(flags).absolute ++ "/.ply-cache/attest/" ++ opts.name ++ "@"
+          ++ opts.version;
+        match staged(base, work, opts.name, r) {
+          Err(d) -> reported(s, "attest", [d], []),
+          Ok(dir) -> {
+            let at = paths::resolve(dir);
+            let tested_line = line(["test", dir, "--json"]);
+            let tested = tests::run(
+              flags_for(tested_line, at),
+              tests::options_from(tested_line, at.machine),
+            );
+            let proved_line = line(["prove", dir, "--json"]);
+            let proved = prove::run(
+              flags_for(proved_line, at),
+              claims::options_from(proved_line, at.machine),
+            );
+            let a = found(
+              opts.name,
+              v,
+              r.digest,
+              "ply " ++ env.binary_version[sys](),
+              tested,
+              proved,
+            );
+            match seed { None -> answered(s, a, false), Some(key) -> sent(s, base, a, key) }
+          },
+        }
+      },
+    },
+  }
+}
+
+fn sent(
+  s: Style,
+  base: Base,
+  a: Attestation,
+  key: Bytes,
+) -> Answer / {net.connect[registry], net.close[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry]} = {
+  let version = render_version(a.version);
+  let body = signed_bytes(
+    countersigned({ payload: bin::encode(a, attestation_bin()), signatures: [] }, key),
+  );
+  let target = attestation_target(base, a.name, version, a.semantics);
+  match exchange(base, put(base, target, "", a.archive, body)) {
+    Err(d) -> reported(s, "attest", [d], []),
+    Ok(answer) -> if answer.status == 201 || answer.status == 200 { answered(s, a, true) } else {
+      reported(
+        s,
+        "attest",
+        [
+          refused_by(
+            "keep the attestation of `" ++ a.name ++ "` " ++ version,
+            answer.status,
+            said(answer),
+          ),
+        ],
+        [],
+      )
+    },
+  }
+}
+
+fn answered(s: Style, a: Attestation, sent: Bool) -> Answer = {
+  let held = attested(a);
+  {
+    json: object([
+      { key: "command", value: Str("attest") },
+      { key: "ok", value: Bool(true) },
+      { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
+      { key: "name", value: Str(a.name) },
+      { key: "version", value: Str(render_version(a.version)) },
+      { key: "archive", value: Str(a.archive) },
+      { key: "semantics", value: Str(a.semantics) },
+      { key: "builder", value: Str(a.builder) },
+      { key: "attested", value: Bool(held) },
+      { key: "checked", value: Bool(a.checked) },
+      { key: "promises", value: Bool(a.promises) },
+      {
+        key: "tests",
+        value: object([
+          { key: "passed", value: Number(decimal_of_int(a.tests.passed)) },
+          { key: "failed", value: Number(decimal_of_int(a.tests.failed)) },
+        ]),
+      },
+      {
+        key: "proofs",
+        value: object([
+          { key: "proved", value: Number(decimal_of_int(a.proofs.proved)) },
+          { key: "property", value: Number(decimal_of_int(a.proofs.property)) },
+          { key: "example", value: Number(decimal_of_int(a.proofs.example)) },
+          { key: "refuted", value: Number(decimal_of_int(a.proofs.refuted)) },
+          { key: "unattempted", value: Number(decimal_of_int(a.proofs.unattempted)) },
+        ]),
+      },
+      { key: "sent", value: Bool(sent) },
+    ]),
+    lines: [
+      ind() ++ (if held { green(s, "attested") } else { yellow(s, "not attested") }) ++ " "
+        ++ a.name
+        ++ " "
+        ++ render_version(a.version)
+        ++ " · "
+        ++ (if sent { "sent to the registry" } else { "kept here" }),
+      ind() ++ "  " ++ bold(s, "tests") ++ " " ++ int_to_string(a.tests.passed) ++ " passed, "
+        ++ int_to_string(a.tests.failed)
+        ++ " failed · "
+        ++ bold(s, "claims")
+        ++ " "
+        ++ int_to_string(a.proofs.proved)
+        ++ " proved, "
+        ++ int_to_string(a.proofs.property + a.proofs.example)
+        ++ " sampled, "
+        ++ int_to_string(a.proofs.refuted)
+        ++ " refuted · "
+        ++ (if a.promises { "promises kept" } else { "a promise broken" }),
+    ],
+    errs: [],
+    code: ok_code(),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn answer_of(j: Json) -> Answer = { json: j, lines: [], errs: [], code: 0 }
+
+fn summary(pairs: List<{ key: String, n: Int }>) -> Json =
+  object([
+    {
+      key: "summary",
+      value: object(
+        map(pairs, |p: { key: String, n: Int }| { key: p.key, value: Number(decimal_of_int(p.n)) }),
+      ),
+    },
+  ])
+
+test "an attestation reads what the test and prove commands answered" {
+  let tested = answer_of(summary([{ key: "passed", n: 3 }, { key: "failed", n: 1 }]));
+  let proved = answer_of(
+    summary([{ key: "proved", n: 2 }, { key: "example", n: 1 }, { key: "refuted", n: 0 }]),
+  );
+  let a = found("orders", { major: 0, minor: 1, patch: 0 }, "b3:00", "ply 0.0.0", tested, proved);
+  assert_eq(a.tests, { passed: 3, failed: 1 });
+  assert_eq(a.proofs, { proved: 2, property: 0, example: 1, refuted: 0, unattempted: 0 });
+  assert(a.checked && a.promises);
+  assert(!attested(a))
+}
+
+test "a test run refused over a broken promise is a version that checks and breaks it" {
+  let refused = answer_of(
+    object([
+      { key: "diagnostics", value: Array([object([{ key: "code", value: Str("E0127") }])]) },
+    ]),
+  );
+  let a = found(
+    "orders",
+    { major: 0, minor: 1, patch: 0 },
+    "b3:00",
+    "ply 0.0.0",
+    refused,
+    answer_of(Null),
+  );
+  assert(a.checked);
+  assert(!a.promises);
+  let broken = answer_of(
+    object([
+      { key: "diagnostics", value: Array([object([{ key: "code", value: Str("E0201") }])]) },
+    ]),
+  );
+  assert(
+    !found(
+      "orders",
+      { major: 0, minor: 1, patch: 0 },
+      "b3:00",
+      "ply 0.0.0",
+      broken,
+      answer_of(Null),
+    ).checked,
+  )
+}
