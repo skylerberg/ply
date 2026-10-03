@@ -46,6 +46,16 @@ impl fmt::Display for TaskId {
     }
 }
 
+/// A channel of one region, numbered as [`TaskId`] numbers tasks.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ChanId(pub u64);
+
+impl fmt::Display for ChanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
 /// The two streams a root expands into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Domain {
@@ -313,7 +323,9 @@ pub fn signature(effect: &str, op: &str) -> Option<&'static OpSignature> {
 }
 
 /// Answered by the scheduler, not [`Handlers`]: they are polymorphic and use scheduler state.
-pub const TASK_OPS: &[&str] = &["spawn", "join", "yield", "cancel", "await"];
+pub const TASK_OPS: &[&str] = &[
+    "spawn", "join", "yield", "cancel", "await", "channel", "send", "recv", "close",
+];
 
 /// What a cancel writes and every step of the cancelled task reads, so the search sees that
 /// cancelling earlier or later is a different run.
@@ -322,6 +334,25 @@ pub fn liveness(task: TaskId, mode: Mode) -> Access {
         effect: Symbol::new("task.alive"),
         resource: crate::footprint::Resource::Named(Symbol::new(format!("@{}", task.0))),
         mode,
+        op: None,
+    })
+}
+
+/// What every operation on a channel writes: which of two goes first decides what each answers.
+pub fn channel_access(chan: ChanId) -> Access {
+    channel_atom(format!("{chan}"))
+}
+
+/// What making a channel writes, as allocating a cell does: the order two run in decides each id.
+pub fn channel_made() -> Access {
+    channel_atom("new".to_string())
+}
+
+fn channel_atom(resource: String) -> Access {
+    Access::Atom(EffectAtom {
+        effect: Symbol::new("task.chan"),
+        resource: crate::footprint::Resource::Named(Symbol::new(resource)),
+        mode: Mode::Write,
         op: None,
     })
 }

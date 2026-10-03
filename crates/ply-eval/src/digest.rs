@@ -72,6 +72,7 @@ fn write(h: &mut blake3::Hasher, v: &Value, span: Span) -> Result<(), Diagnostic
         | Value::Closure(_)
         | Value::Cell(_)
         | Value::Task(_)
+        | Value::Chan(_)
         | Value::Secret(_) => {
             return Err(Diagnostic::error(
                 codes::RUNTIME_ERROR,
