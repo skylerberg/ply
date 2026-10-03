@@ -2,7 +2,9 @@
 //! switches into it; stops are snapshotted so a finished body can be resumed again (multi-shot).
 
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame};
+use crate::rt::{
+    Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame,
+};
 use crate::stack::{Stack, switch};
 use ply_eval::arena::{Owner, Pin, RegionId};
 use ply_eval::{Diagnostic, Symbol, codes};
@@ -427,21 +429,35 @@ extern "C" fn entry(arg: usize) {
     let mut r = call_value(ctx, body, &[]);
     let c = unsafe { &mut *ctx };
     let frames = c.detached[id].frames;
-    let frame = c.stacks[frames].list.pop();
-    // A zero-shot clause of this frame unwinds to it; `return` is not applied. What the body left
-    // open goes back in `finish`.
+    let mut frame = c.stacks[frames].list.pop();
+    // A zero-shot clause of this frame unwinds to it, and a raise its clause answers lands here;
+    // `return` is applied to neither. What the body left open goes back in `finish`.
+    let mut answered = false;
     if c.failed == FAILED_UNWIND
         && let Some((stack, depth, v)) = c.unwind.take()
     {
         if stack == frames && depth == 0 {
             c.failed = 0;
             r = v;
+            answered = true;
         } else {
             c.unwind = Some((stack, depth, v));
         }
     }
+    if c.failed == FAILED_ABORT
+        && let Some(a) = c.aborting.take_if(|a| a.stack == frames && a.depth == 0)
+        && let Some(f) = frame.as_mut()
+    {
+        c.failed = 0;
+        let closure = f.take_abort_clause();
+        let message = c.word(&ply_eval::Value::str(a.message));
+        r = call_value(ctx, closure, &[message]);
+        heap::dec(closure);
+        answered = true;
+    }
+    let c = unsafe { &mut *ctx };
     let ret = c.detached[id].ret;
-    if c.failed == 0 && ret != 0 {
+    if c.failed == 0 && ret != 0 && !answered {
         r = call_value(ctx, ret, &[r]);
     }
     let c = unsafe { &mut *ctx };
