@@ -1,0 +1,110 @@
+// `task.channel(n)` makes a channel holding up to `n` values no receiver has taken; `0` is a
+// rendezvous. A send waits while the channel is full and a receive while it is empty. Once it is
+// closed, a send answers `false` and a receive takes what was queued, then `None`.
+
+fn produce(c: Chan<Int>, n: Int) -> Unit / {task.write} = {
+  fold(range(0, n), (), |u: Unit, i: Int| {
+    task.send(c, i);
+    ()
+  });
+  task.close(c)
+}
+
+fn drained(c: Chan<Int>, got: List<Int>) -> List<Int> / {task.write} =
+  match task.recv(c) { Some(x) -> drained(c, push(got, x)), None -> got }
+
+test "a receiver takes every value a producer sends, in order, in every interleaving" {
+  simulate {
+    let c = task.channel(1);
+    let p = task.spawn(|| produce(c, 2));
+    assert_eq(drained(c, []), [0, 1]);
+    task.join(p)
+  }
+}
+
+test "a rendezvous hands each value over as it is sent" {
+  simulate {
+    let c = task.channel(0);
+    let p = task.spawn(|| produce(c, 2));
+    assert_eq(drained(c, []), [0, 1]);
+    task.join(p)
+  }
+}
+
+test "two senders race, and the receiver hears both in one order or the other" {
+  simulate {
+    let c = task.channel(0);
+    let a = task.spawn(|| task.send(c, 1));
+    let b = task.spawn(|| task.send(c, 2));
+    let first = task.recv(c);
+    let second = task.recv(c);
+    assert(task.join(a) && task.join(b));
+    assert((first, second) == (Some(1), Some(2)) || (first, second) == (Some(2), Some(1)))
+  }
+}
+
+test "a closed channel refuses a send and gives up what was queued, then None" {
+  simulate {
+    let c = task.channel(2);
+    assert(task.send(c, 1));
+    task.close(c);
+    assert(!task.send(c, 2));
+    assert_eq(task.recv(c), Some(1));
+    assert_eq(task.recv(c), None);
+    task.close(c)
+  }
+}
+
+// Virtual time moves only once nothing can run, so a task spawned before a sleep is waiting after it.
+test "closing lets go of a waiting receiver with None and a waiting sender with false" {
+  simulate {
+    let c: Chan<Int> = task.channel(0);
+    let r = task.spawn(|| task.recv(c));
+    clock.sleep(Duration(1));
+    task.close(c);
+    assert_eq(task.join(r), None);
+    let d = task.channel(0);
+    let s = task.spawn(|| task.send(d, 5));
+    clock.sleep(Duration(1));
+    task.close(d);
+    assert(!task.join(s))
+  }
+}
+
+test "a cancelled receiver takes nothing that is sent after it" {
+  simulate {
+    let c = task.channel(1);
+    let r = task.spawn(|| task.recv(c));
+    clock.sleep(Duration(1));
+    assert(task.cancel(r));
+    assert_eq(task.await(r), None);
+    assert(task.send(c, 3));
+    assert_eq(task.recv(c), Some(3))
+  }
+}
+
+// The first of several workers to answer: each sends on one channel, and the first receive wins.
+fn first_of(
+  works: List<() -> Int / {clock.write}>,
+) -> Int / {task.write, clock.write, abort.raise} = {
+  let answers = task.channel(len(works));
+  let tasks = map(works, |w: () -> Int / {clock.write}| task.spawn(|| task.send(answers, w())));
+  let first = task.recv(answers);
+  fold(tasks, (), |u: Unit, t: Task<Bool>| {
+    task.cancel(t);
+    ()
+  });
+  match first { Some(x) -> x, None -> panic("every worker was cancelled before it answered") }
+}
+
+fn after(ns: Int, x: Int) -> Int / {clock.write} = {
+  clock.sleep(Duration(ns));
+  x
+}
+
+test "a race answers the first worker to finish and stops the others" {
+  simulate {
+    assert_eq(first_of([|| after(30, 1), || after(10, 2), || after(20, 3)]), 2);
+    assert_eq(clock.now(), Instant(10))
+  }
+}

@@ -1,7 +1,7 @@
 use crate::arena::Slot;
 use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
-use crate::sched::TaskHandle;
+use crate::sched::{ChanHandle, TaskHandle};
 use crate::{Diagnostic, IntTy, Span, Symbol, codes};
 use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
@@ -157,6 +157,7 @@ pub enum Value {
     Cell(Slot),
     /// Compared by region and id; its count is what tells a production region the task can retire.
     Task(TaskHandle),
+    Chan(ChanHandle),
     /// A credential; a distinct variant rather than a `Ctor`, so no pattern match can unwrap it.
     Secret(Arc<Value>),
 }
@@ -331,6 +332,7 @@ impl Value {
             Value::Closure(_) => "function",
             Value::Cell(_) => "Cell",
             Value::Task(_) => "Task",
+            Value::Chan(_) => "Chan",
             Value::Secret(_) => "Secret",
         }
     }
@@ -427,6 +429,13 @@ impl Value {
         match self {
             Value::Task(handle) => Ok(handle),
             other => Err(type_error(span, what, "Task", other)),
+        }
+    }
+
+    pub fn as_chan(&self, span: Span, what: &str) -> Result<ChanHandle, Diagnostic> {
+        match self {
+            Value::Chan(handle) => Ok(*handle),
+            other => Err(type_error(span, what, "Chan", other)),
         }
     }
 }
@@ -667,6 +676,7 @@ fn discriminant(v: &Value) -> u8 {
         Value::Fixed(_) => 15,
         Value::Char(_) => 16,
         Value::Array(_) => 17,
+        Value::Chan(_) => 18,
     }
 }
 
@@ -699,6 +709,7 @@ impl Ord for Value {
             }
             (Value::Cell(x), Value::Cell(y)) => x.cmp(y),
             (Value::Task(x), Value::Task(y)) => (x.region(), x.id()).cmp(&(y.region(), y.id())),
+            (Value::Chan(x), Value::Chan(y)) => x.cmp(y),
             // Unreachable from a well-typed program: a `Secret` has no order.
             (Value::Secret(x), Value::Secret(y)) => grow(|| x.cmp(y)),
             (Value::Closure(_), Value::Closure(_)) => Ordering::Equal,
@@ -906,6 +917,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
         }
         (Value::Cell(x), Value::Cell(y)) => x == y,
         (Value::Task(x), Value::Task(y)) => x.region() == y.region() && x.id() == y.id(),
+        (Value::Chan(x), Value::Chan(y)) => x == y,
         (Value::Secret(x), Value::Secret(y)) => {
             return descend(span, depth, || match (&**x, &**y) {
                 (Value::Str(p), Value::Str(q)) => Ok(constant_time_eq(p.as_bytes(), q.as_bytes())),

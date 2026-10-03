@@ -9,6 +9,7 @@ use std::borrow::Cow;
 pub enum Handle {
     Cell,
     Task,
+    Chan,
     Continuation,
 }
 
@@ -18,6 +19,7 @@ impl Handle {
         match self {
             Handle::Cell => "a `Cell`",
             Handle::Task => "a `Task`",
+            Handle::Chan => "a `Chan`",
             Handle::Continuation => "a continuation",
         }
     }
@@ -32,6 +34,10 @@ impl Handle {
                 "a `Task` is a key into a scheduler, and the scheduler dies with the region that \
                  opened it"
             }
+            Handle::Chan => {
+                "a `Chan` is a key into a scheduler, and the scheduler dies with the region that \
+                 opened it"
+            }
             Handle::Continuation => {
                 "a continuation resumes a body that lives only as long as the entry that captured \
                  it, and that body reaches every region open at the capture"
@@ -42,7 +48,7 @@ impl Handle {
     /// Why no type refused it before the boundary did.
     fn unseen(self) -> &'static str {
         match self {
-            Handle::Cell | Handle::Task => {
+            Handle::Cell | Handle::Task | Handle::Chan => {
                 "the escape brand makes this a type error wherever a type still mentions the \
                  brand; this is the boundary where none does, so it is refused here instead of \
                  read later"
@@ -158,7 +164,7 @@ impl Boundary<'_> {
 
     fn remedy(&self, handle: Handle) -> &'static str {
         match (self, handle) {
-            (Boundary::HostArgument { .. }, Handle::Cell | Handle::Task) => {
+            (Boundary::HostArgument { .. }, Handle::Cell | Handle::Task | Handle::Chan) => {
                 "read the value inside the region and perform the operation with something that \
                  does not reach a region"
             }
@@ -171,10 +177,10 @@ impl Boundary<'_> {
                  is in a position to have"
             }
             (Boundary::EntryPoint { .. }, _) => {
-                "call the entry point with data, and let the program make its own cells, tasks \
-                 and continuations"
+                "call the entry point with data, and let the program make its own cells, tasks, \
+                 channels and continuations"
             }
-            (Boundary::EntryAnswer { .. }, Handle::Cell | Handle::Task) => {
+            (Boundary::EntryAnswer { .. }, Handle::Cell | Handle::Task | Handle::Chan) => {
                 "read the value inside the region and answer with something that does not reach \
                  a region"
             }
@@ -239,6 +245,7 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
     match value {
         Value::Cell(_) => Some(Handle::Cell),
         Value::Task(_) => Some(Handle::Task),
+        Value::Chan(_) => Some(Handle::Chan),
 
         Value::Int(_)
         | Value::Fixed(_)
