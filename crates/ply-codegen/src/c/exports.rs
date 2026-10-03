@@ -1,9 +1,9 @@
 //! What a compiled unit says about itself, embedded in its C so loading reads no source. Helpers
-//! bind by position, so a unit serves while the runtime's helper table starts with the unit's.
+//! bind by name, so a unit serves while the runtime has every helper its C calls.
 
 use super::encoding::{count, decode_tables, encode_tables, line};
 use super::load::Library;
-use super::prelude::HELPERS;
+use super::prelude::{helpers, pointer_name};
 use super::tables::Defined;
 use anyhow::{Result, anyhow};
 use ply_eval::{Symbol, Value};
@@ -23,7 +23,7 @@ pub struct HelperShape {
 }
 
 pub fn runtime_helpers() -> Vec<HelperShape> {
-    HELPERS
+    helpers()
         .iter()
         .map(|h| HelperShape {
             name: h.name.to_string(),
@@ -36,13 +36,14 @@ pub fn runtime_helpers() -> Vec<HelperShape> {
 /// A digest of the runtime's whole helper table, for cache keys (stricter than serving needs).
 pub fn helpers_digest() -> String {
     let mut h = blake3::Hasher::new();
-    for helper in HELPERS {
+    for helper in helpers() {
         h.update(format!("{} {} {}\n", helper.name, helper.args, helper.answers).as_bytes());
     }
     h.finalize().to_hex().to_string()
 }
 
-/// Why a unit does not serve this runtime: its first helper the runtime lacks at that position.
+/// Why a unit does not serve this runtime: a helper its C calls that the runtime does not have as
+/// the unit knows it.
 #[derive(Debug)]
 pub struct Unserved(pub String);
 
@@ -86,6 +87,18 @@ pub struct Exports {
     pub buckets: Vec<(u8, Vec<u32>)>,
 }
 
+/// Whether `text` calls `helper` through its pointer, as the emitter writes a call: the name
+/// whole, then `(`.
+fn calls(text: &str, helper: &str) -> bool {
+    let call = format!("{}(", pointer_name(helper));
+    text.match_indices(&call).any(|(at, _)| {
+        !text[..at]
+            .bytes()
+            .next_back()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
 impl Exports {
     pub fn names(&self) -> Vec<String> {
         self.taken.iter().map(|t| t.name.clone()).collect()
@@ -95,41 +108,46 @@ impl Exports {
         self.taken.iter().find(|t| t.name == name)
     }
 
-    /// `None` when the runtime's helper table starts with this unit's.
-    pub fn unserved(&self) -> Option<Unserved> {
-        let runtime = runtime_helpers();
-        for (i, mine) in self.helpers.iter().enumerate() {
-            match runtime.get(i) {
-                Some(theirs) if theirs == mine => {}
-                Some(theirs) => {
-                    return Some(Unserved(format!(
-                        "helper {i} is `{}` taking {} and {}, and this runtime's is `{}` taking {} and {}",
-                        mine.name,
-                        mine.args,
-                        if mine.answers {
-                            "answering"
-                        } else {
-                            "answering nothing"
-                        },
-                        theirs.name,
-                        theirs.args,
-                        if theirs.answers {
-                            "answering"
-                        } else {
-                            "answering nothing"
-                        },
-                    )));
+    /// The address each helper the unit records binds to, in the unit's order. One this runtime
+    /// no longer has binds to nothing, which serves a unit whose C never calls it: `text` is
+    /// that C.
+    pub fn bound(&self, text: &str) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
+        let said = |h: &HelperShape| {
+            format!(
+                "taking {} and {}",
+                h.args,
+                if h.answers {
+                    "answering"
+                } else {
+                    "answering nothing"
                 }
-                None => {
-                    return Some(Unserved(format!(
-                        "helper {i} is `{}`, past the {} this runtime has",
+            )
+        };
+        self.helpers
+            .iter()
+            .map(
+                |mine| match helpers().iter().find(|h| h.name == mine.name) {
+                    Some(h) if h.args == mine.args && h.answers == mine.answers => {
+                        Ok(h.address as *mut std::ffi::c_void)
+                    }
+                    Some(h) => Err(Unserved(format!(
+                        "it was emitted against `{}` {}, and this runtime's is {}",
                         mine.name,
-                        runtime.len()
-                    )));
-                }
-            }
-        }
-        None
+                        said(mine),
+                        said(&HelperShape {
+                            name: h.name.to_string(),
+                            args: h.args,
+                            answers: h.answers,
+                        }),
+                    ))),
+                    None if calls(text, &mine.name) => Err(Unserved(format!(
+                        "it calls `{}`, which this runtime does not have",
+                        mine.name
+                    ))),
+                    None => Ok(std::ptr::null_mut()),
+                },
+            )
+            .collect()
     }
 
     pub fn encode(&self) -> String {

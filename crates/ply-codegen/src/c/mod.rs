@@ -17,7 +17,10 @@ pub use exports::{Exports, Unserved};
 pub use load::{
     BUCKETS_COMPILED, BUCKETS_REUSED, Library, Parts, UNITS_MAPPED, compile_and_load, split,
 };
-pub use prelude::{HELPERS, PRELUDE, RUNTIME_MARK, pointer_name, runtime_header, runtime_object};
+pub use prelude::{
+    PRELUDE, RUNTIME_MARK, builtin_helper_name, helpers, pointer_name, runtime_header,
+    runtime_object,
+};
 pub use toolchain::{Profile, select as select_profile};
 
 /// The sources of the runtime the emitter runs on, as `build.rs` digests them. Not the binary: a
@@ -66,20 +69,11 @@ pub fn unit_head() -> String {
 }
 
 /// What a unit emitted against this runtime is a function of on the runtime's side: the sources
-/// that run while the emitter emits inside a loaded unit, and the helper table its C binds by
-/// position.
+/// that run while the emitter emits inside a loaded unit, and the helpers its C binds.
 pub fn runtime_identity() -> String {
     let mut h = blake3::Hasher::new();
     h.update(semantics_digest().as_bytes());
     h.update(&[0]);
     h.update(exports::helpers_digest().as_bytes());
     h.finalize().to_hex().to_string()
-}
-
-/// The addresses the loaded unit binds, in [`HELPERS`]' order.
-pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
-    HELPERS
-        .iter()
-        .map(|h| h.address as *mut std::ffi::c_void)
-        .collect()
 }
