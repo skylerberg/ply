@@ -1,38 +1,20 @@
 use ply_eval::{Analysis, CheckOutput, Diagnostic, Machine, Provider};
 use std::rc::Rc;
 
-/// What the builder makes of `sources`, `(module name, text)` each written to the file its name
-/// spells: the front end's answer, a refusal's included, and the unit's C.
+/// What the builder makes of `sources`, `(module name, text)` each: the front end's answer, a
+/// refusal's included, and the unit's C.
 #[track_caller]
 fn answered(sources: &[(&str, &str)]) -> ply_machine::runnable::Runnable {
-    let files: Vec<(String, String)> = sources
-        .iter()
-        .map(|(name, src)| {
-            (
-                format!("{}.ply", name.replace('.', "/")),
-                (*src).to_string(),
-            )
-        })
-        .collect();
-    let bytes = ply_machine::builds::answered(&files)
-        .unwrap_or_else(|d| panic!("the builder answers for the fixture: {}", d.message));
-    ply_machine::runnable::decode(&bytes)
-        .unwrap_or_else(|why| panic!("the builder's answer reads: {why}"))
+    let files = ply_machine::builds::module_files(sources);
+    ply_machine::builds::answered_program(&files)
+        .unwrap_or_else(|d| panic!("the builder answers for the fixture: {d}"))
 }
 
 #[track_caller]
 fn accepted(sources: &[(&str, &str)]) -> ply_machine::runnable::Runnable {
-    let answer = answered(sources);
-    let errors: Vec<String> = answer
-        .front
-        .answer
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == ply_eval::Severity::Error)
-        .map(|d| format!("{}: {}", d.code, d.message))
-        .collect();
-    assert!(errors.is_empty(), "the fixture must typecheck: {errors:?}");
-    answer
+    let files = ply_machine::builds::module_files(sources);
+    ply_machine::builds::checked_program(&files)
+        .unwrap_or_else(|d| panic!("the fixture must typecheck: {d}"))
 }
 
 #[track_caller]

@@ -9,15 +9,17 @@ import std.hash (blake3)
 import compiler.front (DefInterface, KnownTestRow, Filing, FiledModule, FiledEntry, FiledTest,
                        FiledDef, FiledDecl, FiledBody, FiledMember, FiledSpan, body_encoding,
                        def_interface_bin, decl_interface_bin, known_test_row_bin)
+import compiler.hash (Prior, hex, prior_bin)
 import compiler.resolve (Diag)
 import compiler.termination (Ends, unknown_summary)
+import compiler.unit (emitter_identity)
 import paths
 import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
 import store.tables (Cache, Stamps, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind,
                      KFn, KType, KEffect, Package, Body, open_cache, flush_cache, fingerprint,
                      put_fingerprint, def_of, put_def, put_decl, put_body, prune, source_key,
                      source_keys, shipped_digest, put_shipped_digest, warnings, filed_load,
-                     put_filed_load)
+                     put_filed_load, filed_priors, put_filed_priors, body)
 import store.twin (on_twin)
 
 // One file a load read: where from, the module it is, and its bytes. The store keys it by its path,
@@ -38,7 +40,8 @@ pub type StdlibMoved = { was: String, now: String, entries: List<ShippedEntry> }
 // What the store holds for the files a load reads: every definition's and test's filed rows,
 // whatever hash each was filed under, and what opening and reading the store degraded past.
 // `intact` holds the paths whose every row is there, decodes, and was filed for the file's text;
-// `filed_load` is the digest the last filing was filed under.
+// `filed_load` is the digest the last filing was filed under, and `priors` what its hashing
+// answered, each with its body.
 pub type Recorded = {
   defs: List<DefInterface>,
   tests: List<KnownTestRow>,
@@ -46,6 +49,7 @@ pub type Recorded = {
   warnings: List<Diag>,
   intact: Map<String, Bool>,
   filed_load: Option<Bytes>,
+  priors: List<Prior>,
 }
 
 // Where a load keeps its store: `.ply-cache` in the project root, under the root's own label, with
@@ -64,11 +68,30 @@ pub fn place_of(paths: List<paths::Resolved>, stamps: Stamps) -> Place =
     None -> { label: "cwd", dir: ".ply-cache", root: ".", stamps: stamps },
   }
 
-// The launcher lays `stamps` beside the shelf as `name digest` lines.
-pub fn shelf_stamps() -> Stamps / {fs.read_file[shelf], abort.raise} =
+// The launcher lays `stamps` beside the shelf as `name digest` lines. A pass is also the emitter's
+// that compiled what ran, which the shelf alone says, so the runtime stamp takes in its identity.
+pub fn shelf_stamps() -> Stamps / {fs.list_dir[shelf], fs.read_file[shelf], abort.raise} =
   match fs.read_file[shelf]("stamps") {
     None -> panic("the shelf carries no stamps; the launcher lays them out beside the modules"),
-    Some(b) -> stamps_of(string_of_bytes_lossy(b)),
+    Some(b) -> {
+      let launched = stamps_of(string_of_bytes_lossy(b));
+      let emitter = emitter_identity(shelf_names(), |n: String| fs.read_file[shelf](n ++ ".ply"));
+      {
+        ..launched,
+        runtime: string_of_bytes(
+          hex(blake3(bytes_concat_all([bytes_of_string(launched.runtime), b"\x00", emitter]))),
+        ),
+      }
+    },
+  }
+
+// The modules the shelf lays out, by name.
+fn shelf_names() -> List<String> / {fs.list_dir[shelf], abort.raise} =
+  match fs.list_dir[shelf](".") {
+    None -> [],
+    Some(files) ->
+      map(filter(files, |f: String| string_ends_with(f, ".ply")), |f: String|
+        string_slice(f, 0, string_len(f) - 4)),
   }
 
 pub fn stamps_of(text: String) -> Stamps / {abort.raise} =
@@ -271,17 +294,43 @@ pub fn known<[r]>(
   );
   let m = moved[r](g.cache, now);
   let last = filed_load[r](m.cache);
+  let p = priors_read[r](last.cache);
   {
     defs: g.defs,
     tests: g.tests,
     stdlib: m.moved,
-    warnings: push_all(diags_of(warnings(last.cache)), match g.unread {
+    warnings: push_all(diags_of(warnings(p.cache)), match g.unread {
       Some(why) -> [unreadable_value(why)],
       None -> [],
     }),
     intact: g.intact,
     filed_load: last.value,
+    priors: p.priors,
   }
+}
+
+// The last filing's priors, each with the body the bodies table holds under its hash; one whose body
+// is not there is hashed again.
+fn priors_read<[r]>(c: Cache) -> { priors: List<Prior>, cache: Cache } / {fs.read[r], abort.raise} = {
+  let filed = filed_priors[r](c);
+  let listed = match filed.value {
+    None -> [],
+    Some(bytes) -> match bin::decode(bytes, bin::list_bin(prior_bin())) {
+      Ok(priors) -> priors,
+      Err(_) -> [],
+    },
+  };
+  fold(
+    listed,
+    { priors: [], cache: filed.cache },
+    |acc: { priors: List<Prior>, cache: Cache }, p: Prior| {
+      let got = body[r](acc.cache, p.hash);
+      match got.value {
+        Some(b) -> { priors: push(acc.priors, { ..p, body: b.bytes }), cache: got.cache },
+        None -> { ..acc, cache: got.cache },
+      }
+    },
+  )
 }
 
 fn push_all<a>(xs: List<a>, ys: List<a>) -> List<a> =
@@ -340,6 +389,7 @@ pub fn file<[r]>(
   whole: Bool,
   now: String,
   load: Bytes,
+  priors: List<Prior>,
 ) -> List<Diag> / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
   let c0 = opened[r](place, sources);
   let c1 = fold(filing.modules, c0, |c: Cache, m: FiledModule|
@@ -369,7 +419,11 @@ pub fn file<[r]>(
   } else { c4 };
   let was = shipped_digest[r](c5);
   let c6 = if was.value == Some(now) { was.cache } else { put_shipped_digest(was.cache, now) };
-  let kept = diags_of(warnings(flush_cache[r](put_filed_load[r](c6, load))));
+  let c7 = put_filed_priors[r](
+    put_filed_load[r](c6, load),
+    bin::encode(map(priors, |p: Prior| { ..p, body: b"" }), bin::list_bin(prior_bin())),
+  );
+  let kept = diags_of(warnings(flush_cache[r](c7)));
   fold(retired[r](place), kept, |diags: List<Diag>, d: Diag| push(diags, d))
 }
 
@@ -422,6 +476,7 @@ fn told(
       false,
       now,
       b"load",
+      [],
     );
     { before: before, after: known[mem](a_place(), shipped_sources(), now).stdlib }
   }).value
@@ -482,9 +537,43 @@ fn reread(filing: Filing, was: Bytes, now: Bytes) -> Recorded / {abort.raise} =
         ],
         packages: [],
       };
-    let filed = file[mem](a_place(), holding(was), filing, true, "b3:now", b"load");
+    let filed = file[mem](a_place(), holding(was), filing, true, "b3:now", b"load", []);
     known[mem](a_place(), holding(now), "b3:now")
   }).value
+
+fn a_prior(hash: Bytes) -> Prior =
+  {
+    name: b"m.f",
+    decl: false,
+    sketch: b"sketch",
+    hash: hash,
+    check: hash,
+    own: None,
+    specs: [],
+    spec_texts: [],
+    spec_checks: [],
+    body: b"",
+  }
+
+test "a filing's priors read back with the bodies filed under their hashes, and one without is dropped" {
+  // The body `one_fn`'s entry names, so the filing's prune keeps it.
+  let filed_body = b"\0f";
+  let hash = blake3(b"f");
+  let read = on_twin(mem_empty(), || {
+    let at = { files: [{ path: "m.ply", name: "m", text: b"f" }], packages: [] };
+    let filed = file[mem](
+      a_place(),
+      at,
+      { ..one_fn(), bodies: [{ hash: hash, body: filed_body }] },
+      true,
+      "b3:now",
+      b"load",
+      [{ ..a_prior(hash), body: filed_body }, a_prior(blake3(b"a body never filed"))],
+    );
+    known[mem](a_place(), at, "b3:now").priors
+  }).value;
+  assert_eq(read, [{ ..a_prior(hash), body: filed_body }])
+}
 
 test "a file's rows are intact while it holds the text they were filed for and each reads back" {
   let same = reread(one_fn(), b"f", b"f");

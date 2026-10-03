@@ -50,8 +50,9 @@ const VERDICT_CODE: &str = env!("PLY_VERDICT_CODE");
 
 /// What a store's groups are a function of beyond their own keys, as `name hex` lines. A front-end
 /// entry is the evaluator's and the Ply that loads and files it; a pass or a claim's evidence is the
-/// runtime's, the Ply that decides and files it, and the emitter's that compiled what ran. A test's
-/// own hash covers every definition it reaches, so the rest of `ply` is in neither.
+/// runtime's and the Ply that decides and files it, and the CLI adds the emitter's identity, which
+/// is the shelf's to say. A test's own hash covers every definition it reaches, so the rest of `ply`
+/// is in neither.
 pub fn stamps() -> String {
     let stamp = |parts: &[&str]| {
         let mut h = blake3::Hasher::new();
@@ -61,7 +62,6 @@ pub fn stamps() -> String {
         }
         h.finalize().to_hex().to_string()
     };
-    let emitter = ply_machine::builds::emitter();
     format!(
         "frontend {}\nruntime {}\n",
         stamp(&[
@@ -69,12 +69,7 @@ pub fn stamps() -> String {
             ply_codegen::c::semantics_digest(),
             FRONT_CODE
         ]),
-        stamp(&[
-            "ply.stamp.runtime.2",
-            RUNTIME_SOURCES,
-            VERDICT_CODE,
-            &emitter
-        ])
+        stamp(&["ply.stamp.runtime.3", RUNTIME_SOURCES, VERDICT_CODE])
     )
 }
 
