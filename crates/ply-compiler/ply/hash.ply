@@ -661,6 +661,7 @@ fn tag_constraint() -> Int = 95
 fn tag_returns_fresh() -> Int = 101
 fn tag_returns_param() -> Int = 102
 fn tag_bounded() -> Int = 103
+fn tag_decreases() -> Int = 104
 
 // An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -911,7 +912,12 @@ fn fn_def(encoder: Encoder, def: FnDef) -> Encoder / {abort.raise} = {
     ..signature,
     values: append(signature.values, map(def.params, |param: Param| param.name.name)),
   };
-  expr(bound, def.body)
+  // A stated measure decides the definition's verdict, so it is part of what was written.
+  let measured: Encoder = match def.decreases {
+    Some(m) -> expr(put_tag(bound, tag_decreases()), m),
+    None -> bound,
+  };
+  expr(measured, def.body)
 }
 
 // A `returns` clause names a parameter by its position, so renaming one moves nothing.
@@ -4304,7 +4310,14 @@ fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.r
   let row = read_opt(ret.decoder, |g: Decoder| print_row(printer, g));
   let cs = read_count(row.decoder);
   let derives: DecodedList = read_many(cs.decoder, cs.value, print_constraint);
-  let body = print_expr(printer, { ..derives.decoder, values: n.value }, 0);
+  let scoped: Decoder = { ..derives.decoder, values: n.value };
+  let measure: DecodedOption = if peek(scoped) != tag_decreases() {
+    { decoder: scoped, text: b"", some: false }
+  } else {
+    let m = print_expr(printer, expect(scoped, tag_decreases(), b"a measure"), 0);
+    { decoder: m.decoder, text: m.text, some: true }
+  };
+  let body = print_expr(printer, measure.decoder, 0);
   {
     decoder: body.decoder,
     text: bytes_concat_all([
@@ -4317,6 +4330,7 @@ fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.r
       prefixed(ret, b" -> "),
       prefixed(row, b" / "),
       if cs.value > 0 { bytes_concat(b" where ", joined(derives.texts, b", ")) } else { b"" },
+      if measure.some { bytes_concat(b"\n  decreases ", measure.text) } else { b"" },
       b" =\n  ",
       body.text,
     ]),
@@ -5195,6 +5209,22 @@ fn printed_of(
 
 fn holds_text(text: Bytes, part: Bytes) -> Bool =
   match bytes_index_of(text, part) { Some(_) -> true, None -> false }
+
+test "a stated measure moves a definition's hash, and prints back to what it was stored under" {
+  let src = b"fn f(n: Int) -> Int decreases n = if n <= 0 { 0 } else { f(n - 1) }";
+  let plain = hash_dump([
+    { name: b"m", src: b"fn f(n: Int) -> Int = if n <= 0 { 0 } else { f(n - 1) }" },
+  ]);
+  let measured = hash_dump([{ name: b"m", src: src }]);
+  assert(dumped_hash(plain, b"m.f") != dumped_hash(measured, b"m.f"));
+  let out = hash_index(indexed([{ name: b"m", src: src }]));
+  let ms = printed_of(out, []);
+  assert(holds_text(at(ms, 0).text, b"decreases"));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
 
 test "printed bodies hash back to what they were stored under, under their own names" {
   let out = hash_index(
