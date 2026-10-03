@@ -1522,6 +1522,13 @@ Strings are indexed by character, bytes by byte.
 | `float_of_string(s: String) -> Option<Float>` | `Float` literal syntax with a sign; `None` for `inf`/`NaN` |
 | `decimal_to_string(d: Decimal) -> String` | |
 | `bits_of_float(f: Float) -> Int`, `float_of_bits(n: Int) -> Float` | IEEE-754 bit pattern; total |
+| `float_of_int(n: Int) -> Float` | nearest; exact up to `2^53` |
+| `int_of_float(x: Float, mode: Rounding) -> Option<Int>` | `x` rounded to a whole number by `mode`; `None` for `NaN`, an infinity, or one past `Int` |
+| `floor`, `ceil` `(x: Float) -> Float` | the nearest whole number below, above |
+| `round(x: Float, mode: Rounding) -> Float` | `x` at a whole number, chosen as `mode` chooses |
+| `sqrt`, `exp`, `ln`, `log2`, `log10` `(x: Float) -> Float` | `sqrt` is correctly rounded; `ln(0.0)` is `-inf` and a logarithm below zero `NaN` |
+| `sin`, `cos`, `tan`, `asin`, `acos`, `atan` `(x: Float) -> Float` | radians |
+| `pow(x: Float, y: Float) -> Float`, `atan2(y: Float, x: Float) -> Float`, `hypot(x: Float, y: Float) -> Float` | `atan2` in `[-pi, pi]`; `hypot` does not overflow on the way |
 | `u8_of_int(n: Int) -> U8` … `i128_of_int(n: Int) -> I128` | ten; raise if out of range |
 | `int_of_u8(n: U8) -> Int` … `int_of_i128(n: I128) -> Int` | ten; total but `int_of_u64`, `int_of_u128` and `int_of_i128` |
 | `u128_to_string(n: U128) -> String`, `i128_to_string(n: I128) -> String` | decimal |
@@ -1531,6 +1538,12 @@ Strings are indexed by character, bytes by byte.
 | `checked_neg(a: t) -> Option<t>` | any integer `t`; `None` for an unsigned nonzero `a` and a signed type's least value |
 | `rotr(x: t, n: Int) -> t` | rotate right at `t`'s width, count modulo the width |
 | `rotr32(x: Int, n: Int) -> Int` | rotate the low 32 bits of an `Int` |
+
+The float functions answer the same bits on every machine: they are computed by
+Ply, not asked of the platform, whose answers may differ in the last place, and
+every `NaN` they answer is the one `std.float.nan()` is. A result is cached and
+the prover evaluates ground terms, so an answer that moved with the machine would
+be a wrong cache hit.
 
 ## 13. The standard library
 
@@ -2802,13 +2815,17 @@ pub fn nan() -> Float
 pub fn infinity() -> Float
 pub fn neg_infinity() -> Float
 pub fn max_value() -> Float
+pub fn pi() -> Float
+pub fn e() -> Float
+pub fn tau() -> Float
 ```
 
 A `Float`'s classification, sign and magnitude, read off its IEEE-754 bits, so
 nothing here raises. `is_sign_negative` holds for `-0.0` and a negative NaN too.
 `trunc` goes toward zero and keeps the sign, leaving a NaN or an infinity as it
 is. `pow2(k)` is `2^k` exactly, through the subnormals down to `2^-1074`, zero
-below that and an infinity above `2^1023`.
+below that and an infinity above `2^1023`. `pi`, `e` and `tau` are the nearest
+`Float`s to π, Euler's number and 2π; the arithmetic over them is §12.3's.
 
 ### 13.35 `std.value`
 
