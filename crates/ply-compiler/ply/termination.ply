@@ -31,9 +31,10 @@ pub type Ending =
   | Ends
   // Only by the measures its group states with `decreases`, which nothing has checked yet.
   | Stated
-  // A call by which it may not return: back into its group without descending, or, `through`, to a
-  // definition that may not return.
-  | Diverges({ at: Span, through: Option<Bytes> })
+  // A call by which it may not return: back into its group without descending, on the `loop` of
+  // calls that does not, or with no `loop` where the group is past what the check follows; or,
+  // `through`, to a definition that may not return.
+  | Diverges({ at: Span, through: Option<Bytes>, loop: List<Span> })
 
 // A parameter, or a field reached from one through records.
 pub type Place = { param: Int, path: List<Bytes> }
@@ -148,8 +149,8 @@ type Measure =
 // From the caller's measure `a` to the callee's `b`: smaller when `strict`, otherwise no larger.
 type Arc = { a: Int, b: Int, strict: Bool }
 
-// What a chain of calls from `from` to `to` does to the measures; `span` is its first call.
-type Graph = { from: Int, to: Int, arcs: List<Arc>, span: Span }
+// What a chain of calls from `from` to `to` does to the measures; `calls` are the chain's, in order.
+type Graph = { from: Int, to: Int, arcs: List<Arc>, calls: List<Span> }
 
 // --- The verdict ----------------------------------------------------------------------------------
 
@@ -162,20 +163,16 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
   let lost = fold(seen, None, |acc: Option<Span>, x: Seen|
     match acc { Some(_) -> acc, None -> x.lost });
   let own = match lost {
-    Some(span) -> Diverges({ at: span, through: None }),
+    Some(span) -> Diverges({ at: span, through: None, loop: [] }),
     None -> match looping(g, calls, false) {
       None -> Ends,
-      Some(first) -> if !stating { Diverges({ at: first, through: None }) } else {
-        match looping(g, calls, true) {
-          None -> Stated,
-          Some(again) -> Diverges({ at: again, through: None }),
-        }
-      },
+      Some(first) -> if !stating { looped(first) }
+      else { match looping(g, calls, true) { None -> Stated, Some(again) -> looped(again) } },
     },
   };
   let out = |e: Ending, o: Outside|
     weaker(e, match (g.ending_of)(o.name) {
-      Diverges(_) -> Diverges({ at: o.span, through: Some(o.name) }),
+      Diverges(_) -> Diverges({ at: o.span, through: Some(o.name), loop: [] }),
       other -> other,
     });
   let settled = match own { Diverges(_) -> Ends, other -> other };
@@ -188,12 +185,18 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
   }
 }
 
+fn looped(u: Unending) -> Ending = Diverges({ at: u.at, through: None, loop: u.loop })
+
+// A loop that may not shrink any measure: its first call and all of them, or, past what the check
+// follows, a call into the group and no loop.
+type Unending = { at: Span, loop: List<Span> }
+
 fn weaker(a: Ending, b: Ending) -> Ending =
   match a { Diverges(_) -> a, Stated -> match b { Diverges(_) -> b, _ -> a }, Ends -> b }
 
-// A call on a loop that may not shrink any measure; `None` when every loop does. With `stated`,
+// The calls of a loop that may not shrink any measure; `None` when every loop does. With `stated`,
 // the measures the members state count as shrinking at every call between two of them.
-fn looping(g: Group, calls: List<List<Call>>, stated: Bool) -> Option<Span> / {abort.raise} = {
+fn looping(g: Group, calls: List<List<Call>>, stated: Bool) -> Option<Unending> / {abort.raise} = {
   let measures = spread(
     calls,
     map(range(0, len(g.defs)), |i: Int| measures_of(g, i, at(calls, i), stated)),
@@ -212,9 +215,14 @@ fn shrinks(x: Graph) -> Bool =
 // path is found once its prefix is: the first loop found that shrinks no measure, or `None` once
 // every path is found. Past a number of paths this check does not search, the group is not read as
 // ending.
-type Closure = { buckets: Map<Int, List<Graph>>, queue: List<Graph>, next: Int, bad: Option<Span> }
+type Closure = {
+  buckets: Map<Int, List<Graph>>,
+  queue: List<Graph>,
+  next: Int,
+  bad: Option<Unending>,
+}
 
-fn searched(n: Int, calls: List<Graph>) -> Option<Span> / {abort.raise} = {
+fn searched(n: Int, calls: List<Graph>) -> Option<Unending> / {abort.raise} = {
   let from = map(range(0, n), |i: Int| filter(calls, |x: Graph| x.from == i));
   let start = fold(
     calls,
@@ -224,8 +232,9 @@ fn searched(n: Int, calls: List<Graph>) -> Option<Span> / {abort.raise} = {
   iterate(start, closure_bound() + 2, |c: Closure|
     match c.bad {
       Some(_) -> Stop(c.bad),
-      None -> if c.next >= len(c.queue) { Stop(None) }
-      else if len(c.queue) > closure_bound() { Stop(Some(at(c.queue, 0).span)) } else {
+      None -> if c.next >= len(c.queue) { Stop(None) } else if len(c.queue) > closure_bound() {
+        Stop(Some({ at: at(at(c.queue, 0).calls, 0), loop: [] }))
+      } else {
         let x = at(c.queue, c.next);
         let grown = fold(at(from, x.to), c, |acc: Closure, y: Graph|
           enqueued(acc, n, composed(x, y)));
@@ -244,13 +253,15 @@ fn enqueued(c: Closure, n: Int, x: Graph) -> Closure / {abort.raise} = {
       queue: push(c.queue, x),
       bad: match c.bad {
         Some(_) -> c.bad,
-        None -> if x.from == x.to && idempotent(x) && !shrinks(x) { Some(x.span) } else { None },
+        None -> if x.from == x.to && idempotent(x) && !shrinks(x) {
+          Some({ at: at(x.calls, 0), loop: x.calls })
+        } else { None },
       },
     }
   }
 }
 
-fn closure_bound() -> Int = 2000
+fn closure_bound() -> Int = 10000
 
 fn added(gs: List<Graph>, x: Graph) -> List<Graph> =
   if fold(gs, false, |found: Bool, y: Graph|
@@ -270,7 +281,7 @@ fn composed(x: Graph, y: Graph) -> Graph / {abort.raise} =
       fold(y.arcs, acc, |a: List<Arc>, s: Arc|
         if r.b != s.a { a }
         else { with_arc(a, { a: r.a, b: s.b, strict: r.strict || s.strict }) })),
-    span: x.span,
+    calls: fold(y.calls, x.calls, |acc: List<Span>, sp: Span| push(acc, sp)),
   }
 
 // Keeps the stronger of two arcs between the same measures.
@@ -368,7 +379,7 @@ fn call_graph(g: Group, measures: List<List<Measure>>, me: Int, c: Call) -> Grap
           Some(strict) -> with_arc(a, { a: i, b: j, strict: strict }),
         })
     }),
-    span: c.span,
+    calls: [c.span],
   }
 }
 
@@ -1506,24 +1517,7 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
       walked.seen
     },
     EBlock(b) -> {
-      let r = fold(b.stmts, { s: s, acc: acc }, |st: { s: Scope, acc: Seen }, x: Stmt|
-        match x {
-          SLet(l) -> match l.pat {
-            PVar(_) -> match l.value {
-              ELambda(_) -> { s: statement_scope(context, st.s, x), acc: st.acc },
-              _ ->
-                { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
-            },
-            _ ->
-              { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
-          },
-          SLetElse(l) ->
-            {
-              s: statement_scope(context, st.s, x),
-              acc: walk(context, st.s, walk(context, st.s, st.acc, l.value), l.fallback),
-            },
-          SExpr(y) -> { s: st.s, acc: walk(context, st.s, st.acc, y) },
-        });
+      let r = statements(context, s, acc, b.stmts);
       match b.tail { Some(t) -> walk(context, r.s, r.acc, t), None -> r.acc }
     },
     ERecord(r) -> fold(r.fields, acc, |a: Seen, f: RecField| walk(context, s, a, f.value)),
@@ -1555,6 +1549,30 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
     EParallel(p) -> fold(p.branches, acc, |a: Seen, x: Expr| walk(context, s, a, x)),
     EBad(_) -> acc,
   }
+
+// A block's statements walked, and the scope past them.
+fn statements(
+  context: MemberContext,
+  s: Scope,
+  acc: Seen,
+  stmts: List<Stmt>,
+) -> { s: Scope, acc: Seen } / {abort.raise} =
+  fold(stmts, { s: s, acc: acc }, |st: { s: Scope, acc: Seen }, x: Stmt|
+    match x {
+      SLet(l) -> match l.pat {
+        PVar(_) -> match l.value {
+          ELambda(_) -> { s: statement_scope(context, st.s, x), acc: st.acc },
+          _ -> { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
+        },
+        _ -> { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
+      },
+      SLetElse(l) ->
+        {
+          s: statement_scope(context, st.s, x),
+          acc: walk(context, st.s, walk(context, st.s, st.acc, l.value), l.fallback),
+        },
+      SExpr(y) -> { s: st.s, acc: walk(context, st.s, st.acc, y) },
+    })
 
 // Past this many lambdas' bodies read within one another, a body is not read.
 fn inline_bound() -> Int = 8
@@ -1723,6 +1741,42 @@ fn handed(
             called(a, { callee: t, args: call, facts: s.facts, span: v.span })),
         _ -> walk(context, s, acc, x),
       },
+    },
+    // A function an `if`, a `match` or a block answers is called as each branch would be.
+    EBlock(b) -> {
+      let r = statements(context, s, acc, b.stmts);
+      match b.tail { Some(t) -> handed(context, r.s, r.acc, t, calls), None -> r.acc }
+    },
+    EIf(i) ->
+      handed(
+        context,
+        assume(context, s, i.cond, false),
+        handed(
+          context,
+          assume(context, s, i.cond, true),
+          walk(context, s, acc, i.cond),
+          i.then_branch,
+          calls,
+        ),
+        i.else_branch,
+        calls,
+      ),
+    EMatch(m) -> {
+      let t = term(context, s, m.scrutinee);
+      fold(m.arms, walk(context, s, acc, m.scrutinee), |a: Seen, arm: MatchArm| {
+        let inside = bind(s, arm.pat, t);
+        match arm.guard {
+          None -> handed(context, inside, a, arm.body, calls),
+          Some(g) ->
+            handed(
+              context,
+              assume(context, inside, g, true),
+              walk(context, inside, a, g),
+              arm.body,
+              calls,
+            ),
+        }
+      })
     },
     _ -> walk(context, s, acc, x),
   }
