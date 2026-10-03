@@ -4,8 +4,11 @@
 
 import harness (Ran, Server, write, read, fresh, working, repo, reserve, serving, connected, sent,
                 hang_up, stop, on_disk, on_disk_with, spawned, said, stdout, json_of, at, path, nth,
-                str, truth, int, shown, concatenated, Here, Repo, Shelf, Spawned, Reached, Wire,
-                Clock)
+                str, truth, int, items, shown, concatenated, Here, Repo, Shelf, Spawned, Reached,
+                Wire, Clock)
+import compiler.front (KnownDefRow)
+import compiler.interface (CompiledPackage, compiled_package_bin, envelope_of, enveloped)
+import std.bin
 import std.certgen (certgen)
 import std.fs (fs)
 import std.json
@@ -163,8 +166,14 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
   assert_eq(str(at(nth(at(index("orders"), "versions"), 0), "digest")), published);
   assert_eq(read("store/orders/0.1.0/package.plyz.b3"), Some(published ++ "\n"));
 
-  // A version is published once; a publish needs a token the name maps to.
+  // A version is published once: the same bytes again are what the registry holds, and other bytes
+  // under that version are refused. A publish needs a token the name maps to.
+  let again = asking(registry, true, ["publish", "orders", "--json"]);
+  ok(again);
+  assert(truth(at(json_of(again), "already")), Some(said(again)));
+  replaced("orders/lib.ply", "n * 2", "2 * n");
   refused(asking(registry, true, ["publish", "orders"]), "E0144", "409");
+  replaced("orders/lib.ply", "2 * n", "n * 2");
   refused(asking(registry, false, ["publish", "orders"]), "E0141", "PLY_REGISTRY_TOKEN");
 
   // Nothing reads the registry but `ply resolve`: before it, the dependency is not there.
@@ -221,6 +230,102 @@ test/nondet "a library is published, resolved, built, and its tampered archive r
   // With no lock, the index's own digest is what the archive is held to.
   removed("app/ply.lock");
   refused(asking(registry, false, ["resolve", "app"]), "E0142", "index lists");
+  stop(registry.server)
+}
+
+// The interface at `slot` with `orders.lib.double`'s row claiming what its body never performs.
+fn tampered(slot: String) -> Unit / {fs.read_file[cwd], fs.write_file[cwd]} =
+  match fs.read_file[cwd](slot) {
+    None -> panic("`" ++ slot ++ "` reads"),
+    Some(bytes) -> match envelope_of(bytes) {
+      None -> panic("`" ++ slot ++ "` is framed"),
+      Some(e) -> match bin::decode(e.payload, compiled_package_bin()) {
+        Err(_) -> panic("`" ++ slot ++ "` holds a package"),
+        Ok(p) -> {
+          let forged: CompiledPackage = {
+            ..p,
+            defs: map(p.defs, |r: KnownDefRow|
+              if r.name == b"orders.lib.double" { { ..r, performed: b"orders.lib.forged" } }
+              else { r }),
+          };
+          if !fs.write_file[cwd](
+              slot,
+              enveloped({ ..e, payload: bin::encode(forged, compiled_package_bin()) }),
+            ) { panic("`" ++ slot ++ "` was not written") }
+        },
+      },
+    },
+  }
+
+test/nondet "a dependency's first load reads the interface its publisher sent, which re-derives from its source" {
+  fresh();
+  let registry = start(None);
+  ok(on_disk(["new", "orders", "--lib"]));
+  let out = asking(registry, true, ["publish", "orders", "--json"]);
+  ok(out);
+  let semantics = str(at(json_of(out), "semantics"));
+  assert(exists("store/orders/0.1.0/interface/" ++ semantics), Some(said(out)));
+
+  an_app();
+  let resolved = asking(registry, false, ["resolve", "app", "--json"]);
+  ok(resolved);
+  assert(truth(at(nth(at(json_of(resolved), "packages"), 0), "interface")), Some(said(resolved)));
+  let slot = "app/.ply-cache/registry/orders/.interface/" ++ semantics;
+  assert(exists(slot), None);
+
+  let first = on_disk(["check", "app", "--json"]);
+  ok(first);
+  let stubbed = map(items(path(json_of(first), ["front_end", "stubbed"])), str);
+  assert(fold(stubbed, false, |hit: Bool, m: String| hit || m == "orders.lib"), Some(said(first)));
+  ok(on_disk(["check", "app", "--verify-deps"]));
+
+  tampered(slot);
+  refused(on_disk(["check", "app", "--verify-deps"]), "E0149", "`orders.lib.double`'s row");
+  stop(registry.server)
+}
+
+fn versioned(from: String, to: String) -> Unit / {Here} =
+  replaced("orders/ply.pkg", "version: " ++ from, "version: " ++ to)
+
+test/nondet "a version is held to the bump its changes need, and `contracts` lists them" {
+  fresh();
+  let registry = start(None);
+  ok(on_disk(["new", "orders", "--lib"]));
+  ok(asking(registry, true, ["publish", "orders"]));
+
+  // A new definition is a minor's to add, never a patch's.
+  replaced(
+    "orders/lib.ply",
+    "pub fn double(n: Int) -> Int = n * 2\n",
+    "pub fn double(n: Int) -> Int = n * 2\n\npub fn triple(n: Int) -> Int = n * 3\n",
+  );
+  versioned("{ major: 0, minor: 1, patch: 0 }", "{ major: 0, minor: 1, patch: 1 }");
+  refused(asking(registry, true, ["publish", "orders"]), "E0150", "adds `orders.lib.triple`");
+  versioned("{ major: 0, minor: 1, patch: 1 }", "{ major: 0, minor: 2, patch: 0 }");
+  ok(asking(registry, true, ["publish", "orders"]));
+
+  // An `ensures` moves what `double` promises: a major's to make.
+  replaced(
+    "orders/lib.ply",
+    "pub fn double(n: Int) -> Int = n * 2",
+    "pub fn double(n: Int) -> Int ensures result == n + n = n * 2",
+  );
+  versioned("{ major: 0, minor: 2, patch: 0 }", "{ major: 0, minor: 2, patch: 1 }");
+  refused(
+    asking(registry, true, ["publish", "orders"]),
+    "E0150",
+    "changes what `orders.lib.double` promises",
+  );
+  versioned("{ major: 0, minor: 2, patch: 1 }", "{ major: 1, minor: 0, patch: 0 }");
+  ok(asking(registry, true, ["publish", "orders"]));
+
+  let listed = asking(registry, false, ["contracts", "orders", "0.1.0", "1.0.0", "--json"]);
+  ok(listed);
+  let j = json_of(listed);
+  assert_eq(map(items(at(j, "changed")), str), ["orders.lib.double"]);
+  assert_eq(map(items(at(j, "added")), str), ["orders.lib.triple"]);
+  assert_eq(str(at(j, "needs")), "major");
+  assert(truth(at(j, "kept")), Some(said(listed)));
   stop(registry.server)
 }
 
