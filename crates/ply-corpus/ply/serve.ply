@@ -162,34 +162,34 @@ pub type Point = { load: kit::Load, sample: Sample }
 // A server's points, its answer to `GET /health`, and how it stopped.
 pub type Measured = { points: List<Point>, health: http::Response, stop: Stop }
 
-fn connections(a: Args) -> Int / {abort.raise} = {
-  let per = if a.per_conn < 1 { 1 } else { a.per_conn };
-  (a.requests + per - 1) / per
+fn connections(args: Args) -> Int / {abort.raise} = {
+  let per = if args.per_conn < 1 { 1 } else { args.per_conn };
+  (args.requests + per - 1) / per
 }
 
-fn load_at(a: Args, port: Int, clients: Int) -> kit::Load / {abort.raise} =
+fn load_at(args: Args, port: Int, clients: Int) -> kit::Load / {abort.raise} =
   {
     port: port,
     routes: ["/health"],
-    connections: connections(a),
+    connections: connections(args),
     concurrency: clients,
-    per_conn: a.per_conn,
+    per_conn: args.per_conn,
     trust: None,
   }
 
 // A server's points at each of `clients`, the best of `repeats` runs each, and its `/health`.
 fn points_on(
   k: Kit,
-  a: Args,
-  s: Server,
+  args: Args,
+  server: Server,
   clients: List<Int>,
 ) -> Result<{ points: List<Point>, health: http::Response }, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], abort.raise} =
-  match kit::fetch(s.port, "/health") {
+  match kit::fetch(server.port, "/health") {
     Err(why) -> Err(why),
     Ok(health) -> match kit::all_of(
         map(clients, |c: Int| {
-          let l = load_at(a, s.port, c);
-          match kit::measured(k, l, a.repeats) {
+          let l = load_at(args, server.port, c);
+          match kit::measured(k, l, args.repeats) {
             Err(why) -> Err(why),
             Ok(sample) -> Ok({ load: l, sample: sample }),
           }
@@ -200,23 +200,24 @@ fn points_on(
     },
   }
 
-fn rate(p: Point) -> Int / {abort.raise} = stats::per_second(p.sample.answered, p.sample.wall_us)
+fn rate(point: Point) -> Int / {abort.raise} =
+  stats::per_second(point.sample.answered, point.sample.wall_us)
 
 fn at_clients(ps: List<Point>, clients: Int) -> Option<Point> =
-  fold(ps, None, |found: Option<Point>, p: Point|
-    if p.load.concurrency == clients { Some(p) } else { found })
+  fold(ps, None, |found: Option<Point>, point: Point|
+    if point.load.concurrency == clients { Some(point) } else { found })
 
 // Every request answered 200, and for the desk, its rate as a share of the floor's at the same
 // number of clients.
 fn point_rows(name: String, mine: List<Point>, floor: List<Point>) -> List<Row> / {abort.raise} =
-  map(mine, |p: Point| {
-    let versus = match at_clients(floor, p.load.concurrency) {
-      Some(f) -> [number("floor_percent", stats::percent(rate(p), rate(f)), "%")],
+  map(mine, |point: Point| {
+    let versus = match at_clients(floor, point.load.concurrency) {
+      Some(f) -> [number("floor_percent", stats::percent(rate(point), rate(f)), "%")],
       None -> [],
     };
     {
-      ..row(name ++ ", " ++ kit::clients_text(p.load.concurrency), kit::complete(200), list::flatten([kit::measurements_of(p.load, p.sample, 200), versus])),
-      detail: kit::detail_of(p.sample),
+      ..row(name ++ ", " ++ kit::clients_text(point.load.concurrency), kit::complete(200), list::flatten([kit::measurements_of(point.load, point.sample, 200), versus])),
+      detail: kit::detail_of(point.sample),
     }
   })
 
@@ -251,7 +252,7 @@ fn measured_on<[l]>(
   args: List<String>,
   clients: List<Int>,
 ) -> Result<Measured, String> / {process.start[l], process.output_line[l], process.wait[l], process.signal[l], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms, abort.raise} =
-  match kit::serving[l](k, name, args, |s: Server| points_on(k, a, s, clients)) {
+  match kit::serving[l](k, name, args, |server: Server| points_on(k, a, server, clients)) {
     Err(why) -> Err(why),
     Ok(done) -> Ok({ points: done.value.points, health: done.value.health, stop: done.stop }),
   }
@@ -270,17 +271,17 @@ fn threaded_floor() -> String = "floor, a thread per connection"
 // The floor one connection at a time and then a thread per connection, each started, loaded and
 // stopped before the next.
 fn floors_served(
-  k: Kit,
-  a: Args,
+  kit: Kit,
+  args: Args,
 ) -> Result<Floors, String> / {process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms, abort.raise} =
-  match measured_on[http_floor](k, a, "floor-sequential", ["sequential", "0"], [1]) {
+  match measured_on[http_floor](kit, args, "floor-sequential", ["sequential", "0"], [1]) {
     Err(why) -> Err(why),
     Ok(sequential) -> match measured_on[http_floor](
-        k,
-        a,
+        kit,
+        args,
         "floor-threads",
         ["threads", "0"],
-        a.concurrency,
+        args.concurrency,
       ) {
       Err(why) -> Err(why),
       Ok(threads) -> Ok({ sequential: sequential, threads: threads }),
@@ -290,27 +291,27 @@ fn floors_served(
 // The desk one connection at a time and a task per connection, then the floor when the runner
 // bound one.
 fn all_served(
-  k: Kit,
-  a: Args,
+  kit: Kit,
+  args: Args,
 ) -> Result<Servers, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.bound[http_floor], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms, abort.raise} =
   match measured_on[ply](
-      k,
-      a,
+      kit,
+      args,
       "desk-sequential",
-      served::desk_args(k, served::twin("sequential")),
+      served::desk_args(kit, served::twin("sequential")),
       [1],
     ) {
     Err(why) -> Err(why),
     Ok(desk) -> match measured_on[ply](
-        k,
-        a,
+        kit,
+        args,
         "desk-task-per-connection",
-        served::desk_args(k, served::twin("task-per-connection")),
-        a.concurrency,
+        served::desk_args(kit, served::twin("task-per-connection")),
+        args.concurrency,
       ) {
       Err(why) -> Err(why),
       Ok(desk_tasks) -> if process.bound[http_floor]() {
-        match floors_served(k, a) {
+        match floors_served(kit, args) {
           Err(why) -> Err(why),
           Ok(floors) -> Ok({ desk: desk, desk_tasks: desk_tasks, floors: Some(floors) }),
         }
@@ -357,14 +358,14 @@ pub fn load_rows(s: Servers) -> List<Row> / {abort.raise} = {
 // --- The report ------------------------------------------------------------------------
 
 pub fn run(
-  a: Args,
+  args: Args,
 ) -> Result<report::Report, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.bound[http_floor], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], config.get[env], fs.read_file[work], fs.remove[work], fs.create_dir[work], fs.read[repo], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms, abort.raise} = {
-  let k = { repo: a.repo, scratch: under(a.scratch, "serve") };
+  let k = { repo: args.repo, scratch: under(args.scratch, "serve") };
   match kit::prepare(k) {
     Err(why) -> Err(why),
     Ok(_) -> {
-      let layers = if list::contains(a.sections, "layers") {
-        match kit::timed(k, "layers.ply", a.iterations, a.repeats) {
+      let layers = if list::contains(args.sections, "layers") {
+        match kit::timed(k, "layers.ply", args.iterations, args.repeats) {
           Err(why) -> Err(why),
           Ok(j) -> match layers_of(j) {
             Err(why) -> Err(why),
@@ -372,14 +373,14 @@ pub fn run(
           },
         }
       } else { Ok([]) };
-      let scans = if list::contains(a.sections, "scans") {
-        match kit::timed(k, "scans.ply", a.iterations, a.repeats) {
+      let scans = if list::contains(args.sections, "scans") {
+        match kit::timed(k, "scans.ply", args.iterations, args.repeats) {
           Err(why) -> Err(why),
           Ok(j) -> match scans_of(j) { Err(why) -> Err(why), Ok(ss) -> Ok(scan_rows(ss)) },
         }
       } else { Ok([]) };
-      let load = if list::contains(a.sections, "load") {
-        match all_served(k, a) { Err(why) -> Err(why), Ok(servers) -> Ok(load_rows(servers)) }
+      let load = if list::contains(args.sections, "load") {
+        match all_served(k, args) { Err(why) -> Err(why), Ok(servers) -> Ok(load_rows(servers)) }
       } else { Ok([]) };
       match kit::all_of([layers, scans, load]) {
         Err(why) -> Err(why),
@@ -389,8 +390,8 @@ pub fn run(
             "serve — what one request costs, and where",
             list::flatten(parts),
             [
-              { key: "sections", value: array(map(a.sections, |s: String| Str(s))) },
-              { key: "per_conn", value: Number(decimal_of_int(a.per_conn)) },
+              { key: "sections", value: array(map(args.sections, |s: String| Str(s))) },
+              { key: "per_conn", value: Number(decimal_of_int(args.per_conn)) },
             ],
           ),
       }
@@ -402,7 +403,8 @@ pub fn run(
 
 fn layer(name: String, nanos: Int) -> Layer = { name: name, what: name, nanos: nanos }
 
-fn verdicts(rows: List<Row>) -> List<Bool> = map(report::judge(rows), |j: Judged| report::passed(j))
+fn verdicts(rows: List<Row>) -> List<Bool> =
+  map(report::judge(rows), |judged: Judged| report::passed(judged))
 
 test "a layer is judged against the whole it is part of, and the loop against the cheapest layer" {
   let rows = layer_rows([
@@ -447,7 +449,7 @@ test "the builtins are judged against the folds over the same head, and a head w
     { scans: "folds", headers: 8, bytes: 500, nanos: 800 },
     { scans: "builtins", headers: 16, bytes: 900, nanos: 900 },
   ]);
-  assert_eq(map(report::judge(rows), |j: Judged| j.verdict), [
+  assert_eq(map(report::judge(rows), |judged: Judged| judged.verdict), [
     Pass,
     Fail([ns("builtins", 900), ns("folds", 800)]),
     Inconclusive("not every one of builtins, folds was measured"),
