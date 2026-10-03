@@ -1,6 +1,7 @@
 // `ply publish` — a library, sent to the registry `PLY_REGISTRY` names: the `.plyz` `ply build`
-// writes for it, uploaded under its name and version with the digest its bytes seal. The registry
-// recomputes that digest and refuses a mismatch, and a version it already holds is never replaced.
+// writes for it, uploaded under its name and version with the digest its bytes seal, then the
+// interface a consumer reads it through. The registry recomputes that digest and refuses a
+// mismatch, and a version it already holds is never replaced.
 
 import args (Flags, style_of)
 import builder (Loaded)
@@ -10,17 +11,26 @@ import env (env)
 import lock
 import paths (Resolved, here)
 import program (Program, Timed, front_of, timed_uncached)
-import registry (Base, base_of, exchange, put, refused_by, release_target, said, token_variable,
-                 unasked, unset, untakeable, variable)
+import registry (Base, base_of, exchange, interface_target, put, refused_by, release_target, said,
+                 token_variable, unasked, unset, untakeable, variable)
+import interfaces
+import semantics
+import sources (Embed, File, shelf)
 import report (Answer, ind, ok_code, count_of, refused, reported)
 import style (Style, green)
+import contracts (as_consumed, moved, previous, promised, published_promises, refusal)
+import remote
+import compiler.hash (Contract)
+import compiler.interface (compile_package, compiled_package_bin, enveloped)
+import compiler.pkg (Supplied, registry_key)
 import compiler.plyx (digest_text)
-import compiler.resolve (Diag)
+import compiler.resolve (Diag, diag1)
+import std.bin
 import std.fs (fs)
 import std.json (Json, Bool, Number, Str, object, to_string)
 import std.net (net)
 import std.time (time)
-import std.pkg (Dep, Manifest, Path, Git, Registry, Version, render_version)
+import std.pkg (Dep, Manifest, Path, Git, Registry, Release, Version, render_version)
 
 fn root_of(flags: Flags) -> String =
   match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." }
@@ -62,11 +72,75 @@ pub fn unpublishable(m: Manifest, mains: Int) -> Option<Diag> =
     },
   }
 
+// --- What a consumer reads, and what it was promised before ---------------------------
+
+// What `ply publish` sends beside the archive, and what the version promises its consumers.
+type Cut = { envelope: Bytes, promised: List<Contract> }
+
+// Cut from a load of the package as a consumer makes one, so its modules are named as every
+// consumer names them, and each stub is keyed by what this load read: a consumer whose closure
+// differs reads those modules from source instead.
+fn cut_of(
+  loaded: Program,
+  m: Manifest,
+  archive: String,
+) -> Result<Cut, List<Diag>> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let slot = registry_key(loaded.pkgs.root, bytes_of_string(m.name));
+  let mine: Supplied = {
+    root: slot,
+    manifest: loaded.pkgs.manifest,
+    modules: map(loaded.files, |f: File| { name: bytes_of_string(f.module), src: f.text }),
+  };
+  let shelved = shelf();
+  let embeds = map(loaded.embeds, |e: Embed|
+    if e.embedded.root == loaded.pkgs.root { { ..e.embedded, root: slot } } else { e.embedded });
+  match as_consumed(loaded.pkgs.root, m, mine, loaded.pkgs.supplied, shelved, embeds) {
+    Err(ds) -> Err(ds),
+    Ok(c) ->
+      Ok({
+        envelope: enveloped({
+          semantics: bytes_of_string(semantics::version()),
+          archive: bytes_of_string(archive),
+          payload: bin::encode(
+            compile_package(interfaces::originals(c.pkgs, [], shelved), c.whole, c.modules),
+            compiled_package_bin(),
+          ),
+        }),
+        promised: promised(c),
+      }),
+  }
+}
+
+// A version is held to the bump its changes need against the highest one published below it; a
+// first version, or one the registry already holds, is held to nothing.
+fn bump_refusal(
+  base: Base,
+  root: String,
+  m: Manifest,
+  now: List<Contract>,
+) -> Option<List<Diag>> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} =
+  match remote::index_of(base, m.name) {
+    Err(d) -> if d.code == b"E0143" { None } else { Some([d]) },
+    Ok(index) -> if fold(index.versions, false, |held: Bool, r: Release|
+        held || r.version == m.version) { None } else {
+      match previous(index, m.version) {
+        None -> None,
+        Some(was) -> match published_promises(base, root, m.name, index, was.version) {
+          Err(ds) -> Some(ds),
+          Ok(before) -> match refusal(m.name, was.version, m.version, moved(before, now)) {
+            None -> None,
+            Some(d) -> Some([d]),
+          },
+        },
+      }
+    },
+  }
+
 // --- The command --------------------------------------------------------------------
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], builder.loaded[build], builder.unit[build], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us} = {
+) -> Answer / {builder.git[vcs], builder.loaded[build], builder.unit[build], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us} = {
   let s = style_of(flags);
   let r = resolved_root(flags);
   let t: Timed = timed_uncached(flags.paths);
@@ -78,7 +152,7 @@ pub fn run(
         Err(why) -> reported(s, "publish", [lock::refused(r, why)], p.places),
         Ok(existing) -> match pinned_ok(r, existing, p) {
           Some(d) -> reported(s, "publish", [d], p.places),
-          None -> checked(s, t.program, p),
+          None -> checked(s, r.absolute, t.program, p),
         },
       },
     },
@@ -94,9 +168,10 @@ fn pinned_ok(r: Resolved, existing: Option<lock::Lock>, p: Loaded) -> Option<Dia
 
 fn checked(
   s: Style,
+  root: String,
   loaded: Program,
   p: Loaded,
-) -> Answer / {builder.unit[build], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]} =
+) -> Answer / {builder.git[vcs], builder.unit[build], fs.list_dir[shelf], fs.read_file[shelf], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} =
   match loaded.whole {
     None -> refused(s, "publish", loaded.diags, loaded.places),
     Some(w) -> match w.manifest {
@@ -115,7 +190,10 @@ fn checked(
         Some(d) -> reported(s, "publish", [d], p.places),
         None -> match packed(loaded, defs_of(w)) {
           Err(why) -> reported(s, "publish", why.diags, p.places),
-          Ok(k) -> sent(s, m, k),
+          Ok(k) -> match cut_of(loaded, m, digest_text(k.x.full)) {
+            Err(ds) -> reported(s, "publish", ds, p.places),
+            Ok(cut) -> sent(s, root, m, k, cut),
+          },
         },
       },
     },
@@ -123,9 +201,11 @@ fn checked(
 
 fn sent(
   s: Style,
+  root: String,
   m: Manifest,
   k: Packed,
-) -> Answer / {env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]} =
+  cut: Cut,
+) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} =
   match env.var[sys](variable()) {
     None ->
       reported(s, "publish", [unset(variable(), "a publish needs a registry to send to")], []),
@@ -134,7 +214,10 @@ fn sent(
       Ok(base) -> match env.var[sys](token_variable()) {
         None ->
           reported(s, "publish", [unset(token_variable(), "a publish is made under a token")], []),
-        Some(token) -> uploaded(s, base, token, m, k),
+        Some(token) -> match bump_refusal(base, root, m, cut.promised) {
+          Some(ds) -> reported(s, "publish", ds, []),
+          None -> uploaded(s, base, token, m, k, cut.envelope),
+        },
       },
     },
   }
@@ -145,21 +228,42 @@ fn uploaded(
   token: String,
   m: Manifest,
   k: Packed,
+  iface: Bytes,
 ) -> Answer / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]} = {
   let version = render_version(m.version);
   let digest = digest_text(k.x.full);
   let target = release_target(base, m.name, version);
   match exchange(base, put(base, target, token, digest, k.x.bytes)) {
     Err(d) -> reported(s, "publish", [d], []),
-    Ok(answer) -> if answer.status == 201 {
-      {
-        json: json_of(m.name, version, digest, base.url, bytes_len(k.x.bytes)),
-        lines: [
-          ind() ++ green(s, "published") ++ " " ++ m.name ++ " " ++ version ++ " · " ++ digest,
-          ind() ++ "  " ++ count_of(bytes_len(k.x.bytes), "byte") ++ " · " ++ base.url,
-        ],
-        errs: [],
-        code: ok_code(),
+    Ok(answer) -> if answer.status == 201 || answer.status == 200 {
+      let held = answer.status == 200;
+      let at = interface_target(base, m.name, version, semantics::version());
+      match exchange(base, put(base, at, token, digest, iface)) {
+        Err(d) -> reported(s, "publish", [d], []),
+        Ok(sent) -> if sent.status == 201 || sent.status == 200 {
+          {
+            json: json_of(m.name, version, digest, base.url, bytes_len(k.x.bytes), held),
+            lines: [
+              ind() ++ green(s, if held { "already published" } else { "published" }) ++ " "
+                ++ m.name
+                ++ " "
+                ++ version
+                ++ " · "
+                ++ digest,
+              ind() ++ "  " ++ count_of(bytes_len(k.x.bytes), "byte") ++ " and its interface · "
+                ++ base.url,
+            ],
+            errs: [],
+            code: ok_code(),
+          }
+        } else {
+          reported(
+            s,
+            "publish",
+            [interface_refused(m.name ++ "` " ++ version, sent.status, said(sent))],
+            [],
+          )
+        },
       }
     } else {
       reported(
@@ -172,7 +276,29 @@ fn uploaded(
   }
 }
 
-fn json_of(name: String, version: String, digest: String, url: String, size: Int) -> Json =
+// `already`: the registry held this version as these bytes before the publish.
+// What the registry would not keep beside a version it holds: the version stands either way.
+fn interface_refused(what: String, status: Int, why: String) -> Diag =
+  diag1(
+    b"E0144",
+    4294967295,
+    { start: 0, end: 0 },
+    bytes_of_string(
+      "the registry refused to keep the interface of `" ++ what ++ ": " ++ int_to_string(status)
+        ++ (if why == "" { "" } else { " " ++ why }),
+    ),
+    b"the registry refused",
+    [b"the version itself is published: `ply publish` again sends the interface beside it"],
+  )
+
+fn json_of(
+  name: String,
+  version: String,
+  digest: String,
+  url: String,
+  size: Int,
+  already: Bool,
+) -> Json =
   object([
     { key: "command", value: Str("publish") },
     { key: "ok", value: Bool(true) },
@@ -182,6 +308,8 @@ fn json_of(name: String, version: String, digest: String, url: String, size: Int
     { key: "digest", value: Str(digest) },
     { key: "registry", value: Str(url) },
     { key: "bytes", value: Number(decimal_of_int(size)) },
+    { key: "already", value: Bool(already) },
+    { key: "semantics", value: Str(semantics::version()) },
   ])
 
 // --- Tests ------------------------------------------------------------------
@@ -241,7 +369,7 @@ test "a dependency the registry cannot serve keeps a package unpublished" {
 }
 
 test "a publish answers with what it sent and where" {
-  let text = to_string(json_of("orders", "0.2.0", "b3:ab", "https://r.example", 512));
+  let text = to_string(json_of("orders", "0.2.0", "b3:ab", "https://r.example", 512, false));
   assert(string_contains(text, "\"command\":\"publish\""));
   assert(string_contains(text, "\"digest\":\"b3:ab\""));
   assert(string_contains(text, "\"registry\":\"https://r.example\""))
