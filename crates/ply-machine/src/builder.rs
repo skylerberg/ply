@@ -1,7 +1,7 @@
 //! What `ply build` reads of the program it builds, as the program in `crates/ply-cli/ply`
-//! performs it: the front end that program ran, read back as a load, and the git dependencies its
-//! walk fetches. Which entry is built, what the artifact holds and how it is made, where it lands
-//! and what the report says are the program's.
+//! performs it: the front end that program ran, read back as a load. Which entry is built, what
+//! the artifact holds and how it is made, where it lands and what the report says are the
+//! program's.
 
 use crate::driver::{
     LoadedAnalysis, load_over_analysis, load_over_analysis_in, loaded_analysis_of,
@@ -10,7 +10,7 @@ use crate::hosts::LentOp;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{diags_value, option, places_value, record};
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
-use ply_eval::{Diagnostic, Value as PlyValue, codes};
+use ply_eval::{Diagnostic, Value as PlyValue};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,15 +19,10 @@ const EFFECT: &str = "builder";
 
 const HERMETIC: &str = "hermetic_builder";
 
-const OPERATIONS: [(&str, &str); 2] = [
-    ("loaded", "ply_machine::builder::loaded"),
-    ("git", "ply_machine::builder::git"),
-];
+const OPERATIONS: [(&str, &str); 1] = [("loaded", "ply_machine::builder::loaded")];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 2] = [
-    ("loaded", "ply_machine::builder::hermetic::loaded"),
-    ("git", "ply_machine::builder::hermetic::git"),
-];
+const HERMETIC_OPERATIONS: [(&str, &str); 1] =
+    [("loaded", "ply_machine::builder::hermetic::loaded")];
 
 /// The ops and the one handler serving them, and the hermetic half's.
 pub fn lent() -> Vec<LentOp> {
@@ -58,7 +53,7 @@ fn lent_by(hermetic: bool) -> Vec<LentOp> {
 }
 
 struct BuilderHandler {
-    /// Answers from what it is handed alone: it measures no binary and fetches nothing.
+    /// Answers from what it is handed alone: it measures no binary.
     hermetic: bool,
 }
 
@@ -71,34 +66,9 @@ impl HostHandler for BuilderHandler {
                 let front = loaded_analysis_of(front, span)?;
                 self.loaded(&self.load(&path, &front))
             }
-            ("git", [_, _]) if self.hermetic => answered(Err(hermetic_fetch())),
-            ("git", [root, key]) => {
-                let root = PathBuf::from(root.as_str(span, "the project's root")?);
-                let key = key.as_str(span, "a git dependency's key")?.to_string();
-                // A fetch is I/O and a subprocess: its failure is the dependency's trouble rather
-                // than a refusal of the whole program.
-                answered(
-                    crate::vcs::fetch(&root, &key)
-                        .map(|dir| PlyValue::str(dir.display().to_string())),
-                )
-            }
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
-    }
-}
-
-/// `Ok(v)` or `Err(Refusal)`, as the program reads an operation's answer.
-fn answered(answer: Result<PlyValue, Diagnostic>) -> PlyValue {
-    match answer {
-        Ok(value) => PlyValue::ctor("Ok", vec![value]),
-        Err(diagnostic) => PlyValue::ctor(
-            "Err",
-            vec![record(vec![
-                ("diags", diags_value(std::slice::from_ref(&diagnostic))),
-                ("places", PlyValue::list(Vec::new())),
-            ])],
-        ),
     }
 }
 
@@ -177,13 +147,4 @@ fn binary_bytes() -> Option<u64> {
 
 fn size(n: u64) -> PlyValue {
     PlyValue::Int(n as i64)
-}
-
-#[cold]
-fn hermetic_fetch() -> Diagnostic {
-    Diagnostic::error(
-        codes::CAPABILITY_UNDECLARED,
-        "`hermetic_builder` fetches nothing, and the project names a git dependency",
-    )
-    .note("a program whose build fetches reads the network, and performs `builder`")
 }
