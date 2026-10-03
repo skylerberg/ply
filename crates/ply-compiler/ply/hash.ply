@@ -1545,7 +1545,7 @@ pub type HashOutput = {
   spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
   law_texts: List<Bytes>,
   deps: List<{ name: Bytes, names: List<Bytes> }>,
-  closure: List<{ name: Bytes, names: Names }>,
+  refs: Refs,
   bodies: List<{ name: Bytes, body: Bytes }>,
   test_bodies: List<Bytes>,
   // What a definition's checked rows and proofs are filed under: its body and the contracts of what
@@ -1554,9 +1554,32 @@ pub type HashOutput = {
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
 }
 
-// `deps` and `closure` are lists the dump writes in order; the maps index them, or recording is quadratic.
-// They live here rather than in `HashOutput` because that type crosses into Rust.
-type Recording = { out: HashOutput, deps_at: Map<Bytes, Int>, closure_at: Map<Bytes, Int> }
+// Each node's name and what it references, by index, and where a walk from a name or a key starts:
+// a name at every node it names, a test's or law's key at what that item references. A closure is
+// walked over these when it is asked for.
+pub type Refs = { names: List<Bytes>, edges: List<List<Int>>, starts: Map<Bytes, List<Int>> }
+
+// What hashing no program answers.
+pub fn no_hashes() -> HashOutput =
+  {
+    defs: [],
+    own: [],
+    decls: [],
+    tests: [],
+    laws: [],
+    specs: [],
+    spec_texts: [],
+    law_texts: [],
+    deps: [],
+    refs: { names: [], edges: [], starts: map_new() },
+    bodies: [],
+    test_bodies: [],
+    checks: [],
+    spec_checks: [],
+  }
+
+// `deps` is a list in entry order; the map indexes it, or recording is quadratic.
+type Recording = { out: HashOutput, deps_at: Map<Bytes, Int> }
 
 // --- The published-hash digest -------------------------------------------------------
 
@@ -1773,14 +1796,17 @@ type Keyed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, fresh: Map<Int,
 
 type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
 
-fn graph_of(index: Index) -> Graph = graph_with(index, map_new())
+// Every node normalized with nothing known: the reference graph, and a sketch that orders a cycle's
+// members without source position.
+fn first_pass(index: Index) -> List<Finished> =
+  map(index.nodes, |node: Node|
+    finish(normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body)))
+
+fn graph_of(index: Index) -> Graph = graph_with(index, first_pass(index), map_new())
 
 // `extra` gives a node the references its compiled body has, where the body here is a blank.
-fn graph_with(index: Index, extra: Map<Int, List<Int>>) -> Graph = {
+fn graph_with(index: Index, first: List<Finished>, extra: Map<Int, List<Int>>) -> Graph = {
   let n = len(index.nodes);
-  // A first pass with nothing known yields the reference graph, and a sketch that orders a cycle's members without source position.
-  let first = map(index.nodes, |node: Node|
-    finish(normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body)));
   let edges = map(range(0, n), |v: Int|
     match map_get(extra, v) { Some(es) -> es, None -> at(first, v).refs });
   let sketches = map(first, |f: Finished| f.bytes);
@@ -1899,12 +1925,31 @@ fn node_keys(index: Index) -> Map<Bytes, Int> =
   })
 
 // A fixed node keeps the hash, references, forms and body it compiled with; none is hashed here.
-pub fn hash_index_pinned(index: Index, fixed: List<Fixed>, packages: List<Int> = []) -> HashOutput = {
+pub fn hash_index_pinned(index: Index, fixed: List<Fixed>, packages: List<Int> = []) -> HashOutput =
+  hashed_over(index, first_pass(index), fixed, packages)
+
+// The hashes and the definitions nothing uses, over one normalization of every node.
+pub fn hashed_and_unused(
+  index: Index,
+  fixed: List<Fixed>,
+  packages: List<Int>,
+) -> { hashes: HashOutput, unused: List<Diag> } = {
+  let first = first_pass(index);
+  { hashes: hashed_over(index, first, fixed, packages), unused: unused_over(index, first, fixed) }
+}
+
+fn hashed_over(
+  index: Index,
+  first: List<Finished>,
+  fixed: List<Fixed>,
+  packages: List<Int>,
+) -> HashOutput = {
   let keys = node_keys(index);
   let held = fold(fixed, map_new(), |acc: Map<Int, Fixed>, f: Fixed|
     match map_get(keys, pin_key(f.name, f.decl)) { Some(v) -> map_insert(acc, v, f), None -> acc });
   let g = graph_with(
     index,
+    first,
     map_fold(held, map_new(), |acc: Map<Int, List<Int>>, v: Int, f: Fixed|
       map_insert(
         acc,
@@ -1913,7 +1958,6 @@ pub fn hash_index_pinned(index: Index, fixed: List<Fixed>, packages: List<Int> =
           match map_get(keys, pin_key(r.name, r.decl)) { Some(w) -> push(es, w), None -> es }),
       )),
   );
-  let components = g.components;
   let edges = g.edges;
   let scc = g.scc;
   let pinned = map_fold(held, map_new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
@@ -1966,7 +2010,7 @@ pub fn hash_index_pinned(index: Index, fixed: List<Fixed>, packages: List<Int> =
         _ -> acc,
       },
   );
-  assemble(index, components, edges, {
+  assemble(index, edges, {
     hashes: hashes,
     bodies: keyed.bodies,
     tests: tests.hashes,
@@ -2034,7 +2078,7 @@ pub fn public_contracts(index: Index, h: HashOutput, mine: (Bytes) -> Bool) -> L
         None -> acc,
       });
   let hashes = named(h.decls, true, named(h.defs, false, map_new()));
-  let g = graph_with(index, map_new());
+  let g = graph_of(index);
   fold(range(0, len(index.nodes)), [], |acc: List<Contract>, v: Int| {
     let node = at(index.nodes, v);
     if !is_public(node) || !mine(at(index.mods, node.module).name) { acc } else {
@@ -2335,40 +2379,17 @@ pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed = {
   }
 }
 
-// Keys come back in byte order.
-type Names = Map<Bytes, Bool>
+fn started(m: Map<Bytes, List<Int>>, key: Bytes, vs: List<Int>) -> Map<Bytes, List<Int>> =
+  map_insert(m, key, append(match map_get(m, key) { Some(xs) -> xs, None -> [] }, vs))
 
-fn names_union(a: Names, b: Names) -> Names =
-  map_fold(b, a, |acc: Names, k: Bytes, v: Bool| map_insert(acc, k, true))
-
-fn names_of(ns: Names) -> List<Bytes> =
-  map_fold(ns, [], |acc: List<Bytes>, k: Bytes, v: Bool| push(acc, k))
-
-fn assemble(
-  index: Index,
-  components: List<List<Int>>,
-  edges: List<List<Int>>,
-  h: Hashed,
-) -> HashOutput = {
-  let n = len(index.nodes);
-  let component_of = fold(
-    range(0, len(components)),
-    map(range(0, n), |i: Int| 0 - 1),
-    |acc: List<Int>, ci: Int|
-      fold(at(components, ci), acc, |a: List<Int>, v: Int| set_at(a, v, ci)),
-  );
-  // Dependency-first, so every closure a component needs is built by the time it is reached.
-  let closures = fold(range(0, len(components)), [], |acc: List<Names>, ci: Int| {
-    let component = at(components, ci);
-    let own = fold(component, map_new(), |c: Names, v: Int|
-      map_insert(c, at(index.nodes, v).name, true));
-    let reached = fold(component, own, |c: Names, v: Int|
-      fold(at(edges, v), c, |cc: Names, r: Int| {
-        let rc = at(component_of, r);
-        if rc != ci && rc >= 0 && rc < len(acc) { names_union(cc, at(acc, rc)) } else { cc }
-      }));
-    push(acc, reached)
-  });
+fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput = {
+  let named = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Bytes, List<Int>>, v: Int|
+    started(acc, at(index.nodes, v).name, [v]));
+  let tested = fold(range(0, len(index.tests)), named, |acc: Map<Bytes, List<Int>>, i: Int|
+    started(acc, at(index.tests, i).key, at(h.test_refs, i)));
+  let starts = fold(range(0, len(index.laws)), tested, |acc: Map<Bytes, List<Int>>, i: Int|
+    started(acc, at(index.laws, i).key, at(h.law_refs, i)));
+  let names_at = |refs: List<Int>| map(refs, |r: Int| at(index.nodes, r).name);
   let empty: HashOutput = {
     defs: [],
     own: h.own,
@@ -2379,126 +2400,132 @@ fn assemble(
     spec_texts: h.spec_texts,
     law_texts: h.law_texts,
     deps: [],
-    closure: [],
+    refs: { names: map(index.nodes, |node: Node| node.name), edges: edges, starts: starts },
     bodies: [],
     test_bodies: h.test_bodies,
     checks: [],
     spec_checks: h.spec_checks,
   };
-  fold(
-    index.order,
-    { out: empty, deps_at: map_new(), closure_at: map_new() },
-    |acc: Recording, e: Entry|
-      match e {
-        EDef(v) -> {
-          let node = at(index.nodes, v);
-          let bodied: HashOutput = match map_get(h.bodies, v) {
-            None -> acc.out,
-            Some(body) ->
-              { ..acc.out, bodies: push(acc.out.bodies, { name: node.name, body: body }) },
-          };
-          let keyed: HashOutput = match map_get(h.hashes, v) {
-            None -> bodied,
-            Some(hash) -> match node.body {
-              NFn(_) ->
-                {
-                  ..bodied,
-                  defs: push(bodied.defs, { name: node.name, hash: hash }),
-                  checks: push(bodied.checks, {
-                    name: node.name,
-                    hash: match map_get(h.checks, v) { Some(k) -> k, None -> hash },
-                  }),
-                },
-              _ -> { ..bodied, decls: push(bodied.decls, { name: node.name, hash: hash }) },
-            },
-          };
-          let deps = map(at(edges, v), |r: Int| at(index.nodes, r).name);
-          let closure = {
-            let ci = at(component_of, v);
-            if ci >= 0 && ci < len(closures) { at(closures, ci) } else { map_new() }
-          };
-          record({ ..acc, out: keyed }, node.name, deps, closure)
-        },
-        ETest(t) -> {
-          let key = at(index.tests, t).key;
-          let r = reached(at(h.test_refs, t), index, component_of, closures, key);
-          record(acc, key, r.deps, r.closure)
-        },
-        // A law's references are what it is a claim about.
-        ELaw(l) -> {
-          let key = at(index.laws, l).key;
-          let r = reached(at(h.law_refs, l), index, component_of, closures, key);
-          record(acc, key, r.deps, r.closure)
-        },
+  fold(index.order, { out: empty, deps_at: map_new() }, |acc: Recording, e: Entry|
+    match e {
+      EDef(v) -> {
+        let node = at(index.nodes, v);
+        let bodied: HashOutput = match map_get(h.bodies, v) {
+          None -> acc.out,
+          Some(body) ->
+            { ..acc.out, bodies: push(acc.out.bodies, { name: node.name, body: body }) },
+        };
+        let keyed: HashOutput = match map_get(h.hashes, v) {
+          None -> bodied,
+          Some(hash) -> match node.body {
+            NFn(_) ->
+              {
+                ..bodied,
+                defs: push(bodied.defs, { name: node.name, hash: hash }),
+                checks: push(bodied.checks, {
+                  name: node.name,
+                  hash: match map_get(h.checks, v) { Some(k) -> k, None -> hash },
+                }),
+              },
+            _ -> { ..bodied, decls: push(bodied.decls, { name: node.name, hash: hash }) },
+          },
+        };
+        record({ ..acc, out: keyed }, node.name, names_at(at(edges, v)))
       },
-  ).out
-}
-
-fn reached(
-  refs: List<Int>,
-  index: Index,
-  component_of: List<Int>,
-  closures: List<Names>,
-  own: Bytes,
-) -> { deps: List<Bytes>, closure: Names } = {
-  let deps = map(refs, |r: Int| at(index.nodes, r).name);
-  let closure = fold(refs, map_insert(map_new(), own, true), |acc: Names, r: Int| {
-    let ci = at(component_of, r);
-    if ci >= 0 && ci < len(closures) { names_union(acc, at(closures, ci)) } else { acc }
-  });
-  { deps: deps, closure: closure }
+      ETest(i) -> record(acc, at(index.tests, i).key, names_at(at(h.test_refs, i))),
+      // A law's references are what it is a claim about.
+      ELaw(i) -> record(acc, at(index.laws, i).key, names_at(at(h.law_refs, i))),
+    }).out
 }
 
 // Names collide across namespaces, so entries are merged rather than replaced.
-fn record(a: Recording, name: Bytes, deps: List<Bytes>, closure: Names) -> Recording = {
+fn record(a: Recording, name: Bytes, deps: List<Bytes>) -> Recording = {
   let out: HashOutput = a.out;
-  let deps_ = match map_get(a.deps_at, name) {
+  match map_get(a.deps_at, name) {
     Some(i) -> {
       let existing = at(out.deps, i);
       {
-        xs: set_at(out.deps, i, {
-          name: name,
-          names: fold(deps, existing.names, |acc: List<Bytes>, d: Bytes|
-            if contains_bytes(acc, d) { acc } else { push(acc, d) }),
-        }),
-        at: a.deps_at,
+        out: {
+          ..out,
+          deps: set_at(out.deps, i, {
+            name: name,
+            names: fold(deps, existing.names, |acc: List<Bytes>, d: Bytes|
+              if contains_bytes(acc, d) { acc } else { push(acc, d) }),
+          }),
+        },
+        deps_at: a.deps_at,
       }
     },
     None ->
       {
-        xs: push(out.deps, { name: name, names: deps }),
-        at: map_insert(a.deps_at, name, len(out.deps)),
+        out: { ..out, deps: push(out.deps, { name: name, names: deps }) },
+        deps_at: map_insert(a.deps_at, name, len(out.deps)),
       },
-  };
-  let closure_ = match map_get(a.closure_at, name) {
-    Some(i) -> {
-      let existing = at(out.closure, i);
-      {
-        xs: set_at(out.closure, i, { name: name, names: names_union(existing.names, closure) }),
-        at: a.closure_at,
-      }
-    },
-    None ->
-      {
-        xs: push(out.closure, { name: name, names: closure }),
-        at: map_insert(a.closure_at, name, len(out.closure)),
-      },
-  };
-  {
-    out: { ..out, deps: deps_.xs, closure: closure_.xs },
-    deps_at: deps_.at,
-    closure_at: closure_.at,
   }
+}
+
+// --- Closures ---------------------------------------------------------------------------------------
+
+type Reach = { seen: List<Bool>, frontier: List<Int>, all: List<Int> }
+
+fn reach(r: Reach, v: Int) -> Reach =
+  if at(r.seen, v) { r }
+  else { { seen: set_at(r.seen, v, true), frontier: push(r.frontier, v), all: push(r.all, v) } }
+
+// Every node `edges` lead to from `from`, those included: as a mark per node, and in the order met.
+fn walked(edges: List<List<Int>>, from: List<Int>) -> { seen: List<Bool>, all: List<Int> } = {
+  let n = len(edges);
+  let start = fold(from, { seen: map(range(0, n), |i: Int| false), frontier: [], all: [] }, reach);
+  iterate(start, n + 2, |r: Reach|
+    if len(r.frontier) == 0 { Stop({ seen: r.seen, all: r.all }) } else {
+      Continue(
+        fold(r.frontier, { ..r, frontier: [] }, |acc: Reach, v: Int|
+          fold(at(edges, v), acc, reach)),
+      )
+    })
+}
+
+// Every name the program declares that `keys` reach, and each of the keys the program knows: a
+// definition's or declaration's name reaches what each node of that name references, and a test's
+// or law's key what the item does.
+pub fn closure_of(h: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> = {
+  let r = h.refs;
+  let known = filter(keys, |k: Bytes| map_contains(r.starts, k));
+  let from = fold(known, [], |acc: List<Int>, k: Bytes|
+    append(acc, match map_get(r.starts, k) { Some(vs) -> vs, None -> [] }));
+  fold(
+    walked(r.edges, from).all,
+    fold(known, map_new(), |acc: Map<Bytes, Bool>, k: Bytes| map_insert(acc, k, true)),
+    |acc: Map<Bytes, Bool>, v: Int| map_insert(acc, at(r.names, v), true),
+  )
+}
+
+// Every name and key the program knows whose closure holds one of `names`.
+pub fn reaching(h: HashOutput, names: Map<Bytes, Bool>) -> Map<Bytes, Bool> = {
+  let r = h.refs;
+  let n = len(r.names);
+  // Each list is taken out of its slot before the push, so the push finds it unshared.
+  let back = fold(range(0, n), map(range(0, n), |i: Int| []), |acc: List<List<Int>>, v: Int|
+    fold(at(r.edges, v), acc, |a: List<List<Int>>, w: Int| {
+      let into = at(a, w);
+      set_at(set_at(a, w, []), w, push(into, v))
+    }));
+  let seen = walked(back, filter(range(0, n), |v: Int| map_contains(names, at(r.names, v)))).seen;
+  map_fold(r.starts, map_new(), |acc: Map<Bytes, Bool>, k: Bytes, vs: List<Int>|
+    if map_contains(names, k) || fold(vs, false, |b: Bool, v: Int| b || at(seen, v)) {
+      map_insert(acc, k, true)
+    } else { acc })
 }
 
 // --- What nothing reaches -------------------------------------------------------------------------------
 // The roots: a `pub` item, `main`, a derived definition, a name led by `_`, and what a test or a law mentions.
 // A spec clause is reached with its owner.
 
-type Reach = { seen: List<Bool>, frontier: List<Int> }
-
 // A fixed node is never reported: its own package's check answered for it.
-pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> = {
+pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> =
+  unused_over(index, first_pass(index), fixed)
+
+fn unused_over(index: Index, first: List<Finished>, fixed: List<Fixed>) -> List<Diag> = {
   let keys = node_keys(index);
   let held = fold(fixed, map_new(), |acc: Map<Int, Bool>, f: Fixed|
     match map_get(keys, pin_key(f.name, f.decl)) {
@@ -2506,7 +2533,7 @@ pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> = {
       None -> acc,
     });
   let n = len(index.nodes);
-  let edges = map(index.nodes, |node: Node| node_edges(index, node));
+  let edges = map(range(0, n), |v: Int| node_edges(index, at(index.nodes, v), at(first, v).refs));
   let own = filter(range(0, n), |v: Int| is_root(index, at(index.nodes, v)));
   let tested = fold(index.tests, own, |acc: List<Int>, t: TestNode|
     append(
@@ -2520,27 +2547,17 @@ pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> = {
       ret_refs(index, l.module, exprs),
     )
   });
-  let start = fold(roots, { seen: map(range(0, n), |i: Int| false), frontier: [] }, reach);
-  let seen = iterate(start, n + 2, |r: Reach|
-    if len(r.frontier) == 0 { Stop(r.seen) } else {
-      Continue(
-        fold(r.frontier, { seen: r.seen, frontier: [] }, |acc: Reach, v: Int|
-          fold(at(edges, v), acc, reach)),
-      )
-    });
+  let seen = walked(edges, roots).seen;
   fold(range(0, n), [], |acc: List<Diag>, v: Int|
     if at(seen, v) || map_contains(held, v) { acc }
     else { push(acc, never_used(at(index.nodes, v))) })
 }
 
-fn reach(r: Reach, v: Int) -> Reach =
-  if at(r.seen, v) { r } else { { seen: set_at(r.seen, v, true), frontier: push(r.frontier, v) } }
-
 fn refs_of(index: Index, module: Int, encode: (Nz) -> Nz) -> List<Int> =
   finish(encode(new_nz(index, module, map_new(), map_new(), map_new()))).refs
 
-fn node_edges(index: Index, node: Node) -> List<Int> = {
-  let own = refs_of(index, node.module, |z: Nz| normalize_node(z, node.body));
+// `own` is what normalizing the node alone references.
+fn node_edges(index: Index, node: Node, own: List<Int>) -> List<Int> =
   match node.body {
     NFn(d) -> {
       let clauses = fold(d.spec, own, |acc: List<Int>, c: SpecClause|
@@ -2558,7 +2575,6 @@ fn node_edges(index: Index, node: Node) -> List<Int> = {
     },
     _ -> own,
   }
-}
 
 // The encoding leaves a lambda's written return type out, and a type named only there is still used.
 fn ret_refs(index: Index, module: Int, exprs: List<Expr>) -> List<Int> =
@@ -2684,8 +2700,14 @@ fn dump_hashes(out: HashOutput) -> Bytes =
         bytes_concat_all([b"D;", d.name, b";", names_text(d.names), b";"])),
     ),
     bytes_concat_all(
-      map(out.closure, |d: { name: Bytes, names: Names }|
-        bytes_concat_all([b"C;", d.name, b";", names_text(names_of(d.names)), b";"])),
+      map(out.deps, |d: { name: Bytes, names: List<Bytes> }|
+        bytes_concat_all([
+          b"C;",
+          d.name,
+          b";",
+          names_text(map_keys(closure_of(out, [d.name]))),
+          b";",
+        ])),
     ),
   ])
 
@@ -4398,6 +4420,42 @@ fn indexed(sources: List<Source>) -> Index =
 
 fn named_hashes(out: HashOutput) -> List<{ name: Bytes, hash: Bytes }> = append(out.defs, out.decls)
 
+fn one_set(names: List<Bytes>) -> Map<Bytes, Bool> =
+  fold(names, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true))
+
+test "a closure is what a name reaches, the name included, and a test's what the test references" {
+  let h = hash_index(
+    indexed([
+      {
+        name: b"m",
+        src: b"pub fn leaf() -> Int = 1\npub fn mid() -> Int = leaf()\npub fn top() -> Int = mid()\npub fn other() -> Int = 2\ntest \"it\" { assert_eq(top(), 1) }",
+      },
+    ]),
+  );
+  assert_eq(map_keys(closure_of(h, [b"m.mid"])), [b"m.leaf", b"m.mid"]);
+  assert_eq(map_keys(closure_of(h, [b"m.it"])), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
+  assert_eq(map_keys(closure_of(h, [b"m.mid", b"m.other"])), [b"m.leaf", b"m.mid", b"m.other"]);
+  assert_eq(closure_of(h, [b"m.nothing"]), map_new());
+  assert_eq(map_keys(reaching(h, one_set([b"m.leaf"]))), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
+  assert_eq(map_keys(reaching(h, one_set([b"m.other"]))), [b"m.other"])
+}
+
+// A function and an effect may share a name: the name reaches what either does, and a reference to
+// one reaches only what that one does.
+test "a reference reaches through the node it names, and a shared name through both" {
+  let h = hash_index(
+    indexed([
+      {
+        name: b"m",
+        src: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)",
+      },
+    ]),
+  );
+  assert_eq(map_keys(closure_of(h, [b"m.user"])), [b"m.log", b"m.user"]);
+  assert_eq(map_keys(closure_of(h, [b"m.log"])), [b"m.helper", b"m.log"]);
+  assert_eq(map_keys(reaching(h, one_set([b"m.helper"]))), [b"m.helper", b"m.log"])
+}
+
 // The fixtures below write `pub` throughout, so every name is one a reference may be printed under.
 fn all_public(
   xs: List<{ name: Bytes, hash: Bytes }>,
@@ -4741,20 +4799,12 @@ test "a definition's hash follows the name of the effect it performs" {
 test "the published hashes digest to a pinned value" {
   let h = |v: Int| bytes_concat_all(map(range(0, 32), |i: Int| byte_of(v)));
   let sample: HashOutput = {
+    ..no_hashes(),
     defs: [{ name: b"a", hash: h(1) }],
-    own: [],
     decls: [{ name: b"b", hash: h(2) }],
     tests: [h(5)],
     laws: [h(6)],
     specs: [{ name: b"a", hashes: [h(3), h(4)] }],
-    spec_texts: [],
-    law_texts: [],
-    deps: [],
-    closure: [],
-    bodies: [],
-    test_bodies: [],
-    checks: [],
-    spec_checks: [],
   };
   assert_eq(
     hex(digest(sample)),
