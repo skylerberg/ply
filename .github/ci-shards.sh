@@ -135,7 +135,11 @@ declare -a PROBE_JOBS=(
 GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
 
 # `<family>-<run id>` entries only the newest of which is ever restored.
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes-)
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest-)
+
+# `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
+# prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
+NEWEST=(ply-c-stage-sources- ply-c-corpus-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -626,7 +630,7 @@ ci_files() {
 cmd_cache_keys() {
   local files=() file
   while IFS= read -r file; do files+=("$file"); done < <(ci_files)
-  awk -v give_back="${GIVE_BACK[*]}" '
+  awk -v give_back="${GIVE_BACK[*]}" -v families="${SUPERSEDED[*]} ${NEWEST[*]}" '
     function literal(s) {
       sub(/\$\{\{.*/, "", s)
       gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", s)
@@ -723,6 +727,16 @@ cmd_cache_keys() {
           bad = 1
         }
       }
+      nf = split(families, fk, " ")
+      for (j = 1; j <= nf; j++) {
+        if (fk[j] == "") continue
+        ok = 0
+        for (k in saved) if (index(k, fk[j]) == 1) { ok = 1; break }
+        if (!ok) {
+          printf "FAIL: SUPERSEDED or NEWEST names \"%s\", which no save writes\n", fk[j] > "/dev/stderr"
+          bad = 1
+        }
+      }
       if (bad) exit 1
       printf "cache keys: %d written and %d restored, each side matched by the other; %d run-scoped, each read later or given back\n", n, length(read), length(run_scoped)
     }
@@ -781,7 +795,9 @@ cmd_give_back() {
   done
 }
 
-# A family only this run's entry replaces, so a job that wrote nothing keeps what it had.
+# A family only this run's entry replaces, so a job that wrote nothing keeps what it had; of a family
+# keyed by content, the newest entry on the ref; and what an earlier run on the ref parked for its own
+# jobs, which a cancelled run never gave back. A ref runs one run at a time.
 cmd_supersede() {
   local run=${1:?usage: ci-shards.sh supersede RUN_ID REF} ref=${2:?a ref} prefix listing current key id
   for prefix in "${SUPERSEDED[@]}"; do
@@ -793,6 +809,22 @@ cmd_supersede() {
       grep -qxF "${key%-*}" <<< "$current" || continue
       gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
     done <<< "$listing"
+  done
+  for prefix in "${GIVE_BACK[@]}"; do
+    listing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&ref=$ref&per_page=100" \
+      -q '.actions_caches[] | "\(.key) \(.id)"')
+    while read -r key id; do
+      [[ -n $id && $key != *-"$run" ]] || continue
+      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "gave back $key"
+    done <<< "$listing"
+  done
+  for prefix in "${NEWEST[@]}"; do
+    listing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&ref=$ref&sort=created_at&direction=desc&per_page=100" \
+      -q '.actions_caches[] | "\(.key) \(.id)"')
+    while read -r key id; do
+      [[ -n $id ]] || continue
+      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
+    done < <(awk '{ family = $1; sub(/[0-9a-f]+$/, "", family); if (seen[family]++) print }' <<< "$listing")
   done
 }
 
