@@ -13,7 +13,7 @@ import compiler.pkg (PackageSources, Pinned, Supplied)
 import compiler.interface (CompiledPackage, Original, merged_interfaces)
 import interfaces
 import compiler.hash
-import compiler.hash (HashOutput, hex)
+import compiler.hash (HashOutput, Prior, hex)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, TestInfo, LawInfo, Location)
@@ -157,6 +157,7 @@ fn front_end(
   pkgs: PackageSources,
   through: List<CompiledPackage>,
   embeds: List<Embed>,
+  priors: List<Prior>,
 ) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(
     sources,
@@ -166,6 +167,7 @@ fn front_end(
     pkgs,
     merged_interfaces(through),
     map(embeds, |embed: Embed| embed.embedded),
+    priors,
   )
 
 // Seeded with what the load published, so only what the splice moved is walked again.
@@ -176,18 +178,35 @@ pub fn reanalysed(
   shelved: List<Source>,
   pkgs: PackageSources,
 ) -> Pulled / {abort.raise} =
-  front_end(sources, shelved, rows_of(analysis), pkgs, program.through, program.embeds)
+  front_end(
+    sources,
+    shelved,
+    rows_of(analysis),
+    pkgs,
+    program.through,
+    program.embeds,
+    analysis.hashes.priors,
+  )
 
 fn analysed(
   project: Project,
   shelved: List<Source>,
   rows: Rows,
   through: List<CompiledPackage>,
+  priors: List<Prior>,
 ) -> Program / {abort.raise} = {
   let texts = fold(shelved, map_new(), |acc: Map<String, Bytes>, source: Source|
     map_insert(acc, string_of_bytes_lossy(source.name), source.src));
   let pkgs: PackageSources = pkgs_of(project);
-  let pulled: Pulled = front_end(project.sources, shelved, rows, pkgs, through, project.embeds);
+  let pulled: Pulled = front_end(
+    project.sources,
+    shelved,
+    rows,
+    pkgs,
+    through,
+    project.embeds,
+    priors,
+  );
   let shelved_places = map(pulled.pulled, |n: Bytes| shelf_place(texts, string_of_bytes_lossy(n)));
   let own = placed_of(project);
   let places = appended(appended(own.modules, shelved_places), own.manifests);
@@ -215,13 +234,14 @@ fn assembled(
   paths: List<paths::Resolved>,
   rows: Rows,
   through: List<CompiledPackage> = [],
+  priors: List<Prior> = [],
 ) -> Program / {abort.raise} =
   if len(project.diags) > 0 { broken(project, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
     broken(project, [], [
       nothing_here(match list_at(paths, 0) { Some(r) -> r.display, None -> "." }),
     ])
-  } else { analysed(project, shelved, rows, through) }
+  } else { analysed(project, shelved, rows, through, priors) }
 
 // The toolchain's own tree: its shipped modules are its roots, not a dependency.
 fn claims_the_shelf(project: Project, shelved: List<Source>) -> Bool = {
@@ -299,7 +319,15 @@ fn refreshing(
 // --- The front-end cache ---------------------------------------------------------
 
 fn nothing_recorded() -> Recorded =
-  { defs: [], tests: [], stdlib: None, warnings: [], intact: map_new(), filed_load: None }
+  {
+    defs: [],
+    tests: [],
+    stdlib: None,
+    warnings: [],
+    intact: map_new(),
+    filed_load: None,
+    priors: [],
+  }
 
 fn rows_recorded(k: Recorded) -> Rows =
   { defs: map(k.defs, |d: DefInterface| d.row), tests: k.tests }
@@ -493,9 +521,10 @@ fn filed(
           }));
       // The last filing was of this load and the store still holds all it wrote: filing it again
       // would write nothing.
-      let more = if held && len(k.warnings) == 0 && k.filed_load == Some(load) { [] }
-      else if place.label == "cwd" { loads::file[cwd](place, sources, filing(w), whole, now, load) }
-      else { loads::file[abs](place, sources, filing(w), whole, now, load) };
+      let more = if held && len(k.warnings) == 0 && k.filed_load == Some(load)
+          && len(k.priors) == len(w.hashes.priors) { [] } else if place.label == "cwd" {
+        loads::file[cwd](place, sources, filing(w), whole, now, load, w.hashes.priors)
+      } else { loads::file[abs](place, sources, filing(w), whole, now, load, w.hashes.priors) };
       {
         ..program,
         diags: appended(
@@ -524,7 +553,7 @@ pub fn load_program(
     project,
     shelved,
     verify,
-    assembled(project, shelved, paths, rows, through),
+    assembled(project, shelved, paths, rows, through, if verify { [] } else { k.priors }),
   );
   refreshing(paths, project, shelved, stamps, interfaced, through, p);
   filed(paths, shelved, stamps, k, p)
@@ -608,7 +637,7 @@ pub fn timed_over(
     project,
     shelved,
     verify,
-    assembled(project, shelved, paths, rows, through),
+    assembled(project, shelved, paths, rows, through, if verify { [] } else { k.priors }),
   );
   let front_done = time.elapsed_ms();
   refreshing(paths, project, shelved, stamps, interfaced, through, p);

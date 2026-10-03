@@ -2936,17 +2936,14 @@ equality. The base is a power of two so a limb boundary is a bit boundary — sh
 and bit tests are limb arithmetic, and only the decimal conversions pay for the
 base. `ord` is deliberately **not** derived: the number's order is not the
 record's (with the sign first, `-10` would sort after `-5` by magnitude), so
-`compare` is the ordering and a hand-written instance would be card `C4`'s ground.
+`compare` is the ordering.
 `of_string` takes an optional sign and refuses anything else, `to_string` is its
 inverse, and `-0` is zero. Division is truncated toward zero — `q` takes the sign
 of `a * b` and `r` the sign of `a`, so `a == q * b + r` and `|r| < |b|` — and a
 zero divisor is `None` rather than a raise; `floor_mod` is the remainder with the
 divisor's sign, which is what `mod_pow` reduces with. A negative exponent is one,
 as integer arithmetic has it. `to_int` answers `None` outside `i64`, `min_int`
-included as exact on the way in and out. One implementation note worth keeping:
-`limbs_of` is written as a plain recursion rather than a tail loop because a self
-tail call that passes an `Int` at or beyond 2^62 back to itself releases the word
-and reuses it (card `6298c4dd`).
+included as exact on the way in and out.
 
 ### 13.33 `std.decimal`
 
