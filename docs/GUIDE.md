@@ -1332,10 +1332,9 @@ plain values: `json::decode_bytes(body, order_json())`.
 
 `E0206` names the field that blocks a derivation: function types, `Cell` and
 `Task` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`, `bin`,
-`show`, `hash`);
-`Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin` need their
-module imported (`import std.json`, `import std.bin`), or the `derive` is
-`E0206`; `show` imports `std.show` itself.
+`show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json` and
+`bin` need their module imported (`import std.json`, `import std.bin`), or the
+`derive` is `E0206`; `show` imports `std.show` itself.
 
 ## 12. Builtins
 
