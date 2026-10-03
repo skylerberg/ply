@@ -11,6 +11,7 @@ pub enum Carry {
     /// No fixed width sits anywhere below, so every word reads as itself.
     Plain,
     Width(IntTy),
+    /// A list's elements, or an array's.
     List(Box<Carry>),
     Map(Box<Carry>, Box<Carry>),
     /// Sorted by name.
@@ -134,6 +135,14 @@ impl Carry {
                     }
                 }
             }
+            (Carry::List(item), Value::Array(items)) => {
+                for x in items.iter() {
+                    item.bind(x, vars, ctors);
+                    if item.settled(vars) {
+                        break;
+                    }
+                }
+            }
             (Carry::Map(key, val), Value::Map(entries)) => {
                 for (k, v) in entries.iter() {
                     key.bind(k, vars, ctors);
@@ -182,16 +191,8 @@ impl Carry {
     pub fn of(value: &Value, ctors: &CtorCarries) -> Carry {
         match value {
             Value::Fixed(f) => Carry::Width(f.ty),
-            Value::List(items) => {
-                let mut item = Carry::Open;
-                for x in items.iter() {
-                    if item.complete() {
-                        break;
-                    }
-                    item = item.join(Carry::of(x, ctors));
-                }
-                Carry::List(Box::new(item))
-            }
+            Value::List(items) => Carry::items(items.iter(), ctors),
+            Value::Array(items) => Carry::items(items.iter(), ctors),
             Value::Map(entries) => {
                 let (mut key, mut val) = (Carry::Open, Carry::Open);
                 for (k, v) in entries.iter() {
@@ -220,6 +221,17 @@ impl Carry {
             }
             _ => Carry::Plain,
         }
+    }
+
+    fn items<'a>(items: impl Iterator<Item = &'a Value>, ctors: &CtorCarries) -> Carry {
+        let mut item = Carry::Open;
+        for x in items {
+            if item.complete() {
+                break;
+            }
+            item = item.join(Carry::of(x, ctors));
+        }
+        Carry::List(Box::new(item))
     }
 
     /// What two readings of one type say together: an open part gives way to the other's.

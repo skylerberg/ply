@@ -158,6 +158,7 @@ fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
     match v {
         Value::Cell(other) => *other == slot,
         Value::List(xs) => xs.iter().any(|x| reaches_cell(x, slot, next, budget)),
+        Value::Array(xs) => xs.iter().any(|x| reaches_cell(x, slot, next, budget)),
         Value::Map(m) => m.iter().any(|(k, x)| {
             reaches_cell(k, slot, next, budget) || reaches_cell(x, slot, next, budget)
         }),
