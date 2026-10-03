@@ -58,8 +58,12 @@ pub const UNIT: &str = include_str!("../ply/unit.ply");
 /// A program read from a directory, checked and emitted, as a program that drives another hands it.
 pub const LOAD: &str = include_str!("../ply/load.ply");
 
+/// The builder: what the launcher enters to make a program it ships out of that program's sources.
+pub const BUILD: &str = include_str!("../ply/build.ply");
+
 /// The order is part of the identity: the producer digests these texts in this order.
 pub const MODULES: &[(&str, &str)] = &[
+    ("build", BUILD),
     ("code", CODE),
     ("costs", COSTS),
     ("derive", DERIVE),
@@ -100,4 +104,10 @@ pub mod bootstrap {
     pub const SOURCES: &str = include_str!("../bootstrap/SOURCES.digest");
 
     pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bootstrap");
+
+    /// The builder's runnable as `ply bootstrap` last wrote it, empty when none is committed.
+    pub const BUILDER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/builder.run"));
+
+    /// The digest of the shelf and runtime the committed builder was built for, empty with it.
+    pub const BUILDER_DIGEST: &str = include_str!(concat!(env!("OUT_DIR"), "/builder.digest"));
 }
