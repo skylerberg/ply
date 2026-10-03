@@ -123,6 +123,12 @@ impl Declines {
     }
 }
 
+thread_local! {
+    /// The unit a pre-flight on this thread loaded, by the address of the `Unit` it is for: the
+    /// first worker on the thread takes it rather than mapping the same object a second time.
+    static PREFLIGHT: RefCell<Option<(usize, crate::c::Native)>> = const { RefCell::new(None) };
+}
+
 /// One run's compiled unit, shared by every worker's backend.
 pub struct Unit {
     /// [`ply_eval::Front::hashes_digest`] of the program this was built over, for
@@ -159,7 +165,7 @@ impl Unit {
         let candidates = source.functions();
         let started = std::time::Instant::now();
         // The pre-flight decides the compiled set and leaves the unit every worker reads back.
-        let (compiled, refusals) = closure(source, &candidates)?;
+        let ((compiled, refusals), native) = closed(source, &candidates)?;
         let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
         let analysis_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let unit = Unit {
@@ -175,23 +181,33 @@ impl Unit {
             poisoned: AtomicU64::new(0),
             embedded: None,
         };
-        Ok(Box::leak(Box::new(unit)))
+        let unit: &'static Unit = Box::leak(Box::new(unit));
+        PREFLIGHT.with(|slot| *slot.borrow_mut() = Some((unit.address(), native)));
+        Ok(unit)
     }
 
-    /// An artifact's unit, produced elsewhere; loaded once here to read its table.
+    fn address(&'static self) -> usize {
+        self as *const Unit as usize
+    }
+
+    /// An artifact's unit, produced elsewhere, loaded once: the first backend on this thread takes
+    /// that load, and one that does not serve this runtime is an [`crate::c::Unserved`].
     pub fn embedded(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
-        let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
         let identity = front.hashes_digest;
         let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::from_front(front)));
-        let compiled = exports.names();
+        let (native, refused) = crate::c::load_unit(&text, Some(source), "artifact")?;
+        let compiled = native.names();
         let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
         let unit = Unit {
             identity,
             source,
             compiled,
             members,
-            refusals: exports.refusals,
+            refusals: refused
+                .into_iter()
+                .map(|r| (r.function, r.construct))
+                .collect(),
             counters: Counters::default(),
             analysis_nanos: 0,
             codegen_nanos: AtomicU64::new(0),
@@ -199,7 +215,9 @@ impl Unit {
             poisoned: AtomicU64::new(0),
             embedded: Some(text),
         };
-        Ok(Box::leak(Box::new(unit)))
+        let unit: &'static Unit = Box::leak(Box::new(unit));
+        PREFLIGHT.with(|slot| *slot.borrow_mut() = Some((unit.address(), native)));
+        Ok(unit)
     }
 
     /// The whole unit over `names`, produced and not compiled: what `ply build` embeds.
@@ -242,10 +260,21 @@ impl Unit {
 
     fn build(&'static self) -> Result<Bodies> {
         let started = std::time::Instant::now();
-        let native = match &self.embedded {
-            Some(text) => crate::c::load_unit(text, Some(self.source), "artifact")?.0,
+        let preflown = PREFLIGHT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.take() {
+                Some((unit, native)) if unit == self.address() => Some(native),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        });
+        let native = match (preflown, &self.embedded) {
+            (Some(native), _) => native,
+            (None, Some(text)) => crate::c::load_unit(text, Some(self.source), "artifact")?.0,
             // The same set as the pre-flight, so the unit key matches and the unit is read back.
-            None => {
+            (None, None) => {
                 let candidates = self.source.functions();
                 let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
                 crate::c::build(self.source, &names)?.0
@@ -688,6 +717,11 @@ impl ply_eval::Compiled for Bodies {
 
 /// The largest subset of `candidates` the emitter compiles as one unit, and what it dropped.
 pub fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed> {
+    closed(source, candidates).map(|(closed, _)| closed)
+}
+
+/// [`closure`], with the unit it loaded.
+fn closed(source: &'static Source, candidates: &[String]) -> Result<(Closed, crate::c::Native)> {
     let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
     let (native, refused) =
         crate::c::build(source, &names).context("compiling the fragment of this program")?;
@@ -700,7 +734,7 @@ pub fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed>
         .into_iter()
         .map(|r| (r.function, r.construct))
         .collect();
-    Ok((set, lost))
+    Ok(((set, lost), native))
 }
 
 /// The surviving set, and every function that was dropped with the reason.

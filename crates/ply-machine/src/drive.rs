@@ -84,8 +84,8 @@ pub struct Deployment {
     artifact: Artifact,
     opened: artifact::Opened,
     digest: String,
-    /// Whether the embedded unit is one this runtime can enter; a stale one is left aside.
-    unit: bool,
+    /// The embedded unit's C when it is one this runtime can enter; a stale one is left aside.
+    unit: Option<String>,
     warnings: Vec<Diagnostic>,
 }
 
@@ -179,7 +179,7 @@ impl Target {
                 digest: d.digest.clone(),
                 entry: d.opened.entry.as_str().to_string(),
                 definitions: d.artifact.bodies.len(),
-                unit: d.unit,
+                unit: d.unit.is_some(),
                 warnings: d.warnings.clone(),
             },
         }
@@ -201,14 +201,7 @@ impl Target {
         }
         match self {
             Target::Project(loaded) => prover_backend(loaded),
-            Target::Deployed(d) => {
-                let unit = if d.unit {
-                    d.artifact.unit.as_ref()
-                } else {
-                    None
-                };
-                artifact::tier(&d.opened, unit)
-            }
+            Target::Deployed(d) => artifact::tier(&d.opened, d.unit.clone()),
         }
     }
 }
@@ -276,8 +269,11 @@ fn deployment(path: &std::path::Path, bytes: Option<&[u8]>) -> Result<Deployment
     let bytes = bytes.ok_or_else(|| about(vec![artifact::unreadable(path)]))?;
     let (container, mut warnings) = artifact::decode(bytes, path).map_err(|d| about(vec![d]))?;
     let opened = artifact::open(&container, path).map_err(about)?;
-    let unit = artifact::servable(&container);
-    if container.has_unit() && !unit {
+    let unit = match container.unit.as_ref() {
+        None => None,
+        Some(unit) => artifact::served_text(unit).map_err(|d| about(vec![d]))?,
+    };
+    if container.has_unit() && unit.is_none() {
         warnings.push(artifact::stale_unit());
     }
     Ok(Deployment {

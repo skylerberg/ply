@@ -139,14 +139,31 @@ const BY_FILE: [&str; 2] = [FRONTS, RUNS];
 const RECENT: Duration = Duration::from_secs(3600);
 
 /// Records that a stage directory or a cached file was just used. A file is opened for reading
-/// only: an object a loader has mapped may refuse a writer.
+/// only: an object a loader has mapped may refuse a writer. A mark younger than [`MARKED`] stands,
+/// since the sweep orders entries by hours.
 pub fn used(path: &Path) {
+    let marked = if path.is_dir() {
+        path.join(USED)
+    } else {
+        path.to_path_buf()
+    };
+    let fresh = std::fs::metadata(&marked)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age < MARKED);
+    if fresh {
+        return;
+    }
     if path.is_dir() {
-        let _ = std::fs::write(path.join(USED), b"");
+        let _ = std::fs::write(marked, b"");
     } else if let Ok(f) = std::fs::File::open(path) {
         let _ = f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
     }
 }
+
+/// How old a mark may be and still stand for a use now.
+const MARKED: Duration = Duration::from_secs(600);
 
 /// Remove stage-directory entries, least recently used first, until the rest fits in `budget`.
 /// Each stage directory goes whole; each file under one of [`BY_FILE`] goes on its own. Errors are

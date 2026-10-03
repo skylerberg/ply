@@ -387,7 +387,6 @@ fn def_row(d: DefInfo, w: Written) -> DefRow =
     simple_name: d.simple_name,
     public: w.public,
     reuse: w.reuse,
-    scheme: canonical_scheme(d.scheme),
     footprint: canonical_atoms(d.footprint),
     performed: canonical_atoms(d.performed),
     constraints: d.constraints,
@@ -483,15 +482,6 @@ fn by_name_names(xs: List<{ name: Bytes, names: List<Bytes> }>) -> Map<Bytes, Li
   fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
     map_insert(acc, x.name, x.names))
 
-// A closure is a set kept as a map, so its names come back in byte order.
-fn by_name_closure(xs: List<{ name: Bytes, names: Map<Bytes, Bool> }>) -> Map<Bytes, List<Bytes>> =
-  fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: Map<Bytes, Bool> }|
-    map_insert(
-      acc,
-      x.name,
-      map_fold(x.names, [], |ns: List<Bytes>, k: Bytes, v: Bool| push(ns, k)),
-    ))
-
 type Tables = {
   defs: Map<Bytes, Bytes>,
   own: Map<Bytes, Bytes>,
@@ -499,7 +489,6 @@ type Tables = {
   specs: Map<Bytes, List<Bytes>>,
   spec_texts: Map<Bytes, List<Bytes>>,
   deps: Map<Bytes, List<Bytes>>,
-  closure: Map<Bytes, List<Bytes>>,
 }
 
 fn hash_tables(h: HashOutput) -> Tables =
@@ -510,7 +499,6 @@ fn hash_tables(h: HashOutput) -> Tables =
     specs: by_name_many(h.specs),
     spec_texts: by_name_many(h.spec_texts),
     deps: by_name_names(h.deps),
-    closure: by_name_closure(h.closure),
   }
 
 fn hex_one(m: Map<Bytes, Bytes>, name: Bytes) -> Option<Bytes> =
@@ -531,7 +519,6 @@ fn def_hash_row(t: Tables, name: Bytes) -> HashRow =
     specs: hex_many(t.specs, name),
     spec_texts: hex_many(t.spec_texts, name),
     deps: names_of(t.deps, name),
-    closure: names_of(t.closure, name),
   }
 
 fn hash_rows(index: Index, h: HashOutput) -> List<HashFrame> = {
@@ -564,7 +551,6 @@ fn hash_rows(index: Index, h: HashOutput) -> List<HashFrame> = {
                 hash: hex(at(h.tests, i)),
                 text: b"",
                 deps: names_of(t.deps, key),
-                closure: names_of(t.closure, key),
               }),
             ),
           }
@@ -581,7 +567,6 @@ fn hash_rows(index: Index, h: HashOutput) -> List<HashFrame> = {
                 hash: hex(at(h.laws, i)),
                 text: hex(at(h.law_texts, i)),
                 deps: names_of(t.deps, key),
-                closure: names_of(t.closure, key),
               }),
             ),
           }
@@ -2549,7 +2534,6 @@ pub type DefRow = {
   simple_name: Bytes,
   public: Bool,
   reuse: Bool,
-  scheme: Scheme,
   footprint: List<Atom>,
   performed: List<Atom>,
   constraints: List<DefConstraint>,
@@ -2638,19 +2622,11 @@ pub type HashRow = {
   specs: List<Bytes>,
   spec_texts: List<Bytes>,
   deps: List<Bytes>,
-  closure: List<Bytes>,
 }
 
 // A test's or a law's hash row, under the index of the item it is about; `text` is a law's
 // sentence hash and is empty for a test.
-pub type ItemHashRow = {
-  index: Int,
-  key: Bytes,
-  hash: Bytes,
-  text: Bytes,
-  deps: List<Bytes>,
-  closure: List<Bytes>,
-}
+pub type ItemHashRow = { index: Int, key: Bytes, hash: Bytes, text: Bytes, deps: List<Bytes> }
 
 pub type HashFrame = | HDef(HashRow) | HTest(ItemHashRow) | HLaw(ItemHashRow)
 
@@ -2865,12 +2841,15 @@ test "only a definition no root reaches is warned, each once" {
   assert(len(d.order) > 0)
 }
 
-test "a definition's row holds its scheme, footprint, parameters and span" {
+test "a definition's row holds its footprint, parameters and span" {
   let say = def_named(dump_of(analyse(parse_all(program()))), b"m.say");
   assert_eq(say.module, b"m");
   assert_eq(say.simple_name, b"say");
   assert(!say.public && !say.reuse);
-  assert_eq(scheme_text(say.scheme), b"(Bytes) -> Unit / {m.log.write}");
+  assert_eq(
+    scheme_text(scheme_named(published(analyse(parse_all(program()))), b"m.say")),
+    b"(Bytes) -> Unit / {m.log.write}",
+  );
   assert_eq(atoms_text(say.footprint, b","), b"m.log.write");
   assert_eq(atoms_text(say.performed, b","), b"m.log.emit");
   assert_eq(say.params, [{ name: b"b", at: { module: 0, start: 79, end: 87 } }]);
@@ -2973,12 +2952,11 @@ fn body_named(d: Dump, name: Bytes) -> Bytes =
     None -> panic("the answer holds the body"),
   }
 
-test "a hash row carries the definition's hash, its own form and its reach, and the body hashes to it" {
+test "a hash row carries the definition's hash, its own form and its references, and the body hashes to it" {
   let d = dump_of(analyse(parse_all(program())));
   let say = def_hash_named(d, b"m.say");
   assert(say.own != None);
   assert_eq(say.deps, [b"m.log"]);
-  assert_eq(say.closure, [b"m.log", b"m.say"]);
   // The test's row follows the definition it reaches.
   let order = map(d.hashes, |h: HashFrame|
     match h { HDef(r) -> r.name, HTest(r) -> r.key, HLaw(r) -> r.key });
@@ -3012,7 +2990,10 @@ test "a definition's row holds its row aliases and each clause with its kind, in
   assert_eq(say.params, [{ name: b"b", at: { module: 0, start: 76, end: 84 } }]);
   assert_eq(say.at, { module: 0, start: 69, end: 114 });
   let inc = def_named(d, b"m.inc");
-  assert_eq(scheme_text(inc.scheme), b"(Int) -> Int");
+  assert_eq(
+    scheme_text(scheme_named(published(analyse(parse_all(specified()))), b"m.inc")),
+    b"(Int) -> Int",
+  );
   assert_eq(inc.footprint, []);
   assert_eq(inc.params, [{ name: b"x", at: { module: 0, start: 122, end: 128 } }]);
   assert_eq(inc.spec, [
@@ -3125,7 +3106,6 @@ test "a law's row holds its binders with their spans and types, and its hashes c
   assert_eq(bytes_len(law.hash), 64);
   assert_eq(bytes_len(law.text), 64);
   assert_eq(law.deps, [b"m.inc"]);
-  assert_eq(law.closure, [b"m.inc", b"m.inc grows"]);
   // Two clauses: two obligation keys and two sentence keys, in source order.
   let inc = def_hash_named(d, b"m.inc");
   assert(inc.own != None);
@@ -3340,27 +3320,9 @@ test "the answer's rows hold each type and row as the checker's value" {
   let a = answer_pulling_std_with(answered(), shelf(), [], []);
   assert_eq(a.pulled, [b"std.b"]);
   let same = def_named(a.dump, b"base.same");
-  assert_eq(same.scheme, {
-    ty_vars: [],
-    row_vars: [],
-    label_vars: [],
-    ty: TyFn({
-      params: [con_named(b"Int")],
-      ret: con_named(b"Int"),
-      effects: { atoms: [], tail: None },
-    }),
-  });
   assert_eq(same.footprint, []);
   let write: Atom = { effect: b"base.log", resource: RSingleton, mode: MWrite, op: None };
   let say = def_named(a.dump, b"base.say");
-  assert_eq(
-    say.scheme.ty,
-    TyFn({
-      params: [con_named(b"Bytes")],
-      ret: con_named(b"Unit"),
-      effects: { atoms: [write], tail: None },
-    }),
-  );
   assert_eq(say.footprint, [write]);
   assert_eq(
     map(filter(a.dump.ctors, |k: CtorRow| k.name == b"base.Line"), |k: CtorRow| k.fields),
@@ -3411,10 +3373,27 @@ fn effectful() -> List<Source> =
     },
   ]
 
+type Published = { dump: Dump, schemes: List<{ name: Bytes, scheme: Scheme }> }
+
 // The rows an analysis publishes, which number their variables as their texts name them: a seeded
-// row and a walked one are then alike, however the checker numbered each.
-// What a load answers, all but what its check walked: a seeded load walks less by design.
-fn published(a: Analysis) -> Dump = { ..dump_of(a), walked: b"" }
+// row and a walked one are then alike, however the checker numbered each. What a load answers, all
+// but what its check walked (a seeded load walks less by design), and every definition's scheme.
+fn published(a: Analysis) -> Published =
+  {
+    dump: { ..dump_of(a), walked: b"" },
+    schemes: match a {
+      Refused(_) -> [],
+      Analysed(w) ->
+        map(w.checked.defs, |d: DefInfo| { name: d.name, scheme: canonical_scheme(d.scheme) }),
+    },
+  }
+
+fn scheme_named(p: Published, name: Bytes) -> Scheme =
+  match fold(p.schemes, None, |acc: Option<Scheme>, s: { name: Bytes, scheme: Scheme }|
+      if s.name == name { Some(s.scheme) } else { acc }) {
+    Some(sc) -> sc,
+    None -> panic("the analysis checked the definition"),
+  }
 
 // The same definition, with a module of generics checked ahead of it in one of the two programs:
 // the checker numbers its variables apart in the two, and the rows do not.
@@ -3429,11 +3408,11 @@ test "two programs alike but for what the checker numbered first publish equal r
     fold(whole_of(sources).checked.defs, None, |acc: Option<Scheme>, d: DefInfo|
       if d.name == b"m.pick" { Some(d.scheme) } else { acc });
   assert(raw(alone) != raw(behind));
-  let one = def_named(published(analyse(parse_all(alone))), b"m.pick");
-  let two = def_named(published(analyse(parse_all(behind))), b"m.pick");
-  assert_eq(one.scheme, two.scheme);
-  assert_eq(one.footprint, two.footprint);
-  assert_eq(one.scheme.ty_vars, [0, 1])
+  let one = published(analyse(parse_all(alone)));
+  let two = published(analyse(parse_all(behind)));
+  assert_eq(scheme_named(one, b"m.pick"), scheme_named(two, b"m.pick"));
+  assert_eq(def_named(one.dump, b"m.pick").footprint, def_named(two.dump, b"m.pick").footprint);
+  assert_eq(scheme_named(one, b"m.pick").ty_vars, [0, 1])
 }
 
 test "a definition whose hash has not moved is published from its rows, not from its body" {

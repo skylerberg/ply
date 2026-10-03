@@ -15,7 +15,7 @@ pub mod tables;
 pub mod toolchain;
 pub mod upgrade;
 
-pub use build::{Native, Produced, build, load_unit, produce, served};
+pub use build::{Native, Produced, build, load_unit, produce};
 pub use exports::{Exports, Unserved};
 pub use load::{Library, Parts, compile_and_load, split};
 pub use prelude::{HELPERS, PRELUDE, RUNTIME_MARK, pointer_name, runtime_header, runtime_object};

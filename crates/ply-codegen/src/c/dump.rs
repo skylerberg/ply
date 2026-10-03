@@ -218,9 +218,7 @@ fn def_hash(h: At<'_>, out: &mut HashOutput) -> Result<(), Error> {
     if let Some(x) = h.field("decl")?.option()? {
         out.decls.insert(name.clone(), hash_of(x)?);
     }
-    out.deps.insert(name.clone(), symbols(h.field("deps")?)?);
-    out.closure
-        .insert(name, symbols(h.field("closure")?)?.into_iter().collect());
+    out.deps.insert(name, symbols(h.field("deps")?)?);
     Ok(())
 }
 
@@ -247,10 +245,6 @@ fn item_hash(h: At<'_>, declared: &Symbol, out: &mut HashOutput) -> Result<DefHa
             known.push(d);
         }
     }
-    out.closure
-        .entry(declared.clone())
-        .or_default()
-        .extend(symbols(h.field("closure")?)?);
     Ok(hash)
 }
 
