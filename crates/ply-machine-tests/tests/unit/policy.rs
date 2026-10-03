@@ -7,7 +7,6 @@ fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
         "tcb" => "hosts",
-        "edit" => "replace",
         "shipped" => "compiler.unit",
         other => other,
     }

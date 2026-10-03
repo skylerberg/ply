@@ -311,8 +311,9 @@ root package squatting on a dependency's prefix — and a cycle of packages is
 package root: `rev` may be a commit, a tag or a branch, and a branch means what
 it means the day it is fetched — the fetched tree is reused without asking the
 remote again, so a cleared cache is what picks up a moved branch, and `ply.lock`'s
-digest is what catches it when that happens. A fetch that git cannot do is
-`E0140`.
+digest is what catches it when that happens. The fetch runs the `git` on
+`PATH`, with the run's own environment. A fetch that git cannot do, or a run
+with no `git` to do it, is `E0140`.
 
 A `Registry` dependency is the package of that `name` from the registry
 `PLY_REGISTRY` names (§15.1), at least `min`; its `name` must be a package name
@@ -3191,7 +3192,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`), `edit` or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3483,7 +3484,7 @@ An allocation with no `ply_*` frame on its stack is counted under the site
 `<no ply frame>`.
 What a host may lend is a policy with names, one family each:
 `machine` (load, bind, enter and call a nested program), `tester`, `claims`,
-`builder`, `hosts`, `edit` and `shipped`, each with a summary a
+`builder`, `hosts` and `shipped`, each with a summary a
 reviewer can read. The launcher lends its own program every family; another host
 names the ones it means, so `machine` — which drives another machine — is
 granted on purpose and not by accident. A program lent `machine` hands it a

@@ -9,6 +9,7 @@ import cli.ply (main)
 import cli.paths
 import cli.program (pkgs_of)
 import cli.sources
+import cli.vcs
 import compiler.pkg
 import compiler.pkg (Supplied)
 import cli.builder (builder, hermetic_builder)
@@ -31,7 +32,8 @@ import std.net
 import std.net (net)
 import std.random (entropy)
 import std.process (process, Var, Finished, Exited, Signalled, Captured, captured, args_step,
-                    out_step, err_step, exit_step, Keep, Lines, Discard, Said, Signal, Kill)
+                    out_step, err_step, exit_step, with_input, line_step, Line, Keep, Lines,
+                    Discard, Said, Signal, Kill)
 import std.time (time)
 
 // --- What a run said ---------------------------------------------------------
@@ -317,7 +319,7 @@ pub type Closure = { packages: List<Package>, dirs: List<String> }
 pub fn manifest_closure(dir: String) -> Closure / {Reached, abort.raise} = {
   let pwd = working();
   handle {
-    let project = sources::load_resolved([paths::resolve(dir)]);
+    let project = vcs::fetching(|| sources::load_resolved([paths::resolve(dir)]));
     let pkgs = pkgs_of(project);
     let settled = pkg::closure(
       pkgs,
@@ -331,6 +333,7 @@ pub fn manifest_closure(dir: String) -> Closure / {Reached, abort.raise} = {
     }
   } with {
     env.pwd[sys]() -> pwd,
+    env.vars[sys]() -> [],
   }
 }
 
@@ -481,9 +484,9 @@ pub fn kept_in_memory(
 }
 
 // Written out, so an operation `main` gains and `over_tree` misses is a type error, not a disk read.
-pub effect set Reached = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, builder.git[vcs], builder.loaded[build], tcb.schema[host], tcb.preview[host], machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.filed[run], machine.reload[run], machine.schema[run], machine.bound[run], machine.enter[run], machine.drop[run], tester.read[corpus], tester.write[corpus], prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.schema[claims], prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], prover.ended[claims], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
+pub effect set Reached = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, process.bound[git], process.spawn[git], builder.loaded[build], tcb.schema[host], tcb.preview[host], machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.filed[run], machine.reload[run], machine.schema[run], machine.bound[run], machine.enter[run], machine.drop[run], tester.read[corpus], tester.write[corpus], prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.schema[claims], prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], prover.ended[claims], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
 
-pub effect set Hermetic = {hermetic_tester.read[corpus], hermetic_tester.write[corpus], hermetic_builder.read[build], hermetic_builder.git[vcs], hermetic_prover.read[claims], hermetic_prover.write[claims], hermetic_tcb.read[host], hermetic_machine.configure[run], hermetic_machine.load[run], hermetic_machine.opened[run], hermetic_machine.reuse[run], hermetic_machine.filed[run], hermetic_machine.reload[run], hermetic_machine.schema[run], hermetic_machine.bound[run], hermetic_machine.enter[run], hermetic_machine.drop[run]}
+pub effect set Hermetic = {hermetic_tester.read[corpus], hermetic_tester.write[corpus], hermetic_builder.read[build], hermetic_prover.read[claims], hermetic_prover.write[claims], hermetic_tcb.read[host], hermetic_machine.configure[run], hermetic_machine.load[run], hermetic_machine.opened[run], hermetic_machine.reuse[run], hermetic_machine.filed[run], hermetic_machine.reload[run], hermetic_machine.schema[run], hermetic_machine.bound[run], hermetic_machine.enter[run], hermetic_machine.drop[run]}
 
 // The test's working directory, the checkout the tests run from, `ply` run as a process with the
 // environment it inherits, the connections a test makes to a server it started, and the wall clock
@@ -587,7 +590,8 @@ pub fn over_tree<a | e>(
         time.elapsed_ms() -> 0,
         time.elapsed_us() -> 0,
         time.sleep_ms(_) -> panic("`--watch` waits on a disk; in memory nothing changes"),
-        builder.git[vcs](root, key) -> hermetic_builder.git[vcs](root, key),
+        process.bound[git]() -> false,
+        process.spawn[git](args, dir, vars) -> panic(no_machine("`git`")),
         builder.loaded[build](root, front) -> hermetic_builder.loaded[build](root, front),
         tcb.schema[host](root, front, unit, name) ->
           hermetic_tcb.schema[host](root, front, unit, name),
@@ -649,19 +653,19 @@ fn out_of_w(p: String) -> String / {abort.raise} =
   else if string_starts_with(p, "w/") { string_slice(p, 2, string_len(p)) }
   else { p }
 
-// What `ply replace` puts in a definition's place: the file `--with` names, or what a test hands
-// in as its standard input, which is empty when it hands in none.
-fn replacement<| e>(
-  from: Option<String>,
-  stdin: Option<String>,
-  read_at: (String) -> Option<String> / e,
-) -> Result<String, String> / e =
-  match from {
-    Some(file) -> match read_at(file) {
-      Some(t) -> Ok(t),
-      None -> Err("could not read `" ++ file ++ "`: No such file or directory (os error 2)"),
+// The lines a test's standard input holds, as a console hands them over: empty when it hands in
+// none, and a last line is one whether or not a newline ends it.
+fn input_lines(stdin: Option<String>) -> List<String> / {abort.raise} =
+  match stdin {
+    None -> [],
+    Some(text) -> {
+      let lines = string_split(text, "\n");
+      let last = len(lines) - 1;
+      if list_at(lines, last) == Some("") {
+        fold(range(0, last), [], |acc: List<String>, i: Int|
+          match list_at(lines, i) { Some(l) -> push(acc, l), None -> acc })
+      } else { lines }
     },
-    None -> match stdin { Some(t) -> Ok(t), None -> Ok("") },
   }
 
 // --- On disk -----------------------------------------------------------------
@@ -694,7 +698,7 @@ fn on_disk_over(
 ) -> Ran / {Reached, Shelf, abort.raise} = {
   // Tests share the machine they are lent, so a command starts and ends with the label empty.
   machine.drop[run]();
-  let ran = with_cell[disk_io](captured(argv)) { io -> {
+  let ran = with_cell[disk_io](with_input(captured(argv), input_lines(stdin))) { io -> {
     let pwd = working();
     handle {
       main()
@@ -712,7 +716,11 @@ fn on_disk_over(
       env.builder_digest[sys]() -> in_process_digest(),
       env.reused[sys]() -> pwd ++ "/" ++ reused_dir(),
       env.bodies[sys]() -> pwd ++ "/" ++ bodies(),
-      edit.item[replace](from) -> replacement(from, stdin, read),
+      process.line[proc]() -> {
+        let read: Line = line_step(cell_get(io));
+        cell_set(io, read.captured);
+        read.line
+      },
       fs.list_dir[shelf](_) -> shelf_names(),
       fs.read_file[shelf](name) -> match filter(shipped, |f: Source| f.path == name) {
         [f, ..] -> Some(bytes_of_string(f.text)),
