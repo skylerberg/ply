@@ -5,11 +5,20 @@
 
 import std.random (entropy)
 import builder (builder)
-import args (Flags, style_of)
+import args (Flags, style_of, no_flags)
 import appends (costs_of, priced, promised, promises, report_lines, unresolved)
 import diagnostic (Place, all_to_json)
-import program (Program, Timed, ModuleFacts, timed_load, module_facts, published, is_shelved,
-                own_tests)
+import program (Program, Timed, ModuleFacts, timed_over, module_facts, published, is_shelved,
+                own_tests, placed_of)
+import reused (Toolchain, entry_at, file, key_of, touched)
+import env (env)
+import paths
+import paths (Resolved)
+import sources (Project, DepPackage, load_resolved)
+import interfaces
+import compiler.hash (hex)
+import std.bin
+import std.hash (blake3)
 import report (Answer, ok_code, count_of, indent, plural, refused, warning_lines)
 import signature (SetLine, counted_lines, effect_sets, provenance, provenance_lines, set_lines)
 import style (Style, bold, dim, green)
@@ -21,7 +30,8 @@ import compiler.types (Atom, Type, printer_new, print_atom_list, scheme_text, ro
                        atom_text, append)
 import compiler.type_syntax (Mode, MRead, MWrite, MBad)
 import std.fs (fs)
-import std.json (Json, Member, Str, Bool, Number, Array, object)
+import std.json (Json, Member, Str, Bool, Number, Array, Object, Null, object, parse_string,
+                 to_string)
 import std.time (time)
 
 // `indent()` plus the two spaces that put a definition under its module heading.
@@ -482,19 +492,198 @@ fn checked(
   }
 }
 
+// --- An unchanged check ---------------------------------------------------------------
+// A check's answer depends only on what its walk read, the toolchain, the places its reports name and
+// its flags; one filed under all of those is taken back, as `ply run` takes a front end.
+
+// A check's answer as it is filed.
+type Replay = { lines: List<String>, errs: List<String>, code: Int, json: String }
+
+derive bin for Replay
+
+fn field(b: Bytes) -> Bytes =
+  bytes_concat_all([bytes_of_string(int_to_string(bytes_len(b))), b":", b])
+
+fn flag(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
+
+fn resolved_field(r: Resolved) -> Bytes =
+  bytes_concat_all(
+    map([r.label, r.spelling, r.display, r.inside, r.absolute, r.machine], |s: String|
+      field(bytes_of_string(s))),
+  )
+
+// The interface each registry dependency's slot holds, which a load reads beside its walk.
+fn published_field(project: Project) -> Bytes / {fs.read_file[abs], abort.raise} = {
+  let slots = interfaces::slots(project.root_key, map(project.packages, |p: DepPackage| p.root));
+  bytes_concat(
+    field(bytes_of_string(int_to_string(len(slots)))),
+    bytes_concat_all(
+      map(slots, |slot: String|
+        bytes_concat(field(bytes_of_string(slot)), match interfaces::slot_read(slot) {
+          Some(b) -> bytes_concat(b"+", blake3(b)),
+          None -> b"-",
+        })),
+    ),
+  )
+}
+
+fn replay_key(
+  tools: Toolchain,
+  project: Project,
+  published: Bytes,
+  flags: Flags,
+) -> String / {abort.raise} = {
+  let placed = placed_of(project);
+  let places = fold(placed.manifests, placed.modules, |acc: List<Place>, p: Place| push(acc, p));
+  string_of_bytes(
+    hex(
+      blake3(
+        bytes_concat_all([
+          field(b"ply check answer 1"),
+          field(bytes_of_string(key_of(tools, project, None))),
+          field(published),
+          flag(flags.json),
+          flag(flags.types),
+          flag(flags.costs),
+          flag(flags.color),
+          flag(flags.verify_deps),
+          field(bytes_of_string(flags.root)),
+          field(bytes_of_string(int_to_string(len(flags.paths)))),
+          bytes_concat_all(map(flags.paths, resolved_field)),
+          field(bytes_of_string(int_to_string(len(places)))),
+          bytes_concat_all(map(places, |p: Place| field(bytes_of_string(p.path)))),
+        ]),
+      ),
+    ),
+  )
+}
+
+fn filed_answer(a: Answer) -> Bytes / {abort.raise} =
+  bin::encode({ lines: a.lines, errs: a.errs, code: a.code, json: to_string(a.json) }, replay_bin())
+
+fn replayed(entry: Option<Bytes>) -> Option<Answer> / {abort.raise} =
+  match entry {
+    None -> None,
+    Some(bytes) -> match bin::decode(bytes, replay_bin()) {
+      Err(_) -> None,
+      Ok(r) -> match parse_string(r.json) {
+        Ok(json) -> Some({ json: json, lines: r.lines, errs: r.errs, code: r.code }),
+        Err(_) -> None,
+      },
+    },
+  }
+
+// The answer with its `front_end` member as `front` makes it: what the front end did is this run's,
+// whatever answer it takes.
+fn with_front(a: Answer, front: (Json) -> Json) -> Answer =
+  match a.json {
+    Object(members) ->
+      {
+        ..a,
+        json: Object(
+          map_insert(
+            members,
+            "front_end",
+            front(match map_get(members, "front_end") { Some(f) -> f, None -> Null }),
+          ),
+        ),
+      },
+    _ -> a,
+  }
+
+fn reuse_said(front: Json, reused: Bool, key: String) -> Json =
+  match front {
+    Object(members) ->
+      Object(map_insert(map_insert(members, "reused", Bool(reused)), "key", Str(key))),
+    _ -> object([{ key: "reused", value: Bool(reused) }, { key: "key", value: Str(key) }]),
+  }
+
+// A check run now, and the answer a later check may take back: one the front end answered whole,
+// without what the front-end cache said of itself, which a run that does not read it never says.
+fn checked_now(
+  flags: Flags,
+  project: Project,
+  started: Int,
+) -> { answer: Answer, filed: Option<Answer> } / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, abort.raise} = {
+  let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps);
+  match t.program.whole {
+    None ->
+      { answer: refused(style_of(flags), "check", t.program.diags, t.program.places), filed: None },
+    Some(w) -> {
+      let answer = checked(style_of(flags), flags, t, w);
+      let own = if len(t.own) == len(t.program.diags) { answer }
+      else { checked(style_of(flags), flags, { ..t, program: { ..t.program, diags: t.own } }, w) };
+      { answer: answer, filed: Some(own) }
+    },
+  }
+}
+
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, abort.raise} = {
-  let t: Timed = timed_load(flags.paths, true, flags.verify_deps);
-  match t.program.whole {
-    None -> refused(style_of(flags), "check", t.program.diags, t.program.places),
-    Some(w) -> checked(style_of(flags), flags, t, w),
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, env.binary_version[sys], env.shipped_digest[sys], env.fronts[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise} = {
+  let started = time.elapsed_ms();
+  let project = load_resolved(flags.paths);
+  // `--explain` says what this run's own phases took, which no filed answer knows.
+  if flags.explain { checked_now(flags, project, started).answer } else {
+    let tools: Toolchain = { stamp: env.shipped_digest[sys](), version: env.binary_version[sys]() };
+    let key = replay_key(tools, project, published_field(project), flags);
+    match replayed(entry_at(key)) {
+      Some(answer) -> {
+        touched(key);
+        if flags.json { with_front(answer, |_: Json| reuse_said(object([]), true, key)) }
+        else { answer }
+      },
+      None -> {
+        let now = checked_now(flags, project, started);
+        match now.filed { Some(own) -> file(key, filed_answer(own)), None -> () };
+        if flags.json { with_front(now.answer, |front: Json| reuse_said(front, false, key)) }
+        else { now.answer }
+      },
+    }
   }
 }
 
 // --- Tests ------------------------------------------------------------------
 
 fn plain() -> Style = { styled: false }
+
+fn a_project(path: String, main: Bytes) -> Project =
+  {
+    files: [{ path: path, module: "main", text: main, at: { label: "cwd", path: path } }],
+    sources: [],
+    diags: [],
+    manifest: None,
+    packages: [],
+    root_key: "/w/app",
+    embeds: [],
+  }
+
+test "a check's answer is filed under its walk, toolchain, places and flags, and reads back whole" {
+  let flags = { ..no_flags(), paths: [paths::here()] };
+  let project = a_project("main.ply", b"fn main() -> Int = 1\n");
+  let key = |p: Project, f: Flags, stamp: String|
+    replay_key({ stamp: stamp, version: "0.16.0" }, p, b"", f);
+  let base = key(project, flags, "b3:a");
+  assert_eq(key(project, flags, "b3:a"), base);
+  assert(key(a_project("main.ply", b"fn main() -> Int = 2\n"), flags, "b3:a") != base);
+  assert(key(a_project("app/main.ply", b"fn main() -> Int = 1\n"), flags, "b3:a") != base);
+  assert(key(project, flags, "b3:b") != base);
+  assert(replay_key({ stamp: "b3:a", version: "0.16.0" }, project, b"+published", flags) != base);
+  assert(key(project, { ..flags, types: true }, "b3:a") != base);
+  assert(key(project, { ..flags, json: true }, "b3:a") != base);
+  assert(key(project, { ..flags, costs: true }, "b3:a") != base);
+  assert(key(project, { ..flags, color: true }, "b3:a") != base);
+  assert(key(project, { ..flags, verify_deps: true }, "b3:a") != base);
+  assert(key(project, { ..flags, paths: [paths::at_cwd("app")] }, "b3:a") != base);
+  let answer: Answer = {
+    json: object([{ key: "ok", value: Bool(true) }]),
+    lines: ["   checked 1 module"],
+    errs: ["a note"],
+    code: 0,
+  };
+  assert_eq(replayed(Some(filed_answer(answer))), Some(answer));
+  assert_eq(replayed(Some(b"not an answer")), None)
+}
 
 test "a share is a tenth of a percent, and a run that took no time at all is not a division" {
   assert_eq(share(984, 1000), " 98.4%");
@@ -517,6 +706,7 @@ test "the longest phase is printed first, and the total accounts for all three" 
     front_ms: 90,
     file_ms: 8,
     cached: true,
+    own: [],
   });
   assert_eq(lines, [
     "",

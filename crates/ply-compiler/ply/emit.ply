@@ -3,10 +3,10 @@
 
 import parsing (int_to_bytes, Ident, Span, dummy_span, span_key, ParseDiag)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpdate,
-             NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField,
-             NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, CStmt, CLet, CLetPat,
-             CDo, pat_slots, CField, CArm, Capture, CClause, CReturn, Own, Borrowed, Owned,
-             lower_fn, qname_text)
+             NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList,
+             CodePatternField, NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle,
+             CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm, Capture, CodeClause,
+             CodeReturn, Own, Borrowed, Owned, lower_fn, qname_text)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
               SEnsures, FnDef)
@@ -49,8 +49,8 @@ pub fn ctype(k: Kind) -> Bytes =
     _ -> b"int64_t",
   }
 
-fn unsigned_ctype(w: Width) -> Bytes =
-  if w.bits == 8 { b"uint8_t" } else if w.bits == 16 { b"uint16_t" } else { b"uint32_t" }
+fn unsigned_ctype(width: Width) -> Bytes =
+  if width.bits == 8 { b"uint8_t" } else if width.bits == 16 { b"uint16_t" } else { b"uint32_t" }
 
 // `width_index`'s order is the runtime's width numbering.
 fn width_named(name: Bytes) -> Option<Width> =
@@ -66,27 +66,30 @@ fn width_named(name: Bytes) -> Option<Width> =
   else if name == b"I128" { Some({ bits: 128, signed: true }) }
   else { None }
 
-fn width_index(w: Width) -> Int =
-  if w.bits == 128 { if w.signed { 9 } else { 8 } } else {
-    (if w.signed { 4 } else { 0 })
-      + (if w.bits == 8 { 0 } else if w.bits == 16 { 1 } else if w.bits == 32 { 2 } else { 3 })
+fn width_index(width: Width) -> Int =
+  if width.bits == 128 { if width.signed { 9 } else { 8 } } else {
+    (if width.signed { 4 } else { 0 })
+      + (if width.bits == 8 { 0 }
+      else if width.bits == 16 { 1 }
+      else if width.bits == 32 { 2 }
+      else { 3 })
   }
 
-fn carried(w: Width) -> Bool = w.bits < 64
+fn carried(width: Width) -> Bool = width.bits < 64
 
 fn power_of_two(n: Int) -> Int = if n <= 0 { 1 } else { 2 * power_of_two(n - 1) }
 
-fn width_min(w: Width) -> Int = if w.signed { 0 - power_of_two(w.bits - 1) } else { 0 }
+fn width_min(width: Width) -> Int = if width.signed { 0 - power_of_two(width.bits - 1) } else { 0 }
 
-fn width_max(w: Width) -> Int =
-  if w.signed { power_of_two(w.bits - 1) - 1 } else { power_of_two(w.bits) - 1 }
+fn width_max(width: Width) -> Int =
+  if width.signed { power_of_two(width.bits - 1) - 1 } else { power_of_two(width.bits) - 1 }
 
-fn as_num(value: CValue, w: Width) -> Bytes =
+fn as_num(value: CValue, width: Width) -> Bytes =
   match value.kind {
-    KNum(h) -> if h == w { value.expr }
-    else { bytes_concat_all([b"(", ctype(KNum(w)), b")(", value.expr, b")"]) },
-    KBoxed -> bytes_concat_all([b"(", ctype(KNum(w)), b")ply_imm_value(", value.expr, b")"]),
-    _ -> bytes_concat_all([b"(", ctype(KNum(w)), b")(", value.expr, b")"]),
+    KNum(h) -> if h == width { value.expr }
+    else { bytes_concat_all([b"(", ctype(KNum(width)), b")(", value.expr, b")"]) },
+    KBoxed -> bytes_concat_all([b"(", ctype(KNum(width)), b")ply_imm_value(", value.expr, b")"]),
+    _ -> bytes_concat_all([b"(", ctype(KNum(width)), b")(", value.expr, b")"]),
   }
 
 // An emitted value: the kind it is held at and the C expression naming it.
@@ -855,9 +858,9 @@ fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
   }
 
 fn note_deferred(emitter: Emitter, d: Deferred) -> Emitter =
-  note_holder(note_deferred0(emitter, d), d.name)
+  note_holder(push_deferred(emitter, d), d.name)
 
-fn note_deferred0(emitter: Emitter, d: Deferred) -> Emitter =
+fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
   {
     out: emitter.out,
     temp_count: emitter.temp_count,
@@ -1447,7 +1450,7 @@ fn sets_bound(
 fn concat_names(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
   fold(b, a, |acc: List<Bytes>, x: Bytes| push(acc, x))
 
-fn set_value(sets: List<CField>, vals: List<CValue>, name: Bytes) -> Option<CValue> =
+fn set_value(sets: List<CodeField>, vals: List<CValue>, name: Bytes) -> Option<CValue> =
   fold(range(0, len(sets)), None, |acc: Option<CValue>, i: Int|
     match list_at(sets, i) {
       Some(f) -> if f.name == name { list_at(vals, i) } else { acc },
@@ -1742,7 +1745,7 @@ fn slots_read(code: Code) -> List<Int> =
       concat(slots_read(i.cond), concat(slots_read(i.then_branch), slots_read(i.else_branch))),
     NBlock(b) ->
       concat(
-        fold(b.stmts, [], |acc: List<Int>, stmt: CStmt|
+        fold(b.stmts, [], |acc: List<Int>, stmt: CodeStmt|
           concat(acc, match stmt {
             CLet(l) -> slots_read(l.value),
             CLetPat(l) -> slots_read(l.value),
@@ -1755,7 +1758,7 @@ fn slots_read(code: Code) -> List<Int> =
     NMatch(m) ->
       concat(
         slots_read(m.scrutinee),
-        fold(m.arms, [], |acc: List<Int>, a: CArm|
+        fold(m.arms, [], |acc: List<Int>, a: CodeArm|
           concat(
             acc,
             concat(match a.guard { Some(g) -> slots_read(g), None -> [] }, slots_read(a.body)),
@@ -1773,7 +1776,7 @@ fn slots_read(code: Code) -> List<Int> =
       concat(
         slots_read(h.body),
         concat(
-          fold(h.clauses, [], |acc: List<Int>, clause: CClause|
+          fold(h.clauses, [], |acc: List<Int>, clause: CodeClause|
             concat(
               concat(acc, match clause.label { Some(x) -> slots_read(x), None -> [] }),
               through_caps(slots_read(clause.body), clause.captures),
@@ -1786,8 +1789,8 @@ fn slots_read(code: Code) -> List<Int> =
 fn all_read(codes: List<Code>) -> List<Int> =
   fold(codes, [], |acc: List<Int>, code: Code| concat(acc, slots_read(code)))
 
-fn fields_read(fs: List<CField>, before: List<Int>) -> List<Int> =
-  fold(fs, before, |acc: List<Int>, field: CField| concat(acc, slots_read(field.value)))
+fn fields_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
+  fold(fs, before, |acc: List<Int>, field: CodeField| concat(acc, slots_read(field.value)))
 
 fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
   fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
@@ -2421,7 +2424,7 @@ fn fusable_step(emitter: Emitter, code: Code) -> Bool / {abort.raise} =
         }),
     NIf(i) -> fusable_step(emitter, i.then_branch) && fusable_step(emitter, i.else_branch),
     NBlock(b) -> match b.tail { Some(t) -> fusable_step(emitter, t), None -> false },
-    NMatch(m) -> fold(m.arms, true, |acc: Bool, a: CArm| acc && fusable_step(emitter, a.body)),
+    NMatch(m) -> fold(m.arms, true, |acc: Bool, a: CodeArm| acc && fusable_step(emitter, a.body)),
     _ -> false,
   }
 
@@ -4608,9 +4611,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     // `{..b, f: e}` reuses the base's memory: the base is released before the allocation, so its cells are the token.
     // Order: the written fields are evaluated, then the base read, then each field filled in shape order.
     NUpdate(u) -> {
-      let names = sorted_names(concat_names(u.copies, map(u.sets, |f: CField| f.name)));
+      let names = sorted_names(concat_names(u.copies, map(u.sets, |f: CodeField| f.name)));
       // Each written field is evaluated and bound before the base is read.
-      match sets_bound(emitter, map(u.sets, |f: CField| f.value), params, 0, []) {
+      match sets_bound(emitter, map(u.sets, |f: CodeField| f.value), params, 0, []) {
         None -> None,
         Some(ev) -> match expr(notail(ev.emitter), u.base, params) {
           None -> None,
@@ -4742,8 +4745,8 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     },
     // Values evaluated in written order, assembled in sorted-name order, from a reuse token of this width when there is one.
     NRecord(r) -> {
-      let names = map(r.fields, |f: CField| f.name);
-      match items(emitter, map(r.fields, |f: CField| f.value), params, 0, []) {
+      let names = map(r.fields, |f: CodeField| f.name);
+      match items(emitter, map(r.fields, |f: CodeField| f.value), params, 0, []) {
         None -> None,
         Some(w) -> {
           let sorted = sorted_names(names);
@@ -5473,7 +5476,7 @@ fn tail_calls_of(code: Code, k: Int) -> Int =
     },
     NIf(i) -> tail_calls_of(i.then_branch, k) + tail_calls_of(i.else_branch, k),
     NBlock(b) -> match b.tail { Some(t) -> tail_calls_of(t, k), None -> 0 },
-    NMatch(m) -> fold(m.arms, 0, |acc: Int, a: CArm| acc + tail_calls_of(a.body, k)),
+    NMatch(m) -> fold(m.arms, 0, |acc: Int, a: CodeArm| acc + tail_calls_of(a.body, k)),
     _ -> 0,
   }
 
@@ -5481,14 +5484,14 @@ fn tail_calls_of(code: Code, k: Int) -> Int =
 fn handle_site(
   emitter: Emitter,
   body: Code,
-  clauses: List<CClause>,
-  ret: Option<CReturn>,
+  clauses: List<CodeClause>,
+  ret: Option<CodeReturn>,
   params: List<EmitParam>,
 ) -> Option<WithValue> / {abort.raise} = {
   let named = fold(
     clauses,
     Some([]),
-    |acc: Option<List<{ global: Bytes, clause: CClause }>>, clause: CClause|
+    |acc: Option<List<{ global: Bytes, clause: CodeClause }>>, clause: CodeClause|
       match acc {
         None -> None,
         Some(xs) -> match effect_global(emitter, clause.effect) {
@@ -5498,7 +5501,7 @@ fn handle_site(
       },
   );
   // A clause calling `resume` off the tail detaches the body: it runs on its own stack, so it becomes a closure.
-  let detached = fold(clauses, false, |acc: Bool, clause: CClause|
+  let detached = fold(clauses, false, |acc: Bool, clause: CodeClause|
     acc || (clause.resume && !resume_in_tail_only(clause.body, clause.params)));
   match named {
     None ->
@@ -5509,7 +5512,7 @@ fn handle_site(
       match fold(
           cs,
           Some({ emitter: opened, entries: [] }),
-          |acc: Option<{ emitter: Emitter, entries: List<Bytes> }>, x: { global: Bytes, clause: CClause }|
+          |acc: Option<{ emitter: Emitter, entries: List<Bytes> }>, x: { global: Bytes, clause: CodeClause }|
             match acc {
               None -> None,
               Some(st) -> {
@@ -5813,7 +5816,7 @@ fn bytes_join(xs: List<Bytes>, sep: Bytes) -> Bytes =
 // A `let` binds its value under its own name even when it is already a temporary.
 fn stmts(
   emitter: Emitter,
-  xs: List<CStmt>,
+  xs: List<CodeStmt>,
   params: List<EmitParam>,
   i: Int,
 ) -> Option<Emitter> / {abort.raise} =
@@ -5876,7 +5879,7 @@ fn stmts(
 // Each arm is guarded by the flag rather than an `else`, so its test is written at one depth.
 fn arms(
   emitter: Emitter,
-  xs: List<CArm>,
+  xs: List<CodeArm>,
   params: List<EmitParam>,
   i: Int,
   subj: CValue,
@@ -6000,7 +6003,7 @@ fn arm_body(
 fn match_subject(
   emitter: Emitter,
   scrutinee: Code,
-  xs: List<CArm>,
+  xs: List<CodeArm>,
   params: List<EmitParam>,
 ) -> Option<{ emitter: Emitter, subj: CValue, lookup: Bool }> / {abort.raise} =
   match lookup_of(emitter, scrutinee, xs) {
@@ -6035,7 +6038,7 @@ fn match_arms(
   emitter: Emitter,
   subj: CValue,
   lookup: Bool,
-  xs: List<CArm>,
+  xs: List<CodeArm>,
   params: List<EmitParam>,
   sink: Sink,
   span: Span,
@@ -6070,7 +6073,7 @@ fn match_arms(
 fn lookup_of(
   emitter: Emitter,
   scrutinee: Code,
-  xs: List<CArm>,
+  xs: List<CodeArm>,
 ) -> Option<{ helper: Bytes, args: List<Code> }> / {abort.raise} =
   match scrutinee.node {
     NApp(a) -> match a.func.node {
@@ -6104,7 +6107,7 @@ fn lookup_of(
   }
 
 // `true` for `Some(x)` or `Some(_)`, `false` for `None`, and nothing for any other pattern.
-fn unwraps(emitter: Emitter, pattern: CPat) -> Option<Bool> / {abort.raise} =
+fn unwraps(emitter: Emitter, pattern: CodePattern) -> Option<Bool> / {abort.raise} =
   match pattern {
     PxCtor(c) -> if tag_of(emitter, c.name) == None { None }
     else if c.name == b"Some" && len(c.args) == 1 {
@@ -6122,7 +6125,7 @@ fn unwraps(emitter: Emitter, pattern: CPat) -> Option<Bool> / {abort.raise} =
   }
 
 // A lookup's arm tests the answer itself: an element for `Some`, zero for `None`.
-fn lookup_test(pattern: CPat, held: Bytes) -> Bytes =
+fn lookup_test(pattern: CodePattern, held: Bytes) -> Bytes =
   match pattern {
     PxCtor(c) -> if len(c.args) == 1 { bytes_concat_all([b"(", held, b" != 0)"]) }
     else { bytes_concat_all([b"(", held, b" == 0)"]) },
@@ -6130,7 +6133,7 @@ fn lookup_test(pattern: CPat, held: Bytes) -> Bytes =
   }
 
 // The helper handed back a count, so binding it adds no increment.
-fn lookup_bind(emitter: Emitter, pattern: CPat, subj: CValue) -> Emitter / {abort.raise} =
+fn lookup_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {abort.raise} =
   match pattern {
     PxCtor(c) -> match list_at(c.args, 0) {
       Some(sub) -> pat_bind(emitter, sub, subj),
@@ -6189,12 +6192,12 @@ fn equal_test(
 }
 
 // A variable pattern is irrefutable: the parser makes every upper-case bare name in pattern position a constructor.
-fn irrefutable(pattern: CPat) -> Bool =
+fn irrefutable(pattern: CodePattern) -> Bool =
   match pattern { PxWild -> true, PxVar(_) -> true, _ -> false }
 
 // A nested pattern reads a field into a local under the test so far, since reading a non-record raises. `None` for an unsupported pattern.
 fn pat_test(
-  pattern: CPat,
+  pattern: CodePattern,
   subj: CValue,
   emitter: Emitter,
 ) -> Option<{ emitter: Emitter, expr: Bytes }> / {abort.raise} =
@@ -6297,7 +6300,7 @@ fn pat_test(
       fold(
         r.fields,
         Some({ emitter: emitter, expr: head }),
-        |acc: Option<{ emitter: Emitter, expr: Bytes }>, f: CPatField|
+        |acc: Option<{ emitter: Emitter, expr: Bytes }>, f: CodePatternField|
           match acc {
             None -> None,
             Some(t) -> {
@@ -6391,7 +6394,7 @@ fn pat_test(
   }
 
 // A constructor's argument is duplicated when bound: the object still holds it.
-fn pat_bind(emitter: Emitter, pattern: CPat, subj: CValue) -> Emitter / {abort.raise} =
+fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {abort.raise} =
   match pattern {
     // The binder carries the subject's shape, so `match r { x -> x.f }` reads at an offset.
     PxVar(v) -> match v.slot {
@@ -6417,7 +6420,7 @@ fn pat_bind(emitter: Emitter, pattern: CPat, subj: CValue) -> Emitter / {abort.r
       }),
     // The runtime's read by name answers the field duplicated; no increment here.
     PxRecord(r) ->
-      fold(r.fields, emitter, |acc: Emitter, f: CPatField| {
+      fold(r.fields, emitter, |acc: Emitter, f: CodePatternField| {
         let idx = field_of(acc, f.name);
         let field = bind(
           idx.emitter,
@@ -6692,24 +6695,24 @@ fn overflow_code(op: Bytes) -> Int =
   else if op == b"mul" { 3 }
   else { 4 }
 
-fn narrow(wide: WithValue, w: Width, code: Int) -> Option<WithValue> / {abort.raise} = {
+fn narrow(wide: WithValue, width: Width, code: Int) -> Option<WithValue> / {abort.raise} = {
   let g = line(
     wide.emitter,
     bytes_concat_all([
       b"if (",
       wide.value.expr,
       b" < ",
-      int_lit(width_min(w)),
+      int_lit(width_min(width)),
       b" || ",
       wide.value.expr,
       b" > ",
-      int_lit(width_max(w)),
+      int_lit(width_max(width)),
       b") { rt_overflow_p(ctx, ",
       int_to_bytes(code),
       b"); return 0; }",
     ]),
   );
-  Some(bind(g, KNum(w), bytes_concat_all([b"(", ctype(KNum(w)), b")", wide.value.expr])))
+  Some(bind(g, KNum(width), bytes_concat_all([b"(", ctype(KNum(width)), b")", wide.value.expr])))
 }
 
 fn negated(
@@ -7043,7 +7046,7 @@ fn loops_to_self(emitter: Emitter, code: Code, params: List<EmitParam>) -> Bool 
         || loops_to_self(emitter, i.else_branch, params),
     NBlock(b) -> match b.tail { Some(t) -> loops_to_self(emitter, t, params), None -> false },
     NMatch(m) ->
-      fold(m.arms, false, |acc: Bool, a: CArm| acc || loops_to_self(emitter, a.body, params)),
+      fold(m.arms, false, |acc: Bool, a: CodeArm| acc || loops_to_self(emitter, a.body, params)),
     _ -> false,
   }
 
@@ -9093,7 +9096,7 @@ fn tail_callees(here: List<Def>, code: Code, acc: List<Bytes>) -> List<Bytes> / 
     else { acc },
     NIf(i) -> tail_callees(here, i.else_branch, tail_callees(here, i.then_branch, acc)),
     NBlock(b) -> match b.tail { Some(t) -> tail_callees(here, t, acc), None -> acc },
-    NMatch(m) -> fold(m.arms, acc, |a: List<Bytes>, arm: CArm| tail_callees(here, arm.body, a)),
+    NMatch(m) -> fold(m.arms, acc, |a: List<Bytes>, arm: CodeArm| tail_callees(here, arm.body, a)),
     _ -> acc,
   }
 
@@ -9108,7 +9111,7 @@ fn has_handle(c: Code) -> Bool = {
     NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
     NBlock(b) ->
       (match b.tail { Some(t) -> has_handle(t), None -> false })
-        || fold(b.stmts, false, |acc: Bool, stmt: CStmt|
+        || fold(b.stmts, false, |acc: Bool, stmt: CodeStmt|
           acc
             || (match stmt {
               CLet(l) -> has_handle(l.value),
@@ -9116,11 +9119,11 @@ fn has_handle(c: Code) -> Bool = {
               CDo(d) -> has_handle(d.code),
             })),
     NList(l) -> within(l.items),
-    NRecord(r) -> within(map(r.fields, |f: CField| f.value)),
-    NUpdate(u) -> within(push(map(u.sets, |f: CField| f.value), u.base)),
+    NRecord(r) -> within(map(r.fields, |f: CodeField| f.value)),
+    NUpdate(u) -> within(push(map(u.sets, |f: CodeField| f.value), u.base)),
     NMatch(m) ->
       has_handle(m.scrutinee)
-        || fold(m.arms, false, |acc: Bool, a: CArm|
+        || fold(m.arms, false, |acc: Bool, a: CodeArm|
           acc || (match a.guard { Some(g) -> has_handle(g), None -> false }) || has_handle(a.body)),
     NPerform(p) -> within(p.args),
     NCell(c2) -> within([c2.init, c2.body]),
@@ -9441,7 +9444,7 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
   let here = |acc: List<Bytes>, x: Code| concat_names(acc, walk_handles(x, effects));
   match c.node {
     NHandle(h) ->
-      fold(h.clauses, walk_handles(h.body, effects), |acc: List<Bytes>, clause: CClause|
+      fold(h.clauses, walk_handles(h.body, effects), |acc: List<Bytes>, clause: CodeClause|
         concat_names(
           match fold(
               concat_effects(effects, prelude_effects_here()),
@@ -9460,7 +9463,7 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
     NApp(a) -> fold(a.args, walk_handles(a.func, effects), here),
     NIf(i) -> here(here(walk_handles(i.cond, effects), i.then_branch), i.else_branch),
     NBlock(b) -> {
-      let stmts = fold(b.stmts, [], |acc: List<Bytes>, stmt: CStmt|
+      let stmts = fold(b.stmts, [], |acc: List<Bytes>, stmt: CodeStmt|
         match stmt {
           CLet(l) -> here(acc, l.value),
           CLetPat(l) -> here(acc, l.value),
@@ -9469,11 +9472,12 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
       match b.tail { Some(t) -> here(stmts, t), None -> stmts }
     },
     NList(l) -> fold(l.items, [], here),
-    NRecord(r) -> fold(r.fields, [], |acc: List<Bytes>, f: CField| here(acc, f.value)),
+    NRecord(r) -> fold(r.fields, [], |acc: List<Bytes>, f: CodeField| here(acc, f.value)),
     NUpdate(u) ->
-      fold(u.sets, walk_handles(u.base, effects), |acc: List<Bytes>, f: CField| here(acc, f.value)),
+      fold(u.sets, walk_handles(u.base, effects), |acc: List<Bytes>, f: CodeField|
+        here(acc, f.value)),
     NMatch(m) ->
-      fold(m.arms, walk_handles(m.scrutinee, effects), |acc: List<Bytes>, a: CArm|
+      fold(m.arms, walk_handles(m.scrutinee, effects), |acc: List<Bytes>, a: CodeArm|
         here(match a.guard { Some(g) -> here(acc, g), None -> acc }, a.body)),
     NPerform(p) -> fold(p.args, [], here),
     NCell(c2) -> here(walk_handles(c2.init, effects), c2.body),
