@@ -18,9 +18,17 @@ import report (Answer, ind, ok_code, count_of, refused, reported)
 import sources (load_resolved)
 import style (Style, bold, green, plain)
 import compiler.resolve (Diag, diag1)
+import signing (public_of, unkeyed)
+import std.bin
+import std.bytes (hex_of)
 import std.fs (fs)
-import std.json (Json, Array, Bool, Member, Number, Str, object, to_string)
+import std.json (Json, Array, Bool, Member, Null, Number, Str, object, to_string)
 import std.net (net)
+import std.pkg (Attestation, attestation_bin, attested)
+import std.signed (countersigned, signed_bytes, signed_of, vouched_by)
+import std.ed25519
+import semantics
+import paths
 
 // The root the command was pointed at, as the resolved path the lock is written under.
 fn root_of(flags: Flags) -> Resolved =
@@ -45,12 +53,93 @@ fn archived_of(archives: List<Archived>, p: Pinned) -> Option<Archived> =
       None -> if a.name == p.name && a.version == p.version { Some(a) } else { None },
     })
 
-fn archive_of(archives: List<Archived>, p: Pinned) -> Option<String> =
-  match archived_of(archives, p) { Some(a) -> Some(a.archive), None -> None }
+// --- Attestations --------------------------------------------------------------------
+// A registry dependency's attestation is believed only when a key `PLY_ATTESTERS` names signed it,
+// for the archive the lock pins, under this `ply`'s semantics: whichever build ran it.
 
-fn one(p: Pinned, archive: Option<String>) -> String =
+fn attesters_variable() -> String = "PLY_ATTESTERS"
+
+// The public key files `PLY_ATTESTERS` names, separated as `PATH` separates directories.
+fn attesters() -> Result<List<Bytes>, Diag> / {env.var[sys], fs.read_file[cwd], fs.read_file[abs]} =
+  match env.var[sys](attesters_variable()) {
+    None -> Ok([]),
+    Some(text) ->
+      fold(string_split(text, ":"), Ok([]), |acc: Result<List<Bytes>, Diag>, path: String|
+        match acc {
+          Err(d) -> Err(d),
+          Ok(keys) -> if path == "" { Ok(keys) } else {
+            match paths::read_file(paths::spelled(path)) {
+              None -> Err(unkeyed(path, "cannot be read")),
+              Some(b) -> match public_of(string_of_bytes_lossy(b)) {
+                Ok(k) -> Ok(push(keys, k)),
+                Err(why) -> Err(unkeyed(path, "does not hold a public key: " ++ why)),
+              },
+            }
+          },
+        }),
+  }
+
+type Vouched = { signer: Option<Bytes>, attestation: Attestation }
+
+fn vouched(a: Archived, keys: List<Bytes>) -> Option<Vouched> =
+  match a.attestation {
+    None -> None,
+    Some(b) -> match signed_of(b) {
+      None -> None,
+      Some(doc) -> match bin::decode(doc.payload, attestation_bin()) {
+        Err(_) -> None,
+        Ok(x) -> if x.archive != a.archive || x.semantics != semantics::version() { None }
+        else { Some({ signer: vouched_by(doc, keys), attestation: x }) },
+      },
+    },
+  }
+
+fn held(v: Vouched) -> Bool = v.signer != None && attested(v.attestation)
+
+fn count(n: Int) -> Json = Number(decimal_of_int(n))
+
+fn vouched_json(v: Option<Vouched>) -> Json =
+  match v {
+    None -> Null,
+    Some(x) ->
+      object([
+        { key: "attested", value: Bool(held(x)) },
+        { key: "trusted", value: Bool(x.signer != None) },
+        { key: "signer", value: match x.signer { Some(k) -> Str(hex_of(k)), None -> Null } },
+        { key: "checked", value: Bool(x.attestation.checked) },
+        { key: "promises", value: Bool(x.attestation.promises) },
+        {
+          key: "tests",
+          value: object([
+            { key: "passed", value: count(x.attestation.tests.passed) },
+            { key: "failed", value: count(x.attestation.tests.failed) },
+          ]),
+        },
+        {
+          key: "proofs",
+          value: object([
+            { key: "proved", value: count(x.attestation.proofs.proved) },
+            { key: "property", value: count(x.attestation.proofs.property) },
+            { key: "example", value: count(x.attestation.proofs.example) },
+            { key: "refuted", value: count(x.attestation.proofs.refuted) },
+            { key: "unattempted", value: count(x.attestation.proofs.unattempted) },
+          ]),
+        },
+        { key: "builder", value: Str(x.attestation.builder) },
+      ]),
+  }
+
+fn one(p: Pinned, archived: Option<Archived>, keys: List<Bytes>) -> String =
   p.name ++ " " ++ p.version ++ " · " ++ p.digest
-    ++ (match archive { Some(_) -> " · registry", None -> "" })
+    ++ (match archived {
+      Some(a) ->
+        " · registry"
+          ++ (match vouched(a, keys) {
+            None -> "",
+            Some(v) -> if held(v) { " · attested" } else { " · not attested" },
+          }),
+      None -> "",
+    })
 
 // The head names the lock and how many packages it pins. `--json` prints the object instead.
 fn lines(s: Style, pins: List<Pinned>, path: String) -> List<String> =
@@ -59,6 +148,7 @@ fn lines(s: Style, pins: List<Pinned>, path: String) -> List<String> =
 fn json_of(
   pins: List<Pinned>,
   archives: List<Archived>,
+  keys: List<Bytes>,
   path: String,
   code: Int,
   wrote: Bool,
@@ -81,6 +171,7 @@ fn json_of(
                   [
                     { key: "archive", value: Str(a.archive) },
                     { key: "interface", value: Bool(a.interface) },
+                    { key: "attestation", value: vouched_json(vouched(a, keys)) },
                   ],
               },
               [
@@ -101,14 +192,16 @@ fn answered(
   s: Style,
   pins: List<Pinned>,
   archives: List<Archived>,
+  keys: List<Bytes>,
   path: String,
   code: Int,
   wrote: Bool,
   more: Bool,
 ) -> Answer = {
-  let body: List<String> = map(pins, |p: Pinned| ind() ++ "  " ++ one(p, archive_of(archives, p)));
+  let body: List<String> = map(pins, |p: Pinned|
+    ind() ++ "  " ++ one(p, archived_of(archives, p), keys));
   {
-    json: json_of(pins, archives, path, code, wrote),
+    json: json_of(pins, archives, keys, path, code, wrote),
     lines: append_lines(lines(s, pins, path), if more { body } else { [] }),
     errs: [],
     code: code,
@@ -125,11 +218,14 @@ pub fn run(
   let r = root_of(flags);
   // The lock is read before anything is fetched: the archive digests it pins are what a registry's
   // answer for a pinned version is checked against.
-  match lock::read(r) {
-    Err(why) -> reported(s, "resolve", [lock::refused(r, why)], []),
-    Ok(existing) -> match remote::resolved(load_resolved(flags.paths), existing) {
-      Err(d) -> reported(s, "resolve", [d], []),
-      Ok(archives) -> pinned(s, flags, r, archives),
+  match attesters() {
+    Err(d) -> reported(s, "resolve", [d], []),
+    Ok(keys) -> match lock::read(r) {
+      Err(why) -> reported(s, "resolve", [lock::refused(r, why)], []),
+      Ok(existing) -> match remote::resolved(load_resolved(flags.paths), existing) {
+        Err(d) -> reported(s, "resolve", [d], []),
+        Ok(archives) -> pinned(s, flags, r, archives, keys),
+      },
     },
   }
 }
@@ -139,6 +235,7 @@ fn pinned(
   flags: Flags,
   r: Resolved,
   archives: List<Archived>,
+  keys: List<Bytes>,
 ) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let loaded: Program = load_program(flags.paths);
   match loaded.whole {
@@ -149,7 +246,7 @@ fn pinned(
       let body = bytes_of_string(text(None, pins, archives));
       if !write_file(at, body) {
         reported(s, "resolve", [unwritable(displayed(at))], loaded.places)
-      } else { answered(s, pins, archives, displayed(at), ok_code(), true, !flags.json) }
+      } else { answered(s, pins, archives, keys, displayed(at), ok_code(), true, !flags.json) }
     },
   }
 }
@@ -164,7 +261,8 @@ test "a resolve names what it pinned, one line per package" {
   let answer = answered(
     plain(),
     pins,
-    [{ name: "base", version: "0.0.1", archive: "b3:77", interface: false }],
+    [{ name: "base", version: "0.0.1", archive: "b3:77", interface: false, attestation: None }],
+    [],
     "app/ply.lock",
     ok_code(),
     true,
@@ -183,7 +281,8 @@ test "the json answer carries every pin, and `--json` prints no lines" {
   let text = to_string(
     json_of(
       pins,
-      [{ name: "lib", version: "0.1.0", archive: "b3:77", interface: true }],
+      [{ name: "lib", version: "0.1.0", archive: "b3:77", interface: true, attestation: None }],
+      [],
       "app/ply.lock",
       ok_code(),
       true,
@@ -200,6 +299,47 @@ test "the json answer carries every pin, and `--json` prints no lines" {
 }
 
 test "a project with no dependencies resolves to an empty lock" {
-  let answer = answered(plain(), [], [], "ply.lock", ok_code(), true, false);
+  let answer = answered(plain(), [], [], [], "ply.lock", ok_code(), true, false);
   assert_eq(answer.lines, ["   resolved 0 packages · ply.lock"])
+}
+
+fn a_seed(n: Int) -> Bytes =
+  bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int((i + n) % 256)))
+
+fn an_attestation(builder: String, semantics: String) -> Attestation =
+  {
+    name: "orders",
+    version: { major: 0, minor: 1, patch: 0 },
+    archive: "b3:77",
+    semantics: semantics,
+    builder: builder,
+    checked: true,
+    promises: true,
+    tests: { passed: 2, failed: 0 },
+    proofs: { proved: 1, property: 0, example: 0, refuted: 0, unattempted: 0 },
+  }
+
+fn archived_with(a: Attestation) -> Archived =
+  {
+    name: "orders",
+    version: "0.1.0",
+    archive: "b3:77",
+    interface: false,
+    attestation: Some(
+      signed_bytes(
+        countersigned({ payload: bin::encode(a, attestation_bin()), signatures: [] }, a_seed(1)),
+      ),
+    ),
+  }
+
+test "an attestation another build signed is believed under these semantics, and never under others" {
+  let key = ed25519::public_key(a_seed(1));
+  let other_build = archived_with(an_attestation("ply 9.9.9", semantics::version()));
+  match vouched(other_build, [key]) {
+    None -> panic("an attestation under these semantics was not read"),
+    Some(v) -> assert(held(v)),
+  };
+  assert(match vouched(other_build, []) { Some(v) -> !held(v), None -> false });
+  assert_eq(vouched(archived_with(an_attestation("ply 9.9.9", "elsewhere")), [key]), None);
+  assert_eq(vouched({ ..other_build, archive: "b3:88" }, [key]), None)
 }

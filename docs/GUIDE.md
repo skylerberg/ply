@@ -2158,6 +2158,12 @@ type Manifest = {
 }
 type Release = { version: Version, digest: String, yanked: Bool, runtime: Version }
 type Index = { name: String, versions: List<Release> }
+type Attestation = {
+  name: String, version: Version, archive: String, semantics: String, builder: String,
+  checked: Bool, promises: Bool,
+  tests: { passed: Int, failed: Int },
+  proofs: { proved: Int, property: Int, example: Int, refuted: Int, unattempted: Int },
+}
 ```
 
 The package manifest as typed data: a `ply.pkg` file is one literal of
@@ -2169,7 +2175,9 @@ version dotted and `parse_version` reads one back (three counts, no leading
 zero, nothing else). `Index` is a registry's `index.json` (§15.1): every
 published `Release` of one package, newest last, read and written by
 `index_json` (`release_json` for one entry), with each version as its dotted
-text.
+text. An `Attestation` is what an attester found of one published version
+(§15.1), derived `bin`; `attested` is whether it checks, keeps its promises,
+failed no test and had no claim refuted.
 
 ### 13.16 `std.pg` — the postgres wire protocol
 
@@ -2977,8 +2985,10 @@ GET  /<name>/index.json                      every version of <name>, newest las
 GET  /<name>/<version>/package.plyz          the library's `.plyz`, as `ply build` writes it
 GET  /<name>/<version>/package.plyz.b3       its digest, one `b3:<hex>` line
 GET  /<name>/<version>/interface/<semantics> the interface its publisher cut under <semantics>
+GET  /<name>/<version>/attestation/<semantics> what the registry's attester found of it
 PUT  /<name>/<version>                       publish: the `.plyz` as the body
 PUT  /<name>/<version>/interface/<semantics> the interface beside it
+PUT  /<name>/<version>/attestation/<semantics> an attestation its attester's key signed
 POST /<name>/<version>/yank                  mark the version yanked
 ```
 
@@ -3029,6 +3039,25 @@ archive into the dependency's slot, and the first load reads the dependency
 through it rather than analysing its source. `--verify-deps` (`check`, `test`,
 `prove`) reads every dependency from source instead and refuses one whose
 interface does not re-derive from it, `E0149`.
+
+A registry with an **attester** vouches for what it serves. `ply attest NAME
+VERSION` lays the published version out as a project of its own, fetched and
+checked as a resolve fetches it, and runs `ply test` and `ply prove` over it:
+whether it checks, whether its `reuse fn` and `returns` promises are kept, its
+tests and the tier each claim was discharged at, under this `ply`'s semantics.
+With `--sign KEY` the answer, a `std.pkg.Attestation`, is signed as §15.2 signs
+a build and sent back; the registry keeps it only when its `attester`'s public key
+signed it, for the version's own archive and the semantics the path names.
+Without `--sign` nothing is sent, which is how anyone runs an attestation again.
+A registry run with `--set attester=<public key hex>`, `--set attest.key=<secret
+key file>`, `--set url=<where the attester reaches it>` and `--exec
+attest=<a ply>` attests every version published, one at a time between
+connections, with that `ply`. A version whose tests fail or whose claim is refuted
+is published all the same, and its attestation says so. `ply resolve` fetches
+each dependency's attestation and believes it only when a key `PLY_ATTESTERS`
+names (public key files, separated as `PATH` separates directories) signed it for
+the archive the lock pins; `--json` reports each one as `attestation`
+(`attested`, `trusted`, `signer`, and what was run).
 `ply yank NAME VERSION` sets the version's `yanked` field under the same token:
 a new resolution passes it over and a lock that pins it keeps it, and its archive
 is served exactly as before. Nothing is ever deleted.
@@ -3132,11 +3161,12 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface published for it under this `ply`'s semantics when there is one (`interface` in `--json`) |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
 | `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
+| `ply attest NAME VERSION` | run a published version's tests, claims and promises over what the registry serves and report the attestation; `--sign KEY` signs it and sends it to the registry (§15.1); no path |
 | `ply keygen PATH` | an Ed25519 key pair: the secret key at `PATH`, the public key at `PATH.pub` (§15.2); no path |
 | `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
