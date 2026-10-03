@@ -39,6 +39,22 @@ pub fn trust() -> Vec<PathBuf> {
     }
 }
 
+/// The programs the `ply` program's own `process.spawn` labels start: the `git` on `PATH`, which
+/// fetches a git dependency. Where none is installed the label stays unbound, which the program
+/// reads with `process.bound[git]`.
+pub fn executables() -> ply_host::process::Executables {
+    let mut executables = ply_host::process::Executables::new();
+    let git = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|program| program.is_file())
+    });
+    if let Some(git) = git {
+        let _ = executables.bind("git", &git, ply_eval::Span::DUMMY);
+    }
+    executables
+}
+
 /// Not `.ply` files, so the program's own listing passes over them.
 const STAMPS: &str = "stamps";
 

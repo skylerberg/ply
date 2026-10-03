@@ -450,8 +450,8 @@ type TryState = {
 
 type Lift = { operand: Expr, binder: Ident, at: Span }
 type Scan = | ScanFound(Lift) | ScanPure | ScanImpure
-type Scanned = { cx: TryState, s: Scan, e: Expr }
-type TryOut = { cx: TryState, e: Expr }
+type Scanned = { state: TryState, scan: Scan, expr: Expr }
+type TryOut = { state: TryState, expr: Expr }
 
 fn is_expansion_name(name: Bytes) -> Bool =
   name == b"Ok" || name == b"Err" || name == b"Some" || name == b"None"
@@ -558,10 +558,10 @@ fn mode_for(state: TryState, ret: Option<TypeExpr>) -> Result<TryMode, Bytes> =
 fn under(barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
   match barrier { Some(_) -> barrier, None -> Some(what) }
 
-fn fresh_binder(state: TryState, span: Span) -> { cx: TryState, b: Ident } =
+fn fresh_binder(state: TryState, span: Span) -> { state: TryState, binder: Ident } =
   {
-    cx: { ..state, fresh: state.fresh + 1 },
-    b: { name: bytes_concat(b"?", bytes_of_string(int_to_string(state.fresh))), span: span },
+    state: { ..state, fresh: state.fresh + 1 },
+    binder: { name: bytes_concat(b"?", bytes_of_string(int_to_string(state.fresh))), span: span },
   }
 
 fn var_of(name: Ident) -> Expr = EVar({ span: name.span, name: bare(name) })
@@ -575,7 +575,7 @@ fn ctor_pattern(name: Bytes, args: List<Pattern>, span: Span) -> Pattern =
 fn wrap(
   state: TryState,
   operand: Expr,
-  at_: Span,
+  span: Span,
   pat: Pattern,
   body: Expr,
 ) -> TryOut / {abort.raise} = {
@@ -585,38 +585,38 @@ fn wrap(
   };
   match mode {
     TryResult -> {
-      let fb = fresh_binder(state, at_);
-      let fail_pat = ctor_pattern(b"Err", [var_pattern(fb.b)], at_);
+      let fresh = fresh_binder(state, span);
+      let fail_pat = ctor_pattern(b"Err", [var_pattern(fresh.binder)], span);
       let fail_body = EApp({
-        span: at_,
-        func: var_of({ name: b"Err", span: at_ }),
-        args: [var_of(fb.b)],
+        span: span,
+        func: var_of({ name: b"Err", span: span }),
+        args: [var_of(fresh.binder)],
         named: [],
         labels: [],
       });
       {
-        cx: fb.cx,
-        e: EMatch({
-          span: at_,
+        state: fresh.state,
+        expr: EMatch({
+          span: span,
           scrutinee: operand,
           arms: [
-            { pat: fail_pat, guard: None, body: fail_body, span: at_ },
-            { pat: ctor_pattern(b"Ok", [pat], at_), guard: None, body: body, span: at_ },
+            { pat: fail_pat, guard: None, body: fail_body, span: span },
+            { pat: ctor_pattern(b"Ok", [pat], span), guard: None, body: body, span: span },
           ],
         }),
       }
     },
     TryOption -> {
-      let fail_pat = ctor_pattern(b"None", [], at_);
-      let fail_body = var_of({ name: b"None", span: at_ });
+      let fail_pat = ctor_pattern(b"None", [], span);
+      let fail_body = var_of({ name: b"None", span: span });
       {
-        cx: state,
-        e: EMatch({
-          span: at_,
+        state: state,
+        expr: EMatch({
+          span: span,
           scrutinee: operand,
           arms: [
-            { pat: fail_pat, guard: None, body: fail_body, span: at_ },
-            { pat: ctor_pattern(b"Some", [pat], at_), guard: None, body: body, span: at_ },
+            { pat: fail_pat, guard: None, body: fail_body, span: span },
+            { pat: ctor_pattern(b"Some", [pat], span), guard: None, body: body, span: span },
           ],
         }),
       }
@@ -630,36 +630,41 @@ fn purity(pure: Bool) -> Scan = if pure { ScanPure } else { ScanImpure }
 fn sequence(
   state: TryState,
   parts: List<Expr>,
-) -> { cx: TryState, s: Scan, xs: List<Expr> } / {abort.raise} =
+) -> { state: TryState, scan: Scan, exprs: List<Expr> } / {abort.raise} =
   fold(
     parts,
-    { cx: state, s: ScanPure, xs: [] },
-    |acc: { cx: TryState, s: Scan, xs: List<Expr> }, expr: Expr|
-      match acc.s {
+    { state: state, scan: ScanPure, exprs: [] },
+    |acc: { state: TryState, scan: Scan, exprs: List<Expr> }, expr: Expr|
+      match acc.scan {
         ScanPure -> {
-          let o = scan(acc.cx, expr);
-          { cx: o.cx, s: o.s, xs: push(acc.xs, o.e) }
+          let o = scan(acc.state, expr);
+          { state: o.state, scan: o.scan, exprs: push(acc.exprs, o.expr) }
         },
-        _ -> { ..acc, xs: push(acc.xs, expr) },
+        _ -> { ..acc, exprs: push(acc.exprs, expr) },
       },
   )
 
 // Lifts the first `?` reachable in evaluation order, leaving its binder in its place.
 fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
   match expr {
-    ELit(_) -> { cx: state, s: ScanPure, e: expr },
-    EVar(_) -> { cx: state, s: ScanPure, e: expr },
-    EBad(_) -> { cx: state, s: ScanPure, e: expr },
+    ELit(_) -> { state: state, scan: ScanPure, expr: expr },
+    EVar(_) -> { state: state, scan: ScanPure, expr: expr },
+    EBad(_) -> { state: state, scan: ScanPure, expr: expr },
     ETry(t) -> {
       let inner = scan(state, t.operand);
-      match inner.s {
-        ScanFound(_) -> { cx: inner.cx, s: inner.s, e: ETry({ span: t.span, operand: inner.e }) },
-        _ -> {
-          let fb = fresh_binder(inner.cx, t.span);
+      match inner.scan {
+        ScanFound(_) ->
           {
-            cx: fb.cx,
-            s: ScanFound({ operand: inner.e, binder: fb.b, at: t.span }),
-            e: var_of(fb.b),
+            state: inner.state,
+            scan: inner.scan,
+            expr: ETry({ span: t.span, operand: inner.expr }),
+          },
+        _ -> {
+          let fresh = fresh_binder(inner.state, t.span);
+          {
+            state: fresh.state,
+            scan: ScanFound({ operand: inner.expr, binder: fresh.binder, at: t.span }),
+            expr: var_of(fresh.binder),
           }
         },
       }
@@ -667,36 +672,44 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
     EBinary(b) -> {
       let short = b.op == b"and" || b.op == b"or";
       let l = scan(state, b.lhs);
-      match l.s {
+      match l.scan {
         ScanFound(_) ->
-          { cx: l.cx, s: l.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: b.rhs }) },
-        ScanImpure -> { cx: l.cx, s: ScanImpure, e: expr },
-        ScanPure -> if short { { cx: l.cx, s: purity(is_pure(b.rhs)), e: expr } } else {
-          let r = scan(l.cx, b.rhs);
-          { cx: r.cx, s: r.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+          {
+            state: l.state,
+            scan: l.scan,
+            expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: b.rhs }),
+          },
+        ScanImpure -> { state: l.state, scan: ScanImpure, expr: expr },
+        ScanPure -> if short { { state: l.state, scan: purity(is_pure(b.rhs)), expr: expr } } else {
+          let r = scan(l.state, b.rhs);
+          {
+            state: r.state,
+            scan: r.scan,
+            expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: r.expr }),
+          }
         },
       }
     },
     EUnary(u) -> {
       let o = scan(state, u.operand);
-      { cx: o.cx, s: o.s, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
+      { state: o.state, scan: o.scan, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
     },
     EApp(a) -> {
       let o = sequence(
         state,
         append(append([a.func], a.args), map(a.named, |n: NamedArg| n.value)),
       );
-      let func = at(o.xs, 0);
-      let args = take(drop(o.xs, 1), len(a.args));
-      let nvals = drop(o.xs, 1 + len(a.args));
+      let func = at(o.exprs, 0);
+      let args = take(drop(o.exprs, 1), len(a.args));
+      let nvals = drop(o.exprs, 1 + len(a.args));
       let named = map(range(0, len(a.named)), |i: Int| {
         let n = at(a.named, i);
         { name: n.name, value: at(nvals, i), span: n.span }
       });
       let rebuilt = EApp({ span: a.span, func: func, named: named, args: args, labels: a.labels });
-      match o.s {
-        ScanFound(_) -> { cx: o.cx, s: o.s, e: rebuilt },
-        _ -> { cx: o.cx, s: ScanImpure, e: rebuilt },
+      match o.scan {
+        ScanFound(_) -> { state: o.state, scan: o.scan, expr: rebuilt },
+        _ -> { state: o.state, scan: ScanImpure, expr: rebuilt },
       }
     },
     EPerform(p) -> {
@@ -706,43 +719,43 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
         eff: p.eff,
         op: p.op,
         resource: p.resource,
-        args: o.xs,
+        args: o.exprs,
       });
-      match o.s {
-        ScanFound(_) -> { cx: o.cx, s: o.s, e: rebuilt },
-        _ -> { cx: o.cx, s: ScanImpure, e: rebuilt },
+      match o.scan {
+        ScanFound(_) -> { state: o.state, scan: o.scan, expr: rebuilt },
+        _ -> { state: o.state, scan: ScanImpure, expr: rebuilt },
       }
     },
     ERecord(r) -> {
       let o = sequence(state, map(r.fields, |f: RecField| f.value));
       {
-        cx: o.cx,
-        s: o.s,
-        e: ERecord({
+        state: o.state,
+        scan: o.scan,
+        expr: ERecord({
           span: r.span,
           fields: map(range(0, len(r.fields)), |i: Int|
-            { name: at(r.fields, i).name, value: at(o.xs, i) }),
+            { name: at(r.fields, i).name, value: at(o.exprs, i) }),
         }),
       }
     },
     EList(l) -> {
       let o = sequence(state, l.items);
-      { cx: o.cx, s: o.s, e: EList({ span: l.span, items: o.xs }) }
+      { state: o.state, scan: o.scan, expr: EList({ span: l.span, items: o.exprs }) }
     },
     EField(f) -> {
       let o = scan(state, f.base);
-      { cx: o.cx, s: o.s, e: EField({ span: f.span, base: o.e, field: f.field }) }
+      { state: o.state, scan: o.scan, expr: EField({ span: f.span, base: o.expr, field: f.field }) }
     },
     ERecordUpdate(r) -> {
       let o = sequence(state, append([r.base], map(r.fields, |f: RecField| f.value)));
       {
-        cx: o.cx,
-        s: o.s,
-        e: ERecordUpdate({
+        state: o.state,
+        scan: o.scan,
+        expr: ERecordUpdate({
           span: r.span,
-          base: at(o.xs, 0),
+          base: at(o.exprs, 0),
           fields: map(range(0, len(r.fields)), |i: Int|
-            { name: at(r.fields, i).name, value: at(o.xs, i + 1) }),
+            { name: at(r.fields, i).name, value: at(o.exprs, i + 1) }),
         }),
       }
     },
@@ -750,58 +763,62 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
       let c = scan(state, i.cond);
       let rebuilt = EIf({
         span: i.span,
-        cond: c.e,
+        cond: c.expr,
         then_branch: i.then_branch,
         else_branch: i.else_branch,
       });
-      match c.s {
-        ScanFound(_) -> { cx: c.cx, s: c.s, e: rebuilt },
-        ScanImpure -> { cx: c.cx, s: ScanImpure, e: rebuilt },
+      match c.scan {
+        ScanFound(_) -> { state: c.state, scan: c.scan, expr: rebuilt },
+        ScanImpure -> { state: c.state, scan: ScanImpure, expr: rebuilt },
         ScanPure ->
-          { cx: c.cx, s: purity(is_pure(i.then_branch) && is_pure(i.else_branch)), e: rebuilt },
+          {
+            state: c.state,
+            scan: purity(is_pure(i.then_branch) && is_pure(i.else_branch)),
+            expr: rebuilt,
+          },
       }
     },
     EMatch(m) -> {
       let sc = scan(state, m.scrutinee);
-      let rebuilt = EMatch({ span: m.span, scrutinee: sc.e, arms: m.arms });
-      match sc.s {
-        ScanFound(_) -> { cx: sc.cx, s: sc.s, e: rebuilt },
-        ScanImpure -> { cx: sc.cx, s: ScanImpure, e: rebuilt },
+      let rebuilt = EMatch({ span: m.span, scrutinee: sc.expr, arms: m.arms });
+      match sc.scan {
+        ScanFound(_) -> { state: sc.state, scan: sc.scan, expr: rebuilt },
+        ScanImpure -> { state: sc.state, scan: ScanImpure, expr: rebuilt },
         ScanPure ->
           {
-            cx: sc.cx,
-            s: purity(
+            state: sc.state,
+            scan: purity(
               fold(m.arms, true, |acc: Bool, arm: MatchArm|
                 acc && is_pure(arm.body)
                   && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
             ),
-            e: rebuilt,
+            expr: rebuilt,
           },
       }
     },
     // A nested block is not entered; a lambda, handler, cell, region, `simulate` or `parallel` is a
     // barrier to `?`.
-    _ -> { cx: state, s: purity(is_pure(expr)), e: expr },
+    _ -> { state: state, scan: purity(is_pure(expr)), expr: expr },
   }
 
 // One `match` per `?` lifted from `expr`'s head, with the rewritten `expr` as the success arm's body.
 fn region_cond(state: TryState, expr: Expr) -> TryOut / {abort.raise} = {
   let found = scan_head(state, expr);
-  match found.s {
+  match found.scan {
     ScanFound(l) -> {
-      let w = wrap(found.cx, l.operand, l.at, var_pattern(l.binder), found.e);
-      match w.e {
+      let w = wrap(found.state, l.operand, l.at, var_pattern(l.binder), found.expr);
+      match w.expr {
         EMatch(m) -> {
           let success = at(m.arms, 1);
-          let inner = region_cond(w.cx, success.body);
+          let inner = region_cond(w.state, success.body);
           {
-            cx: inner.cx,
-            e: EMatch({
+            state: inner.state,
+            expr: EMatch({
               span: m.span,
               scrutinee: m.scrutinee,
               arms: [
                 at(m.arms, 0),
-                { pat: success.pat, guard: None, body: inner.e, span: success.span },
+                { pat: success.pat, guard: None, body: inner.expr, span: success.span },
               ],
             }),
           }
@@ -809,7 +826,7 @@ fn region_cond(state: TryState, expr: Expr) -> TryOut / {abort.raise} = {
         _ -> w,
       }
     },
-    _ -> { cx: found.cx, e: found.e },
+    _ -> { state: found.state, expr: found.expr },
   }
 }
 
@@ -818,14 +835,23 @@ fn scan_head(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
     EIf(i) -> {
       let c = scan(state, i.cond);
       {
-        cx: c.cx,
-        s: c.s,
-        e: EIf({ span: i.span, cond: c.e, then_branch: i.then_branch, else_branch: i.else_branch }),
+        state: c.state,
+        scan: c.scan,
+        expr: EIf({
+          span: i.span,
+          cond: c.expr,
+          then_branch: i.then_branch,
+          else_branch: i.else_branch,
+        }),
       }
     },
     EMatch(m) -> {
       let sc = scan(state, m.scrutinee);
-      { cx: sc.cx, s: sc.s, e: EMatch({ span: m.span, scrutinee: sc.e, arms: m.arms }) }
+      {
+        state: sc.state,
+        scan: sc.scan,
+        expr: EMatch({ span: m.span, scrutinee: sc.expr, arms: m.arms }),
+      }
     },
     _ -> scan(state, expr),
   }
@@ -836,22 +862,25 @@ fn ret(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
     EBlock(_) -> block(state, expr),
     EIf(i) -> {
       let t = ret(state, i.then_branch);
-      let el = ret(t.cx, i.else_branch);
-      region_cond(el.cx, EIf({ span: i.span, cond: i.cond, then_branch: t.e, else_branch: el.e }))
+      let el = ret(t.state, i.else_branch);
+      region_cond(
+        el.state,
+        EIf({ span: i.span, cond: i.cond, then_branch: t.expr, else_branch: el.expr }),
+      )
     },
     EMatch(m) -> {
       let arms = fold(
         m.arms,
-        { cx: state, arms: [] },
-        |acc: { cx: TryState, arms: List<MatchArm> }, arm: MatchArm| {
-          let b = ret(acc.cx, arm.body);
+        { state: state, arms: [] },
+        |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
+          let b = ret(acc.state, arm.body);
           {
-            cx: b.cx,
-            arms: push(acc.arms, { pat: arm.pat, guard: arm.guard, body: b.e, span: arm.span }),
+            state: b.state,
+            arms: push(acc.arms, { pat: arm.pat, guard: arm.guard, body: b.expr, span: arm.span }),
           }
         },
       );
-      region_cond(arms.cx, EMatch({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }))
+      region_cond(arms.state, EMatch({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }))
     },
     _ -> region_cond(state, expr),
   }
@@ -862,24 +891,28 @@ fn block(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
     EBlock(b) -> {
       let split = fold(
         range(0, len(b.stmts)),
-        { cx: state, stmts: b.stmts, tail: b.tail, done: false },
-        |acc: { cx: TryState, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
+        { state: state, stmts: b.stmts, tail: b.tail, done: false },
+        |acc: { state: TryState, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
           if acc.done { acc } else {
-            let o = split_at(acc.cx, acc.stmts, acc.tail, i);
+            let o = split_at(acc.state, acc.stmts, acc.tail, i);
             match o.split {
-              None -> { cx: o.cx, stmts: o.stmts, tail: acc.tail, done: false },
-              Some(t) -> { cx: o.cx, stmts: take(o.stmts, i), tail: Some(t), done: true },
+              None -> { state: o.state, stmts: o.stmts, tail: acc.tail, done: false },
+              Some(t) -> { state: o.state, stmts: take(o.stmts, i), tail: Some(t), done: true },
             }
           },
       );
       if split.done {
-        { cx: split.cx, e: EBlock({ span: b.span, tail: split.tail, stmts: split.stmts }) }
+        { state: split.state, expr: EBlock({ span: b.span, tail: split.tail, stmts: split.stmts }) }
       } else {
         match split.tail {
-          None -> { cx: split.cx, e: EBlock({ span: b.span, tail: None, stmts: split.stmts }) },
+          None ->
+            { state: split.state, expr: EBlock({ span: b.span, tail: None, stmts: split.stmts }) },
           Some(t) -> {
-            let o = ret(split.cx, t);
-            { cx: o.cx, e: EBlock({ span: b.span, tail: Some(o.e), stmts: split.stmts }) }
+            let o = ret(split.state, t);
+            {
+              state: o.state,
+              expr: EBlock({ span: b.span, tail: Some(o.expr), stmts: split.stmts }),
+            }
           },
         }
       }
@@ -888,7 +921,7 @@ fn block(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
   }
 
 type Taken = {
-  cx: TryState,
+  state: TryState,
   stmt: Stmt,
   take: Option<{ operand: Expr, at: Span, pat: Pattern, consumes: Bool }>,
 }
@@ -898,19 +931,19 @@ fn split_at(
   stmts: List<Stmt>,
   tail: Option<Expr>,
   i: Int,
-) -> { cx: TryState, stmts: List<Stmt>, split: Option<Expr> } / {abort.raise} = {
+) -> { state: TryState, stmts: List<Stmt>, split: Option<Expr> } / {abort.raise} = {
   let st = at(stmts, i);
   let taken = take_stmt(state, st);
   match taken.take {
-    None -> { cx: taken.cx, stmts: set_at(stmts, i, taken.stmt), split: None },
+    None -> { state: taken.state, stmts: set_at(stmts, i, taken.stmt), split: None },
     Some(t) -> {
       let kept = set_at(stmts, i, taken.stmt);
       let rest = drop(kept, if t.consumes { i + 1 } else { i });
       // A consumed statement goes: its binder is now the success arm's pattern.
       let body0 = EBlock({ span: t.at, tail: tail, stmts: rest });
-      let body = block(taken.cx, body0);
-      let w = wrap(body.cx, t.operand, t.at, t.pat, body.e);
-      { cx: w.cx, stmts: kept, split: Some(w.e) }
+      let body = block(taken.state, body0);
+      let w = wrap(body.state, t.operand, t.at, t.pat, body.expr);
+      { state: w.state, stmts: kept, split: Some(w.expr) }
     },
   }
 }
@@ -921,12 +954,12 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
     // value, so it is a return position: expanded once, when no `?` is left in the initializer.
     SLetElse(l) -> match l.value {
       ETry(t) -> {
-        let fb = fresh_binder(state, t.span);
-        let o = take_try(fb.cx, t.operand, t.span, var_pattern(fb.b));
+        let fresh = fresh_binder(state, t.span);
+        let o = take_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
         if o.take.consumes {
           {
-            cx: o.cx,
-            stmt: SLetElse({ ..l, value: var_of(fb.b) }),
+            state: o.state,
+            stmt: SLetElse({ ..l, value: var_of(fresh.binder) }),
             take: Some({
               operand: o.take.operand,
               at: o.take.at,
@@ -936,7 +969,7 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
           }
         } else {
           {
-            cx: o.cx,
+            state: o.state,
             stmt: SLetElse({ ..l, value: ETry({ span: t.span, operand: o.operand_left }) }),
             take: Some(o.take),
           }
@@ -944,11 +977,11 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
       },
       _ -> {
         let o = scan(state, l.value);
-        match o.s {
+        match o.scan {
           ScanFound(lift) ->
             {
-              cx: o.cx,
-              stmt: SLetElse({ ..l, value: o.e }),
+              state: o.state,
+              stmt: SLetElse({ ..l, value: o.expr }),
               take: Some({
                 operand: lift.operand,
                 at: lift.at,
@@ -957,8 +990,8 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
               }),
             },
           _ -> {
-            let f = ret(o.cx, l.fallback);
-            { cx: f.cx, stmt: SLetElse({ ..l, fallback: f.e }), take: None }
+            let f = ret(o.state, l.fallback);
+            { state: f.state, stmt: SLetElse({ ..l, fallback: f.expr }), take: None }
           },
         }
       },
@@ -967,12 +1000,12 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
       ETry(t) -> match l.ty {
         // The annotation stays: the `let` now binds the success arm's binder.
         Some(_) -> {
-          let fb = fresh_binder(state, t.span);
-          let o = take_try(fb.cx, t.operand, t.span, var_pattern(fb.b));
+          let fresh = fresh_binder(state, t.span);
+          let o = take_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
           if o.take.consumes {
             {
-              cx: o.cx,
-              stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: var_of(fb.b) }),
+              state: o.state,
+              stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: var_of(fresh.binder) }),
               take: Some({
                 operand: o.take.operand,
                 at: o.take.at,
@@ -982,7 +1015,7 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
             }
           } else {
             {
-              cx: o.cx,
+              state: o.state,
               stmt: SLet({
                 span: l.span,
                 pat: l.pat,
@@ -996,7 +1029,7 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
         None -> {
           let o = take_try(state, t.operand, t.span, l.pat);
           {
-            cx: o.cx,
+            state: o.state,
             stmt: SLet({
               span: l.span,
               pat: l.pat,
@@ -1009,11 +1042,11 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
       },
       _ -> {
         let o = scan(state, l.value);
-        match o.s {
+        match o.scan {
           ScanFound(lift) ->
             {
-              cx: o.cx,
-              stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e }),
+              state: o.state,
+              stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr }),
               take: Some({
                 operand: lift.operand,
                 at: lift.at,
@@ -1021,7 +1054,7 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
                 consumes: false,
               }),
             },
-          _ -> { cx: o.cx, stmt: stmt, take: None },
+          _ -> { state: o.state, stmt: stmt, take: None },
         }
       },
     },
@@ -1029,18 +1062,18 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
       ETry(t) -> {
         let o = take_try(state, t.operand, t.span, PWild({ span: v_span(v) }));
         {
-          cx: o.cx,
+          state: o.state,
           stmt: SExpr(ETry({ span: t.span, operand: o.operand_left })),
           take: Some(o.take),
         }
       },
       _ -> {
         let o = scan(state, v);
-        match o.s {
+        match o.scan {
           ScanFound(lift) ->
             {
-              cx: o.cx,
-              stmt: SExpr(o.e),
+              state: o.state,
+              stmt: SExpr(o.expr),
               take: Some({
                 operand: lift.operand,
                 at: lift.at,
@@ -1048,7 +1081,7 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
                 consumes: false,
               }),
             },
-          _ -> { cx: o.cx, stmt: stmt, take: None },
+          _ -> { state: o.state, stmt: stmt, take: None },
         }
       },
     },
@@ -1057,7 +1090,7 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
 fn v_span(expr: Expr) -> Span = expr_span(expr)
 
 type TryTaken = {
-  cx: TryState,
+  state: TryState,
   operand_left: Expr,
   take: { operand: Expr, at: Span, pat: Pattern, consumes: Bool },
 }
@@ -1065,11 +1098,11 @@ type TryTaken = {
 // An inner `?` in the operand is lifted first and the statement stays; otherwise the statement is consumed.
 fn take_try(state: TryState, operand: Expr, span: Span, pat: Pattern) -> TryTaken / {abort.raise} = {
   let o = scan(state, operand);
-  match o.s {
+  match o.scan {
     ScanFound(lift) ->
       {
-        cx: o.cx,
-        operand_left: o.e,
+        state: o.state,
+        operand_left: o.expr,
         take: {
           operand: lift.operand,
           at: lift.at,
@@ -1079,9 +1112,9 @@ fn take_try(state: TryState, operand: Expr, span: Span, pat: Pattern) -> TryTake
       },
     _ ->
       {
-        cx: o.cx,
+        state: o.state,
         operand_left: ELit({ span: span, lit: LUnit }),
-        take: { operand: o.e, at: span, pat: pat, consumes: true },
+        take: { operand: o.expr, at: span, pat: pat, consumes: true },
       },
   }
 }
@@ -1131,11 +1164,11 @@ fn sweep(
             ),
         },
       };
-      { cx: { ..state, diags: push(state.diags, d) }, e: t.operand }
+      { state: { ..state, diags: push(state.diags, d) }, expr: t.operand }
     },
-    _ -> { cx: state, e: expr },
+    _ -> { state: state, expr: expr },
   };
-  sweep_inner(refused.cx, refused.e, scope, barrier)
+  sweep_inner(refused.state, refused.expr, scope, barrier)
 }
 
 fn sweep_inner(
@@ -1147,156 +1180,177 @@ fn sweep_inner(
   match expr {
     ETry(t) -> {
       let o = sweep(state, t.operand, scope, barrier);
-      { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) }
+      { state: o.state, expr: ETry({ span: t.span, operand: o.expr }) }
     },
     EBinary(b) -> {
       let l = sweep(state, b.lhs, scope, barrier);
-      let r = sweep(l.cx, b.rhs, scope, barrier);
-      { cx: r.cx, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+      let r = sweep(l.state, b.rhs, scope, barrier);
+      { state: r.state, expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: r.expr }) }
     },
     EUnary(u) -> {
       let o = sweep(state, u.operand, scope, barrier);
-      { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
+      { state: o.state, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
     },
     ELambda(l) -> match l.ret {
       None -> {
         let o = sweep(state, l.body, scope, under(barrier, b"a lambda"));
-        { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: None }) }
+        {
+          state: o.state,
+          expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: None }),
+        }
       },
       Some(ty) -> match mode_for(state, Some(ty)) {
         Err(why) -> {
           let o = sweep(state, l.body, Some(why), None);
-          { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: Some(ty) }) }
+          {
+            state: o.state,
+            expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: Some(ty) }),
+          }
         },
         Ok(m) -> {
           let saved = state.mode;
           let r = ret({ ..state, mode: Some(m) }, l.body);
-          let s: TryOut = sweep(r.cx, r.e, None, None);
+          let s: TryOut = sweep(r.state, r.expr, None, None);
           {
-            cx: { ..s.cx, mode: saved },
-            e: ELambda({ span: l.span, body: s.e, params: l.params, ret: Some(ty) }),
+            state: { ..s.state, mode: saved },
+            expr: ELambda({ span: l.span, body: s.expr, params: l.params, ret: Some(ty) }),
           }
         },
       },
     },
     EApp(a) -> {
       let f = sweep(state, a.func, scope, barrier);
-      let args = sweep_all(f.cx, a.args, scope, barrier);
+      let args = sweep_all(f.state, a.args, scope, barrier);
       let named = fold(
         a.named,
-        { cx: args.cx, ns: [] },
-        |acc: { cx: TryState, ns: List<NamedArg> }, arg: NamedArg| {
-          let o = sweep(acc.cx, arg.value, scope, barrier);
-          { cx: o.cx, ns: push(acc.ns, { name: arg.name, value: o.e, span: arg.span }) }
+        { state: args.state, args: [] },
+        |acc: { state: TryState, args: List<NamedArg> }, arg: NamedArg| {
+          let o = sweep(acc.state, arg.value, scope, barrier);
+          {
+            state: o.state,
+            args: push(acc.args, { name: arg.name, value: o.expr, span: arg.span }),
+          }
         },
       );
       {
-        cx: named.cx,
-        e: EApp({ span: a.span, func: f.e, named: named.ns, args: args.xs, labels: a.labels }),
+        state: named.state,
+        expr: EApp({
+          span: a.span,
+          func: f.expr,
+          named: named.args,
+          args: args.exprs,
+          labels: a.labels,
+        }),
       }
     },
     EIf(i) -> {
       let c = sweep(state, i.cond, scope, barrier);
-      let t = sweep(c.cx, i.then_branch, scope, barrier);
-      let el = sweep(t.cx, i.else_branch, scope, barrier);
-      { cx: el.cx, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+      let t = sweep(c.state, i.then_branch, scope, barrier);
+      let el = sweep(t.state, i.else_branch, scope, barrier);
+      {
+        state: el.state,
+        expr: EIf({ span: i.span, cond: c.expr, then_branch: t.expr, else_branch: el.expr }),
+      }
     },
     EMatch(m) -> {
       let sc = sweep(state, m.scrutinee, scope, barrier);
       let arms = fold(
         m.arms,
-        { cx: sc.cx, arms: [] },
-        |acc: { cx: TryState, arms: List<MatchArm> }, arm: MatchArm| {
+        { state: sc.state, arms: [] },
+        |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
-            None -> { cx: acc.cx, e: None },
+            None -> { state: acc.state, expr: None },
             Some(x) -> {
-              let o = sweep(acc.cx, x, scope, barrier);
-              { cx: o.cx, e: Some(o.e) }
+              let o = sweep(acc.state, x, scope, barrier);
+              { state: o.state, expr: Some(o.expr) }
             },
           };
-          let b = sweep(g.cx, arm.body, scope, barrier);
+          let b = sweep(g.state, arm.body, scope, barrier);
           {
-            cx: b.cx,
-            arms: push(acc.arms, { pat: arm.pat, guard: g.e, body: b.e, span: arm.span }),
+            state: b.state,
+            arms: push(acc.arms, { pat: arm.pat, guard: g.expr, body: b.expr, span: arm.span }),
           }
         },
       );
-      { cx: arms.cx, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
+      { state: arms.state, expr: EMatch({ span: m.span, scrutinee: sc.expr, arms: arms.arms }) }
     },
     EBlock(b) -> {
       let stmts = fold(
         b.stmts,
-        { cx: state, ss: [] },
-        |acc: { cx: TryState, ss: List<Stmt> }, stmt: Stmt|
+        { state: state, stmts: [] },
+        |acc: { state: TryState, stmts: List<Stmt> }, stmt: Stmt|
           match stmt {
             SLet(l) -> {
-              let o = sweep(acc.cx, l.value, scope, barrier);
+              let o = sweep(acc.state, l.value, scope, barrier);
               {
-                cx: o.cx,
-                ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
+                state: o.state,
+                stmts: push(acc.stmts, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr })),
               }
             },
             SLetElse(l) -> {
-              let v = sweep(acc.cx, l.value, scope, barrier);
-              let f = sweep(v.cx, l.fallback, scope, barrier);
-              { cx: f.cx, ss: push(acc.ss, SLetElse({ ..l, value: v.e, fallback: f.e })) }
+              let v = sweep(acc.state, l.value, scope, barrier);
+              let f = sweep(v.state, l.fallback, scope, barrier);
+              {
+                state: f.state,
+                stmts: push(acc.stmts, SLetElse({ ..l, value: v.expr, fallback: f.expr })),
+              }
             },
             SExpr(x) -> {
-              let o = sweep(acc.cx, x, scope, barrier);
-              { cx: o.cx, ss: push(acc.ss, SExpr(o.e)) }
+              let o = sweep(acc.state, x, scope, barrier);
+              { state: o.state, stmts: push(acc.stmts, SExpr(o.expr)) }
             },
           },
       );
       let tl = match b.tail {
-        None -> { cx: stmts.cx, e: None },
+        None -> { state: stmts.state, expr: None },
         Some(t) -> {
-          let o = sweep(stmts.cx, t, scope, barrier);
-          { cx: o.cx, e: Some(o.e) }
+          let o = sweep(stmts.state, t, scope, barrier);
+          { state: o.state, expr: Some(o.expr) }
         },
       };
-      { cx: tl.cx, e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
+      { state: tl.state, expr: EBlock({ span: b.span, tail: tl.expr, stmts: stmts.stmts }) }
     },
     ERecord(r) -> {
       let o = sweep_fields(state, r.fields, scope, barrier);
-      { cx: o.cx, e: ERecord({ span: r.span, fields: o.fs }) }
+      { state: o.state, expr: ERecord({ span: r.span, fields: o.fields }) }
     },
     ERecordUpdate(r) -> {
       let b = sweep(state, r.base, scope, barrier);
-      let o = sweep_fields(b.cx, r.fields, scope, barrier);
-      { cx: o.cx, e: ERecordUpdate({ span: r.span, base: b.e, fields: o.fs }) }
+      let o = sweep_fields(b.state, r.fields, scope, barrier);
+      { state: o.state, expr: ERecordUpdate({ span: r.span, base: b.expr, fields: o.fields }) }
     },
     EField(f) -> {
       let o = sweep(state, f.base, scope, barrier);
-      { cx: o.cx, e: EField({ span: f.span, base: o.e, field: f.field }) }
+      { state: o.state, expr: EField({ span: f.span, base: o.expr, field: f.field }) }
     },
     EList(l) -> {
       let o = sweep_all(state, l.items, scope, barrier);
-      { cx: o.cx, e: EList({ span: l.span, items: o.xs }) }
+      { state: o.state, expr: EList({ span: l.span, items: o.exprs }) }
     },
     EPerform(p) -> {
       let o = sweep_all(state, p.args, scope, barrier);
       {
-        cx: o.cx,
-        e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
+        state: o.state,
+        expr: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.exprs }),
       }
     },
     EHandle(h) -> {
       let b = sweep(state, h.body, scope, under(barrier, b"a `handle` body"));
       let cs = fold(
         h.clauses,
-        { cx: b.cx, cs: [] },
-        |acc: { cx: TryState, cs: List<HandleClause> }, c: HandleClause| {
-          let o = sweep(acc.cx, c.body, scope, under(barrier, b"a `handle` clause"));
+        { state: b.state, clauses: [] },
+        |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
+          let o = sweep(acc.state, c.body, scope, under(barrier, b"a `handle` clause"));
           {
-            cx: o.cx,
-            cs: push(acc.cs, {
+            state: o.state,
+            clauses: push(acc.clauses, {
               eff: c.eff,
               op: c.op,
               resource: c.resource,
               every_label: c.every_label,
               label_binder: c.label_binder,
               resume: c.resume,
-              body: o.e,
+              body: o.expr,
               span: c.span,
               params: c.params,
             }),
@@ -1304,37 +1358,40 @@ fn sweep_inner(
         },
       );
       let r = match h.ret {
-        None -> { cx: cs.cx, r: None },
+        None -> { state: cs.state, ret: None },
         Some(rc) -> {
-          let o = sweep(cs.cx, rc.body, scope, under(barrier, b"a `handle` return clause"));
-          { cx: o.cx, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
+          let o = sweep(cs.state, rc.body, scope, under(barrier, b"a `handle` return clause"));
+          { state: o.state, ret: Some({ binder: rc.binder, body: o.expr, span: rc.span }) }
         },
       };
-      { cx: r.cx, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
+      {
+        state: r.state,
+        expr: EHandle({ span: h.span, body: b.expr, ret: r.ret, clauses: cs.clauses }),
+      }
     },
     EWithCell(c) -> {
       let i = sweep(state, c.init, scope, barrier);
-      let b = sweep(i.cx, c.body, scope, under(barrier, b"a `with_cell` body"));
+      let b = sweep(i.state, c.body, scope, under(barrier, b"a `with_cell` body"));
       {
-        cx: b.cx,
-        e: EWithCell({
+        state: b.state,
+        expr: EWithCell({
           span: c.span,
           resource: c.resource,
-          init: i.e,
+          init: i.expr,
           binder: c.binder,
-          body: b.e,
+          body: b.expr,
         }),
       }
     },
     ESimulate(x) -> {
       let o = sweep(state, x.body, scope, under(barrier, b"a `simulate` body"));
-      { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) }
+      { state: o.state, expr: ESimulate({ span: x.span, body: o.expr }) }
     },
     EParallel(x) -> {
       let o = sweep_all(state, x.branches, scope, under(barrier, b"a `parallel` branch"));
-      { cx: o.cx, e: EParallel({ span: x.span, branches: o.xs }) }
+      { state: o.state, expr: EParallel({ span: x.span, branches: o.exprs }) }
     },
-    _ -> { cx: state, e: expr },
+    _ -> { state: state, expr: expr },
   }
 
 fn sweep_all(
@@ -1342,61 +1399,68 @@ fn sweep_all(
   exprs: List<Expr>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-) -> { cx: TryState, xs: List<Expr> } / {abort.raise} =
-  fold(exprs, { cx: state, xs: [] }, |acc: { cx: TryState, xs: List<Expr> }, expr: Expr| {
-    let o = sweep(acc.cx, expr, scope, barrier);
-    { cx: o.cx, xs: push(acc.xs, o.e) }
-  })
+) -> { state: TryState, exprs: List<Expr> } / {abort.raise} =
+  fold(
+    exprs,
+    { state: state, exprs: [] },
+    |acc: { state: TryState, exprs: List<Expr> }, expr: Expr| {
+      let o = sweep(acc.state, expr, scope, barrier);
+      { state: o.state, exprs: push(acc.exprs, o.expr) }
+    },
+  )
 
 fn sweep_fields(
   state: TryState,
   fields: List<RecField>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-) -> { cx: TryState, fs: List<RecField> } / {abort.raise} =
+) -> { state: TryState, fields: List<RecField> } / {abort.raise} =
   fold(
     fields,
-    { cx: state, fs: [] },
-    |acc: { cx: TryState, fs: List<RecField> }, field: RecField| {
-      let o = sweep(acc.cx, field.value, scope, barrier);
-      { cx: o.cx, fs: push(acc.fs, { name: field.name, value: o.e }) }
+    { state: state, fields: [] },
+    |acc: { state: TryState, fields: List<RecField> }, field: RecField| {
+      let o = sweep(acc.state, field.value, scope, barrier);
+      { state: o.state, fields: push(acc.fields, { name: field.name, value: o.expr }) }
     },
   )
 
-fn try_item(cx0: TryState, item: Item) -> { cx: TryState, it: Item } / {abort.raise} = {
-  let cx = { ..cx0, fresh: 0, mode: None };
+fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {abort.raise} = {
+  let state = { ..outer, fresh: 0, mode: None };
   match item {
     IFn(d) -> {
-      let spec: { cx: TryState, xs: List<SpecClause> } = fold(
+      let spec: { state: TryState, clauses: List<SpecClause> } = fold(
         d.spec,
-        { cx: cx, xs: [] },
-        |acc: { cx: TryState, xs: List<SpecClause> }, clause: SpecClause| {
+        { state: state, clauses: [] },
+        |acc: { state: TryState, clauses: List<SpecClause> }, clause: SpecClause| {
           let what = match clause.kind {
             SRequires -> b"a `requires` clause",
             SEnsures -> b"an `ensures` clause",
           };
-          let o = sweep(acc.cx, clause.expr, Some(not_in_a_function(what)), None);
-          { cx: o.cx, xs: push(acc.xs, { kind: clause.kind, expr: o.e, span: clause.span }) }
+          let o = sweep(acc.state, clause.expr, Some(not_in_a_function(what)), None);
+          {
+            state: o.state,
+            clauses: push(acc.clauses, { kind: clause.kind, expr: o.expr, span: clause.span }),
+          }
         },
       );
-      let measured: { cx: TryState, e: Option<Expr> } = match d.decreases {
-        None -> { cx: spec.cx, e: None },
+      let measured: { state: TryState, expr: Option<Expr> } = match d.decreases {
+        None -> { state: spec.state, expr: None },
         Some(e) -> {
-          let o = sweep(spec.cx, e, Some(not_in_a_function(b"a `decreases` clause")), None);
-          { cx: o.cx, e: Some(o.e) }
+          let o = sweep(spec.state, e, Some(not_in_a_function(b"a `decreases` clause")), None);
+          { state: o.state, expr: Some(o.expr) }
         },
       };
-      let body = match mode_for(cx, d.ret) {
-        Err(why) -> sweep(measured.cx, d.body, Some(why), None),
+      let body = match mode_for(state, d.ret) {
+        Err(why) -> sweep(measured.state, d.body, Some(why), None),
         Ok(m) -> {
-          let r = ret({ ..measured.cx, mode: Some(m) }, d.body);
-          let s: TryOut = sweep(r.cx, r.e, None, None);
-          { cx: { ..s.cx, mode: None }, e: s.e }
+          let r = ret({ ..measured.state, mode: Some(m) }, d.body);
+          let s: TryOut = sweep(r.state, r.expr, None, None);
+          { state: { ..s.state, mode: None }, expr: s.expr }
         },
       };
       {
-        cx: body.cx,
-        it: IFn({
+        state: body.state,
+        item: IFn({
           vis: d.vis,
           name: d.name,
           generics: d.generics,
@@ -1404,25 +1468,25 @@ fn try_item(cx0: TryState, item: Item) -> { cx: TryState, it: Item } / {abort.ra
           ret: d.ret,
           effects: d.effects,
           constraints: d.constraints,
-          spec: spec.xs,
+          spec: spec.clauses,
           returns: d.returns,
           reuse: d.reuse,
           transparent: d.transparent,
-          decreases: measured.e,
-          body: body.e,
+          decreases: measured.expr,
+          body: body.expr,
           span: d.span,
         }),
       }
     },
     ITest(d) -> {
-      let o = sweep(cx, d.body, Some(not_in_a_function(b"a `test`")), None);
+      let o = sweep(state, d.body, Some(not_in_a_function(b"a `test`")), None);
       {
-        cx: o.cx,
-        it: ITest({
+        state: o.state,
+        item: ITest({
           name: d.name,
           name_span: d.name_span,
           is_nondet: d.is_nondet,
-          body: o.e,
+          body: o.expr,
           span: d.span,
         }),
       }
@@ -1430,28 +1494,28 @@ fn try_item(cx0: TryState, item: Item) -> { cx: TryState, it: Item } / {abort.ra
     ILaw(d) -> {
       let why = not_in_a_function(b"a `law`");
       let g = match d.guard {
-        None -> { cx: cx, e: None },
+        None -> { state: state, expr: None },
         Some(x) -> {
-          let o = sweep(cx, x, Some(why), None);
-          { cx: o.cx, e: Some(o.e) }
+          let o = sweep(state, x, Some(why), None);
+          { state: o.state, expr: Some(o.expr) }
         },
       };
-      let b = sweep(g.cx, d.body, Some(why), None);
+      let b = sweep(g.state, d.body, Some(why), None);
       {
-        cx: b.cx,
-        it: ILaw({
+        state: b.state,
+        item: ILaw({
           name: d.name,
           name_span: d.name_span,
           host: d.host,
           binders: d.binders,
-          guard: g.e,
+          guard: g.expr,
           cost: d.cost,
-          body: b.e,
+          body: b.expr,
           span: d.span,
         }),
       }
     },
-    _ -> { cx: cx, it: item },
+    _ -> { state: state, item: item },
   }
 }
 
@@ -1468,13 +1532,13 @@ pub fn expand_try(
   };
   let walked = fold(
     module.items,
-    { cx: start, items: [] },
-    |acc: { cx: TryState, items: List<Item> }, item: Item| {
-      let o = try_item(acc.cx, item);
-      { cx: o.cx, items: push(acc.items, o.it) }
+    { state: start, items: [] },
+    |acc: { state: TryState, items: List<Item> }, item: Item| {
+      let o = try_item(acc.state, item);
+      { state: o.state, items: push(acc.items, o.item) }
     },
   );
-  { module: { imports: module.imports, items: walked.items }, diags: walked.cx.diags }
+  { module: { imports: module.imports, items: walked.items }, diags: walked.state.diags }
 }
 
 // --- Running the rewrites --------------------------------------------------------------------

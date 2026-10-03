@@ -14,8 +14,6 @@ pub const REUSE_BROKEN: &str = "E0127";
 pub const PREFIX_COLLISION: &str = "E0133";
 /// A dependency whose path is missing, that holds no `ply.pkg`, or that was never fetched.
 pub const DEPENDENCY_UNUSABLE: &str = "E0135";
-/// A git dependency that could not be fetched.
-pub const DEPENDENCY_FETCH: &str = "E0140";
 pub const TYPE_MISMATCH: &str = "E0201";
 pub const ARITY_MISMATCH: &str = "E0202";
 pub const OCCURS_CHECK: &str = "E0203";

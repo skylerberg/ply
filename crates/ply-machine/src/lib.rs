@@ -16,7 +16,6 @@ pub mod claims;
 pub mod config;
 pub mod drive;
 pub mod driver;
-pub mod edit;
 pub mod engine;
 pub mod enter;
 pub mod hosts;
@@ -33,7 +32,6 @@ pub mod support;
 pub mod tester;
 pub mod testrun;
 pub mod trace;
-pub mod vcs;
 
 use ply_eval::host::{
     HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, Linearity,

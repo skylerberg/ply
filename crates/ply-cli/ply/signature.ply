@@ -7,7 +7,7 @@ import compiler.types (Atom, Row, RNamed, RSingleton, Type, TyVar, TyCon, TyFn, 
                        append)
 import compiler.type_syntax (Mode, MRead, MWrite)
 import compiler.infer (DefInfo)
-import compiler.termination (Ends, Diverges)
+import compiler.termination (Ends, Diverges, unknown_summary)
 import compiler.front (SetView)
 import report (count_of)
 
@@ -138,6 +138,7 @@ pub fn counted_lines(
   label_width: Int,
   label: String,
   def_info: DefInfo,
+  call_at: Option<String>,
 ) -> List<String> / {abort.raise} = {
   let sp: Split = split(def_info.scheme);
   let marked = match ((sp.row, def_info.scheme.ty)) {
@@ -162,8 +163,19 @@ pub fn counted_lines(
   let lines = split_lines(indent, label_width, label, marked);
   // A definition that may not return says so on a line of its own, beneath its row.
   match def_info.ending {
-    Diverges(_) -> push(lines, spaces(held(label_width, label) + 3) ++ "div"),
+    Diverges(d) ->
+      push(lines, spaces(held(label_width, label) + 3) ++ "diverges: " ++ why(d.through, call_at)),
     _ -> lines,
+  }
+}
+
+// Why a definition may not return, at the call by which it may not where the source says.
+fn why(through: Option<Bytes>, call_at: Option<String>) -> String = {
+  let at_ = match call_at { Some(p) -> " at " ++ p, None -> "" };
+  match through {
+    None -> "its recursion" ++ at_ ++ " is not seen to descend",
+    Some(name) ->
+      "calls `" ++ string_of_bytes_lossy(name) ++ "`" ++ at_ ++ ", which may not return",
   }
 }
 
@@ -344,11 +356,11 @@ test "each atom and the row variable print with how many times a call performs t
   let query = named(b"db", MRead, Some(b"orders"));
   let log = named(b"log", MWrite, None);
   let row: Row = { atoms: [query, log], tail: Some(3) };
-  assert_eq(counted_lines(5, 4, "find", counted_def(row, [query], [0])), [
+  assert_eq(counted_lines(5, 4, "find", counted_def(row, [query], [0]), None), [
     "find : <| e>(Request) -> Response",
     "       / {db.read[orders] scaling, log.write bounded | e scaling}",
   ]);
-  assert_eq(counted_lines(5, 4, "find", counted_def(row, [], [])), [
+  assert_eq(counted_lines(5, 4, "find", counted_def(row, [], []), None), [
     "find : <| e>(Request) -> Response",
     "       / {db.read[orders] bounded, log.write bounded | e bounded}",
   ])
@@ -358,10 +370,34 @@ test "each atom and the row variable print with how many times a call performs t
 test "a row variable too wide to sit beside the last atom takes a line of its own" {
   let long = named(b"a_very_long_effect_name_that_fills_a_line", MWrite, Some(b"a_long_label"));
   let row: Row = { atoms: [long], tail: Some(3) };
-  assert_eq(counted_lines(5, 4, "wide", counted_def(row, [long], [0])), [
+  assert_eq(counted_lines(5, 4, "wide", counted_def(row, [long], [0]), None), [
     "wide : <| e>(Request) -> Response",
     "       / {a_very_long_effect_name_that_fills_a_line.write[a_long_label] scaling",
     "          | e scaling}",
+  ])
+}
+
+test "a definition that may not return says by which call, and where" {
+  let pure: Row = { atoms: [], tail: None };
+  let looping = {
+    ..counted_def(pure, [], []),
+    ending: Diverges({ at: { start: 4, end: 9 }, through: None }),
+  };
+  let calling = {
+    ..counted_def(pure, [], []),
+    ending: Diverges({ at: { start: 4, end: 9 }, through: Some(b"m.spin") }),
+  };
+  assert_eq(counted_lines(5, 4, "spin", looping, Some("m.ply:3:5")), [
+    "spin : (Request) -> Response",
+    "       diverges: its recursion at m.ply:3:5 is not seen to descend",
+  ]);
+  assert_eq(counted_lines(5, 4, "wait", calling, Some("m.ply:7:3")), [
+    "wait : (Request) -> Response",
+    "       diverges: calls `m.spin` at m.ply:7:3, which may not return",
+  ]);
+  assert_eq(counted_lines(5, 4, "wait", calling, None), [
+    "wait : (Request) -> Response",
+    "       diverges: calls `m.spin`, which may not return",
   ])
 }
 
@@ -410,6 +446,7 @@ fn def_of(aliases: List<Bytes>, declared: List<Atom>, performed: List<Atom>) -> 
     bounded: [],
     tail_bounded: false,
     ending: Ends,
+    summary: unknown_summary(),
     row_aliases: aliases,
     constraints: [],
     spec: [],

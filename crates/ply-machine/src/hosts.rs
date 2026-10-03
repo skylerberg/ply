@@ -676,15 +676,10 @@ const EFFECT: &str = "tcb";
 /// A preview that would read a credential or a root off the disk is refused.
 const HERMETIC: &str = "hermetic_tcb";
 
-const OPERATIONS: [(&str, &str); 2] = [
-    ("schema", "ply_machine::hosts::schema"),
-    ("preview", "ply_machine::hosts::preview"),
-];
+const OPERATIONS: [(&str, &str); 1] = [("preview", "ply_machine::hosts::preview")];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 2] = [
-    ("schema", "ply_machine::hosts::hermetic::schema"),
-    ("preview", "ply_machine::hosts::hermetic::preview"),
-];
+const HERMETIC_OPERATIONS: [(&str, &str); 1] =
+    [("preview", "ply_machine::hosts::hermetic::preview")];
 
 /// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
 pub fn lent(module: &str) -> Vec<LentOp> {
@@ -725,13 +720,6 @@ impl HostHandler for Facility {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("schema", [path, front, unit, name]) => {
-                let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
-                let front = crate::driver::loaded_analysis_of(front, span)?;
-                let unit = unit.as_bytes(span, "the program's unit")?;
-                let name = name.as_str(span, "a definition's name")?;
-                crate::config::schema_answer(schema(&path, &front, unit, name, self.hermetic))
-            }
             ("preview", [path, options, front, config]) => {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
                 let mut options = crate::drive::run_options_of(options, span)?;
@@ -744,27 +732,6 @@ impl HostHandler for Facility {
         };
         Ok(HostAnswer::Value(value))
     }
-}
-
-/// The value of the definition `--config-schema` names, entered on the unit the program handed over
-/// for it alone: this command runs nothing else.
-fn schema(
-    path: &std::path::Path,
-    front: &crate::driver::LoadedAnalysis,
-    unit: &[u8],
-    name: &str,
-    hermetic: bool,
-) -> Result<ply_eval::Plain, Diagnostic> {
-    let loaded = loaded_over(path, front, hermetic).map_err(|err| {
-        err.diagnostics.into_iter().next().unwrap_or_else(|| {
-            Diagnostic::error(
-                ply_eval::codes::INTERNAL_ERROR,
-                "the program would not load, and said nothing",
-            )
-        })
-    })?;
-    let backend = crate::support::unit_of(&loaded.front, unit)?;
-    crate::config::schema_of(&loaded.check, Some(backend), name)
 }
 
 /// The binding this invocation's flags define.

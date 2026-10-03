@@ -8,8 +8,8 @@ import builder (builder)
 import args (Flags, style_of, no_flags)
 import appends (costs_of, priced, promised, promises, report_lines, unresolved)
 import diagnostic (Place, all_to_json)
-import program (Program, Timed, ModuleFacts, timed_over, module_facts, published, is_shelved,
-                own_tests, placed_of)
+import program (Program, Timed, load_diagnostics, ModuleFacts, timed_over, module_facts, published,
+                is_shelved, own_tests, placed_of, location_of)
 import reused (Toolchain, entry_at, file, key_of, touched)
 import env (env)
 import paths
@@ -23,6 +23,7 @@ import report (Answer, ok_code, count_of, indent, plural, refused, warning_lines
 import signature (SetLine, counted_lines, effect_sets, provenance, provenance_lines, set_lines)
 import style (Style, bold, dim, green)
 import compiler.costs (Report)
+import compiler.termination (Ends, Stated, Diverges)
 import compiler.front (Analysis, effect_sets_of)
 import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo)
 import compiler.resolve (Diag)
@@ -216,12 +217,19 @@ fn widest(defs: List<DefInfo>) -> Int =
 fn def_block(
   style: Style,
   explain: Bool,
+  program: Program,
   width: Int,
   lines: List<String>,
   def_info: DefInfo,
 ) -> List<String> / {abort.raise} = {
   let said = fold(
-    counted_lines(types_indent(), width, string_of_bytes_lossy(def_info.simple_name), def_info),
+    counted_lines(
+      types_indent(),
+      width,
+      string_of_bytes_lossy(def_info.simple_name),
+      def_info,
+      diverging_at(program, def_info),
+    ),
     lines,
     |acc: List<String>, l: String| push(acc, under() ++ l),
   );
@@ -234,6 +242,13 @@ fn def_block(
   }
 }
 
+// Where the call is by which a definition may not return; it is in the definition's own module.
+fn diverging_at(program: Program, def_info: DefInfo) -> Option<String> / {abort.raise} =
+  match def_info.ending {
+    Diverges(d) -> location_of(program, { module: def_info.at.module, span: d.at }),
+    _ -> None,
+  }
+
 fn test_line(style: Style, test_info: TestInfo) -> String / {abort.raise} = {
   let kind = if test_info.nondet { "test/nondet" } else { "test" };
   under() ++ dim(style, kind) ++ " " ++ quoted(string_of_bytes_lossy(test_info.name)) ++ " : "
@@ -243,6 +258,7 @@ fn test_line(style: Style, test_info: TestInfo) -> String / {abort.raise} = {
 fn module_block(
   style: Style,
   explain: Bool,
+  program: Program,
   analysis: Analysis,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
@@ -264,7 +280,7 @@ fn module_block(
   let setted = if !explain { effected } else { set_blocks(effected, sets_of(analysis, mo, ours)) };
   let width = widest(ours);
   let defined = fold(ours, setted, |acc: List<String>, def_info: DefInfo|
-    def_block(style, explain, width, acc, def_info));
+    def_block(style, explain, program, width, acc, def_info));
   fold(
     filter(tests, |test_info: TestInfo| string_of_bytes_lossy(test_info.module) == mo.name),
     defined,
@@ -285,13 +301,14 @@ fn sets_of(
 fn type_lines(
   style: Style,
   explain: Bool,
+  program: Program,
   analysis: Analysis,
   views: List<ModuleFacts>,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
 ) -> List<String> / {abort.raise} =
   fold(views, [], |acc: List<String>, mo: ModuleFacts|
-    module_block(style, explain, analysis, defs, tests, acc, mo))
+    module_block(style, explain, program, analysis, defs, tests, acc, mo))
 
 // --- The JSON document ---------------------------------------------------------------
 
@@ -335,7 +352,7 @@ fn provenance_fields(def_info: DefInfo) -> List<Member> / {abort.raise} =
     { key: "declared_not_performed", value: Array(json_strings(provenance(def_info).unperformed)) },
   ]
 
-fn definition_json(explain: Bool, def_info: DefInfo) -> Json / {abort.raise} = {
+fn definition_json(program: Program, explain: Bool, def_info: DefInfo) -> Json / {abort.raise} = {
   let named: List<Member> = [
     { key: "name", value: Str(string_of_bytes_lossy(def_info.name)) },
     { key: "module", value: Str(string_of_bytes_lossy(def_info.module)) },
@@ -345,11 +362,31 @@ fn definition_json(explain: Bool, def_info: DefInfo) -> Json / {abort.raise} = {
     { key: "atoms", value: Array(json_strings(atoms_of(def_info.footprint))) },
     { key: "scaling", value: Array(json_strings(atoms_of(def_info.scaling))) },
     { key: "repeats", value: Array(map(def_info.repeats, |i: Int| number(i))) },
+    { key: "ending", value: ending_json(program, def_info) },
   ];
   let fields: List<Member> = if !explain { named }
   else { fold(provenance_fields(def_info), named, |acc: List<Member>, f: Member| push(acc, f)) };
   object(fields)
 }
+
+// How a definition's calls are known to return; one that may not names the call and where it is.
+fn ending_json(program: Program, def_info: DefInfo) -> Json / {abort.raise} =
+  match def_info.ending {
+    Ends -> object([{ key: "kind", value: Str("ends") }]),
+    Stated -> object([{ key: "kind", value: Str("stated") }]),
+    Diverges(d) ->
+      object([
+        { key: "kind", value: Str("diverges") },
+        {
+          key: "through",
+          value: match d.through { Some(n) -> Str(string_of_bytes_lossy(n)), None -> Null },
+        },
+        {
+          key: "at",
+          value: match diverging_at(program, def_info) { Some(p) -> Str(p), None -> Null },
+        },
+      ]),
+  }
 
 fn test_json(test_info: TestInfo) -> Json / {abort.raise} =
   object([
@@ -403,7 +440,7 @@ fn document(
     },
     {
       key: "definitions",
-      value: Array(map(defs, |def_info: DefInfo| definition_json(flags.explain, def_info))),
+      value: Array(map(defs, |def_info: DefInfo| definition_json(p, flags.explain, def_info))),
     },
     { key: "tests", value: Array(map(own_tests(p, analysis), test_json)) },
     { key: "effects", value: Array(map(analysis.checked.effects, effect_json)) },
@@ -457,7 +494,7 @@ fn answered(
     append(append(head, phase_lines(style, timed)), seeding_lines(style, analysis))
   } else { head };
   let typed = if flags.types {
-    append(explained, type_lines(style, flags.explain, analysis, views, defs, tests))
+    append(explained, type_lines(style, flags.explain, timed.program, analysis, views, defs, tests))
   } else { explained };
   {
     json: if flags.json { document(flags, timed, analysis, views, defs, warnings) }
@@ -487,7 +524,7 @@ fn checked(
       timed,
       analysis,
       r,
-      filter(timed.program.diags, |diag: Diag| !is_shelved(timed.program, diag)),
+      filter(load_diagnostics(timed.program), |diag: Diag| !is_shelved(timed.program, diag)),
     )
   }
 }
@@ -506,10 +543,19 @@ fn field(b: Bytes) -> Bytes =
 
 fn flag(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
 
-fn resolved_field(r: Resolved) -> Bytes =
+fn resolved_field(resolved: Resolved) -> Bytes =
   bytes_concat_all(
-    map([r.label, r.spelling, r.display, r.inside, r.absolute, r.machine], |s: String|
-      field(bytes_of_string(s))),
+    map(
+      [
+        resolved.label,
+        resolved.spelling,
+        resolved.display,
+        resolved.inside,
+        resolved.absolute,
+        resolved.machine,
+      ],
+      |s: String| field(bytes_of_string(s)),
+    ),
   )
 
 // The interface each registry dependency's slot holds, which a load reads beside its walk.
@@ -591,15 +637,17 @@ fn with_front(a: Answer, front: (Json) -> Json) -> Answer =
     _ -> a,
   }
 
-fn reuse_said(front: Json, reused: Bool, key: String) -> Json =
+fn reuse_said(front: Json, said: List<Member>) -> Json =
   match front {
     Object(members) ->
-      Object(map_insert(map_insert(members, "reused", Bool(reused)), "key", Str(key))),
-    _ -> object([{ key: "reused", value: Bool(reused) }, { key: "key", value: Str(key) }]),
+      Object(
+        fold(said, members, |acc: Map<String, Json>, m: Member| map_insert(acc, m.key, m.value)),
+      ),
+    _ -> object(said),
   }
 
 // A check run now, and the answer a later check may take back: one the front end answered whole,
-// without what the front-end cache said of itself, which a run that does not read it never says.
+// without the cache's warnings, which a run that never reads the cache does not say.
 fn checked_now(
   flags: Flags,
   project: Project,
@@ -608,11 +656,15 @@ fn checked_now(
   let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps);
   match t.program.whole {
     None ->
-      { answer: refused(style_of(flags), "check", t.program.diags, t.program.places), filed: None },
+      {
+        answer: refused(style_of(flags), "check", load_diagnostics(t.program), t.program.places),
+        filed: None,
+      },
     Some(w) -> {
       let answer = checked(style_of(flags), flags, t, w);
-      let own = if len(t.own) == len(t.program.diags) { answer }
-      else { checked(style_of(flags), flags, { ..t, program: { ..t.program, diags: t.own } }, w) };
+      let own = if len(t.program.cache_warnings) == 0 { answer } else {
+        checked(style_of(flags), flags, { ..t, program: { ..t.program, cache_warnings: [] } }, w)
+      };
       { answer: answer, filed: Some(own) }
     },
   }
@@ -620,7 +672,7 @@ fn checked_now(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, env.binary_version[sys], env.shipped_digest[sys], env.fronts[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, env.binary_version[sys], env.shipped_digest[sys], env.reused[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise} = {
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
   // `--explain` says what this run's own phases took, which no filed answer knows.
@@ -630,14 +682,22 @@ pub fn run(
     match replayed(entry_at(key)) {
       Some(answer) -> {
         touched(key);
-        if flags.json { with_front(answer, |_: Json| reuse_said(object([]), true, key)) }
-        else { answer }
+        if !flags.json { answer } else {
+          with_front(answer, |_: Json|
+            object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(key) }]))
+        }
       },
       None -> {
         let now = checked_now(flags, project, started);
-        match now.filed { Some(own) -> file(key, filed_answer(own)), None -> () };
-        if flags.json { with_front(now.answer, |front: Json| reuse_said(front, false, key)) }
-        else { now.answer }
+        let filed = match now.filed { Some(own) -> file(key, filed_answer(own)), None -> false };
+        if !flags.json { now.answer } else {
+          with_front(now.answer, |front: Json|
+            reuse_said(front, [
+              { key: "reused", value: Bool(false) },
+              { key: "key", value: Str(key) },
+              { key: "filed", value: Bool(filed) },
+            ]))
+        }
       },
     }
   }
@@ -697,6 +757,7 @@ test "the longest phase is printed first, and the total accounts for all three" 
       files: [],
       places: [],
       diags: [],
+      cache_warnings: [],
       whole: None,
       pkgs: { root: b"", manifest: None, supplied: [] },
       through: [],
@@ -706,7 +767,6 @@ test "the longest phase is printed first, and the total accounts for all three" 
     front_ms: 90,
     file_ms: 8,
     cached: true,
-    own: [],
   });
   assert_eq(lines, [
     "",

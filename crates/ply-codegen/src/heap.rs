@@ -145,10 +145,10 @@ pub fn poisoning() -> bool {
     *ON.get_or_init(|| std::env::var_os("PLY_HEAP_POISON").is_some())
 }
 
-/// Under `PLY_C_PHASES`, allocations are also tallied by layout, at a map insert each.
+/// Under `PLY_HEAP_CENSUS`, allocations are also tallied by layout, at a map insert each.
 fn census_by_layout() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PLY_C_PHASES").is_some())
+    *ON.get_or_init(|| std::env::var_os("PLY_HEAP_CENSUS").is_some())
 }
 
 /// How many releases a dead block waits before reuse: `PLY_HEAP_DELAY`, zero by default.
@@ -487,7 +487,7 @@ pub struct Heap {
     /// Objects allocated since the last reset, and the same by kind.
     count: usize,
     by_kind: [usize; 16],
-    /// Under `PLY_C_PHASES`, allocations by kind and layout or power-of-two length.
+    /// Under `PLY_HEAP_CENSUS`, allocations by kind and layout or power-of-two length.
     by_layout: HashMap<(u8, u32), usize>,
     recycled: usize,
     /// Dead objects by size class in words, taken before the bump pointer moves.
@@ -732,7 +732,7 @@ impl Heap {
         self.by_kind
     }
 
-    /// Under `PLY_C_PHASES`, allocations by kind and layout or length class, most first.
+    /// Under `PLY_HEAP_CENSUS`, allocations by kind and layout or length class, most first.
     pub fn allocated_by_layout(&self) -> Vec<((u8, u32), usize)> {
         let mut out: Vec<((u8, u32), usize)> =
             self.by_layout.iter().map(|(k, n)| (*k, *n)).collect();

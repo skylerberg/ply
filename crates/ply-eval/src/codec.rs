@@ -110,7 +110,7 @@ impl<'v> Encoder<'v> {
             }
             Value::Map(m) => {
                 self.out.push(MAP);
-                self.varint(m.size() as u64);
+                self.varint(m.len() as u64);
                 for (k, v) in m.iter() {
                     self.value(k)?;
                     self.value(v)?;

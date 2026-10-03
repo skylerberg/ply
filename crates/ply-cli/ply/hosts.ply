@@ -10,7 +10,7 @@ import configuration
 import configuration (Report, ReportKey, Resolution)
 import env (env)
 import std.value (Value)
-import program (Timed, front_of, no_front, timed_uncached)
+import program (Timed, load_diagnostics, front_of, no_front, timed_uncached)
 import builder (builder)
 import std.fs (fs, Missing)
 import std.time (time)
@@ -25,16 +25,34 @@ import style (Style, plain, red)
 
 // The trusted computing base, as the Rust side assembles it under the host flags.
 pub nondet effect tcb {
-  // The value of the nullary definition `--config-schema` names, entered on the program's unit.
+  // The value of the nullary definition `--config-schema` names, which `configuring` enters on the
+  // program's unit.
   read schema[r](root: String, front: LoadedAnalysis, unit: Bytes, name: String) -> Result<Value, List<Diag>>
   read preview[r](root: String, options: machine::Options, front: LoadedAnalysis, config: machine::Configured) -> Previewed
 }
 
-// `tcb` answered from what it is handed alone: a preview that reads a credential is refused.
+// `tcb.preview` answered from what it is handed alone: one that reads a credential is refused.
 pub effect hermetic_tcb {
-  read schema[r](root: String, front: LoadedAnalysis, unit: Bytes, name: String) -> Result<Value, List<Diag>>
   read preview[r](root: String, options: machine::Options, front: LoadedAnalysis, config: machine::Configured) -> Previewed
 }
+
+// `body` with every schema it asks for entered on a machine loaded for that alone: this command
+// runs nothing else, so the label a run would take is free.
+pub fn configuring<a | e>(
+  body: () -> a / {tcb.schema[host] | e},
+) -> a / {machine::machine.load[run], machine::machine.schema[run], machine::machine.drop[run] | e} =
+  handle {
+    body()
+  } with {
+    tcb.schema[host](root, front, unit, name) -> {
+      let entered = match machine::machine.load[run](root, front, unit) {
+        Err(refused) -> Err(refused.diags),
+        Ok(_) -> machine::machine.schema[run](name),
+      };
+      machine::machine.drop[run]();
+      entered
+    },
+  }
 
 // --- What the Rust side answers with ----------------------------------------
 
@@ -506,7 +524,7 @@ pub fn run(
   let s: Style = style_of(flags);
   let t: Timed = timed_uncached(flags.paths);
   match t.program.whole {
-    None -> refused(s, "hosts", t.program.diags, t.program.places),
+    None -> refused(s, "hosts", load_diagnostics(t.program), t.program.places),
     Some(w) -> match config_schema::refusal(w, options.config.schema) {
       Some(d) -> unbound(s, [d], t.program.places),
       None -> binding_over(s, flags, options, front_of(t, w), t.program.places),
