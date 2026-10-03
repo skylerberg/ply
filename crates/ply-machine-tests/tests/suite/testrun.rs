@@ -21,12 +21,7 @@ struct Compiled {
 impl Compiled {
     #[track_caller]
     fn new(src: &str) -> Compiled {
-        ply_codegen::c::producer::ensure_default();
-        let sources = vec![("m".to_string(), src.to_string())];
-        let front = ply_codegen::c::producer::checked_analysis(&sources, &[SourceId(0)])
-            .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"));
-        let unit = ply_codegen::Unit::over_front(&front, sources.into_iter().collect())
-            .expect("this host has a C compiler");
+        let (front, unit) = crate::fixture::built("m", src);
         Compiled { front, unit }
     }
 
@@ -337,11 +332,9 @@ fn the_same_det_test_is_refused_hermetically() {
 
 #[test]
 fn an_operation_a_partial_clause_set_leaves_is_refused_by_the_checker() {
-    ply_codegen::c::producer::ensure_default();
-    let diagnostics = ply_codegen::c::producer::front(
-        &[(
-            "m".to_string(),
-            r#"
+    let diagnostics = crate::fixture::answer_for(
+        "m",
+        r#"
 effect disk {
   read peek[r](key: Int) -> Int
   read poke[r](key: Int) -> Int
@@ -355,12 +348,10 @@ test "the clause set misses an operation it performs" {
   };
   assert(n > 0)
 }
-"#
-            .to_string(),
-        )],
-        &[SourceId(0)],
+"#,
     )
-    .expect("the front end answers")
+    .front
+    .answer
     .diagnostics;
     assert_eq!(
         diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),

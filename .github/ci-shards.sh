@@ -22,8 +22,6 @@
 #                                nextest JUnit report
 #   ci-shards.sh timings BEFORE  the table the next run is cut by, from this
 #                                run's rows on stdin and the table BEFORE
-#   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
-#   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
 #   ci-shards.sh corpus-matrix   the JSON matrix of the corpus runs that get
 #                                runners of their own: the desk runners, then
 #                                each run alone
@@ -33,8 +31,8 @@
 #   ci-shards.sh desks-for-runner K [DIR]
 #                                the desk runs runner K takes, likewise
 #   ci-shards.sh corpus-line ID  the package one run tests and its filter
-#   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
-#                                jobs: the solo tests and the host packages
+#   ci-shards.sh exclude-filter  the filterset a partition leaves to the gates
+#                                job: the host packages
 #   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
 #   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
@@ -57,15 +55,6 @@ TIMINGS=/tmp/ply-test-timings/timings.tsv
 
 TAB=$'\t'
 
-# Tests that run alone, as `id:package:target:test`, after the gates on the gates job's runner. A long
-# test is no reason: the cut balances by duration. A test that must not share its runner is, since the
-# cut cannot see that.
-SOLO=(
-  # It takes every test thread (nextest.toml), so in a shard it would run alone for its whole length
-  # on top of the shard's share.
-  "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
-)
-
 # The Ply tests, one run an entry: the corpus program's own, each module of the corpus's checks package
 # that declares a test, and each module of the CLI's suite as `cli-<module>`, selected by its name.
 # Every check spawns `ply`, so a run takes its checks one after another, and the CLI's suite drives
@@ -85,7 +74,7 @@ CORPUS_ALONE=(cli-compiler_on_the_tier)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
+CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations goldens incremental)
 # Corpus processes a partition runs side by side, each a lane of the cut: a lane's runs of one package
 # go in one `ply test`, which loads the package's closure once. Two, so the program's and the packages'
 # own `ply test`s, each with a front end and C of its own, are not all one lane's to take in turn.
@@ -181,16 +170,6 @@ triples() {
 
 cmd_tree_checks() { triples "${TREE_CHECKS[@]}"; }
 
-# `id package target test` per solo test.
-cmd_solo() {
-  local entry rest
-  for entry in "${SOLO[@]}"; do
-    rest=${entry#*:}
-    printf '%s ' "${entry%%:*}"
-    triples "$rest"
-  done
-}
-
 # `(binary_id(=..) & test(=..)) | ...` over `package target test` lines on stdin.
 filter_of() {
   local package target test first=1
@@ -199,18 +178,6 @@ filter_of() {
     first=0
     printf '(binary_id(=%s) & test(=%s))' "$(binary_id "$package" "$target")" "$test"
   done
-}
-
-cmd_solo_filter() {
-  local id package target test
-  while read -r id package target test; do
-    if [[ $id == "$1" ]]; then
-      printf '%s\n' "$(printf '%s %s %s\n' "$package" "$target" "$test" | filter_of)"
-      return 0
-    fi
-  done < <(cmd_solo)
-  echo "no solo test named '$1'" >&2
-  return 1
 }
 
 # One entry id a line: `program`, `fixture-<name>` per fixture, `package-<id>` per package suite,
@@ -358,22 +325,23 @@ cmd_corpus_for_partition() {
 
 # `path filter`: the program's entry takes every test of its package, a module's its own, and
 # `module:<id>` the test whose label hashes to it, by the qualified name `ply test --filter` matches.
+# A module the cut places a test at a time is a run too, of every test it declares.
 cmd_corpus_line() {
   local entry entries
   # Read whole before the loop can return, so the lister never writes into a closed pipe.
   entries=$(corpus_entries)
   while read -r entry; do
-    [[ $entry == "$1" ]] || continue
-    if [[ $entry == program ]]; then
+    [[ $entry == "$1" || ${entry%%:*} == "$1" ]] || continue
+    if [[ $1 == program ]]; then
       printf '%s\n' "$CORPUS_PROGRAM"
-    elif [[ $entry == fixture-* ]]; then
-      printf '%s/%s.ply\n' "$CORPUS_FIXTURES" "${entry#fixture-}"
-    elif [[ $entry == package-* ]]; then
-      package_path "${entry#package-}"
-    elif [[ $entry == cli-* ]]; then
-      module_line "$CLI_SUITE" "${entry#cli-}"
+    elif [[ $1 == fixture-* ]]; then
+      printf '%s/%s.ply\n' "$CORPUS_FIXTURES" "${1#fixture-}"
+    elif [[ $1 == package-* ]]; then
+      package_path "${1#package-}"
+    elif [[ $1 == cli-* ]]; then
+      module_line "$CLI_SUITE" "${1#cli-}"
     else
-      module_line "$CORPUS_CHECKS" "$entry"
+      module_line "$CORPUS_CHECKS" "$1"
     fi
     return 0
   done <<< "$entries"
@@ -410,10 +378,7 @@ cmd_tree_check_filter() {
 
 cmd_gate_filter() { cmd_tree_check_filter; }
 
-# Solo tests are excluded by name, so a new test in one of their binaries still runs in a partition.
-cmd_exclude_filter() {
-  printf '%s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$(cmd_host_filter)"
-}
+cmd_exclude_filter() { cmd_host_filter; }
 
 cmd_partitions() { matrix "$PARTITIONS"; }
 
@@ -1030,17 +995,6 @@ cmd_supersede() {
     -q '.actions_caches[] | select(.ref | startswith("refs/pull/")) | "\(.ref) \(.id)"' | sort)
 }
 
-cmd_solo_matrix() {
-  local id package target test first=1
-  printf '{"include":['
-  while read -r id package target test; do
-    ((first)) || printf ','
-    first=0
-    printf '{"id":"%s"}' "$id"
-  done < <(cmd_solo)
-  printf ']}\n'
-}
-
 # Workspace members under `crates/`, read out of `Cargo.toml` as text.
 members() {
   local manifest="$root/Cargo.toml" found
@@ -1322,17 +1276,6 @@ cmd_verify() {
   while read -r package target test; do
     check_test_exists "tree check" "$package" "$target" "$test" || failures=$((failures + 1))
   done < <(cmd_tree_checks)
-  while read -r id package target test; do
-    check_test_exists "solo test '$id'" "$package" "$target" "$test" || failures=$((failures + 1))
-    seen=0
-    for entry in "${SOLO[@]}"; do
-      [[ ${entry%%:*} == "$id" ]] && seen=$((seen + 1))
-    done
-    if [[ $seen -gt 1 ]]; then
-      echo "FAIL: SOLO names '$id' $seen times" >&2
-      failures=$((failures + 1))
-    fi
-  done < <(cmd_solo)
   # The archive carries `ply` only if ply-launcher has an integration test of its own.
   if ! ls "$root"/crates/ply-launcher/tests/*.rs >/dev/null 2>&1; then
     echo "FAIL: crates/ply-launcher/tests/ has no .rs file, so cargo builds no 'ply' for the Ply runs to drive" >&2
@@ -1587,7 +1530,7 @@ cmd_verify() {
   fi
   local cut="by test count, with nothing measured"
   [[ -s $TIMINGS ]] && cut="from $(grep -c . "$TIMINGS") measured durations"
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks, ${#CLI_TREE_CHECKS[@]} in the CLI's suite, and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
 }
 
 case "${1:-}" in
@@ -1598,8 +1541,6 @@ case "${1:-}" in
   shard-configs) cmd_shard_configs "${2:-}" ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
   timings) cmd_timings "${2:?the table this run was cut by, which need not exist}" ;;
-  solo-matrix) cmd_solo_matrix ;;
-  solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
   corpus-matrix) cmd_corpus_matrix ;;
   corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" "${3:-}" ;;
   desks-for-runner) cmd_desks_for_runner "${2:?a desk runner}" "${3:-}" ;;
@@ -1612,7 +1553,7 @@ case "${1:-}" in
   give-back) cmd_give_back "${2:?a run id}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
     exit 2
     ;;
 esac
