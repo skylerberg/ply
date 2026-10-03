@@ -6,8 +6,8 @@ use crate::load::Loaded;
 use crate::payload::record;
 use ply_eval::decode::{self, At};
 use ply_eval::{
-    DefHash, DefInfo, Diagnostic, Ended, Front, HashOutput, ModuleName, Severity, SourceMap, Span,
-    Symbol, Value, codes,
+    DefHash, DefInfo, Diagnostic, Ended, Front, ModuleName, Severity, SourceMap, Span, Symbol,
+    Value, codes,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -331,7 +331,8 @@ pub struct Built {
     pub entry_name: Symbol,
     /// In the order they were named.
     pub startup: Vec<Symbol>,
-    pub closure: BTreeMap<String, BTreeSet<String>>,
+    /// Every definition the entry and the startup roots reach, them included.
+    pub reachable: BTreeSet<Symbol>,
     /// What the emitter refused, as `(definition, the construct that refused it)`, in the order
     /// the fixpoint dropped them: the first are the causes, the rest what those causes carried.
     pub refused: Vec<(String, String)>,
@@ -377,13 +378,11 @@ pub fn build(
     let Some(entry_hash) = hashes.defs.get(&entry.name).copied() else {
         return Err(vec![missing_entry(&entry.name)]);
     };
-    let mut reachable = hashes.closure.get(&entry.name).cloned().unwrap_or_default();
-    for root in startup {
-        match hashes.closure.get(&root.name) {
-            Some(closure) => reachable.extend(closure.iter().cloned()),
-            None => return Err(vec![missing_entry(&root.name)]),
-        }
+    if let Some(root) = startup.iter().find(|r| !hashes.deps.contains_key(&r.name)) {
+        return Err(vec![missing_entry(&root.name)]);
     }
+    let reachable =
+        hashes.reach(std::iter::once(&entry.name).chain(startup.iter().map(|r| &r.name)));
 
     let mut out = Artifact {
         frontend: compiler(),
@@ -428,7 +427,7 @@ pub fn build(
         artifact: out,
         entry_name: entry.name.clone(),
         startup: startup.iter().map(|d| d.name.clone()).collect(),
-        closure: restricted_closure(hashes, &reachable),
+        reachable,
         refused: emission.refused,
         entry_compiled: emission.entry_compiled,
         warnings: emission.warnings,
@@ -584,37 +583,6 @@ pub fn refusal_list(refused: &[(String, String)]) -> String {
         out.push_str(&format!("\n  `{function}` ({construct})"));
     }
     out
-}
-
-pub(crate) fn stale_unit() -> Diagnostic {
-    Diagnostic::warning(
-        codes::ARTIFACT_VERSION,
-        "the artifact's compiled unit was built for another runtime and is left aside",
-    )
-    .note("the artifact's bodies are printed back to source and compiled at this run instead")
-    .note("rebuild the artifact with this `ply` to carry a unit it can enter")
-}
-
-fn restricted_closure(
-    hashes: &HashOutput,
-    reachable: &BTreeSet<Symbol>,
-) -> BTreeMap<String, BTreeSet<String>> {
-    reachable
-        .iter()
-        .map(|name| {
-            let inner = hashes
-                .closure
-                .get(name)
-                .map(|set| {
-                    set.iter()
-                        .filter(|n| reachable.contains(*n))
-                        .map(|n| n.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            (name.to_string(), inner)
-        })
-        .collect()
 }
 
 struct Reader<'a> {
@@ -1096,13 +1064,10 @@ pub const EXIT_OK: i32 = 0;
 /// else `0` for a value returned and the diagnostic for a raise; what the entry ended with is the
 /// caller's to report.
 pub fn enter(artifact: &Artifact, opened: &Opened, argv: Vec<String>, binds: Binds) -> Ended<i32> {
-    // A unit built for another runtime is left aside and the bodies serve.
-    let unit = if servable(artifact) {
-        artifact.unit.as_ref()
-    } else {
-        None
-    };
-    entered_with(unit, opened, argv, binds)
+    match artifact.unit.as_ref().map(served_text).transpose() {
+        Ok(text) => entered_with(text.flatten(), opened, argv, binds),
+        Err(refused) => Ended::refused(refused),
+    }
 }
 
 /// [`enter`] for a program no artifact carries: its own load, compiled here from the body cache.
@@ -1111,7 +1076,7 @@ pub fn enter_loaded(opened: &Opened, argv: Vec<String>, binds: Binds) -> Ended<i
 }
 
 fn entered_with(
-    unit: Option<&EmbeddedUnit>,
+    unit: Option<String>,
     opened: &Opened,
     argv: Vec<String>,
     binds: Binds,
@@ -1181,31 +1146,40 @@ fn bind_failed(diagnostics: &[Diagnostic]) -> Diagnostic {
     })
 }
 
-/// Whether the artifact's embedded unit is one this runtime can enter. One built for another
-/// runtime is left aside; one that is broken rather than foreign is passed on and refused loudly.
-pub(crate) fn servable(artifact: &Artifact) -> bool {
-    let Some(unit) = &artifact.unit else {
-        return false;
-    };
-    let served = ply_codegen::c::bundle::unpack(&unit.text)
-        .and_then(|text| ply_codegen::c::served(&text, "artifact"));
-    !matches!(&served, Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some())
+fn unit_error(e: &dyn std::fmt::Display) -> Diagnostic {
+    Diagnostic::error(
+        codes::ARTIFACT_INVALID,
+        format!("the artifact's compiled unit could not be entered: {e:#}"),
+    )
+}
+
+/// The embedded unit's C when it serves this runtime, `None` when it was emitted for another (the
+/// bodies serve instead), and a refusal when it is broken rather than foreign. Read from the text,
+/// so nothing is compiled to find out.
+pub(crate) fn served_text(unit: &EmbeddedUnit) -> Result<Option<String>, Diagnostic> {
+    let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
+    let exports = ply_codegen::c::Exports::from_text(&text)
+        .ok_or_else(|| unit_error(&"its table of what it holds does not read"))?;
+    Ok(exports.unserved().is_none().then_some(text))
+}
+
+pub(crate) fn stale_unit() -> Diagnostic {
+    Diagnostic::warning(
+        codes::ARTIFACT_VERSION,
+        "the artifact's compiled unit was built for another runtime and is left aside",
+    )
+    .note("the artifact's bodies are printed back to source and compiled at this run instead")
+    .note("rebuild the artifact with this `ply` to carry a unit it can enter")
 }
 
 /// The unit the artifact runs on: its embedded one as built, else one compiled from its bodies.
+/// `unit` is the embedded unit's C, as [`served_text`] answers it.
 pub(crate) fn tier(
     opened: &Opened,
-    unit: Option<&EmbeddedUnit>,
+    unit: Option<String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     // Entered as built: no producer is asked.
-    if let Some(unit) = unit {
-        let unit_error = |e: &dyn std::fmt::Display| {
-            Diagnostic::error(
-                codes::ARTIFACT_INVALID,
-                format!("the artifact's compiled unit could not be entered: {e:#}"),
-            )
-        };
-        let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
+    if let Some(text) = unit {
         let provider: &'static dyn ply_eval::Provider =
             ply_codegen::Unit::handed(&opened.front, text).map_err(|e| unit_error(&e))?;
         return Ok(provider);

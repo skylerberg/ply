@@ -98,7 +98,7 @@ pub fn program() -> Result<Image, Diagnostic> {
     }
     if let Ok(bytes) = std::fs::read(kept_front())
         && let Some(handed) = ply_machine::driver::kept_front(&bytes)
-        && let Ok(loaded) = ply_machine::driver::load_over_front_in(PathBuf::from(ROOT), &handed)
+        && let Ok(loaded) = ply_machine::driver::load_over_front_taken(PathBuf::from(ROOT), handed)
     {
         ply_codegen::c::sweep::used(&stage());
         return Ok(Image::Loaded(Box::new(loaded)));

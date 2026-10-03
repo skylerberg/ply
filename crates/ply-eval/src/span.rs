@@ -131,11 +131,7 @@ impl SourceMap {
     pub fn add(&mut self, path: impl AsRef<Path>, text: impl Into<String>) -> SourceId {
         let text: Arc<str> = Arc::from(text.into());
         let mut line_starts = vec![0u32];
-        line_starts.extend(
-            text.char_indices()
-                .filter(|(_, c)| *c == '\n')
-                .map(|(i, _)| (i + 1) as u32),
-        );
+        line_starts.extend(memchr::memchr_iter(b'\n', text.as_bytes()).map(|i| (i + 1) as u32));
         let id = SourceId(self.files.len() as u32);
         self.files.push(SourceFile {
             id,
