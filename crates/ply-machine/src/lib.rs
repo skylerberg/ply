@@ -6,8 +6,8 @@
 //! resource label, parked on a channel between operations: `load[m]` opens the target rooted at a
 //! path (`reload[m]` asks again, and `reuse[m]` opens it over the front end an earlier run filed),
 //! `bound[m]` binds the hosts the named entry may reach and answers the disclosure, `enter[m]`
-//! runs it and answers how it ended, `drop[m]` lets the thread go. The run flow itself —
-//! targets, bindings, teardown — is `crate::drive`.
+//! runs it and answers how it ended, `drop[m]` lets the thread go and forgets what the label was
+//! configured with. The run flow itself — targets, bindings, teardown — is `crate::drive`.
 
 pub mod artifact;
 pub mod body;
@@ -555,6 +555,10 @@ impl Site {
     }
 
     fn drop(&self, label: &str) -> Value {
+        self.configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(label);
         let mut labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut machine) = labels.remove(label) {
             machine.join();

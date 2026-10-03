@@ -130,7 +130,7 @@ unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [W
         spent = spent.saturating_add(ctx.ticks);
         let out_of_steps =
             ctx.failed == FAILED_OUT_OF_STEPS || left.is_some_and(|left| spent > left);
-        let failure = (ctx.failed != 0).then(|| (ctx.failed, ctx.diagnostic.take()));
+        let failure = ctx.take_branch_failure();
         *slot = answer;
         parent.absorb(ctx);
         if out_of_steps {
