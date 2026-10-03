@@ -47,11 +47,7 @@ fn first(list: &Value) -> Value {
 
 /// The front end's answer over modules that import nothing shipped, as the builder writes it.
 fn answer(modules: &[(&str, &str)]) -> Value {
-    let files: Vec<(String, String)> = modules
-        .iter()
-        .map(|(name, text)| (format!("{}.ply", name.replace('.', "/")), text.to_string()))
-        .collect();
-    let bytes = ply_machine::builds::answered(&files)
+    let bytes = ply_machine::builds::answered(&ply_machine::builds::module_files(modules))
         .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
     let answer = ply_machine::runnable::front_value(&bytes)
         .unwrap_or_else(|why| panic!("the answer reads: {why}"));
