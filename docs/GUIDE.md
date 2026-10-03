@@ -971,10 +971,10 @@ The prelude declares `effect abort { read raise<a>(message: String) -> a }`.
 come back. So does everything else that can fail on a value it is given: `panic`,
 `assert` and `assert_eq`, a builtin outside what it is defined for (§12), a `/`
 or `%` by zero (§2.4), a `let` whose pattern misses (§5.1), an `iterate` past
-its budget and a `task.join` of a cancelled task (§9). A row that omits `abort.raise` on a body that can raise is `E0302`,
-which names the operation; `ply check --types` shows it on every definition
-that can raise. Overflow, the call ceiling and a spent step budget end the run
-whatever the row says.
+its budget and a `task.join` of a cancelled task (§9). A signature that leaves
+`abort.raise` out of its row where its body can raise is `E0302`, which names
+the operation and offers the row to write. Overflow, the call ceiling and a
+spent step budget end the run whatever the row says.
 
 A clause for `abort.raise` has the `handle`'s type: its value is the `handle`'s,
 `return` is not applied to it, and it cannot bind `resume` (`E0201`). Its
