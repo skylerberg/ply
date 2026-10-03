@@ -128,6 +128,9 @@ pub struct Front {
     /// What every definition and test published, its `front.Rows` as [`crate::codec`] encodes it
     /// and empty when the answer carried none: the emitter walks only the bodies it lowers.
     pub rows: Vec<u8>,
+    /// What the front end's check read of the bodies it walked, a `front.Walked` in the encoding
+    /// `std.bin` reads it with, empty when the answer carried none.
+    pub walked: Vec<u8>,
 }
 
 impl Front {
@@ -211,7 +214,19 @@ pub struct ModuleInfo {
     pub source: SourceId,
     /// Program-wide names of everything this module declares, in source order.
     pub items: Vec<Symbol>,
+    /// Each module this one imports, as the program names it.
     pub imports: Vec<ModuleName>,
+    /// What a stub of this module blanks, in source order.
+    pub cuts: Vec<Cut>,
+}
+
+/// A span of a module a stub blanks: a body, which keeps its braces as an empty block, or a whole
+/// test or law.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub start: usize,
+    pub end: usize,
+    pub braced: bool,
 }
 
 /// Every map is keyed by program-wide name, so entries from different modules cannot collide.

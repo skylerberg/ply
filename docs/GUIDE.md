@@ -23,7 +23,8 @@ fn main() -> Unit = assert_eq(greeting(), "hello from ply")
 `0`. There is no `print`: output is the `std.process` effect (§13.9). The everyday commands are
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a project root, defaulting to `.`.
-`ply check --types` prints every definition's inferred signature.
+`ply check --types` prints every definition's inferred signature, each atom of
+its row marked with how many times a call performs it (§6.2).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
 `demo/main.ply` — a manifest (§3.3), a `main` and one test — and `cd demo &&
@@ -94,6 +95,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `set` | `effect set X = {..}` |
 | `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard |
+| `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
@@ -900,6 +902,39 @@ one is a `write`. A label parameter or `[*]` may be any label, so it conflicts
 with every label of its effect. `parallel` (§5.9) and the test scheduler (§8.4)
 both decide by this.
 
+A row also counts. Each atom a call performs runs a `bounded` number of times,
+one no input decides, or a `scaling` one that grows with its input:
+performed inside a callback that `map`, `filter`, `fold`, `map_fold`,
+`bytes_position` or `iterate` calls once per element (unless the list,
+`range` or budget is written out literally), inside a definition that calls
+back into its own recursive group, or by a callee that performs it so. A
+higher-order definition counts its callbacks the same way, so `map(ids,
+lookup)` scales `lookup`'s query, a definition that calls its callback in a
+`fold` scales whatever it is handed, and one that calls it once does not.
+`ply check --types` prints each atom and row variable with its count:
+
+```ply
+fn lookup(id: Int) -> Row / {db.query[conn]} = db.query[conn](id)
+fn lookup_all(ids: List<Int>) -> List<Row> / {db.query[conn]} = map(ids, lookup)
+```
+
+```
+     lookup     : (Int) -> Row
+                  / {m.db.query[conn] bounded}
+     lookup_all : (List<Int>) -> List<Row>
+                  / {m.db.query[conn] scaling}
+```
+
+A definition's row may promise an atom, or its row variable, `bounded`:
+`/ {db.query[conn] bounded}`, `/ {log.write | e bounded}`, `/ e bounded`. A
+body that performs it a scaling number of times is `E0465`, naming the
+operation and the iteration that repeats it — batch it into one operation over
+the whole input, or move it out of the iteration. `bounded` belongs to a
+definition's own row; in a function type or an effect set it is `E0466`. A
+definition of another package is read by what its row writes: an atom it does
+not promise `bounded` may scale, and so may each callback it takes unless its
+row variable is promised.
+
 ### 6.3 Performing
 
 `db.get[users](3)`, `clock.now()`, `store::db.put[orders](id, row)` add their
@@ -1132,8 +1167,11 @@ A definition's hash covers its normalized form: names, comments, formatting,
 imports, `pub`, specs and test labels are erased, and references are replaced by
 their referent's hash. A test runs exactly when its hash has no recorded pass,
 so renames and comment edits run nothing. `ply hash` prints the hashes.
-`--explain` says why each test was selected and where the run's time went, phase
-by phase from the process's start (`phases` in the `--json` report);
+`--explain` says why each test was selected, what a pass is filed under (the
+test's hash and the runtime stamp, `filed_under` in `--json`), which of a test's
+atoms are answers this binary gives from what it ships (`shipped`), which no key
+covers (`unkeyed`), and where the run's time went, phase by phase from the
+process's start (`phases` in the `--json` report);
 `--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
 any of them matches; `--no-cache` bypasses both the result and the front-end
 cache.
@@ -1993,9 +2031,9 @@ pub nondet effect time {
   read elapsed_ms()       -> Int
   write sleep_ms(ms: Int) -> Unit
 }
-pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms}
-pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms}
-pub fn since(started: Int) -> Int / {time.elapsed_ms}
+pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms bounded}
+pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms bounded}
+pub fn since(started: Int) -> Int / {time.elapsed_ms bounded}
 
 pub fn nanos(n: Int) -> Duration        // also micros, millis, seconds, minutes, hours
 pub fn as_nanos(d: Duration) -> Int     // also as_micros, as_millis, as_seconds, toward zero
@@ -2398,7 +2436,7 @@ pub type Issued = {
   fingerprint: String,
 }
 
-pub fn localhost() -> Issued / {certgen.issue}
+pub fn localhost() -> Issued / {certgen.issue bounded}
 ```
 
 A throwaway self-signed certificate for `localhost`, generated where the run
@@ -2415,9 +2453,9 @@ pub nondet effect entropy {
   read next() -> Int
   read below(n: Int) -> Int
 }
-pub fn next() -> Int / {entropy.next}
-pub fn below(n: Int) -> Int / {entropy.below}
-pub fn nonce() -> String / {entropy.next}
+pub fn next() -> Int / {entropy.next bounded}
+pub fn below(n: Int) -> Int / {entropy.below bounded}
+pub fn nonce() -> String / {entropy.next bounded}
 pub type Rand = { root: Int, key: Bytes, counter: Int }
 pub fn rand(root: Int) -> Rand
 pub fn rand_keyed(root: Int, key: Bytes) -> Rand
@@ -2455,7 +2493,7 @@ the host's. A run that is not simulated draws here, and `--host` binds it.
 pub type Uuid = { octets: Bytes }
 pub fn uuid_render(u: Uuid) -> String
 pub fn uuid_parse(text: String) -> Option<Uuid>
-pub fn uuid_v4() -> Uuid / {entropy.next}
+pub fn uuid_v4() -> Uuid / {entropy.next bounded}
 ```
 
 A 128-bit identifier as its sixteen octets. `uuid_render` writes the canonical
@@ -2618,18 +2656,18 @@ negative, a surrogate (`U+D800` to `U+DFFF`) or past `U+10FFFF`.
 ### 13.26 `std.option`
 
 ```ply
-pub fn option_map<a, b | e>(o: Option<a>, f: (a) -> b / e) -> Option<b> / e
-pub fn option_and_then<a, b | e>(o: Option<a>, f: (a) -> Option<b> / e) -> Option<b> / e
-pub fn option_filter<a | e>(o: Option<a>, ok: (a) -> Bool / e) -> Option<a> / e
+pub fn option_map<a, b | e>(o: Option<a>, f: (a) -> b / e) -> Option<b> / e bounded
+pub fn option_and_then<a, b | e>(o: Option<a>, f: (a) -> Option<b> / e) -> Option<b> / e bounded
+pub fn option_filter<a | e>(o: Option<a>, ok: (a) -> Bool / e) -> Option<a> / e bounded
 pub fn option_or<a>(o: Option<a>, fallback: Option<a>) -> Option<a>
 pub fn option_unwrap_or<a>(o: Option<a>, fallback: a) -> a
 pub fn option_expect<a>(o: Option<a>, message: String) -> a
 pub fn option_is_some<a>(o: Option<a>) -> Bool
 pub fn option_is_none<a>(o: Option<a>) -> Bool
 pub fn option_ok_or<a, e>(o: Option<a>, err: e) -> Result<a, e>
-pub fn option_or_else<a | e>(o: Option<a>, fallback: () -> Option<a> / e) -> Option<a> / e
-pub fn option_unwrap_or_else<a | e>(o: Option<a>, fallback: () -> a / e) -> a / e
-pub fn option_map_or<a, b | e>(o: Option<a>, fallback: b, f: (a) -> b / e) -> b / e
+pub fn option_or_else<a | e>(o: Option<a>, fallback: () -> Option<a> / e) -> Option<a> / e bounded
+pub fn option_unwrap_or_else<a | e>(o: Option<a>, fallback: () -> a / e) -> a / e bounded
+pub fn option_map_or<a, b | e>(o: Option<a>, fallback: b, f: (a) -> b / e) -> b / e bounded
 ```
 
 `Option`'s constructors and `?` are the prelude's; this is the chain a caller reads
@@ -2643,18 +2681,18 @@ of `None` never calls `f`.
 ### 13.27 `std.result`
 
 ```ply
-pub fn result_map<a, b, e | row>(r: Result<a, e>, f: (a) -> b / row) -> Result<b, e> / row
-pub fn result_map_err<a, e, f | row>(r: Result<a, e>, g: (e) -> f / row) -> Result<a, f> / row
-pub fn result_and_then<a, b, e | row>(r: Result<a, e>, f: (a) -> Result<b, e> / row) -> Result<b, e> / row
+pub fn result_map<a, b, e | row>(r: Result<a, e>, f: (a) -> b / row) -> Result<b, e> / row bounded
+pub fn result_map_err<a, e, f | row>(r: Result<a, e>, g: (e) -> f / row) -> Result<a, f> / row bounded
+pub fn result_and_then<a, b, e | row>(r: Result<a, e>, f: (a) -> Result<b, e> / row) -> Result<b, e> / row bounded
 pub fn result_unwrap_or<a, e>(r: Result<a, e>, fallback: a) -> a
 pub fn result_expect<a, e>(r: Result<a, e>, message: String) -> a
 pub fn result_ok<a, e>(r: Result<a, e>) -> Option<a>
 pub fn result_err<a, e>(r: Result<a, e>) -> Option<e>
 pub fn result_is_ok<a, e>(r: Result<a, e>) -> Bool
 pub fn result_is_err<a, e>(r: Result<a, e>) -> Bool
-pub fn result_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> Result<a, e> / row) -> Result<a, e> / row
-pub fn result_unwrap_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> a / row) -> a / row
-pub fn result_map_or<a, b, e | row>(r: Result<a, e>, fallback: b, f: (a) -> b / row) -> b / row
+pub fn result_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> Result<a, e> / row) -> Result<a, e> / row bounded
+pub fn result_unwrap_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> a / row) -> a / row bounded
+pub fn result_map_or<a, b, e | row>(r: Result<a, e>, fallback: b, f: (a) -> b / row) -> b / row bounded
 ```
 
 The same shape over `Ok`/`Err`. `result_map_err` is how a low-level failure
@@ -3564,6 +3602,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0462` | key file that cannot be read, decoded or written |
 | `E0463` | cost law that cannot be measured: not one `Int` size, `law/host`, or a body that performs |
 | `E0464` | cost law whose steps outgrew its bound |
+| `E0465` | an operation a row promises `bounded` that grows with the input |
+| `E0466` | `bounded` outside a definition's own row |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
