@@ -28,7 +28,7 @@ fn until_stopped_accepting(shutdown: &Arc<Shutdown>) {
     }
     assert!(
         shutdown.stopped_accepting(),
-        "the phase machine never reached phase 2"
+        "the shutdown never reached its stop"
     );
 }
 
@@ -299,7 +299,7 @@ fn the_drain_can_still_name_a_listener_it_closed() {
     assert_eq!(
         host.listening_at(),
         vec![wanted],
-        "phase 2 dials after it closes, so the address has to outlive the socket"
+        "the stop dials after it closes, so the address has to outlive the socket"
     );
 }
 

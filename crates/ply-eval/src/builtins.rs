@@ -1608,22 +1608,22 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             let x = args[0].as_float(span, "`round`")?;
             Ok(Value::Float(rounded(x, rounding(&args[1], span, "round")?)))
         }
-        Builtin::Floor => float1(&args[0], span, "`floor`", f64::floor),
-        Builtin::Ceil => float1(&args[0], span, "`ceil`", f64::ceil),
-        Builtin::Sqrt => float1(&args[0], span, "`sqrt`", f64::sqrt),
-        Builtin::Exp => float1(&args[0], span, "`exp`", libm::exp),
-        Builtin::Ln => float1(&args[0], span, "`ln`", libm::log),
-        Builtin::Log2 => float1(&args[0], span, "`log2`", libm::log2),
-        Builtin::Log10 => float1(&args[0], span, "`log10`", libm::log10),
-        Builtin::Sin => float1(&args[0], span, "`sin`", libm::sin),
-        Builtin::Cos => float1(&args[0], span, "`cos`", libm::cos),
-        Builtin::Tan => float1(&args[0], span, "`tan`", libm::tan),
-        Builtin::Asin => float1(&args[0], span, "`asin`", libm::asin),
-        Builtin::Acos => float1(&args[0], span, "`acos`", libm::acos),
-        Builtin::Atan => float1(&args[0], span, "`atan`", libm::atan),
-        Builtin::Pow => float2(args, span, "`pow`", libm::pow),
-        Builtin::Atan2 => float2(args, span, "`atan2`", libm::atan2),
-        Builtin::Hypot => float2(args, span, "`hypot`", libm::hypot),
+        Builtin::Floor => unary_float(&args[0], span, "`floor`", f64::floor),
+        Builtin::Ceil => unary_float(&args[0], span, "`ceil`", f64::ceil),
+        Builtin::Sqrt => unary_float(&args[0], span, "`sqrt`", f64::sqrt),
+        Builtin::Exp => unary_float(&args[0], span, "`exp`", libm::exp),
+        Builtin::Ln => unary_float(&args[0], span, "`ln`", libm::log),
+        Builtin::Log2 => unary_float(&args[0], span, "`log2`", libm::log2),
+        Builtin::Log10 => unary_float(&args[0], span, "`log10`", libm::log10),
+        Builtin::Sin => unary_float(&args[0], span, "`sin`", libm::sin),
+        Builtin::Cos => unary_float(&args[0], span, "`cos`", libm::cos),
+        Builtin::Tan => unary_float(&args[0], span, "`tan`", libm::tan),
+        Builtin::Asin => unary_float(&args[0], span, "`asin`", libm::asin),
+        Builtin::Acos => unary_float(&args[0], span, "`acos`", libm::acos),
+        Builtin::Atan => unary_float(&args[0], span, "`atan`", libm::atan),
+        Builtin::Pow => binary_float(args, span, "`pow`", libm::pow),
+        Builtin::Atan2 => binary_float(args, span, "`atan2`", libm::atan2),
+        Builtin::Hypot => binary_float(args, span, "`hypot`", libm::hypot),
 
         Builtin::StringSlice => {
             let s = args[0].as_str(span, "`string_slice`")?;
@@ -1893,11 +1893,11 @@ fn canonical(x: f64) -> f64 {
     f64::from_bits(if nan { CANONICAL_NAN_BITS } else { bits })
 }
 
-fn float1(x: &Value, span: Span, what: &str, f: fn(f64) -> f64) -> Result<Value, Diagnostic> {
+fn unary_float(x: &Value, span: Span, what: &str, f: fn(f64) -> f64) -> Result<Value, Diagnostic> {
     Ok(Value::Float(canonical(f(x.as_float(span, what)?))))
 }
 
-fn float2(
+fn binary_float(
     args: &[Value],
     span: Span,
     what: &str,
