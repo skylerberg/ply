@@ -1,8 +1,8 @@
 // What each tier claims about the corpus and about claims chosen to sit at its edges, read from the
 // document `ply prove --json` writes: a certificate's rules, a tier, a gap.
 
-import harness (scratch, program, repo, on_disk, json_of, at, path, nth, items, str, int, truth,
-                shown, concatenated, Reached, Repo, Shelf)
+import harness (scratch, program, project, embedded, example_files, on_disk, json_of, at, path, nth,
+                items, str, int, truth, shown, concatenated, Reached, Shelf, Source)
 import std.json
 import std.json (Json, Null, Str, Object, Array, Number)
 import std.string
@@ -18,11 +18,27 @@ fn proved(source: String) -> Json / {Reached, Shelf} = {
 fn proved_here(flags: List<String>) -> Json / {Reached, Shelf} =
   json_of(on_disk(concatenated(["prove", "--no-cache", "--json"], flags)))
 
-// What `ply prove` answers for `relative` under the repository, discharged afresh.
-fn corpus_report(relative: String, flags: List<String>) -> Json / {Reached, Shelf, Repo} =
-  json_of(
-    on_disk(concatenated(["prove", repo() ++ "/" ++ relative, "--no-cache", "--json"], flags)),
-  )
+// The repository's claims and its fixtures at each tier's edge, laid out as the repository lays
+// them out. Embedded, so a report is cached until one of them changes.
+fn checkout() -> List<Source> =
+  concatenated(embedded(example_files(), "examples"), [
+    fixture("refuted_law", embed("../../../tests/fixtures/refuted_law.ply")),
+    fixture("vacuous_law", embed("../../../tests/fixtures/vacuous_law.ply")),
+    fixture(
+      "obligation_not_discharged",
+      embed("../../../tests/fixtures/obligation_not_discharged.ply"),
+    ),
+    fixture("concurrency_law_binder", embed("../../../tests/fixtures/concurrency_law_binder.ply")),
+  ])
+
+fn fixture(name: String, text: Bytes) -> Source =
+  { path: "tests/fixtures/" ++ name ++ ".ply", text: string_of_bytes(text) }
+
+// What `ply prove` answers for `relative` in the checkout, discharged afresh.
+fn corpus_report(relative: String, flags: List<String>) -> Json / {Reached, Shelf} = {
+  project(checkout());
+  json_of(on_disk(concatenated(["prove", relative, "--no-cache", "--json"], flags)))
+}
 
 // The repository's own claims, and fixtures that sit at each tier's edges.
 fn corpus() -> List<String> =
@@ -59,85 +75,91 @@ fn rules(o: Json, tag: String) -> List<Json> =
 fn timeless(report: Json) -> Json =
   match report { Object(m) -> Object(map_insert(m, "duration_ms", Null)), other -> other }
 
-test/nondet "the certificate audit" {
-  let proofs = fold(corpus(), 0, |count: Int, relative: String| {
-    let report = corpus_report(relative, []);
-    let budget = int(path(report, ["plan", "prove_budget"]));
-    assert(budget >= 0, Some("the plan names its budget: " ++ shown(report)));
-    fold(
-      filter(obligations(report), |o: Json| at(o, "certificate") != Null),
-      count,
-      |n: Int, o: Json| {
-        let certificate = at(o, "certificate");
-        let owner = str(at(o, "owner"));
-        assert(
-          truth(at(certificate, "guard_satisfiable")),
-          Some(owner ++ " holds a certificate that did not establish its guard"),
-        );
-        assert(
-          items(at(certificate, "rules")) != [],
-          Some(owner ++ " is proved by no rule at all"),
-        );
-        fold(rules(o, "unfold"), (), |u: Unit, unfolded: Json|
+test "the certificate audit" {
+  scratch(|| {
+    let proofs = fold(corpus(), 0, |count: Int, relative: String| {
+      let report = corpus_report(relative, []);
+      let budget = int(path(report, ["plan", "prove_budget"]));
+      assert(budget >= 0, Some("the plan names its budget: " ++ shown(report)));
+      fold(
+        filter(obligations(report), |o: Json| at(o, "certificate") != Null),
+        count,
+        |n: Int, o: Json| {
+          let certificate = at(o, "certificate");
+          let owner = str(at(o, "owner"));
           assert(
-            int(at(unfolded, "depth")) >= 0 && int(at(unfolded, "depth")) <= unfold_depth(),
-            Some(owner ++ " unfolded past the bound: " ++ shown(unfolded)),
-          ));
-        fold(rules(o, "exhaustive_interleaving"), (), |u: Unit, searched: Json| {
-          assert(
-            int(at(searched, "interleavings")) > 0,
-            Some(owner ++ " is proved by an exhaustive search that ran no interleaving"),
+            truth(at(certificate, "guard_satisfiable")),
+            Some(owner ++ " holds a certificate that did not establish its guard"),
           );
           assert(
-            at(certificate, "sorts") == Array([]),
-            Some(owner ++ " is a proof about one program, so it has no uninterpreted sorts"),
-          )
-        });
-        fold(rules(o, "induction"), (), |u: Unit, inducted: Json|
+            items(at(certificate, "rules")) != [],
+            Some(owner ++ " is proved by no rule at all"),
+          );
+          fold(rules(o, "unfold"), (), |u: Unit, unfolded: Json|
+            assert(
+              int(at(unfolded, "depth")) >= 0 && int(at(unfolded, "depth")) <= unfold_depth(),
+              Some(owner ++ " unfolded past the bound: " ++ shown(unfolded)),
+            ));
+          fold(rules(o, "exhaustive_interleaving"), (), |u: Unit, searched: Json| {
+            assert(
+              int(at(searched, "interleavings")) > 0,
+              Some(owner ++ " is proved by an exhaustive search that ran no interleaving"),
+            );
+            assert(
+              at(certificate, "sorts") == Array([]),
+              Some(owner ++ " is a proof about one program, so it has no uninterpreted sorts"),
+            )
+          });
+          fold(rules(o, "induction"), (), |u: Unit, inducted: Json|
+            assert(
+              len(
+                  filter(rules(o, "unfold"), |unfolded: Json|
+                    at(unfolded, "def") == at(inducted, "def")),
+                )
+                > 0,
+              Some(
+                owner ++ " claims induction over " ++ shown(at(inducted, "def"))
+                  ++ " without unrolling it",
+              ),
+            ));
+          // An enumeration spends a step a point, and anything else at most the prove budget.
+          let walked = fold(rules(o, "exhaustive_enumeration"), 0, |most: Int, e: Json|
+            if int(at(e, "points")) > most { int(at(e, "points")) } else { most });
+          let steps = int(at(certificate, "steps"));
           assert(
-            len(
-                filter(rules(o, "unfold"), |unfolded: Json|
-                  at(unfolded, "def") == at(inducted, "def")),
-              )
-              > 0,
-            Some(
-              owner ++ " claims induction over " ++ shown(at(inducted, "def"))
-                ++ " without unrolling it",
-            ),
-          ));
-        // An enumeration spends a step a point, and anything else at most the prove budget.
-        let walked = fold(rules(o, "exhaustive_enumeration"), 0, |most: Int, e: Json|
-          if int(at(e, "points")) > most { int(at(e, "points")) } else { most });
-        let steps = int(at(certificate, "steps"));
-        assert(
-          steps >= 0 && steps <= (if budget > walked { budget } else { walked }),
-          Some(owner ++ " spent " ++ int_to_string(steps) ++ " steps"),
-        );
-        n + 1
-      },
-    )
-  });
-  assert(proofs >= 10, Some("the corpus produced only " ++ int_to_string(proofs) ++ " proofs"))
+            steps >= 0 && steps <= (if budget > walked { budget } else { walked }),
+            Some(owner ++ " spent " ++ int_to_string(steps) ++ " steps"),
+          );
+          n + 1
+        },
+      )
+    });
+    assert(proofs >= 10, Some("the corpus produced only " ++ int_to_string(proofs) ++ " proofs"))
+  })
 }
 
 // A run is a function of the program and the plan: the worker pool decides nothing, and a
 // refutation shrinks to the same value every time.
-test/nondet "two runs over one corpus agree" {
-  fold(corpus(), (), |u: Unit, relative: String|
-    assert(
-      timeless(corpus_report(relative, ["--jobs", "1"]))
-        == timeless(corpus_report(relative, ["--jobs", "4"])),
-      Some("in " ++ relative),
-    ))
+test "two runs over one corpus agree" {
+  scratch(|| {
+    fold(corpus(), (), |u: Unit, relative: String|
+      assert(
+        timeless(corpus_report(relative, ["--jobs", "1"]))
+          == timeless(corpus_report(relative, ["--jobs", "4"])),
+        Some("in " ++ relative),
+      ))
+  })
 }
 
-test/nondet "a refutation names the value it shrank to" {
-  let o = obligation(
-    corpus_report("tests/fixtures/refuted_law.ply", []),
-    "settling a day's payments drops nothing",
-  );
-  assert(outcome(o) == "refuted", Some("the fixture exists to be refuted: " ++ shown(o)));
-  assert(items(path(o, ["counterexample", "bindings"])) != [], Some(shown(o)))
+test "a refutation names the value it shrank to" {
+  scratch(|| {
+    let o = obligation(
+      corpus_report("tests/fixtures/refuted_law.ply", []),
+      "settling a day's payments drops nothing",
+    );
+    assert(outcome(o) == "refuted", Some("the fixture exists to be refuted: " ++ shown(o)));
+    assert(items(path(o, ["counterexample", "bindings"])) != [], Some(shown(o)))
+  })
 }
 
 test "a finite domain is proved by covering it" {
@@ -294,43 +316,49 @@ test "a spent budget reports the weaker tier" {
   })
 }
 
-test/nondet "an unsatisfiable guard is vacuous rather than proved" {
-  let report = corpus_report("tests/fixtures/vacuous_law.ply", []);
-  assert(obligations(report) != [], Some(shown(report)));
-  fold(obligations(report), (), |u: Unit, o: Json| {
-    assert(outcome(o) == "vacuous", Some(shown(o)));
-    assert(at(o, "tier") == Null, Some(shown(o)))
+test "an unsatisfiable guard is vacuous rather than proved" {
+  scratch(|| {
+    let report = corpus_report("tests/fixtures/vacuous_law.ply", []);
+    assert(obligations(report) != [], Some(shown(report)));
+    fold(obligations(report), (), |u: Unit, o: Json| {
+      assert(outcome(o) == "vacuous", Some(shown(o)));
+      assert(at(o, "tier") == Null, Some(shown(o)))
+    })
   })
 }
 
 // Checking an `ensures` means calling the definition, and one that performs needs a handler nothing
 // supplies; a spec that raises is not false, so it is neither a refutation nor a hold.
-test/nondet "a gap is reported as one and carries no tier" {
-  let report = corpus_report("tests/fixtures/obligation_not_discharged.ply", []);
-  let recorded = obligation(report, "recorded");
-  assert(outcome(recorded) == "unattempted", Some(shown(recorded)));
-  assert(string_contains(str(at(recorded, "gap")), "no handler"), Some(shown(recorded)));
-  let share = obligation(report, "share");
-  assert(outcome(share) == "unattempted", Some(shown(share)));
-  assert(
-    string_starts_with(str(at(share, "gap")), "raised: ")
-      && string_contains(str(at(share, "gap")), "division by zero"),
-    Some(shown(share)),
-  );
-  assert(at(recorded, "tier") == Null && at(share, "tier") == Null, Some(shown(report)))
+test "a gap is reported as one and carries no tier" {
+  scratch(|| {
+    let report = corpus_report("tests/fixtures/obligation_not_discharged.ply", []);
+    let recorded = obligation(report, "recorded");
+    assert(outcome(recorded) == "unattempted", Some(shown(recorded)));
+    assert(string_contains(str(at(recorded, "gap")), "no handler"), Some(shown(recorded)));
+    let share = obligation(report, "share");
+    assert(outcome(share) == "unattempted", Some(shown(share)));
+    assert(
+      string_starts_with(str(at(share, "gap")), "raised: ")
+        && string_contains(str(at(share, "gap")), "division by zero"),
+      Some(shown(share)),
+    );
+    assert(at(recorded, "tier") == Null && at(share, "tier") == Null, Some(shown(report)))
+  })
 }
 
-test/nondet "a ground concurrency law whose search is exhaustive is proved" {
-  let label = "no interleaving of two guarded settlements";
-  let o = obligation(corpus_report("examples", ["--filter", label]), label);
-  assert(tier(o) == "proved", Some(shown(o)));
-  assert(
-    rules(o, "exhaustive_interleaving") != [],
-    Some("an execution-derived proof names the rule that says so: " ++ shown(o)),
-  );
-  // One interleaving is one concrete case, which is not a coverage claim at all.
-  let once = corpus_report("examples", ["--filter", label, "--seed", "7"]);
-  assert(tier(obligation(once, label)) == "example", Some(shown(once)))
+test "a ground concurrency law whose search is exhaustive is proved" {
+  scratch(|| {
+    let label = "no interleaving of two guarded settlements";
+    let o = obligation(corpus_report("examples", ["--filter", label]), label);
+    assert(tier(o) == "proved", Some(shown(o)));
+    assert(
+      rules(o, "exhaustive_interleaving") != [],
+      Some("an execution-derived proof names the rule that says so: " ++ shown(o)),
+    );
+    // One interleaving is one concrete case, which is not a coverage claim at all.
+    let once = corpus_report("examples", ["--filter", label, "--seed", "7"]);
+    assert(tier(obligation(once, label)) == "example", Some(shown(once)))
+  })
 }
 
 test "a precondition alone is not an obligation" {
@@ -345,20 +373,23 @@ test "a precondition alone is not an obligation" {
   })
 }
 
-test/nondet "each postcondition is discharged at its own tier" {
-  let report = corpus_report("examples/ledger.ply", []);
-  let tiers = map(
-    filter(obligations(report), |o: Json|
-      string_ends_with(str(at(o, "owner")), "ledger.transfer") && str(at(o, "kind")) == "ensures"),
-    tier,
-  );
-  assert(
-    tiers == ["proved", "proved", "property"],
-    Some(
-      "one clause per obligation, or the pair would share the weaker label: "
-        ++ string::join(tiers, ", "),
-    ),
-  )
+test "each postcondition is discharged at its own tier" {
+  scratch(|| {
+    let report = corpus_report("examples/ledger.ply", []);
+    let tiers = map(
+      filter(obligations(report), |o: Json|
+        string_ends_with(str(at(o, "owner")), "ledger.transfer")
+          && str(at(o, "kind")) == "ensures"),
+      tier,
+    );
+    assert(
+      tiers == ["proved", "proved", "property"],
+      Some(
+        "one clause per obligation, or the pair would share the weaker label: "
+          ++ string::join(tiers, ", "),
+      ),
+    )
+  })
 }
 
 test "a total index is proved where a raising one is a gap" {
