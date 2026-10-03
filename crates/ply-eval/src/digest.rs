@@ -47,7 +47,7 @@ fn write(h: &mut blake3::Hasher, v: &Value, span: Span) -> Result<(), Diagnostic
             }
         }
         Value::Map(m) => {
-            count(h, 11, m.size());
+            count(h, 11, m.len());
             for (k, x) in m.iter() {
                 grow(|| write(h, k, span))?;
                 grow(|| write(h, x, span))?;
