@@ -105,32 +105,37 @@ pub fn mem_empty() -> MemFs =
 
 // A tree seeded with files, every parent directory created along the way.
 pub fn mem_of(files: List<{ path: String, body: Bytes }>) -> MemFs / {abort.raise} =
-  fold(files, mem_empty(), |f: MemFs, entry: { path: String, body: Bytes }|
-    mem_write(mem_create_dir(f, parent_of(entry.path)).fs, entry.path, entry.body).fs)
+  fold(files, mem_empty(), |tree: MemFs, entry: { path: String, body: Bytes }|
+    mem_write(mem_create_dir(tree, parent_of(entry.path)).fs, entry.path, entry.body).fs)
 
 // The lexical half of the host's confinement check.
 pub fn mem_confined(path: String) -> Bool / {abort.raise} =
   !string_starts_with(path, "/") && len(filter(string_split(path, "/"), |s: String| s == "..")) == 0
 
-pub fn mem_read(f: MemFs, path: String) -> Option<Bytes> / {abort.raise} = {
-  let key = key_of(f, path, true)?;
-  if readable(f, key) { map_get(f.files, key) } else { None }
+pub fn mem_read(tree: MemFs, path: String) -> Option<Bytes> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  if readable(tree, key) { map_get(tree.files, key) } else { None }
 }
 
 pub fn mem_exists(f: MemFs, path: String) -> Bool / {abort.raise} =
   match key_of(f, path, false) { Some(key) -> kind_at(f, key) != Missing, None -> false }
 
 // A size is the inode's, so no permission is needed to read it.
-pub fn mem_size(f: MemFs, path: String) -> Option<Int> / {abort.raise} = {
-  let key = key_of(f, path, true)?;
-  let body = map_get(f.files, key)?;
+pub fn mem_size(tree: MemFs, path: String) -> Option<Int> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  let body = map_get(tree.files, key)?;
   Some(bytes_len(body))
 }
 
 // What is there, which may be less than was asked for: a file can end before the range does, and
 // a caller that wanted all of it compares the answer's length with the one it asked for.
-pub fn mem_read_at(f: MemFs, path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} = {
-  let body = mem_read(f, path)?;
+pub fn mem_read_at(
+  tree: MemFs,
+  path: String,
+  offset: Int,
+  len: Int,
+) -> Option<Bytes> / {abort.raise} = {
+  let body = mem_read(tree, path)?;
   let size = bytes_len(body);
   let start = at_most(offset, size);
   Some(bytes_slice(body, start, at_most(start + len, size)))
@@ -139,14 +144,14 @@ pub fn mem_read_at(f: MemFs, path: String, offset: Int, len: Int) -> Option<Byte
 fn at_most(n: Int, hi: Int) -> Int = if n > hi { hi } else { n }
 
 // A directory's stamp is its creation, a file's its last write.
-pub fn mem_modified(f: MemFs, path: String) -> Option<Int> / {abort.raise} = {
-  let key = key_of(f, path, true)?;
-  match map_get(f.modified, key) { Some(at) -> Some(at), None -> map_get(f.dirs, key) }
+pub fn mem_modified(tree: MemFs, path: String) -> Option<Int> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  match map_get(tree.modified, key) { Some(at) -> Some(at), None -> map_get(tree.dirs, key) }
 }
 
-pub fn mem_resolved(f: MemFs, path: String) -> Kind / {abort.raise} =
-  match key_of(f, path, true) {
-    Some(key) -> match kind_at(f, key) { Symlink -> Missing, k -> k },
+pub fn mem_resolved(tree: MemFs, path: String) -> Kind / {abort.raise} =
+  match key_of(tree, path, true) {
+    Some(key) -> match kind_at(tree, key) { Symlink -> Missing, k -> k },
     None -> Missing,
   }
 
@@ -154,86 +159,91 @@ pub fn mem_kind(f: MemFs, path: String) -> Kind / {abort.raise} =
   match key_of(f, path, false) { Some(key) -> kind_at(f, key), None -> Missing }
 
 // One directory, never its subtree, ascending so the order is a fact about the contents.
-pub fn mem_list(f: MemFs, path: String) -> Option<List<String>> / {abort.raise} = {
-  let key = key_of(f, path, true)?;
-  if kind_at(f, key) != Dir || !readable(f, key) { None } else { Some(names_in(f, key)) }
+pub fn mem_list(tree: MemFs, path: String) -> Option<List<String>> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  if kind_at(tree, key) != Dir || !readable(tree, key) { None } else { Some(names_in(tree, key)) }
 }
 
 // Depth first, each directory's names ascending, a link listed and never followed.
-pub fn mem_walk(f: MemFs, path: String) -> Option<List<Entry>> / {abort.raise} = {
-  let key = key_of(f, path, true)?;
-  if kind_at(f, key) != Dir { None } else { Some(walked(f, key, normal(path), [])) }
+pub fn mem_walk(tree: MemFs, path: String) -> Option<List<Entry>> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  if kind_at(tree, key) != Dir { None } else { Some(walked(tree, key, normal(path), [])) }
 }
 
-fn walked(f: MemFs, key: String, named: String, acc: List<Entry>) -> List<Entry> / {abort.raise} =
-  if !readable(f, key) { acc } else {
-    fold(names_in(f, key), acc, |out: List<Entry>, name: String| {
+fn walked(
+  tree: MemFs,
+  key: String,
+  named: String,
+  acc: List<Entry>,
+) -> List<Entry> / {abort.raise} =
+  if !readable(tree, key) { acc } else {
+    fold(names_in(tree, key), acc, |out: List<Entry>, name: String| {
       let child = under(key, name);
       let shown = under(named, name);
-      let kind = kind_at(f, child);
+      let kind = kind_at(tree, child);
       let listed = push(out, { path: shown, kind: kind });
-      if kind == Dir { walked(f, child, shown, listed) } else { listed }
+      if kind == Dir { walked(tree, child, shown, listed) } else { listed }
     })
   }
 
 // `false` when the parent is missing, a directory occupies the path, or the path leaves the root.
-pub fn mem_write(f: MemFs, path: String, body: Bytes) -> Written / {abort.raise} =
-  match key_of(f, path, true) {
-    Some(key) -> if writes_file(f, key) {
+pub fn mem_write(tree: MemFs, path: String, body: Bytes) -> Written / {abort.raise} =
+  match key_of(tree, path, true) {
+    Some(key) -> if writes_file(tree, key) {
       {
         fs: {
-          ..f,
-          files: map_insert(f.files, key, body),
-          modified: map_insert(f.modified, key, f.clock),
-          clock: f.clock + 1,
+          ..tree,
+          files: map_insert(tree.files, key, body),
+          modified: map_insert(tree.modified, key, tree.clock),
+          clock: tree.clock + 1,
         },
         ok: true,
       }
-    } else { { fs: f, ok: false } },
-    None -> { fs: f, ok: false },
+    } else { { fs: tree, ok: false } },
+    None -> { fs: tree, ok: false },
   }
 
 // Costs what is new rather than what is there, and creates the file, so a log's first frame needs
 // no write before it. `None` is what `mem_write` refuses for, and the offset is where it landed.
-pub fn mem_append(f: MemFs, path: String, body: Bytes) -> Appended / {abort.raise} =
-  match key_of(f, path, true) {
-    Some(key) -> if writes_file(f, key) {
-      let had = match map_get(f.files, key) { Some(b) -> b, None -> b"" };
+pub fn mem_append(tree: MemFs, path: String, body: Bytes) -> Appended / {abort.raise} =
+  match key_of(tree, path, true) {
+    Some(key) -> if writes_file(tree, key) {
+      let had = match map_get(tree.files, key) { Some(b) -> b, None -> b"" };
       {
         fs: {
-          ..f,
-          files: map_insert(f.files, key, bytes_concat(had, body)),
-          modified: map_insert(f.modified, key, f.clock),
-          clock: f.clock + 1,
+          ..tree,
+          files: map_insert(tree.files, key, bytes_concat(had, body)),
+          modified: map_insert(tree.modified, key, tree.clock),
+          clock: tree.clock + 1,
         },
         at: Some(bytes_len(had)),
       }
-    } else { { fs: f, at: None } },
-    None -> { fs: f, at: None },
+    } else { { fs: tree, at: None } },
+    None -> { fs: tree, at: None },
   }
 
 // A file's bytes and mode, over whatever file the destination held; never a directory.
-pub fn mem_copy(f: MemFs, from: String, to: String) -> Written / {abort.raise} =
-  match key_of(f, from, true) {
-    Some(src) -> match key_of(f, to, true) {
-      Some(dst) -> match map_get(f.files, src) {
-        Some(body) -> if readable(f, src) && writes_file(f, dst) {
+pub fn mem_copy(tree: MemFs, from: String, to: String) -> Written / {abort.raise} =
+  match key_of(tree, from, true) {
+    Some(src) -> match key_of(tree, to, true) {
+      Some(dst) -> match map_get(tree.files, src) {
+        Some(body) -> if readable(tree, src) && writes_file(tree, dst) {
           {
             fs: {
-              ..f,
-              files: map_insert(f.files, dst, body),
-              modes: map_insert(f.modes, dst, mode_at(f, src)),
-              modified: map_insert(f.modified, dst, f.clock),
-              clock: f.clock + 1,
+              ..tree,
+              files: map_insert(tree.files, dst, body),
+              modes: map_insert(tree.modes, dst, mode_at(tree, src)),
+              modified: map_insert(tree.modified, dst, tree.clock),
+              clock: tree.clock + 1,
             },
             ok: true,
           }
-        } else { { fs: f, ok: false } },
-        None -> { fs: f, ok: false },
+        } else { { fs: tree, ok: false } },
+        None -> { fs: tree, ok: false },
       },
-      None -> { fs: f, ok: false },
+      None -> { fs: tree, ok: false },
     },
-    None -> { fs: f, ok: false },
+    None -> { fs: tree, ok: false },
   }
 
 // Nothing in a tree was ever on a disk, so a sync only answers whether the path names something.
@@ -242,10 +252,10 @@ pub fn mem_sync(f: MemFs, path: String) -> Bool / {abort.raise} =
 
 // The directory and every missing ancestor, as the host's `create_dir` does; nothing is made when
 // one of them cannot be.
-pub fn mem_create_dir(f: MemFs, path: String) -> Written / {abort.raise} =
-  match key_of(f, path, true) {
+pub fn mem_create_dir(tree: MemFs, path: String) -> Written / {abort.raise} =
+  match key_of(tree, path, true) {
     Some(key) -> {
-      let made = fold(ancestors(key), { fs: f, ok: true }, |w: Written, dir: String|
+      let made = fold(ancestors(key), { fs: tree, ok: true }, |w: Written, dir: String|
         if !w.ok { w } else {
           match kind_at(w.fs, dir) {
             Dir -> w,
@@ -258,40 +268,39 @@ pub fn mem_create_dir(f: MemFs, path: String) -> Written / {abort.raise} =
             _ -> { fs: w.fs, ok: false },
           }
         });
-      if made.ok { made } else { { fs: f, ok: false } }
+      if made.ok { made } else { { fs: tree, ok: false } }
     },
-    None -> { fs: f, ok: false },
+    None -> { fs: tree, ok: false },
   }
 
 // Named from `prefix` and the tree's clock, so a test can say what it will be called.
-pub fn mem_temp_dir(f: MemFs, dir: String, prefix: String) -> Made / {abort.raise} =
-  match key_of(f, dir, true) {
-    Some(key) -> if string_contains(prefix, "/") || kind_at(f, key) != Dir || !writable(f, key) {
-      { fs: f, path: None }
-    } else {
-      let free = iterate(f.clock, len(all_keys(f)) + 2, |c: Int|
-        if kind_at(f, under(key, prefix ++ int_to_string(c))) == Missing { Stop(c) }
+pub fn mem_temp_dir(tree: MemFs, dir: String, prefix: String) -> Made / {abort.raise} =
+  match key_of(tree, dir, true) {
+    Some(key) -> if string_contains(prefix, "/") || kind_at(tree, key) != Dir
+        || !writable(tree, key) { { fs: tree, path: None } } else {
+      let free = iterate(tree.clock, len(all_keys(tree)) + 2, |c: Int|
+        if kind_at(tree, under(key, prefix ++ int_to_string(c))) == Missing { Stop(c) }
         else { Continue(c + 1) });
       let name = prefix ++ int_to_string(free);
-      let made = mem_create_dir({ ..f, clock: free }, under(key, name));
+      let made = mem_create_dir({ ..tree, clock: free }, under(key, name));
       if made.ok { { fs: made.fs, path: Some(under(normal(dir), name)) } }
-      else { { fs: f, path: None } }
+      else { { fs: tree, path: None } }
     },
-    None -> { fs: f, path: None },
+    None -> { fs: tree, path: None },
   }
 
 // One file, one link, or one empty directory.
-pub fn mem_remove(f: MemFs, path: String) -> Written / {abort.raise} =
-  match key_of(f, path, false) {
-    Some(key) -> if key == "" || !writable(f, parent_of(key)) { { fs: f, ok: false } } else {
-      match kind_at(f, key) {
-        Dir -> if len(names_in(f, key)) > 0 { { fs: f, ok: false } }
-        else { { fs: dropped(f, key), ok: true } },
-        Missing -> { fs: f, ok: false },
-        _ -> { fs: dropped(f, key), ok: true },
+pub fn mem_remove(tree: MemFs, path: String) -> Written / {abort.raise} =
+  match key_of(tree, path, false) {
+    Some(key) -> if key == "" || !writable(tree, parent_of(key)) { { fs: tree, ok: false } } else {
+      match kind_at(tree, key) {
+        Dir -> if len(names_in(tree, key)) > 0 { { fs: tree, ok: false } }
+        else { { fs: dropped(tree, key), ok: true } },
+        Missing -> { fs: tree, ok: false },
+        _ -> { fs: dropped(tree, key), ok: true },
       }
     },
-    None -> { fs: f, ok: false },
+    None -> { fs: tree, ok: false },
   }
 
 // A link as itself, or a directory with everything under it; never the root.
@@ -311,23 +320,23 @@ pub fn mem_remove_tree(f: MemFs, path: String) -> Written / {abort.raise} =
 
 // A move within one root, which is what makes a cache write atomic: a file or a link over a file
 // or a link, or a directory to where nothing is and never into itself.
-pub fn mem_rename(f: MemFs, from: String, to: String) -> Written / {abort.raise} =
-  match key_of(f, from, false) {
-    Some(src) -> match key_of(f, to, false) {
-      Some(dst) -> if src == dst && kind_at(f, src) != Missing { { fs: f, ok: true } }
-      else if movable(f, src, dst) { { fs: moved(f, src, dst), ok: true } }
-      else { { fs: f, ok: false } },
-      None -> { fs: f, ok: false },
+pub fn mem_rename(tree: MemFs, from: String, to: String) -> Written / {abort.raise} =
+  match key_of(tree, from, false) {
+    Some(src) -> match key_of(tree, to, false) {
+      Some(dst) -> if src == dst && kind_at(tree, src) != Missing { { fs: tree, ok: true } }
+      else if movable(tree, src, dst) { { fs: moved(tree, src, dst), ok: true } }
+      else { { fs: tree, ok: false } },
+      None -> { fs: tree, ok: false },
     },
-    None -> { fs: f, ok: false },
+    None -> { fs: tree, ok: false },
   }
 
-fn movable(f: MemFs, src: String, dst: String) -> Bool / {abort.raise} = {
-  let from = kind_at(f, src);
-  let to = kind_at(f, dst);
-  src != "" && dst != "" && from != Missing && kind_at(f, parent_of(dst)) == Dir
-    && writable(f, parent_of(src))
-    && writable(f, parent_of(dst))
+fn movable(tree: MemFs, src: String, dst: String) -> Bool / {abort.raise} = {
+  let from = kind_at(tree, src);
+  let to = kind_at(tree, dst);
+  src != "" && dst != "" && from != Missing && kind_at(tree, parent_of(dst)) == Dir
+    && writable(tree, parent_of(src))
+    && writable(tree, parent_of(dst))
     && !string_starts_with(dst ++ "/", src ++ "/")
     && (to == Missing || (from != Dir && to != Dir))
 }
@@ -343,85 +352,85 @@ fn moved(f: MemFs, src: String, dst: String) -> MemFs / {abort.raise} = {
 }
 
 // The lock is the file's existence, so a second taker finds it there and gets `false`.
-pub fn mem_lock(f: MemFs, path: String) -> Written / {abort.raise} =
-  match key_of(f, path, false) {
-    Some(key) -> if kind_at(f, key) == Missing && placeable(f, key) {
+pub fn mem_lock(tree: MemFs, path: String) -> Written / {abort.raise} =
+  match key_of(tree, path, false) {
+    Some(key) -> if kind_at(tree, key) == Missing && placeable(tree, key) {
       {
         fs: {
-          ..f,
-          files: map_insert(f.files, key, b""),
-          modified: map_insert(f.modified, key, f.clock),
-          locks: map_insert(f.locks, key, f.clock),
-          clock: f.clock + 1,
+          ..tree,
+          files: map_insert(tree.files, key, b""),
+          modified: map_insert(tree.modified, key, tree.clock),
+          locks: map_insert(tree.locks, key, tree.clock),
+          clock: tree.clock + 1,
         },
         ok: true,
       }
-    } else { { fs: f, ok: false } },
-    None -> { fs: f, ok: false },
+    } else { { fs: tree, ok: false } },
+    None -> { fs: tree, ok: false },
   }
 
 // Only what this tree took: a lock left behind by another holder is broken by removing its file.
-pub fn mem_unlock(f: MemFs, path: String) -> Written / {abort.raise} =
-  match key_of(f, path, false) {
-    Some(key) -> if map_contains(f.locks, key) {
+pub fn mem_unlock(tree: MemFs, path: String) -> Written / {abort.raise} =
+  match key_of(tree, path, false) {
+    Some(key) -> if map_contains(tree.locks, key) {
       {
         fs: {
-          ..f,
-          files: map_remove(f.files, key),
-          modified: map_remove(f.modified, key),
-          locks: map_remove(f.locks, key),
+          ..tree,
+          files: map_remove(tree.files, key),
+          modified: map_remove(tree.modified, key),
+          locks: map_remove(tree.locks, key),
         },
         ok: true,
       }
-    } else { { fs: f, ok: false } },
-    None -> { fs: f, ok: false },
+    } else { { fs: tree, ok: false } },
+    None -> { fs: tree, ok: false },
   }
 
 // `at` is the absolute path the tree stands for, which a twin has no disk to say.
-pub fn mem_canonical(f: MemFs, at: String, path: String) -> Option<String> / {abort.raise} = {
-  let key = key_of(f, path, true)?;
-  if kind_at(f, key) == Missing { None }
+pub fn mem_canonical(tree: MemFs, at: String, path: String) -> Option<String> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  if kind_at(tree, key) == Missing { None }
   else if key == "" { Some(at) }
   else { Some(at ++ "/" ++ key) }
 }
 
-pub fn mem_mode(f: MemFs, path: String) -> Option<Mode> / {abort.raise} = {
-  let key = key_of(f, path, true)?;
-  if kind_at(f, key) == Missing { None } else { Some(mode_at(f, key)) }
+pub fn mem_mode(tree: MemFs, path: String) -> Option<Mode> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  if kind_at(tree, key) == Missing { None } else { Some(mode_at(tree, key)) }
 }
 
-pub fn mem_set_mode(f: MemFs, path: String, mode: Mode) -> Written / {abort.raise} =
-  match key_of(f, path, true) {
-    Some(key) -> if kind_at(f, key) == Missing { { fs: f, ok: false } }
-    else { { fs: { ..f, modes: map_insert(f.modes, key, mode) }, ok: true } },
-    None -> { fs: f, ok: false },
+pub fn mem_set_mode(tree: MemFs, path: String, mode: Mode) -> Written / {abort.raise} =
+  match key_of(tree, path, true) {
+    Some(key) -> if kind_at(tree, key) == Missing { { fs: tree, ok: false } }
+    else { { fs: { ..tree, modes: map_insert(tree.modes, key, mode) }, ok: true } },
+    None -> { fs: tree, ok: false },
   }
 
 // A target that names its own root or climbs out of the tree is refused, as the host refuses it.
-pub fn mem_symlink(f: MemFs, path: String, target: String) -> Written / {abort.raise} =
-  match key_of(f, path, false) {
+pub fn mem_symlink(tree: MemFs, path: String, target: String) -> Written / {abort.raise} =
+  match key_of(tree, path, false) {
     Some(key) -> match lexical(segments(parent_of(key)), target) {
-      Some(_) -> if target != "" && kind_at(f, key) == Missing && placeable(f, key) {
-        { fs: { ..f, links: map_insert(f.links, key, target) }, ok: true }
-      } else { { fs: f, ok: false } },
-      None -> { fs: f, ok: false },
+      Some(_) -> if target != "" && kind_at(tree, key) == Missing && placeable(tree, key) {
+        { fs: { ..tree, links: map_insert(tree.links, key, target) }, ok: true }
+      } else { { fs: tree, ok: false } },
+      None -> { fs: tree, ok: false },
     },
-    None -> { fs: f, ok: false },
+    None -> { fs: tree, ok: false },
   }
 
-pub fn mem_read_link(f: MemFs, path: String) -> Option<String> / {abort.raise} = {
-  let key = key_of(f, path, false)?;
-  map_get(f.links, key)
+pub fn mem_read_link(tree: MemFs, path: String) -> Option<String> / {abort.raise} = {
+  let key = key_of(tree, path, false)?;
+  map_get(tree.links, key)
 }
 
 // A time before the epoch panics, as the host refuses one.
-pub fn mem_set_modified(f: MemFs, path: String, ms: Int) -> Written / {abort.raise} =
+pub fn mem_set_modified(tree: MemFs, path: String, ms: Int) -> Written / {abort.raise} =
   if ms < 0 { panic("a modification time is milliseconds since the Unix epoch, never before it") }
   else {
-    match key_of(f, path, true) {
-      Some(key) -> if kind_at(f, key) == Missing { { fs: f, ok: false } }
-      else { { fs: { ..f, modified: map_insert(f.modified, key, ms) }, ok: true } },
-      None -> { fs: f, ok: false },
+    match key_of(tree, path, true) {
+      Some(key) -> if kind_at(tree, key) == Missing { { fs: tree, ok: false } }
+      else { { fs: { ..tree, modified: map_insert(tree.modified, key, ms) }, ok: true } },
+      None -> { fs: tree, ok: false },
     }
   }
 
@@ -487,20 +496,25 @@ fn link_hops() -> Int = 40
 
 // The key a path names with every link along it followed, the last one too when `last` is set;
 // `None` for a loop, or a path or link that leaves the tree.
-fn key_of(f: MemFs, path: String, last: Bool) -> Option<String> / {abort.raise} =
-  if mem_confined(path) { followed(f, segments(path), last, 0) } else { None }
+fn key_of(tree: MemFs, path: String, last: Bool) -> Option<String> / {abort.raise} =
+  if mem_confined(path) { followed(tree, segments(path), last, 0) } else { None }
 
-fn followed(f: MemFs, segs: List<String>, last: Bool, hops: Int) -> Option<String> / {abort.raise} = {
+fn followed(
+  tree: MemFs,
+  segs: List<String>,
+  last: Bool,
+  hops: Int,
+) -> Option<String> / {abort.raise} = {
   let n = len(segs);
   let hit = fold(range(0, n), -1, |found: Int, i: Int|
     if found >= 0 { found }
-    else if (i < n - 1 || last) && map_contains(f.links, joined(prefix(segs, i + 1))) { i }
+    else if (i < n - 1 || last) && map_contains(tree.links, joined(prefix(segs, i + 1))) { i }
     else { -1 });
   if hit < 0 { Some(joined(segs)) }
   else if hops >= link_hops() { None } else {
-    let target = map_get(f.links, joined(prefix(segs, hit + 1)))?;
+    let target = map_get(tree.links, joined(prefix(segs, hit + 1)))?;
     let base = lexical(prefix(segs, hit), target)?;
-    followed(f, concatenated(base, suffix(segs, hit + 1)), last, hops + 1)
+    followed(tree, concatenated(base, suffix(segs, hit + 1)), last, hops + 1)
   }
 }
 
@@ -516,10 +530,10 @@ fn lexical(at: List<String>, target: String) -> Option<List<String>> / {abort.ra
       })
   }
 
-fn kind_at(f: MemFs, key: String) -> Kind =
-  if key == "" || map_contains(f.dirs, key) { Dir }
-  else if map_contains(f.files, key) { File }
-  else if map_contains(f.links, key) { Symlink }
+fn kind_at(tree: MemFs, key: String) -> Kind =
+  if key == "" || map_contains(tree.dirs, key) { Dir }
+  else if map_contains(tree.files, key) { File }
+  else if map_contains(tree.links, key) { Symlink }
   else { Missing }
 
 fn access(read: Bool, write: Bool, execute: Bool) -> Access =
@@ -542,42 +556,46 @@ fn fresh_mode(k: Kind) -> Mode =
       },
   }
 
-fn mode_at(f: MemFs, key: String) -> Mode =
-  match map_get(f.modes, key) { Some(m) -> m, None -> fresh_mode(kind_at(f, key)) }
+fn mode_at(tree: MemFs, key: String) -> Mode =
+  match map_get(tree.modes, key) { Some(m) -> m, None -> fresh_mode(kind_at(tree, key)) }
 
 // The twin is its files' owner, so the owner's bits are the ones it is held to.
-fn readable(f: MemFs, key: String) -> Bool = mode_at(f, key).owner.read
+fn readable(tree: MemFs, key: String) -> Bool = mode_at(tree, key).owner.read
 
-fn writable(f: MemFs, key: String) -> Bool = mode_at(f, key).owner.write
+fn writable(tree: MemFs, key: String) -> Bool = mode_at(tree, key).owner.write
 
 // A new entry needs its directory there and writable.
-fn placeable(f: MemFs, key: String) -> Bool / {abort.raise} =
-  key != "" && kind_at(f, parent_of(key)) == Dir && writable(f, parent_of(key))
+fn placeable(tree: MemFs, key: String) -> Bool / {abort.raise} =
+  key != "" && kind_at(tree, parent_of(key)) == Dir && writable(tree, parent_of(key))
 
 // A file there the tree may write, or a new one its directory may take.
-fn writes_file(f: MemFs, key: String) -> Bool / {abort.raise} =
-  match kind_at(f, key) { File -> writable(f, key), Missing -> placeable(f, key), _ -> false }
-
-// Every trace of one key but a lock, which is released rather than removed.
-fn dropped(f: MemFs, key: String) -> MemFs =
-  {
-    ..f,
-    files: map_remove(f.files, key),
-    dirs: map_remove(f.dirs, key),
-    links: map_remove(f.links, key),
-    modes: map_remove(f.modes, key),
-    modified: map_remove(f.modified, key),
+fn writes_file(tree: MemFs, key: String) -> Bool / {abort.raise} =
+  match kind_at(tree, key) {
+    File -> writable(tree, key),
+    Missing -> placeable(tree, key),
+    _ -> false,
   }
 
-fn rekeyed(f: MemFs, from: String, to: String) -> MemFs =
+// Every trace of one key but a lock, which is released rather than removed.
+fn dropped(tree: MemFs, key: String) -> MemFs =
   {
-    ..f,
-    files: moved_key(f.files, from, to),
-    dirs: moved_key(f.dirs, from, to),
-    links: moved_key(f.links, from, to),
-    modes: moved_key(f.modes, from, to),
-    modified: moved_key(f.modified, from, to),
-    locks: moved_key(f.locks, from, to),
+    ..tree,
+    files: map_remove(tree.files, key),
+    dirs: map_remove(tree.dirs, key),
+    links: map_remove(tree.links, key),
+    modes: map_remove(tree.modes, key),
+    modified: map_remove(tree.modified, key),
+  }
+
+fn rekeyed(tree: MemFs, from: String, to: String) -> MemFs =
+  {
+    ..tree,
+    files: moved_key(tree.files, from, to),
+    dirs: moved_key(tree.dirs, from, to),
+    links: moved_key(tree.links, from, to),
+    modes: moved_key(tree.modes, from, to),
+    modified: moved_key(tree.modified, from, to),
+    locks: moved_key(tree.locks, from, to),
   }
 
 fn moved_key<v>(m: Map<String, v>, from: String, to: String) -> Map<String, v> =
@@ -621,13 +639,13 @@ fn parent_of(p: String) -> String / {abort.raise} = {
 fn base_of(p: String) -> String / {abort.raise} =
   match list_at(segments(p), len(segments(p)) - 1) { Some(name) -> name, None -> "" }
 
-fn all_keys(f: MemFs) -> List<String> =
-  concatenated(concatenated(map_keys(f.files), map_keys(f.dirs)), map_keys(f.links))
+fn all_keys(tree: MemFs) -> List<String> =
+  concatenated(concatenated(map_keys(tree.files), map_keys(tree.dirs)), map_keys(tree.links))
 
 // One directory's names, ascending, so the order is a fact about the contents.
-fn names_in(f: MemFs, dir: String) -> List<String> / {abort.raise} =
+fn names_in(tree: MemFs, dir: String) -> List<String> / {abort.raise} =
   map_keys(
-    fold(all_keys(f), map_new(), |acc: Map<String, Bool>, k: String|
+    fold(all_keys(tree), map_new(), |acc: Map<String, Bool>, k: String|
       if k != "" && parent_of(k) == dir { map_insert(acc, base_of(k), true) } else { acc }),
   )
 
