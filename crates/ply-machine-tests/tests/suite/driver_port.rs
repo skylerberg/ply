@@ -11,7 +11,7 @@ fn repo() -> PathBuf {
 }
 
 /// The port's answer over a flat directory, pulling in the shipped modules itself, and the driver's.
-fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_eval::Front, Result<Loaded, LoadError>) {
+fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_eval::Analysis, Result<Loaded, LoadError>) {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())

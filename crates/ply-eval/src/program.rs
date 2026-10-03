@@ -87,7 +87,7 @@ impl EmitterRoot {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Front {
+pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
     /// The closure's packages as `(prefix, declared dep prefixes)`; empty for a project
     /// without packages.
@@ -133,7 +133,7 @@ pub struct Front {
     pub walked: Vec<u8>,
 }
 
-impl Front {
+impl Analysis {
     pub fn has_error(&self) -> bool {
         self.diagnostics
             .iter()

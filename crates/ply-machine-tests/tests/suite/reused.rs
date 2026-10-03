@@ -4,7 +4,7 @@
 
 use crate::fixture::{handed, project};
 use ply_eval::Span;
-use ply_machine::driver::{HandedFront, handed_front_of};
+use ply_machine::driver::{LoadedAnalysis, loaded_analysis_of};
 use ply_machine::reused::{self, Walked};
 use std::path::Path;
 
@@ -15,9 +15,9 @@ const PULLING: &str =
 const UNIT: &[u8] = b"/* the unit */\n";
 
 /// The fixture's front as handed, and the entry a load that held over it files.
-fn filed(dir: &Path) -> (HandedFront, Vec<u8>) {
+fn filed(dir: &Path) -> (LoadedAnalysis, Vec<u8>) {
     let value = handed(dir);
-    let front = handed_front_of(&value, Span::DUMMY).expect("the handed front reads");
+    let front = loaded_analysis_of(&value, Span::DUMMY).expect("the handed front reads");
     let placed: Vec<(String, String)> = front
         .files
         .iter()

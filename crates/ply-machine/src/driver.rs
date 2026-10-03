@@ -8,7 +8,7 @@ use crate::load::{
 use crate::payload::record;
 use ply_codegen::c::producer::{self, KnownRows};
 use ply_eval::decode::At;
-use ply_eval::{Diagnostic, Front, ModuleName, SourceId, SourceMap, Span, Value, codes};
+use ply_eval::{Analysis, Diagnostic, ModuleName, SourceId, SourceMap, Span, Value, codes};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,9 +35,9 @@ pub struct FrontEnd {
 /// order its ids run, what the CLI's own load cost, and whether it read and filed the front-end
 /// cache for it. This side reads the answer rather than walking and analysing again.
 #[derive(Clone, Debug)]
-pub struct HandedFront {
-    pub answer: Front,
-    pub files: Vec<FrontFile>,
+pub struct LoadedAnalysis {
+    pub answer: Analysis,
+    pub files: Vec<LoadedFile>,
     pub read: Duration,
     /// The CLI's front end, and reading its answer here.
     pub front: Duration,
@@ -46,15 +46,15 @@ pub struct HandedFront {
 }
 
 /// The answer is read as it is handed over: a `Value` may not cross to another thread, and the load
-/// it is for runs on a machine's own. [`load_over_front`] adds the files to a fresh map in order, so
+/// it is for runs on a machine's own. [`load_over_analysis`] adds the files to a fresh map in order, so
 /// file `i` is `SourceId(i)`.
-pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, Diagnostic> {
+pub fn loaded_analysis_of(v: &ply_eval::Value, span: Span) -> Result<LoadedAnalysis, Diagnostic> {
     use crate::payload::field_of;
     let mut files = Vec::new();
     for item in field_of(v, "files", span)?.as_list(span, "files")?.iter() {
         let text = String::from_utf8_lossy(field_of(item, "text", span)?.as_bytes(span, "a text")?)
             .into_owned();
-        files.push(FrontFile {
+        files.push(LoadedFile {
             path: field_of(item, "path", span)?
                 .as_str(span, "a path")?
                 .to_string(),
@@ -72,7 +72,7 @@ pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, D
     let started = Instant::now();
     let answer = ply_codegen::c::dump::read(field_of(v, "dump", span)?, &ids)
         .map_err(|e| port_failed(&format!("the front end's answer does not read: {e}")))?;
-    Ok(HandedFront {
+    Ok(LoadedAnalysis {
         answer,
         files,
         read: millis("read_ms")?,
@@ -85,7 +85,7 @@ pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, D
 /// One source as a caller's load found it: its path, the module the front end named it, and the text
 /// it read.
 #[derive(Clone, Debug)]
-pub struct FrontFile {
+pub struct LoadedFile {
     pub path: String,
     pub name: String,
     pub text: String,
@@ -94,17 +94,20 @@ pub struct FrontFile {
 /// The load over a front end a caller already ran: `ply test` walks the tree and runs the compiler
 /// in order to report on both, so this side is handed the answer — the tables, and every source
 /// they name in the order their ids run — rather than walking and analysing a second time.
-pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, LoadError> {
-    load_over_front_in(project_root(path), handed)
+pub fn load_over_analysis(path: &Path, handed: &LoadedAnalysis) -> Result<Loaded, LoadError> {
+    load_over_analysis_in(project_root(path), handed)
 }
 
-/// [`load_over_front`] with the root decided, so nothing on disk is read.
-pub fn load_over_front_in(root: PathBuf, handed: &HandedFront) -> Result<Loaded, LoadError> {
-    load_over_front_taken(root, handed.clone())
+/// [`load_over_analysis`] with the root decided, so nothing on disk is read.
+pub fn load_over_analysis_in(root: PathBuf, handed: &LoadedAnalysis) -> Result<Loaded, LoadError> {
+    load_over_analysis_taken(root, handed.clone())
 }
 
-/// [`load_over_front_in`] taking the front it is handed, so nothing in it is copied.
-pub fn load_over_front_taken(root: PathBuf, handed: HandedFront) -> Result<Loaded, LoadError> {
+/// [`load_over_analysis_in`] taking the front it is handed, so nothing in it is copied.
+pub fn load_over_analysis_taken(
+    root: PathBuf,
+    handed: LoadedAnalysis,
+) -> Result<Loaded, LoadError> {
     let mut sources = SourceMap::new();
     let mut states = Vec::with_capacity(handed.files.len());
     for file in handed.files {
@@ -177,7 +180,7 @@ const KEPT: &str = "ply kept front 1";
 
 /// A front [`Seeded::front`] kept, read back: every file it was over, and the front end's answer.
 /// `None` when the bytes are not one.
-pub fn kept_front(bytes: &[u8]) -> Option<HandedFront> {
+pub fn kept_front(bytes: &[u8]) -> Option<LoadedAnalysis> {
     let started = Instant::now();
     let kept = ply_eval::codec::decode(bytes).ok()?;
     let at = At::new("a kept front", &kept);
@@ -188,7 +191,7 @@ pub fn kept_front(bytes: &[u8]) -> Option<HandedFront> {
         .field("files")
         .ok()?
         .items(|file| {
-            Ok(FrontFile {
+            Ok(LoadedFile {
                 path: file.field("path")?.str()?.to_string(),
                 name: file.field("name")?.str()?.to_string(),
                 text: file.field("text")?.str()?.to_string(),
@@ -197,7 +200,7 @@ pub fn kept_front(bytes: &[u8]) -> Option<HandedFront> {
         .ok()?;
     let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
     let answer = ply_codegen::c::dump::read(at.field("dump").ok()?.value(), &ids).ok()?;
-    Some(HandedFront {
+    Some(LoadedAnalysis {
         answer,
         files,
         read: Duration::ZERO,
@@ -222,7 +225,7 @@ struct Driver {
     /// The front end a caller already ran, which [`Driver::ask_the_port`] takes rather than pulls.
     /// Nothing here walks or analyses when it is set: the caller did both, and the answer is the
     /// one the report is about.
-    answer: Option<Front>,
+    answer: Option<Analysis>,
     /// The project's own files, which every placement of the shipped modules follows.
     project: SourceMap,
     /// The root's `ply.pkg`, when there is one: the front end checks it and places it last.
@@ -579,7 +582,7 @@ impl Driver {
         })
     }
 
-    fn ask_the_port(&mut self) -> Result<Front, LoadError> {
+    fn ask_the_port(&mut self) -> Result<Analysis, LoadError> {
         if let Some(front) = self.answer.take() {
             return Ok(front);
         }
@@ -595,7 +598,7 @@ impl Driver {
     }
 
     /// The port pulls in the shipped modules the program imports, so its answer also places them.
-    fn whole(&mut self) -> Result<Front, LoadError> {
+    fn whole(&mut self) -> Result<Analysis, LoadError> {
         let own: Vec<(String, String)> = self.files[..self.own()]
             .iter()
             .map(|f| (f.module.to_string(), f.text.to_string()))
@@ -778,7 +781,7 @@ fn port_failed(why: &str) -> Diagnostic {
 }
 
 /// Files in load order, then items as written; the port answers dependency-first.
-fn published_order(front: &Front) -> ply_eval::CheckOutput {
+fn published_order(front: &Analysis) -> ply_eval::CheckOutput {
     let mut check = front.check.clone();
     let mut defs = indexmap::IndexMap::with_capacity(check.defs.len());
     for (_, items) in &front.ordinals {

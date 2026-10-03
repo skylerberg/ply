@@ -19,7 +19,7 @@ fn emitter_source() -> (&'static Source, String) {
         modules.iter().partition(|(name, _)| !ply_std::is_std(name));
     let own: Vec<_> = own.into_iter().cloned().collect();
     // No recipe is installed: each round's emitter is handed over in `emit_with`, and a handover wins over an installation.
-    let answered = producer::checked_front_with_std(&own).expect("the emitter checks");
+    let answered = producer::checked_analysis_with_std(&own).expect("the emitter checks");
     let front = answered.front;
     let unused: Vec<&str> = front
         .diagnostics
@@ -32,9 +32,10 @@ fn emitter_source() -> (&'static Source, String) {
         "the emitter's program carries definitions nothing reaches; delete them:\n  {}",
         unused.join("\n  ")
     );
-    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
     let texts: HashMap<String, String> = answered.modules.into_iter().collect();
-    let source: &'static Source = Box::leak(Box::new(Source::from_front(front).with_texts(texts)));
+    let source: &'static Source =
+        Box::leak(Box::new(Source::from_analysis(front).with_texts(texts)));
     (source, identity)
 }
 

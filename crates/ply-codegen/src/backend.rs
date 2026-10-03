@@ -131,7 +131,7 @@ thread_local! {
 
 /// One run's compiled unit, shared by every worker's backend.
 pub struct Unit {
-    /// [`ply_eval::Front::hashes_digest`] of the program this was built over, for
+    /// [`ply_eval::Analysis::hashes_digest`] of the program this was built over, for
     /// `Compiled::describes`.
     identity: DefHash,
     source: &'static Source,
@@ -155,13 +155,13 @@ pub struct Unit {
 impl Unit {
     /// `texts` is each module's source by name, which the cache keys cover.
     pub fn over_front(
-        front: &ply_eval::Front,
+        front: &ply_eval::Analysis,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         let identity = front.hashes_digest;
-        let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
+        let front: &'static ply_eval::Analysis = Box::leak(Box::new(front.clone()));
         let source: &'static Source =
-            Box::leak(Box::new(Source::from_front(front).with_texts(texts)));
+            Box::leak(Box::new(Source::from_analysis(front).with_texts(texts)));
         let candidates = source.functions();
         let started = std::time::Instant::now();
         // The pre-flight decides the compiled set and leaves the unit every worker reads back.
@@ -193,10 +193,10 @@ impl Unit {
     /// A unit produced elsewhere, its C handed over whole, loaded once: the first backend on this
     /// thread takes that load, and one that does not serve this runtime is an
     /// [`crate::c::Unserved`].
-    pub fn handed(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
+    pub fn handed(front: &ply_eval::Analysis, text: String) -> Result<&'static Unit> {
         let identity = front.hashes_digest;
-        let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
-        let source: &'static Source = Box::leak(Box::new(Source::from_front(front)));
+        let front: &'static ply_eval::Analysis = Box::leak(Box::new(front.clone()));
+        let source: &'static Source = Box::leak(Box::new(Source::from_analysis(front)));
         let (native, refused) = crate::c::load_unit(&text, Some(source), "unit")?;
         let compiled = native.names();
         let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
@@ -325,7 +325,7 @@ impl Provider for Unit {
         self.poisoned()
     }
 
-    fn relocate(&self, front: &ply_eval::Front, sources: &ply_eval::SourceMap) -> bool {
+    fn relocate(&self, front: &ply_eval::Analysis, sources: &ply_eval::SourceMap) -> bool {
         self.source.relocate(front, sources)
     }
 }

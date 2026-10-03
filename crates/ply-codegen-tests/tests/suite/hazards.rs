@@ -11,7 +11,7 @@ fn fixtures() -> PathBuf {
 }
 
 pub struct Loaded {
-    pub front: ply_eval::Front,
+    pub front: ply_eval::Analysis,
     /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }
