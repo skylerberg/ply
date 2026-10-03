@@ -28,9 +28,10 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
-  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
+  read filed[m](front: Front) -> Bytes
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
@@ -131,7 +132,7 @@ type Ended = {
 }
 
 fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front), None) {
+  match machine.load[m](root, Some(front)) {
     Ok(_t) -> {
       match machine.bound[m]("inner.main", unconfigured()) {
         Ok(_b) -> {
@@ -312,9 +313,10 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
-  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
+  read filed[m](front: Front) -> Bytes
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
@@ -364,7 +366,7 @@ type Raised = { diag: Diag, values: List<Value> }
 type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
 fn main(root: String, front: Front) -> Called / {machine.load[m], machine.bound[m], machine.call[m], machine.drop[m]} = {
-  let _loaded = machine.load[m](root, Some(front), None);
+  let _loaded = machine.load[m](root, Some(front));
   let _bound = machine.bound[m]("inner.main", unconfigured());
   let called = machine.call[m]("inner.main", []);
   machine.drop[m]();
@@ -470,9 +472,10 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
-  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
+  read filed[m](front: Front) -> Bytes
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
@@ -559,7 +562,7 @@ fn once() -> Option<Value> / {machine.bound[m], machine.enter[m]} = {
 }
 
 fn main(root: String, front: Front) -> Option<Value> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
-  let _loaded = machine.load[m](root, Some(front), None);
+  let _loaded = machine.load[m](root, Some(front));
   once()
 }
 
@@ -624,9 +627,10 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
-  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
+  read filed[m](front: Front) -> Bytes
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
@@ -769,7 +773,7 @@ fn opts(host: Bool) -> Options =
 
 fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   machine.configure[m](opts(true));
-  match machine.load[m](root, Some(front), None) {
+  match machine.load[m](root, Some(front)) {
     Err(_) -> false,
     Ok(_t) -> {
       let bound = machine.bound[m]("inner.main", unconfigured());
@@ -788,7 +792,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
 fn forgotten(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.drop[m]} = {
   machine.configure[m](opts(true));
   machine.drop[m]();
-  match machine.load[m](root, Some(front), None) {
+  match machine.load[m](root, Some(front)) {
     Err(_) -> false,
     Ok(_t) -> {
       let bound = machine.bound[m]("inner.main", unconfigured());
@@ -848,9 +852,10 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
-  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
+  read filed[m](front: Front) -> Bytes
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
@@ -901,7 +906,7 @@ type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
 fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front), None) {
+  match machine.load[m](root, Some(front)) {
     Ok(_) -> match machine.bound[m]("inner.main", unconfigured()) {
       Ok(_) -> {
         let doubled = machine.call[m]("inner.double", [VInt(21)]);
@@ -1004,9 +1009,10 @@ import std.value (Value, VInt)
 
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
   read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
-  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
+  read filed[m](front: Front) -> Bytes
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
   read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
@@ -1062,7 +1068,7 @@ fn answered(c: Called) -> Int =
   match c.answer { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
 
 fn main(root: String, front: Front) -> Spent / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  let _loaded = machine.load[m](root, Some(front), None);
+  let _loaded = machine.load[m](root, Some(front));
   let _bound = machine.bound[m]("inner.main", unconfigured());
   let first = answered(machine.call[m]("inner.constant", []));
   let ran = spent();

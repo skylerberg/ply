@@ -1,5 +1,6 @@
 //! The environment a launched program runs in, as a lent effect: the variables, whether the
-//! streams are terminals, the working directory, and the binary's own version and shipped digest.
+//! streams are terminals, the working directory, the binary's own version and shipped digest, and
+//! the directory `ply run` files the fronts it reuses in.
 //! Bound by the launcher for the program it enters — user programs read configuration, not the
 //! environment.
 //!
@@ -14,13 +15,14 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 6] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("var", "ply_launcher::env::var"),
     ("vars", "ply_launcher::env::vars"),
     ("terminal", "ply_launcher::env::terminal"),
     ("binary_version", "ply_launcher::env::binary_version"),
     ("pwd", "ply_launcher::env::pwd"),
     ("shipped_digest", "ply_launcher::env::shipped_digest"),
+    ("fronts", "ply_launcher::env::fronts"),
 ];
 
 /// The ops and the handler, lent with the binary's version.
@@ -78,6 +80,12 @@ impl HostHandler for Site {
             // The digest the committed CLI artifact is gated on: the build of the program's own
             // sources writes it beside the artifact.
             ("shipped_digest", []) => Value::str(crate::shipped::identity()),
+            // Under the stage root, where `sweep` keeps them to the cache's budget.
+            ("fronts", []) => Value::str(
+                ply_codegen::c::bundle::stage_dir(ply_codegen::c::sweep::RUNS)
+                    .display()
+                    .to_string(),
+            ),
             // The working directory the `cwd` root is bound to, as the program resolves paths.
             ("pwd", []) => Value::str(
                 std::env::current_dir()
