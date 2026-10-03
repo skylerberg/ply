@@ -71,7 +71,7 @@ pub use program::{
     ModuleInfo, ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility,
     WrittenParam, is_ident, is_ident_continue, is_ident_start,
 };
-pub use rc::Stats as RcStats;
+pub use rc::RcStats;
 pub use region::{Interleaving, SimId, Verdict};
 pub use sched::TaskHandle;
 pub use semantics::strict_binary;
@@ -86,6 +86,6 @@ pub use span::{
 pub use task_regions::{Fixture, TaskRegions};
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, Step as PathStep,
-    Synth, Value, constant_time_eq, first_difference, values_equal,
+    Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, PathStep, Synth, Value,
+    constant_time_eq, first_difference, values_equal,
 };

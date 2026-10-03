@@ -1,5 +1,5 @@
-//! The compiled map: a B-tree over words, keyed by [`heap::cmp_words`] so iteration matches the
-//! interpreter's. Writes go in place along what is held once, else copy one node per level.
+//! The compiled map: a B-tree over words, keyed by [`heap::cmp_words`] so iteration matches a
+//! `Value::Map`'s. Writes go in place along what is held once, else copy one node per level.
 
 use crate::heap::{
     self, Heap, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, Layouts, Obj, Word, dec, inc, is_unique, obj,

@@ -61,7 +61,7 @@ impl<'a> Executor<'a> {
 
 /// What running a test, or one interleaving of it, cost and reached, whatever it decided.
 #[derive(Clone, Debug, Default)]
-pub struct Use {
+pub struct Usage {
     pub duration: Duration,
     /// The run reached a nondeterministic host handler.
     pub host: bool,
@@ -78,7 +78,7 @@ pub struct Use {
 struct Entered {
     outcome: Result<(), Diagnostic>,
     interleaving: Option<Interleaving>,
-    usage: Use,
+    usage: Usage,
 }
 
 fn entered(
@@ -101,7 +101,7 @@ fn entered(
             .map(|record| record.interleaving(&outcome))
     });
     Ok(Entered {
-        usage: Use {
+        usage: Usage {
             duration: Duration::ZERO,
             host: machine.host_use().is_some_and(HostUse::acted),
             entries,
@@ -119,7 +119,7 @@ pub struct Executed {
     pub failure: Option<Diagnostic>,
     /// Ply unwound rather than the program failing.
     pub panicked: bool,
-    pub usage: Use,
+    pub usage: Usage,
 }
 
 impl Executed {
@@ -128,7 +128,7 @@ impl Executed {
         Executed {
             failure: Some(refusal),
             panicked: false,
-            usage: Use::default(),
+            usage: Usage::default(),
         }
     }
 }
@@ -142,7 +142,7 @@ pub fn executed(executor: &Executor<'_>, index: usize) -> Executed {
         Ok(Ok(e)) => Executed {
             failure: e.outcome.err(),
             panicked: false,
-            usage: Use {
+            usage: Usage {
                 duration,
                 ..e.usage
             },
@@ -151,9 +151,9 @@ pub fn executed(executor: &Executor<'_>, index: usize) -> Executed {
         Err(payload) => Executed {
             failure: Some(panic_diagnostic(payload, executor.front, index)),
             panicked: true,
-            usage: Use {
+            usage: Usage {
                 duration,
-                ..Use::default()
+                ..Usage::default()
             },
         },
     }
@@ -165,7 +165,7 @@ pub struct Interleaved {
     /// The test entered a `simulate` region, and so had a schedule to vary.
     pub observed: bool,
     pub panicked: bool,
-    pub usage: Use,
+    pub usage: Usage,
 }
 
 impl Interleaved {
@@ -174,7 +174,7 @@ impl Interleaved {
             interleaving: Interleaving::failed(Vec::new(), refusal),
             observed: false,
             panicked: false,
-            usage: Use::default(),
+            usage: Usage::default(),
         }
     }
 }
@@ -202,23 +202,23 @@ pub fn interleaved(
                 },
             },
             panicked: false,
-            usage: Use {
+            usage: Usage {
                 duration,
                 ..e.usage
             },
         },
         Ok(Err(refused)) => Interleaved {
-            usage: Use {
+            usage: Usage {
                 duration,
-                ..Use::default()
+                ..Usage::default()
             },
             ..Interleaved::refused(refused)
         },
         Err(payload) => Interleaved {
             panicked: true,
-            usage: Use {
+            usage: Usage {
                 duration,
-                ..Use::default()
+                ..Usage::default()
             },
             ..Interleaved::refused(panic_diagnostic(payload, executor.front, index))
         },
@@ -245,7 +245,7 @@ fn panic_diagnostic(
         codes::INTERNAL_ERROR,
         format!("test `{name}` panicked: {message}"),
     )
-    .primary(span, "the interpreter panicked while running this test")
+    .primary(span, "Ply panicked while running this test")
     .note("a panic is a defect in Ply itself, not in the test; please report it with this source")
     .note("the other tests still ran, and this one was not cached")
 }

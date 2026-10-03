@@ -17,7 +17,7 @@ use crate::support::unit_of;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
+use ply_eval::{Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, codes};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -722,14 +722,14 @@ fn prepare(
 }
 
 /// The values plain values name, on the thread that judges them.
-fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Diagnostic> {
+fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<PlyValue>>, Diagnostic> {
     points
         .iter()
         .map(|point| {
             point
                 .iter()
                 .map(|plain| plain.clone().into_value())
-                .collect::<Result<Vec<Value>, _>>()
+                .collect::<Result<Vec<PlyValue>, _>>()
         })
         .collect::<Result<_, _>>()
         .map_err(|why| {
