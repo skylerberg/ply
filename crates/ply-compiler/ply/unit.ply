@@ -47,6 +47,10 @@ pub effect shipped {
   read version() -> String
   read stamps() -> String
   read runtime() -> Runtime
+  // Each definition of this binary's own program, the one its launcher entered (the builder's own
+  // where a builder asks), and the hash its front end gave it, a `name hash` line each: a hash
+  // covers all its definition reaches.
+  read definitions() -> Bytes
   // Each builtin the runtime implements, how many words a call to it passes, and whether a failure
   // of it raises rather than ending the run.
   read builtins() -> List<{ name: Bytes, arity: Int, raises: Bool }>
@@ -55,75 +59,70 @@ pub effect shipped {
   read runnable(entry: String, files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, unit: Bytes) -> Bytes
 }
 
-// What an emitter built from the shelf answers is a function of: the compiler's modules and the
-// shipped ones they import, so a shipped module the compiler never reads moves no kept answer.
-pub fn shelf_identity() -> Bytes / {shipped.names, shipped.module, abort.raise} =
-  emitter_identity(shipped.names(), |n: String| shipped.module(n))
+// The hash `definitions` holds for a definition of the compiler's, `name` as the compiler's own
+// program names it: a program that ships the compiler names it under `compiler.`.
+pub fn definition_hash(definitions: Bytes, name: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let held = |full: Bytes| {
+    let line = bytes_concat(full, b" ");
+    let found = if bytes_starts_with(definitions, line) { Some(0) } else {
+      match bytes_index_of(definitions, bytes_concat(b"\n", line)) {
+        Some(i) -> Some(i + 1),
+        None -> None,
+      }
+    };
+    match found {
+      None -> None,
+      Some(i) -> {
+        let from = i + bytes_len(line);
+        // A hash is sixty-four digits, so its line ends within this many bytes.
+        let most = if from + 65 > bytes_len(definitions) { bytes_len(definitions) }
+        else { from + 65 };
+        let rest = bytes_slice(definitions, from, most);
+        Some(
+          bytes_slice(rest, 0, match bytes_index_of_byte(rest, 10) {
+            Some(end) -> end,
+            None -> bytes_len(rest),
+          }),
+        )
+      },
+    }
+  };
+  match held(bytes_concat(b"compiler.", name)) { Some(h) -> Some(h), None -> held(name) }
+}
 
-// [`shelf_identity`] of a shelf that lists `names` and `read` answers a module's text from.
-pub fn emitter_identity<| e>(
-  names: List<String>,
-  read: (String) -> Option<Bytes> / e,
-) -> Bytes / {abort.raise | e} = {
-  let texts = emitter_texts(names, read);
+// What the answers `roots` compute are a function of on the program's side: each root's hash,
+// which covers all the root reaches and nothing else of the program. A root the program does not
+// hold was renamed without the list that names it.
+pub fn identity_of(definitions: Bytes, roots: List<Bytes>) -> Bytes / {abort.raise} =
   hex(
     blake3(
       bytes_concat_all(
-        map(map_keys(texts), |n: String|
-          bytes_concat_all([
-            bytes_of_string(n),
-            b"\x00",
-            match map_get(texts, n) { Some(text) -> blake3(text), None -> b"" },
-            b"\x00",
-          ])),
+        map(roots, |root: Bytes|
+          match definition_hash(definitions, root) {
+            Some(h) -> bytes_concat_all([root, b" ", h, b"\n"]),
+            None ->
+              panic(
+                "this binary's program holds no definition `" ++ string_of_bytes_lossy(root)
+                  ++ "`, which a kept answer is filed under",
+              ),
+          }),
       ),
     ),
   )
-}
 
-// Each shipped module the compiler's modules reach through the `import` lines they open with, and
-// its text, by name.
-pub fn emitter_texts<| e>(
-  names: List<String>,
-  read: (String) -> Option<Bytes> / e,
-) -> Map<String, Bytes> / {abort.raise | e} =
-  reached_from(read, filter(names, |n: String| string_starts_with(n, "compiler.")), map_new())
+// The definitions an emitter's answer is a function of besides the root it answers for: the one
+// that asks the emitter, and the one that makes the front end's answer it is asked over.
+pub fn emitter_roots() -> List<Bytes> = [b"unit.emitter_answers", b"front.dump_of"]
 
-fn reached_from<| e>(
-  read: (String) -> Option<Bytes> / e,
-  frontier: List<String>,
-  seen: Map<String, Bytes>,
-) -> Map<String, Bytes> / {abort.raise | e} =
-  match frontier {
-    [] -> seen,
-    [module, ..rest] -> if map_contains(seen, module) { reached_from(read, rest, seen) } else {
-      match read(module) {
-        Some(text) ->
-          reached_from(read, append(rest, imports_of(text)), map_insert(seen, module, text)),
-        None -> reached_from(read, rest, seen),
-      }
-    },
-  }
+pub fn emitter_identity(definitions: Bytes) -> Bytes / {abort.raise} =
+  identity_of(definitions, emitter_roots())
 
-// The shipped modules a module's `import` lines name: a compiler module names a sibling bare, and
-// every module names a standard one by its `std.` name.
-fn imports_of(text: Bytes) -> List<String> / {abort.raise} =
-  fold(bytes_split(text, b"\n"), [], |acc: List<String>, line: Bytes|
-    if !bytes_starts_with(line, b"import ") { acc } else {
-      let rest = bytes_slice(line, 7, bytes_len(line));
-      let name = string_of_bytes_lossy(bytes_slice(rest, 0, name_end(rest)));
-      push(acc, if string_starts_with(name, "std.") || string_starts_with(name, "compiler.") {
-        name
-      } else { "compiler." ++ name })
-    })
+// The definitions a unit is a function of besides the program it is of: the emitter's, and the ones
+// that produce a unit over its answers and hold it to what was offered.
+pub fn unit_roots() -> List<Bytes> = [b"unit.emitted", b"unit.held", b"front.dump_of"]
 
-fn name_end(rest: Bytes) -> Int / {abort.raise} = {
-  let space = match bytes_index_of_byte(rest, 32) { Some(i) -> i, None -> bytes_len(rest) };
-  match bytes_index_of_byte(rest, 40) {
-    Some(i) -> if i < space { i } else { space },
-    None -> space,
-  }
-}
+// The definitions a program's analysis and its unit are a function of besides its sources.
+pub fn compiler_roots() -> List<Bytes> = push(unit_roots(), b"front.analyse_pulling_std_with")
 
 fn kept_at(dir: String, key: Bytes) -> String / {abort.raise} =
   if dir == "" || dir == "." { string_of_bytes(key) } else { dir ++ "/" ++ string_of_bytes(key) }
@@ -1059,10 +1058,45 @@ fn repacked(
     }
   })
 
+// What the emitter answers for `missed`: entered once, over the modules those roots are in and the
+// ones they import.
+fn emitter_answers(
+  runtime: Runtime,
+  dump: Dump,
+  p: Program,
+  ctors: List<Ctor>,
+  missed: List<Bytes>,
+) -> List<RootAnswer> / {abort.raise} = {
+  let lowered = fold(missed, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+    map_insert(acc, module_of_root(n), true));
+  let needed = imported(p, map_keys(lowered));
+  let placed = filter(range(0, len(p.modules)), |i: Int|
+    map_contains(needed, at(p.modules, i).name));
+  let names = map(placed, |i: Int| at(p.modules, i).name);
+  // A module no wanted root is in is read for its declarations, its rows standing for its bodies.
+  let text_of = |m: ModuleRow| {
+    let text = match text_at(p, m.index) { Some(t) -> t, None -> b"" };
+    if map_contains(lowered, m.name) { text } else { stubbed(text, m.cuts) }
+  };
+  emit_roots_answer(
+    names,
+    map(placed, |i: Int| text_of(at(p.modules, i))),
+    map(ctors, |c: Ctor| c.name),
+    runtime.builtins,
+    missed,
+    if len(dump.packages) == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
+    if len(dump.packages) == 0 { map(names, |_: Bytes| 0) }
+    else { map(placed, |i: Int| match list_at(dump.mod_pkg, i) { Some(k) -> k, None -> 0 }) },
+    dump.embeds,
+    dump.rows,
+    dump.walked,
+  )
+}
+
 // The unit over `offered`: each root's answer taken from what an earlier run kept where it stands,
 // the emitter entered once for the rest, what it answered kept for the next run, and the unit
-// produced over all of it. `emitter` names the compiler doing the emitting, which every kept answer
-// is a function of. `Err` says why the emitter answered nothing at all.
+// produced over all of it. `emitter` is what the emitter's answers are a function of on its side,
+// which every kept answer is filed under. `Err` says why the emitter answered nothing at all.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -1109,32 +1143,7 @@ pub fn emitted<| e>(
     decoded(read(refusal_key(m))));
   let kept = standing(looked, asked);
   let missed = filter(offered, |n: Bytes| !map_contains(kept, n));
-  let fresh = if len(missed) == 0 { [] } else {
-    let lowered = fold(missed, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
-      map_insert(acc, module_of_root(n), true));
-    let needed = imported(p, map_keys(lowered));
-    let placed = filter(range(0, len(p.modules)), |i: Int|
-      map_contains(needed, at(p.modules, i).name));
-    let names = map(placed, |i: Int| at(p.modules, i).name);
-    // A module no wanted root is in is read for its declarations, its rows standing for its bodies.
-    let text_of = |m: ModuleRow| {
-      let text = match text_at(p, m.index) { Some(t) -> t, None -> b"" };
-      if map_contains(lowered, m.name) { text } else { stubbed(text, m.cuts) }
-    };
-    emit_roots_answer(
-      names,
-      map(placed, |i: Int| text_of(at(p.modules, i))),
-      map(ctors, |c: Ctor| c.name),
-      runtime.builtins,
-      missed,
-      if len(dump.packages) == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
-      if len(dump.packages) == 0 { map(names, |_: Bytes| 0) }
-      else { map(placed, |i: Int| match list_at(dump.mod_pkg, i) { Some(k) -> k, None -> 0 }) },
-      dump.embeds,
-      dump.rows,
-      dump.walked,
-    )
-  };
+  let fresh = if len(missed) == 0 { [] } else { emitter_answers(runtime, dump, p, ctors, missed) };
   if len(missed) > 0 && len(fresh) == 0 {
     Err(
       bytes_concat_all([
@@ -1261,6 +1270,35 @@ pub fn compiled<| e>(
   held(dump, offered, emitted(runtime, dump, sources, offered, emitter, read, write))
 
 // --- Tests ------------------------------------------------------------------
+
+fn some_definitions() -> Bytes =
+  b"compiler.unit.emitted aa\nfront.dump_of bb\nunit.emitted cc\nunit.emitted_twice dd\n"
+
+test "a definition's hash is read under its own name, or under `compiler.` where the program ships the compiler" {
+  assert_eq(definition_hash(some_definitions(), b"unit.emitted"), Some(b"aa"));
+  assert_eq(definition_hash(some_definitions(), b"front.dump_of"), Some(b"bb"));
+  assert_eq(definition_hash(some_definitions(), b"unit.emitted_twice"), Some(b"dd"));
+  assert_eq(definition_hash(b"unit.emitted cc", b"unit.emitted"), Some(b"cc"));
+  assert_eq(definition_hash(some_definitions(), b"emitted"), None);
+  assert_eq(definition_hash(some_definitions(), b"unit.emit"), None)
+}
+
+test "an identity moves with the hash of a root it names, and with no other definition's" {
+  let roots = [b"unit.emitted", b"front.dump_of"];
+  let one = identity_of(some_definitions(), roots);
+  assert_eq(
+    identity_of(
+      b"compiler.unit.emitted aa\nfront.dump_of bb\nunit.emitted_twice ee\nzeta.new ff\n",
+      roots,
+    ),
+    one,
+  );
+  assert(
+    identity_of(b"compiler.unit.emitted aa\nfront.dump_of b0\n", roots) != one,
+    Some("a root's hash moved and the identity did not"),
+  );
+  assert(identity_of(some_definitions(), [b"unit.emitted"]) != one, None)
+}
 
 test "a pooled constant's line is the one the runtime reads it back from" {
   assert_eq(const_line(ConstUnit), b"u");
