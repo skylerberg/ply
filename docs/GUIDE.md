@@ -1310,6 +1310,7 @@ derive json for Line
 | `ord` | `<snake_case(T)>_ord` | `{compare: (T, T) -> Ordering}` |
 | `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
 | `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
+| `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
 
 There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
 `HttpRequest` both give `http_request`) is `E0105`. A `derive` must be in the
@@ -1330,10 +1331,10 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 plain values: `json::decode_bytes(body, order_json())`.
 
 `E0206` names the field that blocks a derivation: function types, `Cell` and
-`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`, `bin`, `show`);
-`Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin` need their
-module imported (`import std.json`, `import std.bin`), or the `derive` is
-`E0206`; `show` imports `std.show` itself.
+`Task` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`, `bin`,
+`show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json` and
+`bin` need their module imported (`import std.json`, `import std.bin`), or the
+`derive` is `E0206`; `show` imports `std.show` itself.
 
 ## 12. Builtins
 
@@ -1352,6 +1353,7 @@ authority when this page and it disagree.
 | `panic<a>(message: String) -> a` | `E0502` |
 | `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
+| `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
 | `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
 | `min`, `max` `(a: Int, b: Int) -> Int` | |
 | `cell_get<a>(c: Cell<a>) -> a` | |
