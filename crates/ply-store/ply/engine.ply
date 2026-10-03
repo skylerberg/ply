@@ -139,14 +139,20 @@ fn load<[r]>(dir: String, schema: Bytes) -> Loaded / {fs.read[r], abort.raise} =
 // The most one read answers.
 fn read_cap() -> Int = 64 * 1024 * 1024
 
-// Only what the index vouches for: a torn append past it can take the file over the cap.
+// The most data a store holds whole; past it, each entry is read when it is wanted.
+fn whole_cap() -> Int = 1024 * 1024 * 1024
+
+// Only what the index vouches for: a torn append past it is never read.
 fn whole<[r]>(dir: String, data_len: Int) -> Bytes / {fs.read[r]} =
-  if data_len > read_cap() { b"" } else {
-    match fs.read_at[r](path(dir, data_name()), 0, data_len) {
-      Some(b) -> if bytes_len(b) == data_len { b } else { b"" },
-      None -> b"",
-    }
-  }
+  if data_len > whole_cap() { b"" } else { pieced[r](path(dir, data_name()), data_len, read_cap()) }
+
+// The first `len` bytes of `file` as one value, read `piece` bytes at a time; none if it is shorter.
+fn pieced<[r]>(file: String, len: Int, piece: Int) -> Bytes / {fs.read[r]} = {
+  let pieces = map(range(0, (len + piece - 1) / piece), |i: Int|
+    fs.read_at[r](file, i * piece, min(piece, len - i * piece)));
+  let b = bytes_concat_all(map(pieces, |p: Option<Bytes>| match p { Some(x) -> x, None -> b"" }));
+  if bytes_len(b) == len { b } else { b"" }
+}
 
 fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, Problem> / {abort.raise} =
   if bytes_len(b) < index_header() || bytes_slice(b, 0, 8) != index_magic() {
@@ -441,12 +447,27 @@ fn sweep<[r]>(dir: String) -> Unit / {fs.read[r], fs.write[r]} =
 
 type Base = { disk: Option<Disk>, warnings: List<Warning> }
 
-// The store on disk now, which another run may have written since this one opened it.
-fn base<[r]>(s: Store) -> Base / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  match load[r](s.dir, s.schema) {
-    Valid(d) -> { disk: Some(d), warnings: s.warnings },
-    Cold -> started[r](s.dir, s.schema, s.warnings),
-    Unusable(p) -> started[r](s.dir, s.schema, noted(s.warnings, starts_empty(p))),
+// The store on disk now, which another run may have written since this one opened it: what this
+// run holds, where the index it read is still the one on disk.
+fn base<[r]>(s: Store) -> Base / {fs.read[r], fs.write[r], entropy.next, time.now_ms} =
+  if s.data_len > 0 && bytes_len(s.data) >= s.data_len
+      && fs.read_file[r](path(s.dir, index_name())) == Some(s.index) {
+    {
+      disk: Some({
+        nonce: s.nonce,
+        data_len: s.data_len,
+        index: s.index,
+        sections: s.sections,
+        data: s.data,
+      }),
+      warnings: s.warnings,
+    }
+  } else {
+    match load[r](s.dir, s.schema) {
+      Valid(d) -> { disk: Some(d), warnings: s.warnings },
+      Cold -> started[r](s.dir, s.schema, s.warnings),
+      Unusable(p) -> started[r](s.dir, s.schema, noted(s.warnings, starts_empty(p))),
+    }
   }
 
 fn started<[r]>(
@@ -781,6 +802,32 @@ test "two runs flushing one store keep each other's entries, and the later wins 
     all([a1.warnings, b1.warnings, c.warnings])
   });
   assert_eq(run.value, [])
+}
+
+test "a run whose index is stale at its flush reads the store again and keeps the other's entries" {
+  let run = on_twin(mem_empty(), || {
+    let s0 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("first"), b"0"));
+    let a = put(open[mem]("cache", schema_a()), 1, k("mine"), b"a");
+    let b = put(open[mem]("cache", schema_a()), 1, k("theirs"), b"b");
+    let a1 = flush[mem](a);
+    let b1 = flush[mem](b);
+    let c = open[mem]("cache", schema_a());
+    assert_eq(hit(get[mem](c, 1, k("first"))), b"0");
+    assert_eq(hit(get[mem](c, 1, k("mine"))), b"a");
+    assert_eq(hit(get[mem](c, 1, k("theirs"))), b"b");
+    all([s0.warnings, a1.warnings, b1.warnings, c.warnings])
+  });
+  assert_eq(run.value, [])
+}
+
+test "a file larger than one read is read whole a piece at a time, and only as far as asked" {
+  let run = on_twin(mem_empty(), || {
+    assert(fs.write_file[mem]("f", b"0123456789abcdefghij"));
+    { whole: pieced[mem]("f", 20, 7), part: pieced[mem]("f", 15, 4), past: pieced[mem]("f", 25, 7) }
+  });
+  assert_eq(run.value.whole, b"0123456789abcdefghij");
+  assert_eq(run.value.part, b"0123456789abcde");
+  assert_eq(run.value.past, b"")
 }
 
 test "a torn append past what the index vouches for is never read and is written over" {

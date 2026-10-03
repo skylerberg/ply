@@ -115,9 +115,9 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) {
 
 /// The file or project at `path` loaded as the CLI hands one to a machine.
 pub fn loaded(path: &Path) -> ply_machine::load::Loaded {
-    let front = ply_machine::driver::handed_front_of(&handed(path), ply_eval::Span::DUMMY)
+    let front = ply_machine::driver::loaded_analysis_of(&handed(path), ply_eval::Span::DUMMY)
         .unwrap_or_else(|d| panic!("the front end is handed over: {}", d.message));
-    ply_machine::driver::load_over_front(path, &front).unwrap_or_else(|e| {
+    ply_machine::driver::load_over_analysis(path, &front).unwrap_or_else(|e| {
         panic!(
             "`{}` did not compile: {:?}",
             path.display(),

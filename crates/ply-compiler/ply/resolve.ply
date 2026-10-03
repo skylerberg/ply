@@ -2,8 +2,8 @@
 // sets and defaults.
 // Ordered tables are lists in insertion order: the dump encodes that order and a `Map` sorts its keys.
 
-import spine (Span, Ident, QName, span_to, dummy_span, num)
-import types (TypeExpr, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
+import parsing (Span, Ident, QName, span_to, dummy_span, int_to_bytes)
+import type_syntax (TypeExpr, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef,
               TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, Binder, Vis, VPub, VPriv,
               ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, parse,
@@ -19,9 +19,9 @@ import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
 pub type Source = { name: Bytes, src: Bytes }
 
 // `derived` is what `derive.ply`'s expansion generated into `module`, for the checker.
-pub type Mod = { name: Bytes, module: Module, derived: List<Derived> }
+pub type ParsedModule = { name: Bytes, module: Module, derived: List<Derived> }
 
-pub type Ns = | NValue | NType | NEffect | NSet
+pub type Namespace = | ValueSpace | TypeSpace | EffectSpace | SetSpace
 
 pub type Declared = { name: Bytes, qualified: Bytes, public: Bool, span: Span }
 // The lists keep insertion order, which the dump encodes; the maps answer lookups. A name's first entry wins in both.
@@ -46,11 +46,11 @@ pub type Bindings = {
   by_effect: Map<Bytes, Binding>,
   by_set: Map<Bytes, Binding>,
 }
-pub type ModBind = { binder: Bytes, target: Int, span: Span }
+pub type ModuleBinding = { binder: Bytes, target: Int, span: Span }
 pub type Scope = {
   module: Bytes,
-  modules: List<ModBind>,
-  selective: List<ModBind>,
+  modules: List<ModuleBinding>,
+  selective: List<ModuleBinding>,
   bound: Bindings,
 }
 pub type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
@@ -70,9 +70,9 @@ pub type Diag = {
   fixes: List<Fix>,
 }
 type Edge = { from: Int, target: Int, span: Span }
-pub type Entry = { name: Bytes, at: Int }
+pub type ModuleEntry = { name: Bytes, at: Int }
 pub type Resolved = {
-  names: List<Entry>,
+  names: List<ModuleEntry>,
   scopes: List<Scope>,
   declarations: List<Decls>,
   declared: List<Bindings>,
@@ -105,58 +105,113 @@ fn no_bindings() -> Bindings =
     by_set: map_new(),
   }
 
-fn spaces() -> List<Ns> = [NValue, NType, NEffect, NSet]
+fn namespaces() -> List<Namespace> = [ValueSpace, TypeSpace, EffectSpace, SetSpace]
 
-pub fn space(d: Decls, ns: Ns) -> List<Declared> =
-  match ns { NValue -> d.values, NType -> d.types, NEffect -> d.effects, NSet -> d.sets }
-
-fn first_declared(m: Map<Bytes, Declared>, x: Declared) -> Map<Bytes, Declared> =
-  if map_contains(m, x.name) { m } else { map_insert(m, x.name, x) }
-
-fn first_binding(m: Map<Bytes, Binding>, x: Binding) -> Map<Bytes, Binding> =
-  if map_contains(m, x.name) { m } else { map_insert(m, x.name, x) }
-
-fn dpush(d: Decls, ns: Ns, x: Declared) -> Decls =
-  match ns {
-    NValue -> { ..d, values: push(d.values, x), by_value: first_declared(d.by_value, x) },
-    NType -> { ..d, types: push(d.types, x), by_type: first_declared(d.by_type, x) },
-    NEffect -> { ..d, effects: push(d.effects, x), by_effect: first_declared(d.by_effect, x) },
-    NSet -> { ..d, sets: push(d.sets, x), by_set: first_declared(d.by_set, x) },
+pub fn space(decls: Decls, namespace: Namespace) -> List<Declared> =
+  match namespace {
+    ValueSpace -> decls.values,
+    TypeSpace -> decls.types,
+    EffectSpace -> decls.effects,
+    SetSpace -> decls.sets,
   }
 
-pub fn dlookup(d: Decls, ns: Ns, name: Bytes) -> Option<Declared> =
+fn first_declared(m: Map<Bytes, Declared>, declared: Declared) -> Map<Bytes, Declared> =
+  if map_contains(m, declared.name) { m } else { map_insert(m, declared.name, declared) }
+
+fn first_binding(m: Map<Bytes, Binding>, binding: Binding) -> Map<Bytes, Binding> =
+  if map_contains(m, binding.name) { m } else { map_insert(m, binding.name, binding) }
+
+fn push_declared(decls: Decls, namespace: Namespace, declared: Declared) -> Decls =
+  match namespace {
+    ValueSpace ->
+      {
+        ..decls,
+        values: push(decls.values, declared),
+        by_value: first_declared(decls.by_value, declared),
+      },
+    TypeSpace ->
+      {
+        ..decls,
+        types: push(decls.types, declared),
+        by_type: first_declared(decls.by_type, declared),
+      },
+    EffectSpace ->
+      {
+        ..decls,
+        effects: push(decls.effects, declared),
+        by_effect: first_declared(decls.by_effect, declared),
+      },
+    SetSpace ->
+      { ..decls, sets: push(decls.sets, declared), by_set: first_declared(decls.by_set, declared) },
+  }
+
+pub fn lookup_declared(decls: Decls, namespace: Namespace, name: Bytes) -> Option<Declared> =
   map_get(
-    match ns { NValue -> d.by_value, NType -> d.by_type, NEffect -> d.by_effect, NSet -> d.by_set },
+    match namespace {
+      ValueSpace -> decls.by_value,
+      TypeSpace -> decls.by_type,
+      EffectSpace -> decls.by_effect,
+      SetSpace -> decls.by_set,
+    },
     name,
   )
 
-fn with_bspace(b: Bindings, ns: Ns, xs: List<Binding>) -> Bindings = {
-  let by = fold(xs, map_new(), |m: Map<Bytes, Binding>, x: Binding| first_binding(m, x));
-  match ns {
-    NValue -> { ..b, values: xs, by_value: by },
-    NType -> { ..b, types: xs, by_type: by },
-    NEffect -> { ..b, effects: xs, by_effect: by },
-    NSet -> { ..b, sets: xs, by_set: by },
+fn with_space_bindings(b: Bindings, namespace: Namespace, xs: List<Binding>) -> Bindings = {
+  let by = fold(xs, map_new(), |m: Map<Bytes, Binding>, binding: Binding|
+    first_binding(m, binding));
+  match namespace {
+    ValueSpace -> { ..b, values: xs, by_value: by },
+    TypeSpace -> { ..b, types: xs, by_type: by },
+    EffectSpace -> { ..b, effects: xs, by_effect: by },
+    SetSpace -> { ..b, sets: xs, by_set: by },
   }
 }
 
-fn bpush(b: Bindings, ns: Ns, x: Binding) -> Bindings =
-  match ns {
-    NValue -> { ..b, values: push(b.values, x), by_value: first_binding(b.by_value, x) },
-    NType -> { ..b, types: push(b.types, x), by_type: first_binding(b.by_type, x) },
-    NEffect -> { ..b, effects: push(b.effects, x), by_effect: first_binding(b.by_effect, x) },
-    NSet -> { ..b, sets: push(b.sets, x), by_set: first_binding(b.by_set, x) },
+fn push_binding(bindings: Bindings, namespace: Namespace, binding: Binding) -> Bindings =
+  match namespace {
+    ValueSpace ->
+      {
+        ..bindings,
+        values: push(bindings.values, binding),
+        by_value: first_binding(bindings.by_value, binding),
+      },
+    TypeSpace ->
+      {
+        ..bindings,
+        types: push(bindings.types, binding),
+        by_type: first_binding(bindings.by_type, binding),
+      },
+    EffectSpace ->
+      {
+        ..bindings,
+        effects: push(bindings.effects, binding),
+        by_effect: first_binding(bindings.by_effect, binding),
+      },
+    SetSpace ->
+      {
+        ..bindings,
+        sets: push(bindings.sets, binding),
+        by_set: first_binding(bindings.by_set, binding),
+      },
   }
 
-pub fn lookup(b: Bindings, ns: Ns, name: Bytes) -> Option<Binding> =
+pub fn lookup(bindings: Bindings, namespace: Namespace, name: Bytes) -> Option<Binding> =
   map_get(
-    match ns { NValue -> b.by_value, NType -> b.by_type, NEffect -> b.by_effect, NSet -> b.by_set },
+    match namespace {
+      ValueSpace -> bindings.by_value,
+      TypeSpace -> bindings.by_type,
+      EffectSpace -> bindings.by_effect,
+      SetSpace -> bindings.by_set,
+    },
     name,
   )
 
-pub fn find_modbind(xs: List<ModBind>, binder: Bytes) -> Option<ModBind> =
-  fold(xs, None, |acc: Option<ModBind>, x: ModBind|
-    match acc { Some(_) -> acc, None -> if x.binder == binder { Some(x) } else { None } })
+pub fn find_module_binding(bindings: List<ModuleBinding>, binder: Bytes) -> Option<ModuleBinding> =
+  fold(bindings, None, |acc: Option<ModuleBinding>, binding: ModuleBinding|
+    match acc {
+      Some(_) -> acc,
+      None -> if binding.binder == binder { Some(binding) } else { None },
+    })
 
 fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
   match list_at(xs, i) { Some(x) -> x, None -> panic("an index the tables do not hold") }
@@ -194,34 +249,41 @@ pub fn qualify(module: Bytes, name: Bytes) -> Bytes =
 
 fn is_public(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
 
-pub fn import_module_name(d: ImportDecl) -> Bytes / {abort.raise} =
-  fold(range(0, len(d.path)), b"", |acc: Bytes, i: Int|
-    if i == 0 { at(d.path, i).name } else { bytes_concat_all([acc, b".", at(d.path, i).name]) })
+pub fn import_module_name(decl: ImportDecl) -> Bytes =
+  fold(range(0, len(decl.path)), b"", |acc: Bytes, i: Int|
+    if i == 0 { at(decl.path, i).name }
+    else { bytes_concat_all([acc, b".", at(decl.path, i).name]) })
 
-pub fn path_span(d: ImportDecl) -> Span / {abort.raise} =
-  if len(d.path) == 0 { d.span }
-  else { span_to(at(d.path, 0).span, at(d.path, len(d.path) - 1).span) }
+pub fn path_span(decl: ImportDecl) -> Span =
+  if len(decl.path) == 0 { decl.span }
+  else { span_to(at(decl.path, 0).span, at(decl.path, len(decl.path) - 1).span) }
 
-fn import_binder(d: ImportDecl) -> Option<Bytes> / {abort.raise} =
-  match d.kind {
-    IModule -> if len(d.path) == 0 { None } else { Some(at(d.path, len(d.path) - 1).name) },
+fn import_binder(decl: ImportDecl) -> Option<Bytes> =
+  match decl.kind {
+    IModule -> if len(decl.path) == 0 { None }
+    else { Some(at(decl.path, len(decl.path) - 1).name) },
     IAlias(a) -> Some(a.name),
     INames(_) -> None,
   }
 
-fn binder_span(d: ImportDecl) -> Span / {abort.raise} =
-  match d.kind {
-    IModule -> if len(d.path) == 0 { d.span } else { at(d.path, len(d.path) - 1).span },
+fn binder_span(decl: ImportDecl) -> Span =
+  match decl.kind {
+    IModule -> if len(decl.path) == 0 { decl.span } else { at(decl.path, len(decl.path) - 1).span },
     IAlias(a) -> a.span,
-    INames(_) -> d.span,
+    INames(_) -> decl.span,
   }
 
 // --- Diagnostics ---------------------------------------------------------------
 
-pub fn lab(m: Int, s: Span, primary: Bool, text: Bytes) -> Label =
-  { module: m, start: s.start, end: s.end, primary: primary, text: text }
+pub fn label_at(m: Int, span: Span, primary: Bool, text: Bytes) -> Label =
+  { module: m, start: span.start, end: span.end, primary: primary, text: text }
 
-pub fn diag(code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>) -> Diag =
+pub fn error_with_labels(
+  code: Bytes,
+  message: Bytes,
+  labels: List<Label>,
+  notes: List<Bytes>,
+) -> Diag =
   {
     code: code,
     notes: len(notes),
@@ -233,32 +295,38 @@ pub fn diag(code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>
     fixes: [],
   }
 
-pub fn with_fix(d: Diag, title: Bytes, edits: List<Edit>) -> Diag =
-  { ..d, fixes: push(d.fixes, { title: title, edits: edits }) }
+pub fn with_fix(diag: Diag, title: Bytes, edits: List<Edit>) -> Diag =
+  { ..diag, fixes: push(diag.fixes, { title: title, edits: edits }) }
 
 pub fn insertion(m: Int, at: Int, text: Bytes) -> Edit =
   { module: m, start: at, end: at, text: text }
 
-pub fn diag1(
+pub fn error_at(
   code: Bytes,
   m: Int,
-  s: Span,
+  span: Span,
   message: Bytes,
   label: Bytes,
   notes: List<Bytes>,
-) -> Diag = diag(code, message, [lab(m, s, true, label)], notes)
+) -> Diag = error_with_labels(code, message, [label_at(m, span, true, label)], notes)
 
-pub fn diag2(
+pub fn error_at_and(
   code: Bytes,
   m: Int,
-  s: Span,
+  span: Span,
   message: Bytes,
   label: Bytes,
   m2: Int,
   also: Span,
   also_text: Bytes,
   notes: List<Bytes>,
-) -> Diag = diag(code, message, [lab(m, s, true, label), lab(m2, also, false, also_text)], notes)
+) -> Diag =
+  error_with_labels(
+    code,
+    message,
+    [label_at(m, span, true, label), label_at(m2, also, false, also_text)],
+    notes,
+  )
 
 pub fn backticked(xs: List<Bytes>, sep: Bytes) -> Bytes / {abort.raise} =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| {
@@ -276,49 +344,55 @@ pub fn list_names(xs: List<Bytes>) -> Bytes / {abort.raise} =
     })
   }
 
-pub fn ns_describe(ns: Ns) -> Bytes =
-  match ns {
-    NValue -> b"definition",
-    NType -> b"type",
-    NEffect -> b"effect",
-    NSet -> b"effect set",
+pub fn describe_namespace(namespace: Namespace) -> Bytes =
+  match namespace {
+    ValueSpace -> b"definition",
+    TypeSpace -> b"type",
+    EffectSpace -> b"effect",
+    SetSpace -> b"effect set",
   }
 
-pub fn ns_keyword(ns: Ns) -> Bytes =
-  match ns { NValue -> b"fn", NType -> b"type", NEffect -> b"effect", NSet -> b"effect set" }
+pub fn namespace_keyword(namespace: Namespace) -> Bytes =
+  match namespace {
+    ValueSpace -> b"fn",
+    TypeSpace -> b"type",
+    EffectSpace -> b"effect",
+    SetSpace -> b"effect set",
+  }
 
-pub fn exported_names(d: Decls) -> List<Bytes> =
-  fold(spaces(), [], |acc: List<Bytes>, ns: Ns|
-    fold(space(d, ns), acc, |a: List<Bytes>, x: Declared|
-      if x.public { push(a, x.name) } else { a }))
+pub fn exported_names(decls: Decls) -> List<Bytes> =
+  fold(namespaces(), [], |acc: List<Bytes>, namespace: Namespace|
+    fold(space(decls, namespace), acc, |a: List<Bytes>, declared: Declared|
+      if declared.public { push(a, declared.name) } else { a }))
 
 // --- Declarations ---------------------------------------------------------------
 
 // Every name an item declares; the first declaration wins.
-fn declarations_of(m: Mod) -> Decls =
-  fold(m.module.items, no_decls(), |d: Decls, it: Item|
-    match it {
-      IFn(f) -> declare(d, NValue, m.name, f.name, f.vis),
-      IEffect(e) -> declare(d, NEffect, m.name, e.name, e.vis),
-      IEffectSet(e) -> declare(d, NSet, m.name, e.name, e.vis),
+fn declarations_of(parsed: ParsedModule) -> Decls =
+  fold(parsed.module.items, no_decls(), |decls: Decls, item: Item|
+    match item {
+      IFn(f) -> declare(decls, ValueSpace, parsed.name, f.name, f.vis),
+      IEffect(e) -> declare(decls, EffectSpace, parsed.name, e.name, e.vis),
+      IEffectSet(e) -> declare(decls, SetSpace, parsed.name, e.name, e.vis),
       IType(t) -> {
-        let d2 = declare(d, NType, m.name, t.name, t.vis);
+        let d2 = declare(decls, TypeSpace, parsed.name, t.name, t.vis);
         match t.body {
           // A constructor is as public as its type: a type you cannot match on is not a useful export.
           TDSum(vs) ->
-            fold(vs, d2, |acc: Decls, v: VariantDef| declare(acc, NValue, m.name, v.name, t.vis)),
+            fold(vs, d2, |acc: Decls, variant: VariantDef|
+              declare(acc, ValueSpace, parsed.name, variant.name, t.vis)),
           TDAlias(_) -> d2,
         }
       },
       // None declares a name a reference could reach.
-      _ -> d,
+      _ -> decls,
     })
 
-fn declare(d: Decls, ns: Ns, module: Bytes, name: Ident, vis: Vis) -> Decls =
-  match dlookup(d, ns, name.name) {
-    Some(_) -> d,
+fn declare(decls: Decls, namespace: Namespace, module: Bytes, name: Ident, vis: Vis) -> Decls =
+  match lookup_declared(decls, namespace, name.name) {
+    Some(_) -> decls,
     None ->
-      dpush(d, ns, {
+      push_declared(decls, namespace, {
         name: name.name,
         qualified: qualify(module, name.name),
         public: is_public(vis),
@@ -326,13 +400,13 @@ fn declare(d: Decls, ns: Ns, module: Bytes, name: Ident, vis: Vis) -> Decls =
       }),
   }
 
-fn bindings_of(owner: Int, d: Decls) -> Bindings =
-  fold(spaces(), no_bindings(), |b: Bindings, ns: Ns|
-    with_bspace(
-      b,
-      ns,
-      map(space(d, ns), |x: Declared|
-        { name: x.name, qualified: x.qualified, owner: owner, span: x.span }),
+fn bindings_of(owner: Int, decls: Decls) -> Bindings =
+  fold(namespaces(), no_bindings(), |bindings: Bindings, namespace: Namespace|
+    with_space_bindings(
+      bindings,
+      namespace,
+      map(space(decls, namespace), |declared: Declared|
+        { name: declared.name, qualified: declared.qualified, owner: owner, span: declared.span }),
     ))
 
 // --- Scopes ---------------------------------------------------------------------
@@ -340,14 +414,14 @@ fn bindings_of(owner: Int, d: Decls) -> Bindings =
 type Builder = { scope: Scope, local: Decls, imported: Decls, edges: List<Edge>, diags: List<Diag> }
 
 type World = {
-  mods: List<Mod>,
-  names: List<Entry>,
+  mods: List<ParsedModule>,
+  names: List<ModuleEntry>,
   declarations: List<Decls>,
   declared: List<Bindings>,
   // The packages of the closure: 0 is the root package, and `mod_pkg` maps a module to one.
   // `std` and `compiler` are the built-in packages every package may import; a `mod_pkg` of
   // `shelf` is a module the toolchain ships outside any package, likewise importable by all.
-  pkgs: List<Pkg>,
+  pkgs: List<PackageDeps>,
   mod_pkg: List<Int>,
   std: Int,
   compiler: Int,
@@ -355,51 +429,54 @@ type World = {
 }
 
 // A package for import resolution: the module prefix it grants and the prefixes it declares.
-pub type Pkg = { prefix: Bytes, deps: List<Bytes> }
+pub type PackageDeps = { prefix: Bytes, deps: List<Bytes> }
 
 // Every module one unnamed package, as projects without packages resolve.
-pub fn no_pkgs(
-  mods: List<Mod>,
-) -> { pkgs: List<Pkg>, mod_pkg: List<Int>, std: Int, compiler: Int, shelf: Int } =
+pub fn no_packages(
+  mods: List<ParsedModule>,
+) -> { pkgs: List<PackageDeps>, mod_pkg: List<Int>, std: Int, compiler: Int, shelf: Int } =
   {
     pkgs: [{ prefix: b"", deps: [] }],
-    mod_pkg: map(mods, |_m: Mod| 0),
+    mod_pkg: map(mods, |parsed: ParsedModule| 0),
     std: 1,
     compiler: 2,
     shelf: 3,
   }
 
-fn index_of(names: List<Entry>, name: Bytes) -> Option<Int> =
-  fold(names, None, |acc: Option<Int>, e: Entry|
+fn index_of(names: List<ModuleEntry>, name: Bytes) -> Option<Int> =
+  fold(names, None, |acc: Option<Int>, e: ModuleEntry|
     match acc { Some(_) -> acc, None -> if e.name == name { Some(e.at) } else { None } })
 
-fn one_import(w: World, i: Int, b: Builder, d: ImportDecl) -> Builder / {abort.raise} =
-  match target(w, i, b, d) {
+fn one_import(w: World, i: Int, builder: Builder, decl: ImportDecl) -> Builder =
+  match target(w, i, builder, decl) {
     Found(t) -> {
-      let b2: Builder = { ..b, edges: push(b.edges, { from: i, target: t, span: path_span(d) }) };
-      match d.kind {
+      let b2: Builder = {
+        ..builder,
+        edges: push(builder.edges, { from: i, target: t, span: path_span(decl) }),
+      };
+      match decl.kind {
         INames(names) -> {
-          let key = default_binder(import_module_name(d));
-          let sel = match find_modbind(b2.scope.selective, key) {
+          let key = default_binder(import_module_name(decl));
+          let sel = match find_module_binding(b2.scope.selective, key) {
             Some(_) -> b2.scope.selective,
-            None -> push(b2.scope.selective, { binder: key, target: t, span: path_span(d) }),
+            None -> push(b2.scope.selective, { binder: key, target: t, span: path_span(decl) }),
           };
           let b3: Builder = { ..b2, scope: { ..b2.scope, selective: sel } };
-          fold(names, b3, |acc: Builder, n: Ident| bind_name(w, i, acc, t, n))
+          fold(names, b3, |acc: Builder, ident: Ident| bind_name(w, i, acc, t, ident))
         },
-        _ -> bind_module(w, i, b2, d, t),
+        _ -> bind_module(w, i, b2, decl, t),
       }
     },
-    _ -> b,
+    _ -> builder,
   }
 
 // What an import aims at: a module it may use, no such module, or a module of a package its
 // manifest does not declare (naming the importer and the holder).
-type Aim = | Found(Int) | Missing | Undeclared({ importer: Int, holder: Int })
+type ImportTarget = | Found(Int) | Missing | Undeclared({ importer: Int, holder: Int })
 
 // The module an import names, judged against the package table.
-fn target(w: World, i: Int, b: Builder, d: ImportDecl) -> Aim / {abort.raise} = {
-  let name = import_module_name(d);
+fn target(w: World, i: Int, builder: Builder, decl: ImportDecl) -> ImportTarget = {
+  let name = import_module_name(decl);
   if bytes_len(name) == 0 { Missing } else {
     let p = at(w.mod_pkg, i);
     // A bare import inside a dependency names that package's own modules and nothing
@@ -422,7 +499,7 @@ fn target(w: World, i: Int, b: Builder, d: ImportDecl) -> Aim / {abort.raise} = 
 // A sibling within the importing module's own package: a dependency's `import args` means
 // `<its prefix>.args` — always ahead of another package's bare `args`. The root package and
 // the shelf resolve bare names as written.
-fn sibling(w: World, i: Int, name: Bytes) -> Aim / {abort.raise} = {
+fn sibling(w: World, i: Int, name: Bytes) -> ImportTarget / {abort.raise} = {
   let p = at(w.mod_pkg, i);
   if p == 0 || p >= w.shelf || p >= len(w.pkgs) { Missing } else {
     let prefix = at(w.pkgs, p).prefix;
@@ -437,7 +514,7 @@ fn sibling(w: World, i: Int, name: Bytes) -> Aim / {abort.raise} = {
 
 // An exact hit is usable when it is the importer's own package, the shelf, or a package the
 // importer's manifest declares; anything else is E0132, naming who holds it and who wants it.
-fn declared(w: World, i: Int, t: Int) -> Aim / {abort.raise} = {
+fn declared(w: World, i: Int, t: Int) -> ImportTarget / {abort.raise} = {
   let p = at(w.mod_pkg, i);
   let q = at(w.mod_pkg, t);
   if q == p || q == w.std || q == w.compiler || q >= w.shelf || p >= w.shelf { Found(t) } else {
@@ -450,13 +527,13 @@ fn declared(w: World, i: Int, t: Int) -> Aim / {abort.raise} = {
 fn target_or_report(
   w: World,
   i: Int,
-  b: Builder,
-  d: ImportDecl,
-) -> { b: Builder, t: Option<Int> } / {abort.raise} =
-  match target(w, i, b, d) {
-    Found(t) -> { b: b, t: Some(t) },
+  builder: Builder,
+  decl: ImportDecl,
+) -> { b: Builder, t: Option<Int> } =
+  match target(w, i, builder, decl) {
+    Found(t) -> { b: builder, t: Some(t) },
     Undeclared(u) -> {
-      let name = import_module_name(d);
+      let name = import_module_name(decl);
       let message = if u.holder == 0 {
         bytes_concat_all([
           b"`",
@@ -476,10 +553,10 @@ fn target_or_report(
       };
       {
         b: {
-          ..b,
+          ..builder,
           diags: push(
-            b.diags,
-            diag1(b"E0132", i, path_span(d), message, b"not a declared dependency", [
+            builder.diags,
+            error_at(b"E0132", i, path_span(decl), message, b"not a declared dependency", [
               b"add it to that package's ply.pkg dependencies to import it",
             ]),
           ),
@@ -488,8 +565,8 @@ fn target_or_report(
       }
     },
     Missing -> {
-      let name = import_module_name(d);
-      let near = fold(w.names, [], |acc: List<Bytes>, e: Entry|
+      let name = import_module_name(decl);
+      let near = fold(w.names, [], |acc: List<Bytes>, e: ModuleEntry|
         if bytes_len(e.name) > 0 && bytes_ends_with(e.name, default_binder(name)) {
           push(acc, e.name)
         } else { acc });
@@ -498,13 +575,13 @@ fn target_or_report(
       } else { bytes_concat(b"modules with that last segment: ", backticked(near, b", ")) };
       {
         b: {
-          ..b,
+          ..builder,
           diags: push(
-            b.diags,
-            diag1(
+            builder.diags,
+            error_at(
               b"E0106",
               i,
-              path_span(d),
+              path_span(decl),
               bytes_concat_all([b"no module named `", name, b"` in this program"]),
               b"not found",
               [note],
@@ -516,19 +593,19 @@ fn target_or_report(
     },
   }
 
-fn bind_module(w: World, i: Int, b: Builder, d: ImportDecl, t: Int) -> Builder / {abort.raise} =
-  match import_binder(d) {
-    None -> b,
+fn bind_module(w: World, i: Int, builder: Builder, decl: ImportDecl, t: Int) -> Builder =
+  match import_binder(decl) {
+    None -> builder,
     Some(binder) -> {
-      let s = binder_span(d);
-      match find_modbind(b.scope.modules, binder) {
+      let s = binder_span(decl);
+      match find_module_binding(builder.scope.modules, binder) {
         Some(first) -> {
-          let name = import_module_name(d);
+          let name = import_module_name(decl);
           {
-            ..b,
+            ..builder,
             diags: push(
-              b.diags,
-              diag2(
+              builder.diags,
+              error_at_and(
                 b"E0110",
                 i,
                 s,
@@ -550,31 +627,31 @@ fn bind_module(w: World, i: Int, b: Builder, d: ImportDecl, t: Int) -> Builder /
         },
         None ->
           {
-            ..b,
+            ..builder,
             scope: {
-              ..b.scope,
-              modules: push(b.scope.modules, { binder: binder, target: t, span: s }),
+              ..builder.scope,
+              modules: push(builder.scope.modules, { binder: binder, target: t, span: s }),
             },
           },
       }
     },
   }
 
-fn bind_name(w: World, i: Int, b: Builder, t: Int, name: Ident) -> Builder / {abort.raise} = {
+fn bind_name(w: World, i: Int, builder: Builder, t: Int, name: Ident) -> Builder = {
   let decls = at(w.declarations, t);
   let module = at(w.mods, t).name;
-  let found = filter(spaces(), |ns: Ns|
-    match dlookup(decls, ns, name.name) { Some(_) -> true, None -> false });
+  let found = filter(namespaces(), |namespace: Namespace|
+    match lookup_declared(decls, namespace, name.name) { Some(_) -> true, None -> false });
   if len(found) == 0 {
     let exported = exported_names(decls);
     let note = if len(exported) == 0 {
       bytes_concat_all([b"`", module, b"` exports nothing; mark an item `pub` to export it"])
     } else { bytes_concat_all([b"`", module, b"` exports: ", backticked(exported, b", ")]) };
     {
-      ..b,
+      ..builder,
       diags: push(
-        b.diags,
-        diag1(
+        builder.diags,
+        error_at(
           b"E0101",
           i,
           name.span,
@@ -585,21 +662,24 @@ fn bind_name(w: World, i: Int, b: Builder, t: Int, name: Ident) -> Builder / {ab
       ),
     }
   } else {
-    let public = filter(found, |ns: Ns|
-      match dlookup(decls, ns, name.name) { Some(x) -> x.public, None -> false });
+    let public = filter(found, |namespace: Namespace|
+      match lookup_declared(decls, namespace, name.name) { Some(x) -> x.public, None -> false });
     if len(public) == 0 {
-      let declared = match dlookup(decls, at(found, 0), name.name) {
+      let declared = match lookup_declared(decls, at(found, 0), name.name) {
         Some(x) -> x,
         None -> panic("just found"),
       };
       {
-        ..b,
+        ..builder,
         diags: push(
-          b.diags,
+          builder.diags,
           private_name(i, name.span, t, declared.span, at(found, 0), name.name, module),
         ),
       }
-    } else { fold(public, b, |acc: Builder, ns: Ns| bind_one(w, i, acc, t, name, ns)) }
+    } else {
+      fold(public, builder, |acc: Builder, namespace: Namespace|
+        bind_one(w, i, acc, t, name, namespace))
+    }
   }
 }
 
@@ -608,11 +688,11 @@ pub fn private_name(
   at_: Span,
   owner: Int,
   declared: Span,
-  ns: Ns,
+  namespace: Namespace,
   name: Bytes,
   module: Bytes,
 ) -> Diag =
-  diag2(
+  error_at_and(
     b"E0107",
     m,
     at_,
@@ -624,7 +704,7 @@ pub fn private_name(
     [
       bytes_concat_all([
         b"write `pub ",
-        ns_keyword(ns),
+        namespace_keyword(namespace),
         b" ",
         name,
         b"` in `",
@@ -635,30 +715,37 @@ pub fn private_name(
     ],
   )
 
-fn bind_one(w: World, i: Int, b: Builder, t: Int, name: Ident, ns: Ns) -> Builder / {abort.raise} = {
-  let binding = match lookup(at(w.declared, t), ns, name.name) {
+fn bind_one(
+  w: World,
+  i: Int,
+  builder: Builder,
+  t: Int,
+  name: Ident,
+  namespace: Namespace,
+) -> Builder = {
+  let binding = match lookup(at(w.declared, t), namespace, name.name) {
     Some(x) -> x,
     None -> panic("a public declaration always has a binding"),
   };
   let module = at(w.mods, t).name;
-  match dlookup(b.local, ns, name.name) {
+  match lookup_declared(builder.local, namespace, name.name) {
     // Local-wins was rejected: a local added beside an import would silently steal every existing call site.
     Some(prev) ->
       {
-        ..b,
+        ..builder,
         diags: push(
-          b.diags,
-          diag2(
+          builder.diags,
+          error_at_and(
             b"E0108",
             i,
             name.span,
             bytes_concat_all([
               b"the ",
-              ns_describe(ns),
+              describe_namespace(namespace),
               b" `",
               name.name,
               b"` is both imported and defined in `",
-              b.scope.module,
+              builder.scope.module,
               b"`",
             ]),
             bytes_concat_all([b"imported from `", module, b"` here"]),
@@ -680,19 +767,19 @@ fn bind_one(w: World, i: Int, b: Builder, t: Int, name: Ident, ns: Ns) -> Builde
           ),
         ),
       },
-    None -> match dlookup(b.imported, ns, name.name) {
+    None -> match lookup_declared(builder.imported, namespace, name.name) {
       Some(prev) ->
         {
-          ..b,
+          ..builder,
           diags: push(
-            b.diags,
-            diag2(
+            builder.diags,
+            error_at_and(
               b"E0110",
               i,
               name.span,
               bytes_concat_all([
                 b"the ",
-                ns_describe(ns),
+                describe_namespace(namespace),
                 b" `",
                 name.name,
                 b"` is imported twice",
@@ -712,19 +799,19 @@ fn bind_one(w: World, i: Int, b: Builder, t: Int, name: Ident, ns: Ns) -> Builde
           ),
         },
       None -> {
-        let imported = dpush(b.imported, ns, {
+        let imported = push_declared(builder.imported, namespace, {
           name: name.name,
           qualified: binding.qualified,
           public: true,
           span: name.span,
         });
-        let bound = bpush(b.scope.bound, ns, {
+        let bound = push_binding(builder.scope.bound, namespace, {
           name: name.name,
           qualified: binding.qualified,
           owner: t,
           span: name.span,
         });
-        { ..b, imported: imported, scope: { ..b.scope, bound: bound } }
+        { ..builder, imported: imported, scope: { ..builder.scope, bound: bound } }
       },
     },
   }
@@ -734,7 +821,7 @@ fn bind_one(w: World, i: Int, b: Builder, t: Int, name: Ident, ns: Ns) -> Builde
 
 type Cycle = { nodes: List<Int>, closing: Edge }
 
-type Dfs = {
+type OrderSearch = {
   color: List<Int>,
   order: List<Int>,
   cycles: List<Cycle>,
@@ -744,7 +831,7 @@ type Dfs = {
 }
 
 // One iterative DFS finds every cycle and, when there is none, leaves the dependency-first load order.
-fn traverse(edges: List<List<Edge>>) -> Dfs / {abort.raise} = {
+fn traverse(edges: List<List<Edge>>) -> OrderSearch / {abort.raise} = {
   let n = len(edges);
   let steps = fold(edges, 0, |acc: Int, es: List<Edge>| acc + len(es));
   let start = {
@@ -755,20 +842,20 @@ fn traverse(edges: List<List<Edge>>) -> Dfs / {abort.raise} = {
     path: [],
     stack: [],
   };
-  fold(range(0, n), start, |s: Dfs, root: Int|
+  fold(range(0, n), start, |s: OrderSearch, root: Int|
     if at(s.color, root) != 0 { s } else {
-      let opened: Dfs = {
+      let opened: OrderSearch = {
         ..s,
         color: set_at(s.color, root, 1),
         path: push(s.path, root),
         stack: [{ v: root, edge: 0 }],
       };
-      iterate(opened, 2 * (n + steps) + 4, |d: Dfs|
-        if len(d.stack) == 0 { Stop(d) } else { Continue(dfs_step(edges, d)) })
+      iterate(opened, 2 * (n + steps) + 4, |d: OrderSearch|
+        if len(d.stack) == 0 { Stop(d) } else { Continue(order_step(edges, d)) })
     })
 }
 
-fn dfs_step(edges: List<List<Edge>>, d: Dfs) -> Dfs / {abort.raise} = {
+fn order_step(edges: List<List<Edge>>, d: OrderSearch) -> OrderSearch / {abort.raise} = {
   let top = at(d.stack, len(d.stack) - 1);
   let popped = map(range(0, len(d.stack) - 1), |i: Int| at(d.stack, i));
   let out = at(edges, top.v);
@@ -819,23 +906,23 @@ fn canonical(nodes: List<Int>) -> List<Int> / {abort.raise} =
     map(range(0, len(nodes)), |i: Int| at(nodes, (least + i) % len(nodes)))
   }
 
-fn cycle_diag(mods: List<Mod>, c: Cycle) -> Diag / {abort.raise} = {
-  let names = map(c.nodes, |i: Int| at(mods, i).name);
+fn cycle_diag(mods: List<ParsedModule>, cycle: Cycle) -> Diag = {
+  let names = map(cycle.nodes, |i: Int| at(mods, i).name);
   let first = if len(names) == 0 { b"" } else { at(names, 0) };
-  if len(c.nodes) == 1 {
-    diag1(
+  if len(cycle.nodes) == 1 {
+    error_at(
       b"E0109",
-      c.closing.from,
-      c.closing.span,
+      cycle.closing.from,
+      cycle.closing.span,
       bytes_concat_all([b"module `", first, b"` imports itself"]),
       b"a module cannot import itself",
       [b"every name a module declares is already in scope in its own file"],
     )
   } else {
-    diag1(
+    error_at(
       b"E0109",
-      c.closing.from,
-      c.closing.span,
+      cycle.closing.from,
+      cycle.closing.span,
       bytes_concat_all([b"module cycle: ", backticked(names, b" -> "), b" -> `", first, b"`"]),
       b"this import closes the cycle",
       [
@@ -848,22 +935,31 @@ fn cycle_diag(mods: List<Mod>, c: Cycle) -> Diag / {abort.raise} = {
 
 // --- `find`: what a name denotes in a module -----------------------------------------
 
-pub fn find(r: Resolved, module: Int, ns: Ns, q: QName) -> Option<Binding> / {abort.raise} = {
-  let scope = at(r.scopes, module);
-  match q.module {
-    None -> lookup(scope.bound, ns, q.name.name),
-    Some(binder) -> match find_modbind(scope.modules, binder.name) {
+pub fn find(
+  resolved: Resolved,
+  module: Int,
+  namespace: Namespace,
+  qname: QName,
+) -> Option<Binding> = {
+  let scope = at(resolved.scopes, module);
+  match qname.module {
+    None -> lookup(scope.bound, namespace, qname.name.name),
+    Some(binder) -> match find_module_binding(scope.modules, binder.name) {
       None -> None,
-      Some(mb) -> match dlookup(at(r.declarations, mb.target), ns, q.name.name) {
+      Some(mb) -> match lookup_declared(
+          at(resolved.declarations, mb.target),
+          namespace,
+          qname.name.name,
+        ) {
         None -> None,
         Some(d) -> if !d.public { None }
-        else { lookup(at(r.declared, mb.target), ns, q.name.name) },
+        else { lookup(at(resolved.declared, mb.target), namespace, qname.name.name) },
       },
     },
   }
 }
 
-pub fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(_) -> false }
+pub fn is_bare(qname: QName) -> Bool = match qname.module { None -> true, Some(_) -> false }
 
 pub fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
   bytes_len(name) > 0 && bytes_at(name, 0) >= 65 && bytes_at(name, 0) <= 90
@@ -871,8 +967,8 @@ pub fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
 // --- Defaults: what a default may be -----------------------------------------------------
 
 // A pure, closed expression: a value, not something that runs.
-fn is_default_expr(e: Expr) -> Bool / {abort.raise} =
-  match e {
+fn is_default_expr(expr: Expr) -> Bool =
+  match expr {
     EApp(a) ->
       len(a.named) == 0 && (match a.func { EVar(v) -> is_ctor_name(v.name.name.name), _ -> false })
         && all_default(a.args),
@@ -895,9 +991,9 @@ fn is_default_expr(e: Expr) -> Bool / {abort.raise} =
           acc && is_default_expr(arm.body)
             && (match arm.guard { None -> true, Some(g) -> is_default_expr(g) })),
     EBlock(b) ->
-      fold(b.stmts, true, |acc: Bool, s: Stmt|
+      fold(b.stmts, true, |acc: Bool, stmt: Stmt|
           acc
-            && (match s {
+            && (match stmt {
               SLet(l) -> is_default_expr(l.value),
               SLetElse(l) -> is_default_expr(l.value) && is_default_expr(l.fallback),
               SExpr(x) -> is_default_expr(x),
@@ -912,8 +1008,8 @@ fn is_default_expr(e: Expr) -> Bool / {abort.raise} =
     EBad(_) -> true,
   }
 
-fn all_default(xs: List<Expr>) -> Bool / {abort.raise} =
-  fold(xs, true, |acc: Bool, x: Expr| acc && is_default_expr(x))
+fn all_default(exprs: List<Expr>) -> Bool =
+  fold(exprs, true, |acc: Bool, expr: Expr| acc && is_default_expr(expr))
 
 pub fn pattern_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
   match p {
@@ -948,7 +1044,7 @@ fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) 
     EApp(a) -> {
       let o1 = mentions(a.func, params, bound, out);
       let o2 = fold(a.args, o1, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc));
-      fold(a.named, o2, |acc: List<Bytes>, n: NamedArg| mentions(n.value, params, bound, acc))
+      fold(a.named, o2, |acc: List<Bytes>, arg: NamedArg| mentions(arg.value, params, bound, acc))
     },
     EBinary(b) -> mentions(b.rhs, params, bound, mentions(b.lhs, params, bound, out)),
     EUnary(u) -> mentions(u.operand, params, bound, out),
@@ -1012,31 +1108,33 @@ fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) 
 
 // --- Defaults: qualifying one against the module that wrote it -----------------------------
 
-type Qual = {
+type Qualifier = {
   owner: Int,
   public: Bool,
   bound: List<Bytes>,
-  imports: List<ModBind>,
+  imports: List<ModuleBinding>,
   diags: List<Diag>,
 }
-type QOut = { q: Qual, e: Expr }
+type Qualified = { q: Qualifier, e: Expr }
 
-fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut / {abort.raise} =
-  match e {
-    EVar(v) -> if !is_bare(v.name) || contains_bytes(q.bound, v.name.name.name) { { q: q, e: e } }
-    else {
-      match find(r, q.owner, NValue, v.name) {
+fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualified =
+  match expr {
+    EVar(v) -> if !is_bare(v.name) || contains_bytes(qualifier.bound, v.name.name.name) {
+      { q: qualifier, e: expr }
+    } else {
+      match find(resolved, qualifier.owner, ValueSpace, v.name) {
         // A builtin or a prelude constructor: in reach everywhere, so it needs no qualifying.
-        None -> { q: q, e: e },
-        Some(b) -> if b.owner == q.owner && q.public && !decl_public(r, q.owner, v.name.name.name) {
+        None -> { q: qualifier, e: expr },
+        Some(b) -> if b.owner == qualifier.owner && qualifier.public
+            && !decl_public(resolved, qualifier.owner, v.name.name.name) {
           {
             q: {
-              ..q,
+              ..qualifier,
               diags: push(
-                q.diags,
-                diag1(
+                qualifier.diags,
+                error_at(
                   b"E0122",
-                  q.owner,
+                  qualifier.owner,
                   v.name.span,
                   bytes_concat_all([
                     b"a default on a `pub fn` cannot mention `",
@@ -1050,16 +1148,17 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut / {abort.raise} =
                 ),
               ),
             },
-            e: e,
+            e: expr,
           }
         } else {
-          let module = at(r.scopes, b.owner).module;
-          let imports = match find_modbind(q.imports, module) {
-            Some(_) -> q.imports,
-            None -> push(q.imports, { binder: module, target: b.owner, span: dummy_span() }),
+          let module = at(resolved.scopes, b.owner).module;
+          let imports = match find_module_binding(qualifier.imports, module) {
+            Some(_) -> qualifier.imports,
+            None ->
+              push(qualifier.imports, { binder: module, target: b.owner, span: dummy_span() }),
           };
           {
-            q: { ..q, imports: imports },
+            q: { ..qualifier, imports: imports },
             e: EVar({
               span: v.span,
               name: {
@@ -1073,23 +1172,24 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut / {abort.raise} =
       }
     },
     ELambda(l) -> {
-      let mark = len(q.bound);
-      let inner = fold(l.params, q.bound, |acc: List<Bytes>, p: Param| push(acc, p.name.name));
-      let o: QOut = qexpr(r, { ..q, bound: inner }, l.body);
+      let mark = len(qualifier.bound);
+      let inner = fold(l.params, qualifier.bound, |acc: List<Bytes>, p: Param|
+        push(acc, p.name.name));
+      let o: Qualified = qualify_expr(resolved, { ..qualifier, bound: inner }, l.body);
       {
         q: { ..o.q, bound: take_bytes(o.q.bound, mark) },
         e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }),
       }
     },
     EApp(a) -> {
-      let f = qexpr(r, q, a.func);
-      let args = qexprs(r, f.q, a.args);
+      let f = qualify_expr(resolved, qualifier, a.func);
+      let args = qualify_exprs(resolved, f.q, a.args);
       let named = fold(
         a.named,
         { q: args.q, xs: [] },
-        |acc: { q: Qual, xs: List<NamedArg> }, n: NamedArg| {
-          let o = qexpr(r, acc.q, n.value);
-          { q: o.q, xs: push(acc.xs, { name: n.name, value: o.e, span: n.span }) }
+        |acc: { q: Qualifier, xs: List<NamedArg> }, arg: NamedArg| {
+          let o = qualify_expr(resolved, acc.q, arg.value);
+          { q: o.q, xs: push(acc.xs, { name: arg.name, value: o.e, span: arg.span }) }
         },
       );
       {
@@ -1098,21 +1198,21 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut / {abort.raise} =
       }
     },
     EMatch(m) -> {
-      let s: QOut = qexpr(r, q, m.scrutinee);
+      let s: Qualified = qualify_expr(resolved, qualifier, m.scrutinee);
       let arms = fold(
         m.arms,
         { q: s.q, xs: [] },
-        |acc: { q: Qual, xs: List<MatchArm> }, arm: MatchArm| {
+        |acc: { q: Qualifier, xs: List<MatchArm> }, arm: MatchArm| {
           let mark = len(acc.q.bound);
           let inner = { ..acc.q, bound: pattern_binders(arm.pat, acc.q.bound) };
-          let g: { q: Qual, e: Option<Expr> } = match arm.guard {
+          let g: { q: Qualifier, e: Option<Expr> } = match arm.guard {
             None -> { q: inner, e: None },
             Some(x) -> {
-              let o: QOut = qexpr(r, inner, x);
+              let o: Qualified = qualify_expr(resolved, inner, x);
               { q: o.q, e: Some(o.e) }
             },
           };
-          let body: QOut = qexpr(r, g.q, arm.body);
+          let body: Qualified = qualify_expr(resolved, g.q, arm.body);
           {
             q: { ..body.q, bound: take_bytes(body.q.bound, mark) },
             xs: push(acc.xs, { pat: arm.pat, guard: g.e, body: body.e, span: arm.span }),
@@ -1122,37 +1222,37 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut / {abort.raise} =
       { q: arms.q, e: EMatch({ span: m.span, scrutinee: s.e, arms: arms.xs }) }
     },
     EBlock(b) -> {
-      let mark = len(q.bound);
-      let stmts: { q: Qual, xs: List<Stmt> } = fold(
+      let mark = len(qualifier.bound);
+      let stmts: { q: Qualifier, xs: List<Stmt> } = fold(
         b.stmts,
-        { q: q, xs: [] },
-        |acc: { q: Qual, xs: List<Stmt> }, s: Stmt|
+        { q: qualifier, xs: [] },
+        |acc: { q: Qualifier, xs: List<Stmt> }, s: Stmt|
           match s {
             SLet(l) -> {
-              let o: QOut = qexpr(r, acc.q, l.value);
+              let o: Qualified = qualify_expr(resolved, acc.q, l.value);
               {
                 q: { ..o.q, bound: pattern_binders(l.pat, o.q.bound) },
                 xs: push(acc.xs, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
               }
             },
             SLetElse(l) -> {
-              let o: QOut = qexpr(r, acc.q, l.value);
-              let fb: QOut = qexpr(r, o.q, l.fallback);
+              let o: Qualified = qualify_expr(resolved, acc.q, l.value);
+              let fb: Qualified = qualify_expr(resolved, o.q, l.fallback);
               {
                 q: { ..fb.q, bound: pattern_binders(l.pat, fb.q.bound) },
                 xs: push(acc.xs, SLetElse({ ..l, value: o.e, fallback: fb.e })),
               }
             },
             SExpr(x) -> {
-              let o: QOut = qexpr(r, acc.q, x);
+              let o: Qualified = qualify_expr(resolved, acc.q, x);
               { q: o.q, xs: push(acc.xs, SExpr(o.e)) }
             },
           },
       );
-      let tail: { q: Qual, e: Option<Expr> } = match b.tail {
+      let tail: { q: Qualifier, e: Option<Expr> } = match b.tail {
         None -> { q: stmts.q, e: None },
         Some(t) -> {
-          let o: QOut = qexpr(r, stmts.q, t);
+          let o: Qualified = qualify_expr(resolved, stmts.q, t);
           { q: o.q, e: Some(o.e) }
         },
       };
@@ -1162,55 +1262,55 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut / {abort.raise} =
       }
     },
     EBinary(b) -> {
-      let l = qexpr(r, q, b.lhs);
-      let rr = qexpr(r, l.q, b.rhs);
+      let l = qualify_expr(resolved, qualifier, b.lhs);
+      let rr = qualify_expr(resolved, l.q, b.rhs);
       { q: rr.q, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
     },
     EUnary(u) -> {
-      let o: QOut = qexpr(r, q, u.operand);
+      let o: Qualified = qualify_expr(resolved, qualifier, u.operand);
       { q: o.q, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
     },
     EIf(i) -> {
-      let c = qexpr(r, q, i.cond);
-      let t = qexpr(r, c.q, i.then_branch);
-      let el = qexpr(r, t.q, i.else_branch);
+      let c = qualify_expr(resolved, qualifier, i.cond);
+      let t = qualify_expr(resolved, c.q, i.then_branch);
+      let el = qualify_expr(resolved, t.q, i.else_branch);
       { q: el.q, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
     },
     ERecord(rec) -> {
-      let o = qfields(r, q, rec.fields);
+      let o = qualify_fields(resolved, qualifier, rec.fields);
       { q: o.q, e: ERecord({ span: rec.span, fields: o.xs }) }
     },
     ERecordUpdate(rec) -> {
-      let b = qexpr(r, q, rec.base);
-      let o = qfields(r, b.q, rec.fields);
+      let b = qualify_expr(resolved, qualifier, rec.base);
+      let o = qualify_fields(resolved, b.q, rec.fields);
       { q: o.q, e: ERecordUpdate({ span: rec.span, base: b.e, fields: o.xs }) }
     },
     EField(f) -> {
-      let o: QOut = qexpr(r, q, f.base);
+      let o: Qualified = qualify_expr(resolved, qualifier, f.base);
       { q: o.q, e: EField({ span: f.span, base: o.e, field: f.field }) }
     },
     EList(l) -> {
-      let o = qexprs(r, q, l.items);
+      let o = qualify_exprs(resolved, qualifier, l.items);
       { q: o.q, e: EList({ span: l.span, items: o.xs }) }
     },
     ETry(t) -> {
-      let o: QOut = qexpr(r, q, t.operand);
+      let o: Qualified = qualify_expr(resolved, qualifier, t.operand);
       { q: o.q, e: ETry({ span: t.span, operand: o.e }) }
     },
     // Refused by `is_default_expr` already; reached only after the checker has reported it.
     EPerform(p) -> {
-      let o = qexprs(r, q, p.args);
+      let o = qualify_exprs(resolved, qualifier, p.args);
       {
         q: o.q,
         e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
       }
     },
     EHandle(h) -> {
-      let o: QOut = qexpr(r, q, h.body);
+      let o: Qualified = qualify_expr(resolved, qualifier, h.body);
       { q: o.q, e: EHandle({ span: h.span, body: o.e, ret: h.ret, clauses: h.clauses }) }
     },
     EWithCell(c) -> {
-      let o: QOut = qexpr(r, q, c.body);
+      let o: Qualified = qualify_expr(resolved, qualifier, c.body);
       {
         q: o.q,
         e: EWithCell({
@@ -1223,35 +1323,46 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut / {abort.raise} =
       }
     },
     ESimulate(s) -> {
-      let o: QOut = qexpr(r, q, s.body);
+      let o: Qualified = qualify_expr(resolved, qualifier, s.body);
       { q: o.q, e: ESimulate({ span: s.span, body: o.e }) }
     },
     EParallel(v) -> {
-      let o = qexprs(r, q, v.branches);
+      let o = qualify_exprs(resolved, qualifier, v.branches);
       { q: o.q, e: EParallel({ span: v.span, branches: o.xs }) }
     },
-    ELit(_) -> { q: q, e: e },
-    EBad(_) -> { q: q, e: e },
+    ELit(_) -> { q: qualifier, e: expr },
+    EBad(_) -> { q: qualifier, e: expr },
   }
 
-fn qexprs(r: Resolved, q: Qual, xs: List<Expr>) -> { q: Qual, xs: List<Expr> } / {abort.raise} =
-  fold(xs, { q: q, xs: [] }, |acc: { q: Qual, xs: List<Expr> }, x: Expr| {
-    let o = qexpr(r, acc.q, x);
+fn qualify_exprs(
+  resolved: Resolved,
+  qualifier: Qualifier,
+  exprs: List<Expr>,
+) -> { q: Qualifier, xs: List<Expr> } =
+  fold(exprs, { q: qualifier, xs: [] }, |acc: { q: Qualifier, xs: List<Expr> }, expr: Expr| {
+    let o = qualify_expr(resolved, acc.q, expr);
     { q: o.q, xs: push(acc.xs, o.e) }
   })
 
-fn qfields(
-  r: Resolved,
-  q: Qual,
-  xs: List<RecField>,
-) -> { q: Qual, xs: List<RecField> } / {abort.raise} =
-  fold(xs, { q: q, xs: [] }, |acc: { q: Qual, xs: List<RecField> }, f: RecField| {
-    let o = qexpr(r, acc.q, f.value);
-    { q: o.q, xs: push(acc.xs, { name: f.name, value: o.e }) }
-  })
+fn qualify_fields(
+  resolved: Resolved,
+  qualifier: Qualifier,
+  fields: List<RecField>,
+) -> { q: Qualifier, xs: List<RecField> } =
+  fold(
+    fields,
+    { q: qualifier, xs: [] },
+    |acc: { q: Qualifier, xs: List<RecField> }, field: RecField| {
+      let o = qualify_expr(resolved, acc.q, field.value);
+      { q: o.q, xs: push(acc.xs, { name: field.name, value: o.e }) }
+    },
+  )
 
-fn decl_public(r: Resolved, owner: Int, name: Bytes) -> Bool / {abort.raise} =
-  match dlookup(at(r.declarations, owner), NValue, name) { Some(d) -> d.public, None -> false }
+fn decl_public(resolved: Resolved, owner: Int, name: Bytes) -> Bool =
+  match lookup_declared(at(resolved.declarations, owner), ValueSpace, name) {
+    Some(d) -> d.public,
+    None -> false,
+  }
 
 // --- Effect sets ---------------------------------------------------------------------------
 // A set stands for its atoms, each meaning what it means in the module that wrote it. A row of that
@@ -1284,13 +1395,13 @@ type SetNode = {
 // Each module's sets by name; the first declaration of a name is the set.
 type SetTable = { nodes: List<SetNode>, by_module: List<Map<Bytes, Int>>, diags: List<Diag> }
 
-fn set_table(mods: List<Mod>) -> SetTable / {abort.raise} =
-  fold(range(0, len(mods)), { nodes: [], by_module: [], diags: [] }, |t: SetTable, m: Int|
+fn set_table(mods: List<ParsedModule>) -> SetTable =
+  fold(range(0, len(mods)), { nodes: [], by_module: [], diags: [] }, |table: SetTable, m: Int|
     fold(
       at(mods, m).module.items,
-      { ..t, by_module: push(t.by_module, map_new()) },
-      |acc: SetTable, it: Item|
-        match it {
+      { ..table, by_module: push(table.by_module, map_new()) },
+      |acc: SetTable, item: Item|
+        match item {
           IEffectSet(d) -> {
             let mine = at(acc.by_module, m);
             match map_get(mine, d.name.name) {
@@ -1299,7 +1410,7 @@ fn set_table(mods: List<Mod>) -> SetTable / {abort.raise} =
                   ..acc,
                   diags: push(
                     acc.diags,
-                    diag2(
+                    error_at_and(
                       b"E0105",
                       m,
                       d.name.span,
@@ -1334,10 +1445,10 @@ fn set_table(mods: List<Mod>) -> SetTable / {abort.raise} =
         },
     ))
 
-fn unknown_set(r: Resolved, m: Int, q: QName) -> Diag / {abort.raise} = {
-  let scope = at(r.scopes, m);
-  let n = q.name.name;
-  let effect_notes = match lookup(scope.bound, NEffect, n) {
+fn unknown_set(resolved: Resolved, m: Int, qname: QName) -> Diag = {
+  let scope = at(resolved.scopes, m);
+  let n = qname.name.name;
+  let effect_notes = match lookup(scope.bound, EffectSpace, n) {
     Some(_) ->
       [
         bytes_concat_all([
@@ -1353,14 +1464,14 @@ fn unknown_set(r: Resolved, m: Int, q: QName) -> Diag / {abort.raise} = {
       ],
     None -> [],
   };
-  let named = map(scope.bound.sets, |b: Binding| b.name);
+  let named = map(scope.bound.sets, |binding: Binding| binding.name);
   let known = if len(named) == 0 {
     b"this module names no `effect set`: declare one, or import one by name from the module that declares it `pub`"
   } else { bytes_concat(b"the sets this module names: ", backticked(named, b", ")) };
-  diag1(
+  error_at(
     b"E0114",
     m,
-    q.span,
+    qname.span,
     bytes_concat_all([b"no `effect set` named `", n, b"` here"]),
     b"neither declared nor imported here",
     push(effect_notes, known),
@@ -1368,48 +1479,56 @@ fn unknown_set(r: Resolved, m: Int, q: QName) -> Diag / {abort.raise} = {
 }
 
 // `div` in a row is divergence, an atom with no operation to name, rather than a set.
-fn is_div_name(q: QName) -> Bool = q.module == None && q.name.name == b"div"
+fn is_div_name(qname: QName) -> Bool = qname.module == None && qname.name.name == b"div"
 
-fn div_expr(q: QName) -> AtomExpr =
-  { eff: q, mode: MRead, op: None, resource: None, every: false, bounded: false, span: q.span }
+fn div_expr(qname: QName) -> AtomExpr =
+  {
+    eff: qname,
+    mode: MRead,
+    op: None,
+    resource: None,
+    every: false,
+    bounded: false,
+    span: qname.span,
+  }
 
-// The set `q` names in module `m`: one it declares or imports by name, or one a module binder reaches.
-fn set_named(r: Resolved, t: SetTable, m: Int, q: QName) -> Result<Int, Diag> / {abort.raise} = {
-  let scope = at(r.scopes, m);
-  let name = q.name.name;
-  match q.module {
-    None -> match lookup(scope.bound, NSet, name) {
-      Some(b) -> match map_get(at(t.by_module, b.owner), name) {
+// The set `qname` names in module `m`: one it declares or imports by name, or one a module binder reaches.
+fn set_named(resolved: Resolved, table: SetTable, m: Int, qname: QName) -> Result<Int, Diag> = {
+  let scope = at(resolved.scopes, m);
+  let name = qname.name.name;
+  match qname.module {
+    None -> match lookup(scope.bound, SetSpace, name) {
+      Some(b) -> match map_get(at(table.by_module, b.owner), name) {
         Some(id) -> Ok(id),
-        None -> Err(unknown_set(r, m, q)),
+        None -> Err(unknown_set(resolved, m, qname)),
       },
-      None -> Err(unknown_set(r, m, q)),
+      None -> Err(unknown_set(resolved, m, qname)),
     },
-    Some(binder) -> match find_modbind(scope.modules, binder.name) {
+    Some(binder) -> match find_module_binding(scope.modules, binder.name) {
       None ->
         Err(
-          diag1(
+          error_at(
             b"E0114",
             m,
-            q.span,
+            qname.span,
             bytes_concat_all([b"no module is imported as `", binder.name, b"`"]),
             b"not a module imported by this file",
             [b"import the module that declares the set, or import the set by name"],
           ),
         ),
       Some(mb) -> {
-        let module = at(r.scopes, mb.target).module;
-        match dlookup(at(r.declarations, mb.target), NSet, name) {
+        let module = at(resolved.scopes, mb.target).module;
+        match lookup_declared(at(resolved.declarations, mb.target), SetSpace, name) {
           None -> {
             let exported = map(
-              filter(at(r.declarations, mb.target).sets, |d: Declared| d.public),
+              filter(at(resolved.declarations, mb.target).sets, |d: Declared| d.public),
               |d: Declared| d.name,
             );
             Err(
-              diag1(
+              error_at(
                 b"E0114",
                 m,
-                q.span,
+                qname.span,
                 bytes_concat_all([
                   b"module `",
                   module,
@@ -1429,11 +1548,11 @@ fn set_named(r: Resolved, t: SetTable, m: Int, q: QName) -> Result<Int, Diag> / 
             )
           },
           Some(d) -> if !d.public && mb.target != m {
-            Err(private_name(m, q.span, mb.target, d.span, NSet, name, module))
+            Err(private_name(m, qname.span, mb.target, d.span, SetSpace, name, module))
           } else {
-            match map_get(at(t.by_module, mb.target), name) {
+            match map_get(at(table.by_module, mb.target), name) {
               Some(id) -> Ok(id),
-              None -> Err(unknown_set(r, m, q)),
+              None -> Err(unknown_set(resolved, m, qname)),
             }
           },
         }
@@ -1442,14 +1561,14 @@ fn set_named(r: Resolved, t: SetTable, m: Int, q: QName) -> Result<Int, Diag> / 
   }
 }
 
-fn set_includes(r: Resolved, t: SetTable) -> SetTable / {abort.raise} =
-  fold(range(0, len(t.nodes)), t, |acc: SetTable, id: Int| {
+fn set_includes(resolved: Resolved, table: SetTable) -> SetTable =
+  fold(range(0, len(table.nodes)), table, |acc: SetTable, id: Int| {
     let node = at(acc.nodes, id);
     let walked = fold(
       node.def.includes,
       { diags: acc.diags, xs: [] },
-      |w: { diags: List<Diag>, xs: List<Option<Int>> }, q: QName|
-        match set_named(r, acc, node.module, q) {
+      |w: { diags: List<Diag>, xs: List<Option<Int>> }, qname: QName|
+        match set_named(resolved, acc, node.module, qname) {
           Ok(i) -> { ..w, xs: push(w.xs, Some(i)) },
           Err(d) -> { diags: push(w.diags, d), xs: push(w.xs, None) },
         },
@@ -1457,32 +1576,32 @@ fn set_includes(r: Resolved, t: SetTable) -> SetTable / {abort.raise} =
     { ..acc, diags: walked.diags, nodes: set_at(acc.nodes, id, { ..node, includes: walked.xs }) }
   })
 
-type SetDfs = {
+type SetSearch = {
   color: List<Int>,
   path: List<Int>,
   work: List<{ node: Int, next: Int }>,
   t: SetTable,
 }
 
-fn set_cycles(t: SetTable) -> SetTable / {abort.raise} = {
-  let n = len(t.nodes);
-  let steps = fold(t.nodes, 0, |acc: Int, s: SetNode| acc + len(s.includes));
-  let start: SetDfs = { color: map(range(0, n), |i: Int| 0), path: [], work: [], t: t };
-  let done = fold(range(0, n), start, |d: SetDfs, root: Int|
+fn set_cycles(table: SetTable) -> SetTable = {
+  let n = len(table.nodes);
+  let steps = fold(table.nodes, 0, |acc: Int, node: SetNode| acc + len(node.includes));
+  let start: SetSearch = { color: map(range(0, n), |i: Int| 0), path: [], work: [], t: table };
+  let done = fold(range(0, n), start, |d: SetSearch, root: Int|
     if at(d.color, root) != 0 { d } else {
-      let opened: SetDfs = {
+      let opened: SetSearch = {
         ..d,
         color: set_at(d.color, root, 1),
         path: push(d.path, root),
         work: [{ node: root, next: 0 }],
       };
-      iterate(opened, 2 * (n + steps) + 4, |x: SetDfs|
-        if len(x.work) == 0 { Stop(x) } else { Continue(set_dfs_step(x)) })
+      iterate(opened, 2 * (n + steps) + 4, |x: SetSearch|
+        if len(x.work) == 0 { Stop(x) } else { Continue(set_search_step(x)) })
     });
   done.t
 }
 
-fn set_dfs_step(d: SetDfs) -> SetDfs / {abort.raise} = {
+fn set_search_step(d: SetSearch) -> SetSearch / {abort.raise} = {
   let top = at(d.work, len(d.work) - 1);
   let rest = first_n(d.work, len(d.work) - 1);
   let out = at(d.t.nodes, top.node).includes;
@@ -1517,25 +1636,33 @@ fn set_dfs_step(d: SetDfs) -> SetDfs / {abort.raise} = {
   }
 }
 
-fn set_cycle(t: SetTable, cycle: List<Int>) -> Diag / {abort.raise} = {
-  let head = at(t.nodes, at(cycle, 0));
+fn set_cycle(table: SetTable, cycle: List<Int>) -> Diag = {
+  let head = at(table.nodes, at(cycle, 0));
   let others = drop(cycle, 1);
-  let names = push(map(cycle, |i: Int| at(t.nodes, i).def.name.name), head.def.name.name);
+  let names = push(map(cycle, |i: Int| at(table.nodes, i).def.name.name), head.def.name.name);
   let primary = if len(cycle) == 1 { b"this set names itself" } else {
     bytes_concat_all([
       b"expands through ",
-      backticked(map(others, |i: Int| at(t.nodes, i).def.name.name), b", "),
+      backticked(map(others, |i: Int| at(table.nodes, i).def.name.name), b", "),
       b" and back",
     ])
   };
-  diag(
+  error_with_labels(
     b"E0115",
     bytes_concat_all([b"effect set `", head.def.name.name, b"` contains itself"]),
     fold(
       others,
-      [lab(head.module, head.def.name.span, true, primary)],
-      |ls: List<Label>, i: Int|
-        push(ls, lab(at(t.nodes, i).module, at(t.nodes, i).def.name.span, false, b"on the cycle")),
+      [label_at(head.module, head.def.name.span, true, primary)],
+      |labels: List<Label>, i: Int|
+        push(
+          labels,
+          label_at(
+            at(table.nodes, i).module,
+            at(table.nodes, i).def.name.span,
+            false,
+            b"on the cycle",
+          ),
+        ),
     ),
     [
       bytes_concat(b"the cycle is ", backticked(names, b" -> ")),
@@ -1544,36 +1671,40 @@ fn set_cycle(t: SetTable, cycle: List<Int>) -> Diag / {abort.raise} = {
   )
 }
 
-// The module that declares the effect `q` names in `home`, and its name there: none for a prelude
+// The module that declares the effect `qname` names in `home`, and its name there: none for a prelude
 // effect, or one nothing declares.
 fn effect_owner(
-  r: Resolved,
+  resolved: Resolved,
   home: Int,
-  q: QName,
-) -> Option<{ target: Int, name: Bytes }> / {abort.raise} = {
-  let scope = at(r.scopes, home);
-  match q.module {
-    Some(b) -> match find_modbind(scope.modules, b.name) {
-      Some(mb) -> match dlookup(at(r.declarations, mb.target), NEffect, q.name.name) {
-        Some(_) -> Some({ target: mb.target, name: q.name.name }),
+  qname: QName,
+) -> Option<{ target: Int, name: Bytes }> = {
+  let scope = at(resolved.scopes, home);
+  match qname.module {
+    Some(b) -> match find_module_binding(scope.modules, b.name) {
+      Some(mb) -> match lookup_declared(
+          at(resolved.declarations, mb.target),
+          EffectSpace,
+          qname.name.name,
+        ) {
+        Some(_) -> Some({ target: mb.target, name: qname.name.name }),
         None -> None,
       },
       None -> None,
     },
-    None -> match lookup(scope.bound, NEffect, q.name.name) {
+    None -> match lookup(scope.bound, EffectSpace, qname.name.name) {
       Some(b) -> Some({ target: b.owner, name: b.name }),
       None -> None,
     },
   }
 }
 
-fn mode_word(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
+fn mode_word(mode: Mode) -> Bytes = match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
 
 // What an atom names, wherever it was written: its effect's program-wide name, mode, operation and label.
-fn member_key(r: Resolved, mb: Member) -> Bytes / {abort.raise} = {
-  let a = mb.atom;
-  let eff = match effect_owner(r, mb.home, a.eff) {
-    Some(o) -> qualify(at(r.scopes, o.target).module, o.name),
+fn member_key(resolved: Resolved, member: Member) -> Bytes = {
+  let a = member.atom;
+  let eff = match effect_owner(resolved, member.home, a.eff) {
+    Some(o) -> qualify(at(resolved.scopes, o.target).module, o.name),
     None -> match a.eff.module {
       Some(b) -> bytes_concat_all([b.name, b"::", a.eff.name.name]),
       None -> a.eff.name.name,
@@ -1590,41 +1721,42 @@ fn member_key(r: Resolved, mb: Member) -> Bytes / {abort.raise} = {
   ])
 }
 
-type Keyed = { key: Bytes, mb: Member }
+type KeyedMember = { key: Bytes, member: Member }
 
-fn insert_keyed(sorted: List<Keyed>, k: Keyed) -> List<Keyed> / {abort.raise} = {
+fn insert_keyed(sorted: List<KeyedMember>, k: KeyedMember) -> List<KeyedMember> / {abort.raise} = {
   let n = len(sorted);
   let i = fold(range(0, n), n, |acc: Int, j: Int|
     if acc < n { acc } else if bytes_before(k.key, at(sorted, j).key) { j } else { acc });
-  fold(after_n(sorted, i), push(first_n(sorted, i), k), |acc: List<Keyed>, x: Keyed| push(acc, x))
+  fold(after_n(sorted, i), push(first_n(sorted, i), k), |acc: List<KeyedMember>, x: KeyedMember|
+    push(acc, x))
 }
 
 // Ordered by what each atom names; of two that name the same, the first written is kept.
-fn canonical_members(r: Resolved, xs: List<Member>) -> List<Member> / {abort.raise} = {
-  let sorted = fold(xs, [], |acc: List<Keyed>, mb: Member|
-    insert_keyed(acc, { key: member_key(r, mb), mb: mb }));
+fn canonical_members(resolved: Resolved, xs: List<Member>) -> List<Member> = {
+  let sorted = fold(xs, [], |acc: List<KeyedMember>, member: Member|
+    insert_keyed(acc, { key: member_key(resolved, member), member: member }));
   map(
-    fold(sorted, [], |acc: List<Keyed>, k: Keyed|
-      if len(acc) > 0 && at(acc, len(acc) - 1).key == k.key { acc } else { push(acc, k) }),
-    |k: Keyed| k.mb,
+    fold(sorted, [], |acc: List<KeyedMember>, keyed: KeyedMember|
+      if len(acc) > 0 && at(acc, len(acc) - 1).key == keyed.key { acc } else { push(acc, keyed) }),
+    |keyed: KeyedMember| keyed.member,
   )
 }
 
 type SetWork = { t: SetTable, done: List<Bool>, work: List<{ node: Int, visited: Bool }> }
 
-fn set_expand_all(r: Resolved, t: SetTable) -> SetTable / {abort.raise} = {
-  let n = len(t.nodes);
-  let steps = fold(t.nodes, 0, |acc: Int, s: SetNode| acc + len(s.includes));
-  let start: SetWork = { t: t, done: map(range(0, n), |i: Int| false), work: [] };
+fn set_expand_all(resolved: Resolved, table: SetTable) -> SetTable = {
+  let n = len(table.nodes);
+  let steps = fold(table.nodes, 0, |acc: Int, node: SetNode| acc + len(node.includes));
+  let start: SetWork = { t: table, done: map(range(0, n), |i: Int| false), work: [] };
   let finished = fold(range(0, n), start, |x: SetWork, root: Int|
     if at(x.done, root) || at(x.t.nodes, root).cyclic { x } else {
       iterate({ ..x, work: [{ node: root, visited: false }] }, 4 * (n + steps) + 4, |y: SetWork|
-        if len(y.work) == 0 { Stop(y) } else { Continue(set_expand_step(r, y)) })
+        if len(y.work) == 0 { Stop(y) } else { Continue(set_expand_step(resolved, y)) })
     });
   finished.t
 }
 
-fn set_expand_step(r: Resolved, x: SetWork) -> SetWork / {abort.raise} = {
+fn set_expand_step(resolved: Resolved, x: SetWork) -> SetWork = {
   let top = at(x.work, len(x.work) - 1);
   let rest = first_n(x.work, len(x.work) - 1);
   let node = at(x.t.nodes, top.node);
@@ -1642,10 +1774,11 @@ fn set_expand_step(r: Resolved, x: SetWork) -> SetWork / {abort.raise} = {
     );
     { ..x, work: pushed }
   } else {
-    let own = map(node.def.atoms, |a: AtomExpr| { atom: a, home: node.module });
+    let own = map(node.def.atoms, |atom: AtomExpr| { atom: atom, home: node.module });
     let all = fold(node.includes, own, |acc: List<Member>, e: Option<Int>|
       match e {
-        Some(i) -> fold(at(x.t.nodes, i).members, acc, |ms: List<Member>, mb: Member| push(ms, mb)),
+        Some(i) ->
+          fold(at(x.t.nodes, i).members, acc, |ms: List<Member>, member: Member| push(ms, member)),
         None -> acc,
       });
     {
@@ -1654,39 +1787,39 @@ fn set_expand_step(r: Resolved, x: SetWork) -> SetWork / {abort.raise} = {
       done: set_at(x.done, top.node, true),
       t: {
         ..x.t,
-        nodes: set_at(x.t.nodes, top.node, { ..node, members: canonical_members(r, all) }),
+        nodes: set_at(x.t.nodes, top.node, { ..node, members: canonical_members(resolved, all) }),
       },
     }
   }
 }
 
-fn moved_to(a: AtomExpr, span: Span) -> AtomExpr =
+fn moved_to(atom: AtomExpr, span: Span) -> AtomExpr =
   {
     eff: {
-      module: match a.eff.module { Some(b) -> Some({ name: b.name, span: span }), None -> None },
-      name: { name: a.eff.name.name, span: span },
+      module: match atom.eff.module { Some(b) -> Some({ name: b.name, span: span }), None -> None },
+      name: { name: atom.eff.name.name, span: span },
       span: span,
     },
-    mode: a.mode,
-    op: match a.op { Some(o) -> Some({ name: o.name, span: span }), None -> None },
-    resource: match a.resource { Some(x) -> Some({ name: x.name, span: span }), None -> None },
-    every: a.every,
-    bounded: a.bounded,
+    mode: atom.mode,
+    op: match atom.op { Some(o) -> Some({ name: o.name, span: span }), None -> None },
+    resource: match atom.resource { Some(x) -> Some({ name: x.name, span: span }), None -> None },
+    every: atom.every,
+    bounded: atom.bounded,
     span: span,
   }
 
-type Usable = { atom: AtomExpr, bind: Option<ModBind> }
+type Usable = { atom: AtomExpr, bind: Option<ModuleBinding> }
 
 // A member as module `m` writes it at `span`: as written in its own module, and through the module
 // that declares its effect anywhere else. An effect that resolves to no module, a prelude one or a
 // misspelling, keeps its written name, and the checker answers for it where the set is named.
-fn usable(r: Resolved, m: Int, mb: Member, span: Span) -> Usable / {abort.raise} =
-  if mb.home == m { { atom: mb.atom, bind: None } } else {
-    let moved = moved_to(mb.atom, span);
-    match effect_owner(r, mb.home, mb.atom.eff) {
+fn usable(resolved: Resolved, m: Int, member: Member, span: Span) -> Usable =
+  if member.home == m { { atom: member.atom, bind: None } } else {
+    let moved = moved_to(member.atom, span);
+    match effect_owner(resolved, member.home, member.atom.eff) {
       None -> { atom: moved, bind: None },
       Some(o) -> {
-        let module = at(r.scopes, o.target).module;
+        let module = at(resolved.scopes, o.target).module;
         if bytes_len(module) == 0 { { atom: moved, bind: None } } else {
           let binder = reached_binder(module);
           {
@@ -1705,31 +1838,37 @@ fn usable(r: Resolved, m: Int, mb: Member, span: Span) -> Usable / {abort.raise}
     }
   }
 
-fn with_reach(xs: List<ModBind>, b: Option<ModBind>) -> List<ModBind> =
+fn with_reach(xs: List<ModuleBinding>, b: Option<ModuleBinding>) -> List<ModuleBinding> =
   match b {
     None -> xs,
-    Some(x) -> match find_modbind(xs, x.binder) { Some(_) -> xs, None -> push(xs, x) },
+    Some(x) -> match find_module_binding(xs, x.binder) { Some(_) -> xs, None -> push(xs, x) },
   }
 
-type Rows = { r: Resolved, t: SetTable, module: Int, reached: List<ModBind>, diags: List<Diag> }
+type RowExpander = {
+  r: Resolved,
+  t: SetTable,
+  module: Int,
+  reached: List<ModuleBinding>,
+  diags: List<Diag>,
+}
 
-type Rowed = { s: Rows, r: RowExpr }
+type ExpandedRow = { s: RowExpander, r: RowExpr }
 
-fn row_with_sets(s: Rows, row: RowExpr) -> Rowed / {abort.raise} =
-  if len(row.aliases) == 0 { { s: s, r: row } } else {
+fn row_with_sets(expander: RowExpander, row: RowExpr) -> ExpandedRow =
+  if len(row.aliases) == 0 { { s: expander, r: row } } else {
     let o = fold(
       row.aliases,
-      { s: s, atoms: row.atoms },
-      |acc: { s: Rows, atoms: List<AtomExpr> }, q: QName|
-        if is_div_name(q) { { ..acc, atoms: push(acc.atoms, div_expr(q)) } } else {
-          match set_named(acc.s.r, acc.s.t, acc.s.module, q) {
+      { s: expander, atoms: row.atoms },
+      |acc: { s: RowExpander, atoms: List<AtomExpr> }, qname: QName|
+        if is_div_name(qname) { { ..acc, atoms: push(acc.atoms, div_expr(qname)) } } else {
+          match set_named(acc.s.r, acc.s.t, acc.s.module, qname) {
             Err(d) -> { ..acc, s: { ..acc.s, diags: push(acc.s.diags, d) } },
             Ok(id) ->
               fold(
                 at(acc.s.t.nodes, id).members,
                 acc,
-                |a: { s: Rows, atoms: List<AtomExpr> }, mb: Member| {
-                  let u = usable(a.s.r, a.s.module, mb, q.span);
+                |a: { s: RowExpander, atoms: List<AtomExpr> }, member: Member| {
+                  let u = usable(a.s.r, a.s.module, member, qname.span);
                   {
                     s: { ..a.s, reached: with_reach(a.s.reached, u.bind) },
                     atoms: push(a.atoms, u.atom),
@@ -1752,38 +1891,44 @@ fn row_with_sets(s: Rows, row: RowExpr) -> Rowed / {abort.raise} =
   }
 
 // Each row of the module with every set it names expanded; each set's own item with all it stands for.
-fn module_sets(r: Resolved, t: SetTable, m: Int, md: Mod) -> { md: Mod, s: Rows } / {abort.raise} = {
-  let start: Rows = { r: r, t: t, module: m, reached: [], diags: [] };
+fn module_sets(
+  resolved: Resolved,
+  table: SetTable,
+  m: Int,
+  parsed: ParsedModule,
+) -> { md: ParsedModule, s: RowExpander } = {
+  let start: RowExpander = { r: resolved, t: table, module: m, reached: [], diags: [] };
   let walked = fold(
-    md.module.items,
+    parsed.module.items,
     { s: start, items: [] },
-    |acc: { s: Rows, items: List<Item> }, it: Item|
-      match it {
-        IEffectSet(d) -> match map_get(at(t.by_module, m), d.name.name) {
-          Some(id) -> if at(t.nodes, id).def.span == d.span {
-            let us = map(at(t.nodes, id).members, |mb: Member| usable(r, m, mb, d.name.span));
+    |acc: { s: RowExpander, items: List<Item> }, item: Item|
+      match item {
+        IEffectSet(d) -> match map_get(at(table.by_module, m), d.name.name) {
+          Some(id) -> if at(table.nodes, id).def.span == d.span {
+            let us = map(at(table.nodes, id).members, |member: Member|
+              usable(resolved, m, member, d.name.span));
             {
               s: {
                 ..acc.s,
-                reached: fold(us, acc.s.reached, |xs: List<ModBind>, u: Usable|
-                  with_reach(xs, u.bind)),
+                reached: fold(us, acc.s.reached, |bindings: List<ModuleBinding>, u: Usable|
+                  with_reach(bindings, u.bind)),
               },
               items: push(acc.items, IEffectSet({ ..d, expansion: map(us, |u: Usable| u.atom) })),
             }
-          } else { { ..acc, items: push(acc.items, it) } },
-          None -> { ..acc, items: push(acc.items, it) },
+          } else { { ..acc, items: push(acc.items, item) } },
+          None -> { ..acc, items: push(acc.items, item) },
         },
         _ -> {
-          let o = rows_item(acc.s, it);
+          let o = rows_item(acc.s, item);
           { s: o.s, items: push(acc.items, o.it) }
         },
       },
   );
   {
     md: {
-      name: md.name,
-      module: { imports: md.module.imports, items: walked.items },
-      derived: md.derived,
+      name: parsed.name,
+      module: { imports: parsed.module.imports, items: walked.items },
+      derived: parsed.derived,
     },
     s: walked.s,
   }
@@ -1792,23 +1937,23 @@ fn module_sets(r: Resolved, t: SetTable, m: Int, md: Mod) -> { md: Mod, s: Rows 
 // Every row an item writes, with the sets it names expanded. Rows are walked on lambda parameter
 // types and `let` annotations, never on a lambda's return type.
 
-fn rows_opt(s: Rows, r: Option<RowExpr>) -> { s: Rows, r: Option<RowExpr> } / {abort.raise} =
+fn rows_opt(expander: RowExpander, r: Option<RowExpr>) -> { s: RowExpander, r: Option<RowExpr> } =
   match r {
-    None -> { s: s, r: None },
+    None -> { s: expander, r: None },
     Some(x) -> {
-      let o = row_with_sets(s, x);
+      let o = row_with_sets(expander, x);
       { s: o.s, r: Some(o.r) }
     },
   }
 
-fn rows_ty(s: Rows, t: TypeExpr) -> { s: Rows, t: TypeExpr } / {abort.raise} =
-  match t {
+fn rows_ty(expander: RowExpander, ty: TypeExpr) -> { s: RowExpander, t: TypeExpr } =
+  match ty {
     TCon(c) -> {
-      let o = rows_tys(s, c.args);
+      let o = rows_tys(expander, c.args);
       { s: o.s, t: TCon({ span: c.span, name: c.name, args: o.ts }) }
     },
     TFn(ft) -> {
-      let ps = rows_tys(s, ft.params);
+      let ps = rows_tys(expander, ft.params);
       let r = rows_ty(ps.s, ft.ret);
       let e = rows_opt(r.s, ft.effects);
       { s: e.s, t: TFn({ span: ft.span, params: ps.ts, ret: r.t, effects: e.r }) }
@@ -1816,84 +1961,97 @@ fn rows_ty(s: Rows, t: TypeExpr) -> { s: Rows, t: TypeExpr } / {abort.raise} =
     TRecord(r) -> {
       let fs = fold(
         r.fields,
-        { s: s, fs: [] },
-        |acc: { s: Rows, fs: List<{ name: Ident, ty: TypeExpr }> }, fd: { name: Ident, ty: TypeExpr }| {
+        { s: expander, fs: [] },
+        |acc: { s: RowExpander, fs: List<{ name: Ident, ty: TypeExpr }> }, fd: { name: Ident, ty: TypeExpr }| {
           let o = rows_ty(acc.s, fd.ty);
           { s: o.s, fs: push(acc.fs, { name: fd.name, ty: o.t }) }
         },
       );
       { s: fs.s, t: TRecord({ span: r.span, fields: fs.fs }) }
     },
-    _ -> { s: s, t: t },
+    _ -> { s: expander, t: ty },
   }
 
-fn rows_tys(s: Rows, ts: List<TypeExpr>) -> { s: Rows, ts: List<TypeExpr> } / {abort.raise} =
-  fold(ts, { s: s, ts: [] }, |acc: { s: Rows, ts: List<TypeExpr> }, t: TypeExpr| {
-    let o = rows_ty(acc.s, t);
+fn rows_tys(expander: RowExpander, tys: List<TypeExpr>) -> { s: RowExpander, ts: List<TypeExpr> } =
+  fold(tys, { s: expander, ts: [] }, |acc: { s: RowExpander, ts: List<TypeExpr> }, ty: TypeExpr| {
+    let o = rows_ty(acc.s, ty);
     { s: o.s, ts: push(acc.ts, o.t) }
   })
 
-fn rows_opt_ty(s: Rows, t: Option<TypeExpr>) -> { s: Rows, t: Option<TypeExpr> } / {abort.raise} =
-  match t {
-    None -> { s: s, t: None },
+fn rows_opt_ty(
+  expander: RowExpander,
+  ty: Option<TypeExpr>,
+) -> { s: RowExpander, t: Option<TypeExpr> } =
+  match ty {
+    None -> { s: expander, t: None },
     Some(x) -> {
-      let o = rows_ty(s, x);
+      let o = rows_ty(expander, x);
       { s: o.s, t: Some(o.t) }
     },
   }
 
-fn rows_params(s: Rows, ps: List<Param>) -> { s: Rows, ps: List<Param> } / {abort.raise} =
-  fold(ps, { s: s, ps: [] }, |acc: { s: Rows, ps: List<Param> }, p: Param| {
-    let o = rows_opt_ty(acc.s, p.ty);
-    { s: o.s, ps: push(acc.ps, { name: p.name, ty: o.t, default: p.default, span: p.span }) }
+fn rows_params(expander: RowExpander, params: List<Param>) -> { s: RowExpander, ps: List<Param> } =
+  fold(params, { s: expander, ps: [] }, |acc: { s: RowExpander, ps: List<Param> }, param: Param| {
+    let o = rows_opt_ty(acc.s, param.ty);
+    {
+      s: o.s,
+      ps: push(acc.ps, { name: param.name, ty: o.t, default: param.default, span: param.span }),
+    }
   })
 
-fn rows_exprs(s: Rows, xs: List<Expr>) -> { s: Rows, xs: List<Expr> } / {abort.raise} =
-  fold(xs, { s: s, xs: [] }, |acc: { s: Rows, xs: List<Expr> }, x: Expr| {
-    let o = rows_expr(acc.s, x);
+fn rows_exprs(expander: RowExpander, exprs: List<Expr>) -> { s: RowExpander, xs: List<Expr> } =
+  fold(exprs, { s: expander, xs: [] }, |acc: { s: RowExpander, xs: List<Expr> }, expr: Expr| {
+    let o = rows_expr(acc.s, expr);
     { s: o.s, xs: push(acc.xs, o.e) }
   })
 
-fn rows_fields(s: Rows, fs: List<RecField>) -> { s: Rows, fs: List<RecField> } / {abort.raise} =
-  fold(fs, { s: s, fs: [] }, |acc: { s: Rows, fs: List<RecField> }, fd: RecField| {
-    let o = rows_expr(acc.s, fd.value);
-    { s: o.s, fs: push(acc.fs, { name: fd.name, value: o.e }) }
-  })
+fn rows_fields(
+  expander: RowExpander,
+  fields: List<RecField>,
+) -> { s: RowExpander, fs: List<RecField> } =
+  fold(
+    fields,
+    { s: expander, fs: [] },
+    |acc: { s: RowExpander, fs: List<RecField> }, field: RecField| {
+      let o = rows_expr(acc.s, field.value);
+      { s: o.s, fs: push(acc.fs, { name: field.name, value: o.e }) }
+    },
+  )
 
-fn rows_opt_expr(s: Rows, e: Option<Expr>) -> { s: Rows, e: Option<Expr> } / {abort.raise} =
-  match e {
-    None -> { s: s, e: None },
+fn rows_opt_expr(expander: RowExpander, expr: Option<Expr>) -> { s: RowExpander, e: Option<Expr> } =
+  match expr {
+    None -> { s: expander, e: None },
     Some(x) -> {
-      let o = rows_expr(s, x);
+      let o = rows_expr(expander, x);
       { s: o.s, e: Some(o.e) }
     },
   }
 
-fn rows_expr(s: Rows, e: Expr) -> { s: Rows, e: Expr } / {abort.raise} =
-  match e {
+fn rows_expr(expander: RowExpander, expr: Expr) -> { s: RowExpander, e: Expr } =
+  match expr {
     EBinary(b) -> {
-      let l = rows_expr(s, b.lhs);
+      let l = rows_expr(expander, b.lhs);
       let r = rows_expr(l.s, b.rhs);
       { s: r.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
     },
     EUnary(u) -> {
-      let o = rows_expr(s, u.operand);
+      let o = rows_expr(expander, u.operand);
       { s: o.s, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
     },
     ELambda(l) -> {
-      let ps = rows_params(s, l.params);
+      let ps = rows_params(expander, l.params);
       let b = rows_expr(ps.s, l.body);
       { s: b.s, e: ELambda({ span: l.span, body: b.e, params: ps.ps, ret: l.ret }) }
     },
     EApp(a) -> {
-      let callee = rows_expr(s, a.func);
+      let callee = rows_expr(expander, a.func);
       let args = rows_exprs(callee.s, a.args);
       let named = fold(
         a.named,
         { s: args.s, ns: [] },
-        |acc: { s: Rows, ns: List<NamedArg> }, n: NamedArg| {
-          let o = rows_expr(acc.s, n.value);
-          { s: o.s, ns: push(acc.ns, { name: n.name, value: o.e, span: n.span }) }
+        |acc: { s: RowExpander, ns: List<NamedArg> }, arg: NamedArg| {
+          let o = rows_expr(acc.s, arg.value);
+          { s: o.s, ns: push(acc.ns, { name: arg.name, value: o.e, span: arg.span }) }
         },
       );
       {
@@ -1902,17 +2060,17 @@ fn rows_expr(s: Rows, e: Expr) -> { s: Rows, e: Expr } / {abort.raise} =
       }
     },
     EIf(i) -> {
-      let c = rows_expr(s, i.cond);
+      let c = rows_expr(expander, i.cond);
       let t = rows_expr(c.s, i.then_branch);
       let el = rows_expr(t.s, i.else_branch);
       { s: el.s, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
     },
     EMatch(m) -> {
-      let sc = rows_expr(s, m.scrutinee);
+      let sc = rows_expr(expander, m.scrutinee);
       let arms = fold(
         m.arms,
         { s: sc.s, arms: [] },
-        |acc: { s: Rows, arms: List<MatchArm> }, arm: MatchArm| {
+        |acc: { s: RowExpander, arms: List<MatchArm> }, arm: MatchArm| {
           let g = rows_opt_expr(acc.s, arm.guard);
           let b = rows_expr(g.s, arm.body);
           { s: b.s, arms: push(acc.arms, { pat: arm.pat, guard: g.e, body: b.e, span: arm.span }) }
@@ -1921,67 +2079,71 @@ fn rows_expr(s: Rows, e: Expr) -> { s: Rows, e: Expr } / {abort.raise} =
       { s: arms.s, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
     },
     EBlock(b) -> {
-      let stmts = fold(b.stmts, { s: s, ss: [] }, |acc: { s: Rows, ss: List<Stmt> }, sm: Stmt|
-        match sm {
-          SLet(l) -> {
-            let t = rows_opt_ty(acc.s, l.ty);
-            let v = rows_expr(t.s, l.value);
-            { s: v.s, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: t.t, value: v.e })) }
+      let stmts = fold(
+        b.stmts,
+        { s: expander, ss: [] },
+        |acc: { s: RowExpander, ss: List<Stmt> }, stmt: Stmt|
+          match stmt {
+            SLet(l) -> {
+              let t = rows_opt_ty(acc.s, l.ty);
+              let v = rows_expr(t.s, l.value);
+              { s: v.s, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: t.t, value: v.e })) }
+            },
+            SLetElse(l) -> {
+              let t = rows_opt_ty(acc.s, l.ty);
+              let v = rows_expr(t.s, l.value);
+              let fb = rows_expr(v.s, l.fallback);
+              {
+                s: fb.s,
+                ss: push(
+                  acc.ss,
+                  SLetElse({ span: l.span, pat: l.pat, ty: t.t, value: v.e, fallback: fb.e }),
+                ),
+              }
+            },
+            SExpr(x) -> {
+              let o = rows_expr(acc.s, x);
+              { s: o.s, ss: push(acc.ss, SExpr(o.e)) }
+            },
           },
-          SLetElse(l) -> {
-            let t = rows_opt_ty(acc.s, l.ty);
-            let v = rows_expr(t.s, l.value);
-            let fb = rows_expr(v.s, l.fallback);
-            {
-              s: fb.s,
-              ss: push(
-                acc.ss,
-                SLetElse({ span: l.span, pat: l.pat, ty: t.t, value: v.e, fallback: fb.e }),
-              ),
-            }
-          },
-          SExpr(x) -> {
-            let o = rows_expr(acc.s, x);
-            { s: o.s, ss: push(acc.ss, SExpr(o.e)) }
-          },
-        });
+      );
       let tl = rows_opt_expr(stmts.s, b.tail);
       { s: tl.s, e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
     },
     ERecord(r) -> {
-      let o = rows_fields(s, r.fields);
+      let o = rows_fields(expander, r.fields);
       { s: o.s, e: ERecord({ span: r.span, fields: o.fs }) }
     },
     ERecordUpdate(r) -> {
-      let b = rows_expr(s, r.base);
+      let b = rows_expr(expander, r.base);
       let o = rows_fields(b.s, r.fields);
       { s: o.s, e: ERecordUpdate({ span: r.span, base: b.e, fields: o.fs }) }
     },
     EField(fd) -> {
-      let o = rows_expr(s, fd.base);
+      let o = rows_expr(expander, fd.base);
       { s: o.s, e: EField({ span: fd.span, base: o.e, field: fd.field }) }
     },
     ETry(t) -> {
-      let o = rows_expr(s, t.operand);
+      let o = rows_expr(expander, t.operand);
       { s: o.s, e: ETry({ span: t.span, operand: o.e }) }
     },
     EList(l) -> {
-      let o = rows_exprs(s, l.items);
+      let o = rows_exprs(expander, l.items);
       { s: o.s, e: EList({ span: l.span, items: o.xs }) }
     },
     EPerform(p) -> {
-      let o = rows_exprs(s, p.args);
+      let o = rows_exprs(expander, p.args);
       {
         s: o.s,
         e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
       }
     },
     EHandle(h) -> {
-      let b = rows_expr(s, h.body);
+      let b = rows_expr(expander, h.body);
       let cs = fold(
         h.clauses,
         { s: b.s, cs: [] },
-        |acc: { s: Rows, cs: List<HandleClause> }, c: HandleClause| {
+        |acc: { s: RowExpander, cs: List<HandleClause> }, c: HandleClause| {
           let o = rows_expr(acc.s, c.body);
           {
             s: o.s,
@@ -2009,7 +2171,7 @@ fn rows_expr(s: Rows, e: Expr) -> { s: Rows, e: Expr } / {abort.raise} =
       { s: r.s, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
     },
     EWithCell(c) -> {
-      let i = rows_expr(s, c.init);
+      let i = rows_expr(expander, c.init);
       let b = rows_expr(i.s, c.body);
       {
         s: b.s,
@@ -2023,31 +2185,31 @@ fn rows_expr(s: Rows, e: Expr) -> { s: Rows, e: Expr } / {abort.raise} =
       }
     },
     ESimulate(x) -> {
-      let o = rows_expr(s, x.body);
+      let o = rows_expr(expander, x.body);
       { s: o.s, e: ESimulate({ span: x.span, body: o.e }) }
     },
     EParallel(x) -> {
-      let o = rows_exprs(s, x.branches);
+      let o = rows_exprs(expander, x.branches);
       { s: o.s, e: EParallel({ span: x.span, branches: o.xs }) }
     },
-    _ -> { s: s, e: e },
+    _ -> { s: expander, e: expr },
   }
 
-fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } / {abort.raise} =
-  match it {
+fn rows_item(expander: RowExpander, item: Item) -> { s: RowExpander, it: Item } =
+  match item {
     IFn(d) -> {
-      let ps = rows_params(s, d.params);
+      let ps = rows_params(expander, d.params);
       let r = rows_opt_ty(ps.s, d.ret);
       let ef = rows_opt(r.s, d.effects);
       let spec = fold(
         d.spec,
         { s: ef.s, xs: [] },
-        |acc: { s: Rows, xs: List<SpecClause> }, c: SpecClause| {
-          let o = rows_expr(acc.s, c.expr);
-          { s: o.s, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
+        |acc: { s: RowExpander, xs: List<SpecClause> }, clause: SpecClause| {
+          let o = rows_expr(acc.s, clause.expr);
+          { s: o.s, xs: push(acc.xs, { kind: clause.kind, expr: o.e, span: clause.span }) }
         },
       );
-      let measured: { s: Rows, e: Option<Expr> } = match d.decreases {
+      let measured: { s: RowExpander, e: Option<Expr> } = match d.decreases {
         None -> { s: spec.s, e: None },
         Some(e) -> {
           let o = rows_expr(spec.s, e);
@@ -2077,7 +2239,7 @@ fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } / {abort.raise} =
     },
     IType(d) -> match d.body {
       TDAlias(t) -> {
-        let o = rows_ty(s, t);
+        let o = rows_ty(expander, t);
         {
           s: o.s,
           it: IType({
@@ -2092,10 +2254,10 @@ fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } / {abort.raise} =
       TDSum(vs) -> {
         let out = fold(
           vs,
-          { s: s, vs: [] },
-          |acc: { s: Rows, vs: List<VariantDef> }, v: VariantDef| {
-            let o = rows_tys(acc.s, v.fields);
-            { s: o.s, vs: push(acc.vs, { name: v.name, fields: o.ts, span: v.span }) }
+          { s: expander, vs: [] },
+          |acc: { s: RowExpander, vs: List<VariantDef> }, variant: VariantDef| {
+            let o = rows_tys(acc.s, variant.fields);
+            { s: o.s, vs: push(acc.vs, { name: variant.name, fields: o.ts, span: variant.span }) }
           },
         );
         {
@@ -2111,22 +2273,26 @@ fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } / {abort.raise} =
       },
     },
     IEffect(d) -> {
-      let ops = fold(d.ops, { s: s, ops: [] }, |acc: { s: Rows, ops: List<OpDef> }, op: OpDef| {
-        let ps = rows_tys(acc.s, op.params);
-        let r = rows_ty(ps.s, op.ret);
-        {
-          s: r.s,
-          ops: push(acc.ops, {
-            name: op.name,
-            mode: op.mode,
-            resource_param: op.resource_param,
-            ty_params: op.ty_params,
-            params: ps.ts,
-            ret: r.t,
-            span: op.span,
-          }),
-        }
-      });
+      let ops = fold(
+        d.ops,
+        { s: expander, ops: [] },
+        |acc: { s: RowExpander, ops: List<OpDef> }, op: OpDef| {
+          let ps = rows_tys(acc.s, op.params);
+          let r = rows_ty(ps.s, op.ret);
+          {
+            s: r.s,
+            ops: push(acc.ops, {
+              name: op.name,
+              mode: op.mode,
+              resource_param: op.resource_param,
+              ty_params: op.ty_params,
+              params: ps.ts,
+              ret: r.t,
+              span: op.span,
+            }),
+          }
+        },
+      );
       {
         s: ops.s,
         it: IEffect({
@@ -2139,7 +2305,7 @@ fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } / {abort.raise} =
       }
     },
     ITest(d) -> {
-      let o = rows_expr(s, d.body);
+      let o = rows_expr(expander, d.body);
       {
         s: o.s,
         it: ITest({
@@ -2152,10 +2318,14 @@ fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } / {abort.raise} =
       }
     },
     ILaw(d) -> {
-      let bs = fold(d.binders, { s: s, bs: [] }, |acc: { s: Rows, bs: List<Binder> }, b: Binder| {
-        let o = rows_ty(acc.s, b.ty);
-        { s: o.s, bs: push(acc.bs, { name: b.name, ty: o.t, span: b.span }) }
-      });
+      let bs = fold(
+        d.binders,
+        { s: expander, bs: [] },
+        |acc: { s: RowExpander, bs: List<Binder> }, b: Binder| {
+          let o = rows_ty(acc.s, b.ty);
+          { s: o.s, bs: push(acc.bs, { name: b.name, ty: o.t, span: b.span }) }
+        },
+      );
       let g = rows_opt_expr(bs.s, d.guard);
       let b = rows_expr(g.s, d.body);
       {
@@ -2172,17 +2342,18 @@ fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } / {abort.raise} =
         }),
       }
     },
-    _ -> { s: s, it: it },
+    _ -> { s: expander, it: item },
   }
 
-type SetsExpanded = { r: Resolved, mods: List<Mod>, diags: List<Diag> }
+type SetsExpanded = { r: Resolved, mods: List<ParsedModule>, diags: List<Diag> }
 
-fn expand_sets(r: Resolved, mods: List<Mod>) -> SetsExpanded / {abort.raise} = {
+fn expand_sets(r: Resolved, mods: List<ParsedModule>) -> SetsExpanded / {abort.raise} = {
   let t = set_expand_all(r, set_cycles(set_includes(r, set_table(mods))));
   fold(range(0, len(mods)), { r: r, mods: [], diags: t.diags }, |acc: SetsExpanded, m: Int| {
     let o = module_sets(r, t, m, at(mods, m));
     {
-      r: fold(o.s.reached, acc.r, |rr: Resolved, mb: ModBind| reach(rr, m, mb.binder, mb.target)),
+      r: fold(o.s.reached, acc.r, |rr: Resolved, binding: ModuleBinding|
+        reach(rr, m, binding.binder, binding.target)),
       mods: push(acc.mods, o.md),
       diags: bytes_concat_diags(acc.diags, o.s.diags),
     }
@@ -2191,58 +2362,61 @@ fn expand_sets(r: Resolved, mods: List<Mod>) -> SetsExpanded / {abort.raise} = {
 
 // --- Defaults: the signatures ---------------------------------------------------------------
 
-type PInfo = { name: Bytes, default: Option<Expr>, imports: List<ModBind> }
-type Sig = { name: Bytes, params: List<PInfo> }
+type ParamInfo = { name: Bytes, default: Option<Expr>, imports: List<ModuleBinding> }
+type Signature = { name: Bytes, params: List<ParamInfo> }
 type Collected = {
-  sigs: List<Sig>,
+  sigs: List<Signature>,
   owner_imports: List<{ module: Int, binder: Bytes, target: Int }>,
   diags: List<Diag>,
 }
 
-fn collect(r: Resolved, mods: List<Mod>) -> Collected / {abort.raise} =
+fn collect(resolved: Resolved, mods: List<ParsedModule>) -> Collected =
   fold(range(0, len(mods)), { sigs: [], owner_imports: [], diags: [] }, |acc: Collected, m: Int|
-    fold(at(mods, m).module.items, acc, |c: Collected, it: Item|
-      match it { IFn(f) -> collect_fn(r, mods, m, c, f), _ -> c }))
+    fold(at(mods, m).module.items, acc, |c: Collected, item: Item|
+      match item { IFn(f) -> collect_fn(resolved, mods, m, c, f), _ -> c }))
 
 fn collect_fn(
-  r: Resolved,
-  mods: List<Mod>,
+  resolved: Resolved,
+  mods: List<ParsedModule>,
   m: Int,
   c: Collected,
-  f: FnDef,
-) -> Collected / {abort.raise} = {
-  let names = map(f.params, |p: Param| p.name.name);
-  let walked: { c: Collected, params: List<PInfo> } = fold(
-    f.params,
+  def: FnDef,
+) -> Collected = {
+  let names = map(def.params, |param: Param| param.name.name);
+  let walked: { c: Collected, params: List<ParamInfo> } = fold(
+    def.params,
     { c: c, params: [] },
-    |acc: { c: Collected, params: List<PInfo> }, p: Param|
-      match p.default {
+    |acc: { c: Collected, params: List<ParamInfo> }, param: Param|
+      match param.default {
         None ->
-          { ..acc, params: push(acc.params, { name: p.name.name, default: None, imports: [] }) },
+          {
+            ..acc,
+            params: push(acc.params, { name: param.name.name, default: None, imports: [] }),
+          },
         Some(d) -> {
           let adm = admissible(m, d, names, acc.c.diags);
           if !adm.ok {
             {
               c: { ..acc.c, diags: adm.diags },
-              params: push(acc.params, { name: p.name.name, default: None, imports: [] }),
+              params: push(acc.params, { name: param.name.name, default: None, imports: [] }),
             }
           } else {
-            let o = qexpr(
-              r,
-              { owner: m, public: is_public(f.vis), bound: [], imports: [], diags: adm.diags },
+            let o = qualify_expr(
+              resolved,
+              { owner: m, public: is_public(def.vis), bound: [], imports: [], diags: adm.diags },
               d,
             );
             // The writing module needs the binder as much as any caller does.
             let owner_imports = fold(
               o.q.imports,
               acc.c.owner_imports,
-              |oi: List<{ module: Int, binder: Bytes, target: Int }>, mb: ModBind|
-                push(oi, { module: m, binder: mb.binder, target: mb.target }),
+              |oi: List<{ module: Int, binder: Bytes, target: Int }>, binding: ModuleBinding|
+                push(oi, { module: m, binder: binding.binder, target: binding.target }),
             );
             {
               c: { ..acc.c, diags: o.q.diags, owner_imports: owner_imports },
               params: push(acc.params, {
-                name: p.name.name,
+                name: param.name.name,
                 default: Some(o.e),
                 imports: o.q.imports,
               }),
@@ -2254,7 +2428,7 @@ fn collect_fn(
   {
     ..walked.c,
     sigs: push(walked.c.sigs, {
-      name: qualify(at(mods, m).name, f.name.name),
+      name: qualify(at(mods, m).name, def.name.name),
       params: walked.params,
     }),
   }
@@ -2262,19 +2436,19 @@ fn collect_fn(
 
 fn admissible(
   m: Int,
-  e: Expr,
+  expr: Expr,
   names: List<Bytes>,
   diags: List<Diag>,
-) -> { ok: Bool, diags: List<Diag> } / {abort.raise} =
-  if !is_default_expr(e) {
+) -> { ok: Bool, diags: List<Diag> } =
+  if !is_default_expr(expr) {
     {
       ok: false,
       diags: push(
         diags,
-        diag1(
+        error_at(
           b"E0121",
           m,
-          expr_span(e),
+          expr_span(expr),
           b"a parameter default must be a pure, closed expression",
           b"this runs, rather than being a value",
           [
@@ -2285,16 +2459,16 @@ fn admissible(
       ),
     }
   } else {
-    let mentioned = mentions(e, names, [], []);
+    let mentioned = mentions(expr, names, [], []);
     if len(mentioned) > 0 {
       {
         ok: false,
         diags: push(
           diags,
-          diag1(
+          error_at(
             b"E0121",
             m,
-            expr_span(e),
+            expr_span(expr),
             bytes_concat_all([b"a parameter default cannot mention `", at(mentioned, 0), b"`"]),
             b"names a parameter of this same signature",
             [b"a call site has no such binding for the default to be copied into"],
@@ -2305,14 +2479,14 @@ fn admissible(
   }
 
 // The module now reaches `target` under `binder`, with no span.
-fn reach(r: Resolved, module: Int, binder: Bytes, target: Int) -> Resolved / {abort.raise} = {
-  let scope: Scope = at(r.scopes, module);
-  match find_modbind(scope.modules, binder) {
-    Some(_) -> r,
+fn reach(resolved: Resolved, module: Int, binder: Bytes, target: Int) -> Resolved = {
+  let scope: Scope = at(resolved.scopes, module);
+  match find_module_binding(scope.modules, binder) {
+    Some(_) -> resolved,
     None ->
       {
-        ..r,
-        scopes: set_at(r.scopes, module, {
+        ..resolved,
+        scopes: set_at(resolved.scopes, module, {
           ..scope,
           modules: push(scope.modules, { binder: binder, target: target, span: dummy_span() }),
         }),
@@ -2321,7 +2495,7 @@ fn reach(r: Resolved, module: Int, binder: Bytes, target: Int) -> Resolved / {ab
 }
 
 // The builtins that carry a default: `assert(cond, message: None)`.
-fn builtin_signature(name: Bytes) -> Option<Sig> =
+fn builtin_signature(name: Bytes) -> Option<Signature> =
   if name == b"assert" {
     Some({
       name: b"assert",
@@ -2347,51 +2521,51 @@ fn builtin_signature(name: Bytes) -> Option<Sig> =
 
 // --- Defaults: filling every call --------------------------------------------------------
 
-type Cx = { module: Int, scope: List<Bytes>, implicit: List<ModBind>, diags: List<Diag> }
-type COut = { cx: Cx, e: Expr }
-type Filling = { r: Resolved, index: Map<Bytes, Sig> }
+type Filler = { module: Int, scope: List<Bytes>, implicit: List<ModuleBinding>, diags: List<Diag> }
+type Filled = { cx: Filler, e: Expr }
+type Filling = { r: Resolved, index: Map<Bytes, Signature> }
 
-fn cexpr(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} = {
+fn fill_expr(f: Filling, filler: Filler, expr: Expr) -> Filled = {
   // Children first, so a nested call is filled before the outer one copies it.
-  let o = cchildren(f, cx, e);
+  let o = fill_children(f, filler, expr);
   match o.e { EApp(a) -> fill(f, o.cx, a), _ -> o }
 }
 
-fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
-  match e {
-    ELit(_) -> { cx: cx, e: e },
-    EVar(_) -> { cx: cx, e: e },
-    EBad(_) -> { cx: cx, e: e },
+fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled =
+  match expr {
+    ELit(_) -> { cx: filler, e: expr },
+    EVar(_) -> { cx: filler, e: expr },
+    EBad(_) -> { cx: filler, e: expr },
     EBinary(b) -> {
-      let l = cexpr(f, cx, b.lhs);
-      let rr = cexpr(f, l.cx, b.rhs);
+      let l = fill_expr(f, filler, b.lhs);
+      let rr = fill_expr(f, l.cx, b.rhs);
       { cx: rr.cx, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
     },
     EUnary(u) -> {
-      let o: COut = cexpr(f, cx, u.operand);
+      let o: Filled = fill_expr(f, filler, u.operand);
       { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
     },
     ELambda(l) -> {
-      let mark = len(cx.scope);
+      let mark = len(filler.scope);
       let inner = {
-        ..cx,
-        scope: fold(l.params, cx.scope, |acc: List<Bytes>, p: Param| push(acc, p.name.name)),
+        ..filler,
+        scope: fold(l.params, filler.scope, |acc: List<Bytes>, p: Param| push(acc, p.name.name)),
       };
-      let o: COut = cexpr(f, inner, l.body);
+      let o: Filled = fill_expr(f, inner, l.body);
       {
         cx: { ..o.cx, scope: take_bytes(o.cx.scope, mark) },
         e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }),
       }
     },
     EApp(a) -> {
-      let fn_ = cexpr(f, cx, a.func);
-      let args = cexprs(f, fn_.cx, a.args);
+      let fn_ = fill_expr(f, filler, a.func);
+      let args = fill_exprs(f, fn_.cx, a.args);
       let named = fold(
         a.named,
         { cx: args.cx, xs: [] },
-        |acc: { cx: Cx, xs: List<NamedArg> }, n: NamedArg| {
-          let o = cexpr(f, acc.cx, n.value);
-          { cx: o.cx, xs: push(acc.xs, { name: n.name, value: o.e, span: n.span }) }
+        |acc: { cx: Filler, xs: List<NamedArg> }, arg: NamedArg| {
+          let o = fill_expr(f, acc.cx, arg.value);
+          { cx: o.cx, xs: push(acc.xs, { name: arg.name, value: o.e, span: arg.span }) }
         },
       );
       {
@@ -2400,27 +2574,27 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
       }
     },
     EIf(i) -> {
-      let c = cexpr(f, cx, i.cond);
-      let t = cexpr(f, c.cx, i.then_branch);
-      let el = cexpr(f, t.cx, i.else_branch);
+      let c = fill_expr(f, filler, i.cond);
+      let t = fill_expr(f, c.cx, i.then_branch);
+      let el = fill_expr(f, t.cx, i.else_branch);
       { cx: el.cx, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
     },
     EMatch(m) -> {
-      let s = cexpr(f, cx, m.scrutinee);
+      let s = fill_expr(f, filler, m.scrutinee);
       let arms = fold(
         m.arms,
         { cx: s.cx, xs: [] },
-        |acc: { cx: Cx, xs: List<MatchArm> }, arm: MatchArm| {
+        |acc: { cx: Filler, xs: List<MatchArm> }, arm: MatchArm| {
           let mark = len(acc.cx.scope);
           let inner = { ..acc.cx, scope: pattern_binders(arm.pat, acc.cx.scope) };
-          let g: { cx: Cx, e: Option<Expr> } = match arm.guard {
+          let g: { cx: Filler, e: Option<Expr> } = match arm.guard {
             None -> { cx: inner, e: None },
             Some(x) -> {
-              let o: COut = cexpr(f, inner, x);
+              let o: Filled = fill_expr(f, inner, x);
               { cx: o.cx, e: Some(o.e) }
             },
           };
-          let body: COut = cexpr(f, g.cx, arm.body);
+          let body: Filled = fill_expr(f, g.cx, arm.body);
           {
             cx: { ..body.cx, scope: take_bytes(body.cx.scope, mark) },
             xs: push(acc.xs, { pat: arm.pat, guard: g.e, body: body.e, span: arm.span }),
@@ -2430,37 +2604,37 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
       { cx: arms.cx, e: EMatch({ span: m.span, scrutinee: s.e, arms: arms.xs }) }
     },
     EBlock(b) -> {
-      let mark = len(cx.scope);
-      let stmts: { cx: Cx, xs: List<Stmt> } = fold(
+      let mark = len(filler.scope);
+      let stmts: { cx: Filler, xs: List<Stmt> } = fold(
         b.stmts,
-        { cx: cx, xs: [] },
-        |acc: { cx: Cx, xs: List<Stmt> }, s: Stmt|
+        { cx: filler, xs: [] },
+        |acc: { cx: Filler, xs: List<Stmt> }, s: Stmt|
           match s {
             SLet(l) -> {
-              let o: COut = cexpr(f, acc.cx, l.value);
+              let o: Filled = fill_expr(f, acc.cx, l.value);
               {
                 cx: { ..o.cx, scope: pattern_binders(l.pat, o.cx.scope) },
                 xs: push(acc.xs, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
               }
             },
             SLetElse(l) -> {
-              let o: COut = cexpr(f, acc.cx, l.value);
-              let fb: COut = cexpr(f, o.cx, l.fallback);
+              let o: Filled = fill_expr(f, acc.cx, l.value);
+              let fb: Filled = fill_expr(f, o.cx, l.fallback);
               {
                 cx: { ..fb.cx, scope: pattern_binders(l.pat, fb.cx.scope) },
                 xs: push(acc.xs, SLetElse({ ..l, value: o.e, fallback: fb.e })),
               }
             },
             SExpr(x) -> {
-              let o: COut = cexpr(f, acc.cx, x);
+              let o: Filled = fill_expr(f, acc.cx, x);
               { cx: o.cx, xs: push(acc.xs, SExpr(o.e)) }
             },
           },
       );
-      let tail: { cx: Cx, e: Option<Expr> } = match b.tail {
+      let tail: { cx: Filler, e: Option<Expr> } = match b.tail {
         None -> { cx: stmts.cx, e: None },
         Some(t) -> {
-          let o: COut = cexpr(f, stmts.cx, t);
+          let o: Filled = fill_expr(f, stmts.cx, t);
           { cx: o.cx, e: Some(o.e) }
         },
       };
@@ -2470,39 +2644,39 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
       }
     },
     ERecord(rec) -> {
-      let o = cfields(f, cx, rec.fields);
+      let o = fill_fields(f, filler, rec.fields);
       { cx: o.cx, e: ERecord({ span: rec.span, fields: o.xs }) }
     },
     ERecordUpdate(rec) -> {
-      let b = cexpr(f, cx, rec.base);
-      let o = cfields(f, b.cx, rec.fields);
+      let b = fill_expr(f, filler, rec.base);
+      let o = fill_fields(f, b.cx, rec.fields);
       { cx: o.cx, e: ERecordUpdate({ span: rec.span, base: b.e, fields: o.xs }) }
     },
     EField(fl) -> {
-      let o: COut = cexpr(f, cx, fl.base);
+      let o: Filled = fill_expr(f, filler, fl.base);
       { cx: o.cx, e: EField({ span: fl.span, base: o.e, field: fl.field }) }
     },
     EList(l) -> {
-      let o = cexprs(f, cx, l.items);
+      let o = fill_exprs(f, filler, l.items);
       { cx: o.cx, e: EList({ span: l.span, items: o.xs }) }
     },
     ETry(t) -> {
-      let o: COut = cexpr(f, cx, t.operand);
+      let o: Filled = fill_expr(f, filler, t.operand);
       { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) }
     },
     EPerform(p) -> {
-      let o = cexprs(f, cx, p.args);
+      let o = fill_exprs(f, filler, p.args);
       {
         cx: o.cx,
         e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
       }
     },
     EHandle(h) -> {
-      let body: COut = cexpr(f, cx, h.body);
-      let clauses: { cx: Cx, xs: List<HandleClause> } = fold(
+      let body: Filled = fill_expr(f, filler, h.body);
+      let clauses: { cx: Filler, xs: List<HandleClause> } = fold(
         h.clauses,
         { cx: body.cx, xs: [] },
-        |acc: { cx: Cx, xs: List<HandleClause> }, c: HandleClause| {
+        |acc: { cx: Filler, xs: List<HandleClause> }, c: HandleClause| {
           let mark = len(acc.cx.scope);
           let with_params = fold(c.params, acc.cx.scope, |sc: List<Bytes>, p: Ident|
             push(sc, p.name));
@@ -2514,7 +2688,7 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
             None -> with_label,
             Some(k) -> push(with_label, k.name),
           };
-          let o: COut = cexpr(f, { ..acc.cx, scope: with_resume }, c.body);
+          let o: Filled = fill_expr(f, { ..acc.cx, scope: with_resume }, c.body);
           {
             cx: { ..o.cx, scope: take_bytes(o.cx.scope, mark) },
             xs: push(acc.xs, {
@@ -2531,11 +2705,11 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
           }
         },
       );
-      let ret: { cx: Cx, e: Option<ReturnClause> } = match h.ret {
+      let ret: { cx: Filler, e: Option<ReturnClause> } = match h.ret {
         None -> { cx: clauses.cx, e: None },
         Some(rc) -> {
           let mark = len(clauses.cx.scope);
-          let o: COut = cexpr(
+          let o: Filled = fill_expr(
             f,
             { ..clauses.cx, scope: push(clauses.cx.scope, rc.binder.name) },
             rc.body,
@@ -2549,9 +2723,13 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
       { cx: ret.cx, e: EHandle({ span: h.span, body: body.e, ret: ret.e, clauses: clauses.xs }) }
     },
     EWithCell(c) -> {
-      let init: COut = cexpr(f, cx, c.init);
+      let init: Filled = fill_expr(f, filler, c.init);
       let mark = len(init.cx.scope);
-      let o: COut = cexpr(f, { ..init.cx, scope: push(init.cx.scope, c.binder.name) }, c.body);
+      let o: Filled = fill_expr(
+        f,
+        { ..init.cx, scope: push(init.cx.scope, c.binder.name) },
+        c.body,
+      );
       {
         cx: { ..o.cx, scope: take_bytes(o.cx.scope, mark) },
         e: EWithCell({
@@ -2564,37 +2742,37 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut / {abort.raise} =
       }
     },
     ESimulate(s) -> {
-      let o: COut = cexpr(f, cx, s.body);
+      let o: Filled = fill_expr(f, filler, s.body);
       { cx: o.cx, e: ESimulate({ span: s.span, body: o.e }) }
     },
     EParallel(v) -> {
-      let o = cexprs(f, cx, v.branches);
+      let o = fill_exprs(f, filler, v.branches);
       { cx: o.cx, e: EParallel({ span: v.span, branches: o.xs }) }
     },
   }
 
-fn cexprs(f: Filling, cx: Cx, xs: List<Expr>) -> { cx: Cx, xs: List<Expr> } / {abort.raise} =
-  fold(xs, { cx: cx, xs: [] }, |acc: { cx: Cx, xs: List<Expr> }, x: Expr| {
-    let o = cexpr(f, acc.cx, x);
+fn fill_exprs(f: Filling, filler: Filler, exprs: List<Expr>) -> { cx: Filler, xs: List<Expr> } =
+  fold(exprs, { cx: filler, xs: [] }, |acc: { cx: Filler, xs: List<Expr> }, expr: Expr| {
+    let o = fill_expr(f, acc.cx, expr);
     { cx: o.cx, xs: push(acc.xs, o.e) }
   })
 
-fn cfields(
+fn fill_fields(
   f: Filling,
-  cx: Cx,
-  xs: List<RecField>,
-) -> { cx: Cx, xs: List<RecField> } / {abort.raise} =
-  fold(xs, { cx: cx, xs: [] }, |acc: { cx: Cx, xs: List<RecField> }, fl: RecField| {
-    let o = cexpr(f, acc.cx, fl.value);
-    { cx: o.cx, xs: push(acc.xs, { name: fl.name, value: o.e }) }
+  filler: Filler,
+  fields: List<RecField>,
+) -> { cx: Filler, xs: List<RecField> } =
+  fold(fields, { cx: filler, xs: [] }, |acc: { cx: Filler, xs: List<RecField> }, field: RecField| {
+    let o = fill_expr(f, acc.cx, field.value);
+    { cx: o.cx, xs: push(acc.xs, { name: field.name, value: o.e }) }
   })
 
-fn signature_of(f: Filling, cx: Cx, func: Expr) -> Option<Sig> / {abort.raise} =
+fn signature_of(f: Filling, filler: Filler, func: Expr) -> Option<Signature> =
   match func {
     EVar(v) ->      // Constructors carry no defaults; a local binder shadows everything, making this a call through a value.
       if is_bare(v.name) && is_ctor_name(v.name.name.name) { None }
-      else if is_bare(v.name) && contains_bytes(cx.scope, v.name.name.name) { None } else {
-        match find(f.r, cx.module, NValue, v.name) {
+      else if is_bare(v.name) && contains_bytes(filler.scope, v.name.name.name) { None } else {
+        match find(f.r, filler.module, ValueSpace, v.name) {
           Some(b) -> map_get(f.index, b.qualified),
           None -> if is_bare(v.name) { builtin_signature(v.name.name.name) } else { None },
         }
@@ -2602,42 +2780,42 @@ fn signature_of(f: Filling, cx: Cx, func: Expr) -> Option<Sig> / {abort.raise} =
     _ -> None,
   }
 
-type App = { span: Span, func: Expr, named: List<NamedArg>, args: List<Expr>, labels: List<Ident> }
+type Call = { span: Span, func: Expr, named: List<NamedArg>, args: List<Expr>, labels: List<Ident> }
 
-fn fill(f: Filling, cx: Cx, a: App) -> COut / {abort.raise} =
-  match signature_of(f, cx, a.func) {
+fn fill(f: Filling, filler: Filler, call: Call) -> Filled =
+  match signature_of(f, filler, call.func) {
     None -> {
       // No signature: a call through a value, a constructor or an unresolved name, so a named argument names no parameter.
-      let diags = fold(a.named, cx.diags, |ds: List<Diag>, n: NamedArg|
+      let diags = fold(call.named, filler.diags, |ds: List<Diag>, arg: NamedArg|
         push(
           ds,
-          diag1(
+          error_at(
             b"E0123",
-            cx.module,
-            n.name.span,
-            bytes_concat_all([b"`", n.name.name, b"` names no parameter here"]),
+            filler.module,
+            arg.name.span,
+            bytes_concat_all([b"`", arg.name.name, b"` names no parameter here"]),
             b"no signature to match this against",
             [
               b"a named argument needs a callee reached by name; a call through a value, a lambda or a constructor is positional",
             ],
           ),
         ));
-      { cx: { ..cx, diags: diags }, e: EApp({ ..a, named: [] }) }
+      { cx: { ..filler, diags: diags }, e: EApp({ ..call, named: [] }) }
     },
     Some(sig) ->      // Over-application is `E0202`'s to report, with the callee's own type in hand.
-      if len(a.args) > len(sig.params) { { cx: cx, e: EApp({ ..a, named: [] }) } }
-      else { fill_slots(cx, a, sig) },
+      if len(call.args) > len(sig.params) { { cx: filler, e: EApp({ ..call, named: [] }) } }
+      else { fill_slots(filler, call, sig) },
   }
 
-fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut / {abort.raise} = {
-  let was_named = len(a.named) > 0;
-  let filled_positionally = len(a.args);
-  let start = map(range(0, len(sig.params)), |i: Int| list_at(a.args, i));
-  let placed: { cx: Cx, slots: List<Option<Expr>> } = fold(
-    a.named,
-    { cx: cx, slots: start },
-    |acc: { cx: Cx, slots: List<Option<Expr>> }, n: NamedArg|
-      match param_index(sig, n.name.name) {
+fn fill_slots(filler: Filler, call: Call, signature: Signature) -> Filled = {
+  let was_named = len(call.named) > 0;
+  let filled_positionally = len(call.args);
+  let start = map(range(0, len(signature.params)), |i: Int| list_at(call.args, i));
+  let placed: { cx: Filler, slots: List<Option<Expr>> } = fold(
+    call.named,
+    { cx: filler, slots: start },
+    |acc: { cx: Filler, slots: List<Option<Expr>> }, arg: NamedArg|
+      match param_index(signature, arg.name.name) {
         None ->
           {
             ..acc,
@@ -2645,16 +2823,16 @@ fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut / {abort.raise} = {
               ..acc.cx,
               diags: push(
                 acc.cx.diags,
-                diag1(
+                error_at(
                   b"E0123",
-                  cx.module,
-                  n.name.span,
-                  bytes_concat_all([b"`", n.name.name, b"` names no parameter of this function"]),
+                  filler.module,
+                  arg.name.span,
+                  bytes_concat_all([b"`", arg.name.name, b"` names no parameter of this function"]),
                   b"not a parameter",
                   [
                     bytes_concat(
                       b"the parameters are ",
-                      list_names(map(sig.params, |p: PInfo| p.name)),
+                      list_names(map(signature.params, |p: ParamInfo| p.name)),
                     ),
                   ],
                 ),
@@ -2671,11 +2849,11 @@ fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut / {abort.raise} = {
                 ..acc.cx,
                 diags: push(
                   acc.cx.diags,
-                  diag1(
+                  error_at(
                     b"E0123",
-                    cx.module,
-                    n.name.span,
-                    bytes_concat_all([b"`", n.name.name, b"` is ", already]),
+                    filler.module,
+                    arg.name.span,
+                    bytes_concat_all([b"`", arg.name.name, b"` is ", already]),
                     b"given twice",
                     [],
                   ),
@@ -2683,24 +2861,31 @@ fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut / {abort.raise} = {
               },
             }
           },
-          None -> { ..acc, slots: set_at(acc.slots, i, Some(n.value)) },
+          None -> { ..acc, slots: set_at(acc.slots, i, Some(arg.value)) },
         },
       },
   );
-  let out: { cx: Cx, xs: List<Expr>, missing: List<Bytes> } = fold(
-    range(0, len(sig.params)),
+  let out: { cx: Filler, xs: List<Expr>, missing: List<Bytes> } = fold(
+    range(0, len(signature.params)),
     { cx: placed.cx, xs: [], missing: [] },
-    |acc: { cx: Cx, xs: List<Expr>, missing: List<Bytes> }, i: Int|
+    |acc: { cx: Filler, xs: List<Expr>, missing: List<Bytes> }, i: Int|
       match at(placed.slots, i) {
         Some(written) -> { ..acc, xs: push(acc.xs, written) },
         None -> {
-          let p = at(sig.params, i);
+          let p = at(signature.params, i);
           match p.default {
             None -> { ..acc, missing: push(acc.missing, p.name) },
             Some(d) -> {
               // The default may name something in its own module, which this one may never have imported.
-              let implicit = fold(p.imports, acc.cx.implicit, |im: List<ModBind>, mb: ModBind|
-                match find_modbind(im, mb.binder) { Some(_) -> im, None -> push(im, mb) });
+              let implicit = fold(
+                p.imports,
+                acc.cx.implicit,
+                |im: List<ModuleBinding>, binding: ModuleBinding|
+                  match find_module_binding(im, binding.binder) {
+                    Some(_) -> im,
+                    None -> push(im, binding),
+                  },
+              );
               { ..acc, cx: { ..acc.cx, implicit: implicit }, xs: push(acc.xs, d) }
             },
           }
@@ -2714,10 +2899,10 @@ fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut / {abort.raise} = {
         ..out.cx,
         diags: push(
           out.cx.diags,
-          diag1(
+          error_at(
             b"E0125",
-            cx.module,
-            a.span,
+            filler.module,
+            call.span,
             bytes_concat_all([b"this call leaves ", list_names(out.missing), b" unfilled"]),
             b"no argument and no default",
             [b"pass it positionally, or by name as `<parameter>: <value>`"],
@@ -2725,42 +2910,43 @@ fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut / {abort.raise} = {
         ),
       }
     } else { out.cx };
-    { cx: cx2, e: EApp({ ..a, named: [] }) }
-  } else { { cx: out.cx, e: EApp({ ..a, args: out.xs, named: [] }) } }
+    { cx: cx2, e: EApp({ ..call, named: [] }) }
+  } else { { cx: out.cx, e: EApp({ ..call, args: out.xs, named: [] }) } }
 }
 
-fn param_index(sig: Sig, name: Bytes) -> Option<Int> / {abort.raise} =
-  fold(range(0, len(sig.params)), None, |acc: Option<Int>, i: Int|
+fn param_index(signature: Signature, name: Bytes) -> Option<Int> =
+  fold(range(0, len(signature.params)), None, |acc: Option<Int>, i: Int|
     match acc {
       Some(_) -> acc,
-      None -> if at(sig.params, i).name == name { Some(i) } else { None },
+      None -> if at(signature.params, i).name == name { Some(i) } else { None },
     })
 
-fn citem(f: Filling, cx: Cx, it: Item) -> { cx: Cx, it: Item } / {abort.raise} =
-  match it {
+fn fill_item(f: Filling, filler: Filler, item: Item) -> { cx: Filler, it: Item } =
+  match item {
     IFn(d) -> {
-      let mark = len(cx.scope);
+      let mark = len(filler.scope);
       let inner = {
-        ..cx,
-        scope: fold(d.params, cx.scope, |acc: List<Bytes>, p: Param| push(acc, p.name.name)),
+        ..filler,
+        scope: fold(d.params, filler.scope, |acc: List<Bytes>, param: Param|
+          push(acc, param.name.name)),
       };
       // A default is not walked here: it was qualified against this module in `collect`.
-      let spec: { cx: Cx, xs: List<SpecClause> } = fold(
+      let spec: { cx: Filler, xs: List<SpecClause> } = fold(
         d.spec,
         { cx: inner, xs: [] },
-        |acc: { cx: Cx, xs: List<SpecClause> }, s: SpecClause| {
-          let o = cexpr(f, acc.cx, s.expr);
-          { cx: o.cx, xs: push(acc.xs, { kind: s.kind, expr: o.e, span: s.span }) }
+        |acc: { cx: Filler, xs: List<SpecClause> }, clause: SpecClause| {
+          let o = fill_expr(f, acc.cx, clause.expr);
+          { cx: o.cx, xs: push(acc.xs, { kind: clause.kind, expr: o.e, span: clause.span }) }
         },
       );
-      let measured: { cx: Cx, e: Option<Expr> } = match d.decreases {
+      let measured: { cx: Filler, e: Option<Expr> } = match d.decreases {
         None -> { cx: spec.cx, e: None },
         Some(e) -> {
-          let o = cexpr(f, spec.cx, e);
+          let o = fill_expr(f, spec.cx, e);
           { cx: o.cx, e: Some(o.e) }
         },
       };
-      let body: COut = cexpr(f, measured.cx, d.body);
+      let body: Filled = fill_expr(f, measured.cx, d.body);
       {
         cx: { ..body.cx, scope: take_bytes(body.cx.scope, mark) },
         it: IFn({
@@ -2782,7 +2968,7 @@ fn citem(f: Filling, cx: Cx, it: Item) -> { cx: Cx, it: Item } / {abort.raise} =
       }
     },
     ITest(d) -> {
-      let o: COut = cexpr(f, cx, d.body);
+      let o: Filled = fill_expr(f, filler, d.body);
       {
         cx: o.cx,
         it: ITest({
@@ -2795,19 +2981,20 @@ fn citem(f: Filling, cx: Cx, it: Item) -> { cx: Cx, it: Item } / {abort.raise} =
       }
     },
     ILaw(d) -> {
-      let mark = len(cx.scope);
+      let mark = len(filler.scope);
       let inner = {
-        ..cx,
-        scope: fold(d.binders, cx.scope, |acc: List<Bytes>, b: Binder| push(acc, b.name.name)),
+        ..filler,
+        scope: fold(d.binders, filler.scope, |acc: List<Bytes>, binder: Binder|
+          push(acc, binder.name.name)),
       };
       let g = match d.guard {
         None -> { cx: inner, e: None },
         Some(x) -> {
-          let o: COut = cexpr(f, inner, x);
+          let o: Filled = fill_expr(f, inner, x);
           { cx: o.cx, e: Some(o.e) }
         },
       };
-      let body: COut = cexpr(f, g.cx, d.body);
+      let body: Filled = fill_expr(f, g.cx, d.body);
       {
         cx: { ..body.cx, scope: take_bytes(body.cx.scope, mark) },
         it: ILaw({
@@ -2822,13 +3009,13 @@ fn citem(f: Filling, cx: Cx, it: Item) -> { cx: Cx, it: Item } / {abort.raise} =
         }),
       }
     },
-    _ -> { cx: cx, it: it },
+    _ -> { cx: filler, it: item },
   }
 
-pub type Expanded = { r: Resolved, mods: List<Mod>, diags: List<Diag> }
+pub type Expanded = { r: Resolved, mods: List<ParsedModule>, diags: List<Diag> }
 
 // The signatures, then every module's calls, then the modules a spliced default made each one reference.
-fn expand(r: Resolved, mods: List<Mod>, diags: List<Diag>) -> Expanded / {abort.raise} = {
+fn expand(r: Resolved, mods: List<ParsedModule>, diags: List<Diag>) -> Expanded / {abort.raise} = {
   let c = collect(r, mods);
   let r2 = fold(
     c.owner_imports,
@@ -2839,24 +3026,27 @@ fn expand(r: Resolved, mods: List<Mod>, diags: List<Diag>) -> Expanded / {abort.
   // Indexed once: a list lookup per call is quadratic in the program. First writer wins.
   let f = {
     r: r2,
-    index: fold(c.sigs, map_new(), |acc: Map<Bytes, Sig>, s: Sig|
-      match map_get(acc, s.name) { Some(_) -> acc, None -> map_insert(acc, s.name, s) }),
+    index: fold(c.sigs, map_new(), |acc: Map<Bytes, Signature>, signature: Signature|
+      match map_get(acc, signature.name) {
+        Some(_) -> acc,
+        None -> map_insert(acc, signature.name, signature),
+      }),
   };
   let walked = fold(
     range(0, len(mods)),
     { r: r2, mods: [], diags: bytes_concat_diags(diags, c.diags) },
     |acc: Expanded, m: Int| {
-      let mod: Mod = at(mods, m);
-      let items: { cx: Cx, xs: List<Item> } = fold(
+      let mod: ParsedModule = at(mods, m);
+      let items: { cx: Filler, xs: List<Item> } = fold(
         mod.module.items,
         { cx: { module: m, scope: [], implicit: [], diags: acc.diags }, xs: [] },
-        |ia: { cx: Cx, xs: List<Item> }, it: Item| {
-          let o = citem(f, ia.cx, it);
+        |ia: { cx: Filler, xs: List<Item> }, item: Item| {
+          let o = fill_item(f, ia.cx, item);
           { cx: o.cx, xs: push(ia.xs, o.it) }
         },
       );
-      let reached = fold(items.cx.implicit, acc.r, |rr: Resolved, mb: ModBind|
-        reach(rr, m, mb.binder, mb.target));
+      let reached = fold(items.cx.implicit, acc.r, |rr: Resolved, binding: ModuleBinding|
+        reach(rr, m, binding.binder, binding.target));
       {
         r: reached,
         mods: push(acc.mods, {
@@ -2872,35 +3062,36 @@ fn expand(r: Resolved, mods: List<Mod>, diags: List<Diag>) -> Expanded / {abort.
 }
 
 fn bytes_concat_diags(a: List<Diag>, b: List<Diag>) -> List<Diag> =
-  fold(b, a, |acc: List<Diag>, d: Diag| push(acc, d))
+  fold(b, a, |acc: List<Diag>, diag: Diag| push(acc, diag))
 
 // --- `resolve` ---------------------------------------------------------------------------
 
-pub type Outcome = | Resolved_(Expanded) | Failed(List<Diag>)
+pub type ResolveOutcome = | ResolveSucceeded(Expanded) | ResolveFailed(List<Diag>)
 
-pub fn resolve(sources: List<Source>) -> Outcome / {abort.raise} =
+pub fn resolve(sources: List<Source>) -> ResolveOutcome / {abort.raise} =
   resolve_modules(
-    map(sources, |s: Source| { name: s.name, module: parse(s.src).node, derived: [] }),
+    map(sources, |source: Source|
+      { name: source.name, module: parse(source.src).node, derived: [] }),
   )
 
 // Over modules already parsed and, for the checker, already rewritten.
-pub fn resolve_modules(mods: List<Mod>) -> Outcome / {abort.raise} =
-  resolve_with(mods, no_pkgs(mods), true)
+pub fn resolve_modules(mods: List<ParsedModule>) -> ResolveOutcome =
+  resolve_with(mods, no_packages(mods), true)
 
 // The tables without the defaults pass, so the two can be timed apart.
-pub fn resolve_tables(mods: List<Mod>) -> Outcome / {abort.raise} =
-  resolve_with(mods, no_pkgs(mods), false)
+pub fn resolve_tables(mods: List<ParsedModule>) -> ResolveOutcome =
+  resolve_with(mods, no_packages(mods), false)
 
 // Resolution against a package closure: `mod_pkg[i]` is the package of module `i`, and `shelf`
 // marks the modules the toolchain ships, which any package may import.
 pub fn resolve_packaged(
-  mods: List<Mod>,
-  pkgs: List<Pkg>,
+  mods: List<ParsedModule>,
+  pkgs: List<PackageDeps>,
   mod_pkg: List<Int>,
   std: Int,
   compiler: Int,
   shelf: Int,
-) -> Outcome / {abort.raise} =
+) -> ResolveOutcome / {abort.raise} =
   resolve_with(
     mods,
     { pkgs: pkgs, mod_pkg: mod_pkg, std: std, compiler: compiler, shelf: shelf },
@@ -2908,16 +3099,16 @@ pub fn resolve_packaged(
   )
 
 fn resolve_with(
-  mods: List<Mod>,
-  packages: { pkgs: List<Pkg>, mod_pkg: List<Int>, std: Int, compiler: Int, shelf: Int },
+  mods: List<ParsedModule>,
+  packages: { pkgs: List<PackageDeps>, mod_pkg: List<Int>, std: Int, compiler: Int, shelf: Int },
   defaults: Bool,
-) -> Outcome / {abort.raise} = {
+) -> ResolveOutcome / {abort.raise} = {
   let n = len(mods);
   // The index: the first module of each name; a second non-anonymous one is `E0105`.
   let indexed = fold(
     range(0, n),
     { names: [], diags: [] },
-    |acc: { names: List<Entry>, diags: List<Diag> }, i: Int| {
+    |acc: { names: List<ModuleEntry>, diags: List<Diag> }, i: Int| {
       let name = at(mods, i).name;
       match index_of(acc.names, name) {
         None -> { ..acc, names: push(acc.names, { name: name, at: i }) },
@@ -2926,7 +3117,7 @@ fn resolve_with(
             ..acc,
             diags: push(
               acc.diags,
-              diag1(
+              error_at(
                 b"E0105",
                 i,
                 dummy_span(),
@@ -2954,14 +3145,15 @@ fn resolve_with(
     shelf: packages.shelf,
   };
   let built = map(range(0, n), |i: Int| build_scope_reporting(w, i));
-  let scopes = map(built, |b: Builder| b.scope);
-  let edges = map(built, |b: Builder| b.edges);
-  let diags1 = fold(built, indexed.diags, |acc: List<Diag>, b: Builder|
-    bytes_concat_diags(acc, b.diags));
+  let scopes = map(built, |builder: Builder| builder.scope);
+  let edges = map(built, |builder: Builder| builder.edges);
+  let diags1 = fold(built, indexed.diags, |acc: List<Diag>, builder: Builder|
+    bytes_concat_diags(acc, builder.diags));
   let dfs = traverse(edges);
-  let diags2 = fold(dfs.cycles, diags1, |acc: List<Diag>, c: Cycle| push(acc, cycle_diag(mods, c)));
+  let diags2 = fold(dfs.cycles, diags1, |acc: List<Diag>, cycle: Cycle|
+    push(acc, cycle_diag(mods, cycle)));
   // Only with a consistent set of tables: expansion resolves names through them.
-  if len(diags2) > 0 { Failed(diags2) } else {
+  if len(diags2) > 0 { ResolveFailed(diags2) } else {
     let r = {
       names: indexed.names,
       scopes: scopes,
@@ -2972,10 +3164,10 @@ fn resolve_with(
         map(es, |e: { from: Int, target: Int, span: Span }| e.target)),
     };
     let sets = expand_sets(r, mods);
-    if len(sets.diags) > 0 { Failed(sets.diags) }
-    else if !defaults { Resolved_({ r: sets.r, mods: sets.mods, diags: [] }) } else {
+    if len(sets.diags) > 0 { ResolveFailed(sets.diags) }
+    else if !defaults { ResolveSucceeded({ r: sets.r, mods: sets.mods, diags: [] }) } else {
       let x = expand(sets.r, sets.mods, []);
-      if len(x.diags) > 0 { Failed(x.diags) } else { Resolved_(x) }
+      if len(x.diags) > 0 { ResolveFailed(x.diags) } else { ResolveSucceeded(x) }
     }
   }
 }
@@ -2989,107 +3181,125 @@ fn build_scope_reporting(w: World, i: Int) -> Builder / {abort.raise} = {
     edges: [],
     diags: [],
   };
-  fold(m.module.imports, start, |b: Builder, d: ImportDecl| {
-    let t = target_or_report(w, i, b, d);
-    match t.t { None -> t.b, Some(_) -> one_import(w, i, t.b, d) }
+  fold(m.module.imports, start, |builder: Builder, decl: ImportDecl| {
+    let t = target_or_report(w, i, builder, decl);
+    match t.t { None -> t.b, Some(_) -> one_import(w, i, t.b, decl) }
   })
 }
 
 // --- The dump -------------------------------------------------------------------------------
 
-fn n(v: Int) -> Bytes = num(v)
+fn dump_int(v: Int) -> Bytes = int_to_bytes(v)
 
-fn dump_span(s: Span) -> Bytes = bytes_concat_all([n(s.start), b":", n(s.end)])
+fn dump_span(span: Span) -> Bytes =
+  bytes_concat_all([dump_int(span.start), b":", dump_int(span.end)])
 
-fn dump_modbind(tag: Bytes, mb: ModBind) -> Bytes =
-  bytes_concat_all([tag, b";", mb.binder, b";", n(mb.target), b";", dump_span(mb.span), b";"])
-
-fn dump_binding(tag: Bytes, b: Binding) -> Bytes =
+fn dump_modbind(tag: Bytes, binding: ModuleBinding) -> Bytes =
   bytes_concat_all([
     tag,
     b";",
-    b.name,
+    binding.binder,
     b";",
-    b.qualified,
+    dump_int(binding.target),
     b";",
-    n(b.owner),
-    b";",
-    dump_span(b.span),
+    dump_span(binding.span),
     b";",
   ])
 
-fn dump_scope(i: Int, s: Scope) -> Bytes =
+fn dump_binding(tag: Bytes, binding: Binding) -> Bytes =
+  bytes_concat_all([
+    tag,
+    b";",
+    binding.name,
+    b";",
+    binding.qualified,
+    b";",
+    dump_int(binding.owner),
+    b";",
+    dump_span(binding.span),
+    b";",
+  ])
+
+fn dump_scope(i: Int, scope: Scope) -> Bytes =
   bytes_concat_all([
     b"M;",
-    n(i),
+    dump_int(i),
     b";",
-    s.module,
+    scope.module,
     b";",
-    bytes_concat_all(map(s.modules, |mb: ModBind| dump_modbind(b"B", mb))),
-    bytes_concat_all(map(s.selective, |mb: ModBind| dump_modbind(b"S", mb))),
-    bytes_concat_all(map(s.bound.values, |b: Binding| dump_binding(b"V", b))),
-    bytes_concat_all(map(s.bound.types, |b: Binding| dump_binding(b"T", b))),
-    bytes_concat_all(map(s.bound.effects, |b: Binding| dump_binding(b"E", b))),
-    bytes_concat_all(map(s.bound.sets, |b: Binding| dump_binding(b"R", b))),
+    bytes_concat_all(map(scope.modules, |mb: ModuleBinding| dump_modbind(b"B", mb))),
+    bytes_concat_all(map(scope.selective, |mb: ModuleBinding| dump_modbind(b"S", mb))),
+    bytes_concat_all(map(scope.bound.values, |b: Binding| dump_binding(b"V", b))),
+    bytes_concat_all(map(scope.bound.types, |b: Binding| dump_binding(b"T", b))),
+    bytes_concat_all(map(scope.bound.effects, |b: Binding| dump_binding(b"E", b))),
+    bytes_concat_all(map(scope.bound.sets, |b: Binding| dump_binding(b"R", b))),
   ])
 
 fn dump_order(order: List<Int>) -> Bytes / {abort.raise} =
   bytes_concat_all([
     b"O;",
     fold(range(0, len(order)), b"", |acc: Bytes, i: Int|
-      if i == 0 { n(at(order, i)) } else { bytes_concat_all([acc, b",", n(at(order, i))]) }),
+      if i == 0 { dump_int(at(order, i)) }
+      else { bytes_concat_all([acc, b",", dump_int(at(order, i))]) }),
     b";",
   ])
 
-fn dump_label(l: Label) -> Bytes =
+fn dump_label(label: Label) -> Bytes =
   bytes_concat_all([
     b"=",
-    n(l.module),
+    dump_int(label.module),
     b":",
-    n(l.start),
+    dump_int(label.start),
     b":",
-    n(l.end),
+    dump_int(label.end),
     b":",
-    if l.primary { b"1" } else { b"0" },
+    if label.primary { b"1" } else { b"0" },
     b";",
   ])
 
-fn dump_diag(d: Diag) -> Bytes = {
-  let primary = fold(d.labels, None, |acc: Option<Label>, l: Label|
+fn dump_diag(diag: Diag) -> Bytes = {
+  let primary = fold(diag.labels, None, |acc: Option<Label>, l: Label|
     match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } });
   let head = match primary {
-    Some(l) -> bytes_concat_all([n(l.module), b":", n(l.start), b":", n(l.end)]),
+    Some(l) ->
+      bytes_concat_all([dump_int(l.module), b":", dump_int(l.start), b":", dump_int(l.end)]),
     None -> b"0:0:0",
   };
   bytes_concat_all([
     b"!",
-    d.code,
+    diag.code,
     b":",
     head,
     b":",
-    n(len(d.labels)),
+    dump_int(len(diag.labels)),
     b":",
-    n(d.notes),
+    dump_int(diag.notes),
     b";",
-    bytes_concat_all(map(d.labels, dump_label)),
+    bytes_concat_all(map(diag.labels, dump_label)),
   ])
 }
 
-pub fn dump_diags(ds: List<Diag>) -> Bytes =
-  bytes_concat_all([b"D;", n(len(ds)), b";", bytes_concat_all(map(ds, dump_diag))])
+pub fn dump_diags(diags: List<Diag>) -> Bytes =
+  bytes_concat_all([b"D;", dump_int(len(diags)), b";", bytes_concat_all(map(diags, dump_diag))])
 
 pub fn resolve_dump(sources: List<Source>) -> String / {abort.raise} = {
-  let head = bytes_concat_all([b"R;", n(len(sources)), b";"]);
+  let head = bytes_concat_all([b"R;", dump_int(len(sources)), b";"]);
   let body = match resolve(sources) {
-    Failed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
-    Resolved_(x) ->
+    ResolveFailed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
+    ResolveSucceeded(x) ->
       bytes_concat_all([
         bytes_concat_all(map(range(0, len(x.r.scopes)), |i: Int| dump_scope(i, at(x.r.scopes, i)))),
         dump_order(x.r.order),
         dump_diags([]),
         bytes_concat_all(
           map(range(0, len(x.mods)), |i: Int|
-            bytes_concat_all([b"P;", n(i), b";", dump_module(at(x.mods, i).module), b"#0;"])),
+            bytes_concat_all([
+              b"P;",
+              dump_int(i),
+              b";",
+              dump_module(at(x.mods, i).module),
+              b"#0;",
+            ])),
         ),
       ]),
   };
@@ -3127,7 +3337,7 @@ test "a default is a value, and may not name a parameter of its own signature" {
   let src = b"fn f(a: Int = 1, b: Int = g(1), c: Int = a) -> Int = 0";
   let m = parse(src).node;
   let f = match at(m.items, 0) { IFn(d) -> d, _ -> panic("a fn") };
-  let names = map(f.params, |p: Param| p.name.name);
+  let names = map(f.params, |param: Param| param.name.name);
   let d = |i: Int| match at(f.params, i).default { Some(x) -> x, None -> panic("a default") };
   assert(is_default_expr(d(0)));
   assert(!is_default_expr(d(1)));
@@ -3148,21 +3358,21 @@ test "two modules resolve to the tables the reference builds" {
 }
 
 // Each atom of the first `fn`'s written row in module `m`, as the expansion left it.
-fn first_row(x: Expanded, m: Int) -> List<Bytes> / {abort.raise} = {
-  let f = fold(at(x.mods, m).module.items, None, |acc: Option<FnDef>, it: Item|
-    match acc { Some(_) -> acc, None -> match it { IFn(d) -> Some(d), _ -> None } });
+fn first_row(expanded: Expanded, m: Int) -> List<Bytes> = {
+  let f = fold(at(expanded.mods, m).module.items, None, |acc: Option<FnDef>, item: Item|
+    match acc { Some(_) -> acc, None -> match item { IFn(d) -> Some(d), _ -> None } });
   match f {
     None -> panic("the module writes a fn"),
     Some(d) -> match d.effects {
       None -> [],
       Some(r) ->
-        map(r.atoms, |a: AtomExpr|
+        map(r.atoms, |atom: AtomExpr|
           bytes_concat_all([
-            match a.eff.module { Some(b) -> bytes_concat(b.name, b"::"), None -> b"" },
-            a.eff.name.name,
+            match atom.eff.module { Some(b) -> bytes_concat(b.name, b"::"), None -> b"" },
+            atom.eff.name.name,
             b".",
-            match a.op { Some(o) -> o.name, None -> mode_word(a.mode) },
-            match a.resource { Some(l) -> bytes_concat_all([b"[", l.name, b"]"]), None -> b"" },
+            match atom.op { Some(o) -> o.name, None -> mode_word(atom.mode) },
+            match atom.resource { Some(l) -> bytes_concat_all([b"[", l.name, b"]"]), None -> b"" },
           ])),
     },
   }
@@ -3170,12 +3380,15 @@ fn first_row(x: Expanded, m: Int) -> List<Bytes> / {abort.raise} = {
 
 fn resolved(sources: List<Source>) -> Expanded / {abort.raise} =
   match resolve(sources) {
-    Resolved_(x) -> x,
-    Failed(ds) -> panic(string_of_bytes(bytes_concat(b"refused: ", dump_diags(ds)))),
+    ResolveSucceeded(x) -> x,
+    ResolveFailed(ds) -> panic(string_of_bytes(bytes_concat(b"refused: ", dump_diags(ds)))),
   }
 
-fn refused_codes(sources: List<Source>) -> List<Bytes> / {abort.raise} =
-  match resolve(sources) { Resolved_(_) -> [], Failed(ds) -> map(ds, |d: Diag| d.code) }
+fn refused_codes(sources: List<Source>) -> List<Bytes> =
+  match resolve(sources) {
+    ResolveSucceeded(_) -> [],
+    ResolveFailed(ds) -> map(ds, |diag: Diag| diag.code),
+  }
 
 fn store_base() -> Bytes =
   b"pub effect store { read get[t](k: Int) -> Int }\npub effect set Reads = {store.read[orders], log.write}\nfn own() -> Int / {Reads} = 1\n"
@@ -3188,7 +3401,7 @@ test "a `pub` set is named by import or through its module, and means what it me
   // The declaring module writes its own atoms; another reaches the effect's module itself.
   assert_eq(first_row(by_name, 0), [b"store.read[orders]", b"log.write"]);
   assert_eq(first_row(by_name, 1), [b"@base::store.read[orders]", b"log.write"]);
-  assert(find_modbind(at(by_name.r.scopes, 1).modules, b"@base") != None);
+  assert(find_module_binding(at(by_name.r.scopes, 1).modules, b"@base") != None);
   let through = resolved([
     { name: b"base", src: store_base() },
     { name: b"app", src: b"import base\nfn f() -> Int / {base::Reads} = 1" },

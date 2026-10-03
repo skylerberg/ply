@@ -6,7 +6,7 @@ use super::tables::{Defined, Tables};
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::decode::{self, At};
-use ply_eval::{DefHash, Diagnostic, Fields, Front, Severity, SourceId, Symbol, Value, codes};
+use ply_eval::{Analysis, DefHash, Diagnostic, Fields, Severity, SourceId, Symbol, Value, codes};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -299,9 +299,9 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
     {
         return Err(placed(error, &modules));
     }
-    let front: &'static Front = Box::leak(Box::new(front));
+    let front: &'static Analysis = Box::leak(Box::new(front));
     Ok(Box::leak(Box::new(
-        Source::from_front(front).with_texts(texts),
+        Source::from_analysis(front).with_texts(texts),
     )))
 }
 
@@ -759,9 +759,9 @@ pub fn census() -> Census {
 }
 
 /// The front end over a program that ships its own modules, pulling none; `ids[i]` is module
-/// `i`'s source. Program errors are in `diagnostics`, not the `Err`; use [`checked_front`] to
+/// `i`'s source. Program errors are in `diagnostics`, not the `Err`; use [`checked_analysis`] to
 /// raise them.
-pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
+pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Analysis> {
     if sources.len() != ids.len() {
         bail!(
             "{} module(s) handed over with {} source id(s)",
@@ -770,16 +770,16 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
         );
     }
     let pulled = front_pulling_std(sources, &[])?;
-    read_front(&pulled.dump, ids)
+    read_analysis(&pulled.dump, ids)
 }
 
 /// [`super::dump::read`], its failure the front end's.
-fn read_front(dump: &Value, ids: &[SourceId]) -> Result<Front> {
+fn read_analysis(dump: &Value, ids: &[SourceId]) -> Result<Analysis> {
     super::dump::read(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
 }
 
 /// What the front end embedded, as the compiler's passes take it back.
-pub fn embeds_of(front: &Front) -> Result<Value> {
+pub fn embeds_of(front: &Analysis) -> Result<Value> {
     if front.embeds.is_empty() {
         return Ok(Value::list(Vec::new()));
     }
@@ -796,7 +796,7 @@ pub fn module_of_root(root: &str) -> &str {
 /// `modules` and every module they import, directly or not, by what the answer says each imports:
 /// all the emitter reads to lower a body of one of them.
 pub fn imported_closure<'a>(
-    front: &Front,
+    front: &Analysis,
     modules: impl IntoIterator<Item = &'a str>,
 ) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
@@ -836,7 +836,7 @@ pub fn stubbed(text: &str, cuts: &[ply_eval::Cut]) -> String {
 }
 
 /// What every definition and test published, as the emitter takes it; none seeds nothing.
-pub fn rows_of(front: &Front) -> Result<Value> {
+pub fn rows_of(front: &Analysis) -> Result<Value> {
     if front.rows.is_empty() {
         return Ok(record(vec![
             ("defs", Value::list(Vec::new())),
@@ -846,7 +846,7 @@ pub fn rows_of(front: &Front) -> Result<Value> {
     ply_eval::codec::decode(&front.rows).map_err(|e| anyhow!("the answer's rows: {e}"))
 }
 
-/// The package tables a caller passes to a resolving entry, as values: what [`Front`]
+/// The package tables a caller passes to a resolving entry, as values: what [`Analysis`]
 /// publishes, or empty lists for a program without packages.
 pub fn package_tables(
     packages: &[(String, Vec<String>)],
@@ -1301,12 +1301,12 @@ pub fn front_rows_pulling_std_with(
 }
 
 /// [`front`] over the default producer, with the program's errors raised rather than answered.
-pub fn checked_front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
+pub fn checked_analysis(sources: &[(String, String)], ids: &[SourceId]) -> Result<Analysis> {
     ensure_default();
     checked(front(sources, ids)?)
 }
 
-fn checked(front: Front) -> Result<Front> {
+fn checked(front: Analysis) -> Result<Analysis> {
     let errors: Vec<String> = front
         .diagnostics
         .iter()
@@ -1320,16 +1320,16 @@ fn checked(front: Front) -> Result<Front> {
 }
 
 /// A checked front end, and every module of the program in program order.
-pub struct FrontWithStd {
-    pub front: Front,
+pub struct AnalysisWithStd {
+    pub front: Analysis,
     /// The caller's modules, then the pulled std modules, as `(name, text)` in program order.
     pub modules: Vec<(String, String)>,
 }
 
-/// [`checked_front`] over the caller's own sources, with the standard library pulled as the
+/// [`checked_analysis`] over the caller's own sources, with the standard library pulled as the
 /// built-in package rather than inlined: the pattern every harness that composes a program
 /// out of its own modules and the toolchain's shares.
-pub fn checked_front_with_std(user: &[(String, String)]) -> Result<FrontWithStd> {
+pub fn checked_analysis_with_std(user: &[(String, String)]) -> Result<AnalysisWithStd> {
     let shipped: Vec<(String, String)> = ply_std::sources()
         .map(|(name, text)| (name.to_string(), text.to_string()))
         .collect();
@@ -1342,8 +1342,8 @@ pub fn checked_front_with_std(user: &[(String, String)]) -> Result<FrontWithStd>
         modules.push((name.clone(), text.to_string()));
     }
     let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let front = checked(read_front(&pulled.dump, &ids)?)?;
-    Ok(FrontWithStd { front, modules })
+    let front = checked(read_analysis(&pulled.dump, &ids)?)?;
+    Ok(AnalysisWithStd { front, modules })
 }
 
 /// Enters `name` in this thread's compiled emitter, building it first when the thread has none.

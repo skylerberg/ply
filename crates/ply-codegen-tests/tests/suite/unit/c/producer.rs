@@ -1,5 +1,5 @@
 use ply_codegen::c::producer::{imported_closure, module_of_root, stubbed};
-use ply_eval::{Cut, Front, ModuleInfo, ModuleName, SourceId, Symbol};
+use ply_eval::{Analysis, Cut, ModuleInfo, ModuleName, SourceId, Symbol};
 use std::collections::HashSet;
 
 /// The emitter reads roots the same way: `emit.module_of_root`'s test holds the same cases.
@@ -14,7 +14,7 @@ fn a_root_is_in_the_module_its_owner_is_in() {
 
 #[test]
 fn the_emitter_is_handed_the_lowered_modules_and_what_they_import_transitively() {
-    let mut front = Front::default();
+    let mut front = Analysis::default();
     for (at, (name, imports)) in [
         ("a", vec!["b"]),
         ("b", vec!["c"]),

@@ -3,13 +3,13 @@
 // own lexer, and a mutant is the text the load read with that token replaced, checked again over
 // the load's own packages and seeded with its rows, so only what the change reaches is walked.
 
-import cache (Front)
+import compiler.load (LoadedAnalysis)
 import units (emit)
-import compiler.front (Analysed, Refused, Whole)
+import compiler.front (Analysed, Refused, Analysis)
 import compiler.hash (closure_of)
 import compiler.infer (DefInfo, TestInfo)
-import compiler.lexer (Token, TInt, TKw, TPunct, lex)
-import compiler.pkg (Pkgs, Supplied)
+import compiler.lexer (Token, IntLiteral, Keyword, Punctuation, lex)
+import compiler.pkg (PackageSources, Supplied)
 import compiler.resolve (Diag, Source)
 import diagnostic (Place, diag_of, place_json, placeless)
 import entry (At)
@@ -54,12 +54,12 @@ fn joined(parts: List<String>, sep: String) -> String =
 
 // Every definition of this project, as the load published them: what `--mutate *` and
 // `--coverage` are over.
-fn project_defs(w: Whole) -> List<DefInfo> =
+fn project_defs(w: Analysis) -> List<DefInfo> =
   filter(published(w), |d: DefInfo| !is_shipped(text(d.module)))
 
 // The definitions `--mutate DEF` names: every project definition for `*`, else one by its
 // program-wide or unique simple name.
-pub fn targets(w: Whole, query: String) -> Result<List<DefInfo>, Diag> = {
+pub fn targets(w: Analysis, query: String) -> Result<List<DefInfo>, Diag> = {
   let project = project_defs(w);
   let exact = filter(project, |d: DefInfo| text(d.name) == query);
   let simple = filter(project, |d: DefInfo| text(d.simple_name) == query);
@@ -91,12 +91,12 @@ pub fn targets(w: Whole, query: String) -> Result<List<DefInfo>, Diag> = {
 }
 
 // Each test's closure, by the test's program-wide name.
-fn closures(w: Whole) -> Map<Bytes, Map<Bytes, Bool>> / {abort.raise} =
+fn closures(w: Analysis) -> Map<Bytes, Map<Bytes, Bool>> / {abort.raise} =
   fold(w.checked.tests, map_new(), |acc: Map<Bytes, Map<Bytes, Bool>>, t: TestInfo|
     map_insert(acc, t.key, closure_of(w.hashes, [t.key])))
 
 // The tests whose closure holds the definition, in test order.
-fn reaching(w: Whole, closed: Map<Bytes, Map<Bytes, Bool>>, name: Bytes) -> List<TestInfo> =
+fn reaching(w: Analysis, closed: Map<Bytes, Map<Bytes, Bool>>, name: Bytes) -> List<TestInfo> =
   filter(w.checked.tests, |t: TestInfo|
     match map_get(closed, t.key) { Some(names) -> map_contains(names, name), None -> false })
 
@@ -106,7 +106,7 @@ fn token_at(toks: List<Token>, i: Int) -> Option<Token> =
   if i < 0 { None } else { list_at(toks, i) }
 
 fn is_punct(t: Option<Token>, p: Bytes) -> Bool =
-  match t { Some(x) -> x.tok == TPunct(p), None -> false }
+  match t { Some(x) -> x.kind == Punctuation(p), None -> false }
 
 // `<<` and `>>` are two tokens touching, which a comparison never is.
 fn touching(toks: List<Token>, i: Int, p: Bytes) -> Bool =
@@ -149,19 +149,19 @@ fn plain_decimal(src: Bytes, t: Token) -> Bool / {abort.raise} = {
 // One change per operator or literal of `src`, outside strings and comments, in source order. A
 // site the grammar gives another meaning, a `<` opening a type argument, makes a mutant that does
 // not check, which the run skips.
-pub fn sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> / {abort.raise} = {
-  let toks = lex(src).toks;
+pub fn sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> = {
+  let toks = lex(src).tokens;
   fold(range(0, len(toks)), [], |acc: List<{ start: Int, end: Int, to: String }>, i: Int|
     match token_at(toks, i) {
       None -> acc,
       Some(t) -> {
         let site = |to: String| push(acc, { start: t.start, end: t.end, to: to });
-        match t.tok {
-          TPunct(p) -> match swapped(toks, i, p) { Some(to) -> site(to), None -> acc },
-          TKw(k) -> if k == b"true" { site("false") }
+        match t.kind {
+          Punctuation(p) -> match swapped(toks, i, p) { Some(to) -> site(to), None -> acc },
+          Keyword(k) -> if k == b"true" { site("false") }
           else if k == b"false" { site("true") }
           else { acc },
-          TInt(n) -> if !plain_decimal(src, t) { acc }
+          IntLiteral(n) -> if !plain_decimal(src, t) { acc }
           else { match checked_add(n, 1) { Some(m) -> site(int_to_string(m)), None -> acc } },
           _ -> acc,
         }
@@ -188,7 +188,7 @@ pub fn mutations(places: List<Place>, d: DefInfo) -> List<Mutation> / {abort.rai
 
 // Every mutation of every target some test reaches, cheapest first: the fewer tests reach a
 // mutant, the less judging it costs, and mutants a run reaches equally stay in source order.
-pub fn queued(places: List<Place>, w: Whole, targets: List<DefInfo>) -> Queue / {abort.raise} = {
+pub fn queued(places: List<Place>, w: Analysis, targets: List<DefInfo>) -> Queue / {abort.raise} = {
   let closed = closures(w);
   let start: { unreached: List<String>, by_cost: Map<Int, List<{ tests: List<Int>, mutation: Mutation }>> } = {
     unreached: [],
@@ -252,7 +252,7 @@ fn spliced_places(places: List<Place>, m: Mutation) -> List<Place> / {abort.rais
     })
 
 // A dependency's modules come after the root's, package by package, as the load placed them.
-fn spliced_pkgs(pkgs: Pkgs, own: Int, places: List<Place>) -> Pkgs = {
+fn spliced_pkgs(pkgs: PackageSources, own: Int, places: List<Place>) -> PackageSources = {
   let done = fold(
     pkgs.supplied,
     { at: own, out: [] },
@@ -272,7 +272,7 @@ fn spliced_pkgs(pkgs: Pkgs, own: Int, places: List<Place>) -> Pkgs = {
 // The unit a mutant's tests run in, or the verdict a mutant that is not a program already is.
 pub fn built(
   p: Program,
-  w: Whole,
+  w: Analysis,
   shelved: List<Source>,
   m: Mutation,
 ) -> Result<Int, Judged> / {tester.unit[corpus], emit.unit, abort.raise} = {
@@ -286,7 +286,7 @@ pub fn built(
   match out {
     Refused(_) -> Err({ id: 0, verdict: "skipped", why: "does not check" }),
     Analysed(mutant) -> {
-      let front: Front = front_of(
+      let front: LoadedAnalysis = front_of(
         {
           program: { ..p, places: places, diags: mutant.warnings, whole: Some(mutant) },
           read_ms: 0,
@@ -329,7 +329,7 @@ fn num(n: Int) -> Json = Number(decimal_of_int(n))
 // it, and every mutant the budget never reached left out.
 pub fn mutants(
   places: List<Place>,
-  w: Whole,
+  w: Analysis,
   q: Queue,
   judged: List<Judged>,
   budget_spent: Bool,
@@ -408,7 +408,7 @@ pub fn mutants(
 }
 
 // Which tests reach each project definition, from the hash closure alone.
-pub fn coverage(w: Whole) -> Coverage / {abort.raise} = {
+pub fn coverage(w: Analysis) -> Coverage / {abort.raise} = {
   let closed = closures(w);
   let defs = map(project_defs(w), |d: DefInfo|
     {

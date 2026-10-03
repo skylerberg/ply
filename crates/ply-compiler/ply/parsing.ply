@@ -1,0 +1,1043 @@
+// The parser's spine: token access, threaded state, diagnostics, the sequence driver, the dump encoder.
+// Rule: a parse function answers `Result<R<Thing>, P>` and propagates with `?`, except around a
+// save/restore of `no_brace`, `no_pipe` or `depth`, which is a `match` so both paths restore.
+// Rule: a sequence is one `iterate`, never recursion; recursion is reserved for grammar nesting.
+// Rule: the growing field is last in every record literal (`SoFar.out`, `Parser.diags`), or accumulation
+// turns quadratic; build a `Parser` only through the constructors below.
+
+import lexer
+import std.bin
+
+// --- Spans, names -----------------------------------------------------------
+
+pub type Span = { start: Int, end: Int }
+
+derive bin for Span
+
+pub type Ident = { name: Bytes, span: Span }
+
+pub type QName = { module: Option<Ident>, name: Ident, span: Span }
+
+pub fn dummy_span() -> Span = { start: 0, end: 0 }
+
+pub fn span_between(s: Int, e: Int) -> Span = { start: s, end: e }
+
+pub fn span_to(a: Span, b: Span) -> Span =
+  {
+    start: if a.start < b.start { a.start } else { b.start },
+    end: if a.end > b.end { a.end } else { b.end },
+  }
+
+// A span as the key a table of per-site facts is read by.
+pub fn span_key(span: Span) -> Bytes =
+  bytes_concat_all([int_to_bytes(span.start), b":", int_to_bytes(span.end)])
+
+pub fn no_ident() -> Ident = { name: b"", span: dummy_span() }
+
+pub fn no_qname() -> QName = { module: None, name: no_ident(), span: dummy_span() }
+
+pub fn bare(ident: Ident) -> QName = { module: None, name: ident, span: ident.span }
+
+pub fn qualified(m: Ident, n: Ident) -> QName =
+  { module: Some(m), name: n, span: span_to(m.span, n.span) }
+
+// --- Diagnostics ------------------------------------------------------------
+
+// `notes` is always `len(notes_text)`.
+pub type Label = { start: Int, end: Int, primary: Bool, text: Bytes }
+
+pub type ParseDiag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+}
+
+pub fn unexpected() -> Bytes = b"E0001"
+pub fn unterminated() -> Bytes = b"E0002"
+pub fn duplicate_definition() -> Bytes = b"E0105"
+pub fn unknown_effect_set() -> Bytes = b"E0114"
+pub fn effect_set_cycle() -> Bytes = b"E0115"
+pub fn unknown_deriver() -> Bytes = b"E0207"
+pub fn default_not_allowed() -> Bytes = b"E0120"
+pub fn unknown_argument_name() -> Bytes = b"E0123"
+pub fn argument_order() -> Bytes = b"E0124"
+
+pub fn parse_label(span: Span, primary: Bool, text: Bytes) -> Label =
+  { start: span.start, end: span.end, primary: primary, text: text }
+
+pub fn parse_diag(
+  code: Bytes,
+  message: Bytes,
+  labels: List<Label>,
+  notes: List<Bytes>,
+) -> ParseDiag =
+  {
+    code: code,
+    notes: len(notes),
+    labels: labels,
+    message: message,
+    notes_text: notes,
+    severity: b"error",
+  }
+
+pub fn error_at(
+  code: Bytes,
+  span: Span,
+  message: Bytes,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> ParseDiag = parse_diag(code, message, [parse_label(span, true, label)], notes)
+
+pub fn error_at_and(
+  code: Bytes,
+  span: Span,
+  message: Bytes,
+  label: Bytes,
+  also: Span,
+  also_text: Bytes,
+  notes: List<Bytes>,
+) -> ParseDiag =
+  parse_diag(
+    code,
+    message,
+    [parse_label(span, true, label), parse_label(also, false, also_text)],
+    notes,
+  )
+
+pub fn primary_span_of(diag: ParseDiag) -> Span = {
+  let first = fold(
+    diag.labels,
+    { seen: false, s: dummy_span() },
+    |a: { seen: Bool, s: Span }, label: Label|
+      if a.seen { a } else { { seen: true, s: { start: label.start, end: label.end } } },
+  );
+  let prim = fold(
+    diag.labels,
+    { seen: false, s: dummy_span() },
+    |a: { seen: Bool, s: Span }, label: Label|
+      if a.seen || !label.primary { a }
+      else { { seen: true, s: { start: label.start, end: label.end } } },
+  );
+  if prim.seen { prim.s } else { first.s }
+}
+
+// --- The token buffer -------------------------------------------------------
+
+pub type Input = { token_count: Int, source: Bytes, tokens: List<lexer::Token> }
+
+// `gt_split` is the index where `expect_gt` split a `>=`: `token_index` reads it as `=` over its
+// second byte. One slot suffices because `pos` must pass a split before another can happen.
+pub type Parser = {
+  pos: Int,
+  no_brace: Bool,
+  // Inside a lambda's parameter list, `|` closes the list and is never bit-or.
+  no_pipe: Bool,
+  depth: Int,
+  gt_split: Int,
+  diags: List<ParseDiag>,
+}
+
+pub type Parsed<a> = { parser: Parser, node: a }
+
+pub type Eaten = { parser: Parser, ok: Bool }
+
+pub type SoFar<a> = { parser: Parser, out: List<a> }
+
+pub type ParseStart = { input: Input, parser: Parser }
+
+pub fn start(src: Bytes) -> ParseStart / {abort.raise} = {
+  let lx = lexer::lex(src);
+  let d = map(lx.diags, |diag: lexer::Diag|
+    error_at(diag.code, { start: diag.start, end: diag.end }, diag.message, diag.label, []));
+  {
+    input: { token_count: len(lx.tokens), source: src, tokens: lx.tokens },
+    parser: { pos: 0, no_brace: false, no_pipe: false, depth: 0, gt_split: -1, diags: d },
+  }
+}
+
+// --- Constructing `Parser` -------------------------------------------------------
+
+pub fn at_pos(parser: Parser, pos: Int) -> Parser =
+  {
+    no_brace: parser.no_brace,
+    no_pipe: parser.no_pipe,
+    depth: parser.depth,
+    gt_split: parser.gt_split,
+    pos: pos,
+    diags: parser.diags,
+  }
+
+pub fn with_no_brace(parser: Parser, b: Bool) -> Parser =
+  {
+    pos: parser.pos,
+    no_pipe: parser.no_pipe,
+    depth: parser.depth,
+    gt_split: parser.gt_split,
+    no_brace: b,
+    diags: parser.diags,
+  }
+
+pub fn with_no_pipe(parser: Parser, b: Bool) -> Parser =
+  {
+    pos: parser.pos,
+    no_brace: parser.no_brace,
+    depth: parser.depth,
+    gt_split: parser.gt_split,
+    no_pipe: b,
+    diags: parser.diags,
+  }
+
+pub fn with_depth(parser: Parser, d: Int) -> Parser =
+  {
+    pos: parser.pos,
+    no_brace: parser.no_brace,
+    no_pipe: parser.no_pipe,
+    gt_split: parser.gt_split,
+    depth: d,
+    diags: parser.diags,
+  }
+
+pub fn with_gt_split(parser: Parser, i: Int) -> Parser =
+  {
+    pos: parser.pos,
+    no_brace: parser.no_brace,
+    no_pipe: parser.no_pipe,
+    depth: parser.depth,
+    gt_split: i,
+    diags: parser.diags,
+  }
+
+pub fn fresh_item(parser: Parser) -> Parser =
+  {
+    pos: parser.pos,
+    no_pipe: parser.no_pipe,
+    gt_split: parser.gt_split,
+    no_brace: false,
+    depth: 0,
+    diags: parser.diags,
+  }
+
+pub fn advance_n(input: Input, parser: Parser, n: Int) -> Parser =
+  if n <= 0 { parser } else { advance_n(input, advance(input, parser).parser, n - 1) }
+
+// Drops a diagnostic with the same code and primary span as the previous one: one mistake trips several expectations.
+pub fn push_diag(parser: Parser, diag: ParseDiag) -> Parser = {
+  let s = primary_span_of(diag);
+  let dup = match list_at(parser.diags, len(parser.diags) - 1) {
+    Some(l) -> {
+      let ls = primary_span_of(l);
+      l.code == diag.code && ls.start == s.start && ls.end == s.end
+    },
+    None -> false,
+  };
+  if dup { parser } else {
+    {
+      pos: parser.pos,
+      no_brace: parser.no_brace,
+      no_pipe: parser.no_pipe,
+      depth: parser.depth,
+      gt_split: parser.gt_split,
+      diags: push(parser.diags, diag),
+    }
+  }
+}
+
+// Where `?` cannot stand (tests, lambdas): `parsed_or` answers the state either way; `failed` says which arm.
+pub fn parsed_or<a>(r: Result<Parsed<a>, Parser>, d: a) -> Parsed<a> =
+  match r { Ok(x) -> x, Err(q) -> { parser: q, node: d } }
+
+pub fn failed<a>(r: Result<Parsed<a>, Parser>) -> Bool = match r { Ok(x) -> false, Err(q) -> true }
+
+// --- Token access -----------------------------------------------------------
+
+fn eof_token() -> lexer::Token = { start: 0, end: 0, kind: lexer::EndOfInput }
+
+// Absolute index, clamped to the buffer (the clamped token is observable), with `expect_gt`'s split applied.
+pub fn token_index(input: Input, parser: Parser, i: Int) -> lexer::Token = {
+  let j = if i < 0 { 0 } else if i > input.token_count - 1 { input.token_count - 1 } else { i };
+  let t = match list_at(input.tokens, j) { Some(x) -> x, None -> eof_token() };
+  if j == parser.gt_split { { start: t.start + 1, end: t.end, kind: lexer::Punctuation(b"eq") } }
+  else { t }
+}
+
+pub fn token_at(input: Input, parser: Parser, n: Int) -> lexer::Token =
+  token_index(input, parser, parser.pos + n)
+
+pub fn token_kind(input: Input, parser: Parser) -> lexer::TokenKind =
+  token_at(input, parser, 0).kind
+
+pub fn token_kind_at(input: Input, parser: Parser, n: Int) -> lexer::TokenKind =
+  token_at(input, parser, n).kind
+
+pub fn span_at(input: Input, parser: Parser, n: Int) -> Span = {
+  let t = token_at(input, parser, n);
+  { start: t.start, end: t.end }
+}
+
+pub fn current_span(input: Input, parser: Parser) -> Span = span_at(input, parser, 0)
+
+pub fn previous_span(input: Input, parser: Parser) -> Span = {
+  let t = token_index(input, parser, parser.pos - 1);
+  { start: t.start, end: t.end }
+}
+
+pub fn token_bytes(input: Input, token: lexer::Token) -> Bytes =
+  bytes_slice(input.source, token.start, token.end)
+
+// Answers the current span and moves on, except at the last token, where it stays.
+pub fn advance(input: Input, parser: Parser) -> Parsed<Span> =
+  {
+    parser: if parser.pos + 1 < input.token_count { at_pos(parser, parser.pos + 1) }
+    else { parser },
+    node: current_span(input, parser),
+  }
+
+pub fn at_token(input: Input, parser: Parser, kind: lexer::TokenKind) -> Bool =
+  token_kind(input, parser) == kind
+
+pub fn at_eof(input: Input, parser: Parser) -> Bool = token_kind(input, parser) == lexer::EndOfInput
+
+pub fn at_ident_text(input: Input, parser: Parser, text: Bytes) -> Bool =
+  token_kind(input, parser) == lexer::Identifier(text)
+
+// Constructor versus binder. ASCII suffices: the lexer refuses a token whose first byte is >= 128.
+pub fn starts_upper(name: Bytes) -> Bool / {abort.raise} =
+  bytes_len(name) > 0 && bytes_at(name, 0) >= 65 && bytes_at(name, 0) <= 90
+
+pub fn is_str(input: Input, parser: Parser) -> Bool =
+  match token_kind(input, parser) { lexer::StringLiteral(v) -> true, _ -> false }
+
+pub fn bump(input: Input, parser: Parser) -> Parser = advance(input, parser).parser
+
+pub fn dump_bool(b: Bool) -> Bytes = if b { dump_word(b"true") } else { dump_word(b"false") }
+
+pub fn is_ident(input: Input, parser: Parser) -> Bool =
+  match token_kind(input, parser) { lexer::Identifier(n) -> true, _ -> false }
+
+// --- Expecting --------------------------------------------------------------
+
+pub fn eat(input: Input, parser: Parser, kind: lexer::TokenKind) -> Eaten =
+  if at_token(input, parser, kind) { { parser: advance(input, parser).parser, ok: true } }
+  else { { parser: parser, ok: false } }
+
+// How a diagnostic names the token it found.
+pub fn describe(kind: lexer::TokenKind) -> Bytes =
+  match kind {
+    lexer::Identifier(n) -> bytes_concat_all([b"identifier `", n, b"`"]),
+    lexer::IntLiteral(v) -> bytes_concat_all([b"integer `", int_to_bytes(v), b"`"]),
+    lexer::FixedLiteral(ty, v) ->
+      bytes_concat_all([b"`", ty, b"` literal `", int_to_bytes(v), b"`"]),
+    lexer::WideLiteral(ty, high, low) ->
+      bytes_concat_all([
+        b"`",
+        ty,
+        b"` literal `",
+        lexer::wide_decimal(ty == b"I128", high, low),
+        b"`",
+      ]),
+    lexer::FloatLiteral(txt) -> bytes_concat_all([b"float `", float_display(txt), b"`"]),
+    lexer::DecimalLiteral(m, sc) -> bytes_concat_all([b"decimal `", render_decimal(m, sc), b"`"]),
+    lexer::StringLiteral(_) -> b"string literal",
+    lexer::LineString(_) -> b"line string",
+    lexer::BytesLiteral(_) -> b"byte-string literal",
+    lexer::InterpolatedHead(_) -> b"interpolated string",
+    lexer::InterpolatedMiddle(_) -> b"`}` closing an interpolated value",
+    lexer::InterpolatedTail(_) -> b"`}` closing an interpolated value",
+    lexer::CharLiteral(_) -> b"character literal",
+    lexer::Keyword(k) -> bytes_concat_all([b"keyword `", k, b"`"]),
+    lexer::EndOfInput -> b"end of file",
+    lexer::Punctuation(name) -> bytes_concat_all([b"`", punct_text(name), b"`"]),
+  }
+
+// A table, not an `else if` chain: a long chain overflows the native stack when the emitter compiles itself.
+fn punct_text(name: Bytes) -> Bytes = {
+  let table = [
+    { n: b"lparen", t: b"(" },
+    { n: b"rparen", t: b")" },
+    { n: b"lbrace", t: b"{" },
+    { n: b"rbrace", t: b"}" },
+    { n: b"lbracket", t: b"[" },
+    { n: b"rbracket", t: b"]" },
+    { n: b"comma", t: b"," },
+    { n: b"semi", t: b";" },
+    { n: b"colon", t: b":" },
+    { n: b"coloncolon", t: b"::" },
+    { n: b"dot", t: b"." },
+    { n: b"dotdot", t: b".." },
+    { n: b"underscore", t: b"_" },
+    { n: b"arrow", t: b"->" },
+    { n: b"eq", t: b"=" },
+    { n: b"eqeq", t: b"==" },
+    { n: b"bang", t: b"!" },
+    { n: b"bangeq", t: b"!=" },
+    { n: b"lt", t: b"<" },
+    { n: b"le", t: b"<=" },
+    { n: b"gt", t: b">" },
+    { n: b"ge", t: b">=" },
+    { n: b"plus", t: b"+" },
+    { n: b"plusplus", t: b"++" },
+    { n: b"minus", t: b"-" },
+    { n: b"star", t: b"*" },
+    { n: b"slash", t: b"/" },
+    { n: b"percent", t: b"%" },
+    { n: b"amp", t: b"&" },
+    { n: b"ampamp", t: b"&&" },
+    { n: b"caret", t: b"^" },
+    { n: b"pipe", t: b"|" },
+    { n: b"pipepipe", t: b"||" },
+    { n: b"tilde", t: b"~" },
+    { n: b"hashbrace", t: b"#{" },
+    { n: b"hashbracket", t: b"#[" },
+    { n: b"question", t: b"?" },
+  ];
+  fold(table, b"", |acc: Bytes, e: { n: Bytes, t: Bytes }| if e.n == name { e.t } else { acc })
+}
+
+// The mantissa's digits with the point `scale` places from the end.
+pub fn render_decimal(digits: Bytes, scale: Int) -> Bytes / {abort.raise} =
+  if scale == 0 { digits } else {
+    let padded = if bytes_len(digits) <= scale {
+      bytes_concat(
+        bytes_concat_all(map(range(0, scale - bytes_len(digits) + 1), |_: Int| b"0")),
+        digits,
+      )
+    } else { digits };
+    let point = bytes_len(padded) - scale;
+    bytes_concat_all([
+      bytes_slice(padded, 0, point),
+      b".",
+      bytes_slice(padded, point, bytes_len(padded)),
+    ])
+  }
+
+// `f64`'s `Display` over literal text: zeros trimmed, exponent applied; exact up to 17 significant digits.
+pub fn float_display(txt: Bytes) -> Bytes / {abort.raise} = {
+  let n = bytes_len(txt);
+  let e_at = match bytes_index_of(txt, b"e") { Some(i) -> i, None -> n };
+  let mantissa = bytes_slice(txt, 0, e_at);
+  let exp = if e_at == n { 0 } else { int_of_signed(bytes_slice(txt, e_at + 1, n)) };
+  let dot = match bytes_index_of(mantissa, b".") { Some(i) -> i, None -> bytes_len(mantissa) };
+  let whole = bytes_slice(mantissa, 0, dot);
+  let frac = if dot == bytes_len(mantissa) { b"" }
+  else { bytes_slice(mantissa, dot + 1, bytes_len(mantissa)) };
+  let digits = bytes_concat(whole, frac);
+  let point = bytes_len(whole) + exp;
+  let lead = bytes_scan(digits, 0, b"0", bytes_len(digits));
+  let trail = trailing_zeros(digits);
+  if lead == bytes_len(digits) { b"0" } else {
+    let sig = bytes_slice(digits, lead, bytes_len(digits) - trail);
+    let parser = point - lead;
+    if parser <= 0 {
+      bytes_concat_all([b"0.", bytes_concat_all(map(range(0, 0 - parser), |_: Int| b"0")), sig])
+    } else if parser >= bytes_len(sig) {
+      bytes_concat(sig, bytes_concat_all(map(range(0, parser - bytes_len(sig)), |_: Int| b"0")))
+    } else {
+      bytes_concat_all([
+        bytes_slice(sig, 0, parser),
+        b".",
+        bytes_slice(sig, parser, bytes_len(sig)),
+      ])
+    }
+  }
+}
+
+fn trailing_zeros(b: Bytes) -> Int / {abort.raise} =
+  fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int|
+    if bytes_at(b, bytes_len(b) - 1 - i) == 48 && acc == i { acc + 1 } else { acc })
+
+fn int_of_signed(b: Bytes) -> Int / {abort.raise} =
+  if bytes_len(b) == 0 { 0 }
+  else if bytes_at(b, 0) == 45 { 0 - int_of_digits(bytes_slice(b, 1, bytes_len(b))) }
+  else if bytes_at(b, 0) == 43 { int_of_digits(bytes_slice(b, 1, bytes_len(b))) }
+  else { int_of_digits(b) }
+
+fn int_of_digits(d: Bytes) -> Int / {abort.raise} =
+  fold(range(0, bytes_len(d)), 0, |a: Int, i: Int| a * 10 + (bytes_at(d, i) - 48))
+
+pub fn error_here(input: Input, parser: Parser, what: Bytes) -> Parser =
+  push_diag(
+    parser,
+    error_at(
+      unexpected(),
+      current_span(input, parser),
+      bytes_concat_all([b"expected ", what, b", found ", describe(token_kind(input, parser))]),
+      bytes_concat(b"expected ", what),
+      [],
+    ),
+  )
+
+pub fn unclosed(input: Input, parser: Parser, open: Span, what: Bytes) -> Parser =
+  push_diag(
+    parser,
+    error_at_and(
+      unexpected(),
+      current_span(input, parser),
+      bytes_concat_all([b"expected ", what, b", found ", describe(token_kind(input, parser))]),
+      bytes_concat(b"expected ", what),
+      open,
+      b"unclosed delimiter opened here",
+      [],
+    ),
+  )
+
+pub fn expect(
+  input: Input,
+  parser: Parser,
+  kind: lexer::TokenKind,
+  what: Bytes,
+) -> Result<Parsed<Span>, Parser> =
+  if at_token(input, parser, kind) { Ok(advance(input, parser)) }
+  else { Err(error_here(input, parser, what)) }
+
+pub fn expect_close(
+  input: Input,
+  parser: Parser,
+  kind: lexer::TokenKind,
+  open: Span,
+  what: Bytes,
+) -> Result<Parsed<Span>, Parser> =
+  if at_token(input, parser, kind) { Ok(advance(input, parser)) }
+  else { Err(unclosed(input, parser, open, what)) }
+
+pub fn expect_ident(input: Input, parser: Parser, what: Bytes) -> Result<Parsed<Ident>, Parser> =
+  match token_kind(input, parser) {
+    lexer::Identifier(n) -> {
+      let a = advance(input, parser);
+      Ok({ parser: a.parser, node: { name: n, span: a.node } })
+    },
+    _ -> Err(error_here(input, parser, what)),
+  }
+
+// A parameter name, or `_` for one the body never names: it binds like any other name and is
+// unreachable only because `_` never lexes as an identifier in expression position.
+pub fn expect_binder(input: Input, parser: Parser, what: Bytes) -> Result<Parsed<Ident>, Parser> =
+  match token_kind(input, parser) {
+    lexer::Identifier(n) -> {
+      let a = advance(input, parser);
+      Ok({ parser: a.parser, node: { name: n, span: a.node } })
+    },
+    lexer::Punctuation(s) -> if s == b"underscore" {
+      let a = advance(input, parser);
+      Ok({ parser: a.parser, node: { name: b"_", span: a.node } })
+    } else { Err(error_here(input, parser, what)) },
+    _ -> Err(error_here(input, parser, what)),
+  }
+
+// A keyword may name a field; `keyword` flags it for the punned forms that also bind a variable.
+pub fn expect_field_name(
+  input: Input,
+  parser: Parser,
+  what: Bytes,
+) -> Result<Parsed<{ name: Ident, keyword: Bool }>, Parser> =
+  match token_kind(input, parser) {
+    lexer::Identifier(n) -> {
+      let a = advance(input, parser);
+      Ok({ parser: a.parser, node: { name: { name: n, span: a.node }, keyword: false } })
+    },
+    lexer::Keyword(k) -> {
+      let a = advance(input, parser);
+      Ok({ parser: a.parser, node: { name: { name: k, span: a.node }, keyword: true } })
+    },
+    _ -> Err(error_here(input, parser, what)),
+  }
+
+pub fn keyword_pun_refusal(parser: Parser, name: Ident) -> Parser =
+  push_diag(
+    parser,
+    error_at(
+      unexpected(),
+      name.span,
+      bytes_concat_all([
+        b"`",
+        name.name,
+        b"` names a field here, and a bare field also names a variable",
+      ]),
+      b"a keyword cannot name a variable",
+      [
+        bytes_concat_all([
+          b"write `",
+          name.name,
+          b": ",
+          name.name,
+          b"_` with a name of your own on the right",
+        ]),
+      ],
+    ),
+  )
+
+// On `>=`, answers the `>` and leaves `pos`, with `gt_split` turning the rest into `=`.
+pub fn expect_gt(input: Input, parser: Parser, what: Bytes) -> Result<Parsed<Span>, Parser> =
+  if at_token(input, parser, token_gt()) { Ok(advance(input, parser)) }
+  else if at_token(input, parser, token_ge()) {
+    let s = current_span(input, parser);
+    Ok({ parser: with_gt_split(parser, parser.pos), node: { start: s.start, end: s.start + 1 } })
+  } else { Err(error_here(input, parser, what)) }
+
+// --- Depth ------------------------------------------------------------------
+
+pub fn max_depth() -> Int = 128
+
+pub fn deeper(input: Input, parser: Parser) -> Result<Parser, Parser> = {
+  let q = with_depth(parser, parser.depth + 1);
+  if q.depth <= max_depth() { Ok(q) } else {
+    Err(
+      push_diag(
+        q,
+        error_at(
+          unexpected(),
+          current_span(input, q),
+          b"input is nested too deeply to parse",
+          bytes_concat_all([b"more than ", int_to_bytes(max_depth()), b" levels of nesting"]),
+          [b"split this into smaller definitions"],
+        ),
+      ),
+    )
+  }
+}
+
+pub fn shallower(parser: Parser) -> Parser = with_depth(parser, parser.depth - 1)
+
+// --- The shared sequence driver ---------------------------------------------
+
+pub fn comma_list<a | e>(
+  input: Input,
+  parser: Parser,
+  close: lexer::TokenKind,
+  item: (Input, Parser) -> Result<Parsed<a>, Parser> / e,
+) -> Result<Parsed<List<a>>, Parser> / {abort.raise | e} =
+  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: SoFar<a>|
+    if at_token(input, s.parser, close) || at_eof(input, s.parser) {
+      Stop(Ok({ parser: s.parser, node: s.out }))
+    } else {
+      match item(input, s.parser) {
+        Err(q) -> Stop(Err(q)),
+        Ok(r) -> {
+          let e = eat(input, r.parser, token_comma());
+          if e.ok { Continue({ parser: e.parser, out: push(s.out, r.node) }) }
+          else { Stop(Ok({ parser: e.parser, node: push(s.out, r.node) })) }
+        },
+      }
+    })
+
+// --- Qualified names --------------------------------------------------------
+
+pub fn qname(input: Input, parser: Parser, what: Bytes) -> Result<Parsed<QName>, Parser> = {
+  let { parser, node: first } = expect_ident(input, parser, what)?;
+  let cc = eat(input, parser, token_coloncolon());
+  if !cc.ok { Ok({ parser: cc.parser, node: bare(first) }) } else {
+    let { parser, node: second } = expect_ident(input, cc.parser, b"a name after `::`")?;
+    if at_token(input, parser, token_coloncolon()) {
+      Err(
+        push_diag(
+          parser,
+          error_at(
+            unexpected(),
+            current_span(input, parser),
+            b"a qualified name has at most one `::`",
+            b"unexpected `::`",
+            [
+              b"a module binder is a single name: `import store.orders` binds `orders`, so write `orders::place`",
+            ],
+          ),
+        ),
+      )
+    } else { Ok({ parser: parser, node: qualified(first, second) }) }
+  }
+}
+
+// --- The token vocabulary ---------------------------------------------------
+
+pub fn token_lparen() -> lexer::TokenKind = lexer::Punctuation(b"lparen")
+pub fn token_rparen() -> lexer::TokenKind = lexer::Punctuation(b"rparen")
+pub fn token_lbrace() -> lexer::TokenKind = lexer::Punctuation(b"lbrace")
+pub fn token_rbrace() -> lexer::TokenKind = lexer::Punctuation(b"rbrace")
+pub fn token_lbracket() -> lexer::TokenKind = lexer::Punctuation(b"lbracket")
+pub fn token_rbracket() -> lexer::TokenKind = lexer::Punctuation(b"rbracket")
+pub fn token_comma() -> lexer::TokenKind = lexer::Punctuation(b"comma")
+pub fn token_semi() -> lexer::TokenKind = lexer::Punctuation(b"semi")
+pub fn token_colon() -> lexer::TokenKind = lexer::Punctuation(b"colon")
+pub fn token_coloncolon() -> lexer::TokenKind = lexer::Punctuation(b"coloncolon")
+pub fn token_dot() -> lexer::TokenKind = lexer::Punctuation(b"dot")
+pub fn token_dotdot() -> lexer::TokenKind = lexer::Punctuation(b"dotdot")
+pub fn token_underscore() -> lexer::TokenKind = lexer::Punctuation(b"underscore")
+pub fn token_arrow() -> lexer::TokenKind = lexer::Punctuation(b"arrow")
+pub fn token_eq() -> lexer::TokenKind = lexer::Punctuation(b"eq")
+pub fn token_eqeq() -> lexer::TokenKind = lexer::Punctuation(b"eqeq")
+pub fn token_bang() -> lexer::TokenKind = lexer::Punctuation(b"bang")
+pub fn token_bangeq() -> lexer::TokenKind = lexer::Punctuation(b"bangeq")
+pub fn token_lt() -> lexer::TokenKind = lexer::Punctuation(b"lt")
+pub fn token_amp() -> lexer::TokenKind = lexer::Punctuation(b"amp")
+pub fn token_caret() -> lexer::TokenKind = lexer::Punctuation(b"caret")
+pub fn token_tilde() -> lexer::TokenKind = lexer::Punctuation(b"tilde")
+pub fn token_hashbrace() -> lexer::TokenKind = lexer::Punctuation(b"hashbrace")
+pub fn token_hashbracket() -> lexer::TokenKind = lexer::Punctuation(b"hashbracket")
+pub fn token_le() -> lexer::TokenKind = lexer::Punctuation(b"le")
+pub fn token_gt() -> lexer::TokenKind = lexer::Punctuation(b"gt")
+pub fn token_ge() -> lexer::TokenKind = lexer::Punctuation(b"ge")
+pub fn token_plus() -> lexer::TokenKind = lexer::Punctuation(b"plus")
+pub fn token_plusplus() -> lexer::TokenKind = lexer::Punctuation(b"plusplus")
+pub fn token_minus() -> lexer::TokenKind = lexer::Punctuation(b"minus")
+pub fn token_star() -> lexer::TokenKind = lexer::Punctuation(b"star")
+pub fn token_slash() -> lexer::TokenKind = lexer::Punctuation(b"slash")
+pub fn token_percent() -> lexer::TokenKind = lexer::Punctuation(b"percent")
+pub fn token_question() -> lexer::TokenKind = lexer::Punctuation(b"question")
+pub fn token_ampamp() -> lexer::TokenKind = lexer::Punctuation(b"ampamp")
+pub fn token_pipe() -> lexer::TokenKind = lexer::Punctuation(b"pipe")
+pub fn token_pipepipe() -> lexer::TokenKind = lexer::Punctuation(b"pipepipe")
+pub fn token_eof() -> lexer::TokenKind = lexer::EndOfInput
+
+pub fn keyword_pub() -> lexer::TokenKind = lexer::Keyword(b"pub")
+pub fn keyword_import() -> lexer::TokenKind = lexer::Keyword(b"import")
+pub fn keyword_fn() -> lexer::TokenKind = lexer::Keyword(b"fn")
+pub fn keyword_type() -> lexer::TokenKind = lexer::Keyword(b"type")
+pub fn keyword_effect() -> lexer::TokenKind = lexer::Keyword(b"effect")
+pub fn keyword_nondet() -> lexer::TokenKind = lexer::Keyword(b"nondet")
+pub fn keyword_test() -> lexer::TokenKind = lexer::Keyword(b"test")
+pub fn keyword_let() -> lexer::TokenKind = lexer::Keyword(b"let")
+pub fn keyword_if() -> lexer::TokenKind = lexer::Keyword(b"if")
+pub fn keyword_else() -> lexer::TokenKind = lexer::Keyword(b"else")
+pub fn keyword_match() -> lexer::TokenKind = lexer::Keyword(b"match")
+pub fn keyword_handle() -> lexer::TokenKind = lexer::Keyword(b"handle")
+pub fn keyword_with() -> lexer::TokenKind = lexer::Keyword(b"with")
+pub fn keyword_true() -> lexer::TokenKind = lexer::Keyword(b"true")
+pub fn keyword_false() -> lexer::TokenKind = lexer::Keyword(b"false")
+
+// --- The dump encoder -------------------------------------------------------
+// Printable ASCII with no `"` and no `\`: the dump is read back through `ply run --json`'s escaping.
+
+pub fn int_to_bytes(i: Int) -> Bytes = bytes_of_string(int_to_string(i))
+
+pub fn dump_node(span: Span, tag: Bytes) -> Bytes =
+  bytes_concat_all([int_to_bytes(span.start), b":", int_to_bytes(span.end), b":", tag, b";"])
+
+pub fn dump_count(k: Int) -> Bytes = bytes_concat_all([b"#", int_to_bytes(k), b";"])
+
+pub fn dump_presence(present: Bool) -> Bytes = if present { b"?1;" } else { b"?0;" }
+
+pub fn dump_word(w: Bytes) -> Bytes = bytes_concat_all([b"%", w, b";"])
+
+pub fn dump_payload(b: Bytes) -> Bytes / {abort.raise} = bytes_concat_all([b"@", hex(b), b";"])
+
+pub fn dump_list<a | e>(xs: List<a>, f: (a) -> Bytes / e) -> Bytes / e =
+  bytes_concat(dump_count(len(xs)), bytes_concat_all(map(xs, f)))
+
+pub fn dump_opt<a | e>(o: Option<a>, f: (a) -> Bytes / e) -> Bytes / e =
+  match o { None -> dump_presence(false), Some(x) -> bytes_concat(dump_presence(true), f(x)) }
+
+pub fn dump_ident(ident: Ident) -> Bytes =
+  bytes_concat(dump_node(ident.span, b"ident"), dump_payload(ident.name))
+
+pub fn dump_qname(qname: QName) -> Bytes =
+  bytes_concat_all([
+    dump_node(qname.span, b"qname"),
+    dump_opt(qname.module, dump_ident),
+    dump_ident(qname.name),
+  ])
+
+pub fn dump_label(label: Label) -> Bytes =
+  bytes_concat_all([
+    b"=",
+    int_to_bytes(label.start),
+    b":",
+    int_to_bytes(label.end),
+    b":",
+    if label.primary { b"1" } else { b"0" },
+    b";",
+  ])
+
+pub fn dump_diag(diag: ParseDiag) -> Bytes = {
+  let s = primary_span_of(diag);
+  bytes_concat(
+    bytes_concat_all([
+      b"!",
+      diag.code,
+      b":",
+      int_to_bytes(s.start),
+      b":",
+      int_to_bytes(s.end),
+      b":",
+      int_to_bytes(len(diag.labels)),
+      b":",
+      int_to_bytes(diag.notes),
+      b";",
+    ]),
+    bytes_concat_all(map(diag.labels, dump_label)),
+  )
+}
+
+pub fn dump_diags(diags: List<ParseDiag>) -> Bytes =
+  bytes_concat(dump_count(len(diags)), bytes_concat_all(map(diags, dump_diag)))
+
+fn hex_digits() -> Bytes = b"0123456789abcdef"
+
+fn hex_digit(v: Int) -> Bytes / {abort.raise} = bytes_slice(hex_digits(), v, v + 1)
+
+fn hex_byte(v: Int) -> Bytes / {abort.raise} = bytes_concat(hex_digit(v / 16), hex_digit(v % 16))
+
+pub fn hex(b: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(range(0, bytes_len(b)), |i: Int| hex_byte(bytes_at(b, i))))
+
+// --- The spine's own tests --------------------------------------------------
+
+fn probe(src: Bytes) -> ParseStart / {abort.raise} = start(src)
+
+test "the token buffer is indexed from zero and ends with the EOF token" {
+  let s = probe(b"fn f");
+  assert_eq(s.input.token_count, 3);
+  assert_eq(token_kind_at(s.input, s.parser, 0), lexer::Keyword(b"fn"));
+  assert_eq(token_kind_at(s.input, s.parser, 1), lexer::Identifier(b"f"));
+  assert_eq(token_kind_at(s.input, s.parser, 2), lexer::EndOfInput);
+}
+
+test "lookahead past the end clamps to the last token rather than failing" {
+  let s = probe(b"fn");
+  assert_eq(token_kind_at(s.input, s.parser, 7), lexer::EndOfInput);
+  assert_eq(span_at(s.input, s.parser, 7).start, 2);
+}
+
+test "advance stops at the last token, so a parser at EOF cannot run away" {
+  let s = probe(b"fn");
+  let a = advance(s.input, advance(s.input, advance(s.input, s.parser).parser).parser);
+  assert_eq(a.parser.pos, 1);
+  assert_eq(at_eof(s.input, a.parser), true);
+}
+
+test "prev_span at position zero is the first token, as saturating_sub says" {
+  let s = probe(b"fn f");
+  assert_eq(previous_span(s.input, s.parser).start, 0);
+  assert_eq(previous_span(s.input, advance(s.input, s.parser).parser).end, 2);
+}
+
+test "a float literal is carried as the raw source over its span" {
+  let s = probe(b"1.50");
+  assert_eq(token_bytes(s.input, token_at(s.input, s.parser, 0)), b"1.50");
+}
+
+test "expect_gt splits a `>=` into `>` and leaves an `=` where it stood" {
+  let s = probe(b">= x");
+  let g = parsed_or(expect_gt(s.input, s.parser, b"`>`"), dummy_span());
+  assert_eq(g.node.start, 0);
+  assert_eq(g.node.end, 1);
+  assert_eq(g.parser.pos, 0);
+  assert_eq(token_kind(s.input, g.parser), token_eq());
+  assert_eq(current_span(s.input, g.parser).start, 1);
+  assert_eq(current_span(s.input, g.parser).end, 2);
+  let a = advance(s.input, g.parser);
+  assert_eq(previous_span(s.input, a.parser).start, 1);
+  assert_eq(token_kind(s.input, a.parser), lexer::Identifier(b"x"));
+}
+
+test "two diagnostics with the same code and primary span collapse to one" {
+  let s = probe(b"fn f");
+  let a = error_here(s.input, s.parser, b"one");
+  let b = push_diag(a, error_at(unexpected(), current_span(s.input, s.parser), b"", b"", []));
+  assert_eq(len(b.diags), 1);
+  let c2 = push_diag(a, error_at(unexpected(), span_between(9, 9), b"", b"", []));
+  assert_eq(len(c2.diags), 2);
+  let d = push_diag(a, error_at(unterminated(), current_span(s.input, s.parser), b"", b"", []));
+  assert_eq(len(d.diags), 2);
+}
+
+test "the dedup rule sees the last lexer diagnostic, not only parser ones" {
+  let s = probe(b"$");
+  assert_eq(len(s.parser.diags), 1);
+  let last = match list_at(s.parser.diags, len(s.parser.diags) - 1) {
+    Some(l) -> l,
+    None -> error_at(b"", dummy_span(), b"", b"", []),
+  };
+  assert_eq(last.code, b"E0001");
+  assert_eq(primary_span_of(last).start, 0);
+  let q = push_diag(s.parser, error_at(unexpected(), span_between(0, 1), b"", b"", []));
+  assert_eq(len(q.diags), 1);
+}
+
+test "an unclosed delimiter carries a secondary label at the opener" {
+  let s = probe(b"( ]");
+  let u = unclosed(s.input, at_pos(s.parser, 1), span_between(0, 1), b"`)`");
+  assert_eq(len(u.diags), 1);
+  assert_eq(dump_diags(u.diags), b"#1;!E0001:2:3:2:0;=2:3:1;=0:1:0;");
+}
+
+test "deeper fails at MAX_DEPTH and the diagnostic carries its note" {
+  let s = probe(b"fn");
+  let deep = with_depth(s.parser, max_depth());
+  match deeper(s.input, deep) {
+    Ok(q) -> assert(false),
+    Err(q) -> assert_eq(dump_diags(q.diags), b"#1;!E0001:0:2:1:1;=0:2:1;"),
+  };
+  match deeper(s.input, s.parser) {
+    Ok(q) -> assert_eq(shallower(q).depth, 0),
+    Err(q) -> assert(false),
+  };
+}
+
+fn a_name(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> =
+  expect_ident(input, parser, b"a name")
+
+fn idents(r: Result<Parsed<List<Ident>>, Parser>) -> Parsed<List<Ident>> = parsed_or(r, [])
+
+test "comma_list reads a comma-separated run and stops at its closer" {
+  let s = probe(b"a, b, c)");
+  let r = idents(comma_list(s.input, s.parser, token_rparen(), a_name));
+  assert_eq(len(r.node), 3);
+  assert_eq(at_token(s.input, r.parser, token_rparen()), true);
+  assert_eq(failed(comma_list(s.input, s.parser, token_rparen(), a_name)), false);
+}
+
+test "comma_list accepts an empty run and a trailing comma" {
+  let s = probe(b")");
+  assert_eq(len(idents(comma_list(s.input, s.parser, token_rparen(), a_name)).node), 0);
+  let t = probe(b"a, )");
+  let r = idents(comma_list(t.input, t.parser, token_rparen(), a_name));
+  assert_eq(len(r.node), 1);
+  assert_eq(at_token(t.input, r.parser, token_rparen()), true);
+}
+
+// The trailing comma matters: without it the run stops at the missing comma, not at end of input.
+test "comma_list stops at end of input rather than running off the buffer" {
+  let s = probe(b"a, b,");
+  let r = idents(comma_list(s.input, s.parser, token_rparen(), a_name));
+  assert_eq(len(r.node), 2);
+  assert_eq(at_eof(s.input, r.parser), true);
+  assert_eq(failed(comma_list(s.input, s.parser, token_rparen(), a_name)), false);
+  assert_eq(len(r.parser.diags), 0);
+}
+
+test "two elements with no comma between them are one element and a stop" {
+  let s = probe(b"a b)");
+  let r = idents(comma_list(s.input, s.parser, token_rparen(), a_name));
+  assert_eq(len(r.node), 1);
+  assert_eq(token_kind(s.input, r.parser), lexer::Identifier(b"b"));
+  assert_eq(failed(comma_list(s.input, s.parser, token_rparen(), a_name)), false);
+}
+
+test "an element that fails abandons the list and propagates the failure" {
+  let s = probe(b"a, 1, c)");
+  let r = comma_list(s.input, s.parser, token_rparen(), a_name);
+  assert_eq(failed(r), true);
+  assert_eq(len(parsed_or(r, []).parser.diags), 1);
+  assert_eq(len(parsed_or(r, []).node), 0);
+}
+
+test "a list emits its length, so a dropped element shifts what follows" {
+  let xs = [{ name: b"a", span: span_between(0, 1) }, { name: b"b", span: span_between(2, 3) }];
+  assert_eq(dump_list(xs, dump_ident), b"#2;0:1:ident;@61;2:3:ident;@62;");
+  assert_eq(dump_list([], dump_ident), b"#0;");
+}
+
+test "span_to covers both spans whichever order they arrive in" {
+  assert_eq(span_to(span_between(5, 10), span_between(20, 25)), span_between(5, 25));
+  assert_eq(span_to(span_between(20, 25), span_between(5, 10)), span_between(5, 25));
+}
+
+test "the primary span is the first primary label, not the first label" {
+  let two = parse_diag(
+    unexpected(),
+    b"",
+    [parse_label(span_between(7, 8), false, b""), parse_label(span_between(1, 2), true, b"")],
+    [],
+  );
+  assert_eq(primary_span_of(two), span_between(1, 2));
+  let none = parse_diag(unexpected(), b"", [parse_label(span_between(7, 8), false, b"")], []);
+  assert_eq(primary_span_of(none), span_between(7, 8));
+}
+
+test "a diagnostic names the token it found the way the reference does" {
+  let s = probe(b"fn 1.50 255u8 1.5m \"s\" b\"b\" ) x");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 0)), b"keyword `fn`");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 1)), b"float `1.5`");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 2)), b"`U8` literal `255`");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 3)), b"decimal `1.5`");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 4)), b"string literal");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 5)), b"byte-string literal");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 6)), b"`)`");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 7)), b"identifier `x`");
+  assert_eq(describe(token_kind_at(s.input, s.parser, 8)), b"end of file");
+  assert_eq(float_display(b"1e9"), b"1000000000");
+  assert_eq(float_display(b"2.5e-3"), b"0.0025");
+  assert_eq(float_display(b"007.50"), b"7.5");
+  assert_eq(float_display(b"0.0"), b"0");
+  assert_eq(render_decimal(b"5", 3), b"0.005");
+  assert_eq(render_decimal(b"150", 2), b"1.50");
+  let e = error_here(s.input, s.parser, b"a type");
+  let d = match list_at(e.diags, 0) { Some(x) -> x, None -> parse_diag(b"", b"", [], []) };
+  assert_eq(d.message, b"expected a type, found keyword `fn`");
+  assert_eq(match list_at(d.labels, 0) { Some(l) -> l.text, None -> b"" }, b"expected a type");
+}
+
+// `law` is a contextual keyword, so an identifier; `type` checks that a real keyword never matches.
+test "at_ident_text matches an identifier and never a keyword" {
+  let s = probe(b"law type");
+  assert_eq(at_ident_text(s.input, s.parser, b"law"), true);
+  assert_eq(at_ident_text(s.input, s.parser, b"lav"), false);
+  assert_eq(is_ident(s.input, s.parser), true);
+  let n = advance(s.input, s.parser).parser;
+  assert_eq(at_ident_text(s.input, n, b"type"), false);
+  assert_eq(is_ident(s.input, n), false);
+  assert_eq(at_token(s.input, n, keyword_type()), true);
+}
+
+test "starts_upper is the constructor-versus-binder decision, on ASCII" {
+  assert_eq(starts_upper(b"Some"), true);
+  assert_eq(starts_upper(b"Z"), true);
+  assert_eq(starts_upper(b"A"), true);
+  assert_eq(starts_upper(b"some"), false);
+  assert_eq(starts_upper(b"_x"), false);
+  assert_eq(starts_upper(b"["), false);
+  assert_eq(starts_upper(b"a"), false);
+  assert_eq(starts_upper(b""), false);
+}
+
+test "is_str is a string literal and not a byte string" {
+  let s = probe(b"\"a\" b\"a\" x");
+  assert_eq(is_str(s.input, s.parser), true);
+  assert_eq(is_str(s.input, bump(s.input, s.parser)), false);
+  assert_eq(is_str(s.input, bump(s.input, bump(s.input, s.parser))), false);
+}
+
+test "bump moves one token and dump_bool tells the two booleans apart" {
+  let s = probe(b"a b");
+  assert_eq(token_kind(s.input, bump(s.input, s.parser)), lexer::Identifier(b"b"));
+  assert_eq(dump_bool(true), b"%true;");
+  assert_eq(dump_bool(false), b"%false;");
+}
+
+test "the dump encoder emits printable ASCII with no quote and no backslash" {
+  let d = bytes_concat_all([
+    dump_node(span_between(3, 9), b"efoo"),
+    dump_count(2),
+    dump_presence(true),
+    dump_presence(false),
+    dump_word(b"pub"),
+    dump_payload(b"a\"b\\c\n"),
+    dump_ident({ name: b"x", span: span_between(0, 1) }),
+  ]);
+  assert_eq(d, b"3:9:efoo;#2;?1;?0;%pub;@6122625c630a;0:1:ident;@78;");
+}
+
+test "a qualified name and a bare one differ in the option, not only the span" {
+  let s = probe(b"orders::place");
+  let q = parsed_or(qname(s.input, s.parser, b"a name"), no_qname());
+  assert_eq(dump_qname(q.node), b"0:13:qname;?1;0:6:ident;@6f7264657273;8:13:ident;@706c616365;");
+  let t = probe(b"place");
+  let b = parsed_or(qname(t.input, t.parser, b"a name"), no_qname());
+  assert_eq(dump_qname(b.node), b"0:5:qname;?0;0:5:ident;@706c616365;");
+}
+
+test "a name with two `::` is a diagnostic with a note, and fails" {
+  let s = probe(b"a::b::c");
+  let q = qname(s.input, s.parser, b"a name");
+  assert_eq(failed(q), true);
+  assert_eq(dump_diags(parsed_or(q, no_qname()).parser.diags), b"#1;!E0001:4:6:1:1;=4:6:1;");
+}
+
+// --- Tuples -----------------------------------------------------------------
+
+pub fn push_front<a>(x: a, xs: List<a>) -> List<a> =
+  fold(xs, [x], |acc: List<a>, y: a| push(acc, y))
+
+pub fn positional(i: Int, span: Span) -> Ident =
+  { name: bytes_concat(b"_", bytes_of_string(int_to_string(i))), span: span }

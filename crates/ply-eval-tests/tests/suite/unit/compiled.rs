@@ -1,11 +1,11 @@
 use crate::fixture::port_front;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
-use ply_eval::{DefHash, Diagnostic, Front, Plain, Span, Symbol, Value, codes, slot};
+use ply_eval::{Analysis, DefHash, Diagnostic, Plain, Span, Symbol, Value, codes, slot};
 use std::rc::Rc;
 
 struct Checked {
-    front: Front,
+    front: Analysis,
 }
 
 fn checked_source(source: &str) -> Checked {

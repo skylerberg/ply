@@ -1,11 +1,11 @@
 // Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 // A float literal hashes by its IEEE bit pattern.
 
-import spine (Span, Ident, QName, num)
+import parsing (Span, Ident, QName, int_to_bytes)
 import std.bin
 import lexer (byte_of, widths, wide_decimal, utf8_of)
-import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-              MWrite, MBad)
+import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
+                    MWrite, MBad)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
@@ -18,9 +18,9 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               constraint_written, SpecKind, SRequires, SEnsures, SpecClause, ReturnsFresh,
               ReturnsParam, Derived, Vis, VPub, VPriv, parse)
 import rewrite (expand)
-import resolve (Mod, Source, Resolved, Scope, Binding, Bindings, ModBind, Diag, Outcome, Resolved_,
-                Failed, resolve_modules, diag2, lab, is_bare, dump_diags, qualify, default_binder,
-                backticked, is_ctor_name)
+import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
+                ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
+                label_at, is_bare, dump_diags, qualify, default_binder, backticked, is_ctor_name)
 import derive (Expansion, expand_derives)
 import std.bytes (u32_at)
 import std.hash (blake3)
@@ -126,13 +126,13 @@ fn decimal_parts(text: Bytes) -> { mantissa: Bytes, scale: Int } / {abort.raise}
 
 // --- The reference graph over every top-level definition ------------------------------
 
-pub type NodeBody = | NFn(FnDef) | NType(TypeDef) | NEffect(EffectDef)
+pub type NodeBody = | NodeFn(FnDef) | NodeType(TypeDef) | NodeEffect(EffectDef)
 pub type Node = { name: Bytes, simple: Bytes, module: Int, body: NodeBody }
 pub type TestNode = { key: Bytes, module: Int, def: TestDef }
 pub type LawNode = { key: Bytes, module: Int, def: LawDef }
-pub type Entry = | EDef(Int) | ETest(Int) | ELaw(Int)
+pub type IndexEntry = | DefEntry(Int) | TestEntry(Int) | LawEntry(Int)
 type Target = { owner: Int, name: Bytes }
-pub type ValueTarget = | VFn(Int) | VCtor({ owner: Int, name: Bytes })
+pub type ValueTarget = | FnTarget(Int) | CtorTarget({ owner: Int, name: Bytes })
 type ModuleItems = {
   fns: Map<Bytes, Int>,
   types: Map<Bytes, Int>,
@@ -147,17 +147,18 @@ type ScopeIndex = {
 }
 
 pub type Index = {
-  mods: List<Mod>,
+  mods: List<ParsedModule>,
   nodes: List<Node>,
   tests: List<TestNode>,
   laws: List<LawNode>,
-  order: List<Entry>,
+  order: List<IndexEntry>,
   items: List<ModuleItems>,
   scopes: List<ScopeIndex>,
   effect_sketches: Map<Int, Bytes>,
 }
 
-fn qualifier(q: QName) -> Option<Bytes> = match q.module { Some(m) -> Some(m.name), None -> None }
+fn qualifier(qname: QName) -> Option<Bytes> =
+  match qname.module { Some(m) -> Some(m.name), None -> None }
 
 // The name `qualified` has inside the module that declares it.
 fn simple_of(qualified: Bytes, owner: Bytes) -> Bytes / {abort.raise} = {
@@ -171,7 +172,7 @@ type Building = {
   nodes: List<Node>,
   tests: List<TestNode>,
   laws: List<LawNode>,
-  order: List<Entry>,
+  order: List<IndexEntry>,
   items: List<ModuleItems>,
   diags: List<Diag>,
 }
@@ -184,7 +185,7 @@ fn declare(d: Declaring, m: Int, name: Ident, id: Int, what: Bytes) -> Declaring
         ..d,
         diags: push(
           d.diags,
-          diag2(
+          error_at_and(
             b"E0105",
             m,
             name.span,
@@ -214,9 +215,9 @@ fn declare(d: Declaring, m: Int, name: Ident, id: Int, what: Bytes) -> Declaring
 fn no_declaring(diags: List<Diag>) -> Declaring = { map: map_new(), spans: map_new(), diags: diags }
 
 pub fn build_index(
-  mods: List<Mod>,
-  r: Resolved,
-) -> { index: Index, diags: List<Diag> } / {abort.raise} = {
+  mods: List<ParsedModule>,
+  resolved: Resolved,
+) -> { index: Index, diags: List<Diag> } = {
   let built = fold(
     range(0, len(mods)),
     { nodes: [], tests: [], laws: [], order: [], items: [], diags: [] },
@@ -231,9 +232,9 @@ pub fn build_index(
           effects: no_declaring([]),
           ctors: no_declaring([]),
         },
-        |s: { b: Building, fns: Declaring, types: Declaring, effects: Declaring, ctors: Declaring }, it: Item| {
+        |s: { b: Building, fns: Declaring, types: Declaring, effects: Declaring, ctors: Declaring }, item: Item| {
           let bb: Building = s.b;
-          match it {
+          match item {
             IFn(d) -> {
               let id = len(bb.nodes);
               let pushed: Building = {
@@ -242,9 +243,9 @@ pub fn build_index(
                   name: qualify(module.name, d.name.name),
                   simple: d.name.name,
                   module: m,
-                  body: NFn(d),
+                  body: NodeFn(d),
                 }),
-                order: push(bb.order, EDef(id)),
+                order: push(bb.order, DefEntry(id)),
               };
               let fns: Declaring = declare({ ..s.fns, diags: [] }, m, d.name, id, b"definition");
               {
@@ -261,15 +262,15 @@ pub fn build_index(
                   name: qualify(module.name, d.name.name),
                   simple: d.name.name,
                   module: m,
-                  body: NType(d),
+                  body: NodeType(d),
                 }),
-                order: push(bb.order, EDef(id)),
+                order: push(bb.order, DefEntry(id)),
               };
               let types: Declaring = declare({ ..s.types, diags: [] }, m, d.name, id, b"type");
               let ctors: Declaring = match d.body {
                 TDSum(variants) ->
-                  fold(variants, { ..s.ctors, diags: [] }, |c: Declaring, v: VariantDef|
-                    declare(c, m, v.name, id, b"variant")),
+                  fold(variants, { ..s.ctors, diags: [] }, |c: Declaring, variant: VariantDef|
+                    declare(c, m, variant.name, id, b"variant")),
                 _ -> { ..s.ctors, diags: [] },
               };
               {
@@ -287,9 +288,9 @@ pub fn build_index(
                   name: qualify(module.name, d.name.name),
                   simple: d.name.name,
                   module: m,
-                  body: NEffect(d),
+                  body: NodeEffect(d),
                 }),
-                order: push(bb.order, EDef(id)),
+                order: push(bb.order, DefEntry(id)),
               };
               let effects: Declaring = declare(
                 { ..s.effects, diags: [] },
@@ -309,7 +310,7 @@ pub fn build_index(
                 ..s,
                 b: {
                   ..bb,
-                  order: push(bb.order, ETest(len(bb.tests))),
+                  order: push(bb.order, TestEntry(len(bb.tests))),
                   tests: push(bb.tests, { key: qualify(module.name, d.name), module: m, def: d }),
                 },
               },
@@ -318,7 +319,7 @@ pub fn build_index(
                 ..s,
                 b: {
                   ..bb,
-                  order: push(bb.order, ELaw(len(bb.laws))),
+                  order: push(bb.order, LawEntry(len(bb.laws))),
                   laws: push(bb.laws, { key: qualify(module.name, d.name), module: m, def: d }),
                 },
               },
@@ -339,9 +340,9 @@ pub fn build_index(
     },
   );
   let scopes = map(range(0, len(mods)), |m: Int| {
-    let scope = at(r.scopes, m);
-    let project = |bs: List<Binding>|
-      fold(bs, map_new(), |acc: Map<Bytes, Target>, b: Binding|
+    let scope = at(resolved.scopes, m);
+    let project = |bindings: List<Binding>|
+      fold(bindings, map_new(), |acc: Map<Bytes, Target>, b: Binding|
         map_insert(acc, b.name, {
           owner: b.owner,
           name: simple_of(b.qualified, at(mods, b.owner).name),
@@ -350,7 +351,7 @@ pub fn build_index(
       values: project(scope.bound.values),
       types: project(scope.bound.types),
       effects: project(scope.bound.effects),
-      modules: fold(scope.modules, map_new(), |acc: Map<Bytes, Int>, mb: ModBind|
+      modules: fold(scope.modules, map_new(), |acc: Map<Bytes, Int>, mb: ModuleBinding|
         map_insert(acc, mb.binder, mb.target)),
     }
   });
@@ -371,12 +372,15 @@ fn sketch_effects(index: Index) -> Map<Int, Bytes> / {abort.raise} =
   fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int| {
     let node = at(index.nodes, v);
     match node.body {
-      NEffect(_) ->
+      NodeEffect(_) ->
         map_insert(
           acc,
           v,
           finish(
-            normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body),
+            normalize_node(
+              new_encoder(index, node.module, map_new(), map_new(), map_new()),
+              node.body,
+            ),
           ).bytes,
         ),
       _ -> acc,
@@ -384,7 +388,7 @@ fn sketch_effects(index: Index) -> Map<Int, Bytes> / {abort.raise} =
   })
 
 fn is_effect(index: Index, v: Int) -> Bool / {abort.raise} =
-  match at(index.nodes, v).body { NEffect(_) -> true, _ -> false }
+  match at(index.nodes, v).body { NodeEffect(_) -> true, _ -> false }
 
 // A qualified name consults only the named module's declarations; a bare one only the scope.
 fn target(
@@ -416,40 +420,40 @@ fn exports(index: Index, qual: Option<Bytes>, node: Int) -> Bool / {abort.raise}
   match qual {
     None -> true,
     Some(_) -> match at(index.nodes, node).body {
-      NFn(d) -> is_pub(d.vis),
-      NType(d) -> is_pub(d.vis),
-      NEffect(d) -> is_pub(d.vis),
+      NodeFn(d) -> is_pub(d.vis),
+      NodeType(d) -> is_pub(d.vis),
+      NodeEffect(d) -> is_pub(d.vis),
     },
   }
 
 fn exported(index: Index, qual: Option<Bytes>, node: Option<Int>) -> Option<Int> / {abort.raise} =
   match node { None -> None, Some(v) -> if exports(index, qual, v) { Some(v) } else { None } }
 
-fn value_target(index: Index, module: Int, q: QName) -> Option<ValueTarget> / {abort.raise} =
-  match target(index, module, 0, qualifier(q), q.name.name) {
+fn value_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> =
+  match target(index, module, 0, qualifier(qname), qname.name.name) {
     None -> None,
     Some(t) -> {
       let items = at(index.items, t.owner);
-      match exported(index, qualifier(q), map_get(items.fns, t.name)) {
-        Some(node) -> Some(VFn(node)),
+      match exported(index, qualifier(qname), map_get(items.fns, t.name)) {
+        Some(node) -> Some(FnTarget(node)),
         // A variant is exported exactly when the type that declares it is.
-        None -> match exported(index, qualifier(q), map_get(items.ctors, t.name)) {
-          Some(owner) -> Some(VCtor({ owner: owner, name: t.name })),
+        None -> match exported(index, qualifier(qname), map_get(items.ctors, t.name)) {
+          Some(owner) -> Some(CtorTarget({ owner: owner, name: t.name })),
           None -> None,
         },
       }
     },
   }
 
-fn ctor_target(index: Index, module: Int, q: QName) -> Option<ValueTarget> / {abort.raise} =
-  match target(index, module, 0, qualifier(q), q.name.name) {
+fn ctor_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> =
+  match target(index, module, 0, qualifier(qname), qname.name.name) {
     None -> None,
     Some(t) -> match exported(
         index,
-        qualifier(q),
+        qualifier(qname),
         map_get(at(index.items, t.owner).ctors, t.name),
       ) {
-      Some(owner) -> Some(VCtor({ owner: owner, name: t.name })),
+      Some(owner) -> Some(CtorTarget({ owner: owner, name: t.name })),
       None -> None,
     },
   }
@@ -465,10 +469,10 @@ fn type_target(
     Some(t) -> exported(index, qual, map_get(at(index.items, t.owner).types, t.name)),
   }
 
-fn effect_target(index: Index, module: Int, q: QName) -> Option<Int> / {abort.raise} =
-  match target(index, module, 2, qualifier(q), q.name.name) {
+fn effect_target(index: Index, module: Int, qname: QName) -> Option<Int> =
+  match target(index, module, 2, qualifier(qname), qname.name.name) {
     None -> None,
-    Some(t) -> exported(index, qualifier(q), map_get(at(index.items, t.owner).effects, t.name)),
+    Some(t) -> exported(index, qualifier(qname), map_get(at(index.items, t.owner).effects, t.name)),
   }
 
 // Tarjan's components, iterative: completion order, each component's members as they left the stack.
@@ -568,83 +572,83 @@ fn is_cyclic(component: List<Int>, edges: List<List<Int>>) -> Bool / {abort.rais
 
 // --- The byte encoding ----------------------------------------------------------------
 
-fn t_local() -> Int = 1
-fn t_ref_hash() -> Int = 2
-fn t_ref_self() -> Int = 3
-fn t_ref_index() -> Int = 4
-fn t_free() -> Int = 5
-fn t_ctor() -> Int = 6
-fn t_ty_param() -> Int = 7
-fn t_row_param() -> Int = 8
-fn t_free_qualified() -> Int = 9
-fn t_none() -> Int = 10
-fn t_some() -> Int = 11
-fn t_ref_name() -> Int = 12
-fn t_param_default() -> Int = 13
-fn t_fn() -> Int = 20
-fn t_type_alias() -> Int = 21
-fn t_type_sum() -> Int = 22
-fn t_effect() -> Int = 23
-fn t_test() -> Int = 24
-fn t_variant() -> Int = 25
-fn t_op() -> Int = 26
-fn t_type() -> Int = 27
-fn t_law() -> Int = 28
-fn t_spec() -> Int = 29
-fn t_ty_con() -> Int = 30
-fn t_ty_fn() -> Int = 31
-fn t_ty_record() -> Int = 32
-fn t_ty_unit() -> Int = 33
-fn t_lit_int() -> Int = 40
-fn t_lit_bool() -> Int = 41
-fn t_lit_str() -> Int = 42
-fn t_lit_unit() -> Int = 43
-fn t_lit_bytes() -> Int = 44
-fn t_lit_float() -> Int = 45
-fn t_lit_decimal() -> Int = 46
-fn t_lit_char() -> Int = 47
+fn tag_local() -> Int = 1
+fn tag_ref_hash() -> Int = 2
+fn tag_ref_self() -> Int = 3
+fn tag_ref_index() -> Int = 4
+fn tag_free() -> Int = 5
+fn tag_ctor() -> Int = 6
+fn tag_ty_param() -> Int = 7
+fn tag_row_param() -> Int = 8
+fn tag_free_qualified() -> Int = 9
+fn tag_none() -> Int = 10
+fn tag_some() -> Int = 11
+fn tag_ref_name() -> Int = 12
+fn tag_param_default() -> Int = 13
+fn tag_fn() -> Int = 20
+fn tag_type_alias() -> Int = 21
+fn tag_type_sum() -> Int = 22
+fn tag_effect() -> Int = 23
+fn tag_test() -> Int = 24
+fn tag_variant() -> Int = 25
+fn tag_op() -> Int = 26
+fn tag_type() -> Int = 27
+fn tag_law() -> Int = 28
+fn tag_spec() -> Int = 29
+fn tag_ty_con() -> Int = 30
+fn tag_ty_fn() -> Int = 31
+fn tag_ty_record() -> Int = 32
+fn tag_ty_unit() -> Int = 33
+fn tag_lit_int() -> Int = 40
+fn tag_lit_bool() -> Int = 41
+fn tag_lit_str() -> Int = 42
+fn tag_lit_unit() -> Int = 43
+fn tag_lit_bytes() -> Int = 44
+fn tag_lit_float() -> Int = 45
+fn tag_lit_decimal() -> Int = 46
+fn tag_lit_char() -> Int = 47
 // A tag of its own: `5` and `5u32` are different definitions. Tags never renumber, or stored hashes move.
-fn t_lit_fixed() -> Int = 96
-fn t_lit_wide() -> Int = 99
-fn t_e_lit() -> Int = 50
-fn t_e_var() -> Int = 51
-fn t_e_binary() -> Int = 52
-fn t_e_unary() -> Int = 53
-fn t_e_lambda() -> Int = 54
-fn t_e_app() -> Int = 55
-fn t_e_if() -> Int = 56
-fn t_e_match() -> Int = 57
-fn t_e_block() -> Int = 58
-fn t_e_record() -> Int = 59
-fn t_e_field() -> Int = 60
-fn t_e_list() -> Int = 61
-fn t_e_perform() -> Int = 62
-fn t_e_handle() -> Int = 63
-fn t_e_with_cell() -> Int = 64
-fn t_e_simulate() -> Int = 65
-fn t_e_parallel() -> Int = 100
-fn t_e_record_update() -> Int = 67
-fn t_s_let() -> Int = 70
-fn t_s_expr() -> Int = 71
-fn t_s_let_else() -> Int = 72
-fn t_p_wildcard() -> Int = 80
-fn t_p_var() -> Int = 81
-fn t_p_lit() -> Int = 82
-fn t_p_ctor() -> Int = 83
-fn t_p_record() -> Int = 84
-fn t_p_list() -> Int = 85
-fn t_p_or() -> Int = 86
-fn t_row() -> Int = 90
-fn t_atom() -> Int = 91
-fn t_atom_op() -> Int = 97
-fn t_label_param() -> Int = 98
-fn t_arm() -> Int = 92
-fn t_clause() -> Int = 93
-fn t_return_clause() -> Int = 94
-fn t_constraint() -> Int = 95
-fn t_returns_fresh() -> Int = 101
-fn t_returns_param() -> Int = 102
-fn t_bounded() -> Int = 103
+fn tag_lit_fixed() -> Int = 96
+fn tag_lit_wide() -> Int = 99
+fn tag_e_lit() -> Int = 50
+fn tag_e_var() -> Int = 51
+fn tag_e_binary() -> Int = 52
+fn tag_e_unary() -> Int = 53
+fn tag_e_lambda() -> Int = 54
+fn tag_e_app() -> Int = 55
+fn tag_e_if() -> Int = 56
+fn tag_e_match() -> Int = 57
+fn tag_e_block() -> Int = 58
+fn tag_e_record() -> Int = 59
+fn tag_e_field() -> Int = 60
+fn tag_e_list() -> Int = 61
+fn tag_e_perform() -> Int = 62
+fn tag_e_handle() -> Int = 63
+fn tag_e_with_cell() -> Int = 64
+fn tag_e_simulate() -> Int = 65
+fn tag_e_parallel() -> Int = 100
+fn tag_e_record_update() -> Int = 67
+fn tag_s_let() -> Int = 70
+fn tag_s_expr() -> Int = 71
+fn tag_s_let_else() -> Int = 72
+fn tag_p_wildcard() -> Int = 80
+fn tag_p_var() -> Int = 81
+fn tag_p_lit() -> Int = 82
+fn tag_p_ctor() -> Int = 83
+fn tag_p_record() -> Int = 84
+fn tag_p_list() -> Int = 85
+fn tag_p_or() -> Int = 86
+fn tag_row() -> Int = 90
+fn tag_atom() -> Int = 91
+fn tag_atom_op() -> Int = 97
+fn tag_label_param() -> Int = 98
+fn tag_arm() -> Int = 92
+fn tag_clause() -> Int = 93
+fn tag_return_clause() -> Int = 94
+fn tag_constraint() -> Int = 95
+fn tag_returns_fresh() -> Int = 101
+fn tag_returns_param() -> Int = 102
+fn tag_bounded() -> Int = 103
 
 // An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -671,14 +675,14 @@ fn binop_byte(op: Bytes) -> Int =
 
 fn unop_byte(op: Bytes) -> Int = if op == b"neg" { 1 } else if op == b"not" { 2 } else { 3 }
 
-fn mode_byte(m: Mode) -> Int = match m { MRead -> 0, MWrite -> 1, MBad -> 0 }
+fn mode_byte(mode: Mode) -> Int = match mode { MRead -> 0, MWrite -> 1, MBad -> 0 }
 
 fn spec_tag(k: SpecKind) -> Int = match k { SRequires -> 1, SEnsures -> 2 }
 
-fn deriver_byte(d: Deriver) -> Int = deriver_tag(d) + 1
+fn deriver_byte(deriver: Deriver) -> Int = deriver_tag(deriver) + 1
 
 // `out` is chunks concatenated once at the end; `refs` is first-mention order; the binder lists are de Bruijn levels.
-type Nz = {
+type Encoder = {
   index: Index,
   module: Int,
   hashes: Map<Int, Bytes>,
@@ -697,13 +701,13 @@ type Nz = {
 
 type Finished = { bytes: Bytes, refs: List<Int> }
 
-fn new_nz(
+fn new_encoder(
   index: Index,
   module: Int,
   hashes: Map<Int, Bytes>,
   component: Map<Int, Int>,
   effects: Map<Int, Int>,
-) -> Nz =
+) -> Encoder =
   {
     index: index,
     module: module,
@@ -721,77 +725,84 @@ fn new_nz(
     deferred: None,
   }
 
-fn finish(z: Nz) -> Finished = { bytes: bytes_concat_all(z.out), refs: z.refs }
+fn finish(encoder: Encoder) -> Finished =
+  { bytes: bytes_concat_all(encoder.out), refs: encoder.refs }
 
-fn emit(z: Nz, b: Bytes) -> Nz = { ..z, out: push(z.out, b) }
-fn tag(z: Nz, t: Int) -> Nz / {abort.raise} = emit(z, byte_of(t))
-fn u32v(z: Nz, v: Int) -> Nz / {abort.raise} = emit(z, u32_le(v))
-fn boolv(z: Nz, b: Bool) -> Nz / {abort.raise} = emit(z, byte_of(if b { 1 } else { 0 }))
-fn strv(z: Nz, s: Bytes) -> Nz / {abort.raise} = emit(u32v(z, bytes_len(s)), s)
+fn put_bytes(encoder: Encoder, b: Bytes) -> Encoder = { ..encoder, out: push(encoder.out, b) }
+fn put_tag(encoder: Encoder, t: Int) -> Encoder = put_bytes(encoder, byte_of(t))
+fn put_u32(encoder: Encoder, v: Int) -> Encoder = put_bytes(encoder, u32_le(v))
+fn put_bool(encoder: Encoder, b: Bool) -> Encoder =
+  put_bytes(encoder, byte_of(if b { 1 } else { 0 }))
+fn put_text(encoder: Encoder, s: Bytes) -> Encoder = put_bytes(put_u32(encoder, bytes_len(s)), s)
 
-type Captured = { z: Nz, bytes: Bytes }
+type Captured = { encoder: Encoder, bytes: Bytes }
 
 // The bytes `f` writes, kept apart from the encoding so far.
-fn capture<| e>(z: Nz, f: (Nz) -> Nz / e) -> Captured / e = {
-  let inner: Nz = f({ ..z, out: [] });
-  { z: { ..inner, out: z.out }, bytes: bytes_concat_all(inner.out) }
+fn capture<| e>(encoder: Encoder, f: (Encoder) -> Encoder / e) -> Captured / e = {
+  let inner: Encoder = f({ ..encoder, out: [] });
+  { encoder: { ..inner, out: encoder.out }, bytes: bytes_concat_all(inner.out) }
 }
 
-fn normalize_node(z: Nz, body: NodeBody) -> Nz / {abort.raise} =
-  match body { NFn(d) -> fn_def(z, d), NType(d) -> type_def(z, d), NEffect(d) -> effect_def(z, d) }
-
-// A reference in first-mention order, unless a row is holding its mentions back.
-fn mention(z: Nz, node: Int) -> Nz =
-  match z.deferred {
-    Some(held) -> { ..z, deferred: Some(push(held, node)) },
-    None -> if map_contains(z.seen, node) { z }
-    else { { ..z, seen: map_insert(z.seen, node, true), refs: push(z.refs, node) } },
+fn normalize_node(z: Encoder, body: NodeBody) -> Encoder =
+  match body {
+    NodeFn(d) -> fn_def(z, d),
+    NodeType(d) -> type_def(z, d),
+    NodeEffect(d) -> effect_def(z, d),
   }
 
-fn node_ref(z: Nz, node: Int) -> Nz / {abort.raise} = {
-  let m: Nz = mention(z, node);
-  if m.by_name { strv(tag(m, t_ref_name()), at(m.index.nodes, node).name) } else {
+// A reference in first-mention order, unless a row is holding its mentions back.
+fn mention(encoder: Encoder, node: Int) -> Encoder =
+  match encoder.deferred {
+    Some(held) -> { ..encoder, deferred: Some(push(held, node)) },
+    None -> if map_contains(encoder.seen, node) { encoder } else {
+      { ..encoder, seen: map_insert(encoder.seen, node, true), refs: push(encoder.refs, node) }
+    },
+  }
+
+fn node_ref(encoder: Encoder, node: Int) -> Encoder = {
+  let m: Encoder = mention(encoder, node);
+  if m.by_name { put_text(put_tag(m, tag_ref_name()), at(m.index.nodes, node).name) } else {
     match map_get(m.component, node) {
-      Some(ix) -> u32v(tag(m, t_ref_index()), ix),
+      Some(ix) -> put_u32(put_tag(m, tag_ref_index()), ix),
       None -> match map_get(m.hashes, node) {
-        Some(h) -> emit(tag(m, t_ref_hash()), h),
-        None -> tag(m, t_ref_self()),
+        Some(h) -> put_bytes(put_tag(m, tag_ref_hash()), h),
+        None -> put_tag(m, tag_ref_self()),
       },
     }
   }
 }
 
-fn free_ref(z: Nz, qual: Option<Bytes>, name: Bytes) -> Nz / {abort.raise} =
+fn free_ref(encoder: Encoder, qual: Option<Bytes>, name: Bytes) -> Encoder =
   match qual {
-    None -> strv(tag(z, t_free()), name),
-    Some(m) -> strv(strv(tag(z, t_free_qualified()), m), name),
+    None -> put_text(put_tag(encoder, tag_free()), name),
+    Some(m) -> put_text(put_text(put_tag(encoder, tag_free_qualified()), m), name),
   }
 
-fn ctor_bytes(z: Nz, owner: Int, name: Bytes) -> Nz / {abort.raise} =
-  strv(node_ref(tag(z, t_ctor()), owner), name)
+fn ctor_bytes(encoder: Encoder, owner: Int, name: Bytes) -> Encoder =
+  put_text(node_ref(put_tag(encoder, tag_ctor()), owner), name)
 
 // A local binder wins over everything, and only a bare name can be one.
-fn value_ref(z: Nz, q: QName) -> Nz / {abort.raise} = {
-  let local = if is_bare(q) { rposition(z.values, q.name.name) } else { None };
+fn value_ref(encoder: Encoder, qname: QName) -> Encoder = {
+  let local = if is_bare(qname) { rposition(encoder.values, qname.name.name) } else { None };
   match local {
-    Some(level) -> u32v(tag(z, t_local()), level),
-    None -> match value_target(z.index, z.module, q) {
+    Some(level) -> put_u32(put_tag(encoder, tag_local()), level),
+    None -> match value_target(encoder.index, encoder.module, qname) {
       Some(t) -> match t {
-        VFn(node) -> node_ref(z, node),
-        VCtor(c) -> ctor_bytes(z, c.owner, c.name),
+        FnTarget(node) -> node_ref(encoder, node),
+        CtorTarget(c) -> ctor_bytes(encoder, c.owner, c.name),
       },
-      None -> free_ref(z, qualifier(q), q.name.name),
+      None -> free_ref(encoder, qualifier(qname), qname.name.name),
     },
   }
 }
 
-fn type_ref(z: Nz, qual: Option<Bytes>, name: Bytes) -> Nz / {abort.raise} = {
-  let param = match qual { None -> rposition(z.ty_params, name), Some(_) -> None };
+fn type_ref(encoder: Encoder, qual: Option<Bytes>, name: Bytes) -> Encoder = {
+  let param = match qual { None -> rposition(encoder.ty_params, name), Some(_) -> None };
   match param {
-    Some(level) -> u32v(tag(z, t_ty_param()), level),
-    None -> match type_target(z.index, z.module, qual, name) {
-      Some(node) -> node_ref(z, node),
-      None -> free_ref(z, qual, name),
+    Some(level) -> put_u32(put_tag(encoder, tag_ty_param()), level),
+    None -> match type_target(encoder.index, encoder.module, qual, name) {
+      Some(node) -> node_ref(encoder, node),
+      None -> free_ref(encoder, qual, name),
     },
   }
 }
@@ -799,88 +810,98 @@ fn type_ref(z: Nz, qual: Option<Bytes>, name: Bytes) -> Nz / {abort.raise} = {
 // Effects are nominal: the declaration referenced, then the slot the component's enumeration gave
 // it. What makes that true is the simple name in the declaration's own encoding; its module path is
 // not, so two modules declaring one effect alike declare one effect.
-fn effect_ref(z: Nz, q: QName) -> Nz / {abort.raise} =
-  match effect_target(z.index, z.module, q) {
+fn effect_ref(z: Encoder, qname: QName) -> Encoder =
+  match effect_target(z.index, z.module, qname) {
     Some(node) ->
-      u32v(node_ref(z, node), match map_get(z.effects, node) { Some(s) -> s, None -> 0 }),
-    None -> free_ref(z, qualifier(q), q.name.name),
+      put_u32(node_ref(z, node), match map_get(z.effects, node) { Some(s) -> s, None -> 0 }),
+    None -> free_ref(z, qualifier(qname), qname.name.name),
   }
 
-fn ctor_ref(z: Nz, q: QName) -> Nz / {abort.raise} =
-  match ctor_target(z.index, z.module, q) {
-    Some(VCtor(c)) -> ctor_bytes(z, c.owner, c.name),
-    _ -> free_ref(z, qualifier(q), q.name.name),
+fn ctor_ref(encoder: Encoder, qname: QName) -> Encoder =
+  match ctor_target(encoder.index, encoder.module, qname) {
+    Some(CtorTarget(c)) -> ctor_bytes(encoder, c.owner, c.name),
+    _ -> free_ref(encoder, qualifier(qname), qname.name.name),
   }
 
 // A resource the signature binds is a level, so renaming the binder is not an edit; a real one stays a name.
-fn label_ref(z: Nz, l: Ident) -> Nz / {abort.raise} =
-  match rposition(z.label_params, l.name) {
-    Some(level) -> u32v(tag(z, t_label_param()), level),
-    None -> strv(tag(z, t_free()), l.name),
+fn label_ref(encoder: Encoder, ident: Ident) -> Encoder =
+  match rposition(encoder.label_params, ident.name) {
+    Some(level) -> put_u32(put_tag(encoder, tag_label_param()), level),
+    None -> put_text(put_tag(encoder, tag_free()), ident.name),
   }
 
-fn opt_type(z: Nz, t: Option<TypeExpr>) -> Nz / {abort.raise} =
-  match t { None -> tag(z, t_none()), Some(te) -> type_expr(tag(z, t_some()), te) }
-fn opt_row(z: Nz, r: Option<RowExpr>) -> Nz / {abort.raise} =
-  match r { None -> tag(z, t_none()), Some(row) -> row_expr(tag(z, t_some()), row) }
-fn opt_expr(z: Nz, e: Option<Expr>) -> Nz / {abort.raise} =
-  match e { None -> tag(z, t_none()), Some(x) -> expr(tag(z, t_some()), x) }
+fn opt_type(z: Encoder, ty: Option<TypeExpr>) -> Encoder =
+  match ty { None -> put_tag(z, tag_none()), Some(te) -> type_expr(put_tag(z, tag_some()), te) }
+fn opt_row(z: Encoder, r: Option<RowExpr>) -> Encoder =
+  match r { None -> put_tag(z, tag_none()), Some(row) -> row_expr(put_tag(z, tag_some()), row) }
+fn opt_expr(z: Encoder, e: Option<Expr>) -> Encoder / {abort.raise} =
+  match e { None -> put_tag(z, tag_none()), Some(x) -> expr(put_tag(z, tag_some()), x) }
 // A `[*]` clause is not the clause that names no label, so the wildcard is spelled out rather
 // than shared with the empty case. A `[*t]` clause is not a `[*]` one either: naming the label is
 // what the body reads, so the binder is part of what the clause is.
-fn clause_label(c: HandleClause) -> Option<Ident> =
-  match c.label_binder {
-    Some(t) -> Some({ name: bytes_concat(b"*", t.name), span: c.span }),
-    None -> if c.every_label { Some({ name: b"*", span: c.span }) } else { c.resource },
+fn clause_label(clause: HandleClause) -> Option<Ident> =
+  match clause.label_binder {
+    Some(t) -> Some({ name: bytes_concat(b"*", t.name), span: clause.span }),
+    None -> if clause.every_label { Some({ name: b"*", span: clause.span }) }
+    else { clause.resource },
   }
 
-fn opt_label(z: Nz, i: Option<Ident>) -> Nz / {abort.raise} =
-  match i { None -> tag(z, t_none()), Some(x) -> label_ref(tag(z, t_some()), x) }
+fn opt_label(z: Encoder, i: Option<Ident>) -> Encoder / {abort.raise} =
+  match i { None -> put_tag(z, tag_none()), Some(x) -> label_ref(put_tag(z, tag_some()), x) }
 
-fn push_generics(z: Nz, def: FnDef) -> Nz =
+fn push_generics(encoder: Encoder, def: FnDef) -> Encoder =
   {
-    ..z,
-    ty_params: append(z.ty_params, map(def.generics.types, |g: Ident| g.name)),
-    row_params: append(z.row_params, map(def.generics.effects, |g: Ident| g.name)),
-    label_params: append(z.label_params, map(def.generics.labels, |g: Ident| g.name)),
+    ..encoder,
+    ty_params: append(encoder.ty_params, map(def.generics.types, |ident: Ident| ident.name)),
+    row_params: append(encoder.row_params, map(def.generics.effects, |ident: Ident| ident.name)),
+    label_params: append(encoder.label_params, map(def.generics.labels, |ident: Ident| ident.name)),
   }
 
-fn fn_def(z: Nz, d: FnDef) -> Nz / {abort.raise} = {
-  let z1: Nz = push_generics(
-    u32v(
-      u32v(u32v(tag(z, t_fn()), len(d.generics.types)), len(d.generics.effects)),
-      len(d.generics.labels),
+fn fn_def(encoder: Encoder, def: FnDef) -> Encoder = {
+  let z1: Encoder = push_generics(
+    put_u32(
+      put_u32(
+        put_u32(put_tag(encoder, tag_fn()), len(def.generics.types)),
+        len(def.generics.effects),
+      ),
+      len(def.generics.labels),
     ),
-    d,
+    def,
   );
   // Before the parameter names reach `values`: a default is closed.
-  let z2: Nz = fold(d.params, u32v(z1, len(d.params)), |acc: Nz, p: Param|
-    match p.default {
-      Some(dflt) -> expr(opt_type(tag(acc, t_param_default()), p.ty), dflt),
-      None -> opt_type(acc, p.ty),
+  let z2: Encoder = fold(def.params, put_u32(z1, len(def.params)), |acc: Encoder, param: Param|
+    match param.default {
+      Some(dflt) -> expr(opt_type(put_tag(acc, tag_param_default()), param.ty), dflt),
+      None -> opt_type(acc, param.ty),
     });
-  let z3: Nz = returns(constraints(opt_row(opt_type(z2, d.ret), d.effects), d.constraints), d);
-  let z4: Nz = { ..z3, values: append(z3.values, map(d.params, |p: Param| p.name.name)) };
-  expr(z4, d.body)
+  let z3: Encoder = returns(
+    constraints(opt_row(opt_type(z2, def.ret), def.effects), def.constraints),
+    def,
+  );
+  let z4: Encoder = {
+    ..z3,
+    values: append(z3.values, map(def.params, |param: Param| param.name.name)),
+  };
+  expr(z4, def.body)
 }
 
 // A `returns` clause names a parameter by its position, so renaming one moves nothing.
-fn returns(z: Nz, d: FnDef) -> Nz / {abort.raise} =
-  match d.returns {
-    None -> z,
-    Some(ReturnsFresh(_)) -> tag(z, t_returns_fresh()),
+fn returns(encoder: Encoder, def: FnDef) -> Encoder =
+  match def.returns {
+    None -> encoder,
+    Some(ReturnsFresh(_)) -> put_tag(encoder, tag_returns_fresh()),
     Some(ReturnsParam(x)) ->
-      u32v(
-        tag(z, t_returns_param()),
-        fold(range(0, len(d.params)), 0, |acc: Int, i: Int|
-          if at(d.params, i).name.name == x.name { i } else { acc }),
+      put_u32(
+        put_tag(encoder, tag_returns_param()),
+        fold(range(0, len(def.params)), 0, |acc: Int, i: Int|
+          if at(def.params, i).name.name == x.name { i } else { acc }),
       ),
   }
 
 // Sorted and deduplicated: the same two constraints in the other order are one definition.
-fn constraints(z: Nz, cs: List<Constraint>) -> Nz / {abort.raise} = {
+fn constraints(encoder: Encoder, cs: List<Constraint>) -> Encoder = {
   let levels = fold(cs, [], |acc: List<{ level: Int, deriver: Int }>, c: Constraint|
-    match rposition(z.ty_params, c.param.name) {
+    match rposition(encoder.ty_params, c.param.name) {
       Some(level) -> push(acc, { level: level, deriver: deriver_byte(c.deriver) }),
       None -> acc,
     });
@@ -889,8 +910,8 @@ fn constraints(z: Nz, cs: List<Constraint>) -> Nz / {abort.raise} = {
     [],
     |acc: List<{ level: Int, deriver: Int }>, x: { level: Int, deriver: Int }| insert_pair(acc, x),
   );
-  fold(sorted, u32v(z, len(sorted)), |acc: Nz, x: { level: Int, deriver: Int }|
-    tag(u32v(tag(acc, t_constraint()), x.level), x.deriver))
+  fold(sorted, put_u32(encoder, len(sorted)), |acc: Encoder, x: { level: Int, deriver: Int }|
+    put_tag(put_u32(put_tag(acc, tag_constraint()), x.level), x.deriver))
 }
 
 fn insert_pair(
@@ -914,21 +935,24 @@ fn insert_pair(
 // a sum a `TyCon` under its name, which `unify_structural` compares by name, and expands an alias
 // in place, so two aliases of one expansion are one type there and must be one type here. The name
 // is the simple one: a module path is no part of an identity, so vendoring a module moves nothing.
-fn type_def(z: Nz, d: TypeDef) -> Nz / {abort.raise} = {
-  let z0: Nz = tag(z, t_type());
-  let z1: Nz = { ..z0, ty_params: append(z0.ty_params, map(d.params, |p: Ident| p.name)) };
-  let z2: Nz = u32v(z1, len(d.params));
+fn type_def(z: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
+  let z0: Encoder = put_tag(z, tag_type());
+  let z1: Encoder = {
+    ..z0,
+    ty_params: append(z0.ty_params, map(d.params, |ident: Ident| ident.name)),
+  };
+  let z2: Encoder = put_u32(z1, len(d.params));
   match d.body {
-    TDAlias(t) -> type_expr(tag(z2, t_type_alias()), t),
+    TDAlias(t) -> type_expr(put_tag(z2, tag_type_alias()), t),
     TDSum(variants) ->
       fold(
         variants,
-        u32v(strv(tag(z2, t_type_sum()), d.name.name), len(variants)),
-        |acc: Nz, v: VariantDef|
+        put_u32(put_text(put_tag(z2, tag_type_sum()), d.name.name), len(variants)),
+        |acc: Encoder, variant: VariantDef|
           fold(
-            v.fields,
-            u32v(strv(tag(acc, t_variant()), v.name.name), len(v.fields)),
-            |a: Nz, f: TypeExpr| type_expr(a, f),
+            variant.fields,
+            put_u32(put_text(put_tag(acc, tag_variant()), variant.name.name), len(variant.fields)),
+            |a: Encoder, ty: TypeExpr| type_expr(a, ty),
           ),
       ),
   }
@@ -940,19 +964,19 @@ fn type_def(z: Nz, d: TypeDef) -> Nz / {abort.raise} = {
 // a published row names its atoms' effects, and nothing else would make a hash pin those names.
 // The name is the simple one: a module path is no part of an identity here, so the same declaration
 // vendored under another path is still that declaration.
-fn effect_def(z: Nz, d: EffectDef) -> Nz / {abort.raise} = {
-  let named: Nz = strv(tag(z, t_effect()), d.name.name);
-  let z1: Nz = boolv(named, d.is_nondet);
+fn effect_def(z: Encoder, d: EffectDef) -> Encoder / {abort.raise} = {
+  let named: Encoder = put_text(put_tag(z, tag_effect()), d.name.name);
+  let z1: Encoder = put_bool(named, d.is_nondet);
   let ops = fold(
     d.ops,
     { z: z1, encoded: [] },
-    |acc: { z: Nz, encoded: List<Bytes> }, op: OpDef| {
-      let c: Captured = capture(acc.z, |x: Nz| op_def(x, op));
-      { z: c.z, encoded: push(acc.encoded, c.bytes) }
+    |acc: { z: Encoder, encoded: List<Bytes> }, op: OpDef| {
+      let c: Captured = capture(acc.z, |x: Encoder| op_def(x, op));
+      { z: c.encoder, encoded: push(acc.encoded, c.bytes) }
     },
   );
   let sorted = sort_bytes(ops.encoded);
-  fold(sorted, u32v(ops.z, len(sorted)), |acc: Nz, b: Bytes| emit(acc, b))
+  fold(sorted, put_u32(ops.z, len(sorted)), |acc: Encoder, b: Bytes| put_bytes(acc, b))
 }
 
 fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare_values(a, b) { Less -> true, _ -> false }
@@ -966,71 +990,89 @@ pub fn sort_bytes(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
   })
 
 // An effect's operations share one encoder, so each one's type parameters go out of scope after it.
-fn op_def(z: Nz, op: OpDef) -> Nz / {abort.raise} = {
-  let z1: Nz = u32v(
-    boolv(emit(strv(tag(z, t_op()), op.name.name), byte_of(mode_byte(op.mode))), op.resource_param),
+fn op_def(encoder: Encoder, op: OpDef) -> Encoder = {
+  let z1: Encoder = put_u32(
+    put_bool(
+      put_bytes(put_text(put_tag(encoder, tag_op()), op.name.name), byte_of(mode_byte(op.mode))),
+      op.resource_param,
+    ),
     len(op.ty_params),
   );
-  let bound: Nz = { ..z1, ty_params: append(z1.ty_params, map(op.ty_params, |p: Ident| p.name)) };
-  let encoded: Nz = type_expr(
-    fold(op.params, u32v(bound, len(op.params)), |acc: Nz, p: TypeExpr| type_expr(acc, p)),
+  let bound: Encoder = {
+    ..z1,
+    ty_params: append(z1.ty_params, map(op.ty_params, |p: Ident| p.name)),
+  };
+  let encoded: Encoder = type_expr(
+    fold(op.params, put_u32(bound, len(op.params)), |acc: Encoder, p: TypeExpr| type_expr(acc, p)),
     op.ret,
   );
-  { ..encoded, ty_params: z.ty_params }
+  { ..encoded, ty_params: encoder.ty_params }
 }
 
-pub fn test_def(z: Nz, d: TestDef) -> Nz / {abort.raise} =
-  expr(boolv(tag(z, t_test()), d.is_nondet), d.body)
+pub fn test_def(encoder: Encoder, d: TestDef) -> Encoder =
+  expr(put_bool(put_tag(encoder, tag_test()), d.is_nondet), d.body)
 
 // A law's binder types are part of its identity; their names are levels like any other binder.
-pub fn law_def(z: Nz, d: LawDef) -> Nz / {abort.raise} = {
-  let z1: Nz = fold(
+pub fn law_def(encoder: Encoder, d: LawDef) -> Encoder = {
+  let z1: Encoder = fold(
     d.binders,
-    u32v(boolv(tag(z, t_law()), d.host), len(d.binders)),
-    |acc: Nz, b: Binder| type_expr(acc, b.ty),
+    put_u32(put_bool(put_tag(encoder, tag_law()), d.host), len(d.binders)),
+    |acc: Encoder, binder: Binder| type_expr(acc, binder.ty),
   );
-  let z2: Nz = { ..z1, values: append(z1.values, map(d.binders, |b: Binder| b.name.name)) };
+  let z2: Encoder = {
+    ..z1,
+    values: append(z1.values, map(d.binders, |binder: Binder| binder.name.name)),
+  };
   expr(opt_expr(z2, d.guard), d.body)
 }
 
 // In its owner's scope: generics, parameters, and `result` for an `ensures`. Parameter defaults are not written.
-pub fn spec_clause(z: Nz, owner: FnDef, clause: SpecClause) -> Nz / {abort.raise} = {
-  let z1: Nz = push_generics(
-    u32v(
-      u32v(
-        u32v(emit(tag(z, t_spec()), byte_of(spec_tag(clause.kind))), len(owner.generics.types)),
+pub fn spec_clause(encoder: Encoder, owner: FnDef, clause: SpecClause) -> Encoder = {
+  let z1: Encoder = push_generics(
+    put_u32(
+      put_u32(
+        put_u32(
+          put_bytes(put_tag(encoder, tag_spec()), byte_of(spec_tag(clause.kind))),
+          len(owner.generics.types),
+        ),
         len(owner.generics.effects),
       ),
       len(owner.generics.labels),
     ),
     owner,
   );
-  let counted: Nz = u32v(z1, len(owner.params));
-  let z2: Nz = {
+  let counted: Encoder = put_u32(z1, len(owner.params));
+  let z2: Encoder = {
     ..counted,
-    values: append(counted.values, map(owner.params, |p: Param| p.name.name)),
+    values: append(counted.values, map(owner.params, |param: Param| param.name.name)),
   };
-  let z3: Nz = match clause.kind {
+  let z3: Encoder = match clause.kind {
     SEnsures -> { ..z2, values: push(z2.values, b"result") },
     SRequires -> z2,
   };
   expr(z3, clause.expr)
 }
 
-fn type_expr(z: Nz, t: TypeExpr) -> Nz / {abort.raise} =
+fn type_expr(z: Encoder, t: TypeExpr) -> Encoder / {abort.raise} =
   match t {
-    TVar(name) -> u32v(type_ref(tag(z, t_ty_con()), None, name.name), 0),
+    TVar(name) -> put_u32(type_ref(put_tag(z, tag_ty_con()), None, name.name), 0),
     TCon(c) ->
       fold(
         c.args,
-        u32v(type_ref(tag(z, t_ty_con()), qualifier(c.name), c.name.name.name), len(c.args)),
-        |acc: Nz, a: TypeExpr| type_expr(acc, a),
+        put_u32(
+          type_ref(put_tag(z, tag_ty_con()), qualifier(c.name), c.name.name.name),
+          len(c.args),
+        ),
+        |acc: Encoder, a: TypeExpr| type_expr(acc, a),
       ),
     TFn(f) ->
       opt_row(
         type_expr(
-          fold(f.params, u32v(tag(z, t_ty_fn()), len(f.params)), |acc: Nz, p: TypeExpr|
-            type_expr(acc, p)),
+          fold(
+            f.params,
+            put_u32(put_tag(z, tag_ty_fn()), len(f.params)),
+            |acc: Encoder, p: TypeExpr| type_expr(acc, p),
+          ),
           f.ret,
         ),
         f.effects,
@@ -1039,32 +1081,32 @@ fn type_expr(z: Nz, t: TypeExpr) -> Nz / {abort.raise} =
     TRecord(r) -> {
       let fields = fold(
         r.fields,
-        { z: tag(z, t_ty_record()), encoded: [] },
-        |acc: { z: Nz, encoded: List<Bytes> }, f: { name: Ident, ty: TypeExpr }| {
-          let c: Captured = capture(acc.z, |x: Nz| type_expr(strv(x, f.name.name), f.ty));
-          { z: c.z, encoded: push(acc.encoded, c.bytes) }
+        { z: put_tag(z, tag_ty_record()), encoded: [] },
+        |acc: { z: Encoder, encoded: List<Bytes> }, f: { name: Ident, ty: TypeExpr }| {
+          let c: Captured = capture(acc.z, |x: Encoder| type_expr(put_text(x, f.name.name), f.ty));
+          { z: c.encoder, encoded: push(acc.encoded, c.bytes) }
         },
       );
       let sorted = sort_bytes(fields.encoded);
-      fold(sorted, u32v(fields.z, len(sorted)), |acc: Nz, b: Bytes| emit(acc, b))
+      fold(sorted, put_u32(fields.z, len(sorted)), |acc: Encoder, b: Bytes| put_bytes(acc, b))
     },
-    TUnit(_) -> tag(z, t_ty_unit()),
-    TBad(_) -> tag(z, t_ty_unit()),
+    TUnit(_) -> put_tag(z, tag_ty_unit()),
+    TBad(_) -> put_tag(z, tag_ty_unit()),
   }
 
 type AtomEncoding = { bytes: Bytes, tie: Bytes, held: List<Int> }
 
 // A row is a set: atoms sorted by encoding, then by the effect's declaration, and deduplicated.
 // Every atom is mentioned, including one the dedup drops.
-fn row_expr(z: Nz, r: RowExpr) -> Nz / {abort.raise} = {
-  let z0: Nz = tag(z, t_row());
+fn row_expr(z: Encoder, row: RowExpr) -> Encoder = {
+  let z0: Encoder = put_tag(z, tag_row());
   let atoms = fold(
-    r.atoms,
+    row.atoms,
     { z: z0, encoded: [] },
-    |acc: { z: Nz, encoded: List<AtomEncoding> }, a: AtomExpr| {
+    |acc: { z: Encoder, encoded: List<AtomEncoding> }, a: AtomExpr| {
       let outer = acc.z.deferred;
-      let c: Captured = capture({ ..acc.z, deferred: Some([]) }, |x: Nz| atom(x, a));
-      let held = match c.z.deferred { Some(h) -> h, None -> [] };
+      let c: Captured = capture({ ..acc.z, deferred: Some([]) }, |x: Encoder| atom(x, a));
+      let held = match c.encoder.deferred { Some(h) -> h, None -> [] };
       let tie = match effect_target(acc.z.index, acc.z.module, a.eff) {
         Some(node) -> match map_get(acc.z.index.effect_sketches, node) {
           Some(s) -> s,
@@ -1073,7 +1115,7 @@ fn row_expr(z: Nz, r: RowExpr) -> Nz / {abort.raise} = {
         None -> b"",
       };
       {
-        z: { ..c.z, deferred: outer },
+        z: { ..c.encoder, deferred: outer },
         encoded: push(acc.encoded, { bytes: c.bytes, tie: tie, held: held }),
       }
     },
@@ -1082,19 +1124,20 @@ fn row_expr(z: Nz, r: RowExpr) -> Nz / {abort.raise} = {
     insert_atom(acc, x));
   let distinct = fold(range(0, len(sorted)), 0, |acc: Int, i: Int|
     if i == 0 || at(sorted, i - 1).bytes != at(sorted, i).bytes { acc + 1 } else { acc });
-  let written = fold(range(0, len(sorted)), u32v(atoms.z, distinct), |acc: Nz, i: Int| {
+  let written = fold(range(0, len(sorted)), put_u32(atoms.z, distinct), |acc: Encoder, i: Int| {
     let x = at(sorted, i);
-    let mentioned: Nz = fold(x.held, acc, |a: Nz, node: Int| mention(a, node));
-    if i > 0 && at(sorted, i - 1).bytes == x.bytes { mentioned } else { emit(mentioned, x.bytes) }
+    let mentioned: Encoder = fold(x.held, acc, |a: Encoder, node: Int| mention(a, node));
+    if i > 0 && at(sorted, i - 1).bytes == x.bytes { mentioned }
+    else { put_bytes(mentioned, x.bytes) }
   });
-  let tailed: Nz = match r.tail {
-    None -> tag(written, t_none()),
+  let tailed: Encoder = match row.tail {
+    None -> put_tag(written, tag_none()),
     Some(t) -> match rposition(written.row_params, t.name) {
-      Some(level) -> u32v(tag(tag(written, t_some()), t_row_param()), level),
-      None -> strv(tag(tag(written, t_some()), t_free()), t.name),
+      Some(level) -> put_u32(put_tag(put_tag(written, tag_some()), tag_row_param()), level),
+      None -> put_text(put_tag(put_tag(written, tag_some()), tag_free()), t.name),
     },
   };
-  if r.tail_bounded { tag(tailed, t_bounded()) } else { tailed }
+  if row.tail_bounded { put_tag(tailed, tag_bounded()) } else { tailed }
 }
 
 fn atom_lt(a: AtomEncoding, b: AtomEncoding) -> Bool =
@@ -1107,144 +1150,182 @@ fn insert_atom(sorted: List<AtomEncoding>, x: AtomEncoding) -> List<AtomEncoding
   append(push(take(sorted, i), x), map(range(i, n), |j: Int| at(sorted, j)))
 }
 
-fn atom(z: Nz, a: AtomExpr) -> Nz / {abort.raise} = {
-  let named: Nz = match a.op {
+fn atom(encoder: Encoder, a: AtomExpr) -> Encoder = {
+  let named: Encoder = match a.op {
     None ->
       opt_label(
-        emit(effect_ref(tag(z, t_atom()), a.eff), byte_of(mode_byte(a.mode))),
+        put_bytes(effect_ref(put_tag(encoder, tag_atom()), a.eff), byte_of(mode_byte(a.mode))),
         atom_label(a),
       ),
-    Some(op) -> opt_label(strv(effect_ref(tag(z, t_atom_op()), a.eff), op.name), atom_label(a)),
+    Some(op) ->
+      opt_label(
+        put_text(effect_ref(put_tag(encoder, tag_atom_op()), a.eff), op.name),
+        atom_label(a),
+      ),
   };
-  if a.bounded { tag(named, t_bounded()) } else { named }
+  if a.bounded { put_tag(named, tag_bounded()) } else { named }
 }
 
 // `[*]` is not the absence of a label, so the wildcard is spelled out and hashes apart from it.
-fn atom_label(a: AtomExpr) -> Option<Ident> =
-  if a.every { Some({ name: b"*", span: a.span }) } else { a.resource }
+fn atom_label(atom: AtomExpr) -> Option<Ident> =
+  if atom.every { Some({ name: b"*", span: atom.span }) } else { atom.resource }
 
-fn expr(z: Nz, e: Expr) -> Nz / {abort.raise} =
+fn expr(encoder: Encoder, e: Expr) -> Encoder =
   match e {
     // `{ e }` and `e` are the same computation.
     EBlock(b) -> if len(b.stmts) == 0 {
-      match b.tail { Some(t) -> expr(z, t), None -> block(z, b.stmts, b.tail) }
-    } else { block(z, b.stmts, b.tail) },
-    ELit(l) -> lit(tag(z, t_e_lit()), l.lit),
-    EVar(v) -> value_ref(tag(z, t_e_var()), v.name),
-    EBinary(b) -> expr(expr(emit(tag(z, t_e_binary()), byte_of(binop_byte(b.op))), b.lhs), b.rhs),
-    EUnary(u) -> expr(emit(tag(z, t_e_unary()), byte_of(unop_byte(u.op))), u.operand),
+      match b.tail { Some(t) -> expr(encoder, t), None -> block(encoder, b.stmts, b.tail) }
+    } else { block(encoder, b.stmts, b.tail) },
+    ELit(l) -> lit(put_tag(encoder, tag_e_lit()), l.lit),
+    EVar(v) -> value_ref(put_tag(encoder, tag_e_var()), v.name),
+    EBinary(b) ->
+      expr(
+        expr(put_bytes(put_tag(encoder, tag_e_binary()), byte_of(binop_byte(b.op))), b.lhs),
+        b.rhs,
+      ),
+    EUnary(u) ->
+      expr(put_bytes(put_tag(encoder, tag_e_unary()), byte_of(unop_byte(u.op))), u.operand),
     ELambda(l) -> {
-      let z1: Nz = fold(l.params, u32v(tag(z, t_e_lambda()), len(l.params)), |acc: Nz, p: Param|
-        opt_type(acc, p.ty));
-      let inner: Nz = expr(
+      let z1: Encoder = fold(
+        l.params,
+        put_u32(put_tag(encoder, tag_e_lambda()), len(l.params)),
+        |acc: Encoder, p: Param| opt_type(acc, p.ty),
+      );
+      let inner: Encoder = expr(
         { ..z1, values: append(z1.values, map(l.params, |p: Param| p.name.name)) },
         l.body,
       );
       { ..inner, values: z1.values }
     },
     EApp(a) -> {
-      let called: Nz = fold(
+      let called: Encoder = fold(
         a.args,
-        u32v(expr(tag(z, t_e_app()), a.func), len(a.args)),
-        |acc: Nz, x: Expr| expr(acc, x),
+        put_u32(expr(put_tag(encoder, tag_e_app()), a.func), len(a.args)),
+        |acc: Encoder, x: Expr| expr(acc, x),
       );
-      fold(a.labels, u32v(called, len(a.labels)), label_ref)
+      fold(a.labels, put_u32(called, len(a.labels)), label_ref)
     },
-    EIf(i) -> expr(expr(expr(tag(z, t_e_if()), i.cond), i.then_branch), i.else_branch),
+    EIf(i) -> expr(expr(expr(put_tag(encoder, tag_e_if()), i.cond), i.then_branch), i.else_branch),
     EMatch(m) ->
       fold(
         m.arms,
-        u32v(expr(tag(z, t_e_match()), m.scrutinee), len(m.arms)),
-        |acc: Nz, arm: MatchArm| {
-          let inner: Nz = expr(opt_expr(pattern(tag(acc, t_arm()), arm.pat), arm.guard), arm.body);
+        put_u32(expr(put_tag(encoder, tag_e_match()), m.scrutinee), len(m.arms)),
+        |acc: Encoder, arm: MatchArm| {
+          let inner: Encoder = expr(
+            opt_expr(pattern(put_tag(acc, tag_arm()), arm.pat), arm.guard),
+            arm.body,
+          );
           { ..inner, values: acc.values }
         },
       ),
     ERecord(r) ->
-      fold(r.fields, u32v(tag(z, t_e_record()), len(r.fields)), |acc: Nz, f: RecField|
-        expr(strv(acc, f.name.name), f.value)),
+      fold(
+        r.fields,
+        put_u32(put_tag(encoder, tag_e_record()), len(r.fields)),
+        |acc: Encoder, f: RecField| expr(put_text(acc, f.name.name), f.value),
+      ),
     // The update is the definition, not the literal it expands to: its meaning follows the base's type.
     ERecordUpdate(r) ->
       fold(
         r.fields,
-        u32v(expr(tag(z, t_e_record_update()), r.base), len(r.fields)),
-        |acc: Nz, f: RecField| expr(strv(acc, f.name.name), f.value),
+        put_u32(expr(put_tag(encoder, tag_e_record_update()), r.base), len(r.fields)),
+        |acc: Encoder, f: RecField| expr(put_text(acc, f.name.name), f.value),
       ),
     ETry(_) -> panic("`e?` is expanded away before hashing"),
-    EField(f) -> strv(expr(tag(z, t_e_field()), f.base), f.field.name),
+    EField(f) -> put_text(expr(put_tag(encoder, tag_e_field()), f.base), f.field.name),
     EList(l) ->
-      fold(l.items, u32v(tag(z, t_e_list()), len(l.items)), |acc: Nz, x: Expr| expr(acc, x)),
+      fold(
+        l.items,
+        put_u32(put_tag(encoder, tag_e_list()), len(l.items)),
+        |acc: Encoder, x: Expr| expr(acc, x),
+      ),
     EPerform(p) ->
       fold(
         p.args,
-        u32v(
-          opt_label(strv(effect_ref(tag(z, t_e_perform()), p.eff), p.op.name), p.resource),
+        put_u32(
+          opt_label(
+            put_text(effect_ref(put_tag(encoder, tag_e_perform()), p.eff), p.op.name),
+            p.resource,
+          ),
           len(p.args),
         ),
-        |acc: Nz, x: Expr| expr(acc, x),
+        |acc: Encoder, x: Expr| expr(acc, x),
       ),
     EHandle(h) -> {
-      let clauses: Nz = fold(
+      let clauses: Encoder = fold(
         h.clauses,
-        u32v(expr(tag(z, t_e_handle()), h.body), len(h.clauses)),
-        |acc: Nz, c: HandleClause| {
-          let head: Nz = u32v(
-            opt_label(strv(effect_ref(tag(acc, t_clause()), c.eff), c.op.name), clause_label(c)),
+        put_u32(expr(put_tag(encoder, tag_e_handle()), h.body), len(h.clauses)),
+        |acc: Encoder, c: HandleClause| {
+          let head: Encoder = put_u32(
+            opt_label(
+              put_text(effect_ref(put_tag(acc, tag_clause()), c.eff), c.op.name),
+              clause_label(c),
+            ),
             len(c.params),
           );
-          let bound: Nz = { ..head, values: append(head.values, map(c.params, |p: Ident| p.name)) };
+          let bound: Encoder = {
+            ..head,
+            values: append(head.values, map(c.params, |p: Ident| p.name)),
+          };
           // Whether a clause binds a continuation is part of what the definition is.
-          let resumed: Nz = match c.resume {
-            None -> tag(bound, t_none()),
+          let resumed: Encoder = match c.resume {
+            None -> put_tag(bound, tag_none()),
             Some(k) -> {
-              let some: Nz = tag(bound, t_some());
+              let some: Encoder = put_tag(bound, tag_some());
               { ..some, values: push(some.values, k.name) }
             },
           };
-          let inner: Nz = expr(resumed, c.body);
+          let inner: Encoder = expr(resumed, c.body);
           { ..inner, values: acc.values }
         },
       );
       match h.ret {
-        None -> tag(clauses, t_none()),
+        None -> put_tag(clauses, tag_none()),
         Some(rc) -> {
-          let head: Nz = tag(tag(clauses, t_some()), t_return_clause());
-          let inner: Nz = expr({ ..head, values: push(head.values, rc.binder.name) }, rc.body);
+          let head: Encoder = put_tag(put_tag(clauses, tag_some()), tag_return_clause());
+          let inner: Encoder = expr({ ..head, values: push(head.values, rc.binder.name) }, rc.body);
           { ..inner, values: clauses.values }
         },
       }
     },
     EWithCell(c) -> {
-      let head: Nz = expr(strv(tag(z, t_e_with_cell()), c.resource.name), c.init);
-      let inner: Nz = expr({ ..head, values: push(head.values, c.binder.name) }, c.body);
+      let head: Encoder = expr(
+        put_text(put_tag(encoder, tag_e_with_cell()), c.resource.name),
+        c.init,
+      );
+      let inner: Encoder = expr({ ..head, values: push(head.values, c.binder.name) }, c.body);
       { ..inner, values: head.values }
     },
-    ESimulate(s) -> expr(tag(z, t_e_simulate()), s.body),
+    ESimulate(s) -> expr(put_tag(encoder, tag_e_simulate()), s.body),
     EParallel(v) ->
-      fold(v.branches, u32v(tag(z, t_e_parallel()), len(v.branches)), |acc: Nz, x: Expr|
-        expr(acc, x)),
+      fold(
+        v.branches,
+        put_u32(put_tag(encoder, tag_e_parallel()), len(v.branches)),
+        |acc: Encoder, x: Expr| expr(acc, x),
+      ),
     EBad(_) -> panic("a placeholder reached the hasher"),
   }
 
-fn block(z: Nz, stmts: List<Stmt>, tail: Option<Expr>) -> Nz / {abort.raise} = {
-  let head: Nz = u32v(tag(z, t_e_block()), len(stmts));
-  let ordered: { z: Nz, order: List<Int> } = stmt_order(head, stmts);
-  let walked: Nz = fold(ordered.order, ordered.z, |acc: Nz, i: Int| stmt(acc, at(stmts, i)));
-  let tailed: Nz = opt_expr(walked, tail);
+fn block(encoder: Encoder, stmts: List<Stmt>, tail: Option<Expr>) -> Encoder = {
+  let head: Encoder = put_u32(put_tag(encoder, tag_e_block()), len(stmts));
+  let ordered: { z: Encoder, order: List<Int> } = stmt_order(head, stmts);
+  let walked: Encoder = fold(ordered.order, ordered.z, |acc: Encoder, i: Int|
+    stmt(acc, at(stmts, i)));
+  let tailed: Encoder = opt_expr(walked, tail);
   { ..tailed, values: head.values }
 }
 
 // Consecutive `let`s that commute are emitted in the order their own encodings sort in.
-fn stmt_order(z: Nz, stmts: List<Stmt>) -> { z: Nz, order: List<Int> } / {abort.raise} = {
+fn stmt_order(encoder: Encoder, stmts: List<Stmt>) -> { z: Encoder, order: List<Int> } = {
   let n = len(stmts);
   let walked = iterate(
-    { z: z, i: 0, order: [] },
+    { z: encoder, i: 0, order: [] },
     n + 2,
-    |s: { z: Nz, i: Int, order: List<Int> }|
+    |s: { z: Encoder, i: Int, order: List<Int> }|
       if s.i >= n { Stop(s) } else {
         let run = commutable_run(stmts, s.i);
         if run < 2 { Continue({ ..s, i: s.i + 1, order: push(s.order, s.i) }) } else {
-          let sorted: { z: Nz, order: List<Int> } = sorted_run(s.z, stmts, s.i, s.i + run);
+          let sorted: { z: Encoder, order: List<Int> } = sorted_run(s.z, stmts, s.i, s.i + run);
           Continue({ z: sorted.z, i: s.i + run, order: append(s.order, sorted.order) })
         }
       },
@@ -1254,17 +1335,17 @@ fn stmt_order(z: Nz, stmts: List<Stmt>) -> { z: Nz, order: List<Int> } / {abort.
 
 // The members of the run, ordered by their encodings; ties keep their source order.
 fn sorted_run(
-  z: Nz,
+  z: Encoder,
   stmts: List<Stmt>,
   from: Int,
   to: Int,
-) -> { z: Nz, order: List<Int> } / {abort.raise} = {
+) -> { z: Encoder, order: List<Int> } = {
   let keyed = fold(
     range(from, to),
     { z: z, keys: [] },
-    |acc: { z: Nz, keys: List<{ key: Bytes, i: Int }> }, i: Int| {
-      let c: Captured = capture(acc.z, |x: Nz| stmt(x, at(stmts, i)));
-      { z: { ..c.z, values: acc.z.values }, keys: push(acc.keys, { key: c.bytes, i: i }) }
+    |acc: { z: Encoder, keys: List<{ key: Bytes, i: Int }> }, i: Int| {
+      let c: Captured = capture(acc.z, |x: Encoder| stmt(x, at(stmts, i)));
+      { z: { ..c.encoder, values: acc.z.values }, keys: push(acc.keys, { key: c.bytes, i: i }) }
     },
   );
   let sorted = fold(
@@ -1283,69 +1364,81 @@ fn sorted_run(
   { z: keyed.z, order: map(sorted, |x: { key: Bytes, i: Int }| x.i) }
 }
 
-fn stmt(z: Nz, s: Stmt) -> Nz / {abort.raise} =
+fn stmt(encoder: Encoder, s: Stmt) -> Encoder =
   match s {
-    SLet(l) -> pattern(expr(opt_type(tag(z, t_s_let()), l.ty), l.value), l.pat),
+    SLet(l) -> pattern(expr(opt_type(put_tag(encoder, tag_s_let()), l.ty), l.value), l.pat),
     SLetElse(l) ->
-      expr(pattern(expr(opt_type(tag(z, t_s_let_else()), l.ty), l.value), l.pat), l.fallback),
-    SExpr(e) -> expr(tag(z, t_s_expr()), e),
+      expr(
+        pattern(expr(opt_type(put_tag(encoder, tag_s_let_else()), l.ty), l.value), l.pat),
+        l.fallback,
+      ),
+    SExpr(e) -> expr(put_tag(encoder, tag_s_expr()), e),
   }
 
-fn lit(z: Nz, l: Lit) -> Nz / {abort.raise} =
-  match l {
-    LInt(i) -> emit(tag(z, t_lit_int()), i64_le(i)),
-    LFixed(ty, v) -> emit(emit(tag(z, t_lit_fixed()), width_index(ty)), i64_le(v)),
+fn lit(encoder: Encoder, literal: Lit) -> Encoder =
+  match literal {
+    LInt(i) -> put_bytes(put_tag(encoder, tag_lit_int()), i64_le(i)),
+    LFixed(ty, v) ->
+      put_bytes(put_bytes(put_tag(encoder, tag_lit_fixed()), width_index(ty)), i64_le(v)),
     LWide(ty, high, low) ->
-      emit(emit(emit(tag(z, t_lit_wide()), width_index(ty)), i64_le(high)), i64_le(low)),
-    LBool(b) -> boolv(tag(z, t_lit_bool()), b),
-    LStr(s) -> strv(tag(z, t_lit_str()), s),
-    LBytes(b) -> emit(u32v(tag(z, t_lit_bytes()), bytes_len(b)), b),
-    LFloat(text) -> emit(tag(z, t_lit_float()), i64_le(float_bits(text))),
+      put_bytes(
+        put_bytes(put_bytes(put_tag(encoder, tag_lit_wide()), width_index(ty)), i64_le(high)),
+        i64_le(low),
+      ),
+    LBool(b) -> put_bool(put_tag(encoder, tag_lit_bool()), b),
+    LStr(s) -> put_text(put_tag(encoder, tag_lit_str()), s),
+    LBytes(b) -> put_bytes(put_u32(put_tag(encoder, tag_lit_bytes()), bytes_len(b)), b),
+    LFloat(text) -> put_bytes(put_tag(encoder, tag_lit_float()), i64_le(float_bits(text))),
     LDec(text) -> {
       let p = decimal_parts(text);
-      emit(emit(tag(z, t_lit_decimal()), p.mantissa), u32_le(p.scale))
+      put_bytes(put_bytes(put_tag(encoder, tag_lit_decimal()), p.mantissa), u32_le(p.scale))
     },
-    LChar(v) -> emit(tag(z, t_lit_char()), u32_le(v)),
-    LUnit -> tag(z, t_lit_unit()),
+    LChar(v) -> put_bytes(put_tag(encoder, tag_lit_char()), u32_le(v)),
+    LUnit -> put_tag(encoder, tag_lit_unit()),
     LBad -> panic("a placeholder literal reached the hasher"),
   }
 
-fn pattern(z: Nz, p: Pattern) -> Nz / {abort.raise} =
+fn pattern(encoder: Encoder, p: Pattern) -> Encoder =
   match p {
-    PWild(_) -> tag(z, t_p_wildcard()),
+    PWild(_) -> put_tag(encoder, tag_p_wildcard()),
     PVar(v) -> {
-      let t: Nz = tag(z, t_p_var());
+      let t: Encoder = put_tag(encoder, tag_p_var());
       { ..t, values: push(t.values, v.name.name) }
     },
-    PLit(l) -> lit(tag(z, t_p_lit()), l.lit),
+    PLit(l) -> lit(put_tag(encoder, tag_p_lit()), l.lit),
     PCtor(c) ->
       fold(
         c.args,
-        u32v(ctor_ref(tag(z, t_p_ctor()), c.name), len(c.args)),
-        |acc: Nz, a: Pattern| pattern(acc, a),
+        put_u32(ctor_ref(put_tag(encoder, tag_p_ctor()), c.name), len(c.args)),
+        |acc: Encoder, a: Pattern| pattern(acc, a),
       ),
     PRecord(r) ->
-      boolv(
+      put_bool(
         fold(
           r.fields,
-          u32v(tag(z, t_p_record()), len(r.fields)),
-          |acc: Nz, f: { name: Ident, pat: Pattern }| pattern(strv(acc, f.name.name), f.pat),
+          put_u32(put_tag(encoder, tag_p_record()), len(r.fields)),
+          |acc: Encoder, f: { name: Ident, pat: Pattern }|
+            pattern(put_text(acc, f.name.name), f.pat),
         ),
         r.rest,
       ),
     PList(l) -> {
-      let items: Nz = fold(
+      let items: Encoder = fold(
         l.items,
-        u32v(tag(z, t_p_list()), len(l.items)),
-        |acc: Nz, i: Pattern| pattern(acc, i),
+        put_u32(put_tag(encoder, tag_p_list()), len(l.items)),
+        |acc: Encoder, i: Pattern| pattern(acc, i),
       );
       match l.rest {
-        None -> tag(items, t_none()),
-        Some(rest) -> pattern(tag(items, t_some()), rest),
+        None -> put_tag(items, tag_none()),
+        Some(rest) -> pattern(put_tag(items, tag_some()), rest),
       }
     },
     POr(o) ->
-      fold(o.alts, u32v(tag(z, t_p_or()), len(o.alts)), |acc: Nz, a: Pattern| pattern(acc, a)),
+      fold(
+        o.alts,
+        put_u32(put_tag(encoder, tag_p_or()), len(o.alts)),
+        |acc: Encoder, a: Pattern| pattern(acc, a),
+      ),
     PBad(_) -> panic("a placeholder pattern reached the hasher"),
   }
 
@@ -1363,8 +1456,8 @@ fn commutable_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
     let counted = fold(
       run,
       { count: 0, bound: [] },
-      |acc: { count: Int, bound: List<Bytes> }, s: Stmt|
-        match s {
+      |acc: { count: Int, bound: List<Bytes> }, stmt: Stmt|
+        match stmt {
           SLet(l) -> {
             let b = pattern_binders(l.pat, acc.bound);
             { count: acc.count + b.count, bound: b.bound }
@@ -1373,8 +1466,8 @@ fn commutable_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
         },
     );
     if counted.count != len(counted.bound) { 0 }
-    else if fold(run, false, |b: Bool, s: Stmt|
-        b || (match s { SLet(l) -> mentions(l.value, counted.bound), _ -> false })) { 0 }
+    else if fold(run, false, |b: Bool, stmt: Stmt|
+        b || (match stmt { SLet(l) -> mentions(l.value, counted.bound), _ -> false })) { 0 }
     else { to - from }
   }
 }
@@ -1448,12 +1541,12 @@ pub fn is_pure(e: Expr) -> Bool =
     EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
     EMatch(m) ->
       is_pure(m.scrutinee)
-        && fold(m.arms, true, |acc: Bool, a: MatchArm|
-          acc && is_pure(a.body) && (match a.guard { Some(g) -> is_pure(g), None -> true })),
+        && fold(m.arms, true, |acc: Bool, arm: MatchArm|
+          acc && is_pure(arm.body) && (match arm.guard { Some(g) -> is_pure(g), None -> true })),
     EBlock(b) ->
-      fold(b.stmts, true, |acc: Bool, s: Stmt|
+      fold(b.stmts, true, |acc: Bool, stmt: Stmt|
           acc
-            && (match s {
+            && (match stmt {
               SLet(l) -> is_pure(l.value),
               SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
               SExpr(x) -> is_pure(x),
@@ -1636,20 +1729,20 @@ fn digest_spec(s: { name: Bytes, hashes: List<Bytes> }) -> Bytes / {abort.raise}
 
 // Every published hash, framed so two tables cannot collide: what a compiled unit and the machine
 // entering it agree on. Each list is in the order the dump writes it.
-pub fn digest(h: HashOutput) -> Bytes / {abort.raise} =
+pub fn digest(hashes: HashOutput) -> Bytes =
   blake3(
     bytes_concat_all([
       hashes_domain(),
-      u64_le(len(h.defs)),
-      bytes_concat_all(map(h.defs, |p: { name: Bytes, hash: Bytes }| digest_named(p))),
-      u64_le(len(h.decls)),
-      bytes_concat_all(map(h.decls, |p: { name: Bytes, hash: Bytes }| digest_named(p))),
-      u64_le(len(h.specs)),
-      bytes_concat_all(map(h.specs, |s: { name: Bytes, hashes: List<Bytes> }| digest_spec(s))),
-      u64_le(len(h.tests)),
-      bytes_concat_all(h.tests),
-      u64_le(len(h.laws)),
-      bytes_concat_all(h.laws),
+      u64_le(len(hashes.defs)),
+      bytes_concat_all(map(hashes.defs, |p: { name: Bytes, hash: Bytes }| digest_named(p))),
+      u64_le(len(hashes.decls)),
+      bytes_concat_all(map(hashes.decls, |p: { name: Bytes, hash: Bytes }| digest_named(p))),
+      u64_le(len(hashes.specs)),
+      bytes_concat_all(map(hashes.specs, |s: { name: Bytes, hashes: List<Bytes> }| digest_spec(s))),
+      u64_le(len(hashes.tests)),
+      bytes_concat_all(hashes.tests),
+      u64_le(len(hashes.laws)),
+      bytes_concat_all(hashes.laws),
     ]),
   )
 
@@ -1692,11 +1785,11 @@ fn encode_item<| e>(
   scc: Sccs,
   hashes: Map<Int, Bytes>,
   by_name: Bool,
-  encode: (Nz) -> Nz / e,
+  encode: (Encoder) -> Encoder / e,
 ) -> Finished / {abort.raise | e} = {
-  let first: Finished = finish(encode(new_nz(index, module, map_new(), map_new(), map_new())));
+  let first: Finished = finish(encode(new_encoder(index, module, map_new(), map_new(), map_new())));
   let effects = slots(effect_order(index, first.refs, scc, None, []));
-  let z: Nz = new_nz(index, module, hashes, map_new(), effects);
+  let z: Encoder = new_encoder(index, module, hashes, map_new(), effects);
   finish(encode({ ..z, by_name: by_name }))
 }
 
@@ -1714,7 +1807,7 @@ fn hash_component(
   let encode = |classes: Map<Int, Int>, v: Int|
     finish(
       normalize_node(
-        new_nz(index, at(index.nodes, v).module, hashes, classes, effects),
+        new_encoder(index, at(index.nodes, v).module, hashes, classes, effects),
         at(index.nodes, v).body,
       ),
     ).bytes;
@@ -1835,7 +1928,9 @@ type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
 // members without source position.
 fn first_pass(index: Index) -> List<Finished> / {abort.raise} =
   map(index.nodes, |node: Node|
-    finish(normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body)))
+    finish(
+      normalize_node(new_encoder(index, node.module, map_new(), map_new(), map_new()), node.body),
+    ))
 
 fn graph_of(index: Index) -> Graph / {abort.raise} = graph_with(index, first_pass(index), map_new())
 
@@ -1877,15 +1972,15 @@ fn graph_with(
 
 fn key_components(
   index: Index,
-  g: Graph,
+  graph: Graph,
   pinned: Map<Int, Bytes>,
   held: Map<Int, Fixed>,
-) -> Keyed / {abort.raise} =
+) -> Keyed =
   fold(
-    range(0, len(g.components)),
+    range(0, len(graph.components)),
     { hashes: map_new(), bodies: map_new(), fresh: map_new() },
     |acc: Keyed, ci: Int| {
-      let component = at(g.components, ci);
+      let component = at(graph.components, ci);
       if fold(component, true, |all: Bool, v: Int| all && map_contains(held, v)) {
         fold(component, acc, |a: Keyed, v: Int|
           match map_get(held, v) {
@@ -1897,20 +1992,20 @@ fn key_components(
                 fresh: map_insert(a.fresh, v, f.hash),
               },
           })
-      } else { key_component(index, g, pinned, acc, ci, component) }
+      } else { key_component(index, graph, pinned, acc, ci, component) }
     },
   )
 
 fn key_component(
   index: Index,
-  g: Graph,
+  graph: Graph,
   pinned: Map<Int, Bytes>,
   acc: Keyed,
   ci: Int,
   component: List<Int>,
-) -> Keyed / {abort.raise} = {
-  let effects = slots(at(g.scc.orders, ci));
-  let own: Keyed = if is_cyclic(component, g.edges) {
+) -> Keyed = {
+  let effects = slots(at(graph.scc.orders, ci));
+  let own: Keyed = if is_cyclic(component, graph.edges) {
     let refined: Refined = hash_component(index, component, acc.hashes, effects);
     fold(refined.members, acc, |a: Keyed, m: { node: Int, hash: Bytes }| {
       let class = match map_get(refined.classes, m.node) { Some(c) -> c, None -> 0 };
@@ -1924,7 +2019,7 @@ fn key_component(
     let v = at(component, 0);
     let node = at(index.nodes, v);
     let encoding = finish(
-      normalize_node(new_nz(index, node.module, acc.hashes, map_new(), effects), node.body),
+      normalize_node(new_encoder(index, node.module, acc.hashes, map_new(), effects), node.body),
     ).bytes;
     {
       ..acc,
@@ -2016,8 +2111,8 @@ fn hashed_over(
     index.tests,
     { hashes: [], bodies: [], refs: [] },
     |acc: { hashes: List<Bytes>, bodies: List<Bytes>, refs: List<List<Int>> }, t: TestNode| {
-      let f: Finished = encode_item(index, t.module, scc, hashes, false, |z: Nz|
-        test_def(z, t.def));
+      let f: Finished = encode_item(index, t.module, scc, hashes, false, |encoder: Encoder|
+        test_def(encoder, t.def));
       {
         hashes: push(acc.hashes, blake3(f.bytes)),
         bodies: push(acc.bodies, solo_body(f.bytes)),
@@ -2029,9 +2124,10 @@ fn hashed_over(
     index.laws,
     { hashes: [], refs: [], texts: [] },
     |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, l: LawNode| {
-      let f: Finished = encode_item(index, l.module, scc, hashes, false, |z: Nz| law_def(z, l.def));
-      let text: Finished = encode_item(index, l.module, scc, hashes, true, |z: Nz|
-        law_def(z, l.def));
+      let f: Finished = encode_item(index, l.module, scc, hashes, false, |encoder: Encoder|
+        law_def(encoder, l.def));
+      let text: Finished = encode_item(index, l.module, scc, hashes, true, |encoder: Encoder|
+        law_def(encoder, l.def));
       {
         hashes: push(acc.hashes, blake3(f.bytes)),
         refs: push(acc.refs, f.refs),
@@ -2042,9 +2138,9 @@ fn hashed_over(
   let forms = fold(
     index.order,
     { own: [], specs: [], spec_texts: [], spec_checks: [] },
-    |acc: Forms, e: Entry|
+    |acc: Forms, e: IndexEntry|
       match e {
-        EDef(v) -> {
+        DefEntry(v) -> {
           let node = at(index.nodes, v);
           match map_get(held, v) {
             Some(f) -> fixed_forms(acc, node.name, f),
@@ -2083,15 +2179,23 @@ fn package_of(index: Index, packages: List<Int>, v: Int) -> Int / {abort.raise} 
 
 // What another package reads of a definition: its signature and specifications, and its body only
 // when it is `transparent`.
-fn contract_of(index: Index, g: Graph, hashes: Map<Int, Bytes>, v: Int) -> Bytes / {abort.raise} = {
+fn contract_of(index: Index, graph: Graph, hashes: Map<Int, Bytes>, v: Int) -> Bytes = {
   let node = at(index.nodes, v);
   match node.body {
-    NFn(d) -> {
-      let signature = encode_item(index, node.module, g.scc, hashes, false, |z: Nz|
-        normalize_node(z, NFn({ ..d, body: ELit({ span: d.name.span, lit: LUnit }) }))).bytes;
+    NodeFn(d) -> {
+      let signature = encode_item(
+        index,
+        node.module,
+        graph.scc,
+        hashes,
+        false,
+        |encoder: Encoder|
+          normalize_node(encoder, NodeFn({ ..d, body: ELit({ span: d.name.span, lit: LUnit }) })),
+      ).bytes;
       // Normalizing erases the specifications, which a dependent is owed as much as the types.
-      let clauses = map(d.spec, |c: SpecClause|
-        encode_item(index, node.module, g.scc, hashes, false, |z: Nz| spec_clause(z, d, c)).bytes);
+      let clauses = map(d.spec, |clause: SpecClause|
+        encode_item(index, node.module, graph.scc, hashes, false, |encoder: Encoder|
+          spec_clause(encoder, d, clause)).bytes);
       // A `transparent` body is read too, so the contract holds the hash of it and all it reaches.
       let body = match d.transparent {
         Some(_) ->
@@ -2110,9 +2214,9 @@ pub type Contract = { name: Bytes, decl: Bool, hash: Bytes }
 
 fn is_public(node: Node) -> Bool =
   match node.body {
-    NFn(d) -> is_pub(d.vis),
-    NType(d) -> is_pub(d.vis),
-    NEffect(d) -> is_pub(d.vis),
+    NodeFn(d) -> is_pub(d.vis),
+    NodeType(d) -> is_pub(d.vis),
+    NodeEffect(d) -> is_pub(d.vis),
   }
 
 // Every public definition and declaration of the modules `mine` names, as another package reads it.
@@ -2146,7 +2250,7 @@ type Viewed = { cut: Cut, view: Map<Int, Bytes> }
 // contract, a fixed one by its hash, and any other by its check key.
 fn viewed_refs(
   index: Index,
-  g: Graph,
+  graph: Graph,
   held: Map<Int, Fixed>,
   packages: List<Int>,
   hashes: Map<Int, Bytes>,
@@ -2154,12 +2258,12 @@ fn viewed_refs(
   v: Int,
 ) -> Viewed / {abort.raise} = {
   let own = package_of(index, packages, v);
-  fold(at(g.edges, v), { cut: cut, view: map_new() }, |acc: Viewed, r: Int|
+  fold(at(graph.edges, v), { cut: cut, view: map_new() }, |acc: Viewed, r: Int|
     if package_of(index, packages, r) != own {
       match map_get(acc.cut.contracts, r) {
         Some(c) -> { ..acc, view: map_insert(acc.view, r, c) },
         None -> {
-          let c = contract_of(index, g, hashes, r);
+          let c = contract_of(index, graph, hashes, r);
           {
             cut: { ..acc.cut, contracts: map_insert(acc.cut.contracts, r, c) },
             view: map_insert(acc.view, r, c),
@@ -2177,22 +2281,22 @@ fn viewed_refs(
 // them, and any other is keyed again under its view.
 fn cut_components(
   index: Index,
-  g: Graph,
+  graph: Graph,
   held: Map<Int, Fixed>,
   packages: List<Int>,
   hashes: Map<Int, Bytes>,
 ) -> Cut / {abort.raise} =
   fold(
-    range(0, len(g.components)),
+    range(0, len(graph.components)),
     { checks: map_new(), contracts: map_new() },
     |acc: Cut, ci: Int| {
-      let component = at(g.components, ci);
+      let component = at(graph.components, ci);
       let gathered = fold(component, { cut: acc, view: map_new() }, |a: Viewed, v: Int| {
-        let x = viewed_refs(index, g, held, packages, hashes, a.cut, v);
+        let x = viewed_refs(index, graph, held, packages, hashes, a.cut, v);
         {
           cut: x.cut,
           view: map_fold(x.view, a.view, |m: Map<Int, Bytes>, r: Int, k: Bytes|
-            if at(g.scc.component_of, r) == ci { m } else { map_insert(m, r, k) }),
+            if at(graph.scc.component_of, r) == ci { m } else { map_insert(m, r, k) }),
         }
       });
       let unmoved = map_fold(gathered.view, true, |all: Bool, r: Int, k: Bytes|
@@ -2204,8 +2308,8 @@ fn cut_components(
             None -> c,
           })
       } else {
-        let effects = slots(at(g.scc.orders, ci));
-        if is_cyclic(component, g.edges) {
+        let effects = slots(at(graph.scc.orders, ci));
+        if is_cyclic(component, graph.edges) {
           let refined: Refined = hash_component(index, component, gathered.view, effects);
           fold(refined.members, gathered.cut, |c: Cut, m: { node: Int, hash: Bytes }|
             { ..c, checks: map_insert(c.checks, m.node, m.hash) })
@@ -2214,7 +2318,7 @@ fn cut_components(
           let node = at(index.nodes, v);
           let encoding = finish(
             normalize_node(
-              new_nz(index, node.module, gathered.view, map_new(), effects),
+              new_encoder(index, node.module, gathered.view, map_new(), effects),
               node.body,
             ),
           ).bytes;
@@ -2224,17 +2328,17 @@ fn cut_components(
     },
   )
 
-fn fixed_forms(acc: Forms, name: Bytes, f: Fixed) -> Forms = {
-  let owned: Forms = match f.own {
+fn fixed_forms(acc: Forms, name: Bytes, fixed: Fixed) -> Forms = {
+  let owned: Forms = match fixed.own {
     Some(o) -> { ..acc, own: push(acc.own, { name: name, hash: o }) },
     None -> acc,
   };
-  if len(f.specs) == 0 { owned } else {
+  if len(fixed.specs) == 0 { owned } else {
     {
       ..owned,
-      specs: push(owned.specs, { name: name, hashes: f.specs }),
-      spec_texts: push(owned.spec_texts, { name: name, hashes: f.spec_texts }),
-      spec_checks: push(owned.spec_checks, { name: name, hashes: f.specs }),
+      specs: push(owned.specs, { name: name, hashes: fixed.specs }),
+      spec_texts: push(owned.spec_texts, { name: name, hashes: fixed.spec_texts }),
+      spec_checks: push(owned.spec_checks, { name: name, hashes: fixed.specs }),
     }
   }
 }
@@ -2250,9 +2354,9 @@ fn unfixed_forms(
   node: Node,
 ) -> Forms / {abort.raise} =
   match node.body {
-    NFn(def) -> {
-      let form: Finished = encode_item(index, node.module, scc, hashes, true, |z: Nz|
-        normalize_node(z, NFn(def)));
+    NodeFn(def) -> {
+      let form: Finished = encode_item(index, node.module, scc, hashes, true, |encoder: Encoder|
+        normalize_node(encoder, NodeFn(def)));
       let owned: Forms = {
         ..acc,
         own: push(acc.own, { name: node.name, hash: own_hash(form.bytes) }),
@@ -2267,8 +2371,8 @@ fn unfixed_forms(
                 owner,
                 spec_tag(c.kind),
                 i,
-                encode_item(index, node.module, scc, hashes, false, |z: Nz|
-                  spec_clause(z, def, c)).bytes,
+                encode_item(index, node.module, scc, hashes, false, |encoder: Encoder|
+                  spec_clause(encoder, def, c)).bytes,
               )
             });
             let texts = map(range(0, len(def.spec)), |i: Int| {
@@ -2276,8 +2380,8 @@ fn unfixed_forms(
               spec_text_hash(
                 spec_tag(c.kind),
                 i,
-                encode_item(index, node.module, scc, hashes, true, |z: Nz|
-                  spec_clause(z, def, c)).bytes,
+                encode_item(index, node.module, scc, hashes, true, |encoder: Encoder|
+                  spec_clause(encoder, def, c)).bytes,
               )
             });
             let cut_owner = match map_get(checks, v) { Some(k) -> k, None -> owner };
@@ -2287,8 +2391,8 @@ fn unfixed_forms(
                 cut_owner,
                 spec_tag(c.kind),
                 i,
-                encode_item(index, node.module, scc, view, false, |z: Nz|
-                  spec_clause(z, def, c)).bytes,
+                encode_item(index, node.module, scc, view, false, |encoder: Encoder|
+                  spec_clause(encoder, def, c)).bytes,
               )
             });
             {
@@ -2307,7 +2411,7 @@ fn unfixed_forms(
 // Pairs nodes by `index.order`, as `assemble` pushed them; a node `applied` fixed keeps its edges.
 pub fn fixed_nodes(
   index: Index,
-  h: HashOutput,
+  hashes: HashOutput,
   keep: Map<Bytes, Bool>,
   applied: List<Fixed> = [],
 ) -> List<Fixed> / {abort.raise} = {
@@ -2319,21 +2423,27 @@ pub fn fixed_nodes(
       None ->
         map(
           finish(
-            normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body),
+            normalize_node(
+              new_encoder(index, node.module, map_new(), map_new(), map_new()),
+              node.body,
+            ),
           ).refs,
           |r: Int| { name: at(index.nodes, r).name, decl: is_decl(at(index.nodes, r)) },
         ),
     };
-  let own = fold(h.own, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-    map_insert(acc, x.name, x.hash));
+  let own = fold(
+    hashes.own,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash),
+  );
   let specs = fold(
-    h.specs,
+    hashes.specs,
     map_new(),
     |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
       map_insert(acc, x.name, x.hashes),
   );
   let texts = fold(
-    h.spec_texts,
+    hashes.spec_texts,
     map_new(),
     |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
       map_insert(acc, x.name, x.hashes),
@@ -2343,12 +2453,12 @@ pub fn fixed_nodes(
   let walked = fold(
     index.order,
     { body: 0, def: 0, decl: 0, out: [] },
-    |acc: { body: Int, def: Int, decl: Int, out: List<Fixed> }, e: Entry|
+    |acc: { body: Int, def: Int, decl: Int, out: List<Fixed> }, e: IndexEntry|
       match e {
-        EDef(v) -> {
+        DefEntry(v) -> {
           let node = at(index.nodes, v);
           let decl = is_decl(node);
-          let body = at(h.bodies, acc.body);
+          let body = at(hashes.bodies, acc.body);
           if body.name != node.name {
             panic("hashes and the index disagree on the order of nodes")
           };
@@ -2364,7 +2474,8 @@ pub fn fixed_nodes(
               out: push(next.out, {
                 name: node.name,
                 decl: decl,
-                hash: if decl { at(h.decls, acc.decl).hash } else { at(h.defs, acc.def).hash },
+                hash: if decl { at(hashes.decls, acc.decl).hash }
+                else { at(hashes.defs, acc.def).hash },
                 own: if decl { None } else { map_get(own, node.name) },
                 specs: if decl { [] } else { listed(specs, node.name) },
                 spec_texts: if decl { [] } else { listed(texts, node.name) },
@@ -2386,14 +2497,14 @@ pub type Pin = { name: Bytes, decl: Bool, hash: Bytes }
 pub type Rehash = { name: Bytes, decl: Bool, fresh: Bytes, table: Bytes, component: Int }
 pub type Rehashed = { nodes: List<Rehash>, tests: List<{ key: Bytes, hash: Bytes }> }
 
-fn is_decl(node: Node) -> Bool = match node.body { NFn(_) -> false, _ -> true }
+fn is_decl(node: Node) -> Bool = match node.body { NodeFn(_) -> false, _ -> true }
 
 fn pin_key(name: Bytes, decl: Bool) -> Bytes =
   bytes_concat(if decl { b"decl " } else { b"def " }, name)
 
-pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed / {abort.raise} = {
-  let wanted = fold(pins, map_new(), |acc: Map<Bytes, Bytes>, p: Pin|
-    map_insert(acc, pin_key(p.name, p.decl), p.hash));
+pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed = {
+  let wanted = fold(pins, map_new(), |acc: Map<Bytes, Bytes>, pin: Pin|
+    map_insert(acc, pin_key(pin.name, pin.decl), pin.hash));
   let pinned = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int| {
     let node = at(index.nodes, v);
     match map_get(wanted, pin_key(node.name, is_decl(node))) {
@@ -2423,8 +2534,8 @@ pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed / {abort.raise} =
       {
         key: t.key,
         hash: blake3(
-          encode_item(index, t.module, g.scc, keyed.hashes, false, |z: Nz|
-            test_def(z, t.def)).bytes,
+          encode_item(index, t.module, g.scc, keyed.hashes, false, |encoder: Encoder|
+            test_def(encoder, t.def)).bytes,
         ),
       }),
   }
@@ -2457,9 +2568,9 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
     checks: [],
     spec_checks: h.spec_checks,
   };
-  fold(index.order, { out: empty, deps_at: map_new() }, |acc: Recording, e: Entry|
+  fold(index.order, { out: empty, deps_at: map_new() }, |acc: Recording, e: IndexEntry|
     match e {
-      EDef(v) -> {
+      DefEntry(v) -> {
         let node = at(index.nodes, v);
         let bodied: HashOutput = match map_get(h.bodies, v) {
           None -> acc.out,
@@ -2469,7 +2580,7 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
         let keyed: HashOutput = match map_get(h.hashes, v) {
           None -> bodied,
           Some(hash) -> match node.body {
-            NFn(_) ->
+            NodeFn(_) ->
               {
                 ..bodied,
                 defs: push(bodied.defs, { name: node.name, hash: hash }),
@@ -2483,9 +2594,9 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
         };
         record({ ..acc, out: keyed }, node.name, names_at(at(edges, v)))
       },
-      ETest(i) -> record(acc, at(index.tests, i).key, names_at(at(h.test_refs, i))),
+      TestEntry(i) -> record(acc, at(index.tests, i).key, names_at(at(h.test_refs, i))),
       // A law's references are what it is a claim about.
-      ELaw(i) -> record(acc, at(index.laws, i).key, names_at(at(h.law_refs, i))),
+      LawEntry(i) -> record(acc, at(index.laws, i).key, names_at(at(h.law_refs, i))),
     }).out
 }
 
@@ -2542,8 +2653,8 @@ fn walked(
 // Every name the program declares that `keys` reach, and each of the keys the program knows: a
 // definition's or declaration's name reaches what each node of that name references, and a test's
 // or law's key what the item does.
-pub fn closure_of(h: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
-  let r = h.refs;
+pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> = {
+  let r = hashes.refs;
   let known = filter(keys, |k: Bytes| map_contains(r.starts, k));
   let from = fold(known, [], |acc: List<Int>, k: Bytes|
     append(acc, match map_get(r.starts, k) { Some(vs) -> vs, None -> [] }));
@@ -2555,8 +2666,8 @@ pub fn closure_of(h: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {abort
 }
 
 // Every name and key the program knows whose closure holds one of `names`.
-pub fn reaching(h: HashOutput, names: Map<Bytes, Bool>) -> Map<Bytes, Bool> / {abort.raise} = {
-  let r = h.refs;
+pub fn reaching(hashes: HashOutput, names: Map<Bytes, Bool>) -> Map<Bytes, Bool> = {
+  let r = hashes.refs;
   let n = len(r.names);
   // Each list is taken out of its slot before the push, so the push finds it unshared.
   let back = fold(range(0, n), map(range(0, n), |i: Int| []), |acc: List<List<Int>>, v: Int|
@@ -2595,13 +2706,13 @@ fn unused_over(
   let own = filter(range(0, n), |v: Int| is_root(index, at(index.nodes, v)));
   let tested = fold(index.tests, own, |acc: List<Int>, t: TestNode|
     append(
-      append(acc, refs_of(index, t.module, |z: Nz| test_def(z, t.def))),
+      append(acc, refs_of(index, t.module, |encoder: Encoder| test_def(encoder, t.def))),
       ret_refs(index, t.module, [t.def.body]),
     ));
   let roots = fold(index.laws, tested, |acc: List<Int>, l: LawNode| {
     let exprs = match l.def.guard { Some(g) -> [g, l.def.body], None -> [l.def.body] };
     append(
-      append(acc, refs_of(index, l.module, |z: Nz| law_def(z, l.def))),
+      append(acc, refs_of(index, l.module, |encoder: Encoder| law_def(encoder, l.def))),
       ret_refs(index, l.module, exprs),
     )
   });
@@ -2611,23 +2722,26 @@ fn unused_over(
     else { push(acc, never_used(at(index.nodes, v))) })
 }
 
-fn refs_of<| e>(index: Index, module: Int, encode: (Nz) -> Nz / e) -> List<Int> / e =
-  finish(encode(new_nz(index, module, map_new(), map_new(), map_new()))).refs
+fn refs_of<| e>(index: Index, module: Int, encode: (Encoder) -> Encoder / e) -> List<Int> / e =
+  finish(encode(new_encoder(index, module, map_new(), map_new(), map_new()))).refs
 
 // `own` is what normalizing the node alone references.
 fn node_edges(index: Index, node: Node, own: List<Int>) -> List<Int> / {abort.raise} =
   match node.body {
-    NFn(d) -> {
-      let clauses = fold(d.spec, own, |acc: List<Int>, c: SpecClause|
-        append(acc, refs_of(index, node.module, |z: Nz| spec_clause(z, d, c))));
-      let defaults = fold(d.params, [], |acc: List<Expr>, p: Param|
-        match p.default { Some(x) -> push(acc, x), None -> acc });
+    NodeFn(d) -> {
+      let clauses = fold(d.spec, own, |acc: List<Int>, clause: SpecClause|
+        append(
+          acc,
+          refs_of(index, node.module, |encoder: Encoder| spec_clause(encoder, d, clause)),
+        ));
+      let defaults = fold(d.params, [], |acc: List<Expr>, param: Param|
+        match param.default { Some(x) -> push(acc, x), None -> acc });
       append(
         clauses,
         ret_refs(
           index,
           node.module,
-          push(append(defaults, map(d.spec, |c: SpecClause| c.expr)), d.body),
+          push(append(defaults, map(d.spec, |clause: SpecClause| clause.expr)), d.body),
         ),
       )
     },
@@ -2635,12 +2749,12 @@ fn node_edges(index: Index, node: Node, own: List<Int>) -> List<Int> / {abort.ra
   }
 
 // The encoding leaves a lambda's written return type out, and a type named only there is still used.
-fn ret_refs(index: Index, module: Int, exprs: List<Expr>) -> List<Int> / {abort.raise} =
-  refs_of(index, module, |z: Nz|
+fn ret_refs(index: Index, module: Int, exprs: List<Expr>) -> List<Int> =
+  refs_of(index, module, |encoder: Encoder|
     fold(
-      fold(exprs, [], |acc: List<TypeExpr>, e: Expr| lambda_rets(e, acc)),
-      z,
-      |acc: Nz, t: TypeExpr| type_expr(acc, t),
+      fold(exprs, [], |acc: List<TypeExpr>, expr: Expr| lambda_rets(expr, acc)),
+      encoder,
+      |acc: Encoder, ty: TypeExpr| type_expr(acc, ty),
     ))
 
 fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
@@ -2692,24 +2806,24 @@ fn is_pub(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
 fn is_root(index: Index, node: Node) -> Bool / {abort.raise} =
   bytes_starts_with(node.simple, b"_")
     || (match node.body {
-      NFn(d) ->
+      NodeFn(d) ->
         is_pub(d.vis) || node.simple == b"main"
           || fold(at(index.mods, node.module).derived, false, |b: Bool, x: Derived|
             b || x.span == d.span),
-      NType(d) -> is_pub(d.vis),
-      NEffect(d) -> is_pub(d.vis),
+      NodeType(d) -> is_pub(d.vis),
+      NodeEffect(d) -> is_pub(d.vis),
     })
 
 fn never_used(node: Node) -> Diag = {
   let named: { kind: Bytes, span: Span } = match node.body {
-    NFn(d) -> { kind: b"fn", span: d.name.span },
-    NType(d) -> { kind: b"type", span: d.name.span },
-    NEffect(d) -> { kind: b"effect", span: d.name.span },
+    NodeFn(d) -> { kind: b"fn", span: d.name.span },
+    NodeType(d) -> { kind: b"type", span: d.name.span },
+    NodeEffect(d) -> { kind: b"effect", span: d.name.span },
   };
   {
     code: b"W0611",
     notes: 0,
-    labels: [lab(node.module, named.span, true, b"never used")],
+    labels: [label_at(node.module, named.span, true, b"never used")],
     text: b"",
     message: bytes_concat_all([named.kind, b" `", node.name, b"` is never used"]),
     notes_text: [],
@@ -2776,17 +2890,17 @@ pub fn hash_dump(sources: List<Source>) -> String / {abort.raise} = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
-    let x = expand(r.node, r.p.diags);
+    let x = expand(r.node, r.parser.diags);
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
   });
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-  let head = bytes_concat_all([b"K;", num(len(sources)), b";"]);
+  let head = bytes_concat_all([b"K;", int_to_bytes(len(sources)), b";"]);
   let body = if len(expansion) > 0 { bytes_concat(b"E;", dump_diags(expansion)) } else {
     match resolve_modules(mods) {
-      Failed(ds) -> bytes_concat(b"E;", dump_diags(ds)),
-      Resolved_(x) -> {
+      ResolveFailed(ds) -> bytes_concat(b"E;", dump_diags(ds)),
+      ResolveSucceeded(x) -> {
         let built = build_index(x.mods, x.r);
         if len(built.diags) > 0 { bytes_concat(b"E;", dump_diags(built.diags)) }
         else { dump_hashes(hash_index(built.index)) }
@@ -2814,31 +2928,31 @@ type Slot = { part: Int, class: Int }
 type Layout = { parts: List<Part>, by_hash: Map<Bytes, List<Slot>>, relink: Map<Bytes, Bytes> }
 // The import graph the print has laid down so far travels with the printer: a home is chosen
 // with it in view, so a reference never closes a cycle the source did not have.
-type Pr = { layout: Layout, part: Int, own: Bytes, graph: Map<Bytes, List<Bytes>> }
-type Dc = {
-  b: Bytes,
+type BodyPrinter = { layout: Layout, part: Int, own: Bytes, graph: Map<Bytes, List<Bytes>> }
+type Decoder = {
+  bytes: Bytes,
   pos: Int,
   values: Int,
-  typs: Int,
+  types: Int,
   rows: Int,
   labels: Int,
   imports: Map<Bytes, Bytes>,
   missing: Map<Bytes, Bool>,
   slots: Map<Bytes, Int>,
 }
-type Got = { d: Dc, t: Bytes }
-type Rd = { d: Dc, v: Int }
-type Flag = { d: Dc, v: Bool }
-type Opt = { d: Dc, t: Bytes, some: Bool }
-type Many = { d: Dc, ts: List<Bytes> }
-type Rf = { d: Dc, hash: Bytes, class: Int }
+type Decoded = { decoder: Decoder, text: Bytes }
+type DecodedInt = { decoder: Decoder, value: Int }
+type DecodedFlag = { decoder: Decoder, value: Bool }
+type DecodedOption = { decoder: Decoder, text: Bytes, some: Bool }
+type DecodedList = { decoder: Decoder, texts: List<Bytes> }
+type DecodedRef = { decoder: Decoder, hash: Bytes, class: Int }
 
-fn cursor(b: Bytes, missing: Map<Bytes, Bool>) -> Dc =
+fn cursor(b: Bytes, missing: Map<Bytes, Bool>) -> Decoder =
   {
-    b: b,
+    bytes: b,
     pos: 0,
     values: 0,
-    typs: 0,
+    types: 0,
     rows: 0,
     labels: 0,
     imports: map_new(),
@@ -2846,64 +2960,78 @@ fn cursor(b: Bytes, missing: Map<Bytes, Bool>) -> Dc =
     slots: map_new(),
   }
 
-fn rd_bytes(d: Dc, n: Int) -> Got / {abort.raise} =
-  if d.pos + n > bytes_len(d.b) { panic("a stored body ends inside a value") }
-  else { { d: { ..d, pos: d.pos + n }, t: bytes_slice(d.b, d.pos, d.pos + n) } }
+fn read_bytes(decoder: Decoder, n: Int) -> Decoded =
+  if decoder.pos + n > bytes_len(decoder.bytes) { panic("a stored body ends inside a value") }
+  else {
+    {
+      decoder: { ..decoder, pos: decoder.pos + n },
+      text: bytes_slice(decoder.bytes, decoder.pos, decoder.pos + n),
+    }
+  }
 
 fn le_int(b: Bytes) -> Int / {abort.raise} =
   fold(range(0, bytes_len(b)), 0, |a: Int, i: Int| a | bytes_at(b, i) << 8 * i)
 
-fn rd_int(d: Dc, n: Int) -> Rd / {abort.raise} = {
-  let g = rd_bytes(d, n);
-  { d: g.d, v: le_int(g.t) }
+fn read_int(decoder: Decoder, n: Int) -> DecodedInt = {
+  let g = read_bytes(decoder, n);
+  { decoder: g.decoder, value: le_int(g.text) }
 }
 
-fn rd_u8(d: Dc) -> Rd / {abort.raise} = rd_int(d, 1)
+fn read_u8(decoder: Decoder) -> DecodedInt = read_int(decoder, 1)
 
-fn rd_u32(d: Dc) -> Rd / {abort.raise} = rd_int(d, 4)
+fn read_u32(decoder: Decoder) -> DecodedInt = read_int(decoder, 4)
 
-fn rd_text(d: Dc) -> Got / {abort.raise} = {
-  let n = rd_u32(d);
-  rd_bytes(n.d, n.v)
+fn read_text(decoder: Decoder) -> Decoded = {
+  let n = read_u32(decoder);
+  read_bytes(n.decoder, n.value)
 }
 
-fn rd_bool(d: Dc) -> Flag / {abort.raise} = {
-  let r = rd_u8(d);
-  if r.v > 1 { panic("a byte that is not a boolean") } else { { d: r.d, v: r.v == 1 } }
+fn read_bool(decoder: Decoder) -> DecodedFlag = {
+  let r = read_u8(decoder);
+  if r.value > 1 { panic("a byte that is not a boolean") }
+  else { { decoder: r.decoder, value: r.value == 1 } }
 }
 
-fn peek(d: Dc) -> Int / {abort.raise} =
-  if d.pos < bytes_len(d.b) { bytes_at(d.b, d.pos) } else { 0 - 1 }
+fn peek(decoder: Decoder) -> Int =
+  if decoder.pos < bytes_len(decoder.bytes) { bytes_at(decoder.bytes, decoder.pos) } else { 0 - 1 }
 
-fn skip(d: Dc) -> Dc = { ..d, pos: d.pos + 1 }
+fn skip(decoder: Decoder) -> Decoder = { ..decoder, pos: decoder.pos + 1 }
 
-fn expect(d: Dc, want: Int, what: Bytes) -> Dc / {abort.raise} = {
-  let r = rd_u8(d);
-  if r.v == want { r.d }
-  else { panic(string_of_bytes(bytes_concat_all([b"expected ", what, b", found tag ", num(r.v)]))) }
+fn expect(decoder: Decoder, want: Int, what: Bytes) -> Decoder = {
+  let r = read_u8(decoder);
+  if r.value == want { r.decoder } else {
+    panic(
+      string_of_bytes(
+        bytes_concat_all([b"expected ", what, b", found tag ", int_to_bytes(r.value)]),
+      ),
+    )
+  }
 }
 
-fn rd_count(d: Dc) -> Rd / {abort.raise} = {
-  let r = rd_u32(d);
-  if r.v > bytes_len(r.d.b) - r.d.pos { panic("a count runs past the stored body") } else { r }
+fn read_count(decoder: Decoder) -> DecodedInt = {
+  let r = read_u32(decoder);
+  if r.value > bytes_len(r.decoder.bytes) - r.decoder.pos {
+    panic("a count runs past the stored body")
+  } else { r }
 }
 
-fn rd_binders(d: Dc) -> Rd / {abort.raise} = {
-  let r = rd_u32(d);
-  if r.v > 65535 { panic("a count of binders no definition declares") } else { r }
+fn read_binders(decoder: Decoder) -> DecodedInt = {
+  let r = read_u32(decoder);
+  if r.value > 65535 { panic("a count of binders no definition declares") } else { r }
 }
 
-fn rd_many<| e>(d: Dc, count: Int, f: (Dc) -> Got / e) -> Many / e =
-  fold(range(0, count), { d: d, ts: [] }, |s: Many, i: Int| {
-    let g = f(s.d);
-    { d: g.d, ts: push(s.ts, g.t) }
+fn read_many<| e>(decoder: Decoder, count: Int, f: (Decoder) -> Decoded / e) -> DecodedList / e =
+  fold(range(0, count), { decoder: decoder, texts: [] }, |decoded: DecodedList, i: Int| {
+    let g = f(decoded.decoder);
+    { decoder: g.decoder, texts: push(decoded.texts, g.text) }
   })
 
-fn rd_opt<| e>(d: Dc, f: (Dc) -> Got / e) -> Opt / {abort.raise | e} = {
-  let r = rd_u8(d);
-  if r.v == t_none() { { d: r.d, t: b"", some: false } } else if r.v == t_some() {
-    let g = f(r.d);
-    { d: g.d, t: g.t, some: true }
+fn read_opt<| e>(decoder: Decoder, f: (Decoder) -> Decoded / e) -> DecodedOption / {abort.raise | e} = {
+  let r = read_u8(decoder);
+  if r.value == tag_none() { { decoder: r.decoder, text: b"", some: false } }
+  else if r.value == tag_some() {
+    let g = f(r.decoder);
+    { decoder: g.decoder, text: g.text, some: true }
   } else { panic("a byte that is not an optional marker") }
 }
 
@@ -2912,46 +3040,48 @@ fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes / {abort.raise} =
     map(range(0, len(xs)), |i: Int| if i == 0 { at(xs, i) } else { bytes_concat(sep, at(xs, i)) }),
   )
 
-fn prefixed(o: Opt, before: Bytes) -> Bytes = if o.some { bytes_concat(before, o.t) } else { b"" }
+fn prefixed(decoded: DecodedOption, before: Bytes) -> Bytes =
+  if decoded.some { bytes_concat(before, decoded.text) } else { b"" }
 
-fn bracketed(o: Opt) -> Bytes = if o.some { bytes_concat_all([b"[", o.t, b"]"]) } else { b"" }
+fn bracketed(decoded: DecodedOption) -> Bytes =
+  if decoded.some { bytes_concat_all([b"[", decoded.text, b"]"]) } else { b"" }
 
-fn lname(level: Int) -> Bytes = bytes_concat(b"_l", num(level))
-fn tname(level: Int) -> Bytes = bytes_concat(b"_t", num(level))
-fn ename(level: Int) -> Bytes = bytes_concat(b"_e", num(level))
-fn rname(level: Int) -> Bytes = bytes_concat(b"_r", num(level))
+fn local_name(level: Int) -> Bytes = bytes_concat(b"_l", int_to_bytes(level))
+fn type_var_name(level: Int) -> Bytes = bytes_concat(b"_t", int_to_bytes(level))
+fn row_var_name(level: Int) -> Bytes = bytes_concat(b"_e", int_to_bytes(level))
+fn label_name(level: Int) -> Bytes = bytes_concat(b"_r", int_to_bytes(level))
 
-fn nl(depth: Int) -> Bytes =
+fn line_break(depth: Int) -> Bytes =
   bytes_concat(b"\n", bytes_concat_all(map(range(0, depth), |i: Int| b"  ")))
 
 fn zeros(k: Int) -> Bytes = bytes_concat_all(map(range(0, k), |i: Int| b"0"))
 
 fn short_hex(h: Bytes) -> Bytes / {abort.raise} = bytes_slice(hex(h), 0, 12)
 
-fn rd_ref(x: Pr, d: Dc) -> Rf / {abort.raise} = {
-  let t = rd_u8(d);
-  if t.v == t_ref_hash() {
-    let g: Got = rd_bytes(t.d, 32);
-    let h = match map_get(x.layout.relink, g.t) { Some(to) -> to, None -> g.t };
+fn read_ref(printer: BodyPrinter, decoder: Decoder) -> DecodedRef = {
+  let t = read_u8(decoder);
+  if t.value == tag_ref_hash() {
+    let g: Decoded = read_bytes(t.decoder, 32);
+    let h = match map_get(printer.layout.relink, g.text) { Some(to) -> to, None -> g.text };
     {
-      d: if map_contains(x.layout.by_hash, h) { g.d }
-      else { { ..g.d, missing: map_insert(g.d.missing, h, true) } },
+      decoder: if map_contains(printer.layout.by_hash, h) { g.decoder }
+      else { { ..g.decoder, missing: map_insert(g.decoder.missing, h, true) } },
       hash: h,
       class: 0 - 1,
     }
-  } else if t.v == t_ref_index() {
-    let c = rd_u32(t.d);
-    let hashes = if x.part < 0 { [] } else { at(x.layout.parts, x.part).hashes };
-    if c.v >= len(hashes) { panic("a reference to a member this component does not have") }
-    else { { d: c.d, hash: at(hashes, c.v), class: c.v } }
-  } else { panic(string_of_bytes(bytes_concat(b"a reference of tag ", num(t.v)))) }
+  } else if t.value == tag_ref_index() {
+    let c = read_u32(t.decoder);
+    let hashes = if printer.part < 0 { [] } else { at(printer.layout.parts, printer.part).hashes };
+    if c.value >= len(hashes) { panic("a reference to a member this component does not have") }
+    else { { decoder: c.decoder, hash: at(hashes, c.value), class: c.value } }
+  } else { panic(string_of_bytes(bytes_concat(b"a reference of tag ", int_to_bytes(t.value)))) }
 }
 
 // A name the module being printed may write: its own needs no export, a printed module is reprinted
 // `pub` throughout, and any other is reached as `binder::name`, which is what its own `pub` permits.
-fn nameable(l: Layout, s: Slot, own: Bytes) -> Bool / {abort.raise} = {
-  let p = at(l.parts, s.part);
-  p.module == own || p.printed || at(p.public, s.class)
+fn nameable(layout: Layout, slot: Slot, own: Bytes) -> Bool = {
+  let p = at(layout.parts, slot.part);
+  p.module == own || p.printed || at(p.public, slot.class)
 }
 
 // Two definitions alike are one body under two names, and only some of those names are in reach:
@@ -2966,7 +3096,7 @@ fn reaches(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes, seen: List<By
   }
 
 fn pick(
-  l: Layout,
+  layout: Layout,
   g: Map<Bytes, List<Bytes>>,
   mine: Map<Bytes, Bytes>,
   h: Bytes,
@@ -2978,18 +3108,18 @@ fn pick(
   // choice that is only worse is still better than a cycle.
   let edges = map_insert(g, own, map_keys(mine));
   let safe = |s: Slot| {
-    let p = at(l.parts, s.part);
+    let p = at(layout.parts, s.part);
     p.module == own || map_contains(mine, p.module) || !reaches(edges, p.module, own, [])
   };
   let score = |s: Slot| {
-    let p = at(l.parts, s.part);
+    let p = at(layout.parts, s.part);
     (if p.module == own { 0 } else { 4 }) + (if map_contains(mine, p.module) { 0 } else { 2 })
       + (if p.printed { 0 } else { 1 })
   };
-  match map_get(l.by_hash, h) {
+  match map_get(layout.by_hash, h) {
     None -> None,
     Some(found) -> {
-      let named = filter(found, |s: Slot| nameable(l, s, own));
+      let named = filter(found, |s: Slot| nameable(layout, s, own));
       let pool = match filter(named, safe) { [] -> named, homes -> homes };
       fold(pool, None, |best: Option<Slot>, s: Slot|
         match best { Some(b) -> if score(s) < score(b) { Some(s) } else { best }, None -> Some(s) })
@@ -2997,166 +3127,186 @@ fn pick(
   }
 }
 
-fn qname(x: Pr, r: Rf, ctor: Option<Bytes>) -> Got / {abort.raise} = {
-  let found = if r.class >= 0 { Some({ part: x.part, class: r.class }) }
-  else { pick(x.layout, x.graph, r.d.imports, r.hash, x.own) };
+fn qname(printer: BodyPrinter, decoded: DecodedRef, ctor: Option<Bytes>) -> Decoded = {
+  let found = if decoded.class >= 0 { Some({ part: printer.part, class: decoded.class }) }
+  else { pick(printer.layout, printer.graph, decoded.decoder.imports, decoded.hash, printer.own) };
   match found {
     // A body with no name this module may write is filed with the ones it has no body for: either
     // way the reference cannot be printed, and a refusal names it rather than a hex string standing
     // in for it.
     None ->
       {
-        d: { ..r.d, missing: map_insert(r.d.missing, r.hash, true) },
-        t: match ctor { Some(c) -> c, None -> short_hex(r.hash) },
+        decoder: {
+          ..decoded.decoder,
+          missing: map_insert(decoded.decoder.missing, decoded.hash, true),
+        },
+        text: match ctor { Some(c) -> c, None -> short_hex(decoded.hash) },
       },
     Some(s) -> {
-      let p = at(x.layout.parts, s.part);
+      let p = at(printer.layout.parts, s.part);
       let name = match ctor { Some(c) -> c, None -> at(p.names, s.class) };
-      if p.module == x.own { { d: r.d, t: name } } else {
+      if p.module == printer.own { { decoder: decoded.decoder, text: name } } else {
         {
-          d: { ..r.d, imports: map_insert(r.d.imports, p.module, p.binder) },
-          t: bytes_concat_all([p.binder, b"::", name]),
+          decoder: {
+            ..decoded.decoder,
+            imports: map_insert(decoded.decoder.imports, p.module, p.binder),
+          },
+          text: bytes_concat_all([p.binder, b"::", name]),
         }
       }
     },
   }
 }
 
-fn is_free(d: Dc) -> Bool / {abort.raise} = peek(d) == t_free() || peek(d) == t_free_qualified()
+fn is_free(decoder: Decoder) -> Bool =
+  peek(decoder) == tag_free() || peek(decoder) == tag_free_qualified()
 
-fn rd_free(d: Dc) -> Got / {abort.raise} = {
-  let t = rd_u8(d);
-  if t.v == t_free() { rd_text(t.d) } else if t.v == t_free_qualified() {
-    let m = rd_text(t.d);
-    let n = rd_text(m.d);
-    { d: n.d, t: bytes_concat_all([m.t, b"::", n.t]) }
+fn read_free(decoder: Decoder) -> Decoded = {
+  let t = read_u8(decoder);
+  if t.value == tag_free() { read_text(t.decoder) } else if t.value == tag_free_qualified() {
+    let m = read_text(t.decoder);
+    let n = read_text(m.decoder);
+    { decoder: n.decoder, text: bytes_concat_all([m.text, b"::", n.text]) }
   } else { panic("a tag that is not a free reference") }
 }
 
-fn rd_value(x: Pr, d: Dc) -> Got / {abort.raise} =
-  if peek(d) == t_local() {
-    let l = rd_u32(skip(d));
-    if l.v >= d.values { panic("a local that is not in scope") } else { { d: l.d, t: lname(l.v) } }
-  } else if peek(d) == t_ctor() { rd_ctor(x, d) }
-  else if is_free(d) { rd_free(d) }
-  else { qname(x, rd_ref(x, d), None) }
+fn read_value(printer: BodyPrinter, decoder: Decoder) -> Decoded =
+  if peek(decoder) == tag_local() {
+    let l = read_u32(skip(decoder));
+    if l.value >= decoder.values { panic("a local that is not in scope") }
+    else { { decoder: l.decoder, text: local_name(l.value) } }
+  } else if peek(decoder) == tag_ctor() { read_ctor(printer, decoder) }
+  else if is_free(decoder) { read_free(decoder) }
+  else { qname(printer, read_ref(printer, decoder), None) }
 
-fn rd_ctor(x: Pr, d: Dc) -> Got / {abort.raise} =
-  if peek(d) == t_ctor() {
-    let owner: Rf = rd_ref(x, skip(d));
-    let name = rd_text(owner.d);
-    qname(x, { ..owner, d: name.d }, Some(name.t))
-  } else { rd_free(d) }
+fn read_ctor(printer: BodyPrinter, decoder: Decoder) -> Decoded =
+  if peek(decoder) == tag_ctor() {
+    let owner: DecodedRef = read_ref(printer, skip(decoder));
+    let name = read_text(owner.decoder);
+    qname(printer, { ..owner, decoder: name.decoder }, Some(name.text))
+  } else { read_free(decoder) }
 
 // Two effects declared alike share a hash, and only the slot tells them apart.
-fn rd_effect(x: Pr, d: Dc) -> Got / {abort.raise} =
-  if is_free(d) { rd_free(d) } else {
-    let r: Rf = rd_ref(x, d);
-    let s: Rd = rd_u32(r.d);
-    match map_get(s.d.slots, r.hash) {
-      Some(was) -> if was != s.v {
+fn read_effect(printer: BodyPrinter, decoder: Decoder) -> Decoded =
+  if is_free(decoder) { read_free(decoder) } else {
+    let r: DecodedRef = read_ref(printer, decoder);
+    let s: DecodedInt = read_u32(r.decoder);
+    match map_get(s.decoder.slots, r.hash) {
+      Some(was) -> if was != s.value {
         panic(
           "two distinct effects share one declaration, which a hash-keyed body cannot tell apart",
         )
-      } else { qname(x, { ..r, d: s.d }, None) },
-      None -> qname(x, { ..r, d: { ..s.d, slots: map_insert(s.d.slots, r.hash, s.v) } }, None),
+      } else { qname(printer, { ..r, decoder: s.decoder }, None) },
+      None ->
+        qname(
+          printer,
+          { ..r, decoder: { ..s.decoder, slots: map_insert(s.decoder.slots, r.hash, s.value) } },
+          None,
+        ),
     }
   }
 
-fn p_type(x: Pr, d: Dc) -> Got / {abort.raise} = {
-  let t = rd_u8(d);
-  if t.v == t_ty_con() {
-    if peek(t.d) == t_ty_param() {
-      let l = rd_u32(skip(t.d));
-      let n = rd_u32(l.d);
-      if l.v >= d.typs || n.v != 0 { panic("a type parameter out of scope, or applied") }
-      else { { d: n.d, t: tname(l.v) } }
+fn print_type(printer: BodyPrinter, d: Decoder) -> Decoded = {
+  let t = read_u8(d);
+  if t.value == tag_ty_con() {
+    if peek(t.decoder) == tag_ty_param() {
+      let l = read_u32(skip(t.decoder));
+      let n = read_u32(l.decoder);
+      if l.value >= d.types || n.value != 0 { panic("a type parameter out of scope, or applied") }
+      else { { decoder: n.decoder, text: type_var_name(l.value) } }
     } else {
-      let name = if is_free(t.d) { rd_free(t.d) } else { qname(x, rd_ref(x, t.d), None) };
-      let n = rd_count(name.d);
-      let args = rd_many(n.d, n.v, |e: Dc| p_type(x, e));
+      let name = if is_free(t.decoder) { read_free(t.decoder) }
+      else { qname(printer, read_ref(printer, t.decoder), None) };
+      let n = read_count(name.decoder);
+      let args = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
       // A bare lowercase name reads back as a type variable, so it keeps an empty `<>`.
-      let bare = match bytes_index_of(name.t, b"::") { Some(_) -> false, None -> true };
+      let bare = match bytes_index_of(name.text, b"::") { Some(_) -> false, None -> true };
       {
-        d: args.d,
-        t: if n.v > 0 || (bare && !is_ctor_name(name.t)) {
-          bytes_concat_all([name.t, b"<", joined(args.ts, b", "), b">"])
-        } else { name.t },
+        decoder: args.decoder,
+        text: if n.value > 0 || (bare && !is_ctor_name(name.text)) {
+          bytes_concat_all([name.text, b"<", joined(args.texts, b", "), b">"])
+        } else { name.text },
       }
     }
-  } else if t.v == t_ty_fn() {
-    let n = rd_count(t.d);
-    let ps = rd_many(n.d, n.v, |e: Dc| p_type(x, e));
-    let ret = p_ret(x, ps.d);
-    let row = rd_opt(ret.d, |e: Dc| p_row(x, e));
+  } else if t.value == tag_ty_fn() {
+    let n = read_count(t.decoder);
+    let ps = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
+    let ret = print_ret(printer, ps.decoder);
+    let row = read_opt(ret.decoder, |e: Decoder| print_row(printer, e));
     {
-      d: row.d,
-      t: bytes_concat_all([b"(", joined(ps.ts, b", "), b") -> ", ret.t, prefixed(row, b" / ")]),
+      decoder: row.decoder,
+      text: bytes_concat_all([
+        b"(",
+        joined(ps.texts, b", "),
+        b") -> ",
+        ret.text,
+        prefixed(row, b" / "),
+      ]),
     }
-  } else if t.v == t_ty_record() {
-    let n = rd_count(t.d);
-    let fs = rd_many(n.d, n.v, |e: Dc| {
-      let f = rd_text(e);
-      let ty = p_type(x, f.d);
-      { d: ty.d, t: bytes_concat_all([f.t, b": ", ty.t]) }
+  } else if t.value == tag_ty_record() {
+    let n = read_count(t.decoder);
+    let fs = read_many(n.decoder, n.value, |e: Decoder| {
+      let f = read_text(e);
+      let ty = print_type(printer, f.decoder);
+      { decoder: ty.decoder, text: bytes_concat_all([f.text, b": ", ty.text]) }
     });
-    { d: fs.d, t: bytes_concat_all([b"{", joined(fs.ts, b", "), b"}"]) }
-  } else if t.v == t_ty_unit() { { d: t.d, t: b"()" } }
+    { decoder: fs.decoder, text: bytes_concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
+  } else if t.value == tag_ty_unit() { { decoder: t.decoder, text: b"()" } }
   else { panic("a tag that does not begin a type") }
 }
 
 // After `->` a function type is parenthesized, or a row after it would bind to the inner arrow.
-fn p_ret(x: Pr, d: Dc) -> Got / {abort.raise} =
-  if peek(d) == t_ty_fn() {
-    let g = p_type(x, d);
-    { d: g.d, t: bytes_concat_all([b"(", g.t, b")"]) }
-  } else { p_type(x, d) }
+fn print_ret(printer: BodyPrinter, decoder: Decoder) -> Decoded =
+  if peek(decoder) == tag_ty_fn() {
+    let g = print_type(printer, decoder);
+    { decoder: g.decoder, text: bytes_concat_all([b"(", g.text, b")"]) }
+  } else { print_type(printer, decoder) }
 
-fn rd_mode(d: Dc) -> Got / {abort.raise} = {
-  let m = rd_u8(d);
-  if m.v == 0 { { d: m.d, t: b"read" } }
-  else if m.v == 1 { { d: m.d, t: b"write" } }
+fn read_mode(decoder: Decoder) -> Decoded = {
+  let m = read_u8(decoder);
+  if m.value == 0 { { decoder: m.decoder, text: b"read" } }
+  else if m.value == 1 { { decoder: m.decoder, text: b"write" } }
   else { panic("a byte that is not an access mode") }
 }
 
-fn rd_label(d: Dc) -> Got / {abort.raise} = {
-  let k = rd_u8(d);
-  if k.v == t_label_param() {
-    let l = rd_u32(k.d);
-    if l.v >= d.labels { panic("a label parameter that is not in scope") }
-    else { { d: l.d, t: rname(l.v) } }
-  } else if k.v == t_free() { rd_text(k.d) }
+fn read_label(decoder: Decoder) -> Decoded = {
+  let k = read_u8(decoder);
+  if k.value == tag_label_param() {
+    let l = read_u32(k.decoder);
+    if l.value >= decoder.labels { panic("a label parameter that is not in scope") }
+    else { { decoder: l.decoder, text: label_name(l.value) } }
+  } else if k.value == tag_free() { read_text(k.decoder) }
   else { panic("a tag that is not a resource label") }
 }
 
-fn p_row(x: Pr, d: Dc) -> Got / {abort.raise} = {
-  let n = rd_count(expect(d, t_row(), b"an effect row"));
-  let atoms = rd_many(n.d, n.v, |e: Dc| {
-    if peek(e) == t_atom_op() {
-      let eff = rd_effect(x, expect(e, t_atom_op(), b"an operation atom"));
-      let op = rd_text(eff.d);
-      let r = rd_opt(op.d, rd_label);
-      { d: r.d, t: bytes_concat_all([eff.t, b".", op.t, bracketed(r)]) }
+fn print_row(printer: BodyPrinter, d: Decoder) -> Decoded = {
+  let n = read_count(expect(d, tag_row(), b"an effect row"));
+  let atoms = read_many(n.decoder, n.value, |e: Decoder| {
+    if peek(e) == tag_atom_op() {
+      let eff = read_effect(printer, expect(e, tag_atom_op(), b"an operation atom"));
+      let op = read_text(eff.decoder);
+      let r = read_opt(op.decoder, read_label);
+      { decoder: r.decoder, text: bytes_concat_all([eff.text, b".", op.text, bracketed(r)]) }
     } else {
-      let eff = rd_effect(x, expect(e, t_atom(), b"an effect atom"));
-      let m = rd_mode(eff.d);
-      let r = rd_opt(m.d, rd_label);
-      { d: r.d, t: bytes_concat_all([eff.t, b".", m.t, bracketed(r)]) }
+      let eff = read_effect(printer, expect(e, tag_atom(), b"an effect atom"));
+      let m = read_mode(eff.decoder);
+      let r = read_opt(m.decoder, read_label);
+      { decoder: r.decoder, text: bytes_concat_all([eff.text, b".", m.text, bracketed(r)]) }
     }
   });
-  let tail = rd_opt(atoms.d, |e: Dc| {
-    let k = rd_u8(e);
-    if k.v == t_row_param() {
-      let l = rd_u32(k.d);
-      if l.v >= e.rows { panic("a row parameter that is not in scope") }
-      else { { d: l.d, t: ename(l.v) } }
-    } else if k.v == t_free() { rd_text(k.d) }
+  let tail = read_opt(atoms.decoder, |e: Decoder| {
+    let k = read_u8(e);
+    if k.value == tag_row_param() {
+      let l = read_u32(k.decoder);
+      if l.value >= e.rows { panic("a row parameter that is not in scope") }
+      else { { decoder: l.decoder, text: row_var_name(l.value) } }
+    } else if k.value == tag_free() { read_text(k.decoder) }
     else { panic("a tag that is not a row tail") }
   });
   {
-    d: tail.d,
-    t: if n.v == 0 && tail.some { tail.t }
-    else { bytes_concat_all([b"{", joined(atoms.ts, b", "), prefixed(tail, b" | "), b"}"]) },
+    decoder: tail.decoder,
+    text: if n.value == 0 && tail.some { tail.text }
+    else { bytes_concat_all([b"{", joined(atoms.texts, b", "), prefixed(tail, b" | "), b"}"]) },
   }
 }
 
@@ -3204,14 +3354,14 @@ fn hex_int(v: Int, bits: Int) -> Bytes / {abort.raise} = {
 }
 
 // A negative literal is spelled as its bit pattern: `-5` would read back as a negation.
-fn int_text(v: Int) -> Bytes / {abort.raise} = if v >= 0 { num(v) } else { hex_int(v, 64) }
+fn int_text(v: Int) -> Bytes / {abort.raise} = if v >= 0 { int_to_bytes(v) } else { hex_int(v, 64) }
 
 fn fixed_text(which: Int, v: Int) -> Bytes / {abort.raise} =
   match list_at(widths(), which) {
     None -> panic("a byte that is not a fixed-width integer type"),
     Some(w) ->
       bytes_concat(
-        if v >= 0 { num(v) }
+        if v >= 0 { int_to_bytes(v) }
         else { hex_int(if w.bits == 64 { v } else { v & (1 << w.bits) - 1 }, w.bits) },
         w.name,
       ),
@@ -3258,7 +3408,7 @@ fn big_digits(n: List<Int>) -> Bytes / {abort.raise} = {
   let top = fold(range(0, len(n)), 0, |t: Int, i: Int| if at(n, i) != 0 { i } else { t });
   bytes_concat_all(
     map(range(0, top + 1), |j: Int| {
-      let d = num(at(n, top - j));
+      let d = int_to_bytes(at(n, top - j));
       if j == 0 { d } else { bytes_concat(zeros(9 - bytes_len(d)), d) }
     }),
   )
@@ -3296,12 +3446,12 @@ fn trim_zeros(s: Bytes) -> Bytes / {abort.raise} =
       if bytes_at(s, i) != 48 { i + 1 } else { acc }),
   )
 
-fn sci(s: Bytes, x: Int) -> Bytes / {abort.raise} =
+fn scientific(s: Bytes, x: Int) -> Bytes / {abort.raise} =
   bytes_concat_all([
     bytes_slice(s, 0, 1),
     if bytes_len(s) > 1 { bytes_concat(b".", bytes_slice(s, 1, bytes_len(s))) } else { b"" },
     b"e",
-    num(x),
+    int_to_bytes(x),
   ])
 
 fn round_to(ds: Bytes, x0: Int, p: Int) -> Rounded / {abort.raise} = {
@@ -3321,7 +3471,7 @@ fn round_to(ds: Bytes, x0: Int, p: Int) -> Rounded / {abort.raise} = {
 }
 
 fn reads_back(r: Rounded, mag: Int) -> Bool / {abort.raise} =
-  match float_of_string(string_of_bytes(sci(r.digits, r.exp))) {
+  match float_of_string(string_of_bytes(scientific(r.digits, r.exp))) {
     Some(f) -> bits_of_float(f) == mag,
     None -> false,
   }
@@ -3339,7 +3489,7 @@ fn float_spelling(r: Rounded) -> Bytes / {abort.raise} = {
   let positional = if r.exp >= n - 1 { bytes_concat(s, zeros(r.exp - n + 1)) } else if r.exp >= 0 {
     bytes_concat_all([bytes_slice(s, 0, r.exp + 1), b".", bytes_slice(s, r.exp + 1, n)])
   } else { bytes_concat_all([b"0.", zeros(0 - r.exp - 1), s]) };
-  let exponential = sci(s, r.exp);
+  let exponential = scientific(s, r.exp);
   let text = if bytes_len(exponential) < bytes_len(positional) { exponential } else { positional };
   match bytes_index_of(text, b".") {
     Some(_) -> text,
@@ -3364,90 +3514,90 @@ fn float_text(bits: Int) -> Bytes / {abort.raise} = {
   }
 }
 
-fn p_lit(d: Dc) -> Got / {abort.raise} = {
-  let t = rd_u8(d);
-  let e = t.d;
-  if t.v == t_lit_int() {
-    let v = rd_int(e, 8);
-    { d: v.d, t: int_text(v.v) }
-  } else if t.v == t_lit_bool() {
-    let b = rd_bool(e);
-    { d: b.d, t: if b.v { b"true" } else { b"false" } }
-  } else if t.v == t_lit_str() {
-    let s = rd_text(e);
-    { d: s.d, t: str_lit(s.t) }
-  } else if t.v == t_lit_bytes() {
-    let s = rd_text(e);
-    { d: s.d, t: bytes_lit(s.t) }
-  } else if t.v == t_lit_float() {
-    let v = rd_int(e, 8);
-    { d: v.d, t: float_text(v.v) }
-  } else if t.v == t_lit_decimal() {
-    let m = rd_bytes(e, 16);
-    let s = rd_u32(m.d);
-    { d: s.d, t: decimal_text(m.t, s.v) }
-  } else if t.v == t_lit_fixed() {
-    let w = rd_u8(e);
-    let v = rd_int(w.d, 8);
-    { d: v.d, t: fixed_text(w.v, v.v) }
-  } else if t.v == t_lit_wide() {
-    let w = rd_u8(e);
-    let high = rd_int(w.d, 8);
-    let low = rd_int(high.d, 8);
-    { d: low.d, t: wide_text(w.v, high.v, low.v) }
-  } else if t.v == t_lit_char() {
-    let v = rd_u32(e);
-    { d: v.d, t: char_lit(v.v) }
-  } else if t.v == t_lit_unit() { { d: e, t: b"()" } }
+fn print_lit(decoder: Decoder) -> Decoded = {
+  let t = read_u8(decoder);
+  let e = t.decoder;
+  if t.value == tag_lit_int() {
+    let v = read_int(e, 8);
+    { decoder: v.decoder, text: int_text(v.value) }
+  } else if t.value == tag_lit_bool() {
+    let b = read_bool(e);
+    { decoder: b.decoder, text: if b.value { b"true" } else { b"false" } }
+  } else if t.value == tag_lit_str() {
+    let s = read_text(e);
+    { decoder: s.decoder, text: str_lit(s.text) }
+  } else if t.value == tag_lit_bytes() {
+    let s = read_text(e);
+    { decoder: s.decoder, text: bytes_lit(s.text) }
+  } else if t.value == tag_lit_float() {
+    let v = read_int(e, 8);
+    { decoder: v.decoder, text: float_text(v.value) }
+  } else if t.value == tag_lit_decimal() {
+    let m = read_bytes(e, 16);
+    let s = read_u32(m.decoder);
+    { decoder: s.decoder, text: decimal_text(m.text, s.value) }
+  } else if t.value == tag_lit_fixed() {
+    let w = read_u8(e);
+    let v = read_int(w.decoder, 8);
+    { decoder: v.decoder, text: fixed_text(w.value, v.value) }
+  } else if t.value == tag_lit_wide() {
+    let w = read_u8(e);
+    let high = read_int(w.decoder, 8);
+    let low = read_int(high.decoder, 8);
+    { decoder: low.decoder, text: wide_text(w.value, high.value, low.value) }
+  } else if t.value == tag_lit_char() {
+    let v = read_u32(e);
+    { decoder: v.decoder, text: char_lit(v.value) }
+  } else if t.value == tag_lit_unit() { { decoder: e, text: b"()" } }
   else { panic("a tag that is not a literal") }
 }
 
-fn p_pat(x: Pr, d: Dc) -> Got / {abort.raise} = {
-  let t = rd_u8(d);
-  let e: Dc = t.d;
-  if t.v == t_p_wildcard() { { d: e, t: b"_" } }
-  else if t.v == t_p_var() { { d: { ..e, values: e.values + 1 }, t: lname(e.values) } }
-  else if t.v == t_p_lit() { p_lit(e) } else if t.v == t_p_ctor() {
-    let name = rd_ctor(x, e);
-    let n = rd_count(name.d);
-    let args = rd_many(n.d, n.v, |g: Dc| p_pat(x, g));
+fn print_pat(printer: BodyPrinter, d: Decoder) -> Decoded = {
+  let t = read_u8(d);
+  let e: Decoder = t.decoder;
+  if t.value == tag_p_wildcard() { { decoder: e, text: b"_" } } else if t.value == tag_p_var() {
+    { decoder: { ..e, values: e.values + 1 }, text: local_name(e.values) }
+  } else if t.value == tag_p_lit() { print_lit(e) } else if t.value == tag_p_ctor() {
+    let name = read_ctor(printer, e);
+    let n = read_count(name.decoder);
+    let args = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
     {
-      d: args.d,
-      t: if n.v == 0 { name.t }
-      else { bytes_concat_all([name.t, b"(", joined(args.ts, b", "), b")"]) },
+      decoder: args.decoder,
+      text: if n.value == 0 { name.text }
+      else { bytes_concat_all([name.text, b"(", joined(args.texts, b", "), b")"]) },
     }
-  } else if t.v == t_p_record() {
-    let n = rd_count(e);
-    let fs = rd_many(n.d, n.v, |g: Dc| {
-      let f = rd_text(g);
-      let p = p_pat(x, f.d);
-      { d: p.d, t: bytes_concat_all([f.t, b": ", p.t]) }
+  } else if t.value == tag_p_record() {
+    let n = read_count(e);
+    let fs = read_many(n.decoder, n.value, |g: Decoder| {
+      let f = read_text(g);
+      let p = print_pat(printer, f.decoder);
+      { decoder: p.decoder, text: bytes_concat_all([f.text, b": ", p.text]) }
     });
-    let rest = rd_bool(fs.d);
+    let rest = read_bool(fs.decoder);
     {
-      d: rest.d,
-      t: bytes_concat_all([
+      decoder: rest.decoder,
+      text: bytes_concat_all([
         b"{",
-        joined(fs.ts, b", "),
-        if !rest.v { b"" } else if n.v > 0 { b", .." } else { b".." },
+        joined(fs.texts, b", "),
+        if !rest.value { b"" } else if n.value > 0 { b", .." } else { b".." },
         b"}",
       ]),
     }
-  } else if t.v == t_p_list() {
-    let n = rd_count(e);
-    let items = rd_many(n.d, n.v, |g: Dc| p_pat(x, g));
-    let named = peek(skip(items.d)) == t_p_var();
-    let rest = rd_opt(items.d, |g: Dc| p_pat(x, g));
+  } else if t.value == tag_p_list() {
+    let n = read_count(e);
+    let items = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
+    let named = peek(skip(items.decoder)) == tag_p_var();
+    let rest = read_opt(items.decoder, |g: Decoder| print_pat(printer, g));
     {
-      d: rest.d,
-      t: bytes_concat_all([
+      decoder: rest.decoder,
+      text: bytes_concat_all([
         b"[",
-        joined(items.ts, b", "),
+        joined(items.texts, b", "),
         if !rest.some { b"" } else {
           bytes_concat_all([
-            if n.v > 0 { b", " } else { b"" },
+            if n.value > 0 { b", " } else { b"" },
             b"..",
-            if named { rest.t } else { b"" },
+            if named { rest.text } else { b"" },
           ])
         },
         b"]",
@@ -3456,27 +3606,32 @@ fn p_pat(x: Pr, d: Dc) -> Got / {abort.raise} = {
   } else { panic("a tag that does not begin a pattern") }
 }
 
-fn parens(g: Got, bare: Bool) -> Got =
-  if bare { g } else { { d: g.d, t: bytes_concat_all([b"(", g.t, b")"]) } }
+fn parens(decoded: Decoded, bare: Bool) -> Decoded =
+  if bare { decoded }
+  else { { decoder: decoded.decoder, text: bytes_concat_all([b"(", decoded.text, b")"]) } }
 
-fn is_atomic(d: Dc) -> Bool / {abort.raise} = {
-  let t = peek(d);
-  t == t_e_lit() || t == t_e_var() || t == t_e_app() || t == t_e_field() || t == t_e_list()
-    || t == t_e_perform()
+fn is_atomic(decoder: Decoder) -> Bool = {
+  let t = peek(decoder);
+  t == tag_e_lit() || t == tag_e_var() || t == tag_e_app() || t == tag_e_field()
+    || t == tag_e_list()
+    || t == tag_e_perform()
 }
 
-fn is_base(d: Dc) -> Bool / {abort.raise} = {
-  let t = peek(d);
-  t == t_e_var() || t == t_e_app() || t == t_e_field() || t == t_e_perform()
+fn is_base(decoder: Decoder) -> Bool = {
+  let t = peek(decoder);
+  t == tag_e_var() || t == tag_e_app() || t == tag_e_field() || t == tag_e_perform()
 }
 
-fn p_operand(x: Pr, d: Dc, depth: Int) -> Got / {abort.raise} =
-  parens(p_expr(x, d, depth), is_atomic(d))
+fn print_operand(printer: BodyPrinter, decoder: Decoder, depth: Int) -> Decoded =
+  parens(print_expr(printer, decoder, depth), is_atomic(decoder))
 
-fn p_block(x: Pr, d: Dc, depth: Int) -> Got / {abort.raise} =
-  if peek(d) == t_e_block() { p_expr(x, d, depth) } else {
-    let g = p_expr(x, d, depth + 1);
-    { d: g.d, t: bytes_concat_all([b"{", nl(depth + 1), g.t, nl(depth), b"}"]) }
+fn print_block(printer: BodyPrinter, decoder: Decoder, depth: Int) -> Decoded =
+  if peek(decoder) == tag_e_block() { print_expr(printer, decoder, depth) } else {
+    let g = print_expr(printer, decoder, depth + 1);
+    {
+      decoder: g.decoder,
+      text: bytes_concat_all([b"{", line_break(depth + 1), g.text, line_break(depth), b"}"]),
+    }
   }
 
 fn binop_text(op: Int) -> Bytes / {abort.raise} =
@@ -3516,416 +3671,465 @@ fn unop_text(op: Int) -> Bytes / {abort.raise} =
   else { panic("a byte that is not a unary operator") }
 
 // `if c { t }` is the parser's own spelling of an `else ()`.
-fn p_if(x: Pr, d: Dc, depth: Int) -> Got / {abort.raise} = {
-  let c = p_operand(x, d, depth);
-  let th = p_block(x, c.d, depth);
-  let el: Dc = th.d;
-  let tail: Got = if peek(el) == t_e_lit() && peek(skip(el)) == t_lit_unit() {
-    { d: { ..el, pos: el.pos + 2 }, t: b"" }
-  } else if peek(el) == t_e_if() {
-    let g = p_expr(x, el, depth);
-    { d: g.d, t: bytes_concat(b" else ", g.t) }
+fn print_if(printer: BodyPrinter, decoder: Decoder, depth: Int) -> Decoded = {
+  let c = print_operand(printer, decoder, depth);
+  let th = print_block(printer, c.decoder, depth);
+  let el: Decoder = th.decoder;
+  let tail: Decoded = if peek(el) == tag_e_lit() && peek(skip(el)) == tag_lit_unit() {
+    { decoder: { ..el, pos: el.pos + 2 }, text: b"" }
+  } else if peek(el) == tag_e_if() {
+    let g = print_expr(printer, el, depth);
+    { decoder: g.decoder, text: bytes_concat(b" else ", g.text) }
   } else {
-    let g = p_block(x, el, depth);
-    { d: g.d, t: bytes_concat(b" else ", g.t) }
+    let g = print_block(printer, el, depth);
+    { decoder: g.decoder, text: bytes_concat(b" else ", g.text) }
   };
-  { d: tail.d, t: bytes_concat_all([b"if ", c.t, b" ", th.t, tail.t]) }
+  { decoder: tail.decoder, text: bytes_concat_all([b"if ", c.text, b" ", th.text, tail.text]) }
 }
 
-fn p_expr(x: Pr, d: Dc, depth: Int) -> Got / {abort.raise} = {
-  let t = rd_u8(d);
-  let e = t.d;
+fn print_expr(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded = {
+  let t = read_u8(d);
+  let e = t.decoder;
   let inner = depth + 1;
-  if t.v == t_e_lit() { p_lit(e) }
-  else if t.v == t_e_var() { rd_value(x, e) } else if t.v == t_e_binary() {
-    let op = rd_u8(e);
-    let l = p_operand(x, op.d, depth);
-    let r = p_operand(x, l.d, depth);
-    { d: r.d, t: bytes_concat_all([l.t, b" ", binop_text(op.v), b" ", r.t]) }
-  } else if t.v == t_e_unary() {
-    let op = rd_u8(e);
-    let o = p_operand(x, op.d, depth);
-    { d: o.d, t: bytes_concat(unop_text(op.v), o.t) }
-  } else if t.v == t_e_lambda() {
-    let n = rd_count(e);
-    let anns: Many = rd_many(n.d, n.v, |g: Dc| {
-      let o = rd_opt(g, |h: Dc| p_type(x, h));
-      { d: o.d, t: prefixed(o, b": ") }
-    });
-    let base = anns.d.values;
-    let body: Got = p_expr(x, { ..anns.d, values: base + n.v }, depth);
-    let ps = map(range(0, n.v), |i: Int| bytes_concat(lname(base + i), at(anns.ts, i)));
+  if t.value == tag_e_lit() { print_lit(e) }
+  else if t.value == tag_e_var() { read_value(printer, e) } else if t.value == tag_e_binary() {
+    let op = read_u8(e);
+    let l = print_operand(printer, op.decoder, depth);
+    let r = print_operand(printer, l.decoder, depth);
     {
-      d: { ..body.d, values: base },
-      t: bytes_concat_all([
-        if n.v == 0 { b"||" } else { bytes_concat_all([b"|", joined(ps, b", "), b"|"]) },
+      decoder: r.decoder,
+      text: bytes_concat_all([l.text, b" ", binop_text(op.value), b" ", r.text]),
+    }
+  } else if t.value == tag_e_unary() {
+    let op = read_u8(e);
+    let o = print_operand(printer, op.decoder, depth);
+    { decoder: o.decoder, text: bytes_concat(unop_text(op.value), o.text) }
+  } else if t.value == tag_e_lambda() {
+    let n = read_count(e);
+    let anns: DecodedList = read_many(n.decoder, n.value, |g: Decoder| {
+      let o = read_opt(g, |h: Decoder| print_type(printer, h));
+      { decoder: o.decoder, text: prefixed(o, b": ") }
+    });
+    let base = anns.decoder.values;
+    let body: Decoded = print_expr(printer, { ..anns.decoder, values: base + n.value }, depth);
+    let ps = map(range(0, n.value), |i: Int| bytes_concat(local_name(base + i), at(anns.texts, i)));
+    {
+      decoder: { ..body.decoder, values: base },
+      text: bytes_concat_all([
+        if n.value == 0 { b"||" } else { bytes_concat_all([b"|", joined(ps, b", "), b"|"]) },
         b" ",
-        body.t,
+        body.text,
       ]),
     }
-  } else if t.v == t_e_app() {
+  } else if t.value == tag_e_app() {
     // `r.f(x)` performs an effect, so a call through anything but a name is parenthesized.
-    let f = parens(p_expr(x, e, depth), peek(e) == t_e_var());
-    let n = rd_count(f.d);
-    let args = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
-    let ln = rd_count(args.d);
-    let ls = rd_many(ln.d, ln.v, rd_label);
+    let f = parens(print_expr(printer, e, depth), peek(e) == tag_e_var());
+    let n = read_count(f.decoder);
+    let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+    let ln = read_count(args.decoder);
+    let ls = read_many(ln.decoder, ln.value, read_label);
     {
-      d: ls.d,
-      t: bytes_concat_all([
-        f.t,
-        if ln.v == 0 { b"" } else { bytes_concat_all([b"[", joined(ls.ts, b", "), b"]"]) },
+      decoder: ls.decoder,
+      text: bytes_concat_all([
+        f.text,
+        if ln.value == 0 { b"" } else { bytes_concat_all([b"[", joined(ls.texts, b", "), b"]"]) },
         b"(",
-        joined(args.ts, b", "),
+        joined(args.texts, b", "),
         b")",
       ]),
     }
-  } else if t.v == t_e_if() { p_if(x, e, depth) } else if t.v == t_e_match() {
-    let s = p_operand(x, e, depth);
-    let n = rd_count(s.d);
-    let arms = rd_many(n.d, n.v, |g: Dc| {
-      let p = p_pat(x, expect(g, t_arm(), b"a match arm"));
-      let guard = rd_opt(p.d, |h: Dc| p_expr(x, h, inner));
-      let body: Got = p_expr(x, guard.d, inner);
+  } else if t.value == tag_e_if() { print_if(printer, e, depth) } else if t.value == tag_e_match() {
+    let s = print_operand(printer, e, depth);
+    let n = read_count(s.decoder);
+    let arms = read_many(n.decoder, n.value, |g: Decoder| {
+      let p = print_pat(printer, expect(g, tag_arm(), b"a match arm"));
+      let guard = read_opt(p.decoder, |h: Decoder| print_expr(printer, h, inner));
+      let body: Decoded = print_expr(printer, guard.decoder, inner);
       {
-        d: { ..body.d, values: g.values },
-        t: bytes_concat_all([nl(inner), p.t, prefixed(guard, b" if "), b" -> ", body.t, b","]),
-      }
-    });
-    {
-      d: arms.d,
-      t: bytes_concat_all([b"match ", s.t, b" {", bytes_concat_all(arms.ts), nl(depth), b"}"]),
-    }
-  } else if t.v == t_e_block() {
-    let n = rd_count(e);
-    let stmts = rd_many(n.d, n.v, |g: Dc| {
-      let s = p_stmt(x, g, inner);
-      { d: s.d, t: bytes_concat(nl(inner), s.t) }
-    });
-    let tail: Opt = rd_opt(stmts.d, |g: Dc| p_expr(x, g, inner));
-    {
-      d: { ..tail.d, values: e.values },
-      t: bytes_concat_all([
-        b"{",
-        bytes_concat_all(stmts.ts),
-        prefixed(tail, nl(inner)),
-        nl(depth),
-        b"}",
-      ]),
-    }
-  } else if t.v == t_e_record() {
-    let n = rd_count(e);
-    let fs = rd_many(n.d, n.v, |g: Dc| {
-      let f = rd_text(g);
-      let v = p_expr(x, f.d, depth);
-      { d: v.d, t: bytes_concat_all([f.t, b": ", v.t]) }
-    });
-    { d: fs.d, t: bytes_concat_all([b"{", joined(fs.ts, b", "), b"}"]) }
-  } else if t.v == t_e_record_update() {
-    let b = p_expr(x, e, depth);
-    let n = rd_count(b.d);
-    let fs = rd_many(n.d, n.v, |g: Dc| {
-      let f = rd_text(g);
-      let v = p_expr(x, f.d, depth);
-      { d: v.d, t: bytes_concat_all([f.t, b": ", v.t]) }
-    });
-    {
-      d: fs.d,
-      t: bytes_concat_all([
-        b"{..",
-        b.t,
-        if n.v > 0 { b", " } else { b"" },
-        joined(fs.ts, b", "),
-        b"}",
-      ]),
-    }
-  } else if t.v == t_e_field() {
-    let b = parens(p_expr(x, e, depth), is_base(e));
-    let f = rd_text(b.d);
-    { d: f.d, t: bytes_concat_all([b.t, b".", f.t]) }
-  } else if t.v == t_e_list() {
-    let n = rd_count(e);
-    let items = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
-    { d: items.d, t: bytes_concat_all([b"[", joined(items.ts, b", "), b"]"]) }
-  } else if t.v == t_e_perform() {
-    let eff = rd_effect(x, e);
-    let op = rd_text(eff.d);
-    let r = rd_opt(op.d, rd_label);
-    let n = rd_count(r.d);
-    let args = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
-    {
-      d: args.d,
-      t: bytes_concat_all([eff.t, b".", op.t, bracketed(r), b"(", joined(args.ts, b", "), b")"]),
-    }
-  } else if t.v == t_e_handle() {
-    let body = p_expr(x, e, depth);
-    let n = rd_count(body.d);
-    let clauses = rd_many(n.d, n.v, |g: Dc| {
-      let eff = rd_effect(x, expect(g, t_clause(), b"a handler clause"));
-      let op = rd_text(eff.d);
-      let r = rd_opt(op.d, rd_label);
-      let k: Rd = rd_binders(r.d);
-      let bound = g.values + k.v;
-      let resumed: Opt = rd_opt({ ..k.d, values: bound }, |h: Dc|
-        { d: h, t: bytes_concat(b" resume ", lname(bound)) });
-      let cb: Got = p_expr(
-        x,
-        { ..resumed.d, values: if resumed.some { bound + 1 } else { bound } },
-        inner,
-      );
-      {
-        d: { ..cb.d, values: g.values },
-        t: bytes_concat_all([
-          nl(inner),
-          eff.t,
-          b".",
-          op.t,
-          bracketed(r),
-          b"(",
-          joined(map(range(0, k.v), |i: Int| lname(g.values + i)), b", "),
-          b")",
-          resumed.t,
+        decoder: { ..body.decoder, values: g.values },
+        text: bytes_concat_all([
+          line_break(inner),
+          p.text,
+          prefixed(guard, b" if "),
           b" -> ",
-          cb.t,
+          body.text,
           b",",
         ]),
       }
     });
-    let ret = rd_opt(clauses.d, |g: Dc| {
-      let h: Dc = expect(g, t_return_clause(), b"a return clause");
-      let rb: Got = p_expr(x, { ..h, values: g.values + 1 }, inner);
+    {
+      decoder: arms.decoder,
+      text: bytes_concat_all([
+        b"match ",
+        s.text,
+        b" {",
+        bytes_concat_all(arms.texts),
+        line_break(depth),
+        b"}",
+      ]),
+    }
+  } else if t.value == tag_e_block() {
+    let n = read_count(e);
+    let stmts = read_many(n.decoder, n.value, |g: Decoder| {
+      let s = print_stmt(printer, g, inner);
+      { decoder: s.decoder, text: bytes_concat(line_break(inner), s.text) }
+    });
+    let tail: DecodedOption = read_opt(stmts.decoder, |g: Decoder| print_expr(printer, g, inner));
+    {
+      decoder: { ..tail.decoder, values: e.values },
+      text: bytes_concat_all([
+        b"{",
+        bytes_concat_all(stmts.texts),
+        prefixed(tail, line_break(inner)),
+        line_break(depth),
+        b"}",
+      ]),
+    }
+  } else if t.value == tag_e_record() {
+    let n = read_count(e);
+    let fs = read_many(n.decoder, n.value, |g: Decoder| {
+      let f = read_text(g);
+      let v = print_expr(printer, f.decoder, depth);
+      { decoder: v.decoder, text: bytes_concat_all([f.text, b": ", v.text]) }
+    });
+    { decoder: fs.decoder, text: bytes_concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
+  } else if t.value == tag_e_record_update() {
+    let b = print_expr(printer, e, depth);
+    let n = read_count(b.decoder);
+    let fs = read_many(n.decoder, n.value, |g: Decoder| {
+      let f = read_text(g);
+      let v = print_expr(printer, f.decoder, depth);
+      { decoder: v.decoder, text: bytes_concat_all([f.text, b": ", v.text]) }
+    });
+    {
+      decoder: fs.decoder,
+      text: bytes_concat_all([
+        b"{..",
+        b.text,
+        if n.value > 0 { b", " } else { b"" },
+        joined(fs.texts, b", "),
+        b"}",
+      ]),
+    }
+  } else if t.value == tag_e_field() {
+    let b = parens(print_expr(printer, e, depth), is_base(e));
+    let f = read_text(b.decoder);
+    { decoder: f.decoder, text: bytes_concat_all([b.text, b".", f.text]) }
+  } else if t.value == tag_e_list() {
+    let n = read_count(e);
+    let items = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+    { decoder: items.decoder, text: bytes_concat_all([b"[", joined(items.texts, b", "), b"]"]) }
+  } else if t.value == tag_e_perform() {
+    let eff = read_effect(printer, e);
+    let op = read_text(eff.decoder);
+    let r = read_opt(op.decoder, read_label);
+    let n = read_count(r.decoder);
+    let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+    {
+      decoder: args.decoder,
+      text: bytes_concat_all([
+        eff.text,
+        b".",
+        op.text,
+        bracketed(r),
+        b"(",
+        joined(args.texts, b", "),
+        b")",
+      ]),
+    }
+  } else if t.value == tag_e_handle() {
+    let body = print_expr(printer, e, depth);
+    let n = read_count(body.decoder);
+    let clauses = read_many(n.decoder, n.value, |g: Decoder| {
+      let eff = read_effect(printer, expect(g, tag_clause(), b"a handler clause"));
+      let op = read_text(eff.decoder);
+      let r = read_opt(op.decoder, read_label);
+      let k: DecodedInt = read_binders(r.decoder);
+      let bound = g.values + k.value;
+      let resumed: DecodedOption = read_opt({ ..k.decoder, values: bound }, |h: Decoder|
+        { decoder: h, text: bytes_concat(b" resume ", local_name(bound)) });
+      let cb: Decoded = print_expr(
+        printer,
+        { ..resumed.decoder, values: if resumed.some { bound + 1 } else { bound } },
+        inner,
+      );
       {
-        d: { ..rb.d, values: g.values },
-        t: bytes_concat_all([nl(inner), b"return ", lname(g.values), b" -> ", rb.t, b","]),
+        decoder: { ..cb.decoder, values: g.values },
+        text: bytes_concat_all([
+          line_break(inner),
+          eff.text,
+          b".",
+          op.text,
+          bracketed(r),
+          b"(",
+          joined(map(range(0, k.value), |i: Int| local_name(g.values + i)), b", "),
+          b")",
+          resumed.text,
+          b" -> ",
+          cb.text,
+          b",",
+        ]),
+      }
+    });
+    let ret = read_opt(clauses.decoder, |g: Decoder| {
+      let h: Decoder = expect(g, tag_return_clause(), b"a return clause");
+      let rb: Decoded = print_expr(printer, { ..h, values: g.values + 1 }, inner);
+      {
+        decoder: { ..rb.decoder, values: g.values },
+        text: bytes_concat_all([
+          line_break(inner),
+          b"return ",
+          local_name(g.values),
+          b" -> ",
+          rb.text,
+          b",",
+        ]),
       }
     });
     {
-      d: ret.d,
-      t: bytes_concat_all([
+      decoder: ret.decoder,
+      text: bytes_concat_all([
         b"handle ",
-        body.t,
+        body.text,
         b" with {",
-        bytes_concat_all(clauses.ts),
-        ret.t,
-        nl(depth),
+        bytes_concat_all(clauses.texts),
+        ret.text,
+        line_break(depth),
         b"}",
       ]),
     }
-  } else if t.v == t_e_with_cell() {
-    let r = rd_text(e);
-    let init: Got = p_expr(x, r.d, depth);
-    let at_ = init.d.values;
-    let body: Got = p_expr(x, { ..init.d, values: at_ + 1 }, inner);
+  } else if t.value == tag_e_with_cell() {
+    let r = read_text(e);
+    let init: Decoded = print_expr(printer, r.decoder, depth);
+    let at_ = init.decoder.values;
+    let body: Decoded = print_expr(printer, { ..init.decoder, values: at_ + 1 }, inner);
     {
-      d: { ..body.d, values: at_ },
-      t: bytes_concat_all([
+      decoder: { ..body.decoder, values: at_ },
+      text: bytes_concat_all([
         b"with_cell[",
-        r.t,
+        r.text,
         b"](",
-        init.t,
+        init.text,
         b") {",
-        nl(inner),
-        lname(at_),
+        line_break(inner),
+        local_name(at_),
         b" -> ",
-        body.t,
-        nl(depth),
+        body.text,
+        line_break(depth),
         b"}",
       ]),
     }
-  } else if t.v == t_e_simulate() {
-    let body = p_block(x, e, depth);
-    { d: body.d, t: bytes_concat(b"simulate ", body.t) }
-  } else if t.v == t_e_parallel() {
-    let n = rd_count(e);
-    let branches = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
-    { d: branches.d, t: bytes_concat_all([b"parallel { ", joined(branches.ts, b", "), b" }"]) }
+  } else if t.value == tag_e_simulate() {
+    let body = print_block(printer, e, depth);
+    { decoder: body.decoder, text: bytes_concat(b"simulate ", body.text) }
+  } else if t.value == tag_e_parallel() {
+    let n = read_count(e);
+    let branches = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+    {
+      decoder: branches.decoder,
+      text: bytes_concat_all([b"parallel { ", joined(branches.texts, b", "), b" }"]),
+    }
   } else {
-    panic(string_of_bytes(bytes_concat(b"a tag that does not begin an expression: ", num(t.v))))
+    panic(
+      string_of_bytes(
+        bytes_concat(b"a tag that does not begin an expression: ", int_to_bytes(t.value)),
+      ),
+    )
   }
 }
 
-fn p_stmt(x: Pr, d: Dc, depth: Int) -> Got / {abort.raise} = {
-  let t = rd_u8(d);
-  if t.v == t_s_let() {
-    let ty = rd_opt(t.d, |g: Dc| p_type(x, g));
-    let v = p_expr(x, ty.d, depth);
-    let p = p_pat(x, v.d);
-    { d: p.d, t: bytes_concat_all([b"let ", p.t, prefixed(ty, b": "), b" = ", v.t, b";"]) }
-  } else if t.v == t_s_expr() {
-    let g = p_expr(x, t.d, depth);
-    { d: g.d, t: bytes_concat(g.t, b";") }
+fn print_stmt(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded = {
+  let t = read_u8(d);
+  if t.value == tag_s_let() {
+    let ty = read_opt(t.decoder, |g: Decoder| print_type(printer, g));
+    let v = print_expr(printer, ty.decoder, depth);
+    let p = print_pat(printer, v.decoder);
+    {
+      decoder: p.decoder,
+      text: bytes_concat_all([b"let ", p.text, prefixed(ty, b": "), b" = ", v.text, b";"]),
+    }
+  } else if t.value == tag_s_expr() {
+    let g = print_expr(printer, t.decoder, depth);
+    { decoder: g.decoder, text: bytes_concat(g.text, b";") }
   } else { panic("a tag that does not begin a statement") }
 }
 
-fn p_param_slot(x: Pr, d: Dc) -> Got / {abort.raise} = {
-  let t = rd_u8(d);
-  if t.v == t_none() { { d: t.d, t: b"" } } else if t.v == t_some() {
-    let ty = p_type(x, t.d);
-    { d: ty.d, t: bytes_concat(b": ", ty.t) }
-  } else if t.v == t_param_default() {
-    let ty = rd_opt(t.d, |g: Dc| p_type(x, g));
-    let v = p_expr(x, ty.d, 0);
-    { d: v.d, t: bytes_concat_all([prefixed(ty, b": "), b" = ", v.t]) }
+fn print_param_slot(printer: BodyPrinter, d: Decoder) -> Decoded = {
+  let t = read_u8(d);
+  if t.value == tag_none() { { decoder: t.decoder, text: b"" } } else if t.value == tag_some() {
+    let ty = print_type(printer, t.decoder);
+    { decoder: ty.decoder, text: bytes_concat(b": ", ty.text) }
+  } else if t.value == tag_param_default() {
+    let ty = read_opt(t.decoder, |g: Decoder| print_type(printer, g));
+    let v = print_expr(printer, ty.decoder, 0);
+    { decoder: v.decoder, text: bytes_concat_all([prefixed(ty, b": "), b" = ", v.text]) }
   } else { panic("a tag that does not open a parameter") }
 }
 
-fn p_constraint(d: Dc) -> Got / {abort.raise} = {
-  let l = rd_u32(expect(d, t_constraint(), b"a constraint"));
-  let k = rd_u8(l.d);
-  match fold(constraint_kinds(), None, |acc: Option<Deriver>, x: Deriver|
-      if deriver_byte(x) == k.v { Some(x) } else { acc }) {
-    Some(d) -> { d: k.d, t: constraint_written(d, tname(l.v)) },
+fn print_constraint(d: Decoder) -> Decoded / {abort.raise} = {
+  let l = read_u32(expect(d, tag_constraint(), b"a constraint"));
+  let k = read_u8(l.decoder);
+  match fold(constraint_kinds(), None, |acc: Option<Deriver>, deriver: Deriver|
+      if deriver_byte(deriver) == k.value { Some(deriver) } else { acc }) {
+    Some(d) -> { decoder: k.decoder, text: constraint_written(d, type_var_name(l.value)) },
     None -> panic("a byte that is not a deriver"),
   }
 }
 
-fn p_fn(x: Pr, d: Dc, name: Bytes) -> Got / {abort.raise} = {
-  let tc = rd_binders(expect(d, t_fn(), b"a function"));
-  let ec: Rd = rd_binders(tc.d);
-  let lc: Rd = rd_binders(ec.d);
-  let generics = if tc.v == 0 && ec.v == 0 && lc.v == 0 { b"" } else {
+fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded = {
+  let tc = read_binders(expect(d, tag_fn(), b"a function"));
+  let ec: DecodedInt = read_binders(tc.decoder);
+  let lc: DecodedInt = read_binders(ec.decoder);
+  let generics = if tc.value == 0 && ec.value == 0 && lc.value == 0 { b"" } else {
     bytes_concat_all([
       b"<",
       joined(
         append(
-          map(range(0, tc.v), tname),
-          map(range(0, lc.v), |i: Int| bytes_concat_all([b"[", rname(i), b"]"])),
+          map(range(0, tc.value), type_var_name),
+          map(range(0, lc.value), |i: Int| bytes_concat_all([b"[", label_name(i), b"]"])),
         ),
         b", ",
       ),
-      if ec.v > 0 { bytes_concat(b" | ", joined(map(range(0, ec.v), ename), b", ")) } else { b"" },
+      if ec.value > 0 { bytes_concat(b" | ", joined(map(range(0, ec.value), row_var_name), b", ")) }
+      else { b"" },
       b">",
     ])
   };
-  let n = rd_count({ ..lc.d, typs: tc.v, rows: ec.v, labels: lc.v });
-  let ps = rd_many(n.d, n.v, |g: Dc| p_param_slot(x, g));
-  let ret = rd_opt(ps.d, |g: Dc| p_ret(x, g));
-  let row = rd_opt(ret.d, |g: Dc| p_row(x, g));
-  let cs = rd_count(row.d);
-  let derives: Many = rd_many(cs.d, cs.v, p_constraint);
-  let body = p_expr(x, { ..derives.d, values: n.v }, 0);
+  let n = read_count({ ..lc.decoder, types: tc.value, rows: ec.value, labels: lc.value });
+  let ps = read_many(n.decoder, n.value, |g: Decoder| print_param_slot(printer, g));
+  let ret = read_opt(ps.decoder, |g: Decoder| print_ret(printer, g));
+  let row = read_opt(ret.decoder, |g: Decoder| print_row(printer, g));
+  let cs = read_count(row.decoder);
+  let derives: DecodedList = read_many(cs.decoder, cs.value, print_constraint);
+  let body = print_expr(printer, { ..derives.decoder, values: n.value }, 0);
   {
-    d: body.d,
-    t: bytes_concat_all([
+    decoder: body.decoder,
+    text: bytes_concat_all([
       b"fn ",
       name,
       generics,
       b"(",
-      joined(map(range(0, n.v), |i: Int| bytes_concat(lname(i), at(ps.ts, i))), b", "),
+      joined(map(range(0, n.value), |i: Int| bytes_concat(local_name(i), at(ps.texts, i))), b", "),
       b")",
       prefixed(ret, b" -> "),
       prefixed(row, b" / "),
-      if cs.v > 0 { bytes_concat(b" where ", joined(derives.ts, b", ")) } else { b"" },
+      if cs.value > 0 { bytes_concat(b" where ", joined(derives.texts, b", ")) } else { b"" },
       b" =\n  ",
-      body.t,
+      body.text,
     ]),
   }
 }
 
-fn type_binders(count: Int) -> Bytes / {abort.raise} =
-  if count > 0 { bytes_concat_all([b"<", joined(map(range(0, count), tname), b", "), b">"]) }
-  else { b"" }
+fn type_binders(count: Int) -> Bytes =
+  if count > 0 {
+    bytes_concat_all([b"<", joined(map(range(0, count), type_var_name), b", "), b">"])
+  } else { b"" }
 
-fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got / {abort.raise} = {
-  let n: Rd = rd_binders(expect(d, t_type(), b"a type"));
-  let k = rd_u8({ ..n.d, typs: n.v });
+fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded = {
+  let n: DecodedInt = read_binders(expect(d, tag_type(), b"a type"));
+  let k = read_u8({ ..n.decoder, types: n.value });
   // Every variant keeps its `|`: a single-variant sum without one reads as an alias.
-  let body: Got = if k.v == t_type_alias() { p_type(x, k.d) } else if k.v == t_type_sum() {
+  let body: Decoded = if k.value == tag_type_alias() { print_type(printer, k.decoder) }
+  else if k.value == tag_type_sum() {
     // The encoding carries the name the declaring program wrote; this printing uses the one it
     // was asked for, which a relink may have changed.
-    let declared = rd_text(k.d);
-    let vn = rd_count(declared.d);
-    let vs = rd_many(vn.d, vn.v, |g: Dc| {
-      let vname = rd_text(expect(g, t_variant(), b"a variant"));
-      let fc = rd_count(vname.d);
-      let fs = rd_many(fc.d, fc.v, |h: Dc| p_type(x, h));
+    let declared = read_text(k.decoder);
+    let vn = read_count(declared.decoder);
+    let vs = read_many(vn.decoder, vn.value, |g: Decoder| {
+      let vname = read_text(expect(g, tag_variant(), b"a variant"));
+      let fc = read_count(vname.decoder);
+      let fs = read_many(fc.decoder, fc.value, |h: Decoder| print_type(printer, h));
       {
-        d: fs.d,
-        t: bytes_concat_all([
+        decoder: fs.decoder,
+        text: bytes_concat_all([
           b"| ",
-          vname.t,
-          if fc.v > 0 { bytes_concat_all([b"(", joined(fs.ts, b", "), b")"]) } else { b"" },
+          vname.text,
+          if fc.value > 0 { bytes_concat_all([b"(", joined(fs.texts, b", "), b")"]) } else { b"" },
           b" ",
         ]),
       }
     });
-    { d: vs.d, t: bytes_concat_all(vs.ts) }
+    { decoder: vs.decoder, text: bytes_concat_all(vs.texts) }
   } else { panic("a tag that does not begin a type body") };
-  { d: body.d, t: bytes_concat_all([b"type ", name, type_binders(n.v), b" = ", body.t]) }
+  {
+    decoder: body.decoder,
+    text: bytes_concat_all([b"type ", name, type_binders(n.value), b" = ", body.text]),
+  }
 }
 
-fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got / {abort.raise} = {
+fn print_effect(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded = {
   // The encoding carries the name the declaring program wrote; this printing uses the one it was
   // asked for, which a relink may have changed.
-  let declared = rd_text(expect(d, t_effect(), b"an effect"));
-  let nd = rd_bool(declared.d);
-  let n = rd_count(nd.d);
-  let ops = rd_many(n.d, n.v, |g: Dc| {
-    let op = rd_text(expect(g, t_op(), b"an operation"));
-    let m = rd_mode(op.d);
-    let r = rd_bool(m.d);
-    let tc = rd_binders(r.d);
-    let pc = rd_count({ ..tc.d, typs: tc.v });
-    let ps = rd_many(pc.d, pc.v, |h: Dc| p_type(x, h));
-    let ret = p_type(x, ps.d);
+  let declared = read_text(expect(d, tag_effect(), b"an effect"));
+  let nd = read_bool(declared.decoder);
+  let n = read_count(nd.decoder);
+  let ops = read_many(n.decoder, n.value, |g: Decoder| {
+    let op = read_text(expect(g, tag_op(), b"an operation"));
+    let m = read_mode(op.decoder);
+    let r = read_bool(m.decoder);
+    let tc = read_binders(r.decoder);
+    let pc = read_count({ ..tc.decoder, types: tc.value });
+    let ps = read_many(pc.decoder, pc.value, |h: Decoder| print_type(printer, h));
+    let ret = print_type(printer, ps.decoder);
     {
-      d: { ..ret.d, typs: g.typs },
-      t: bytes_concat_all([
-        nl(1),
-        m.t,
+      decoder: { ..ret.decoder, types: g.types },
+      text: bytes_concat_all([
+        line_break(1),
+        m.text,
         b" ",
-        op.t,
-        if r.v { b"[r]" } else { b"" },
-        type_binders(tc.v),
+        op.text,
+        if r.value { b"[r]" } else { b"" },
+        type_binders(tc.value),
         b"(",
-        joined(ps.ts, b", "),
+        joined(ps.texts, b", "),
         b") -> ",
-        ret.t,
+        ret.text,
       ]),
     }
   });
   {
-    d: ops.d,
-    t: bytes_concat_all([
-      if nd.v { b"nondet " } else { b"" },
+    decoder: ops.decoder,
+    text: bytes_concat_all([
+      if nd.value { b"nondet " } else { b"" },
       b"effect ",
       name,
       b" {",
-      bytes_concat_all(ops.ts),
+      bytes_concat_all(ops.texts),
       b"\n}",
     ]),
   }
 }
 
 // Everything is `pub`: visibility is metadata the encoding erased.
-fn p_item(x: Pr, d: Dc, name: Bytes) -> Got / {abort.raise} = {
-  let t = peek(d);
-  let g = if t == t_fn() { p_fn(x, d, name) }
-  else if t == t_type() { p_type_def(x, d, name) }
-  else if t == t_effect() { p_effect(x, d, name) }
+fn print_item(printer: BodyPrinter, decoder: Decoder, name: Bytes) -> Decoded = {
+  let t = peek(decoder);
+  let g = if t == tag_fn() { print_fn(printer, decoder, name) }
+  else if t == tag_type() { print_type_def(printer, decoder, name) }
+  else if t == tag_effect() { print_effect(printer, decoder, name) }
   else { panic("a tag that does not begin a definition") };
-  if g.d.pos != bytes_len(g.d.b) { panic("bytes remain after the definition") }
-  else { { d: g.d, t: bytes_concat(b"pub ", g.t) } }
+  if g.decoder.pos != bytes_len(g.decoder.bytes) { panic("bytes remain after the definition") }
+  else { { decoder: g.decoder, text: bytes_concat(b"pub ", g.text) } }
 }
 
-fn p_test(x: Pr, d: Dc, label: Bytes) -> Got / {abort.raise} = {
-  let nd = rd_bool(expect(d, t_test(), b"a test"));
-  let body = p_block(x, nd.d, 0);
-  if body.d.pos != bytes_len(body.d.b) { panic("bytes remain after the test") } else {
+fn print_test(printer: BodyPrinter, decoder: Decoder, label: Bytes) -> Decoded = {
+  let nd = read_bool(expect(decoder, tag_test(), b"a test"));
+  let body = print_block(printer, nd.decoder, 0);
+  if body.decoder.pos != bytes_len(body.decoder.bytes) { panic("bytes remain after the test") }
+  else {
     {
-      d: body.d,
-      t: bytes_concat_all([
-        if nd.v { b"test/nondet " } else { b"test " },
+      decoder: body.decoder,
+      text: bytes_concat_all([
+        if nd.value { b"test/nondet " } else { b"test " },
         str_lit(label),
         b" ",
-        body.t,
+        body.text,
       ]),
     }
   }
 }
 
 type Named = { module: Bytes, simple: Bytes, public: Bool }
-type Comp = { members: List<Bytes>, hashes: List<Bytes>, id: Bytes, key: Bytes }
+type Component = { members: List<Bytes>, hashes: List<Bytes>, id: Bytes, key: Bytes }
 type Copied = { module: Bytes, names: List<Bytes>, public: List<Bool> }
 type Parting = {
   seen: Map<Bytes, Bool>,
@@ -3938,25 +4142,26 @@ type Sheet = { items: List<Bytes>, imports: Map<Bytes, Bytes> }
 fn refuse(message: Bytes, notes: List<Bytes>) -> Option<Refusal> =
   Some({ message: message, notes: notes })
 
-fn comp_of(body: Bytes) -> Comp / {abort.raise} = {
-  let k = rd_u8(cursor(body, map_new()));
-  if k.v == 0 {
+fn comp_of(body: Bytes) -> Component = {
+  let k = read_u8(cursor(body, map_new()));
+  if k.value == 0 {
     let payload = bytes_slice(body, 1, bytes_len(body));
     let id = blake3(payload);
     { members: [payload], hashes: [id], id: id, key: id }
-  } else if k.v == 1 {
-    let class = rd_u32(k.d);
+  } else if k.value == 1 {
+    let class = read_u32(k.decoder);
     let payload = bytes_slice(body, 5, bytes_len(body));
-    let c = rd_count(cursor(payload, map_new()));
-    let ms = rd_many(c.d, c.v, rd_text);
-    if ms.d.pos != bytes_len(payload) || class.v >= c.v { panic("a malformed component body") }
-    else {
+    let c = read_count(cursor(payload, map_new()));
+    let ms = read_many(c.decoder, c.value, read_text);
+    if ms.decoder.pos != bytes_len(payload) || class.value >= c.value {
+      panic("a malformed component body")
+    } else {
       let id = blake3(payload);
       {
-        members: ms.ts,
-        hashes: map(range(0, c.v), |i: Int| member_hash(id, i)),
+        members: ms.texts,
+        hashes: map(range(0, c.value), |i: Int| member_hash(id, i)),
         id: id,
-        key: member_hash(id, class.v),
+        key: member_hash(id, class.value),
       }
     }
   } else { panic("a stored body of a kind this build does not read") }
@@ -4040,19 +4245,19 @@ fn copies(classes: List<List<Named>>) -> Option<List<Copied>> / {abort.raise} =
 
 fn part_in(
   acc: Parting,
-  c: Comp,
+  component: Component,
   named: Map<Bytes, Map<Bytes, Named>>,
   shipped: List<Bytes>,
-) -> Parting / {abort.raise} = {
-  let classes = map(c.hashes, |h: Bytes|
+) -> Parting = {
+  let classes = map(component.hashes, |h: Bytes|
     match map_get(named, h) { Some(m) -> map_values(m), None -> [] });
-  let checked: Parting = fold(range(0, len(c.hashes)), acc, |a: Parting, i: Int|
+  let checked: Parting = fold(range(0, len(component.hashes)), acc, |a: Parting, i: Int|
     match a.bad {
       Some(_) -> a,
       None -> {
         let all = at(classes, i);
-        let h = at(c.hashes, i);
-        let kind = bytes_at(at(c.members, i), 0);
+        let h = at(component.hashes, i);
+        let kind = bytes_at(at(component.members, i), 0);
         if len(all) == 0 {
           {
             ..a,
@@ -4061,7 +4266,7 @@ fn part_in(
         }
         // Two modules declaring one effect alike declare one effect, so a body performing it cannot
         // be printed back under a name: either module's would be a different claim about what it does.
-        else if kind == t_effect() && len(all) > 1 {
+        else if kind == tag_effect() && len(all) > 1 {
           {
             ..a,
             bad: refuse(
@@ -4109,8 +4314,8 @@ fn part_in(
           ..checked,
           parts: fold(cs, checked.parts, |ps: List<Part>, cp: Copied|
             push(ps, {
-              members: c.members,
-              hashes: c.hashes,
+              members: component.members,
+              hashes: component.hashes,
               names: cp.names,
               public: cp.public,
               module: cp.module,
@@ -4150,7 +4355,10 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
           2 * len(modules) + 2,
           |t: { n: Int, binder: Bytes }|
             if map_contains(s.taken, t.binder) {
-              Continue({ n: t.n + 1, binder: bytes_concat_all([base, b"_", num(t.n + 1)]) })
+              Continue({
+                n: t.n + 1,
+                binder: bytes_concat_all([base, b"_", int_to_bytes(t.n + 1)]),
+              })
             } else { Stop(t) },
         );
         { taken: map_insert(s.taken, found.binder, true), out: map_insert(s.out, m, found.binder) }
@@ -4163,11 +4371,12 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
 fn layout_of(parts: List<Part>, relink: Map<Bytes, Bytes>) -> Layout / {abort.raise} = {
   let bound = binders(
     map_keys(
-      fold(parts, map_new(), |acc: Map<Bytes, Bool>, p: Part| map_insert(acc, p.module, true)),
+      fold(parts, map_new(), |acc: Map<Bytes, Bool>, part: Part|
+        map_insert(acc, part.module, true)),
     ),
   );
-  let placed = map(parts, |p: Part|
-    { ..p, binder: match map_get(bound, p.module) { Some(b) -> b, None -> p.binder } });
+  let placed = map(parts, |part: Part|
+    { ..part, binder: match map_get(bound, part.module) { Some(b) -> b, None -> part.binder } });
   {
     parts: placed,
     by_hash: fold(range(0, len(placed)), map_new(), |acc: Map<Bytes, List<Slot>>, u: Int| {
@@ -4187,38 +4396,46 @@ fn layout_of(parts: List<Part>, relink: Map<Bytes, Bytes>) -> Layout / {abort.ra
 }
 
 fn print_parts(
-  l: Layout,
-) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> } / {abort.raise} =
+  layout: Layout,
+) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> } =
   fold(
-    range(0, len(l.parts)),
+    range(0, len(layout.parts)),
     { modules: map_new(), missing: map_new(), graph: map_new() },
     |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
-      let p = at(l.parts, u);
+      let p = at(layout.parts, u);
       if !p.printed { acc } else {
-        let x = { layout: l, part: u, own: p.module, graph: acc.graph };
+        let x = { layout: layout, part: u, own: p.module, graph: acc.graph };
         let walked = fold(
           range(0, len(p.members)),
-          { d: cursor(b"", acc.missing), ts: [] },
-          |s: Many, c: Int| {
-            let g = p_item(
+          { decoder: cursor(b"", acc.missing), texts: [] },
+          |decoded: DecodedList, c: Int| {
+            let g = print_item(
               x,
-              { ..s.d, b: at(p.members, c), pos: 0, values: 0, typs: 0, rows: 0, labels: 0 },
+              {
+                ..decoded.decoder,
+                bytes: at(p.members, c),
+                pos: 0,
+                values: 0,
+                types: 0,
+                rows: 0,
+                labels: 0,
+              },
               at(p.names, c),
             );
-            { d: g.d, ts: push(s.ts, g.t) }
+            { decoder: g.decoder, texts: push(decoded.texts, g.text) }
           },
         );
         let had = match map_get(acc.modules, p.module) {
           Some(m) -> m,
           None -> { items: [], imports: map_new() },
         };
-        let imports = map_merge(had.imports, map_remove(walked.d.imports, p.module));
+        let imports = map_merge(had.imports, map_remove(walked.decoder.imports, p.module));
         {
           modules: map_insert(acc.modules, p.module, {
-            items: append(had.items, walked.ts),
+            items: append(had.items, walked.texts),
             imports: imports,
           }),
-          missing: walked.d.missing,
+          missing: walked.decoder.missing,
           graph: map_insert(acc.graph, p.module, map_keys(imports)),
         }
       }
@@ -4226,40 +4443,44 @@ fn print_parts(
   )
 
 fn print_tests(
-  l: Layout,
+  layout: Layout,
   g: Map<Bytes, List<Bytes>>,
   tests: List<Bytes>,
   missing: Map<Bytes, Bool>,
-) -> Many / {abort.raise} = {
-  let x = { layout: l, part: 0 - 1, own: b"", graph: g };
-  fold(range(0, len(tests)), { d: cursor(b"", missing), ts: [] }, |s: Many, i: Int| {
-    let body = at(tests, i);
-    if bytes_len(body) == 0 || bytes_at(body, 0) != 0 {
-      panic("a test body that is not a solo body")
-    } else {
-      let g = p_test(
-        x,
-        {
-          ..s.d,
-          b: bytes_slice(body, 1, bytes_len(body)),
-          pos: 0,
-          values: 0,
-          typs: 0,
-          rows: 0,
-          labels: 0,
-          slots: map_new(),
-        },
-        bytes_concat(b"t", num(i)),
-      );
-      { d: g.d, ts: push(s.ts, g.t) }
-    }
-  })
+) -> DecodedList = {
+  let x = { layout: layout, part: 0 - 1, own: b"", graph: g };
+  fold(
+    range(0, len(tests)),
+    { decoder: cursor(b"", missing), texts: [] },
+    |decoded: DecodedList, i: Int| {
+      let body = at(tests, i);
+      if bytes_len(body) == 0 || bytes_at(body, 0) != 0 {
+        panic("a test body that is not a solo body")
+      } else {
+        let g = print_test(
+          x,
+          {
+            ..decoded.decoder,
+            bytes: bytes_slice(body, 1, bytes_len(body)),
+            pos: 0,
+            values: 0,
+            types: 0,
+            rows: 0,
+            labels: 0,
+            slots: map_new(),
+          },
+          bytes_concat(b"t", int_to_bytes(i)),
+        );
+        { decoder: g.decoder, texts: push(decoded.texts, g.text) }
+      }
+    },
+  )
 }
 
-fn sheet_text(s: Sheet) -> Bytes / {abort.raise} =
+fn sheet_text(sheet: Sheet) -> Bytes =
   bytes_concat_all(
     append(
-      map_fold(s.imports, [], |acc: List<Bytes>, m: Bytes, b: Bytes|
+      map_fold(sheet.imports, [], |acc: List<Bytes>, m: Bytes, b: Bytes|
         push(
           acc,
           bytes_concat_all([
@@ -4269,7 +4490,7 @@ fn sheet_text(s: Sheet) -> Bytes / {abort.raise} =
             b"\n",
           ]),
         )),
-      map(s.items, |it: Bytes| bytes_concat_all([b"\n", it, b"\n"])),
+      map(sheet.items, |it: Bytes| bytes_concat_all([b"\n", it, b"\n"])),
     ),
   )
 
@@ -4282,11 +4503,12 @@ pub fn print_bodies(
   tests: List<Bytes>,
   relink: List<{ from: Bytes, to: Bytes }>,
   shipped: List<Bytes>,
-) -> Printing / {abort.raise} = {
+) -> Printing = {
   let comps = map(bodies, comp_of);
   let n = named_of(
     names,
-    fold(comps, map_new(), |acc: Map<Bytes, Bool>, c: Comp| map_insert(acc, c.key, true)),
+    fold(comps, map_new(), |acc: Map<Bytes, Bool>, component: Component|
+      map_insert(acc, component.key, true)),
   );
   let parted: Parting = match n.bad {
     Some(_) -> { seen: map_new(), declared: map_new(), parts: [], bad: n.bad },
@@ -4294,9 +4516,15 @@ pub fn print_bodies(
       fold(
         comps,
         { seen: map_new(), declared: map_new(), parts: [], bad: None },
-        |acc: Parting, c: Comp|
-          if is_some(acc.bad) || map_contains(acc.seen, c.id) { acc }
-          else { part_in({ ..acc, seen: map_insert(acc.seen, c.id, true) }, c, n.named, shipped) },
+        |acc: Parting, component: Component|
+          if is_some(acc.bad) || map_contains(acc.seen, component.id) { acc } else {
+            part_in(
+              { ..acc, seen: map_insert(acc.seen, component.id, true) },
+              component,
+              n.named,
+              shipped,
+            )
+          },
       ),
   };
   match parted.bad {
@@ -4309,11 +4537,11 @@ pub fn print_bodies(
       );
       let printed = print_parts(l);
       let t = print_tests(l, printed.graph, tests, printed.missing);
-      let missing = map_keys(t.d.missing);
+      let missing = map_keys(t.decoder.missing);
       if len(missing) > 0 {
         Unprintable({
           message: bytes_concat(
-            num(len(missing)),
+            int_to_bytes(len(missing)),
             b" definitions a body refers to are not among the bodies it can name",
           ),
           notes: [
@@ -4327,13 +4555,13 @@ pub fn print_bodies(
         let texts = map_fold(
           printed.modules,
           [],
-          |acc: List<{ module: Bytes, text: Bytes }>, m: Bytes, s: Sheet|
-            push(acc, { module: m, text: sheet_text(s) }),
+          |acc: List<{ module: Bytes, text: Bytes }>, m: Bytes, sheet: Sheet|
+            push(acc, { module: m, text: sheet_text(sheet) }),
         );
         Printed(if len(tests) == 0 { texts } else {
           push(texts, {
             module: b"ply_tests",
-            text: sheet_text({ items: t.ts, imports: t.d.imports }),
+            text: sheet_text({ items: t.texts, imports: t.decoder.imports }),
           })
         })
       }
@@ -4470,12 +4698,16 @@ fn indexed(sources: List<Source>) -> Index / {abort.raise} =
   match resolve_modules(
       map(range(0, len(sources)), |i: Int| {
         let r = parse(at(sources, i).src);
-        let d: Expansion = expand_derives(i, at(sources, i).name, expand(r.node, r.p.diags).module);
+        let d: Expansion = expand_derives(
+          i,
+          at(sources, i).name,
+          expand(r.node, r.parser.diags).module,
+        );
         { name: at(sources, i).name, module: d.module, derived: d.derived }
       }),
     ) {
-    Failed(_) -> panic("the fixture resolves"),
-    Resolved_(x) -> build_index(x.mods, x.r).index,
+    ResolveFailed(_) -> panic("the fixture resolves"),
+    ResolveSucceeded(x) -> build_index(x.mods, x.r).index,
   }
 
 fn named_hashes(out: HashOutput) -> List<{ name: Bytes, hash: Bytes }> = append(out.defs, out.decls)

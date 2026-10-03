@@ -11,7 +11,7 @@ use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
 use crate::support::{select_profile, unit_of};
 use ply_eval::{
-    CheckOutput, DefHash, Diagnostic, Ended, Front, ModuleName, SourceMap, Span, Symbol,
+    Analysis, CheckOutput, DefHash, Diagnostic, Ended, ModuleName, SourceMap, Span, Symbol,
     Value as PlyValue, codes,
 };
 use ply_host::process::{Executables, ProcessHost, Sink, Stream};
@@ -26,7 +26,7 @@ use std::time::Instant;
 pub struct RunOptions {
     /// The front end the CLI ran and the C of the unit it emitted from it: the CLI walks the tree,
     /// runs the compiler and emits, and this side reads the answer and compiles the C.
-    pub front: Option<crate::driver::HandedFront>,
+    pub front: Option<crate::driver::LoadedAnalysis>,
     pub unit: Option<Vec<u8>>,
     /// The target's argument vector: what its `process.args` answers.
     pub argv: Vec<String>,
@@ -108,7 +108,7 @@ impl Target {
     /// and the C of its unit, compiled here when the run first enters it.
     pub fn open(
         path: &std::path::Path,
-        front: Option<&crate::driver::HandedFront>,
+        front: Option<&crate::driver::LoadedAnalysis>,
         unit: Option<&[u8]>,
         hermetic: bool,
     ) -> Result<Target, Refused> {
@@ -116,9 +116,9 @@ impl Target {
             return Err(unemitted(path));
         };
         let loaded = if hermetic {
-            crate::driver::load_over_front_in(crate::load::tidy(path), front)
+            crate::driver::load_over_analysis_in(crate::load::tidy(path), front)
         } else {
-            crate::driver::load_over_front(path, front)
+            crate::driver::load_over_analysis(path, front)
         }
         .map_err(|err| Refused {
             diagnostics: err.diagnostics,
@@ -175,7 +175,7 @@ impl Target {
             ));
         }
         let loaded =
-            crate::driver::load_over_front_taken(crate::load::project_root(path), held.front)
+            crate::driver::load_over_analysis_taken(crate::load::project_root(path), held.front)
                 .map_err(|err| Refused {
                     diagnostics: err.diagnostics,
                     sources: SourceMap::new(),
@@ -215,7 +215,7 @@ impl Target {
         })
     }
 
-    pub fn front(&self) -> &Front {
+    pub fn front(&self) -> &Analysis {
         &self.loaded.front
     }
 
@@ -363,7 +363,7 @@ impl Drive {
     /// tree as it *was*, and whoever noticed the move re-ran the compiler for this one.
     pub fn reload(
         &mut self,
-        front: &crate::driver::HandedFront,
+        front: &crate::driver::LoadedAnalysis,
         unit: &[u8],
     ) -> Result<(), Refused> {
         let path = self.target.loaded.root.clone();
@@ -685,7 +685,7 @@ pub struct Call<'a> {
 }
 
 fn evaluate(
-    front: &Front,
+    front: &Analysis,
     call: Call<'_>,
     span: Span,
     seed: &ply_eval::Seed,

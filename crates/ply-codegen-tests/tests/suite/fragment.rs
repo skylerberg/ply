@@ -3,16 +3,18 @@ use ply_eval::{Provider, Symbol, Value};
 use std::collections::HashMap;
 
 pub struct Loaded {
-    pub front: &'static ply_eval::Front,
+    pub front: &'static ply_eval::Analysis,
     /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }
 
 /// `source` as a module named `m`, with the standard library pulled as the built-in package.
 fn load(source: &str) -> Loaded {
-    let answered =
-        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), source.to_string())])
-            .expect("the corpus checks");
+    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
+        "m".to_string(),
+        source.to_string(),
+    )])
+    .expect("the corpus checks");
     Loaded {
         front: Box::leak(Box::new(answered.front)),
         texts: answered.modules.into_iter().collect(),
@@ -785,7 +787,7 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
 #[test]
 fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let source = ply_codegen::Source::from_front(loaded.front).with_texts(loaded.texts.clone());
+    let source = ply_codegen::Source::from_analysis(loaded.front).with_texts(loaded.texts.clone());
     let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
     let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
     assert!(
@@ -797,7 +799,7 @@ fn the_compiled_set_is_closed_under_calls() {
 #[test]
 fn the_census_over_the_standard_library() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let functions = ply_codegen::Source::from_front(loaded.front)
+    let functions = ply_codegen::Source::from_analysis(loaded.front)
         .functions()
         .len();
     let mut by_construct: std::collections::BTreeMap<&str, usize> = Default::default();

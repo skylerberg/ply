@@ -3,16 +3,16 @@
 
 import std.bin
 import std.hash (blake3)
-import resolve (Source, Mod)
-import diag (parse_all)
-import pkg (Pkgs)
+import resolve (Source, ParsedModule)
+import diagnostics (parse_all)
+import pkg (PackageSources)
 import hash (Contract, Fixed, closure_of, fixed_nodes, fixed_bin, public_contracts)
-import front (Whole, Analysis, Analysed, Refused, Interfaces, no_interfaces, contracted_rows_of,
-              KnownDefRow, EmitRoot, KeyRow, analyse, analyse_with, dump_of, known_def_row_bin, Cut,
-              cuts_of)
+import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_interfaces,
+              contracted_rows_of, KnownDefRow, EmitRoot, KeyRow, analyse, analyse_with, dump_of,
+              known_def_row_bin, Cut, cuts_of)
 
 import infer (DefInfo)
-import tycore (Scheme, at, append, canonical_scheme, take)
+import types (Scheme, at, append, canonical_scheme, take)
 
 // A module another one's analysis read, with the key it had then.
 pub type Reached = { name: Bytes, key: Bytes }
@@ -46,8 +46,8 @@ derive bin for Envelope
 
 fn envelope_magic() -> Bytes = b"PLYIFC01"
 
-pub fn enveloped(e: Envelope) -> Bytes / {abort.raise} =
-  bytes_concat(envelope_magic(), bin::encode(e, envelope_bin()))
+pub fn enveloped(envelope: Envelope) -> Bytes =
+  bytes_concat(envelope_magic(), bin::encode(envelope, envelope_bin()))
 
 pub fn envelope_of(b: Bytes) -> Option<Envelope> / {abort.raise} =
   if !bytes_starts_with(b, envelope_magic()) { None } else {
@@ -81,7 +81,7 @@ fn cut(src: Bytes, c: Cut) -> List<Bytes> / {abort.raise} =
   if c.braced { [b"{", blank(bytes_slice(src, c.start + 1, c.end - 1)), b"}"] }
   else { [blank(bytes_slice(src, c.start, c.end))] }
 
-pub fn stub_module(src: Bytes, m: Mod) -> Bytes / {abort.raise} = stubbed(src, cuts_of(m))
+pub fn stub_module(src: Bytes, parsed: ParsedModule) -> Bytes = stubbed(src, cuts_of(parsed))
 
 // `src` with each cut blanked, at the offsets it had: what a module's published cuts make of it.
 pub fn stubbed(src: Bytes, cuts: List<Cut>) -> Bytes / {abort.raise} = {
@@ -103,13 +103,13 @@ pub fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
 fn last_dot(s: Bytes, i: Int) -> Int / {abort.raise} =
   if i <= 0 { 0 - 1 } else if bytes_at(s, i - 1) == 46 { i - 1 } else { last_dot(s, i - 1) }
 
-pub fn module_key(o: Original) -> Bytes =
+pub fn module_key(original: Original) -> Bytes =
   blake3(
     bytes_concat_all([
       b"ply.interface.module.1\0",
-      match o.manifest { None -> b"-", Some(m) -> bytes_concat(b"+", blake3(m)) },
+      match original.manifest { None -> b"-", Some(m) -> bytes_concat(b"+", blake3(m)) },
       b"\0",
-      o.src,
+      original.src,
     ]),
   )
 
@@ -131,31 +131,35 @@ fn reach(imports: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
   filter(range(0, len(imports)), |i: Int| map_contains(seen, i))
 }
 
-// A module `w` read through `through` keeps that package's stub and edges, its body here a blank;
-// one `w` never reached is carried over whole, since what a package fixes of a module is its own.
+// A module `analysis` read through `through` keeps that package's stub and edges, its body here a blank;
+// one `analysis` never reached is carried over whole, since what a package fixes of a module is its own.
 pub fn compile_package(
   sources: List<Original>,
-  w: Whole,
+  analysis: Analysis,
   modules: List<Bytes>,
   through: List<CompiledPackage> = [],
 ) -> CompiledPackage / {abort.raise} = {
   let members = fold(modules, map_new(), |acc: Map<Bytes, Bool>, m: Bytes|
     map_insert(acc, m, true));
   let mine = |name: Bytes| map_contains(members, module_of(name));
-  let read = fold(through, map_new(), |acc: Map<Bytes, CompiledModule>, p: CompiledPackage|
-    fold(p.modules, acc, |a: Map<Bytes, CompiledModule>, m: CompiledModule|
-      map_insert(a, m.name, m)));
+  let read = fold(
+    through,
+    map_new(),
+    |acc: Map<Bytes, CompiledModule>, package: CompiledPackage|
+      fold(package.modules, acc, |a: Map<Bytes, CompiledModule>, m: CompiledModule|
+        map_insert(a, m.name, m)),
+  );
   let originals = fold(sources, map_new(), |acc: Map<Bytes, Original>, o: Original|
     map_insert(acc, o.name, o));
-  let index = fold(range(0, len(w.mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
-    map_insert(acc, at(w.mods, i).name, i));
+  let index = fold(range(0, len(analysis.mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    map_insert(acc, at(analysis.mods, i).name, i));
   let reached = |i: Int|
-    map(reach(w.r.imports, i), |j: Int| {
-      let name = at(w.mods, j).name;
+    map(reach(analysis.r.imports, i), |j: Int| {
+      let name = at(analysis.mods, j).name;
       { name: name, key: match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" } }
     });
   let implemented = fold(
-    w.hashes.defs,
+    analysis.hashes.defs,
     map_new(),
     |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash),
   );
@@ -167,7 +171,7 @@ pub fn compile_package(
           (Some(o), Some(i)) ->
             {
               name: name,
-              stub: stub_module(o.src, at(w.mods, i)),
+              stub: stub_module(o.src, at(analysis.mods, i)),
               key: module_key(o),
               reaches: reached(i),
             },
@@ -175,20 +179,23 @@ pub fn compile_package(
         },
       }),
     // A later load reads these modules fixed, where a row is matched under the definition's hash.
-    defs: map(filter(contracted_rows_of(w), |r: KnownDefRow| mine(r.name)), |r: KnownDefRow|
-      match map_get(implemented, r.name) { Some(h) -> { ..r, hash: h }, None -> r }),
+    defs: map(
+      filter(contracted_rows_of(analysis), |row: KnownDefRow| mine(row.name)),
+      |row: KnownDefRow|
+        match map_get(implemented, row.name) { Some(h) -> { ..row, hash: h }, None -> row },
+    ),
     fixed: fixed_nodes(
-      w.index,
-      w.hashes,
+      analysis.index,
+      analysis.hashes,
       members,
-      fold(through, [], |acc: List<Fixed>, p: CompiledPackage| append(acc, p.fixed)),
+      fold(through, [], |acc: List<Fixed>, package: CompiledPackage| append(acc, package.fixed)),
     ),
   };
   fold(
     through,
     { covered: members, package: cut },
-    |acc: { covered: Map<Bytes, Bool>, package: CompiledPackage }, p: CompiledPackage| {
-      let more = filter(p.modules, |m: CompiledModule| !map_contains(acc.covered, m.name));
+    |acc: { covered: Map<Bytes, Bool>, package: CompiledPackage }, package: CompiledPackage| {
+      let more = filter(package.modules, |m: CompiledModule| !map_contains(acc.covered, m.name));
       let named = fold(more, map_new(), |s: Map<Bytes, Bool>, m: CompiledModule|
         map_insert(s, m.name, true));
       let theirs = |name: Bytes| map_contains(named, module_of(name));
@@ -197,8 +204,11 @@ pub fn compile_package(
           map_insert(s, m.name, true)),
         package: {
           modules: append(acc.package.modules, more),
-          defs: append(acc.package.defs, filter(p.defs, |r: KnownDefRow| theirs(r.name))),
-          fixed: append(acc.package.fixed, filter(p.fixed, |f: Fixed| theirs(f.name))),
+          defs: append(acc.package.defs, filter(package.defs, |row: KnownDefRow| theirs(row.name))),
+          fixed: append(
+            acc.package.fixed,
+            filter(package.fixed, |fixed: Fixed| theirs(fixed.name)),
+          ),
         },
       }
     },
@@ -207,36 +217,45 @@ pub fn compile_package(
 
 // --- Loading ----------------------------------------------------------------
 
-// The part of `p` that still stands, given each module's current key: a module whose key moved,
+// The part of `package` that still stands, given each module's current key: a module whose key moved,
 // or that reaches one whose key moved, is read from its source again.
-pub fn valid_part(p: CompiledPackage, keys: Map<Bytes, Bytes>) -> CompiledPackage / {abort.raise} = {
+pub fn valid_part(package: CompiledPackage, keys: Map<Bytes, Bytes>) -> CompiledPackage = {
   let stands = |name: Bytes, key: Bytes| map_get(keys, name) == Some(key);
-  let standing = fold(p.modules, map_new(), |acc: Map<Bytes, Bool>, m: CompiledModule|
-    if stands(m.name, m.key)
-        && fold(m.reaches, true, |all: Bool, r: Reached| all && stands(r.name, r.key)) {
-      map_insert(acc, m.name, true)
-    } else { acc });
+  let standing = fold(
+    package.modules,
+    map_new(),
+    |acc: Map<Bytes, Bool>, compiled: CompiledModule|
+      if stands(compiled.name, compiled.key)
+          && fold(compiled.reaches, true, |all: Bool, r: Reached| all && stands(r.name, r.key)) {
+        map_insert(acc, compiled.name, true)
+      } else { acc },
+  );
   let here = |name: Bytes| map_contains(standing, module_of(name));
   {
-    modules: filter(p.modules, |m: CompiledModule| map_contains(standing, m.name)),
-    defs: filter(p.defs, |r: KnownDefRow| here(r.name)),
-    fixed: filter(p.fixed, |f: Fixed| here(f.name)),
+    modules: filter(package.modules, |compiled: CompiledModule|
+      map_contains(standing, compiled.name)),
+    defs: filter(package.defs, |r: KnownDefRow| here(r.name)),
+    fixed: filter(package.fixed, |fixed: Fixed| here(fixed.name)),
   }
 }
 
 pub fn merged_interfaces(packages: List<CompiledPackage>) -> Interfaces =
-  fold(packages, no_interfaces(), |acc: Interfaces, p: CompiledPackage|
+  fold(packages, no_interfaces(), |acc: Interfaces, package: CompiledPackage|
     {
-      stubs: append(acc.stubs, map(p.modules, |m: CompiledModule| { name: m.name, src: m.stub })),
-      defs: append(acc.defs, p.defs),
-      fixed: append(acc.fixed, p.fixed),
+      stubs: append(
+        acc.stubs,
+        map(package.modules, |compiled: CompiledModule|
+          { name: compiled.name, src: compiled.stub }),
+      ),
+      defs: append(acc.defs, package.defs),
+      fixed: append(acc.fixed, package.fixed),
     })
 
 // Each package's modules resolve among the roots, as bare imports do.
 fn analyse_with_interfaces(
   root: List<Source>,
   packages: List<CompiledPackage>,
-) -> Analysis / {abort.raise} = {
+) -> AnalysisOutcome / {abort.raise} = {
   let ifaces = merged_interfaces(packages);
   analyse_with(
     parse_all(append(root, ifaces.stubs)),
@@ -249,10 +268,10 @@ fn analyse_with_interfaces(
 
 // --- Tests ------------------------------------------------------------------
 
-fn original(s: Source) -> Original = { name: s.name, src: s.src, manifest: None }
+fn original(source: Source) -> Original = { name: source.name, src: source.src, manifest: None }
 
-fn whole_of(a: Analysis) -> Whole / {abort.raise} =
-  match a { Analysed(w) -> w, Refused(ds) -> panic("analysis refused") }
+fn whole_of(analysis: AnalysisOutcome) -> Analysis =
+  match analysis { Analysed(w) -> w, Refused(ds) -> panic("analysis refused") }
 
 fn named_set(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bool> =
   fold(xs, map_new(), |acc: Map<Bytes, Bool>, x: { name: Bytes, hash: Bytes }|
@@ -292,8 +311,9 @@ test "a stub keeps every offset and line of its source" {
 }
 
 // Every definition's scheme as the checker published it, its variables numbered as its text names them.
-fn schemes(w: Whole) -> List<{ name: Bytes, scheme: Scheme }> / {abort.raise} =
-  map(w.checked.defs, |d: DefInfo| { name: d.name, scheme: canonical_scheme(d.scheme) })
+fn schemes(analysis: Analysis) -> List<{ name: Bytes, scheme: Scheme }> =
+  map(analysis.checked.defs, |def_info: DefInfo|
+    { name: def_info.name, scheme: canonical_scheme(def_info.scheme) })
 
 test "a dependency reached through its interface answers what its source does" {
   let base = depends();
@@ -330,8 +350,8 @@ test "a dependency reached through its interface answers what its source does" {
   );
   // What the emitter reads of every definition is the same.
   assert_eq(
-    filter(vd.emit_roots, |r: EmitRoot| map_contains(nodes, r.root)),
-    filter(fd.emit_roots, |r: EmitRoot| map_contains(nodes, r.root)),
+    filter(vd.emit_roots, |root: EmitRoot| map_contains(nodes, root.root)),
+    filter(fd.emit_roots, |root: EmitRoot| map_contains(nodes, root.root)),
   );
   assert_eq(
     filter(vd.keys, |k: KeyRow| map_contains(nodes, k.root)),
@@ -366,12 +386,12 @@ test "a package re-cut from an analysis that read it through itself is the same 
   assert_eq(compile_package([original(base)], via, [b"base"], [iface]), iface)
 }
 
-fn of_module(p: CompiledPackage, m: Bytes) -> CompiledPackage / {abort.raise} = {
+fn of_module(package: CompiledPackage, m: Bytes) -> CompiledPackage = {
   let here = |name: Bytes| module_of(name) == m;
   {
-    modules: filter(p.modules, |x: CompiledModule| x.name == m),
-    defs: filter(p.defs, |r: KnownDefRow| here(r.name)),
-    fixed: filter(p.fixed, |f: Fixed| here(f.name)),
+    modules: filter(package.modules, |compiled: CompiledModule| compiled.name == m),
+    defs: filter(package.defs, |row: KnownDefRow| here(row.name)),
+    fixed: filter(package.fixed, |fixed: Fixed| here(fixed.name)),
   }
 }
 
@@ -404,7 +424,7 @@ fn manifest_of(name: String, deps: String) -> Bytes =
   )
 
 // `app` over the package `base` at `../base`, whose one module is `lib`.
-fn over_base(lib: Bytes) -> Pkgs =
+fn over_base(lib: Bytes) -> PackageSources =
   {
     root: b"/x/app",
     manifest: Some(
@@ -472,7 +492,7 @@ test "a stub stands while its source, its package's manifest and what it imports
   let keyed = |xs: List<Original>|
     fold(xs, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
       map_insert(acc, o.name, module_key(o)));
-  let names = |q: CompiledPackage| map(q.modules, |m: CompiledModule| m.name);
+  let names = |package: CompiledPackage| map(package.modules, |m: CompiledModule| m.name);
   assert_eq(valid_part(p, keyed([original(a), original(b), original(c)])), p);
   // An edit to `a` takes `b`, which imports it, down with it; `c` stands.
   let edited: Original = { name: b"a", src: b"pub fn one() -> Int = 2\n", manifest: None };
@@ -535,7 +555,7 @@ test "a stub cut alone stands on the keys of the modules it reaches, wherever th
   let keyed = |xs: List<Original>|
     fold(xs, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
       map_insert(acc, o.name, module_key(o)));
-  assert_eq(map(of_module(p, b"c").modules, |m: CompiledModule| m.reaches), [
+  assert_eq(map(of_module(p, b"c").modules, |compiled: CompiledModule| compiled.reaches), [
     [{ name: b"a", key: module_key(original(a)) }, { name: b"b", key: module_key(original(b)) }],
   ]);
   assert_eq(valid_part(p, keyed([original(a), original(b), original(c)])), p);
@@ -594,9 +614,9 @@ fn contracts_of(src: Bytes) -> List<Contract> / {abort.raise} = {
   public_contracts(w.index, w.hashes, |m: Bytes| m == b"lib")
 }
 
-fn contract_named(cs: List<Contract>, name: Bytes) -> Bytes / {abort.raise} =
-  match filter(cs, |c: Contract| c.name == name) {
-    [c] -> c.hash,
+fn contract_named(cs: List<Contract>, name: Bytes) -> Bytes =
+  match filter(cs, |contract: Contract| contract.name == name) {
+    [contract] -> contract.hash,
     _ -> panic("one contract of the name"),
   }
 
@@ -612,7 +632,7 @@ test "a public definition's contract moves with its signature and specification,
       b"\nfn hidden() -> Int = 1\n",
     ]);
   let base = contracts_of(lib(b"x + 1", b"", b"| A | B"));
-  assert_eq(map(base, |c: Contract| c.name), [b"lib.T", b"lib.f"]);
+  assert_eq(map(base, |contract: Contract| contract.name), [b"lib.T", b"lib.f"]);
   assert_eq(contracts_of(lib(b"x + 2", b"", b"| A | B")), base);
   let specified = contracts_of(lib(b"x + 1", b" ensures result > x", b"| A | B"));
   assert(contract_named(specified, b"lib.f") != contract_named(base, b"lib.f"));

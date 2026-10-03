@@ -169,9 +169,12 @@ fn a_run_with_no_schema_contributes_nothing_to_the_digest() {
 }
 
 fn check(source: &str) -> ply_eval::CheckOutput {
-    ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
-        .expect("the fixture typechecks")
-        .check
+    ply_codegen::c::producer::checked_analysis(
+        &[(String::new(), source.to_string())],
+        &[SourceId(0)],
+    )
+    .expect("the fixture typechecks")
+    .check
 }
 
 /// An artifact built without the schema carries none, and a definition no tier can enter has no

@@ -4,15 +4,14 @@
 // runnable is `shipped.runnable`'s.
 
 import builder (Refusal)
-import cache (Front)
 import sources (is_std)
 import units (emit)
 import compiler.front (Dump, HashFrame, HDef, HashRow, BodyRow, DefRow, TypeRow, EffectRow)
 import compiler.hash (Printed, Unprintable, body_key, hex, print_bodies)
-import compiler.load (SourceFile, held)
-import compiler.plyx (Head, Placed, Section, decode, digest_of, digest_text, domain)
-import compiler.resolve (Diag, diag1)
-import compiler.spine (num)
+import compiler.load (SourceFile, held, LoadedAnalysis)
+import compiler.plyx (Header, Placed, Section, decode, digest_of, digest_text, domain)
+import compiler.resolve (Diag, error_at)
+import compiler.parsing (int_to_bytes)
 import compiler.unit (Helper, Runtime, shipped, shelf_identity)
 import std.bytes (bytes_of_hex, u32_le, u32_at, u64_le, hex_of, slice_at)
 import std.hash (blake3)
@@ -28,7 +27,7 @@ pub type Made = {
   entry: String,
   entry_hash: String,
   startup: List<String>,
-  head: Head,
+  head: Header,
   sections: List<Section>,
   definitions: Int,
   names: List<Named>,
@@ -36,7 +35,7 @@ pub type Made = {
 }
 
 // A library's unit: the head every container records, and its one section's payload.
-pub type Compiled = { head: Head, count: Int, payload: Bytes }
+pub type Compiled = { head: Header, count: Int, payload: Bytes }
 
 // What an artifact holds once every part of it agrees with every other: the runnable a machine
 // loads and what that machine holds it to, and what a report says of it.
@@ -54,10 +53,10 @@ pub type Opened = {
 // What a build asks of its artifacts: one made from the program, an earlier one read back, and a
 // library's unit. `deploying` answers it with this module; a test answers it with what it reports.
 pub effect artifacts {
-  read made(front: Front, entry: String, startup: List<String>, reaches: Bool) -> Result<Made, Refusal>
+  read made(front: LoadedAnalysis, entry: String, startup: List<String>, reaches: Bool) -> Result<Made, Refusal>
   // `None` when nothing could be read at `path`.
   read previous(path: String, bytes: Option<Bytes>) -> Result<Previous, Refusal>
-  read unit(front: Front, names: List<String>) -> Result<Compiled, Refusal>
+  read unit(front: LoadedAnalysis, names: List<String>) -> Result<Compiled, Refusal>
 }
 
 pub type Previous = { digest: String, names: List<Named>, warnings: List<Diag> }
@@ -86,7 +85,7 @@ fn sealed_short(d: Bytes) -> String / {abort.raise} = string_slice(digest_text(d
 fn refusal(diags: List<Diag>) -> Refusal = { diags: diags, places: [] }
 
 fn internal(message: String, notes: List<Bytes>) -> Diag =
-  diag1(
+  error_at(
     b"E0505",
     outside(),
     nowhere(),
@@ -96,7 +95,7 @@ fn internal(message: String, notes: List<Bytes>) -> Diag =
   )
 
 fn invalid(path: String, message: String, notes: List<Bytes>) -> Diag =
-  diag1(
+  error_at(
     b"E0443",
     outside(),
     nowhere(),
@@ -106,7 +105,7 @@ fn invalid(path: String, message: String, notes: List<Bytes>) -> Diag =
   )
 
 fn version(path: String, message: String) -> Diag =
-  diag1(
+  error_at(
     b"E0444",
     outside(),
     nowhere(),
@@ -124,7 +123,7 @@ fn helper_line(h: Helper) -> Bytes =
   bytes_concat_all([
     h.name,
     b" ",
-    num(h.args),
+    int_to_bytes(h.args),
     b" ",
     if h.answers { b"true" } else { b"false" },
     b"\n",
@@ -147,7 +146,7 @@ pub fn stdlib() -> Bytes / {shipped.names, shipped.module, abort.raise} =
     ),
   )
 
-fn head_of(entry: Bytes) -> Head / {shipped.names, shipped.module, shipped.runtime, abort.raise} =
+fn head_of(entry: Bytes) -> Header / {shipped.names, shipped.module, shipped.runtime, abort.raise} =
   { frontend: frontend(), runtime: runtime_of(shipped.runtime()), stdlib: stdlib(), entry: entry }
 
 // --- The closure ------------------------------------------------------------------
@@ -226,7 +225,7 @@ fn listed(names: List<Bytes>) -> Bytes =
     })
 
 fn no_body(absent: List<Bytes>) -> Diag =
-  diag1(
+  error_at(
     b"E0443",
     outside(),
     nowhere(),
@@ -238,7 +237,7 @@ fn no_body(absent: List<Bytes>) -> Diag =
   )
 
 fn unhashed(name: Bytes) -> Diag =
-  diag1(
+  error_at(
     b"E0443",
     outside(),
     nowhere(),
@@ -399,7 +398,7 @@ fn closure_section(files: List<SourceFile>) -> Section / {abort.raise} =
 // The artifact of `entry`, with `startup` run before it: its closure, printed back to source and
 // checked again, the unit emitted from that check, and the runnable made of both.
 pub fn made(
-  front: Front,
+  front: LoadedAnalysis,
   entry: String,
   startup: List<String>,
   reaches: Bool,
@@ -493,7 +492,7 @@ fn append_all<a>(parts: List<List<a>>) -> List<a> =
 
 // A library's unit: every definition `names` names, compiled with no entry, as a `.plyz` carries it.
 pub fn library_unit(
-  front: Front,
+  front: LoadedAnalysis,
   names: List<String>,
 ) -> Result<Compiled, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.runtime, abort.raise} =
   match emit.unit(front, map(names, bytes_of_string)) {
@@ -680,7 +679,7 @@ fn noted(d: Diag, note: Bytes) -> Diag =
 
 fn stdlib_changed() -> Diag / {shipped.names, shipped.module, abort.raise} =
   {
-    ..diag1(b"W0605", outside(), nowhere(), b"the artifact was built against a different standard library", b"", [bytes_of_string("this `ply` ships " ++ sealed_short(stdlib())), b"a shipped definition is content-addressed like any other, so the digest differs over modules the program may never import"]),
+    ..error_at(b"W0605", outside(), nowhere(), b"the artifact was built against a different standard library", b"", [bytes_of_string("this `ply` ships " ++ sealed_short(stdlib())), b"a shipped definition is content-addressed like any other, so the digest differs over modules the program may never import"]),
     severity: b"warning",
   }
 
