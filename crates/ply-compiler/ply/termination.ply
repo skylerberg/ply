@@ -68,6 +68,9 @@ pub type Term =
   | RecordTerm({ base: Option<Term>, fields: List<{ name: Bytes, term: Term }> })
   // A value with no parts: a nullary constructor, an empty list, a literal.
   | NoParts
+  // A constructor of one field, which the term is, or a value with no parts: no larger than a place
+  // the field is a part of, since a part is smaller than what it is a part of by at least one.
+  | Wrapped(Term)
   // As long as the place: what a write at an index leaves of it.
   | SameLength(Place)
   | UnknownTerm
@@ -330,8 +333,9 @@ fn remains(b: Option<Base>) -> Bool = match b { Some(x) -> remainder_in(x), None
 fn remainder_in(b: Base) -> Bool =
   match b { RemainderBase(_) -> true, QuotientBase(q) -> remainder_in(q.of), _ -> false }
 
-// A difference a member's guard bounds, carried back along every call into it that hands it the
-// same difference of the caller's own, so a loop through members that test nothing still reads it.
+// A difference a member's guard bounds, or a field it measures, carried back along every call into
+// it that hands it the same of the caller's own, so a loop through members that test nothing, or
+// that pass the record on whole, still reads it.
 // A loop is no longer than the group, so that many rounds carry it all the way round.
 fn spread(calls: List<List<Call>>, ms: List<List<Measure>>) -> List<List<Measure>> / {abort.raise} =
   fold(range(0, len(ms)), ms, |acc: List<List<Measure>>, _: Int|
@@ -346,11 +350,28 @@ fn spread(calls: List<List<Call>>, ms: List<List<Measure>>) -> List<List<Measure
               },
               None -> m,
             },
+            // A field the callee measures, which the caller hands it as a field of its own.
+            SizeValue(Exactly(l)) -> match field_place(l) {
+              Some(p) -> with_measure(m, SizeMeasure(p)),
+              None -> m,
+            },
             _ -> m,
           }))))
 
+// A field of a parameter, which a measure may size on its own.
+fn field_place(l: Linear) -> Option<Place> =
+  match l.base {
+    Some(PlaceBase(p)) -> if l.k == 0 && len(p.path) > 0 { Some(p) } else { None },
+    _ -> None,
+  }
+
 fn deeper_places(acc: List<Measure>, t: Term) -> List<Measure> =
   match t {
+    Exactly(l) -> match field_place(l) {
+      Some(p) -> with_measure(acc, SizeMeasure(p)),
+      None -> acc,
+    },
+    Wrapped(x) -> deeper_places(acc, x),
     Below(p) -> if len(p.path) == 0 { acc } else { with_measure(acc, SizeMeasure(p)) },
     Inside(p) -> if len(p.path) == 0 { acc } else { with_measure(acc, SizeMeasure(p)) },
     RecordTerm(r) -> {
@@ -574,6 +595,17 @@ fn place_relation(t: Term, p: Place) -> Option<Bool> =
     Inside(q) -> if q == p || within(q, p) { Some(true) } else { None },
     // Every value has a size of at least one, which is the whole of one with no parts.
     NoParts -> Some(false),
+    Wrapped(x) -> match x {
+      Exactly(l) -> match l.base {
+        Some(PlaceBase(q)) -> if l.k == 0 && within(q, p) { Some(false) } else { None },
+        _ -> None,
+      },
+      NoParts -> Some(false),
+      _ -> match part_place(x) {
+        Some(q) -> if q == p { Some(false) } else if within(q, p) { Some(true) } else { None },
+        None -> None,
+      },
+    },
     _ -> None,
   }
 
@@ -690,6 +722,7 @@ fn project(t: Term, field: Bytes) -> Term =
       None -> match r.base { Some(b) -> project(b, field), None -> UnknownTerm },
     },
     NoParts -> UnknownTerm,
+    Wrapped(_) -> UnknownTerm,
     SameLength(_) -> UnknownTerm,
     UnknownTerm -> UnknownTerm,
   }
@@ -697,6 +730,7 @@ fn project(t: Term, field: Bytes) -> Term =
 // An element or a field of the value, or one of theirs: of a list's tail, an element of the list.
 fn below(t: Term) -> Term =
   match t {
+    Wrapped(x) -> x,
     Exactly(l) -> match l.base {
       Some(PlaceBase(p)) -> if l.k == 0 { Below(p) } else { UnknownTerm },
       _ -> UnknownTerm,
@@ -1047,7 +1081,8 @@ fn applied_term(
       else if name == b"fold" && len(args) == 3 {
         folded(context, s, at(args, 0), at(args, 1), at(args, 2))
       } else { UnknownTerm },
-      ConstructorCallee -> parts_of(map(args, |x: Expr| term(context, s, x))),
+      ConstructorCallee -> if len(args) == 1 { Wrapped(term(context, s, at(args, 0))) }
+      else { parts_of(map(args, |x: Expr| term(context, s, x))) },
       DefinedCallee(n) -> match context.group.summary_of(n) {
         Some(sum) -> translated(context, sum.result, actuals(context, s, sum.names, args, named)),
         None -> UnknownTerm,
@@ -1077,6 +1112,7 @@ fn translated(context: MemberContext, t: Term, args: List<Term>) -> Term / {abor
           { name: f.name, term: translated(context, f.term, args) }),
       }),
     NoParts -> NoParts,
+    Wrapped(x) -> Wrapped(translated(context, x, args)),
     SameLength(p) -> same_length(along(actual(args, p.param), p.path)),
     UnknownTerm -> UnknownTerm,
   }
@@ -1151,10 +1187,21 @@ fn joined(a: Option<Term>, b: Option<Term>) -> Option<Term> =
   match a { None -> b, Some(x) -> match b { None -> a, Some(y) -> Some(join(x, y)) } }
 
 // A value either term may be: its parts are parts of a place both are, or are parts of, whatever
-// a term with no parts adds. Two parts are a part of the wider place, of the looser kind.
+// a term with no parts adds. Two parts are a part of the wider place, of the looser kind, and two
+// constructors of one field one whose field is either.
 fn join(a: Term, b: Term) -> Term =
-  if a == b { a }
-  else if a == NoParts { widened(b) }
+  if a == b { a } else {
+    match a {
+      Wrapped(x) -> match b { Wrapped(y) -> Wrapped(join(x, y)), NoParts -> a, _ -> UnknownTerm },
+      _ -> match b {
+        Wrapped(_) -> if a == NoParts { b } else { UnknownTerm },
+        _ -> joined_parts(a, b),
+      },
+    }
+  }
+
+fn joined_parts(a: Term, b: Term) -> Term =
+  if a == NoParts { widened(b) }
   else if b == NoParts { widened(a) } else {
     match place_of(a) {
       Some(p) -> match place_of(b) {

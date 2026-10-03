@@ -2921,6 +2921,71 @@ fn width_closure(code: Code, name: Bytes) -> Code = {
   )
 }
 
+// Each width builtin used as a value written out as the lambda `width_closure` makes, before a body
+// is emitted, so emitting never writes code it then emits. A name a call applies stays a call.
+fn widths_closed(emitter: Emitter, c: Code) -> Code / {abort.raise} = {
+  let go = |x: Code| widths_closed(emitter, x);
+  let maybe = |x: Option<Code>| match x { Some(y) -> Some(go(y)), None -> None };
+  let node = match c.node {
+    NVar(v) -> c.node,
+    NLit(_) -> c.node,
+    NLabel(_) -> c.node,
+    NUnary(u) -> NUnary({ ..u, operand: go(u.operand) }),
+    NBinary(b) -> NBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    NApp(a) ->
+      NApp({
+        func: match a.func.node { NVar(_) -> a.func, _ -> go(a.func) },
+        args: map(a.args, go),
+      }),
+    NIf(i) ->
+      NIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
+    NBlock(b) ->
+      NBlock({
+        stmts: map(b.stmts, |stmt: CodeStmt|
+          match stmt {
+            CLet(l) -> CLet({ ..l, value: go(l.value) }),
+            CLetPat(l) -> CLetPat({ ..l, value: go(l.value) }),
+            CDo(d) -> CDo({ code: go(d.code) }),
+          }),
+        tail: maybe(b.tail),
+      }),
+    NList(l) -> NList({ items: map(l.items, go) }),
+    NRecord(r) -> NRecord({ fields: map(r.fields, |f: CodeField| { ..f, value: go(f.value) }) }),
+    NMatch(m) ->
+      NMatch({
+        scrutinee: go(m.scrutinee),
+        arms: map(m.arms, |a: CodeArm| { ..a, guard: maybe(a.guard), body: go(a.body) }),
+      }),
+    NPerform(p) -> NPerform({ ..p, label: maybe(p.label), args: map(p.args, go) }),
+    NCell(cl) -> NCell({ ..cl, init: go(cl.init), body: go(cl.body) }),
+    NLambda(l) -> NLambda({ ..l, body: go(l.body) }),
+    NSimulate(x) -> NSimulate({ ..x, body: go(x.body) }),
+    NParallel(pr) -> NParallel({ branches: map(pr.branches, go) }),
+    NHandle(h) ->
+      NHandle({
+        body: go(h.body),
+        clauses: map(h.clauses, |k: CodeClause| { ..k, label: maybe(k.label), body: go(k.body) }),
+        ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
+      }),
+    NField(f) -> NField({ ..f, base: go(f.base) }),
+    NUpdate(u) ->
+      NUpdate({
+        ..u,
+        base: go(u.base),
+        sets: map(u.sets, |f: CodeField| { ..f, value: go(f.value) }),
+      }),
+  };
+  match c.node {
+    NVar(v) -> if bare_width(emitter, v.name, v.slot) { width_closure(c, v.name) } else { c },
+    _ -> { ..c, node: node },
+  }
+}
+
+// A name that is a width builtin and not a local, a constructor or a definition, as `expr` reads one.
+fn bare_width(emitter: Emitter, name: Bytes, slot: Option<Int>) -> Bool / {abort.raise} =
+  slot == None && !is_ctor_name(name) && is_width_builtin(name)
+    && (match def_of(emitter, name) { Some(_) -> false, None -> true })
+
 // Wrapping, checked arithmetic and conversions over a carried width, in place; otherwise the
 // runtime's call on the evaluated values. The wrapping and checked families work at the type the
 // checker settled at `at`, their name.
@@ -4187,6 +4252,98 @@ pub fn covers() -> List<Bytes> =
     b"a lambda, as the closure over the slots it copies in",
   ]
 
+// A lambda's closure: its body emitted as an entry of its own, and its captures copied in.
+fn closure_value(
+  emitter: Emitter,
+  l: { params: Int, size: Int, captures: List<Capture>, body: Code },
+  params: List<EmitParam>,
+) -> Option<WithValue> / {abort.raise} =
+  match caps_owned(emitter, l.captures, params, 0, []) {
+    None -> None,
+    Some(w) -> {
+      // Numbered among this body's lambdas; the code table holds constants' entries too.
+      let prefix = bytes_concat(symbol_of(emitter.owner), b"_lambda");
+      let idx = fold(w.emitter.lambdas, 0, |acc: Int, sym: Bytes|
+        if bytes_len(sym) >= bytes_len(prefix) && bytes_slice(sym, 0, bytes_len(prefix)) == prefix {
+          acc + 1
+        } else { acc });
+      let sub = bytes_concat(prefix, int_to_bytes(idx));
+      let entry = lambda_of(w.emitter, bytes_concat(sub, b"_entry"));
+      match emit_lambda(entry.emitter, sub, l) {
+        None -> None,
+        Some(sub_out) -> {
+          let arr = fresh(entry.emitter);
+          let e = line(
+            arr.emitter,
+            bytes_concat_all([
+              b"Word ",
+              arr.name,
+              b"[] = {",
+              if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
+              b"};",
+            ]),
+          );
+          let grown = {
+            out: e.out,
+            temp_count: e.temp_count,
+            unboxed: e.unboxed,
+            indent: e.indent,
+            reads: e.reads,
+            shapes: sub_out.shapes,
+            built: e.built,
+            module: e.module,
+            base: e.base,
+            count_locals: e.count_locals,
+            here: e.here,
+            imports: e.imports,
+            consts: sub_out.consts,
+            ctors: e.ctors,
+            lambda_bodies: bytes_concat_all([e.lambda_bodies, sub_out.text, sub_out.extra]),
+            lambdas: sub_out.lambdas,
+            owner: e.owner,
+            builtins: e.builtins,
+            called_builtins: sub_out.met,
+            fields: sub_out.fields,
+            released: e.released,
+            reuse_widths: e.reuse_widths,
+            alias: e.alias,
+            by_root: e.by_root,
+            tail: e.tail,
+            calls: sub_out.calls,
+            refused: sub_out.refused,
+            deferred: e.deferred,
+            deferred_locals: e.deferred_locals,
+            performs: sub_out.performs,
+            handles: sub_out.handles,
+            landing: e.landing,
+            effects: e.effects,
+            release: e.release,
+            pinned: e.pinned,
+            bound: e.bound,
+            group: e.group,
+            operands: e.operands,
+          };
+          let o = bind(
+            grown,
+            KBoxed,
+            bytes_concat_all([
+              b"rt_closure_p(ctx, @@l",
+              int_to_bytes(entry.i),
+              b"@@, ",
+              int_to_bytes(l.params),
+              b", (Word)(intptr_t)",
+              arr.name,
+              b", ",
+              int_to_bytes(len(l.captures)),
+              b")",
+            ]),
+          );
+          Some({ emitter: check(o.emitter), value: o.value })
+        },
+      }
+    },
+  }
+
 fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue> / {abort.raise} =
   match c.node {
     NLabel(n) -> {
@@ -4261,8 +4418,14 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             );
             Some({ emitter: note_made(check(o.emitter), o.value.expr), value: o.value })
           },
-          None -> if is_width_builtin(v.name) { expr(emitter, width_closure(c, v.name), params) }
-          else if fold(emitter.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == v.name) {
+          None -> if is_width_builtin(v.name) {
+            Some(
+              refused(
+                emitter,
+                bytes_concat(b"a width builtin left unwritten as a value: ", v.name),
+              ),
+            )
+          } else if fold(emitter.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == v.name) {
             let bi = builtin_of(emitter, v.name);
             let o = bind(
               bi.emitter,
@@ -4416,93 +4579,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     } else { None },
     // A lambda is a closure and also a function written after the one that builds it.
     // A nested lambda is one more of the owner's: numbered after its container, its entry interned before its body.
-    NLambda(l) -> {
-      match caps_owned(emitter, l.captures, params, 0, []) {
-        None -> None,
-        Some(w) -> {
-          // Numbered among this body's lambdas; the code table holds constants' entries too.
-          let prefix = bytes_concat(symbol_of(emitter.owner), b"_lambda");
-          let idx = fold(w.emitter.lambdas, 0, |acc: Int, sym: Bytes|
-            if bytes_len(sym) >= bytes_len(prefix)
-                && bytes_slice(sym, 0, bytes_len(prefix)) == prefix { acc + 1 }
-            else { acc });
-          let sub = bytes_concat(prefix, int_to_bytes(idx));
-          let entry = lambda_of(w.emitter, bytes_concat(sub, b"_entry"));
-          match emit_lambda(entry.emitter, sub, l) {
-            None -> None,
-            Some(sub_out) -> {
-              let arr = fresh(entry.emitter);
-              let e = line(
-                arr.emitter,
-                bytes_concat_all([
-                  b"Word ",
-                  arr.name,
-                  b"[] = {",
-                  if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
-                  b"};",
-                ]),
-              );
-              let grown = {
-                out: e.out,
-                temp_count: e.temp_count,
-                unboxed: e.unboxed,
-                indent: e.indent,
-                reads: e.reads,
-                shapes: sub_out.shapes,
-                built: e.built,
-                module: e.module,
-                base: e.base,
-                count_locals: e.count_locals,
-                here: e.here,
-                imports: e.imports,
-                consts: sub_out.consts,
-                ctors: e.ctors,
-                lambda_bodies: bytes_concat_all([e.lambda_bodies, sub_out.text, sub_out.extra]),
-                lambdas: sub_out.lambdas,
-                owner: e.owner,
-                builtins: e.builtins,
-                called_builtins: sub_out.met,
-                fields: sub_out.fields,
-                released: e.released,
-                reuse_widths: e.reuse_widths,
-                alias: e.alias,
-                by_root: e.by_root,
-                tail: e.tail,
-                calls: sub_out.calls,
-                refused: sub_out.refused,
-                deferred: e.deferred,
-                deferred_locals: e.deferred_locals,
-                performs: sub_out.performs,
-                handles: sub_out.handles,
-                landing: e.landing,
-                effects: e.effects,
-                release: e.release,
-                pinned: e.pinned,
-                bound: e.bound,
-                group: e.group,
-                operands: e.operands,
-              };
-              let o = bind(
-                grown,
-                KBoxed,
-                bytes_concat_all([
-                  b"rt_closure_p(ctx, @@l",
-                  int_to_bytes(entry.i),
-                  b"@@, ",
-                  int_to_bytes(l.params),
-                  b", (Word)(intptr_t)",
-                  arr.name,
-                  b", ",
-                  int_to_bytes(len(l.captures)),
-                  b")",
-                ]),
-              );
-              Some({ emitter: check(o.emitter), value: o.value })
-            },
-          }
-        },
-      }
-    },
+    NLambda(l) -> closure_value(emitter, l, params),
     NList(l) -> match items(emitter, l.items, params, 0, []) {
       None -> None,
       Some(w) -> {
@@ -5323,12 +5400,11 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     },
     // `simulate { body }`: the body is a nullary closure run as the root task of a region whose scheduler the runtime drives.
     NSimulate(x) -> {
-      let lam = {
-        own: Borrowed,
-        span: dummy_span(),
-        node: NLambda({ params: 0, size: x.size, captures: x.captures, body: x.body }),
-      };
-      match expr(notail(emitter), lam, params) {
+      match closure_value(
+          notail(emitter),
+          { params: 0, size: x.size, captures: x.captures, body: x.body },
+          params,
+        ) {
         None -> None,
         Some(cl) -> {
           let held = owned(cl.emitter, cl.value);
@@ -5488,230 +5564,214 @@ fn handle_site(
   ret: Option<CodeReturn>,
   params: List<EmitParam>,
 ) -> Option<WithValue> / {abort.raise} = {
-  let named = fold(
-    clauses,
-    Some([]),
-    |acc: Option<List<{ global: Bytes, clause: CodeClause }>>, clause: CodeClause|
-      match acc {
-        None -> None,
-        Some(xs) -> match effect_global(emitter, clause.effect) {
-          Some(g) -> Some(push(xs, { global: g, clause: clause })),
-          None -> None,
-        },
-      },
-  );
+  let resolved = fold(clauses, true, |ok: Bool, clause: CodeClause|
+    ok && (match effect_global(emitter, clause.effect) { Some(_) -> true, None -> false }));
   // A clause calling `resume` off the tail detaches the body: it runs on its own stack, so it becomes a closure.
   let detached = fold(clauses, false, |acc: Bool, clause: CodeClause|
     acc || (clause.resume && !resume_in_tail_only(clause.body, clause.params)));
-  match named {
-    None ->
-      Some(refused(emitter, b"a `handle` this backend cannot carry: an effect it cannot resolve")),
-    Some(cs) -> {
-      let ans = fresh(emitter);
-      let opened = line(ans.emitter, bytes_concat_all([b"Word ", ans.name, b" = 0;"]));
-      match fold(
-          cs,
-          Some({ emitter: opened, entries: [] }),
-          |acc: Option<{ emitter: Emitter, entries: List<Bytes> }>, x: { global: Bytes, clause: CodeClause }|
-            match acc {
+  if !resolved {
+    Some(refused(emitter, b"a `handle` this backend cannot carry: an effect it cannot resolve"))
+  } else {
+    let ans = fresh(emitter);
+    let opened = line(ans.emitter, bytes_concat_all([b"Word ", ans.name, b" = 0;"]));
+    match fold(
+        clauses,
+        Some({ emitter: opened, entries: [] }),
+        |acc: Option<{ emitter: Emitter, entries: List<Bytes> }>, clause: CodeClause|
+          match acc {
+            None -> None,
+            Some(st) -> match effect_global(emitter, clause.effect) {
               None -> None,
-              Some(st) -> {
-                let lam = {
-                  own: Borrowed,
-                  span: dummy_span(),
-                  node: NLambda({
-                    params: x.clause.params + (if x.clause.binds_label { 1 } else { 0 })
-                      + (if x.clause.resume { 1 } else { 0 }),
-                    size: x.clause.size,
-                    captures: x.clause.captures,
-                    body: x.clause.body,
-                  }),
-                };
-                match expr(notail(st.emitter), lam, params) {
-                  None -> None,
-                  Some(cl) -> {
-                    let held = owned(cl.emitter, cl.value);
-                    let ef = field_of(held.emitter, x.global);
-                    // A clause on a label parameter keys on the slot, read where the table is built.
-                    let lb: Option<WithValue> = match x.clause.label {
-                      None -> None,
-                      Some(cd) -> expr(notail(ef.emitter), cd, params),
-                    };
-                    let wanted = match x.clause.label { None -> false, Some(_) -> true };
-                    let res = if wanted { None }
-                    else if x.clause.resource == b"" { None }
-                    else { Some(field_of(ef.emitter, x.clause.resource)) };
-                    let op = field_of(
-                      match lb {
-                        Some(o) -> o.emitter,
-                        None -> match res { Some(r) -> r.emitter, None -> ef.emitter },
-                      },
-                      x.clause.op,
-                    );
-                    if wanted && (match lb { Some(_) -> false, None -> true }) { None } else {
-                      Some({
-                        emitter: note_handles(
-                          op.emitter,
-                          bytes_concat_all([x.global, b"#", x.clause.op]),
-                        ),
-                        entries: push(
-                          st.entries,
-                          bytes_concat_all([
-                            field_ref(ef.i),
-                            b", ",
-                            match lb {
-                              Some(o) -> as_int(o.value),
-                              None -> match res { Some(r) -> field_ref(r.i), None -> b"-1" },
-                            },
-                            b", ",
-                            field_ref(op.i),
-                            b", ",
-                            held.value.expr,
-                            b", ",
-                            if !x.clause.resume { b"0" }
-                            else if resume_in_tail_only(x.clause.body, x.clause.params) { b"1" }
-                            else { b"2" },
-                            b", ",
-                            if x.clause.binds_label { b"1" } else { b"0" },
-                          ]),
-                        ),
-                      })
-                    }
+              Some(global) -> match closure_value(
+                  notail(st.emitter),
+                  {
+                    params: clause.params + (if clause.binds_label { 1 } else { 0 })
+                      + (if clause.resume { 1 } else { 0 }),
+                    size: clause.size,
+                    captures: clause.captures,
+                    body: clause.body,
                   },
-                }
-              },
-            },
-        ) {
-        None -> None,
-        Some(built) -> {
-          let arr = fresh(built.emitter);
-          let table = line(
-            arr.emitter,
-            bytes_concat_all([
-              b"Word ",
-              arr.name,
-              b"[] = {",
-              bytes_join(built.entries, b", "),
-              b"};",
-            ]),
-          );
-          let retc = match ret {
-            None -> Some({ emitter: table, clause: b"0" }),
-            Some(r) -> {
-              let lam = {
-                own: Borrowed,
-                span: dummy_span(),
-                node: NLambda({ params: 1, size: r.size, captures: r.captures, body: r.body }),
-              };
-              match expr(notail(table), lam, params) {
+                  params,
+                ) {
                 None -> None,
                 Some(cl) -> {
                   let held = owned(cl.emitter, cl.value);
-                  Some({ emitter: held.emitter, clause: held.value.expr })
+                  let ef = field_of(held.emitter, global);
+                  // A clause on a label parameter keys on the slot, read where the table is built.
+                  let lb: Option<WithValue> = match clause.label {
+                    None -> None,
+                    Some(cd) -> expr(notail(ef.emitter), cd, params),
+                  };
+                  let wanted = match clause.label { None -> false, Some(_) -> true };
+                  let res = if wanted { None }
+                  else if clause.resource == b"" { None }
+                  else { Some(field_of(ef.emitter, clause.resource)) };
+                  let op = field_of(
+                    match lb {
+                      Some(o) -> o.emitter,
+                      None -> match res { Some(r) -> r.emitter, None -> ef.emitter },
+                    },
+                    clause.op,
+                  );
+                  if wanted && (match lb { Some(_) -> false, None -> true }) { None } else {
+                    Some({
+                      emitter: note_handles(
+                        op.emitter,
+                        bytes_concat_all([global, b"#", clause.op]),
+                      ),
+                      entries: push(
+                        st.entries,
+                        bytes_concat_all([
+                          field_ref(ef.i),
+                          b", ",
+                          match lb {
+                            Some(o) -> as_int(o.value),
+                            None -> match res { Some(r) -> field_ref(r.i), None -> b"-1" },
+                          },
+                          b", ",
+                          field_ref(op.i),
+                          b", ",
+                          held.value.expr,
+                          b", ",
+                          if !clause.resume { b"0" }
+                          else if resume_in_tail_only(clause.body, clause.params) { b"1" }
+                          else { b"2" },
+                          b", ",
+                          if clause.binds_label { b"1" } else { b"0" },
+                        ]),
+                      ),
+                    })
+                  }
                 },
-              }
+              },
             },
-          };
-          match retc {
-            None -> None,
-            Some(rc) -> if detached {
-              // The body closes over every slot it reads at the same slot numbers, so nothing is renumbered.
-              let reads = filter(dedup(slots_read(body)), |r: Int|
-                match conv_of(rc.emitter, r) {
-                  Some(_) -> true,
-                  None -> match list_at(params, r) { Some(_) -> true, None -> false },
-                });
-              let lam = {
-                own: Borrowed,
-                span: dummy_span(),
-                node: NLambda({
+          },
+      ) {
+      None -> None,
+      Some(built) -> {
+        let arr = fresh(built.emitter);
+        let table = line(
+          arr.emitter,
+          bytes_concat_all([
+            b"Word ",
+            arr.name,
+            b"[] = {",
+            bytes_join(built.entries, b", "),
+            b"};",
+          ]),
+        );
+        let retc = match ret {
+          None -> Some({ emitter: table, clause: b"0" }),
+          Some(r) -> {
+
+            match closure_value(
+                notail(table),
+                { params: 1, size: r.size, captures: r.captures, body: r.body },
+                params,
+              ) {
+              None -> None,
+              Some(cl) -> {
+                let held = owned(cl.emitter, cl.value);
+                Some({ emitter: held.emitter, clause: held.value.expr })
+              },
+            }
+          },
+        };
+        match retc {
+          None -> None,
+          Some(rc) -> if detached {
+            // The body closes over every slot it reads at the same slot numbers, so nothing is renumbered.
+            let reads = filter(dedup(slots_read(body)), |r: Int|
+              match conv_of(rc.emitter, r) {
+                Some(_) -> true,
+                None -> match list_at(params, r) { Some(_) -> true, None -> false },
+              });
+            match closure_value(
+                notail(rc.emitter),
+                {
                   params: 0,
                   size: fold(reads, 0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
                   captures: map(reads, |r: Int| { src: r, dst: r, own: Borrowed }),
                   body: body,
-                }),
-              };
-              match expr(notail(rc.emitter), lam, params) {
-                None -> None,
-                Some(cl) -> {
-                  let held = owned(cl.emitter, cl.value);
-                  let out = bind(
-                    held.emitter,
-                    KBoxed,
-                    bytes_concat_all([
-                      b"rt_handle_detached_p(ctx, (Word)(intptr_t)",
-                      arr.name,
-                      b", ",
-                      int_to_bytes(len(cs)),
-                      b", ",
-                      rc.clause,
-                      b", ",
-                      held.value.expr,
-                      b")",
-                    ]),
-                  );
-                  Some({ emitter: check(out.emitter), value: out.value })
                 },
-              }
-            } else {
-              let depth = bind(
-                rc.emitter,
-                KInt,
-                bytes_concat_all([
-                  b"rt_handle_push_p(ctx, (Word)(intptr_t)",
-                  arr.name,
-                  b", ",
-                  int_to_bytes(len(cs)),
-                  b", ",
-                  rc.clause,
-                  b")",
-                ]),
-              );
-              let mark = fresh(depth.emitter);
-              let label = bytes_concat(b"land_", int_to_bytes(mark.emitter.temp_count));
-              // Under release the body is its own block, so its holders are released at its close, before the landing label.
-              let opened = if mark.emitter.release { indent(line(mark.emitter, b"{")) }
-              else { mark.emitter };
-              match expr(notail(with_landing(opened, Some(label))), body, params) {
-                None -> None,
-                Some(b) -> {
-                  let bw = owned(b.emitter, b.value);
-                  let set = line(
-                    bw.emitter,
-                    bytes_concat_all([ans.name, b" = ", bw.value.expr, b";"]),
-                  );
-                  let closed = if set.release {
-                    with_made(
-                      close(set),
-                      union_made(
-                        mark.emitter.count_locals,
-                        release_at(set, set.indent).count_locals,
-                      ),
-                    )
-                  } else { set };
-                  let landed = line(
-                    with_landing(closed, emitter.landing),
-                    bytes_concat_all([label, b":;"]),
-                  );
-                  let out = bind(
-                    landed,
-                    KBoxed,
-                    bytes_concat_all([
-                      b"rt_handle_land_p(ctx, ",
-                      depth.value.expr,
-                      b", ",
-                      ans.name,
-                      b")",
-                    ]),
-                  );
-                  Some({ emitter: check(out.emitter), value: out.value })
-                },
-              }
-            },
-          }
-        },
-      }
-    },
+                params,
+              ) {
+              None -> None,
+              Some(cl) -> {
+                let held = owned(cl.emitter, cl.value);
+                let out = bind(
+                  held.emitter,
+                  KBoxed,
+                  bytes_concat_all([
+                    b"rt_handle_detached_p(ctx, (Word)(intptr_t)",
+                    arr.name,
+                    b", ",
+                    int_to_bytes(len(clauses)),
+                    b", ",
+                    rc.clause,
+                    b", ",
+                    held.value.expr,
+                    b")",
+                  ]),
+                );
+                Some({ emitter: check(out.emitter), value: out.value })
+              },
+            }
+          } else {
+            let depth = bind(
+              rc.emitter,
+              KInt,
+              bytes_concat_all([
+                b"rt_handle_push_p(ctx, (Word)(intptr_t)",
+                arr.name,
+                b", ",
+                int_to_bytes(len(clauses)),
+                b", ",
+                rc.clause,
+                b")",
+              ]),
+            );
+            let mark = fresh(depth.emitter);
+            let label = bytes_concat(b"land_", int_to_bytes(mark.emitter.temp_count));
+            // Under release the body is its own block, so its holders are released at its close, before the landing label.
+            let opened = if mark.emitter.release { indent(line(mark.emitter, b"{")) }
+            else { mark.emitter };
+            match expr(notail(with_landing(opened, Some(label))), body, params) {
+              None -> None,
+              Some(b) -> {
+                let bw = owned(b.emitter, b.value);
+                let set = line(
+                  bw.emitter,
+                  bytes_concat_all([ans.name, b" = ", bw.value.expr, b";"]),
+                );
+                let closed = if set.release {
+                  with_made(
+                    close(set),
+                    union_made(mark.emitter.count_locals, release_at(set, set.indent).count_locals),
+                  )
+                } else { set };
+                let landed = line(
+                  with_landing(closed, emitter.landing),
+                  bytes_concat_all([label, b":;"]),
+                );
+                let out = bind(
+                  landed,
+                  KBoxed,
+                  bytes_concat_all([
+                    b"rt_handle_land_p(ctx, ",
+                    depth.value.expr,
+                    b", ",
+                    ans.name,
+                    b")",
+                  ]),
+                );
+                Some({ emitter: check(out.emitter), value: out.value })
+              },
+            }
+          },
+        }
+      },
+    }
   }
 }
 
@@ -6007,21 +6067,25 @@ fn match_subject(
   params: List<EmitParam>,
 ) -> Option<{ emitter: Emitter, subj: CValue, lookup: Bool }> / {abort.raise} =
   match lookup_of(emitter, scrutinee, xs) {
-    Some(l) -> match args_owned_at(notail(emitter), l.args, params, scrutinee.span) {
-      None -> None,
-      Some(w) -> {
-        let held = bind(
-          w.emitter,
-          KBoxed,
-          bytes_concat_all([
-            l.helper,
-            b"(ctx",
-            fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
-            b")",
-          ]),
-        );
-        Some({ emitter: check(held.emitter), subj: held.value, lookup: true })
+    // Only a call is a lookup.
+    Some(helper) -> match scrutinee.node {
+      NApp(a) -> match args_owned_at(notail(emitter), a.args, params, scrutinee.span) {
+        None -> None,
+        Some(w) -> {
+          let held = bind(
+            w.emitter,
+            KBoxed,
+            bytes_concat_all([
+              helper,
+              b"(ctx",
+              fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
+              b")",
+            ]),
+          );
+          Some({ emitter: check(held.emitter), subj: held.value, lookup: true })
+        },
       },
+      _ -> None,
     },
     None -> match expr(notail(emitter), scrutinee, params) {
       None -> None,
@@ -6069,12 +6133,12 @@ fn match_arms(
   }
 }
 
-// `match list_at(..)` or `map_get(..)` with unguarded `Some(x)`/`None` arms: the helper answering the element or zero, and its arguments.
+// `match list_at(..)` or `map_get(..)` with unguarded `Some(x)`/`None` arms: the helper answering the element or zero, which takes the call's arguments.
 fn lookup_of(
   emitter: Emitter,
   scrutinee: Code,
   xs: List<CodeArm>,
-) -> Option<{ helper: Bytes, args: List<Code> }> / {abort.raise} =
+) -> Option<Bytes> / {abort.raise} =
   match scrutinee.node {
     NApp(a) -> match a.func.node {
       NVar(fv) -> if fv.slot != None || len(a.args) != 2 || len(xs) != 2
@@ -6093,7 +6157,7 @@ fn lookup_of(
                   None -> None,
                   Some(ux) -> match unwraps(emitter, y.pat) {
                     None -> None,
-                    Some(uy) -> if ux != uy { Some({ helper: h, args: a.args }) } else { None },
+                    Some(uy) -> if ux != uy { Some(h) } else { None },
                   },
                 }
               },
@@ -7017,7 +7081,11 @@ fn emit_body(
 ) -> Option<WithValue> / {abort.raise} = {
   let opened = prologue(start, params);
   let looped = line(opened, bytes_concat(b"ply_loop: ", tick_line()));
-  expr(if loops_to_self(opened, body, params) { looped } else { opened }, body, params)
+  expr(
+    if loops_to_self(opened, body, params) { looped } else { opened },
+    widths_closed(start, body),
+    params,
+  )
 }
 
 // A call of the definition being emitted that fills every parameter: from tail position it restarts the body.
@@ -7244,7 +7312,11 @@ fn param_kind_with(
   aliases: List<Alias>,
   others: List<ModAliases>,
   ty: Option<TypeExpr>,
-) -> Option<{ kind: Kind, ty: Ty }> = written_kind(aliases, others, [], ty)
+) -> Option<{ kind: Kind, ty: Ty }> = {
+  // No alias names itself through others, so a type expands through each at most once.
+  let room = fold(others, len(aliases), |n: Int, o: ModAliases| n + len(o.aliases));
+  written_kind(aliases, others, [], ty, room)
+}
 
 // An alias's arguments resolve where written, its body in the alias's own module with its parameters bound to them.
 fn bind_args(
@@ -7253,11 +7325,12 @@ fn bind_args(
   vars: List<Bound>,
   params: List<Bytes>,
   args: List<TypeExpr>,
+  room: Int,
 ) -> List<Bound> =
   map(range(0, len(params)), |i: Int| {
     let name = match list_at(params, i) { Some(n) -> n, None -> b"" };
     match list_at(args, i) {
-      Some(arg) -> match written_kind(aliases, others, vars, Some(arg)) {
+      Some(arg) -> match written_type(aliases, others, vars, arg, room) {
         Some(x) -> { name: name, kind: x.kind, ty: x.ty },
         None -> { name: name, kind: KBoxed, ty: TyOpen },
       },
@@ -7274,65 +7347,70 @@ fn written_kind(
   others: List<ModAliases>,
   vars: List<Bound>,
   ty: Option<TypeExpr>,
+  room: Int,
 ) -> Option<{ kind: Kind, ty: Ty }> =
-  match ty {
-    Some(TVar(id)) -> match fold(vars, None, |acc: Option<Bound>, b: Bound|
-        if b.name == id.name { Some(b) } else { acc }) {
-      Some(b) -> Some({ kind: b.kind, ty: b.ty }),
-      None -> param_kind(ty),
-    },
-    Some(TCon(c)) -> match c.name.module {
-      Some(binder) -> match fold(others, None, |acc: Option<List<Alias>>, o: ModAliases|
-          if o.binder == binder.name { Some(o.aliases) } else { acc }) {
-        None -> param_kind(ty),
-        Some(theirs) -> match alias_named(theirs, c.name.name.name) {
-          // Resolved in the other module's own scope: its aliases, and none of ours.
-          Some(a) ->
-            written_kind(
-              theirs,
-              [],
-              bind_args(aliases, others, vars, a.params, c.args),
-              Some(a.ty),
-            ),
-          None -> param_kind(ty),
-        },
-      },
-      None -> match alias_named(aliases, c.name.name.name) {
-        Some(a) ->
-          written_kind(
-            aliases,
-            others,
-            bind_args(aliases, others, vars, a.params, c.args),
-            Some(a.ty),
-          ),
-        None -> param_kind_record(aliases, others, vars, ty),
-      },
-    },
-    _ -> param_kind_record(aliases, others, vars, ty),
-  }
+  match ty { Some(t) -> written_type(aliases, others, vars, t, room), None -> param_kind(ty) }
 
-// A record's fields resolve in the record's own scope.
-fn param_kind_record(
+// `room` is how many more aliases the type may expand through; past it the kind is refused.
+fn written_type(
   aliases: List<Alias>,
   others: List<ModAliases>,
   vars: List<Bound>,
-  ty: Option<TypeExpr>,
+  ty: TypeExpr,
+  room: Int,
 ) -> Option<{ kind: Kind, ty: Ty }> =
   match ty {
-    Some(TRecord(r)) -> if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
-        acc || written_kind(aliases, others, vars, Some(f.ty)) == None) { None } else {
+    TVar(id) -> match fold(vars, None, |acc: Option<Bound>, b: Bound|
+        if b.name == id.name { Some(b) } else { acc }) {
+      Some(b) -> Some({ kind: b.kind, ty: b.ty }),
+      None -> type_kind(ty),
+    },
+    TCon(c) -> match c.name.module {
+      Some(binder) -> match fold(others, None, |acc: Option<List<Alias>>, o: ModAliases|
+          if o.binder == binder.name { Some(o.aliases) } else { acc }) {
+        None -> type_kind(ty),
+        Some(theirs) -> match alias_named(theirs, c.name.name.name) {
+          // Resolved in the other module's own scope: its aliases, and none of ours.
+          Some(a) -> if room <= 0 { None } else {
+            written_type(
+              theirs,
+              [],
+              bind_args(aliases, others, vars, a.params, c.args, room),
+              a.ty,
+              room - 1,
+            )
+          },
+          None -> type_kind(ty),
+        },
+      },
+      None -> match alias_named(aliases, c.name.name.name) {
+        Some(a) -> if room <= 0 { None } else {
+          written_type(
+            aliases,
+            others,
+            bind_args(aliases, others, vars, a.params, c.args, room),
+            a.ty,
+            room - 1,
+          )
+        },
+        None -> type_kind(ty),
+      },
+    },
+    // A record's fields resolve in the record's own scope.
+    TRecord(r) -> if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
+        acc || written_type(aliases, others, vars, f.ty, room) == None) { None } else {
       Some({
         kind: KBoxed,
         ty: TyRec(
           map(r.fields, |f: { name: Ident, ty: TypeExpr }|
-            match written_kind(aliases, others, vars, Some(f.ty)) {
+            match written_type(aliases, others, vars, f.ty, room) {
               Some(x) -> { name: f.name.name, kind: x.kind, ty: x.ty },
               None -> { name: f.name.name, kind: KBoxed, ty: TyOpen },
             }),
         ),
       })
     },
-    _ -> param_kind(ty),
+    _ -> type_kind(ty),
   }
 
 // Only a missing annotation is refused.
@@ -7721,7 +7799,7 @@ fn group_cases(emitter: Emitter, members: List<Member>, i: Int) -> Option<Emitte
           owner: m.full,
           base: m.base,
         };
-        match expr(prologue(entered, m.params), m.body, m.params) {
+        match expr(prologue(entered, m.params), widths_closed(entered, m.body), m.params) {
           None -> None,
           Some(o) -> {
             let w = returned(o.emitter, o.value);
