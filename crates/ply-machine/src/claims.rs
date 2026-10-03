@@ -10,7 +10,7 @@
 
 use crate::config::Configuration;
 use crate::engine::{Interleaved, Judgement, Mode, Obligation};
-use crate::hosts::{Hosts, Lent};
+use crate::hosts::{Hosts, LentOp};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{ctor, diags_value, places_value, record, strings};
 use crate::support::unit_of;
@@ -116,14 +116,14 @@ pub struct Binding {
 
 /// The operations, for a program that declares `prover` in `module`: a value this side builds of a
 /// type that module declares is named as that program names it.
-pub fn lent(module: &str) -> Vec<Lent> {
+pub fn lent(module: &str) -> Vec<LentOp> {
     let mut ops = lent_by(module, false);
     ops.extend(lent_by(module, true));
     ops
 }
 
-fn lent_by(module: &str, hermetic: bool) -> Vec<Lent> {
-    let site: Arc<dyn HostHandler> = Arc::new(Site {
+fn lent_by(module: &str, hermetic: bool) -> Vec<LentOp> {
+    let handler: Arc<dyn HostHandler> = Arc::new(ProverHandler {
         hermetic,
         job: Mutex::new(None),
         machine: Mutex::new(None),
@@ -138,7 +138,7 @@ fn lent_by(module: &str, hermetic: bool) -> Vec<Lent> {
     };
     operations
         .into_iter()
-        .map(|(op, path)| (registration(op, path, hermetic), Arc::clone(&site)))
+        .map(|(op, path)| (registration(op, path, hermetic), Arc::clone(&handler)))
         .collect()
 }
 
@@ -163,7 +163,7 @@ fn registration(op: &str, path: &'static str, hermetic: bool) -> HostOp {
     }
 }
 
-struct Site {
+struct ProverHandler {
     /// Loads only what it is handed and binds no host.
     hermetic: bool,
     /// Taken by the first operation, which is what starts the machine.
@@ -178,7 +178,7 @@ struct Site {
     module: String,
 }
 
-impl HostHandler for Site {
+impl HostHandler for ProverHandler {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
@@ -186,9 +186,10 @@ impl HostHandler for Site {
                 let mut job = job_of(options, span)?;
                 job.hermetic = self.hermetic;
                 job.front = Some(crate::driver::loaded_analysis_of(front, span)?);
-                job.obligations =
-                    crate::engine::obligations_of(ply_eval::decode::At::new("the world", world))
-                        .map_err(|e| unread_world(&e, span))?;
+                job.obligations = crate::engine::obligations_of(
+                    ply_eval::decode::AnswerValue::new("the world", world),
+                )
+                .map_err(|e| unread_world(&e, span))?;
                 // A configuration begins a run, whatever the last one was left doing: its machine
                 // is dropped, which joins its thread, and its claims are no longer this run's.
                 let previous = self.held().take();
@@ -295,7 +296,7 @@ fn malformed(why: &str, span: Span) -> Diagnostic {
     .note("`proof.decide` and this reader are one program's two halves; this is Ply's fault")
 }
 
-impl Site {
+impl ProverHandler {
     fn held(&self) -> std::sync::MutexGuard<'_, Option<Machine>> {
         self.machine.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -312,8 +313,8 @@ impl Site {
             *held = Some(Machine::start(job)?);
         }
         let machine = held.as_ref().ok_or_else(|| unstarted("collected"))?;
-        match machine.step()? {
-            Step::Collected(answer) => {
+        match machine.reply()? {
+            Reply::Collected(answer) => {
                 if let Ok(collection) = &*answer {
                     *self.claims.lock().unwrap_or_else(|e| e.into_inner()) = collection.obligations;
                 }
@@ -328,10 +329,10 @@ impl Site {
     fn compiled(&self, unit: &[u8]) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("compiled"))?;
-        machine.ask(Go::Compiled(unit.to_vec()))?;
-        match machine.step()? {
-            Step::Compiled(Ok(())) => Ok(PlyValue::ctor("Ok", vec![PlyValue::Unit])),
-            Step::Compiled(Err(diagnostic)) => Ok(PlyValue::ctor(
+        machine.ask(Request::Compiled(unit.to_vec()))?;
+        match machine.reply()? {
+            Reply::Compiled(Ok(())) => Ok(PlyValue::ctor("Ok", vec![PlyValue::Unit])),
+            Reply::Compiled(Err(diagnostic)) => Ok(PlyValue::ctor(
                 "Err",
                 vec![diags_value(std::slice::from_ref(&diagnostic))],
             )),
@@ -343,9 +344,9 @@ impl Site {
     fn schema(&self, name: &str) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("schema"))?;
-        machine.ask(Go::Schema(name.to_string()))?;
-        match machine.step()? {
-            Step::Schema(answer) => Ok(crate::config::schema_answer(answer)),
+        machine.ask(Request::Schema(name.to_string()))?;
+        match machine.reply()? {
+            Reply::Schema(answer) => Ok(crate::config::schema_answer(answer)),
             _ => Err(out_of_step("schema")),
         }
     }
@@ -359,9 +360,9 @@ impl Site {
     ) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("prepared"))?;
-        machine.ask(Go::Prepare(step_budget, configuration))?;
-        match machine.step()? {
-            Step::Prepared(answer) => Ok(self.answered((*answer).map(|ready| {
+        machine.ask(Request::Prepare(step_budget, configuration))?;
+        match machine.reply()? {
+            Reply::Prepared(answer) => Ok(self.answered((*answer).map(|ready| {
                 *self.judging.write().unwrap_or_else(|e| e.into_inner()) = Some(ready.judging);
                 PlyValue::Unit
             }))),
@@ -418,7 +419,7 @@ impl Site {
 }
 
 /// `Ok(v)` or `Err(Refusal)`, as the program reads an operation's answer.
-impl Site {
+impl ProverHandler {
     fn answered(&self, answer: Result<PlyValue, Refused>) -> PlyValue {
         match answer {
             Ok(value) => PlyValue::ctor("Ok", vec![value]),
@@ -430,7 +431,7 @@ impl Site {
 // --- The thread the work lives on ---------------------------------------------
 
 /// What the program asks the machine for next.
-enum Go {
+enum Request {
     /// Compile the program's unit from the C it handed over.
     Compiled(Vec<u8>),
     /// Enter the definition `--config-schema` names on the program's unit.
@@ -440,7 +441,7 @@ enum Go {
     Prepare(i64, Configuration),
 }
 
-enum Step {
+enum Reply {
     Collected(Box<Result<Collection, Refused>>),
     Compiled(Result<(), Diagnostic>),
     Schema(Result<ply_eval::Plain, Diagnostic>),
@@ -450,35 +451,35 @@ enum Step {
 /// The thread the load and the store live on, and the prover is built on. Claims are judged on the
 /// threads the program asks from, against the [`Judging`] this thread publishes.
 struct Machine {
-    go: Option<mpsc::Sender<Go>>,
-    steps: mpsc::Receiver<Step>,
+    requests: Option<mpsc::Sender<Request>>,
+    replies: mpsc::Receiver<Reply>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Machine {
     fn start(job: Job) -> Result<Machine, Diagnostic> {
-        let (go, asked) = mpsc::channel();
-        let (told, steps) = mpsc::channel();
+        let (requests, asked) = mpsc::channel();
+        let (told, replies) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .stack_size(CLAIMS_STACK)
             .spawn(move || serve(job, &told, &asked))
             .map_err(|e| unspawned(&e))?;
         Ok(Machine {
-            go: Some(go),
-            steps,
+            requests: Some(requests),
+            replies,
             thread: Some(thread),
         })
     }
 
-    fn ask(&self, go: Go) -> Result<(), Diagnostic> {
-        match &self.go {
-            Some(sender) => sender.send(go).map_err(|_| unanswered()),
+    fn ask(&self, request: Request) -> Result<(), Diagnostic> {
+        match &self.requests {
+            Some(sender) => sender.send(request).map_err(|_| unanswered()),
             None => Err(unanswered()),
         }
     }
 
-    fn step(&self) -> Result<Step, Diagnostic> {
-        self.steps.recv().map_err(|_| unanswered())
+    fn reply(&self) -> Result<Reply, Diagnostic> {
+        self.replies.recv().map_err(|_| unanswered())
     }
 }
 
@@ -486,20 +487,20 @@ impl Drop for Machine {
     fn drop(&mut self) {
         // Dropping the sender ends whichever wait the thread is parked on, so a run that stopped
         // short of discharging leaves nothing running.
-        self.go.take();
+        self.requests.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
+fn serve(job: Job, told: &mpsc::Sender<Reply>, asked: &mpsc::Receiver<Request>) {
     let mut warnings = Vec::new();
     let loaded = match load(&job) {
         Ok(loaded) => loaded,
         Err(err) => {
-            let _ = told.send(Step::Collected(Box::new(Err(Refused {
-                why: Why::Broken,
+            let _ = told.send(Reply::Collected(Box::new(Err(Refused {
+                kind: RefusalKind::Broken,
                 diagnostics: err.diagnostics,
                 sources: err.sources,
             }))));
@@ -510,7 +511,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
 
     let obligations: &[Obligation] = &job.obligations;
 
-    let _ = told.send(Step::Collected(Box::new(Ok(Collection {
+    let _ = told.send(Reply::Collected(Box::new(Ok(Collection {
         sources: loaded.sources.clone(),
         warnings: std::mem::take(&mut warnings),
         obligations: obligations.len(),
@@ -523,20 +524,20 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
-            Ok(Go::Compiled(unit)) => {
+            Ok(Request::Compiled(unit)) => {
                 let built = unit_of(&loaded.front, &unit).map(|unit| {
                     backend = Some(unit);
                 });
-                let _ = told.send(Step::Compiled(built));
+                let _ = told.send(Reply::Compiled(built));
             }
-            Ok(Go::Schema(name)) => {
+            Ok(Request::Schema(name)) => {
                 let answer = match backend {
                     Some(unit) => crate::config::schema_of(&loaded.check, Some(unit), &name),
                     None => Err(uncompiled()),
                 };
-                let _ = told.send(Step::Schema(answer));
+                let _ = told.send(Reply::Schema(answer));
             }
-            Ok(Go::Prepare(step_budget, configuration)) => {
+            Ok(Request::Prepare(step_budget, configuration)) => {
                 if prepared.is_none() {
                     let built = backend.ok_or_else(uncompiled);
                     prepared = Some(prepare(&job, &loaded, built, step_budget, configuration));
@@ -548,7 +549,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     Some(Err(refused)) => Err(refused.clone()),
                     None => return,
                 };
-                let _ = told.send(Step::Prepared(Box::new(answer)));
+                let _ = told.send(Reply::Prepared(Box::new(answer)));
             }
             Err(_) => return,
         }
@@ -682,7 +683,7 @@ fn prepare(
     configuration: Configuration,
 ) -> Result<Prepared, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
-        why: Why::Unbound,
+        kind: RefusalKind::Unbound,
         diagnostics,
         sources: loaded.sources.clone(),
     };
@@ -741,14 +742,14 @@ fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Diagnos
 }
 
 #[derive(Clone)]
-enum Why {
+enum RefusalKind {
     Broken,
     Unbound,
 }
 
 #[derive(Clone)]
 struct Refused {
-    why: Why,
+    kind: RefusalKind,
     diagnostics: Vec<Diagnostic>,
     sources: SourceMap,
 }
@@ -766,9 +767,9 @@ struct Collection {
 // --- The values the program reads -------------------------------------------------
 
 fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
-    let named = match refused.why {
-        Why::Broken => "Broken",
-        Why::Unbound => "Unbound",
+    let named = match refused.kind {
+        RefusalKind::Broken => "Broken",
+        RefusalKind::Unbound => "Unbound",
     };
     ctor(
         module,

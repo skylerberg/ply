@@ -1,7 +1,7 @@
 //! The tables a unit names, written into its C and read back from it: one encoding, so what a
 //! unit says about itself is what loading it reads.
 
-use super::tables::Tables;
+use super::tables::BodyTables;
 use ply_eval::{Symbol, Value};
 
 /// The five tables a body and a whole unit both name, in one shared encoding.
@@ -53,13 +53,13 @@ pub(super) fn encode_const(v: &Value) -> String {
         Value::Char(c) => format!("c {}", u32::from(*c)),
         Value::Float(x) => format!("x {:016x}", x.to_bits()),
         Value::Decimal(d) => format!("d {} {}", d.mantissa(), d.scale()),
-        other => unreachable!("a constant this tier does not pool: {other:?}"),
+        other => unreachable!("a constant this backend does not pool: {other:?}"),
     }
 }
 
 /// Inverse of [`encode_tables`]; leaves the cursor after them.
-pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
-    let mut t = Tables::default();
+pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<BodyTables> {
+    let mut t = BodyTables::default();
     let n = count(line(s, at)?, "consts")?;
     for _ in 0..n {
         let l = line(s, at)?;

@@ -1,4 +1,4 @@
-//! Programs the builder compiles, entered in the C tier: each answers as the language says.
+//! Programs the builder compiles, entered in the C backend: each answers as the language says.
 
 use crate::fixture;
 use ply_codegen::Source;
@@ -65,7 +65,7 @@ fn built_and_checked() {
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
         assert_eq!(got, want, "`{name}{args:?}`");
@@ -134,7 +134,7 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
         assert_eq!(
             ctx.failed,
             0,
-            "`{name}{args:?}` raised in the C tier: {:?}",
+            "`{name}{args:?}` raised in the C backend: {:?}",
             ctx.diagnostic.as_ref().map(|d| d.message.clone())
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
@@ -297,19 +297,19 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
                 assert_eq!(
                     ctx.failed,
                     0,
-                    "`{name}{args:?}` raised in the C tier: {:?}",
+                    "`{name}{args:?}` raised in the C backend: {:?}",
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
                 assert_eq!(
                     got, want,
-                    "`{name}{args:?}`: the tier and the golden disagree"
+                    "`{name}{args:?}`: the C backend and the golden disagree"
                 );
             }
             Err(code) => {
                 assert_ne!(
                     ctx.failed, 0,
-                    "`{name}{args:?}` did not refuse in the C tier"
+                    "`{name}{args:?}` did not refuse in the C backend"
                 );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
                 assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
@@ -369,7 +369,7 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
         assert_eq!(
             ctx.failed,
             0,
-            "`{name}{args:?}` raised in the C tier: {:?}",
+            "`{name}{args:?}` raised in the C backend: {:?}",
             ctx.diagnostic.as_ref().map(|d| d.message.clone())
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
@@ -466,11 +466,11 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
         assert_eq!(
             ctx.failed,
             0,
-            "`{name}{args:?}` raised in the C tier: {:?}",
+            "`{name}{args:?}` raised in the C backend: {:?}",
             ctx.diagnostic.as_ref().map(|d| d.message.clone())
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-        let ours = ctx.record.clone().expect("the tier ran a region");
+        let ours = ctx.record.clone().expect("the C backend ran a region");
         ctx.end();
         let shape = |r: &ply_eval::region::Record| -> Vec<String> {
             r.steps
@@ -485,7 +485,7 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
         };
         assert_eq!(
             got, want,
-            "`{name}{args:?}`: the tier and the golden disagree"
+            "`{name}{args:?}`: the C backend and the golden disagree"
         );
         assert_eq!(
             format!("{:?}", shape(&ours)),
@@ -555,14 +555,14 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
         assert_eq!(
             ctx.failed,
             0,
-            "`{name}{args:?}` raised in the C tier: {:?}",
+            "`{name}{args:?}` raised in the C backend: {:?}",
             ctx.diagnostic.as_ref().map(|d| d.message.clone())
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
         assert_eq!(
             got, want,
-            "`{name}{args:?}`: the tier and the golden disagree"
+            "`{name}{args:?}`: the C backend and the golden disagree"
         );
     }
 }
@@ -664,7 +664,7 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let Some((_, native)) = built(MULTISHOT) else {
         return;
     };
-    // `across` captures under a task whose region has ended by the second resumption, so the tier refuses it.
+    // `across` captures under a task whose region has ended by the second resumption, so the C backend refuses it.
     // `threaded` and `later` resume into a cell opened before the stop: the second run reads what the first wrote.
     let cases: Vec<(&str, Vec<Value>, Result<Value, &str>)> = vec![
         ("m.both", vec![Value::Int(3)], Ok(Value::Int(303))),
@@ -698,19 +698,19 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
                 assert_eq!(
                     ctx.failed,
                     0,
-                    "`{name}{args:?}` raised in the C tier: {:?}",
+                    "`{name}{args:?}` raised in the C backend: {:?}",
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
                 assert_eq!(
                     got, want,
-                    "`{name}{args:?}`: the tier and the golden disagree"
+                    "`{name}{args:?}`: the C backend and the golden disagree"
                 );
             }
             Err(code) => {
                 assert_ne!(
                     ctx.failed, 0,
-                    "`{name}{args:?}` did not refuse in the C tier"
+                    "`{name}{args:?}` did not refuse in the C backend"
                 );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
                 assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
@@ -868,19 +868,19 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
                 assert_eq!(
                     ctx.failed,
                     0,
-                    "`{name}{args:?}` raised in the C tier: {:?}",
+                    "`{name}{args:?}` raised in the C backend: {:?}",
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
                 assert_eq!(
                     got, want,
-                    "`{name}{args:?}`: the tier and the golden disagree"
+                    "`{name}{args:?}`: the C backend and the golden disagree"
                 );
             }
             Err(code) => {
                 assert_ne!(
                     ctx.failed, 0,
-                    "`{name}{args:?}` did not refuse in the C tier"
+                    "`{name}{args:?}` did not refuse in the C backend"
                 );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
                 assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
@@ -965,7 +965,7 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
         assert_eq!(got, Value::Bool(want), "`{name}{args:?}`");

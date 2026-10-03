@@ -2,7 +2,7 @@
 //! other host names the ones it means, so what may drive a machine is a decision with a name and
 //! a summary a reviewer can read.
 
-use crate::hosts::Lent;
+use crate::hosts::LentOp;
 use ply_eval::{CheckOutput, Diagnostic, Span, codes};
 
 /// One family of capabilities, and what lending it lets a program do.
@@ -88,7 +88,7 @@ fn own(effect: &str) -> String {
 }
 
 /// The operations one family lends.
-pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
+pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
     Some(match family {
         "machine" => {
             let mut ops =
@@ -121,7 +121,7 @@ pub fn hermetic_of(family: &str) -> Option<&'static str> {
 }
 
 /// The operations of the named families, or why one of them is not a family.
-pub fn lent_for(families: &[&str], declared: Declared<'_>) -> Result<Vec<Lent>, String> {
+pub fn lent_for(families: &[&str], declared: Declared<'_>) -> Result<Vec<LentOp>, String> {
     let mut out = Vec::new();
     for family in families {
         match lent(family, declared) {
@@ -140,7 +140,7 @@ pub fn lent_for(families: &[&str], declared: Declared<'_>) -> Result<Vec<Lent>, 
 /// What `--allow` grants a program: the operations of every family it names, each of whose effect
 /// the program must declare. A family whose effect it does not declare reaches nothing, so granting
 /// one is refused rather than ignored.
-pub fn granted(check: &CheckOutput, allow: &[String]) -> Result<Vec<Lent>, Diagnostic> {
+pub fn granted(check: &CheckOutput, allow: &[String]) -> Result<Vec<LentOp>, Diagnostic> {
     let declared = |effect: &str| {
         check
             .effects
@@ -174,7 +174,7 @@ pub fn granted(check: &CheckOutput, allow: &[String]) -> Result<Vec<Lent>, Diagn
 }
 
 /// Every family, for a host that lends them all: the `ply` binary's own program.
-pub fn all() -> Vec<Lent> {
+pub fn all() -> Vec<LentOp> {
     FAMILIES
         .iter()
         .flat_map(|f| lent(f.name, &own).unwrap_or_default())

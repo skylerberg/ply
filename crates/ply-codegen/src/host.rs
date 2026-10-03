@@ -1,4 +1,4 @@
-//! The host boundary from the compiled tier: an unhandled `perform` reaches the context's binding
+//! The host boundary from the C backend: an unhandled `perform` reaches the context's binding
 //! through the machine's checks, in the machine's order.
 
 use crate::heap::{self, Heap, Walked, Word};

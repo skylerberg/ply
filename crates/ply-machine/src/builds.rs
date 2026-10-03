@@ -234,7 +234,7 @@ pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
 
 /// The shipped operations `front` declares: a builder behind this binary's shelf was built before
 /// any added since, and is lent only those it names.
-fn lent_to(front: &ply_eval::Analysis) -> Vec<crate::hosts::Lent> {
+fn lent_to(front: &ply_eval::Analysis) -> Vec<crate::hosts::LentOp> {
     let declared: std::collections::HashSet<&str> = front
         .check
         .effects

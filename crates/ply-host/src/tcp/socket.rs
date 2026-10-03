@@ -1,7 +1,7 @@
 //! `net` over loopback TCP, plaintext or TLS.
 
 use super::{Handles, Net, Op, not_a_listener, not_a_stream, unknown_handle};
-use crate::pool::{Bell, Done, Inbox, NET_FIRST_TOKEN, Pool};
+use crate::pool::{Bell, Inbox, JobOutput, NET_FIRST_TOKEN, Pool};
 use crate::tls::{self, Credentials, Handshakes};
 use ply_eval::{Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Value};
 use rustls::pki_types::ServerName;
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-enum Sock {
+enum Socket {
     /// `None` for plaintext; otherwise the config every accepted connection is terminated with.
     Listener(Arc<TcpListener>, Option<Arc<ServerConfig>>),
     Stream(Arc<TcpStream>),
@@ -22,19 +22,19 @@ enum Sock {
     Finished,
 }
 
-enum Conn {
+enum Connection {
     Plain(Arc<TcpStream>),
     Tls(Arc<tls::Session>),
 }
 
 /// The socket table and handle allocator, together because a completing `accept` inserts into both.
 struct Sockets {
-    open: Mutex<BTreeMap<i64, Sock>>,
+    open: Mutex<BTreeMap<i64, Socket>>,
     handles: Handles,
 }
 
 impl Sockets {
-    fn insert(&self, at: Option<&Resource>, sock: Sock) -> i64 {
+    fn insert(&self, at: Option<&Resource>, sock: Socket) -> i64 {
         let handle = self.handles.open(at);
         lock(&self.open).insert(handle, sock);
         handle
@@ -48,20 +48,20 @@ impl Sockets {
     ) -> Result<(Arc<TcpListener>, Option<Arc<ServerConfig>>), Diagnostic> {
         self.handles.check(handle, at, span)?;
         match lock(&self.open).get(&handle) {
-            Some(Sock::Listener(l, tls)) => Ok((Arc::clone(l), tls.clone())),
-            Some(Sock::Stream(_) | Sock::Tls(_)) => Err(not_a_listener(handle, span)),
+            Some(Socket::Listener(l, tls)) => Ok((Arc::clone(l), tls.clone())),
+            Some(Socket::Stream(_) | Socket::Tls(_)) => Err(not_a_listener(handle, span)),
             // Unreachable: `accept` checks the stop flag, set before any listener is swapped.
-            Some(Sock::Finished) => Err(not_a_listener(handle, span)),
+            Some(Socket::Finished) => Err(not_a_listener(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
     }
 
-    fn stream(&self, handle: i64, at: &Resource, span: Span) -> Result<Conn, Diagnostic> {
+    fn stream(&self, handle: i64, at: &Resource, span: Span) -> Result<Connection, Diagnostic> {
         self.handles.check(handle, at, span)?;
         match lock(&self.open).get(&handle) {
-            Some(Sock::Stream(s)) => Ok(Conn::Plain(Arc::clone(s))),
-            Some(Sock::Tls(s)) => Ok(Conn::Tls(Arc::clone(s))),
-            Some(Sock::Listener(..) | Sock::Finished) => Err(not_a_stream(handle, span)),
+            Some(Socket::Stream(s)) => Ok(Connection::Plain(Arc::clone(s))),
+            Some(Socket::Tls(s)) => Ok(Connection::Tls(Arc::clone(s))),
+            Some(Socket::Listener(..) | Socket::Finished) => Err(not_a_stream(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
     }
@@ -69,7 +69,7 @@ impl Sockets {
     fn connections(&self) -> usize {
         lock(&self.open)
             .values()
-            .filter(|s| matches!(s, Sock::Stream(_) | Sock::Tls(_)))
+            .filter(|s| matches!(s, Socket::Stream(_) | Socket::Tls(_)))
             .count()
     }
 }
@@ -128,7 +128,7 @@ impl TcpHost {
     /// The address a listening handle actually bound.
     pub fn local_addr(&self, handle: i64) -> Option<SocketAddr> {
         match lock(&self.sockets.open).get(&handle) {
-            Some(Sock::Listener(l, _)) => l.local_addr().ok(),
+            Some(Socket::Listener(l, _)) => l.local_addr().ok(),
             _ => None,
         }
     }
@@ -170,7 +170,7 @@ impl TcpHost {
         span: Span,
         label: &'static str,
         what: &'static str,
-        job: impl FnOnce() -> Done + Send + 'static,
+        job: impl FnOnce() -> JobOutput + Send + 'static,
     ) -> Result<HostAnswer, Diagnostic> {
         self.pool
             .submit(span, label, what, Box::new(job))
@@ -203,7 +203,7 @@ impl Net for TcpHost {
         let listener = super::bind(Op::Listen.what(), port, span)?;
         Ok(HostAnswer::Value(Value::Int(self.sockets.insert(
             Some(at),
-            Sock::Listener(Arc::new(listener), None),
+            Socket::Listener(Arc::new(listener), None),
         ))))
     }
 
@@ -217,7 +217,7 @@ impl Net for TcpHost {
         let (listener, config) = tls::listen(&self.credentials, credential, port, span)?;
         Ok(HostAnswer::Value(Value::Int(self.sockets.insert(
             Some(at),
-            Sock::Listener(Arc::new(listener), Some(config)),
+            Socket::Listener(Arc::new(listener), Some(config)),
         ))))
     }
 
@@ -235,9 +235,9 @@ impl Net for TcpHost {
         let host = host.to_string();
         let at = at.clone();
         self.waiting(span, "connect", Op::Connect.what(), move || {
-            Done::MaybeInt(
+            JobOutput::MaybeInt(
                 reach(&host, port, timeout)
-                    .map(|stream| sockets.insert(Some(&at), Sock::Stream(Arc::new(stream)))),
+                    .map(|stream| sockets.insert(Some(&at), Socket::Stream(Arc::new(stream)))),
             )
         })
     }
@@ -258,11 +258,11 @@ impl Net for TcpHost {
         self.waiting(span, "connect_tls", Op::ConnectTls.what(), move || {
             // A host that is not a DNS name or an IP address is one no server can be verified as.
             let Ok(name) = ServerName::try_from(host.clone()) else {
-                return Done::MaybeInt(None);
+                return JobOutput::MaybeInt(None);
             };
-            Done::MaybeInt(reach(&host, port, timeout).map(|stream| {
+            JobOutput::MaybeInt(reach(&host, port, timeout).map(|stream| {
                 let session = tls::Session::connect(config, name, Arc::new(stream), handshakes);
-                sockets.insert(Some(&at), Sock::Tls(Arc::new(session)))
+                sockets.insert(Some(&at), Socket::Tls(Arc::new(session)))
             }))
         })
     }
@@ -272,11 +272,11 @@ impl Net for TcpHost {
     /// `net.handshake`.
     fn handshake(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
         let session = match self.sockets.stream(conn, at, span)? {
-            Conn::Tls(session) => Some(session),
-            Conn::Plain(_) => None,
+            Connection::Tls(session) => Some(session),
+            Connection::Plain(_) => None,
         };
         self.waiting(span, "handshake", Op::Handshake.what(), move || {
-            Done::MaybeInt(
+            JobOutput::MaybeInt(
                 session
                     .and_then(|session| session.handshake())
                     .map(|us| us as i64),
@@ -288,7 +288,7 @@ impl Net for TcpHost {
         // Before the lookup, because `stop_accepting` has already swapped the listener out.
         if self.stopping.load(Ordering::Acquire) {
             self.sockets.handles.check(listener, at, span)?;
-            return self.waiting(span, "accept", Op::Accept.what(), || Done::Int(0));
+            return self.waiting(span, "accept", Op::Accept.what(), || JobOutput::Int(0));
         }
         let (listener, config) = self.sockets.listener(listener, at, span)?;
         let sockets = Arc::clone(&self.sockets);
@@ -299,27 +299,27 @@ impl Net for TcpHost {
         self.waiting(span, "accept", Op::Accept.what(), move || {
             let done = match listener.accept() {
                 // Taken as the run stopped accepting: the drain's wake dial, or a client racing it.
-                Ok(_) if stopping.load(Ordering::Acquire) => Done::Int(0),
+                Ok(_) if stopping.load(Ordering::Acquire) => JobOutput::Int(0),
                 // No label: the connection takes whichever one the program first uses it under.
                 Ok((stream, _)) => {
                     let stream = Arc::new(stream);
                     let sock = match config {
                         Some(config) => {
-                            Sock::Tls(Arc::new(tls::Session::new(config, stream, handshakes)))
+                            Socket::Tls(Arc::new(tls::Session::new(config, stream, handshakes)))
                         }
-                        None => Sock::Stream(stream),
+                        None => Socket::Stream(stream),
                     };
-                    Done::Int(sockets.insert(None, sock))
+                    JobOutput::Int(sockets.insert(None, sock))
                 }
                 // `0` is never a live handle: handles ascend from 1 and are never reused.
-                Err(e) if transient(&e) => Done::Int(retry_accept(
+                Err(e) if transient(&e) => JobOutput::Int(retry_accept(
                     &listener,
                     &sockets,
                     &config,
                     &handshakes,
                     &stopping,
                 )),
-                Err(_) => Done::Int(0),
+                Err(_) => JobOutput::Int(0),
             };
             accepts.fetch_sub(1, Ordering::AcqRel);
             done
@@ -336,7 +336,7 @@ impl Net for TcpHost {
     ) -> Result<HostAnswer, Diagnostic> {
         let conn = self.sockets.stream(conn, at, span)?;
         self.waiting(span, "recv", Op::Recv.what(), move || match conn {
-            Conn::Plain(stream) => {
+            Connection::Plain(stream) => {
                 // This job owns the socket for its duration, so setting its timeout is safe.
                 let _ = stream.set_read_timeout(Some(timeout));
                 let mut buffer = vec![0u8; max];
@@ -344,17 +344,17 @@ impl Net for TcpHost {
                 match (&*stream).read(&mut buffer) {
                     Ok(n) => {
                         buffer.truncate(n);
-                        Done::MaybeBytes(Some(buffer))
+                        JobOutput::MaybeBytes(Some(buffer))
                     }
-                    Err(e) if expired(&e) => Done::MaybeBytes(None),
-                    Err(e) if peer_gone(&e) => Done::MaybeBytes(Some(Vec::new())),
-                    Err(e) => Done::Failed(e.to_string()),
+                    Err(e) if expired(&e) => JobOutput::MaybeBytes(None),
+                    Err(e) if peer_gone(&e) => JobOutput::MaybeBytes(Some(Vec::new())),
+                    Err(e) => JobOutput::Failed(e.to_string()),
                 }
             }
             // Never `Failed`: any TLS failure is "the peer went away", so the accept loop survives.
-            Conn::Tls(session) => {
+            Connection::Tls(session) => {
                 session.deadline(timeout);
-                Done::MaybeBytes(session.read(max))
+                JobOutput::MaybeBytes(session.read(max))
             }
         })
     }
@@ -370,19 +370,19 @@ impl Net for TcpHost {
         let conn = self.sockets.stream(conn, at, span)?;
         let payload = payload.to_vec();
         self.waiting(span, "send", Op::Send.what(), move || match conn {
-            Conn::Plain(stream) => {
+            Connection::Plain(stream) => {
                 let _ = stream.set_write_timeout(Some(timeout));
                 // One `write`, which may be short under backpressure; `std.net.send_all` loops.
                 match (&*stream).write(&payload) {
-                    Ok(n) => Done::MaybeInt(Some(n as i64)),
-                    Err(e) if expired(&e) => Done::MaybeInt(None),
-                    Err(e) if peer_gone(&e) => Done::MaybeInt(Some(0)),
-                    Err(e) => Done::Failed(e.to_string()),
+                    Ok(n) => JobOutput::MaybeInt(Some(n as i64)),
+                    Err(e) if expired(&e) => JobOutput::MaybeInt(None),
+                    Err(e) if peer_gone(&e) => JobOutput::MaybeInt(Some(0)),
+                    Err(e) => JobOutput::Failed(e.to_string()),
                 }
             }
-            Conn::Tls(session) => {
+            Connection::Tls(session) => {
                 session.deadline(timeout);
-                Done::MaybeInt(Some(session.write(&payload) as i64))
+                JobOutput::MaybeInt(Some(session.write(&payload) as i64))
             }
         })
     }
@@ -393,16 +393,16 @@ impl Net for TcpHost {
         self.sockets.handles.close(socket);
         match sock {
             // Shut down, not just dropped: a `recv` parked on another `Arc` returns only then.
-            Some(Sock::Stream(s)) => {
+            Some(Socket::Stream(s)) => {
                 let _ = s.shutdown(Shutdown::Both);
                 Ok(HostAnswer::Value(Value::Unit))
             }
             // `close_notify` first, so the peer sees a clean end rather than a truncation.
-            Some(Sock::Tls(s)) => {
+            Some(Socket::Tls(s)) => {
                 s.close();
                 Ok(HostAnswer::Value(Value::Unit))
             }
-            Some(Sock::Listener(..) | Sock::Finished) => Ok(HostAnswer::Value(Value::Unit)),
+            Some(Socket::Listener(..) | Socket::Finished) => Ok(HostAnswer::Value(Value::Unit)),
             None => Err(unknown_handle(socket, span)),
         }
     }
@@ -410,10 +410,10 @@ impl Net for TcpHost {
     fn local_port(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
         self.sockets.handles.check(socket, at, span)?;
         let address = match lock(&self.sockets.open).get(&socket) {
-            Some(Sock::Listener(l, _)) => l.local_addr().ok(),
-            Some(Sock::Stream(s)) => s.local_addr().ok(),
-            Some(Sock::Tls(s)) => s.local_addr().ok(),
-            Some(Sock::Finished) => None,
+            Some(Socket::Listener(l, _)) => l.local_addr().ok(),
+            Some(Socket::Stream(s)) => s.local_addr().ok(),
+            Some(Socket::Tls(s)) => s.local_addr().ok(),
+            Some(Socket::Finished) => None,
             None => return Err(unknown_handle(socket, span)),
         };
         Ok(HostAnswer::Value(match address {
@@ -430,17 +430,17 @@ impl crate::signal::Accepting for TcpHost {
         let mut open = lock(&self.sockets.open);
         let listeners: Vec<i64> = open
             .iter()
-            .filter(|(_, s)| matches!(s, Sock::Listener(..)))
+            .filter(|(_, s)| matches!(s, Socket::Listener(..)))
             .map(|(handle, _)| *handle)
             .collect();
         let mut closed = Vec::new();
         for handle in &listeners {
-            if let Some(Sock::Listener(l, _)) = open.get(handle)
+            if let Some(Socket::Listener(l, _)) = open.get(handle)
                 && let Ok(address) = l.local_addr()
             {
                 closed.push(address);
             }
-            open.insert(*handle, Sock::Finished);
+            open.insert(*handle, Socket::Finished);
         }
         *lock(&self.closed_at) = closed;
         // The fd closes when the parked `accept` job drops its `Arc`, shortly after this returns.
@@ -451,7 +451,7 @@ impl crate::signal::Accepting for TcpHost {
         let mut addresses: Vec<SocketAddr> = lock(&self.sockets.open)
             .values()
             .filter_map(|s| match s {
-                Sock::Listener(l, _) => l.local_addr().ok(),
+                Socket::Listener(l, _) => l.local_addr().ok(),
                 _ => None,
             })
             .collect();
@@ -533,12 +533,12 @@ fn retry_accept(
                 let stream = Arc::new(stream);
                 // The listener's transport: a retry that dropped TLS would serve in the clear.
                 let sock = match config {
-                    Some(config) => Sock::Tls(Arc::new(tls::Session::new(
+                    Some(config) => Socket::Tls(Arc::new(tls::Session::new(
                         Arc::clone(config),
                         stream,
                         Arc::clone(handshakes),
                     ))),
-                    None => Sock::Stream(stream),
+                    None => Socket::Stream(stream),
                 };
                 return sockets.insert(None, sock);
             }
