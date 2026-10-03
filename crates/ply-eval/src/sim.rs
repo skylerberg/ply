@@ -479,8 +479,8 @@ impl Rand {
     }
 
     pub fn below(&mut self, bound: i64, span: Span) -> Result<i64, Diagnostic> {
-        let n = u64::try_from(bound).ok().filter(|n| *n > 0);
-        match n.and_then(|n| self.stream.below(n)) {
+        let n = bound_of(bound, span)?;
+        match self.stream.below(n) {
             // `x < n <= i64::MAX`, so the cast keeps the value.
             Some(x) => Ok(x as i64),
             None => Err(err_bad_bound(span, bound)),
@@ -566,6 +566,14 @@ impl Handlers {
             _ => Err(err_not_seeded(span, sig)),
         }
     }
+}
+
+/// What `random.below(bound)` draws below, or the raise a bound below one is.
+pub fn bound_of(bound: i64, span: Span) -> Result<u64, Diagnostic> {
+    u64::try_from(bound)
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| err_bad_bound(span, bound))
 }
 
 #[cold]

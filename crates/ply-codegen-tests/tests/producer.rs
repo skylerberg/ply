@@ -496,7 +496,7 @@ fn timed(n: Int) -> Int / {sim.read} = simulate {
   match clock.now() { Instant(at) -> at }
 }
 
-fn drawn(bound: Int) -> Int / {sim.read} = simulate { random.below(bound) * 7 + random.below(bound) }
+fn drawn(bound: Int) -> Int / {sim.read, abort.raise} = simulate { random.below(bound) * 7 + random.below(bound) }
 
 fn racing(n: Int) -> Int / {sim.read, abort.raise} =
   with_cell[r](0) { c ->
