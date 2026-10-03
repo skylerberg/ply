@@ -67,6 +67,7 @@ pub const RESULT: &str = include_str!("../ply/result.ply");
 pub const ROUTER: &str = include_str!("../ply/router.ply");
 
 pub const SET: &str = include_str!("../ply/set.ply");
+pub const SHOW: &str = include_str!("../ply/show.ply");
 
 pub const TRACE: &str = include_str!("../ply/trace.ply");
 
@@ -114,6 +115,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.result", RESULT),
     ("std.router", ROUTER),
     ("std.set", SET),
+    ("std.show", SHOW),
     ("std.signal", SIGNAL),
     ("std.string", STRING),
     ("std.time", TIME),

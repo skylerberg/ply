@@ -11,8 +11,8 @@ import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, S
               t_colon, t_dot, t_dotdot, t_arrow, t_eq, t_pipe, t_pipepipe, t_question, t_star,
               k_let, k_if, k_else, k_with, rec, nlist, opt, word, dump_list, dump_opt, dump_ident,
               dump_qname, dump_diags, with_no_pipe, advance_n, tok_at, t_gt, t_lt)
-import lexer (Tok, TIdent, TInt, TFixed, TWide, TFloat, TDec, TStr, TLines, TBytes, TChar, TKw,
-              TPunct, TEof)
+import lexer (Tok, TIdent, TInt, TFixed, TWide, TFloat, TDec, TStr, TLines, TBytes, TFHead, TFMid,
+              TFTail, TChar, TKw, TPunct, TEof)
 import types (TypeExpr, ty, ty_span, dump_ty)
 import patterns (Pattern, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
                  pattern, pat_span, no_pattern, dump_pattern, dump_lit)
@@ -510,6 +510,7 @@ fn primary_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
     TStr(s) -> lit_expr(c, p, LStr(s)),
     TLines(s) -> lit_expr(c, p, LStr(s)),
     TBytes(b) -> lit_expr(c, p, LBytes(b)),
+    TFHead(t) -> interpolated(c, p, t),
     TChar(v) -> lit_expr(c, p, LChar(v)),
     TKw(k) -> if k == b"true" { lit_expr(c, p, LBool(true)) }
     else if k == b"false" { lit_expr(c, p, LBool(false)) }
@@ -628,6 +629,69 @@ fn map_literal_inner(c: Ctx, p: P, set: Bool) -> Result<R<Expr>, P> = {
     }),
   })
 }
+
+// --- Interpolated strings ---------------------------------------------------
+
+// The binder under which a module that interpolates imports `std.show`; no source can spell it.
+pub fn shown_binder() -> Bytes = b"?show"
+
+// `f"a {x} b"` is `"a " ++ display(x) ++ " b"`, `display` being `std.show`'s.
+fn interpolated(c: Ctx, p: P, head: Bytes) -> Result<R<Expr>, P> = {
+  let saved = p.no_brace;
+  let first = cur_span(c, p);
+  match holes(c, with_no_brace(p, false), first, [ELit({ span: first, lit: LStr(head) })]) {
+    Err(q) -> Err(with_no_brace(q, saved)),
+    Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
+  }
+}
+
+// At a `TFHead` or a `TFMid`: the hole after it, and the text that closes the hole.
+fn holes(c: Ctx, p: P, first: Span, parts: List<Expr>) -> Result<R<Expr>, P> = {
+  let opened = advance(c, p);
+  let { p, node: e } = expr(c, opened.p)?;
+  let shown = push(parts, displayed(e));
+  let sp = cur_span(c, p);
+  match kind(c, p) {
+    TFMid(t) -> holes(c, p, first, push(shown, ELit({ span: sp, lit: LStr(t) }))),
+    TFTail(t) -> {
+      let closed = advance(c, p);
+      let all = push(shown, ELit({ span: sp, lit: LStr(t) }));
+      Ok({ p: closed.p, node: concatenated(span_to(first, closed.node), all) })
+    },
+    _ -> Err(error_here(c, p, b"`}` to close the interpolated value")),
+  }
+}
+
+fn displayed(e: Expr) -> Expr = {
+  let sp = expr_span(e);
+  EApp({
+    span: sp,
+    func: EVar({
+      span: sp,
+      name: {
+        module: Some({ name: shown_binder(), span: sp }),
+        name: { name: b"display", span: sp },
+        span: sp,
+      },
+    }),
+    named: [],
+    args: [e],
+    labels: [],
+  })
+}
+
+// The pieces concatenated, empty text dropped; the outermost node spans the whole literal.
+fn concatenated(span: Span, parts: List<Expr>) -> Expr = {
+  let kept = filter(parts, |e: Expr| match e { ELit(l) -> l.lit != LStr(b""), _ -> true });
+  let chained = fold(range(1, len(kept)), at_expr(kept, 0), |acc: Expr, i: Int| {
+    let x = at_expr(kept, i);
+    EBinary({ span: span_to(expr_span(acc), expr_span(x)), op: b"concat", lhs: acc, rhs: x })
+  });
+  set_span(chained, span)
+}
+
+fn at_expr(xs: List<Expr>, i: Int) -> Expr =
+  match list_at(xs, i) { Some(x) -> x, None -> ELit({ span: dummy_span(), lit: LStr(b"") }) }
 
 fn map_entry(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   let { p, node: key } = expr(c, p)?;
