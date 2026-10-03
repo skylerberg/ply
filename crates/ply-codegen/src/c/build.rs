@@ -28,6 +28,13 @@ pub struct Native {
 }
 
 impl Native {
+    /// The definitions the unit holds, in name order.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.entries.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub fn entry(&self, name: &str) -> Option<Entry> {
         self.entries.get(name).map(|(e, _)| *e)
     }
@@ -358,15 +365,6 @@ pub(super) fn finish_unit(lib: Library, source: Option<&Source>) -> Result<(Nati
     let refused = refused_of(&exports);
     let native = finish(lib, exports, source)?;
     Ok((native, refused))
-}
-
-/// Whether a unit produced elsewhere serves this runtime; refusal is an [`Unserved`].
-pub fn served(text: &str, stem: &str) -> Result<()> {
-    let lib = compile_and_load(text, stem)?;
-    match Exports::read(&lib)?.unserved() {
-        Some(why) => Err(why.into()),
-        None => Ok(()),
-    }
 }
 
 fn refused_of(exports: &Exports) -> Vec<Refused> {

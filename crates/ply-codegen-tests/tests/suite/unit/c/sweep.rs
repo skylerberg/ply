@@ -83,6 +83,28 @@ fn an_object_used_lately_outlives_one_written_later() {
     );
 }
 
+/// The sweep orders entries by hours, so a use minutes after the last one writes nothing.
+#[test]
+fn a_recent_mark_stands_and_an_old_one_is_renewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mark = |name: &str, ago: u64| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"x").unwrap();
+        let when = SystemTime::now() - Duration::from_secs(ago);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+        (path, when)
+    };
+    let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+    let (recent, when) = mark("recent.dylib", 60);
+    used(&recent);
+    assert_eq!(modified(&recent), when);
+    let (old, when) = mark("old.dylib", 7_200);
+    used(&old);
+    assert!(modified(&old) > when);
+}
+
 /// A half-written entry belongs to a run still in progress.
 #[test]
 fn a_temporary_is_never_swept() {

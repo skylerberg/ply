@@ -115,12 +115,7 @@ fn a_real_answer_reads_to_the_program_it_describes() {
         assert!(front.hashes.defs.contains_key(&named(def)), "{def}");
     }
     assert_eq!(front.hashes.tests.len(), 1);
-    assert!(
-        front
-            .hashes
-            .closure
-            .contains_key(&named("m.picks the first"))
-    );
+    assert!(front.hashes.deps.contains_key(&named("m.picks the first")));
     assert_eq!(front.test_bodies.len(), 1);
 
     assert_eq!(
