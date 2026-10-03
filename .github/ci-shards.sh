@@ -52,8 +52,9 @@ TIMINGS=/tmp/ply-test-timings/timings.tsv
 
 TAB=$'\t'
 
-# Tests that get a runner of their own, as `id:package:target:test`. A long test is no reason: the
-# cut balances by duration. A test that must not share its runner is, since the cut cannot see that.
+# Tests that run alone, as `id:package:target:test`, after the gates on the gates job's runner. A long
+# test is no reason: the cut balances by duration. A test that must not share its runner is, since the
+# cut cannot see that.
 SOLO=(
   # It takes every test thread (nextest.toml), so in a shard it would run alone for its whole length
   # on top of the shard's share.
@@ -92,9 +93,8 @@ PACKAGE_SUITES=(
   "suite:crates/ply-test/ply"
 )
 
-# The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
-# `test-hosts` runs them in one job. The set was named for postgres when the driver lived in the
-# host; the exclusion is the same and the name is not.
+# The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
+# gates job runs them after its own tests.
 HOST_PACKAGES=(ply-host-tests)
 
 # Crate directories that are deliberately not workspace members, as `name:why`.
@@ -643,6 +643,7 @@ cmd_cache_keys() {
     function note(kind, value, key) {
       key = literal(value)
       if (key == "") return
+      steplit[++nlit] = key
       if (kind == "save") {
         if (key in saved) return
         saved[key] = 1
@@ -656,12 +657,35 @@ cmd_cache_keys() {
         read[key] = 1
       }
     }
-    FNR == 1 { mode = ""; inkeys = 0; indent = 0 }
+    # A step is done: what it saves is saved from its path, and what it restores is only an entry
+    # saved from the same path, since a path is part of an entry'"'"'s version.
+    function flush(i) {
+      for (i = 1; i <= nlit; i++) {
+        if (mode == "save") savepath[steplit[i]] = steppath
+        else if (mode == "restore") { rlit[++nr] = steplit[i]; rpath[nr] = steppath; rwhere[nr] = stepwhere }
+      }
+      nlit = 0; steppath = ""; inpath = 0
+    }
+    FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0 }
     # A new list item is a new step; the rules below read the one they are in.
-    /^[[:space:]]*-[[:space:]]/ { mode = ""; inkeys = 0 }
-    /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; next }
-    /uses:[[:space:]]*actions\/cache\/restore@/ { mode = "restore"; inkeys = 0; next }
+    /^[[:space:]]*-[[:space:]]/ { flush(); mode = ""; inkeys = 0 }
+    /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
+    /uses:[[:space:]]*actions\/cache\/restore@/ { mode = "restore"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
     mode == "" { next }
+    inpath {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      if (line != "" && length($0) - length(line) > pindent) { steppath = steppath (steppath == "" ? "" : ",") line; next }
+      inpath = 0
+    }
+    /^[[:space:]]*path:/ {
+      rest = $0
+      sub(/.*path:[[:space:]]*/, "", rest)
+      pindent = match($0, /[^ ]/) - 1
+      if (rest == "|") inpath = 1
+      else steppath = rest
+      next
+    }
     inkeys && /^[[:space:]]*$/ { next }
     inkeys {
       line = $0
@@ -683,7 +707,15 @@ cmd_cache_keys() {
       note(mode, rest)
     }
     END {
+      flush()
       bad = 0
+      for (i = 1; i <= nr; i++)
+        for (k in savepath)
+          if (index(k, rlit[i]) == 1 && savepath[k] != rpath[i] && !((rwhere[i], rlit[i]) in told)) {
+            told[rwhere[i], rlit[i]] = 1
+            printf "FAIL: %s restores \"%s\" into %s, and \"%s\" is saved from %s: a path is part of an entry'"'"'s version, so the restore never finds it\n", rwhere[i], rlit[i], rpath[i], k, savepath[k] > "/dev/stderr"
+            bad = 1
+          }
       if (n == 0 || length(read) == 0) {
         printf "FAIL: read %d cache key literal(s) written and %d restored -- the check would pass vacuously\n", n, length(read) > "/dev/stderr"
         exit 1
