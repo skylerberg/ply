@@ -21,7 +21,7 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
               atoms_sorted, atoms_union, atoms_contains, atoms_difference, resource_covers,
               row_empty, row_open, row_closed, row_singleton, row_is_pure, row_is_pure_but_raise,
-              without_abort, is_div, div_atom, row_union, row_without, row_without_covered,
+              without_abort, is_diverges, row_union, row_without, row_without_covered,
               atom_conflicts, atom_covers, named_type, applied_type, int_type, bool_type,
               string_type, bytes_type, float_type, decimal_type, unit_type, list_type, option_type,
               map_type, iter_type, secret_type, fn_type, monomorphic, fields_sorted, field_get,
@@ -35,8 +35,8 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               region_of, label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
               scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
               print_row)
-import termination (Callee, GroupMember, BuiltinCallee, DefinedCallee, OtherCallee, Ending, Ends,
-                    Diverges, ending)
+import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
+                    OtherCallee, Ending, Ends, Diverges, Summary, Verdict, verdict)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, Declared,
                 ModuleEntry, Diag, Label, Edit, Fix, with_fix, insertion, Namespace, ValueSpace,
                 TypeSpace, EffectSpace, resolve_modules, ResolveSucceeded, ResolveFailed, Expanded,
@@ -99,8 +99,10 @@ pub type DefInfo = {
   // What the written row promises bounded, which is all a caller in another package reads.
   bounded: List<Atom>,
   tail_bounded: Bool,
-  // Whether its calls are known to return (`div` where they may not).
+  // Whether its calls are known to return (`diverges` where they may not).
   ending: Ending,
+  // How it calls the functions it is handed and what it answers, which callers' endings read.
+  summary: Summary,
   row_aliases: List<Bytes>,
   constraints: List<DefConstraint>,
   spec: List<SpecInfo>,
@@ -302,6 +304,8 @@ pub type KnownDef = {
   performed: List<Atom>,
   scaling: List<Atom>,
   repeats: List<Int>,
+  ending: Ending,
+  summary: Summary,
 }
 // `root`: the modules below it are the run's own, whose promises are checked here; a dependency's
 // were checked when its package was.
@@ -363,6 +367,8 @@ type Checker = {
   witness_refs: List<WitnessRef>,
   witness_orders: List<WitnessOrder>,
   group_refs: List<GroupRef>,
+  // How each definition checked so far calls the functions it is handed, and what it answers.
+  summaries: Map<Bytes, Summary>,
   concats: List<ConcatSite>,
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
@@ -531,7 +537,8 @@ fn with_unified(checker: Checker, unified: Unified) -> Checker =
 
 // --- The prelude ----------------------------------------------------------------------
 
-fn prelude_effect_names() -> List<Bytes> = [b"task", b"clock", b"random", b"sim", b"abort", b"div"]
+fn prelude_effect_names() -> List<Bytes> =
+  [b"task", b"clock", b"random", b"sim", b"abort", b"diverges"]
 pub fn is_prelude_effect(name: Bytes) -> Bool = contains_bytes(prelude_effect_names(), name)
 fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
 
@@ -805,7 +812,7 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       ops: [prelude_op(b"raise", MRead, [0], [], [string_type()], ta, row_empty())],
     },
     // Divergence names no operation: nothing performs it, and nothing handles it.
-    { name: b"div", module: b"", simple_name: b"div", nondet: false, at: none, ops: [] },
+    { name: b"diverges", module: b"", simple_name: b"diverges", nondet: false, at: none, ops: [] },
   ]
 }
 
@@ -2254,8 +2261,8 @@ fn conv_atom(
               None -> None,
             },
             None -> {
-              // `div` names no operation: it is written bare and stands for itself.
-              let declares_mode = eff == b"div"
+              // `diverges` names no operation: it is written bare and stands for itself.
+              let declares_mode = eff == b"diverges"
                 || (match info {
                   Some(i) ->
                     fold(i.ops, false, |acc: Bool, o: OpInfo| acc || mode_eq(o.mode, a.mode)),
@@ -7113,13 +7120,15 @@ fn group_callee_kind(
   qualified: List<Bytes>,
   qname: QName,
 ) -> Callee / {abort.raise} =
-  match declared_value(checker, qname) {
-    Some(n) ->
-      fold(range(0, len(qualified)), DefinedCallee(n), |acc: Callee, i: Int|
-        if at(qualified, i) == n { GroupMember(i) } else { acc }),
-    None -> if is_bare(qname) && env_depth_of(checker.env, qname.name.name) == Some(0) {
-      BuiltinCallee(qname.name.name)
-    } else { OtherCallee },
+  if is_ctor_name(qname.name.name) { ConstructorCallee } else {
+    match declared_value(checker, qname) {
+      Some(n) ->
+        fold(range(0, len(qualified)), DefinedCallee(n), |acc: Callee, i: Int|
+          if at(qualified, i) == n { GroupMember(i) } else { acc }),
+      None -> if is_bare(qname) && env_depth_of(checker.env, qname.name.name) == Some(0) {
+        BuiltinCallee(qname.name.name)
+      } else { OtherCallee },
+    }
   }
 
 fn check_component(
@@ -7252,15 +7261,31 @@ fn check_component(
       }
     },
   );
-  let verdict: Ending = ending({
+  let read: Verdict = verdict({
     defs: map(comp, |i: Int| at(fns, i)),
     params: map(sigs.sigs, |s: Signature| map(s.params, |ty: Type| resolve(bodies.checker, ty))),
     resolve: |qname: QName| group_callee_kind(bodies.checker, qualified, qname),
     ending_of: |n: Bytes| match def_of(bodies.checker, n) { Some(d) -> d.ending, None -> Ends },
+    summary_of: |n: Bytes| map_get(bodies.checker.summaries, n),
   });
+  // A definition published from its filed rows answers what it was filed with: its body may be a
+  // stub's blank.
+  let filed: List<Option<KnownDef>> = map(range(0, len(comp)), |slot: Int|
+    seeded_rows(bodies.checker, at(fns, at(comp, slot)), at(qualified, slot)));
+  let ending_of = |slot: Int| match at(filed, slot) { Some(k) -> k.ending, None -> read.ending };
+  let summary_of = |slot: Int|
+    match at(filed, slot) { Some(k) -> k.summary, None -> at(read.summaries, slot) };
+  let summarized: Checker = {
+    ..bodies.checker,
+    summaries: fold(
+      range(0, len(comp)),
+      bodies.checker.summaries,
+      |m: Map<Bytes, Summary>, slot: Int| map_insert(m, at(qualified, slot), summary_of(slot)),
+    ),
+  };
   let settled: Checker = settle_bit_ops(
     settle_numerics(
-      settle_concats(settle_updates({ ..bodies.checker, group_defs: [], group_rows: [] })),
+      settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
     ),
   );
   let required: Checker = fold(range(0, len(comp)), settled, |c: Checker, slot: Int|
@@ -7325,7 +7350,8 @@ fn check_component(
         repeats: counted.repeats,
         bounded: bounded,
         tail_bounded: sig.tail_bounded,
-        ending: verdict,
+        ending: ending_of(slot),
+        summary: summary_of(slot),
         row_aliases: row_aliases(def),
         constraints: constraints,
         spec: [],
@@ -7810,7 +7836,7 @@ fn narrowed_by_row(dec: List<Atom>, o: Offence) -> Bool =
   match o.site { Some(s) -> narrowed_site(dec, s), None -> false }
 
 fn atom_written(checker: Checker, atom: Atom) -> Bytes / {abort.raise} =
-  if is_div(atom) { b"div" } else {
+  if is_diverges(atom) { b"diverges" } else {
     bytes_concat_all([
       as_written(checker, atom.effect),
       b".",
@@ -10706,6 +10732,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     witness_refs: [],
     witness_orders: [],
     group_refs: [],
+    summaries: map_new(),
     concats: [],
     updates: [],
     update_shapes: [],
@@ -11214,6 +11241,8 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
       performed: def_info.performed,
       scaling: def_info.scaling,
       repeats: def_info.repeats,
+      ending: def_info.ending,
+      summary: def_info.summary,
     }));
   // Tests are in load order, then source order, so each `test` item takes the next entry.
   let walked = fold(
@@ -13437,12 +13466,118 @@ test "a group terminates when every loop through it descends, through a builtin'
   )
 }
 
-test "a row may write div, the atom of a call that may not return" {
-  assert_eq(check_codes(b"fn spin(n: Int) -> Int / {div} = spin(n)\n"), []);
+test "a guard an earlier arm failed, an index found, and a write that keeps the length bound a walk" {
+  assert(
+    !diverges(
+      b"fn down(p: { left: Int, seen: Int }) -> Int = match p { { left, seen } if left <= 0 -> seen, { left, seen } -> down({ left: left - 1, seen: seen + 1 }) }\n",
+      b"down",
+    ),
+  );
+  assert(
+    diverges(
+      b"fn down(p: { left: Int, seen: Int }) -> Int = match p { { left, seen } if left > 9 -> seen, { left, seen } -> down({ left: left - 1, seen: seen + 1 }) }\n",
+      b"down",
+    ),
+  );
+  assert(
+    !diverges(
+      b"fn last(xs: List<Int>, i: Int, seen: Option<Int>) -> Option<Int> = match list_at(xs, i) { None -> seen, Some(x) -> last(xs, i + 1, Some(x)) }\n",
+      b"last",
+    ),
+  );
+  assert(
+    !diverges(
+      b"fn fill(a: Array<Int>, i: Int) -> Array<Int> = if i >= array_len(a) { a } else { fill(array_set(a, i, i * 2), i + 1) }\n",
+      b"fill",
+    ),
+  );
+  assert(
+    !diverges(
+      b"fn zero(xs: List<Int>, i: Int) -> List<Int> = if i >= len(xs) { xs } else { zero(list_set(xs, i, 0), i + 1) }\n",
+      b"zero",
+    ),
+  )
+}
+
+test "a constant past Int's range leaves the termination check unsure rather than broken" {
   assert_eq(
     check_codes(
-      b"fn spin(n: Int) -> Int / {div} = spin(n)\nfn use(n: Int) -> Int / {div} = spin(n)\n",
+      b"fn up() -> Int = 9223372036854775807 + 1\nfn down() -> Int = 0 - 9223372036854775807 - 1 - 1\n",
     ),
     [],
+  );
+  assert(
+    diverges(
+      b"fn far(n: Int) -> Int = if n <= 0 { 0 } else { far(n + 9223372036854775807 + 1) }\n",
+      b"far",
+    ),
   )
+}
+
+test "a bound one member of a group guards holds for the loops through the others" {
+  let src = b"fn nest(n: Int, d: Int) -> Int = if d >= 10 { 0 } else { inner(n, d + 1) }\nfn inner(n: Int, d: Int) -> Int = nest(n, d) + 1\n";
+  assert(!diverges(src, b"nest"));
+  assert(!diverges(src, b"inner"));
+  assert(
+    diverges(
+      b"fn nest(n: Int, d: Int) -> Int = if d >= 10 { 0 } else { inner(n, d + 1) }\nfn inner(n: Int, d: Int) -> Int = nest(n, d - 1)\n",
+      b"nest",
+    ),
+  )
+}
+
+test "a lookup folded to the part it finds answers a part, however the start holds nothing" {
+  let src = |found: Bytes|
+    bytes_concat_all([
+      b"type T = | Leaf | Node(List<{ key: Int, kid: T }>)\n",
+      b"fn find(fs: List<{ key: Int, kid: T }>, k: Int) -> Option<T> =\n  fold(fs, None, |acc: Option<T>, f: { key: Int, kid: T }| if f.key == k { Some(",
+      found,
+      b") } else { acc })\n",
+      b"fn depth(t: T) -> Int = match t { Leaf -> 0, Node(fs) -> match find(fs, 0) { Some(kid) -> 1 + depth(kid), None -> 0 } }\n",
+    ]);
+  assert(!diverges(src(b"f.kid"), b"depth"));
+  assert(diverges(src(b"Node(fs)"), b"depth"))
+}
+
+test "a list written of parts, pushed or filtered or mapped to parts, is made of parts" {
+  let tree = b"type T = | Leaf | Node(T, T) | Many(List<T>) | Named(List<{ name: String, value: T }>)\n";
+  let walked = |name: Bytes, arms: Bytes|
+    bytes_concat_all([
+      tree,
+      b"fn ",
+      name,
+      b"(t: T) -> Bool = {\n  let any = |xs: List<T>| fold(xs, false, |acc: Bool, x: T| acc || ",
+      name,
+      b"(x));\n  match t { Leaf -> true, ",
+      arms,
+      b" }\n}\n",
+    ]);
+  assert(!diverges(walked(b"listed", b"Node(l, r) -> any([l, r]), _ -> false"), b"listed"));
+  assert(!diverges(walked(b"pushed", b"Node(l, r) -> any(push([l], r)), _ -> false"), b"pushed"));
+  assert(
+    !diverges(walked(b"kept", b"Many(xs) -> any(filter(xs, |x: T| true)), _ -> false"), b"kept"),
+  );
+  assert(
+    !diverges(
+      walked(
+        b"projected",
+        b"Named(fs) -> any(map(fs, |f: { name: String, value: T }| f.value)), _ -> false",
+      ),
+      b"projected",
+    ),
+  );
+  // Pushing the value itself makes a list one of whose elements is not smaller.
+  assert(diverges(walked(b"again", b"Many(xs) -> any(push(xs, t)), _ -> false"), b"again"))
+}
+
+test "a row may write diverges, the atom of a call that may not return" {
+  assert_eq(check_codes(b"fn spin(n: Int) -> Int / {diverges} = spin(n)\n"), []);
+  assert_eq(
+    check_codes(
+      b"fn spin(n: Int) -> Int / {diverges} = spin(n)\nfn use(n: Int) -> Int / {diverges} = spin(n)\n",
+    ),
+    [],
+  );
+  // `div` names an effect set like any other name, and none is declared.
+  assert_eq(check_codes(b"fn spin(n: Int) -> Int / {div} = spin(n)\n"), [b"E0114"])
 }
