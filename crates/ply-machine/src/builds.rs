@@ -6,7 +6,7 @@
 use crate::enter::{self, Binds};
 use crate::runnable::{self, Runnable};
 use ply_codegen::c::{stage, sweep};
-use ply_eval::{Diagnostic, Span, codes};
+use ply_eval::{Diagnostic, Severity, Span, codes};
 use std::path::{Path, PathBuf};
 
 /// Where the compiler's package sits in a stage laid out from the shelf, as `ply bootstrap` reads
@@ -40,54 +40,6 @@ pub fn digest_of(modules: &[(String, String)]) -> String {
         h.update(&[0]);
     }
     h.finalize().to_hex()[..16].to_string()
-}
-
-/// The emitter's program: the compiler's modules and the shipped modules they import, transitively,
-/// read off their import lines, since its identity is needed before any compiler runs.
-pub fn emitter_program() -> Vec<(String, String)> {
-    let mut program: Vec<(String, String)> = ply_compiler::sources()
-        .map(|(m, t)| (m.to_string(), t.to_string()))
-        .collect();
-    let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut frontier: Vec<String> = program
-        .iter()
-        .flat_map(|(_, text)| imports_of(text))
-        .collect();
-    while let Some(name) = frontier.pop() {
-        if let Some(text) = ply_std::source(&name)
-            && wanted.insert(name)
-        {
-            frontier.extend(imports_of(text));
-        }
-    }
-    program.extend(
-        ply_std::sources()
-            .filter(|(name, _)| wanted.contains(*name))
-            .map(|(name, text)| (name.to_string(), text.to_string())),
-    );
-    program
-}
-
-/// What the emitter is a function of, so a shipped module the compiler never reads moves nothing
-/// kept under it.
-pub fn emitter() -> String {
-    static EMITTER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    EMITTER
-        .get_or_init(|| digest_of(&emitter_program()))
-        .clone()
-}
-
-/// The module each `import` line of `text` opens with.
-fn imports_of(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| line.strip_prefix("import "))
-        .map(|rest| {
-            rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
-                .next()
-                .unwrap_or("")
-                .to_string()
-        })
-        .collect()
 }
 
 /// What a builder is a function of: the shelf it is built from, the compiler among it, and the
@@ -230,6 +182,44 @@ pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
     built?;
     landed(&fresh, &at)?;
     std::fs::read(&at).map_err(|e| unbuilt(format!("`{}` could not be read: {e}", at.display())))
+}
+
+/// [`answered`] read back: the front end's answer, a refusal's included, and the unit's C.
+pub fn answered_program(files: &[(String, String)]) -> Result<Runnable, Diagnostic> {
+    let bytes = answered(files)?;
+    runnable::decode(&bytes)
+        .map_err(|why| unbuilt(format!("what it answered does not read: {why}")))
+}
+
+/// [`answered_program`] of a program that has to check: one the front end refused is the first
+/// error it was refused with, the rest as its notes.
+pub fn checked_program(files: &[(String, String)]) -> Result<Runnable, Diagnostic> {
+    let program = answered_program(files)?;
+    let mut errors = program
+        .front
+        .answer
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error);
+    match errors.next() {
+        None => Ok(program),
+        Some(first) => Err(errors.fold(first.clone(), |refused, more| {
+            refused.note(format!("and {}: {}", more.code, more.message))
+        })),
+    }
+}
+
+/// Each `(module name, text)` as the file its name spells, `a.b` at `a/b.ply`.
+pub fn module_files(modules: &[(&str, &str)]) -> Vec<(String, String)> {
+    modules
+        .iter()
+        .map(|(name, text)| {
+            (
+                format!("{}.ply", name.replace('.', "/")),
+                (*text).to_string(),
+            )
+        })
+        .collect()
 }
 
 /// The shipped operations `front` declares: a builder behind this binary's shelf was built before
