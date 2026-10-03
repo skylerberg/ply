@@ -47,6 +47,9 @@ pub struct Tables {
     pub functions: Vec<usize>,
     /// Each pure nullary function's memoized answer by index, as an immortal word; `0` is none.
     pub memo: Box<[AtomicI64]>,
+    /// What computing each memoized answer cost, in calls and allocations, stored before the
+    /// answer is: a later read charges it, so a cost is the same whether or not it was memoized.
+    pub memo_costs: Box<[(AtomicI64, AtomicI64)]>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
     pub immortals: Mutex<Heap>,
     /// The 256 one-byte values, each made immortal when first asked for; `0` is not yet.
@@ -118,6 +121,26 @@ impl Tables {
             slot.store(kept, Release);
         }
         kept
+    }
+
+    /// As [`Tables::memoize`], with what computing the answer cost, which every later read charges.
+    pub fn memoize_costing(&self, index: usize, w: Word, cost: Cost) -> Word {
+        if let Some((steps, allocations)) = self.memo_costs.get(index) {
+            steps.store(cost.steps, Release);
+            allocations.store(cost.allocations, Release);
+        }
+        self.memoize(index, w)
+    }
+
+    /// What computing the memoized answer at `index` cost.
+    pub fn memo_cost(&self, index: usize) -> Cost {
+        match self.memo_costs.get(index) {
+            Some((steps, allocations)) => Cost {
+                steps: steps.load(Acquire),
+                allocations: allocations.load(Acquire),
+            },
+            None => Cost::default(),
+        }
     }
 
     /// The value a memo word was converted to before, if it was.
@@ -492,6 +515,9 @@ pub struct Ctx {
     pub site_end: i64,
     /// Calls this entry has made: the prologue counts one, and so does every pass of a loop.
     pub ticks: i64,
+    /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
+    /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
+    pub charged: Cost,
     /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
     /// nor the clock bounds this entry, so nothing calls back at all.
     pub next_tick: i64,
@@ -573,6 +599,7 @@ impl Ctx {
             site_start: 0,
             site_end: 0,
             ticks: 0,
+            charged: Cost::default(),
             next_tick: i64::MAX,
             step_budget: 0,
             grown: 0,
@@ -650,6 +677,7 @@ impl Ctx {
         branch.cells.close_program_regions();
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
         self.ticks = self.ticks.saturating_add(branch.ticks);
+        self.charged = self.charged.plus(branch.charged);
         self.grown += branch.grown;
         self.performed.append(&mut branch.performed);
         self.host_use.absorb(&branch.host_use);
@@ -704,6 +732,7 @@ impl Ctx {
         self.failed = 0;
         self.fuel = fuel;
         self.ticks = 0;
+        self.charged = Cost::default();
         self.step_budget = step_budget();
         self.grown = 0;
         self.time_budget_ms = time_budget_ms();
@@ -1801,6 +1830,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             *release,
             *body,
         )),
+        (Builtin::Metered, [f]) => Some(metered(ctx, *f)),
         (Builtin::MapUpdate, [m, k, f]) => Some(map_update(ctx, *m, *k, *f)),
         (Builtin::BytesPosition, [b, from, p]) => Some(bytes_position(ctx, *b, *from, *p)),
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
@@ -2923,12 +2953,97 @@ pub unsafe extern "C" fn rt_parallel(ctx: *mut Ctx, slots: i64, n: i64) {
     unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize) }
 }
 
+/// What a computation cost: the calls it made and the objects it allocated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cost {
+    pub steps: i64,
+    pub allocations: i64,
+}
+
+impl Cost {
+    fn plus(self, other: Cost) -> Cost {
+        Cost {
+            steps: self.steps.saturating_add(other.steps),
+            allocations: self.allocations.saturating_add(other.allocations),
+        }
+    }
+
+    fn minus(self, other: Cost) -> Cost {
+        Cost {
+            steps: self.steps - other.steps,
+            allocations: self.allocations - other.allocations,
+        }
+    }
+}
+
+impl Ctx {
+    /// What this entry has cost so far, memoized answers charged as if computed again.
+    fn cost(&self) -> Cost {
+        Cost {
+            steps: self.ticks,
+            allocations: i64::try_from(self.heap.allocated()).unwrap_or(i64::MAX),
+        }
+        .plus(self.charged)
+    }
+}
+
+/// `metered(f)`: `f()` and what it cost, as `{allocations, performs, steps, value}` with each
+/// performed atom's count in `performs`, ordered by the atom.
+fn metered(ctx: &mut Ctx, f: Word) -> Word {
+    let before = ctx.cost();
+    let performed = ctx.performed.len();
+    let value = call_value(std::ptr::from_mut(ctx), f, &[]);
+    heap::dec(f);
+    if ctx.failed != 0 {
+        return 0;
+    }
+    let spent = ctx.cost().minus(before);
+    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for atom in &ctx.performed[performed..] {
+        *counts.entry(atom.to_string()).or_insert(0) += 1;
+    }
+    let tables = Arc::clone(&ctx.tables);
+    let per_atom = tables
+        .layouts
+        .shape(vec![Symbol::new("atom"), Symbol::new("count")]);
+    let items: Vec<Word> = counts
+        .into_iter()
+        .map(|(atom, count)| {
+            let text = ctx.heap.str(&atom);
+            let r = ctx.heap.alloc(KIND_RECORD, 0, 2, per_atom);
+            unsafe {
+                set_word(r, 0, text);
+                set_word(r, 1, heap::imm(count));
+            }
+            r as Word
+        })
+        .collect();
+    let performs = ctx.heap.list_from(&items);
+    let shape = tables.layouts.shape(vec![
+        Symbol::new("allocations"),
+        Symbol::new("performs"),
+        Symbol::new("steps"),
+        Symbol::new("value"),
+    ]);
+    let r = ctx.heap.alloc(KIND_RECORD, 0, 4, shape);
+    unsafe {
+        set_word(r, 0, heap::imm(spent.allocations));
+        set_word(r, 1, performs);
+        set_word(r, 2, heap::imm(spent.steps));
+        set_word(r, 3, value);
+    }
+    r as Word
+}
+
 /// The value of the pure nullary function at `index`, memoized when world-independent.
 pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     let tables = Arc::clone(&unsafe { &*ctx }.tables);
     if let Some(w) = tables.memoized(index as usize) {
+        let c = unsafe { &mut *ctx };
+        c.charged = c.charged.plus(tables.memo_cost(index as usize));
         return w;
     }
+    let before = unsafe { &*ctx }.cost();
     // SAFETY: as in `call_value`; a nullary function never reads the null argument pointer.
     let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(tables.functions[index as usize]) };
     let w = unsafe { f(ctx, std::ptr::null()) };
@@ -2938,7 +3053,7 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     }
     // The memo keeps a copy; the entry keeps using its own word.
     if heap::world_independent(w) {
-        tables.memoize(index as usize, w);
+        tables.memoize_costing(index as usize, w, c.cost().minus(before));
     }
     w
 }

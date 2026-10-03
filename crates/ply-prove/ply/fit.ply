@@ -1,0 +1,253 @@
+// `fit` — what a cost law's sizes came to. A cost law's body is run at doubling sizes, and over the
+// last two spans between them the steps it took may grow no faster than its bound does, give or take
+// a twentieth of a doubling: a slope on a log-log plot, read without taking a logarithm.
+
+import std.bin
+import std.math (ilog2)
+
+// One size a cost law's body was run at: the steps it took there, and its bound there.
+pub type Measure = { size: Int, steps: Int, bound: Int }
+
+// The size whose run took more steps than it was allowed, which ended the measuring, and how many
+// that was.
+pub type Spent = { size: Int, limit: Int }
+
+// Each size measured, in order, and the size that ended the measuring short of 4096, if one did.
+pub type Fit = { measures: List<Measure>, spent: Option<Spent> }
+
+derive bin for Measure
+derive bin for Spent
+derive bin for Fit
+
+// Every power of two up to 4096.
+pub fn sizes() -> List<Int> = map(range(0, 13), |k: Int| 1 << k)
+
+// The most steps one size may take, so a body that outgrows its bound fast stops being run early. A
+// claim's own step budget lowers it.
+pub fn size_limit() -> Int = 10000000
+
+// Two spans are what a verdict reads, so fewer sizes than this decide nothing.
+pub fn min_fit_sizes() -> Int = 3
+
+// A trend over fewer sizes than this spans too little to be more than an example.
+pub fn min_fitted_sizes() -> Int = 8
+
+// The sizes a fit reads: a bound that is not positive says nothing about growth.
+pub fn fitted(f: Fit) -> List<Measure> = filter(f.measures, |m: Measure| m.bound > 0)
+
+// Whether the steps outgrew the bound: they grew past the slack over both of the last two spans.
+// One span alone is not enough, since a body can change strategies at one size.
+pub fn outgrown(f: Fit) -> Bool = {
+  let ms = fitted(f);
+  let n = len(ms);
+  n >= min_fit_sizes() && outgrew(at(ms, n - 3), at(ms, n - 2))
+    && outgrew(at(ms, n - 2), at(ms, n - 1))
+}
+
+// 2^0.05: how much faster than the bound a doubling may grow the steps.
+fn slack() -> Float = 1.0352649238413776
+
+fn outgrew(was: Measure, now: Measure) -> Bool = {
+  let allowed = fold(range(0, doublings(was.size, now.size)), 1.0, |a: Float, i: Int| a * slack());
+  float_of_int(now.steps) * float_of_int(was.bound)
+    > float_of_int(was.steps) * float_of_int(now.bound) * allowed
+}
+
+fn doublings(from: Int, to: Int) -> Int =
+  if from <= 0 || from >= to { 0 } else { 1 + doublings(from * 2, to) }
+
+fn at(ms: List<Measure>, i: Int) -> Measure =
+  match list_at(ms, i) { Some(m) -> m, None -> { size: 0, steps: 0, bound: 0 } }
+
+// --- What a fit reads as -------------------------------------------------------
+
+// How much a span grew a count, to two places. Counted in hundredths, since a quotient is written
+// at the scale it divides out to rather than the one it is read at.
+fn growth(was: Int, now: Int) -> String =
+  if was <= 0 { "from nothing" } else {
+    let hundredths = match int_of_decimal(
+        decimal_div(decimal_of_int(now) * 100m, decimal_of_int(was), 0, HalfEven),
+        Down,
+      ) {
+      Some(h) -> h,
+      None -> 0,
+    };
+    let cents = hundredths % 100;
+    int_to_string(hundredths / 100) ++ "." ++ (if cents < 10 { "0" } else { "" })
+      ++ int_to_string(cents)
+      ++ "×"
+  }
+
+// The last span the fit read: where it starts and ends, and how much it grew the steps and the bound.
+pub fn last_span(f: Fit) -> String = {
+  let ms = fitted(f);
+  let n = len(ms);
+  if n < 2 { "" } else { span_text(at(ms, n - 2), at(ms, n - 1)) }
+}
+
+fn span_text(was: Measure, now: Measure) -> String =
+  "from " ++ int_to_string(was.size) ++ " to " ++ int_to_string(now.size) ++ " steps grew "
+    ++ growth(was.steps, now.steps)
+    ++ ", the bound "
+    ++ growth(was.bound, now.bound)
+
+// Both spans an outgrown fit read, the earlier first.
+pub fn outgrowth(f: Fit) -> String = {
+  let ms = fitted(f);
+  let n = len(ms);
+  if n < 3 { last_span(f) } else {
+    span_text(at(ms, n - 3), at(ms, n - 2)) ++ "; " ++ span_text(at(ms, n - 2), at(ms, n - 1))
+  }
+}
+
+fn spent_text(f: Fit) -> String =
+  match f.spent {
+    None -> "",
+    Some(s) ->
+      " · " ++ int_to_string(s.size) ++ " took more than " ++ int_to_string(s.limit) ++ " steps",
+  }
+
+// A held fit in one line: how many sizes it read, up to which, and its last span.
+pub fn fit_summary(f: Fit) -> String = {
+  let ms = fitted(f);
+  let top = match list_at(ms, len(ms) - 1) { Some(m) -> m.size, None -> 0 };
+  int_to_string(len(ms)) ++ " sizes to " ++ int_to_string(top) ++ " · " ++ last_span(f)
+    ++ spent_text(f)
+}
+
+// Why a fit read nothing: too few sizes measured with a positive bound.
+pub fn unfitted_summary(f: Fit) -> String =
+  int_to_string(len(fitted(f))) ++ " sizes measured with a positive bound, and a fit needs "
+    ++ int_to_string(min_fit_sizes())
+    ++ spent_text(f)
+
+// Each size measured, as a table a reader can check the verdict against, and the size that ended
+// the measuring.
+pub fn table(f: Fit) -> List<String> = {
+  let width = 12;
+  let cell = |s: String| spaces(width - string_len(s)) ++ s;
+  let head = cell("size") ++ cell("steps") ++ cell("bound");
+  let rows = fold(f.measures, [head], |acc: List<String>, m: Measure|
+    push(
+      acc,
+      cell(int_to_string(m.size)) ++ cell(int_to_string(m.steps)) ++ cell(int_to_string(m.bound)),
+    ));
+  match spent_line(f) { Some(line) -> push(rows, line), None -> rows }
+}
+
+fn spent_line(f: Fit) -> Option<String> =
+  match f.spent {
+    None -> None,
+    Some(s) ->
+      Some(
+        int_to_string(s.size) ++ " took more than " ++ int_to_string(s.limit)
+          ++ " steps, so no larger size was run",
+      ),
+  }
+
+// Each size measured, a line each, as a diagnostic's notes carry them.
+pub fn measure_lines(f: Fit) -> List<String> = {
+  let lines = map(f.measures, |m: Measure|
+    "at " ++ int_to_string(m.size) ++ ": " ++ int_to_string(m.steps) ++ " steps, bound "
+      ++ int_to_string(m.bound));
+  match spent_line(f) { Some(line) -> push(lines, line), None -> lines }
+}
+
+fn spaces(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ " ")
+
+// --- Tests ------------------------------------------------------------------
+
+fn measured_by(steps: (Int) -> Int, bound: (Int) -> Int) -> Fit =
+  { measures: map(sizes(), |n: Int| { size: n, steps: steps(n), bound: bound(n) }), spent: None }
+
+test "the sizes are the powers of two up to 4096" {
+  assert_eq(len(sizes()), 13);
+  assert_eq(list_at(sizes(), 0), Some(1));
+  assert_eq(list_at(sizes(), 12), Some(4096))
+}
+
+test "a linear count under a linear bound holds, whatever its constants" {
+  assert(!outgrown(measured_by(|n: Int| 5 * n + 1000, |n: Int| n)));
+  assert(!outgrown(measured_by(|n: Int| 3 * n, |n: Int| n)));
+  // Growing more slowly than the bound is within it.
+  assert(!outgrown(measured_by(|n: Int| 7, |n: Int| n)))
+}
+
+test "a count growing faster than its bound is outgrown, and one matching it is not" {
+  assert(outgrown(measured_by(|n: Int| n * n, |n: Int| n)));
+  assert(!outgrown(measured_by(|n: Int| 2 * n * n + n, |n: Int| n * n)));
+  assert(outgrown(measured_by(|n: Int| n * ilog2(n) + n, |n: Int| n)));
+  assert(!outgrown(measured_by(|n: Int| n * ilog2(n) + n, |n: Int| n * ilog2(n))));
+  // A constant bound is outgrown by anything that grows.
+  assert(outgrown(measured_by(|n: Int| n, |n: Int| 1)))
+}
+
+test "only the last two spans decide, so a body that changes strategy at one size still fits" {
+  // Quadratic until 64, then linear: the tail is what the bound is about.
+  let switched = measured_by(|n: Int| if n <= 64 { n * n } else { 64 * n }, |n: Int| n);
+  assert(!outgrown(switched));
+  // One span past the slack is not two.
+  let jumped = measured_by(|n: Int| if n < 4096 { n } else { 3 * n }, |n: Int| n);
+  assert(!outgrown(jumped))
+}
+
+test "a size with no positive bound is not read, and a span over a skipped size allows its doublings" {
+  // `n * ilog2(n)` is zero at one.
+  let f = measured_by(|n: Int| n * ilog2(n), |n: Int| n * ilog2(n));
+  assert_eq(len(fitted(f)), 12);
+  assert(!outgrown(f));
+  let skipping = {
+    measures: [
+      { size: 1, steps: 1, bound: 1 },
+      { size: 4, steps: 4, bound: 4 },
+      { size: 16, steps: 16, bound: 16 },
+    ],
+    spent: None,
+  };
+  assert(!outgrown(skipping));
+  assert(
+    outgrown({
+      ..skipping,
+      measures: map(skipping.measures, |m: Measure| { ..m, steps: m.size * m.size }),
+    }),
+  )
+}
+
+test "too few sizes decide nothing" {
+  let two = {
+    measures: [{ size: 1, steps: 1, bound: 1 }, { size: 2, steps: 100, bound: 1 }],
+    spent: None,
+  };
+  assert(!outgrown(two))
+}
+
+test "a fit reads as its sizes and its last span, and a table shows every size" {
+  let f = measured_by(|n: Int| 2 * n, |n: Int| n);
+  assert_eq(
+    fit_summary(f),
+    "13 sizes to 4096 · from 2048 to 4096 steps grew 2.00×, the bound 2.00×",
+  );
+  let cut = {
+    measures: [{ size: 1, steps: 3, bound: 1 }, { size: 2, steps: 12, bound: 2 }],
+    spent: Some({ size: 4, limit: 10000000 }),
+  };
+  assert_eq(
+    unfitted_summary(cut),
+    "2 sizes measured with a positive bound, and a fit needs 3 · 4 took more than 10000000 steps",
+  );
+  assert_eq(
+    outgrowth(measured_by(|n: Int| n * n, |n: Int| n)),
+    "from 1024 to 2048 steps grew 4.00×, the bound 2.00×; from 2048 to 4096 steps grew 4.00×, the bound 2.00×",
+  );
+  assert_eq(measure_lines(cut), [
+    "at 1: 3 steps, bound 1",
+    "at 2: 12 steps, bound 2",
+    "4 took more than 10000000 steps, so no larger size was run",
+  ]);
+  assert_eq(table(cut), [
+    "        size       steps       bound",
+    "           1           3           1",
+    "           2          12           2",
+    "4 took more than 10000000 steps, so no larger size was run",
+  ])
+}
