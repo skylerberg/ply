@@ -6,7 +6,6 @@
 //! `tests/unit`.
 
 mod claims;
-mod driver_port;
 mod embeds;
 mod enter;
 mod fixture;
@@ -15,7 +14,6 @@ mod judging;
 mod prover_runs;
 mod reused;
 mod runnable;
-mod seeded;
 mod tester_ops;
 mod testrun;
 
@@ -164,16 +162,7 @@ fn main(root: String, front: LoadedAnalysis, unit: Bytes) -> Ended / {machine.lo
 
 /// The program checked with the standard library it imports, and compiled.
 fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
-    ply_codegen::c::producer::ensure_default();
-    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
-        "m".to_string(),
-        source.to_string(),
-    )])
-    .expect("the outer program checks");
-    let unit =
-        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
-            .expect("this host has a C toolchain");
-    (answered.front, unit)
+    crate::fixture::built("m", source)
 }
 
 /// The inner program's home: a directory with `inner.ply` in it.

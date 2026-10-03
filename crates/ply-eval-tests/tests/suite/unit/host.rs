@@ -14,11 +14,11 @@ impl HostHandler for Never {
     }
 }
 
+/// Inside the module `m`, so every declared effect is program-wide `m.<name>`, as a real load makes it.
 fn check(source: &str) -> CheckOutput {
-    port_check(&[("", source)])
+    qualified("m", source)
 }
 
-/// Inside a named module, so every declared effect is program-wide `<module>.<name>` as a real load makes it.
 fn qualified(module: &str, source: &str) -> CheckOutput {
     port_check(&[(module, source)])
 }
@@ -109,7 +109,7 @@ fn an_unknown_effect_is_e0421() {
         .expect_err("nothing declares `dbx`");
     assert_eq!(codes_of(&diagnostics), [codes::HOST_OPERATION_UNKNOWN]);
     assert!(
-        diagnostics[0].notes.iter().any(|n| n.contains("`db`")),
+        diagnostics[0].notes.iter().any(|n| n.contains("`m.db`")),
         "the nearest declared effect is named: {:?}",
         diagnostics[0].notes
     );
@@ -221,7 +221,7 @@ fn any_expands_to_the_labels_the_program_uses() {
         .iter()
         .map(|r| r.atom.to_string())
         .collect();
-    assert_eq!(atoms, ["db.get[users]", "db.put[orders]"]);
+    assert_eq!(atoms, ["m.db.get[users]", "m.db.put[orders]"]);
     assert_eq!(binding.listing().handlers, 2);
     assert!(!atoms.iter().any(|a| a.contains('*')));
 }
@@ -237,7 +237,7 @@ fn any_does_not_cross_modes() {
         .iter()
         .map(|r| r.atom.to_string())
         .collect();
-    assert_eq!(atoms, ["db.get[users]"]);
+    assert_eq!(atoms, ["m.db.get[users]"]);
 }
 
 /// A written mode atom and an inferred operation atom both name the label; the registration
@@ -267,7 +267,7 @@ fn narrow(c: Int) -> Bytes / {net.recv[c]} = net.recv[c](16)
         .iter()
         .map(|r| r.to_string())
         .collect();
-    assert_eq!(rows, ["net.recv[c]", "net.send[c]"]);
+    assert_eq!(rows, ["m.net.recv[c]", "m.net.send[c]"]);
     assert_eq!(binding.footprint().atoms().count(), 2);
 
     let only = registry(vec![op("net", "recv", named("c"))])
@@ -298,7 +298,7 @@ fn answer(payload: Bytes) -> Int / {net.send[conn]} = relay[conn](payload)
         .iter()
         .map(|r| r.to_string())
         .collect();
-    assert_eq!(rows, ["net.send[conn]"]);
+    assert_eq!(rows, ["m.net.send[conn]"]);
 }
 
 /// A body with no written row publishes the operations it performs, and `Any` expands on those.
@@ -330,16 +330,16 @@ fn store(k: Int) -> Int / {db.put[orders]} = db.put[orders](k, 1)
         .collect();
     assert_eq!(
         rows,
-        ["db.get[users]", "db.put[orders]"],
+        ["m.db.get[users]", "m.db.put[orders]"],
         "`peek` is never performed"
     );
     assert!(binding.serves(&EffectAtom::new(
-        "db",
+        "m.db",
         Resource::Named(Symbol::new("users")),
         ply_eval::Mode::Read,
     )));
     assert!(!binding.serves(&EffectAtom::operation(
-        "db",
+        "m.db",
         Resource::Named(Symbol::new("users")),
         ply_eval::Mode::Read,
         "peek",
@@ -411,7 +411,7 @@ fn b(k: Int) -> Int / {db.read[users]} = db.peek[users](k)
     assert_eq!(
         binding
             .resolve(
-                &Symbol::new("db"),
+                &Symbol::new("m.db"),
                 &Symbol::new("peek"),
                 Some(&Symbol::new("users"))
             )
@@ -428,7 +428,7 @@ fn reaches_is_footprint_intersection() {
         .bind(&check(DB))
         .expect("binds");
     let touched = Footprint::from_atoms([EffectAtom::new(
-        "db",
+        "m.db",
         Resource::Named(Symbol::new("users")),
         ply_eval::Mode::Read,
     )]);
@@ -584,7 +584,11 @@ pub nondet effect net {
 pub fn out(x: Int) -> Int / {net.write[socket]} = net.send[socket](x)
 "#;
 
-    let shipped = qualified("std.net", DECL);
+    let shipped = qualified(
+        "app",
+        "import std.net (net)\n\
+         pub fn out(c: Int) -> Option<Int> / {net.write[socket]} = net.send[socket](c, b\"x\", 1000)\n",
+    );
     let binding = registry(vec![op("std.net.net", "send", named("socket"))])
         .bind(&shipped)
         .expect("a shipped declaration is named in full");

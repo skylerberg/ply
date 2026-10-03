@@ -1,4 +1,4 @@
-use ply_codegen::c::sweep::{FRONTS, RUNS, STAMP, USED, claim, sweep, sweep_stages, used};
+use ply_codegen::c::sweep::{ANSWERED, RUNS, STAMP, USED, claim, sweep, sweep_stages, used};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -215,7 +215,7 @@ fn filed(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago
 
 /// An opened artifact's cached front.
 fn front(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
-    filed(root, FRONTS, name, size, now, ago);
+    filed(root, ANSWERED, name, size, now, ago);
 }
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -228,7 +228,7 @@ fn a_stage_directory_inside_its_budget_is_left_alone() {
     front(root.path(), "front.a", 100, now, 5 * HOUR);
     assert_eq!(sweep_stages(root.path(), 1_000, now), 0);
     assert!(root.path().join("stage-a").exists());
-    assert!(root.path().join(FRONTS).join("front.a").exists());
+    assert!(root.path().join(ANSWERED).join("front.a").exists());
 }
 
 /// A stage goes whole and a front goes on its own, least recently used first, and whatever a run
@@ -248,8 +248,8 @@ fn stages_and_fronts_go_least_recently_used_first() {
         .map(|n| root.path().join(n).exists())
         .collect();
     assert_eq!(left, vec![false, false, true]);
-    assert!(!root.path().join(FRONTS).join("front.oldest").exists());
-    assert!(root.path().join(FRONTS).join("front.fresh").exists());
+    assert!(!root.path().join(ANSWERED).join("front.oldest").exists());
+    assert!(root.path().join(ANSWERED).join("front.fresh").exists());
 }
 
 /// A stage is written once and used by every run after, so its use, not its writing, is its age.
@@ -276,7 +276,7 @@ fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
     std::fs::write(root.path().join(STAMP), vec![b'x'; 100]).unwrap();
     set(&root.path().join(STAMP), now - 5 * HOUR);
     sweep_stages(root.path(), 0, now);
-    assert!(root.path().join(FRONTS).join("front.1234.tmp").exists());
+    assert!(root.path().join(ANSWERED).join("front.1234.tmp").exists());
     assert!(root.path().join(STAMP).exists());
 }
 
@@ -296,7 +296,7 @@ fn a_runs_front_goes_on_its_own_least_recently_used_first() {
         !runs.join("old").exists(),
         "the run used longest ago goes first"
     );
-    assert!(!root.path().join(FRONTS).join("front.mid").exists());
+    assert!(!root.path().join(ANSWERED).join("front.mid").exists());
     assert!(
         root.path().join("stage-a").exists(),
         "the rest fits once two have gone"

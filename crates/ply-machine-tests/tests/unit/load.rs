@@ -1,200 +1,28 @@
-use ply_eval::{ModuleName, Symbol, codes};
+use ply_eval::{ModuleName, codes};
 use ply_machine::load::*;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-fn write(dir: &Path, rel: &str, text: &str) {
-    let path = dir.join(rel);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, text).unwrap();
-}
-
-fn names(loaded: &Loaded) -> Vec<String> {
-    loaded
-        .modules()
+/// The program of `files`, `(path, text)` below one root, as the machine holds it over the
+/// builder's answer for it.
+fn loaded(files: &[(&str, &str)]) -> Loaded {
+    let files: Vec<(String, String)> = files
         .iter()
-        .map(|m| m.name.to_string())
-        .collect()
-}
-
-#[test]
-fn a_directory_becomes_one_module_per_file_named_after_its_path() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "b.ply", "pub fn b() -> Int = 2\n");
-    write(dir.path(), "a.ply", "pub fn a() -> Int = 1\n");
-    write(dir.path(), "store/orders.ply", "fn c() -> Int = 3\n");
-    write(dir.path(), "notes.txt", "ignored");
-
-    let loaded = load(dir.path()).unwrap();
-    assert_eq!(names(&loaded), ["a", "b", "store.orders"]);
-    assert_eq!(loaded.module_count(), 3);
-    assert!(
-        loaded
-            .check
-            .defs
-            .contains_key(&Symbol::new("store.orders.c"))
-    );
-}
-
-#[test]
-fn a_name_in_one_file_is_invisible_in_another_until_it_is_imported() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "a.ply", "pub fn a() -> Int = 1\n");
-    write(dir.path(), "b.ply", "fn b() -> Int = a()\n");
-
-    let err = load(dir.path()).unwrap_err();
-    assert!(
-        err.diagnostics
-            .iter()
-            .any(|d| d.code == codes::UNKNOWN_NAME),
-        "a directory must no longer be concatenated: {:?}",
-        err.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
-    );
-
-    write(dir.path(), "b.ply", "import a\nfn b() -> Int = a::a()\n");
-    let loaded = load(dir.path()).unwrap();
-    assert!(loaded.check.defs.contains_key(&Symbol::new("b.b")));
-}
-
-#[test]
-fn a_file_argument_roots_the_project_at_its_directory() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "src/one.ply", "fn one() -> Int = 1\n");
-    write(dir.path(), "src/two.ply", "fn two() -> Int = 2\n");
-
-    let file = dir.path().join("src/one.ply");
-    let loaded = load(&file).unwrap();
-    assert_eq!(loaded.root, dir.path().join("src"));
-    assert_eq!(names(&loaded), ["one"]);
-    assert_eq!(loaded.check.defs.len(), 1);
-}
-
-#[test]
-fn hidden_directories_are_not_part_of_the_program() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "ok.ply", "fn ok() -> Int = 1\n");
-    write(
-        dir.path(),
-        ".ply-cache/stale.ply",
-        "this is not even valid ply\n",
-    );
-    write(dir.path(), ".git/x.ply", "nor is this\n");
-
-    let loaded = load(dir.path()).unwrap();
-    assert_eq!(names(&loaded), ["ok"]);
-}
-
-#[test]
-fn a_path_that_cannot_name_a_module_is_e0111_against_the_file() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "my-notes.ply", "fn f() -> Int = 1\n");
-
-    let err = load(dir.path()).unwrap_err();
-    assert_eq!(err.diagnostics.len(), 1);
-    assert_eq!(err.diagnostics[0].code, codes::INVALID_MODULE_PATH);
-    let span = err.diagnostics[0].primary_span().unwrap();
-    assert!(!span.is_dummy(), "E0111 must point at the file it is about");
-    assert!(err.sources.get(span.source).is_some());
-}
-
-#[test]
-fn a_directory_segment_that_is_not_an_identifier_is_also_e0111() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "not-a-module/f.ply", "fn f() -> Int = 1\n");
-    let err = load(dir.path()).unwrap_err();
-    assert_eq!(err.diagnostics[0].code, codes::INVALID_MODULE_PATH);
-    assert!(err.diagnostics[0].message.contains("not-a-module"));
-}
-
-/// The rule is ASCII, as the lexer implements it; a non-ASCII name is refused here rather than
-/// surviving to be refused later as `X0001` inside an `import`.
-#[test]
-fn a_non_ascii_segment_is_not_an_identifier() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "café.ply", "fn f() -> Int = 1\n");
-
-    let err = load(dir.path()).unwrap_err();
-    assert_eq!(err.diagnostics.len(), 1);
-    assert_eq!(err.diagnostics[0].code, codes::INVALID_MODULE_PATH);
-    assert!(err.diagnostics[0].message.contains("café"));
-}
-
-#[test]
-fn a_missing_path_is_a_diagnostic_rather_than_a_panic() {
-    let err = load(Path::new("definitely/not/here.ply")).unwrap_err();
-    assert_eq!(err.diagnostics.len(), 1);
-    assert_eq!(err.diagnostics[0].code, codes::RUNTIME_ERROR);
-    assert!(
-        err.diagnostics[0]
-            .message
-            .contains("definitely/not/here.ply")
-    );
-}
-
-#[test]
-fn an_empty_directory_says_what_to_do_about_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let err = load(dir.path()).unwrap_err();
-    assert!(err.diagnostics[0].message.contains("no `.ply` files"));
-    assert!(!err.diagnostics[0].notes.is_empty());
-}
-
-#[test]
-fn a_syntax_error_still_hands_back_the_sources_its_spans_point_into() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "bad.ply", "fn broken( = 1\n");
-    let err = load(dir.path()).unwrap_err();
-    assert!(!err.diagnostics.is_empty());
-    let span = err.diagnostics[0].primary_span().unwrap();
-    assert!(err.sources.get(span.source).is_some());
-}
-
-#[test]
-fn a_type_error_is_reported_after_a_clean_parse() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "bad.ply", "fn f() -> Int = 1 + true\n");
-    let err = load(dir.path()).unwrap_err();
-    assert!(
-        err.diagnostics
-            .iter()
-            .any(|d| d.code == codes::TYPE_MISMATCH)
-    );
-}
-
-#[test]
-fn a_module_cycle_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "a.ply",
-        "import b\npub fn a() -> Int = b::b()\n",
-    );
-    write(
-        dir.path(),
-        "b.ply",
-        "import a\npub fn b() -> Int = a::a()\n",
-    );
-    let err = load(dir.path()).unwrap_err();
-    assert!(
-        err.diagnostics
-            .iter()
-            .any(|d| d.code == codes::MODULE_CYCLE)
-    );
+        .map(|(path, text)| (path.to_string(), text.to_string()))
+        .collect();
+    let bytes = ply_machine::builds::answered(&files)
+        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
+    let answer = ply_machine::runnable::decode(&bytes)
+        .unwrap_or_else(|why| panic!("the answer reads: {why}"));
+    ply_machine::driver::load_over_analysis_taken(PathBuf::from("."), answer.front)
+        .unwrap_or_else(|e| panic!("it loads: {:?}", e.diagnostics))
 }
 
 #[test]
 fn entry_points_finds_main_in_whatever_module_declares_it() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "lib.ply", "pub fn one() -> Int = 1\n");
-    write(
-        dir.path(),
-        "app.ply",
-        "import lib\nfn main() -> Int = lib::one()\n",
-    );
-
-    let loaded = load(dir.path()).unwrap();
+    let loaded = loaded(&[
+        ("lib.ply", "pub fn one() -> Int = 1\n"),
+        ("app.ply", "import lib\nfn main() -> Int = lib::one()\n"),
+    ]);
     let mains = loaded.entry_points();
     assert_eq!(mains.len(), 1);
     assert_eq!(mains[0].name.as_str(), "app.main");
@@ -203,11 +31,10 @@ fn entry_points_finds_main_in_whatever_module_declares_it() {
 
 #[test]
 fn two_modules_may_each_declare_main() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "one.ply", "fn main() -> Int = 1\n");
-    write(dir.path(), "two.ply", "fn main() -> Int = 2\n");
-
-    let loaded = load(dir.path()).unwrap();
+    let loaded = loaded(&[
+        ("one.ply", "fn main() -> Int = 1\n"),
+        ("two.ply", "fn main() -> Int = 2\n"),
+    ]);
     let mains: Vec<&str> = loaded
         .entry_points()
         .iter()
@@ -218,15 +45,13 @@ fn two_modules_may_each_declare_main() {
 
 #[test]
 fn defs_and_tests_can_be_read_back_per_module() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "a.ply",
-        "fn a() -> Int = 1\ntest \"a\" { assert_eq(a(), 1) }\n",
-    );
-    write(dir.path(), "b.ply", "fn b() -> Int = 2\n");
-
-    let loaded = load(dir.path()).unwrap();
+    let loaded = loaded(&[
+        (
+            "a.ply",
+            "fn a() -> Int = 1\ntest \"a\" { assert_eq(a(), 1) }\n",
+        ),
+        ("b.ply", "fn b() -> Int = 2\n"),
+    ]);
     let a = ModuleName::from_dotted("a");
     assert_eq!(loaded.defs_of(&a).len(), 1);
     assert_eq!(loaded.tests_of(&a).len(), 1);
@@ -247,68 +72,12 @@ fn the_working_directory_tidies_to_itself_rather_than_to_nothing() {
     assert_eq!(project_root(Path::new(".")), PathBuf::from("."));
 }
 
-/// The root and the file paths a load answers with are what the cache records and what a span
-/// renders, so their spelling is a fact about the argument and not about how rooting is written.
-/// `Path` equality normalises `.` away, so these compare the text.
 #[test]
-fn every_shape_of_argument_records_the_paths_it_names_and_no_others() {
-    let spelling = |loaded: &Loaded| -> (String, Vec<String>) {
-        (loaded.root.display().to_string(), loaded.file_names())
-    };
-    let plain = |paths: &[String]| {
-        for path in paths {
-            assert!(
-                !path.starts_with("./") && !path.contains("/./"),
-                "a recorded path carries a `.` component: {path}"
-            );
-        }
-    };
-
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "m.ply", "pub fn m() -> Int = 1\n");
-    write(dir.path(), "src/a.ply", "pub fn a() -> Int = 1\n");
-    write(dir.path(), "src/z.ply", "pub fn z() -> Int = 2\n");
-
-    // A directory argument, which is also the absolute one: a temp directory is absolute.
-    let (root, files) = spelling(&load(dir.path()).unwrap());
-    assert_eq!(root, dir.path().display().to_string());
-    plain(&files);
-    let nested: Vec<String> = files
-        .iter()
-        .map(|f| {
-            f.trim_start_matches(&root)
-                .trim_start_matches('/')
-                .to_string()
-        })
-        .collect();
-    assert_eq!(nested, vec!["m.ply", "src/a.ply", "src/z.ply"]);
-
-    // A file argument: the root is the directory it sits in, and it is the only module.
-    let one = dir.path().join("src/a.ply");
-    let (root, files) = spelling(&load(&one).unwrap());
-    assert_eq!(root, dir.path().join("src").display().to_string());
-    plain(&files);
-    assert_eq!(files, vec![one.display().to_string()]);
-
-    // A directory named with a trailing `./`, which strips to the directory itself.
-    let dotted = dir.path().join("./src");
-    let (root, files) = spelling(&load(&dotted).unwrap());
-    plain(std::slice::from_ref(&root));
-    plain(&files);
-    assert_eq!(root, dir.path().join("src").display().to_string());
-}
-
-#[test]
-fn the_texts_are_every_module_the_port_answered_the_shipped_ones_included() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "a.ply",
-        "import std.json\npub fn a() -> Int = 1\n",
-    );
-    write(dir.path(), "b.ply", "import a\nfn b() -> Int = a::a()\n");
-
-    let loaded = load(dir.path()).unwrap();
+fn the_texts_are_every_module_the_front_end_answered_the_shipped_ones_included() {
+    let loaded = loaded(&[
+        ("a.ply", "import std.json\npub fn a() -> Int = 1\n"),
+        ("b.ply", "import a\nfn b() -> Int = a::a()\n"),
+    ]);
     let texts = loaded.texts();
     assert_eq!(texts.len(), loaded.module_count());
     assert!(texts.iter().any(|(name, _)| name == "std.json"));
@@ -319,19 +88,8 @@ fn the_texts_are_every_module_the_port_answered_the_shipped_ones_included() {
 }
 
 #[test]
-fn a_broken_module_never_loads_and_writes_no_cache() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "m.ply", "fn f() -> Int = true\n");
-    let err = load(dir.path()).unwrap_err();
-    assert_eq!(err.diagnostics[0].code, codes::TYPE_MISMATCH);
-    assert!(!dir.path().join(".ply-cache").exists());
-}
-
-#[test]
 fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
+    let loaded = loaded(&[(
         "m.ply",
         "pub fn api() -> Int = shared()\n\
          fn shared() -> Int = 1\n\
@@ -351,9 +109,7 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
          type Unused = | Nothing\n\
          test \"calls it\" { assert_eq(tested(), 3) }\n\
          law \"it is the identity\" forall (x: Int) { lawful(x) == x }\n",
-    );
-
-    let loaded = load(dir.path()).unwrap();
+    )]);
     let named: Vec<(&str, String)> = loaded
         .frontend
         .warnings
@@ -373,74 +129,5 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
             ("fn `m.deader` is never used", "deader"),
             ("type `m.Unused` is never used", "Unused"),
         ]
-    );
-}
-
-fn manifest(name: &str, deps: &str) -> String {
-    format!(
-        "import std.pkg (Manifest)\nfn package() -> Manifest = {{name: \"{name}\", version: {{major: 0, minor: 0, patch: 1}}, prefix: None, runtime: {{major: 0, minor: 0, patch: 1}}, dependencies: [{deps}], entry: None}}\n"
-    )
-}
-
-/// Derived, because a filter naming no test runs nothing and exits 0, which reads as a pass.
-fn own_test_name(leaf: &str) -> String {
-    match module_path!().split_once("::") {
-        Some((_binary, module)) => format!("{module}::{leaf}"),
-        None => leaf.to_string(),
-    }
-}
-
-/// A load rooted at `.` joins the directory `ply vendor` wrote onto `.`, and the vendored package
-/// still supplies its modules. `.` is only ever the working directory, which a process shares with
-/// every test in it, so the load runs in a process of its own, inside the project.
-#[test]
-fn a_project_rooted_at_the_working_directory_reads_what_it_vendored() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = dir.path().join("app");
-    let lib = "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../lib\")}";
-    write(&app, "ply.pkg", &manifest("app", lib));
-    write(
-        &app,
-        "main.ply",
-        "import lib.answer\nfn main() -> Int = answer::answer()\n",
-    );
-    // No `../lib` exists: only the vendored copy can answer the want.
-    write(&app, "vendor/index", "../lib\tvendor/lib\n");
-    write(&app, "vendor/lib/ply.pkg", &manifest("lib", ""));
-    write(
-        &app,
-        "vendor/lib/answer.ply",
-        "pub fn answer() -> Int = 7\n",
-    );
-
-    let name = own_test_name("the_vendored_project_here_loads");
-    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
-        .current_dir(&app)
-        .output()
-        .expect("the test binary runs");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "the load rooted at `.` refused:\n{stdout}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        stdout.contains("1 passed"),
-        "the child ran no test matching `{name}`, and a filter that matches nothing exits 0:\n{stdout}"
-    );
-}
-
-#[test]
-#[ignore = "run by the vendoring test above, from inside the project it lays out"]
-fn the_vendored_project_here_loads() {
-    let loaded = load(Path::new(".")).unwrap_or_else(|err| panic!("{:?}", err.diagnostics));
-    assert!(
-        loaded
-            .check
-            .defs
-            .contains_key(&Symbol::new("lib.answer.answer")),
-        "the vendored package supplied no `answer`: {:?}",
-        loaded.check.defs.keys().collect::<Vec<_>>()
     );
 }

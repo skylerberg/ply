@@ -2,7 +2,7 @@
 //! unit is built with its tables sorted by content, so a body's resolved C is a function of what
 //! the unit holds and never of the order its definitions were taken in.
 
-use super::cache::encode_const;
+use super::encoding::encode_const;
 use crate::heap::Layouts;
 use ply_eval::{Builtin, Symbol, Value};
 use std::collections::HashMap;
