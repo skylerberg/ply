@@ -73,7 +73,7 @@ pub fn span_id(value: &Value, span: Span) -> Result<i64, Diagnostic> {
 /// `Map<String, Field>`, in the map's own ascending key order.
 pub fn fields(value: &Value, span: Span) -> Result<Vec<(String, Field)>, Diagnostic> {
     let entries = value.as_map(span, "a `Fields` map")?;
-    let mut out = Vec::with_capacity(entries.size());
+    let mut out = Vec::with_capacity(entries.len());
     for (key, field) in entries.iter() {
         out.push((
             key.as_str(span, "a field name")?.to_string(),

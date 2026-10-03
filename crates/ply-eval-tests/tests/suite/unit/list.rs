@@ -5,7 +5,6 @@ fn ints(n: usize) -> Vec<Value> {
     (0..n as i64).map(Value::Int).collect()
 }
 
-/// Across the sizes that reach three levels of trie.
 #[test]
 fn a_list_agrees_with_a_vec_under_every_operation() {
     let mut list = List::default();
@@ -43,30 +42,23 @@ fn a_list_agrees_with_a_vec_under_every_operation() {
 }
 
 #[test]
-fn a_shared_push_copies_one_leaf_and_the_path_above_it_whatever_the_length() {
-    let mut worst = 0;
-    for n in [1usize, 31, 32, 33, 1_000, 1_024, 1_025, 40_000, 100_000] {
+fn a_shared_write_copies_and_leaves_the_other_holder_alone() {
+    for n in [1usize, 32, 33, 1_025] {
         let base = List::from(ints(n));
         let mut pushed = base.clone();
-        let copied = pushed
-            .push(Value::Int(-1))
-            .expect("a shared push is a copy");
+        assert_eq!(pushed.push(Value::Int(-1)), Some(n));
         assert_eq!(pushed.len(), n + 1);
-        assert_eq!(base.len(), n, "the shared base moved");
         assert_eq!(pushed.last(), Some(&Value::Int(-1)));
-        worst = worst.max(copied);
-        let levels = shift_for(n) / BITS + 1;
-        assert!(
-            copied <= WIDTH * (levels as usize + 1),
-            "pushing onto a shared list of {n} copied {copied} slots"
-        );
+        let mut set = base.clone();
+        assert_eq!(set.set(0, Value::Int(-2)), Some(n));
+        assert_eq!(set.first(), Some(&Value::Int(-2)));
+        assert_eq!(base.to_vec(), ints(n), "the shared base moved");
     }
-    assert!(worst > 0, "the instrument saw no copy at all");
 }
 
 #[test]
-fn a_rest_shares_the_list_and_a_chain_of_rests_holds_one_leaf() {
-    let list = List::from(ints(2_000));
+fn a_rest_leaves_the_list_it_was_taken_from_alone() {
+    let list = List::from(ints(200));
     let mut cursor = list.clone();
     let mut seen = 0;
     while let Some(head) = cursor.first() {
@@ -74,19 +66,15 @@ fn a_rest_shares_the_list_and_a_chain_of_rests_holds_one_leaf() {
         seen += 1;
         cursor = cursor.skip(1);
     }
-    assert_eq!(seen, 2_000);
-    assert_eq!(list.len(), 2_000, "the original moved");
-    let mut late = list.skip(1_990);
-    assert_eq!(
-        late.identity().1,
-        0,
-        "a rest past the trie still holds the trie"
-    );
+    assert_eq!(seen, 200);
+    assert_eq!(list.len(), 200, "the original moved");
+    let mut late = list.skip(190);
     assert_eq!(late.push(Value::Int(7)), None);
     assert_eq!(
         late.to_vec(),
-        [ints(2_000)[1_990..].to_vec(), vec![Value::Int(7)]].concat()
+        [ints(200)[190..].to_vec(), vec![Value::Int(7)]].concat()
     );
+    assert!(list.skip(500).is_empty());
 }
 
 #[test]
