@@ -224,7 +224,7 @@ enum Go {
         reply: Sender<drive::Measured>,
     },
     Reload {
-        front: Box<crate::driver::HandedFront>,
+        front: Box<crate::driver::LoadedAnalysis>,
         unit: Vec<u8>,
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
@@ -241,7 +241,7 @@ impl HostHandler for Site {
             ("reuse", [root, walked, entry]) => self.reuse(&label, root, walked, entry, span)?,
             ("filed", [front, unit]) => filed(front, unit, span)?,
             ("reload", [front, unit]) => {
-                let front = Box::new(crate::driver::handed_front_of(front, span)?);
+                let front = Box::new(crate::driver::loaded_analysis_of(front, span)?);
                 let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
                 let answer: Result<drive::FoundData, drive::Refused> =
                     self.ask(&label, span, |reply| Go::Reload { reply, front, unit })?;
@@ -376,7 +376,7 @@ impl Site {
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
-        let handed = crate::driver::handed_front_of(front, span)?;
+        let handed = crate::driver::loaded_analysis_of(front, span)?;
         let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
         let mut options = self.taken(label);
         options.front = Some(handed);

@@ -2,7 +2,7 @@
 
 pub const LEXER: &str = include_str!("../ply/lexer.ply");
 
-pub const SPINE: &str = include_str!("../ply/spine.ply");
+pub const PARSING: &str = include_str!("../ply/parsing.ply");
 
 pub const EXPRS: &str = include_str!("../ply/exprs.ply");
 
@@ -12,9 +12,9 @@ pub const PATTERNS: &str = include_str!("../ply/patterns.ply");
 
 pub const PKG: &str = include_str!("../ply/pkg.ply");
 
-pub const TYPES: &str = include_str!("../ply/types.ply");
+pub const TYPE_SYNTAX: &str = include_str!("../ply/type_syntax.ply");
 
-pub const TYCORE: &str = include_str!("../ply/tycore.ply");
+pub const TYPES: &str = include_str!("../ply/types.ply");
 
 /// Whether a recursive group's calls back into itself descend a measure.
 pub const TERMINATION: &str = include_str!("../ply/termination.ply");
@@ -30,7 +30,7 @@ pub const INTERFACE: &str = include_str!("../ply/interface.ply");
 
 pub const DERIVE: &str = include_str!("../ply/derive.ply");
 
-pub const DIAG: &str = include_str!("../ply/diag.ply");
+pub const DIAGNOSTICS: &str = include_str!("../ply/diagnostics.ply");
 
 /// The front end's whole answer, as the rows the driver reads.
 pub const FRONT: &str = include_str!("../ply/front.ply");
@@ -67,7 +67,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("code", CODE),
     ("costs", COSTS),
     ("derive", DERIVE),
-    ("diag", DIAG),
+    ("diagnostics", DIAGNOSTICS),
     ("embed", EMBED),
     ("emit", EMIT),
     ("exprs", EXPRS),
@@ -79,14 +79,14 @@ pub const MODULES: &[(&str, &str)] = &[
     ("items", ITEMS),
     ("lexer", LEXER),
     ("load", LOAD),
+    ("parsing", PARSING),
     ("patterns", PATTERNS),
     ("pkg", PKG),
     ("plyx", PLYX),
     ("resolve", RESOLVE),
     ("rewrite", REWRITE),
-    ("spine", SPINE),
     ("termination", TERMINATION),
-    ("tycore", TYCORE),
+    ("type_syntax", TYPE_SYNTAX),
     ("types", TYPES),
     ("unit", UNIT),
 ];

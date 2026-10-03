@@ -2,7 +2,7 @@ use ply_codegen::Unit;
 use ply_eval::{ModuleName, Provider, Symbol, Value};
 
 /// As `ply test benches/kernel` loads it: the project's own `.ply` files, and no standard library.
-fn kernel() -> (&'static ply_eval::Front, &'static Unit) {
+fn kernel() -> (&'static ply_eval::Analysis, &'static Unit) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -33,8 +33,9 @@ fn kernel() -> (&'static ply_eval::Front, &'static Unit) {
         .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
         .collect();
     let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
-    let front = ply_codegen::c::producer::checked_front(&named, &ids).expect("the kernel checks");
-    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
+    let front =
+        ply_codegen::c::producer::checked_analysis(&named, &ids).expect("the kernel checks");
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
     let unit =
         Unit::over_front(front, named.into_iter().collect()).expect("this host has a C compiler");
     (front, unit)

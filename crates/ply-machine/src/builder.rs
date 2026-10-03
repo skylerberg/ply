@@ -7,7 +7,9 @@
 
 use crate::artifact::{self, Built};
 
-use crate::driver::{HandedFront, handed_front_of, load_over_front, load_over_front_in};
+use crate::driver::{
+    LoadedAnalysis, load_over_analysis, load_over_analysis_in, loaded_analysis_of,
+};
 use crate::hosts::Lent;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, diags_value, option, places_value, record};
@@ -88,7 +90,7 @@ impl HostHandler for Site {
         let value = match (req.op.op.as_str(), req.args) {
             ("loaded", [path, front]) => {
                 let path = PathBuf::from(path.as_str(span, "the program's root")?);
-                let front = handed_front_of(front, span)?;
+                let front = loaded_analysis_of(front, span)?;
                 let loaded = self.load(&path, &front);
                 self.loaded(loaded)
             }
@@ -174,13 +176,13 @@ impl Site {
     fn load(
         &self,
         path: &Path,
-        front: &HandedFront,
+        front: &LoadedAnalysis,
     ) -> std::sync::MutexGuard<'_, Option<Result<Loaded, LoadError>>> {
         let mut program = self.program.lock().unwrap_or_else(|e| e.into_inner());
         *program = Some(if self.hermetic {
-            load_over_front_in(crate::load::tidy(path), front)
+            load_over_analysis_in(crate::load::tidy(path), front)
         } else {
-            load_over_front(path, front)
+            load_over_analysis(path, front)
         });
         program
     }

@@ -226,16 +226,17 @@ pub(super) static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// this runtime is known before anything is compiled.
 #[test]
 fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
-    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
         "m".to_string(),
         "pub type Shape = | Dot | Line(Int)\nfn double(x: Int) -> Int = x * 2\n\
          fn named(s: Shape) -> Bytes = match s { Dot -> b\"dot\", Line(_) -> b\"a \\\"line\\\"?\" }\n"
             .to_string(),
     )])
     .expect("the program checks");
-    let front: &'static ply_eval::Front = Box::leak(Box::new(answered.front));
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(answered.front));
     let source: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_front(front).with_texts(answered.modules.into_iter().collect()),
+        ply_codegen::Source::from_analysis(front)
+            .with_texts(answered.modules.into_iter().collect()),
     ));
     let produced =
         ply_codegen::c::produce(source, &["m.double", "m.named"]).expect("the unit emits");
@@ -268,12 +269,12 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
 fn the_first_backend_on_the_preflights_thread_takes_the_unit_it_loaded() {
     use ply_eval::{Provider, Symbol, Value};
     use std::sync::atomic::Ordering::Relaxed;
-    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
         "m".to_string(),
         "fn double(x: Int) -> Int = x * 2\n".to_string(),
     )])
     .expect("the program checks");
-    let front: &'static ply_eval::Front = Box::leak(Box::new(answered.front));
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(answered.front));
     // Writing: `UNITS_REUSED` below counts every build in the process.
     let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let unit = ply_codegen::Unit::over_front(front, answered.modules.into_iter().collect())
@@ -303,9 +304,9 @@ pub mod tests_support {
         with_refusals(text).map(|(s, n, _)| (s, n))
     }
 
-    fn front(text: &str) -> &'static ply_eval::Front {
+    fn front(text: &str) -> &'static ply_eval::Analysis {
         Box::leak(Box::new(
-            ply_codegen::c::producer::checked_front(
+            ply_codegen::c::producer::checked_analysis(
                 &[("m".to_string(), text.to_string())],
                 &[SourceId(0)],
             )
@@ -322,9 +323,9 @@ pub mod tests_support {
             .keys()
             .map(|n| (n.clone(), format!("h-{n}-{}", &stamp[..16])))
             .collect();
-        let front: &'static ply_eval::Front = Box::leak(Box::new(front));
+        let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
         Some(Box::leak(Box::new(
-            Source::from_front(front).with_texts(texts(text)),
+            Source::from_analysis(front).with_texts(texts(text)),
         )))
     }
 
@@ -332,7 +333,7 @@ pub mod tests_support {
         text: &str,
     ) -> Option<(&'static Source, Native, Vec<ply_codegen::c::Refused>)> {
         let source: &'static Source = Box::leak(Box::new(
-            Source::from_front(front(text)).with_texts(texts(text)),
+            Source::from_analysis(front(text)).with_texts(texts(text)),
         ));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -893,15 +894,18 @@ fn keyed_by_hash(text: &str, suffix: &str) -> &'static ply_codegen::Source {
     let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
     let id = ply_eval::SourceId(0);
     let mut front =
-        ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
+        ply_codegen::c::producer::checked_analysis(&[("m".to_string(), owned.to_string())], &[id])
             .expect("checks");
     for key in front.keys.values_mut() {
         key.push_str(suffix);
     }
-    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
-    Box::leak(Box::new(ply_codegen::Source::from_front(front).with_texts(
-        std::collections::HashMap::from([("m".to_string(), owned.to_string())]),
-    )))
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
+    Box::leak(Box::new(
+        ply_codegen::Source::from_analysis(front).with_texts(std::collections::HashMap::from([(
+            "m".to_string(),
+            owned.to_string(),
+        )])),
+    ))
 }
 
 /// The unit over every root of `source`, body by body: `produce` never reads a whole unit back.
@@ -1605,10 +1609,10 @@ fn keyed_modules(modules: &[(&str, &str)]) -> &'static ply_codegen::Source {
     let ids: Vec<ply_eval::SourceId> = (0..owned.len())
         .map(|i| ply_eval::SourceId(i as u32))
         .collect();
-    let front = ply_codegen::c::producer::checked_front(&owned, &ids).expect("checks");
-    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
+    let front = ply_codegen::c::producer::checked_analysis(&owned, &ids).expect("checks");
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(front));
     Box::leak(Box::new(
-        ply_codegen::Source::from_front(front).with_texts(owned.into_iter().collect()),
+        ply_codegen::Source::from_analysis(front).with_texts(owned.into_iter().collect()),
     ))
 }
 

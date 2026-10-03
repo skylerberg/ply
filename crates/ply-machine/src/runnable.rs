@@ -2,7 +2,7 @@
 //! source that answer's indices run over, and the C of its unit, in the value codec this runtime
 //! reads, compressed. A program writes one through `shipped.runnable`; reading one runs no compiler.
 
-use crate::driver::{FrontFile, HandedFront};
+use crate::driver::{LoadedAnalysis, LoadedFile};
 use crate::payload::record;
 use ply_eval::decode::At;
 use ply_eval::{SourceId, Value};
@@ -15,7 +15,7 @@ const FORMAT: &str = "ply runnable 1";
 /// A program read back from its runnable.
 pub struct Runnable {
     pub entry: String,
-    pub front: HandedFront,
+    pub front: LoadedAnalysis,
     /// The unit's C.
     pub unit: String,
 }
@@ -71,7 +71,7 @@ pub fn decode(bytes: &[u8]) -> Result<Runnable, String> {
             return Err(at.error("a runnable of another format"));
         }
         let files = at.field("files")?.items(|file| {
-            Ok(FrontFile {
+            Ok(LoadedFile {
                 path: file.field("path")?.str()?.to_string(),
                 name: file.field("name")?.str()?.to_string(),
                 text: String::from_utf8_lossy(file.field("text")?.bytes()?).into_owned(),
@@ -84,7 +84,7 @@ pub fn decode(bytes: &[u8]) -> Result<Runnable, String> {
             .map_err(|_| at.error("its unit's C is not UTF-8"))?;
         Ok(Runnable {
             entry: at.field("entry")?.str()?.to_string(),
-            front: HandedFront {
+            front: LoadedAnalysis {
                 answer,
                 files,
                 read: Duration::ZERO,

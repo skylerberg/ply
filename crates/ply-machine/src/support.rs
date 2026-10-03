@@ -55,7 +55,7 @@ pub fn module_texts(
 /// The unit the program produced for `front`, its C compiled and loaded here. What the program
 /// reaches was settled where the C was produced, so a refusal is this host failing to build it.
 pub fn unit_of(
-    front: &ply_eval::Front,
+    front: &ply_eval::Analysis,
     text: &[u8],
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     let text =

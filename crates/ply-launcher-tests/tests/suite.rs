@@ -7,7 +7,7 @@
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Front, Machine, Provider, SourceId, Span};
+use ply_eval::{Analysis, Machine, Provider, SourceId, Span};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -39,11 +39,11 @@ fn main() -> String / {env.var[e], env.vars[e], env.terminal[e], env.binary_vers
 }
 "#;
 
-fn front_of(source: &str) -> Front {
+fn front_of(source: &str) -> Analysis {
     let named = vec![("m".to_string(), source.to_string())];
     let ids = vec![SourceId(0)];
     ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_front(&named, &ids).expect("the program checks")
+    ply_codegen::c::producer::checked_analysis(&named, &ids).expect("the program checks")
 }
 
 fn ask() -> ply_eval::Value {

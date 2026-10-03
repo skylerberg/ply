@@ -22,10 +22,12 @@ pub fn named() -> String / {entropy.next} = nonce()
 pub fn no_range() -> Int / {entropy.below} = below(0)
 "#;
 
-fn tiered(service: &str) -> (ply_eval::Front, &'static ply_codegen::Unit) {
-    let answered =
-        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), service.to_string())])
-            .unwrap_or_else(|e| panic!("they check: {e:#}"));
+fn tiered(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+    let answered = ply_codegen::c::producer::checked_analysis_with_std(&[(
+        "m".to_string(),
+        service.to_string(),
+    )])
+    .unwrap_or_else(|e| panic!("they check: {e:#}"));
     let front = answered.front;
     let unit = ply_codegen::Unit::over_front(&front, answered.modules.into_iter().collect())
         .expect("this host has a C compiler");

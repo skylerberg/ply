@@ -1,7 +1,7 @@
 use crate::fixture::port_front;
 use ply_eval::compiled::{Compiled, Entered};
 use ply_eval::host::{HostRuntime, MachineId, Pending};
-use ply_eval::{DefHash, Diagnostic, Front, Machine, Span, Symbol, Value, codes};
+use ply_eval::{Analysis, DefHash, Diagnostic, Machine, Span, Symbol, Value, codes};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -94,7 +94,7 @@ fn both() -> Vec<&'static str> {
 
 /// The machine, and how many entry points its runtime has been told ended.
 fn machine_over(
-    front: &Front,
+    front: &Analysis,
     answer: impl Fn() -> Entered + 'static,
 ) -> (Machine<'_>, Arc<AtomicU32>) {
     let tier = Rc::new(Leaves {
