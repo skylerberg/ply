@@ -1,0 +1,231 @@
+// The entry points a load offers: every `main` of the package being loaded and every module the
+// load read, as `entry` picks between them. They are read off the front end's answer, and kept
+// beside the answer `ply run` files, so a run that takes one back names its entry without it.
+
+import compiler.diagnostics (parse_all)
+import compiler.front (DefRow, Dump, ModuleRow, OrdinalRow, analyse, dump_of)
+import compiler.load (LoadedAnalysis, SourceFile)
+import entry (Main, Module)
+import program (is_shipped)
+import std.bin
+
+pub type Entries = { mains: List<Main>, modules: List<Module> }
+
+pub fn none() -> Entries = { mains: [], modules: [] }
+
+// Which modules are the package being loaded, rather than a dependency's or the shelf's: only it
+// offers an entry point. A project without packages is every module the toolchain does not ship.
+fn in_root(dump: Dump) -> (Bytes) -> Bool =
+  if len(dump.packages) == 0 { |module: Bytes| !is_shipped(string_of_bytes_lossy(module)) } else {
+    let roots = fold(range(0, len(dump.ordinals)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
+      match ((list_at(dump.ordinals, i), list_at(dump.module_packages, i))) {
+        (Some(o), Some(package)) -> if package == 0 { map_insert(acc, o.module, true) }
+        else { acc },
+        _ -> acc,
+      });
+    |module: Bytes| map_contains(roots, module)
+  }
+
+// The definition an ordinal names, when it is a `fn`: `fn <name>`, then its clauses' kinds.
+fn fn_named(item: Bytes) -> Option<Bytes> / {abort.raise} =
+  if !bytes_starts_with(item, b"fn ") { None } else {
+    let rest = bytes_slice(item, 3, bytes_len(item));
+    match bytes_index_of_byte(rest, 32) {
+      Some(space) -> Some(bytes_slice(rest, 0, space)),
+      None -> Some(rest),
+    }
+  }
+
+// The file a module was read from, as its reports name it.
+fn path_of(front: LoadedAnalysis, module: Bytes) -> String =
+  match filter(front.dump.modules, |row: ModuleRow| row.name == module) {
+    [row, ..] -> match list_at(front.files, row.index) {
+      Some(file) -> file.path,
+      None -> "<unknown>",
+    },
+    [] -> string_of_bytes_lossy(module),
+  }
+
+type Picked = { seen: Map<Bytes, Bool>, mains: List<Main> }
+
+fn picked(front: LoadedAnalysis, acc: Picked, def: DefRow) -> Picked =
+  if map_contains(acc.seen, def.name) { acc } else {
+    {
+      seen: map_insert(acc.seen, def.name, true),
+      mains: push(acc.mains, {
+        name: string_of_bytes_lossy(def.name),
+        module: string_of_bytes_lossy(def.module),
+        path: path_of(front, def.module),
+        at: def.at,
+      }),
+    }
+  }
+
+// Every `main` of the package being loaded, files in load order and then as written: a
+// dependency's `main` is its own business.
+pub fn mains_of(front: LoadedAnalysis) -> List<Main> / {abort.raise} = {
+  let root = in_root(front.dump);
+  let offered = fold(front.dump.defs, map_new(), |acc: Map<Bytes, DefRow>, def: DefRow|
+    if def.simple_name == b"main" && root(def.module) { map_insert(acc, def.name, def) }
+    else { acc });
+  let written: Picked = fold(
+    front.dump.ordinals,
+    { seen: map_new(), mains: [] },
+    |acc: Picked, o: OrdinalRow|
+      fold(o.items, acc, |inner: Picked, item: Bytes|
+        match fn_named(item) {
+          None -> inner,
+          Some(name) -> match map_get(offered, name) {
+            Some(def) -> picked(front, inner, def),
+            None -> inner,
+          },
+        }),
+  );
+  let all: Picked = fold(front.dump.defs, written, |acc: Picked, def: DefRow|
+    if map_contains(offered, def.name) { picked(front, acc, def) } else { acc });
+  all.mains
+}
+
+// Every module the load read, with the empty position at the end of its file: where the entry
+// point it does not declare would be written.
+pub fn modules_of(front: LoadedAnalysis) -> List<Module> =
+  map(front.dump.modules, |row: ModuleRow| {
+    let file: Option<SourceFile> = list_at(front.files, row.index);
+    let end = match file { Some(f) -> bytes_len(f.text), None -> 0 };
+    {
+      name: string_of_bytes_lossy(row.name),
+      path: match file { Some(f) -> f.path, None -> "<unknown>" },
+      at: { module: row.index, start: end, end: end },
+    }
+  })
+
+pub fn of_front(front: LoadedAnalysis) -> Entries / {abort.raise} =
+  { mains: mains_of(front), modules: modules_of(front) }
+
+// --- As `ply run` keeps them ----------------------------------------------------
+
+// A `main` or a module, flat: `module` is empty for a module.
+type Held = { name: String, module: String, path: String, index: Int, start: Int, end: Int }
+
+// What `ply run` files under a walk's key: the entry points its load offered, and the machine's
+// own entry for the front and the unit.
+type Kept = { mains: List<Held>, modules: List<Held>, front: Bytes }
+
+derive bin for Held
+derive bin for Kept
+
+pub fn kept(entries: Entries, front: Bytes) -> Bytes / {abort.raise} =
+  bin::encode(
+    {
+      mains: map(entries.mains, |m: Main|
+        {
+          name: m.name,
+          module: m.module,
+          path: m.path,
+          index: m.at.module,
+          start: m.at.start,
+          end: m.at.end,
+        }),
+      modules: map(entries.modules, |m: Module|
+        {
+          name: m.name,
+          module: "",
+          path: m.path,
+          index: m.at.module,
+          start: m.at.start,
+          end: m.at.end,
+        }),
+      front: front,
+    },
+    kept_bin(),
+  )
+
+// What `kept` filed, or `None` for bytes it did not write.
+pub fn taken(filed: Bytes) -> Option<{ entries: Entries, front: Bytes }> / {abort.raise} =
+  match bin::decode(filed, kept_bin()) {
+    Err(_) -> None,
+    Ok(k) ->
+      Some({
+        entries: {
+          mains: map(k.mains, |h: Held|
+            {
+              name: h.name,
+              module: h.module,
+              path: h.path,
+              at: { module: h.index, start: h.start, end: h.end },
+            }),
+          modules: map(k.modules, |h: Held|
+            { name: h.name, path: h.path, at: { module: h.index, start: h.start, end: h.end } }),
+        },
+        front: k.front,
+      }),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+type Written = { name: String, text: String }
+
+// The front end's answer over `files`, each a module named by its file.
+fn front_over(files: List<Written>) -> LoadedAnalysis / {abort.raise} =
+  {
+    dump: dump_of(
+      analyse(
+        parse_all(
+          map(files, |f: Written| { name: bytes_of_string(f.name), src: bytes_of_string(f.text) }),
+        ),
+      ),
+    ),
+    files: map(files, |f: Written|
+      { path: f.name ++ ".ply", name: f.name, text: bytes_of_string(f.text) }),
+    read_ms: 0,
+    front_ms: 0,
+    file_ms: 0,
+    cached: false,
+  }
+
+test "a `main` is found in whatever module declares it, with the file that holds it" {
+  let front = front_over([
+    { name: "lib", text: "pub fn one() -> Int = 1\n" },
+    { name: "app", text: "import lib\nfn main() -> Int = lib::one()\n" },
+  ]);
+  match mains_of(front) {
+    [only] -> {
+      assert_eq(only.name, "app.main");
+      assert_eq(only.module, "app");
+      assert_eq(only.path, "app.ply");
+      assert_eq(only.at.module, 1)
+    },
+    others -> panic("one `main` is offered, and " ++ int_to_string(len(others)) ++ " were"),
+  }
+}
+
+test "two modules may each declare `main`, offered in load order" {
+  let front = front_over([
+    { name: "one", text: "fn main() -> Int = 1\n" },
+    { name: "two", text: "fn main() -> Int = 2\n" },
+  ]);
+  assert_eq(map(mains_of(front), |m: Main| m.name), ["one.main", "two.main"])
+}
+
+test "every module the load read is offered, placed at the end of its file" {
+  let front = front_over([
+    { name: "lib", text: "pub fn one() -> Int = 1\n" },
+    { name: "app", text: "import lib\nfn main() -> Int = lib::one()\n" },
+  ]);
+  assert_eq(modules_of(front), [
+    { name: "lib", path: "lib.ply", at: { module: 0, start: 24, end: 24 } },
+    { name: "app", path: "app.ply", at: { module: 1, start: 41, end: 41 } },
+  ])
+}
+
+test "what a run keeps of a load reads back as it was filed, and nothing else reads" {
+  let offered = of_front(front_over([{ name: "m", text: "fn main() -> Int = 1\n" }]));
+  match taken(kept(offered, b"the machine's own entry")) {
+    None -> panic("what `kept` wrote reads back"),
+    Some(k) -> {
+      assert_eq(k.entries, offered);
+      assert_eq(k.front, b"the machine's own entry")
+    },
+  };
+  assert(taken(b"an entry of another shape") == None, None)
+}
