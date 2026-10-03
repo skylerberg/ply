@@ -2,8 +2,8 @@
 
 import compiler.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
                       NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField,
-                      NUpdate, CStmt, CLet, CLetPat, CDo, CField, CArm, Capture, CPat, PxWild,
-                      PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField)
+                      NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, Capture,
+                      CodePattern, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CodePatternField)
 import compiler.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
                           LBad)
 import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, is_pure, is_recursive,
@@ -337,7 +337,12 @@ pub fn lower(lw: Lowering, cx: Context, c: Code) -> L / {abort.raise} =
     NMatch(m) -> match_expr(lw, cx, m.scrutinee, m.arms),
     NBlock(b) -> block(lw, cx, b.stmts, b.tail),
     NRecord(r) ->
-      record(lw, cx, map(r.fields, |f: CField| { name: text(f.name), value: Some(f.value) }), None),
+      record(
+        lw,
+        cx,
+        map(r.fields, |f: CodeField| { name: text(f.name), value: Some(f.value) }),
+        None,
+      ),
     // Each branch applied where it stands: the block means the tuple of its branches' answers.
     NParallel(pr) ->
       record(
@@ -361,7 +366,7 @@ pub fn lower(lw: Lowering, cx: Context, c: Code) -> L / {abort.raise} =
         fold(
           u.sets,
           map(u.copies, |n: Bytes| { name: text(n), value: None }),
-          |acc: List<{ name: String, value: Option<Code> }>, f: CField|
+          |acc: List<{ name: String, value: Option<Code> }>, f: CodeField|
             push(acc, { name: text(f.name), value: Some(f.value) }),
         ),
         Some(u.base),
@@ -936,8 +941,13 @@ fn try_unfold(
     }
   }
 
-fn block(lw: Lowering, cx: Context, stmts: List<CStmt>, tail: Option<Code>) -> L / {abort.raise} = {
-  let after = fold(stmts, lw, |acc: Lowering, st: CStmt|
+fn block(
+  lw: Lowering,
+  cx: Context,
+  stmts: List<CodeStmt>,
+  tail: Option<Code>,
+) -> L / {abort.raise} = {
+  let after = fold(stmts, lw, |acc: Lowering, st: CodeStmt|
     match st {
       CLet(l) -> {
         let r = lower(acc, cx, l.value);
@@ -964,7 +974,12 @@ fn block(lw: Lowering, cx: Context, stmts: List<CStmt>, tail: Option<Code>) -> L
   match tail { Some(t) -> lower(after, cx, t), None -> on(after, unit(after.ts)) }
 }
 
-fn bind_opaque(lw: Lowering, cx: Context, pat: CPat, sort: Option<Ty>) -> Lowering / {abort.raise} = {
+fn bind_opaque(
+  lw: Lowering,
+  cx: Context,
+  pat: CodePattern,
+  sort: Option<Ty>,
+) -> Lowering / {abort.raise} = {
   let lw2 = match sort {
     Some(s) -> if reaches_float(cx, s) { floated(lw) } else { lw },
     None -> lw,
@@ -976,8 +991,8 @@ fn bind_opaque(lw: Lowering, cx: Context, pat: CPat, sort: Option<Ty>) -> Loweri
 }
 
 // Each slot a pattern binds, in the order the Rust walk's stack visits them.
-fn pattern_slots(p: CPat) -> List<Int> / {abort.raise} =
-  iterate({ stack: [p], out: [] }, 1000000, |s: { stack: List<CPat>, out: List<Int> }|
+fn pattern_slots(p: CodePattern) -> List<Int> / {abort.raise} =
+  iterate({ stack: [p], out: [] }, 1000000, |s: { stack: List<CodePattern>, out: List<Int> }|
     match list_at(s.stack, len(s.stack) - 1) {
       None -> Stop(s),
       Some(top) -> {
@@ -986,14 +1001,18 @@ fn pattern_slots(p: CPat) -> List<Int> / {abort.raise} =
           PxVar(v) ->
             { stack: rest, out: match v.slot { Some(slot) -> push(s.out, slot), None -> s.out } },
           PxCtor(c) ->
-            { stack: fold(c.args, rest, |acc: List<CPat>, a: CPat| push(acc, a)), out: s.out },
+            {
+              stack: fold(c.args, rest, |acc: List<CodePattern>, a: CodePattern| push(acc, a)),
+              out: s.out,
+            },
           PxRecord(r) ->
             {
-              stack: fold(r.fields, rest, |acc: List<CPat>, f: CPatField| push(acc, f.pat)),
+              stack: fold(r.fields, rest, |acc: List<CodePattern>, f: CodePatternField|
+                push(acc, f.pat)),
               out: s.out,
             },
           PxList(l) -> {
-            let items = fold(l.items, rest, |acc: List<CPat>, a: CPat| push(acc, a));
+            let items = fold(l.items, rest, |acc: List<CodePattern>, a: CodePattern| push(acc, a));
             { stack: match l.rest { Some(r) -> push(items, r), None -> items }, out: s.out }
           },
           _ -> { stack: rest, out: s.out },
@@ -1001,13 +1020,18 @@ fn pattern_slots(p: CPat) -> List<Int> / {abort.raise} =
       },
     }).out
 
-fn match_expr(lw: Lowering, cx: Context, scrutinee: Code, arms: List<CArm>) -> L / {abort.raise} = {
+fn match_expr(
+  lw: Lowering,
+  cx: Context,
+  scrutinee: Code,
+  arms: List<CodeArm>,
+) -> L / {abort.raise} = {
   let s = lower(lw, cx, scrutinee);
   let s_sort = sort_of(s.lw.ts, s.id);
   let walked = fold(
     arms,
     { lw: s.lw, arms: [], sort: None },
-    |acc: { lw: Lowering, arms: List<Arm>, sort: Option<Ty> }, a: CArm| {
+    |acc: { lw: Lowering, arms: List<Arm>, sort: Option<Ty> }, a: CodeArm| {
       // What a guard admits is not modelled, so a guarded arm is never known to be taken.
       let shaped = match a.guard {
         Some(_) -> None,
@@ -1047,12 +1071,12 @@ fn match_expr(lw: Lowering, cx: Context, scrutinee: Code, arms: List<CArm>) -> L
   on(walked.lw, mk(walked.lw.ts, TMatch({ scrutinee: s.id, arms: walked.arms }), walked.sort))
 }
 
-fn is_simple(p: CPat) -> Bool = match p { PxWild -> true, PxVar(_) -> true, _ -> false }
+fn is_simple(p: CodePattern) -> Bool = match p { PxWild -> true, PxVar(_) -> true, _ -> false }
 
 fn arm_shape(
   lw: Lowering,
   cx: Context,
-  pat: CPat,
+  pat: CodePattern,
   scrutinee: Int,
   s_sort: Option<Ty>,
 ) -> Option<{ lw: Lowering, test: ArmTest, binds: List<Int> }> / {abort.raise} =
@@ -1071,7 +1095,7 @@ fn arm_shape(
     PxCtor(c) -> match ctor(cx, text(c.name)) {
       None -> None,
       Some(k) -> if arity(k) != len(c.args)
-          || !fold(c.args, true, |ok: Bool, a: CPat| ok && is_simple(a)) { None } else {
+          || !fold(c.args, true, |ok: Bool, a: CodePattern| ok && is_simple(a)) { None } else {
         let sorts = field_sorts(k, s_sort);
         let bound = fold(
           range(0, len(c.args)),
@@ -1090,7 +1114,7 @@ fn arm_shape(
       },
     },
     PxList(l) -> {
-      let simple = fold(l.items, true, |ok: Bool, a: CPat| ok && is_simple(a))
+      let simple = fold(l.items, true, |ok: Bool, a: CodePattern| ok && is_simple(a))
         && (match l.rest { Some(r) -> is_simple(r), None -> true });
       if !simple { None } else {
         let elem = match s_sort { Some(s) -> list_elem(s), None -> None };
@@ -1099,7 +1123,7 @@ fn arm_shape(
         let heads = fold(
           l.items,
           { lw: lw, at: Some(scrutinee), binds: [] },
-          |acc: { lw: Lowering, at: Option<Int>, binds: List<Int> }, item: CPat| {
+          |acc: { lw: Lowering, at: Option<Int>, binds: List<Int> }, item: CodePattern| {
             let stepped = match acc.at {
               Some(t) -> match node(acc.lw.ts, t) {
                 TCons(c) -> { lw: acc.lw, at: Some(c.tail), field: c.head },
