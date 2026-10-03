@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 pub type Owner = (MachineId, Option<TaskId>);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Open {
+pub struct OpenSpan {
     pub id: i64,
     /// The channel the `enter` named; the closing record is written on it.
     pub channel: Resource,
@@ -19,7 +19,7 @@ pub struct Open {
 }
 
 pub struct Closing {
-    pub open: Open,
+    pub open: OpenSpan,
     pub outcome: Outcome,
 }
 
@@ -48,7 +48,7 @@ impl Abandoned {
         self.count == 0
     }
 
-    fn note(&mut self, open: &Open) {
+    fn note(&mut self, open: &OpenSpan) {
         self.count += 1;
         if self.first.len() < NAMED {
             self.first
@@ -66,7 +66,7 @@ impl Abandoned {
 }
 
 pub struct Spans {
-    open: BTreeMap<Owner, Vec<Open>>,
+    open: BTreeMap<Owner, Vec<OpenSpan>>,
     /// The next id each entry point mints; dropped by [`Spans::end_entry_point`].
     next: BTreeMap<MachineId, i64>,
     /// Per machine, what its retired tasks left open, for the warning its entry point ends with.
@@ -132,14 +132,14 @@ impl Spans {
         channel: Resource,
         name: std::sync::Arc<str>,
         started: Option<i64>,
-    ) -> Open {
+    ) -> OpenSpan {
         // From 1, so `0` in a record's `span` or `parent` unambiguously means no span.
         let next = self.next.entry(owner.0).or_insert(1);
         let id = *next;
         *next += 1;
         let stack = self.open.entry(owner).or_default();
         let parent = stack.last().map_or(0, |open| open.id);
-        let open = Open {
+        let open = OpenSpan {
             id,
             channel,
             name,
@@ -159,7 +159,7 @@ impl Spans {
         channel: &Resource,
         outcome: Outcome,
     ) -> Result<Vec<Closing>, Unbalanced> {
-        let stack: &[Open] = self.open.get(&owner).map_or(&[], Vec::as_slice);
+        let stack: &[OpenSpan] = self.open.get(&owner).map_or(&[], Vec::as_slice);
         let Some(at) = stack.iter().position(|open| open.id == id) else {
             return Err(self.why(owner, id));
         };
@@ -170,7 +170,7 @@ impl Spans {
             .open
             .get_mut(&owner)
             .expect("the position came from it");
-        let popped: Vec<Open> = stack.drain(at..).collect();
+        let popped: Vec<OpenSpan> = stack.drain(at..).collect();
         // `popped[0]` is the span the program named; the rest never ran their own `exit`.
         let closings: Vec<Closing> = popped
             .into_iter()

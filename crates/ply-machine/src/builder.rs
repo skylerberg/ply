@@ -6,7 +6,7 @@
 use crate::driver::{
     LoadedAnalysis, load_over_analysis, load_over_analysis_in, loaded_analysis_of,
 };
-use crate::hosts::Lent;
+use crate::hosts::LentOp;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{diags_value, option, places_value, record};
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
@@ -30,14 +30,14 @@ const HERMETIC_OPERATIONS: [(&str, &str); 2] = [
 ];
 
 /// The ops and the one handler serving them, and the hermetic half's.
-pub fn lent() -> Vec<Lent> {
+pub fn lent() -> Vec<LentOp> {
     let mut ops = lent_by(false);
     ops.extend(lent_by(true));
     ops
 }
 
-fn lent_by(hermetic: bool) -> Vec<Lent> {
-    let site: Arc<dyn HostHandler> = Arc::new(Site { hermetic });
+fn lent_by(hermetic: bool) -> Vec<LentOp> {
+    let handler: Arc<dyn HostHandler> = Arc::new(BuilderHandler { hermetic });
     let (effect, operations) = if hermetic {
         (HERMETIC, HERMETIC_OPERATIONS)
     } else {
@@ -52,17 +52,17 @@ fn lent_by(hermetic: bool) -> Vec<Lent> {
             } else {
                 crate::hosts::privileged_op(effect, op, Linearity::Repeatable, path)
             };
-            (op, Arc::clone(&site))
+            (op, Arc::clone(&handler))
         })
         .collect()
 }
 
-struct Site {
+struct BuilderHandler {
     /// Answers from what it is handed alone: it measures no binary and fetches nothing.
     hermetic: bool,
 }
 
-impl HostHandler for Site {
+impl HostHandler for BuilderHandler {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
@@ -104,7 +104,7 @@ fn answered(answer: Result<PlyValue, Diagnostic>) -> PlyValue {
 
 // --- The program as it loaded -------------------------------------------------
 
-impl Site {
+impl BuilderHandler {
     /// A load is of the root and front end it is handed.
     fn load(&self, path: &Path, front: &LoadedAnalysis) -> Result<Loaded, LoadError> {
         if self.hermetic {

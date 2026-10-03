@@ -6,7 +6,7 @@ use ply_eval::{
     Determinism, Diagnostic, EffectAtom, HostAnswer, HostHandler, HostRequest, HostResource,
     HostRuntime, Linearity, Mode, Resource, Span, Symbol, TaskId, codes,
 };
-use ply_host::trace::sink::{Kept, Recording};
+use ply_host::trace::sink::{OwnedRecord, Recording};
 use ply_host::trace::*;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -114,11 +114,11 @@ impl Fixture {
         perform_on(&self.trace, self.machine, task, op, at, args)
     }
 
-    fn kinds(&self) -> Vec<Kind> {
+    fn kinds(&self) -> Vec<RecordKind> {
         self.sink.records().iter().map(|r| r.kind).collect()
     }
 
-    fn records(&self) -> Vec<Kept> {
+    fn records(&self) -> Vec<OwnedRecord> {
         self.sink.records()
     }
 }
@@ -235,11 +235,11 @@ fn a_nested_span_records_its_parent_and_an_event_inside_it_records_the_span() {
     assert_eq!(
         f.kinds(),
         [
-            Kind::Enter,
-            Kind::Enter,
-            Kind::Event,
-            Kind::Exit,
-            Kind::Exit
+            RecordKind::Enter,
+            RecordKind::Enter,
+            RecordKind::Event,
+            RecordKind::Exit,
+            RecordKind::Exit
         ]
     );
     let spans: Vec<i64> = records.iter().map(|r| r.span).collect();
@@ -280,7 +280,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
     );
 
     // Nothing was recorded for the refusal, and the span is still task 1's to close.
-    assert_eq!(f.kinds(), [Kind::Enter]);
+    assert_eq!(f.kinds(), [RecordKind::Enter]);
     f.as_task(
         Some(TaskId(1)),
         Op::Exit,
@@ -288,7 +288,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
         vec![first, ctor("Ok", Vec::new())],
     )
     .expect("task 1 closes its own span");
-    assert_eq!(f.kinds(), [Kind::Enter, Kind::Exit]);
+    assert_eq!(f.kinds(), [RecordKind::Enter, RecordKind::Exit]);
 }
 
 /// Checked against the tree the records imply, not the driver's own bookkeeping.
@@ -318,11 +318,11 @@ fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
     let parent_of = |name: &str| -> String {
         let record = records
             .iter()
-            .find(|r| r.name == name && r.kind == Kind::Enter)
+            .find(|r| r.name == name && r.kind == RecordKind::Enter)
             .expect("an enter");
         records
             .iter()
-            .find(|r| r.span == record.parent && r.kind == Kind::Enter)
+            .find(|r| r.span == record.parent && r.kind == RecordKind::Enter)
             .map(|r| r.name.clone())
             .unwrap_or_else(|| "-".to_string())
     };
@@ -352,7 +352,12 @@ fn closing_an_outer_span_abandons_the_spans_above_it() {
     let records = f.records();
     assert_eq!(
         f.kinds(),
-        [Kind::Enter, Kind::Enter, Kind::Exit, Kind::Exit]
+        [
+            RecordKind::Enter,
+            RecordKind::Enter,
+            RecordKind::Exit,
+            RecordKind::Exit
+        ]
     );
     assert_eq!(records[2].span, 2, "innermost first");
     assert_eq!(records[2].outcome, Outcome::Abandoned);
@@ -380,7 +385,12 @@ fn teardown_closes_what_the_program_left_open_and_reports_w0609() {
     let records = f.records();
     assert_eq!(
         f.kinds(),
-        [Kind::Enter, Kind::Enter, Kind::Exit, Kind::Exit]
+        [
+            RecordKind::Enter,
+            RecordKind::Enter,
+            RecordKind::Exit,
+            RecordKind::Exit
+        ]
     );
     assert_eq!(records[2].name, "query", "innermost first");
     assert!(
@@ -415,11 +425,11 @@ fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
     assert_eq!(
         f.kinds(),
         [
-            Kind::Enter,
-            Kind::Enter,
-            Kind::Enter,
-            Kind::Exit,
-            Kind::Exit
+            RecordKind::Enter,
+            RecordKind::Enter,
+            RecordKind::Enter,
+            RecordKind::Exit,
+            RecordKind::Exit
         ]
     );
     assert_eq!(records[3].name, "query", "innermost first");
@@ -465,7 +475,7 @@ fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_end
     );
     assert_eq!(
         f.kinds(),
-        [Kind::Enter, Kind::Exit],
+        [RecordKind::Enter, RecordKind::Exit],
         "written once, at retirement"
     );
     assert!(
@@ -528,7 +538,7 @@ fn teardown_writes_before_it_flushes() {
     enter(&f, "orders", "place_order");
     assert_eq!(f.sink.flushes(), 0);
     f.trace.end_entry_point(f.machine);
-    assert_eq!(f.kinds(), [Kind::Enter, Kind::Exit]);
+    assert_eq!(f.kinds(), [RecordKind::Enter, RecordKind::Exit]);
     f.trace.flush();
     assert_eq!(f.sink.flushes(), 1);
     assert!(f.trace.counts().flushed);
@@ -566,7 +576,10 @@ fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
     );
 
     let records = f.records();
-    assert_eq!(f.kinds(), [Kind::Count, Kind::Gauge, Kind::Time]);
+    assert_eq!(
+        f.kinds(),
+        [RecordKind::Count, RecordKind::Gauge, RecordKind::Time]
+    );
     assert_eq!(records[0].amount, Some(3));
     assert_eq!(
         records[1].value,
@@ -676,13 +689,17 @@ fn a_level_filter_drops_the_record_and_reads_no_clock() {
 
     event(&f, "orders", "Warn", "slow");
     assert_eq!(f.clock.reads(), 1);
-    assert_eq!(f.kinds(), [Kind::Event]);
+    assert_eq!(f.kinds(), [RecordKind::Event]);
 
     // A span is `Info`, so `warn` drops it, yet the stack keeps it for `E0445` and `W0609`.
     let span = enter(&f, "orders", "place_order");
     assert_eq!(f.trace.open_spans(), 1);
     exit(&f, "orders", span);
-    assert_eq!(f.kinds(), [Kind::Event], "nothing at `info` was written");
+    assert_eq!(
+        f.kinds(),
+        [RecordKind::Event],
+        "nothing at `info` was written"
+    );
     assert_eq!(f.clock.reads(), 1, "and nothing at `info` was stamped");
 }
 

@@ -111,7 +111,7 @@ fn lent_by(
     options: drive::RunOptions,
     hermetic: bool,
 ) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    let site: Arc<dyn HostHandler> = Arc::new(Site {
+    let handler: Arc<dyn HostHandler> = Arc::new(MachineHandler {
         module: module.to_string(),
         hermetic,
         options,
@@ -132,7 +132,7 @@ fn lent_by(
             } else {
                 hosts::privileged_op(effect, op, Linearity::Repeatable, path)
             };
-            (op, Arc::clone(&site))
+            (op, Arc::clone(&handler))
         })
         .collect()
 }
@@ -168,33 +168,33 @@ fn refused_value(refused: &drive::Refused) -> Value {
 
 // --- The handler ------------------------------------------------------------------
 
-struct Site {
+struct MachineHandler {
     module: String,
     hermetic: bool,
     options: drive::RunOptions,
-    labels: Mutex<HashMap<String, Labelled>>,
+    labels: Mutex<HashMap<String, MachineThread>>,
     /// What a label was configured with before it loaded, if it was.
     configured: Mutex<HashMap<String, drive::RunOptions>>,
 }
 
 /// A label's machine: the channel to its thread, and the join on the way out.
-struct Labelled {
-    go: Option<Sender<Go>>,
+struct MachineThread {
+    requests: Option<Sender<Request>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Labelled {
+impl MachineThread {
     fn join(&mut self) {
         // The sender goes first: the thread is parked on it, and dropping it ends the wait, so a
         // program that never drops its machine still leaves nothing running.
-        self.go.take();
+        self.requests.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-impl Drop for Labelled {
+impl Drop for MachineThread {
     fn drop(&mut self) {
         self.join();
     }
@@ -202,7 +202,7 @@ impl Drop for Labelled {
 
 /// The steps' answers cross as plain data; a `Value` is not `Send`, so the handler thread builds
 /// the one the program reads.
-enum Go {
+enum Request {
     Schema {
         name: String,
         reply: Sender<Result<ply_eval::Plain, Diagnostic>>,
@@ -230,7 +230,7 @@ enum Go {
     },
 }
 
-impl HostHandler for Site {
+impl HostHandler for MachineHandler {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let label = label_of(req, span)?;
@@ -254,7 +254,7 @@ impl HostHandler for Site {
                 let front = Box::new(crate::driver::loaded_analysis_of(front, span)?);
                 let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
                 let answer: Result<drive::FoundData, drive::Refused> =
-                    self.ask(&label, span, |reply| Go::Reload { reply, front, unit })?;
+                    self.ask(&label, span, |reply| Request::Reload { reply, front, unit })?;
                 match answer {
                     Ok(found) => ok(drive::found_value(&found, &self.module)),
                     Err(refused) => refused_value(&refused),
@@ -263,14 +263,14 @@ impl HostHandler for Site {
             ("schema", [name]) => {
                 let name = name.as_str(span, "a definition's name")?.to_string();
                 let answer: Result<ply_eval::Plain, Diagnostic> =
-                    self.ask(&label, span, |reply| Go::Schema { name, reply })?;
+                    self.ask(&label, span, |reply| Request::Schema { name, reply })?;
                 crate::config::schema_answer(answer)
             }
             ("bound", [entry, config]) => {
                 let entry = entry.as_str(span, "an entry point's name")?.to_string();
                 let configuration = crate::config::Configuration::of(config, span)?;
                 let answer: Result<drive::Disclosed, drive::Refused> =
-                    self.ask(&label, span, |reply| Go::Bound {
+                    self.ask(&label, span, |reply| Request::Bound {
                         entry,
                         configuration,
                         reply,
@@ -282,7 +282,7 @@ impl HostHandler for Site {
             }
             ("enter", []) => {
                 let outcome: drive::Outcome =
-                    self.ask(&label, span, |reply| Go::Enter { reply })?;
+                    self.ask(&label, span, |reply| Request::Enter { reply })?;
                 drive::outcome_value(&outcome)
             }
             ("call", [name, args]) => {
@@ -301,12 +301,12 @@ impl HostHandler for Site {
                     .map(|a| ply_eval::reflect::plain_of(a, span))
                     .collect::<Result<_, _>>()?;
                 let called: ply_eval::Ended<ply_eval::Plain> =
-                    self.ask(&label, span, |reply| Go::Call { name, args, reply })?;
+                    self.ask(&label, span, |reply| Request::Call { name, args, reply })?;
                 drive::called_value(called)
             }
             ("accounting", []) => {
                 let measured: drive::Measured =
-                    self.ask(&label, span, |reply| Go::Accounting { reply })?;
+                    self.ask(&label, span, |reply| Request::Accounting { reply })?;
                 drive::accounting_value(&measured)
             }
             ("drop", []) => self.drop(&label),
@@ -360,7 +360,7 @@ fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
     }
 }
 
-impl Site {
+impl MachineHandler {
     /// The program parsed the line; the machine reads the record.
     fn configure(&self, label: &str, options: &Value, span: Span) -> Result<Value, Diagnostic> {
         let mut parsed = drive::run_options_of(options, span)?;
@@ -546,7 +546,7 @@ impl Site {
             .primary(span, "drop it first, or load under another label"));
         }
         let (reply, answered) = mpsc::channel();
-        let (go, hearing) = mpsc::channel();
+        let (requests, hearing) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name(format!("machine-{label}"))
             .stack_size(STACK)
@@ -563,8 +563,8 @@ impl Site {
             .unwrap_or_else(|e| e.into_inner())
             .insert(
                 label.to_string(),
-                Labelled {
-                    go: Some(go),
+                MachineThread {
+                    requests: Some(requests),
                     thread: Some(thread),
                 },
             );
@@ -576,7 +576,7 @@ impl Site {
         &self,
         label: &str,
         span: Span,
-        go: impl FnOnce(Sender<T>) -> Go,
+        request: impl FnOnce(Sender<T>) -> Request,
     ) -> Result<T, Diagnostic> {
         let (reply, answered) = mpsc::channel();
         {
@@ -589,10 +589,10 @@ impl Site {
                 .primary(span, "a machine answers for the program it was loaded with"));
             };
             machine
-                .go
+                .requests
                 .as_ref()
                 .ok_or_else(|| unanswered(label))?
-                .send(go(reply))
+                .send(request(reply))
                 .map_err(|_| unanswered(label))?;
         }
         answered.recv().map_err(|_| unanswered(label))
@@ -632,7 +632,7 @@ fn unanswered(label: &str) -> Diagnostic {
 fn serve(
     opened: Result<drive::Drive, drive::Refused>,
     reply: Sender<Result<drive::FoundData, drive::Refused>>,
-    hearing: mpsc::Receiver<Go>,
+    hearing: mpsc::Receiver<Request>,
 ) {
     match opened {
         Ok(drive) => {
@@ -646,29 +646,29 @@ fn serve(
     }
 }
 
-fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Go>) {
-    while let Ok(go) = hearing.recv() {
-        match go {
-            Go::Schema { name, reply } => {
+fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Request>) {
+    while let Ok(request) = hearing.recv() {
+        match request {
+            Request::Schema { name, reply } => {
                 let _ = reply.send(drive.schema(&name));
             }
-            Go::Bound {
+            Request::Bound {
                 entry,
                 configuration,
                 reply,
             } => {
                 let _ = reply.send(drive.bound(&entry, configuration));
             }
-            Go::Enter { reply } => {
+            Request::Enter { reply } => {
                 let _ = reply.send(drive.enter());
             }
-            Go::Call { name, args, reply } => {
+            Request::Call { name, args, reply } => {
                 let _ = reply.send(drive.call(&name, args));
             }
-            Go::Accounting { reply } => {
+            Request::Accounting { reply } => {
                 let _ = reply.send(drive.accounting());
             }
-            Go::Reload { reply, front, unit } => {
+            Request::Reload { reply, front, unit } => {
                 let answer = drive.reload(&front, &unit).map(|()| drive.found_data());
                 let _ = reply.send(answer);
             }
