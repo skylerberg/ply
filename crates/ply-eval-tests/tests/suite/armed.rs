@@ -846,8 +846,11 @@ fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// The registry of codes: the table `ply explain` answers from, one `m("E0000", "...")` per code.
+/// The registry of codes: the table `ply explain` answers from, one `meaning_of("E0000", "...")` per code.
 const REGISTRY: &str = "crates/ply-cli/ply/explain.ply";
+
+/// What every row of the registry opens with.
+const ROW: &[u8] = b"meaning_of(";
 
 /// `(code, line)` for every row of the registry's `meanings()`, in the table's order. A row this
 /// cannot read fails the read rather than being skipped, so no code hides behind another shape.
@@ -869,11 +872,11 @@ fn registry_rows(root: &Path) -> Vec<(String, usize)> {
         if text.get(i) == Some(&b']') {
             return rows;
         }
-        if !text[i..].starts_with(b"m(") {
+        if !text[i..].starts_with(ROW) {
             unreadable_row(&text, i);
         }
         let row = i;
-        let (code, after) = ply_string(&text, skip_ply_space(&text, i + 2))
+        let (code, after) = ply_string(&text, skip_ply_space(&text, i + ROW.len()))
             .unwrap_or_else(|| unreadable_row(&text, i));
         i = skip_ply_space(&text, after);
         if text.get(i) != Some(&b',') {
@@ -900,7 +903,7 @@ fn registry_rows(root: &Path) -> Vec<(String, usize)> {
 
 fn unreadable_row(text: &[u8], at: usize) -> ! {
     panic!(
-        "{REGISTRY}:{}: `meanings()` holds something other than an `m(\"E0000\", \"meaning\")` \
+        "{REGISTRY}:{}: `meanings()` holds something other than a `meaning_of(\"E0000\", \"meaning\")` \
          row, which the registry gates cannot read",
         line_of(text, at)
     )
