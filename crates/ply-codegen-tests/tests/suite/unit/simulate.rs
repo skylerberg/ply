@@ -68,7 +68,7 @@ fn counted(i: Int) -> Int =
     cell_get(c)
   } }
 
-pub fn churn(n: Int) -> Int / {task.write} =
+pub fn churn(n: Int) -> Int / {task.write, abort.raise} =
   fold(range(0, n), 0, |sum: Int, i: Int| {
     task.spawn(|| counted(i));
     let t = task.spawn(|| counted(i));

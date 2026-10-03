@@ -130,7 +130,7 @@ type Ended = {
   hosts: Json,
 }
 
-fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m], abort.raise} = {
   match machine.load[m](root, Some(front), None) {
     Ok(_t) -> {
       match machine.bound[m]("inner.main", unconfigured()) {
@@ -282,7 +282,7 @@ fn main() -> Unit / {process.exit[proc]} = process.exit[proc](7)
 fn a_nested_raise_is_a_value_not_an_unwind() {
     let answer = entered(
         r#"
-fn main() -> Int = panic("the inner program's own bug")
+fn main() -> Int / {abort.raise} = panic("the inner program's own bug")
 "#,
     );
     // A raise is a diagnostic value; the outer program does not read inside it.
@@ -935,7 +935,7 @@ fn main() -> Int = 0
 
 pub fn double(x: Int) -> Int = x * 2
 
-pub fn boom() -> Int = panic("oh no")
+pub fn boom() -> Int / {abort.raise} = panic("oh no")
 "#;
 
 #[test]

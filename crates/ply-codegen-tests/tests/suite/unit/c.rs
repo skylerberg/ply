@@ -127,7 +127,7 @@ fn clamp(x: Int, lo: Int, hi: Int) -> Int =
   if x < lo { lo } else { if x > hi { hi } else { x } }
 fn collatz(n: Int) -> Int =
   if n <= 1 { 0 } else { if even(n) { 1 + collatz(n / 2) } else { 1 + collatz(3 * n + 1) } }
-pub fn width(a: Int, b: Int) -> Int =
+pub fn width(a: Int, b: Int) -> Int / {abort.raise} =
   int_of_u32(wrap_add(u32_of_int(a), u32_of_int(b)) ^ rotr(u32_of_int(b), 8))
 pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
 "#;
@@ -288,21 +288,21 @@ fn g(q: Quad, mx: U32) -> Quad = {
   let b1 = rotr(q.b ^ c1, 12);
   {a: a1, b: b1, c: c1, d: d1}
 }
-pub fn mixed(n: Int) -> Int = {
+pub fn mixed(n: Int) -> Int / {abort.raise} = {
   let w = u32_of_int(n);
   let q = g({a: w, b: 1u32, c: 0x3C6E_F372u32, d: 0xA54F_F53Au32}, w);
   int_of_u32(q.a ^ q.b ^ q.c ^ q.d)
 }
-pub fn counted(n: Int) -> Int =
+pub fn counted(n: Int) -> Int / {abort.raise} =
   iterate({i: 0, acc: 0}, n + 1, |s: {i: Int, acc: Int}|
     if s.i >= n { Stop(s.acc) } else { Continue({i: s.i + 1, acc: s.acc + s.i * s.i}) })
-pub fn bytes_sum(b: Bytes) -> Int =
+pub fn bytes_sum(b: Bytes) -> Int / {abort.raise} =
   iterate({i: 0, acc: 0}, bytes_len(b) + 1, |s: {i: Int, acc: Int}|
     if s.i >= bytes_len(b) { Stop(s.acc) }
     else { Continue({i: s.i + 1, acc: s.acc + bytes_at(b, s.i)}) })
 pub fn shifted(a: Int, n: Int) -> Int = (a << n) + (a >> n) + (a >>> n)
 pub fn matched(n: Int) -> Int = match n { 0 -> 100, 1 -> 200, _ -> n * 3 }
-pub fn looped(n: Int) -> Int =
+pub fn looped(n: Int) -> Int / {abort.raise} =
   iterate({i: 0, q: {a: 1u32, b: 2u32, c: 3u32, d: 4u32}}, n + 1, |s: {i: Int, q: Quad}|
     if s.i >= n { Stop(int_of_u32(s.q.a ^ s.q.b ^ s.q.c ^ s.q.d)) }
     else { Continue({i: s.i + 1, q: g(s.q, u32_of_int(s.i))}) })
@@ -355,12 +355,12 @@ pub fn looped(n: Int) -> Int =
 #[test]
 fn a_width_the_tier_cannot_carry_in_a_register_still_answers() {
     let source = r#"
-pub fn wide(n: Int) -> Int = {
+pub fn wide(n: Int) -> Int / {abort.raise} = {
   let a = u64_of_int(n);
   let b = wrap_mul(wrap_add(a, a), 0x9E37_79B9_7F4A_7C15u64);
   int_of_u64(rotr(b, 7) & 0xFFFFu64)
 }
-pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 2654435761u32), 7))
+pub fn narrow(n: Int) -> Int / {abort.raise} = int_of_u32(rotr(wrap_mul(u32_of_int(n), 2654435761u32), 7))
 "#;
     let Some((_, native, _)) = tests_support::with_refusals(source) else {
         return;
@@ -477,8 +477,8 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
 #[test]
 fn two_definitions_that_say_the_same_thing_get_their_own_bodies() {
     let source = r#"
-pub fn one(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
-pub fn two(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
+pub fn one(b: Bytes, i: Int) -> Int / {abort.raise} = bytes_at(b, i) + 1
+pub fn two(b: Bytes, i: Int) -> Int / {abort.raise} = bytes_at(b, i) + 1
 "#;
     let Some((_, native)) = tests_support::unit(source) else {
         return;
@@ -845,7 +845,7 @@ fn produced(source: &'static ply_codegen::Source) -> ply_codegen::c::Produced {
 #[test]
 fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now_is() {
     let nonce = nonce();
-    let main = "fn main() -> Int = 1 / 0\n";
+    let main = "fn main() -> Int / {abort.raise} = 1 / 0\n";
     let moved = format!("fn spare() -> Int = {nonce}\n\n\n{main}");
     let hashed = |text: &str| keyed_by_hash(text, "");
     let failure = |source: &'static ply_codegen::Source| -> Option<ply_eval::Span> {
@@ -1019,12 +1019,12 @@ fn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }
 pub fn a_list() -> List<Int> = [deep(32)]
 pub fn an_int() -> Int = deep(32)
 pub fn a_bool() -> Bool = deep(32) > 0
-pub fn a_u8() -> U8 = u8_of_int(deep(32))
+pub fn a_u8() -> U8 / {abort.raise} = u8_of_int(deep(32))
 pub fn reads_a_list(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len(a_list()))
 pub fn reads_an_int(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + an_int())
 pub fn reads_a_bool(n: Int) -> Int =
   fold(range(0, n), 0, |acc: Int, _x: Int| if a_bool() { acc + 1 } else { acc })
-pub fn reads_a_u8(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + int_of_u8(a_u8()))
+pub fn reads_a_u8(n: Int) -> Int / {abort.raise} = fold(range(0, n), 0, |acc: Int, _x: Int| acc + int_of_u8(a_u8()))
 "#;
     let Some((loaded, native)) = tests_support::unit(source) else {
         return;
@@ -1126,7 +1126,7 @@ pub fn with_wide(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, wide).i
 #[test]
 fn a_helper_answer_handed_to_a_helper_is_not_counted_again() {
     let source = r#"
-pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
+pub fn wrap(n: Int) -> List<Bytes> / {abort.raise} = [byte_of_int(n)]
 "#;
     let Some(loaded) = tests_support::keyed(source) else {
         return;

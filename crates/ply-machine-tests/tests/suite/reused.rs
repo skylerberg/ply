@@ -8,8 +8,7 @@ use ply_machine::driver::{HandedFront, handed_front_of};
 use ply_machine::reused::{self, Walked};
 use std::path::{Path, PathBuf};
 
-const PULLING: &str =
-    "import std.json (Null, to_string)\n\nfn main() -> Int = string_len(to_string(Null))\n";
+const PULLING: &str = "import std.json (Null, to_string)\n\nfn main() -> Int / {abort.raise} = string_len(to_string(Null))\n";
 
 /// A key nothing else files under: the digest of the project's own path.
 fn key_of(dir: &Path) -> String {

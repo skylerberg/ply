@@ -8,7 +8,7 @@ effect amb { read flip[coin]() -> Bool }
 
 type Saved = Nothing | Just((Bool) -> Int)
 
-pub fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
+pub fn parked() -> Saved / {abort.raise} = with_cell[slot](Nothing) { s -> {
   let inner = handle {
     if amb.flip[coin]() { 41 } else { 0 }
   } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 } };
@@ -18,7 +18,7 @@ pub fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
 
 pub fn resume_it(s: Saved) -> Int = match s { Just(k) -> k(true), Nothing -> 0 }
 
-pub fn beside(s: Saved) -> Int = {
+pub fn beside(s: Saved) -> Int / {abort.raise} = {
   let mine = parked();
   resume_it(s) + resume_it(mine)
 }
