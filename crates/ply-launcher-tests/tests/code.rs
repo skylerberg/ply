@@ -21,7 +21,7 @@ fn repository() -> tempfile::TempDir {
     write(&r.join("std/net.ply"), "pub fn n() -> Int = 1\n");
     write(
         &r.join("compiler/front.ply"),
-        "import spine (s)\npub fn f() -> Int = 1\n",
+        "import parsing (s)\npub fn f() -> Int = 1\n",
     );
     write(&r.join("compiler/parsing.ply"), "pub fn s() -> Int = 1\n");
     write(&r.join("compiler/emit.ply"), "pub fn e() -> Int = 1\n");
