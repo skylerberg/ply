@@ -28,14 +28,18 @@ type Cause =
   | CHandler
   | CClosure
 
-type Why = { cause: Cause, text: Bytes }
+type Reason = { cause: Cause, text: Bytes }
 
 // Who owns a value besides the place it stands; a parameter is sole-owned exactly when every caller hands it over.
-type Owner = | FreshOwner | ParamOwner(Int) | BlockedOwner(Why) | UnknownOwner(Why)
+type Owner = | FreshOwner | ParamOwner(Int) | BlockedOwner(Reason) | UnknownOwner(Reason)
 
-type ParamOwnership = | SoleParam | UnsureParam(Why) | SharedParam(Why)
+type ParamOwnership = | SoleParam | UnsureParam(Reason) | SharedParam(Reason)
 
-type ReturnOwnership = | FreshReturn | ReturnOfParam(Int) | SharedReturn(Why) | UnsureReturn(Why)
+type ReturnOwnership =
+  | FreshReturn
+  | ReturnOfParam(Int)
+  | SharedReturn(Reason)
+  | UnsureReturn(Reason)
 
 type Tables = { params: List<List<ParamOwnership>>, rets: List<ReturnOwnership> }
 
@@ -100,11 +104,11 @@ type Settled = { tables: Tables, rounds: Int }
 
 type Parsed = { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }
 
-fn blocked(c: Cause, text: Bytes) -> Owner = BlockedOwner({ cause: c, text: text })
+fn blocked(cause: Cause, text: Bytes) -> Owner = BlockedOwner({ cause: cause, text: text })
 
-fn unknown(c: Cause, text: Bytes) -> Owner = UnknownOwner({ cause: c, text: text })
+fn unknown(cause: Cause, text: Bytes) -> Owner = UnknownOwner({ cause: cause, text: text })
 
-fn reworded(w: Why, text: Bytes) -> Why = { cause: w.cause, text: text }
+fn reworded(reason: Reason, text: Bytes) -> Reason = { cause: reason.cause, text: text }
 
 fn fresh(state: CostState) -> WithOwner = { state: state, owner: FreshOwner }
 
@@ -195,16 +199,16 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
     NField(f) -> {
       let b = walk(env, f.base, state);
       match b.owner {
-        BlockedOwner(w) ->
+        BlockedOwner(reason) ->
           {
             state: b.state,
             owner: blocked(
-              w.cause,
+              reason.cause,
               bytes_concat_all([
                 b"`.",
                 f.field,
                 b"` was read out of a record something else still holds: ",
-                w.text,
+                reason.text,
               ]),
             ),
           },
@@ -415,12 +419,12 @@ fn sep_at(text: Bytes) -> Int / {abort.raise} =
     if acc < 0 && bytes_at(text, i) == 58 && bytes_at(text, i + 1) == 58 { i } else { acc })
 
 fn qname_of(text: Bytes) -> QName / {abort.raise} = {
-  let at_ = sep_at(text);
-  if at_ < 0 { { module: None, name: { name: text, span: dummy_span() }, span: dummy_span() } }
+  let sep = sep_at(text);
+  if sep < 0 { { module: None, name: { name: text, span: dummy_span() }, span: dummy_span() } }
   else {
     {
-      module: Some({ name: bytes_slice(text, 0, at_), span: dummy_span() }),
-      name: { name: bytes_slice(text, at_ + 2, bytes_len(text)), span: dummy_span() },
+      module: Some({ name: bytes_slice(text, 0, sep), span: dummy_span() }),
+      name: { name: bytes_slice(text, sep + 2, bytes_len(text)), span: dummy_span() },
       span: dummy_span(),
     }
   }
@@ -498,8 +502,8 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
           Some(o) -> o,
           None -> unknown(CCall, b"a call answering an argument it was not given"),
         },
-        Some(SharedReturn(w)) -> BlockedOwner(w),
-        Some(UnsureReturn(w)) -> UnknownOwner(w),
+        Some(SharedReturn(reason)) -> BlockedOwner(reason),
+        Some(UnsureReturn(reason)) -> UnknownOwner(reason),
         _ -> FreshOwner,
       },
     },
@@ -521,11 +525,11 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
 
 fn callback_owners(
   builtin: Option<Bytes>,
-  at_: Int,
+  position: Int,
   arity: Int,
   done: List<Owner>,
 ) -> Option<List<Owner>> =
-  if at_ + 1 != arity { None } else {
+  if position + 1 != arity { None } else {
     match builtin {
       None -> None,
       Some(b) -> if b == b"fold" {
@@ -588,37 +592,41 @@ fn ret_of(owner: Owner) -> ReturnOwnership =
   match owner {
     FreshOwner -> FreshReturn,
     ParamOwner(k) -> ReturnOfParam(k),
-    BlockedOwner(w) -> SharedReturn(w),
-    UnknownOwner(w) -> UnsureReturn(w),
+    BlockedOwner(reason) -> SharedReturn(reason),
+    UnknownOwner(reason) -> UnsureReturn(reason),
   }
 
-fn interpret(owner: Owner, caller: Int, tables: Tables, at_: Bytes) -> ParamOwnership =
+fn interpret(owner: Owner, caller: Int, tables: Tables, label: Bytes) -> ParamOwnership =
   match owner {
     FreshOwner -> SoleParam,
-    BlockedOwner(w) ->
-      SharedParam(reworded(w, bytes_concat_all([at_, b" passes a value where ", w.text]))),
-    UnknownOwner(w) ->
-      UnsureParam(reworded(w, bytes_concat_all([at_, b" passes a value where ", w.text]))),
+    BlockedOwner(reason) ->
+      SharedParam(
+        reworded(reason, bytes_concat_all([label, b" passes a value where ", reason.text])),
+      ),
+    UnknownOwner(reason) ->
+      UnsureParam(
+        reworded(reason, bytes_concat_all([label, b" passes a value where ", reason.text])),
+      ),
     ParamOwner(k) -> match param_at(tables, caller, k) {
       Some(SoleParam) -> SoleParam,
-      Some(UnsureParam(w)) ->
+      Some(UnsureParam(reason)) ->
         UnsureParam(
           reworded(
-            w,
+            reason,
             bytes_concat_all([
-              at_,
+              label,
               b" passes its own parameter ",
               int_to_bytes(k),
               b", which is unsettled",
             ]),
           ),
         ),
-      Some(SharedParam(w)) ->
+      Some(SharedParam(reason)) ->
         SharedParam(
           reworded(
-            w,
+            reason,
             bytes_concat_all([
-              at_,
+              label,
               b" passes its own parameter ",
               int_to_bytes(k),
               b", whose callers keep what they pass",
@@ -628,7 +636,7 @@ fn interpret(owner: Owner, caller: Int, tables: Tables, at_: Bytes) -> ParamOwne
       None ->
         UnsureParam({
           cause: CCallerKeeps,
-          text: bytes_concat_all([at_, b" passes a parameter this pass cannot name"]),
+          text: bytes_concat_all([label, b" passes a parameter this pass cannot name"]),
         }),
     },
   }
@@ -703,8 +711,8 @@ fn fixpoint(program: Program, tables: Tables, rounds: Int) -> Settled / {abort.r
   else { fixpoint(program, next, rounds + 1) }
 }
 
-fn fix(c: Option<Cause>) -> Bytes =
-  match c {
+fn fix(cause: Option<Cause>) -> Bytes =
+  match cause {
     Some(CReadAgain) ->
       b"make the update the binding's last use: bind whatever you still need out of it first",
     Some(CCell) -> b"`cell_update`",
@@ -777,8 +785,8 @@ fn finish(raw: RawSite, def: Int, tables: Tables) -> Site = {
         None,
         0 - 1,
       ),
-    BlockedOwner(w) -> sited(b"copies", w.text, Some(w.cause), 0 - 1),
-    UnknownOwner(w) -> sited(b"unknown", w.text, Some(w.cause), 0 - 1),
+    BlockedOwner(reason) -> sited(b"copies", reason.text, Some(reason.cause), 0 - 1),
+    UnknownOwner(reason) -> sited(b"unknown", reason.text, Some(reason.cause), 0 - 1),
     ParamOwner(k) -> {
       let head = bytes_concat_all([b"the ", held(raw.op), b" is parameter ", int_to_bytes(k)]);
       match param_at(tables, def, k) {
@@ -789,18 +797,18 @@ fn finish(raw: RawSite, def: Int, tables: Tables) -> Site = {
             None,
             k,
           ),
-        Some(SharedParam(w)) ->
+        Some(SharedParam(reason)) ->
           sited(
             b"copies",
-            bytes_concat_all([head, b", and a caller keeps it: ", w.text]),
+            bytes_concat_all([head, b", and a caller keeps it: ", reason.text]),
             Some(CCallerKeeps),
             k,
           ),
-        Some(UnsureParam(w)) ->
+        Some(UnsureParam(reason)) ->
           sited(
             b"unknown",
-            bytes_concat_all([head, b", and a call site is undecided: ", w.text]),
-            Some(w.cause),
+            bytes_concat_all([head, b", and a call site is undecided: ", reason.text]),
+            Some(reason.cause),
             k,
           ),
         None ->
@@ -935,8 +943,8 @@ fn ret_text(d: Def, r: ReturnOwnership) -> Bytes =
         match list_at(d.params, k) { Some(n) -> n, None -> int_to_bytes(k) },
         b"`",
       ]),
-    SharedReturn(w) -> w.text,
-    UnsureReturn(w) -> w.text,
+    SharedReturn(reason) -> reason.text,
+    UnsureReturn(reason) -> reason.text,
   }
 
 fn unkept_of(program: Program, tables: Tables) -> List<Unkept> / {abort.raise} =
@@ -972,7 +980,7 @@ fn program_of(
   names: List<Bytes>,
   srcs: List<Bytes>,
   pkgs: List<PackageDeps>,
-  mod_pkg: List<Int>,
+  module_packages: List<Int>,
   shelf: Int,
   embeds: List<EmbedAt>,
 ) -> Option<Program> / {abort.raise} = {
@@ -991,12 +999,19 @@ fn program_of(
   });
   if fold(parsed, false, |acc: Bool, p: Parsed| acc || p.bad) { None } else {
     let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-    let packaged = if len(pkgs) == 0 { no_packages(mods) }
-    else { { pkgs: pkgs, mod_pkg: mod_pkg, std: shelf - 2, compiler: shelf - 1, shelf: shelf } };
+    let packaged = if len(pkgs) == 0 { no_packages(mods) } else {
+      {
+        pkgs: pkgs,
+        module_packages: module_packages,
+        std: shelf - 2,
+        compiler: shelf - 1,
+        shelf: shelf,
+      }
+    };
     match resolve_packaged(
         mods,
         packaged.pkgs,
-        packaged.mod_pkg,
+        packaged.module_packages,
         packaged.std,
         packaged.compiler,
         packaged.shelf,
@@ -1009,7 +1024,8 @@ fn program_of(
         Some(shapes) -> {
           let mods = expanded_mods(x.mods, shapes);
           // The root package's: the one the program's own appends and promises are in.
-          let own = |i: Int| match list_at(packaged.mod_pkg, i) { Some(k) -> k == 0, None -> true };
+          let own = |i: Int|
+            match list_at(packaged.module_packages, i) { Some(k) -> k == 0, None -> true };
           let defs = fold(range(0, len(mods)), [], |acc: List<Def>, i: Int| {
             let m: ParsedModule = at(mods, i);
             fold(m.module.items, acc, |a: List<Def>, item: Item|
@@ -1037,11 +1053,11 @@ pub fn costs(
   names: List<Bytes>,
   srcs: List<Bytes>,
   pkgs: List<PackageDeps>,
-  mod_pkg: List<Int>,
+  module_packages: List<Int>,
   shelf: Int,
   embeds: List<EmbedAt> = [],
 ) -> Report / {abort.raise} =
-  match program_of(names, srcs, pkgs, mod_pkg, shelf, embeds) {
+  match program_of(names, srcs, pkgs, module_packages, shelf, embeds) {
     None -> { ok: false, rounds: 0, defs: [], unkept: [] },
     Some(p) -> {
       let settled = fixpoint(p, start_tables(p.defs), 0);
