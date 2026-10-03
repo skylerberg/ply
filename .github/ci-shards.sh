@@ -20,6 +20,8 @@
 #                                test count
 #   ci-shards.sh durations FILE  `binary_id test milliseconds` per test in a
 #                                nextest JUnit report
+#   ci-shards.sh timings BEFORE  the table the next run is cut by, from this
+#                                run's rows on stdin and the table BEFORE
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
 #   ci-shards.sh corpus-matrix   the JSON matrix of the corpus runs that get a
@@ -130,12 +132,11 @@ declare -a PROBE_JOBS=(
 # What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
 # the archive every partition unpacks, the emitter's stage, and the shard cut. No later run can
 # name one, so a green run gives them back, and the repository's 10 GB cache stays for what does
-# outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache. `test-timings-` is
-# run-scoped too and stays: a later run reads it, through `restore-keys`.
+# outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache.
 GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
 
 # `<family>-<run id>` entries only the newest of which is ever restored.
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest-)
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
@@ -393,6 +394,31 @@ cmd_durations() {
       if (id != "" && name != "") printf "%s\t%s\t%d\n", id, name, attribute($0, "time") * 1000 + 0.5
     }
   ' "$@"
+}
+
+# The table the next run is cut by, from this run's rows on stdin and BEFORE, the table this run was
+# cut by: one duration a test, the longest any job measured. A corpus or startup row is what it cost
+# when no corpus test came from the cache, so a run that took some keeps BEFORE's: cut by a warm
+# run's costs, a cold run piles what the cache had saved onto one partition. `cached` rows only say
+# which run this was.
+cmd_timings() {
+  local before=$1
+  awk -F"$TAB" -v OFS="$TAB" -v before="$before" '
+    BEGIN {
+      while ((getline line < before) > 0) {
+        split(line, f, "\t")
+        if (f[1] == "corpus" || f[1] == "startup") kept[f[1] "\t" f[2]] = f[3]
+      }
+    }
+    $1 == "cached" { if ($3 + 0 > 0) warm = 1; next }
+    NF == 3 { k = $1 OFS $2; if (!(k in ms) || $3 + 0 > ms[k]) ms[k] = $3 + 0 }
+    END {
+      for (k in ms) {
+        split(k, f, OFS)
+        print k, ((warm && (f[1] == "corpus" || f[1] == "startup") && (k in kept)) ? kept[k] : ms[k])
+      }
+    }
+  ' | LC_ALL=C sort -t"$TAB" -k1,1 -k2,2
 }
 
 # `t shard binary test ms` per timed test, longest first onto the least loaded shard, then
@@ -1123,7 +1149,7 @@ cmd_verify() {
   fi
 
   # --- the shards the durations cut -----------------------------------------
-  local made_up made_up_test
+  local made_up
   if [[ $NEXTEST_SHARDS -lt 2 ]]; then
     echo "FAIL: NEXTEST_SHARDS is $NEXTEST_SHARDS, and one shard is the negation of the others" >&2
     failures=$((failures + 1))
@@ -1147,6 +1173,30 @@ cmd_verify() {
       check_shards measured "$TIMINGS" || failures=$((failures + 1))
     fi
   fi
+
+  # --- the table the next run is cut by -------------------------------------
+  local table warm cold
+  made_up=$(mktemp -d)
+  printf 'corpus\ta\t100\nstartup\tp\t90000\nx::y\tt\t5\n' > "$made_up/before.tsv"
+  printf 'corpus\ta\t3\ncorpus\ta\t7\ncorpus\tb\t40\nstartup\tp\t20000\nx::y\tt\t9\n' > "$made_up/measured.tsv"
+  warm="corpus a 100;corpus b 40;startup p 90000;x::y t 9;"
+  cold="corpus a 7;corpus b 40;startup p 20000;x::y t 9;"
+  table=$({ cat "$made_up/measured.tsv"; printf 'cached\tp\t12\n'; } | cmd_timings "$made_up/before.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$warm" ]]; then
+    echo "FAIL: a run that took tests from the cache wrote '$table', not the corpus rows it was cut by: '$warm'" >&2
+    failures=$((failures + 1))
+  fi
+  table=$({ cat "$made_up/measured.tsv"; printf 'cached\tp\t0\n'; } | cmd_timings "$made_up/before.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$cold" ]]; then
+    echo "FAIL: a run that took nothing from the cache wrote '$table', not the longest it measured: '$cold'" >&2
+    failures=$((failures + 1))
+  fi
+  table=$(cmd_timings "$made_up/none.tsv" < "$made_up/measured.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$cold" ]]; then
+    echo "FAIL: a run with no table before it wrote '$table', not the longest it measured: '$cold'" >&2
+    failures=$((failures + 1))
+  fi
+  rm -rf "$made_up"
 
   # --- probes ---------------------------------------------------------------
   local workflow="$root/.github/workflows/ci.yml"
@@ -1332,6 +1382,7 @@ case "${1:-}" in
   nextest-shards) cmd_nextest_shards ;;
   shard-configs) cmd_shard_configs "${2:-}" ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
+  timings) cmd_timings "${2:?the table this run was cut by, which need not exist}" ;;
   solo-matrix) cmd_solo_matrix ;;
   solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
   corpus-matrix) cmd_corpus_matrix ;;
