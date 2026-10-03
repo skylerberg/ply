@@ -13,7 +13,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
               ReturnClause, RecField, expr_span)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt)
 
 // --- Shared ---------------------------------------------------------------------
 
@@ -117,99 +117,70 @@ fn expand_update(span: Span, base: Expr, written: List<RecField>, names: List<By
   }
 }
 
-fn ru_exprs(sh: Map<Bytes, List<Bytes>>, xs: List<Expr>) -> List<Expr> =
-  map(xs, |x: Expr| ru_expr(sh, x))
-
-fn ru_fields(sh: Map<Bytes, List<Bytes>>, fs: List<RecField>) -> List<RecField> =
-  map(fs, |f: RecField| { name: f.name, value: ru_expr(sh, f.value) })
-
-fn ru_opt(sh: Map<Bytes, List<Bytes>>, e: Option<Expr>) -> Option<Expr> =
-  match e { None -> None, Some(x) -> Some(ru_expr(sh, x)) }
-
-fn ru_stmt(sh: Map<Bytes, List<Bytes>>, s: Stmt) -> Stmt =
-  match s {
-    SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: ru_expr(sh, l.value) }),
-    SLetElse(l) ->
-      SLetElse({
-        span: l.span,
-        pat: l.pat,
-        ty: l.ty,
-        value: ru_expr(sh, l.value),
-        fallback: ru_expr(sh, l.fallback),
-      }),
-    SExpr(x) -> SExpr(ru_expr(sh, x)),
-  }
-
-// Children first, then this node: a nested update inside a written field expands before its owner.
-fn ru_expr(sh: Map<Bytes, List<Bytes>>, e: Expr) -> Expr =
-  match e {
-    EBinary(b) ->
-      EBinary({ span: b.span, op: b.op, lhs: ru_expr(sh, b.lhs), rhs: ru_expr(sh, b.rhs) }),
-    EUnary(u) -> EUnary({ span: u.span, op: u.op, operand: ru_expr(sh, u.operand) }),
-    ELambda(l) ->
-      ELambda({ span: l.span, body: ru_expr(sh, l.body), params: l.params, ret: l.ret }),
+// Children first, then the node through `f`: a nested update inside a written field expands
+// before its owner, and what `f` builds is not visited again.
+pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
+  let go = |x: Expr| map_expr(x, f);
+  let opt = |x: Option<Expr>| match x { None -> None, Some(y) -> Some(map_expr(y, f)) };
+  let fields = |fs: List<RecField>| map(fs, |fl: RecField| { name: fl.name, value: go(fl.value) });
+  f(match e {
+    EBinary(b) -> EBinary({ span: b.span, op: b.op, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    EUnary(u) -> EUnary({ span: u.span, op: u.op, operand: go(u.operand) }),
+    ELambda(l) -> ELambda({ span: l.span, body: go(l.body), params: l.params, ret: l.ret }),
     EApp(a) ->
       EApp({
         span: a.span,
-        func: ru_expr(sh, a.func),
-        named: map(a.named, |n: NamedArg|
-          { name: n.name, value: ru_expr(sh, n.value), span: n.span }),
-        args: ru_exprs(sh, a.args),
+        func: go(a.func),
+        named: map(a.named, |n: NamedArg| { name: n.name, value: go(n.value), span: n.span }),
+        args: map(a.args, go),
         labels: a.labels,
       }),
     EIf(i) ->
       EIf({
         span: i.span,
-        cond: ru_expr(sh, i.cond),
-        then_branch: ru_expr(sh, i.then_branch),
-        else_branch: ru_expr(sh, i.else_branch),
+        cond: go(i.cond),
+        then_branch: go(i.then_branch),
+        else_branch: go(i.else_branch),
       }),
     EMatch(m) ->
       EMatch({
         span: m.span,
-        scrutinee: ru_expr(sh, m.scrutinee),
+        scrutinee: go(m.scrutinee),
         arms: map(m.arms, |arm: MatchArm|
-          {
-            pat: arm.pat,
-            guard: ru_opt(sh, arm.guard),
-            body: ru_expr(sh, arm.body),
-            span: arm.span,
-          }),
+          { pat: arm.pat, guard: opt(arm.guard), body: go(arm.body), span: arm.span }),
       }),
     EBlock(b) ->
       EBlock({
         span: b.span,
-        tail: ru_opt(sh, b.tail),
-        stmts: map(b.stmts, |st: Stmt| ru_stmt(sh, st)),
+        tail: opt(b.tail),
+        stmts: map(b.stmts, |st: Stmt|
+          match st {
+            SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: go(l.value) }),
+            SLetElse(l) ->
+              SLetElse({
+                span: l.span,
+                pat: l.pat,
+                ty: l.ty,
+                value: go(l.value),
+                fallback: go(l.fallback),
+              }),
+            SExpr(x) -> SExpr(go(x)),
+          }),
       }),
-    ERecord(r) -> ERecord({ span: r.span, fields: ru_fields(sh, r.fields) }),
-    ERecordUpdate(r) -> {
-      let base = ru_expr(sh, r.base);
-      let fs = ru_fields(sh, r.fields);
-      // A span the table does not hold belongs to a program that did not check; the lowering declines it.
-      match map_get(sh, span_key(r.span)) {
-        None -> ERecordUpdate({ span: r.span, base: base, fields: fs }),
-        Some(names) -> expand_update(r.span, base, fs, names),
-      }
-    },
-    EField(f) -> EField({ span: f.span, base: ru_expr(sh, f.base), field: f.field }),
-    ETry(t) -> ETry({ span: t.span, operand: ru_expr(sh, t.operand) }),
-    EList(l) -> EList({ span: l.span, items: ru_exprs(sh, l.items) }),
-    EPerform(p) ->
-      EPerform({
-        span: p.span,
-        eff: p.eff,
-        op: p.op,
-        resource: p.resource,
-        args: ru_exprs(sh, p.args),
-      }),
+    ERecord(r) -> ERecord({ span: r.span, fields: fields(r.fields) }),
+    ERecordUpdate(r) -> ERecordUpdate({ span: r.span, base: go(r.base), fields: fields(r.fields) }),
+    EField(fl) -> EField({ span: fl.span, base: go(fl.base), field: fl.field }),
+    ETry(t) -> ETry({ span: t.span, operand: go(t.operand) }),
+    EList(l) -> EList({ span: l.span, items: map(l.items, go) }),
+    EPerform(x) ->
+      EPerform({ span: x.span, eff: x.eff, op: x.op, resource: x.resource, args: map(x.args, go) }),
     EHandle(h) ->
       EHandle({
         span: h.span,
-        body: ru_expr(sh, h.body),
+        body: go(h.body),
         ret: match h.ret {
           None -> None,
-          Some(rc) -> Some({ binder: rc.binder, body: ru_expr(sh, rc.body), span: rc.span }),
+          Some(rc) -> Some({ binder: rc.binder, body: go(rc.body), span: rc.span }),
         },
         clauses: map(h.clauses, |c: HandleClause|
           {
@@ -219,7 +190,7 @@ fn ru_expr(sh: Map<Bytes, List<Bytes>>, e: Expr) -> Expr =
             every_label: c.every_label,
             label_binder: c.label_binder,
             resume: c.resume,
-            body: ru_expr(sh, c.body),
+            body: go(c.body),
             span: c.span,
             params: c.params,
           }),
@@ -228,59 +199,231 @@ fn ru_expr(sh: Map<Bytes, List<Bytes>>, e: Expr) -> Expr =
       EWithCell({
         span: c.span,
         resource: c.resource,
-        init: ru_expr(sh, c.init),
+        init: go(c.init),
         binder: c.binder,
-        body: ru_expr(sh, c.body),
+        body: go(c.body),
       }),
-    ESimulate(x) -> ESimulate({ span: x.span, body: ru_expr(sh, x.body) }),
-    EParallel(x) -> EParallel({ span: x.span, branches: ru_exprs(sh, x.branches) }),
+    ESimulate(x) -> ESimulate({ span: x.span, body: go(x.body) }),
+    EParallel(x) -> EParallel({ span: x.span, branches: map(x.branches, go) }),
     _ -> e,
-  }
+  })
+}
 
-fn ru_item(sh: Map<Bytes, List<Bytes>>, it: Item) -> Item =
+// Every expression an item holds, through `map_expr`.
+fn map_item(it: Item, f: (Expr) -> Expr) -> Item = {
+  let go = |x: Expr| map_expr(x, f);
   match it {
     IFn(d) ->
       IFn({
-        vis: d.vis,
-        name: d.name,
-        generics: d.generics,
-        params: d.params,
-        ret: d.ret,
-        effects: d.effects,
-        constraints: d.constraints,
-        spec: map(d.spec, |c: SpecClause|
-          { kind: c.kind, expr: ru_expr(sh, c.expr), span: c.span }),
-        returns: d.returns,
-        reuse: d.reuse,
-        transparent: d.transparent,
-        body: ru_expr(sh, d.body),
-        span: d.span,
+        ..d,
+        params: map(d.params, |p: Param|
+          { ..p, default: match p.default { None -> None, Some(x) -> Some(go(x)) } }),
+        spec: map(d.spec, |c: SpecClause| { kind: c.kind, expr: go(c.expr), span: c.span }),
+        body: go(d.body),
       }),
-    ITest(d) ->
-      ITest({
-        name: d.name,
-        name_span: d.name_span,
-        is_nondet: d.is_nondet,
-        body: ru_expr(sh, d.body),
-        span: d.span,
-      }),
+    ITest(d) -> ITest({ ..d, body: go(d.body) }),
     ILaw(d) ->
       ILaw({
-        name: d.name,
-        name_span: d.name_span,
-        host: d.host,
-        binders: d.binders,
-        guard: ru_opt(sh, d.guard),
-        body: ru_expr(sh, d.body),
-        span: d.span,
+        ..d,
+        guard: match d.guard { None -> None, Some(g) -> Some(go(g)) },
+        body: go(d.body),
       }),
     _ -> it,
+  }
+}
+
+// A span the table does not hold belongs to a program that did not check; the lowering declines it.
+fn expanded_update(sh: Map<Bytes, List<Bytes>>, e: Expr) -> Expr =
+  match e {
+    ERecordUpdate(r) -> match map_get(sh, span_key(r.span)) {
+      None -> e,
+      Some(names) -> expand_update(r.span, r.base, r.fields, names),
+    },
+    _ -> e,
   }
 
 // Every update of a checked module replaced by the literal it stands for.
 pub fn expand_record_updates(m: Module, shapes: Map<Bytes, List<Bytes>>) -> Module =
-  if !has_update(m) { m }
-  else { { imports: m.imports, items: map(m.items, |it: Item| ru_item(shapes, it)) } }
+  if !has_update(m) { m } else {
+    {
+      imports: m.imports,
+      items: map(m.items, |it: Item| map_item(it, |e: Expr| expanded_update(shapes, e))),
+    }
+  }
+
+// --- Witnesses -----------------------------------------------------------------------------
+// A definition with `numeric(a)` or `integer(a)` takes, ahead of its written parameters, an `Int`
+// per such parameter naming the type a call instantiates it at, in the order the checker gives.
+// Its operators over the parameter read that witness, and every call of it passes one: a type's
+// number, or the caller's own.
+
+pub type Witness = | WType(Bytes) | WParam(Bytes)
+
+// No source can spell it, so it never collides with a binder the program wrote.
+pub fn witness_param(param: Bytes) -> Bytes = bytes_concat(b"?w_", param)
+
+// The runtime's numbering: its ten widths in order, then `Int`, `Float` and `Decimal`.
+pub fn witness_code(name: Bytes) -> Int =
+  match fold(range(0, 13), None, |acc: Option<Int>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> match list_at(
+            [
+              b"U8",
+              b"U16",
+              b"U32",
+              b"U64",
+              b"I8",
+              b"I16",
+              b"I32",
+              b"I64",
+              b"U128",
+              b"I128",
+              b"Int",
+              b"Float",
+              b"Decimal",
+            ],
+            i,
+          ) {
+          Some(n) -> if n == name { Some(i) } else { None },
+          None -> None,
+        },
+      }) {
+    Some(i) -> i,
+    None -> 10,
+  }
+
+fn witness_expr(w: Witness, sp: Span) -> Expr =
+  match w {
+    WType(n) -> ELit({ span: sp, lit: LInt(witness_code(n)) }),
+    WParam(p) -> EVar({ span: sp, name: bare({ name: witness_param(p), span: sp }) }),
+  }
+
+// The runtime's numbering of the operators a witnessed parameter takes; `-` and `~` are 0 and 1.
+fn numeric_op_code(op: Bytes) -> Int =
+  match fold(range(0, 15), None, |acc: Option<Int>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> match list_at(
+            [
+              b"add",
+              b"sub",
+              b"mul",
+              b"div",
+              b"rem",
+              b"lt",
+              b"le",
+              b"gt",
+              b"ge",
+              b"bitand",
+              b"bitor",
+              b"bitxor",
+              b"shl",
+              b"shr",
+              b"ushr",
+            ],
+            i,
+          ) {
+          Some(n) -> if n == op { Some(i) } else { None },
+          None -> None,
+        },
+      }) {
+    Some(i) -> i,
+    None -> 0 - 1,
+  }
+
+fn hidden_call(sp: Span, name: Bytes, args: List<Expr>) -> Expr =
+  EApp({
+    span: sp,
+    func: EVar({ span: sp, name: bare({ name: name, span: sp }) }),
+    named: [],
+    args: args,
+    labels: [],
+  })
+
+fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<Witness>>, e: Expr) -> Expr =
+  match e {
+    EBinary(b) -> match map_get(ops, span_key(b.span)) {
+      Some(p) -> if b.op == b"eq" || b.op == b"ne" { e } else {
+        hidden_call(b.span, b"?numeric_binary", [
+          ELit({ span: b.span, lit: LInt(numeric_op_code(b.op)) }),
+          witness_expr(WParam(p), b.span),
+          b.lhs,
+          b.rhs,
+        ])
+      },
+      None -> e,
+    },
+    EUnary(u) -> match map_get(ops, span_key(u.span)) {
+      Some(p) ->
+        hidden_call(u.span, b"?numeric_unary", [
+          ELit({ span: u.span, lit: LInt(if u.op == b"bitnot" { 1 } else { 0 }) }),
+          witness_expr(WParam(p), u.span),
+          u.operand,
+        ]),
+      None -> e,
+    },
+    EApp(a) -> match a.func {
+      EVar(v) -> match map_get(refs, span_key(v.span)) {
+        Some(ws) ->
+          EApp({
+            ..a,
+            args: fold(
+              a.args,
+              map(ws, |w: Witness| witness_expr(w, v.span)),
+              |acc: List<Expr>, x: Expr| push(acc, x),
+            ),
+          }),
+        None -> e,
+      },
+      _ -> e,
+    },
+    _ -> e,
+  }
+
+fn witness_params(orders: Map<Bytes, List<Bytes>>, it: Item) -> Item =
+  match it {
+    IFn(d) -> match map_get(orders, d.name.name) {
+      None -> it,
+      Some(ws) ->
+        IFn({
+          ..d,
+          params: fold(
+            d.params,
+            map(ws, |w: Bytes|
+              {
+                name: { name: witness_param(w), span: d.name.span },
+                ty: Some(
+                  TCon({
+                    name: bare({ name: b"Int", span: d.name.span }),
+                    args: [],
+                    span: d.name.span,
+                  }),
+                ),
+                default: None,
+                span: d.name.span,
+              }),
+            |acc: List<Param>, p: Param| push(acc, p),
+          ),
+        }),
+    },
+    _ -> it,
+  }
+
+// `orders` holds each witnessed definition's parameters by simple name, as the checker ordered them.
+pub fn expand_witnesses(
+  m: Module,
+  ops: Map<Bytes, Bytes>,
+  refs: Map<Bytes, List<Witness>>,
+  orders: Map<Bytes, List<Bytes>>,
+) -> Module =
+  if map_len(ops) == 0 && map_len(refs) == 0 && map_len(orders) == 0 { m } else {
+    {
+      imports: m.imports,
+      items: map(m.items, |it: Item|
+        witness_params(orders, map_item(it, |e: Expr| witnessed(ops, refs, e)))),
+    }
+  }
 
 // --- The try operator ------------------------------------------------------------------------
 
@@ -1287,6 +1430,7 @@ fn is_update(e: Expr) -> Bool = match e { ERecordUpdate(_) -> true, _ -> false }
 
 // Whether a definition writes a record update anywhere: its body, a clause, or a default.
 pub fn fn_has_update(d: FnDef) -> Bool = any_expr({ imports: [], items: [IFn(d)] }, is_update)
+
 fn has_try(m: Module) -> Bool = any_expr(m, |e: Expr| match e { ETry(_) -> true, _ -> false })
 
 fn any_expr(m: Module, p: (Expr) -> Bool) -> Bool =
