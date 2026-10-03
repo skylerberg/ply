@@ -33,6 +33,7 @@ pub mod memo;
 mod plain;
 mod program;
 pub mod rc;
+pub mod reflect;
 pub mod region;
 pub mod sched;
 pub mod semantics;
