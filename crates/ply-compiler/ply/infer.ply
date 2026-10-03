@@ -1,6 +1,7 @@
 // The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import spine (Span, Ident, QName, span_to, dummy_span, num, span_key, push_front)
+import spine (Span, Ident, QName, span_to, dummy_span, num, span_key, push_front, span_bin)
+import std.bin
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
               MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
@@ -37,7 +38,8 @@ import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
                 diag, diag1, diag2, lab, is_bare, is_ctor_name, backticked, ns_describe,
                 private_name)
-import rewrite (expand, expand_record_updates, expand_witnesses, Witness, WType, WParam)
+import rewrite (expand, expand_record_updates, expand_witnesses, Witness, WType, WParam,
+                witness_bin)
 import derive (Why, WFunction, WHandle, WFloat, WUnconstrained, WNullInsideOption, WSecret,
                ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name,
                Expansion, expand_derives, refusal_note, secret_reason, float_reason,
@@ -85,6 +87,13 @@ pub type DefInfo = {
   scheme: Scheme,
   footprint: List<Atom>,
   performed: List<Atom>,
+  // The atoms of `footprint` performed a number of times that grows with the input, and the
+  // parameters whose functions are called so.
+  scaling: List<Atom>,
+  repeats: List<Int>,
+  // What the written row promises bounded, which is all a caller in another package reads.
+  bounded: List<Atom>,
+  tail_bounded: Bool,
   row_aliases: List<Bytes>,
   constraints: List<DefConstraint>,
   spec: List<SpecInfo>,
@@ -108,13 +117,17 @@ pub type LawInfo = {
   binders: List<LawBinder>,
   has_guard: Bool,
   host: Bool,
+  // A cost law: its body answers the steps it took beside its bound.
+  cost: Bool,
   footprint: List<Atom>,
   at: Loc,
 }
 // Where an atom entered a body's row: an operation performed here, a named definition's row,
 // arguments alone (a builtin or constructor), or a function value.
 type Src = | SDirect | SVia(Bytes) | SArgs | SOpaque
-type PerformSite = { atom: Atom, module: Int, span: Span, source: Src }
+// `over` is the iteration the site repeats with: a call that runs it once per element of its input,
+// or a recursive call; `None` where it runs a number of times no input decides.
+type PerformSite = { atom: Atom, module: Int, span: Span, source: Src, over: Option<Span> }
 type OpKey = { effect: Bytes, op: Bytes, res: Resource }
 type Numeric = { span: Span, op: Bytes, ty: Type }
 // A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
@@ -157,6 +170,9 @@ type Sig = {
   ret: Type,
   declared: Option<Row>,
   published_row: Row,
+  // The written row's atoms marked `bounded`, and whether its variable is.
+  bounded: List<Atom>,
+  tail_bounded: Bool,
   scope: Int,
 }
 // One use of a label-generic definition: `vars` are the variables its label parameters became,
@@ -261,10 +277,21 @@ type Shared = { labels: List<Int>, rows: List<Int> }
 
 // The rows the driver hands in for definitions whose hash has not moved, and test footprints, one
 // slot per `test`. The rest of a published interface is the written signature, which is on hand.
-pub type KnownDef = { footprint: List<Atom>, performed: List<Atom> }
-pub type Known = { defs: Map<Bytes, KnownDef>, tests: Map<Bytes, List<Option<List<Atom>>>> }
+pub type KnownDef = {
+  footprint: List<Atom>,
+  performed: List<Atom>,
+  scaling: List<Atom>,
+  repeats: List<Int>,
+}
+// `root`: the modules below it are the run's own, whose promises are checked here; a dependency's
+// were checked when its package was.
+pub type Known = {
+  defs: Map<Bytes, KnownDef>,
+  tests: Map<Bytes, List<Option<List<Atom>>>>,
+  root: Int,
+}
 
-pub fn no_known() -> Known = { defs: map_new(), tests: map_new() }
+pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), root: 1 << 62 }
 
 type Cx = {
   r: Resolved,
@@ -295,6 +322,12 @@ type Cx = {
   alias_stack: List<Bytes>,
   refused_atoms: List<Span>,
   performs: List<PerformSite>,
+  // The iteration around the expression being inferred, as `PerformSite.over` reads.
+  over: Option<Span>,
+  // Each row variable a body performs under an iteration.
+  repeated_vars: List<{ v: Int, over: Span }>,
+  // The first call into the group being walked: a recursive body performs all it does again there.
+  recursed: Option<Span>,
   // The written row of the definition being checked; empty when it wrote none, or for a test or law.
   declared_atoms: List<Atom>,
   comparisons: List<{ module: Int, span: Span, ty: Type }>,
@@ -325,6 +358,8 @@ type Cx = {
   derived: Option<Derived>,
   known: Known,
   seeded: List<Bytes>,
+  // The tests published from the rows handed in, by key.
+  seeded_tests: List<Bytes>,
   assumed: List<Assumed>,
 }
 
@@ -341,6 +376,26 @@ type WithKey = { cx: Cx, key: Option<ValueKey> }
 type WithHit = { cx: Cx, hit: Option<{ info: EffectInfo, op: OpInfo }> }
 type WithRes = { cx: Cx, res: Option<Resource> }
 type WithBodyRow = { cx: Cx, row: Row }
+
+// What a group member performs a number of times that grows with its input: its atoms, the sites a
+// walk of its body found them at, and the parameters it calls so.
+type Count = {
+  scaling: List<Atom>,
+  sites: List<PerformSite>,
+  repeats: List<Int>,
+  tail_over: Option<Span>,
+  recursed: Option<Span>,
+}
+
+// A body's row, and of its atoms and its parameters, what it performs or calls a number of times that
+// grows with its input, each with the site and the iteration that make it so.
+type Counted = {
+  cx: Cx,
+  row: Row,
+  scaling: List<PerformSite>,
+  repeats: List<Int>,
+  tail_over: Option<Span>,
+}
 type Generalized = { e: TypeEnv, sc: Scheme }
 
 fn cell() -> Bytes = b"cell"
@@ -706,6 +761,17 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
   let re = row_open(e);
   let map_ty = t_map(ta, tb);
   let entry_ty = TyRecord(fields_sorted([{ name: b"key", ty: ta }, { name: b"value", ty: tb }]));
+  let performed_ty = TyRecord(
+    fields_sorted([{ name: b"atom", ty: t_string() }, { name: b"count", ty: t_int() }]),
+  );
+  let metered_ty = TyRecord(
+    fields_sorted([
+      { name: b"value", ty: ta },
+      { name: b"steps", ty: t_int() },
+      { name: b"allocations", ty: t_int() },
+      { name: b"performs", ty: t_list(performed_ty) },
+    ]),
+  );
   let ordering = con(b"Ordering");
   let rounding = con(b"Rounding");
   let cell_ty = TyCon({ name: b"Cell", args: [tb, ta] });
@@ -747,6 +813,7 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
         re,
       ),
     },
+    { name: b"metered", sc: poly_fn([a], [e], [t_fn([], ta, re)], metered_ty, re) },
     { name: b"range", sc: mono_fn([t_int(), t_int()], t_list(t_int())) },
     // The wrapping family is `forall a. (a, a) -> a`; `infer_app` attaches the integer obligation at each call.
     { name: b"wrap_add", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
@@ -942,6 +1009,11 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
       b"iterate",
       [b"seed", b"budget", b"step"],
       b"`step` answers `Continue(next)` or `Stop(result)`; the budget bounds the steps",
+    ),
+    bdoc(
+      b"metered",
+      [b"f"],
+      b"`f()` and what it cost: the calls it made, the objects it allocated, and how many times it performed each atom",
     ),
     bdoc(
       b"bracket",
@@ -1738,14 +1810,25 @@ fn row_param(cx: Cx, id: Ident) -> { cx: Cx, v: Option<Int> } =
   }
 
 fn conv_row(cx: Cx, row: RowExpr) -> { cx: Cx, r: Row } = {
+  let o = conv_marked(cx, row);
+  { cx: refuse_marks(o.cx, row), r: o.r }
+}
+
+// A row with the atoms it marks `bounded`.
+fn conv_marked(cx: Cx, row: RowExpr) -> { cx: Cx, r: Row, bounded: List<Atom> } = {
   let atoms = fold(
     row.atoms,
-    { cx: cx, atoms: [] },
-    |acc: { cx: Cx, atoms: List<Atom> }, a: AtomExpr| {
+    { cx: cx, atoms: [], bounded: [] },
+    |acc: { cx: Cx, atoms: List<Atom>, bounded: List<Atom> }, a: AtomExpr| {
       let o: WithAtom = conv_atom(acc.cx, a);
       match o.atom {
-        Some(x) -> { cx: o.cx, atoms: atoms_insert(acc.atoms, x) },
-        None -> { cx: o.cx, atoms: acc.atoms },
+        Some(x) ->
+          {
+            cx: o.cx,
+            atoms: atoms_insert(acc.atoms, x),
+            bounded: if a.bounded { atoms_insert(acc.bounded, x) } else { acc.bounded },
+          },
+        None -> { ..acc, cx: o.cx },
       }
     },
   );
@@ -1753,8 +1836,27 @@ fn conv_row(cx: Cx, row: RowExpr) -> { cx: Cx, r: Row } = {
     Some(t) -> row_param(atoms.cx, t),
     None -> { cx: atoms.cx, v: None },
   };
-  { cx: tail.cx, r: { atoms: atoms.atoms, tail: tail.v } }
+  { cx: tail.cx, r: { atoms: atoms.atoms, tail: tail.v }, bounded: atoms.bounded }
 }
+
+// `bounded` is a promise a definition makes of its own row; a function type's row makes none.
+fn refuse_marks(cx: Cx, row: RowExpr) -> Cx = {
+  let marked = fold(row.atoms, cx, |c: Cx, a: AtomExpr|
+    if a.bounded { refuse_mark(c, a.span) } else { c });
+  if row.tail_bounded { refuse_mark(marked, row.span) } else { marked }
+}
+
+fn refuse_mark(cx: Cx, s: Span) -> Cx =
+  err1(
+    cx,
+    b"E0466",
+    s,
+    b"`bounded` is a promise a definition makes of its own row",
+    b"this row belongs to a type, not to a definition",
+    [
+      b"write `bounded` in the row after a `fn` signature's `->`, where the body is checked against it",
+    ],
+  )
 
 fn refused(cx: Cx, s: Span) -> Bool =
   fold(cx.refused_atoms, false, |acc: Bool, x: Span| acc || x == s)
@@ -2373,12 +2475,12 @@ fn signature_sharing(cx0: Cx, def: FnDef, shared: Shared) -> { cx: Cx, sig: Sig 
   );
   let ret = match def.ret { Some(t) -> conv_type(params.cx, t), None -> new_ty(params.cx) };
   // A function's row is what its signature writes: with no `/`, the empty one.
-  let declared: { cx: Cx, r: Option<Row> } = match def.effects {
+  let declared: { cx: Cx, r: Option<Row>, bounded: List<Atom> } = match def.effects {
     Some(r) -> {
-      let o: WithRow = conv_row(ret.cx, r);
-      { cx: o.cx, r: Some(o.r) }
+      let o = conv_marked(ret.cx, r);
+      { cx: o.cx, r: Some(o.r), bounded: o.bounded }
     },
-    None -> { cx: ret.cx, r: Some(row_empty()) },
+    None -> { cx: ret.cx, r: Some(row_empty()), bounded: [] },
   };
   let row: WithRow = match declared.r {
     Some(r) -> { cx: declared.cx, r: r },
@@ -2396,6 +2498,8 @@ fn signature_sharing(cx0: Cx, def: FnDef, shared: Shared) -> { cx: Cx, sig: Sig 
       ret: ret.t,
       declared: declared.r,
       published_row: row.r,
+      bounded: declared.bounded,
+      tail_bounded: match def.effects { Some(r) -> r.tail_bounded, None -> false },
       scope: c.scope,
     },
   }
@@ -2418,10 +2522,19 @@ fn lit_type(l: Lit) -> Type =
   }
 
 fn record_site(cx: Cx, atom: Atom, span: Span, source: Src) -> Cx =
+  record_over(cx, atom, span, source, cx.over)
+
+fn record_over(cx: Cx, atom: Atom, span: Span, source: Src, over: Option<Span>) -> Cx =
   if span.start == 0 && span.end == 0 { cx } else {
     {
       ..cx,
-      performs: push(cx.performs, { atom: atom, module: cx.module, span: span, source: source }),
+      performs: push(cx.performs, {
+        atom: atom,
+        module: cx.module,
+        span: span,
+        source: source,
+        over: over,
+      }),
     }
   }
 
@@ -2480,8 +2593,7 @@ fn site_for(cx: Cx, atom: Atom) -> Option<PerformSite> =
   site_among(resolved_sites(cx.subst, cx.performs), atom)
 
 fn resolved_sites(s: Subst, sites: List<PerformSite>) -> List<PerformSite> =
-  map(sites, |x: PerformSite|
-    { atom: resolve_atom(s, x.atom), module: x.module, span: x.span, source: x.source })
+  map(sites, |x: PerformSite| { ..x, atom: resolve_atom(s, x.atom) })
 
 fn site_among(sites: List<PerformSite>, atom: Atom) -> Option<PerformSite> =
   fold(sites, None, |acc: Option<PerformSite>, s: PerformSite|
@@ -2711,6 +2823,126 @@ fn settle_concats(cx: Cx) -> Cx = {
 fn bind_all(cx: Cx, bindings: List<{ name: Bytes, ty: Type }>) -> Cx =
   fold(bindings, cx, |c: Cx, b: { name: Bytes, ty: Type }|
     { ..c, env: env_bind(c.env, b.name, mono(b.ty)) })
+
+// A call's arguments; a lambda the callee calls once per element of its input is inferred under the
+// call, which is the iteration its body repeats with.
+fn infer_args(
+  cx: Cx,
+  xs: List<Expr>,
+  span: Span,
+  repeats: List<Int>,
+) -> { cx: Cx, tys: List<Type>, row: Row } =
+  fold(
+    range(0, len(xs)),
+    { cx: cx, tys: [], row: row_empty() },
+    |acc: { cx: Cx, tys: List<Type>, row: Row }, i: Int| {
+      let x = at(xs, i);
+      let looped = contains_int(repeats, i) && (match x { ELambda(_) -> true, _ -> false });
+      let o: Inferred = if looped {
+        let inner: Inferred = infer({ ..acc.cx, over: Some(span) }, x);
+        { ..inner, cx: { ..inner.cx, over: acc.cx.over } }
+      } else { infer(acc.cx, x) };
+      let j: WithRow = join(o.cx, span, acc.row, o.row);
+      { cx: j.cx, tys: push(acc.tys, o.ty), row: j.r }
+    },
+  )
+
+// The parameters a callee calls a number of times that grows with its input. A builtin's count is
+// fixed when the argument it iterates over is written out; a function value's is unknown, so each
+// of its parameters is taken to.
+fn callee_repeats(cx: Cx, func: Expr, args: List<Expr>) -> List<Int> = {
+  let builtin = prelude_named(cx, func);
+  if builtin != b"" {
+    let r = builtin_repeats(builtin);
+    match list_at(args, r.over) {
+      Some(x) -> if fixed_size(cx, x) { [] } else { r.params },
+      None -> r.params,
+    }
+  } else {
+    match callee_source(cx, func) {
+      SVia(name) -> match def_of(cx, name) { Some(d) -> d.repeats, None -> [] },
+      SOpaque -> range(0, len(args)),
+      _ -> [],
+    }
+  }
+}
+
+// The parameters a builtin calls once per element of its argument at `over`.
+fn builtin_repeats(name: Bytes) -> { params: List<Int>, over: Int } =
+  if name == b"map" || name == b"filter" { { params: [1], over: 0 } }
+  else if name == b"fold" || name == b"map_fold" || name == b"bytes_position" {
+    { params: [2], over: 0 }
+  } else if name == b"iterate" { { params: [2], over: 1 } }
+  else { { params: [], over: 0 } }
+
+// A literal, a list literal, or a `range` between two literals: a size the text fixes.
+fn fixed_size(cx: Cx, e: Expr) -> Bool =
+  match e {
+    ELit(_) -> true,
+    EList(_) -> true,
+    EApp(a) ->
+      prelude_named(cx, a.func) == b"range"
+        && fold(a.args, true, |ok: Bool, x: Expr| ok && (match x { ELit(_) -> true, _ -> false })),
+    _ -> false,
+  }
+
+// Every row a repeated parameter's type holds: what its functions perform, once per call.
+fn repeated_rows(
+  cx: Cx,
+  params: List<Type>,
+  repeats: List<Int>,
+) -> { atoms: List<Atom>, vars: List<Int> } =
+  fold(repeats, { atoms: [], vars: [] }, |acc: { atoms: List<Atom>, vars: List<Int> }, i: Int|
+    match list_at(params, i) { Some(t) -> rows_in(cx, t, acc), None -> acc })
+
+fn rows_in(
+  cx: Cx,
+  t: Type,
+  acc: { atoms: List<Atom>, vars: List<Int> },
+) -> { atoms: List<Atom>, vars: List<Int> } =
+  match resolve(cx, t) {
+    TyFn(f) -> {
+      let r = resolve_r(cx, f.effects);
+      let own = {
+        atoms: append(acc.atoms, r.atoms),
+        vars: match r.tail { Some(v) -> push(acc.vars, v), None -> acc.vars },
+      };
+      fold(
+        f.params,
+        rows_in(cx, f.ret, own),
+        |a: { atoms: List<Atom>, vars: List<Int> }, p: Type| rows_in(cx, p, a),
+      )
+    },
+    TyCon(c) ->
+      fold(c.args, acc, |a: { atoms: List<Atom>, vars: List<Int> }, x: Type| rows_in(cx, x, a)),
+    TyRecord(fs) ->
+      fold(fs, acc, |a: { atoms: List<Atom>, vars: List<Int> }, f: Field| rows_in(cx, f.ty, a)),
+    TyVar(_) -> acc,
+  }
+
+fn contains_atom(atoms: List<Atom>, a: Atom) -> Bool =
+  fold(atoms, false, |found: Bool, x: Atom| found || x == a)
+
+// A callee's own scaling atom, as its call performs it: a label variable stands for any label.
+fn scales_like(scales: List<Atom>, a: Atom) -> Bool =
+  fold(scales, false, |found: Bool, s: Atom|
+    found
+      || (s.effect == a.effect && mode_eq(s.mode, a.mode) && s.op == a.op
+      && (s.resource == a.resource || (match s.resource { RVar(_) -> true, _ -> false }))))
+
+// A row variable a call performs under an iteration: the callee's own, or the one around the call.
+fn repeat_tail(cx: Cx, tail: Option<Int>, vars: List<Int>, span: Span) -> Cx =
+  match tail {
+    None -> cx,
+    Some(v) -> if contains_int(vars, v) {
+      { ..cx, repeated_vars: push(cx.repeated_vars, { v: v, over: span }) }
+    } else {
+      match cx.over {
+        Some(o) -> { ..cx, repeated_vars: push(cx.repeated_vars, { v: v, over: o }) },
+        None -> cx,
+      }
+    },
+  }
 
 fn infer_all(cx: Cx, xs: List<Expr>, span: Span) -> { cx: Cx, tys: List<Type>, row: Row } =
   fold(
@@ -3850,7 +4082,8 @@ fn infer_app_general(
     ty: f0.ty,
     row: f0.row,
   };
-  let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_all(f.cx, args, span);
+  let repeats = callee_repeats(f.cx, func, args);
+  let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_args(f.cx, args, span, repeats);
   let j0: WithRow = join(as_.cx, span, f.row, as_.row);
   let c: Cx = j0.cx;
   match resolve(c, f.ty) {
@@ -3901,9 +4134,33 @@ fn infer_app_general(
         }
       } else { checked };
       let effects = resolve_r(obliged, fn_.effects);
-      let recorded: Cx = fold(effects.atoms, obliged, |cc: Cx, a: Atom|
-        record_site(cc, a, span, source));
-      let j: WithRow = join(recorded, span, j0.r, effects);
+      let scaled = repeated_rows(obliged, fn_.params, repeats);
+      let scales = match source {
+        SVia(name) -> match def_of(obliged, name) { Some(d) -> d.scaling, None -> [] },
+        _ -> [],
+      };
+      let entered: Cx = match callee {
+        Some(_) -> match obliged.recursed {
+          Some(_) -> obliged,
+          None -> { ..obliged, recursed: Some(span) },
+        },
+        None -> obliged,
+      };
+      let recorded: Cx = fold(effects.atoms, entered, |cc: Cx, a: Atom|
+        record_over(
+          cc,
+          a,
+          span,
+          source,
+          if contains_atom(scaled.atoms, a) || scales_like(scales, a) { Some(span) }
+          else { cc.over },
+        ));
+      let j: WithRow = join(
+        repeat_tail(recorded, effects.tail, scaled.vars, span),
+        span,
+        j0.r,
+        effects,
+      );
       { cx: j.cx, ty: fn_.ret, row: j.r }
     },
     TyVar(_) -> {
@@ -3911,7 +4168,7 @@ fn infer_app_general(
       let eff: WithRow = new_row(ret.cx);
       let want = t_fn(as_.tys, ret.t, eff.r);
       let x: Expected = expect(eff.cx, expr_span(func), want, f.ty, b"callee type");
-      let j: WithRow = join(x.cx, span, j0.r, eff.r);
+      let j: WithRow = join(repeat_tail(x.cx, eff.r.tail, [], span), span, j0.r, eff.r);
       { cx: j.cx, ty: ret.t, row: j.r }
     },
     other -> {
@@ -5932,13 +6189,13 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
   // body is what a walk reads, and the hash the rows came under says the body has not moved. A row
   // that will not unify is one the caller should never have filed, which is nothing this program's
   // author can act on, so the body is walked instead: slower, and right whatever the row said.
-  let bodies: { cx: Cx, rows: List<Row> } = fold(
+  let bodies: { cx: Cx, rows: List<Row>, counts: List<Count> } = fold(
     range(0, len(comp)),
-    { cx: grouped, rows: [] },
-    |acc: { cx: Cx, rows: List<Row> }, slot: Int| {
+    { cx: grouped, rows: [], counts: [] },
+    |acc: { cx: Cx, rows: List<Row>, counts: List<Count> }, slot: Int| {
       let def = at(fns, at(comp, slot));
       let sig = at(sigs.sigs, slot);
-      let taken: Option<{ cx: Cx, row: Row }> = match seeded_rows(
+      let taken: Option<{ cx: Cx, row: Row, count: Count }> = match seeded_rows(
           acc.cx,
           def,
           at(qualified, slot),
@@ -5956,16 +6213,41 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
             Some(_) -> None,
             None -> {
               let c: Cx = with_unified(acc.cx, u);
-              Some({ cx: c, row: settled_row(c, rows.performed) })
+              Some({
+                cx: c,
+                row: settled_row(c, rows.performed),
+                count: {
+                  scaling: settled_row(c, rows.scaling).atoms,
+                  sites: [],
+                  repeats: rows.repeats,
+                  tail_over: None,
+                  recursed: None,
+                },
+              })
             },
           }
         },
       };
-      let stepped: { cx: Cx, row: Row } = match taken {
-        Some(x) -> { cx: { ..x.cx, seeded: push(x.cx.seeded, at(qualified, slot)) }, row: x.row },
+      let stepped: { cx: Cx, row: Row, count: Count } = match taken {
+        Some(x) ->
+          {
+            cx: { ..x.cx, seeded: push(x.cx.seeded, at(qualified, slot)) },
+            row: x.row,
+            count: x.count,
+          },
         None -> {
-          let o: WithBodyRow = check_fn_body({ ..acc.cx, derived: derived_of(m, def) }, def, sig);
-          { cx: { ..o.cx, derived: None }, row: o.row }
+          let o: Counted = check_fn_body({ ..acc.cx, derived: derived_of(m, def) }, def, sig);
+          {
+            cx: { ..o.cx, derived: None, recursed: None },
+            row: o.row,
+            count: {
+              scaling: map(o.scaling, |s: PerformSite| s.atom),
+              sites: o.scaling,
+              repeats: o.repeats,
+              tail_over: o.tail_over,
+              recursed: o.cx.recursed,
+            },
+          }
         },
       };
       let refs = stepped.cx.group_refs;
@@ -5981,6 +6263,7 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
       {
         cx: record_spec_env(tagged, def, at(qualified, slot), sig),
         rows: push(acc.rows, stepped.row),
+        counts: push(acc.counts, stepped.count),
       }
     },
   );
@@ -5991,7 +6274,11 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
   );
   let required: Cx = fold(range(0, len(comp)), settled, |c: Cx, slot: Int|
     require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
-  let closed: Cx = fold(sigs.sigs, required, |c: Cx, s: Sig| close_unreachable_row(c, s));
+  let kept: Cx = if required.module >= required.known.root { required } else {
+    fold(range(0, len(comp)), required, |c: Cx, slot: Int|
+      kept_promises(c, at(sigs.sigs, slot), at(bodies.counts, slot)))
+  };
+  let closed: Cx = fold(sigs.sigs, kept, |c: Cx, s: Sig| close_unreachable_row(c, s));
   let removed: Cx = fold(qualified, closed, |c: Cx, name: Bytes|
     { ..c, env: env_remove_global(c.env, name) });
   let published: Cx = fold(range(0, len(comp)), removed, |c: Cx, slot: Int| {
@@ -6008,6 +6295,20 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
     let g: Generalized = generalize(c.subst, c.env, fn_ty);
     let sc: Scheme = split_labels(g.sc, def, sig);
     let row = if overran { body_row } else { resolve_r(c, sig.published_row) };
+    let count = at(bodies.counts, slot);
+    let bounded = map(sig.bounded, |a: Atom| resolve_atom(c.subst, a));
+    // Another package's definition is read by what its row writes, whatever its body does.
+    let counted = if c.module >= c.known.root {
+      written_counts(fn_ty, row.atoms, bounded, sig.tail_bounded)
+    } else {
+      {
+        scaling: fold(row.atoms, [], |acc: List<Atom>, w: Atom|
+          if fold(count.scaling, false, |b: Bool, a: Atom|
+              b || atoms_covered([w], resolve_atom(c.subst, a))) { push(acc, w) }
+          else { acc }),
+        repeats: count.repeats,
+      }
+    };
     let bound: Cx = {
       ..c,
       env: env_bind_global(g.e, at(qualified, slot), sc),
@@ -6028,6 +6329,10 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
         scheme: sc,
         footprint: row.atoms,
         performed: body_row.atoms,
+        scaling: counted.scaling,
+        repeats: counted.repeats,
+        bounded: bounded,
+        tail_bounded: sig.tail_bounded,
         row_aliases: row_aliases(def),
         constraints: constraints,
         spec: [],
@@ -6211,7 +6516,7 @@ fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> =
         && same_deriver(at(acc, len(acc) - 1).deriver, c.deriver) { acc }
     else { push(acc, c) })
 
-fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
+fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> Counted = {
   let cx: Cx = {
     ..cx0,
     scope: sig.scope,
@@ -6219,6 +6524,9 @@ fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
     row_params: sig.row_params,
     label_params: sig.label_params,
     performs: [],
+    over: None,
+    repeated_vars: [],
+    recursed: None,
     declared_atoms: match sig.declared { Some(r) -> resolve_r(cx0, r).atoms, None -> [] },
   };
   let assumed: Cx = witnessing(
@@ -6256,6 +6564,7 @@ fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
       }
     },
   };
+  let counted = counts_of(rowed, sig, body.row);
   {
     cx: {
       ..rowed,
@@ -6263,9 +6572,174 @@ fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
       row_params: map_new(),
       label_params: map_new(),
       assumed: [],
+      over: None,
+      repeated_vars: [],
     },
     row: body.row,
+    scaling: counted.scaling,
+    repeats: counted.repeats,
+    tail_over: counted.tail_over,
   }
+}
+
+// What a body performs a number of times that grows with its input: what it performs under an
+// iteration, or everything, when it calls back into its own group. A parameter is called so when a
+// row variable its type holds is.
+fn counts_of(
+  cx: Cx,
+  sig: Sig,
+  body: Row,
+) -> { scaling: List<PerformSite>, repeats: List<Int>, tail_over: Option<Span> } = {
+  let row = resolve_r(cx, body);
+  let sites = resolved_sites(cx.subst, cx.performs);
+  let scaling = match cx.recursed {
+    Some(again) ->
+      fold(row.atoms, [], |acc: List<PerformSite>, a: Atom| {
+        let s = match site_among(sites, a) {
+          Some(x) -> x,
+          None -> { atom: a, module: cx.module, span: again, source: SDirect, over: None },
+        };
+        push(acc, { ..s, over: Some(again) })
+      }),
+    None ->
+      fold(row.atoms, [], |acc: List<PerformSite>, a: Atom|
+        match fold(sites, None, |found: Option<PerformSite>, s: PerformSite|
+            match found {
+              Some(_) -> found,
+              None -> if s.atom == a && s.over != None { Some(s) } else { None },
+            }) {
+          Some(s) -> push(acc, s),
+          None -> acc,
+        }),
+  };
+  let vars = map(cx.repeated_vars, |r: { v: Int, over: Span }|
+    match resolve_r(cx, row_open(r.v)).tail { Some(v) -> v, None -> r.v });
+  let repeats = fold(range(0, len(sig.params)), [], |acc: List<Int>, i: Int| {
+    let held = rows_in(cx, at(sig.params, i), { atoms: [], vars: [] });
+    let called = match cx.recursed {
+      Some(_) -> len(held.vars) > 0 || len(held.atoms) > 0,
+      None -> fold(held.vars, false, |b: Bool, v: Int| b || contains_int(vars, v)),
+    };
+    if called { push(acc, i) } else { acc }
+  });
+  let tail = resolve_r(cx, sig.published_row).tail;
+  let tail_over = match tail {
+    None -> None,
+    Some(t) -> match cx.recursed {
+      Some(again) -> Some(again),
+      None ->
+        fold(cx.repeated_vars, None, |found: Option<Span>, r: { v: Int, over: Span }|
+          match found {
+            Some(_) -> found,
+            None -> if resolve_r(cx, row_open(r.v)).tail == Some(t) { Some(r.over) } else { None },
+          }),
+    },
+  };
+  { scaling: scaling, repeats: repeats, tail_over: tail_over }
+}
+
+// A written row's `bounded` atoms and variable, held to what the body performs: an atom that grows
+// with the input is refused where it is performed, naming the iteration that repeats it.
+fn kept_promises(cx: Cx, sig: Sig, count: Count) -> Cx = {
+  let bounded = map(sig.bounded, |a: Atom| resolve_atom(cx.subst, a));
+  let atoms: Cx = fold(bounded, cx, |c: Cx, w: Atom|
+    match fold(count.sites, None, |found: Option<PerformSite>, s: PerformSite|
+        match found {
+          Some(_) -> found,
+          None -> if atoms_covered([w], resolve_atom(c.subst, s.atom)) { Some(s) } else { None },
+        }) {
+      None -> c,
+      Some(s) -> broken_promise(c, tick(atom_written(c, w)), s, count.recursed),
+    });
+  if !sig.tail_bounded { atoms } else {
+    match count.tail_over {
+      None -> atoms,
+      Some(over) -> {
+        let named = match resolve_r(atoms, sig.published_row).tail {
+          Some(v) ->
+            map_fold(sig.row_params, None, |found: Option<Bytes>, name: Bytes, w: Int|
+              match found { Some(_) -> found, None -> if w == v { Some(name) } else { None } }),
+          None -> None,
+        };
+        broken_promise(
+          atoms,
+          match named {
+            Some(n) -> bytes_concat(tick(n), b"'s operations"),
+            None -> b"the row variable",
+          },
+          { atom: no_atom(), module: atoms.module, span: over, source: SArgs, over: Some(over) },
+          count.recursed,
+        )
+      },
+    }
+  }
+}
+
+fn no_atom() -> Atom = { effect: b"", resource: RSingleton, mode: MRead, op: None }
+
+// What a signature alone says of its counts: an atom not promised `bounded` may grow with the input,
+// and each parameter holding a function is called so unless the row variable is promised.
+pub fn written_counts(
+  fn_ty: Type,
+  footprint: List<Atom>,
+  bounded: List<Atom>,
+  tail_bounded: Bool,
+) -> { scaling: List<Atom>, repeats: List<Int> } =
+  {
+    scaling: filter(footprint, |a: Atom| !atoms_covered(bounded, a)),
+    repeats: if tail_bounded { [] } else {
+      match fn_ty {
+        TyFn(f) ->
+          fold(range(0, len(f.params)), [], |acc: List<Int>, i: Int|
+            if holds_fn(at(f.params, i)) { push(acc, i) } else { acc }),
+        _ -> [],
+      }
+    },
+  }
+
+fn holds_fn(t: Type) -> Bool =
+  match t {
+    TyFn(_) -> true,
+    TyCon(c) -> fold(c.args, false, |b: Bool, x: Type| b || holds_fn(x)),
+    TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || holds_fn(f.ty)),
+    TyVar(_) -> false,
+  }
+
+// Where the promise breaks: the operation, and the iteration that repeats it, which is the call
+// itself when the callee iterates.
+fn broken_promise(cx: Cx, what: Bytes, s: PerformSite, recursed: Option<Span>) -> Cx = {
+  let again = s.over != None && s.over == recursed;
+  let here = if again { b"performed here, and again at each call back into its own group" }
+  else if s.over != Some(s.span) { b"performed here" } else {
+    match s.source {
+      SVia(name) ->
+        bytes_concat_all([
+          tick(simple_name_of(name)),
+          b" performs it once per element of its input",
+        ]),
+      _ -> b"performed once for each element this iterates over",
+    }
+  };
+  let iteration = match s.over {
+    Some(o) -> if o == s.span || again { [] }
+    else { [lab(s.module, o, false, b"once for each element this iterates over")] },
+    None -> [],
+  };
+  err_labels(
+    cx,
+    b"E0465",
+    bytes_concat_all([
+      what,
+      if bytes_ends_with(what, b"operations") {
+        b" grow with the input, and the signature promises them `bounded`"
+      } else { b" grows with the input, and the signature promises it `bounded`" },
+    ]),
+    append([lab(s.module, s.span, true, here)], iteration),
+    [
+      b"a `bounded` operation runs a number of times no input decides",
+      b"batch the operation over the whole input into one, or move it out of the iteration",
+    ],
+  )
 }
 
 type Offence = { atom: Atom, site: Option<PerformSite> }
@@ -6761,7 +7235,11 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
         ITest(def) -> {
           let c: Cx = { ..acc.cx, scope: acc.cx.scope + 1 };
           let footprint: WithAtoms = match known_test(c, m.name, acc.position) {
-            Some(cached) -> { cx: c, atoms: settled_row(c, cached).atoms },
+            Some(cached) ->
+              {
+                cx: { ..c, seeded_tests: push(c.seeded_tests, qualify(m.name, def.name)) },
+                atoms: settled_row(c, cached).atoms,
+              },
             None -> {
               let c1: Cx = {
                 ..c,
@@ -6984,6 +7462,24 @@ fn debug_quoted(s: Bytes) -> Bytes =
     b"\"",
   ])
 
+// What a cost law's body answers at each size: the steps it took, beside its bound there.
+pub fn measure_ty() -> Type =
+  TyRecord(fields_sorted([{ name: b"bound", ty: t_int() }, { name: b"steps", ty: t_int() }]))
+
+// A cost law is run at sizes its one `Int` binder takes, so it binds exactly one, and measures what
+// the program does, never what a host does.
+fn sized(cx: Cx, def: LawDef, tys: List<Type>) -> Cx = {
+  let refuse = |why: Bytes|
+    err1(cx, b"E0463", def.name_span, why, b"a cost law ranges over one size", [
+      b"write `forall (n: Int)` and build the input of size `n` in the body: `cost n { sort(shuffled(n)) }`",
+    ]);
+  if def.host { refuse(b"a cost law measures the program, so it is never `law/host`") }
+  else if len(tys) != 1 { refuse(b"a cost law binds exactly one size") }
+  else if !(match list_at(tys, 0) { Some(t) -> t == t_int(), None -> false }) {
+    refuse(b"a cost law's size is an `Int`")
+  } else { cx }
+}
+
 fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
   let cx: Cx = {
     ..cx0,
@@ -7024,16 +7520,35 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
     None -> bound,
   };
   let body: Inferred = infer({ ..guarded, performs: [] }, def.body);
-  let c2: Cx = expect(
-    body.cx,
-    expr_span(def.body),
-    t_bool(),
-    body.ty,
-    b"a law states a proposition",
-  ).cx;
+  let c2: Cx = match def.cost {
+    None ->
+      expect(body.cx, expr_span(def.body), t_bool(), body.ty, b"a law states a proposition").cx,
+    Some(bound) ->
+      sized(
+        expect(
+          body.cx,
+          expr_span(bound),
+          measure_ty(),
+          body.ty,
+          b"a cost law's bound is an `Int` over its size",
+        ).cx,
+        def,
+        map(types.ts, |t: Type| resolve(body.cx, t)),
+      ),
+  };
   let row = resolve_r(c2, body.row);
-  let c3: Cx = if def.host { c2 }
-  else { check_spec_purity(c2, SSLawBody, [seed_atom()], expr_span(def.body), row) };
+  let c3: Cx = if def.host { c2 } else if def.cost != None && len(without_abort(row.atoms)) > 0 {
+    err1(
+      c2,
+      b"E0463",
+      expr_span(def.body),
+      b"a cost law's body performs nothing",
+      b"this body performs an effect",
+      [
+        b"a cost law runs its body once at each size and counts the steps it took, so a run that a handler or a schedule could change counts nothing",
+      ],
+    )
+  } else { check_spec_purity(c2, SSLawBody, [seed_atom()], expr_span(def.body), row) };
   let popped: Cx = { ..c3, env: env_pop(c3.env) };
   let binders = map(range(0, len(def.binders)), |i: Int| {
     let b = at(def.binders, i);
@@ -7051,6 +7566,7 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
       binders: binders,
       has_guard: match def.guard { Some(_) -> true, None -> false },
       host: def.host,
+      cost: def.cost != None,
       footprint: row.atoms,
       at: here(popped, def.span),
     }),
@@ -8979,6 +9495,9 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
     alias_stack: [],
     refused_atoms: [],
     performs: [],
+    over: None,
+    repeated_vars: [],
+    recursed: None,
     declared_atoms: [],
     comparisons: [],
     scope: 0,
@@ -9007,6 +9526,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
     derived: None,
     known: known,
     seeded: [],
+    seeded_tests: [],
     assumed: [],
   })
 
@@ -9039,6 +9559,10 @@ pub type Front = {
   ctors: List<CtorInfo>,
   // The definitions published from the rows handed in rather than from a walk of their bodies.
   seeded: List<Bytes>,
+  // The same for tests, by key.
+  seeded_tests: List<Bytes>,
+  // What the emitter reads of the bodies walked, so a body it lowers is not walked again.
+  facts: EmitFacts,
 }
 
 pub fn check_front(r: Resolved, mods: List<Mod>) -> Front = check_front_with(r, mods, no_known())
@@ -9055,6 +9579,8 @@ pub fn check_front_with(r: Resolved, mods: List<Mod>, known: Known) -> Front = {
     effects: out.cx.effects,
     ctors: out.cx.ctors,
     seeded: out.cx.seeded,
+    seeded_tests: out.cx.seeded_tests,
+    facts: facts_of(out.cx),
   }
 }
 
@@ -9095,6 +9621,17 @@ fn elaboration_of(cx: Cx) -> Elaboration =
     orders: cx.witness_orders,
   }
 
+// The facts cross from the program that checked to the one that lowers as bytes: a constructor's
+// name is each program's own, its index in its type is not.
+derive bin for UpdateShape
+derive bin for LabelSite
+derive bin for OperandSite
+derive bin for WitnessOp
+derive bin for WitnessRef
+derive bin for WitnessOrder
+derive bin for Elaboration
+derive bin for EmitFacts
+
 // What the checker answers a lowering: the facts it asked for, or the diagnostics that stopped it.
 // The caller is the one that reports them, so the caller is the one that gets them.
 pub type CheckedFacts = | Facts(EmitFacts) | Refuses(List<Diag>)
@@ -9103,17 +9640,18 @@ pub type CheckedFacts = | Facts(EmitFacts) | Refuses(List<Diag>)
 // so the caller seeds only what it will not lower.
 pub fn emit_facts(r: Resolved, mods: List<Mod>, known: Known) -> CheckedFacts = {
   let out = check_program_with(r, mods, known);
-  if !out.ok { Refuses(out.cx.diags) } else {
-    Facts({
-      pure: fold(out.cx.defs, [], |acc: List<Bytes>, d: DefInfo|
-        if published_pure(d) { push(acc, d.name) } else { acc }),
-      label_sites: out.cx.label_sites,
-      elaboration: elaboration_of(out.cx),
-      operands: map(out.cx.operands, |o: OperandAt|
-        { module: o.module, span: o.span, ty: operand_name(resolve(out.cx, o.ty)) }),
-    })
-  }
+  if !out.ok { Refuses(out.cx.diags) } else { Facts(facts_of(out.cx)) }
 }
+
+fn facts_of(cx: Cx) -> EmitFacts =
+  {
+    pure: fold(cx.defs, [], |acc: List<Bytes>, d: DefInfo|
+      if published_pure(d) { push(acc, d.name) } else { acc }),
+    label_sites: cx.label_sites,
+    elaboration: elaboration_of(cx),
+    operands: map(cx.operands, |o: OperandAt|
+      { module: o.module, span: o.span, ty: operand_name(resolve(cx, o.ty)) }),
+  }
 
 fn operand_name(t: Type) -> Bytes =
   match t { TyCon(k) -> if len(k.args) == 0 { k.name } else { b"" }, _ -> b"" }
@@ -9421,7 +9959,12 @@ fn dump_outcome(out: Checked) -> Bytes =
 // What a checked program publishes, as the interfaces a second check of it would be handed.
 fn known_of(cx: Cx) -> Known = {
   let defs = fold(cx.defs, map_new(), |acc: Map<Bytes, KnownDef>, d: DefInfo|
-    map_insert(acc, d.name, { footprint: d.footprint, performed: d.performed }));
+    map_insert(acc, d.name, {
+      footprint: d.footprint,
+      performed: d.performed,
+      scaling: d.scaling,
+      repeats: d.repeats,
+    }));
   // Tests are in load order, then source order, so each `test` item takes the next entry.
   let walked = fold(
     cx.mods,
@@ -9440,7 +9983,7 @@ fn known_of(cx: Cx) -> Known = {
       { next: slots.next, tests: map_insert(acc.tests, m.name, slots.slots) }
     },
   );
-  { defs: defs, tests: walked.tests }
+  { defs: defs, tests: walked.tests, root: cx.known.root }
 }
 
 // The program checked twice, the second time from what the first published.
@@ -10081,6 +10624,21 @@ test "an operation's type variables are the ones its own list declares" {
     ),
     [],
   )
+}
+
+test "a cost law ranges over one `Int` size, measures the program alone, and bounds it with an `Int`" {
+  assert_eq(
+    check_codes(b"fn f(n: Int) -> Int = n\nlaw \"l\" forall (n: Int) where n > 0 cost n { f(n) }"),
+    [],
+  );
+  assert_eq(check_codes(b"law \"l\" forall (n: Int, m: Int) cost n { n + m }"), [b"E0463"]);
+  assert_eq(check_codes(b"law \"l\" forall (b: Bool) cost 1 { b }"), [b"E0463"]);
+  assert_eq(check_codes(b"law \"l\" cost 1 { 1 }"), [b"E0463"]);
+  assert_eq(check_codes(b"law/host \"l\" forall (n: Int) cost n { n }"), [b"E0463"]);
+  assert_eq(check_codes(b"law \"l\" forall (n: Int) cost n { simulate { n } }"), [b"E0463"]);
+  // A raise is a gap at the size it happens at, as in any law, and not an effect.
+  assert_eq(check_codes(b"law \"l\" forall (n: Int) cost n { 100 / n }"), []);
+  assert_eq(check_codes(b"law \"l\" forall (n: Int) cost true { n }"), [b"E0201"])
 }
 
 test "a law binder naming a type nothing declares is refused, and a lowercase one is a variable" {
@@ -11298,5 +11856,87 @@ test "a branch may not open a `simulate` region, whose schedule is its entry's, 
       b"fn f() -> (Int, Int) / {task.write} = parallel { task.join(task.spawn(|| 1)), 2 }",
     ),
     [b"E0309"],
+  )
+}
+
+// --- How many times a body performs what its row names --------------------------------------
+
+fn db_src(body: Bytes) -> Bytes =
+  bytes_concat(
+    b"effect db { read query[c](sql: Bytes) -> Int }\nfn lookup(id: Int) -> Int / {db.query[conn]} = db.query[conn](b\"one\")\n",
+    body,
+  )
+
+// Whether `name`'s row names its atoms as growing with the input, and which callbacks it calls so.
+fn counted(src: Bytes, name: Bytes) -> { scaling: Bool, repeats: List<Int> } =
+  match def_of(checked_cx(src), bytes_concat(b"m.", name)) {
+    Some(d) -> { scaling: len(d.scaling) > 0, repeats: d.repeats },
+    None -> panic("the definition the test names"),
+  }
+
+test "a lookup performs its query a bounded number of times, and the same lookup mapped over its input scales" {
+  assert_eq(counted(db_src(b""), b"lookup"), { scaling: false, repeats: [] });
+  let mapped = db_src(
+    b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = map(ids, lookup)\n",
+  );
+  assert_eq(counted(mapped, b"all"), { scaling: true, repeats: [] });
+  let lambda = db_src(
+    b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = map(ids, |id: Int| lookup(id))\n",
+  );
+  assert_eq(counted(lambda, b"all"), { scaling: true, repeats: [] });
+  // A list the text writes out is a size no input decides.
+  let three = db_src(
+    b"fn three() -> List<Int> / {db.query[conn]} = map([1, 2, 3], |id: Int| lookup(id))\n",
+  );
+  assert_eq(counted(three, b"three"), { scaling: false, repeats: [] });
+  // What a mapped callback evaluates once, before the iteration, does not scale with it.
+  let once = db_src(
+    b"fn first(ids: List<Int>) -> List<Int> / {db.query[conn]} = { let n = lookup(0); map(ids, |id: Int| id + n) }\n",
+  );
+  assert_eq(counted(once, b"first"), { scaling: false, repeats: [] })
+}
+
+test "recursion repeats everything its body performs, and a callback's count composes through its caller" {
+  let walked = db_src(
+    b"fn walk(ids: List<Int>) -> Int / {db.query[conn]} = match ids { [] -> 0, [id, ..rest] -> lookup(id) + walk(rest) }\n",
+  );
+  assert_eq(counted(walked, b"walk"), { scaling: true, repeats: [] });
+  let each = db_src(
+    b"fn each<a | e>(xs: List<a>, f: (a) -> Unit / e) -> Unit / e = fold(xs, (), |u: Unit, x: a| f(x))\nfn once<a | e>(f: () -> a / e) -> a / e = f()\nfn looked(ids: List<Int>) -> Unit / {db.query[conn]} = each(ids, |id: Int| { lookup(id); () })\nfn one() -> Int / {db.query[conn]} = once(|| lookup(1))\n",
+  );
+  assert_eq(counted(each, b"each"), { scaling: false, repeats: [1] });
+  assert_eq(counted(each, b"once"), { scaling: false, repeats: [] });
+  assert_eq(counted(each, b"looked"), { scaling: true, repeats: [] });
+  assert_eq(counted(each, b"one"), { scaling: false, repeats: [] })
+}
+
+test "a row's `bounded` promise is held to the body, and only a definition's own row makes one" {
+  assert_eq(
+    check_codes(
+      db_src(
+        b"fn batched(ids: List<Int>) -> Int / {db.query[conn] bounded} = db.query[conn](b\"in\")\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      db_src(
+        b"fn per_item(ids: List<Int>) -> Int / {db.query[conn] bounded} = fold(ids, 0, |n: Int, id: Int| n + lookup(id))\n",
+      ),
+    ),
+    [b"E0465"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn each<a | e>(xs: List<a>, f: (a) -> Unit / e) -> Unit / e bounded = fold(xs, (), |u: Unit, x: a| f(x))\n",
+    ),
+    [b"E0465"],
+  );
+  assert_eq(
+    check_codes(
+      db_src(b"fn take(f: () -> Int / {db.query[conn] bounded}) -> Int / {db.query[conn]} = f()\n"),
+    ),
+    [b"E0466"],
   )
 }

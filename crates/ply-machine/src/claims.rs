@@ -42,7 +42,15 @@ const HERMETIC: &str = "hermetic_prover";
 pub const MARSHALLED: &[(&str, &str, &[&str])] = &[(
     "proof.obligation",
     "Judged",
-    &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
+    &[
+        "JHeld",
+        "JFailed",
+        "JRejected",
+        "JRaised",
+        "JFaulted",
+        "JMeasured",
+        "JSpent",
+    ],
 )];
 
 /// One case of a type this side marshals, under the name the program declares it by.
@@ -223,7 +231,7 @@ fn batches_of(value: &PlyValue, span: Span) -> Result<Vec<Batch>, Diagnostic> {
     let mut out = Vec::new();
     for batch in value.as_list(span, "the batches to judge")? {
         let claim = field_of(batch, "claim", span)?.as_int(span, "a claim's place")?;
-        let (mode, _) = case_of(field_of(batch, "mode", span)?, "a mode", span)?;
+        let (mode, args) = case_of(field_of(batch, "mode", span)?, "a mode", span)?;
         out.push(Batch {
             claim: usize::try_from(claim).unwrap_or(usize::MAX),
             points: points_of(field_of(batch, "points", span)?, span)?,
@@ -231,6 +239,12 @@ fn batches_of(value: &PlyValue, span: Span) -> Result<Vec<Batch>, Diagnostic> {
                 "MWhole" => Mode::Whole,
                 "MWitness" => Mode::Witness,
                 "MDomain" => Mode::Domain,
+                "MCost" => match args {
+                    [limit] => Mode::Cost {
+                        limit: limit.as_int(span, "the steps one size may take")?,
+                    },
+                    _ => return Err(malformed("`MCost` carries one limit", span)),
+                },
                 other => return Err(malformed(&format!("`{other}` is no mode"), span)),
             },
         });
@@ -800,6 +814,15 @@ fn judged_value(judgement: &Judgement) -> PlyValue {
                 ("values", shown_values(diagnostic)),
             ])],
         ),
+        Judgement::Measured { steps, bound } => case(
+            "Judged",
+            "JMeasured",
+            vec![record(vec![
+                ("bound", PlyValue::Int(*bound)),
+                ("steps", PlyValue::Int(*steps)),
+            ])],
+        ),
+        Judgement::Spent { limit } => case("Judged", "JSpent", vec![PlyValue::Int(*limit)]),
     }
 }
 

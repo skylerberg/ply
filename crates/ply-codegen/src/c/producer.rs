@@ -460,8 +460,8 @@ pub struct PlyProducer {
     kept: Option<String>,
 }
 
-/// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg, embeds, rows)`: every module at
-/// once, so they resolve together, emitting the roots `wanted` names.
+/// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg, embeds, rows, walked)`: the
+/// modules the roots `wanted` names are in and what they import, so they resolve together.
 const ENTRY: &str = "emit.emit_roots_answer";
 
 impl PlyProducer {
@@ -565,7 +565,11 @@ impl PlyProducer {
     /// One entry over the whole program, emitting `wanted`'s roots.
     fn enter(&self, loaded: &Source, wanted: &[String]) -> Result<Bodies> {
         let front = loaded.front;
-        let needed = imported_closure(front, wanted.iter().map(|r| module_of_root(r)));
+        let lowered: HashSet<&str> = wanted.iter().map(|r| module_of_root(r)).collect();
+        let needed = imported_closure(front, lowered.iter().copied());
+        // A module no wanted root is in is read for its declarations, its rows standing for its
+        // bodies; an answer that published no rows leaves every body to be walked.
+        let stubbing = !front.rows.is_empty();
         let mut names = Vec::new();
         let mut srcs = Vec::new();
         let mut placed = Vec::new();
@@ -576,6 +580,11 @@ impl PlyProducer {
             }
             let Some(text) = loaded.texts.get(&name) else {
                 bail!("no source text for module `{name}`, and the emitter reads a program's text");
+            };
+            let cuts = front.check.modules.get(module).map(|m| m.cuts.as_slice());
+            let text = match cuts {
+                Some(cuts) if stubbing && !lowered.contains(name.as_str()) => stubbed(text, cuts),
+                _ => text.clone(),
             };
             names.push(Value::bytes(name.as_bytes()));
             srcs.push(Value::bytes(text.as_bytes()));
@@ -640,6 +649,7 @@ impl PlyProducer {
             mod_pkg,
             embeds_of(front)?,
             rows_of(front)?,
+            Value::bytes(&front.walked),
         ];
         tally(|census| census.wanted.push(wanted.to_vec()));
         let value = self.call(ENTRY, &args)?;
@@ -800,6 +810,29 @@ pub fn imported_closure<'a>(
         }
     }
     seen
+}
+
+/// `text` with each of `cuts` blanked, every byte but a newline a space and a braced cut keeping its
+/// braces: the module's declarations at the offsets they have, over empty bodies. The front end's
+/// `stub_module` blanks a compiled package's modules the same way.
+pub fn stubbed(text: &str, cuts: &[ply_eval::Cut]) -> String {
+    let mut out = text.as_bytes().to_vec();
+    for cut in cuts {
+        let Some(span) = out.get_mut(cut.start..cut.end) else {
+            continue;
+        };
+        for byte in span.iter_mut() {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        if cut.braced && span.len() >= 2 {
+            let last = span.len() - 1;
+            span[0] = b'{';
+            span[last] = b'}';
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 /// What every definition and test published, as the emitter takes it; none seeds nothing.

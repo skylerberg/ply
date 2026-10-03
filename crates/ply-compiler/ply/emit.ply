@@ -14,9 +14,13 @@ import resolve (Mod, Source, Resolved_, Failed, Diag, resolve_modules, Resolved,
                 ModBind, Pkg, resolve_packaged, no_pkgs, default_binder, find_modbind, qualify)
 import derive (expand_derives)
 import infer (emit_facts, Facts, Refuses, LabelSite, OperandSite, expanded_mods, sccs,
-              prelude_effects, EffectInfo, OpInfo, Known, KnownDef, no_known)
+              prelude_effects, EffectInfo, OpInfo, Known, KnownDef, no_known, EmitFacts,
+              UpdateShape, WitnessOp, WitnessRef)
 import tycore (Atom, read_atoms)
-import front (Rows, KnownDefRow, KnownTestRow)
+import front (Rows, KnownDefRow, KnownTestRow, analyse, dump_of, Walked, walked_bin)
+import std.bin
+import diag (parse_all)
+import interface (stub_module)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EWithCell, HandleClause,
               MatchArm, RecField, Stmt, SLet, SLetElse, SExpr)
@@ -7615,7 +7619,7 @@ test "the emitter writes an embed out as the front end's answer says it was read
 }
 
 fn pure_row(name: Bytes) -> KnownDefRow =
-  { name: name, hash: b"", witness: [], footprint: b"", performed: b"" }
+  { name: name, hash: b"", witness: [], footprint: b"", performed: b"", scaling: b"", repeats: [] }
 
 test "a body emitted with the program's rows is the body emitted without them" {
   let a = b"import b\nfn f(x: Int) -> Int = b::g(x) + 1\ntest \"adds\" { assert(f(1) == 3) }\n";
@@ -7632,6 +7636,47 @@ test "a body emitted with the program's rows is the body emitted without them" {
     emit_roots_answer([b"a", b"b"], [a, b], [], [], wanted, [], [], [], rows),
     emit_roots_answer([b"a", b"b"], [a, b], [], [], wanted, [], [], []),
   )
+}
+
+test "a module no wanted root is in, read as its stub under its rows, lowers what its text does" {
+  let a = b"import b\nfn f(x: Int) -> Int = b::g(x) + 1\n";
+  let b = b"pub fn g(x: Int) -> Int = x * 2\ntest \"doubles\" { assert(g(1) == 2) }\n";
+  let parsed = parse_all([{ name: b"a", src: a }, { name: b"b", src: b }]);
+  let rows = dump_of(analyse(parsed)).rows;
+  let stub = stub_module(b, at(parsed, 1).module);
+  assert(bytes_index_of(stub, b"x * 2") == None);
+  let call = |srcs: List<Bytes>|
+    emit_roots_answer([b"a", b"b"], srcs, [], [], [b"a.f"], [], [], [], rows);
+  assert_eq(call([a, stub]), call([a, b]))
+}
+
+test "a body the front end walked is lowered from what it read, as from a walk here" {
+  let a = b"import b\ntype P = { x: Int, y: Int }\nfn moved(p: P) -> P = { ..p, x: b::twice(p.x) + 1 }\n";
+  let b = b"pub fn twice<a>(x: a) -> a\n  where numeric(a)\n= x + x\n";
+  let d = dump_of(analyse(parse_all([{ name: b"a", src: a }, { name: b"b", src: b }])));
+  match walked_read(d.walked) {
+    None -> panic("the answer carries what its check read"),
+    Some(w) -> {
+      assert_eq(w.whole, [b"a", b"b"]);
+      assert_eq(len(w.facts.elaboration.updates), 1);
+      assert(len(w.facts.elaboration.refs) > 0);
+      assert(len(w.facts.operands) > 0)
+    },
+  };
+  let call = |walked: Bytes|
+    emit_roots_answer(
+      [b"a", b"b"],
+      [a, b],
+      [],
+      [],
+      [b"a.moved", b"b.twice"],
+      [],
+      [],
+      [],
+      d.rows,
+      walked,
+    );
+  assert_eq(call(d.walked), call(b""))
 }
 
 // The driver hands over a lowered module's imports and nothing else, reading roots the same way:
@@ -7724,11 +7769,91 @@ fn module_of_root(root: Bytes) -> Bytes = {
   if dot < 0 { b"" } else { bytes_slice(owner, 0, dot) }
 }
 
-// Every definition and test outside the lowered modules as the front end published it, so the
-// check behind this answer walks only the bodies it lowers. The rows are this program's own: they
-// came with its texts, so no hash is checked.
-fn seeds(mods: List<Mod>, lowered: Option<Map<Bytes, Bool>>, rows: Rows) -> Known =
+// What the front end's check read, or nothing when its answer carried none or one this program does
+// not read.
+fn walked_read(walked: Bytes) -> Option<Walked> =
+  if bytes_len(walked) == 0 { None }
+  else { match bin::decode(walked, walked_bin()) { Ok(w) -> Some(w), Err(_) -> None } }
+
+// The lowered modules the front end's check did not walk whole, which the check here walks; `None`
+// walks every module.
+fn unwalked(lowered: Option<Map<Bytes, Bool>>, read: Option<Walked>) -> Option<Map<Bytes, Bool>> =
   match lowered {
+    None -> None,
+    Some(l) -> match read {
+      None -> Some(l),
+      Some(w) -> {
+        let whole = fold(w.whole, map_new(), |acc: Map<Bytes, Bool>, m: Bytes|
+          map_insert(acc, m, true));
+        Some(
+          map_fold(l, map_new(), |acc: Map<Bytes, Bool>, m: Bytes, _: Bool|
+            if map_contains(whole, m) { acc } else { map_insert(acc, m, true) }),
+        )
+      },
+    },
+  }
+
+// What the check here read, and what the front end's read of the lowered modules it walked whole,
+// moved onto the indices of the modules here. A definition's witness order is its signature's,
+// which the check here published for every module it was handed.
+fn with_walked(
+  own: EmitFacts,
+  read: Option<Walked>,
+  lowered: Option<Map<Bytes, Bool>>,
+  walking: Option<Map<Bytes, Bool>>,
+  mods: List<Mod>,
+) -> EmitFacts =
+  match ((lowered, read)) {
+    (Some(l), Some(w)) -> {
+      let here = fold(range(0, len(mods)), map_new(), |acc: Map<Bytes, Int>, i: Int| {
+        let name = at(mods, i).name;
+        if map_contains(l, name) && !lowers(walking, name) { map_insert(acc, name, i) } else { acc }
+      });
+      let moved = fold(range(0, len(w.modules)), map_new(), |acc: Map<Int, Int>, i: Int|
+        match map_get(here, at(w.modules, i)) { Some(j) -> map_insert(acc, i, j), None -> acc });
+      let f = w.facts;
+      {
+        pure: own.pure,
+        label_sites: fold(f.label_sites, own.label_sites, |acc: List<LabelSite>, x: LabelSite|
+          match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+        elaboration: {
+          updates: fold(
+            f.elaboration.updates,
+            own.elaboration.updates,
+            |acc: List<UpdateShape>, x: UpdateShape|
+              match map_get(moved, x.module) {
+                Some(j) -> push(acc, { ..x, module: j }),
+                None -> acc,
+              },
+          ),
+          ops: fold(f.elaboration.ops, own.elaboration.ops, |acc: List<WitnessOp>, x: WitnessOp|
+            match map_get(moved, x.module) {
+              Some(j) -> push(acc, { ..x, module: j }),
+              None -> acc,
+            }),
+          refs: fold(
+            f.elaboration.refs,
+            own.elaboration.refs,
+            |acc: List<WitnessRef>, x: WitnessRef|
+              match map_get(moved, x.module) {
+                Some(j) -> push(acc, { ..x, module: j }),
+                None -> acc,
+              },
+          ),
+          orders: own.elaboration.orders,
+        },
+        operands: fold(f.operands, own.operands, |acc: List<OperandSite>, x: OperandSite|
+          match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+      }
+    },
+    _ -> own,
+  }
+
+// Every definition and test outside the modules walked here as the front end published it, so the
+// check behind this answer walks only bodies it lowers that the front end's did not walk. The rows
+// are this program's own: they came with its texts, so no hash is checked.
+fn seeds(mods: List<Mod>, walking: Option<Map<Bytes, Bool>>, rows: Rows) -> Known =
+  match walking {
     None -> no_known(),
     Some(walked) -> {
       let tests = fold(rows.tests, map_new(), |acc: Map<Bytes, Bytes>, r: KnownTestRow|
@@ -7736,13 +7861,15 @@ fn seeds(mods: List<Mod>, lowered: Option<Map<Bytes, Bool>>, rows: Rows) -> Know
       {
         defs: fold(rows.defs, map_new(), |acc: Map<Bytes, KnownDef>, r: KnownDefRow|
           if map_contains(walked, module_of_root(r.name)) { acc } else {
-            match read_atoms(r.footprint) {
-              None -> acc,
-              Some(footprint) -> match read_atoms(r.performed) {
-                None -> acc,
-                Some(performed) ->
-                  map_insert(acc, r.name, { footprint: footprint, performed: performed }),
-              },
+            match ((read_atoms(r.footprint), read_atoms(r.performed), read_atoms(r.scaling))) {
+              (Some(footprint), Some(performed), Some(scaling)) ->
+                map_insert(acc, r.name, {
+                  footprint: footprint,
+                  performed: performed,
+                  scaling: scaling,
+                  repeats: r.repeats,
+                }),
+              _ -> acc,
             }
           }),
         tests: fold(mods, map_new(), |acc: Map<Bytes, List<Option<List<Atom>>>>, m: Mod|
@@ -7761,6 +7888,8 @@ fn seeds(mods: List<Mod>, lowered: Option<Map<Bytes, Bool>>, rows: Rows) -> Know
                 }),
             )
           }),
+        // The front end held every promise already; lowering checks none again.
+        root: 0,
       }
     },
   }
@@ -7779,6 +7908,7 @@ fn emit_program(
   mod_pkg: List<Int>,
   embeds: List<EmbedAt> = [],
   rows: Rows = { defs: [], tests: [] },
+  walked: Bytes = b"",
 ) -> List<Emitted> = {
   let tables = embed_tables(embeds);
   let parsed = map(range(0, len(sources)), |i: Int| {
@@ -7832,9 +7962,12 @@ fn emit_program(
         Failed(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
         Resolved_(x) -> {
           let lowered = lowered_modules(wanted);
-          match emit_facts(x.r, x.mods, seeds(x.mods, lowered, rows)) {
+          let read = walked_read(walked);
+          let walking = unwalked(lowered, read);
+          match emit_facts(x.r, x.mods, seeds(x.mods, walking, rows)) {
             Refuses(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
-            Facts(facts) -> {
+            Facts(own) -> {
+              let facts = with_walked(own, read, lowered, walking, x.mods);
               let pure = fold(facts.pure, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
                 map_insert(acc, n, true));
               // The checker has the shape of every update, so the literals they stand for are written in here.
@@ -8641,8 +8774,9 @@ pub type RootAnswer = { name: Bytes, answer: Answer }
 
 // The roots `wanted` names, resolved against the whole program: one entry per root emitted or
 // refused, in its order, so the driver can drop what was refused. `embeds` is what the front end's
-// answer says it embedded, and `rows` what it published for every definition and test, which spare
-// a walk of every module no wanted root is in.
+// answer says it embedded, `rows` what it published for every definition and test, which spare a
+// walk of every module no wanted root is in, and `walked` what its check read of the modules it
+// walked whole, which spares a walk of those too.
 pub fn emit_roots_answer(
   names: List<Bytes>,
   srcs: List<Bytes>,
@@ -8653,6 +8787,7 @@ pub fn emit_roots_answer(
   mod_pkg: List<Int>,
   embeds: List<EmbedAt>,
   rows: Rows = { defs: [], tests: [] },
+  walked: Bytes = b"",
 ) -> List<RootAnswer> =
   map(
     emit_program(
@@ -8665,6 +8800,7 @@ pub fn emit_roots_answer(
       mod_pkg,
       embeds,
       rows,
+      walked,
     ),
     answer_of,
   )
