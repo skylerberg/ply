@@ -8,8 +8,8 @@ use ply_eval::decode::{AnswerValue, Error};
 use ply_eval::{
     Analysis, Carry, DefHash, DefInfo, Diagnostic, Edit, EffectAtom, EffectInfo, EmitterRoot, Fix,
     Footprint, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo, ModuleName, OpInfo,
-    Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo, TypeDecl,
-    Value, Visibility, intern_code,
+    Ordinal, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo, TypeDecl, Value,
+    Visibility, intern_code,
 };
 use std::collections::BTreeMap;
 
@@ -33,20 +33,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
         return Ok(front);
     }
 
-    front.packages = d.field("packages")?.items(|p| {
-        Ok((
-            p.field("prefix")?.utf8()?.to_string(),
-            strings(p.field("deps")?)?,
-        ))
-    })?;
-    front.pins = d.field("pins")?.items(|p| {
-        Ok(Pinned {
-            name: p.field("name")?.utf8()?.to_string(),
-            version: p.field("version")?.utf8()?.to_string(),
-            digest: p.field("digest")?.utf8()?.to_string(),
-        })
-    })?;
-    front.module_packages = d.field("module_packages")?.items(|i| i.number())?;
     for m in d.field("modules")?.list()? {
         let name = m.field("name")?.utf8()?;
         let index = m.field("index")?;

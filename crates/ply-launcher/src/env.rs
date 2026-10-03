@@ -1,7 +1,7 @@
 //! The environment a launched program runs in, as a lent effect: the variables, whether the
-//! streams are terminals, the working directory, the binary's own version and shipped digest, the
-//! directory `ply run` and `ply check` file what they reuse in, and the one the emitter's answers
-//! are kept in.
+//! streams are terminals, the working directory, the binary's own version, size and shipped
+//! digest, the directory `ply run` and `ply check` file what they reuse in, and the one the
+//! emitter's answers are kept in.
 //! Bound by the launcher for the program it enters — user programs read configuration, not the
 //! environment.
 //!
@@ -16,11 +16,12 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 9] = [
+const OPERATIONS: [(&str, &str); 10] = [
     ("var", "ply_launcher::env::var"),
     ("vars", "ply_launcher::env::vars"),
     ("terminal", "ply_launcher::env::terminal"),
     ("binary_version", "ply_launcher::env::binary_version"),
+    ("binary_bytes", "ply_launcher::env::binary_bytes"),
     ("pwd", "ply_launcher::env::pwd"),
     ("shipped_digest", "ply_launcher::env::shipped_digest"),
     ("builder_digest", "ply_launcher::env::builder_digest"),
@@ -80,6 +81,11 @@ impl HostHandler for EnvHandler {
                 Value::Bool(terminal)
             }
             ("binary_version", []) => Value::str(&self.version),
+            // `None` when the running binary cannot be measured, which fails nothing.
+            ("binary_bytes", []) => match std::env::current_exe().and_then(std::fs::metadata) {
+                Ok(binary) => Value::ctor("Some", vec![Value::Int(binary.len() as i64)]),
+                Err(_) => Value::ctor("None", Vec::new()),
+            },
             // The digest the committed `ply` runnable is gated on: `ply bootstrap` writes it
             // beside the runnable.
             ("shipped_digest", []) => Value::str(crate::shipped::identity()),
