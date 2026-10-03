@@ -3,7 +3,7 @@
 // seeded analysis is sound through every kind of edit is the compiler's own property, and
 // `crates/ply-compiler/ply/front.ply` tests it over sessions of edits.
 
-import harness (scratch, Ran, Server, Source, project, write, read, working, on_disk, serving,
+import harness (scratch, Ran, Server, Source, project, write, read, loads_here, on_disk, serving,
                 ended, finished, said, stderr, warm_agrees, seeding, seeding_at, json_of, at, path,
                 items, first, str, int, truth, shown, in_memory, tree, sources_here, comparable,
                 Here, Reached, Shelf)
@@ -448,10 +448,7 @@ test/nondet "a load that does not cache files nothing" {
     { path: "m.ply", text: "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n" },
   ]);
   // This test is a program, and loads one through the machine it is lent.
-  match machine.load[run](working(), None, None) {
-    Ok(_) -> (),
-    Err(_) -> panic("the program loads"),
-  };
+  assert(loads_here(), Some("the program loads"));
   machine.drop[run]();
   filed_nothing("a program's own load");
   let tested = on_disk(["test", "--no-cache"]);
@@ -736,3 +733,51 @@ test "a dependency read through its compiled package answers what its source doe
 
 fn contains_code(xs: List<String>, code: String) -> Bool =
   fold(xs, false, |found: Bool, x: String| found || x == code)
+
+fn tiers(v: Json) -> List<String> = map(items(at(v, "obligations")), |o: Json| str(at(o, "tier")))
+
+test "a dependent proves through a transparent definition, and is checked and proved again when its body moves" {
+  scratch(|| {
+    project([
+      { path: "app/ply.pkg", text: manifest("app", lib_dep("../lib")) },
+      {
+        path: "app/main.ply",
+        text: "import lib.same\n\npub fn kept(x: Int) -> Int\n  ensures result == x\n= same::same(x)\n",
+      },
+      { path: "lib/ply.pkg", text: manifest("lib", "") },
+      { path: "lib/same.ply", text: "pub transparent fn same(x: Int) -> Int = x\n" },
+    ]);
+    assert_eq(tiers(json_of(on_disk(["prove", "app", "--json"]))), ["proved"]);
+    assert(seeding_at("app").checked == 0, Some("a warm load walks nothing"));
+    edit("lib/same.ply", "= x", "= x + 0");
+    // The body is part of the contract: the dependent is checked and proved again.
+    assert(seeding_at("app").checked == 2, Some("the edit and its dependent are walked"));
+    let again = json_of(on_disk(["prove", "app", "--json"]));
+    assert(int(at(again, "cached")) == 0, Some(shown(again)));
+    assert_eq(tiers(again), ["proved"])
+  })
+}
+
+test "a `reuse fn` keeps its promise through another package's `returns` clause" {
+  scratch(|| {
+    project([
+      { path: "app/ply.pkg", text: manifest("app", lib_dep("../lib")) },
+      {
+        path: "app/main.ply",
+        text: "import lib.lists\n\nreuse fn grow(n: Int) -> List<Int> = push(lists::made(n), n)\n",
+      },
+      { path: "lib/ply.pkg", text: manifest("lib", "") },
+      {
+        path: "lib/lists.ply",
+        text: "pub fn made(n: Int) -> List<Int>\n  returns fresh\n= range(0, n)\n",
+      },
+    ]);
+    let kept = json_of(on_disk(["check", "app", "--json"]));
+    assert(int(at(kept, "exit_code")) == 0, Some(shown(kept)));
+    assert(on_disk(["check", "lib"]).code == 0, None);
+    // Without the clause nothing says the answer is fresh, whatever the body does.
+    edit("lib/lists.ply", "  returns fresh\n", "");
+    let refused = json_of(on_disk(["check", "app", "--json"]));
+    assert(contains_code(codes(refused), "E0127"), Some(shown(refused)))
+  })
+}

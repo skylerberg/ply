@@ -94,8 +94,9 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `set` | `effect set X = {..}` |
 | `law`, `host`, `forall` | `law "..."` or `law/host` at item position; `forall` after the label |
-| `derive`, `for`, `reuse` | `derive <deriver> for <Type>` and `reuse fn` at item position |
+| `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
+| `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
 | `with_cell` | before `[` |
@@ -110,7 +111,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `1.5`, `1e9`, `2.5e-3` | `Float` | IEEE-754 binary64. |
 | `1.50m`, `0m` | `Decimal` | Exact base 10; up to 28 fractional digits, 96-bit mantissa; keeps its written scale. |
 | `"text"` | `String` | UTF-8; no line breaks. |
-| `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.value.display` writes of it, below. |
+| `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
@@ -128,12 +129,12 @@ digits naming a Unicode scalar value (a surrogate or a value past `10FFFF` is `E
 strings add `\xNN`, refuse `\u{...}` and refuse source characters above `U+007F`.
 
 An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ " b"`, with
-`std.value`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
-writes it (§13.35). The two spellings are one definition with one hash. A hole is any expression,
+`std.show`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
+writes it (§13.38). The two spellings are one definition with one hash. A hole is any expression,
 strings and braces included, and `{{` and `}}` are braces of the text; a lone `}` is `E0001`. A
 hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Cell` or a `Task` in one
-is `E0206`. A module that interpolates imports `std.value` itself, under a name no source can
-write, so `std.value` and the modules it imports cannot interpolate.
+is `E0206`. A module that interpolates imports `std.show` itself, under a name no source can
+write, so `std.show` and the modules it imports cannot interpolate.
 
 A map literal is the call `map_of_entries([{key: k, value: v}, ..])` and a set literal the same
 with `()` for each value, so either spelling is one definition with one hash; `ply fmt` keeps the
@@ -223,7 +224,8 @@ literal, a constructor over literals, a record or a list — and may not name
 another parameter (`E0121`) or, on a `pub fn`, anything its module does not
 export (`E0122`). Only a `fn` takes defaults (`E0120` elsewhere).
 
-`reuse fn` promises that every `push` in the body reuses its list (§5.6). The
+`reuse fn` promises that every `push` in the body reuses its list (§5.6), and
+`transparent fn` puts the body into what another package reads of it (§10). The
 entry point is `main`, of any type and row: no `main` is `E0101`, several is
 `E0112` (name the file to pick one).
 
@@ -680,6 +682,19 @@ reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
   let ys = push(xs, n);
   if len(xs) < 0 { xs } else { ys }                       // E0127: xs is read again after the update
 }
+```
+
+A call of another package's definition answers what its `returns` clause says,
+never what its body does: `returns fresh`, a value nothing else holds, or
+`returns xs`, one that may share the parameter `xs`. Without the clause an
+append onto the answer cannot be shown to reuse. The clause stands between the
+signature and its specifications, and the cost checker shows it of the body
+when that package is the one checked (`E0148`):
+
+```ply
+pub fn digits(n: Int) -> List<Int>
+  returns fresh
+= range(0, n)
 ```
 
 ### 5.7 Iteration
@@ -1244,7 +1259,9 @@ list patterns exposed is unrolled, and the claim is proved at `[]` and then at
 view and `len` known to lie below `i64::MAX`. A definition of another package
 — a dependency's, or outside `--std` a shipped module's — is claimed by its
 `requires` and `ensures` alone: a proof may use what it promises and never
-unfolds its body, which that package's own run proves.
+unfolds its body, which that package's own run proves. A `transparent fn` is
+claimed by its body too: a proof anywhere may unfold it, so its body, and all
+it reaches, is part of what its dependents are checked and proved against.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
@@ -1292,7 +1309,7 @@ derive json for Line
 | `eq` | `<snake_case(T)>_eq` | `{eq: (T, T) -> Bool}` |
 | `ord` | `<snake_case(T)>_ord` | `{compare: (T, T) -> Ordering}` |
 | `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
-| `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.value.show` does |
+| `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
 | `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
 
 There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
@@ -1318,7 +1335,7 @@ plain values: `json::decode_bytes(body, order_json())`.
 `show`, `hash`);
 `Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin` need their
 module imported (`import std.json`, `import std.bin`), or the `derive` is
-`E0206`; `show` imports `std.value` itself.
+`E0206`; `show` imports `std.show` itself.
 
 ## 12. Builtins
 
@@ -2719,8 +2736,7 @@ pub type Fun =
   | FProject({ arity: Int, index: Int })
   | FTable({ arity: Int, entries: List<Entry>, default: Value })
 pub fn render(v: Value) -> String
-pub fn show<a>(x: a) -> String where derivable(show, a)
-pub fn display<a>(x: a) -> String where derivable(show, a)
+pub fn render_all(v: Value) -> String
 pub fn filled(text: String, values: List<Value>) -> String
 pub fn order(a: Value, b: Value) -> Ordering
 pub fn map_of(entries: List<Entry>) -> Value
@@ -2733,12 +2749,9 @@ runtime diagnostic carries, and what a counterexample binds. `render` is the one
 way a value is shown, in the language's own spelling: a constructor by the name
 its module declares, an array as `array_of_list([..])`. In a diagnostic, a list
 or map past `shown_items` items counts the rest, nesting past `shown_depth`
-shows as `…`, and a credential shows as `Secret(****)`. `show` writes any value
-of a program the same way, every item at every depth (`reflect`, §12.1, is the
-value as data), and `display` writes a `String` or a `Char` as itself and
-anything else as `show` does: it is what an interpolated string's holes are
-(§2.3). A fixed width holds the bit pattern it
-reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
+shows as `…`, and a credential shows as `Secret(****)`; `render_all` writes
+every item at every depth, which is what a program shows (§13.38). A fixed
+width holds the bit pattern it reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
 a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
 and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
 value a runtime diagnostic's text names in its place. `order` is the order the
@@ -2801,6 +2814,18 @@ Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
 combinators `list_bin`, `option_bin`,
 `result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*` and `take_*` are
 public too.
+
+### 13.38 `std.show`
+
+```ply
+pub fn show<a>(x: a) -> String where derivable(show, a)
+pub fn display<a>(x: a) -> String where derivable(show, a)
+```
+
+`show` writes any value of a program as `std.value.render_all` does (`reflect`,
+§12.1, is the value as data), and `derive show` (§11) writes what it does.
+`display` writes a `String` or a `Char` as itself and anything else as `show`
+does: it is what an interpolated string's holes are (§2.3).
 
 ## 14. The host boundary
 
@@ -3175,6 +3200,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0145` | a package or a version no registry takes |
 | `E0146` | an embed whose file or directory could not be read |
 | `E0147` | an embed whose path is not a string literal |
+| `E0148` | a `returns` clause the body does not keep |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
