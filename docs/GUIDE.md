@@ -94,8 +94,9 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `set` | `effect set X = {..}` |
 | `law`, `host`, `forall` | `law "..."` or `law/host` at item position; `forall` after the label |
-| `derive`, `for`, `reuse` | `derive <deriver> for <Type>` and `reuse fn` at item position |
+| `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
+| `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
 | `with_cell` | before `[` |
@@ -223,7 +224,8 @@ literal, a constructor over literals, a record or a list — and may not name
 another parameter (`E0121`) or, on a `pub fn`, anything its module does not
 export (`E0122`). Only a `fn` takes defaults (`E0120` elsewhere).
 
-`reuse fn` promises that every `push` in the body reuses its list (§5.6). The
+`reuse fn` promises that every `push` in the body reuses its list (§5.6), and
+`transparent fn` puts the body into what another package reads of it (§10). The
 entry point is `main`, of any type and row: no `main` is `E0101`, several is
 `E0112` (name the file to pick one).
 
@@ -680,6 +682,19 @@ reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
   let ys = push(xs, n);
   if len(xs) < 0 { xs } else { ys }                       // E0127: xs is read again after the update
 }
+```
+
+A call of another package's definition answers what its `returns` clause says,
+never what its body does: `returns fresh`, a value nothing else holds, or
+`returns xs`, one that may share the parameter `xs`. Without the clause an
+append onto the answer cannot be shown to reuse. The clause stands between the
+signature and its specifications, and the cost checker shows it of the body
+when that package is the one checked (`E0148`):
+
+```ply
+pub fn digits(n: Int) -> List<Int>
+  returns fresh
+= range(0, n)
 ```
 
 ### 5.7 Iteration
@@ -1244,7 +1259,9 @@ list patterns exposed is unrolled, and the claim is proved at `[]` and then at
 view and `len` known to lie below `i64::MAX`. A definition of another package
 — a dependency's, or outside `--std` a shipped module's — is claimed by its
 `requires` and `ensures` alone: a proof may use what it promises and never
-unfolds its body, which that package's own run proves.
+unfolds its body, which that package's own run proves. A `transparent fn` is
+claimed by its body too: a proof anywhere may unfold it, so its body, and all
+it reaches, is part of what its dependents are checked and proved against.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
@@ -3180,6 +3197,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0145` | a package or a version no registry takes |
 | `E0146` | an embed whose file or directory could not be read |
 | `E0147` | an embed whose path is not a string literal |
+| `E0148` | a `returns` clause the body does not keep |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
