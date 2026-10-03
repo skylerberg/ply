@@ -61,16 +61,16 @@ fn assert_over_budget(d: &Diagnostic) {
     );
 }
 
-/// `name`'s answer and the calls the tier counted, on a tier whose memo no earlier entry filled.
+/// `name`'s answer and the calls the backend counted, on a backend whose memo no earlier entry filled.
 fn counted(c: &Compiled, name: &str, args: Vec<Value>) -> (Value, u64) {
-    let (machine, tier) = c.machine_and_tier();
+    let (machine, backend) = c.machine_and_backend();
     let mut machine = machine.with_max_calls(BUDGET);
     let value = machine
         .call(name, args, Span::DUMMY)
         .into_parts()
         .0
         .unwrap_or_else(|d| panic!("`{name}` raised: {d:#?}"));
-    (value, tier.steps())
+    (value, backend.steps())
 }
 
 /// What the refusals below are measured against: the same shape, remembered, fits the budget.
@@ -89,7 +89,7 @@ fn a_constant_read_many_times_runs_its_body_once() {
     let c = Compiled::new(SOURCE);
     let (value, body) = counted(&c, "m.constant", vec![]);
     assert_eq!(value, Value::Int(700));
-    assert!(body > 0, "the tier counted no call of `constant`'s body");
+    assert!(body > 0, "the backend counted no call of `constant`'s body");
     let args = || vec![Value::Int(READS), Value::Int(0)];
     let (literal, looped) = counted(&c, "m.reads_literal", args());
     let (read, spent) = counted(&c, "m.reads", args());
@@ -102,11 +102,11 @@ fn a_constant_read_many_times_runs_its_body_once() {
     );
 }
 
-/// A tier's steps are its last entry's own: an entry the memo answers ran no body, so it made none.
+/// A backend's steps are its last entry's own: an entry the memo answers ran no body, so it made none.
 #[test]
 fn a_constant_the_memo_answers_counts_no_steps() {
     let c = Compiled::new(SOURCE);
-    let (machine, tier) = c.machine_and_tier();
+    let (machine, backend) = c.machine_and_backend();
     let mut machine = machine.with_max_calls(BUDGET);
     let mut constant = || {
         let value = machine
@@ -114,7 +114,7 @@ fn a_constant_the_memo_answers_counts_no_steps() {
             .into_parts()
             .0
             .unwrap_or_else(|d| panic!("`m.constant` raised: {d:#?}"));
-        (value, tier.steps())
+        (value, backend.steps())
     };
     let (value, ran) = constant();
     assert_eq!(value, Value::Int(700));
@@ -127,13 +127,13 @@ fn a_constant_the_memo_answers_counts_no_steps() {
 }
 
 /// `parameterized`'s steps: an `Int` is no memo word, so every entry runs the body.
-fn ran(machine: &mut Machine<'_>, tier: &ply_codegen::Bodies) -> u64 {
+fn ran(machine: &mut Machine<'_>, backend: &ply_codegen::Bodies) -> u64 {
     machine
         .call("m.parameterized", vec![Value::Int(0)], Span::DUMMY)
         .into_parts()
         .0
         .unwrap_or_else(|d| panic!("`m.parameterized` raised: {d:#?}"));
-    let steps = tier.steps();
+    let steps = backend.steps();
     assert!(steps > 0, "`m.parameterized` ran no body");
     steps
 }
@@ -142,37 +142,38 @@ fn ran(machine: &mut Machine<'_>, tier: &ply_codegen::Bodies) -> u64 {
 #[test]
 fn a_declined_entry_counts_no_steps() {
     let c = Compiled::new(SOURCE);
-    let (machine, tier) = c.machine_and_tier();
+    let (machine, backend) = c.machine_and_backend();
     let mut machine = machine.with_max_calls(BUDGET);
     // A name the unit never compiled, then a compiled one offered the wrong number of arguments.
     for (name, args) in [("m.absent", vec![]), ("m.parameterized", vec![])] {
-        let before = ran(&mut machine, &tier);
+        let before = ran(&mut machine, &backend);
         machine
             .call(name, args, Span::DUMMY)
             .into_parts()
             .0
             .expect_err("the seam declines the offer");
         assert_eq!(
-            tier.steps(),
+            backend.steps(),
             0,
             "declining `{name}` reported the {before} calls of the entry before it"
         );
     }
-    let before = ran(&mut machine, &tier);
-    tier.while_entered(|| {
-        machine
-            .call("m.parameterized", vec![Value::Int(0)], Span::DUMMY)
-            .into_parts()
-            .0
-    })
-    .expect_err("an entry that arrives while another runs is declined");
+    let before = ran(&mut machine, &backend);
+    backend
+        .while_entered(|| {
+            machine
+                .call("m.parameterized", vec![Value::Int(0)], Span::DUMMY)
+                .into_parts()
+                .0
+        })
+        .expect_err("an entry that arrives while another runs is declined");
     assert_eq!(
-        tier.steps(),
+        backend.steps(),
         0,
         "the reentrant decline reported the {before} calls of the entry before it"
     );
     assert_eq!(
-        tier.declines(),
+        backend.declines(),
         ply_codegen::Declines {
             not_compiled: 1,
             arity: 1,
@@ -204,7 +205,7 @@ fn called(machine: &mut Machine<'_>, name: &str) -> Value {
 #[test]
 fn a_constant_the_memo_answers_after_a_region_reports_no_record() {
     let c = Compiled::new(REGION);
-    let (mut machine, tier) = c.machine_and_tier();
+    let (mut machine, backend) = c.machine_and_backend();
     assert_eq!(called(&mut machine, "m.constant"), Value::Int(7));
     assert_eq!(called(&mut machine, "m.raced"), Value::Int(3));
     assert!(
@@ -212,7 +213,11 @@ fn a_constant_the_memo_answers_after_a_region_reports_no_record() {
         "`raced` left no record of its region"
     );
     assert_eq!(called(&mut machine, "m.constant"), Value::Int(7));
-    assert_eq!(tier.steps(), 0, "`constant` was not answered from the memo");
+    assert_eq!(
+        backend.steps(),
+        0,
+        "`constant` was not answered from the memo"
+    );
     assert!(
         machine.simulated().is_none(),
         "the memo's answer reported the region of the entry before it"
@@ -223,25 +228,27 @@ fn a_constant_the_memo_answers_after_a_region_reports_no_record() {
 #[test]
 fn an_entry_no_body_ran_for_reports_nothing_of_the_one_before_it() {
     let c = Compiled::new(REGION);
-    let (_machine, tier) = c.machine_and_tier();
-    let enter = |name: &str| tier.enter_whole(&Symbol::new(name), &[], BUDGET);
+    let (_machine, backend) = c.machine_and_backend();
+    let enter = |name: &str| backend.enter_whole(&Symbol::new(name), &[], BUDGET);
     assert!(matches!(
         enter("m.constant"),
         Entered::Answered(Value::Int(7))
     ));
     assert!(matches!(enter("m.raced"), Entered::Answered(Value::Int(3))));
     assert!(
-        tier.steps() > 0 && tier.simulated().is_some() && !tier.take_performed().is_empty(),
+        backend.steps() > 0
+            && backend.simulated().is_some()
+            && !backend.take_performed().is_empty(),
         "`raced` did not leave its calls, its record and its atoms"
     );
     let reports_nothing = |entry: &str| {
-        assert_eq!(tier.steps(), 0, "{entry} reported `raced`'s calls");
+        assert_eq!(backend.steps(), 0, "{entry} reported `raced`'s calls");
         assert!(
-            tier.simulated().is_none(),
+            backend.simulated().is_none(),
             "{entry} reported `raced`'s region"
         );
         assert!(
-            tier.take_performed().is_empty(),
+            backend.take_performed().is_empty(),
             "{entry} reported `raced`'s atoms"
         );
     };

@@ -244,13 +244,13 @@ pub fn tasked(n: Int) -> Int / {sim.read, abort.raise} = with_cell[slot](Nothing
 } }
 "#;
 
-/// Runs `name(n)` for each seed `n` in `seeds` and checks it answers `n + more`, the tier having
+/// Runs `name(n)` for each seed `n` in `seeds` and checks it answers `n + more`, the backend having
 /// found every region and slot given back rather than declining the entry. An `Int` argument is
 /// never a memo word, so every call runs.
 #[track_caller]
 fn answers(name: &str, more: i64, seeds: std::ops::Range<u64>) {
     let compiled = Compiled::new(PROGRAMS);
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
     for root in seeds {
         let n = root as i64;
         machine.set_seed(Seed::at(root, Vec::new()), DEFAULT_STEPS);
@@ -263,7 +263,7 @@ fn answers(name: &str, more: i64, seeds: std::ops::Range<u64>) {
             other => panic!("`{name}` at seed {root}: {other:?}"),
         }
     }
-    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(backend.declines().total(), 0, "{:?}", backend.declines());
 }
 
 /// The body closes the region it opened before it stopped; the clause opened one after, on the

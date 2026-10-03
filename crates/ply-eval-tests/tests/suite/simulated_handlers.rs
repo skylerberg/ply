@@ -1,7 +1,7 @@
 use crate::fixture::port_check;
 use ply_eval::decode::AnswerValue;
 use ply_eval::{
-    Answer, CheckOutput, EffectInfo, Handlers, SEEDED_OPS, SimTy, SourceId, Span, Symbol, TaskId,
+    Answer, CheckOutput, EffectInfo, Handlers, SEEDED_OPS, SimType, SourceId, Span, Symbol, TaskId,
     Value,
 };
 use std::collections::HashMap;
@@ -175,7 +175,7 @@ fn what_the_handlers_answer_has_the_declared_type() {
             // A woken sleeper is resumed with `clock.sleep`'s declared return.
             Ok(Answer::Sleeping { .. }) => {
                 assert_eq!(ret, "Unit");
-                assert_eq!(sig.ret, SimTy::Unit);
+                assert_eq!(sig.ret, SimType::Unit);
             }
             Err(d) => panic!("`{sig}` refused its own declared arguments: {}", d.message),
         }

@@ -140,7 +140,7 @@ fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
         counter.clone(),
     )]);
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(registry)));
     let d = diagnostic(machine.eval_test(0));
 
@@ -158,7 +158,7 @@ fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
 #[test]
 fn an_operation_no_handler_claims_is_still_e0303() {
     let compiled = Compiled::named("t", SEND);
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(HostBinding::hermetic()));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -184,7 +184,7 @@ test/nondet "closes without sending" {
 "#,
     );
     let binding = registry.bind(&idle.front.check).expect("binds");
-    let mut machine = idle.machine_on_tier();
+    let mut machine = idle.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -202,7 +202,7 @@ fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -244,7 +244,7 @@ test/nondet "the double answers" {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -287,7 +287,7 @@ test/nondet "the clause hands its continuation to the host" {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     let d = diagnostic(machine.eval_test(0));
 
@@ -340,7 +340,7 @@ test/nondet "captured after the send" {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -365,7 +365,7 @@ test "three resumptions" {
 }
 "#,
     );
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(HostBinding::hermetic()));
     machine
         .eval_test(0)
@@ -408,7 +408,7 @@ test/nondet "reached through a call" {
         )]);
         let binding = registry.bind(&compiled.front.check).expect("binds");
 
-        let mut machine = compiled.machine_on_tier();
+        let mut machine = compiled.machine_on_backend();
         machine.set_host_binding(Arc::new(binding));
         let d = diagnostic(machine.eval_test(0));
         assert_eq!(d.code, codes::HOST_IN_SIMULATION, "{}", d.message);
@@ -435,7 +435,7 @@ test/nondet "hermetic, in a region" {
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Counter::default()),
     )]);
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(registry)));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -469,7 +469,7 @@ test/nondet "a socket under a seed" {
         let registry = registry_of(vec![(registration, handler.clone())]);
         let binding = registry.bind(&compiled.front.check).expect("binds");
 
-        let mut machine = compiled.machine_on_tier();
+        let mut machine = compiled.machine_on_backend();
         machine.set_host_binding(Arc::new(binding));
         machine.set_host_runtime(std::sync::Arc::new(|| {
             std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
@@ -551,7 +551,7 @@ test/nondet "the region's own handlers answer" {
         "every scheduled operation must really be bound for the shadowing to mean anything"
     );
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -595,7 +595,7 @@ test/nondet "the region's own scheduler answers" {
         "the fixture exists to have a bound `task` handler to shadow"
     );
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -623,7 +623,7 @@ fn an_answer_outside_the_declared_footprint_is_refused() {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine.set_declared_footprint(Footprint::empty());
     let d = diagnostic(machine.eval_test(0));
@@ -646,7 +646,7 @@ fn an_answer_inside_the_declared_footprint_is_allowed() {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine.set_declared_footprint(Footprint::from_atoms([atom(
         "t.net",
@@ -669,7 +669,7 @@ fn a_declared_operation_atom_admits_that_operation_alone() {
             Arc::new(Counter::default()),
         )]);
         let binding = registry.bind(&compiled.front.check).expect("binds");
-        let mut machine = compiled.machine_on_tier();
+        let mut machine = compiled.machine_on_backend();
         machine.set_host_binding(Arc::new(binding));
         machine
     };
@@ -708,7 +708,7 @@ fn the_declared_footprint_survives_the_next_entry_point() {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine.set_declared_footprint(Footprint::empty());
     diagnostic(machine.eval_test(0));
@@ -739,7 +739,7 @@ test/nondet "waits" {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
@@ -762,7 +762,7 @@ fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     let d = diagnostic(machine.eval_test(0));
     assert_eq!(d.code, codes::INTERNAL_ERROR);
@@ -817,7 +817,7 @@ test/nondet "two tasks and a join" {
         .bind(&compiled.front.check)
         .expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -845,7 +845,7 @@ test/nondet "spawns" {
 }
 "#,
     );
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(task_registry(
         Arc::new(Counter::default()),
     ))));
@@ -869,7 +869,7 @@ test/nondet "a region inside the production one" {
     let binding = task_registry(Arc::new(Counter::default()))
         .bind(&compiled.front.check)
         .expect("binds");
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -892,7 +892,7 @@ test/nondet "reads a clock inside the production region" {
     let binding = task_registry(Arc::new(Counter::default()))
         .bind(&compiled.front.check)
         .expect("binds");
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     // Nothing registers `clock`, so it reaches the boundary and is unhandled.
     assert_eq!(
@@ -968,7 +968,7 @@ test/nondet "the sibling runs while one task waits" {
     registry.register(op("net", "accept", Linearity::AtMostOnce), Arc::new(Once));
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(Later::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
@@ -1068,7 +1068,7 @@ test/nondet "each task reads its cell after the other's region closed" {
     );
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let (mut machine, tier) = compiled.machine_and_tier();
+    let (mut machine, backend) = compiled.machine_and_backend();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(AfterPark::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
@@ -1078,7 +1078,12 @@ test/nondet "each task reads its cell after the other's region closed" {
         .into_parts()
         .0
         .expect("both tasks read their own cells");
-    assert_eq!(tier.declines().touched_cells, 0, "{:?}", tier.declines());
+    assert_eq!(
+        backend.declines().touched_cells,
+        0,
+        "{:?}",
+        backend.declines()
+    );
 }
 
 #[test]
@@ -1107,7 +1112,7 @@ test/nondet "the task first runs after the handle around its spawn ended" {
     registry.register(op("net", "mark", Linearity::Repeatable), probe.clone());
     let binding = registry.bind(&compiled.front.check).expect("binds");
 
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -1127,7 +1132,7 @@ fn tasks_bound(source: &str) -> ply_eval::Machine<'static> {
     let binding = task_registry(Arc::new(Counter::default()))
         .bind(&compiled.front.check)
         .expect("binds");
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine
 }
@@ -1225,7 +1230,7 @@ test/nondet "one operation, no tasks" {
         Arc::new(Waits),
     )]);
     let binding = registry.bind(&compiled.front.check).expect("binds");
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>

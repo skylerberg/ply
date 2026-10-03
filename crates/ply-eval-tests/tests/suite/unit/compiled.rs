@@ -33,13 +33,13 @@ impl Compiled for Roots {
     }
 }
 
-/// A machine whose tier enters every test root the way `entered` says and declines every call.
+/// A machine whose backend enters every test root the way `entered` says and declines every call.
 fn machine_under(c: &Checked, entered: impl Fn() -> Entered + 'static) -> Machine<'_> {
-    let tier = Rc::new(Roots {
+    let backend = Rc::new(Roots {
         program: c.front.hashes_digest,
         entered: Box::new(entered),
     });
-    Machine::new(&c.front, tier).expect("the tier describes the program")
+    Machine::new(&c.front, backend).expect("the backend describes the program")
 }
 
 fn first_test_under(
@@ -69,15 +69,15 @@ fn a_test_root_the_backend_raised_in_keeps_the_machines_diagnostic_when_it_raise
 }
 
 #[test]
-fn a_tier_built_from_another_program_is_refused_before_anything_runs() {
+fn a_backend_built_from_another_program_is_refused_before_anything_runs() {
     let c = checked_source(DOUBLE_DOUBLES);
-    let tier = Rc::new(Roots {
+    let backend = Rc::new(Roots {
         program: DefHash::of(b"another program"),
-        entered: Box::new(|| panic!("a refused tier was entered")),
+        entered: Box::new(|| panic!("a refused backend was entered")),
     });
-    let refused = Machine::new(&c.front, tier)
+    let refused = Machine::new(&c.front, backend)
         .err()
-        .expect("a machine is never built on another program's tier");
+        .expect("a machine is never built on another program's backend");
     assert_eq!(refused.code, codes::INTERNAL_ERROR, "{refused:?}");
     assert!(
         refused.message.contains("built from another"),
@@ -88,7 +88,7 @@ fn a_tier_built_from_another_program_is_refused_before_anything_runs() {
 /// Nothing the program wrote ran, so the failure is Ply's and no assertion on the program's own
 /// codes can be met by it.
 #[test]
-fn a_test_root_the_tier_did_not_run_is_plys_defect_and_counted_as_declined() {
+fn a_test_root_the_backend_did_not_run_is_plys_defect_and_counted_as_declined() {
     let c = checked_source(DOUBLE_DOUBLES);
     let (outcome, counts) = first_test_under(&c, || Entered::Declined);
     let d = outcome.expect_err("a declined test answers nothing");
@@ -101,7 +101,7 @@ fn a_test_root_the_tier_did_not_run_is_plys_defect_and_counted_as_declined() {
 }
 
 /// The checker refuses a test whose body is not `Unit`, so a value is Ply's defect rather than a
-/// decline: the tier did run the test.
+/// decline: the backend did run the test.
 #[test]
 fn a_test_root_that_answers_a_value_is_plys_defect_and_counted_as_entered() {
     let c = checked_source(DOUBLE_DOUBLES);
@@ -117,7 +117,7 @@ fn a_test_root_that_answers_a_value_is_plys_defect_and_counted_as_entered() {
 }
 
 #[test]
-fn an_entry_point_the_tier_declined_is_plys_defect_and_counted_as_declined() {
+fn an_entry_point_the_backend_declined_is_plys_defect_and_counted_as_declined() {
     let c = checked_source(DOUBLE_DOUBLES);
     let mut machine = machine_under(&c, || panic!("no test is entered here"));
     let d = machine

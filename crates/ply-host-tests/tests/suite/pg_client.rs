@@ -124,8 +124,8 @@ fn first_text(answer: Answer) -> String / {abort.raise} =
   }
 "#;
 
-fn tiered(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
-    crate::support::answered::tiered("m", service)
+fn compiled(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+    crate::support::answered::compiled("m", service)
 }
 struct Ran {
     text: String,
@@ -153,7 +153,7 @@ fn ran(answered: Value, net: Option<Arc<SimNet>>) -> Result<Ran, String> {
 /// client said and what the entry returned.
 fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, String> {
     let net = Arc::new(SimNet::new(vec![script]));
-    let (front, unit) = tiered(CLIENT);
+    let (front, unit) = compiled(CLIENT);
     let binding = ply_host::tcp::registry(Arc::clone(&net) as Arc<dyn Net>)
         .bind(&front.check)
         .expect("the declaration and the registration agree");
@@ -179,7 +179,7 @@ fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, Strin
 /// the client's SCRAM is a SCRAM a server accepts.
 fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
     let host = std::sync::Arc::new(ply_host::Host::new());
-    let (front, unit) = tiered(CLIENT);
+    let (front, unit) = compiled(CLIENT);
     let binding = host
         .registry()
         .bind(&front.check)
