@@ -69,6 +69,8 @@ pub enum Builtin {
     BytesConcat,
     BytesConcatAll,
     BytesBlake3,
+    BytesGzip,
+    BytesGunzip,
     BytesOfString,
     BytesIsUtf8,
     BytesIndexOf,
@@ -279,6 +281,8 @@ impl Builtin {
             "bytes_concat" => Builtin::BytesConcat,
             "bytes_concat_all" => Builtin::BytesConcatAll,
             "bytes_blake3" => Builtin::BytesBlake3,
+            "bytes_gzip" => Builtin::BytesGzip,
+            "bytes_gunzip" => Builtin::BytesGunzip,
             "bytes_of_string" => Builtin::BytesOfString,
             "bytes_is_utf8" => Builtin::BytesIsUtf8,
             "bytes_index_of" => Builtin::BytesIndexOf,
@@ -434,6 +438,8 @@ impl Builtin {
             Builtin::BytesConcat => "bytes_concat",
             Builtin::BytesConcatAll => "bytes_concat_all",
             Builtin::BytesBlake3 => "bytes_blake3",
+            Builtin::BytesGzip => "bytes_gzip",
+            Builtin::BytesGunzip => "bytes_gunzip",
             Builtin::BytesOfString => "bytes_of_string",
             Builtin::BytesIsUtf8 => "bytes_is_utf8",
             Builtin::BytesIndexOf => "bytes_index_of",
@@ -572,6 +578,8 @@ impl Builtin {
             | Builtin::BytesIsUtf8
             | Builtin::BytesConcatAll
             | Builtin::BytesBlake3
+            | Builtin::BytesGzip
+            | Builtin::BytesGunzip
             | Builtin::StringOfBytes
             | Builtin::StringOfBytesLossy
             | Builtin::StringLen
@@ -785,6 +793,8 @@ impl Builtin {
             Builtin::BytesConcat,
             Builtin::BytesConcatAll,
             Builtin::BytesBlake3,
+            Builtin::BytesGzip,
+            Builtin::BytesGunzip,
             Builtin::BytesOfString,
             Builtin::BytesIsUtf8,
             Builtin::BytesIndexOf,
@@ -1329,6 +1339,23 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::BytesBlake3 => {
             let b = args[0].as_bytes(span, "`bytes_blake3`")?;
             Ok(Value::bytes(blake3::hash(b).as_bytes()))
+        }
+
+        // At the best level, so what a writer seals is a function of the bytes alone.
+        Builtin::BytesGzip => {
+            use std::io::Write;
+            let b = args[0].as_bytes(span, "`bytes_gzip`")?;
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            let sealed = gz.write_all(b).and_then(|()| gz.finish());
+            Ok(Value::bytes(sealed.expect("writing to memory cannot fail")))
+        }
+
+        Builtin::BytesGunzip => {
+            use std::io::Read;
+            let b = args[0].as_bytes(span, "`bytes_gunzip`")?;
+            let mut out = Vec::new();
+            let read = flate2::read::GzDecoder::new(&b[..]).read_to_end(&mut out);
+            Ok(option(read.ok().map(|_| Value::bytes(out))))
         }
 
         Builtin::BytesConcatAll => {

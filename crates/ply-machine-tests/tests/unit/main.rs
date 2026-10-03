@@ -2,7 +2,6 @@
 
 mod artifact;
 mod config;
-mod costs;
 mod drive;
 mod hosts;
 mod load;

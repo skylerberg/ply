@@ -16,6 +16,7 @@ import std.value (Value, VInt, render)
 nondet effect prover {
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
+  write compiled[claims](unit: Bytes) -> Result<Unit, List<Diag>>
   read schema[claims](name: String) -> Result<Value, List<Diag>>
   read prepared[claims](step_budget: Int, config: Configured) -> Result<Unit, Refusal>
   read cached[claims](keys: List<String>) -> List<Option<String>>
@@ -136,7 +137,7 @@ fn judged_at(index: Int) -> Answer / {prover.judged[claims], abort.raise} = {
     })
 }
 
-fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.prepared[claims], prover.judged[claims], abort.raise} = {
+fn main(root: String, index: Int, front: Front, unit: Bytes, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.prepared[claims], prover.judged[claims], abort.raise} = {
   prover.configure[claims]({
     path: root,
     no_incremental: false,
@@ -169,8 +170,8 @@ fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prove
       measure_reduction: false,
     },
   }, front, world);
-  match (prover.collected[claims](), prover.prepared[claims](1000000000, { values: [], schema: None, opened: false })) {
-    (Ok(_), Ok(_)) -> judged_at(index),
+  match (prover.collected[claims](), prover.compiled[claims](unit), prover.prepared[claims](1000000000, { values: [], schema: None, opened: false })) {
+    (Ok(_), Ok(_), Ok(_)) -> judged_at(index),
     _ -> { failed: 0 - 1, held: 0, rejected: 0, first: "" },
   }
 }
@@ -230,6 +231,7 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
                 Value::str(project.path().display().to_string()),
                 Value::Int(index),
                 crate::fixture::handed(project.path()),
+                crate::fixture::unit(project.path()),
                 crate::fixture::int_laws(&[THE_LAW]),
             ],
             Span::DUMMY,

@@ -129,6 +129,32 @@ pub fn loaded(path: &Path) -> ply_machine::load::Loaded {
     })
 }
 
+/// The C of `loaded`'s unit, every definition offered: what the CLI's emitter hands a machine.
+pub fn unit_text(loaded: &ply_machine::load::Loaded) -> Vec<u8> {
+    ply_codegen::c::producer::ensure_default();
+    let unit = ply_codegen::Unit::over_front(
+        &loaded.front,
+        ply_machine::support::module_texts(&loaded.check, &loaded.sources),
+    )
+    .expect("the program compiles to a tier");
+    let names: Vec<&str> = unit.compiled().iter().map(String::as_str).collect();
+    unit.produce(&names)
+        .expect("the unit is produced")
+        .text
+        .into_bytes()
+}
+
+/// The C of the unit of the program at `path`, as the value a program hands `machine.load`.
+pub fn unit(path: &Path) -> ply_eval::Value {
+    ply_eval::Value::bytes(unit_text(&loaded(path)))
+}
+
+/// The compiled tier over `loaded`, from the C handed over as the CLI hands it.
+pub fn backend(loaded: &ply_machine::load::Loaded) -> &'static dyn ply_eval::Provider {
+    ply_machine::support::unit_of(&loaded.front, &unit_text(loaded))
+        .unwrap_or_else(|d| panic!("the unit compiles: {}", d.message))
+}
+
 /// A world of no declared types holding one law per `(owner, binders)`, each over `Int` binders and
 /// sampled once the static prover has not settled it, keyed `1`, `2`, ... in order: what
 /// `proof.world` builds for such a law, spelled out for a test that drives the claims effect with no

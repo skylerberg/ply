@@ -1,0 +1,202 @@
+// A program read from a directory, checked and emitted: what a program that drives another hands
+// the machine, which compiles the C it is handed and loads no source of its own. Its modules are
+// the `.ply` files below the root, named by their paths; the shipped modules they import come off
+// the binary's own shelf.
+
+import front (Dump, EmitRoot, Analysed, Refused, analyse_pulling_std_with, dump_of, module_of)
+import resolve (Source, Diag, diag1)
+import unit (Runtime, shipped, compiled)
+import std.fs
+import std.fs (fs, File, Dir)
+
+fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+// One source a front end's answer names: where it was read, the module it is, and its text.
+pub type SourceFile = { path: String, name: String, text: Bytes }
+
+// What a machine is handed for a program: the front end's answer, every source its ids run over in
+// that order, what its load cost, and whether it read and filed a front-end cache.
+pub type Front = {
+  dump: Dump,
+  files: List<SourceFile>,
+  read_ms: Int,
+  front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
+}
+
+// A program a machine can load: its front end's answer and the C of its unit.
+pub type Loaded = { front: Front, unit: Bytes }
+
+// A directory a walk does not enter: a hidden one holds caches and VCS metadata, and `target`
+// build output.
+pub fn skipped(name: String) -> Bool = string_starts_with(name, ".") || name == "target"
+
+fn joined(dir: String, name: String) -> String =
+  if dir == "" || dir == "." { name } else if name == "" { dir } else { dir ++ "/" ++ name }
+
+fn sorted(xs: List<String>) -> List<String> =
+  map_keys(fold(xs, map_new(), |acc: Map<String, Bool>, x: String| map_insert(acc, x, true)))
+
+// Every `.ply` file below `dir`, by its path below it, in path order; a symlink is not followed.
+fn below<[r]>(dir: String, under: String) -> List<String> / {fs.list_dir[r], fs.kind[r]} =
+  match fs.list_dir[r](joined(dir, under)) {
+    None -> [],
+    Some(names) ->
+      fold(sorted(names), [], |acc: List<String>, name: String| {
+        let path = joined(under, name);
+        match fs.kind[r](joined(dir, path)) {
+          Dir -> if skipped(name) { acc } else { append(acc, below[r](dir, path)) },
+          File -> if string_ends_with(name, ".ply") { push(acc, path) } else { acc },
+          _ -> acc,
+        }
+      }),
+  }
+
+fn outside() -> Int = 4294967295
+
+fn nowhere(message: String) -> Diag =
+  diag1(b"E0502", outside(), { start: 0, end: 0 }, bytes_of_string(message), b"nothing to load", [])
+
+// `std.json` is `<std>/json.ply`, as a rendered span names a module the shelf holds.
+fn shelf_path(name: String) -> String / {abort.raise} = {
+  let segments = string_split(name, ".");
+  match list_at(segments, 0) {
+    None -> name,
+    Some(root) ->
+      "<" ++ root ++ ">/"
+        ++ fold(range(1, len(segments)), "", |acc: String, i: Int|
+          if i == 1 { at(segments, i) } else { acc ++ "/" ++ at(segments, i) })
+        ++ ".ply",
+  }
+}
+
+// The program below `root`: read, checked, and emitted afresh. A file that cannot be a module, a
+// program that does not check, and a definition the emitter refuses are each a refusal.
+pub fn load<[r]>(
+  root: String,
+) -> Result<Loaded, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, shipped.runtime, abort.raise} = {
+  let paths = below[r](root, "");
+  let named = fold(paths, Ok([]), |acc: Result<List<SourceFile>, List<Diag>>, p: String|
+    match acc {
+      Err(e) -> Err(e),
+      Ok(done) -> match module_of(p) {
+        Err(why) -> Err([nowhere("`" ++ joined(root, p) ++ "` cannot be a module: " ++ why)]),
+        Ok(name) -> match fs.read_file[r](joined(root, p)) {
+          None -> Err([nowhere("could not read `" ++ joined(root, p) ++ "`")]),
+          Some(text) -> Ok(push(done, { path: joined(root, p), name: name, text: text })),
+        },
+      },
+    });
+  match named {
+    Err(diags) -> Err(diags),
+    Ok([]) -> Err([nowhere("no `.ply` files under `" ++ root ++ "`")]),
+    Ok(own) -> {
+      let shelf = map(shipped.names(), |n: String|
+        { name: bytes_of_string(n), src: match shipped.module(n) { Some(t) -> t, None -> b"" } });
+      let texts = fold(shelf, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+        map_insert(acc, s.name, s.src));
+      let pulled = analyse_pulling_std_with(
+        map(own, |f: SourceFile| { name: bytes_of_string(f.name), src: f.text }),
+        shelf,
+        [],
+        [],
+      );
+      match pulled.out {
+        Refused(diags) -> Err(diags),
+        Analysed(w) -> {
+          let dump = dump_of(Analysed(w));
+          let files = append(
+            own,
+            map(pulled.pulled, |n: Bytes|
+              {
+                path: shelf_path(string_of_bytes(n)),
+                name: string_of_bytes(n),
+                text: match map_get(texts, n) { Some(t) -> t, None -> b"" },
+              }),
+          );
+          match compiled(
+              shipped.runtime(),
+              dump,
+              map(files, |f: SourceFile| f.text),
+              map(dump.emit_roots, |e: EmitRoot| e.root),
+              b"",
+              |_: Bytes| None,
+              |_: Bytes, _: Bytes| (),
+            ) {
+            Err(diags) -> Err(diags),
+            Ok(unit) ->
+              Ok({
+                front: {
+                  dump: dump,
+                  files: files,
+                  read_ms: 0,
+                  front_ms: 0,
+                  file_ms: 0,
+                  cached: false,
+                },
+                unit: unit,
+              }),
+          }
+        },
+      }
+    },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn no_runtime() -> Runtime = { head: b"", tail: b"", helpers: [], builtins: [], identity: b"" }
+
+// `load` over a tree held in memory, with nothing on the shelf.
+fn loaded_from(
+  files: List<{ path: String, body: Bytes }>,
+) -> Result<Loaded, List<Diag>> / {abort.raise} = {
+  let tree = fs::mem_of(files);
+  handle {
+    load[t]("p")
+  } with {
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> fs::mem_read(tree, path),
+    shipped.names() -> [],
+    shipped.module(name) -> None,
+    shipped.runtime() -> no_runtime(),
+  }
+}
+
+fn codes(r: Result<Loaded, List<Diag>>) -> List<Bytes> =
+  match r { Ok(_) -> [], Err(diags) -> map(diags, |d: Diag| d.code) }
+
+test "a program is the `.ply` files below its root, in path order, each the module its path names" {
+  match loaded_from([
+      { path: "p/b.ply", body: b"import a.c (two)\n\nfn main() -> Int = two()\n" },
+      { path: "p/a/c.ply", body: b"pub fn two() -> Int = 2\n" },
+      { path: "p/.cache/x.ply", body: b"not ply" },
+      { path: "p/target/y.ply", body: b"not ply" },
+      { path: "p/notes.txt", body: b"not ply" },
+    ]) {
+    Err(diags) ->
+      panic(string_of_bytes(fold(diags, b"", |acc: Bytes, d: Diag| bytes_concat(acc, d.message)))),
+    Ok(l) -> {
+      assert_eq(map(l.front.files, |f: SourceFile| f.path), ["p/a/c.ply", "p/b.ply"]);
+      assert_eq(map(l.front.files, |f: SourceFile| f.name), ["a.c", "b"]);
+      assert(bytes_len(l.unit) > 0)
+    },
+  }
+}
+
+test "a root with nothing to load, and a file that cannot be a module, are refused" {
+  assert_eq(codes(loaded_from([{ path: "p/notes.txt", body: b"" }])), [b"E0502"]);
+  assert_eq(codes(loaded_from([{ path: "p/a-b.ply", body: b"fn main() -> Int = 1\n" }])), [
+    b"E0502",
+  ])
+}
+
+test "a program that does not check is refused with what the checker said" {
+  let said = codes(loaded_from([{ path: "p/m.ply", body: b"fn main() -> Int = \"one\"\n" }]));
+  assert(len(said) > 0 && len(filter(said, |c: Bytes| c == b"E0502")) == 0)
+}
