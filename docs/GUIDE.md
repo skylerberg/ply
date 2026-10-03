@@ -1600,8 +1600,8 @@ implicitly (`normalize_path` is explicit).
 Codecs: `int_json`, `string_json`, `bool_json`, `decimal_json`, `float_json`,
 `bytes_json`, `unit_json`, `json_json`, `char_json` (a string of one
 character), `instant_json` and `duration_json` (nanoseconds), and combinators
-`list_json`,
-`option_json`, `result_json`, `map_json`, `string_map_json`. Entry points:
+`list_json`, `array_json` (a JSON array, as a list is), `option_json`,
+`result_json`, `map_json`, `string_map_json`. Entry points:
 `decode_bytes`, `decode_string`, `encode_bytes`, `encode_string`, `parse`,
 `parse_string`, `to_bytes`, `to_string`. `error_to_string` gives
 `$.lines[2].unit_price: expected a number, found a string`.
@@ -2845,9 +2845,9 @@ named rather than entered.
 Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
 `string_bin`, `bytes_bin`, `char_bin`, `u8_bin` … `u128_bin`, `i8_bin` …
 `i128_bin`, `instant_bin`, `duration_bin`, `ordering_bin`, `rounding_bin`, and
-combinators `list_bin`, `option_bin`,
-`result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*` and `take_*` are
-public too.
+combinators `list_bin`, `array_bin` (written as a list is, under a shape of its
+own), `option_bin`, `result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*`
+and `take_*` are public too.
 
 ### 13.38 `std.show`
 
