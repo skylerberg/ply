@@ -1221,7 +1221,8 @@ effect, or write `test/nondet "label" { ... }`, which is never cached.
 
 Tests whose footprints do not conflict run concurrently, under `parallel`
 blocks (§5.9) on one thread per core; a test whose effects are all discharged in
-a region conflicts with nothing. `--jobs N`/`-j` deals them into `N` lanes, each
+a region conflicts with nothing. A raise is in no footprint, since the run
+answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, each
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.
 
@@ -2769,8 +2770,8 @@ pub fn ilog2(n: Int) -> Int
 ```
 
 `min` and `max` are prelude builtins and stay there. `abs`, `sign`, `clamp`,
-`sum` and `product` take any numeric type (§4.5) and raise where its operators
-raise, so `abs(min_int())` and a width's overflowing `sum` raise; an empty
+`sum` and `product` take any numeric type (§4.5) and cannot raise:
+`abs(min_int())` and a width's overflowing `sum` end the run (§2.4); an empty
 list's `sum` is zero and its `product` one. The rest is `Int`. `gcd` and `lcm`
 are never negative, and `gcd(0, 0)` is `0`. `is_prime` says no for zero, one and
 every negative, `factorial` is `1` at and below one, `isqrt` is the greatest
