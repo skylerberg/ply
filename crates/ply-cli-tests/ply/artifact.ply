@@ -8,7 +8,7 @@ import harness (scratch, Source, program, project, write, on_disk, spawned, said
                 Reached, Shelf)
 import compiler.plyx (Header, Section, Placed, decode, encode, digest_of, domain, offset_digest,
                       format)
-import cli.gzip (gzip, gunzip)
+import cli.gzip (gunzip)
 import std.bytes (u32_le, u32_at, hex_of)
 import std.fs (fs)
 import std.json
@@ -225,19 +225,13 @@ fn with_files(p: Parts, files: List<Source>) -> Parts =
     ),
   })
 
-// The unit's C, which the section holds gzipped after its length.
-fn unit_text(p: Parts) -> String = {
-  let s = section(p, b"unit");
-  match gunzip(bytes_slice(s.payload, 4, 4 + word(s.payload, 0))) {
-    Ok(c) -> string_of_bytes(c),
-    Err(why) -> panic("the unit does not unpack: " ++ why),
+// What the runnable holds, unpacked: its files, its front end's answer and its unit's C, each
+// spelled out in the value encoding.
+fn runnable_text(p: Parts) -> String =
+  match gunzip(section(p, b"runnable").payload) {
+    Ok(b) -> string_of_bytes_lossy(b),
+    Err(why) -> panic("the runnable does not unpack: " ++ why),
   }
-}
-
-fn with_unit_text(p: Parts, c: String) -> Parts = {
-  let packed = gzip(bytes_of_string(c));
-  replaced(p, { name: b"unit", count: 1, payload: bytes_concat(u32_le(bytes_len(packed)), packed) })
-}
 
 fn filled(byte: Int) -> Bytes = bytes_concat_all(map(range(0, 32), |_i: Int| byte_of_int(byte)))
 
@@ -255,7 +249,7 @@ test "an artifact read back section by section and written again is the same byt
       shipped_files(p),
     );
     assert(sealed(rewritten) == b, Some("a section read and written back moved the bytes"));
-    assert(truth(at(ran_bytes("again.plyx", sealed(with_unit_text(p, unit_text(p)))), "ok")), None)
+    assert(truth(at(ran_bytes("again.plyx", sealed(rewritten)), "ok")), None)
   })
 }
 
@@ -311,7 +305,7 @@ test "an artifact carries no test, no law and nothing unreached" {
       Some("no test key may appear: " ++ listed),
     );
     // A test or a law is declared by its name, so a closure that spells neither declares neither.
-    let shipped = [string_of_bytes_lossy(b), unit_text(p)];
+    let shipped = [string_of_bytes_lossy(b), runnable_text(p)];
     fold(
       ["unreached", "announce", "shade reads a payload", "even and odd disagree"],
       (),
@@ -414,6 +408,18 @@ test "a closure that is not the closure is refused" {
         )
       },
     )
+  })
+}
+
+// A runnable is held to the artifact around it: one another build wrote is not this program.
+test "a runnable that is not the artifact's is refused" {
+  scratch(|| {
+    program(source());
+    let p = parts_of(built());
+    program("fn main() -> Int = 7\n");
+    let other = parts_of(built_to("other.plyx"));
+    let report = ran_bytes("t.plyx", sealed(replaced(p, section(other, b"runnable"))));
+    assert(code_of(report) == "E0443", Some(shown(report)))
   })
 }
 
@@ -913,45 +919,6 @@ test "a build schema that names nothing is refused at build time" {
     assert(string_contains(said(out), "E0440"), Some(said(out)));
     assert(string_contains(said(out), "this program has: m.spec"), Some(said(out)));
     assert(!fs.exists[cwd]("x.plyx"), None)
-  })
-}
-
-// The unit's own table opens `"helpers <n>\n"`, then one line per helper:
-// `"<name> <args> <answers>\n"`, bound by position.
-fn first_helper(c: String) -> String =
-  match string::split_once(c, "const char ply_exports[] =\n") {
-    None -> panic("the unit carries no table"),
-    Some(p) -> match string_split(p.tail, "\n") {
-      [count, helper, ..] -> if string_starts_with(count, "\"helpers ") { helper ++ "\n" }
-      else { panic("the table does not open with its helpers: " ++ count) },
-      _ -> panic("the table holds no helper"),
-    },
-  }
-
-fn taking_one_more(line: String) -> String =
-  match string_split(line, " ") {
-    [name, args, answers] -> match string::int_of_string(args) {
-      Some(n) -> name ++ " " ++ int_to_string(n + 1) ++ " " ++ answers,
-      None -> panic("a helper's arity is a number: " ++ line),
-    },
-    _ -> panic("a helper's line is three fields: " ++ line),
-  }
-
-// "Another runtime": the unit's own helper table is rewritten so its first helper takes one argument
-// more.
-test "a unit built for another runtime is left aside with a warning" {
-  scratch(|| {
-    program("fn main() -> Int = 6 * 7\n");
-    let p = parts_of(built());
-    let c = unit_text(p);
-    let line = first_helper(c);
-    assert(string::count(c, line) == 1, Some("the unit's table names its first helper once"));
-    put("m.plyx", sealed(with_unit_text(p, string::replace(c, line, taking_one_more(line)))));
-    let out = on_disk(["run", "m.plyx"]);
-    assert(out.code == 0, Some(said(out)));
-    assert(string_contains(said(out), "built for another runtime"), Some(said(out)));
-    let v = ran("m.plyx");
-    assert(str(at(v, "value")) == "42", Some(shown(v)))
   })
 }
 

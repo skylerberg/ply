@@ -5,14 +5,13 @@
 //! not nest on a thread — so all of it lives here, on the machine's own thread, and the answers
 //! cross as values.
 
-use crate::artifact::{self, Artifact};
 use crate::config::Configuration;
 use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
 use crate::support::{select_profile, unit_of};
 use ply_eval::{
-    Analysis, CheckOutput, Diagnostic, Ended, ModuleName, SourceMap, Span, Symbol,
+    Analysis, CheckOutput, DefHash, Diagnostic, Ended, ModuleName, SourceMap, Span, Symbol,
     Value as PlyValue, codes,
 };
 use ply_host::process::{Executables, ProcessHost, Sink, Stream};
@@ -75,21 +74,14 @@ impl Default for RunOptions {
 
 // --- The target ---------------------------------------------------------------
 
-/// A program the front end loaded, with the C of the unit the program emitted for it, or an
-/// artifact opened from its bytes.
-pub enum Target {
-    Project(Box<Loaded>, Vec<u8>),
-    Deployed(Box<Deployment>),
-}
-
-pub struct Deployment {
-    path: String,
-    artifact: Artifact,
-    opened: artifact::Opened,
-    digest: String,
-    /// The embedded unit's C when it is one this runtime can enter; a stale one is left aside.
-    unit: Option<String>,
-    warnings: Vec<Diagnostic>,
+/// A program the front end loaded, with the C of the unit the program emitted for it, or the
+/// program an artifact's runnable holds.
+pub struct Target {
+    loaded: Box<Loaded>,
+    unit: Vec<u8>,
+    /// Opened from an artifact, whose positions are in text printed at build time, which no
+    /// reader wrote.
+    deployed: bool,
 }
 
 /// A load's refusal: the diagnostics, the sources they point into, and the file if one was named.
@@ -97,6 +89,18 @@ pub struct Refused {
     pub diagnostics: Vec<Diagnostic>,
     pub sources: SourceMap,
     pub artifact: Option<String>,
+}
+
+/// A module of an artifact's closure, as its caller read it out.
+pub struct Closed {
+    pub path: String,
+    pub text: String,
+}
+
+/// A name an artifact holds, and the hash of what it names.
+pub struct Hashed {
+    pub name: String,
+    pub hash: DefHash,
 }
 
 impl Target {
@@ -108,12 +112,6 @@ impl Target {
         unit: Option<&[u8]>,
         hermetic: bool,
     ) -> Result<Target, Refused> {
-        if let Some(refused) = library(path) {
-            return Err(refused);
-        }
-        if path.extension().is_some_and(|e| e == artifact::EXTENSION) {
-            return Err(unhanded(path));
-        }
         let (Some(front), Some(unit)) = (front, unit) else {
             return Err(unemitted(path));
         };
@@ -127,110 +125,137 @@ impl Target {
             sources: err.sources,
             artifact: None,
         })?;
-        Ok(Target::Project(Box::new(loaded), unit.to_vec()))
+        Ok(Target {
+            loaded: Box::new(loaded),
+            unit: unit.to_vec(),
+            deployed: false,
+        })
+    }
+
+    /// The program the artifact at `path` holds as its runnable, held to the parts of the artifact
+    /// its caller read and checked: the entry its namespace names, the closure it prints, and the
+    /// hash it files each name under.
+    pub fn deployed(
+        path: &std::path::Path,
+        runnable: &[u8],
+        entry: &str,
+        closure: &[Closed],
+        names: &[Hashed],
+    ) -> Result<Target, Refused> {
+        let about = |message: String| Refused {
+            diagnostics: vec![
+                Diagnostic::error(codes::ARTIFACT_INVALID, message)
+                    .primary(Span::DUMMY, format!("in `{}`", path.display()))
+                    .note("rebuild it with `ply build`, or transfer the file again"),
+            ],
+            sources: SourceMap::new(),
+            artifact: Some(path.display().to_string()),
+        };
+        let held = crate::runnable::decode(runnable)
+            .map_err(|why| about(format!("the artifact's runnable does not read: {why}")))?;
+        if held.entry != entry {
+            return Err(about(format!(
+                "the artifact's runnable enters `{}`, and its namespace names `{entry}`",
+                held.entry
+            )));
+        }
+        let printed = held
+            .front
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.text.as_str()));
+        if closure.len() > held.front.files.len()
+            || !closure
+                .iter()
+                .map(|c| (c.path.as_str(), c.text.as_str()))
+                .eq(printed.take(closure.len()))
+        {
+            return Err(about(
+                "the artifact's closure is not the program its runnable holds".to_string(),
+            ));
+        }
+        let loaded =
+            crate::driver::load_over_analysis_taken(crate::load::project_root(path), held.front)
+                .map_err(|err| Refused {
+                    diagnostics: err.diagnostics,
+                    sources: SourceMap::new(),
+                    artifact: Some(path.display().to_string()),
+                })?;
+        let hashes = &loaded.front.hashes;
+        if let Some(named) = names.iter().find(|n| {
+            let symbol = Symbol::new(&n.name);
+            hashes.defs.get(&symbol) != Some(&n.hash) && hashes.decls.get(&symbol) != Some(&n.hash)
+        }) {
+            return Err(about(format!(
+                "the closure does not define `{}` as the artifact does",
+                named.name
+            )));
+        }
+        let known: std::collections::BTreeSet<(&str, DefHash)> =
+            names.iter().map(|n| (n.name.as_str(), n.hash)).collect();
+        let printed = |name: &Symbol| {
+            name.as_str()
+                .rsplit_once('.')
+                .is_some_and(|(module, _)| !crate::shelf::is_shipped_name(module))
+        };
+        if let Some((name, _)) = hashes
+            .defs
+            .iter()
+            .chain(&hashes.decls)
+            .find(|(name, hash)| printed(name) && !known.contains(&(name.as_str(), **hash)))
+        {
+            return Err(about(format!(
+                "the closure defines `{name}`, which the artifact's namespace does not name"
+            )));
+        }
+        Ok(Target {
+            loaded: Box::new(loaded),
+            unit: held.unit.into_bytes(),
+            deployed: true,
+        })
     }
 
     pub fn front(&self) -> &Analysis {
-        match self {
-            Target::Project(loaded, _) => &loaded.front,
-            Target::Deployed(d) => &d.opened.front,
-        }
+        &self.loaded.front
     }
 
     pub fn check(&self) -> &CheckOutput {
         &self.front().check
     }
 
-    /// A closure's positions are in text printed at build time, which no reader wrote.
     pub fn sources(&self) -> SourceMap {
-        match self {
-            Target::Project(loaded, _) => loaded.sources.clone(),
-            Target::Deployed(_) => SourceMap::new(),
+        if self.deployed {
+            SourceMap::new()
+        } else {
+            self.loaded.sources.clone()
         }
     }
 
     /// What `load` answers with, as plain data: a `Value` is not `Send`, so the value is built
     /// on the calling thread from this.
     pub fn found_data(&self) -> FoundData {
-        match self {
-            Target::Project(loaded, _) => FoundData::Project {
-                root: loaded.root.display().to_string(),
-                files: loaded.file_names(),
-                places: loaded
-                    .sources
-                    .files()
-                    .iter()
-                    .map(|f| (f.path.display().to_string(), f.text.as_bytes().to_vec()))
-                    .collect(),
-                mains: mains_of(loaded),
-                modules: modules_of(loaded),
-            },
-            Target::Deployed(d) => FoundData::Deployed {
-                path: d.path.clone(),
-                digest: d.digest.clone(),
-                entry: d.opened.entry.as_str().to_string(),
-                definitions: d.artifact.bodies.len(),
-                unit: d.unit.is_some(),
-                warnings: d.warnings.clone(),
-            },
+        let loaded = &self.loaded;
+        FoundData {
+            root: loaded.root.display().to_string(),
+            files: loaded.file_names(),
+            places: loaded
+                .sources
+                .files()
+                .iter()
+                .map(|f| (f.path.display().to_string(), f.text.as_bytes().to_vec()))
+                .collect(),
+            mains: mains_of(loaded),
+            modules: modules_of(loaded),
         }
     }
 
-    /// An artifact runs out of its own verified definitions, not a source tree.
-    pub fn artifact(path: &std::path::Path, bytes: Option<&[u8]>) -> Result<Target, Refused> {
-        if let Some(refused) = library(path) {
-            return Err(refused);
-        }
-        deployment(path, bytes).map(|d| Target::Deployed(Box::new(d)))
-    }
-
-    /// The unit this run evaluates on: an artifact's own as built, else one over the sources.
+    /// The unit this run evaluates on, compiled from the C the target came with.
     fn tier(&self, options: &RunOptions) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
         // Which C compiler ran is no part of what a hermetic run answers.
         if !options.hermetic {
             select_profile(&options.profile)?;
         }
-        match self {
-            Target::Project(loaded, unit) => unit_of(&loaded.front, unit),
-            Target::Deployed(d) => artifact::tier(&d.opened, d.unit.clone()),
-        }
-    }
-}
-
-/// A library is a package to depend on, not a program: reading it as sources would report a
-/// container as text that is not UTF-8.
-fn library(path: &std::path::Path) -> Option<Refused> {
-    path.extension()
-        .is_some_and(|e| e == artifact::LIBRARY_EXTENSION)
-        .then(|| Refused {
-            diagnostics: vec![
-                Diagnostic::error(
-                    codes::ARTIFACT_INVALID,
-                    format!("`{}` is a library, and nothing to run", path.display()),
-                )
-                .primary(Span::DUMMY, "not a program")
-                .note("a `.plyz` is a package: declare it in a `ply.pkg` and depend on it")
-                .note("`ply build` writes a program's artifact as a `.plyx`"),
-            ],
-            sources: SourceMap::new(),
-            artifact: None,
-        })
-}
-
-fn unhanded(path: &std::path::Path) -> Refused {
-    Refused {
-        diagnostics: vec![
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!(
-                    "`{}` is an artifact, and a load opens sources",
-                    path.display()
-                ),
-            )
-            .note("`machine.opened` opens an artifact from the bytes its caller read"),
-        ],
-        sources: SourceMap::new(),
-        artifact: Some(path.display().to_string()),
+        unit_of(&self.loaded.front, &self.unit)
     }
 }
 
@@ -249,32 +274,6 @@ fn unemitted(path: &std::path::Path) -> Refused {
         sources: SourceMap::new(),
         artifact: None,
     }
-}
-
-fn deployment(path: &std::path::Path, bytes: Option<&[u8]>) -> Result<Deployment, Refused> {
-    let about = |diagnostics: Vec<Diagnostic>| Refused {
-        diagnostics,
-        sources: SourceMap::new(),
-        artifact: Some(path.display().to_string()),
-    };
-    let bytes = bytes.ok_or_else(|| about(vec![artifact::unreadable(path)]))?;
-    let (container, mut warnings) = artifact::decode(bytes, path).map_err(|d| about(vec![d]))?;
-    let opened = artifact::open(&container, path).map_err(about)?;
-    let unit = match container.unit.as_ref() {
-        None => None,
-        Some(unit) => artifact::served_text(unit).map_err(|d| about(vec![d]))?,
-    };
-    if container.has_unit() && unit.is_none() {
-        warnings.push(artifact::stale_unit());
-    }
-    Ok(Deployment {
-        path: path.display().to_string(),
-        digest: container.digest_short(),
-        artifact: container,
-        opened,
-        unit,
-        warnings,
-    })
 }
 
 // --- The drive ---------------------------------------------------------------
@@ -330,12 +329,17 @@ impl Drive {
         Ok(Drive::over(options, target))
     }
 
-    pub fn open_artifact(
+    /// The program an artifact holds, from the parts of it its caller read and checked.
+    pub fn open_deployed(
         options: RunOptions,
         path: &std::path::Path,
-        bytes: Option<&[u8]>,
+        runnable: &[u8],
+        entry: &str,
+        closure: &[Closed],
+        names: &[Hashed],
     ) -> Result<Drive, Refused> {
-        Ok(Drive::over(options, Target::artifact(path, bytes)?))
+        let target = Target::deployed(path, runnable, entry, closure, names)?;
+        Ok(Drive::over(options, target))
     }
 
     fn over(options: RunOptions, target: Target) -> Drive {
@@ -362,10 +366,7 @@ impl Drive {
         front: &crate::driver::LoadedAnalysis,
         unit: &[u8],
     ) -> Result<(), Refused> {
-        let path = std::path::PathBuf::from(match &self.target {
-            Target::Project(loaded, _) => loaded.root.display().to_string(),
-            Target::Deployed(d) => d.path.clone(),
-        });
+        let path = self.target.loaded.root.clone();
         self.target = Target::open(&path, Some(front), Some(unit), self.options.hermetic)?;
         self.tier = None;
         self.bound = None;
@@ -756,65 +757,28 @@ pub struct Placed {
     at: At,
 }
 
-/// The load's answer as plain data: what `machine.Project`/`machine.Deployed` carry.
-pub enum FoundData {
-    Project {
-        root: String,
-        files: Vec<String>,
-        places: Vec<(String, Vec<u8>)>,
-        mains: Vec<Named>,
-        modules: Vec<Placed>,
-    },
-    Deployed {
-        path: String,
-        digest: String,
-        entry: String,
-        definitions: usize,
-        unit: bool,
-        warnings: Vec<Diagnostic>,
-    },
+/// The load's answer as plain data: what `machine.Project` carries.
+pub struct FoundData {
+    pub root: String,
+    pub files: Vec<String>,
+    pub places: Vec<(String, Vec<u8>)>,
+    pub mains: Vec<Named>,
+    pub modules: Vec<Placed>,
 }
 
 /// [`FoundData`] as the value the program reads it as. Called on the calling thread.
 pub fn found_value(found: &FoundData, module: &str) -> PlyValue {
-    match found {
-        FoundData::Project {
-            root,
-            files,
-            places,
-            mains,
-            modules,
-        } => crate::payload::ctor(
-            module,
-            "Project",
-            vec![record(vec![
-                ("root", PlyValue::str(root)),
-                ("files", strings(files.iter().map(String::as_str))),
-                ("places", places_value(places)),
-                ("mains", named_values(mains)),
-                ("modules", placed_values(modules)),
-            ])],
-        ),
-        FoundData::Deployed {
-            path,
-            digest,
-            entry,
-            definitions,
-            unit,
-            warnings,
-        } => crate::payload::ctor(
-            module,
-            "Deployed",
-            vec![record(vec![
-                ("path", PlyValue::str(path)),
-                ("digest", PlyValue::str(digest)),
-                ("entry", PlyValue::str(entry)),
-                ("definitions", count(*definitions)),
-                ("unit", PlyValue::Bool(*unit)),
-                ("warnings", diags_value(warnings)),
-            ])],
-        ),
-    }
+    crate::payload::ctor(
+        module,
+        "Project",
+        vec![record(vec![
+            ("root", PlyValue::str(&found.root)),
+            ("files", strings(found.files.iter().map(String::as_str))),
+            ("places", places_value(&found.places)),
+            ("mains", named_values(&found.mains)),
+            ("modules", placed_values(&found.modules)),
+        ])],
+    )
 }
 
 fn places_value(places: &[(String, Vec<u8>)]) -> PlyValue {
