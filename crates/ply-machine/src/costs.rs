@@ -114,6 +114,8 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
     }
     let (packages, mod_pkg, shelf) =
         ply_codegen::c::producer::package_tables(&loaded.front.packages, &loaded.front.mod_pkg);
+    let embeds = ply_codegen::c::producer::embeds_of(&loaded.front)
+        .map_err(|e| failed(&format!("{e:#}")))?;
     let answer = ply_codegen::c::producer::call(
         ENTRY,
         &[
@@ -122,6 +124,7 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
             packages,
             mod_pkg,
             shelf,
+            embeds,
         ],
     )
     .map_err(|e| failed(&format!("{e:#}")))?;

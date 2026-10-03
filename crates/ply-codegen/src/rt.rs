@@ -257,6 +257,8 @@ pub const FAILED_UNWIND: i64 = 4;
 pub const FAILED_ABANDONED: i64 = 5;
 /// The entry spent its step budget without finishing.
 pub const FAILED_OUT_OF_STEPS: i64 = 6;
+/// The task was cancelled: it unwinds to its entry, which reports it cancelled rather than failed.
+pub const FAILED_CANCELLED: i64 = 7;
 
 /// An installed handler: pushed by a `handle` site, searched innermost-out by a `perform`.
 pub struct HandlerFrame {

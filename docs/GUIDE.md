@@ -325,8 +325,9 @@ and kept by a lock that already pins it.
 
 `ply build` records what it resolved in `ply.lock`, beside the package's own
 `ply.pkg`: every dependency's name, its version, and the BLAKE3 digest of the
-modules it contributed, sorted by name, and for a registry dependency the
-`archive` digest it was fetched as. A package is pinned by *what* it is and
+modules it contributed, sorted by name, with what they embed (§3.4), and for a
+registry dependency the `archive` digest it was fetched as. A package is pinned
+by *what* it is and
 never by where it was found, so a moved checkout keeps its pin. A build verifies
 the lock before it writes an artifact — a dependency whose sources moved since it
 was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
@@ -348,6 +349,24 @@ the packages that declare it, then the version and digest it resolved to.
 A command acts on the root package, the one whose tree it was given: a
 dependency's `main` is no entry point, and `ply test` runs the root package's
 tests and never a dependency's, which are that package's own to run.
+
+### 3.4 Embedding files
+
+```ply
+fn schema() -> Bytes = embed("schema.sql")
+fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("fixtures")
+```
+
+`embed("path")` is the bytes of a file, and `embed_dir("path")` every file under
+a directory by its path below it (`a/b.txt`), in that order; nothing under a
+name starting with `.` is read. The path is a string literal (`E0147`), read
+relative to the module's own file when the program is loaded, and the call is
+written out as what was read before anything hashes or checks the module. The
+bytes are therefore part of the definition's hash: a test reading an embedded
+file reruns exactly when the file changes, and is cached while it does not. A
+path that does not exist, a directory handed to `embed`, a file handed to
+`embed_dir`, or a file that cannot be read is `E0146`, which refuses the load. A
+module that declares or imports its own `embed` or `embed_dir` calls that one.
 
 ## 4. Types
 
@@ -473,7 +492,13 @@ Result<a, e>  = Ok(a) | Err(e)
 Ordering      = Less | Equal | Greater
 Rounding      = HalfEven | HalfUp | Down | Up | Ceiling | Floor
 Iter<s, r>    = Continue(s) | Stop(r)
+Instant       = Instant(Int)
+Duration      = Duration(Int)
 ```
+
+`Instant` is a reading of a clock and `Duration` the span between two, both in
+nanoseconds; they are separate types so a deadline cannot be added to a byte
+count. `std.time` builds and reads them (§13.10).
 
 A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
 `None` loses `?`; one that declares its own `Stop` loses `iterate`.
@@ -1016,8 +1041,8 @@ this. `--json` prints one object with each failure's diagnostic, declared
 footprint, suspects, culprit and replay command (`schema_version` 6); the
 suspects are ranked culprits first, then an edited definition before one whose
 hash only moved. Each result counts the operations its test performed,
-handled ones included, as `performs`. `--watch` re-runs on every `.ply` change,
-keeping caches in memory.
+handled ones included, as `performs`. `--watch` re-runs on every `.ply` change
+and on every change to what the last run embedded, keeping caches in memory.
 
 ### 8.5 Coverage and mutants
 
@@ -1048,7 +1073,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled unit cache (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled unit cache, and the compiler's answers to what the runtime asks it, each kept under the emitter, the entry and the question (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them, and the front-end answers `ply run` files (§16) (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -1078,9 +1103,11 @@ scheduler:
 ```ply
 nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write join<a>(t: Task<a>) -> a
-                       write yield() -> Unit }
-nondet effect clock  { read  now() -> Int
-                       write sleep(nanos: Int) -> Unit }
+                       write yield() -> Unit
+                       write cancel<a>(t: Task<a>) -> Bool
+                       write await<a>(t: Task<a>) -> Option<a> }
+nondet effect clock  { read  now() -> Instant
+                       write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
                        write below(bound: Int) -> Int }
 effect sim           { read  seed() -> Int }
@@ -1109,6 +1136,16 @@ effect sim           { read  seed() -> Int }
 * A `parallel` block (§5.9) inside a region runs its branches in turn, so the
   scheduler sees nothing of it. A branch may not open a region (`E0309`): a
   region's schedule is drawn from its entry's seed in the order regions open.
+
+`task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
+it waits on is let go, and it performs nothing more. When it next runs it only
+unwinds, releasing what it holds. The cancel answers `false` for a task that had
+already ended and leaves its answer alone. `task.await(t)` is a join that answers
+`Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
+cancelled task has nothing to answer and raises `E0502`. A task cannot cancel
+itself or the region's body. A deadline is the two together: one task sleeps and
+cancels the other, which a third awaits. Every step a cancelled task took is read
+against the cancel, so the search tries cancelling it earlier and later.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -1748,7 +1785,20 @@ pub nondet effect time {
 pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms}
 pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms}
 pub fn since(started: Int) -> Int / {time.elapsed_ms}
+
+pub fn nanos(n: Int) -> Duration        // also micros, millis, seconds, minutes, hours
+pub fn as_nanos(d: Duration) -> Int     // also as_micros, as_millis, as_seconds, toward zero
+pub fn plus(a: Duration, b: Duration) -> Duration
+pub fn minus(a: Duration, b: Duration) -> Duration
+pub fn scaled(d: Duration, k: Int) -> Duration
+pub fn nanos_at(i: Instant) -> Int
+pub fn after(i: Instant, d: Duration) -> Instant
+pub fn between(earlier: Instant, later: Instant) -> Duration
 ```
+
+The prelude's `Instant` and `Duration` (§4.6) are what the simulation's `clock`
+reads and sleeps in, and these build and read them; every conversion is checked
+arithmetic.
 
 The host's real time, in two readings and a wait, none of them a function of the
 program state, so a definition that takes one is `nondet` and a `test` over it
@@ -2961,7 +3011,8 @@ filed by a compiler whose shipped modules differed says so once, as `W0605`.
 `ply run` over sources goes further: once a load holds, the front end's answer
 is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
 read — the name and bytes of every module the walk read, the root's manifest,
-each dependency's key, manifest and modules, the root's absolute path, the `ply`
+each dependency's key, manifest and modules, what the modules embed, the root's
+absolute path, the `ply`
 program and the modules it ships as the launcher gates them (so `PLY_C_EMITTER`
 too), the binary's version, and `--config-schema`. A later run whose walk hashes
 the same takes that answer and runs neither the front end nor the promise check,
@@ -3075,6 +3126,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0143` | a registry dependency no published version satisfies |
 | `E0144` | a publish or a yank the registry refused |
 | `E0145` | a package or a version no registry takes |
+| `E0146` | an embed whose file or directory could not be read |
+| `E0147` | an embed whose path is not a string literal |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -3161,7 +3214,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   moves between OS threads; only a `parallel` block's branches run on threads
   of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
-  between calls; no cancellation or backpressure; no migrations or live schema
+  between calls; no backpressure; no migrations or live schema
   check; HTTP/1.1 only; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no

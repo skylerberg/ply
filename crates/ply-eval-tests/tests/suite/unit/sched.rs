@@ -153,7 +153,7 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                             let answer = handlers.dispatch(
                                 signature("clock", "sleep").expect("declared"),
                                 task,
-                                &[Value::Int(nanos)],
+                                &[Value::ctor("Duration", vec![Value::Int(nanos)])],
                                 Span::DUMMY,
                             )?;
                             match answer {
