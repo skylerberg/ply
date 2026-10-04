@@ -38,8 +38,11 @@ pub fn aside() -> String {
 }
 
 /// What a set of modules is, as `(path, text)` pairs in any order.
-pub fn digest_of(modules: &[(String, String)]) -> String {
-    let mut sorted: Vec<&(String, String)> = modules.iter().collect();
+pub fn digest_of<T: AsRef<str>>(modules: &[(String, T)]) -> String {
+    let mut sorted: Vec<(&str, &str)> = modules
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_ref()))
+        .collect();
     sorted.sort();
     let mut h = blake3::Hasher::new();
     for (name, text) in sorted {
@@ -59,7 +62,9 @@ pub fn identity() -> String {
         .get_or_init(|| {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"ply builder 1\0");
-            hasher.update(digest_of(crate::shipped_modules::sources()).as_bytes());
+            // A stage's name: what it holds is a product of it, so reading it is no test's input.
+            let shipped = ply_pack::unrecorded(crate::shipped_modules::sources);
+            hasher.update(digest_of(&shipped).as_bytes());
             hasher.update(&[0]);
             hasher.update(ply_codegen::c::runtime_digest().as_bytes());
             hasher.finalize().to_hex()[..16].to_string()

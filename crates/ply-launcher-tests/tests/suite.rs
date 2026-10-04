@@ -4,10 +4,10 @@
 /// This test binary's pack is the checkout it was built in, as `ply`'s is the one appended to it.
 #[ctor::ctor(unsafe)]
 fn pack() {
-    ply_pack::install_checkout(std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../.."
-    )));
+    ply_machine::tested::installed(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")),
+        concat!(env!("CARGO_PKG_NAME"), "::", env!("CARGO_CRATE_NAME")),
+    );
 }
 
 /// The counting allocator is a whole-binary decision, so this test binary installs it too, which
@@ -305,7 +305,10 @@ fn the_builder_these_sources_make_builds_the_program_and_it_runs() {
     .expect("the project is written");
     let program = ply_launcher::Program {
         runnable,
-        shipped_modules: ply_machine::shipped_modules::sources().to_vec(),
+        shipped_modules: ply_machine::shipped_modules::sources()
+            .into_iter()
+            .map(|(name, text)| (name, text.to_string()))
+            .collect(),
         stage: ply_launcher::shipped::own_stage_name(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };

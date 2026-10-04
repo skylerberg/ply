@@ -6,7 +6,6 @@
 
 use ply_eval::ModuleName;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 /// The reserved first segments the standard library's and the compiler's modules answer to.
 pub const STD_ROOT: &str = "std";
@@ -32,41 +31,59 @@ pub fn is_shipped_name(name: &str) -> bool {
     ply_eval::host::is_std(name) || is_compiler(name)
 }
 
-/// Every shipped module as `(name, text)`: the standard library's, the compiler's, then what the
-/// compiler embeds from beside its package. Read once: the front end and the emitter must be
-/// handed the same bytes, or they resolve the same module two ways.
-pub fn sources() -> &'static [(String, String)] {
-    static SOURCES: OnceLock<Vec<(String, String)>> = OnceLock::new();
-    SOURCES.get_or_init(|| {
-        let pack = ply_pack::installed();
-        let named = |root: &'static str, dir: &'static str| {
-            pack.files_in(dir).map(move |path| {
-                let stem = path[dir.len() + 1..].trim_end_matches(".ply");
-                (format!("{root}.{stem}"), text(path))
-            })
-        };
-        named(STD_ROOT, ply_pack::STD)
-            .chain(named(COMPILER_ROOT, ply_pack::COMPILER))
-            .chain([(
-                format!("{COMPILER_ROOT}.{PRELUDE_NAME}"),
-                text(ply_pack::PRELUDE),
-            )])
-            .collect()
-    })
+/// Every shipped module's name: the standard library's, the compiler's, then what the compiler
+/// embeds from beside its package. No text is read.
+pub fn names() -> Vec<String> {
+    let pack = ply_pack::installed();
+    let named = |root: &'static str, dir: &'static str| {
+        pack.files_in(dir).map(move |path| {
+            let stem = path[dir.len() + 1..].trim_end_matches(".ply");
+            format!("{root}.{stem}")
+        })
+    };
+    named(STD_ROOT, ply_pack::STD)
+        .chain(named(COMPILER_ROOT, ply_pack::COMPILER))
+        .chain([format!("{COMPILER_ROOT}.{PRELUDE_NAME}")])
+        .collect()
 }
 
-fn text(path: &str) -> String {
-    ply_pack::installed()
-        .text(path)
-        .unwrap_or_else(|| panic!("the pack lists `{path}` and carries it"))
-        .to_string()
+/// Whether `module` is one this binary ships, read off the listing.
+pub fn ships(module: &ModuleName) -> bool {
+    names().iter().any(|name| name == module.as_str())
+}
+
+/// Every shipped module as `(name, text)`, in [`names`]'s order. The pack reads each file once, so
+/// the front end and the emitter are handed the same bytes.
+pub fn sources() -> Vec<(String, &'static str)> {
+    names()
+        .into_iter()
+        .filter_map(|name| {
+            let text = source(&ModuleName::from_dotted(&name))?;
+            Some((name, text))
+        })
+        .collect()
+}
+
+/// Where the pack carries a shipped module.
+fn path_of(module: &str) -> Option<String> {
+    if module == format!("{COMPILER_ROOT}.{PRELUDE_NAME}") {
+        return Some(ply_pack::PRELUDE.to_string());
+    }
+    let (dir, stem) = match module.split_once('.')? {
+        (STD_ROOT, stem) => (ply_pack::STD, stem),
+        (COMPILER_ROOT, stem) => (ply_pack::COMPILER, stem),
+        _ => return None,
+    };
+    Some(format!("{dir}/{stem}.ply"))
 }
 
 pub fn source(module: &ModuleName) -> Option<&'static str> {
-    sources()
-        .iter()
-        .find(|(name, _)| name == module.as_str())
-        .map(|(_, text)| text.as_str())
+    let path = path_of(module.as_str())?;
+    let text = ply_pack::installed().bytes(&path)?;
+    Some(
+        std::str::from_utf8(text)
+            .unwrap_or_else(|e| panic!("`{path}` in the pack is not UTF-8: {e}")),
+    )
 }
 
 pub fn pseudo_path(module: &ModuleName) -> PathBuf {

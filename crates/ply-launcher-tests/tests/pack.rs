@@ -4,6 +4,15 @@
 use ply_pack::Pack;
 use std::path::{Path, PathBuf};
 
+/// This test binary's pack is the checkout it was built in, and what each test reads of it is traced.
+#[ctor::ctor(unsafe)]
+fn pack() {
+    ply_machine::tested::installed(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")),
+        concat!(env!("CARGO_PKG_NAME"), "::", env!("CARGO_CRATE_NAME")),
+    );
+}
+
 fn repo() -> PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).to_path_buf()
 }
@@ -220,4 +229,29 @@ fn a_manifest_names_its_path_dependencies_and_nothing_else() {
         "crates/ply-prove/ply"
     );
     assert_eq!(ply_pack::normalized("./a//b/./c"), "a/b/c");
+}
+
+#[test]
+fn what_a_process_asks_of_its_pack_is_a_trace_the_pack_answers() {
+    let pack = Pack::of_checkout(&repo()).expect("the checkout packs");
+    ply_pack::record();
+    pack.bytes("crates/ply-std/ply/option.ply")
+        .expect("the pack carries std.option");
+    assert_eq!(pack.files_in("crates/ply-std/ply").count(), {
+        ply_pack::unrecorded(|| pack.files_in("crates/ply-std/ply").count())
+    });
+    let lines = pack.asked_lines();
+    let read = lines
+        .iter()
+        .find(|l| l.starts_with("pack\tcrates/ply-std/ply/option.ply\t"))
+        .expect("the read is a line");
+    let listed = lines
+        .iter()
+        .find(|l| l.starts_with("packed\tcrates/ply-std/ply\t"))
+        .expect("the listing is a line");
+    assert_eq!(pack.stands(read), Some(true));
+    assert_eq!(pack.stands(listed), Some(true));
+    let moved = format!("pack\tcrates/ply-std/ply/option.ply\t{}", "0".repeat(64));
+    assert_eq!(pack.stands(&moved), Some(false));
+    assert_eq!(pack.stands("file\trepo\tCargo.toml\t\tabc"), None);
 }

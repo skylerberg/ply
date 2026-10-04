@@ -9,6 +9,15 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// This test binary's pack is the checkout it was built in, and what each test reads of it is traced.
+#[ctor::ctor(unsafe)]
+fn pack() {
+    ply_machine::tested::installed(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")),
+        concat!(env!("CARGO_PKG_NAME"), "::", env!("CARGO_CRATE_NAME")),
+    );
+}
+
 thread_local! {
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
 }

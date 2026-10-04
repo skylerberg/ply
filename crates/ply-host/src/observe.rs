@@ -106,7 +106,20 @@ const STORE: &str = ".ply-cache";
 /// run leaves for the next in.
 pub fn laid_out(shipped_dir: &Path, kept: Vec<PathBuf>) {
     let _ = SHIPPED_DIR.set(shipped_dir.to_path_buf());
+    keeps(kept);
+}
+
+/// The directories this process keeps what one run leaves for the next in.
+pub fn keeps(kept: Vec<PathBuf>) {
     let _ = KEPT.set(kept);
+}
+
+/// `f` runs as the process exits normally, after its `main` returns.
+pub fn at_exit(f: extern "C" fn()) {
+    // SAFETY: `atexit` only records the function, which takes and returns nothing.
+    unsafe {
+        libc::atexit(f);
+    }
 }
 
 fn is_kept(path: &Path) -> bool {

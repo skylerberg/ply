@@ -79,3 +79,34 @@ fn a_programs_definitions_are_each_fn_its_entry_reaches_under_the_hash_that_cove
         "a caller's hash covers what it calls"
     );
 }
+
+/// A Rust test's trace stands while every pack entry and file it read answers as it did.
+#[test]
+fn a_test_s_trace_stands_while_what_it_read_answers_as_it_did() {
+    let repo = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .canonicalize()
+        .expect("the checkout");
+    let bytes = ply_pack::installed()
+        .bytes("crates/ply-std/ply/option.ply")
+        .expect("the pack carries std.option");
+    let option = blake3::hash(bytes).to_hex().to_string();
+    let trace = format!("test\tplay::suite\ta::b\npack\tcrates/ply-std/ply/option.ply\t{option}\n");
+    let read = ply_machine::tested::answered(&trace, &repo).expect("a trace");
+    assert_eq!(
+        (read.binary.as_str(), read.test.as_str()),
+        ("play::suite", "a::b")
+    );
+    assert!(read.stands);
+    let moved = trace.replace(&option, &"0".repeat(64));
+    assert!(
+        !ply_machine::tested::answered(&moved, &repo)
+            .expect("a trace")
+            .stands
+    );
+    let file = format!("{trace}file\trepo\tCargo.toml\t\t{}\n", "0".repeat(64));
+    assert!(
+        !ply_machine::tested::answered(&file, &repo)
+            .expect("a trace")
+            .stands
+    );
+}
