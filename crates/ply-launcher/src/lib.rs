@@ -144,14 +144,24 @@ fn lay_out(
     write_atomically(&dir.join(SHIPPED_MARKER), b"ok")
 }
 
-/// Where the `ply` that started this one asked it to report what it read, begun so that a report
-/// that never finishes is told from one never asked for; and the record the report is made of.
-fn reporting() -> Option<(PathBuf, std::sync::Arc<ply_host::observe::Recorder>)> {
+/// Writes what this `ply` read where the `ply` that started it asked, begun now so that a report
+/// that never finishes is told from one never asked for. It is written when the entry ends, or
+/// wherever the process ends first.
+fn reporting() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
     let file = PathBuf::from(std::env::var_os(ply_host::observe::TRACE_VAR)?);
     std::fs::write(&file, b"").ok()?;
     let recorder = ply_host::observe::begin_process();
     recorder.ran_program();
-    Some((file, recorder))
+    let write: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let binary = ply_host::observe::Binary {
+            shipped: &ply_machine::shipped::module_digest,
+            program: ply_machine::shipped::program_digest(),
+        };
+        let _ = std::fs::write(&file, ply_host::observe::report(&recorder, &binary));
+    });
+    let at_exit = std::sync::Arc::clone(&write);
+    ply_host::observe::reports_with(Box::new(move || at_exit()));
+    Some(write)
 }
 
 /// Enter the program on the command's own big-stack thread; the answer is the exit code it asked
@@ -231,12 +241,8 @@ pub fn run(
     match work {
         Ok(thread) => match thread.join() {
             Ok(answer) => {
-                if let Some((file, recorder)) = reporting {
-                    let binary = ply_host::observe::Binary {
-                        shipped: &ply_machine::shipped::module_digest,
-                        program: ply_machine::shipped::program_digest(),
-                    };
-                    let _ = std::fs::write(file, ply_host::observe::report(&recorder, &binary));
+                if let Some(write) = reporting {
+                    write();
                 }
                 answer
             }
