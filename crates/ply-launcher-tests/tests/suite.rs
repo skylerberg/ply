@@ -350,3 +350,55 @@ fn a_text_that_enters_what_a_built_program_does_is_not_built_again() {
         "a text whose entry reaches another body is built"
     );
 }
+
+/// The value a runnable's `m.main` answers.
+fn answer_of(runnable: &[u8]) -> ply_eval::Value {
+    let program = ply_machine::runnable::decode(runnable)
+        .unwrap_or_else(|why| panic!("the runnable reads: {why}"));
+    let front = program.front.answer;
+    let unit =
+        ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C toolchain");
+    Machine::new(&front, unit.attach())
+        .expect("the unit was compiled from this program")
+        .call("m.main", Vec::new(), Span::DUMMY)
+        .into_parts()
+        .0
+        .expect("the entry ran")
+}
+
+/// A build after one body moved reads every module that did not move, and that reaches none that
+/// did, through what the build before it kept: here `lib` and the shipped module it imports. The
+/// program it makes is the program its sources say, and a file `lib` embeds is one of them.
+#[test]
+fn a_program_built_through_what_its_last_build_kept_is_the_program() {
+    let id = std::process::id();
+    let stage = ply_codegen::c::stage::stage_dir(&format!("kept-modules-{id}"));
+    let src = stage.join("src");
+    std::fs::create_dir_all(&src).expect("the sources' directory");
+    std::fs::write(
+        src.join("lib.ply"),
+        "import std.math (abs)\n\npub fn far(a: Int, b: Int) -> Int = abs(a - b) + bytes_len(embed(\"n.txt\"))\n\ntest \"far\" { assert_eq(far(2, 9), 8) }\n",
+    )
+    .expect("the library is written");
+    std::fs::write(src.join("n.txt"), "x").expect("the embedded file is written");
+    let rows = format!("kept-modules-test-{id}");
+    let build = |name: &str, more: i64| {
+        std::fs::write(
+            src.join("m.ply"),
+            format!("import lib\n\npub fn main() -> Int = lib::far(2, 9) + {more} + {id} - {id}\n"),
+        )
+        .expect("the entry's module is written");
+        let out = stage.join(name);
+        ply_machine::builds::build_by_own(&src, ".", "m.main", &out, &rows)
+            .unwrap_or_else(|d| panic!("this tree's builder builds `{name}`: {d}"));
+        std::fs::read(&out).expect("the runnable is read")
+    };
+    let first = build("first.run", 1);
+    let second = build("second.run", 2);
+    std::fs::write(src.join("n.txt"), "xyz").expect("the embedded file is written again");
+    let third = build("third.run", 2);
+    let _ = std::fs::remove_dir_all(&stage);
+    assert_eq!(answer_of(&first), ply_eval::Value::Int(9));
+    assert_eq!(answer_of(&second), ply_eval::Value::Int(10));
+    assert_eq!(answer_of(&third), ply_eval::Value::Int(12));
+}
