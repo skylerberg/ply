@@ -38,20 +38,55 @@ fn a_run_is_traced_by_what_it_read_under_the_root_that_holds_it() {
     let recorder = observe::begin(m);
     observe::read(m, Read::File, &dir.path().join("src/a.ply"));
     observe::read(m, Read::Dir, &dir.path().join("src"));
-    observe::read(m, Read::Dir, &dir.path().join("work"));
     observe::wrote(m, &dir.path().join("out"));
     observe::read(m, Read::File, &dir.path().join("out/b.ply"));
-    observe::wrote(m, &dir.path().join("work/c.ply"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
     observe::end(&recorder);
-    // What it wrote is its own, and so is a directory it wrote into, whenever it listed it.
-    assert_eq!(lines(&trace), ["dir\tcwd\tsrc", "file\tcwd\tsrc/a.ply"]);
+    // What it wrote is its own: reading it back is no input.
+    assert_eq!(lines(&trace), ["dir\tcwd\tsrc\t", "file\tcwd\tsrc/a.ply\t"]);
     let probe = MachineId::next();
     assert!(observe::unchanged(&trace, &world(&roots, "b"), probe));
     std::fs::write(dir.path().join("src/b.ply"), b"new").unwrap();
     assert!(!observe::unchanged(&trace, &world(&roots, "b"), probe));
     std::fs::remove_file(dir.path().join("src/b.ply")).unwrap();
     std::fs::write(dir.path().join("src/a.ply"), b"two").unwrap();
+    assert!(!observe::unchanged(&trace, &world(&roots, "b"), probe));
+}
+
+#[test]
+fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("pkg");
+    std::fs::create_dir(&pkg).unwrap();
+    std::fs::write(pkg.join("a.ply"), b"a").unwrap();
+    std::fs::write(pkg.join("left over"), b"by another test").unwrap();
+    let roots = rooted(dir.path());
+    let m = MachineId::next();
+    let recorder = observe::begin(m);
+    // Listed, emptied of what was left there, and written into.
+    observe::read(m, Read::Dir, &pkg);
+    observe::read(m, Read::Tree, &pkg);
+    std::fs::remove_file(pkg.join("left over")).unwrap();
+    observe::wrote(m, &pkg.join("left over"));
+    std::fs::create_dir(pkg.join(".cache")).unwrap();
+    std::fs::write(pkg.join(".cache/entry"), b"kept").unwrap();
+    observe::wrote(m, &pkg.join(".cache/entry"));
+    let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
+    observe::end(&recorder);
+    assert_eq!(
+        lines(&trace),
+        [
+            "dir\tcwd\tpkg\t.cache\u{1f}left over",
+            "tree\tcwd\tpkg\t.cache/entry\u{1f}left over"
+        ]
+    );
+    let probe = MachineId::next();
+    // Another run leaves something else there, which this one would have removed.
+    std::fs::write(pkg.join("left over"), b"by yet another").unwrap();
+    std::fs::write(pkg.join(".cache/entry"), b"moved").unwrap();
+    assert!(observe::unchanged(&trace, &world(&roots, "b"), probe));
+    // A module added beside the ones it read is not its own.
+    std::fs::write(pkg.join("b.ply"), b"b").unwrap();
     assert!(!observe::unchanged(&trace, &world(&roots, "b"), probe));
 }
 
@@ -121,7 +156,7 @@ fn an_adopted_machine_is_observed_into_its_parent_until_the_record_ends() {
     observe::end(&recorder);
     observe::read(child, Read::Kind, &dir.path().join("y"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    assert_eq!(lines(&trace), ["kind\tcwd\tx"]);
+    assert_eq!(lines(&trace), ["kind\tcwd\tx\t"]);
 }
 
 #[test]
@@ -142,7 +177,7 @@ fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_i
     // A program that is not `ply` never begins its report.
     let _other = observe::child_trace(m).unwrap();
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    assert_eq!(lines(&trace), ["file\tcwd\ta.ply", "shipped\tstd.list"]);
+    assert_eq!(lines(&trace), ["file\tcwd\ta.ply\t", "shipped\tstd.list"]);
     // The child's binary answered, not ours.
     assert!(trace.contains("shipped\tstd.list\tits own digest\n"));
     let unfinished = observe::child_trace(m).unwrap();

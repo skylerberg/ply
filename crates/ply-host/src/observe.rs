@@ -5,8 +5,9 @@
 //!
 //! A machine is observed when the tester begins it; one run on its behalf (a nested machine a
 //! command drives) is adopted into the same record. What the test writes is its own: a read under a
-//! path it wrote, or of a directory it wrote into, is not an input, nor is one under a directory a
-//! run keeps for the next, where what is there is a product of its key. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
+//! path it wrote is not an input, and a directory it wrote into is read without what it wrote there.
+//! Nor is a read under a directory a run keeps for the next one an input, since what is there is a
+//! product of its key. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
 //! process read; a program that is not `ply` reports nothing and is the environment, as the clock
 //! and the network are. A `ply` that ended without finishing its report leaves the record
 //! incomplete, which files no pass.
@@ -25,6 +26,9 @@ const END: &str = "end";
 
 /// The digest of a line two answers disagreed on, which nothing answers again.
 const SPLIT: &str = "split";
+
+/// Between the paths a listing leaves out, which no name holds.
+const OWN: char = '\u{1f}';
 
 /// How a path was read, which is how it is read again to see whether it moved.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -353,8 +357,9 @@ fn located(root: &str, rest: &str, roots: &[(String, PathBuf)]) -> Option<PathBu
     })
 }
 
-/// What `how` answers of `path` now, as the digest a trace holds.
-fn answered(how: Read, path: &Path) -> String {
+/// What `how` answers of `path` now, as the digest a trace holds, leaving out what lies at `own`
+/// below it: the paths the test wrote there.
+fn answered(how: Read, path: &Path, own: &[PathBuf]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(how.word().as_bytes());
     hasher.update(&[0]);
@@ -373,6 +378,7 @@ fn answered(how: Read, path: &Path) -> String {
                 let mut names: Vec<String> = entries
                     .flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| !own.iter().any(|o| o == Path::new(name)))
                     .collect();
                 names.sort();
                 hasher.update(b"names\0");
@@ -394,12 +400,12 @@ fn answered(how: Read, path: &Path) -> String {
             };
             hasher.update(kind.as_bytes());
         }
-        Read::Tree => tree_into(&mut hasher, path, Path::new("")),
+        Read::Tree => tree_into(&mut hasher, path, Path::new(""), own),
     }
     hasher.finalize().to_hex().to_string()
 }
 
-fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path) {
+fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[PathBuf]) {
     let Ok(entries) = std::fs::read_dir(root.join(below)) else {
         hasher.update(b"none");
         return;
@@ -408,6 +414,9 @@ fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path) {
     names.sort();
     for name in names {
         let rel = below.join(&name);
+        if own.iter().any(|o| rel.starts_with(o)) {
+            continue;
+        }
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(&[0]);
         match std::fs::symlink_metadata(root.join(&rel)) {
@@ -416,7 +425,7 @@ fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path) {
             }
             Ok(m) if m.is_dir() => {
                 hasher.update(b"dir\0");
-                tree_into(hasher, root, &rel);
+                tree_into(hasher, root, &rel, own);
             }
             Ok(_) => {
                 hasher.update(b"file\0");
@@ -438,9 +447,10 @@ pub struct World<'a> {
     pub binary: Binary<'a>,
 }
 
-/// A trace: one line a read, sorted — `<how>\t<root>\t<path>\t<digest>`, the root empty for a path
-/// no root of the run holds; `shipped\t<module>\t<digest>`; `program\t<digest>`; and
-/// `binding\t<digest>` for a run that reached a host handler, whose verdict is the binding's.
+/// A trace: one line a read, sorted — `<how>\t<root>\t<path>\t<own>\t<digest>`, the root empty for
+/// a path no root of the run holds and `own` the paths below it the read leaves out;
+/// `shipped\t<module>\t<digest>`; `program\t<digest>`; and `binding\t<digest>` for a run that
+/// reached a host handler, whose verdict is the binding's.
 pub type Trace = String;
 
 /// What `recorder` came to, read against `world`; `None` when something it did no trace can stand
@@ -451,25 +461,28 @@ pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<
     if !observed.opaque.is_empty() {
         return None;
     }
-    let written = |how: Read, path: &Path| {
-        observed
-            .writes
-            .iter()
-            .any(|w| path.starts_with(w) || (how != Read::File && w.starts_with(path)))
-    };
     let mut lines = digested(&observed, &world.binary);
     if hosted {
         lines.insert("binding".to_string(), world.binding.clone());
     }
     let roots = world.roots.unwrap_or_default();
     for (how, path) in &observed.reads {
-        if written(*how, path) {
+        if observed.writes.iter().any(|w| path.starts_with(w)) {
             continue;
         }
+        let own = own_below(*how, path, &observed.writes);
         let (root, rest) = rooted(path, roots);
+        let listed: Vec<String> = own
+            .iter()
+            .map(|o| o.to_string_lossy().into_owned())
+            .collect();
         lines.insert(
-            format!("{}\t{root}\t{rest}", how.word()),
-            answered(*how, path),
+            format!(
+                "{}\t{root}\t{rest}\t{}",
+                how.word(),
+                listed.join(&OWN.to_string())
+            ),
+            answered(*how, path, &own),
         );
     }
     Some(
@@ -478,6 +491,24 @@ pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<
             .map(|(at, digest)| format!("{at}\t{digest}\n"))
             .collect(),
     )
+}
+
+/// What a listing of `path` leaves out of `writes`: for a directory, each name the test wrote under
+/// it; for a tree, each path. A file or a kind has nothing below it to leave out.
+fn own_below(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    let below = writes.iter().filter_map(|w| w.strip_prefix(path).ok());
+    let own: BTreeSet<PathBuf> = match how {
+        Read::Dir => below
+            .filter_map(|rest| rest.components().next())
+            .map(|first| PathBuf::from(first.as_os_str()))
+            .collect(),
+        Read::Tree => below
+            .filter(|rest| !rest.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect(),
+        Read::File | Read::Kind => BTreeSet::new(),
+    };
+    own.into_iter().collect()
 }
 
 /// Whether every read `trace` holds still answers as it did, read against `world` now. Each read
@@ -495,15 +526,20 @@ pub fn unchanged(trace: &str, world: &World<'_>, machine: MachineId) -> bool {
                 world.binary.program == *digest
             }
             ["binding", digest] => world.binding == *digest,
-            [how, root, rest, digest] => {
+            [how, root, rest, own, digest] => {
                 let (Some(how), Some(roots)) = (Read::of_word(how), world.roots) else {
                     return false;
                 };
                 let Some(path) = located(root, rest, roots) else {
                     return false;
                 };
+                let own: Vec<PathBuf> = own
+                    .split(OWN)
+                    .filter(|o| !o.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
                 read(machine, how, &path);
-                answered(how, &path) == *digest
+                answered(how, &path, &own) == *digest
             }
             _ => false,
         }
