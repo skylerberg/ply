@@ -48,6 +48,10 @@ pub fn key_of(row: Row, digest: Bytes) -> Option<String> / {abort.raise} =
 /// Whether the store is asked about each of this test's roots on its own.
 pub fn answers_per_root(row: Row, s: Search) -> Bool = row.seeded && row.hash != None && per_root(s)
 
+/// What the store holds under a key: a pass that still stands, one something its run read has moved
+/// under since, naming that read, or a failure.
+pub type Held = | Stands | Moved(String) | Failing
+
 // One test the tree declares, what the store holds under the key its result is filed under, and —
 // when its plan answers root by root — the roots nothing has answered for yet.
 pub type Case = {
@@ -60,9 +64,8 @@ pub type Case = {
   cache_key: Option<String>,
   seeded: Bool,
   nondet: Bool,
-  /// `passed`; `changed`, a pass something its run read has moved under since; `failed`; or
-  /// nothing, when the store holds no result under that key.
-  cached: Option<String>,
+  /// Nothing, when the store holds no result under that key.
+  cached: Option<Held>,
   /// The roots still owed, when the plan is answered root by root; `None` when it is not.
   owed: Option<List<Int>>,
 }
@@ -70,7 +73,7 @@ pub type Case = {
 pub fn case_of(
   row: Row,
   cache_key: Option<String>,
-  cached: Option<String>,
+  cached: Option<Held>,
   owed: Option<List<Int>>,
 ) -> Case =
   {
@@ -86,7 +89,7 @@ pub fn case_of(
     owed: owed,
   }
 
-pub type Reason = | New | Changed | PreviousFailure | Cached | SameCode | Unhashed
+pub type Reason = | New | Changed(String) | PreviousFailure | Cached | SameCode | Unhashed
 
 /// A pass as the store files it: the key, and the trace of what its run read.
 pub type Pass = { key: String, trace: Bytes }
@@ -110,21 +113,21 @@ pub fn reason_of(c: Case) -> Reason =
         Some(roots) -> if len(roots) == 0 { Cached } else { New },
         None -> New,
       },
-      Some(text) -> if text == "passed" { Cached }
-      else if text == "changed" { Changed }
-      else { PreviousFailure },
+      Some(Stands) -> Cached,
+      Some(Moved(what)) -> Changed(what),
+      Some(Failing) -> PreviousFailure,
     }
   }
 
 pub fn decide(cases: List<Case>) -> List<Decision> =
   map(cases, |c: Case| { case: c, reason: reason_of(c) })
 
-/// Every root this test still owes, given what the store holds under each root's own key. A stored
-/// pass is answered; anything else — nothing, or a failure — is owed.
-pub fn owed_roots(roots: List<Int>, held: List<Option<String>>) -> List<Int> / {abort.raise} =
+/// Every root this test still owes, given what the store holds under each root's own key. A pass
+/// that stands is answered; anything else is owed.
+pub fn owed_roots(roots: List<Int>, held: List<Option<Held>>) -> List<Int> / {abort.raise} =
   map(
     filter(range(0, len(roots)), |i: Int| {
-      match list_at(held, i) { Some(Some(word)) -> word != "passed", _ -> true }
+      match list_at(held, i) { Some(Some(Stands)) -> false, _ -> true }
     }),
     |i: Int| at(roots, i),
   )
@@ -257,7 +260,7 @@ pub fn reused(decisions: List<Decision>) -> List<{ index: Int, outcome: String }
 pub fn word(r: Reason) -> String =
   match r {
     New -> "new",
-    Changed -> "changed",
+    Changed(_) -> "changed",
     PreviousFailure -> "previous failure",
     Cached -> "cached",
     SameCode -> "same code",
@@ -268,7 +271,7 @@ pub fn word(r: Reason) -> String =
 
 fn a_hash() -> String = "0707070707070707070707070707070707070707070707070707070707070707"
 
-fn a_case(index: Int, cached: Option<String>) -> Case =
+fn a_case(index: Int, cached: Option<Held>) -> Case =
   {
     index: index,
     label: "doubles",
@@ -282,7 +285,7 @@ fn a_case(index: Int, cached: Option<String>) -> Case =
     owed: None,
   }
 
-fn reason(index: Int, cached: Option<String>) -> Reason = reason_of(a_case(index, cached))
+fn reason(index: Int, cached: Option<Held>) -> Reason = reason_of(a_case(index, cached))
 
 fn random(roots: Int) -> Search =
   { mode: "random", roots: range(0, roots), budget: 1, steps: 100000, path: [] }
@@ -290,15 +293,14 @@ fn random(roots: Int) -> Search =
 fn dpor() -> Search = { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] }
 
 test "a stored pass is the only thing that keeps a test from running" {
-  assert_eq(reason(0, Some("passed")), Cached);
+  assert_eq(reason(0, Some(Stands)), Cached);
   assert_eq(reason(0, None), New);
-  assert_eq(reason(0, Some("changed")), Changed);
-  assert_eq(reason(0, Some("failed")), PreviousFailure);
-  assert_eq(reason(0, Some("anything else")), PreviousFailure)
+  assert_eq(reason(0, Some(Moved("file\trepo\ta.ply"))), Changed("file\trepo\ta.ply"));
+  assert_eq(reason(0, Some(Failing)), PreviousFailure)
 }
 
 test "a test with no hash runs, because there is no key to have an answer under" {
-  assert_eq(reason_of({ ..a_case(0, Some("passed")), cache_key: None }), Unhashed);
+  assert_eq(reason_of({ ..a_case(0, Some(Stands)), cache_key: None }), Unhashed);
   let row = {
     index: 0,
     label: "t",
@@ -317,7 +319,7 @@ fn sevens() -> String = "7777777777777777777777777777777777777777777777777777777
 test "a new test is answered by its code, and filed again under its own key; nothing else is" {
   let decisions = decide([
     a_case(0, None),
-    a_case(1, Some("failed")),
+    a_case(1, Some(Failing)),
     a_case(2, None),
     { ..a_case(3, None), nondet: true },
     { ..a_case(4, None), hash: None, cache_key: None },
@@ -360,8 +362,11 @@ test "a seeded test's code key is its code and its plan" {
 }
 
 test "`test/nondet` is answered by the store as any test is" {
-  assert_eq(reason_of({ ..a_case(0, Some("passed")), nondet: true }), Cached);
-  assert_eq(reason_of({ ..a_case(0, Some("changed")), nondet: true }), Changed);
+  assert_eq(reason_of({ ..a_case(0, Some(Stands)), nondet: true }), Cached);
+  assert_eq(
+    reason_of({ ..a_case(0, Some(Moved("file\trepo\ta.ply"))), nondet: true }),
+    Changed("file\trepo\ta.ply"),
+  );
   let d = decide([{ ..a_case(0, None), nondet: true }]);
   assert_eq(to_run(d), [0]);
   assert_eq(filed(d, dpor()), [{ index: 0, keys: [a_hash()] }])
@@ -369,10 +374,10 @@ test "`test/nondet` is answered by the store as any test is" {
 
 test "only a cached test is left out, and the run's list is in index order" {
   let cases = [
-    a_case(0, Some("passed")),
+    a_case(0, Some(Stands)),
     a_case(1, None),
-    a_case(2, Some("failed")),
-    a_case(3, Some("changed")),
+    a_case(2, Some(Failing)),
+    a_case(3, Some(Moved("file\trepo\ta.ply"))),
   ];
   let decisions = decide(cases);
   assert_eq(map(decisions, |d: Decision| word(d.reason)), [
@@ -387,7 +392,7 @@ test "only a cached test is left out, and the run's list is in index order" {
 
 test "every reason has the word the report prints" {
   assert_eq(word(New), "new");
-  assert_eq(word(Changed), "changed");
+  assert_eq(word(Changed("file\trepo\ta.ply")), "changed");
   assert_eq(word(PreviousFailure), "previous failure");
   assert_eq(word(Cached), "cached");
   assert_eq(word(SameCode), "same code");
@@ -432,23 +437,20 @@ test "a seeded test whose roots all passed alone is cached, not re-run from root
   let all = decide([{ ..seeded, owed: Some([0, 1, 2, 3]) }]);
   assert_eq(narrowed(all, [0, 1, 2, 3]), []);
   // A stored failure under the plan's key is never trusted, whatever the roots say.
-  assert_eq(reason_of({ ..seeded, cached: Some("failed") }), PreviousFailure);
+  assert_eq(reason_of({ ..seeded, cached: Some(Failing) }), PreviousFailure);
   // And a pass under the plan's key is an answer on its own.
-  assert_eq(reason_of({ ..seeded, cached: Some("passed"), owed: Some([1]) }), Cached)
+  assert_eq(reason_of({ ..seeded, cached: Some(Stands), owed: Some([1]) }), Cached)
 }
 
 test "a failure that owes no root still searches the whole plan" {
-  let failing = decide([{ ..a_case(0, Some("failed")), seeded: true, owed: Some([]) }]);
+  let failing = decide([{ ..a_case(0, Some(Failing)), seeded: true, owed: Some([]) }]);
   assert_eq(to_run(failing), [0]);
   assert_eq(narrowed(failing, [0, 1, 2, 3]), []);
   assert_eq(searched_roots(at(failing, 0).case, [0, 1, 2, 3]), [0, 1, 2, 3])
 }
 
 test "a root is owed unless its own key holds a pass" {
-  assert_eq(owed_roots([0, 1, 2, 3], [Some("passed"), None, Some("failed"), Some("passed")]), [
-    1,
-    2,
-  ]);
+  assert_eq(owed_roots([0, 1, 2, 3], [Some(Stands), None, Some(Failing), Some(Stands)]), [1, 2]);
   assert_eq(owed_roots([4, 5], []), [4, 5]);
   assert_eq(len(seed_keys(a_hash(), [0, 1, 2], [])), 3)
 }
@@ -457,7 +459,7 @@ test "a pass is filed under what the test ran and the plan it answers for" {
   let hermetic = decide([a_case(0, None)]);
   assert_eq(filed(hermetic, dpor()), [{ index: 0, keys: [a_hash()] }]);
   // A cached test runs nothing, so nothing is filed for it.
-  assert_eq(filed(decide([a_case(0, Some("passed"))]), dpor()), []);
+  assert_eq(filed(decide([a_case(0, Some(Stands))]), dpor()), []);
   // A narrowed `random` search files the roots it ran and the key of the whole plan.
   let seeded = { ..a_case(0, None), seeded: true, owed: Some([2, 3]) };
   let four = random(4);

@@ -20,7 +20,7 @@ nondet effect tester {
   read hosted[r]() -> Hosted
   write ended[r]() -> Unit
   read executed[r](unit: Int, index: Int) -> Executed
-  read unchanged[r](trace: Bytes) -> Bool
+  read moved[r](trace: Bytes) -> Option<String>
 }
 
 type Configured = {
