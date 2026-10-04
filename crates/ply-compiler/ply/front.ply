@@ -25,7 +25,7 @@ import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOut
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, Prior, Rehash, Rehashed,
              rehash_index)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
-              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaborated, ended,
+              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, elaborated, ended,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
               builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
@@ -1262,11 +1262,11 @@ pub type Analysis = {
 // A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
 pub type AnalysisOutcome = | Refused(List<Diag>) | Analysed(Analysis)
 
-// A definition's or a test's published rows as the last answer wrote them, under the hash it had
-// then: the checker takes them wherever this program hashes that item the same, and walks the rest.
-// A row's atoms name their effects, which a hash does not pin — a reference is encoded by the hash
-// of what it reaches, so renaming an effect moves nothing. `witness` is the name and hash each of
-// those declarations had, and a row whose witness no longer holds is not a row about this program.
+// A definition's or a test's published rows as the last answer wrote them, under the check key it
+// had then: the checker takes them wherever the item's own form and what it reads of the rest of
+// the program are what they were, and walks the rest. A row's atoms name effects the item may
+// never mention, which its key does not pin. `effect_hashes` is the name and hash each of those
+// declarations had, and a row whose effects no longer hash so is not a row about this program.
 pub type EffectHash = { name: Bytes, hash: Bytes }
 pub type KnownDefRow = {
   name: Bytes,
@@ -1294,18 +1294,20 @@ fn effect_hashes_hold(decls: Map<Bytes, Bytes>, effect_hashes: List<EffectHash>)
   fold(effect_hashes, true, |acc: Bool, entry: EffectHash|
     acc && still_hashed(decls, entry.name, entry.hash))
 
+// How a row is taken: as it is, under the key it was filed with, or not at all.
+type Taking = | TakeWhole | TakeKeyed | TakeNone
+
 fn known_defs(
-  now: Map<Bytes, Bytes>,
-  decls: Map<Bytes, Bytes>,
   rows: List<KnownDefRow>,
+  taking: (KnownDefRow) -> Taking,
 ) -> Map<Bytes, KnownDef> / {abort.raise} =
-  fold(rows, map_new(), |acc: Map<Bytes, KnownDef>, row: KnownDefRow|
-    if !still_hashed(now, row.name, row.hash) || !effect_hashes_hold(decls, row.effect_hashes) {
-      acc
-    } else {
+  fold(rows, map_new(), |acc: Map<Bytes, KnownDef>, row: KnownDefRow| {
+    let how = taking(row);
+    if how == TakeNone { acc } else {
       match ((read_atoms(row.footprint), read_atoms(row.performed), read_atoms(row.scaling))) {
         (Some(footprint), Some(performed), Some(scaling)) ->
           map_insert(acc, row.name, {
+            key: if how == TakeWhole { None } else { Some(row.hash) },
             footprint: footprint,
             performed: performed,
             scaling: scaling,
@@ -1315,55 +1317,100 @@ fn known_defs(
           }),
         _ -> acc,
       }
-    })
+    }
+  })
 
-// Every test's hash this run, by the key `<module>.<label>` a row names it under.
-fn test_hashes(index: Index, hashes: HashOutput) -> Map<Bytes, Bytes> / {abort.raise} =
-  fold(range(0, len(index.tests)), map_new(), |acc: Map<Bytes, Bytes>, i: Int|
-    map_insert(acc, at(index.tests, i).key, at(hashes.tests, i)))
-
-// One slot per `test` of each module, in source order, as `check_tests` walks them. A test's row
-// names its effects exactly as a definition's does, so it is witnessed exactly as one.
+// One slot per `test` of each module, in source order, as `check_tests` walks them.
 fn known_tests(
-  now: Map<Bytes, Bytes>,
-  decls: Map<Bytes, Bytes>,
   mods: List<ParsedModule>,
   rows: List<KnownTestRow>,
-) -> Map<Bytes, List<Option<List<Atom>>>> / {abort.raise} = {
+  taking: (KnownTestRow) -> Taking,
+) -> Map<Bytes, List<Option<KnownTest>>> / {abort.raise} = {
   let by_key = fold(rows, map_new(), |acc: Map<Bytes, KnownTestRow>, r: KnownTestRow|
     map_insert(acc, r.key, r));
-  fold(mods, map_new(), |acc: Map<Bytes, List<Option<List<Atom>>>>, parsed: ParsedModule|
+  fold(mods, map_new(), |acc: Map<Bytes, List<Option<KnownTest>>>, parsed: ParsedModule|
     map_insert(
       acc,
       parsed.name,
-      fold(parsed.module.items, [], |slots: List<Option<List<Atom>>>, item: Item|
+      fold(parsed.module.items, [], |slots: List<Option<KnownTest>>, item: Item|
         match item {
           ITest(d) ->
             push(slots, match map_get(by_key, qualify(parsed.name, d.name)) {
               None -> None,
-              Some(r) -> if still_hashed(now, r.key, r.hash)
-                  && effect_hashes_hold(decls, r.effect_hashes) { read_atoms(r.footprint) }
-              else { None },
+              Some(r) -> {
+                let how = taking(r);
+                if how == TakeNone { None } else {
+                  match read_atoms(r.footprint) {
+                    None -> None,
+                    Some(atoms) ->
+                      Some({
+                        key: if how == TakeWhole { None } else { Some(r.hash) },
+                        footprint: atoms,
+                      }),
+                  }
+                }
+              },
             }),
           _ -> slots,
         }),
     ))
 }
 
+// What each name says to whoever references it, apart from what its checked rows add: a
+// declaration's hash and a definition's contract, both where a name is in two namespaces.
+fn said_of(hashes: HashOutput) -> Map<Bytes, Bytes> =
+  fold(
+    hashes.contracts,
+    by_name_one(hashes.decls),
+    |acc: Map<Bytes, Bytes>, c: { name: Bytes, hash: Bytes }|
+      map_insert(acc, c.name, match map_get(acc, c.name) {
+        Some(decl) -> bytes_concat(decl, c.hash),
+        None -> c.hash,
+      }),
+  )
+
+// The rows a load was handed, each under the check key it was filed with, and what the checker
+// keys this program by. A fixed definition's body is a blank, so the row its package carries is
+// matched under the hash it compiled with and taken as it is; it is keyed all the same, so the
+// row filed for it here stands when its module is read from source again.
 fn known_from_rows(
   mods: List<ParsedModule>,
-  index: Index,
   hashes: HashOutput,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   root: Int,
-) -> Known / {abort.raise} =
-  if len(defs) == 0 && len(tests) == 0 { { ..no_known(), root: root } } else {
-    {
-      defs: known_defs(by_name_one(hashes.checks), by_name_one(hashes.decls), defs),
-      tests: known_tests(test_hashes(index, hashes), by_name_one(hashes.decls), mods, tests),
-      root: root,
-    }
+  fixed: List<Fixed>,
+) -> Known / {abort.raise} = {
+  let decls = by_name_one(hashes.decls);
+  let held = fold(fixed, map_new(), |acc: Map<Bytes, Bytes>, f: Fixed|
+    if f.decl { acc } else { map_insert(acc, f.name, f.hash) });
+  {
+    defs: known_defs(defs, |row: KnownDefRow|
+      if !effect_hashes_hold(decls, row.effect_hashes) { TakeNone } else {
+        match map_get(held, row.name) {
+          Some(h) -> if h == row.hash { TakeWhole } else { TakeNone },
+          None -> TakeKeyed,
+        }
+      }),
+    tests: known_tests(mods, tests, |row: KnownTestRow|
+      if effect_hashes_hold(decls, row.effect_hashes) { TakeKeyed } else { TakeNone }),
+    root: root,
+    keying: Some({
+      own: by_name_one(hashes.own),
+      test_own: hashes.test_texts,
+      reads: by_name_names(hashes.deps),
+      said: said_of(hashes),
+    }),
+  }
+}
+
+// An analysis's own rows, as a second check of the same program takes them: nothing is keyed.
+fn known_own(mods: List<ParsedModule>, rows: Rows, root: Int) -> Known / {abort.raise} =
+  {
+    defs: known_defs(rows.defs, |row: KnownDefRow| TakeWhole),
+    tests: known_tests(mods, rows.tests, |row: KnownTestRow| TakeWhole),
+    root: root,
+    keying: None,
   }
 
 // --- What the front-end cache files ----------------------------------------------
@@ -1448,17 +1495,33 @@ fn walked_of(mods: List<ParsedModule>, checked: CheckOutput) -> WalkedFacts = {
   }
 }
 
+// What each definition's rows are filed under: the check key the checker gave it, and its hash
+// where the checker had nothing to key it by.
+fn check_keys(checked: CheckOutput, hashes: HashOutput) -> Map<Bytes, Bytes> =
+  fold(
+    checked.checks,
+    by_name_one(hashes.defs),
+    |acc: Map<Bytes, Bytes>, c: { name: Bytes, hash: Bytes }| map_insert(acc, c.name, c.hash),
+  )
+
+// A test's, which is its hash where the checker keyed nothing.
+fn test_check_key(checked: CheckOutput, hashes: HashOutput, i: Int) -> Bytes / {abort.raise} =
+  match list_at(checked.test_checks, i) {
+    Some(k) -> if bytes_len(k) > 0 { k } else { at(hashes.tests, i) },
+    None -> at(hashes.tests, i),
+  }
+
 fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.raise} = {
-  let hashed = by_name_one(hashes.checks);
+  let keyed = check_keys(checked, hashes);
   let decls = by_name_one(hashes.decls);
   {
     defs: fold(checked.defs, [], |acc: List<KnownDefRow>, def_info: DefInfo|
-      match map_get(hashed, def_info.name) {
+      match map_get(keyed, def_info.name) {
         Some(x) -> push(acc, def_known_row(decls, def_info, x)),
         None -> acc,
       }),
     tests: map(range(0, len(checked.tests)), |i: Int|
-      test_known_row(decls, at(checked.tests, i), at(hashes.tests, i))),
+      test_known_row(decls, at(checked.tests, i), test_check_key(checked, hashes, i))),
   }
 }
 
@@ -1505,7 +1568,9 @@ derive bin for FiledVariant
 derive bin for FiledOp
 derive bin for DeclInterface
 
-pub type FiledDef = { name: Bytes, hash: Bytes, interface: DefInterface }
+// `hash` names the definition and `check` what its rows are taken under; its interface is filed
+// under both, for whoever asks what a definition of that hash published.
+pub type FiledDef = { name: Bytes, hash: Bytes, check: Bytes, interface: DefInterface }
 
 pub type FiledDecl = { name: Bytes, hash: Bytes, interface: DeclInterface }
 
@@ -1643,19 +1708,18 @@ fn module_entries(f: Filers, parsed: ParsedModule) -> List<FiledEntry> = {
 }
 
 fn tests_by_module(
-  tests: List<TestInfo>,
-  hashes: List<Bytes>,
+  checked: CheckOutput,
+  hashes: HashOutput,
   decls: Map<Bytes, Bytes>,
 ) -> Map<Bytes, List<FiledTest>> / {abort.raise} =
-  fold(range(0, len(tests)), map_new(), |acc: Map<Bytes, List<FiledTest>>, i: Int| {
-    let t = at(tests, i);
-    let h = at(hashes, i);
+  fold(range(0, len(checked.tests)), map_new(), |acc: Map<Bytes, List<FiledTest>>, i: Int| {
+    let t = at(checked.tests, i);
     let filed = {
       name: t.name,
-      hash: h,
+      hash: at(hashes.tests, i),
       nondet: t.nondet,
       span: filed_span(t.at.span),
-      row: test_known_row(decls, t, h),
+      row: test_known_row(decls, t, test_check_key(checked, hashes, i)),
     };
     map_insert(
       acc,
@@ -1706,7 +1770,7 @@ fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
 // Everything the front-end cache files after an analysis, as plain data.
 pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
   let hashed = by_name_one(analysis.hashes.defs);
-  let checked = by_name_one(analysis.hashes.checks);
+  let checked = check_keys(analysis.checked, analysis.hashes);
   let decls = by_name_one(analysis.hashes.decls);
   let types = type_rows(analysis.mods);
   let f: Filers = {
@@ -1723,7 +1787,7 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
     checked: checked,
     decls: decls,
   };
-  let tests = tests_by_module(analysis.checked.tests, analysis.hashes.tests, decls);
+  let tests = tests_by_module(analysis.checked, analysis.hashes, decls);
   let typed = fold(types, [], |acc: List<FiledDecl>, t: TypeRow|
     match map_get(decls, t.name) {
       None -> acc,
@@ -1751,20 +1815,21 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
         tests: match map_get(tests, m.name) { Some(ts) -> ts, None -> [] },
       }
     }),
-    // A definition's interface holds while its check key does, which a body edit in a package it
-    // depends on leaves alone.
+    // A definition's interface holds while its check key does, which a body edit leaves alone
+    // wherever what the edited definition publishes does not move.
     defs: fold(analysis.checked.defs, [], |acc: List<FiledDef>, def_info: DefInfo|
-      match map_get(checked, def_info.name) {
-        None -> acc,
-        Some(h) ->
+      match ((map_get(hashed, def_info.name), map_get(checked, def_info.name))) {
+        (Some(h), Some(k)) ->
           push(acc, {
             name: def_info.name,
             hash: h,
+            check: k,
             interface: {
-              row: def_known_row(decls, def_info, h),
+              row: def_known_row(decls, def_info, k),
               scheme: scheme_text(def_info.scheme),
             },
           }),
+        _ -> acc,
       }),
     decls: fold(analysis.checked.effects, typed, |acc: List<FiledDecl>, effect_info: EffectInfo|
       match map_get(decls, effect_info.name) {
@@ -1968,7 +2033,7 @@ fn analyse_closure(
             let checked: CheckOutput = check_front_with(
               x.r,
               x.mods,
-              known_from_rows(x.mods, built.index, hashes, defs, tests, root_count),
+              known_from_rows(x.mods, hashes, defs, tests, root_count, ifaces.fixed),
             );
             if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
               Analysed({
@@ -2358,12 +2423,12 @@ pub fn claims_in(
   });
   let rows = rows_of(analysis);
   // The analysis held every promise already, so this check of it holds none again.
-  let known = known_from_rows(
+  let known = known_own(
     analysis.mods,
-    analysis.index,
-    analysis.hashes,
-    filter(rows.defs, |row: KnownDefRow| !map_contains(walked, row.name)),
-    rows.tests,
+    {
+      defs: filter(rows.defs, |row: KnownDefRow| !map_contains(walked, row.name)),
+      tests: rows.tests,
+    },
     0,
   );
   match elaboration_with(analysis.r, analysis.mods, known) {
@@ -3943,14 +4008,6 @@ fn footprint_of(outcome: AnalysisOutcome, name: Bytes) -> Bytes / {abort.raise} 
         if def_info.name == name { atoms_text(def_info.footprint, b",") } else { acc }),
   }
 
-fn performed_of(outcome: AnalysisOutcome, name: Bytes) -> Bytes / {abort.raise} =
-  match outcome {
-    Refused(_) -> b"<refused>",
-    Analysed(w) ->
-      fold(w.checked.defs, b"", |acc: Bytes, def_info: DefInfo|
-        if def_info.name == name { atoms_text(def_info.performed, b",") } else { acc }),
-  }
-
 // `say` writes its row and `quiet` writes none, so neither row handed in unifies and the
 // other cannot, in one program and one run.
 fn two_effects() -> List<Source> =
@@ -3966,7 +4023,7 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> / {abort.raise} =
   match analyse(parse_all(sources)) {
     Refused(_) -> panic("the program checks"),
     Analysed(w) -> {
-      let defs = by_name_one(w.hashes.defs);
+      let defs = by_name_one(w.checked.checks);
       let witness = [{ name: b"m.other", hash: held(by_name_one(w.hashes.decls), b"m.other") }];
       map([b"m.say", b"m.quiet"], |n: Bytes|
         {
@@ -4008,7 +4065,7 @@ test "a filing carries exactly the rows the analysis publishes" {
   let rows = rows_of(w);
   assert_eq(map(f.defs, |d: FiledDef| d.interface.row), rows.defs);
   assert_eq(map(f.defs, |d: FiledDef| d.name), map(rows.defs, |row: KnownDefRow| row.name));
-  assert_eq(map(f.defs, |d: FiledDef| d.hash), map(rows.defs, |row: KnownDefRow| row.hash));
+  assert_eq(map(f.defs, |d: FiledDef| d.check), map(rows.defs, |row: KnownDefRow| row.hash));
   assert_eq(len(filed_tests(f)), len(rows.tests));
   assert(
     fold(filed_tests(f), true, |acc: Bool, row: KnownTestRow| acc && has_test_row(rows.tests, row)),
@@ -4025,13 +4082,12 @@ test "an analysis seeded from its own filing answers exactly what a fresh one do
   assert_eq(test_footprint_of(seeded, b"app.says"), b"base.log.write")
 }
 
-// A performed row no body here performs, so a definition published from its row is told from a walked one.
 fn probed(body: Bytes) -> List<Source> =
   [
     {
       name: b"base",
       src: bytes_concat_all([
-        b"effect probe { read peek() -> Int }\npub fn poke() -> Int / {probe.read} = probe.peek()\npub fn one() -> Int = ",
+        b"pub fn one() -> Int = ",
         body,
         b"\npub fn two() -> Int = 2\npub fn three() -> Int = one() + 1\n",
       ]),
@@ -4042,44 +4098,102 @@ fn probed(body: Bytes) -> List<Source> =
     },
   ]
 
-fn sentinel_rows(analysis: Analysis) -> List<KnownDefRow> / {abort.raise} = {
-  let probe = held(by_name_one(analysis.hashes.decls), b"base.probe");
-  let written = fold(
-    analysis.checked.defs,
-    map_new(),
-    |acc: Map<Bytes, Bytes>, def_info: DefInfo|
-      map_insert(acc, def_info.name, atoms_text(def_info.footprint, b",")),
-  );
-  map(analysis.hashes.defs, |x: { name: Bytes, hash: Bytes }|
-    {
-      name: x.name,
-      hash: x.hash,
-      effect_hashes: [{ name: b"base.probe", hash: probe }],
-      footprint: held(written, x.name),
-      performed: b"base.probe.read",
-      scaling: b"",
-      repeats: [],
-      ending: Ends,
-      summary: unknown_summary(),
-    })
+test "an edit walks the edited body, and what references it only where what it publishes moved" {
+  let rows = rows_of(analysis_of(probed(b"1"))).defs;
+  let all = [b"base.one", b"base.two", b"base.three", b"app.four", b"app.five"];
+  assert_eq(seeded_of(analyse_with(parse_all(probed(b"1")), rows, [])), all);
+  // A body edited to answer what it did: `one` is walked, and nothing that references it.
+  assert_eq(seeded_of(analyse_with(parse_all(probed(b"0 + 1")), rows, [])), [
+    b"base.two",
+    b"base.three",
+    b"app.four",
+    b"app.five",
+  ]);
+  // Edited to answer another number, which a caller's ending may read: what references `one` is
+  // walked with it, in its package and in the one that imports it, and nothing else.
+  assert_eq(seeded_of(analyse_with(parse_all(probed(b"11")), rows, [])), [b"base.two", b"app.five"])
 }
 
-test "an edit walks the definitions that depend on it and no others" {
-  let rows = sentinel_rows(analysis_of(probed(b"1")));
-  let kept = analyse_with(parse_all(probed(b"1")), rows, []);
-  assert_eq(len(seeded_of(kept)), len(rows));
-  assert_eq(performed_of(kept, b"base.one"), b"base.probe.read");
-  // One body edited: `one` moves, and with it everything that reaches it, and nothing else.
-  let after = analyse_with(parse_all(probed(b"11")), rows, []);
-  let seeded = seeded_of(after);
-  assert(contains_bytes(seeded, b"base.poke"));
-  assert(contains_bytes(seeded, b"base.two"));
-  assert(contains_bytes(seeded, b"app.five"));
-  assert_eq(len(seeded), 3);
-  assert_eq(performed_of(after, b"base.one"), b"");
-  assert_eq(performed_of(after, b"base.three"), b"");
-  assert_eq(performed_of(after, b"app.four"), b"");
-  assert_eq(performed_of(after, b"app.five"), b"base.probe.read")
+// `leaf` is referenced by `mid` alone, and `mid` by `top`: an edit to `leaf` reaches `top` only
+// through what `mid` publishes.
+fn chained(leaf: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      src: bytes_concat_all([
+        b"effect probe { read peek() -> Int }\nfn leaf(xs: List<Int>) -> Int = ",
+        leaf,
+        b"\nfn mid(xs: List<Int>) -> Int = leaf(xs) + 1\npub fn top(xs: List<Int>) -> Int = mid(xs) + 1\ntest \"top\" { assert_eq(top([]), 2) }\n",
+      ]),
+    },
+  ]
+
+fn test_seeded_of(outcome: AnalysisOutcome) -> List<Bytes> / {abort.raise} =
+  match outcome { Refused(_) -> panic("the program checks"), Analysed(w) -> w.checked.seeded_tests }
+
+test "a body edit stops at the first definition that publishes what it did" {
+  let before = analysis_of(chained(b"len(xs)"));
+  let rows = rows_of(before);
+  let edited = analyse_with(parse_all(chained(b"len(xs) + 0")), rows.defs, rows.tests);
+  assert_eq(seeded_of(edited), [b"m.mid", b"m.top"]);
+  // The test references `top` alone, so it is not walked, though its hash moved with the body.
+  assert_eq(test_seeded_of(edited), [b"m.top"]);
+  match edited {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> assert(w.hashes.tests != before.hashes.tests),
+  };
+  assert_eq(published(edited), published(analyse(parse_all(chained(b"len(xs) + 0")))))
+}
+
+// `mid` reads a field of what `leaf` answers and never names its type.
+fn shaped(fields: Bytes, built: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      src: bytes_concat_all([
+        b"type Shape = { ",
+        fields,
+        b" }\nfn leaf() -> Shape = { ",
+        built,
+        b" }\nfn mid() -> Int = leaf().a\npub fn top() -> Int = mid() + 1\n",
+      ]),
+    },
+  ]
+
+test "a caller is walked again when a type its callee's signature names moved" {
+  let rows = rows_of(analysis_of(shaped(b"a: Int", b"a: 1"))).defs;
+  let edited = analyse_with(parse_all(shaped(b"a: Int, b: Int", b"a: 1, b: 2")), rows, []);
+  assert_eq(seeded_of(edited), [b"m.top"])
+}
+
+// `count` ends by descending `n`, or calls itself with what it was handed.
+fn counting(again: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      src: bytes_concat_all([
+        b"fn count(n: Int) -> Int = if n <= 0 { 0 } else { count(",
+        again,
+        b") }\nfn mid(n: Int) -> Int = count(n) + 1\npub fn top(n: Int) -> Int = mid(n) + 1\nfn aside() -> Int = 3\n",
+      ]),
+    },
+  ]
+
+test "a caller is walked again when how its callee's calls end moved" {
+  let rows = rows_of(analysis_of(counting(b"n - 1"))).defs;
+  let edited = analyse_with(parse_all(counting(b"n")), rows, []);
+  // `mid` may not return now, and so neither may `top`: each published an ending that moved.
+  assert_eq(seeded_of(edited), [b"m.aside"]);
+  assert_eq(published(edited), published(analyse(parse_all(counting(b"n")))))
+}
+
+test "a seeded check files each row under the key a fresh check of the same program does" {
+  let before = rows_of(analysis_of(chained(b"len(xs)")));
+  let fresh = rows_of(analysis_of(chained(b"len(xs) + 0")));
+  match analyse_with(parse_all(chained(b"len(xs) + 0")), before.defs, before.tests) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> assert_eq(rows_of(w), fresh),
+  }
 }
 
 test "seeded from the last answer's filing, an edited program answers what a fresh check does" {
