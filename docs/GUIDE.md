@@ -3484,7 +3484,11 @@ the machine is lent to the program as an effect: `ply run`, `ply test` and
 and of what `ply bootstrap` writes, itself: the emitter's answer for a
 definition is kept under the toolchain's cache and read back while the
 definition, the emitter and the runtime are the ones it was made by, and the
-machine compiles the C it is handed and loads it. The launcher enters `ply`
+machine compiles the C it is handed and loads it. What the emitter needs of a
+body beyond its text — the type each operator reads its operands at, the shape
+of each record update, the labels and witnesses each call passes — the front
+end's check files with the body's row, placed from where the definition
+starts, so a body is walked once however often it is lowered or moved. The launcher enters `ply`
 from a runnable — its front end's answer, its sources and its unit's C, which
 reading runs no compiler: the committed one when it was built from the
 binary's own sources, else one a builder made of them for an earlier run, or
