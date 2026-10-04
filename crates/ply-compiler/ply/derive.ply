@@ -15,7 +15,8 @@ import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TD
               Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written)
 import rewrite (expand)
 import resolve (Diag, Source, error_at, error_at_and, is_bare, dump_diags)
-import std.list (at)
+import std.list (at, concat, contains)
+import std.bytes (is_digit, join)
 
 // --- Rules ---------------------------------------------------------------------------------------
 
@@ -78,7 +79,6 @@ fn runtime_path(deriver: Deriver) -> List<Bytes> =
 
 fn is_upper_byte(c: Int) -> Bool = c >= 65 && c <= 90
 fn is_lower_byte(c: Int) -> Bool = c >= 97 && c <= 122
-fn is_digit_byte(c: Int) -> Bool = c >= 48 && c <= 57
 fn lower_byte(c: Int) -> Int = if is_upper_byte(c) { c + 32 } else { c }
 
 // `_` before an uppercase after a lowercase or digit, and before the last of an uppercase run a lowercase follows.
@@ -89,7 +89,7 @@ pub fn snake_case(name: Bytes) -> Bytes / {abort.raise} = {
     let sep = if i > 0 && is_upper_byte(c) {
       let prev = bytes_at(name, i - 1);
       let next_lower = i + 1 < n && is_lower_byte(bytes_at(name, i + 1));
-      is_lower_byte(prev) || is_digit_byte(prev) || (is_upper_byte(prev) && next_lower)
+      is_lower_byte(prev) || is_digit(prev) || (is_upper_byte(prev) && next_lower)
     } else { false };
     bytes_concat_all([out, if sep { b"_" } else { b"" }, byte_of(lower_byte(c))])
   })
@@ -97,14 +97,6 @@ pub fn snake_case(name: Bytes) -> Bytes / {abort.raise} = {
 
 pub fn generated_name(deriver: Deriver, type_name: Bytes) -> Bytes / {abort.raise} =
   bytes_concat_all([snake_case(type_name), b"_", deriver_text(deriver)])
-
-fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
-
-fn join(xs: List<Bytes>, sep: Bytes) -> Bytes / {abort.raise} =
-  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
-    if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
-
-fn has(xs: List<Bytes>, x: Bytes) -> Bool = fold(xs, false, |found: Bool, y: Bytes| found || y == x)
 
 // --- The syntactic half of `derivable(D, t)` ---------------------------------------------------
 
@@ -468,7 +460,7 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
         match constructor_shape(emitter.d, simple) {
           Nominal -> match c.name.module {
             Some(m) -> bytes_concat_all([m.name, b"::", call]),
-            None -> if has(emitter.cycle, simple) {
+            None -> if contains(emitter.cycle, simple) {
               bytes_concat_all([
                 snake_case(simple),
                 b"_",
@@ -1427,7 +1419,7 @@ fn derived_calls(expander: Expander, deriver: Deriver) -> List<Calls> = {
     });
   let names = map(targets, |t: TypeDef| t.name.name);
   map(targets, |t: TypeDef|
-    { name: t.name.name, calls: filter(named_in_def(deriver, t), |n: Bytes| has(names, n)) })
+    { name: t.name.name, calls: filter(named_in_def(deriver, t), |n: Bytes| contains(names, n)) })
 }
 
 fn named_in_def(deriver: Deriver, type_def: TypeDef) -> List<Bytes> =
@@ -1436,7 +1428,7 @@ fn named_in_def(deriver: Deriver, type_def: TypeDef) -> List<Bytes> =
     TDSum(variants) ->
       fold(variants, [], |acc: List<Bytes>, variant: VariantDef|
         fold(variant.fields, acc, |inner: List<Bytes>, ty: TypeExpr|
-          append(inner, named_in(deriver, ty)))),
+          concat(inner, named_in(deriver, ty)))),
   }
 
 // The types `codec` composes through by a name of this module's.
@@ -1444,7 +1436,7 @@ fn named_in(deriver: Deriver, te: TypeExpr) -> List<Bytes> =
   match te {
     TCon(c) -> {
       let inner = fold(c.args, [], |acc: List<Bytes>, a: TypeExpr|
-        append(acc, named_in(deriver, a)));
+        concat(acc, named_in(deriver, a)));
       match constructor_shape(deriver, c.name.name.name) {
         Nominal -> if is_bare(c.name) { push(inner, c.name.name.name) } else { inner },
         _ -> inner,
@@ -1452,24 +1444,24 @@ fn named_in(deriver: Deriver, te: TypeExpr) -> List<Bytes> =
     },
     TRecord(r) ->
       fold(r.fields, [], |acc: List<Bytes>, f: { name: Ident, ty: TypeExpr }|
-        append(acc, named_in(deriver, f.ty))),
+        concat(acc, named_in(deriver, f.ty))),
     _ -> [],
   }
 
 fn callees(calls: List<Calls>, name: Bytes) -> List<Bytes> =
   fold(calls, [], |acc: List<Bytes>, c: Calls|
-    if c.name == name { append(acc, c.calls) } else { acc })
+    if c.name == name { concat(acc, c.calls) } else { acc })
 
 // Every type a chain of one or more calls leads to from `from`: no chain is longer than the types.
 fn reached(calls: List<Calls>, from: Bytes) -> List<Bytes> =
   fold(range(0, len(calls)), callees(calls, from), |seen: List<Bytes>, _: Int|
     fold(seen, seen, |acc: List<Bytes>, n: Bytes|
       fold(callees(calls, n), acc, |more: List<Bytes>, m: Bytes|
-        if has(more, m) { more } else { push(more, m) })))
+        if contains(more, m) { more } else { push(more, m) })))
 
 // Empty unless `target`'s codec calls itself, through any of the others.
 fn cycle_of(calls: List<Calls>, target: Bytes) -> List<Bytes> =
-  filter(reached(calls, target), |n: Bytes| has(reached(calls, n), target))
+  filter(reached(calls, target), |n: Bytes| contains(reached(calls, n), target))
 
 // How this module writes a name that lives in the deriver's runtime module.
 fn runtime_prefix(expander: Expander, def: DeriveDef) -> WithPrefix / {abort.raise} =
@@ -1687,9 +1679,9 @@ pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion / {abort
       match runtime.added { Some(i) -> push(acc, i), None -> acc });
     {
       module: {
-        imports: append(module.imports, added),
+        imports: concat(module.imports, added),
         items: fold(ex.generated, module.items, |acc: List<Item>, generated: Generated|
-          append(acc, map(generated.defs, |def: FnDef| IFn(def)))),
+          concat(acc, map(generated.defs, |def: FnDef| IFn(def)))),
       },
       derived: map(ex.generated, |generated: Generated| generated.derived),
       diags: ex.diags,
