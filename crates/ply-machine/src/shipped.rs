@@ -23,12 +23,46 @@ static STAMPS: OnceLock<String> = OnceLock::new();
 /// The program the launcher entered, as [`definitions`] spells one; empty where it entered none.
 static ENTERED: OnceLock<String> = OnceLock::new();
 
+/// The line of [`ENTERED`] that names the entry: its hash covers everything the program runs.
+static ENTRY: OnceLock<String> = OnceLock::new();
+
 pub fn stamp(stamps: String) {
     let _ = STAMPS.set(stamps);
 }
 
-pub fn entered(definitions: String) {
+pub fn entered(entry: &str, definitions: String) {
+    let named = format!("{entry} ");
+    let line = definitions
+        .lines()
+        .find(|line| line.starts_with(&named))
+        .unwrap_or("");
+    let _ = ENTRY.set(line.to_string());
     let _ = ENTERED.set(definitions);
+}
+
+/// What the running `ply` program is a function of: the runtime's stamps and its entry's hash. A
+/// trace whose test asked what program ran holds this.
+pub fn program_digest() -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(STAMPS.get().map_or("", String::as_str).as_bytes());
+    hasher.update(&[0]);
+    hasher.update(ENTRY.get().map_or("", String::as_str).as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The digest a trace holds of the shipped module `name`, or of the list of them for the empty
+/// name.
+pub fn module_digest(name: &str) -> Option<String> {
+    if name.is_empty() {
+        let mut hasher = blake3::Hasher::new();
+        for (module, _) in crate::shipped_modules::sources() {
+            hasher.update(module.as_bytes());
+            hasher.update(&[0]);
+        }
+        return Some(hasher.finalize().to_hex().to_string());
+    }
+    crate::shipped_modules::source(&ply_eval::ModuleName::from_dotted(name))
+        .map(|text| blake3::hash(text.as_bytes()).to_hex().to_string())
 }
 
 /// Every `fn` of a program and the hash its front end gave it, a `name hash` line each in name
@@ -77,6 +111,19 @@ struct Shipped {
 impl HostHandler for Shipped {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
+        // The rest answer for the runtime, which a pass's store is stamped with.
+        match (req.op.op.as_str(), req.args) {
+            ("names", []) => ply_host::observe::shipped(req.machine, ""),
+            ("module", [name]) => {
+                if let Ok(name) = name.as_str(span, "a module's name") {
+                    ply_host::observe::shipped(req.machine, name);
+                }
+            }
+            ("definitions", []) if self.definitions.is_none() => {
+                ply_host::observe::program(req.machine)
+            }
+            _ => {}
+        }
         let value = match (req.op.op.as_str(), req.args) {
             ("names", []) => PlyValue::list(
                 crate::shipped_modules::sources()

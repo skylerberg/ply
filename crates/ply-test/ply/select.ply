@@ -1,7 +1,7 @@
 // `select` — which of a run's tests it must execute, and where each pass is filed. A test re-runs iff
-// its result is absent from the store, and every other answer is a reason a report prints:
-// `test/nondet` opts out of the cache in both directions, a test the front end never hashed cannot
-// be keyed at all, and a stored failure is never trusted.
+// no pass is filed under its key that still stands, and every other answer is a reason a report
+// prints: a pass stands while what its run read still answers as it did, a test the front end never
+// hashed cannot be keyed at all, and a stored failure is never trusted.
 //
 import std.bytes (bytes_of_hex, hex_of)
 import std.list (at)
@@ -25,7 +25,6 @@ pub type Row = {
   hash: Option<String>,
   /// Whether the key is the search's, rather than the test's own hash.
   seeded: Bool,
-  /// `test/nondet` opts out of the cache in both directions.
   nondet: Bool,
 }
 
@@ -61,7 +60,8 @@ pub type Case = {
   cache_key: Option<String>,
   seeded: Bool,
   nondet: Bool,
-  /// `passed`, `failed`, or nothing, when the store holds no result under that key.
+  /// `passed`; `changed`, a pass something its run read has moved under since; `failed`; or
+  /// nothing, when the store holds no result under that key.
   cached: Option<String>,
   /// The roots still owed, when the plan is answered root by root; `None` when it is not.
   owed: Option<List<Int>>,
@@ -86,7 +86,10 @@ pub fn case_of(
     owed: owed,
   }
 
-pub type Reason = | New | Nondet | PreviousFailure | Cached | SameCode | Unhashed
+pub type Reason = | New | Changed | PreviousFailure | Cached | SameCode | Unhashed
+
+/// A pass as the store files it: the key, and the trace of what its run read.
+pub type Pass = { key: String, trace: Bytes }
 
 // One test's answer: what was decided, and whether it therefore runs.
 pub type Decision = { case: Case, reason: Reason }
@@ -97,19 +100,19 @@ pub fn passed_before(r: Reason) -> Bool = match r { Cached -> true, SameCode -> 
 
 pub fn runs(d: Decision) -> Bool = !passed_before(d.reason)
 
-// `test/nondet` answers first: it never consults the store, so a stale result cannot silence a
-// search that has to be re-run. A test with no hash cannot be keyed, so it always runs. A stored
-// failure is never reused — the point of the run is to find out whether it is still a failure. A
-// plan nothing was filed under is still answered when every one of its roots passed on its own.
+// A test with no hash cannot be keyed, so it always runs. A stored failure is never reused — the
+// point of the run is to find out whether it is still a failure. A plan nothing was filed under is
+// still answered when every one of its roots passed on its own.
 pub fn reason_of(c: Case) -> Reason =
-  if c.nondet { Nondet }
-  else if c.cache_key == None { Unhashed } else {
+  if c.cache_key == None { Unhashed } else {
     match c.cached {
       None -> match c.owed {
         Some(roots) -> if len(roots) == 0 { Cached } else { New },
         None -> New,
       },
-      Some(text) -> if text == "passed" { Cached } else { PreviousFailure },
+      Some(text) -> if text == "passed" { Cached }
+      else if text == "changed" { Changed }
+      else { PreviousFailure },
     }
   }
 
@@ -153,8 +156,8 @@ pub fn narrowed(
     else { acc }
   })
 
-/// Where each running test's pass is filed. `test/nondet` opts out of the cache in both
-/// directions and a test with no hash has nowhere to be filed, so neither is named at all.
+/// Where each running test's pass is filed. A test with no hash has nowhere to be filed, so it is
+/// not named at all.
 pub fn filed(
   decisions: List<Decision>,
   s: Search,
@@ -163,7 +166,7 @@ pub fn filed(
   fold(decisions, [], |acc: List<{ index: Int, keys: List<String> }>, d: Decision|
     match d.case.hash {
       None -> acc,
-      Some(h) -> if !runs(d) || d.case.nondet { acc } else {
+      Some(h) -> if !runs(d) { acc } else {
         let keys = filed_keys(
           bytes_of_hex(h),
           d.case.seeded,
@@ -177,8 +180,8 @@ pub fn filed(
 }
 
 /// The key each test is filed under by the code its unit made of it, `codes` being each test's code by
-/// index: what a later run answers it by when nothing was filed under its own key. `test/nondet` and
-/// a test with no hash are filed by neither key.
+/// index: what a later run answers it by when nothing was filed under its own key. A test with no
+/// hash is filed by neither key.
 pub fn code_keys(
   decisions: List<Decision>,
   codes: Map<Int, String>,
@@ -186,7 +189,7 @@ pub fn code_keys(
 ) -> Map<Int, String> / {abort.raise} = {
   let digest = digest_of(s);
   fold(decisions, map_new(), |acc: Map<Int, String>, d: Decision|
-    if d.case.nondet || d.case.hash == None { acc } else {
+    if d.case.hash == None { acc } else {
       match map_get(codes, d.case.index) {
         None -> acc,
         Some(code) ->
@@ -213,14 +216,15 @@ pub fn asked_by_code(
       }
     })
 
-/// What answering by code decided: a new test whose code passed before is cached, and the keys it
-/// would have been filed under had it run, which the store is told so the next run answers it by
-/// them without asking for its code.
-pub type ByCode = { decisions: List<Decision>, refiled: List<String> }
+/// What answering by code decided: a new test whose code passed before is cached, and the passes it
+/// would have filed had it run, each with the trace its code's pass stands on, which the store is
+/// told so the next run answers it by them without asking for its code.
+pub type ByCode = { decisions: List<Decision>, refiled: List<Pass> }
 
+/// `passed` is each test whose code's pass still stands, with that pass's trace.
 pub fn by_code(
   decisions: List<Decision>,
-  passed: Map<Int, Bool>,
+  passed: Map<Int, Bytes>,
   s: Search,
 ) -> ByCode / {abort.raise} = {
   let hit = |d: Decision| d.reason == New && map_contains(passed, d.case.index);
@@ -229,8 +233,10 @@ pub fn by_code(
     refiled: fold(
       filed(filter(decisions, hit), s),
       [],
-      |acc: List<String>, e: { index: Int, keys: List<String> }|
-        fold(e.keys, acc, |a: List<String>, k: String| push(a, k)),
+      |acc: List<Pass>, e: { index: Int, keys: List<String> }| {
+        let trace = match map_get(passed, e.index) { Some(t) -> t, None -> b"" };
+        fold(e.keys, acc, |a: List<Pass>, k: String| push(a, { key: k, trace: trace }))
+      },
     ),
   }
 }
@@ -251,7 +257,7 @@ pub fn reused(decisions: List<Decision>) -> List<{ index: Int, outcome: String }
 pub fn word(r: Reason) -> String =
   match r {
     New -> "new",
-    Nondet -> "nondet",
+    Changed -> "changed",
     PreviousFailure -> "previous failure",
     Cached -> "cached",
     SameCode -> "same code",
@@ -286,6 +292,7 @@ fn dpor() -> Search = { mode: "dpor", roots: [0], budget: 256, steps: 100000, pa
 test "a stored pass is the only thing that keeps a test from running" {
   assert_eq(reason(0, Some("passed")), Cached);
   assert_eq(reason(0, None), New);
+  assert_eq(reason(0, Some("changed")), Changed);
   assert_eq(reason(0, Some("failed")), PreviousFailure);
   assert_eq(reason(0, Some("anything else")), PreviousFailure)
 }
@@ -318,21 +325,26 @@ test "a new test is answered by its code, and filed again under its own key; not
   let codes = fold(range(0, 5), map_new(), |m: Map<Int, String>, i: Int|
     map_insert(m, i, sevens()));
   let keys = code_keys(decisions, codes, dpor());
-  // A nondet test and an unhashed one are filed by no key, their code's included.
-  assert_eq(map_keys(keys), [0, 1, 2]);
+  // An unhashed test is filed by no key, its code's included.
+  assert_eq(map_keys(keys), [0, 1, 2, 3]);
   // Two tests that ran the same code share its key: what passed as that code passes again.
   assert_eq(map_get(keys, 0), map_get(keys, 2));
   // A stored failure runs again whatever its code did before.
-  assert_eq(map(asked_by_code(decisions, keys), |a: { index: Int, key: String }| a.index), [0, 2]);
-  let answered = by_code(decisions, map_insert(map_new(), 0, true), dpor());
+  assert_eq(map(asked_by_code(decisions, keys), |a: { index: Int, key: String }| a.index), [
+    0,
+    2,
+    3,
+  ]);
+  let answered = by_code(decisions, map_insert(map_new(), 0, b"read"), dpor());
   assert_eq(map(answered.decisions, |d: Decision| d.reason), [
     SameCode,
     PreviousFailure,
     New,
-    Nondet,
+    New,
     Unhashed,
   ]);
-  assert_eq(answered.refiled, [a_hash()]);
+  // Filed again under its own key, standing on what its code's pass read.
+  assert_eq(answered.refiled, [{ key: a_hash(), trace: b"read" }]);
   assert_eq(to_run(answered.decisions), [1, 2, 3, 4]);
   assert_eq(reused(answered.decisions), [{ index: 0, outcome: "passed" }])
 }
@@ -347,15 +359,12 @@ test "a seeded test's code key is its code and its plan" {
   )
 }
 
-test "`test/nondet` opts out of the cache in both directions" {
-  assert_eq(reason_of({ ..a_case(0, Some("passed")), nondet: true }), Nondet);
-  assert_eq(reason_of({ ..a_case(0, Some("failed")), nondet: true }), Nondet);
-  // Even a test with no hash is `nondet` rather than `unhashed`: it opts out first.
-  assert_eq(reason_of({ ..a_case(0, Some("passed")), nondet: true, cache_key: None }), Nondet);
-  // And nothing it does is filed.
+test "`test/nondet` is answered by the store as any test is" {
+  assert_eq(reason_of({ ..a_case(0, Some("passed")), nondet: true }), Cached);
+  assert_eq(reason_of({ ..a_case(0, Some("changed")), nondet: true }), Changed);
   let d = decide([{ ..a_case(0, None), nondet: true }]);
   assert_eq(to_run(d), [0]);
-  assert_eq(filed(d, dpor()), [])
+  assert_eq(filed(d, dpor()), [{ index: 0, keys: [a_hash()] }])
 }
 
 test "only a cached test is left out, and the run's list is in index order" {
@@ -363,14 +372,14 @@ test "only a cached test is left out, and the run's list is in index order" {
     a_case(0, Some("passed")),
     a_case(1, None),
     a_case(2, Some("failed")),
-    { ..a_case(3, Some("passed")), nondet: true },
+    a_case(3, Some("changed")),
   ];
   let decisions = decide(cases);
   assert_eq(map(decisions, |d: Decision| word(d.reason)), [
     "cached",
     "new",
     "previous failure",
-    "nondet",
+    "changed",
   ]);
   assert_eq(to_run(decisions), [1, 2, 3]);
   assert_eq(reused(decisions), [{ index: 0, outcome: "passed" }])
@@ -378,7 +387,7 @@ test "only a cached test is left out, and the run's list is in index order" {
 
 test "every reason has the word the report prints" {
   assert_eq(word(New), "new");
-  assert_eq(word(Nondet), "nondet");
+  assert_eq(word(Changed), "changed");
   assert_eq(word(PreviousFailure), "previous failure");
   assert_eq(word(Cached), "cached");
   assert_eq(word(SameCode), "same code");

@@ -13,7 +13,7 @@ use crate::support::{select_profile, unit_of};
 use crate::testrun::{
     Executed, Executor, Hosting, Interleaved, Usage, executed, interleaved, status_word,
 };
-use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
+use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity, MachineId};
 use ply_eval::{Diagnostic, Seed, Span, Value as PlyValue, codes};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -23,7 +23,7 @@ const EFFECT: &str = "tester";
 
 const HERMETIC: &str = "hermetic_tester";
 
-const OPERATIONS: [(&str, &str); 8] = [
+const OPERATIONS: [(&str, &str); 9] = [
     ("configure", "ply_machine::tester::configure"),
     // The programs tests run in, the schema the first one enters, the binding over it, and what
     // it came to.
@@ -35,9 +35,11 @@ const OPERATIONS: [(&str, &str); 8] = [
     // A test once, or one interleaving of it, on whichever thread asks.
     ("executed", "ply_machine::tester::executed"),
     ("interleaved", "ply_machine::tester::interleaved"),
+    // Whether what a pass's run read still answers as it did.
+    ("unchanged", "ply_machine::tester::unchanged"),
 ];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 8] = [
+const HERMETIC_OPERATIONS: [(&str, &str); 9] = [
     ("configure", "ply_machine::tester::hermetic::configure"),
     ("unit", "ply_machine::tester::hermetic::unit"),
     ("schema", "ply_machine::tester::hermetic::schema"),
@@ -46,6 +48,7 @@ const HERMETIC_OPERATIONS: [(&str, &str); 8] = [
     ("ended", "ply_machine::tester::hermetic::ended"),
     ("executed", "ply_machine::tester::hermetic::executed"),
     ("interleaved", "ply_machine::tester::hermetic::interleaved"),
+    ("unchanged", "ply_machine::tester::hermetic::unchanged"),
 ];
 
 /// What the binding and the budgets are read from, out of the options record the program parsed.
@@ -190,7 +193,7 @@ impl HostHandler for TesterHandler {
             "executed" => {
                 let unit = index_arg(req, 0, "a unit")?;
                 let test = index_arg(req, 1, "a test index")?;
-                self.executed(unit, test)?
+                self.executed(unit, test, req.machine)?
             }
             "interleaved" => {
                 let unit = index_arg(req, 0, "a unit")?;
@@ -199,7 +202,16 @@ impl HostHandler for TesterHandler {
                 let steps = arg(req, 3)?.as_int(span, "a step bound")?;
                 let re_executed = arg(req, 4)?.as_bool(span, "whether the test re-runs")?;
                 let steps = u32::try_from(steps.max(1)).unwrap_or(u32::MAX);
-                self.interleaved(unit, test, &seed, steps, re_executed)?
+                self.interleaved(unit, test, &seed, steps, re_executed, req.machine)?
+            }
+            "unchanged" => {
+                let trace = arg(req, 0)?.as_bytes(span, "a trace")?;
+                let roots = self.roots();
+                PlyValue::Bool(ply_host::observe::unchanged(
+                    &String::from_utf8_lossy(trace),
+                    &self.world(&roots),
+                    req.machine,
+                ))
             }
             other => return Err(crate::hosts::unserved(EFFECT, other, span)),
         };
@@ -413,7 +425,52 @@ impl TesterHandler {
         ply_codegen::rt::with_step_budget(steps, || ply_codegen::rt::with_time_budget(timeout, f))
     }
 
-    fn executed(&self, unit: usize, test: usize) -> Result<PlyValue, Diagnostic> {
+    /// The run's roots, which a trace's paths are written under.
+    fn roots(&self) -> Vec<(String, PathBuf)> {
+        let options = lock(&self.options);
+        ply_host::fs::Roots::load(&options.fs, Span::DUMMY)
+            .map(|roots| {
+                roots
+                    .listing()
+                    .map(|(name, dir)| (name.to_string(), dir.to_path_buf()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// What a trace is read against here: a hermetic run reads no file, so no file it names is
+    /// known to stand.
+    fn world<'a>(&self, roots: &'a [(String, PathBuf)]) -> ply_host::observe::World<'a> {
+        ply_host::observe::World {
+            roots: (!self.hermetic).then_some(roots),
+            binding: binding_digest(&lock(&self.options)),
+            binary: ply_host::observe::Binary {
+                shipped: &crate::shipped::module_digest,
+                program: crate::shipped::program_digest(),
+            },
+        }
+    }
+
+    /// What a run read, as the trace its pass is filed with; and into the record of whatever is
+    /// observing `caller`, which ran this run.
+    fn traced(
+        &self,
+        observed: Option<&Arc<ply_host::observe::Recorder>>,
+        usage: &Usage,
+        caller: MachineId,
+    ) -> Option<String> {
+        let observed = observed?;
+        ply_host::observe::absorb(caller, observed);
+        let roots = self.roots();
+        ply_host::observe::finished(observed, &self.world(&roots), usage.host)
+    }
+
+    fn executed(
+        &self,
+        unit: usize,
+        test: usize,
+        caller: MachineId,
+    ) -> Result<PlyValue, Diagnostic> {
         let (unit, hosting) = self.unit_at(unit)?;
         let once = match unit.provider {
             Some(provider) => {
@@ -434,7 +491,8 @@ impl TesterHandler {
         } else {
             once
         };
-        Ok(executed_value(&once))
+        let trace = self.traced(once.observed.as_ref(), &once.usage, caller);
+        Ok(executed_value(&once, trace))
     }
 
     fn interleaved(
@@ -444,6 +502,7 @@ impl TesterHandler {
         seed: &Seed,
         steps: u32,
         re_executed: bool,
+        caller: MachineId,
     ) -> Result<PlyValue, Diagnostic> {
         let (unit, hosting) = self.unit_at(unit)?;
         let run = match unit.provider {
@@ -465,7 +524,8 @@ impl TesterHandler {
         } else {
             run
         };
-        Ok(interleaved_value(&run))
+        let trace = self.traced(run.read.as_ref(), &run.usage, caller);
+        Ok(interleaved_value(&run, trace))
     }
 }
 
@@ -520,7 +580,45 @@ fn use_value(usage: &Usage) -> PlyValue {
     ])
 }
 
-fn executed_value(run: &Executed) -> PlyValue {
+/// What a run is configured to bind, apart from the program, which a pass's key covers: whether
+/// it binds the host, the roots and programs it lends by name, and the families it allows.
+fn binding_digest(options: &TestOptions) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(if options.host {
+        b"host\0"
+    } else {
+        b"hermetic\0"
+    });
+    for (part, names) in [
+        (
+            "fs",
+            options
+                .fs
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "exec",
+            options.exec.iter().map(|e| e.name.as_str()).collect(),
+        ),
+        ("allow", options.allow.iter().map(String::as_str).collect()),
+    ] {
+        let mut names = names;
+        names.sort();
+        hasher.update(part.as_bytes());
+        hasher.update(&[0]);
+        for name in names {
+            hasher.update(name.as_bytes());
+            hasher.update(&[0]);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// `trace` is what the run read, which its pass is filed with: `None` when nothing could stand in
+/// for the run, which files no pass.
+fn executed_value(run: &Executed, trace: Option<String>) -> PlyValue {
     record(vec![
         (
             "status",
@@ -528,11 +626,15 @@ fn executed_value(run: &Executed) -> PlyValue {
         ),
         ("failure", option(run.failure.as_ref().map(raised_value))),
         ("usage", use_value(&run.usage)),
+        (
+            "trace",
+            option(trace.map(|t| PlyValue::bytes(t.as_bytes()))),
+        ),
     ])
 }
 
 /// A failing interleaving's verdict carries the failure itself and how a report classes it.
-fn interleaved_value(run: &Interleaved) -> PlyValue {
+fn interleaved_value(run: &Interleaved, trace: Option<String>) -> PlyValue {
     let fell = match &run.interleaving.verdict {
         ply_eval::Verdict::Failed(diagnostic) => Some(record(vec![
             (
@@ -550,6 +652,10 @@ fn interleaved_value(run: &Interleaved) -> PlyValue {
         ),
         ("observed", PlyValue::Bool(run.observed)),
         ("usage", use_value(&run.usage)),
+        (
+            "trace",
+            option(trace.map(|t| PlyValue::bytes(t.as_bytes()))),
+        ),
     ])
 }
 

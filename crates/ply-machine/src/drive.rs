@@ -10,6 +10,7 @@ use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
 use crate::support::{select_profile, unit_of};
+use ply_eval::host::MachineId;
 use ply_eval::{
     Analysis, CheckOutput, DefHash, Diagnostic, Ended, SourceMap, Span, Symbol, Value as PlyValue,
     codes,
@@ -466,7 +467,12 @@ impl Drive {
     /// Enter one definition with arguments, the way `call` asks: the value back, or what it
     /// raised, and what the entry ended with. The binding stays up, so a load may be called any
     /// number of times.
-    pub fn call(&mut self, name: &str, args: Vec<ply_eval::Plain>) -> Ended<ply_eval::Plain> {
+    pub fn call(
+        &mut self,
+        name: &str,
+        args: Vec<ply_eval::Plain>,
+        caller: MachineId,
+    ) -> Ended<ply_eval::Plain> {
         let options = &self.options;
         let target = &self.target;
         let span = target
@@ -505,7 +511,7 @@ impl Drive {
             ply_codegen::rt::with_time_budget(options.timeout, || {
                 evaluate(
                     target.front(),
-                    Call { name, args },
+                    Call { name, args, caller },
                     span,
                     &seed,
                     &bound.hosts,
@@ -525,7 +531,7 @@ impl Drive {
     }
 
     /// Enter the bound entry and tear the binding down; the answer an `enter` op hands back.
-    pub fn enter(&mut self) -> Outcome {
+    pub fn enter(&mut self, caller: MachineId) -> Outcome {
         let Some((entry, bound)) = self.bound.take() else {
             return Outcome::unentered();
         };
@@ -551,6 +557,7 @@ impl Drive {
                     Call {
                         name: &entry,
                         args: Vec::new(),
+                        caller,
                     },
                     span,
                     &seed,
@@ -679,10 +686,12 @@ fn hermetic_host() -> Diagnostic {
     .note("a program that drives a run reaching the host performs `machine`, and is `test/nondet`")
 }
 
-/// The definition a call enters: its program-wide name and the arguments it takes.
+/// The definition a call enters: its program-wide name, the arguments it takes, and the machine
+/// it runs on behalf of, whose record observes it.
 pub struct Call<'a> {
     pub name: &'a str,
     pub args: Vec<PlyValue>,
+    pub caller: MachineId,
 }
 
 fn evaluate(
@@ -698,6 +707,7 @@ fn evaluate(
         Ok(machine) => machine,
         Err(refused) => return Ended::refused(refused),
     };
+    ply_host::observe::adopt(machine.id(), call.caller);
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);

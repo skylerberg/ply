@@ -4,6 +4,7 @@
 mod certgen;
 mod config;
 mod fs;
+mod observe;
 mod pool;
 mod process;
 mod registry;

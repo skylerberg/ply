@@ -7,9 +7,15 @@ mod code;
 
 use std::path::{Path, PathBuf};
 
-/// What runs a test or a law. `ply-host` is not: every handler it serves is nondeterministic, so
-/// nothing a store keeps reached it, which `ply-host-tests` holds it to.
-const RUNTIME: &[&str] = &["ply-eval", "ply-codegen", "ply-machine"];
+/// What runs a test or a law, the handlers a kept pass's trace was read through, and the launcher a
+/// `ply` it started ran under.
+const RUNTIME: &[&str] = &[
+    "ply-eval",
+    "ply-codegen",
+    "ply-machine",
+    "ply-host",
+    "ply-launcher",
+];
 
 fn main() {
     let repo = code::normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
