@@ -1,0 +1,87 @@
+// No function is written twice: two modules whose functions hash alike carry one copy too many, and
+// the one to keep is the one every caller can reach. A copy kept on purpose says why.
+
+import harness (at, items, json_of, on_disk, repo, str, Reached, Repo, Shelf)
+import std.json (Json)
+import std.list (contains, push_unique, sort)
+import std.map (get_or)
+import std.string
+
+// Every package the repository maintains, by its directory under `crates/`.
+fn packages() -> List<String> =
+  ["std", "compiler", "cli", "prove", "sim", "test", "store", "registry", "corpus", "cli-tests"]
+
+// Each copy kept on purpose: its members, sorted, and why it stays.
+fn kept() -> List<{ members: List<String>, why: String }> =
+  [
+    {
+      members: ["cli/signing.a_seed", "registry/service.a_seed", "std/signed.a_seed"],
+      why: "the seed three packages' key tests each need, where no test helper reaches all three",
+    },
+  ]
+
+type Member = { name: String, module: String }
+
+// Whether a function takes anything: constants that agree are often different things.
+fn takes_parameters(ty: String) -> Bool / {abort.raise} = {
+  let params = if string_starts_with(ty, "<") { string_slice(ty, generics_end(ty), string_len(ty)) }
+  else { ty };
+  string_starts_with(params, "(") && !string_starts_with(params, "()")
+}
+
+// Past the `<..>` that opens `ty`.
+fn generics_end(ty: String) -> Int / {abort.raise} =
+  fold(range(0, string_len(ty)), { depth: 0, end: 0 }, |s: { depth: Int, end: Int }, i: Int|
+    if s.end > 0 { s } else {
+      let c = string_slice(ty, i, i + 1);
+      let depth = if c == "<" { s.depth + 1 } else if c == ">" { s.depth - 1 } else { s.depth };
+      { depth: depth, end: if depth == 0 { i + 1 } else { 0 } }
+    }).end
+
+// Every function with parameters each package defines, grouped by hash.
+fn by_hash() -> Map<String, List<Member>> / {Reached, Shelf, Repo, abort.raise} =
+  fold(packages(), map_new(), |acc: Map<String, List<Member>>, pkg: String| {
+    let v = json_of(on_disk(["defs", "--json", repo() ++ "/crates/ply-" ++ pkg ++ "/ply"]));
+    fold(items(at(v, "definitions")), acc, |m: Map<String, List<Member>>, d: Json| {
+      let module = str(at(d, "module"));
+      // A dependency's definitions are listed again, under its package's prefix.
+      if string_contains(module, ".") || !takes_parameters(str(at(d, "type"))) { m } else {
+        let hash = str(at(d, "hash"));
+        map_insert(
+          m,
+          hash,
+          push(get_or(m, hash, []), {
+            name: pkg ++ "/" ++ str(at(d, "name")),
+            module: pkg ++ "/" ++ module,
+          }),
+        )
+      }
+    })
+  })
+
+test/nondet "no two modules define the same function" {
+  let copies = fold(map_values(by_hash()), [], |acc: List<List<String>>, ms: List<Member>|
+    if len(fold(ms, [], |seen: List<String>, x: Member| push_unique(seen, x.module))) < 2 { acc }
+    else { push(acc, sort(map(ms, |x: Member| x.name))) });
+  let allowed = map(kept(), |k: { members: List<String>, why: String }| k.members);
+  let unexplained = filter(copies, |c: List<String>| !contains(allowed, c));
+  let stale = filter(allowed, |k: List<String>| !contains(copies, k));
+  let lines = |groups: List<List<String>>|
+    string::join(map(groups, |g: List<String>| string::join(g, " ")), "\n  ");
+  assert(
+    unexplained == [] && stale == [],
+    Some(
+      "functions more than one module defines; keep the copy every caller reaches:\n  "
+        ++ lines(unexplained)
+        ++ "\ncopies `kept` names that no longer hash alike:\n  "
+        ++ lines(stale),
+    ),
+  )
+}
+
+test "a function's type takes parameters past its generics, and a constant's takes none" {
+  assert(takes_parameters("(Int) -> Int"));
+  assert(takes_parameters("<a>(List<a>, Int) -> Option<a>"));
+  assert(!takes_parameters("() -> Int"));
+  assert(!takes_parameters("<a>() -> List<a>"))
+}

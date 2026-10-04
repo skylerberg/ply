@@ -1911,8 +1911,8 @@ implicitly (`normalize_path` is explicit).
 `map_json`, `string_map_json`. Entry points: `decode_bytes`, `decode_string`,
 `encode_bytes`, `encode_string`, `parse`, `parse_string`, `to_bytes`,
 `to_string`. Builders: `object(members)`, `array(items)`, `int(n)`,
-`strings(xs)` (an array of strings) and `string_or_null(s)` (`Null` where the
-`Option` is `None`). `error_to_string` gives `$.lines[2].unit_price: expected a
+`strings(xs)` (an array of strings), and `string_or_null(s)`, `int_or_null(n)`
+and `strings_or_null(xs)` (`Null` where the `Option` is `None`). `error_to_string` gives `$.lines[2].unit_price: expected a
 number, found a string`. `max_depth()` is the nesting `parse` reads and
 `to_bytes` writes, 128; `too_deep()` is the codec a derived one becomes past it
 (§11).
@@ -2461,6 +2461,12 @@ pub fn bytes_of_hex(text: String) -> Bytes
 pub fn int_of_ascii(b: Bytes) -> Option<Int>
 pub fn is_digit(b: Int) -> Bool
 pub fn hex_digit(v: Int) -> Bytes / {abort.raise}
+pub fn hex_value(c: Int) -> Int
+pub fn peek(b: Bytes, i: Int) -> Int / {abort.raise}
+pub fn scan(b: Bytes, i: Int, set: Bytes) -> Int / {abort.raise}
+pub fn scan_until(b: Bytes, i: Int, set: Bytes) -> Int / {abort.raise}
+pub fn ascii_of_int(n: Int) -> Bytes
+pub fn cstring(s: String) -> Bytes
 ```
 
 Integers in a byte string, little-endian and big-endian: how a binary format and
@@ -2476,7 +2482,12 @@ written in ASCII — an optional `-`, then digits, and nothing else — and is
 one integer parser the shipped modules share, and `std.string`'s `int_of_string`
 is it over a `String`. `is_digit` is whether a byte is an ASCII decimal digit.
 `contains` is whether `part` occurs in `b`, and `replace` swaps every occurrence
-of `from` left to right; an empty `from` occurs nowhere.
+of `from` left to right; an empty `from` occurs nowhere. `hex_value` reads a hex
+digit back in either case, and is `-1` for any other byte. A scanner reads with
+`peek`, the byte at `i` or `-1` where there is none, and `scan` and `scan_until`,
+where the first byte from `i` not in, or in, `set` is: the length of `b` where no
+byte is. `ascii_of_int` writes what `int_of_ascii` reads, and `cstring` is a
+string with a NUL after it, as C and the wire protocols spell one.
 
 ### 13.15 `std.pkg`
 
@@ -2511,7 +2522,8 @@ version dotted and `parse_version` reads one back (three counts, no leading
 zero, nothing else). `Index` is a registry's `index.json` (§15.1): every
 published `Release` of one package, newest last, read and written by
 `index_json` (`release_json` for one entry), with each version as its dotted
-text. An `Attestation` is what an attester found of one published version
+text, and `release_at` is the release of a version an index lists, if it lists
+one. An `Attestation` is what an attester found of one published version
 (§15.1), derived `bin`; `attested` is whether it checks, keeps its promises,
 failed no test and had no claim refuted.
 
@@ -2801,6 +2813,8 @@ pub fn contains(text: String, needle: String) -> Bool
 pub fn starts_with(text: String, prefix: String) -> Bool
 pub fn ends_with(text: String, suffix: String) -> Bool
 pub fn index_of(text: String, needle: String) -> Option<Int>
+pub fn strip_suffix(text: String, suffix: String) -> String
+pub fn unlines(rows: List<String>) -> String
 pub fn lines(text: String) -> List<String>
 pub fn words(text: String) -> List<String>
 pub fn count(text: String, needle: String) -> Int
@@ -2817,7 +2831,9 @@ spells `string_split`/`string_contains`/`string_find`. `index_of` answers `None`
 rather than the prelude's `-1`, which is not a position. `lines` takes a trailing
 `\r` off each line, so a CRLF file reads as an LF one, and the empty text has no
 lines rather than one empty line; `words` is the runs that are not whitespace and
-never empty. `count` does not overlap. Every one is total — `replace` with an
+never empty. `unlines` writes each row followed by a newline, and `strip_suffix`
+takes one `suffix` off the end where the text ends with it. `count` does not
+overlap. Every one is total — `replace` with an
 empty needle is the text unchanged rather than a loop, and the case fold touches
 `A-Z`/`a-z` and leaves every other character as it is. `std.bytes.join` is the
 same operation over `Bytes`. `int_of_string` is `std.bytes.int_of_ascii` over the
@@ -2922,6 +2938,7 @@ pub fn contains<a>(xs: List<a>, x: a) -> Bool where derivable(eq, a)
 pub fn push_unique<a>(xs: List<a>, x: a) -> List<a> where derivable(eq, a)
 pub fn is_empty<a>(xs: List<a>) -> Bool
 pub fn somes<a>(xs: List<Option<a>>) -> List<a>
+pub fn prepend<a>(x: a, xs: List<a>) -> List<a>
 pub fn index_of<a>(xs: List<a>, x: a) -> Option<Int> where derivable(eq, a)
 pub fn remove_first<a>(xs: List<a>, x: a) -> Option<List<a>> where derivable(eq, a)
 pub fn sum(xs: List<Int>) -> Int
@@ -2940,8 +2957,9 @@ pub fn unique<a>(xs: List<a>) -> List<a> where derivable(ord, a)
 
 The prelude has the pieces — `map`, `filter`, `fold`, `iterate`, `range`, `push`
 and `list_at` — and not the wholes. A `List` is a vector, not a linked list: the
-cheap end is the back, `push` appends and nothing prepends, so every function
-here folds left to right and appends, which is one pass and linear. That is why
+cheap end is the back: `push` appends, and `prepend` puts an element first by
+copying the list, so every function here folds left to right and appends, which
+is one pass and linear. That is why
 building the same list from the front is a shape to avoid in Ply as well: it
 copies the accumulator every step and is quadratic. `at` is the element at an
 index and raises for an index the list does not hold; `at_or` answers a spare
@@ -3134,6 +3152,7 @@ pub fn order(a: Value, b: Value) -> Ordering
 pub fn map_of(entries: List<Entry>) -> Value
 pub fn shown_items() -> Int
 pub fn shown_depth() -> Int
+pub fn width_of(ty: String) -> Int
 ```
 
 A value of any type as data: what `machine.call` takes and answers, what a
@@ -3143,7 +3162,9 @@ its module declares, an array as `array_of_list([..])`. In a diagnostic, a list
 or map past `shown_items` items counts the rest, nesting past `shown_depth`
 shows as `…`, and a credential shows as `Secret(****)`; `render_all` writes
 every item at every depth, which is what a program shows (§13.38). A fixed
-width holds the bit pattern it reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
+width holds the bit pattern it reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`;
+`width_of` is how many bits a fixed-width type's name names (`"U8"` is 8), and
+128 for any other name. Only
 a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
 and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
 value a runtime diagnostic's text names in its place. `order` is the order the

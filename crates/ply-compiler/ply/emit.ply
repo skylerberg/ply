@@ -1,12 +1,12 @@
 // The C emitter: writes the C for one lowered body, or `None` for a form it does not cover.
 // Output is diffed byte for byte against the Rust back end, so emission order and temporary numbering are load-bearing.
 
-import parsing (int_to_bytes, Ident, Span, dummy_span, span_key, ParseDiag)
+import parsing (Ident, Span, dummy_span, span_key, ParseDiag, qname_text)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpdate,
              NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList,
              CodePatternField, NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle,
              CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm, Capture, CodeClause,
-             CodeReturn, Own, Borrowed, Owned, lower_fn, qname_text)
+             CodeReturn, Own, Borrowed, Owned, lower_fn, irrefutable)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
               SEnsures, FnDef)
@@ -26,12 +26,14 @@ import diagnostics (parse_all)
 import interface (stub_module)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EWithCell, HandleClause,
-              MatchArm, RecField, Stmt, SLet, SLetElse, SExpr)
+              MatchArm, RecField, Stmt, SLet, SLetElse, SExpr, is_arithmetic)
 import type_syntax (MWrite, TypeExpr, TVar, TCon, TRecord)
 import rewrite (expand)
 import embed (EmbedAt, embed_tables, rewritten)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import std.list
+import std.bytes (ascii_of_int)
+import std.math (pow)
 
 // `KBoxed` is a tagged word; `KInt` is the untagged 64 bits inside one.
 pub type Kind =
@@ -79,12 +81,10 @@ fn width_index(width: Width) -> Int =
 
 fn carried(width: Width) -> Bool = width.bits < 64
 
-fn power_of_two(n: Int) -> Int = if n <= 0 { 1 } else { 2 * power_of_two(n - 1) }
-
-fn width_min(width: Width) -> Int = if width.signed { 0 - power_of_two(width.bits - 1) } else { 0 }
+fn width_min(width: Width) -> Int = if width.signed { 0 - pow(2, width.bits - 1) } else { 0 }
 
 fn width_max(width: Width) -> Int =
-  if width.signed { power_of_two(width.bits - 1) - 1 } else { power_of_two(width.bits) - 1 }
+  if width.signed { pow(2, width.bits - 1) - 1 } else { pow(2, width.bits) - 1 }
 
 fn as_num(value: CValue, width: Width) -> Bytes =
   match value.kind {
@@ -528,7 +528,7 @@ fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
       group: emitter.group,
       operands: emitter.operands,
     },
-    name: bytes_concat(b"t", int_to_bytes(emitter.temp_count + 1)),
+    name: bytes_concat(b"t", ascii_of_int(emitter.temp_count + 1)),
   }
 
 // The last entry wins: a `let` may shadow a slot an enclosing scope filled.
@@ -577,15 +577,15 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
     None -> emitter,
     Some(d) -> {
       let o1 = line(note_tok(emitter, d.n), bytes_concat_all([b"if (!", name, b") {"]));
-      let o2 = line(indent(o1), bytes_concat_all([b"if (tok", int_to_bytes(d.n), b") {"]));
+      let o2 = line(indent(o1), bytes_concat_all([b"if (tok", ascii_of_int(d.n), b") {"]));
       let o3 = line(
         indent(o2),
         bytes_concat_all([
           name,
           b" = tok",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b"; tok",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b" = 0;",
         ]),
       );
@@ -597,15 +597,15 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
           b")->rc = 1; ply_obj(",
           name,
           b")->flags = ",
-          int_to_bytes(d.flags),
+          ascii_of_int(d.flags),
           b"; ply_obj(",
           name,
           b")->len = ",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b"; ply_obj(",
           name,
           b")->layout = @@s",
-          int_to_bytes(d.shape),
+          ascii_of_int(d.shape),
           b"@@;",
         ]),
       );
@@ -614,11 +614,11 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
         bytes_concat_all([
           name,
           b" = rt_alloc_p(ctx, 3, ",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b", @@s",
-          int_to_bytes(d.shape),
+          ascii_of_int(d.shape),
           b"@@, ",
-          int_to_bytes(d.flags),
+          ascii_of_int(d.flags),
           b");",
         ]),
       );
@@ -630,7 +630,7 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
             b"ply_words(",
             name,
             b")[",
-            int_to_bytes(at),
+            ascii_of_int(at),
             b"] = ",
             match list_at(d.words, at) { Some(w) -> w, None -> b"0" },
             b";",
@@ -954,16 +954,16 @@ fn built_now(
   vals: Option<List<CValue>>,
 ) -> WithValue / {abort.raise} = {
   let rec = bind(note_tok(emitter, n), KBoxed, b"0");
-  let opened = line(rec.emitter, bytes_concat_all([b"if (tok", int_to_bytes(n), b") {"]));
+  let opened = line(rec.emitter, bytes_concat_all([b"if (tok", ascii_of_int(n), b") {"]));
   let took = line(
     line(
       indent(opened),
       bytes_concat_all([
         rec.value.expr,
         b" = tok",
-        int_to_bytes(n),
+        ascii_of_int(n),
         b"; tok",
-        int_to_bytes(n),
+        ascii_of_int(n),
         b" = 0;",
       ]),
     ),
@@ -973,15 +973,15 @@ fn built_now(
       b")->rc = 1; ply_obj(",
       rec.value.expr,
       b")->flags = ",
-      int_to_bytes(flags),
+      ascii_of_int(flags),
       b"; ply_obj(",
       rec.value.expr,
       b")->len = ",
-      int_to_bytes(n),
+      ascii_of_int(n),
       b"; ply_obj(",
       rec.value.expr,
       b")->layout = @@s",
-      int_to_bytes(shape),
+      ascii_of_int(shape),
       b"@@;",
     ]),
   );
@@ -991,11 +991,11 @@ fn built_now(
       bytes_concat_all([
         rec.value.expr,
         b" = rt_alloc_p(ctx, 3, ",
-        int_to_bytes(n),
+        ascii_of_int(n),
         b", @@s",
-        int_to_bytes(shape),
+        ascii_of_int(shape),
         b"@@, ",
-        int_to_bytes(flags),
+        ascii_of_int(flags),
         b");",
       ]),
     ),
@@ -1009,7 +1009,7 @@ fn built_now(
         b"ply_words(",
         rec.value.expr,
         b")[",
-        int_to_bytes(at),
+        ascii_of_int(at),
         b"] = ",
         match list_at(words, at) { Some(w) -> w, None -> b"0" },
         b";",
@@ -1087,7 +1087,7 @@ fn note_alias(emitter: Emitter, local: Bytes, root: Bytes) -> Emitter =
 fn charge(emitter: Emitter, slot: Int, local: Bytes) -> Emitter = {
   let r = root_of(emitter, local);
   let already = fold(emitter.by_root, false, |acc: Bool, e: { root: Bytes, n: Int }|
-    acc || e.root == bytes_concat_all([r, b"#", int_to_bytes(slot)]));
+    acc || e.root == bytes_concat_all([r, b"#", ascii_of_int(slot)]));
   if already { emitter } else {
     {
       out: emitter.out,
@@ -1114,7 +1114,7 @@ fn charge(emitter: Emitter, slot: Int, local: Bytes) -> Emitter = {
       reuse_widths: emitter.reuse_widths,
       alias: emitter.alias,
       by_root: push(
-        push(emitter.by_root, { root: bytes_concat_all([r, b"#", int_to_bytes(slot)]), n: 0 }),
+        push(emitter.by_root, { root: bytes_concat_all([r, b"#", ascii_of_int(slot)]), n: 0 }),
         { root: r, n: list::count(emitter.reads, |y: Int| y == slot) },
       ),
       tail: emitter.tail,
@@ -1499,9 +1499,9 @@ fn site(emitter: Emitter, span: Span) -> Emitter =
         b"PLY_SITE(ctx, @@",
         root_key(emitter),
         b"@@, ",
-        int_to_bytes(span.start - emitter.base),
+        ascii_of_int(span.start - emitter.base),
         b", ",
-        int_to_bytes(span.end - emitter.base),
+        ascii_of_int(span.end - emitter.base),
         b");",
       ]),
     )
@@ -1511,7 +1511,7 @@ fn site(emitter: Emitter, span: Span) -> Emitter =
 fn root_key(emitter: Emitter) -> Bytes =
   match position_of(emitter.group, emitter.owner) {
     None -> b"r",
-    Some(i) -> bytes_concat(b"r", int_to_bytes(i)),
+    Some(i) -> bytes_concat(b"r", ascii_of_int(i)),
   }
 
 fn position_of(xs: List<Bytes>, x: Bytes) -> Option<Int> =
@@ -1583,15 +1583,15 @@ fn release_from(
                       b"if (",
                       value.expr,
                       b") { if (tok",
-                      int_to_bytes(d.n),
+                      ascii_of_int(d.n),
                       b" == 0) { tok",
-                      int_to_bytes(d.n),
+                      ascii_of_int(d.n),
                       b" = ply_reset_flat(",
                       value.expr,
                       b"); if (!tok",
-                      int_to_bytes(d.n),
+                      ascii_of_int(d.n),
                       b") tok",
-                      int_to_bytes(d.n),
+                      ascii_of_int(d.n),
                       b" = rt_reset_p(ctx, ",
                       value.expr,
                       b"); } else { ply_dec(ctx, ",
@@ -1612,15 +1612,15 @@ fn release_from(
                       emitter,
                       bytes_concat_all([
                         b"if (tok",
-                        int_to_bytes(n),
+                        ascii_of_int(n),
                         b" == 0) { tok",
-                        int_to_bytes(n),
+                        ascii_of_int(n),
                         b" = ply_reset_flat(",
                         as_word(value),
                         b"); if (!tok",
-                        int_to_bytes(n),
+                        ascii_of_int(n),
                         b") tok",
-                        int_to_bytes(n),
+                        ascii_of_int(n),
                         b" = rt_reset_p(ctx, ",
                         as_word(value),
                         b"); } else { ply_dec(ctx, ",
@@ -1653,15 +1653,15 @@ fn release_holder(emitter: Emitter, value: CValue) -> Emitter =
           b"if (",
           value.expr,
           b") { if (tok",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b" == 0) { tok",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b" = ply_reset_flat(",
           value.expr,
           b"); if (!tok",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b") tok",
-          int_to_bytes(d.n),
+          ascii_of_int(d.n),
           b" = rt_reset_p(ctx, ",
           value.expr,
           b"); } else { ply_dec(ctx, ",
@@ -1682,15 +1682,15 @@ fn release_holder(emitter: Emitter, value: CValue) -> Emitter =
           note_tok(emitter, n),
           bytes_concat_all([
             b"if (tok",
-            int_to_bytes(n),
+            ascii_of_int(n),
             b" == 0) { tok",
-            int_to_bytes(n),
+            ascii_of_int(n),
             b" = ply_reset_flat(",
             value.expr,
             b"); if (!tok",
-            int_to_bytes(n),
+            ascii_of_int(n),
             b") tok",
-            int_to_bytes(n),
+            ascii_of_int(n),
             b" = rt_reset_p(ctx, ",
             value.expr,
             b"); } else { ply_dec(ctx, ",
@@ -1791,7 +1791,7 @@ fn from_table(emitter: Emitter, literal: Lit) -> WithValue / {abort.raise} = {
   let o = bind(
     c.emitter,
     KBoxed,
-    bytes_concat_all([b"rt_lit_p(ctx, @@c", int_to_bytes(c.i), b"@@)"]),
+    bytes_concat_all([b"rt_lit_p(ctx, @@c", ascii_of_int(c.i), b"@@)"]),
   );
   { emitter: check(o.emitter), value: o.value }
 }
@@ -2252,7 +2252,7 @@ fn fused_iterate(
                                     push(w, {
                                       slot: capture.dst,
                                       kind: KBoxed,
-                                      expr: bytes_concat(b"p", int_to_bytes(capture.src)),
+                                      expr: bytes_concat(b"p", ascii_of_int(capture.src)),
                                       ty: p.ty,
                                     }),
                                   ),
@@ -2884,7 +2884,7 @@ fn width_closure(code: Code, name: Bytes) -> Code = {
         NApp({
           func: at(NVar({ name: name, slot: None })),
           args: map(range(0, n), |i: Int|
-            at(NVar({ name: bytes_concat(b"p", int_to_bytes(i)), slot: Some(i) }))),
+            at(NVar({ name: bytes_concat(b"p", ascii_of_int(i)), slot: Some(i) }))),
         }),
       ),
     }),
@@ -3013,7 +3013,7 @@ fn width_builtin(
                   b" > ",
                   int_lit(width_max(t)),
                   b") { rt_not_that_width_p(ctx, ",
-                  int_to_bytes(width_index(t)),
+                  ascii_of_int(width_index(t)),
                   b", ",
                   held.value.expr,
                   b"); return 0; }",
@@ -3051,11 +3051,11 @@ fn wrapped(
         b"((",
         as_int(v1),
         b") % ",
-        int_to_bytes(t.bits),
+        ascii_of_int(t.bits),
         b" + ",
-        int_to_bytes(t.bits),
+        ascii_of_int(t.bits),
         b") % ",
-        int_to_bytes(t.bits),
+        ascii_of_int(t.bits),
       ]),
     );
     bind(
@@ -3081,7 +3081,7 @@ fn wrapped(
         b")(",
         a,
         b") << (",
-        int_to_bytes(t.bits),
+        ascii_of_int(t.bits),
         b" - ",
         k.value.expr,
         b")))",
@@ -3246,7 +3246,7 @@ fn inline_join(
               b"rt_bytes_join_p(ctx, (Word)(intptr_t)",
               arr.name,
               b", ",
-              int_to_bytes(len(l.items)),
+              ascii_of_int(len(l.items)),
               b")",
             ]),
           );
@@ -3594,7 +3594,7 @@ fn call_value(
               b", (Word)(intptr_t)",
               arr.name,
               b", ",
-              int_to_bytes(len(args)),
+              ascii_of_int(len(args)),
               b")",
             ]),
           );
@@ -3621,7 +3621,7 @@ fn caps_owned(
           None -> match list_at(params, c.src) {
             Some(p) -> match p.kind {
               KBoxed ->
-                Some({ kind: KBoxed, expr: bytes_concat(b"p", int_to_bytes(c.src)), ty: p.ty }),
+                Some({ kind: KBoxed, expr: bytes_concat(b"p", ascii_of_int(c.src)), ty: p.ty }),
               _ -> None,
             },
             None -> None,
@@ -3656,7 +3656,7 @@ fn emit_lambda(
           push(acc, {
             slot: c.dst,
             kind: KBoxed,
-            expr: bytes_concat(b"q", int_to_bytes(i)),
+            expr: bytes_concat(b"q", ascii_of_int(i)),
             ty: TyOpen,
           }),
         None -> acc,
@@ -3665,7 +3665,7 @@ fn emit_lambda(
       push(acc, {
         slot: j,
         kind: KBoxed,
-        expr: bytes_concat(b"q", int_to_bytes(len(l.captures) + j)),
+        expr: bytes_concat(b"q", ascii_of_int(len(l.captures) + j)),
         ty: TyOpen,
       }),
   );
@@ -3737,11 +3737,11 @@ fn emit_lambda(
           name,
           b"(PlyCtx *ctx",
           fold(range(0, n), b"", |acc: Bytes, i: Int|
-            bytes_concat_all([acc, b", Word q", int_to_bytes(i)])),
+            bytes_concat_all([acc, b", Word q", ascii_of_int(i)])),
           b") {\n",
           fuel_head(bytes_concat(name, b"_entry"), param_names(b"q", n)),
           fold(sorted_widths(o.emitter.reuse_widths), b"", |acc: Bytes, w: Int|
-            bytes_concat_all([acc, b"  Word tok", int_to_bytes(w), b" = 0;\n"])),
+            bytes_concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"])),
           fold(o.emitter.deferred_locals, b"", |acc: Bytes, r: Bytes|
             bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"])),
           bytes_join(o.emitter.out, b""),
@@ -3754,7 +3754,7 @@ fn emit_lambda(
           name,
           b"(ctx",
           fold(range(0, n), b"", |acc: Bytes, i: Int|
-            bytes_concat_all([acc, b", args[", int_to_bytes(i), b"]"])),
+            bytes_concat_all([acc, b", args[", ascii_of_int(i), b"]"])),
           b");\n}\n",
         ]),
       })
@@ -4174,7 +4174,7 @@ fn closure_value(
         if bytes_len(sym) >= bytes_len(prefix) && bytes_slice(sym, 0, bytes_len(prefix)) == prefix {
           acc + 1
         } else { acc });
-      let sub = bytes_concat(prefix, int_to_bytes(idx));
+      let sub = bytes_concat(prefix, ascii_of_int(idx));
       let entry = lambda_of(w.emitter, bytes_concat(sub, b"_entry"));
       match emit_lambda(entry.emitter, sub, l) {
         None -> None,
@@ -4235,13 +4235,13 @@ fn closure_value(
             KBoxed,
             bytes_concat_all([
               b"rt_closure_p(ctx, @@l",
-              int_to_bytes(entry.i),
+              ascii_of_int(entry.i),
               b"@@, ",
-              int_to_bytes(l.params),
+              ascii_of_int(l.params),
               b", (Word)(intptr_t)",
               arr.name,
               b", ",
-              int_to_bytes(len(l.captures)),
+              ascii_of_int(len(l.captures)),
               b")",
             ]),
           );
@@ -4276,7 +4276,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             emitter: emitter,
             value: {
               kind: KNum(w),
-              expr: bytes_concat_all([b"((", ctype(KNum(w)), b")", int_to_bytes(bits), b")"]),
+              expr: bytes_concat_all([b"((", ctype(KNum(w)), b")", ascii_of_int(bits), b")"]),
               ty: TyOpen,
             },
           })
@@ -4315,9 +4315,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               KBoxed,
               bytes_concat_all([
                 b"rt_closure_p(ctx, @@l",
-                int_to_bytes(l.i),
+                ascii_of_int(l.i),
                 b"@@, ",
-                int_to_bytes(d.arity),
+                ascii_of_int(d.arity),
                 b", (Word)(intptr_t)",
                 arr.name,
                 b", 0)",
@@ -4337,7 +4337,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             let o = bind(
               bi.emitter,
               KBoxed,
-              bytes_concat_all([b"rt_builtin_value_p(ctx, @@b", int_to_bytes(bi.i), b"@@)"]),
+              bytes_concat_all([b"rt_builtin_value_p(ctx, @@b", ascii_of_int(bi.i), b"@@)"]),
             );
             Some({ emitter: check(o.emitter), value: o.value })
           } else {
@@ -4356,7 +4356,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               Some(
                 move_read(emitter, c.own, {
                   kind: KBoxed,
-                  expr: bytes_concat(b"p", int_to_bytes(s)),
+                  expr: bytes_concat(b"p", ascii_of_int(s)),
                   ty: p.ty,
                 }),
               ),
@@ -4430,7 +4430,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               },
             },
           }
-        } else if !is_arith(b.op) && compare_op(b.op) == None && !is_bitop(b.op)
+        } else if !is_arithmetic(b.op) && compare_op(b.op) == None && !is_bitop(b.op)
             && !is_shift(b.op) {
           Some(refused(emitter, bytes_concat(b"an operator this port does not emit: ", b.op)))
         } else {
@@ -4442,7 +4442,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 None -> None,
                 Some(r) ->
                   binary_rest(
-                    if is_arith(b.op) || is_shift(b.op) { site(r.emitter, c.span) }
+                    if is_arithmetic(b.op) || is_shift(b.op) { site(r.emitter, c.span) }
                     else { r.emitter },
                     b.op,
                     l.value,
@@ -4509,7 +4509,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             b"rt_list_p(ctx, (Word)(intptr_t)",
             arr.name,
             b", ",
-            int_to_bytes(len(l.items)),
+            ascii_of_int(len(l.items)),
             b")",
           ]),
         );
@@ -4539,7 +4539,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 held.emitter,
                 KBoxed,
                 i.ty,
-                bytes_concat_all([b"ply_words(", held.value.expr, b")[", int_to_bytes(i.at), b"]"]),
+                bytes_concat_all([b"ply_words(", held.value.expr, b")[", ascii_of_int(i.at), b"]"]),
               );
               match i.kind {
                 // Without release a word-kinded field never releases its base: there is no in-place field take.
@@ -4577,7 +4577,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   b"rt_field_p(ctx, ",
                   held.value.expr,
                   b", @@f",
-                  int_to_bytes(idx.i),
+                  ascii_of_int(idx.i),
                   b"@@, ",
                   if take { b"1" } else { b"0" },
                   b")",
@@ -4634,7 +4634,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                             b"ply_words(",
                             held.value.expr,
                             b")[",
-                            int_to_bytes(f.at),
+                            ascii_of_int(f.at),
                             b"]",
                           ]),
                         );
@@ -4673,7 +4673,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                             b"rt_field_p(ctx, ",
                             held.value.expr,
                             b", @@f",
-                            int_to_bytes(idx.i),
+                            ascii_of_int(idx.i),
                             b"@@, 0)",
                           ]),
                         );
@@ -4786,7 +4786,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                     b", (Word)(intptr_t)",
                     arr.name,
                     b", ",
-                    int_to_bytes(len(a.args)),
+                    ascii_of_int(len(a.args)),
                     b")",
                   ]),
                 );
@@ -4805,7 +4805,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 let held = bind(
                   l.emitter,
                   KBoxed,
-                  bytes_concat_all([b"rt_constant_p(ctx, @@l", int_to_bytes(l.i), b"@@)"]),
+                  bytes_concat_all([b"rt_constant_p(ctx, @@l", ascii_of_int(l.i), b"@@)"]),
                 );
                 Some(opened_to(check(held.emitter), held.value, k.ret))
               },
@@ -5245,7 +5245,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               b", (Word)(intptr_t)",
               arr.name,
               b", ",
-              int_to_bytes(len(p.args)),
+              ascii_of_int(len(p.args)),
               b")",
             ]),
           );
@@ -5328,14 +5328,14 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               b"rt_parallel_p(ctx, (Word)(intptr_t)",
               arr.name,
               b", ",
-              int_to_bytes(n),
+              ascii_of_int(n),
               b");",
             ]),
           ),
         );
-        let names = map(range(0, n), |i: Int| bytes_concat(b"_", int_to_bytes(i)));
+        let names = map(range(0, n), |i: Int| bytes_concat(b"_", ascii_of_int(i)));
         let words = map(range(0, n), |i: Int|
-          bytes_concat_all([arr.name, b"[", int_to_bytes(i), b"]"]));
+          bytes_concat_all([arr.name, b"[", ascii_of_int(i), b"]"]));
         let sorted = sorted_names(names);
         Some(
           build_record(
@@ -5365,7 +5365,7 @@ fn scheduled_ops() -> List<Bytes> =
   ]
 
 // A field-table placeholder the unit resolves; the runtime reads effect, operation and resource names from it.
-fn field_ref(i: Int) -> Bytes = bytes_concat_all([b"@@f", int_to_bytes(i), b"@@"])
+fn field_ref(i: Int) -> Bytes = bytes_concat_all([b"@@f", ascii_of_int(i), b"@@"])
 
 // `None` for a name the module's scope does not bind.
 fn effect_global(emitter: Emitter, written: Bytes) -> Option<Bytes> =
@@ -5597,7 +5597,7 @@ fn handle_site(
                     b"rt_handle_detached_p(ctx, (Word)(intptr_t)",
                     arr.name,
                     b", ",
-                    int_to_bytes(len(clauses)),
+                    ascii_of_int(len(clauses)),
                     b", ",
                     rc.clause,
                     b", ",
@@ -5616,14 +5616,14 @@ fn handle_site(
                 b"rt_handle_push_p(ctx, (Word)(intptr_t)",
                 arr.name,
                 b", ",
-                int_to_bytes(len(clauses)),
+                ascii_of_int(len(clauses)),
                 b", ",
                 rc.clause,
                 b")",
               ]),
             );
             let mark = fresh(depth.emitter);
-            let label = bytes_concat(b"land_", int_to_bytes(mark.emitter.temp_count));
+            let label = bytes_concat(b"land_", ascii_of_int(mark.emitter.temp_count));
             // Under release the body is its own block, so its holders are released at its close, before the landing label.
             let opened = if mark.emitter.release { indent(line(mark.emitter, b"{")) }
             else { mark.emitter };
@@ -5752,7 +5752,7 @@ fn local_of(emitter: Emitter, params: List<EmitParam>, s: Int) -> Option<Bytes> 
   match conv_of(emitter, s) {
     Some(cv) -> Some(cv.expr),
     None -> match list_at(params, s) {
-      Some(_) -> Some(bytes_concat(b"p", int_to_bytes(s))),
+      Some(_) -> Some(bytes_concat(b"p", ascii_of_int(s))),
       None -> None,
     },
   }
@@ -6147,10 +6147,6 @@ fn equal_test(
   { emitter: check(eq.emitter), expr: eq.value.expr }
 }
 
-// A variable pattern is irrefutable: the parser makes every upper-case bare name in pattern position a constructor.
-fn irrefutable(pattern: CodePattern) -> Bool =
-  match pattern { PxWild -> true, PxVar(_) -> true, _ -> false }
-
 // A nested pattern reads a field into a local under the test so far, since reading a non-record raises. `None` for an unsupported pattern.
 fn pat_test(
   pattern: CodePattern,
@@ -6203,7 +6199,7 @@ fn pat_test(
           b" && ply_obj(",
           subj.expr,
           b")->len == ",
-          int_to_bytes(len(c.args)),
+          ascii_of_int(len(c.args)),
           b")",
         ]);
         fold(
@@ -6224,7 +6220,7 @@ fn pat_test(
                       b" ? ply_words(",
                       subj.expr,
                       b")[",
-                      int_to_bytes(k),
+                      ascii_of_int(k),
                       b"] : 0)",
                     ]),
                   );
@@ -6248,7 +6244,7 @@ fn pat_test(
         b"rt_record_fits_p(ctx, ",
         subj.expr,
         b", ",
-        int_to_bytes(len(r.fields)),
+        ascii_of_int(len(r.fields)),
         b", ",
         if r.rest { b"0" } else { b"1" },
         b")",
@@ -6267,7 +6263,7 @@ fn pat_test(
                 b" && rt_record_has_p(ctx, ",
                 subj.expr,
                 b", @@f",
-                int_to_bytes(idx.i),
+                ascii_of_int(idx.i),
                 b"@@))",
               ]);
               if irrefutable(f.pat) { Some({ emitter: idx.emitter, expr: has }) } else {
@@ -6280,7 +6276,7 @@ fn pat_test(
                     b" ? rt_field_p(ctx, ",
                     subj.expr,
                     b", @@f",
-                    int_to_bytes(idx.i),
+                    ascii_of_int(idx.i),
                     b"@@, 0) : 0)",
                   ]),
                 );
@@ -6307,7 +6303,7 @@ fn pat_test(
         b"rt_list_fits_p(ctx, ",
         subj.expr,
         b", ",
-        int_to_bytes(len(l.items)),
+        ascii_of_int(len(l.items)),
         b", ",
         match l.rest { Some(_) -> b"0", None -> b"1" },
         b")",
@@ -6330,7 +6326,7 @@ fn pat_test(
                     b" ? rt_list_at_p(ctx, ",
                     subj.expr,
                     b", ",
-                    int_to_bytes(i),
+                    ascii_of_int(i),
                     b") : 0)",
                   ]),
                 );
@@ -6366,7 +6362,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         let w = bind(
           acc,
           KBoxed,
-          bytes_concat_all([b"ply_words(", subj.expr, b")[", int_to_bytes(i), b"]"]),
+          bytes_concat_all([b"ply_words(", subj.expr, b")[", ascii_of_int(i), b"]"]),
         );
         let inc = note_holder(
           line(w.emitter, bytes_concat_all([b"ply_inc(", w.value.expr, b");"])),
@@ -6385,7 +6381,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
             b"rt_field_p(ctx, ",
             subj.expr,
             b", @@f",
-            int_to_bytes(idx.i),
+            ascii_of_int(idx.i),
             b"@@, 0)",
           ]),
         );
@@ -6396,7 +6392,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         let at = bind(
           acc,
           KBoxed,
-          bytes_concat_all([b"rt_list_at_p(ctx, ", subj.expr, b", ", int_to_bytes(i), b")"]),
+          bytes_concat_all([b"rt_list_at_p(ctx, ", subj.expr, b", ", ascii_of_int(i), b")"]),
         );
         match list_at(l.items, i) {
           Some(item) -> pat_bind(check(at.emitter), item, at.value),
@@ -6413,7 +6409,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
               b"rt_list_rest_p(ctx, ",
               subj.expr,
               b", ",
-              int_to_bytes(len(l.items)),
+              ascii_of_int(len(l.items)),
               b")",
             ]),
           );
@@ -6587,7 +6583,7 @@ fn rebuild(
 // `INT64_C(-9223372036854775808)` negates an unsigned literal, which C cannot write as a constant, so the least `Int` is named.
 fn int_lit(n: Int) -> Bytes =
   if n == 0 - 9223372036854775807 - 1 { b"INT64_MIN" }
-  else { bytes_concat_all([b"INT64_C(", int_to_bytes(n), b")"]) }
+  else { bytes_concat_all([b"INT64_C(", ascii_of_int(n), b")"]) }
 
 // Two literals folded under an operator: `+`, `-`, `*` only without overflow, a shift only by a count the width holds.
 fn lit_int(code: Code) -> Option<Int> / {abort.raise} =
@@ -6633,9 +6629,6 @@ fn checked_mul(a: Int, b: Int) -> Option<Int> / {abort.raise} =
 // Where two arms disagree the join is a word, and each is converted into it.
 fn join_kind(a: Kind, b: Kind) -> Kind = if a == b { a } else { KBoxed }
 
-fn is_arith(op: Bytes) -> Bool =
-  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
-
 fn is_bitop(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
 
 fn is_shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
@@ -6664,7 +6657,7 @@ fn narrow(wide: WithValue, width: Width, code: Int) -> Option<WithValue> / {abor
       b" > ",
       int_lit(width_max(width)),
       b") { rt_overflow_p(ctx, ",
-      int_to_bytes(code),
+      ascii_of_int(code),
       b"); return 0; }",
     ]),
   );
@@ -6695,7 +6688,7 @@ fn negated(
           b"if (",
           a,
           b" == INT64_MIN) { rt_overflow_p(ctx, ",
-          int_to_bytes(overflow_code(b"neg")),
+          ascii_of_int(overflow_code(b"neg")),
           b"); return 0; }",
         ]),
       );
@@ -6739,14 +6732,14 @@ fn shift(
 ) -> WithValue / {abort.raise} = {
   let bound = match width { Some(t) -> t.bits, None -> 64 };
   let count = bind(emitter, KInt, as_int(r));
-  let which = match width { Some(t) -> int_to_bytes(width_index(t)), None -> b"-1" };
+  let which = match width { Some(t) -> ascii_of_int(width_index(t)), None -> b"-1" };
   let g = line(
     count.emitter,
     bytes_concat_all([
       b"if ((uint64_t)",
       count.value.expr,
       b" >= (uint64_t)",
-      int_to_bytes(bound),
+      ascii_of_int(bound),
       b") { rt_shift_count_p(ctx, ",
       count.value.expr,
       b", ",
@@ -6783,7 +6776,7 @@ fn width_binary(
 ) -> Option<WithValue> / {abort.raise} = {
   let a = as_num(l, t);
   let bb = as_num(r, t);
-  if is_arith(op) {
+  if is_arithmetic(op) {
     let wide = if op == b"add" {
       bind(emitter, KInt, bytes_concat_all([b"(int64_t)(", a, b") + (int64_t)(", bb, b")"]))
     } else if op == b"sub" {
@@ -6794,7 +6787,7 @@ fn width_binary(
         KInt,
         bytes_concat_all([
           b"rt_arith_p(ctx, ",
-          int_to_bytes(arith_code(op)),
+          ascii_of_int(arith_code(op)),
           b", (int64_t)(",
           a,
           b"), (int64_t)(",
@@ -6904,7 +6897,7 @@ fn word_binary(
       KBoxed,
       bytes_concat_all([
         b"rt_binary_p(ctx, ",
-        int_to_bytes(binary_code(op)),
+        ascii_of_int(binary_code(op)),
         b", ",
         lo.value.expr,
         b", ",
@@ -6942,7 +6935,7 @@ fn arithmetic(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> WithValue / 
         b", &",
         f.name,
         b")) { rt_overflow_p(ctx, ",
-        int_to_bytes(overflow_code(op)),
+        ascii_of_int(overflow_code(op)),
         b"); return 0; }",
       ]),
     );
@@ -6953,7 +6946,7 @@ fn arithmetic(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> WithValue / 
       KInt,
       bytes_concat_all([
         b"rt_arith_p(ctx, ",
-        int_to_bytes(arith_code(op)),
+        ascii_of_int(arith_code(op)),
         b", ",
         l.expr,
         b", ",
@@ -7025,7 +7018,7 @@ fn param_local(emitter: Emitter, i: Int) -> Option<CValue> =
 fn converted_params(emitter: Emitter, params: List<EmitParam>) -> List<Bytes> =
   fold(range(0, len(params)), [], |acc: List<Bytes>, i: Int|
     match param_local(emitter, i) {
-      Some(_) -> push(acc, bytes_concat(b"p", int_to_bytes(i))),
+      Some(_) -> push(acc, bytes_concat(b"p", ascii_of_int(i))),
       None -> acc,
     })
 
@@ -7075,7 +7068,7 @@ fn self_tail(
                 bytes_concat_all([
                   match param_local(acc, i) {
                     Some(p) -> p.expr,
-                    None -> bytes_concat(b"p", int_to_bytes(i)),
+                    None -> bytes_concat(b"p", ascii_of_int(i)),
                   },
                   b" = ",
                   nm,
@@ -7128,18 +7121,18 @@ fn group_tail(
         |acc: Emitter, i: Int|
           match list_at(w.names, i) {
             None -> acc,
-            Some(nm) -> line(acc, bytes_concat_all([b"p", int_to_bytes(i), b" = ", nm, b";"])),
+            Some(nm) -> line(acc, bytes_concat_all([b"p", ascii_of_int(i), b" = ", nm, b";"])),
           },
       );
       let zeroed = fold(
         range(len(w.names), group_width(emitter)),
         assigned,
-        |acc: Emitter, i: Int| line(acc, bytes_concat_all([b"p", int_to_bytes(i), b" = 0;"])),
+        |acc: Emitter, i: Int| line(acc, bytes_concat_all([b"p", ascii_of_int(i), b" = 0;"])),
       );
       let d = ret_of(emitter.here, name);
       Some({
         emitter: line(
-          line(zeroed, bytes_concat_all([b"which = ", int_to_bytes(which), b";"])),
+          line(zeroed, bytes_concat_all([b"which = ", ascii_of_int(which), b";"])),
           b"goto ply_loop;",
         ),
         value: { kind: match d.kind { Some(k) -> k, None -> KBoxed }, expr: b"0", ty: d.ty },
@@ -7154,17 +7147,17 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter / {abort.raise
       None -> acc,
       Some(p) -> {
         let acc = note_bound(
-          note_holder(acc, bytes_concat(b"p", int_to_bytes(i))),
-          bytes_concat(b"p", int_to_bytes(i)),
+          note_holder(acc, bytes_concat(b"p", ascii_of_int(i))),
+          bytes_concat(b"p", ascii_of_int(i)),
         );
         match p.kind {
           // A record arrives as its word and is never opened, but its reads are still charged, or the release rule sees nothing read it.
-          KBoxed -> charge(acc, i, bytes_concat(b"p", int_to_bytes(i))),
+          KBoxed -> charge(acc, i, bytes_concat(b"p", ascii_of_int(i))),
           KBool -> {
             let o = bind(
               acc,
               KBool,
-              bytes_concat_all([b"rt_unbox_bool_p(ctx, p", int_to_bytes(i), b")"]),
+              bytes_concat_all([b"rt_unbox_bool_p(ctx, p", ascii_of_int(i), b")"]),
             );
             remember(o.emitter, i, o.value)
           },
@@ -7172,7 +7165,7 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter / {abort.raise
             let o = bind(
               acc,
               KNum(w),
-              as_num({ kind: KBoxed, expr: bytes_concat(b"p", int_to_bytes(i)), ty: TyOpen }, w),
+              as_num({ kind: KBoxed, expr: bytes_concat(b"p", ascii_of_int(i)), ty: TyOpen }, w),
             );
             remember(o.emitter, i, o.value)
           },
@@ -7182,11 +7175,11 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter / {abort.raise
               KInt,
               bytes_concat_all([
                 b"(ply_is_imm(p",
-                int_to_bytes(i),
+                ascii_of_int(i),
                 b") ? ply_imm_value(p",
-                int_to_bytes(i),
+                ascii_of_int(i),
                 b") : rt_unbox_int_p(ctx, p",
-                int_to_bytes(i),
+                ascii_of_int(i),
                 b"))",
               ]),
             );
@@ -7447,7 +7440,7 @@ pub fn emit_fn_full(
         name,
         b"(PlyCtx *ctx",
         fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
-          bytes_concat_all([acc, b", Word p", int_to_bytes(i)])),
+          bytes_concat_all([acc, b", Word p", ascii_of_int(i)])),
         b") {\n",
       ]);
       let head = fuel_head(bytes_concat(name, b"_entry"), param_names(b"p", len(params)));
@@ -7461,12 +7454,12 @@ pub fn emit_fn_full(
         name,
         b"(ctx",
         fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
-          bytes_concat_all([acc, b", args[", int_to_bytes(i), b"]"])),
+          bytes_concat_all([acc, b", args[", ascii_of_int(i), b"]"])),
         b");\n}\n",
       ]);
       // Token declarations go in front once the body has used them; they take no temporary, so nothing moves.
       let toks = fold(sorted_widths(o.emitter.reuse_widths), b"", |acc: Bytes, w: Int|
-        bytes_concat_all([acc, b"  Word tok", int_to_bytes(w), b" = 0;\n"]));
+        bytes_concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"]));
       let decls = fold(o.emitter.deferred_locals, b"", |acc: Bytes, r: Bytes|
         bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"]));
       Some({
@@ -7621,11 +7614,11 @@ pub fn emit_group_full(
         gname,
         b"(PlyCtx *ctx, int which",
         fold(range(0, width), b"", |acc: Bytes, i: Int|
-          bytes_concat_all([acc, b", Word p", int_to_bytes(i)])),
+          bytes_concat_all([acc, b", Word p", ascii_of_int(i)])),
         b") {\n",
       ]);
       let toks = fold(sorted_widths(emitter.reuse_widths), b"", |acc: Bytes, w: Int|
-        bytes_concat_all([acc, b"  Word tok", int_to_bytes(w), b" = 0;\n"]));
+        bytes_concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"]));
       let decls = fold(emitter.deferred_locals, b"", |acc: Bytes, r: Bytes|
         bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"]));
       let entered = bytes_concat_all([
@@ -7635,7 +7628,7 @@ pub fn emit_group_full(
         gname,
         b"(ctx, (int)args[0]",
         fold(range(0, width), b"", |acc: Bytes, i: Int|
-          bytes_concat_all([acc, b", args[", int_to_bytes(i + 1), b"]"])),
+          bytes_concat_all([acc, b", args[", ascii_of_int(i + 1), b"]"])),
         b");\n}\n",
       ]);
       let wrappers = fold(range(0, len(members)), b"", |acc: Bytes, i: Int|
@@ -7672,7 +7665,7 @@ fn group_cases(emitter: Emitter, members: List<Member>, i: Int) -> Option<Emitte
       None -> None,
       Some(m) -> {
         let opened: Emitter = indent(
-          line(emitter, bytes_concat_all([b"case ", int_to_bytes(i), b": {"])),
+          line(emitter, bytes_concat_all([b"case ", ascii_of_int(i), b": {"])),
         );
         let entered: Emitter = {
           ..opened,
@@ -7714,14 +7707,14 @@ fn group_wrapper(gname: Bytes, which: Int, member: Member, width: Int) -> Bytes 
     name,
     b"(PlyCtx *ctx",
     fold(range(0, n), b"", |acc: Bytes, i: Int|
-      bytes_concat_all([acc, b", Word p", int_to_bytes(i)])),
+      bytes_concat_all([acc, b", Word p", ascii_of_int(i)])),
     b") {\n",
     b"  return ",
     gname,
     b"(ctx, ",
-    int_to_bytes(which),
+    ascii_of_int(which),
     fold(range(0, width), b"", |acc: Bytes, i: Int|
-      bytes_concat(acc, if i < n { bytes_concat(b", p", int_to_bytes(i)) } else { b", 0" })),
+      bytes_concat(acc, if i < n { bytes_concat(b", p", ascii_of_int(i)) } else { b", 0" })),
     b");\n}\n",
     b"Word ",
     name,
@@ -7729,7 +7722,7 @@ fn group_wrapper(gname: Bytes, which: Int, member: Member, width: Int) -> Bytes 
     name,
     b"(ctx",
     fold(range(0, n), b"", |acc: Bytes, i: Int|
-      bytes_concat_all([acc, b", args[", int_to_bytes(i), b"]"])),
+      bytes_concat_all([acc, b", args[", ascii_of_int(i), b"]"])),
     b");\n}\n",
   ])
 }
@@ -7861,13 +7854,13 @@ fn grow_call(entry: Bytes, args: List<Bytes>) -> Bytes =
   } else {
     bytes_concat_all([
       b"Word ply_grown[",
-      int_to_bytes(len(args)),
+      ascii_of_int(len(args)),
       b"];",
       fold(range(0, len(args)), b"", |acc: Bytes, i: Int|
         bytes_concat_all([
           acc,
           b" ply_grown[",
-          int_to_bytes(i),
+          ascii_of_int(i),
           b"] = ",
           match list_at(args, i) { Some(a) -> a, None -> b"" },
           b";",
@@ -7880,12 +7873,12 @@ fn grow_call(entry: Bytes, args: List<Bytes>) -> Bytes =
 
 // The names a prologue still holds its arguments under, before any loop has reassigned them.
 fn param_names(prefix: Bytes, n: Int) -> List<Bytes> =
-  map(range(0, n), |i: Int| bytes_concat(prefix, int_to_bytes(i)))
+  map(range(0, n), |i: Int| bytes_concat(prefix, ascii_of_int(i)))
 
 // A group's are its case selector and the widest member's parameters.
 fn group_args(width: Int) -> List<Bytes> =
   fold(range(0, width), [b"which"], |acc: List<Bytes>, i: Int|
-    push(acc, bytes_concat(b"p", int_to_bytes(i))))
+    push(acc, bytes_concat(b"p", ascii_of_int(i))))
 
 test "a body that answers a literal" {
   let f = symbol_of(b"m.f");
@@ -8931,7 +8924,7 @@ fn emit_module(
         },
         // A test is a nullary root named by its place among the module's tests.
         ITest(t) -> {
-          let full = qualify(module, bytes_concat_all([b"test#", int_to_bytes(acc.tests)]));
+          let full = qualify(module, bytes_concat_all([b"test#", ascii_of_int(acc.tests)]));
           let out = if !wants(wanted, full) { acc.out } else {
             push(
               acc.out,
@@ -8965,7 +8958,7 @@ fn emit_module(
           let known = fold(kinds, true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
             acc2 && k != None);
           let part = |which: Bytes|
-            qualify(module, bytes_concat_all([b"law#", int_to_bytes(acc.laws), which]));
+            qualify(module, bytes_concat_all([b"law#", ascii_of_int(acc.laws), which]));
           let with_guard = match d.guard {
             None -> acc.out,
             Some(g) -> if !wants(wanted, part(b".guard")) { acc.out } else {
@@ -9339,7 +9332,7 @@ fn clause_roots(
 ) -> Walk / {abort.raise} = {
   let known = fold(kinds, true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>| acc2 && k != None);
   let clause = |kind: Bytes, k: Int|
-    qualify(module, bytes_concat_all([def.name.name, b"#", kind, b"#", int_to_bytes(k)]));
+    qualify(module, bytes_concat_all([def.name.name, b"#", kind, b"#", ascii_of_int(k)]));
   let walked = fold(
     def.spec,
     { out: acc.out, requires: 0, ensures: 0 },
@@ -9609,10 +9602,10 @@ fn mangled(name: Bytes, start: Int, at: Int, delim: Int, acc: Bytes) -> Bytes / 
 
 fn mangled_part(part: Bytes, delim: Int) -> Bytes / {abort.raise} =
   if c_ident_bytes(part, 0) {
-    bytes_concat_all([part, if delim == 35 { b"h" } else { b"_" }, int_to_bytes(bytes_len(part))])
+    bytes_concat_all([part, if delim == 35 { b"h" } else { b"_" }, ascii_of_int(bytes_len(part))])
   } else {
     let hexed = hex(part);
-    bytes_concat_all([hexed, if delim == 35 { b"y" } else { b"x" }, int_to_bytes(bytes_len(hexed))])
+    bytes_concat_all([hexed, if delim == 35 { b"y" } else { b"x" }, ascii_of_int(bytes_len(hexed))])
   }
 
 fn c_ident_bytes(part: Bytes, i: Int) -> Bool / {abort.raise} =

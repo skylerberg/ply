@@ -1,12 +1,12 @@
 // The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import parsing (Span, Ident, QName, span_to, dummy_span, int_to_bytes, span_key, push_front,
-                span_bin)
+import parsing (Span, Ident, QName, span_to, dummy_span, span_key, span_bin, is_bare, qname_text,
+                starts_upper)
 import std.bin
 import std.hash (blake3)
-import std.list (at, concat, contains, drop, sort_by, take)
+import std.list (at, concat, contains, drop, sort_by, take, prepend)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span)
+                    MWrite, MBad, ty_span, mode_text)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
               ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
               EffectDef, OpDef, TestDef, LawDef, Binder, Constraint, Deriver, DJson, DEq, DOrd,
@@ -15,7 +15,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
-              ReturnClause, RecField, expr_span)
+              ReturnClause, RecField, expr_span, is_arithmetic, is_ordered)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -42,8 +42,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 ModuleEntry, Diag, Label, Edit, Fix, with_fix, insertion, Namespace, ValueSpace,
                 TypeSpace, EffectSpace, resolve_modules, ResolveSucceeded, ResolveFailed, Expanded,
                 find, lookup, lookup_declared, space, qualify, default_binder, dump_diags,
-                error_with_labels, error_at, error_at_and, label_at, is_bare, is_ctor_name,
-                backticked, describe_namespace, private_name, pattern_binders)
+                error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
+                private_name, pattern_binders, has_error)
 import rewrite (expand, expand_record_updates, expand_witnesses, NumericWitness, ConcreteWitness,
                 ParamWitness, numeric_witness_bin)
 import embed (EmbedAt, embed_tables, rewritten)
@@ -53,6 +53,7 @@ import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrai
                constructor_shape, null_encoded_name, Expansion, expand_derives, refusal_note,
                secret_reason, float_reason, null_in_option_note, same_deriver)
 import std.bytes
+import std.bytes (ascii_of_int)
 
 // --- What the checker keeps ----------------------------------------------------------
 
@@ -343,7 +344,7 @@ pub type KeptFacts = { name: Bytes, facts: Bytes }
 // The name a test's sites are filed under: its module and its place among the module's tests,
 // since two tests may share a label and a test may share a definition's name.
 pub fn test_owner(module: Bytes, position: Int) -> Bytes =
-  bytes_concat_all([module, b".test#", int_to_bytes(position)])
+  bytes_concat_all([module, b".test#", ascii_of_int(position)])
 // `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own,
 // whose promises are checked here; a dependency's were checked when its package was.
 pub type Known = {
@@ -539,16 +540,10 @@ fn err_labels(
 
 fn backticked_text(x: Bytes) -> Bytes = bytes_concat_all([b"`", x, b"`"])
 
-fn qname_text(qname: QName) -> Bytes =
-  match qname.module {
-    Some(m) -> bytes_concat_all([m.name, b"::", qname.name.name]),
-    None -> qname.name.name,
-  }
-
 fn plural(n: Int) -> Bytes = if n == 1 { b"" } else { b"s" }
 
 fn supplied(n: Int) -> Bytes =
-  if n == 1 { b"1 was supplied" } else { bytes_concat(int_to_bytes(n), b" were supplied") }
+  if n == 1 { b"1 was supplied" } else { bytes_concat(ascii_of_int(n), b" were supplied") }
 
 fn what_of(deriver: Deriver) -> Bytes =
   match deriver {
@@ -1634,13 +1629,13 @@ fn arity_error(
       b"`",
       name,
       b"` takes ",
-      int_to_bytes(expected),
+      ascii_of_int(expected),
       b" ",
       w,
       b", but ",
       supplied(found),
     ]),
-    bytes_concat_all([b"expected ", int_to_bytes(expected), b", found ", int_to_bytes(found)]),
+    bytes_concat_all([b"expected ", ascii_of_int(expected), b", found ", ascii_of_int(found)]),
     [],
   )
 }
@@ -2000,10 +1995,10 @@ fn conv_atom(
                     b"effect `",
                     eff,
                     b"` declares no `",
-                    mode_key(a.mode),
+                    mode_text(a.mode),
                     b"` operation",
                   ]),
-                  bytes_concat_all([b"no `", mode_key(a.mode), b"` operation to perform"]),
+                  bytes_concat_all([b"no `", mode_text(a.mode), b"` operation to perform"]),
                 ),
             };
             let reported: Checker = report_error_at(
@@ -2023,7 +2018,7 @@ fn conv_atom(
 
 fn known_modes(info: EffectInfo) -> List<Bytes> =
   fold(info.ops, [], |acc: List<Bytes>, op_info: OpInfo| {
-    let k = bytes_concat_all([info.simple_name, b".", mode_key(op_info.mode)]);
+    let k = bytes_concat_all([info.simple_name, b".", mode_text(op_info.mode)]);
     if contains(acc, k) { acc } else { push(acc, k) }
   })
 
@@ -2040,8 +2035,6 @@ fn mode_eq(a: Mode, b: Mode) -> Bool =
     MWrite -> match b { MWrite -> true, _ -> false },
     MBad -> false,
   }
-
-fn mode_key(mode: Mode) -> Bytes = match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
 
 fn effect_name(
   checker: Checker,
@@ -2260,7 +2253,7 @@ fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                         at(ps.tys, i),
                         ty_span(at(op.params, i)),
                         op.name.name,
-                        bytes_concat(b"parameter ", int_to_bytes(i + 1)),
+                        bytes_concat(b"parameter ", ascii_of_int(i + 1)),
                       ));
                     let c4 = reject_declared_brand(
                       c3,
@@ -2338,7 +2331,7 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
                           at(fs.tys, i),
                           ty_span(at(variant.fields, i)),
                           variant.name.name,
-                          bytes_concat(b"field ", int_to_bytes(i + 1)),
+                          bytes_concat(b"field ", ascii_of_int(i + 1)),
                         ),
                     );
                     let ty = if len(fs.tys) == 0 { result }
@@ -2765,13 +2758,13 @@ fn report_unify(
         checker,
         b"E0202",
         span,
-        bytes_concat_all([context, b"|", int_to_bytes(a.expected), b"|", int_to_bytes(a.found)]),
+        bytes_concat_all([context, b"|", ascii_of_int(a.expected), b"|", ascii_of_int(a.found)]),
         bytes_concat(b"function arity mismatch: ", context),
         bytes_concat_all([
           b"expected ",
-          int_to_bytes(a.expected),
+          ascii_of_int(a.expected),
           b" parameter(s), found ",
-          int_to_bytes(a.found),
+          ascii_of_int(a.found),
         ]),
         [],
       ),
@@ -3356,7 +3349,7 @@ fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferre
       let j: WithRow = join(o.checker, span, acc.row, o.row);
       {
         checker: j.checker,
-        fs: push(acc.fs, { name: bytes_concat(b"_", int_to_bytes(i)), ty: o.ty }),
+        fs: push(acc.fs, { name: bytes_concat(b"_", ascii_of_int(i)), ty: o.ty }),
         row: j.row,
         rows: push(acc.rows, { span: expr_span(b), row: o.row }),
       }
@@ -3612,9 +3605,6 @@ fn nonzero_literal(e: Expr) -> Bool =
     _ -> false,
   }
 
-fn is_arithmetic(op: Bytes) -> Bool =
-  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
-fn is_ordered(op: Bytes) -> Bool = op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
 fn is_bits(op: Bytes) -> Bool =
   op == b"bitand" || op == b"bitor" || op == b"bitxor" || op == b"shl" || op == b"shr"
     || op == b"ushr"
@@ -4069,11 +4059,11 @@ fn wrong_labels(
     bytes_concat_all([
       who,
       b" takes ",
-      int_to_bytes(want),
+      ascii_of_int(want),
       b" label parameter",
       plural(want),
       b", but ",
-      int_to_bytes(len(labels)),
+      ascii_of_int(len(labels)),
       b" ",
       if len(labels) == 1 { b"is" } else { b"are" },
       b" written",
@@ -4506,7 +4496,7 @@ fn infer_app_general(
         b"E0202",
         bytes_concat_all([
           b"this function takes ",
-          int_to_bytes(n),
+          ascii_of_int(n),
           b" argument",
           plural(n),
           b", but ",
@@ -4517,7 +4507,7 @@ fn infer_app_general(
             c.module,
             span,
             true,
-            bytes_concat_all([b"expected ", int_to_bytes(n), b", found ", int_to_bytes(len(args))]),
+            bytes_concat_all([b"expected ", ascii_of_int(n), b", found ", ascii_of_int(len(args))]),
           ),
           label_at(c.module, expr_span(func), false, b"this is the function being called"),
         ],
@@ -4790,13 +4780,13 @@ fn bind_pattern(
                   b"constructor `",
                   ci.name,
                   b"` takes ",
-                  int_to_bytes(nf),
+                  ascii_of_int(nf),
                   b" field",
                   plural(nf),
                   b", but the pattern binds ",
-                  int_to_bytes(len(c.args)),
+                  ascii_of_int(len(c.args)),
                 ]),
-                bytes_concat_all([b"expected ", int_to_bytes(nf), b" fields"]),
+                bytes_concat_all([b"expected ", ascii_of_int(nf), b" fields"]),
                 ci.at,
                 b"declared here",
                 [],
@@ -5177,7 +5167,7 @@ fn uncovered_within(
 fn split_or(patterns: List<CoveragePattern>) -> List<List<CoveragePattern>> / {abort.raise} =
   match patterns {
     [CoverEither(alts), ..rest] ->
-      map(alternatives(CoverEither(alts)), |pattern: CoveragePattern| push_front(pattern, rest)),
+      map(alternatives(CoverEither(alts)), |pattern: CoveragePattern| prepend(pattern, rest)),
     _ -> [patterns],
   }
 
@@ -5204,7 +5194,7 @@ fn uncovered_split(
         None ->
           map(
             uncovered_within(checker, default_rows(rows, family), n - 1, room),
-            |w: List<CoveragePattern>| push_front(CoverAny, w),
+            |w: List<CoveragePattern>| prepend(CoverAny, w),
           ),
         Some(all) -> if fold(all, true, |b: Bool, k: CoverageCtor|
             b && heads_ctor(rows, family, k.key)) {
@@ -5221,7 +5211,7 @@ fn uncovered_split(
                 } else {
                   push(
                     acc,
-                    push_front(
+                    prepend(
                       CoverCtor({ family: family, key: k.key, name: k.name, args: wilds(k.arity) }),
                       w,
                     ),
@@ -5244,7 +5234,7 @@ fn through(
   map(
     uncovered_within(checker, specialize(rows, family, k), k.arity + n - 1, room),
     |patterns: List<CoveragePattern>|
-      push_front(
+      prepend(
         CoverCtor({ family: family, key: k.key, name: k.name, args: take(patterns, k.arity) }),
         drop(patterns, k.arity),
       ),
@@ -5299,7 +5289,7 @@ fn uncovered_record(
       _ -> push(acc, concat(wilds(k), drop(r, 1))),
     });
   map(uncovered_within(checker, spread, k + n - 1, room), |w: List<CoveragePattern>|
-    push_front(
+    prepend(
       CoverRecord(map(range(0, k), |i: Int| { name: at(names, i), pat: at(w, i) })),
       drop(w, k),
     ))
@@ -5337,7 +5327,7 @@ fn shown_record(fs: List<{ name: Bytes, pat: CoveragePattern }>) -> Bytes / {abo
   let parts = map(fs, |f: { name: Bytes, pat: CoveragePattern }| shown(f.pat));
   let tuple = len(fs) > 1
     && fold(range(0, len(fs)), true, |b: Bool, i: Int|
-      b && at(fs, i).name == bytes_concat(b"_", int_to_bytes(i)));
+      b && at(fs, i).name == bytes_concat(b"_", ascii_of_int(i)));
   if !fold(parts, false, |b: Bool, t: Bytes| b || t != b"_") { b"_" }
   else if tuple { bytes_concat_all([b"(", bytes::join(parts, b", "), b")"]) } else {
     let named = filter(range(0, len(fs)), |i: Int| at(parts, i) != b"_");
@@ -5495,7 +5485,7 @@ fn resource_for(
           [
             bytes_concat_all([
               b"drop the label, or declare it as `",
-              mode_key(op_info.mode),
+              mode_text(op_info.mode),
               b" ",
               op_info.name,
               b"[r](..)`",
@@ -5560,7 +5550,7 @@ fn clause_resource_for(
         [
           bytes_concat_all([
             b"drop it, or declare it as `",
-            mode_key(op_info.mode),
+            mode_text(op_info.mode),
             b" ",
             op_info.name,
             b"[r](..)`",
@@ -5667,7 +5657,7 @@ fn infer_perform(
                   b".",
                   hit.op.name,
                   b"` takes ",
-                  int_to_bytes(n),
+                  ascii_of_int(n),
                   b" argument",
                   plural(n),
                   b", but ",
@@ -5675,9 +5665,9 @@ fn infer_perform(
                 ]),
                 bytes_concat_all([
                   b"expected ",
-                  int_to_bytes(n),
+                  ascii_of_int(n),
                   b", found ",
-                  int_to_bytes(len(args)),
+                  ascii_of_int(len(args)),
                 ]),
                 hit.op.at,
                 b"declared here",
@@ -5817,15 +5807,15 @@ fn infer_handle(
                       b".",
                       hit.op.name,
                       b"` binds ",
-                      int_to_bytes(bound),
+                      ascii_of_int(bound),
                       b" parameter",
                       plural(bound),
                       b", but the operation takes ",
-                      int_to_bytes(len(shape.params)),
+                      ascii_of_int(len(shape.params)),
                     ]),
                     bytes_concat_all([
                       b"expected ",
-                      int_to_bytes(len(shape.params)),
+                      ascii_of_int(len(shape.params)),
                       b" parameters",
                     ]),
                     hit.op.at,
@@ -6086,7 +6076,7 @@ fn incomplete(
           bytes_concat_all([
             through,
             b" may perform any `",
-            mode_key(a.mode),
+            mode_text(a.mode),
             b"` operation of `",
             as_written(checker, a.effect),
             b"`; a clause for each of them discharges ",
@@ -6137,7 +6127,7 @@ fn clause_for(checker: Checker, atom: Atom) -> Bytes / {abort.raise} = {
   bytes_concat_all([
     written,
     b"(",
-    bytes::join(map(range(0, params), |i: Int| bytes_concat(b"a", int_to_bytes(i))), b", "),
+    bytes::join(map(range(0, params), |i: Int| bytes_concat(b"a", ascii_of_int(i))), b", "),
     b") -> panic(\"",
     written,
     b" is not handled here\")",
@@ -6817,7 +6807,7 @@ fn settled_row(checker: Checker, atoms: List<Atom>) -> Row / {abort.raise} =
 
 fn check_domain() -> Bytes = b"ply.check.1\0"
 
-fn framed(b: Bytes) -> Bytes = bytes_concat_all([int_to_bytes(bytes_len(b)), b":", b])
+fn framed(b: Bytes) -> Bytes = bytes_concat_all([ascii_of_int(bytes_len(b)), b":", b])
 
 // What a caller reads of a definition beyond its written signature: how its calls end, how it calls
 // what it is handed, and what it performs a growing number of times. The row it published is here
@@ -6828,7 +6818,7 @@ fn published_digest(info: DefInfo) -> Bytes / {abort.raise} =
       b"ply.published.1\0",
       framed(atoms_text(info.footprint, b",")),
       framed(atoms_text(info.scaling, b",")),
-      framed(bytes_concat_all(map(info.repeats, |i: Int| bytes_concat(int_to_bytes(i), b",")))),
+      framed(bytes_concat_all(map(info.repeats, |i: Int| bytes_concat(ascii_of_int(i), b",")))),
       match info.ending {
         Ends -> b"e",
         Stated -> b"s",
@@ -6949,7 +6939,7 @@ fn seeded_rows(checker: Checker, name: Bytes, check: Option<Bytes>) -> Option<Kn
 
 fn binders_text(n: Int, what: Bytes) -> Bytes =
   if n == 0 { bytes_concat_all([b"binds no ", what, b" parameters"]) }
-  else { bytes_concat_all([b"binds ", int_to_bytes(n), b" ", what, b" parameter", plural(n)]) }
+  else { bytes_concat_all([b"binds ", ascii_of_int(n), b" ", what, b" parameter", plural(n)]) }
 
 fn binders_differ(
   checker: Checker,
@@ -7054,7 +7044,7 @@ fn group_callee_kind(
   qualified: List<Bytes>,
   qname: QName,
 ) -> Callee / {abort.raise} =
-  if is_ctor_name(qname.name.name) { ConstructorCallee } else {
+  if starts_upper(qname.name.name) { ConstructorCallee } else {
     match declared_value(checker, qname) {
       Some(n) ->
         fold(range(0, len(qualified)), DefinedCallee(n), |acc: Callee, i: Int|
@@ -7793,7 +7783,7 @@ fn atom_written(checker: Checker, atom: Atom) -> Bytes / {abort.raise} =
     bytes_concat_all([
       as_written(checker, atom.effect),
       b".",
-      match atom.op { Some(op) -> op, None -> mode_key(atom.mode) },
+      match atom.op { Some(op) -> op, None -> mode_text(atom.mode) },
       resource_text(atom.resource),
     ])
   }
@@ -8466,7 +8456,7 @@ fn example_clause(checker: Checker, info: EffectInfo, atom: Atom) -> Bytes / {ab
     Some(o) -> {
       let resource = if o.resource_param { resource_text(atom.resource) } else { b"" };
       let args = bytes::join(
-        map(range(0, len(o.params)), |i: Int| bytes_concat(b"a", int_to_bytes(i))),
+        map(range(0, len(o.params)), |i: Int| bytes_concat(b"a", ascii_of_int(i))),
         b", ",
       );
       bytes_concat_all([written, b".", o.name, resource, b"(", args, b") -> <value>"])
@@ -8699,8 +8689,8 @@ fn row_display(row: Row) -> Bytes / {abort.raise} = {
   let atoms = bytes::join(map(row.atoms, atom_text), b", ");
   match row.tail {
     None -> bytes_concat_all([b"{", atoms, b"}"]),
-    Some(v) -> if len(row.atoms) == 0 { bytes_concat_all([b"{| e", int_to_bytes(v), b"}"]) }
-    else { bytes_concat_all([b"{", atoms, b" | e", int_to_bytes(v), b"}"]) },
+    Some(v) -> if len(row.atoms) == 0 { bytes_concat_all([b"{| e", ascii_of_int(v), b"}"]) }
+    else { bytes_concat_all([b"{", atoms, b" | e", ascii_of_int(v), b"}"]) },
   }
 }
 
@@ -10552,7 +10542,7 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
             bytes_concat_all([
               as_written({ ..c, module: site.module }, cl.op.effect),
               b".",
-              match cl.op.op { Some(o) -> o, None -> mode_key(cl.op.mode) },
+              match cl.op.op { Some(o) -> o, None -> mode_text(cl.op.mode) },
             ]),
           );
           err_labels(
@@ -10759,18 +10749,13 @@ type Checked = { checker: Checker, ok: Bool }
 pub fn check_program(resolved: Resolved, mods: List<ParsedModule>) -> Checked / {abort.raise} =
   check_program_with(resolved, mods, no_known())
 
-/// Whether any of `diags` is an error. A program with a warning in it is still a program: the
-/// emitter compiles it, the runtime runs it, and the warning is the reader's to act on.
-pub fn any_error(diags: List<Diag>) -> Bool =
-  fold(diags, false, |b: Bool, diag: Diag| b || diag.severity == b"error")
-
 // Every diagnostic, deduplicated, when any is an error; a warning alone is not one.
 pub fn check_diagnostics(
   resolved: Resolved,
   mods: List<ParsedModule>,
 ) -> List<Diag> / {abort.raise} = {
   let out = check_program(resolved, mods);
-  if any_error(out.checker.diags) { dedup_diags(out.checker.diags) } else { [] }
+  if has_error(out.checker.diags) { dedup_diags(out.checker.diags) } else { [] }
 }
 
 // What `check_program` publishes, prelude entries included, or the diagnostics when any is an error.
@@ -10805,7 +10790,7 @@ pub fn check_front_with(
   known: Known,
 ) -> CheckOutput / {abort.raise} = {
   let out = check_program_with(resolved, mods, known);
-  let failed = any_error(out.checker.diags);
+  let failed = has_error(out.checker.diags);
   {
     ok: !failed,
     diags: if failed { dedup_diags(out.checker.diags) } else { [] },
@@ -10996,7 +10981,7 @@ pub fn elaboration(
   mods: List<ParsedModule>,
 ) -> Option<Elaboration> / {abort.raise} = {
   let out = check_program(resolved, mods);
-  if any_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
+  if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
 }
 
 // The elaboration, and the definitions whose calls the checker saw end, which are the recursive
@@ -11008,7 +10993,7 @@ pub fn elaborated(
   mods: List<ParsedModule>,
 ) -> Option<Elaborated> / {abort.raise} = {
   let out = check_program(resolved, mods);
-  if any_error(out.checker.diags) { None } else {
+  if has_error(out.checker.diags) { None } else {
     Some({
       elaboration: elaboration_of(out.checker),
       ends: ended(out.checker.defs),
@@ -11034,7 +11019,7 @@ pub fn elaboration_with(
   known: Known,
 ) -> Option<Elaboration> / {abort.raise} = {
   let out = check_program_with(resolved, mods, known);
-  if any_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
+  if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
 }
 
 // One module's shapes, keyed by the update's span, as `expand_record_updates` reads them.
@@ -11192,16 +11177,14 @@ pub fn check_program_with(
   let solved: Checker = check_parallels(
     check_regions(check_simulations(attribute_generated(check_derives(constrained)))),
   );
-  { checker: solved, ok: !any_error(solved.diags) }
+  { checker: solved, ok: !has_error(solved.diags) }
 }
 
 // --- The dump -----------------------------------------------------------------------------------------------
 
-fn dump_int(v: Int) -> Bytes = int_to_bytes(v)
-
 fn footprint_text(atoms: List<Atom>) -> Bytes / {abort.raise} = atoms_text(atoms, b",")
 
-fn dump_flag(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
+pub fn dump_flag(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
 
 fn dump_def(def_info: DefInfo) -> Bytes / {abort.raise} =
   bytes_concat_all([
@@ -11216,7 +11199,7 @@ fn dump_def(def_info: DefInfo) -> Bytes / {abort.raise} =
     b";",
     bytes::join(
       map(def_info.constraints, |c: DefConstraint|
-        bytes_concat(deriver_text(c.deriver), dump_int(c.param))),
+        bytes_concat(deriver_text(c.deriver), ascii_of_int(c.param))),
       b",",
     ),
     b";",
@@ -11294,9 +11277,9 @@ fn dump_checked(checker: Checker) -> Bytes / {abort.raise} =
             b";",
             ctor_info.type_name,
             b";",
-            dump_int(ctor_info.index),
+            ascii_of_int(ctor_info.index),
             b";",
-            dump_int(ctor_info.arity),
+            ascii_of_int(ctor_info.arity),
             b";",
             scheme_text(ctor_info.scheme),
             b";",
@@ -11340,7 +11323,7 @@ pub fn check_dump(sources: List<Source>, embeds: List<EmbedAt> = []) -> String /
   let parsed = parsed_all(sources, embeds);
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| concat(acc, p.diags));
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-  let head = bytes_concat_all([b"K;", dump_int(len(sources)), b";"]);
+  let head = bytes_concat_all([b"K;", ascii_of_int(len(sources)), b";"]);
   let body = if len(expansion) > 0 { bytes_concat(b"X;", dump_diags(expansion)) } else {
     match resolve_modules(mods) {
       ResolveFailed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
@@ -11402,7 +11385,7 @@ pub fn check_dump_known(
   let parsed = parsed_all(sources, embeds);
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| concat(acc, p.diags));
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-  let head = bytes_concat_all([b"K;", dump_int(len(sources)), b";"]);
+  let head = bytes_concat_all([b"K;", ascii_of_int(len(sources)), b";"]);
   let body = if len(expansion) > 0 { bytes_concat(b"X;", dump_diags(expansion)) } else {
     match resolve_modules(mods) {
       ResolveFailed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
@@ -14000,14 +13983,14 @@ test "lambdas bound by `let` are read where they are called, so many deep and no
         map(range(1, n), |i: Int|
           bytes_concat_all([
             b"  let l",
-            int_to_bytes(i),
+            ascii_of_int(i),
             b" = |x: Int| l",
-            int_to_bytes(i - 1),
+            ascii_of_int(i - 1),
             b"(x);\n",
           ])),
       ),
       b"  if n <= 0 { 0 } else { l",
-      int_to_bytes(n - 1),
+      ascii_of_int(n - 1),
       b"(n - 1) }\n}\n",
     ]);
   assert(!diverges(chain(8), b"down"));
