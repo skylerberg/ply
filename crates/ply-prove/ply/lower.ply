@@ -3,7 +3,8 @@
 import compiler.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
                       NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField,
                       NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, Capture,
-                      CodePattern, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CodePatternField)
+                      CodePattern, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CodePatternField,
+                      irrefutable)
 import compiler.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
                           LBad)
 import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, is_pure, is_recursive,
@@ -21,6 +22,7 @@ import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym
              and, or, cmp, eq, app, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and,
              op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge)
 import std.list (concat, drop, take)
+import compiler.exprs (is_arithmetic, is_ordered)
 
 // Past this many terms no definition is unfolded further.
 pub fn max_terms() -> Int = 20000
@@ -607,11 +609,6 @@ fn binary_code(
     binary(r.lowering, op, l.id, r.id)
   }
 
-fn is_arith_op(op: Bytes) -> Bool =
-  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
-
-fn is_cmp_op(op: Bytes) -> Bool = op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
-
 fn cmp_of(op: Bytes) -> CmpOp =
   if op == b"lt" { Lt } else if op == b"le" { Le } else if op == b"gt" { Gt } else { Ge }
 
@@ -633,7 +630,7 @@ fn non_int_operator(
   rhs: Int,
   numeric: Numeric,
 ) -> L / {abort.raise} = {
-  let comparison = is_cmp_op(op);
+  let comparison = is_ordered(op);
   let lw2 = match numeric {
     FloatOperand -> floated(lowering),
     DecimalOperand -> {
@@ -651,10 +648,10 @@ fn forced(lowering: Lowering, a: Int, b: Int) -> Lowering / {abort.raise} =
   with_terms(lowering, force_int(force_int(lowering.terms, a), b))
 
 fn binary(lowering: Lowering, op: Bytes, lhs: Int, rhs: Int) -> L / {abort.raise} =
-  match if is_arith_op(op) || is_cmp_op(op) { operand_type(lowering.terms, lhs, rhs) }
+  match if is_arithmetic(op) || is_ordered(op) { operand_type(lowering.terms, lhs, rhs) }
     else { None } {
     Some(numeric) -> non_int_operator(lowering, op, lhs, rhs, numeric),
-    None -> if is_arith_op(op) {
+    None -> if is_arithmetic(op) {
       let lw2 = forced(lowering, lhs, rhs);
       let folded = if op == b"add" { add(lw2.terms, lhs, rhs) }
       else if op == b"sub" { sub(lw2.terms, lhs, rhs) }
@@ -677,7 +674,7 @@ fn binary(lowering: Lowering, op: Bytes, lhs: Int, rhs: Int) -> L / {abort.raise
           { lowering: with_terms(lw4, force_int(term.terms, term.id)), id: term.id }
         },
       }
-    } else if is_cmp_op(op) {
+    } else if is_ordered(op) {
       let lw2 = forced(lowering, lhs, rhs);
       on(lw2, cmp(lw2.terms, cmp_of(op), lhs, rhs))
     } else if op == b"and" { on(lowering, and(lowering.terms, lhs, rhs)) }
@@ -1344,12 +1341,12 @@ fn fits(
     PxCtor(c) -> match node(lowering.terms, t) {
       TCtor(k) -> if k.name != string_of_bytes_lossy(c.name) { Some(false) }
       else if len(k.args) == len(c.args)
-          && fold(c.args, true, |ok: Bool, a: CodePattern| ok && is_simple(a)) { Some(true) }
+          && fold(c.args, true, |ok: Bool, a: CodePattern| ok && irrefutable(a)) { Some(true) }
       else { None },
       _ -> None,
     },
-    PxList(l) -> if !fold(l.items, true, |ok: Bool, a: CodePattern| ok && is_simple(a))
-        || !(match l.rest { Some(r) -> is_simple(r), None -> true }) { None } else {
+    PxList(l) -> if !fold(l.items, true, |ok: Bool, a: CodePattern| ok && irrefutable(a))
+        || !(match l.rest { Some(r) -> irrefutable(r), None -> true }) { None } else {
       let s = spine(lowering.terms, t);
       let ended = match node(lowering.terms, s.end) { TNil -> true, _ -> false };
       if len(s.heads) < len(l.items) { if ended { Some(false) } else { None } }
@@ -1433,8 +1430,6 @@ fn arms_of(
   )
 }
 
-fn is_simple(p: CodePattern) -> Bool = match p { PxWild -> true, PxVar(_) -> true, _ -> false }
-
 fn arm_shape(
   lowering: Lowering,
   context: Context,
@@ -1457,7 +1452,7 @@ fn arm_shape(
     PxCtor(c) -> match ctor(context, string_of_bytes_lossy(c.name)) {
       None -> None,
       Some(k) -> if arity(k) != len(c.args)
-          || !fold(c.args, true, |ok: Bool, a: CodePattern| ok && is_simple(a)) { None } else {
+          || !fold(c.args, true, |ok: Bool, a: CodePattern| ok && irrefutable(a)) { None } else {
         let sorts = field_sorts(k, s_sort);
         let bound = fold(
           range(0, len(c.args)),
@@ -1480,8 +1475,8 @@ fn arm_shape(
       },
     },
     PxList(l) -> {
-      let simple = fold(l.items, true, |ok: Bool, a: CodePattern| ok && is_simple(a))
-        && (match l.rest { Some(r) -> is_simple(r), None -> true });
+      let simple = fold(l.items, true, |ok: Bool, a: CodePattern| ok && irrefutable(a))
+        && (match l.rest { Some(r) -> irrefutable(r), None -> true });
       if !simple { None } else {
         let elem = match s_sort { Some(s) -> list_elem(s), None -> None };
         // A spine in view binds its own heads and tail, so a call over the tail is the same term

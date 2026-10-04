@@ -6,7 +6,7 @@
 import compiler.interface (envelope_of)
 import compiler.pkg (Supplied, check_source, registry_dir, registry_key)
 import compiler.plyx (digest_of, digest_text, encode_named, library_domain, library_magic,
-                      offset_digest)
+                      offset_digest, archive_digest)
 import builder (builder)
 import compiler.resolve (Diag, error_at)
 import env (env)
@@ -17,14 +17,15 @@ import registry (Base, archive_target, attestation_target, base_of, exchange, ge
                  interface_target, said, unasked, unset, variable)
 import interfaces (slot_attestation, slot_interface)
 import semantics
-import sources (DepPackage, File, Project, Vendored, from_vendor, under_abs, vendored)
+import sources (DepPackage, File, Project, Vendored, from_vendor, under_abs, vendored, nowhere)
 import std.fs (fs, Dir)
 import std.json (decode_bytes, error_to_string)
 import std.net (net)
 import std.path (join, parent)
 import std.pkg (Dep, Index, Manifest, Registry, Release, Version, index_json, parse_version,
-                render_version)
+                render_version, release_at)
 import std.list (concat)
+import std.option (option_expect)
 
 /// One registry dependency as a manifest asks for it: a name, and the least version it takes.
 pub type Requirement = { name: String, floor: Version }
@@ -74,7 +75,7 @@ fn asked(manifest: Manifest) -> List<Requirement> =
 pub fn select(index: Index, floor: Version, pinned: Option<Version>) -> Option<Release> = {
   let held = match pinned {
     None -> None,
-    Some(v) -> if compare(v, floor) == Less { None } else { release_of(index, v) },
+    Some(v) -> if compare(v, floor) == Less { None } else { release_at(index, v) },
   };
   match held {
     Some(r) -> Some(r),
@@ -88,13 +89,6 @@ pub fn select(index: Index, floor: Version, pinned: Option<Version>) -> Option<R
         }),
   }
 }
-
-fn release_of(index: Index, version: Version) -> Option<Release> =
-  fold(index.versions, None, |found: Option<Release>, release: Release|
-    match found {
-      Some(_) -> found,
-      None -> if release.version == version { Some(release) } else { None },
-    })
 
 fn pinned_version(lock: Option<Lock>, name: String) -> Option<Version> / {abort.raise} =
   match lock {
@@ -669,11 +663,6 @@ pub fn staged(
 
 // --- Refusals -----------------------------------------------------------------------
 
-fn outside() -> Int = 4294967295
-
-fn nowhere(code: Bytes, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
-  error_at(code, outside(), { start: 0, end: 0 }, bytes_of_string(message), label, notes)
-
 // The registry answered, and not with what it was asked for.
 fn untrue(message: String, notes: List<Bytes>) -> Diag =
   nowhere(b"E0142", message, b"the registry's answer is not what it names", notes)
@@ -747,15 +736,12 @@ fn unwritable(path: String) -> Diag =
 
 // --- Tests ------------------------------------------------------------------
 
-fn version_of(text: String) -> Version / {abort.raise} =
-  match parse_version(text) { Some(x) -> x, None -> panic("a fixture's version") }
-
 fn rel(version: String, yanked: Bool) -> Release / {abort.raise} =
   {
-    version: version_of(version),
+    version: option_expect(parse_version(version), "a fixture's version"),
     digest: "b3:" ++ version,
     yanked: yanked,
-    runtime: version_of("0.16.0"),
+    runtime: option_expect(parse_version("0.16.0"), "a fixture's version"),
   }
 
 fn an_index(releases: List<Release>) -> Index = { name: "orders", versions: releases }
@@ -765,27 +751,87 @@ fn chosen(r: Option<Release>) -> String =
 
 test "a floor selects the lowest version at or above it that is not yanked" {
   let index = an_index([rel("0.1.0", false), rel("0.3.0", false), rel("0.2.0", false)]);
-  assert_eq(chosen(select(index, version_of("0.1.0"), None)), "0.1.0");
-  assert_eq(chosen(select(index, version_of("0.1.5"), None)), "0.2.0");
-  assert_eq(chosen(select(index, version_of("0.3.0"), None)), "0.3.0");
-  assert_eq(chosen(select(index, version_of("0.4.0"), None)), "none")
+  assert_eq(
+    chosen(select(index, option_expect(parse_version("0.1.0"), "a fixture's version"), None)),
+    "0.1.0",
+  );
+  assert_eq(
+    chosen(select(index, option_expect(parse_version("0.1.5"), "a fixture's version"), None)),
+    "0.2.0",
+  );
+  assert_eq(
+    chosen(select(index, option_expect(parse_version("0.3.0"), "a fixture's version"), None)),
+    "0.3.0",
+  );
+  assert_eq(
+    chosen(select(index, option_expect(parse_version("0.4.0"), "a fixture's version"), None)),
+    "none",
+  )
 }
 
 test "a yanked version is refused to a new resolution and served to a lock that pins it" {
   let index = an_index([rel("0.1.0", false), rel("0.2.0", true), rel("0.2.1", false)]);
-  assert_eq(chosen(select(index, version_of("0.2.0"), None)), "0.2.1");
-  assert_eq(chosen(select(index, version_of("0.2.0"), Some(version_of("0.2.0")))), "0.2.0");
+  assert_eq(
+    chosen(select(index, option_expect(parse_version("0.2.0"), "a fixture's version"), None)),
+    "0.2.1",
+  );
+  assert_eq(
+    chosen(
+      select(
+        index,
+        option_expect(parse_version("0.2.0"), "a fixture's version"),
+        Some(option_expect(parse_version("0.2.0"), "a fixture's version")),
+      ),
+    ),
+    "0.2.0",
+  );
   let only = an_index([rel("0.2.0", true)]);
-  assert_eq(chosen(select(only, version_of("0.1.0"), None)), "none");
-  assert_eq(unsatisfied({ name: "orders", floor: version_of("0.1.0") }, only).code, b"E0143")
+  assert_eq(
+    chosen(select(only, option_expect(parse_version("0.1.0"), "a fixture's version"), None)),
+    "none",
+  );
+  assert_eq(
+    unsatisfied(
+      { name: "orders", floor: option_expect(parse_version("0.1.0"), "a fixture's version") },
+      only,
+    ).code,
+    b"E0143",
+  )
 }
 
 test "a lock's version holds while the floor allows it, and a raised floor moves past it" {
   let index = an_index([rel("0.1.0", false), rel("0.2.0", false), rel("0.3.0", false)]);
-  assert_eq(chosen(select(index, version_of("0.1.0"), Some(version_of("0.2.0")))), "0.2.0");
-  assert_eq(chosen(select(index, version_of("0.3.0"), Some(version_of("0.2.0")))), "0.3.0");
+  assert_eq(
+    chosen(
+      select(
+        index,
+        option_expect(parse_version("0.1.0"), "a fixture's version"),
+        Some(option_expect(parse_version("0.2.0"), "a fixture's version")),
+      ),
+    ),
+    "0.2.0",
+  );
+  assert_eq(
+    chosen(
+      select(
+        index,
+        option_expect(parse_version("0.3.0"), "a fixture's version"),
+        Some(option_expect(parse_version("0.2.0"), "a fixture's version")),
+      ),
+    ),
+    "0.3.0",
+  );
   // A pin the index no longer lists is not a version to select.
-  assert_eq(chosen(select(index, version_of("0.1.0"), Some(version_of("0.9.0")))), "0.1.0")
+  assert_eq(
+    chosen(
+      select(
+        index,
+        option_expect(parse_version("0.1.0"), "a fixture's version"),
+        Some(option_expect(parse_version("0.9.0"), "a fixture's version")),
+      ),
+    ),
+    "0.1.0",
+  )
 }
 
 fn a_node(name: String, version: String) -> Node / {abort.raise} =
@@ -828,10 +874,13 @@ fn a_registry() -> Map<String, Index> / {abort.raise} =
   ])
 
 fn deps_of(name: String, version: String) -> List<Requirement> / {abort.raise} =
-  if name == "orders" && version == "0.1.0" { [{ name: "money", floor: version_of("1.0.0") }] }
-  else if name == "orders" && version == "0.2.0" { [{ name: "money", floor: version_of("1.1.0") }] }
-  else if name == "billing" { [{ name: "orders", floor: version_of("0.2.0") }] }
-  else { [] }
+  if name == "orders" && version == "0.1.0" {
+    [{ name: "money", floor: option_expect(parse_version("1.0.0"), "a fixture's version") }]
+  } else if name == "orders" && version == "0.2.0" {
+    [{ name: "money", floor: option_expect(parse_version("1.1.0"), "a fixture's version") }]
+  } else if name == "billing" {
+    [{ name: "orders", floor: option_expect(parse_version("0.2.0"), "a fixture's version") }]
+  } else { [] }
 
 fn over_table(
   reqs: List<Requirement>,
@@ -877,8 +926,8 @@ test "minimal version selection takes the highest floor anything reached asks fo
   // `billing` raises `orders` to 0.2.0, which raises `money` to 1.1.0; nothing asks for 1.2.0.
   let got = over_table(
     [
-      { name: "orders", floor: version_of("0.1.0") },
-      { name: "billing", floor: version_of("0.1.0") },
+      { name: "orders", floor: option_expect(parse_version("0.1.0"), "a fixture's version") },
+      { name: "billing", floor: option_expect(parse_version("0.1.0"), "a fixture's version") },
     ],
     None,
   );
@@ -887,8 +936,8 @@ test "minimal version selection takes the highest floor anything reached asks fo
   assert_eq(
     over_table(
       [
-        { name: "billing", floor: version_of("0.1.0") },
-        { name: "orders", floor: version_of("0.1.0") },
+        { name: "billing", floor: option_expect(parse_version("0.1.0"), "a fixture's version") },
+        { name: "orders", floor: option_expect(parse_version("0.1.0"), "a fixture's version") },
       ],
       None,
     ),
@@ -897,11 +946,17 @@ test "minimal version selection takes the highest floor anything reached asks fo
 }
 
 test "a package the registry does not hold, or a floor it cannot meet, is refused" {
-  match over_table([{ name: "absent", floor: version_of("0.1.0") }], None) {
+  match over_table(
+      [{ name: "absent", floor: option_expect(parse_version("0.1.0"), "a fixture's version") }],
+      None,
+    ) {
     Ok(_) -> panic("a package nobody published was selected"),
     Err(d) -> assert_eq(d.code, b"E0143"),
   };
-  match over_table([{ name: "orders", floor: version_of("0.9.0") }], None) {
+  match over_table(
+      [{ name: "orders", floor: option_expect(parse_version("0.9.0"), "a fixture's version") }],
+      None,
+    ) {
     Ok(_) -> panic("a floor above every version was met"),
     Err(d) -> {
       assert_eq(d.code, b"E0143");
@@ -916,7 +971,10 @@ test "a lock keeps the versions it pins while the floors allow them" {
     packages: [{ name: "money", version: "1.2.0", digest: "b3:m", archive: Some("b3:1.2.0") }],
   };
   assert_eq(
-    over_table([{ name: "orders", floor: version_of("0.2.0") }], Some(lock)),
+    over_table(
+      [{ name: "orders", floor: option_expect(parse_version("0.2.0"), "a fixture's version") }],
+      Some(lock),
+    ),
     Ok(["money 1.2.0", "orders 0.2.0"]),
   )
 }
@@ -959,12 +1017,9 @@ fn an_archive(manifest: Bytes) -> Bytes / {abort.raise} = {
   }
 }
 
-fn digest_of_archive(b: Bytes) -> String / {abort.raise} =
-  match digest_of(library_domain(), b) { Some(d) -> digest_text(d), None -> "" }
-
 test "an archive is believed only when its bytes seal the digest listed and the digest pinned" {
   let bytes = an_archive(a_manifest("orders", 2));
-  let d = digest_of_archive(bytes);
+  let d = archive_digest(bytes);
   match vouched("orders", "0.2.0", bytes, d, Some(d)) {
     Err(_) -> panic("the archive the index lists and the lock pins was refused"),
     Ok(u) -> assert_eq(map(u.modules, |module: Module| module.path), ["core.ply"]),
@@ -993,7 +1048,7 @@ test "a tampered archive does not read, whatever the index says of it" {
     b"X",
     bytes_slice(bytes, at + 1, bytes_len(bytes)),
   ]);
-  match vouched("orders", "0.2.0", tampered, digest_of_archive(tampered), None) {
+  match vouched("orders", "0.2.0", tampered, archive_digest(tampered), None) {
     Ok(_) -> panic("an archive whose digest field lies was believed"),
     Err(e) -> {
       assert_eq(e.code, b"E0142");

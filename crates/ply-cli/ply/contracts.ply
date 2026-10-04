@@ -3,7 +3,7 @@
 // moves no contract, a minor only adds, a major may change anything. `ply contracts NAME OLD NEW`
 // lists what moved between two published versions.
 
-import args (Flags, style_of)
+import args (Flags, style_of, root_of)
 import cmdline (Parsed)
 import env (env)
 import paths (Resolved, here)
@@ -21,8 +21,11 @@ import compiler.resolve (Diag, Source, error_at)
 import std.fs (fs)
 import std.json (Json, Array, Bool, Number, Str, object)
 import std.net (net)
-import std.pkg (Index, Manifest, Release, Version, parse_version, prefix_of, render_version)
+import std.pkg (Index, Manifest, Release, Version, parse_version, prefix_of, render_version,
+                release_at)
 import std.list (at_or)
+import std.option (option_expect)
+import compiler.parsing (no_module)
 
 // --- A package as its consumers read it ------------------------------------------------
 // A root of no modules that depends on the package from the registry, whose slot holds its sources:
@@ -158,8 +161,6 @@ pub fn previous(index: Index, now: Version) -> Option<Release> =
       }
     })
 
-fn outside() -> Int = 4294967295
-
 fn listed(names: List<String>) -> String =
   fold(names, "", |acc: String, n: String|
     if acc == "" { "`" ++ n ++ "`" } else { acc ++ ", `" ++ n ++ "`" })
@@ -182,7 +183,7 @@ pub fn refusal(name: String, was: Version, now: Version, m: Moved) -> Option<Dia
     Some(
       error_at(
         b"E0150",
-        outside(),
+        no_module(),
         { start: 0, end: 0 },
         bytes_of_string(
           "`" ++ name ++ "` " ++ render_version(now) ++ " is a " ++ bump_word(made) ++ " of "
@@ -217,17 +218,10 @@ fn version_of(text: String) -> Result<Version, Diag> / {abort.raise} =
     None -> Err(untakeable("`" ++ text ++ "` is not a version", [b"a version reads like `0.2.0`"])),
   }
 
-pub fn release_at(index: Index, version: Version) -> Option<Release> =
-  fold(index.versions, None, |found: Option<Release>, release: Release|
-    match found {
-      Some(_) -> found,
-      None -> if release.version == version { Some(release) } else { None },
-    })
-
 pub fn unpublished(name: String, version: Version) -> Diag =
   error_at(
     b"E0143",
-    outside(),
+    no_module(),
     { start: 0, end: 0 },
     bytes_of_string("the registry holds no `" ++ name ++ "` " ++ render_version(version)),
     b"no such published version",
@@ -252,9 +246,6 @@ pub fn published_promises(
       },
     },
   }
-
-fn root_of(flags: Flags) -> Resolved =
-  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
 
 pub fn run(
   flags: Flags,
@@ -336,9 +327,6 @@ fn answered(
 
 // --- Tests ------------------------------------------------------------------
 
-fn v(text: String) -> Version / {abort.raise} =
-  match parse_version(text) { Some(x) -> x, None -> panic("a fixture's version") }
-
 fn contract_of(name: String, hash: Bytes) -> Contract =
   { name: bytes_of_string(name), decl: false, hash: hash }
 
@@ -362,10 +350,39 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
   let none = { added: [], changed: [], removed: [] };
   let adds = { ..none, added: ["m.d"] };
   let changes = { ..none, changed: ["m.b"] };
-  assert_eq(refusal("orders", v("0.1.0"), v("0.1.1"), none), None);
-  assert_eq(refusal("orders", v("0.1.0"), v("0.2.0"), adds), None);
-  assert_eq(refusal("orders", v("0.1.0"), v("1.0.0"), changes), None);
-  match refusal("orders", v("0.1.0"), v("0.1.1"), changes) {
+  assert_eq(
+    refusal(
+      "orders",
+      option_expect(parse_version("0.1.0"), "a fixture's version"),
+      option_expect(parse_version("0.1.1"), "a fixture's version"),
+      none,
+    ),
+    None,
+  );
+  assert_eq(
+    refusal(
+      "orders",
+      option_expect(parse_version("0.1.0"), "a fixture's version"),
+      option_expect(parse_version("0.2.0"), "a fixture's version"),
+      adds,
+    ),
+    None,
+  );
+  assert_eq(
+    refusal(
+      "orders",
+      option_expect(parse_version("0.1.0"), "a fixture's version"),
+      option_expect(parse_version("1.0.0"), "a fixture's version"),
+      changes,
+    ),
+    None,
+  );
+  match refusal(
+      "orders",
+      option_expect(parse_version("0.1.0"), "a fixture's version"),
+      option_expect(parse_version("0.1.1"), "a fixture's version"),
+      changes,
+    ) {
     None -> panic("a patch that changes a contract was taken"),
     Some(d) -> {
       assert_eq(d.code, b"E0150");
@@ -376,7 +393,12 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
       )
     },
   };
-  match refusal("orders", v("0.1.0"), v("0.1.1"), adds) {
+  match refusal(
+      "orders",
+      option_expect(parse_version("0.1.0"), "a fixture's version"),
+      option_expect(parse_version("0.1.1"), "a fixture's version"),
+      adds,
+    ) {
     None -> panic("a patch that adds was taken"),
     Some(d) -> assert(string_contains(string_of_bytes_lossy(d.message), "adds `m.d`")),
   }
@@ -384,18 +406,29 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
 
 test "a version is held to the highest one published below it that is not yanked" {
   let r = |text: String, yanked: Bool|
-    { version: v(text), digest: "b3:" ++ text, yanked: yanked, runtime: v("0.16.0") };
+    {
+      version: option_expect(parse_version(text), "a fixture's version"),
+      digest: "b3:" ++ text,
+      yanked: yanked,
+      runtime: option_expect(parse_version("0.16.0"), "a fixture's version"),
+    };
   let index = {
     name: "orders",
     versions: [r("0.1.0", false), r("0.3.0", false), r("0.2.0", true), r("0.2.1", false)],
   };
   assert_eq(
-    match previous(index, v("0.2.5")) { Some(x) -> render_version(x.version), None -> "" },
+    match previous(index, option_expect(parse_version("0.2.5"), "a fixture's version")) {
+      Some(x) -> render_version(x.version),
+      None -> "",
+    },
     "0.2.1",
   );
   assert_eq(
-    match previous(index, v("0.2.1")) { Some(x) -> render_version(x.version), None -> "" },
+    match previous(index, option_expect(parse_version("0.2.1"), "a fixture's version")) {
+      Some(x) -> render_version(x.version),
+      None -> "",
+    },
     "0.1.0",
   );
-  assert_eq(previous(index, v("0.1.0")), None)
+  assert_eq(previous(index, option_expect(parse_version("0.1.0"), "a fixture's version")), None)
 }

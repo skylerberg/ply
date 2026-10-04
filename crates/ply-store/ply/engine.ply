@@ -6,6 +6,7 @@ import std.random (entropy)
 import std.time (time)
 import std.bytes (u32_le, u64_le)
 import twin (on_twin)
+import std.path (join)
 
 // --- Layout -----------------------------------------------------------------
 
@@ -35,8 +36,6 @@ fn record_width() -> Int = 44
 
 // Table, payload length, checksum.
 fn frame_header() -> Int = 13
-
-fn path(dir: String, name: String) -> String = if dir == "" { name } else { dir ++ "/" ++ name }
 
 fn u32_at(b: Bytes, at: Int) -> Int / {abort.raise} = int_of_u32(bytes_u32_le(b, at))
 
@@ -125,7 +124,7 @@ pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise
 }
 
 fn load<[r]>(dir: String, schema: Bytes) -> Loaded / {fs.read[r], abort.raise} =
-  match fs.read_file[r](path(dir, index_name())) {
+  match fs.read_file[r](join(dir, index_name())) {
     None -> Cold,
     Some(idx) -> match parse_index(idx, schema) {
       Err(p) -> Unusable(p),
@@ -144,7 +143,7 @@ fn whole_cap() -> Int = 1024 * 1024 * 1024
 
 // Only what the index vouches for: a torn append past it is never read.
 fn whole<[r]>(dir: String, data_len: Int) -> Bytes / {fs.read[r], abort.raise} =
-  if data_len > whole_cap() { b"" } else { pieced[r](path(dir, data_name()), data_len, read_cap()) }
+  if data_len > whole_cap() { b"" } else { pieced[r](join(dir, data_name()), data_len, read_cap()) }
 
 // The first `len` bytes of `file` as one value, read `piece` bytes at a time; none if it is shorter.
 fn pieced<[r]>(file: String, len: Int, piece: Int) -> Bytes / {fs.read[r], abort.raise} = {
@@ -209,7 +208,7 @@ fn data_problem<[r]>(
   d: Disk,
   schema: Bytes,
 ) -> Option<Problem> / {fs.read[r], abort.raise} = {
-  let file = path(dir, data_name());
+  let file = join(dir, data_name());
   match fs.read_at[r](file, 0, data_header()) {
     None -> Some(corrupt("the data file is missing")),
     Some(h) -> if bytes_len(h) < data_header() || bytes_slice(h, 0, 8) != data_magic() {
@@ -341,7 +340,7 @@ fn frame_at<[r]>(
   } else {
     let read = if bytes_len(data) >= data_len {
       Some(bytes_slice(data, offset, offset + frame_header() + len))
-    } else { fs.read_at[r](path(dir, data_name()), offset, frame_header() + len) };
+    } else { fs.read_at[r](join(dir, data_name()), offset, frame_header() + len) };
     match read {
       None -> Bad("the data file could not be read"),
       Some(b) -> if bytes_len(b) != frame_header() + len {
@@ -420,7 +419,7 @@ pub fn flush<[r]>(
 ) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
   if pending(store) == 0 { store } else if !fs.create_dir[r](store.dir) {
     not_kept(store, "the store's directory could not be made")
-  } else if !fs.lock[r](path(store.dir, lock_name())) {
+  } else if !fs.lock[r](join(store.dir, lock_name())) {
     not_kept(store, "another run holds the store's lock")
   } else {
     sweep[r](store.dir);
@@ -429,7 +428,7 @@ pub fn flush<[r]>(
     // read of its own, so a data file mostly unreachable is rewritten while the lock is held.
     let kept = if pending(written) == 0 && wasteful(stats(written)) { locked_compact[r](written) }
     else { written };
-    if fs.unlock[r](path(store.dir, lock_name())) { kept }
+    if fs.unlock[r](join(store.dir, lock_name())) { kept }
     else { warn(kept, Unreadable, "the store's lock could not be released") }
   }
 
@@ -442,7 +441,7 @@ fn sweep<[r]>(dir: String) -> Unit / {fs.read[r], fs.write[r]} =
     Some(names) ->
       fold(names, (), |u: Unit, name: String|
         if string_starts_with(name, "store.") && string_ends_with(name, temp_suffix()) {
-          if fs.remove[r](path(dir, name)) { () } else { () }
+          if fs.remove[r](join(dir, name)) { () } else { () }
         } else { () }),
   }
 
@@ -454,7 +453,7 @@ fn base<[r]>(
   store: Store,
 ) -> Base / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
   if store.data_len > 0 && bytes_len(store.data) >= store.data_len
-      && fs.read_file[r](path(store.dir, index_name())) == Some(store.index) {
+      && fs.read_file[r](join(store.dir, index_name())) == Some(store.index) {
     {
       disk: Some({
         nonce: store.nonce,
@@ -479,7 +478,7 @@ fn started<[r]>(
   warnings: List<Warning>,
 ) -> Base / {fs.write[r], entropy.next, time.now_ms, abort.raise} = {
   let nonce = fresh_nonce();
-  let file = path(dir, data_name());
+  let file = join(dir, data_name());
   if fs.write_file[r](file, data_head(nonce, schema)) && fs.sync[r](file) {
     {
       disk: Some({ nonce: nonce, data_len: data_header(), index: b"", sections: [], data: b"" }),
@@ -510,7 +509,7 @@ fn locked_flush<[r]>(
     None -> not_kept(s1, "the store's data file could not be started"),
     Some(d) -> {
       let batch = batch_of(store.puts);
-      let file = path(store.dir, data_name());
+      let file = join(store.dir, data_name());
       let landed = if batch.size == 0 { Some(d.data_len) }
       else { fs.append[r](file, bytes_concat_all(batch.frames)) };
       match landed {
@@ -535,9 +534,9 @@ fn locked_flush<[r]>(
 
 // Writes the index beside its place, then renames it there, so a reader sees the old or the new.
 fn published<[r]>(store: Store, index: Bytes) -> Store / {fs.write[r], abort.raise} = {
-  let tmp = path(store.dir, index_name() ++ temp_suffix());
+  let tmp = join(store.dir, index_name() ++ temp_suffix());
   if fs.write_file[r](tmp, index) && fs.sync[r](tmp)
-      && fs.rename[r](tmp, path(store.dir, index_name())) {
+      && fs.rename[r](tmp, join(store.dir, index_name())) {
     match parse_index(index, store.schema) {
       Ok(d) -> {
         let fresh = with_disk(store.dir, store.schema, d, store.warnings);
@@ -658,12 +657,12 @@ pub fn compact<[r]>(
   s0: Store,
 ) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
   let s = flush[r](s0);
-  if pending(s) > 0 { s } else if !fs.lock[r](path(s.dir, lock_name())) {
+  if pending(s) > 0 { s } else if !fs.lock[r](join(s.dir, lock_name())) {
     warn(s, Unreadable, "another run holds the store's lock; it was not compacted")
   } else {
     sweep[r](s.dir);
     let done = locked_compact[r](s);
-    if fs.unlock[r](path(s.dir, lock_name())) { done }
+    if fs.unlock[r](join(s.dir, lock_name())) { done }
     else { warn(done, Unreadable, "the store's lock could not be released") }
   }
 }
@@ -686,14 +685,14 @@ fn locked_compact<[r]>(
         bytes_concat_all(copied.frames),
       ]);
       let index = index_bytes(nonce, copied.size, store.schema, copied.tables);
-      let dtmp = path(store.dir, data_name() ++ temp_suffix());
-      let itmp = path(store.dir, index_name() ++ temp_suffix());
+      let dtmp = join(store.dir, data_name() ++ temp_suffix());
+      let itmp = join(store.dir, index_name() ++ temp_suffix());
       let s1 = if copied.dropped == 0 { store }
       else { warn(store, Corrupt, "compaction dropped entries that did not verify") };
       if fs.write_file[r](dtmp, data) && fs.sync[r](dtmp) && fs.write_file[r](itmp, index)
           && fs.sync[r](itmp)
-          && fs.rename[r](dtmp, path(store.dir, data_name()))
-          && fs.rename[r](itmp, path(store.dir, index_name())) {
+          && fs.rename[r](dtmp, join(store.dir, data_name()))
+          && fs.rename[r](itmp, join(store.dir, index_name())) {
         match parse_index(index, store.schema) {
           Ok(nd) -> with_disk(store.dir, store.schema, nd, s1.warnings),
           Err(p) ->
@@ -744,9 +743,9 @@ fn copy_table<[r]>(
   }
 }
 
-// --- Tests ------------------------------------------------------------------
+pub fn name_key(name: String) -> Bytes = bytes_blake3(bytes_of_string(name))
 
-fn k(name: String) -> Bytes = bytes_blake3(bytes_of_string(name))
+// --- Tests ------------------------------------------------------------------
 
 fn schema_a() -> Bytes = b"schema a"
 
@@ -763,16 +762,21 @@ test "what a store puts it reads at once, and again after a flush and a reopen" 
   let run = on_twin(mem_empty(), || {
     let s0 = open[mem]("cache", schema_a());
     assert_eq(s0.warnings, []);
-    let s1 = put(put(put(s0, 1, k("a"), b"alpha"), 2, k("a"), b"other table"), 1, k("b"), b"beta");
-    assert_eq(hit(get[mem](s1, 1, k("a"))), b"alpha");
+    let s1 = put(
+      put(put(s0, 1, name_key("a"), b"alpha"), 2, name_key("a"), b"other table"),
+      1,
+      name_key("b"),
+      b"beta",
+    );
+    assert_eq(hit(get[mem](s1, 1, name_key("a"))), b"alpha");
     let s2 = flush[mem](s1);
     assert_eq(s2.warnings, []);
     assert_eq(pending(s2), 0);
     let s3 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s3, 1, k("a"))), b"alpha");
-    assert_eq(hit(get[mem](s3, 1, k("b"))), b"beta");
-    assert_eq(hit(get[mem](s3, 2, k("a"))), b"other table");
-    assert(missed(get[mem](s3, 1, k("c"))));
+    assert_eq(hit(get[mem](s3, 1, name_key("a"))), b"alpha");
+    assert_eq(hit(get[mem](s3, 1, name_key("b"))), b"beta");
+    assert_eq(hit(get[mem](s3, 2, name_key("a"))), b"other table");
+    assert(missed(get[mem](s3, 1, name_key("c"))));
     assert_eq(len(keys(s3, 1)), 2);
     assert_eq(map(stats(s3).entries, |e: { table: Int, count: Int }| e.count), [2, 1]);
     messages(s3.warnings)
@@ -783,14 +787,14 @@ test "what a store puts it reads at once, and again after a flush and a reopen" 
 test "a drop and a replacement hold across a flush" {
   let run = on_twin(mem_empty(), || {
     let s1 = flush[mem](
-      put(put(open[mem]("cache", schema_a()), 1, k("a"), b"one"), 1, k("b"), b"two"),
+      put(put(open[mem]("cache", schema_a()), 1, name_key("a"), b"one"), 1, name_key("b"), b"two"),
     );
-    let s2 = flush[mem](put(drop(s1, 1, k("a")), 1, k("b"), b"three"));
-    assert(missed(get[mem](s2, 1, k("a"))));
+    let s2 = flush[mem](put(drop(s1, 1, name_key("a")), 1, name_key("b"), b"three"));
+    assert(missed(get[mem](s2, 1, name_key("a"))));
     let s3 = open[mem]("cache", schema_a());
-    assert(missed(get[mem](s3, 1, k("a"))));
-    assert_eq(hit(get[mem](s3, 1, k("b"))), b"three");
-    assert_eq(keys(s3, 1), [k("b")]);
+    assert(missed(get[mem](s3, 1, name_key("a"))));
+    assert_eq(hit(get[mem](s3, 1, name_key("b"))), b"three");
+    assert_eq(keys(s3, 1), [name_key("b")]);
     messages(s3.warnings)
   });
   assert_eq(run.value, [])
@@ -798,14 +802,24 @@ test "a drop and a replacement hold across a flush" {
 
 test "two runs flushing one store keep each other's entries, and the later wins a shared key" {
   let run = on_twin(mem_empty(), || {
-    let a = put(put(open[mem]("cache", schema_a()), 1, k("mine"), b"a"), 1, k("both"), b"from a");
-    let b = put(put(open[mem]("cache", schema_a()), 1, k("theirs"), b"b"), 1, k("both"), b"from b");
+    let a = put(
+      put(open[mem]("cache", schema_a()), 1, name_key("mine"), b"a"),
+      1,
+      name_key("both"),
+      b"from a",
+    );
+    let b = put(
+      put(open[mem]("cache", schema_a()), 1, name_key("theirs"), b"b"),
+      1,
+      name_key("both"),
+      b"from b",
+    );
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
     let c = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](c, 1, k("mine"))), b"a");
-    assert_eq(hit(get[mem](c, 1, k("theirs"))), b"b");
-    assert_eq(hit(get[mem](c, 1, k("both"))), b"from b");
+    assert_eq(hit(get[mem](c, 1, name_key("mine"))), b"a");
+    assert_eq(hit(get[mem](c, 1, name_key("theirs"))), b"b");
+    assert_eq(hit(get[mem](c, 1, name_key("both"))), b"from b");
     all([a1.warnings, b1.warnings, c.warnings])
   });
   assert_eq(run.value, [])
@@ -813,15 +827,15 @@ test "two runs flushing one store keep each other's entries, and the later wins 
 
 test "a run whose index is stale at its flush reads the store again and keeps the other's entries" {
   let run = on_twin(mem_empty(), || {
-    let s0 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("first"), b"0"));
-    let a = put(open[mem]("cache", schema_a()), 1, k("mine"), b"a");
-    let b = put(open[mem]("cache", schema_a()), 1, k("theirs"), b"b");
+    let s0 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("first"), b"0"));
+    let a = put(open[mem]("cache", schema_a()), 1, name_key("mine"), b"a");
+    let b = put(open[mem]("cache", schema_a()), 1, name_key("theirs"), b"b");
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
     let c = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](c, 1, k("first"))), b"0");
-    assert_eq(hit(get[mem](c, 1, k("mine"))), b"a");
-    assert_eq(hit(get[mem](c, 1, k("theirs"))), b"b");
+    assert_eq(hit(get[mem](c, 1, name_key("first"))), b"0");
+    assert_eq(hit(get[mem](c, 1, name_key("mine"))), b"a");
+    assert_eq(hit(get[mem](c, 1, name_key("theirs"))), b"b");
     all([s0.warnings, a1.warnings, b1.warnings, c.warnings])
   });
   assert_eq(run.value, [])
@@ -839,15 +853,15 @@ test "a file larger than one read is read whole a piece at a time, and only as f
 
 test "a torn append past what the index vouches for is never read and is written over" {
   let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"kept"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"kept"));
     match fs.append[mem]("cache/store.dat", b"\x01\x05\x00\x00\x00half") { _ -> () };
     let s2 = open[mem]("cache", schema_a());
     assert_eq(s2.warnings, []);
-    assert_eq(hit(get[mem](s2, 1, k("a"))), b"kept");
-    let s3 = flush[mem](put(s2, 1, k("b"), b"after"));
+    assert_eq(hit(get[mem](s2, 1, name_key("a"))), b"kept");
+    let s3 = flush[mem](put(s2, 1, name_key("b"), b"after"));
     let s4 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s4, 1, k("a"))), b"kept");
-    assert_eq(hit(get[mem](s4, 1, k("b"))), b"after");
+    assert_eq(hit(get[mem](s4, 1, name_key("a"))), b"kept");
+    assert_eq(hit(get[mem](s4, 1, name_key("b"))), b"after");
     all([s1.warnings, s3.warnings, s4.warnings])
   });
   assert_eq(run.value, [])
@@ -855,7 +869,7 @@ test "a torn append past what the index vouches for is never read and is written
 
 test "a load reads the data file as far as the index vouches for and no further" {
   let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"kept"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"kept"));
     match fs.append[mem]("cache/store.dat", b"a torn tail") { _ -> () };
     let s2 = open[mem]("cache", schema_a());
     { read: bytes_len(s2.data), vouched: s2.data_len, warnings: all([s1.warnings, s2.warnings]) }
@@ -866,26 +880,26 @@ test "a load reads the data file as far as the index vouches for and no further"
 
 test "a frame that does not verify is a miss with its reason, never a half-read value" {
   let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"payload"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"payload"));
     let data = match fs.read_file[mem]("cache/store.dat") { Some(b) -> b, None -> b"" };
     let n = bytes_len(data);
     let broken = bytes_slice(data, 0, n - 1) ++ b"X";
     assert(fs.write_file[mem]("cache/store.dat", broken));
-    get[mem](open[mem]("cache", schema_a()), 1, k("a"))
+    get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))
   });
   assert_eq(run.value, Bad("a frame does not match its checksum"))
 }
 
 test "a store written under another schema, or missing its data file, opens empty and says why" {
   let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"x"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
     let other = open[mem]("cache", b"schema b");
-    assert(missed(get[mem](other, 1, k("a"))));
+    assert(missed(get[mem](other, 1, name_key("a"))));
     assert(fs.remove[mem]("cache/store.dat"));
     let gone = open[mem]("cache", schema_a());
-    assert(missed(get[mem](gone, 1, k("a"))));
-    let again = flush[mem](put(gone, 1, k("b"), b"y"));
-    assert_eq(hit(get[mem](open[mem]("cache", schema_a()), 1, k("b"))), b"y");
+    assert(missed(get[mem](gone, 1, name_key("a"))));
+    let again = flush[mem](put(gone, 1, name_key("b"), b"y"));
+    assert_eq(hit(get[mem](open[mem]("cache", schema_a()), 1, name_key("b"))), b"y");
     all([other.warnings, gone.warnings])
   });
   assert_eq(run.value, [
@@ -898,9 +912,9 @@ test "a run that cannot take the lock writes nothing and says so" {
   let run = on_twin(mem_empty(), || {
     assert(fs.create_dir[mem]("cache"));
     assert(fs.lock[mem]("cache/store.lock"));
-    let s = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"x"));
+    let s = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
     assert_eq(pending(s), 1);
-    assert(missed(get[mem](open[mem]("cache", schema_a()), 1, k("a"))));
+    assert(missed(get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))));
     messages(s.warnings)
   });
   assert_eq(run.value, ["another run holds the store's lock; this run's entries were not kept"])
@@ -909,9 +923,14 @@ test "a run that cannot take the lock writes nothing and says so" {
 test "compaction keeps the live frames, reclaims the rest, and sweeps a stale temp" {
   let run = on_twin(mem_empty(), || {
     let s1 = flush[mem](
-      put(put(open[mem]("cache", schema_a()), 1, k("a"), b"first"), 1, k("b"), b"gone"),
+      put(
+        put(open[mem]("cache", schema_a()), 1, name_key("a"), b"first"),
+        1,
+        name_key("b"),
+        b"gone",
+      ),
     );
-    let s2 = flush[mem](drop(put(s1, 1, k("a"), b"second"), 1, k("b")));
+    let s2 = flush[mem](drop(put(s1, 1, name_key("a"), b"second"), 1, name_key("b")));
     assert(stats(s2).data_bytes > stats(s2).live_bytes);
     assert(fs.write_file[mem]("cache/store.idx.tmp", b"left by a crash"));
     let s3 = compact[mem](s2);
@@ -919,8 +938,8 @@ test "compaction keeps the live frames, reclaims the rest, and sweeps a stale te
     assert(s3.nonce != s2.nonce);
     assert(!fs.exists[mem]("cache/store.idx.tmp"));
     let s4 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s4, 1, k("a"))), b"second");
-    assert(missed(get[mem](s4, 1, k("b"))));
+    assert_eq(hit(get[mem](s4, 1, name_key("a"))), b"second");
+    assert(missed(get[mem](s4, 1, name_key("b"))));
     all([s3.warnings, s4.warnings])
   });
   assert_eq(run.value, [])
@@ -929,12 +948,12 @@ test "compaction keeps the live frames, reclaims the rest, and sweeps a stale te
 test "a flush that leaves most of the data file unreachable compacts it" {
   let run = on_twin(mem_empty(), || {
     let big = bytes_concat_all(map(range(0, 64), |i: Int| b"0123456789abcdef"));
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), big));
-    let s2 = flush[mem](put(s1, 1, k("a"), b"small"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), big));
+    let s2 = flush[mem](put(s1, 1, name_key("a"), b"small"));
     assert_eq(stats(s2).data_bytes, stats(s2).live_bytes);
     assert(s2.nonce != s1.nonce);
     let s3 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s3, 1, k("a"))), b"small");
+    assert_eq(hit(get[mem](s3, 1, name_key("a"))), b"small");
     all([s2.warnings, s3.warnings])
   });
   assert_eq(run.value, [])
@@ -942,7 +961,7 @@ test "a flush that leaves most of the data file unreachable compacts it" {
 
 test "an index that does not match its checksum opens empty and is replaced by the next flush" {
   let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"x"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
     let idx = match fs.read_file[mem]("cache/store.idx") { Some(b) -> b, None -> b"" };
     let n = bytes_len(idx);
     let flipped = byte_of_int(bytes_at(idx, n - 4) ^ 1);
@@ -953,10 +972,10 @@ test "an index that does not match its checksum opens empty and is replaced by t
       ),
     );
     let s2 = open[mem]("cache", schema_a());
-    assert(missed(get[mem](s2, 1, k("a"))));
-    let s3 = flush[mem](put(s2, 1, k("b"), b"y"));
+    assert(missed(get[mem](s2, 1, name_key("a"))));
+    let s3 = flush[mem](put(s2, 1, name_key("b"), b"y"));
     let s4 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s4, 1, k("b"))), b"y");
+    assert_eq(hit(get[mem](s4, 1, name_key("b"))), b"y");
     all([s2.warnings, s4.warnings])
   });
   assert_eq(run.value, [
@@ -969,12 +988,12 @@ fn at_least(ws: List<Warning>) -> Warning =
 
 test "a warning says whether the store was another version's, damaged, or out of reach" {
   let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"x"));
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
     let other = open[mem]("cache", b"schema b");
     assert(fs.remove[mem]("cache/store.dat"));
     let gone = open[mem]("cache", schema_a());
     assert(fs.lock[mem]("cache/store.lock"));
-    let held = flush[mem](put(gone, 1, k("b"), b"y"));
+    let held = flush[mem](put(gone, 1, name_key("b"), b"y"));
     map(push(held.warnings, at_least(other.warnings)), |w: Warning| w.trouble)
   });
   assert_eq(run.value, [Corrupt, Unreadable, OtherVersion])

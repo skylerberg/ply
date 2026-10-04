@@ -1,7 +1,7 @@
 // Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 // A float literal hashes by its IEEE bit pattern.
 
-import parsing (Span, Ident, QName, int_to_bytes)
+import parsing (Span, Ident, QName, is_bare, starts_upper)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
@@ -16,13 +16,13 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
               constraint_written, SpecKind, SRequires, SEnsures, SpecClause, ReturnsFresh,
-              ReturnsParam, Derived, Vis, VPub, VPriv, parse)
+              ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
-                label_at, is_bare, dump_diags, qualify, default_binder, backticked, is_ctor_name)
+                label_at, dump_diags, qualify, default_binder, backticked)
 import derive (Expansion, expand_derives)
-import std.bytes (u32_at, is_digit, replace)
+import std.bytes (u32_at, is_digit, replace, ascii_of_int, u32_le, u64_le)
 import std.hash (blake3)
 import std.list (at, concat, contains, take, push_unique)
 import std.bytes
@@ -33,14 +33,6 @@ import std.bytes
 fn rposition(xs: List<Bytes>, v: Bytes) -> Option<Int> / {abort.raise} =
   fold(range(0, len(xs)), None, |acc: Option<Int>, i: Int|
     if at(xs, i) == v { Some(i) } else { acc })
-
-fn u32_le(v: Int) -> Bytes / {abort.raise} =
-  bytes_concat_all([
-    byte_of_int(v & 0xFF),
-    byte_of_int(v >>> 8 & 0xFF),
-    byte_of_int(v >>> 16 & 0xFF),
-    byte_of_int(v >>> 24 & 0xFF),
-  ])
 
 // The width's position in `lexer::widths`: the discriminant the encoding writes.
 fn width_index(ty: Bytes) -> Bytes / {abort.raise} = {
@@ -1761,8 +1753,6 @@ type Recording = { out: HashOutput, deps_at: Map<Bytes, Int> }
 // The digest names the shape it covers, so it is never confused with a definition hash.
 fn hashes_domain() -> Bytes = b"ply.hashes.1"
 
-fn u64_le(v: Int) -> Bytes / {abort.raise} = bytes_concat(u32_le(v), u32_le(v >>> 32))
-
 fn digest_named(p: { name: Bytes, hash: Bytes }) -> Bytes / {abort.raise} =
   bytes_concat_all([u64_le(bytes_len(p.name)), p.name, p.hash])
 
@@ -3148,8 +3138,6 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
     EParallel(v) -> fold(v.branches, out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
   }
 
-fn is_pub(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
-
 fn is_root(index: Index, node: Node) -> Bool / {abort.raise} =
   bytes_starts_with(node.simple, b"_")
     || (match node.body {
@@ -3243,7 +3231,7 @@ pub fn hash_dump(sources: List<Source>) -> String / {abort.raise} = {
   });
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| concat(acc, p.diags));
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-  let head = bytes_concat_all([b"K;", int_to_bytes(len(sources)), b";"]);
+  let head = bytes_concat_all([b"K;", ascii_of_int(len(sources)), b";"]);
   let body = if len(expansion) > 0 { bytes_concat(b"E;", dump_diags(expansion)) } else {
     match resolve_modules(mods) {
       ResolveFailed(ds) -> bytes_concat(b"E;", dump_diags(ds)),
@@ -3356,7 +3344,7 @@ fn expect(decoder: Decoder, want: Int, what: Bytes) -> Decoder / {abort.raise} =
   if r.value == want { r.decoder } else {
     panic(
       string_of_bytes(
-        bytes_concat_all([b"expected ", what, b", found tag ", int_to_bytes(r.value)]),
+        bytes_concat_all([b"expected ", what, b", found tag ", ascii_of_int(r.value)]),
       ),
     )
   }
@@ -3403,10 +3391,10 @@ fn prefixed(decoded: DecodedOption, before: Bytes) -> Bytes =
 fn bracketed(decoded: DecodedOption) -> Bytes =
   if decoded.some { bytes_concat_all([b"[", decoded.text, b"]"]) } else { b"" }
 
-fn local_name(level: Int) -> Bytes = bytes_concat(b"_l", int_to_bytes(level))
-fn type_var_name(level: Int) -> Bytes = bytes_concat(b"_t", int_to_bytes(level))
-fn row_var_name(level: Int) -> Bytes = bytes_concat(b"_e", int_to_bytes(level))
-fn label_name(level: Int) -> Bytes = bytes_concat(b"_r", int_to_bytes(level))
+fn local_name(level: Int) -> Bytes = bytes_concat(b"_l", ascii_of_int(level))
+fn type_var_name(level: Int) -> Bytes = bytes_concat(b"_t", ascii_of_int(level))
+fn row_var_name(level: Int) -> Bytes = bytes_concat(b"_e", ascii_of_int(level))
+fn label_name(level: Int) -> Bytes = bytes_concat(b"_r", ascii_of_int(level))
 
 fn line_break(depth: Int) -> Bytes =
   bytes_concat(b"\n", bytes_concat_all(map(range(0, depth), |i: Int| b"  ")))
@@ -3431,7 +3419,7 @@ fn read_ref(printer: BodyPrinter, decoder: Decoder) -> DecodedRef / {abort.raise
     let hashes = if printer.part < 0 { [] } else { at(printer.layout.parts, printer.part).hashes };
     if c.value >= len(hashes) { panic("a reference to a member this component does not have") }
     else { { decoder: c.decoder, hash: at(hashes, c.value), class: c.value } }
-  } else { panic(string_of_bytes(bytes_concat(b"a reference of tag ", int_to_bytes(t.value)))) }
+  } else { panic(string_of_bytes(bytes_concat(b"a reference of tag ", ascii_of_int(t.value)))) }
 }
 
 // A name the module being printed may write: its own needs no export, a printed module is reprinted
@@ -3601,7 +3589,7 @@ fn print_type(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
         let bare = match bytes_index_of(name.text, b"::") { Some(_) -> false, None -> true };
         {
           decoder: args.decoder,
-          text: if n.value > 0 || (bare && !is_ctor_name(name.text)) {
+          text: if n.value > 0 || (bare && !starts_upper(name.text)) {
             bytes_concat_all([name.text, b"<", joined(args.texts, b", "), b">"])
           } else { name.text },
         }
@@ -3732,14 +3720,14 @@ fn hex_int(v: Int, bits: Int) -> Bytes / {abort.raise} = {
 }
 
 // A negative literal is spelled as its bit pattern: `-5` would read back as a negation.
-fn int_text(v: Int) -> Bytes / {abort.raise} = if v >= 0 { int_to_bytes(v) } else { hex_int(v, 64) }
+fn int_text(v: Int) -> Bytes / {abort.raise} = if v >= 0 { ascii_of_int(v) } else { hex_int(v, 64) }
 
 fn fixed_text(which: Int, v: Int) -> Bytes / {abort.raise} =
   match list_at(widths(), which) {
     None -> panic("a byte that is not a fixed-width integer type"),
     Some(w) ->
       bytes_concat(
-        if v >= 0 { int_to_bytes(v) }
+        if v >= 0 { ascii_of_int(v) }
         else { hex_int(if w.bits == 64 { v } else { v & (1 << w.bits) - 1 }, w.bits) },
         w.name,
       ),
@@ -3786,7 +3774,7 @@ fn big_digits(n: List<Int>) -> Bytes / {abort.raise} = {
   let top = fold(range(0, len(n)), 0, |t: Int, i: Int| if at(n, i) != 0 { i } else { t });
   bytes_concat_all(
     map(range(0, top + 1), |j: Int| {
-      let d = int_to_bytes(at(n, top - j));
+      let d = ascii_of_int(at(n, top - j));
       if j == 0 { d } else { bytes_concat(zeros(9 - bytes_len(d)), d) }
     }),
   )
@@ -3829,7 +3817,7 @@ fn scientific(s: Bytes, x: Int) -> Bytes / {abort.raise} =
     bytes_slice(s, 0, 1),
     if bytes_len(s) > 1 { bytes_concat(b".", bytes_slice(s, 1, bytes_len(s))) } else { b"" },
     b"e",
-    int_to_bytes(x),
+    ascii_of_int(x),
   ])
 
 fn round_to(ds: Bytes, x0: Int, p: Int) -> Rounded / {abort.raise} = {
@@ -4316,7 +4304,7 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
     } else {
       panic(
         string_of_bytes(
-          bytes_concat(b"a tag that does not begin an expression: ", int_to_bytes(t.value)),
+          bytes_concat(b"a tag that does not begin an expression: ", ascii_of_int(t.value)),
         ),
       )
     }
@@ -4751,7 +4739,7 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
             if map_contains(s.taken, t.binder) {
               Continue({
                 n: t.n + 1,
-                binder: bytes_concat_all([base, b"_", int_to_bytes(t.n + 1)]),
+                binder: bytes_concat_all([base, b"_", ascii_of_int(t.n + 1)]),
               })
             } else { Stop(t) },
         );
@@ -4863,7 +4851,7 @@ fn print_tests(
             labels: 0,
             slots: map_new(),
           },
-          bytes_concat(b"t", int_to_bytes(i)),
+          bytes_concat(b"t", ascii_of_int(i)),
         );
         { decoder: g.decoder, texts: push(decoded.texts, g.text) }
       }
@@ -4935,7 +4923,7 @@ pub fn print_bodies(
       if len(missing) > 0 {
         Unprintable({
           message: bytes_concat(
-            int_to_bytes(len(missing)),
+            ascii_of_int(len(missing)),
             b" definitions a body refers to are not among the bodies it can name",
           ),
           notes: [
@@ -5253,7 +5241,7 @@ fn all_public(
 ) -> List<{ name: Bytes, hash: Bytes, public: Bool }> =
   map(xs, |x: { name: Bytes, hash: Bytes }| { name: x.name, hash: x.hash, public: true })
 
-fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bytes> =
+pub fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bytes> =
   fold(xs, map_new(), |m: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
     map_insert(m, x.name, x.hash))
 

@@ -1,8 +1,8 @@
 // `derive D for T` becomes an ordinary definition: generated as source, parsed back, and retargeted.
 
-import parsing (Span, Ident, QName, span_to, int_to_bytes)
+import parsing (Span, Ident, QName, span_to, is_bare, qname_text)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span)
+                    MWrite, MBad, ty_span, mode_text)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -12,10 +12,10 @@ import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TD
               VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric,
               DInteger, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias, INames,
               Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written)
-import rewrite (expand)
-import resolve (Diag, Source, error_at, error_at_and, is_bare, dump_diags)
+import rewrite (expand, find_type)
+import resolve (Diag, Source, error_at, error_at_and, dump_diags, path_span)
 import std.list (at, concat, contains)
-import std.bytes (is_digit, join)
+import std.bytes (is_digit, join, ascii_of_int)
 
 // --- Rules ---------------------------------------------------------------------------------------
 
@@ -521,7 +521,7 @@ fn json_record(
     b"])",
   ]);
   let built = map(range(0, len(fields)), |i: Int|
-    bytes_concat_all([at(fields, i).name.name, b": ", emitter.b, int_to_bytes(i)]));
+    bytes_concat_all([at(fields, i).name.name, b": ", emitter.b, ascii_of_int(i)]));
   let decode = fold(
     range(0, len(fields)),
     bytes_concat_all([b"Ok({", join(built, b", "), b"})"]),
@@ -543,7 +543,7 @@ fn json_record(
         emitter.b,
         b"e), Ok(",
         emitter.b,
-        int_to_bytes(i),
+        ascii_of_int(i),
         b") -> ",
         acc,
         b"}",
@@ -570,7 +570,7 @@ fn json_sum(
   target: Bytes,
 ) -> Bytes / {abort.raise} = {
   let arms = map(variants, |v: VariantDef| {
-    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, int_to_bytes(i)));
+    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, ascii_of_int(i)));
     let pat = if len(binders) == 0 { v.name.name }
     else { bytes_concat_all([v.name.name, b"(", join(binders, b", "), b")"]) };
     let values = map(range(0, len(v.fields)), |i: Int|
@@ -579,7 +579,7 @@ fn json_sum(
         codec(emitter, at(v.fields, i), render_type(at(v.fields, i))),
         b".encode)(",
         emitter.b,
-        int_to_bytes(i),
+        ascii_of_int(i),
         b")",
       ]));
     bytes_concat_all([
@@ -621,7 +621,7 @@ fn json_sum(
         bytes_concat_all([
           b"(",
           join(
-            map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, int_to_bytes(i))),
+            map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, ascii_of_int(i))),
             b", ",
           ),
           b")",
@@ -640,7 +640,7 @@ fn json_sum(
             b"variant_value(",
             emitter.b,
             b"t, ",
-            int_to_bytes(i),
+            ascii_of_int(i),
             b"), ",
             codec(emitter, at(v.fields, i), render_type(at(v.fields, i))),
             b".decode) {Err(",
@@ -649,7 +649,7 @@ fn json_sum(
             emitter.b,
             b"e), Ok(",
             emitter.b,
-            int_to_bytes(i),
+            ascii_of_int(i),
             b") -> ",
             inner,
             b"}",
@@ -730,7 +730,7 @@ fn bin_takes(
 ) -> Bytes / {abort.raise} = {
   let n = len(tys);
   let end_of = |i: Int|
-    if i < 0 { start } else { bytes_concat_all([emitter.b, int_to_bytes(i), b".at"]) };
+    if i < 0 { start } else { bytes_concat_all([emitter.b, ascii_of_int(i), b".at"]) };
   fold(
     range(0, n),
     bytes_concat_all([b"Ok({value: ", built, b", at: ", end_of(n - 1), b"})"]),
@@ -745,7 +745,7 @@ fn bin_takes(
         emitter.b,
         b"e), Ok(",
         emitter.b,
-        int_to_bytes(i),
+        ascii_of_int(i),
         b") -> ",
         acc,
         b"}",
@@ -755,7 +755,7 @@ fn bin_takes(
 }
 
 fn values_of(emitter: DeriveEmitter, n: Int) -> List<Bytes> =
-  map(range(0, n), |i: Int| bytes_concat_all([emitter.b, int_to_bytes(i), b".value"]))
+  map(range(0, n), |i: Int| bytes_concat_all([emitter.b, ascii_of_int(i), b".value"]))
 
 fn shapes_of(emitter: DeriveEmitter, tys: List<TypeExpr>) -> Bytes / {abort.raise} =
   join(map(tys, |ty: TypeExpr| bytes_concat(codec(emitter, ty, render_type(ty)), b".shape")), b", ")
@@ -826,7 +826,7 @@ fn bin_sum(
   let count = len(variants);
   let arms = map(range(0, count), |vi: Int| {
     let v = at(variants, vi);
-    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, int_to_bytes(i)));
+    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, ascii_of_int(i)));
     let pat = if len(binders) == 0 { v.name.name }
     else { bytes_concat_all([v.name.name, b"(", join(binders, b", "), b")"]) };
     let tagged = bytes_concat_all([
@@ -834,7 +834,7 @@ fn bin_sum(
       b"put_tag(",
       emitter.b,
       b"w, ",
-      int_to_bytes(vi),
+      ascii_of_int(vi),
       b")",
     ]);
     let body = fold(range(0, len(v.fields)), tagged, |acc: Bytes, i: Int|
@@ -846,7 +846,7 @@ fn bin_sum(
     let args = if len(v.fields) == 0 { b"" }
     else { bytes_concat_all([b"(", join(values_of(emitter, len(v.fields)), b", "), b")"]) };
     bytes_concat_all([
-      if vi == count - 1 { b"_" } else { int_to_bytes(vi) },
+      if vi == count - 1 { b"_" } else { ascii_of_int(vi) },
       b" -> ",
       bin_takes(
         emitter,
@@ -887,7 +887,7 @@ fn bin_sum(
     b"d, ",
     emitter.b,
     b"n, ",
-    int_to_bytes(count),
+    ascii_of_int(count),
     b") {Err(",
     emitter.b,
     b"e) -> Err(",
@@ -919,14 +919,6 @@ fn bin_sum(
     b"])}",
   ])
 }
-
-fn qname_text(qname: QName) -> Bytes =
-  match qname.module {
-    Some(m) -> bytes_concat_all([m.name, b"::", qname.name.name]),
-    None -> qname.name.name,
-  }
-
-fn mode_text(mode: Mode) -> Bytes = match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
 
 // A type back as source, for the annotations a generated lambda needs.
 pub fn render_type(ty: TypeExpr) -> Bytes / {abort.raise} =
@@ -1258,13 +1250,6 @@ pub type Expansion = { module: Module, derived: List<Derived>, diags: List<Diag>
 fn report(expander: Expander, diag: Diag) -> Expander =
   { ..expander, diags: push(expander.diags, diag) }
 
-fn find_type(types: List<TypeDef>, name: Bytes) -> Option<TypeDef> =
-  fold(types, None, |acc: Option<TypeDef>, type_def: TypeDef|
-    match acc {
-      Some(_) -> acc,
-      None -> if type_def.name.name == name { Some(type_def) } else { None },
-    })
-
 fn find_claimed(xs: List<Claimed>, name: Bytes) -> Option<DeriveDef> =
   fold(xs, None, |acc: Option<DeriveDef>, claimed: Claimed|
     match acc {
@@ -1294,10 +1279,6 @@ fn import_binder(decl: ImportDecl) -> Option<Bytes> / {abort.raise} =
     IAlias(a) -> if a.name == shown_binder() { None } else { Some(a.name) },
     INames(_) -> None,
   }
-
-fn path_span(decl: ImportDecl) -> Span / {abort.raise} =
-  if len(decl.path) == 0 { decl.span }
-  else { span_to(at(decl.path, 0).span, at(decl.path, len(decl.path) - 1).span) }
 
 fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
   bytes_len(a) == bytes_len(b)
@@ -1703,10 +1684,10 @@ pub fn derive_dump(sources: List<Source>) -> String / {abort.raise} = {
     bytes_concat_all([
       acc,
       b"M;",
-      int_to_bytes(len(generated)),
+      ascii_of_int(len(generated)),
       b";",
       bytes_concat_all(
-        map(generated, |g: Bytes| bytes_concat_all([b"S;", int_to_bytes(bytes_len(g)), b";", g])),
+        map(generated, |g: Bytes| bytes_concat_all([b"S;", ascii_of_int(bytes_len(g)), b";", g])),
       ),
       dump_diags(d.diags),
     ])

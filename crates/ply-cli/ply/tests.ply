@@ -25,11 +25,11 @@ import configuration
 import surface
 import machine
 import compiler.diagnostics (parse_all)
-import compiler.front (Analysed, Refused, Analysis, analyse, ModuleSpan, no_module, test_roots)
+import compiler.front (Analysed, Refused, Analysis, analyse, ModuleSpan, test_roots)
 import compiler.unit (codes)
 import compiler.hash (closure_of)
 import compiler.infer (DefInfo, TestInfo)
-import compiler.resolve (Diag, Label, Source)
+import compiler.resolve (Diag, Label, Source, error_with_labels)
 import compiler.types
 import compiler.types (RAny, RNamed, RSingleton, RVar)
 import compiler.type_syntax
@@ -39,17 +39,17 @@ import diagnostic (Place, Raised, Spot, diag_of, noted, place_json, placeless, s
 import mutants (Coverage, Judged, Mutants, Mutation, Queue, Survivor, built, coverage, mutants,
                 queued, targets)
 import paths
-import program (Timed, load_diagnostics, front_of, is_shelved, is_shipped, modules_of, outside,
-                timed_over, timed_uncached_over, unmoved)
-import report (Answer, indent, ok_code, compile_error, count_of, plural, refused, warned_lines)
+import program (Timed, load_diagnostics, front_of, is_shelved, is_shipped, modules_of, timed_over,
+                timed_uncached_over, unmoved)
+import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
 import sources (Embed, load_resolved, shelf)
 import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
-                 string_or_null, strings)
+                 string_or_null, strings, int_or_null, strings_or_null)
 import style (Style, plain, bold, dim, green, red, yellow)
 import tester (tester, ledger, Executed, InterleavingFailure, Filed, Hosted, Options, Usage,
                sum_usage, no_usage, unit_over)
-import trials (Bench, Evident, Tried, diagnosed, trial)
+import trials (Bench, Evident, Tried, diagnosed, trial, by_name)
 import trials
 import walk
 // What a test's footprint makes it — shared, isolated or host — and the classes the tests that run
@@ -81,6 +81,13 @@ import sim.search
 import sim.search (Exact, Exploration, Failure, Diverged, Unscheduled)
 import std.string (join, pad_right, repeat, pad_left)
 import std.math (pow)
+import claims (located)
+import signature (atom_texts)
+import surface (parsed)
+import proof.goal (set_of)
+import proof.obligation (plural)
+import std.option (option_unwrap_or)
+import compiler.parsing (no_module)
 
 // One atom of a test's footprint, as a scheduler compares them and as the printer spells it.
 pub type Printed = { atom: Atom, text: String }
@@ -233,7 +240,7 @@ fn binary_families() -> List<String> = ["shipped"]
 // The atoms of a test's footprint whose answers no pass key covers, printed.
 fn unkeyed_texts(case: Case) -> List<String> =
   map(
-    filter(case.atoms, |printed: Printed| said(binary_families(), printed.atom.effect)),
+    filter(case.atoms, |printed: Printed| contains(binary_families(), printed.atom.effect)),
     |printed: Printed| printed.text,
   )
 
@@ -515,19 +522,9 @@ fn no_spent() -> Spent =
 
 // --- Small things -----------------------------------------------------------
 
-fn opt_num(v: Option<Int>) -> Json = match v { Some(n) -> int(n), None -> Null }
-
 fn opt_bool(v: Option<Bool>) -> Json = match v { Some(b) -> Bool(b), None -> Null }
 
-fn opt_strings(v: Option<List<String>>) -> Json = match v { Some(xs) -> strings(xs), None -> Null }
-
 fn covers(xs: List<Int>, wanted: Int) -> Bool = len(filter(xs, |x: Int| x == wanted)) > 0
-
-fn set_of(xs: List<Int>) -> Map<Int, Bool> =
-  fold(xs, map_new(), |acc: Map<Int, Bool>, x: Int| map_insert(acc, x, true))
-
-fn said(lines: List<String>, wanted: String) -> Bool =
-  len(filter(lines, |l: String| l == wanted)) > 0
 
 fn no_group() -> Group = { tests: [], footprint: "" }
 
@@ -559,10 +556,8 @@ fn ns_as_ms_tenths(ns: Int) -> String / {abort.raise} = fixed((ns + 50000) / 100
 fn share(part: Int, total: Int) -> String / {abort.raise} =
   pad_left(fixed(if total == 0 { 0 } else { part * 1000 / total }, 1), 5, " ") ++ "%"
 
-fn decimal(text: String) -> Decimal =
-  match decimal_of_string(text) { Some(d) -> d, None -> decimal_of_int(0) }
-
-fn millis(us: Int) -> Json / {abort.raise} = Number(decimal(ms_thousandths(us)))
+fn millis(us: Int) -> Json / {abort.raise} =
+  Number(option_unwrap_or(decimal_of_string(ms_thousandths(us)), decimal_of_int(0)))
 
 // --- Naming and placing -----------------------------------------------------
 
@@ -572,18 +567,6 @@ fn display_of(program: Program, case: Case) -> String =
 
 fn short_of(hash: Option<String>) -> String / {abort.raise} =
   match hash { Some(h) -> string_slice(h, 0, 12), None -> repeat("-", 12) }
-
-// `path:line:col`, one-based, as every other command prints a place.
-fn located(places: List<Place>, a: ModuleSpan) -> Option<String> / {abort.raise} =
-  if a.module == no_module() { None } else {
-    match list_at(places, a.module) {
-      None -> None,
-      Some(place) -> {
-        let spot: Spot = spot_of(place.text, a.start);
-        Some(place.path ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col))
-      },
-    }
-  }
 
 fn dim_place(style: Style, places: List<Place>, a: Option<ModuleSpan>) -> String / {abort.raise} =
   match a {
@@ -941,7 +924,7 @@ fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
 fn reasons_seen(program: Program, decided: Decided) -> List<String> =
   fold(program.cases, [], |acc: List<String>, case: Case| {
     let reason = word(reason_of(decided, case.index));
-    if said(acc, reason) { acc } else { push(acc, reason) }
+    if contains(acc, reason) { acc } else { push(acc, reason) }
   })
 
 fn why_lines(style: Style, program: Program, decided: Decided) -> List<String> / {abort.raise} = {
@@ -1411,7 +1394,7 @@ fn case_json(report: RunReport, case: Case, decided: Decided) -> Json / {abort.r
     { key: "selected", value: Bool(runs_test(decided, case.index)) },
     { key: "reason", value: Str(keyed(word(reason_of(decided, case.index)))) },
     { key: "why", value: Str(why(word(reason_of(decided, case.index)))) },
-    { key: "group", value: opt_num(group_of(decided, case.index)) },
+    { key: "group", value: int_or_null(group_of(decided, case.index)) },
     { key: "footprint", value: Str(case.footprint) },
     { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
     // Whether this test reaches the binding, and so always runs uncached.
@@ -1461,7 +1444,10 @@ fn search_json(e: Explored) -> Json / {abort.raise} =
     { key: "naive", value: cost_json(e.naive) },
     {
       key: "reduction",
-      value: match e.reduction_tenths { Some(t) -> Number(decimal(fixed(t, 1))), None -> Null },
+      value: match e.reduction_tenths {
+        Some(t) -> Number(option_unwrap_or(decimal_of_string(fixed(t, 1)), decimal_of_int(0))),
+        None -> Null,
+      },
     },
     { key: "steps", value: int(e.steps) },
     { key: "virtual_time_ns", value: int(e.virtual_time_ns) },
@@ -1548,7 +1534,10 @@ fn fault_json(program: Program, fault: Fault) -> Json / {abort.raise} =
     { key: "nondet", value: opt_bool(fault.nondet) },
     { key: "status", value: string_or_null(fault.status) },
     { key: "location", value: location_json(program.places, fault.diagnostic) },
-    { key: "footprint", value: object([{ key: "declared", value: opt_strings(fault.declared) }]) },
+    {
+      key: "footprint",
+      value: object([{ key: "declared", value: strings_or_null(fault.declared) }]),
+    },
   ])
 
 // The verdict as the document carries it: what to change, how sure the system is, and how it
@@ -1662,9 +1651,9 @@ fn backend_json(report: RunReport) -> Json =
         { key: "name", value: Str(b.name) },
         { key: "fragment", value: int(b.fragment) },
         { key: "offered", value: int(b.offered) },
-        { key: "analysis_nanos", value: opt_num(b.analysis_nanos) },
-        { key: "codegen_nanos", value: opt_num(b.codegen_nanos) },
-        { key: "units", value: opt_num(b.units) },
+        { key: "analysis_nanos", value: int_or_null(b.analysis_nanos) },
+        { key: "codegen_nanos", value: int_or_null(b.codegen_nanos) },
+        { key: "units", value: int_or_null(b.units) },
         { key: "entered", value: int(b.entered) },
         { key: "declined", value: int(b.declined) },
         { key: "converted_in", value: int(b.converted_in) },
@@ -1997,10 +1986,6 @@ fn canonical(atoms: List<types::Atom>) -> List<types::Atom> = {
       None -> push(acc, a),
     })
 }
-
-// Each atom's text, a label variable named against the rest, so `[l]` means one thing among them.
-fn atom_texts(atoms: List<types::Atom>) -> List<String> / {abort.raise} =
-  map(types::print_atom_list(types::printer_new(), atoms).texts, string_of_bytes_lossy)
 
 fn footprint_text(atoms: List<types::Atom>) -> String / {abort.raise} =
   "{" ++ join(atom_texts(atoms), ", ") ++ "}"
@@ -2451,7 +2436,13 @@ fn sim_json(p: plan::Plan, sim: machine::SimulationOptions) -> Json / {abort.rai
     { key: "budget", value: int(p.budget) },
     { key: "measure_reduction", value: Bool(sim.measure_reduction) },
     { key: "mode", value: Str(plan::mode_word(p.mode)) },
-    { key: "roots", value: Array(map(p.roots, |r: U64| Number(decimal(plan::u64_text(r))))) },
+    {
+      key: "roots",
+      value: Array(
+        map(p.roots, |r: U64|
+          Number(option_unwrap_or(decimal_of_string(plan::u64_text(r)), decimal_of_int(0)))),
+      ),
+    },
     {
       key: "seed",
       value: match sim.seed {
@@ -2644,10 +2635,6 @@ fn stopped(fl: Failure<InterleavingFailure>) -> Raised / {abort.raise} =
 
 // --- What the run establishes ------------------------------------------------
 
-fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<String, String> / {abort.raise} =
-  fold(xs, map_new(), |acc: Map<String, String>, x: { name: Bytes, hash: Bytes }|
-    map_insert(acc, string_of_bytes_lossy(x.name), hex_of(x.hash)))
-
 fn hashes_of(analysis: Analysis) -> Hashes / {abort.raise} =
   {
     defs: by_name(analysis.hashes.defs),
@@ -2747,7 +2734,7 @@ fn site_of(x: search::RaceSite) -> Site =
     task: "@" ++ int_to_string(x.task),
     definition: x.definition,
     access: x.access,
-    at: if x.span.module == outside() { None } else { Some(x.span) },
+    at: if x.span.module == no_module() { None } else { Some(x.span) },
   }
 
 // A test as its group ran it, which is all its result line says; the conclusion adds the failure
@@ -3031,9 +3018,10 @@ fn judged_mutant(
           ));
         let expected = fold(classes, 0, |n: Int, class: List<Int>| n + len(class));
         let judged = |verdict: String, why: String| { id: id, verdict: verdict, why: why };
-        if said(statuses, "failed") { judged("killed", "") }
-        else if said(statuses, "panicked") { judged("unresolved", "Ply failed running the tests") }
-        else if len(filter(statuses, |s: String| s == "passed")) == expected {
+        if contains(statuses, "failed") { judged("killed", "") }
+        else if contains(statuses, "panicked") {
+          judged("unresolved", "Ply failed running the tests")
+        } else if len(filter(statuses, |s: String| s == "passed")) == expected {
           judged("survived", "")
         } else { judged("unresolved", "not every test answered") }
       },
@@ -3063,7 +3051,7 @@ fn cases_of(
     |st: { at: Int, out: List<Option<String>> }, k: Option<String>|
       match k {
         None -> { ..st, out: push(st.out, None) },
-        Some(_) -> { at: st.at + 1, out: push(st.out, answer_at(answers, st.at)) },
+        Some(_) -> { at: st.at + 1, out: push(st.out, at_or(answers, st.at, None)) },
       },
   ).out;
   map(range(0, len(rows)), |i: Int| {
@@ -3074,12 +3062,9 @@ fn cases_of(
       } else { None },
       None -> None,
     };
-    select::case_of(r, at_or(keys, i, None), answer_at(held, i), owed)
+    select::case_of(r, at_or(keys, i, None), at_or(held, i, None), owed)
   })
 }
-
-fn answer_at(answers: List<Option<String>>, i: Int) -> Option<String> =
-  match list_at(answers, i) { Some(answer) -> answer, None -> None }
 
 fn no_row() -> Row =
   { index: 0, label: "", name: "", module: "", hash: None, seeded: false, nondet: false }
@@ -3274,18 +3259,6 @@ fn at_at(hits: List<{ name: String, at: Option<ModuleSpan> }>, i: Int) -> Option
 
 // --- Tests ------------------------------------------------------------------
 
-fn a_diag(code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>) -> Diag =
-  {
-    code: code,
-    notes: len(notes),
-    labels: labels,
-    text: b"",
-    message: message,
-    notes_text: notes,
-    severity: b"error",
-    fixes: [],
-  }
-
 fn a_place() -> List<Place> =
   [{ path: "m.ply", text: b"test \"two is two\" { assert_eq(1 + 1, 2) }\n" }]
 
@@ -3308,9 +3281,6 @@ fn a_key(index: Int, label: String, answered: Bool, seeded: Bool, unstable: Bool
   }
 
 fn a_search() -> Search = { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] }
-
-fn parsed(argv: List<String>) -> Parsed / {abort.raise} =
-  match parse(surface::spec("0.0.0-test"), argv) { Run(p) -> p, _ -> panic("the line parses") }
 
 fn a_case(index: Int, name: String) -> Case =
   {
@@ -3433,7 +3403,7 @@ fn a_fault() -> Fault =
   {
     key: "m.two is two",
     name: "two is two",
-    diagnostic: a_diag(b"E0502", b"assertion failed", [], []),
+    diagnostic: error_with_labels(b"E0502", b"assertion failed", [], []),
     defect: false,
     bisect: no_bisect(),
     suspects: [],
@@ -3456,7 +3426,7 @@ fn a_failed(defect: Bool, host: Bool, absent: Option<Skipped>) -> Failed =
   {
     key: "m.two is two",
     name: "two is two",
-    diagnostic: { diag: a_diag(b"E0501", b"assertion failed", [], []), values: [] },
+    diagnostic: { diag: error_with_labels(b"E0501", b"assertion failed", [], []), values: [] },
     defect: defect,
     host: host,
     search: Some({
@@ -3534,7 +3504,7 @@ test "a green run is exit 0, and the head says what was selected of what before 
   );
   assert_eq(answer.code, 0);
   // The head and the results went out as the run went; the answer is what follows them.
-  assert(!said(answer.lines, "   selected 1 of 2 (1 cached)"));
+  assert(!contains(answer.lines, "   selected 1 of 2 (1 cached)"));
   assert_eq(filter(answer.lines, |l: String| string_starts_with(l, "   ok ")), []);
   assert_eq(answer.errs, [])
 }
@@ -3561,10 +3531,10 @@ test "a failure is exit 1 and the culprit is printed before the diff" {
     a_decided(p, keys),
   );
   assert_eq(answer.code, 1);
-  assert(said(answer.lines, "   m.two is two"));
-  assert(said(answer.lines, "     culprit: m.total"));
-  assert(said(answer.lines, "       narrowed to one body"));
-  assert(said(answer.lines, "     assertion failed"))
+  assert(contains(answer.lines, "   m.two is two"));
+  assert(contains(answer.lines, "     culprit: m.total"));
+  assert(contains(answer.lines, "       narrowed to one body"));
+  assert(contains(answer.lines, "     assertion failed"))
 }
 
 test "a bisection nobody asked for says nothing, and one that failed says why" {
@@ -3600,7 +3570,7 @@ test "a test the clock stopped is abandoned rather than judged, and the run is n
   let stopped = {
     ..an_outcome(0, "slow", "abandoned"),
     diagnostic: Some({
-      diag: a_diag(b"E0504", b"the run was abandoned", [], [b"raise the clock"]),
+      diag: error_with_labels(b"E0504", b"the run was abandoned", [], [b"raise the clock"]),
       values: [],
     }),
   };
@@ -3613,9 +3583,9 @@ test "a test the clock stopped is abandoned rather than judged, and the run is n
     a_decided(p, keys),
   );
   assert_eq(answer.code, 1);
-  assert(said(answer.lines, "   slow abandoned"));
-  assert(said(answer.lines, "     the run was abandoned"));
-  assert(said(answer.lines, "     = raise the clock"))
+  assert(contains(answer.lines, "   slow abandoned"));
+  assert(contains(answer.lines, "     the run was abandoned"));
+  assert(contains(answer.lines, "     = raise the clock"))
 }
 
 // A pass a later hermetic run would believe is not a warning: the run is red over it.
@@ -3624,7 +3594,7 @@ test "an escaped cache entry fails the run even with every test green" {
   let keys = [a_key(0, "one", false, false, false)];
   let escaped = {
     ..a_run([an_outcome(0, "one", "passed")], 0),
-    escapes: [a_diag(b"E0001", b"`m.one` can reach the host binding", [], [])],
+    escapes: [error_with_labels(b"E0001", b"`m.one` can reach the host binding", [], [])],
   };
   assert_eq(answered(plain(), from_argv("test", []), p, escaped, [], a_decided(p, keys)).code, 1)
 }
@@ -3646,8 +3616,8 @@ test "a mutant no test kills fails the run and is named with what it changed" {
   };
   let answer = answered(plain(), from_argv("test", []), p, mutated, [], a_decided(p, keys));
   assert_eq(answer.code, 1);
-  assert(said(answer.lines, "   mutants 2 killed, 1 survived, 0 skipped"));
-  assert(said(answer.lines, "      m.total survives `+` -> `-` at "))
+  assert(contains(answer.lines, "   mutants 2 killed, 1 survived, 0 skipped"));
+  assert(contains(answer.lines, "      m.total survives `+` -> `-` at "))
 }
 
 test "the mark is a word in a plain run and one glyph in a styled one" {
@@ -3720,11 +3690,11 @@ test "`--explain` says why each test ran, once per reason, and how the groups fo
   assert(string_contains(at_or(lines, 1, ""), "run  abcdef012345 new "));
   assert(string_contains(at_or(lines, 1, ""), "isolation: region"));
   assert(string_contains(at_or(lines, 2, ""), "skip abcdef012345 cached "));
-  assert(said(lines, "   why"));
-  assert(said(lines, "   concurrency groups"));
+  assert(contains(lines, "   why"));
+  assert(contains(lines, "   concurrency groups"));
   // One class, holding the one test that runs: a cached test shares a worker with nobody.
-  assert(said(lines, "     group 0 · 1 test · {}"));
-  assert(said(lines, "       one"))
+  assert(contains(lines, "     group 0 · 1 test · {}"));
+  assert(contains(lines, "       one"))
 }
 
 // What `shipped` answers is the binary's, so a test reading it is cached across a change to it.
@@ -3738,21 +3708,21 @@ test "`--explain` says what a pass is filed under and names what no key covers" 
   let lines = explain_lines(plain(), p, [], a_decided(p, keys));
   assert(string_contains(at_or(lines, 1, ""), " · outside its key: {shipped.read}"));
   assert(!string_contains(at_or(lines, 2, ""), "outside its key"));
-  assert(said(lines, "   key"));
+  assert(contains(lines, "   key"));
   assert(
-    said(
+    contains(
       lines,
       "     a pass is filed under its test's hash and the runtime stamp aabbccddeeff, and under the code the test ran",
     ),
   );
   assert(
-    said(
+    contains(
       lines,
       "     1 test read what this binary ships (shipped), which is in no key: a change to it reruns none of them",
     ),
   );
   let uncached = explain_lines(plain(), { ..p, filed_under: None }, [], a_decided(p, keys));
-  assert(said(uncached, "     no pass is filed: `--no-cache` reads and writes none"));
+  assert(contains(uncached, "     no pass is filed: `--no-cache` reads and writes none"));
   let text = to_string(
     answered(plain(), from_argv("test", ["--json"]), p, a_run([], 0), [], a_decided(p, keys)).json,
   );
@@ -3838,14 +3808,14 @@ test "a failure's artifact says what failed, how to replay it, and what caused i
 test "a program with no tests at all says so, and one narrowed to none says that instead" {
   let empty = { ..a_program([]), declared: 0 };
   assert(
-    said(
+    contains(
       answered(plain(), from_argv("test", []), empty, a_run([], 0), [], a_decided(empty, [])).lines,
       "   no `test` items in this program",
     ),
   );
   let hidden = { ..a_program([]), declared: 3, filtered_out: 3 };
   assert(
-    said(
+    contains(
       answered(
         plain(),
         from_argv("test", ["--filter=none"]),
@@ -4060,7 +4030,7 @@ test "a label is bare in a single-module run and qualified across several" {
 // A deadlock's cycle lives only in its secondary labels, so each is printed where it points.
 
 test "a failure's other labels are printed under it, each with its own place" {
-  let d = a_diag(
+  let d = error_with_labels(
     b"E0414",
     b"these tasks are deadlocked",
     [
@@ -4106,14 +4076,15 @@ test "every reason has an explanation of its own" {
 }
 
 test "a load that refuses tallies its errors and binds nothing" {
-  let answer = refused(plain(), "test", [a_diag(b"E0201", b"type mismatch", [], [])], []);
+  let answer = refused(plain(), "test", [error_with_labels(b"E0201", b"type mismatch", [], [])], [
+  ]);
   assert_eq(answer.code, 2);
   assert_eq(answer.errs, ["Error[E0201]: type mismatch", "   compilation failed (1 error)"])
 }
 
 test "a binding that does not match the program is a start-up failure naming no line" {
   let answer = unbound(plain(), {
-    diags: [a_diag(b"E0412", b"a nondet effect in a det test", [], [])],
+    diags: [error_with_labels(b"E0412", b"a nondet effect in a det test", [], [])],
     places: [],
   });
   assert_eq(answer.code, 2);
@@ -4197,7 +4168,7 @@ test "the atoms that serialise them are the set's expansion, and an alias only e
   assert(len(filter(broad, |t: String| string_ends_with(t, "store.write[orders]"))) > 0);
   assert(len(filter(broad, |t: String| string_contains(t, "Desk"))) == 0);
   assert(len(filter(narrow, |t: String| string_ends_with(t, "store.write[orders]"))) == 0);
-  assert(fold(narrow, true, |ok: Bool, t: String| ok && said(broad, t)))
+  assert(fold(narrow, true, |ok: Bool, t: String| ok && contains(broad, t)))
 }
 
 fn cell_test(label: String, i: Int) -> String =
