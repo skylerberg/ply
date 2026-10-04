@@ -70,7 +70,12 @@ runtime. A pass is filed as well under the code its test compiled to, believed b
 whose runtime and definitions that run a test and file its pass hash as they did,
 so a compiler change that leaves a test's code as it was does not run it again.
 A hash covers what its definition reaches and no comment or
-layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these. A dependency's own
+layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these.
+What the front end filed for a definition is taken again while the definition's
+own text and what it reads of each definition and declaration it references
+stand: the signature and specifications written there, how its calls end, and
+what it performs or answers that a caller's check counts by. An edited body is
+checked again, and what references it only where one of those moved. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
