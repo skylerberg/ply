@@ -2744,49 +2744,160 @@ fn foreign_import(m: Int, span: Span, importer: Bytes, name: Bytes) -> Diag =
 
 type Round = { wanted: Map<Bytes, Bytes>, diags: List<Diag> }
 
+type Wanted = { names: Map<Bytes, Bool>, diags: List<Diag> }
+
+// The shipped modules `parsed` imports and does not hold yet, by name. A user module names one by its
+// root; a shipped one names its siblings in the compiler package bare. `listed` is every shipped
+// module there is, read or not.
+fn wanted(users: Int, listed: List<Bytes>, parsed: List<ParsedSource>) -> Wanted / {abort.raise} = {
+  let has = fold(listed, map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
+    map_insert(acc, name, true));
+  let present = fold(parsed, map_new(), |acc: Map<Bytes, Bool>, p: ParsedSource|
+    map_insert(acc, p.name, true));
+  fold(range(0, len(parsed)), { names: map_new(), diags: [] }, |acc: Wanted, i: Int| {
+    let p = at(parsed, i);
+    let imports = p.module.module.imports;
+    let ships = i >= users;
+    fold(imports, acc, |w: Wanted, decl: ImportDecl| {
+      let name = import_module_name(decl);
+      if is_shipped(name) && !map_contains(present, name) {
+        if map_contains(has, name) { { ..w, names: map_insert(w.names, name, true) } } else {
+          {
+            ..w,
+            diags: push(w.diags, if ships {
+              foreign_import(i, import_at(imports, name), p.name, name)
+            } else { unknown_shipped(i, import_at(imports, name), name, listed) }),
+          }
+        }
+      } else if ships && !is_shipped(name) {
+        // The compiler package's internal import: `import parsing` in `compiler.costs` means `compiler.parsing`.
+        let internal = bytes_concat(b"compiler.", name);
+        if map_contains(present, internal) { w }
+        else if map_contains(has, internal) { { ..w, names: map_insert(w.names, internal, true) } }
+        else if is_compiler(p.name) { w } else {
+          { ..w, diags: push(w.diags, foreign_import(i, import_at(imports, name), p.name, name)) }
+        }
+      } else { w }
+    })
+  })
+}
+
 fn pull_round(
   users: Int,
   shipped: Map<Bytes, Bytes>,
   listed: List<Bytes>,
   parsed: List<ParsedSource>,
 ) -> Round / {abort.raise} = {
-  let present = fold(parsed, map_new(), |acc: Map<Bytes, Bool>, p: ParsedSource|
-    map_insert(acc, p.name, true));
-  fold(range(0, len(parsed)), { wanted: map_new(), diags: [] }, |acc: Round, i: Int| {
-    let p = at(parsed, i);
-    let imports = p.module.module.imports;
-    let ships = i >= users;
-    fold(imports, acc, |r: Round, decl: ImportDecl| {
-      let name = import_module_name(decl);
-      if is_shipped(name) && !map_contains(present, name) {
-        match map_get(shipped, name) {
-          Some(src) -> { ..r, wanted: map_insert(r.wanted, name, src) },
-          None ->
-            {
-              ..r,
-              diags: push(r.diags, if ships {
-                foreign_import(i, import_at(imports, name), p.name, name)
-              } else { unknown_shipped(i, import_at(imports, name), name, listed) }),
-            },
-        }
-      } else if ships && !is_shipped(name) {
-        // The compiler package's internal import: `import parsing` in `compiler.costs` means `compiler.parsing`.
-        let internal = bytes_concat(b"compiler.", name);
-        if map_contains(present, internal) { r } else {
-          match map_get(shipped, internal) {
-            Some(src) -> { ..r, wanted: map_insert(r.wanted, internal, src) },
-            None -> if is_compiler(p.name) { r } else {
-              {
-                ..r,
-                diags: push(r.diags, foreign_import(i, import_at(imports, name), p.name, name)),
-              }
-            },
-          }
-        }
-      } else { r }
+  let w = wanted(users, listed, parsed);
+  map_fold(w.names, { wanted: map_new(), diags: w.diags }, |r: Round, name: Bytes, _: Bool|
+    match map_get(shipped, name) {
+      Some(src) -> { ..r, wanted: map_insert(r.wanted, name, src) },
+      None -> { ..r, diags: push(r.diags, unread_shipped(name)) },
     })
-  })
 }
+
+fn unread_shipped(name: Bytes) -> Diag =
+  error_at(
+    b"E0505",
+    0,
+    dummy_span(),
+    bytes_concat_all([b"the shipped module `", name, b"` is pulled and was never read"]),
+    b"the load read its shipped modules before it knew what it pulls",
+    [b"this is Ply's fault, not the program's"],
+  )
+
+// The shipped modules a load reads, and the names of the rest, of which it reads none.
+pub type Shipping = { read: List<Source>, unread: List<Bytes> }
+
+// What a load of `user` and its package closure pulls, each module read once through `read`: what
+// they import, what those import in turn, and what any of them embeds beside itself. Handed the
+// read ones, and the rest as `unread`, the front end pulls what it would have pulled from every
+// shipped module.
+pub fn shipped_pulled<| e>(
+  user: List<Source>,
+  pkgs: PackageSources,
+  listed: List<Bytes>,
+  read: (Bytes) -> Option<Bytes> / e,
+) -> Shipping / {abort.raise | e} = {
+  let clo = closure(pkgs, map(user, |s: Source| s.name));
+  let own = concat(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
+  let parsed = map(range(0, len(own)), |i: Int| parse_at(i, at(own, i)));
+  let found = needing(
+    len(own),
+    listed,
+    read,
+    { parsed: parsed, found: [], tried: map_new() },
+    len(listed) + 1,
+  ).found;
+  let held = fold(found, map_new(), |acc: Map<Bytes, Bool>, s: Source|
+    map_insert(acc, s.name, true));
+  { read: found, unread: filter(listed, |name: Bytes| !map_contains(held, name)) }
+}
+
+type Needed = { parsed: List<ParsedSource>, found: List<Source>, tried: Map<Bytes, Bool> }
+
+// A round of reads at a time, each of what the last round's modules import and nothing read before;
+// `room` bounds the rounds, as each reads at least one module no earlier round did.
+fn needing<| e>(
+  users: Int,
+  listed: List<Bytes>,
+  read: (Bytes) -> Option<Bytes> / e,
+  x: Needed,
+  room: Int,
+) -> Needed / {abort.raise | e} = {
+  let names = filter(map_keys(wanted(users, listed, x.parsed).names), |name: Bytes|
+    !map_contains(x.tried, name));
+  if len(names) == 0 || room <= 0 { x } else {
+    needing(
+      users,
+      listed,
+      read,
+      fold(names, x, |acc: Needed, name: Bytes| {
+        let tried = map_insert(acc.tried, name, true);
+        match read(name) {
+          None -> { ..acc, tried: tried },
+          Some(src) -> {
+            let source = { name: name, src: src };
+            let p = parse_at(len(acc.parsed), source);
+            beside(
+              listed,
+              read,
+              { parsed: push(acc.parsed, p), found: push(acc.found, source), tried: tried },
+              source,
+            )
+          },
+        }
+      }),
+      room - 1,
+    )
+  }
+}
+
+// What a pulled module embeds from beside itself, read once: the prelude beside the compiler's
+// package is one, which no module imports.
+fn beside<| e>(
+  listed: List<Bytes>,
+  read: (Bytes) -> Option<Bytes> / e,
+  x: Needed,
+  source: Source,
+) -> Needed / {abort.raise | e} =
+  if !names_embed(source.src) { x } else {
+    fold(wants_of(parse(source.src).node), x, |acc: Needed, want: EmbedWant|
+      if want.dir { acc } else {
+        match shipped_name(source.name, want.path) {
+          None -> acc,
+          Some(name) -> if map_contains(acc.tried, name) || !list::contains(listed, name) { acc }
+          else {
+            let tried = map_insert(acc.tried, name, true);
+            match read(name) {
+              None -> { ..acc, tried: tried },
+              Some(src) ->
+                { ..acc, found: push(acc.found, { name: name, src: src }), tried: tried },
+            }
+          },
+        }
+      })
+  }
 
 fn without_last(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
   fold(range(0, len(xs) - 1), [], |acc: List<Bytes>, i: Int| push(acc, at(xs, i)))
@@ -2958,6 +3069,9 @@ pub fn staged_pulling_std_with(
   // Whether the program's tests and laws are read. A program to ship is the definition it enters
   // and all that reaches, which is never a test or a law.
   tested: Bool = true,
+  // The shipped modules there are and `shipped` does not hold, because this load pulls none of them
+  // (`shipped_pulled`).
+  unread: List<Bytes> = [],
 ) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
@@ -2983,16 +3097,17 @@ pub fn staged_pulling_std_with(
   let assembled = written.parsed;
   // The toolchain's own tree loads without its implicit self: every root module under `std`
   // with the whole shipped set among them is the built-in package's sources.
+  let listed = concat(map(shipped, |s: Source| s.name), unread);
   let toolchain = fold(user, true, |acc: Bool, s: Source| acc && is_std(s.name))
-    && fold(shipped, true, |acc: Bool, s: Source|
-      acc && (!is_std(s.name) || list::contains(map(user, |u: Source| u.name), s.name)));
+    && fold(listed, true, |acc: Bool, name: Bytes|
+      acc && (!is_std(name) || list::contains(map(user, |u: Source| u.name), name)));
   let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
   let x = pulling(
     len(assembled),
     texts,
     whole,
-    map(shipped, |s: Source| s.name),
+    listed,
     stubs,
     tested,
     { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, diags: [] },
@@ -3039,8 +3154,13 @@ pub fn analyse_pulling_std_with(
   embeds: List<Embedded> = [],
   // What an earlier load of the same program hashed, which this one takes where it stands.
   priors: List<Prior> = [],
+  unread: List<Bytes> = [],
 ) -> Pulled / {abort.raise} =
-  checked_staged(staged_pulling_std_with(user, shipped, pkgs, ifaces, embeds, priors), defs, tests)
+  checked_staged(
+    staged_pulling_std_with(user, shipped, pkgs, ifaces, embeds, priors, unread: unread),
+    defs,
+    tests,
+  )
 
 // What a load of `user` pins, and nothing more of it: each dependency's name, version and digest,
 // read off the package closure and the embeds the driver read, so no module is parsed. A closure
@@ -4049,6 +4169,76 @@ test "an import of a module that does not ship is reported at the import, listin
       fixes: [],
     },
   ])
+}
+
+// `shipped_modules` as a load reads them: each module's text, asked of `read` when it is pulled.
+fn shipped_text(name: Bytes) -> Option<Bytes> =
+  fold(shipped_modules(), None, |acc: Option<Bytes>, s: Source|
+    if s.name == name { Some(s.src) } else { acc })
+
+fn pulled_by(user: List<Source>) -> { shipping: Shipping, asked: List<Bytes> } / {abort.raise} =
+  with_cell[asked]([]) { c -> {
+    let shipping = shipped_pulled(
+      user,
+      { root: b"", manifest: None, supplied: [] },
+      map(shipped_modules(), |s: Source| s.name),
+      |name: Bytes| {
+        cell_update(c, |xs: List<Bytes>| push(xs, name));
+        shipped_text(name)
+      },
+    );
+    { shipping: shipping, asked: cell_get(c) }
+  } }
+
+test "a load reads the shipped modules it imports and what those import, and no other" {
+  let p = pulled_by([{ name: b"m", src: b"import std.a\npub fn f() -> Int = 1" }]);
+  assert_eq(p.asked, [b"std.a", b"std.c"]);
+  assert_eq(map(p.shipping.read, |s: Source| s.name), [b"std.a", b"std.c"]);
+  assert_eq(p.shipping.unread, [b"std.b", b"std.d"])
+}
+
+test "a load reads a compiler module's bare sibling imports and what it embeds beside its package" {
+  let texts = [
+    {
+      name: b"compiler.fmt",
+      src: b"import lexer\npub fn f() -> Bytes = embed(\"../prelude.ply\")\n",
+    },
+    { name: b"compiler.lexer", src: b"pub fn l() -> Int = 1\n" },
+    { name: b"compiler.prelude", src: b"" },
+    { name: b"compiler.unit", src: b"pub fn u() -> Int = 2\n" },
+  ];
+  let s = shipped_pulled(
+    [{ name: b"app", src: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
+    { root: b"", manifest: None, supplied: [] },
+    map(texts, |t: Source| t.name),
+    |name: Bytes|
+      fold(texts, None, |acc: Option<Bytes>, t: Source|
+        if t.name == name { Some(t.src) } else { acc }),
+  );
+  assert_eq(map(s.read, |t: Source| t.name), [
+    b"compiler.fmt",
+    b"compiler.prelude",
+    b"compiler.lexer",
+  ]);
+  assert_eq(s.unread, [b"compiler.unit"])
+}
+
+test "handed only what a load reads, the front end pulls and answers as it does over every module" {
+  let user = [{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }];
+  let p = pulled_by(user);
+  let whole = analyse_pulling_std(user, shipped_modules());
+  let lazy = analyse_pulling_std_with(user, p.shipping.read, [], [], unread: p.shipping.unread);
+  assert_eq(lazy.pulled, whole.pulled);
+  assert_eq(dump_of(lazy.out), dump_of(whole.out))
+}
+
+test "a module that does not ship is reported listing every one that does, read or not" {
+  let user = [{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }];
+  let p = pulled_by(user);
+  assert_eq(p.shipping.read, []);
+  let lazy = analyse_pulling_std_with(user, [], [], [], unread: p.shipping.unread);
+  let whole = analyse_pulling_std(user, shipped_modules());
+  assert_eq(dump_of(lazy.out), dump_of(whole.out))
 }
 
 fn compiler_shipped() -> List<Source> =
