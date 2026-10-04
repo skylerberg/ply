@@ -20,9 +20,6 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// The Ply declaration the registrations below are checked against.
-pub const DECLARATION: &str = ply_std::PROCESS;
-
 pub const MODULE: &str = "std.process";
 
 pub const EFFECT: &str = "std.process.process";

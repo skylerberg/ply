@@ -5,62 +5,69 @@ use ply_eval::{Diagnostic, Span, codes};
 use ply_machine::runnable::{self, Runnable};
 use std::path::{Path, PathBuf};
 
-include!(concat!(env!("OUT_DIR"), "/program_sources.rs"));
-
-/// Where the built program and the digest of the sources it was built from are committed.
-pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ply-cli/bootstrap");
-
 pub const RUNNABLE: &str = "ply.run";
 
-pub const DIGEST: &str = "ply.digest";
-
-/// What a builder keeps the committed program under, for a text that enters the definition it does.
-pub const KEY: &str = "ply.key";
+/// The committed program, the digest of the sources it was built from, and what a builder keeps it
+/// under, for a text that enters the definition it does: where `ply bootstrap` writes them.
+const COMMITTED: &str = "crates/ply-cli/bootstrap/ply.run";
+const COMMITTED_DIGEST: &str = "crates/ply-cli/bootstrap/ply.digest";
+const COMMITTED_KEY: &str = "crates/ply-cli/bootstrap/ply.key";
 
 // --- The `ply` program -------------------------------------------------------
 
 /// Where the CLI package sits inside a stage that carries its closure: the repository's own path,
 /// because the keys below are the repository's own paths.
-pub const ROOT: &str = "crates/ply-cli/ply";
+pub const ROOT: &str = ply_pack::PROGRAM;
 
 const ENTRY: &str = "ply.main";
 
 /// The name the rows of the program's builds are kept under.
 const ROWS: &str = "cli";
 
-/// The whole closure as the port takes it: `(path, text)`, which `digest_of` sorts. A package's own
-/// modules and its manifest are keyed by the path they have in the repository, so nothing about the
-/// program is a function of where this binary happens to be.
-pub fn program_sources() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = PROGRAM_PACKAGES
+/// Each file of the program's packages as the pack carries it: the path it has in the repository.
+fn program_files() -> Vec<&'static str> {
+    let pack = ply_pack::installed();
+    pack.program_packages()
         .iter()
-        .map(|(dir, name, text)| (format!("{dir}/{name}"), (*text).to_string()))
-        .collect();
-    out.extend(
-        PROGRAM_PACKAGE_MANIFESTS
-            .iter()
-            .map(|(dir, text)| (format!("{dir}/ply.pkg"), (*text).to_string())),
-    );
-    out
+        .flat_map(|package| pack.files_in(package))
+        .collect()
+}
+
+/// The whole closure as the port takes it: `(path, text)`, which `digest_of` sorts. A module is
+/// keyed by its package's path and its stem and a manifest by its own path, as the repository has
+/// them, so nothing about the program is a function of where this binary happens to be.
+pub fn program_sources() -> Vec<(String, String)> {
+    let pack = ply_pack::installed();
+    program_files()
+        .into_iter()
+        .map(|path| {
+            let key = path.strip_suffix(".ply").unwrap_or(path).to_string();
+            let text = pack
+                .text(path)
+                .expect("a listed path is carried")
+                .to_string();
+            (key, text)
+        })
+        .collect()
 }
 
 /// Lays the shipped closure out under `stage`, keyed by the repository's paths, so a package's
 /// `Path(..)` dependency resolves the way it does in a checkout.
 pub fn lay_out(stage: &Path) -> std::io::Result<()> {
-    for (dir, name, text) in PROGRAM_PACKAGES {
-        let package = stage.join(dir);
-        std::fs::create_dir_all(&package)?;
-        std::fs::write(package.join(format!("{name}.ply")), text)?;
-    }
-    for (dir, text) in PROGRAM_PACKAGE_MANIFESTS {
-        std::fs::write(stage.join(dir).join("ply.pkg"), text)?;
+    let pack = ply_pack::installed();
+    for path in program_files() {
+        let at = stage.join(path);
+        if let Some(dir) = at.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(at, pack.bytes(path).expect("a listed path is carried"))?;
     }
     Ok(())
 }
 
-/// What the built program is a function of: its sources, the shelf it is closed over as the shelf
-/// hands it out, the compiler that builds it among them, and the runtime its unit is compiled
-/// against. `ply bootstrap` writes it beside the runnable it builds.
+/// What the built program is a function of: its sources, the shipped modules it is closed over,
+/// the compiler that builds it among them, and the runtime its unit is compiled against.
+/// `ply bootstrap` writes it beside the runnable it builds.
 pub fn identity() -> String {
     static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     IDENTITY
@@ -69,7 +76,7 @@ pub fn identity() -> String {
             hasher.update(b"ply program 1\0");
             for part in [
                 ply_machine::builds::digest_of(&program_sources()),
-                ply_machine::builds::digest_of(ply_machine::shelf::sources()),
+                ply_machine::builds::digest_of(ply_machine::shipped_modules::sources()),
                 ply_codegen::c::runtime_digest().to_string(),
             ] {
                 hasher.update(part.as_bytes());
@@ -105,14 +112,12 @@ pub fn own_stage_name() -> String {
 }
 
 /// The digest the committed program was built from, when one is committed at all.
-pub fn committed_digest() -> Option<String> {
-    std::fs::read_to_string(Path::new(DIR).join(DIGEST))
-        .ok()
-        .map(|text| text.trim().to_string())
+pub fn committed_digest() -> Option<&'static str> {
+    ply_pack::installed().text(COMMITTED_DIGEST).map(str::trim)
 }
 
-pub fn committed() -> PathBuf {
-    Path::new(DIR).join(RUNNABLE)
+fn committed() -> Option<&'static [u8]> {
+    ply_pack::installed().bytes(COMMITTED)
 }
 
 /// The `ply` program: the committed runnable when it was built from these very sources, else one
@@ -123,9 +128,9 @@ pub fn committed() -> PathBuf {
 /// definition that one does: a binary whose committed runnable is behind its sources runs what the
 /// sources mean, never a runnable that means something else.
 pub fn program() -> Result<Runnable, Diagnostic> {
-    if committed_digest().as_deref() == Some(identity().as_str())
-        && let Ok(bytes) = std::fs::read(committed())
-        && let Ok(program) = runnable::decode(&bytes)
+    if committed_digest() == Some(identity().as_str())
+        && let Some(bytes) = committed()
+        && let Ok(program) = runnable::decode(bytes)
     {
         return Ok(program);
     }
@@ -139,8 +144,8 @@ pub fn program() -> Result<Runnable, Diagnostic> {
         if let Some(program) = found() {
             return Ok(program);
         }
-        ply_machine::builds::kept_as_built(&Path::new(DIR).join(KEY), || {
-            std::fs::read(committed()).ok()
+        ply_machine::builds::kept_as_built(ply_pack::installed().text(COMMITTED_KEY), || {
+            committed().map(<[u8]>::to_vec)
         });
         match ply_machine::builds::build(&laid_out()?, ROOT, ENTRY, &staged, ROWS) {
             Ok(()) => read_back(&staged),
@@ -203,7 +208,7 @@ fn laid_out() -> Result<PathBuf, Diagnostic> {
     if at.is_dir() {
         return Ok(at);
     }
-    let aside = stage().join(format!("src.{}", std::process::id()));
+    let aside = stage().join(format!("src.{}", ply_machine::builds::aside()));
     lay_out(&aside).map_err(|e| {
         unbuilt(format!(
             "its sources could not be placed in `{}`: {e}",

@@ -47,9 +47,14 @@ CI is the verifier; every pull request runs these checks and the whole suite:
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo build --locked --release -p ply-launcher --bin ply
+cargo build --locked --release -p ply-launcher --bins
+cargo pack target/release/ply
 cargo nextest run --workspace
 ```
+
+`ply` is a Rust runtime with the shipped modules, the builder and the `ply` program
+appended to it: `cargo pack BINARY` appends the checkout's, so an edit to Ply sources
+needs only that step, and a binary that carries no pack refuses to start.
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.

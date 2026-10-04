@@ -1,6 +1,15 @@
 //! The environment a launched program reads, end to end: a program performs `env.var`,
 //! `env.vars`, `env.terminal` and `env.binary_version` and the launcher answers.
 
+/// This test binary's pack is the checkout it was built in, as `ply`'s is the one appended to it.
+#[ctor::ctor(unsafe)]
+fn pack() {
+    ply_pack::install_checkout(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../.."
+    )));
+}
+
 /// The counting allocator is a whole-binary decision, so this test binary installs it too, which
 /// is what makes the window tests meaningful here.
 #[global_allocator]
@@ -296,7 +305,7 @@ fn the_builder_these_sources_make_builds_the_program_and_it_runs() {
     .expect("the project is written");
     let program = ply_launcher::Program {
         runnable,
-        shelf: ply_machine::shelf::sources().to_vec(),
+        shipped_modules: ply_machine::shipped_modules::sources().to_vec(),
         stage: ply_launcher::shipped::own_stage_name(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };

@@ -13,7 +13,8 @@ edits="${1:-5}"
 sizes=("10,25,125" "40,25,500" "160,25,2000")
 load1() { uptime | sed 's/.*load averages*: *//' | awk -F'[ ,]+' '{print $1}'; }
 
-cargo build --release --manifest-path "$root/Cargo.toml" -p ply-launcher --bin ply
+cargo build --release --manifest-path "$root/Cargo.toml" -p ply-launcher --bins
+(cd "$root" && target/release/ply-pack target/release/ply)
 "$root/.github/binary-is-current.sh" || { echo "STALE -- rebuild before measuring" >&2; exit 2; }
 ply="$root/target/release/ply"
 

@@ -4,24 +4,27 @@
 #
 #   .github/binary-is-current.sh                    # target/release/ply, or $PLY_BIN
 #   .github/binary-is-current.sh target/debug/ply target/release/ply
+#   .github/binary-is-current.sh --rust BINARY      # the runtime alone, before it is packed
 #   .github/binary-is-current.sh --self-test        # watch the check go red
 #
 # Exit 0 the binary is current · 1 it is STALE · 2 the question cannot be
 # answered (no binary, no dep-info).
 #
-# Checks rustc's dep-info (`<binary>.d`), the stdlib bytes the binary embeds
-# (`ply std --show`, one run for the whole shelf, so `ply` only), and cargo's own
-# inputs, which no dep-info lists. An mtime equal to the binary's counts as stale.
+# Checks rustc's dep-info (`<binary>.d`) and cargo's own inputs, which no dep-info
+# lists, for the runtime, and `ply-pack --check` for the pack appended to it. An
+# mtime equal to the binary's counts as stale.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 self_test=0
+rust_only=0
 targets=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test) self_test=1; shift ;;
-    -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's|^# \{0,1\}||'; exit 0 ;;
+    --rust) rust_only=1; shift ;;
+    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's|^# \{0,1\}||'; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) targets+=("$1"); shift ;;
   esac
@@ -77,36 +80,16 @@ check_depinfo() {                    # $1 binary, $2 dep-info, $3 scratch
   return "$bad"
 }
 
-# 2. content: the stdlib bytes inside the binary against the bytes in directory $2.
-#
-# `ply std --show` with no module prints every shipped source, in name order, which
-# is the order `$2`'s glob expands to; so a shelf that matches costs one spawn, not
-# one per module. A mismatch pays a spawn per module up to the first that differs.
-check_embedded_stdlib() {            # $1 binary, $2 stdlib dir
-  local bin="$1" dir="$2" dumped want f name named=0
-  dumped=$(mktemp); want=$(mktemp)
-  if ! "$bin" std --show >"$dumped" 2>/dev/null; then
-    rm -f "$dumped" "$want"
-    echo "  NOTE     no content check for $(rel "$bin") -- no bare \`std --show\`; its embedded .ply are on dep-info mtimes alone"
-    return 0
+# 2. the pack: what the binary carries, against the checkout at $2, by the `ply-pack` built beside it.
+check_pack() {                       # $1 binary, $2 checkout
+  local bin="$1" repo="$2" pack out
+  pack="$(dirname "$bin")/ply-pack"
+  if [ ! -x "$pack" ]; then
+    echo "  PACK     no $(rel "$pack") beside the binary to check its pack with"
+    return 1
   fi
-  cat "$dir"/*.ply > "$want" 2>/dev/null || true
-  if diff -q "$dumped" "$want" >/dev/null 2>&1; then
-    rm -f "$dumped" "$want"
-    return 0
-  fi
-  for f in "$dir"/*.ply; do
-    [ -e "$f" ] || continue
-    name=$(basename "$f" .ply)
-    if ! "$bin" std --show "std.$name" 2>/dev/null | diff -q - "$f" >/dev/null 2>&1; then
-      echo "  EMBEDDED std.$name differs from $(rel "$f") -- the binary holds other bytes"
-      named=1
-      break
-    fi
-  done
-  # Differing and naming no module: the two shelves hold a different set of them.
-  [ "$named" -eq 1 ] || echo "  EMBEDDED the shelf differs from $(rel "$dir") -- not one module's bytes, but which modules there are"
-  rm -f "$dumped" "$want"
+  if out=$(cd "$repo" && "$pack" --check "$bin" 2>&1); then return 0; fi
+  echo "  PACK     ${out#ply-pack: }"
   return 1
 }
 
@@ -166,13 +149,9 @@ verdict_for() {                      # 0 current, 1 stale, 2 unanswerable
     echo "UNKNOWN  $(rel "$bin") -- no $(rel "$dep"); rebuild so rustc writes one"
     return 2
   fi
-  # cargo writes dep-info after linking, so only a `.d` older than the binary is odd.
-  if [ "$(mtime_of "$dep")" -lt "$(mtime_of "$bin")" ]; then
-    echo "  NOTE     $(rel "$dep") is older than the binary; the binary was not written by this cargo build"
-  fi
   tmp=$(mktemp -d)
   check_depinfo "$bin" "$dep" "$tmp" || rc=1
-  check_embedded_stdlib "$bin" "$root/crates/ply-std/ply" || rc=1
+  [ "$rust_only" -eq 1 ] || check_pack "$bin" "$root" || rc=1
   check_cargo_inputs "$bin" "$tmp" || rc=1
   check_unlisted "$bin" "$tmp"
   if [ "$rc" -eq 0 ]; then
@@ -190,20 +169,31 @@ run_self_test() {
   [ -x "$bin" ] || { echo "self-test needs $(rel "$bin"); build it first" >&2; exit 2; }
   tmp=$(mktemp -d)
 
-  echo "1. the content instrument, against a corrupted copy of the stdlib"
-  cp "$root"/crates/ply-std/ply/*.ply "$tmp/"
-  printf '\n// self-test\n' >> "$tmp/http.ply"
-  if out=$(check_embedded_stdlib "$bin" "$tmp"); then
-    echo "   FAILED -- it did not notice bytes that differ"; rc=1
+  echo "1. the pack instrument, against a binary packed from another checkout"
+  local other="$tmp/checkout/crates"
+  mkdir -p "$other/ply-std/ply" "$other/ply-compiler/ply" "$other/ply-compiler/bootstrap" "$other/ply-cli/ply" "$other/ply-cli/bootstrap"
+  printf 'pub fn one() -> Int = 1\n' > "$other/ply-std/ply/one.ply"
+  printf 'pub fn two() -> Int = 2\n' > "$other/ply-compiler/ply/two.ply"
+  printf '\n' > "$other/ply-compiler/prelude.ply"
+  printf 'not a builder' > "$other/ply-compiler/bootstrap/build.run"
+  printf '0000000000000000\n' > "$other/ply-compiler/bootstrap/build.digest"
+  printf 'fn package() -> Manifest = {}\n' > "$other/ply-cli/ply/ply.pkg"
+  printf 'pub fn main() -> Unit = ()\n' > "$other/ply-cli/ply/ply.ply"
+  mkdir -p "$tmp/packed"
+  cp "$bin" "$tmp/packed/ply"
+  cp "$(dirname "$bin")/ply-pack" "$tmp/packed/ply-pack"
+  (cd "$tmp/checkout" && "$tmp/packed/ply-pack" "$tmp/packed/ply")
+  if out=$(check_pack "$tmp/packed/ply" "$root"); then
+    echo "   FAILED -- it did not notice a pack of other sources"; rc=1
   else
     echo "   red, as it must be:${out#  }"
   fi
 
-  echo "2. the content instrument, against the real stdlib"
-  if out=$(check_embedded_stdlib "$bin" "$root/crates/ply-std/ply"); then
+  echo "2. the pack instrument, against this binary"
+  if out=$(check_pack "$bin" "$root"); then
     echo "   green, as it must be"
   else
-    echo "   this worktree's stdlib is not the one in this binary:"; echo "$out"; rc=1
+    echo "   this worktree's pack is not the one in this binary:"; echo "$out"; rc=1
   fi
 
   mkdir -p "$tmp/fake"
@@ -239,6 +229,7 @@ run_self_test() {
 
   mkdir -p "$tmp/whole"
   cp "$bin" "$tmp/whole/ply"
+  cp "$(dirname "$bin")/ply-pack" "$tmp/whole/ply-pack"
 
   echo "6. the assembled verdict: a red arm must become STALE and exit 1"
   touch "$tmp/whole/newer.ply"

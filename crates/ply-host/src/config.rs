@@ -9,9 +9,6 @@ use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The Ply declaration the registrations below are checked against.
-pub const DECLARATION: &str = ply_std::CONFIG;
-
 pub const MODULE: &str = "std.config";
 
 pub const EFFECT: &str = "std.config.config";

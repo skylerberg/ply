@@ -9,9 +9,6 @@ use ply_eval::{
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The Ply declaration the registrations below are checked against.
-pub const DECLARATION: &str = ply_std::TIME;
-
 pub const MODULE: &str = "std.time";
 
 pub const EFFECT: &str = "std.time.time";

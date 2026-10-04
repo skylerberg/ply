@@ -321,7 +321,12 @@ fn an_answer_over_the_examples_and_the_compiler_reads_whole() {
     let examples = ply_machine::builds::answered(&ply_files(&root.join("examples")))
         .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
     for (what, bytes) in [
-        ("the committed builder", ply_compiler::bootstrap::BUILDER),
+        (
+            "the committed builder",
+            ply_pack::installed()
+                .bytes("crates/ply-compiler/bootstrap/build.run")
+                .expect("the pack carries the committed builder"),
+        ),
         ("the examples", examples.as_slice()),
     ] {
         let answer = ply_machine::runnable::front_value(bytes)

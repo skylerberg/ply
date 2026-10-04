@@ -19,8 +19,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub const DECLARATION: &str = ply_std::TRACE;
-
 pub const MODULE: &str = "std.trace";
 
 pub const EFFECT: &str = "std.trace.trace";

@@ -5,6 +5,15 @@
 //! One binary. The engine's own unit tests, one per module of `crates/ply-machine/src`, are in
 //! `tests/unit`.
 
+/// This test binary's pack is the checkout it was built in, as `ply`'s is the one appended to it.
+#[ctor::ctor(unsafe)]
+fn pack() {
+    ply_pack::install_checkout(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../.."
+    )));
+}
+
 mod claims;
 mod embeds;
 mod enter;

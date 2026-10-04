@@ -28,6 +28,9 @@ permissions:
   actions: read
 
 env:
+  # The Rust key folds both in, so raising either builds afresh.
+  RUST_TOOLCHAIN: "1.93.1"
+  NEXTEST_VERSION: "0.9.143"
   CARGO_TERM_COLOR: always
   # No job reuses incremental artifacts, and sccache cannot wrap rustc with it on.
   CARGO_INCREMENTAL: "0"
@@ -115,7 +118,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          toolchain: "1.93.1"
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
       # rust-cache keys on every Cargo.toml and Cargo.lock and the job itself, and falls back to the
       # job's last entry when they move. A key of our own would be part of that fallback's prefix,
@@ -129,6 +132,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo fmt --all --check
 
+  # The archive is keyed by the Rust key alone, so a run that changed no Rust builds none: it finds
+  # the archive main's run or this pull request's last run cached, or, on main, the one the pull
+  # request's run uploaded, since main cannot read a pull request's cache.
   build:
     name: cargo nextest archive
     runs-on: ubuntu-24.04
@@ -140,73 +146,83 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: The tree this run builds
-        id: tree
-        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
-      # main cannot read a pull request's cache, so a pull request's build comes back as an artifact.
-      - name: The archive a pull request's run built for this tree
+      - uses: ./.github/actions/rust-key
+        id: rust
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cached
+        with:
+          path: nextest.tar.zst
+          key: nextest-archive-${{ steps.rust.outputs.key }}
+          lookup-only: true
+      - name: The archive a pull request's run built of this Rust
         id: reuse
-        if: github.event_name == 'push'
+        if: steps.cached.outputs.cache-hit != 'true' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          NAME: nextest-archive-${{ steps.rust.outputs.key }}
         run: |
           set -euo pipefail
-          found=$(.github/artifact-for-this-tree.sh nextest-archive "${{ steps.tree.outputs.tree }}")
-          if [ -z "$found" ]; then echo "no run has built this tree; building"; exit 0; fi
-          run=${found%% *}; name=${found##* }
-          gh run download "$run" -n "$name"
+          run=$(.github/artifact-run.sh "$NAME")
+          if [ -z "$run" ]; then echo "no run has built this Rust; building"; exit 0; fi
+          gh run download "$run" -n "$NAME"
           test -f nextest.tar.zst
           echo "reused=true" >> "$GITHUB_OUTPUT"
-          echo "$name came back from run $run"
+          echo "$NAME came back from run $run"
+      - name: Whether this run builds the archive
+        id: builds
+        if: steps.cached.outputs.cache-hit != 'true' && steps.reuse.outputs.reused != 'true'
+        run: echo "yes=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         with:
-          toolchain: "1.93.1"
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # rust-cache keys on every Cargo.toml and Cargo.lock and the job itself, and falls back to the
+      # job's last entry when they move. A key of our own would be part of that fallback's prefix,
+      # so a changed manifest would find nothing and rebuild every dependency.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         with:
           save-if: ${{ github.ref_name == github.event.repository.default_branch }}
       - uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
 
       - name: cargo test --workspace --no-run
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         run: cargo test --locked --workspace --no-run
 
       - name: cargo nextest archive --workspace
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         run: cargo nextest archive --locked --workspace --archive-file nextest.tar.zst
 
       # The window is part of the format: every job that unpacks this must pass `--long=30` too.
       - name: Recompress the archive with a whole-tree window
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         run: |
           set -euo pipefail
           zstd -d -c nextest.tar.zst | zstd -q -T0 -3 --long=30 -o nextest.long.tar.zst
           mv nextest.long.tar.zst nextest.tar.zst
 
-      # Jobs restore the archive from the cache, which is faster than an artifact download; the
-      # artifact is for a later push to main to reuse.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: github.event_name == 'pull_request'
+        if: steps.builds.outputs.yes == 'true' && github.event_name == 'pull_request'
         with:
-          name: nextest-archive-${{ steps.tree.outputs.tree }}
+          name: nextest-archive-${{ steps.rust.outputs.key }}
           path: nextest.tar.zst
           retention-days: 2
           if-no-files-found: error
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.cached.outputs.cache-hit != 'true'
         with:
           path: nextest.tar.zst
-          key: nextest-archive-${{ github.run_id }}
+          key: nextest-archive-${{ steps.rust.outputs.key }}
       # A save that cannot reserve its key only warns; fail here rather than in every job below.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: nextest.tar.zst
-          key: nextest-archive-${{ github.run_id }}
+          key: nextest-archive-${{ steps.rust.outputs.key }}
           lookup-only: true
           fail-on-cache-miss: true
 
@@ -223,37 +239,78 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: The tree this run builds
-        id: tree
-        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
-      - name: The binary a pull request's run built for this tree
+      - uses: ./.github/actions/rust-key
+        id: rust
+      # The runtime alone, before any pack: what the Rust key is a key of.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cached
+        with:
+          path: |
+            target/release/ply
+            target/release/ply-pack
+          key: ply-runtime-${{ steps.rust.outputs.key }}
+      - name: The runtime a pull request's run built of this Rust
         id: reuse
-        if: github.event_name == 'push'
+        if: steps.cached.outputs.cache-hit != 'true' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          NAME: ply-runtime-${{ steps.rust.outputs.key }}
         run: |
           set -euo pipefail
-          found=$(.github/artifact-for-this-tree.sh ply "${{ steps.tree.outputs.tree }}")
-          if [ -z "$found" ]; then echo "no run has built this tree; building"; exit 0; fi
-          run=${found%% *}; name=${found##* }
-          gh run download "$run" -n "$name" -D target/release
-          chmod +x target/release/ply
-          touch target/release/ply target/release/ply.d
+          run=$(.github/artifact-run.sh "$NAME")
+          if [ -z "$run" ]; then echo "no run has built this Rust; building"; exit 0; fi
+          gh run download "$run" -n "$NAME" -D target/release
+          chmod +x target/release/ply target/release/ply-pack
           echo "reused=true" >> "$GITHUB_OUTPUT"
-          echo "$name came back from run $run"
+          echo "$NAME came back from run $run"
+      - name: Whether this run builds the runtime
+        id: builds
+        if: steps.cached.outputs.cache-hit != 'true' && steps.reuse.outputs.reused != 'true'
+        run: echo "yes=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         with:
-          toolchain: "1.93.1"
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: steps.reuse.outputs.reused != 'true'
+        if: steps.builds.outputs.yes == 'true'
         with:
           save-if: ${{ github.ref_name == github.event.repository.default_branch }}
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        if: steps.reuse.outputs.reused != 'true'
-      - name: cargo build --locked --release -p ply-launcher --bin ply
-        if: steps.reuse.outputs.reused != 'true'
-        run: cargo build --locked --release -p ply-launcher --bin ply
+        if: steps.builds.outputs.yes == 'true'
+      - name: cargo build --locked --release -p ply-launcher --bins
+        if: steps.builds.outputs.yes == 'true'
+        run: cargo build --locked --release -p ply-launcher --bins
+      # A cached runtime is only as current as the key is whole: an input the key missed would be
+      # served stale to every run after.
+      - name: Every input the build read is under the Rust key
+        if: steps.builds.outputs.yes == 'true'
+        run: .github/ci-shards.sh rust-inputs target/release/ply.d
+      # Here rather than in a later job: it compares mtimes, and a later checkout is newer than the
+      # binary. Only a binary this job built has the mtimes it compares.
+      - name: The runtime is built from this tree
+        if: steps.builds.outputs.yes == 'true'
+        run: .github/binary-is-current.sh --rust target/release/ply
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.builds.outputs.yes == 'true' && github.event_name == 'pull_request'
+        with:
+          name: ply-runtime-${{ steps.rust.outputs.key }}
+          path: |
+            target/release/ply
+            target/release/ply-pack
+          retention-days: 2
+          if-no-files-found: error
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.cached.outputs.cache-hit != 'true'
+        with:
+          path: |
+            target/release/ply
+            target/release/ply-pack
+          key: ply-runtime-${{ steps.rust.outputs.key }}
+
+      # What this tree holds of Ply, appended to the runtime: the step a change to Ply sources alone
+      # costs where it used to cost a Rust build.
+      - name: The pack of this tree's Ply sources and runnables
+        run: target/release/ply-pack target/release/ply
 
       # A cache rather than an artifact: every suite job wants these two files, and the artifact
       # service is the one part of a run that fails on its own.
@@ -304,11 +361,8 @@ jobs:
       # A step of its own, so a run says what building it took and where.
       - name: The `ply` program these sources build
         run: .github/ci-warm.sh program target/release/ply
-      # Here rather than in a later job: it compares mtimes, and a later checkout is newer than the binary.
       - name: The freshness check can still go red
         run: .github/binary-is-current.sh --self-test
-      - name: The binary is built from this tree
-        run: .github/binary-is-current.sh target/release/ply
       # The check above needs the `ply` program but not the emitter, which a restored `ply`
       # program never asks for: without this, every later job's first compiles built it again.
       - name: The emitter, for every job after this one
@@ -337,22 +391,15 @@ jobs:
             /tmp/ply-c-stage
           key: ply-c-stage-emitter-${{ github.run_id }}
 
-      # For `refresh`, the one job that runs this binary.
+      # For `refresh`, the one job that runs this binary, and repacks it with what it emits.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name == 'push'
         with:
           name: ply
-          path: target/release/ply
-          retention-days: 1
-          if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: github.event_name == 'pull_request'
-        with:
-          name: ply-${{ steps.tree.outputs.tree }}
           path: |
             target/release/ply
-            target/release/ply.d
-          retention-days: 2
+            target/release/ply-pack
+          retention-days: 1
           if-no-files-found: error
 
   # On runners of its own, so the corpus lanes have theirs to themselves. After `build-ply`, whose
@@ -776,16 +823,16 @@ jobs:
       - name: Emit the builder and the `ply` program
         run: |
           set -euo pipefail
-          chmod +x target/release/ply
+          chmod +x target/release/ply target/release/ply-pack
           target/release/ply bootstrap crates/ply-compiler/ply --out crates/ply-compiler/bootstrap
           target/release/ply bootstrap crates/ply-cli/ply --out crates/ply-cli/bootstrap
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: "1.93.1"
-      # `ply-compiler`'s build script holds the builder's directory to what `ply bootstrap` writes,
-      # so a builder the build refuses is caught here rather than committed for every checkout.
-      - name: The builder it emitted builds
-        run: cargo check --locked -p ply-compiler
+      # The pack refuses a bootstrap directory holding anything `ply bootstrap` does not write, and a
+      # binary carrying what was emitted must still start, so neither is committed for every checkout.
+      - name: A binary packed with what it emitted runs
+        run: |
+          set -euo pipefail
+          target/release/ply-pack target/release/ply
+          target/release/ply --version
       # The digest covers everything the build reads, so bytes that moved under it are a build that
       # is not a function of its sources, which committing them would hide.
       - name: The programs moved only with their digests
