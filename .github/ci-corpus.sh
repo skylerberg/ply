@@ -94,9 +94,12 @@ timed() {
   jq -r --arg p "$2" '.results[]? | "\((.duration_ms // 0) | floor)\t\($p)\t\(.key // .name)"' "$1" 2>/dev/null
 }
 
-# Each test a run ran, with how it ended and its seconds, and each it took from the cache.
+# Each test a run ran, with how it ended, its seconds, why it ran (the read that moved, for a
+# `changed` one) and `unfiled` for a pass no trace stands in for; and each it took from the cache.
 listed() {
-  jq -r '(.results[]? | "\(.status)\t\(((.duration_ms // 0) / 100 | floor) / 10)s\t\(.key // .name)"), (.selection.tests[]? | select(.reason == "cached") | "cached\t\t\(.key)")' "$1" 2>/dev/null
+  jq -r '(.selection.tests // [] | map({key: .key, value: (.reason + (if .moved then ": " + .moved else "" end))}) | from_entries) as $why
+    | (.results[]? | "\(.status)\t\(((.duration_ms // 0) / 100 | floor) / 10)s\t\(.key // .name)\t\($why[.key // .name] // "")\(if .cached == false then " (unfiled)" else "" end)"),
+      (.selection.tests[]? | select(.reason == "cached") | "cached\t\t\(.key)")' "$1" 2>/dev/null
 }
 
 # The row saying how many tests the report at $1 took from the cache, under $2, onto $3 if one is named.
