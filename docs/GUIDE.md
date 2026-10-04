@@ -591,6 +591,10 @@ Functions cannot be compared, encoded, ordered or used as map keys.
 ## 5. Expressions
 
 Everything is an expression, including `if`, `match`, `handle` and blocks.
+An expression nests at most 128 levels deep: each operand, parenthesis and
+block, a `let ... else` block among them, is a level, and the parser refuses
+one level more ("input is nested too deeply to parse"). An `else if` chain and
+a run of operators of one precedence are each one level, however long.
 
 ### 5.1 Blocks and `let`
 
@@ -842,7 +846,9 @@ termination): a part of an argument — a constructor's field, a record's field,
 a list's element or tail, a map's key, value or entry, at any depth — or an
 integer moving toward a bound that a guard on the way to the call holds it
 beyond, as `down` does, or as `if i >= len(xs) { .. } else { walk(xs, i + 1) }`
-does. A quotient by a literal greater than one, a shift right by one, and a
+does. A value with no parts — a nullary constructor, an empty list, a literal —
+is no larger than any argument, and a constructor of one field no larger than
+what its field is a part of. A quotient by a literal greater than one, a shift right by one, and a
 remainder by the measure itself lower an integer the guard holds at one or
 more. A loop may lower different measures at different calls, as Ackermann's
 function does, and a guard in one member of a group bounds the loops through
@@ -857,19 +863,25 @@ keep the length. A list written of parts, one they are pushed onto, one
 `filter` keeps, one `map` makes of a part of each element, and what `fold`
 answers when each step answers the accumulator or a part (a lookup that starts
 at `None`) are made of parts: each element is a part, though neither the list
-nor its tail need be smaller than what its parts are parts of.
+nor its tail need be smaller than what its parts are parts of. A value an `if`
+or a `match` chooses is what each branch is, and what a member of the group
+answers is read to a fixed point over the group, so a member that answers a
+part of its argument hands its caller a part.
 
-A function handed to `map`, `filter` or `fold` is called with each element; one
-handed to a definition outside the group is called as that definition calls
-it, with the parts of its arguments it hands on; and a lambda bound by `let` is
-read where it is called. A member of the group handed anywhere else, or one
-called from a lambda whose calls the checker cannot see, is called with nothing
-known.
+A function handed to `map`, `filter` or `fold` is called with each element, and
+one handed to `map_fold` with each key and value; one handed to a definition
+outside the group is called as that definition calls it, with the parts of its
+arguments it hands on; a function an `if` chooses is handed on as each branch
+is; and a lambda bound by `let` is read where it is called, eight lambdas deep
+at most. A member of the group handed anywhere else, or one called from a
+lambda whose calls the checker cannot see, is called with nothing known.
 
 A definition whose group descends ends, and so does one calling only
 definitions that end. `ply check --types` marks `diverges` on any other and
 says why, at the call's place: its own recursion is not seen to descend there,
-or it calls there a definition, which it names, that may not return. `ply check
+or is past what the check follows (a lambda deeper than it reads, or calls that
+compose into more than 10,000 size-change graphs), or it calls there a
+definition, which it names, that may not return. `ply check
 --json` gives each definition's `ending`: its `kind` (`ends`, `stated` or
 `diverges`) and, for one that diverges, `through` and `at`.
 

@@ -17,6 +17,7 @@ import parsing (push_front, positional, Span, Ident, QName, Input, Parser, Parse
 import lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLiteral, FloatLiteral,
               DecimalLiteral, StringLiteral, LineString, BytesLiteral, InterpolatedHead,
               InterpolatedMiddle, InterpolatedTail, CharLiteral, Keyword, Punctuation, EndOfInput)
+import std.list (at)
 import type_syntax (TypeExpr, ty, ty_span, dump_ty)
 import patterns (Pattern, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
                  pattern, pat_span, no_pattern, dump_pattern, dump_lit)
@@ -201,7 +202,7 @@ fn src_over(input: Input, span: Span) -> Bytes / {abort.raise} =
 // --- The grammar ------------------------------------------------------------
 
 pub fn expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
-  bin_expr(input, parser, 1)
+  bin_expr(input, parser, 1, binding_powers())
 
 // In a scrutinee a `{` opens the arm block, never a record or a block expression — except at the
 // very start, where nothing else can stand and the arms are the `{` after it.
@@ -213,21 +214,25 @@ pub fn scrutinee(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> /
   }
 }
 
-// The left spine is one `iterate`; the right operand recurses at `bp + 1`, a level deeper, so depth
-// is bounded by the number of binding powers rather than by the input's length.
+// How many binding powers there are, so how many times a right operand can recurse at a higher one.
+fn binding_powers() -> Int = 10
+
+// The left spine is one `iterate`; the right operand recurses at `bp + 1`, spending one of `powers`,
+// so depth is bounded by the number of binding powers rather than by the input's length.
 fn bin_expr(
   input: Input,
   parser: Parser,
   min_bp: Int,
+  powers: Int,
 ) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let lhs = unary_expr(input, parser)?;
   iterate(lhs, input.token_count - lhs.parser.pos + 1, |s: Parsed<Expr>|
     match peek_bin_op(input, s.parser) {
       None -> Stop(Ok(s)),
       Some(o) -> if o.bp < min_bp { Stop(Ok(s)) }
-      else if input.room <= 0 { Stop(Err(too_deep(input, s.parser))) } else {
+      else if powers <= 0 { Stop(Err(too_deep(input, s.parser))) } else {
         let a = advance_n(input, s.parser, o.width);
-        match bin_expr({ ..input, room: input.room - 1 }, a, o.bp + 1) {
+        match bin_expr(input, a, o.bp + 1, powers - 1) {
           Err(q) -> Stop(Err(q)),
           Ok(rhs) ->
             Continue({
@@ -1253,25 +1258,46 @@ fn else_branch(
     // No `else`: a `()` over the empty span at the end of the `then` block.
     let end = expr_span(then_branch).end;
     Ok({ parser: els.parser, node: ELit({ span: { start: end, end: end }, lit: LUnit }) })
-  } else if at_token(input, els.parser, keyword_if()) {
-    // The `if` it chains to nests in its `else`.
-    if input.room <= 0 { Err(too_deep(input, els.parser)) }
-    else { if_expr({ ..input, room: input.room - 1 }, els.parser) }
   } else { block_expr(input, els.parser) }
 }
 
+type IfArm = { start: Span, cond: Expr, then_branch: Expr }
+
+// An `else if` chain is read as one loop, an arm a round, and nested from its end: a chain nests no
+// deeper for being long.
 fn if_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
-  let st = advance(input, parser);
-  let { parser, node: cond } = scrutinee(input, st.parser)?;
-  let { parser, node: then_b } = block_expr(input, parser)?;
-  let { parser, node: else_b } = else_branch(input, parser, then_b)?;
+  let chain = iterate(
+    { parser: parser, out: [] },
+    input.token_count - parser.pos + 1,
+    |s: SoFar<IfArm>| {
+      let st = advance(input, s.parser);
+      match scrutinee(input, st.parser) {
+        Err(q) -> Stop(Err(q)),
+        Ok(c) -> match block_expr(input, c.parser) {
+          Err(q) -> Stop(Err(q)),
+          Ok(t) -> {
+            let out = push(s.out, { start: st.node, cond: c.node, then_branch: t.node });
+            let els = eat(input, t.parser, keyword_else());
+            if els.ok && at_token(input, els.parser, keyword_if()) {
+              Continue({ parser: els.parser, out: out })
+            } else { Stop(Ok({ parser: t.parser, out: out })) }
+          },
+        },
+      }
+    },
+  )?;
+  let last = at(chain.out, len(chain.out) - 1);
+  let { parser, node: else_b } = else_branch(input, chain.parser, last.then_branch)?;
   Ok({
     parser: parser,
-    node: EIf({
-      span: span_to(st.node, expr_span(else_b)),
-      cond: cond,
-      then_branch: then_b,
-      else_branch: else_b,
+    node: fold(range(0, len(chain.out)), else_b, |inner: Expr, i: Int| {
+      let arm = at(chain.out, len(chain.out) - 1 - i);
+      EIf({
+        span: span_to(arm.start, expr_span(inner)),
+        cond: arm.cond,
+        then_branch: arm.then_branch,
+        else_branch: inner,
+      })
     }),
   })
 }
@@ -2058,6 +2084,19 @@ test "a long left-associative chain is one iterate and adds no frames" {
   let r = parsed_or(rr, no_expr());
   assert_eq(len(r.parser.diags), 0);
   assert_eq(node_count(r.node), 801);
+}
+
+test "an `else if` chain nests no deeper for being long, and every binding power can climb at once" {
+  let arms = bytes_concat_all(map(range(0, 2 * max_depth()), |i: Int| b"if x { 1 } else "));
+  let chained = start(bytes_concat(arms, b"{ 2 }"));
+  let read = expr(chained.input, chained.parser);
+  assert(!failed(read));
+  assert_eq(len(parsed_or(read, no_expr()).parser.diags), 0);
+  // Each operator binds tighter than the one before it, so each right operand is read a power up.
+  let climbing = start(b"a || b && c == d | e ^ f & g << h ++ i + j * k");
+  let climbed = expr(climbing.input, climbing.parser);
+  assert(!failed(climbed));
+  assert_eq(len(parsed_or(climbed, no_expr()).parser.diags), 0)
 }
 
 test "each level of nesting spends one of the input's room, and one past it is refused there" {
