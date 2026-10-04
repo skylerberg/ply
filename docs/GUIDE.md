@@ -2342,6 +2342,7 @@ pub fn with_extension(path: String, ext: String) -> String
 pub fn parent(path: String) -> String
 pub fn extension(path: String) -> Option<String>
 pub fn components(path: String) -> List<String>
+pub fn segments(path: String) -> List<String>
 pub fn resolve(base: String, path: String) -> String
 pub fn strip_dot(path: String) -> String
 ```
@@ -2351,14 +2352,15 @@ one separator and adds none for a root spelled `"."` or `""`. `file_name` is the
 last segment, `""` for a path ending in a separator, and `stem` is that name
 with its extension taken off, so `stem("a.tar.gz")` is `"a.tar"` and
 `with_extension` puts another one back. `parent` is the directory holding the
-path, `"."` for a name with no separator and for a root, so
-`join(parent(p), file_name(p))` puts back what the two took apart. `extension`
-follows the last dot of the file name, and a dotfile has none. `components` is
-the separators' parts, a leading separator an empty first segment.
-`resolve(base, p)` is `p` against `base`, an absolute `p` as itself and a
-relative one appended and normalized; it reads no directory, so `..` is resolved
-by segment rather than by what is there. `strip_dot`
-removes a leading `./`, so `./m.ply` and `m.ply` are one key in a set.
+path, `"."` for a name with no separator and for a root, so `join(parent(p),
+file_name(p))` puts back what the two took apart. `extension` follows the last
+dot of the file name, and a dotfile has none. `components` is the separators'
+parts, a leading separator an empty first segment, and `segments` is the ones
+that name something, with no empty segment and none spelled `.`. `resolve(base,
+p)` is `p` against `base`, an absolute `p` as itself and a relative one appended
+and normalized; it reads no directory, so `..` is resolved by segment rather
+than by what is there. `strip_dot` removes a leading `./`, so `./m.ply` and
+`m.ply` are one key in a set.
 
 ### 13.13 `std.hash`
 
@@ -2401,6 +2403,8 @@ pub fn i32_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn i64_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn slice_at(b: Bytes, at: Int, n: Int) -> Option<Bytes>
 pub fn join(pieces: List<Bytes>, sep: Bytes) -> Bytes
+pub fn contains(b: Bytes, part: Bytes) -> Bool
+pub fn replace(b: Bytes, from: Bytes, to: Bytes) -> Bytes
 pub fn compare(a: Bytes, b: Bytes) -> Ordering
 pub fn repeat(b: Bytes, n: Int) -> Bytes
 pub fn hex_of(b: Bytes) -> String
@@ -2422,6 +2426,8 @@ written in ASCII — an optional `-`, then digits, and nothing else — and is
 `None` for anything else and for a number past what an `Int` holds; it is the
 one integer parser the shipped modules share, and `std.string`'s `int_of_string`
 is it over a `String`. `is_digit` is whether a byte is an ASCII decimal digit.
+`contains` is whether `part` occurs in `b`, and `replace` swaps every occurrence
+of `from` left to right; an empty `from` occurs nowhere.
 
 ### 13.15 `std.pkg`
 
@@ -2862,6 +2868,9 @@ pub fn count<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Int / e
 pub fn find<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<a> / e
 pub fn find_index<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<Int> / e
 pub fn contains<a>(xs: List<a>, x: a) -> Bool where derivable(eq, a)
+pub fn push_unique<a>(xs: List<a>, x: a) -> List<a> where derivable(eq, a)
+pub fn is_empty<a>(xs: List<a>) -> Bool
+pub fn somes<a>(xs: List<Option<a>>) -> List<a>
 pub fn index_of<a>(xs: List<a>, x: a) -> Option<Int> where derivable(eq, a)
 pub fn remove_first<a>(xs: List<a>, x: a) -> Option<List<a>> where derivable(eq, a)
 pub fn sum(xs: List<Int>) -> Int
@@ -2885,19 +2894,21 @@ here folds left to right and appends, which is one pass and linear. That is why
 building the same list from the front is a shape to avoid in Ply as well: it
 copies the accumulator every step and is quadratic. `at` is the element at an
 index and raises for an index the list does not hold; `at_or` answers a spare
-there instead, and `list_at` an `Option`. `take` and `drop` are the two halves
-of a list (`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks its
-index down while it appends, and `sort` is a merge sort — `n log n` comparisons
-whatever the input order is, and equal elements keep their relative order.
-`sort_by` is the same sort under a caller's `before`, which is how a key sort is
-written. `find` and `find_index` keep the first answer a scan meets. A callback
-may perform effects, as the prelude's `map` and `fold` allow: one given an
-element runs in list order, and `any`, `all`, `find` and `find_index` stop
-calling theirs once the answer is known. `partition`, `split_at` and `chunks`
-divide one list into others and keep the order; `flatten` is `flat_map` of the
-identity, `intersperse` puts its separator between the elements, and `unique`
-keeps each element's first occurrence — its membership test is a map's, so it is
-`n log n` rather than the `n²` a scan through the output would be.
+there instead, and `list_at` an `Option`. `push_unique` pushes only what the
+list does not hold, `is_empty` is whether it holds nothing, and `somes` keeps
+what each `Some` holds. `take` and `drop` are the two halves of a list
+(`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks its index down
+while it appends, and `sort` is a merge sort — `n log n` comparisons whatever
+the input order is, and equal elements keep their relative order. `sort_by` is
+the same sort under a caller's `before`, which is how a key sort is written.
+`find` and `find_index` keep the first answer a scan meets. A callback may
+perform effects, as the prelude's `map` and `fold` allow: one given an element
+runs in list order, and `any`, `all`, `find` and `find_index` stop calling
+theirs once the answer is known. `partition`, `split_at` and `chunks` divide one
+list into others and keep the order; `flatten` is `flat_map` of the identity,
+`intersperse` puts its separator between the elements, and `unique` keeps each
+element's first occurrence — its membership test is a map's, so it is `n log n`
+rather than the `n²` a scan through the output would be.
 
 ### 13.30 `std.map`
 
