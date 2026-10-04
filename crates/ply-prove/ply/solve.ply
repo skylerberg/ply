@@ -9,11 +9,11 @@ import egraph (Classes, Pair, Joined, classes, grow, find, union, equal, disting
 import lower (field_sorts)
 import rules (RuleLog, Rule, note, Propositional, CaseSplit, Congruence, Injectivity,
               LinearArithmetic)
-import sort (is_con, list_elem, field_names)
+import sort (is_con, list_elem, field_names, int_ty)
 import term (Terms, Made, Node, TInt, TBool, TLin, TApp, TCtor, TNil, TCons, TRecord, TField, TNot,
-             TAnd, TOr, TCmp, TEq, TIf, TMatch, Poly, Mono, CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest,
-             Always, TestCtor, TestLit, TestList, Undecidable, true_id, false_id, size, node,
-             sort_of, is_int, mk, sym, nil, cons)
+             TAnd, TOr, TCmp, TEq, TIf, TMatch, TOpaque, Poly, Mono, CmpOp, Lt, Le, Gt, Ge, Arm,
+             ArmTest, Always, TestCtor, TestLit, TestList, Undecidable, true_id, false_id, size,
+             node, sort_of, is_int, mk, sym, nil, cons, int_lit, add, app)
 
 pub type Answer = | Closed | Open | Exhausted
 
@@ -318,12 +318,16 @@ fn structural(solver: Solver, branch: Branch, n: Int) -> Stepped / {abort.raise}
                         },
                       Some(false) -> {
                         let u = unify_arguments(acc.st.sv.terms, acc.st.b, previous, t);
+                        // A `push` is a cell with no fields to read, so a cell that has them
+                        // witnesses the class in its place.
+                        let witness = if has_fields(acc.st.sv.terms, previous) { acc.witness }
+                        else { Some(t) };
                         if u.changed {
                           {
                             st: { sv: noted(acc.st.sv, Injectivity), b: u.b, changed: true },
-                            witness: acc.witness,
+                            witness: witness,
                           }
-                        } else { { st: { ..acc.st, b: u.b }, witness: acc.witness } }
+                        } else { { st: { ..acc.st, b: u.b }, witness: witness } }
                       },
                       None -> acc,
                     },
@@ -334,6 +338,9 @@ fn structural(solver: Solver, branch: Branch, n: Int) -> Stepped / {abort.raise}
         ).st
       },
   )
+
+fn has_fields(terms: Terms, t: Int) -> Bool / {abort.raise} =
+  match node(terms, t) { TApp(_) -> false, _ -> true }
 
 fn unify_arguments(
   terms: Terms,
@@ -422,8 +429,95 @@ fn propagate_one(solver: Solver, branch: Branch, t: Int) -> Stepped / {abort.rai
       },
       None -> { sv: solver, b: branch, changed: false },
     },
+    TApp(a) -> over_spine(solver, branch, t, a.head, a.args),
     _ -> { sv: solver, b: branch, changed: false },
   }
+
+// `len` and `push` over a list whose class holds a spine cell, one cell at a time: what lowering
+// does for a spine in view, for one the search came to know.
+fn over_spine(
+  solver: Solver,
+  branch: Branch,
+  t: Int,
+  head: Int,
+  args: List<Int>,
+) -> Stepped / {abort.raise} = {
+  let unchanged = { sv: solver, b: branch, changed: false };
+  match node(solver.terms, head) {
+    TOpaque(name) -> match args {
+      [xs] -> if name != "len" { unchanged } else {
+        match known_cell(solver.terms, branch, xs) {
+          Some(TNil) -> made(solver, branch, t, int_lit(solver.terms, 0)),
+          known -> {
+            // What a push leaves is one longer than what it was pushed onto, whatever that is.
+            let shorter = match known {
+              Some(TCons(c)) -> Some(c.tail),
+              _ -> pushed_onto(solver.terms, branch, xs),
+            };
+            match shorter {
+              None -> unchanged,
+              Some(below) -> {
+                let rest = app(solver.terms, head, [below], Some(int_ty()));
+                let one = int_lit(rest.terms, 1);
+                match add(one.terms, one.id, rest.id) {
+                  Some(sum) -> made(solver, branch, t, sum),
+                  None -> unchanged,
+                }
+              },
+            }
+          },
+        }
+      },
+      [xs, x] -> if name != "push" { unchanged } else {
+        let sort = sort_of(solver.terms, t);
+        match known_cell(solver.terms, branch, xs) {
+          Some(TNil) -> {
+            let empty = nil(solver.terms, sort);
+            made(solver, branch, t, cons(empty.terms, x, empty.id, sort))
+          },
+          Some(TCons(c)) -> {
+            let rest = app(solver.terms, head, [c.tail, x], sort);
+            made(solver, branch, t, cons(rest.terms, c.head, rest.id, sort))
+          },
+          _ -> unchanged,
+        }
+      },
+      _ -> unchanged,
+    },
+    _ -> unchanged,
+  }
+}
+
+// The list a `push` in the class pushed onto.
+fn pushed_onto(terms: Terms, branch: Branch, xs: Int) -> Option<Int> / {abort.raise} =
+  fold(range(0, size(terms)), None, |found: Option<Int>, p: Int|
+    match found {
+      Some(_) -> found,
+      None -> match node(terms, p) {
+        TApp(a) -> match a.args {
+          [onto, _] -> if equal(branch.cs, p, xs) && is_named(terms, a.head, "push") { Some(onto) }
+          else { None },
+          _ -> None,
+        },
+        _ -> None,
+      },
+    })
+
+fn is_named(terms: Terms, head: Int, name: String) -> Bool / {abort.raise} =
+  match node(terms, head) { TOpaque(n) -> n == name, _ -> false }
+
+fn known_cell(terms: Terms, branch: Branch, xs: Int) -> Option<Node> / {abort.raise} =
+  match known_list(terms, branch, xs) { Some(k) -> Some(node(terms, k)), None -> None }
+
+// `t` joined with a term made for it, the classes grown to hold it.
+fn made(solver: Solver, branch: Branch, t: Int, m: Made) -> Stepped = {
+  let j = union(grow(branch.cs, size(m.terms)), t, m.id);
+  {
+    sv: { ..noted(solver, Congruence), terms: m.terms },
+    b: { ..branch, cs: j.cs },
+    changed: j.changed,
+  }
+}
 
 // `a != b` at `Bool` decides one side from the other.
 fn propagate_disequalities(solver: Solver, branch: Branch) -> Stepped = {

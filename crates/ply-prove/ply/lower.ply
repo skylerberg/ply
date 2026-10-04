@@ -9,7 +9,8 @@ import compiler.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat,
 import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, is_pure, is_recursive,
                 unfoldable, self_recursive, reaches_float)
 import domain (Ty, Var, Fn, Record, Con)
-import rules (RuleLog, unfolded)
+import lemma (Lemma)
+import rules (RuleLog, Cited, note, unfolded)
 import sort (bool_ty, bytes_ty, float_ty, int_ty, string_ty, decimal_ty, is_con, list_elem, list_ty,
              option_ty, record_of, substituted, field_ty)
 import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym, TOpaque, TLin,
@@ -19,7 +20,7 @@ import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym
              string, decimal, fixed, unit, nil, cons, sym, opaque, add, sub, neg, mul, field, not,
              and, or, cmp, eq, app, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and,
              op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge)
-import std.list (drop, take)
+import std.list (concat, drop, take)
 
 // Past this many terms no definition is unfolded further.
 pub fn max_terms() -> Int = 20000
@@ -154,6 +155,10 @@ pub type Lowering = {
   calls: List<Int>,
   // Each rest binder of a list pattern, with the list it is the tail of.
   smaller: List<{ tail: Int, from: Int }>,
+  // The proved laws this claim may use, and each one's claim at a call that fit its trigger, which
+  // holds.
+  lemmas: List<Lemma>,
+  facts: List<Int>,
 }
 
 // A lowering after a step, and the term the step produced.
@@ -176,6 +181,8 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering / {abort.raise} =
     defined: [],
     calls: [],
     smaller: [],
+    lemmas: [],
+    facts: [],
   }
 
 // Lifts a term-store step into the lowering.
@@ -816,13 +823,25 @@ fn call(
             ),
           )
         } else { Keep(pure0, head.lowering) },
-        None -> match try_unfold(head.lowering, context, name, head.id, sort, args, unfolds) {
-          Some(r) -> Done(r),
-          None ->
-            Keep(
-              pure0 && is_pure(context, name),
-              note_unfold_refusal(head.lowering, context, name),
-            ),
+        None -> {
+          let told = instances(head.lowering, context, name, args, unfolds);
+          // A recursive call a lemma takes apart is the value its facts describe, not one to unroll.
+          if told.apart && is_recursive(context, name) && is_pure(context, name) {
+            let made = on(told.lowering, app(told.lowering.terms, head.id, args, sort));
+            Done({
+              lowering: { ..made.lowering, defined: push(made.lowering.defined, made.id) },
+              id: made.id,
+            })
+          } else {
+            match try_unfold(told.lowering, context, name, head.id, sort, args, unfolds) {
+              Some(r) -> Done(r),
+              None ->
+                Keep(
+                  pure0 && is_pure(context, name),
+                  note_unfold_refusal(told.lowering, context, name),
+                ),
+            }
+          }
         },
       }
     },
@@ -853,6 +872,143 @@ fn call(
 }
 
 type Opened = | Done(L) | Keep(Bool, Lowering)
+
+type Told = { lowering: Lowering, apart: Bool }
+
+// Each lemma whose trigger the call `name(args)` fits puts its claim at what the trigger bound into
+// the proof, lowered on one unfolding less, as a definition's body is.
+fn instances(
+  lowering: Lowering,
+  context: Context,
+  name: String,
+  args: List<Int>,
+  unfolds: Int,
+) -> Told / {abort.raise} =
+  fold(lowering.lemmas, { lowering: lowering, apart: false }, |acc: Told, lemma: Lemma|
+    if unfolds <= 0 || lemma.func != name || len(lemma.args) != len(args) { acc } else {
+      match fitted_all(
+          acc.lowering,
+          context,
+          lemma.args,
+          args,
+          map(range(0, lemma.binders), |_k: Int| None),
+        ) {
+        None -> acc,
+        Some(binds) -> match all_bound(binds) {
+          None -> acc,
+          Some(terms) ->
+            {
+              lowering: instance(acc.lowering, context, lemma, terms, unfolds - 1),
+              apart: acc.apart || lemma.apart,
+            },
+        },
+      }
+    })
+
+fn all_bound(binds: List<Option<Int>>) -> Option<List<Int>> =
+  fold(binds, Some([]), |acc: Option<List<Int>>, b: Option<Int>|
+    match ((acc, b)) { (Some(xs), Some(t)) -> Some(push(xs, t)), _ -> None })
+
+fn fitted_all(
+  lowering: Lowering,
+  context: Context,
+  patterns: List<Code>,
+  ts: List<Int>,
+  binds: List<Option<Int>>,
+) -> Option<List<Option<Int>>> / {abort.raise} =
+  if len(patterns) != len(ts) { None } else {
+    fold(range(0, len(patterns)), Some(binds), |acc: Option<List<Option<Int>>>, i: Int|
+      match acc {
+        None -> None,
+        Some(bs) -> match ((list_at(patterns, i), list_at(ts, i))) {
+          (Some(p), Some(t)) -> fitted(lowering, context, p, t, bs),
+          _ -> None,
+        },
+      })
+  }
+
+// What the trigger's pattern binds when the term `t` fits it: a binder binds the term, a global or a
+// literal is the term it lowers to, and a call or a list fits one of the same shape.
+fn fitted(
+  lowering: Lowering,
+  context: Context,
+  pattern: Code,
+  t: Int,
+  binds: List<Option<Int>>,
+) -> Option<List<Option<Int>>> / {abort.raise} =
+  match pattern.node {
+    NVar(v) -> match v.slot {
+      Some(k) -> match list_at(binds, k) {
+        Some(Some(u)) -> if u == t { Some(binds) } else { None },
+        Some(None) -> Some(list_set(binds, k, Some(t))),
+        None -> None,
+      },
+      None -> if global(lowering, context, string_of_bytes_lossy(v.name)).id == t { Some(binds) }
+      else { None },
+    },
+    NLit(l) -> if literal(lowering, l).id == t { Some(binds) } else { None },
+    NApp(a) -> match a.func.node {
+      NVar(f) -> if f.slot != None { None } else {
+        let name = string_of_bytes_lossy(f.name);
+        match node(lowering.terms, t) {
+          TApp(called) -> match node(lowering.terms, called.head) {
+            TOpaque(h) -> if h == name { fitted_all(lowering, context, a.args, called.args, binds) }
+            else { None },
+            _ -> None,
+          },
+          TCtor(k) -> if k.name == name { fitted_all(lowering, context, a.args, k.args, binds) }
+          else { None },
+          _ -> None,
+        }
+      },
+      _ -> None,
+    },
+    NList(l) -> {
+      let s = spine(lowering.terms, t);
+      match node(lowering.terms, s.end) {
+        TNil -> fitted_all(lowering, context, l.items, s.heads, binds),
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+
+// The law at `terms`, lowered where nothing has been assumed and no lemma fits, so a law's instance
+// never asks for another. A proved law holds and is defined at every point, so what lowering it owes
+// is not owed, and the calls it makes are values.
+fn instance(
+  lowering: Lowering,
+  context: Context,
+  lemma: Lemma,
+  terms: List<Int>,
+  unfolds: Int,
+) -> Lowering / {abort.raise} = {
+  let r = lower(
+    {
+      ..lowering,
+      window: map(terms, |t: Int| Some(t)),
+      path: [],
+      depth: lowering.depth + 1,
+      lemmas: [],
+    },
+    context,
+    lemma.body,
+    unfolds,
+  );
+  {
+    ..r.lowering,
+    window: lowering.window,
+    path: lowering.path,
+    depth: lowering.depth,
+    lemmas: lowering.lemmas,
+    requirements: lowering.requirements,
+    blockers: lowering.blockers,
+    calls: lowering.calls,
+    defined: concat(r.lowering.defined, drop(r.lowering.calls, len(lowering.calls))),
+    facts: push(r.lowering.facts, r.id),
+    rules: note(r.lowering.rules, Cited({ law: lemma.law, label: lemma.label })),
+  }
+}
 
 // `len` and `push` over a list whose spine is in view, structurally; where the spine ends in a
 // symbol the call stays, over that symbol.
@@ -974,8 +1130,10 @@ fn try_unfold(
   if lowering.depth >= lowering.unfold_limit || unfolds <= 0
       || size(lowering.terms) >= max_terms() { None } else {
     let unrolling = map_contains(lowering.unrolled, name);
-    // One step of a recursive definition: the hypothesis speaks about the call that remains.
-    if unrolling && lowering.depth >= 1 { None } else {
+    // One step of a recursive definition: the hypothesis speaks about the call that remains. A call
+    // on values in view needs no hypothesis, and unrolls as far as the depth allows.
+    if unrolling && lowering.depth >= 1
+        && !fold(args, true, |all: Bool, a: Int| all && in_view(lowering.terms, a)) { None } else {
       match match unfoldable(context, name) {
           Some(d) -> Some(d),
           None -> if unrolling { self_recursive(context, name) } else { None },
@@ -1009,6 +1167,23 @@ fn try_unfold(
           } else { Some({ lowering: back, id: r.id }) }
         },
       }
+    }
+  }
+
+// A value the lowering sees all of that a recursion could take apart: a literal, a constructor of
+// them, or a list's whole spine, whatever its elements.
+fn in_view(terms: Terms, t: Int) -> Bool / {abort.raise} = seen_whole(terms, t, size(terms))
+
+// A term's arguments are made before it, so no chain of them is longer than the store.
+fn seen_whole(terms: Terms, t: Int, room: Int) -> Bool / {abort.raise} =
+  if room <= 0 { false } else {
+    match node(terms, t) {
+      TInt(_) -> true,
+      TBool(_) -> true,
+      TNil -> true,
+      TCons(c) -> seen_whole(terms, c.tail, room - 1),
+      TCtor(c) -> fold(c.args, true, |all: Bool, a: Int| all && seen_whole(terms, a, room - 1)),
+      _ -> false,
     }
   }
 
@@ -1101,6 +1276,109 @@ fn match_expr(
 ) -> L / {abort.raise} = {
   let s = lower(lowering, context, scrutinee, unfolds);
   let s_sort = sort_of(s.lowering.terms, s.id);
+  match taken_in_view(s.lowering, context, s.id, arms) {
+    Some(arm) -> {
+      let entered = match arm.pat {
+        PxCtor(c) -> match node(s.lowering.terms, s.id) {
+          TCtor(k) ->
+            fold(range(0, len(c.args)), s.lowering, |acc: Lowering, i: Int|
+              match ((list_at(c.args, i), list_at(k.args, i))) {
+                (Some(PxVar(v)), Some(field)) -> match v.slot {
+                  Some(slot) -> bind(acc, slot, field),
+                  None -> acc,
+                },
+                _ -> acc,
+              }),
+          _ -> s.lowering,
+        },
+        _ -> match arm_shape(s.lowering, context, arm.pat, s.id, s_sort) {
+          Some(shaped) -> shaped.lowering,
+          None -> s.lowering,
+        },
+      };
+      lower(entered, context, arm.body, unfolds)
+    },
+    None -> arms_of(s, s_sort, context, arms, unfolds),
+  }
+}
+
+// The arm a scrutinee in view takes, decided as the solver decides it: the first whose pattern the
+// value fits, after arms it plainly does not; none where an arm before it has a guard, or a pattern
+// the value's shape does not settle.
+fn taken_in_view(
+  lowering: Lowering,
+  context: Context,
+  scrutinee: Int,
+  arms: List<CodeArm>,
+) -> Option<CodeArm> / {abort.raise} = {
+  let found = fold(
+    arms,
+    { arm: None, open: false },
+    |acc: { arm: Option<CodeArm>, open: Bool }, a: CodeArm|
+      if acc.open || acc.arm != None { acc } else {
+        match a.guard {
+          Some(_) -> { arm: None, open: true },
+          None -> match fits(lowering, context, a.pat, scrutinee) {
+            Some(true) -> { arm: Some(a), open: false },
+            Some(false) -> acc,
+            None -> { arm: None, open: true },
+          },
+        }
+      },
+  );
+  found.arm
+}
+
+// Whether a value in view fits a pattern of one level: `None` when its shape does not say.
+fn fits(
+  lowering: Lowering,
+  context: Context,
+  p: CodePattern,
+  t: Int,
+) -> Option<Bool> / {abort.raise} =
+  match p {
+    PxWild -> Some(true),
+    PxVar(_) -> Some(true),
+    PxLit(l) -> if !is_literal(lowering.terms, t) { None }
+    else { Some(literal(lowering, l).id == t) },
+    PxCtor(c) -> match node(lowering.terms, t) {
+      TCtor(k) -> if k.name != string_of_bytes_lossy(c.name) { Some(false) }
+      else if len(k.args) == len(c.args)
+          && fold(c.args, true, |ok: Bool, a: CodePattern| ok && is_simple(a)) { Some(true) }
+      else { None },
+      _ -> None,
+    },
+    PxList(l) -> if !fold(l.items, true, |ok: Bool, a: CodePattern| ok && is_simple(a))
+        || !(match l.rest { Some(r) -> is_simple(r), None -> true }) { None } else {
+      let s = spine(lowering.terms, t);
+      let ended = match node(lowering.terms, s.end) { TNil -> true, _ -> false };
+      if len(s.heads) < len(l.items) { if ended { Some(false) } else { None } }
+      else if l.rest != None { Some(true) }
+      else if len(s.heads) > len(l.items) { Some(false) }
+      else if ended { Some(true) }
+      else { None }
+    },
+    PxRecord(_) -> None,
+  }
+
+fn is_literal(terms: Terms, t: Int) -> Bool / {abort.raise} =
+  match node(terms, t) {
+    TInt(_) -> true,
+    TBool(_) -> true,
+    TStr(_) -> true,
+    TDecimal(_) -> true,
+    TFixed(_, _, _) -> true,
+    TUnit -> true,
+    _ -> false,
+  }
+
+fn arms_of(
+  s: L,
+  s_sort: Option<Ty>,
+  context: Context,
+  arms: List<CodeArm>,
+  unfolds: Int,
+) -> L / {abort.raise} = {
   let walked = fold(
     arms,
     { lowering: s.lowering, arms: [], sort: None },

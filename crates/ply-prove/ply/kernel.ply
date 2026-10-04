@@ -1,0 +1,588 @@
+// `kernel` — what makes an induction a proof, checked from the claim alone. The record a certificate
+// keeps of an induction names one of the claim's own binders, takes it apart below each case it
+// proves, and unrolls only definitions the checker saw end; the cases it splits the claim into are
+// lowered and refuted here, whatever search proposed it.
+//
+// An unrolled definition is total, so its calls are values and its body may be unrolled with
+// `f(x̄) == body(x̄)` in hand. The claim is proved at the base case, and at the step from its own
+// instance below, whose recursive calls are left as they are so the unrolled conclusion meets them by
+// congruence.
+
+import compiler.code (Code)
+import context (Context, self_recursive, ends)
+import goal (Goal, Binder, Limits, Proof, Assertion, Ran, run, conjunction, domain_inhabited,
+             uninterpreted_sorts, int_ranges, ranges_of, set_of, with_true)
+import lower (Lowering, L, Blocker, Induction, lowering, bind_symbolic, lower_root, assume,
+              drop_assumptions, smaller_than, requirements_since, requirements_between)
+import rules (RuleLog, Rule, Scheme, Descent, Spine, no_rules, rules_of, induction_rule)
+import solve (Closed)
+import sort (bool_ty, is_con, list_elem)
+import term (Terms, TApp, Le, Gt, node, int_lit, sub, nil, cons, sym, not, and, or, cmp, eq)
+import std.list (concat, contains, drop, take)
+
+// The binder at `slot`, named `binder`, taken apart by `scheme`, with `defs` unrolled.
+pub type Inducting = { binder: String, slot: Int, scheme: Scheme, defs: List<String> }
+
+pub type Inducted = { proof: Option<Proof>, used: Int, blockers: List<Blocker> }
+
+pub fn declined(blockers: List<Blocker>, why: String) -> List<Blocker> =
+  push(blockers, Induction(why))
+
+// Why a record proves nothing whatever its cases come to, or `None` when its cases decide it.
+pub fn refusal(context: Context, g: Goal, r: Inducting) -> Option<String> = {
+  let result_slot = match g.result { Some(_) -> len(g.binders) - 1, None -> 0 - 1 };
+  match list_at(g.binders, r.slot) {
+    None -> Some("the claim has no binder at " ++ int_to_string(r.slot)),
+    Some(b) -> if b.name != r.binder {
+      Some("the claim's binder at " ++ int_to_string(r.slot) ++ " is `" ++ b.name ++ "`")
+    } else if r.slot == result_slot { Some("`result` is the answer, not a binder") } else {
+      let shape = match r.scheme {
+        Descent(k) -> if !is_con(b.ty, "Int") { Some("`" ++ b.name ++ "` is not an `Int`") }
+        else if k < 1 { Some("the hypothesis is not below the case it proves") }
+        else { None },
+        Spine(k) -> if list_elem(b.ty) == None { Some("`" ++ b.name ++ "` is not a list") }
+        else if k < 1 { Some("the hypothesis is not below the case it proves") }
+        else if k > 1 { Some("a spine is taken apart one head at a time") }
+        else { None },
+      };
+      match shape { Some(why) -> Some(why), None -> unrolled(context, r.defs) }
+    },
+  }
+}
+
+fn unrolled(context: Context, defs: List<String>) -> Option<String> =
+  if len(defs) == 0 { Some("it unrolls no definition") } else {
+    fold(defs, None, |why: Option<String>, name: String|
+      match why {
+        Some(_) -> why,
+        None -> match self_recursive(context, name) {
+          None -> Some("`" ++ name ++ "` is not a pure definition calling only itself"),
+          Some(_) -> if ends(context, name) { None } else {
+            Some("the checker does not see every call `" ++ name ++ "` makes of itself descend")
+          },
+        },
+      })
+  }
+
+// The record checked, then its cases refuted on `budget`.
+pub fn checked(
+  context: Context,
+  g: Goal,
+  r: Inducting,
+  limits: Limits,
+  budget: Int,
+  blockers: List<Blocker>,
+) -> Inducted / {abort.raise} =
+  match refusal(context, g, r) {
+    Some(why) ->
+      { proof: None, used: 0, blockers: declined(blockers, "on `" ++ r.binder ++ "`: " ++ why) },
+    None -> {
+      let cases = match r.scheme {
+        Descent(k) -> induct_on(context, g, limits, budget, r.defs, r.slot, k, blockers),
+        Spine(_) -> induct_list(context, g, limits, budget, r.defs, r.slot, blockers),
+      };
+      match cases.proof {
+        Some(p) ->
+          {
+            ..cases,
+            proof: Some({
+              ..p,
+              rules: fold(r.defs, p.rules, |acc: List<Rule>, def: String|
+                push(acc, induction_rule(r.binder, r.scheme, def))),
+            }),
+          },
+        None -> cases,
+      }
+    },
+  }
+
+// A refutation on the shared budget; `closed` when the assertions contradict each other.
+type Settled = { terms: Terms, rules: RuleLog, budget: Int, spent: Int, closed: Bool }
+
+fn settle(
+  terms: Terms,
+  context: Context,
+  rules: RuleLog,
+  limits: Limits,
+  budget: Int,
+  spent: Int,
+  assertions: List<Assertion>,
+) -> Settled / {abort.raise} = {
+  let r = run(terms, context, rules, budget, limits, assertions);
+  {
+    terms: r.terms,
+    rules: r.rules,
+    budget: r.left,
+    spent: spent + (budget - r.left),
+    closed: r.answer == Closed,
+  }
+}
+
+fn ran_out(budget: Int) -> String = if budget == 0 { ", the budget spent" } else { "" }
+
+fn bound_all(
+  lowering: Lowering,
+  context: Context,
+  binders: List<Binder>,
+) -> { lowering: Lowering, ids: List<Int> } / {abort.raise} =
+  fold(
+    binders,
+    { lowering: lowering, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, binder: Binder| {
+      let r = bind_symbolic(acc.lowering, binder.ty, context);
+      { lowering: r.lowering, ids: push(acc.ids, r.id) }
+    },
+  )
+
+// `And(body, needs)` when anything is owed.
+fn owing(terms: Terms, body: Int, needs: List<Int>) -> { terms: Terms, id: Int } / {abort.raise} = {
+  let c = conjunction(terms, needs);
+  match c.id {
+    Some(n) -> {
+      let m = and(c.terms, body, n);
+      { terms: m.terms, id: m.id }
+    },
+    None -> { terms: c.terms, id: body },
+  }
+}
+
+// `Or(!guard, held)` when there is a guard.
+fn guarded(
+  terms: Terms,
+  guards: List<Int>,
+  held: Int,
+) -> { terms: Terms, id: Int } / {abort.raise} = {
+  let c = conjunction(terms, guards);
+  match c.id {
+    Some(gd) -> {
+      let unguarded = not(c.terms, gd);
+      let m = or(unguarded.terms, unguarded.id, held);
+      { terms: m.terms, id: m.id }
+    },
+    None -> { terms: c.terms, id: held },
+  }
+}
+
+fn guard_satisfiable(
+  terms: Terms,
+  context: Context,
+  limits: Limits,
+  budget: Int,
+  spent: Int,
+  binders: List<Binder>,
+  guards: List<Int>,
+) -> { ok: Bool, spent: Int } / {abort.raise} =
+  if !domain_inhabited(context, binders) { { ok: false, spent: spent } } else {
+    let c = conjunction(terms, guards);
+    match c.id {
+      None -> { ok: true, spent: spent },
+      Some(all) -> {
+        let s = settle(c.terms, context, no_rules(), limits, budget, spent, [
+          { term: all, polarity: false },
+        ]);
+        { ok: s.closed, spent: s.spent }
+      },
+    }
+  }
+
+// The claim at `n <= 0`, then at `n > 0` from its instance at `n - step`.
+fn induct_on(
+  context: Context,
+  g: Goal,
+  limits: Limits,
+  budget: Int,
+  recursive: List<String>,
+  slot: Int,
+  step: Int,
+  blockers: List<Blocker>,
+) -> Inducted / {abort.raise} = {
+  let binder = match list_at(g.binders, slot) { Some(b) -> b.name, None -> "" };
+  let no = |why: String, used: Int|
+    { proof: None, used: used, blockers: declined(blockers, "on `" ++ binder ++ "`: " ++ why) };
+  let recursive_set = fold(recursive, map_new(), |m: Map<String, Bool>, n: String|
+    map_insert(m, n, true));
+  let start = {
+    ..lowering(no_rules(), limits.unfold_depth),
+    total: fold(g.total, recursive_set, |m: Map<String, Bool>, n: String| map_insert(m, n, true)),
+    unrolled: recursive_set,
+    lemmas: g.lemmas,
+  };
+  let bound = bound_all(start, context, g.binders);
+  let guarded_lw = fold(
+    g.guards,
+    { lowering: bound.lowering, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(acc.lowering, context, guard, bound.ids);
+      { lowering: assume(r.lowering, r.id), ids: push(acc.ids, r.id) }
+    },
+  );
+  let guard_mark = len(guarded_lw.lowering.requirements);
+  let defined_result = match g.result {
+    Some(result_body) -> if len(bound.ids) == 0 { { lowering: guarded_lw.lowering, def: None } }
+    else {
+      let r = lower_root(
+        guarded_lw.lowering,
+        context,
+        result_body,
+        take(bound.ids, len(bound.ids) - 1),
+      );
+      {
+        lowering: r.lowering,
+        def: Some({
+          symbol: match list_at(bound.ids, len(bound.ids) - 1) { Some(t) -> t, None -> 0 },
+          value: r.id,
+        }),
+      }
+    },
+    None -> { lowering: guarded_lw.lowering, def: None },
+  };
+  let body = lower_root(defined_result.lowering, context, g.body, bound.ids);
+  let body_mark = len(body.lowering.requirements);
+  let claim_calls = body.lowering.calls;
+  // The hypothesis: the same claim `step` below, its recursive calls left unrolled.
+  let down = { ..drop_assumptions(body.lowering), unrolled: map_new() };
+  let below = int_lit(down.terms, step);
+  match sub(below.terms, match list_at(bound.ids, slot) { Some(t) -> t, None -> 0 }, below.id) {
+    None -> no("no term for the step down", 0),
+    Some(previous) -> {
+      let lw0 = { ..down, terms: previous.terms };
+      let prior0 = list_set(bound.ids, slot, previous.id);
+      let prior_guards = fold(
+        g.guards,
+        { lowering: lw0, ids: [] },
+        |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+          let r = lower_root(acc.lowering, context, guard, prior0);
+          { lowering: r.lowering, ids: push(acc.ids, r.id) }
+        },
+      );
+      let with_result = match g.result {
+        Some(result_body) -> if len(prior0) == 0 {
+          { lowering: prior_guards.lowering, prior: prior0 }
+        } else {
+          let r = lower_root(
+            prior_guards.lowering,
+            context,
+            result_body,
+            take(prior0, len(prior0) - 1),
+          );
+          { lowering: r.lowering, prior: list_set(prior0, len(prior0) - 1, r.id) }
+        },
+        None -> { lowering: prior_guards.lowering, prior: prior0 },
+      };
+      let prior_body = lower_root(with_result.lowering, context, g.body, with_result.prior);
+      let lw1 = prior_body.lowering;
+      let hypothesis_needs = requirements_since(lw1, body_mark);
+      // The hypothesis makes values of the calls it reaches; a call it does not reach, and that no
+      // equation defines, is one this induction cannot speak for.
+      let covered = map_keys(set_of(drop(lw1.calls, len(claim_calls))));
+      let defined = lw1.defined;
+      if fold(claim_calls, false, |f: Bool, c: Int|
+          f || (!contains(covered, c) && !contains(defined, c))) {
+        no("a remaining call is not one the hypothesis reaches", 0)
+      } else if lw1.float { no("a Float", 0) } else {
+        let requirements = lw1.requirements;
+        let equations = lw1.equations;
+        let definition = match defined_result.def {
+          Some(d) -> {
+            let m = eq(lw1.terms, d.symbol, d.value);
+            { terms: m.terms, eq: Some(m.id), symbol: Some(d.symbol) }
+          },
+          None -> { terms: lw1.terms, eq: None, symbol: None },
+        };
+        let in_question = set_of(concat(covered, defined));
+        let ranges = int_ranges(definition.terms, definition.symbol, in_question);
+        let guard_needs = take(requirements, guard_mark);
+        let body_needs = take(drop(requirements, guard_mark), body_mark - guard_mark);
+        let needed = conjunction(ranges.terms, guard_needs);
+        let guard_check = match needed.id {
+          None -> { terms: needed.terms, rules: lw1.rules, budget: budget, spent: 0, closed: true },
+          Some(conjoined) ->
+            settle(
+              needed.terms,
+              context,
+              lw1.rules,
+              limits,
+              budget,
+              0,
+              push(ranges.out, { term: conjoined, polarity: false }),
+            ),
+        };
+        if !guard_check.closed { no("the guard can raise", guard_check.spent) } else {
+          let claim = owing(guard_check.terms, body.id, body_needs);
+          let held = owing(claim.terms, prior_body.id, hypothesis_needs);
+          let hypothesis = guarded(held.terms, prior_guards.ids, held.id);
+          let zero = int_lit(hypothesis.terms, 0);
+          let n = match list_at(bound.ids, slot) { Some(t) -> t, None -> 0 };
+          let base = cmp(zero.terms, Le, n, zero.id);
+          let step = cmp(base.terms, Gt, n, zero.id);
+          let common = concat(
+            concat(
+              concat(concat(ranges.out, with_true(guarded_lw.ids)), with_true(equations)),
+              with_true(lw1.facts),
+            ),
+            match definition.eq { Some(d) -> [{ term: d, polarity: true }], None -> [] },
+          );
+          let base_case = settle(
+            step.terms,
+            context,
+            guard_check.rules,
+            limits,
+            guard_check.budget,
+            guard_check.spent,
+            concat(common, [
+              { term: base.id, polarity: true },
+              { term: claim.id, polarity: false },
+            ]),
+          );
+          if !base_case.closed {
+            no("the base case is open" ++ ran_out(base_case.budget), base_case.spent)
+          } else {
+            let covered_ranges = ranges_of(base_case.terms, covered);
+            let step_case = settle(
+              covered_ranges.terms,
+              context,
+              base_case.rules,
+              limits,
+              base_case.budget,
+              base_case.spent,
+              push(
+                concat(
+                  concat(common, [
+                    { term: step.id, polarity: true },
+                    { term: hypothesis.id, polarity: true },
+                  ]),
+                  covered_ranges.out,
+                ),
+                { term: claim.id, polarity: false },
+              ),
+            );
+            if !step_case.closed {
+              no("the step is open" ++ ran_out(step_case.budget), step_case.spent)
+            } else {
+              let sat = guard_satisfiable(
+                step_case.terms,
+                context,
+                limits,
+                step_case.budget,
+                step_case.spent,
+                g.binders,
+                guarded_lw.ids,
+              );
+              {
+                proof: Some({
+                  rules: rules_of(step_case.rules),
+                  steps: sat.spent,
+                  sorts: uninterpreted_sorts(g.binders),
+                  guard_satisfiable: sat.ok,
+                }),
+                used: sat.spent,
+                blockers: blockers,
+              }
+            }
+          }
+        }
+      }
+    },
+  }
+}
+
+// The claim lowered with the binder at `at`: its guards, what they owe, its body and what it owes.
+type Instance = { guards: List<Int>, guard_needs: List<Int>, body: Int, needs: List<Int> }
+
+fn instance(
+  lowering: Lowering,
+  context: Context,
+  g: Goal,
+  bound: List<Int>,
+  slot: Int,
+  at: Int,
+) -> { lowering: Lowering, inst: Instance } / {abort.raise} = {
+  let placed = list_set(bound, slot, at);
+  let start = drop_assumptions(lowering);
+  let before = len(start.requirements);
+  let guards = fold(
+    g.guards,
+    { lowering: start, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(acc.lowering, context, guard, placed);
+      { lowering: assume(r.lowering, r.id), ids: push(acc.ids, r.id) }
+    },
+  );
+  let guard_mark = len(guards.lowering.requirements);
+  let body = lower_root(guards.lowering, context, g.body, placed);
+  let after = len(body.lowering.requirements);
+  {
+    lowering: body.lowering,
+    inst: {
+      guards: guards.ids,
+      guard_needs: requirements_between(body.lowering, before, guard_mark),
+      body: body.id,
+      needs: requirements_between(body.lowering, guard_mark, after),
+    },
+  }
+}
+
+// The claim at `[]`, then at `[h, ..t]` from its instance at `t`. Each instance is its own
+// lowering, so `len` and the matches in reach reduce over the spine they are given.
+fn induct_list(
+  context: Context,
+  g: Goal,
+  limits: Limits,
+  budget: Int,
+  recursive: List<String>,
+  slot: Int,
+  blockers: List<Blocker>,
+) -> Inducted / {abort.raise} = {
+  let binder = match list_at(g.binders, slot) { Some(b) -> b, None -> { name: "", ty: bool_ty() } };
+  let no = |why: String, used: Int|
+    {
+      proof: None,
+      used: used,
+      blockers: declined(blockers, "on `" ++ binder.name ++ "`: " ++ why),
+    };
+  match g.result {
+    Some(_) -> no("a clause with a `result` is not inducted over a list", 0),
+    None -> {
+      let recursive_set = fold(recursive, map_new(), |m: Map<String, Bool>, n: String|
+        map_insert(m, n, true));
+      let start = {
+        ..lowering(no_rules(), limits.unfold_depth),
+        total: fold(g.total, recursive_set, |m: Map<String, Bool>, n: String|
+          map_insert(m, n, true)),
+        unrolled: recursive_set,
+        lemmas: g.lemmas,
+      };
+      let bound = bound_all(start, context, g.binders);
+      let sort = binder.ty;
+      let elem = list_elem(sort);
+      let empty = nil(bound.lowering.terms, Some(sort));
+      let head = sym(empty.terms, elem);
+      let tail = sym(head.terms, Some(sort));
+      let pair = cons(tail.terms, head.id, tail.id, Some(sort));
+      let lw0 = { ..bound.lowering, terms: pair.terms };
+      let base = instance(lw0, context, g, bound.ids, slot, empty.id);
+      let step = instance(base.lowering, context, g, bound.ids, slot, pair.id);
+      let claim_calls = step.lowering.calls;
+      // A remaining call over a tail the patterns took off the instance is one the hypothesis speaks for.
+      let structural = filter(claim_calls, |c: Int|
+        match node(step.lowering.terms, c) {
+          TApp(a) ->
+            fold(a.args, false, |f: Bool, x: Int|
+              f || smaller_than(step.lowering, x, pair.id)
+                || smaller_than(step.lowering, x, empty.id)),
+          _ -> false,
+        });
+      let hyp = instance(
+        { ..step.lowering, unrolled: map_new() },
+        context,
+        g,
+        bound.ids,
+        slot,
+        tail.id,
+      );
+      let lw1 = hyp.lowering;
+      let covered = map_keys(set_of(drop(lw1.calls, len(claim_calls))));
+      let defined = lw1.defined;
+      if fold(claim_calls, false, |f: Bool, c: Int|
+          f || (!contains(covered, c) && !contains(defined, c) && !contains(structural, c))) {
+        no("a remaining call is not one the hypothesis reaches", 0)
+      } else if lw1.float { no("a Float", 0) } else {
+        let equations = lw1.equations;
+        let in_question = set_of(concat(concat(covered, defined), structural));
+        let ranges = int_ranges(lw1.terms, None, in_question);
+        let guards_checked = fold(
+          [base.inst, step.inst],
+          {
+            st: { terms: ranges.terms, rules: lw1.rules, budget: budget, spent: 0, closed: true },
+            failed: false,
+          },
+          |acc: { st: Settled, failed: Bool }, case: Instance|
+            if acc.failed { acc } else {
+              let c = conjunction(acc.st.terms, case.guard_needs);
+              match c.id {
+                None -> { st: { ..acc.st, terms: c.terms }, failed: false },
+                Some(conjoined) -> {
+                  let s = settle(
+                    c.terms,
+                    context,
+                    acc.st.rules,
+                    limits,
+                    acc.st.budget,
+                    acc.st.spent,
+                    push(ranges.out, { term: conjoined, polarity: false }),
+                  );
+                  { st: s, failed: !s.closed }
+                },
+              }
+            },
+        );
+        if guards_checked.failed { no("the guard can raise", guards_checked.st.spent) } else {
+          let gs = guards_checked.st;
+          let base_claim = owing(gs.terms, base.inst.body, base.inst.needs);
+          let step_claim = owing(base_claim.terms, step.inst.body, step.inst.needs);
+          let held = owing(step_claim.terms, hyp.inst.body, hyp.inst.needs);
+          let hypothesis = guarded(held.terms, hyp.inst.guards, held.id);
+          let common = concat(concat(ranges.out, with_true(equations)), with_true(lw1.facts));
+          let base_case = settle(
+            hypothesis.terms,
+            context,
+            gs.rules,
+            limits,
+            gs.budget,
+            gs.spent,
+            push(concat(common, with_true(base.inst.guards)), {
+              term: base_claim.id,
+              polarity: false,
+            }),
+          );
+          if !base_case.closed {
+            no("the base case is open" ++ ran_out(base_case.budget), base_case.spent)
+          } else {
+            let covered_ranges = ranges_of(base_case.terms, covered);
+            let step_case = settle(
+              covered_ranges.terms,
+              context,
+              base_case.rules,
+              limits,
+              base_case.budget,
+              base_case.spent,
+              push(
+                concat(
+                  push(concat(common, with_true(step.inst.guards)), {
+                    term: hypothesis.id,
+                    polarity: true,
+                  }),
+                  covered_ranges.out,
+                ),
+                { term: step_claim.id, polarity: false },
+              ),
+            );
+            if !step_case.closed {
+              no("the step is open" ++ ran_out(step_case.budget), step_case.spent)
+            } else {
+              let sat = guard_satisfiable(
+                step_case.terms,
+                context,
+                limits,
+                step_case.budget,
+                step_case.spent,
+                g.binders,
+                step.inst.guards,
+              );
+              {
+                proof: Some({
+                  rules: rules_of(step_case.rules),
+                  steps: sat.spent,
+                  sorts: uninterpreted_sorts(g.binders),
+                  guard_satisfiable: sat.ok,
+                }),
+                used: sat.spent,
+                blockers: blockers,
+              }
+            }
+          }
+        }
+      }
+    },
+  }
+}
