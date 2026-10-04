@@ -10,10 +10,12 @@ import pkg (PackageSources)
 import hash (Contract, Fixed, closure_of, fixed_nodes, fixed_bin, public_contracts)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_interfaces,
               contracted_rows_of, KnownDefRow, EmitterRoot, KeyRow, analyse, analyse_with, dump_of,
-              known_def_row_bin, Cut, cut_bin, cuts_of, Dump, ModuleRow)
+              known_def_row_bin, Cut, cut_bin, cuts_of, body_cuts_of, Dump, ModuleRow, Rows,
+              checked_staged, no_rows, rows_of, staged_pulling_std_with)
 
 import infer (DefInfo)
 import types (Scheme, canonical_scheme)
+import embed (EmbedAt, EmbedRead, EmbedReader, EmbedFile)
 
 // A module another one's analysis read, with the key it had then.
 pub type Reached = { name: Bytes, key: Bytes }
@@ -139,6 +141,78 @@ fn reach(imports: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
   filter(range(0, len(imports)), |i: Int| map_contains(seen, i))
 }
 
+// What a module embeds no module's text says, so a stub stands on it as on a module it imports: an
+// embed is reached under the name of the module that asks for it and its key, keyed by what was read.
+fn embed_name(module: Bytes, key: Bytes) -> Bytes = bytes_concat_all([module, b"\0", key])
+
+fn embed_named(name: Bytes) -> Option<{ module: Bytes, key: Bytes }> / {abort.raise} =
+  match bytes_index_of_from(name, b"\0", 0) {
+    None -> None,
+    Some(i) ->
+      Some({ module: bytes_slice(name, 0, i), key: bytes_slice(name, i + 1, bytes_len(name)) }),
+  }
+
+fn sized(b: Bytes) -> Bytes =
+  bytes_concat_all([bytes_of_string(int_to_string(bytes_len(b))), b":", b])
+
+pub fn read_key(read: EmbedRead) -> Bytes =
+  blake3(
+    bytes_concat_all(match read {
+      Err(why) -> [b"ply.interface.embed.1\0!", why],
+      Ok(files) ->
+        fold(files, [b"ply.interface.embed.1\0="], |acc: List<Bytes>, f: EmbedFile|
+          push(push(acc, sized(f.name)), sized(f.bytes))),
+    }),
+  )
+
+fn embeds_reached(embeds: List<EmbedAt>) -> Map<Bytes, List<Reached>> =
+  fold(embeds, map_new(), |acc: Map<Bytes, List<Reached>>, e: EmbedAt|
+    map_insert(
+      acc,
+      e.module,
+      push(match map_get(acc, e.module) { Some(rs) -> rs, None -> [] }, {
+        name: embed_name(e.module, e.key),
+        key: read_key(e.read),
+      }),
+    ))
+
+// Every module `from` imports, directly or not, each under `keyed`'s key for it, then every embed
+// of those and of `from` itself.
+fn reached_from(
+  analysis: Analysis,
+  keyed: (Bytes) -> Bytes,
+  embedded: Map<Bytes, List<Reached>>,
+  from: Int,
+) -> List<Reached> / {abort.raise} = {
+  let modules = reach(analysis.r.imports, from);
+  fold(
+    concat([from], modules),
+    map(modules, |j: Int|
+      { name: at(analysis.mods, j).name, key: keyed(at(analysis.mods, j).name) }),
+    |acc: List<Reached>, j: Int|
+      match map_get(embedded, at(analysis.mods, j).name) {
+        Some(rs) -> concat(acc, rs),
+        None -> acc,
+      },
+  )
+}
+
+// `keys` with what each embed a module of `modules` reaches reads now, under the name it is
+// reached by.
+pub fn with_embeds(
+  keys: Map<Bytes, Bytes>,
+  modules: List<CompiledModule>,
+  read: EmbedReader,
+) -> Map<Bytes, Bytes> / {abort.raise} =
+  fold(modules, keys, |acc: Map<Bytes, Bytes>, m: CompiledModule|
+    fold(m.reaches, acc, |a: Map<Bytes, Bytes>, r: Reached|
+      if map_contains(a, r.name) { a } else {
+        match embed_named(r.name) {
+          None -> a,
+          Some(e) -> map_insert(a, r.name, read_key(read(e.module, e.key))),
+        }
+      }))
+
 // A module `analysis` read through `through` keeps that package's stub and edges, its body here a blank;
 // one `analysis` never reached is carried over whole, since what a package fixes of a module is its own.
 pub fn compile_package(
@@ -161,11 +235,14 @@ pub fn compile_package(
     map_insert(acc, o.name, o));
   let index = fold(range(0, len(analysis.mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
     map_insert(acc, at(analysis.mods, i).name, i));
+  let embedded = embeds_reached(analysis.embeds);
   let reached = |i: Int|
-    map(reach(analysis.r.imports, i), |j: Int| {
-      let name = at(analysis.mods, j).name;
-      { name: name, key: match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" } }
-    });
+    reached_from(
+      analysis,
+      |name: Bytes| match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" },
+      embedded,
+      i,
+    );
   let implemented = fold(
     analysis.hashes.defs,
     map_new(),
@@ -226,10 +303,138 @@ pub fn compile_package(
   ).package
 }
 
+// What a build keeps of every module of the program it built, so its next build reads a module
+// whose text did not move, and that reaches none whose did, as its stub: where each is cut, what
+// its hashing fixed, and the check key each definition's row was filed under. A stub's text is its
+// source cut again, a row is the build's own and a body is read by nothing a build makes, so none
+// of the three is kept.
+pub type KeptModules = {
+  modules: List<CompiledModule>,
+  fixed: List<Fixed>,
+  checks: List<{ name: Bytes, hash: Bytes }>,
+}
+
+derive bin for KeptModules
+
+// `own`, where it is given, keeps the root package's modules alone, each cut at its bodies with
+// its tests and laws left standing: what a load that answers for its own tests reads back.
+pub fn kept_modules(
+  sources: List<Original>,
+  analysis: Analysis,
+  through: List<CompiledPackage> = [],
+  own: Bool = false,
+) -> KeptModules / {abort.raise} = {
+  let names = map(analysis.mods, |m: ParsedModule| m.name);
+  let kept = |i: Int| !own || list_at(analysis.module_packages, i) == Some(0);
+  let members = fold(range(0, len(names)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
+    if kept(i) { map_insert(acc, at(names, i), true) } else { acc });
+  let read = fold(
+    through,
+    map_new(),
+    |acc: Map<Bytes, CompiledModule>, package: CompiledPackage|
+      fold(package.modules, acc, |a: Map<Bytes, CompiledModule>, m: CompiledModule|
+        map_insert(a, m.name, m)),
+  );
+  let originals = fold(sources, map_new(), |acc: Map<Bytes, Original>, o: Original|
+    map_insert(acc, o.name, o));
+  let keyed = |name: Bytes|
+    match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" };
+  let embedded = embeds_reached(analysis.embeds);
+  {
+    modules: map(filter(range(0, len(names)), kept), |i: Int| {
+      let name = at(names, i);
+      match map_get(read, name) {
+        Some(m) -> { ..m, stub: b"" },
+        None ->
+          {
+            name: name,
+            stub: b"",
+            key: keyed(name),
+            reaches: reached_from(analysis, keyed, embedded, i),
+            cuts: match map_get(analysis.stub_cuts, name) {
+              Some(cuts) -> cuts,
+              None -> if own { body_cuts_of(at(analysis.mods, i)) }
+              else { cuts_of(at(analysis.mods, i)) },
+            },
+          },
+      }
+    }),
+    fixed: map(
+      fixed_nodes(
+        analysis.index,
+        analysis.hashes,
+        members,
+        fold(through, [], |acc: List<Fixed>, package: CompiledPackage| concat(acc, package.fixed)),
+      ),
+      |fixed: Fixed| { ..fixed, body: b"" },
+    ),
+    checks: if !own { analysis.checked.checks } else {
+      filter(analysis.checked.checks, |c: { name: Bytes, hash: Bytes }|
+        map_contains(members, module_of(c.name)))
+    },
+  }
+}
+
+// What a build kept, as the load after it reads the modules that still stand: each one's stub cut
+// from its source again, and of `rows` each fixed definition's under the hash it was fixed with,
+// which is how a load takes a row with a stub. `rows` are whatever the last build to write them
+// kept, which another checkout may have: a row is this module's where it was filed under the key
+// kept here, and a module one of whose definitions has no such row is read from its source. `read`
+// is what a module embeds, as it reads now.
+pub fn standing_modules(
+  kept: KeptModules,
+  sources: List<Original>,
+  rows: List<KnownDefRow>,
+  read: EmbedReader,
+) -> List<CompiledPackage> / {abort.raise} = {
+  let originals = fold(sources, map_new(), |acc: Map<Bytes, Original>, o: Original|
+    map_insert(acc, o.name, o));
+  let valid = valid_part(
+    { modules: kept.modules, defs: [], fixed: kept.fixed },
+    with_embeds(
+      map_fold(originals, map_new(), |acc: Map<Bytes, Bytes>, name: Bytes, o: Original|
+        map_insert(acc, name, module_key(o))),
+      kept.modules,
+      read,
+    ),
+  );
+  let checks = fold(
+    kept.checks,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, c: { name: Bytes, hash: Bytes }| map_insert(acc, c.name, c.hash),
+  );
+  let filed = fold(rows, map_new(), |acc: Map<Bytes, KnownDefRow>, row: KnownDefRow|
+    if map_get(checks, row.name) == Some(row.hash) { map_insert(acc, row.name, row) } else { acc });
+  let rowless = fold(valid.fixed, map_new(), |acc: Map<Bytes, Bool>, fixed: Fixed|
+    if fixed.decl || map_contains(filed, fixed.name) { acc }
+    else { map_insert(acc, module_of(fixed.name), true) });
+  let here = |name: Bytes| !map_contains(rowless, name);
+  let modules = filter(valid.modules, |m: CompiledModule| here(m.name));
+  if len(modules) == 0 { [] } else {
+    let fixed = filter(valid.fixed, |f: Fixed| here(module_of(f.name)));
+    [
+      {
+        modules: map(modules, |m: CompiledModule|
+          match map_get(originals, m.name) {
+            Some(o) -> { ..m, stub: stubbed(o.src, m.cuts) },
+            None -> m,
+          }),
+        defs: fold(fixed, [], |acc: List<KnownDefRow>, f: Fixed|
+          match map_get(filed, f.name) {
+            Some(row) -> if f.decl { acc } else { push(acc, { ..row, hash: f.hash }) },
+            None -> acc,
+          }),
+        fixed: fixed,
+      },
+    ]
+  }
+}
+
 // --- Loading ----------------------------------------------------------------
 
-// The part of `package` that still stands, given each module's current key: a module whose key moved,
-// or that reaches one whose key moved, is read from its source again.
+// The part of `package` that still stands, given each module's current key and what each embed
+// reads now (`with_embeds`): a module whose key moved, or that reaches a module or an embed whose
+// key moved, is read from its source again.
 pub fn valid_part(
   package: CompiledPackage,
   keys: Map<Bytes, Bytes>,
@@ -539,6 +744,142 @@ test "a stub stands while its source, its package's manifest and what it imports
   let under = |m: Bytes| module_key({ name: b"a", src: a.src, manifest: Some(m) });
   assert(under(b"one") != under(b"two"));
   assert(under(b"one") != module_key(original(a)))
+}
+
+fn reading(bytes: Bytes) -> EmbedReader =
+  |module: Bytes, key: Bytes|
+    if module == b"a" && key == b"file:x.txt" { Ok([{ name: b"", bytes: bytes }]) }
+    else { Err(b"nothing is embedded") }
+
+test "a stub stands while what its module, and each module it reaches, embeds reads the same" {
+  let a: Source = { name: b"a", src: b"pub fn text() -> Bytes = embed(\"x.txt\")\n" };
+  let b: Source = {
+    name: b"b",
+    src: b"import a (text)\npub fn size() -> Int = bytes_len(text())\n",
+  };
+  let c: Source = { name: b"c", src: b"pub fn three() -> Int = 3\n" };
+  let originals = [original(a), original(b), original(c)];
+  let full = whole_of(
+    checked_staged(
+      staged_pulling_std_with(
+        [a, b, c],
+        [],
+        { root: b"", manifest: None, supplied: [] },
+        no_interfaces(),
+        [
+          {
+            root: b"",
+            module: b"a",
+            want: { path: b"x.txt", dir: false },
+            read: Ok([{ name: b"", bytes: b"one" }]),
+          },
+        ],
+      ),
+      [],
+      [],
+    ).out,
+  );
+  let p = compile_package(originals, full, [b"a", b"b", b"c"]);
+  let keys = fold(originals, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
+    map_insert(acc, o.name, module_key(o)));
+  let standing = |read: EmbedReader|
+    map(valid_part(p, with_embeds(keys, p.modules, read)).modules, |m: CompiledModule| m.name);
+  assert_eq(standing(reading(b"one")), [b"a", b"b", b"c"]);
+  // The file moved and no module's text did: `a`, which embeds it, and `b`, which reaches `a`.
+  assert_eq(standing(reading(b"two")), [b"c"]);
+  let kept = kept_modules(originals, full);
+  let rows = rows_of(full).defs;
+  assert_eq(standing_names(standing_modules(kept, originals, rows, reading(b"one"))), [
+    b"a",
+    b"b",
+    b"c",
+  ]);
+  assert_eq(standing_names(standing_modules(kept, originals, rows, reading(b"two"))), [b"c"])
+}
+
+// A program to ship, loaded as a builder loads it: with no test or law, through `through`, seeded
+// with `rows`.
+fn shipping(
+  sources: List<Source>,
+  through: List<CompiledPackage>,
+  rows: Rows,
+) -> Analysis / {abort.raise} =
+  whole_of(
+    checked_staged(
+      staged_pulling_std_with(
+        sources,
+        [],
+        { root: b"", manifest: None, supplied: [] },
+        merged_interfaces(through),
+        [],
+        [],
+        false,
+      ),
+      rows.defs,
+      rows.tests,
+    ).out,
+  )
+
+// The answer less what no build reads back: a stub's fixed nodes hold no body.
+fn shipped_answer(analysis: Analysis) -> Dump / {abort.raise} =
+  { ..dump_of(Analysed(analysis)), bodies: [], walked: b"" }
+
+// What a program that embeds nothing is asked to read.
+fn unread(module: Bytes, key: Bytes) -> EmbedRead / {abort.raise} = Err(b"nothing is embedded")
+
+fn standing_names(through: List<CompiledPackage>) -> List<Bytes> =
+  fold(through, [], |acc: List<Bytes>, p: CompiledPackage|
+    concat(acc, map(p.modules, |m: CompiledModule| m.name)))
+
+test "a program read through what its last load kept answers what its source does" {
+  let sources = [dependent(), depends()];
+  let first = shipping(sources, [], no_rows());
+  assert_eq(len(first.checked.tests), 0);
+  let kept = kept_modules(map(sources, original), first);
+  assert_eq(map(kept.modules, |m: CompiledModule| m.stub), [b"", b""]);
+  let rows = rows_of(first);
+  // Nothing moved: both modules are read as stubs, their rows taken whole.
+  let unmoved = standing_modules(kept, map(sources, original), rows.defs, unread);
+  assert_eq(standing_names(unmoved), [b"app", b"base"]);
+  let again = shipping(sources, unmoved, rows);
+  assert_eq(again.stubs, [b"app", b"base"]);
+  let r1 = at(rows_of(again).defs, 12);
+  let r0 = at(rows.defs, 12);
+  assert_eq(shipped_answer(again), shipped_answer(first));
+  assert_eq(rows_of(again), rows);
+  // A body of `app` moved: `base`, which reaches nothing that moved, is still read as its stub.
+  let edited = [
+    {
+      name: b"app",
+      src: b"import base (one, two, Pair, mk, even, say, twice, log)\npub fn four() -> Int = two(one()) + 2\npub fn pair() -> Pair = mk(four())\npub fn parity() -> Bool = even(4)\nfn hi() -> Unit / { log.write } = say(b\"hi\")\npub fn shout() -> Unit / { log.write } = twice(hi)\ntest \"four\" { assert_eq(four(), 5) }\n",
+    },
+    depends(),
+  ];
+  let through = standing_modules(kept, map(edited, original), rows.defs, unread);
+  assert_eq(standing_names(through), [b"base"]);
+  let via = shipping(edited, through, rows);
+  let fresh = shipping(edited, [], no_rows());
+  assert_eq(shipped_answer(via), shipped_answer(fresh));
+  assert_eq(rows_of(via), rows_of(fresh));
+  // What the next load keeps is what a load from source would have kept.
+  assert_eq(
+    kept_modules(map(edited, original), via, through),
+    kept_modules(map(edited, original), fresh),
+  );
+  // `base` moved: `app`, which reaches it, is read from its source with it.
+  let below = [dependent(), { name: b"base", src: bytes_concat(depends().src, b"\n") }];
+  assert_eq(standing_names(standing_modules(kept, map(below, original), rows.defs, unread)), []);
+  // A module a definition of which has no row, or a row filed under another key, is read from its
+  // source.
+  let rowless = filter(rows.defs, |row: KnownDefRow| row.name != b"base.one");
+  assert_eq(standing_names(standing_modules(kept, map(sources, original), rowless, unread)), [
+    b"app",
+  ]);
+  let another = map(rows.defs, |row: KnownDefRow|
+    if row.name == b"app.four" { { ..row, hash: b"another build's" } } else { row });
+  assert_eq(standing_names(standing_modules(kept, map(sources, original), another, unread)), [
+    b"base",
+  ])
 }
 
 fn keyed_by(xs: List<{ name: Bytes, hash: Bytes }>, name: Bytes) -> Bytes =

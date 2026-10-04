@@ -7,22 +7,24 @@ import compiler.load (LoadedAnalysis)
 import std.fs (fs)
 import std.time (time)
 import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface,
-                       analyse_pulling_std_with, dump_of, filing, module_items, module_imports,
-                       no_rows, pins_pulling, rows_of)
+                       analyse_pulling_std_with, dump_of, embeds_now, filing, module_items,
+                       module_imports, no_rows, pins_pulling, rows_of)
 import compiler.pkg (PackageSources, Pinned, Supplied)
-import compiler.interface (CompiledPackage, Original, merged_interfaces)
+import compiler.interface (CompiledPackage, CompiledModule, Original, merged_interfaces)
 import interfaces
 import compiler.hash
 import compiler.hash (HashOutput, Prior, hex)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, TestInfo, LawInfo, Location)
+import compiler.embed (EmbedReader)
 import compiler.termination (Ends, unknown_summary)
 import compiler.resolve (Source, ParsedModule, Diag, Label, error_at, qualify)
 import compiler.types (TyCon, TyFn)
 import diagnostic (Place, spot_of)
 import paths
 import proof.statics (Unshown, unshown)
+import proof.world (measures_in)
 import sources (File, Project, DepPackage, Embed, load_resolved, shelf, nothing_here, is_std,
                 is_compiler, shipped_digest_of)
 import store.tables (Stamps)
@@ -195,16 +197,38 @@ fn analysed(
   rows: Rows,
   through: List<CompiledPackage>,
   priors: List<Prior>,
+  mine: interfaces::Own,
 ) -> Program / {abort.raise} = {
+  let first = analysed_through(project, shelved, rows, through, priors, mine);
+  if !first.starved { first.program }
+  else { analysed_through(project, shelved, rows, through, priors, interfaces::no_own()).program }
+}
+
+// A load read through `mine`, the stubs of the project's own modules. It is `starved` where a
+// module it read from source states a measure: the proof of one reads the bodies of what its
+// module imports, and a stub has none.
+type Loaded = { program: Program, starved: Bool }
+
+fn loaded(program: Program) -> Loaded = { program: program, starved: false }
+
+fn analysed_through(
+  project: Project,
+  shelved: List<Source>,
+  rows: Rows,
+  through: List<CompiledPackage>,
+  priors: List<Prior>,
+  mine: interfaces::Own,
+) -> Loaded / {abort.raise} = {
   let texts = fold(shelved, map_new(), |acc: Map<String, Bytes>, source: Source|
     map_insert(acc, string_of_bytes_lossy(source.name), source.src));
   let pkgs: PackageSources = pkgs_of(project);
+  let read = concat(through, mine.through);
   let pulled: Pulled = front_end(
     project.sources,
     shelved,
     rows,
     pkgs,
-    through,
+    read,
     project.embeds,
     priors,
   );
@@ -213,21 +237,31 @@ fn analysed(
   let places = concat(concat(own.modules, shelved_places), own.manifests);
   let own = fold(project.sources, map_new(), |acc: Map<Bytes, Bool>, source: Source|
     map_insert(acc, source.name, true));
+  let stubbed = fold(mine.through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
+    fold(p.modules, acc, |a: Map<Bytes, Bool>, m: CompiledModule| map_insert(a, m.name, true)));
+  // The check that kept a module's stub showed its measures, and its text and all it reaches stand.
+  let fresh = |m: Bytes| map_contains(own, m) && !map_contains(stubbed, m);
   match pulled.out {
-    Refused(ds) -> broken(project, places, ds),
-    Analysed(w) -> match unshown(w, |m: Bytes| map_contains(own, m)) {
-      [] ->
-        {
-          files: project.files,
-          places: places,
-          diags: w.warnings,
-          cache_warnings: [],
-          whole: Some(w),
-          pkgs: pkgs,
-          through: through,
-          embeds: project.embeds,
+    Refused(ds) -> loaded(broken(project, places, ds)),
+    Analysed(w) -> if len(mine.through) > 0 && len(measures_in(w, fresh)) > 0 {
+      { program: broken(project, places, []), starved: true }
+    } else {
+      match unshown(w, fresh) {
+        [] -> {
+          let warnings = interfaces::warned_with(w.mods, w.warnings, mine);
+          loaded({
+            files: project.files,
+            places: places,
+            diags: warnings,
+            cache_warnings: [],
+            whole: Some({ ..w, warnings: warnings }),
+            pkgs: pkgs,
+            through: read,
+            embeds: project.embeds,
+          })
         },
-      missing -> broken(project, places, map(missing, undescended)),
+        missing -> loaded(broken(project, places, map(missing, undescended))),
+      }
     },
   }
 }
@@ -259,13 +293,14 @@ fn assembled(
   rows: Rows,
   through: List<CompiledPackage> = [],
   priors: List<Prior> = [],
+  own: interfaces::Own = { through: [], names: [], warned: [] },
 ) -> Program / {abort.raise} =
   if len(project.diags) > 0 { broken(project, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
     broken(project, [], [
       nothing_here(match list_at(paths, 0) { Some(r) -> r.display, None -> "." }),
     ])
-  } else { analysed(project, shelved, rows, through, priors) }
+  } else { analysed(project, shelved, rows, through, priors, own) }
 
 // The toolchain's own tree: its shipped modules are its roots, not a dependency.
 fn claims_the_shelf(project: Project, shelved: List<Source>) -> Bool = {
@@ -296,9 +331,68 @@ fn through_of(
   if verify || !interfaced_for(interfaced, project, shelved) { [] } else {
     let place = loads::place_of(paths, stamps);
     let found = originals_of(project, shelved);
-    let own = if place.label == "cwd" { interfaces::read_through[cwd](place, found) }
-    else { interfaces::read_through[abs](place, found) };
-    interfaces::beside(own, interfaces::published(slots_of(project), found))
+    let read = embeds_read(project, shelved);
+    let own = if place.label == "cwd" { interfaces::read_through[cwd](place, found, read) }
+    else { interfaces::read_through[abs](place, found, read) };
+    interfaces::beside(own, interfaces::published(slots_of(project), found, read))
+  }
+
+// What each module embeds, as the walk and the shelf read it.
+fn embeds_read(project: Project, shelved: List<Source>) -> EmbedReader / {abort.raise} =
+  embeds_now(
+    pkgs_of(project),
+    project.sources,
+    shelved,
+    map(project.embeds, |embed: Embed| embed.embedded),
+  )
+
+// Every module a load may read, as it stands now: a root module's text stands over a shipped one
+// its tree claims the name of.
+fn every_original(project: Project, shelved: List<Source>) -> List<Original> / {abort.raise} =
+  concat(
+    originals_of(project, shelved),
+    interfaces::own_originals(pkgs_of(project), project.sources),
+  )
+
+// Only a check of the whole project, which answers for no body, reads its own modules as stubs.
+fn own_stubs(paths: List<paths::Resolved>, project: Project, own: Bool, verify: Bool) -> Bool =
+  own && !verify && usable(project) && whole_project(paths)
+
+fn own_read(
+  paths: List<paths::Resolved>,
+  project: Project,
+  shelved: List<Source>,
+  stamps: Stamps,
+  rows: Rows,
+  own: Bool,
+  verify: Bool,
+) -> interfaces::Own / {fs.read[cwd], fs.read[abs], abort.raise} =
+  if !own_stubs(paths, project, own, verify) { interfaces::no_own() } else {
+    let place = loads::place_of(paths, stamps);
+    let found = every_original(project, shelved);
+    let read = embeds_read(project, shelved);
+    if place.label == "cwd" { interfaces::own_through[cwd](place, found, rows.defs, read) }
+    else { interfaces::own_through[abs](place, found, rows.defs, read) }
+  }
+
+fn own_keeping(
+  paths: List<paths::Resolved>,
+  project: Project,
+  shelved: List<Source>,
+  stamps: Stamps,
+  own: Bool,
+  verify: Bool,
+  program: Program,
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+  match program.whole {
+    None -> (),
+    Some(w) -> if !own_stubs(paths, project, own, verify) { () } else {
+      let place = loads::place_of(paths, stamps);
+      let found = every_original(project, shelved);
+      if place.label == "cwd" {
+        interfaces::own_kept[cwd](place, found, w, program.through, program.diags)
+      } else { interfaces::own_kept[abs](place, found, w, program.through, program.diags) }
+    },
   }
 
 fn slots_of(project: Project) -> List<String> / {abort.raise} =
@@ -314,7 +408,12 @@ fn verified(
   match program.whole {
     None -> program,
     Some(w) -> if !verify { program } else {
-      match interfaces::underived(slots_of(project), originals_of(project, shelved), w) {
+      match interfaces::underived(
+          slots_of(project),
+          originals_of(project, shelved),
+          w,
+          embeds_read(project, shelved),
+        ) {
         [] -> program,
         refused -> { ..program, diags: concat(program.diags, refused), whole: None },
       }
@@ -651,28 +750,33 @@ pub fn timed_load(
   timed_over(paths, load_resolved(paths), started, interfaced, verify)
 }
 
-// [`timed_load`] over a walk already made, with the clock as it read before the walk.
+// [`timed_load`] over a walk already made, with the clock as it read before the walk. `own` reads
+// each of the root package's modules that stands as the last such load kept it through its stub: a
+// load that answers for no body of theirs.
 pub fn timed_over(
   paths: List<paths::Resolved>,
   project: Project,
   started: Int,
   interfaced: Bool = true,
   verify: Bool = false,
+  own: Bool = false,
 ) -> Timed / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let stamps = loads::shelf_stamps();
   let k: Recorded = recorded_for(paths, project, shelved, stamps);
   let rows = if verify { no_rows() } else { rows_recorded(k) };
   let through = through_of(paths, project, shelved, stamps, interfaced, verify);
+  let mine = own_read(paths, project, shelved, stamps, rows, own, verify);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
     shelved,
     verify,
-    assembled(project, shelved, paths, rows, through, if verify { [] } else { k.priors }),
+    assembled(project, shelved, paths, rows, through, if verify { [] } else { k.priors }, mine),
   );
   let front_done = time.elapsed_ms();
   refreshing(paths, project, shelved, stamps, interfaced, through, p);
+  own_keeping(paths, project, shelved, stamps, own, verify, p);
   let kept: Program = filed(paths, shelved, stamps, k, p);
   {
     program: kept,
