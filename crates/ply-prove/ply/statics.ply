@@ -7,30 +7,43 @@ import compiler.front (Analysed, Claim, ClaimClause, ClaimDef, Refused, Analysis
                        claims_in, module_imports)
 import compiler.items (SEnsures, SRequires)
 import compiler.resolve (ParsedModule)
-import context (Context, Claims, claims_of, context, group_of)
+import context (Context, Claims, claims_of, context, ctor, signature, group_of)
 import decide (Certified, Diagnosed, Static, Undecided, GuardRefuted, Unwitnessed, Proved, Unknown,
                decide_and_diagnose, static_of)
 import goal (Goal, Binder, Limits, BudgetSpent, default_limits, default_prove_budget)
+import lemma (Lemma, lemma_of)
 import lower (Blocker, blocker_parts)
 import measure (descent_of)
 import obligation (Ensures, Law)
 import sort (canonical)
 import world (Drawn, Fitting, Measure, Obligation, World, Interleave, Hosted, measures_in,
-              measures_world, world_of)
+              measures_world, unsettled, world_of)
 import world
 import std.list (concat)
 
-pub type Prover = { cx: Context, claims: Claims, limits: Limits }
+// A proved law where it is written, which every claim below it in its module may use.
+pub type Placed = { module: Int, start: Int, lemma: Lemma }
+
+// `proved` holds the laws a claim below them may use, and `decided` what deciding each of those laws
+// came to, by obligation key, which a run that asks about one reads rather than deciding it twice.
+pub type Prover = {
+  cx: Context,
+  claims: Claims,
+  limits: Limits,
+  proved: List<Placed>,
+  decided: Map<String, Diagnosed>,
+}
 
 // Measures are decided first: a definition whose measures a proof shows descend, across its group, is
-// unrolled as one the checker saw end.
+// unrolled as one the checker saw end. Then each law a later claim may use, in the order they are
+// written, each with the ones above it in hand.
 pub fn prover_of(cs: List<Claim>, w: World, budget: Int) -> Prover / {abort.raise} = {
   let claims = claims_of(cs);
   let cx = context(claims, w);
   let limits = { ..default_limits(), steps: budget };
   let shown = fold(w.measures, map_new(), |m: Map<String, Bool>, x: Measure|
     match judged(cx, x, limits) { Ok([]) -> map_insert(m, x.owner, true), _ -> m });
-  {
+  let measured = {
     cx: {
       ..cx,
       measured: fold(map_keys(shown), map_new(), |m: Map<String, Bool>, name: String|
@@ -41,8 +54,72 @@ pub fn prover_of(cs: List<Claim>, w: World, budget: Int) -> Prover / {abort.rais
     },
     claims: claims,
     limits: limits,
-  }
+    proved: [],
+    decided: map_new(),
+  };
+  fold(
+    in_place_order(filter(w.obligations, lemma_candidate)),
+    measured,
+    |p: Prover, o: Obligation|
+      match lemma_at(p, o) {
+        None -> p,
+        Some(l) -> match goal_of(p, o) {
+          None -> p,
+          Some(g) -> {
+            let d = decide_and_diagnose(p.cx, g, p.limits);
+            let decided = { ..p, decided: map_insert(p.decided, o.key, d) };
+            match d.decision {
+              Proved(_) ->
+                {
+                  ..decided,
+                  proved: push(p.proved, { module: o.at.module, start: o.at.start, lemma: l }),
+                },
+              _ -> decided,
+            }
+          },
+        },
+      },
+  )
 }
+
+// A law with no guard that the static prover is asked about first.
+fn lemma_candidate(o: Obligation) -> Bool =
+  match o.kind {
+    Law(_) ->
+      len(o.guards) == 0 && (match unsettled(o.strategy) { Some(_) -> true, None -> false }),
+    _ -> false,
+  }
+
+fn lemma_at(p: Prover, o: Obligation) -> Option<Lemma> =
+  match map_get(p.claims.laws, o.owner) {
+    None -> None,
+    Some(l) -> match l.guard {
+      Some(_) -> None,
+      None ->
+        lemma_of(
+          o.owner,
+          match o.kind { Law(Some(label)) -> label, _ -> o.owner },
+          len(o.binders),
+          l.body,
+          |name: String| signature(p.cx, name) != None && ctor(p.cx, name) == None,
+        ),
+    },
+  }
+
+// By module, then where each is written.
+fn in_place_order(os: List<Obligation>) -> List<Obligation> =
+  fold(os, [], |acc: List<Obligation>, o: Obligation| {
+    let before = filter(acc, |x: Obligation|
+      x.at.module < o.at.module || (x.at.module == o.at.module && x.at.start <= o.at.start));
+    let after = filter(acc, |x: Obligation|
+      !(x.at.module < o.at.module || (x.at.module == o.at.module && x.at.start <= o.at.start)));
+    concat(push(before, o), after)
+  })
+
+// The proved laws written above `o` in its module.
+fn lemmas_for(p: Prover, o: Obligation) -> List<Lemma> =
+  map(filter(p.proved, |x: Placed| x.module == o.at.module && x.start < o.at.start), |x: Placed|
+    x.lemma)
 
 // A measure no proof shows descends, what kept one from it, and whether the checker reads its
 // definition as ending without it.
@@ -83,6 +160,7 @@ fn judged(cx: Context, m: Measure, limits: Limits) -> Result<List<String>, Strin
           guards: [],
           result: None,
           body: Some(body),
+          lemmas: [],
           total: group_of(cx, m.owner),
           partial: true,
         },
@@ -185,6 +263,7 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
               c.clause.code),
             result: match obligation.result { Some(_) -> Some(d.body), None -> None },
             body: clause.clause.code,
+            lemmas: lemmas_for(p, obligation),
             total: [],
             partial: false,
           }),
@@ -198,6 +277,7 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
           guards: match l.guard { Some(g) -> [g.code], None -> [] },
           result: None,
           body: l.body,
+          lemmas: lemmas_for(p, obligation),
           total: [],
           partial: false,
         }),
@@ -211,9 +291,12 @@ pub fn diagnosed(p: Prover, obligation: Obligation) -> Option<Diagnosed> / {abor
   match obligation.strategy {
     Interleave(_) -> None,
     Fitting -> None,
-    _ -> match goal_of(p, obligation) {
-      Some(g) -> Some(decide_and_diagnose(p.cx, g, p.limits)),
-      None -> None,
+    _ -> match map_get(p.decided, obligation.key) {
+      Some(d) -> Some(d),
+      None -> match goal_of(p, obligation) {
+        Some(g) -> Some(decide_and_diagnose(p.cx, g, p.limits)),
+        None -> None,
+      },
     },
   }
 
