@@ -364,6 +364,7 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
         if connections == 1 { "" } else { "s" },
     );
     shutdown.end_children();
+    crate::observe::exiting();
     std::process::exit(which.exit_code());
 }
 

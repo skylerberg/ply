@@ -237,3 +237,24 @@ fn a_trace_naming_a_file_is_never_answered_where_no_file_may_be_read() {
     };
     assert!(moved(&trace, &hermetic, m));
 }
+
+#[test]
+fn a_front_end_s_store_is_neither_read_nor_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("pkg");
+    std::fs::create_dir(&pkg).unwrap();
+    std::fs::write(pkg.join("a.ply"), b"a").unwrap();
+    let roots = rooted(dir.path());
+    let m = MachineId::next();
+    let recorder = observe::begin(m);
+    observe::read(m, Read::Dir, &pkg);
+    observe::read(m, Read::Tree, &pkg);
+    observe::read(m, Read::File, &pkg.join(".ply-cache/index"));
+    let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
+    observe::end(&recorder);
+    assert_eq!(lines(&trace), ["dir\tcwd\tpkg\t", "tree\tcwd\tpkg\t"]);
+    // Another test's store appearing beside the sources moves nothing.
+    std::fs::create_dir(pkg.join(".ply-cache")).unwrap();
+    std::fs::write(pkg.join(".ply-cache/index"), b"filed").unwrap();
+    assert!(stands(&trace, &world(&roots, "b"), MachineId::next()));
+}

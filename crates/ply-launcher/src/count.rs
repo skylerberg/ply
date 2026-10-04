@@ -376,7 +376,9 @@ pub fn write(
         out.push_str("\n  ]");
     }
     out.push_str("\n}\n");
-    std::fs::write(path, out)
+    std::fs::write(path, out)?;
+    ply_host::observe::process_wrote(&std::fs::canonicalize(path)?);
+    Ok(())
 }
 
 /// A JSON string: site names are `ply_*` symbols and separators, so only `"` and `\` can appear.

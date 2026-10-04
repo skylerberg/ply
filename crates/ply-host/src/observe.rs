@@ -6,8 +6,8 @@
 //! A machine is observed when the tester begins it; one run on its behalf (a nested machine a
 //! command drives) is adopted into the same record. What the test writes is its own: a read under a
 //! path it wrote is not an input, and a directory it wrote into is read without what it wrote there.
-//! Nor is a read under a directory a run keeps for the next one an input, since what is there is a
-//! product of its key. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
+//! Nor is a read under a directory a run keeps for the next one an input, a front end's store
+//! included wherever it sits, since what is there is a product of its key. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
 //! process read; a program that is not `ply` reports nothing and is the environment, as the clock
 //! and the network are. A `ply` that ended without finishing its report leaves the record
 //! incomplete, which files no pass.
@@ -99,6 +99,9 @@ static SHIPPED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 static KEPT: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
+/// The directory a front end keeps its store in, beside what it loads.
+const STORE: &str = ".ply-cache";
+
 /// Where this `ply` lays its shipped modules out as files, and the directories it keeps what one
 /// run leaves for the next in.
 pub fn laid_out(shipped_dir: &Path, kept: Vec<PathBuf>) {
@@ -107,8 +110,10 @@ pub fn laid_out(shipped_dir: &Path, kept: Vec<PathBuf>) {
 }
 
 fn is_kept(path: &Path) -> bool {
-    KEPT.get()
-        .is_some_and(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
+    path.components().any(|c| c.as_os_str() == STORE)
+        || KEPT
+            .get()
+            .is_some_and(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
 }
 
 fn recorder_of(machine: MachineId) -> Option<Arc<Recorder>> {
@@ -151,6 +156,22 @@ pub fn begin_process() -> Arc<Recorder> {
     Arc::clone(PROCESS.get_or_init(|| Arc::new(Recorder::default())))
 }
 
+type Reporter = Box<dyn Fn() + Send + Sync>;
+
+static REPORTER: OnceLock<Reporter> = OnceLock::new();
+
+/// How the process's report is written, which a process ending outside its entry calls first.
+pub fn reports_with(reporter: Reporter) {
+    let _ = REPORTER.set(reporter);
+}
+
+/// The process is ending wherever it stands: its report is written now.
+pub fn exiting() {
+    if let Some(report) = REPORTER.get() {
+        report();
+    }
+}
+
 pub fn read(machine: MachineId, how: Read, path: &Path) {
     if let Some(rest) = SHIPPED_DIR
         .get()
@@ -173,6 +194,14 @@ pub fn wrote(machine: MachineId, path: &Path) {
     with(machine, |o| {
         o.writes.insert(path.to_path_buf());
     });
+}
+
+/// What this `ply` wrote outside any handler, when a `ply` that started it is observing it.
+pub fn process_wrote(path: &Path) {
+    if let Some(recorder) = PROCESS.get() {
+        let mut o = recorder.observed.lock().unwrap_or_else(|e| e.into_inner());
+        o.writes.insert(path.to_path_buf());
+    }
 }
 
 pub fn shipped(machine: MachineId, name: &str) {
@@ -378,7 +407,7 @@ fn answered(how: Read, path: &Path, own: &[PathBuf]) -> String {
                 let mut names: Vec<String> = entries
                     .flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|name| !own.iter().any(|o| o == Path::new(name)))
+                    .filter(|name| name != STORE && !own.iter().any(|o| o == Path::new(name)))
                     .collect();
                 names.sort();
                 hasher.update(b"names\0");
@@ -414,7 +443,7 @@ fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[Path
     names.sort();
     for name in names {
         let rel = below.join(&name);
-        if own.iter().any(|o| rel.starts_with(o)) {
+        if name == STORE || own.iter().any(|o| rel.starts_with(o)) {
             continue;
         }
         hasher.update(rel.to_string_lossy().as_bytes());
