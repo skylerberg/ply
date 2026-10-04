@@ -2309,7 +2309,9 @@ The twin is `MemFs`, with a `mem_` function for every operation (`mem_read`,
 `mem_remove`, `mem_remove_tree`, `mem_rename`, `mem_symlink`, `mem_set_mode`,
 `mem_set_modified`, `mem_sync`, `mem_lock`, `mem_unlock`) and `mem_empty` and
 `mem_of` to start one. It follows a symlink where the host does, a chain of more
-than forty being a loop that names nothing. It holds its owner to a path's
+than forty being a loop that names nothing, and it refuses a path that leaves
+its root as the host does, raising with `E0452`'s words, so a test over the twin
+fails where the same code fails on a disk. It holds its owner to a path's
 owner bits, a fresh file being `rw-r--r--` and a fresh directory `rwxr-xr-x`, so
 a test can make a file unreadable. It has no wall clock, so no lock in it goes
 stale and `mem_temp_dir` names a directory from its prefix and the tree's own
