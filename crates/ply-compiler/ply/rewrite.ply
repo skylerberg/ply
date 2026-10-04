@@ -399,6 +399,7 @@ fn witness_params(orders: Map<Bytes, List<Bytes>>, item: Item) -> Item =
                     span: d.name.span,
                   }),
                 ),
+                cost: None,
                 default: None,
                 span: d.name.span,
               }),
@@ -1813,15 +1814,24 @@ fn cost_law(d: FnDef, clause: SpecClause, k: Int) -> LawDef = {
   let var = |t: Bytes| EVar({ span: at, name: { module: None, name: ident(t), span: at } });
   let call = |f: Bytes, args: List<Expr>|
     EApp({ span: at, func: var(f), named: [], args: args, labels: [] });
-  let taken = fold(d.params, [d.name.name], |acc: List<Bytes>, p: Param| push(acc, p.name.name));
+  let taken = fold(d.params, [d.name.name], |acc: List<Bytes>, p: Param|
+    match p.cost {
+      Some(c) -> push(push(acc, p.name.name), c.name),
+      None -> push(acc, p.name.name),
+    });
   let size = fresh_name(taken);
-  let made = map(d.params, |p: Param|
-    SLet({
-      span: at,
-      pat: PVar({ span: at, name: p.name }),
-      ty: None,
-      value: made_of(p.ty, var(size), at),
-    }));
+  let let_of = |name: Ident, value: Expr|
+    SLet({ span: at, pat: PVar({ span: at, name: name }), ty: None, value: value });
+  // A function parameter with a cost name is a closure of one step, so its cost name is 1.
+  let made = fold(d.params, [], |acc: List<Stmt>, p: Param|
+    match ((p.cost, p.ty)) {
+      (Some(c), Some(TFn(f))) ->
+        push(
+          push(acc, let_of(p.name, one_step(f.params, f.ret, at))),
+          let_of(c, ELit({ span: at, lit: LInt(1) })),
+        ),
+      _ -> push(acc, let_of(p.name, made_of(p.ty, var(size), at))),
+    });
   let steps = EField({
     span: at,
     base: call(b"metered", [
@@ -1871,6 +1881,22 @@ fn cost_law(d: FnDef, clause: SpecClause, k: Int) -> LawDef = {
   }
 }
 
+// A closure that answers a value of `ret` at once, whatever it is given.
+fn one_step(params: List<TypeExpr>, ret: TypeExpr, at: Span) -> Expr =
+  ELambda({
+    span: at,
+    body: match ret {
+      TUnit(_) -> ELit({ span: at, lit: LUnit }),
+      _ -> match element_of(ret, ELit({ span: at, lit: LInt(0) }), at) {
+        Some(e) -> e,
+        None -> unmade(at),
+      },
+    },
+    params: map(params, |_t: TypeExpr|
+      { name: { name: b"_", span: at }, ty: None, cost: None, default: None, span: at }),
+    ret: None,
+  })
+
 // The first of `n`, `n1`, `n2` ... no parameter or the definition is named.
 fn fresh_name(taken: List<Bytes>) -> Bytes =
   fold(range(0, len(taken) + 1), b"", |found: Bytes, i: Int|
@@ -1893,7 +1919,7 @@ fn made_of(ty: Option<TypeExpr>, size: Expr, at: Span) -> Expr =
         ELambda({
           span: at,
           body: body,
-          params: [{ name: ident(b"i"), ty: None, default: None, span: at }],
+          params: [{ name: ident(b"i"), ty: None, cost: None, default: None, span: at }],
           ret: None,
         });
       let text = call(b"fold", [
@@ -1908,8 +1934,8 @@ fn made_of(ty: Option<TypeExpr>, size: Expr, at: Span) -> Expr =
             rhs: ELit({ span: at, lit: LStr(b"a") }),
           }),
           params: [
-            { name: ident(b"s"), ty: None, default: None, span: at },
-            { name: ident(b"i"), ty: None, default: None, span: at },
+            { name: ident(b"s"), ty: None, cost: None, default: None, span: at },
+            { name: ident(b"i"), ty: None, cost: None, default: None, span: at },
           ],
           ret: None,
         }),
@@ -1940,8 +1966,8 @@ fn made_of(ty: Option<TypeExpr>, size: Expr, at: Span) -> Expr =
                   span: at,
                   body: call(b"map_insert", [var(b"m"), kv, vv]),
                   params: [
-                    { name: ident(b"m"), ty: None, default: None, span: at },
-                    { name: ident(b"i"), ty: None, default: None, span: at },
+                    { name: ident(b"m"), ty: None, cost: None, default: None, span: at },
+                    { name: ident(b"i"), ty: None, cost: None, default: None, span: at },
                   ],
                   ret: None,
                 }),
@@ -2015,6 +2041,22 @@ test "each `cost` clause is also a cost law, over a size no parameter is named, 
   assert(string_contains(dumped, "@72616e6765"));
   assert(string_contains(dumped, "@6d657465726564"));
   assert(!string_contains(dumped, "E0463"))
+}
+
+test "a function parameter with a cost name is made a closure of one step, and its cost name 1" {
+  let dumped = dump_expanded(
+    b"fn f(xs: List<Int>, g: (Int) -> String cost k) -> Int cost len(xs) * k = 0",
+  );
+  // The closure answers `int_to_string(0)` whatever it is given; `k` is bound to 1.
+  assert(string_contains(dumped, "@696e745f746f5f737472696e67"));
+  // The only `1` in the law is the one `k` is bound to.
+  assert(string_contains(dumped, "%int;@31"));
+  assert(
+    !string_contains(
+      dumped,
+      "@612060636f73746020626f756e64206973206d65617375726564206f6e6c79206f76657220706172616d6574657273206d616465206f6620612073697a65",
+    ),
+  )
 }
 
 test "a `metered` of the module's own, an unqualified import of one, or a size named so is refused" {

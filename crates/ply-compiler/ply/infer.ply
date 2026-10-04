@@ -8032,11 +8032,12 @@ fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {a
 }
 
 // A bound on the steps a call takes says the call ends, which a row writing `diverges` denies; and
-// it is measured by running the call, which a handler of anything but a raise could change.
+// it is measured by running the call, which a handler of anything but a raise could change. A row
+// variable is what a function parameter performs, whose steps its cost name stands for.
 fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort.raise} = {
   let row = resolve_row_in(checker, sig.published_row);
   let diverges = fold(row.atoms, false, |found: Bool, a: Atom| found || is_diverges(a));
-  let performs = row.tail != None || len(run_needs(row.atoms)) > 0;
+  let performs = len(run_needs(row.atoms)) > 0;
   let written = match def.effects { Some(r) -> r.span, None -> def.name.span };
   fold(
     filter(def.spec, |c: SpecClause| c.kind == SCost),
@@ -8644,15 +8645,17 @@ fn check_laws(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise}
   walked.checker
 }
 
-// A law a `cost` clause made repeats the clause, which was checked first: what it finds wrong is
-// already said there, or is that it cannot be made of the definition's parameters.
+// A law a `cost` clause made repeats the clause, which was checked first with the definition's
+// header: what it finds wrong is already said there, or is that it cannot be made of the parameters.
 fn made_of_clause(before: Checker, after: Checker, def: LawDef) -> Checker =
   if def.costs == None || len(after.diags) == len(before.diags) { after } else {
+    // From the definition's name to the clause: its parameters and their cost names among it.
+    let from = match def.costs { Some(c) -> c.def.span.start, None -> def.span.start };
     let said = fold(before.diags, false, |found: Bool, d: Diag|
       found
         || fold(d.labels, false, |inside: Bool, l: Label|
           inside
-            || (l.primary && l.module == before.module && l.start >= def.span.start
+            || (l.primary && l.module == before.module && l.start >= from
             && l.end <= def.span.end)));
     if said { { ..after, diags: before.diags } } else {
       report_error_at(
@@ -9132,7 +9135,7 @@ fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
         match spec_env_of(c, name) {
           None -> c,
           Some(env) -> {
-            let shadowed: Checker = check_result_shadow(c, def);
+            let shadowed: Checker = check_cost_names(check_result_shadow(c, def), def);
             let walked = fold(
               range(0, len(def.spec)),
               { checker: shadowed, specs: [] },
@@ -9223,7 +9226,13 @@ fn check_clause(
   let with_result: Checker = match clause.kind {
     SEnsures -> { ..bound, env: env_bind(bound.env, result_name(), monomorphic(env.ret)) },
     SRequires -> bound,
-    SCost -> bound,
+    // A cost name is the steps one call of its parameter takes.
+    SCost ->
+      fold(def.params, bound, |c: Checker, param: Param|
+        match param.cost {
+          Some(k) -> { ..c, env: env_bind(c.env, k.name, monomorphic(int_type())) },
+          None -> c,
+        }),
   };
   let outer = with_result.spec_kind;
   let o: Inferred = infer({ ..with_result, spec_kind: Some(clause.kind) }, clause.expr);
@@ -9258,6 +9267,37 @@ fn check_clause(
     atoms: run_needs(row.atoms),
   }
 }
+
+// A cost name is introduced beside the parameters, so one named like a parameter or another is reported.
+fn check_cost_names(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
+  fold(range(0, len(def.params)), checker, |c: Checker, i: Int|
+    match at(def.params, i).cost {
+      None -> c,
+      Some(k) -> match fold(range(0, len(def.params)), None, |found: Option<Span>, j: Int|
+          match found {
+            Some(_) -> found,
+            None -> {
+              let other = at(def.params, j);
+              if other.name.name == k.name { Some(other.name.span) }
+              else if j < i && (match other.cost { Some(o) -> o.name == k.name, None -> false }) {
+                match other.cost { Some(o) -> Some(o.span), None -> None }
+              } else { None }
+            },
+          }) {
+        None -> c,
+        Some(first) ->
+          err_labels(
+            c,
+            b"E0105",
+            bytes_concat_all([b"`", k.name, b"` is bound twice on `", def.name.name, b"`"]),
+            [
+              label_at(c.module, k.span, true, b"this names a parameter's cost"),
+              label_at(c.module, first, false, b"and this is named alike"),
+            ],
+            [b"a `cost` clause reads parameters and cost names alike, so each needs its own name"],
+          ),
+      },
+    })
 
 // `result` is introduced beside the parameters, so a definition that has both is reported.
 fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
@@ -12254,7 +12294,18 @@ test "a `cost` clause bounds a definition that ends and only raises, by an `Int`
     ),
     [b"E0463"],
   );
-  assert_eq(check_codes(b"fn f<| e>(g: () -> Int / e) -> Int / e cost 1 = g()"), [b"E0463"])
+  assert_eq(check_codes(b"fn f<| e>(g: () -> Int / e cost k) -> Int / e cost k = g()"), []);
+  assert_eq(
+    check_codes(b"fn f(g: (Int) -> Int cost k, xs: List<Int>) -> Int cost len(xs) * k = 0"),
+    [],
+  );
+  // A cost name is read by `cost` clauses alone, and only a function parameter has one.
+  assert_eq(check_codes(b"fn f(g: (Int) -> Int cost k) -> Int requires k > 0 = 0"), [b"E0101"]);
+  assert_eq(check_codes(b"fn f(g: (Int) -> Int cost k) -> Int = k"), [b"E0101"]);
+  assert_eq(check_codes(b"fn f(g: (Int) -> Int cost g) -> Int cost g = 0"), [b"E0105"]);
+  assert_eq(check_codes(b"fn f(g: () -> Int cost k, h: () -> Int cost k) -> Int cost k = 0"), [
+    b"E0105",
+  ])
 }
 
 test "a law binder naming a type nothing declares is refused, and a lowercase one is a variable" {
