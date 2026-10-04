@@ -1848,18 +1848,20 @@ implicitly (`normalize_path` is explicit).
 
 `Json` has the constructors `Null`, `Bool(Bool)`, `Number(Decimal)`,
 `Str(String)`, `Array(List<Json>)` and `Object(Map<String, Json>)`. Numbers are
-`Decimal`; objects are maps, so key order is canonical. A codec is
-`JsonCodec<a> = {encode: (a) -> Json, decode: (Json) -> Result<a, DecodeError>}`.
-Codecs: `int_json`, `string_json`, `bool_json`, `decimal_json`, `float_json`,
-`bytes_json`, `unit_json`, `json_json`, `char_json` (a string of one
-character), `instant_json` and `duration_json` (nanoseconds), and combinators
-`list_json`, `array_json` (a JSON array, as a list is), `option_json`,
-`result_json`, `map_json`, `string_map_json`. Entry points:
-`decode_bytes`, `decode_string`, `encode_bytes`, `encode_string`, `parse`,
-`parse_string`, `to_bytes`, `to_string`. `error_to_string` gives
-`$.lines[2].unit_price: expected a number, found a string`. `max_depth()` is
-the nesting `parse` reads and `to_bytes` writes, 128; `too_deep()` is the codec
-a derived one becomes past it (§11).
+`Decimal`; objects are maps, so key order is canonical. A codec is `JsonCodec<a>
+= {encode: (a) -> Json, decode: (Json) -> Result<a, DecodeError>}`. Codecs:
+`int_json`, `string_json`, `bool_json`, `decimal_json`, `float_json`,
+`bytes_json`, `unit_json`, `json_json`, `char_json` (a string of one character),
+`instant_json` and `duration_json` (nanoseconds), and combinators `list_json`,
+`array_json` (a JSON array, as a list is), `option_json`, `result_json`,
+`map_json`, `string_map_json`. Entry points: `decode_bytes`, `decode_string`,
+`encode_bytes`, `encode_string`, `parse`, `parse_string`, `to_bytes`,
+`to_string`. Builders: `object(members)`, `array(items)`, `int(n)`,
+`strings(xs)` (an array of strings) and `string_or_null(s)` (`Null` where the
+`Option` is `None`). `error_to_string` gives `$.lines[2].unit_price: expected a
+number, found a string`. `max_depth()` is the nesting `parse` reads and
+`to_bytes` writes, 128; `too_deep()` is the codec a derived one becomes past it
+(§11).
 
 ### 13.5 `std.db` — PostgreSQL
 
@@ -2397,19 +2399,22 @@ pub fn repeat(b: Bytes, n: Int) -> Bytes
 pub fn hex_of(b: Bytes) -> String
 pub fn bytes_of_hex(text: String) -> Bytes
 pub fn int_of_ascii(b: Bytes) -> Option<Int>
+pub fn is_digit(b: Int) -> Bool
+pub fn hex_digit(v: Int) -> Bytes / {abort.raise}
 ```
 
 Integers in a byte string, little-endian and big-endian: how a binary format and
 a network protocol are written and read back. The writers take the low two, four
 or eight bytes of `n`; the `i` writers are the `u` ones' bytes, since two's
 complement is the representation, and exist so a call site says which it meant.
-Nothing here raises: a read past either end is `None`, and so is a `u64` past
-what an `Int` holds, so an answer is never a negative length. The `i` readers
-carry the sign, and `i64_be_at` answers for every `Int`. `int_of_ascii` reads a
-decimal integer written in ASCII — an optional `-`, then digits, and nothing else
-— and is `None` for anything else and for a number past what an `Int` holds; it
-is the one integer parser the shipped modules share, and `std.string`'s
-`int_of_string` is it over a `String`.
+Nothing here raises but `hex_digit`, the lowercase digit for a `v` below 16: a
+read past either end is `None`, and so is a `u64` past what an `Int` holds, so
+an answer is never a negative length. The `i` readers carry the sign, and
+`i64_be_at` answers for every `Int`. `int_of_ascii` reads a decimal integer
+written in ASCII — an optional `-`, then digits, and nothing else — and is
+`None` for anything else and for a number past what an `Int` holds; it is the
+one integer parser the shipped modules share, and `std.string`'s `int_of_string`
+is it over a `String`. `is_digit` is whether a byte is an ASCII decimal digit.
 
 ### 13.15 `std.pkg`
 
