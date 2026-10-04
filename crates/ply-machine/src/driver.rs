@@ -107,7 +107,7 @@ pub fn load_over_analysis_taken(
     for file in handed.files {
         let path = PathBuf::from(&file.path);
         let source = sources.add(&path, file.text);
-        if crate::shipped_modules::source(&ModuleName::from_dotted(&file.name)).is_some() {
+        if crate::shipped_modules::ships(&ModuleName::from_dotted(&file.name)) {
             shipped.push(source);
         }
         files.push(Found { path });
