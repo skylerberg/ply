@@ -190,7 +190,8 @@ pub type Emitter = {
 pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool, arity: Int }
 
 // An imported name lowers like a builtin; only the import list tells them apart. `defs` is empty when the module is out of reach.
-pub type Imported = { name: Bytes, module: Bytes, defs: List<Def> }
+// `whole` binds the module itself, which only a qualified name reaches: a bare `map` is never `std.map`.
+pub type Imported = { name: Bytes, module: Bytes, defs: List<Def>, whole: Bool }
 
 pub type ModuleDefs = { module: Bytes, defs: List<Def>, aliases: List<Alias> }
 
@@ -1846,7 +1847,7 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> / {abort.raise} = {
   let part = qualified(name);
   let written = match part { Some(q) -> q.name, None -> name };
   let want = match part {
-    Some(q) -> match from_import(emitter.imports, q.binder) {
+    Some(q) -> match module_import(emitter.imports, q.binder) {
       Some(imp) -> bytes_concat_all([imp.module, b".", q.name]),
       None -> bytes_concat_all([b"std.", q.binder, b".", q.name]),
     },
@@ -1860,7 +1861,7 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> / {abort.raise} = {
       fold(emitter.imports, None, |acc: Option<Int>, imp: Imported|
         match acc {
           Some(_) -> acc,
-          None -> if imp.name == written {
+          None -> if !imp.whole && imp.name == written {
             ctor_index(emitter.ctors, bytes_concat_all([imp.module, b".", written]), b"")
           } else { None },
         }),
@@ -1902,7 +1903,12 @@ fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> / {abort.rai
     })
 
 fn from_import(xs: List<Imported>, name: Bytes) -> Option<Imported> =
-  fold(xs, None, |acc: Option<Imported>, i: Imported| if i.name == name { Some(i) } else { acc })
+  fold(xs, None, |acc: Option<Imported>, i: Imported|
+    if !i.whole && i.name == name { Some(i) } else { acc })
+
+fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
+  fold(xs, None, |acc: Option<Imported>, i: Imported|
+    if i.whole && i.name == binder { Some(i) } else { acc })
 
 fn opened_to(
   emitter: Emitter,
@@ -1933,7 +1939,7 @@ fn constant_of(
   } else {
     let callee = match qualified(name) { Some(q) -> q.name, None -> name };
     match match qualified(name) {
-        Some(q) -> from_import(emitter.imports, q.binder),
+        Some(q) -> module_import(emitter.imports, q.binder),
         None -> from_import(emitter.imports, name),
       } {
       None -> None,
@@ -1968,7 +1974,7 @@ fn def_of(
 ) -> Option<{ full: Bytes, expr: Bytes, arity: Int }> / {abort.raise} =
   if is_ctor_name(name) { None } else {
     let target = match qualified(name) {
-      Some(q) -> match from_import(emitter.imports, q.binder) {
+      Some(q) -> match module_import(emitter.imports, q.binder) {
         Some(imp) -> Some({ module: imp.module, name: q.name, defs: imp.defs }),
         None -> None,
       },
@@ -4807,7 +4813,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           } else if !fold(emitter.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
             // Not this module's: an import, which takes the name where it has it, else a builtin.
             match match qualified(fv.name) {
-                Some(q) -> from_import(emitter.imports, q.binder),
+                Some(q) -> module_import(emitter.imports, q.binder),
                 None -> from_import(emitter.imports, fv.name),
               } {
               // Callback and inline builtins outside their fused shapes are refused: a plain call for them is a wrong answer, not a slow one.
@@ -8757,10 +8763,10 @@ fn resolved_imports(
     match im.kind {
       INames(ns) ->
         fold(ns, acc, |a: List<Imported>, n: Ident|
-          push(a, { name: n.name, module: full, defs: defs_of(full) })),
-      // A whole module binds under its last segment or alias; the binder goes under the empty name so one table answers both spellings.
-      IModule -> push(acc, { name: last_segment(im.path), module: full, defs: defs_of(full) }),
-      IAlias(a2) -> push(acc, { name: a2.name, module: full, defs: defs_of(full) }),
+          push(a, { name: n.name, module: full, defs: defs_of(full), whole: false })),
+      IModule ->
+        push(acc, { name: last_segment(im.path), module: full, defs: defs_of(full), whole: true }),
+      IAlias(a2) -> push(acc, { name: a2.name, module: full, defs: defs_of(full), whole: true }),
     }
   });
   // A default copied into a call names its own module through a binder no import wrote.
@@ -8768,11 +8774,11 @@ fn resolved_imports(
     None -> written,
     Some(scope) ->
       fold(scope.modules, written, |acc: List<Imported>, mb: ModuleBinding|
-        match from_import(acc, mb.binder) {
+        match module_import(acc, mb.binder) {
           Some(_) -> acc,
           None -> {
             let full = at(mods, mb.target).name;
-            push(acc, { name: mb.binder, module: full, defs: defs_of(full) })
+            push(acc, { name: mb.binder, module: full, defs: defs_of(full), whole: true })
           },
         }),
   }
@@ -9624,6 +9630,26 @@ fn bytes_join_dots(xs: List<Bytes>) -> Bytes =
       if i == 0 { b"" } else { b"." },
       match list_at(xs, i) { Some(x) -> x, None -> b"" },
     ]))
+
+test "a module imported whole under a builtin's name leaves a bare call the builtin's" {
+  let emitted = emit_all_program(
+    [
+      { name: b"map", src: b"pub fn size(xs: List<Int>) -> Int = len(xs)\n" },
+      {
+        name: b"b",
+        src: b"import map\nfn doubled(xs: List<Int>) -> List<Int> = map(xs, |x: Int| x * 2)\nfn n(xs: List<Int>) -> Int = map::size(xs)\n",
+      },
+    ],
+    [],
+    [b"map", b"len"],
+    true,
+  );
+  assert_eq(map(emitted, |e: Emitted| e.why), [None, None, None]);
+  let calls = |full: Bytes|
+    map(emitted, |e: Emitted| bytes_index_of(e.text, symbol_of(full)) != None);
+  assert_eq(calls(b"map.map"), [false, false, false]);
+  assert_eq(calls(b"map.size"), [true, false, true])
+}
 
 test "a builtin is called through the helper named for it, and an import that takes its name is called instead" {
   let own = emit_all_program(
