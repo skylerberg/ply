@@ -108,7 +108,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `as` | in an `import`, after the module path |
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `set` | `effect set X = {..}` |
-| `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, or among a `fn`'s `requires` and `ensures` |
+| `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
@@ -1620,8 +1620,27 @@ The bound is an `Int` over the parameters, and the steps may be at most a
 constant times it plus a constant at every size, zero included: with `ys`
 empty these steps still grow with `xs`, so `len(xs) * len(ys)` would not hold.
 A clause on a definition whose row writes `diverges` is `E0468`, and on one
-that performs more than a raise, or has a row variable, `E0463`, since a
-handler could change the steps.
+that performs more than a raise `E0463`, since a handler could change the
+steps.
+
+A function parameter may name the steps a call of it takes, after its type,
+and only the definition's `cost` clauses read that name, as an `Int` of at
+least 1 (`E0105` if it is named like a parameter or another cost name):
+
+```ply
+fn each_of<| e>(xs: List<Int>, f: (Int) -> Int / e cost k) -> Int / e
+  cost len(xs) * k
+= fold(xs, 0, |a: Int, x: Int| a + f(x))
+
+fn pairs(xs: List<Int>, ys: List<Int>) -> Int
+  cost len(xs) * (len(ys) + 1)
+= each_of(xs, |_x: Int| total(ys))
+```
+
+At a call the name stands for the steps of the function given: a lambda's
+body, a named definition's, or the caller's own parameter's cost name, so
+`pairs` composes `each_of`'s bound with its lambda's. A function given whose
+steps grow with what it is given leaves the call unread.
 
 `ply prove` first reads the steps off the body. A builtin is at most a step;
 `map`, `filter`, `fold`, `map_fold`, `iterate`, `map_update`, `bytes_position`
@@ -1633,17 +1652,19 @@ call back takes a part of one list parameter that a list pattern took a head
 off, no path calls back twice, and every other parameter its steps grow with is
 handed on unchanged or as a part of itself: it takes that list's length in
 calls. The bound is read from below: the lengths of parameters (`len`,
-`map_len`, `string_len`, `bytes_len`), positive literals, `+`, `*`, and `ilog2`
-alone or beside sizes of the one length it is of. Steps within the bound are
-`proved`. Anything else, such as another operation, a call of a function value,
-a group of definitions calling each other, a body another package keeps with no
-`cost` bound, or an `Int` parameter the steps grow with, leaves the clause to
-the cost law `cost of <name>` (`#2` and on for later clauses): it makes each
-parameter of one size `n`, an `Int` being `n` and a list, map, string or bytes
-holding `n` elements made of their index, and meters the call alone, so it is
-`fitted`, `outgrown` (`E0464`) or a gap as above. A parameter of any other type
-is not made, which leaves the law `unattempted`. Under `--reach` a clause the
-body does not show carries the blocker `unbounded`, with why.
+`map_len`, `string_len`, `bytes_len`), cost names, positive literals, `+`, `*`,
+and `ilog2` alone or beside sizes of the one length it is of. Steps within the
+bound are `proved`. Anything else, such as another operation, a call of a
+function value with no cost name, a group of definitions calling each other, a
+body another package keeps with no `cost` bound, or an `Int` parameter the steps
+grow with, leaves the clause to the cost law `cost of <name>` (`#2` and on for
+later clauses): it makes each parameter of one size `n`, an `Int` being `n` and
+a list, map, string or bytes holding `n` elements made of their index, and a
+function parameter with a cost name a closure of one step, its cost name 1, and
+meters the call alone, so it is `fitted`, `outgrown` (`E0464`) or a gap as
+above. A parameter of any other type is not made, which leaves the law
+`unattempted`. Under `--reach` a clause the body does not show carries the
+blocker `unbounded`, with why.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
