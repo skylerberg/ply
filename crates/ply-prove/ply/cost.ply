@@ -17,19 +17,28 @@ import compiler.patterns (LInt)
 import compiler.types (Type, TyVar, TyCon, TyFn, TyRecord, Field)
 import context (Context, Def, claims_of, context, ctor, signature, is_recursive)
 import domain (Ty, Fn, Con)
-import std.list (concat)
+import std.list (concat, contains)
 import world (world_of)
 
-// The power each parameter's size is raised to, by its index; no entry is power zero.
+// The power each parameter's size is raised to, by its index, and each cost name's, by
+// `cost_key`; no entry is power zero.
 pub type Mono = Map<Int, Int>
 
 // The sum of these, each times a constant, plus a constant.
 pub type Poly = List<Mono>
 
 // What walking an expression finds: its steps, its size where it is a list, map, string, bytes or
-// `Int` the walk can bound, the parameter it is or is a strict part of, how many calls back into
-// the definition being bounded one path through it makes, and the arguments of each.
-type Walked = { cost: Poly, size: Option<Poly>, of: Of, calls: Int, back: List<List<Of>> }
+// `Int` the walk can bound, the parameter it is or is a strict part of, the steps a call of it takes
+// where it is a function they are read of, how many calls back into the definition being bounded one
+// path through it makes, and the arguments of each.
+type Walked = {
+  cost: Poly,
+  size: Option<Poly>,
+  of: Of,
+  fun: Option<Poly>,
+  calls: Int,
+  back: List<List<Of>>,
+}
 
 // `Same(i)` is parameter `i` itself; `Part(i)`, a tail a list pattern took off it.
 type Of = | Same(Int) | Part(Int) | Other
@@ -46,13 +55,19 @@ type Env = {
   empty: Option<Int>,
 }
 
-type Slot = { size: Option<Poly>, of: Of }
+type Slot = { size: Option<Poly>, of: Of, fun: Option<Poly> }
 
 fn zero() -> Poly = []
 
 fn constant() -> Poly = [map_new()]
 
 fn size_of(i: Int) -> Poly = [map_insert(map_new(), i, 1)]
+
+// The key of the steps one call of function parameter `i` takes: a call is at least a step, so
+// unlike a size it is never zero.
+fn cost_key(i: Int) -> Int = 0 - i - 1
+
+fn param_of_key(k: Int) -> Int = if k < 0 { 0 - k - 1 } else { k }
 
 fn mono_eq(a: Mono, b: Mono) -> Bool =
   len(map_keys(a)) == len(map_keys(b))
@@ -85,12 +100,12 @@ fn power(p: Poly, k: Int) -> Result<Poly, String> =
   fold(range(0, k), Ok(constant()), |acc: Result<Poly, String>, _i: Int|
     match acc { Ok(q) -> product(q, p), Err(_) -> acc })
 
-// `m` is at most a constant times `n` at every size, zero included: no size is raised higher in
-// it, and every size in `n` is in it, so that one of them at zero takes `m` to zero with `n`.
+// `m` is at most a constant times `n` at every size, zero included: nothing is raised higher in it,
+// and every size in `n` is in it, so that one of them at zero takes `m` to zero with `n`.
 fn below(m: Mono, n: Mono) -> Bool =
   map_fold(m, true, |ok: Bool, k: Int, v: Int|
       ok && v <= (match map_get(n, k) { Some(w) -> w, None -> 0 }))
-    && map_fold(n, true, |ok: Bool, k: Int, _v: Int| ok && map_contains(m, k))
+    && map_fold(n, true, |ok: Bool, k: Int, _v: Int| ok && (k < 0 || map_contains(m, k)))
 
 // Every monomial of `steps` is below one of `bound`'s; a constant is below anything.
 pub fn dominated(steps: Poly, bound: Poly) -> Bool =
@@ -98,17 +113,21 @@ pub fn dominated(steps: Poly, bound: Poly) -> Bool =
     ok
       && (len(map_keys(m)) == 0 || fold(bound, false, |found: Bool, n: Mono| found || below(m, n))))
 
-// `p`, a bound over a callee's parameters, at the sizes its arguments have.
-fn at_args(p: Poly, args: List<Option<Poly>>) -> Result<Poly, String> =
+// `p`, a bound over a callee's parameters, at the sizes its arguments have and the steps of a call of
+// each function it is given.
+fn at_args(p: Poly, args: List<Option<Poly>>, funs: List<Option<Poly>>) -> Result<Poly, String> =
   fold(p, Ok(zero()), |acc: Result<Poly, String>, m: Mono|
     match acc {
       Err(_) -> acc,
       Ok(sofar) -> match map_fold(m, Ok(constant()), |r: Result<Poly, String>, k: Int, v: Int|
           match r {
             Err(_) -> r,
-            Ok(q) -> match list_at(args, k) {
+            Ok(q) -> match list_at(if k < 0 { funs } else { args }, param_of_key(k)) {
               Some(Some(s)) -> match power(s, v) { Ok(sv) -> product(q, sv), Err(why) -> Err(why) },
-              _ -> Err("a callee's steps grow with an argument whose size is not read"),
+              _ ->
+                Err(if k < 0 {
+                  "a callee's steps grow with a function it is given whose steps are not read"
+                } else { "a callee's steps grow with an argument whose size is not read" }),
             },
           }) {
         Ok(q) -> Ok(plus(sofar, q)),
@@ -119,33 +138,52 @@ fn at_args(p: Poly, args: List<Option<Poly>>) -> Result<Poly, String> =
 // --- A bound's own reading ----------------------------------------------------------------------
 
 // The bound a clause states, read from below: a reading that is at most a constant times it, plus a
-// constant, at every size. It reads lengths, positive literals, sums, products and `ilog2`. An
-// `Int` parameter is no size here, since it may be negative.
-pub fn stated(bound: Code, params: Int) -> Option<Poly> =
-  match reading(bound, params) { Some(r) -> Some(r.poly), None -> None }
+// constant, at every size. It reads lengths, cost names, positive literals, sums, products and
+// `ilog2`. An `Int` parameter is no size here, since it may be negative.
+pub fn stated(bound: Code, params: Int, costed: List<Int>) -> Option<Poly> =
+  match reading(bound, { params: params, costed: costed }) { Some(r) -> Some(r.poly), None -> None }
+
+// What a bound's slots are: the parameters, then a cost name for each of `costed`.
+type Scope = { params: Int, costed: List<Int> }
+
+// The cost name a slot holds, as the key of its steps.
+fn cost_name(sc: Scope, c: Code) -> Option<Int> =
+  match c.node {
+    NVar(v) -> match v.slot {
+      Some(k) -> if k < sc.params { None } else {
+        match list_at(sc.costed, k - sc.params) { Some(i) -> Some(cost_key(i)), None -> None }
+      },
+      None -> None,
+    },
+    _ -> None,
+  }
 
 // `exact` where the reading is at most a constant times the bound, with no constant beside it. Only
 // `ilog2` reads loosely: it is zero below 2, so it reads as 1 alone, or times sizes of the one
 // length it takes, which are at most 1 where it is zero.
 type Reading = { poly: Poly, exact: Bool }
 
-fn reading(bound: Code, params: Int) -> Option<Reading> =
+fn reading(bound: Code, sc: Scope) -> Option<Reading> =
   match bound.node {
+    NVar(_) -> match cost_name(sc, bound) {
+      Some(k) -> Some({ poly: [map_insert(map_new(), k, 1)], exact: true }),
+      None -> None,
+    },
     NLit(l) -> match l {
       LInt(k) -> if k > 0 { Some({ poly: constant(), exact: true }) } else { None },
       _ -> None,
     },
     NBinary(b) -> if b.op == b"add" {
-      match ((reading(b.lhs, params), reading(b.rhs, params))) {
+      match ((reading(b.lhs, sc), reading(b.rhs, sc))) {
         (Some(x), Some(y)) -> Some({ poly: plus(x.poly, y.poly), exact: x.exact && y.exact }),
         _ -> None,
       }
     } else if b.op == b"mul" {
-      match ((logged(b.lhs, params), logged(b.rhs, params))) {
-        (Some(k), None) -> times_log(k, reading(b.rhs, params)),
-        (None, Some(k)) -> times_log(k, reading(b.lhs, params)),
+      match ((logged(b.lhs, sc.params), logged(b.rhs, sc.params))) {
+        (Some(k), None) -> times_log(k, reading(b.rhs, sc)),
+        (None, Some(k)) -> times_log(k, reading(b.lhs, sc)),
         (Some(_), Some(_)) -> Some({ poly: constant(), exact: false }),
-        (None, None) -> match ((reading(b.lhs, params), reading(b.rhs, params))) {
+        (None, None) -> match ((reading(b.lhs, sc), reading(b.rhs, sc))) {
           (Some(x), Some(y)) -> if x.exact && y.exact {
             match product(x.poly, y.poly) {
               Ok(p) -> Some({ poly: p, exact: true }),
@@ -156,9 +194,9 @@ fn reading(bound: Code, params: Int) -> Option<Reading> =
         },
       }
     } else { None },
-    NApp(_) -> match logged(bound, params) {
+    NApp(_) -> match logged(bound, sc.params) {
       Some(_) -> Some({ poly: constant(), exact: false }),
-      None -> match length_of(bound, params) {
+      None -> match length_of(bound, sc.params) {
         Some(k) -> Some({ poly: size_of(k), exact: true }),
         None -> None,
       },
@@ -295,7 +333,12 @@ fn steps_of(
         let env = {
           cx: cx,
           slots: map(range(0, d.params), |i: Int|
-            { size: if at_or(sized, i, false) { Some(size_of(i)) } else { None }, of: Same(i) }),
+            {
+              size: if at_or(sized, i, false) { Some(size_of(i)) } else { None },
+              of: Same(i),
+              fun: if contains(d.costed, i) { Some([map_insert(map_new(), cost_key(i), 1)]) }
+              else { None },
+            }),
           own: def,
           known: known,
           first_order: first_order,
@@ -316,7 +359,7 @@ fn steps_of(
                   {
                     ..env,
                     empty: Some(p),
-                    slots: list_set(env.slots, p, { size: Some(zero()), of: Same(p) }),
+                    slots: list_set(env.slots, p, { size: Some(zero()), of: Same(p), fun: None }),
                   },
                   body,
                 ) {
@@ -342,7 +385,10 @@ fn promised(def: String, d: Def) -> Result<Poly, String> =
       |found: Option<Poly>, c: ClaimClause|
         match found {
           Some(_) -> found,
-          None -> match c.clause.code { Some(b) -> ceiling(b, d.params), None -> None },
+          None -> match c.clause.code {
+            Some(b) -> ceiling(b, { params: d.params, costed: d.costed }),
+            None -> None,
+          },
         },
     ) {
     Some(p) -> Ok(plus(constant(), p)),
@@ -351,29 +397,31 @@ fn promised(def: String, d: Def) -> Result<Poly, String> =
   }
 
 // A bound read from above: what is at least it, up to a constant factor and a constant, at every
-// size. An `Int` parameter reads as its magnitude, a quotient or remainder as its left, and `ilog2`
-// as what it is of.
-fn ceiling(c: Code, params: Int) -> Option<Poly> =
+// size. An `Int` parameter reads as its magnitude, a quotient or remainder as its left, `ilog2` as
+// what it is of, and a cost name as the steps of a call of the function it is given.
+fn ceiling(c: Code, sc: Scope) -> Option<Poly> =
   match c.node {
     NLit(l) -> match l { LInt(_) -> Some(constant()), _ -> None },
     NVar(v) -> match v.slot {
-      Some(k) -> if k < params { Some(size_of(k)) } else { None },
+      Some(k) -> if k < sc.params { Some(size_of(k)) } else {
+        match cost_name(sc, c) { Some(key) -> Some([map_insert(map_new(), key, 1)]), None -> None }
+      },
       None -> None,
     },
-    NUnary(u) -> if u.op == b"neg" { ceiling(u.operand, params) } else { None },
-    NBinary(b) -> match ((ceiling(b.lhs, params), ceiling(b.rhs, params))) {
+    NUnary(u) -> if u.op == b"neg" { ceiling(u.operand, sc) } else { None },
+    NBinary(b) -> match ((ceiling(b.lhs, sc), ceiling(b.rhs, sc))) {
       (Some(x), Some(y)) -> if b.op == b"add" || b.op == b"sub" { Some(plus(x, y)) }
       else if b.op == b"mul" { match product(x, y) { Ok(p) -> Some(p), Err(_) -> None } }
       else if b.op == b"div" || b.op == b"rem" { Some(x) }
       else { None },
       _ -> None,
     },
-    NApp(_) -> match length_of(c, params) {
+    NApp(_) -> match length_of(c, sc.params) {
       Some(k) -> Some(size_of(k)),
       None -> match c.node {
         NApp(a) -> match ((a.func.node, a.args)) {
           (NVar(f), [arg]) -> if f.slot == None
-              && string_of_bytes_lossy(f.name) == "std.math.ilog2" { ceiling(arg, params) }
+              && string_of_bytes_lossy(f.name) == "std.math.ilog2" { ceiling(arg, sc) }
           else { None },
           _ -> None,
         },
@@ -420,7 +468,8 @@ fn descent(def: String, w: Walked) -> Result<Option<Int>, String> =
       None ->
         Err("`" ++ def ++ "` does not call itself on a part of one list parameter every time"),
       Some(p) -> {
-        let grows = fold(w.cost, [], |acc: List<Int>, m: Mono| concat(acc, map_keys(m)));
+        let grows = fold(w.cost, [], |acc: List<Int>, m: Mono|
+          concat(acc, map(map_keys(m), param_of_key)));
         let kept = fold(grows, true, |ok: Bool, q: Int|
           ok
             && fold(w.back, true, |all: Bool, args: List<Of>|
@@ -436,7 +485,7 @@ fn descent(def: String, w: Walked) -> Result<Option<Int>, String> =
     }
   }
 
-fn none() -> Walked = { cost: zero(), size: None, of: Other, calls: 0, back: [] }
+fn none() -> Walked = { cost: zero(), size: None, of: Other, fun: None, calls: 0, back: [] }
 
 fn sized(p: Poly) -> Walked = { ..none(), size: Some(p) }
 
@@ -447,6 +496,7 @@ fn then(a: Walked, b: Walked) -> Walked =
     cost: plus(a.cost, b.cost),
     size: b.size,
     of: b.of,
+    fun: b.fun,
     calls: a.calls + b.calls,
     back: concat(a.back, b.back),
   }
@@ -457,17 +507,18 @@ fn either(a: Walked, b: Walked) -> Walked =
     cost: plus(a.cost, b.cost),
     size: match ((a.size, b.size)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None },
     of: Other,
+    fun: match ((a.fun, b.fun)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None },
     calls: if a.calls > b.calls { a.calls } else { b.calls },
     back: concat(a.back, b.back),
   }
 
 fn slot_at(env: Env, k: Int) -> Slot =
-  match list_at(env.slots, k) { Some(s) -> s, None -> { size: None, of: Other } }
+  match list_at(env.slots, k) { Some(s) -> s, None -> { size: None, of: Other, fun: None } }
 
 fn bind(env: Env, k: Int, s: Slot) -> Env / {abort.raise} = {
   let grown = if len(env.slots) <= k {
     fold(range(len(env.slots), k + 1), env.slots, |acc: List<Slot>, _i: Int|
-      push(acc, { size: None, of: Other }))
+      push(acc, { size: None, of: Other, fun: None }))
   } else { env.slots };
   { ..env, slots: list_set(grown, k, s) }
 }
@@ -477,19 +528,25 @@ fn walk(env: Env, c: Code) -> Result<Walked, String> / {abort.raise} =
     NLit(l) -> Ok(match l { LInt(_) -> sized(constant()), _ -> none() }),
     NVar(v) ->
       Ok(match v.slot {
-        Some(k) -> { ..none(), size: slot_at(env, k).size, of: slot_at(env, k).of },
-        None -> none(),
+        Some(k) ->
+          {
+            ..none(),
+            size: slot_at(env, k).size,
+            of: slot_at(env, k).of,
+            fun: slot_at(env, k).fun,
+          },
+        None -> { ..none(), fun: fun_named(env, string_of_bytes_lossy(v.name)) },
       }),
     NLabel(_) -> Ok(none()),
     NUnary(u) -> match walk(env, u.operand) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok({ ..w, of: Other }),
+      Ok(w) -> Ok({ ..w, of: Other, fun: None }),
     },
     NBinary(b) -> match walk(env, b.lhs) {
       Err(why) -> Err(why),
       Ok(l) -> match walk(env, b.rhs) {
         Err(why) -> Err(why),
-        Ok(r) -> Ok({ ..then(l, r), size: arithmetic(b.op, l.size, r.size), of: Other }),
+        Ok(r) -> Ok({ ..then(l, r), size: arithmetic(b.op, l.size, r.size), of: Other, fun: None }),
       },
     },
     NIf(i) -> match walk(env, i.cond) {
@@ -505,19 +562,19 @@ fn walk(env: Env, c: Code) -> Result<Walked, String> / {abort.raise} =
     NBlock(b) -> block(env, b.stmts, b.tail),
     NList(l) -> match all(env, l.items) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok({ ..w, size: Some(constant()), of: Other }),
+      Ok(w) -> Ok({ ..w, size: Some(constant()), of: Other, fun: None }),
     },
     NRecord(r) -> match all(env, map(r.fields, |f: CodeField| f.value)) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok({ ..w, size: None, of: Other }),
+      Ok(w) -> Ok({ ..w, size: None, of: Other, fun: None }),
     },
     NField(f) -> match walk(env, f.base) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok({ ..w, size: None, of: Other }),
+      Ok(w) -> Ok({ ..w, size: None, of: Other, fun: None }),
     },
     NUpdate(u) -> match all(env, push(map(u.sets, |f: CodeField| f.value), u.base)) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok({ ..w, size: None, of: Other }),
+      Ok(w) -> Ok({ ..w, size: None, of: Other, fun: None }),
     },
     NMatch(m) -> match walk(env, m.scrutinee) {
       Err(why) -> Err(why),
@@ -530,10 +587,17 @@ fn walk(env: Env, c: Code) -> Result<Walked, String> / {abort.raise} =
     } else {
       match all(env, p.args) {
         Err(why) -> Err(why),
-        Ok(w) -> Ok({ ..add(w, constant()), size: None, of: Other }),
+        Ok(w) -> Ok({ ..add(w, constant()), size: None, of: Other, fun: None }),
       }
     },
-    NLambda(_) -> Ok(none()),
+    NLambda(l) ->
+      Ok({
+        ..none(),
+        fun: match lambda_steps(env, l.params, l.captures, l.body, []) {
+          Ok(w) -> if w.calls > 0 { None } else { Some(plus(constant(), w.cost)) },
+          Err(_) -> None,
+        },
+      }),
     NCell(_) -> Err("a cell the bound does not read"),
     NSimulate(_) -> Err("a `simulate` region the bound does not read"),
     NParallel(_) -> Err("a `parallel` block the bound does not read"),
@@ -575,11 +639,19 @@ fn block(
             Err(why) -> Err(why),
           },
           CLet(l) -> match walk(s.env, l.value) {
-            Ok(w) -> Ok({ env: bind(s.env, l.slot, { size: w.size, of: w.of }), w: then(s.w, w) }),
+            Ok(w) ->
+              Ok({
+                env: bind(s.env, l.slot, { size: w.size, of: w.of, fun: w.fun }),
+                w: then(s.w, w),
+              }),
             Err(why) -> Err(why),
           },
           CLetPat(l) -> match walk(s.env, l.value) {
-            Ok(w) -> Ok({ env: bound(s.env, l.pat, { size: w.size, of: w.of }), w: then(s.w, w) }),
+            Ok(w) ->
+              Ok({
+                env: bound(s.env, l.pat, { size: w.size, of: w.of, fun: w.fun }),
+                w: then(s.w, w),
+              }),
             Err(why) -> Err(why),
           },
         },
@@ -588,7 +660,7 @@ fn block(
   match ran {
     Err(why) -> Err(why),
     Ok(s) -> match tail {
-      None -> Ok({ ..s.w, size: None, of: Other }),
+      None -> Ok({ ..s.w, size: None, of: Other, fun: None }),
       Some(t) -> match walk(s.env, t) { Ok(w) -> Ok(then(s.w, w)), Err(why) -> Err(why) },
     },
   }
@@ -601,20 +673,23 @@ fn bound(env: Env, pat: CodePattern, of: Slot) -> Env / {abort.raise} =
     PxVar(v) -> match v.slot { Some(k) -> bind(env, k, of), None -> env },
     PxList(l) -> {
       let heads = fold(l.items, env, |e: Env, p: CodePattern|
-        bound(e, p, { size: None, of: Other }));
+        bound(e, p, { size: None, of: Other, fun: None }));
       match l.rest {
         None -> heads,
         Some(r) ->
           bound(heads, r, {
             size: of.size,
+            fun: None,
             of: if len(l.items) == 0 { of.of }
             else { match of.of { Same(i) -> Part(i), Part(i) -> Part(i), Other -> Other } },
           }),
       }
     },
-    PxCtor(c) -> fold(c.args, env, |e: Env, p: CodePattern| bound(e, p, { size: None, of: Other })),
+    PxCtor(c) ->
+      fold(c.args, env, |e: Env, p: CodePattern| bound(e, p, { size: None, of: Other, fun: None })),
     PxRecord(r) ->
-      fold(r.fields, env, |e: Env, f: CodePatternField| bound(e, f.pat, { size: None, of: Other })),
+      fold(r.fields, env, |e: Env, f: CodePatternField|
+        bound(e, f.pat, { size: None, of: Other, fun: None })),
     _ -> env,
   }
 
@@ -634,7 +709,11 @@ fn arms(env: Env, scrutinee: Walked, xs: List<CodeArm>) -> Result<Walked, String
         match acc {
           Err(_) -> acc,
           Ok(sofar) -> if needs_head(env, scrutinee, arm.pat) { acc } else {
-            let inside = bound(env, arm.pat, { size: scrutinee.size, of: scrutinee.of });
+            let inside = bound(env, arm.pat, {
+              size: scrutinee.size,
+              of: scrutinee.of,
+              fun: scrutinee.fun,
+            });
             match match arm.guard { None -> Ok(none()), Some(g) -> walk(inside, g) } {
               Err(why) -> Err(why),
               Ok(g) -> match walk(inside, arm.body) {
@@ -664,31 +743,38 @@ fn application(env: Env, func: Code, args: List<Code>) -> Result<Walked, String>
       }) {
     Err(why) -> Err(why),
     Ok(walked) -> {
-      let given = fold(walked, none(), then);
+      let given = { ..fold(walked, none(), then), size: None, of: Other, fun: None };
       let sizes = map(walked, |w: Walked| w.size);
       let ofs = map(walked, |w: Walked| w.of);
+      let funs = map(walked, |w: Walked| w.fun);
       match func.node {
-        NVar(f) -> if f.slot != None { Err("a call of a function value the bound does not read") }
-        else {
-          let name = string_of_bytes_lossy(f.name);
-          if name == env.own {
-            Ok({
-              ..add(given, constant()),
-              size: None,
-              of: Other,
-              calls: given.calls + 1,
-              back: push(given.back, ofs),
-            })
-          } else if ctor(env.cx, name) != None { Ok({ ..given, size: None, of: Other }) }
-          else if map_contains(env.cx.claims.defs, name) {
-            match read(env, name) {
-              Err(why) -> Err(why),
-              Ok(p) -> match at_args(p, sizes) {
+        NVar(f) -> match f.slot {
+          Some(k) -> match slot_at(env, k).fun {
+            Some(p) -> Ok(add(given, p)),
+            None -> Err("a call of a function value whose steps are not read"),
+          },
+          None -> {
+            let name = string_of_bytes_lossy(f.name);
+            if name == env.own {
+              Ok({
+                ..add(given, constant()),
+                size: None,
+                of: Other,
+                calls: given.calls + 1,
+                back: push(given.back, ofs),
+              })
+            } else if ctor(env.cx, name) != None {
+              Ok({ ..given, size: None, of: Other, fun: None })
+            } else if map_contains(env.cx.claims.defs, name) {
+              match read(env, name) {
                 Err(why) -> Err(why),
-                Ok(q) -> Ok({ ..add(given, plus(constant(), q)), size: None, of: Other }),
-              },
-            }
-          } else { builtin(env, name, args, given, sizes) }
+                Ok(p) -> match at_args(p, sizes, funs) {
+                  Err(why) -> Err(why),
+                  Ok(q) -> Ok(add(given, plus(constant(), q))),
+                },
+              }
+            } else { builtin(env, name, args, given, sizes) }
+          },
         },
         NLambda(l) -> match lambda_steps(
             env,
@@ -698,11 +784,22 @@ fn application(env: Env, func: Code, args: List<Code>) -> Result<Walked, String>
             map(sizes, |s: Option<Poly>| s),
           ) {
           Err(why) -> Err(why),
-          Ok(w) -> Ok({ ..add(then(given, w), constant()), of: Other }),
+          Ok(w) -> Ok({ ..add(then(given, w), constant()), of: Other, fun: None }),
         },
         _ -> Err("a call of a computed function the bound does not read"),
       }
     },
+  }
+
+// The steps of one call of a definition or constructor named as a value, where they grow with nothing
+// it is given.
+fn fun_named(env: Env, name: String) -> Option<Poly> =
+  if ctor(env.cx, name) != None { Some(constant()) }
+  else if !map_contains(env.cx.claims.defs, name) { None } else {
+    match read(env, name) {
+      Ok(p) -> match at_args(p, [], []) { Ok(q) -> Some(plus(constant(), q)), Err(_) -> None },
+      Err(_) -> None,
+    }
   }
 
 fn read(env: Env, name: String) -> Result<Poly, String> =
@@ -720,7 +817,11 @@ fn lambda_steps(
   sizes: List<Option<Poly>>,
 ) -> Result<Walked, String> / {abort.raise} = {
   let start = fold(range(0, params), { ..env, slots: [] }, |e: Env, i: Int|
-    bind(e, i, { size: match list_at(sizes, i) { Some(s) -> s, None -> None }, of: Other }));
+    bind(e, i, {
+      size: match list_at(sizes, i) { Some(s) -> s, None -> None },
+      of: Other,
+      fun: None,
+    }));
   let captured = fold(captures, start, |e: Env, cap: Capture|
     bind(e, cap.dst, slot_at(env, cap.src)));
   walk(captured, body)
@@ -736,7 +837,7 @@ fn builtin(
   sizes: List<Option<Poly>>,
 ) -> Result<Walked, String> / {abort.raise} = {
   let size_at = |i: Int| match list_at(sizes, i) { Some(s) -> s, None -> None };
-  let one = { ..add(given, constant()), size: None, of: Other };
+  let one = { ..add(given, constant()), size: None, of: Other, fun: None };
   let each = |times_of: Option<Poly>, callback: Int, arity: Int|
     match match list_at(args, callback) {
         None -> Err("a builtin called without its callback"),
@@ -794,13 +895,18 @@ fn callback_steps(env: Env, cb: Code, arity: Int) -> Result<Poly, String> / {abo
       Err(why) -> Err(why),
       Ok(w) -> if w.calls > 0 { Err("a call back inside an iteration") } else { Ok(w.cost) },
     },
-    NVar(f) -> if f.slot != None { Err("a callback the bound does not read") }
-    else if ctor(env.cx, string_of_bytes_lossy(f.name)) != None { Ok(zero()) }
+    NVar(f) -> if f.slot != None {
+      match slot_at(env, match f.slot { Some(k) -> k, None -> 0 }).fun {
+        Some(p) -> Ok(p),
+        None -> Err("a callback whose steps are not read"),
+      }
+    } else if ctor(env.cx, string_of_bytes_lossy(f.name)) != None { Ok(zero()) }
     else if string_of_bytes_lossy(f.name) == env.own { Err("a call back inside an iteration") }
     else if map_contains(env.cx.claims.defs, string_of_bytes_lossy(f.name)) {
       match read(env, string_of_bytes_lossy(f.name)) {
         Err(why) -> Err(why),
-        Ok(p) -> at_args(p, map(range(0, arity), |_i: Int| None)),
+        Ok(p) ->
+          at_args(p, map(range(0, arity), |_i: Int| None), map(range(0, arity), |_i: Int| None)),
       }
     } else { Err("a callback the bound does not read") },
     _ -> Err("a callback the bound does not read"),
@@ -835,7 +941,7 @@ fn shown(src: Bytes, def: String) -> Result<Bool, String> / {abort.raise} = {
     Some(d) -> match filter(d.spec, |c: ClaimClause| c.kind == SCost) {
       [c, ..] -> match c.clause.code {
         None -> panic("a lowered bound"),
-        Some(b) -> match stated(b, d.params) {
+        Some(b) -> match stated(b, d.params, d.costed) {
           None -> Err("the bound is not read"),
           Some(bound) -> match steps(cx, "m." ++ def) {
             Err(why) -> Err(why),
@@ -936,17 +1042,20 @@ fn logged_of(c: Code) -> Code = called(b"std.math.ilog2", c)
 fn op(name: Bytes, l: Code, r: Code) -> Code = coded(NBinary({ op: name, lhs: l, rhs: r }))
 
 test "`ilog2` reads as one alone, or beside sizes of the one length it is of" {
-  assert_eq(stated(op(b"mul", length(0), logged_of(length(0))), 2), Some(size_of(0)));
+  assert_eq(stated(op(b"mul", length(0), logged_of(length(0))), 2, []), Some(size_of(0)));
   assert_eq(
-    stated(op(b"add", op(b"mul", logged_of(length(0)), length(0)), coded(NLit(LInt(1)))), 2),
+    stated(op(b"add", op(b"mul", logged_of(length(0)), length(0)), coded(NLit(LInt(1)))), 2, []),
     Some(plus(size_of(0), constant())),
   );
-  assert_eq(stated(logged_of(length(1)), 2), Some(constant()));
+  assert_eq(stated(logged_of(length(1)), 2, []), Some(constant()));
   // Where `ys` is short `ilog2` is zero, while `xs` may be long.
-  assert_eq(stated(op(b"mul", length(0), logged_of(length(1))), 2), None);
-  assert_eq(stated(op(b"mul", op(b"mul", length(0), length(1)), logged_of(length(0))), 2), None);
-  assert_eq(stated(op(b"mul", length(0), coded(NLit(LInt(0)))), 2), None);
-  assert_eq(stated(op(b"sub", length(0), length(1)), 2), None)
+  assert_eq(stated(op(b"mul", length(0), logged_of(length(1))), 2, []), None);
+  assert_eq(
+    stated(op(b"mul", op(b"mul", length(0), length(1)), logged_of(length(0))), 2, []),
+    None,
+  );
+  assert_eq(stated(op(b"mul", length(0), coded(NLit(LInt(0)))), 2, []), None);
+  assert_eq(stated(op(b"sub", length(0), length(1)), 2, []), None)
 }
 
 fn steps_in(src: Bytes, def: String) -> Result<Poly, String> / {abort.raise} =
@@ -972,7 +1081,7 @@ test "a raise is a step, while another operation, a function value or a group of
       b"fn ap(g: (Int) -> Int, x: Int) -> Int = g(x)\nfn f(xs: List<Int>) -> Int cost len(xs) = ap(|y: Int| y, 1)",
       "f",
     ),
-    Err("a call of a function value the bound does not read"),
+    Err("a call of a function value whose steps are not read"),
   );
   assert_eq(
     shown(
@@ -1002,4 +1111,81 @@ test "another package's definition costs what its `cost` bound says, read from a
     steps(cx, "app.g"),
     Err("`base.hidden` has no body here to read, and no `cost` bound to read as its steps"),
   )
+}
+
+fn each_of() -> Bytes =
+  b"fn each_of(xs: List<Int>, f: (Int) -> Int cost k) -> Int cost len(xs) * k = fold(xs, 0, |a: Int, x: Int| a + f(x))\n"
+
+test "a function parameter's cost name stands for the steps of each call of it" {
+  assert_eq(shown(each_of(), "each_of"), Ok(true));
+  assert_eq(
+    shown(
+      b"fn f(xs: List<Int>, g: (Int) -> Int cost k) -> List<Int> cost len(xs) * k = map(xs, g)",
+      "f",
+    ),
+    Ok(true),
+  );
+  // A call of `f` may take any number of steps, so they bound nothing without its cost name.
+  assert_eq(
+    shown(
+      b"fn f(xs: List<Int>, g: (Int) -> Int cost k) -> List<Int> cost len(xs) = map(xs, g)",
+      "f",
+    ),
+    Ok(false),
+  );
+  assert_eq(
+    shown(b"fn f(xs: List<Int>, g: (Int) -> Int) -> List<Int> cost len(xs) = map(xs, g)", "f"),
+    Err("a callback whose steps are not read"),
+  )
+}
+
+test "at a call site a bound with a cost name composes with the steps of the function given" {
+  let src = bytes_concat_all([
+    b"fn total(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, x: Int| a + x)\n",
+    b"fn double(x: Int) -> Int = 2 * x\n",
+    each_of(),
+    b"fn pairs(xs: List<Int>, ys: List<Int>) -> Int cost len(xs) * (len(ys) + 1) = each_of(xs, |_x: Int| total(ys))\n",
+    b"fn wrong(xs: List<Int>, ys: List<Int>) -> Int cost len(xs) = each_of(xs, |_x: Int| total(ys))\n",
+    b"fn named(xs: List<Int>) -> Int cost len(xs) = each_of(xs, double)\n",
+    b"fn passed(xs: List<Int>, g: (Int) -> Int cost j) -> Int cost len(xs) * j = each_of(xs, g)\n",
+    b"fn kept(xs: List<Int>, g: (Int) -> Int cost j) -> Int cost len(xs) * j = { let h = g; each_of(xs, h) }\n",
+  ]);
+  assert_eq(shown(src, "pairs"), Ok(true));
+  assert_eq(shown(src, "wrong"), Ok(false));
+  assert_eq(shown(src, "named"), Ok(true));
+  assert_eq(shown(src, "passed"), Ok(true));
+  assert_eq(shown(src, "kept"), Ok(true))
+}
+
+test "a function given whose steps grow with what it is given leaves the call unread" {
+  let src = bytes_concat_all([
+    b"fn total(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, x: Int| a + x)\n",
+    b"fn each_list(xss: List<List<Int>>, f: (List<Int>) -> Int cost k) -> Int cost len(xss) * k = fold(xss, 0, |a: Int, xs: List<Int>| a + f(xs))\n",
+    b"fn f(xss: List<List<Int>>) -> Int cost len(xss) = each_list(xss, total)\n",
+    b"fn g(xss: List<List<Int>>) -> Int cost len(xss) = each_list(xss, |xs: List<Int>| total(xs))\n",
+  ]);
+  assert_eq(shown(src, "each_list"), Ok(true));
+  assert_eq(
+    shown(src, "f"),
+    Err("a callee's steps grow with a function it is given whose steps are not read"),
+  );
+  assert_eq(
+    shown(src, "g"),
+    Err("a callee's steps grow with a function it is given whose steps are not read"),
+  )
+}
+
+test "another package's definition with a cost name composes by its `cost` bound" {
+  let cx = cx_owning(
+    [
+      { name: b"base", src: bytes_concat(b"pub ", each_of()) },
+      {
+        name: b"app",
+        src: b"import base\nfn total(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, x: Int| a + x)\nfn f(xs: List<Int>, ys: List<Int>) -> Int = base::each_of(xs, |_x: Int| total(ys))\n",
+      },
+    ],
+    |m: Bytes| m == b"app",
+  );
+  let xs = map_insert(map_new(), 0, 1);
+  assert_eq(steps(cx, "app.f"), Ok([map_new(), xs, map_insert(xs, 1, 1)]))
 }
