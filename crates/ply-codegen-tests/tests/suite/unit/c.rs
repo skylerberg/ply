@@ -111,7 +111,7 @@ fn double(x: Int) -> Int = x * 2
 fn even(x: Int) -> Bool = x % 2 == 0
 fn clamp(x: Int, lo: Int, hi: Int) -> Int =
   if x < lo { lo } else { if x > hi { hi } else { x } }
-fn collatz(n: Int) -> Int =
+fn collatz(n: Int) -> Int / {diverges} =
   if n <= 1 { 0 } else { if even(n) { 1 + collatz(n / 2) } else { 1 + collatz(3 * n + 1) } }
 pub fn width(a: Int, b: Int) -> Int / {abort.raise} =
   int_of_u32(wrap_add(u32_of_int(a), u32_of_int(b)) ^ rotr(u32_of_int(b), 8))
@@ -182,7 +182,7 @@ fn a_recursion_past_what_the_stack_holds_grows_onto_another_and_answers() {
 /// thousand it fires long before the step budget counts the same calls as work.
 #[test]
 fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
-    const SPIN: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)";
+    const SPIN: &str = "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)";
     let Some((_loaded, native)) = fixture::unit(SPIN) else {
         return;
     };
@@ -1148,8 +1148,8 @@ fn a_unit_publishes_the_symbols_its_c_defines() {
             r#"
 fn key(x: Int) -> Int = x + 1
 pub fn a_b(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
-pub fn ping(n: Int, acc: Int) -> Int = if n == 0 { acc } else { pong(n - 1, acc + 1) }
-fn pong(n: Int, acc: Int) -> Int = if n == 0 { acc } else { ping(n - 1, acc + 2) }
+pub fn ping(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { pong(n - 1, acc + 1) }
+fn pong(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { ping(n - 1, acc + 2) }
 pub fn steady() -> Int = 7
 "#,
         ),
@@ -1189,8 +1189,8 @@ pub fn sum(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
 pub fn each(xs: List<Int>) -> List<Int> = map(xs, |x: Int| key(x))
 pub fn twice(x: Int) -> Int = key(key(x))
 pub fn apart(x: Int) -> Int = x * 2
-fn ping(n: Int, acc: Int) -> Int = if n == 0 { acc } else { pong(n - 1, acc + 1) }
-fn pong(n: Int, acc: Int) -> Int = if n == 0 { acc } else { ping(n - 1, acc + 2) }
+fn ping(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { pong(n - 1, acc + 1) }
+fn pong(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { ping(n - 1, acc + 2) }
 pub fn volley(n: Int) -> Int = ping(n, 0)
 "#;
     let produced = produced_of(&[("m", source)]);
@@ -1314,8 +1314,8 @@ effect net {
   write send[s](payload: Int) -> Int
 }
 
-fn ping<[l]>(n: Int) -> Int / {net.send[l]} = if n == 0 { net.send[l](0) } else { pong(n - 1) }
-fn pong<[k]>(n: Int) -> Int / {net.send[k]} = if n == 0 { net.send[k](1) } else { ping(n - 1) }
+fn ping<[l]>(n: Int) -> Int / {net.send[l]} = if n <= 0 { net.send[l](0) } else { pong(n - 1) }
+fn pong<[k]>(n: Int) -> Int / {net.send[k]} = if n <= 0 { net.send[k](1) } else { ping(n - 1) }
 
 pub fn near(n: Int) -> Int = handle { ping[conn](n) } with { net.send[conn](p) -> p + 10 }
 pub fn far(n: Int) -> Int = handle { ping[upstream](n) } with { net.send[upstream](p) -> p + 20 }
@@ -1336,8 +1336,8 @@ pub fn far(n: Int) -> Int = handle { ping[upstream](n) } with { net.send[upstrea
 #[test]
 fn a_tail_call_between_members_of_a_recursive_group_is_a_jump() {
     let source = r#"
-fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
-fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
+fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }
+fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }
 pub fn parity(n: Int) -> Bool = even(n)
 "#;
     let Some((loaded, native)) = fixture::unit(source) else {
@@ -1372,9 +1372,9 @@ pub fn parity(n: Int) -> Bool = even(n)
 #[test]
 fn a_self_tail_call_releases_a_converted_parameter_once() {
     let source = r#"
-fn countdown(n: Int, k: Int) -> Int = if k == 0 { n } else { countdown(n, k - 1) }
-fn flip(b: Bool, k: Int) -> Bool = if k == 0 { b } else { flip(b, k - 1) }
-fn narrow(w: U32, k: Int) -> U32 = if k == 0 { w } else { narrow(w, k - 1) }
+fn countdown(n: Int, k: Int) -> Int = if k <= 0 { n } else { countdown(n, k - 1) }
+fn flip(b: Bool, k: Int) -> Bool = if k <= 0 { b } else { flip(b, k - 1) }
+fn narrow(w: U32, k: Int) -> U32 = if k <= 0 { w } else { narrow(w, k - 1) }
 pub fn down(k: Int) -> Int = countdown(4611686018427387904, k)
 pub fn toggled(k: Int) -> Bool = flip(true, k)
 pub fn narrowed(k: Int) -> U32 = narrow(7u32, k)
@@ -1430,8 +1430,8 @@ pub fn narrowed(k: Int) -> U32 = narrow(7u32, k)
 #[test]
 fn a_recursive_group_holding_a_handle_is_emitted_per_definition() {
     let source = r#"
-fn a(n: Int) -> Int / {clock.now} = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> Instant(7), } } else { b(n - 1) }
-fn b(n: Int) -> Int / {clock.now} = if n == 0 { match clock.now() { Instant(t) -> t } } else { a(n - 1) }
+fn a(n: Int) -> Int / {clock.now, diverges} = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> Instant(7), } } else { b(n - 1) }
+fn b(n: Int) -> Int / {clock.now, diverges} = if n == 0 { match clock.now() { Instant(t) -> t } } else { a(n - 1) }
 "#;
     let produced = produced_of(&[("m", source)]);
     let code = numbering_support::code(&produced.text);
