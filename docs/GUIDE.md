@@ -2696,8 +2696,10 @@ pub fn word(stop: String) -> Parser<String>
 A parser is a value: the input, a position, and a `Step` or `None`. `run` wants
 the whole input consumed and `at` reads a prefix. `or_else` runs its second
 parser from the same position as the first, so there is no half-consumed state
-to unwind; `many` stops when its parser consumes nothing, so a parser that can
-match the empty string still cannot loop, and nothing needs a fuel argument.
+to unwind; `many` stops when its parser consumes nothing or answers a position
+past the input, and `sep_by` when a separator and an item together do, so a
+parser that can match the empty string still cannot loop, and nothing needs a
+fuel argument.
 This is the shape `std.json`, `std.db` and `std.http` already write by hand, as
 a module a user's parser can share.
 
