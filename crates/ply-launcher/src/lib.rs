@@ -174,7 +174,10 @@ pub fn run(
     mut binds: Binds,
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
-    let definitions = ply_machine::shipped::definitions(&program.runnable.front.answer);
+    let definitions = ply_machine::shipped::definitions(
+        &program.runnable.front.answer,
+        Some(&program.runnable.entry),
+    );
     let shipped = match shipped_modules(&program, &definitions) {
         Ok(shipped) => shipped,
         Err(refused) => return Ended::refused(refused),

@@ -65,6 +65,8 @@ CORPUS_PROGRAM=crates/ply-corpus/ply
 # The programs the corpus program runs, each a `ply test` of its own whose tests must pass.
 CORPUS_FIXTURES=crates/ply-corpus/fixtures
 CORPUS_CHECKS=crates/ply-corpus/checks
+# A program importing every standard library module, whose tests and laws run under `--std`.
+CORPUS_STDLIB=crates/ply-corpus/stdlib
 CLI_SUITE=crates/ply-cli-tests/ply
 # The checks that start desks under load and drive them over postgres: a test at a time, cut by
 # duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
@@ -122,7 +124,13 @@ GATES_ALONE=(
 CLI_TREE_CHECKS=(
   "copies:no two modules define the same function"
   "fixture_list:every fixture is listed"
-  "fmt:the maintained sources are committed formatted"
+  "fmt:the standard library is committed formatted"
+  "fmt:the compiler is committed formatted"
+  "fmt:the CLI is committed formatted"
+  "fmt:the CLI's suite is committed formatted"
+  "fmt:the corpus is committed formatted"
+  "fmt:the packages beside the CLI are committed formatted"
+  "fmt:the benches, the language tests and the examples are committed formatted"
   "tree:the harness is the only module that starts the \`ply\` binary"
 )
 
@@ -188,13 +196,14 @@ filter_of() {
   done
 }
 
-# One entry id a line: `program`, `fixture-<name>` per fixture, `package-<id>` per package suite,
-# every checks module that declares a test, then every such module of the CLI's suite under `cli-`;
+# One entry id a line: `program`, `stdlib`, `fixture-<name>` per fixture, `package-<id>` per package
+# suite, every checks module that declares a test, then every such module of the CLI's suite under `cli-`;
 # each module as `module`, or, for one placed a test at a time, `module:<id>` per test, the id a hash
 # of its label, so a duration measured for a test stays with it however the module's tests move.
 corpus_entries() {
   local entry file
   printf 'program\n'
+  printf 'stdlib\n'
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
@@ -342,6 +351,8 @@ cmd_corpus_line() {
     [[ $entry == "$1" || ${entry%%:*} == "$1" ]] || continue
     if [[ $1 == program ]]; then
       printf '%s\n' "$CORPUS_PROGRAM"
+    elif [[ $1 == stdlib ]]; then
+      printf '%s\n' "$CORPUS_STDLIB"
     elif [[ $1 == fixture-* ]]; then
       printf '%s/%s.ply\n' "$CORPUS_FIXTURES" "${1#fixture-}"
     elif [[ $1 == package-* ]]; then
@@ -664,7 +675,7 @@ corpus_cut() {
     -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" '
     function package(id) {
       if (id ~ /^cli-/) return cli
-      if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
+      if (id == "program" || id == "stdlib" || id ~ /^package-/ || id ~ /^fixture-/) return id
       return checks
     }
     function module_of(id) { return index(id, ":") ? substr(id, 1, index(id, ":") - 1) : "" }
