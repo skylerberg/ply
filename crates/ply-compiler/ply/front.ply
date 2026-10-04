@@ -37,10 +37,11 @@ import resolve (PackageDeps, resolve_packaged, no_packages)
 import std.bin
 import std.hash (blake3)
 import std.pkg (Manifest)
-import std.list (at, concat, contains, take, push_unique)
+import std.list (at, concat, contains, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update)
-import embed (EmbedAt, EmbedRead, EmbedWant, embed_key, embed_tables, embedded, rewritten, wants_of)
+import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_key, embed_tables, embedded,
+              rewritten, wants_of, want_of_key)
 import items (parse)
 import std.bytes (join)
 import std.list
@@ -390,6 +391,11 @@ pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
       _ -> acc,
     })
 }
+
+// The cuts that blank a module's bodies and leave its tests and laws: a stub of a module whose own
+// tests a load still answers for.
+pub fn body_cuts_of(parsed: ParsedModule) -> List<Cut> =
+  filter(cuts_of(parsed), |cut: Cut| cut.braced)
 
 fn def_row(def_info: DefInfo, w: Written) -> DefRow / {abort.raise} =
   {
@@ -1181,6 +1187,14 @@ fn ordinal_row(parsed: ParsedModule) -> OrdinalRow / {abort.raise} =
       }),
   }
 
+// The definitions by where they are written: the order the checker takes them in follows what
+// their bodies call, which a module read as a stub does not show.
+fn in_place(defs: List<DefInfo>) -> List<DefInfo> =
+  sort_by(defs, |a: DefInfo, b: DefInfo|
+    if a.at.module != b.at.module { a.at.module < b.at.module }
+    else if a.at.span.start != b.at.span.start { a.at.span.start < b.at.span.start }
+    else { match compare_values(a.name, b.name) { Greater -> false, _ -> true } })
+
 fn tables(
   warnings: List<Diag>,
   mods: List<ParsedModule>,
@@ -1208,7 +1222,8 @@ fn tables(
     module_packages: module_packages,
     modules: map(range(0, len(mods)), |i: Int|
       module_row(i, at(mods, i), resolved, checked.effects, mod_names, stub_cuts)),
-    defs: map(checked.defs, |def_info: DefInfo| def_row(def_info, written_of(fns, def_info.name))),
+    defs: map(in_place(checked.defs), |def_info: DefInfo|
+      def_row(def_info, written_of(fns, def_info.name))),
     types: type_rows(mods),
     tests: map(range(0, len(checked.tests)), |i: Int| test_row(at(checked.tests, i), at(names, i))),
     laws: map(range(0, len(checked.laws)), |i: Int| law_row(at(checked.laws, i), at(lits, i))),
@@ -1247,7 +1262,7 @@ pub type Analysis = {
   pins: List<Pinned>,
   module_packages: List<Int>,
   // The modules a compiled package's stubs stand for: their bodies are blanks. `stub_cuts` are
-  // what each one's source was cut by.
+  // what each one's source was cut by, and what a module read without its tests and laws is.
   stubs: List<Bytes>,
   stub_cuts: Map<Bytes, List<Cut>>,
   // What each module embeds, for every pass that parses its text again.
@@ -1383,6 +1398,7 @@ fn known_from_rows(
   root: Int,
   fixed: List<Fixed>,
   texts: List<Bytes>,
+  blank: Map<Bytes, Bool>,
 ) -> Known / {abort.raise} = {
   let decls = by_name_one(hashes.decls);
   let held = fold(fixed, map_new(), |acc: Map<Bytes, Bytes>, f: Fixed|
@@ -1409,6 +1425,7 @@ fn known_from_rows(
       test_layout: written.tests,
       reads: by_name_names(hashes.deps),
       said: said_of(hashes),
+      blank: blank,
     }),
   }
 }
@@ -1837,16 +1854,18 @@ fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
     |acc: Map<Bytes, Int>, b: { name: Bytes, body: Bytes }|
       map_insert(acc, b.name, match map_get(acc, b.name) { Some(n) -> n + 1, None -> 1 }),
   );
-  fold(hashes.bodies, [], |acc: List<FiledBody>, b: { name: Bytes, body: Bytes }| {
-    let alone = match map_get(counted, b.name) { Some(n) -> n == 1, None -> false };
-    fold(
-      concat(listed(map_get(defs, b.name)), listed(map_get(decls, b.name))),
-      acc,
-      |a: List<FiledBody>, hash: Bytes|
-        if alone || body_key(b.body) == Some(hash) { push(a, { hash: hash, body: b.body }) }
-        else { a },
-    )
-  })
+  // A module read through what a load kept of it brings no body: the one filed for its hash stands.
+  fold(hashes.bodies, [], |acc: List<FiledBody>, b: { name: Bytes, body: Bytes }|
+    if bytes_len(b.body) == 0 { acc } else {
+      let alone = match map_get(counted, b.name) { Some(n) -> n == 1, None -> false };
+      fold(
+        concat(listed(map_get(defs, b.name)), listed(map_get(decls, b.name))),
+        acc,
+        |a: List<FiledBody>, hash: Bytes|
+          if alone || body_key(b.body) == Some(hash) { push(a, { hash: hash, body: b.body }) }
+          else { a },
+      )
+    })
 }
 
 // Everything the front-end cache files after an analysis, as plain data.
@@ -2081,6 +2100,8 @@ pub type Hashed = {
   embeds: List<EmbedAt>,
   // Each module's text as its source holds it, a stub's too.
   texts: List<Bytes>,
+  // What a stub's source was cut by, and a module's read with its tests and laws left out.
+  cuts: Map<Bytes, List<Cut>>,
 }
 
 fn hashed_closure(
@@ -2091,6 +2112,7 @@ fn hashed_closure(
   ifaces: Interfaces = { stubs: [], cuts: [], defs: [], fixed: [] },
   embeds: List<EmbedAt> = [],
   priors: List<Prior> = [],
+  cuts: List<StubCuts> = [],
 ) -> Result<Hashed, List<Diag>> / {abort.raise} = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
   // and graph diags point one slot past every module, in manifest order.
@@ -2141,6 +2163,11 @@ fn hashed_closure(
               ifaces: ifaces,
               embeds: embeds,
               texts: map(parsed, |p: ParsedSource| p.src),
+              cuts: fold(
+                concat(ifaces.cuts, cuts),
+                map_new(),
+                |acc: Map<Bytes, List<Cut>>, c: StubCuts| map_insert(acc, c.name, c.cuts),
+              ),
             })
           }
         },
@@ -2157,7 +2184,17 @@ fn checked_closure(
   let checked: CheckOutput = check_front_with(
     h.r,
     h.mods,
-    known_from_rows(h.mods, h.hashes, defs, tests, h.root_count, h.ifaces.fixed, h.texts),
+    known_from_rows(
+      h.mods,
+      h.hashes,
+      defs,
+      tests,
+      h.root_count,
+      h.ifaces.fixed,
+      h.texts,
+      fold(h.ifaces.stubs, map_new(), |acc: Map<Bytes, Bool>, stub: Source|
+        map_insert(acc, stub.name, true)),
+    ),
   );
   if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
     Analysed({
@@ -2182,8 +2219,7 @@ fn checked_closure(
       pins: pins_of(h.clo, h.embeds),
       module_packages: h.module_packages,
       stubs: map(h.ifaces.stubs, |source: Source| source.name),
-      stub_cuts: fold(h.ifaces.cuts, map_new(), |acc: Map<Bytes, List<Cut>>, s: StubCuts|
-        map_insert(acc, s.name, s.cuts)),
+      stub_cuts: h.cuts,
       embeds: h.embeds,
     })
   }
@@ -2760,7 +2796,29 @@ type Pull = {
   pulled: List<Bytes>,
   embeds: List<EmbedAt>,
   diags: List<Diag>,
+  // What each module read whole is cut by, where its tests and laws were left out.
+  cuts: List<StubCuts>,
 }
+
+// What a module read whole is cut by, noted before its tests and laws are left out: a stub of it
+// blanks them too, and its own cuts are what the stub was made with.
+fn uncut(cuts: List<StubCuts>, stubs: Map<Bytes, Bytes>, p: ParsedSource) -> List<StubCuts> =
+  if map_contains(stubs, p.name) { cuts }
+  else { push(cuts, { name: p.name, cuts: cuts_of(p.module) }) }
+
+// A module with its tests and laws left out.
+fn untested(p: ParsedSource) -> ParsedSource =
+  {
+    ..p,
+    module: {
+      ..p.module,
+      module: {
+        ..p.module.module,
+        items: filter(p.module.module.items, |item: Item|
+          match item { ITest(_) -> false, ILaw(_) -> false, _ -> true }),
+      },
+    },
+  }
 
 // `shipped` is each shelved module as the analysis reads it, a stub where it has one, and `whole` the
 // shelf as it stands. `room` is how many more rounds may pull: each pulls a shipped module not
@@ -2770,6 +2828,8 @@ fn pulling(
   shipped: Map<Bytes, Bytes>,
   whole: Map<Bytes, Bytes>,
   listed: List<Bytes>,
+  stubs: Map<Bytes, Bytes>,
+  tested: Bool,
   x: Pull,
   room: Int,
 ) -> Pull / {abort.raise} = {
@@ -2784,11 +2844,14 @@ fn pulling(
         shipped,
         whole,
         listed,
+        stubs,
+        tested,
         map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes| {
           let o = shelf_embedded(whole, len(acc.parsed), { name: name, src: src });
           {
             ..acc,
-            parsed: push(acc.parsed, o.parsed),
+            parsed: push(acc.parsed, if tested { o.parsed } else { untested(o.parsed) }),
+            cuts: if tested { acc.cuts } else { uncut(acc.cuts, stubs, o.parsed) },
             pulled: push(acc.pulled, name),
             embeds: concat(acc.embeds, o.embeds),
           }
@@ -2870,17 +2933,26 @@ pub fn staged_pulling_std_with(
   embeds: List<Embedded> = [],
   // What an earlier load of the same program hashed, which this one takes where it stands.
   priors: List<Prior> = [],
+  // Whether the program's tests and laws are read. A program to ship is the definition it enters
+  // and all that reaches, which is never a test or a law.
+  tested: Bool = true,
 ) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, read_as(stubs, s).src));
-  let parsed = fold(
-    clo.modules,
-    parse_all(user),
-    |acc: List<ParsedSource>, m: { pkg: Int, src: Source }|
-      push(acc, { ..parse_at(len(acc), read_as(stubs, m.src)), src: m.src.src }),
+  let sources = concat(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
+  let read = fold(
+    range(0, len(sources)),
+    { parsed: [], cuts: [] },
+    |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
+      let s = at(sources, i);
+      let p = { ..parse_at(i, read_as(stubs, s)), src: s.src };
+      if tested { { ..acc, parsed: push(acc.parsed, p) } }
+      else { { parsed: push(acc.parsed, untested(p)), cuts: uncut(acc.cuts, stubs, p) } }
+    },
   );
+  let parsed = read.parsed;
   let mentions = concat(
     map(user, |s: Source| names_embed(s.src)),
     map(clo.modules, |m: { pkg: Int, src: Source }| names_embed(m.src.src)),
@@ -2899,7 +2971,9 @@ pub fn staged_pulling_std_with(
     texts,
     whole,
     map(shipped, |s: Source| s.name),
-    { parsed: assembled, pulled: [], embeds: [], diags: [] },
+    stubs,
+    tested,
+    { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, diags: [] },
     map_len(texts),
   );
   {
@@ -2913,6 +2987,7 @@ pub fn staged_pulling_std_with(
         ifaces,
         concat(written.at, x.embeds),
         priors,
+        x.cuts,
       )
     },
   }
@@ -3019,6 +3094,45 @@ fn past_spaces(src: Bytes, at: Int) -> Int / {abort.raise} =
       && (bytes_at(src, at) == 32 || bytes_at(src, at) == 9 || bytes_at(src, at) == 10
       || bytes_at(src, at) == 13) { past_spaces(src, at + 1) }
   else { at }
+
+// Of a module the driver read beside, what `embeds` holds; of a shipped one, what the shelf does.
+pub fn embeds_now(
+  pkgs: PackageSources,
+  user: List<Source>,
+  shipped: List<Source>,
+  embeds: List<Embedded>,
+) -> EmbedReader / {abort.raise} = {
+  let clo = closure(pkgs, map(user, |s: Source| s.name));
+  let names = concat(
+    map(user, |s: Source| s.name),
+    map(clo.modules, |m: { pkg: Int, src: Source }| m.src.name),
+  );
+  let slots = own_names(pkgs, user);
+  let tables = embed_reads(embeds);
+  let beside = fold(
+    range(0, len(names)),
+    map_new(),
+    |acc: Map<Bytes, Map<Bytes, EmbedRead>>, i: Int|
+      match list_at(slots, i) {
+        None -> acc,
+        Some(slot) -> match map_get(tables, slot) {
+          Some(table) -> map_insert(acc, at(names, i), table),
+          None -> acc,
+        },
+      },
+  );
+  let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  |module: Bytes, key: Bytes|
+    match map_get(beside, module) {
+      Some(table) -> match map_get(table, key) {
+        Some(read) -> read,
+        None -> Err(b"the module asks for no such embed now"),
+      },
+      None -> if map_contains(whole, module) { shelf_read(whole, module, want_of_key(key)) }
+      else { Err(b"the module asks for no such embed now") },
+    }
+}
 
 // What the modules of the package at `root` ask to embed. Only a module that may call `embed` is
 // parsed for it.

@@ -332,6 +332,9 @@ pub type Keying = {
   test_layout: List<Bytes>,
   reads: Map<Bytes, List<Bytes>>,
   said: Map<Bytes, Bytes>,
+  // The modules read as stubs: a blank body names nothing, so the order its module's definitions
+  // are taken in comes from `reads`.
+  blank: Map<Bytes, Bool>,
 }
 // What the emitter reads of one body published from its rows: `name` is the definition, or a test
 // as `test_owner` names it.
@@ -6743,16 +6746,37 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
     let n = at(names, i);
     if map_contains(acc, n) { acc } else { map_insert(acc, n, i) }
   });
-  let adj = map(fns, |d: FnDef| {
-    let refs = refs_of(d.body, param_names(d.params));
-    fold(refs.names, [], |acc: List<Int>, qname: QName|
-      if !is_bare(qname) { acc } else {
-        match map_get(index, qname.name.name) {
-          Some(i) -> if contains(acc, i) { acc } else { push(acc, i) },
-          None -> acc,
-        }
-      })
-  });
+  // A stub's bodies are blanks, so what each named is read from what its hashing kept: a caller
+  // is still taken after what it calls, and keyed by what that published.
+  let kept_reads = match collected.checker.known.keying {
+    Some(keying) -> if map_contains(keying.blank, parsed.name) { Some(keying.reads) } else { None },
+    None -> None,
+  };
+  let adj = map(fns, |d: FnDef|
+    match kept_reads {
+      Some(reads) ->
+        fold(
+          match map_get(reads, qualify(parsed.name, d.name.name)) { Some(rs) -> rs, None -> [] },
+          [],
+          |acc: List<Int>, r: Bytes|
+            if !bytes_starts_with(r, bytes_concat(parsed.name, b".")) { acc } else {
+              match map_get(index, bytes_slice(r, bytes_len(parsed.name) + 1, bytes_len(r))) {
+                Some(i) -> if contains(acc, i) { acc } else { push(acc, i) },
+                None -> acc,
+              }
+            },
+        ),
+      None -> {
+        let refs = refs_of(d.body, param_names(d.params));
+        fold(refs.names, [], |acc: List<Int>, qname: QName|
+          if !is_bare(qname) { acc } else {
+            match map_get(index, qname.name.name) {
+              Some(i) -> if contains(acc, i) { acc } else { push(acc, i) },
+              None -> acc,
+            }
+          })
+      },
+    });
   fold(sccs(len(fns), adj), collected.checker, |c: Checker, comp: List<Int>|
     check_component(c, parsed, fns, comp))
 }
@@ -7178,17 +7202,20 @@ fn check_component(
       }
     },
   );
-  let read: Verdict = verdict({
-    defs: map(comp, |i: Int| at(fns, i)),
-    names: qualified,
-    params: map(sigs.sigs, |s: Signature| map(s.params, |ty: Type| resolve(bodies.checker, ty))),
-    resolve: |qname: QName| group_callee_kind(bodies.checker, qualified, qname),
-    ending_of: |n: Bytes| match def_of(bodies.checker, n) { Some(d) -> d.ending, None -> Ends },
-    summary_of: |n: Bytes| map_get(bodies.checker.summaries, n),
-  });
   // A definition published from its filed rows answers what it was filed with: its body may be a
-  // stub's blank.
+  // stub's blank. A group published wholly so has no body left to read an ending from.
   let filed = bodies.filed;
+  let walked = fold(filed, false, |any: Bool, k: Option<KnownDef>| any || k == None);
+  let read: Verdict = if !walked { { endings: [], summaries: [] } } else {
+    verdict({
+      defs: map(comp, |i: Int| at(fns, i)),
+      names: qualified,
+      params: map(sigs.sigs, |s: Signature| map(s.params, |ty: Type| resolve(bodies.checker, ty))),
+      resolve: |qname: QName| group_callee_kind(bodies.checker, qualified, qname),
+      ending_of: |n: Bytes| match def_of(bodies.checker, n) { Some(d) -> d.ending, None -> Ends },
+      summary_of: |n: Bytes| map_get(bodies.checker.summaries, n),
+    })
+  };
   let ending_of = |slot: Int|
     match at(filed, slot) { Some(k) -> k.ending, None -> at(read.endings, slot) };
   let summary_of = |slot: Int|
