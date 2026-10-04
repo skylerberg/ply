@@ -20,6 +20,7 @@ nondet effect tester {
   read hosted[r]() -> Hosted
   write ended[r]() -> Unit
   read executed[r](unit: Int, index: Int) -> Executed
+  read unchanged[r](trace: Bytes) -> Bool
 }
 
 type Configured = {
@@ -50,7 +51,7 @@ type Usage = {
   performs: Int,
   teardown: List<Diag>,
 }
-type Executed = { status: String, failure: Option<Raised>, usage: Usage }
+type Executed = { status: String, failure: Option<Raised>, usage: Usage, trace: Option<Bytes> }
 type Compiled = {
   name: String,
   fragment: Int,
