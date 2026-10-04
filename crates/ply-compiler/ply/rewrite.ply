@@ -626,23 +626,22 @@ fn wrap(
 
 fn purity(pure: Bool) -> Scan = if pure { ScanPure } else { ScanImpure }
 
+type Sequenced = { state: TryState, scan: Scan, exprs: List<Expr> }
+
 // Sub-expressions left to right, stopping at the first `?` and at the first impure one.
-fn sequence(
-  state: TryState,
-  parts: List<Expr>,
-) -> { state: TryState, scan: Scan, exprs: List<Expr> } / {abort.raise} =
-  fold(
-    parts,
-    { state: state, scan: ScanPure, exprs: [] },
-    |acc: { state: TryState, scan: Scan, exprs: List<Expr> }, expr: Expr|
-      match acc.scan {
-        ScanPure -> {
-          let o = scan(acc.state, expr);
-          { state: o.state, scan: o.scan, exprs: push(acc.exprs, o.expr) }
-        },
-        _ -> { ..acc, exprs: push(acc.exprs, expr) },
+fn sequence(state: TryState, parts: List<Expr>) -> Sequenced / {abort.raise} =
+  sequence_on({ state: state, scan: ScanPure, exprs: [] }, parts)
+
+// `sequence` going on from where one over the sub-expressions before `parts` stopped.
+fn sequence_on(before: Sequenced, parts: List<Expr>) -> Sequenced / {abort.raise} =
+  fold(parts, before, |acc: Sequenced, expr: Expr|
+    match acc.scan {
+      ScanPure -> {
+        let o = scan(acc.state, expr);
+        { state: o.state, scan: o.scan, exprs: push(acc.exprs, o.expr) }
       },
-  )
+      _ -> { ..acc, exprs: push(acc.exprs, expr) },
+    })
 
 // Lifts the first `?` reachable in evaluation order, leaving its binder in its place.
 fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
@@ -695,9 +694,9 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
       { state: o.state, scan: o.scan, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
     },
     EApp(a) -> {
-      let o = sequence(
-        state,
-        append(append([a.func], a.args), map(a.named, |n: NamedArg| n.value)),
+      let o = sequence_on(
+        sequence_on(sequence(state, [a.func]), a.args),
+        map(a.named, |n: NamedArg| n.value),
       );
       let func = at(o.exprs, 0);
       let args = take(drop(o.exprs, 1), len(a.args));
@@ -747,7 +746,7 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
       { state: o.state, scan: o.scan, expr: EField({ span: f.span, base: o.expr, field: f.field }) }
     },
     ERecordUpdate(r) -> {
-      let o = sequence(state, append([r.base], map(r.fields, |f: RecField| f.value)));
+      let o = sequence_on(sequence(state, [r.base]), map(r.fields, |f: RecField| f.value));
       {
         state: o.state,
         scan: o.scan,
@@ -802,7 +801,8 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
   }
 
 // One `match` per `?` lifted from `expr`'s head, with the rewritten `expr` as the success arm's body.
-fn region_cond(state: TryState, expr: Expr) -> TryOut / {abort.raise} = {
+// `room` is how many `?` are left to lift: each lift takes one away and none is copied.
+fn region_cond(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} = {
   let found = scan_head(state, expr);
   match found.scan {
     ScanFound(l) -> {
@@ -810,7 +810,8 @@ fn region_cond(state: TryState, expr: Expr) -> TryOut / {abort.raise} = {
       match w.expr {
         EMatch(m) -> {
           let success = at(m.arms, 1);
-          let inner = region_cond(w.state, success.body);
+          let inner = if room <= 0 { panic(lifted_past()) }
+          else { region_cond(w.state, success.body, room - 1) };
           {
             state: inner.state,
             expr: EMatch({
@@ -856,16 +857,19 @@ fn scan_head(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
     _ -> scan(state, expr),
   }
 
-// An expression in return position.
-fn ret(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
+fn lifted_past() -> String = "a `?` lifted past the ones written"
+
+// An expression in return position, with `room` as in `region_cond`.
+fn ret(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
   match expr {
-    EBlock(_) -> block(state, expr),
+    EBlock(_) -> block(state, expr, room),
     EIf(i) -> {
-      let t = ret(state, i.then_branch);
-      let el = ret(t.state, i.else_branch);
+      let t = ret(state, i.then_branch, room);
+      let el = ret(t.state, i.else_branch, room);
       region_cond(
         el.state,
         EIf({ span: i.span, cond: i.cond, then_branch: t.expr, else_branch: el.expr }),
+        room,
       )
     },
     EMatch(m) -> {
@@ -873,20 +877,24 @@ fn ret(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
         m.arms,
         { state: state, arms: [] },
         |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
-          let b = ret(acc.state, arm.body);
+          let b = ret(acc.state, arm.body, room);
           {
             state: b.state,
             arms: push(acc.arms, { pat: arm.pat, guard: arm.guard, body: b.expr, span: arm.span }),
           }
         },
       );
-      region_cond(arms.state, EMatch({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }))
+      region_cond(
+        arms.state,
+        EMatch({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }),
+        room,
+      )
     },
-    _ -> region_cond(state, expr),
+    _ -> region_cond(state, expr, room),
   }
 
 // A block in return position: split at the first statement a `?` can be lifted from.
-fn block(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
+fn block(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
   match expr {
     EBlock(b) -> {
       let split = fold(
@@ -894,7 +902,7 @@ fn block(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
         { state: state, stmts: b.stmts, tail: b.tail, done: false },
         |acc: { state: TryState, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
           if acc.done { acc } else {
-            let o = split_at(acc.state, acc.stmts, acc.tail, i);
+            let o = split_at(acc.state, acc.stmts, acc.tail, i, at(b.stmts, i), room);
             match o.split {
               None -> { state: o.state, stmts: o.stmts, tail: acc.tail, done: false },
               Some(t) -> { state: o.state, stmts: take(o.stmts, i), tail: Some(t), done: true },
@@ -904,11 +912,11 @@ fn block(state: TryState, expr: Expr) -> TryOut / {abort.raise} =
       if split.done {
         { state: split.state, expr: EBlock({ span: b.span, tail: split.tail, stmts: split.stmts }) }
       } else {
-        match split.tail {
+        match b.tail {
           None ->
             { state: split.state, expr: EBlock({ span: b.span, tail: None, stmts: split.stmts }) },
           Some(t) -> {
-            let o = ret(split.state, t);
+            let o = ret(split.state, t, room);
             {
               state: o.state,
               expr: EBlock({ span: b.span, tail: Some(o.expr), stmts: split.stmts }),
@@ -926,14 +934,16 @@ type Taken = {
   take: Option<{ operand: Expr, at: Span, pat: Pattern, consumes: Bool }>,
 }
 
+// `st` is `stmts`' `i`th as written: only the ones before it are rewritten yet.
 fn split_at(
   state: TryState,
   stmts: List<Stmt>,
   tail: Option<Expr>,
   i: Int,
+  st: Stmt,
+  room: Int,
 ) -> { state: TryState, stmts: List<Stmt>, split: Option<Expr> } / {abort.raise} = {
-  let st = at(stmts, i);
-  let taken = take_stmt(state, st);
+  let taken = take_stmt(state, st, room);
   match taken.take {
     None -> { state: taken.state, stmts: set_at(stmts, i, taken.stmt), split: None },
     Some(t) -> {
@@ -941,14 +951,14 @@ fn split_at(
       let rest = drop(kept, if t.consumes { i + 1 } else { i });
       // A consumed statement goes: its binder is now the success arm's pattern.
       let body0 = EBlock({ span: t.at, tail: tail, stmts: rest });
-      let body = block(taken.state, body0);
+      let body = if room <= 0 { panic(lifted_past()) } else { block(taken.state, body0, room - 1) };
       let w = wrap(body.state, t.operand, t.at, t.pat, body.expr);
       { state: w.state, stmts: kept, split: Some(w.expr) }
     },
   }
 }
 
-fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
+fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
   match stmt {
     // Never consumed, since its pattern is not the success arm's. Its `else` block is the block's
     // value, so it is a return position: expanded once, when no `?` is left in the initializer.
@@ -990,7 +1000,7 @@ fn take_stmt(state: TryState, stmt: Stmt) -> Taken / {abort.raise} =
               }),
             },
           _ -> {
-            let f = ret(o.state, l.fallback);
+            let f = ret(o.state, l.fallback, room);
             { state: f.state, stmt: SLetElse({ ..l, fallback: f.expr }), take: None }
           },
         }
@@ -1125,8 +1135,21 @@ fn sweep(
   expr: Expr,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-) -> TryOut / {abort.raise} = {
-  let refused = match expr {
+) -> TryOut / {abort.raise} =
+  sweep_within(state, expr, scope, barrier, count_in(expr, typed_lambda))
+
+fn typed_lambda(e: Expr) -> Bool = match e { ELambda(l) -> l.ret != None, _ -> false }
+
+// `room` is how many lambdas with a written return type are left to sweep: the body of one is swept
+// after `ret` rewrites it, which copies no lambda.
+fn sweep_within(
+  state: TryState,
+  expr: Expr,
+  scope: Option<Bytes>,
+  barrier: Option<Bytes>,
+  room: Int,
+) -> TryOut / {abort.raise} =
+  match expr {
     ETry(t) -> {
       let d = match barrier {
         Some(what) ->
@@ -1164,36 +1187,35 @@ fn sweep(
             ),
         },
       };
-      { state: { ..state, diags: push(state.diags, d) }, expr: t.operand }
+      sweep_inner({ ..state, diags: push(state.diags, d) }, t.operand, scope, barrier, room)
     },
-    _ -> { state: state, expr: expr },
-  };
-  sweep_inner(refused.state, refused.expr, scope, barrier)
-}
+    _ -> sweep_inner(state, expr, scope, barrier, room),
+  }
 
 fn sweep_inner(
   state: TryState,
   expr: Expr,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
+  room: Int,
 ) -> TryOut / {abort.raise} =
   match expr {
     ETry(t) -> {
-      let o = sweep(state, t.operand, scope, barrier);
+      let o = sweep_within(state, t.operand, scope, barrier, room);
       { state: o.state, expr: ETry({ span: t.span, operand: o.expr }) }
     },
     EBinary(b) -> {
-      let l = sweep(state, b.lhs, scope, barrier);
-      let r = sweep(l.state, b.rhs, scope, barrier);
+      let l = sweep_within(state, b.lhs, scope, barrier, room);
+      let r = sweep_within(l.state, b.rhs, scope, barrier, room);
       { state: r.state, expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: r.expr }) }
     },
     EUnary(u) -> {
-      let o = sweep(state, u.operand, scope, barrier);
+      let o = sweep_within(state, u.operand, scope, barrier, room);
       { state: o.state, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
     },
     ELambda(l) -> match l.ret {
       None -> {
-        let o = sweep(state, l.body, scope, under(barrier, b"a lambda"));
+        let o = sweep_within(state, l.body, scope, under(barrier, b"a lambda"), room);
         {
           state: o.state,
           expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: None }),
@@ -1201,7 +1223,7 @@ fn sweep_inner(
       },
       Some(ty) -> match mode_for(state, Some(ty)) {
         Err(why) -> {
-          let o = sweep(state, l.body, Some(why), None);
+          let o = sweep_within(state, l.body, Some(why), None, room);
           {
             state: o.state,
             expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: Some(ty) }),
@@ -1209,8 +1231,9 @@ fn sweep_inner(
         },
         Ok(m) -> {
           let saved = state.mode;
-          let r = ret({ ..state, mode: Some(m) }, l.body);
-          let s: TryOut = sweep(r.state, r.expr, None, None);
+          let r = ret({ ..state, mode: Some(m) }, l.body, tries_in(l.body));
+          let s: TryOut = if room <= 0 { panic("a lambda swept past the ones written") }
+          else { sweep_within(r.state, r.expr, None, None, room - 1) };
           {
             state: { ..s.state, mode: saved },
             expr: ELambda({ span: l.span, body: s.expr, params: l.params, ret: Some(ty) }),
@@ -1219,13 +1242,13 @@ fn sweep_inner(
       },
     },
     EApp(a) -> {
-      let f = sweep(state, a.func, scope, barrier);
-      let args = sweep_all(f.state, a.args, scope, barrier);
+      let f = sweep_within(state, a.func, scope, barrier, room);
+      let args = sweep_all(f.state, a.args, scope, barrier, room);
       let named = fold(
         a.named,
         { state: args.state, args: [] },
         |acc: { state: TryState, args: List<NamedArg> }, arg: NamedArg| {
-          let o = sweep(acc.state, arg.value, scope, barrier);
+          let o = sweep_within(acc.state, arg.value, scope, barrier, room);
           {
             state: o.state,
             args: push(acc.args, { name: arg.name, value: o.expr, span: arg.span }),
@@ -1244,16 +1267,16 @@ fn sweep_inner(
       }
     },
     EIf(i) -> {
-      let c = sweep(state, i.cond, scope, barrier);
-      let t = sweep(c.state, i.then_branch, scope, barrier);
-      let el = sweep(t.state, i.else_branch, scope, barrier);
+      let c = sweep_within(state, i.cond, scope, barrier, room);
+      let t = sweep_within(c.state, i.then_branch, scope, barrier, room);
+      let el = sweep_within(t.state, i.else_branch, scope, barrier, room);
       {
         state: el.state,
         expr: EIf({ span: i.span, cond: c.expr, then_branch: t.expr, else_branch: el.expr }),
       }
     },
     EMatch(m) -> {
-      let sc = sweep(state, m.scrutinee, scope, barrier);
+      let sc = sweep_within(state, m.scrutinee, scope, barrier, room);
       let arms = fold(
         m.arms,
         { state: sc.state, arms: [] },
@@ -1261,11 +1284,11 @@ fn sweep_inner(
           let g = match arm.guard {
             None -> { state: acc.state, expr: None },
             Some(x) -> {
-              let o = sweep(acc.state, x, scope, barrier);
+              let o = sweep_within(acc.state, x, scope, barrier, room);
               { state: o.state, expr: Some(o.expr) }
             },
           };
-          let b = sweep(g.state, arm.body, scope, barrier);
+          let b = sweep_within(g.state, arm.body, scope, barrier, room);
           {
             state: b.state,
             arms: push(acc.arms, { pat: arm.pat, guard: g.expr, body: b.expr, span: arm.span }),
@@ -1281,22 +1304,22 @@ fn sweep_inner(
         |acc: { state: TryState, stmts: List<Stmt> }, stmt: Stmt|
           match stmt {
             SLet(l) -> {
-              let o = sweep(acc.state, l.value, scope, barrier);
+              let o = sweep_within(acc.state, l.value, scope, barrier, room);
               {
                 state: o.state,
                 stmts: push(acc.stmts, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr })),
               }
             },
             SLetElse(l) -> {
-              let v = sweep(acc.state, l.value, scope, barrier);
-              let f = sweep(v.state, l.fallback, scope, barrier);
+              let v = sweep_within(acc.state, l.value, scope, barrier, room);
+              let f = sweep_within(v.state, l.fallback, scope, barrier, room);
               {
                 state: f.state,
                 stmts: push(acc.stmts, SLetElse({ ..l, value: v.expr, fallback: f.expr })),
               }
             },
             SExpr(x) -> {
-              let o = sweep(acc.state, x, scope, barrier);
+              let o = sweep_within(acc.state, x, scope, barrier, room);
               { state: o.state, stmts: push(acc.stmts, SExpr(o.expr)) }
             },
           },
@@ -1304,43 +1327,49 @@ fn sweep_inner(
       let tl = match b.tail {
         None -> { state: stmts.state, expr: None },
         Some(t) -> {
-          let o = sweep(stmts.state, t, scope, barrier);
+          let o = sweep_within(stmts.state, t, scope, barrier, room);
           { state: o.state, expr: Some(o.expr) }
         },
       };
       { state: tl.state, expr: EBlock({ span: b.span, tail: tl.expr, stmts: stmts.stmts }) }
     },
     ERecord(r) -> {
-      let o = sweep_fields(state, r.fields, scope, barrier);
+      let o = sweep_fields(state, r.fields, scope, barrier, room);
       { state: o.state, expr: ERecord({ span: r.span, fields: o.fields }) }
     },
     ERecordUpdate(r) -> {
-      let b = sweep(state, r.base, scope, barrier);
-      let o = sweep_fields(b.state, r.fields, scope, barrier);
+      let b = sweep_within(state, r.base, scope, barrier, room);
+      let o = sweep_fields(b.state, r.fields, scope, barrier, room);
       { state: o.state, expr: ERecordUpdate({ span: r.span, base: b.expr, fields: o.fields }) }
     },
     EField(f) -> {
-      let o = sweep(state, f.base, scope, barrier);
+      let o = sweep_within(state, f.base, scope, barrier, room);
       { state: o.state, expr: EField({ span: f.span, base: o.expr, field: f.field }) }
     },
     EList(l) -> {
-      let o = sweep_all(state, l.items, scope, barrier);
+      let o = sweep_all(state, l.items, scope, barrier, room);
       { state: o.state, expr: EList({ span: l.span, items: o.exprs }) }
     },
     EPerform(p) -> {
-      let o = sweep_all(state, p.args, scope, barrier);
+      let o = sweep_all(state, p.args, scope, barrier, room);
       {
         state: o.state,
         expr: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.exprs }),
       }
     },
     EHandle(h) -> {
-      let b = sweep(state, h.body, scope, under(barrier, b"a `handle` body"));
+      let b = sweep_within(state, h.body, scope, under(barrier, b"a `handle` body"), room);
       let cs = fold(
         h.clauses,
         { state: b.state, clauses: [] },
         |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
-          let o = sweep(acc.state, c.body, scope, under(barrier, b"a `handle` clause"));
+          let o = sweep_within(
+            acc.state,
+            c.body,
+            scope,
+            under(barrier, b"a `handle` clause"),
+            room,
+          );
           {
             state: o.state,
             clauses: push(acc.clauses, {
@@ -1360,7 +1389,13 @@ fn sweep_inner(
       let r = match h.ret {
         None -> { state: cs.state, ret: None },
         Some(rc) -> {
-          let o = sweep(cs.state, rc.body, scope, under(barrier, b"a `handle` return clause"));
+          let o = sweep_within(
+            cs.state,
+            rc.body,
+            scope,
+            under(barrier, b"a `handle` return clause"),
+            room,
+          );
           { state: o.state, ret: Some({ binder: rc.binder, body: o.expr, span: rc.span }) }
         },
       };
@@ -1370,8 +1405,8 @@ fn sweep_inner(
       }
     },
     EWithCell(c) -> {
-      let i = sweep(state, c.init, scope, barrier);
-      let b = sweep(i.state, c.body, scope, under(barrier, b"a `with_cell` body"));
+      let i = sweep_within(state, c.init, scope, barrier, room);
+      let b = sweep_within(i.state, c.body, scope, under(barrier, b"a `with_cell` body"), room);
       {
         state: b.state,
         expr: EWithCell({
@@ -1384,11 +1419,11 @@ fn sweep_inner(
       }
     },
     ESimulate(x) -> {
-      let o = sweep(state, x.body, scope, under(barrier, b"a `simulate` body"));
+      let o = sweep_within(state, x.body, scope, under(barrier, b"a `simulate` body"), room);
       { state: o.state, expr: ESimulate({ span: x.span, body: o.expr }) }
     },
     EParallel(x) -> {
-      let o = sweep_all(state, x.branches, scope, under(barrier, b"a `parallel` branch"));
+      let o = sweep_all(state, x.branches, scope, under(barrier, b"a `parallel` branch"), room);
       { state: o.state, expr: EParallel({ span: x.span, branches: o.exprs }) }
     },
     _ -> { state: state, expr: expr },
@@ -1399,12 +1434,13 @@ fn sweep_all(
   exprs: List<Expr>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
+  room: Int,
 ) -> { state: TryState, exprs: List<Expr> } / {abort.raise} =
   fold(
     exprs,
     { state: state, exprs: [] },
     |acc: { state: TryState, exprs: List<Expr> }, expr: Expr| {
-      let o = sweep(acc.state, expr, scope, barrier);
+      let o = sweep_within(acc.state, expr, scope, barrier, room);
       { state: o.state, exprs: push(acc.exprs, o.expr) }
     },
   )
@@ -1414,12 +1450,13 @@ fn sweep_fields(
   fields: List<RecField>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
+  room: Int,
 ) -> { state: TryState, fields: List<RecField> } / {abort.raise} =
   fold(
     fields,
     { state: state, fields: [] },
     |acc: { state: TryState, fields: List<RecField> }, field: RecField| {
-      let o = sweep(acc.state, field.value, scope, barrier);
+      let o = sweep_within(acc.state, field.value, scope, barrier, room);
       { state: o.state, fields: push(acc.fields, { name: field.name, value: o.expr }) }
     },
   )
@@ -1453,7 +1490,7 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
       let body = match mode_for(state, d.ret) {
         Err(why) -> sweep(measured.state, d.body, Some(why), None),
         Ok(m) -> {
-          let r = ret({ ..measured.state, mode: Some(m) }, d.body);
+          let r = ret({ ..measured.state, mode: Some(m) }, d.body, tries_in(d.body));
           let s: TryOut = sweep(r.state, r.expr, None, None);
           { state: { ..s.state, mode: None }, expr: s.expr }
         },
@@ -1557,58 +1594,61 @@ fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
     acc
       || (match item {
         IFn(d) ->
-          any_in(d.body, p)
-            || fold(d.spec, false, |b: Bool, clause: SpecClause| b || any_in(clause.expr, p))
+          count_in(d.body, p) > 0
+            || fold(d.spec, false, |b: Bool, clause: SpecClause| b || count_in(clause.expr, p) > 0)
             || fold(d.params, false, |b: Bool, param: Param|
-              b || (match param.default { None -> false, Some(v) -> any_in(v, p) })),
-        ITest(d) -> any_in(d.body, p),
-        ILaw(d) -> any_in(d.body, p) || (match d.guard { None -> false, Some(g) -> any_in(g, p) }),
+              b || (match param.default { None -> false, Some(v) -> count_in(v, p) > 0 })),
+        ITest(d) -> count_in(d.body, p) > 0,
+        ILaw(d) ->
+          count_in(d.body, p) > 0
+            || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
         _ -> false,
       }))
 
-fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
-  p(e)
-    || (match e {
-      EBinary(b) -> any_in(b.lhs, p) || any_in(b.rhs, p),
-      EUnary(u) -> any_in(u.operand, p),
+// How many expressions within `e`, itself included, `p` holds for.
+fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
+  let all = |es: List<Expr>| fold(es, 0, |n: Int, x: Expr| n + count_in(x, p));
+  let maybe = |o: Option<Expr>| match o { None -> 0, Some(x) -> count_in(x, p) };
+  (if p(e) { 1 } else { 0 })
+    + (match e {
+      EBinary(b) -> count_in(b.lhs, p) + count_in(b.rhs, p),
+      EUnary(u) -> count_in(u.operand, p),
       ELambda(l) ->
-        any_in(l.body, p)
-          || fold(l.params, false, |b: Bool, x: Param|
-            b || (match x.default { None -> false, Some(v) -> any_in(v, p) })),
+        count_in(l.body, p) + fold(l.params, 0, |n: Int, x: Param| n + maybe(x.default)),
       EApp(a) ->
-        any_in(a.func, p) || fold(a.args, false, |b: Bool, x: Expr| b || any_in(x, p))
-          || fold(a.named, false, |b: Bool, arg: NamedArg| b || any_in(arg.value, p)),
-      EIf(i) -> any_in(i.cond, p) || any_in(i.then_branch, p) || any_in(i.else_branch, p),
+        count_in(a.func, p) + all(a.args)
+          + fold(a.named, 0, |n: Int, arg: NamedArg| n + count_in(arg.value, p)),
+      EIf(i) -> count_in(i.cond, p) + count_in(i.then_branch, p) + count_in(i.else_branch, p),
       EMatch(m) ->
-        any_in(m.scrutinee, p)
-          || fold(m.arms, false, |b: Bool, arm: MatchArm|
-            b || any_in(arm.body, p)
-              || (match arm.guard { None -> false, Some(g) -> any_in(g, p) })),
+        count_in(m.scrutinee, p)
+          + fold(m.arms, 0, |n: Int, arm: MatchArm| n + count_in(arm.body, p) + maybe(arm.guard)),
       EBlock(b) ->
-        fold(b.stmts, false, |acc: Bool, stmt: Stmt|
-            acc
-              || (match stmt {
-                SLet(l) -> any_in(l.value, p),
-                SLetElse(l) -> any_in(l.value, p) || any_in(l.fallback, p),
-                SExpr(x) -> any_in(x, p),
+        fold(b.stmts, 0, |n: Int, stmt: Stmt|
+            n
+              + (match stmt {
+                SLet(l) -> count_in(l.value, p),
+                SLetElse(l) -> count_in(l.value, p) + count_in(l.fallback, p),
+                SExpr(x) -> count_in(x, p),
               }))
-          || (match b.tail { None -> false, Some(t) -> any_in(t, p) }),
-      ERecord(r) -> fold(r.fields, false, |b: Bool, f: RecField| b || any_in(f.value, p)),
+          + maybe(b.tail),
+      ERecord(r) -> fold(r.fields, 0, |n: Int, f: RecField| n + count_in(f.value, p)),
       ERecordUpdate(r) ->
-        any_in(r.base, p) || fold(r.fields, false, |b: Bool, f: RecField| b || any_in(f.value, p)),
-      ETry(t) -> any_in(t.operand, p),
-      EField(f) -> any_in(f.base, p),
-      EList(l) -> fold(l.items, false, |b: Bool, x: Expr| b || any_in(x, p)),
-      EPerform(x) -> fold(x.args, false, |b: Bool, y: Expr| b || any_in(y, p)),
+        count_in(r.base, p) + fold(r.fields, 0, |n: Int, f: RecField| n + count_in(f.value, p)),
+      ETry(t) -> count_in(t.operand, p),
+      EField(f) -> count_in(f.base, p),
+      EList(l) -> all(l.items),
+      EPerform(x) -> all(x.args),
       EHandle(h) ->
-        any_in(h.body, p)
-          || fold(h.clauses, false, |b: Bool, c: HandleClause| b || any_in(c.body, p))
-          || (match h.ret { None -> false, Some(rc) -> any_in(rc.body, p) }),
-      EWithCell(c) -> any_in(c.init, p) || any_in(c.body, p),
-      ESimulate(x) -> any_in(x.body, p),
-      EParallel(x) -> fold(x.branches, false, |b: Bool, y: Expr| b || any_in(y, p)),
-      _ -> false,
+        count_in(h.body, p) + fold(h.clauses, 0, |n: Int, c: HandleClause| n + count_in(c.body, p))
+          + (match h.ret { None -> 0, Some(rc) -> count_in(rc.body, p) }),
+      EWithCell(c) -> count_in(c.init, p) + count_in(c.body, p),
+      ESimulate(x) -> count_in(x.body, p),
+      EParallel(x) -> all(x.branches),
+      _ -> 0,
     })
+}
+
+fn tries_in(e: Expr) -> Int = count_in(e, |x: Expr| match x { ETry(_) -> true, _ -> false })
 
 // --- The cost law ----------------------------------------------------------------------------
 
