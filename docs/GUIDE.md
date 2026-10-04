@@ -66,8 +66,11 @@ definitions that analyse a program and file the answer hash as they did, and a
 pass or a discharged obligation only by one whose runtime is the same and whose
 definitions that make a unit and decide a verdict hash as they did: another
 build files them again (`W0603`), and an upstream answers only builds of its
-runtime. A hash covers what its definition reaches and no comment or layout
-(§8.2), so the rest of `ply`, its other commands among it, is in neither. A dependency's own
+runtime. A pass is filed as well under the code its test compiled to, believed by a build
+whose runtime and definitions that run a test and file its pass hash as they did,
+so a compiler change that leaves a test's code as it was does not run it again.
+A hash covers what its definition reaches and no comment or
+layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
@@ -311,8 +314,9 @@ root package squatting on a dependency's prefix — and a cycle of packages is
 package root: `rev` may be a commit, a tag or a branch, and a branch means what
 it means the day it is fetched — the fetched tree is reused without asking the
 remote again, so a cleared cache is what picks up a moved branch, and `ply.lock`'s
-digest is what catches it when that happens. A fetch that git cannot do is
-`E0140`.
+digest is what catches it when that happens. The fetch runs the `git` on
+`PATH`, with the run's own environment. A fetch that git cannot do, or a run
+with no `git` to do it, leaves a dependency that was not fetched (`E0135`).
 
 A `Registry` dependency is the package of that `name` from the registry
 `PLY_REGISTRY` names (§15.1), at least `min`; its `name` must be a package name
@@ -1227,10 +1231,12 @@ A cost law (§10) states how `steps` grows with a size instead of pinning it.
 
 A definition's hash covers its normalized form: names, comments, formatting,
 imports, `pub`, specs and test labels are erased, and references are replaced by
-their referent's hash. A test runs exactly when its hash has no recorded pass,
-so renames and comment edits run nothing. `ply hash` prints the hashes.
+their referent's hash. A test runs exactly when neither its hash nor the code it compiles to has a
+recorded pass, so renames and comment edits run nothing, and neither does an edit or a new `ply`
+that compiles a test to the same code; the selection line counts those `by code` (`by_code` in
+`--json`, reason `same code`). `ply hash` prints the hashes.
 `--explain` says why each test was selected, what a pass is filed under (the
-test's hash and the runtime stamp, `filed_under` in `--json`), which of a test's
+test's hash and the runtime stamp, `filed_under` in `--json`, and the code it ran), which of a test's
 atoms are answers this binary gives from what it ships (`shipped`), which no key
 covers (`unkeyed`), and where the run's time went, phase by phase from the
 process's start (`phases` in the `--json` report);
@@ -1310,12 +1316,13 @@ rather than raised.
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
 | `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, and the cost checker's report on a program, kept under the checker's hash and the program's text (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's committed builder or `ply` program is behind its sources, the one the builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
-| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, and allocation counts |
+| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, and allocation counts by kind |
+| `PLY_HEAP_CENSUS=1` | count allocations by constructor, record shape and length class as well, which `PLY_C_PHASES` then prints; a map insert per allocation |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 
@@ -1596,8 +1603,11 @@ In scope everywhere; a module may shadow any except `compare_values` and
 `map_of_entries`, which the map and set literals are written in (`E0105`).
 Out-of-range indexes and slices raise (§6.8) unless noted; nothing is clamped, and
 a builtin that can raise carries `abort.raise` in its row.
-`ply doc NAME` prints any of these from the compiler's own table, which is the
-authority when this page and it disagree.
+Each is declared in the compiler's prelude as an `extern fn`: a signature the
+runtime implements, with a row and a `where` like any other and no body.
+`ply doc NAME` prints any of these from that declaration, which is the
+authority when this page and it disagree. Only the prelude declares one; an
+`extern fn` in a module is `E0151`.
 
 ### 12.1 Core, lists and maps
 
@@ -2299,7 +2309,9 @@ The twin is `MemFs`, with a `mem_` function for every operation (`mem_read`,
 `mem_remove`, `mem_remove_tree`, `mem_rename`, `mem_symlink`, `mem_set_mode`,
 `mem_set_modified`, `mem_sync`, `mem_lock`, `mem_unlock`) and `mem_empty` and
 `mem_of` to start one. It follows a symlink where the host does, a chain of more
-than forty being a loop that names nothing. It holds its owner to a path's
+than forty being a loop that names nothing, and it refuses a path that leaves
+its root as the host does, raising with `E0452`'s words, so a test over the twin
+fails where the same code fails on a disk. It holds its owner to a path's
 owner bits, a fresh file being `rw-r--r--` and a fresh directory `rwxr-xr-x`, so
 a test can make a file unreadable. It has no wall clock, so no lock in it goes
 stale and `mem_temp_dir` names a directory from its prefix and the tree's own
@@ -2828,6 +2840,8 @@ the greatest `k` with `pow(2, k) <= n`, `0` at and below one.
 ```ply
 pub fn first<a>(xs: List<a>) -> Option<a>
 pub fn last<a>(xs: List<a>) -> Option<a>
+pub fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise}
+pub fn at_or<a>(xs: List<a>, i: Int, spare: a) -> a
 pub fn take<a>(xs: List<a>, n: Int) -> List<a>
 pub fn drop<a>(xs: List<a>, n: Int) -> List<a>
 pub fn reverse<a>(xs: List<a>) -> List<a>
@@ -2861,20 +2875,21 @@ and `list_at` — and not the wholes. A `List` is a vector, not a linked list: t
 cheap end is the back, `push` appends and nothing prepends, so every function
 here folds left to right and appends, which is one pass and linear. That is why
 building the same list from the front is a shape to avoid in Ply as well: it
-copies the accumulator every step and is quadratic. `take` and `drop` are the two
-halves of a list (`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks its
+copies the accumulator every step and is quadratic. `at` is the element at an
+index and raises for an index the list does not hold; `at_or` answers a spare
+there instead, and `list_at` an `Option`. `take` and `drop` are the two halves
+of a list (`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks its
 index down while it appends, and `sort` is a merge sort — `n log n` comparisons
 whatever the input order is, and equal elements keep their relative order.
 `sort_by` is the same sort under a caller's `before`, which is how a key sort is
 written. `find` and `find_index` keep the first answer a scan meets. A callback
 may perform effects, as the prelude's `map` and `fold` allow: one given an
 element runs in list order, and `any`, `all`, `find` and `find_index` stop
-calling theirs once the answer is known. `partition`,
-`split_at` and `chunks` divide one list into others and keep the order;
-`flatten` is `flat_map` of the identity, `intersperse` puts its separator
-between the elements, and `unique` keeps each element's first occurrence — its
-membership test is a map's, so it is `n log n` rather than the `n²` a scan
-through the output would be.
+calling theirs once the answer is known. `partition`, `split_at` and `chunks`
+divide one list into others and keep the order; `flatten` is `flat_map` of the
+identity, `intersperse` puts its separator between the elements, and `unique`
+keeps each element's first occurrence — its membership test is a map's, so it is
+`n log n` rather than the `n²` a scan through the output would be.
 
 ### 13.30 `std.map`
 
@@ -3196,7 +3211,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `hosts` (`tcb`), `edit` or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3464,12 +3479,14 @@ definition, the emitter and the runtime are the ones it was made by, and the
 machine compiles the C it is handed and loads it. The launcher enters `ply`
 from a runnable — its front end's answer, its sources and its unit's C, which
 reading runs no compiler: the committed one when it was built from the
-binary's own sources, else one the builder made of them for an earlier run.
+binary's own sources, else one a builder made of them for an earlier run, or
+makes now.
 The builder is the compiler's own `build.main`, entered the same way: it
 checks a program's sources, seeded with the rows its last build of that program
 kept, emits its unit with the emitter's answers kept, and writes the runnable.
-A builder behind the shelf the binary ships first builds the shelf's, keeping
-no answers, since its emitter is not the one they would be filed under. `ply std`
+The committed builder builds `ply`, so each build reads back what the ones
+before it kept; where `ply`'s sources need a rule that builder lacks, it builds
+the builder of the binary's own compiler first, and that one builds `ply`. `ply std`
 needs no project: it reads the shipped modules off a second, read-only root.
 `--count-allocs=PATH` is the launcher's own flag rather than the program's: it is
 taken out of the line before the program parses it, and the run writes what the
@@ -3488,7 +3505,7 @@ An allocation with no `ply_*` frame on its stack is counted under the site
 `<no ply frame>`.
 What a host may lend is a policy with names, one family each:
 `machine` (load, bind, enter and call a nested program), `tester`, `claims`,
-`builder`, `hosts`, `edit` and `shipped`, each with a summary a
+`hosts` and `shipped`, each with a summary a
 reviewer can read. The launcher lends its own program every family; another host
 names the ones it means, so `machine` — which drives another machine — is
 granted on purpose and not by accident. A program lent `machine` hands it a
@@ -3654,7 +3671,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0137` | one package reached at two places, where a closure pins one version |
 | `E0138` | a dependency whose sources are not what `ply.lock` pinned |
 | `E0139` | a `ply.lock` that does not decode or is from another format |
-| `E0140` | a git dependency that could not be fetched |
 | `E0141` | a registry that could not be asked: unset, malformed or not answering |
 | `E0142` | a registry archive that is not the one the lock pins or the index lists |
 | `E0143` | a registry dependency no published version satisfies |
@@ -3665,6 +3681,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0148` | a `returns` clause the body does not keep |
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
+| `E0151` | an `extern fn` outside the prelude |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -3755,7 +3772,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 * No loops, `break` or `return` (`?` is the only early exit, and `abort.raise`
   the only one past the caller, §6.8); no mutable variables; no exceptions
   outside the row; no typeclasses, implicits or method syntax; no
-  modules-as-values or first-class effects; no `unsafe` or FFI.
+  modules-as-values or first-class effects; no `unsafe` or FFI: what a program
+  reaches outside itself is an effect a handler answers, and the builtins are the
+  only functions the runtime implements (§12).
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads; only a `parallel` block's branches run on threads
   of the runtime's own.

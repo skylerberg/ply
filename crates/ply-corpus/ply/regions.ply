@@ -20,6 +20,7 @@ import std.json
 import std.fs (fs)
 import std.process (process)
 import std.config (config)
+import std.list (at_or)
 
 // One test as the colourings see it: the atoms another test could contend over (the footprint minus
 // the inputs only this test is handed), whether it was handed one, and what it took on one worker.
@@ -103,12 +104,10 @@ pub fn colour(
 
 // --- The wall-clock model ----------------------------------------------------------------
 
-fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
-
 // The worker a test is handed to: the first of the least loaded.
 fn least(free: List<Int>) -> Int =
   fold(range(0, len(free)), 0, |best: Int, i: Int|
-    if at(free, i, 0) < at(free, best, 0) { i } else { best })
+    if at_or(free, i, 0) < at_or(free, best, 0) { i } else { best })
 
 // Wall clock for a schedule as the runner executes it: classes in turn, each on `jobs` workers (one
 // per test at 0), every worker starting at `setup`.
@@ -123,7 +122,7 @@ pub fn makespan(groups: List<List<Int>>, us: Map<Int, Int>, jobs: Int, setup: In
           let slot = least(free);
           let cost = match map_get(us, index) { Some(c) -> c, None -> 0 };
           map(range(0, len(free)), |w: Int|
-            if w == slot { at(free, w, 0) + cost } else { at(free, w, 0) })
+            if w == slot { at_or(free, w, 0) + cost } else { at_or(free, w, 0) })
         },
       );
       total + fold(free, 0, |m: Int, f: Int| max(m, f))
@@ -134,7 +133,7 @@ fn split(groups: List<List<Int>>, us: Map<Int, Int>, jobs: Int, setup: Int) -> S
     groups: len(groups),
     largest_group: fold(groups, 0, |m: Int, g: List<Int>| max(m, len(g))),
     after_the_first_group: fold(range(1, len(groups)), 0, |n: Int, i: Int|
-      n + len(at(groups, i, []))),
+      n + len(at_or(groups, i, []))),
     makespan_us: makespan(groups, us, jobs, setup),
     critical_path_us: makespan(groups, us, 0, setup),
     sequential_us: makespan(
@@ -165,24 +164,24 @@ fn newly_serialized(tests: List<Test>) -> List<Newly> =
       }
     })
 
-pub fn analyse(c: Corpus, jobs: Int) -> Cost / {abort.raise} = {
-  let us = fold(c.tests, map_new(), |m: Map<Int, Int>, t: Test| map_insert(m, t.index, t.us));
-  let forked_groups = colour(c.tests, forked);
-  let region_groups = colour(c.tests, in_regions);
-  let isolated = len(filter(c.tests, world_isolated));
-  let pure = len(filter(c.tests, is_pure));
-  let world_backed = len(filter(c.tests, isolated_by_forking));
+pub fn analyse(corpus: Corpus, jobs: Int) -> Cost / {abort.raise} = {
+  let us = fold(corpus.tests, map_new(), |m: Map<Int, Int>, t: Test| map_insert(m, t.index, t.us));
+  let forked_groups = colour(corpus.tests, forked);
+  let region_groups = colour(corpus.tests, in_regions);
+  let isolated = len(filter(corpus.tests, world_isolated));
+  let pure = len(filter(corpus.tests, is_pure));
+  let world_backed = len(filter(corpus.tests, isolated_by_forking));
   {
-    root: c.root,
+    root: corpus.root,
     jobs: jobs,
-    tests: len(c.tests),
+    tests: len(corpus.tests),
     isolated: isolated,
     pure: pure,
     seeded: isolated - pure - world_backed,
     world_backed: world_backed,
-    newly: newly_serialized(c.tests),
-    forked: split(forked_groups, us, jobs, c.setup_us),
-    regions: split(region_groups, us, jobs, c.setup_us),
+    newly: newly_serialized(corpus.tests),
+    forked: split(forked_groups, us, jobs, corpus.setup_us),
+    regions: split(region_groups, us, jobs, corpus.setup_us),
     region_groups: region_groups,
   }
 }
@@ -418,7 +417,7 @@ fn measured(
 
 fn criterion() -> report::Criterion = AtMost("newly_serialized", 0m)
 
-pub fn cost_measurements(cost: Cost, c: Corpus) -> List<Measurement> / {abort.raise} = {
+pub fn cost_measurements(cost: Cost, corpus: Corpus) -> List<Measurement> / {abort.raise} = {
   let modelled = [
     number("tests", cost.tests, "tests"),
     number("isolated", cost.isolated, "tests"),
@@ -435,13 +434,13 @@ pub fn cost_measurements(cost: Cost, c: Corpus) -> List<Measurement> / {abort.ra
     exact("ratio", ratio(cost), "×"),
     ms_of_us("critical_forked", cost.forked.critical_path_us),
     ms_of_us("critical_regions", cost.regions.critical_path_us),
-    ms_of_us("setup", c.setup_us),
+    ms_of_us("setup", corpus.setup_us),
   ];
-  match c.suite_us {
+  match corpus.suite_us {
     None -> modelled,
     Some(suite) -> {
       let timed = push(modelled, ms_of_us("suite", suite));
-      let with_sequential = match c.sequential_us {
+      let with_sequential = match corpus.sequential_us {
         Some(s) -> push(timed, ms_of_us("sequential", s)),
         None -> timed,
       };
@@ -468,8 +467,8 @@ pub fn cost_measurements(cost: Cost, c: Corpus) -> List<Measurement> / {abort.ra
 
 // The effects that reach any test's footprint: the contended ones, and the seed a simulated one is
 // handed.
-pub fn effects_present(c: Corpus) -> List<String> = {
-  let names = fold(c.tests, map_new(), |m: Map<String, Bool>, t: Test| {
+pub fn effects_present(corpus: Corpus) -> List<String> = {
+  let names = fold(corpus.tests, map_new(), |m: Map<String, Bool>, t: Test| {
     let with_atoms = fold(t.contends, m, |inner: Map<String, Bool>, a: Atom|
       map_insert(inner, a.effect, true));
     if t.seeded {
@@ -480,9 +479,9 @@ pub fn effects_present(c: Corpus) -> List<String> = {
   map_keys(names)
 }
 
-fn cost_detail(cost: Cost, c: Corpus) -> Json =
+fn cost_detail(cost: Cost, corpus: Corpus) -> Json =
   object([
-    { key: "effects", value: array(map(effects_present(c), |e: String| Str(e))) },
+    { key: "effects", value: array(map(effects_present(corpus), |e: String| Str(e))) },
     {
       key: "newly_serialized",
       value: array(
@@ -496,9 +495,12 @@ fn cost_detail(cost: Cost, c: Corpus) -> Json =
     },
   ])
 
-pub fn cost_row(c: Corpus, jobs: Int) -> Row / {abort.raise} = {
-  let cost = analyse(c, jobs);
-  { ..row(c.root, criterion(), cost_measurements(cost, c)), detail: cost_detail(cost, c) }
+pub fn cost_row(corpus: Corpus, jobs: Int) -> Row / {abort.raise} = {
+  let cost = analyse(corpus, jobs);
+  {
+    ..row(corpus.root, criterion(), cost_measurements(cost, corpus)),
+    detail: cost_detail(cost, corpus),
+  }
 }
 
 fn agreement_criterion() -> report::Criterion =
@@ -509,12 +511,12 @@ fn agreement_criterion() -> report::Criterion =
   )
 
 // The model's colouring against the runner's own: the one place the two could drift apart.
-pub fn agreement_row(c: Corpus) -> Row / {abort.raise} = {
-  let name = c.root ++ " colouring";
-  match c.runner {
+pub fn agreement_row(corpus: Corpus) -> Row / {abort.raise} = {
+  let name = corpus.root ++ " colouring";
+  match corpus.runner {
     None -> untaken(name, agreement_criterion(), "the runner coloured nothing"),
     Some(runner) -> {
-      let modelled = colour(c.tests, in_regions);
+      let modelled = colour(corpus.tests, in_regions);
       row(name, agreement_criterion(), [
         number("agrees", report::one_if(modelled == runner), ""),
         number("groups_regions", len(modelled), "groups"),
@@ -536,38 +538,42 @@ pub type Args = {
 // Every root measured and every hypothetical drawn, a row or two each, in the order they were asked
 // for.
 pub fn run(
-  a: Args,
+  args: Args,
 ) -> Result<report::Report, String> / {process.spawn[ply], config.get[env], fs.read[repo], abort.raise} = {
-  let roots = filter(a.roots, |r: String| r != "");
-  if len(roots) == 0 && len(a.hypothetical) == 0 {
+  let roots = filter(args.roots, |r: String| r != "");
+  if len(roots) == 0 && len(args.hypothetical) == 0 {
     Err("nothing to analyse: pass a project root or `--hypothetical cells:labels`")
   } else {
-    match fold(a.hypothetical, Ok([]), |acc: Result<List<Hypothetical>, String>, text: String|
-        match acc {
-          Err(e) -> Err(e),
-          Ok(done) -> match shape_of(text, a.hypothetical_shared, a.hypothetical_pure) {
+    match fold(
+        args.hypothetical,
+        Ok([]),
+        |acc: Result<List<Hypothetical>, String>, text: String|
+          match acc {
             Err(e) -> Err(e),
-            Ok(h) -> Ok(push(done, h)),
+            Ok(done) -> match shape_of(text, args.hypothetical_shared, args.hypothetical_pure) {
+              Err(e) -> Err(e),
+              Ok(h) -> Ok(push(done, h)),
+            },
           },
-        }) {
+      ) {
       Err(why) -> Err(why),
       Ok(shapes) -> {
         let measured_rows = fold(roots, [], |acc: List<Row>, root: String|
-          match measured(root, a.jobs, a.std) {
+          match measured(root, args.jobs, args.std) {
             Err(why) ->
               push(
                 push(acc, untaken(root, criterion(), why)),
                 untaken(root ++ " colouring", agreement_criterion(), why),
               ),
-            Ok(c) -> push(push(acc, cost_row(c, a.jobs)), agreement_row(c)),
+            Ok(c) -> push(push(acc, cost_row(c, args.jobs)), agreement_row(c)),
           });
-        let drawn_rows = map(shapes, |h: Hypothetical| cost_row(hypothetical(h), a.jobs));
+        let drawn_rows = map(shapes, |h: Hypothetical| cost_row(hypothetical(h), args.jobs));
         report::made(
           "regions",
-          "region isolation at " ++ int_to_string(a.jobs)
+          "region isolation at " ++ int_to_string(args.jobs)
             ++ " workers: the forkable world against the region model",
           fold(drawn_rows, measured_rows, |acc: List<Row>, r: Row| push(acc, r)),
-          [{ key: "jobs", value: Number(decimal_of_int(a.jobs)) }],
+          [{ key: "jobs", value: Number(decimal_of_int(args.jobs)) }],
         )
       },
     }

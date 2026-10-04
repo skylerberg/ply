@@ -2,9 +2,11 @@
 // reports in text and in JSON, how it schedules, the binding it runs under, and the search it
 // publishes.
 
-import harness (scratch, Ran, Server, in_memory, on_disk, speaking, next_line, stop, one, program,
-                project, write, stdout, stderr, said, json_of, at, path, nth, items, str, int,
-                truth, shown, concatenated, Here, Reached, Shelf, Spawned)
+import harness (scratch, Ran, Server, Source, in_memory, on_disk, on_disk_shipping, speaking,
+                next_line, stop, one, program, project, write, stdout, stderr, said, json_of, at,
+                path, nth, items, str, int, truth, shown, concatenated, Here, Reached, Shelf,
+                Spawned)
+import compiler.unit (shipped)
 import std.fs (fs)
 import std.json
 import std.json (Json, Null, Number, Array, Str)
@@ -32,8 +34,8 @@ fn red() -> String =
   \\
 
 // The first line a run printed, without the indent a report gives it.
-fn first_line(r: Ran) -> String / {abort.raise} =
-  match r.out { [l, ..] -> string::trim(l), [] -> "" }
+fn first_line(ran: Ran) -> String / {abort.raise} =
+  match ran.out { [l, ..] -> string::trim(l), [] -> "" }
 
 fn tested(flags: List<String>) -> Json / {Reached, Shelf, abort.raise} =
   json_of(on_disk(concatenated(["test", "--json"], flags)))
@@ -88,16 +90,16 @@ test "a second run selects nothing because the cache is exact" {
 }
 
 // The next report a watching run wrote, one document a line.
-fn report(s: Server, what: String) -> Json / {Spawned, abort.raise} =
-  match next_line(s, 60000) {
+fn report(server: Server, what: String) -> Json / {Spawned, abort.raise} =
+  match next_line(server, 60000) {
     None -> {
-      stop(s);
+      stop(server);
       panic("`--watch` " ++ what)
     },
     Some(line) -> match json::parse_string(line) {
       Ok(v) -> v,
       Err(_) -> {
-        stop(s);
+        stop(server);
         panic("`--watch` wrote a line that is no report: " ++ line)
       },
     },
@@ -179,7 +181,7 @@ test "editing a body re-runs exactly the tests that reach it" {
     let tests = "test \"a is one\" { assert_eq(a(), 1) }\ntest \"b is two\" { assert_eq(b(), 2) }\n";
     program("fn a() -> Int = 1\nfn b() -> Int = 2\n" ++ tests);
     assert(on_disk(["test"]).code == 0, None);
-    write("m.ply", "fn a() -> Int = 0 + 1\nfn b() -> Int = 2\n" ++ tests);
+    write("m.ply", "fn a() -> Int = len([1])\nfn b() -> Int = 2\n" ++ tests);
     let v = tested([]);
     assert(int(path(v, ["selection", "selected"])) == 1, Some(shown(v)));
     assert(int(path(v, ["selection", "cached"])) == 1, Some(shown(v)));
@@ -187,6 +189,20 @@ test "editing a body re-runs exactly the tests that reach it" {
       map(items(at(v, "results")), |r: Json| str(at(r, "name"))) == ["a is one"],
       Some(shown(v)),
     )
+  })
+}
+
+test "an edit the compiler makes the same code of re-runs nothing" {
+  scratch(|| {
+    let tests = "test \"a is one\" { assert_eq(a(), 1) }\n";
+    program("fn a() -> Int = 1\n" ++ tests);
+    assert(on_disk(["test"]).code == 0, None);
+    // Two literals under `+` are folded, so this body is emitted as the one it replaced.
+    write("m.ply", "fn a() -> Int = 0 + 1\n" ++ tests);
+    let v = tested([]);
+    assert(int(path(v, ["selection", "selected"])) == 0, Some(shown(v)));
+    assert(int(path(v, ["selection", "by_code"])) == 1, Some(shown(v)));
+    assert(str(at(selected_test(v, "a is one"), "reason")) == "same_code", Some(shown(v)))
   })
 }
 
@@ -265,6 +281,46 @@ test "moving a definition between modules re-runs nothing" {
     assert(
       string_contains(text, "selected 0 of 1 (1 cached)"),
       Some("moving a definition rebuilt something:\n" ++ text),
+    )
+  })
+}
+
+// The shelf as a `ply` whose `names` changed would ship it: each under the hash `to`.
+fn moving(names: List<String>, to: String) -> List<Source> / {Shelf, abort.raise} =
+  [
+    {
+      path: "definitions",
+      text: string::join(
+        map(string::split(string_of_bytes(shipped.definitions()), "\n"), |line: String|
+          match filter(names, |n: String| string_starts_with(line, n ++ " ")) {
+            [n, ..] -> n ++ " " ++ to,
+            [] -> line,
+          }),
+        "\n",
+      ),
+    },
+  ]
+
+test "a compiler change that leaves a test's code alone re-runs nothing" {
+  scratch(|| {
+    program(green());
+    assert(on_disk(["test"]).code == 0, None);
+    let deciding = stdout(on_disk_shipping(["test"], moving(["tests.selected"], "a")));
+    assert(
+      string_contains(deciding, "selected 0 of 2 (2 cached, 2 by code)"),
+      Some("a pass was not found by the code its test ran:\n" ++ deciding),
+    );
+    // Found by its code, a pass is filed again by its test: a run that loses the code passes keeps it.
+    let refiled = stdout(
+      on_disk_shipping(["test"], moving(["tests.selected", "tests.ran_job"], "a")),
+    );
+    assert(string_contains(refiled, "selected 0 of 2 (2 cached)"), Some(refiled));
+    let running = stdout(
+      on_disk_shipping(["test"], moving(["tests.selected", "tests.ran_job"], "b")),
+    );
+    assert(
+      string_contains(running, "selected 2 of 2 (0 cached)"),
+      Some("a change to what runs a test re-ran nothing:\n" ++ running),
     )
   })
 }

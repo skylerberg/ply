@@ -464,7 +464,7 @@ fn an_error_is_the_whole_answer_with_its_labels_notes_and_fixes() {
     let sources = [SourceId(9), SourceId(4)];
     let front = dump::read(&refused, &sources).unwrap_or_else(|e| panic!("{e}"));
     assert!(front.has_error());
-    assert!(front.check.defs.is_empty() && front.packages.is_empty());
+    assert!(front.check.defs.is_empty() && front.check.modules.is_empty());
 
     let [failed, warned] = &front.diagnostics[..] else {
         panic!("two diagnostics: {:?}", front.diagnostics);
@@ -551,9 +551,6 @@ fn holding(footprint: Value) -> Value {
     ]);
     let mut tables: Vec<(&str, Value)> = [
         "diags",
-        "packages",
-        "pins",
-        "module_packages",
         "modules",
         "types",
         "tests",

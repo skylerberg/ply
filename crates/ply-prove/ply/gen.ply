@@ -10,6 +10,7 @@ import std.random (Rand, rand_u64)
 import std.random
 import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
                   VArray, VRecord, VCtor, VFn, Field, Entry, FConst, FProject, FTable, map_of)
+import std.list (at)
 import domain (Ty, Var, Fn, Record, Con, Decl, Variant)
 
 // Why a type has no value to draw.
@@ -69,41 +70,41 @@ fn is_scalar(name: String) -> Bool =
 pub fn types_of(decls: List<Decl>) -> Types / {abort.raise} = {
   let start = fold(decls, map_new(), |acc: Types, d: Decl|
     map_insert(acc, d.name, { decl: d, depth: None, depths: map(d.variants, |_v: Variant| None) }));
-  iterate(start, len(decls) + 2, |ts: Types| {
-    let next = map_fold(ts, ts, |acc: Types, name: String, t: Typed| {
+  iterate(start, len(decls) + 2, |types: Types| {
+    let next = map_fold(types, types, |acc: Types, name: String, t: Typed| {
       let depths = map(t.decl.variants, |v: Variant| variant_depth(acc, v.fields));
       let best = fold(depths, None, |m: Option<Int>, d: Option<Int>|
         match d { None -> m, Some(x) -> match m { None -> Some(x), Some(y) -> Some(min(x, y)) } });
       map_insert(acc, name, { ..t, depth: best, depths: depths })
     });
-    if next == ts { Stop(ts) } else { Continue(next) }
+    if next == types { Stop(types) } else { Continue(next) }
   })
 }
 
-fn variant_depth(ts: Types, fields: List<Ty>) -> Option<Int> =
+fn variant_depth(types: Types, fields: List<Ty>) -> Option<Int> =
   match fold(fields, Some(0), |acc: Option<Int>, f: Ty|
       match acc {
         None -> None,
-        Some(m) -> match depth(ts, f) { None -> None, Some(d) -> Some(max(m, d)) },
+        Some(m) -> match depth(types, f) { None -> None, Some(d) -> Some(max(m, d)) },
       }) {
     Some(d) -> Some(d + 1),
     None -> None,
   }
 
-// Nested constructor applications a value of `t` needs, or `None` when nothing finite inhabits it.
-pub fn depth(ts: Types, t: Ty) -> Option<Int> =
-  match t {
+// Nested constructor applications a value of `ty` needs, or `None` when nothing finite inhabits it.
+pub fn depth(types: Types, ty: Ty) -> Option<Int> =
+  match ty {
     Var(_) -> Some(0),
     Record(fields) ->
       fold(fields, Some(0), |acc: Option<Int>, f: { name: String, ty: Ty }|
         match acc {
           None -> None,
-          Some(m) -> match depth(ts, f.ty) { None -> None, Some(d) -> Some(max(m, d)) },
+          Some(m) -> match depth(types, f.ty) { None -> None, Some(d) -> Some(max(m, d)) },
         }),
-    Fn(_, ret, pure) -> if pure { depth(ts, ret) } else { None },
+    Fn(_, ret, pure) -> if pure { depth(types, ret) } else { None },
     Con(name, _) -> if is_scalar(name) || is_sequence(name) || name == "Map" { Some(0) }
     else if name == "Cell" || name == "Task" || name == "Chan" || name == "Secret" { None }
-    else { match map_get(ts, name) { Some(typed) -> typed.depth, None -> None } },
+    else { match map_get(types, name) { Some(typed) -> typed.depth, None -> None } },
   }
 
 // A variant's fields with `args` in place of its type's parameters.
@@ -141,36 +142,36 @@ pub fn by_name(fields: List<{ name: String, ty: Ty }>) -> List<{ name: String, t
     }
   })
 
-pub fn generatable(t: Ty, ts: Types) -> Result<Unit, Ungeneratable> =
-  match t {
+pub fn generatable(ty: Ty, types: Types) -> Result<Unit, Ungeneratable> =
+  match ty {
     Var(_) -> Ok(()),
-    Record(fields) -> all_ok(map(fields, |f: { name: String, ty: Ty }| f.ty), ts),
-    Fn(params, ret, pure) -> if !pure { Err(UEffectful) } else { all_ok(push(params, ret), ts) },
+    Record(fields) -> all_ok(map(fields, |f: { name: String, ty: Ty }| f.ty), types),
+    Fn(params, ret, pure) -> if !pure { Err(UEffectful) } else { all_ok(push(params, ret), types) },
     Con(name, args) -> if is_scalar(name) { Ok(()) }
-    else if is_sequence(name) || name == "Map" { all_ok(args, ts) }
+    else if is_sequence(name) || name == "Map" { all_ok(args, types) }
     else if name == "Cell" { Err(UCell) }
     else if name == "Task" { Err(UTask) }
     else if name == "Chan" { Err(UChan) }
     else if name == "Secret" { Err(USecret) } else {
-      match map_get(ts, name) {
+      match map_get(types, name) {
         None -> Err(UUnknown(name)),
         Some(typed) -> match typed.depth {
           None -> Err(UUninhabited(name)),
-          Some(_) -> all_ok(args, ts),
+          Some(_) -> all_ok(args, types),
         },
       }
     },
   }
 
-fn all_ok(xs: List<Ty>, ts: Types) -> Result<Unit, Ungeneratable> =
+fn all_ok(xs: List<Ty>, types: Types) -> Result<Unit, Ungeneratable> =
   fold(xs, Ok(()), |acc: Result<Unit, Ungeneratable>, x: Ty|
-    match acc { Err(_) -> acc, Ok(_) -> generatable(x, ts) })
+    match acc { Err(_) -> acc, Ok(_) -> generatable(x, types) })
 
 // --- Drawing ------------------------------------------------------------------
 
 // What a draw is from: the declared types, how large a value may grow, and the edge point every leaf
 // takes in an edge case.
-type Gen = { ts: Types, size: Int, edge: Option<Int> }
+type Gen = { types: Types, size: Int, edge: Option<Int> }
 
 // A value, and the stream after it.
 pub type Generated = { value: Value, rand: Rand }
@@ -178,8 +179,8 @@ pub type Generated = { value: Value, rand: Rand }
 // One sixty-four-bit draw, as its low and high halves.
 type Word = { lo: Int, hi: Int, rand: Rand }
 
-fn word(r: Rand) -> Word / {abort.raise} = {
-  let d = rand_u64(r);
+fn word(rand: Rand) -> Word / {abort.raise} = {
+  let d = rand_u64(rand);
   { lo: int_of_u64(d.value & 0xFFFF_FFFFu64), hi: int_of_u64(d.value >> 32), rand: d.rand }
 }
 
@@ -191,19 +192,20 @@ fn shifted(w: Word, k: Int) -> Int = w.hi << 32 - k | w.lo >> k
 
 fn wide(w: Word) -> U128 / {abort.raise} = u128_of_int(w.hi) << 32 | u128_of_int(w.lo)
 
-fn nth<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
-  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
-
 pub fn generate(
-  t: Ty,
-  ts: Types,
-  r: Rand,
+  ty: Ty,
+  types: Types,
+  rand: Rand,
   case: Int,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} =
   value(
-    { ts: ts, size: min(case, 63), edge: if case < edge_cases() { Some(case) } else { None } },
-    t,
-    r,
+    {
+      types: types,
+      size: min(case, 63),
+      edge: if case < edge_cases() { Some(case) } else { None },
+    },
+    ty,
+    rand,
     0,
   )
 
@@ -211,30 +213,35 @@ fn int_ty() -> Ty = Con("Int", [])
 
 fn arg(args: List<Ty>, i: Int) -> Ty = match list_at(args, i) { Some(a) -> a, None -> int_ty() }
 
-fn value(g: Gen, t: Ty, r: Rand, depth: Int) -> Result<Generated, Ungeneratable> / {abort.raise} =
+fn value(
+  gen: Gen,
+  ty: Ty,
+  rand: Rand,
+  depth: Int,
+) -> Result<Generated, Ungeneratable> / {abort.raise} =
   if depth >= hard_depth() { Err(UTooDeep) } else {
-    match t {
-      Var(_) -> Ok(int(g, r)),
-      Record(fields) -> record(g, by_name(fields), r, depth),
+    match ty {
+      Var(_) -> Ok(int(gen, rand)),
+      Record(fields) -> record(gen, by_name(fields), rand, depth),
       Fn(params, ret, pure) -> if !pure { Err(UEffectful) }
-      else { function(g, params, ret, r, depth) },
-      Con(name, args) -> if name == "Int" { Ok(int(g, r)) }
-      else if is_width(name) { Ok(fixed(g, name, r)) }
-      else if name == "Float" { Ok(float(g, r)) }
-      else if name == "Decimal" { Ok(decimal(g, r)) }
-      else if name == "Char" { Ok(character(g, r)) }
-      else if name == "Bool" { Ok(boolean(g, r)) }
-      else if name == "String" { Ok(text(g, r)) }
-      else if name == "Bytes" { Ok(bytes(g, r)) }
-      else if name == "Unit" { Ok({ value: VUnit, rand: r }) }
-      else if name == "List" { list(g, arg(args, 0), r, depth, |xs: List<Value>| VList(xs)) }
-      else if name == "Array" { list(g, arg(args, 0), r, depth, |xs: List<Value>| VArray(xs)) }
-      else if name == "Map" { map_value(g, arg(args, 0), arg(args, 1), r, depth) }
+      else { function(gen, params, ret, rand, depth) },
+      Con(name, args) -> if name == "Int" { Ok(int(gen, rand)) }
+      else if is_width(name) { Ok(fixed(gen, name, rand)) }
+      else if name == "Float" { Ok(float(gen, rand)) }
+      else if name == "Decimal" { Ok(decimal(gen, rand)) }
+      else if name == "Char" { Ok(character(gen, rand)) }
+      else if name == "Bool" { Ok(boolean(gen, rand)) }
+      else if name == "String" { Ok(text(gen, rand)) }
+      else if name == "Bytes" { Ok(bytes(gen, rand)) }
+      else if name == "Unit" { Ok({ value: VUnit, rand: rand }) }
+      else if name == "List" { list(gen, arg(args, 0), rand, depth, |xs: List<Value>| VList(xs)) }
+      else if name == "Array" { list(gen, arg(args, 0), rand, depth, |xs: List<Value>| VArray(xs)) }
+      else if name == "Map" { map_value(gen, arg(args, 0), arg(args, 1), rand, depth) }
       else if name == "Cell" { Err(UCell) }
       else if name == "Task" { Err(UTask) }
       else if name == "Chan" { Err(UChan) }
       else if name == "Secret" { Err(USecret) }
-      else { adt(g, name, args, r, depth) },
+      else { adt(gen, name, args, rand, depth) },
     }
   }
 
@@ -242,14 +249,14 @@ fn least_int() -> Int = 0 - 9223372036854775807 - 1
 
 fn edge_ints() -> List<Int> = [0, 1, 0 - 1, least_int(), 9223372036854775807]
 
-fn int(g: Gen, r: Rand) -> Generated / {abort.raise} =
-  match g.edge {
-    Some(i) -> { value: VInt(nth(edge_ints(), i % 5)), rand: r },
+fn int(gen: Gen, rand: Rand) -> Generated / {abort.raise} =
+  match gen.edge {
+    Some(i) -> { value: VInt(at(edge_ints(), i % 5)), rand: rand },
     None -> {
-      let s = word(r);
-      if s.lo % 32 < 5 { { value: VInt(nth(edge_ints(), s.lo % 32)), rand: s.rand } } else {
+      let s = word(rand);
+      if s.lo % 32 < 5 { { value: VInt(at(edge_ints(), s.lo % 32)), rand: s.rand } } else {
         let x = word(s.rand);
-        let magnitude = shifted(x, 1) & (1 << 8 + min(g.size, 54)) - 1;
+        let magnitude = shifted(x, 1) & (1 << 8 + min(gen.size, 54)) - 1;
         { value: VInt(if x.lo % 2 == 0 { magnitude } else { 0 - magnitude }), rand: x.rand }
       }
     },
@@ -274,12 +281,12 @@ fn fixed_edges(name: String) -> List<U128> = {
   } else { [0u128, 1u128, mask(w), 0u128, mask(w), mask(w) - 1u128] }
 }
 
-fn fixed(g: Gen, name: String, r: Rand) -> Generated / {abort.raise} =
-  match g.edge {
-    Some(i) -> { value: VFixed(name, nth(fixed_edges(name), i % 6)), rand: r },
+fn fixed(gen: Gen, name: String, r: Rand) -> Generated / {abort.raise} =
+  match gen.edge {
+    Some(i) -> { value: VFixed(name, at(fixed_edges(name), i % 6)), rand: r },
     None -> {
       let s = word(r);
-      if s.lo % 32 < 6 { { value: VFixed(name, nth(fixed_edges(name), s.lo % 32)), rand: s.rand } }
+      if s.lo % 32 < 6 { { value: VFixed(name, at(fixed_edges(name), s.lo % 32)), rand: s.rand } }
       else if width(name) == 128 {
         let high = word(s.rand);
         let low = word(high.rand);
@@ -310,17 +317,17 @@ fn edge_floats() -> List<Float> =
     float::max_value(),
   ]
 
-fn float(g: Gen, r: Rand) -> Generated / {abort.raise} =
-  match g.edge {
-    Some(i) -> { value: VFloat(nth(edge_floats(), i % 8)), rand: r },
+fn float(gen: Gen, rand: Rand) -> Generated / {abort.raise} =
+  match gen.edge {
+    Some(i) -> { value: VFloat(at(edge_floats(), i % 8)), rand: rand },
     None -> {
-      let s = word(r);
-      if s.lo % 32 < 8 { { value: VFloat(nth(edge_floats(), s.lo % 32)), rand: s.rand } } else {
+      let s = word(rand);
+      if s.lo % 32 < 8 { { value: VFloat(at(edge_floats(), s.lo % 32)), rand: s.rand } } else {
         // Not over the bit pattern: a bounded mantissa and exponent reach ordinary scales too.
         let m = word(s.rand);
         let e = word(m.rand);
         let sign = word(e.rand);
-        let magnitude = exact_float(shifted(m, 11)) * pow2(modulo(e, 1 + min(g.size, 60)) - 30);
+        let magnitude = exact_float(shifted(m, 11)) * pow2(modulo(e, 1 + min(gen.size, 60)) - 30);
         {
           value: VFloat((if sign.lo % 2 == 0 { 1.0 } else { 0.0 - 1.0 }) * magnitude),
           rand: sign.rand,
@@ -339,15 +346,15 @@ fn edge_decimals() -> List<Decimal> / {abort.raise} =
     decimal::min_value(),
   ]
 
-fn decimal(g: Gen, r: Rand) -> Generated / {abort.raise} =
-  match g.edge {
-    Some(i) -> { value: VDecimal(nth(edge_decimals(), i % 6)), rand: r },
+fn decimal(gen: Gen, rand: Rand) -> Generated / {abort.raise} =
+  match gen.edge {
+    Some(i) -> { value: VDecimal(at(edge_decimals(), i % 6)), rand: rand },
     None -> {
-      let s = word(r);
-      if s.lo % 32 < 6 { { value: VDecimal(nth(edge_decimals(), s.lo % 32)), rand: s.rand } } else {
+      let s = word(rand);
+      if s.lo % 32 < 6 { { value: VDecimal(at(edge_decimals(), s.lo % 32)), rand: s.rand } } else {
         let scale = word(s.rand);
         let x = word(scale.rand);
-        let magnitude = shifted(x, 1) & (1 << 8 + min(g.size, 54)) - 1;
+        let magnitude = shifted(x, 1) & (1 << 8 + min(gen.size, 54)) - 1;
         let mantissa = if x.lo % 2 == 0 { magnitude } else { 0 - magnitude };
         {
           value: VDecimal(match of_parts(mantissa, modulo(scale, 7)) { Some(d) -> d, None -> 0m }),
@@ -357,29 +364,29 @@ fn decimal(g: Gen, r: Rand) -> Generated / {abort.raise} =
     },
   }
 
-fn boolean(g: Gen, r: Rand) -> Generated / {abort.raise} =
-  match g.edge {
-    Some(i) -> { value: VBool(i % 2 == 1), rand: r },
+fn boolean(gen: Gen, rand: Rand) -> Generated / {abort.raise} =
+  match gen.edge {
+    Some(i) -> { value: VBool(i % 2 == 1), rand: rand },
     None -> {
-      let s = word(r);
+      let s = word(rand);
       { value: VBool(s.lo % 2 == 1), rand: s.rand }
     },
   }
 
 // The lesser of two draws, capped by the size, so early cases are short.
-fn length(g: Gen, r: Rand) -> { n: Int, rand: Rand } / {abort.raise} =
-  match g.edge {
-    Some(i) -> { n: i % 3, rand: r },
+fn length(gen: Gen, rand: Rand) -> { n: Int, rand: Rand } / {abort.raise} =
+  match gen.edge {
+    Some(i) -> { n: i % 3, rand: rand },
     None -> {
-      let cap = min(max_len(), 1 + g.size / 4);
-      let a = word(r);
+      let cap = min(max_len(), 1 + gen.size / 4);
+      let a = word(rand);
       let b = word(a.rand);
       { n: min(modulo(a, cap + 1), modulo(b, cap + 1)), rand: b.rand }
     },
   }
 
-fn text(g: Gen, r: Rand) -> Generated / {abort.raise} = {
-  let l = length(g, r);
+fn text(gen: Gen, rand: Rand) -> Generated / {abort.raise} = {
+  let l = length(gen, rand);
   let drawn = fold(
     range(0, l.n),
     { out: [], rand: l.rand },
@@ -398,18 +405,18 @@ fn edge_chars() -> List<Char> = ['a', '\0', '\n', ' ', '\'', '\u{e9}', '\u{1F600
 fn letter(i: Int) -> Char = match char_of_int(97 + i) { Some(c) -> c, None -> 'a' }
 
 // Mostly the alphabet strings draw from, so a character and a string's characters agree.
-fn character(g: Gen, r: Rand) -> Generated / {abort.raise} =
-  match g.edge {
-    Some(i) -> { value: VChar(nth(edge_chars(), i % 8)), rand: r },
+fn character(gen: Gen, rand: Rand) -> Generated / {abort.raise} =
+  match gen.edge {
+    Some(i) -> { value: VChar(at(edge_chars(), i % 8)), rand: rand },
     None -> {
-      let c = word(r);
-      if c.lo % 8 == 0 { { value: VChar(nth(edge_chars(), c.lo / 8 % 8)), rand: c.rand } }
+      let c = word(rand);
+      if c.lo % 8 == 0 { { value: VChar(at(edge_chars(), c.lo / 8 % 8)), rand: c.rand } }
       else { { value: VChar(letter(c.lo % 16)), rand: c.rand } }
     },
   }
 
-fn bytes(g: Gen, r: Rand) -> Generated / {abort.raise} = {
-  let l = length(g, r);
+fn bytes(gen: Gen, rand: Rand) -> Generated / {abort.raise} = {
+  let l = length(gen, rand);
   let drawn = fold(
     range(0, l.n),
     { out: [], rand: l.rand },
@@ -421,21 +428,21 @@ fn bytes(g: Gen, r: Rand) -> Generated / {abort.raise} = {
   { value: VBytes(bytes_concat_all(drawn.out)), rand: drawn.rand }
 }
 
-// `n` values of `t` in a row, each at `depth`.
+// `n` values of `ty` in a row, each at `depth`.
 fn several(
-  g: Gen,
-  t: Ty,
+  gen: Gen,
+  ty: Ty,
   n: Int,
-  r: Rand,
+  rand: Rand,
   depth: Int,
 ) -> Result<{ values: List<Value>, rand: Rand }, Ungeneratable> / {abort.raise} =
   fold(
     range(0, n),
-    Ok({ values: [], rand: r }),
+    Ok({ values: [], rand: rand }),
     |acc: Result<{ values: List<Value>, rand: Rand }, Ungeneratable>, _i: Int|
       match acc {
         Err(_) -> acc,
-        Ok(so_far) -> match value(g, t, so_far.rand, depth) {
+        Ok(so_far) -> match value(gen, ty, so_far.rand, depth) {
           Err(e) -> Err(e),
           Ok(d) -> Ok({ values: push(so_far.values, d.value), rand: d.rand }),
         },
@@ -443,36 +450,36 @@ fn several(
   )
 
 fn list(
-  g: Gen,
+  gen: Gen,
   elem: Ty,
-  r: Rand,
+  rand: Rand,
   depth: Int,
   made: (List<Value>) -> Value,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} = {
-  let l = if depth >= gen_depth() { { n: 0, rand: r } } else { length(g, r) };
-  match several(g, elem, l.n, l.rand, depth + 1) {
+  let l = if depth >= gen_depth() { { n: 0, rand: rand } } else { length(gen, rand) };
+  match several(gen, elem, l.n, l.rand, depth + 1) {
     Err(e) -> Err(e),
     Ok(items) -> Ok({ value: made(items.values), rand: items.rand }),
   }
 }
 
 fn map_value(
-  g: Gen,
+  gen: Gen,
   key: Ty,
   val: Ty,
-  r: Rand,
+  rand: Rand,
   depth: Int,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} = {
-  let l = if depth >= gen_depth() { { n: 0, rand: r } } else { length(g, r) };
+  let l = if depth >= gen_depth() { { n: 0, rand: rand } } else { length(gen, rand) };
   let drawn = fold(
     range(0, min(l.n, max_entries())),
     Ok({ entries: [], rand: l.rand }),
     |acc: Result<{ entries: List<Entry>, rand: Rand }, Ungeneratable>, _i: Int|
       match acc {
         Err(_) -> acc,
-        Ok(so_far) -> match value(g, key, so_far.rand, depth + 1) {
+        Ok(so_far) -> match value(gen, key, so_far.rand, depth + 1) {
           Err(e) -> Err(e),
-          Ok(k) -> match value(g, val, k.rand, depth + 1) {
+          Ok(k) -> match value(gen, val, k.rand, depth + 1) {
             Err(e) -> Err(e),
             Ok(v) ->
               Ok({ entries: push(so_far.entries, { key: k.value, value: v.value }), rand: v.rand }),
@@ -484,18 +491,18 @@ fn map_value(
 }
 
 fn record(
-  g: Gen,
+  gen: Gen,
   fields: List<{ name: String, ty: Ty }>,
-  r: Rand,
+  rand: Rand,
   depth: Int,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} = {
   let drawn = fold(
     fields,
-    Ok({ out: [], rand: r }),
+    Ok({ out: [], rand: rand }),
     |acc: Result<{ out: List<Field>, rand: Rand }, Ungeneratable>, f: { name: String, ty: Ty }|
       match acc {
         Err(_) -> acc,
-        Ok(so_far) -> match value(g, f.ty, so_far.rand, depth + 1) {
+        Ok(so_far) -> match value(gen, f.ty, so_far.rand, depth + 1) {
           Err(e) -> Err(e),
           Ok(d) -> Ok({ out: push(so_far.out, { name: f.name, value: d.value }), rand: d.rand }),
         },
@@ -507,21 +514,21 @@ fn record(
 // The variants a value of `name<args>` may be drawn as: those whose fields can be drawn, and past
 // the soft depth only the shallowest of them.
 pub fn usable(
-  ts: Types,
+  types: Types,
   name: String,
   args: List<Ty>,
   depth: Int,
 ) -> Result<List<{ name: String, index: Int, fields: List<Ty> }>, Ungeneratable> / {abort.raise} =
-  match map_get(ts, name) {
+  match map_get(types, name) {
     None -> Err(UUnknown(name)),
     Some(typed) -> {
       let all = fold(
         range(0, len(typed.decl.variants)),
         [],
         |acc: List<{ name: String, index: Int, fields: List<Ty> }>, i: Int| {
-          let v = nth(typed.decl.variants, i);
+          let v = at(typed.decl.variants, i);
           let fields = fields_of(v.fields, args);
-          if fold(fields, true, |ok: Bool, f: Ty| ok && generatable(f, ts) == Ok(())) {
+          if fold(fields, true, |ok: Bool, f: Ty| ok && generatable(f, types) == Ok(())) {
             push(acc, { name: v.name, index: i, fields: fields })
           } else { acc }
         },
@@ -549,24 +556,24 @@ pub fn usable(
   }
 
 fn adt(
-  g: Gen,
+  gen: Gen,
   name: String,
   args: List<Ty>,
-  r: Rand,
+  rand: Rand,
   depth: Int,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} =
-  match usable(g.ts, name, args, depth) {
+  match usable(gen.types, name, args, depth) {
     Err(e) -> Err(e),
     Ok(variants) -> {
-      let picked = match g.edge {
-        Some(i) -> { index: i % len(variants), rand: r },
+      let picked = match gen.edge {
+        Some(i) -> { index: i % len(variants), rand: rand },
         None -> {
-          let w = word(r);
+          let w = word(rand);
           { index: modulo(w, len(variants)), rand: w.rand }
         },
       };
-      let v = nth(variants, picked.index);
-      match several_of(g, v.fields, picked.rand, depth + 1) {
+      let v = at(variants, picked.index);
+      match several_of(gen, v.fields, picked.rand, depth + 1) {
         Err(e) -> Err(e),
         Ok(drawn) -> Ok({ value: VCtor(v.name, drawn.values), rand: drawn.rand }),
       }
@@ -575,18 +582,18 @@ fn adt(
 
 // One value of each type, in order.
 fn several_of(
-  g: Gen,
-  ts: List<Ty>,
-  r: Rand,
+  gen: Gen,
+  types: List<Ty>,
+  rand: Rand,
   depth: Int,
 ) -> Result<{ values: List<Value>, rand: Rand }, Ungeneratable> / {abort.raise} =
   fold(
-    ts,
-    Ok({ values: [], rand: r }),
-    |acc: Result<{ values: List<Value>, rand: Rand }, Ungeneratable>, t: Ty|
+    types,
+    Ok({ values: [], rand: rand }),
+    |acc: Result<{ values: List<Value>, rand: Rand }, Ungeneratable>, ty: Ty|
       match acc {
         Err(_) -> acc,
-        Ok(so_far) -> match value(g, t, so_far.rand, depth) {
+        Ok(so_far) -> match value(gen, ty, so_far.rand, depth) {
           Err(e) -> Err(e),
           Ok(d) -> Ok({ values: push(so_far.values, d.value), rand: d.rand }),
         },
@@ -604,20 +611,20 @@ pub fn comparable(t: Ty) -> Bool =
 
 // From a fixed family of pure, total, printable functions, so a counterexample reads.
 fn function(
-  g: Gen,
+  gen: Gen,
   params: List<Ty>,
   ret: Ty,
-  r: Rand,
+  rand: Rand,
   depth: Int,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} = {
   let arity = len(params);
   let projection = fold(range(0, arity), None, |found: Option<Int>, i: Int|
-    match found { Some(_) -> found, None -> if nth(params, i) == ret { Some(i) } else { None } });
+    match found { Some(_) -> found, None -> if at(params, i) == ret { Some(i) } else { None } });
   let tabulatable = match list_at(params, 0) { Some(p) -> comparable(p), None -> false };
-  let chosen = match g.edge {
-    Some(_) -> { choice: 0, rand: r },
+  let chosen = match gen.edge {
+    Some(_) -> { choice: 0, rand: rand },
     None -> {
-      let w = word(r);
+      let w = word(rand);
       { choice: w.lo % 4, rand: w.rand }
     },
   };
@@ -632,9 +639,9 @@ fn function(
         |acc: Result<{ entries: List<Entry>, rand: Rand }, Ungeneratable>, _i: Int|
           match acc {
             Err(_) -> acc,
-            Ok(so_far) -> match value(g, nth(params, 0), so_far.rand, depth + 1) {
+            Ok(so_far) -> match value(gen, at(params, 0), so_far.rand, depth + 1) {
               Err(e) -> Err(e),
-              Ok(k) -> match value(g, ret, k.rand, depth + 1) {
+              Ok(k) -> match value(gen, ret, k.rand, depth + 1) {
                 Err(e) -> Err(e),
                 Ok(v) ->
                   Ok({
@@ -647,7 +654,7 @@ fn function(
       );
       match drawn {
         Err(e) -> Err(e),
-        Ok(table) -> match value(g, ret, table.rand, depth + 1) {
+        Ok(table) -> match value(gen, ret, table.rand, depth + 1) {
           Err(e) -> Err(e),
           Ok(fallback) ->
             Ok({
@@ -657,7 +664,7 @@ fn function(
         },
       }
     } else {
-      match value(g, ret, chosen.rand, depth + 1) {
+      match value(gen, ret, chosen.rand, depth + 1) {
         Err(e) -> Err(e),
         Ok(v) -> Ok({ value: VFn(FConst({ arity: arity, value: v.value })), rand: v.rand }),
       }
@@ -689,8 +696,8 @@ fn shapes() -> List<Decl> =
     { name: "m.Loop", params: 0, variants: [{ name: "m.Again", fields: [Con("m.Loop", [])] }] },
   ]
 
-fn drawn_at(t: Ty, root: Int, case: Int) -> Result<Value, Ungeneratable> / {abort.raise} =
-  match generate(t, types_of(shapes()), random::rand_keyed(root, b"key"), case) {
+fn drawn_at(ty: Ty, root: Int, case: Int) -> Result<Value, Ungeneratable> / {abort.raise} =
+  match generate(ty, types_of(shapes()), random::rand_keyed(root, b"key"), case) {
     Ok(g) -> Ok(g.value),
     Err(e) -> Err(e),
   }
@@ -751,12 +758,12 @@ test "a recursive type terminates, and one nothing finite inhabits is not genera
     fold(range(0, 64), true, |ok: Bool, c: Int|
       ok && (match drawn_at(Con("m.Tree", []), 5, c) { Ok(_) -> true, Err(_) -> false })),
   );
-  let ts = types_of(shapes());
-  assert_eq(generatable(Con("m.Loop", []), ts), Err(UUninhabited("m.Loop")));
-  assert_eq(generatable(Con("Cell", [int_t()]), ts), Err(UCell));
-  assert_eq(generatable(Con("Chan", [int_t()]), ts), Err(UChan));
-  assert_eq(generatable(Fn([int_t()], int_t(), false), ts), Err(UEffectful));
-  assert_eq(generatable(Con("m.Nowhere", []), ts), Err(UUnknown("m.Nowhere")))
+  let types = types_of(shapes());
+  assert_eq(generatable(Con("m.Loop", []), types), Err(UUninhabited("m.Loop")));
+  assert_eq(generatable(Con("Cell", [int_t()]), types), Err(UCell));
+  assert_eq(generatable(Con("Chan", [int_t()]), types), Err(UChan));
+  assert_eq(generatable(Fn([int_t()], int_t(), false), types), Err(UEffectful));
+  assert_eq(generatable(Con("m.Nowhere", []), types), Err(UUnknown("m.Nowhere")))
 }
 
 test "a draw is a function of its root, its key and its case" {

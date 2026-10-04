@@ -211,12 +211,14 @@ jobs:
           fail-on-cache-miss: true
 
   build-ply:
-    name: cargo build --release -p ply-launcher
+    name: the ply binary and the ply program it builds
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
+    outputs:
+      built: ${{ steps.stage-cache.outputs.cache-hit != 'true' && steps.shared.outputs.found != 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -269,16 +271,16 @@ jobs:
           path: tcc
           key: tcc-${{ runner.os }}-${{ runner.arch }}
 
-      # The self-test below is the run's first `ply`, and a first `ply` emits the emitter's own
-      # unit and compiles it with whatever `Profile::Development` finds — `cc -O0` when tcc is
-      # absent. Installed here it is tcc, the compiler every suite job compiles that unit with, so
-      # the emitted stage and the objects this job writes are the ones they read.
+      # The run's first `ply` emits the emitter's own unit and compiles it with whatever
+      # `Profile::Development` finds — `cc -O0` when tcc is absent. Installed here it is tcc, the
+      # compiler every suite job compiles that unit with, so the emitted stage and the objects this
+      # job writes are the ones they read.
       - name: tcc, the development profile's C compiler
         run: .github/ci-tcc.sh install
 
-      # The self-test's first `ply` is minutes of emitting and compiling. A tree whose sources
-      # have not moved has both from an earlier run; against any other tree the buckets of emitted
-      # C that did not move are already built, which is most of them.
+      # The run's first `ply` is minutes of checking and emitting. A tree whose sources have not
+      # moved has both from an earlier run; against any other tree the buckets of emitted C that
+      # did not move are already built, which is most of them.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: stage-cache
         with:
@@ -290,7 +292,18 @@ jobs:
       # Before this job's first `ply`, so what it reads is newer than this and the rest is not.
       - name: The moment this job's `ply`s start
         run: touch /tmp/ply-c-used.mark
+      # After the mark, so the cut below keeps it. The builder is in the name: a stage holds what
+      # the committed builder made of these sources.
+      - name: The stage a run on another branch built from these sources
+        id: shared
+        if: steps.stage-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/ci-warm.sh shared "ply-stage-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/bootstrap/build.digest') }}"
 
+      # A step of its own, so a run says what building it took and where.
+      - name: The `ply` program these sources build
+        run: .github/ci-warm.sh program target/release/ply
       # Here rather than in a later job: it compares mtimes, and a later checkout is newer than the binary.
       - name: The freshness check can still go red
         run: .github/binary-is-current.sh --self-test
@@ -344,7 +357,8 @@ jobs:
 
   # On runners of its own, so the corpus lanes have theirs to themselves. After `build-ply`, whose
   # stage it restores: a run that changed the compiler would otherwise have each shard emit the
-  # emitter's stage itself, minutes of a runner the lanes are queued for.
+  # emitter's stage itself, minutes of a runner the lanes are queued for. The builder its tests ask
+  # this tree's compiler through is each shard's own to build, once.
   nextest:
     name: nextest ${{ matrix.shard }}/${{ matrix.of }}
     needs: [plan, build, build-ply]
@@ -804,6 +818,21 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/suite
 
+      # What `build-ply` built, for a run of these sources on another branch: main's after the
+      # merge, most of all. From here, beside the partitions, and never a reason for a red run.
+      - name: The stage, packed
+        if: github.event_name == 'pull_request' && needs.build-ply.outputs.built == 'true'
+        continue-on-error: true
+        run: .github/ci-warm.sh pack /tmp/stage.tar.zst
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'pull_request' && needs.build-ply.outputs.built == 'true'
+        continue-on-error: true
+        with:
+          name: ply-stage-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/bootstrap/build.digest') }}
+          path: /tmp/stage.tar.zst
+          retention-days: 2
+          compression-level: 0
+
       - name: cargo nextest run
         run: |
           set -euo pipefail
@@ -832,6 +861,16 @@ jobs:
           done < <(.github/ci-shards.sh tree-checks)
           echo "$ran tree checks ran"
           [ "$ran" -gt 0 ] || { echo "the table is empty" >&2; exit 1; }
+      # The tree check that builds the `ply` program with this tree's own builder filed that build's
+      # rows and bodies under the compiler `refresh` is about to commit as main's builder. Kept, a
+      # pull request's first `ply` after that commit reads them back.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push'
+        with:
+          path: |
+            /tmp/ply-c-cache
+            /tmp/ply-c-stage
+          key: ply-c-stage-own-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
 
       # On the merge with main, not only the branch: two changes that each re-pinned their own tree
       # leave main's lock stale, and main's refresh is the first build that verifies it. Here, beside

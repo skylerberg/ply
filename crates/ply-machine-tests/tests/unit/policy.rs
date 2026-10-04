@@ -7,7 +7,6 @@ fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
         "tcb" => "hosts",
-        "edit" => "replace",
         "shipped" => "compiler.unit",
         other => other,
     }
@@ -104,7 +103,7 @@ fn a_familys_values_are_named_by_the_module_the_program_declares_it_in() {
     // These families build values of types their program declares; lending one to a consumer that
     // imports the CLI's modules is the same operations, named as it names them.
     let consumer = |effect: &str| format!("cli.{}", own(effect));
-    for family in ["machine", "claims", "hosts"] {
+    for family in ["claims", "hosts"] {
         let as_cli = policy::lent(family, &own).expect("the family is there");
         let as_consumer = policy::lent(family, &consumer).expect("the family is there");
         assert_eq!(
@@ -113,19 +112,21 @@ fn a_familys_values_are_named_by_the_module_the_program_declares_it_in() {
             "the same operations, named differently"
         );
     }
+}
+
+/// A load answers what the machine read and nothing a program's module would have to name.
+#[test]
+fn a_load_answers_a_record_of_what_was_read() {
     let found = ply_machine::drive::FoundData {
-        root: String::new(),
-        files: Vec::new(),
-        places: Vec::new(),
-        mains: Vec::new(),
-        modules: Vec::new(),
+        root: "app".to_string(),
+        files: vec!["app/m.ply".to_string()],
+        places: vec![("app/m.ply".to_string(), b"fn main() -> Int = 1\n".to_vec())],
     };
-    for module in ["machine", "cli.machine"] {
-        match &ply_machine::drive::found_value(&found, module) {
-            ply_eval::Value::Ctor { name, .. } => {
-                assert_eq!(name.as_str(), format!("{module}.Project"))
-            }
-            other => panic!("a load answers a `Target`, not {}", other.type_name()),
+    match &ply_machine::drive::found_value(&found) {
+        ply_eval::Value::Record(fields) => {
+            let names: Vec<&str> = fields.keys().map(|name| name.as_str()).collect();
+            assert_eq!(names, ["files", "places", "root"]);
         }
+        other => panic!("a load answers a record, not {}", other.type_name()),
     }
 }

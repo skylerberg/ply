@@ -60,7 +60,7 @@ grants=(--host --timeout 900000 --steps 0 --json
 cli_grants=(--host --timeout 900000 --steps 0 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   --fs cwd=. --fs abs=/ --fs "repo=$root"
-  --allow machine --allow tester --allow claims --allow builder --allow hosts
+  --allow machine --allow tester --allow claims --allow hosts
   --allow shipped)
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a

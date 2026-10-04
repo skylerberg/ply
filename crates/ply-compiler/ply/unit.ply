@@ -6,20 +6,19 @@ import parsing (int_to_bytes)
 import hash (hex)
 import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, answer_bin,
-             emit_roots_answer, module_of_root)
-import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow)
+             tables_bin, emit_roots_answer, module_of_root)
+import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow, analyse, dump_of)
+import diagnostics (parse_all)
+import infer (sccs)
 import interface (stubbed)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
 import std.bin
-import std.list (take)
+import std.list (sort_by, take, at)
 import std.bytes (hex_of, u32_at, u64_le)
 import std.fs (fs)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
-
-fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
-  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
 
 fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
 
@@ -175,8 +174,13 @@ pub type Ctor = { name: Bytes, arity: Int }
 // does not take.
 pub type Dropped = { function: Bytes, construct: Bytes, missing: Option<Bytes> }
 
-// A unit's C, the roots it takes, and what it dropped, in the order it dropped them.
-pub type Produced = { text: Bytes, taken: List<Bytes>, dropped: List<Dropped> }
+// What a unit's C was made of: its bodies, before the unit placed them, and its roots as they were
+// offered, which decide how the unit places each.
+pub type Made = { bodies: List<UnitBody>, offered: List<Offered> }
+
+// A unit's C, the roots it takes, what it dropped, in the order it dropped them, and what it was
+// made of.
+pub type Produced = { text: Bytes, taken: List<Bytes>, dropped: List<Dropped>, made: Made }
 
 // A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
 // the offered roots each covered.
@@ -211,7 +215,7 @@ fn positions(keys: List<Bytes>) -> Map<Bytes, Int> / {abort.raise} =
 // --- The fixpoint ---------------------------------------------------------------
 
 // A body the unit holds once: a group's under its first member.
-type UnitBody = { name: Bytes, text: Bytes, tables: Tables }
+pub type UnitBody = { name: Bytes, text: Bytes, tables: Tables }
 
 type Round = { bodies: List<UnitBody>, symbols: Map<Bytes, Defined>, out: List<Dropped> }
 
@@ -875,7 +879,73 @@ pub fn produce(
     ),
     taken: s.taken,
     dropped: s.dropped,
+    made: { bodies: s.bodies, offered: offered },
   }
+}
+
+// --- What a root runs ----------------------------------------------------------
+
+// The names a body answers for: a group's members, or its own.
+fn answered(body: UnitBody) -> List<Bytes> =
+  if len(body.tables.members) == 0 { [body.name] } else { body.tables.members }
+
+// How a body's roots were offered, which places them: a constant is held rather than called.
+fn offered_as(roots: Map<Bytes, Offered>, body: UnitBody) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    map(answered(body), |name: Bytes|
+      match map_get(roots, name) {
+        Some(o) ->
+          bytes_concat_all([
+            name,
+            b" ",
+            int_to_bytes(o.arity),
+            if o.constant { b" constant\n" } else { b"\n" },
+          ]),
+        None -> bytes_concat(name, b" unoffered\n"),
+      }),
+  )
+
+// What each root of a unit runs, as one digest: its own body and every body it can call, whatever
+// the calls' cycles. A body is digested as the unit keeps it, before placing, so a root that two
+// compilers or two units made into the same code is named alike by both.
+pub fn codes(made: Made) -> Map<Bytes, Bytes> / {abort.raise} = {
+  let bodies = made.bodies;
+  let n = len(bodies);
+  let index = fold(range(0, n), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    fold(answered(at(bodies, i)), acc, |m: Map<Bytes, Int>, name: Bytes| map_insert(m, name, i)));
+  let roots = fold(made.offered, map_new(), |acc: Map<Bytes, Offered>, o: Offered|
+    map_insert(acc, o.name, o));
+  let own = map(bodies, |b: UnitBody|
+    blake3(
+      bytes_concat_all([
+        blake3(b.name),
+        blake3(b.text),
+        blake3(bin::encode(b.tables, tables_bin())),
+        blake3(offered_as(roots, b)),
+      ]),
+    ));
+  let adj = map(bodies, |b: UnitBody|
+    fold(b.tables.calls, [], |acc: List<Int>, c: Bytes|
+      match map_get(index, c) { Some(j) -> push(acc, j), None -> acc }));
+  // Components come callees first, so each folds in the digests of those it reaches.
+  let reached = fold(sccs(n, adj), map_new(), |done: Map<Int, Bytes>, comp: List<Int>| {
+    let inside = fold(comp, map_new(), |m: Map<Int, Bool>, i: Int| map_insert(m, i, true));
+    let below = fold(comp, [], |acc: List<Bytes>, i: Int|
+      fold(at(adj, i), acc, |a: List<Bytes>, j: Int|
+        if map_contains(inside, j) { a }
+        else { match map_get(done, j) { Some(d) -> push(a, d), None -> a } }));
+    let digest = blake3(
+      bytes_concat_all(append(ordered(map(comp, |i: Int| at(own, i))), ordered(below))),
+    );
+    fold(comp, done, |m: Map<Int, Bytes>, i: Int| map_insert(m, i, digest))
+  });
+  fold(range(0, n), map_new(), |acc: Map<Bytes, Bytes>, i: Int| {
+    let code = blake3(
+      bytes_concat(at(own, i), match map_get(reached, i) { Some(d) -> d, None -> b"" }),
+    );
+    fold(answered(at(bodies, i)), acc, |m: Map<Bytes, Bytes>, name: Bytes|
+      map_insert(m, name, code))
+  })
 }
 
 // --- Emitting what no earlier run kept --------------------------------------------
@@ -1094,6 +1164,63 @@ fn emitter_answers(
   )
 }
 
+// The calls the emitter's work is dealt over. Each repeats the front end's work over its modules'
+// imports, so more of them lose more than they gain.
+fn pieces() -> Int = 2
+
+type Piece = { weight: Int, roots: List<Bytes> }
+
+// `missed` as at most `pieces()` lists that lower about as much each: the longest module first onto
+// the lightest list, and a module's roots together, since the emitter groups what one call wants.
+fn dealt(p: Program, missed: List<Bytes>) -> List<List<Bytes>> / {abort.raise} = {
+  let by_module = fold(missed, map_new(), |acc: Map<Bytes, List<Bytes>>, n: Bytes| {
+    let m = module_of_root(n);
+    map_insert(acc, m, push(match map_get(acc, m) { Some(xs) -> xs, None -> [] }, n))
+  });
+  let lengths = fold(p.modules, map_new(), |acc: Map<Bytes, Int>, m: ModuleRow|
+    map_insert(acc, m.name, match text_at(p, m.index) { Some(t) -> bytes_len(t), None -> 0 }));
+  let weighed = map_fold(by_module, [], |acc: List<Piece>, m: Bytes, roots: List<Bytes>|
+    push(acc, { weight: match map_get(lengths, m) { Some(n) -> n, None -> 0 }, roots: roots }));
+  let longest_first = sort_by(weighed, |a: Piece, b: Piece| a.weight >= b.weight);
+  let dealt = fold(longest_first, [], |acc: List<Piece>, m: Piece|
+    if len(acc) < pieces() { push(acc, m) } else {
+      let lightest = fold(range(0, len(acc)), 0, |best: Int, i: Int|
+        if at(acc, i).weight < at(acc, best).weight { i } else { best });
+      map(range(0, len(acc)), |i: Int| {
+        let piece = at(acc, i);
+        if i == lightest {
+          { weight: piece.weight + m.weight, roots: append(piece.roots, m.roots) }
+        } else { piece }
+      })
+    });
+  map(dealt, |piece: Piece| piece.roots)
+}
+
+// What the emitter answers for every list of `pieces` from `lo` up to `hi`, each list a call of its
+// own and the calls at once: a root's answer is the same whichever call asks for it.
+fn answers_at_once(
+  runtime: Runtime,
+  dump: Dump,
+  p: Program,
+  ctors: List<Ctor>,
+  pieces: List<List<Bytes>>,
+  lo: Int,
+  hi: Int,
+) -> List<RootAnswer> / {abort.raise} =
+  if hi - lo <= 1 {
+    match list_at(pieces, lo) {
+      Some(roots) -> emitter_answers(runtime, dump, p, ctors, roots),
+      None -> [],
+    }
+  } else {
+    let mid = lo + (hi - lo) / 2;
+    let halves = parallel {
+      answers_at_once(runtime, dump, p, ctors, pieces, lo, mid),
+      answers_at_once(runtime, dump, p, ctors, pieces, mid, hi),
+    };
+    append(halves._0, halves._1)
+  }
+
 // The unit over `offered`: each root's answer taken from what an earlier run kept where it stands,
 // the emitter entered once for the rest, what it answered kept for the next run, and the unit
 // produced over all of it. `emitter` is what the emitter's answers are a function of on its side,
@@ -1144,7 +1271,10 @@ pub fn emitted<| e>(
     decoded(read(refusal_key(m))));
   let kept = standing(looked, asked);
   let missed = filter(offered, |n: Bytes| !map_contains(kept, n));
-  let fresh = if len(missed) == 0 { [] } else { emitter_answers(runtime, dump, p, ctors, missed) };
+  let fresh = if len(missed) == 0 { [] } else {
+    let pieces = dealt(p, missed);
+    answers_at_once(runtime, dump, p, ctors, pieces, 0, len(pieces))
+  };
   if len(missed) > 0 && len(fresh) == 0 {
     Err(
       bytes_concat_all([
@@ -1377,6 +1507,86 @@ fn one_body(name: Bytes, calls: List<Bytes>) -> Answer =
     },
   })
 
+// `one_body` with other text, as an edit to its definition would make it.
+fn edited_body(name: Bytes) -> Answer =
+  match one_body(name, []) {
+    Body(b) -> Body({ ..b, text: bytes_concat(b.text, b"\n/* edited */") }),
+    other -> other,
+  }
+
+// The codes of a unit over `answers`, offering `constants` as constants and the rest as calls.
+fn codes_over(
+  answers: List<{ key: Bytes, value: Answer }>,
+  offered: List<Bytes>,
+  constants: List<Bytes>,
+) -> Map<Bytes, Bytes> / {abort.raise} =
+  codes(
+    produce(
+      { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" },
+      [],
+      map(offered, |n: Bytes|
+        { name: n, arity: 0, constant: len(filter(constants, |c: Bytes| c == n)) > 0 }),
+      1,
+      map_of_entries(answers),
+    ).made,
+  )
+
+test "a root's code moves with every body it can call, and with no other" {
+  let program = |g: Answer|
+    codes_over(
+      [
+        { key: b"m.f", value: one_body(b"m.f", [b"m.g"]) },
+        { key: b"m.g", value: g },
+        { key: b"m.h", value: one_body(b"m.h", []) },
+      ],
+      [b"m.f", b"m.g", b"m.h"],
+      [],
+    );
+  let before = program(one_body(b"m.g", []));
+  let after = program(edited_body(b"m.g"));
+  assert(map_get(before, b"m.f") != map_get(after, b"m.f"), None);
+  assert(map_get(before, b"m.g") != map_get(after, b"m.g"), None);
+  assert_eq(map_get(before, b"m.h"), map_get(after, b"m.h"));
+  assert(map_get(before, b"m.f") != map_get(before, b"m.h"), None)
+}
+
+// The checker decides which roots are constants, and the unit holds a constant where it would call
+// a root, so the same bodies offered otherwise are other code.
+test "a root's code moves with how it and its callees were offered" {
+  let program = |constants: List<Bytes>|
+    codes_over(
+      [
+        { key: b"m.f", value: one_body(b"m.f", [b"m.g"]) },
+        { key: b"m.g", value: one_body(b"m.g", []) },
+        { key: b"m.h", value: one_body(b"m.h", []) },
+      ],
+      [b"m.f", b"m.g", b"m.h"],
+      constants,
+    );
+  let called = program([]);
+  let held = program([b"m.g"]);
+  assert(map_get(called, b"m.g") != map_get(held, b"m.g"), None);
+  assert(map_get(called, b"m.f") != map_get(held, b"m.f"), None);
+  assert_eq(map_get(called, b"m.h"), map_get(held, b"m.h"))
+}
+
+test "a cycle is digested whole, whatever order the unit holds its roots in" {
+  let cycle = |b: Answer, order: List<Bytes>|
+    codes_over(
+      [{ key: b"m.a", value: one_body(b"m.a", [b"m.b"]) }, { key: b"m.b", value: b }],
+      order,
+      [],
+    );
+  let one = cycle(one_body(b"m.b", [b"m.a"]), [b"m.a", b"m.b"]);
+  assert_eq(cycle(one_body(b"m.b", [b"m.a"]), [b"m.b", b"m.a"]), one);
+  assert(map_get(one, b"m.a") != map_get(one, b"m.b"), None);
+  let edited = match edited_body(b"m.b") {
+    Body(b) -> Body({ ..b, tables: { ..b.tables, calls: [b"m.a"] } }),
+    other -> other,
+  };
+  assert(map_get(cycle(edited, [b"m.a", b"m.b"]), b"m.a") != map_get(one, b"m.a"), None)
+}
+
 // A body names a constructor's tag by the constructor, so the same answer serves programs whose
 // tables differ, and each unit writes the position its own table gives.
 test "a constructor's tag is its bucket's to read, at the position the unit's own table gives it" {
@@ -1529,6 +1739,72 @@ test "a pack is written again where it was missing or a root in it gained a body
   );
   assert_eq(len(again), 2);
   assert(fold(again, false, |found: Bool, r: List<Bytes>| found || r == [b"m.a", mate]), None)
+}
+
+fn three_modules() -> List<Bytes> =
+  [
+    b"import b\nimport c\nfn f(x: Int) -> Int = b::g(x) + c::h(x)\n",
+    b"import c\npub fn g(x: Int) -> Int = c::h(x) * 2\n",
+    bytes_concat_all([
+      b"pub fn h(x: Int) -> Int = if even(x) { x } else { x + 1 }\n",
+      b"fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\n",
+      b"fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\n",
+    ]),
+  ]
+
+fn three_modules_dump() -> Dump / {abort.raise} = {
+  let texts = three_modules();
+  dump_of(
+    analyse(
+      parse_all([
+        { name: b"a", src: at(texts, 0) },
+        { name: b"b", src: at(texts, 1) },
+        { name: b"c", src: at(texts, 2) },
+      ]),
+    ),
+  )
+}
+
+test "roots are dealt a module at a time, each once, over no more lists than there are pieces" {
+  let dump = three_modules_dump();
+  let p = program_of(dump, three_modules());
+  let missed = map(dump.emitter_roots, |r: EmitterRoot| r.root);
+  let lists = dealt(p, missed);
+  assert_eq(len(lists), pieces());
+  assert_eq(
+    ordered(fold(lists, [], |acc: List<Bytes>, roots: List<Bytes>| append(acc, roots))),
+    ordered(missed),
+  );
+  assert_eq(fold(lists, 0, |n: Int, roots: List<Bytes>| n + len(roots)), len(missed));
+  let modules = |roots: List<Bytes>| ordered(map(roots, module_of_root));
+  assert_eq(
+    fold(lists, 0, |n: Int, roots: List<Bytes>| n + len(modules(roots))),
+    len(modules(missed)),
+  );
+  let many = map(range(0, 3 * pieces()), |i: Int| bytes_concat_all([b"m", int_to_bytes(i), b".f"]));
+  assert_eq(len(dealt(p, many)), pieces())
+}
+
+test "the emitter answers roots dealt over calls as it answers them in one" {
+  let dump = three_modules_dump();
+  let p = program_of(dump, three_modules());
+  let missed = map(dump.emitter_roots, |r: EmitterRoot| r.root);
+  let runtime = { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" };
+  let lists = dealt(p, missed);
+  let rows = |answers: List<RootAnswer>|
+    map_fold(answers_of(answers), [], |acc: List<RootAnswer>, n: Bytes, a: Answer|
+      push(acc, { name: n, answer: a }));
+  let together = rows(emitter_answers(runtime, dump, p, [], missed));
+  assert(
+    fold(together, false, |found: Bool, r: RootAnswer|
+      found
+        || (match r.answer {
+          Body(b) -> b.tables.members == [b"c.even", b"c.odd"],
+          Refused(_) -> false,
+        })),
+    None,
+  );
+  assert_eq(rows(answers_at_once(runtime, dump, p, [], lists, 0, len(lists))), together)
 }
 
 test "a unit takes what its callees let it, resolves its bodies and says what it holds" {

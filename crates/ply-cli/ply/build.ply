@@ -3,8 +3,10 @@
 // which entry is built, where the artifact lands, and what both forms say. The container itself is
 // `compiler.plyx`, which owns the magic, the header and the section table.
 
-import compiler.load (LoadedAnalysis)
+import compiler.load (LoadedAnalysis, SourceFile)
 import args (Flags, no_flags, style_of)
+import entries
+import std.path (normalize)
 import builder (Loaded, Refusal)
 import builder (builder)
 import deployed (Compiled, Made, Named, Previous, Reach, artifacts, deploying)
@@ -29,7 +31,7 @@ import plyz
 import report (Answer, indent, ok_code, count_of, plural, refused, reported, warning_lines)
 import std.fs (fs, Missing)
 import std.time (time)
-import std.list (sort_by)
+import std.list (sort_by, at_or)
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
 import std.pkg (Manifest, render_version)
 import compiler.front (Analysis, Analysed, Refused, analyse, ModuleSpan, no_module, no_module_span)
@@ -89,8 +91,6 @@ fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> / {abort.
 fn root_of(flags: Flags) -> String =
   match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." }
 
-fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
-
 fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
   fold(tail, head, |acc: List<a>, x: a| push(acc, x))
 
@@ -99,7 +99,7 @@ fn repeated(text: String, n: Int) -> String =
 
 fn joined(parts: List<String>, sep: String) -> String =
   fold(range(0, len(parts)), "", |acc: String, i: Int|
-    if i == 0 { at(parts, i, "") } else { acc ++ sep ++ at(parts, i, "") })
+    if i == 0 { at_or(parts, i, "") } else { acc ++ sep ++ at_or(parts, i, "") })
 
 fn padded(text: String, width: Int) -> String =
   if string_len(text) >= width { text } else { text ++ repeated(" ", width - string_len(text)) }
@@ -131,7 +131,7 @@ fn human(n: Int) -> String / {abort.raise} = {
   let unit = unit_of(n);
   let divisor = pow1024(unit);
   if unit == 0 { int_to_string(n) ++ " B" }
-  else { one_decimal((n * 10 + divisor / 2) / divisor) ++ " " ++ at(units(), unit, "B") }
+  else { one_decimal((n * 10 + divisor / 2) / divisor) ++ " " ++ at_or(units(), unit, "B") }
 }
 
 fn shown() -> Int = 8
@@ -140,14 +140,14 @@ fn shown() -> Int = 8
 fn listed(all: List<String>) -> String = {
   let n = len(all);
   let kept = if n < shown() { n } else { shown() };
-  let head = joined(map(range(0, kept), |i: Int| at(all, i, "")), ", ");
+  let head = joined(map(range(0, kept), |i: Int| at_or(all, i, "")), ", ");
   if n <= shown() { head } else { head ++ ", and " ++ int_to_string(n - shown()) ++ " more" }
 }
 
 // `desk.run` becomes `desk.plyx`: the module is what a deployment thinks it ships.
 fn default_output(entry: String) -> String / {abort.raise} = {
   let parts = string_split(entry, ".");
-  if len(parts) < 2 { entry ++ ".plyx" } else { at(parts, len(parts) - 2, entry) ++ ".plyx" }
+  if len(parts) < 2 { entry ++ ".plyx" } else { at_or(parts, len(parts) - 2, entry) ++ ".plyx" }
 }
 
 // --- Which entry is built ---------------------------------------------------
@@ -367,25 +367,25 @@ fn startup_line(style: Style, roots: List<String>) -> String / {abort.raise} =
 fn built_lines(
   style: Style,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
   out: String,
 ) -> List<String> / {abort.raise} =
   [
-    indent() ++ green(style, "built") ++ " " ++ m.entry ++ " · " ++ sealed.digest,
-    indent() ++ bold(style, "artifact") ++ " " ++ int_to_string(m.definitions) ++ " "
-      ++ plural(m.definitions, "definition")
+    indent() ++ green(style, "built") ++ " " ++ made.entry ++ " · " ++ sealed.digest,
+    indent() ++ bold(style, "artifact") ++ " " ++ int_to_string(made.definitions) ++ " "
+      ++ plural(made.definitions, "definition")
       ++ " · "
       ++ human(bytes_len(sealed.bytes))
       ++ " · "
       ++ out,
     binary_line(style, loaded),
-    startup_line(style, m.startup),
+    startup_line(style, made.startup),
   ]
 
 fn built_json(
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
   out: String,
   signer: Option<String>,
@@ -395,14 +395,14 @@ fn built_json(
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: num(ok_code()) },
     { key: "root", value: Str(loaded.root) },
-    { key: "entry", value: Str(m.entry) },
-    { key: "entry_hash", value: Str(m.entry_hash) },
-    { key: "startup", value: strings(m.startup) },
+    { key: "entry", value: Str(made.entry) },
+    { key: "entry_hash", value: Str(made.entry_hash) },
+    { key: "startup", value: strings(made.startup) },
     { key: "artifact", value: Str(out) },
     { key: "digest", value: Str(sealed.digest) },
     { key: "format", value: num(format()) },
-    { key: "definitions", value: num(m.definitions) },
-    { key: "names", value: num(len(m.names)) },
+    { key: "definitions", value: num(made.definitions) },
+    { key: "names", value: num(len(made.names)) },
     { key: "unit", value: Bool(true) },
     { key: "artifact_bytes", value: num(bytes_len(sealed.bytes)) },
     { key: "binary_bytes", value: opt_num(loaded.binary_bytes) },
@@ -411,12 +411,12 @@ fn built_json(
   ])
 
 // `--digest` is the one line a deployment pins: not the report, and no file.
-fn digest_json(m: Made, sealed: Sealed) -> Json =
+fn digest_json(made: Made, sealed: Sealed) -> Json =
   object([
     { key: "command", value: Str("build") },
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: num(ok_code()) },
-    { key: "entry", value: Str(m.entry) },
+    { key: "entry", value: Str(made.entry) },
     { key: "digest", value: Str(sealed.digest) },
   ])
 
@@ -654,10 +654,10 @@ fn written(
   style: Style,
   flags: Flags,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
 ) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
-  let out = match flags.out { Some(v) -> v, None -> default_output(m.entry) };
+  let out = match flags.out { Some(v) -> v, None -> default_output(made.entry) };
   match signing_key(flags) {
     Err(d) -> reported(style, "build", [d], loaded.places),
     Ok(seed) -> match stored(out, sealed.bytes) {
@@ -665,15 +665,15 @@ fn written(
       Ok(_) -> match signed(
           seed,
           out,
-          built_provenance(flags, loaded, "program", m.entry, sealed),
+          built_provenance(flags, loaded, "program", made.entry, sealed),
         ) {
         Err(d) -> reported(style, "build", [d], loaded.places),
         Ok(signer) ->
           {
-            json: built_json(loaded, m, sealed, out, signer),
+            json: built_json(loaded, made, sealed, out, signer),
             lines: fold(
               signer_lines(style, signer),
-              built_lines(style, loaded, m, sealed, out),
+              built_lines(style, loaded, made, sealed, out),
               |acc: List<String>, l: String| push(acc, l),
             ),
             errs: [],
@@ -687,17 +687,17 @@ fn written(
 fn differed(
   style: Style,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
   old: String,
 ) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match artifacts.previous(old, paths::read_file(paths::spelled(old))) {
     Err(why) -> reported(style, "build", why.diags, why.places),
     Ok(was) -> {
-      let d = compared(was.names, m.names, m.reaches);
+      let d = compared(was.names, made.names, made.reaches);
       {
         json: diff_json(
-          m.entry,
+          made.entry,
           old,
           was.digest,
           sealed.digest,
@@ -706,7 +706,7 @@ fn differed(
           loaded.binary_bytes,
           was.warnings,
         ),
-        lines: diff_lines(style, m.entry, was.digest, sealed.digest, d, was.warnings),
+        lines: diff_lines(style, made.entry, was.digest, sealed.digest, d, was.warnings),
         errs: [],
         code: ok_code(),
       }
@@ -714,25 +714,25 @@ fn differed(
   }
 
 fn delivered(
-  s: Style,
+  style: Style,
   flags: Flags,
   loaded: Loaded,
-  m: Made,
+  made: Made,
   sealed: Sealed,
 ) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match flags.diff {
-    Some(old) -> differed(s, loaded, m, sealed, old),
+    Some(old) -> differed(style, loaded, made, sealed, old),
     None -> if flags.digest {
-      { json: digest_json(m, sealed), lines: [sealed.digest], errs: [], code: ok_code() }
+      { json: digest_json(made, sealed), lines: [sealed.digest], errs: [], code: ok_code() }
     } else if flags.action == "verify" {
       verified(
-        s,
+        style,
         loaded,
-        match flags.out { Some(v) -> v, None -> default_output(m.entry) },
+        match flags.out { Some(v) -> v, None -> default_output(made.entry) },
         sealed,
         domain(),
       )
-    } else { written(s, flags, loaded, m, sealed) },
+    } else { written(style, flags, loaded, made, sealed) },
   }
 
 fn is_diffed(flags: Flags) -> Bool = match flags.diff { Some(_) -> true, None -> false }
@@ -787,8 +787,29 @@ pub fn run(
   }
 }
 
-// The build, over the program `run` loaded, what it decided of it, and the front end it handed the
-// Rust side.
+// `body` with every program it reads back answered from the front end it hands over: the root it
+// was loaded at, the entry points and the pins the answer holds, and this binary's size and
+// version.
+pub fn reading_back<a | e>(
+  body: () -> a / {builder.loaded[build] | e},
+) -> a / {env.binary_bytes[sys], env.binary_version[sys], abort.raise | e} =
+  handle { body() } with { builder.loaded[build](root, front) -> Ok(read_back(root, front)) }
+
+fn read_back(
+  root: String,
+  front: LoadedAnalysis,
+) -> Loaded / {env.binary_bytes[sys], env.binary_version[sys], abort.raise} =
+  {
+    root: normalize(root),
+    mains: entries::mains_of(front),
+    modules: entries::modules_of(front),
+    places: map(front.files, |file: SourceFile| { path: file.path, text: file.text }),
+    pins: lock::from_front(front.dump.pins),
+    binary_bytes: env.binary_bytes[sys](),
+    version: env.binary_version[sys](),
+  }
+
+// The build, over the program `run` loaded, what it decided of it, and its front end.
 fn built_over(
   style: Style,
   flags: Flags,
@@ -1082,8 +1103,8 @@ test "a simple name two modules declare says which two" {
       assert_eq(d.code, b"E0112");
       assert_eq(d.message, b"2 definitions are named `util`");
       assert_eq(len(d.labels), 2);
-      assert_eq(at(d.labels, 0, marked(no_module_span(), false, b"")).primary, true);
-      assert_eq(at(d.labels, 1, marked(no_module_span(), true, b"")).primary, false)
+      assert_eq(at_or(d.labels, 0, marked(no_module_span(), false, b"")).primary, true);
+      assert_eq(at_or(d.labels, 1, marked(no_module_span(), true, b"")).primary, false)
     },
   }
 }
@@ -1266,7 +1287,7 @@ test "the object keys off `command` and `exit_code`, and names the file it wrote
 
 test "`-o` names the file, and the entry's module names it otherwise" {
   let answer = a_build({ ..no_flags(), out: Some("dist/app.plyx") });
-  assert_eq(at(answer.lines, 1, ""), "   artifact 1 definition · 210 B · dist/app.plyx")
+  assert_eq(at_or(answer.lines, 1, ""), "   artifact 1 definition · 210 B · dist/app.plyx")
 }
 
 test "`--digest` writes the one line a deployment pins and nothing else" {
@@ -1352,7 +1373,7 @@ test "an entry point the flags name badly stops the build before anything is mad
   );
   assert_eq(answer.code, 2);
   assert_eq(
-    at(answer.errs, 0, ""),
+    at_or(answer.errs, 0, ""),
     "Error[E0201]: `m.serve` takes 1 argument, and a deployed artifact is started with none",
   )
 }

@@ -24,6 +24,7 @@ import configuration (Configuration, Resolution)
 import std.config (SInt, SSecret)
 import compiler.resolve (Diag, Label)
 import diagnostic (Place, Raised, Spot, shown, spot_of, all_to_json, all_to_text)
+import entries
 import entry (Main, Module, entry_point)
 import env (env)
 import paths
@@ -44,6 +45,7 @@ import std.process (process, Captured, captured, out_step, err_step)
 import style (Style, dim, plain, red)
 import signing (provenance_of, public_of, signatures_path, unkeyed)
 import std.signed (signed_of, vouched_by)
+import std.list (at_or)
 import compiler.plyx (digest_of, digest_text, domain, library_domain)
 import compiler.resolve (error_at)
 import compiler.unit (shipped)
@@ -53,7 +55,7 @@ import deployed
 // the path the line named, or `.`.
 
 import machine (Artifact, Deployed, Bound, Counters, Ended, Options, Program, Project, Refusal,
-                Signals, Stopping, Target, Teardown, Trace, WalkKey, machine)
+                Signals, Stopping, Target, Teardown, Trace, WalkKey, machine, program_of)
 
 // --- Small things -----------------------------------------------------------
 
@@ -67,11 +69,9 @@ fn failed() -> Int = 1
 // The drain deadline expired with requests still in flight.
 fn drain_incomplete() -> Int = 3
 
-fn nth(xs: List<String>, i: Int) -> String = match list_at(xs, i) { Some(x) -> x, None -> "" }
-
 fn joined(parts: List<String>, sep: String) -> String =
   fold(range(0, len(parts)), "", |acc: String, i: Int|
-    if i == 0 { nth(parts, i) } else { acc ++ sep ++ nth(parts, i) })
+    if i == 0 { at_or(parts, i, "") } else { acc ++ sep ++ at_or(parts, i, "") })
 
 fn also<a>(head: List<a>, tail: List<a>) -> List<a> =
   fold(tail, head, |acc: List<a>, x: a| push(acc, x))
@@ -85,7 +85,7 @@ fn texts(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
 // `m.main` is declared by `m`: a definition's name is its module's and its own.
 fn module_of(name: String) -> String / {abort.raise} = {
   let parts = string_split(name, ".");
-  joined(map(range(0, len(parts) - 1), |i: Int| nth(parts, i)), ".")
+  joined(map(range(0, len(parts) - 1), |i: Int| at_or(parts, i, "")), ".")
 }
 
 // An artifact's spans point into text printed at build time, which no reader wrote, so it places
@@ -163,13 +163,13 @@ fn signal_lines(style: Style, bound: Bound) -> List<String> / {abort.raise} =
 
 fn wrote(lines: List<String>, i: Int) -> Unit / {process.out[proc]} =
   if i >= len(lines) { () } else {
-    process.out[proc](nth(lines, i));
+    process.out[proc](at_or(lines, i, ""));
     wrote(lines, i + 1)
   }
 
 fn warned(lines: List<String>, i: Int) -> Unit / {process.err[proc]} =
   if i >= len(lines) { () } else {
-    process.err[proc](nth(lines, i));
+    process.err[proc](at_or(lines, i, ""));
     warned(lines, i + 1)
   }
 
@@ -562,14 +562,14 @@ fn started(
   }
 
 fn chosen(
-  s: Style,
+  style: Style,
   flags: Flags,
   target: Target,
   cfg: Result<Resolution, List<Diag>>,
 ) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], abort.raise} =
   match entry_of(target) {
-    Err(d) -> unentered(s, target, d),
-    Ok(en) -> started(s, flags, target, en, cfg),
+    Err(d) -> unentered(style, target, d),
+    Ok(en) -> started(style, flags, target, en, cfg),
   }
 
 // The configuration a run binds, read once its target loaded, whose own unit enters the schema.
@@ -762,8 +762,14 @@ fn sourced(
   let asked = time.elapsed_ms();
   let kept: Option<Target> = if usable(project) {
     match entry_at(walk.key) {
-      Some(entry) -> machine.reuse[run](root_of(flags), walk, entry),
       None -> None,
+      Some(filed) -> match entries::taken(filed) {
+        None -> None,
+        Some(k) -> match machine.reuse[run](root_of(flags), walk, k.front) {
+          Some(read) -> Some(program_of(read, k.entries.mains, k.entries.modules)),
+          None -> None,
+        },
+      },
     }
   } else { None };
   match kept {
@@ -825,9 +831,13 @@ fn loaded_built(
   let asked = time.elapsed_ms();
   let front = front_of(timed, analysis);
   let emitted = units::whole(front);
+  let offered = entries::of_front(front);
   let target = match emitted {
     Err(diags) -> Err({ diags: diags, places: timed.program.places, artifact: None }),
-    Ok(unit) -> machine.load[run](root_of(flags), front, unit),
+    Ok(unit) -> match machine.load[run](root_of(flags), front, unit) {
+      Ok(read) -> Ok(program_of(read, offered.mains, offered.modules)),
+      Err(why) -> Err(why),
+    },
   };
   let l = {
     reused: false,
@@ -840,7 +850,7 @@ fn loaded_built(
   match ((target, emitted)) {
     (Ok(_), Ok(unit)) -> match machine.filed[run](front, unit) {
       Some(entry) -> {
-        let _ = file(key, entry);
+        let _ = file(key, entries::kept(offered, entry));
         ()
       },
       None -> (),
@@ -1138,8 +1148,8 @@ test "a raise is exit 1, and says where it was raised for a reader with the file
   let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), raise);
   assert_eq(ran.answer.code, 1);
   assert_eq(ran.answer.lines, []);
-  assert_eq(nth(ran.answer.errs, 0), "Error[E0501]: nope");
-  assert_eq(nth(ran.answer.errs, len(ran.answer.errs) - 1), "   raised at m.ply:1:20")
+  assert_eq(at_or(ran.answer.errs, 0, ""), "Error[E0501]: nope");
+  assert_eq(at_or(ran.answer.errs, len(ran.answer.errs) - 1, ""), "   raised at m.ply:1:20")
 }
 
 test "a raise shows the values it carries, rendered where its text names them" {
@@ -1149,7 +1159,7 @@ test "a raise shows the values it carries, rendered where its text names them" {
     raised: Some({ diag: a_diag(b"E0501", b"expected \x010\x02", []), values: [VInt(3)] }),
   };
   let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), raise);
-  assert_eq(nth(ran.answer.errs, 0), "Error[E0501]: expected 3")
+  assert_eq(at_or(ran.answer.errs, 0, ""), "Error[E0501]: expected 3")
 }
 
 test "an expired drain is exit 3, and is not attributed to a line of the program" {
@@ -1243,9 +1253,9 @@ test "a raise that left spans open is said first, and the spans after where it w
   let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), finished);
   assert_eq(ran.answer.code, 1);
   let errs = ran.answer.errs;
-  assert_eq(nth(errs, 0), "Error[E0502]: boom");
-  assert_eq(nth(errs, len(errs) - 4), "   raised at m.ply:1:20");
-  assert_eq(map(range(len(errs) - 3, len(errs)), |i: Int| nth(errs, i)), warned_of_spans())
+  assert_eq(at_or(errs, 0, ""), "Error[E0502]: boom");
+  assert_eq(at_or(errs, len(errs) - 4, ""), "   raised at m.ply:1:20");
+  assert_eq(map(range(len(errs) - 3, len(errs)), |i: Int| at_or(errs, i, "")), warned_of_spans())
 }
 
 test "an artifact says which file it ran, its digest, and what it carries" {
@@ -1271,7 +1281,7 @@ test "what opening an artifact warned of is said before it runs" {
   });
   let ran = ran_over(bare(), Ok(warned), Ok(hermetic()), answered_with(VInt(42)));
   assert_eq(
-    nth(ran.out, 0),
+    at_or(ran.out, 0, ""),
     "   warning: the artifact was built against a different standard library",
   );
   assert_eq(ran.answer.code, 0)
@@ -1394,14 +1404,17 @@ test "a run over a reused front end answers exactly as one over a front end it r
 
 test "`--explain` says whether the front end ran, under which key, and where the time went" {
   let reused = loaded(explaining(), a_reuse());
-  assert_eq(nth(reused.err, 0), "   front end   reused b3:0123456789ab · read 9ms · load 41ms");
+  assert_eq(
+    at_or(reused.err, 0, ""),
+    "   front end   reused b3:0123456789ab · read 9ms · load 41ms",
+  );
   let built = loaded(explaining(), a_build());
   assert_eq(
-    nth(built.err, 0),
+    at_or(built.err, 0, ""),
     "   front end   built b3:0123456789ab · read 7ms · front 1774ms · write back 44ms · load 1392ms",
   );
   // Said before the entry runs, ahead of what the binding discloses on the same stream.
-  assert_eq(nth(built.err, 1), nth(loaded(bare(), a_build()).err, 0));
+  assert_eq(at_or(built.err, 1, ""), at_or(loaded(bare(), a_build()).err, 0, ""));
   assert_eq(built.answer, loaded(bare(), a_build()).answer)
 }
 
