@@ -70,7 +70,12 @@ runtime. A pass is filed as well under the code its test compiled to, believed b
 whose runtime and definitions that run a test and file its pass hash as they did,
 so a compiler change that leaves a test's code as it was does not run it again.
 A hash covers what its definition reaches and no comment or
-layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these. A dependency's own
+layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these.
+What the front end filed for a definition is taken again while the definition's
+own text and what it reads of each definition and declaration it references
+stand: the signature and specifications written there, how its calls end, and
+what it performs or answers that a caller's check counts by. An edited body is
+checked again, and what references it only where one of those moved. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
@@ -2311,7 +2316,9 @@ The twin is `MemFs`, with a `mem_` function for every operation (`mem_read`,
 `mem_remove`, `mem_remove_tree`, `mem_rename`, `mem_symlink`, `mem_set_mode`,
 `mem_set_modified`, `mem_sync`, `mem_lock`, `mem_unlock`) and `mem_empty` and
 `mem_of` to start one. It follows a symlink where the host does, a chain of more
-than forty being a loop that names nothing. It holds its owner to a path's
+than forty being a loop that names nothing, and it refuses a path that leaves
+its root as the host does, raising with `E0452`'s words, so a test over the twin
+fails where the same code fails on a disk. It holds its owner to a path's
 owner bits, a fresh file being `rw-r--r--` and a fresh directory `rwxr-xr-x`, so
 a test can make a file unreadable. It has no wall clock, so no lock in it goes
 stale and `mem_temp_dir` names a directory from its prefix and the tree's own

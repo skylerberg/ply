@@ -1715,9 +1715,12 @@ pub type HashOutput = {
   refs: Refs,
   bodies: List<{ name: Bytes, body: Bytes }>,
   test_bodies: List<Bytes>,
-  // What a definition's checked rows and proofs are filed under: its body and the contracts of what
-  // it reaches in other packages. A fixed definition's is its hash.
-  checks: List<{ name: Bytes, hash: Bytes }>,
+  // Each test's own form: its body with every reference written as the name it resolves to.
+  test_texts: List<Bytes>,
+  // What a definition's signature and specifications say to whoever references it.
+  contracts: List<{ name: Bytes, hash: Bytes }>,
+  // What a clause's proof is filed under: its definition's body and the contracts of what that
+  // reaches in other packages. A fixed definition's is its hash.
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
   // What a later run of the same program takes in place of hashing a node again.
   priors: List<Prior>,
@@ -1743,7 +1746,8 @@ pub fn no_hashes() -> HashOutput =
     refs: { names: [], edges: [], starts: map_new() },
     bodies: [],
     test_bodies: [],
-    checks: [],
+    test_texts: [],
+    contracts: [],
     spec_checks: [],
     priors: [],
   }
@@ -1974,6 +1978,7 @@ type Hashed = {
   bodies: Map<Int, Bytes>,
   tests: List<Bytes>,
   test_bodies: List<Bytes>,
+  test_texts: List<Bytes>,
   test_refs: List<List<Int>>,
   laws: List<Bytes>,
   law_refs: List<List<Int>>,
@@ -1981,9 +1986,17 @@ type Hashed = {
   own: List<{ name: Bytes, hash: Bytes }>,
   specs: List<{ name: Bytes, hashes: List<Bytes> }>,
   spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
-  checks: Map<Int, Bytes>,
+  contracts: Map<Int, Bytes>,
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
   priors: List<Prior>,
+}
+
+// Each test's hash, stored body, own form and references, in the index's order.
+type TestForms = {
+  hashes: List<Bytes>,
+  bodies: List<Bytes>,
+  texts: List<Bytes>,
+  refs: List<List<Int>>,
 }
 
 // `hashes` is the table references are written from; `fresh` is what each body hashed to under it.
@@ -2173,6 +2186,7 @@ pub type Prior = {
   sketch: Bytes,
   hash: Bytes,
   check: Bytes,
+  contract: Bytes,
   own: Option<Bytes>,
   specs: List<Bytes>,
   spec_texts: List<Bytes>,
@@ -2313,6 +2327,7 @@ fn priors_of(
   sketches: List<Sketched>,
   keyed: Keyed,
   check_keys: CheckKeys,
+  contracts: Map<Int, Bytes>,
   forms: Forms,
 ) -> List<Prior> / {abort.raise} = {
   let named = |xs: List<{ name: Bytes, hashes: List<Bytes> }>|
@@ -2338,6 +2353,7 @@ fn priors_of(
             sketch: at(sketches, v).sketch,
             hash: h,
             check: match map_get(check_keys.checks, v) { Some(c) -> c, None -> h },
+            contract: match map_get(contracts, v) { Some(c) -> c, None -> h },
             own: if decl { None } else { map_get(own, node.name) },
             specs: if decl { [] } else { listed(specs, node.name) },
             spec_texts: if decl { [] } else { listed(spec_texts, node.name) },
@@ -2381,15 +2397,28 @@ fn hashed_over(
   let keyed = key_components(index, g, pinned, held, kept);
   let hashes = keyed.hashes;
   let check_keys = check_key_components(index, g, held, kept, packages, hashes);
+  let contracts = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int|
+    if is_decl(at(index.nodes, v)) { acc } else {
+      map_insert(acc, v, match map_get(kept, v) {
+        Some(p) -> p.contract,
+        None -> match map_get(check_keys.contracts, v) {
+          Some(c) -> c,
+          None -> contract_of(index, g, hashes, v),
+        },
+      })
+    });
   let tests = fold(
     index.tests,
-    { hashes: [], bodies: [], refs: [] },
-    |acc: { hashes: List<Bytes>, bodies: List<Bytes>, refs: List<List<Int>> }, t: TestNode| {
-      let f: Finished = encode_item(index, t.module, scc, hashes, false, |encoder: Encoder|
-        test_def(encoder, t.def));
+    { hashes: [], bodies: [], texts: [], refs: [] },
+    |acc: TestForms, t: TestNode| {
+      let body = |encoder: Encoder| test_def(encoder, t.def);
+      let effects = slots_of(index, t.module, scc, body);
+      let f: Finished = encode_slotted(index, t.module, hashes, effects, false, body);
+      let text: Finished = encode_slotted(index, t.module, hashes, effects, true, body);
       {
         hashes: push(acc.hashes, blake3(f.bytes)),
         bodies: push(acc.bodies, solo_body(f.bytes)),
+        texts: push(acc.texts, own_hash(text.bytes)),
         refs: push(acc.refs, f.refs),
       }
     },
@@ -2445,6 +2474,7 @@ fn hashed_over(
     bodies: keyed.bodies,
     tests: tests.hashes,
     test_bodies: tests.bodies,
+    test_texts: tests.texts,
     test_refs: tests.refs,
     laws: laws.hashes,
     law_refs: laws.refs,
@@ -2452,9 +2482,9 @@ fn hashed_over(
     own: forms.own,
     specs: forms.specs,
     spec_texts: forms.spec_texts,
-    checks: check_keys.checks,
+    contracts: contracts,
     spec_checks: forms.spec_checks,
-    priors: priors_of(index, held, sketches, keyed, check_keys, forms),
+    priors: priors_of(index, held, sketches, keyed, check_keys, contracts, forms),
   })
 }
 
@@ -2868,7 +2898,8 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
     refs: { names: map(index.nodes, |node: Node| node.name), edges: edges, starts: starts },
     bodies: [],
     test_bodies: h.test_bodies,
-    checks: [],
+    test_texts: h.test_texts,
+    contracts: [],
     spec_checks: h.spec_checks,
     priors: h.priors,
   };
@@ -2888,9 +2919,9 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
               {
                 ..bodied,
                 defs: push(bodied.defs, { name: node.name, hash: hash }),
-                checks: push(bodied.checks, {
+                contracts: push(bodied.contracts, {
                   name: node.name,
-                  hash: match map_get(h.checks, v) { Some(k) -> k, None -> hash },
+                  hash: match map_get(h.contracts, v) { Some(c) -> c, None -> hash },
                 }),
               },
             _ -> { ..bodied, decls: push(bodied.decls, { name: node.name, hash: hash }) },
