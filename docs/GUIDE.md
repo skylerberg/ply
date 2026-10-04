@@ -48,7 +48,8 @@ makes its parent the root and loads only that file.
 filed for each file, the tests' passes and baselines, the discharged
 obligations and the review baselines, in one data file (`store.dat`) found
 through one index (`store.idx`) — the compiled package the project's loads
-read their dependencies and the shipped modules through (`interfaces/`, §16),
+read their dependencies and the shipped modules through, and what `ply check`
+kept of the project's own modules (`interfaces/`, §16),
 and the git dependencies that were fetched;
 `vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
 not reach the network carries. It is safe to delete (`ply cache clear` discards
@@ -3561,7 +3562,14 @@ this compiler, that runnable is the program: a hash covers all its definition
 reaches and no comment, layout, test or definition nothing reaches. Otherwise it
 checks the sources, seeded with the rows its last build of that program
 kept, emits its unit with the emitter's answers kept, and writes the runnable,
-keeping it under that key in `programs/` below the stage root. The launcher
+keeping it under that key in `programs/` below the stage root. A program it
+ships holds no test and no law, which nothing it enters reaches, and a module
+whose text has not moved since its last build of the program, and that imports
+none whose text has, it reads as that build cut it: its signatures and
+declarations, with the rows and hashes kept for its bodies. What a module embeds
+counts as its text does: a file it embeds that reads otherwise has the module,
+and every module importing it, read from source. The answer is the
+one a build from every source gives. The launcher
 lays the committed runnable there under the key committed beside it.
 The committed builder builds `ply`, so each build reads back what the ones
 before it kept; where `ply`'s sources need a rule that builder lacks, it builds
@@ -3611,12 +3619,17 @@ pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the
 front end takes as they are. A module whose source or package manifest moved
-since, or that imports one that did, is read from source, as is one the package
+since, or that embeds a file that reads otherwise, or that imports a module
+either is true of, is read from source, as is one the package
 lacks, and the package is cut again from the load's own analysis, so a package
 costs no analysis of its own; a project keeps one per semantics version (§15.1),
 so a `ply` that changes nothing a hash or a row means reads the one another
 kept. A registry dependency's first load reads it through the interface its
-publisher sent. A run about the
+publisher sent. `ply check` of a whole project reads the project's own modules
+the same way, from what its last check kept beside the package: a module that
+still stands enters with its bodies cut out and its tests and laws as written,
+its rows answer for the bodies, and what the check warned of it is said again.
+Its answer is the one a check of every source gives. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
 read and file neither, and neither does `compiler.load`. A cache that will not read
