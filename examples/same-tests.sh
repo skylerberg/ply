@@ -41,7 +41,8 @@ done
 if [ -n "${PLY_BIN:-}" ]; then
   ply="$PLY_BIN"
 else
-  cargo build --locked --release --quiet --manifest-path "$root/Cargo.toml" -p ply-launcher --bin ply
+  cargo build --locked --release --quiet --manifest-path "$root/Cargo.toml" -p ply-launcher --bins
+  (cd "$root" && target/release/ply-pack target/release/ply)
   ply="$root/target/release/ply"
 fi
 if ! "$root/.github/binary-is-current.sh" "$ply"; then

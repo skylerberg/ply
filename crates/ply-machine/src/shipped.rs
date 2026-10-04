@@ -79,7 +79,7 @@ impl HostHandler for Shipped {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
             ("names", []) => PlyValue::list(
-                crate::shelf::sources()
+                crate::shipped_modules::sources()
                     .iter()
                     .map(|(name, _)| PlyValue::str(name))
                     .collect(),
@@ -87,7 +87,7 @@ impl HostHandler for Shipped {
             ("module", [name]) => {
                 let name = name.as_str(span, "a module's name")?;
                 crate::payload::option(
-                    crate::shelf::sources()
+                    crate::shipped_modules::sources()
                         .iter()
                         .find(|(n, _)| n == name)
                         .map(|(_, text)| PlyValue::bytes(text.as_bytes())),

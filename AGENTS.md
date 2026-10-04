@@ -2,7 +2,9 @@
 
 Ply is a general-purpose programming language. Its compiler is written in Ply
 (`crates/ply-compiler/ply`), and its builder (`build.main`) is committed as a runnable the launcher
-enters to build `ply` itself. The Rust crates are the runtime and the launcher.
+enters to build `ply` itself. The Rust crates are the runtime and the launcher; the Ply sources and
+runnables a `ply` binary carries are appended to it by `cargo pack BINARY`, never compiled into
+Rust, so after editing Ply sources `cargo pack` is the rebuild.
 
 ## Prose
 

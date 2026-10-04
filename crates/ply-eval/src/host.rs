@@ -393,9 +393,14 @@ fn resolve(
     }
 }
 
+/// The standard library's reserved root itself, or a module under it.
+pub fn is_std(name: &str) -> bool {
+    name == "std" || name.starts_with("std.")
+}
+
 /// Reserved std effects match by program-wide name; others by their declared name.
 fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: &Symbol) -> bool {
-    if ply_std::is_std(registered.as_str()) {
+    if is_std(registered.as_str()) {
         registered == program_wide
     } else {
         registered == declared
@@ -485,7 +490,7 @@ impl HostListing {
     }
 
     pub fn digest_short(&self) -> String {
-        ply_std::short_digest(&self.digest())
+        crate::digest::short(&self.digest())
     }
 }
 

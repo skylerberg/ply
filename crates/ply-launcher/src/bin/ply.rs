@@ -9,10 +9,14 @@ static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
 fn main() {
     ply_host::time::mark_start(std::time::Instant::now());
+    if let Err(why) = ply_launcher::install_own_pack() {
+        eprintln!("ply: {why}");
+        std::process::exit(2);
+    }
     let program = match ply_launcher::shipped::program() {
         Ok(runnable) => Program {
             runnable,
-            shelf: ply_machine::shelf::sources().to_vec(),
+            shipped_modules: ply_machine::shipped_modules::sources().to_vec(),
             stage: ply_launcher::shipped::stage_name(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },

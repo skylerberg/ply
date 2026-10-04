@@ -5,6 +5,16 @@
 use crate::limit::grow;
 use crate::{Diagnostic, Span, Value, codes};
 
+/// `b3:` and a digest's first twelve hex characters: every digest Ply prints for a person to
+/// compare is written this way.
+pub fn short(digest: &[u8; 32]) -> String {
+    let mut out = String::from("b3:");
+    for byte in &digest[..6] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// The digest, or the refusal of a value `derivable(hash, ·)` admits no type of.
 pub fn digest(v: &Value, span: Span) -> Result<[u8; 32], Diagnostic> {
     let mut h = blake3::Hasher::new();

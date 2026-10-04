@@ -1,31 +1,10 @@
-//! What the build script reads of the tree `ply` is built from: the packages a manifest depends on
-//! by path, and the `Cargo.lock` entries the runtime's crates reach. `build.rs` includes this
-//! file, so it reads the files themselves.
+//! What the build script reads of the tree `ply` is built from: the `Cargo.lock` entries the
+//! runtime's crates reach. `build.rs` includes this file, so it reads the files themselves.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The directories every `Path("...")` of a manifest names, resolved against its own.
-pub fn path_dependencies(manifest: &Path) -> Vec<PathBuf> {
-    let text = std::fs::read_to_string(manifest).unwrap_or_default();
-    let dir = manifest.parent().expect("a manifest is in a directory");
-    let mut out = Vec::new();
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find("Path(\"") {
-        rest = &rest[at + "Path(\"".len()..];
-        match rest.find('"') {
-            Some(end) => {
-                out.push(normalize(&dir.join(&rest[..end])));
-                rest = &rest[end + 1..];
-            }
-            None => break,
-        }
-    }
-    out
-}
-
-/// Lexical, because a dependency is written as `../../x` and `Path::join` keeps the `..`s: the keys
-/// have to line up with the repository's own paths.
+/// Lexical, because `Path::join` keeps the `..`s: the digest's keys are the repository's paths.
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {

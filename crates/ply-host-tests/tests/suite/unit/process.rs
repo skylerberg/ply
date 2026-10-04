@@ -109,7 +109,10 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         };
         assert_eq!(op.linearity, expected, "{op}");
     }
-    assert!(DECLARATION.contains("pub nondet effect process"));
+    let declaration =
+        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.process"))
+            .expect("std.process ships");
+    assert!(declaration.contains("pub nondet effect process"));
     for op in Op::ALL {
         // The label is the process for its own streams, and the executable for a child or `bound`.
         let executes = matches!(
@@ -125,7 +128,7 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         );
         let label = if executes { "e" } else { "p" };
         assert!(
-            DECLARATION.contains(&format!(" {}[{label}]", op.name())),
+            declaration.contains(&format!(" {}[{label}]", op.name())),
             "`{}` is not declared in std.process",
             op.name()
         );

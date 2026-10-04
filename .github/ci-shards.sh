@@ -132,17 +132,17 @@ declare -a PROBE_JOBS=(
 )
 
 # What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
-# the archive every partition unpacks, the emitter's stage, and the shard cut. No later run can
-# name one, so a green run gives them back, and the repository's 10 GB cache stays for what does
-# outlive a run: the stage under `ply-c-stage-sources-`, the kept C, the stores and the passes.
-GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
+# the emitter's stage and the shard cut. No later run can name one, so a green run gives them back,
+# and the repository's 10 GB cache stays for what does outlive a run: the archive and the runtime
+# under the Rust key, the stage under `ply-c-stage-sources-`, the kept C, the stores and the passes.
+GIVE_BACK=(ply-c-stage-emitter- test-shards-)
 
 # `<family>-<run id>` entries only the newest of which is ever restored.
 SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(ply-c-stage-sources- ply-c-stage-own- ply-c-corpus-)
+NEWEST=(nextest-archive- ply-runtime- ply-c-stage-sources- ply-c-stage-own- ply-c-corpus-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -941,6 +941,54 @@ cmd_cache_payloads() {
   return $((missing > 0))
 }
 
+# Every input a fresh build's dep-info lists, held to the patterns the Rust key hashes: an input the
+# key missed would let a cached runtime or archive stand for sources it was not built from. A path
+# outside the repository is a registry crate's, which `Cargo.lock` pins.
+cmd_rust_inputs() {
+  local depinfo=${1:?usage: ci-shards.sh rust-inputs DEPINFO} action="$root/.github/actions/rust-key/action.yml"
+  local patterns=() pattern dep rel part missing=0 checked=0 covered
+  while IFS= read -r pattern; do
+    pattern=$(printf '%s' "$pattern" | tr -d "\"' ")
+    [ -n "$pattern" ] && patterns+=("$pattern")
+  done < <(grep -oh 'hashFiles([^)]*)' "$action" | sed -e 's/.*hashFiles(//' -e 's/)$//' | tr ',' '\n')
+  [ "${#patterns[@]}" -gt 0 ] || { echo "FAIL: $action hashes no pattern" >&2; return 1; }
+  while IFS= read -r dep; do
+    [ -n "$dep" ] || continue
+    case "$dep" in "$root"/*) dep=${dep#"$root"/} ;; /*) continue ;; esac
+    # Lexically, as the key's patterns spell the repository: `a/../b` is `b`.
+    local parts=()
+    IFS=/ read -r -a segments <<< "$dep"
+    for part in "${segments[@]}"; do
+      case "$part" in
+        "" | .) ;;
+        ..) [ "${#parts[@]}" -gt 0 ] && unset 'parts[${#parts[@]}-1]' ;;
+        *) parts+=("$part") ;;
+      esac
+    done
+    rel=$(IFS=/; printf '%s' "${parts[*]}")
+    case "$rel" in target/*) continue ;; esac
+    checked=$((checked + 1))
+    covered=no
+    for pattern in "${patterns[@]}"; do
+      # shellcheck disable=SC2053 # the pattern is a glob on purpose
+      if [[ $rel == $pattern || $rel/ == $pattern ]]; then covered=yes; break; fi
+    done
+    if [ "$covered" = no ]; then
+      echo "FAIL: the build read $rel, which no pattern of the Rust key covers" >&2
+      missing=$((missing + 1))
+    fi
+  done < <(awk '
+    { i = index($0, ":"); if (i == 0) next
+      rest = substr($0, i + 1)
+      gsub(/\\ /, "\001", rest)
+      n = split(rest, a, / +/)
+      for (j = 1; j <= n; j++) if (a[j] != "") { gsub(/\001/, " ", a[j]); print a[j] } }
+  ' "$depinfo")
+  [ "$checked" -gt 0 ] || { echo "FAIL: $depinfo names no input" >&2; return 1; }
+  [ "$missing" -eq 0 ] && echo "rust inputs: all $checked inputs the build read are under the Rust key"
+  return $((missing > 0))
+}
+
 # Deletes this run's entries under the keys above. A GitHub key is immutable, so an entry no later
 # run reads holds the repository's cache budget against the caches that do outlive a run.
 cmd_give_back() {
@@ -1560,10 +1608,11 @@ case "${1:-}" in
   host-filter) cmd_host_filter ;;
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
+  rust-inputs) cmd_rust_inputs "${2:-}" ;;
   give-back) cmd_give_back "${2:?a run id}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|give-back RUN|supersede RUN REF}" >&2
     exit 2
     ;;
 esac
