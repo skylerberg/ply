@@ -7,22 +7,112 @@ import compiler.front (Analysed, Claim, ClaimClause, ClaimDef, Refused, Analysis
                        claims_in, module_imports)
 import compiler.items (SEnsures, SRequires)
 import compiler.resolve (ParsedModule)
-import context (Context, Claims, claims_of, context)
-import decide (Certified, Diagnosed, Static, Undecided, GuardRefuted, Unwitnessed,
+import context (Context, Claims, claims_of, context, group_of)
+import decide (Certified, Diagnosed, Static, Undecided, GuardRefuted, Unwitnessed, Proved, Unknown,
                decide_and_diagnose, static_of)
-import goal (Goal, Binder, Limits, default_limits)
+import goal (Goal, Binder, Limits, BudgetSpent, default_limits, default_prove_budget)
+import lower (Blocker, blocker_parts)
+import measure (descent_of)
 import obligation (Ensures, Law)
 import sort (canonical)
-import world (Drawn, Fitting, Obligation, World, Interleave, Hosted, world_of)
+import world (Drawn, Fitting, Measure, Obligation, World, Interleave, Hosted, measures_in,
+              measures_world, world_of)
 import world
 import std.list (concat)
 
 pub type Prover = { cx: Context, claims: Claims, limits: Limits }
 
+// Measures are decided first: a definition whose measures a proof shows descend, across its group, is
+// unrolled as one the checker saw end.
 pub fn prover_of(cs: List<Claim>, w: World, budget: Int) -> Prover / {abort.raise} = {
   let claims = claims_of(cs);
-  { cx: context(claims, w), claims: claims, limits: { ..default_limits(), steps: budget } }
+  let cx = context(claims, w);
+  let limits = { ..default_limits(), steps: budget };
+  let shown = fold(w.measures, map_new(), |m: Map<String, Bool>, x: Measure|
+    match judged(cx, x, limits) { Ok([]) -> map_insert(m, x.owner, true), _ -> m });
+  {
+    cx: {
+      ..cx,
+      measured: fold(map_keys(shown), map_new(), |m: Map<String, Bool>, name: String|
+        if fold(group_of(cx, name), true, |all: Bool, member: String|
+            all && (map_contains(shown, member) || !states(cx, member))) {
+          map_insert(m, name, true)
+        } else { m }),
+    },
+    claims: claims,
+    limits: limits,
+  }
 }
+
+// A measure no proof shows descends, what kept one from it, and whether the checker reads its
+// definition as ending without it.
+pub type Unshown = { measure: Measure, why: List<String>, ends: Bool }
+
+// The measures the modules `owned` answers for state that no proof shows descend, which the checker
+// refuses: a definition is read as ending on its measure only once a proof shows the measure.
+pub fn unshown(analysis: Analysis, owned: (Bytes) -> Bool) -> List<Unshown> / {abort.raise} = {
+  let measures = measures_in(analysis, owned);
+  if len(measures) == 0 { [] } else {
+    let w = measures_world(analysis, measures);
+    let modules = fold(w.measures, [], |acc: List<Int>, m: Measure|
+      if fold(acc, false, |seen: Bool, k: Int| seen || k == m.at.module) { acc }
+      else { push(acc, m.at.module) });
+    let cx = context(claims_of(claims_for(analysis, modules, owned)), w);
+    let limits = { ..default_limits(), steps: default_prove_budget() };
+    fold(w.measures, [], |acc: List<Unshown>, m: Measure| {
+      let ends = match map_get(cx.claims.defs, m.owner) { Some(d) -> d.ends, None -> false };
+      match judged(cx, m, limits) {
+        Ok([]) -> acc,
+        Ok(why) -> push(acc, { measure: m, why: why, ends: ends }),
+        Err(why) -> push(acc, { measure: m, why: ["no proof can be stated: " ++ why], ends: ends }),
+      }
+    })
+  }
+}
+
+// Nothing when a proof shows the measure descends; otherwise where the proof left what the prover
+// decides. `Err` when no proof could be stated.
+fn judged(cx: Context, m: Measure, limits: Limits) -> Result<List<String>, String> / {abort.raise} =
+  match descent_of(cx, m.owner) {
+    Err(why) -> Err(why),
+    Ok(body) -> {
+      let d = decide_and_diagnose(
+        cx,
+        {
+          binders: map(m.binders, |b: world::Binder| { name: b.name, ty: canonical(b.ty) }),
+          guards: [],
+          result: None,
+          body: Some(body),
+          total: group_of(cx, m.owner),
+          partial: true,
+        },
+        limits,
+      );
+      match d.decision {
+        Proved(_) -> Ok([]),
+        Unknown(u) -> if u.reason == BudgetSpent {
+          Ok(["the proof spent its " ++ int_to_string(limits.steps) ++ " steps"])
+        } else if len(d.blockers) == 0 {
+          Ok(["at some call the measure is negative or does not fall"])
+        } else {
+          Ok(
+            map(d.blockers, |b: Blocker| {
+              let parts = blocker_parts(b);
+              "the proof stopped at " ++ parts.kind
+                ++ (match parts.detail { Some(x) -> " `" ++ x ++ "`", None -> "" })
+            }),
+          )
+        },
+        _ -> Ok(["no proof was found"]),
+      }
+    },
+  }
+
+fn states(cx: Context, name: String) -> Bool =
+  match map_get(cx.claims.defs, name) {
+    Some(d) -> match d.measure { Some(_) -> true, None -> false },
+    None -> false,
+  }
 
 // The claims of the modules at `wanted` and everything they import; a module not `owned` is opaque.
 pub fn claims_for(
@@ -95,6 +185,8 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
               c.clause.code),
             result: match obligation.result { Some(_) -> Some(d.body), None -> None },
             body: clause.clause.code,
+            total: [],
+            partial: false,
           }),
       },
     },
@@ -106,6 +198,8 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
           guards: match l.guard { Some(g) -> [g.code], None -> [] },
           result: None,
           body: l.body,
+          total: [],
+          partial: false,
         }),
     },
   }
