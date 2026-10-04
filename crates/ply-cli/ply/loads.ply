@@ -19,8 +19,7 @@ import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
 import store.tables (Cache, Stamps, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind,
                      KFn, KType, KEffect, Package, Body, open_cache, flush_cache, fingerprint,
                      put_fingerprint, def_of, put_def, put_decl, put_body, prune, source_key,
-                     source_keys, shipped_digest, put_shipped_digest, warnings, filed_load,
-                     put_filed_load, filed_priors, put_filed_priors, body)
+                     warnings, filed_load, put_filed_load, filed_priors, put_filed_priors, body)
 import store.twin (on_twin)
 import std.list (concat)
 
@@ -36,8 +35,9 @@ pub type Sources = { files: List<SourceFile>, packages: List<SourcePackage> }
 // A shipped module's entry as the store last filed it.
 pub type ShippedEntry = { name: Bytes, hash: Bytes }
 
-// What the shipped modules were when the store was last filed, by a compiler whose were different.
-pub type StdlibMoved = { was: String, now: String, entries: List<ShippedEntry> }
+// The shipped modules a load reads that the store last filed with other bytes, and what it filed for
+// them.
+pub type StdlibMoved = { modules: List<String>, entries: List<ShippedEntry> }
 
 // What the store holds for the files a load reads: every definition's and test's filed rows,
 // whatever hash each was filed under, and what opening and reading the store degraded past.
@@ -297,50 +297,51 @@ fn gathered<[r]>(g0: Gathered, f: SourceFile) -> Gathered / {fs.read[r], abort.r
 
 fn is_shipped_key(key: String) -> Bool = string_starts_with(key, "<std>/")
 
-// The shipped modules' entries as they were filed, when a compiler whose shipped modules differ
-// filed them: the program says what that change reached.
+type MovedWalk = { modules: List<String>, entries: List<ShippedEntry>, cache: Cache }
+
+// The shipped modules this load reads that the store filed with other bytes, with the entries it
+// filed for them: the program says what the change reached.
 fn moved<[r]>(
   cache: Cache,
-  now: String,
+  files: List<SourceFile>,
 ) -> { moved: Option<StdlibMoved>, cache: Cache } / {fs.read[r], abort.raise} = {
-  let was = shipped_digest[r](cache);
-  match was.value {
-    None -> { moved: None, cache: was.cache },
-    Some(d) -> if d == now { { moved: None, cache: was.cache } } else {
-      let ks = source_keys[r](was.cache);
-      let walked = fold(
-        filter(match ks.value { Some(xs) -> xs, None -> [] }, is_shipped_key),
-        { entries: [], cache: ks.cache },
-        |acc: { entries: List<ShippedEntry>, cache: Cache }, k: String| {
-          let got = fingerprint[r](acc.cache, k);
+  let walked = fold(
+    filter(files, |f: SourceFile| is_shipped_key(f.path)),
+    { modules: [], entries: [], cache: cache },
+    |acc: MovedWalk, f: SourceFile|
+      match source_key(acc.cache, f.path) {
+        None -> acc,
+        Some(key) -> {
+          let got = fingerprint[r](acc.cache, key);
           match got.value {
-            None -> { entries: acc.entries, cache: got.cache },
-            Some(fp) ->
+            None -> { ..acc, cache: got.cache },
+            Some(fp) -> if fp.content == blake3(f.text) { { ..acc, cache: got.cache } } else {
               {
+                modules: push(acc.modules, f.name),
                 entries: fold(fp.defs, acc.entries, |es: List<ShippedEntry>, e: DefEntry|
                   push(es, { name: bytes_of_string(e.name), hash: e.hash })),
                 cache: got.cache,
-              },
+              }
+            },
           }
         },
-      );
-      { moved: Some({ was: d, now: now, entries: walked.entries }), cache: walked.cache }
-    },
+      },
+  );
+  {
+    moved: if len(walked.modules) == 0 { None }
+    else { Some({ modules: walked.modules, entries: walked.entries }) },
+    cache: walked.cache,
   }
 }
 
-// What the store holds for the files a load is about to read. `now` is the shipped modules' digest.
-pub fn known<[r]>(
-  place: Place,
-  sources: Sources,
-  now: String,
-) -> Recorded / {fs.read[r], abort.raise} = {
+// What the store holds for the files a load is about to read.
+pub fn known<[r]>(place: Place, sources: Sources) -> Recorded / {fs.read[r], abort.raise} = {
   let g = fold(
     sources.files,
     { cache: opened[r](place, sources), defs: [], tests: [], intact: map_new(), unread: None },
     |acc: Gathered, f: SourceFile| gathered[r](acc, f),
   );
-  let m = moved[r](g.cache, now);
+  let m = moved[r](g.cache, sources.files);
   let last = filed_load[r](m.cache);
   let p = priors_read[r](last.cache);
   {
@@ -432,7 +433,6 @@ pub fn file<[r]>(
   sources: Sources,
   filing: Filing,
   whole: Bool,
-  now: String,
   load: Bytes,
   priors: List<Prior>,
 ) -> List<Diag> / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
@@ -461,10 +461,8 @@ pub fn file<[r]>(
         match source_key(c4, f.path) { Some(k) -> push(ks, k), None -> ks }),
     ).cache
   } else { c4 };
-  let was = shipped_digest[r](c5);
-  let c6 = if was.value == Some(now) { was.cache } else { put_shipped_digest(was.cache, now) };
   let c7 = put_filed_priors[r](
-    put_filed_load[r](c6, load),
+    put_filed_load[r](c5, load),
     bin::encode(map(priors, |p: Prior| { ..p, body: b"" }), bin::list_bin(prior_bin())),
   );
   let kept = diags_of(warnings(flush_cache[r](c7)));
@@ -549,32 +547,49 @@ fn drain_entry() -> DefEntry =
     members: [],
   }
 
-// What a load whose shipped modules digest to `now` is told, over a store last filed under `was`.
+// What a load that reads `std.net` is told over a store that last filed it as `filed`, before and
+// after the load files its own reading of it.
 fn told(
-  was: String,
-  now: String,
+  filed: Bytes,
 ) -> { before: Option<StdlibMoved>, after: Option<StdlibMoved> } / {abort.raise} =
   on_twin(mem_empty(), || {
     let c0 = put_fingerprint[mem](open_cache[mem]("cache", "", [], built()), {
       key: "<std>/net.ply",
-      content: blake3(b"what the last compiler shipped"),
+      content: blake3(filed),
       module: "std.net",
       defs: [drain_entry()],
       tests: [],
     });
-    let c1 = flush_cache[mem](put_shipped_digest(c0, was));
-    let before = known[mem](a_place(), shipped_sources(), now).stdlib;
-    let filed = file[mem](
-      a_place(),
-      shipped_sources(),
-      { modules: [], defs: [], decls: [], bodies: [] },
-      false,
-      now,
-      b"load",
-      [],
-    );
-    { before: before, after: known[mem](a_place(), shipped_sources(), now).stdlib }
+    let c1 = flush_cache[mem](c0);
+    let before = known[mem](a_place(), shipped_sources()).stdlib;
+    let filed = file[mem](a_place(), shipped_sources(), net_filing(), false, b"load", []);
+    { before: before, after: known[mem](a_place(), shipped_sources()).stdlib }
   }).value
+
+// `std.net` as a load files it: its one definition, read from the first source.
+fn net_filing() -> Filing =
+  {
+    modules: [
+      {
+        name: b"std.net",
+        source: 0,
+        entries: [
+          {
+            name: b"std.net.drain",
+            hash: blake3(b"drain"),
+            check: blake3(b"drain"),
+            kind: b"fn",
+            span: { start: 0, end: 1 },
+            members: [],
+          },
+        ],
+        tests: [],
+      },
+    ],
+    defs: [],
+    decls: [],
+    bodies: [],
+  }
 
 fn one_fn() -> Filing = {
   let check = blake3(b"f.check");
@@ -634,8 +649,8 @@ fn reread(filing: Filing, was: Bytes, now: Bytes) -> Recorded / {abort.raise} =
         ],
         packages: [],
       };
-    let filed = file[mem](a_place(), holding(was), filing, true, "b3:now", b"load", []);
-    known[mem](a_place(), holding(now), "b3:now")
+    let filed = file[mem](a_place(), holding(was), filing, true, b"load", []);
+    known[mem](a_place(), holding(now))
   }).value
 
 fn a_prior(hash: Bytes) -> Prior =
@@ -664,11 +679,10 @@ test "a filing's priors read back with the bodies filed under their hashes, and 
       at,
       { ..one_fn(), bodies: [{ hash: hash, body: filed_body }] },
       true,
-      "b3:now",
       b"load",
       [{ ..a_prior(hash), body: filed_body }, a_prior(blake3(b"a body never filed"))],
     );
-    known[mem](a_place(), at, "b3:now").priors
+    known[mem](a_place(), at).priors
   }).value;
   assert_eq(read, [{ ..a_prior(hash), body: filed_body }])
 }
@@ -682,26 +696,22 @@ test "a file's rows are intact while it holds the text they were filed for and e
   assert_eq(map_keys(reread({ ..one_fn(), modules: [] }, b"f", b"f").intact), ["../out.ply"])
 }
 
-test "a store filed under other shipped modules says what it held for them, until it is filed again" {
-  let t = told("b3:old", "b3:new");
+test "a shipped module the store filed with other bytes is named, until the load files it again" {
+  let t = told(b"what the last compiler shipped");
   assert_eq(
     t.before,
-    Some({
-      was: "b3:old",
-      now: "b3:new",
-      entries: [{ name: b"std.net.drain", hash: blake3(b"drain") }],
-    }),
+    Some({ modules: ["std.net"], entries: [{ name: b"std.net.drain", hash: blake3(b"drain") }] }),
   );
   assert_eq(t.after, None)
 }
 
-test "a store filed under these shipped modules says nothing moved" {
-  assert_eq(told("b3:same", "b3:same"), { before: None, after: None })
+test "a shipped module filed with the bytes this load reads has not moved" {
+  assert_eq(told(b"pub fn drain() -> Int = 0\n"), { before: None, after: None })
 }
 
 test "a cold store has no shipped modules to compare against" {
   let run = on_twin(mem_empty(), || {
-    let r = known[mem](a_place(), shipped_sources(), "b3:new");
+    let r = known[mem](a_place(), shipped_sources());
     let c = flush_cache[mem](open_cache[mem]("cache", "", [], built()));
     r
   });
