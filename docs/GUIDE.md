@@ -70,7 +70,12 @@ runtime. A pass is filed as well under the code its test compiled to, believed b
 whose runtime and definitions that run a test and file its pass hash as they did,
 so a compiler change that leaves a test's code as it was does not run it again.
 A hash covers what its definition reaches and no comment or
-layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these. A dependency's own
+layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these.
+What the front end filed for a definition is taken again while the definition's
+own text and what it reads of each definition and declaration it references
+stand: the signature and specifications written there, how its calls end, and
+what it performs or answers that a caller's check counts by. An edited body is
+checked again, and what references it only where one of those moved. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
@@ -3468,7 +3473,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
@@ -3494,8 +3499,14 @@ reading runs no compiler: the committed one when it was built from the
 binary's own sources, else one a builder made of them for an earlier run, or
 makes now.
 The builder is the compiler's own `build.main`, entered the same way: it
-checks a program's sources, seeded with the rows its last build of that program
-kept, emits its unit with the emitter's answers kept, and writes the runnable.
+reads a program's sources and hashes them, and where the definition the program
+enters hashes as one of a program it already built, for this runtime and by
+this compiler, that runnable is the program: a hash covers all its definition
+reaches and no comment, layout, test or definition nothing reaches. Otherwise it
+checks the sources, seeded with the rows its last build of that program
+kept, emits its unit with the emitter's answers kept, and writes the runnable,
+keeping it under that key in `programs/` below the stage root. The launcher
+lays the committed runnable there under the key committed beside it.
 The committed builder builds `ply`, so each build reads back what the ones
 before it kept; where `ply`'s sources need a rule that builder lacks, it builds
 the builder of the binary's own compiler first, and that one builds `ply`. `ply std`
