@@ -127,13 +127,15 @@ type Pending<b> = | Looked(b) | Asking({ s: Stmt, ps: List<Param>, next: (Answer
 pub fn batched<a, b, [t]>(
   xs: List<a>,
   lookup: (a) -> b / {db.query[t]},
-) -> List<b> / {db.query[t], db.batch[t], abort.raise} =
+) -> List<b> / {db.query[t], db.batch[t], abort.raise, diverges} =
   rounds[t](map(xs, |x: a| stepped[t](|| lookup(x))))
 
 fn stepped<b, [t]>(go: () -> b / {db.query[t]}) -> Pending<b> =
   handle { Looked(go()) } with { db.query[t](s, ps) resume k -> Asking({ s: s, ps: ps, next: k }) }
 
-fn rounds<b, [t]>(ps: List<Pending<b>>) -> List<b> / {db.query[t], db.batch[t], abort.raise} = {
+fn rounds<b, [t]>(
+  ps: List<Pending<b>>,
+) -> List<b> / {db.query[t], db.batch[t], abort.raise, diverges} = {
   let waiting = filter(range(0, len(ps)), |i: Int|
     match list_at(ps, i) { Some(Asking(_)) -> true, _ -> false });
   if len(waiting) == 0 {
@@ -5477,7 +5479,7 @@ fn run_checked(
   ps: List<Param>,
   rows: Bool,
   cfg: Server,
-) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link], abort.raise} =
+) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link], abort.raise, diverges} =
   match pg::extended_query[link](
       session,
       s.sql,
@@ -5498,14 +5500,14 @@ fn control(
   session: pg::Session,
   sql: String,
   cfg: Server,
-) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link], abort.raise} =
+) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link], abort.raise, diverges} =
   pg::simple_query[link](session, sql, cfg.client)
 
 fn linked(
   cfg: Server,
   nonce: String,
   c: Claim,
-) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
+) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match c {
     Idle(l) -> Ok(l),
     Fresh(n) -> match pg::connect[link](
@@ -5583,7 +5585,7 @@ fn statement_outside(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match run_checked(l.session, s, ps, rows, cfg) {
@@ -5605,7 +5607,7 @@ fn statement_within(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match run_checked(session, s, ps, rows, cfg) {
     Ok(ran) ->
       { answer: ran.answer, n: scope.n, scope: Some(kept(scope, ran.session, 0)), freed: None },
@@ -5618,7 +5620,7 @@ fn opening(
   c: Claim,
   level: Isolation,
   access: Access,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match control(
@@ -5648,7 +5650,7 @@ fn nesting(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match control(session, "savepoint " ++ savepoint_name(scope.depth + 1), cfg) {
     Ok(reply) ->
       { answer: Count(0), n: scope.n, scope: Some(kept(scope, reply.session, 1)), freed: None },
@@ -5665,7 +5667,7 @@ fn committing(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   if scope.depth > 1 {
     match control(session, "release savepoint " ++ savepoint_name(scope.depth), cfg) {
       Ok(reply) ->
@@ -5691,7 +5693,7 @@ fn aborting(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   if scope.depth > 1 {
     // A savepoint outlives a rollback to it, so it is released too.
     let name = savepoint_name(scope.depth);
@@ -5718,7 +5720,7 @@ pub fn serve<a | e>(
   size: Int,
   nonce: String,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> a / {abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
+) -> a / {diverges, abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
   with_cell[dbpool]({ idle: [], opened: 0, made: 0, open: [] }) { pool -> {
     let taken = |d: Decided| {
       cell_set(pool, d.pool);
@@ -6150,7 +6152,7 @@ pub fn with_server<a | e>(
   url: String,
   size: Int,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> Result<a, String> / {abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
+) -> Result<a, String> / {diverges, abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
   match server_of(url) { Err(why) -> Err(why), Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)) }
 
 // --- Tests ------------------------------------------------------------------
@@ -6938,7 +6940,7 @@ fn over_script<a | e>(
   size: Int,
   refusals: List<Refusal>,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> Scripted<a> / {abort.raise, task.yield | e} =
+) -> Scripted<a> / {diverges, abort.raise, task.yield | e} =
   with_cell[wire]({ wires: [], refusals: refusals }) { fake -> {
     let value = handle {
       serve(server("db", 5432, "ply", "ply", None), size, "t", body)
@@ -7244,8 +7246,8 @@ test "a connection lost inside a transaction fails the rest of it, and nothing o
 
 // A store of `id * 10` for every id, answering each ask alone, counting what it was asked.
 fn tens<a>(
-  go: () -> a / {db.query[items], db.batch[items], abort.raise},
-) -> { value: a, queries: Int, batches: Int } / {abort.raise} =
+  go: () -> a / {db.query[items], db.batch[items], abort.raise, diverges},
+) -> { value: a, queries: Int, batches: Int } / {abort.raise, diverges} =
   with_cell[asked]({ queries: 0, batches: 0 }) { counts -> {
     let row = |ps: List<Param>|
       match ps {
