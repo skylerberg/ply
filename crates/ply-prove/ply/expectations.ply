@@ -11,11 +11,12 @@ import decide (Decision, Proved, GuardUnsatisfiable, Unknown, Diagnosed, Static,
 import domain (Ty, Fn)
 import goal (Goal, Binder, Limits, Proof, BudgetSpent, default_limits, default_prove_budget,
              default_unfold_depth)
+import kernel (checked, refusal)
 import statics (Prover, Unshown, prover_of, unshown)
 import statics
 import lower (Blocker, BitOperator, FloatTerm, DecimalArithmetic)
 import rules (Rule, LinearArithmetic, Propositional, Congruence, Injectivity, CaseSplit, Unfold,
-              induction_rule)
+              Induction, Cited, Descent, Spine)
 import sort (canonical, int_ty)
 import world
 import world (Built, Obligation, Signature, world_of)
@@ -51,6 +52,7 @@ fn law_goal(f: Fixture, label: String) -> Goal / {abort.raise} =
         guards: match l.guard { Some(g) -> [g.code], None -> [] },
         result: None,
         body: l.body,
+        lemmas: [],
         total: [],
         partial: false,
       },
@@ -368,6 +370,7 @@ fn chain() -> String =
     "law \"a definition that never returns is not a function\" forall (n: Int) { forever(n) == forever(n) }",
     "law \"stepping by two counts\" forall (n: Int) where n >= 0 { twice_down(n) == n }",
     "law \"a mutual recursion is not unrolled\" forall (n: Int) where n >= 0 { ping(n) == n }",
+    "law \"every int is at most zero\" forall (n: Int) { n <= 0 }",
     "law \"a measured recursion counts\" forall (n: Int) where n >= 0 { lowered(n) == n }",
   ])
 
@@ -386,6 +389,11 @@ fn spines() -> String =
     "law \"a list pattern takes the head of a literal\" forall (x: Int) { match [x, 2] { [a, ..] -> a == x, [] -> false } }",
     "law \"a list pattern does not confuse the tail\" forall (x: Int) { match [1, x] { [_, b] -> b == 1, _ -> false } }",
     "law \"a pushed literal ends in what was pushed\" forall (x: Int) { match push([1], x) { [_, b] -> b == x, _ -> false } }",
+    "fn reverse(xs: List<Int>) -> List<Int> = match xs { [] -> [], [x, ..rest] -> push(reverse(rest), x) }",
+    "law \"reversing twice, before its lemma\" forall (xs: List<Int>) { xs == reverse(reverse(xs)) }",
+    "law \"reversing keeps the length\" forall (xs: List<Int>) { len(reverse(xs)) == len(xs) }",
+    "law \"a push reversed leads\" forall (ys: List<Int>, x: Int) { match reverse(push(ys, x)) { [h, ..t] -> h == x && t == reverse(ys), [] -> false } }",
+    "law \"reverse twice is identity\" forall (xs: List<Int>) { reverse(reverse(xs)) == xs }",
   ])
 
 fn effectful() -> String =
@@ -606,6 +614,7 @@ fn returns_zero(f: Fixture, name: String) -> Decision / {abort.raise} = {
       guards: [],
       result: Some(d.body),
       body: at(clauses(d, true), 0),
+      lemmas: [],
       total: [],
       partial: false,
     },
@@ -623,6 +632,7 @@ fn ensures_goal(index: Int) -> Decision / {abort.raise} = {
       guards: clauses(d, false),
       result: Some(d.body),
       body: at(clauses(d, true), index),
+      lemmas: [],
       total: [],
       partial: false,
     },
@@ -633,7 +643,13 @@ fn ensures_goal(index: Int) -> Decision / {abort.raise} = {
 fn spends_its_budget(f: Fixture, label: String, limits: Limits) -> Bool / {abort.raise} =
   match attempt_with(f, label, limits) { Unknown(u) -> u.reason == BudgetSpent, _ -> false }
 
-fn inducted_on(p: Proof, binder: String, def: String) -> Bool = uses(p, induction_rule(binder, def))
+fn inducted_on(p: Proof, binder: String, def: String) -> Bool =
+  fold(p.rules, false, |found: Bool, r: Rule|
+    found || (match r { Induction(i) -> i.binder == binder && i.def == def, _ -> false }))
+
+fn cites(p: Proof, label: String) -> Bool =
+  fold(p.rules, false, |found: Bool, r: Rule|
+    found || (match r { Cited(c) -> c.label == label, _ -> false }))
 
 fn deepest_unfold(p: Proof) -> Int =
   fold(p.rules, 0, |acc: Int, r: Rule|
@@ -781,6 +797,84 @@ test "only recursion the checker reads as ending is unrolled, and a stated measu
   })
 }
 
+test "the kernel refuses an induction its record cannot stand behind, whatever its cases come to" {
+  let f = fixture(chain());
+  let counts = law_goal(f, "counting down counts");
+  let record = { binder: "n", slot: 0, scheme: Descent(1), defs: ["m.countdown"] };
+  assert(refusal(f.cx, counts, record) == None);
+  assert(match checked(f.cx, counts, record, default_limits(), default_prove_budget(), []).proof {
+    Some(pr) -> inducted_on(pr, "n", "m.countdown"),
+    None -> false,
+  });
+  // A hypothesis at the case it proves closes any step, so with it this false law would be proved.
+  let false_law = law_goal(f, "every int is at most zero");
+  let circular = { ..record, scheme: Descent(0) };
+  assert_eq(
+    refusal(f.cx, false_law, circular),
+    Some("the hypothesis is not below the case it proves"),
+  );
+  assert(
+    checked(f.cx, false_law, circular, default_limits(), default_prove_budget(), []).proof == None,
+  );
+  assert_eq(refusal(f.cx, counts, { ..record, scheme: Spine(1) }), Some("`n` is not a list"));
+  assert_eq(
+    refusal(f.cx, counts, { ..record, binder: "k" }),
+    Some("the claim's binder at 0 is `n`"),
+  );
+  assert_eq(refusal(f.cx, counts, { ..record, slot: 3 }), Some("the claim has no binder at 3"));
+  assert_eq(
+    refusal(f.cx, counts, { ..record, defs: ["m.forever"] }),
+    Some("the checker does not see every call `m.forever` makes of itself descend"),
+  );
+  assert_eq(
+    refusal(f.cx, counts, { ..record, defs: ["m.ping"] }),
+    Some("`m.ping` is not a pure definition calling only itself"),
+  );
+  assert_eq(refusal(f.cx, counts, { ..record, defs: [] }), Some("it unrolls no definition"))
+}
+
+test "a proof uses each proved law above it in its module, and none below" {
+  let p = proving(spines());
+  // The lemma itself is proved by induction on its list.
+  assert(match decided_by(p, "m.a push reversed leads") {
+    Some(pr) -> inducted_on(pr, "ys", "m.reverse"),
+    None -> false,
+  });
+  assert(match decided_by(p, "m.reverse twice is identity") {
+    Some(pr) -> inducted_on(pr, "xs", "m.reverse") && cites(pr, "a push reversed leads"),
+    None -> false,
+  });
+  assert(decided_by(p, "m.reversing twice, before its lemma") == None);
+  assert(match decided_by(p, "m.reversing keeps the length") {
+    Some(pr) -> !cites(pr, "a push reversed leads"),
+    None -> true,
+  })
+}
+
+// Beside each rule a proof of `reverse` twice leans on, a claim that is false.
+fn near_misses() -> String =
+  source([
+    "fn reverse(xs: List<Int>) -> List<Int> = match xs { [] -> [], [x, ..rest] -> push(reverse(rest), x) }",
+    "law \"a push reversed leads\" forall (ys: List<Int>, x: Int) { match reverse(push(ys, x)) { [h, ..t] -> h == x && t == reverse(ys), [] -> false } }",
+    "law \"reversing changes nothing\" forall (xs: List<Int>) { reverse(xs) == xs }",
+    "law \"a push reversed leads with zero\" forall (ys: List<Int>, x: Int) { match reverse(push(ys, x)) { [h, ..t] -> h == 0, [] -> false } }",
+    "law \"reverse twice drops a push\" forall (xs: List<Int>) { reverse(reverse(push(xs, 1))) == xs }",
+    "law \"a one-element list matches two\" forall (x: Int) { match [x] { [] -> true, [a, b] -> true, _ -> x == 0 } }",
+    "law \"a known constructor takes its own arm\" forall (x: Int) { match Some(x) { None -> true, Some(y) -> y == 0 } }",
+    "law \"a push keeps the length\" forall (xs: List<Int>, x: Int) { len(push(xs, x)) == len(xs) }",
+  ])
+
+test "a false claim beside a lemma, a list in view or a known constructor is never proved" {
+  let p = proving(near_misses());
+  assert(decided_by(p, "m.a push reversed leads") != None);
+  assert(decided_by(p, "m.reversing changes nothing") == None);
+  assert(decided_by(p, "m.a push reversed leads with zero") == None);
+  assert(decided_by(p, "m.reverse twice drops a push") == None);
+  assert(decided_by(p, "m.a one-element list matches two") == None);
+  assert(decided_by(p, "m.a known constructor takes its own arm") == None);
+  assert(decided_by(p, "m.a push keeps the length") == None)
+}
+
 test "a measure is shown where every call its group makes back into it descends, and only then" {
   let p = proving(chain());
   let missing = unshown(p.analysis, every);
@@ -882,6 +976,7 @@ test "a postcondition without the definition is unknown" {
       guards: [],
       result: None,
       body: at(clauses(d, true), 0),
+      lemmas: [],
       total: [],
       partial: false,
     },
