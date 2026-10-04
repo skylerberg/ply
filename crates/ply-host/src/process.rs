@@ -513,20 +513,27 @@ impl HostHandler for Operation {
                 let args = argument_vector(&req.args[0], span)?;
                 let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
                 let io = io_of(&req.args[3], span)?;
+                let dir = req.args[1].as_str(span, "a working directory")?;
                 let launch = Launch {
                     label: &req.atom.resource,
                     program,
                     args: &args,
-                    dir: req.args[1].as_str(span, "a working directory")?,
+                    dir,
                     env: &env,
                     io: &io,
                 };
-                Ok(HostAnswer::Value(
-                    match host.children.start(&launch, &host.sink) {
-                        Ok(handle) => Value::ctor("Ok", vec![Value::Int(handle)]),
-                        Err(why) => Value::ctor("Err", vec![Value::str(why)]),
-                    },
-                ))
+                let started = host.children.start(&launch, &host.sink);
+                for output in [&io.out, &io.err] {
+                    if let Output::File(path) = output
+                        && let Ok(at) = Path::new(dir).join(path).canonicalize()
+                    {
+                        crate::observe::wrote(req.machine, &at);
+                    }
+                }
+                Ok(HostAnswer::Value(match started {
+                    Ok(handle) => Value::ctor("Ok", vec![Value::Int(handle)]),
+                    Err(why) => Value::ctor("Err", vec![Value::str(why)]),
+                }))
             }
             Op::Wait => {
                 let (handle, child) = child_of(host, self.op, req)?;

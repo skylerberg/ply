@@ -258,3 +258,16 @@ fn a_front_end_s_store_is_neither_read_nor_listed() {
     std::fs::write(pkg.join(".ply-cache/index"), b"filed").unwrap();
     assert!(stands(&trace, &world(&roots, "b"), MachineId::next()));
 }
+
+#[test]
+fn a_checkout_s_version_control_is_no_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let roots = rooted(dir.path());
+    let m = MachineId::next();
+    let recorder = observe::begin(m);
+    observe::read(m, Read::File, &dir.path().join(".git/HEAD"));
+    observe::read(m, Read::Kind, &dir.path().join("pkg/.git"));
+    let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
+    observe::end(&recorder);
+    assert_eq!(trace, "");
+}
