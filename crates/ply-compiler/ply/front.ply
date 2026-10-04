@@ -37,12 +37,13 @@ import resolve (PackageDeps, resolve_packaged, no_packages)
 import std.bin
 import std.hash (blake3)
 import std.pkg (Manifest)
-import std.list (at, concat, contains, take)
+import std.list (at, concat, contains, take, push_unique)
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update)
 import embed (EmbedAt, EmbedRead, EmbedWant, embed_key, embed_tables, embedded, rewritten, wants_of)
 import items (parse)
 import std.bytes (join)
+import std.list
 
 fn mode_text(mode: Mode) -> Bytes = match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
 
@@ -128,23 +129,20 @@ fn test_name_spans(mods: List<ParsedModule>) -> List<Location> / {abort.raise} =
 // --- A guard's literals -------------------------------------------------------
 // The order seeds the prover's witness search, so it is the stack walk's first-reached order, not sorted.
 
-fn push_new(acc: List<Bytes>, x: Bytes) -> List<Bytes> =
-  if contains(acc, x) { acc } else { push(acc, x) }
-
 fn int_lit(k: Int) -> Bytes = bytes_concat(b"int ", int_to_bytes(k))
 
 fn lit_text(acc: List<Bytes>, literal: Lit) -> List<Bytes> / {abort.raise} =
   match literal {
-    LInt(k) -> push_new(acc, int_lit(k)),
-    LStr(s) -> push_new(acc, bytes_concat(b"str ", s)),
-    LBytes(b) -> push_new(acc, bytes_concat(b"bytes ", hex(b))),
+    LInt(k) -> push_unique(acc, int_lit(k)),
+    LStr(s) -> push_unique(acc, bytes_concat(b"str ", s)),
+    LBytes(b) -> push_unique(acc, bytes_concat(b"bytes ", hex(b))),
     _ -> acc,
   }
 
 // A negated literal is kept negated, as the guard means it; the walk still reaches the literal itself.
 fn neg_lit(acc: List<Bytes>, expr: Expr) -> List<Bytes> =
   match expr {
-    ELit(v) -> match v.lit { LInt(k) -> push_new(acc, int_lit(0 - k)), _ -> acc },
+    ELit(v) -> match v.lit { LInt(k) -> push_unique(acc, int_lit(0 - k)), _ -> acc },
     _ -> acc,
   }
 
@@ -1992,9 +1990,6 @@ pub fn std_pkg() -> PackageDeps = { prefix: b"std", deps: [] }
 
 pub fn compiler_pkg() -> PackageDeps = { prefix: b"compiler", deps: [b"std"] }
 
-fn has(xs: List<Bytes>, x: Bytes) -> Bool =
-  match xs { [] -> false, [y, ..rest] -> if y == x { true } else { has(rest, x) } }
-
 // The packages of a load as the front end's tables take them: the root package first, then
 // the closure's, then the built-in std, with the shelf past the end, and every module mapped
 // to the package it was parsed from. The order is the root's modules, then the closure's
@@ -2896,7 +2891,7 @@ pub fn staged_pulling_std_with(
   // with the whole shipped set among them is the built-in package's sources.
   let toolchain = fold(user, true, |acc: Bool, s: Source| acc && is_std(s.name))
     && fold(shipped, true, |acc: Bool, s: Source|
-      acc && (!is_std(s.name) || has(map(user, |u: Source| u.name), s.name)));
+      acc && (!is_std(s.name) || list::contains(map(user, |u: Source| u.name), s.name)));
   let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
   let x = pulling(
@@ -4396,6 +4391,36 @@ test "a caller is walked again when how its callee's calls end moved" {
   // `mid` may not return now, and so neither may `top`: each published an ending that moved.
   assert_eq(seeded_of(edited), [b"m.aside"]);
   assert_eq(published(edited), published(analyse(parse_all(counting(b"n")))))
+}
+
+// `spin` and `hop` call each other without descending, and `wait` calls into them; `between` sits
+// between the two members, so a longer one moves `hop` away from `spin`.
+fn looping(above: Bytes, between: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      src: bytes_concat_all([
+        above,
+        b"fn spin(n: Int) -> Int = hop(n + 1)\n",
+        between,
+        b"fn hop(n: Int) -> Int = spin(n)\npub fn wait(n: Int) -> Int = spin(n)\n",
+      ]),
+    },
+  ]
+
+fn endings(outcome: AnalysisOutcome) -> List<{ name: Bytes, ending: Ending }> / {abort.raise} =
+  match outcome {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) ->
+      map(w.checked.defs, |def_info: DefInfo| { name: def_info.name, ending: def_info.ending }),
+  }
+
+test "a seeded ending is where its call is now, however its definitions moved" {
+  let rows = rows_of(analysis_of(looping(b"", b""))).defs;
+  let moved = looping(b"pub fn aside() -> Int = 3\n", b"pub fn apart() -> Int = 4\n");
+  let seeded = analyse_with(parse_all(moved), rows, []);
+  assert_eq(seeded_of(seeded), [b"m.spin", b"m.hop", b"m.wait"]);
+  assert_eq(endings(seeded), endings(analyse(parse_all(moved))))
 }
 
 test "a seeded check files each row under the key a fresh check of the same program does" {
