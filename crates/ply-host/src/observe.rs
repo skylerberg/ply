@@ -7,7 +7,8 @@
 //! command drives) is adopted into the same record. What the test writes is its own: a read under a
 //! path it wrote is not an input, and a directory it wrote into is read without what it wrote there.
 //! Nor is a read under a directory a run keeps for the next one an input, a front end's store
-//! included wherever it sits, since what is there is a product of its key. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
+//! included wherever it sits, since what is there is a product of its key; nor one of a checkout's
+//! version control, whose commit moves with every change, as the clock does. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
 //! process read; a program that is not `ply` reports nothing and is the environment, as the clock
 //! and the network are. A `ply` that ended without finishing its report leaves the record
 //! incomplete, which files no pass.
@@ -102,6 +103,9 @@ static KEPT: OnceLock<Vec<PathBuf>> = OnceLock::new();
 /// The directory a front end keeps its store in, beside what it loads.
 const STORE: &str = ".ply-cache";
 
+/// A checkout's version control.
+const VCS: &str = ".git";
+
 /// Where this `ply` lays its shipped modules out as files, and the directories it keeps what one
 /// run leaves for the next in.
 pub fn laid_out(shipped_dir: &Path, kept: Vec<PathBuf>) {
@@ -123,7 +127,8 @@ pub fn at_exit(f: extern "C" fn()) {
 }
 
 fn is_kept(path: &Path) -> bool {
-    path.components().any(|c| c.as_os_str() == STORE)
+    path.components()
+        .any(|c| c.as_os_str() == STORE || c.as_os_str() == VCS)
         || KEPT
             .get()
             .is_some_and(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
