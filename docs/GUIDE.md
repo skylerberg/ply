@@ -108,7 +108,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `as` | in an `import`, after the module path |
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `set` | `effect set X = {..}` |
-| `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard |
+| `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, or among a `fn`'s `requires` and `ensures` |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
@@ -1483,8 +1483,8 @@ law "a credit and a matching debit leave an account exactly as it was"
   }
 ```
 
-* `requires`/`ensures` go between the signature and body, in any number;
-  `result` is bound in `ensures`. `requires` restricts the domain of its
+* `requires`/`ensures` go between the signature and body, in any number, as
+  does `cost` (below); `result` is bound in `ensures`. `requires` restricts the domain of its
   `ensures`; it is not checked at call sites and laws do not inherit it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
   be quantified), an optional `where` guard, an optional `cost` bound (below)
@@ -1502,7 +1502,7 @@ law "a credit and a matching debit leave an account exactly as it was"
 
 | tier | claim |
 | --- | --- |
-| `proved` | holds for every input satisfying the guard |
+| `proved` | holds for every input satisfying the guard, or a `cost` clause read off the body |
 | `property` | randomized cases passed; failures shrink |
 | `example` | concrete cases passed |
 | `fitted` | a cost law's steps kept its bound's pace over eight or more sizes |
@@ -1542,8 +1542,9 @@ law "reverse twice is identity" forall (xs: List<Int>) { reverse(reverse(xs)) ==
 
 Both are `proved`, the second by structural induction on `xs` citing the
 first. Under `--json` a certificate's `rules` name each lemma as `lemma` with
-its `law` and `label`, and each induction as `induction` with its `binder`,
-`def`, `over` (`int` or `list`) and `step`.
+its `law` and `label`, each induction as `induction` with its `binder`,
+`def`, `over` (`int` or `list`) and `step`, and a `cost` clause read off its
+body (below) as `cost_bound` with its `def`.
 
 A definition of another package
 — a dependency's, or outside `--std` a shipped module's — is claimed by its
@@ -1606,6 +1607,43 @@ and bound. A law that keeps pace is `fitted` over eight sizes or more and
 `unfitted`. Under `--json` each carries `fit`: its `measures` (`size`, `steps`,
 `bound`), the size that took more steps than it was allowed as `spent` (`size`,
 `limit`), and a `summary`; and `summary` counts `fitted` and `outgrown`.
+
+A `cost` clause bounds the steps a call of its definition takes:
+
+```ply
+fn pairs(xs: List<Int>, ys: List<Int>) -> Int
+  cost len(xs) * (len(ys) + 1)
+= fold(xs, 0, |a: Int, x: Int| fold(ys, a, |b: Int, y: Int| b + x * y))
+```
+
+The bound is an `Int` over the parameters, and the steps may be at most a
+constant times it plus a constant at every size, zero included: with `ys`
+empty these steps still grow with `xs`, so `len(xs) * len(ys)` would not hold.
+A clause on a definition whose row writes `diverges` is `E0468`, and on one
+that performs more than a raise, or has a row variable, `E0463`, since a
+handler could change the steps.
+
+`ply prove` first reads the steps off the body. A builtin is at most a step;
+`map`, `filter`, `fold`, `map_fold`, `iterate`, `map_update`, `bytes_position`
+and `metered` call a literal lambda or a named definition back as many times as
+an argument's size allows; a call of a definition costs its steps at the sizes
+of its arguments, and of one whose body another package keeps, its first `cost`
+bound read from above; a raise ends the call. A recursion is read when every
+call back takes a part of one list parameter that a list pattern took a head
+off, no path calls back twice, and every other parameter its steps grow with is
+handed on unchanged or as a part of itself: it takes that list's length in
+calls. The bound is read from below: the lengths of parameters (`len`,
+`map_len`, `string_len`, `bytes_len`), positive literals, `+`, `*`, and `ilog2`
+alone or beside sizes of the one length it is of. Steps within the bound are
+`proved`. Anything else, such as another operation, a call of a function value,
+a group of definitions calling each other, a body another package keeps with no
+`cost` bound, or an `Int` parameter the steps grow with, leaves the clause to
+the cost law `cost of <name>` (`#2` and on for later clauses): it makes each
+parameter of one size `n`, an `Int` being `n` and a list, map, string or bytes
+holding `n` elements made of their index, and meters the call alone, so it is
+`fitted`, `outgrown` (`E0464`) or a gap as above. A parameter of any other type
+is not made, which leaves the law `unattempted`. Under `--reach` a clause the
+body does not show carries the blocker `unbounded`, with why.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -3869,11 +3907,12 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0460` | artifact `--require-signer` refuses: unsigned, signed for other bytes, or by no trusted key |
 | `E0461` | `ply build --verify`: a file or signature that is not what these sources build |
 | `E0462` | key file that cannot be read, decoded or written |
-| `E0463` | cost law that cannot be measured: not one `Int` size, `law/host`, or a body that performs |
-| `E0464` | cost law whose steps outgrew its bound |
+| `E0463` | cost law or `cost` bound that cannot be measured: not one `Int` size, `law/host`, or a body or definition that performs |
+| `E0464` | cost law or `cost` bound whose steps outgrew it |
 | `E0465` | an operation a row promises `bounded` that grows with the input |
 | `E0466` | `bounded` outside a definition's own row |
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
+| `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
