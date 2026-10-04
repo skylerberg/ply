@@ -616,6 +616,12 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
+    fn set_machine(&self, machine: ply_eval::host::MachineId) {
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.id = machine;
+        }
+    }
+
     fn steps(&self) -> u64 {
         self.last.borrow().steps
     }

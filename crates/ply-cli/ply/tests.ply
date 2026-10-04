@@ -48,7 +48,7 @@ import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, t
                  string_or_null, strings, int_or_null, strings_or_null)
 import style (Style, plain, bold, dim, green, red, yellow)
 import tester (tester, ledger, Executed, InterleavingFailure, Filed, Hosted, Options, Usage,
-               sum_usage, no_usage, unit_over)
+               joined_trace, sum_usage, no_usage, unit_over)
 import trials (Bench, Evident, Tried, diagnosed, trial, by_name)
 import trials
 import walk
@@ -70,8 +70,8 @@ import suite.delta (Delta, DefKey, Edited, Facts, Value, classified, flipped_key
                     ns_word)
 import suite.diagnose (Attribution, Evidence, Suspect, diagnose)
 import suite.select
-import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Row, SameCode, Search,
-                     Unhashed, answers_per_root, asked_by_code, by_code, code_keys, decide,
+import suite.select (Cached, Changed, Decision, New, Pass, PreviousFailure, Reason, Row, SameCode,
+                     Search, Unhashed, answers_per_root, asked_by_code, by_code, code_keys, decide,
                      digest_of, filed, key_of, narrowed, owed_roots, seed_keys, to_run, word)
 import std.bytes (bytes_of_hex, hex_of)
 import sim.plan
@@ -597,7 +597,9 @@ fn keyed(reason: String) -> String / {abort.raise} = join(string_split(reason, "
 
 fn why(reason: String) -> String =
   if reason == "new" { "this hash has never gone green, so nothing is known about it" }
-  else if reason == "nondet" { "`test/nondet` always runs and is never cached" }
+  else if reason == "changed" {
+    "something its last pass read has changed since, so that pass no longer answers for it"
+  }
   else if reason == "previous failure" {
     "the cache holds a failure, and a failure is never trusted"
   } else if reason == "cached" {
@@ -606,8 +608,8 @@ fn why(reason: String) -> String =
     "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new"
   } else { "no hash was produced, so the cache cannot answer for it" }
 
-// `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is
-// neither isolated nor cached.
+// `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is not
+// isolated.
 fn isolated_as(reaches: List<Int>, case: Case) -> String =
   isolation_word(isolation_of(reported(reaches, case)))
 
@@ -665,7 +667,7 @@ fn binding_lines(style: Style, o: Opening, c: Counts) -> List<String> / {abort.r
       indent() ++ bold(style, "host") ++ " " ++ bold(style, int_to_string(c.host)) ++ " of "
         ++ int_to_string(c.total)
         ++ " · "
-        ++ dim(style, "not cached"),
+        ++ dim(style, "cached by what each read"),
       indent()
         ++ dim(
           style,
@@ -1156,13 +1158,13 @@ fn result_lines(
 
 // --- The summary ------------------------------------------------------------
 
-// `host` sits beside `cached` so "0 cached" is not misread as selection working.
+// `host` sits beside `cached`: a host-backed pass stands only while what it read does.
 fn summary_line(style: Style, report: RunReport, counted: Counts) -> String / {abort.raise} = {
   let c = report.summary;
   let failures = int_to_string(c.failed) ++ " failed";
   let passes = int_to_string(c.passed) ++ " passed";
   let hosted = if counted.host == 0 { "" }
-  else { dim(style, ", " ++ int_to_string(counted.host) ++ " host-backed and not cached") };
+  else { dim(style, ", " ++ int_to_string(counted.host) ++ " host-backed") };
   let given_up = if c.abandoned == 0 { "" }
   else { yellow(style, ", " ++ int_to_string(c.abandoned) ++ " abandoned") };
   indent() ++ (if c.failed > 0 { red(style, failures) } else { dim(style, failures) }) ++ ", "
@@ -1397,7 +1399,7 @@ fn case_json(report: RunReport, case: Case, decided: Decided) -> Json / {abort.r
     { key: "group", value: int_or_null(group_of(decided, case.index)) },
     { key: "footprint", value: Str(case.footprint) },
     { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
-    // Whether this test reaches the binding, and so always runs uncached.
+    // Whether this test reaches the binding.
     { key: "host", value: Bool(covers(report.reaches, case.index)) },
     { key: "shared_atoms", value: strings(shared_texts(case)) },
     // The same atoms unprinted, as the scheduler compares them, and whether the test is handed a
@@ -2266,18 +2268,19 @@ fn codes_of(front: LoadedAnalysis, emitted: Emitted) -> Map<Int, String> / {abor
     })
 }
 
-// The tests the store holds a pass for under the code they run.
+// The tests the store holds a pass for under the code they run that still stands, each with the
+// trace it stands on.
 fn passed_by_code(
   decisions: List<Decision>,
   keyed: Map<Int, String>,
-) -> Map<Int, Bool> / {ledger.code_outcomes, abort.raise} = {
+) -> Map<Int, Bytes> / {ledger.code_passes, tester.unchanged[corpus], abort.raise} = {
   let asked = asked_by_code(decisions, keyed);
   let answers = if len(asked) == 0 { [] }
-  else { ledger.code_outcomes(map(asked, |a: { index: Int, key: String }| a.key)) };
-  fold(range(0, len(asked)), map_new(), |acc: Map<Int, Bool>, i: Int|
+  else { ledger.code_passes(map(asked, |a: { index: Int, key: String }| a.key)) };
+  fold(range(0, len(asked)), map_new(), |acc: Map<Int, Bytes>, i: Int|
     match list_at(answers, i) {
-      Some(Some(word)) -> if word == "passed" {
-        map_insert(acc, at_or(asked, i, { index: 0 - 1, key: "" }).index, true)
+      Some(Some(trace)) -> if standing(Some(trace)) == Some("passed") {
+        map_insert(acc, at_or(asked, i, { index: 0 - 1, key: "" }).index, trace)
       } else { acc },
       _ -> acc,
     })
@@ -2296,12 +2299,12 @@ fn concluded_run(
   decisions: List<Decision>,
   decided: Decided,
   keyed: Map<Int, String>,
-  refiled: List<String>,
+  refiled: List<Pass>,
   searching: plan::Plan,
   configured: List<Diag>,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
-) -> Answer / {process.out[proc], builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.outcomes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed, emit.unit, abort.raise} = {
+) -> Answer / {process.out[proc], builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed, emit.unit, abort.raise} = {
   let asked = {
     plan: searching,
     measuring: options.sim.measure_reduction,
@@ -2391,7 +2394,12 @@ fn concluded_run(
   let cause = decided_faults({ ..r, failures: found.failures }, found.benches, diagnosing(options));
   let proved = if options.no_cache || len(cause.proved) == 0 { [] } else {
     filing_said(
-      ledger.filed({ passes: cause.proved, codes: [], records: [], seen: [] }),
+      ledger.filed({
+        passes: map(cause.proved, |key: String| { key: key, trace: b"" }),
+        codes: [],
+        records: [],
+        seen: [],
+      }),
       "could not write what the bisection's mixtures proved: ",
       "every verdict stands; the next bisection runs those mixtures again",
     )
@@ -2474,6 +2482,8 @@ type Done = {
   status: String,
   failure: Option<Raised>,
   usage: Usage,
+  // What every run of it read between them, `None` when no trace stands in for one.
+  trace: Option<Bytes>,
   searched: Option<{ exploration: Exploration, seeds: Int }>,
 }
 
@@ -2537,9 +2547,9 @@ fn ran_lanes(
     concat(halves._0, halves._1)
   }
 
-// What a search's runs come to between them: what they cost, and whether one of them never
-// entered a region, which makes the whole search no search.
-type Swept = { usage: Usage, unobserved: Bool }
+// What a search's runs come to between them: what they cost and read, and whether one of them
+// never entered a region, which makes the whole search no search.
+type Swept = { usage: Usage, trace: Option<Bytes>, unobserved: Bool }
 
 // A test once, or a seeded one searched an interleaving at a time.
 fn ran_job(
@@ -2549,7 +2559,14 @@ fn ran_job(
   match j.search {
     None -> {
       let e: Executed = tester.executed[corpus](j.unit, j.test);
-      { test: j.test, status: e.status, failure: e.failure, usage: e.usage, searched: None }
+      {
+        test: j.test,
+        status: e.status,
+        failure: e.failure,
+        usage: e.usage,
+        trace: e.trace,
+        searched: None,
+      }
     },
     Some(p) -> {
       // A search re-runs the whole test, so any host operation runs once per interleaving.
@@ -2560,11 +2577,12 @@ fn ran_job(
           run: one.run,
           state: {
             usage: sum_usage(st.usage, one.usage),
+            trace: joined_trace(st.trace, one.trace),
             unobserved: st.unobserved || !one.observed,
           },
         }
       };
-      let begun: Swept = { usage: no_usage(), unobserved: false };
+      let begun: Swept = { usage: no_usage(), trace: Some(b""), unobserved: false };
       let kept = if measuring { search::measure_keeping(p, begun, run) }
       else { search::explore_keeping(p, Exact, begun, run) };
       let explored = kept.explored;
@@ -2580,6 +2598,7 @@ fn ran_job(
         },
         failure: match explored.failure { Some(fl) -> Some(stopped(fl)), None -> None },
         usage: kept.state.usage,
+        trace: kept.state.trace,
         searched: if kept.state.unobserved { None }
         else { Some({ exploration: explored.exploration, seeds: len(plan::normalized(p).roots) }) },
       }
@@ -2676,6 +2695,7 @@ fn conclusion_of(done: Done) -> conclude::Ran<Raised> =
     status: done.status,
     failure: done.failure,
     host: done.usage.host,
+    trace: done.trace,
     searched: match done.searched {
       Some(x) ->
         Some({
@@ -2820,14 +2840,26 @@ fn failed_of(
   }
 }
 
-// A pass a later hermetic run would believe, filed for a test the binding can reach, and a backend
-// that silently declined every call: each is a run that is green over a seam nothing reached.
-fn escapes_of(hosted: Hosted, analysis: Analysis, c: Concluded<Raised>) -> List<Diag> = {
-  let reached = set_of(hosted.reaches);
+// A pass a later hermetic run would believe, filed for a run that reached the host without the
+// binding it ran under, and a backend that silently declined every call: each is a run that is
+// green over a seam nothing reached.
+fn escapes_of(
+  hosted: Hosted,
+  analysis: Analysis,
+  c: Concluded<Raised>,
+  done: Map<Int, Done>,
+) -> List<Diag> / {abort.raise} = {
+  let unbound = |index: Int| match done_at(done, index) {
+    Some(d) -> d.usage.host && match d.trace {
+      Some(trace) -> !string_contains("\n" ++ string_of_bytes_lossy(trace), "\nbinding\t"),
+      None -> false,
+    },
+    None -> false,
+  };
   let filed_host = if hosted.hermetic { [] } else {
     fold(c.outcomes, [], |acc: List<Diag>, outcome: conclude::Outcome<Raised>| {
       let wrote = match outcome.recorded { Some(rec) -> written(rec), None -> false };
-      if !wrote || !map_contains(reached, outcome.index) { acc } else {
+      if !wrote || !unbound(outcome.index) { acc } else {
         push(
           acc,
           diag_of(
@@ -2838,12 +2870,12 @@ fn escapes_of(hosted: Hosted, analysis: Analysis, c: Concluded<Raised>) -> List<
                 Some(t) -> string_of_bytes_lossy(t.name),
                 None -> "",
               })
-              ++ "` can reach the host binding, and its pass was written to the result cache",
+              ++ "` reached the host, and its pass was written without the binding it ran under",
             [],
             [
-              "a run that reached the host proves nothing about the next one, so it is never cached",
+              "a pass that reached the host answers only for the binding it ran under",
               "run `ply cache clear`: an entry written here would be believed by a later hermetic run",
-              "this is Ply's fault — the runner and the binding disagree about what this test can do",
+              "this is Ply's fault — the runner and the tester disagree about what this test reached",
             ],
           ),
         )
@@ -2945,7 +2977,7 @@ fn ran_of(
       duration_us: elapsed,
     },
     simulation: c.simulation,
-    escapes: escapes_of(hosted, analysis, c),
+    escapes: escapes_of(hosted, analysis, c, done),
     warnings: concat(concat(teardown, map(c.notices, notice_of)), said),
     mutants: None,
     coverage: if options.coverage { Some(coverage(analysis)) } else { None },
@@ -3033,9 +3065,9 @@ fn cases_of(
   rows: List<Row>,
   search: Search,
   bypassed: Bool,
-) -> List<select::Case> / {ledger.outcomes, abort.raise} = {
+) -> List<select::Case> / {ledger.passes, tester.unchanged[corpus], abort.raise} = {
   let ask = |keys: List<String>|
-    if bypassed { map(keys, |k: String| None) } else { ledger.outcomes(keys) };
+    if bypassed { map(keys, |k: String| None) } else { map(ledger.passes(keys), standing) };
   let digest = digest_of(search);
   let keys = map(rows, |r: Row| key_of(r, digest));
   let answers = ask(
@@ -3063,6 +3095,14 @@ fn cases_of(
     select::case_of(r, at_or(keys, i, None), at_or(held, i, None), owed)
   })
 }
+
+// What a filed pass says now: it passed while every read its trace holds still answers as it did.
+fn standing(held: Option<Bytes>) -> Option<String> / {tester.unchanged[corpus]} =
+  match held {
+    None -> None,
+    Some(trace) -> if trace == b"" || tester.unchanged[corpus](trace) { Some("passed") }
+    else { Some("changed") },
+  }
 
 fn no_row() -> Row =
   { index: 0, label: "", name: "", module: "", hash: None, seeded: false, nondet: false }
@@ -3117,7 +3157,7 @@ fn decided_faults(
   report: RunReport,
   benches: List<Option<Bench>>,
   asked: Diagnosing,
-) -> { faults: List<Fault>, proved: List<String> } / {ledger.outcomes, tester.unit[corpus], tester.interleaved[corpus], emit.unit, abort.raise} =
+) -> { faults: List<Fault>, proved: List<String> } / {ledger.passes, tester.unit[corpus], tester.interleaved[corpus], emit.unit, abort.raise} =
   with_cell[proofs]([]) { held -> {
     let faults = flat_map(range(0, len(report.failures)), |i: Int|
       match list_at(report.failures, i) {
@@ -3669,7 +3709,7 @@ test "the summary counts what was decided and how long it took" {
   assert(
     string_contains(
       summary_line(plain(), hosted, counts_of(p, hosted.reaches)),
-      "1 host-backed and not cached",
+      "1 host-backed",
     ),
   )
 }
@@ -3677,7 +3717,7 @@ test "the summary counts what was decided and how long it took" {
 test "a reason is spaced in the line and joined in the document" {
   assert_eq(keyed(word(PreviousFailure)), "previous_failure");
   assert_eq(keyed(word(New)), "new");
-  assert_eq(word(Nondet), "nondet");
+  assert_eq(word(Changed), "changed");
   assert_eq(word(Unhashed), "unhashed")
 }
 
@@ -4001,7 +4041,7 @@ test "a bound run says how many tests reach the host and what it bound, and afte
   let o = { ..an_opening(), hermetic: false, operations: 7, digest: "b3:aabbccddeeff" };
   let c = { total: 3, isolated: 1, shared: 0, host: 2 };
   assert_eq(binding_lines(plain(), o, c), [
-    "   host 2 of 3 · not cached",
+    "   host 2 of 3 · cached by what each read",
     "   binding host · 7 operations · b3:aabbccddeeff",
   ]);
   assert_eq(binding_lines(plain(), an_opening(), c), []);
@@ -4061,7 +4101,7 @@ test "a bounded naive count makes the ratio a lower bound" {
 
 test "every reason has an explanation of its own" {
   let lines = map(
-    map([New, Nondet, PreviousFailure, Cached, SameCode, Unhashed], |r: Reason| word(r)),
+    map([New, Changed, PreviousFailure, Cached, SameCode, Unhashed], |r: Reason| word(r)),
     why,
   );
   assert_eq(

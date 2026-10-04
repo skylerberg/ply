@@ -6,6 +6,7 @@
 //! cross as values.
 
 use crate::config::Configuration;
+use ply_eval::host::MachineId;
 use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
@@ -466,7 +467,12 @@ impl Drive {
     /// Enter one definition with arguments, the way `call` asks: the value back, or what it
     /// raised, and what the entry ended with. The binding stays up, so a load may be called any
     /// number of times.
-    pub fn call(&mut self, name: &str, args: Vec<ply_eval::Plain>) -> Ended<ply_eval::Plain> {
+    pub fn call(
+        &mut self,
+        name: &str,
+        args: Vec<ply_eval::Plain>,
+        caller: MachineId,
+    ) -> Ended<ply_eval::Plain> {
         let options = &self.options;
         let target = &self.target;
         let span = target
@@ -511,6 +517,7 @@ impl Drive {
                     &bound.hosts,
                     bound.declared.as_ref(),
                     compiled.clone(),
+                    caller,
                 )
             })
         });
@@ -525,7 +532,7 @@ impl Drive {
     }
 
     /// Enter the bound entry and tear the binding down; the answer an `enter` op hands back.
-    pub fn enter(&mut self) -> Outcome {
+    pub fn enter(&mut self, caller: MachineId) -> Outcome {
         let Some((entry, bound)) = self.bound.take() else {
             return Outcome::unentered();
         };
@@ -557,6 +564,7 @@ impl Drive {
                     &bound.hosts,
                     bound.declared.as_ref(),
                     compiled.clone(),
+                    caller,
                 )
             })
         });
@@ -693,11 +701,13 @@ fn evaluate(
     hosts: &Hosts,
     declared: Option<&ply_eval::Footprint>,
     compiled: std::rc::Rc<dyn ply_eval::Compiled>,
+    caller: MachineId,
 ) -> Ended<PlyValue> {
     let mut machine = match ply_eval::Machine::new(front, compiled) {
         Ok(machine) => machine,
         Err(refused) => return Ended::refused(refused),
     };
+    ply_host::observe::adopt(machine.id(), caller);
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);
