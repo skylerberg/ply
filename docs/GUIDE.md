@@ -3459,7 +3459,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
@@ -3485,8 +3485,14 @@ reading runs no compiler: the committed one when it was built from the
 binary's own sources, else one a builder made of them for an earlier run, or
 makes now.
 The builder is the compiler's own `build.main`, entered the same way: it
-checks a program's sources, seeded with the rows its last build of that program
-kept, emits its unit with the emitter's answers kept, and writes the runnable.
+reads a program's sources and hashes them, and where the definition the program
+enters hashes as one of a program it already built, for this runtime and by
+this compiler, that runnable is the program: a hash covers all its definition
+reaches and no comment, layout, test or definition nothing reaches. Otherwise it
+checks the sources, seeded with the rows its last build of that program
+kept, emits its unit with the emitter's answers kept, and writes the runnable,
+keeping it under that key in `programs/` below the stage root. The launcher
+lays the committed runnable there under the key committed beside it.
 The committed builder builds `ply`, so each build reads back what the ones
 before it kept; where `ply`'s sources need a rule that builder lacks, it builds
 the builder of the binary's own compiler first, and that one builds `ply`. `ply std`
