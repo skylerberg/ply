@@ -110,23 +110,28 @@ fn value_at(s: Shape, index: Int) -> Option<Value> / {abort.raise} =
     },
   }
 
-fn by_name(fields: List<Field>) -> List<Field> =
-  fold(fields, [], |acc: List<Field>, f: Field| {
-    let at = fold(range(0, len(acc)), len(acc), |found: Int, i: Int|
+// The places of `names` in ascending order, equal names in the order they came.
+pub fn name_order(names: List<String>) -> List<Int> =
+  fold(range(0, len(names)), [], |acc: List<Int>, i: Int| {
+    let name = match list_at(names, i) { Some(n) -> n, None -> "" };
+    let before = |j: Int|
+      match list_at(names, j) { Some(m) -> compare(name, m) == Less, None -> false };
+    let at = fold(range(0, len(acc)), len(acc), |found: Int, k: Int|
       if found < len(acc) { found } else {
-        match list_at(acc, i) {
-          Some(g) -> if compare(f.name, g.name) == Less { i } else { found },
-          None -> found,
-        }
+        match list_at(acc, k) { Some(j) -> if before(j) { k } else { found }, None -> found }
       });
-    if at == len(acc) { push(acc, f) } else {
-      fold(range(0, len(acc)), [], |out: List<Field>, i: Int|
-        match list_at(acc, i) {
-          Some(g) -> if i == at { push(push(out, f), g) } else { push(out, g) },
+    if at == len(acc) { push(acc, i) } else {
+      fold(range(0, len(acc)), [], |out: List<Int>, k: Int|
+        match list_at(acc, k) {
+          Some(j) -> if k == at { push(push(out, i), j) } else { push(out, j) },
           None -> out,
         })
     }
   })
+
+fn by_name(fields: List<Field>) -> List<Field> =
+  fold(name_order(map(fields, |f: Field| f.name)), [], |acc: List<Field>, i: Int|
+    match list_at(fields, i) { Some(f) -> push(acc, f), None -> acc })
 
 // A width's least value plus `index`, as the pattern it is.
 fn fixed_at(name: String, index: Int) -> Option<Value> / {abort.raise} = {
@@ -153,7 +158,8 @@ pub fn sizes_of(domain: Domain) -> List<Int> = map(domain.shapes, shape_size)
 pub fn bound() -> Int = 4096
 
 // What a type came to, or `None` when it is infinite, unknown, or past [`bound`].
-pub fn shape_of(ty: Ty, decls: List<Decl>) -> Option<Shape> = shaped(ty, decls, [], [])
+pub fn shape_of(ty: Ty, decls: List<Decl>) -> Option<Shape> =
+  shaped(ty, decls, [], [], 2 * len(decls) + 2)
 
 // How many values inhabit a type, or `None` when it is infinite, unknown, or past [`bound`].
 pub fn size(ty: Ty, decls: List<Decl>) -> Option<Int> =
@@ -207,35 +213,50 @@ fn tuple_at(sizes: List<Int>, at: Int, rest: Int) -> List<Int> / {abort.raise} =
   }
 
 // What a type came to, with the names whose variants are already being walked: a type that mentions
-// itself has no finite size even when it has a nullary case.
-fn shaped(ty: Ty, decls: List<Decl>, open: List<String>, subst: List<Ty>) -> Option<Shape> =
-  match ty {
-    // Arguments arrive already substituted into the scope that wrote them, so one read settles a
-    // parameter; reading it against `subst` again would let `Var(0)` name itself forever.
-    Var(index) -> match list_at(subst, index) {
-      Some(argument) -> shaped(argument, decls, open, []),
-      None -> None,
-    },
-    Fn(_, _, _) -> None,
-    Record(fields) -> match fields_of(fields, decls, open, subst) {
-      None -> None,
-      Some(fs) -> Some(Fields(fs.size, fs.fields)),
-    },
-    Con(name, args) -> {
-      if name == "Unit" { Some(Scalar(name, 1)) }
-      else if name == "Bool" { Some(Scalar(name, 2)) }
-      // `Float` and `Decimal` are finite but far too large to enumerate, and a 64-bit width does not
-      // fit the arithmetic here.
-      else if is_unbounded(name) { None }
-      else if width_of(name) != 0 { Some(Scalar(name, two_to(width_of(name)))) }
-      else if contains_text(open, name) { None } else {
-        match find_decl(decls, name) {
-          None -> None,
-          Some(decl) ->
-            cases_of(decl, decls, push(open, name), map(args, |a: Ty| substituted(a, subst))),
+// itself has no finite size even when it has a nullary case. `room` is spent opening a declared type,
+// which a path does once for each, and reading an argument, which a path does once between two.
+fn shaped(
+  ty: Ty,
+  decls: List<Decl>,
+  open: List<String>,
+  subst: List<Ty>,
+  room: Int,
+) -> Option<Shape> =
+  if room <= 0 { None } else {
+    match ty {
+      // Arguments arrive already substituted into the scope that wrote them, so one read settles a
+      // parameter; reading it against `subst` again would let `Var(0)` name itself forever.
+      Var(index) -> match list_at(subst, index) {
+        Some(argument) -> shaped(argument, decls, open, [], room - 1),
+        None -> None,
+      },
+      Fn(_, _, _) -> None,
+      Record(fields) -> match fields_of(fields, decls, open, subst, room) {
+        None -> None,
+        Some(fs) -> Some(Fields(fs.size, fs.fields)),
+      },
+      Con(name, args) -> {
+        if name == "Unit" { Some(Scalar(name, 1)) }
+        else if name == "Bool" { Some(Scalar(name, 2)) }
+        // `Float` and `Decimal` are finite but far too large to enumerate, and a 64-bit width does not
+        // fit the arithmetic here.
+        else if is_unbounded(name) { None }
+        else if width_of(name) != 0 { Some(Scalar(name, two_to(width_of(name)))) }
+        else if contains_text(open, name) { None } else {
+          match find_decl(decls, name) {
+            None -> None,
+            Some(decl) ->
+              cases_of(
+                decl,
+                decls,
+                push(open, name),
+                map(args, |a: Ty| substituted(a, subst)),
+                room - 1,
+              ),
+          }
         }
-      }
-    },
+      },
+    }
   }
 
 // A type whose values are too many to walk, or that is not finite at all.
@@ -259,14 +280,20 @@ fn width_of(name: String) -> Int =
 fn two_to(bits: Int) -> Int = fold(range(0, bits), 1, |acc: Int, _i: Int| acc * 2)
 
 // Every case of one declared type, summed: a type with no variants has no values at all.
-fn cases_of(decl: Decl, decls: List<Decl>, open: List<String>, args: List<Ty>) -> Option<Shape> =
+fn cases_of(
+  decl: Decl,
+  decls: List<Decl>,
+  open: List<String>,
+  args: List<Ty>,
+  room: Int,
+) -> Option<Shape> =
   match fold(
       decl.variants,
       Some({ total: 0, cases: [] }),
       |acc: Option<{ total: Int, cases: List<{ name: String, size: Int, fields: List<Shape> }> }>, variant: Variant|
         match acc {
           None -> None,
-          Some(seen) -> match product_of(variant.fields, decls, open, args) {
+          Some(seen) -> match product_of(variant.fields, decls, open, args, room) {
             None -> None,
             Some(p) -> {
               let total = seen.total + p.size;
@@ -290,6 +317,7 @@ fn product_of(
   decls: List<Decl>,
   open: List<String>,
   subst: List<Ty>,
+  room: Int,
 ) -> Option<{ size: Int, shapes: List<Shape> }> =
   fold(
     types,
@@ -297,7 +325,7 @@ fn product_of(
     |acc: Option<{ size: Int, shapes: List<Shape> }>, ty: Ty|
       match acc {
         None -> None,
-        Some(seen) -> match shaped(ty, decls, open, subst) {
+        Some(seen) -> match shaped(ty, decls, open, subst, room) {
           None -> None,
           Some(shape) -> {
             let next = seen.size * shape_size(shape);
@@ -314,8 +342,9 @@ fn fields_of(
   decls: List<Decl>,
   open: List<String>,
   subst: List<Ty>,
+  room: Int,
 ) -> Option<{ size: Int, fields: List<{ name: String, shape: Shape }> }> =
-  match product_of(map(fields, |f: { name: String, ty: Ty }| f.ty), decls, open, subst) {
+  match product_of(map(fields, |f: { name: String, ty: Ty }| f.ty), decls, open, subst, room) {
     None -> None,
     Some(p) ->
       Some({
