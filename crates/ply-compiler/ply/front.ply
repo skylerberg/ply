@@ -3,8 +3,8 @@
 import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_label, span_key,
                 is_bare, no_module)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
-              SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder,
-              is_predicate, Derived, is_pub, spec_kind_text)
+              SpecKind, SRequires, SEnsures, SCost, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef,
+              Binder, is_predicate, Derived, is_pub, spec_kind_text)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -74,7 +74,11 @@ fn fn_written(mods: List<ParsedModule>) -> Map<Bytes, Written> / {abort.raise} =
             reuse: match d.reuse { Some(_) -> true, None -> false },
             params: d.params,
             literals: fold(d.spec, [], |found: List<Bytes>, clause: SpecClause|
-              match clause.kind { SRequires -> lits(found, clause.expr), SEnsures -> found }),
+              match clause.kind {
+                SRequires -> lits(found, clause.expr),
+                SEnsures -> found,
+                SCost -> found,
+              }),
           }),
         _ -> a,
       }))
@@ -686,16 +690,27 @@ fn key_fn(
         { out: a.out, requires: 0, ensures: 0 },
         |b: { out: List<KeyRow>, requires: Int, ensures: Int }, i: Int| {
           let kind = at(spec, i).kind;
-          let text = match kind { SRequires -> b"requires", SEnsures -> b"ensures" };
-          let k = if kind == SRequires { b.requires } else { b.ensures };
-          let sentence = match list_at(sents, i) { Some(s) -> s, None -> owner };
-          {
-            out: push(b.out, {
-              root: key_clause_root(name, text, k),
-              key: bytes_concat_all([hex(sentence), b"#", text, b"#", ascii_of_int(k), b"+", read]),
-            }),
-            requires: if kind == SRequires { b.requires + 1 } else { b.requires },
-            ensures: if kind == SEnsures { b.ensures + 1 } else { b.ensures },
+          // A `cost` clause is keyed as the law it becomes.
+          if kind == SCost { b } else {
+            let text = spec_kind_text(kind);
+            let k = if kind == SRequires { b.requires } else { b.ensures };
+            let sentence = match list_at(sents, i) { Some(s) -> s, None -> owner };
+            {
+              out: push(b.out, {
+                root: key_clause_root(name, text, k),
+                key: bytes_concat_all([
+                  hex(sentence),
+                  b"#",
+                  text,
+                  b"#",
+                  ascii_of_int(k),
+                  b"+",
+                  read,
+                ]),
+              }),
+              requires: if kind == SRequires { b.requires + 1 } else { b.requires },
+              ensures: if kind == SEnsures { b.ensures + 1 } else { b.ensures },
+            }
           }
         },
       );
@@ -1103,6 +1118,7 @@ fn emitter_roots(
                           );
                           { rows: push(b.rows, row), requires: b.requires, ensures: b.ensures + 1 }
                         },
+                        SCost -> b,
                       }
                     },
                   );
@@ -1163,10 +1179,12 @@ fn ordinal_row(parsed: ParsedModule) -> OrdinalRow / {abort.raise} =
     items: fold(parsed.module.items, [], |acc: List<Bytes>, item: Item|
       match item {
         IFn(d) -> {
-          let kinds = if len(d.spec) == 0 { b"" } else {
+          // A `cost` clause is measured through the law it becomes, so it is no clause root.
+          let rooted = filter(d.spec, |clause: SpecClause| clause.kind != SCost);
+          let kinds = if len(rooted) == 0 { b"" } else {
             bytes_concat(
               b" ",
-              join(map(d.spec, |clause: SpecClause| spec_kind_text(clause.kind)), b","),
+              join(map(rooted, |clause: SpecClause| spec_kind_text(clause.kind)), b","),
             )
           };
           push(acc, bytes_concat_all([b"fn ", qualify(parsed.name, d.name.name), kinds]))
@@ -2433,7 +2451,7 @@ fn named(resolved: Resolved, m: Int, c: Code) -> Code / {abort.raise} = {
 pub type Claim =
   | ClaimDef({ name: Bytes, params: Int, body: Option<Code>, spec: List<ClaimClause>, measure: Option<Code>, ends: Bool, stated: Bool })
   | ClaimSum({ name: Bytes, variants: Int })
-  | ClaimLaw({ key: Bytes, guard: Option<Lowered>, body: Option<Code> })
+  | ClaimLaw({ key: Bytes, guard: Option<Lowered>, body: Option<Code>, costs: Option<{ def: Bytes, index: Int }> })
 
 // A clause lowered under its binders, and where it is written.
 pub type Lowered = { at: ModuleSpan, code: Option<Code> }
@@ -2481,7 +2499,11 @@ fn def_claim(
         clause: lowered_at(
           resolved,
           m,
-          match clause.kind { SRequires -> params, SEnsures -> push(params, b"result") },
+          match clause.kind {
+            SRequires -> params,
+            SEnsures -> push(params, b"result"),
+            SCost -> params,
+          },
           clause.expr,
         ),
       }),
@@ -2494,6 +2516,10 @@ fn law_claim(r: Resolved, m: Int, module: Bytes, law_def: LawDef) -> Claim / {ab
     key: qualify(module, law_def.name),
     guard: match law_def.guard { Some(g) -> Some(lowered_at(r, m, names, g)), None -> None },
     body: lowered(r, m, names, law_def.body),
+    costs: match law_def.costs {
+      Some(c) -> Some({ def: qualify(module, c.def.name), index: c.index }),
+      None -> None,
+    },
   })
 }
 

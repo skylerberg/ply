@@ -5,16 +5,18 @@
 import compiler.diagnostics (parse_all)
 import compiler.front (Analysed, Claim, ClaimClause, ClaimDef, Refused, Analysis, analyse,
                        claims_in, module_imports)
-import compiler.items (SEnsures, SRequires)
+import compiler.items (SCost, SEnsures, SRequires)
 import compiler.resolve (ParsedModule)
 import context (Context, Claims, claims_of, context, ctor, signature, group_of)
 import decide (Certified, Diagnosed, Static, Undecided, GuardRefuted, Unwitnessed, Proved, Unknown,
                decide_and_diagnose, static_of)
-import goal (Goal, Binder, Limits, BudgetSpent, default_limits, default_prove_budget)
+import goal (Goal, Binder, Limits, BudgetSpent, Open, default_limits, default_prove_budget)
 import lemma (Lemma, lemma_of)
-import lower (Blocker, blocker_parts)
+import cost (dominated, stated, steps)
+import lower (Blocker, Unbounded, blocker_parts)
 import measure (descent_of)
 import obligation (Ensures, Law)
+import rules (CostBound)
 import sort (canonical)
 import world (Drawn, Fitting, Measure, Obligation, World, Interleave, Hosted, measures_in,
               measures_world, unsettled, world_of)
@@ -290,7 +292,10 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
 pub fn diagnosed(p: Prover, obligation: Obligation) -> Option<Diagnosed> / {abort.raise} =
   match obligation.strategy {
     Interleave(_) -> None,
-    Fitting -> None,
+    Fitting -> match map_get(p.claims.laws, obligation.owner) {
+      Some(l) -> match l.costs { Some(c) -> Some(bounded(p.cx, c.def, c.index)), None -> None },
+      None -> None,
+    },
     _ -> match map_get(p.decided, obligation.key) {
       Some(d) -> Some(d),
       None -> match goal_of(p, obligation) {
@@ -306,7 +311,14 @@ pub fn settled_by(obligation: Obligation, d: Option<Diagnosed>) -> Static =
   match obligation.strategy {
     Interleave(_) -> Undecided,
     Hosted -> Undecided,
-    Fitting -> Undecided,
+    // A fit is measured unless a proof shows the bound.
+    Fitting -> match d {
+      Some(x) -> match x.decision {
+        Proved(_) -> static_of(x.decision, obligation.variables),
+        _ -> Undecided,
+      },
+      None -> Undecided,
+    },
     _ -> match d { Some(x) -> static_of(x.decision, obligation.variables), None -> Undecided },
   }
 
@@ -314,9 +326,47 @@ pub fn settled(p: Prover, obligation: Obligation) -> Static / {abort.raise} =
   match obligation.strategy {
     Interleave(_) -> Undecided,
     Hosted -> Undecided,
-    Fitting -> Undecided,
     _ -> settled_by(obligation, diagnosed(p, obligation)),
   }
+
+// Whether `def`'s steps grow no faster than its `index`th `cost` bound, read off its body.
+fn bounded(cx: Context, def: String, index: Int) -> Diagnosed / {abort.raise} = {
+  let open = |why: String|
+    { decision: Unknown({ reason: Open, steps: 0 }), blockers: [Unbounded(why)] };
+  match map_get(cx.claims.defs, def) {
+    None -> open("`" ++ def ++ "` has no claim here"),
+    Some(d) -> match list_at(filter(d.spec, |c: ClaimClause| c.kind == SCost), index) {
+      None -> open("`" ++ def ++ "` has no such bound"),
+      Some(clause) -> match clause.clause.code {
+        None -> open("the bound was not lowered"),
+        Some(b) -> match stated(b, d.params) {
+          None ->
+            open(
+              "only a bound of parameters' lengths, positive literals, sums, products and `ilog2` is read",
+            ),
+          Some(bound) -> match steps(cx, def) {
+            Err(why) -> open(why),
+            Ok(steps) -> if dominated(steps, bound) {
+              {
+                decision: Proved({
+                  rules: [CostBound({ def: def })],
+                  steps: 1,
+                  sorts: [],
+                  guard_satisfiable: true,
+                }),
+                blockers: [],
+              }
+            } else {
+              open(
+                "its steps are not within a constant times the bound at every size, zero included",
+              )
+            },
+          },
+        },
+      },
+    },
+  }
+}
 
 // --- Tests ---------------------------------------------------------------------------
 
@@ -376,6 +426,33 @@ test "an obligation is settled by what the prover decides, and only when its str
   // Nor a cost law's fit, which is measured.
   assert(settled(p, { ..bump, strategy: Fitting }) == Undecided);
   assert(diagnosed(p, { ..bump, strategy: Fitting }) == None)
+}
+
+test "a `cost` clause its body shows settles the law it became, and one it does not is left to the fit" {
+  let sources = [
+    {
+      name: b"m",
+      src: b"fn total(xs: List<Int>) -> Int cost len(xs) = fold(xs, 0, |a: Int, x: Int| a + x)\nfn wrong(xs: List<Int>) -> Int cost 1 = fold(xs, 0, |a: Int, x: Int| a + x)\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let p = prover_of(claims_for(w, [0]), world_of(w, world::every).world, 10000);
+  assert(match settled(p, owed(w, "m.cost of total")) {
+    Certified(s) -> s.rules == [CostBound({ def: "m.total" })],
+    _ -> false,
+  });
+  let wrong = owed(w, "m.cost of wrong");
+  assert_eq(settled(p, wrong), Undecided);
+  assert(match diagnosed(p, wrong) {
+    Some(d) ->
+      d.blockers
+        == [
+          Unbounded(
+            "its steps are not within a constant times the bound at every size, zero included",
+          ),
+        ],
+    None -> false,
+  })
 }
 
 test "a module the run does not own is claimed by its specifications, and a transparent definition by its body" {
