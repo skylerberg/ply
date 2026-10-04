@@ -465,7 +465,12 @@ impl TesterHandler {
         ply_host::observe::finished(observed, &self.world(&roots), usage.host)
     }
 
-    fn executed(&self, unit: usize, test: usize, caller: MachineId) -> Result<PlyValue, Diagnostic> {
+    fn executed(
+        &self,
+        unit: usize,
+        test: usize,
+        caller: MachineId,
+    ) -> Result<PlyValue, Diagnostic> {
         let (unit, hosting) = self.unit_at(unit)?;
         let once = match unit.provider {
             Some(provider) => {
@@ -579,10 +584,24 @@ fn use_value(usage: &Usage) -> PlyValue {
 /// it binds the host, the roots and programs it lends by name, and the families it allows.
 fn binding_digest(options: &TestOptions) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(if options.host { b"host\0" } else { b"hermetic\0" });
+    hasher.update(if options.host {
+        b"host\0"
+    } else {
+        b"hermetic\0"
+    });
     for (part, names) in [
-        ("fs", options.fs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>()),
-        ("exec", options.exec.iter().map(|e| e.name.as_str()).collect()),
+        (
+            "fs",
+            options
+                .fs
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "exec",
+            options.exec.iter().map(|e| e.name.as_str()).collect(),
+        ),
         ("allow", options.allow.iter().map(String::as_str).collect()),
     ] {
         let mut names = names;
@@ -607,7 +626,10 @@ fn executed_value(run: &Executed, trace: Option<String>) -> PlyValue {
         ),
         ("failure", option(run.failure.as_ref().map(raised_value))),
         ("usage", use_value(&run.usage)),
-        ("trace", option(trace.map(|t| PlyValue::bytes(t.as_bytes())))),
+        (
+            "trace",
+            option(trace.map(|t| PlyValue::bytes(t.as_bytes()))),
+        ),
     ])
 }
 
@@ -630,7 +652,10 @@ fn interleaved_value(run: &Interleaved, trace: Option<String>) -> PlyValue {
         ),
         ("observed", PlyValue::Bool(run.observed)),
         ("usage", use_value(&run.usage)),
-        ("trace", option(trace.map(|t| PlyValue::bytes(t.as_bytes())))),
+        (
+            "trace",
+            option(trace.map(|t| PlyValue::bytes(t.as_bytes()))),
+        ),
     ])
 }
 

@@ -266,11 +266,10 @@ impl HostHandler for MachineHandler {
                 }
             }
             ("enter", []) => {
-                let outcome: drive::Outcome =
-                    self.ask(&label, span, |reply| Request::Enter {
-                        caller: req.machine,
-                        reply,
-                    })?;
+                let outcome: drive::Outcome = self.ask(&label, span, |reply| Request::Enter {
+                    caller: req.machine,
+                    reply,
+                })?;
                 drive::outcome_value(&outcome)
             }
             ("call", [name, args]) => {

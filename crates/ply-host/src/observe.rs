@@ -4,9 +4,9 @@
 //! every read still answers as it did.
 //!
 //! A machine is observed when the tester begins it; one run on its behalf (a nested machine a
-//! command drives) is adopted into the same record. A read under a path the test wrote is not an
-//! input, nor is one under a directory a run keeps for the next: what is there is a product of its
-//! key. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
+//! command drives) is adopted into the same record. What the test writes is its own: a read under a
+//! path it wrote, or of a directory it wrote into, is not an input, nor is one under a directory a
+//! run keeps for the next, where what is there is a product of its key. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
 //! process read; a program that is not `ply` reports nothing and is the environment, as the clock
 //! and the network are. A `ply` that ended without finishing its report leaves the record
 //! incomplete, which files no pass.
@@ -109,7 +109,9 @@ fn is_kept(path: &Path) -> bool {
 
 fn recorder_of(machine: MachineId) -> Option<Arc<Recorder>> {
     let held = recorders().lock().unwrap_or_else(|e| e.into_inner());
-    held.get(&machine).cloned().or_else(|| PROCESS.get().cloned())
+    held.get(&machine)
+        .cloned()
+        .or_else(|| PROCESS.get().cloned())
 }
 
 fn with(machine: MachineId, f: impl FnOnce(&mut Observed)) {
@@ -146,7 +148,10 @@ pub fn begin_process() -> Arc<Recorder> {
 }
 
 pub fn read(machine: MachineId, how: Read, path: &Path) {
-    if let Some(rest) = SHIPPED_DIR.get().and_then(|dir| path.strip_prefix(dir).ok()) {
+    if let Some(rest) = SHIPPED_DIR
+        .get()
+        .and_then(|dir| path.strip_prefix(dir).ok())
+    {
         return match rest.to_str().and_then(|n| n.strip_suffix(".ply")) {
             Some(name) if how == Read::File => shipped(machine, name),
             _ => program(machine),
@@ -446,14 +451,19 @@ pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<
     if !observed.opaque.is_empty() {
         return None;
     }
-    let written = |path: &Path| observed.writes.iter().any(|w| path.starts_with(w));
+    let written = |how: Read, path: &Path| {
+        observed
+            .writes
+            .iter()
+            .any(|w| path.starts_with(w) || (how != Read::File && w.starts_with(path)))
+    };
     let mut lines = digested(&observed, &world.binary);
     if hosted {
         lines.insert("binding".to_string(), world.binding.clone());
     }
     let roots = world.roots.unwrap_or_default();
     for (how, path) in &observed.reads {
-        if written(path) {
+        if written(*how, path) {
             continue;
         }
         let (root, rest) = rooted(path, roots);

@@ -6,11 +6,11 @@
 //! cross as values.
 
 use crate::config::Configuration;
-use ply_eval::host::MachineId;
 use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
 use crate::support::{select_profile, unit_of};
+use ply_eval::host::MachineId;
 use ply_eval::{
     Analysis, CheckOutput, DefHash, Diagnostic, Ended, SourceMap, Span, Symbol, Value as PlyValue,
     codes,
@@ -511,13 +511,12 @@ impl Drive {
             ply_codegen::rt::with_time_budget(options.timeout, || {
                 evaluate(
                     target.front(),
-                    Call { name, args },
+                    Call { name, args, caller },
                     span,
                     &seed,
                     &bound.hosts,
                     bound.declared.as_ref(),
                     compiled.clone(),
-                    caller,
                 )
             })
         });
@@ -558,13 +557,13 @@ impl Drive {
                     Call {
                         name: &entry,
                         args: Vec::new(),
+                        caller,
                     },
                     span,
                     &seed,
                     &bound.hosts,
                     bound.declared.as_ref(),
                     compiled.clone(),
-                    caller,
                 )
             })
         });
@@ -687,10 +686,12 @@ fn hermetic_host() -> Diagnostic {
     .note("a program that drives a run reaching the host performs `machine`, and is `test/nondet`")
 }
 
-/// The definition a call enters: its program-wide name and the arguments it takes.
+/// The definition a call enters: its program-wide name, the arguments it takes, and the machine
+/// it runs on behalf of, whose record observes it.
 pub struct Call<'a> {
     pub name: &'a str,
     pub args: Vec<PlyValue>,
+    pub caller: MachineId,
 }
 
 fn evaluate(
@@ -701,13 +702,12 @@ fn evaluate(
     hosts: &Hosts,
     declared: Option<&ply_eval::Footprint>,
     compiled: std::rc::Rc<dyn ply_eval::Compiled>,
-    caller: MachineId,
 ) -> Ended<PlyValue> {
     let mut machine = match ply_eval::Machine::new(front, compiled) {
         Ok(machine) => machine,
         Err(refused) => return Ended::refused(refused),
     };
-    ply_host::observe::adopt(machine.id(), caller);
+    ply_host::observe::adopt(machine.id(), call.caller);
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);
