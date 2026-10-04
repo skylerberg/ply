@@ -55,7 +55,7 @@ pub fn program_digest() -> String {
 pub fn module_digest(name: &str) -> Option<String> {
     if name.is_empty() {
         let mut hasher = blake3::Hasher::new();
-        for (module, _) in crate::shipped_modules::sources() {
+        for module in crate::shipped_modules::names() {
             hasher.update(module.as_bytes());
             hasher.update(&[0]);
         }
@@ -130,18 +130,16 @@ impl HostHandler for Shipped {
         }
         let value = match (req.op.op.as_str(), req.args) {
             ("names", []) => PlyValue::list(
-                crate::shipped_modules::sources()
+                crate::shipped_modules::names()
                     .iter()
-                    .map(|(name, _)| PlyValue::str(name))
+                    .map(PlyValue::str)
                     .collect(),
             ),
             ("module", [name]) => {
                 let name = name.as_str(span, "a module's name")?;
                 crate::payload::option(
-                    crate::shipped_modules::sources()
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, text)| PlyValue::bytes(text.as_bytes())),
+                    crate::shipped_modules::source(&ply_eval::ModuleName::from_dotted(name))
+                        .map(|text| PlyValue::bytes(text.as_bytes())),
                 )
             }
             ("version", []) => PlyValue::str(env!("CARGO_PKG_VERSION")),

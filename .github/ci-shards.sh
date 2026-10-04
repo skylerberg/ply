@@ -37,6 +37,12 @@
 #   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
 #   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
+#   ci-shards.sh rust-answered DIR
+#                                the filterset of the tests whose traces in DIR
+#                                still stand against this checkout
+#   ci-shards.sh rust-kept NEW JUNIT OUT
+#                                the traces in NEW of the tests JUNIT says passed,
+#                                copied into OUT
 #   ci-shards.sh give-back RUN   delete the entries this run parked for its own
 #                                jobs, once every job that reads them is done
 #   ci-shards.sh supersede RUN REF
@@ -146,7 +152,7 @@ declare -a PROBE_JOBS=(
 GIVE_BACK=(ply-c-stage-emitter- test-shards-)
 
 # `<family>-<run id>` entries only the newest of which is ever restored.
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings-)
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings- rust-traces-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
@@ -396,6 +402,45 @@ cmd_tree_check_filter() {
 }
 
 cmd_gate_filter() { cmd_tree_check_filter; }
+
+# A Rust test is answered by its trace when nothing it read of the pack or the checkout has moved:
+# the trace store is keyed by the Rust key, so a test binary that changed answers nothing.
+cmd_rust_answered() {
+  local dir=${1:?a directory of traces} pack=${PLY_PACK:-$root/target/debug/ply-pack} answered
+  answered=$([ -d "$dir" ] && (cd "$root" && "$pack" --answered "$dir") || true)
+  if [ -z "$answered" ]; then
+    printf 'none()\n'
+    return 0
+  fi
+  local binary test first=1
+  while IFS=$'\t' read -r binary test; do
+    ((first)) || printf ' | '
+    first=0
+    printf '(binary_id(=%s) & test(=%s))' "$binary" "$test"
+  done <<< "$answered"
+  printf '\n'
+}
+
+# Only a pass is kept: a trace whose test failed, or that the report does not name, is dropped.
+cmd_rust_kept() {
+  local new=${1:?a directory of new traces} junit=${2:?a nextest JUnit report} out=${3:?a directory}
+  mkdir -p "$out"
+  [ -d "$new" ] && [ -f "$junit" ] || return 0
+  python3 - "$new" "$junit" "$out" <<'PY'
+import os, shutil, sys
+import xml.etree.ElementTree as ET
+new, junit, out = sys.argv[1:4]
+passed = set()
+for case in ET.parse(junit).getroot().iter("testcase"):
+    if case.find("failure") is None and case.find("error") is None:
+        passed.add((case.get("classname"), case.get("name")))
+for name in os.listdir(new):
+    with open(os.path.join(new, name), encoding="utf-8", errors="replace") as f:
+        head = f.readline().rstrip("\n").split("\t")
+    if len(head) == 3 and head[0] == "test" and (head[1], head[2]) in passed:
+        shutil.copy(os.path.join(new, name), os.path.join(out, name))
+PY
+}
 
 cmd_exclude_filter() {
   printf '%s | %s\n' "$(cmd_host_filter)" "$(triples "${GATES_ALONE[@]}" | filter_of)"
@@ -1616,6 +1661,8 @@ case "${1:-}" in
   corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
+  rust-answered) cmd_rust_answered "${2:-}" ;;
+  rust-kept) cmd_rust_kept "${2:-}" "${3:-}" "${4:-}" ;;
   host-filter) cmd_host_filter ;;
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;

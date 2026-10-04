@@ -439,9 +439,11 @@ jobs:
           set -euo pipefail
           .github/ci-corpus.sh restore /tmp/ply-c-nextest
           .github/ci-corpus.sh mark
+      - uses: ./.github/actions/rust-traces
 
       # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
-      # every other shard: a test the durations do not name runs there, and only there.
+      # every other shard: a test the durations do not name runs there, and only there. A test whose
+      # trace still stands is answered by it and not run.
       # The awk strips colour first: nextest colours its summary line.
       - name: cargo nextest run
         id: run
@@ -449,10 +451,13 @@ jobs:
           SHARD: ${{ matrix.shard }}
           OF: ${{ matrix.of }}
           SHARDS: ${{ needs.plan.outputs.shards }}
+          PLY_TEST_TRACES: /tmp/ply-rust-traces-new
         run: |
           set -euo pipefail
+          mkdir -p "$PLY_TEST_TRACES"
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
+          answered=$(.github/ci-shards.sh rust-answered /tmp/ply-rust-traces)
           config=/tmp/ply-shards/shard-$SHARD.toml
           if [ "$SHARDS" = true ]; then
             [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
@@ -462,12 +467,13 @@ jobs:
             profile=default
             cut=(--partition "slice:$SHARD/$OF")
           fi
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast "${cut[@]}" \
-            -E "not ($exclude)" 2>&1 | tee /tmp/shard.log || nextest=$?
+            --no-fail-fast --no-tests=pass "${cut[@]}" \
+            -E "not ($exclude) and not ($answered)" 2>&1 | tee /tmp/shard.log || nextest=$?
           [ "${nextest:-0}" -eq 0 ] || exit "$nextest"
           ran=$(awk '
             { gsub(/\033\[[0-9;]*m/, "") }
@@ -475,8 +481,7 @@ jobs:
             END { print n + 0 }
           ' /tmp/shard.log)
           echo "shard $SHARD ran $ran tests"
-          [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
-          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          [ "$ran" -gt 0 ] || [ "$answered" != "none()" ] || { echo "the shard ran no tests at all" >&2; exit 1; }
           echo "ran=$ran" >> "$GITHUB_OUTPUT"
 
       # What the next run cuts its shards from.
@@ -500,6 +505,19 @@ jobs:
           path: /tmp/timings-nextest-${{ matrix.shard }}.tsv
           retention-days: 1
           if-no-files-found: error
+      # Even from a red shard: a pass is a fact about its test.
+      - name: The traces of the tests this shard passed
+        if: ${{ !cancelled() }}
+        env:
+          PROFILE: ${{ steps.run.outputs.profile }}
+        run: .github/ci-shards.sh rust-kept /tmp/ply-rust-traces-new "target/nextest/${PROFILE:-default}/junit.xml" /tmp/rust-traces-out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: rust-traces-nextest-${{ matrix.shard }}
+          path: /tmp/rust-traces-out
+          retention-days: 1
+          if-no-files-found: ignore
 
       - name: What this shard compiled and asked
         if: ${{ !cancelled() }}
@@ -634,7 +652,7 @@ jobs:
   passes:
     name: the passes this run published, and what its tests cost
     if: ${{ !cancelled() }}
-    needs: [nextest, lanes, corpus]
+    needs: [nextest, gates, lanes, corpus]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -661,6 +679,28 @@ jobs:
         with:
           path: /tmp/ply-upstream
           key: ply-upstream-${{ github.run_id }}
+
+      # Every Rust test's last passing trace, the ones this run filed over the ones it read.
+      - uses: ./.github/actions/rust-traces
+        id: traces
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: rust-traces-*
+          merge-multiple: true
+          path: /tmp/rust-traces-parts
+      - name: Every job's Rust traces in one store
+        id: rust-traces
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ply-rust-traces
+          if [ -d /tmp/rust-traces-parts ]; then cp -R /tmp/rust-traces-parts/. /tmp/ply-rust-traces/; fi
+          if [ -n "$(find /tmp/ply-rust-traces -type f -print -quit)" ]; then echo "any=true" >> "$GITHUB_OUTPUT"; fi
+          echo "$(find /tmp/ply-rust-traces -type f | wc -l) Rust tests answered by a trace"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.rust-traces.outputs.any == 'true'
+        with:
+          path: /tmp/ply-rust-traces
+          key: rust-traces-${{ steps.traces.outputs.digest }}-${{ github.run_id }}
 
       # Every partition's C and the stores it wrote, as one entry each that every partition of the
       # next run restores: the cut moves runs between partitions as the durations move, and a
@@ -899,16 +939,26 @@ jobs:
           retention-days: 2
           compression-level: 0
 
+      - uses: ./.github/actions/rust-traces
       - name: cargo nextest run
+        env:
+          PLY_TEST_TRACES: /tmp/ply-rust-traces-new
         run: |
           set -euo pipefail
+          mkdir -p "$PLY_TEST_TRACES"
           filter=$(.github/ci-shards.sh gate-filter)
+          answered=$(.github/ci-shards.sh rust-answered /tmp/ply-rust-traces)
+          { [ -d /tmp/ply-rust-traces ] && target/debug/ply-pack --answered /tmp/ply-rust-traces; } > /tmp/answered.tsv || true
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast -E "$filter" 2>&1 | tee /tmp/gates.log
+            --no-fail-fast --no-tests=pass -E "($filter) and not ($answered)" 2>&1 | tee /tmp/gates.log
+      - name: The traces of the gates the job passed
+        if: ${{ !cancelled() }}
+        run: .github/ci-shards.sh rust-kept /tmp/ply-rust-traces-new target/nextest/default/junit.xml /tmp/rust-traces-out
 
+      # A tree check ran here, or its trace answered for it: either way the binary has it.
       - name: Every tree check ran
         run: |
           set -euo pipefail
@@ -919,13 +969,13 @@ jobs:
               { gsub(/\033\[[0-9;]*m/, "") }
               $1 == "PASS" && $NF == test && $(NF - 1) == id { found = 1 }
               END { exit !found }
-            ' /tmp/gates.log || {
+            ' /tmp/gates.log || grep -qxF "$id"$'\t'"$test" /tmp/answered.tsv || {
               echo "'$id $test' did not run: the table names a test the binary does not have" >&2
               exit 1
             }
             ran=$((ran + 1))
           done < <(.github/ci-shards.sh tree-checks)
-          echo "$ran tree checks ran"
+          echo "$ran tree checks ran or were answered"
           [ "$ran" -gt 0 ] || { echo "the table is empty" >&2; exit 1; }
       # The tree check that builds the `ply` program with this tree's own builder filed that build's
       # rows and bodies under the compiler `refresh` is about to commit as main's builder. Kept, a
@@ -951,14 +1001,28 @@ jobs:
 
       - name: cargo nextest run, the host packages
         if: ${{ !cancelled() }}
+        env:
+          PLY_TEST_TRACES: /tmp/ply-rust-traces-host
         run: |
           set -euo pipefail
+          mkdir -p "$PLY_TEST_TRACES"
           filter=$(.github/ci-shards.sh host-filter)
+          answered=$(.github/ci-shards.sh rust-answered /tmp/ply-rust-traces)
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast --success-output immediate -E "$filter"
+            --no-fail-fast --no-tests=pass --success-output immediate -E "($filter) and not ($answered)"
+      - name: The traces of the host packages' tests the job passed
+        if: ${{ !cancelled() }}
+        run: .github/ci-shards.sh rust-kept /tmp/ply-rust-traces-host target/nextest/default/junit.xml /tmp/rust-traces-out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: rust-traces-gates
+          path: /tmp/rust-traces-out
+          retention-days: 1
+          if-no-files-found: ignore
 
   # The Ply runs that would starve a partition, on runners of their own (`ci-shards.sh corpus-matrix`):
   # the corpus's checks that start desks under load, cut by duration over the `desks-<k>` runners,

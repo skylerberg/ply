@@ -6,8 +6,9 @@
 //! A pack is the files' bytes, then a table of `(path, offset, length, digest)`, then a trailer of
 //! the pack's and the table's lengths and [`MAGIC`].
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// The shipped modules: `std.<stem>` for each file here.
 pub const STD: &str = "crates/ply-std/ply";
@@ -120,16 +121,81 @@ impl Pack {
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &str> {
+        asked(|a| a.every = true);
+        self.listed()
+    }
+
+    fn listed(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.path.as_str())
     }
 
     /// The paths of the files directly in `dir`, ascending.
     pub fn files_in<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
+        asked(|a| {
+            a.dirs.insert(dir.to_string());
+        });
+        self.directly_in(dir)
+    }
+
+    fn directly_in<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
         let prefix = format!("{dir}/");
-        self.paths().filter(move |path| {
+        self.listed().filter(move |path| {
             path.strip_prefix(prefix.as_str())
                 .is_some_and(|name| !name.contains('/'))
         })
+    }
+
+    /// What this process asked of the pack since [`record`], as trace lines: `pack\t<path>\t<digest>`
+    /// a file read, `packed\t<dir>\t<digest>` a directory listed, `*` for every path.
+    pub fn asked_lines(&self) -> Vec<String> {
+        let Some(asked) = ASKED.get() else {
+            return Vec::new();
+        };
+        let asked = asked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines: Vec<String> = asked
+            .paths
+            .iter()
+            .map(|path| format!("pack\t{path}\t{}", self.answer_of(path)))
+            .collect();
+        for dir in &asked.dirs {
+            lines.push(format!("packed\t{dir}\t{}", self.listing_of(dir)));
+        }
+        if asked.every {
+            lines.push(format!("packed\t*\t{}", self.listing_of("*")));
+        }
+        lines
+    }
+
+    /// Whether a trace line this pack answers still answers as it did; `None` for a line it does not.
+    pub fn stands(&self, line: &str) -> Option<bool> {
+        match line.split('\t').collect::<Vec<_>>().as_slice() {
+            ["pack", path, digest] => Some(self.answer_of(path) == *digest),
+            ["packed", dir, digest] => Some(self.listing_of(dir) == *digest),
+            _ => None,
+        }
+    }
+
+    fn answer_of(&self, path: &str) -> String {
+        match self.entry_quietly(path) {
+            Some(entry) => blake3::Hash::from(self.entry_digest(entry))
+                .to_hex()
+                .to_string(),
+            None => "none".to_string(),
+        }
+    }
+
+    fn listing_of(&self, dir: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        let names: Vec<&str> = if dir == "*" {
+            self.listed().collect()
+        } else {
+            self.directly_in(dir).collect()
+        };
+        for name in names {
+            hasher.update(name.as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.finalize().to_hex().to_string()
     }
 
     pub fn bytes(&self, path: &str) -> Option<&[u8]> {
@@ -189,6 +255,13 @@ impl Pack {
     }
 
     fn entry(&self, path: &str) -> Option<&Entry> {
+        asked(|a| {
+            a.paths.insert(path.to_string());
+        });
+        self.entry_quietly(path)
+    }
+
+    fn entry_quietly(&self, path: &str) -> Option<&Entry> {
         self.entries
             .binary_search_by(|entry| entry.path.as_str().cmp(path))
             .ok()
@@ -330,6 +403,42 @@ pub fn checkout_around(dir: &Path) -> Result<PathBuf, String> {
 }
 
 static INSTALLED: OnceLock<Pack> = OnceLock::new();
+
+#[derive(Default)]
+struct Asked {
+    paths: BTreeSet<String>,
+    dirs: BTreeSet<String>,
+    every: bool,
+}
+
+static ASKED: OnceLock<Mutex<Asked>> = OnceLock::new();
+
+/// From now on, what this process asks of any pack is noted, for [`Pack::asked_lines`].
+pub fn record() {
+    ASKED.get_or_init(Mutex::default);
+}
+
+thread_local! {
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` run without what it asks of the pack being noted: for what only keys a cache, whose
+/// contents are a product of their key.
+pub fn unrecorded<T>(f: impl FnOnce() -> T) -> T {
+    let was = QUIET.with(|q| q.replace(true));
+    let out = f();
+    QUIET.with(|q| q.set(was));
+    out
+}
+
+fn asked(f: impl FnOnce(&mut Asked)) {
+    if QUIET.with(std::cell::Cell::get) {
+        return;
+    }
+    if let Some(asked) = ASKED.get() {
+        f(&mut asked.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
 
 /// The pack this process reads: the `ply` binary installs its own before anything runs, and a test
 /// binary the checkout's.
