@@ -11,14 +11,17 @@ import sort (canonical, is_pure_fn)
 import world (Signature, World)
 
 // A definition as the prover reads it: its body (`None` when the lowering did not take it), its
-// clauses, and every global its body names, which is what its place in the call graph is made of.
-// `ends`: the checker saw every call it makes of its own group descend.
+// clauses, its `decreases` measure, and every global its body names, which is what its place in the
+// call graph is made of. `ends`: the checker saw every call it makes of its own group descend;
+// `stated`: it saw that only once the measures the group states are counted.
 pub type Def = {
   params: Int,
   body: Option<Code>,
   spec: List<ClaimClause>,
+  measure: Option<Code>,
   refs: List<String>,
   ends: Bool,
+  stated: Bool,
 }
 
 pub type Law = { guard: Option<Lowered>, body: Option<Code> }
@@ -36,6 +39,10 @@ pub type Context = {
   recursive: Map<String, Bool>,
   // A component of one definition calling itself: the shape induction unrolls.
   self_recursive: Map<String, Bool>,
+  // Each recursive definition's component.
+  groups: Map<String, List<String>>,
+  // Definitions whose stated measures a proof showed descend, which end as surely as `ends` says.
+  measured: Map<String, Bool>,
   // The sum types a case split may range over.
   sums: Map<String, Bool>,
   inhabited: Map<String, Bool>,
@@ -53,8 +60,10 @@ pub fn claims_of(cs: List<Claim>) -> Claims =
             params: d.params,
             body: d.body,
             spec: d.spec,
+            measure: d.measure,
             refs: match d.body { Some(b) -> refs_of(b, []), None -> [] },
             ends: d.ends,
+            stated: d.stated,
           }),
         },
       ClaimLaw(l) ->
@@ -141,14 +150,18 @@ pub fn context(claims: Claims, world: World) -> Context / {abort.raise} = {
     ),
   );
   let rec = recursive_definitions(claims.defs);
+  let signatures = fold(world.signatures, map_new(), |m: Map<String, Signature>, s: Signature|
+    map_insert(m, s.name, { ..s, ty: canonical(s.ty) }));
+  let measures = measure_defs(claims.defs, signatures);
   {
-    claims: claims,
+    claims: { ..claims, defs: map_merge(claims.defs, measures.defs) },
     decls: by_name,
     ctors: ctors,
-    signatures: fold(world.signatures, map_new(), |m: Map<String, Signature>, s: Signature|
-      map_insert(m, s.name, { ..s, ty: canonical(s.ty) })),
+    signatures: map_merge(signatures, measures.signatures),
     recursive: rec.recursive,
     self_recursive: rec.alone,
+    groups: rec.groups,
+    measured: map_new(),
     sums: sums,
     inhabited: inhabited_sum_types(decls, sums),
     float_types: float_reaching_types(decls),
@@ -269,9 +282,7 @@ fn field_inhabited(ty: Ty, sums: Map<String, Bool>, inhabited: Map<String, Bool>
   }
 
 // Definitions in a call-graph cycle, and among them the ones whose cycle is only themselves.
-fn recursive_definitions(
-  defs: Map<String, Def>,
-) -> { recursive: Map<String, Bool>, alone: Map<String, Bool> } / {abort.raise} = {
+fn recursive_definitions(defs: Map<String, Def>) -> Recursion / {abort.raise} = {
   let names = map_keys(defs);
   let index = fold(range(0, len(names)), map_new(), |m: Map<String, Int>, i: Int|
     match list_at(names, i) { Some(n) -> map_insert(m, n, i), None -> m });
@@ -288,8 +299,8 @@ fn recursive_definitions(
     });
   fold(
     tarjan(len(names), edges),
-    { recursive: map_new(), alone: map_new() },
-    |acc: { recursive: Map<String, Bool>, alone: Map<String, Bool> }, component: List<Int>| {
+    { recursive: map_new(), alone: map_new(), groups: map_new() },
+    |acc: Recursion, component: List<Int>| {
       let self_loop = match component {
         [v] -> match list_at(edges, v) {
           Some(es) -> fold(es, false, |f: Bool, w: Int| f || w == v),
@@ -301,10 +312,71 @@ fn recursive_definitions(
       let alone = if self_loop {
         fold(named, acc.alone, |m: Map<String, Bool>, n: String| map_insert(m, n, true))
       } else { acc.alone };
-      let recursive = if len(component) > 1 || self_loop {
+      let looping = len(component) > 1 || self_loop;
+      let recursive = if looping {
         fold(named, acc.recursive, |m: Map<String, Bool>, n: String| map_insert(m, n, true))
       } else { acc.recursive };
-      { recursive: recursive, alone: alone }
+      let groups = if looping {
+        fold(named, acc.groups, |m: Map<String, List<String>>, n: String| map_insert(m, n, named))
+      } else { acc.groups };
+      { recursive: recursive, alone: alone, groups: groups }
     },
   )
 }
+
+type Recursion = {
+  recursive: Map<String, Bool>,
+  alone: Map<String, Bool>,
+  groups: Map<String, List<String>>,
+}
+
+// The name a definition's measure goes by as a definition of its own parameters.
+pub fn measure_name(def: String) -> String = def ++ " decreases"
+
+// Each measure as a definition the lowering unfolds, so a measure at a call's arguments is a call.
+fn measure_defs(
+  defs: Map<String, Def>,
+  signatures: Map<String, Signature>,
+) -> { defs: Map<String, Def>, signatures: Map<String, Signature> } =
+  map_fold(
+    defs,
+    { defs: map_new(), signatures: map_new() },
+    |acc: { defs: Map<String, Def>, signatures: Map<String, Signature> }, name: String, d: Def|
+      match d.measure {
+        None -> acc,
+        Some(m) -> match map_get(signatures, name) {
+          Some(s) -> match s.ty {
+            Fn(params, _, _) ->
+              {
+                defs: map_insert(acc.defs, measure_name(name), {
+                  params: d.params,
+                  body: Some(m),
+                  spec: [],
+                  measure: None,
+                  refs: refs_of(m, []),
+                  ends: true,
+                  stated: false,
+                }),
+                signatures: map_insert(acc.signatures, measure_name(name), {
+                  name: measure_name(name),
+                  ty: Fn(params, Con("Int", []), true),
+                  pure: true,
+                }),
+              },
+            _ -> acc,
+          },
+          None -> acc,
+        },
+      },
+  )
+
+pub fn group_of(cx: Context, name: String) -> List<String> =
+  match map_get(cx.groups, name) { Some(g) -> g, None -> [name] }
+
+// Whether a definition's calls are known to end: the checker saw them, or a proof showed the measures
+// it read them by descend.
+pub fn ends(cx: Context, name: String) -> Bool =
+  match map_get(cx.claims.defs, name) {
+    Some(d) -> d.ends || (d.stated && holds(cx.measured, name)),
+    None -> false,
+  }

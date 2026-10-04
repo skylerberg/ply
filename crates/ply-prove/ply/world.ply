@@ -84,7 +84,20 @@ pub type Obligation = {
   strategy: Strategy,
 }
 
-pub type World = { decls: List<Decl>, signatures: List<Signature>, obligations: List<Obligation> }
+// A definition's `decreases`, with the parameters it is stated over, named as its signature writes
+// them. Only a proof shows a measure descends, and the checker refuses one no proof shows.
+pub type Measure = {
+  owner: String,
+  at: { module: Int, start: Int, end: Int },
+  binders: List<Binder>,
+}
+
+pub type World = {
+  decls: List<Decl>,
+  signatures: List<Signature>,
+  obligations: List<Obligation>,
+  measures: List<Measure>,
+}
 
 // The world; every definition and every hashed law of the modules a run answers for, in the
 // checker's order, which is what its coverage and its review count; and the trouble that cost it an
@@ -92,7 +105,7 @@ pub type World = { decls: List<Decl>, signatures: List<Signature>, obligations: 
 pub type Built = { world: World, defs: List<Def>, laws: List<Written>, warnings: List<Diag> }
 
 // Every declared type and signature, and the obligations of the modules `owned` answers for: every
-// definition's `ensures` clauses in the checker's order, then every law.
+// definition's `ensures` clauses in the checker's order, then every law; and their measures.
 pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.raise} = {
   let decls = decls_of(analysis.checked.ctors);
   let written = written_params(analysis.mods);
@@ -114,6 +127,7 @@ pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.ra
       decls: decls,
       signatures: map(analysis.checked.defs, signature_of),
       obligations: owed.obligations,
+      measures: measures_in(analysis, owned),
     },
     defs: defined(defs, analysis.hashes),
     laws: sentences_of(laws, analysis.hashes),
@@ -542,6 +556,51 @@ fn law_of(
     },
   }
 
+// The declared types and signatures every claim is read against, and `measures`, with no
+// obligation: all that judging a measure reads.
+pub fn measures_world(analysis: Analysis, measures: List<Measure>) -> World / {abort.raise} =
+  {
+    decls: decls_of(analysis.checked.ctors),
+    signatures: map(analysis.checked.defs, signature_of),
+    obligations: [],
+    measures: measures,
+  }
+
+// The measures the definitions of the modules `owned` answers for state, in the checker's order.
+pub fn measures_in(analysis: Analysis, owned: (Bytes) -> Bool) -> List<Measure> / {abort.raise} = {
+  let stated = measures_of(analysis.mods);
+  let written = if len(map_keys(stated)) == 0 { map_new() } else { written_params(analysis.mods) };
+  fold(analysis.checked.defs, [], |acc: List<Measure>, d: DefInfo|
+    if !owned(d.module) { acc } else {
+      match map_get(stated, d.name) {
+        None -> acc,
+        Some(m) -> {
+          let shape = match d.scheme.ty { TyFn(f) -> f.params, _ -> [] };
+          let names = match map_get(written, d.name) { Some(ns) -> ns, None -> [] };
+          push(acc, {
+            owner: string_of_bytes_lossy(d.name),
+            at: at_of(d.at.module, expr_span(m)),
+            binders: binders_of(
+              map(range(0, min(len(names), len(shape))), |i: Int|
+                { name: at(names, i), ty: at(shape, i) }),
+            ).binders,
+          })
+        },
+      }
+    })
+}
+
+fn measures_of(mods: List<ParsedModule>) -> Map<Bytes, Expr> =
+  fold(mods, map_new(), |acc: Map<Bytes, Expr>, m: ParsedModule|
+    fold(m.module.items, acc, |a: Map<Bytes, Expr>, item: Item|
+      match item {
+        IFn(d) -> match d.decreases {
+          Some(e) -> map_insert(a, qualify(m.name, d.name.name), e),
+          None -> a,
+        },
+        _ -> a,
+      }))
+
 // --- Tests ---------------------------------------------------------------------------
 
 fn whole_of(src: Bytes) -> Analysis / {abort.raise} =
@@ -806,4 +865,12 @@ test "a law's guard is its `where`, where it is written" {
       map(obligation.guards, |g: { module: Int, start: Int, end: Int }| (g.start, g.end))),
     [[(36, 41)]],
   )
+}
+
+test "a measure is its definition's, apart from every obligation, over the parameters as written" {
+  let src = b"fn climb(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }\nfn plain(n: Int) -> Int = n\n";
+  let w = built_of(src).world;
+  assert_eq(map(w.measures, |m: Measure| m.owner), ["m.climb"]);
+  assert_eq(map(w.measures, |m: Measure| map(m.binders, |b: Binder| b.name)), [["a", "b"]]);
+  assert_eq(owned_by(w.obligations, "m.climb"), [])
 }
