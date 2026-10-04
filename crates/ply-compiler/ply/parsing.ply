@@ -1,7 +1,8 @@
 // The parser's spine: token access, threaded state, diagnostics, the sequence driver, the dump encoder.
 // Rule: a parse function answers `Result<R<Thing>, P>` and propagates with `?`, except around a
-// save/restore of `no_brace`, `no_pipe` or `depth`, which is a `match` so both paths restore.
-// Rule: a sequence is one `iterate`, never recursion; recursion is reserved for grammar nesting.
+// save/restore of `no_brace` or `no_pipe`, which is a `match` so both paths restore.
+// Rule: a sequence is one `iterate`, never recursion; recursion is reserved for grammar nesting, and
+// a rule that nests spends one of `Input.room`.
 // Rule: the growing field is last in every record literal (`SoFar.out`, `Parser.diags`), or accumulation
 // turns quadratic; build a `Parser` only through the constructors below.
 
@@ -127,7 +128,9 @@ pub fn primary_span_of(diag: ParseDiag) -> Span = {
 
 // --- The token buffer -------------------------------------------------------
 
-pub type Input = { token_count: Int, source: Bytes, tokens: List<lexer::Token> }
+// What a parse reads, which flows down into what it parses: the tokens, and `room`, how many levels
+// deeper the grammar may nest from here, which every rule that nests spends one of.
+pub type Input = { token_count: Int, source: Bytes, tokens: List<lexer::Token>, room: Int }
 
 // `gt_split` is the index where `expect_gt` split a `>=`: `token_index` reads it as `=` over its
 // second byte. One slot suffices because `pos` must pass a split before another can happen.
@@ -136,7 +139,6 @@ pub type Parser = {
   no_brace: Bool,
   // Inside a lambda's parameter list, `|` closes the list and is never bit-or.
   no_pipe: Bool,
-  depth: Int,
   gt_split: Int,
   diags: List<ParseDiag>,
 }
@@ -154,8 +156,8 @@ pub fn start(src: Bytes) -> ParseStart / {abort.raise} = {
   let d = map(lx.diags, |diag: lexer::Diag|
     error_at(diag.code, { start: diag.start, end: diag.end }, diag.message, diag.label, []));
   {
-    input: { token_count: len(lx.tokens), source: src, tokens: lx.tokens },
-    parser: { pos: 0, no_brace: false, no_pipe: false, depth: 0, gt_split: -1, diags: d },
+    input: { token_count: len(lx.tokens), source: src, tokens: lx.tokens, room: max_depth() },
+    parser: { pos: 0, no_brace: false, no_pipe: false, gt_split: -1, diags: d },
   }
 }
 
@@ -165,7 +167,6 @@ pub fn at_pos(parser: Parser, pos: Int) -> Parser =
   {
     no_brace: parser.no_brace,
     no_pipe: parser.no_pipe,
-    depth: parser.depth,
     gt_split: parser.gt_split,
     pos: pos,
     diags: parser.diags,
@@ -175,7 +176,6 @@ pub fn with_no_brace(parser: Parser, b: Bool) -> Parser =
   {
     pos: parser.pos,
     no_pipe: parser.no_pipe,
-    depth: parser.depth,
     gt_split: parser.gt_split,
     no_brace: b,
     diags: parser.diags,
@@ -185,19 +185,8 @@ pub fn with_no_pipe(parser: Parser, b: Bool) -> Parser =
   {
     pos: parser.pos,
     no_brace: parser.no_brace,
-    depth: parser.depth,
     gt_split: parser.gt_split,
     no_pipe: b,
-    diags: parser.diags,
-  }
-
-pub fn with_depth(parser: Parser, d: Int) -> Parser =
-  {
-    pos: parser.pos,
-    no_brace: parser.no_brace,
-    no_pipe: parser.no_pipe,
-    gt_split: parser.gt_split,
-    depth: d,
     diags: parser.diags,
   }
 
@@ -206,7 +195,6 @@ pub fn with_gt_split(parser: Parser, i: Int) -> Parser =
     pos: parser.pos,
     no_brace: parser.no_brace,
     no_pipe: parser.no_pipe,
-    depth: parser.depth,
     gt_split: i,
     diags: parser.diags,
   }
@@ -217,7 +205,6 @@ pub fn fresh_item(parser: Parser) -> Parser =
     no_pipe: parser.no_pipe,
     gt_split: parser.gt_split,
     no_brace: false,
-    depth: 0,
     diags: parser.diags,
   }
 
@@ -239,7 +226,6 @@ pub fn push_diag(parser: Parser, diag: ParseDiag) -> Parser = {
       pos: parser.pos,
       no_brace: parser.no_brace,
       no_pipe: parser.no_pipe,
-      depth: parser.depth,
       gt_split: parser.gt_split,
       diags: push(parser.diags, diag),
     }
@@ -593,25 +579,18 @@ pub fn expect_gt(
 
 pub fn max_depth() -> Int = 128
 
-pub fn deeper(input: Input, parser: Parser) -> Result<Parser, Parser> = {
-  let q = with_depth(parser, parser.depth + 1);
-  if q.depth <= max_depth() { Ok(q) } else {
-    Err(
-      push_diag(
-        q,
-        error_at(
-          unexpected(),
-          current_span(input, q),
-          b"input is nested too deeply to parse",
-          bytes_concat_all([b"more than ", int_to_bytes(max_depth()), b" levels of nesting"]),
-          [b"split this into smaller definitions"],
-        ),
-      ),
-    )
-  }
-}
-
-pub fn shallower(parser: Parser) -> Parser = with_depth(parser, parser.depth - 1)
+// Where a rule would nest once more than `max_depth()` allows.
+pub fn too_deep(input: Input, parser: Parser) -> Parser =
+  push_diag(
+    parser,
+    error_at(
+      unexpected(),
+      current_span(input, parser),
+      b"input is nested too deeply to parse",
+      bytes_concat_all([b"more than ", int_to_bytes(max_depth()), b" levels of nesting"]),
+      [b"split this into smaller definitions"],
+    ),
+  )
 
 // --- The shared sequence driver ---------------------------------------------
 
@@ -874,17 +853,10 @@ test "an unclosed delimiter carries a secondary label at the opener" {
   assert_eq(dump_diags(u.diags), b"#1;!E0001:2:3:2:0;=2:3:1;=0:1:0;");
 }
 
-test "deeper fails at MAX_DEPTH and the diagnostic carries its note" {
+test "nesting too deep is refused where it would go deeper, and the diagnostic carries its note" {
   let s = probe(b"fn");
-  let deep = with_depth(s.parser, max_depth());
-  match deeper(s.input, deep) {
-    Ok(q) -> assert(false),
-    Err(q) -> assert_eq(dump_diags(q.diags), b"#1;!E0001:0:2:1:1;=0:2:1;"),
-  };
-  match deeper(s.input, s.parser) {
-    Ok(q) -> assert_eq(shallower(q).depth, 0),
-    Err(q) -> assert(false),
-  };
+  assert_eq(s.input.room, max_depth());
+  assert_eq(dump_diags(too_deep(s.input, s.parser).diags), b"#1;!E0001:0:2:1:1;=0:2:1;")
 }
 
 fn a_name(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> / {abort.raise} =

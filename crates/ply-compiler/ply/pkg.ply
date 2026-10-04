@@ -540,21 +540,17 @@ pub type Closure = {
 // `base` joined with `rel`, then `.` and `..` segments folded out textually, so two spellings
 // of one directory key the same package.
 fn join_normalized(base: Bytes, rel: Bytes) -> Bytes / {abort.raise} =
-  normalize(bytes_concat_all([base, b"/", rel]), [], 0)
+  normalize(bytes_concat_all([base, b"/", rel]))
 
-fn normalize(path: Bytes, out: List<Bytes>, i: Int) -> Bytes / {abort.raise} =
-  if i >= bytes_len(path) {
-    let joined = bytes::join(out, b"/");
-    if bytes_len(path) > 0 && bytes_at(path, 0) == 47 { bytes_concat(b"/", joined) } else { joined }
-  } else {
-    let end = match bytes_index_of_from(path, b"/", i) { Some(j) -> j, None -> bytes_len(path) };
-    let seg = bytes_slice(path, i, end);
-    let next = end + 1;
-    if seg == b"." || seg == b"" { normalize(path, out, next) } else if seg == b".." {
-      if len(out) == 0 || at(out, len(out) - 1) == b".." { normalize(path, push(out, b".."), next) }
-      else { normalize(path, take(out, len(out) - 1), next) }
-    } else { normalize(path, push(out, seg), next) }
-  }
+fn normalize(path: Bytes) -> Bytes / {abort.raise} = {
+  let out = fold(bytes_split(path, b"/"), [], |out: List<Bytes>, seg: Bytes|
+    if seg == b"." || seg == b"" { out } else if seg == b".." {
+      if len(out) == 0 || at(out, len(out) - 1) == b".." { push(out, b"..") }
+      else { take(out, len(out) - 1) }
+    } else { push(out, seg) });
+  let joined = bytes::join(out, b"/");
+  if bytes_len(path) > 0 && bytes_at(path, 0) == 47 { bytes_concat(b"/", joined) } else { joined }
+}
 
 // The root keys a set of manifests asks for beyond the ones already known: what a walker
 // reads next. Malformed manifests ask for nothing; their refusal is the final pass's to say.
@@ -609,7 +605,7 @@ pub fn registry_key(root: Bytes, name: Bytes) -> Bytes / {abort.raise} =
 pub fn git_spec(key: Bytes) -> Option<{ url: Bytes, rev: Bytes }> / {abort.raise} =
   if !bytes_starts_with(key, b"git+") { None } else {
     let rest = bytes_slice(key, 4, bytes_len(key));
-    match last_at(rest, 0, 0) {
+    match last_at(rest) {
       None -> None,
       Some(at) ->
         Some({ url: bytes_slice(rest, 0, at), rev: bytes_slice(rest, at + 1, bytes_len(rest)) }),
@@ -617,12 +613,12 @@ pub fn git_spec(key: Bytes) -> Option<{ url: Bytes, rev: Bytes }> / {abort.raise
   }
 
 // The last `@` in a key's url: a url may hold one of its own (`git@host:path`), and the revision
-// never does.
-fn last_at(rest: Bytes, from: Int, found: Int) -> Option<Int> / {abort.raise} =
-  match bytes_index_of_from(rest, b"@", from) {
-    None -> if found == 0 { None } else { Some(found) },
-    Some(at) -> if at + 1 >= bytes_len(rest) { None } else { last_at(rest, at + 1, at) },
-  }
+// never does. Neither side of it may be empty.
+fn last_at(rest: Bytes) -> Option<Int> / {abort.raise} = {
+  let found = fold(range(0, bytes_len(rest)), 0, |acc: Int, i: Int|
+    if bytes_at(rest, i) == 64 { i } else { acc });
+  if found == 0 || found + 1 >= bytes_len(rest) { None } else { Some(found) }
+}
 
 fn slot_of(manifests: List<Option<Bytes>>, i: Int) -> Int / {abort.raise} = {
   let before = take(manifests, i);
@@ -1207,18 +1203,21 @@ fn visit(
   match nodes {
     [] -> None,
     [u, ..rest] -> if at(colors, u) != 0 { visit(rest, edges, colors, stack, 0) } else {
-      match dfs(u, edges, list_set(colors, u, 1), push(stack, u)) {
+      match dfs(u, edges, list_set(colors, u, 1), push(stack, u), len(colors) - 1) {
         { colors: c2, cycle: Some(c) } -> Some(c),
         { colors: c2, cycle: None } -> visit(rest, edges, list_set(c2, u, 2), stack, 0),
       }
     },
   }
 
+// `room` is how many more packages the walk may go down into: each one it does turns gray, and a
+// gray one is never gone into again.
 fn dfs(
   u: Int,
   edges: List<{ from: Int, target: Int }>,
   colors: List<Int>,
   stack: List<Int>,
+  room: Int,
 ) -> { colors: List<Int>, cycle: Option<List<Int>> } / {abort.raise} =
   fold(
     edges,
@@ -1229,10 +1228,18 @@ fn dfs(
         None -> if e.from != u { acc } else if at(acc.colors, e.target) == 1 {
           { colors: acc.colors, cycle: Some(stack_from(stack, e.target)) }
         } else if at(acc.colors, e.target) == 0 {
-          match dfs(e.target, edges, list_set(acc.colors, e.target, 1), push(stack, e.target)) {
-            // Black once its own edges are done: a package two others both depend on is reached
-            // twice, and only a gray target is a back edge.
-            { colors: c2, cycle: c } -> { colors: list_set(c2, e.target, 2), cycle: c },
+          if room <= 0 { panic("a walk down past the packages there are") } else {
+            match dfs(
+                e.target,
+                edges,
+                list_set(acc.colors, e.target, 1),
+                push(stack, e.target),
+                room - 1,
+              ) {
+              // Black once its own edges are done: a package two others both depend on is reached
+              // twice, and only a gray target is a back edge.
+              { colors: c2, cycle: c } -> { colors: list_set(c2, e.target, 2), cycle: c },
+            }
           }
         } else { acc },
       },

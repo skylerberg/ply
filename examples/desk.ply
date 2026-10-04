@@ -832,8 +832,21 @@ pub fn next_chunk(c: Cursor) -> Option<{ chunk: Bytes, next: Cursor }> =
 // What a buffered path would have sent.
 pub fn drained(c: Cursor) -> Bytes = bytes_concat_all(chunks_of(c, []))
 
+// A cursor writes its opening, a line per item and its close, so the items and three more rounds
+// see it done.
 fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
-  match next_chunk(c) { None -> acc, Some(step) -> chunks_of(step.next, push(acc, step.chunk)) }
+  fold(
+    range(0, len(c.pending) + 3),
+    { at: Some(c), out: acc },
+    |s: { at: Option<Cursor>, out: List<Bytes> }, _round: Int|
+      match s.at {
+        None -> s,
+        Some(now) -> match next_chunk(now) {
+          None -> { at: None, out: s.out },
+          Some(step) -> { at: Some(step.next), out: push(s.out, step.chunk) },
+        },
+      },
+  ).out
 
 // --- Dispatch ---------------------------------------------------------------------
 
@@ -1079,10 +1092,11 @@ fn turn(
           false,
           http::text_response(408, "the request head did not arrive\n"),
         ),
-      http::HeadBytes(read) -> heard(c, l, read.buf, read.complete, left),
+      http::HeadBytes(read) -> heard(c, l, read.buf, read.complete, left - 1),
     }
   }
 
+// From here on `left` is how many requests the connection may serve after this one.
 fn heard(
   c: Int,
   l: http::Limits,
@@ -1173,7 +1187,7 @@ fn answered(
   got: { bytes: Bytes, rest: Bytes, trailers: http::Headers },
   left: Int,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} = {
-  let keep = h.keep_alive && left > 1;
+  let keep = h.keep_alive && left > 0;
   let reply = answer(whole(h, got.bytes, got.trailers));
   let wrote = match streamable(h.request.method, reply) {
     Buffered(r) ->
@@ -1189,7 +1203,7 @@ fn answered(
   if wrote && keep {
     // Pipelined requests are answered in order by construction: one connection, one task, and the
     // leftover buffer carried into the next turn.
-    turn(c, l, got.rest, left - 1, true)
+    turn(c, l, got.rest, left, true)
   } else { () }
 }
 
@@ -2840,11 +2854,8 @@ test "more header bytes than this service will hold is 431" {
   )
 }
 
-fn filler(n: Int) -> Bytes = fill_to(b"", n)
-
-fn fill_to(so_far: Bytes, n: Int) -> Bytes =
-  if bytes_len(so_far) >= n { so_far }
-  else { fill_to(bytes_concat(so_far, b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), n) }
+fn filler(n: Int) -> Bytes =
+  bytes_concat_all(map(range(0, (n + 31) / 32), |_i: Int| b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
 
 // --- Laws the route table being data makes possible -------------------------------------
 

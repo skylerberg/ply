@@ -323,28 +323,32 @@ pub fn empty_corpus(tables: List<String>, regions: List<String>, shards: List<St
 pub fn effectful_defs(corpus: Corpus) -> Int =
   fold(corpus.defs, 0, |acc: Int, d: Def| if len(d.footprint) > 0 { acc + 1 } else { acc })
 
-// `def(args)` under `world`, which receives exactly the writes the definition performs.
+// `def(args)` under `world`, which receives exactly the writes the definition performs. `room` is
+// how many calls deeper evaluation may go: the corpus calls only earlier definitions, so its
+// definitions are room enough.
 pub fn eval(
   corpus: Corpus,
   id: Int,
   args: List<Int>,
   world: World,
-) -> (World, Int) / {abort.raise} = {
-  let def = at_def(corpus, id);
-  let p0 = match list_at(args, 0) { Some(x) -> x, None -> 0 };
-  let p1 = match list_at(args, 1) { Some(x) -> x, None -> 0 };
-  let (w2, core) = eval_shape(corpus, def, p0, p1, world);
-  if len(def.extras) == 0 { (w2, core) } else {
-    let (w3, sum) = fold(def.extras, (w2, 0), |acc: (World, Int), extra: Call|
-      match acc {
-        (w, sum) -> {
-          let (w_next, v) = invoke(corpus, extra, p0, w);
-          (w_next, sum + v)
-        },
-      });
-    (w3, mix(core, sum))
+  room: Int,
+) -> (World, Int) / {abort.raise} =
+  if room <= 0 { panic("the corpus calls round in a cycle") } else {
+    let def = at_def(corpus, id);
+    let p0 = match list_at(args, 0) { Some(x) -> x, None -> 0 };
+    let p1 = match list_at(args, 1) { Some(x) -> x, None -> 0 };
+    let (w2, core) = eval_shape(corpus, def, p0, p1, world, room - 1);
+    if len(def.extras) == 0 { (w2, core) } else {
+      let (w3, sum) = fold(def.extras, (w2, 0), |acc: (World, Int), extra: Call|
+        match acc {
+          (w, sum) -> {
+            let (w_next, v) = invoke(corpus, extra, p0, w, room - 1);
+            (w_next, sum + v)
+          },
+        });
+      (w3, mix(core, sum))
+    }
   }
-}
 
 pub fn at_def_pub(corpus: Corpus, id: Int) -> Def / {abort.raise} = at_def(corpus, id)
 
@@ -360,15 +364,16 @@ fn eval_shape(
   p0: Int,
   p1: Int,
   world: World,
+  room: Int,
 ) -> (World, Int) / {abort.raise} =
   match def.shape {
     Arith(a, b) -> (world, clamp(p0 * a + b)),
     Compose(f, g) -> {
-      let (w1, left) = invoke(corpus, f, p0, world);
-      let (w2, right) = invoke(corpus, g, p0, w1);
+      let (w1, left) = invoke(corpus, f, p0, world, room);
+      let (w2, right) = invoke(corpus, g, p0, w1, room);
       (w2, mix(left, right))
     },
-    Guard(m, f, b) -> if p0 % m == 0 { invoke(corpus, f, p0, world) }
+    Guard(m, f, b) -> if p0 % m == 0 { invoke(corpus, f, p0, world, room) }
     else { (world, clamp(p0 + b)) },
     Fold(n, k) -> (world, fold(range(0, n), 0, |acc: Int, v: Int| clamp(acc + v * k + p0))),
     Record(m, k) -> (world, weigh(p0 % m, clamp(p0 * k))),
@@ -376,21 +381,21 @@ fn eval_shape(
       let module = at_module(corpus, def.module);
       let x = p0 + off;
       if x % module.helper.m == 0 { (world, idle) }
-      else { invoke(corpus, f, clamp(x + module.helper.b), world) }
+      else { invoke(corpus, f, clamp(x + module.helper.b), world, room) }
     },
     Chain(inner, outer, b) -> {
-      let (w1, v) = invoke(corpus, inner, p0, world);
-      invoke_with(corpus, { target: outer, offset: 0 }, v + b, w1)
+      let (w1, v) = invoke(corpus, inner, p0, world, room);
+      invoke_with(corpus, { target: outer, offset: 0 }, v + b, w1, room)
     },
     ListMap(n, k) -> (world, total(map(range(0, n), |v: Int| clamp(v * k + p0)))),
     Pair(f, a, b) -> {
-      let (w1, left) = invoke(corpus, f, p0, world);
+      let (w1, left) = invoke(corpus, f, p0, world, room);
       (w1, mix(left, p1 * a + b))
     },
     TableCount(table, a, f) -> {
       let label = at_or(corpus.tables, table, "");
       let (w1, rows) = world_read_table(world, label, table);
-      let (w2, rest) = invoke(corpus, f, p0, w1);
+      let (w2, rest) = invoke(corpus, f, p0, w1, room);
       (w2, clamp(len(rows) * a + rest))
     },
     TableSum(table, a) -> {
@@ -425,11 +430,28 @@ fn eval_shape(
     },
   }
 
-fn invoke(corpus: Corpus, call: Call, p0: Int, world: World) -> (World, Int) / {abort.raise} =
-  invoke_with(corpus, call, p0 + call.offset, world)
+fn invoke(
+  corpus: Corpus,
+  call: Call,
+  p0: Int,
+  world: World,
+  room: Int,
+) -> (World, Int) / {abort.raise} = invoke_with(corpus, call, p0 + call.offset, world, room)
 
-fn invoke_with(corpus: Corpus, call: Call, arg: Int, world: World) -> (World, Int) / {abort.raise} =
-  eval(corpus, call.target, call_args(at_def(corpus, call.target).arity, arg, call.offset), world)
+fn invoke_with(
+  corpus: Corpus,
+  call: Call,
+  arg: Int,
+  world: World,
+  room: Int,
+) -> (World, Int) / {abort.raise} =
+  eval(
+    corpus,
+    call.target,
+    call_args(at_def(corpus, call.target).arity, arg, call.offset),
+    world,
+    room,
+  )
 
 // The second parameter derives from the call's offset, so emission and evaluation agree.
 pub fn call_args(arity: Int, first: Int, offset: Int) -> List<Int> =
@@ -512,9 +534,9 @@ test "the mirror agrees with a worked example" {
     regions: [],
     shards: [],
   };
-  let (_, v) = eval(c, 0, [4], empty_world(0));
+  let (_, v) = eval(c, 0, [4], empty_world(0), len(c.defs) + 1);
   assert_eq(v, 17);
-  let (_, w) = eval(c, 1, [4], empty_world(0));
+  let (_, w) = eval(c, 1, [4], empty_world(0), len(c.defs) + 1);
   // compose(f=x+2, g=x): f(4) = apply_0(6) = 23, g(4) = 17; mix = clamp(23*31 + 17*17 + 7)
   assert_eq(w, (23 * 31 + 17 * 17 + 7) % 100003);
 }
@@ -559,7 +581,7 @@ test "a table append touches the world the handler will grant" {
     shards: [],
   };
   let w0 = { tables: [(0, [10, 20])], regions: [], clock: 0, touched: [] };
-  let (w1, v) = eval(c, 0, [5], w0);
+  let (w1, v) = eval(c, 0, [5], w0, len(c.defs) + 1);
   assert_eq(v, 2 * 3 + 5);
   assert_eq(world_table(w1, 0), [10, 20, 10]);
   assert_eq(len(w1.touched), 2);
