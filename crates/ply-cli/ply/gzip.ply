@@ -207,40 +207,54 @@ fn insert_span(
 
 type Scan = { out: Out, table: List<Int>, i: Int }
 
-fn scan(data: Bytes, s: Scan) -> Out / {abort.raise} = {
-  let n = bytes_len(data);
-  if s.i >= n { s.out }
-  else if s.i + 3 > n { scan(data, { ..s, out: emit_lit(s.out, bytes_at(data, s.i)), i: s.i + 1 }) }
-  else {
-    let h = trigram_hash(data, s.i);
-    let cand = (match list_at(s.table, h) { Some(p) -> p, None -> -1 }) - 1;
-    let ahead = n - s.i;
-    let best = if cand >= 0 && s.i - cand <= 32768 {
-      match_len(data, cand, s.i, min(258, ahead), 0)
-    } else { 0 };
-    if best >= 3 && s.i + 3 < n
-        && match_at(data, insert_position(s.table, data, s.i, n), s.i + 1, n) > best {
-      // A longer match starts one byte later: this byte goes out as a literal instead.
-      scan(data, {
-        out: emit_lit(s.out, bytes_at(data, s.i)),
-        table: insert_position(s.table, data, s.i, n),
-        i: s.i + 1,
-      })
-    } else if best >= 3 {
-      scan(data, {
-        out: emit_match(s.out, best, s.i - cand),
-        table: insert_span(s.table, data, s.i, s.i + best, n),
-        i: s.i + best,
-      })
+// `left` bounds the rounds: each moves on a byte at least.
+fn scan(data: Bytes, s: Scan, left: Int) -> Out / {abort.raise} =
+  if left <= 0 { panic("more rounds than the input holds") } else {
+    let n = bytes_len(data);
+    if s.i >= n { s.out } else if s.i + 3 > n {
+      scan(data, { ..s, out: emit_lit(s.out, bytes_at(data, s.i)), i: s.i + 1 }, left - 1)
     } else {
-      scan(data, {
-        out: emit_lit(s.out, bytes_at(data, s.i)),
-        table: list_set(s.table, h, s.i + 1),
-        i: s.i + 1,
-      })
+      let h = trigram_hash(data, s.i);
+      let cand = (match list_at(s.table, h) { Some(p) -> p, None -> -1 }) - 1;
+      let ahead = n - s.i;
+      let best = if cand >= 0 && s.i - cand <= 32768 {
+        match_len(data, cand, s.i, min(258, ahead), 0)
+      } else { 0 };
+      if best >= 3 && s.i + 3 < n
+          && match_at(data, insert_position(s.table, data, s.i, n), s.i + 1, n) > best {
+        // A longer match starts one byte later: this byte goes out as a literal instead.
+        scan(
+          data,
+          {
+            out: emit_lit(s.out, bytes_at(data, s.i)),
+            table: insert_position(s.table, data, s.i, n),
+            i: s.i + 1,
+          },
+          left - 1,
+        )
+      } else if best >= 3 {
+        scan(
+          data,
+          {
+            out: emit_match(s.out, best, s.i - cand),
+            table: insert_span(s.table, data, s.i, s.i + best, n),
+            i: s.i + best,
+          },
+          left - 1,
+        )
+      } else {
+        scan(
+          data,
+          {
+            out: emit_lit(s.out, bytes_at(data, s.i)),
+            table: list_set(s.table, h, s.i + 1),
+            i: s.i + 1,
+          },
+          left - 1,
+        )
+      }
     }
   }
-}
 
 // The match at the next position, when one is on the table: lazy matching's one look ahead.
 fn match_at(data: Bytes, table: List<Int>, i: Int, n: Int) -> Int / {abort.raise} = {
@@ -254,7 +268,7 @@ fn deflate(data: Bytes) -> Bytes / {abort.raise} = {
   // BFINAL = 1, then BTYPE = 01 (fixed) in two bits, LSB-first.
   let out = emit(out_new(), 1, 1);
   let out1 = emit(out, 1, 2);
-  let body = scan(data, { out: out1, table: table_new(), i: 0 });
+  let body = scan(data, { out: out1, table: table_new(), i: 0 }, bytes_len(data) + 1);
   let ended = emit_lit(body, 256);
   finish_out(ended)
 }
@@ -403,20 +417,27 @@ fn fixed_dist_lengths() -> List<Int> = map(range(0, 30), |_: Int| 5)
 type Inflated = { bit: Int, window: Window }
 
 fn inflate(data: Bytes, bit: Int) -> Result<Bytes, String> / {abort.raise} =
-  match blocks(data, bit, window_new()) {
+  match blocks(data, bit, window_new(), bytes_len(data) * 8 + 1) {
     Ok(done) -> Ok(window_bytes(done.window)),
     Err(why) -> Err(why),
   }
 
-fn blocks(data: Bytes, bit: Int, window: Window) -> Result<Inflated, String> / {abort.raise} = {
-  let head = read_bits(data, bit, 3);
-  let final = head.value & 1;
-  let btype = head.value >>> 1;
-  match block(data, head.bit, btype, window) {
-    Ok(next) -> if final == 1 { Ok(next) } else { blocks(data, next.bit, next.window) },
-    Err(why) -> Err(why),
+// `left` bounds the blocks: each reads its three-bit header at least.
+fn blocks(
+  data: Bytes,
+  bit: Int,
+  window: Window,
+  left: Int,
+) -> Result<Inflated, String> / {abort.raise} =
+  if left <= 0 { panic("more blocks than bits") } else {
+    let head = read_bits(data, bit, 3);
+    let final = head.value & 1;
+    let btype = head.value >>> 1;
+    match block(data, head.bit, btype, window) {
+      Ok(next) -> if final == 1 { Ok(next) } else { blocks(data, next.bit, next.window, left - 1) },
+      Err(why) -> Err(why),
+    }
   }
-}
 
 fn block(
   data: Bytes,
@@ -425,7 +446,14 @@ fn block(
   window: Window,
 ) -> Result<Inflated, String> / {abort.raise} =
   if btype == 0 { stored_block(data, bit, window) } else if btype == 1 {
-    symbols(data, bit, window, build_huff(fixed_lit_lengths()), build_huff(fixed_dist_lengths()))
+    symbols(
+      data,
+      bit,
+      window,
+      build_huff(fixed_lit_lengths()),
+      build_huff(fixed_dist_lengths()),
+      bytes_len(data) * 8 + 2,
+    )
   } else if btype == 2 { dynamic_block(data, bit, window) }
   else { Err("a deflate block of type 3 is not deflate") }
 
@@ -444,23 +472,28 @@ fn copy_verbatim(window: Window, data: Bytes, at: Int, left: Int) -> Window / {a
   if left <= 0 { window }
   else { copy_verbatim(emit_byte(window, bytes_at(data, at)), data, at + 1, left - 1) }
 
+// `left` bounds the symbols: each reads a bit at least.
 fn symbols(
   data: Bytes,
   bit: Int,
   window: Window,
   lit: Huffman,
   dist: Huffman,
+  left: Int,
 ) -> Result<Inflated, String> / {abort.raise} =
-  match decode_sym(data, bit, lit, 1, 0) {
-    None -> Err("a Huffman code no table holds"),
-    Some(found) -> if found.sym < 256 {
-      symbols(data, found.bit, emit_byte(window, found.sym), lit, dist)
-    } else if found.sym == 256 { Ok({ bit: found.bit, window: window }) } else {
-      match match_bounds(data, found.bit, found.sym - 257, dist) {
-        None -> Err("a match code no table holds"),
-        Some(m) -> symbols(data, m.bit, copy_match(window, m.dist, m.length, 0), lit, dist),
-      }
-    },
+  if left <= 0 { panic("more symbols than bits") } else {
+    match decode_sym(data, bit, lit, 1, 0) {
+      None -> Err("a Huffman code no table holds"),
+      Some(found) -> if found.sym < 256 {
+        symbols(data, found.bit, emit_byte(window, found.sym), lit, dist, left - 1)
+      } else if found.sym == 256 { Ok({ bit: found.bit, window: window }) } else {
+        match match_bounds(data, found.bit, found.sym - 257, dist) {
+          None -> Err("a match code no table holds"),
+          Some(m) ->
+            symbols(data, m.bit, copy_match(window, m.dist, m.length, 0), lit, dist, left - 1),
+        }
+      },
+    }
   }
 
 fn match_bounds(
@@ -495,7 +528,7 @@ fn dynamic_block(
   let hclen = (counts.value >>> 10 & 15) + 4;
   let cl_lengths = read_code_lengths(data, counts.bit, hclen, 0, zeros(19));
   let cl = build_huff(cl_lengths);
-  match read_lengths(data, counts.bit + hclen * 3, cl, hlit + hdist, []) {
+  match read_lengths(data, counts.bit + hclen * 3, cl, hlit + hdist, [], hlit + hdist + 1) {
     None -> Err("dynamic block code lengths that do not parse"),
     Some(all) -> if len(all.lengths) != hlit + hdist {
       Err("a dynamic block short of its code lengths")
@@ -506,6 +539,7 @@ fn dynamic_block(
         window,
         build_huff(take(all.lengths, hlit)),
         build_huff(drop(all.lengths, hlit)),
+        bytes_len(data) * 8 + 2,
       )
     },
   }
@@ -531,33 +565,44 @@ fn read_code_lengths(
 
 // The lit/dist code lengths: a length, a repeat of the one before (16), or a run of zeros
 // (17, 18).
+// `left` bounds the rounds: each adds a length at least.
 fn read_lengths(
   data: Bytes,
   bit: Int,
   huffman: Huffman,
   want: Int,
   acc: List<Int>,
+  left: Int,
 ) -> Option<{ bit: Int, lengths: List<Int> }> / {abort.raise} =
-  if len(acc) >= want { Some({ bit: bit, lengths: acc }) } else {
-    match decode_sym(data, bit, huffman, 1, 0) {
-      None -> None,
-      Some(found) -> if found.sym < 16 {
-        read_lengths(data, found.bit, huffman, want, push(acc, found.sym))
-      } else if found.sym == 16 {
-        match list_at(acc, len(acc) - 1) {
-          None -> None,
-          Some(prev) -> {
-            let extra = read_bits(data, found.bit, 2);
-            read_lengths(data, extra.bit, huffman, want, append_n(acc, prev, 3 + extra.value))
-          },
-        }
-      } else if found.sym == 17 {
-        let extra = read_bits(data, found.bit, 3);
-        read_lengths(data, extra.bit, huffman, want, append_n(acc, 0, 3 + extra.value))
-      } else {
-        let extra = read_bits(data, found.bit, 7);
-        read_lengths(data, extra.bit, huffman, want, append_n(acc, 0, 11 + extra.value))
-      },
+  if left <= 0 { panic("more rounds than lengths") } else {
+    if len(acc) >= want { Some({ bit: bit, lengths: acc }) } else {
+      match decode_sym(data, bit, huffman, 1, 0) {
+        None -> None,
+        Some(found) -> if found.sym < 16 {
+          read_lengths(data, found.bit, huffman, want, push(acc, found.sym), left - 1)
+        } else if found.sym == 16 {
+          match list_at(acc, len(acc) - 1) {
+            None -> None,
+            Some(prev) -> {
+              let extra = read_bits(data, found.bit, 2);
+              read_lengths(
+                data,
+                extra.bit,
+                huffman,
+                want,
+                append_n(acc, prev, 3 + extra.value),
+                left - 1,
+              )
+            },
+          }
+        } else if found.sym == 17 {
+          let extra = read_bits(data, found.bit, 3);
+          read_lengths(data, extra.bit, huffman, want, append_n(acc, 0, 3 + extra.value), left - 1)
+        } else {
+          let extra = read_bits(data, found.bit, 7);
+          read_lengths(data, extra.bit, huffman, want, append_n(acc, 0, 11 + extra.value), left - 1)
+        },
+      }
     }
   }
 
@@ -583,21 +628,19 @@ fn header_end(data: Bytes, at: Int) -> Result<Int, String> / {abort.raise} =
     skip_extras(data, at, flags)
   }
 
-fn skip_extras(data: Bytes, at: Int, flags: Int) -> Result<Int, String> / {abort.raise} =
+// FEXTRA(4) carries a length; FNAME(8) and FCOMMENT(16) end at a zero; FHCRC(2) is two bytes.
+fn skip_extras(data: Bytes, at: Int, flags: Int) -> Result<Int, String> / {abort.raise} = {
+  let extra = if flags & 4 == 4 { at + 2 + (bytes_at(data, at) | bytes_at(data, at + 1) << 8) }
+  else { at };
+  let named = (if flags & 8 == 8 { past_zero(data, extra) } else { Ok(extra) })?;
+  let commented = (if flags & 16 == 16 { past_zero(data, named) } else { Ok(named) })?;
+  Ok(if flags & 2 == 2 { commented + 2 } else { commented })
+}
 
-  // FEXTRA(4) carries a length; FNAME(8) and FCOMMENT(16) end at a zero; FHCRC(2) is two bytes.
-  if flags & 4 == 4 {
-    let len = bytes_at(data, at) | bytes_at(data, at + 1) << 8;
-    skip_extras(data, at + 2 + len, flags - 4)
-  } else if flags & 8 == 8 { skip_zeroed(data, at, flags - 8) }
-  else if flags & 16 == 16 { skip_zeroed(data, at, flags - 16) }
-  else if flags & 2 == 2 { Ok(at + 2) }
-  else { Ok(at) }
-
-fn skip_zeroed(data: Bytes, at: Int, flags: Int) -> Result<Int, String> / {abort.raise} =
+fn past_zero(data: Bytes, at: Int) -> Result<Int, String> / {abort.raise} =
   if at >= bytes_len(data) { Err("a gzip header field without its zero") }
-  else if bytes_at(data, at) == 0 { skip_extras(data, at + 1, flags) }
-  else { skip_zeroed(data, at + 1, flags) }
+  else if bytes_at(data, at) == 0 { Ok(at + 1) }
+  else { past_zero(data, at + 1) }
 
 fn check_trailer(data: Bytes, out: Bytes) -> Result<Bytes, String> / {abort.raise} = {
   let n = bytes_len(data);
