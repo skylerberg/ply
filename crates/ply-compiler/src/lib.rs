@@ -112,4 +112,7 @@ pub mod bootstrap {
 
     /// The digest of the shelf and runtime the committed builder was built for.
     pub const BUILDER_DIGEST: &str = include_str!("../bootstrap/build.digest");
+
+    /// Where the key a builder keeps the committed builder under is, in a checkout that has one.
+    pub const BUILDER_KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bootstrap/build.key");
 }

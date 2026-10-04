@@ -1983,6 +1983,127 @@ fn std_squats(
     })
   }
 
+// A load read and hashed with nothing checked: what every definition hashes to is known before
+// any body is walked.
+pub type Hashed = {
+  mods: List<ParsedModule>,
+  r: Resolved,
+  index: Index,
+  hashes: HashOutput,
+  unused: List<Diag>,
+  clo: Closure,
+  packages: List<PackageDeps>,
+  module_packages: List<Int>,
+  root_count: Int,
+  ifaces: Interfaces,
+  embeds: List<EmbedAt>,
+}
+
+fn hashed_closure(
+  parsed: List<ParsedSource>,
+  clo: Closure,
+  root_count: Int,
+  toolchain: Bool,
+  ifaces: Interfaces = { stubs: [], cuts: [], defs: [], fixed: [] },
+  embeds: List<EmbedAt> = [],
+  priors: List<Prior> = [],
+) -> Result<Hashed, List<Diag>> / {abort.raise} = {
+  // The packages' identity reports ahead of anything the program text has to say: manifest
+  // and graph diags point one slot past every module, in manifest order.
+  let pkg_diags = fold(
+    std_squats(parsed, root_count, toolchain),
+    clo.diags,
+    |acc: List<{ slot: Int, diag: ParseDiag }>, sd: { slot: Int, diag: ParseDiag }| push(acc, sd),
+  );
+  if len(pkg_diags) > 0 {
+    Err(
+      map(pkg_diags, |sd: { slot: Int, diag: ParseDiag }|
+        if sd.slot < 0 { placed(0 - sd.slot - 1, sd.diag) }
+        else { placed(len(parsed) + sd.slot, sd.diag) }),
+    )
+  } else {
+    let early = fold(parsed, [], |acc: List<Diag>, p: ParsedSource| append(acc, p.diags));
+    if len(early) > 0 { Err(early) } else {
+      let tables = pkg_tables(parsed, root_count, clo, toolchain);
+      match resolve_packaged(
+          map(parsed, |p: ParsedSource| p.module),
+          tables.pkgs,
+          tables.module_packages,
+          tables.std,
+          tables.compiler,
+          tables.shelf,
+        ) {
+        ResolveFailed(ds) -> Err(map(ds, outside_every_module)),
+        ResolveSucceeded(x) -> {
+          let built = build_index(x.mods, x.r);
+          if len(built.diags) > 0 { Err(map(built.diags, outside_every_module)) } else {
+            // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
+            let hashed = hashed_and_unused(
+              built.index,
+              ifaces.fixed,
+              tables.module_packages,
+              priors,
+            );
+            Ok({
+              mods: x.mods,
+              r: x.r,
+              index: built.index,
+              hashes: hashed.hashes,
+              unused: hashed.unused,
+              clo: clo,
+              packages: tables.pkgs,
+              module_packages: tables.module_packages,
+              root_count: root_count,
+              ifaces: ifaces,
+              embeds: embeds,
+            })
+          }
+        },
+      }
+    }
+  }
+}
+
+fn checked_closure(
+  h: Hashed,
+  defs: List<KnownDefRow>,
+  tests: List<KnownTestRow>,
+) -> AnalysisOutcome / {abort.raise} = {
+  let checked: CheckOutput = check_front_with(
+    h.r,
+    h.mods,
+    known_from_rows(h.mods, h.hashes, defs, tests, h.root_count, h.ifaces.fixed),
+  );
+  if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
+    Analysed({
+      mods: h.mods,
+      r: h.r,
+      checked: checked,
+      index: h.index,
+      hashes: h.hashes,
+      // A dependency's unused definitions are its own package's to report.
+      warnings: map(
+        filter(h.unused, |diag: Diag|
+          fold(
+            diag.labels,
+            false,
+            |b: Bool, l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+              b || (l.primary && l.module < h.root_count),
+          )),
+        outside_every_module,
+      ),
+      manifest: at(h.clo.packages, 0).manifest,
+      packages: h.packages,
+      pins: pins_of(h.clo, h.embeds),
+      module_packages: h.module_packages,
+      stubs: map(h.ifaces.stubs, |source: Source| source.name),
+      stub_cuts: fold(h.ifaces.cuts, map_new(), |acc: Map<Bytes, List<Cut>>, s: StubCuts|
+        map_insert(acc, s.name, s.cuts)),
+      embeds: h.embeds,
+    })
+  }
+}
+
 fn analyse_closure(
   parsed: List<ParsedSource>,
   clo: Closure,
@@ -1993,86 +2114,11 @@ fn analyse_closure(
   ifaces: Interfaces = { stubs: [], cuts: [], defs: [], fixed: [] },
   embeds: List<EmbedAt> = [],
   priors: List<Prior> = [],
-) -> AnalysisOutcome / {abort.raise} = {
-  // The packages' identity reports ahead of anything the program text has to say: manifest
-  // and graph diags point one slot past every module, in manifest order.
-  let pkg_diags = fold(
-    std_squats(parsed, root_count, toolchain),
-    clo.diags,
-    |acc: List<{ slot: Int, diag: ParseDiag }>, sd: { slot: Int, diag: ParseDiag }| push(acc, sd),
-  );
-  if len(pkg_diags) > 0 {
-    Refused(
-      map(pkg_diags, |sd: { slot: Int, diag: ParseDiag }|
-        if sd.slot < 0 { placed(0 - sd.slot - 1, sd.diag) }
-        else { placed(len(parsed) + sd.slot, sd.diag) }),
-    )
-  } else {
-    let early = fold(parsed, [], |acc: List<Diag>, p: ParsedSource| append(acc, p.diags));
-    if len(early) > 0 { Refused(early) } else {
-      let tables = pkg_tables(parsed, root_count, clo, toolchain);
-      match resolve_packaged(
-          map(parsed, |p: ParsedSource| p.module),
-          tables.pkgs,
-          tables.module_packages,
-          tables.std,
-          tables.compiler,
-          tables.shelf,
-        ) {
-        ResolveFailed(ds) -> Refused(map(ds, outside_every_module)),
-        ResolveSucceeded(x) -> {
-          let built = build_index(x.mods, x.r);
-          if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
-            // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
-            let hashed = hashed_and_unused(
-              built.index,
-              ifaces.fixed,
-              tables.module_packages,
-              priors,
-            );
-            let hashes: HashOutput = hashed.hashes;
-            let checked: CheckOutput = check_front_with(
-              x.r,
-              x.mods,
-              known_from_rows(x.mods, hashes, defs, tests, root_count, ifaces.fixed),
-            );
-            if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
-              Analysed({
-                mods: x.mods,
-                r: x.r,
-                checked: checked,
-                index: built.index,
-                hashes: hashes,
-                // A dependency's unused definitions are its own package's to report.
-                warnings: map(
-                  filter(hashed.unused, |diag: Diag|
-                    fold(
-                      diag.labels,
-                      false,
-                      |b: Bool, l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
-                        b || (l.primary && l.module < root_count),
-                    )),
-                  outside_every_module,
-                ),
-                manifest: at(clo.packages, 0).manifest,
-                packages: tables.pkgs,
-                pins: pins_of(clo, embeds),
-                module_packages: tables.module_packages,
-                stubs: map(ifaces.stubs, |source: Source| source.name),
-                stub_cuts: fold(
-                  ifaces.cuts,
-                  map_new(),
-                  |acc: Map<Bytes, List<Cut>>, s: StubCuts| map_insert(acc, s.name, s.cuts),
-                ),
-                embeds: embeds,
-              })
-            }
-          }
-        },
-      }
-    }
+) -> AnalysisOutcome / {abort.raise} =
+  match hashed_closure(parsed, clo, root_count, toolchain, ifaces, embeds, priors) {
+    Err(diags) -> Refused(diags),
+    Ok(h) -> checked_closure(h, defs, tests),
   }
-}
 
 // Every table the answer holds, as rows.
 // The answer as a program ships it: what a load walked and what it warned of are functions of the
@@ -2694,17 +2740,27 @@ pub type Pulled = { pulled: List<Bytes>, out: AnalysisOutcome }
 pub fn analyse_pulling_std(user: List<Source>, shipped: List<Source>) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(user, shipped, [], [])
 
-pub fn analyse_pulling_std_with(
+// A load read and hashed, the shipped modules it pulled among it, or what refused it before that.
+pub type Staged = { pulled: List<Bytes>, hashed: Result<Hashed, List<Diag>> }
+
+// What `name` hashes to in a load that hashed.
+pub fn staged_hash(staged: Staged, name: Bytes) -> Option<Bytes> =
+  match staged.hashed {
+    Err(_) -> None,
+    Ok(h) ->
+      fold(h.hashes.defs, None, |acc: Option<Bytes>, d: { name: Bytes, hash: Bytes }|
+        if d.name == name { Some(d.hash) } else { acc }),
+  }
+
+pub fn staged_pulling_std_with(
   user: List<Source>,
   shipped: List<Source>,
-  defs: List<KnownDefRow>,
-  tests: List<KnownTestRow>,
   pkgs: PackageSources = { root: b"", manifest: None, supplied: [] },
   ifaces: Interfaces = { stubs: [], cuts: [], defs: [], fixed: [] },
   embeds: List<Embedded> = [],
   // What an earlier load of the same program hashed, which this one takes where it stands.
   priors: List<Prior> = [],
-) -> Pulled / {abort.raise} = {
+) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
@@ -2736,12 +2792,10 @@ pub fn analyse_pulling_std_with(
   });
   {
     pulled: x.pulled,
-    out: if len(x.diags) > 0 { Refused(x.diags) } else {
-      analyse_closure(
+    hashed: if len(x.diags) > 0 { Err(x.diags) } else {
+      hashed_closure(
         x.parsed,
         clo,
-        append(defs, ifaces.defs),
-        tests,
         len(user),
         toolchain,
         ifaces,
@@ -2751,6 +2805,33 @@ pub fn analyse_pulling_std_with(
     },
   }
 }
+
+// A hashed load checked, seeded with the rows a last load published.
+pub fn checked_staged(
+  staged: Staged,
+  defs: List<KnownDefRow>,
+  tests: List<KnownTestRow>,
+) -> Pulled / {abort.raise} =
+  {
+    pulled: staged.pulled,
+    out: match staged.hashed {
+      Err(diags) -> Refused(diags),
+      Ok(h) -> checked_closure(h, append(defs, h.ifaces.defs), tests),
+    },
+  }
+
+pub fn analyse_pulling_std_with(
+  user: List<Source>,
+  shipped: List<Source>,
+  defs: List<KnownDefRow>,
+  tests: List<KnownTestRow>,
+  pkgs: PackageSources = { root: b"", manifest: None, supplied: [] },
+  ifaces: Interfaces = { stubs: [], cuts: [], defs: [], fixed: [] },
+  embeds: List<Embedded> = [],
+  // What an earlier load of the same program hashed, which this one takes where it stands.
+  priors: List<Prior> = [],
+) -> Pulled / {abort.raise} =
+  checked_staged(staged_pulling_std_with(user, shipped, pkgs, ifaces, embeds, priors), defs, tests)
 
 // What a load of `user` pins, and nothing more of it: each dependency's name, version and digest,
 // read off the package closure and the embeds the driver read, so no module is parsed. A closure
