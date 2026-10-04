@@ -21,6 +21,14 @@ fn rooted(dir: &Path) -> Vec<(String, PathBuf)> {
     vec![("cwd".to_string(), dir.to_path_buf())]
 }
 
+fn stands(trace: &str, world: &World<'_>, machine: MachineId) -> bool {
+    observe::moved(trace, world, machine).is_none()
+}
+
+fn moved(trace: &str, world: &World<'_>, machine: MachineId) -> bool {
+    observe::moved(trace, world, machine).is_some()
+}
+
 fn lines(trace: &str) -> Vec<&str> {
     trace
         .lines()
@@ -45,12 +53,15 @@ fn a_run_is_traced_by_what_it_read_under_the_root_that_holds_it() {
     // What it wrote is its own: reading it back is no input.
     assert_eq!(lines(&trace), ["dir\tcwd\tsrc\t", "file\tcwd\tsrc/a.ply\t"]);
     let probe = MachineId::next();
-    assert!(observe::unchanged(&trace, &world(&roots, "b"), probe));
+    assert!(stands(&trace, &world(&roots, "b"), probe));
     std::fs::write(dir.path().join("src/b.ply"), b"new").unwrap();
-    assert!(!observe::unchanged(&trace, &world(&roots, "b"), probe));
+    assert!(moved(&trace, &world(&roots, "b"), probe));
     std::fs::remove_file(dir.path().join("src/b.ply")).unwrap();
     std::fs::write(dir.path().join("src/a.ply"), b"two").unwrap();
-    assert!(!observe::unchanged(&trace, &world(&roots, "b"), probe));
+    assert_eq!(
+        observe::moved(&trace, &world(&roots, "b"), probe),
+        Some("the file `src/a.ply` under `cwd`".to_string())
+    );
 }
 
 #[test]
@@ -84,10 +95,10 @@ fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
     // Another run leaves something else there, which this one would have removed.
     std::fs::write(pkg.join("left over"), b"by yet another").unwrap();
     std::fs::write(pkg.join(".cache/entry"), b"moved").unwrap();
-    assert!(observe::unchanged(&trace, &world(&roots, "b"), probe));
+    assert!(stands(&trace, &world(&roots, "b"), probe));
     // A module added beside the ones it read is not its own.
     std::fs::write(pkg.join("b.ply"), b"b").unwrap();
-    assert!(!observe::unchanged(&trace, &world(&roots, "b"), probe));
+    assert!(moved(&trace, &world(&roots, "b"), probe));
 }
 
 #[test]
@@ -102,7 +113,7 @@ fn a_trace_reads_the_same_from_another_directory_under_the_same_root() {
     observe::read(m, Read::File, &one.path().join("a.ply"));
     let trace = observe::finished(&recorder, &world(&rooted(one.path()), "b"), false).unwrap();
     observe::end(&recorder);
-    assert!(observe::unchanged(
+    assert!(stands(
         &trace,
         &world(&rooted(other.path()), "b"),
         MachineId::next()
@@ -116,8 +127,8 @@ fn a_run_that_reached_the_host_stands_for_its_binding_alone() {
     let trace = observe::finished(&recorder, &world(&[], "hosted"), true).unwrap();
     observe::end(&recorder);
     assert_eq!(lines(&trace), ["binding"]);
-    assert!(observe::unchanged(&trace, &world(&[], "hosted"), m));
-    assert!(!observe::unchanged(&trace, &world(&[], "hermetic"), m));
+    assert!(stands(&trace, &world(&[], "hosted"), m));
+    assert!(moved(&trace, &world(&[], "hermetic"), m));
 }
 
 #[test]
@@ -133,15 +144,18 @@ fn shipped_modules_and_the_program_are_held_at_the_binary_s_digests() {
         trace,
         "program\tprogram digest\nshipped\tstd.gone\tnone\nshipped\tstd.list\tlist digest\n"
     );
-    assert!(observe::unchanged(&trace, &world(&[], "b"), m));
-    let moved = World {
+    assert!(stands(&trace, &world(&[], "b"), m));
+    let another = World {
         binary: Binary {
             shipped: &module,
             program: "another program".to_string(),
         },
         ..world(&[], "b")
     };
-    assert!(!observe::unchanged(&trace, &moved, m));
+    assert_eq!(
+        observe::moved(&trace, &another, m),
+        Some("the `ply` program".to_string())
+    );
 }
 
 #[test]
@@ -201,7 +215,7 @@ fn checking_a_trace_enters_what_it_read_into_the_asker_s_record() {
     observe::end(&recorder);
     let asker = MachineId::next();
     let asking = observe::begin(asker);
-    assert!(observe::unchanged(&trace, &world(&roots, "b"), asker));
+    assert!(stands(&trace, &world(&roots, "b"), asker));
     let asked = observe::finished(&asking, &world(&roots, "b"), false).unwrap();
     observe::end(&asking);
     assert_eq!(asked, trace);
@@ -221,5 +235,5 @@ fn a_trace_naming_a_file_is_never_answered_where_no_file_may_be_read() {
         roots: None,
         ..world(&roots, "b")
     };
-    assert!(!observe::unchanged(&trace, &hermetic, m));
+    assert!(moved(&trace, &hermetic, m));
 }

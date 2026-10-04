@@ -511,12 +511,13 @@ fn own_below(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Vec<PathBuf>
     own.into_iter().collect()
 }
 
-/// Whether every read `trace` holds still answers as it did, read against `world` now. Each read
-/// is entered into whatever observes `machine`, since what it decides rests on them.
-pub fn unchanged(trace: &str, world: &World<'_>, machine: MachineId) -> bool {
-    trace.lines().all(|line| {
+/// The first read `trace` holds that no longer answers as it did, read against `world` now, as a
+/// person reads it; `None` when every one still does. Each read checked is entered into whatever
+/// observes `machine`, since what it decides rests on them.
+pub fn moved(trace: &str, world: &World<'_>, machine: MachineId) -> Option<String> {
+    trace.lines().find_map(|line| {
         let fields: Vec<&str> = line.split('\t').collect();
-        match fields.as_slice() {
+        let stands = match fields.as_slice() {
             ["shipped", name, digest] => {
                 shipped(machine, name);
                 (world.binary.shipped)(name).unwrap_or_else(|| "none".to_string()) == *digest
@@ -526,22 +527,36 @@ pub fn unchanged(trace: &str, world: &World<'_>, machine: MachineId) -> bool {
                 world.binary.program == *digest
             }
             ["binding", digest] => world.binding == *digest,
-            [how, root, rest, own, digest] => {
-                let (Some(how), Some(roots)) = (Read::of_word(how), world.roots) else {
-                    return false;
-                };
-                let Some(path) = located(root, rest, roots) else {
-                    return false;
-                };
-                let own: Vec<PathBuf> = own
-                    .split(OWN)
-                    .filter(|o| !o.is_empty())
-                    .map(PathBuf::from)
-                    .collect();
-                read(machine, how, &path);
-                answered(how, &path, &own) == *digest
-            }
+            [how, root, rest, own, digest] => match (Read::of_word(how), world.roots) {
+                (Some(how), Some(roots)) => match located(root, rest, roots) {
+                    Some(path) => {
+                        let own: Vec<PathBuf> = own
+                            .split(OWN)
+                            .filter(|o| !o.is_empty())
+                            .map(PathBuf::from)
+                            .collect();
+                        read(machine, how, &path);
+                        answered(how, &path, &own) == *digest
+                    }
+                    None => false,
+                },
+                _ => false,
+            },
             _ => false,
-        }
+        };
+        (!stands).then(|| said(&fields))
     })
+}
+
+/// A trace line as a person reads it.
+fn said(fields: &[&str]) -> String {
+    match fields {
+        ["shipped", "", _] => "the list of shipped modules".to_string(),
+        ["shipped", name, _] => format!("the shipped module `{name}`"),
+        ["program", _] => "the `ply` program".to_string(),
+        ["binding", _] => "the binding".to_string(),
+        [how, "", rest, ..] => format!("the {how} `{rest}`"),
+        [how, root, rest, ..] => format!("the {how} `{rest}` under `{root}`"),
+        _ => format!("an unreadable trace line `{}`", fields.join(" ")),
+    }
 }
