@@ -24,8 +24,8 @@ fn main() -> Unit = assert_eq(greeting(), "hello from ply")
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a project root, defaulting to `.`.
 `ply check --types` prints every definition's inferred signature, each atom of
-its row marked with how many times a call performs it (§6.2), and `diverges` on
-one whose calls may not return (§5.10).
+its row marked with how many times a call performs it (§6.2), and, under one
+whose row says `diverges`, why its calls may not return (§5.10).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
 `demo/main.ply` — a manifest (§3.3), a `main` and one test — and `cd demo &&
@@ -883,14 +883,22 @@ at most. A member of the group handed anywhere else, or one called from a
 lambda whose calls the checker cannot see, is called with nothing known.
 
 A definition whose group descends ends, and so does one calling only
-definitions that end. `ply check --types` marks `diverges` on any other and
-says why, at the call's place: its own recursion is not seen to descend there,
-or is past what the check follows (a lambda deeper than it reads, or calls that
-compose into more than 10,000 size-change graphs), or it calls there a
-definition, which it names, that may not return. `ply check
---json` gives each definition's `ending`: its `kind` (`ends`, `stated` for one
-that ends by its group's measures, or `diverges`) and, for one that diverges,
-`through` and `at`.
+definitions that end. Any other may not return, and its row says so with the
+atom `diverges` (§6.2). One whose own recursion is not seen to descend, or is
+past what the check follows (a lambda deeper than it reads, or calls that
+compose into more than 10,000 size-change graphs), must write it: without it
+the definition is `E0302`, with no fix offered, since what usually fixes it is
+a recursion that descends, a budget spent with `iterate`, or a `decreases` a
+proof shows. `diverges` belongs in the row only of a loop that waits on
+something outside, such as a stream or a peer. A caller inherits it as it
+inherits any atom, and there `E0302` offers the fix that writes it. A test, law
+or clause that may not return supplies nothing for it: its steps bound it.
+`ply check --types` says under each such definition why, at the call's place:
+its own recursion is not seen to descend there, or is past what the check
+follows, or it calls there a definition, which it names, that may not return.
+`ply check --json` gives each definition's `ending`: its `kind` (`ends`,
+`stated` for one that ends by its group's measures, or `diverges`) and, for one
+that diverges, `through` and `at`.
 
 `decreases <measure>`, after the other clauses, states an `Int` over the
 parameters for a descent no one argument makes, as in `climb`: at every call
@@ -1482,8 +1490,9 @@ law "a credit and a matching debit leave an account exactly as it was"
   be quantified), an optional `where` guard, an optional `cost` bound (below)
   and a block body.
 * Specs, guards and law bodies must be pure (`E0417`), except that they may
-  raise (§6.8) and a law body may be a `simulate` region; a proposition that
-  raises is a gap in the claim. `law/host "..." { }` allows any effect but is
+  raise (§6.8) or may not return (§5.10), and a law body may be a `simulate`
+  region; a proposition that raises, or runs past its steps, is a gap in the
+  claim. `law/host "..." { }` allows any effect but is
   never `proved` or cached, and is `W0604` under a hermetic run. Under `--host`
   its guard and body run against the host the run binds, and what their entries
   end with, such as a span left open (`W0609`), is reported once.

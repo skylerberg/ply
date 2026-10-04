@@ -14,15 +14,16 @@ fn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
 
 pub fn pair(n: Int) -> (Int, Int) = parallel { fib(n), fib(n + 1) }
 
-fn summed(lo: Int, hi: Int) -> Int =
-  if hi - lo <= 64 { fold(range(lo, hi), 0, |acc: Int, i: Int| acc + i) }
+// `depth`: each split halves the span, so 64 splits reach any `Int` span's leaves.
+fn summed(lo: Int, hi: Int, depth: Int) -> Int =
+  if hi - lo <= 64 || depth <= 0 { fold(range(lo, hi), 0, |acc: Int, i: Int| acc + i) }
   else {
     let mid = (lo + hi) / 2;
-    let p = parallel { summed(lo, mid), summed(mid, hi) };
+    let p = parallel { summed(lo, mid, depth - 1), summed(mid, hi, depth - 1) };
     p._0 + p._1
   }
 
-pub fn total(n: Int) -> Int = summed(0, n)
+pub fn total(n: Int) -> Int = summed(0, n, 64)
 
 pub fn lengths(n: Int) -> Int = {
   let words = map(range(0, n), |i: Int| "w" ++ int_to_string(i));

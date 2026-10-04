@@ -23,18 +23,19 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
               atoms_sorted, atoms_union, atoms_difference, resource_covers, row_empty, row_open,
               row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_abort,
-              is_diverges, row_union, row_without, row_without_covered, atom_conflicts, atom_covers,
-              named_type, applied_type, int_type, bool_type, string_type, bytes_type, float_type,
-              decimal_type, unit_type, list_type, option_type, map_type, iter_type, secret_type,
-              fn_type, monomorphic, fields_sorted, field_get, mentions_secret, ints_insert,
-              ints_union, ints_difference, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var,
-              fresh_row, subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty, is_rigid_row,
-              shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty, solve_continuation_row,
-              free_vars, unify, unify_row, covariant_con, env_new, env_push, env_pop, env_bind,
-              env_bind_global, env_remove_global, env_lookup, env_depth_of, env_locals,
-              instantiate_with, instantiate, rename_scheme, generalize, region_prefix, region_of,
-              label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text, scheme_text,
-              type_text, row_text, Printer, printer_new, printer_naming, print_ty, print_row)
+              run_needs, is_diverges, row_union, row_without, row_without_covered, atom_conflicts,
+              atom_covers, named_type, applied_type, int_type, bool_type, string_type, bytes_type,
+              float_type, decimal_type, unit_type, list_type, option_type, map_type, iter_type,
+              secret_type, fn_type, monomorphic, fields_sorted, field_get, mentions_secret,
+              ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var, fresh_ty,
+              fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty,
+              is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
+              solve_continuation_row, free_vars, unify, unify_row, covariant_con, env_new, env_push,
+              env_pop, env_bind, env_bind_global, env_remove_global, env_lookup, env_depth_of,
+              env_locals, instantiate_with, instantiate, rename_scheme, generalize, region_prefix,
+              region_of, label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
+              scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
+              print_row)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin)
@@ -119,7 +120,7 @@ pub type TestInfo = {
   key: Bytes,
   index: Int,
   nondet: Bool,
-  // What a run of it must be given: the runner answers a raise as the test's failure, so no raise.
+  // What a run of it must be given: no raise, which fails it, and no `diverges`, which its steps bound.
   footprint: List<Atom>,
   at: Location,
 }
@@ -7227,7 +7228,15 @@ fn check_component(
     require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
   let kept: Checker = if required.module >= required.known.root { required } else {
     fold(range(0, len(comp)), required, |c: Checker, slot: Int|
-      kept_promises(c, at(sigs.sigs, slot), at(bodies.counts, slot)))
+      unwritten_divergence(
+        kept_promises(c, at(sigs.sigs, slot), at(bodies.counts, slot)),
+        at(fns, at(comp, slot)),
+        at(sigs.sigs, slot),
+        ending_of(slot),
+        |caller: Bytes|
+          fold(range(0, len(comp)), 0, |start: Int, k: Int|
+            if at(qualified, k) == caller { at(fns, at(comp, k)).span.start } else { start }),
+      ))
   };
   let closed: Checker = fold(sigs.sigs, kept, |c: Checker, s: Signature|
     close_unreachable_row(c, s));
@@ -7976,13 +7985,24 @@ fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {a
         label_at(checker.module, def.name.span, false, b"no `/` written: the row is empty"),
       ),
       [
-        bytes_concat_all([
-          b"a function performs only what its signature writes: write `/ ",
-          row,
-          b"` after the return type, or handle the effects inside `",
-          def.name.name,
-          b"`",
-        ]),
+        if len(closed_row.atoms) > 0 && closed_row.tail == None
+            && fold(closed_row.atoms, true, |all: Bool, a: Atom| all && is_diverges(a)) {
+          bytes_concat_all([
+            b"a call that may not return makes `",
+            def.name.name,
+            b"` one too: write `/ ",
+            row,
+            b"` after the return type, or call only what ends",
+          ])
+        } else {
+          bytes_concat_all([
+            b"a function performs only what its signature writes: write `/ ",
+            row,
+            b"` after the return type, or handle the effects inside `",
+            def.name.name,
+            b"`",
+          ])
+        },
       ],
     );
     let nameable = fold(grouped.rest, true, |all: Bool, atom: Atom|
@@ -7999,6 +8019,53 @@ fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {a
     report(checker, fixed)
   }
 }
+
+// A definition whose own recursion is not seen to descend may not return, which its row has to say.
+// Nothing is offered to write: the fix is usually a recursion that descends.
+fn unwritten_divergence(
+  checker: Checker,
+  def: FnDef,
+  sig: Signature,
+  ending: Ending,
+  start_of: (Bytes) -> Int / {abort.raise},
+) -> Checker / {abort.raise} =
+  match ending {
+    Diverges(d) -> if d.through != None
+        || fold(resolve_row_in(checker, sig.published_row).atoms, false, |found: Bool, a: Atom|
+          found || is_diverges(a)) { checker } else {
+      report(
+        checker,
+        error_with_labels(
+          b"E0302",
+          bytes_concat_all([b"`", def.name.name, b"` may not return, and its row does not say so"]),
+          [
+            label_at(
+              checker.module,
+              {
+                start: start_of(d.at.caller) + d.at.span.start,
+                end: start_of(d.at.caller) + d.at.span.end,
+              },
+              true,
+              if len(d.loop) > 0 { b"this call back into its group is not seen to descend" }
+              else { b"this recursion is past what the termination check follows" },
+            ),
+            label_at(
+              checker.module,
+              match def.effects { Some(r) -> r.span, None -> def.name.span },
+              false,
+              b"no `diverges` written",
+            ),
+          ],
+          [
+            b"a call back into the group descends when it hands on a part of an argument, or an `Int` moved toward a bound a guard on the way holds it beyond",
+            b"a loop with no such measure can spend a budget, with `iterate`, or state a `decreases` a proof shows falls",
+            b"write `diverges` in the row only of a loop that waits on something outside, such as a stream or a peer",
+          ],
+        ),
+      )
+    },
+    _ -> checker,
+  }
 
 fn check_written(
   checker: Checker,
@@ -8027,17 +8094,27 @@ fn check_written(
         ),
       ]
     } else { sites };
-    let notes = [
-      bytes_concat_all([
-        b"add ",
-        names,
-        b" to the `/ {..}` annotation, or handle ",
-        if len(extra) == 1 { b"it" } else { b"them" },
-        b" inside `",
-        def.name.name,
-        b"`",
-      ]),
-    ];
+    let notes = if fold(extra, true, |all: Bool, o: Offence| all && is_diverges(o.atom)) {
+      [
+        bytes_concat_all([
+          b"a call that may not return makes `",
+          def.name.name,
+          b"` one too: add `diverges` to its row, or call only what ends",
+        ]),
+      ]
+    } else {
+      [
+        bytes_concat_all([
+          b"add ",
+          names,
+          b" to the `/ {..}` annotation, or handle ",
+          if len(extra) == 1 { b"it" } else { b"them" },
+          b" inside `",
+          def.name.name,
+          b"`",
+        ]),
+      ]
+    };
     let narrowed = fold(extra, false, |acc: Bool, o: Offence| acc || narrowed_by_row(dec.atoms, o));
     let d: Diag = error_with_labels(
       b"E0302",
@@ -8310,7 +8387,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
               {
                 checker: if def.is_nondet { popped }
                 else { check_determinism(popped, def, row.atoms) },
-                atoms: without_abort(row.atoms),
+                atoms: run_needs(row.atoms),
               }
             },
           };
@@ -8604,8 +8681,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
       ),
   };
   let row = resolve_row_in(c2, body.row);
-  let c3: Checker = if def.host { c2 }
-  else if def.cost != None && len(without_abort(row.atoms)) > 0 {
+  let c3: Checker = if def.host { c2 } else if def.cost != None && len(run_needs(row.atoms)) > 0 {
     report_error_at(
       c2,
       b"E0463",
@@ -8635,7 +8711,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
       has_guard: match def.guard { Some(_) -> true, None -> false },
       host: def.host,
       cost: def.cost != None,
-      footprint: without_abort(row.atoms),
+      footprint: run_needs(row.atoms),
       at: location_of(popped, def.span),
     }),
   }
@@ -8859,7 +8935,7 @@ fn check_spec_purity(
 ) -> Checker / {abort.raise} = {
   let law_body = match site { InLawBody -> true, _ -> false };
   let c1: Checker = fold(
-    filter(without_abort(row.atoms), |a: Atom| !atoms_covered(allowed, a)),
+    filter(run_needs(row.atoms), |a: Atom| !atoms_covered(allowed, a)),
     checker,
     |c: Checker, atom: Atom| {
       let found = site_for(c, atom);
@@ -9079,7 +9155,7 @@ fn check_clause(
       clause.span,
       row,
     ),
-    atoms: without_abort(row.atoms),
+    atoms: run_needs(row.atoms),
   }
 }
 
@@ -11525,7 +11601,7 @@ test "two label parameters stay apart, and each names its own atom" {
 test "mutually recursive definitions are checked with one set of label binders" {
   let src = bytes_concat_all([
     b"effect net { write send[r](Bytes) -> Unit }\n",
-    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
+    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
     b"fn pong<[k]>(n: Int, b: Bytes) -> Unit / {net.send[k]} = ping(n - 1, b)\n",
     b"fn go(b: Bytes) -> Unit / {net.send[conn]} = ping[conn](2, b)",
   ]);
@@ -11549,7 +11625,7 @@ test "a call inside a recursive group writes no labels, or the caller's own bind
   let pair = |call: Bytes|
     bytes_concat_all([
       b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { ",
+      b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ",
       call,
       b" }\n",
       b"fn pong<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)",
@@ -11568,7 +11644,7 @@ test "a call inside a recursive group writes no labels, or the caller's own bind
   let alone = |call: Bytes|
     bytes_concat_all([
       b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { ",
+      b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ",
       call,
       b" }",
     ]);
@@ -11583,7 +11659,7 @@ test "the members of a recursive group bind the same label parameters" {
       b"effect net { write send[r](Bytes) -> Unit }\n",
       b"fn ping",
       first,
-      b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
+      b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
       b"fn pong",
       second,
       b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)",
@@ -11607,7 +11683,7 @@ test "the members of a recursive group bind the same label parameters" {
 test "mutually recursive definitions are checked with one set of row binders" {
   let src = bytes_concat_all([
     b"effect tick { write now() -> Unit }\n",
-    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n == 0 { f() } else { pong(n - 1, f) }\n",
+    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
     b"fn pong<|t>(n: Int, f: () -> Unit / t) -> Unit / t = ping(n - 1, f)\n",
     b"fn go() -> Unit / {tick.now} = ping(2, || tick.now())",
   ]);
@@ -11621,7 +11697,7 @@ test "mutually recursive definitions are checked with one set of row binders" {
 test "a call inside a recursive group keeps the row the group was called with" {
   let src = bytes_concat_all([
     b"effect tick { write now() -> Unit }\n",
-    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n == 0 { f() } else { pong(n - 1, f) }\n",
+    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
     b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || tick.now())",
   ]);
   assert_eq(check_codes(src), [b"E0308"]);
@@ -11633,7 +11709,7 @@ test "a call inside a recursive group keeps the row the group was called with" {
     b"the group's row here is e, and this argument's is {m.tick.now}",
   ]);
   let quiet = bytes_concat_all([
-    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n == 0 { f() } else { pong(n - 1, f) }\n",
+    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
     b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || ())",
   ]);
   assert_eq(check_codes(quiet), [])
@@ -11750,7 +11826,7 @@ test "the members of a recursive group bind the same row parameters" {
     bytes_concat_all([
       b"fn ping",
       first,
-      b"(n: Int, f: () -> Unit / e) -> Unit / e = if n == 0 { f() } else { pong(n - 1, f) }\n",
+      b"(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
       b"fn pong",
       second,
       b"(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, f)",
@@ -11768,8 +11844,8 @@ test "the members of a recursive group bind the same row parameters" {
   ]);
   // A group mixing a row-generic member with one that binds none is refused where they disagree.
   let mixed = bytes_concat_all([
-    b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n == 0 { f() } else { plain(n - 1) }\n",
-    b"fn plain(n: Int) -> Unit = if n == 0 { () } else { each(n - 1, || ()) }",
+    b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { plain(n - 1) }\n",
+    b"fn plain(n: Int) -> Unit = if n <= 0 { () } else { each(n - 1, || ()) }",
   ]);
   assert(contains(check_codes(mixed), b"E0307"))
 }
@@ -11777,7 +11853,7 @@ test "the members of a recursive group bind the same row parameters" {
 test "a call inside a recursive group cannot instantiate a type parameter" {
   // A concrete argument where the callee's own parameter stands.
   let concrete = bytes_concat_all([
-    b"fn ping<a>(n: Int, x: a) -> Int = if n == 0 { 0 } else { pong(n - 1) }\n",
+    b"fn ping<a>(n: Int, x: a) -> Int = if n <= 0 { 0 } else { pong(n - 1) }\n",
     b"fn pong(n: Int) -> Int = ping(n - 1, 0)",
   ]);
   assert_eq(check_codes(concrete), [b"E0308"]);
@@ -11794,7 +11870,7 @@ test "a call inside a recursive group cannot instantiate a type parameter" {
   );
   // Two members each generic over their own parameter: neither call can pass the other's.
   let both = bytes_concat_all([
-    b"fn ping<a>(n: Int, x: a) -> Int = if n == 0 { 0 } else { pong(n - 1, [x]) }\n",
+    b"fn ping<a>(n: Int, x: a) -> Int = if n <= 0 { 0 } else { pong(n - 1, [x]) }\n",
     b"fn pong<b>(n: Int, xs: List<b>) -> Int = ping(n - 1, xs)",
   ]);
   assert_eq(check_codes(both), [b"E0308", b"E0308"]);
@@ -11833,7 +11909,7 @@ test "a numeric constraint is refused where no call could pass its type" {
   );
   assert_eq(
     check_codes(
-      b"fn d<a>(x: a, n: Int) -> a where numeric(a) = if n == 0 { x } else { let f = d; f(x, n - 1) }",
+      b"fn d<a>(x: a, n: Int) -> a / {diverges} where numeric(a) = if n <= 0 { x } else { let f = d; f(x, n - 1) }",
     ),
     [b"E0310"],
   );
@@ -11841,7 +11917,7 @@ test "a numeric constraint is refused where no call could pass its type" {
     check_codes(
       bytes_concat_all([
         b"fn ping<b>(n: Int) -> b where numeric(b) =\n",
-        b"  if n == 0 { numeric_of_int(0) } else { let _ = pong(n - 1); numeric_of_int(1) }\n",
+        b"  if n <= 0 { numeric_of_int(0) } else { let _ = pong(n - 1); numeric_of_int(1) }\n",
         b"fn pong(n: Int) -> Int = { let _ = ping(n); n }",
       ]),
     ),
@@ -13565,6 +13641,54 @@ fn diverges(src: Bytes, name: Bytes) -> Bool / {abort.raise} =
     Some(d) -> match d.ending { Diverges(_) -> true, _ -> false },
     None -> panic("the definition the test names"),
   }
+
+test "a definition that may not return writes `diverges`, which its callers inherit and a fix writes for them" {
+  // At the root no fix is offered: what usually fixes it is a recursion that descends.
+  let root = check_diags(b"fn spin(n: Int) -> Int = spin(n + 1)\n");
+  assert_eq(map(root, |diag: Diag| diag.code), [b"E0302"]);
+  assert_eq(map(root, |diag: Diag| diag.message), [
+    b"`spin` may not return, and its row does not say so",
+  ]);
+  assert_eq(map(root, |diag: Diag| len(diag.fixes)), [0]);
+  assert_eq(check_codes(b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\n"), []);
+  // A caller writes it as it writes any effect it performs, and here the fix is the whole answer.
+  let caller = check_diags(
+    b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\nfn wait(n: Int) -> Int = spin(n)\n",
+  );
+  assert_eq(map(caller, |diag: Diag| diag.code), [b"E0302"]);
+  assert_eq(map(caller, |diag: Diag| diag.notes_text), [
+    [
+      b"a call that may not return makes `wait` one too: write `/ {diverges}` after the return type, or call only what ends",
+    ],
+  ]);
+  assert_eq(map(caller, |diag: Diag| len(diag.fixes)), [1]);
+  assert_eq(
+    check_codes(
+      b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\nfn wait(n: Int) -> Int / {diverges} = spin(n)\n",
+    ),
+    [],
+  );
+  // A row that says more than the body does is allowed, as for any effect.
+  assert_eq(
+    check_codes(b"fn down(n: Int) -> Int / {diverges} = if n <= 0 { 0 } else { down(n - 1) }\n"),
+    [],
+  );
+  // A stated measure is read by the checker, and judged where the program is loaded.
+  assert_eq(
+    check_codes(
+      b"fn climb(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }\n",
+    ),
+    [],
+  )
+}
+
+test "a test or law that may not return supplies nothing for it: its steps bound it" {
+  let src = b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\nlaw \"spins too\" forall (n: Int) { spin(n) == spin(n) }\n";
+  assert_eq(check_codes(src), []);
+  let c = checked_cx(src);
+  assert_eq(map(c.tests, |t: TestInfo| len(t.footprint)), [0]);
+  assert_eq(map(c.laws, |l: LawInfo| len(l.footprint)), [0])
+}
 
 test "recursion on a part of an argument terminates, and recursion on the argument itself may not" {
   assert(
