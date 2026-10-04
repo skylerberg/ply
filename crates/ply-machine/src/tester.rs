@@ -35,8 +35,8 @@ const OPERATIONS: [(&str, &str); 9] = [
     // A test once, or one interleaving of it, on whichever thread asks.
     ("executed", "ply_machine::tester::executed"),
     ("interleaved", "ply_machine::tester::interleaved"),
-    // Whether what a pass's run read still answers as it did.
-    ("unchanged", "ply_machine::tester::unchanged"),
+    // The first read a pass's run made that no longer answers as it did.
+    ("moved", "ply_machine::tester::moved"),
 ];
 
 const HERMETIC_OPERATIONS: [(&str, &str); 9] = [
@@ -48,7 +48,7 @@ const HERMETIC_OPERATIONS: [(&str, &str); 9] = [
     ("ended", "ply_machine::tester::hermetic::ended"),
     ("executed", "ply_machine::tester::hermetic::executed"),
     ("interleaved", "ply_machine::tester::hermetic::interleaved"),
-    ("unchanged", "ply_machine::tester::hermetic::unchanged"),
+    ("moved", "ply_machine::tester::hermetic::moved"),
 ];
 
 /// What the binding and the budgets are read from, out of the options record the program parsed.
@@ -204,14 +204,17 @@ impl HostHandler for TesterHandler {
                 let steps = u32::try_from(steps.max(1)).unwrap_or(u32::MAX);
                 self.interleaved(unit, test, &seed, steps, re_executed, req.machine)?
             }
-            "unchanged" => {
+            "moved" => {
                 let trace = arg(req, 0)?.as_bytes(span, "a trace")?;
                 let roots = self.roots();
-                PlyValue::Bool(ply_host::observe::unchanged(
-                    &String::from_utf8_lossy(trace),
-                    &self.world(&roots),
-                    req.machine,
-                ))
+                crate::payload::option(
+                    ply_host::observe::moved(
+                        &String::from_utf8_lossy(trace),
+                        &self.world(&roots),
+                        req.machine,
+                    )
+                    .map(PlyValue::str),
+                )
             }
             other => return Err(crate::hosts::unserved(EFFECT, other, span)),
         };

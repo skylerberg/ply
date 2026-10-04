@@ -135,11 +135,21 @@ fn helper_line(h: Helper) -> Bytes =
 pub fn runtime_of(r: Runtime) -> Bytes / {abort.raise} =
   blake3(hex(blake3(bytes_concat_all(map(r.helpers, helper_line)))))
 
-// The standard library this binary ships, every module by its name and the hash of its text.
-pub fn stdlib() -> Bytes / {shipped.names, shipped.module, abort.raise} =
+// The standard library modules a program's `names` are defined in, each once, in name order.
+fn std_modules_of(names: List<Bytes>) -> List<String> / {abort.raise} =
+  map_keys(
+    fold(names, map_new(), |acc: Map<String, Bool>, n: Bytes| {
+      let module = string_of_bytes(module_of(n));
+      if is_std(module) { map_insert(acc, module, true) } else { acc }
+    }),
+  )
+
+// The standard library modules `modules` as this binary ships them, each by its name and the hash
+// of its text.
+pub fn stdlib(modules: List<String>) -> Bytes / {shipped.module, abort.raise} =
   blake3(
     bytes_concat_all(
-      map(filter(shipped.names(), is_std), |n: String|
+      map(modules, |n: String|
         bytes_concat_all([
           u64_le(string_len(n)),
           bytes_of_string(n),
@@ -148,10 +158,17 @@ pub fn stdlib() -> Bytes / {shipped.names, shipped.module, abort.raise} =
     ),
   )
 
+// `names` are the program's: its standard library is the modules they are defined in.
 fn head_of(
   entry: Bytes,
-) -> Header / {shipped.names, shipped.module, shipped.definitions, shipped.runtime, abort.raise} =
-  { frontend: frontend(), runtime: runtime_of(shipped.runtime()), stdlib: stdlib(), entry: entry }
+  names: List<Bytes>,
+) -> Header / {shipped.module, shipped.definitions, shipped.runtime, abort.raise} =
+  {
+    frontend: frontend(),
+    runtime: runtime_of(shipped.runtime()),
+    stdlib: stdlib(std_modules_of(names)),
+    entry: entry,
+  }
 
 // --- The closure ------------------------------------------------------------------
 
@@ -493,7 +510,7 @@ pub fn made(
                         entry: entry,
                         entry_hash: hex_of(entry_hash),
                         startup: startup,
-                        head: head_of(entry_hash),
+                        head: head_of(entry_hash, map(pairs, |pair: Pair| pair.name)),
                         sections: append_all([
                           [bodies_section(bodies)],
                           named_sections(pairs),
@@ -529,7 +546,8 @@ pub fn library_unit(
 ) -> Result<Compiled, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, abort.raise} =
   match units::text_of(emit.unit(front, map(names, bytes_of_string))) {
     Err(diags) -> Err(refusal(diags)),
-    Ok(unit) -> Ok({ head: head_of(b""), count: 1, payload: bytes_gzip(unit) }),
+    Ok(unit) ->
+      Ok({ head: head_of(b"", map(names, bytes_of_string)), count: 1, payload: bytes_gzip(unit) }),
   }
 
 // --- Opening one ------------------------------------------------------------------
@@ -707,9 +725,9 @@ fn noted(diag: Diag, note: Bytes) -> Diag =
   if bytes_len(note) == 0 { diag }
   else { { ..diag, notes_text: push(diag.notes_text, note), notes: diag.notes + 1 } }
 
-fn stdlib_changed() -> Diag / {shipped.names, shipped.module, abort.raise} =
+fn stdlib_changed(now: Bytes) -> Diag / {abort.raise} =
   {
-    ..error_at(b"W0605", no_module(), nowhere(), b"the artifact was built against a different standard library", b"", [bytes_of_string("this `ply` ships " ++ sealed_short(stdlib())), b"a shipped definition is content-addressed like any other, so the digest differs over modules the program may never import"]),
+    ..error_at(b"W0605", no_module(), nowhere(), b"the artifact was built against a different standard library", b"", [bytes_of_string("this `ply` ships " ++ sealed_short(now) ++ " of the modules it draws on"), b"its definitions are its own, so it runs as it was built"]),
     severity: b"warning",
   }
 
@@ -729,7 +747,6 @@ pub fn opened(
     } else if o.runtime != runtime_of(shipped.runtime()) {
       Err(version(path, "the artifact was compiled for another runtime than this `ply` runs"))
     } else {
-      let warnings = if o.stdlib != stdlib() { [stdlib_changed()] } else { [] };
       match placed_named(o.sections, b"bodies") {
         None -> Err(invalid(path, "the artifact carries no definitions", [])),
         Some(at) -> match read_bodies(path, b, at) {
@@ -797,7 +814,12 @@ pub fn opened(
                             names: names,
                             closure: closure,
                             runnable: payload(b, r),
-                            warnings: warnings,
+                            warnings: {
+                              let now = stdlib(
+                                std_modules_of(map(names, |n: Name| bytes_of_string(n.name))),
+                              );
+                              if o.stdlib != now { [stdlib_changed(now)] } else { [] }
+                            },
                           }),
                       },
                     }
