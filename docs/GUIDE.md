@@ -2938,6 +2938,7 @@ pub fn option_ok_or<a, e>(o: Option<a>, err: e) -> Result<a, e>
 pub fn option_or_else<a | e>(o: Option<a>, fallback: () -> Option<a> / e) -> Option<a> / e bounded
 pub fn option_unwrap_or_else<a | e>(o: Option<a>, fallback: () -> a / e) -> a / e bounded
 pub fn option_map_or<a, b | e>(o: Option<a>, fallback: b, f: (a) -> b / e) -> b / e bounded
+pub fn option_zip<a, b>(o: Option<a>, p: Option<b>) -> Option<(a, b)>
 ```
 
 `Option`'s constructors and `?` are the prelude's; this is the chain a caller reads
