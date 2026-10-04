@@ -308,3 +308,45 @@ fn the_builder_these_sources_make_builds_the_program_and_it_runs() {
     let (answer, _) = ply_launcher::run(program, project.path(), argv, binds, None).into_parts();
     assert_eq!(answer.unwrap_or_else(|d| panic!("the program ran: {d}")), 0);
 }
+
+/// `main` and what it reaches, beside a definition nothing reaches and a comment.
+fn entered(answer: &str, aside: &str, comment: &str) -> String {
+    format!(
+        "// {comment}\nfn answer() -> Int = {answer}\n\npub fn main() -> Int = answer()\n\nfn aside() -> Int = {aside}\n"
+    )
+}
+
+/// The runnable this tree's builder makes of `text`, which holds the text it was built from.
+fn built_by_own(stage: &std::path::Path, name: &str, text: &str) -> Vec<u8> {
+    let src = stage.join(format!("{name}.src"));
+    std::fs::create_dir_all(&src).expect("the sources' directory");
+    std::fs::write(src.join("m.ply"), text).expect("the source is written");
+    let out = stage.join(format!("{name}.run"));
+    let rows = format!("kept-program-test-{}", std::process::id());
+    ply_machine::builds::build_by_own(&src, ".", "m.main", &out, &rows)
+        .unwrap_or_else(|d| panic!("this tree's builder builds `{name}`: {d}"));
+    std::fs::read(&out).expect("the runnable is read")
+}
+
+/// A program is the definition it enters and all that reaches: a text that moved everywhere else
+/// is the program already built, and one whose entry reaches something else is built.
+#[test]
+fn a_text_that_enters_what_a_built_program_does_is_not_built_again() {
+    let stage = ply_codegen::c::stage::stage_dir(&format!("kept-program-{}", std::process::id()));
+    let first = built_by_own(&stage, "first", &entered("1", "2", "as written"));
+    let moved = built_by_own(
+        &stage,
+        "moved",
+        &entered("1", "3", "a comment and `aside` moved"),
+    );
+    let edited = built_by_own(&stage, "edited", &entered("4", "2", "as written"));
+    let _ = std::fs::remove_dir_all(&stage);
+    assert!(
+        first == moved,
+        "a text whose entry hashes as a built program's takes that program, sources and all"
+    );
+    assert!(
+        first != edited,
+        "a text whose entry reaches another body is built"
+    );
+}
