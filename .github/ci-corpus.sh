@@ -130,6 +130,13 @@ run_one() {
     # A package's own suite and a fixture run as `ply test` runs them: the corpus's grants are for
     # the corpus.
     "$ply" test "$path" --json "$@" > "$out" || status=$?
+  elif [[ $id == stdlib ]]; then
+    "$ply" test --std "$path" --json "$@" > "$out" || status=$?
+    local proved
+    if ! proved=$("$ply" prove --std "$path" 2>&1); then
+      printf '%s\n' "$proved" >&2
+      status=1
+    fi
   else
     tested "$path" ${filter:+--filter "$filter"} "$@" > "$out" || status=$?
   fi
@@ -208,7 +215,7 @@ lane() {
   : > "$durations"
   for id in "$@"; do
     case "$id" in
-      program | package-* | fixture-*)
+      program | stdlib | package-* | fixture-*)
         echo "::group::corpus $id"
         started=$(date +%s%3N)
         run_one "$timings" "$id" || failed=1
@@ -310,7 +317,7 @@ case "${1:-}" in
     work=$(mktemp -d)
     kept_answers "$work/c" || exit 1
     # A store is one file set: it travels whole, from the partition that wrote it.
-    for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache; do
+    for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache "$root"/crates/ply-corpus/stdlib/.ply-cache; do
       [ -d "$store" ] && [ -n "$(find "$store" -type f -newer "$mark" -print -quit)" ] || continue
       rel=${store#"$root"/}
       "$ply" cache compact "${store%/.ply-cache}" > /dev/null ||
