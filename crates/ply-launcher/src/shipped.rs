@@ -14,6 +14,9 @@ pub const RUNNABLE: &str = "ply.run";
 
 pub const DIGEST: &str = "ply.digest";
 
+/// What a builder keeps the committed program under, for a text that enters the definition it does.
+pub const KEY: &str = "ply.key";
+
 // --- The `ply` program -------------------------------------------------------
 
 /// Where the CLI package sits inside a stage that carries its closure: the repository's own path,
@@ -115,8 +118,10 @@ pub fn committed() -> PathBuf {
 /// The `ply` program: the committed runnable when it was built from these very sources, else one
 /// a builder made of them for an earlier process, else one it makes now. The committed builder
 /// makes it, since every build since main's last refresh shares its rows and bodies; where these
-/// sources need a rule that builder lacks and it refuses them, this tree's own does. A binary
-/// whose committed runnable is behind its sources therefore runs the sources, never the runnable.
+/// sources need a rule that builder lacks and it refuses them, this tree's own does. A builder
+/// takes a program it already built, the committed one among them, where these sources enter the
+/// definition that one does: a binary whose committed runnable is behind its sources runs what the
+/// sources mean, never a runnable that means something else.
 pub fn program() -> Result<Runnable, Diagnostic> {
     if committed_digest().as_deref() == Some(identity().as_str())
         && let Ok(bytes) = std::fs::read(committed())
@@ -134,6 +139,9 @@ pub fn program() -> Result<Runnable, Diagnostic> {
         if let Some(program) = found() {
             return Ok(program);
         }
+        ply_machine::builds::kept_as_built(&Path::new(DIR).join(KEY), || {
+            std::fs::read(committed()).ok()
+        });
         match ply_machine::builds::build(&laid_out()?, ROOT, ENTRY, &staged, ROWS) {
             Ok(()) => read_back(&staged),
             Err(_) => {
