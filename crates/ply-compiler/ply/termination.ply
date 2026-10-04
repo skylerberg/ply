@@ -16,6 +16,7 @@ import items (FnDef)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, Field)
 import std.bin
 import std.list (at, concat, contains)
+import std.math (pow)
 
 // What a name the walk did not bind names: a member of the group, a builtin, a constructor,
 // another definition by its qualified name, or something else.
@@ -35,7 +36,11 @@ pub type Ending =
   // A call by which it may not return: back into its group without descending, on the `loop` of
   // calls that does not, or with no `loop` where the group is past what the check follows; or,
   // `through`, to a definition that may not return.
-  | Diverges({ at: Span, through: Option<Bytes>, loop: List<Span> })
+  | Diverges({ at: Site, through: Option<Bytes>, loop: List<Site> })
+
+// A call in the body of the definition `caller` names, `span` counted from where that definition
+// starts, so an ending filed for a definition holds wherever the definition moves to.
+pub type Site = { caller: Bytes, span: Span }
 
 // A parameter, or a field reached from one through records.
 pub type Place = { param: Int, path: List<Bytes> }
@@ -88,10 +93,11 @@ pub type Passing =
   // Kept, answered, or handed somewhere the walk does not follow: called with anything.
   | Escapes
 
-// A group's members in slot order, each with its parameters' types; how to read a free name; how a
-// definition outside the group ends; and how it calls what it is handed.
+// A group's members in slot order, each with its qualified name and its parameters' types; how to
+// read a free name; how a definition outside the group ends; and how it calls what it is handed.
 pub type Group = {
   defs: List<FnDef>,
+  names: List<Bytes>,
   params: List<List<Type>>,
   resolve: (QName) -> Callee / {abort.raise},
   ending_of: (Bytes) -> Ending / {abort.raise},
@@ -103,6 +109,7 @@ pub type Group = {
 pub type Verdict = { endings: List<Ending>, summaries: List<Summary> }
 
 // Filed with a definition's rows, so a stub, whose body is a blank, still answers what its own did.
+derive bin for Site
 derive bin for Ending
 derive bin for Place
 derive bin for Base
@@ -155,7 +162,7 @@ type Measure =
 type Arc = { a: Int, b: Int, strict: Bool }
 
 // What a chain of calls from `from` to `to` does to the measures; `calls` are the chain's, in order.
-type Graph = { from: Int, to: Int, arcs: List<Arc>, calls: List<Span> }
+type Graph = { from: Int, to: Int, arcs: List<Arc>, calls: List<Site> }
 
 // --- The verdict ----------------------------------------------------------------------------------
 
@@ -166,26 +173,33 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
   let calls = map(seen, |x: Seen| x.calls);
   let stating = fold(g.defs, false, |acc: Bool, d: FnDef|
     acc || (match d.decreases { Some(_) -> true, None -> false }));
-  let lost = fold(seen, None, |acc: Option<Span>, x: Seen|
-    match acc { Some(_) -> acc, None -> x.lost });
+  let lost = fold(range(0, len(seen)), None, |acc: Option<Site>, i: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> match at(seen, i).lost { Some(span) -> Some(site(g, i, span)), None -> None },
+    });
   let own = match lost {
-    Some(span) -> Diverges({ at: span, through: None, loop: [] }),
+    Some(s) -> Diverges({ at: s, through: None, loop: [] }),
     None -> match looping(g, calls, false) {
       None -> Ends,
       Some(first) -> if !stating { looped(first) }
       else { match looping(g, calls, true) { None -> Stated, Some(again) -> looped(again) } },
     },
   };
-  let out = |e: Ending, o: Outside|
-    weaker(e, match (g.ending_of)(o.name) {
-      Diverges(_) -> Diverges({ at: o.span, through: Some(o.name), loop: [] }),
-      other -> other,
-    });
+  let out = |me: Int|
+    |e: Ending, o: Outside|
+      weaker(e, match (g.ending_of)(o.name) {
+        Diverges(_) -> Diverges({ at: site(g, me, o.span), through: Some(o.name), loop: [] }),
+        other -> other,
+      });
   let settled = match own { Diverges(_) -> Ends, other -> other };
   {
     endings: map(range(0, len(g.defs)), |i: Int|
-      fold(seen, weaker(fold(at(seen, i).outside, settled, out), own), |e: Ending, x: Seen|
-        fold(x.outside, e, out))),
+      fold(
+        range(0, len(seen)),
+        weaker(fold(at(seen, i).outside, settled, out(i)), own),
+        |e: Ending, j: Int| fold(at(seen, j).outside, e, out(j)),
+      )),
     summaries: map(range(0, len(g.defs)), |i: Int|
       summary({ group: g, me: i, depth: 0, results: results }, at(seen, i))),
   }
@@ -219,7 +233,13 @@ fn looped(u: Unending) -> Ending = Diverges({ at: u.at, through: None, loop: u.l
 
 // A loop that may not shrink any measure: its first call and all of them, or, past what the check
 // follows, a call into the group and no loop.
-type Unending = { at: Span, loop: List<Span> }
+type Unending = { at: Site, loop: List<Site> }
+
+// The call at `span` in member `me`'s body.
+fn site(g: Group, me: Int, span: Span) -> Site / {abort.raise} = {
+  let start = at(g.defs, me).span.start;
+  { caller: at(g.names, me), span: { start: span.start - start, end: span.end - start } }
+}
 
 fn weaker(a: Ending, b: Ending) -> Ending =
   match a { Diverges(_) -> a, Stated -> match b { Diverges(_) -> b, _ -> a }, Ends -> b }
@@ -311,7 +331,7 @@ fn composed(x: Graph, y: Graph) -> Graph / {abort.raise} =
       fold(y.arcs, acc, |a: List<Arc>, s: Arc|
         if r.b != s.a { a }
         else { with_arc(a, { a: r.a, b: s.b, strict: r.strict || s.strict }) })),
-    calls: fold(y.calls, x.calls, |acc: List<Span>, sp: Span| push(acc, sp)),
+    calls: fold(y.calls, x.calls, |acc: List<Site>, s: Site| push(acc, s)),
   }
 
 // Keeps the stronger of two arcs between the same measures.
@@ -427,7 +447,7 @@ fn call_graph(g: Group, measures: List<List<Measure>>, me: Int, c: Call) -> Grap
           Some(strict) -> with_arc(a, { a: i, b: j, strict: strict }),
         })
     }),
-    calls: [c.span],
+    calls: [site(g, me, c.span)],
   }
 }
 
@@ -961,7 +981,7 @@ fn term(context: MemberContext, scope: Scope, e: Expr) -> Term / {abort.raise} =
           quotient(
             context,
             term(context, scope, b.lhs),
-            Exactly({ base: None, k: power_of_two(r.k) }),
+            Exactly({ base: None, k: pow(2, r.k) }),
             b.op,
           )
         } else { UnknownTerm },
@@ -1061,8 +1081,6 @@ fn remainder(context: MemberContext, b: Term) -> Term / {abort.raise} =
     },
     _ -> UnknownTerm,
   }
-
-fn power_of_two(k: Int) -> Int = fold(range(0, k), 1, |acc: Int, i: Int| acc * 2)
 
 fn integer(context: MemberContext, l: Linear) -> Bool / {abort.raise} =
   match l.base { None -> true, Some(x) -> integer_base(context, x) }

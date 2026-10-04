@@ -3,7 +3,7 @@
 
 import parsing (Span, Ident, QName, int_to_bytes)
 import std.bin
-import lexer (byte_of, widths, wide_decimal, utf8_of)
+import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
@@ -22,9 +22,10 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, Module
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
                 label_at, is_bare, dump_diags, qualify, default_binder, backticked, is_ctor_name)
 import derive (Expansion, expand_derives)
-import std.bytes (u32_at, is_digit)
+import std.bytes (u32_at, is_digit, replace)
 import std.hash (blake3)
-import std.list (at, concat, contains, take)
+import std.list (at, concat, contains, take, push_unique)
+import std.bytes
 
 // --- Bytes ------------------------------------------------------------------------------------
 
@@ -35,26 +36,26 @@ fn rposition(xs: List<Bytes>, v: Bytes) -> Option<Int> / {abort.raise} =
 
 fn u32_le(v: Int) -> Bytes / {abort.raise} =
   bytes_concat_all([
-    byte_of(v & 0xFF),
-    byte_of(v >>> 8 & 0xFF),
-    byte_of(v >>> 16 & 0xFF),
-    byte_of(v >>> 24 & 0xFF),
+    byte_of_int(v & 0xFF),
+    byte_of_int(v >>> 8 & 0xFF),
+    byte_of_int(v >>> 16 & 0xFF),
+    byte_of_int(v >>> 24 & 0xFF),
   ])
 
 // The width's position in `lexer::widths`: the discriminant the encoding writes.
 fn width_index(ty: Bytes) -> Bytes / {abort.raise} = {
   let want = bytes_of_string(string_lower(string_of_bytes(ty)));
-  byte_of(
+  byte_of_int(
     fold(range(0, len(widths())), 0, |at: Int, i: Int|
       match list_at(widths(), i) { Some(w) -> if w.name == want { i } else { at }, None -> at }),
   )
 }
 
 fn i64_le(v: Int) -> Bytes / {abort.raise} =
-  bytes_concat_all(map(range(0, 8), |i: Int| byte_of(v >>> 8 * i & 0xFF)))
+  bytes_concat_all(map(range(0, 8), |i: Int| byte_of_int(v >>> 8 * i & 0xFF)))
 
 fn hex_digit(v: Int) -> Bytes / {abort.raise} =
-  if v < 10 { byte_of(48 + v) } else { byte_of(87 + v) }
+  if v < 10 { byte_of_int(48 + v) } else { byte_of_int(87 + v) }
 
 // Every byte's two digits, so a byte of `hex` is one lookup.
 fn hex_pairs() -> List<Bytes> / {abort.raise} =
@@ -83,7 +84,7 @@ fn i128_le_of_digits(digits: Bytes) -> Bytes / {abort.raise} = {
       carried.limbs
     },
   );
-  bytes_concat_all(map(limbs, |v: Int| byte_of(v)))
+  bytes_concat_all(map(limbs, |v: Int| byte_of_int(v)))
 }
 
 fn float_bits(text: Bytes) -> Int / {abort.raise} =
@@ -103,7 +104,7 @@ fn decimal_parts(text: Bytes) -> { mantissa: Bytes, scale: Int } / {abort.raise}
       if c == 46 { { ..s, after: true } }
       else if !is_digit(c) { s } else {
         {
-          digits: bytes_concat(s.digits, byte_of(c)),
+          digits: bytes_concat(s.digits, byte_of_int(c)),
           scale: if s.after { s.scale + 1 } else { s.scale },
           after: s.after,
         }
@@ -727,10 +728,10 @@ fn finish(encoder: Encoder) -> Finished =
   { bytes: bytes_concat_all(encoder.out), refs: encoder.refs }
 
 fn put_bytes(encoder: Encoder, b: Bytes) -> Encoder = { ..encoder, out: push(encoder.out, b) }
-fn put_tag(encoder: Encoder, t: Int) -> Encoder / {abort.raise} = put_bytes(encoder, byte_of(t))
+fn put_tag(encoder: Encoder, t: Int) -> Encoder / {abort.raise} = put_bytes(encoder, byte_of_int(t))
 fn put_u32(encoder: Encoder, v: Int) -> Encoder / {abort.raise} = put_bytes(encoder, u32_le(v))
 fn put_bool(encoder: Encoder, b: Bool) -> Encoder / {abort.raise} =
-  put_bytes(encoder, byte_of(if b { 1 } else { 0 }))
+  put_bytes(encoder, byte_of_int(if b { 1 } else { 0 }))
 fn put_text(encoder: Encoder, s: Bytes) -> Encoder / {abort.raise} =
   put_bytes(put_u32(encoder, bytes_len(s)), s)
 
@@ -1015,7 +1016,10 @@ pub fn sort_bytes(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
 fn op_def(encoder: Encoder, op: OpDef) -> Encoder / {abort.raise} = {
   let header: Encoder = put_u32(
     put_bool(
-      put_bytes(put_text(put_tag(encoder, tag_op()), op.name.name), byte_of(mode_byte(op.mode))),
+      put_bytes(
+        put_text(put_tag(encoder, tag_op()), op.name.name),
+        byte_of_int(mode_byte(op.mode)),
+      ),
       op.resource_param,
     ),
     len(op.ty_params),
@@ -1054,7 +1058,7 @@ pub fn spec_clause(encoder: Encoder, owner: FnDef, clause: SpecClause) -> Encode
     put_u32(
       put_u32(
         put_u32(
-          put_bytes(put_tag(encoder, tag_spec()), byte_of(spec_tag(clause.kind))),
+          put_bytes(put_tag(encoder, tag_spec()), byte_of_int(spec_tag(clause.kind))),
           len(owner.generics.types),
         ),
         len(owner.generics.effects),
@@ -1182,7 +1186,7 @@ fn atom(encoder: Encoder, a: AtomExpr) -> Encoder / {abort.raise} = {
   let named: Encoder = match a.op {
     None ->
       opt_label(
-        put_bytes(effect_ref(put_tag(encoder, tag_atom()), a.eff), byte_of(mode_byte(a.mode))),
+        put_bytes(effect_ref(put_tag(encoder, tag_atom()), a.eff), byte_of_int(mode_byte(a.mode))),
         atom_label(a),
       ),
     Some(op) ->
@@ -1208,11 +1212,11 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
     EVar(v) -> value_ref(put_tag(encoder, tag_e_var()), v.name),
     EBinary(b) ->
       expr(
-        expr(put_bytes(put_tag(encoder, tag_e_binary()), byte_of(binop_byte(b.op))), b.lhs),
+        expr(put_bytes(put_tag(encoder, tag_e_binary()), byte_of_int(binop_byte(b.op))), b.lhs),
         b.rhs,
       ),
     EUnary(u) ->
-      expr(put_bytes(put_tag(encoder, tag_e_unary()), byte_of(unop_byte(u.op))), u.operand),
+      expr(put_bytes(put_tag(encoder, tag_e_unary()), byte_of_int(unop_byte(u.op))), u.operand),
     ELambda(l) -> {
       let typed: Encoder = fold(
         l.params,
@@ -1511,12 +1515,9 @@ fn commutable_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
   }
 }
 
-fn insert_name(xs: List<Bytes>, v: Bytes) -> List<Bytes> =
-  if contains(xs, v) { xs } else { push(xs, v) }
-
 fn pattern_binders(p: Pattern, out: List<Bytes>) -> { count: Int, bound: List<Bytes> } =
   match p {
-    PVar(v) -> { count: 1, bound: insert_name(out, v.name.name) },
+    PVar(v) -> { count: 1, bound: push_unique(out, v.name.name) },
     PWild(_) -> { count: 0, bound: out },
     PLit(_) -> { count: 0, bound: out },
     PBad(_) -> { count: 0, bound: out },
@@ -1679,12 +1680,12 @@ fn spec_text_domain() -> Bytes = b"ply.spec.text.1"
 fn own_domain() -> Bytes = b"ply.own.1"
 
 fn spec_text_hash(kind: Int, index: Int, normalized: Bytes) -> Bytes / {abort.raise} =
-  blake3(bytes_concat_all([spec_text_domain(), byte_of(kind), u32_le(index), normalized]))
+  blake3(bytes_concat_all([spec_text_domain(), byte_of_int(kind), u32_le(index), normalized]))
 
 fn own_hash(normalized: Bytes) -> Bytes = blake3(bytes_concat(own_domain(), normalized))
 
 pub fn spec_hash(owner: Bytes, kind: Int, index: Int, normalized: Bytes) -> Bytes / {abort.raise} =
-  blake3(bytes_concat_all([spec_domain(), owner, byte_of(kind), u32_le(index), normalized]))
+  blake3(bytes_concat_all([spec_domain(), owner, byte_of_int(kind), u32_le(index), normalized]))
 
 fn member_hash(component: Bytes, class: Int) -> Bytes / {abort.raise} =
   blake3(bytes_concat(component, u32_le(class)))
@@ -1816,8 +1817,6 @@ fn effect_order(
       with_effect
     } else { fold(at(scc.orders, ci), with_effect, |a: List<Int>, node: Int| push_unique(a, node)) }
   })
-
-fn push_unique(xs: List<Int>, v: Int) -> List<Int> = if contains(xs, v) { xs } else { push(xs, v) }
 
 fn slots(order: List<Int>) -> Map<Int, Int> / {abort.raise} =
   fold(range(0, len(order)), map_new(), |acc: Map<Int, Int>, i: Int|
@@ -3683,7 +3682,7 @@ fn escape(c: Int, raw: Bool) -> Bytes / {abort.raise} =
   else if c == 9 { b"\\t" }
   else if c == 13 { b"\\r" }
   else if c == 0 { b"\\0" }
-  else if raw || (c >= 32 && c <= 126) { byte_of(c) }
+  else if raw || (c >= 32 && c <= 126) { byte_of_int(c) }
   else { bytes_concat_all([b"\\x", hex_digit(c >>> 4), hex_digit(c & 15)]) }
 
 fn str_lit(s: Bytes) -> Bytes / {abort.raise} =
@@ -3828,7 +3827,7 @@ fn round_to(ds: Bytes, x0: Int, p: Int) -> Rounded / {abort.raise} = {
       if bytes_at(head, i) != 57 { i } else { acc });
     if k < 0 { { digits: b"1", exp: x0 + 1, p: p } } else {
       {
-        digits: bytes_concat(bytes_slice(head, 0, k), byte_of(bytes_at(head, k) + 1)),
+        digits: bytes_concat(bytes_slice(head, 0, k), byte_of_int(bytes_at(head, k) + 1)),
         exp: x0,
         p: p,
       }
@@ -4662,7 +4661,7 @@ fn part_in(
         } else {
           fold(all, a, |b: Parting, n: Named| {
             let q = qualify(n.module, n.simple);
-            let key = bytes_concat(byte_of(kind), q);
+            let key = bytes_concat(byte_of_int(kind), q);
             match map_get(b.declared, key) {
               Some(other) -> if other == h || is_some(b.bad) { b } else {
                 {
@@ -4986,10 +4985,6 @@ fn dumped_hash(dump: String, name: Bytes) -> Bytes / {abort.raise} = {
   bytes_slice(d, start, start + 64)
 }
 
-// `text` with every `from` written as `to`.
-fn swapped(text: Bytes, from: Bytes, to: Bytes) -> Bytes / {abort.raise} =
-  if bytes_len(from) == 0 { panic("nothing to swap") } else { joined(bytes_split(text, from), to) }
-
 fn primed_m(changed: Bytes) -> Source =
   {
     name: b"m",
@@ -5023,11 +5018,11 @@ fn primed_variants() -> List<List<Source>> / {abort.raise} =
       primed_n(b"pub fn parity() -> Bool = even(4)\n"),
     ],
     [
-      { name: b"m", src: swapped(at(primed_base(), 0).src, b"x * 2", b"x * 3") },
+      { name: b"m", src: replace(at(primed_base(), 0).src, b"x * 2", b"x * 3") },
       at(primed_base(), 1),
     ],
     [
-      { name: b"m", src: swapped(at(primed_base(), 0).src, b"requires x >= 0", b"requires x > 0") },
+      { name: b"m", src: replace(at(primed_base(), 0).src, b"requires x >= 0", b"requires x > 0") },
       at(primed_base(), 1),
     ],
     [
@@ -5036,22 +5031,22 @@ fn primed_variants() -> List<List<Source>> / {abort.raise} =
       ),
       {
         name: b"n",
-        src: swapped(at(primed_base(), 1).src, b"two(two(one()))", b"two(two(three()))"),
+        src: replace(at(primed_base(), 1).src, b"two(two(one()))", b"two(two(three()))"),
       },
     ],
     [at(primed_base(), 0), primed_n(b"")],
     [
-      { name: b"m", src: swapped(at(primed_base(), 0).src, b"helper", b"assist") },
+      { name: b"m", src: replace(at(primed_base(), 0).src, b"helper", b"assist") },
       at(primed_base(), 1),
     ],
     [
-      { name: b"m", src: swapped(at(primed_base(), 0).src, b"b: Int }", b"b: Int, c: Int }") },
-      { name: b"n", src: swapped(at(primed_base(), 1).src, b"b: four() }", b"b: four(), c: 0 }") },
+      { name: b"m", src: replace(at(primed_base(), 0).src, b"b: Int }", b"b: Int, c: Int }") },
+      { name: b"n", src: replace(at(primed_base(), 1).src, b"b: four() }", b"b: four(), c: 0 }") },
     ],
     [
       {
         name: b"m",
-        src: swapped(
+        src: replace(
           at(primed_base(), 0).src,
           b"emit(Bytes) -> Unit }",
           b"emit(Bytes) -> Unit\n  write flush() -> Unit }",
@@ -5081,7 +5076,7 @@ test "a run over an earlier run's priors hashes what a run from nothing does" {
     }));
   // Priors of a program whose names all moved stand for nothing in this one.
   let renamed = map(primed_base(), |s: Source|
-    { name: s.name, src: swapped(s.src, b"one", b"uno") });
+    { name: s.name, src: replace(s.src, b"one", b"uno") });
   assert(primed_as_fresh(renamed, primed_base(), []))
 }
 
@@ -5146,7 +5141,7 @@ test "a record update of another module's record hashes stably, and follows that
   );
   let out = hash_index(indexed(narrow));
   let ms = printed_of(out, []);
-  assert(holds_text(at(ms, 0).text, b"{.."));
+  assert(bytes::contains(at(ms, 0).text, b"{.."));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -5264,9 +5259,6 @@ fn printed_of(
     Unprintable(why) -> panic(string_of_bytes(why.message)),
   }
 
-fn holds_text(text: Bytes, part: Bytes) -> Bool =
-  match bytes_index_of(text, part) { Some(_) -> true, None -> false }
-
 test "a stated measure moves a definition's hash, and prints back to what it was stored under" {
   let src = b"fn f(n: Int) -> Int decreases n = if n <= 0 { 0 } else { f(n - 1) }";
   let plain = hash_dump([
@@ -5276,7 +5268,7 @@ test "a stated measure moves a definition's hash, and prints back to what it was
   assert(dumped_hash(plain, b"m.f") != dumped_hash(measured, b"m.f"));
   let out = hash_index(indexed([{ name: b"m", src: src }]));
   let ms = printed_of(out, []);
-  assert(holds_text(at(ms, 0).text, b"decreases"));
+  assert(bytes::contains(at(ms, 0).text, b"decreases"));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -5306,7 +5298,7 @@ test "printed bodies hash back to what they were stored under, under their own n
     b"left.util",
     b"right.util",
   ]);
-  assert(holds_text(at(ms, 0).text, b"import left.util as left_util\n"));
+  assert(bytes::contains(at(ms, 0).text, b"import left.util as left_util\n"));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -5325,8 +5317,8 @@ test "every deriver a constraint names prints back and hashes back to what it wa
     ]),
   );
   let ms = printed_of(out, []);
-  assert(holds_text(at(ms, 0).text, b"derivable(bin, "));
-  assert(holds_text(at(ms, 0).text, b"derivable(show, "));
+  assert(bytes::contains(at(ms, 0).text, b"derivable(bin, "));
+  assert(bytes::contains(at(ms, 0).text, b"derivable(show, "));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -5340,7 +5332,7 @@ test "a parallel block prints back as written and hashes back to what it was sto
     ]),
   );
   let ms = printed_of(out, []);
-  assert(holds_text(at(ms, 0).text, b"parallel { "));
+  assert(bytes::contains(at(ms, 0).text, b"parallel { "));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -5368,8 +5360,8 @@ test "a reference is printed under a name the module holding it exports" {
     Unprintable(why) -> panic(string_of_bytes(why.message)),
     Printed(ms) -> {
       assert_eq(map(ms, |m: { module: Bytes, text: Bytes }| m.module), [b"app"]);
-      assert(holds_text(at(ms, 0).text, b"shelf::width()"));
-      assert(!holds_text(at(ms, 0).text, b"hidden::"))
+      assert(bytes::contains(at(ms, 0).text, b"shelf::width()"));
+      assert(!bytes::contains(at(ms, 0).text, b"hidden::"))
     },
   }
 }
@@ -5389,7 +5381,7 @@ test "an operation atom hashes apart from its mode atom and prints back as writt
   };
   let out = hash_index(indexed([{ name: b"m", src: src(b"send") }]));
   let ms = printed_of(out, []);
-  assert(holds_text(at(ms, 0).text, b"net.send[conn]"));
+  assert(bytes::contains(at(ms, 0).text, b"net.send[conn]"));
   let again = hash_index(indexed([{ name: b"m", src: at(ms, 0).text }]));
   assert_eq(hash_of(again), hash_of(out));
   assert(hash_of(out) != hash_of(hash_index(indexed([{ name: b"m", src: src(b"write") }]))))
@@ -5460,13 +5452,13 @@ test "a label binder, the resources it names and the labels a call fills print b
     ]),
   );
   let ms = printed_of(out, []);
-  assert(holds_text(at(ms, 0).text, b"fn relay<[_r0]>"));
-  assert(holds_text(at(ms, 0).text, b"/ {net.send[_r0]}"));
-  assert(holds_text(at(ms, 0).text, b"net.send[_r0](_l0)"));
-  assert(holds_text(at(ms, 0).text, b"relay[_r0](_l0)"));
-  assert(holds_text(at(ms, 0).text, b"net.send[_r0](_l1) -> _l1"));
-  assert(holds_text(at(ms, 0).text, b"/ {net.send[conn]}"));
-  assert(holds_text(at(ms, 0).text, b"relay[conn](_l0)"));
+  assert(bytes::contains(at(ms, 0).text, b"fn relay<[_r0]>"));
+  assert(bytes::contains(at(ms, 0).text, b"/ {net.send[_r0]}"));
+  assert(bytes::contains(at(ms, 0).text, b"net.send[_r0](_l0)"));
+  assert(bytes::contains(at(ms, 0).text, b"relay[_r0](_l0)"));
+  assert(bytes::contains(at(ms, 0).text, b"net.send[_r0](_l1) -> _l1"));
+  assert(bytes::contains(at(ms, 0).text, b"/ {net.send[conn]}"));
+  assert(bytes::contains(at(ms, 0).text, b"relay[conn](_l0)"));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -5488,7 +5480,7 @@ test "renaming an operation's type parameter does not move a hash, and it prints
   let renamed = hash_index(indexed([{ name: b"m", src: boxed(b"b") }]));
   assert_eq(by_name(named_hashes(renamed)), by_name(named_hashes(out)));
   let ms = printed_of(out, []);
-  assert(holds_text(at(ms, 0).text, b"read take[r]<_t0>(List<_t0>) -> _t0"));
+  assert(bytes::contains(at(ms, 0).text, b"read take[r]<_t0>(List<_t0>) -> _t0"));
   let again = hash_index(indexed([{ name: b"m", src: at(ms, 0).text }]));
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
@@ -5599,7 +5591,7 @@ test "a definition's hash follows the name of the effect it performs" {
 // Pinned, so a framing change fails here rather than silently moving the digests a warm cache
 // keys on.
 test "the published hashes digest to a pinned value" {
-  let h = |v: Int| bytes_concat_all(map(range(0, 32), |i: Int| byte_of(v)));
+  let h = |v: Int| bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int(v)));
   let sample: HashOutput = {
     ..no_hashes(),
     defs: [{ name: b"a", hash: h(1) }],
@@ -5627,7 +5619,7 @@ test "a stored body is keyed by its own bytes, and bytes no envelope holds by no
 
 test "a call that leaves an argument to a default naming what its module keeps hashes as one that writes it" {
   let left = b"fn triple(x: Int) -> Int = x * 3\nfn inner(x: Int, f: (Int) -> Int = triple) -> Int = f(x)\nfn caller() -> Int = inner(1)";
-  let written = swapped(left, b"inner(1)", b"inner(1, triple)");
+  let written = replace(left, b"inner(1)", b"inner(1, triple)");
   assert_eq(
     dumped_hash(hash_dump([{ name: b"m", src: left }]), b"m.caller"),
     dumped_hash(hash_dump([{ name: b"m", src: written }]), b"m.caller"),

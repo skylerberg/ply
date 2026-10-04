@@ -23,10 +23,9 @@ import report (Answer, ok_code, count_of, indent, plural, refused, warning_lines
 import signature (SetLine, counted_lines, effect_sets, provenance, provenance_lines, set_lines)
 import style (Style, bold, dim, green)
 import compiler.costs (Report)
-import compiler.parsing (Span)
-import compiler.termination (Ends, Stated, Diverges)
+import compiler.termination (Ends, Stated, Diverges, Site)
 import compiler.front (Analysis, effect_sets_of)
-import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo)
+import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location)
 import compiler.resolve (Diag)
 import compiler.types (Atom, Type, printer_new, print_atom_list, scheme_text, row_text, type_text,
                        atom_text)
@@ -36,19 +35,14 @@ import std.json (Json, Member, Str, Bool, Number, Array, Object, Null, object, p
                  to_string, int)
 import std.time (time)
 import std.list (concat)
-import std.string (join, pad_right, repeat)
+import std.string (join, pad_right, repeat, pad_left)
 
 // `indent()` plus the two spaces that put a definition under its module heading.
 fn types_indent() -> Int = 5
 
 fn under() -> String = indent() ++ "  "
 
-fn texts(bs: List<Bytes>) -> List<String> = map(bs, |b: Bytes| string_of_bytes_lossy(b))
-
 fn json_strings(ss: List<String>) -> List<Json> = map(ss, |s: String| Str(s))
-
-fn pad_left(s: String, n: Int) -> String =
-  if string_len(s) >= n { s } else { repeat(" ", n - string_len(s)) ++ s }
 
 // As the reference prints a test's name: the bytes, with the ones that would close the quotes escaped.
 fn quoted(s: String) -> String / {abort.raise} = {
@@ -81,7 +75,7 @@ fn footprint_of(atoms: List<Atom>) -> String / {abort.raise} =
   string_of_bytes_lossy(row_text({ atoms: atoms, tail: None }))
 
 fn atoms_of(atoms: List<Atom>) -> List<String> / {abort.raise} =
-  texts(print_atom_list(printer_new(), atoms).texts)
+  map(print_atom_list(printer_new(), atoms).texts, string_of_bytes_lossy)
 
 fn mine(name: String, defs: List<DefInfo>) -> List<DefInfo> =
   filter(defs, |def_info: DefInfo| string_of_bytes_lossy(def_info.module) == name)
@@ -94,11 +88,12 @@ type Phase = { label: String, ms: Int }
 fn share(ms: Int, total: Int) -> String / {abort.raise} = {
   // Per mille is tenths of a percent, so one division answers both digits.
   let tenths = if total == 0 { 0 } else { ms * 1000 / total };
-  pad_left(int_to_string(tenths / 10) ++ "." ++ int_to_string(tenths % 10), 5) ++ "%"
+  pad_left(int_to_string(tenths / 10) ++ "." ++ int_to_string(tenths % 10), 5, " ") ++ "%"
 }
 
 fn phase_line(style: Style, phase: Phase, total: Int) -> String / {abort.raise} =
-  under() ++ pad_right(phase.label, 11, " ") ++ " " ++ pad_left(int_to_string(phase.ms), 8) ++ "ms "
+  under() ++ pad_right(phase.label, 11, " ") ++ " " ++ pad_left(int_to_string(phase.ms), 8, " ")
+    ++ "ms "
     ++ dim(style, share(phase.ms, total))
 
 // Longest first, so what dominated a run is read first; a tie keeps the order the load ran them in.
@@ -120,7 +115,10 @@ fn phase_lines(style: Style, timed: Timed) -> List<String> / {abort.raise} = {
       ["", indent() ++ bold(style, "front-end time")],
       map(rows, |phase: Phase| phase_line(style, phase, total)),
     ),
-    [under() ++ pad_right("total", 11, " ") ++ " " ++ pad_left(int_to_string(total), 8) ++ "ms"],
+    [
+      under() ++ pad_right("total", 11, " ") ++ " " ++ pad_left(int_to_string(total), 8, " ")
+        ++ "ms",
+    ],
   )
 }
 
@@ -144,7 +142,7 @@ fn seeding_of(analysis: Analysis) -> Seeding = {
 }
 
 fn count_line(label: String, n: Int) -> String / {abort.raise} =
-  under() ++ pad_right(label, 11, " ") ++ " " ++ pad_left(int_to_string(n), 8) ++ " "
+  under() ++ pad_right(label, 11, " ") ++ " " ++ pad_left(int_to_string(n), 8, " ") ++ " "
     ++ plural(n, "definition")
 
 fn seeding_lines(style: Style, analysis: Analysis) -> List<String> / {abort.raise} = {
@@ -155,7 +153,7 @@ fn seeding_lines(style: Style, analysis: Analysis) -> List<String> / {abort.rais
     count_line("seeded", x.seeded),
     count_line("checked", x.checked),
     under() ++ pad_right("stubbed", 11, " ") ++ " "
-      ++ pad_left(int_to_string(len(analysis.stubs)), 8)
+      ++ pad_left(int_to_string(len(analysis.stubs)), 8, " ")
       ++ " "
       ++ plural(len(analysis.stubs), "module"),
   ]
@@ -211,6 +209,7 @@ fn def_block(
   style: Style,
   explain: Bool,
   program: Program,
+  located: Map<Bytes, Location>,
   width: Int,
   lines: List<String>,
   def_info: DefInfo,
@@ -221,7 +220,7 @@ fn def_block(
       width,
       string_of_bytes_lossy(def_info.simple_name),
       def_info,
-      diverging_at(program, def_info),
+      diverging_at(program, located, def_info),
     ),
     lines,
     |acc: List<String>, l: String| push(acc, under() ++ l),
@@ -235,12 +234,35 @@ fn def_block(
   }
 }
 
-// Where the call is by which a definition may not return; it is in the definition's own module.
-fn diverging_at(program: Program, def_info: DefInfo) -> Option<String> / {abort.raise} =
-  match def_info.ending {
-    Diverges(d) -> location_of(program, { module: def_info.at.module, span: d.at }),
-    _ -> None,
+// Each definition's location, by its qualified name.
+fn locations(defs: List<DefInfo>) -> Map<Bytes, Location> =
+  fold(defs, map_new(), |acc: Map<Bytes, Location>, def_info: DefInfo|
+    map_insert(acc, def_info.name, def_info.at))
+
+// Where a call is: in its caller's body, where that body is now.
+fn site_at(
+  program: Program,
+  located: Map<Bytes, Location>,
+  site: Site,
+) -> Option<String> / {abort.raise} =
+  match map_get(located, site.caller) {
+    Some(caller) -> {
+      let start = caller.span.start;
+      location_of(program, {
+        module: caller.module,
+        span: { start: start + site.span.start, end: start + site.span.end },
+      })
+    },
+    None -> None,
   }
+
+// Where the call is by which a definition may not return.
+fn diverging_at(
+  program: Program,
+  located: Map<Bytes, Location>,
+  def_info: DefInfo,
+) -> Option<String> / {abort.raise} =
+  match def_info.ending { Diverges(d) -> site_at(program, located, d.at), _ -> None }
 
 fn test_line(style: Style, test_info: TestInfo) -> String / {abort.raise} = {
   let kind = if test_info.nondet { "test/nondet" } else { "test" };
@@ -253,6 +275,7 @@ fn module_block(
   explain: Bool,
   program: Program,
   analysis: Analysis,
+  located: Map<Bytes, Location>,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
   lines: List<String>,
@@ -273,7 +296,7 @@ fn module_block(
   let setted = if !explain { effected } else { set_blocks(effected, sets_of(analysis, mo, ours)) };
   let width = widest(ours);
   let defined = fold(ours, setted, |acc: List<String>, def_info: DefInfo|
-    def_block(style, explain, program, width, acc, def_info));
+    def_block(style, explain, program, located, width, acc, def_info));
   fold(
     filter(tests, |test_info: TestInfo| string_of_bytes_lossy(test_info.module) == mo.name),
     defined,
@@ -299,9 +322,11 @@ fn type_lines(
   views: List<ModuleFacts>,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
-) -> List<String> / {abort.raise} =
+) -> List<String> / {abort.raise} = {
+  let located = locations(defs);
   fold(views, [], |acc: List<String>, mo: ModuleFacts|
-    module_block(style, explain, program, analysis, defs, tests, acc, mo))
+    module_block(style, explain, program, analysis, located, defs, tests, acc, mo))
+}
 
 // --- The JSON document ---------------------------------------------------------------
 
@@ -335,7 +360,10 @@ fn module_json(
 
 fn provenance_fields(def_info: DefInfo) -> List<Member> / {abort.raise} =
   [
-    { key: "written_as", value: Array(json_strings(texts(def_info.row_aliases))) },
+    {
+      key: "written_as",
+      value: Array(json_strings(map(def_info.row_aliases, string_of_bytes_lossy))),
+    },
     {
       key: "performed",
       value: Array(
@@ -345,7 +373,12 @@ fn provenance_fields(def_info: DefInfo) -> List<Member> / {abort.raise} =
     { key: "declared_not_performed", value: Array(json_strings(provenance(def_info).unperformed)) },
   ]
 
-fn definition_json(program: Program, explain: Bool, def_info: DefInfo) -> Json / {abort.raise} = {
+fn definition_json(
+  program: Program,
+  explain: Bool,
+  located: Map<Bytes, Location>,
+  def_info: DefInfo,
+) -> Json / {abort.raise} = {
   let named: List<Member> = [
     { key: "name", value: Str(string_of_bytes_lossy(def_info.name)) },
     { key: "module", value: Str(string_of_bytes_lossy(def_info.module)) },
@@ -355,7 +388,7 @@ fn definition_json(program: Program, explain: Bool, def_info: DefInfo) -> Json /
     { key: "atoms", value: Array(json_strings(atoms_of(def_info.footprint))) },
     { key: "scaling", value: Array(json_strings(atoms_of(def_info.scaling))) },
     { key: "repeats", value: Array(map(def_info.repeats, |i: Int| int(i))) },
-    { key: "ending", value: ending_json(program, def_info) },
+    { key: "ending", value: ending_json(program, located, def_info) },
   ];
   let fields: List<Member> = if !explain { named }
   else { fold(provenance_fields(def_info), named, |acc: List<Member>, f: Member| push(acc, f)) };
@@ -363,7 +396,11 @@ fn definition_json(program: Program, explain: Bool, def_info: DefInfo) -> Json /
 }
 
 // How a definition's calls are known to return; one that may not names the call and where it is.
-fn ending_json(program: Program, def_info: DefInfo) -> Json / {abort.raise} =
+fn ending_json(
+  program: Program,
+  located: Map<Bytes, Location>,
+  def_info: DefInfo,
+) -> Json / {abort.raise} =
   match def_info.ending {
     Ends -> object([{ key: "kind", value: Str("ends") }]),
     Stated -> object([{ key: "kind", value: Str("stated") }]),
@@ -376,16 +413,13 @@ fn ending_json(program: Program, def_info: DefInfo) -> Json / {abort.raise} =
         },
         {
           key: "at",
-          value: match diverging_at(program, def_info) { Some(p) -> Str(p), None -> Null },
+          value: match diverging_at(program, located, def_info) { Some(p) -> Str(p), None -> Null },
         },
         {
           key: "loop",
           value: Array(
-            map(d.loop, |span: Span|
-              match location_of(program, { module: def_info.at.module, span: span }) {
-                Some(p) -> Str(p),
-                None -> Null,
-              }),
+            map(d.loop, |site: Site|
+              match site_at(program, located, site) { Some(p) -> Str(p), None -> Null }),
           ),
         },
       ]),
@@ -431,6 +465,7 @@ fn document(
   warnings: List<Diag>,
 ) -> Json / {abort.raise} = {
   let p: Program = timed.program;
+  let located = locations(defs);
   object([
     { key: "command", value: Str("check") },
     { key: "ok", value: Bool(true) },
@@ -443,7 +478,9 @@ fn document(
     },
     {
       key: "definitions",
-      value: Array(map(defs, |def_info: DefInfo| definition_json(p, flags.explain, def_info))),
+      value: Array(
+        map(defs, |def_info: DefInfo| definition_json(p, flags.explain, located, def_info)),
+      ),
     },
     { key: "tests", value: Array(map(own_tests(p, analysis), test_json)) },
     { key: "effects", value: Array(map(analysis.checked.effects, effect_json)) },
@@ -452,7 +489,7 @@ fn document(
       value: object([
         { key: "phases", value: phases_json(timed) },
         { key: "definitions", value: seeding_json(analysis) },
-        { key: "stubbed", value: Array(json_strings(texts(analysis.stubs))) },
+        { key: "stubbed", value: Array(json_strings(map(analysis.stubs, string_of_bytes_lossy))) },
       ]),
     },
     { key: "diagnostics", value: all_to_json(warnings, p.places) },
