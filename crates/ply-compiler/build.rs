@@ -3,7 +3,7 @@
 use std::path::Path;
 
 /// What `ply bootstrap` writes into `bootstrap/`; a file of another name there is one nothing embeds.
-const WRITTEN: [&str; 2] = ["build.run", "build.digest"];
+const WRITTEN: [&str; 3] = ["build.run", "build.digest", "build.key"];
 
 fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap");
