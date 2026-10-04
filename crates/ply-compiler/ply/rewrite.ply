@@ -8,14 +8,15 @@ import parsing (Span, Ident, QName, ParseDiag, Label, span_to, dummy_span, bare,
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
-              TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures,
+              TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures, SCost,
               EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef, TestDef,
               LawDef, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
               ReturnClause, RecField, expr_span)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt, LStr,
+                 LBool)
 import std.bytes (ascii_of_int)
 
 // --- Shared ---------------------------------------------------------------------
@@ -1460,6 +1461,7 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
           let what = match clause.kind {
             SRequires -> b"a `requires` clause",
             SEnsures -> b"an `ensures` clause",
+            SCost -> b"a `cost` clause",
           };
           let o = sweep(acc.state, clause.expr, Some(not_in_a_function(what)), None);
           {
@@ -1535,6 +1537,7 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
           binders: d.binders,
           guard: g.expr,
           cost: d.cost,
+          costs: d.costs,
           body: b.expr,
           span: d.span,
         }),
@@ -1756,8 +1759,236 @@ pub fn expand(
 ) -> { module: Module, diags: List<ParseDiag> } / {abort.raise} = {
   let tried = if has_try(module) { expand_try(module, diags) }
   else { { module: module, diags: diags } };
-  measured_laws(tried.module, tried.diags)
+  let measured = measured_laws(tried.module, tried.diags);
+  cost_laws(measured.module, measured.diags)
 }
+
+// --- The cost clause ---------------------------------------------------------------------------
+
+// Each `cost` clause is also a cost law over one size, measured where no proof shows the bound:
+// every parameter is made of that size before the call, and only the call is metered. A parameter
+// of a type nothing here makes raises, which leaves the clause to a proof.
+fn cost_laws(module: Module, diags: List<ParseDiag>) -> { module: Module, diags: List<ParseDiag> } = {
+  let made = fold(module.items, [], |acc: List<Item>, item: Item|
+    match item {
+      IFn(d) -> {
+        let bounds = filter(d.spec, |c: SpecClause| c.kind == SCost);
+        concat(
+          acc,
+          map(range(0, len(bounds)), |k: Int|
+            ILaw(cost_law(d, match list_at(bounds, k) { Some(c) -> c, None -> no_cost() }, k))),
+        )
+      },
+      _ -> acc,
+    });
+  if len(made) == 0 { { module: module, diags: diags } } else {
+    let captured = match metered_captured(module) {
+      None -> diags,
+      Some(note) ->
+        fold(made, diags, |acc: List<ParseDiag>, item: Item|
+          match item {
+            ILaw(l) ->
+              push(
+                acc,
+                error_at(
+                  b"E0463",
+                  l.name_span,
+                  b"this `cost` bound cannot be measured",
+                  b"a bound is measured with the builtin `metered`",
+                  [note],
+                ),
+              ),
+            _ -> acc,
+          }),
+    };
+    { module: { ..module, items: concat(module.items, made) }, diags: captured }
+  }
+}
+
+fn no_cost() -> SpecClause = { kind: SCost, expr: EBad({ span: dummy_span() }), span: dummy_span() }
+
+fn cost_law(d: FnDef, clause: SpecClause, k: Int) -> LawDef = {
+  let at = clause.span;
+  let ident = |t: Bytes| { name: t, span: at };
+  let var = |t: Bytes| EVar({ span: at, name: { module: None, name: ident(t), span: at } });
+  let call = |f: Bytes, args: List<Expr>|
+    EApp({ span: at, func: var(f), named: [], args: args, labels: [] });
+  let taken = fold(d.params, [d.name.name], |acc: List<Bytes>, p: Param| push(acc, p.name.name));
+  let size = fresh_name(taken);
+  let made = map(d.params, |p: Param|
+    SLet({
+      span: at,
+      pat: PVar({ span: at, name: p.name }),
+      ty: None,
+      value: made_of(p.ty, var(size), at),
+    }));
+  let steps = EField({
+    span: at,
+    base: call(b"metered", [
+      ELambda({
+        span: at,
+        body: call(d.name.name, map(d.params, |p: Param| var(p.name.name))),
+        params: [],
+        ret: None,
+      }),
+    ]),
+    field: ident(b"steps"),
+  });
+  {
+    name: bytes_concat_all([
+      b"cost of ",
+      d.name.name,
+      if k == 0 { b"" } else { bytes_concat(b" #", ascii_of_int(k + 1)) },
+    ]),
+    name_span: at,
+    host: false,
+    binders: [
+      {
+        name: ident(size),
+        ty: TCon({ span: at, name: { module: None, name: ident(b"Int"), span: at }, args: [] }),
+        span: at,
+      },
+    ],
+    guard: Some(
+      EBinary({ span: at, op: b"gt", lhs: var(size), rhs: ELit({ span: at, lit: LInt(0) }) }),
+    ),
+    cost: Some(EBlock({ span: at, stmts: made, tail: Some(clause.expr) })),
+    costs: Some({ def: d.name, index: k }),
+    body: EBlock({
+      span: at,
+      stmts: made,
+      tail: Some(
+        ERecord({
+          span: at,
+          fields: [
+            { name: ident(b"bound"), value: clause.expr },
+            { name: ident(b"steps"), value: steps },
+          ],
+        }),
+      ),
+    }),
+    span: at,
+  }
+}
+
+// The first of `n`, `n1`, `n2` ... no parameter or the definition is named.
+fn fresh_name(taken: List<Bytes>) -> Bytes =
+  fold(range(0, len(taken) + 1), b"", |found: Bytes, i: Int|
+    if found != b"" { found } else {
+      let name = if i == 0 { b"n" } else { bytes_concat(b"n", ascii_of_int(i)) };
+      if fold(taken, false, |hit: Bool, t: Bytes| hit || t == name) { b"" } else { name }
+    })
+
+// A value of the parameter's type whose size is `size`: an `Int` is it, and a list, a string, bytes
+// or a map holds that many elements.
+fn made_of(ty: Option<TypeExpr>, size: Expr, at: Span) -> Expr =
+  match ty {
+    Some(TCon(t)) -> {
+      let ident = |s: Bytes| { name: s, span: at };
+      let var = |s: Bytes| EVar({ span: at, name: { module: None, name: ident(s), span: at } });
+      let call = |f: Bytes, args: List<Expr>|
+        EApp({ span: at, func: var(f), named: [], args: args, labels: [] });
+      let indices = call(b"range", [ELit({ span: at, lit: LInt(0) }), size]);
+      let each = |body: Expr|
+        ELambda({
+          span: at,
+          body: body,
+          params: [{ name: ident(b"i"), ty: None, default: None, span: at }],
+          ret: None,
+        });
+      let text = call(b"fold", [
+        indices,
+        ELit({ span: at, lit: LStr(b"") }),
+        ELambda({
+          span: at,
+          body: EBinary({
+            span: at,
+            op: b"concat",
+            lhs: var(b"s"),
+            rhs: ELit({ span: at, lit: LStr(b"a") }),
+          }),
+          params: [
+            { name: ident(b"s"), ty: None, default: None, span: at },
+            { name: ident(b"i"), ty: None, default: None, span: at },
+          ],
+          ret: None,
+        }),
+      ]);
+      let name = t.name.name.name;
+      if t.name.module != None { unmade(at) }
+      else if name == b"Int" { size }
+      else if name == b"String" { text }
+      else if name == b"Bytes" { call(b"bytes_of_string", [text]) } else if name == b"List" {
+        match t.args {
+          [elem] -> match element_of(elem, var(b"i"), at) {
+            Some(e) -> call(b"map", [indices, each(e)]),
+            None -> unmade(at),
+          },
+          _ -> unmade(at),
+        }
+      } else if name == b"Map" {
+        match t.args {
+          [key, value] -> match ((
+              element_of(key, var(b"i"), at),
+              element_of(value, var(b"i"), at),
+            )) {
+            (Some(kv), Some(vv)) ->
+              call(b"fold", [
+                indices,
+                call(b"map_new", []),
+                ELambda({
+                  span: at,
+                  body: call(b"map_insert", [var(b"m"), kv, vv]),
+                  params: [
+                    { name: ident(b"m"), ty: None, default: None, span: at },
+                    { name: ident(b"i"), ty: None, default: None, span: at },
+                  ],
+                  ret: None,
+                }),
+              ]),
+            _ -> unmade(at),
+          },
+          _ -> unmade(at),
+        }
+      } else { unmade(at) }
+    },
+    _ -> unmade(at),
+  }
+
+// One element made of its index: a number is it, a string spells it, and a collection is empty.
+fn element_of(ty: TypeExpr, index: Expr, at: Span) -> Option<Expr> = {
+  let var = |s: Bytes|
+    EVar({ span: at, name: { module: None, name: { name: s, span: at }, span: at } });
+  let call = |f: Bytes, args: List<Expr>|
+    EApp({ span: at, func: var(f), named: [], args: args, labels: [] });
+  match ty {
+    TVar(_) -> Some(index),
+    TCon(t) -> if t.name.module != None { None } else {
+      let name = t.name.name.name;
+      if name == b"Int" { Some(index) }
+      else if name == b"String" { Some(call(b"int_to_string", [index])) }
+      else if name == b"Bool" { Some(ELit({ span: at, lit: LBool(true) })) }
+      else if name == b"List" { Some(EList({ span: at, items: [] })) }
+      else if name == b"Map" { Some(call(b"map_new", [])) }
+      else { None }
+    },
+    _ -> None,
+  }
+}
+
+fn unmade(at: Span) -> Expr =
+  EApp({
+    span: at,
+    func: EVar({ span: at, name: { module: None, name: { name: b"panic", span: at }, span: at } }),
+    named: [],
+    args: [
+      ELit({
+        span: at,
+        lit: LStr(b"a `cost` bound is measured only over parameters made of a size"),
+      }),
+    ],
+    labels: [],
+  })
 
 pub fn dump_expanded(src: Bytes) -> String / {abort.raise} = {
   let r = parse(src);
@@ -1772,6 +2003,17 @@ test "a cost law's body is measured with the builtin `metered`, beside its bound
   // `metered` and `steps`, as the dump spells a name.
   assert(string_contains(dumped, "@6d657465726564"));
   assert(string_contains(dumped, "@7374657073"));
+  assert(!string_contains(dumped, "E0463"))
+}
+
+test "each `cost` clause is also a cost law, over a size no parameter is named, that makes each parameter of it" {
+  let dumped = dump_expanded(b"fn f(n: Int, xs: List<Int>) -> Int cost len(xs) cost n = n");
+  assert(string_contains(dumped, "@636f7374206f662066"));
+  assert(string_contains(dumped, "@636f7374206f662066202332"));
+  // `n` is a parameter, so the size is `n1`; `xs` is made with `range` and `map`.
+  assert(string_contains(dumped, "@6e31"));
+  assert(string_contains(dumped, "@72616e6765"));
+  assert(string_contains(dumped, "@6d657465726564"));
   assert(!string_contains(dumped, "E0463"))
 }
 
