@@ -1280,11 +1280,10 @@ answers as it did, and otherwise the test runs again (reason `changed`). A read 
 test wrote first is not an input, and neither is the clock, the network, a program other than
 `ply`, or what a run keeps for the next (`PLY_C_CACHE`, `PLY_C_STAGE`). A `ply` that ended before
 reporting what it read files no pass.
-`--explain` says why each test was selected, what a pass is filed under (the
-test's hash and the runtime stamp, `filed_under` in `--json`, and the code it ran), which of a test's
-atoms are answers this binary gives from what it ships (`shipped`), which no key
-covers (`unkeyed`), and where the run's time went, phase by phase from the
-process's start (`phases` in the `--json` report);
+`--explain` says why each test was selected, naming for a `changed` one the read that moved
+(`moved` in `--json`), what a pass is filed under (the test's hash and the runtime stamp,
+`filed_under` in `--json`, and the code it ran), and where the run's time went, phase by phase
+from the process's start (`phases` in the `--json` report);
 `--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
 any of them matches; `--no-cache` bypasses both the result and the front-end
 cache.
@@ -3433,7 +3432,9 @@ it, a name with no body, a closure or runnable that is not the one these
 definitions make — is `E0443`, as is a build whose closure holds two identical
 declarations it cannot tell apart (two effects, or two members of one recursive
 group); an artifact built by another compiler, or compiled for another runtime,
-is `E0444`: rebuild it with this `ply`.
+is `E0444`: rebuild it with this `ply`. One built against other text of a standard
+library module its definitions are drawn from runs as it was built, and warns
+`W0605`.
 `--config-schema` ships that function too, resolved as a run resolves it: a name
 that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 
