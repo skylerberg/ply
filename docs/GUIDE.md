@@ -840,9 +840,9 @@ fn count(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(re
 
 fn down(n: Int) -> Int = if n <= 0 { 0 } else { down(n - 1) }
 
-fn halves(n: Int) -> Int
-  decreases n
-  = if n <= 1 { 0 } else { 1 + halves(n / 2) }
+fn climb(a: Int, b: Int) -> Int
+  decreases a + b
+  = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }
 ```
 
 The checker reads each recursive group, mutual recursion included, for a
@@ -887,15 +887,22 @@ says why, at the call's place: its own recursion is not seen to descend there,
 or is past what the check follows (a lambda deeper than it reads, or calls that
 compose into more than 10,000 size-change graphs), or it calls there a
 definition, which it names, that may not return. `ply check
---json` gives each definition's `ending`: its `kind` (`ends`, `stated` or
-`diverges`) and, for one that diverges, `through` and `at`.
+--json` gives each definition's `ending`: its `kind` (`ends`, `stated` for one
+that ends by its group's measures, or `diverges`) and, for one that diverges,
+`through` and `at`.
 
 `decreases <measure>`, after the other clauses, states an `Int` over the
-parameters that every call the group makes back into itself lowers while it
-stays non-negative; a group that descends with its stated measures counted is
-read as ending, and the checker takes the measure at its word. It is pure, as a
-clause is (`E0417`), and part of the definition's hash, since it decides what
-the definition is read to do.
+parameters for a descent no one argument makes, as in `climb`: at every call
+the group makes back into itself, the callee's measure at the call's arguments
+lies below the caller's, which is not negative. The checker proves it, as `ply
+prove` proves a claim (§10), over the body and the guards on the way to each
+call, reading the group's calls before that one as values; a group that
+descends with its proved measures counted is read as ending. A measure no proof
+shows is `E0467`, noting where the proof stopped, and so is one on a definition
+the checker sees end without it, which can be deleted. A call into the group
+from a lambda, a region or an arm's guard leaves nothing to prove. A measure is
+pure, as a clause is (`E0417`), and part of the definition's hash, since it
+decides what the definition is read to do.
 
 ## 6. Effects and handlers
 
@@ -1496,7 +1503,7 @@ law "a credit and a matching debit leave an account exactly as it was"
 points, linear `Int` arithmetic, case splits, congruence, constructor
 injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
 induction: a definition that calls only itself, and that the checker reads as
-ending without a `decreases` (§5.10), is unrolled. On an `Int` binder the claim
+ending (§5.10), is unrolled. On an `Int` binder the claim
 is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; on a `List`
 binder at `[]` and then at `[h, ..t]` from itself at `t`, with `len` and `push`
 reduced over the spine in view and `len` known to lie below `i64::MAX`. A definition of another package
@@ -3783,6 +3790,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0464` | cost law whose steps outgrew its bound |
 | `E0465` | an operation a row promises `bounded` that grows with the input |
 | `E0466` | `bounded` outside a definition's own row |
+| `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
