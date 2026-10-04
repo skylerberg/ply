@@ -2314,7 +2314,9 @@ The twin is `MemFs`, with a `mem_` function for every operation (`mem_read`,
 `mem_remove`, `mem_remove_tree`, `mem_rename`, `mem_symlink`, `mem_set_mode`,
 `mem_set_modified`, `mem_sync`, `mem_lock`, `mem_unlock`) and `mem_empty` and
 `mem_of` to start one. It follows a symlink where the host does, a chain of more
-than forty being a loop that names nothing. It holds its owner to a path's
+than forty being a loop that names nothing, and it refuses a path that leaves
+its root as the host does, raising with `E0452`'s words, so a test over the twin
+fails where the same code fails on a disk. It holds its owner to a path's
 owner bits, a fresh file being `rw-r--r--` and a fresh directory `rwxr-xr-x`, so
 a test can make a file unreadable. It has no wall clock, so no lock in it goes
 stale and `mem_temp_dir` names a directory from its prefix and the tree's own
@@ -2841,6 +2843,8 @@ the greatest `k` with `pow(2, k) <= n`, `0` at and below one.
 ```ply
 pub fn first<a>(xs: List<a>) -> Option<a>
 pub fn last<a>(xs: List<a>) -> Option<a>
+pub fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise}
+pub fn at_or<a>(xs: List<a>, i: Int, spare: a) -> a
 pub fn take<a>(xs: List<a>, n: Int) -> List<a>
 pub fn drop<a>(xs: List<a>, n: Int) -> List<a>
 pub fn reverse<a>(xs: List<a>) -> List<a>
@@ -2874,20 +2878,21 @@ and `list_at` — and not the wholes. A `List` is a vector, not a linked list: t
 cheap end is the back, `push` appends and nothing prepends, so every function
 here folds left to right and appends, which is one pass and linear. That is why
 building the same list from the front is a shape to avoid in Ply as well: it
-copies the accumulator every step and is quadratic. `take` and `drop` are the two
-halves of a list (`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks its
+copies the accumulator every step and is quadratic. `at` is the element at an
+index and raises for an index the list does not hold; `at_or` answers a spare
+there instead, and `list_at` an `Option`. `take` and `drop` are the two halves
+of a list (`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks its
 index down while it appends, and `sort` is a merge sort — `n log n` comparisons
 whatever the input order is, and equal elements keep their relative order.
 `sort_by` is the same sort under a caller's `before`, which is how a key sort is
 written. `find` and `find_index` keep the first answer a scan meets. A callback
 may perform effects, as the prelude's `map` and `fold` allow: one given an
 element runs in list order, and `any`, `all`, `find` and `find_index` stop
-calling theirs once the answer is known. `partition`,
-`split_at` and `chunks` divide one list into others and keep the order;
-`flatten` is `flat_map` of the identity, `intersperse` puts its separator
-between the elements, and `unique` keeps each element's first occurrence — its
-membership test is a map's, so it is `n log n` rather than the `n²` a scan
-through the output would be.
+calling theirs once the answer is known. `partition`, `split_at` and `chunks`
+divide one list into others and keep the order; `flatten` is `flat_map` of the
+identity, `intersperse` puts its separator between the elements, and `unique`
+keeps each element's first occurrence — its membership test is a map's, so it is
+`n log n` rather than the `n²` a scan through the output would be.
 
 ### 13.30 `std.map`
 
