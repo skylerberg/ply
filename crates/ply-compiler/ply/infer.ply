@@ -3,7 +3,8 @@
 import parsing (Span, Ident, QName, span_to, dummy_span, int_to_bytes, span_key, push_front,
                 span_bin)
 import std.bin
-import std.list (at, concat, contains, drop, take)
+import std.hash (blake3)
+import std.list (at, sort_by)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
@@ -35,7 +36,8 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text, scheme_text,
               type_text, row_text, Printer, printer_new, printer_naming, print_ty, print_row)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
-                    OtherCallee, Ending, Ends, Diverges, Summary, Verdict, verdict)
+                    OtherCallee, Ending, Ends, Stated, Diverges, Summary, Verdict, verdict,
+                    summary_bin)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, Declared,
                 ModuleEntry, Diag, Label, Edit, Fix, with_fix, insertion, Namespace, ValueSpace,
                 TypeSpace, EffectSpace, resolve_modules, ResolveSucceeded, ResolveFailed, Expanded,
@@ -299,9 +301,11 @@ type GroupOwner = { owner: Bytes, name: Bytes }
 // The label and row variables one recursive group is checked with, taken by every member in order.
 type Shared = { labels: List<Int>, rows: List<Int> }
 
-// The rows the driver hands in for definitions whose hash has not moved, and test footprints, one
-// slot per `test`. The rest of a published interface is the written signature, which is on hand.
+// The rows the driver hands in for a definition, under the check key they were filed with; no key
+// for rows that came with this program's own text, which are taken as they are. The rest of a
+// published interface is the written signature, which is on hand.
 pub type KnownDef = {
+  key: Option<Bytes>,
   footprint: List<Atom>,
   performed: List<Atom>,
   scaling: List<Atom>,
@@ -309,15 +313,27 @@ pub type KnownDef = {
   ending: Ending,
   summary: Summary,
 }
-// `root`: the modules below it are the run's own, whose promises are checked here; a dependency's
-// were checked when its package was.
+pub type KnownTest = { key: Option<Bytes>, footprint: List<Atom> }
+// What a check key is made of besides what the checker publishes: each definition's own form, each
+// test's in the order they are checked, the names each references, and what a name's declaration
+// and written signature say. A body is walked again only when one of these moved, or when what a
+// definition it references published did.
+pub type Keying = {
+  own: Map<Bytes, Bytes>,
+  test_own: List<Bytes>,
+  reads: Map<Bytes, List<Bytes>>,
+  said: Map<Bytes, Bytes>,
+}
+// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own,
+// whose promises are checked here; a dependency's were checked when its package was.
 pub type Known = {
   defs: Map<Bytes, KnownDef>,
-  tests: Map<Bytes, List<Option<List<Atom>>>>,
+  tests: Map<Bytes, List<Option<KnownTest>>>,
   root: Int,
+  keying: Option<Keying>,
 }
 
-pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), root: 1 << 62 }
+pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), root: 1 << 62, keying: None }
 
 type Checker = {
   resolved: Resolved,
@@ -391,6 +407,10 @@ type Checker = {
   seeded: List<Bytes>,
   // The tests published from the rows handed in, by key.
   seeded_tests: List<Bytes>,
+  // What each definition published says to a caller beyond its written signature, as a digest.
+  published: Map<Bytes, Bytes>,
+  checks: List<{ name: Bytes, hash: Bytes }>,
+  test_checks: List<Bytes>,
   assumed: List<Assumed>,
 }
 
@@ -407,6 +427,15 @@ type WithKey = { checker: Checker, key: Option<ValueKey> }
 type WithHit = { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> }
 type WithResource = { checker: Checker, resource: Option<Resource> }
 type WithBodyRow = { checker: Checker, row: Row }
+
+// A group's bodies as its members are taken in turn: each one's row and counts, and the rows it was
+// published from where its body was not walked.
+type Walked = {
+  checker: Checker,
+  rows: List<Row>,
+  counts: List<Count>,
+  filed: List<Option<KnownDef>>,
+}
 
 // What a group member performs a number of times that grows with its input: its atoms, the sites a
 // walk of its body found them at, and the parameters it calls so.
@@ -6609,10 +6638,22 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
     check_component(c, parsed, fns, comp))
 }
 
-fn known_test(checker: Checker, module: Bytes, position: Int) -> Option<List<Atom>> =
+// The footprint handed in for a test, where it came with no key or under the one it has now.
+fn known_test(
+  checker: Checker,
+  module: Bytes,
+  position: Int,
+  check: Option<Bytes>,
+) -> Option<List<Atom>> =
   match map_get(checker.known.tests, module) {
     None -> None,
-    Some(slots) -> match list_at(slots, position) { Some(slot) -> slot, None -> None },
+    Some(slots) -> match list_at(slots, position) {
+      Some(Some(t)) -> match t.key {
+        None -> Some(t.footprint),
+        Some(k) -> if check == Some(k) { Some(t.footprint) } else { None },
+      },
+      _ -> None,
+    },
   }
 
 // An operation atom's mode is its declaration's; a row read back from text does not carry it.
@@ -6631,9 +6672,126 @@ fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
 fn settled_row(checker: Checker, atoms: List<Atom>) -> Row / {abort.raise} =
   { atoms: atoms_sorted(map(atoms, |atom: Atom| settled_atom(checker, atom))), tail: None }
 
-// The rows a definition published last time, where its hash says its body means what it meant then.
-fn seeded_rows(checker: Checker, name: Bytes) -> Option<KnownDef> =
-  map_get(checker.known.defs, name)
+fn check_domain() -> Bytes = b"ply.check.1\0"
+
+fn framed(b: Bytes) -> Bytes = bytes_concat_all([int_to_bytes(bytes_len(b)), b":", b])
+
+// What a caller reads of a definition beyond its written signature: how its calls end, how it calls
+// what it is handed, and what it performs a growing number of times. The row it published is here
+// for a definition that overran an unwritten one, whose callers are checked against the overrun.
+fn published_digest(info: DefInfo) -> Bytes / {abort.raise} =
+  blake3(
+    bytes_concat_all([
+      b"ply.published.1\0",
+      framed(atoms_text(info.footprint, b",")),
+      framed(atoms_text(info.scaling, b",")),
+      framed(bytes_concat_all(map(info.repeats, |i: Int| bytes_concat(int_to_bytes(i), b",")))),
+      match info.ending {
+        Ends -> b"e",
+        Stated -> b"s",
+        Diverges(d) -> match d.through { Some(n) -> bytes_concat(b"t", framed(n)), None -> b"d" },
+      },
+      bin::encode(info.summary, summary_bin()),
+    ]),
+  )
+
+fn publishing(checker: Checker, name: Bytes) -> Checker / {abort.raise} =
+  match ((checker.known.keying, def_of(checker, name))) {
+    (Some(_), Some(info)) ->
+      { ..checker, published: map_insert(checker.published, name, published_digest(info)) },
+    _ -> checker,
+  }
+
+// Everything `names` reference outside `inside`, in the order they mention it, each with what its
+// declaration and written signature say and what it published.
+fn reads_digest(
+  checker: Checker,
+  keying: Keying,
+  names: List<Bytes>,
+  inside: Map<Bytes, Bool>,
+) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    fold(
+      names,
+      { seen: inside, out: [] },
+      |acc: { seen: Map<Bytes, Bool>, out: List<Bytes> }, name: Bytes|
+        fold(
+          match map_get(keying.reads, name) { Some(rs) -> rs, None -> [] },
+          acc,
+          |a: { seen: Map<Bytes, Bool>, out: List<Bytes> }, r: Bytes|
+            if map_contains(a.seen, r) { a } else {
+              {
+                seen: map_insert(a.seen, r, true),
+                out: push(
+                  push(
+                    push(a.out, framed(r)),
+                    framed(match map_get(keying.said, r) { Some(x) -> x, None -> b"" }),
+                  ),
+                  framed(match map_get(checker.published, r) { Some(x) -> x, None -> b"" }),
+                ),
+              }
+            },
+        ),
+    ).out,
+  )
+
+// The key each member of a group's rows are filed under: its own form, every member's, and what
+// the group reads of everything outside it. None where the driver handed in nothing to key by.
+fn group_checks(checker: Checker, members: List<Bytes>) -> List<Option<Bytes>> / {abort.raise} =
+  match checker.known.keying {
+    None -> map(members, |m: Bytes| None),
+    Some(keying) -> {
+      let owns = map(members, |m: Bytes| map_get(keying.own, m));
+      if fold(owns, false, |missing: Bool, o: Option<Bytes>| missing || o == None) {
+        map(members, |m: Bytes| None)
+      } else {
+        let own = map(owns, |o: Option<Bytes>| match o { Some(h) -> h, None -> b"" });
+        let inside = fold(members, map_new(), |acc: Map<Bytes, Bool>, m: Bytes|
+          map_insert(acc, m, true));
+        let group = blake3(
+          bytes_concat_all([
+            check_domain(),
+            bytes_concat_all(
+              sort_by(own, |a: Bytes, b: Bytes|
+                match compare_values(a, b) { Greater -> false, _ -> true }),
+            ),
+            reads_digest(checker, keying, members, inside),
+          ]),
+        );
+        map(own, |o: Bytes| Some(blake3(bytes_concat_all([check_domain(), o, group]))))
+      }
+    },
+  }
+
+// A test's key: its own form and what it reads, which a definition named as the test is among.
+fn test_check(checker: Checker, key: Bytes) -> Option<Bytes> / {abort.raise} =
+  match checker.known.keying {
+    None -> None,
+    Some(keying) -> match list_at(keying.test_own, len(checker.tests)) {
+      None -> None,
+      Some(own) ->
+        Some(
+          blake3(
+            bytes_concat_all([
+              check_domain(),
+              b"test\0",
+              own,
+              reads_digest(checker, keying, [key], map_new()),
+            ]),
+          ),
+        ),
+    },
+  }
+
+// The rows handed in for a definition, where they came with no key or under the one it has now.
+fn seeded_rows(checker: Checker, name: Bytes, check: Option<Bytes>) -> Option<KnownDef> =
+  match map_get(checker.known.defs, name) {
+    None -> None,
+    Some(rows) -> match rows.key {
+      None -> Some(rows),
+      Some(k) -> if check == Some(k) { Some(rows) } else { None },
+    },
+  }
 
 fn binders_text(n: Int, what: Bytes) -> Bytes =
   if n == 0 { bytes_concat_all([b"binds no ", what, b" parameters"]) }
@@ -6797,20 +6955,20 @@ fn check_component(
       push(acc, { name: at(qualified, slot), labels: labels, types: types })
     }),
   };
+  let checks = group_checks(grouped, qualified);
   // A definition whose rows are handed in is published from its written signature and them: the
-  // body is what a walk reads, and the hash the rows came under says the body has not moved. A row
-  // that will not unify is one the caller should never have filed, which is nothing this program's
-  // author can act on, so the body is walked instead: slower, and right whatever the row said.
-  let bodies: { checker: Checker, rows: List<Row>, counts: List<Count> } = fold(
+  // body is what a walk reads, and the key the rows came under says neither it nor what it reads
+  // has moved. A row that will not unify is one the caller should never have filed, which is
+  // nothing this program's author can act on, so the body is walked instead: slower, and right
+  // whatever the row said.
+  let bodies: Walked = fold(
     range(0, len(comp)),
-    { checker: grouped, rows: [], counts: [] },
-    |acc: { checker: Checker, rows: List<Row>, counts: List<Count> }, slot: Int| {
+    { checker: grouped, rows: [], counts: [], filed: [] },
+    |acc: Walked, slot: Int| {
       let def = at(fns, at(comp, slot));
       let sig = at(sigs.sigs, slot);
-      let taken: Option<{ checker: Checker, row: Row, count: Count }> = match seeded_rows(
-          acc.checker,
-          at(qualified, slot),
-        ) {
+      let handed = seeded_rows(acc.checker, at(qualified, slot), at(checks, slot));
+      let taken: Option<{ checker: Checker, row: Row, count: Count }> = match handed {
         None -> None,
         Some(rows) -> {
           // The rows handed in carry atoms alone; a row ends in what the signature writes, the
@@ -6879,6 +7037,7 @@ fn check_component(
         checker: record_spec_env(tagged, def, at(qualified, slot), sig),
         rows: push(acc.rows, stepped.row),
         counts: push(acc.counts, stepped.count),
+        filed: push(acc.filed, match taken { Some(_) -> handed, None -> None }),
       }
     },
   );
@@ -6891,8 +7050,7 @@ fn check_component(
   });
   // A definition published from its filed rows answers what it was filed with: its body may be a
   // stub's blank.
-  let filed: List<Option<KnownDef>> = map(range(0, len(comp)), |slot: Int|
-    seeded_rows(bodies.checker, at(qualified, slot)));
+  let filed = bodies.filed;
   let ending_of = |slot: Int| match at(filed, slot) { Some(k) -> k.ending, None -> read.ending };
   let summary_of = |slot: Int|
     match at(filed, slot) { Some(k) -> k.summary, None -> at(read.summaries, slot) };
@@ -6980,7 +7138,14 @@ fn check_component(
       },
     )
   });
-  group_witnesses(published)
+  let keyed: Checker = fold(range(0, len(comp)), published, |c: Checker, slot: Int| {
+    let said: Checker = publishing(c, at(qualified, slot));
+    match at(checks, slot) {
+      Some(k) -> { ..said, checks: push(said.checks, { name: at(qualified, slot), hash: k }) },
+      None -> said,
+    }
+  });
+  group_witnesses(keyed)
 }
 
 // A call to a member of the group just walked passes the witnesses the member now has an order
@@ -7964,7 +8129,8 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
       match item {
         ITest(def) -> {
           let c: Checker = { ..acc.checker, scope: acc.checker.scope + 1 };
-          let footprint: WithAtoms = match known_test(c, parsed.name, acc.position) {
+          let check = test_check(c, qualify(parsed.name, def.name));
+          let footprint: WithAtoms = match known_test(c, parsed.name, acc.position, check) {
             Some(cached) ->
               {
                 checker: {
@@ -8007,6 +8173,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                 footprint: footprint.atoms,
                 at: location_of(checked, def.span),
               }),
+              test_checks: push(checked.test_checks, match check { Some(k) -> k, None -> b"" }),
             },
             position: acc.position + 1,
           }
@@ -10378,6 +10545,9 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     known: known,
     seeded: [],
     seeded_tests: [],
+    published: map_new(),
+    checks: [],
+    test_checks: [],
     assumed: [],
   })
 
@@ -10415,6 +10585,10 @@ pub type CheckOutput = {
   seeded: List<Bytes>,
   // The same for tests, by key.
   seeded_tests: List<Bytes>,
+  // The check key of each definition the driver handed a keying for, and of each test in `tests`'
+  // order: what its rows are filed under.
+  checks: List<{ name: Bytes, hash: Bytes }>,
+  test_checks: List<Bytes>,
   // What the emitter reads of the bodies walked, so a body it lowers is not walked again.
   facts: EmitFacts,
 }
@@ -10439,6 +10613,8 @@ pub fn check_front_with(
     ctors: out.checker.ctors,
     seeded: out.checker.seeded,
     seeded_tests: out.checker.seeded_tests,
+    checks: out.checker.checks,
+    test_checks: out.checker.test_checks,
     facts: facts_of(out.checker),
   }
 }
@@ -10876,6 +11052,7 @@ fn dump_outcome(out: Checked) -> Bytes / {abort.raise} =
 fn known_of(checker: Checker) -> Known / {abort.raise} = {
   let defs = fold(checker.defs, map_new(), |acc: Map<Bytes, KnownDef>, def_info: DefInfo|
     map_insert(acc, def_info.name, {
+      key: None,
       footprint: def_info.footprint,
       performed: def_info.performed,
       scaling: def_info.scaling,
@@ -10887,21 +11064,27 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
   let walked = fold(
     checker.modules,
     { next: 0, tests: map_new() },
-    |acc: { next: Int, tests: Map<Bytes, List<Option<List<Atom>>>> }, parsed: ParsedModule| {
+    |acc: { next: Int, tests: Map<Bytes, List<Option<KnownTest>>> }, parsed: ParsedModule| {
       let slots = fold(
         parsed.module.items,
         { next: acc.next, slots: [] },
-        |a: { next: Int, slots: List<Option<List<Atom>>> }, item: Item|
+        |a: { next: Int, slots: List<Option<KnownTest>> }, item: Item|
           match item {
             ITest(_) ->
-              { next: a.next + 1, slots: push(a.slots, Some(at(checker.tests, a.next).footprint)) },
+              {
+                next: a.next + 1,
+                slots: push(
+                  a.slots,
+                  Some({ key: None, footprint: at(checker.tests, a.next).footprint }),
+                ),
+              },
             _ -> a,
           },
       );
       { next: slots.next, tests: map_insert(acc.tests, parsed.name, slots.slots) }
     },
   );
-  { defs: defs, tests: walked.tests, root: checker.known.root }
+  { defs: defs, tests: walked.tests, root: checker.known.root, keying: None }
 }
 
 // The program checked twice, the second time from what the first published.
