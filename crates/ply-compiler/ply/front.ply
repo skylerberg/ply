@@ -25,9 +25,11 @@ import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOut
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, Prior, Rehash, Rehashed,
              rehash_index)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
-              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, elaborated, ended,
-              elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
-              builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts)
+              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
+              WitnessOrder, facts_by_owner, filed_facts, foreign_facts, no_root_facts,
+              root_facts_bin, test_owner, witness_order_bin, elaborated, ended, elaboration_with,
+              updated_mods, check_front_with, is_prelude_effect, Builtin, builtins, published_pure,
+              measure_ty, EmitFacts, emit_facts_bin, written_counts)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
@@ -1274,12 +1276,17 @@ pub type KnownDefRow = {
   // Whether its calls end and how it calls what it is handed, which a stub's blank body cannot say.
   ending: Ending,
   summary: Summary,
+  // What the emitter reads of its body, as `filed_facts` writes it.
+  facts: Bytes,
 }
+// `owner` is the test as the checker files its sites: its module and its place among the module's.
 pub type KnownTestRow = {
   key: Bytes,
   hash: Bytes,
   effect_hashes: List<EffectHash>,
   footprint: Bytes,
+  owner: Bytes,
+  facts: Bytes,
 }
 
 fn still_hashed(now: Map<Bytes, Bytes>, name: Bytes, was: Bytes) -> Bool =
@@ -1294,7 +1301,7 @@ type Taking = | TakeWhole | TakeKeyed | TakeNone
 
 fn known_defs(
   rows: List<KnownDefRow>,
-  taking: (KnownDefRow) -> Taking,
+  taking: (KnownDefRow) -> Taking / {abort.raise},
 ) -> Map<Bytes, KnownDef> / {abort.raise} =
   fold(rows, map_new(), |acc: Map<Bytes, KnownDef>, row: KnownDefRow| {
     let how = taking(row);
@@ -1309,6 +1316,7 @@ fn known_defs(
             repeats: row.repeats,
             ending: row.ending,
             summary: row.summary,
+            facts: row.facts,
           }),
         _ -> acc,
       }
@@ -1319,7 +1327,7 @@ fn known_defs(
 fn known_tests(
   mods: List<ParsedModule>,
   rows: List<KnownTestRow>,
-  taking: (KnownTestRow) -> Taking,
+  taking: (KnownTestRow) -> Taking / {abort.raise},
 ) -> Map<Bytes, List<Option<KnownTest>>> / {abort.raise} = {
   let by_key = fold(rows, map_new(), |acc: Map<Bytes, KnownTestRow>, r: KnownTestRow|
     map_insert(acc, r.key, r));
@@ -1341,6 +1349,7 @@ fn known_tests(
                       Some({
                         key: if how == TakeWhole { None } else { Some(r.hash) },
                         footprint: atoms,
+                        facts: r.facts,
                       }),
                   }
                 }
@@ -1375,29 +1384,65 @@ fn known_from_rows(
   tests: List<KnownTestRow>,
   root: Int,
   fixed: List<Fixed>,
+  texts: List<Bytes>,
 ) -> Known / {abort.raise} = {
   let decls = by_name_one(hashes.decls);
   let held = fold(fixed, map_new(), |acc: Map<Bytes, Bytes>, f: Fixed|
     if f.decl { acc } else { map_insert(acc, f.name, f.hash) });
+  let written = layouts(mods, texts);
   {
+    // A body that holds a foreign site is filed by where another module's text stands, which a
+    // key does not say: it is taken only with a stub, which stands while both texts do.
     defs: known_defs(defs, |row: KnownDefRow|
       if !effect_hashes_hold(decls, row.effect_hashes) { TakeNone } else {
         match map_get(held, row.name) {
           Some(h) -> if h == row.hash { TakeWhole } else { TakeNone },
-          None -> TakeKeyed,
+          None -> if foreign_facts(row.facts) { TakeNone } else { TakeKeyed },
         }
       }),
     tests: known_tests(mods, tests, |row: KnownTestRow|
-      if effect_hashes_hold(decls, row.effect_hashes) { TakeKeyed } else { TakeNone }),
+      if effect_hashes_hold(decls, row.effect_hashes) && !foreign_facts(row.facts) { TakeKeyed }
+      else { TakeNone }),
     root: root,
     keying: Some({
       own: by_name_one(hashes.own),
       test_own: hashes.test_texts,
+      layout: written.defs,
+      test_layout: written.tests,
       reads: by_name_names(hashes.deps),
       said: said_of(hashes),
     }),
   }
 }
+
+// The text each definition and each test is written as, digested: a definition's by its name, a
+// test's in the order the tests are checked. A module with no text here has none.
+fn layouts(
+  mods: List<ParsedModule>,
+  texts: List<Bytes>,
+) -> { defs: Map<Bytes, Bytes>, tests: List<Bytes> } / {abort.raise} =
+  fold(
+    range(0, len(mods)),
+    { defs: map_new(), tests: [] },
+    |acc: { defs: Map<Bytes, Bytes>, tests: List<Bytes> }, i: Int| {
+      let parsed = at(mods, i);
+      let text = match list_at(texts, i) { Some(t) -> t, None -> b"" };
+      let written = |span: Span|
+        if span.start < 0 || span.end > bytes_len(text) || span.start > span.end { b"" }
+        else { blake3(bytes_slice(text, span.start, span.end)) };
+      fold(
+        parsed.module.items,
+        acc,
+        |a: { defs: Map<Bytes, Bytes>, tests: List<Bytes> }, item: Item|
+          match item {
+            IFn(d) ->
+              { ..a, defs: map_insert(a.defs, qualify(parsed.name, d.name.name), written(d.span)) },
+            ITest(d) -> { ..a, tests: push(a.tests, written(d.span)) },
+            _ -> a,
+          },
+      )
+    },
+  )
 
 // An analysis's own rows, as a second check of the same program takes them: nothing is keyed.
 fn known_own(mods: List<ParsedModule>, rows: Rows, root: Int) -> Known / {abort.raise} =
@@ -1430,6 +1475,7 @@ fn def_known_row(
   decls: Map<Bytes, Bytes>,
   def_info: DefInfo,
   hash: Bytes,
+  read: BodiesRead,
 ) -> KnownDefRow / {abort.raise} =
   {
     name: def_info.name,
@@ -1441,19 +1487,58 @@ fn def_known_row(
     repeats: def_info.repeats,
     ending: def_info.ending,
     summary: def_info.summary,
+    facts: facts_filed(read, def_info.name, def_info.at.span),
   }
 
 fn test_known_row(
   decls: Map<Bytes, Bytes>,
   test_info: TestInfo,
   hash: Bytes,
+  owner: Bytes,
+  read: BodiesRead,
 ) -> KnownTestRow / {abort.raise} =
   {
     key: test_info.key,
     hash: hash,
     effect_hashes: row_effect_hashes(decls, test_info.footprint),
     footprint: atoms_text(test_info.footprint, b","),
+    owner: owner,
+    facts: facts_filed(read, owner, test_info.at.span),
   }
+
+// What the emitter reads of each body: what the rows a body was published from held, and what a
+// walk of the rest recorded.
+type BodiesRead = { kept: Map<Bytes, Bytes>, walked: Map<Bytes, RootFacts> }
+
+fn bodies_read(checked: CheckOutput) -> BodiesRead =
+  {
+    kept: fold(checked.kept, map_new(), |acc: Map<Bytes, Bytes>, k: KeptFacts|
+      map_insert(acc, k.name, k.facts)),
+    walked: facts_by_owner(checked.facts),
+  }
+
+// One body's facts as its row files them: the bytes its last row held where it was published from
+// that, else what this walk recorded, counted from where its definition starts.
+fn facts_filed(read: BodiesRead, owner: Bytes, at: Span) -> Bytes / {abort.raise} =
+  match map_get(read.kept, owner) {
+    Some(filed) -> filed,
+    None ->
+      filed_facts(match map_get(read.walked, owner) { Some(f) -> f, None -> no_root_facts() }, at),
+  }
+
+// Each test's owner, in the order the tests were checked.
+fn test_owners(tests: List<TestInfo>) -> List<Bytes> =
+  fold(
+    tests,
+    { seen: map_new(), out: [] },
+    |acc: { seen: Map<Bytes, Int>, out: List<Bytes> }, t: TestInfo| {
+      let position = match map_get(acc.seen, t.module) { Some(n) -> n, None -> 0 };
+      {
+        seen: map_insert(acc.seen, t.module, position + 1),
+        out: push(acc.out, test_owner(t.module, position)),
+      }
+    },
+  ).out
 
 pub type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow> }
 
@@ -1463,32 +1548,28 @@ pub fn no_rows() -> Rows = { defs: [], tests: [] }
 pub fn rows_of(analysis: Analysis) -> Rows / {abort.raise} =
   rows_from(analysis.checked, analysis.hashes)
 
-// The modules the checker walked whole, by name, and what it read of every body it walked, its
-// module indices into `modules`.
-pub type WalkedFacts = { modules: List<Bytes>, whole: List<Bytes>, facts: EmitFacts }
+// What the emitter reads of a checked program beyond each body's own row: the definitions
+// published pure, each definition's witness order, and the sites of what is walked afresh every
+// time, a clause or a law. Module indices are into `modules`.
+pub type WalkedFacts = {
+  modules: List<Bytes>,
+  pure: List<Bytes>,
+  orders: List<WitnessOrder>,
+  loose: RootFacts,
+}
 
 derive bin for WalkedFacts
 
-fn walked_of(mods: List<ParsedModule>, checked: CheckOutput) -> WalkedFacts = {
-  let named = |xs: List<Bytes>|
-    fold(xs, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
-  let seeded = named(checked.seeded);
-  let seeded_tests = named(checked.seeded_tests);
-  let whole = |parsed: ParsedModule|
-    fold(parsed.module.items, true, |acc: Bool, item: Item|
-      acc
-        && (match item {
-          IFn(d) -> !map_contains(seeded, qualify(parsed.name, d.name.name)),
-          ITest(d) -> !map_contains(seeded_tests, qualify(parsed.name, d.name)),
-          _ -> true,
-        }));
+fn walked_of(mods: List<ParsedModule>, checked: CheckOutput) -> WalkedFacts =
   {
     modules: map(mods, |parsed: ParsedModule| parsed.name),
-    whole: fold(mods, [], |acc: List<Bytes>, parsed: ParsedModule|
-      if whole(parsed) { push(acc, parsed.name) } else { acc }),
-    facts: checked.facts,
+    pure: checked.facts.pure,
+    orders: checked.facts.elaboration.orders,
+    loose: match map_get(facts_by_owner(checked.facts), b"") {
+      Some(f) -> f,
+      None -> no_root_facts(),
+    },
   }
-}
 
 // What each definition's rows are filed under: the check key the checker gave it, and its hash
 // where the checker had nothing to key it by.
@@ -1509,14 +1590,22 @@ fn test_check_key(checked: CheckOutput, hashes: HashOutput, i: Int) -> Bytes / {
 fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.raise} = {
   let keyed = check_keys(checked, hashes);
   let decls = by_name_one(hashes.decls);
+  let read = bodies_read(checked);
+  let owners = test_owners(checked.tests);
   {
     defs: fold(checked.defs, [], |acc: List<KnownDefRow>, def_info: DefInfo|
       match map_get(keyed, def_info.name) {
-        Some(x) -> push(acc, def_known_row(decls, def_info, x)),
+        Some(x) -> push(acc, def_known_row(decls, def_info, x, read)),
         None -> acc,
       }),
     tests: map(range(0, len(checked.tests)), |i: Int|
-      test_known_row(decls, at(checked.tests, i), test_check_key(checked, hashes, i))),
+      test_known_row(
+        decls,
+        at(checked.tests, i),
+        test_check_key(checked, hashes, i),
+        at(owners, i),
+        read,
+      )),
   }
 }
 
@@ -1705,7 +1794,7 @@ fn module_entries(f: Filers, parsed: ParsedModule) -> List<FiledEntry> = {
 fn tests_by_module(
   checked: CheckOutput,
   hashes: HashOutput,
-  decls: Map<Bytes, Bytes>,
+  rows: List<KnownTestRow>,
 ) -> Map<Bytes, List<FiledTest>> / {abort.raise} =
   fold(range(0, len(checked.tests)), map_new(), |acc: Map<Bytes, List<FiledTest>>, i: Int| {
     let t = at(checked.tests, i);
@@ -1714,7 +1803,7 @@ fn tests_by_module(
       hash: at(hashes.tests, i),
       nondet: t.nondet,
       span: filed_span(t.at.span),
-      row: test_known_row(decls, t, test_check_key(checked, hashes, i)),
+      row: at(rows, i),
     };
     map_insert(
       acc,
@@ -1782,7 +1871,10 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
     checked: checked,
     decls: decls,
   };
-  let tests = tests_by_module(analysis.checked, analysis.hashes, decls);
+  let rows = rows_of(analysis);
+  let row_of = fold(rows.defs, map_new(), |acc: Map<Bytes, KnownDefRow>, row: KnownDefRow|
+    map_insert(acc, row.name, row));
+  let tests = tests_by_module(analysis.checked, analysis.hashes, rows.tests);
   let typed = fold(types, [], |acc: List<FiledDecl>, t: TypeRow|
     match map_get(decls, t.name) {
       None -> acc,
@@ -1813,16 +1905,17 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
     // A definition's interface holds while its check key does, which a body edit leaves alone
     // wherever what the edited definition publishes does not move.
     defs: fold(analysis.checked.defs, [], |acc: List<FiledDef>, def_info: DefInfo|
-      match ((map_get(hashed, def_info.name), map_get(checked, def_info.name))) {
-        (Some(h), Some(k)) ->
+      match ((
+          map_get(hashed, def_info.name),
+          map_get(checked, def_info.name),
+          map_get(row_of, def_info.name),
+        )) {
+        (Some(h), Some(k), Some(row)) ->
           push(acc, {
             name: def_info.name,
             hash: h,
             check: k,
-            interface: {
-              row: def_known_row(decls, def_info, k),
-              scheme: scheme_text(def_info.scheme),
-            },
+            interface: { row: row, scheme: scheme_text(def_info.scheme) },
           }),
         _ -> acc,
       }),
@@ -1883,7 +1976,7 @@ pub fn analyse_with(
   let clo = closure(pkgs, map(parsed, |p: ParsedSource| p.name));
   let stubs = stubbed(ifaces);
   let all = fold(clo.modules, parsed, |acc: List<ParsedSource>, m: { pkg: Int, src: Source }|
-    push(acc, parse_at(len(acc), read_as(stubs, m.src))));
+    push(acc, { ..parse_at(len(acc), read_as(stubs, m.src)), src: m.src.src }));
   // The toolchain's own tree loads without its implicit self; this path has no shelf list to
   // check the coverage half of that against, and only the toolchain's listings use it.
   let toolchain = fold(parsed, true, |acc: Bool, p: ParsedSource| acc && is_std(p.name));
@@ -1991,6 +2084,8 @@ pub type Hashed = {
   root_count: Int,
   ifaces: Interfaces,
   embeds: List<EmbedAt>,
+  // Each module's text as its source holds it, a stub's too.
+  texts: List<Bytes>,
 }
 
 fn hashed_closure(
@@ -2050,6 +2145,7 @@ fn hashed_closure(
               root_count: root_count,
               ifaces: ifaces,
               embeds: embeds,
+              texts: map(parsed, |p: ParsedSource| p.src),
             })
           }
         },
@@ -2066,7 +2162,7 @@ fn checked_closure(
   let checked: CheckOutput = check_front_with(
     h.r,
     h.mods,
-    known_from_rows(h.mods, h.hashes, defs, tests, h.root_count, h.ifaces.fixed),
+    known_from_rows(h.mods, h.hashes, defs, tests, h.root_count, h.ifaces.fixed, h.texts),
   );
   if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
     Analysed({
@@ -2710,8 +2806,8 @@ fn shelf_embedded(
   index: Int,
   source: Source,
 ) -> { parsed: ParsedSource, embeds: List<EmbedAt> } / {abort.raise} = {
-  let p = parse_at(index, source);
   let text = match map_get(whole, source.name) { Some(t) -> t, None -> source.src };
+  let p = { ..parse_at(index, source), src: text };
   if !names_embed(text) { { parsed: p, embeds: [] } } else {
     let wants = if text == source.src { wants_of(p.module.module) }
     else { wants_of(parse(text).node) };
@@ -2767,7 +2863,7 @@ pub fn staged_pulling_std_with(
     clo.modules,
     parse_all(user),
     |acc: List<ParsedSource>, m: { pkg: Int, src: Source }|
-      push(acc, parse_at(len(acc), read_as(stubs, m.src))),
+      push(acc, { ..parse_at(len(acc), read_as(stubs, m.src)), src: m.src.src }),
   );
   let mentions = concat(
     map(user, |s: Source| names_embed(s.src)),
@@ -3588,8 +3684,16 @@ fn def_hashes(d: Dump) -> List<{ name: Bytes, def: Option<Bytes> }> =
 test "a row alias and its expansion are one program: the same hashes, bodies and rows" {
   let aliased = rows_written_as(b"Io");
   let expanded = rows_written_as(b"log.write");
-  // The published rows, each under its definition's hash.
-  assert_eq(rows_of(analysis_of(aliased)), rows_of(analysis_of(expanded)));
+  // The published rows; the key a row is filed under and what it files of its body are by the
+  // text the definition is written as.
+  let published = |sources: List<Source>| {
+    let rows = rows_of(analysis_of(sources));
+    {
+      defs: map(rows.defs, |row: KnownDefRow| { ..row, hash: b"", facts: b"" }),
+      tests: map(rows.tests, |row: KnownTestRow| { ..row, hash: b"", facts: b"" }),
+    }
+  };
+  assert_eq(published(aliased), published(expanded));
   let a = dump_of(analyse(parse_all(aliased)));
   let e = dump_of(analyse(parse_all(expanded)));
   assert_eq(def_hashes(a), def_hashes(e));
@@ -4121,6 +4225,7 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> / {abort.raise} =
           repeats: [],
           ending: Ends,
           summary: unknown_summary(),
+          facts: filed_facts(no_root_facts(), { start: 0, end: 0 }),
         })
     },
   }
