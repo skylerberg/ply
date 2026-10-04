@@ -4,19 +4,34 @@ mod toolchain;
 
 use crate::fixture;
 
+use ply_codegen::c::exports::HelperShape;
 use ply_codegen::c::tables::{BUCKETS, bucket_of};
 use ply_codegen::c::{
-    HELPERS, Native, PRELUDE, RUNTIME_MARK, compile_and_load, helper_addresses, runtime_header,
+    Native, PRELUDE, RUNTIME_MARK, builtin_helper_name, compile_and_load, helpers, runtime_header,
     runtime_object, split,
 };
 
 /// A declaration with no address is a null call at run time: a crash rather than a decline.
 #[test]
 fn every_declared_helper_has_an_address() {
-    let addrs = helper_addresses();
-    assert_eq!(addrs.len(), HELPERS.len());
-    for (h, a) in HELPERS.iter().zip(&addrs) {
-        assert!(!a.is_null(), "`{}` has no address", h.name);
+    for h in helpers() {
+        assert!(!h.address.is_null(), "`{}` has no address", h.name);
+    }
+}
+
+/// A builtin's helper takes the words a call of it passes, under the name the emitter writes.
+#[test]
+fn every_builtin_has_a_helper_of_its_own() {
+    for b in ply_eval::Builtin::all() {
+        let name = builtin_helper_name(b.name());
+        assert!(
+            name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
+            "`{name}` is no C name"
+        );
+        let found: Vec<_> = helpers().iter().filter(|h| h.name == name).collect();
+        assert_eq!(found.len(), 1, "`{name}`");
+        assert_eq!(found[0].args, b.arity(), "`{name}`");
+        assert!(found[0].answers, "`{name}`");
     }
 }
 
@@ -75,7 +90,10 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
     let bind = lib.symbol("ply_bind").expect("the unit exports `ply_bind`");
     let bind: unsafe extern "C" fn(*const *mut std::ffi::c_void) =
         unsafe { std::mem::transmute(bind) };
-    let addrs = helper_addresses();
+    let addrs: Vec<*mut std::ffi::c_void> = helpers()
+        .iter()
+        .map(|h| h.address as *mut std::ffi::c_void)
+        .collect();
     unsafe { bind(addrs.as_ptr()) };
     let probe = lib
         .symbol("ply_probe")
@@ -216,7 +234,7 @@ fn built(text: &str) -> Option<Native> {
 }
 
 /// What a unit says about itself reads back from its text as it was embedded, so whether it serves
-/// this runtime is known before anything is compiled.
+/// this runtime is known before anything is compiled: its helpers bind by name, in its own order.
 #[test]
 fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
     let produced = produced_of(&[(
@@ -226,24 +244,45 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
     )]);
     let read = ply_codegen::c::Exports::from_text(&produced.text).expect("the table reads back");
     assert_eq!(read.encode(), produced.exports.encode());
-    assert!(read.unserved().is_none());
-    // A table whose first helper this runtime does not have is one that does not serve.
-    let first = &produced.exports.helpers[0].name;
-    let head = produced
-        .text
-        .rfind("const char ply_exports[] =")
-        .expect("the unit embeds its table");
-    let (code, table) = produced.text.split_at(head);
-    let foreign = format!(
-        "{code}{}",
-        table.replacen(
-            &format!("\"{first} "),
-            &format!("\"{first}_from_elsewhere "),
-            1
-        )
+    let bound = read
+        .bound(&produced.text)
+        .expect("the unit serves this runtime");
+    for (helper, address) in read.helpers.iter().zip(&bound) {
+        let runtime = helpers()
+            .iter()
+            .find(|h| h.name == helper.name)
+            .expect("the runtime has every helper it handed the emitter");
+        assert_eq!(*address as *const (), runtime.address, "`{}`", helper.name);
+    }
+    // A helper this runtime does not have binds to nothing while the unit's C never calls it.
+    let mut retired = read.clone();
+    retired.helpers.push(HelperShape {
+        name: "rt_retired".to_string(),
+        args: 1,
+        answers: true,
+    });
+    let bound = retired
+        .bound(&produced.text)
+        .expect("a helper nothing calls is no reason to refuse the unit");
+    assert!(bound.last().is_some_and(|address| address.is_null()));
+    let calling = format!(
+        "{}\nWord gone(PlyCtx *ctx) {{ return rt_retired_p(ctx, 0); }}\n",
+        produced.text
     );
-    let read = ply_codegen::c::Exports::from_text(&foreign).expect("the table still reads");
-    assert!(read.unserved().is_some());
+    let refused = retired
+        .bound(&calling)
+        .expect_err("a unit that calls what the runtime lacks does not serve it");
+    assert!(refused.to_string().contains("`rt_retired`"), "{refused}");
+    // One the runtime has under another shape is another helper.
+    let mut reshaped = read.clone();
+    reshaped.helpers[0].args += 1;
+    let refused = reshaped
+        .bound(&produced.text)
+        .expect_err("a helper taking other words is not the one the unit was emitted against");
+    assert!(
+        refused.to_string().contains(&reshaped.helpers[0].name),
+        "{refused}"
+    );
     assert!(ply_codegen::c::Exports::from_text("int main(void) { return 0; }").is_none());
 }
 
@@ -729,7 +768,7 @@ pub fn wrap(n: Int) -> List<Bytes> / {abort.raise} = [byte_of_int(n)]
         &numbering_support::symbol(&produced, "m.wrap"),
     );
     assert!(
-        text.contains("rt_byte_of_int_p") && text.contains("rt_list_p"),
+        text.contains("builtin_byte_of_int_p") && text.contains("rt_list_p"),
         "the body no longer has the shape this test is about:\n{text}"
     );
     assert_eq!(

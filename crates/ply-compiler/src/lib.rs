@@ -44,6 +44,9 @@ pub const COSTS: &str = include_str!("../ply/costs.ply");
 /// The `.plyx` container: the header, the section table, and what a program digest covers.
 pub const PLYX: &str = include_str!("../ply/plyx.ply");
 
+/// The one module that embeds [`PRELUDE`], kept small: a load reads it whole to learn that.
+pub const PRELUDE_SOURCE: &str = include_str!("../ply/prelude_source.ply");
+
 pub const EMIT: &str = include_str!("../ply/emit.ply");
 
 /// `embed` and `embed_dir`, written out as the literals the driver read for them.
@@ -83,6 +86,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("patterns", PATTERNS),
     ("pkg", PKG),
     ("plyx", PLYX),
+    ("prelude_source", PRELUDE_SOURCE),
     ("resolve", RESOLVE),
     ("rewrite", REWRITE),
     ("termination", TERMINATION),
@@ -94,6 +98,13 @@ pub const MODULES: &[(&str, &str)] = &[
 pub fn sources() -> impl Iterator<Item = (&'static str, &'static str)> {
     MODULES.iter().copied()
 }
+
+/// The builtins, declared: `prelude_source` embeds it from beside the package, so it is no module.
+pub const PRELUDE: &str = include_str!("../prelude.ply");
+
+/// The name [`PRELUDE`] is shelved under, beside [`MODULES`]: what lies beside a shipped package
+/// is held under the package's root.
+pub const PRELUDE_NAME: &str = "prelude";
 
 /// The builder `ply bootstrap` last wrote for this compiler: the runnable the launcher enters.
 pub mod bootstrap {

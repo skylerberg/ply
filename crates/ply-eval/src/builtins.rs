@@ -17,696 +17,241 @@ pub const MAX_ARRAY_LEN: i64 = 1 << 26;
 
 /// `Decimal`'s scale bound, the type's rather than a policy.
 const MAX_DECIMAL_SCALE: u32 = 28;
+/// Every builtin, once: its name in the prelude, the words a call passes, and whether a failure of
+/// it is a raise of `abort.raise`, which the prelude's scheme for it carries in its row and a
+/// `handle` answers (`raises`), or a fault that ends the run (`ends`).
+macro_rules! builtins {
+    ($d:tt $( $(#[$doc:meta])* $variant:ident = $name:literal, $arity:tt, $failure:ident; )*) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum Builtin {
+            $( $(#[$doc])* $variant, )*
+        }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Builtin {
-    Assert,
-    AssertEq,
-    Len,
-    Push,
-    ListAt,
+        impl Builtin {
+            pub fn raises(self) -> bool {
+                match self {
+                    $( Builtin::$variant => builtins!(@raises $failure), )*
+                }
+            }
+
+            pub fn from_name(name: &str) -> Option<Builtin> {
+                match name {
+                    $( $name => Some(Builtin::$variant), )*
+                    _ => None,
+                }
+            }
+
+            pub fn name(self) -> &'static str {
+                match self {
+                    $( Builtin::$variant => $name, )*
+                }
+            }
+
+            /// The words a call passes.
+            pub fn arity(self) -> usize {
+                match self {
+                    $( Builtin::$variant => $arity, )*
+                }
+            }
+
+            pub fn all() -> &'static [Builtin] {
+                &[ $( Builtin::$variant, )* ]
+            }
+        }
+
+        /// Hands `$m` every builtin as `Variant "name" arity;`: what is made one per builtin is
+        /// made from this table.
+        #[macro_export]
+        macro_rules! each_builtin {
+            ($d m:ident) => {
+                $d m! { $( $variant $name $arity; )* }
+            };
+        }
+    };
+    (@raises raises) => { true };
+    (@raises ends) => { false };
+}
+
+builtins! { $
+    Assert = "assert", 2, raises;
+    AssertEq = "assert_eq", 2, raises;
+    Len = "len", 1, ends;
+    Push = "push", 2, ends;
+    ListAt = "list_at", 2, ends;
     /// One element replaced, sharing the rest; raises where `list_at` answers `None`.
-    ListSet,
-    Map,
-    Filter,
-    Fold,
-    Iterate,
-    Metered,
-    Range,
-    WrapAdd,
-    WrapSub,
-    WrapMul,
+    ListSet = "list_set", 3, raises;
+    Map = "map", 2, ends;
+    Filter = "filter", 2, ends;
+    Fold = "fold", 3, ends;
+    Iterate = "iterate", 3, raises;
+    Metered = "metered", 1, ends;
+    Range = "range", 2, ends;
+    WrapAdd = "wrap_add", 2, ends;
+    WrapSub = "wrap_sub", 2, ends;
+    WrapMul = "wrap_mul", 2, ends;
     /// The low thirty-two bits of an `Int`, rotated right.
-    Rotr32,
-    Rotr,
+    Rotr32 = "rotr32", 2, ends;
+    Rotr = "rotr", 2, ends;
     // Field-less rather than carrying an `IntTy`: the enum is cast to a per-builtin cache index.
-    U8OfInt,
-    U16OfInt,
-    U32OfInt,
-    U64OfInt,
-    I8OfInt,
-    I16OfInt,
-    I32OfInt,
-    I64OfInt,
-    IntOfU8,
-    IntOfU16,
-    IntOfU32,
-    IntOfU64,
-    IntOfI8,
-    IntOfI16,
-    IntOfI32,
-    IntOfI64,
-    Min,
-    Max,
-    ByteOfInt,
-    IntToString,
-    FloatToString,
-    StringConcat,
-    BytesLen,
-    BytesAt,
-    BytesU32Le,
-    BytesSlice,
-    BytesConcat,
-    BytesConcatAll,
-    BytesBlake3,
-    BytesGzip,
-    BytesGunzip,
-    BytesOfString,
-    BytesIsUtf8,
-    BytesIndexOf,
-    BytesIndexOfFrom,
-    BytesIndexOfByte,
-    BytesStartsWith,
-    BytesEndsWith,
-    BytesSplit,
-    BytesScan,
-    BytesScanUntil,
-    BytesPosition,
-    StringOfBytes,
-    StringOfBytesLossy,
-    StringLen,
-    StringSlice,
-    StringSplit,
-    StringTrim,
-    StringLower,
-    StringUpper,
-    StringStartsWith,
-    StringEndsWith,
-    StringContains,
-    StringFind,
-    MapNew,
-    MapInsert,
-    MapGet,
-    MapContains,
-    MapRemove,
-    MapLen,
-    MapKeys,
-    MapValues,
-    MapEntries,
-    MapOfEntries,
-    MapMerge,
-    MapFold,
+    U8OfInt = "u8_of_int", 1, raises;
+    U16OfInt = "u16_of_int", 1, raises;
+    U32OfInt = "u32_of_int", 1, raises;
+    U64OfInt = "u64_of_int", 1, raises;
+    I8OfInt = "i8_of_int", 1, raises;
+    I16OfInt = "i16_of_int", 1, raises;
+    I32OfInt = "i32_of_int", 1, raises;
+    I64OfInt = "i64_of_int", 1, raises;
+    IntOfU8 = "int_of_u8", 1, ends;
+    IntOfU16 = "int_of_u16", 1, ends;
+    IntOfU32 = "int_of_u32", 1, ends;
+    IntOfU64 = "int_of_u64", 1, raises;
+    IntOfI8 = "int_of_i8", 1, ends;
+    IntOfI16 = "int_of_i16", 1, ends;
+    IntOfI32 = "int_of_i32", 1, ends;
+    IntOfI64 = "int_of_i64", 1, ends;
+    Min = "min", 2, ends;
+    Max = "max", 2, ends;
+    ByteOfInt = "byte_of_int", 1, raises;
+    IntToString = "int_to_string", 1, ends;
+    FloatToString = "float_to_string", 1, ends;
+    StringConcat = "string_concat", 2, ends;
+    BytesLen = "bytes_len", 1, ends;
+    BytesAt = "bytes_at", 2, raises;
+    BytesU32Le = "bytes_u32_le", 2, raises;
+    BytesSlice = "bytes_slice", 3, raises;
+    BytesConcat = "bytes_concat", 2, ends;
+    BytesConcatAll = "bytes_concat_all", 1, ends;
+    BytesBlake3 = "bytes_blake3", 1, ends;
+    BytesGzip = "bytes_gzip", 1, ends;
+    BytesGunzip = "bytes_gunzip", 1, ends;
+    BytesOfString = "bytes_of_string", 1, ends;
+    BytesIsUtf8 = "bytes_is_utf8", 1, ends;
+    BytesIndexOf = "bytes_index_of", 2, ends;
+    BytesIndexOfFrom = "bytes_index_of_from", 3, raises;
+    BytesIndexOfByte = "bytes_index_of_byte", 2, raises;
+    BytesStartsWith = "bytes_starts_with", 2, ends;
+    BytesEndsWith = "bytes_ends_with", 2, ends;
+    BytesSplit = "bytes_split", 2, raises;
+    BytesScan = "bytes_scan", 4, raises;
+    BytesScanUntil = "bytes_scan_until", 4, raises;
+    BytesPosition = "bytes_position", 3, raises;
+    StringOfBytes = "string_of_bytes", 1, raises;
+    StringOfBytesLossy = "string_of_bytes_lossy", 1, ends;
+    StringLen = "string_len", 1, ends;
+    StringSlice = "string_slice", 3, raises;
+    StringSplit = "string_split", 2, raises;
+    StringTrim = "string_trim", 1, ends;
+    StringLower = "string_lower", 1, ends;
+    StringUpper = "string_upper", 1, ends;
+    StringStartsWith = "string_starts_with", 2, ends;
+    StringEndsWith = "string_ends_with", 2, ends;
+    StringContains = "string_contains", 2, ends;
+    StringFind = "string_find", 2, raises;
+    MapNew = "map_new", 0, ends;
+    MapInsert = "map_insert", 3, ends;
+    MapGet = "map_get", 2, ends;
+    MapContains = "map_contains", 2, ends;
+    MapRemove = "map_remove", 2, ends;
+    MapLen = "map_len", 1, ends;
+    MapKeys = "map_keys", 1, ends;
+    MapValues = "map_values", 1, ends;
+    MapEntries = "map_entries", 1, ends;
+    MapOfEntries = "map_of_entries", 1, ends;
+    MapMerge = "map_merge", 2, ends;
+    MapFold = "map_fold", 3, ends;
     /// `CellUpdate`'s shape over one map entry.
-    MapUpdate,
-    DecimalDiv,
-    DecimalRound,
-    DecimalOfInt,
-    IntOfDecimal,
-    FloatOfDecimal,
-    DecimalOfFloat,
-    DecimalOfString,
+    MapUpdate = "map_update", 3, ends;
+    DecimalDiv = "decimal_div", 4, raises;
+    DecimalRound = "decimal_round", 3, raises;
+    DecimalOfInt = "decimal_of_int", 1, ends;
+    IntOfDecimal = "int_of_decimal", 2, ends;
+    FloatOfDecimal = "float_of_decimal", 1, ends;
+    DecimalOfFloat = "decimal_of_float", 1, ends;
+    DecimalOfString = "decimal_of_string", 1, ends;
     /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
-    FloatOfString,
-    DecimalToString,
+    FloatOfString = "float_of_string", 1, ends;
+    DecimalToString = "decimal_to_string", 1, ends;
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
-    BitsOfFloat,
-    FloatOfBits,
-    Compare,
+    BitsOfFloat = "bits_of_float", 1, ends;
+    FloatOfBits = "float_of_bits", 1, ends;
+    Compare = "compare", 2, ends;
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
-    CompareValues,
-    CellGet,
-    CellSet,
+    CompareValues = "compare_values", 2, ends;
+    CellGet = "cell_get", 1, ends;
+    CellSet = "cell_set", 2, ends;
     /// Takes the contents out for the call, so an append inside the function owns them.
-    CellUpdate,
-    Panic,
+    CellUpdate = "cell_update", 2, ends;
+    Panic = "panic", 1, raises;
     /// The identity a benchmark pins a measured value with: opaque, so it is not optimized away.
-    Observe,
+    Observe = "observe", 1, ends;
     /// The only introduction of a [`Value::Secret`].
-    SecretOfString,
-    SecretVerify,
-    SecretIsEmpty,
+    SecretOfString = "secret_of_string", 1, ends;
+    SecretVerify = "secret_verify", 2, ends;
+    SecretIsEmpty = "secret_is_empty", 1, ends;
     // Appended, so every earlier builtin keeps its cache index.
-    U128OfInt,
-    I128OfInt,
-    IntOfU128,
-    IntOfI128,
-    U128ToString,
-    I128ToString,
-    U128OfString,
-    I128OfString,
+    U128OfInt = "u128_of_int", 1, raises;
+    I128OfInt = "i128_of_int", 1, raises;
+    IntOfU128 = "int_of_u128", 1, raises;
+    IntOfI128 = "int_of_i128", 1, raises;
+    U128ToString = "u128_to_string", 1, ends;
+    I128ToString = "i128_to_string", 1, ends;
+    U128OfString = "u128_of_string", 1, ends;
+    I128OfString = "i128_of_string", 1, ends;
     /// Over any integer type: the exact answer, or `None` where it leaves the type.
-    CheckedAdd,
-    CheckedSub,
-    CheckedMul,
-    CheckedNeg,
+    CheckedAdd = "checked_add", 2, ends;
+    CheckedSub = "checked_sub", 2, ends;
+    CheckedMul = "checked_mul", 2, ends;
+    CheckedNeg = "checked_neg", 1, ends;
     /// `None` for a surrogate or past `U+10FFFF`, which no `Char` is.
-    CharOfInt,
-    IntOfChar,
-    StringChars,
-    StringOfChars,
-    ArrayNew,
-    ArrayOfList,
-    ArrayToList,
-    ArrayLen,
-    ArrayAt,
+    CharOfInt = "char_of_int", 1, ends;
+    IntOfChar = "int_of_char", 1, ends;
+    StringChars = "string_chars", 1, ends;
+    StringOfChars = "string_of_chars", 1, ends;
+    ArrayNew = "array_new", 2, raises;
+    ArrayOfList = "array_of_list", 1, ends;
+    ArrayToList = "array_to_list", 1, ends;
+    ArrayLen = "array_len", 1, ends;
+    ArrayAt = "array_at", 2, ends;
     /// Raises where `array_at` answers `None`.
-    ArrayGet,
+    ArrayGet = "array_get", 2, raises;
     /// In place while the array has one holder; raises out of range.
-    ArraySet,
+    ArraySet = "array_set", 3, raises;
     /// The value as a `std.value.Value`, whole: what `std.show.show` renders.
-    Reflect,
+    Reflect = "reflect", 1, ends;
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
-    Digest,
+    Digest = "digest", 1, ends;
     /// `bracket(acquire, release, body)`: `release` runs on every exit from `body` but a failure.
-    Bracket,
+    Bracket = "bracket", 3, ends;
     /// An operator over a `numeric` or `integer` type parameter: `?numeric_binary(op, witness, x,
     /// y)`, its operands read as the type the witness names. No source can spell it; the
     /// elaboration writes it.
-    NumericBinary,
-    NumericUnary,
+    NumericBinary = "?numeric_binary", 4, ends;
+    NumericUnary = "?numeric_unary", 3, ends;
     /// `numeric_of_int(n)`, called with the witness the elaboration passes first.
-    NumericOfInt,
-    FloatOfInt,
+    NumericOfInt = "numeric_of_int", 2, raises;
+    FloatOfInt = "float_of_int", 1, ends;
     /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
-    IntOfFloat,
-    Floor,
-    Ceil,
-    Round,
-    Sqrt,
-    Pow,
-    Exp,
-    Ln,
-    Log2,
-    Log10,
-    Sin,
-    Cos,
-    Tan,
-    Asin,
-    Acos,
-    Atan,
-    Atan2,
-    Hypot,
+    IntOfFloat = "int_of_float", 2, ends;
+    Floor = "floor", 1, ends;
+    Ceil = "ceil", 1, ends;
+    Round = "round", 2, ends;
+    Sqrt = "sqrt", 1, ends;
+    Pow = "pow", 2, ends;
+    Exp = "exp", 1, ends;
+    Ln = "ln", 1, ends;
+    Log2 = "log2", 1, ends;
+    Log10 = "log10", 1, ends;
+    Sin = "sin", 1, ends;
+    Cos = "cos", 1, ends;
+    Tan = "tan", 1, ends;
+    Asin = "asin", 1, ends;
+    Acos = "acos", 1, ends;
+    Atan = "atan", 1, ends;
+    Atan2 = "atan2", 2, ends;
+    Hypot = "hypot", 2, ends;
 }
 
 impl Builtin {
-    /// Whether a failure of this builtin is a raise of `abort.raise`, which the prelude's scheme
-    /// for it carries in its row: one a `handle` answers, not a fault that ends the run.
-    pub fn raises(self) -> bool {
-        matches!(
-            self,
-            Builtin::Assert
-                | Builtin::AssertEq
-                | Builtin::ListSet
-                | Builtin::ArrayNew
-                | Builtin::ArrayGet
-                | Builtin::ArraySet
-                | Builtin::Iterate
-                | Builtin::U8OfInt
-                | Builtin::U16OfInt
-                | Builtin::U32OfInt
-                | Builtin::U64OfInt
-                | Builtin::I8OfInt
-                | Builtin::I16OfInt
-                | Builtin::I32OfInt
-                | Builtin::I64OfInt
-                | Builtin::U128OfInt
-                | Builtin::I128OfInt
-                | Builtin::NumericOfInt
-                | Builtin::IntOfU64
-                | Builtin::IntOfU128
-                | Builtin::IntOfI128
-                | Builtin::ByteOfInt
-                | Builtin::BytesAt
-                | Builtin::BytesU32Le
-                | Builtin::BytesSlice
-                | Builtin::BytesIndexOfFrom
-                | Builtin::BytesIndexOfByte
-                | Builtin::BytesSplit
-                | Builtin::BytesScan
-                | Builtin::BytesScanUntil
-                | Builtin::BytesPosition
-                | Builtin::StringOfBytes
-                | Builtin::StringSlice
-                | Builtin::StringSplit
-                | Builtin::StringFind
-                | Builtin::DecimalDiv
-                | Builtin::DecimalRound
-                | Builtin::Panic
-        )
-    }
-
-    pub fn from_name(name: &str) -> Option<Builtin> {
-        if let Some(t) = IntTy::of_int_from_name(name) {
-            return Some(Builtin::of_int(t));
-        }
-        if let Some(t) = IntTy::to_int_from_name(name) {
-            return Some(Builtin::int_of(t));
-        }
-        Some(match name {
-            "assert" => Builtin::Assert,
-            "assert_eq" => Builtin::AssertEq,
-            "len" => Builtin::Len,
-            "push" => Builtin::Push,
-            "list_at" => Builtin::ListAt,
-            "list_set" => Builtin::ListSet,
-            "map" => Builtin::Map,
-            "filter" => Builtin::Filter,
-            "fold" => Builtin::Fold,
-            "range" => Builtin::Range,
-            "wrap_add" => Builtin::WrapAdd,
-            "min" => Builtin::Min,
-            "max" => Builtin::Max,
-            "wrap_sub" => Builtin::WrapSub,
-            "wrap_mul" => Builtin::WrapMul,
-            "rotr32" => Builtin::Rotr32,
-            "rotr" => Builtin::Rotr,
-            "byte_of_int" => Builtin::ByteOfInt,
-            "int_to_string" => Builtin::IntToString,
-            "float_to_string" => Builtin::FloatToString,
-            "string_concat" => Builtin::StringConcat,
-            "bytes_len" => Builtin::BytesLen,
-            "bytes_at" => Builtin::BytesAt,
-            "bytes_u32_le" => Builtin::BytesU32Le,
-            "bytes_slice" => Builtin::BytesSlice,
-            "bytes_concat" => Builtin::BytesConcat,
-            "bytes_concat_all" => Builtin::BytesConcatAll,
-            "bytes_blake3" => Builtin::BytesBlake3,
-            "bytes_gzip" => Builtin::BytesGzip,
-            "bytes_gunzip" => Builtin::BytesGunzip,
-            "bytes_of_string" => Builtin::BytesOfString,
-            "bytes_is_utf8" => Builtin::BytesIsUtf8,
-            "bytes_index_of" => Builtin::BytesIndexOf,
-            "bytes_index_of_from" => Builtin::BytesIndexOfFrom,
-            "bytes_index_of_byte" => Builtin::BytesIndexOfByte,
-            "bytes_starts_with" => Builtin::BytesStartsWith,
-            "bytes_ends_with" => Builtin::BytesEndsWith,
-            "bytes_split" => Builtin::BytesSplit,
-            "bytes_scan" => Builtin::BytesScan,
-            "bytes_scan_until" => Builtin::BytesScanUntil,
-            "bytes_position" => Builtin::BytesPosition,
-            "string_of_bytes" => Builtin::StringOfBytes,
-            "string_of_bytes_lossy" => Builtin::StringOfBytesLossy,
-            "string_len" => Builtin::StringLen,
-            "string_slice" => Builtin::StringSlice,
-            "string_split" => Builtin::StringSplit,
-            "string_trim" => Builtin::StringTrim,
-            "string_lower" => Builtin::StringLower,
-            "string_upper" => Builtin::StringUpper,
-            "string_starts_with" => Builtin::StringStartsWith,
-            "string_ends_with" => Builtin::StringEndsWith,
-            "string_contains" => Builtin::StringContains,
-            "string_find" => Builtin::StringFind,
-            "compare" => Builtin::Compare,
-            "compare_values" => Builtin::CompareValues,
-            "map_new" => Builtin::MapNew,
-            "map_insert" => Builtin::MapInsert,
-            "map_get" => Builtin::MapGet,
-            "map_contains" => Builtin::MapContains,
-            "map_remove" => Builtin::MapRemove,
-            "map_len" => Builtin::MapLen,
-            "map_keys" => Builtin::MapKeys,
-            "map_values" => Builtin::MapValues,
-            "map_entries" => Builtin::MapEntries,
-            "map_of_entries" => Builtin::MapOfEntries,
-            "map_merge" => Builtin::MapMerge,
-            "map_fold" => Builtin::MapFold,
-            "map_update" => Builtin::MapUpdate,
-            "iterate" => Builtin::Iterate,
-            "metered" => Builtin::Metered,
-            "decimal_div" => Builtin::DecimalDiv,
-            "decimal_round" => Builtin::DecimalRound,
-            "decimal_of_int" => Builtin::DecimalOfInt,
-            "int_of_decimal" => Builtin::IntOfDecimal,
-            "float_of_decimal" => Builtin::FloatOfDecimal,
-            "decimal_of_float" => Builtin::DecimalOfFloat,
-            "decimal_of_string" => Builtin::DecimalOfString,
-            "float_of_string" => Builtin::FloatOfString,
-            "decimal_to_string" => Builtin::DecimalToString,
-            "bits_of_float" => Builtin::BitsOfFloat,
-            "float_of_bits" => Builtin::FloatOfBits,
-            "cell_get" => Builtin::CellGet,
-            "cell_set" => Builtin::CellSet,
-            "cell_update" => Builtin::CellUpdate,
-            "panic" => Builtin::Panic,
-            "observe" => Builtin::Observe,
-            "secret_of_string" => Builtin::SecretOfString,
-            "secret_verify" => Builtin::SecretVerify,
-            "secret_is_empty" => Builtin::SecretIsEmpty,
-            "u128_to_string" => Builtin::U128ToString,
-            "i128_to_string" => Builtin::I128ToString,
-            "u128_of_string" => Builtin::U128OfString,
-            "i128_of_string" => Builtin::I128OfString,
-            "checked_add" => Builtin::CheckedAdd,
-            "checked_sub" => Builtin::CheckedSub,
-            "checked_mul" => Builtin::CheckedMul,
-            "checked_neg" => Builtin::CheckedNeg,
-            "char_of_int" => Builtin::CharOfInt,
-            "int_of_char" => Builtin::IntOfChar,
-            "string_chars" => Builtin::StringChars,
-            "string_of_chars" => Builtin::StringOfChars,
-            "array_new" => Builtin::ArrayNew,
-            "array_of_list" => Builtin::ArrayOfList,
-            "array_to_list" => Builtin::ArrayToList,
-            "array_len" => Builtin::ArrayLen,
-            "array_at" => Builtin::ArrayAt,
-            "array_get" => Builtin::ArrayGet,
-            "array_set" => Builtin::ArraySet,
-            "reflect" => Builtin::Reflect,
-            "digest" => Builtin::Digest,
-            "bracket" => Builtin::Bracket,
-            "?numeric_binary" => Builtin::NumericBinary,
-            "?numeric_unary" => Builtin::NumericUnary,
-            "numeric_of_int" => Builtin::NumericOfInt,
-            "float_of_int" => Builtin::FloatOfInt,
-            "int_of_float" => Builtin::IntOfFloat,
-            "floor" => Builtin::Floor,
-            "ceil" => Builtin::Ceil,
-            "round" => Builtin::Round,
-            "sqrt" => Builtin::Sqrt,
-            "pow" => Builtin::Pow,
-            "exp" => Builtin::Exp,
-            "ln" => Builtin::Ln,
-            "log2" => Builtin::Log2,
-            "log10" => Builtin::Log10,
-            "sin" => Builtin::Sin,
-            "cos" => Builtin::Cos,
-            "tan" => Builtin::Tan,
-            "asin" => Builtin::Asin,
-            "acos" => Builtin::Acos,
-            "atan" => Builtin::Atan,
-            "atan2" => Builtin::Atan2,
-            "hypot" => Builtin::Hypot,
-            _ => return None,
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Builtin::Assert => "assert",
-            Builtin::AssertEq => "assert_eq",
-            Builtin::Len => "len",
-            Builtin::Push => "push",
-            Builtin::ListAt => "list_at",
-            Builtin::ListSet => "list_set",
-            Builtin::Map => "map",
-            Builtin::Filter => "filter",
-            Builtin::Fold => "fold",
-            Builtin::Iterate => "iterate",
-            Builtin::Metered => "metered",
-            Builtin::Range => "range",
-            Builtin::WrapAdd => "wrap_add",
-            Builtin::Min => "min",
-            Builtin::Max => "max",
-            Builtin::WrapSub => "wrap_sub",
-            Builtin::WrapMul => "wrap_mul",
-            Builtin::Rotr32 => "rotr32",
-            Builtin::Rotr => "rotr",
-            Builtin::U8OfInt => "u8_of_int",
-            Builtin::U16OfInt => "u16_of_int",
-            Builtin::U32OfInt => "u32_of_int",
-            Builtin::U64OfInt => "u64_of_int",
-            Builtin::I8OfInt => "i8_of_int",
-            Builtin::I16OfInt => "i16_of_int",
-            Builtin::I32OfInt => "i32_of_int",
-            Builtin::I64OfInt => "i64_of_int",
-            Builtin::IntOfU8 => "int_of_u8",
-            Builtin::IntOfU16 => "int_of_u16",
-            Builtin::IntOfU32 => "int_of_u32",
-            Builtin::IntOfU64 => "int_of_u64",
-            Builtin::IntOfI8 => "int_of_i8",
-            Builtin::IntOfI16 => "int_of_i16",
-            Builtin::IntOfI32 => "int_of_i32",
-            Builtin::IntOfI64 => "int_of_i64",
-            Builtin::ByteOfInt => "byte_of_int",
-            Builtin::IntToString => "int_to_string",
-            Builtin::FloatToString => "float_to_string",
-            Builtin::StringConcat => "string_concat",
-            Builtin::BytesLen => "bytes_len",
-            Builtin::BytesAt => "bytes_at",
-            Builtin::BytesU32Le => "bytes_u32_le",
-            Builtin::BytesSlice => "bytes_slice",
-            Builtin::BytesConcat => "bytes_concat",
-            Builtin::BytesConcatAll => "bytes_concat_all",
-            Builtin::BytesBlake3 => "bytes_blake3",
-            Builtin::BytesGzip => "bytes_gzip",
-            Builtin::BytesGunzip => "bytes_gunzip",
-            Builtin::BytesOfString => "bytes_of_string",
-            Builtin::BytesIsUtf8 => "bytes_is_utf8",
-            Builtin::BytesIndexOf => "bytes_index_of",
-            Builtin::BytesIndexOfFrom => "bytes_index_of_from",
-            Builtin::BytesIndexOfByte => "bytes_index_of_byte",
-            Builtin::BytesStartsWith => "bytes_starts_with",
-            Builtin::BytesEndsWith => "bytes_ends_with",
-            Builtin::BytesSplit => "bytes_split",
-            Builtin::BytesScan => "bytes_scan",
-            Builtin::BytesScanUntil => "bytes_scan_until",
-            Builtin::BytesPosition => "bytes_position",
-            Builtin::StringOfBytes => "string_of_bytes",
-            Builtin::StringOfBytesLossy => "string_of_bytes_lossy",
-            Builtin::StringLen => "string_len",
-            Builtin::StringSlice => "string_slice",
-            Builtin::StringSplit => "string_split",
-            Builtin::StringTrim => "string_trim",
-            Builtin::StringLower => "string_lower",
-            Builtin::StringUpper => "string_upper",
-            Builtin::StringStartsWith => "string_starts_with",
-            Builtin::StringEndsWith => "string_ends_with",
-            Builtin::StringContains => "string_contains",
-            Builtin::StringFind => "string_find",
-            Builtin::Compare => "compare",
-            Builtin::CompareValues => "compare_values",
-            Builtin::MapNew => "map_new",
-            Builtin::MapInsert => "map_insert",
-            Builtin::MapGet => "map_get",
-            Builtin::MapContains => "map_contains",
-            Builtin::MapRemove => "map_remove",
-            Builtin::MapLen => "map_len",
-            Builtin::MapKeys => "map_keys",
-            Builtin::MapValues => "map_values",
-            Builtin::MapEntries => "map_entries",
-            Builtin::MapOfEntries => "map_of_entries",
-            Builtin::MapMerge => "map_merge",
-            Builtin::MapFold => "map_fold",
-            Builtin::MapUpdate => "map_update",
-            Builtin::DecimalDiv => "decimal_div",
-            Builtin::DecimalRound => "decimal_round",
-            Builtin::DecimalOfInt => "decimal_of_int",
-            Builtin::IntOfDecimal => "int_of_decimal",
-            Builtin::FloatOfDecimal => "float_of_decimal",
-            Builtin::DecimalOfFloat => "decimal_of_float",
-            Builtin::DecimalOfString => "decimal_of_string",
-            Builtin::FloatOfString => "float_of_string",
-            Builtin::DecimalToString => "decimal_to_string",
-            Builtin::BitsOfFloat => "bits_of_float",
-            Builtin::FloatOfBits => "float_of_bits",
-            Builtin::CellGet => "cell_get",
-            Builtin::CellSet => "cell_set",
-            Builtin::CellUpdate => "cell_update",
-            Builtin::Panic => "panic",
-            Builtin::Observe => "observe",
-            Builtin::SecretOfString => "secret_of_string",
-            Builtin::SecretVerify => "secret_verify",
-            Builtin::SecretIsEmpty => "secret_is_empty",
-            Builtin::U128OfInt => "u128_of_int",
-            Builtin::I128OfInt => "i128_of_int",
-            Builtin::IntOfU128 => "int_of_u128",
-            Builtin::IntOfI128 => "int_of_i128",
-            Builtin::U128ToString => "u128_to_string",
-            Builtin::I128ToString => "i128_to_string",
-            Builtin::U128OfString => "u128_of_string",
-            Builtin::I128OfString => "i128_of_string",
-            Builtin::CheckedAdd => "checked_add",
-            Builtin::CheckedSub => "checked_sub",
-            Builtin::CheckedMul => "checked_mul",
-            Builtin::CheckedNeg => "checked_neg",
-            Builtin::CharOfInt => "char_of_int",
-            Builtin::IntOfChar => "int_of_char",
-            Builtin::StringChars => "string_chars",
-            Builtin::StringOfChars => "string_of_chars",
-            Builtin::ArrayNew => "array_new",
-            Builtin::ArrayOfList => "array_of_list",
-            Builtin::ArrayToList => "array_to_list",
-            Builtin::ArrayLen => "array_len",
-            Builtin::ArrayAt => "array_at",
-            Builtin::ArrayGet => "array_get",
-            Builtin::ArraySet => "array_set",
-            Builtin::Reflect => "reflect",
-            Builtin::Digest => "digest",
-            Builtin::Bracket => "bracket",
-            Builtin::NumericBinary => "?numeric_binary",
-            Builtin::NumericUnary => "?numeric_unary",
-            Builtin::NumericOfInt => "numeric_of_int",
-            Builtin::FloatOfInt => "float_of_int",
-            Builtin::IntOfFloat => "int_of_float",
-            Builtin::Floor => "floor",
-            Builtin::Ceil => "ceil",
-            Builtin::Round => "round",
-            Builtin::Sqrt => "sqrt",
-            Builtin::Pow => "pow",
-            Builtin::Exp => "exp",
-            Builtin::Ln => "ln",
-            Builtin::Log2 => "log2",
-            Builtin::Log10 => "log10",
-            Builtin::Sin => "sin",
-            Builtin::Cos => "cos",
-            Builtin::Tan => "tan",
-            Builtin::Asin => "asin",
-            Builtin::Acos => "acos",
-            Builtin::Atan => "atan",
-            Builtin::Atan2 => "atan2",
-            Builtin::Hypot => "hypot",
-        }
-    }
-
-    /// Inclusive `(min, max)` argument counts.
-    pub fn arity(self) -> (usize, usize) {
-        match self {
-            Builtin::MapNew => (0, 0),
-            Builtin::Len
-            | Builtin::FloatOfInt
-            | Builtin::Floor
-            | Builtin::Ceil
-            | Builtin::Sqrt
-            | Builtin::Exp
-            | Builtin::Ln
-            | Builtin::Log2
-            | Builtin::Log10
-            | Builtin::Sin
-            | Builtin::Cos
-            | Builtin::Tan
-            | Builtin::Asin
-            | Builtin::Acos
-            | Builtin::Atan
-            | Builtin::IntToString
-            | Builtin::FloatToString
-            | Builtin::ByteOfInt
-            | Builtin::CellGet
-            | Builtin::Panic
-            | Builtin::Observe
-            | Builtin::BytesLen
-            | Builtin::BytesOfString
-            | Builtin::BytesIsUtf8
-            | Builtin::BytesConcatAll
-            | Builtin::BytesBlake3
-            | Builtin::BytesGzip
-            | Builtin::BytesGunzip
-            | Builtin::StringOfBytes
-            | Builtin::StringOfBytesLossy
-            | Builtin::StringLen
-            | Builtin::StringTrim
-            | Builtin::StringLower
-            | Builtin::StringUpper
-            | Builtin::MapLen
-            | Builtin::MapKeys
-            | Builtin::MapValues
-            | Builtin::MapEntries
-            | Builtin::MapOfEntries
-            | Builtin::DecimalOfInt
-            | Builtin::FloatOfDecimal
-            | Builtin::DecimalOfFloat
-            | Builtin::DecimalOfString
-            | Builtin::FloatOfString
-            | Builtin::DecimalToString
-            | Builtin::BitsOfFloat
-            | Builtin::FloatOfBits
-            | Builtin::SecretOfString
-            | Builtin::SecretIsEmpty
-            | Builtin::U8OfInt
-            | Builtin::U16OfInt
-            | Builtin::U32OfInt
-            | Builtin::U64OfInt
-            | Builtin::I8OfInt
-            | Builtin::I16OfInt
-            | Builtin::I32OfInt
-            | Builtin::I64OfInt
-            | Builtin::U128OfInt
-            | Builtin::I128OfInt
-            | Builtin::IntOfU128
-            | Builtin::IntOfI128
-            | Builtin::U128ToString
-            | Builtin::I128ToString
-            | Builtin::U128OfString
-            | Builtin::I128OfString
-            | Builtin::CheckedNeg
-            | Builtin::CharOfInt
-            | Builtin::IntOfChar
-            | Builtin::StringChars
-            | Builtin::StringOfChars
-            | Builtin::ArrayOfList
-            | Builtin::ArrayToList
-            | Builtin::ArrayLen
-            | Builtin::Reflect
-            | Builtin::Digest
-            | Builtin::IntOfU8
-            | Builtin::IntOfU16
-            | Builtin::IntOfU32
-            | Builtin::IntOfU64
-            | Builtin::IntOfI8
-            | Builtin::IntOfI16
-            | Builtin::IntOfI32
-            | Builtin::IntOfI64
-            | Builtin::Metered => (1, 1),
-            Builtin::AssertEq
-            | Builtin::Push
-            | Builtin::ListAt
-            | Builtin::Map
-            | Builtin::Filter
-            | Builtin::StringConcat
-            | Builtin::CellSet
-            | Builtin::CellUpdate
-            | Builtin::BytesAt
-            | Builtin::BytesU32Le
-            | Builtin::BytesConcat
-            | Builtin::BytesIndexOf
-            | Builtin::BytesIndexOfByte
-            | Builtin::BytesStartsWith
-            | Builtin::BytesEndsWith
-            | Builtin::BytesSplit
-            | Builtin::StringSplit
-            | Builtin::StringStartsWith
-            | Builtin::StringEndsWith
-            | Builtin::StringContains
-            | Builtin::StringFind
-            | Builtin::MapGet
-            | Builtin::MapContains
-            | Builtin::MapRemove
-            | Builtin::MapMerge
-            | Builtin::Compare
-            | Builtin::CompareValues
-            | Builtin::IntOfDecimal
-            | Builtin::SecretVerify
-            | Builtin::Assert
-            | Builtin::WrapAdd
-            | Builtin::CheckedAdd
-            | Builtin::CheckedSub
-            | Builtin::CheckedMul
-            | Builtin::Min
-            | Builtin::Max
-            | Builtin::WrapSub
-            | Builtin::WrapMul
-            | Builtin::Rotr32
-            | Builtin::Rotr
-            | Builtin::Range
-            | Builtin::NumericOfInt
-            | Builtin::ArrayNew
-            | Builtin::ArrayAt
-            | Builtin::IntOfFloat
-            | Builtin::Round
-            | Builtin::Pow
-            | Builtin::Atan2
-            | Builtin::Hypot
-            | Builtin::ArrayGet => (2, 2),
-            Builtin::Fold
-            | Builtin::Iterate
-            | Builtin::Bracket
-            | Builtin::ListSet
-            | Builtin::ArraySet
-            | Builtin::NumericUnary
-            | Builtin::BytesSlice
-            | Builtin::BytesIndexOfFrom
-            | Builtin::BytesPosition
-            | Builtin::StringSlice
-            | Builtin::MapInsert
-            | Builtin::MapFold
-            | Builtin::MapUpdate
-            | Builtin::DecimalRound => (3, 3),
-            Builtin::BytesScan
-            | Builtin::BytesScanUntil
-            | Builtin::DecimalDiv
-            | Builtin::NumericBinary => (4, 4),
-        }
-    }
-
     pub fn of_int(t: IntTy) -> Builtin {
         match t {
             IntTy::U8 => Builtin::U8OfInt,
@@ -743,164 +288,6 @@ impl Builtin {
 
     pub fn converts_from(self) -> Option<IntTy> {
         INT_TYPES.into_iter().find(|t| Builtin::int_of(*t) == self)
-    }
-
-    pub fn all() -> &'static [Builtin] {
-        &[
-            Builtin::Assert,
-            Builtin::AssertEq,
-            Builtin::Len,
-            Builtin::Push,
-            Builtin::ListAt,
-            Builtin::ListSet,
-            Builtin::Map,
-            Builtin::Filter,
-            Builtin::Fold,
-            Builtin::Iterate,
-            Builtin::Metered,
-            Builtin::Range,
-            Builtin::WrapAdd,
-            Builtin::WrapSub,
-            Builtin::WrapMul,
-            Builtin::Rotr32,
-            Builtin::Rotr,
-            Builtin::U8OfInt,
-            Builtin::U16OfInt,
-            Builtin::U32OfInt,
-            Builtin::U64OfInt,
-            Builtin::I8OfInt,
-            Builtin::I16OfInt,
-            Builtin::I32OfInt,
-            Builtin::I64OfInt,
-            Builtin::IntOfU8,
-            Builtin::IntOfU16,
-            Builtin::IntOfU32,
-            Builtin::IntOfU64,
-            Builtin::IntOfI8,
-            Builtin::IntOfI16,
-            Builtin::IntOfI32,
-            Builtin::IntOfI64,
-            Builtin::Min,
-            Builtin::Max,
-            Builtin::ByteOfInt,
-            Builtin::IntToString,
-            Builtin::FloatToString,
-            Builtin::StringConcat,
-            Builtin::BytesLen,
-            Builtin::BytesAt,
-            Builtin::BytesU32Le,
-            Builtin::BytesSlice,
-            Builtin::BytesConcat,
-            Builtin::BytesConcatAll,
-            Builtin::BytesBlake3,
-            Builtin::BytesGzip,
-            Builtin::BytesGunzip,
-            Builtin::BytesOfString,
-            Builtin::BytesIsUtf8,
-            Builtin::BytesIndexOf,
-            Builtin::BytesIndexOfFrom,
-            Builtin::BytesIndexOfByte,
-            Builtin::BytesStartsWith,
-            Builtin::BytesEndsWith,
-            Builtin::BytesSplit,
-            Builtin::BytesScan,
-            Builtin::BytesScanUntil,
-            Builtin::BytesPosition,
-            Builtin::StringOfBytes,
-            Builtin::StringOfBytesLossy,
-            Builtin::StringLen,
-            Builtin::StringSlice,
-            Builtin::StringSplit,
-            Builtin::StringTrim,
-            Builtin::StringLower,
-            Builtin::StringUpper,
-            Builtin::StringStartsWith,
-            Builtin::StringEndsWith,
-            Builtin::StringContains,
-            Builtin::StringFind,
-            Builtin::MapNew,
-            Builtin::MapInsert,
-            Builtin::MapGet,
-            Builtin::MapContains,
-            Builtin::MapRemove,
-            Builtin::MapLen,
-            Builtin::MapKeys,
-            Builtin::MapValues,
-            Builtin::MapEntries,
-            Builtin::MapOfEntries,
-            Builtin::MapMerge,
-            Builtin::MapFold,
-            Builtin::MapUpdate,
-            Builtin::DecimalDiv,
-            Builtin::DecimalRound,
-            Builtin::DecimalOfInt,
-            Builtin::IntOfDecimal,
-            Builtin::FloatOfDecimal,
-            Builtin::DecimalOfFloat,
-            Builtin::DecimalOfString,
-            Builtin::FloatOfString,
-            Builtin::DecimalToString,
-            Builtin::BitsOfFloat,
-            Builtin::FloatOfBits,
-            Builtin::Compare,
-            Builtin::CompareValues,
-            Builtin::CellGet,
-            Builtin::CellSet,
-            Builtin::CellUpdate,
-            Builtin::Panic,
-            Builtin::Observe,
-            Builtin::SecretOfString,
-            Builtin::SecretVerify,
-            Builtin::SecretIsEmpty,
-            Builtin::U128OfInt,
-            Builtin::I128OfInt,
-            Builtin::IntOfU128,
-            Builtin::IntOfI128,
-            Builtin::U128ToString,
-            Builtin::I128ToString,
-            Builtin::U128OfString,
-            Builtin::I128OfString,
-            Builtin::CheckedAdd,
-            Builtin::CheckedSub,
-            Builtin::CheckedMul,
-            Builtin::CheckedNeg,
-            Builtin::CharOfInt,
-            Builtin::IntOfChar,
-            Builtin::StringChars,
-            Builtin::StringOfChars,
-            Builtin::ArrayNew,
-            Builtin::ArrayOfList,
-            Builtin::ArrayToList,
-            Builtin::ArrayLen,
-            Builtin::ArrayAt,
-            Builtin::ArrayGet,
-            Builtin::ArraySet,
-            Builtin::Reflect,
-            Builtin::Digest,
-            Builtin::Bracket,
-            Builtin::NumericBinary,
-            Builtin::NumericUnary,
-            Builtin::NumericOfInt,
-            Builtin::FloatOfInt,
-            Builtin::IntOfFloat,
-            Builtin::Floor,
-            Builtin::Ceil,
-            Builtin::Round,
-            Builtin::Sqrt,
-            Builtin::Pow,
-            Builtin::Exp,
-            Builtin::Ln,
-            Builtin::Log2,
-            Builtin::Log10,
-            Builtin::Sin,
-            Builtin::Cos,
-            Builtin::Tan,
-            Builtin::Asin,
-            Builtin::Acos,
-            Builtin::Atan,
-            Builtin::Atan2,
-            Builtin::Hypot,
-        ]
     }
 }
 
@@ -1024,13 +411,11 @@ pub fn call(b: Builtin, mut args: Vec<Value>, span: Span) -> Result<Value, Diagn
 }
 
 fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
-    let (min, max) = b.arity();
-    if args.len() < min || args.len() > max {
-        let expected = if min == max { min } else { max };
+    if args.len() != b.arity() {
         return Err(arity_error(
             span,
             &format!("`{}`", b.name()),
-            expected,
+            b.arity(),
             args.len(),
         ));
     }
@@ -1168,12 +553,12 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::U128OfInt
         | Builtin::I128OfInt => {
             let t = b.converts_into().expect("every `_of_int` names its type");
-            let n = args[0].as_int(span, &format!("`{}`", t.of_int_name()))?;
+            let n = args[0].as_int(span, &format!("`{}`", b.name()))?;
             match Fixed::of(t, i128::from(n)) {
                 Some(v) => Ok(Value::Fixed(v)),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!("`{}` was given {n}", t.of_int_name()),
+                    format!("`{}` was given {n}", b.name()),
                 )
                 .primary(span, format!("`{t}` holds {} to {}", t.min(), t.max()))
                 .note(format!(
@@ -1194,12 +579,12 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::IntOfU128
         | Builtin::IntOfI128 => {
             let t = b.converts_from().expect("every `int_of_` names its type");
-            let f = args[0].as_fixed(span, &format!("`{}`", t.to_int_name()))?;
+            let f = args[0].as_fixed(span, &format!("`{}`", b.name()))?;
             match f.to_i128().and_then(|v| i64::try_from(v).ok()) {
                 Some(n) => Ok(Value::Int(n)),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!("`{}` was given {}", t.to_int_name(), slot(0)),
+                    format!("`{}` was given {}", b.name(), slot(0)),
                 )
                 .primary(span, "outside what an `Int` holds")
                 .note(format!(

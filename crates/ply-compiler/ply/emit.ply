@@ -21,6 +21,7 @@ import types (Atom, read_atoms)
 import front (Rows, KnownDefRow, KnownTestRow, analyse, dump_of, WalkedFacts, walked_facts_bin)
 import termination (Ends, unknown_summary)
 import std.bin
+import std.list (at)
 import diagnostics (parse_all)
 import interface (stub_module)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
@@ -264,9 +265,6 @@ fn line(emitter: Emitter, text: Bytes) -> Emitter =
     group: emitter.group,
     operands: emitter.operands,
   }
-
-fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
-  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the tables do not hold") }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
 
@@ -1145,9 +1143,9 @@ fn built_of(emitter: Emitter, local: Bytes) -> Option<Built> =
   fold(emitter.built, None, |acc: Option<Built>, b: Built|
     if b.local == local { Some(b) } else { acc })
 
-// Only a runtime helper's result hands over its count; a compiled call's result is duplicated before it is handed on.
+// Only a runtime helper's result hands over its count, a builtin's among them; a compiled call's result is duplicated before it is handed on.
 fn answers_owned(emitter: Emitter, expr: Bytes) -> Bool / {abort.raise} =
-  (bytes_len(expr) > 3 && bytes_slice(expr, 0, 3) == b"rt_")
+  bytes_starts_with(expr, b"rt_") || bytes_starts_with(expr, b"builtin_")
     || (emitter.release
     && ((bytes_len(expr) > 4 && bytes_slice(expr, 0, 4) == b"ply_" && calls_with_ctx(expr))
     || (bytes_len(expr) > 13 && bytes_slice(expr, 0, 13) == b"(ply_fits_imm")))
@@ -2035,10 +2033,9 @@ fn position_call(
                         None -> None,
                         Some(pv) -> {
                           let po = owned(pv.emitter, pv.value);
-                          let bi = builtin_of(po.emitter, b"bytes_position");
                           // Bad input goes to the runtime's own call, which raises before it would suspend.
                           let guard = line(
-                            site(bi.emitter, span),
+                            site(po.emitter, span),
                             bytes_concat_all([
                               b"if (ply_is_imm(",
                               bo.value.expr,
@@ -2048,15 +2045,13 @@ fn position_call(
                               from.value.expr,
                               b" > (uint64_t)ply_obj(",
                               bo.value.expr,
-                              b")->len) { Word a[3]; a[0] = ",
-                              bo.value.expr,
-                              b"; a[1] = ply_imm(",
-                              from.value.expr,
-                              b"); a[2] = ",
-                              po.value.expr,
-                              b"; rt_builtin_p(ctx, @@b",
-                              int_to_bytes(bi.i),
-                              b"@@, (Word)(intptr_t)a, 3); return 0; }",
+                              b")->len) { ",
+                              builtin_call_over(b"bytes_position", [
+                                bo.value.expr,
+                                bytes_concat_all([b"ply_imm(", from.value.expr, b")"]),
+                                po.value.expr,
+                              ]),
+                              b"; return 0; }",
                             ]),
                           );
                           let ans = fresh(guard);
@@ -2562,31 +2557,8 @@ fn fused_fold(
             None -> None,
             Some(lv) -> {
               let lo = owned(lv.emitter, lv.value);
-              let arr = fresh(lo.emitter);
-              let cnt = line(
-                arr.emitter,
-                bytes_concat_all([
-                  b"Word ",
-                  arr.name,
-                  b"[1] = {",
-                  lo.value.expr,
-                  b"}; ply_inc(",
-                  arr.name,
-                  b"[0]);",
-                ]),
-              );
-              let bi = builtin_of(cnt, b"len");
-              let raw = bind(
-                bi.emitter,
-                KBoxed,
-                bytes_concat_all([
-                  b"rt_builtin_p(ctx, @@b",
-                  int_to_bytes(bi.i),
-                  b"@@, (Word)(intptr_t)",
-                  arr.name,
-                  b", 1)",
-                ]),
-              );
+              let cnt = line(lo.emitter, bytes_concat_all([b"ply_inc(", lo.value.expr, b");"]));
+              let raw = bind(cnt, KBoxed, builtin_call_over(b"len", [lo.value.expr]));
               let n = bind(check(raw.emitter), KInt, as_int(raw.value));
               // A compiled function is called straight per element; anything else is evaluated once outside the loop, and each iteration hands `rt_call` its own count.
               let step = nameable_step(n.emitter, f);
@@ -3191,40 +3163,25 @@ fn kind_tested(
           b"]; } else {",
         ]),
       );
-      let bi = builtin_of(indent(opened), name);
-      let a0 = fresh(bi.emitter);
       line(
         line(
           line(
-            line(
-              line(
-                line(a0.emitter, bytes_concat_all([b"Word ", a0.name, b"[2];"])),
-                bytes_concat_all([
-                  a0.name,
-                  b"[0] = ",
-                  t.value.expr,
-                  b"; ply_inc(",
-                  a0.name,
-                  b"[0]);",
-                ]),
-              ),
-              bytes_concat_all([
-                a0.name,
-                b"[1] = (ply_fits_imm(",
-                idx.value.expr,
-                b") ? ply_imm(",
-                idx.value.expr,
-                b") : rt_box_int_p(ctx, ",
-                idx.value.expr,
-                b"));",
-              ]),
-            ),
+            line(indent(opened), bytes_concat_all([b"ply_inc(", t.value.expr, b");"])),
             bytes_concat_all([
-              b"Word r = rt_builtin_p(ctx, @@b",
-              int_to_bytes(bi.i),
-              b"@@, (Word)(intptr_t)",
-              a0.name,
-              b", 2);",
+              b"Word r = ",
+              builtin_call_over(name, [
+                t.value.expr,
+                bytes_concat_all([
+                  b"(ply_fits_imm(",
+                  idx.value.expr,
+                  b") ? ply_imm(",
+                  idx.value.expr,
+                  b") : rt_box_int_p(ctx, ",
+                  idx.value.expr,
+                  b"))",
+                ]),
+              ]),
+              b";",
             ]),
           ),
           b"if (ctx->failed) return 0;",
@@ -3245,29 +3202,11 @@ fn kind_tested(
           b")->len; } else {",
         ]),
       );
-      let bi = builtin_of(indent(opened), name);
-      let a0 = fresh(bi.emitter);
       line(
         line(
           line(
-            line(
-              line(a0.emitter, bytes_concat_all([b"Word ", a0.name, b"[1];"])),
-              bytes_concat_all([
-                a0.name,
-                b"[0] = ",
-                t.value.expr,
-                b"; ply_inc(",
-                a0.name,
-                b"[0]);",
-              ]),
-            ),
-            bytes_concat_all([
-              b"Word r = rt_builtin_p(ctx, @@b",
-              int_to_bytes(bi.i),
-              b"@@, (Word)(intptr_t)",
-              a0.name,
-              b", 1);",
-            ]),
+            line(indent(opened), bytes_concat_all([b"ply_inc(", t.value.expr, b");"])),
+            bytes_concat_all([b"Word r = ", builtin_call_over(name, [t.value.expr]), b";"]),
           ),
           b"if (ctx->failed) return 0;",
         ),
@@ -3351,22 +3290,22 @@ fn inline_at(
               } else {
                 let t = bind(iv.emitter, KBoxed, as_word(bv.value));
                 let idx = bind(t.emitter, KInt, as_int(iv.value));
-                let bi = builtin_of(idx.emitter, if wide { b"bytes_u32_le" } else { b"bytes_at" });
                 let g = line(
-                  bi.emitter,
+                  idx.emitter,
                   bytes_concat_all([
                     b"if ((uint64_t)",
                     idx.value.expr,
                     if wide { b" + 4 > " } else { b" >= " },
                     b"(uint64_t)ply_obj(",
                     t.value.expr,
-                    b")->len) { Word a[2]; a[0] = ",
+                    b")->len) { ply_inc(",
                     t.value.expr,
-                    b"; ply_inc(a[0]); a[1] = ply_imm(",
-                    idx.value.expr,
-                    b"); rt_builtin_p(ctx, @@b",
-                    int_to_bytes(bi.i),
-                    b"@@, (Word)(intptr_t)a, 2); return 0; }",
+                    b"); ",
+                    builtin_call_over(if wide { b"bytes_u32_le" } else { b"bytes_at" }, [
+                      t.value.expr,
+                      bytes_concat_all([b"ply_imm(", idx.value.expr, b")"]),
+                    ]),
+                    b"; return 0; }",
                   ]),
                 );
                 if wide {
@@ -3436,25 +3375,29 @@ fn inline_get(
             Some(iv0) -> {
               let t = bind(site(iv0.emitter, span), KBoxed, as_word(av.value));
               let idx = bind(t.emitter, KInt, as_int(iv0.value));
-              let bi = builtin_of(idx.emitter, b"array_get");
               let g = line(
-                bi.emitter,
+                idx.emitter,
                 bytes_concat_all([
                   b"if ((uint64_t)",
                   idx.value.expr,
                   b" >= (uint64_t)ply_obj(",
                   t.value.expr,
-                  b")->len) { Word a[2]; a[0] = ",
+                  b")->len) { ply_inc(",
                   t.value.expr,
-                  b"; ply_inc(a[0]); a[1] = (ply_fits_imm(",
-                  idx.value.expr,
-                  b") ? ply_imm(",
-                  idx.value.expr,
-                  b") : rt_box_int_p(ctx, ",
-                  idx.value.expr,
-                  b")); rt_builtin_p(ctx, @@b",
-                  int_to_bytes(bi.i),
-                  b"@@, (Word)(intptr_t)a, 2); return 0; }",
+                  b"); ",
+                  builtin_call_over(b"array_get", [
+                    t.value.expr,
+                    bytes_concat_all([
+                      b"(ply_fits_imm(",
+                      idx.value.expr,
+                      b") ? ply_imm(",
+                      idx.value.expr,
+                      b") : rt_box_int_p(ctx, ",
+                      idx.value.expr,
+                      b"))",
+                    ]),
+                  ]),
+                  b"; return 0; }",
                 ]),
               );
               let r = fresh(g);
@@ -3544,28 +3487,21 @@ fn builtin_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
       },
   }
 
-// A builtin missing here is refused rather than sent down the generic path.
-fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
-  if name == b"push" && args == 2 { Some(b"rt_push_p") }
-  else if name == b"map_insert" && args == 3 { Some(b"rt_map_insert_p") }
-  else if name == b"map_contains" && args == 2 { Some(b"rt_map_contains_p") }
-  else if name == b"map_get" && args == 2 { Some(b"rt_map_get_p") }
-  else if name == b"compare" && args == 2 { Some(b"rt_compare_p") }
-  // `observe` has no direct helper: it goes through `rt_builtin_p` like `panic`, an indirect
-  // call the C compiler cannot see into, which is exactly what keeps an observed call alive.
-  else if name == b"byte_of_int" && args == 1 { Some(b"rt_byte_of_int_p") }
-  else if name == b"bytes_concat" && args == 2 { Some(b"rt_bytes_concat_p") }
-  else if name == b"bytes_slice" && args == 3 { Some(b"rt_bytes_slice_p") }
-  else if name == b"bytes_scan" && args == 4 { Some(b"rt_bytes_scan_p") }
-  else if name == b"bytes_scan_until" && args == 4 { Some(b"rt_bytes_scan_until_p") }
-  else if name == b"list_at" && args == 2 { Some(b"rt_list_index_p") }
-  else if name == b"list_set" && args == 3 { Some(b"rt_list_set_p") }
-  else if name == b"array_set" && args == 3 { Some(b"rt_array_set_p") }
-  // `fold` is absent: it is fused into the body (`fused_fold`).
-  else if name == b"map" && args == 2 { Some(b"rt_map_p") }
-  else if name == b"filter" && args == 2 { Some(b"rt_filter_p") }
-  else if name == b"map_fold" && args == 3 { Some(b"rt_map_fold_p") }
-  else { None }
+// The runtime's helper for a builtin, named for it. An elaboration's `?` is spelled out, since no C
+// name holds one.
+pub fn builtin_helper(name: Bytes) -> Bytes / {abort.raise} =
+  if bytes_starts_with(name, b"?") {
+    bytes_concat(b"builtin_elaborated_", bytes_slice(name, 1, bytes_len(name)))
+  } else { bytes_concat(b"builtin_", name) }
+
+// A call of a builtin's helper over the words it takes, each already the callee's.
+fn builtin_call_over(name: Bytes, words: List<Bytes>) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    builtin_helper(name),
+    b"_p(ctx",
+    fold(words, b"", |acc: Bytes, word: Bytes| bytes_concat_all([acc, b", ", word])),
+    b")",
+  ])
 
 // Two passes: every argument evaluated, the site stored, then each duplicated; a compiled call interleaves (`args_one_pass`).
 fn args_owned_at(
@@ -3611,7 +3547,7 @@ fn args_owned(
       ),
   }
 
-// A builtin with no helper goes through the runtime by this body's index for it.
+// A builtin called over what its arguments evaluated to, each duplicated here.
 fn builtin_call(emitter: Emitter, name: Bytes, vals: List<CValue>) -> WithValue / {abort.raise} = {
   let w = fold(
     vals,
@@ -3621,31 +3557,7 @@ fn builtin_call(emitter: Emitter, name: Bytes, vals: List<CValue>) -> WithValue 
       { emitter: o.emitter, names: push(a.names, o.value.expr) }
     },
   );
-  let bi = builtin_of(w.emitter, name);
-  let arr = fresh(bi.emitter);
-  let e = line(
-    arr.emitter,
-    bytes_concat_all([
-      b"Word ",
-      arr.name,
-      b"[] = {",
-      if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
-      b"};",
-    ]),
-  );
-  let o = bind(
-    e,
-    KBoxed,
-    bytes_concat_all([
-      b"rt_builtin_p(ctx, @@b",
-      int_to_bytes(bi.i),
-      b"@@, (Word)(intptr_t)",
-      arr.name,
-      b", ",
-      int_to_bytes(len(vals)),
-      b")",
-    ]),
-  );
+  let o = bind(w.emitter, KBoxed, builtin_call_over(name, w.names));
   { emitter: check(o.emitter), value: o.value }
 }
 
@@ -4243,7 +4155,7 @@ pub fn covers() -> List<Bytes> =
     b"a field of a record whose shape a parameter's type gives",
     b"a record literal, through this body's reuse token for its width",
     b"a direct call to a definition of the same module",
-    b"the builtins with a runtime helper of their own",
+    b"a call of a builtin, through the runtime's helper for it",
     b"a match over every pattern form, guards included",
     b"a call of a name another module exports by name",
     b"a Str or Bytes literal, from the unit's constant table",
@@ -4904,102 +4816,86 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               },
             }
           } else if !fold(emitter.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
-            // Not this module's: a builtin or an import.
-            match direct_helper(fv.name, len(a.args)) {
-              // An import: the same direct call, mangled with its module.
-              None -> match match qualified(fv.name) {
-                  Some(q) -> from_import(emitter.imports, q.binder),
-                  None -> from_import(emitter.imports, fv.name),
-                } {
-                // Callback and inline builtins outside their fused shapes are refused: a plain call for them is a wrong answer, not a slow one.
-                None -> match fused_fold(emitter, fv.name, a.args, params, c.span) {
+            // Not this module's: an import, which takes the name where it has it, else a builtin.
+            match match qualified(fv.name) {
+                Some(q) -> from_import(emitter.imports, q.binder),
+                None -> from_import(emitter.imports, fv.name),
+              } {
+              // Callback and inline builtins outside their fused shapes are refused: a plain call for them is a wrong answer, not a slow one.
+              None -> match fused_fold(emitter, fv.name, a.args, params, c.span) {
+                Some(o) -> Some(o),
+                None -> match iterate_call(emitter, fv.name, a.args, params, c.span) {
                   Some(o) -> Some(o),
-                  None -> match iterate_call(emitter, fv.name, a.args, params, c.span) {
+                  None -> match position_call(emitter, fv.name, a.args, params, c.span) {
                     Some(o) -> Some(o),
-                    None -> match position_call(emitter, fv.name, a.args, params, c.span) {
+                    None -> match width_builtin(
+                        emitter,
+                        fv.name,
+                        a.args,
+                        params,
+                        c.span,
+                        a.func.span,
+                      ) {
                       Some(o) -> Some(o),
-                      None -> match width_builtin(
-                          emitter,
-                          fv.name,
-                          a.args,
-                          params,
-                          c.span,
-                          a.func.span,
-                        ) {
+                      None -> match inline_len(emitter, fv.name, a.args, params, c.span) {
                         Some(o) -> Some(o),
-                        None -> match inline_len(emitter, fv.name, a.args, params, c.span) {
-                          Some(o) -> Some(o),
-                          None -> if is_callback(fv.name) || is_inlined(fv.name) {
-                            Some(
-                              refused(
-                                emitter,
-                                bytes_concat(
-                                  b"a callback or inline builtin outside its fused shape: ",
-                                  fv.name,
-                                ),
+                        None -> if is_callback(fv.name) || is_inlined(fv.name) {
+                          Some(
+                            refused(
+                              emitter,
+                              bytes_concat(
+                                b"a callback or inline builtin outside its fused shape: ",
+                                fv.name,
                               ),
-                            )
-                          } else if !fold(emitter.builtins, false, |acc: Bool, b2: Bytes|
-                              acc || b2 == fv.name) {
-                            Some(
-                              refused(
-                                emitter,
-                                bytes_concat(b"a name this port cannot resolve: ", fv.name),
-                              ),
-                            )
-                          } else {
-                            match args_evaled(emitter, a.args, params, 0, []) {
-                              None -> None,
-                              Some(e) ->
-                                Some(builtin_call(site(e.emitter, c.span), fv.name, e.vals)),
-                            }
-                          },
+                            ),
+                          )
+                        } else if !fold(emitter.builtins, false, |acc: Bool, b2: Bytes|
+                            acc || b2 == fv.name) {
+                          Some(
+                            refused(
+                              emitter,
+                              bytes_concat(b"a name this port cannot resolve: ", fv.name),
+                            ),
+                          )
+                        } else {
+                          // `map` and `filter` duplicate the list before the closure is built; the rest evaluate everything first.
+                          match if fv.name == b"map" || fv.name == b"filter" {
+                              args_one_pass(emitter, a.args, params, 0, [])
+                            } else if fv.name == b"map_fold" {
+                              args_owned(emitter, a.args, params, 0, [])
+                            } else { args_owned_at(emitter, a.args, params, c.span) } {
+                            None -> None,
+                            Some(w) -> {
+                              let o = bind(w.emitter, KBoxed, builtin_call_over(fv.name, w.names));
+                              Some({ emitter: check(o.emitter), value: o.value })
+                            },
+                          }
                         },
                       },
                     },
                   },
                 },
-                Some(imp) -> match args_one_pass(emitter, a.args, params, 0, []) {
-                  None -> None,
-                  Some(w) -> {
-                    let m = imp.module;
-                    let callee = match qualified(fv.name) { Some(q) -> q.name, None -> fv.name };
-                    let full = bytes_concat_all([m, b".", callee]);
-                    let o = bind(
-                      note_call(site(w.emitter, c.span), full),
-                      KBoxed,
-                      bytes_concat_all([
-                        symbol_of(full),
-                        b"(ctx",
-                        fold(w.names, b"", |acc: Bytes, nm: Bytes|
-                          bytes_concat_all([acc, b", ", nm])),
-                        b")",
-                      ]),
-                    );
-                    // Opened to the callee's declared type when its module was resolved alongside; a word otherwise.
-                    Some(opened_to(check(o.emitter), o.value, ret_of(imp.defs, callee)))
-                  },
-                },
               },
-              // `map` and `filter` duplicate the list before the closure is built; the rest evaluate everything first.
-              Some(h) -> match if fv.name == b"map" || fv.name == b"filter" {
-                  args_one_pass(emitter, a.args, params, 0, [])
-                } else if fv.name == b"map_fold" { args_owned(emitter, a.args, params, 0, []) }
-                else { args_owned_at(emitter, a.args, params, c.span) } {
+              // The same direct call, mangled with its module.
+              Some(imp) -> match args_one_pass(emitter, a.args, params, 0, []) {
                 None -> None,
                 Some(w) -> {
+                  let m = imp.module;
+                  let callee = match qualified(fv.name) { Some(q) -> q.name, None -> fv.name };
+                  let full = bytes_concat_all([m, b".", callee]);
                   let o = bind(
-                    w.emitter,
+                    note_call(site(w.emitter, c.span), full),
                     KBoxed,
                     bytes_concat_all([
-                      h,
+                      symbol_of(full),
                       b"(ctx",
                       fold(w.names, b"", |acc: Bytes, nm: Bytes|
                         bytes_concat_all([acc, b", ", nm])),
                       b")",
                     ]),
                   );
-                  Some({ emitter: check(o.emitter), value: o.value })
+                  // Opened to the callee's declared type when its module was resolved alongside; a word otherwise.
+                  Some(opened_to(check(o.emitter), o.value, ret_of(imp.defs, callee)))
                 },
               },
             }
@@ -9691,3 +9587,39 @@ fn bytes_join_dots(xs: List<Bytes>) -> Bytes =
       if i == 0 { b"" } else { b"." },
       match list_at(xs, i) { Some(x) -> x, None -> b"" },
     ]))
+
+test "a builtin is called through the helper named for it, and an import that takes its name is called instead" {
+  let own = emit_all_program(
+    [
+      {
+        name: b"m",
+        src: b"fn longer(xs: List<Int>) -> List<Int> = push(xs, 1)\nfn head(b: Bytes) -> Bytes / {abort.raise} = bytes_slice(b, 0, 1)\n",
+      },
+    ],
+    [],
+    [b"push", b"bytes_slice"],
+    true,
+  );
+  assert_eq(map(own, |e: Emitted| e.why), [None, None]);
+  let has = |text: Bytes| map(own, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(has(b"builtin_push_p(ctx, "), [true, false]);
+  assert_eq(has(b"builtin_bytes_slice_p(ctx, "), [false, true]);
+  assert_eq(builtin_helper(b"?numeric_binary"), b"builtin_elaborated_numeric_binary");
+  let imported = emit_all_program(
+    [
+      { name: b"a", src: b"pub fn push(xs: List<Int>, x: Int) -> List<Int> = xs\n" },
+      {
+        name: b"b",
+        src: b"import a (push)\nfn longer(xs: List<Int>) -> List<Int> = push(xs, 1)\n",
+      },
+    ],
+    [],
+    [b"push"],
+    true,
+  );
+  assert_eq(map(imported, |e: Emitted| e.why), [None, None]);
+  assert_eq(map(imported, |e: Emitted| bytes_index_of(e.text, b"builtin_push_p") != None), [
+    false,
+    false,
+  ])
+}

@@ -11,8 +11,8 @@ use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
 use crate::support::{select_profile, unit_of};
 use ply_eval::{
-    Analysis, CheckOutput, DefHash, Diagnostic, Ended, ModuleName, SourceMap, Span, Symbol,
-    Value as PlyValue, codes,
+    Analysis, CheckOutput, DefHash, Diagnostic, Ended, SourceMap, Span, Symbol, Value as PlyValue,
+    codes,
 };
 use ply_host::process::{Executables, OutputSink, ProcessHost, Stream};
 use ply_host::signal::{self, Shutdown};
@@ -244,8 +244,6 @@ impl Target {
                 .iter()
                 .map(|f| (f.path.display().to_string(), f.text.as_bytes().to_vec()))
                 .collect(),
-            mains: mains_of(loaded),
-            modules: modules_of(loaded),
         }
     }
 
@@ -730,58 +728,20 @@ pub fn place_the_unplaced(mut d: Diagnostic, entry: &str) -> Diagnostic {
 
 // --- The values that cross --------------------------------------------------------
 
-/// Where a definition is written, as a label points at it.
-pub struct ModuleSpan {
-    pub module: u32,
-    pub start: u32,
-    pub end: u32,
-}
-
-impl ModuleSpan {
-    fn of(span: Span) -> ModuleSpan {
-        ModuleSpan {
-            module: span.source.0,
-            start: span.start,
-            end: span.end,
-        }
-    }
-}
-
-pub struct Named {
-    pub name: String,
-    pub module: String,
-    pub path: String,
-    pub at: ModuleSpan,
-}
-
-pub struct Placed {
-    pub name: String,
-    pub path: String,
-    at: ModuleSpan,
-}
-
-/// The load's answer as plain data: what `machine.Project` carries.
+/// The load's answer as plain data: what `machine.Read` carries.
 pub struct FoundData {
     pub root: String,
     pub files: Vec<String>,
     pub places: Vec<(String, Vec<u8>)>,
-    pub mains: Vec<Named>,
-    pub modules: Vec<Placed>,
 }
 
 /// [`FoundData`] as the value the program reads it as. Called on the calling thread.
-pub fn found_value(found: &FoundData, module: &str) -> PlyValue {
-    crate::payload::ctor(
-        module,
-        "Project",
-        vec![record(vec![
-            ("root", PlyValue::str(&found.root)),
-            ("files", strings(found.files.iter().map(String::as_str))),
-            ("places", places_value(&found.places)),
-            ("mains", named_values(&found.mains)),
-            ("modules", placed_values(&found.modules)),
-        ])],
-    )
+pub fn found_value(found: &FoundData) -> PlyValue {
+    record(vec![
+        ("root", PlyValue::str(&found.root)),
+        ("files", strings(found.files.iter().map(String::as_str))),
+        ("places", places_value(&found.places)),
+    ])
 }
 
 fn places_value(places: &[(String, Vec<u8>)]) -> PlyValue {
@@ -796,101 +756,6 @@ fn places_value(places: &[(String, Vec<u8>)]) -> PlyValue {
             })
             .collect(),
     )
-}
-
-/// Every non-shipped definition named `main`, which is what the program picks its entry from.
-fn mains_of(loaded: &Loaded) -> Vec<Named> {
-    loaded
-        .entry_points()
-        .into_iter()
-        .map(|def| Named {
-            name: def.name.as_str().to_string(),
-            module: def.module.to_string(),
-            path: file_of(loaded, &def.module),
-            at: ModuleSpan::of(def.span),
-        })
-        .collect()
-}
-
-/// Every module the load read, with the empty position at the end of its file: where the entry
-/// point it does not declare would be written.
-fn modules_of(loaded: &Loaded) -> Vec<Placed> {
-    loaded
-        .modules()
-        .into_iter()
-        .map(|view| {
-            let end = loaded
-                .sources
-                .get(view.info.source)
-                .map_or(0, |f| f.text.len() as u32);
-            Placed {
-                name: view.name.to_string(),
-                path: view.path.display().to_string(),
-                at: ModuleSpan {
-                    module: view.info.source.0,
-                    start: end,
-                    end,
-                },
-            }
-        })
-        .collect()
-}
-
-/// Every definition named `main`, as the program's `entry` module reads them.
-pub fn mains_value(loaded: &Loaded) -> PlyValue {
-    named_values(&mains_of(loaded))
-}
-
-pub fn modules_value(loaded: &Loaded) -> PlyValue {
-    placed_values(&modules_of(loaded))
-}
-
-fn file_of(loaded: &Loaded, module: &ModuleName) -> String {
-    loaded
-        .check
-        .modules
-        .get(module.as_symbol())
-        .map(|m| loaded.path_of(m.source).display().to_string())
-        .unwrap_or_else(|| module.to_string())
-}
-
-fn named_values(mains: &[Named]) -> PlyValue {
-    PlyValue::list(
-        mains
-            .iter()
-            .map(|m| {
-                record(vec![
-                    ("name", PlyValue::str(&m.name)),
-                    ("module", PlyValue::str(&m.module)),
-                    ("path", PlyValue::str(&m.path)),
-                    ("at", at_value(&m.at)),
-                ])
-            })
-            .collect(),
-    )
-}
-
-fn placed_values(modules: &[Placed]) -> PlyValue {
-    PlyValue::list(
-        modules
-            .iter()
-            .map(|m| {
-                record(vec![
-                    ("name", PlyValue::str(&m.name)),
-                    ("path", PlyValue::str(&m.path)),
-                    ("at", at_value(&m.at)),
-                ])
-            })
-            .collect(),
-    )
-}
-
-fn at_value(at: &ModuleSpan) -> PlyValue {
-    record(vec![
-        ("module", PlyValue::Int(i64::from(at.module))),
-        ("start", PlyValue::Int(i64::from(at.start))),
-        ("end", PlyValue::Int(i64::from(at.end))),
-    ])
 }
 
 pub struct Signals {

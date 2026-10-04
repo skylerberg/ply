@@ -1170,12 +1170,6 @@ pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     ctx.heap.bridge(Value::Cell(slot))
 }
 
-/// Perceus's `dup`: the same word, held once more.
-pub unsafe extern "C" fn rt_dup(_ctx: *mut Ctx, w: i64) -> i64 {
-    heap::inc(w);
-    w
-}
-
 /// Perceus's `drop`: one holder fewer.
 pub unsafe extern "C" fn rt_dec(ctx: *mut Ctx, w: i64) {
     let ctx = unsafe { &mut *ctx };
@@ -1564,7 +1558,7 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
     let t = ply_eval::INT_TYPES[which as usize];
     let d = error(format!(
         "`{}` was given {value}: `{t}` holds {} to {}",
-        t.of_int_name(),
+        Builtin::of_int(t).name(),
         t.min(),
         t.max()
     ));
@@ -1609,11 +1603,69 @@ pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
-/// A builtin over taken arguments, by this unit's index for it.
-pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let b = ctx.tables.builtins[index as usize];
-    builtin(ctx, b, args_of(args, n))
+macro_rules! builtin_helper {
+    ($variant:ident 0) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[])
+        }
+    };
+    ($variant:ident 1) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a])
+        }
+    };
+    ($variant:ident 2) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b])
+        }
+    };
+    ($variant:ident 3) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64, c: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c])
+        }
+    };
+    ($variant:ident 4) => {
+        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64, c: i64, d: i64) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d])
+        }
+    };
+}
+
+macro_rules! builtin_helpers {
+    ($($variant:ident $name:literal $arity:tt;)*) => {
+        /// Each builtin as compiled code calls it: its words in, each one the callee's, and its
+        /// answer out.
+        #[allow(non_snake_case)]
+        mod called {
+            use super::{Builtin, Ctx, builtin};
+            $( builtin_helper!($variant $arity); )*
+        }
+
+        fn called(b: Builtin) -> *const () {
+            match b {
+                $( Builtin::$variant => called::$variant as *const (), )*
+            }
+        }
+    };
+}
+
+ply_eval::each_builtin!(builtin_helpers);
+
+/// What a unit binds a builtin's helper to: the builtin's own road past the dispatch where it has
+/// one, else its call through [`builtin`].
+pub fn builtin_address(b: Builtin) -> *const () {
+    match b {
+        Builtin::Push => rt_push as *const (),
+        Builtin::MapInsert => rt_map_insert as *const (),
+        Builtin::MapContains => rt_map_contains as *const (),
+        Builtin::ByteOfInt => rt_byte_of_int as *const (),
+        Builtin::Map => rt_map as *const (),
+        Builtin::Filter => rt_filter as *const (),
+        Builtin::Fold => rt_fold as *const (),
+        Builtin::MapFold => rt_map_fold as *const (),
+        Builtin::Iterate => rt_iterate as *const (),
+        _ => called(b),
+    }
 }
 
 /// Every call of a builtin, whether named or called through a value: natively over words where it
@@ -3543,19 +3595,6 @@ pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n:
     o as Word
 }
 
-/// A record literal: the fields in the shape's own sorted order. Takes the fields.
-pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let args = args_of(args, n);
-    let o = ctx
-        .heap
-        .alloc(KIND_RECORD, flat_over(args), n as u32, shape as u32);
-    for (i, w) in args.iter().enumerate() {
-        unsafe { set_word(o, i, *w) };
-    }
-    o as Word
-}
-
 /// One field of a record by name. `own`: 0 reads the base and holds the field once more; 2 moves
 /// the field out of a unique base that stays; 1 and 3 also take and release the base.
 pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64) -> i64 {
@@ -3667,28 +3706,6 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
     ctx.heap.list_skip(value, from.max(0) as usize)
 }
 
-/// Argument `i` of a matched constructor: moved out when `take` and it is unique, else held once
-/// more. Reads the constructor.
-pub unsafe extern "C" fn rt_ctor_arg(ctx: *mut Ctx, value: i64, i: i64, take: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(value) != KIND_CTOR {
-        let d = error("a constructor pattern bound a value that is not a constructor");
-        return ctx.fail(d);
-    }
-    let o = obj(value);
-    if i < 0 || i >= unsafe { (*o).len } as i64 {
-        let d = error("a constructor pattern read an argument that is not there");
-        return ctx.fail(d);
-    }
-    let w = unsafe { word_at(o, i as usize) };
-    if take != 0 && is_unique(value) {
-        unsafe { set_word(o, i as usize, heap::unit()) };
-    } else {
-        heap::inc(w);
-    }
-    w
-}
-
 /// `map_get` for a `match` that unwraps it at once: the value held once more, or `0` when absent,
 /// with no constructor built. Takes the map and the key.
 pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
@@ -3744,18 +3761,6 @@ fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     };
     heap::dec(answer);
     v
-}
-
-pub unsafe extern "C" fn rt_list_index(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
-    builtin(unsafe { &mut *ctx }, Builtin::ListAt, &[xs, i])
-}
-
-pub unsafe extern "C" fn rt_list_set(ctx: *mut Ctx, xs: i64, i: i64, v: i64) -> i64 {
-    builtin(unsafe { &mut *ctx }, Builtin::ListSet, &[xs, i, v])
-}
-
-pub unsafe extern "C" fn rt_array_set(ctx: *mut Ctx, xs: i64, i: i64, v: i64) -> i64 {
-    builtin(unsafe { &mut *ctx }, Builtin::ArraySet, &[xs, i, v])
 }
 
 /// `array_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].
@@ -3826,54 +3831,10 @@ pub unsafe extern "C" fn rt_map_contains(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     builtin(ctx, Builtin::MapContains, &[m, k])
 }
 
-pub unsafe extern "C" fn rt_map_get(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
-    builtin(unsafe { &mut *ctx }, Builtin::MapGet, &[m, k])
-}
-
-pub unsafe extern "C" fn rt_compare(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-    builtin(unsafe { &mut *ctx }, Builtin::Compare, &[a, b])
-}
-
 pub unsafe extern "C" fn rt_byte_of_int(ctx: *mut Ctx, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     match heap::as_int(n).and_then(|v| u8::try_from(v).ok()) {
         Some(b) => ctx.tables.byte(b),
         None => builtin(ctx, Builtin::ByteOfInt, &[n]),
     }
-}
-
-pub unsafe extern "C" fn rt_bytes_scan(
-    ctx: *mut Ctx,
-    hay: i64,
-    from: i64,
-    members: i64,
-    max: i64,
-) -> i64 {
-    builtin(
-        unsafe { &mut *ctx },
-        Builtin::BytesScan,
-        &[hay, from, members, max],
-    )
-}
-
-pub unsafe extern "C" fn rt_bytes_scan_until(
-    ctx: *mut Ctx,
-    hay: i64,
-    from: i64,
-    members: i64,
-    max: i64,
-) -> i64 {
-    builtin(
-        unsafe { &mut *ctx },
-        Builtin::BytesScanUntil,
-        &[hay, from, members, max],
-    )
-}
-
-pub unsafe extern "C" fn rt_bytes_slice(ctx: *mut Ctx, b: i64, s: i64, e: i64) -> i64 {
-    builtin(unsafe { &mut *ctx }, Builtin::BytesSlice, &[b, s, e])
-}
-
-pub unsafe extern "C" fn rt_bytes_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-    builtin(unsafe { &mut *ctx }, Builtin::BytesConcat, &[a, b])
 }

@@ -13,7 +13,7 @@ fn main() {
         Ok(runnable) => Program {
             runnable,
             shelf: ply_machine::shelf::sources().to_vec(),
-            stage: format!("cli-{}", ply_launcher::shipped::identity()),
+            stage: ply_launcher::shipped::stage_name(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         Err(diagnostic) => {
@@ -35,6 +35,7 @@ fn main() {
     // binary's own; the program configures what it drives.
     let binds = ply_machine::enter::Binds {
         lent: ply_machine::policy::all(),
+        executables: ply_launcher::executables(),
         trust: ply_launcher::trust(),
         ..ply_machine::enter::Binds::default()
     };

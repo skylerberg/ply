@@ -16,32 +16,6 @@ fn loaded(files: &[(&str, &str)]) -> Loaded {
 }
 
 #[test]
-fn entry_points_finds_main_in_whatever_module_declares_it() {
-    let loaded = loaded(&[
-        ("lib.ply", "pub fn one() -> Int = 1\n"),
-        ("app.ply", "import lib\nfn main() -> Int = lib::one()\n"),
-    ]);
-    let mains = loaded.entry_points();
-    assert_eq!(mains.len(), 1);
-    assert_eq!(mains[0].name.as_str(), "app.main");
-    assert_eq!(mains[0].module.as_str(), "app");
-}
-
-#[test]
-fn two_modules_may_each_declare_main() {
-    let loaded = loaded(&[
-        ("one.ply", "fn main() -> Int = 1\n"),
-        ("two.ply", "fn main() -> Int = 2\n"),
-    ]);
-    let mains: Vec<&str> = loaded
-        .entry_points()
-        .iter()
-        .map(|d| d.name.as_str())
-        .collect();
-    assert_eq!(mains, ["one.main", "two.main"]);
-}
-
-#[test]
 fn defs_and_tests_can_be_read_back_per_module() {
     let loaded = loaded(&[
         (

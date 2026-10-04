@@ -32,16 +32,6 @@ pub struct TypeDecl {
     pub span: Span,
 }
 
-/// One dependency as `ply.lock` pins it: what it calls itself, the version it declares, and the
-/// BLAKE3 digest of the modules it contributed. Read from the front end's answer, whose package
-/// judgments are what make a pin mean one thing rather than a path.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Pinned {
-    pub name: String,
-    pub version: String,
-    pub digest: String,
-}
-
 /// One root the emitter offers: a definition, a spec clause, a test or a law part.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct EmitterRoot {
@@ -72,15 +62,6 @@ impl EmitterRoot {
 #[derive(Clone, Debug, Default)]
 pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
-    /// The closure's packages as `(prefix, declared dep prefixes)`; empty for a project
-    /// without packages.
-    pub packages: Vec<(String, Vec<String>)>,
-    /// The closure's dependencies, in package order, as a lockfile pins them. The root package is
-    /// the project's own sources and has no entry.
-    pub pins: Vec<Pinned>,
-    /// Each module's package, in program order: an index into `packages`, or one past the end
-    /// for a module the toolchain ships.
-    pub module_packages: Vec<usize>,
     pub check: CheckOutput,
     pub hashes: HashOutput,
     /// The digest of [`hashes`](Analysis::hashes), as the compiler computed it.

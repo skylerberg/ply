@@ -1,6 +1,8 @@
 // The corpus as data, plus the reference evaluator: the same shapes the Rust model held, so a
 // shape drives both the emitted source and the expected values, and they cannot drift.
 
+import std.list (at_or)
+
 // `prim::clamp`'s modulus.
 pub fn clamp(v: Int) -> Int = v % 100003
 
@@ -141,19 +143,16 @@ pub fn own_atoms(
   regions: List<String>,
 ) -> Footprint / {abort.raise} =
   match s {
-    TableCount(t, _, _) -> [read(Db, at_str(tables, t))],
-    TableSum(t, _) -> [read(Db, at_str(tables, t))],
+    TableCount(t, _, _) -> [read(Db, at_or(tables, t, ""))],
+    TableSum(t, _) -> [read(Db, at_or(tables, t, ""))],
     TableAppend(t, _, _) ->
-      insert_sorted([read(Db, at_str(tables, t))], write(Db, at_str(tables, t)), []),
-    CachePeek(r, _) -> [read(Cache, at_str(regions, r))],
+      insert_sorted([read(Db, at_or(tables, t, ""))], write(Db, at_or(tables, t, "")), []),
+    CachePeek(r, _) -> [read(Cache, at_or(regions, r, ""))],
     CachePoke(r, _) ->
-      insert_sorted([read(Cache, at_str(regions, r))], write(Cache, at_str(regions, r)), []),
+      insert_sorted([read(Cache, at_or(regions, r, ""))], write(Cache, at_or(regions, r, "")), []),
     Now(_) -> [singleton_read(Clock)],
     _ -> [],
   }
-
-pub fn at_str(xs: List<String>, i: Int) -> String =
-  match list_at(xs, i) { Some(s) -> s, None -> "" }
 
 pub fn is_block(s: Shape) -> Bool =
   match s { TableAppend(_, _, _) -> true, CachePoke(_, _) -> true, _ -> false }
@@ -321,20 +320,25 @@ pub fn empty_corpus(tables: List<String>, regions: List<String>, shards: List<St
     shards: shards,
   }
 
-pub fn effectful_defs(c: Corpus) -> Int =
-  fold(c.defs, 0, |acc: Int, d: Def| if len(d.footprint) > 0 { acc + 1 } else { acc })
+pub fn effectful_defs(corpus: Corpus) -> Int =
+  fold(corpus.defs, 0, |acc: Int, d: Def| if len(d.footprint) > 0 { acc + 1 } else { acc })
 
 // `def(args)` under `world`, which receives exactly the writes the definition performs.
-pub fn eval(c: Corpus, id: Int, args: List<Int>, world: World) -> (World, Int) / {abort.raise} = {
-  let def = at_def(c, id);
+pub fn eval(
+  corpus: Corpus,
+  id: Int,
+  args: List<Int>,
+  world: World,
+) -> (World, Int) / {abort.raise} = {
+  let def = at_def(corpus, id);
   let p0 = match list_at(args, 0) { Some(x) -> x, None -> 0 };
   let p1 = match list_at(args, 1) { Some(x) -> x, None -> 0 };
-  let (w2, core) = eval_shape(c, def, p0, p1, world);
+  let (w2, core) = eval_shape(corpus, def, p0, p1, world);
   if len(def.extras) == 0 { (w2, core) } else {
     let (w3, sum) = fold(def.extras, (w2, 0), |acc: (World, Int), extra: Call|
       match acc {
         (w, sum) -> {
-          let (w_next, v) = invoke(c, extra, p0, w);
+          let (w_next, v) = invoke(corpus, extra, p0, w);
           (w_next, sum + v)
         },
       });
@@ -342,53 +346,60 @@ pub fn eval(c: Corpus, id: Int, args: List<Int>, world: World) -> (World, Int) /
   }
 }
 
-pub fn at_def_pub(c: Corpus, id: Int) -> Def / {abort.raise} = at_def(c, id)
+pub fn at_def_pub(corpus: Corpus, id: Int) -> Def / {abort.raise} = at_def(corpus, id)
 
-fn at_def(c: Corpus, id: Int) -> Def / {abort.raise} =
-  match list_at(c.defs, id) { Some(d) -> d, None -> panic("eval: no such definition") }
+fn at_def(corpus: Corpus, id: Int) -> Def / {abort.raise} =
+  match list_at(corpus.defs, id) { Some(d) -> d, None -> panic("eval: no such definition") }
 
-fn at_module(c: Corpus, id: Int) -> Module / {abort.raise} =
-  match list_at(c.modules, id) { Some(m) -> m, None -> panic("eval: no such module") }
+fn at_module(corpus: Corpus, id: Int) -> Module / {abort.raise} =
+  match list_at(corpus.modules, id) { Some(m) -> m, None -> panic("eval: no such module") }
 
-fn eval_shape(c: Corpus, def: Def, p0: Int, p1: Int, world: World) -> (World, Int) / {abort.raise} =
+fn eval_shape(
+  corpus: Corpus,
+  def: Def,
+  p0: Int,
+  p1: Int,
+  world: World,
+) -> (World, Int) / {abort.raise} =
   match def.shape {
     Arith(a, b) -> (world, clamp(p0 * a + b)),
     Compose(f, g) -> {
-      let (w1, left) = invoke(c, f, p0, world);
-      let (w2, right) = invoke(c, g, p0, w1);
+      let (w1, left) = invoke(corpus, f, p0, world);
+      let (w2, right) = invoke(corpus, g, p0, w1);
       (w2, mix(left, right))
     },
-    Guard(m, f, b) -> if p0 % m == 0 { invoke(c, f, p0, world) } else { (world, clamp(p0 + b)) },
+    Guard(m, f, b) -> if p0 % m == 0 { invoke(corpus, f, p0, world) }
+    else { (world, clamp(p0 + b)) },
     Fold(n, k) -> (world, fold(range(0, n), 0, |acc: Int, v: Int| clamp(acc + v * k + p0))),
     Record(m, k) -> (world, weigh(p0 % m, clamp(p0 * k))),
     Sum(off, f, idle) -> {
-      let module = at_module(c, def.module);
+      let module = at_module(corpus, def.module);
       let x = p0 + off;
       if x % module.helper.m == 0 { (world, idle) }
-      else { invoke(c, f, clamp(x + module.helper.b), world) }
+      else { invoke(corpus, f, clamp(x + module.helper.b), world) }
     },
     Chain(inner, outer, b) -> {
-      let (w1, v) = invoke(c, inner, p0, world);
-      invoke_with(c, { target: outer, offset: 0 }, v + b, w1)
+      let (w1, v) = invoke(corpus, inner, p0, world);
+      invoke_with(corpus, { target: outer, offset: 0 }, v + b, w1)
     },
     ListMap(n, k) -> (world, total(map(range(0, n), |v: Int| clamp(v * k + p0)))),
     Pair(f, a, b) -> {
-      let (w1, left) = invoke(c, f, p0, world);
+      let (w1, left) = invoke(corpus, f, p0, world);
       (w1, mix(left, p1 * a + b))
     },
     TableCount(table, a, f) -> {
-      let label = at_str(c.tables, table);
+      let label = at_or(corpus.tables, table, "");
       let (w1, rows) = world_read_table(world, label, table);
-      let (w2, rest) = invoke(c, f, p0, w1);
+      let (w2, rest) = invoke(corpus, f, p0, w1);
       (w2, clamp(len(rows) * a + rest))
     },
     TableSum(table, a) -> {
-      let label = at_str(c.tables, table);
+      let label = at_or(corpus.tables, table, "");
       let (w1, rows) = world_read_table(world, label, table);
       (w1, clamp(total(rows) + p0 * a))
     },
     TableAppend(table, a, b) -> {
-      let label = at_str(c.tables, table);
+      let label = at_or(corpus.tables, table, "");
       let (w1, rows) = world_read_table(world, label, table);
       let before = len(rows);
       let pushed = clamp(p0 * a);
@@ -397,12 +408,12 @@ fn eval_shape(c: Corpus, def: Def, p0: Int, p1: Int, world: World) -> (World, In
       (w3, clamp(before * b + p0))
     },
     CachePeek(region, a) -> {
-      let label = at_str(c.regions, region);
+      let label = at_or(corpus.regions, region, "");
       let (w1, seen) = world_read_region(world, label, region);
       (w1, clamp(seen + p0 * a))
     },
     CachePoke(region, a) -> {
-      let label = at_str(c.regions, region);
+      let label = at_or(corpus.regions, region, "");
       let (w1, seen) = world_read_region(world, label, region);
       let w2 = { ..w1, touched: atom_insert(w1.touched, write(Cache, label)) };
       let w3 = world_set_region(w2, region, clamp(seen + p0));
@@ -414,11 +425,11 @@ fn eval_shape(c: Corpus, def: Def, p0: Int, p1: Int, world: World) -> (World, In
     },
   }
 
-fn invoke(c: Corpus, call: Call, p0: Int, world: World) -> (World, Int) / {abort.raise} =
-  invoke_with(c, call, p0 + call.offset, world)
+fn invoke(corpus: Corpus, call: Call, p0: Int, world: World) -> (World, Int) / {abort.raise} =
+  invoke_with(corpus, call, p0 + call.offset, world)
 
-fn invoke_with(c: Corpus, call: Call, arg: Int, world: World) -> (World, Int) / {abort.raise} =
-  eval(c, call.target, call_args(at_def(c, call.target).arity, arg, call.offset), world)
+fn invoke_with(corpus: Corpus, call: Call, arg: Int, world: World) -> (World, Int) / {abort.raise} =
+  eval(corpus, call.target, call_args(at_def(corpus, call.target).arity, arg, call.offset), world)
 
 // The second parameter derives from the call's offset, so emission and evaluation agree.
 pub fn call_args(arity: Int, first: Int, offset: Int) -> List<Int> =
@@ -428,12 +439,12 @@ pub fn second_arg(offset: Int) -> Int = offset * 7 % 97 + 3
 
 // --- The obligations the corpus carries ---------------------------------------------------
 
-pub fn obligations_by_intent(c: Corpus) -> (Int, Int, Int) = {
-  let claims = fold(c.defs, (0, 0, 0), |acc: (Int, Int, Int), d: Def|
+pub fn obligations_by_intent(corpus: Corpus) -> (Int, Int, Int) = {
+  let claims = fold(corpus.defs, (0, 0, 0), |acc: (Int, Int, Int), d: Def|
     match d.claim { None -> acc, Some(cl) -> bump(acc, cl.intent) });
-  let with_specimens = fold(c.specimens, claims, |acc: (Int, Int, Int), s: Specimen|
+  let with_specimens = fold(corpus.specimens, claims, |acc: (Int, Int, Int), s: Specimen|
     bump(acc, specimen_intent(s.kind)));
-  fold(c.laws, with_specimens, |acc: (Int, Int, Int), l: Law| bump(acc, law_intent(l.kind)))
+  fold(corpus.laws, with_specimens, |acc: (Int, Int, Int), l: Law| bump(acc, law_intent(l.kind)))
 }
 
 fn bump(acc: (Int, Int, Int), intent: Intent) -> (Int, Int, Int) =
@@ -445,8 +456,8 @@ fn bump(acc: (Int, Int, Int), intent: Intent) -> (Int, Int, Int) =
     },
   }
 
-pub fn specified_defs(c: Corpus) -> Int =
-  fold(c.defs, 0, |acc: Int, d: Def| match d.claim { Some(_) -> acc + 1, None -> acc })
+pub fn specified_defs(corpus: Corpus) -> Int =
+  fold(corpus.defs, 0, |acc: Int, d: Def| match d.claim { Some(_) -> acc + 1, None -> acc })
 
 // --- Tests --------------------------------------------------------------------------------
 

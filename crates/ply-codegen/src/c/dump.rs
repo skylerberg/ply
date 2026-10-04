@@ -8,8 +8,8 @@ use ply_eval::decode::{AnswerValue, Error};
 use ply_eval::{
     Analysis, Carry, DefHash, DefInfo, Diagnostic, Edit, EffectAtom, EffectInfo, EmitterRoot, Fix,
     Footprint, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo, ModuleName, OpInfo,
-    Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo, TypeDecl,
-    Value, Visibility, intern_code,
+    Ordinal, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo, TypeDecl, Value,
+    Visibility, intern_code,
 };
 use std::collections::BTreeMap;
 
@@ -18,11 +18,6 @@ const ANSWER: &str = "the front end's answer";
 
 /// The module index of a span outside every module.
 const NO_MODULE: u32 = u32::MAX;
-
-/// A table under its name, or under the name the checked-in builder's answer still gives it.
-fn renamed<'v>(d: AnswerValue<'v>, name: &str, was: &str) -> Result<AnswerValue<'v>, Error> {
-    d.field(name).or_else(|_| d.field(was))
-}
 
 /// `sources[i]` is the source a module index `i` names: the program's own modules, the shipped
 /// ones pulled after them, then any manifest the answer places past those.
@@ -38,20 +33,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
         return Ok(front);
     }
 
-    front.packages = d.field("packages")?.items(|p| {
-        Ok((
-            p.field("prefix")?.utf8()?.to_string(),
-            strings(p.field("deps")?)?,
-        ))
-    })?;
-    front.pins = d.field("pins")?.items(|p| {
-        Ok(Pinned {
-            name: p.field("name")?.utf8()?.to_string(),
-            version: p.field("version")?.utf8()?.to_string(),
-            digest: p.field("digest")?.utf8()?.to_string(),
-        })
-    })?;
-    front.module_packages = renamed(d, "module_packages", "mod_pkg")?.items(|i| i.number())?;
     for m in d.field("modules")?.list()? {
         let name = m.field("name")?.utf8()?;
         let index = m.field("index")?;
@@ -93,7 +74,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
     }
     hashes(d.field("hashes")?, &mut front)?;
     front.hashes_digest = DefHash(d.field("hashes_digest")?.byte_array()?);
-    front.emitter_roots = renamed(d, "emitter_roots", "emit_roots")?.items(|e| {
+    front.emitter_roots = d.field("emitter_roots")?.items(|e| {
         Ok(EmitterRoot {
             root: Symbol::new(e.field("root")?.utf8()?),
             arity: e.field("arity")?.number()?,
@@ -104,7 +85,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
             witnesses: e.field("witnesses")?.items(|w| w.number())?,
         })
     })?;
-    for k in renamed(d, "emitter_ctors", "emit_ctors")?.list()? {
+    for k in d.field("emitter_ctors")?.list()? {
         let name = Symbol::new(k.field("name")?.utf8()?);
         front
             .ctor_carries

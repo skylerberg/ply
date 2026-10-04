@@ -104,6 +104,7 @@ static inline void ply_set_field(Word base, int at, Word v) { ply_words(base)[at
 
 /// A runtime helper the emitted C may call: arguments past the context, whether it answers, and
 /// the function a loaded unit binds it to.
+#[derive(Clone, Copy)]
 pub struct Helper {
     pub name: &'static str,
     pub args: usize,
@@ -111,9 +112,14 @@ pub struct Helper {
     pub address: *const (),
 }
 
+// SAFETY: an address is read and never written through.
+unsafe impl Send for Helper {}
+unsafe impl Sync for Helper {}
+
 macro_rules! helpers {
     ($(($f:ident, $a:literal, $r:literal)),* $(,)?) => {
-        pub const HELPERS: &[Helper] = &[$(Helper {
+        /// The helpers that are no builtin's: what the emitted C does to values, frames and handlers.
+        const OWN: &[Helper] = &[$(Helper {
             name: stringify!($f),
             args: $a,
             answers: $r,
@@ -123,7 +129,6 @@ macro_rules! helpers {
 }
 
 helpers![
-    (rt_dup, 1, true),
     (rt_dec, 1, false),
     (rt_reset, 1, true),
     (rt_box_int, 1, true),
@@ -141,32 +146,16 @@ helpers![
     (rt_not_that_width, 2, false),
     (rt_equal, 2, true),
     (rt_concat, 2, true),
-    (rt_builtin, 3, true),
     (rt_bytes_join, 2, true),
     (rt_builtin_value, 1, true),
     (rt_ctor_value, 1, true),
     (rt_constant, 1, true),
     (rt_call, 3, true),
     (rt_closure, 4, true),
-    (rt_map, 2, true),
-    (rt_filter, 2, true),
-    (rt_fold, 3, true),
-    (rt_map_fold, 3, true),
     (rt_iterate, 3, true),
-    (rt_push, 2, true),
-    (rt_map_insert, 3, true),
-    (rt_map_contains, 2, true),
-    (rt_map_get, 2, true),
-    (rt_compare, 2, true),
-    (rt_byte_of_int, 1, true),
-    (rt_bytes_concat, 2, true),
-    (rt_bytes_slice, 3, true),
-    (rt_bytes_scan, 4, true),
-    (rt_bytes_scan_until, 4, true),
     (rt_iterate_bad, 2, false),
     (rt_shift_count, 2, false),
     (rt_ctor, 3, true),
-    (rt_record, 3, true),
     (rt_field, 3, true),
     (rt_list, 2, true),
     (rt_record_fits, 3, true),
@@ -174,9 +163,7 @@ helpers![
     (rt_list_fits, 3, true),
     (rt_list_at, 2, true),
     (rt_list_rest, 2, true),
-    (rt_ctor_arg, 3, true),
     (rt_alloc, 4, true),
-    (rt_list_index, 2, true),
     (rt_nullary, 1, true),
     (rt_cell, 1, true),
     (rt_handle_push, 3, true),
@@ -186,20 +173,39 @@ helpers![
     (rt_handle_detached, 4, true),
     (rt_region, 1, true),
     (rt_region_close, 1, false),
-    (rt_list_set, 3, true),
     (rt_list_lookup, 2, true),
     (rt_map_lookup, 2, true),
     (rt_tick, 0, false),
-    // Appended, never inserted: a unit binds helpers by position, so a committed bundle serves
-    // only while this table still starts with the one it was emitted against.
     (rt_grow, 2, true),
     (rt_bitnot, 1, true),
     (rt_inc_shared, 1, false),
     (rt_dec_shared, 1, false),
     (rt_parallel, 2, false),
-    (rt_array_set, 3, true),
     (rt_array_lookup, 2, true),
 ];
+
+/// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
+/// no C name holds one.
+pub fn builtin_helper_name(builtin: &str) -> String {
+    match builtin.strip_prefix('?') {
+        Some(written) => format!("builtin_elaborated_{written}"),
+        None => format!("builtin_{builtin}"),
+    }
+}
+
+/// Every helper a unit may bind: the runtime's own, then one a builtin.
+pub fn helpers() -> &'static [Helper] {
+    static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let builtins = ply_eval::Builtin::all().iter().map(|b| Helper {
+            name: Box::leak(builtin_helper_name(b.name()).into_boxed_str()),
+            args: b.arity(),
+            answers: true,
+            address: crate::rt::builtin_address(*b),
+        });
+        OWN.iter().copied().chain(builtins).collect()
+    })
+}
 
 /// The line that opens the runtime's definitions: everything from it on is the unit's tail, the
 /// one translation unit that defines what [`runtime_header`] declares.
@@ -220,7 +226,7 @@ fn signature(h: &Helper) -> (&'static str, String) {
 /// parts binds one table rather than one per part.
 pub fn runtime_header() -> String {
     let mut out = String::from("\n/* --- the runtime, declared --- */\n");
-    for h in HELPERS {
+    for h in helpers() {
         let (ret, params) = signature(h);
         out.push_str(&format!(
             "extern {ret} (*{})({params});\n",
@@ -254,10 +260,10 @@ pub fn runtime_header() -> String {
 }
 
 /// The runtime's definitions and the exported binders that fill them, generated from
-/// [`HELPERS`]; the unit's tail holds them once.
+/// [`helpers`]; the unit's tail holds them once.
 pub fn runtime_object() -> String {
     let mut out = format!("\n{RUNTIME_MARK}\n");
-    for h in HELPERS {
+    for h in helpers() {
         let (ret, params) = signature(h);
         out.push_str(&format!("{ret} (*{})({params});\n", pointer_name(h.name)));
     }
@@ -266,7 +272,7 @@ pub fn runtime_object() -> String {
         "void ply_bind_singletons(Word t, Word f, Word u) { ply_true = t; ply_false = f; ply_unit = u; }\n",
     );
     out.push_str("\nvoid ply_bind(void **fns) {\n");
-    for (i, h) in HELPERS.iter().enumerate() {
+    for (i, h) in helpers().iter().enumerate() {
         let (ret, params) = signature(h);
         out.push_str(&format!(
             "  {} = ({ret} (*)({params}))fns[{i}];\n",
