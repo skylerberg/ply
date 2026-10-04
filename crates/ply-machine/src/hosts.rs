@@ -655,7 +655,7 @@ pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String 
         hasher.update(SHUTDOWN_DOMAIN);
         shutdown.hash_into(&mut hasher);
     }
-    ply_std::short_digest(hasher.finalize().as_bytes())
+    ply_eval::digest::short(hasher.finalize().as_bytes())
 }
 
 /// Domain-separated so a listing with an empty disclosure cannot collide with one that has none.

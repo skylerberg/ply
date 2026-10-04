@@ -13,9 +13,6 @@ use ply_eval::{
 use ring::rand::SecureRandom;
 use std::sync::Arc;
 
-/// The Ply declaration the registrations below are checked against.
-pub const DECLARATION: &str = ply_std::RANDOM;
-
 pub const MODULE: &str = "std.random";
 
 pub const EFFECT: &str = "std.random.entropy";

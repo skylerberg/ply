@@ -9,8 +9,10 @@ This guide is the reference for writing Ply and using the `ply` command.
 
 ## 1. Getting started
 
-Build with `cargo build --release` and put `target/release/ply` on your path. A
-Ply file is a module:
+Build with `cargo build --release -p ply-launcher --bins`, then `cargo pack
+target/release/ply` to append the shipped modules and the `ply` program to it, and
+put `target/release/ply` on your path. After editing Ply sources in the checkout,
+`cargo pack` again is the whole rebuild. A Ply file is a module:
 
 ```ply
 // hello/main.ply

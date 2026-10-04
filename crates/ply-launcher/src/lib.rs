@@ -1,9 +1,9 @@
-//! The launcher: enter a shipped program with the command line, its shelf beside it, and its
-//! environment lent.
+//! The launcher: enter a shipped program with the command line, the shipped modules beside it, and
+//! its environment lent.
 //!
 //! This is the whole of what stands between the operating system and the program `ply` is: the
-//! big-stack thread, the runnable opened, the `cwd` and `shelf` roots, the process and environment
-//! bindings, and the exit code.
+//! big-stack thread, the runnable opened, the `cwd` and `shipped` roots, the process and
+//! environment bindings, and the exit code.
 
 use ply_eval::{Diagnostic, Ended, codes};
 use ply_machine::enter::{self, Binds};
@@ -13,19 +13,36 @@ use std::path::{Path, PathBuf};
 /// The front end and emitter recurse once per node on the native stack.
 const STACK: usize = 256 << 20;
 
-/// What a launched program is: the runnable it is entered from, the shelf its modules lay out as,
-/// the root its `cwd` names, and the binary's version for the environment it may ask about.
+/// What a launched program is: the runnable it is entered from, the shipped modules it reads as
+/// files, the root its `cwd` names, and the binary's version for the environment it may ask about.
 pub struct Program {
     pub runnable: Runnable,
-    pub shelf: Vec<(String, String)>,
-    /// The stage's identity: the shelf lands under it, beside the C cache.
+    pub shipped_modules: Vec<(String, String)>,
+    /// The stage's identity: the shipped modules land under it, beside the C cache.
     pub stage: String,
     pub version: String,
 }
 
-/// The marker that says a shelf directory is whole; landed last, so a reader never sees half of
-/// one. Not a `.ply` file, so the program's own listing passes over it.
-const SHELF_MARKER: &str = "SHELF.ok";
+/// The marker that says a shipped modules directory is whole; landed last, so a reader never sees
+/// half of one. Not a `.ply` file, so the program's own listing passes over it.
+const SHIPPED_MARKER: &str = "SHIPPED.ok";
+
+/// The pack appended to this binary, installed for everything after it to read.
+pub fn install_own_pack() -> Result<(), String> {
+    let binary =
+        std::env::current_exe().map_err(|e| format!("this binary cannot be found: {e}"))?;
+    match ply_pack::Pack::of_binary(&binary)? {
+        Some(pack) => {
+            ply_pack::install(pack);
+            Ok(())
+        }
+        None => Err(format!(
+            "`{}` carries no pack; `cargo pack {}` appends the checkout's",
+            binary.display(),
+            binary.display()
+        )),
+    }
+}
 
 /// The PEM files `PLY_TRUST` names, separated as `PATH` separates directories: roots the program's
 /// own `net.connect_tls` accepts beside the built-in ones, as `--trust` gives a program a command
@@ -81,20 +98,21 @@ pub fn stamps() -> String {
     )
 }
 
-/// Each file lands by a rename and the marker last, so a run that finds the marker finds it whole.
-pub fn shelf(program: &Program, definitions: &str) -> Result<PathBuf, Diagnostic> {
+/// The shipped modules as files, with the stamps and definitions beside them. Each file lands by a
+/// rename and the marker last, so a run that finds the marker finds it whole.
+pub fn shipped_modules(program: &Program, definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
     let mut laid = blake3::Hasher::new();
     laid.update(stamps.as_bytes());
     laid.update(&[0]);
     laid.update(definitions.as_bytes());
     let dir = ply_codegen::c::stage::stage_dir(&program.stage)
-        .join(format!("shelf-{}", &laid.finalize().to_hex()[..16]));
-    if dir.join(SHELF_MARKER).exists() {
+        .join(format!("shipped-{}", &laid.finalize().to_hex()[..16]));
+    if dir.join(SHIPPED_MARKER).exists() {
         ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(&program.stage));
         return Ok(dir);
     }
-    lay_out(&dir, &program.shelf, &stamps, definitions).map_err(|e| {
+    lay_out(&dir, &program.shipped_modules, &stamps, definitions).map_err(|e| {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!(
@@ -123,7 +141,7 @@ fn lay_out(
     }
     write_atomically(&dir.join(STAMPS), stamps.as_bytes())?;
     write_atomically(&dir.join(DEFINITIONS), definitions.as_bytes())?;
-    write_atomically(&dir.join(SHELF_MARKER), b"ok")
+    write_atomically(&dir.join(SHIPPED_MARKER), b"ok")
 }
 
 /// Enter the program on the command's own big-stack thread; the answer is the exit code it asked
@@ -137,8 +155,8 @@ pub fn run(
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
     let definitions = ply_machine::shipped::definitions(&program.runnable.front.answer);
-    let shelf = match shelf(&program, &definitions) {
-        Ok(shelf) => shelf,
+    let shipped = match shipped_modules(&program, &definitions) {
+        Ok(shipped) => shipped,
         Err(refused) => return Ended::refused(refused),
     };
     ply_machine::shipped::stamp(stamps());
@@ -154,8 +172,8 @@ pub fn run(
             path: root.to_path_buf(),
         },
         ply_host::fs::RootSpec {
-            name: "shelf".to_string(),
-            path: shelf,
+            name: "shipped".to_string(),
+            path: shipped,
         },
         // The program is the tool: a path that leaves the working directory is addressed under
         // `abs`, the filesystem's root.

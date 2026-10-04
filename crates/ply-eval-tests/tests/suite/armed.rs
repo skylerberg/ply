@@ -682,38 +682,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Every `.ply` source a workspace member ships, which is production the same way `src/` is.
-fn ply_sources(root: &Path) -> Vec<Source> {
-    let mut out = Vec::new();
-    // ply-cli is the CLI's sources without a crate of its own; ply-launcher ships them, so its
-    // directory answers for both.
-    let mut owners: Vec<String> = workspace_members(root);
-    owners.retain(|member| member != "ply-launcher");
-    owners.push("ply-cli".to_string());
-    for member in owners {
-        let dir = root.join("crates").join(&member).join("ply");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "ply"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let Ok(text) = std::fs::read(&path) else {
-                continue;
-            };
-            let rel = format!(
-                "crates/{member}/ply/{}",
-                path.file_name().unwrap().to_string_lossy()
-            );
+/// Every `.ply` source a `ply` binary ships — the shipped modules and the `ply` program's packages —
+/// which is production the same way `src/` is.
+fn ply_sources() -> Vec<Source> {
+    let pack = ply_pack::installed();
+    pack.paths()
+        .filter(|path| path.ends_with(".ply"))
+        .map(|path| {
+            let text = pack
+                .bytes(path)
+                .expect("the pack carries what it lists")
+                .to_vec();
             let masked = ply_item_bodies_masked(&text);
-            out.push(Source { rel, text, masked });
-        }
-    }
-    out
+            Source {
+                rel: path.to_string(),
+                text,
+                masked,
+            }
+        })
+        .collect()
 }
 
 /// True where a byte sits inside a `test` or `law` body, which is not production any more than
@@ -1160,7 +1147,7 @@ fn tree() -> &'static Tree {
         let registry = registry_rows(&root);
         // A Ply source raises a code by its number, so an arming there is matched against the
         // constant's number rather than against `codes::NAME`.
-        let raised = ply_armed_numbers(&ply_sources(&root));
+        let raised = ply_armed_numbers(&ply_sources());
         let mut armed = armed_codes(&sources);
         for (name, (number, _)) in &declared {
             if raised.contains(number) {

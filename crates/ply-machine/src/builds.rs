@@ -1,8 +1,8 @@
 //! The builder this binary carries, and what it builds: the compiler's own `build.main`, a
 //! runnable like any other. The committed one builds the `ply` program. The one a program held in
 //! memory is answered by is this tree's own: the committed one when that was built for this
-//! binary's shelf and runtime, else the one an earlier process staged, else one the committed
-//! builder builds now from the shelf's compiler.
+//! binary's shipped modules and runtime, else the one an earlier process staged, else one the
+//! committed builder builds now from the shipped compiler.
 
 use crate::enter::{self, Binds};
 use crate::runnable::{self, Runnable};
@@ -10,12 +10,9 @@ use ply_codegen::c::{stage, sweep};
 use ply_eval::{Diagnostic, Severity, Span, codes};
 use std::path::{Path, PathBuf};
 
-/// Where the compiler's package sits in a stage laid out from the shelf, as `ply bootstrap` reads
+/// Where the compiler's package sits in a stage laid out from the pack, as `ply bootstrap` reads
 /// it in a checkout.
-const ROOT: &str = "crates/ply-compiler/ply";
-
-/// Beside [`ROOT`], where the compiler's `embed("../prelude.ply")` reads it.
-const PRELUDE_FILE: &str = "prelude.ply";
+const ROOT: &str = ply_pack::COMPILER;
 
 const ENTRY: &str = "build.main";
 
@@ -32,6 +29,14 @@ enum Asked {
     Answer,
 }
 
+/// A name for work set aside before it lands, which no other process or thread uses: two threads
+/// of one process can build the same thing at once.
+pub fn aside() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}.{n}", std::process::id())
+}
+
 /// What a set of modules is, as `(path, text)` pairs in any order.
 pub fn digest_of(modules: &[(String, String)]) -> String {
     let mut sorted: Vec<&(String, String)> = modules.iter().collect();
@@ -46,7 +51,7 @@ pub fn digest_of(modules: &[(String, String)]) -> String {
     h.finalize().to_hex()[..16].to_string()
 }
 
-/// What a builder is a function of: the shelf it is built from, the compiler among it, and the
+/// What a builder is a function of: the shipped modules it is built from, the compiler among them, and the
 /// runtime its unit is compiled against.
 pub fn identity() -> String {
     static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -54,7 +59,7 @@ pub fn identity() -> String {
         .get_or_init(|| {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"ply builder 1\0");
-            hasher.update(digest_of(crate::shelf::sources()).as_bytes());
+            hasher.update(digest_of(crate::shipped_modules::sources()).as_bytes());
             hasher.update(&[0]);
             hasher.update(ply_codegen::c::runtime_digest().as_bytes());
             hasher.finalize().to_hex()[..16].to_string()
@@ -72,14 +77,29 @@ fn rows(program: &str) -> PathBuf {
     stage::stage_dir(sweep::ROWS).join(program)
 }
 
-/// The digest of the shelf and runtime the committed builder was built for.
+/// The builder main last refreshed, and the digest of the shipped modules and runtime it was built
+/// for.
+const COMMITTED: &str = "crates/ply-compiler/bootstrap/build.run";
+const COMMITTED_DIGEST: &str = "crates/ply-compiler/bootstrap/build.digest";
+
+/// The key a builder keeps the committed builder under, when one was committed.
+const COMMITTED_KEY: &str = "crates/ply-compiler/bootstrap/build.key";
+
 pub fn committed_digest() -> &'static str {
-    ply_compiler::bootstrap::BUILDER_DIGEST.trim()
+    ply_pack::installed()
+        .text(COMMITTED_DIGEST)
+        .expect("the pack carries the committed builder's digest")
+        .trim()
 }
 
-/// The builder main last refreshed.
+fn committed_bytes() -> &'static [u8] {
+    ply_pack::installed()
+        .bytes(COMMITTED)
+        .expect("the pack carries the committed builder")
+}
+
 fn committed() -> Result<Runnable, Diagnostic> {
-    runnable::decode(ply_compiler::bootstrap::BUILDER).map_err(|why| {
+    runnable::decode(committed_bytes()).map_err(|why| {
         unbuilt(format!(
             "the committed builder does not read: {why}; a field the runtime requires of a front \
              end's answer lands after main's builder writes it"
@@ -87,12 +107,12 @@ fn committed() -> Result<Runnable, Diagnostic> {
     })
 }
 
-/// `runnable` laid where a builder keeps the programs it built, under the key in the file at
-/// `key`, which `ply bootstrap` writes beside a runnable it commits: a builder asked for a program
-/// that enters the definition the committed one does then takes the committed one. A checkout whose
-/// runnable was committed without a key has none to lay.
-pub fn kept_as_built(key: &Path, runnable: impl FnOnce() -> Option<Vec<u8>>) {
-    let Ok(key) = std::fs::read_to_string(key) else {
+/// `runnable` laid where a builder keeps the programs it built, under `key`, which `ply bootstrap`
+/// writes beside a runnable it commits: a builder asked for a program that enters the definition
+/// the committed one does then takes the committed one. A runnable committed without a key has
+/// none to lay.
+pub fn kept_as_built(key: Option<&str>, runnable: impl FnOnce() -> Option<Vec<u8>>) {
+    let Some(key) = key else {
         return;
     };
     let key = key.trim();
@@ -105,7 +125,7 @@ pub fn kept_as_built(key: &Path, runnable: impl FnOnce() -> Option<Vec<u8>>) {
         return;
     }
     let Some(bytes) = runnable() else { return };
-    let aside = dir.join(format!("{key}.{}.tmp", std::process::id()));
+    let aside = dir.join(format!("{key}.{}.tmp", aside()));
     if std::fs::create_dir_all(&dir).is_ok()
         && std::fs::write(&aside, bytes).is_ok()
         && std::fs::rename(&aside, &at).is_err()
@@ -142,7 +162,7 @@ pub fn alone<T>(
     made
 }
 
-/// This tree's own builder: the committed one when it was built for this shelf and runtime, else
+/// This tree's own builder: the committed one when it was built for these shipped modules and runtime, else
 /// staged, else built now by the committed one and staged.
 pub fn builder() -> Result<Runnable, Diagnostic> {
     if committed_digest() == identity() {
@@ -157,9 +177,9 @@ pub fn builder() -> Result<Runnable, Diagnostic> {
             return Ok(builder);
         }
         let src = laid_out()?;
-        let fresh = staged.with_extension(format!("run.{}", std::process::id()));
-        kept_as_built(Path::new(ply_compiler::bootstrap::BUILDER_KEY), || {
-            Some(ply_compiler::bootstrap::BUILDER.to_vec())
+        let fresh = staged.with_extension(format!("run.{}", aside()));
+        kept_as_built(ply_pack::installed().text(COMMITTED_KEY), || {
+            Some(committed_bytes().to_vec())
         });
         build_by_committed(&src, ROOT, ENTRY, &fresh, "builder")?;
         landed(&fresh, &staged)
@@ -177,7 +197,7 @@ fn build_by_committed(
 ) -> Result<(), Diagnostic> {
     let committed = committed()?;
     // A builder that files what it keeps under its own definitions keeps and seeds as it does
-    // anywhere; one from before that would file under this shelf's, so it keeps nothing.
+    // anywhere; one from before that would file under these shipped modules', so it keeps nothing.
     let own = declared(&committed.front.answer).contains("definitions");
     let seeds = rows(rows_of);
     build_with(
@@ -203,7 +223,7 @@ pub fn build(
     rows_of: &str,
 ) -> Result<(), Diagnostic> {
     let started = std::time::Instant::now();
-    let fresh = out.with_extension(format!("run.{}", std::process::id()));
+    let fresh = out.with_extension(format!("run.{}", aside()));
     build_by_committed(src, root, entry, &fresh, rows_of)?;
     let built = started.elapsed();
     landed(&fresh, out)?;
@@ -226,7 +246,7 @@ pub fn build_by_own(
     out: &Path,
     rows_of: &str,
 ) -> Result<(), Diagnostic> {
-    let fresh = out.with_extension(format!("run.{}", std::process::id()));
+    let fresh = out.with_extension(format!("run.{}", aside()));
     build_with(
         builder()?,
         src,
@@ -261,7 +281,7 @@ pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
         sweep::used(&at);
         return Ok(bytes);
     }
-    let src = stage::stage_dir(sweep::ANSWERED).join(format!("{key}.src.{}", std::process::id()));
+    let src = stage::stage_dir(sweep::ANSWERED).join(format!("{key}.src.{}", aside()));
     let written = files.iter().try_for_each(|(path, text)| {
         let file = src.join(path);
         if let Some(parent) = file.parent() {
@@ -275,7 +295,7 @@ pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
             src.display()
         ))
     })?;
-    let fresh = at.with_extension(format!("run.{}", std::process::id()));
+    let fresh = at.with_extension(format!("run.{}", aside()));
     let built = build_with(builder()?, &src, ".", "", &fresh, None, true, Asked::Answer);
     let _ = std::fs::remove_dir_all(&src);
     built?;
@@ -321,7 +341,7 @@ pub fn module_files(modules: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The shipped operations `front` declares: a builder behind this binary's shelf was built before
+/// The shipped operations `front` declares: a builder behind this binary's shipped modules was built before
 /// any added since, and is lent only those it names.
 fn lent_to(front: &ply_eval::Analysis) -> Vec<crate::hosts::LentOp> {
     let declared = declared(front);
@@ -364,15 +384,16 @@ fn laid_out() -> Result<PathBuf, Diagnostic> {
     if at.is_dir() {
         return Ok(at);
     }
-    let aside = stage().join(format!("src.{}", std::process::id()));
-    let package = aside.join(ROOT);
-    let written = std::fs::create_dir_all(&package)
-        .and_then(|()| {
-            ply_compiler::MODULES.iter().try_for_each(|(name, text)| {
-                std::fs::write(package.join(format!("{name}.ply")), text)
+    let aside = stage().join(format!("src.{}", aside()));
+    let pack = ply_pack::installed();
+    let written = std::fs::create_dir_all(aside.join(ROOT)).and_then(|()| {
+        pack.files_in(ROOT)
+            .chain([ply_pack::PRELUDE])
+            .try_for_each(|path| {
+                let bytes = pack.bytes(path).expect("the pack carries what it lists");
+                std::fs::write(aside.join(path), bytes)
             })
-        })
-        .and_then(|()| std::fs::write(package.with_file_name(PRELUDE_FILE), ply_compiler::PRELUDE));
+    });
     written.map_err(|e| {
         unbuilt(format!(
             "the compiler's sources could not be placed in `{}`: {e}",
@@ -428,7 +449,7 @@ fn build_with(
         .to_string(),
     ];
     let argv = match asked {
-        // A builder behind the shelf is only ever asked to ship, in the words it was built to read.
+        // A builder behind the shipped modules is only ever asked to ship, in the words it was built to read.
         Asked::Ship => argv,
         Asked::Answer => [argv, vec!["answer".to_string()]].concat(),
     };
