@@ -240,11 +240,16 @@ pub fn first(buf: Bytes) -> Partial / {abort.raise} = {
 }
 
 // Every whole frame in `buf`, and the bytes that are not yet one.
-pub fn read(buf: Bytes) -> Frames / {abort.raise} = read_all(buf, [])
+pub fn read(buf: Bytes) -> Frames / {abort.raise} = read_all(buf, [], bytes_len(buf))
 
-fn read_all(buf: Bytes, acc: List<Message>) -> Frames / {abort.raise} = {
+// A frame is five bytes at least, so the bytes bound the frames: `left`.
+fn read_all(buf: Bytes, acc: List<Message>, left: Int) -> Frames / {abort.raise} = {
   let p = first(buf);
-  match p.frame { None -> { done: acc, rest: p.rest }, Some(m) -> read_all(p.rest, push(acc, m)) }
+  match p.frame {
+    None -> { done: acc, rest: p.rest },
+    Some(m) -> if left <= 0 { panic("more frames than bytes") }
+    else { read_all(p.rest, push(acc, m), left - 1) },
+  }
 }
 
 // --- Reading a body -----------------------------------------------------------
@@ -394,15 +399,18 @@ fn oids(body: Bytes, at: Int, left: Int, acc: List<Int>) -> Option<List<Int>> / 
 // detail and `n` the constraint a violation names.
 pub type Field = { code: Int, text: String }
 
-pub fn diagnostic_fields(m: Message) -> List<Field> / {abort.raise} = fields_of(m.body, 0, [])
+pub fn diagnostic_fields(m: Message) -> List<Field> / {abort.raise} =
+  fields_of(m.body, 0, [], bytes_len(m.body))
 
-fn fields_of(b: Bytes, at: Int, acc: List<Field>) -> List<Field> / {abort.raise} =
+// A field is its code and its text's end at least, so the bytes bound the fields: `left`.
+fn fields_of(b: Bytes, at: Int, acc: List<Field>, left: Int) -> List<Field> / {abort.raise} =
   if at >= bytes_len(b) { acc }
   else if bytes_at(b, at) == 0 { acc } else {
     let code = bytes_at(b, at);
     match read_cstring(b, at + 1) {
       None -> acc,
-      Some(field) -> fields_of(b, field.next, push(acc, { code: code, text: field.text })),
+      Some(field) -> if left <= 0 { panic("more fields than bytes") }
+      else { fields_of(b, field.next, push(acc, { code: code, text: field.text }), left - 1) },
     }
   }
 
@@ -477,14 +485,29 @@ fn read_message<[l]>(
   c: Int,
   buf: Bytes,
   timeout_ms: Int,
+) -> Result<Received, ClientError> / {net.recv[l], abort.raise} =
+  awaiting[l](c, buf, timeout_ms, 4294967297)
+
+// A frame is at most 2^32 bytes past its kind, and a round adds a byte at least, so a well-formed
+// one is whole within `room` rounds.
+fn awaiting<[l]>(
+  c: Int,
+  buf: Bytes,
+  timeout_ms: Int,
+  room: Int,
 ) -> Result<Received, ClientError> / {net.recv[l], abort.raise} = {
   let p = first(buf);
   match p.frame {
     Some(m) -> Ok({ message: m, rest: p.rest }),
-    None -> match net.recv[l](c, read_size(), timeout_ms) {
-      None -> Err(TimedOut),
-      Some(bytes) -> if bytes_len(bytes) == 0 { Err(Closed) }
-      else { read_message[l](c, bytes_concat(buf, bytes), timeout_ms) },
+    None -> if bytes_len(buf) >= 5
+        && (match u32_be_at(buf, 1) { Some(n) -> n < 4, None -> false }) {
+      Err(Unexpected("a frame whose length is less than its own four bytes"))
+    } else if room <= 0 { panic("a frame past its own length") } else {
+      match net.recv[l](c, read_size(), timeout_ms) {
+        None -> Err(TimedOut),
+        Some(bytes) -> if bytes_len(bytes) == 0 { Err(Closed) }
+        else { awaiting[l](c, bytes_concat(buf, bytes), timeout_ms, room - 1) },
+      }
     },
   }
 }
@@ -717,14 +740,16 @@ fn auth_text(m: Message) -> Option<String> / {abort.raise} =
 
 // The mechanisms an `AuthenticationSASL` offers: cstrings until an empty one.
 fn mechanisms(m: Message) -> List<String> / {abort.raise} =
-  match auth_body(m) { None -> [], Some(bytes) -> names_from(bytes, 0, []) }
+  match auth_body(m) { None -> [], Some(bytes) -> names_from(bytes, 0, [], bytes_len(bytes)) }
 
-fn names_from(b: Bytes, at: Int, acc: List<String>) -> List<String> / {abort.raise} =
+// `left` as in `fields_of`: a name that goes on is a byte and its end at least.
+fn names_from(b: Bytes, at: Int, acc: List<String>, left: Int) -> List<String> / {abort.raise} =
   if at >= bytes_len(b) { acc } else {
     match read_cstring(b, at) {
       None -> acc,
       Some(name) -> if string_len(name.text) == 0 { acc }
-      else { names_from(b, name.next, push(acc, name.text)) },
+      else if left <= 0 { panic("more names than bytes") }
+      else { names_from(b, name.next, push(acc, name.text), left - 1) },
     }
   }
 
@@ -1163,6 +1188,14 @@ test "a refusal that ends the session keeps its SQLSTATE" {
       assert_eq(s.severity, "FATAL")
     },
     _ -> panic("the refusal was lost to the hang-up"),
+  }
+}
+
+test "a frame shorter than its own length field is refused rather than waited on" {
+  let short = bytes_concat_all([byte_of_int(90), u32_be(3), b"I"]);
+  match t_queries([short, short], ["select 1"]) {
+    [Err(Unexpected(why))] -> assert(string_contains(why, "less than its own four bytes")),
+    _ -> panic("a malformed frame was waited on"),
   }
 }
 
