@@ -84,7 +84,7 @@ fn fields_head(n: Int) -> Bytes / {abort.raise} =
 
 /// The value `data` holds, or `None` if it is not exactly one value of this subset.
 pub fn msgpack_decode(data: Bytes) -> Option<Value> / {abort.raise} =
-  match read_at(data, 0, 0) {
+  match read_at(data, 0, max_depth()) {
     None -> None,
     Some(read) -> if read.at == bytes_len(data) { Some(read.value) } else { None },
   }
@@ -95,29 +95,30 @@ pub type Read = { value: Value, at: Int }
 /// stack it cannot hold; 64 is deeper than any message and shallower than the stack.
 fn max_depth() -> Int = 64
 
-fn read_at(data: Bytes, at: Int, depth: Int) -> Option<Read> / {abort.raise} =
-  if depth > max_depth() || at >= bytes_len(data) { None } else {
+// `room` is how many levels deeper a value may nest; each level below this one spends one.
+fn read_at(data: Bytes, at: Int, room: Int) -> Option<Read> / {abort.raise} =
+  if room < 0 || at >= bytes_len(data) { None } else {
     let tag = bytes_at(data, at);
     if tag <= 0x7F { Some({ value: Int(tag), at: at + 1 }) }
     else if tag >= 0xE0 { Some({ value: Int(tag - 256), at: at + 1 }) }
-    else if tag >= 0x80 && tag <= 0x8F { read_fields(data, at + 1, tag & 0x0F, depth) }
-    else if tag >= 0x90 && tag <= 0x9F { read_items(data, at + 1, tag & 0x0F, depth) }
+    else if tag >= 0x80 && tag <= 0x8F { read_fields(data, at + 1, tag & 0x0F, room - 1) }
+    else if tag >= 0x90 && tag <= 0x9F { read_items(data, at + 1, tag & 0x0F, room - 1) }
     else if tag >= 0xA0 && tag <= 0xBF { read_text(data, at + 1, tag & 0x1F) }
     else {
       // A table rather than a chain of comparisons: one level of nesting for twenty-odd tags, and
       // the emitter's recursion is what the depth costs.
-      read_tagged(data, at, tag, depth)
+      read_tagged(data, at, tag, room - 1)
     }
   }
 
-fn read_tagged(data: Bytes, at: Int, tag: Int, depth: Int) -> Option<Read> / {abort.raise} =
+fn read_tagged(data: Bytes, at: Int, tag: Int, room: Int) -> Option<Read> / {abort.raise} =
   match tag {
     0xC0 -> Some({ value: Nil, at: at + 1 }),
     0xC2 -> Some({ value: Flag(false), at: at + 1 }),
     0xC3 -> Some({ value: Flag(true), at: at + 1 }),
-    0xC4 -> read_length(data, at + 1, 1, KBits, depth),
-    0xC5 -> read_length(data, at + 1, 2, KBits, depth),
-    0xC6 -> read_length(data, at + 1, 4, KBits, depth),
+    0xC4 -> read_length(data, at + 1, 1, KBits, room),
+    0xC5 -> read_length(data, at + 1, 2, KBits, room),
+    0xC6 -> read_length(data, at + 1, 4, KBits, room),
     0xCB -> read_float(data, at),
     0xCC -> unsigned(data, at, 1, 2),
     0xCD -> unsigned(data, at, 2, 3),
@@ -127,13 +128,13 @@ fn read_tagged(data: Bytes, at: Int, tag: Int, depth: Int) -> Option<Read> / {ab
     0xD1 -> read_signed(data, at, 2, 0x8000, 0x1_0000),
     0xD2 -> read_signed(data, at, 4, 0x8000_0000, 0x1_0000_0000),
     0xD3 -> read_int64(data, at),
-    0xD9 -> read_length(data, at + 1, 1, KText, depth),
-    0xDA -> read_length(data, at + 1, 2, KText, depth),
-    0xDB -> read_length(data, at + 1, 4, KText, depth),
-    0xDC -> read_length(data, at + 1, 2, KItems, depth),
-    0xDD -> read_length(data, at + 1, 4, KItems, depth),
-    0xDE -> read_length(data, at + 1, 2, KFields, depth),
-    0xDF -> read_length(data, at + 1, 4, KFields, depth),
+    0xD9 -> read_length(data, at + 1, 1, KText, room),
+    0xDA -> read_length(data, at + 1, 2, KText, room),
+    0xDB -> read_length(data, at + 1, 4, KText, room),
+    0xDC -> read_length(data, at + 1, 2, KItems, room),
+    0xDD -> read_length(data, at + 1, 4, KItems, room),
+    0xDE -> read_length(data, at + 1, 2, KFields, room),
+    0xDF -> read_length(data, at + 1, 4, KFields, room),
     // `float32`, the extension types, the reserved `0xc1`, and everything above `0xdf`.
     _ -> None,
   }
@@ -181,7 +182,7 @@ fn read_length(
   at: Int,
   width: Int,
   kind: Kind,
-  depth: Int,
+  room: Int,
 ) -> Option<Read> / {abort.raise} =
   match read_n(data, at, width) {
     None -> None,
@@ -194,8 +195,8 @@ fn read_length(
           Some(payload) -> Some({ value: Bits(payload), at: from + n }),
         }
       } else if kind == KText { read_text(data, from, n) }
-      else if kind == KItems { read_items(data, from, n, depth) }
-      else { read_fields(data, from, n, depth) }
+      else if kind == KItems { read_items(data, from, n, room) }
+      else { read_fields(data, from, n, room) }
     },
   }
 
@@ -217,8 +218,8 @@ fn read_text(data: Bytes, at: Int, n: Int) -> Option<Read> / {abort.raise} =
     } else { None },
   }
 
-fn read_items(data: Bytes, at: Int, n: Int, depth: Int) -> Option<Read> / {abort.raise} =
-  match read_values(data, at, n, depth, []) {
+fn read_items(data: Bytes, at: Int, n: Int, room: Int) -> Option<Read> / {abort.raise} =
+  match read_values(data, at, n, room, []) {
     None -> None,
     Some(done) -> Some({ value: Items(done.items), at: done.at }),
   }
@@ -227,18 +228,18 @@ fn read_values(
   data: Bytes,
   at: Int,
   n: Int,
-  depth: Int,
+  room: Int,
   acc: List<Value>,
 ) -> Option<{ items: List<Value>, at: Int }> / {abort.raise} =
   if n <= 0 { Some({ items: acc, at: at }) } else {
-    match read_at(data, at, depth + 1) {
+    match read_at(data, at, room) {
       None -> None,
-      Some(read) -> read_values(data, read.at, n - 1, depth, push(acc, read.value)),
+      Some(read) -> read_values(data, read.at, n - 1, room, push(acc, read.value)),
     }
   }
 
-fn read_fields(data: Bytes, at: Int, n: Int, depth: Int) -> Option<Read> / {abort.raise} =
-  match read_pairs(data, at, n, depth, []) {
+fn read_fields(data: Bytes, at: Int, n: Int, room: Int) -> Option<Read> / {abort.raise} =
+  match read_pairs(data, at, n, room, []) {
     None -> None,
     Some(done) -> Some({ value: Fields(done.fields), at: done.at }),
   }
@@ -247,20 +248,20 @@ fn read_pairs(
   data: Bytes,
   at: Int,
   n: Int,
-  depth: Int,
+  room: Int,
   acc: List<Field>,
 ) -> Option<{ fields: List<Field>, at: Int }> / {abort.raise} =
   if n <= 0 { Some({ fields: acc, at: at }) } else {
-    match read_at(data, at, depth + 1) {
+    match read_at(data, at, room) {
       None -> None,
-      Some(key) -> match read_at(data, key.at, depth + 1) {
+      Some(key) -> match read_at(data, key.at, room) {
         None -> None,
         Some(value) ->
           read_pairs(
             data,
             value.at,
             n - 1,
-            depth,
+            room,
             push(acc, { key: key.value, value: value.value }),
           ),
       },

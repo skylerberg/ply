@@ -7,16 +7,17 @@ import parsing (push_front, positional, Span, Ident, QName, Input, Parser, Parse
                 default_not_allowed, unknown_argument_name, argument_order, token_kind,
                 token_kind_at, current_span, previous_span, at_token, at_eof, at_ident_text,
                 advance, bump, eat, expect, expect_close, expect_ident, expect_binder,
-                expect_field_name, keyword_pun_refusal, with_no_brace, deeper, shallower, start,
-                qname, comma_list, token_lparen, token_rparen, token_lbrace, token_rbrace,
-                token_lbracket, token_rbracket, token_comma, token_semi, token_colon, token_dot,
-                token_dotdot, token_arrow, token_eq, token_pipe, token_pipepipe, token_question,
-                token_star, keyword_let, keyword_if, keyword_else, keyword_with, dump_node,
-                dump_count, dump_presence, dump_word, dump_list, dump_opt, dump_ident, dump_qname,
-                dump_diags, with_no_pipe, advance_n, token_at, token_gt, token_lt)
+                expect_field_name, keyword_pun_refusal, with_no_brace, too_deep, start, qname,
+                comma_list, token_lparen, token_rparen, token_lbrace, token_rbrace, token_lbracket,
+                token_rbracket, token_comma, token_semi, token_colon, token_dot, token_dotdot,
+                token_arrow, token_eq, token_pipe, token_pipepipe, token_question, token_star,
+                keyword_let, keyword_if, keyword_else, keyword_with, dump_node, dump_count,
+                dump_presence, dump_word, dump_list, dump_opt, dump_ident, dump_qname, dump_diags,
+                with_no_pipe, advance_n, token_at, token_gt, token_lt, max_depth)
 import lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLiteral, FloatLiteral,
               DecimalLiteral, StringLiteral, LineString, BytesLiteral, InterpolatedHead,
               InterpolatedMiddle, InterpolatedTail, CharLiteral, Keyword, Punctuation, EndOfInput)
+import std.list (at)
 import type_syntax (TypeExpr, ty, ty_span, dump_ty)
 import patterns (Pattern, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
                  pattern, pat_span, no_pattern, dump_pattern, dump_lit)
@@ -201,7 +202,7 @@ fn src_over(input: Input, span: Span) -> Bytes / {abort.raise} =
 // --- The grammar ------------------------------------------------------------
 
 pub fn expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
-  bin_expr(input, parser, 1)
+  bin_expr(input, parser, 1, binding_powers())
 
 // In a scrutinee a `{` opens the arm block, never a record or a block expression — except at the
 // very start, where nothing else can stand and the arms are the `{` after it.
@@ -213,20 +214,25 @@ pub fn scrutinee(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> /
   }
 }
 
-// The left spine is one `iterate`; the right operand recurses at `bp + 1`, so depth is bounded
-// by the number of binding powers rather than by the input's length.
+// How many binding powers there are, so how many times a right operand can recurse at a higher one.
+fn binding_powers() -> Int = 10
+
+// The left spine is one `iterate`; the right operand recurses at `bp + 1`, spending one of `powers`,
+// so depth is bounded by the number of binding powers rather than by the input's length.
 fn bin_expr(
   input: Input,
   parser: Parser,
   min_bp: Int,
+  powers: Int,
 ) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let lhs = unary_expr(input, parser)?;
   iterate(lhs, input.token_count - lhs.parser.pos + 1, |s: Parsed<Expr>|
     match peek_bin_op(input, s.parser) {
       None -> Stop(Ok(s)),
-      Some(o) -> if o.bp < min_bp { Stop(Ok(s)) } else {
+      Some(o) -> if o.bp < min_bp { Stop(Ok(s)) }
+      else if powers <= 0 { Stop(Err(too_deep(input, s.parser))) } else {
         let a = advance_n(input, s.parser, o.width);
-        match bin_expr(input, a, o.bp + 1) {
+        match bin_expr(input, a, o.bp + 1, powers - 1) {
           Err(q) -> Stop(Err(q)),
           Ok(rhs) ->
             Continue({
@@ -243,13 +249,9 @@ fn bin_expr(
     })
 }
 
-fn unary_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
-  let d = deeper(input, parser)?;
-  match unary_body(input, d) {
-    Err(q) -> Err(shallower(q)),
-    Ok(r) -> Ok({ parser: shallower(r.parser), node: r.node }),
-  }
-}
+fn unary_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
+  if input.room <= 0 { Err(too_deep(input, parser)) }
+  else { unary_body({ ..input, room: input.room - 1 }, parser) }
 
 fn unary_body(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let op = match token_kind(input, parser) {
@@ -742,28 +744,36 @@ fn interpolated(
   }
 }
 
-// At a `InterpolatedHead` or a `InterpolatedMiddle`: the hole after it, and the text that closes the hole.
+// At a `InterpolatedHead` or a `InterpolatedMiddle`: the hole after it and the text that closes the
+// hole, a round each, every round passing at least the token that opens its hole.
 fn holes(
   input: Input,
   parser: Parser,
   first: Span,
   parts: List<Expr>,
-) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
-  let opened = advance(input, parser);
-  let { parser, node: e } = expr(input, opened.parser)?;
-  let shown = push(parts, displayed(e));
-  let sp = current_span(input, parser);
-  match token_kind(input, parser) {
-    InterpolatedMiddle(t) ->
-      holes(input, parser, first, push(shown, ELit({ span: sp, lit: LStr(t) }))),
-    InterpolatedTail(t) -> {
-      let closed = advance(input, parser);
-      let all = push(shown, ELit({ span: sp, lit: LStr(t) }));
-      Ok({ parser: closed.parser, node: concatenated(span_to(first, closed.node), all) })
-    },
-    _ -> Err(error_here(input, parser, b"`}` to close the interpolated value")),
-  }
-}
+) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
+  iterate({ parser: parser, out: parts }, input.token_count - parser.pos + 1, |s: SoFar<Expr>| {
+    let opened = advance(input, s.parser);
+    match expr(input, opened.parser) {
+      Err(q) -> Stop(Err(q)),
+      Ok(r) -> {
+        let shown = push(s.out, displayed(r.node));
+        let sp = current_span(input, r.parser);
+        match token_kind(input, r.parser) {
+          InterpolatedMiddle(t) ->
+            Continue({ parser: r.parser, out: push(shown, ELit({ span: sp, lit: LStr(t) })) }),
+          InterpolatedTail(t) -> {
+            let closed = advance(input, r.parser);
+            let all = push(shown, ELit({ span: sp, lit: LStr(t) }));
+            Stop(
+              Ok({ parser: closed.parser, node: concatenated(span_to(first, closed.node), all) }),
+            )
+          },
+          _ -> Stop(Err(error_here(input, r.parser, b"`}` to close the interpolated value"))),
+        }
+      },
+    }
+  })
 
 fn displayed(expr: Expr) -> Expr = {
   let sp = expr_span(expr);
@@ -1094,9 +1104,12 @@ fn let_else(
   })
 }
 
+// The block nests in the statement.
 fn else_block(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
-  if at_token(input, parser, token_lbrace()) { block_expr(input, parser) }
-  else { Err(error_here(input, parser, b"`{` to open the `else` block of a `let ... else`")) }
+  if !at_token(input, parser, token_lbrace()) {
+    Err(error_here(input, parser, b"`{` to open the `else` block of a `let ... else`"))
+  } else if input.room <= 0 { Err(too_deep(input, parser)) }
+  else { block_expr({ ..input, room: input.room - 1 }, parser) }
 
 pub fn fn_param(input: Input, parser: Parser) -> Result<Parsed<Param>, Parser> / {abort.raise} =
   param_inner(input, parser, true)
@@ -1245,22 +1258,46 @@ fn else_branch(
     // No `else`: a `()` over the empty span at the end of the `then` block.
     let end = expr_span(then_branch).end;
     Ok({ parser: els.parser, node: ELit({ span: { start: end, end: end }, lit: LUnit }) })
-  } else if at_token(input, els.parser, keyword_if()) { if_expr(input, els.parser) }
-  else { block_expr(input, els.parser) }
+  } else { block_expr(input, els.parser) }
 }
 
+type IfArm = { start: Span, cond: Expr, then_branch: Expr }
+
+// An `else if` chain is read as one loop, an arm a round, and nested from its end: a chain nests no
+// deeper for being long.
 fn if_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
-  let st = advance(input, parser);
-  let { parser, node: cond } = scrutinee(input, st.parser)?;
-  let { parser, node: then_b } = block_expr(input, parser)?;
-  let { parser, node: else_b } = else_branch(input, parser, then_b)?;
+  let chain = iterate(
+    { parser: parser, out: [] },
+    input.token_count - parser.pos + 1,
+    |s: SoFar<IfArm>| {
+      let st = advance(input, s.parser);
+      match scrutinee(input, st.parser) {
+        Err(q) -> Stop(Err(q)),
+        Ok(c) -> match block_expr(input, c.parser) {
+          Err(q) -> Stop(Err(q)),
+          Ok(t) -> {
+            let out = push(s.out, { start: st.node, cond: c.node, then_branch: t.node });
+            let els = eat(input, t.parser, keyword_else());
+            if els.ok && at_token(input, els.parser, keyword_if()) {
+              Continue({ parser: els.parser, out: out })
+            } else { Stop(Ok({ parser: t.parser, out: out })) }
+          },
+        },
+      }
+    },
+  )?;
+  let last = at(chain.out, len(chain.out) - 1);
+  let { parser, node: else_b } = else_branch(input, chain.parser, last.then_branch)?;
   Ok({
     parser: parser,
-    node: EIf({
-      span: span_to(st.node, expr_span(else_b)),
-      cond: cond,
-      then_branch: then_b,
-      else_branch: else_b,
+    node: fold(range(0, len(chain.out)), else_b, |inner: Expr, i: Int| {
+      let arm = at(chain.out, len(chain.out) - 1 - i);
+      EIf({
+        span: span_to(arm.start, expr_span(inner)),
+        cond: arm.cond,
+        then_branch: arm.then_branch,
+        else_branch: inner,
+      })
     }),
   })
 }
@@ -2046,8 +2083,40 @@ test "a long left-associative chain is one iterate and adds no frames" {
   assert(!failed(rr));
   let r = parsed_or(rr, no_expr());
   assert_eq(len(r.parser.diags), 0);
-  assert_eq(r.parser.depth, 0);
   assert_eq(node_count(r.node), 801);
+}
+
+test "an `else if` chain nests no deeper for being long, and every binding power can climb at once" {
+  let arms = bytes_concat_all(map(range(0, 2 * max_depth()), |i: Int| b"if x { 1 } else "));
+  let chained = start(bytes_concat(arms, b"{ 2 }"));
+  let read = expr(chained.input, chained.parser);
+  assert(!failed(read));
+  assert_eq(len(parsed_or(read, no_expr()).parser.diags), 0);
+  // Each operator binds tighter than the one before it, so each right operand is read a power up.
+  let climbing = start(b"a || b && c == d | e ^ f & g << h ++ i + j * k");
+  let climbed = expr(climbing.input, climbing.parser);
+  assert(!failed(climbed));
+  assert_eq(len(parsed_or(climbed, no_expr()).parser.diags), 0)
+}
+
+test "each level of nesting spends one of the input's room, and one past it is refused there" {
+  let nested = |n: Int|
+    bytes_concat_all([
+      bytes_concat_all(map(range(0, n), |i: Int| b"(")),
+      b"1",
+      bytes_concat_all(map(range(0, n), |i: Int| b")")),
+    ]);
+  // The expression itself is one level, and each pair of parentheses another.
+  let deepest = start(nested(max_depth() - 1));
+  let fits = expr(deepest.input, deepest.parser);
+  assert(!failed(fits));
+  assert_eq(len(parsed_or(fits, no_expr()).parser.diags), 0);
+  let past = start(nested(max_depth()));
+  match expr(past.input, past.parser) {
+    Ok(_) -> assert(false),
+    Err(q) ->
+      assert_eq(map(q.diags, |d: ParseDiag| d.message), [b"input is nested too deeply to parse"]),
+  }
 }
 
 test "a unary operator nests, and a `-` before a literal is an operator here" {

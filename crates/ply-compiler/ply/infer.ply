@@ -999,19 +999,22 @@ fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
 fn line_start(text: Bytes, at: Int) -> Int / {abort.raise} =
   if at <= 0 { 0 } else if bytes_at(text, at - 1) == 10 { at } else { line_start(text, at - 1) }
 
-// The `//` lines directly above the line at `at`, joined: the note a declaration carries.
-fn note_above(text: Bytes, at: Int, below: Bytes) -> Bytes / {abort.raise}
-  decreases at
-=
-  if at <= 0 { below } else {
-    let start = line_start(text, at - 1);
-    let line = bytes_slice(text, start, at - 1);
-    if !bytes_starts_with(line, b"// ") { below } else {
-      let words = bytes_slice(line, 3, bytes_len(line));
-      note_above(text, start, if bytes_len(below) == 0 { words }
-      else { bytes_concat_all([words, b" ", below]) })
-    }
-  }
+// The `//` lines directly above the line at `at`, joined: the note a declaration carries. Each round
+// starts a line further up, so `at` bounds the rounds.
+fn note_above(text: Bytes, at: Int, below: Bytes) -> Bytes / {abort.raise} =
+  iterate({ at: at, below: below }, at + 1, |s: { at: Int, below: Bytes }|
+    if s.at <= 0 { Stop(s.below) } else {
+      let start = line_start(text, s.at - 1);
+      let line = bytes_slice(text, start, s.at - 1);
+      if !bytes_starts_with(line, b"// ") { Stop(s.below) } else {
+        let words = bytes_slice(line, 3, bytes_len(line));
+        Continue({
+          at: start,
+          below: if bytes_len(s.below) == 0 { words }
+          else { bytes_concat_all([words, b" ", s.below]) },
+        })
+      }
+    })
 
 fn declared(imported: Map<Bytes, Bytes>, text: Bytes, def: ExternDef) -> Builtin / {abort.raise} = {
   let tys = fold(
@@ -1552,6 +1555,17 @@ fn type_param(checker: Checker, ident: Ident) -> { checker: Checker, ty: Type } 
   }
 
 fn conv_type(checker: Checker, ty: TypeExpr) -> { checker: Checker, ty: Type } / {abort.raise} =
+  conv_within(checker, ty, alias_room(checker))
+
+// How many more aliases a conversion may expand inside one another: an alias already being
+// expanded is refused, so each is a declared alias not yet on the stack.
+fn alias_room(checker: Checker) -> Int = map_len(checker.types) - len(checker.alias_stack)
+
+fn conv_within(
+  checker: Checker,
+  ty: TypeExpr,
+  room: Int,
+) -> { checker: Checker, ty: Type } / {abort.raise} =
   match ty {
     TVar(id) -> type_param(checker, id),
     TUnit(_) -> { checker: checker, ty: unit_type() },
@@ -1561,33 +1575,40 @@ fn conv_type(checker: Checker, ty: TypeExpr) -> { checker: Checker, ty: Type } /
         r.fields,
         { checker: checker, fs: [] },
         |acc: { checker: Checker, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
-          let o: WithTy = conv_type(acc.checker, f.ty);
+          let o: WithTy = conv_within(acc.checker, f.ty, room);
           { checker: o.checker, fs: push(acc.fs, { name: f.name.name, ty: o.ty }) }
         },
       );
       { checker: fs.checker, ty: TyRecord(fields_sorted(fs.fs)) }
     },
     TFn(f) -> {
-      let ps: WithTys = conv_types(checker, f.params);
-      let r: WithTy = conv_type(ps.checker, f.ret);
+      let ps: WithTys = conv_all_within(checker, f.params, room);
+      let r: WithTy = conv_within(ps.checker, f.ret, room);
       let eff = match f.effects {
         Some(row) -> conv_row(r.checker, row),
         None -> { checker: r.checker, row: row_empty() },
       };
       { checker: eff.checker, ty: fn_type(ps.tys, r.ty, eff.row) }
     },
-    TCon(c) -> conv_con(checker, c.name, c.args, c.span),
+    TCon(c) -> conv_con(checker, c.name, c.args, c.span, room),
   }
 
 fn conv_types(
   checker: Checker,
   tys: List<TypeExpr>,
 ) -> { checker: Checker, tys: List<Type> } / {abort.raise} =
+  conv_all_within(checker, tys, alias_room(checker))
+
+fn conv_all_within(
+  checker: Checker,
+  tys: List<TypeExpr>,
+  room: Int,
+) -> { checker: Checker, tys: List<Type> } / {abort.raise} =
   fold(
     tys,
     { checker: checker, tys: [] },
     |acc: { checker: Checker, tys: List<Type> }, ty: TypeExpr| {
-      let o: WithTy = conv_type(acc.checker, ty);
+      let o: WithTy = conv_within(acc.checker, ty, room);
       { checker: o.checker, tys: push(acc.tys, o.ty) }
     },
   )
@@ -1626,6 +1647,7 @@ fn conv_con(
   name: QName,
   args: List<TypeExpr>,
   span: Span,
+  room: Int,
 ) -> { checker: Checker, ty: Type } / {abort.raise} =
   if is_bare(name) && len(args) == 0 && map_contains(checker.ty_params, name.name.name) {
     {
@@ -1633,7 +1655,7 @@ fn conv_con(
       ty: match map_get(checker.ty_params, name.name.name) { Some(t) -> t, None -> unit_type() },
     }
   } else {
-    let converted: WithTys = conv_types(checker, args);
+    let converted: WithTys = conv_all_within(checker, args, room);
     let c: Checker = converted.checker;
     match if is_bare(name) { builtin_type_arity(name.name.name) } else { None } {
       Some(arity) -> if len(converted.tys) != arity {
@@ -1680,7 +1702,7 @@ fn conv_con(
                       [b"break the cycle, or make this a `type` with variants"],
                     ),
                   )
-                } else {
+                } else if room <= 0 { panic("an alias expanded past the aliases there are") } else {
                   let outermost = len(g.checker.alias_stack) == 0;
                   let before = len(g.checker.map_keys);
                   // A `Map` key's order is the using signature's to promise, so a refusal names the use.
@@ -1718,7 +1740,7 @@ fn conv_con(
                         alias_stack: push(g.checker.alias_stack, qualified),
                         module: decl.owner,
                       };
-                      let o: WithTy = conv_type(inner, alias);
+                      let o: WithTy = conv_within(inner, alias, room - 1);
                       // Kept only when the expansion touched nothing but the keys it noted: a
                       // fresh variable, a diagnostic or a refused atom belongs to the one use.
                       let kept = memo && o.checker.fresh == g.checker.fresh
@@ -3025,7 +3047,14 @@ fn rows_in(
   t: Type,
   acc: { atoms: List<Atom>, vars: List<Int> },
 ) -> { atoms: List<Atom>, vars: List<Int> } / {abort.raise} =
-  match resolve(checker, t) {
+  rows_of(checker, resolve(checker, t), acc)
+
+fn rows_of(
+  checker: Checker,
+  t: Type,
+  acc: { atoms: List<Atom>, vars: List<Int> },
+) -> { atoms: List<Atom>, vars: List<Int> } / {abort.raise} =
+  match t {
     TyFn(f) -> {
       let r = resolve_row_in(checker, f.effects);
       let own = {
@@ -3034,16 +3063,16 @@ fn rows_in(
       };
       fold(
         f.params,
-        rows_in(checker, f.ret, own),
-        |a: { atoms: List<Atom>, vars: List<Int> }, p: Type| rows_in(checker, p, a),
+        rows_of(checker, f.ret, own),
+        |a: { atoms: List<Atom>, vars: List<Int> }, p: Type| rows_of(checker, p, a),
       )
     },
     TyCon(c) ->
       fold(c.args, acc, |a: { atoms: List<Atom>, vars: List<Int> }, x: Type|
-        rows_in(checker, x, a)),
+        rows_of(checker, x, a)),
     TyRecord(fs) ->
       fold(fs, acc, |a: { atoms: List<Atom>, vars: List<Int> }, f: Field|
-        rows_in(checker, f.ty, a)),
+        rows_of(checker, f.ty, a)),
     TyVar(_) -> acc,
   }
 
@@ -4160,15 +4189,26 @@ fn widen_fn(
 
 // A fresh tail on each closed row of a function the value holds where a narrower one may stand.
 fn open_rows(checker: Checker, ty: Type) -> Widened / {abort.raise} =
-  match shallow(checker.subst, ty) {
-    TyFn(g) -> widen_fn(open_rows(checker, g.ret), ty, g),
+  opened(checker, ty, map_len(checker.subst.ty))
+
+// `room` as in `types::resolved_ty`: opening binds no type, so the bindings stay as they were.
+fn opened(checker: Checker, ty: Type, room: Int) -> Widened / {abort.raise} =
+  match ty {
+    TyVar(v) -> match map_get(checker.subst.ty, v) {
+      None -> unwidened(checker, ty),
+      Some(bound) -> if room <= 0 { panic("a type bound to itself") } else {
+        let w: Widened = opened(checker, bound, room - 1);
+        if len(w.tails) == 0 { unwidened(w.checker, ty) } else { w }
+      },
+    },
+    TyFn(g) -> widen_fn(opened(checker, g.ret, room), ty, g),
     TyRecord(fs) -> {
       let o: Items<Field> = fold(
         range(0, len(fs)),
         { checker: checker, items: fs, tails: [] },
         |acc: Items<Field>, i: Int| {
           let x = at(fs, i);
-          let w: Widened = open_rows(acc.checker, x.ty);
+          let w: Widened = opened(acc.checker, x.ty, room);
           if len(w.tails) == 0 { acc } else {
             {
               checker: w.checker,
@@ -4186,7 +4226,7 @@ fn open_rows(checker: Checker, ty: Type) -> Widened / {abort.raise} =
         range(0, len(c.args)),
         { checker: checker, items: c.args, tails: [] },
         |acc: Items<Type>, i: Int| {
-          let w: Widened = open_rows(acc.checker, at(c.args, i));
+          let w: Widened = opened(acc.checker, at(c.args, i), room);
           if len(w.tails) == 0 { acc } else {
             {
               checker: w.checker,
@@ -4199,7 +4239,6 @@ fn open_rows(checker: Checker, ty: Type) -> Widened / {abort.raise} =
       if len(o.tails) == 0 { unwidened(checker, ty) }
       else { { checker: o.checker, ty: TyCon({ name: c.name, args: o.items }), tails: o.tails } }
     },
-    TyVar(_) -> unwidened(checker, ty),
   }
 
 // What will not meet its type as written meets it again widened, which costs a walk, so only then.
@@ -4785,13 +4824,16 @@ fn bind_pattern(
       }
     },
     // Each alternative binds against the scrutinee alone; the first one's names are the arm's.
-    POr(o) -> {
-      let first: Bound = bind_pattern(checker, at(o.alts, 0), scrutinee, []);
-      let agreed: Checker = fold(drop(o.alts, 1), first.checker, |c: Checker, alt: Pattern| {
-        let b: Bound = bind_pattern(c, alt, scrutinee, []);
-        same_binders(b.checker, pat_span(alt), first.out, b.out)
-      });
-      { checker: agreed, out: concat(out, first.out) }
+    POr(o) -> match o.alts {
+      [] -> panic("an or-pattern with no alternatives"),
+      [head, ..rest] -> {
+        let first: Bound = bind_pattern(checker, head, scrutinee, []);
+        let agreed: Checker = fold(rest, first.checker, |c: Checker, alt: Pattern| {
+          let b: Bound = bind_pattern(c, alt, scrutinee, []);
+          same_binders(b.checker, pat_span(alt), first.out, b.out)
+        });
+        { checker: agreed, out: concat(out, first.out) }
+      },
     },
     PRecord(r) -> match resolve(checker, scrutinee) {
       TyRecord(known) -> {
@@ -5090,48 +5132,89 @@ fn uncovered(
   rows: List<List<CoveragePattern>>,
   n: Int,
 ) -> List<List<CoveragePattern>> / {abort.raise} =
-  uncovered_split(
-    checker,
-    fold(rows, [], |acc: List<List<CoveragePattern>>, patterns: List<CoveragePattern>|
-      concat(acc, split_or(patterns))),
-    n,
-  )
+  uncovered_within(checker, rows, n, search_room(checker, rows, n))
 
-// A row headed by an or-pattern is one row per alternative, each split again in its turn.
+// Each step of the search puts the columns of what heads the first column in its place, and a path
+// steps through each place once: so the columns there are, and those each pattern can bring (a
+// constructor at most as many as any has), are room enough.
+fn search_room(checker: Checker, rows: List<List<CoveragePattern>>, n: Int) -> Int = {
+  let most = fold(checker.ctors, 2, |m: Int, c: CtorInfo| if c.arity > m { c.arity } else { m });
+  fold(rows, n + 1, |acc: Int, r: List<CoveragePattern>|
+    fold(r, acc, |a: Int, p: CoveragePattern| a + brought(p, most)))
+}
+
+fn brought(p: CoveragePattern, most: Int) -> Int =
+  match p {
+    CoverAny -> 0,
+    CoverNothing -> 0,
+    CoverCtor(c) -> fold(c.args, most, |n: Int, a: CoveragePattern| n + brought(a, most)),
+    CoverRecord(fs) ->
+      fold(fs, len(fs), |n: Int, f: { name: Bytes, pat: CoveragePattern }|
+        n + brought(f.pat, most)),
+    CoverEither(alts) -> fold(alts, 0, |n: Int, a: CoveragePattern| n + brought(a, most)),
+  }
+
+fn uncovered_within(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  n: Int,
+  room: Int,
+) -> List<List<CoveragePattern>> / {abort.raise} =
+  if room <= 0 { panic("a coverage search past its columns") } else {
+    uncovered_split(
+      checker,
+      fold(rows, [], |acc: List<List<CoveragePattern>>, patterns: List<CoveragePattern>|
+        concat(acc, split_or(patterns))),
+      n,
+      room - 1,
+    )
+  }
+
+// A row headed by an or-pattern is one row per alternative, nested ones included.
 fn split_or(patterns: List<CoveragePattern>) -> List<List<CoveragePattern>> / {abort.raise} =
-  match list_at(patterns, 0) {
-    Some(CoverEither(alts)) ->
-      fold(alts, [], |acc: List<List<CoveragePattern>>, pattern: CoveragePattern|
-        concat(acc, split_or(push_front(pattern, drop(patterns, 1))))),
+  match patterns {
+    [CoverEither(alts), ..rest] ->
+      map(alternatives(CoverEither(alts)), |pattern: CoveragePattern| push_front(pattern, rest)),
     _ -> [patterns],
+  }
+
+fn alternatives(pattern: CoveragePattern) -> List<CoveragePattern> =
+  match pattern {
+    CoverEither(alts) ->
+      fold(alts, [], |acc: List<CoveragePattern>, alt: CoveragePattern|
+        concat(acc, alternatives(alt))),
+    _ -> [pattern],
   }
 
 fn uncovered_split(
   checker: Checker,
   rows: List<List<CoveragePattern>>,
   n: Int,
+  room: Int,
 ) -> List<List<CoveragePattern>> / {abort.raise} =
   if len(rows) == 0 { [wilds(n)] }
   else if n == 0 { [] } else {
     let family = fold(rows, b"", |acc: Bytes, r: List<CoveragePattern>|
       if bytes_len(acc) > 0 { acc } else { family_of(at(r, 0)) });
-    if family == b"#rec" { uncovered_record(checker, rows, n) } else {
+    if family == b"#rec" { uncovered_record(checker, rows, n, room) } else {
       match family_ctors(checker, family) {
         None ->
-          map(uncovered(checker, default_rows(rows, family), n - 1), |w: List<CoveragePattern>|
-            push_front(CoverAny, w)),
+          map(
+            uncovered_within(checker, default_rows(rows, family), n - 1, room),
+            |w: List<CoveragePattern>| push_front(CoverAny, w),
+          ),
         Some(all) -> if fold(all, true, |b: Bool, k: CoverageCtor|
             b && heads_ctor(rows, family, k.key)) {
           fold(all, [], |acc: List<List<CoveragePattern>>, k: CoverageCtor|
-            concat(acc, through(checker, rows, n, family, k)))
+            concat(acc, through(checker, rows, n, family, k, room)))
         } else {
           // A constructor no arm names is left uncovered exactly when the default rows are; then the named ones are searched too.
-          match list_at(uncovered(checker, default_rows(rows, family), n - 1), 0) {
+          match list_at(uncovered_within(checker, default_rows(rows, family), n - 1, room), 0) {
             None -> [],
             Some(w) ->
               fold(all, [], |acc: List<List<CoveragePattern>>, k: CoverageCtor|
                 if heads_ctor(rows, family, k.key) {
-                  concat(acc, through(checker, rows, n, family, k))
+                  concat(acc, through(checker, rows, n, family, k, room))
                 } else {
                   push(
                     acc,
@@ -5153,9 +5236,10 @@ fn through(
   n: Int,
   family: Bytes,
   k: CoverageCtor,
+  room: Int,
 ) -> List<List<CoveragePattern>> / {abort.raise} =
   map(
-    uncovered(checker, specialize(rows, family, k), k.arity + n - 1),
+    uncovered_within(checker, specialize(rows, family, k), k.arity + n - 1, room),
     |patterns: List<CoveragePattern>|
       push_front(
         CoverCtor({ family: family, key: k.key, name: k.name, args: take(patterns, k.arity) }),
@@ -5195,6 +5279,7 @@ fn uncovered_record(
   checker: Checker,
   rows: List<List<CoveragePattern>>,
   n: Int,
+  room: Int,
 ) -> List<List<CoveragePattern>> / {abort.raise} = {
   let names = fold(rows, [], |acc: List<Bytes>, r: List<CoveragePattern>|
     match at(r, 0) {
@@ -5210,7 +5295,7 @@ fn uncovered_record(
       CoverRecord(fs) -> push(acc, concat(map(names, |nm: Bytes| field_pat(fs, nm)), drop(r, 1))),
       _ -> push(acc, concat(wilds(k), drop(r, 1))),
     });
-  map(uncovered(checker, spread, k + n - 1), |w: List<CoveragePattern>|
+  map(uncovered_within(checker, spread, k + n - 1, room), |w: List<CoveragePattern>|
     push_front(
       CoverRecord(map(range(0, k), |i: Int| { name: at(names, i), pat: at(w, i) })),
       drop(w, k),
@@ -7103,7 +7188,8 @@ fn check_component(
   // A definition published from its filed rows answers what it was filed with: its body may be a
   // stub's blank.
   let filed = bodies.filed;
-  let ending_of = |slot: Int| match at(filed, slot) { Some(k) -> k.ending, None -> read.ending };
+  let ending_of = |slot: Int|
+    match at(filed, slot) { Some(k) -> k.ending, None -> at(read.endings, slot) };
   let summary_of = |slot: Int|
     match at(filed, slot) { Some(k) -> k.summary, None -> at(read.summaries, slot) };
   let summarized: Checker = {
@@ -8566,7 +8652,7 @@ fn law_binder(checker: Checker, binder: Binder) -> { checker: Checker, ty: Type 
       Some(reason) -> new_ty(unquantifiable(checker, binder, reason)),
       None -> {
         let o: WithTy = conv_type(checker, binder.ty);
-        match ungeneratable(o.checker, o.ty, []) {
+        match ungeneratable(o.checker, o.ty) {
           Some(reason) -> { checker: unquantifiable(o.checker, binder, reason), ty: o.ty },
           None -> o,
         }
@@ -8676,7 +8762,17 @@ fn written_row_reason(ty: TypeExpr) -> Option<Bytes> =
     },
   }
 
-fn ungeneratable(checker: Checker, ty: Type, seen: List<Bytes>) -> Option<Bytes> / {abort.raise} =
+fn ungeneratable(checker: Checker, ty: Type) -> Option<Bytes> / {abort.raise} =
+  ungeneratable_within(checker, ty, [], len(checker.ctors))
+
+// `room` is how many more declared types the walk may enter: a path enters each one once, and each
+// has a constructor.
+fn ungeneratable_within(
+  checker: Checker,
+  ty: Type,
+  seen: List<Bytes>,
+  room: Int,
+) -> Option<Bytes> / {abort.raise} =
   match ty {
     TyVar(_) -> None,
     TyCon(c) -> if c.name == b"Cell" {
@@ -8690,15 +8786,17 @@ fn ungeneratable(checker: Checker, ty: Type, seen: List<Bytes>) -> Option<Bytes>
         b"a `Secret` is a credential: quantifying over one would have the generator mint credentials and the shrinker print counterexamples",
       )
     } else {
-      match first_reason(c.args, |a: Type| ungeneratable(checker, a, seen)) {
+      match first_reason(c.args, |a: Type| ungeneratable_within(checker, a, seen, room)) {
         Some(r) -> Some(r),
         None -> if contains(seen, c.name) { None } else {
-          let inner = push(seen, c.name);
-          first_reason(
-            filter(checker.ctors, |ctor_info: CtorInfo| ctor_info.type_name == c.name),
-            |ctor_info: CtorInfo|
-              first_reason(ctor_info.fields, |f: Type| ungeneratable(checker, f, inner)),
-          )
+          let ctors = filter(checker.ctors, |ctor_info: CtorInfo| ctor_info.type_name == c.name);
+          if len(ctors) == 0 { None }
+          else if room <= 0 { panic("a type entered twice on one path") } else {
+            let inner = push(seen, c.name);
+            first_reason(ctors, |ctor_info: CtorInfo|
+              first_reason(ctor_info.fields, |f: Type|
+                ungeneratable_within(checker, f, inner, room - 1)))
+          }
         },
       }
     },
@@ -8711,12 +8809,12 @@ fn ungeneratable(checker: Checker, ty: Type, seen: List<Bytes>) -> Option<Bytes>
         ]),
       )
     } else {
-      match first_reason(f.params, |p: Type| ungeneratable(checker, p, seen)) {
+      match first_reason(f.params, |p: Type| ungeneratable_within(checker, p, seen, room)) {
         Some(r) -> Some(r),
-        None -> ungeneratable(checker, f.ret, seen),
+        None -> ungeneratable_within(checker, f.ret, seen, room),
       }
     },
-    TyRecord(fs) -> first_reason(fs, |f: Field| ungeneratable(checker, f.ty, seen)),
+    TyRecord(fs) -> first_reason(fs, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
   }
 
 type SpecSite = | InRequires | InEnsures | SSDecreases | InWhere | InLawBody
@@ -9050,45 +9148,60 @@ fn substitute_ty(t: Type, params: List<Int>, args: List<Type>) -> Type / {abort.
 fn json_null_encoded(ty: Type) -> Bool =
   match ty { TyCon(c) -> null_encoded_name(c.name), _ -> false }
 
+fn derivable(
+  deriver: Deriver,
+  ty: Type,
+  adts: List<AlgebraicShape>,
+  assumed: List<Int>,
+) -> Option<Blocked> / {abort.raise} = derivable_within(deriver, ty, adts, assumed, [], len(adts))
+
 fn first_blocked(
   deriver: Deriver,
   tys: List<Type>,
   adts: List<AlgebraicShape>,
   assumed: List<Int>,
   visiting: List<Bytes>,
+  room: Int,
 ) -> Option<Blocked> / {abort.raise} =
   fold(tys, None, |acc: Option<Blocked>, ty: Type|
-    match acc { Some(_) -> acc, None -> derivable(deriver, ty, adts, assumed, visiting) })
+    match acc {
+      Some(_) -> acc,
+      None -> derivable_within(deriver, ty, adts, assumed, visiting, room),
+    })
 
-fn derivable(
+// `room` is how many more declared types the walk may enter: a path enters each one once.
+fn derivable_within(
   deriver: Deriver,
   ty: Type,
   adts: List<AlgebraicShape>,
   assumed: List<Int>,
   visiting: List<Bytes>,
+  room: Int,
 ) -> Option<Blocked> / {abort.raise} =
   match ty {
     TyVar(v) -> if contains(assumed, v) { None } else { Some({ ty: ty, why: Unconstrained(v) }) },
     TyFn(_) -> Some({ ty: ty, why: HoldsFunction }),
-    TyRecord(fs) -> first_blocked(deriver, map(fs, |f: Field| f.ty), adts, assumed, visiting),
+    TyRecord(fs) -> first_blocked(deriver, map(fs, |f: Field| f.ty), adts, assumed, visiting, room),
     TyCon(c) -> match constructor_shape(deriver, c.name) {
       Leaf -> None,
       Refused(why) -> Some({ ty: ty, why: why }),
       Structural -> if same_deriver(deriver, DJson) && c.name == b"Option" && len(c.args) > 0
           && json_null_encoded(at(c.args, 0)) { Some({ ty: ty, why: NullInsideOption }) }
-      else { first_blocked(deriver, c.args, adts, assumed, visiting) },
+      else { first_blocked(deriver, c.args, adts, assumed, visiting, room) },
       Nominal ->        // A recursive type is derivable exactly when its non-recursive parts are.
         if contains(visiting, c.name) { None } else {
           match find_adt(adts, c.name) {
             None -> None,
-            Some(adt) ->
+            Some(adt) -> if room <= 0 { panic("a type entered twice on one path") } else {
               first_blocked(
                 deriver,
                 map(adt.fields, |f: Type| substitute_ty(f, adt.params, c.args)),
                 adts,
                 assumed,
                 push(visiting, c.name),
-              ),
+                room - 1,
+              )
+            },
           }
         },
     },
@@ -9334,7 +9447,7 @@ fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
     { checker: { ..checker, map_keys: [] }, seen: [] },
     |acc: { checker: Checker, seen: List<{ scope: Int, text: Bytes }> }, site: MapKeySite| {
       let key = resolve(acc.checker, site.key);
-      match derivable(DOrd, key, adts, site.assumed, []) {
+      match derivable(DOrd, key, adts, site.assumed) {
         None -> acc,
         Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
           let pr = print_ty(printer_new(), key);
@@ -9390,7 +9503,7 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
       if is_predicate(site.deriver) {
         { checker: check_predicate(acc.checker, site, ty), seen: acc.seen }
       } else {
-        match derivable(site.deriver, ty, adts, site.assumed, []) {
+        match derivable(site.deriver, ty, adts, site.assumed) {
           None -> acc,
           Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
             let pr = print_ty(printer_new(), ty);
@@ -9657,7 +9770,7 @@ fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
         IDerive(def) -> if !expanded_here(m, def) { cc } else {
           match derive_target({ ..cc, module: i }, m, def.target.name) {
             None -> cc,
-            Some(o) -> match derivable(def.deriver, o.ty, adts, [], []) {
+            Some(o) -> match derivable(def.deriver, o.ty, adts, []) {
               None -> o.checker,
               Some(blocked) -> match blocked.why {
                 Unconstrained(_) -> o.checker,
@@ -13697,6 +13810,21 @@ test "a list written of parts, pushed or filtered or mapped to parts, is made of
   assert(diverges(walked(b"again", b"Many(xs) -> any(push(xs, t)), _ -> false"), b"again"))
 }
 
+// Where the call is by which a definition of `src` may not return, as an offset.
+fn diverging_at(src: Bytes, name: Bytes) -> Option<Int> / {abort.raise} =
+  match def_of(checked_cx(src), bytes_concat(b"m.", name)) {
+    Some(d) -> match d.ending { Diverges(x) -> Some(x.at.start), _ -> None },
+    None -> panic("the definition the test names"),
+  }
+
+test "a member of a group that may not return is told first by its own call out" {
+  let src = b"fn spin(n: Int) -> Int = spin(n)\nfn a(n: Int) -> Int = if n <= 0 { spin(n) } else { b(n - 1) }\nfn b(n: Int) -> Int = if n <= 0 { a(n) } else { c(n) }\nfn c(n: Int) -> Int = b(n)\n";
+  assert_eq(diverging_at(src, b"a"), bytes_index_of(src, b"spin(n) }"));
+  // `b` and `c` loop, and are told by that loop rather than by `a`'s call out.
+  assert(diverging_at(src, b"b") != diverging_at(src, b"a"));
+  assert_eq(diverging_at(src, b"b"), diverging_at(src, b"c"))
+}
+
 test "a list rebuilt of parts, a fallback a block takes, and a failure `?` passes on are no smaller" {
   // `map` rebuilds a list of one part a hundred times, and a tail of it is no part of `xs`.
   assert(
@@ -13755,6 +13883,171 @@ test "a list rebuilt of parts, a fallback a block takes, and a failure `?` passe
     diverges(
       b"fn slide(a: Int, m: Int, n: Int) -> Int / {abort.raise} = if a % m < n { slide(a - 1, m, n - 1) } else { 0 }\n",
       b"slide",
+    ),
+  )
+}
+
+test "a value an `if` chooses, an element a helper finds, and a list made of parts descend" {
+  let tree = b"type T = | Leaf | Node(T, T) | Many(List<T>)\n";
+  // The value an `if` answers is a part on either branch.
+  assert(
+    !diverges(
+      bytes_concat(
+        tree,
+        b"fn left(t: T) -> Int = match t { Node(l, r) -> left(if l == Leaf { r } else { l }), _ -> 0 }\n",
+      ),
+      b"left",
+    ),
+  );
+  // A helper that answers an element answers an element of a list rebuilt of parts, too.
+  let pick = b"fn pick(xs: List<T>, i: Int) -> T / {abort.raise} = match list_at(xs, i) { Some(x) -> x, None -> panic(\"none\") }\n";
+  assert(
+    !diverges(
+      bytes_concat_all([
+        tree,
+        pick,
+        b"fn first(t: T) -> Int / {abort.raise} = match t { Many(kids) -> if len(kids) == 0 { 0 } else { first(pick(map(kids, |k: T| k), 0)) }, _ -> 0 }\n",
+      ]),
+      b"first",
+    ),
+  );
+  // Each element of a list written or mapped of parts is smaller than the value they are parts of.
+  let shapes = b"fn shape(t: T) -> Int = match t { Leaf -> 1, Node(a, b) -> shapes([a, b]), Many(ts) -> shapes(map(ts, |x: T| x)) }\nfn shapes(ts: List<T>) -> Int = fold(ts, 0, |n: Int, x: T| n + shape(x))\n";
+  assert(!diverges(bytes_concat(tree, shapes), b"shape"));
+  assert(!diverges(bytes_concat(tree, shapes), b"shapes"));
+  // A list holding the value itself has an element no smaller.
+  assert(
+    diverges(
+      bytes_concat(
+        tree,
+        b"fn shape(t: T) -> Int = match t { Leaf -> 1, Node(a, b) -> shapes([a, t]), Many(ts) -> shapes(ts) }\nfn shapes(ts: List<T>) -> Int = fold(ts, 0, |n: Int, x: T| n + shape(x))\n",
+      ),
+      b"shape",
+    ),
+  )
+}
+
+test "a map's keys and values handed to `map_fold`'s callback are parts of the map" {
+  let tree = b"type T = | Leaf | Node(Map<Int, T>)\n";
+  assert(
+    !diverges(
+      bytes_concat(
+        tree,
+        b"fn size(t: T) -> Int = match t { Node(kids) -> map_fold(kids, 1, |n: Int, k: Int, c: T| n + size(c)), Leaf -> 1 }\n",
+      ),
+      b"size",
+    ),
+  );
+  // What the callback is handed besides is no part of it.
+  assert(
+    diverges(
+      bytes_concat(
+        tree,
+        b"fn worse(t: T) -> Int = match t { Node(kids) -> map_fold(kids, 0, |n: Int, k: Int, c: T| n + worse(t)), Leaf -> 0 }\n",
+      ),
+      b"worse",
+    ),
+  )
+}
+
+test "lambdas bound by `let` are read where they are called, so many deep and no deeper" {
+  // `l0` calls `down`; each later lambda calls the one before it, and `down` calls the last.
+  let chain = |n: Int|
+    bytes_concat_all([
+      b"fn down(n: Int) -> Int = {\n  let l0 = |x: Int| down(x);\n",
+      bytes_concat_all(
+        map(range(1, n), |i: Int|
+          bytes_concat_all([
+            b"  let l",
+            int_to_bytes(i),
+            b" = |x: Int| l",
+            int_to_bytes(i - 1),
+            b"(x);\n",
+          ])),
+      ),
+      b"  if n <= 0 { 0 } else { l",
+      int_to_bytes(n - 1),
+      b"(n - 1) }\n}\n",
+    ]);
+  assert(!diverges(chain(8), b"down"));
+  assert(diverges(chain(9), b"down"))
+}
+
+test "a function an `if` chooses is handed on as each branch is, and a loop that does not descend is told by its calls" {
+  let each = b"type In = { room: Int }\nfn each(i: In, n: Int, f: (In, Int) -> Int) -> Int = fold(range(0, n), 0, |acc: Int, k: Int| acc + f(i, k))\nfn top(i: In, k: Int) -> Int = if i.room <= 0 { 0 } else { inner({ ..i, room: i.room - 1 }, k) }\n";
+  assert(
+    !diverges(
+      bytes_concat(
+        each,
+        b"fn inner(i: In, k: Int) -> Int = each(i, 3, if k > 1 { top } else { other })\nfn other(i: In, k: Int) -> Int = top(i, k)\n",
+      ),
+      b"top",
+    ),
+  );
+  // Each call of the loop, in order from where it starts.
+  let src = b"fn ping(n: Int) -> Int = pong(n)\nfn pong(n: Int) -> Int = if n <= 0 { 0 } else { ping(n) }\n";
+  match def_of(checked_cx(src), b"m.ping") {
+    Some(d) -> match d.ending {
+      Diverges(x) ->
+        assert_eq(map(x.loop, |span: Span| span.start), [
+          match bytes_index_of(src, b"pong(n)\n") { Some(i) -> i, None -> -1 },
+          match bytes_index_of(src, b"ping(n) }") { Some(i) -> i, None -> -1 },
+        ]),
+      _ -> assert(false),
+    },
+    None -> assert(false),
+  }
+}
+
+test "a value with no parts is no larger than any" {
+  // `step` is only ever handed `None`, so its `Some` arm adds nothing a loop could grow by.
+  assert(
+    !diverges(
+      b"type T = | Leaf | Node(T, T)\nfn walk(t: T) -> Int = match t { Node(l, r) -> step(l, None), Leaf -> 0 }\nfn step(t: T, extra: Option<T>) -> Int = match extra { Some(e) -> walk(e), None -> walk(t) }\n",
+      b"walk",
+    ),
+  )
+}
+
+test "a constructor of one field around a part is no larger than what that is a part of" {
+  let tree = b"type T = | Leaf | Node(List<T>)\n";
+  assert(
+    !diverges(
+      bytes_concat(
+        tree,
+        b"fn kind(t: Option<T>) -> Int = match t { Some(Node(ts)) -> kinds(ts), _ -> 0 }\nfn kinds(ts: List<T>) -> Int = fold(ts, 0, |n: Int, x: T| n + kind(Some(x)))\n",
+      ),
+      b"kind",
+    ),
+  );
+  // Wrapping the value in more than it was grows it.
+  assert(
+    diverges(
+      bytes_concat(
+        tree,
+        b"fn grow(t: Option<T>) -> Int = match t { Some(x) -> grow(Some(Node([x]))), None -> 0 }\n",
+      ),
+      b"grow",
+    ),
+  )
+}
+
+test "what a recursive definition answers is read to a fixed point over its group" {
+  let tree = b"type T = | Leaf | Node(List<T>)\nfn last(xs: List<T>) -> T / {abort.raise} = match xs { [x] -> x, [_, ..rest] -> last(rest), [] -> panic(\"empty\") }\n";
+  assert(
+    !diverges(
+      bytes_concat(
+        tree,
+        b"fn depth(t: T) -> Int / {abort.raise} = match t { Node(kids) -> if len(kids) == 0 { 0 } else { 1 + depth(last(kids)) }, Leaf -> 0 }\n",
+      ),
+      b"depth",
+    ),
+  );
+  // A definition that answers its argument whole answers nothing smaller.
+  assert(
+    diverges(
+      b"type T = | Leaf | Node(List<T>)\nfn same(t: T, n: Int) -> T = if n <= 0 { t } else { same(t, n - 1) }\nfn spin(t: T) -> Int = match t { Node(_) -> spin(same(t, 3)), Leaf -> 0 }\n",
+      b"spin",
     ),
   )
 }

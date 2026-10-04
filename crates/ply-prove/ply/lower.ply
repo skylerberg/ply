@@ -282,14 +282,24 @@ pub fn lower_root(
   binders: List<Int>,
 ) -> L / {abort.raise} = {
   let outer = lowering.window;
-  let r = lower_opt({ ..lowering, window: map(binders, |t: Int| Some(t)) }, context, c);
+  let r = lower_opt(
+    { ..lowering, window: map(binders, |t: Int| Some(t)) },
+    context,
+    c,
+    lowering.unfold_limit - lowering.depth,
+  );
   { lowering: { ..r.lowering, window: outer }, id: r.id }
 }
 
 // A body or clause the lowering did not take reads as unreached.
-fn lower_opt(lowering: Lowering, context: Context, c: Option<Code>) -> L / {abort.raise} =
+fn lower_opt(
+  lowering: Lowering,
+  context: Context,
+  c: Option<Code>,
+  unfolds: Int,
+) -> L / {abort.raise} =
   match c {
-    Some(code) -> lower(lowering, context, code),
+    Some(code) -> lower(lowering, context, code, unfolds),
     None -> on(blocked(lowering, UndecidableMatchArm), sym(lowering.terms, None)),
   }
 
@@ -298,25 +308,26 @@ fn opaque_sym(lowering: Lowering, b: Blocker) -> L / {abort.raise} = {
   on(lw2, sym(lw2.terms, None))
 }
 
-pub fn lower(lowering: Lowering, context: Context, c: Code) -> L / {abort.raise} =
+pub fn lower(lowering: Lowering, context: Context, c: Code, unfolds: Int) -> L / {abort.raise} =
   match c.node {
     NLit(l) -> literal(lowering, l),
     NVar(v) -> match v.slot {
       Some(s) -> local(lowering, s),
       None -> global(lowering, context, string_of_bytes_lossy(v.name)),
     },
-    NBinary(b) -> binary_code(lowering, context, b.op, b.lhs, b.rhs),
-    NUnary(u) -> unary(lowering, context, u.op, u.operand),
+    NBinary(b) -> binary_code(lowering, context, b.op, b.lhs, b.rhs, unfolds),
+    NUnary(u) -> unary(lowering, context, u.op, u.operand, unfolds),
     NLambda(_) -> opaque_sym(lowering, Lambda),
-    NApp(a) -> application(lowering, context, a.func, a.args),
+    NApp(a) -> application(lowering, context, a.func, a.args, unfolds),
     NIf(i) -> {
-      let cond = lower(lowering, context, i.cond);
-      let then_branch = lower(assume(cond.lowering, cond.id), context, i.then_branch);
+      let cond = lower(lowering, context, i.cond, unfolds);
+      let then_branch = lower(assume(cond.lowering, cond.id), context, i.then_branch, unfolds);
       let otherwise = not(then_branch.lowering.terms, cond.id);
       let else_branch = lower(
         assume(popped(with_terms(then_branch.lowering, otherwise.terms)), otherwise.id),
         context,
         i.else_branch,
+        unfolds,
       );
       let lw2 = popped(else_branch.lowering);
       let sort = match sort_of(lw2.terms, then_branch.id) {
@@ -332,45 +343,28 @@ pub fn lower(lowering: Lowering, context: Context, c: Code) -> L / {abort.raise}
         ),
       )
     },
-    NMatch(m) -> match_expr(lowering, context, m.scrutinee, m.arms),
-    NBlock(b) -> block(lowering, context, b.stmts, b.tail),
-    NRecord(r) ->
-      record(
-        lowering,
-        context,
-        map(r.fields, |f: CodeField| { name: string_of_bytes_lossy(f.name), value: Some(f.value) }),
-        None,
-      ),
+    NMatch(m) -> match_expr(lowering, context, m.scrutinee, m.arms, unfolds),
+    NBlock(b) -> block(lowering, context, b.stmts, b.tail, unfolds),
+    NRecord(r) -> record(lowering, context, [], r.fields, None, unfolds),
     // Each branch applied where it stands: the block means the tuple of its branches' answers.
     NParallel(pr) ->
-      record(
-        lowering,
-        context,
-        map(range(0, len(pr.branches)), |i: Int|
-          {
-            name: "_" ++ int_to_string(i),
-            value: match list_at(pr.branches, i) {
-              Some(b) -> Some({ own: b.own, span: b.span, node: NApp({ func: b, args: [] }) }),
-              None -> None,
+      recorded(
+        fold(range(0, len(pr.branches)), { lowering: lowering, out: [] }, |acc: Lowered, i: Int|
+          match list_at(pr.branches, i) {
+            Some(b) -> {
+              let r = application(acc.lowering, context, b, [], unfolds);
+              {
+                lowering: r.lowering,
+                out: push(acc.out, { name: "_" ++ int_to_string(i), value: r.id }),
+              }
             },
+            None -> acc,
           }),
-        None,
       ),
     // The fields a record update copies read the base; the ones it sets follow them.
-    NUpdate(u) ->
-      record(
-        lowering,
-        context,
-        fold(
-          u.sets,
-          map(u.copies, |n: Bytes| { name: string_of_bytes_lossy(n), value: None }),
-          |acc: List<{ name: String, value: Option<Code> }>, f: CodeField|
-            push(acc, { name: string_of_bytes_lossy(f.name), value: Some(f.value) }),
-        ),
-        Some(u.base),
-      ),
+    NUpdate(u) -> record(lowering, context, u.copies, u.sets, Some(u.base), unfolds),
     NField(f) -> {
-      let base = lower(lowering, context, f.base);
+      let base = lower(lowering, context, f.base, unfolds);
       on(base.lowering, field(base.lowering.terms, base.id, string_of_bytes_lossy(f.field)))
     },
     NList(l) -> {
@@ -378,7 +372,7 @@ pub fn lower(lowering: Lowering, context: Context, c: Code) -> L / {abort.raise}
         l.items,
         { lowering: lowering, ids: [] },
         |acc: { lowering: Lowering, ids: List<Int> }, x: Code| {
-          let r = lower(acc.lowering, context, x);
+          let r = lower(acc.lowering, context, x, unfolds);
           { lowering: r.lowering, ids: push(acc.ids, r.id) }
         },
       );
@@ -405,35 +399,41 @@ pub fn lower(lowering: Lowering, context: Context, c: Code) -> L / {abort.raise}
     NLabel(_) -> opaque_sym(lowering, Region),
   }
 
+type Lowered = { lowering: Lowering, out: List<{ name: String, value: Int }> }
+
 // A record literal, or an update: each copied field read off `base`, then each set one.
 fn record(
   lowering: Lowering,
   context: Context,
-  fields: List<{ name: String, value: Option<Code> }>,
+  copies: List<Bytes>,
+  sets: List<CodeField>,
   base: Option<Code>,
+  unfolds: Int,
 ) -> L / {abort.raise} = {
-  let lowered = fold(
-    fields,
-    { lowering: lowering, out: [] },
-    |acc: { lowering: Lowering, out: List<{ name: String, value: Int }> }, f: { name: String, value: Option<Code> }|
-      match f.value {
-        Some(v) -> {
-          let r = lower(acc.lowering, context, v);
-          { lowering: r.lowering, out: push(acc.out, { name: f.name, value: r.id }) }
-        },
-        None -> match base {
-          Some(b) -> {
-            let r = lower(acc.lowering, context, b);
-            let read = field(r.lowering.terms, r.id, f.name);
-            {
-              lowering: with_terms(r.lowering, read.terms),
-              out: push(acc.out, { name: f.name, value: read.id }),
-            }
-          },
-          None -> acc,
-        },
+  let copied = fold(copies, { lowering: lowering, out: [] }, |acc: Lowered, n: Bytes|
+    match base {
+      Some(b) -> {
+        let r = lower(acc.lowering, context, b, unfolds);
+        let read = field(r.lowering.terms, r.id, string_of_bytes_lossy(n));
+        {
+          lowering: with_terms(r.lowering, read.terms),
+          out: push(acc.out, { name: string_of_bytes_lossy(n), value: read.id }),
+        }
       },
-  );
+      None -> acc,
+    });
+  recorded(
+    fold(sets, copied, |acc: Lowered, f: CodeField| {
+      let r = lower(acc.lowering, context, f.value, unfolds);
+      {
+        lowering: r.lowering,
+        out: push(acc.out, { name: string_of_bytes_lossy(f.name), value: r.id }),
+      }
+    }),
+  )
+}
+
+fn recorded(lowered: Lowered) -> L / {abort.raise} = {
   let sorted = sorted_fields(lowered.out);
   let sort = record_sort(lowered.lowering.terms, sorted);
   on(lowered.lowering, mk(lowered.lowering.terms, TRecord(sorted), sort))
@@ -468,8 +468,14 @@ fn record_sort(terms: Terms, fields: List<{ name: String, value: Int }>) -> Opti
     None -> None,
   }
 
-fn unary(lowering: Lowering, context: Context, op: Bytes, operand: Code) -> L / {abort.raise} = {
-  let t = lower(lowering, context, operand);
+fn unary(
+  lowering: Lowering,
+  context: Context,
+  op: Bytes,
+  operand: Code,
+  unfolds: Int,
+) -> L / {abort.raise} = {
+  let t = lower(lowering, context, operand, unfolds);
   if op == b"not" { on(t.lowering, not(t.lowering.terms, t.id)) }
   // Not folded to `-x - 1`, which raises at `Int`'s least value where `~` does not.
   else if op == b"bitnot" {
@@ -582,16 +588,17 @@ fn binary_code(
   op: Bytes,
   lhs: Code,
   rhs: Code,
+  unfolds: Int,
 ) -> L / {abort.raise} =
   if op == b"and" || op == b"or" {
-    let l = lower(lowering, context, lhs);
+    let l = lower(lowering, context, lhs, unfolds);
     let reached = if op == b"and" { { lowering: l.lowering, id: l.id } }
     else { on(l.lowering, not(l.lowering.terms, l.id)) };
-    let r = lower(assume(reached.lowering, reached.id), context, rhs);
+    let r = lower(assume(reached.lowering, reached.id), context, rhs, unfolds);
     binary(popped(r.lowering), op, l.id, r.id)
   } else {
-    let l = lower(lowering, context, lhs);
-    let r = lower(l.lowering, context, rhs);
+    let l = lower(lowering, context, lhs, unfolds);
+    let r = lower(l.lowering, context, rhs, unfolds);
     binary(r.lowering, op, l.id, r.id)
   }
 
@@ -723,12 +730,13 @@ fn lowered_args(
   lowering: Lowering,
   context: Context,
   args: List<Code>,
+  unfolds: Int,
 ) -> { lowering: Lowering, ids: List<Int> } / {abort.raise} =
   fold(
     args,
     { lowering: lowering, ids: [] },
     |acc: { lowering: Lowering, ids: List<Int> }, a: Code| {
-      let r = lower(acc.lowering, context, a);
+      let r = lower(acc.lowering, context, a, unfolds);
       { lowering: r.lowering, ids: push(acc.ids, r.id) }
     },
   )
@@ -738,13 +746,14 @@ fn application(
   context: Context,
   func: Code,
   args: List<Code>,
+  unfolds: Int,
 ) -> L / {abort.raise} = {
-  let lowered = lowered_args(lowering, context, args);
+  let lowered = lowered_args(lowering, context, args, unfolds);
   match func.node {
     NLambda(l) -> if l.params == len(lowered.ids) {
-      apply_lambda(lowered.lowering, context, lowered.ids, l.captures, l.body)
-    } else { call(lowered.lowering, context, func, lowered.ids) },
-    _ -> call(lowered.lowering, context, func, lowered.ids),
+      apply_lambda(lowered.lowering, context, lowered.ids, l.captures, l.body, unfolds)
+    } else { call(lowered.lowering, context, func, lowered.ids, unfolds) },
+    _ -> call(lowered.lowering, context, func, lowered.ids, unfolds),
   }
 }
 
@@ -754,6 +763,7 @@ fn apply_lambda(
   args: List<Int>,
   caps: List<Capture>,
   body: Code,
+  unfolds: Int,
 ) -> L / {abort.raise} = {
   let captured = fold(
     caps,
@@ -768,13 +778,19 @@ fn apply_lambda(
     },
   );
   let outer = captured.lowering.window;
-  let r = lower({ ..captured.lowering, window: captured.window }, context, body);
+  let r = lower({ ..captured.lowering, window: captured.window }, context, body, unfolds);
   { lowering: { ..r.lowering, window: outer }, id: r.id }
 }
 
-fn call(lowering: Lowering, context: Context, func: Code, args: List<Int>) -> L / {abort.raise} = {
+fn call(
+  lowering: Lowering,
+  context: Context,
+  func: Code,
+  args: List<Int>,
+  unfolds: Int,
+) -> L / {abort.raise} = {
   let who = callee(context, func);
-  let head = lower(lowering, context, func);
+  let head = lower(lowering, context, func, unfolds);
   let head_sort = match sort_of(head.lowering.terms, head.id) {
     Some(Fn(_, ret, _)) -> Some(ret),
     _ -> None,
@@ -802,7 +818,7 @@ fn call(lowering: Lowering, context: Context, func: Code, args: List<Int>) -> L 
             ),
           )
         } else { Keep(pure0, head.lowering) },
-        None -> match try_unfold(head.lowering, context, name, head.id, sort, args) {
+        None -> match try_unfold(head.lowering, context, name, head.id, sort, args, unfolds) {
           Some(r) -> Done(r),
           None ->
             Keep(
@@ -946,6 +962,8 @@ pub fn smaller_than(lowering: Lowering, t: Int, root: Int) -> Bool =
     ).found
     == Some(true)
 
+// `unfolds` is how many more definitions a path may unfold inside one another: the unfold depth
+// left, carried beside the lowering so it is read off the calls rather than off what they answer.
 fn try_unfold(
   lowering: Lowering,
   context: Context,
@@ -953,8 +971,10 @@ fn try_unfold(
   head: Int,
   sort: Option<Ty>,
   args: List<Int>,
+  unfolds: Int,
 ) -> Option<L> / {abort.raise} =
-  if lowering.depth >= lowering.unfold_limit || size(lowering.terms) >= max_terms() { None } else {
+  if lowering.depth >= lowering.unfold_limit || unfolds <= 0
+      || size(lowering.terms) >= max_terms() { None } else {
     let unrolling = holds(lowering.unrolled, name);
     // One step of a recursive definition: the hypothesis speaks about the call that remains.
     if unrolling && lowering.depth >= 1 { None } else {
@@ -970,7 +990,12 @@ fn try_unfold(
             depth: lowering.depth + 1,
           };
           let outer = lw2.window;
-          let r = lower_opt({ ..lw2, window: map(args, |t: Int| Some(t)) }, context, def.body);
+          let r = lower_opt(
+            { ..lw2, window: map(args, |t: Int| Some(t)) },
+            context,
+            def.body,
+            unfolds - 1,
+          );
           let back = { ..r.lowering, window: outer, depth: r.lowering.depth - 1 };
           if unrolling {
             let c = app(back.terms, head, args, sort);
@@ -994,24 +1019,25 @@ fn block(
   context: Context,
   stmts: List<CodeStmt>,
   tail: Option<Code>,
+  unfolds: Int,
 ) -> L / {abort.raise} = {
   let after = fold(stmts, lowering, |acc: Lowering, st: CodeStmt|
     match st {
       CLet(l) -> {
-        let r = lower(acc, context, l.value);
+        let r = lower(acc, context, l.value, unfolds);
         bind(r.lowering, l.slot, r.id)
       },
       CLetPat(l) -> match l.pat {
         PxWild -> acc,
         PxVar(v) -> match v.slot {
           Some(s) -> {
-            let r = lower(acc, context, l.value);
+            let r = lower(acc, context, l.value, unfolds);
             bind(r.lowering, s, r.id)
           },
           None -> acc,
         },
         pat -> {
-          let r = lower(acc, context, l.value);
+          let r = lower(acc, context, l.value, unfolds);
           let sort = sort_of(r.lowering.terms, r.id);
           bind_opaque(blocked(r.lowering, DestructuringLet), context, pat, sort)
         },
@@ -1019,7 +1045,7 @@ fn block(
       // A statement run for its effect adds nothing a claim's value is made of.
       CDo(_) -> acc,
     });
-  match tail { Some(t) -> lower(after, context, t), None -> on(after, unit(after.terms)) }
+  match tail { Some(t) -> lower(after, context, t, unfolds), None -> on(after, unit(after.terms)) }
 }
 
 fn bind_opaque(
@@ -1073,8 +1099,9 @@ fn match_expr(
   context: Context,
   scrutinee: Code,
   arms: List<CodeArm>,
+  unfolds: Int,
 ) -> L / {abort.raise} = {
-  let s = lower(lowering, context, scrutinee);
+  let s = lower(lowering, context, scrutinee, unfolds);
   let s_sort = sort_of(s.lowering.terms, s.id);
   let walked = fold(
     arms,
@@ -1100,7 +1127,7 @@ fn match_expr(
           },
       };
       let guarded = match a.guard {
-        Some(g) -> lower(tested.lowering, context, g).lowering,
+        Some(g) -> lower(tested.lowering, context, g, unfolds).lowering,
         None -> tested.lowering,
       };
       // What a list arm's body owes is owed only where the arm runs: at `[]`, or off it.
@@ -1114,7 +1141,7 @@ fn match_expr(
         _ -> None,
       };
       let entered = match taken { Some(c) -> assume(c.lowering, c.id), None -> guarded };
-      let body = lower(entered, context, a.body);
+      let body = lower(entered, context, a.body, unfolds);
       let left = match taken { Some(_) -> popped(body.lowering), None -> body.lowering };
       let sort = match acc.sort { Some(x) -> Some(x), None -> sort_of(left.terms, body.id) };
       {

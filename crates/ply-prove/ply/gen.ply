@@ -11,7 +11,7 @@ import std.random
 import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
                   VArray, VRecord, VCtor, VFn, Field, Entry, FConst, FProject, FTable, map_of)
 import std.list (at)
-import domain (Ty, Var, Fn, Record, Con, Decl, Variant)
+import domain (Ty, Var, Fn, Record, Con, Decl, Variant, name_order)
 
 // Why a type has no value to draw.
 pub type Ungeneratable =
@@ -123,24 +123,15 @@ pub fn substituted(t: Ty, args: List<Ty>) -> Ty =
       ),
   }
 
-// A record's fields in name order, which is the order they are drawn and stored in.
+// A record's fields in name order, which is the order they are drawn and stored in. Picked by
+// place, so what comes back is plainly the fields themselves.
 pub fn by_name(fields: List<{ name: String, ty: Ty }>) -> List<{ name: String, ty: Ty }> =
-  fold(fields, [], |acc: List<{ name: String, ty: Ty }>, f: { name: String, ty: Ty }| {
-    let at = fold(range(0, len(acc)), len(acc), |found: Int, i: Int|
-      if found < len(acc) { found } else {
-        match list_at(acc, i) {
-          Some(g) -> if compare(f.name, g.name) == Less { i } else { found },
-          None -> found,
-        }
-      });
-    if at == len(acc) { push(acc, f) } else {
-      fold(range(0, len(acc)), [], |out: List<{ name: String, ty: Ty }>, i: Int|
-        match list_at(acc, i) {
-          Some(g) -> if i == at { push(push(out, f), g) } else { push(out, g) },
-          None -> out,
-        })
-    }
-  })
+  fold(
+    name_order(map(fields, |f: { name: String, ty: Ty }| f.name)),
+    [],
+    |acc: List<{ name: String, ty: Ty }>, i: Int|
+      match list_at(fields, i) { Some(f) -> push(acc, f), None -> acc },
+  )
 
 pub fn generatable(ty: Ty, types: Types) -> Result<Unit, Ungeneratable> =
   match ty {
@@ -449,19 +440,21 @@ fn several(
       },
   )
 
+// Each step down repeats `value`'s depth check, so the depth bound reads where it grows.
 fn list(
   gen: Gen,
   elem: Ty,
   rand: Rand,
   depth: Int,
   made: (List<Value>) -> Value,
-) -> Result<Generated, Ungeneratable> / {abort.raise} = {
-  let l = if depth >= gen_depth() { { n: 0, rand: rand } } else { length(gen, rand) };
-  match several(gen, elem, l.n, l.rand, depth + 1) {
-    Err(e) -> Err(e),
-    Ok(items) -> Ok({ value: made(items.values), rand: items.rand }),
+) -> Result<Generated, Ungeneratable> / {abort.raise} =
+  if depth >= hard_depth() { Err(UTooDeep) } else {
+    let l = if depth >= gen_depth() { { n: 0, rand: rand } } else { length(gen, rand) };
+    match several(gen, elem, l.n, l.rand, depth + 1) {
+      Err(e) -> Err(e),
+      Ok(items) -> Ok({ value: made(items.values), rand: items.rand }),
+    }
   }
-}
 
 fn map_value(
   gen: Gen,
@@ -469,26 +462,30 @@ fn map_value(
   val: Ty,
   rand: Rand,
   depth: Int,
-) -> Result<Generated, Ungeneratable> / {abort.raise} = {
-  let l = if depth >= gen_depth() { { n: 0, rand: rand } } else { length(gen, rand) };
-  let drawn = fold(
-    range(0, min(l.n, max_entries())),
-    Ok({ entries: [], rand: l.rand }),
-    |acc: Result<{ entries: List<Entry>, rand: Rand }, Ungeneratable>, _i: Int|
-      match acc {
-        Err(_) -> acc,
-        Ok(so_far) -> match value(gen, key, so_far.rand, depth + 1) {
-          Err(e) -> Err(e),
-          Ok(k) -> match value(gen, val, k.rand, depth + 1) {
+) -> Result<Generated, Ungeneratable> / {abort.raise} =
+  if depth >= hard_depth() { Err(UTooDeep) } else {
+    let l = if depth >= gen_depth() { { n: 0, rand: rand } } else { length(gen, rand) };
+    let drawn = fold(
+      range(0, min(l.n, max_entries())),
+      Ok({ entries: [], rand: l.rand }),
+      |acc: Result<{ entries: List<Entry>, rand: Rand }, Ungeneratable>, _i: Int|
+        match acc {
+          Err(_) -> acc,
+          Ok(so_far) -> match value(gen, key, so_far.rand, depth + 1) {
             Err(e) -> Err(e),
-            Ok(v) ->
-              Ok({ entries: push(so_far.entries, { key: k.value, value: v.value }), rand: v.rand }),
+            Ok(k) -> match value(gen, val, k.rand, depth + 1) {
+              Err(e) -> Err(e),
+              Ok(v) ->
+                Ok({
+                  entries: push(so_far.entries, { key: k.value, value: v.value }),
+                  rand: v.rand,
+                }),
+            },
           },
         },
-      },
-  );
-  match drawn { Err(e) -> Err(e), Ok(d) -> Ok({ value: map_of(d.entries), rand: d.rand }) }
-}
+    );
+    match drawn { Err(e) -> Err(e), Ok(d) -> Ok({ value: map_of(d.entries), rand: d.rand }) }
+  }
 
 fn record(
   gen: Gen,
@@ -562,22 +559,24 @@ fn adt(
   rand: Rand,
   depth: Int,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} =
-  match usable(gen.types, name, args, depth) {
-    Err(e) -> Err(e),
-    Ok(variants) -> {
-      let picked = match gen.edge {
-        Some(i) -> { index: i % len(variants), rand: rand },
-        None -> {
-          let w = word(rand);
-          { index: modulo(w, len(variants)), rand: w.rand }
-        },
-      };
-      let v = at(variants, picked.index);
-      match several_of(gen, v.fields, picked.rand, depth + 1) {
-        Err(e) -> Err(e),
-        Ok(drawn) -> Ok({ value: VCtor(v.name, drawn.values), rand: drawn.rand }),
-      }
-    },
+  if depth >= hard_depth() { Err(UTooDeep) } else {
+    match usable(gen.types, name, args, depth) {
+      Err(e) -> Err(e),
+      Ok(variants) -> {
+        let picked = match gen.edge {
+          Some(i) -> { index: i % len(variants), rand: rand },
+          None -> {
+            let w = word(rand);
+            { index: modulo(w, len(variants)), rand: w.rand }
+          },
+        };
+        let v = at(variants, picked.index);
+        match several_of(gen, v.fields, picked.rand, depth + 1) {
+          Err(e) -> Err(e),
+          Ok(drawn) -> Ok({ value: VCtor(v.name, drawn.values), rand: drawn.rand }),
+        }
+      },
+    }
   }
 
 // One value of each type, in order.

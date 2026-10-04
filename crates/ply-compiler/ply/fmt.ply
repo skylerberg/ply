@@ -118,18 +118,20 @@ fn trim_last(parts: List<Bytes>) -> List<Bytes> / {abort.raise} = {
   if n == 0 { parts } else { list_set(parts, n - 1, trim_end(at(parts, n - 1))) }
 }
 
+// What follows a closed line starts the next one, which `nl` opens and no longer has it closed.
 fn emit(printer: Printer, b: Bytes) -> Printer / {abort.raise} =
   if printer.closed >= 0 && bytes_len(trim(b)) > 0 {
-    emit(nl(printer, printer.closed, false), trim(b))
-  } else {
-    {
-      next_comment: printer.next_comment,
-      previous_end: printer.previous_end,
-      pending: printer.pending,
-      column: printer.column + bytes_len(b),
-      closed: printer.closed,
-      parts: push(printer.parts, b),
-    }
+    appended(nl(printer, printer.closed, false), trim(b))
+  } else { appended(printer, b) }
+
+fn appended(printer: Printer, b: Bytes) -> Printer =
+  {
+    next_comment: printer.next_comment,
+    previous_end: printer.previous_end,
+    pending: printer.pending,
+    column: printer.column + bytes_len(b),
+    closed: printer.closed,
+    parts: push(printer.parts, b),
   }
 
 fn set_prev(printer: Printer, e: Int) -> Printer = { ..printer, previous_end: e }
@@ -228,7 +230,7 @@ fn flush_comments(
   indent: Int,
   blanks: Bool,
 ) -> Printer / {abort.raise} =
-  match next_comment(input, printer) {
+  match list_at(input.comments, printer.next_comment) {
     Some(c) -> if c.start < before {
       let s = nl(printer, indent, blanks && gap(input, printer.previous_end, c.start));
       flush_comments(
@@ -280,7 +282,7 @@ fn trail(input: PrintInput, printer: Printer, end: Int) -> Printer / {abort.rais
 
 // Comments a printed node left behind inside its span end its line rather than being lost.
 fn absorb(input: PrintInput, printer: Printer, end: Int) -> Printer / {abort.raise} =
-  match next_comment(input, printer) {
+  match list_at(input.comments, printer.next_comment) {
     Some(c) -> if c.start < end {
       absorb(
         input,
@@ -476,13 +478,15 @@ fn generics_text(generics: Generics) -> Bytes / {abort.raise} =
 fn unparen(input: PrintInput, span: Span) -> Bytes / {abort.raise} =
   unparen_text(trim(bytes_slice(input.source, span.start, span.end)))
 
-fn unparen_text(t: Bytes) -> Bytes / {abort.raise} = {
-  let n = bytes_len(t);
-  if n >= 2 && bytes_at(t, 0) == 40 && bytes_at(t, n - 1) == 41 {
-    let inner = trim(bytes_slice(t, 1, n - 1));
-    if bytes_len(inner) == 0 { t } else { unparen_text(inner) }
-  } else { t }
-}
+// A pair of parentheses a round, each round two bytes shorter.
+fn unparen_text(t: Bytes) -> Bytes / {abort.raise} =
+  iterate(t, bytes_len(t) / 2 + 1, |cur: Bytes| {
+    let n = bytes_len(cur);
+    if n >= 2 && bytes_at(cur, 0) == 40 && bytes_at(cur, n - 1) == 41 {
+      let inner = trim(bytes_slice(cur, 1, n - 1));
+      if bytes_len(inner) == 0 { Stop(cur) } else { Continue(inner) }
+    } else { Stop(cur) }
+  })
 
 fn strip_blanks(t: Bytes) -> Bytes / {abort.raise} =
   bytes_concat_all(bytes_split(bytes_concat_all(bytes_split(t, b" ")), b"\t"))
@@ -821,7 +825,7 @@ fn interpolated(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
   match e {
     ELit(_) -> None,
     _ -> if !one_interpolation(input, expr_span(e)) { None }
-    else { cat([Some(b"f\""), cat(map(pieces(e, []), |x: Expr| piece(input, x))), Some(b"\"")]) },
+    else { cat([Some(b"f\""), pieces(input, e), Some(b"\"")]) },
   }
 
 // A concatenation the program wrote may open with an interpolated string too, so the span must be
@@ -848,11 +852,12 @@ fn one_interpolation(input: PrintInput, span: Span) -> Bool / {abort.raise} =
     walked.closed == len(toks) - 2
   }
 
-fn pieces(expr: Expr, acc: List<Expr>) -> List<Expr> =
+// Each piece of the concatenation printed, left to right.
+fn pieces(input: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
   match expr {
-    EBinary(v) -> if v.op == b"concat" { pieces(v.rhs, pieces(v.lhs, acc)) }
-    else { push(acc, expr) },
-    _ -> push(acc, expr),
+    EBinary(v) -> if v.op == b"concat" { cat([pieces(input, v.lhs), pieces(input, v.rhs)]) }
+    else { piece(input, expr) },
+    _ -> piece(input, expr),
   }
 
 // A text piece's token runs from the `f"` or `}` before it to the `{` or `"` after it.
@@ -1012,16 +1017,27 @@ fn laid(
   after: Int,
 ) -> Printer / {abort.raise} = {
   let sp = expr_span(e);
+  // On its own line the node starts at the indent, so it is laid out there.
   if printer.column > indent && comment_before(input, printer, sp.start) {
-    expr(input, nl(printer, indent + 2, false), e, indent + 2, after)
-  } else {
-    let s0 = lead(input, printer, sp.start, indent);
-    let s1 = match try_flat(input, s0, flat_expr(input, e), sp.end, after) {
-      Some(f) -> emit(s0, f),
-      None -> broken(input, s0, e, indent, cont, after),
-    };
-    absorb(input, s1, sp.end)
-  }
+    laid_here(input, nl(printer, indent + 2, false), e, indent + 2, indent + 4, after)
+  } else { laid_here(input, printer, e, indent, cont, after) }
+}
+
+fn laid_here(
+  input: PrintInput,
+  printer: Printer,
+  e: Expr,
+  indent: Int,
+  cont: Int,
+  after: Int,
+) -> Printer / {abort.raise} = {
+  let sp = expr_span(e);
+  let s0 = lead(input, printer, sp.start, indent);
+  let s1 = match try_flat(input, s0, flat_expr(input, e), sp.end, after) {
+    Some(f) -> emit(s0, f),
+    None -> broken(input, s0, e, indent, cont, after),
+  };
+  absorb(input, s1, sp.end)
 }
 
 fn operand(
@@ -1117,9 +1133,9 @@ fn broken_node(
         call(input, emit(s1, ls), v.args, v.named, v.span, indent, after)
       },
     },
-    EIf(_) -> if_chain(input, printer, expr, indent, after),
+    EIf(v) -> if_chain(input, printer, v, indent, after),
     EMatch(v) -> match_expr(input, printer, v.scrutinee, v.arms, v.span, indent),
-    EBlock(_) -> block(input, printer, expr, indent),
+    EBlock(v) -> block_of(input, printer, v, indent),
     ERecord(v) -> if is_tuple(v.fields) {
       elements(
         input,
@@ -1177,32 +1193,33 @@ fn broken_node(
 // A block always breaks: `{`, its statements and tail one per line, `}` back at `indent`.
 fn block(input: PrintInput, printer: Printer, e: Expr, indent: Int) -> Printer / {abort.raise} =
   match e {
-    EBlock(v) -> {
-      let has_tail = match v.tail { Some(_) -> true, None -> false };
-      if len(v.stmts) == 0 && !has_tail && !comment_before(input, printer, v.span.end) {
-        emit(printer, b"{}")
-      } else {
-        let s1 = set_prev(trail(input, emit(printer, b"{"), v.span.start + 1), v.span.start + 1);
-        let s2 = fold(v.stmts, s1, |s: Printer, x: Stmt| stmt(input, s, x, indent + 2));
-        let s3 = match v.tail {
-          Some(t) -> {
-            let tsp = expr_span(t);
-            let s = expr(
-              input,
-              open_line(input, s2, tsp.start, indent + 2, true),
-              t,
-              indent + 2,
-              0,
-            );
-            trail(input, set_prev(s, tsp.end), tsp.end)
-          },
-          None -> s2,
-        };
-        close(input, s3, v.span.end, indent, b"}")
-      }
-    },
+    EBlock(v) -> block_of(input, printer, v, indent),
     _ -> expr(input, printer, e, indent, 0),
   }
+
+fn block_of(
+  input: PrintInput,
+  printer: Printer,
+  v: { span: Span, tail: Option<Expr>, stmts: List<Stmt> },
+  indent: Int,
+) -> Printer / {abort.raise} = {
+  let has_tail = match v.tail { Some(_) -> true, None -> false };
+  if len(v.stmts) == 0 && !has_tail && !comment_before(input, printer, v.span.end) {
+    emit(printer, b"{}")
+  } else {
+    let s1 = set_prev(trail(input, emit(printer, b"{"), v.span.start + 1), v.span.start + 1);
+    let s2 = fold(v.stmts, s1, |s: Printer, x: Stmt| stmt(input, s, x, indent + 2));
+    let s3 = match v.tail {
+      Some(t) -> {
+        let tsp = expr_span(t);
+        let s = expr(input, open_line(input, s2, tsp.start, indent + 2, true), t, indent + 2, 0);
+        trail(input, set_prev(s, tsp.end), tsp.end)
+      },
+      None -> s2,
+    };
+    close(input, s3, v.span.end, indent, b"}")
+  }
+}
 
 fn stmt(input: PrintInput, printer: Printer, x: Stmt, indent: Int) -> Printer / {abort.raise} =
   match x {
@@ -1242,7 +1259,7 @@ fn lambda(
   let s1 = emit(printer, lambda_head(input, params, ret));
   let sp = expr_span(body);
   match body {
-    EBlock(_) -> block(input, emit(s1, b" "), body, indent),
+    EBlock(v) -> block_of(input, emit(s1, b" "), v, indent),
     _ -> match try_flat(input, s1, flat_expr(input, body), sp.end, after + 1) {
       Some(f) -> emit(emit(s1, b" "), f),
       None -> expr(input, nl(s1, indent + 2, false), body, indent + 2, after),
@@ -1364,7 +1381,7 @@ fn elements(
 
 // A map or set literal the parser built a `map_of_entries` call of: the source still opens it with
 // `#{` or `#[`, which a call spelled out never does.
-type Literal = { set: Bool, entries: List<{ key: Expr, value: Expr }>, span: Span }
+type Literal = { set: Bool, items: List<Expr>, span: Span }
 
 fn literal_of(input: PrintInput, e: Expr) -> Option<Literal> / {abort.raise} =
   match e {
@@ -1373,16 +1390,7 @@ fn literal_of(input: PrintInput, e: Expr) -> Option<Literal> / {abort.raise} =
         let opener = bytes_slice(input.source, a.span.start, a.span.start + 2);
         match a.args {
           [EList(l)] -> if opener == b"#{" || opener == b"#[" {
-            Some({
-              set: opener == b"#[",
-              entries: map(l.items, |x: Expr|
-                match x {
-                  ERecord(r) ->
-                    { key: field_value(r.fields, b"key"), value: field_value(r.fields, b"value") },
-                  _ -> { key: x, value: x },
-                }),
-              span: a.span,
-            })
+            Some({ set: opener == b"#[", items: l.items, span: a.span })
           } else { None },
           _ -> None,
         }
@@ -1392,23 +1400,46 @@ fn literal_of(input: PrintInput, e: Expr) -> Option<Literal> / {abort.raise} =
     _ -> None,
   }
 
-fn field_value(fields: List<RecField>, name: Bytes) -> Expr =
-  fold(fields, ELit({ span: { start: 0, end: 0 }, lit: LUnit }), |acc: Expr, field: RecField|
-    if field.name.name == name { field.value } else { acc })
+// The parser writes each entry of a literal as a record of its key and value; an item it did not
+// write so is its own key and value.
+fn entry_parts(x: Expr) -> Option<{ key: Expr, value: Expr }> =
+  match x {
+    ERecord(r) -> match field_of(r.fields, b"key") {
+      Some(k) -> match field_of(r.fields, b"value") {
+        Some(v) -> Some({ key: k, value: v }),
+        None -> None,
+      },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn field_of(fields: List<RecField>, name: Bytes) -> Option<Expr> =
+  fold(fields, None, |acc: Option<Expr>, field: RecField|
+    if field.name.name == name { Some(field.value) } else { acc })
 
 fn flat_literal(input: PrintInput, m: Literal) -> Option<Bytes> / {abort.raise} =
   if m.set {
     cat([
       Some(b"#["),
-      sep(map(m.entries, |en: { key: Expr, value: Expr }| flat_expr(input, en.key)), b", "),
+      sep(
+        map(m.items, |x: Expr|
+          match entry_parts(x) {
+            Some(en) -> flat_expr(input, en.key),
+            None -> flat_expr(input, x),
+          }),
+        b", ",
+      ),
       Some(b"]"),
     ])
   } else {
+    let entry = |key: Expr, value: Expr|
+      cat([flat_expr(input, key), Some(b": "), flat_expr(input, value)]);
     cat([
       Some(b"#{"),
       sep(
-        map(m.entries, |en: { key: Expr, value: Expr }|
-          cat([flat_expr(input, en.key), Some(b": "), flat_expr(input, en.value)])),
+        map(m.items, |x: Expr|
+          match entry_parts(x) { Some(en) -> entry(en.key, en.value), None -> entry(x, x) }),
         b", ",
       ),
       Some(b"}"),
@@ -1419,24 +1450,29 @@ fn flat_literal(input: PrintInput, m: Literal) -> Option<Bytes> / {abort.raise} 
 fn literal(p: PrintInput, printer: Printer, m: Literal, indent: Int) -> Printer / {abort.raise} = {
   let open = if m.set { b"#[" } else { b"#{" };
   let s1 = set_prev(trail(p, emit(printer, open), m.span.start + 2), m.span.start + 2);
-  let n = len(m.entries);
+  let n = len(m.items);
   let s2 = fold(range(0, n), s1, |s: Printer, i: Int| {
-    let en = at(m.entries, i);
-    let ks = expr_span(en.key);
-    let o = open_line(p, s, ks.start, indent + 2, false);
-    if m.set {
-      let v = separated(p, expr(p, o, en.key, indent + 2, 1), en.key, i == n - 1);
-      trail(p, set_prev(v, ks.end), ks.end)
-    } else {
-      let vs = expr_span(en.value);
-      let k = match flat_expr(p, en.key) { Some(f) -> f, None -> b"()" };
-      let v = separated(
-        p,
-        expr(p, emit(o, bytes_concat(k, b": ")), en.value, indent + 2, 1),
-        en.value,
-        i == n - 1,
-      );
-      trail(p, set_prev(v, vs.end), vs.end)
+    let entry = |key: Expr, value: Expr| {
+      let ks = expr_span(key);
+      let o = open_line(p, s, ks.start, indent + 2, false);
+      if m.set {
+        let v = separated(p, expr(p, o, key, indent + 2, 1), key, i == n - 1);
+        trail(p, set_prev(v, ks.end), ks.end)
+      } else {
+        let vs = expr_span(value);
+        let k = match flat_expr(p, key) { Some(f) -> f, None -> b"()" };
+        let v = separated(
+          p,
+          expr(p, emit(o, bytes_concat(k, b": ")), value, indent + 2, 1),
+          value,
+          i == n - 1,
+        );
+        trail(p, set_prev(v, vs.end), vs.end)
+      }
+    };
+    match list_at(m.items, i) {
+      None -> s,
+      Some(x) -> match entry_parts(x) { Some(en) -> entry(en.key, en.value), None -> entry(x, x) },
     }
   });
   close(p, s2, m.span.end, indent, if m.set { b"]" } else { b"}" })
@@ -1540,23 +1576,19 @@ fn otherwise(
 fn if_chain(
   input: PrintInput,
   printer: Printer,
-  e: Expr,
+  v: { span: Span, cond: Expr, then_branch: Expr, else_branch: Expr },
   indent: Int,
   after: Int,
-) -> Printer / {abort.raise} =
-  match e {
-    EIf(v) -> {
-      let s1 = scrutinee(input, emit(printer, b"if "), v.cond, indent + 2, 2);
-      let o = v.else_branch;
-      let b = branch(input, emit(s1, b" "), v.then_branch, indent, ending(o, after));
-      match o {
-        ELit(_) -> b.printer,
-        EIf(_) -> if_chain(input, otherwise(input, b, o, indent, after), o, indent, after),
-        _ -> branch(input, otherwise(input, b, o, indent, after), o, indent, after).printer,
-      }
-    },
-    _ -> expr(input, printer, e, indent, after),
+) -> Printer / {abort.raise} = {
+  let s1 = scrutinee(input, emit(printer, b"if "), v.cond, indent + 2, 2);
+  let o = v.else_branch;
+  let b = branch(input, emit(s1, b" "), v.then_branch, indent, ending(o, after));
+  match o {
+    ELit(_) -> b.printer,
+    EIf(w) -> if_chain(input, otherwise(input, b, o, indent, after), w, indent, after),
+    _ -> branch(input, otherwise(input, b, o, indent, after), o, indent, after).printer,
   }
+}
 
 fn match_expr(
   input: PrintInput,
@@ -1615,7 +1647,7 @@ fn handle_expr(
 ) -> Printer / {abort.raise} = {
   let s1 = emit(printer, b"handle ");
   let s2 = match body {
-    EBlock(_) -> block(input, s1, body, indent),
+    EBlock(v) -> block_of(input, s1, v, indent),
     _ -> expr(input, s1, body, indent + 2, 7),
   };
   let s3 = emit(s2, b" with {");
@@ -1748,7 +1780,7 @@ fn def_body(input: PrintInput, printer: Printer, e: Expr, indent: Int) -> Printe
     match try_flat(input, printer, flat_expr(input, e), sp.end, 0) {
       Some(f) -> emit(printer, f),
       None -> match e {
-        EBlock(_) -> block(input, printer, e, indent),
+        EBlock(v) -> block_of(input, printer, v, indent),
         _ -> expr(input, nl(printer, indent + 2, false), e, indent + 2, 0),
       },
     }
