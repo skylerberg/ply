@@ -6,7 +6,7 @@
 import compiler.load (LoadedAnalysis)
 import std.fs (fs)
 import std.time (time)
-import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface,
+import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, Shipping,
                        analyse_pulling_std_with, dump_of, embeds_now, filing, module_items,
                        module_imports, no_rows, pins_pulling, rows_of)
 import compiler.pkg (PackageSources, Pinned, Supplied)
@@ -25,8 +25,8 @@ import diagnostic (Place, spot_of)
 import paths
 import proof.statics (Unshown, unshown)
 import proof.world (measures_in)
-import sources (File, Project, DepPackage, Embed, load_resolved, shipped_modules, nothing_here,
-                is_std, is_compiler, shipped_digest_of)
+import sources (File, Project, DepPackage, Embed, load_resolved, shipping_for, no_shipping,
+                shipped_listed, nothing_here, is_std, is_compiler)
 import store.tables (Stamps)
 import builder (builder)
 import loads
@@ -49,6 +49,8 @@ pub type Program = {
   pkgs: PackageSources,
   through: List<CompiledPackage>,
   embeds: List<Embed>,
+  // The shipped modules the load read, which a splice of it pulls again.
+  shipping: Shipping,
 }
 
 // Every diagnostic a load reports: what the front-end cache said of itself, then the program's.
@@ -92,7 +94,7 @@ fn shipped_place(texts: Map<String, Bytes>, name: String) -> Place / {abort.rais
 
 // --- Loading --------------------------------------------------------------------
 
-fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
+fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List<Diag>) -> Program =
   {
     files: project.files,
     places: places,
@@ -102,6 +104,7 @@ fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
     pkgs: pkgs_of(project),
     through: [],
     embeds: project.embeds,
+    shipping: shipping,
   }
 
 // What a load of this project is made of: its root key and manifest text, and every dependency
@@ -156,7 +159,7 @@ pub fn placed_of(project: Project) -> Placed =
 // A covered module parses from its stub; its place keeps the source the emitter reads.
 fn front_end(
   sources: List<Source>,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   rows: Rows,
   pkgs: PackageSources,
   through: List<CompiledPackage>,
@@ -165,13 +168,14 @@ fn front_end(
 ) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(
     sources,
-    shipped_sources,
+    shipping.read,
     rows.defs,
     rows.tests,
     pkgs,
     merged_interfaces(through),
     map(embeds, |embed: Embed| embed.embedded),
     priors,
+    unread: shipping.unread,
   )
 
 // Seeded with what the load published, so only what the splice moved is walked again.
@@ -179,12 +183,11 @@ pub fn reanalysed(
   program: Program,
   analysis: Analysis,
   sources: List<Source>,
-  shipped_sources: List<Source>,
   pkgs: PackageSources,
 ) -> Pulled / {abort.raise} =
   front_end(
     sources,
-    shipped_sources,
+    program.shipping,
     rows_of(analysis),
     pkgs,
     program.through,
@@ -194,16 +197,15 @@ pub fn reanalysed(
 
 fn analysed(
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   rows: Rows,
   through: List<CompiledPackage>,
   priors: List<Prior>,
   mine: interfaces::Own,
 ) -> Program / {abort.raise} = {
-  let first = analysed_through(project, shipped_sources, rows, through, priors, mine);
-  if !first.starved { first.program } else {
-    analysed_through(project, shipped_sources, rows, through, priors, interfaces::no_own()).program
-  }
+  let first = analysed_through(project, shipping, rows, through, priors, mine);
+  if !first.starved { first.program }
+  else { analysed_through(project, shipping, rows, through, priors, interfaces::no_own()).program }
 }
 
 // A load read through `mine`, the stubs of the project's own modules. It is `starved` where a
@@ -215,19 +217,19 @@ fn loaded(program: Program) -> Loaded = { program: program, starved: false }
 
 fn analysed_through(
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   rows: Rows,
   through: List<CompiledPackage>,
   priors: List<Prior>,
   mine: interfaces::Own,
 ) -> Loaded / {abort.raise} = {
-  let texts = fold(shipped_sources, map_new(), |acc: Map<String, Bytes>, source: Source|
+  let texts = fold(shipping.read, map_new(), |acc: Map<String, Bytes>, source: Source|
     map_insert(acc, string_of_bytes_lossy(source.name), source.src));
   let pkgs: PackageSources = pkgs_of(project);
   let read = concat(through, mine.through);
   let pulled: Pulled = front_end(
     project.sources,
-    shipped_sources,
+    shipping,
     rows,
     pkgs,
     read,
@@ -245,9 +247,9 @@ fn analysed_through(
   // The check that kept a module's stub showed its measures, and its text and all it reaches stand.
   let fresh = |m: Bytes| map_contains(own, m) && !map_contains(stubbed, m);
   match pulled.out {
-    Refused(ds) -> loaded(broken(project, places, ds)),
+    Refused(ds) -> loaded(broken(project, shipping, places, ds)),
     Analysed(w) -> if len(mine.through) > 0 && len(measures_in(w, fresh)) > 0 {
-      { program: broken(project, places, []), starved: true }
+      { program: broken(project, shipping, places, []), starved: true }
     } else {
       match unshown(w, fresh) {
         [] -> {
@@ -261,9 +263,10 @@ fn analysed_through(
             pkgs: pkgs,
             through: read,
             embeds: project.embeds,
+            shipping: shipping,
           })
         },
-        missing -> loaded(broken(project, places, map(missing, undescended))),
+        missing -> loaded(broken(project, shipping, places, map(missing, undescended))),
       }
     },
   }
@@ -292,73 +295,70 @@ pub fn usable(project: Project) -> Bool = len(project.diags) == 0 && len(project
 
 fn assembled(
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   paths: List<paths::Resolved>,
   rows: Rows,
   through: List<CompiledPackage> = [],
   priors: List<Prior> = [],
   own: interfaces::Own = { through: [], names: [], warned: [] },
 ) -> Program / {abort.raise} =
-  if len(project.diags) > 0 { broken(project, own_places(project), project.diags) }
+  if len(project.diags) > 0 { broken(project, shipping, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
-    broken(project, [], [
+    broken(project, shipping, [], [
       nothing_here(match list_at(paths, 0) { Some(r) -> r.display, None -> "." }),
     ])
-  } else { analysed(project, shipped_sources, rows, through, priors, own) }
+  } else { analysed(project, shipping, rows, through, priors, own) }
 
 // The toolchain's own tree: its shipped modules are its roots, not a dependency.
-fn claims_shipped_modules(project: Project, shipped_sources: List<Source>) -> Bool = {
-  let names = fold(shipped_sources, map_new(), |acc: Map<Bytes, Bool>, source: Source|
-    map_insert(acc, source.name, true));
+fn claims_shipped_modules(project: Project, shipping: Shipping) -> Bool = {
+  let names = fold(shipped_listed(shipping), map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
+    map_insert(acc, name, true));
   fold(project.sources, false, |acc: Bool, source: Source| acc || map_contains(names, source.name))
 }
 
-fn interfaced_for(interfaced: Bool, project: Project, shipped_sources: List<Source>) -> Bool =
-  interfaced && usable(project) && len(shipped_sources) > 0
-    && !claims_shipped_modules(project, shipped_sources)
+fn interfaced_for(interfaced: Bool, project: Project, shipping: Shipping) -> Bool =
+  interfaced && usable(project) && len(shipped_listed(shipping)) > 0
+    && !claims_shipped_modules(project, shipping)
 
-fn originals_of(project: Project, shipped_sources: List<Source>) -> List<Original> / {abort.raise} =
+fn originals_of(project: Project, shipping: Shipping) -> List<Original> / {abort.raise} =
   interfaces::originals(
     pkgs_of(project),
     map(project.sources, |source: Source| source.name),
-    shipped_sources,
+    shipping.read,
   )
 
 // A verifying load reads no compiled package, which may carry a published interface over whole.
 fn through_of(
   paths: List<paths::Resolved>,
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   stamps: Stamps,
   interfaced: Bool,
   verify: Bool,
 ) -> List<CompiledPackage> / {fs.read[cwd], fs.read[abs], abort.raise} =
-  if verify || !interfaced_for(interfaced, project, shipped_sources) { [] } else {
+  if verify || !interfaced_for(interfaced, project, shipping) { [] } else {
     let place = loads::place_of(paths, stamps);
-    let found = originals_of(project, shipped_sources);
-    let read = embeds_read(project, shipped_sources);
+    let found = originals_of(project, shipping);
+    let read = embeds_read(project, shipping);
     let own = if place.label == "cwd" { interfaces::read_through[cwd](place, found, read) }
     else { interfaces::read_through[abs](place, found, read) };
     interfaces::beside(own, interfaces::published(slots_of(project), found, read))
   }
 
 // What each module embeds, as the walk and the shipped modules read it.
-fn embeds_read(project: Project, shipped_sources: List<Source>) -> EmbedReader / {abort.raise} =
+fn embeds_read(project: Project, shipping: Shipping) -> EmbedReader / {abort.raise} =
   embeds_now(
     pkgs_of(project),
     project.sources,
-    shipped_sources,
+    shipping.read,
     map(project.embeds, |embed: Embed| embed.embedded),
   )
 
 // Every module a load may read, as it stands now: a root module's text stands over a shipped one
 // its tree claims the name of.
-fn every_original(
-  project: Project,
-  shipped_sources: List<Source>,
-) -> List<Original> / {abort.raise} =
+fn every_original(project: Project, shipping: Shipping) -> List<Original> / {abort.raise} =
   concat(
-    originals_of(project, shipped_sources),
+    originals_of(project, shipping),
     interfaces::own_originals(pkgs_of(project), project.sources),
   )
 
@@ -369,7 +369,7 @@ fn own_stubs(paths: List<paths::Resolved>, project: Project, own: Bool, verify: 
 fn own_read(
   paths: List<paths::Resolved>,
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   stamps: Stamps,
   rows: Rows,
   own: Bool,
@@ -377,8 +377,8 @@ fn own_read(
 ) -> interfaces::Own / {fs.read[cwd], fs.read[abs], abort.raise} =
   if !own_stubs(paths, project, own, verify) { interfaces::no_own() } else {
     let place = loads::place_of(paths, stamps);
-    let found = every_original(project, shipped_sources);
-    let read = embeds_read(project, shipped_sources);
+    let found = every_original(project, shipping);
+    let read = embeds_read(project, shipping);
     if place.label == "cwd" { interfaces::own_through[cwd](place, found, rows.defs, read) }
     else { interfaces::own_through[abs](place, found, rows.defs, read) }
   }
@@ -386,7 +386,7 @@ fn own_read(
 fn own_keeping(
   paths: List<paths::Resolved>,
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   stamps: Stamps,
   own: Bool,
   verify: Bool,
@@ -396,7 +396,7 @@ fn own_keeping(
     None -> (),
     Some(w) -> if !own_stubs(paths, project, own, verify) { () } else {
       let place = loads::place_of(paths, stamps);
-      let found = every_original(project, shipped_sources);
+      let found = every_original(project, shipping);
       if place.label == "cwd" {
         interfaces::own_kept[cwd](place, found, w, program.through, program.diags)
       } else { interfaces::own_kept[abs](place, found, w, program.through, program.diags) }
@@ -409,7 +409,7 @@ fn slots_of(project: Project) -> List<String> / {abort.raise} =
 // Each published interface against what this load cut from source; one that differs refuses the load.
 fn verified(
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   verify: Bool,
   program: Program,
 ) -> Program / {fs.read_file[abs], abort.raise} =
@@ -418,9 +418,9 @@ fn verified(
     Some(w) -> if !verify { program } else {
       match interfaces::underived(
           slots_of(project),
-          originals_of(project, shipped_sources),
+          originals_of(project, shipping),
           w,
-          embeds_read(project, shipped_sources),
+          embeds_read(project, shipping),
         ) {
         [] -> program,
         refused -> { ..program, diags: concat(program.diags, refused), whole: None },
@@ -431,7 +431,7 @@ fn verified(
 fn refreshing(
   paths: List<paths::Resolved>,
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   stamps: Stamps,
   interfaced: Bool,
   through: List<CompiledPackage>,
@@ -439,9 +439,9 @@ fn refreshing(
 ) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
   match program.whole {
     None -> (),
-    Some(w) -> if !interfaced_for(interfaced, project, shipped_sources) { () } else {
+    Some(w) -> if !interfaced_for(interfaced, project, shipping) { () } else {
       let place = loads::place_of(paths, stamps);
-      let found = originals_of(project, shipped_sources);
+      let found = originals_of(project, shipping);
       if place.label == "cwd" { interfaces::refreshed[cwd](place, found, w, through) }
       else { interfaces::refreshed[abs](place, found, w, through) }
     },
@@ -484,7 +484,7 @@ fn source_of(file: File) -> SourceFile = { path: file.path, name: file.module, t
 
 // Every file a load may read before it knows which shipped modules it pulls: its own, each
 // dependency's, and every shipped module.
-fn read_sources(project: Project, shipped_sources: List<Source>) -> Sources / {abort.raise} =
+fn read_sources(project: Project, shipping: Shipping) -> Sources / {abort.raise} =
   {
     files: concat(
       concat(
@@ -492,7 +492,7 @@ fn read_sources(project: Project, shipped_sources: List<Source>) -> Sources / {a
         fold(project.packages, [], |acc: List<SourceFile>, package: DepPackage|
           concat(acc, map(package.files, source_of))),
       ),
-      map(shipped_sources, |source: Source| {
+      map(shipping.read, |source: Source| {
         let name = string_of_bytes_lossy(source.name);
         { path: pseudo_path(name), name: name, text: source.src }
       }),
@@ -517,15 +517,14 @@ fn placed_sources(program: Program, analysis: Analysis) -> List<SourceFile> = {
 fn recorded_for(
   paths: List<paths::Resolved>,
   project: Project,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   stamps: Stamps,
 ) -> Recorded / {fs.read[cwd], fs.read[abs], abort.raise} =
   if usable(project) {
     let place = loads::place_of(paths, stamps);
-    let sources = read_sources(project, shipped_sources);
-    let now = shipped_digest_of(shipped_sources);
-    if place.label == "cwd" { loads::known[cwd](place, sources, now) }
-    else { loads::known[abs](place, sources, now) }
+    let sources = read_sources(project, shipping);
+    if place.label == "cwd" { loads::known[cwd](place, sources) }
+    else { loads::known[abs](place, sources) }
   } else { nothing_recorded() }
 
 fn same_diag(a: Diag, b: Diag) -> Bool = a.code == b.code && a.message == b.message
@@ -534,7 +533,7 @@ fn same_diag(a: Diag, b: Diag) -> Bool = a.code == b.code && a.message == b.mess
 fn unsaid(said: List<Diag>, more: List<Diag>) -> List<Diag> =
   filter(more, |d: Diag| !fold(said, false, |acc: Bool, s: Diag| acc || same_diag(s, d)))
 
-fn stdlib_changed(was: String, now: String, reached: Int) -> Diag = {
+fn stdlib_changed(modules: List<String>, reached: Int) -> Diag = {
   let what = if reached == 0 { "no definition this program reaches changed" }
   else if reached == 1 { "1 definition this program reaches changed" }
   else { int_to_string(reached) ++ " definitions this program reaches changed" };
@@ -543,19 +542,23 @@ fn stdlib_changed(was: String, now: String, reached: Int) -> Diag = {
     notes: 3,
     labels: [],
     text: b"",
-    message: bytes_of_string("the modules that ship with `ply` moved: " ++ was ++ " -> " ++ now),
+    message: bytes_of_string(
+      "shipped modules this load reads changed since the cache was written: "
+        ++ join(modules, ", "),
+    ),
     notes_text: [
       bytes_of_string(what),
       b"a `std` definition hashes like any other, so only what a change reached re-runs",
-      b"`ply std` lists the shipped modules and this digest",
+      b"`ply std` lists the shipped modules and their digest",
     ],
     severity: b"warning",
     fixes: [],
   }
 }
 
-// What a compiler upgrade did to this project, said by the load that files over the old filing:
-// every definition whose closure reaches a shipped one that now hashes differently.
+// What a change to the shipped modules a load reads did to this project, said by the load that
+// files over the old filing: every definition whose closure reaches a shipped one that now hashes
+// differently.
 pub fn stdlib_notice(moved: Option<StdlibMoved>, h: HashOutput) -> List<Diag> / {abort.raise} =
   match moved {
     None -> [],
@@ -573,7 +576,7 @@ pub fn stdlib_notice(moved: Option<StdlibMoved>, h: HashOutput) -> List<Diag> / 
       let counted = |xs: List<{ name: Bytes, hash: Bytes }>|
         fold(xs, 0, |n: Int, x: { name: Bytes, hash: Bytes }|
           if map_contains(reached, x.name) { n + 1 } else { n });
-      [stdlib_changed(m.was, m.now, counted(h.defs) + counted(h.decls))]
+      [stdlib_changed(m.modules, counted(h.defs) + counted(h.decls))]
     },
   }
 
@@ -585,7 +588,6 @@ fn load_digest(
   packages: List<SourcePackage>,
   hashes: HashOutput,
   checks: List<{ name: Bytes, hash: Bytes }>,
-  now: String,
   whole: Bool,
 ) -> Bytes = {
   let counted = |count: Int| bytes_of_string(int_to_string(count) ++ "\0");
@@ -618,7 +620,6 @@ fn load_digest(
       named(hashes.decls),
       counted(len(hashes.tests)),
       bytes_concat_all(hashes.tests),
-      bytes_of_string(now),
       if whole { b"\0whole" } else { b"\0part" },
     ]),
   )
@@ -628,7 +629,7 @@ fn load_digest(
 // never its failure.
 fn filed(
   paths: List<paths::Resolved>,
-  shipped_sources: List<Source>,
+  shipping: Shipping,
   stamps: Stamps,
   k: Recorded,
   program: Program,
@@ -638,16 +639,8 @@ fn filed(
     Some(w) -> {
       let place = loads::place_of(paths, stamps);
       let sources = { files: placed_sources(program, w), packages: packages_of(program.pkgs) };
-      let now = shipped_digest_of(shipped_sources);
       let whole = whole_project(paths);
-      let load = load_digest(
-        sources.files,
-        sources.packages,
-        w.hashes,
-        w.checked.checks,
-        now,
-        whole,
-      );
+      let load = load_digest(sources.files, sources.packages, w.hashes, w.checked.checks, whole);
       let held = fold(range(0, len(w.mods)), true, |all: Bool, i: Int|
         all
           && (match list_at(sources.files, i) {
@@ -658,8 +651,8 @@ fn filed(
       // would write nothing.
       let more = if held && len(k.warnings) == 0 && k.filed_load == Some(load)
           && len(k.priors) == len(w.hashes.priors) { [] } else if place.label == "cwd" {
-        loads::file[cwd](place, sources, filing(w), whole, now, load, w.hashes.priors)
-      } else { loads::file[abs](place, sources, filing(w), whole, now, load, w.hashes.priors) };
+        loads::file[cwd](place, sources, filing(w), whole, load, w.hashes.priors)
+      } else { loads::file[abs](place, sources, filing(w), whole, load, w.hashes.priors) };
       {
         ..program,
         cache_warnings: concat(
@@ -679,19 +672,20 @@ pub fn load_program(
   verify: Bool = false,
 ) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
-  let shipped_sources: List<Source> = if usable(project) { shipped_modules() } else { [] };
+  let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
+  else { no_shipping() };
   let stamps = loads::shipped_stamps();
-  let k: Recorded = recorded_for(paths, project, shipped_sources, stamps);
+  let k: Recorded = recorded_for(paths, project, shipping, stamps);
   let rows = if verify { no_rows() } else { rows_recorded(k) };
-  let through = through_of(paths, project, shipped_sources, stamps, interfaced, verify);
+  let through = through_of(paths, project, shipping, stamps, interfaced, verify);
   let p: Program = verified(
     project,
-    shipped_sources,
+    shipping,
     verify,
-    assembled(project, shipped_sources, paths, rows, through, if verify { [] } else { k.priors }),
+    assembled(project, shipping, paths, rows, through, if verify { [] } else { k.priors }),
   );
-  refreshing(paths, project, shipped_sources, stamps, interfaced, through, p);
-  filed(paths, shipped_sources, stamps, k, p)
+  refreshing(paths, project, shipping, stamps, interfaced, through, p);
+  filed(paths, shipping, stamps, k, p)
 }
 
 // What a load of these paths would pin, with nothing parsed, checked or filed; or what refuses the
@@ -721,8 +715,9 @@ pub fn load_uncached(
   paths: List<paths::Resolved>,
 ) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
-  let shipped_sources: List<Source> = if usable(project) { shipped_modules() } else { [] };
-  assembled(project, shipped_sources, paths, no_rows())
+  let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
+  else { no_shipping() };
+  assembled(project, shipping, paths, no_rows())
 }
 
 // What the load answered, for the machine to read rather than load again. The dump carries the
@@ -765,31 +760,24 @@ pub fn timed_over(
   verify: Bool = false,
   own: Bool = false,
 ) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
-  let shipped_sources: List<Source> = if usable(project) { shipped_modules() } else { [] };
+  let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
+  else { no_shipping() };
   let stamps = loads::shipped_stamps();
-  let k: Recorded = recorded_for(paths, project, shipped_sources, stamps);
+  let k: Recorded = recorded_for(paths, project, shipping, stamps);
   let rows = if verify { no_rows() } else { rows_recorded(k) };
-  let through = through_of(paths, project, shipped_sources, stamps, interfaced, verify);
-  let mine = own_read(paths, project, shipped_sources, stamps, rows, own, verify);
+  let through = through_of(paths, project, shipping, stamps, interfaced, verify);
+  let mine = own_read(paths, project, shipping, stamps, rows, own, verify);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
-    shipped_sources,
+    shipping,
     verify,
-    assembled(
-      project,
-      shipped_sources,
-      paths,
-      rows,
-      through,
-      if verify { [] } else { k.priors },
-      mine,
-    ),
+    assembled(project, shipping, paths, rows, through, if verify { [] } else { k.priors }, mine),
   );
   let front_done = time.elapsed_ms();
-  refreshing(paths, project, shipped_sources, stamps, interfaced, through, p);
-  own_keeping(paths, project, shipped_sources, stamps, own, verify, p);
-  let kept: Program = filed(paths, shipped_sources, stamps, k, p);
+  refreshing(paths, project, shipping, stamps, interfaced, through, p);
+  own_keeping(paths, project, shipping, stamps, own, verify, p);
+  let kept: Program = filed(paths, shipping, stamps, k, p);
   {
     program: kept,
     read_ms: read_done - started,
@@ -815,13 +803,14 @@ pub fn timed_uncached_over(
   started: Int,
   verify: Bool = false,
 ) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise} = {
-  let shipped_sources: List<Source> = if usable(project) { shipped_modules() } else { [] };
+  let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
+  else { no_shipping() };
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
-    shipped_sources,
+    shipping,
     verify,
-    assembled(project, shipped_sources, paths, no_rows()),
+    assembled(project, shipping, paths, no_rows()),
   );
   {
     program: p,
@@ -1138,22 +1127,18 @@ fn two_defs() -> HashOutput =
 
 test "a moved stdlib is said once, counting what reaches a shipped definition that moved" {
   assert_eq(stdlib_notice(None, two_defs()), []);
-  let moved = Some({
-    was: "b3:000000000000",
-    now: "b3:111111111111",
-    entries: [{ name: b"std.net.net", hash: b"n1" }],
-  });
+  let moved = Some({ modules: ["std.net"], entries: [{ name: b"std.net.net", hash: b"n1" }] });
   let said = stdlib_notice(moved, two_defs());
   assert_eq(map(said, |d: Diag| d.code), [b"W0605"]);
   assert_eq(map(said, |d: Diag| d.message), [
-    b"the modules that ship with `ply` moved: b3:000000000000 -> b3:111111111111",
+    b"shipped modules this load reads changed since the cache was written: std.net",
   ]);
   // `app.reads` and the effect itself reach it; `app.pure` does not.
   assert_eq(
     match list_at(said, 0) { Some(d) -> list_at(d.notes_text, 0), None -> None },
     Some(b"2 definitions this program reaches changed"),
   );
-  let same = Some({ was: "b3:0", now: "b3:1", entries: [{ name: b"std.net.net", hash: b"n2" }] });
+  let same = Some({ modules: ["std.net"], entries: [{ name: b"std.net.net", hash: b"n2" }] });
   assert_eq(
     match list_at(stdlib_notice(same, two_defs()), 0) {
       Some(d) -> list_at(d.notes_text, 0),
@@ -1171,25 +1156,24 @@ test "only a load of one directory is a load of the whole project" {
   assert(!whole_project([here, here]))
 }
 
-test "a load's digest moves with each file, hash, shipped module and reach its filing writes for" {
+test "a load's digest moves with each file it placed, shipped ones among them, hash and reach" {
   let files = [{ path: "m.ply", name: "m", text: b"f" }];
   let h = { ..hash::no_hashes(), defs: [{ name: b"m.f", hash: blake3(b"f") }] };
-  let base = load_digest(files, [], h, [], "b3:now", true);
-  assert_eq(load_digest(files, [], h, [], "b3:now", true), base);
-  assert(
-    load_digest([{ path: "m.ply", name: "m", text: b"g" }], [], h, [], "b3:now", true) != base,
-  );
-  assert(load_digest(files, [{ root: "dep", digest: "d" }], h, [], "b3:now", true) != base);
-  assert(load_digest(files, [], h, h.defs, "b3:now", true) != base);
-  assert(load_digest(files, [], { ..h, tests: [blake3(b"t")] }, [], "b3:now", true) != base);
-  assert(load_digest(files, [], h, [], "b3:later", true) != base);
-  assert(load_digest(files, [], h, [], "b3:now", false) != base)
+  let base = load_digest(files, [], h, [], true);
+  assert_eq(load_digest(files, [], h, [], true), base);
+  assert(load_digest([{ path: "m.ply", name: "m", text: b"g" }], [], h, [], true) != base);
+  let shipped = { path: "<std>/net.ply", name: "std.net", text: b"n" };
+  assert(load_digest(push(files, shipped), [], h, [], true) != base);
+  assert(load_digest(files, [{ root: "dep", digest: "d" }], h, [], true) != base);
+  assert(load_digest(files, [], h, h.defs, true) != base);
+  assert(load_digest(files, [], { ..h, tests: [blake3(b"t")] }, [], true) != base);
+  assert(load_digest(files, [], h, [], false) != base)
 }
 
 test "a warning the cache read already gave is not given again by the filing" {
-  let read = [stdlib_changed("a", "b", 0)];
-  assert_eq(unsaid(read, [stdlib_changed("a", "b", 0)]), []);
-  assert_eq(len(unsaid(read, [stdlib_changed("a", "c", 0)])), 1)
+  let read = [stdlib_changed(["std.a"], 0)];
+  assert_eq(unsaid(read, [stdlib_changed(["std.a"], 0)]), []);
+  assert_eq(len(unsaid(read, [stdlib_changed(["std.b"], 0)])), 1)
 }
 
 test "a span outside every module has no place and no location" {
@@ -1202,6 +1186,7 @@ test "a span outside every module has no place and no location" {
     pkgs: { root: b"", manifest: None, supplied: [] },
     through: [],
     embeds: [],
+    shipping: { read: [], unread: [] },
   };
   assert_eq(location_of(p, { module: no_module(), span: { start: 0, end: 0 } }), None);
   assert_eq(location_of(p, { module: 0, span: { start: 3, end: 4 } }), Some("m.ply:1:4"))

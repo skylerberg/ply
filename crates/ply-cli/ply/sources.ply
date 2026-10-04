@@ -7,12 +7,12 @@ import std.bytes (u64_le)
 import std.hash (blake3)
 import compiler.hash (hex)
 import std.path (join, is_absolute, normalize, parent)
-import compiler.front (module_of, Embedded, embeds_wanted)
+import compiler.front (module_of, Embedded, Shipping, embeds_wanted, shipped_pulled)
 import compiler.embed (EmbedRead, EmbedWant)
 import compiler.resolve (Source, Diag, Label, error_at)
 import builder (builder)
 import walk (walk_room)
-import compiler.pkg (Supplied, wants)
+import compiler.pkg (PackageSources, Supplied, wants)
 import paths
 import paths (Rooted, displayed, read_file)
 import walk (Failure, Found, named, nothing, is_ply)
@@ -486,6 +486,28 @@ pub fn shipped_digest_of(srcs: List<Source>) -> String / {abort.raise} = {
   "b3:" ++ string_of_bytes(bytes_slice(hex(blake3(bytes_concat_all(parts))), 0, 12))
 }
 
+// The names of the shipped modules there are, read off the directory without reading one.
+pub fn shipped_names() -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
+  match fs.list_dir[shipped](".") {
+    None -> [],
+    Some(names) -> map(filter(names, is_ply), |name: String| bytes_of_string(stem(name))),
+  }
+
+pub fn no_shipping() -> Shipping = { read: [], unread: [] }
+
+// The shipped modules a load of `user` and `pkgs` pulls, each read off the directory bound as
+// `shipped` when it is pulled.
+pub fn shipping_for(
+  user: List<Source>,
+  pkgs: PackageSources,
+) -> Shipping / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
+  shipped_pulled(user, pkgs, shipped_names(), |name: Bytes|
+    fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply"))
+
+// Every shipped module's name, read or not.
+pub fn shipped_listed(s: Shipping) -> List<Bytes> =
+  concat(map(s.read, |source: Source| source.name), s.unread)
+
 pub fn shipped_modules() -> List<Source> / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
   match fs.list_dir[shipped](".") {
     None -> [],
@@ -616,6 +638,31 @@ test "the manifest is the one in the root's directory, whichever file in it the 
       assert_eq(f.at, { label: "abs", path: "srv/app/ply.pkg" })
     },
   }
+}
+
+test "a load reads the shipped modules it pulls and what they embed, and only those" {
+  let read = with_cell[reads]([]) { c -> {
+    let shipping = handle {
+      shipping_for([{ name: b"main", src: b"import std.json\nfn main() -> Unit = ()\n" }], {
+        root: b"",
+        manifest: None,
+        supplied: [],
+      })
+    } with {
+      fs.list_dir[shipped](p) ->
+        Some(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"]),
+      fs.read_file[shipped](p) -> {
+        cell_update(c, |xs: List<String>| push(xs, p));
+        if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = 1\n") }
+        else if p == "std.bytes.ply" { Some(b"pub fn b() -> Int = 2\n") }
+        else { Some(b"pub fn x() -> Int = 3\n") }
+      },
+    };
+    assert_eq(map(shipping.read, |source: Source| source.name), [b"std.json", b"std.bytes"]);
+    assert_eq(shipping.unread, [b"std.list", b"compiler.fmt"]);
+    cell_get(c)
+  } };
+  assert_eq(read, ["std.json.ply", "std.bytes.ply"])
 }
 
 test "the shipped modules come back one source per `.ply` file, named by its stem" {

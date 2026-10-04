@@ -1868,7 +1868,9 @@ The built-in package, shipped inside `ply` and pre-seeded for every load — an
 implicit dependency of every package, no declaration needed: `import
 std.<name>`. Its tests and obligations are skipped unless you pass `--std`.
 `ply std` lists it, `ply std --show std.json` prints one source and `ply std
---show` alone prints every one; a changed standard library warns `W0605`.
+--show` alone prints every one. A load reads only the shipped modules its
+modules import, what those import in turn, and what they embed, so a change to
+any other leaves it alone; a change to one it reads warns `W0605`.
 
 ### 13.1 `std.net` — sockets
 
@@ -3728,7 +3730,8 @@ shipped modules — `--std`, or a project whose own modules ship — reads them 
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
 read and file neither, and neither does `compiler.load`. A cache that will not read
 is a warning and a cold check, never a failure; the run that files over one
-filed by a compiler whose shipped modules differed says so once, as `W0605`.
+that filed a shipped module this load reads with other bytes says so once, as
+`W0605`, naming the modules and how many definitions the change reached.
 
 `ply run` over sources goes further: once a load holds, the front end's answer
 is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
@@ -3947,7 +3950,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0602` | cache corrupt |
 | `W0603` | cache from another build |
 | `W0604` | obligation undecided at every tier |
-| `W0605` | standard library changed since the cache was written |
+| `W0605` | a shipped module the load reads changed since the cache was written |
 | `W0607` | supplied configuration key the schema does not declare |
 | `W0608` | drain deadline expired with requests in flight |
 | `W0609` | spans still open when their task or the entry point ended |
