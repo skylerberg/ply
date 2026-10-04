@@ -27,7 +27,7 @@ fn even(x: Int) -> Bool = x % 2 == 0
 fn clamp(x: Int, lo: Int, hi: Int) -> Int =
   if x < lo { lo } else { if x > hi { hi } else { x } }
 
-fn collatz(n: Int) -> Int =
+fn collatz(n: Int) -> Int / {diverges} =
   if n <= 1 { 0 } else { if even(n) { 1 + collatz(n / 2) } else { 1 + collatz(3 * n + 1) } }
 
 fn sign(n: Int) -> Int = match n { 0 -> 0, _ -> if n < 0 { 0 - 1 } else { 1 } }
