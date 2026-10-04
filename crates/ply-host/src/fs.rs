@@ -3,7 +3,7 @@
 use crate::pool::{Bell, FS_FIRST_TOKEN, Inbox, JobOutput, Pool};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
-    HostRuntime, Linearity,
+    HostRuntime, Linearity, MachineId,
 };
 use ply_eval::{Diagnostic, Pending, Resource, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
@@ -336,11 +336,16 @@ impl HostHandler for Operation {
 
         let op = self.op;
         let held = Arc::clone(&self.fs.held);
+        let machine = req.machine;
         let pending = self.fs.pool.submit(
             span,
             op.label(),
             op.what(),
-            Box::new(move || run(op, &root, &first, second, &held, span)),
+            Box::new(move || {
+                let done = run(op, &root, &first, second, &held, span);
+                observed(op, &root, &first, &done, machine, span);
+                done
+            }),
         )?;
         Ok(HostAnswer::Pending(pending))
     }
@@ -496,6 +501,42 @@ fn run(
             Second::Millis(ms) => JobOutput::Bool(set_modified(&target, ms)),
             _ => JobOutput::Failed("a stamp with no time reached the pool".into()),
         },
+    }
+}
+
+/// What `op` read of the world or wrote to it, for the record of the test whose machine asked. Taken
+/// after the operation, so a directory `temp_dir` made is known by the name it got.
+fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineId, span: Span) {
+    use crate::observe::{Read, read, wrote};
+    let Ok(target) = confine(root, path, span) else {
+        return;
+    };
+    match op {
+        Op::ReadFile | Op::ReadAt | Op::FileSize | Op::Mode | Op::ReadLink => {
+            read(machine, Read::File, &target)
+        }
+        Op::ListDir => read(machine, Read::Dir, &target),
+        Op::Walk => read(machine, Read::Tree, &target),
+        Op::Kind | Op::Resolved | Op::Exists | Op::Canonical => read(machine, Read::Kind, &target),
+        // A stamp is when, not what; a sync and a lock change nothing a read answers.
+        Op::ModifiedMs | Op::Sync | Op::Lock | Op::Unlock => {}
+        Op::WriteFile
+        | Op::Append
+        | Op::CreateDir
+        | Op::Remove
+        | Op::RemoveTree
+        | Op::SetMode
+        | Op::SetModified
+        | Op::Symlink
+        | Op::Rename
+        | Op::Copy => wrote(machine, &target),
+        Op::TempDir => {
+            if let JobOutput::MaybeString(Some(made)) = done
+                && let Ok(made) = confine(root, made, span)
+            {
+                wrote(machine, &made)
+            }
+        }
     }
 }
 

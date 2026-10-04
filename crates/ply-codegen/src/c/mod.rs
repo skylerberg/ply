@@ -63,6 +63,12 @@ pub fn bodies_dir() -> std::path::PathBuf {
     load::cache_dir().join("bodies")
 }
 
+/// Every directory a run keeps for the next one in: the compiled objects and the stages. What is
+/// there is a product of its key, so no answer depends on finding it.
+pub fn kept_dirs() -> Vec<std::path::PathBuf> {
+    vec![load::cache_dir(), stage::stage_root()]
+}
+
 /// What every unit's C opens with, up to its first bucket: the prelude and the runtime declared.
 pub fn unit_head() -> String {
     format!("{PRELUDE}{}\n", runtime_header())

@@ -7,7 +7,7 @@ pub(crate) use children::{Children, Io, Output, Signal};
 
 use crate::pool::{Bell, Finished, Inbox, JobOutput, PROCESS_FIRST_TOKEN, Pool};
 use children::{Child, Launch, Refusal, Unusable};
-use ply_eval::host::HostRegistry;
+use ply_eval::host::{HostRegistry, MachineId};
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Pending, Plain, Resource, Span, Symbol, Value, codes, slot,
@@ -497,7 +497,7 @@ impl HostHandler for Operation {
                 let program = program.to_path_buf();
                 let args = argument_vector(&req.args[0], span)?;
                 let dir = req.args[1].as_str(span, "a working directory")?.to_string();
-                let env = environment(self.op, &req.args[2], span)?;
+                let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
                 let pending = host.pool.submit(
                     span,
                     "process-spawn",
@@ -511,7 +511,7 @@ impl HostHandler for Operation {
                     return Err(unbound(self.op, &req.atom.resource, span));
                 };
                 let args = argument_vector(&req.args[0], span)?;
-                let env = environment(self.op, &req.args[2], span)?;
+                let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
                 let io = io_of(&req.args[3], span)?;
                 let launch = Launch {
                     label: &req.atom.resource,
@@ -594,6 +594,17 @@ fn argument_vector(value: &Value, span: Span) -> Result<Vec<String>, Diagnostic>
 
 /// The whole environment a child runs under; a later entry for one name wins, as `map_insert`
 /// does.
+/// `env` and, when a test is observing `machine`, where a `ply` the child is reports what it read.
+fn traced(machine: MachineId, mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    if let Some(file) = crate::observe::child_trace(machine) {
+        env.push((
+            crate::observe::TRACE_VAR.to_string(),
+            file.to_string_lossy().into_owned(),
+        ));
+    }
+    env
+}
+
 fn environment(op: Op, value: &Value, span: Span) -> Result<Vec<(String, String)>, Diagnostic> {
     let mut out = Vec::new();
     for entry in value.as_list(span, "an environment")?.iter() {

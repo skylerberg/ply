@@ -144,6 +144,16 @@ fn lay_out(
     write_atomically(&dir.join(SHIPPED_MARKER), b"ok")
 }
 
+/// Where the `ply` that started this one asked it to report what it read, begun so that a report
+/// that never finishes is told from one never asked for; and the record the report is made of.
+fn reporting() -> Option<(PathBuf, std::sync::Arc<ply_host::observe::Recorder>)> {
+    let file = PathBuf::from(std::env::var_os(ply_host::observe::TRACE_VAR)?);
+    std::fs::write(&file, b"").ok()?;
+    let recorder = ply_host::observe::begin_process();
+    recorder.ran_program();
+    Some((file, recorder))
+}
+
 /// Enter the program on the command's own big-stack thread; the answer is the exit code it asked
 /// for, with what the entry ended with. `binds` lends whatever the caller's command configured on
 /// top of the launcher's own.
@@ -159,8 +169,10 @@ pub fn run(
         Ok(shipped) => shipped,
         Err(refused) => return Ended::refused(refused),
     };
+    ply_host::observe::laid_out(&shipped, ply_codegen::c::kept_dirs());
+    let reporting = reporting();
     ply_machine::shipped::stamp(stamps());
-    ply_machine::shipped::entered(definitions);
+    ply_machine::shipped::entered(&program.runnable.entry, definitions);
     let version = program.version.clone();
     let opened = match enter::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
         Ok(opened) => opened,
@@ -218,7 +230,16 @@ pub fn run(
         });
     match work {
         Ok(thread) => match thread.join() {
-            Ok(answer) => answer,
+            Ok(answer) => {
+                if let Some((file, recorder)) = reporting {
+                    let binary = ply_host::observe::Binary {
+                        shipped: &ply_machine::shipped::module_digest,
+                        program: ply_machine::shipped::program_digest(),
+                    };
+                    let _ = std::fs::write(file, ply_host::observe::report(&recorder, &binary));
+                }
+                answer
+            }
             Err(panic) => std::panic::resume_unwind(panic),
         },
         Err(e) => Ended::refused(
