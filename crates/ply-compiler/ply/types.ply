@@ -96,12 +96,20 @@ pub fn atoms_insert(atoms: List<Atom>, atom: Atom) -> List<Atom> / {abort.raise}
 pub fn atoms_union(a: List<Atom>, b: List<Atom>) -> List<Atom> / {abort.raise} =
   fold(b, a, |acc: List<Atom>, atom: Atom| atoms_insert(acc, atom))
 
-// Ordered by `atom_lt` and each atom once, as inserting them one at a time leaves them, by merging.
-pub fn atoms_sorted(atoms: List<Atom>) -> List<Atom> / {abort.raise} = {
-  let n = len(atoms);
-  if n < 2 { atoms }
-  else { atoms_merged(atoms_sorted(take(atoms, n / 2)), atoms_sorted(drop(atoms, n / 2))) }
-}
+// Ordered by `atom_lt` and each atom once, as inserting them one at a time leaves them, by merging
+// neighbouring runs until one is left; each round halves the runs, so `n` rounds are plenty.
+pub fn atoms_sorted(atoms: List<Atom>) -> List<Atom> / {abort.raise} =
+  iterate(map(atoms, |a: Atom| [a]), len(atoms) + 1, |runs: List<List<Atom>>|
+    match runs {
+      [] -> Stop([]),
+      [run] -> Stop(run),
+      _ ->
+        Continue(
+          map(range(0, (len(runs) + 1) / 2), |i: Int|
+            if 2 * i + 1 < len(runs) { atoms_merged(at(runs, 2 * i), at(runs, 2 * i + 1)) }
+            else { at(runs, 2 * i) }),
+        ),
+    })
 
 fn atoms_merged(a: List<Atom>, b: List<Atom>) -> List<Atom> / {abort.raise} = {
   let last = |out: List<Atom>, atom: Atom|
@@ -315,16 +323,26 @@ pub fn shallow(subst: Subst, ty: Type) -> Type / {abort.raise} =
     })
 
 pub fn resolve_ty(subst: Subst, t: Type) -> Type / {abort.raise} =
-  match shallow(subst, t) {
-    TyVar(v) -> TyVar(v),
-    TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| resolve_ty(subst, a)) }),
+  resolved_ty(subst, t, map_len(subst.ty))
+
+// `room` is how many more bindings a path through `t` may pass: bindings never form a cycle, so a
+// path passes each at most once.
+fn resolved_ty(subst: Subst, t: Type, room: Int) -> Type / {abort.raise} =
+  match t {
+    TyVar(v) -> match map_get(subst.ty, v) {
+      None -> t,
+      Some(bound) -> if room <= 0 { panic("a type bound to itself") }
+      else { resolved_ty(subst, bound, room - 1) },
+    },
+    TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| resolved_ty(subst, a, room)) }),
     TyFn(f) ->
       TyFn({
-        params: map(f.params, |p: Type| resolve_ty(subst, p)),
-        ret: resolve_ty(subst, f.ret),
+        params: map(f.params, |p: Type| resolved_ty(subst, p, room)),
+        ret: resolved_ty(subst, f.ret, room),
         effects: resolve_row(subst, f.effects),
       }),
-    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { name: f.name, ty: resolve_ty(subst, f.ty) })),
+    TyRecord(fs) ->
+      TyRecord(map(fs, |f: Field| { name: f.name, ty: resolved_ty(subst, f.ty, room) })),
   }
 
 pub fn resolved_tail(subst: Subst, row: Row) -> Option<Int> / {abort.raise} = {
@@ -472,18 +490,27 @@ pub fn solve_continuation_row(subst: Subst, v: Int, row: Row) -> Subst / {abort.
 pub type Free = { tys: List<Int>, rows: List<Int> }
 
 pub fn free_vars(subst: Subst, ty: Type, acc: Free) -> Free / {abort.raise} =
-  match shallow(subst, ty) {
-    TyVar(v) -> { tys: ints_insert(acc.tys, v), rows: acc.rows },
-    TyCon(c) -> fold(c.args, acc, |a: Free, x: Type| free_vars(subst, x, a)),
+  free_vars_within(subst, ty, acc, map_len(subst.ty))
+
+// `room` as in `resolved_ty`.
+fn free_vars_within(subst: Subst, ty: Type, acc: Free, room: Int) -> Free / {abort.raise} =
+  match ty {
+    TyVar(v) -> match map_get(subst.ty, v) {
+      None -> { tys: ints_insert(acc.tys, v), rows: acc.rows },
+      Some(bound) -> if room <= 0 { panic("a type bound to itself") }
+      else { free_vars_within(subst, bound, acc, room - 1) },
+    },
+    TyCon(c) -> fold(c.args, acc, |a: Free, x: Type| free_vars_within(subst, x, a, room)),
     TyFn(fn_) -> {
-      let ps = fold(fn_.params, acc, |a: Free, x: Type| free_vars(subst, x, a));
-      let r = free_vars(subst, fn_.ret, ps);
+      let ps = fold(fn_.params, acc, |a: Free, x: Type| free_vars_within(subst, x, a, room));
+      let r = free_vars_within(subst, fn_.ret, ps, room);
       let row = resolve_row(subst, fn_.effects);
       let ls = fold(row.atoms, r, |a: Free, x: Atom|
         match x.resource { RVar(v) -> { tys: ints_insert(a.tys, v), rows: a.rows }, _ -> a });
       match row.tail { Some(v) -> { tys: ls.tys, rows: ints_insert(ls.rows, v) }, None -> ls }
     },
-    TyRecord(fs) -> fold(fs, acc, |a: Free, field: Field| free_vars(subst, field.ty, a)),
+    TyRecord(fs) ->
+      fold(fs, acc, |a: Free, field: Field| free_vars_within(subst, field.ty, a, room)),
   }
 
 // Immutable containers, which may hold a narrower function than their type says.
@@ -492,15 +519,21 @@ pub fn covariant_con(name: Bytes) -> Bool =
     || name == b"Iter"
 
 pub fn unify(subst: Subst, fresh: Fresh, expected: Type, found: Type) -> Unified / {abort.raise} =
-  unify_at(subst, fresh, expected, found, false)
+  unify_at(subst, fresh, expected, found, false, unify_room(), 1)
 
 // `exact`: inside a parameter or another constructor, a row must not stand for a wider one.
+// `room` is how many levels deeper the unification may go. Each level goes to a part of the types
+// as they are unified, and a binding never reaches its own variable, so no path meets a part twice:
+// the parts of the two types resolved are room enough. Counting them costs a walk, so it waits
+// until a room that suffices for any type a person writes runs out; `tries` is that one recount.
 fn unify_at(
   subst: Subst,
   fresh: Fresh,
   expected: Type,
   found: Type,
   exact: Bool,
+  room: Int,
+  tries: Int,
 ) -> Unified / {abort.raise} = {
   let a = shallow(subst, expected);
   let b = shallow(subst, found);
@@ -516,10 +549,24 @@ fn unify_at(
     _ -> match b {
       TyVar(y) -> if !is_rigid_ty(subst, y) { bind_ty(subst, fresh, y, a) }
       else { unify_failed(subst, fresh, Mismatch({ expected: a, found: b })) },
-      _ -> unify_structural(subst, fresh, a, b, exact),
+      _ -> if room > 0 { unify_structural(subst, fresh, a, b, exact, room - 1, tries) }
+      else if tries > 0 {
+        let parts = type_size(resolve_ty(subst, a)) + type_size(resolve_ty(subst, b));
+        unify_at(subst, fresh, a, b, exact, parts, tries - 1)
+      } else { panic("a unification deeper than the types it unifies") },
     },
   }
 }
+
+fn unify_room() -> Int = 64
+
+fn type_size(t: Type) -> Int =
+  match t {
+    TyVar(_) -> 1,
+    TyCon(c) -> fold(c.args, 1, |n: Int, a: Type| n + type_size(a)),
+    TyFn(f) -> fold(f.params, 1 + type_size(f.ret), |n: Int, p: Type| n + type_size(p)),
+    TyRecord(fs) -> fold(fs, 1, |n: Int, f: Field| n + type_size(f.ty)),
+  }
 
 fn unify_structural(
   subst: Subst,
@@ -527,24 +574,27 @@ fn unify_structural(
   a: Type,
   b: Type,
   exact: Bool,
+  room: Int,
+  tries: Int,
 ) -> Unified / {abort.raise} =
   match a {
     TyCon(c1) -> match b {
       TyCon(c2) -> if c1.name != c2.name || len(c1.args) != len(c2.args) {
         unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
-      } else if len(c1.args) == 0 { unified(subst, fresh) }
-      else { unify_all(subst, fresh, c1.args, c2.args, exact || !covariant_con(c1.name)) },
+      } else if len(c1.args) == 0 { unified(subst, fresh) } else {
+        unify_all(subst, fresh, c1.args, c2.args, exact || !covariant_con(c1.name), room, tries)
+      },
       _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
     },
     TyFn(f1) -> match b {
       TyFn(f2) -> if len(f1.params) != len(f2.params) {
         unify_failed(subst, fresh, Arity({ expected: len(f1.params), found: len(f2.params) }))
       } else {
-        let ps = unify_all(subst, fresh, f1.params, f2.params, true);
+        let ps = unify_all(subst, fresh, f1.params, f2.params, true, room, tries);
         match ps.error {
           Some(_) -> ps,
           None -> {
-            let r = unify_at(ps.subst, ps.fresh, f1.ret, f2.ret, exact);
+            let r = unify_at(ps.subst, ps.fresh, f1.ret, f2.ret, exact, room, tries);
             match r.error {
               Some(_) -> r,
               None -> unify_row_at(r.subst, r.fresh, f1.effects, f2.effects, exact),
@@ -565,6 +615,8 @@ fn unify_structural(
           map(fs1, |field: Field| field.ty),
           map(fs2, |field: Field| field.ty),
           exact,
+          room,
+          tries,
         )
       },
       _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
@@ -578,11 +630,13 @@ fn unify_all(
   xs: List<Type>,
   ys: List<Type>,
   exact: Bool,
+  room: Int,
+  tries: Int,
 ) -> Unified / {abort.raise} =
   fold(range(0, len(xs)), unified(subst, fresh), |acc: Unified, i: Int|
     match acc.error {
       Some(_) -> acc,
-      None -> unify_at(acc.subst, acc.fresh, at(xs, i), at(ys, i), exact),
+      None -> unify_at(acc.subst, acc.fresh, at(xs, i), at(ys, i), exact, room, tries),
     })
 
 // A free label variable takes the resource the other row names for the same operation, so a
@@ -998,19 +1052,21 @@ fn label_name(printer: Printer, v: Int) -> { printer: Printer, name: Bytes } / {
   match map_get(printer.label_names, v) {
     Some(n) -> { printer: printer, name: n },
     None -> {
-      let name = free_label(printer, 0);
+      let name = free_label(printer);
       { printer: { ..printer, label_names: map_insert(printer.label_names, v, name) }, name: name }
     },
   }
 
 // The first label letter, then round, that no resource in this text and no other label holds, so
-// `[l]` in a printed row or footprint means one thing.
-fn free_label(printer: Printer, i: Int) -> Bytes / {abort.raise} = {
-  let name = letter_name(label_letters(), i);
-  if map_contains(printer.taken, name) || label_held(printer.label_names, name) {
-    free_label(printer, i + 1)
-  } else { name }
-}
+// `[l]` in a printed row or footprint means one thing. Each try is a distinct name, so one more try
+// than there are names held finds a free one.
+fn free_label(printer: Printer) -> Bytes / {abort.raise} =
+  iterate(0, map_len(printer.taken) + map_len(printer.label_names) + 1, |i: Int| {
+    let name = letter_name(label_letters(), i);
+    if map_contains(printer.taken, name) || label_held(printer.label_names, name) {
+      Continue(i + 1)
+    } else { Stop(name) }
+  })
 
 fn label_held(names: Map<Int, Bytes>, name: Bytes) -> Bool =
   map_fold(names, false, |acc: Bool, v: Int, held: Bytes| acc || held == name)
@@ -1344,6 +1400,28 @@ test "unification binds a variable once and refuses the occurs case" {
   assert_eq(type_text(resolve_ty(u.subst, a.ty)), b"List<Int>");
   let bad = unify(u.subst, u.fresh, a.ty, list_type(a.ty));
   assert_eq(match bad.error { Some(Mismatch(_)) -> 1, Some(_) -> 2, None -> 0 }, 1)
+}
+
+test "a unification deeper than its first room counts the types and goes on, through bindings" {
+  let nested = |inner: Type| fold(range(0, 200), inner, |t: Type, _i: Int| list_type(t));
+  let vars = fold(
+    range(0, 201),
+    { fresh: fresh_new(), tys: [] },
+    |acc: { fresh: Fresh, tys: List<Type> }, _i: Int| {
+      let v = fresh_ty(acc.fresh);
+      { fresh: v.fresh, tys: push(acc.tys, v.ty) }
+    },
+  );
+  let chained = fold(range(0, 200), unified(subst_new(), vars.fresh), |u: Unified, i: Int|
+    unify(u.subst, u.fresh, at(vars.tys, i), list_type(at(vars.tys, i + 1))));
+  let u = unify(chained.subst, chained.fresh, at(vars.tys, 0), nested(int_type()));
+  assert(u.error == None);
+  assert(resolve_ty(u.subst, at(vars.tys, 0)) == nested(int_type()));
+  let bad = unify(u.subst, u.fresh, nested(named_type(b"Bool")), at(vars.tys, 0));
+  assert(match bad.error {
+    Some(Mismatch(m)) -> m.expected == named_type(b"Bool") && m.found == int_type(),
+    _ -> false,
+  })
 }
 
 test "a row unifies atom-wise and a closed row refuses what it lacks" {
