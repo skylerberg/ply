@@ -1,0 +1,190 @@
+// `measure` — what a `decreases` owes. Along the way to each call its definition makes into a member
+// of its group that states a measure too, the callee's measure at the call's arguments lies below the
+// caller's, which is not negative. The group's calls on the way are values here: each one before it
+// was itself below the call it was made from, which is what the measure is proved by.
+
+import compiler.code (Code, Owned, Node, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList,
+                      NRecord, NMatch, NPerform, NField, NUpdate, CodeStmt, CLet, CLetPat, CDo,
+                      CodeField, CodeArm)
+import compiler.parsing (Span)
+import compiler.patterns (LBool, LInt)
+import context (Context, measure_name, group_of, refs_of)
+
+// The definition the obligation is about, how many parameters it binds, its group, and which of the
+// group state measures.
+type Owing = { me: String, params: Int, group: Map<String, Bool>, stating: Map<String, Bool> }
+
+// The claim `def`'s measure owes, as a `Bool` over its parameters, or why there is none to state.
+pub fn descent_of(context: Context, def: String) -> Result<Code, String> =
+  match map_get(context.claims.defs, def) {
+    None -> Err("no claim of `" ++ def ++ "` was lowered"),
+    Some(d) -> match ((d.body, d.measure)) {
+      (Some(body), Some(_)) -> {
+        let members = group_of(context, def);
+        let stating = filter(members, |m: String|
+          match map_get(context.claims.defs, m) {
+            Some(x) -> match x.measure { Some(_) -> true, None -> false },
+            None -> false,
+          });
+        let o = { me: def, params: d.params, group: set_of(members), stating: set_of(stating) };
+        // A measure that calls back into its own group is no measure of it.
+        let circular = fold(stating, false, |found: Bool, m: String|
+          found
+            || (match map_get(context.claims.defs, m) {
+              Some(x) -> match x.measure { Some(c) -> mentions(o, c), None -> false },
+              None -> false,
+            }));
+        if circular { Err("a measure calls into its own group") } else { descends(o, body) }
+      },
+      (None, _) -> Err("its body was not lowered"),
+      (_, None) -> Err("it states no measure"),
+    },
+  }
+
+fn set_of(names: List<String>) -> Map<String, Bool> =
+  fold(names, map_new(), |m: Map<String, Bool>, n: String| map_insert(m, n, true))
+
+fn mentions(o: Owing, c: Code) -> Bool =
+  fold(refs_of(c, []), false, |found: Bool, n: String| found || map_contains(o.group, n))
+
+fn made(node: Node, span: Span) -> Code = { own: Owned, node: node, span: span }
+
+fn yes(span: Span) -> Code = made(NLit(LBool(true)), span)
+
+fn is_yes(c: Code) -> Bool = match c.node { NLit(LBool(b)) -> b, _ -> false }
+
+fn both(a: Code, b: Code) -> Code =
+  if is_yes(a) { b }
+  else if is_yes(b) { a }
+  else { made(NBinary({ op: b"and", lhs: a, rhs: b }), a.span) }
+
+fn global(name: String, span: Span) -> Code =
+  made(NVar({ name: bytes_of_string(name), slot: None }), span)
+
+// `def`'s measure at `args`.
+fn measured(def: String, args: List<Code>, span: Span) -> Code =
+  made(NApp({ func: global(measure_name(def), span), args: args }), span)
+
+// At a call of `callee`, a member stating a measure: `0 <= m(x̄) && m'(ȳ) < m(x̄)`.
+fn descent(o: Owing, callee: String, args: List<Code>, span: Span) -> Code = {
+  let mine = measured(
+    o.me,
+    map(range(0, o.params), |k: Int| made(NVar({ name: b"", slot: Some(k) }), span)),
+    span,
+  );
+  let floor = made(NBinary({ op: b"le", lhs: made(NLit(LInt(0)), span), rhs: mine }), span);
+  let below = made(NBinary({ op: b"lt", lhs: measured(callee, args, span), rhs: mine }), span);
+  made(NBinary({ op: b"and", lhs: floor, rhs: below }), span)
+}
+
+fn all(o: Owing, cs: List<Code>, span: Span) -> Result<Code, String> =
+  fold(cs, Ok(yes(span)), |acc: Result<Code, String>, c: Code|
+    match acc {
+      Err(_) -> acc,
+      Ok(sofar) -> match descends(o, c) { Ok(more) -> Ok(both(sofar, more)), Err(why) -> Err(why) },
+    })
+
+// Whether every call into the group that `c` makes, in the order it makes them, descends.
+fn descends(o: Owing, c: Code) -> Result<Code, String> =
+  if !mentions(o, c) { Ok(yes(c.span)) } else {
+    match c.node {
+      NVar(v) -> Err("`" ++ string_of_bytes_lossy(v.name) ++ "` is handed on as a value"),
+      NApp(a) -> {
+        let args = all(o, a.args, c.span)?;
+        match a.func.node {
+          NVar(f) -> {
+            let name = string_of_bytes_lossy(f.name);
+            if f.slot == None && map_contains(o.group, name) {
+              Ok(if map_contains(o.stating, name) { both(args, descent(o, name, a.args, c.span)) }
+              else { args })
+            } else { Ok(args) }
+          },
+          _ -> Ok(both(args, descends(o, a.func)?)),
+        }
+      },
+      NIf(i) -> {
+        let cond = descends(o, i.cond)?;
+        let then_branch = descends(o, i.then_branch)?;
+        let else_branch = descends(o, i.else_branch)?;
+        Ok(
+          both(
+            cond,
+            made(NIf({ cond: i.cond, then_branch: then_branch, else_branch: else_branch }), c.span),
+          ),
+        )
+      },
+      NMatch(m) -> {
+        let scrutinee = descends(o, m.scrutinee)?;
+        if fold(m.arms, false, |found: Bool, arm: CodeArm|
+            found || (match arm.guard { Some(g) -> mentions(o, g), None -> false })) {
+          Err("a call into the group in a guard")
+        } else {
+          let arms = fold(m.arms, Ok([]), |acc: Result<List<CodeArm>, String>, arm: CodeArm|
+            match acc {
+              Err(_) -> acc,
+              Ok(xs) -> match descends(o, arm.body) {
+                Ok(b) -> Ok(push(xs, { ..arm, body: b })),
+                Err(why) -> Err(why),
+              },
+            })?;
+          Ok(both(scrutinee, made(NMatch({ scrutinee: m.scrutinee, arms: arms }), c.span)))
+        }
+      },
+      NBlock(b) -> {
+        let tail = (match b.tail { Some(t) -> descends(o, t), None -> Ok(yes(c.span)) })?;
+        fold(range(0, len(b.stmts)), Ok(tail), |acc: Result<Code, String>, k: Int|
+          match acc {
+            Err(_) -> acc,
+            Ok(rest) -> match list_at(b.stmts, len(b.stmts) - 1 - k) {
+              None -> acc,
+              Some(st) -> match st {
+                CDo(d) -> match descends(o, d.code) {
+                  Ok(x) -> Ok(both(x, rest)),
+                  Err(why) -> Err(why),
+                },
+                CLet(l) -> bound(o, st, l.value, rest, c.span),
+                CLetPat(l) -> bound(o, st, l.value, rest, c.span),
+              },
+            },
+          })
+      },
+      NBinary(b) -> {
+        let lhs = descends(o, b.lhs)?;
+        let rhs = descends(o, b.rhs)?;
+        // The right of `&&` and `||` is evaluated only where the left lets it be.
+        if b.op == b"and" {
+          Ok(
+            both(
+              lhs,
+              made(NIf({ cond: b.lhs, then_branch: rhs, else_branch: yes(c.span) }), c.span),
+            ),
+          )
+        } else if b.op == b"or" {
+          Ok(
+            both(
+              lhs,
+              made(NIf({ cond: b.lhs, then_branch: yes(c.span), else_branch: rhs }), c.span),
+            ),
+          )
+        } else { Ok(both(lhs, rhs)) }
+      },
+      NUnary(u) -> descends(o, u.operand),
+      NList(l) -> all(o, l.items, c.span),
+      NRecord(r) -> all(o, map(r.fields, |f: CodeField| f.value), c.span),
+      NField(f) -> descends(o, f.base),
+      NUpdate(u) -> all(o, push(map(u.sets, |f: CodeField| f.value), u.base), c.span),
+      NPerform(p) -> all(o, p.args, c.span),
+      _ -> Err("a call into the group inside a lambda or a region"),
+    }
+  }
+
+// What the bound value owes, then the rest of the block with the binding in scope.
+fn bound(o: Owing, st: CodeStmt, value: Code, rest: Code, span: Span) -> Result<Code, String> =
+  match descends(o, value) {
+    Err(why) -> Err(why),
+    Ok(v) ->
+      Ok(
+        both(v, if is_yes(rest) { rest }
+        else { made(NBlock({ stmts: [st], tail: Some(rest) }), span) }),
+      ),
+  }

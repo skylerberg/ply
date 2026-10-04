@@ -5,11 +5,14 @@ import compiler.code (Code)
 import compiler.diagnostics (parse_all)
 import compiler.front (Analysis, Analysed, Refused, ClaimClause, analyse, claims)
 import compiler.items (SEnsures, SRequires)
-import context (Context, Claims, Law, Def, claims_of, context, unfoldable, self_recursive)
+import context (Context, Claims, Law, Def, claims_of, context, ends, unfoldable, self_recursive)
 import decide (Decision, Proved, GuardUnsatisfiable, Unknown, Diagnosed, Static, Certified,
                Unwitnessed, GuardRefuted, Undecided, static_of, decide, decide_and_diagnose)
 import domain (Ty, Fn)
-import goal (Goal, Binder, Limits, Proof, BudgetSpent, default_limits, default_unfold_depth)
+import goal (Goal, Binder, Limits, Proof, BudgetSpent, default_limits, default_prove_budget,
+             default_unfold_depth)
+import statics (Prover, Unshown, prover_of, unshown)
+import statics
 import lower (Blocker, BitOperator, FloatTerm, DecimalArithmetic)
 import rules (Rule, LinearArithmetic, Propositional, Congruence, Injectivity, CaseSplit, Unfold,
               induction_rule)
@@ -48,6 +51,8 @@ fn law_goal(f: Fixture, label: String) -> Goal / {abort.raise} =
         guards: match l.guard { Some(g) -> [g.code], None -> [] },
         result: None,
         body: l.body,
+        total: [],
+        partial: false,
       },
   }
 
@@ -340,6 +345,13 @@ fn chain() -> String =
     "fn pong(n: Int) -> Int = if n <= 0 { 0 } else { ping(n - 1) + 1 }",
     "fn halved(n: Int) -> Int decreases n = if n <= 0 { 0 } else { halved(n / 2) + 1 }",
     "fn climb(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }",
+    "fn stall(n: Int) -> Int decreases n = if n <= 0 { 0 } else { stall(n) }",
+    "fn is_small(n: Int) -> Bool = n <= 0",
+    "fn lowered(n: Int) -> Int decreases n = if is_small(n) { 0 } else { lowered(n - 1) + 1 }",
+    "fn up(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { across(a + 1, b - 2) }",
+    "fn across(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { up(a - 2, b + 1) }",
+    "fn tick(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { tock(a + 1, b) }",
+    "fn tock(a: Int, b: Int) -> Int decreases a + b = if a + b <= 0 { 0 } else { tick(a - 2, b) }",
     "",
     "law \"three unfoldings suffice\" forall (x: Int) where x > 0 && x < 1000",
     "  { three(x) == x + 3 }",
@@ -356,6 +368,7 @@ fn chain() -> String =
     "law \"a definition that never returns is not a function\" forall (n: Int) { forever(n) == forever(n) }",
     "law \"stepping by two counts\" forall (n: Int) where n >= 0 { twice_down(n) == n }",
     "law \"a mutual recursion is not unrolled\" forall (n: Int) where n >= 0 { ping(n) == n }",
+    "law \"a measured recursion counts\" forall (n: Int) where n >= 0 { lowered(n) == n }",
   ])
 
 fn spines() -> String =
@@ -593,6 +606,8 @@ fn returns_zero(f: Fixture, name: String) -> Decision / {abort.raise} = {
       guards: [],
       result: Some(d.body),
       body: at(clauses(d, true), 0),
+      total: [],
+      partial: false,
     },
     default_limits(),
   )
@@ -608,6 +623,8 @@ fn ensures_goal(index: Int) -> Decision / {abort.raise} = {
       guards: clauses(d, false),
       result: Some(d.body),
       body: at(clauses(d, true), index),
+      total: [],
+      partial: false,
     },
     default_limits(),
   )
@@ -740,19 +757,74 @@ test "list patterns over literal spines are decided without induction" {
   assert(not_proved(f, "a list pattern does not confuse the tail"))
 }
 
-test "only recursion the checker reads as ending is unrolled, and a stated measure is not read" {
+test "only recursion the checker reads as ending is unrolled, and a stated measure once a proof shows it" {
   let f = fixture(chain());
-  let ends = |name: String|
-    match self_recursive(f.cx, name) {
-      Some(d) -> d.ends,
+  let p = proving(chain());
+  let ends_in = |cx: Context, name: String|
+    match self_recursive(cx, name) {
+      Some(_) -> ends(cx, name),
       None -> panic("a pure definition calling only itself"),
     };
-  assert(ends("m.countdown"));
-  assert(!ends("m.forever"));
+  assert(ends_in(f.cx, "m.countdown"));
+  assert(!ends_in(f.cx, "m.forever"));
   // Halving under a positive guard is a descent the checker sees for itself.
-  assert(ends("m.halved"));
-  assert(!ends("m.climb"))
+  assert(ends_in(f.cx, "m.halved"));
+  assert(!ends_in(f.cx, "m.climb"));
+  assert(!ends_in(f.cx, "m.lowered"));
+  assert(ends_in(p.prover.cx, "m.climb"));
+  assert(ends_in(p.prover.cx, "m.lowered"));
+  assert(!ends_in(p.prover.cx, "m.stall"));
+  assert(not_proved(f, "a measured recursion counts"));
+  assert(match decided_by(p, "m.a measured recursion counts") {
+    Some(pr) -> inducted_on(pr, "n", "m.lowered"),
+    None -> false,
+  })
 }
+
+test "a measure is shown where every call its group makes back into it descends, and only then" {
+  let p = proving(chain());
+  let missing = unshown(p.analysis, every);
+  // `stall` calls itself at its own argument; `halved` halves, which the proof does not follow,
+  // though the checker sees it end without its measure.
+  // `tick` hands `tock` more than it had; `tock` hands back less.
+  assert_eq(map(missing, |u: Unshown| u.measure.owner), ["m.halved", "m.stall", "m.tick"]);
+  assert_eq(map(missing, |u: Unshown| u.ends), [true, false, false]);
+  assert(ends(p.prover.cx, "m.up") && ends(p.prover.cx, "m.across"));
+  // A group the checker reads as ending by its measures ends only when every one of them is shown.
+  assert(match map_get(p.prover.cx.claims.defs, "m.tock") { Some(d) -> d.stated, None -> false });
+  assert(!ends(p.prover.cx, "m.tock"))
+}
+
+type Proving = { prover: Prover, built: Built, analysis: Analysis }
+
+// A fixture with the run's prover over it, its measures decided.
+fn proving(src: String) -> Proving / {abort.raise} = {
+  let sources = [{ name: b"m", src: bytes_of_string(src) }];
+  match analyse(parse_all(sources)) {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> {
+      let built = world_of(w, every);
+      {
+        prover: prover_of(claims(sources), built.world, default_prove_budget()),
+        built: built,
+        analysis: w,
+      }
+    },
+  }
+}
+
+fn proof_of(p: Proving, pick: (Obligation) -> Bool) -> Option<Proof> / {abort.raise} =
+  match fold(p.built.world.obligations, None, |found: Option<Obligation>, o: Obligation|
+      match found { Some(_) -> found, None -> if pick(o) { Some(o) } else { None } }) {
+    None -> panic("no such obligation"),
+    Some(o) -> match statics::diagnosed(p.prover, o) {
+      Some(d) -> match d.decision { Proved(pr) -> Some(pr), _ -> None },
+      None -> None,
+    },
+  }
+
+fn decided_by(p: Proving, owner: String) -> Option<Proof> / {abort.raise} =
+  proof_of(p, |o: Obligation| o.owner == owner)
 
 test "induction needs a decreasing self call and a step of one" {
   let f = fixture(chain());
@@ -810,6 +882,8 @@ test "a postcondition without the definition is unknown" {
       guards: [],
       result: None,
       body: at(clauses(d, true), 0),
+      total: [],
+      partial: false,
     },
     default_limits(),
   );
