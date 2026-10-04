@@ -28,6 +28,7 @@ pub mod runnable;
 pub mod shipped;
 pub mod shipped_modules;
 pub mod support;
+pub mod tested;
 pub mod tester;
 pub mod testrun;
 pub mod trace;

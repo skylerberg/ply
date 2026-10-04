@@ -976,10 +976,10 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
 /// tests compile under `ply test --std`.
 #[test]
 fn the_emitter_refuses_no_body_of_the_standard_library() {
-    let importer: String = ply_machine::shipped_modules::sources()
+    let importer: String = ply_machine::shipped_modules::names()
         .iter()
-        .filter(|(name, _)| name.starts_with("std."))
-        .map(|(name, _)| format!("import {name}\n"))
+        .filter(|name| name.starts_with("std."))
+        .map(|name| format!("import {name}\n"))
         .collect();
     let answer = fixture::answered(&[("m", &importer)]);
     assert!(
