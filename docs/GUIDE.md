@@ -3012,6 +3012,7 @@ pub fn at_or<a>(xs: List<a>, i: Int, spare: a) -> a
 pub fn take<a>(xs: List<a>, n: Int) -> List<a>
 pub fn drop<a>(xs: List<a>, n: Int) -> List<a>
 pub fn take_while<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> List<a> / e
+pub fn drop_while<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> List<a> / e
 pub fn reverse<a>(xs: List<a>) -> List<a>
 pub fn concat<a>(xs: List<a>, ys: List<a>) -> List<a>
 pub fn flat_map<a, b | e>(xs: List<a>, f: (a) -> List<b> / e) -> List<b> / e
