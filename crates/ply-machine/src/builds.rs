@@ -87,6 +87,33 @@ fn committed() -> Result<Runnable, Diagnostic> {
     })
 }
 
+/// `runnable` laid where a builder keeps the programs it built, under the key in the file at
+/// `key`, which `ply bootstrap` writes beside a runnable it commits: a builder asked for a program
+/// that enters the definition the committed one does then takes the committed one. A checkout whose
+/// runnable was committed without a key has none to lay.
+pub fn kept_as_built(key: &Path, runnable: impl FnOnce() -> Option<Vec<u8>>) {
+    let Ok(key) = std::fs::read_to_string(key) else {
+        return;
+    };
+    let key = key.trim();
+    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return;
+    }
+    let dir = stage::stage_dir(sweep::PROGRAMS);
+    let at = dir.join(key);
+    if at.exists() {
+        return;
+    }
+    let Some(bytes) = runnable() else { return };
+    let aside = dir.join(format!("{key}.{}.tmp", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_ok()
+        && std::fs::write(&aside, bytes).is_ok()
+        && std::fs::rename(&aside, &at).is_err()
+    {
+        let _ = std::fs::remove_file(&aside);
+    }
+}
+
 /// A runnable an earlier process left at `staged`, under `stage`.
 pub fn staged_at(stage: &Path, staged: &Path) -> Option<Runnable> {
     let bytes = std::fs::read(staged).ok()?;
@@ -131,6 +158,9 @@ pub fn builder() -> Result<Runnable, Diagnostic> {
         }
         let src = laid_out()?;
         let fresh = staged.with_extension(format!("run.{}", std::process::id()));
+        kept_as_built(Path::new(ply_compiler::bootstrap::BUILDER_KEY), || {
+            Some(ply_compiler::bootstrap::BUILDER.to_vec())
+        });
         build_by_committed(&src, ROOT, ENTRY, &fresh, "builder")?;
         landed(&fresh, &staged)
     })
