@@ -1501,12 +1501,41 @@ law "a credit and a matching debit leave an account exactly as it was"
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
-injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
-induction: a definition that calls only itself, and that the checker reads as
-ending (§5.10), is unrolled. On an `Int` binder the claim
-is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; on a `List`
-binder at `[]` and then at `[h, ..t]` from itself at `t`, with `len` and `push`
-reduced over the spine in view and `len` known to lie below `i64::MAX`. A definition of another package
+injectivity, unfolding non-recursive definitions, a `match` taking its arm over
+a value whose shape is in view, exhaustive interleaving, and induction: a
+definition that calls only itself, and that the checker reads as ending
+(§5.10), is unrolled, and over values in view as deep as the unfolding goes. On
+an `Int` binder the claim is proved at `n <= 0` and then at `n > 0` from itself
+at `n - 1`; on a `List` binder (structural induction) at `[]` and then at
+`[h, ..t]` from itself at `t`, with `len` and `push` reduced over a spine in
+view or one the proof comes to know, and `len` known to lie below `i64::MAX`.
+A kernel checks each induction from the claim alone before refuting its cases,
+whatever proposed it: the binder it names, a hypothesis strictly below the case
+it proves, and only definitions the checker reads as ending unrolled.
+
+A law with no guard, once proved, is a lemma for every claim written below it
+in its module. Its trigger is the first call its body always makes whose
+arguments name every binder; where a claim makes a call that fits it, the law
+at that call is a fact, and a trigger that takes an argument apart, as
+`reverse(push(ys, x))` does, stands for the call in place of its body:
+
+```ply
+fn reverse(xs: List<Int>) -> List<Int> =
+  match xs { [] -> [], [x, ..rest] -> push(reverse(rest), x) }
+
+law "a push reversed leads" forall (ys: List<Int>, x: Int) {
+  match reverse(push(ys, x)) { [h, ..t] -> h == x && t == reverse(ys), [] -> false }
+}
+
+law "reverse twice is identity" forall (xs: List<Int>) { reverse(reverse(xs)) == xs }
+```
+
+Both are `proved`, the second by structural induction on `xs` citing the
+first. Under `--json` a certificate's `rules` name each lemma as `lemma` with
+its `law` and `label`, and each induction as `induction` with its `binder`,
+`def`, `over` (`int` or `list`) and `step`.
+
+A definition of another package
 — a dependency's, or outside `--std` a shipped module's — is claimed by its
 `requires` and `ensures` alone: a proof may use what it promises and never
 unfolds its body, which that package's own run proves. A `transparent fn` is

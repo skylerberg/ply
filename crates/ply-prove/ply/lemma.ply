@@ -1,0 +1,120 @@
+// `lemma` — a law a later proof may use. Its trigger is the first call of a definition its body
+// always makes, outermost first, whose arguments name every binder; a call a proof lowers that fits
+// the trigger puts the law, at what the trigger bound, into that proof as a fact. A proved law's
+// body evaluates its trigger at every point, so the call is a value wherever the trigger fits.
+
+import compiler.code (Code, NVar, NApp, NLit, NList, NBlock, NBinary, NUnary, NIf, NMatch, NRecord,
+                      NField, NUpdate, NPerform, CodeStmt, CLet, CLetPat, CDo, CodeField)
+
+// `binders` is how many slots the law binds, `func` and `args` its trigger, and `body` the claim.
+// `apart`: the trigger takes an argument apart, so it speaks for the calls it fits in place of their
+// bodies; one of bare binders fits every call of `func`, and only adds what it says.
+pub type Lemma = {
+  law: String,
+  label: String,
+  binders: Int,
+  func: String,
+  args: List<Code>,
+  apart: Bool,
+  body: Code,
+}
+
+pub type Trigger = { func: String, args: List<Code> }
+
+// The lemma a law with `binders` binders and no guard states, when its body calls a definition
+// (`defined`) with arguments that name them all.
+pub fn lemma_of(
+  law: String,
+  label: String,
+  binders: Int,
+  body: Option<Code>,
+  defined: (String) -> Bool,
+) -> Option<Lemma> =
+  if binders == 0 { None } else {
+    match body {
+      None -> None,
+      Some(b) -> match trigger(b, binders, defined) {
+        Some(t) ->
+          Some({
+            law: law,
+            label: label,
+            binders: binders,
+            func: t.func,
+            args: t.args,
+            apart: fold(t.args, false, |any: Bool, x: Code|
+              any || (match x.node { NVar(v) -> v.slot == None, _ -> true })),
+            body: b,
+          }),
+        None -> None,
+      },
+    }
+  }
+
+// Only where the body always goes: not a branch, an arm or the right of `&&` or `||`, and never
+// inside a lambda or a region, whose slots are another frame's.
+fn trigger(c: Code, binders: Int, defined: (String) -> Bool) -> Option<Trigger> =
+  match c.node {
+    NApp(a) -> {
+      let own = match a.func.node {
+        NVar(f) -> {
+          let name = string_of_bytes_lossy(f.name);
+          if f.slot == None && defined(name)
+              && fold(a.args, true, |ok: Bool, x: Code| ok && is_pattern(x, binders))
+              && covers(a.args, binders) { Some({ func: name, args: a.args }) }
+          else { None }
+        },
+        _ -> None,
+      };
+      match own { Some(t) -> Some(t), None -> first(a.args, binders, defined) }
+    },
+    NBinary(b) -> if b.op == b"and" || b.op == b"or" { trigger(b.lhs, binders, defined) }
+    else { first([b.lhs, b.rhs], binders, defined) },
+    NUnary(u) -> trigger(u.operand, binders, defined),
+    NIf(i) -> trigger(i.cond, binders, defined),
+    NMatch(m) -> trigger(m.scrutinee, binders, defined),
+    NBlock(b) -> {
+      let stmts = fold(b.stmts, [], |acc: List<Code>, s: CodeStmt|
+        match s {
+          CLet(l) -> push(acc, l.value),
+          CLetPat(l) -> push(acc, l.value),
+          CDo(d) -> push(acc, d.code),
+        });
+      first(match b.tail { Some(t) -> push(stmts, t), None -> stmts }, binders, defined)
+    },
+    NList(l) -> first(l.items, binders, defined),
+    NRecord(r) -> first(map(r.fields, |f: CodeField| f.value), binders, defined),
+    NField(f) -> trigger(f.base, binders, defined),
+    NUpdate(u) -> first(push(map(u.sets, |f: CodeField| f.value), u.base), binders, defined),
+    NPerform(p) -> first(p.args, binders, defined),
+    _ -> None,
+  }
+
+fn first(cs: List<Code>, binders: Int, defined: (String) -> Bool) -> Option<Trigger> =
+  fold(cs, None, |found: Option<Trigger>, c: Code|
+    match found { Some(_) -> found, None -> trigger(c, binders, defined) })
+
+// What a call can be matched against: binders, globals, literals, and calls and lists of them.
+fn is_pattern(c: Code, binders: Int) -> Bool =
+  match c.node {
+    NVar(v) -> match v.slot { Some(k) -> k < binders, None -> true },
+    NLit(_) -> true,
+    NApp(a) ->
+      (match a.func.node { NVar(f) -> f.slot == None, _ -> false })
+        && fold(a.args, true, |ok: Bool, x: Code| ok && is_pattern(x, binders)),
+    NList(l) -> fold(l.items, true, |ok: Bool, x: Code| ok && is_pattern(x, binders)),
+    _ -> false,
+  }
+
+fn covers(args: List<Code>, binders: Int) -> Bool = {
+  let named = fold(args, [], slots_in);
+  fold(range(0, binders), true, |ok: Bool, k: Int|
+    ok && fold(named, false, |f: Bool, s: Int| f || s == k))
+}
+
+fn slots_in(acc: List<Int>, c: Code) -> List<Int> =
+  match c.node {
+    NVar(v) -> match v.slot { Some(k) -> push(acc, k), None -> acc },
+    NApp(a) -> fold(a.args, acc, slots_in),
+    NList(l) -> fold(l.items, acc, slots_in),
+    _ -> acc,
+  }
