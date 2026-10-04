@@ -1066,27 +1066,54 @@ fn standing(looked: Map<Bytes, Answer>, offered: Map<Bytes, Bool>) -> Map<Bytes,
       else { acc },
     })
 
-fn decoded(bytes: Option<Bytes>) -> Option<Answer> / {abort.raise} =
+// A callee a kept body names, with the key it had. A key reads its callees by hash and the C calls
+// them by name, so two callees that hash alike under two names share a key and not a body.
+type Callee = { name: Bytes, key: Option<Bytes> }
+type Kept = { answer: Answer, callees: List<Callee> }
+
+derive bin for Callee
+derive bin for Kept
+
+fn kept_of(keys: Map<Bytes, Bytes>, a: Answer) -> Kept / {abort.raise} =
+  {
+    answer: a,
+    callees: match a {
+      Body(b) -> map(ordered(b.tables.calls), |c: Bytes| { name: c, key: map_get(keys, c) }),
+      Refused(_) -> [],
+    },
+  }
+
+fn holds(keys: Map<Bytes, Bytes>, callees: List<Callee>) -> Bool =
+  fold(callees, true, |ok: Bool, c: Callee| ok && map_get(keys, c.name) == c.key)
+
+fn decoded(keys: Map<Bytes, Bytes>, bytes: Option<Bytes>) -> Option<Answer> / {abort.raise} =
   match bytes {
     None -> None,
-    Some(b) -> match bin::decode(b, answer_bin()) { Ok(a) -> Some(a), Err(_) -> None },
+    Some(b) -> match bin::decode(b, kept_bin()) {
+      Ok(k) -> if holds(keys, k.callees) { Some(k.answer) } else { None },
+      Err(_) -> None,
+    },
   }
 
 // The bodies a bucket's roots had, kept as one answer so a run reads a file per bucket.
-type Packed = { name: Bytes, answer: Answer }
+type Packed = { name: Bytes, kept: Kept }
 type Pack = { rows: List<Packed> }
 
 derive bin for Packed
 derive bin for Pack
 
-fn unpacked(bytes: Option<Bytes>) -> Option<Map<Bytes, Answer>> / {abort.raise} =
+// A row whose callees moved is a root the pack holds no body for, which the emitter is asked again.
+fn unpacked(
+  keys: Map<Bytes, Bytes>,
+  bytes: Option<Bytes>,
+) -> Option<Map<Bytes, Answer>> / {abort.raise} =
   match bytes {
     None -> None,
     Some(b) -> match bin::decode(b, pack_bin()) {
       Ok(p) ->
         Some(
           fold(p.rows, map_new(), |acc: Map<Bytes, Answer>, r: Packed|
-            map_insert(acc, r.name, r.answer)),
+            if holds(keys, r.kept.callees) { map_insert(acc, r.name, r.kept.answer) } else { acc }),
         ),
       Err(_) -> None,
     },
@@ -1125,11 +1152,12 @@ type Repack = { names: List<Bytes>, pack: Pack }
 // The packs to write: each bucket's that was missing or in which a root gained a body now, holding
 // every body its roots have.
 fn repacked(
+  keys: Map<Bytes, Bytes>,
   buckets: Map<Int, List<Bytes>>,
   packs: Map<Int, Map<Bytes, Answer>>,
   looked: Map<Bytes, Answer>,
   answered: Map<Bytes, Answer>,
-) -> List<Repack> =
+) -> List<Repack> / {abort.raise} =
   map_fold(buckets, [], |acc: List<Repack>, b: Int, names: List<Bytes>| {
     let body_of = |n: Bytes|
       match map_get(answered, n) {
@@ -1144,7 +1172,10 @@ fn repacked(
         names: names,
         pack: {
           rows: fold(names, [], |rows: List<Packed>, n: Bytes|
-            match body_of(n) { Some(a) -> push(rows, { name: n, answer: a }), None -> rows }),
+            match body_of(n) {
+              Some(a) -> push(rows, { name: n, kept: kept_of(keys, a) }),
+              None -> rows,
+            }),
         },
       })
     }
@@ -1265,7 +1296,7 @@ pub fn emitted<| e>(
   // declarations already cover, so one answer serves every program that holds the root.
   let common = [
     b"ply.unit.answer.2",
-    hex(bin::shape_digest(answer_bin())),
+    hex(bin::shape_digest(kept_bin())),
     runtime.identity,
     emitter,
   ];
@@ -1286,13 +1317,17 @@ pub fn emitted<| e>(
     buckets,
     map_new(),
     |acc: Map<Int, Map<Bytes, Answer>>, b: Int, names: List<Bytes>|
-      match unpacked(read(pack_key(names))) {
+      match unpacked(p.keys, read(pack_key(names))) {
         Some(found) -> map_insert(acc, b, found),
         None -> acc,
       },
   );
-  let looked = looked_up(materials, packs, |m: Bytes| decoded(read(body_key(m))), |m: Bytes|
-    decoded(read(refusal_key(m))));
+  let looked = looked_up(
+    materials,
+    packs,
+    |m: Bytes| decoded(p.keys, read(body_key(m))),
+    |m: Bytes| decoded(p.keys, read(refusal_key(m))),
+  );
   let kept = standing(looked, asked);
   let missed = filter(offered, |n: Bytes| !map_contains(kept, n));
   let fresh = if len(missed) == 0 { [] } else {
@@ -1314,11 +1349,11 @@ pub fn emitted<| e>(
       match root_material(p, n) {
         None -> (),
         Some(m) -> match a {
-          Body(_) -> write(body_key(m), bin::encode(a, answer_bin())),
-          Refused(_) -> write(refusal_key(m), bin::encode(a, answer_bin())),
+          Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
+          Refused(_) -> write(refusal_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
         },
       });
-    fold(repacked(buckets, packs, looked, answered), (), |_: Unit, r: Repack|
+    fold(repacked(p.keys, buckets, packs, looked, answered), (), |_: Unit, r: Repack|
       write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
     Ok({
       produced: produce(
@@ -1764,6 +1799,21 @@ test "a bucket's pack answers before a root's own body, and a body before a refu
   assert_eq(map_get(looked, mate), Some(refusal))
 }
 
+test "a kept body stands only where each callee it names still has the key it was filed with" {
+  let keys = map_of_entries([{ key: b"m.b", value: b"kb" }]);
+  let body = one_body(b"m.a", [b"m.b"]);
+  let filed = kept_of(keys, body);
+  assert(holds(keys, filed.callees));
+  // Another tree's callee that hashes alike under another name: the C would call a name not here.
+  assert(!holds(map_of_entries([{ key: b"m.c", value: b"kb" }]), filed.callees));
+  assert(!holds(map_of_entries([{ key: b"m.b", value: b"another" }]), filed.callees));
+  assert_eq(decoded(keys, Some(bin::encode(filed, kept_bin()))), Some(body));
+  assert_eq(decoded(map_new(), Some(bin::encode(filed, kept_bin()))), None);
+  let pack = bin::encode({ rows: [{ name: b"m.a", kept: filed }] }, pack_bin());
+  assert_eq(unpacked(keys, Some(pack)), Some(map_insert(map_new(), b"m.a", body)));
+  assert_eq(unpacked(map_new(), Some(pack)), Some(map_new()))
+}
+
 test "a pack is written again where it was missing or a root in it gained a body" {
   let mate = bucket_mate(b"m.a");
   let refusal = Refused({ why: b"a body the lowering does not reach", handles: [] });
@@ -1779,9 +1829,9 @@ test "a pack is written again where it was missing or a root in it gained a body
     { key: b"m.b", value: one_body(b"m.b", []) },
   ]);
   let rows = |rs: List<Repack>| map(rs, |r: Repack| map(r.pack.rows, |p: Packed| p.name));
-  assert_eq(rows(repacked(buckets, packs, looked, map_new())), [[b"m.b"]]);
+  assert_eq(rows(repacked(map_new(), buckets, packs, looked, map_new())), [[b"m.b"]]);
   let again = rows(
-    repacked(buckets, packs, looked, map_insert(map_new(), mate, one_body(mate, []))),
+    repacked(map_new(), buckets, packs, looked, map_insert(map_new(), mate, one_body(mate, []))),
   );
   assert_eq(len(again), 2);
   assert(fold(again, false, |found: Bool, r: List<Bytes>| found || r == [b"m.a", mate]), None)
