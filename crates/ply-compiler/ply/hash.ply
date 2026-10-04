@@ -3262,8 +3262,15 @@ type Part = {
 type Slot = { part: Int, class: Int }
 type Layout = { parts: List<Part>, by_hash: Map<Bytes, List<Slot>>, relink: Map<Bytes, Bytes> }
 // The import graph the print has laid down so far travels with the printer: a home is chosen
-// with it in view, so a reference never closes a cycle the source did not have.
-type BodyPrinter = { layout: Layout, part: Int, own: Bytes, graph: Map<Bytes, List<Bytes>> }
+// with it in view, so a reference never closes a cycle the source did not have. `room` is how
+// much deeper a body may nest: each level reads a byte, so a definition's length is its room.
+type BodyPrinter = {
+  layout: Layout,
+  part: Int,
+  own: Bytes,
+  graph: Map<Bytes, List<Bytes>>,
+  room: Int,
+}
 type Decoder = {
   bytes: Bytes,
   pos: Int,
@@ -3425,13 +3432,28 @@ fn nameable(layout: Layout, slot: Slot, own: Bytes) -> Bool / {abort.raise} = {
 // Two definitions alike are one body under two names, and only some of those names are in reach:
 // an unreachable one is no candidate at all, since printing it names something that will not
 // resolve rather than something merely further away.
-// Whether `from` reaches `target` along the import edges laid down, `seen` against looping.
-fn reaches(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes, seen: List<Bytes>) -> Bool =
-  if from == target { true }
-  else if contains(seen, from) { false } else {
-    let next = match map_get(g, from) { Some(xs) -> xs, None -> [] };
-    fold(next, false, |found: Bool, m: Bytes| found || reaches(g, m, target, push(seen, from)))
-  }
+// Whether `from` reaches `target` along the import edges laid down. Each round reaches one edge
+// further, and a module past the first round has edges only if it is a key, so the rounds suffice.
+fn reaches(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes) -> Bool = {
+  let walked = fold(
+    range(0, map_len(g) + 1),
+    { seen: [from], frontier: [from] },
+    |acc: { seen: List<Bytes>, frontier: List<Bytes> }, _round: Int|
+      fold(
+        acc.frontier,
+        { seen: acc.seen, frontier: [] },
+        |out: { seen: List<Bytes>, frontier: List<Bytes> }, m: Bytes|
+          fold(
+            match map_get(g, m) { Some(xs) -> xs, None -> [] },
+            out,
+            |o: { seen: List<Bytes>, frontier: List<Bytes> }, n: Bytes|
+              if contains(o.seen, n) { o }
+              else { { seen: push(o.seen, n), frontier: push(o.frontier, n) } },
+          ),
+      ),
+  );
+  contains(walked.seen, target)
+}
 
 fn pick(
   layout: Layout,
@@ -3447,7 +3469,7 @@ fn pick(
   let edges = map_insert(g, own, map_keys(mine));
   let safe = |s: Slot| {
     let p = at(layout.parts, s.part);
-    p.module == own || map_contains(mine, p.module) || !reaches(edges, p.module, own, [])
+    p.module == own || map_contains(mine, p.module) || !reaches(edges, p.module, own)
   };
   let score = |s: Slot| {
     let p = at(layout.parts, s.part);
@@ -3548,54 +3570,56 @@ fn read_effect(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise
     }
   }
 
-fn print_type(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} = {
-  let t = read_u8(d);
-  if t.value == tag_ty_con() {
-    if peek(t.decoder) == tag_ty_param() {
-      let l = read_u32(skip(t.decoder));
-      let n = read_u32(l.decoder);
-      if l.value >= d.types || n.value != 0 { panic("a type parameter out of scope, or applied") }
-      else { { decoder: n.decoder, text: type_var_name(l.value) } }
-    } else {
-      let name = if is_free(t.decoder) { read_free(t.decoder) }
-      else { qname(printer, read_ref(printer, t.decoder), None) };
-      let n = read_count(name.decoder);
-      let args = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
-      // A bare lowercase name reads back as a type variable, so it keeps an empty `<>`.
-      let bare = match bytes_index_of(name.text, b"::") { Some(_) -> false, None -> true };
-      {
-        decoder: args.decoder,
-        text: if n.value > 0 || (bare && !is_ctor_name(name.text)) {
-          bytes_concat_all([name.text, b"<", joined(args.texts, b", "), b">"])
-        } else { name.text },
+fn print_type(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
+  if outer.room <= 0 { panic("a body nested deeper than its own length") } else {
+    let printer = { ..outer, room: outer.room - 1 };
+    let t = read_u8(d);
+    if t.value == tag_ty_con() {
+      if peek(t.decoder) == tag_ty_param() {
+        let l = read_u32(skip(t.decoder));
+        let n = read_u32(l.decoder);
+        if l.value >= d.types || n.value != 0 { panic("a type parameter out of scope, or applied") }
+        else { { decoder: n.decoder, text: type_var_name(l.value) } }
+      } else {
+        let name = if is_free(t.decoder) { read_free(t.decoder) }
+        else { qname(printer, read_ref(printer, t.decoder), None) };
+        let n = read_count(name.decoder);
+        let args = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
+        // A bare lowercase name reads back as a type variable, so it keeps an empty `<>`.
+        let bare = match bytes_index_of(name.text, b"::") { Some(_) -> false, None -> true };
+        {
+          decoder: args.decoder,
+          text: if n.value > 0 || (bare && !is_ctor_name(name.text)) {
+            bytes_concat_all([name.text, b"<", joined(args.texts, b", "), b">"])
+          } else { name.text },
+        }
       }
-    }
-  } else if t.value == tag_ty_fn() {
-    let n = read_count(t.decoder);
-    let ps = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
-    let ret = print_ret(printer, ps.decoder);
-    let row = read_opt(ret.decoder, |e: Decoder| print_row(printer, e));
-    {
-      decoder: row.decoder,
-      text: bytes_concat_all([
-        b"(",
-        joined(ps.texts, b", "),
-        b") -> ",
-        ret.text,
-        prefixed(row, b" / "),
-      ]),
-    }
-  } else if t.value == tag_ty_record() {
-    let n = read_count(t.decoder);
-    let fs = read_many(n.decoder, n.value, |e: Decoder| {
-      let f = read_text(e);
-      let ty = print_type(printer, f.decoder);
-      { decoder: ty.decoder, text: bytes_concat_all([f.text, b": ", ty.text]) }
-    });
-    { decoder: fs.decoder, text: bytes_concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
-  } else if t.value == tag_ty_unit() { { decoder: t.decoder, text: b"()" } }
-  else { panic("a tag that does not begin a type") }
-}
+    } else if t.value == tag_ty_fn() {
+      let n = read_count(t.decoder);
+      let ps = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
+      let ret = print_ret(printer, ps.decoder);
+      let row = read_opt(ret.decoder, |e: Decoder| print_row(printer, e));
+      {
+        decoder: row.decoder,
+        text: bytes_concat_all([
+          b"(",
+          joined(ps.texts, b", "),
+          b") -> ",
+          ret.text,
+          prefixed(row, b" / "),
+        ]),
+      }
+    } else if t.value == tag_ty_record() {
+      let n = read_count(t.decoder);
+      let fs = read_many(n.decoder, n.value, |e: Decoder| {
+        let f = read_text(e);
+        let ty = print_type(printer, f.decoder);
+        { decoder: ty.decoder, text: bytes_concat_all([f.text, b": ", ty.text]) }
+      });
+      { decoder: fs.decoder, text: bytes_concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
+    } else if t.value == tag_ty_unit() { { decoder: t.decoder, text: b"()" } }
+    else { panic("a tag that does not begin a type") }
+  }
 
 // After `->` a function type is parenthesized, or a row after it would bind to the inner arrow.
 fn print_ret(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise} =
@@ -3894,59 +3918,61 @@ fn print_lit(decoder: Decoder) -> Decoded / {abort.raise} = {
   else { panic("a tag that is not a literal") }
 }
 
-fn print_pat(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} = {
-  let t = read_u8(d);
-  let e: Decoder = t.decoder;
-  if t.value == tag_p_wildcard() { { decoder: e, text: b"_" } } else if t.value == tag_p_var() {
-    { decoder: { ..e, values: e.values + 1 }, text: local_name(e.values) }
-  } else if t.value == tag_p_lit() { print_lit(e) } else if t.value == tag_p_ctor() {
-    let name = read_ctor(printer, e);
-    let n = read_count(name.decoder);
-    let args = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
-    {
-      decoder: args.decoder,
-      text: if n.value == 0 { name.text }
-      else { bytes_concat_all([name.text, b"(", joined(args.texts, b", "), b")"]) },
-    }
-  } else if t.value == tag_p_record() {
-    let n = read_count(e);
-    let fs = read_many(n.decoder, n.value, |g: Decoder| {
-      let f = read_text(g);
-      let p = print_pat(printer, f.decoder);
-      { decoder: p.decoder, text: bytes_concat_all([f.text, b": ", p.text]) }
-    });
-    let rest = read_bool(fs.decoder);
-    {
-      decoder: rest.decoder,
-      text: bytes_concat_all([
-        b"{",
-        joined(fs.texts, b", "),
-        if !rest.value { b"" } else if n.value > 0 { b", .." } else { b".." },
-        b"}",
-      ]),
-    }
-  } else if t.value == tag_p_list() {
-    let n = read_count(e);
-    let items = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
-    let named = peek(skip(items.decoder)) == tag_p_var();
-    let rest = read_opt(items.decoder, |g: Decoder| print_pat(printer, g));
-    {
-      decoder: rest.decoder,
-      text: bytes_concat_all([
-        b"[",
-        joined(items.texts, b", "),
-        if !rest.some { b"" } else {
-          bytes_concat_all([
-            if n.value > 0 { b", " } else { b"" },
-            b"..",
-            if named { rest.text } else { b"" },
-          ])
-        },
-        b"]",
-      ]),
-    }
-  } else { panic("a tag that does not begin a pattern") }
-}
+fn print_pat(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
+  if outer.room <= 0 { panic("a body nested deeper than its own length") } else {
+    let printer = { ..outer, room: outer.room - 1 };
+    let t = read_u8(d);
+    let e: Decoder = t.decoder;
+    if t.value == tag_p_wildcard() { { decoder: e, text: b"_" } } else if t.value == tag_p_var() {
+      { decoder: { ..e, values: e.values + 1 }, text: local_name(e.values) }
+    } else if t.value == tag_p_lit() { print_lit(e) } else if t.value == tag_p_ctor() {
+      let name = read_ctor(printer, e);
+      let n = read_count(name.decoder);
+      let args = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
+      {
+        decoder: args.decoder,
+        text: if n.value == 0 { name.text }
+        else { bytes_concat_all([name.text, b"(", joined(args.texts, b", "), b")"]) },
+      }
+    } else if t.value == tag_p_record() {
+      let n = read_count(e);
+      let fs = read_many(n.decoder, n.value, |g: Decoder| {
+        let f = read_text(g);
+        let p = print_pat(printer, f.decoder);
+        { decoder: p.decoder, text: bytes_concat_all([f.text, b": ", p.text]) }
+      });
+      let rest = read_bool(fs.decoder);
+      {
+        decoder: rest.decoder,
+        text: bytes_concat_all([
+          b"{",
+          joined(fs.texts, b", "),
+          if !rest.value { b"" } else if n.value > 0 { b", .." } else { b".." },
+          b"}",
+        ]),
+      }
+    } else if t.value == tag_p_list() {
+      let n = read_count(e);
+      let items = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
+      let named = peek(skip(items.decoder)) == tag_p_var();
+      let rest = read_opt(items.decoder, |g: Decoder| print_pat(printer, g));
+      {
+        decoder: rest.decoder,
+        text: bytes_concat_all([
+          b"[",
+          joined(items.texts, b", "),
+          if !rest.some { b"" } else {
+            bytes_concat_all([
+              if n.value > 0 { b", " } else { b"" },
+              b"..",
+              if named { rest.text } else { b"" },
+            ])
+          },
+          b"]",
+        ]),
+      }
+    } else { panic("a tag that does not begin a pattern") }
+  }
 
 fn parens(decoded: Decoded, bare: Bool) -> Decoded =
   if bare { decoded }
@@ -4029,256 +4055,260 @@ fn print_if(printer: BodyPrinter, decoder: Decoder, depth: Int) -> Decoded / {ab
   { decoder: tail.decoder, text: bytes_concat_all([b"if ", c.text, b" ", th.text, tail.text]) }
 }
 
-fn print_expr(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.raise} = {
-  let t = read_u8(d);
-  let e = t.decoder;
-  let inner = depth + 1;
-  if t.value == tag_e_lit() { print_lit(e) }
-  else if t.value == tag_e_var() { read_value(printer, e) } else if t.value == tag_e_binary() {
-    let op = read_u8(e);
-    let l = print_operand(printer, op.decoder, depth);
-    let r = print_operand(printer, l.decoder, depth);
-    {
-      decoder: r.decoder,
-      text: bytes_concat_all([l.text, b" ", binop_text(op.value), b" ", r.text]),
-    }
-  } else if t.value == tag_e_unary() {
-    let op = read_u8(e);
-    let o = print_operand(printer, op.decoder, depth);
-    { decoder: o.decoder, text: bytes_concat(unop_text(op.value), o.text) }
-  } else if t.value == tag_e_lambda() {
-    let n = read_count(e);
-    let anns: DecodedList = read_many(n.decoder, n.value, |g: Decoder| {
-      let o = read_opt(g, |h: Decoder| print_type(printer, h));
-      { decoder: o.decoder, text: prefixed(o, b": ") }
-    });
-    let base = anns.decoder.values;
-    let body: Decoded = print_expr(printer, { ..anns.decoder, values: base + n.value }, depth);
-    let ps = map(range(0, n.value), |i: Int| bytes_concat(local_name(base + i), at(anns.texts, i)));
-    {
-      decoder: { ..body.decoder, values: base },
-      text: bytes_concat_all([
-        if n.value == 0 { b"||" } else { bytes_concat_all([b"|", joined(ps, b", "), b"|"]) },
-        b" ",
-        body.text,
-      ]),
-    }
-  } else if t.value == tag_e_app() {
-    // `r.f(x)` performs an effect, so a call through anything but a name is parenthesized.
-    let f = parens(print_expr(printer, e, depth), peek(e) == tag_e_var());
-    let n = read_count(f.decoder);
-    let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
-    let ln = read_count(args.decoder);
-    let ls = read_many(ln.decoder, ln.value, read_label);
-    {
-      decoder: ls.decoder,
-      text: bytes_concat_all([
-        f.text,
-        if ln.value == 0 { b"" } else { bytes_concat_all([b"[", joined(ls.texts, b", "), b"]"]) },
-        b"(",
-        joined(args.texts, b", "),
-        b")",
-      ]),
-    }
-  } else if t.value == tag_e_if() { print_if(printer, e, depth) } else if t.value == tag_e_match() {
-    let s = print_operand(printer, e, depth);
-    let n = read_count(s.decoder);
-    let arms = read_many(n.decoder, n.value, |g: Decoder| {
-      let p = print_pat(printer, expect(g, tag_arm(), b"a match arm"));
-      let guard = read_opt(p.decoder, |h: Decoder| print_expr(printer, h, inner));
-      let body: Decoded = print_expr(printer, guard.decoder, inner);
+fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.raise} =
+  if outer.room <= 0 { panic("a body nested deeper than its own length") } else {
+    let printer = { ..outer, room: outer.room - 1 };
+    let t = read_u8(d);
+    let e = t.decoder;
+    let inner = depth + 1;
+    if t.value == tag_e_lit() { print_lit(e) }
+    else if t.value == tag_e_var() { read_value(printer, e) } else if t.value == tag_e_binary() {
+      let op = read_u8(e);
+      let l = print_operand(printer, op.decoder, depth);
+      let r = print_operand(printer, l.decoder, depth);
       {
-        decoder: { ..body.decoder, values: g.values },
+        decoder: r.decoder,
+        text: bytes_concat_all([l.text, b" ", binop_text(op.value), b" ", r.text]),
+      }
+    } else if t.value == tag_e_unary() {
+      let op = read_u8(e);
+      let o = print_operand(printer, op.decoder, depth);
+      { decoder: o.decoder, text: bytes_concat(unop_text(op.value), o.text) }
+    } else if t.value == tag_e_lambda() {
+      let n = read_count(e);
+      let anns: DecodedList = read_many(n.decoder, n.value, |g: Decoder| {
+        let o = read_opt(g, |h: Decoder| print_type(printer, h));
+        { decoder: o.decoder, text: prefixed(o, b": ") }
+      });
+      let base = anns.decoder.values;
+      let body: Decoded = print_expr(printer, { ..anns.decoder, values: base + n.value }, depth);
+      let ps = map(range(0, n.value), |i: Int|
+        bytes_concat(local_name(base + i), at(anns.texts, i)));
+      {
+        decoder: { ..body.decoder, values: base },
         text: bytes_concat_all([
-          line_break(inner),
-          p.text,
-          prefixed(guard, b" if "),
-          b" -> ",
+          if n.value == 0 { b"||" } else { bytes_concat_all([b"|", joined(ps, b", "), b"|"]) },
+          b" ",
           body.text,
-          b",",
         ]),
       }
-    });
-    {
-      decoder: arms.decoder,
-      text: bytes_concat_all([
-        b"match ",
-        s.text,
-        b" {",
-        bytes_concat_all(arms.texts),
-        line_break(depth),
-        b"}",
-      ]),
-    }
-  } else if t.value == tag_e_block() {
-    let n = read_count(e);
-    let stmts = read_many(n.decoder, n.value, |g: Decoder| {
-      let s = print_stmt(printer, g, inner);
-      { decoder: s.decoder, text: bytes_concat(line_break(inner), s.text) }
-    });
-    let tail: DecodedOption = read_opt(stmts.decoder, |g: Decoder| print_expr(printer, g, inner));
-    {
-      decoder: { ..tail.decoder, values: e.values },
-      text: bytes_concat_all([
-        b"{",
-        bytes_concat_all(stmts.texts),
-        prefixed(tail, line_break(inner)),
-        line_break(depth),
-        b"}",
-      ]),
-    }
-  } else if t.value == tag_e_record() {
-    let n = read_count(e);
-    let fs = read_many(n.decoder, n.value, |g: Decoder| {
-      let f = read_text(g);
-      let v = print_expr(printer, f.decoder, depth);
-      { decoder: v.decoder, text: bytes_concat_all([f.text, b": ", v.text]) }
-    });
-    { decoder: fs.decoder, text: bytes_concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
-  } else if t.value == tag_e_record_update() {
-    let b = print_expr(printer, e, depth);
-    let n = read_count(b.decoder);
-    let fs = read_many(n.decoder, n.value, |g: Decoder| {
-      let f = read_text(g);
-      let v = print_expr(printer, f.decoder, depth);
-      { decoder: v.decoder, text: bytes_concat_all([f.text, b": ", v.text]) }
-    });
-    {
-      decoder: fs.decoder,
-      text: bytes_concat_all([
-        b"{..",
-        b.text,
-        if n.value > 0 { b", " } else { b"" },
-        joined(fs.texts, b", "),
-        b"}",
-      ]),
-    }
-  } else if t.value == tag_e_field() {
-    let b = parens(print_expr(printer, e, depth), is_base(e));
-    let f = read_text(b.decoder);
-    { decoder: f.decoder, text: bytes_concat_all([b.text, b".", f.text]) }
-  } else if t.value == tag_e_list() {
-    let n = read_count(e);
-    let items = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
-    { decoder: items.decoder, text: bytes_concat_all([b"[", joined(items.texts, b", "), b"]"]) }
-  } else if t.value == tag_e_perform() {
-    let eff = read_effect(printer, e);
-    let op = read_text(eff.decoder);
-    let r = read_opt(op.decoder, read_label);
-    let n = read_count(r.decoder);
-    let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
-    {
-      decoder: args.decoder,
-      text: bytes_concat_all([
-        eff.text,
-        b".",
-        op.text,
-        bracketed(r),
-        b"(",
-        joined(args.texts, b", "),
-        b")",
-      ]),
-    }
-  } else if t.value == tag_e_handle() {
-    let body = print_expr(printer, e, depth);
-    let n = read_count(body.decoder);
-    let clauses = read_many(n.decoder, n.value, |g: Decoder| {
-      let eff = read_effect(printer, expect(g, tag_clause(), b"a handler clause"));
+    } else if t.value == tag_e_app() {
+      // `r.f(x)` performs an effect, so a call through anything but a name is parenthesized.
+      let f = parens(print_expr(printer, e, depth), peek(e) == tag_e_var());
+      let n = read_count(f.decoder);
+      let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+      let ln = read_count(args.decoder);
+      let ls = read_many(ln.decoder, ln.value, read_label);
+      {
+        decoder: ls.decoder,
+        text: bytes_concat_all([
+          f.text,
+          if ln.value == 0 { b"" } else { bytes_concat_all([b"[", joined(ls.texts, b", "), b"]"]) },
+          b"(",
+          joined(args.texts, b", "),
+          b")",
+        ]),
+      }
+    } else if t.value == tag_e_if() { print_if(printer, e, depth) }
+    else if t.value == tag_e_match() {
+      let s = print_operand(printer, e, depth);
+      let n = read_count(s.decoder);
+      let arms = read_many(n.decoder, n.value, |g: Decoder| {
+        let p = print_pat(printer, expect(g, tag_arm(), b"a match arm"));
+        let guard = read_opt(p.decoder, |h: Decoder| print_expr(printer, h, inner));
+        let body: Decoded = print_expr(printer, guard.decoder, inner);
+        {
+          decoder: { ..body.decoder, values: g.values },
+          text: bytes_concat_all([
+            line_break(inner),
+            p.text,
+            prefixed(guard, b" if "),
+            b" -> ",
+            body.text,
+            b",",
+          ]),
+        }
+      });
+      {
+        decoder: arms.decoder,
+        text: bytes_concat_all([
+          b"match ",
+          s.text,
+          b" {",
+          bytes_concat_all(arms.texts),
+          line_break(depth),
+          b"}",
+        ]),
+      }
+    } else if t.value == tag_e_block() {
+      let n = read_count(e);
+      let stmts = read_many(n.decoder, n.value, |g: Decoder| {
+        let s = print_stmt(printer, g, inner);
+        { decoder: s.decoder, text: bytes_concat(line_break(inner), s.text) }
+      });
+      let tail: DecodedOption = read_opt(stmts.decoder, |g: Decoder| print_expr(printer, g, inner));
+      {
+        decoder: { ..tail.decoder, values: e.values },
+        text: bytes_concat_all([
+          b"{",
+          bytes_concat_all(stmts.texts),
+          prefixed(tail, line_break(inner)),
+          line_break(depth),
+          b"}",
+        ]),
+      }
+    } else if t.value == tag_e_record() {
+      let n = read_count(e);
+      let fs = read_many(n.decoder, n.value, |g: Decoder| {
+        let f = read_text(g);
+        let v = print_expr(printer, f.decoder, depth);
+        { decoder: v.decoder, text: bytes_concat_all([f.text, b": ", v.text]) }
+      });
+      { decoder: fs.decoder, text: bytes_concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
+    } else if t.value == tag_e_record_update() {
+      let b = print_expr(printer, e, depth);
+      let n = read_count(b.decoder);
+      let fs = read_many(n.decoder, n.value, |g: Decoder| {
+        let f = read_text(g);
+        let v = print_expr(printer, f.decoder, depth);
+        { decoder: v.decoder, text: bytes_concat_all([f.text, b": ", v.text]) }
+      });
+      {
+        decoder: fs.decoder,
+        text: bytes_concat_all([
+          b"{..",
+          b.text,
+          if n.value > 0 { b", " } else { b"" },
+          joined(fs.texts, b", "),
+          b"}",
+        ]),
+      }
+    } else if t.value == tag_e_field() {
+      let b = parens(print_expr(printer, e, depth), is_base(e));
+      let f = read_text(b.decoder);
+      { decoder: f.decoder, text: bytes_concat_all([b.text, b".", f.text]) }
+    } else if t.value == tag_e_list() {
+      let n = read_count(e);
+      let items = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+      { decoder: items.decoder, text: bytes_concat_all([b"[", joined(items.texts, b", "), b"]"]) }
+    } else if t.value == tag_e_perform() {
+      let eff = read_effect(printer, e);
       let op = read_text(eff.decoder);
       let r = read_opt(op.decoder, read_label);
-      let k: DecodedInt = read_binders(r.decoder);
-      let bound = g.values + k.value;
-      let resumed: DecodedOption = read_opt({ ..k.decoder, values: bound }, |h: Decoder|
-        { decoder: h, text: bytes_concat(b" resume ", local_name(bound)) });
-      let cb: Decoded = print_expr(
-        printer,
-        { ..resumed.decoder, values: if resumed.some { bound + 1 } else { bound } },
-        inner,
-      );
+      let n = read_count(r.decoder);
+      let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
       {
-        decoder: { ..cb.decoder, values: g.values },
+        decoder: args.decoder,
         text: bytes_concat_all([
-          line_break(inner),
           eff.text,
           b".",
           op.text,
           bracketed(r),
           b"(",
-          joined(map(range(0, k.value), |i: Int| local_name(g.values + i)), b", "),
+          joined(args.texts, b", "),
           b")",
-          resumed.text,
-          b" -> ",
-          cb.text,
-          b",",
         ]),
       }
-    });
-    let ret = read_opt(clauses.decoder, |g: Decoder| {
-      let h: Decoder = expect(g, tag_return_clause(), b"a return clause");
-      let rb: Decoded = print_expr(printer, { ..h, values: g.values + 1 }, inner);
+    } else if t.value == tag_e_handle() {
+      let body = print_expr(printer, e, depth);
+      let n = read_count(body.decoder);
+      let clauses = read_many(n.decoder, n.value, |g: Decoder| {
+        let eff = read_effect(printer, expect(g, tag_clause(), b"a handler clause"));
+        let op = read_text(eff.decoder);
+        let r = read_opt(op.decoder, read_label);
+        let k: DecodedInt = read_binders(r.decoder);
+        let bound = g.values + k.value;
+        let resumed: DecodedOption = read_opt({ ..k.decoder, values: bound }, |h: Decoder|
+          { decoder: h, text: bytes_concat(b" resume ", local_name(bound)) });
+        let cb: Decoded = print_expr(
+          printer,
+          { ..resumed.decoder, values: if resumed.some { bound + 1 } else { bound } },
+          inner,
+        );
+        {
+          decoder: { ..cb.decoder, values: g.values },
+          text: bytes_concat_all([
+            line_break(inner),
+            eff.text,
+            b".",
+            op.text,
+            bracketed(r),
+            b"(",
+            joined(map(range(0, k.value), |i: Int| local_name(g.values + i)), b", "),
+            b")",
+            resumed.text,
+            b" -> ",
+            cb.text,
+            b",",
+          ]),
+        }
+      });
+      let ret = read_opt(clauses.decoder, |g: Decoder| {
+        let h: Decoder = expect(g, tag_return_clause(), b"a return clause");
+        let rb: Decoded = print_expr(printer, { ..h, values: g.values + 1 }, inner);
+        {
+          decoder: { ..rb.decoder, values: g.values },
+          text: bytes_concat_all([
+            line_break(inner),
+            b"return ",
+            local_name(g.values),
+            b" -> ",
+            rb.text,
+            b",",
+          ]),
+        }
+      });
       {
-        decoder: { ..rb.decoder, values: g.values },
+        decoder: ret.decoder,
         text: bytes_concat_all([
-          line_break(inner),
-          b"return ",
-          local_name(g.values),
-          b" -> ",
-          rb.text,
-          b",",
+          b"handle ",
+          body.text,
+          b" with {",
+          bytes_concat_all(clauses.texts),
+          ret.text,
+          line_break(depth),
+          b"}",
         ]),
       }
-    });
-    {
-      decoder: ret.decoder,
-      text: bytes_concat_all([
-        b"handle ",
-        body.text,
-        b" with {",
-        bytes_concat_all(clauses.texts),
-        ret.text,
-        line_break(depth),
-        b"}",
-      ]),
+    } else if t.value == tag_e_with_cell() {
+      let r = read_text(e);
+      let init: Decoded = print_expr(printer, r.decoder, depth);
+      let level = init.decoder.values;
+      let body: Decoded = print_expr(printer, { ..init.decoder, values: level + 1 }, inner);
+      {
+        decoder: { ..body.decoder, values: level },
+        text: bytes_concat_all([
+          b"with_cell[",
+          r.text,
+          b"](",
+          init.text,
+          b") {",
+          line_break(inner),
+          local_name(level),
+          b" -> ",
+          body.text,
+          line_break(depth),
+          b"}",
+        ]),
+      }
+    } else if t.value == tag_e_simulate() {
+      let body = print_block(printer, e, depth);
+      { decoder: body.decoder, text: bytes_concat(b"simulate ", body.text) }
+    } else if t.value == tag_e_parallel() {
+      let n = read_count(e);
+      let branches = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+      {
+        decoder: branches.decoder,
+        text: bytes_concat_all([b"parallel { ", joined(branches.texts, b", "), b" }"]),
+      }
+    } else {
+      panic(
+        string_of_bytes(
+          bytes_concat(b"a tag that does not begin an expression: ", int_to_bytes(t.value)),
+        ),
+      )
     }
-  } else if t.value == tag_e_with_cell() {
-    let r = read_text(e);
-    let init: Decoded = print_expr(printer, r.decoder, depth);
-    let level = init.decoder.values;
-    let body: Decoded = print_expr(printer, { ..init.decoder, values: level + 1 }, inner);
-    {
-      decoder: { ..body.decoder, values: level },
-      text: bytes_concat_all([
-        b"with_cell[",
-        r.text,
-        b"](",
-        init.text,
-        b") {",
-        line_break(inner),
-        local_name(level),
-        b" -> ",
-        body.text,
-        line_break(depth),
-        b"}",
-      ]),
-    }
-  } else if t.value == tag_e_simulate() {
-    let body = print_block(printer, e, depth);
-    { decoder: body.decoder, text: bytes_concat(b"simulate ", body.text) }
-  } else if t.value == tag_e_parallel() {
-    let n = read_count(e);
-    let branches = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
-    {
-      decoder: branches.decoder,
-      text: bytes_concat_all([b"parallel { ", joined(branches.texts, b", "), b" }"]),
-    }
-  } else {
-    panic(
-      string_of_bytes(
-        bytes_concat(b"a tag that does not begin an expression: ", int_to_bytes(t.value)),
-      ),
-    )
   }
-}
 
 fn print_stmt(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.raise} = {
   let t = read_u8(d);
@@ -4451,7 +4481,8 @@ fn print_effect(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abo
 }
 
 // Everything is `pub`: visibility is metadata the encoding erased.
-fn print_item(printer: BodyPrinter, decoder: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
+fn print_item(unsized: BodyPrinter, decoder: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
+  let printer = { ..unsized, room: bytes_len(decoder.bytes) };
   let t = peek(decoder);
   let g = if t == tag_fn() { print_fn(printer, decoder, name) }
   else if t == tag_type() { print_type_def(printer, decoder, name) }
@@ -4461,7 +4492,8 @@ fn print_item(printer: BodyPrinter, decoder: Decoder, name: Bytes) -> Decoded / 
   else { { decoder: g.decoder, text: bytes_concat(b"pub ", g.text) } }
 }
 
-fn print_test(printer: BodyPrinter, decoder: Decoder, label: Bytes) -> Decoded / {abort.raise} = {
+fn print_test(unsized: BodyPrinter, decoder: Decoder, label: Bytes) -> Decoded / {abort.raise} = {
+  let printer = { ..unsized, room: bytes_len(decoder.bytes) };
   let nd = read_bool(expect(decoder, tag_test(), b"a test"));
   let body = print_block(printer, nd.decoder, 0);
   if body.decoder.pos != bytes_len(body.decoder.bytes) { panic("bytes remain after the test") }
@@ -4754,7 +4786,7 @@ fn print_parts(
     |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
       let p = at(layout.parts, u);
       if !p.printed { acc } else {
-        let x = { layout: layout, part: u, own: p.module, graph: acc.graph };
+        let x = { layout: layout, part: u, own: p.module, graph: acc.graph, room: 0 };
         let walked = fold(
           range(0, len(p.members)),
           { decoder: cursor(b"", acc.missing), texts: [] },
@@ -4798,7 +4830,7 @@ fn print_tests(
   tests: List<Bytes>,
   missing: Map<Bytes, Bool>,
 ) -> DecodedList / {abort.raise} = {
-  let x = { layout: layout, part: 0 - 1, own: b"", graph: g };
+  let x = { layout: layout, part: 0 - 1, own: b"", graph: g, room: 0 };
   fold(
     range(0, len(tests)),
     { decoder: cursor(b"", missing), texts: [] },
@@ -4956,15 +4988,7 @@ fn dumped_hash(dump: String, name: Bytes) -> Bytes / {abort.raise} = {
 
 // `text` with every `from` written as `to`.
 fn swapped(text: Bytes, from: Bytes, to: Bytes) -> Bytes / {abort.raise} =
-  match bytes_index_of(text, from) {
-    None -> text,
-    Some(i) ->
-      bytes_concat_all([
-        bytes_slice(text, 0, i),
-        to,
-        swapped(bytes_slice(text, i + bytes_len(from), bytes_len(text)), from, to),
-      ]),
-  }
+  if bytes_len(from) == 0 { panic("nothing to swap") } else { joined(bytes_split(text, from), to) }
 
 fn primed_m(changed: Bytes) -> Source =
   {

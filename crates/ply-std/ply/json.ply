@@ -133,18 +133,20 @@ fn array_value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {a
     Err(error_at(i, "nested deeper than " ++ int_to_string(max_depth()) ++ " levels"))
   } else { array_start(src, skip_ws(src, i + 1), depth + 1) }
 
+// An item and its comma take two bytes at least, so the bytes left bound the items: `left`.
 fn array_start(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
   if at(src, i) == 93 { Ok({ value: Array([]), next: i + 1 }) }
-  else { array_items(src, i, depth, []) }
+  else { array_items(src, i, depth, [], bytes_len(src) - i) }
 
 reuse fn array_items(
   src: Bytes,
   i: Int,
   depth: Int,
   acc: List<Json>,
+  left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
   let step = value(src, i, depth)?;
-  array_more(src, step, depth, push(acc, step.value))
+  array_more(src, step, depth, push(acc, step.value), left)
 }
 
 fn array_more(
@@ -152,11 +154,14 @@ fn array_more(
   step: Step,
   depth: Int,
   items: List<Json>,
+  left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
   let j = skip_ws(src, step.next);
   let c = at(src, j);
-  if c == 44 { array_items(src, skip_ws(src, j + 1), depth, items) }
-  else if c == 93 { Ok({ value: Array(items), next: j + 1 }) }
+  if c == 44 {
+    if left <= 0 { panic("more items than bytes") }
+    else { array_items(src, skip_ws(src, j + 1), depth, items, left - 1) }
+  } else if c == 93 { Ok({ value: Array(items), next: j + 1 }) }
   else { Err(error_at(j, "expected `,` or `]` in an array")) }
 }
 
@@ -167,19 +172,21 @@ fn object_value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {
     Err(error_at(i, "nested deeper than " ++ int_to_string(max_depth()) ++ " levels"))
   } else { object_start(src, skip_ws(src, i + 1), depth + 1) }
 
+// `left` as in `array_start`.
 fn object_start(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
   if at(src, i) == 125 { Ok({ value: Object(map_new()), next: i + 1 }) }
-  else { object_members(src, i, depth, map_new()) }
+  else { object_members(src, i, depth, map_new(), bytes_len(src) - i) }
 
 fn object_members(
   src: Bytes,
   i: Int,
   depth: Int,
   acc: Map<String, Json>,
+  left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} =
   if at(src, i) != 34 { Err(error_at(i, "an object key must be a quoted string")) } else {
     let key = string_body(src, i + 1)?;
-    object_colon(src, key, depth, acc)
+    object_colon(src, key, depth, acc, left)
   }
 
 fn object_colon(
@@ -187,10 +194,11 @@ fn object_colon(
   key: Text,
   depth: Int,
   acc: Map<String, Json>,
+  left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
   let j = skip_ws(src, key.next);
   if at(src, j) != 58 { Err(error_at(j, "expected `:` after an object key")) }
-  else { object_member(src, key.text, skip_ws(src, j + 1), depth, acc) }
+  else { object_member(src, key.text, skip_ws(src, j + 1), depth, acc, left) }
 }
 
 // A repeated key keeps the last value, as every mainstream JSON parser does.
@@ -200,9 +208,10 @@ fn object_member(
   i: Int,
   depth: Int,
   acc: Map<String, Json>,
+  left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
   let step = value(src, i, depth)?;
-  object_more(src, step, depth, map_insert(acc, key, step.value))
+  object_more(src, step, depth, map_insert(acc, key, step.value), left)
 }
 
 fn object_more(
@@ -210,11 +219,14 @@ fn object_more(
   step: Step,
   depth: Int,
   members: Map<String, Json>,
+  left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
   let j = skip_ws(src, step.next);
   let c = at(src, j);
-  if c == 44 { object_members(src, skip_ws(src, j + 1), depth, members) }
-  else if c == 125 { Ok({ value: Object(members), next: j + 1 }) }
+  if c == 44 {
+    if left <= 0 { panic("more members than bytes") }
+    else { object_members(src, skip_ws(src, j + 1), depth, members, left - 1) }
+  } else if c == 125 { Ok({ value: Object(members), next: j + 1 }) }
   else { Err(error_at(j, "expected `,` or `}` in an object")) }
 }
 
@@ -229,23 +241,34 @@ fn string_value(src: Bytes, i: Int) -> Result<Step, DecodeError> / {abort.raise}
   Ok({ value: Str(t.text), next: t.next })
 }
 
-// `i` is the first byte of the content, one past the opening quote.
+// `i` is the first byte of the content, one past the opening quote. An escape takes two bytes at
+// least, so the bytes left bound the escapes: `left`.
 fn string_body(src: Bytes, i: Int) -> Result<Text, DecodeError> / {abort.raise} =
-  string_chunks(src, i, b"")
+  string_chunks(src, i, b"", bytes_len(src) - i)
 
 // One native scan per run, so the recursion runs once per escape rather than once per byte.
-fn string_chunks(src: Bytes, i: Int, acc: Bytes) -> Result<Text, DecodeError> / {abort.raise} = {
+fn string_chunks(
+  src: Bytes,
+  i: Int,
+  acc: Bytes,
+  left: Int,
+) -> Result<Text, DecodeError> / {abort.raise} = {
   let n = bytes_len(src);
   let stop = scan_until(src, i, string_stops());
   if stop >= n { Err(error_at(i, "this string is never closed")) }
-  else { string_stop(src, stop, bytes_concat(acc, bytes_slice(src, i, stop))) }
+  else { string_stop(src, stop, bytes_concat(acc, bytes_slice(src, i, stop)), left) }
 }
 
 // `string_of_bytes` cannot fail: valid UTF-8 input, cuts at ASCII bytes, no surrogate escapes.
-fn string_stop(src: Bytes, stop: Int, so_far: Bytes) -> Result<Text, DecodeError> / {abort.raise} = {
+fn string_stop(
+  src: Bytes,
+  stop: Int,
+  so_far: Bytes,
+  left: Int,
+) -> Result<Text, DecodeError> / {abort.raise} = {
   let c = bytes_at(src, stop);
   if c == 34 { Ok({ text: string_of_bytes(so_far), next: stop + 1 }) }
-  else if c == 92 { string_escape(src, stop, so_far) }
+  else if c == 92 { string_escape(src, stop, so_far, left) }
   else { Err(error_at(stop, "a control character must be written as an escape inside a string")) }
 }
 
@@ -253,9 +276,11 @@ fn string_escape(
   src: Bytes,
   stop: Int,
   so_far: Bytes,
+  left: Int,
 ) -> Result<Text, DecodeError> / {abort.raise} = {
   let p = escape(src, stop + 1)?;
-  string_chunks(src, p.next, bytes_concat(so_far, p.bytes))
+  if left <= 0 { panic("more escapes than bytes") }
+  else { string_chunks(src, p.next, bytes_concat(so_far, p.bytes), left - 1) }
 }
 
 fn escape(src: Bytes, i: Int) -> Result<Piece, DecodeError> / {abort.raise} = {
@@ -417,18 +442,29 @@ fn wrap(open: Bytes, inner: Bytes, close: Bytes) -> Bytes =
 
 fn quote(s: String) -> Bytes / {abort.raise} = {
   let raw = bytes_of_string(s);
-  bytes_concat(b"\"", bytes_concat(bytes_concat_all(escape_runs(raw, 0, [])), b"\""))
+  bytes_concat(
+    b"\"",
+    bytes_concat(bytes_concat_all(escape_runs(raw, 0, [], bytes_len(raw))), b"\""),
+  )
 }
 
-// The mirror of `string_chunks`: one native scan per run of bytes that need no escape.
-reuse fn escape_runs(raw: Bytes, i: Int, acc: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+// The mirror of `string_chunks`: one native scan per run of bytes that need no escape. Each run
+// takes the byte it escapes, so the bytes left bound the runs: `left`.
+reuse fn escape_runs(
+  raw: Bytes,
+  i: Int,
+  acc: List<Bytes>,
+  left: Int,
+) -> List<Bytes> / {abort.raise} = {
   let n = bytes_len(raw);
   let stop = scan_until(raw, i, string_stops());
-  if stop >= n { push(acc, bytes_slice(raw, i, n)) } else {
+  if stop >= n { push(acc, bytes_slice(raw, i, n)) }
+  else if left <= 0 { panic("more escapes than bytes") } else {
     escape_runs(
       raw,
       stop + 1,
       push(acc, bytes_concat(bytes_slice(raw, i, stop), escaped_byte(bytes_at(raw, stop)))),
+      left - 1,
     )
   }
 }

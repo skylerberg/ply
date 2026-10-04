@@ -78,11 +78,8 @@ fn fn_written(mods: List<ParsedModule>) -> Map<Bytes, Written> / {abort.raise} =
             public: vis_public(d.vis),
             reuse: match d.reuse { Some(_) -> true, None -> false },
             params: d.params,
-            literals: fold(d.spec, [], |lits: List<Bytes>, clause: SpecClause|
-              match clause.kind {
-                SRequires -> collect_lits([clause.expr], lits),
-                SEnsures -> lits,
-              }),
+            literals: fold(d.spec, [], |found: List<Bytes>, clause: SpecClause|
+              match clause.kind { SRequires -> lits(found, clause.expr), SEnsures -> found }),
           }),
         _ -> a,
       }))
@@ -151,70 +148,66 @@ fn neg_lit(acc: List<Bytes>, expr: Expr) -> List<Bytes> =
     _ -> acc,
   }
 
-type Walk = { stack: List<Expr>, acc: List<Bytes> }
-
-fn arm_exprs(exprs: List<Expr>, arm: MatchArm) -> List<Expr> =
-  push(match arm.guard { Some(g) -> push(exprs, g), None -> exprs }, arm.body)
-
-fn stmt_exprs(exprs: List<Expr>, stmt: Stmt) -> List<Expr> =
-  match stmt {
-    SLet(x) -> push(exprs, x.value),
-    SLetElse(x) -> push(push(exprs, x.value), x.fallback),
-    SExpr(x) -> push(exprs, x),
-  }
-
-fn field_exprs(exprs: List<Expr>, field: RecField) -> List<Expr> = push(exprs, field.value)
-
-fn collect_lits(stack: List<Expr>, acc: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  if len(stack) == 0 { acc } else {
-    let e = at(stack, len(stack) - 1);
-    let rest = take(stack, len(stack) - 1);
-    let step: Walk = match e {
-      ELit(v) -> { stack: rest, acc: lit_text(acc, v.lit) },
-      EVar(_) -> { stack: rest, acc: acc },
-      EBad(_) -> { stack: rest, acc: acc },
-      EBinary(v) -> { stack: push(push(rest, v.lhs), v.rhs), acc: acc },
-      EUnary(v) ->
-        {
-          stack: push(rest, v.operand),
-          acc: if v.op == b"neg" { neg_lit(acc, v.operand) } else { acc },
-        },
-      ELambda(v) -> { stack: push(rest, v.body), acc: acc },
-      EApp(v) -> { stack: concat(push(rest, v.func), v.args), acc: acc },
-      EIf(v) -> { stack: push(push(push(rest, v.cond), v.then_branch), v.else_branch), acc: acc },
-      EMatch(v) -> { stack: fold(v.arms, push(rest, v.scrutinee), arm_exprs), acc: acc },
-      EBlock(v) ->
-        {
-          stack: match v.tail {
-            Some(t) -> push(fold(v.stmts, rest, stmt_exprs), t),
-            None -> fold(v.stmts, rest, stmt_exprs),
+// The literals inside `expr`, each child walked after the ones written after it.
+fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
+  let backwards = |a: List<Bytes>, xs: List<Expr>|
+    fold(range(0, len(xs)), a, |b: List<Bytes>, k: Int|
+      match list_at(xs, len(xs) - 1 - k) { Some(x) -> lits(b, x), None -> b });
+  match expr {
+    ELit(v) -> lit_text(acc, v.lit),
+    EVar(_) -> acc,
+    EBad(_) -> acc,
+    EBinary(v) -> lits(lits(acc, v.rhs), v.lhs),
+    EUnary(v) -> lits(if v.op == b"neg" { neg_lit(acc, v.operand) } else { acc }, v.operand),
+    ELambda(v) -> lits(acc, v.body),
+    EApp(v) -> lits(backwards(acc, v.args), v.func),
+    EIf(v) -> lits(lits(lits(acc, v.else_branch), v.then_branch), v.cond),
+    EMatch(v) -> {
+      let n = len(v.arms);
+      let armed = fold(range(0, n), acc, |a: List<Bytes>, k: Int|
+        match list_at(v.arms, n - 1 - k) {
+          Some(arm) -> match arm.guard {
+            Some(g) -> lits(lits(a, arm.body), g),
+            None -> lits(a, arm.body),
           },
-          acc: acc,
-        },
-      ERecord(v) -> { stack: fold(v.fields, rest, field_exprs), acc: acc },
-      ERecordUpdate(v) -> { stack: fold(v.fields, push(rest, v.base), field_exprs), acc: acc },
-      EField(v) -> { stack: push(rest, v.base), acc: acc },
-      ETry(v) -> { stack: push(rest, v.operand), acc: acc },
-      EList(v) -> { stack: concat(rest, v.items), acc: acc },
-      EPerform(v) -> { stack: concat(rest, v.args), acc: acc },
-      EHandle(v) -> { stack: push(rest, v.body), acc: acc },
-      EWithCell(v) -> { stack: push(push(rest, v.init), v.body), acc: acc },
-      ESimulate(v) -> { stack: push(rest, v.body), acc: acc },
-      EParallel(v) -> { stack: concat(rest, v.branches), acc: acc },
-    };
-    collect_lits(step.stack, step.acc)
+          None -> a,
+        });
+      lits(armed, v.scrutinee)
+    },
+    EBlock(v) -> {
+      let tailed = match v.tail { Some(t) -> lits(acc, t), None -> acc };
+      let n = len(v.stmts);
+      fold(range(0, n), tailed, |a: List<Bytes>, k: Int|
+        match list_at(v.stmts, n - 1 - k) {
+          Some(SLet(x)) -> lits(a, x.value),
+          Some(SLetElse(x)) -> lits(lits(a, x.fallback), x.value),
+          Some(SExpr(x)) -> lits(a, x),
+          None -> a,
+        })
+    },
+    ERecord(v) -> backwards(acc, map(v.fields, |field: RecField| field.value)),
+    ERecordUpdate(v) -> lits(backwards(acc, map(v.fields, |field: RecField| field.value)), v.base),
+    EField(v) -> lits(acc, v.base),
+    ETry(v) -> lits(acc, v.operand),
+    EList(v) -> backwards(acc, v.items),
+    EPerform(v) -> backwards(acc, v.args),
+    EHandle(v) -> lits(acc, v.body),
+    EWithCell(v) -> lits(lits(acc, v.body), v.init),
+    ESimulate(v) -> lits(acc, v.body),
+    EParallel(v) -> backwards(acc, v.branches),
   }
+}
 
 // The literals these guards are written with, one guard at a time, as `<int|str|bytes> <value>`:
 // where a guard's domain is, which a witness search tries first.
 pub fn literals_of(guards: List<Expr>) -> List<Bytes> / {abort.raise} =
-  fold(guards, [], |acc: List<Bytes>, expr: Expr| collect_lits([expr], acc))
+  fold(guards, [], |acc: List<Bytes>, expr: Expr| lits(acc, expr))
 
 fn law_literals(mods: List<ParsedModule>) -> List<List<Bytes>> / {abort.raise} =
   fold(mods, [], |acc: List<List<Bytes>>, parsed: ParsedModule|
     fold(parsed.module.items, acc, |a: List<List<Bytes>>, item: Item|
       match item {
-        ILaw(d) -> push(a, match d.guard { Some(g) -> collect_lits([g], []), None -> [] }),
+        ILaw(d) -> push(a, match d.guard { Some(g) -> lits([], g), None -> [] }),
         _ -> a,
       }))
 
@@ -901,15 +894,22 @@ fn carrier_of(ctors: List<CtorInfo>) -> Carrier = {
   }
 }
 
-// Grown to a fixpoint: a type may hold a width through itself or through another type.
-fn holding_widths(ctors: List<CtorInfo>, held: List<Bytes>) -> List<Bytes> = {
-  let grown = fold(ctors, held, |acc: List<Bytes>, ctor_info: CtorInfo|
-    if contains(acc, ctor_info.type_name) { acc }
-    else if fold(ctor_info.fields, false, |b: Bool, ty: Type| b || reaches_width(ty, acc)) {
-      push(acc, ctor_info.type_name)
-    } else { acc });
-  if len(grown) == len(held) { held } else { holding_widths(ctors, grown) }
-}
+// Grown to a fixpoint: a type may hold a width through itself or through another type. A round that
+// grows adds a type, so there are no more rounds than types.
+fn holding_widths(ctors: List<CtorInfo>, held: List<Bytes>) -> List<Bytes> =
+  fold(
+    range(0, len(ctors) + 1),
+    { held: held, done: false },
+    |st: { held: List<Bytes>, done: Bool }, i: Int|
+      if st.done { st } else {
+        let grown = fold(ctors, st.held, |a: List<Bytes>, ctor_info: CtorInfo|
+          if contains(a, ctor_info.type_name) { a }
+          else if fold(ctor_info.fields, false, |b: Bool, ty: Type| b || reaches_width(ty, a)) {
+            push(a, ctor_info.type_name)
+          } else { a });
+        { held: grown, done: len(grown) == len(st.held) }
+      },
+  ).held
 
 // A function is a closure's word, which no reading looks inside.
 fn reaches_width(t: Type, held: List<Bytes>) -> Bool =
@@ -2747,19 +2747,22 @@ type Pull = {
 }
 
 // `shipped` is each shelved module as the analysis reads it, a stub where it has one, and `whole` the
-// shelf as it stands.
+// shelf as it stands. `room` is how many more rounds may pull: each pulls a shipped module not
+// pulled before.
 fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
   whole: Map<Bytes, Bytes>,
   listed: List<Bytes>,
   x: Pull,
+  room: Int,
 ) -> Pull / {abort.raise} = {
   let early = fold(x.parsed, [], |acc: List<Diag>, parsed: ParsedSource| concat(acc, parsed.diags));
   if len(early) > 0 { { ..x, diags: early } } else {
     let r = pull_round(users, shipped, listed, x.parsed);
     if len(r.diags) > 0 { { ..x, diags: r.diags } }
-    else if map_len(r.wanted) == 0 { x } else {
+    else if map_len(r.wanted) == 0 { x }
+    else if room <= 0 { panic("a shipped module pulled twice") } else {
       pulling(
         users,
         shipped,
@@ -2774,6 +2777,7 @@ fn pulling(
             embeds: concat(acc.embeds, o.embeds),
           }
         }),
+        room - 1,
       )
     }
   }
@@ -2874,12 +2878,14 @@ pub fn staged_pulling_std_with(
       acc && (!is_std(s.name) || has(map(user, |u: Source| u.name), s.name)));
   let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
-  let x = pulling(len(assembled), texts, whole, map(shipped, |s: Source| s.name), {
-    parsed: assembled,
-    pulled: [],
-    embeds: [],
-    diags: [],
-  });
+  let x = pulling(
+    len(assembled),
+    texts,
+    whole,
+    map(shipped, |s: Source| s.name),
+    { parsed: assembled, pulled: [], embeds: [], diags: [] },
+    map_len(texts),
+  );
   {
     pulled: x.pulled,
     hashed: if len(x.diags) > 0 { Err(x.diags) } else {
@@ -2972,19 +2978,22 @@ pub type Embedded = { root: Bytes, module: Bytes, want: EmbedWant, read: EmbedRe
 // it embeds.
 fn names_embed(src: Bytes) -> Bool / {abort.raise} = calls_embed_from(src, 0)
 
+// An occurrence a round, each past the last.
 fn calls_embed_from(src: Bytes, from: Int) -> Bool / {abort.raise} =
-  match bytes_index_of_from(src, b"embed", from) {
-    None -> false,
-    Some(i) -> {
-      let whole = (i == 0 || !ident_byte(bytes_at(src, i - 1)))
-        && !(i >= 7 && bytes_slice(src, i - 7, i) == b"import ");
-      let end = if i + 9 < bytes_len(src) { i + 9 } else { bytes_len(src) };
-      let named = if bytes_slice(src, i + 5, end) == b"_dir" { i + 9 } else { i + 5 };
-      let next = past_spaces(src, named);
-      (whole && next < bytes_len(src) && (bytes_at(src, next) == 40 || bytes_at(src, next) == 47))
-        || calls_embed_from(src, i + 5)
-    },
-  }
+  iterate(from, bytes_len(src) + 2, |at: Int|
+    match bytes_index_of_from(src, b"embed", at) {
+      None -> Stop(false),
+      Some(i) -> {
+        let whole = (i == 0 || !ident_byte(bytes_at(src, i - 1)))
+          && !(i >= 7 && bytes_slice(src, i - 7, i) == b"import ");
+        let end = if i + 9 < bytes_len(src) { i + 9 } else { bytes_len(src) };
+        let named = if bytes_slice(src, i + 5, end) == b"_dir" { i + 9 } else { i + 5 };
+        let next = past_spaces(src, named);
+        if whole && next < bytes_len(src)
+            && (bytes_at(src, next) == 40 || bytes_at(src, next) == 47) { Stop(true) }
+        else { Continue(i + 5) }
+      },
+    })
 
 fn ident_byte(b: Int) -> Bool =
   (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95

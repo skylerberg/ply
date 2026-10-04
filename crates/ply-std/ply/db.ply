@@ -794,29 +794,42 @@ fn scan_set(src: Bytes, i: Int, set: Bytes) -> Int / {abort.raise} =
 fn lex_all(sql: String) -> Result<List<Token>, DbError> / {abort.raise} = {
   let src = bytes_of_string(sql);
   if !bytes_is_utf8(src) { Err(unsupported("statement text that is not valid UTF-8")) }
-  else { lex(src, 0, []) }
+  else { lex(src, 0, [], 2 * bytes_len(src) + 2) }
 }
 
-reuse fn lex(src: Bytes, i: Int, acc: List<Token>) -> Result<List<Token>, DbError> / {abort.raise} = {
-  let j = scan_set(src, i, sql_ws());
-  let c = byte_at(src, j);
-  if c < 0 { Ok(acc) }
-  else if c == 59 { Err(unsupported("more than one statement in one `Stmt`")) }
-  else if c == 45 && byte_at(src, j + 1) == 45 { lex(src, line_comment_end(src, j + 2), acc) }
-  else if c == 47 && byte_at(src, j + 1) == 42 {
-    match block_comment_end(src, j + 2, 1) {
-      None -> Err(unsupported("a block comment that is never closed")),
-      Some(end) -> lex(src, end, acc),
-    }
-  } else if in_set(ident_start(), c) {
-    let end = scan_set(src, j, ident_rest());
-    lex(src, end, push(acc, TWord(string_lower(string_of_bytes(bytes_slice(src, j, end))))))
-  } else if in_set(sql_digits(), c) { lex_number(src, j, acc) }
-  else if c == 39 { lex_string(src, j + 1, b"", acc) }
-  else if c == 34 { lex_quoted(src, j + 1, b"", acc) }
-  else if c == 36 { lex_param(src, j, acc) }
-  else { lex_symbol(src, j, acc) }
-}
+// A token takes a byte at least and two calls at most, so twice the bytes bound the calls: `left`.
+reuse fn lex(
+  src: Bytes,
+  i: Int,
+  acc: List<Token>,
+  left: Int,
+) -> Result<List<Token>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more tokens than bytes") } else {
+    let j = scan_set(src, i, sql_ws());
+    let c = byte_at(src, j);
+    if c < 0 { Ok(acc) }
+    else if c == 59 { Err(unsupported("more than one statement in one `Stmt`")) }
+    else if c == 45 && byte_at(src, j + 1) == 45 {
+      lex(src, line_comment_end(src, j + 2), acc, left - 1)
+    } else if c == 47 && byte_at(src, j + 1) == 42 {
+      match block_comment_end(src, j + 2, 1) {
+        None -> Err(unsupported("a block comment that is never closed")),
+        Some(end) -> lex(src, end, acc, left - 1),
+      }
+    } else if in_set(ident_start(), c) {
+      let end = scan_set(src, j, ident_rest());
+      lex(
+        src,
+        end,
+        push(acc, TWord(string_lower(string_of_bytes(bytes_slice(src, j, end))))),
+        left - 1,
+      )
+    } else if in_set(sql_digits(), c) { lex_number(src, j, acc, left - 1) }
+    else if c == 39 { lex_string(src, j + 1, b"", acc, left - 1) }
+    else if c == 34 { lex_quoted(src, j + 1, b"", acc, left - 1) }
+    else if c == 36 { lex_param(src, j, acc, left - 1) }
+    else { lex_symbol(src, j, acc, left - 1) }
+  }
 
 fn line_comment_end(src: Bytes, i: Int) -> Int / {abort.raise} =
   if i >= bytes_len(src) || byte_at(src, i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
@@ -834,14 +847,17 @@ reuse fn lex_number(
   src: Bytes,
   i: Int,
   acc: List<Token>,
-) -> Result<List<Token>, DbError> / {abort.raise} = {
-  let whole = scan_set(src, i, sql_digits());
-  let end = if byte_at(src, whole) == 46 { scan_set(src, whole + 1, sql_digits()) } else { whole };
-  let after = byte_at(src, end);
-  if after == 101 || after == 69 { Err(unsupported("a number in exponent notation")) }
-  else if in_set(ident_start(), after) { Err(unsupported("a number followed by a letter")) }
-  else { lex(src, end, push(acc, TNum(string_of_bytes(bytes_slice(src, i, end))))) }
-}
+  left: Int,
+) -> Result<List<Token>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more tokens than bytes") } else {
+    let whole = scan_set(src, i, sql_digits());
+    let end = if byte_at(src, whole) == 46 { scan_set(src, whole + 1, sql_digits()) }
+    else { whole };
+    let after = byte_at(src, end);
+    if after == 101 || after == 69 { Err(unsupported("a number in exponent notation")) }
+    else if in_set(ident_start(), after) { Err(unsupported("a number followed by a letter")) }
+    else { lex(src, end, push(acc, TNum(string_of_bytes(bytes_slice(src, i, end)))), left - 1) }
+  }
 
 // `''` is an escaped quote, which is the only escape a standard-conforming string has.
 reuse fn lex_string(
@@ -849,70 +865,82 @@ reuse fn lex_string(
   i: Int,
   so_far: Bytes,
   acc: List<Token>,
-) -> Result<List<Token>, DbError> / {abort.raise} = {
-  let stop = if i >= bytes_len(src) { bytes_len(src) }
-  else { bytes_scan_until(src, i, b"'", bytes_len(src)) };
-  if stop >= bytes_len(src) { Err(unsupported("a string literal with no closing quote")) } else {
-    let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
-    if byte_at(src, stop + 1) == 39 { lex_string(src, stop + 2, bytes_concat(piece, b"'"), acc) }
-    else { lex(src, stop + 1, push(acc, TStr(string_of_bytes(piece)))) }
+  left: Int,
+) -> Result<List<Token>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more tokens than bytes") } else {
+    let stop = if i >= bytes_len(src) { bytes_len(src) }
+    else { bytes_scan_until(src, i, b"'", bytes_len(src)) };
+    if stop >= bytes_len(src) { Err(unsupported("a string literal with no closing quote")) } else {
+      let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
+      if byte_at(src, stop + 1) == 39 {
+        lex_string(src, stop + 2, bytes_concat(piece, b"'"), acc, left - 1)
+      } else { lex(src, stop + 1, push(acc, TStr(string_of_bytes(piece))), left - 1) }
+    }
   }
-}
 
 reuse fn lex_quoted(
   src: Bytes,
   i: Int,
   so_far: Bytes,
   acc: List<Token>,
-) -> Result<List<Token>, DbError> / {abort.raise} = {
-  let stop = if i >= bytes_len(src) { bytes_len(src) }
-  else { bytes_scan_until(src, i, b"\"", bytes_len(src)) };
-  if stop >= bytes_len(src) { Err(unsupported("a quoted identifier with no closing quote")) } else {
-    let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
-    if byte_at(src, stop + 1) == 34 { lex_quoted(src, stop + 2, bytes_concat(piece, b"\""), acc) }
-    else { lex(src, stop + 1, push(acc, TQuoted(string_of_bytes(piece)))) }
+  left: Int,
+) -> Result<List<Token>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more tokens than bytes") } else {
+    let stop = if i >= bytes_len(src) { bytes_len(src) }
+    else { bytes_scan_until(src, i, b"\"", bytes_len(src)) };
+    if stop >= bytes_len(src) { Err(unsupported("a quoted identifier with no closing quote")) }
+    else {
+      let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
+      if byte_at(src, stop + 1) == 34 {
+        lex_quoted(src, stop + 2, bytes_concat(piece, b"\""), acc, left - 1)
+      } else { lex(src, stop + 1, push(acc, TQuoted(string_of_bytes(piece))), left - 1) }
+    }
   }
-}
 
 reuse fn lex_param(
   src: Bytes,
   i: Int,
   acc: List<Token>,
-) -> Result<List<Token>, DbError> / {abort.raise} = {
-  let end = scan_set(src, i + 1, sql_digits());
-  if end == i + 1 { Err(unsupported("a dollar-quoted string, or a `$` that is not a parameter")) }
-  else {
-    match string::int_of_string(string_of_bytes(bytes_slice(src, i + 1, end))) {
-      None -> Err(unsupported("a parameter number too large to read")),
-      Some(n) -> lex(src, end, push(acc, TParam(n))),
+  left: Int,
+) -> Result<List<Token>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more tokens than bytes") } else {
+    let end = scan_set(src, i + 1, sql_digits());
+    if end == i + 1 { Err(unsupported("a dollar-quoted string, or a `$` that is not a parameter")) }
+    else {
+      match string::int_of_string(string_of_bytes(bytes_slice(src, i + 1, end))) {
+        None -> Err(unsupported("a parameter number too large to read")),
+        Some(n) -> lex(src, end, push(acc, TParam(n)), left - 1),
+      }
     }
   }
-}
 
 reuse fn lex_symbol(
   src: Bytes,
   i: Int,
   acc: List<Token>,
-) -> Result<List<Token>, DbError> / {abort.raise} = {
-  let c = byte_at(src, i);
-  let d = byte_at(src, i + 1);
-  let two = if (c == 60 && d == 62) || (c == 33 && d == 61) { "<>" }
-  else if c == 60 && d == 61 { "<=" }
-  else if c == 62 && d == 61 { ">=" }
-  else { "" };
-  if two != "" { lex(src, i + 2, push(acc, TSym(two))) }
-  else if c == 40 || c == 41 || c == 44 || c == 42 || c == 61 || c == 60 || c == 62 || c == 46
-      || c == 45
-      || c == 43 { lex(src, i + 1, push(acc, TSym(string_of_bytes(bytes_slice(src, i, i + 1))))) }
-  else {
-    Err(
-      unsupported(
-        "the token `" ++ string_of_bytes_lossy(bytes_slice(src, i, i + 1)) ++ "` at byte "
-          ++ int_to_string(i),
-      ),
-    )
+  left: Int,
+) -> Result<List<Token>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more tokens than bytes") } else {
+    let c = byte_at(src, i);
+    let d = byte_at(src, i + 1);
+    let two = if (c == 60 && d == 62) || (c == 33 && d == 61) { "<>" }
+    else if c == 60 && d == 61 { "<=" }
+    else if c == 62 && d == 61 { ">=" }
+    else { "" };
+    if two != "" { lex(src, i + 2, push(acc, TSym(two)), left - 1) }
+    else if c == 40 || c == 41 || c == 44 || c == 42 || c == 61 || c == 60 || c == 62 || c == 46
+        || c == 45
+        || c == 43 {
+      lex(src, i + 1, push(acc, TSym(string_of_bytes(bytes_slice(src, i, i + 1)))), left - 1)
+    } else {
+      Err(
+        unsupported(
+          "the token `" ++ string_of_bytes_lossy(bytes_slice(src, i, i + 1)) ++ "` at byte "
+            ++ int_to_string(i),
+        ),
+      )
+    }
   }
-}
 
 // --- The statement, as the twin understands it -----------------------------------
 
@@ -1013,54 +1041,67 @@ fn parse_colref(ts: List<Token>) -> Result<Parsed<String>, DbError> = {
   if token_symbol(c.rest) == "." { parse_name(rest_of(c.rest)) } else { Ok(c) }
 }
 
+// Every cycle through the expression parser takes a token, so a path meets each of its eleven
+// functions once per token at most: the room each starts with.
+fn expr_room(ts: List<Token>) -> Int = (len(ts) + 1) * 11
+
 fn parse_expr_text(s: String) -> Result<Expr, DbError> / {abort.raise} = {
   let ts = lex_all(s)?;
-  let c = parse_or(ts)?;
+  let c = parse_or(ts, expr_room(ts))?;
   if len(c.rest) == 0 { Ok(c.value) } else { Err(expected("the end of the expression", c.rest)) }
 }
 
-fn parse_or(ts: List<Token>) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
-  parse_or_more(parse_and(ts)?)
+fn parse_or(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") }
+  else { parse_or_more(parse_and(ts, left - 1)?, left - 1) }
 
-fn parse_or_more(c: Parsed<Expr>) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
-  if token_word(c.rest) == "or" {
-    let r = parse_and(rest_of(c.rest))?;
-    parse_or_more(parsed(XOr(c.value, r.value), r.rest))
-  } else { Ok(c) }
+fn parse_or_more(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    if token_word(c.rest) == "or" {
+      let r = parse_and(rest_of(c.rest), left - 1)?;
+      parse_or_more(parsed(XOr(c.value, r.value), r.rest), left - 1)
+    } else { Ok(c) }
+  }
 
-fn parse_and(ts: List<Token>) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
-  parse_and_more(parse_not(ts)?)
+fn parse_and(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") }
+  else { parse_and_more(parse_not(ts, left - 1)?, left - 1) }
 
-fn parse_and_more(c: Parsed<Expr>) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
-  if token_word(c.rest) == "and" {
-    let r = parse_not(rest_of(c.rest))?;
-    parse_and_more(parsed(XAnd(c.value, r.value), r.rest))
-  } else { Ok(c) }
+fn parse_and_more(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    if token_word(c.rest) == "and" {
+      let r = parse_not(rest_of(c.rest), left - 1)?;
+      parse_and_more(parsed(XAnd(c.value, r.value), r.rest), left - 1)
+    } else { Ok(c) }
+  }
 
-fn parse_not(ts: List<Token>) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
-  if token_word(ts) == "not" {
-    let c = parse_not(rest_of(ts))?;
-    Ok(parsed(XNot(c.value), c.rest))
-  } else { parse_pred_tail(parse_primary(ts)?) }
+fn parse_not(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    if token_word(ts) == "not" {
+      let c = parse_not(rest_of(ts), left - 1)?;
+      Ok(parsed(XNot(c.value), c.rest))
+    } else { parse_pred_tail(parse_primary(ts, left - 1)?, left - 1) }
+  }
 
-fn parse_pred_tail(c: Parsed<Expr>) -> Result<Parsed<Expr>, DbError> / {abort.raise} = {
-  let w = token_word(c.rest);
-  let s = token_symbol(c.rest);
-  if s == "=" || s == "<>" || s == "<" || s == "<=" || s == ">" || s == ">=" {
-    let r = parse_primary(rest_of(c.rest))?;
-    Ok(parsed(XCompare(comparison_of(s), c.value, r.value), r.rest))
-  } else if w == "is" { parse_is(c, rest_of(c.rest)) }
-  else if w == "in" { parse_in(c, false, rest_of(c.rest)) }
-  else if w == "between" { parse_between(c, false, rest_of(c.rest)) }
-  else if w == "like" { parse_like(c, false, rest_of(c.rest)) } else if w == "not" {
-    let after = rest_of(c.rest);
-    let w2 = token_word(after);
-    if w2 == "in" { parse_in(c, true, rest_of(after)) }
-    else if w2 == "between" { parse_between(c, true, rest_of(after)) }
-    else if w2 == "like" { parse_like(c, true, rest_of(after)) }
-    else { Err(expected("`in`, `between` or `like` after `not`", after)) }
-  } else { Ok(c) }
-}
+fn parse_pred_tail(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let w = token_word(c.rest);
+    let s = token_symbol(c.rest);
+    if s == "=" || s == "<>" || s == "<" || s == "<=" || s == ">" || s == ">=" {
+      let r = parse_primary(rest_of(c.rest), left - 1)?;
+      Ok(parsed(XCompare(comparison_of(s), c.value, r.value), r.rest))
+    } else if w == "is" { parse_is(c, rest_of(c.rest)) }
+    else if w == "in" { parse_in(c, false, rest_of(c.rest), left - 1) }
+    else if w == "between" { parse_between(c, false, rest_of(c.rest), left - 1) }
+    else if w == "like" { parse_like(c, false, rest_of(c.rest), left - 1) } else if w == "not" {
+      let after = rest_of(c.rest);
+      let w2 = token_word(after);
+      if w2 == "in" { parse_in(c, true, rest_of(after), left - 1) }
+      else if w2 == "between" { parse_between(c, true, rest_of(after), left - 1) }
+      else if w2 == "like" { parse_like(c, true, rest_of(after), left - 1) }
+      else { Err(expected("`in`, `between` or `like` after `not`", after)) }
+    } else { Ok(c) }
+  }
 
 fn comparison_of(s: String) -> Comparison =
   if s == "=" { CmpEq }
@@ -1080,71 +1121,81 @@ fn parse_in(
   c: Parsed<Expr>,
   negated: Bool,
   ts: List<Token>,
-) -> Result<Parsed<Expr>, DbError> / {abort.raise} = {
-  let after = want_sym(ts, "(")?;
-  let items = parse_expr_list(after, [])?;
-  Ok(parsed(XIn(c.value, items.value, negated), items.rest))
-}
+  left: Int,
+) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let after = want_sym(ts, "(")?;
+    let items = parse_expr_list(after, [], left - 1)?;
+    Ok(parsed(XIn(c.value, items.value, negated), items.rest))
+  }
 
 fn parse_expr_list(
   ts: List<Token>,
   acc: List<Expr>,
-) -> Result<Parsed<List<Expr>>, DbError> / {abort.raise} = {
-  let c = parse_or(ts)?;
-  let items = push(acc, c.value);
-  if token_symbol(c.rest) == "," { parse_expr_list(rest_of(c.rest), items) } else {
-    let after = want_sym(c.rest, ")")?;
-    Ok(parsed(items, after))
+  left: Int,
+) -> Result<Parsed<List<Expr>>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let c = parse_or(ts, left - 1)?;
+    let items = push(acc, c.value);
+    if token_symbol(c.rest) == "," { parse_expr_list(rest_of(c.rest), items, left - 1) } else {
+      let after = want_sym(c.rest, ")")?;
+      Ok(parsed(items, after))
+    }
   }
-}
 
 fn parse_between(
   c: Parsed<Expr>,
   negated: Bool,
   ts: List<Token>,
-) -> Result<Parsed<Expr>, DbError> / {abort.raise} = {
-  let lo = parse_primary(ts)?;
-  let after = want_word(lo.rest, "and")?;
-  let hi = parse_primary(after)?;
-  Ok(parsed(XBetween(c.value, lo.value, hi.value, negated), hi.rest))
-}
+  left: Int,
+) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let lo = parse_primary(ts, left - 1)?;
+    let after = want_word(lo.rest, "and")?;
+    let hi = parse_primary(after, left - 1)?;
+    Ok(parsed(XBetween(c.value, lo.value, hi.value, negated), hi.rest))
+  }
 
 fn parse_like(
   c: Parsed<Expr>,
   negated: Bool,
   ts: List<Token>,
-) -> Result<Parsed<Expr>, DbError> / {abort.raise} = {
-  let p = parse_primary(ts)?;
-  if token_word(p.rest) == "escape" { Err(unsupported("`like ... escape`")) }
-  else { Ok(parsed(XLike(c.value, p.value, negated), p.rest)) }
-}
+  left: Int,
+) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let p = parse_primary(ts, left - 1)?;
+    if token_word(p.rest) == "escape" { Err(unsupported("`like ... escape`")) }
+    else { Ok(parsed(XLike(c.value, p.value, negated), p.rest)) }
+  }
 
-fn parse_primary(ts: List<Token>) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
-  match ts {
-    [] -> Err(unsupported("the statement ended where a value was expected")),
-    [TParam(n), ..t] -> Ok(parsed(XParam(n), t)),
-    [TStr(s), ..t] -> Ok(parsed(XLit(CText(s)), t)),
-    [TNum(s), ..t] -> num_literal(s, false, t),
-    [TQuoted(w), ..t] -> parse_column_tail(w, t),
-    [TSym(s), ..t] -> if s == "(" {
-      let c = parse_or(t)?;
-      let after = want_sym(c.rest, ")")?;
-      Ok(parsed(c.value, after))
-    } else if s == "-" {
-      match t {
-        [TNum(n), ..t2] -> num_literal(n, true, t2),
-        _ -> Err(expected("a number after `-`", t)),
-      }
-    } else { Err(expected("a value", ts)) },
-    [TWord(w), ..t] -> if w == "null" { Ok(parsed(XLit(CNull), t)) }
-    else if w == "true" { Ok(parsed(XLit(CBool(true)), t)) }
-    else if w == "false" { Ok(parsed(XLit(CBool(false)), t)) }
-    else if w == "default" { Ok(parsed(XDefault, t)) }
-    else if w == "count" || w == "sum" || w == "avg" || w == "min" || w == "max" {
-      Err(unsupported("the aggregate `" ++ w ++ "` outside a bare `count(*)` projection"))
-    } else if w == "select" { Err(unsupported("a subquery")) }
-    else { parse_column_tail(w, t) },
-    _ -> Err(expected("a value", ts)),
+fn parse_primary(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match ts {
+      [] -> Err(unsupported("the statement ended where a value was expected")),
+      [TParam(n), ..t] -> Ok(parsed(XParam(n), t)),
+      [TStr(s), ..t] -> Ok(parsed(XLit(CText(s)), t)),
+      [TNum(s), ..t] -> num_literal(s, false, t),
+      [TQuoted(w), ..t] -> parse_column_tail(w, t),
+      [TSym(s), ..t] -> if s == "(" {
+        let c = parse_or(t, left - 1)?;
+        let after = want_sym(c.rest, ")")?;
+        Ok(parsed(c.value, after))
+      } else if s == "-" {
+        match t {
+          [TNum(n), ..t2] -> num_literal(n, true, t2),
+          _ -> Err(expected("a number after `-`", t)),
+        }
+      } else { Err(expected("a value", ts)) },
+      [TWord(w), ..t] -> if w == "null" { Ok(parsed(XLit(CNull), t)) }
+      else if w == "true" { Ok(parsed(XLit(CBool(true)), t)) }
+      else if w == "false" { Ok(parsed(XLit(CBool(false)), t)) }
+      else if w == "default" { Ok(parsed(XDefault, t)) }
+      else if w == "count" || w == "sum" || w == "avg" || w == "min" || w == "max" {
+        Err(unsupported("the aggregate `" ++ w ++ "` outside a bare `count(*)` projection"))
+      } else if w == "select" { Err(unsupported("a subquery")) }
+      else { parse_column_tail(w, t) },
+      _ -> Err(expected("a value", ts)),
+    }
   }
 
 fn parse_column_tail(name: String, ts: List<Token>) -> Result<Parsed<Expr>, DbError> =
@@ -1234,15 +1285,21 @@ fn parse_proj(ts: List<Token>) -> Result<Parsed<Projection>, DbError> =
         Ok(parsed(PCount(a.value), a.rest))
       },
     }
-  } else { parse_proj_columns(ts, []) }
+  } else { parse_proj_columns(ts, [], len(ts) + 1) }
 
-fn parse_proj_columns(ts: List<Token>, acc: List<Target>) -> Result<Parsed<Projection>, DbError> = {
-  let c = parse_colref(ts)?;
-  let a = parse_alias(c.rest, c.value)?;
-  let targets = push(acc, { column: c.value, name: a.value });
-  if token_symbol(a.rest) == "," { parse_proj_columns(rest_of(a.rest), targets) }
-  else { Ok(parsed(PCols(targets), a.rest)) }
-}
+// `left` bounds the items: each but the last takes its comma.
+fn parse_proj_columns(
+  ts: List<Token>,
+  acc: List<Target>,
+  left: Int,
+) -> Result<Parsed<Projection>, DbError> =
+  if left <= 0 { Err(db_error("XX000", "", "more items than tokens")) } else {
+    let c = parse_colref(ts)?;
+    let a = parse_alias(c.rest, c.value)?;
+    let targets = push(acc, { column: c.value, name: a.value });
+    if token_symbol(a.rest) == "," { parse_proj_columns(rest_of(a.rest), targets, left - 1) }
+    else { Ok(parsed(PCols(targets), a.rest)) }
+  }
 
 fn parse_alias(ts: List<Token>, dflt: String) -> Result<Parsed<String>, DbError> =
   if token_word(ts) == "as" {
@@ -1252,31 +1309,34 @@ fn parse_alias(ts: List<Token>, dflt: String) -> Result<Parsed<String>, DbError>
 
 fn parse_where(ts: List<Token>) -> Result<Parsed<Option<Expr>>, DbError> / {abort.raise} =
   if token_word(ts) == "where" {
-    let c = parse_or(rest_of(ts))?;
+    let c = parse_or(rest_of(ts), expr_room(ts))?;
     Ok(parsed(Some(c.value), c.rest))
   } else { Ok(parsed(None, ts)) }
 
 fn parse_order(ts: List<Token>) -> Result<Parsed<List<OrderKey>>, DbError> =
   if token_word(ts) == "order" {
     let after = want_word(rest_of(ts), "by")?;
-    parse_order_keys(after, [])
+    parse_order_keys(after, [], len(after) + 1)
   } else { Ok(parsed([], ts)) }
 
+// `left` bounds the items: each but the last takes its comma.
 fn parse_order_keys(
   ts: List<Token>,
   acc: List<OrderKey>,
-) -> Result<Parsed<List<OrderKey>>, DbError> = {
-  let c = parse_colref(ts)?;
-  let dir = token_word(c.rest);
-  let desc = dir == "desc";
-  let after_dir = if dir == "asc" || dir == "desc" { rest_of(c.rest) } else { c.rest };
-  {
-    let n = parse_nulls(after_dir, desc)?;
-    let keys = push(acc, { column: c.value, desc: desc, nulls_first: n.value });
-    if token_symbol(n.rest) == "," { parse_order_keys(rest_of(n.rest), keys) }
-    else { Ok(parsed(keys, n.rest)) }
+  left: Int,
+) -> Result<Parsed<List<OrderKey>>, DbError> =
+  if left <= 0 { Err(db_error("XX000", "", "more items than tokens")) } else {
+    let c = parse_colref(ts)?;
+    let dir = token_word(c.rest);
+    let desc = dir == "desc";
+    let after_dir = if dir == "asc" || dir == "desc" { rest_of(c.rest) } else { c.rest };
+    {
+      let n = parse_nulls(after_dir, desc)?;
+      let keys = push(acc, { column: c.value, desc: desc, nulls_first: n.value });
+      if token_symbol(n.rest) == "," { parse_order_keys(rest_of(n.rest), keys, left - 1) }
+      else { Ok(parsed(keys, n.rest)) }
+    }
   }
-}
 
 // Postgres's default is `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC`.
 fn parse_nulls(ts: List<Token>, desc: Bool) -> Result<Parsed<Bool>, DbError> =
@@ -1300,7 +1360,7 @@ fn parse_one_bound(
   word: String,
 ) -> Result<Parsed<Option<Expr>>, DbError> / {abort.raise} =
   if token_word(ts) == word {
-    let c = parse_primary(rest_of(ts))?;
+    let c = parse_primary(rest_of(ts), expr_room(ts))?;
     Ok(parsed(Some(c.value), c.rest))
   } else { Ok(parsed(None, ts)) }
 
@@ -1311,7 +1371,7 @@ fn parse_insert(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.rais
   match want_word(cols.rest, "values") {
     Err(_) -> Err(unsupported("an `insert` whose source is not a `values` list")),
     Ok(b) -> {
-      let tuples = parse_tuples(b, [])?;
+      let tuples = parse_tuples(b, [], len(b) + 1)?;
       let r = parse_returning(tuples.rest)?;
       Ok(
         parsed(
@@ -1329,27 +1389,37 @@ fn parse_insert(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.rais
 }
 
 fn parse_insert_columns(ts: List<Token>) -> Result<Parsed<List<String>>, DbError> =
-  if token_symbol(ts) == "(" { parse_name_list(rest_of(ts), []) } else { Ok(parsed([], ts)) }
+  if token_symbol(ts) == "(" { parse_name_list(rest_of(ts), [], len(ts) + 1) }
+  else { Ok(parsed([], ts)) }
 
-fn parse_name_list(ts: List<Token>, acc: List<String>) -> Result<Parsed<List<String>>, DbError> = {
-  let c = parse_name(ts)?;
-  let names = push(acc, c.value);
-  if token_symbol(c.rest) == "," { parse_name_list(rest_of(c.rest), names) } else {
-    let after = want_sym(c.rest, ")")?;
-    Ok(parsed(names, after))
+// `left` bounds the items: each but the last takes its comma.
+fn parse_name_list(
+  ts: List<Token>,
+  acc: List<String>,
+  left: Int,
+) -> Result<Parsed<List<String>>, DbError> =
+  if left <= 0 { Err(db_error("XX000", "", "more items than tokens")) } else {
+    let c = parse_name(ts)?;
+    let names = push(acc, c.value);
+    if token_symbol(c.rest) == "," { parse_name_list(rest_of(c.rest), names, left - 1) } else {
+      let after = want_sym(c.rest, ")")?;
+      Ok(parsed(names, after))
+    }
   }
-}
 
+// `left` bounds the items: each but the last takes its comma.
 fn parse_tuples(
   ts: List<Token>,
   acc: List<List<Expr>>,
-) -> Result<Parsed<List<List<Expr>>>, DbError> / {abort.raise} = {
-  let a = want_sym(ts, "(")?;
-  let c = parse_expr_list(a, [])?;
-  let tuples = push(acc, c.value);
-  if token_symbol(c.rest) == "," { parse_tuples(rest_of(c.rest), tuples) }
-  else { Ok(parsed(tuples, c.rest)) }
-}
+  left: Int,
+) -> Result<Parsed<List<List<Expr>>>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more items than tokens") } else {
+    let a = want_sym(ts, "(")?;
+    let c = parse_expr_list(a, [], expr_room(a))?;
+    let tuples = push(acc, c.value);
+    if token_symbol(c.rest) == "," { parse_tuples(rest_of(c.rest), tuples, left - 1) }
+    else { Ok(parsed(tuples, c.rest)) }
+  }
 
 fn parse_returning(ts: List<Token>) -> Result<Parsed<Option<Projection>>, DbError> =
   if token_word(ts) == "returning" {
@@ -1364,7 +1434,7 @@ fn parse_returning(ts: List<Token>) -> Result<Parsed<Option<Projection>>, DbErro
 fn parse_update(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.raise} = {
   let src = parse_name(ts)?;
   let a = want_word(src.rest, "set")?;
-  let sets = parse_assignments(a, [])?;
+  let sets = parse_assignments(a, [], len(a) + 1)?;
   if token_word(sets.rest) == "from" { Err(unsupported("`update ... from`")) } else {
     let w = parse_where(sets.rest)?;
     let r = parse_returning(w.rest)?;
@@ -1377,17 +1447,20 @@ fn parse_update(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.rais
   }
 }
 
+// `left` bounds the items: each but the last takes its comma.
 fn parse_assignments(
   ts: List<Token>,
   acc: List<Assign>,
-) -> Result<Parsed<List<Assign>>, DbError> / {abort.raise} = {
-  let n = parse_name(ts)?;
-  let a = want_sym(n.rest, "=")?;
-  let v = parse_primary(a)?;
-  let sets = push(acc, { column: n.value, value: v.value });
-  if token_symbol(v.rest) == "," { parse_assignments(rest_of(v.rest), sets) }
-  else { Ok(parsed(sets, v.rest)) }
-}
+  left: Int,
+) -> Result<Parsed<List<Assign>>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more items than tokens") } else {
+    let n = parse_name(ts)?;
+    let a = want_sym(n.rest, "=")?;
+    let v = parse_primary(a, expr_room(a))?;
+    let sets = push(acc, { column: n.value, value: v.value });
+    if token_symbol(v.rest) == "," { parse_assignments(rest_of(v.rest), sets, left - 1) }
+    else { Ok(parsed(sets, v.rest)) }
+  }
 
 fn parse_delete(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.raise} = {
   let a = want_word(ts, "from")?;
@@ -1450,7 +1523,21 @@ fn datum_type(v: Datum) -> String =
     CArray(_) -> "array",
   }
 
-fn eval_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} =
+fn eval_value(row: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} =
+  match e {
+    XNot(_) -> eval_bool_value(row, ps, e),
+    XAnd(_, _) -> eval_bool_value(row, ps, e),
+    XOr(_, _) -> eval_bool_value(row, ps, e),
+    XCompare(_, _, _) -> eval_bool_value(row, ps, e),
+    XIsNull(_, _) -> eval_bool_value(row, ps, e),
+    XIn(_, _, _) -> eval_bool_value(row, ps, e),
+    XBetween(_, _, _, _) -> eval_bool_value(row, ps, e),
+    XLike(_, _, _) -> eval_bool_value(row, ps, e),
+    _ -> leaf_value(row, ps, e),
+  }
+
+// What a literal, a column or a parameter is; the rest are predicates.
+fn leaf_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} =
   match e {
     XLit(v) -> Ok(v),
     XCol(n) -> match map_get(r, n) { None -> Err(undefined_column(n)), Some(v) -> Ok(v) },
@@ -1459,14 +1546,7 @@ fn eval_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abo
       Some(p) -> Ok(param_datum(p)),
     },
     XDefault -> Err(unsupported("`default` outside an `insert ... values` list")),
-    XNot(_) -> eval_bool_value(r, ps, e),
-    XAnd(_, _) -> eval_bool_value(r, ps, e),
-    XOr(_, _) -> eval_bool_value(r, ps, e),
-    XCompare(_, _, _) -> eval_bool_value(r, ps, e),
-    XIsNull(_, _) -> eval_bool_value(r, ps, e),
-    XIn(_, _, _) -> eval_bool_value(r, ps, e),
-    XBetween(_, _, _, _) -> eval_bool_value(r, ps, e),
-    XLike(_, _, _) -> eval_bool_value(r, ps, e),
+    _ -> panic("a predicate is no leaf"),
   }
 
 fn eval_bool_value(row: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} = {
@@ -1505,7 +1585,7 @@ fn eval_pred(row: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> / {abor
   }
 
 fn eval_pred_of_value(row: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> / {abort.raise} = {
-  let v = eval_value(row, ps, e)?;
+  let v = leaf_value(row, ps, e)?;
   match v {
     CNull -> Ok(TriUnknown),
     CBool(b) -> Ok(tri_of(b)),
@@ -1710,11 +1790,12 @@ fn rescale(d: Decimal, s: Int) -> Option<Decimal> / {abort.raise} = {
   else { decimal_of_string(text ++ zeros(s - have)) }
 }
 
-fn strip_leading_zeros(s: String) -> String / {abort.raise} =
-  if string_len(s) > 1 && string_starts_with(s, "0") {
-    strip_leading_zeros(string_slice(s, 1, string_len(s)))
-  } else if s == "0" { "" }
-  else { s }
+fn strip_leading_zeros(s: String) -> String / {abort.raise} = {
+  let n = string_len(s);
+  let first = fold(range(0, n), n, |at: Int, i: Int|
+    if at < n || string_slice(s, i, i + 1) == "0" { at } else { i });
+  string_slice(s, first, n)
+}
 
 fn numeric_fits(d: Decimal, p: Int, s: Int) -> Bool / {abort.raise} = {
   let text = decimal_to_string(d);
@@ -2156,7 +2237,8 @@ fn plan_expr(def: Table, e: Expr) -> Result<Expr, DbError> =
     },
     XBetween(x, lo, hi, negated) -> {
       let a = plan_operands(def, x, lo)?;
-      let b = plan_operands(def, a.left, hi)?;
+      let ph = plan_expr(def, hi)?;
+      let b = paired(def, a.left, ph)?;
       Ok(XBetween(b.left, a.right, b.right, negated))
     },
     XLike(x, p, negated) -> {
@@ -2166,10 +2248,14 @@ fn plan_expr(def: Table, e: Expr) -> Result<Expr, DbError> =
     },
   }
 
-// An `unknown` literal takes its type from the column on the other side of the operator.
 fn plan_operands(def: Table, a: Expr, b: Expr) -> Result<Planned, DbError> = {
   let pa = plan_expr(def, a)?;
   let pb = plan_expr(def, b)?;
+  paired(def, pa, pb)
+}
+
+// Two planned operands, where an `unknown` literal takes its type from the column on the other side.
+fn paired(def: Table, pa: Expr, pb: Expr) -> Result<Planned, DbError> =
   match column_type_of(def, pa) {
     Some(ty) -> {
       let nb = retype(ty, pb)?;
@@ -2183,7 +2269,6 @@ fn plan_operands(def: Table, a: Expr, b: Expr) -> Result<Planned, DbError> = {
       None -> Ok({ left: pa, right: pb }),
     },
   }
-}
 
 fn plan_items(
   def: Table,
@@ -3558,21 +3643,25 @@ fn array_values(element: Int, text: String) -> List<Datum> / {abort.raise} = {
   else { push(end.items, array_value(element, end.piece, end.was_quoted)) }
 }
 
+// An element is never an array itself: `element_oid` answers only scalar types.
 fn array_value(element: Int, piece: String, was_quoted: Bool) -> Datum / {abort.raise} =
-  if !was_quoted && piece == "NULL" { CNull } else { datum_of(element, Some(piece)) }
+  if !was_quoted && piece == "NULL" { CNull } else { scalar_datum(element, piece) }
 
 fn datum_of(oid: Int, text: Option<String>) -> Datum / {abort.raise} =
   match text {
     None -> CNull,
-    Some(t) -> if oid == 16 { CBool(t == "t") }
-    else if oid == 20 || oid == 21 || oid == 23 { CInt(signed_digits(t)) }
-    else if oid == 700 || oid == 701 { CFloat(float_of_text(t)) }
-    else if oid == 1700 { CNumeric(decimal_of_text(t)) }
-    else if oid == 17 { CBytes(bytes_of_bytea(t)) }
-    else if oid == 114 || oid == 3802 { CJson(json_of_text(t)) }
-    else if element_oid(oid) != 0 { CArray(array_values(element_oid(oid), t)) }
-    else { CText(t) },
+    Some(t) -> if element_oid(oid) != 0 { CArray(array_values(element_oid(oid), t)) }
+    else { scalar_datum(oid, t) },
   }
+
+fn scalar_datum(oid: Int, t: String) -> Datum / {abort.raise} =
+  if oid == 16 { CBool(t == "t") }
+  else if oid == 20 || oid == 21 || oid == 23 { CInt(signed_digits(t)) }
+  else if oid == 700 || oid == 701 { CFloat(float_of_text(t)) }
+  else if oid == 1700 { CNumeric(decimal_of_text(t)) }
+  else if oid == 17 { CBytes(bytes_of_bytea(t)) }
+  else if oid == 114 || oid == 3802 { CJson(json_of_text(t)) }
+  else { CText(t) }
 
 // What the server sent for one column: text, except that bytea's hex form and the text of every
 // other type are read by `datum_of`. `string_of_bytes_lossy` because a bytea is bytes, not text.
@@ -3865,15 +3954,18 @@ fn sql_in_order(
 fn sql_name_before(a: String, b: String) -> Bool / {abort.raise} =
   sql_bytes_cmp(bytes_of_string(a), bytes_of_string(b)) < 0
 
-fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int / {abort.raise} =
-  if bytes_len(a) == 0 { if bytes_len(b) == 0 { 0 } else { -1 } }
-  else if bytes_len(b) == 0 { 1 } else {
-    let x = bytes_at(a, 0);
-    let y = bytes_at(b, 0);
-    if x == y { sql_bytes_cmp(bytes_slice(a, 1, bytes_len(a)), bytes_slice(b, 1, bytes_len(b))) }
-    else if x < y { -1 }
-    else { 1 }
-  }
+fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int / {abort.raise} = {
+  let shorter = if bytes_len(a) < bytes_len(b) { bytes_len(a) } else { bytes_len(b) };
+  let first = fold(range(0, shorter), 0, |found: Int, i: Int|
+    if found != 0 { found }
+    else if bytes_at(a, i) < bytes_at(b, i) { -1 }
+    else if bytes_at(a, i) > bytes_at(b, i) { 1 }
+    else { 0 });
+  if first != 0 { first }
+  else if bytes_len(a) < bytes_len(b) { -1 }
+  else if bytes_len(a) > bytes_len(b) { 1 }
+  else { 0 }
+}
 
 // Every table the statement names, written and read as one sorted list.
 pub fn scan_table_names(t: SqlTables) -> List<String> / {abort.raise} =
@@ -3917,32 +4009,38 @@ pub fn sql_is_semi(t: SqlTok) -> Bool = match t { SqlSemi -> true, _ -> false }
 // closed is refused rather than guessed at: past one, the reader cannot tell text from statement.
 pub fn tokenize(sql: String) -> Result<List<SqlTokAt>, DbError> / {abort.raise} = {
   let b = bytes_of_string(sql);
-  sql_tokens_from(b, 0, [])
+  sql_tokens_from(b, 0, [], bytes_len(b) + 1)
 }
 
+// `left` bounds the tokens: each takes a byte at least.
 fn sql_tokens_from(
   b: Bytes,
   at: Int,
   acc: List<SqlTokAt>,
-) -> Result<List<SqlTokAt>, DbError> / {abort.raise} = {
-  let i = sql_skip_trivia(b, at)?;
-  if i >= bytes_len(b) { Ok(acc) } else {
-    let step = sql_next_token(b, i)?;
-    sql_tokens_from(b, step.next, push(acc, step.tok))
-  }
-}
-
-fn sql_skip_trivia(b: Bytes, at: Int) -> Result<Int, DbError> / {abort.raise} =
-  if at >= bytes_len(b) { Ok(at) }
-  else if is_space_byte(bytes_at(b, at)) { sql_skip_trivia(b, at + 1) }
-  else if bytes_at(b, at) == 45 && sql_byte_is(b, at + 1, 45) {
-    sql_skip_trivia(b, sql_past_line(b, at))
-  } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
-    match sql_past_comment(b, at + 2, 1) {
-      Err(_) -> Err(sql_unclosed(b, at, "a block comment")),
-      Ok(e) -> sql_skip_trivia(b, e),
+  left: Int,
+) -> Result<List<SqlTokAt>, DbError> / {abort.raise} =
+  if left <= 0 { panic("more rounds than input") } else {
+    let i = sql_skip_trivia(b, at, bytes_len(b) + 1)?;
+    if i >= bytes_len(b) { Ok(acc) } else {
+      let step = sql_next_token(b, i)?;
+      sql_tokens_from(b, step.next, push(acc, step.tok), left - 1)
     }
-  } else { Ok(at) }
+  }
+
+// `left` bounds the rounds: each takes a byte at least.
+fn sql_skip_trivia(b: Bytes, at: Int, left: Int) -> Result<Int, DbError> / {abort.raise} =
+  if left <= 0 { panic("more rounds than input") } else {
+    if at >= bytes_len(b) { Ok(at) }
+    else if is_space_byte(bytes_at(b, at)) { sql_skip_trivia(b, at + 1, left - 1) }
+    else if bytes_at(b, at) == 45 && sql_byte_is(b, at + 1, 45) {
+      sql_skip_trivia(b, sql_past_line(b, at), left - 1)
+    } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
+      match sql_past_comment(b, at + 2, 1) {
+        Err(_) -> Err(sql_unclosed(b, at, "a block comment")),
+        Ok(e) -> sql_skip_trivia(b, e, left - 1),
+      }
+    } else { Ok(at) }
+  }
 
 fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool / {abort.raise} =
   at < bytes_len(b) && bytes_at(b, at) == c
@@ -4093,9 +4191,10 @@ fn sql_past_tag(b: Bytes, at: Int) -> Int / {abort.raise} =
   } else { at }
 
 fn sql_find_tag(b: Bytes, tag: Bytes, at: Int) -> Option<Int> / {abort.raise} =
-  if at + bytes_len(tag) > bytes_len(b) { None }
-  else if sql_tag_at(b, tag, at) { Some(at) }
-  else { sql_find_tag(b, tag, at + 1) }
+  iterate(at, bytes_len(b) - at + 1, |i: Int|
+    if i + bytes_len(tag) > bytes_len(b) { Stop(None) }
+    else if sql_tag_at(b, tag, i) { Stop(Some(i)) }
+    else { Continue(i + 1) })
 
 fn sql_tag_at(b: Bytes, tag: Bytes, at: Int) -> Bool / {abort.raise} =
   fold(range(0, bytes_len(tag)), true, |acc: Bool, i: Int|
@@ -4227,23 +4326,27 @@ fn sql_qualified_name(
   rest: Int,
 ) -> Result<{ parser: SqlParser, name: String }, DbError> = {
   let first = sql_identifier(parser, "a table name")?;
-  sql_more_names(first.parser, first.name)
+  sql_more_names(first.parser, first.name, len(first.parser.toks) + 1)
 }
 
+// `left` bounds the rounds: each takes a token at least.
 fn sql_more_names(
   parser: SqlParser,
   name: String,
+  left: Int,
 ) -> Result<{ parser: SqlParser, name: String }, DbError> =
-  if !sql_at_punct(parser, ".") { Ok({ parser: parser, name: name }) } else {
-    match sql_nth(parser.toks, 1) {
-      Some(next) -> match next.tok {
-        SqlWord(w) -> {
-          let after = sql_step(sql_step(parser));
-          sql_more_names(after, w.text)
+  if left <= 0 { Err(db_error("XX000", "", "more rounds than input")) } else {
+    if !sql_at_punct(parser, ".") { Ok({ parser: parser, name: name }) } else {
+      match sql_nth(parser.toks, 1) {
+        Some(next) -> match next.tok {
+          SqlWord(w) -> {
+            let after = sql_step(sql_step(parser));
+            sql_more_names(after, w.text, left - 1)
+          },
+          _ -> Ok({ parser: parser, name: name }),
         },
-        _ -> Ok({ parser: parser, name: name }),
-      },
-      None -> Ok({ parser: parser, name: name }),
+        None -> Ok({ parser: parser, name: name }),
+      }
     }
   }
 
@@ -4268,15 +4371,18 @@ fn sql_alias(parser: SqlParser) -> Result<SqlParser, DbError> = {
 
 fn sql_alias_columns(parser: SqlParser) -> Result<SqlParser, DbError> = {
   let open = sql_eat_punct(parser, "(");
-  if open.ate { sql_name_list(open.parser) } else { Ok(parser) }
+  if open.ate { sql_name_list(open.parser, len(open.parser.toks) + 1) } else { Ok(parser) }
 }
 
 // A column list, which consumes its own `)`.
-fn sql_name_list(parser: SqlParser) -> Result<SqlParser, DbError> = {
-  let first = sql_identifier(parser, "a column name")?;
-  let comma = sql_eat_punct(first.parser, ",");
-  if comma.ate { sql_name_list(comma.parser) } else { sql_expect_punct(first.parser, ")") }
-}
+// `left` bounds the rounds: each takes a token at least.
+fn sql_name_list(parser: SqlParser, left: Int) -> Result<SqlParser, DbError> =
+  if left <= 0 { Err(db_error("XX000", "", "more rounds than input")) } else {
+    let first = sql_identifier(parser, "a column name")?;
+    let comma = sql_eat_punct(first.parser, ",");
+    if comma.ate { sql_name_list(comma.parser, left - 1) }
+    else { sql_expect_punct(first.parser, ")") }
+  }
 
 // --- What the reader vouches for ----------------------------------------------------
 
@@ -4492,91 +4598,101 @@ fn sql_reject_in(toks: List<SqlTokAt>, parser: SqlParser) -> Result<SqlParser, D
 
 fn sql_statement(
   parser: SqlParser,
-) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} = {
-  let deeper = { ..parser, depth: parser.depth + 1 };
-  if deeper.depth > sql_nesting() {
-    Err(sql_here(parser, "this statement nests deeper than the reader will follow"))
-  } else {
-    match sql_reject_nondeterministic(deeper) {
-      Err(e) -> Err(e),
-      Ok(checked) -> sql_with_clause(checked),
+  left: Int,
+) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let deeper = { ..parser, depth: parser.depth + 1 };
+    if deeper.depth > sql_nesting() {
+      Err(sql_here(parser, "this statement nests deeper than the reader will follow"))
+    } else {
+      match sql_reject_nondeterministic(deeper) {
+        Err(e) -> Err(e),
+        Ok(checked) -> sql_with_clause(checked, left - 1),
+      }
     }
   }
-}
 
 // `with` is the one admitted construct that can hide a verb: a CTE's body is a whole statement, so
 // a `delete` inside one makes a statement led by `select` a write.
 fn sql_with_clause(
   parser: SqlParser,
-) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} = {
-  let opening = sql_eat_word(parser, "with");
-  if !opening.ate { sql_body(parser) } else {
-    let recursive = sql_eat_word(opening.parser, "recursive");
-    sql_cte_list(recursive.parser, recursive.ate, no_sql_tables())
+  left: Int,
+) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let opening = sql_eat_word(parser, "with");
+    if !opening.ate { sql_body(parser, left - 1) } else {
+      let recursive = sql_eat_word(opening.parser, "recursive");
+      sql_cte_list(recursive.parser, recursive.ate, no_sql_tables(), left - 1)
+    }
   }
-}
 
 fn sql_cte_list(
   parser: SqlParser,
   recursive: Bool,
   gathered: SqlTables,
+  left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  match sql_cte(parser, recursive) {
-    Err(e) -> Err(e),
-    Ok(one) -> {
-      let absorbed = sql_absorb_tables(gathered, one.tables);
-      let comma = sql_eat_punct(one.parser, ",");
-      if comma.ate { sql_cte_list(comma.parser, recursive, absorbed) } else {
-        match sql_body(comma.parser) {
-          Err(e) -> Err(e),
-          Ok(b) ->
-            Ok({
-              parser: b.parser,
-              scan: { kind: b.scan.kind, tables: sql_absorb_tables(absorbed, b.scan.tables) },
-            }),
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_cte(parser, recursive, left - 1) {
+      Err(e) -> Err(e),
+      Ok(one) -> {
+        let absorbed = sql_absorb_tables(gathered, one.tables);
+        let comma = sql_eat_punct(one.parser, ",");
+        if comma.ate { sql_cte_list(comma.parser, recursive, absorbed, left - 1) } else {
+          match sql_body(comma.parser, left - 1) {
+            Err(e) -> Err(e),
+            Ok(b) ->
+              Ok({
+                parser: b.parser,
+                scan: { kind: b.scan.kind, tables: sql_absorb_tables(absorbed, b.scan.tables) },
+              }),
+          }
         }
-      }
-    },
+      },
+    }
   }
 
 fn sql_cte(
   parser: SqlParser,
   recursive: Bool,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let named = sql_identifier(parser, "a common table expression's name")?;
-  // A `recursive` CTE names itself in its body, so its name is in scope before the body is read.
-  let scope = if recursive { push(named.parser.ctes, named.name) } else { named.parser.ctes };
-  let in_scope = { ..named.parser, ctes: scope };
-  let columns = sql_eat_punct(in_scope, "(");
-  match sql_after_columns(columns) {
-    Err(e) -> Err(e),
-    Ok(listed) -> match sql_expect_word(listed, "as") {
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let named = sql_identifier(parser, "a common table expression's name")?;
+    // A `recursive` CTE names itself in its body, so its name is in scope before the body is read.
+    let scope = if recursive { push(named.parser.ctes, named.name) } else { named.parser.ctes };
+    let in_scope = { ..named.parser, ctes: scope };
+    let columns = sql_eat_punct(in_scope, "(");
+    match sql_after_columns(columns) {
       Err(e) -> Err(e),
-      Ok(after_as) -> {
-        let not_ = sql_eat_word(after_as, "not");
-        let materialized = sql_eat_word(not_.parser, "materialized");
-        match sql_expect_punct(materialized.parser, "(") {
-          Err(e) -> Err(e),
-          Ok(inside) -> match sql_statement(inside) {
+      Ok(listed) -> match sql_expect_word(listed, "as") {
+        Err(e) -> Err(e),
+        Ok(after_as) -> {
+          let not_ = sql_eat_word(after_as, "not");
+          let materialized = sql_eat_word(not_.parser, "materialized");
+          match sql_expect_punct(materialized.parser, "(") {
             Err(e) -> Err(e),
-            Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
+            Ok(inside) -> match sql_statement(inside, left - 1) {
               Err(e) -> Err(e),
-              Ok(after) ->
-                Ok({
-                  parser: { ..after, ctes: push(after.ctes, named.name) },
-                  tables: sql_without_names(inner.scan.tables, after.ctes),
-                }),
+              Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
+                Err(e) -> Err(e),
+                Ok(after) ->
+                  Ok({
+                    parser: { ..after, ctes: push(after.ctes, named.name) },
+                    tables: sql_without_names(inner.scan.tables, after.ctes),
+                  }),
+              },
             },
-          },
-        }
+          }
+        },
       },
-    },
+    }
   }
-}
 
 // The column list after a table name, if there is one.
 fn sql_after_columns(columns: { parser: SqlParser, ate: Bool }) -> Result<SqlParser, DbError> =
-  if columns.ate { sql_name_list(columns.parser) } else { Ok(columns.parser) }
+  if columns.ate { sql_name_list(columns.parser, len(columns.parser.toks) + 1) }
+  else { Ok(columns.parser) }
 
 // A nested statement, which inherits the enclosing `WITH`'s names: a reference to a CTE names that
 // expression rather than a table.
@@ -4588,499 +4704,575 @@ fn sql_without_names(tables: SqlTables, names: List<String>) -> SqlTables =
 
 fn sql_body(
   parser: SqlParser,
+  left: Int,
 ) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
-  match sql_head(parser.toks) {
-    None -> Err(sql_here(parser, "this statement is empty")),
-    Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) }
-    else if sql_is_word(t.tok, "select") || sql_is_punct(t.tok, "(") {
-      match sql_select_stmt(parser) {
-        Err(e) -> Err(e),
-        Ok(s) -> Ok({ parser: s.parser, scan: { kind: KSelect, tables: s.tables } }),
-      }
-    } else if sql_is_word(t.tok, "values") {
-      match sql_select_stmt(parser) {
-        Err(e) -> Err(e),
-        Ok(s) -> Ok({ parser: s.parser, scan: { kind: KValues, tables: s.tables } }),
-      }
-    } else if sql_is_word(t.tok, "insert") { sql_insert(parser) }
-    else if sql_is_word(t.tok, "update") { sql_update(parser) }
-    else if sql_is_word(t.tok, "delete") { sql_delete(parser) } else {
-      Err(
-        sql_refuse_tok(
-          t,
-          "a statement begins with one of `select`, `insert`, `update`, `delete` or `values`, with an optional `with`",
-        ),
-      )
-    },
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_head(parser.toks) {
+      None -> Err(sql_here(parser, "this statement is empty")),
+      Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) }
+      else if sql_is_word(t.tok, "select") || sql_is_punct(t.tok, "(") {
+        match sql_select_stmt(parser, left - 1) {
+          Err(e) -> Err(e),
+          Ok(s) -> Ok({ parser: s.parser, scan: { kind: KSelect, tables: s.tables } }),
+        }
+      } else if sql_is_word(t.tok, "values") {
+        match sql_select_stmt(parser, left - 1) {
+          Err(e) -> Err(e),
+          Ok(s) -> Ok({ parser: s.parser, scan: { kind: KValues, tables: s.tables } }),
+        }
+      } else if sql_is_word(t.tok, "insert") { sql_insert(parser, left - 1) }
+      else if sql_is_word(t.tok, "update") { sql_update(parser, left - 1) }
+      else if sql_is_word(t.tok, "delete") { sql_delete(parser, left - 1) } else {
+        Err(
+          sql_refuse_tok(
+            t,
+            "a statement begins with one of `select`, `insert`, `update`, `delete` or `values`, with an optional `with`",
+          ),
+        )
+      },
+    }
   }
 
 fn sql_select_stmt(
   parser: SqlParser,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match sql_select_core(parser) {
-    Err(e) -> Err(e),
-    Ok(core) -> {
-      match sql_select_arms(core.parser, core.tables) {
-        Err(e) -> Err(e),
-        Ok(armed) -> sql_select_tail(armed.parser, armed.tables),
-      }
-    },
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_select_core(parser, left - 1) {
+      Err(e) -> Err(e),
+      Ok(core) -> {
+        match sql_select_arms(core.parser, core.tables, left - 1) {
+          Err(e) -> Err(e),
+          Ok(armed) -> sql_select_tail(armed.parser, armed.tables, left - 1),
+        }
+      },
+    }
   }
 
 fn sql_select_arms(
   parser: SqlParser,
   tables: SqlTables,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if sql_at_word(parser, "union") || sql_at_word(parser, "intersect")
-      || sql_at_word(parser, "except") {
-    let opened = sql_step(parser);
-    let quantified = sql_eat_word(sql_eat_word(opened, "all").parser, "distinct");
-    match sql_select_core(quantified.parser) {
-      Err(e) -> Err(e),
-      Ok(inner) -> sql_select_arms(inner.parser, sql_absorb_tables(tables, inner.tables)),
-    }
-  } else { Ok({ parser: parser, tables: tables }) }
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    if sql_at_word(parser, "union") || sql_at_word(parser, "intersect")
+        || sql_at_word(parser, "except") {
+      let opened = sql_step(parser);
+      let quantified = sql_eat_word(sql_eat_word(opened, "all").parser, "distinct");
+      match sql_select_core(quantified.parser, left - 1) {
+        Err(e) -> Err(e),
+        Ok(inner) ->
+          sql_select_arms(inner.parser, sql_absorb_tables(tables, inner.tables), left - 1),
+      }
+    } else { Ok({ parser: parser, tables: tables }) }
+  }
 
 fn sql_select_tail(
   parser: SqlParser,
   tables: SqlTables,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let ordered = sql_eat_word(parser, "order");
-  let after_order = if ordered.ate {
-    match sql_expect_word(ordered.parser, "by") {
-      Err(e) -> Err(e),
-      Ok(after) -> sql_skip_expr(after, tables, ["limit", "offset", "fetch", "for"], false),
-    }
-  } else { Ok({ parser: parser, tables: tables }) };
-  match after_order { Err(e) -> Err(e), Ok(o) -> sql_select_tails(o.parser, o.tables) }
-}
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let ordered = sql_eat_word(parser, "order");
+    let after_order = if ordered.ate {
+      match sql_expect_word(ordered.parser, "by") {
+        Err(e) -> Err(e),
+        Ok(after) ->
+          sql_skip_expr(after, tables, ["limit", "offset", "fetch", "for"], false, left - 1),
+      }
+    } else { Ok({ parser: parser, tables: tables }) };
+    match after_order { Err(e) -> Err(e), Ok(o) -> sql_select_tails(o.parser, o.tables, left - 1) }
+  }
 
 fn sql_select_tails(
   parser: SqlParser,
   tables: SqlTables,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if sql_at_word(parser, "limit") || sql_at_word(parser, "offset") {
-    let opened = sql_step(parser);
-    match sql_skip_expr(opened, tables, ["limit", "offset", "fetch", "for"], false) {
-      Err(e) -> Err(e),
-      Ok(o) -> sql_select_tails(o.parser, o.tables),
-    }
-  } else if sql_at_word(parser, "fetch") || sql_at_word(parser, "for") {
-    match sql_head(parser.toks) {
-      Some(t) ->
-        Err(
-          sql_refuse_tok(
-            t,
-            "`fetch` and the row-locking clauses are outside the statements this reader admits: a row lock is a write it cannot express",
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    if sql_at_word(parser, "limit") || sql_at_word(parser, "offset") {
+      let opened = sql_step(parser);
+      match sql_skip_expr(opened, tables, ["limit", "offset", "fetch", "for"], false, left - 1) {
+        Err(e) -> Err(e),
+        Ok(o) -> sql_select_tails(o.parser, o.tables, left - 1),
+      }
+    } else if sql_at_word(parser, "fetch") || sql_at_word(parser, "for") {
+      match sql_head(parser.toks) {
+        Some(t) ->
+          Err(
+            sql_refuse_tok(
+              t,
+              "`fetch` and the row-locking clauses are outside the statements this reader admits: a row lock is a write it cannot express",
+            ),
           ),
-        ),
-      None -> Err(sql_here(parser, "the statement ends mid-clause")),
-    }
-  } else { Ok({ parser: parser, tables: tables }) }
+        None -> Err(sql_here(parser, "the statement ends mid-clause")),
+      }
+    } else { Ok({ parser: parser, tables: tables }) }
+  }
 
 fn sql_select_core(
   parser: SqlParser,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let open = sql_eat_punct(parser, "(");
-  if open.ate {
-    match sql_select_stmt(open.parser) {
-      Err(e) -> Err(e),
-      Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let open = sql_eat_punct(parser, "(");
+    if open.ate {
+      match sql_select_stmt(open.parser, left - 1) {
         Err(e) -> Err(e),
-        Ok(after) -> Ok({ parser: after, tables: inner.tables }),
-      },
-    }
-  } else if sql_at_word(parser, "values") { sql_values_rows(sql_step(parser), no_sql_tables()) }
-  else {
-    let opened = sql_expect_word(parser, "select");
-    match opened {
-      Err(e) -> Err(e),
-      Ok(after_select) -> {
-        let alls = sql_eat_word(after_select, "all");
-        let distinct = sql_eat_word(alls.parser, "distinct");
-        let on_prefix = if distinct.ate { sql_eat_word(distinct.parser, "on") }
-        else { { parser: distinct.parser, ate: false } };
-        let after_prefix = if on_prefix.ate {
-          match sql_expect_punct(on_prefix.parser, "(") {
-            Err(e) -> Err(e),
-            Ok(open) -> sql_skip_parens(open, no_sql_tables()),
-          }
-        } else { Ok({ parser: distinct.parser, tables: no_sql_tables() }) };
-        match after_prefix {
+        Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
           Err(e) -> Err(e),
-          Ok(prefixed) -> match sql_target_list(prefixed.parser, prefixed.tables) {
+          Ok(after) -> Ok({ parser: after, tables: inner.tables }),
+        },
+      }
+    } else if sql_at_word(parser, "values") {
+      sql_values_rows(sql_step(parser), no_sql_tables(), len(parser.toks) + 1)
+    } else {
+      let opened = sql_expect_word(parser, "select");
+      match opened {
+        Err(e) -> Err(e),
+        Ok(after_select) -> {
+          let alls = sql_eat_word(after_select, "all");
+          let distinct = sql_eat_word(alls.parser, "distinct");
+          let on_prefix = if distinct.ate { sql_eat_word(distinct.parser, "on") }
+          else { { parser: distinct.parser, ate: false } };
+          let after_prefix = if on_prefix.ate {
+            match sql_expect_punct(on_prefix.parser, "(") {
+              Err(e) -> Err(e),
+              Ok(open) -> sql_skip_parens(open, no_sql_tables(), left - 1),
+            }
+          } else { Ok({ parser: distinct.parser, tables: no_sql_tables() }) };
+          match after_prefix {
             Err(e) -> Err(e),
-            Ok(targets) -> sql_select_rest(targets),
-          },
-        }
-      },
+            Ok(prefixed) -> match sql_target_list(prefixed.parser, prefixed.tables, left - 1) {
+              Err(e) -> Err(e),
+              Ok(targets) -> sql_select_rest(targets, left - 1),
+            },
+          }
+        },
+      }
     }
   }
-}
 
 fn sql_select_rest(
   at: { parser: SqlParser, tables: SqlTables },
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let from = sql_source_after_from(at)?;
-  let filtered = sql_select_filter(from)?;
-  let grouped = sql_select_grouped(filtered)?;
-  sql_select_having(grouped)
-}
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let from = sql_source_after_from(at, left - 1)?;
+    let filtered = sql_select_filter(from, left - 1)?;
+    let grouped = sql_select_grouped(filtered, left - 1)?;
+    sql_select_having(grouped, left - 1)
+  }
 
 fn sql_source_after_from(
   at: { parser: SqlParser, tables: SqlTables },
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let from = sql_eat_word(at.parser, "from");
-  if from.ate { sql_source_list(from.parser, at.tables) } else { Ok(at) }
-}
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let from = sql_eat_word(at.parser, "from");
+    if from.ate { sql_source_list(from.parser, at.tables, left - 1) } else { Ok(at) }
+  }
 
 fn sql_select_filter(
   at: { parser: SqlParser, tables: SqlTables },
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let where_ = sql_eat_word(at.parser, "where");
-  if where_.ate { sql_skip_expr(where_.parser, at.tables, sql_clause_words(), false) }
-  else { Ok(at) }
-}
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let where_ = sql_eat_word(at.parser, "where");
+    if where_.ate { sql_skip_expr(where_.parser, at.tables, sql_clause_words(), false, left - 1) }
+    else { Ok(at) }
+  }
 
 fn sql_select_grouped(
   at: { parser: SqlParser, tables: SqlTables },
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let group = sql_eat_word(at.parser, "group");
-  if group.ate {
-    match sql_expect_word(group.parser, "by") {
-      Err(e) -> Err(e),
-      Ok(after) -> sql_skip_expr(after, at.tables, sql_clause_words(), false),
-    }
-  } else { Ok(at) }
-}
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let group = sql_eat_word(at.parser, "group");
+    if group.ate {
+      match sql_expect_word(group.parser, "by") {
+        Err(e) -> Err(e),
+        Ok(after) -> sql_skip_expr(after, at.tables, sql_clause_words(), false, left - 1),
+      }
+    } else { Ok(at) }
+  }
 
 fn sql_select_having(
   at: { parser: SqlParser, tables: SqlTables },
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let having = sql_eat_word(at.parser, "having");
-  let after = if having.ate { sql_skip_expr(having.parser, at.tables, sql_clause_words(), false) }
-  else { Ok(at) };
-  match after {
-    Err(e) -> Err(e),
-    Ok(h) -> if sql_at_word(h.parser, "window") {
-      match sql_head(h.parser.toks) {
-        Some(t) -> Err(sql_refuse_tok(t, "window definitions are not modelled")),
-        None -> Err(sql_here(h.parser, "the statement ends mid-clause")),
-      }
-    } else { Ok(h) },
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let having = sql_eat_word(at.parser, "having");
+    let after = if having.ate {
+      sql_skip_expr(having.parser, at.tables, sql_clause_words(), false, left - 1)
+    } else { Ok(at) };
+    match after {
+      Err(e) -> Err(e),
+      Ok(h) -> if sql_at_word(h.parser, "window") {
+        match sql_head(h.parser.toks) {
+          Some(t) -> Err(sql_refuse_tok(t, "window definitions are not modelled")),
+          None -> Err(sql_here(h.parser, "the statement ends mid-clause")),
+        }
+      } else { Ok(h) },
+    }
   }
-}
 
 fn sql_source_list(
   parser: SqlParser,
   tables: SqlTables,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match sql_source_item(parser, tables) {
-    Err(e) -> Err(e),
-    Ok(one) -> {
-      let comma = sql_eat_punct(one.parser, ",");
-      if comma.ate { sql_source_list(comma.parser, one.tables) } else { Ok(one) }
-    },
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_source_item(parser, tables, left - 1) {
+      Err(e) -> Err(e),
+      Ok(one) -> {
+        let comma = sql_eat_punct(one.parser, ",");
+        if comma.ate { sql_source_list(comma.parser, one.tables, left - 1) } else { Ok(one) }
+      },
+    }
   }
 
 fn sql_source_item(
   parser: SqlParser,
   tables: SqlTables,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match sql_source_base(parser, tables) {
-    Err(e) -> Err(e),
-    Ok(base) -> sql_joins(base.parser, base.tables),
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_source_base(parser, tables, left - 1) {
+      Err(e) -> Err(e),
+      Ok(base) -> sql_joins(base.parser, base.tables, left - 1),
+    }
   }
 
 fn sql_joins(
   parser: SqlParser,
   tables: SqlTables,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let natural = sql_eat_word(parser, "natural");
-  let joined = sql_at_word(natural.parser, "join") || sql_at_word(natural.parser, "inner")
-    || sql_at_word(natural.parser, "left")
-    || sql_at_word(natural.parser, "right")
-    || sql_at_word(natural.parser, "full")
-    || sql_at_word(natural.parser, "cross");
-  if !joined {
-    if natural.ate { Err(sql_here(natural.parser, "`natural` must be followed by a join")) }
-    else { Ok({ parser: parser, tables: tables }) }
-  } else {
-    let inner = sql_eat_word(natural.parser, "inner");
-    let side = sql_eat_word(inner.parser, "left");
-    let side2 = sql_eat_word(side.parser, "right");
-    let side3 = sql_eat_word(side2.parser, "full");
-    let after_side = if side.ate || side2.ate || side3.ate {
-      sql_eat_word(side3.parser, "outer").parser
-    } else { side3.parser };
-    let cross = sql_eat_word(after_side, "cross");
-    let join = sql_expect_word(cross.parser, "join");
-    match join {
-      Err(e) -> Err(e),
-      Ok(after_join) -> match sql_source_base(after_join, tables) {
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let natural = sql_eat_word(parser, "natural");
+    let joined = sql_at_word(natural.parser, "join") || sql_at_word(natural.parser, "inner")
+      || sql_at_word(natural.parser, "left")
+      || sql_at_word(natural.parser, "right")
+      || sql_at_word(natural.parser, "full")
+      || sql_at_word(natural.parser, "cross");
+    if !joined {
+      if natural.ate { Err(sql_here(natural.parser, "`natural` must be followed by a join")) }
+      else { Ok({ parser: parser, tables: tables }) }
+    } else {
+      let inner = sql_eat_word(natural.parser, "inner");
+      let side = sql_eat_word(inner.parser, "left");
+      let side2 = sql_eat_word(side.parser, "right");
+      let side3 = sql_eat_word(side2.parser, "full");
+      let after_side = if side.ate || side2.ate || side3.ate {
+        sql_eat_word(side3.parser, "outer").parser
+      } else { side3.parser };
+      let cross = sql_eat_word(after_side, "cross");
+      let join = sql_expect_word(cross.parser, "join");
+      match join {
         Err(e) -> Err(e),
-        Ok(base) -> {
-          let on = sql_eat_word(base.parser, "on");
-          let after_on = if on.ate {
-            sql_skip_expr(on.parser, base.tables, sql_clause_words(), true)
-          } else {
-            let using = sql_eat_word(base.parser, "using");
-            if using.ate {
-              match sql_expect_punct(using.parser, "(") {
-                Err(e) -> Err(e),
-                Ok(open) -> match sql_name_list(open) {
-                  Err(e) -> Err(e),
-                  Ok(after) -> Ok({ parser: after, tables: base.tables }),
-                },
-              }
-            } else { Ok({ parser: base.parser, tables: base.tables }) }
-          };
-          match after_on { Err(e) -> Err(e), Ok(tail) -> sql_joins(tail.parser, tail.tables) }
-        },
-      },
-    }
-  }
-}
-
-fn sql_source_base(
-  parser: SqlParser,
-  tables: SqlTables,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let lateral = sql_eat_word(parser, "lateral");
-  let open_at = match sql_head(lateral.parser.toks) {
-    Some(t) -> t.at,
-    None -> lateral.parser.end_pos,
-  };
-  let open = sql_eat_punct(lateral.parser, "(");
-  if open.ate {
-    if sql_at_word(open.parser, "select") || sql_at_word(open.parser, "values")
-        || sql_at_word(open.parser, "with") {
-      match sql_statement(open.parser) {
-        Err(e) -> Err(e),
-        Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
+        Ok(after_join) -> match sql_source_base(after_join, tables, left - 1) {
           Err(e) -> Err(e),
-          Ok(after) -> {
-            let aliased = sql_alias(after);
-            match aliased {
+          Ok(base) -> {
+            let on = sql_eat_word(base.parser, "on");
+            let after_on = if on.ate {
+              sql_skip_expr(on.parser, base.tables, sql_clause_words(), true, left - 1)
+            } else {
+              let using = sql_eat_word(base.parser, "using");
+              if using.ate {
+                match sql_expect_punct(using.parser, "(") {
+                  Err(e) -> Err(e),
+                  Ok(open) -> match sql_name_list(open, len(open.toks) + 1) {
+                    Err(e) -> Err(e),
+                    Ok(after) -> Ok({ parser: after, tables: base.tables }),
+                  },
+                }
+              } else { Ok({ parser: base.parser, tables: base.tables }) }
+            };
+            match after_on {
               Err(e) -> Err(e),
-              Ok(done) ->
-                Ok({ parser: done, tables: sql_absorb_tables(tables, inner.scan.tables) }),
+              Ok(tail) -> sql_joins(tail.parser, tail.tables, left - 1),
             }
           },
         },
       }
-    } else {
-      Err(sql_refuse("`(`", open_at, "a parenthesised from-item is not a shape the reader models"))
-    }
-  } else {
-    let only = sql_eat_word(lateral.parser, "only");
-    match sql_qualified_name(only.parser, 0) {
-      Err(e) -> Err(e),
-      Ok(named) -> if sql_at_punct(named.parser, "(") {
-        match sql_head(named.parser.toks) {
-          Some(t) ->
-            Err(
-              sql_refuse_tok(
-                t,
-                "a set-returning function in `from` reads tables no reader can name",
-              ),
-            ),
-          None -> Err(sql_here(named.parser, "the statement ends mid-clause")),
-        }
-      } else {
-        let starred = sql_eat_punct(named.parser, "*");
-        let noted = if contains(named.parser.ctes, named.name) { tables }
-        else { sql_note_read(tables, named.name) };
-        match sql_alias(starred.parser) {
-          Err(e) -> Err(e),
-          Ok(after) -> Ok({ parser: after, tables: noted }),
-        }
-      },
     }
   }
-}
+
+fn sql_source_base(
+  parser: SqlParser,
+  tables: SqlTables,
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let lateral = sql_eat_word(parser, "lateral");
+    let open_at = match sql_head(lateral.parser.toks) {
+      Some(t) -> t.at,
+      None -> lateral.parser.end_pos,
+    };
+    let open = sql_eat_punct(lateral.parser, "(");
+    if open.ate {
+      if sql_at_word(open.parser, "select") || sql_at_word(open.parser, "values")
+          || sql_at_word(open.parser, "with") {
+        match sql_statement(open.parser, left - 1) {
+          Err(e) -> Err(e),
+          Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
+            Err(e) -> Err(e),
+            Ok(after) -> {
+              let aliased = sql_alias(after);
+              match aliased {
+                Err(e) -> Err(e),
+                Ok(done) ->
+                  Ok({ parser: done, tables: sql_absorb_tables(tables, inner.scan.tables) }),
+              }
+            },
+          },
+        }
+      } else {
+        Err(
+          sql_refuse("`(`", open_at, "a parenthesised from-item is not a shape the reader models"),
+        )
+      }
+    } else {
+      let only = sql_eat_word(lateral.parser, "only");
+      match sql_qualified_name(only.parser, 0) {
+        Err(e) -> Err(e),
+        Ok(named) -> if sql_at_punct(named.parser, "(") {
+          match sql_head(named.parser.toks) {
+            Some(t) ->
+              Err(
+                sql_refuse_tok(
+                  t,
+                  "a set-returning function in `from` reads tables no reader can name",
+                ),
+              ),
+            None -> Err(sql_here(named.parser, "the statement ends mid-clause")),
+          }
+        } else {
+          let starred = sql_eat_punct(named.parser, "*");
+          let noted = if contains(named.parser.ctes, named.name) { tables }
+          else { sql_note_read(tables, named.name) };
+          match sql_alias(starred.parser) {
+            Err(e) -> Err(e),
+            Ok(after) -> Ok({ parser: after, tables: noted }),
+          }
+        },
+      }
+    }
+  }
 
 fn sql_target_list(
   parser: SqlParser,
   tables: SqlTables,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match sql_skip_expr(parser, tables, sql_clause_words(), true) {
-    Err(e) -> Err(e),
-    Ok(item) -> {
-      let as_ = sql_eat_word(item.parser, "as");
-      let named = if as_.ate {
-        match sql_identifier(as_.parser, "an output column name") {
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_skip_expr(parser, tables, sql_clause_words(), true, left - 1) {
+      Err(e) -> Err(e),
+      Ok(item) -> {
+        let as_ = sql_eat_word(item.parser, "as");
+        let named = if as_.ate {
+          match sql_identifier(as_.parser, "an output column name") {
+            Err(e) -> Err(e),
+            Ok(n) -> Ok(n.parser),
+          }
+        } else { Ok(item.parser) };
+        match named {
           Err(e) -> Err(e),
-          Ok(n) -> Ok(n.parser),
+          Ok(after) -> {
+            let comma = sql_eat_punct(after, ",");
+            if comma.ate { sql_target_list(comma.parser, item.tables, left - 1) }
+            else { Ok({ parser: after, tables: item.tables }) }
+          },
         }
-      } else { Ok(item.parser) };
-      match named {
-        Err(e) -> Err(e),
-        Ok(after) -> {
-          let comma = sql_eat_punct(after, ",");
-          if comma.ate { sql_target_list(comma.parser, item.tables) }
-          else { Ok({ parser: after, tables: item.tables }) }
-        },
-      }
-    },
+      },
+    }
   }
 
 // --- The four verbs -----------------------------------------------------------------
 
 fn sql_insert(
   parser: SqlParser,
-) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} = {
-  let after_insert = sql_expect_word(parser, "insert")?;
-  let into = sql_expect_word(after_insert, "into")?;
-  let named = sql_qualified_name(into, 0)?;
-  let written = sql_note_written(no_sql_tables(), named.name);
-  let aliased = sql_alias(named.parser)?;
-  let columns = sql_eat_punct(aliased, "(");
-  match sql_after_columns(columns) {
-    Err(e) -> Err(e),
-    Ok(after_columns) -> {
-      let default = sql_eat_word(after_columns, "default");
-      match sql_insert_source(default, after_columns) {
-        Err(e) -> Err(e),
-        Ok(source) -> {
-          let rows = sql_absorb_tables(written, source.tables);
-          if sql_at_word(source.parser, "on") {
-            match sql_head(source.parser.toks) {
-              Some(t) ->
-                Err(
-                  sql_refuse_tok(
-                    t,
-                    "`on conflict` is not modelled: an upsert is a write whose outcome the engine cannot reproduce",
+  left: Int,
+) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let after_insert = sql_expect_word(parser, "insert")?;
+    let into = sql_expect_word(after_insert, "into")?;
+    let named = sql_qualified_name(into, 0)?;
+    let written = sql_note_written(no_sql_tables(), named.name);
+    let aliased = sql_alias(named.parser)?;
+    let columns = sql_eat_punct(aliased, "(");
+    match sql_after_columns(columns) {
+      Err(e) -> Err(e),
+      Ok(after_columns) -> {
+        let default = sql_eat_word(after_columns, "default");
+        match sql_insert_source(default, after_columns, left - 1) {
+          Err(e) -> Err(e),
+          Ok(source) -> {
+            let rows = sql_absorb_tables(written, source.tables);
+            if sql_at_word(source.parser, "on") {
+              match sql_head(source.parser.toks) {
+                Some(t) ->
+                  Err(
+                    sql_refuse_tok(
+                      t,
+                      "`on conflict` is not modelled: an upsert is a write whose outcome the engine cannot reproduce",
+                    ),
                   ),
-                ),
-              None -> Err(sql_here(source.parser, "the statement ends mid-clause")),
+                None -> Err(sql_here(source.parser, "the statement ends mid-clause")),
+              }
+            } else {
+              match sql_returning(source.parser, rows, left - 1) {
+                Err(e) -> Err(e),
+                Ok(done) ->
+                  Ok({ parser: done.parser, scan: { kind: KInsert, tables: done.tables } }),
+              }
             }
-          } else {
-            match sql_returning(source.parser, rows) {
-              Err(e) -> Err(e),
-              Ok(done) -> Ok({ parser: done.parser, scan: { kind: KInsert, tables: done.tables } }),
-            }
-          }
-        },
-      }
-    },
+          },
+        }
+      },
+    }
   }
-}
 
 // `default values`, or a `select` that answers the rows.
 fn sql_insert_source(
   default: { parser: SqlParser, ate: Bool },
   after_columns: SqlParser,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  if default.ate {
-    match sql_expect_word(default.parser, "values") {
-      Err(e) -> Err(e),
-      Ok(after) -> Ok({ parser: after, tables: no_sql_tables() }),
-    }
-  } else { sql_select_stmt(after_columns) }
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    if default.ate {
+      match sql_expect_word(default.parser, "values") {
+        Err(e) -> Err(e),
+        Ok(after) -> Ok({ parser: after, tables: no_sql_tables() }),
+      }
+    } else { sql_select_stmt(after_columns, left - 1) }
+  }
 
 fn sql_update(
   parser: SqlParser,
-) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} = {
-  let after_update = sql_expect_word(parser, "update")?;
-  let only = sql_eat_word(after_update, "only");
-  let named = sql_qualified_name(only.parser, 0)?;
-  let written = sql_note_written(no_sql_tables(), named.name);
-  let aliased = sql_alias(named.parser)?;
-  let after_set = sql_expect_word(aliased, "set")?;
-  let assignments = sql_skip_expr(after_set, written, ["from", "where", "returning"], false)?;
-  let from = sql_eat_word(assignments.parser, "from");
-  let after_from = if from.ate { sql_source_list(from.parser, assignments.tables) }
-  else { Ok(assignments) };
-  let sourced = match after_from { Err(e) -> Err(e), Ok(s) -> Ok(s) };
-  let filtered = match sourced {
-    Err(e) -> Err(e),
-    Ok(s) -> {
-      let where_ = sql_eat_word(s.parser, "where");
-      if where_.ate { sql_skip_expr(where_.parser, s.tables, ["returning"], false) } else { Ok(s) }
-    },
-  };
-  match filtered {
-    Err(e) -> Err(e),
-    Ok(f) -> match sql_returning(f.parser, f.tables) {
+  left: Int,
+) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let after_update = sql_expect_word(parser, "update")?;
+    let only = sql_eat_word(after_update, "only");
+    let named = sql_qualified_name(only.parser, 0)?;
+    let written = sql_note_written(no_sql_tables(), named.name);
+    let aliased = sql_alias(named.parser)?;
+    let after_set = sql_expect_word(aliased, "set")?;
+    let assignments = sql_skip_expr(
+      after_set,
+      written,
+      ["from", "where", "returning"],
+      false,
+      left - 1,
+    )?;
+    let from = sql_eat_word(assignments.parser, "from");
+    let after_from = if from.ate { sql_source_list(from.parser, assignments.tables, left - 1) }
+    else { Ok(assignments) };
+    let sourced = match after_from { Err(e) -> Err(e), Ok(s) -> Ok(s) };
+    let filtered = match sourced {
       Err(e) -> Err(e),
-      Ok(done) -> Ok({ parser: done.parser, scan: { kind: KUpdate, tables: done.tables } }),
-    },
+      Ok(s) -> {
+        let where_ = sql_eat_word(s.parser, "where");
+        if where_.ate { sql_skip_expr(where_.parser, s.tables, ["returning"], false, left - 1) }
+        else { Ok(s) }
+      },
+    };
+    match filtered {
+      Err(e) -> Err(e),
+      Ok(f) -> match sql_returning(f.parser, f.tables, left - 1) {
+        Err(e) -> Err(e),
+        Ok(done) -> Ok({ parser: done.parser, scan: { kind: KUpdate, tables: done.tables } }),
+      },
+    }
   }
-}
 
 fn sql_delete(
   parser: SqlParser,
-) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} = {
-  let after_delete = sql_expect_word(parser, "delete")?;
-  let from = sql_expect_word(after_delete, "from")?;
-  let only = sql_eat_word(from, "only");
-  let named = sql_qualified_name(only.parser, 0)?;
-  let written = sql_note_written(no_sql_tables(), named.name);
-  let aliased = sql_alias(named.parser)?;
-  let using = sql_eat_word(aliased, "using");
-  let sourced = if using.ate { sql_source_list(using.parser, written) }
-  else { Ok({ parser: aliased, tables: written }) };
-  let filtered = match sourced {
-    Err(e) -> Err(e),
-    Ok(s) -> {
-      let where_ = sql_eat_word(s.parser, "where");
-      if where_.ate { sql_skip_expr(where_.parser, s.tables, ["returning"], false) } else { Ok(s) }
-    },
-  };
-  match filtered {
-    Err(e) -> Err(e),
-    Ok(f) -> match sql_returning(f.parser, f.tables) {
+  left: Int,
+) -> Result<{ parser: SqlParser, scan: SqlScan }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let after_delete = sql_expect_word(parser, "delete")?;
+    let from = sql_expect_word(after_delete, "from")?;
+    let only = sql_eat_word(from, "only");
+    let named = sql_qualified_name(only.parser, 0)?;
+    let written = sql_note_written(no_sql_tables(), named.name);
+    let aliased = sql_alias(named.parser)?;
+    let using = sql_eat_word(aliased, "using");
+    let sourced = if using.ate { sql_source_list(using.parser, written, left - 1) }
+    else { Ok({ parser: aliased, tables: written }) };
+    let filtered = match sourced {
       Err(e) -> Err(e),
-      Ok(done) -> Ok({ parser: done.parser, scan: { kind: KDelete, tables: done.tables } }),
-    },
+      Ok(s) -> {
+        let where_ = sql_eat_word(s.parser, "where");
+        if where_.ate { sql_skip_expr(where_.parser, s.tables, ["returning"], false, left - 1) }
+        else { Ok(s) }
+      },
+    };
+    match filtered {
+      Err(e) -> Err(e),
+      Ok(f) -> match sql_returning(f.parser, f.tables, left - 1) {
+        Err(e) -> Err(e),
+        Ok(done) -> Ok({ parser: done.parser, scan: { kind: KDelete, tables: done.tables } }),
+      },
+    }
   }
-}
 
 fn sql_returning(
   parser: SqlParser,
   tables: SqlTables,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let returning = sql_eat_word(parser, "returning");
-  if returning.ate { sql_skip_expr(returning.parser, tables, [], false) }
-  else { Ok({ parser: parser, tables: tables }) }
-}
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let returning = sql_eat_word(parser, "returning");
+    if returning.ate { sql_skip_expr(returning.parser, tables, [], false, left - 1) }
+    else { Ok({ parser: parser, tables: tables }) }
+  }
 
 // `values (…), (…)`: the rows are expressions, but a subquery inside one is still a statement.
+// `left` bounds the rows: each but the last takes its comma.
 fn sql_values_rows(
   parser: SqlParser,
   tables: SqlTables,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> = {
-  let open = sql_expect_punct(parser, "(");
-  match open {
-    Err(e) -> Err(e),
-    Ok(after) -> match sql_row_body(after, tables, 1) {
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> =
+  if left <= 0 { Err(db_error("XX000", "", "more rows than tokens")) } else {
+    let open = sql_expect_punct(parser, "(");
+    match open {
       Err(e) -> Err(e),
-      Ok(row) -> {
-        let comma = sql_eat_punct(row.parser, ",");
-        if comma.ate { sql_values_rows(comma.parser, row.tables) } else { Ok(row) }
+      Ok(after) -> match sql_row_body(after, tables, 1, len(after.toks) + 1) {
+        Err(e) -> Err(e),
+        Ok(row) -> {
+          let comma = sql_eat_punct(row.parser, ",");
+          if comma.ate { sql_values_rows(comma.parser, row.tables, left - 1) } else { Ok(row) }
+        },
       },
-    },
+    }
   }
-}
 
+// `left` bounds the rounds: each takes a token at least.
 fn sql_row_body(
   parser: SqlParser,
   tables: SqlTables,
   depth: Int,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> =
-  match sql_head(parser.toks) {
-    None -> Err(sql_here(parser, "this row is never closed")),
-    Some(t) -> if sql_is_punct(t.tok, "(") { sql_row_body(sql_step(parser), tables, depth + 1) }
-    else if sql_is_punct(t.tok, ")") {
-      if depth == 1 { Ok({ parser: sql_step(parser), tables: tables }) }
-      else { sql_row_body(sql_step(parser), tables, depth - 1) }
-    } else if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else {
-      match sql_check_call(parser) {
-        Err(e) -> Err(e),
-        Ok(_) -> sql_row_body(sql_step(parser), tables, depth),
-      }
-    },
+  if left <= 0 { Err(db_error("XX000", "", "more rounds than input")) } else {
+    match sql_head(parser.toks) {
+      None -> Err(sql_here(parser, "this row is never closed")),
+      Some(t) -> if sql_is_punct(t.tok, "(") {
+        sql_row_body(sql_step(parser), tables, depth + 1, left - 1)
+      } else if sql_is_punct(t.tok, ")") {
+        if depth == 1 { Ok({ parser: sql_step(parser), tables: tables }) }
+        else { sql_row_body(sql_step(parser), tables, depth - 1, left - 1) }
+      } else if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else {
+        match sql_check_call(parser) {
+          Err(e) -> Err(e),
+          Ok(_) -> sql_row_body(sql_step(parser), tables, depth, left - 1),
+        }
+      },
+    }
   }
 
 // --- Expressions ----------------------------------------------------------------------
@@ -5092,14 +5284,17 @@ fn sql_skip_expr(
   tables: SqlTables,
   stops: List<String>,
   stop_at_comma: Bool,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match sql_head(parser.toks) {
-    None -> Ok({ parser: parser, tables: tables }),
-    Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) }
-    else if sql_is_punct(t.tok, "(") { sql_skip_paren(parser, tables, stops, stop_at_comma) }
-    else if sql_is_punct(t.tok, ")") { Ok({ parser: parser, tables: tables }) }
-    else if stop_at_comma && sql_is_punct(t.tok, ",") { Ok({ parser: parser, tables: tables }) }
-    else { sql_skip_word(parser, t, tables, stops, stop_at_comma) },
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_head(parser.toks) {
+      None -> Ok({ parser: parser, tables: tables }),
+      Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else if sql_is_punct(t.tok, "(") {
+        sql_skip_paren(parser, tables, stops, stop_at_comma, left - 1)
+      } else if sql_is_punct(t.tok, ")") { Ok({ parser: parser, tables: tables }) }
+      else if stop_at_comma && sql_is_punct(t.tok, ",") { Ok({ parser: parser, tables: tables }) }
+      else { sql_skip_word(parser, t, tables, stops, stop_at_comma, left - 1) },
+    }
   }
 
 fn sql_skip_word(
@@ -5108,19 +5303,23 @@ fn sql_skip_word(
   tables: SqlTables,
   stops: List<String>,
   stop_at_comma: Bool,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match t.tok {
-    SqlWord(w) -> if !w.quoted && contains(stops, w.text) { Ok({ parser: parser, tables: tables }) }
-    else {
-      match sql_check_call(parser) {
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match t.tok {
+      SqlWord(w) -> if !w.quoted && contains(stops, w.text) {
+        Ok({ parser: parser, tables: tables })
+      } else {
+        match sql_check_call(parser) {
+          Err(e) -> Err(e),
+          Ok(_) -> sql_skip_expr(sql_step(parser), tables, stops, stop_at_comma, left - 1),
+        }
+      },
+      _ -> match sql_check_call(parser) {
         Err(e) -> Err(e),
-        Ok(_) -> sql_skip_expr(sql_step(parser), tables, stops, stop_at_comma),
-      }
-    },
-    _ -> match sql_check_call(parser) {
-      Err(e) -> Err(e),
-      Ok(_) -> sql_skip_expr(sql_step(parser), tables, stops, stop_at_comma),
-    },
+        Ok(_) -> sql_skip_expr(sql_step(parser), tables, stops, stop_at_comma, left - 1),
+      },
+    }
   }
 
 // A `(` inside an expression opens either a subquery, whose tables count, or a group, whose
@@ -5130,71 +5329,95 @@ fn sql_skip_paren(
   tables: SqlTables,
   stops: List<String>,
   stop_at_comma: Bool,
-) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} = {
-  let opened = sql_step(parser);
-  if sql_at_word(opened, "select") || sql_at_word(opened, "values") || sql_at_word(opened, "with") {
-    match sql_statement(opened) {
-      Err(e) -> Err(e),
-      Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
+  left: Int,
+) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    let opened = sql_step(parser);
+    if sql_at_word(opened, "select") || sql_at_word(opened, "values")
+        || sql_at_word(opened, "with") {
+      match sql_statement(opened, left - 1) {
         Err(e) -> Err(e),
-        Ok(after) ->
-          sql_skip_expr(after, sql_absorb_tables(tables, inner.scan.tables), stops, stop_at_comma),
-      },
-    }
-  } else {
-    match sql_skip_group(opened, tables, 1) {
-      Err(e) -> Err(e),
-      Ok(closed) -> sql_skip_expr(closed.parser, closed.tables, stops, stop_at_comma),
+        Ok(inner) -> match sql_expect_punct(inner.parser, ")") {
+          Err(e) -> Err(e),
+          Ok(after) ->
+            sql_skip_expr(
+              after,
+              sql_absorb_tables(tables, inner.scan.tables),
+              stops,
+              stop_at_comma,
+              left - 1,
+            ),
+        },
+      }
+    } else {
+      match sql_skip_group(opened, tables, 1, left - 1) {
+        Err(e) -> Err(e),
+        Ok(closed) -> sql_skip_expr(closed.parser, closed.tables, stops, stop_at_comma, left - 1),
+      }
     }
   }
-}
 
 // The body of a group, from just after its `(`, to just past the `)` that closes it.
 fn sql_skip_group(
   parser: SqlParser,
   tables: SqlTables,
   depth: Int,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match sql_head(parser.toks) {
-    None -> Err(sql_here(parser, "this group is never closed")),
-    Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else if sql_is_punct(t.tok, "(") {
-      match sql_check_call(parser) {
-        Err(e) -> Err(e),
-        Ok(_) -> sql_skip_group(sql_step(parser), tables, depth + 1),
-      }
-    } else if sql_is_punct(t.tok, ")") {
-      if depth == 1 { Ok({ parser: sql_step(parser), tables: tables }) } else {
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_head(parser.toks) {
+      None -> Err(sql_here(parser, "this group is never closed")),
+      Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else if sql_is_punct(t.tok, "(") {
         match sql_check_call(parser) {
           Err(e) -> Err(e),
-          Ok(_) -> sql_skip_group(sql_step(parser), tables, depth - 1),
+          Ok(_) -> sql_skip_group(sql_step(parser), tables, depth + 1, left - 1),
         }
-      }
-    } else if sql_at_word(parser, "select") || sql_at_word(parser, "values")
-        || sql_at_word(parser, "with") {
-      match sql_statement(parser) {
-        Err(e) -> Err(e),
-        Ok(inner) ->
-          sql_skip_group(inner.parser, sql_absorb_tables(tables, inner.scan.tables), depth),
-      }
-    } else {
-      match sql_check_call(parser) {
-        Err(e) -> Err(e),
-        Ok(_) -> sql_skip_group(sql_step(parser), tables, depth),
-      }
-    },
+      } else if sql_is_punct(t.tok, ")") {
+        if depth == 1 { Ok({ parser: sql_step(parser), tables: tables }) } else {
+          match sql_check_call(parser) {
+            Err(e) -> Err(e),
+            Ok(_) -> sql_skip_group(sql_step(parser), tables, depth - 1, left - 1),
+          }
+        }
+      } else if sql_at_word(parser, "select") || sql_at_word(parser, "values")
+          || sql_at_word(parser, "with") {
+        match sql_statement(parser, left - 1) {
+          Err(e) -> Err(e),
+          Ok(inner) ->
+            sql_skip_group(
+              inner.parser,
+              sql_absorb_tables(tables, inner.scan.tables),
+              depth,
+              left - 1,
+            ),
+        }
+      } else {
+        match sql_check_call(parser) {
+          Err(e) -> Err(e),
+          Ok(_) -> sql_skip_group(sql_step(parser), tables, depth, left - 1),
+        }
+      },
+    }
   }
 
 // The body of a parenthesised group whose opening paren is already eaten.
 fn sql_skip_parens(
   parser: SqlParser,
   tables: SqlTables,
+  left: Int,
 ) -> Result<{ parser: SqlParser, tables: SqlTables }, DbError> / {abort.raise} =
-  match sql_skip_group(parser, tables, 1) {
-    Err(e) -> Err(e),
-    Ok(closed) -> Ok({ parser: closed.parser, tables: closed.tables }),
+  if left <= 0 { panic("more calls than tokens allow") } else {
+    match sql_skip_group(parser, tables, 1, left - 1) {
+      Err(e) -> Err(e),
+      Ok(closed) -> Ok({ parser: closed.parser, tables: closed.tables }),
+    }
   }
 
 // --- The entry point ------------------------------------------------------------------
+
+// Every cycle through the reader takes a token, so a path meets each of its thirty functions once
+// per token at most: the room the reader starts with is the tokens and one, thirty times over.
+fn reader_functions() -> Int = 30
 
 // What `sql` does and which tables it reaches, or why it is refused. Nothing below the driver's
 // own read of the verb depends on a guess: an unmodelled construct is a table set that would be
@@ -5202,12 +5425,10 @@ fn sql_skip_parens(
 pub fn scan_statement(sql: String) -> Result<SqlScan, DbError> / {abort.raise} =
   match tokenize(sql) {
     Err(e) -> Err(e),
-    Ok(toks) -> match sql_statement({
-        toks: toks,
-        ctes: [],
-        depth: 0,
-        end_pos: bytes_len(bytes_of_string(sql)),
-      }) {
+    Ok(toks) -> match sql_statement(
+        { toks: toks, ctes: [], depth: 0, end_pos: bytes_len(bytes_of_string(sql)) },
+        (len(toks) + 1) * reader_functions(),
+      ) {
       Err(e) -> Err(e),
       Ok(s) -> match sql_nothing_left(s.parser) { Err(e) -> Err(e), Ok(_) -> Ok(s.scan) },
     },
@@ -6657,27 +6878,34 @@ fn t_message(w: Wire, refusals: List<Refusal>, kind: Int, body: Bytes) -> Fed / 
   else if kind == 88 { { wire: { ..w, open: false }, refusals: refusals } }
   else { { wire: w, refusals: refusals } }
 
-// Every whole message in the inbox; the start-up message has no kind byte.
-fn t_feed(w: Wire, refusals: List<Refusal>) -> Fed / {abort.raise} =
-  if !w.started {
-    match u32_be_at(w.inbox, 0) {
-      None -> { wire: w, refusals: refusals },
-      Some(n) -> if bytes_len(w.inbox) < n { { wire: w, refusals: refusals } } else {
-        t_feed({ ..w, inbox: bytes_slice(w.inbox, n, bytes_len(w.inbox)), started: true }, refusals)
-      },
-    }
-  } else {
-    match u32_be_at(w.inbox, 1) {
-      None -> { wire: w, refusals: refusals },
-      Some(n) -> if bytes_len(w.inbox) < 1 + n { { wire: w, refusals: refusals } } else {
-        let fed = t_message(
-          { ..w, inbox: bytes_slice(w.inbox, 1 + n, bytes_len(w.inbox)) },
-          refusals,
-          bytes_at(w.inbox, 0),
-          bytes_slice(w.inbox, 5, 1 + n),
-        );
-        t_feed(fed.wire, fed.refusals)
-      },
+// Every whole message in the inbox; the start-up message has no kind byte, and a length under
+// its own four bytes is no message. `left` bounds the rounds: each takes four bytes at least.
+fn t_feed(w: Wire, refusals: List<Refusal>, left: Int) -> Fed / {abort.raise} =
+  if left <= 0 { panic("more rounds than input") } else {
+    if !w.started {
+      match u32_be_at(w.inbox, 0) {
+        None -> { wire: w, refusals: refusals },
+        Some(n) -> if n < 4 || bytes_len(w.inbox) < n { { wire: w, refusals: refusals } } else {
+          t_feed(
+            { ..w, inbox: bytes_slice(w.inbox, n, bytes_len(w.inbox)), started: true },
+            refusals,
+            left - 1,
+          )
+        },
+      }
+    } else {
+      match u32_be_at(w.inbox, 1) {
+        None -> { wire: w, refusals: refusals },
+        Some(n) -> if n < 4 || bytes_len(w.inbox) < 1 + n { { wire: w, refusals: refusals } } else {
+          let fed = t_message(
+            { ..w, inbox: bytes_slice(w.inbox, 1 + n, bytes_len(w.inbox)) },
+            refusals,
+            bytes_at(w.inbox, 0),
+            bytes_slice(w.inbox, 5, 1 + n),
+          );
+          t_feed(fed.wire, fed.refusals, left - 1)
+        },
+      }
     }
   }
 
@@ -6685,7 +6913,8 @@ fn t_sent(f: Fake, c: Int, payload: Bytes) -> Fake / {abort.raise} =
   match list_at(f.wires, c) {
     None -> panic("a send on a connection the script never opened"),
     Some(w) -> if !w.open { f } else {
-      let fed = t_feed({ ..w, inbox: bytes_concat(w.inbox, payload) }, f.refusals);
+      let inbox = bytes_concat(w.inbox, payload);
+      let fed = t_feed({ ..w, inbox: inbox }, f.refusals, bytes_len(inbox) + 1);
       { wires: list_set(f.wires, c, fed.wire), refusals: fed.refusals }
     },
   }
