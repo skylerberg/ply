@@ -16,8 +16,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-pub const DECLARATION: &str = ply_std::NET;
-
 pub const MODULE: &str = "std.net";
 
 pub const EFFECT: &str = "std.net.net";

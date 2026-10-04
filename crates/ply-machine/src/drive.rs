@@ -196,7 +196,7 @@ impl Target {
         let printed = |name: &Symbol| {
             name.as_str()
                 .rsplit_once('.')
-                .is_some_and(|(module, _)| !crate::shelf::is_shipped_name(module))
+                .is_some_and(|(module, _)| !crate::shipped_modules::is_shipped_name(module))
         };
         if let Some((name, _)) = hashes
             .defs

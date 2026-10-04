@@ -1,6 +1,6 @@
 //! The fronts `ply run` files once a load holds and reads back over a later run's walk: the walk's
-//! own files where it names them, the shelf the filed answer pulled, the unit's C, and the promises
-//! the filed load checked, held.
+//! own files where it names them, the shipped modules the filed answer pulled, the unit's C, and
+//! the promises the filed load checked, held.
 
 use crate::fixture::{handed, project};
 use ply_eval::Span;
@@ -38,10 +38,7 @@ fn walk(dir: &Path, named: &str) -> Vec<Walked> {
 fn a_filed_front_reads_back_over_the_walk_that_asks_for_it() {
     let dir = project(PULLING);
     let (front, entry) = filed(dir.path());
-    assert!(
-        front.files.len() > 1,
-        "the fixture pulls a shipped module off the shelf"
-    );
+    assert!(front.files.len() > 1, "the fixture pulls a shipped module");
     let (back, unit) = reused::front(&entry, walk(dir.path(), "elsewhere/m.ply"), Vec::new())
         .expect("the entry reads back");
     assert_eq!(unit, UNIT, "the unit is read back as it was filed");
@@ -56,7 +53,7 @@ fn a_filed_front_reads_back_over_the_walk_that_asks_for_it() {
         assert_eq!(
             (&was.path, &was.name, &was.text),
             (&now.path, &now.name, &now.text),
-            "a shelved module is placed as the filed answer pulled it"
+            "a shipped module is placed as the filed answer pulled it"
         );
     }
     assert_eq!(

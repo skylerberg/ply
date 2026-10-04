@@ -23,9 +23,9 @@ pub struct Walked {
     pub text: String,
 }
 
-/// The front `entry` filed, over this run's own files: the walk's modules, the shelf the filed
-/// answer pulled, then the walk's manifests, in the order its ids run, and the C of the unit it was
-/// emitted as. The places are this run's, so a span renders as this run's front end would have
+/// The front `entry` filed, over this run's own files: the walk's modules, the shipped modules the
+/// filed answer pulled, then the walk's manifests, in the order its ids run, and the C of the unit
+/// it was emitted as. The places are this run's, so a span renders as this run's front end would have
 /// rendered it. `None` when the entry does not read or does not fit the walk.
 pub fn front(
     entry: &[u8],
@@ -45,7 +45,7 @@ pub fn front(
     let mut files = Vec::with_capacity(filed.files.len());
     for (i, (path, name)) in filed.files.into_iter().enumerate() {
         let (path, text) = if (own..own + pulled).contains(&i) {
-            let text = crate::shelf::source(&ModuleName::from_dotted(&name))?;
+            let text = crate::shipped_modules::source(&ModuleName::from_dotted(&name))?;
             (path, text.to_string())
         } else {
             let file = walked.next()?;

@@ -11,9 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-/// The Ply declaration the registrations below are checked against.
-pub const DECLARATION: &str = ply_std::SIGNAL;
-
 pub const MODULE: &str = "std.signal";
 
 pub const EFFECT: &str = "std.signal.signal";
