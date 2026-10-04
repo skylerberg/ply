@@ -2949,10 +2949,13 @@ pub fn result_is_err<a, e>(r: Result<a, e>) -> Bool
 pub fn result_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> Result<a, e> / row) -> Result<a, e> / row bounded
 pub fn result_unwrap_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> a / row) -> a / row bounded
 pub fn result_map_or<a, b, e | row>(r: Result<a, e>, fallback: b, f: (a) -> b / row) -> b / row bounded
+pub fn result_all<a, e>(rs: List<Result<a, e>>) -> Result<List<a>, e>
 ```
 
 The same shape over `Ok`/`Err`. `result_map_err` is how a low-level failure
-becomes the one a caller names.
+becomes the one a caller names. `result_all` is every success in order, or the
+first failure, so `result_all(map(xs, parse))` reads a whole list or answers why
+it could not.
 
 ### 13.28 `std.math`
 
