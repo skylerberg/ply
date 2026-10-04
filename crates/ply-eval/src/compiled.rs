@@ -32,6 +32,9 @@ pub trait Compiled {
 
     fn set_seed(&self, _seed: Seed, _steps: u32) {}
 
+    /// The machine an entry runs for, which every host request it makes names.
+    fn set_machine(&self, _machine: crate::host::MachineId) {}
+
     /// The calls the last entry's body made: 0 when no body ran, as when a memo answered it.
     fn steps(&self) -> u64 {
         0

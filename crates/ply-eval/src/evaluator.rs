@@ -104,6 +104,11 @@ impl<'a> Machine<'a> {
         Ok(machine)
     }
 
+    /// What every host request an entry of this machine makes names it by.
+    pub fn id(&self) -> MachineId {
+        self.id
+    }
+
     pub fn with_max_calls(mut self, max: usize) -> Machine<'a> {
         self.max_calls = max.max(1);
         self
@@ -199,6 +204,7 @@ impl<'a> Machine<'a> {
     /// any other answer is Ply's defect.
     fn compiled_test(&mut self, module: &ModuleName, ordinal: usize, span: Span) -> Ended<()> {
         let root = module.qualify(&Symbol::new(format!("test#{ordinal}")));
+        self.compiled.set_machine(self.id);
         self.compiled.set_seed(self.seed.clone(), self.sim_steps);
         let entered = self.compiled.enter_test(&root, self.max_calls);
         self.record_compiled_atoms();
@@ -242,6 +248,7 @@ impl<'a> Machine<'a> {
     }
 
     fn compiled_call(&mut self, sym: &Symbol, args: Vec<Value>, span: Span) -> Ended<Value> {
+        self.compiled.set_machine(self.id);
         self.compiled.set_seed(self.seed.clone(), self.sim_steps);
         let entered = self.compiled.enter_whole(sym, &args, self.max_calls);
         self.record_compiled_atoms();

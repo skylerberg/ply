@@ -267,21 +267,19 @@ fn current<[r]>(store: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} 
 
 type Published = { failed: Int, known: Map<Bytes, Bool> }
 
-// Each of `puts` the upstream does not hold, published there; `known` is what it holds of `passes`.
+// Each of `puts` published there; `known` is what it holds of `passes`.
 fn published_to<[u]>(
   up: Upstream,
   puts: List<Put>,
   known: Map<Bytes, Bool>,
   passes: Int,
-) -> Published / {fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} = {
-  let fresh = filter(puts, |p: Put| p.table != passes || !map_contains(known, p.key));
+) -> Published / {fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} =
   {
-    failed: fold(fresh, 0, |n: Int, p: Put|
+    failed: fold(puts, 0, |n: Int, p: Put|
       if publish[u](up, p.table, p.key, p.payload) { n } else { n + 1 }),
-    known: fold(fresh, known, |m: Map<Bytes, Bool>, p: Put|
+    known: fold(puts, known, |m: Map<Bytes, Bool>, p: Put|
       if p.table == passes { map_insert(m, p.key, true) } else { m }),
   }
-}
 
 // The local write comes first, so an upstream that cannot be reached never costs a run its own record.
 pub fn flush_shared<[r], [u]>(
@@ -541,8 +539,38 @@ fn keys_in(cache: Cache, table: Int, shared: Map<Bytes, Bool>) -> List<Bytes> / 
 pub fn passed<[r]>(cache: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
   passed_in[r](cache, t_passed(), cache.shared, key)
 
-pub fn put_passed(cache: Cache, key: Bytes) -> Cache / {abort.raise} =
-  { ..cache, store: put(cache.store, t_passed(), key, b"") }
+// The trace a pass filed under `key` here, or else in the upstream, stands on.
+fn trace_in<[r], [u]>(
+  cache: Cache,
+  table: Int,
+  up: Option<Upstream>,
+  shared: Map<Bytes, Bool>,
+  key: Bytes,
+) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
+  match get[r](cache.store, table, key) {
+    Hit(trace) -> { value: Some(trace), cache: cache },
+    Bad(why) -> { value: None, cache: noted(cache, damaged("result", why)) },
+    Miss -> match up {
+      None -> { value: None, cache: cache },
+      Some(u) -> if !map_contains(shared, key) { { value: None, cache: cache } } else {
+        match read_entry[u](u, table, key) {
+          Hit(trace) -> { value: Some(trace), cache: cache },
+          Miss -> { value: None, cache: cache },
+          Bad(why) -> { value: None, cache: noted(cache, damaged("upstream result", why)) },
+        }
+      },
+    },
+  }
+
+pub fn pass_trace<[r], [u]>(
+  cache: Cache,
+  key: Bytes,
+) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
+  trace_in[r, u](cache, t_passed(), cache.upstream, cache.shared, key)
+
+// A pass, with the trace of what its run read.
+pub fn put_passed(cache: Cache, key: Bytes, trace: Bytes) -> Cache / {abort.raise} =
+  { ..cache, store: put(cache.store, t_passed(), key, trace) }
 
 // Every key a pass is filed under here or in the upstream, read from the index alone.
 pub fn passed_keys(cache: Cache) -> List<Bytes> / {abort.raise} =
@@ -552,8 +580,14 @@ pub fn passed_keys(cache: Cache) -> List<Bytes> / {abort.raise} =
 pub fn passed_code<[r]>(cache: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
   passed_in[r](cache, t_code_passes(), cache.code_shared, key)
 
-pub fn put_passed_code(cache: Cache, key: Bytes) -> Cache / {abort.raise} =
-  { ..cache, store: put(cache.store, t_code_passes(), key, b"") }
+pub fn code_pass_trace<[r], [u]>(
+  cache: Cache,
+  key: Bytes,
+) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
+  trace_in[r, u](cache, t_code_passes(), cache.code_upstream, cache.code_shared, key)
+
+pub fn put_passed_code(cache: Cache, key: Bytes, trace: Bytes) -> Cache / {abort.raise} =
+  { ..cache, store: put(cache.store, t_code_passes(), key, trace) }
 
 pub fn passed_code_keys(cache: Cache) -> List<Bytes> / {abort.raise} =
   keys_in(cache, t_code_passes(), cache.code_shared)
@@ -894,7 +928,7 @@ test "every table round-trips through a flush and a reopen" {
     );
     let c3 = put_body(put_decl[mem](c2, name_key("ty"), "m.T", b"T"), key_of_body(b), b);
     let c4 = put_pass_record(
-      observe_definition(put_passed(c3, name_key("result")), name_key("m.f")),
+      observe_definition(put_passed(c3, name_key("result"), b""), name_key("m.f")),
       "m.t",
       record(["m.f"]),
     );
@@ -1074,7 +1108,7 @@ test "an upstream's passes and evidence answer here, and what this run learns is
   let run = on_twin(mem_empty(), || {
     let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
     let a1 = flush_shared[mem, mem](
-      put_evidence(put_passed(a, name_key("pass")), name_key("claim"), b"evidence"),
+      put_evidence(put_passed(a, name_key("pass"), b""), name_key("claim"), b"evidence"),
     );
     let b = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
     let lonely = open_cache[mem]("three/cache", "three", [], built());
@@ -1089,11 +1123,28 @@ test "an upstream's passes and evidence answer here, and what this run learns is
   assert_eq(run.value, [true, true, true, true, true])
 }
 
+test "a pass is read back with its trace, here or from the upstream, and filed again on another" {
+  let run = on_twin(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
+    let _a1 = flush_shared[mem, mem](put_passed(a, name_key("pass"), b"read a"));
+    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
+    let first = pass_trace[mem, mem](b, name_key("pass")).value;
+    let _b1 = flush_shared[mem, mem](put_passed(b, name_key("pass"), b"read b"));
+    let c = with_upstream[mem](open_cache[mem]("three/cache", "three", [], built()), "shared", true);
+    [
+      first,
+      pass_trace[mem, mem](c, name_key("pass")).value,
+      pass_trace[mem, mem](c, name_key("other")).value,
+    ]
+  });
+  assert_eq(run.value, [Some(b"read a"), Some(b"read b"), None])
+}
+
 test "a pass filed under the code its test ran outlives another runtime stamp, and goes with its own" {
   let run = on_twin(mem_empty(), || {
     let a = open_cache[mem]("cache", "", [], built());
     let _filed = flush_cache[mem](
-      put_passed_code(put_passed(a, name_key("result")), name_key("code")),
+      put_passed_code(put_passed(a, name_key("result"), b""), name_key("code"), b""),
     );
     let moved = open_cache[mem]("cache", "", [], { ..built(), runtime: "another" });
     let recoded = open_cache[mem]("cache", "", [], {
@@ -1114,7 +1165,7 @@ test "a pass filed under its code is shared under a schema of its own, which ano
   let run = on_twin(mem_empty(), || {
     let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
     let _published = flush_shared[mem, mem](
-      put_passed_code(put_passed(a, name_key("pass")), name_key("code")),
+      put_passed_code(put_passed(a, name_key("pass"), b""), name_key("code"), b""),
     );
     let b = with_upstream[mem](
       open_cache[mem]("two/cache", "two", [], { ..built(), runtime: "another" }),
@@ -1147,7 +1198,7 @@ test "a publishing run marks every schema it used live, and a read-only one mark
 test "a read-only upstream answers and is not written" {
   let run = on_twin(mem_empty(), || {
     let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", false);
-    let a1 = flush_shared[mem, mem](put_passed(a, name_key("pass")));
+    let a1 = flush_shared[mem, mem](put_passed(a, name_key("pass"), b""));
     let b = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
     passed[mem](b, name_key("pass")).value
   });
@@ -1158,15 +1209,15 @@ test "two runs publishing one pass race harmlessly, and an unwritable upstream i
   let run = on_twin(mem_empty(), || {
     let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
     let b = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
-    let a1 = flush_shared[mem, mem](put_passed(a, name_key("pass")));
-    let b1 = flush_shared[mem, mem](put_passed(b, name_key("pass")));
+    let a1 = flush_shared[mem, mem](put_passed(a, name_key("pass"), b""));
+    let b1 = flush_shared[mem, mem](put_passed(b, name_key("pass"), b""));
     let blocked = fs.write_file[mem]("blocked", b"a file where the upstream should be");
     let c = with_upstream[mem](
       open_cache[mem]("three/cache", "three", [], built()),
       "blocked",
       true,
     );
-    let c1 = flush_shared[mem, mem](put_passed(c, name_key("mine")));
+    let c1 = flush_shared[mem, mem](put_passed(c, name_key("mine"), b""));
     let again = open_cache[mem]("three/cache", "three", [], built());
     {
       clean: warnings(a1) == [] && warnings(b1) == [],
@@ -1186,6 +1237,7 @@ test "entries filed under another build's stamp are dropped group by group, and 
     let c0 = put_passed(
       put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.f"])),
       name_key("t"),
+      b"",
     );
     let c1 = put_review(c0, "m.f", { def: name_key("m.f"), specs: [] });
     let written = flush_cache[mem](c1);
@@ -1216,6 +1268,7 @@ test "a pass or a claim's evidence filed by another runtime is not believed" {
       put_passed(
         put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.f"])),
         name_key("t"),
+        b"",
       ),
       name_key("claim"),
       b"evidence",
@@ -1238,7 +1291,7 @@ test "a pass or a claim's evidence filed by another runtime is not believed" {
 test "an upstream answers only the runtime that published to it" {
   let run = on_twin(mem_empty(), || {
     let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
-    let published = flush_shared[mem, mem](put_passed(a, name_key("pass")));
+    let published = flush_shared[mem, mem](put_passed(a, name_key("pass"), b""));
     let same = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
     let other = with_upstream[mem](
       open_cache[mem]("three/cache", "three", [], { ..built(), runtime: "another runtime" }),

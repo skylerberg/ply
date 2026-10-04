@@ -3,7 +3,7 @@
 // may record as seen. The runtime ran the tests; what their results establish is decided here.
 
 import std.list (sort)
-import select (Cached, Reason, passed_before)
+import select (Cached, Pass, Reason, passed_before)
 
 /// A search a seeded test ran, as concluding reads it.
 pub type Searched = { explored: Int, exhaustive: Bool, exhausted: Bool, failed: Bool }
@@ -14,8 +14,10 @@ pub type Ran<d> = {
   /// `passed`, `failed`, `panicked` or `abandoned`.
   status: String,
   failure: Option<d>,
-  /// The run reached a host handler, so its verdict is about that moment only.
+  /// The run reached a host handler, so running it again acts on the world again.
   host: Bool,
+  /// What the run read, which its pass is filed with; `None` when no trace stands in for it.
+  trace: Option<Bytes>,
   /// `None` for a test that ran once, and for a search no interleaving of which was observed.
   searched: Option<Searched>,
   /// The roots its search started from.
@@ -51,8 +53,8 @@ pub type Record =
   | Exhausted
   // The footprint reads a seed and no search was observed.
   | Unobserved
-  // The run reached a host handler.
-  | Host
+  // The run did something no trace stands in for.
+  | Untraced
 
 pub fn written(r: Record) -> Bool = match r { Under(_) -> true, _ -> false }
 
@@ -96,8 +98,8 @@ pub type PassRecord = { test: String, closure: List<Named>, decls: List<Named> }
 /// What the store is told: passes by key and by the code their tests ran, pass records by test, and
 /// the definitions it may record as seen.
 pub type Filing = {
-  passes: List<String>,
-  codes: List<String>,
+  passes: List<Pass>,
+  codes: List<Pass>,
   records: List<{ key: String, record: PassRecord }>,
   seen: List<String>,
 }
@@ -143,8 +145,8 @@ type Tally<d> = {
   failed: Int,
   abandoned: Int,
   notices: List<Notice>,
-  passes: List<String>,
-  codes: List<String>,
+  passes: List<Pass>,
+  codes: List<Pass>,
   records: List<{ key: String, record: PassRecord }>,
 }
 
@@ -224,10 +226,9 @@ fn one<d>(
             suspects: suspects_of(h, declared.key, changed),
           }),
         },
-      None -> if r.host {
-        { ..t, outcomes: push(t.outcomes, outcome(Some(Host))), passed: t.passed + 1 }
-      } else {
-        match map_get(chosen.filed, r.index) {
+      None -> match r.trace {
+        None -> { ..t, outcomes: push(t.outcomes, outcome(Some(Untraced))), passed: t.passed + 1 },
+        Some(trace) -> match map_get(chosen.filed, r.index) {
           None -> { ..t, outcomes: push(t.outcomes, outcome(None)), passed: t.passed + 1 },
           Some(keys) -> {
             let record = record_under(keys, declared.seeded, r.searched);
@@ -236,12 +237,14 @@ fn one<d>(
               _ -> t.notices,
             };
             let passes = match record {
-              Under(under) -> fold(under, t.passes, |acc: List<String>, k: String| push(acc, k)),
+              Under(under) ->
+                fold(under, t.passes, |acc: List<Pass>, k: String|
+                  push(acc, { key: k, trace: trace })),
               _ -> t.passes,
             };
             let codes = match map_get(chosen.codes, r.index) {
               Some(cs) -> if written(record) {
-                fold(cs, t.codes, |acc: List<String>, k: String| push(acc, k))
+                fold(cs, t.codes, |acc: List<Pass>, k: String| push(acc, { key: k, trace: trace }))
               } else { t.codes },
               None -> t.codes,
             };
@@ -416,7 +419,17 @@ fn every(tests: List<Test>) -> Chosen =
   }
 
 fn passing(index: Int) -> Ran<String> =
-  { index: index, status: "passed", failure: None, host: false, searched: None, seeds: 0 }
+  {
+    index: index,
+    status: "passed",
+    failure: None,
+    host: false,
+    trace: Some(b""),
+    searched: None,
+    seeds: 0,
+  }
+
+fn pass_of(key: String) -> Pass = { key: key, trace: b"" }
 
 fn failing(index: Int) -> Ran<String> =
   { ..passing(index), status: "failed", failure: Some("assertion failed") }
@@ -427,8 +440,8 @@ test "a pass is filed under its keys with its closure, and a failure under none"
   let c = concluded(both(), a_program(), every(both()), map_new(), [passing(0), failing(1)]);
   assert_eq(c.passed, 1);
   assert_eq(c.failed, 1);
-  assert_eq(c.filing.passes, ["t0"]);
-  assert_eq(c.filing.codes, ["c0"]);
+  assert_eq(c.filing.passes, [pass_of("t0")]);
+  assert_eq(c.filing.codes, [pass_of("c0")]);
   assert_eq(c.filing.records, [
     {
       key: "m.adds",
@@ -457,11 +470,11 @@ test "a failure suspects exactly the definitions in its closure the store never 
   assert_eq(map(c.failures, |f: Failed<String>| f.suspects), [["m.twice"]])
 }
 
-test "a host-backed pass, an abandoned run and a defect are each recorded for what they are" {
-  let hosted = { ..passing(0), host: true };
+test "an untraced pass, an abandoned run and a defect are each recorded for what they are" {
+  let untraced = { ..passing(0), host: true, trace: None };
   let stopped = { ..failing(1), status: "abandoned" };
-  let c = concluded(both(), a_program(), every(both()), map_new(), [hosted, stopped]);
-  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [Some(Host), None]);
+  let c = concluded(both(), a_program(), every(both()), map_new(), [untraced, stopped]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [Some(Untraced), None]);
   assert_eq(c.abandoned, 1);
   assert_eq(c.failed, 0);
   assert_eq(c.filing.passes, []);
@@ -508,7 +521,7 @@ test "a pass is written under exactly the keys it was filed under, a seeded one'
   let c = concluded(seeded, a_program(), chosen, map_new(), [
     { ..passing(0), searched: Some(searched(3, false, false)), seeds: 2 },
   ]);
-  assert_eq(c.filing.passes, ["plan", "root 0", "root 1"]);
+  assert_eq(c.filing.passes, map(["plan", "root 0", "root 1"], pass_of));
   assert_eq(c.simulation.seeds, 2);
   assert_eq(c.simulation.exhaustive, 1)
 }
@@ -550,6 +563,14 @@ test "only a pass with a hash is filed with a pass record" {
   let unhashed = [{ ..a_test(0, "adds"), hash: None }];
   let chosen = { ..every(unhashed), filed: map_insert(map_new(), 0, ["k"]) };
   let c = concluded(unhashed, a_program(), chosen, map_new(), [passing(0)]);
-  assert_eq(c.filing.passes, ["k"]);
+  assert_eq(c.filing.passes, [pass_of("k")]);
   assert_eq(c.filing.records, [])
+}
+
+test "a pass that reached the host is filed with what it read, in both of its keys" {
+  let hosted = { ..passing(0), host: true, trace: Some(b"file\tcwd\ta.txt\tb3\n") };
+  let c = concluded(both(), a_program(), every(both()), map_new(), [hosted]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [Some(Under(["t0"]))]);
+  assert_eq(c.filing.passes, [{ key: "t0", trace: b"file\tcwd\ta.txt\tb3\n" }]);
+  assert_eq(c.filing.codes, [{ key: "c0", trace: b"file\tcwd\ta.txt\tb3\n" }])
 }

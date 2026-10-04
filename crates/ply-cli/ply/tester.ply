@@ -64,6 +64,8 @@ pub nondet effect tester {
   read executed[r](unit: Int, index: Int) -> Executed
   // One interleaving of a seeded test, the one `seed` names.
   read interleaved[r](unit: Int, index: Int, seed: Seed, steps: Int, re_executed: Bool) -> Interleaved
+  // Whether every read a pass's trace holds still answers as it did.
+  read unchanged[r](trace: Bytes) -> Bool
 }
 
 // A unit tests run in, from a front end the program ran: its C emitted here and the unit made of
@@ -88,15 +90,16 @@ pub effect hermetic_tester {
   write ended[r]() -> Unit
   read executed[r](unit: Int, index: Int) -> Executed
   read interleaved[r](unit: Int, index: Int, seed: Seed, steps: Int, re_executed: Bool) -> Interleaved
+  read unchanged[r](trace: Bytes) -> Bool
 }
 
-// The result cache, which whoever opened it handles: what opening it degraded past, each key's
-// outcome, each code key's, whether each definition was ever seen, each test's last pass, stored
-// bodies, and filed interfaces.
+// The result cache, which whoever opened it handles: what opening it degraded past, the pass filed
+// under each key and each code key as the trace its run read, whether each definition was ever
+// seen, each test's last pass, stored bodies, and filed interfaces.
 pub effect ledger {
   read opened() -> List<Diag>
-  read outcomes(keys: List<String>) -> List<Option<String>>
-  read code_outcomes(keys: List<String>) -> List<Option<String>>
+  read passes(keys: List<String>) -> List<Option<Bytes>>
+  read code_passes(keys: List<String>) -> List<Option<Bytes>>
   read seen(hashes: List<String>) -> List<Bool>
   read baselines(keys: List<String>) -> List<Option<PassRecord>>
   read bodies(hashes: List<String>) -> List<Option<Bytes>>
@@ -105,7 +108,7 @@ pub effect ledger {
 }
 
 // What running a test, or one interleaving of it, cost and reached, whatever it decided. `host` is
-// whether it reached a host handler, which makes a green verdict about that moment only.
+// whether it reached a host handler, so that running it again acts on the world again.
 pub type Usage = {
   duration_us: Int,
   host: Bool,
@@ -118,14 +121,20 @@ pub type Usage = {
   teardown: List<Diag>,
 }
 
-// How one run of a test ended: `passed`, `failed`, `panicked` or `abandoned`.
-pub type Executed = { status: String, failure: Option<Raised>, usage: Usage }
+// How one run of a test ended: `passed`, `failed`, `panicked` or `abandoned`; and what it read,
+// which its pass is filed with, `None` when no trace stands in for the run.
+pub type Executed = { status: String, failure: Option<Raised>, usage: Usage, trace: Option<Bytes> }
 
 // A failing interleaving's failure, and how a report classes it.
 pub type InterleavingFailure = { status: String, failure: Raised }
 
 // `observed` is whether the test entered a `simulate` region, and so had a schedule to vary.
-pub type Interleaved = { run: Interleaving<InterleavingFailure>, observed: Bool, usage: Usage }
+pub type Interleaved = {
+  run: Interleaving<InterleavingFailure>,
+  observed: Bool,
+  usage: Usage,
+  trace: Option<Bytes>,
+}
 
 // What the first unit's backend did, apart from the entries each test counted. `unbuilt` counts the
 // threads that could not build it and so declined every call.
@@ -163,6 +172,24 @@ pub fn no_usage() -> Usage =
   { duration_us: 0, host: false, entries: 0, declines: 0, performs: 0, teardown: [] }
 
 // Two runs' costs, as one test that ran both.
+// What two runs of one test read between them: every line of either, sorted, as a trace is. `None`
+// when either has no trace to stand in for it.
+pub fn joined_trace(a: Option<Bytes>, b: Option<Bytes>) -> Option<Bytes> / {abort.raise} =
+  match ((a, b)) {
+    (Some(x), Some(y)) -> if x == y { Some(x) } else {
+      let lines = fold(
+        concat(
+          string_split(string_of_bytes_lossy(x), "\n"),
+          string_split(string_of_bytes_lossy(y), "\n"),
+        ),
+        map_new(),
+        |m: Map<String, Bool>, line: String| if line == "" { m } else { map_insert(m, line, true) },
+      );
+      Some(bytes_of_string(fold(map_keys(lines), "", |acc: String, line: String| acc ++ line ++ "\n")))
+    },
+    _ -> None,
+  }
+
 pub fn sum_usage(a: Usage, b: Usage) -> Usage =
   {
     duration_us: a.duration_us + b.duration_us,
@@ -172,3 +199,9 @@ pub fn sum_usage(a: Usage, b: Usage) -> Usage =
     performs: a.performs + b.performs,
     teardown: fold(b.teardown, a.teardown, |acc: List<Diag>, diag: Diag| push(acc, diag)),
   }
+
+test "two runs' traces join into every line either read, in a trace's order" {
+  assert_eq(joined_trace(Some(b"b\ty\n"), Some(b"a\tx\nb\ty\n")), Some(b"a\tx\nb\ty\n"));
+  assert_eq(joined_trace(Some(b""), Some(b"")), Some(b""));
+  assert_eq(joined_trace(Some(b"a\tx\n"), None), None)
+}

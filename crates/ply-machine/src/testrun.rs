@@ -79,6 +79,16 @@ struct Entered {
     outcome: Result<(), Diagnostic>,
     interleaving: Option<Interleaving>,
     usage: Usage,
+    observed: Arc<ply_host::observe::Recorder>,
+}
+
+/// What a test read is observed from its machine's start to its end, however the entry ends.
+struct Observing(Arc<ply_host::observe::Recorder>);
+
+impl Drop for Observing {
+    fn drop(&mut self) {
+        ply_host::observe::end(&self.0);
+    }
 }
 
 fn entered(
@@ -87,6 +97,7 @@ fn entered(
     seeded: Option<(&Seed, u32, bool)>,
 ) -> Result<Entered, Diagnostic> {
     let mut machine = executor.machine(index)?;
+    let observing = Observing(ply_host::observe::begin(machine.id()));
     if let Some((seed, steps, re_executed)) = seeded {
         machine.set_re_executed(re_executed);
         machine.set_seed(seed.clone(), steps);
@@ -111,6 +122,7 @@ fn entered(
         },
         interleaving,
         outcome,
+        observed: Arc::clone(&observing.0),
     })
 }
 
@@ -120,6 +132,8 @@ pub struct Executed {
     /// Ply unwound rather than the program failing.
     pub panicked: bool,
     pub usage: Usage,
+    /// What it read of the world, when it ran at all.
+    pub observed: Option<Arc<ply_host::observe::Recorder>>,
 }
 
 impl Executed {
@@ -129,6 +143,7 @@ impl Executed {
             failure: Some(refusal),
             panicked: false,
             usage: Usage::default(),
+            observed: None,
         }
     }
 }
@@ -146,6 +161,7 @@ pub fn executed(executor: &Executor<'_>, index: usize) -> Executed {
                 duration,
                 ..e.usage
             },
+            observed: Some(e.observed),
         },
         Ok(Err(refused)) => Executed::refused(refused),
         Err(payload) => Executed {
@@ -155,6 +171,7 @@ pub fn executed(executor: &Executor<'_>, index: usize) -> Executed {
                 duration,
                 ..Usage::default()
             },
+            observed: None,
         },
     }
 }
@@ -166,6 +183,8 @@ pub struct Interleaved {
     pub observed: bool,
     pub panicked: bool,
     pub usage: Usage,
+    /// What it read of the world, when it ran at all.
+    pub read: Option<Arc<ply_host::observe::Recorder>>,
 }
 
 impl Interleaved {
@@ -174,6 +193,7 @@ impl Interleaved {
             interleaving: Interleaving::failed(Vec::new(), refusal),
             observed: false,
             panicked: false,
+            read: None,
             usage: Usage::default(),
         }
     }
@@ -206,6 +226,7 @@ pub fn interleaved(
                 duration,
                 ..e.usage
             },
+            read: Some(e.observed),
         },
         Ok(Err(refused)) => Interleaved {
             usage: Usage {

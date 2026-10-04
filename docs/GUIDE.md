@@ -1267,9 +1267,19 @@ A cost law (§10) states how `steps` grows with a size instead of pinning it.
 A definition's hash covers its normalized form: names, comments, formatting,
 imports, `pub`, specs and test labels are erased, and references are replaced by
 their referent's hash. A test runs exactly when neither its hash nor the code it compiles to has a
-recorded pass, so renames and comment edits run nothing, and neither does an edit or a new `ply`
-that compiles a test to the same code; the selection line counts those `by code` (`by_code` in
-`--json`, reason `same code`). `ply hash` prints the hashes.
+recorded pass that still stands, so renames and comment edits run nothing, and neither does an edit
+or a new `ply` that compiles a test to the same code; the selection line counts those `by code`
+(`by_code` in `--json`, reason `same code`). `ply hash` prints the hashes.
+
+A pass is filed with what its run read of the world: each file and directory a handler read under
+a root (by the root's name, so a pass reads the same from another checkout), each shipped module it
+asked for, and what every `ply` it started read in turn, that `ply`'s own program and shipped
+modules included; and for a run that reached a host handler, the binding it ran under (whether
+`--host`, and the names `--fs`, `--exec` and `--allow` lend). It stands while each of those still
+answers as it did, and otherwise the test runs again (reason `changed`). A read of something the
+test wrote first is not an input, and neither is the clock, the network, a program other than
+`ply`, or what a run keeps for the next (`PLY_C_CACHE`, `PLY_C_STAGE`). A `ply` that ended before
+reporting what it read files no pass.
 `--explain` says why each test was selected, what a pass is filed under (the
 test's hash and the runtime stamp, `filed_under` in `--json`, and the code it ran), which of a test's
 atoms are answers this binary gives from what it ships (`shipped`), which no key
@@ -1282,7 +1292,8 @@ cache.
 ### 8.3 Determinism
 
 A test whose row, after handling, retains a `nondet` atom is `E0412`. Handle the
-effect, or write `test/nondet "label" { ... }`, which is never cached.
+effect, or write `test/nondet "label" { ... }`, which is cached as any test is
+(§8.2): what it reads of the clock or the network is no part of its pass.
 
 ### 8.4 Scheduling and failures
 
@@ -3353,7 +3364,8 @@ holds. `ply build --sign` writes one beside an artifact (§15.2).
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound
-nondeterministic handler always runs and is never cached; one that reaches only
+nondeterministic handler is cached with what it read and the binding it ran
+under (§8.2), so its pass never answers for a hermetic run; one that reaches only
 deterministic handlers, whose answers are a function of what they are handed, is
 cached like any other. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run

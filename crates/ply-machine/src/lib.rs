@@ -33,7 +33,7 @@ pub mod testrun;
 pub mod trace;
 
 use ply_eval::host::{
-    HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, Linearity,
+    HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, Linearity, MachineId,
 };
 use ply_eval::{Diagnostic, Span, Value, codes};
 use std::collections::HashMap;
@@ -194,12 +194,15 @@ enum Request {
         configuration: crate::config::Configuration,
         reply: Sender<Result<drive::Disclosed, drive::Refused>>,
     },
+    // `caller` is the machine that asked, whose test, when one is observed, reads what this does.
     Enter {
+        caller: MachineId,
         reply: Sender<drive::Outcome>,
     },
     Call {
         name: String,
         args: Vec<ply_eval::Plain>,
+        caller: MachineId,
         reply: Sender<ply_eval::Ended<ply_eval::Plain>>,
     },
     Accounting {
@@ -264,7 +267,10 @@ impl HostHandler for MachineHandler {
             }
             ("enter", []) => {
                 let outcome: drive::Outcome =
-                    self.ask(&label, span, |reply| Request::Enter { reply })?;
+                    self.ask(&label, span, |reply| Request::Enter {
+                        caller: req.machine,
+                        reply,
+                    })?;
                 drive::outcome_value(&outcome)
             }
             ("call", [name, args]) => {
@@ -283,7 +289,12 @@ impl HostHandler for MachineHandler {
                     .map(|a| ply_eval::reflect::plain_of(a, span))
                     .collect::<Result<_, _>>()?;
                 let called: ply_eval::Ended<ply_eval::Plain> =
-                    self.ask(&label, span, |reply| Request::Call { name, args, reply })?;
+                    self.ask(&label, span, |reply| Request::Call {
+                        name,
+                        args,
+                        caller: req.machine,
+                        reply,
+                    })?;
                 drive::called_value(called)
             }
             ("accounting", []) => {
@@ -638,11 +649,16 @@ fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Request>) {
             } => {
                 let _ = reply.send(drive.bound(&entry, configuration));
             }
-            Request::Enter { reply } => {
-                let _ = reply.send(drive.enter());
+            Request::Enter { caller, reply } => {
+                let _ = reply.send(drive.enter(caller));
             }
-            Request::Call { name, args, reply } => {
-                let _ = reply.send(drive.call(&name, args));
+            Request::Call {
+                name,
+                args,
+                caller,
+                reply,
+            } => {
+                let _ = reply.send(drive.call(&name, args, caller));
             }
             Request::Accounting { reply } => {
                 let _ = reply.send(drive.accounting());

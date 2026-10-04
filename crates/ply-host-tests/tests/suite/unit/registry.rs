@@ -18,8 +18,7 @@ fn the_trusted_computing_base_declares_everything_it_must() {
         assert_eq!(
             op.determinism,
             Determinism::Nondeterministic,
-            "`{op}` claims to be a function of the program state; nothing in W1 is, and a store's \
-             stamps leave `ply-host` out because no cached pass can reach a handler of it"
+            "`{op}` claims to be a function of the program state; no host handler is"
         );
     }
 }
