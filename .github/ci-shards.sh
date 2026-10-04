@@ -120,6 +120,7 @@ GATES_ALONE=(
 # Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
 # table asserts it is still declared there: a check that stops being declared reports nothing.
 CLI_TREE_CHECKS=(
+  "copies:no two modules define the same function"
   "fixture_list:every fixture is listed"
   "fmt:the maintained sources are committed formatted"
   "tree:the harness is the only module that starts the \`ply\` binary"

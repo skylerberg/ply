@@ -1,12 +1,14 @@
 // The database effect.
 
-import std.bytes (u32_be, u32_be_at, is_digit)
+import std.bytes (u32_be, u32_be_at, is_digit, cstring, peek)
 import std.json
 import std.net (net)
 import std.random (entropy, nonce)
 import std.pg
 import std.string
 import std.list (concat, contains)
+import std.bytes
+import std.option (option_unwrap_or)
 
 pub nondet effect db {
   read query[t](s: Stmt, ps: List<Param>) -> Answer
@@ -701,9 +703,6 @@ fn comma(pieces: List<String>) -> String = string::join(pieces, ", ")
 
 fn reverse_list<a>(xs: List<a>) -> List<a> = fold(xs, [], |acc: List<a>, x: a| concat([x], acc))
 
-fn nth<a>(xs: List<a>, i: Int) -> Option<a> =
-  match xs { [] -> None, [h, ..t] -> if i <= 0 { Some(h) } else { nth(t, i - 1) } }
-
 fn last<a>(xs: List<a>) -> Option<a> = match xs { [] -> None, [h] -> Some(h), [_, ..t] -> last(t) }
 
 fn drop_last<a>(xs: List<a>) -> List<a> =
@@ -787,12 +786,6 @@ fn ident_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX
 fn in_set(set: Bytes, c: Int) -> Bool / {abort.raise} =
   if c < 0 { false } else { match bytes_index_of_byte(set, c) { Some(_) -> true, None -> false } }
 
-fn byte_at(src: Bytes, i: Int) -> Int / {abort.raise} =
-  if i < 0 || i >= bytes_len(src) { -1 } else { bytes_at(src, i) }
-
-fn scan_set(src: Bytes, i: Int, set: Bytes) -> Int / {abort.raise} =
-  if i >= bytes_len(src) { bytes_len(src) } else { bytes_scan(src, i, set, bytes_len(src)) }
-
 fn lex_all(sql: String) -> Result<List<Token>, DbError> / {abort.raise} = {
   let src = bytes_of_string(sql);
   if !bytes_is_utf8(src) { Err(unsupported("statement text that is not valid UTF-8")) }
@@ -807,19 +800,19 @@ reuse fn lex(
   left: Int,
 ) -> Result<List<Token>, DbError> / {abort.raise} =
   if left <= 0 { panic("more tokens than bytes") } else {
-    let j = scan_set(src, i, sql_ws());
-    let c = byte_at(src, j);
+    let j = bytes::scan(src, i, sql_ws());
+    let c = peek(src, j);
     if c < 0 { Ok(acc) }
     else if c == 59 { Err(unsupported("more than one statement in one `Stmt`")) }
-    else if c == 45 && byte_at(src, j + 1) == 45 {
+    else if c == 45 && peek(src, j + 1) == 45 {
       lex(src, line_comment_end(src, j + 2), acc, left - 1)
-    } else if c == 47 && byte_at(src, j + 1) == 42 {
+    } else if c == 47 && peek(src, j + 1) == 42 {
       match block_comment_end(src, j + 2, 1) {
         None -> Err(unsupported("a block comment that is never closed")),
         Some(end) -> lex(src, end, acc, left - 1),
       }
     } else if in_set(ident_start(), c) {
-      let end = scan_set(src, j, ident_rest());
+      let end = bytes::scan(src, j, ident_rest());
       lex(
         src,
         end,
@@ -834,16 +827,15 @@ reuse fn lex(
   }
 
 fn line_comment_end(src: Bytes, i: Int) -> Int / {abort.raise} =
-  if i >= bytes_len(src) || byte_at(src, i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
+  if i >= bytes_len(src) || peek(src, i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
 
 // Postgres nests block comments, so scanning to the first `*/` would leak an outer comment's tail.
 fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> / {abort.raise} =
   if depth == 0 { Some(i) }
-  else if i >= bytes_len(src) { None } else if byte_at(src, i) == 47 && byte_at(src, i + 1) == 42 {
-    block_comment_end(src, i + 2, depth + 1)
-  } else if byte_at(src, i) == 42 && byte_at(src, i + 1) == 47 {
-    block_comment_end(src, i + 2, depth - 1)
-  } else { block_comment_end(src, i + 1, depth) }
+  else if i >= bytes_len(src) { None }
+  else if peek(src, i) == 47 && peek(src, i + 1) == 42 { block_comment_end(src, i + 2, depth + 1) }
+  else if peek(src, i) == 42 && peek(src, i + 1) == 47 { block_comment_end(src, i + 2, depth - 1) }
+  else { block_comment_end(src, i + 1, depth) }
 
 reuse fn lex_number(
   src: Bytes,
@@ -852,10 +844,10 @@ reuse fn lex_number(
   left: Int,
 ) -> Result<List<Token>, DbError> / {abort.raise} =
   if left <= 0 { panic("more tokens than bytes") } else {
-    let whole = scan_set(src, i, sql_digits());
-    let end = if byte_at(src, whole) == 46 { scan_set(src, whole + 1, sql_digits()) }
+    let whole = bytes::scan(src, i, sql_digits());
+    let end = if peek(src, whole) == 46 { bytes::scan(src, whole + 1, sql_digits()) }
     else { whole };
-    let after = byte_at(src, end);
+    let after = peek(src, end);
     if after == 101 || after == 69 { Err(unsupported("a number in exponent notation")) }
     else if in_set(ident_start(), after) { Err(unsupported("a number followed by a letter")) }
     else { lex(src, end, push(acc, TNum(string_of_bytes(bytes_slice(src, i, end)))), left - 1) }
@@ -874,7 +866,7 @@ reuse fn lex_string(
     else { bytes_scan_until(src, i, b"'", bytes_len(src)) };
     if stop >= bytes_len(src) { Err(unsupported("a string literal with no closing quote")) } else {
       let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
-      if byte_at(src, stop + 1) == 39 {
+      if peek(src, stop + 1) == 39 {
         lex_string(src, stop + 2, bytes_concat(piece, b"'"), acc, left - 1)
       } else { lex(src, stop + 1, push(acc, TStr(string_of_bytes(piece))), left - 1) }
     }
@@ -893,7 +885,7 @@ reuse fn lex_quoted(
     if stop >= bytes_len(src) { Err(unsupported("a quoted identifier with no closing quote")) }
     else {
       let piece = bytes_concat(so_far, bytes_slice(src, i, stop));
-      if byte_at(src, stop + 1) == 34 {
+      if peek(src, stop + 1) == 34 {
         lex_quoted(src, stop + 2, bytes_concat(piece, b"\""), acc, left - 1)
       } else { lex(src, stop + 1, push(acc, TQuoted(string_of_bytes(piece))), left - 1) }
     }
@@ -906,7 +898,7 @@ reuse fn lex_param(
   left: Int,
 ) -> Result<List<Token>, DbError> / {abort.raise} =
   if left <= 0 { panic("more tokens than bytes") } else {
-    let end = scan_set(src, i + 1, sql_digits());
+    let end = bytes::scan(src, i + 1, sql_digits());
     if end == i + 1 { Err(unsupported("a dollar-quoted string, or a `$` that is not a parameter")) }
     else {
       match string::int_of_string(string_of_bytes(bytes_slice(src, i + 1, end))) {
@@ -923,8 +915,8 @@ reuse fn lex_symbol(
   left: Int,
 ) -> Result<List<Token>, DbError> / {abort.raise} =
   if left <= 0 { panic("more tokens than bytes") } else {
-    let c = byte_at(src, i);
-    let d = byte_at(src, i + 1);
+    let c = peek(src, i);
+    let d = peek(src, i + 1);
     let two = if (c == 60 && d == 62) || (c == 33 && d == 61) { "<>" }
     else if c == 60 && d == 61 { "<=" }
     else if c == 62 && d == 61 { ">=" }
@@ -1543,7 +1535,7 @@ fn leaf_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abo
   match e {
     XLit(v) -> Ok(v),
     XCol(n) -> match map_get(r, n) { None -> Err(undefined_column(n)), Some(v) -> Ok(v) },
-    XParam(n) -> match nth(ps, n - 1) {
+    XParam(n) -> match list_at(ps, n - 1) {
       None -> Err(db_error("42P02", "", "there is no parameter $" ++ int_to_string(n))),
       Some(p) -> Ok(param_datum(p)),
     },
@@ -2183,7 +2175,7 @@ fn exec(db: MemDb, q: Query, ps: List<Param>) -> Outcome / {abort.raise} =
 
 // The **outermost** scope decides, because a savepoint has no access mode.
 fn read_only(db: MemDb) -> Bool =
-  match nth(db.stack, 0) {
+  match list_at(db.stack, 0) {
     None -> false,
     Some(f) -> match f.access { ReadOnly -> true, ReadWrite -> false },
   }
@@ -2665,7 +2657,7 @@ fn build_column(
 ) -> RowAcc / {abort.raise} =
   match index_of(cols, c.name) {
     None -> default_into(c, acc),
-    Some(i) -> match nth(exprs, i) {
+    Some(i) -> match list_at(exprs, i) {
       None -> default_into(c, acc),
       Some(e) -> match e {
         XDefault -> default_into(c, acc),
@@ -2803,7 +2795,7 @@ fn constant_of(e: Expr, ps: List<Param>) -> Option<Datum> =
   match e {
     XLit(v) -> Some(v),
     XParam(n) -> {
-      let p = nth(ps, n - 1)?;
+      let p = list_at(ps, n - 1)?;
       Some(param_datum(p))
     },
     _ -> None,
@@ -2990,7 +2982,7 @@ fn delete_walk(
 // A refused `begin` does not abort the transaction it is nested inside.
 pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
   let frame = { tables: db.tables, failed: false, level: level, access: access };
-  match nth(db.stack, 0) {
+  match list_at(db.stack, 0) {
     None -> done(memdb(db.tables, db.sequences, [frame], false), Count(0)),
     Some(outer) -> match nested_refusal(
         db.failed,
@@ -3178,9 +3170,9 @@ fn t_count(a: Answer) -> Int =
 test "create_schema renders one statement per table and one per sequence" {
   let sqls = map(create_schema(t_schema()), |s: Stmt| s.sql);
   assert_eq(len(sqls), 3);
-  assert_eq(nth(sqls, 0), Some("create sequence \"bin_id_seq\""));
+  assert_eq(list_at(sqls, 0), Some("create sequence \"bin_id_seq\""));
   assert_eq(
-    nth(sqls, 1),
+    list_at(sqls, 1),
     Some(
       "create table \"part\" (\"sku\" text not null, \"price\" numeric(10,4) not null, "
         ++ "\"tag\" text, \"n\" bigint, primary key (\"sku\"), "
@@ -3464,6 +3456,15 @@ test "a text parameter in an integer column is refused rather than coerced" {
   assert_eq(t_code(t_out(d, "insert into part (sku, price, n) values ('a', 1, 'x')", [])), "22P02")
 }
 
+test "a parameter numbered past the ones given, or below one, is refused" {
+  let d = open(t_schema());
+  assert_eq(
+    t_code(t_out(d, "insert into part (sku, price) values ($2, 1)", [PText("a")])),
+    "42P02",
+  );
+  assert_eq(t_code(t_out(d, "insert into part (sku, price) values ($0, 1)", [PText("a")])), "42P02")
+}
+
 // --- A live server ---------------------------------------------------------------
 //
 // The effect's own handler, over `std.pg`. A perform names its label — the table — and a clause
@@ -3587,9 +3588,6 @@ fn nat_of_text(text: String) -> Int / {abort.raise} =
 
 fn float_of_text(text: String) -> Float = match float_of_string(text) { Some(f) -> f, None -> 0.0 }
 
-fn decimal_of_text(text: String) -> Decimal =
-  match decimal_of_string(text) { Some(d) -> d, None -> decimal_of_int(0) }
-
 fn json_of_text(text: String) -> json::Json / {abort.raise} =
   match json::parse_string(text) { Ok(j) -> j, Err(_) -> json::Str(text) }
 
@@ -3660,7 +3658,7 @@ fn scalar_datum(oid: Int, t: String) -> Datum / {abort.raise} =
   if oid == 16 { CBool(t == "t") }
   else if oid == 20 || oid == 21 || oid == 23 { CInt(signed_digits(t)) }
   else if oid == 700 || oid == 701 { CFloat(float_of_text(t)) }
-  else if oid == 1700 { CNumeric(decimal_of_text(t)) }
+  else if oid == 1700 { CNumeric(option_unwrap_or(decimal_of_string(t), decimal_of_int(0))) }
   else if oid == 17 { CBytes(bytes_of_bytea(t)) }
   else if oid == 114 || oid == 3802 { CJson(json_of_text(t)) }
   else { CText(t) }
@@ -6727,14 +6725,12 @@ type Scripted<a> = { value: a, wires: List<Wire> }
 fn t_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
   bytes_concat_all([byte_of_int(kind), u32_be(bytes_len(body) + 4), body])
 
-fn t_text(s: String) -> Bytes = bytes_concat(bytes_of_string(s), b"\x00")
-
 fn t_ready(status: Int) -> Bytes / {abort.raise} = t_frame(90, byte_of_int(status))
 
-fn t_done(tag: String) -> Bytes / {abort.raise} = t_frame(67, t_text(tag))
+fn t_done(tag: String) -> Bytes / {abort.raise} = t_frame(67, cstring(tag))
 
 fn t_field(code: String, text: String) -> Bytes =
-  if text == "" { b"" } else { bytes_concat(bytes_of_string(code), t_text(text)) }
+  if text == "" { b"" } else { bytes_concat(bytes_of_string(code), cstring(text)) }
 
 fn t_error(severity: String, r: Refusal) -> Bytes / {abort.raise} =
   t_frame(

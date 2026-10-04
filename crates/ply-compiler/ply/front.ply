@@ -1,11 +1,11 @@
 // The front end's answer for the driver: the errors, or else the warnings and every table it reads, as values.
 
-import parsing (Span, Ident, QName, ParseDiag, dummy_span, int_to_bytes, parse_diag, parse_label,
-                span_key)
+import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_label, span_key,
+                is_bare, no_module)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
               SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder,
-              is_predicate, Derived)
-import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr)
+              is_predicate, Derived, is_pub, spec_kind_text)
+import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Param, Stmt, SLet, SLetElse, SExpr, MatchArm, RecField, expr_span)
@@ -17,13 +17,13 @@ import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecor
 import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
               atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
               print_ty, Field, canonical_atoms, canonical_scheme, canonical_type, bool_type,
-              int_type, unit_type)
+              int_type, unit_type, named_type)
 import resolve (Source, ParsedModule, Diag, Resolved, ResolveSucceeded, ResolveFailed, Namespace,
-                ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find, is_bare, error_at,
+                ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find, error_at,
                 backticked, import_module_name, path_span)
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, Prior, Rehash, Rehashed,
-             rehash_index)
+             rehash_index, by_name)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, facts_by_owner, filed_facts, foreign_facts, no_root_facts,
@@ -32,7 +32,8 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, parse_all, parse_at, outside_every_module, placed)
-import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
+import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of,
+            first_segment)
 import resolve (PackageDeps, resolve_packaged, no_packages)
 import std.bin
 import std.hash (blake3)
@@ -43,15 +44,9 @@ import rewrite (fn_has_update)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_key, embed_tables, embedded,
               rewritten, wants_of, want_of_key)
 import items (parse)
-import std.bytes (join)
+import std.bytes (join, ascii_of_int)
 import std.list
-
-fn mode_text(mode: Mode) -> Bytes = match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
-
-fn kind_text(k: SpecKind) -> Bytes = match k { SRequires -> b"requires", SEnsures -> b"ensures" }
-
-// The module index of a span outside every module; a `(0, 0)` span is `dummy_span`.
-pub fn no_module() -> Int = 4294967295
+import lexer (is_ident_start)
 
 fn span_at(module: Int, span: Span) -> ModuleSpan =
   {
@@ -65,8 +60,6 @@ fn loc_at(location: Location) -> ModuleSpan = span_at(location.module, location.
 // --- What the source wrote ----------------------------------------------------
 // What the driver reads from the tree that the checker's tables do not keep.
 
-fn vis_public(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
-
 type Written = { public: Bool, reuse: Bool, params: List<Param>, literals: List<Bytes> }
 
 fn no_written() -> Written = { public: false, reuse: false, params: [], literals: [] }
@@ -77,7 +70,7 @@ fn fn_written(mods: List<ParsedModule>) -> Map<Bytes, Written> / {abort.raise} =
       match item {
         IFn(d) ->
           map_insert(a, qualify(parsed.name, d.name.name), {
-            public: vis_public(d.vis),
+            public: is_pub(d.vis),
             reuse: match d.reuse { Some(_) -> true, None -> false },
             params: d.params,
             literals: fold(d.spec, [], |found: List<Bytes>, clause: SpecClause|
@@ -93,7 +86,7 @@ fn effect_written(mods: List<ParsedModule>) -> Map<Bytes, Bool> =
   fold(mods, map_new(), |acc: Map<Bytes, Bool>, parsed: ParsedModule|
     fold(parsed.module.items, acc, |a: Map<Bytes, Bool>, item: Item|
       match item {
-        IEffect(d) -> map_insert(a, qualify(parsed.name, d.name.name), vis_public(d.vis)),
+        IEffect(d) -> map_insert(a, qualify(parsed.name, d.name.name), is_pub(d.vis)),
         _ -> a,
       }))
 
@@ -112,7 +105,7 @@ fn type_rows(mods: List<ParsedModule>) -> List<TypeRow> / {abort.raise} =
             name: qualify(m.name, d.name.name),
             module: m.name,
             simple_name: d.name.name,
-            public: vis_public(d.vis),
+            public: is_pub(d.vis),
             arity: len(d.params),
             at: span_at(i, d.span),
           }),
@@ -130,7 +123,7 @@ fn test_name_spans(mods: List<ParsedModule>) -> List<Location> / {abort.raise} =
 // --- A guard's literals -------------------------------------------------------
 // The order seeds the prover's witness search, so it is the stack walk's first-reached order, not sorted.
 
-fn int_lit(k: Int) -> Bytes = bytes_concat(b"int ", int_to_bytes(k))
+fn int_lit(k: Int) -> Bytes = bytes_concat(b"int ", ascii_of_int(k))
 
 fn lit_text(acc: List<Bytes>, literal: Lit) -> List<Bytes> / {abort.raise} =
   match literal {
@@ -263,14 +256,12 @@ pub type SetView = { name: Bytes, includes: List<Bytes>, atoms: List<Atom> }
 // rule lives here rather than with the walk that reads a project, because the front end is what
 // names a module to everything downstream of it.
 
-fn start_ok(c: Int) -> Bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
-
-fn continue_ok(c: Int) -> Bool = start_ok(c) || (c >= 48 && c <= 57)
+fn continue_ok(c: Int) -> Bool = is_ident_start(c) || (c >= 48 && c <= 57)
 
 fn ident_ok(segment: String) -> Bool / {abort.raise} = {
   let b = bytes_of_string(segment);
   if bytes_len(b) == 0 { false } else {
-    start_ok(bytes_at(b, 0))
+    is_ident_start(bytes_at(b, 0))
       && fold(range(1, bytes_len(b)), true, |ok: Bool, i: Int| ok && continue_ok(bytes_at(b, i)))
   }
 }
@@ -412,7 +403,7 @@ fn def_row(def_info: DefInfo, w: Written) -> DefRow / {abort.raise} =
       { name: param.name.name, at: span_at(def_info.at.module, param.span) }),
     spec: map(def_info.spec, |spec: SpecInfo|
       {
-        kind: kind_text(spec.kind),
+        kind: spec_kind_text(spec.kind),
         index: spec.index,
         footprint: canonical_atoms(spec.footprint),
         at: span_at(def_info.at.module, spec.span),
@@ -488,15 +479,11 @@ fn ctor_row(ctor_info: CtorInfo) -> CtorRow / {abort.raise} =
 // --- The hashes ---------------------------------------------------------------
 // A name declared twice (a `fn` and an `effect` alike) is one row, as the maps merged it.
 
-fn by_name_one(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bytes> =
-  fold(xs, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-    map_insert(acc, x.name, x.hash))
-
 fn by_name_many(xs: List<{ name: Bytes, hashes: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
   fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
     map_insert(acc, x.name, x.hashes))
 
-fn by_name_names(xs: List<{ name: Bytes, names: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
+pub fn by_name_names(xs: List<{ name: Bytes, names: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
   fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
     map_insert(acc, x.name, x.names))
 
@@ -511,9 +498,9 @@ type Tables = {
 
 fn hash_tables(hashes: HashOutput) -> Tables =
   {
-    defs: by_name_one(hashes.defs),
-    own: by_name_one(hashes.own),
-    decls: by_name_one(hashes.decls),
+    defs: by_name(hashes.defs),
+    own: by_name(hashes.own),
+    decls: by_name(hashes.decls),
     specs: by_name_many(hashes.specs),
     spec_texts: by_name_many(hashes.spec_texts),
     deps: by_name_names(hashes.deps),
@@ -632,12 +619,12 @@ fn key_published(def_info: DefInfo) -> Bytes / {abort.raise} = {
 }
 
 fn key_clause_root(owner: Bytes, kind: Bytes, k: Int) -> Bytes =
-  bytes_concat_all([owner, b"#", kind, b"#", int_to_bytes(k)])
+  bytes_concat_all([owner, b"#", kind, b"#", ascii_of_int(k)])
 
 fn key_law_root(n: Int, part: Bytes) -> Bytes =
-  bytes_concat_all([b"law#", int_to_bytes(n), b".", part])
+  bytes_concat_all([b"law#", ascii_of_int(n), b".", part])
 
-fn key_test_root(n: Int) -> Bytes = bytes_concat(b"test#", int_to_bytes(n))
+fn key_test_root(n: Int) -> Bytes = bytes_concat(b"test#", ascii_of_int(n))
 
 // The roots the emitter answers the program's tests by, in its test order: test `i`'s is the `i`th.
 pub fn test_roots(dump: Dump) -> List<Bytes> / {abort.raise} =
@@ -705,7 +692,7 @@ fn key_fn(
           {
             out: push(b.out, {
               root: key_clause_root(name, text, k),
-              key: bytes_concat_all([hex(sentence), b"#", text, b"#", int_to_bytes(k), b"+", read]),
+              key: bytes_concat_all([hex(sentence), b"#", text, b"#", ascii_of_int(k), b"+", read]),
             }),
             requires: if kind == SRequires { b.requires + 1 } else { b.requires },
             ensures: if kind == SEnsures { b.ensures + 1 } else { b.ensures },
@@ -724,10 +711,10 @@ fn root_keys(
   checked: CheckOutput,
   hashes: HashOutput,
 ) -> List<KeyRow> / {abort.raise} = {
-  let own = by_name_one(hashes.own);
+  let own = by_name(hashes.own);
   let sentences = by_name_many(hashes.spec_texts);
   let deps = by_name_names(hashes.deps);
-  let decls = by_name_one(hashes.decls);
+  let decls = by_name(hashes.decls);
   // Each signature printed once: a root reads many definitions, and many roots read one.
   let published = map_of_entries(
     map(checked.defs, |d: DefInfo| { key: d.name, value: key_published(d) }),
@@ -1177,7 +1164,10 @@ fn ordinal_row(parsed: ParsedModule) -> OrdinalRow / {abort.raise} =
       match item {
         IFn(d) -> {
           let kinds = if len(d.spec) == 0 { b"" } else {
-            bytes_concat(b" ", join(map(d.spec, |clause: SpecClause| kind_text(clause.kind)), b","))
+            bytes_concat(
+              b" ",
+              join(map(d.spec, |clause: SpecClause| spec_kind_text(clause.kind)), b","),
+            )
           };
           push(acc, bytes_concat_all([b"fn ", qualify(parsed.name, d.name.name), kinds]))
         },
@@ -1378,7 +1368,7 @@ fn known_tests(
 fn said_of(hashes: HashOutput) -> Map<Bytes, Bytes> =
   fold(
     hashes.contracts,
-    by_name_one(hashes.decls),
+    by_name(hashes.decls),
     |acc: Map<Bytes, Bytes>, c: { name: Bytes, hash: Bytes }|
       map_insert(acc, c.name, match map_get(acc, c.name) {
         Some(decl) -> bytes_concat(decl, c.hash),
@@ -1400,7 +1390,7 @@ fn known_from_rows(
   texts: List<Bytes>,
   blank: Map<Bytes, Bool>,
 ) -> Known / {abort.raise} = {
-  let decls = by_name_one(hashes.decls);
+  let decls = by_name(hashes.decls);
   let held = fold(fixed, map_new(), |acc: Map<Bytes, Bytes>, f: Fixed|
     if f.decl { acc } else { map_insert(acc, f.name, f.hash) });
   let written = layouts(mods, texts);
@@ -1419,7 +1409,7 @@ fn known_from_rows(
       else { TakeNone }),
     root: root,
     keying: Some({
-      own: by_name_one(hashes.own),
+      own: by_name(hashes.own),
       test_own: hashes.test_texts,
       layout: written.defs,
       test_layout: written.tests,
@@ -1591,7 +1581,7 @@ fn walked_of(mods: List<ParsedModule>, checked: CheckOutput) -> WalkedFacts =
 fn check_keys(checked: CheckOutput, hashes: HashOutput) -> Map<Bytes, Bytes> =
   fold(
     checked.checks,
-    by_name_one(hashes.defs),
+    by_name(hashes.defs),
     |acc: Map<Bytes, Bytes>, c: { name: Bytes, hash: Bytes }| map_insert(acc, c.name, c.hash),
   )
 
@@ -1604,7 +1594,7 @@ fn test_check_key(checked: CheckOutput, hashes: HashOutput, i: Int) -> Bytes / {
 
 fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.raise} = {
   let keyed = check_keys(checked, hashes);
-  let decls = by_name_one(hashes.decls);
+  let decls = by_name(hashes.decls);
   let read = bodies_read(checked);
   let owners = test_owners(checked.tests);
   {
@@ -1705,7 +1695,7 @@ pub type Filing = {
   bodies: List<FiledBody>,
 }
 
-fn filed_span(span: Span) -> FiledSpan = { start: span.start, end: span.end }
+pub fn filed_span(span: Span) -> FiledSpan = { start: span.start, end: span.end }
 
 // A type's constructors in declaration order, which is each one's index.
 fn ctors_of_type(ctors: List<CtorInfo>, name: Bytes) -> List<CtorInfo> = {
@@ -1846,8 +1836,8 @@ fn listed(h: Option<Bytes>) -> List<Bytes> = match h { Some(x) -> [x], None -> [
 // A name's one body answers for each hash the name has; a `fn` and a declaration sharing a name
 // have a body each, and each is filed under the hash it verifies as.
 fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
-  let defs = by_name_one(hashes.defs);
-  let decls = by_name_one(hashes.decls);
+  let defs = by_name(hashes.defs);
+  let decls = by_name(hashes.decls);
   let counted = fold(
     hashes.bodies,
     map_new(),
@@ -1870,9 +1860,9 @@ fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
 
 // Everything the front-end cache files after an analysis, as plain data.
 pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
-  let hashed = by_name_one(analysis.hashes.defs);
+  let hashed = by_name(analysis.hashes.defs);
   let checked = check_keys(analysis.checked, analysis.hashes);
-  let decls = by_name_one(analysis.hashes.decls);
+  let decls = by_name(analysis.hashes.decls);
   let types = type_rows(analysis.mods);
   let f: Filers = {
     defs: map_of_entries(
@@ -2046,9 +2036,6 @@ fn pkg_tables(
     shelf: if toolchain { len(clo.packages) } else { std + 2 },
   }
 }
-
-fn first_segment(name: Bytes) -> Bytes / {abort.raise} =
-  match bytes_index_of(name, b".") { None -> name, Some(i) -> bytes_slice(name, 0, i) }
 
 // A root module under a built-in package's prefix, which no user's file may claim; the
 // toolchain's own std tree is the one load that may, and it announces itself by covering the
@@ -3143,7 +3130,7 @@ pub fn embeds_wanted(root: Bytes, sources: List<Source>) -> List<Embedded> / {ab
         push(a, { root: root, module: source.name, want: want, read: Err(b"not read yet") }))
     })
 
-fn embed_slot(root: Bytes, module: Bytes) -> Bytes = bytes_concat_all([root, b"\x00", module])
+pub fn embed_slot(root: Bytes, module: Bytes) -> Bytes = bytes_concat_all([root, b"\x00", module])
 
 // Each parsed module's package root and own name, in the order the program and its dependencies
 // were parsed.
@@ -3413,9 +3400,6 @@ pub type Dump = {
   walked: Bytes,
 }
 
-pub fn has_error(diags: List<Diag>) -> Bool =
-  fold(diags, false, |acc: Bool, diag: Diag| acc || diag.severity == b"error")
-
 // A diagnostic as the answer carries it: no dedup key, and the note count is the notes.
 pub fn answered_diag(diag: Diag) -> Diag =
   {
@@ -3671,8 +3655,8 @@ test "an effect's row holds each operation with its mode, its types and its span
       name: b"emit",
       mode: b"write",
       resource_param: false,
-      params: [con_named(b"Bytes")],
-      ret: con_named(b"Unit"),
+      params: [named_type(b"Bytes")],
+      ret: named_type(b"Unit"),
       scheme: None,
       at: { module: 0, start: 13, end: 38 },
       carries: [CPlain],
@@ -3690,7 +3674,7 @@ test "a prelude effect is placed outside every module and its operations carry a
   let seed = at(sim.ops, 0);
   assert_eq(seed.mode, b"read");
   assert_eq(seed.params, []);
-  assert_eq(seed.ret, con_named(b"Int"));
+  assert_eq(seed.ret, named_type(b"Int"));
   assert_eq(match seed.scheme { Some(sc) -> scheme_text(sc), None -> b"" }, b"() -> Int");
   assert_eq(seed.at, { module: no_module(), start: 0, end: 0 })
 }
@@ -3705,14 +3689,14 @@ test "a constructor's row holds its fields and its scheme" {
       type_name: b"m.Shape",
       index: 1,
       arity: 1,
-      fields: [con_named(b"Int")],
+      fields: [named_type(b"Int")],
       scheme: {
         ty_vars: [],
         row_vars: [],
         label_vars: [],
         ty: TyFn({
-          params: [con_named(b"Int")],
-          ret: con_named(b"m.Shape"),
+          params: [named_type(b"Int")],
+          ret: named_type(b"m.Shape"),
           effects: { atoms: [], tail: None },
         }),
       },
@@ -3869,7 +3853,7 @@ test "a law's row holds its binders with their spans and types, and its hashes c
       name: b"inc grows",
       module: b"m",
       index: 0,
-      binders: [{ name: b"x", at: { module: 0, start: 203, end: 209 }, ty: con_named(b"Int") }],
+      binders: [{ name: b"x", at: { module: 0, start: 203, end: 209 }, ty: named_type(b"Int") }],
       has_guard: true,
       host: false,
       cost: false,
@@ -4105,8 +4089,6 @@ fn def_named(d: Dump, name: Bytes) -> DefRow / {abort.raise} =
     None -> panic("the dump holds the definition"),
   }
 
-fn con_named(name: Bytes) -> Type = TyCon({ name: name, args: [] })
-
 test "the answer's rows hold each type and row as the checker's value" {
   let a = answer_pulling_std_with(answered(), shelf(), [], []);
   assert_eq(a.pulled, [b"std.b"]);
@@ -4117,7 +4099,7 @@ test "the answer's rows hold each type and row as the checker's value" {
   assert_eq(say.footprint, [write]);
   assert_eq(
     map(filter(a.dump.ctors, |k: CtorRow| k.name == b"base.Line"), |k: CtorRow| k.fields),
-    [[con_named(b"Int")]],
+    [[named_type(b"Int")]],
   )
 }
 
@@ -4342,8 +4324,8 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> / {abort.raise} =
   match analyse(parse_all(sources)) {
     Refused(_) -> panic("the program checks"),
     Analysed(w) -> {
-      let defs = by_name_one(w.checked.checks);
-      let witness = [{ name: b"m.other", hash: held(by_name_one(w.hashes.decls), b"m.other") }];
+      let defs = by_name(w.checked.checks);
+      let witness = [{ name: b"m.other", hash: held(by_name(w.hashes.decls), b"m.other") }];
       map([b"m.say", b"m.quiet"], |n: Bytes|
         {
           name: n,
@@ -4645,7 +4627,7 @@ test "every body is filed under the hash it verifies as, a cycle's members inclu
   assert(fold(f.bodies, true, |acc: Bool, b: FiledBody| acc && body_key(b.body) == Some(b.hash)));
   // One body per hashed name: nothing here declares a name twice.
   assert_eq(len(f.bodies), len(w.hashes.defs) + len(w.hashes.decls));
-  let even = held(by_name_one(w.hashes.defs), b"m.even");
+  let even = held(by_name(w.hashes.defs), b"m.even");
   assert(fold(f.bodies, false, |acc: Bool, b: FiledBody| acc || b.hash == even))
 }
 
@@ -5211,7 +5193,7 @@ fn hash_of(sources: List<Source>, name: Bytes) -> Bytes / {abort.raise} =
   match resolve_modules(map(parse_all(sources), |parsed: ParsedSource| parsed.module)) {
     ResolveFailed(_) -> b"",
     ResolveSucceeded(x) -> match map_get(
-        by_name_one(hash_index(build_index(x.mods, x.r).index).defs),
+        by_name(hash_index(build_index(x.mods, x.r).index).defs),
         name,
       ) {
       Some(h) -> h,

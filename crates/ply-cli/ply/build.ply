@@ -4,7 +4,7 @@
 // `compiler.plyx`, which owns the magic, the header and the section table.
 
 import compiler.load (LoadedAnalysis, SourceFile)
-import args (Flags, no_flags, style_of)
+import args (Flags, no_flags, style_of, root_of)
 import entries
 import std.path (normalize)
 import builder (Loaded, Refusal)
@@ -28,14 +28,14 @@ import env (env)
 import sources (File)
 import program (Program, Timed, load_diagnostics, front_of, is_shipped, no_front, timed_uncached)
 import plyz
-import report (Answer, indent, ok_code, count_of, plural, refused, reported, warning_lines)
+import report (Answer, indent, ok_code, count_of, refused, reported, warning_lines)
 import std.fs (fs, Missing)
 import std.time (time)
 import std.list (sort_by, at_or, concat, contains)
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string, int, string_or_null,
-                 strings)
+                 strings, int_or_null)
 import std.pkg (Manifest, render_version)
-import compiler.front (Analysis, Analysed, Refused, analyse, ModuleSpan, no_module, no_module_span)
+import compiler.front (Analysis, Analysed, Refused, analyse, ModuleSpan, no_module_span)
 import style (Style, plain, bold, green, red)
 import semantics
 import signing (Provenance, head_commit, provenance_bytes, provenance_of, seed_of, signatures_path,
@@ -45,6 +45,8 @@ import std.signed (Signature, countersigned, signed_bytes, signed_of)
 import std.bytes (hex_of)
 import std.string (join, pad_right, repeat)
 import std.math (pow)
+import proof.obligation (plural)
+import compiler.parsing (no_module)
 
 // The container with its digest written into the field no range of the digest covers: `digest`
 // is the short form a report prints, and `full` the digest itself.
@@ -89,15 +91,6 @@ fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> / {abort.
   }
 
 // --- Small things -----------------------------------------------------------
-
-// The build's root is the line's first positional's absolute form, or the working directory.
-fn root_of(flags: Flags) -> String =
-  match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." }
-
-fn opt_num(v: Option<Int>) -> Json = match v { Some(n) -> int(n), None -> Null }
-
-fn holds(names: List<String>, wanted: String) -> Bool =
-  len(filter(names, |x: String| x == wanted)) > 0
 
 // --- Sizes and lists a person reads -----------------------------------------
 
@@ -255,18 +248,18 @@ fn hashes_of(ns: List<Named>, wanted: String) -> List<String> =
 fn compared(before: List<Named>, after: List<Named>, reaches: List<Reach>) -> Diff = {
   let was = distinct(before);
   let now = distinct(after);
-  let added = filter(now, |nm: String| !holds(was, nm));
-  let kept = filter(now, |nm: String| holds(was, nm));
+  let added = filter(now, |nm: String| !contains(was, nm));
+  let kept = filter(now, |nm: String| contains(was, nm));
   let changed = filter(kept, |nm: String| hashes_of(after, nm) != hashes_of(before, nm));
   let moved = concat(added, changed);
   {
     added: added,
     changed: changed,
-    dropped: filter(was, |nm: String| !holds(now, nm)),
+    dropped: filter(was, |nm: String| !contains(now, nm)),
     unchanged: len(kept) - len(changed),
     // A definition reaches itself, so a changed one is always among these.
     reached: map(
-      filter(reaches, |r: Reach| len(filter(r.reaches, |n: String| holds(moved, n))) > 0),
+      filter(reaches, |r: Reach| len(filter(r.reaches, |n: String| contains(moved, n))) > 0),
       |r: Reach| r.name,
     ),
   }
@@ -328,7 +321,7 @@ fn diff_json(
     { key: "unchanged", value: int(d.unchanged) },
     { key: "reached", value: strings(d.reached) },
     { key: "artifact_bytes", value: int(bytes) },
-    { key: "binary_bytes", value: opt_num(binary) },
+    { key: "binary_bytes", value: int_or_null(binary) },
     { key: "diagnostics", value: all_to_json(warnings, []) },
   ])
 
@@ -389,7 +382,7 @@ fn built_json(
     { key: "names", value: int(len(made.names)) },
     { key: "unit", value: Bool(true) },
     { key: "artifact_bytes", value: int(bytes_len(sealed.bytes)) },
-    { key: "binary_bytes", value: opt_num(loaded.binary_bytes) },
+    { key: "binary_bytes", value: int_or_null(loaded.binary_bytes) },
     { key: "signed_by", value: string_or_null(signer) },
     { key: "diagnostics", value: all_to_json([], loaded.places) },
   ])
@@ -435,7 +428,7 @@ fn built_provenance(
     digest: digest_text(sealed.full),
     builder: "ply " ++ loaded.version,
     semantics: semantics::version(),
-    commit: head_commit(resolved_root(flags).absolute),
+    commit: head_commit(root_of(flags).absolute),
   }
 
 // The signatures beside `out` with this key's among them: kept while they vouch for this build,
@@ -800,13 +793,13 @@ fn built_over(
   startup: Result<List<String>, Diag>,
   front: LoadedAnalysis,
 ) -> Answer / {builder.loaded[build], artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
-  let r = resolved_root(flags);
+  let r = root_of(flags);
   let locked: Result<Option<lock::Lock>, String> = lock::read(r);
-  match builder.loaded[build](root_of(flags), front) {
+  match builder.loaded[build](root_of(flags).machine, front) {
     Err(why) -> refused(style, "build", why.diags, why.places),
     Ok(p) -> match locked {
       Err(why) -> reported(style, "build", [lock::refused(r, why)], p.places),
-      Ok(existing) -> match pinned_ok(r, existing, p) {
+      Ok(existing) -> match lock_refusal(r, existing, p) {
         Some(d) -> reported(style, "build", [d], p.places),
         None -> {
           let answer = chosen(style, flags, loaded, p, front, defs, startup);
@@ -817,14 +810,6 @@ fn built_over(
     },
   }
 }
-
-// Every dependency the lock pins must be the one this load found: a build may not ship what the
-// lockfile does not describe.
-fn pinned_ok(r: Resolved, existing: Option<lock::Lock>, loaded: Loaded) -> Option<Diag> =
-  match existing {
-    None -> None,
-    Some(lock) -> match lock::verified(r, lock, loaded.pins) { Ok(_) -> None, Err(d) -> Some(d) },
-  }
 
 fn unchanged(existing: Option<lock::Lock>, pins: List<lock::Pinned>) -> Bool =
   match existing {
@@ -841,10 +826,6 @@ fn pinned(
     write_file(lock::path_of(resolved), bytes_of_string(lock::text(existing, loaded.pins, [])));
     ()
   }
-
-// The root the command was pointed at, as the resolved path the lockfile is read and written under.
-fn resolved_root(flags: Flags) -> Resolved =
-  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
 
 // --- A library ----------------------------------------------------------------------
 
@@ -992,6 +973,14 @@ fn library_json(
     { key: "signed_by", value: string_or_null(signer) },
     { key: "diagnostics", value: all_to_json([], loaded.places) },
   ])
+
+// Every dependency the lock pins must be the one this load found: a build may not ship what the
+// lockfile does not describe.
+pub fn lock_refusal(r: Resolved, existing: Option<lock::Lock>, loaded: Loaded) -> Option<Diag> =
+  match existing {
+    None -> None,
+    Some(lock) -> match lock::verified(r, lock, loaded.pins) { Ok(_) -> None, Err(d) -> Some(d) },
+  }
 
 // --- Tests ------------------------------------------------------------------
 

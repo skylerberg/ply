@@ -2,12 +2,13 @@
 // sets and defaults.
 // Ordered tables are lists in insertion order: the dump encodes that order and a `Map` sorts its keys.
 
-import parsing (Span, Ident, QName, span_to, dummy_span, int_to_bytes)
-import type_syntax (TypeExpr, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
+import parsing (Span, Ident, QName, span_to, dummy_span, is_bare, starts_upper, span_key)
+import type_syntax (TypeExpr, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad,
+                    mode_text)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef,
               TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, Binder, Vis, VPub, VPriv,
               ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, parse,
-              dump_module)
+              dump_module, is_pub)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
@@ -15,6 +16,8 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
 import std.list (at, contains, take, drop)
 import std.bin
+import types (last_dot)
+import std.bytes (ascii_of_int)
 
 // --- The tables ---------------------------------------------------------------
 
@@ -230,10 +233,6 @@ fn position(xs: List<Int>, v: Int) -> Option<Int> / {abort.raise} =
 
 // --- Module names ---------------------------------------------------------------
 
-fn last_dot(name: Bytes) -> Int / {abort.raise} =
-  fold(range(0, bytes_len(name)), 0 - 1, |acc: Int, i: Int|
-    if bytes_at(name, i) == 46 { i } else { acc })
-
 // The last dotted segment.
 pub fn default_binder(name: Bytes) -> Bytes / {abort.raise} =
   bytes_slice(name, last_dot(name) + 1, bytes_len(name))
@@ -241,8 +240,6 @@ pub fn default_binder(name: Bytes) -> Bytes / {abort.raise} =
 // An anonymous module qualifies nothing.
 pub fn qualify(module: Bytes, name: Bytes) -> Bytes =
   if bytes_len(module) == 0 { name } else { bytes_concat_all([module, b".", name]) }
-
-fn is_public(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
 
 pub fn import_module_name(decl: ImportDecl) -> Bytes / {abort.raise} =
   fold(range(0, len(decl.path)), b"", |acc: Bytes, i: Int|
@@ -390,7 +387,7 @@ fn declare(decls: Decls, namespace: Namespace, module: Bytes, name: Ident, vis: 
       push_declared(decls, namespace, {
         name: name.name,
         qualified: qualify(module, name.name),
-        public: is_public(vis),
+        public: is_pub(vis),
         span: name.span,
       }),
   }
@@ -961,18 +958,13 @@ pub fn find(
   }
 }
 
-pub fn is_bare(qname: QName) -> Bool = match qname.module { None -> true, Some(_) -> false }
-
-pub fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
-  bytes_len(name) > 0 && bytes_at(name, 0) >= 65 && bytes_at(name, 0) <= 90
-
 // --- Defaults: what a default may be -----------------------------------------------------
 
 // A pure, closed expression: a value, not something that runs.
 fn is_default_expr(expr: Expr) -> Bool / {abort.raise} =
   match expr {
     EApp(a) ->
-      len(a.named) == 0 && (match a.func { EVar(v) -> is_ctor_name(v.name.name.name), _ -> false })
+      len(a.named) == 0 && (match a.func { EVar(v) -> starts_upper(v.name.name.name), _ -> false })
         && all_default(a.args),
     EPerform(_) -> false,
     EHandle(_) -> false,
@@ -1374,8 +1366,6 @@ fn decl_public(resolved: Resolved, owner: Int, name: Bytes) -> Bool / {abort.rai
 
 pub fn reached_binder(module: Bytes) -> Bytes = bytes_concat(b"@", module)
 
-fn bytes_before(a: Bytes, b: Bytes) -> Bool = match compare(a, b) { Less -> true, _ -> false }
-
 // One atom a set stands for, and the module whose scope wrote it.
 type Member = { atom: AtomExpr, home: Int }
 
@@ -1700,8 +1690,6 @@ fn effect_owner(
   }
 }
 
-fn mode_word(mode: Mode) -> Bytes = match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
-
 // What an atom names, wherever it was written: its effect's program-wide name, mode, operation and label.
 fn member_key(resolved: Resolved, member: Member) -> Bytes / {abort.raise} = {
   let a = member.atom;
@@ -1715,7 +1703,7 @@ fn member_key(resolved: Resolved, member: Member) -> Bytes / {abort.raise} = {
   bytes_concat_all([
     eff,
     b" ",
-    mode_word(a.mode),
+    mode_text(a.mode),
     b" ",
     match a.op { Some(o) -> o.name, None -> b"" },
     b" ",
@@ -1728,7 +1716,7 @@ type KeyedMember = { key: Bytes, member: Member }
 fn insert_keyed(sorted: List<KeyedMember>, k: KeyedMember) -> List<KeyedMember> / {abort.raise} = {
   let n = len(sorted);
   let i = fold(range(0, n), n, |acc: Int, j: Int|
-    if acc < n { acc } else if bytes_before(k.key, at(sorted, j).key) { j } else { acc });
+    if acc < n { acc } else if compare(k.key, at(sorted, j).key) == Less { j } else { acc });
   fold(drop(sorted, i), push(take(sorted, i), k), |acc: List<KeyedMember>, x: KeyedMember|
     push(acc, x))
 }
@@ -2463,7 +2451,7 @@ fn collect_fn(
           } else {
             let o = qualify_expr(
               resolved,
-              { owner: m, public: is_public(def.vis), bound: [], imports: [], diags: adm.diags },
+              { owner: m, public: is_pub(def.vis), bound: [], imports: [], diags: adm.diags },
               d,
             );
             // The writing module needs the binder as much as any caller does.
@@ -2850,7 +2838,7 @@ fn fill_fields(
 fn signature_of(f: Filling, filler: Filler, func: Expr) -> Option<Signature> / {abort.raise} =
   match func {
     EVar(v) ->      // Constructors carry no defaults; a local binder shadows everything, making this a call through a value.
-      if is_bare(v.name) && is_ctor_name(v.name.name.name) { None }
+      if is_bare(v.name) && starts_upper(v.name.name.name) { None }
       else if is_bare(v.name) && contains(filler.scope, v.name.name.name) { None } else {
         match find(f.r, filler.module, ValueSpace, v.name) {
           Some(b) -> map_get(f.index, b.qualified),
@@ -3276,20 +3264,15 @@ fn build_scope_reporting(w: World, i: Int) -> Builder / {abort.raise} = {
 
 // --- The dump -------------------------------------------------------------------------------
 
-fn dump_int(v: Int) -> Bytes = int_to_bytes(v)
-
-fn dump_span(span: Span) -> Bytes =
-  bytes_concat_all([dump_int(span.start), b":", dump_int(span.end)])
-
 fn dump_modbind(tag: Bytes, binding: ModuleBinding) -> Bytes =
   bytes_concat_all([
     tag,
     b";",
     binding.binder,
     b";",
-    dump_int(binding.target),
+    ascii_of_int(binding.target),
     b";",
-    dump_span(binding.span),
+    span_key(binding.span),
     b";",
   ])
 
@@ -3301,16 +3284,16 @@ fn dump_binding(tag: Bytes, binding: Binding) -> Bytes =
     b";",
     binding.qualified,
     b";",
-    dump_int(binding.owner),
+    ascii_of_int(binding.owner),
     b";",
-    dump_span(binding.span),
+    span_key(binding.span),
     b";",
   ])
 
 fn dump_scope(i: Int, scope: Scope) -> Bytes =
   bytes_concat_all([
     b"M;",
-    dump_int(i),
+    ascii_of_int(i),
     b";",
     scope.module,
     b";",
@@ -3326,19 +3309,19 @@ fn dump_order(order: List<Int>) -> Bytes / {abort.raise} =
   bytes_concat_all([
     b"O;",
     fold(range(0, len(order)), b"", |acc: Bytes, i: Int|
-      if i == 0 { dump_int(at(order, i)) }
-      else { bytes_concat_all([acc, b",", dump_int(at(order, i))]) }),
+      if i == 0 { ascii_of_int(at(order, i)) }
+      else { bytes_concat_all([acc, b",", ascii_of_int(at(order, i))]) }),
     b";",
   ])
 
 fn dump_label(label: Label) -> Bytes =
   bytes_concat_all([
     b"=",
-    dump_int(label.module),
+    ascii_of_int(label.module),
     b":",
-    dump_int(label.start),
+    ascii_of_int(label.start),
     b":",
-    dump_int(label.end),
+    ascii_of_int(label.end),
     b":",
     if label.primary { b"1" } else { b"0" },
     b";",
@@ -3349,7 +3332,13 @@ fn dump_diag(diag: Diag) -> Bytes = {
     match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } });
   let head = match primary {
     Some(l) ->
-      bytes_concat_all([dump_int(l.module), b":", dump_int(l.start), b":", dump_int(l.end)]),
+      bytes_concat_all([
+        ascii_of_int(l.module),
+        b":",
+        ascii_of_int(l.start),
+        b":",
+        ascii_of_int(l.end),
+      ]),
     None -> b"0:0:0",
   };
   bytes_concat_all([
@@ -3358,19 +3347,19 @@ fn dump_diag(diag: Diag) -> Bytes = {
     b":",
     head,
     b":",
-    dump_int(len(diag.labels)),
+    ascii_of_int(len(diag.labels)),
     b":",
-    dump_int(diag.notes),
+    ascii_of_int(diag.notes),
     b";",
     bytes_concat_all(map(diag.labels, dump_label)),
   ])
 }
 
 pub fn dump_diags(diags: List<Diag>) -> Bytes =
-  bytes_concat_all([b"D;", dump_int(len(diags)), b";", bytes_concat_all(map(diags, dump_diag))])
+  bytes_concat_all([b"D;", ascii_of_int(len(diags)), b";", bytes_concat_all(map(diags, dump_diag))])
 
 pub fn resolve_dump(sources: List<Source>) -> String / {abort.raise} = {
-  let head = bytes_concat_all([b"R;", dump_int(len(sources)), b";"]);
+  let head = bytes_concat_all([b"R;", ascii_of_int(len(sources)), b";"]);
   let body = match resolve(sources) {
     ResolveFailed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
     ResolveSucceeded(x) ->
@@ -3382,7 +3371,7 @@ pub fn resolve_dump(sources: List<Source>) -> String / {abort.raise} = {
           map(range(0, len(x.mods)), |i: Int|
             bytes_concat_all([
               b"P;",
-              dump_int(i),
+              ascii_of_int(i),
               b";",
               dump_module(at(x.mods, i).module),
               b"#0;",
@@ -3392,6 +3381,11 @@ pub fn resolve_dump(sources: List<Source>) -> String / {abort.raise} = {
   };
   string_of_bytes(bytes_concat(head, body))
 }
+
+// Whether any of `diags` is an error. A program with a warning in it is still a program: the
+// emitter compiles it, the runtime runs it, and the warning is the reader's to act on.
+pub fn has_error(diags: List<Diag>) -> Bool =
+  fold(diags, false, |acc: Bool, diag: Diag| acc || diag.severity == b"error")
 
 // --- Tests ------------------------------------------------------------------
 
@@ -3458,7 +3452,7 @@ fn first_row(expanded: Expanded, m: Int) -> List<Bytes> / {abort.raise} = {
             match atom.eff.module { Some(b) -> bytes_concat(b.name, b"::"), None -> b"" },
             atom.eff.name.name,
             b".",
-            match atom.op { Some(o) -> o.name, None -> mode_word(atom.mode) },
+            match atom.op { Some(o) -> o.name, None -> mode_text(atom.mode) },
             match atom.resource { Some(l) -> bytes_concat_all([b"[", l.name, b"]"]), None -> b"" },
           ])),
     },
