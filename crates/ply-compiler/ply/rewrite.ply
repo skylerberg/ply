@@ -11,12 +11,13 @@ import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, At
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, FnDef,
               TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures,
               SCost, EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef,
-              TestDef, LawDef, SchemaDef, schema_guard_name, parse, dump_module, TDNominal)
+              TestDef, LawDef, SchemaDef, schema_guard_name, parse, dump_module, TDNominal,
+              IInstance, InstanceDef, NGen, sampler_name, VPriv)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm,
               HandleClause, ReturnClause, RecField, expr_span, ETagged, Tagged, tagged_call,
-              tagged_fill, Hole, with_hole_values)
+              tagged_fill, Hole, with_hole_values, gen_binder)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt, LStr,
                  LBool)
 import std.bytes (ascii_of_int)
@@ -2101,9 +2102,128 @@ pub fn expand(
   else { { module: module, diags: diags } };
   let measured = measured_laws(tried.module, tried.diags);
   let costed = cost_laws(measured.module, measured.diags);
-  let made = with_schema_fns(costed.module);
+  let made = with_samplers(with_schema_fns(costed.module));
   { module: made, diags: rebound(made, costed.diags) }
 }
+
+// --- The stated generator -----------------------------------------------------------------------
+
+/// A `gen for T by f` is also the definition a prover enters to draw a `T`: what `f`'s generator
+/// samples at a seed, each generator `f` takes for one of the type's parameters choosing among
+/// values handed in. It carries its statement's span, which regenerates it.
+fn sampler(d: InstanceDef, t: TypeDef) -> Item = {
+  let here = d.span;
+  let ident = |name: Bytes| { name: name, span: here };
+  let shipped = |name: Bytes| { module: Some(ident(gen_binder())), name: ident(name), span: here };
+  let var = |name: Bytes| EVar({ span: here, name: bare(ident(name)) });
+  let con = |name: QName, args: List<TypeExpr>|
+    TCon({ span: here, name: name, args: args, labels: [], rows: [] });
+  let plain = |name: Bytes| nullary(bare(ident(name)));
+  let param = |name: Bytes, ty: TypeExpr|
+    { name: ident(name), ty: Some(ty), cost: None, default: None, span: here };
+  let pool = |i: Int| bytes_concat(b"pool", ascii_of_int(i));
+  let pools = fold(t.generics.types, [], |acc: List<Param>, g: Ident|
+    push(acc, param(pool(len(acc)), con(bare(ident(b"List")), [TVar(g)]))));
+  let seeded = [
+    param(b"root", plain(b"Int")),
+    param(b"key", plain(b"Bytes")),
+    param(b"size", plain(b"Int")),
+    param(b"replay", con(bare(ident(b"Option")), [con(bare(ident(b"List")), [plain(b"Int")])])),
+  ];
+  // Each call stands at a span of its own inside the statement.
+  let chosen = map(range(0, len(t.generics.types)), |i: Int| {
+    let spot = { start: here.start + i, end: here.start + i + 1 };
+    EApp({
+      span: spot,
+      func: EVar({ span: spot, name: shipped(b"elements") }),
+      named: [],
+      args: [var(pool(i))],
+      labels: [],
+    })
+  });
+  let stated = EApp({
+    span: d.by.span,
+    func: EVar({ span: d.by.span, name: bare(d.by) }),
+    named: [],
+    args: chosen,
+    labels: [],
+  });
+  IFn({
+    vis: VPriv,
+    name: ident(sampler_name(d.target.name)),
+    generics: { types: t.generics.types, effects: [], labels: [] },
+    params: concat(pools, seeded),
+    ret: Some(
+      con(shipped(b"Sample"), [con(bare(t.name), map(t.generics.types, |g: Ident| TVar(g)))]),
+    ),
+    effects: Some({
+      atoms: [
+        {
+          eff: bare(ident(b"abort")),
+          mode: MWrite,
+          op: Some(ident(b"raise")),
+          resource: None,
+          every: false,
+          bounded: false,
+          span: here,
+        },
+      ],
+      aliases: [],
+      tail: None,
+      tail_bounded: false,
+      span: here,
+    }),
+    constraints: [],
+    spec: [],
+    returns: None,
+    reuse: None,
+    transparent: None,
+    decreases: None,
+    body: EApp({
+      span: here,
+      func: EVar({ span: d.target.span, name: shipped(b"sample") }),
+      named: [],
+      args: [stated, var(b"root"), var(b"key"), var(b"size"), var(b"replay")],
+      labels: [],
+    }),
+    doc: None,
+    span: here,
+  })
+}
+
+/// Whether a type may state a generator: one of its own values is drawn, so it is a sum or a `new`
+/// record, and its sampler is handed values for type parameters alone.
+pub fn takes_gen(t: TypeDef) -> Bool =
+  len(t.generics.labels) == 0 && len(t.generics.effects) == 0
+    && (match t.body { TDAlias(_) -> false, TDSum(_) -> true, TDNominal(_) -> true })
+
+/// The first `gen` each type of this module states makes its sampler; the checker refuses the rest.
+fn with_samplers(module: Module) -> Module =
+  if !fold(module.items, false, |found: Bool, item: Item|
+      found || (match item { IInstance(d) -> d.kind == NGen, _ -> false })) { module } else {
+    let types = collect_types(module);
+    let made = fold(
+      module.items,
+      { items: [], seen: [] },
+      |acc: { items: List<Item>, seen: List<Bytes> }, item: Item| {
+        let kept = push(acc.items, item);
+        match item {
+          IInstance(d) -> if d.kind != NGen || contains(acc.seen, d.target.name) {
+            { ..acc, items: kept }
+          } else {
+            match find_type(types, d.target.name) {
+              Some(t) -> if takes_gen(t) {
+                { items: push(kept, sampler(d, t)), seen: push(acc.seen, d.target.name) }
+              } else { { ..acc, items: kept } },
+              None -> { ..acc, items: kept },
+            }
+          },
+          _ -> { ..acc, items: kept },
+        }
+      },
+    );
+    { ..module, items: made.items }
+  }
 
 // --- The law schema ----------------------------------------------------------------------------
 
@@ -2629,4 +2749,35 @@ test "a tagged literal and a `try` in a schema or in what a law instantiates one
       b"type Mine = | Ok(Int) | Err(Int)\nlaw schema s(f: (Int) -> Int) forall (x: Int) { try { f(x) } == Mine::Ok(x) }\n",
     ),
   )
+}
+
+fn sampled(src: Bytes) -> List<FnDef> / {abort.raise} = {
+  let r = parse(src);
+  fold(expand(r.node, r.parser.diags).module.items, [], |acc: List<FnDef>, item: Item|
+    match item {
+      IFn(d) -> if bytes_starts_with(d.name.name, b"_sample_") { push(acc, d) } else { acc },
+      _ -> acc,
+    })
+}
+
+test "a gen's sampler takes a pool for each of its type's parameters, then a stream and a record" {
+  let made = sampled(
+    b"type Pair<a, b> = | Pair(a, b)\ngen for Pair by pairs\ntype Coin = | Heads | Tails\ngen for Coin by coins\n",
+  );
+  assert_eq(map(made, |d: FnDef| d.name.name), [b"_sample_Pair", b"_sample_Coin"]);
+  let params = |d: FnDef| map(d.params, |p: Param| p.name.name);
+  assert_eq(map(made, params), [
+    [b"pool0", b"pool1", b"root", b"key", b"size", b"replay"],
+    [b"root", b"key", b"size", b"replay"],
+  ]);
+  assert_eq(map(made, |d: FnDef| map(d.generics.types, |g: Ident| g.name)), [[b"a", b"b"], []]);
+  // It stands at its statement, which is what regenerates it.
+  assert_eq(map(made, |d: FnDef| d.span), [{ start: 31, end: 52 }, { start: 81, end: 102 }])
+}
+
+test "a gen with no type of its own module to sample makes no sampler, and a second makes none" {
+  assert_eq(len(sampled(b"gen for Elsewhere by f\n")), 0);
+  assert_eq(len(sampled(b"type Id = Int\ngen for Id by f\n")), 0);
+  assert_eq(len(sampled(b"type Held<| e> = | Held(() -> Int / e)\ngen for Held by f\n")), 0);
+  assert_eq(len(sampled(b"type T = new { n: Int }\ngen for T by f\ngen for T by g\n")), 1)
 }

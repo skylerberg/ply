@@ -8,10 +8,11 @@
 //! a report prints and in the sort the runtime reasons with.
 
 import compiler.diagnostics (parse_all)
-import compiler.front (Analysis, Analysed, Refused, analyse, guard_literals, literals_of,
-                       schema_definitions)
+import compiler.front (Analysis, Analysed, Refused, analyse, analyse_pulling_std, guard_literals,
+                       literals_of, schema_definitions)
 import compiler.infer (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo, InstanceInfo, NumericInfo)
-import compiler.items (Item, IFn, ILaw, SEnsures, SRequires, SpecClause, NKey, NShow)
+import compiler.items (Item, IFn, IType, ILaw, IInstance, SEnsures, SRequires, SpecClause, NKey,
+                       NShow, NGen, sampler_name)
 import compiler.exprs (Expr, Param, expr_span)
 import compiler.hash (HashOutput, hex)
 import compiler.resolve (Diag, ParsedModule, error_at, qualify)
@@ -21,17 +22,23 @@ import compiler.types (Atom, Field, Printer, Type, TyCon, TyFn, TyRecord, TyVar,
                        reserve_atoms, row_is_pure_but_raise, run_needs, tuple_arity, ty_letter,
                        type_args, without_raises, TyNominal)
 import compiler.type_syntax (MWrite)
-import domain (Cases, Con, Decl, Domain, Fn, Record, Scalar, Shape, Ty, Var, Variant, finite,
-               name_of)
+import domain (Cases, Con, Decl, Domain, Fn, Record, Scalar, Shape, Ty, Var, Variant, find_decl,
+               finite, name_of)
+import gen (substituted)
 import obligation (Def, Ensures, Frame, Kind, Law, Pure, Writes, Written)
-import std.list (at, contains)
+import std.list (at, contains, sort)
 
 /// A definition as a callee: its signature, and whether its published row is empty. The static
 /// prover unfolds a call and shares one term between equal calls only when that row is.
 pub type Signature = { name: String, ty: Ty, pure: Bool }
 
-/// One binder of one claim: its name, its type, and that type as the compiler prints it.
-pub type Binder = { name: String, ty: Ty, text: String }
+/// One binder of one claim: its name, its type, and that type as the compiler prints it. `drawn`
+/// is the type as a sample draws it, where a `new` record that states a generator keeps its name.
+pub type Binder = { name: String, ty: Ty, text: String, drawn: Ty }
+
+/// A type whose module states a generator: how many parameters it takes, the definition that
+/// samples it, and that definition's hash, which covers the generator and all it reaches.
+pub type Generator = { ty: String, params: Int, sampler: String, hash: String }
 
 /// How the runtime discharges an obligation. Which search a claim goes to is decided here, once, and
 /// the runtime carries it out.
@@ -102,6 +109,9 @@ pub type World = {
   // The declared types that state a `key` or a `numeric`: two of their values are equal, and
   // meet under an operator, as those functions answer, which no proof here reads.
   keyed: List<String>,
+  // The types that state a generator, and the declared types as a sample draws them.
+  gens: List<Generator>,
+  drawn: List<Decl>,
 }
 
 /// The world; every definition and every hashed law of the modules a run answers for, in the
@@ -112,7 +122,11 @@ pub type Built = { world: World, defs: List<Def>, laws: List<Written>, warnings:
 /// Every declared type and signature, and the obligations of the modules `owned` answers for: every
 /// definition's `ensures` clauses in the checker's order, then every law; and their measures.
 pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.raise} = {
-  let decls = decls_of(analysis.checked.ctors);
+  let gens = gens_of(analysis);
+  let stated = map(gens, |g: Generator| bytes_of_string(g.ty));
+  let decls = decls_of(analysis.checked.ctors, []);
+  let drawn = if len(gens) == 0 { decls } else { decls_of(analysis.checked.ctors, stated) };
+  let drawing: Drawing = { gens: gens, stated: stated, decls: decls, drawn: drawn };
   let written = written_params(analysis.mods);
   let wheres = law_guards(analysis.mods);
   let requires = requires_of(analysis.mods);
@@ -126,9 +140,10 @@ pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.ra
   let schemas = schema_definitions(analysis.mods);
   let laws = filter(analysis.checked.laws, |l: LawInfo| owned(l.module));
   let clauses = fold(defs, { obligations: [], warnings: [] }, |acc: Owed, d: DefInfo|
-    clauses_of(acc, d, written, requires, keys, runs, decls));
+    clauses_of(acc, d, written, requires, keys, runs, drawing));
   let owed = fold(laws, clauses, |acc: Owed, l: LawInfo|
-    law_of(acc, l, analysis.hashes.laws, wheres, decls));
+    law_of(acc, l, analysis.hashes.laws, wheres, drawing));
+  let samplers = map(gens, |g: Generator| bytes_of_string(g.sampler));
   {
     world: {
       decls: decls,
@@ -136,8 +151,15 @@ pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.ra
       obligations: owed.obligations,
       measures: measures_in(analysis, owned),
       keyed: keyed_of(analysis.checked.instances, analysis.checked.numeric_types),
+      gens: gens,
+      drawn: drawn,
     },
-    defs: defined(filter(defs, |d: DefInfo| !map_contains(schemas, d.name)), analysis.hashes),
+    // A schema's definitions and a `gen`'s sampler are what claims are made with, not definitions
+    // to carry one.
+    defs: defined(
+      filter(defs, |d: DefInfo| !map_contains(schemas, d.name) && !contains(samplers, d.name)),
+      analysis.hashes,
+    ),
     laws: sentences_of(laws, analysis.hashes),
     warnings: owed.warnings,
   }
@@ -192,23 +214,126 @@ fn sentences_of(ls: List<LawInfo>, h: HashOutput) -> List<Written> / {abort.rais
     })
 }
 
+// --- What a sample draws through -----------------------------------------------------
+
+/// What drawing a claim's points reads of the program: the types that state a generator, by name,
+/// and the declared types as a proof reads them and as a sample draws them.
+type Drawing = { gens: List<Generator>, stated: List<Bytes>, decls: List<Decl>, drawn: List<Decl> }
+
+/// Every type whose module states a generator its sampler was made and hashed for.
+fn gens_of(analysis: Analysis) -> List<Generator> / {abort.raise} = {
+  let hashed = fold(
+    analysis.hashes.defs,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash),
+  );
+  fold(analysis.mods, [], |acc: List<Generator>, m: ParsedModule|
+    fold(m.module.items, acc, |a: List<Generator>, item: Item|
+      match item {
+        IInstance(d) -> if d.kind != NGen { a } else {
+          let ty = string_of_bytes_lossy(qualify(m.name, d.target.name));
+          let sampler = qualify(m.name, sampler_name(d.target.name));
+          match map_get(hashed, sampler) {
+            None -> a,
+            Some(h) -> if fold(a, false, |seen: Bool, g: Generator| seen || g.ty == ty) { a } else {
+              push(a, {
+                ty: ty,
+                params: fold(m.module.items, 0, |n: Int, it: Item|
+                  match it {
+                    IType(t) -> if t.name.name == d.target.name { len(t.generics.types) }
+                    else { n },
+                    _ -> n,
+                  }),
+                sampler: string_of_bytes_lossy(sampler),
+                hash: string_of_bytes_lossy(hex(h)),
+              })
+            },
+          }
+        },
+        _ -> a,
+      }))
+}
+
+/// The generators a draw of `ty` goes through, by their types' names, added to `seen`: a type that
+/// states one, and what each of its arguments draws through; otherwise each type its values are
+/// built of. `open` is the declared types being walked, which a type that reaches itself is not
+/// walked into again.
+fn through(ty: Ty, d: Drawing, open: List<String>, seen: List<String>, room: Int) -> List<String> =
+  match ty {
+    Var(_) -> seen,
+    Fn(params, ret, _) ->
+      through(
+        ret,
+        d,
+        open,
+        fold(params, seen, |acc: List<String>, p: Ty| through(p, d, open, acc, room)),
+        room,
+      ),
+    Record(fields) ->
+      fold(fields, seen, |acc: List<String>, f: { name: String, ty: Ty }|
+        through(f.ty, d, open, acc, room)),
+    Con(name, args) -> {
+      let over = fold(args, seen, |acc: List<String>, a: Ty| through(a, d, open, acc, room));
+      if fold(d.gens, false, |hit: Bool, g: Generator| hit || g.ty == name) {
+        if contains(over, name) { over } else { push(over, name) }
+      } else if room <= 0 || contains(open, name) { over } else {
+        match find_decl(d.drawn, name) {
+          None -> over,
+          Some(decl) ->
+            fold(decl.variants, over, |acc: List<String>, v: Variant|
+              fold(v.fields, acc, |inner: List<String>, f: Ty|
+                through(substituted(f, args), d, push(open, name), inner, room - 1))),
+        }
+      }
+    },
+  }
+
+/// The generators a draw of the binders goes through, by their types' names. Opening a declared
+/// type spends room, which a path does once for each.
+fn drawn_through(binders: List<Binder>, d: Drawing) -> List<String> =
+  if len(d.gens) == 0 { [] } else {
+    fold(binders, [], |acc: List<String>, b: Binder| through(b.drawn, d, [], acc, len(d.drawn) + 1))
+  }
+
+/// What a sample of a claim is filed under: what it executes, and each generator its points are
+/// drawn through, so an edit to one draws them again.
+fn run_key(executes: Bytes, binders: List<Binder>, d: Drawing) -> String / {abort.raise} = {
+  let names = drawn_through(binders, d);
+  if len(names) == 0 { string_of_bytes_lossy(hex(executes)) } else {
+    let hashes = sort(
+      fold(d.gens, [], |acc: List<String>, g: Generator|
+        if contains(names, g.ty) { push(acc, g.hash) } else { acc }),
+    );
+    string_of_bytes_lossy(
+      hex(
+        bytes_blake3(
+          bytes_concat_all(
+            fold(hashes, [executes, b"drawn through"], |acc: List<Bytes>, h: String|
+              push(acc, bytes_of_string(h))),
+          ),
+        ),
+      ),
+    )
+  }
+}
+
 // --- How an obligation is discharged -------------------------------------------------
 
 /// The binders' points: every one of them when their domain is finite and small enough to walk,
-/// named as the binders print, or a sample.
-fn points_of(binders: List<Binder>, decls: List<Decl>) -> Points =
-  match finite(map(binders, |binder: Binder| binder.ty), decls) {
-    Some(domain) -> Every(domain, name_of(map(binders, |binder: Binder| binder.text))),
-    None -> Drawn,
+/// named as the binders print, or a sample. A type that states a generator is what its generator
+/// draws, so a domain that holds one is sampled.
+fn points_of(binders: List<Binder>, d: Drawing) -> Points =
+  if len(drawn_through(binders, d)) > 0 { Drawn } else {
+    match finite(map(binders, |binder: Binder| binder.ty), d.decls) {
+      Some(domain) -> Every(domain, name_of(map(binders, |binder: Binder| binder.text))),
+      None -> Drawn,
+    }
   }
 
 /// An `ensures` is attempted statically whatever its owner performs, since a proof never calls the
 /// owner; only a run over its points does, and it answers a raise as a gap.
-fn clause_strategy(performs: Option<String>, binders: List<Binder>, decls: List<Decl>) -> Strategy =
-  match performs {
-    Some(row) -> Static(Unhandled(row)),
-    None -> Static(Run(points_of(binders, decls))),
-  }
+fn clause_strategy(performs: Option<String>, binders: List<Binder>, d: Drawing) -> Strategy =
+  match performs { Some(row) -> Static(Unhandled(row)), None -> Static(Run(points_of(binders, d))) }
 
 /// Whether a counterexample is walked down from the draw it came from. Only a point drawn one at a
 /// time has a draw to walk from: an enumerated point is one a fixed order met, and an interleaving
@@ -226,13 +351,13 @@ fn law_strategy(
   host: Bool,
   footprint: Option<String>,
   binders: List<Binder>,
-  decls: List<Decl>,
+  d: Drawing,
 ) -> Strategy =
   if cost { Fitting }
   else if host { Hosted } else {
     match footprint {
-      Some(_) -> Interleave(points_of(binders, decls)),
-      None -> Static(Run(points_of(binders, decls))),
+      Some(_) -> Interleave(points_of(binders, d)),
+      None -> Static(Run(points_of(binders, d))),
     }
   }
 
@@ -268,24 +393,38 @@ fn number_of(vars: List<Int>, v: Int) -> Int / {abort.raise} =
   fold(range(0, len(vars)), len(vars), |found: Int, i: Int|
     if found < len(vars) { found } else if at(vars, i) == v { i } else { found })
 
-fn ty_of(t: Type, vars: List<Int>) -> Ty / {abort.raise} =
+fn ty_of(t: Type, vars: List<Int>) -> Ty / {abort.raise} = ty_drawn(t, vars, [])
+
+/// `t` as a sample draws it: a `new` record among `stated` keeps its name, since its generator is
+/// found by it.
+fn ty_drawn(t: Type, vars: List<Int>, stated: List<Bytes>) -> Ty / {abort.raise} =
   match t {
     TyVar(v) -> Var(number_of(vars, v)),
     TyCon(c) ->
-      Con(string_of_bytes_lossy(c.name), map(type_args(c.args), |a: Type| ty_of(a, vars))),
+      Con(
+        string_of_bytes_lossy(c.name),
+        map(type_args(c.args), |a: Type| ty_drawn(a, vars, stated)),
+      ),
     TyFn(f) ->
       Fn(
-        map(f.params, |p: Type| ty_of(p, vars)),
-        ty_of(f.ret, vars),
+        map(f.params, |p: Type| ty_drawn(p, vars, stated)),
+        ty_drawn(f.ret, vars, stated),
         row_is_pure_but_raise(f.effects),
       ),
-    TyRecord(fs) -> record_of(fs, vars),
+    TyRecord(fs) -> record_of(fs, vars, stated),
     // A value of a `new` record is the record it is written as, which is what a run is handed.
-    TyNominal(n) -> record_of(n.fields, vars),
+    TyNominal(n) -> if contains(stated, n.name) {
+      Con(
+        string_of_bytes_lossy(n.name),
+        map(type_args(n.args), |a: Type| ty_drawn(a, vars, stated)),
+      )
+    } else { record_of(n.fields, vars, stated) },
   }
 
-fn record_of(fs: List<Field>, vars: List<Int>) -> Ty / {abort.raise} =
-  Record(map(fs, |f: Field| { name: string_of_bytes_lossy(f.name), ty: ty_of(f.ty, vars) }))
+fn record_of(fs: List<Field>, vars: List<Int>, stated: List<Bytes>) -> Ty / {abort.raise} =
+  Record(
+    map(fs, |f: Field| { name: string_of_bytes_lossy(f.name), ty: ty_drawn(f.ty, vars, stated) }),
+  )
 
 /// A printer that names each variable by its number rather than by the order it meets them in.
 fn numbered(vars: List<Int>) -> Printer / {abort.raise} =
@@ -299,19 +438,21 @@ type Printed = { binders: List<Binder>, variables: List<String> }
 
 /// One claim's binders, numbered together and printed by one printer: two binders share a letter
 /// exactly when they share a variable.
-fn binders_of(named: List<Named>) -> Printed / {abort.raise} = {
+fn binders_of(named: List<Named>, stated: List<Bytes>) -> Printed / {abort.raise} = {
   let vars = fold(named, [], |acc: List<Int>, b: Named| met(b.ty, acc));
   let printed = fold(
     named,
     { p: numbered(vars), out: [] },
     |acc: { p: Printer, out: List<Binder> }, b: Named| {
       let o = print_ty(acc.p, b.ty);
+      let ty = ty_of(b.ty, vars);
       {
         p: o.printer,
         out: push(acc.out, {
           name: string_of_bytes_lossy(b.name),
-          ty: ty_of(b.ty, vars),
+          ty: ty,
           text: string_of_bytes_lossy(o.text),
+          drawn: if len(stated) == 0 { ty } else { ty_drawn(b.ty, vars, stated) },
         }),
       }
     },
@@ -342,8 +483,11 @@ fn params_of(k: CtorInfo) -> List<Int> = {
   }
 }
 
-fn variant_of(k: CtorInfo) -> Variant / {abort.raise} =
-  { name: string_of_bytes_lossy(k.name), fields: map(k.fields, |f: Type| ty_of(f, params_of(k))) }
+fn variant_of(k: CtorInfo, stated: List<Bytes>) -> Variant / {abort.raise} =
+  {
+    name: string_of_bytes_lossy(k.name),
+    fields: map(k.fields, |f: Type| ty_drawn(f, params_of(k), stated)),
+  }
 
 fn by_index(ks: List<CtorInfo>) -> List<CtorInfo> =
   fold(ks, [], |acc: List<CtorInfo>, k: CtorInfo| {
@@ -356,8 +500,8 @@ fn by_index(ks: List<CtorInfo>) -> List<CtorInfo> =
   })
 
 /// Every type a constructor belongs to, the prelude's among them, with its variants in declaration
-/// order.
-fn decls_of(ctors: List<CtorInfo>) -> List<Decl> / {abort.raise} = {
+/// order, each field as a proof reads it, or with `stated` as a sample draws it.
+fn decls_of(ctors: List<CtorInfo>, stated: List<Bytes>) -> List<Decl> / {abort.raise} = {
   let grouped = fold(
     ctors,
     { names: [], by: map_new() },
@@ -372,7 +516,7 @@ fn decls_of(ctors: List<CtorInfo>) -> List<Decl> / {abort.raise} = {
     {
       name: string_of_bytes_lossy(name),
       params: match list_at(own, 0) { Some(k) -> len(params_of(k)), None -> 0 },
-      variants: map(own, variant_of),
+      variants: map(own, |k: CtorInfo| variant_of(k, stated)),
     }
   })
 }
@@ -487,7 +631,7 @@ fn clauses_of(
   requires: Map<Bytes, List<Expr>>,
   keys: Map<Bytes, List<Bytes>>,
   runs: Map<Bytes, List<Bytes>>,
-  decls: List<Decl>,
+  drawing: Drawing,
 ) -> Owed / {abort.raise} = {
   let ensures = filter(d.spec, is_ensures);
   if len(ensures) == 0 { acc } else {
@@ -498,14 +642,14 @@ fn clauses_of(
     let names = match map_get(written, d.name) { Some(ns) -> ns, None -> [] };
     let params = map(range(0, min(len(names), len(shape.params))), |i: Int|
       { name: at(names, i), ty: at(shape.params, i) });
-    let printed = binders_of(push(params, { name: b"result", ty: shape.ret }));
+    let printed = binders_of(push(params, { name: b"result", ty: shape.ret }), drawing.stated);
     let binders = map(range(0, len(params)), |i: Int| at(printed.binders, i));
     let result = list_at(printed.binders, len(params));
     let propositions = match map_get(requires, d.name) { Some(es) -> es, None -> [] };
     let guards = map(propositions, |g: Expr| at_of(d.at.module, expr_span(g)));
     let literals = literals_of(propositions);
     let frame = frame_of(d.footprint);
-    let strategy = clause_strategy(footprint_text(run_needs(d.footprint)), binders, decls);
+    let strategy = clause_strategy(footprint_text(run_needs(d.footprint)), binders, drawing);
     let hashed = match map_get(keys, d.name) { Some(hs) -> hs, None -> [] };
     let ran = match map_get(runs, d.name) { Some(hs) -> hs, None -> [] };
     fold(range(0, len(ensures)), acc, |out: Owed, ordinal: Int| {
@@ -517,8 +661,10 @@ fn clauses_of(
             ..out,
             obligations: push(out.obligations, {
               key: string_of_bytes_lossy(hex(key)),
-              run_key: string_of_bytes_lossy(
-                hex(match list_at(ran, clause.index) { Some(r) -> r, None -> key }),
+              run_key: run_key(
+                match list_at(ran, clause.index) { Some(r) -> r, None -> key },
+                binders,
+                drawing,
               ),
               owner: string_of_bytes_lossy(d.name),
               kind: Ensures(ordinal),
@@ -546,18 +692,21 @@ fn law_of(
   l: LawInfo,
   hashes: List<Bytes>,
   wheres: Map<Bytes, Guard>,
-  decls: List<Decl>,
+  drawing: Drawing,
 ) -> Owed / {abort.raise} =
   match list_at(hashes, l.index) {
     None -> { ..acc, warnings: push(acc.warnings, unhashed(l.key, l.at.module, l.at.span)) },
     Some(key) -> {
-      let printed = binders_of(map(l.binders, |b: LawBinder| { name: b.name, ty: b.ty }));
+      let printed = binders_of(
+        map(l.binders, |b: LawBinder| { name: b.name, ty: b.ty }),
+        drawing.stated,
+      );
       let footprint = footprint_text(l.footprint);
       {
         ..acc,
         obligations: push(acc.obligations, {
           key: string_of_bytes_lossy(hex(key)),
-          run_key: string_of_bytes_lossy(hex(key)),
+          run_key: run_key(key, printed.binders, drawing),
           owner: string_of_bytes_lossy(l.key),
           kind: Law(Some(string_of_bytes_lossy(l.name))),
           at: at_of(l.at.module, l.at.span),
@@ -572,7 +721,7 @@ fn law_of(
           host: l.host,
           footprint: footprint,
           frame: Pure,
-          strategy: law_strategy(l.cost, l.host, footprint, printed.binders, decls),
+          strategy: law_strategy(l.cost, l.host, footprint, printed.binders, drawing),
         }),
       }
     },
@@ -580,21 +729,25 @@ fn law_of(
 
 /// The declared types and signatures every claim is read against, and `measures`, with no
 /// obligation: all that judging a measure reads.
-pub fn measures_world(analysis: Analysis, measures: List<Measure>) -> World / {abort.raise} =
+pub fn measures_world(analysis: Analysis, measures: List<Measure>) -> World / {abort.raise} = {
+  let decls = decls_of(analysis.checked.ctors, []);
   {
-    decls: decls_of(analysis.checked.ctors),
+    decls: decls,
     signatures: map(analysis.checked.defs, signature_of),
     obligations: [],
     measures: measures,
     keyed: keyed_of(analysis.checked.instances, analysis.checked.numeric_types),
+    gens: [],
+    drawn: decls,
   }
+}
 
 /// The types that state a `key` or a `numeric`, by name.
 fn keyed_of(instances: List<InstanceInfo>, numeric: List<NumericInfo>) -> List<String> =
   fold(
     numeric,
     fold(instances, [], |acc: List<String>, x: InstanceInfo|
-      match x.kind { NKey -> push(acc, string_of_bytes_lossy(x.type_name)), NShow -> acc }),
+      match x.kind { NKey -> push(acc, string_of_bytes_lossy(x.type_name)), _ -> acc }),
     |acc: List<String>, x: NumericInfo| push(acc, string_of_bytes_lossy(x.type_name)),
   )
 
@@ -615,6 +768,7 @@ pub fn measures_in(analysis: Analysis, owned: (Bytes) -> Bool) -> List<Measure> 
             binders: binders_of(
               map(range(0, min(len(names), len(shape))), |i: Int|
                 { name: at(names, i), ty: at(shape, i) }),
+              [],
             ).binders,
           })
         },
@@ -709,10 +863,10 @@ test "a clause's binders are its owner's parameters as written, and its result i
   let o = at(os, 0);
   // A point assigns the parameters; `result` is the owner's answer at them.
   assert_eq(o.binders, [
-    { name: "first", ty: Var(0), text: "a" },
-    { name: "second", ty: Var(1), text: "b" },
+    { name: "first", ty: Var(0), text: "a", drawn: Var(0) },
+    { name: "second", ty: Var(1), text: "b", drawn: Var(1) },
   ]);
-  assert_eq(o.result, Some({ name: "result", ty: Var(0), text: "a" }));
+  assert_eq(o.result, Some({ name: "result", ty: Var(0), text: "a", drawn: Var(0) }));
   assert_eq(o.variables, ["a", "b"]);
   // One `requires`, where its proposition is written.
   assert_eq(map(o.guards, |g: { module: Int, start: Int, end: Int }| g.start), [49]);
@@ -905,4 +1059,75 @@ test "a measure is its definition's, apart from every obligation, over the param
   assert_eq(map(w.measures, |m: Measure| m.owner), ["m.climb"]);
   assert_eq(map(w.measures, |m: Measure| map(m.binders, |b: Binder| b.name)), [["a", "b"]]);
   assert_eq(owned_by(w.obligations, "m.climb"), [])
+}
+
+// --- Generators --------------------------------------------------------------------------
+
+/// A program beside a `std.gen` of the shapes a sampler is written with, as the prover reads it.
+/// `evens` is what the generator of `Even` is made of.
+fn drawing(evens: Bytes, laws: Bytes) -> Built / {abort.raise} = {
+  let shipped = b"pub type Gen<a> = | Gen((Int) -> Option<a>)\npub type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\npub fn sample<a>(g: Gen<a>, root: Int, key: Bytes, size: Int, replay: Option<List<Int>>) -> Sample<a> = match g { Gen(f) -> { value: f(root), record: [], discards: 0 } }\npub fn elements<a>(xs: List<a>) -> Gen<a> = Gen(|i: Int| list_at(xs, i))\npub fn constant<a>(x: a) -> Gen<a> = Gen(|_i: Int| Some(x))\n";
+  let src = bytes_concat_all([
+    b"import std.gen (Gen, constant, elements)\ntype Even = new { n: Int }\ngen for Even by evens\nfn evens() -> Gen<Even> = constant({ n: ",
+    evens,
+    b" })\ntype Coin = | Heads | Tails\ngen for Coin by coins\nfn coins() -> Gen<Coin> = constant(Heads)\ntype Pair<a> = | Pair(a, a)\ngen for Pair by pairs\nfn pairs<a>(g: Gen<a>) -> Gen<Pair<a>> = match g { Gen(f) -> Gen(|i: Int| match f(i) { Some(x) -> Some(Pair(x, x)), None -> None }) }\ntype Order = | Order(Even, Int)\n",
+    laws,
+  ]);
+  match analyse_pulling_std([{ name: b"m", src: src }], [{ name: b"std.gen", src: shipped }]).out {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> world_of(w, |module: Bytes| module == b"m"),
+  }
+}
+
+fn claim_of(built: Built, owner: String) -> Obligation / {abort.raise} =
+  at(owned_by(built.world.obligations, owner), 0)
+
+test "a type that states a generator is named with its sampler, and its binder keeps its name for a draw" {
+  let built = drawing(
+    b"2",
+    b"law \"evens\" forall (e: Even, es: List<Even>) { e.n % 2 == 0 }\nlaw \"coins\" forall (c: Coin) { c == c }\nlaw \"flags\" forall (b: Bool) { b || !b }\n",
+  );
+  assert_eq(map(built.world.gens, |g: Generator| (g.ty, g.params, g.sampler)), [
+    ("m.Even", 0, "m._sample_Even"),
+    ("m.Coin", 0, "m._sample_Coin"),
+    ("m.Pair", 1, "m._sample_Pair"),
+  ]);
+  // A proof reads the record a `new` record is; a draw reads the type its generator is found by.
+  let record = Record([{ name: "n", ty: Con("Int", []) }]);
+  assert_eq(map(claim_of(built, "m.evens").binders, |b: Binder| (b.ty, b.drawn)), [
+    (record, Con("m.Even", [])),
+    (Con("List", [record]), Con("List", [Con("m.Even", [])])),
+  ]);
+  // A type is what its generator draws, so a domain that holds one is sampled, however small.
+  assert_eq(claim_of(built, "m.coins").strategy, Static(Run(Drawn)));
+  assert_eq(
+    claim_of(built, "m.flags").strategy,
+    Static(Run(Every({ shapes: [Scalar("Bool", 2)], points: 2 }, "Bool"))),
+  );
+  // A sampler is what a claim is drawn with, not a definition to carry one.
+  assert_eq(map(built.defs, |d: Def| d.name), ["m.evens", "m.coins", "m.pairs"])
+}
+
+test "a sample is filed under each generator it draws through, and a proof under none" {
+  let laws = b"fn halved(e: Even) -> Int ensures result * 2 == e.n = e.n / 2\nlaw \"evens\" forall (e: Even) { e.n % 2 == 0 }\nlaw \"orders\" forall (o: Order) { o == o }\nlaw \"paired\" forall (p: Pair<Even>) { p == p }\nlaw \"twins\" forall (p: Pair<Int>) { p == p }\nlaw \"ints\" forall (n: Int) { n == n }\nlaw \"sized\" forall (n: Int) where n > 1 cost n { fold(range(0, n), 0, |a: Int, x: Int| a + x) }\n";
+  let before = drawing(b"2", laws);
+  let edited = drawing(b"4", laws);
+  let keys = |built: Built, owner: String| {
+    let o = claim_of(built, owner);
+    { key: o.key, run_key: o.run_key }
+  };
+  // The generator is no part of what a claim says: every proof stands across the edit.
+  let owners = ["m.halved", "m.evens", "m.orders", "m.paired", "m.twins", "m.ints", "m.sized"];
+  assert_eq(
+    map(owners, |o: String| keys(before, o).key),
+    map(owners, |o: String| keys(edited, o).key),
+  );
+  // A law, a clause, a type that holds one and an argument of another's are drawn through it.
+  let moved = |owner: String| keys(before, owner).run_key != keys(edited, owner).run_key;
+  assert_eq(map(owners, moved), [true, true, true, true, false, false, false]);
+  // What draws through no generator is filed where it always was, a cost law among it.
+  assert_eq(keys(before, "m.ints").run_key, keys(before, "m.ints").key);
+  assert_eq(keys(before, "m.sized").run_key, keys(before, "m.sized").key);
+  assert(keys(before, "m.twins").run_key != keys(before, "m.twins").key);
+  assert(keys(before, "m.evens").run_key != keys(before, "m.evens").key)
 }

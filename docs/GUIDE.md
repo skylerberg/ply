@@ -117,7 +117,7 @@ cases — and holds no examples: the tests and laws that name a definition are
 its examples, and `ply doc` lists them (§16). A blank line between a doc and its
 declaration does not part them, and `ply fmt` removes it. A doc comment that
 documents nothing — one inside a body, above an import, a `test`, a `law`, a
-`derive`, a `key`, a `show` or a `numeric`, or at the end of a file, or a `//!` line below
+`derive`, a `key`, a `show`, a `gen` or a `numeric`, or at the end of a file, or a `//!` line below
 the head of its file — is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
 answer.
 
@@ -148,7 +148,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
-| `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
+| `key`, `show`, `gen`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>`, `gen for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -322,7 +322,7 @@ Loosest to tightest; all binary operators are left-associative:
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
 `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`,
-`show` and `numeric`, in any order.
+`show`, `gen` and `numeric`, in any order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -724,6 +724,46 @@ a numeric type: it fills `numeric(a)` (§4.5), as `std.math.sum(xs)` over a
 `numeric(a)`, which holds the ordered comparisons. `==`, `compare` and `digest`
 are the key's, whatever arithmetic is stated. Each of these is `E0201` where
 the type does not have it.
+
+A type states how its values are drawn, where a claim over it is sampled (§10):
+
+```ply
+import std.gen
+import std.gen (Gen)
+
+pub type Date = new { year: Int, month: Int, day: Int }
+
+gen for Date by dates
+
+fn dates() -> Gen<Date> =
+  gen::map2(gen::int_between(1, 12), gen::int_between(1, 28), |month: Int, day: Int|
+    { year: 2000, month: month, day: day })
+```
+
+`gen for T by f` names a function of the same module that answers a `std.gen`
+generator of the type (`ply doc std.gen`): `f: () -> Gen<T>`, or for a type with
+parameters one that takes a generator for each, `f: (Gen<a>, Gen<b>) -> Gen<T<a, b>>`.
+It performs nothing but `abort.raise`. A `forall` over `T` then draws each `T`
+through `f` and never from the type's fields, wherever the type sits in a
+binder: a `List<T>`, a record or a sum that holds one, a `T<U>`. So a sampled
+claim sees only values the module makes, a month 13 never among them. A module
+that states a `gen` imports `std.gen` itself, under a name no source can write,
+so `std.gen` states none.
+
+`T` is a sum or a `new` record the module declares (`E0208`), and states one
+generator (`E0105`). An alias is the type it names, and nothing says which label
+or row a drawn value of a type that binds one is at, so neither states one; a
+function that is no generator of the type is refused where it is stated, with
+what it was held to (`E0473`). The statement is also the definition `_sample_T`
+(`E0105` if the module declares one): `f`'s generator sampled at a root, a key
+and a size, or from a record of draws, each generator `f` takes choosing among
+values handed in. It is what `ply prove` enters to draw a `T`, and what a test
+calls to see what a generator makes.
+
+A generator decides what a sample draws and nothing a program computes. It is
+no part of its type's hash: an edit to one re-checks no definition that holds a
+`T` and re-runs no test, and draws again exactly the samples drawn through it
+(§10).
 
 ### 4.5 Generics
 
@@ -1940,6 +1980,21 @@ not, and arithmetic as the integers', which an operator at a type that states
 never `proved`: it is run, over every point of a finite domain or over a sample.
 Under `--reach` the place is `float_term` or `keyed_term`.
 
+A sampled claim draws each binder from its type: a scalar, a list, a record or
+a sum from its structure, and a type that states a generator (§4.4) through it,
+at any depth. The generator is handed a size, the case's place in its run up to
+63, so early cases are small, and for each of its type's parameters a generator
+that chooses among sixteen values drawn of the argument. A counterexample
+shrinks as it was drawn: a structural value by its parts, and a generated one by
+replaying a shorter or lower record of the draws that made it, and by shrinking
+the values it chose among, so what a refutation shows is still a value its
+generator makes. A domain that holds such a type is what its generator draws,
+so it is sampled, however small, and never enumerated; the static tier reads
+the type as it reads any other. A generator that draws no value, as
+`such_that` does past its budget, leaves the claim `unattempted` (`gave_up`)
+rather than narrowed, and a sample counts the values its generators turned away
+as `discarded`.
+
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
 arguments name every binder; where a claim makes a call that fits it, the law
@@ -2021,7 +2076,7 @@ declines, or any other failure that is Ply's own, is a `defect` reported under
 Ply's code (`E0505`), as `ply test` reports one. Under `--json` a gap carries
 its sentence as `gap` and its kind as `gap_kind` (`unhandled_effect`,
 `ungeneratable`, `raised`, `guard_not_sampled`, `reaches_host`, `not_drawn`,
-`unfitted`), a
+`unfitted`, `gave_up`), a
 defect carries `defect` — its `code`, `message`, the `bindings` Ply failed at,
 and a `summary` — and `summary` counts defects as `defect`. A claim's type
 variables are lettered by where they first appear among
@@ -2035,7 +2090,8 @@ number keys the cached result, so more budget is a stronger claim). A `proved`
 obligation is cached under its claim's hash, which reads another package's
 definitions by their contracts, so it stands across an edit to a dependency's
 body; a sampled one is cached under the hash of every implementation its cases
-run, and is drawn again. `--reach`
+run and of each generator its points are drawn through, and is drawn again when
+any of them moves. `--reach`
 asks the static tier alone about every obligation the run reports on, cached or
 not, and under `--json` each then carries `reach`: what it decided (`proved`,
 `guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
@@ -2217,7 +2273,7 @@ import, what those import in turn, and what they embed, so a change to any other
 leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
-`show` or `numeric` names (§4.4), and none of their tests or laws; `--std`
+`show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; `--std`
 reads each one whole.
 
 ## 14. The host boundary
@@ -2863,6 +2919,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0469` | a test's table or label that performs more than raises |
 | `E0472` | a law instantiating a definition that is not a `law schema` |
+| `E0473` | `gen` for an alias or a type that binds a label or a row, or one whose function is no generator of the type |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
