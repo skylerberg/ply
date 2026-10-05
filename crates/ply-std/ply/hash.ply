@@ -1,27 +1,149 @@
-//! BLAKE3, SHA-256 and SHA-512.
+//! Hash functions as values, and what is written once over any of them: a digest, a digest of an
+//! input that arrives in parts, HMAC, HKDF and PBKDF2.
 //!
-//! The hashes content addressing, authentication and signing are defined by.
+//! A `Hash` is a block size, a digest size and how a block is taken and a message ended, so `hmac`,
+//! `hkdf` and `pbkdf2` take any of them. The SHA-2 and SHA-3 families, SHAKE and BLAKE2b are here;
+//! MD5 and SHA-1, which are broken for collisions, are in `std.hash_legacy`, so a use of either
+//! shows in an import. `blake3` is the `bytes_blake3` builtin and is no `Hash`.
 //!
-//! `blake3` is the `bytes_blake3` builtin. The SHA family is written in Ply, and the vectors the SHA
-//! standards and RFC 4231 publish are its tests. It is slow, since a compression round walks a list of
-//! words rather than living in scalars, so it is for small inputs: a key, a proof, a nonce, not a file.
+//! Everything else is written in Ply, and the vectors the standards publish are its tests. A round
+//! keeps its working words in parameters and its state in an array it updates in place, so a digest
+//! takes steps linear in its input.
+//!
+//! Nothing here runs in constant time, and a key is `Bytes`, since nothing written in Ply reads a
+//! `Secret`.
 
-import std.bytes (u32_be, u32_be_at, u64_be, xor, xor_byte, repeat)
-import std.list (at_or)
+import std.bytes (bytes_of_hex, hex_of, repeat, u32_be, u64_be, u64_le, xor, xor_byte)
+import std.list (all, find)
 
 /// The 32-byte BLAKE3 hash of `input`.
 pub fn blake3(input: Bytes) -> Bytes = bytes_blake3(input)
 
-// --- SHA-256 ---------------------------------------------------------------------
+// --- A hash as a value ------------------------------------------------------------
 
-// Every word is an `Int` with its low thirty-two bits significant, so a sum is masked down and
-// `rotr32` is the whole of the bit arithmetic.
+/// A hash function: its sizes, and how its state, an array of words, takes a block and ends.
+pub type Hash = new {
+  /// What its standard calls it, as `SHA-256`.
+  name: String,
+  /// The bytes of a block, which is what HMAC pads a key to.
+  block_size: Int,
+  /// The bytes of a digest.
+  digest_size: Int,
+  /// The state before any input.
+  start: Array<Int>,
+  /// `block(state, seen, data, at)` is the state after the `block_size` bytes of `data` at `at`,
+  /// where `state` had `seen` bytes before them. It is never handed a message's last bytes.
+  block: (Array<Int>, Int, Bytes, Int) -> Array<Int> / {abort.raise},
+  /// `finish(state, seen, tail)` is the digest, where `tail` is the message's last bytes: at most
+  /// `block_size` of them, and at least one unless the message is empty.
+  finish: (Array<Int>, Int, Bytes) -> Bytes / {abort.raise},
+}
 
-fn sha_mask(x: Int) -> Int = x & 0xFFFF_FFFF
+/// A digest in progress: the state after the `seen` bytes its blocks held, and the bytes that
+/// follow them, which no block has taken yet.
+pub type Hasher = new { hash: Hash, words: Array<Int>, seen: Int, pending: Bytes }
+
+/// Why a function here refused what it was asked for, with what was asked.
+pub type Refusal =
+  /// An output length the function does not give.
+  | OutputLength(Int)
+  /// A key of a length the function does not take.
+  | KeyLength(Int)
+  /// An iteration count below one.
+  | Iterations(Int)
+
+/// What a function of this module raises where it refuses its parameters.
+pub effect hash {
+  /// A length or a count is outside what the function defines.
+  raise refused(e: Refusal)
+}
+
+/// The digest of `input` under `h`.
+pub fn digest_of(h: Hash, input: Bytes) -> Bytes / {abort.raise} = finish(update(init(h), input))
+
+/// A digest under `h` that has taken no input.
+pub fn init(h: Hash) -> Hasher = { hash: h, words: h.start, seen: 0, pending: b"" }
+
+/// `s` having taken `data` as well. However an input is split across calls, `finish` answers its
+/// one digest.
+pub fn update(s: Hasher, data: Bytes) -> Hasher / {abort.raise} = {
+  let buffer = if bytes_len(s.pending) == 0 { data } else { bytes_concat(s.pending, data) };
+  // The last block stays pending even when it is whole: only `finish` knows it is the last.
+  taken(s, buffer, max(bytes_len(buffer) - 1, 0) / s.hash.block_size)
+}
+
+/// The digest of everything `s` has taken. `s` is a value still: it may take more.
+pub fn finish(s: Hasher) -> Bytes / {abort.raise} = s.hash.finish(s.words, s.seen, s.pending)
+
+/// Any split of an input gives the digest of the whole.
+pub law schema any_split(h: Hash)
+  forall (parts: List<Bytes>) {
+    finish(fold(parts, init(h), update)) == digest_of(h, bytes_concat_all(parts))
+  }
+
+/// `s` after the first `count` blocks of `buffer`, which is all it has not taken, the rest pending.
+fn taken(s: Hasher, buffer: Bytes, count: Int) -> Hasher / {abort.raise} = {
+  let size = s.hash.block_size;
+  {
+    ..s,
+    words: absorbed(s.hash.block, size, s.words, s.seen, buffer, 0, count),
+    seen: s.seen + count * size,
+    pending: bytes_slice(buffer, count * size, bytes_len(buffer)),
+  }
+}
+
+/// `words` after the blocks `i` to `count` of `data`, in turn.
+fn absorbed(
+  block: (Array<Int>, Int, Bytes, Int) -> Array<Int> / {abort.raise},
+  size: Int,
+  words: Array<Int>,
+  seen: Int,
+  data: Bytes,
+  i: Int,
+  count: Int,
+) -> Array<Int> / {abort.raise} =
+  if i >= count { words } else {
+    absorbed(block, size, block(words, seen + i * size, data, i * size), seen, data, i + 1, count)
+  }
+
+/// The state of a Merkle–Damgård hash once its message has ended: `words` after `tail`, a one bit,
+/// zeros, and `length`, which is the message's length as the hash writes it, fill whole blocks.
+pub fn md_closed(
+  block: (Array<Int>, Int, Bytes, Int) -> Array<Int> / {abort.raise},
+  block_size: Int,
+  words: Array<Int>,
+  seen: Int,
+  tail: Bytes,
+  length: Bytes,
+) -> Array<Int> / {abort.raise} = {
+  let used = bytes_len(tail) + 1 + bytes_len(length);
+  let last = bytes_concat_all([
+    tail,
+    b"\x80",
+    zeros((block_size - used % block_size) % block_size),
+    length,
+  ]);
+  absorbed(block, block_size, words, seen, last, 0, bytes_len(last) / block_size)
+}
+
+fn zeros(n: Int) -> Bytes / {abort.raise} =
+  if n <= 256 { bytes_slice(zero_run(), 0, max(n, 0)) }
+  else { bytes_concat(zero_run(), zeros(n - 256)) }
+
+/// Zero bytes, more than a block here holds, and made by no call, so reading them costs no step.
+fn zero_run() -> Bytes = {
+  let eight = b"\x00\x00\x00\x00\x00\x00\x00\x00";
+  let run = bytes_concat_all([eight, eight, eight, eight, eight, eight, eight, eight]);
+  bytes_concat_all([run, run, run, run])
+}
+
+// --- SHA-256 ----------------------------------------------------------------------
+
+// A word is an `Int` below 2^32; a rotation leaves bits above it that the mask ending a sum drops.
 
 /// The first thirty-two bits of the fractional parts of the cube roots of the first sixty-four
 /// primes, as the standard publishes them.
-fn sha_constants() -> List<Int> =
+fn sha256_constants() -> List<Int> =
   [
     0x428A_2F98,
     0x7137_4491,
@@ -89,296 +211,929 @@ fn sha_constants() -> List<Int> =
     0xC671_78F2,
   ]
 
-/// The same of the square roots of the first eight.
-fn sha_initial() -> List<Int> =
-  [
-    0x6A09_E667,
-    0xBB67_AE85,
-    0x3C6E_F372,
-    0xA54F_F53A,
-    0x510E_527F,
-    0x9B05_688C,
-    0x1F83_D9AB,
-    0x5BE0_CD19,
-  ]
+/// SHA-256 as FIPS 180-4 defines it.
+pub fn sha256_hash() -> Hash = {
+  let k = array_of_list(sha256_constants());
+  let block = |h: Array<Int>, _: Int, data: Bytes, at: Int| sha256_block(h, k, data, at);
+  {
+    name: "SHA-256",
+    block_size: 64,
+    digest_size: 32,
+    start: array_of_list([
+      0x6A09_E667,
+      0xBB67_AE85,
+      0x3C6E_F372,
+      0xA54F_F53A,
+      0x510E_527F,
+      0x9B05_688C,
+      0x1F83_D9AB,
+      0x5BE0_CD19,
+    ]),
+    block: block,
+    finish: |h: Array<Int>, seen: Int, tail: Bytes| {
+      let closed = md_closed(block, 64, h, seen, tail, u64_be((seen + bytes_len(tail)) * 8));
+      bytes_concat_all(map(array_to_list(closed), u32_be))
+    },
+  }
+}
 
-/// `g ^ (e & (f ^ g))`, which is the choice without a complement.
-fn sha_choose(e: Int, f: Int, g: Int) -> Int = g ^ e & (f ^ g)
+fn sha256_block(h: Array<Int>, k: Array<Int>, data: Bytes, at: Int) -> Array<Int> / {abort.raise} = {
+  let a = array_get(h, 0);
+  let b = array_get(h, 1);
+  let c = array_get(h, 2);
+  let d = array_get(h, 3);
+  let e = array_get(h, 4);
+  let f = array_get(h, 5);
+  let g = array_get(h, 6);
+  let hh = array_get(h, 7);
+  sha256_rounds(h, k, array_new(16, 0), data, at, 0, a, b, c, d, e, f, g, hh)
+}
 
-fn sha_majority(a: Int, b: Int, c: Int) -> Int = a & b ^ a & c ^ b & c
-
-fn sha_big0(a: Int) -> Int = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
-
-fn sha_big1(e: Int) -> Int = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
-
-fn sha_small0(x: Int) -> Int = rotr32(x, 7) ^ rotr32(x, 18) ^ x >>> 3
-
-fn sha_small1(x: Int) -> Int = rotr32(x, 17) ^ rotr32(x, 19) ^ x >>> 10
-
-/// Sixty-four words: the sixteen a block holds, then the four mixtures of the ones before.
-fn sha_schedule(block: List<Int>, at: Int, acc: List<Int>) -> List<Int> =
-  if at >= 64 { acc }
-  else if at < 16 { sha_schedule(block, at + 1, push(acc, at_or(block, at, 0))) } else {
-    sha_schedule(
-      block,
-      at + 1,
-      push(
-        acc,
-        sha_mask(
-          sha_small1(at_or(acc, at - 2, 0)) + at_or(acc, at - 7, 0)
-            + sha_small0(at_or(acc, at - 15, 0))
-            + at_or(acc, at - 16, 0),
-        ),
-      ),
+/// The rounds from `t` on. `w` holds the sixteen schedule words before `t`, the word for `t - 16`
+/// where the one for `t` goes.
+fn sha256_rounds(
+  h: Array<Int>,
+  k: Array<Int>,
+  w: Array<Int>,
+  data: Bytes,
+  at: Int,
+  t: Int,
+  a: Int,
+  b: Int,
+  c: Int,
+  d: Int,
+  e: Int,
+  f: Int,
+  g: Int,
+  hh: Int,
+) -> Array<Int> / {abort.raise} =
+  if t >= 64 { sha256_sum(h, a, b, c, d, e, f, g, hh) } else {
+    let x = if t < 16 {
+      let p = at + 4 * t;
+      bytes_at(data, p) << 24 | bytes_at(data, p + 1) << 16 | bytes_at(data, p + 2) << 8
+        | bytes_at(data, p + 3)
+    } else {
+      let w2 = array_get(w, t - 2 & 15);
+      let w15 = array_get(w, t - 15 & 15);
+      ((w2 >>> 17 | w2 << 15) ^ (w2 >>> 19 | w2 << 13) ^ w2 >>> 10) + array_get(w, t - 7 & 15)
+        + ((w15 >>> 7 | w15 << 25) ^ (w15 >>> 18 | w15 << 14) ^ w15 >>> 3)
+        + array_get(w, t & 15)
+        & 0xFFFF_FFFF
+    };
+    let t1 = hh + ((e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7))
+      + (g ^ e & (f ^ g))
+      + array_get(k, t)
+      + x;
+    let t2 = ((a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10))
+      + (a & b ^ a & c ^ b & c);
+    sha256_rounds(
+      h,
+      k,
+      array_set(w, t & 15, x),
+      data,
+      at,
+      t + 1,
+      t1 + t2 & 0xFFFF_FFFF,
+      a,
+      b,
+      c,
+      d + t1 & 0xFFFF_FFFF,
+      e,
+      f,
+      g,
     )
   }
 
-fn sha_round(state: List<Int>, k: Int, w: Int) -> List<Int> = {
-  let a = at_or(state, 0, 0);
-  let b = at_or(state, 1, 0);
-  let c = at_or(state, 2, 0);
-  let d = at_or(state, 3, 0);
-  let e = at_or(state, 4, 0);
-  let f = at_or(state, 5, 0);
-  let g = at_or(state, 6, 0);
-  let h = at_or(state, 7, 0);
-  let t1 = sha_mask(h + sha_big1(e) + sha_choose(e, f, g) + k + w);
-  let t2 = sha_mask(sha_big0(a) + sha_majority(a, b, c));
-  [sha_mask(t1 + t2), a, b, c, sha_mask(d + t1), e, f, g]
-}
-
-fn sha_compress(state: List<Int>, block: List<Int>) -> List<Int> = {
-  let schedule = sha_schedule(block, 0, []);
-  let constants = sha_constants();
-  let end = fold(range(0, 64), state, |s: List<Int>, i: Int|
-    sha_round(s, at_or(constants, i, 0), at_or(schedule, i, 0)));
-  map(range(0, 8), |i: Int| sha_mask(at_or(state, i, 0) + at_or(end, i, 0)))
-}
-
-fn sha_zeroes(n: Int) -> Bytes =
-  if n <= 0 { b"" } else {
-    let half = sha_zeroes(n / 2);
-    if n % 2 == 0 { bytes_concat(half, half) }
-    else { bytes_concat(bytes_concat(half, half), b"\x00") }
-  }
-
-fn sha_be_at(b: Bytes, at: Int) -> Int / {abort.raise} =
-  match u32_be_at(b, at) { Some(w) -> w, None -> 0 }
-
-fn sha_block(input: Bytes, at: Int) -> List<Int> / {abort.raise} =
-  map(range(0, 16), |i: Int| sha_be_at(input, at + i * 4))
-
-/// The message, a one bit, as many zeros as leave the length eight short of a block, then the
-/// length in bits as a big-endian word.
-fn sha_padded(input: Bytes) -> Bytes / {abort.raise} = {
-  let n = bytes_len(input);
-  let total = (n + 9 + 63) / 64 * 64;
-  bytes_concat_all([input, b"\x80", sha_zeroes(total - n - 9), u64_be(n * 8)])
+fn sha256_sum(
+  h: Array<Int>,
+  a: Int,
+  b: Int,
+  c: Int,
+  d: Int,
+  e: Int,
+  f: Int,
+  g: Int,
+  hh: Int,
+) -> Array<Int> / {abort.raise} = {
+  let a = array_get(h, 0) + a & 0xFFFF_FFFF;
+  let b = array_get(h, 1) + b & 0xFFFF_FFFF;
+  let c = array_get(h, 2) + c & 0xFFFF_FFFF;
+  let d = array_get(h, 3) + d & 0xFFFF_FFFF;
+  let e = array_get(h, 4) + e & 0xFFFF_FFFF;
+  let f = array_get(h, 5) + f & 0xFFFF_FFFF;
+  let g = array_get(h, 6) + g & 0xFFFF_FFFF;
+  let hh = array_get(h, 7) + hh & 0xFFFF_FFFF;
+  let h = array_set(h, 0, a);
+  let h = array_set(h, 1, b);
+  let h = array_set(h, 2, c);
+  let h = array_set(h, 3, d);
+  let h = array_set(h, 4, e);
+  let h = array_set(h, 5, f);
+  let h = array_set(h, 6, g);
+  array_set(h, 7, hh)
 }
 
 /// Thirty-two bytes, of SHA-256 as the standard defines it.
-pub fn sha256(input: Bytes) -> Bytes / {abort.raise} = {
-  let full = sha_padded(input);
-  let state = fold(range(0, bytes_len(full) / 64), sha_initial(), |acc: List<Int>, i: Int|
-    sha_compress(acc, sha_block(full, i * 64)));
-  bytes_concat_all(map(state, |w: Int| u32_be(w)))
-}
+pub fn sha256(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha256_hash(), input)
 
-// --- SHA-512 ---------------------------------------------------------------------
+// --- SHA-512, SHA-384 and SHA-512/256 ---------------------------------------------
 
-// Every word is a `U64`, so a sum wraps at the standard's own width.
-
-fn rotr64(x: U64, n: Int) -> U64 = x >>> n | x << 64 - n
+// A word is an `Int` read as sixty-four bits; `+` is checked, so a sum is taken a half at a time.
 
 /// The first sixty-four bits of the fractional parts of the cube roots of the first eighty primes.
-fn sha512_constants() -> List<U64> =
+fn sha512_constants() -> List<Int> =
   [
-    0x428A_2F98_D728_AE22u64,
-    0x7137_4491_23EF_65CDu64,
-    0xB5C0_FBCF_EC4D_3B2Fu64,
-    0xE9B5_DBA5_8189_DBBCu64,
-    0x3956_C25B_F348_B538u64,
-    0x59F1_11F1_B605_D019u64,
-    0x923F_82A4_AF19_4F9Bu64,
-    0xAB1C_5ED5_DA6D_8118u64,
-    0xD807_AA98_A303_0242u64,
-    0x1283_5B01_4570_6FBEu64,
-    0x2431_85BE_4EE4_B28Cu64,
-    0x550C_7DC3_D5FF_B4E2u64,
-    0x72BE_5D74_F27B_896Fu64,
-    0x80DE_B1FE_3B16_96B1u64,
-    0x9BDC_06A7_25C7_1235u64,
-    0xC19B_F174_CF69_2694u64,
-    0xE49B_69C1_9EF1_4AD2u64,
-    0xEFBE_4786_384F_25E3u64,
-    0x0FC1_9DC6_8B8C_D5B5u64,
-    0x240C_A1CC_77AC_9C65u64,
-    0x2DE9_2C6F_592B_0275u64,
-    0x4A74_84AA_6EA6_E483u64,
-    0x5CB0_A9DC_BD41_FBD4u64,
-    0x76F9_88DA_8311_53B5u64,
-    0x983E_5152_EE66_DFABu64,
-    0xA831_C66D_2DB4_3210u64,
-    0xB003_27C8_98FB_213Fu64,
-    0xBF59_7FC7_BEEF_0EE4u64,
-    0xC6E0_0BF3_3DA8_8FC2u64,
-    0xD5A7_9147_930A_A725u64,
-    0x06CA_6351_E003_826Fu64,
-    0x1429_2967_0A0E_6E70u64,
-    0x27B7_0A85_46D2_2FFCu64,
-    0x2E1B_2138_5C26_C926u64,
-    0x4D2C_6DFC_5AC4_2AEDu64,
-    0x5338_0D13_9D95_B3DFu64,
-    0x650A_7354_8BAF_63DEu64,
-    0x766A_0ABB_3C77_B2A8u64,
-    0x81C2_C92E_47ED_AEE6u64,
-    0x9272_2C85_1482_353Bu64,
-    0xA2BF_E8A1_4CF1_0364u64,
-    0xA81A_664B_BC42_3001u64,
-    0xC24B_8B70_D0F8_9791u64,
-    0xC76C_51A3_0654_BE30u64,
-    0xD192_E819_D6EF_5218u64,
-    0xD699_0624_5565_A910u64,
-    0xF40E_3585_5771_202Au64,
-    0x106A_A070_32BB_D1B8u64,
-    0x19A4_C116_B8D2_D0C8u64,
-    0x1E37_6C08_5141_AB53u64,
-    0x2748_774C_DF8E_EB99u64,
-    0x34B0_BCB5_E19B_48A8u64,
-    0x391C_0CB3_C5C9_5A63u64,
-    0x4ED8_AA4A_E341_8ACBu64,
-    0x5B9C_CA4F_7763_E373u64,
-    0x682E_6FF3_D6B2_B8A3u64,
-    0x748F_82EE_5DEF_B2FCu64,
-    0x78A5_636F_4317_2F60u64,
-    0x84C8_7814_A1F0_AB72u64,
-    0x8CC7_0208_1A64_39ECu64,
-    0x90BE_FFFA_2363_1E28u64,
-    0xA450_6CEB_DE82_BDE9u64,
-    0xBEF9_A3F7_B2C6_7915u64,
-    0xC671_78F2_E372_532Bu64,
-    0xCA27_3ECE_EA26_619Cu64,
-    0xD186_B8C7_21C0_C207u64,
-    0xEADA_7DD6_CDE0_EB1Eu64,
-    0xF57D_4F7F_EE6E_D178u64,
-    0x06F0_67AA_7217_6FBAu64,
-    0x0A63_7DC5_A2C8_98A6u64,
-    0x113F_9804_BEF9_0DAEu64,
-    0x1B71_0B35_131C_471Bu64,
-    0x28DB_77F5_2304_7D84u64,
-    0x32CA_AB7B_40C7_2493u64,
-    0x3C9E_BE0A_15C9_BEBCu64,
-    0x431D_67C4_9C10_0D4Cu64,
-    0x4CC5_D4BE_CB3E_42B6u64,
-    0x597F_299C_FC65_7E2Au64,
-    0x5FCB_6FAB_3AD6_FAECu64,
-    0x6C44_198C_4A47_5817u64,
+    0x428A_2F98_D728_AE22,
+    0x7137_4491_23EF_65CD,
+    0xB5C0_FBCF_EC4D_3B2F,
+    0xE9B5_DBA5_8189_DBBC,
+    0x3956_C25B_F348_B538,
+    0x59F1_11F1_B605_D019,
+    0x923F_82A4_AF19_4F9B,
+    0xAB1C_5ED5_DA6D_8118,
+    0xD807_AA98_A303_0242,
+    0x1283_5B01_4570_6FBE,
+    0x2431_85BE_4EE4_B28C,
+    0x550C_7DC3_D5FF_B4E2,
+    0x72BE_5D74_F27B_896F,
+    0x80DE_B1FE_3B16_96B1,
+    0x9BDC_06A7_25C7_1235,
+    0xC19B_F174_CF69_2694,
+    0xE49B_69C1_9EF1_4AD2,
+    0xEFBE_4786_384F_25E3,
+    0x0FC1_9DC6_8B8C_D5B5,
+    0x240C_A1CC_77AC_9C65,
+    0x2DE9_2C6F_592B_0275,
+    0x4A74_84AA_6EA6_E483,
+    0x5CB0_A9DC_BD41_FBD4,
+    0x76F9_88DA_8311_53B5,
+    0x983E_5152_EE66_DFAB,
+    0xA831_C66D_2DB4_3210,
+    0xB003_27C8_98FB_213F,
+    0xBF59_7FC7_BEEF_0EE4,
+    0xC6E0_0BF3_3DA8_8FC2,
+    0xD5A7_9147_930A_A725,
+    0x06CA_6351_E003_826F,
+    0x1429_2967_0A0E_6E70,
+    0x27B7_0A85_46D2_2FFC,
+    0x2E1B_2138_5C26_C926,
+    0x4D2C_6DFC_5AC4_2AED,
+    0x5338_0D13_9D95_B3DF,
+    0x650A_7354_8BAF_63DE,
+    0x766A_0ABB_3C77_B2A8,
+    0x81C2_C92E_47ED_AEE6,
+    0x9272_2C85_1482_353B,
+    0xA2BF_E8A1_4CF1_0364,
+    0xA81A_664B_BC42_3001,
+    0xC24B_8B70_D0F8_9791,
+    0xC76C_51A3_0654_BE30,
+    0xD192_E819_D6EF_5218,
+    0xD699_0624_5565_A910,
+    0xF40E_3585_5771_202A,
+    0x106A_A070_32BB_D1B8,
+    0x19A4_C116_B8D2_D0C8,
+    0x1E37_6C08_5141_AB53,
+    0x2748_774C_DF8E_EB99,
+    0x34B0_BCB5_E19B_48A8,
+    0x391C_0CB3_C5C9_5A63,
+    0x4ED8_AA4A_E341_8ACB,
+    0x5B9C_CA4F_7763_E373,
+    0x682E_6FF3_D6B2_B8A3,
+    0x748F_82EE_5DEF_B2FC,
+    0x78A5_636F_4317_2F60,
+    0x84C8_7814_A1F0_AB72,
+    0x8CC7_0208_1A64_39EC,
+    0x90BE_FFFA_2363_1E28,
+    0xA450_6CEB_DE82_BDE9,
+    0xBEF9_A3F7_B2C6_7915,
+    0xC671_78F2_E372_532B,
+    0xCA27_3ECE_EA26_619C,
+    0xD186_B8C7_21C0_C207,
+    0xEADA_7DD6_CDE0_EB1E,
+    0xF57D_4F7F_EE6E_D178,
+    0x06F0_67AA_7217_6FBA,
+    0x0A63_7DC5_A2C8_98A6,
+    0x113F_9804_BEF9_0DAE,
+    0x1B71_0B35_131C_471B,
+    0x28DB_77F5_2304_7D84,
+    0x32CA_AB7B_40C7_2493,
+    0x3C9E_BE0A_15C9_BEBC,
+    0x431D_67C4_9C10_0D4C,
+    0x4CC5_D4BE_CB3E_42B6,
+    0x597F_299C_FC65_7E2A,
+    0x5FCB_6FAB_3AD6_FAEC,
+    0x6C44_198C_4A47_5817,
   ]
 
-/// The same of the square roots of the first eight.
-fn sha512_initial() -> List<U64> =
+/// The same of the square roots of the first eight, which is where BLAKE2b starts too.
+fn sha512_initial() -> List<Int> =
   [
-    0x6A09_E667_F3BC_C908u64,
-    0xBB67_AE85_84CA_A73Bu64,
-    0x3C6E_F372_FE94_F82Bu64,
-    0xA54F_F53A_5F1D_36F1u64,
-    0x510E_527F_ADE6_82D1u64,
-    0x9B05_688C_2B3E_6C1Fu64,
-    0x1F83_D9AB_FB41_BD6Bu64,
-    0x5BE0_CD19_137E_2179u64,
+    0x6A09_E667_F3BC_C908,
+    0xBB67_AE85_84CA_A73B,
+    0x3C6E_F372_FE94_F82B,
+    0xA54F_F53A_5F1D_36F1,
+    0x510E_527F_ADE6_82D1,
+    0x9B05_688C_2B3E_6C1F,
+    0x1F83_D9AB_FB41_BD6B,
+    0x5BE0_CD19_137E_2179,
   ]
 
-fn sha512_word(xs: List<U64>, i: Int) -> U64 = match list_at(xs, i) { Some(w) -> w, None -> 0u64 }
-
-fn sha512_big0(a: U64) -> U64 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
-
-fn sha512_big1(e: U64) -> U64 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
-
-fn sha512_small0(x: U64) -> U64 = rotr64(x, 1) ^ rotr64(x, 8) ^ x >>> 7
-
-fn sha512_small1(x: U64) -> U64 = rotr64(x, 19) ^ rotr64(x, 61) ^ x >>> 6
-
-fn sha512_sum(xs: List<U64>) -> U64 = fold(xs, 0u64, |acc: U64, x: U64| wrap_add(acc, x))
-
-/// Eighty words: the sixteen a block holds, then the four mixtures of the ones before.
-fn sha512_schedule(block: List<U64>) -> List<U64> =
-  fold(range(16, 80), block, |acc: List<U64>, t: Int|
-    push(
-      acc,
-      sha512_sum([
-        sha512_small1(sha512_word(acc, t - 2)),
-        sha512_word(acc, t - 7),
-        sha512_small0(sha512_word(acc, t - 15)),
-        sha512_word(acc, t - 16),
-      ]),
-    ))
-
-fn sha512_round(state: List<U64>, k: U64, w: U64) -> List<U64> = {
-  let a = sha512_word(state, 0);
-  let b = sha512_word(state, 1);
-  let c = sha512_word(state, 2);
-  let d = sha512_word(state, 3);
-  let e = sha512_word(state, 4);
-  let f = sha512_word(state, 5);
-  let g = sha512_word(state, 6);
-  let h = sha512_word(state, 7);
-  let t1 = sha512_sum([h, sha512_big1(e), g ^ e & (f ^ g), k, w]);
-  let t2 = wrap_add(sha512_big0(a), a & b ^ a & c ^ b & c);
-  [wrap_add(t1, t2), a, b, c, wrap_add(d, t1), e, f, g]
+/// SHA-512 from the state `start`, cut to `size` bytes: the family differs in nothing else.
+fn sha512_family(name: String, size: Int, start: List<Int>) -> Hash = {
+  let k = array_of_list(sha512_constants());
+  let block = |h: Array<Int>, _: Int, data: Bytes, at: Int| sha512_block(h, k, data, at);
+  {
+    name: name,
+    block_size: 128,
+    digest_size: size,
+    start: array_of_list(start),
+    block: block,
+    finish: |h: Array<Int>, seen: Int, tail: Bytes| {
+      let length = bytes_concat(zeros(8), u64_be((seen + bytes_len(tail)) * 8));
+      let closed = md_closed(block, 128, h, seen, tail, length);
+      bytes_slice(bytes_concat_all(map(array_to_list(closed), u64_be)), 0, size)
+    },
+  }
 }
 
-fn sha512_compress(state: List<U64>, block: List<U64>) -> List<U64> = {
-  let schedule = sha512_schedule(block);
-  let constants = sha512_constants();
-  let end = fold(range(0, 80), state, |s: List<U64>, i: Int|
-    sha512_round(s, sha512_word(constants, i), sha512_word(schedule, i)));
-  map(range(0, 8), |i: Int| wrap_add(sha512_word(state, i), sha512_word(end, i)))
+/// SHA-512 as FIPS 180-4 defines it.
+pub fn sha512_hash() -> Hash = sha512_family("SHA-512", 64, sha512_initial())
+
+/// SHA-384 as FIPS 180-4 defines it.
+pub fn sha384_hash() -> Hash =
+  sha512_family("SHA-384", 48, [
+    0xCBBB_9D5D_C105_9ED8,
+    0x629A_292A_367C_D507,
+    0x9159_015A_3070_DD17,
+    0x152F_ECD8_F70E_5939,
+    0x6733_2667_FFC0_0B31,
+    0x8EB4_4A87_6858_1511,
+    0xDB0C_2E0D_64F9_8FA7,
+    0x47B5_481D_BEFA_4FA4,
+  ])
+
+/// SHA-512/256 as FIPS 180-4 defines it: SHA-512's speed and a digest SHA-256's size, which no
+/// length extension reaches.
+pub fn sha512_256_hash() -> Hash =
+  sha512_family("SHA-512/256", 32, [
+    0x2231_2194_FC2B_F72C,
+    0x9F55_5FA3_C84C_64C2,
+    0x2393_B86B_6F53_B151,
+    0x9638_7719_5940_EABD,
+    0x9628_3EE2_A88E_FFE3,
+    0xBE5E_1E25_5386_3992,
+    0x2B01_99FC_2C85_B8AA,
+    0x0EB7_2DDC_81C5_2CA2,
+  ])
+
+fn sha512_block(h: Array<Int>, k: Array<Int>, data: Bytes, at: Int) -> Array<Int> / {abort.raise} = {
+  let a = array_get(h, 0);
+  let b = array_get(h, 1);
+  let c = array_get(h, 2);
+  let d = array_get(h, 3);
+  let e = array_get(h, 4);
+  let f = array_get(h, 5);
+  let g = array_get(h, 6);
+  let hh = array_get(h, 7);
+  sha512_rounds(h, k, array_new(16, 0), data, at, 0, a, b, c, d, e, f, g, hh)
 }
 
-fn sha512_be_at(b: Bytes, at: Int) -> U64 / {abort.raise} =
-  fold(range(0, 8), 0u64, |acc: U64, i: Int| acc << 8 | u64_of_int(bytes_at(b, at + i)))
+/// The rounds from `t` on, with `w` as `sha256_rounds` keeps it.
+fn sha512_rounds(
+  h: Array<Int>,
+  k: Array<Int>,
+  w: Array<Int>,
+  data: Bytes,
+  at: Int,
+  t: Int,
+  a: Int,
+  b: Int,
+  c: Int,
+  d: Int,
+  e: Int,
+  f: Int,
+  g: Int,
+  hh: Int,
+) -> Array<Int> / {abort.raise} =
+  if t >= 80 {
+    array_of_list([
+      add64(array_get(h, 0), a),
+      add64(array_get(h, 1), b),
+      add64(array_get(h, 2), c),
+      add64(array_get(h, 3), d),
+      add64(array_get(h, 4), e),
+      add64(array_get(h, 5), f),
+      add64(array_get(h, 6), g),
+      add64(array_get(h, 7), hh),
+    ])
+  } else {
+    let x = if t < 16 {
+      let p = at + 8 * t;
+      bytes_at(data, p) << 56 | bytes_at(data, p + 1) << 48 | bytes_at(data, p + 2) << 40
+        | bytes_at(data, p + 3) << 32
+        | bytes_at(data, p + 4) << 24
+        | bytes_at(data, p + 5) << 16
+        | bytes_at(data, p + 6) << 8
+        | bytes_at(data, p + 7)
+    } else {
+      let w2 = array_get(w, t - 2 & 15);
+      let w7 = array_get(w, t - 7 & 15);
+      let w15 = array_get(w, t - 15 & 15);
+      let w16 = array_get(w, t & 15);
+      let s1 = (w2 >>> 19 | w2 << 45) ^ (w2 >>> 61 | w2 << 3) ^ w2 >>> 6;
+      let s0 = (w15 >>> 1 | w15 << 63) ^ (w15 >>> 8 | w15 << 56) ^ w15 >>> 7;
+      let low = (s1 & 0xFFFF_FFFF) + (w7 & 0xFFFF_FFFF) + (s0 & 0xFFFF_FFFF) + (w16 & 0xFFFF_FFFF);
+      (s1 >>> 32) + (w7 >>> 32) + (s0 >>> 32) + (w16 >>> 32) + (low >>> 32) << 32
+        | low & 0xFFFF_FFFF
+    };
+    let s1 = (e >>> 14 | e << 50) ^ (e >>> 18 | e << 46) ^ (e >>> 41 | e << 23);
+    let ch = g ^ e & (f ^ g);
+    let kt = array_get(k, t);
+    let s0 = (a >>> 28 | a << 36) ^ (a >>> 34 | a << 30) ^ (a >>> 39 | a << 25);
+    let maj = a & b ^ a & c ^ b & c;
+    // `t1` a half at a time, which `a` and `e` each add their own words to.
+    let low = (hh & 0xFFFF_FFFF) + (s1 & 0xFFFF_FFFF) + (ch & 0xFFFF_FFFF) + (kt & 0xFFFF_FFFF)
+      + (x & 0xFFFF_FFFF);
+    let high = (hh >>> 32) + (s1 >>> 32) + (ch >>> 32) + (kt >>> 32) + (x >>> 32);
+    let low_a = low + (s0 & 0xFFFF_FFFF) + (maj & 0xFFFF_FFFF);
+    let low_e = low + (d & 0xFFFF_FFFF);
+    sha512_rounds(
+      h,
+      k,
+      array_set(w, t & 15, x),
+      data,
+      at,
+      t + 1,
+      high + (s0 >>> 32) + (maj >>> 32) + (low_a >>> 32) << 32 | low_a & 0xFFFF_FFFF,
+      a,
+      b,
+      c,
+      high + (d >>> 32) + (low_e >>> 32) << 32 | low_e & 0xFFFF_FFFF,
+      e,
+      f,
+      g,
+    )
+  }
 
-fn sha512_be(w: U64) -> Bytes / {abort.raise} =
-  bytes_concat_all(map(range(0, 8), |i: Int| byte_of_int(int_of_u64(w >>> 56 - 8 * i & 0xFFu64))))
-
-/// The message, a one bit, as many zeros as leave the length sixteen short of a block, then the
-/// length in bits as a big-endian 128-bit number.
-fn sha512_padded(input: Bytes) -> Bytes / {abort.raise} = {
-  let n = bytes_len(input);
-  let total = (n + 17 + 127) / 128 * 128;
-  bytes_concat_all([input, b"\x80", sha_zeroes(total - n - 17), sha_zeroes(8), u64_be(n * 8)])
+/// Two 64-bit words added, wrapping.
+fn add64(a: Int, b: Int) -> Int = {
+  let low = (a & 0xFFFF_FFFF) + (b & 0xFFFF_FFFF);
+  (a >>> 32) + (b >>> 32) + (low >>> 32) << 32 | low & 0xFFFF_FFFF
 }
 
 /// Sixty-four bytes, of SHA-512 as the standard defines it.
-pub fn sha512(input: Bytes) -> Bytes / {abort.raise} = {
-  let full = sha512_padded(input);
-  let state = fold(range(0, bytes_len(full) / 128), sha512_initial(), |acc: List<U64>, i: Int|
-    sha512_compress(acc, map(range(0, 16), |j: Int| sha512_be_at(full, i * 128 + j * 8))));
-  bytes_concat_all(map(state, sha512_be))
+pub fn sha512(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha512_hash(), input)
+
+/// Forty-eight bytes, of SHA-384 as the standard defines it.
+pub fn sha384(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha384_hash(), input)
+
+/// Thirty-two bytes, of SHA-512/256 as the standard defines it.
+pub fn sha512_256(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha512_256_hash(), input)
+
+// --- SHA-3 and SHAKE --------------------------------------------------------------
+
+/// The round constants of Keccak-f[1600].
+fn keccak_constants() -> List<Int> =
+  [
+    0x0000_0000_0000_0001,
+    0x0000_0000_0000_8082,
+    0x8000_0000_0000_808A,
+    0x8000_0000_8000_8000,
+    0x0000_0000_0000_808B,
+    0x0000_0000_8000_0001,
+    0x8000_0000_8000_8081,
+    0x8000_0000_0000_8009,
+    0x0000_0000_0000_008A,
+    0x0000_0000_0000_0088,
+    0x0000_0000_8000_8009,
+    0x0000_0000_8000_000A,
+    0x0000_0000_8000_808B,
+    0x8000_0000_0000_008B,
+    0x8000_0000_0000_8089,
+    0x8000_0000_0000_8003,
+    0x8000_0000_0000_8002,
+    0x8000_0000_0000_0080,
+    0x0000_0000_0000_800A,
+    0x8000_0000_8000_000A,
+    0x8000_0000_8000_8081,
+    0x8000_0000_0000_8080,
+    0x0000_0000_8000_0001,
+    0x8000_0000_8000_8008,
+  ]
+
+/// A sponge over Keccak-f[1600] as FIPS 202 defines one: `rate` bytes a block, `size` bytes of
+/// output, and `suffix`, the bits a function appends to its message with the padding's first bit.
+fn sponge(name: String, rate: Int, size: Int, suffix: Int) -> Hash = {
+  let rc = array_of_list(keccak_constants());
+  let block = |s: Array<Int>, _: Int, data: Bytes, at: Int|
+    keccak_rounds(keccak_mixed(s, data, at, 0, rate / 8), rc, 0);
+  {
+    name: name,
+    block_size: rate,
+    digest_size: size,
+    start: array_of_list(map(range(0, 25), |_: Int| 0)),
+    block: block,
+    finish: |s: Array<Int>, seen: Int, tail: Bytes| {
+      let fill = rate - bytes_len(tail) % rate;
+      let padding = if fill == 1 { byte_of_int(suffix | 0x80) }
+      else { bytes_concat_all([byte_of_int(suffix), zeros(fill - 2), b"\x80"]) };
+      let last = bytes_concat(tail, padding);
+      let full = absorbed(block, rate, s, seen, last, 0, bytes_len(last) / rate);
+      bytes_slice(
+        bytes_concat_all(squeezed(full, rc, rate, 0, (size + rate - 1) / rate, [])),
+        0,
+        size,
+      )
+    },
+  }
 }
 
-// Every byte of `b` xored with one byte, which is what an HMAC key pad is: `std.bytes`'s.
+/// The state with the block's first `lanes` lanes xored in, each least significant byte first.
+fn keccak_mixed(
+  s: Array<Int>,
+  data: Bytes,
+  at: Int,
+  i: Int,
+  lanes: Int,
+) -> Array<Int> / {abort.raise} =
+  if i >= lanes { s } else {
+    let p = at + 8 * i;
+    let lane = array_get(s, i)
+      ^ (int_of_u32(bytes_u32_le(data, p)) | int_of_u32(bytes_u32_le(data, p + 4)) << 32);
+    keccak_mixed(array_set(s, i, lane), data, at, i + 1, lanes)
+  }
 
-/// HMAC-SHA-256, as RFC 2104 defines it and RFC 4231 publishes vectors for.
-pub fn hmac_sha256(key: Bytes, message: Bytes) -> Bytes / {abort.raise} = {
-  let short = if bytes_len(key) > 64 { sha256(key) } else { key };
-  let pad = bytes_concat(short, sha_zeroes(64 - bytes_len(short)));
-  sha256(bytes_concat(xor_byte(pad, 0x5C), sha256(bytes_concat(xor_byte(pad, 0x36), message))))
+/// `rate` bytes of output a block, the state permuted between one and the next.
+fn squeezed(
+  s: Array<Int>,
+  rc: Array<Int>,
+  rate: Int,
+  i: Int,
+  blocks: Int,
+  out: List<Bytes>,
+) -> List<Bytes> / {abort.raise} =
+  if i >= blocks { out } else {
+    let next = if i == 0 { s } else { keccak_rounds(s, rc, 0) };
+    let lanes = bytes_concat_all(map(array_to_list(next), u64_le));
+    squeezed(next, rc, rate, i + 1, blocks, push(out, bytes_slice(lanes, 0, rate)))
+  }
+
+/// The rounds of Keccak-f[1600] from `round` on, a round written out: the column parities `c` and
+/// what each column takes from its neighbours `d` (theta), every lane rotated into its new place
+/// `b` (rho and pi), then each row mixed (chi) and the round's constant (iota).
+fn keccak_rounds(s: Array<Int>, rc: Array<Int>, round: Int) -> Array<Int> / {abort.raise} =
+  if round >= 24 { s } else {
+    let a0 = array_get(s, 0);
+    let a1 = array_get(s, 1);
+    let a2 = array_get(s, 2);
+    let a3 = array_get(s, 3);
+    let a4 = array_get(s, 4);
+    let a5 = array_get(s, 5);
+    let a6 = array_get(s, 6);
+    let a7 = array_get(s, 7);
+    let a8 = array_get(s, 8);
+    let a9 = array_get(s, 9);
+    let a10 = array_get(s, 10);
+    let a11 = array_get(s, 11);
+    let a12 = array_get(s, 12);
+    let a13 = array_get(s, 13);
+    let a14 = array_get(s, 14);
+    let a15 = array_get(s, 15);
+    let a16 = array_get(s, 16);
+    let a17 = array_get(s, 17);
+    let a18 = array_get(s, 18);
+    let a19 = array_get(s, 19);
+    let a20 = array_get(s, 20);
+    let a21 = array_get(s, 21);
+    let a22 = array_get(s, 22);
+    let a23 = array_get(s, 23);
+    let a24 = array_get(s, 24);
+    let c0 = a0 ^ a5 ^ a10 ^ a15 ^ a20;
+    let c1 = a1 ^ a6 ^ a11 ^ a16 ^ a21;
+    let c2 = a2 ^ a7 ^ a12 ^ a17 ^ a22;
+    let c3 = a3 ^ a8 ^ a13 ^ a18 ^ a23;
+    let c4 = a4 ^ a9 ^ a14 ^ a19 ^ a24;
+    let d0 = c4 ^ (c1 << 1 | c1 >>> 63);
+    let d1 = c0 ^ (c2 << 1 | c2 >>> 63);
+    let d2 = c1 ^ (c3 << 1 | c3 >>> 63);
+    let d3 = c2 ^ (c4 << 1 | c4 >>> 63);
+    let d4 = c3 ^ (c0 << 1 | c0 >>> 63);
+    let b0 = a0 ^ d0;
+    let b1 = (a6 ^ d1) << 44 | (a6 ^ d1) >>> 20;
+    let b2 = (a12 ^ d2) << 43 | (a12 ^ d2) >>> 21;
+    let b3 = (a18 ^ d3) << 21 | (a18 ^ d3) >>> 43;
+    let b4 = (a24 ^ d4) << 14 | (a24 ^ d4) >>> 50;
+    let b5 = (a3 ^ d3) << 28 | (a3 ^ d3) >>> 36;
+    let b6 = (a9 ^ d4) << 20 | (a9 ^ d4) >>> 44;
+    let b7 = (a10 ^ d0) << 3 | (a10 ^ d0) >>> 61;
+    let b8 = (a16 ^ d1) << 45 | (a16 ^ d1) >>> 19;
+    let b9 = (a22 ^ d2) << 61 | (a22 ^ d2) >>> 3;
+    let b10 = (a1 ^ d1) << 1 | (a1 ^ d1) >>> 63;
+    let b11 = (a7 ^ d2) << 6 | (a7 ^ d2) >>> 58;
+    let b12 = (a13 ^ d3) << 25 | (a13 ^ d3) >>> 39;
+    let b13 = (a19 ^ d4) << 8 | (a19 ^ d4) >>> 56;
+    let b14 = (a20 ^ d0) << 18 | (a20 ^ d0) >>> 46;
+    let b15 = (a4 ^ d4) << 27 | (a4 ^ d4) >>> 37;
+    let b16 = (a5 ^ d0) << 36 | (a5 ^ d0) >>> 28;
+    let b17 = (a11 ^ d1) << 10 | (a11 ^ d1) >>> 54;
+    let b18 = (a17 ^ d2) << 15 | (a17 ^ d2) >>> 49;
+    let b19 = (a23 ^ d3) << 56 | (a23 ^ d3) >>> 8;
+    let b20 = (a2 ^ d2) << 62 | (a2 ^ d2) >>> 2;
+    let b21 = (a8 ^ d3) << 55 | (a8 ^ d3) >>> 9;
+    let b22 = (a14 ^ d4) << 39 | (a14 ^ d4) >>> 25;
+    let b23 = (a15 ^ d0) << 41 | (a15 ^ d0) >>> 23;
+    let b24 = (a21 ^ d1) << 2 | (a21 ^ d1) >>> 62;
+    keccak_rounds(
+      array_of_list([
+        b0 ^ ~b1 & b2 ^ array_get(rc, round),
+        b1 ^ ~b2 & b3,
+        b2 ^ ~b3 & b4,
+        b3 ^ ~b4 & b0,
+        b4 ^ ~b0 & b1,
+        b5 ^ ~b6 & b7,
+        b6 ^ ~b7 & b8,
+        b7 ^ ~b8 & b9,
+        b8 ^ ~b9 & b5,
+        b9 ^ ~b5 & b6,
+        b10 ^ ~b11 & b12,
+        b11 ^ ~b12 & b13,
+        b12 ^ ~b13 & b14,
+        b13 ^ ~b14 & b10,
+        b14 ^ ~b10 & b11,
+        b15 ^ ~b16 & b17,
+        b16 ^ ~b17 & b18,
+        b17 ^ ~b18 & b19,
+        b18 ^ ~b19 & b15,
+        b19 ^ ~b15 & b16,
+        b20 ^ ~b21 & b22,
+        b21 ^ ~b22 & b23,
+        b22 ^ ~b23 & b24,
+        b23 ^ ~b24 & b20,
+        b24 ^ ~b20 & b21,
+      ]),
+      rc,
+      round + 1,
+    )
+  }
+
+/// SHA3-224 as FIPS 202 defines it.
+pub fn sha3_224_hash() -> Hash = sponge("SHA3-224", 144, 28, 0x06)
+
+/// SHA3-256 as FIPS 202 defines it.
+pub fn sha3_256_hash() -> Hash = sponge("SHA3-256", 136, 32, 0x06)
+
+/// SHA3-384 as FIPS 202 defines it.
+pub fn sha3_384_hash() -> Hash = sponge("SHA3-384", 104, 48, 0x06)
+
+/// SHA3-512 as FIPS 202 defines it.
+pub fn sha3_512_hash() -> Hash = sponge("SHA3-512", 72, 64, 0x06)
+
+/// SHAKE128 as FIPS 202 defines it, read to `length` bytes. A length below zero is refused as an
+/// `OutputLength`.
+pub fn shake128_hash(length: Int) -> Hash / {hash.refused} =
+  if length < 0 { hash.refused(OutputLength(length)) }
+  else { sponge("SHAKE128", 168, length, 0x1F) }
+
+/// SHAKE256 as FIPS 202 defines it, read to `length` bytes. A length below zero is refused as an
+/// `OutputLength`.
+pub fn shake256_hash(length: Int) -> Hash / {hash.refused} =
+  if length < 0 { hash.refused(OutputLength(length)) }
+  else { sponge("SHAKE256", 136, length, 0x1F) }
+
+/// Twenty-eight bytes, of SHA3-224 as the standard defines it.
+pub fn sha3_224(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha3_224_hash(), input)
+
+/// Thirty-two bytes, of SHA3-256 as the standard defines it.
+pub fn sha3_256(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha3_256_hash(), input)
+
+/// Forty-eight bytes, of SHA3-384 as the standard defines it.
+pub fn sha3_384(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha3_384_hash(), input)
+
+/// Sixty-four bytes, of SHA3-512 as the standard defines it.
+pub fn sha3_512(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(sha3_512_hash(), input)
+
+/// `length` bytes of SHAKE128 over `input`; a length below zero is refused as an `OutputLength`.
+pub fn shake128(input: Bytes, length: Int) -> Bytes / {hash.refused, abort.raise}
+  cost bytes_len(input) + length
+= digest_of(shake128_hash(length), input)
+
+/// `length` bytes of SHAKE256 over `input`; a length below zero is refused as an `OutputLength`.
+pub fn shake256(input: Bytes, length: Int) -> Bytes / {hash.refused, abort.raise}
+  cost bytes_len(input) + length
+= digest_of(shake256_hash(length), input)
+
+// --- BLAKE2b ----------------------------------------------------------------------
+
+/// Which message word each step of each of the twelve rounds takes: RFC 7693's SIGMA, a hex digit
+/// a word.
+fn blake2b_schedule() -> Array<Int> =
+  array_of_list(
+    map(
+      string_chars(
+        "0123456789abcdef" ++ "ea489fd61c02b753" ++ "b8c052fdae367194" ++ "7931dcbe265a40f8"
+          ++ "905724afe1bc683d"
+          ++ "2c6a0b834d75fe19"
+          ++ "c51fed4a0763928b"
+          ++ "db7ec13950f4862a"
+          ++ "6fe9b308c2d714a5"
+          ++ "a2847615fb9e3cd0"
+          ++ "0123456789abcdef"
+          ++ "ea489fd61c02b753",
+      ),
+      |c: Char| if int_of_char(c) >= 97 { int_of_char(c) - 87 } else { int_of_char(c) - 48 },
+    ),
+  )
+
+/// BLAKE2b as RFC 7693 defines it, with a digest of sixty-four bytes and no key.
+pub fn blake2b_hash() -> Hash / {abort.raise} = blake2b_over(b"", 64)
+
+/// BLAKE2b with a digest of `size` bytes, keyed by `key` where that is not empty, which makes it a
+/// MAC with no HMAC around it. A size outside one to sixty-four is refused as an `OutputLength`,
+/// and a key past sixty-four bytes as a `KeyLength`.
+pub fn blake2b_with(key: Bytes, size: Int) -> Hash / {hash.refused, abort.raise} =
+  if size < 1 || size > 64 { hash.refused(OutputLength(size)) }
+  else if bytes_len(key) > 64 { hash.refused(KeyLength(bytes_len(key))) }
+  else { blake2b_over(key, size) }
+
+/// A key is a block of its own before the message, so the state's count runs a block ahead of what
+/// the message has had taken, and the key's block is taken when the first of the message is.
+fn blake2b_over(key: Bytes, size: Int) -> Hash / {abort.raise} = {
+  let iv = array_of_list(sha512_initial());
+  let sigma = blake2b_schedule();
+  let keyed = bytes_len(key) > 0;
+  let lead = if keyed { 128 } else { 0 };
+  let first = bytes_concat(key, zeros(128 - bytes_len(key)));
+  let entered = |h: Array<Int>, seen: Int|
+    if keyed && seen == 0 { blake2b_compress(h, iv, sigma, first, 0, 128, false) } else { h };
+  {
+    name: "BLAKE2b",
+    block_size: 128,
+    digest_size: size,
+    start: array_set(iv, 0, array_get(iv, 0) ^ 0x0101_0000 ^ bytes_len(key) << 8 ^ size),
+    block: |h: Array<Int>, seen: Int, data: Bytes, at: Int|
+      blake2b_compress(entered(h, seen), iv, sigma, data, at, lead + seen + 128, false),
+    finish: |h: Array<Int>, seen: Int, tail: Bytes| {
+      let n = bytes_len(tail);
+      let ended = if keyed && seen == 0 && n == 0 {
+        blake2b_compress(h, iv, sigma, first, 0, 128, true)
+      } else {
+        blake2b_compress(
+          entered(h, seen),
+          iv,
+          sigma,
+          bytes_concat(tail, zeros(128 - n)),
+          0,
+          lead + seen + n,
+          true,
+        )
+      };
+      bytes_slice(bytes_concat_all(map(array_to_list(ended), u64_le)), 0, size)
+    },
+  }
 }
 
-type ShaChain = { block: Bytes, total: Bytes }
-
-/// PBKDF2-HMAC-SHA-256 with one output block, which is thirty-two bytes: SCRAM's salted
-/// password, and nothing else here needs a longer key.
-pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes / {abort.raise} = {
-  let first = hmac_sha256(password, bytes_concat(salt, u32_be(1)));
-  fold(range(1, iterations), { block: first, total: first }, |acc: ShaChain, _i: Int| {
-    let next = hmac_sha256(password, acc.block);
-    { block: next, total: xor(acc.total, next) }
-  }).total
+/// F of RFC 7693: `h` after the block of `data` at `at`, where `count` is the message's bytes up
+/// to that block's end and `last` says no block follows.
+fn blake2b_compress(
+  h: Array<Int>,
+  iv: Array<Int>,
+  sigma: Array<Int>,
+  data: Bytes,
+  at: Int,
+  count: Int,
+  last: Bool,
+) -> Array<Int> / {abort.raise} = {
+  let v = blake2b_mixed(
+    array_of_list(
+      map(range(0, 16), |i: Int|
+        if i < 8 { array_get(h, i) }
+        else if i == 12 { array_get(iv, 4) ^ count }
+        else if i == 14 && last { ~array_get(iv, 6) }
+        else { array_get(iv, i - 8) }),
+    ),
+    sigma,
+    data,
+    at,
+    0,
+  );
+  array_of_list(map(range(0, 8), |i: Int| array_get(h, i) ^ array_get(v, i) ^ array_get(v, i + 8)))
 }
 
-// The published test vectors.
+/// The ninety-six steps from `i` on, eight a round: four down the columns of `v`, then four along
+/// its diagonals.
+fn blake2b_mixed(
+  v: Array<Int>,
+  sigma: Array<Int>,
+  data: Bytes,
+  at: Int,
+  i: Int,
+) -> Array<Int> / {abort.raise} =
+  if i >= 96 { v } else {
+    let a = i & 3;
+    let turn = i >>> 2 & 1;
+    blake2b_mixed(
+      blake2b_g(
+        v,
+        a,
+        4 + (a + turn & 3),
+        8 + (a + 2 * turn & 3),
+        12 + (a + 3 * turn & 3),
+        data,
+        at + 8 * array_get(sigma, 2 * i),
+        at + 8 * array_get(sigma, 2 * i + 1),
+      ),
+      sigma,
+      data,
+      at,
+      i + 1,
+    )
+  }
+
+/// G of RFC 7693 over the words `a`, `b`, `c` and `d` of `v`, with the message words at `px` and
+/// `py`.
+fn blake2b_g(
+  v: Array<Int>,
+  a: Int,
+  b: Int,
+  c: Int,
+  d: Int,
+  data: Bytes,
+  px: Int,
+  py: Int,
+) -> Array<Int> / {abort.raise} = {
+  let x = int_of_u32(bytes_u32_le(data, px)) | int_of_u32(bytes_u32_le(data, px + 4)) << 32;
+  let y = int_of_u32(bytes_u32_le(data, py)) | int_of_u32(bytes_u32_le(data, py + 4)) << 32;
+  let va = array_get(v, a);
+  let vb = array_get(v, b);
+  let vc = array_get(v, c);
+  let vd = array_get(v, d);
+  let low = (va & 0xFFFF_FFFF) + (vb & 0xFFFF_FFFF) + (x & 0xFFFF_FFFF);
+  let va = (va >>> 32) + (vb >>> 32) + (x >>> 32) + (low >>> 32) << 32 | low & 0xFFFF_FFFF;
+  let vd = (vd ^ va) >>> 32 | (vd ^ va) << 32;
+  let low = (vc & 0xFFFF_FFFF) + (vd & 0xFFFF_FFFF);
+  let vc = (vc >>> 32) + (vd >>> 32) + (low >>> 32) << 32 | low & 0xFFFF_FFFF;
+  let vb = (vb ^ vc) >>> 24 | (vb ^ vc) << 40;
+  let low = (va & 0xFFFF_FFFF) + (vb & 0xFFFF_FFFF) + (y & 0xFFFF_FFFF);
+  let va = (va >>> 32) + (vb >>> 32) + (y >>> 32) + (low >>> 32) << 32 | low & 0xFFFF_FFFF;
+  let vd = (vd ^ va) >>> 16 | (vd ^ va) << 48;
+  let low = (vc & 0xFFFF_FFFF) + (vd & 0xFFFF_FFFF);
+  let vc = (vc >>> 32) + (vd >>> 32) + (low >>> 32) << 32 | low & 0xFFFF_FFFF;
+  let vb = (vb ^ vc) >>> 63 | (vb ^ vc) << 1;
+  array_set(array_set(array_set(array_set(v, a, va), b, vb), c, vc), d, vd)
+}
+
+/// Sixty-four bytes, of BLAKE2b as RFC 7693 defines it.
+pub fn blake2b(input: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(input)
+= digest_of(blake2b_hash(), input)
+
+// --- HMAC -------------------------------------------------------------------------
+
+/// A key as HMAC uses it: its two pads, and the state after each for a message that follows one.
+type Keyed = { inner_pad: Bytes, outer_pad: Bytes, inner: Hasher, outer: Hasher }
+
+fn keyed(h: Hash, key: Bytes) -> Keyed / {abort.raise} = {
+  let short = if bytes_len(key) > h.block_size { digest_of(h, key) } else { key };
+  let block = bytes_concat(short, zeros(h.block_size - bytes_len(short)));
+  let inner_pad = xor_byte(block, 0x36);
+  let outer_pad = xor_byte(block, 0x5C);
+  {
+    inner_pad: inner_pad,
+    outer_pad: outer_pad,
+    inner: taken(init(h), inner_pad, bytes_len(inner_pad) / h.block_size),
+    outer: taken(init(h), outer_pad, bytes_len(outer_pad) / h.block_size),
+  }
+}
+
+/// The digest of `pad` and then `data`. `after` took the pad's blocks as if more followed, which
+/// holds only where `data` is not empty.
+fn continued(after: Hasher, pad: Bytes, data: Bytes) -> Bytes / {abort.raise} =
+  if bytes_len(data) == 0 { digest_of(after.hash, pad) } else { finish(update(after, data)) }
+
+fn tagged(k: Keyed, message: Bytes) -> Bytes / {abort.raise} =
+  continued(k.outer, k.outer_pad, continued(k.inner, k.inner_pad, message))
+
+/// HMAC over `h`, as RFC 2104 defines it: a tag of `h.digest_size` bytes. Compare one with
+/// `tags_match`, never `==`.
+pub fn hmac(h: Hash, key: Bytes, message: Bytes) -> Bytes / {abort.raise} =
+  tagged(keyed(h, key), message)
+
+/// Whether `tag` is the HMAC of `message` under `key`, compared as `tags_match` compares.
+pub fn hmac_verify(h: Hash, key: Bytes, message: Bytes, tag: Bytes) -> Bool / {abort.raise} =
+  tags_match(hmac(h, key, message), tag)
+
+/// Whether two tags are the same bytes.
+///
+/// Two of one length are read to their ends whatever they hold, so the calls made, which is what
+/// `metered` counts as steps, depend on the length alone and not on where they first differ. That
+/// is all it promises: the compiled code's time is not held constant, and two of different lengths
+/// answer `false` at once, a tag's length being no secret.
+pub fn tags_match(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
+  bytes_len(a) == bytes_len(b) && differing(a, b, 0, 0) == 0
+
+fn differing(a: Bytes, b: Bytes, i: Int, bits: Int) -> Int / {abort.raise} =
+  if i >= bytes_len(a) { bits }
+  else { differing(a, b, i + 1, bits | bytes_at(a, i) ^ bytes_at(b, i)) }
+
+/// HMAC-SHA-256, as RFC 4231 publishes vectors for.
+pub fn hmac_sha256(key: Bytes, message: Bytes) -> Bytes / {abort.raise}
+  cost bytes_len(key) + bytes_len(message)
+= hmac(sha256_hash(), key, message)
+
+// --- HKDF and PBKDF2 --------------------------------------------------------------
+
+/// HKDF's first step, as RFC 5869 defines it: a pseudorandom key of `h.digest_size` bytes out of
+/// `key`, which need not be uniform, and `salt`, which may be empty.
+pub fn hkdf_extract(h: Hash, salt: Bytes, key: Bytes) -> Bytes / {abort.raise} = hmac(h, salt, key)
+
+/// HKDF's second step: `length` bytes out of the pseudorandom key `prk`, bound to `info`. A length
+/// below zero or past 255 digests is refused as an `OutputLength`, and a `prk` shorter than a
+/// digest as a `KeyLength`.
+pub fn hkdf_expand(
+  h: Hash,
+  prk: Bytes,
+  info: Bytes,
+  length: Int,
+) -> Bytes / {hash.refused, abort.raise} =
+  if length < 0 || length > 255 * h.digest_size { hash.refused(OutputLength(length)) }
+  else if bytes_len(prk) < h.digest_size { hash.refused(KeyLength(bytes_len(prk))) }
+  else if length == 0 { b"" } else {
+    let k = keyed(h, prk);
+    let made = fold(
+      range(1, (length + h.digest_size - 1) / h.digest_size + 1),
+      { last: b"", all: [] },
+      |acc: { last: Bytes, all: List<Bytes> }, i: Int| {
+        let next = tagged(k, bytes_concat_all([acc.last, info, byte_of_int(i)]));
+        { last: next, all: push(acc.all, next) }
+      },
+    );
+    bytes_slice(bytes_concat_all(made.all), 0, length)
+  }
+
+/// HKDF, both steps: `length` bytes of key out of `key`, `salt` and `info`. It refuses a length as
+/// `hkdf_expand` does.
+pub fn hkdf(
+  h: Hash,
+  salt: Bytes,
+  key: Bytes,
+  info: Bytes,
+  length: Int,
+) -> Bytes / {hash.refused, abort.raise} = hkdf_expand(h, hkdf_extract(h, salt, key), info, length)
+
+/// PBKDF2 over HMAC over `h`, as RFC 8018 defines it: `length` bytes out of a password, stretched
+/// by `iterations` rounds. An iteration count below one is refused as `Iterations`, and a length
+/// below one or past 2^32 - 1 digests as an `OutputLength`.
+pub fn pbkdf2(
+  h: Hash,
+  password: Bytes,
+  salt: Bytes,
+  iterations: Int,
+  length: Int,
+) -> Bytes / {hash.refused, abort.raise} =
+  if iterations < 1 { hash.refused(Iterations(iterations)) }
+  else if length < 1 || length > 0xFFFF_FFFF * h.digest_size { hash.refused(OutputLength(length)) }
+  else {
+    let k = keyed(h, password);
+    let blocks = map(range(1, (length + h.digest_size - 1) / h.digest_size + 1), |i: Int| {
+      let first = tagged(k, bytes_concat(salt, u32_be(i)));
+      stretched(k, first, first, iterations - 1)
+    });
+    bytes_slice(bytes_concat_all(blocks), 0, length)
+  }
+
+/// `sum` xored with each of the `left` tags that follow `last`, each the tag of the one before.
+fn stretched(k: Keyed, last: Bytes, sum: Bytes, left: Int) -> Bytes / {abort.raise} =
+  if left <= 0 { sum } else {
+    let next = tagged(k, last);
+    stretched(k, next, xor(sum, next), left - 1)
+  }
+
+/// PBKDF2-HMAC-SHA-256 with one output block, which is thirty-two bytes: SCRAM's salted password.
+/// It raises for an iteration count below one.
+pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes / {abort.raise} =
+  handle {
+    pbkdf2(sha256_hash(), password, salt, iterations, 32)
+  } with {
+    hash.refused(_) -> panic("PBKDF2 takes an iteration count of one or more"),
+  }
+
+// --- Tests ------------------------------------------------------------------
 
 test "the empty input" {
   assert_eq(
@@ -412,90 +1167,802 @@ test "a second chunk is a tree, and a tree is not a longer chunk" {
   assert_eq(bytes_len(blake3(repeat(b"a", 2048))), 32)
 }
 
-// The published SHA-256, HMAC-SHA-256 and PBKDF2-SHA-256 vectors, read as hex so a
-// transcription shows up as a diff in one line rather than in thirty-two byte escapes.
+/// Every hash here that takes no parameter.
+fn every() -> List<Hash> / {abort.raise} =
+  [
+    sha256_hash(),
+    sha384_hash(),
+    sha512_hash(),
+    sha512_256_hash(),
+    sha3_224_hash(),
+    sha3_256_hash(),
+    sha3_384_hash(),
+    sha3_512_hash(),
+    blake2b_hash(),
+  ]
 
-fn sha_hex(b: Bytes) -> String / {abort.raise} =
-  fold(range(0, bytes_len(b)), "", |acc: String, i: Int| acc ++ sha_byte_hex(bytes_at(b, i)))
+/// The hash of that name, a SHAKE read to thirty-two bytes.
+fn named(name: String) -> Hash / {hash.refused, abort.raise} =
+  match find(push(push(every(), shake128_hash(32)), shake256_hash(32)), |h: Hash| h.name == name) {
+    Some(h) -> h,
+    None -> panic("no hash here is named " ++ name),
+  }
 
-fn sha_byte_hex(v: Int) -> String / {abort.raise} =
-  string_slice("0123456789abcdef", v >>> 4, (v >>> 4) + 1)
-    ++ string_slice("0123456789abcdef", v & 0xF, (v & 0xF) + 1)
+/// One published digest.
+type Digest = { hash: String, message: String, input: Bytes, digest: String }
 
-test "sha-256 of the empty input" {
-  assert_eq(
-    sha_hex(sha256(b"")),
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  )
+/// FIPS 180-4's examples, and the empty and the million-byte messages NIST publishes beside them.
+fn fips_180() -> List<Digest> / {abort.raise} =
+  [
+    {
+      hash: "SHA-256",
+      message: "the empty message",
+      input: b"",
+      digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    },
+    {
+      hash: "SHA-256",
+      message: "abc",
+      input: b"abc",
+      digest: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    },
+    {
+      hash: "SHA-256",
+      message: "the 448-bit message",
+      input: b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+      digest: "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+    },
+    {
+      hash: "SHA-256",
+      message: "a million a",
+      input: repeat(b"a", 1000000),
+      digest: "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+    },
+    {
+      hash: "SHA-384",
+      message: "the empty message",
+      input: b"",
+      digest: "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
+    },
+    {
+      hash: "SHA-384",
+      message: "abc",
+      input: b"abc",
+      digest: "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+    },
+    {
+      hash: "SHA-384",
+      message: "the 896-bit message",
+      input: b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+      digest: "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039",
+    },
+    {
+      hash: "SHA-384",
+      message: "a million a",
+      input: repeat(b"a", 1000000),
+      digest: "9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985",
+    },
+    {
+      hash: "SHA-512",
+      message: "the empty message",
+      input: b"",
+      digest: "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+    },
+    {
+      hash: "SHA-512",
+      message: "abc",
+      input: b"abc",
+      digest: "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+    },
+    {
+      hash: "SHA-512",
+      message: "the 896-bit message",
+      input: b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+      digest: "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909",
+    },
+    {
+      hash: "SHA-512",
+      message: "a million a",
+      input: repeat(b"a", 1000000),
+      digest: "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b",
+    },
+    {
+      hash: "SHA-512/256",
+      message: "the empty message",
+      input: b"",
+      digest: "c672b8d1ef56ed28ab87c3622c5114069bdd3ad7b8f9737498d0c01ecef0967a",
+    },
+    {
+      hash: "SHA-512/256",
+      message: "abc",
+      input: b"abc",
+      digest: "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23",
+    },
+    {
+      hash: "SHA-512/256",
+      message: "the 896-bit message",
+      input: b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+      digest: "3928e184fb8690f840da3988121d31be65cb9d3ef83ee6146feac861e19b563a",
+    },
+    {
+      hash: "SHA-512/256",
+      message: "a million a",
+      input: repeat(b"a", 1000000),
+      digest: "9a59a052930187a97038cae692f30708aa6491923ef5194394dc68d56c74fb21",
+    },
+  ]
+
+/// One published output of a function read to a length.
+type Squeeze = { hash: String, message: String, input: Bytes, length: Int, output: String }
+
+/// NIST's SHA-3 example values for the 0-bit and the 1600-bit message, and `abc`.
+fn fips_202() -> List<Digest> / {abort.raise} =
+  [
+    {
+      hash: "SHA3-224",
+      message: "the empty message",
+      input: b"",
+      digest: "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7",
+    },
+    {
+      hash: "SHA3-224",
+      message: "abc",
+      input: b"abc",
+      digest: "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf",
+    },
+    {
+      hash: "SHA3-224",
+      message: "the 1600-bit message",
+      input: repeat(b"\xa3", 200),
+      digest: "9376816aba503f72f96ce7eb65ac095deee3be4bf9bbc2a1cb7e11e0",
+    },
+    {
+      hash: "SHA3-256",
+      message: "the empty message",
+      input: b"",
+      digest: "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+    },
+    {
+      hash: "SHA3-256",
+      message: "abc",
+      input: b"abc",
+      digest: "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532",
+    },
+    {
+      hash: "SHA3-256",
+      message: "the 1600-bit message",
+      input: repeat(b"\xa3", 200),
+      digest: "79f38adec5c20307a98ef76e8324afbfd46cfd81b22e3973c65fa1bd9de31787",
+    },
+    {
+      hash: "SHA3-384",
+      message: "the empty message",
+      input: b"",
+      digest: "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2ac3713831264adb47fb6bd1e058d5f004",
+    },
+    {
+      hash: "SHA3-384",
+      message: "abc",
+      input: b"abc",
+      digest: "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25",
+    },
+    {
+      hash: "SHA3-384",
+      message: "the 1600-bit message",
+      input: repeat(b"\xa3", 200),
+      digest: "1881de2ca7e41ef95dc4732b8f5f002b189cc1e42b74168ed1732649ce1dbcdd76197a31fd55ee989f2d7050dd473e8f",
+    },
+    {
+      hash: "SHA3-512",
+      message: "the empty message",
+      input: b"",
+      digest: "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26",
+    },
+    {
+      hash: "SHA3-512",
+      message: "abc",
+      input: b"abc",
+      digest: "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0",
+    },
+    {
+      hash: "SHA3-512",
+      message: "the 1600-bit message",
+      input: repeat(b"\xa3", 200),
+      digest: "e76dfad22084a8b1467fcf2ffa58361bec7628edf5f3fdc0e4805dc48caeeca81b7c13c30adf52a3659584739a2df46be589c51ca1a4a8416df6545a1ce8ba00",
+    },
+  ]
+
+/// NIST's SHAKE example values, which are 4096 bits of output.
+fn shake_examples() -> List<Squeeze> / {abort.raise} =
+  [
+    {
+      hash: "SHAKE128",
+      message: "the empty message",
+      input: b"",
+      length: 32,
+      output: "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26",
+    },
+    {
+      hash: "SHAKE128",
+      message: "the empty message",
+      input: b"",
+      length: 512,
+      output: "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef263cb1eea988004b93103cfb0aeefd2a686e01fa4a58e8a3639ca8a1e3f9ae57e235b8cc873c23dc62b8d260169afa2f75ab916a58d974918835d25e6a435085b2badfd6dfaac359a5efbb7bcc4b59d538df9a04302e10c8bc1cbf1a0b3a5120ea17cda7cfad765f5623474d368ccca8af0007cd9f5e4c849f167a580b14aabdefaee7eef47cb0fca9767be1fda69419dfb927e9df07348b196691abaeb580b32def58538b8d23f87732ea63b02b4fa0f4873360e2841928cd60dd4cee8cc0d4c922a96188d032675c8ac850933c7aff1533b94c834adbb69c6115bad4692d8619f90b0cdf8a7b9c264029ac185b70b83f2801f2f4b3f70c593ea3aeeb613a7f1b1de33fd75081f592305f2e4526edc09631b10958f464d889f31ba010250fda7f1368ec2967fc84ef2ae9aff268e0b1700affc6820b523a3d917135f2dff2ee06bfe72b3124721d4a26c04e53a75e30e73a7a9c4a95d91c55d495e9f51dd0b5e9d83c6d5e8ce803aa62b8d654db53d09b8dcff273cdfeb573fad8bcd45578bec2e770d01efde86e721a3f7c6cce275dabe6e2143f1af18da7efddc4c7b70b5e345db93cc936bea323491ccb38a388f546a9ff00dd4e1300b9b2153d2041d205b443e41b45a653f2a5c4492c1add544512dda2529833462b71a41a45be97290b6f",
+    },
+    {
+      hash: "SHAKE128",
+      message: "the 1600-bit message",
+      input: repeat(b"\xa3", 200),
+      length: 512,
+      output: "131ab8d2b594946b9c81333f9bb6e0ce75c3b93104fa3469d3917457385da037cf232ef7164a6d1eb448c8908186ad852d3f85a5cf28da1ab6fe3438171978467f1c05d58c7ef38c284c41f6c2221a76f12ab1c04082660250802294fb87180213fdef5b0ecb7df50ca1f8555be14d32e10f6edcde892c09424b29f597afc270c904556bfcb47a7d40778d390923642b3cbd0579e60908d5a000c1d08b98ef933f806445bf87f8b009ba9e94f7266122ed7ac24e5e266c42a82fa1bbefb7b8db0066e16a85e0493f07df4809aec084a593748ac3dde5a6d7aae1e8b6e5352b2d71efbb47d4caeed5e6d633805d2d323e6fd81b4684b93a2677d45e7421c2c6aea259b855a698fd7d13477a1fe53e5a4a6197dbec5ce95f505b520bcd9570c4a8265a7e01f89c0c002c59bfec6cd4a5c109258953ee5ee70cd577ee217af21fa70178f0946c9bf6ca8751793479f6b537737e40b6ed28511d8a2d7e73eb75f8daac912ff906e0ab955b083bac45a8e5e9b744c8506f37e9b4e749a184b30f43eb188d855f1b70d71ff3e50c537ac1b0f8974f0fe1a6ad295ba42f6aec74d123a7abedde6e2c0711cab36be5acb1a5a11a4b1db08ba6982efccd716929a7741cfc63aa4435e0b69a9063e880795c3dc5ef3272e11c497a91acf699fefee206227a44c9fb359fd56ac0a9a75a743cff6862f17d7259ab075216c0699511643b6439",
+    },
+    {
+      hash: "SHAKE256",
+      message: "the empty message",
+      input: b"",
+      length: 32,
+      output: "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f",
+    },
+    {
+      hash: "SHAKE256",
+      message: "the empty message",
+      input: b"",
+      length: 512,
+      output: "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762fd75dc4ddd8c0f200cb05019d67b592f6fc821c49479ab48640292eacb3b7c4be141e96616fb13957692cc7edd0b45ae3dc07223c8e92937bef84bc0eab862853349ec75546f58fb7c2775c38462c5010d846c185c15111e595522a6bcd16cf86f3d122109e3b1fdd943b6aec468a2d621a7c06c6a957c62b54dafc3be87567d677231395f6147293b68ceab7a9e0c58d864e8efde4e1b9a46cbe854713672f5caaae314ed9083dab4b099f8e300f01b8650f1f4b1d8fcf3f3cb53fb8e9eb2ea203bdc970f50ae55428a91f7f53ac266b28419c3778a15fd248d339ede785fb7f5a1aaa96d313eacc890936c173cdcd0fab882c45755feb3aed96d477ff96390bf9a66d1368b208e21f7c10d04a3dbd4e360633e5db4b602601c14cea737db3dcf722632cc77851cbdde2aaf0a33a07b373445df490cc8fc1e4160ff118378f11f0477de055a81a9eda57a4a2cfb0c83929d310912f729ec6cfa36c6ac6a75837143045d791cc85eff5b21932f23861bcf23a52b5da67eaf7baae0f5fb1369db78f3ac45f8c4ac5671d85735cdddb09d2b1e34a1fc066ff4a162cb263d6541274ae2fcc865f618abe27c124cd8b074ccd516301b91875824d09958f341ef274bdab0bae316339894304e35877b0c28a9b1fd166c796b9cc258a064a8f57e27f2a",
+    },
+    {
+      hash: "SHAKE256",
+      message: "the 1600-bit message",
+      input: repeat(b"\xa3", 200),
+      length: 512,
+      output: "cd8a920ed141aa0407a22d59288652e9d9f1a7ee0c1e7c1ca699424da84a904d2d700caae7396ece96604440577da4f3aa22aeb8857f961c4cd8e06f0ae6610b1048a7f64e1074cd629e85ad7566048efc4fb500b486a3309a8f26724c0ed628001a1099422468de726f1061d99eb9e93604d5aa7467d4b1bd6484582a384317d7f47d750b8f5499512bb85a226c4243556e696f6bd072c5aa2d9b69730244b56853d16970ad817e213e470618178001c9fb56c54fefa5fee67d2da524bb3b0b61ef0e9114a92cdbb6cccb98615cfe76e3510dd88d1cc28ff99287512f24bfafa1a76877b6f37198e3a641c68a7c42d45fa7acc10dae5f3cefb7b735f12d4e589f7a456e78c0f5e4c4471fffa5e4fa0514ae974d8c2648513b5db494cea847156d277ad0e141c24c7839064cd08851bc2e7ca109fd4e251c35bb0a04fb05b364ff8c4d8b59bc303e25328c09a882e952518e1a8ae0ff265d61c465896973d7490499dc639fb8502b39456791b1b6ec5bcc5d9ac36a6df622a070d43fed781f5f149f7b62675e7d1a4d6dec48c1c7164586eae06a51208c0b791244d307726505c3ad4b26b6822377257aa152037560a739714a3ca79bd605547c9b78dd1f596f2d4f1791bc689a0e9b799a37339c04275733740143ef5d2b58b96a363d4e08076a1a9d7846436e4dca5728b6f760eef0ca92bf0be5615e96959d767197a0beeb",
+    },
+  ]
+
+test "FIPS 180-4: {v.hash} of {v.message}" for v: Digest in fips_180() {
+  assert_eq(hex_of(digest_of(named(v.hash), v.input)), v.digest)
 }
 
-test "sha-256 of abc" {
-  assert_eq(
-    sha_hex(sha256(b"abc")),
-    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-  )
+test "FIPS 202: {v.hash} of {v.message}" for v: Digest in fips_202() {
+  assert_eq(hex_of(digest_of(named(v.hash), v.input)), v.digest)
 }
 
-// Fifty-six bytes is the input whose padding needs a block of its own.
-test "sha-256 where the padding spills into a second block" {
-  assert_eq(
-    sha_hex(sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
-    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
-  )
+test "FIPS 202: {v.hash} of {v.message}, read to {v.length} bytes" for v: Squeeze in shake_examples(
+  ) {
+  let output = if v.hash == "SHAKE128" { shake128(v.input, v.length) }
+  else { shake256(v.input, v.length) };
+  assert_eq(hex_of(output), v.output)
 }
 
-test "hmac-sha-256, against RFC 4231" {
-  assert_eq(
-    sha_hex(hmac_sha256(repeat(b"\x0b", 20), b"Hi There")),
-    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+/// A hash and the one digest its sweep comes to.
+type Sweep = { hash: String, digest: String }
+
+/// For each hash, its digest of its own digests of the first `n` bytes of `varied`, for every `n` to
+/// 340, which is past two blocks of any of them, as another implementation computes it.
+fn sweeps() -> List<Sweep> =
+  [
+    { hash: "SHA-256", digest: "bedbf56584b708fc9b41134658e504acf4a1997674d9f68ee930dfe060841106" },
+    {
+      hash: "SHA-384",
+      digest: "2cf62d61a6068c6a2a0d18777cce8f0943d2f4212e84030cac4485f0bd8e5fa7064b7fd8ebced45bf3a8c5755093c9da",
+    },
+    {
+      hash: "SHA-512",
+      digest: "f865089c08bef7bda34a9d08cdc19c66e9893576ec08b2a6be17768cced4423e65e03d43fa4274df770200229df3d54bc3e5d2501937ae9a264218a99cb79bc0",
+    },
+    {
+      hash: "SHA-512/256",
+      digest: "1bd9605fc3d8c56234a286020e0c7eac1a68f2b32b6834181417e083f60bf1d5",
+    },
+    { hash: "SHA3-224", digest: "3ec903479ace331dc7f6f33d6059fe74466c5f2a554e4a0466f32ec6" },
+    {
+      hash: "SHA3-256",
+      digest: "d6d65a8f9b8d118cfbc2c962463aea8188e4c3b7fa1773d36f6eba15c9b65b2e",
+    },
+    {
+      hash: "SHA3-384",
+      digest: "c4a8d0300e406168e123153a5cb83405c569843059ebc2785cbc3bc3c8cb936856fd4461d576bee217ef1b255e5c0a7b",
+    },
+    {
+      hash: "SHA3-512",
+      digest: "64c9ff4cd1d06cb8528301863bb6944cdb3bcc4d73775fab911326851313768fbdc72aeda4a017e053a9d68128c11bce89b21afc21071c0853e95916525a60b2",
+    },
+    {
+      hash: "SHAKE128",
+      digest: "6f3997c6af2cd1b26661fd88c37153b50a6d9a302ae4906de7e30ca48a9e7bdb",
+    },
+    {
+      hash: "SHAKE256",
+      digest: "e99a620062d47c0fa2154968f5105504c5be2c3f1092dc43fae1d44be7de7450",
+    },
+    {
+      hash: "BLAKE2b",
+      digest: "afc85db81547003f961f66356700589552346dff9d99ade4a41c5f792fa48f797c369d9dffda46236b73453aab11338e0e63a41783038dd756346fbfd464d066",
+    },
+  ]
+
+/// `n` bytes no two blocks of which are alike.
+fn varied(n: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(range(0, n), |i: Int| byte_of_int(i * 7 + i / 64 & 0xFF)))
+
+// Every padding there is: a message that ends a block, one a byte short, one the length just fits.
+test "{v.hash} of every length to 340 bytes, as one digest of the digests" for v: Sweep in sweeps(
+  ) {
+  let h = named(v.hash);
+  let input = varied(340);
+  let all = fold(range(0, 341), init(h), |s: Hasher, n: Int|
+    update(s, digest_of(h, bytes_slice(input, 0, n))));
+  assert_eq(hex_of(finish(all)), v.digest)
+}
+
+test "a shorter SHAKE output is the start of a longer one, a block's edge or not" {
+  let long = shake128(b"abc", 512);
+  assert(
+    all([0, 1, 167, 168, 169, 336, 337], |n: Int| shake128(b"abc", n) == bytes_slice(long, 0, n)),
   );
-  assert_eq(
-    sha_hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
-    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
-  );
-  assert_eq(
-    sha_hex(hmac_sha256(repeat(b"\xaa", 20), repeat(b"\xdd", 50))),
-    "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+  let longer = shake256(b"abc", 512);
+  assert(
+    all([0, 1, 135, 136, 137, 272, 273], |n: Int| shake256(b"abc", n) == bytes_slice(longer, 0, n)),
   )
 }
 
-test "pbkdf2-hmac-sha-256, one block" {
+test "each one-shot digest is its hash's" {
+  let input = b"the quick brown fox";
+  assert_eq(sha256(input), digest_of(sha256_hash(), input));
+  assert_eq(sha384(input), digest_of(sha384_hash(), input));
+  assert_eq(sha512(input), digest_of(sha512_hash(), input));
+  assert_eq(sha512_256(input), digest_of(sha512_256_hash(), input));
+  assert_eq(sha3_224(input), digest_of(sha3_224_hash(), input));
+  assert_eq(sha3_256(input), digest_of(sha3_256_hash(), input));
+  assert_eq(sha3_384(input), digest_of(sha3_384_hash(), input));
+  assert_eq(sha3_512(input), digest_of(sha3_512_hash(), input));
+  assert_eq(blake2b(input), digest_of(blake2b_hash(), input))
+}
+
+test "a digest is as long as its hash says" {
+  assert(all(every(), |h: Hash| bytes_len(digest_of(h, b"ply")) == h.digest_size));
+  assert_eq(bytes_len(shake128(b"ply", 0)), 0);
+  assert_eq(bytes_len(shake256(b"ply", 1000)), 1000)
+}
+
+test "BLAKE2b of abc, as RFC 7693 works it out" {
   assert_eq(
-    sha_hex(pbkdf2_sha256(b"password", b"salt", 1)),
-    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
-  );
-  assert_eq(
-    sha_hex(pbkdf2_sha256(b"password", b"salt", 2)),
-    "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
-  );
-  assert_eq(
-    sha_hex(pbkdf2_sha256(b"password", b"salt", 4096)),
-    "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+    hex_of(blake2b(b"abc")),
+    "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923",
   )
 }
 
-test "sha-512 of the empty input" {
-  assert_eq(
-    sha_hex(sha512(b"")),
-    "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+/// What RFC 7693's self-test fills its inputs and keys with.
+fn filler(n: Int, seed: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    fold(
+      range(0, n),
+      { a: 0xDEAD_4BAD * seed & 0xFFFF_FFFF, b: 1, out: [] },
+      |s: { a: Int, b: Int, out: List<Bytes> }, _: Int| {
+        let t = s.a + s.b & 0xFFFF_FFFF;
+        { a: s.b, b: t, out: push(s.out, byte_of_int(t >>> 24)) }
+      },
+    ).out,
   )
+
+// Four digest sizes over six lengths, keyed and not, hashed into the one digest the RFC publishes.
+test "BLAKE2b's self-test, RFC 7693 appendix E" {
+  let all = fold([20, 32, 48, 64], init(blake2b_with(b"", 32)), |outer: Hasher, size: Int|
+    fold([0, 3, 128, 129, 255, 1024], outer, |s: Hasher, n: Int| {
+      let input = filler(n, n);
+      let plain = digest_of(blake2b_with(b"", size), input);
+      let keyed = digest_of(blake2b_with(filler(size, size), size), input);
+      update(update(s, plain), keyed)
+    }));
+  assert_eq(hex_of(finish(all)), "c23a7800d98123bd10f506c61e29da5603d763b8bbad2e737f5e765a7bccd475")
 }
 
-test "sha-512 of abc" {
-  assert_eq(
-    sha_hex(sha512(b"abc")),
-    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
-  )
-}
+/// One keyed digest.
+type KeyedDigest = { key: Bytes, size: Int, input: Bytes, digest: String }
 
-// A hundred and twelve bytes is the input whose padding needs a block of its own.
-test "sha-512 where the padding spills into a second block" {
-  assert_eq(
-    sha_hex(
-      sha512(
-        b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+/// Keyed BLAKE2b at the edges of what it takes: a key of one byte and of sixty-four, a digest of
+/// one byte, and no message, as another implementation computes them.
+fn blake2b_keyed() -> List<KeyedDigest> / {abort.raise} =
+  [
+    {
+      key: b"k",
+      size: 64,
+      input: b"abc",
+      digest: "aa65cf292e7df1f7439b350072d55485083ccf55b149a400c8c0548233f46447d9f95242a31bf783081c997a6c26e086bc8c0f363dd0c03e8f8edfae0c4aa5ca",
+    },
+    {
+      key: b"k",
+      size: 32,
+      input: b"",
+      digest: "490b6c8300eb23464bd2f9ca37c036be5091da14ddbeafab424c4c0a1f9eaac5",
+    },
+    {
+      key: bytes_of_hex(
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
       ),
-    ),
-    "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909",
+      size: 1,
+      input: b"abc",
+      digest: "46",
+    },
+    {
+      key: bytes_of_hex(
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      ),
+      size: 64,
+      input: varied(129),
+      digest: "83e828ebfb69c6cc9ff4799345eba19aa7e584e1d57ef1a4f3d1d522d8d697e7fde7811dd880e59c739adbb9a22c9bd641517883e76216711f39a5cc46237966",
+    },
+  ]
+
+test "BLAKE2b of {bytes_len(v.input)} bytes to {v.size}, under a key of {bytes_len(v.key)}" for v: KeyedDigest in blake2b_keyed(
+  ) { assert_eq(hex_of(digest_of(blake2b_with(v.key, v.size), v.input)), v.digest) }
+
+law "SHA-256 of an input is one digest however it is split" = any_split(sha256_hash())
+
+law "SHA-384 of an input is one digest however it is split" = any_split(sha384_hash())
+
+law "SHA-512 of an input is one digest however it is split" = any_split(sha512_hash())
+
+law "SHA-512/256 of an input is one digest however it is split" = any_split(sha512_256_hash())
+
+law "SHA3-224 of an input is one digest however it is split" = any_split(sha3_224_hash())
+
+law "SHA3-256 of an input is one digest however it is split" = any_split(sha3_256_hash())
+
+law "SHA3-384 of an input is one digest however it is split" = any_split(sha3_384_hash())
+
+law "SHA3-512 of an input is one digest however it is split" = any_split(sha3_512_hash())
+
+law "SHAKE128 of an input is one output however it is split" = any_split(shake128_hash(200))
+
+law "SHAKE256 of an input is one output however it is split" = any_split(shake256_hash(200))
+
+law "BLAKE2b of an input is one digest however it is split" = any_split(blake2b_hash())
+
+law "keyed BLAKE2b of an input is one digest however it is split" =
+  any_split(blake2b_with(b"a key", 32))
+
+// A random split seldom lands on a block's edge, which is where a buffer goes wrong.
+test "a split at, before and after a block's edge gives the digest of the whole" {
+  let hashes = push(push(every(), blake2b_with(b"a key", 32)), shake256_hash(300));
+  assert(
+    all(hashes, |h: Hash| {
+      let size = h.block_size;
+      let input = varied(3 * size + 5);
+      let n = bytes_len(input);
+      all([1, 2, size - 1, size, size + 1, 2 * size, 3 * size, n - 1, n], |cut: Int|
+        any_split(h, [bytes_slice(input, 0, cut), bytes_slice(input, cut, n)])
+          && any_split(h, [
+            bytes_slice(input, 0, 1),
+            bytes_slice(input, 1, cut),
+            b"",
+            bytes_slice(input, cut, n),
+          ]))
+    }),
   )
+}
+
+test "an input taken a byte at a time gives the digest of the whole" {
+  assert(
+    all(every(), |h: Hash| {
+      let input = varied(2 * h.block_size + 1);
+      any_split(h, map(range(0, bytes_len(input)), |i: Int| bytes_slice(input, i, i + 1)))
+    }),
+  )
+}
+
+test "a digest in progress is a value: finishing it does not end it" {
+  let half = update(init(sha256_hash()), b"ab");
+  assert_eq(finish(half), sha256(b"ab"));
+  assert_eq(finish(update(half, b"c")), sha256(b"abc"));
+  assert_eq(finish(update(half, b"d")), sha256(b"abd"))
+}
+
+/// One of RFC 4231's cases, with the tag it publishes for each hash.
+type Mac = { case: Int, key: Bytes, data: Bytes, sha256: String, sha384: String, sha512: String }
+
+/// RFC 4231's seven cases; the fifth publishes its tags cut to sixteen bytes.
+fn rfc_4231() -> List<Mac> / {abort.raise} =
+  [
+    {
+      case: 1,
+      key: repeat(b"\x0b", 20),
+      data: b"Hi There",
+      sha256: "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+      sha384: "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6",
+      sha512: "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854",
+    },
+    {
+      case: 2,
+      key: b"Jefe",
+      data: b"what do ya want for nothing?",
+      sha256: "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+      sha384: "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649",
+      sha512: "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737",
+    },
+    {
+      case: 3,
+      key: repeat(b"\xaa", 20),
+      data: repeat(b"\xdd", 50),
+      sha256: "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+      sha384: "88062608d3e6ad8a0aa2ace014c8a86f0aa635d947ac9febe83ef4e55966144b2a5ab39dc13814b94e3ab6e101a34f27",
+      sha512: "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb",
+    },
+    {
+      case: 4,
+      key: bytes_of_hex("0102030405060708090a0b0c0d0e0f10111213141516171819"),
+      data: repeat(b"\xcd", 50),
+      sha256: "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+      sha384: "3e8a69b7783c25851933ab6290af6ca77a9981480850009cc5577c6e1f573b4e6801dd23c4a7d679ccf8a386c674cffb",
+      sha512: "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3dba91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd",
+    },
+    {
+      case: 5,
+      key: repeat(b"\x0c", 20),
+      data: b"Test With Truncation",
+      sha256: "a3b6167473100ee06e0c796c2955552b",
+      sha384: "3abf34c3503b2a23a46efc619baef897",
+      sha512: "415fad6271580a531d4179bc891d87a6",
+    },
+    {
+      case: 6,
+      key: repeat(b"\xaa", 131),
+      data: b"Test Using Larger Than Block-Size Key - Hash Key First",
+      sha256: "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+      sha384: "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952",
+      sha512: "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598",
+    },
+    {
+      case: 7,
+      key: repeat(b"\xaa", 131),
+      data: b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.",
+      sha256: "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+      sha384: "6617178e941f020d351e2f254e8fd32c602420feb0b8fb9adccebb82461e99c5a678cc31e799176d3860e6110c46523e",
+      sha512: "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58",
+    },
+  ]
+
+/// The tag's first bytes, as many as `published` has, in hex.
+fn cut_to(tag: Bytes, published: String) -> String / {abort.raise} =
+  hex_of(bytes_slice(tag, 0, string_len(published) / 2))
+
+test "RFC 4231, case {v.case}" for v: Mac in rfc_4231() {
+  assert_eq(cut_to(hmac(sha256_hash(), v.key, v.data), v.sha256), v.sha256);
+  assert_eq(cut_to(hmac(sha384_hash(), v.key, v.data), v.sha384), v.sha384);
+  assert_eq(cut_to(hmac(sha512_hash(), v.key, v.data), v.sha512), v.sha512);
+  assert_eq(cut_to(hmac_sha256(v.key, v.data), v.sha256), v.sha256)
+}
+
+test "HMAC of the empty message, and under the empty key" {
+  assert_eq(
+    hex_of(hmac_sha256(b"", b"")),
+    "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
+  );
+  assert_eq(
+    hex_of(hmac_sha256(b"key", b"")),
+    "5d5d139563c95b5967b9bd9a8c9b233a9dedb45072794cd232dc1b74832607d0",
+  );
+  // BLAKE2b ends its last block as no other: an empty message leaves the pad as that block.
+  assert_eq(
+    hex_of(hmac(blake2b_hash(), b"key", b"")),
+    "019fe04bf010b8d72772e6b46897ecf74b4878c394ff2c4d5cfa0b7cc9bbefcb28c36de23cef03089db9c3d900468c89804f135e9fdef7ec9b3c7abe50ed33d3",
+  );
+  assert_eq(
+    hex_of(hmac(blake2b_hash(), b"key", b"The quick brown fox jumps over the lazy dog")),
+    "92294f92c0dfb9b00ec9ae8bd94d7e7d8a036b885a499f149dfe2fd2199394aaaf6b8894a1730cccb2cd050f9bcf5062a38b51b0dab33207f8ef35ae2c9df51b",
+  );
+  assert_eq(
+    hex_of(hmac(sha3_256_hash(), b"key", b"The quick brown fox jumps over the lazy dog")),
+    "8c6e0683409427f8931711b10ca92a506eb1fafa48fadd66d76126f47ac2c333",
+  )
+}
+
+test "a key of a block's length is used as it is, and a longer one is its digest" {
+  assert(
+    all(every(), |h: Hash| {
+      let whole = varied(h.block_size);
+      let long = varied(h.block_size + 1);
+      hmac(h, long, b"message") == hmac(h, digest_of(h, long), b"message")
+        && hmac(h, whole, b"message") != hmac(h, digest_of(h, whole), b"message")
+    }),
+  )
+}
+
+test "two tags match when every byte does, and never across a length" {
+  let tag = hmac_sha256(b"key", b"message");
+  assert(tags_match(tag, hmac_sha256(b"key", b"message")));
+  assert(!tags_match(tag, hmac_sha256(b"key", b"massage")));
+  assert(!tags_match(tag, bytes_slice(tag, 0, 31)));
+  assert(!tags_match(b"", tag));
+  assert(tags_match(b"", b""));
+  assert(hmac_verify(sha256_hash(), b"key", b"message", tag));
+  assert(!hmac_verify(sha256_hash(), b"kex", b"message", tag));
+  assert(!hmac_verify(sha512_hash(), b"key", b"message", tag))
+}
+
+test "comparing two tags takes the same steps wherever they differ" {
+  let tag = hmac_sha256(b"key", b"message");
+  let early = bytes_concat(b"\x00", bytes_slice(tag, 1, 32));
+  let late = bytes_concat(bytes_slice(tag, 0, 31), b"\x00");
+  let same = metered(|| tags_match(tag, tag));
+  let first = metered(|| tags_match(tag, early));
+  let last = metered(|| tags_match(tag, late));
+  assert(same.value && !first.value && !last.value);
+  assert_eq(first.steps, same.steps);
+  assert_eq(last.steps, same.steps)
+}
+
+/// One of RFC 5869's cases: what goes in, the pseudorandom key the first step makes of it, and the
+/// output.
+type Derivation = {
+  case: Int,
+  key: Bytes,
+  salt: Bytes,
+  info: Bytes,
+  length: Int,
+  prk: String,
+  okm: String,
+}
+
+/// RFC 5869's SHA-256 cases, A.1 to A.3.
+fn rfc_5869() -> List<Derivation> / {abort.raise} =
+  [
+    {
+      case: 1,
+      key: repeat(b"\x0b", 22),
+      salt: bytes_of_hex("000102030405060708090a0b0c"),
+      info: bytes_of_hex("f0f1f2f3f4f5f6f7f8f9"),
+      length: 42,
+      prk: "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+      okm: "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+    },
+    {
+      case: 2,
+      key: bytes_of_hex(
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+      ),
+      salt: bytes_of_hex(
+        "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      ),
+      info: bytes_of_hex(
+        "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      ),
+      length: 82,
+      prk: "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244",
+      okm: "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87",
+    },
+    {
+      case: 3,
+      key: repeat(b"\x0b", 22),
+      salt: b"",
+      info: b"",
+      length: 42,
+      prk: "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04",
+      okm: "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8",
+    },
+  ]
+
+test "RFC 5869, case {v.case}" for v: Derivation in rfc_5869() {
+  let h = sha256_hash();
+  let prk = hkdf_extract(h, v.salt, v.key);
+  assert_eq(hex_of(prk), v.prk);
+  assert_eq(hex_of(hkdf_expand(h, prk, v.info, v.length)), v.okm);
+  assert_eq(hex_of(hkdf(h, v.salt, v.key, v.info, v.length)), v.okm)
+}
+
+test "a shorter HKDF output is the start of a longer one, and its first digest is one HMAC" {
+  let h = sha256_hash();
+  let prk = hkdf_extract(h, b"salt", b"key");
+  let long = hkdf_expand(h, prk, b"info", 65);
+  assert(
+    all([1, 31, 32, 33, 64], |n: Int| hkdf_expand(h, prk, b"info", n) == bytes_slice(long, 0, n)),
+  );
+  assert_eq(hkdf_expand(h, prk, b"info", 32), hmac(h, prk, b"info\x01"))
+}
+
+/// One published PBKDF2 key.
+type Stretch = { password: Bytes, salt: Bytes, iterations: Int, length: Int, key: String }
+
+/// RFC 7914's first PBKDF2-HMAC-SHA-256 vector, which is two digests of output, then RFC 6070's
+/// inputs under SHA-256, as libraries have long published them.
+fn pbkdf2_sha256_vectors() -> List<Stretch> =
+  [
+    {
+      password: b"passwd",
+      salt: b"salt",
+      iterations: 1,
+      length: 64,
+      key: "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783",
+    },
+    {
+      password: b"password",
+      salt: b"salt",
+      iterations: 1,
+      length: 32,
+      key: "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+    },
+    {
+      password: b"password",
+      salt: b"salt",
+      iterations: 2,
+      length: 32,
+      key: "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+    },
+    {
+      password: b"password",
+      salt: b"salt",
+      iterations: 4096,
+      length: 32,
+      key: "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+    },
+    {
+      password: b"passwordPASSWORDpassword",
+      salt: b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+      iterations: 4096,
+      length: 40,
+      key: "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9",
+    },
+    {
+      password: b"pass\x00word",
+      salt: b"sa\x00lt",
+      iterations: 4096,
+      length: 16,
+      key: "89b69d0516f829893c696226650a8687",
+    },
+  ]
+
+test "PBKDF2-HMAC-SHA-256 of {v.password} and {v.salt}, {v.iterations} rounds to {v.length} bytes" for v: Stretch in pbkdf2_sha256_vectors(
+  ) { assert_eq(hex_of(pbkdf2(sha256_hash(), v.password, v.salt, v.iterations, v.length)), v.key) }
+
+test "pbkdf2_sha256 is PBKDF2 over SHA-256 to one digest, and raises for no iterations" {
+  assert_eq(
+    pbkdf2_sha256(b"password", b"salt", 2),
+    pbkdf2(sha256_hash(), b"password", b"salt", 2, 32),
+  );
+  assert_eq(
+    try[abort.raise] { pbkdf2_sha256(b"password", b"salt", 0) },
+    Err("PBKDF2 takes an iteration count of one or more"),
+  )
+}
+
+test "a shorter PBKDF2 key is the start of a longer one" {
+  let long = pbkdf2(sha256_hash(), b"password", b"salt", 3, 65);
+  assert(
+    all([1, 32, 33, 64], |n: Int|
+      pbkdf2(sha256_hash(), b"password", b"salt", 3, n) == bytes_slice(long, 0, n)),
+  )
+}
+
+// A block too many gives the same key at twice the work, which only the steps show.
+test "PBKDF2 runs its rounds once for each digest of output" {
+  let steps = |rounds: Int, length: Int|
+    metered(|| pbkdf2(sha256_hash(), b"password", b"salt", rounds, length)).steps;
+  assert_eq(steps(21, 64) - steps(1, 64), 2 * (steps(21, 32) - steps(1, 32)))
+}
+
+test "zero bytes come in any number" {
+  assert(all([0, 1, 255, 256, 257, 600], |n: Int| zeros(n) == repeat(b"\x00", n)));
+  assert_eq(zeros(0 - 1), b"")
+}
+
+fn refusal<a>(r: Result<a, Refusal>) -> Option<Refusal> =
+  match r { Ok(_) -> None, Err(e) -> Some(e) }
+
+test "a length, a key or a count outside what a function defines is refused, with what was asked" {
+  let h = sha256_hash();
+  let prk = repeat(b"\x0b", 32);
+  assert_eq(bytes_len(hkdf_expand(h, prk, b"", 255 * 32)), 255 * 32);
+  assert_eq(hkdf_expand(h, prk, b"", 0), b"");
+  assert_eq(try { hkdf_expand(h, prk, b"", 255 * 32 + 1) }, Err(OutputLength(255 * 32 + 1)));
+  assert_eq(try { hkdf_expand(h, prk, b"", 0 - 1) }, Err(OutputLength(0 - 1)));
+  assert_eq(try { hkdf_expand(h, b"too short", b"", 32) }, Err(KeyLength(9)));
+  assert_eq(try { hkdf(h, b"", b"key", b"", 255 * 32 + 1) }, Err(OutputLength(255 * 32 + 1)));
+  assert_eq(try { pbkdf2(h, b"password", b"salt", 0, 32) }, Err(Iterations(0)));
+  assert_eq(try { pbkdf2(h, b"password", b"salt", 1, 0) }, Err(OutputLength(0)));
+  assert_eq(try { shake128(b"", 0 - 1) }, Err(OutputLength(0 - 1)));
+  assert_eq(try { shake256(b"", 0 - 1) }, Err(OutputLength(0 - 1)));
+  assert_eq(refusal(try { blake2b_with(b"", 0) }), Some(OutputLength(0)));
+  assert_eq(refusal(try { blake2b_with(b"", 65) }), Some(OutputLength(65)));
+  assert_eq(refusal(try { blake2b_with(repeat(b"k", 65), 64) }), Some(KeyLength(65)));
+  assert_eq(refusal(try { blake2b_with(repeat(b"k", 64), 1) }), None)
 }

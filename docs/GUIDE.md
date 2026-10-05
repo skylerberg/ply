@@ -2217,8 +2217,9 @@ import, what those import in turn, and what they embed, so a change to any other
 leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
-`show` or `numeric` names (§4.4), and none of their tests or laws; `--std`
-reads each one whole.
+`show` or `numeric` names (§4.4), and none of their tests or laws; a function
+it reaches is read with what its specifications name (§10), which a dependent's
+proof is owed; `--std` reads each one whole.
 
 ## 14. The host boundary
 
@@ -2462,6 +2463,7 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
+| 4 | `ply test --kept`: no answer a run kept stands |
 | *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
@@ -2473,7 +2475,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets and provenance), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
@@ -2656,7 +2658,13 @@ shipped definition its program reached hashes as it did (§13); otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 `--no-cache` and a configuration file or schema always load. In the `--json`
 document, `front_end` carries `reused` and `key` for an answer taken back,
-beside the phases of this run, all of it read.
+beside the phases of this run, all of it read. `--kept` answers only that way:
+where no kept answer stands it loads nothing and exits 4, so a caller can tell
+which runs have work before starting them. `ply defs` keeps its listing the same
+way, beside every embed the program read, and a later listing over the same
+command line, files and `ply` takes it back while every shipped definition the
+program reached hashes as it did; its `--json` document then carries
+`front_end` with `reused` and `key`.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
