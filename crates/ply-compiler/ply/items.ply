@@ -19,9 +19,9 @@ import type_syntax (TypeExpr, TRecord, TUnit, RowExpr, AtomExpr, Mode, Generics,
                     MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row,
                     row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
-import exprs (Expr, ELit, Param, expr, scrutinee, block_expr, expr_span, no_expr, fn_param, param,
-              dump_expr, dump_param, shown_binder, cases_binder, hidden_binder, case_at,
-              case_digest, case_body, listing)
+import exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span, no_expr,
+              fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, hidden_binder,
+              case_at, case_digest, case_body, listing)
 import patterns (LStr)
 
 // --- The tree ---------------------------------------------------------------
@@ -118,7 +118,26 @@ pub type LawDef = {
   cost: Option<Expr>,
   /// The definition and the `cost` clause the rewrite made this law of, which no source writes.
   costs: Option<{ def: Ident, index: Int }>,
+  of: Option<OfSchema>,
   body: Expr,
+  span: Span,
+}
+
+/// `law "l" = round_trip(f, g)`. The resolver fills `home`, the schema's module, and `shown`, the
+/// names the schema gives its binders.
+pub type OfSchema = { schema: QName, home: Option<Bytes>, shown: List<Bytes>, span: Span }
+
+/// `law schema round_trip<a>(f: (a) -> String) forall (x: a) { .. }`: a law over what it is given.
+pub type SchemaDef = {
+  vis: Vis,
+  name: Ident,
+  /// Type parameters, and at most one row parameter: what the definitions it is given may raise.
+  generics: Generics,
+  params: List<Binder>,
+  binders: List<Binder>,
+  guard: Option<Expr>,
+  body: Expr,
+  doc: Option<Doc>,
   span: Span,
 }
 
@@ -217,6 +236,7 @@ pub type Item =
   | IEffect(EffectDef)
   | ITest(TestDef)
   | ILaw(LawDef)
+  | ISchema(SchemaDef)
   | IDerive(DeriveDef)
   | IEffectSet(EffectSetDef)
   | IExtern(ExternDef)
@@ -300,6 +320,7 @@ pub fn no_law_def() -> LawDef =
     guard: None,
     cost: None,
     costs: None,
+    of: None,
     body: no_expr(),
     span: dummy_span(),
   }
@@ -327,6 +348,7 @@ pub fn item_doc(item: Item) -> Option<Doc> =
     IEffect(d) -> d.doc,
     IEffectSet(d) -> d.doc,
     IExtern(d) -> d.doc,
+    ISchema(d) -> d.doc,
     ITest(_) -> None,
     ILaw(_) -> None,
     IDerive(_) -> None,
@@ -339,9 +361,39 @@ pub fn item_span(item: Item) -> Span =
     IEffect(d) -> d.span,
     ITest(d) -> d.span,
     ILaw(d) -> d.span,
+    ISchema(d) -> d.span,
     IDerive(d) -> d.span,
     IEffectSet(d) -> d.span,
     IExtern(d) -> d.span,
+  }
+
+// --- Schemas ----------------------------------------------------------------
+
+/// A schema is also two definitions: its body under its own name, and its guard under this one.
+pub fn schema_guard_name(name: Bytes) -> Bytes = bytes_concat(name, b"_where")
+
+pub fn schema_named(module: Module, name: Bytes) -> Option<SchemaDef> =
+  fold(module.items, None, |found: Option<SchemaDef>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item {
+        ISchema(d) -> if d.name.name == name { Some(d) } else { None },
+        _ -> None,
+      },
+    })
+
+/// The schema a definition was made of, by the span they share. Each is `transparent`, so no other
+/// definition pays for the walk.
+pub fn schema_of(module: Module, def: FnDef) -> Option<SchemaDef> =
+  if def.transparent == None { None } else {
+    fold(module.items, None, |found: Option<SchemaDef>, item: Item|
+      match found {
+        Some(_) -> found,
+        None -> match item {
+          ISchema(d) -> if d.span == def.span { Some(d) } else { None },
+          _ -> None,
+        },
+      })
   }
 
 // --- Item starts ------------------------------------------------------------
@@ -357,6 +409,7 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || k == keyword_nondet()
     || k == keyword_test()
     || at_law_start(input, parser)
+    || at_schema_start(input, parser)
     || at_derive_start(input, parser)
     || at_reuse_start(input, parser)
     || at_transparent_start(input, parser)
@@ -373,6 +426,11 @@ pub fn at_law_start(input: Input, parser: Parser) -> Bool =
     && (tok_is_str(token_kind_at(input, parser, 1))
     || (token_kind_at(input, parser, 1) == token_slash()
     && tok_is_ident(token_kind_at(input, parser, 2))))
+
+/// `schema` is contextual as `law` is: the two open an item only before the schema's name.
+pub fn at_schema_start(input: Input, parser: Parser) -> Bool =
+  at_ident_text(input, parser, b"law") && token_kind_at(input, parser, 1) == Identifier(b"schema")
+    && tok_is_ident(token_kind_at(input, parser, 2))
 
 pub fn at_derive_start(input: Input, parser: Parser) -> Bool =
   at_ident_text(input, parser, b"derive") && tok_is_ident(token_kind_at(input, parser, 1))
@@ -920,14 +978,30 @@ pub fn extern_def(
 // --- `law` ------------------------------------------------------------------
 
 /// A binder's type is mandatory: inferring it would make a law's meaning depend on how its body was written.
-pub fn binder(input: Input, parser: Parser) -> Result<Parsed<Binder>, Parser> / {abort.raise} = {
-  let { parser, node: name } = expect_ident(input, parser, b"a binder name")?;
-  let { parser, .. } = expect(
+pub fn binder(input: Input, parser: Parser) -> Result<Parsed<Binder>, Parser> / {abort.raise} =
+  annotated(
     input,
     parser,
-    token_colon(),
+    b"a binder name",
     b"`:` and a type \xe2\x80\x94 a `forall` binder must be annotated",
-  )?;
+  )
+
+fn schema_param(input: Input, parser: Parser) -> Result<Parsed<Binder>, Parser> / {abort.raise} =
+  annotated(
+    input,
+    parser,
+    b"a parameter name",
+    b"`:` and a type \xe2\x80\x94 a schema's parameter must be annotated",
+  )
+
+fn annotated(
+  input: Input,
+  parser: Parser,
+  named: Bytes,
+  typed: Bytes,
+) -> Result<Parsed<Binder>, Parser> / {abort.raise} = {
+  let { parser, node: name } = expect_ident(input, parser, named)?;
+  let { parser, .. } = expect(input, parser, token_colon(), typed)?;
   let { parser, node: t } = ty(input, parser)?;
   Ok({ parser: parser, node: { name: name, ty: t, span: span_to(name.span, ty_span(t)) } })
 }
@@ -1003,6 +1077,16 @@ pub fn law_def(input: Input, parser: Parser) -> Result<Parsed<LawDef>, Parser> /
   let st = advance(input, parser);
   let { parser, node: h } = law_host(input, st.parser)?;
   let nm = quoted(input, parser, b"a quoted law label")?;
+  if at_token(input, nm.parser, token_eq()) { instantiation(input, st.node, h, nm) }
+  else { written_law(input, st.node, h, nm) }
+}
+
+fn written_law(
+  input: Input,
+  start: Span,
+  host: Bool,
+  nm: ParsedName,
+) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
   let { parser, node: bs } = law_binders(input, nm.parser)?;
   let { parser, node: g } = law_guard(input, parser)?;
   let { parser, node: k } = law_cost(input, parser)?;
@@ -1012,12 +1096,169 @@ pub fn law_def(input: Input, parser: Parser) -> Result<Parsed<LawDef>, Parser> /
     node: {
       name: nm.name,
       name_span: nm.span,
-      host: h,
+      host: host,
       binders: bs,
       guard: g,
       cost: k,
       costs: None,
+      of: None,
       body: body,
+      span: span_to(start, expr_span(body)),
+    },
+  })
+}
+
+/// `law "label" = schema(f, g)`: the arguments fill the schema's parameters in order.
+fn instantiation(
+  input: Input,
+  start: Span,
+  host: Bool,
+  nm: ParsedName,
+) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
+  let eq = advance(input, nm.parser);
+  let { parser, node: q } = qname(input, eq.parser, b"the law schema to instantiate")?;
+  let { parser, node: o } = expect(
+    input,
+    parser,
+    token_lparen(),
+    b"`(` and what the schema is instantiated with",
+  )?;
+  let { parser, node: args } = comma_list(input, parser, token_rparen(), expr)?;
+  let { parser, node: cl } = expect_close(
+    input,
+    parser,
+    token_rparen(),
+    o,
+    b"`)` to close the arguments",
+  )?;
+  let span = span_to(q.span, cl);
+  let pure = if !host { parser } else {
+    push_diag(
+      parser,
+      error_at(
+        unexpected(),
+        span_to(start, nm.span),
+        b"an instantiation cannot be `law/host`",
+        b"write `law`",
+        [b"a schema's body is pure, so no instantiation of one reaches the host"],
+      ),
+    )
+  };
+  Ok({
+    parser: pure,
+    node: {
+      name: nm.name,
+      name_span: nm.span,
+      host: false,
+      binders: [],
+      guard: None,
+      cost: None,
+      costs: None,
+      of: Some({ schema: q, home: None, shown: [], span: span }),
+      body: EApp({
+        span: span,
+        func: EVar({ span: q.span, name: q }),
+        named: [],
+        args: args,
+        labels: [],
+      }),
+      span: span_to(start, cl),
+    },
+  })
+}
+
+// --- `law schema` -----------------------------------------------------------
+
+/// A law body is pure, so a schema binds no label, and its one row parameter is what the
+/// definitions it is given may raise: every function parameter that raises shares it.
+fn schema_generics(
+  input: Input,
+  parser: Parser,
+) -> Result<Parsed<Generics>, Parser> / {abort.raise} =
+  if !at_token(input, parser, token_lt()) { Ok({ parser: parser, node: no_generics() }) } else {
+    let { parser, node: g } = generics(input, parser)?;
+    let labelled = match list_at(g.labels, 0) {
+      Some(l) ->
+        push_diag(
+          parser,
+          error_at(unexpected(), l.span, b"a law schema binds no label", b"a label parameter", [
+            b"a law body is pure, so nothing in a schema performs on a resource a label could name",
+          ]),
+        ),
+      None -> parser,
+    };
+    let rowed = match list_at(g.effects, 1) {
+      Some(e) ->
+        push_diag(
+          labelled,
+          error_at(
+            unexpected(),
+            e.span,
+            b"a law schema takes one row parameter",
+            b"a second row parameter",
+            [
+              b"a schema's row parameter is what the definitions it is given may raise, and its body raises what all of them do: write the one on each",
+            ],
+          ),
+        ),
+      None -> labelled,
+    };
+    Ok({ parser: rowed, node: { types: g.types, effects: take_one(g.effects), labels: [] } })
+  }
+
+fn take_one(idents: List<Ident>) -> List<Ident> =
+  match list_at(idents, 0) { Some(first) -> [first], None -> [] }
+
+fn uncosted(parser: Parser, cost: Option<Expr>) -> Parser =
+  match cost {
+    None -> parser,
+    Some(bound) ->
+      push_diag(
+        parser,
+        error_at(unexpected(), expr_span(bound), b"a law schema states no `cost`", b"remove it", [
+          b"a cost law measures one body at its sizes: write the bound on the law that has the body",
+        ]),
+      ),
+  }
+
+pub fn schema_def(
+  input: Input,
+  parser: Parser,
+  vis: Vis,
+) -> Result<Parsed<SchemaDef>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let kw = advance(input, st.parser);
+  let { parser, node: name } = expect_ident(input, kw.parser, b"a name after `law schema`")?;
+  let { parser, node: g } = schema_generics(input, parser)?;
+  let { parser, node: o } = expect(
+    input,
+    parser,
+    token_lparen(),
+    b"`(` to start the schema's parameters",
+  )?;
+  let { parser, node: ps } = comma_list(input, parser, token_rparen(), schema_param)?;
+  let { parser, .. } = expect_close(
+    input,
+    parser,
+    token_rparen(),
+    o,
+    b"`)` to close the parameters",
+  )?;
+  let { parser, node: bs } = law_binders(input, parser)?;
+  let { parser, node: guard } = law_guard(input, parser)?;
+  let { parser, node: k } = law_cost(input, parser)?;
+  let { parser, node: body } = block_expr(input, uncosted(parser, k))?;
+  Ok({
+    parser: parser,
+    node: {
+      vis: vis,
+      name: name,
+      generics: g,
+      params: ps,
+      binders: bs,
+      guard: guard,
+      body: body,
+      doc: None,
       span: span_to(st.node, expr_span(body)),
     },
   })
@@ -1675,6 +1916,9 @@ pub fn item_at(
       ]),
     )?;
     Ok({ parser: d.parser, node: ITest(d.node) })
+  } else if at_schema_start(input, parser) {
+    let d = schema_def(input, parser, vis)?;
+    Ok({ parser: d.parser, node: ISchema(d.node) })
   } else if at_law_start(input, parser) {
     let d = law_def(
       input,
@@ -1727,6 +1971,7 @@ fn documented(item: Item, doc: Option<Doc>) -> Item =
     IEffect(d) -> IEffect({ ..d, doc: doc }),
     IEffectSet(d) -> IEffectSet({ ..d, doc: doc }),
     IExtern(d) -> IExtern({ ..d, doc: doc }),
+    ISchema(d) -> ISchema({ ..d, doc: doc }),
     ITest(_) -> item,
     ILaw(_) -> item,
     IDerive(_) -> item,
@@ -1865,7 +2110,7 @@ fn stray_doc(mark: DocMark, c: Comment) -> ParseDiag =
         b"this doc comment documents nothing",
         b"no declaration follows it",
         [
-          b"`///` documents the `fn`, `type`, `effect`, operation, `effect set`, variant or record field right below it; a test or a law says what it is in its name",
+          b"`///` documents the `fn`, `type`, `effect`, operation, `effect set`, `law schema`, variant or record field right below it; a test or a law says what it is in its name",
           b"write `//` for a comment",
         ],
       ),
@@ -1997,6 +2242,23 @@ pub fn dump_law(law_def: LawDef) -> Bytes / {abort.raise} =
     dump_opt(law_def.guard, dump_expr),
     dump_opt(law_def.cost, dump_expr),
     dump_expr(law_def.body),
+    match law_def.of {
+      Some(i) -> bytes_concat(dump_node(i.span, b"of"), dump_qname(i.schema)),
+      None -> b"",
+    },
+  ])
+
+pub fn dump_schema(d: SchemaDef) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    dump_node(d.span, b"sch"),
+    dump_vis(d.vis),
+    dump_ident(d.name),
+    dump_generics(d.generics),
+    dump_list(d.params, dump_binder),
+    dump_list(d.binders, dump_binder),
+    dump_opt(d.guard, dump_expr),
+    dump_expr(d.body),
+    dump_doc_if(d.doc),
   ])
 
 pub fn dump_variant(variant: VariantDef) -> Bytes / {abort.raise} =
@@ -2107,6 +2369,7 @@ pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
     IEffect(d) -> dump_effect(d),
     ITest(d) -> dump_test(d),
     ILaw(d) -> dump_law(d),
+    ISchema(d) -> dump_schema(d),
     IDerive(d) -> dump_derive(d),
     IEffectSet(d) -> dump_effect_set(d),
     IExtern(d) -> dump_extern(d),
@@ -2406,6 +2669,55 @@ test "an `extern fn` writes every type and is never `pub`" {
   assert(len(parse(b"pub extern fn f(x: Int) -> Int\n").parser.diags) > 0)
 }
 
+test "a law schema carries its parameters, its binders, a guard and a body, and may be `pub`" {
+  assert_eq(
+    dump(b"pub law schema s<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\n"),
+    "#0;#1;4:73:sch;%pub;15:16:ident;@73;%gen;#1;17:18:ident;@61;#0;#0;#1;20:31:bnd;20:21:ident;@66;23:31:tfn;#1;24:25:tvar;24:25:ident;@61;30:31:tvar;30:31:ident;@61;?0;#1;41:45:bnd;41:42:ident;@78;44:45:tvar;44:45:ident;@61;?1;53:59:ebin;%eq;53:54:evar;53:54:qname;?0;53:54:ident;@78;58:59:evar;58:59:qname;?0;58:59:ident;@78;60:73:eblk;#0;?1;62:71:ebin;%eq;62:66:eapp;62:63:evar;62:63:qname;?0;62:63:ident;@66;#1;64:65:evar;64:65:qname;?0;64:65:ident;@78;#0;#0;70:71:evar;70:71:qname;?0;70:71:ident;@78;#0;",
+  )
+}
+
+test "an instantiation is a law whose body is the call it writes" {
+  assert_eq(
+    dump(b"law \"l\" = m::s(f, 1)\n"),
+    "#0;#1;0:20:law;4:7:lnm;@6c;%false;#0;?0;?0;10:20:eapp;10:14:evar;10:14:qname;?1;10:11:ident;@6d;13:14:ident;@73;#2;15:16:evar;15:16:qname;?0;15:16:ident;@66;18:19:elit;%int;@31;#0;#0;10:20:of;10:14:qname;?1;10:11:ident;@6d;13:14:ident;@73;#0;",
+  )
+}
+
+test "a schema takes types and one row, binds no label, states no bound and writes each parameter's type" {
+  assert_eq(
+    dump(b"law schema s<a | e>(f: (a) -> a / e) { true }\n"),
+    "#0;#1;0:45:sch;%priv;11:12:ident;@73;%gen;#1;13:14:ident;@61;#1;17:18:ident;@65;#0;#1;20:35:bnd;20:21:ident;@66;23:35:tfn;#1;24:25:tvar;24:25:ident;@61;30:31:tvar;30:31:ident;@61;?1;34:35:row;#0;#0;?1;34:35:ident;@65;#0;?0;37:45:eblk;#0;?1;39:43:elit;%bool;@31;#0;",
+  );
+  assert(
+    string_ends_with(
+      dump(b"law schema s<a | e, r>(f: (a) -> a / e) { true }\n"),
+      "#1;!E0001:20:21:1:1;=20:21:1;",
+    ),
+  );
+  assert(
+    string_ends_with(
+      dump(b"law schema s<[l]>(f: Int) { true }\n"),
+      "#1;!E0001:14:15:1:1;=14:15:1;",
+    ),
+  );
+  assert(
+    string_ends_with(
+      dump(b"law schema s(f: Int) forall (n: Int) cost n { true }\n"),
+      "#1;!E0001:42:43:1:1;=42:43:1;",
+    ),
+  );
+  assert_eq(dump(b"law schema s(f) { true }\n"), "#0;#0;#1;!E0001:14:15:1:0;=14:15:1;")
+}
+
+test "an instantiation is never `law/host` or `pub`, and `schema` stays a name" {
+  assert(string_ends_with(dump(b"law/host \"l\" = s(f)\n"), "#1;!E0001:0:12:1:1;=0:12:1;"));
+  assert(string_ends_with(dump(b"pub law \"l\" = s(f)\n"), "#1;!E0001:0:3:1:1;=0:3:1;"));
+  assert_eq(
+    len(parse(b"fn law(schema: Int) -> Int = schema\nfn f() -> Int = law(1)\n").parser.diags),
+    0,
+  )
+}
+
 fn doc_lines(doc: Option<Doc>) -> List<Bytes> = match doc { Some(d) -> d.lines, None -> [] }
 
 fn item_at_index(m: Module, i: Int) -> Item =
@@ -2492,4 +2804,24 @@ test "a test over cases takes no doc either, above it or between its label and i
   let commented = parse(b"// over cases\ntest \"t {n}\" // then\nfor n: Int in [1] { () }\n");
   assert_eq(len(commented.parser.diags), 0);
   match commented.node.items { [ITest(d)] -> assert(d.cases != None), _ -> panic("one test") }
+}
+
+test "a `///` block documents a `law schema`, and above an instantiation it documents nothing" {
+  let r = parse(
+    b"/// What a codec is held to.\npub law schema s(f: (Int) -> Int) forall (x: Int) { f(x) == x }\n",
+  );
+  assert_eq(len(r.parser.diags), 0);
+  match item_at_index(r.node, 0) {
+    ISchema(d) -> assert_eq(doc_lines(d.doc), [b"What a codec is held to."]),
+    _ -> assert(false),
+  };
+  assert_eq(
+    map(
+      parse(
+        b"law schema s(f: (Int) -> Int) { f(1) == 1 }\n\n/// stray\nlaw \"l\" = s(g)\n",
+      ).parser.diags,
+      |d: ParseDiag| d.code,
+    ),
+    [b"E0003"],
+  )
 }

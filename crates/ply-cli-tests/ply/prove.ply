@@ -941,3 +941,169 @@ test "a counterexample is shrunk by the program that reads it" {
     assert(settled == 100, Some("the walk stopped short of the boundary: " ++ text))
   })
 }
+
+fn obligation(report: Json, label: String) -> Json =
+  first(filter(items(at(report, "obligations")), |o: Json| str(at(o, "label")) == label))
+
+test "an instantiation is discharged as its schema's body written out, and names its schema" {
+  scratch(|| {
+    let over = |laws: String|
+      "fn clamp(n: Int) -> Int = if n > 10 { 10 } else { n }\n\nfn reverse(xs: List<Int>) -> List<Int> =\n  match xs { [] -> [], [x, ..rest] -> push(reverse(rest), x) }\n\n"
+        ++ laws;
+    program(
+      over(
+        \\law "clamp settles" forall (x: Int) { clamp(clamp(x)) == clamp(x) }
+        \\
+        \\law "reverse twice" forall (x: List<Int>) { reverse(reverse(x)) == x }
+        \\
+        \\law "small values are fixed" forall (x: Int) where x > 0 && x < 10 { clamp(x) == x }
+        \\
+      ),
+    );
+    let written = proved_json(["--no-cache"]);
+    program(
+      over(
+        \\law schema idempotent<a>(f: (a) -> a) forall (x: a) { f(f(x)) == f(x) }
+        \\
+        \\law schema involution<a>(f: (a) -> a) forall (x: a) { f(f(x)) == x }
+        \\
+        \\law schema fixed_within(f: (Int) -> Int, low: Int, high: Int)
+        \\  forall (x: Int) where x > low && x < high { f(x) == x }
+        \\
+        \\law "clamp settles" = idempotent(clamp)
+        \\
+        \\law "reverse twice" = involution(reverse)
+        \\
+        \\law "small values are fixed" = fixed_within(clamp, 0, 10)
+        \\
+      ),
+    );
+    let made = proved_json(["--no-cache"]);
+    assert(int(at(made, "exit_code")) == 0, Some(shown(made)));
+    // A schema's own definitions are what is claimed, not definitions to carry a claim.
+    assert(at(made, "coverage") == at(written, "coverage"), Some(shown(at(made, "coverage"))));
+    let schema_of = |label: String, tier: String| {
+      let m = obligation(made, "law \"" ++ label ++ "\"");
+      let w = obligation(written, "law \"" ++ label ++ "\"");
+      assert(str(at(m, "tier")) == tier && str(at(w, "tier")) == tier, Some(shown(m)));
+      assert(at(m, "certificate") == at(w, "certificate"), Some(shown(m) ++ "\n" ++ shown(w)));
+      assert(at(m, "cases") == at(w, "cases"), Some(shown(m) ++ "\n" ++ shown(w)));
+      assert(at(m, "guarded") == at(w, "guarded"), Some(shown(m)));
+      assert(at(w, "schema") == Null, Some(shown(w)));
+      str(at(m, "schema"))
+    };
+    assert(schema_of("clamp settles", "proved") == "m.idempotent", Some(shown(made)));
+    assert(schema_of("reverse twice", "property") == "m.involution", Some(shown(made)));
+    assert(schema_of("small values are fixed", "proved") == "m.fixed_within", Some(shown(made)))
+  })
+}
+
+test "a refuted instantiation is refuted at the schema's binder, where it is written" {
+  scratch(|| {
+    program(
+      \\fn x(n: Int) -> Int = if n > 3 { 3 } else { n }
+      \\
+      \\law schema involution<a>(f: (a) -> a) forall (x: a) { f(f(x)) == x }
+      \\
+      \\law "a clamp undoes itself" = involution(x)
+      \\
+    );
+    let r = on_disk(["prove", "--no-cache"]);
+    assert(r.code == 1, Some(said(r)));
+    assert(string_contains(stdout(r), "forall (x: Int)"), Some(stdout(r)));
+    assert(string_contains(stdout(r), "schema: m.involution"), Some(stdout(r)));
+    let o = obligation(
+      json_of(on_disk(["prove", "--no-cache", "--json"])),
+      "law \"a clamp undoes itself\"",
+    );
+    assert(str(at(o, "outcome")) == "refuted", Some(shown(o)));
+    assert(str(at(o, "location")) == "m.ply:5:1", Some(shown(o)));
+    assert(str(at(nth(path(o, ["counterexample", "bindings"]), 0), "name")) == "x", Some(shown(o)))
+  })
+}
+
+test "a schema takes what raises a refusal of its own, and quantifies the `new` record it is given" {
+  scratch(|| {
+    let over = |laws: String|
+      "import std.uuid (Uuid, uuid_render, uuid_parse)\n\ntype Sign = new { negative: Bool }\n\neffect reader {\n  raise refused(at: Int)\n}\n\nfn shown(s: Sign) -> String = if s.negative { \"-\" } else { \"+\" }\n\nfn read(t: String) -> Option<Sign> / {reader.refused} =\n  if t == \"-\" { Some({ negative: true }) }\n  else if t == \"+\" { Some({ negative: false }) }\n  else { reader.refused(string_len(t)) }\n\nfn digit(n: Int) -> Int / {reader.refused} = if n < 0 { reader.refused(n) } else { n % 10 }\n\n"
+        ++ laws;
+    program(
+      over(
+        \\law "a sign reads back" forall (x: Sign) { read(shown(x)) == Some(x) }
+        \\
+        \\law "a digit settles" forall (x: Int) { digit(digit(x)) == digit(x) }
+        \\
+        \\law "a uuid reads back" forall (x: Uuid) { uuid_parse(uuid_render(x)) == Some(x) }
+        \\
+      ),
+    );
+    let written = proved_json(["--no-cache"]);
+    program(
+      over(
+        \\law schema reads_back<a, b | e>(shown: (a) -> b / e, read: (b) -> Option<a> / e)
+        \\  forall (x: a) { read(shown(x)) == Some(x) }
+        \\
+        \\law schema settles<a | e>(f: (a) -> a / e) forall (x: a) { f(f(x)) == f(x) }
+        \\
+        \\law "a sign reads back" = reads_back(shown, read)
+        \\
+        \\law "a digit settles" = settles(digit)
+        \\
+        \\law "a uuid reads back" = reads_back(uuid_render, uuid_parse)
+        \\
+      ),
+    );
+    let made = proved_json(["--no-cache"]);
+    let same = |label: String, key: String| {
+      let m = obligation(made, "law \"" ++ label ++ "\"");
+      let w = obligation(written, "law \"" ++ label ++ "\"");
+      assert(at(m, key) != Null && at(m, key) == at(w, key), Some(shown(m) ++ "\n" ++ shown(w)));
+      assert(at(m, "outcome") == at(w, "outcome"), Some(shown(m) ++ "\n" ++ shown(w)));
+      m
+    };
+    // A `new` record of two values is every value there is of it, to the schema as to the law.
+    let sign = same("a sign reads back", "certificate");
+    assert(
+      string_contains(str(path(sign, ["certificate", "summary"])), "2 points of m.Sign"),
+      Some(shown(sign)),
+    );
+    // A refusal of the program's own is a gap at the point that raised it, never an effect.
+    let digit = same("a digit settles", "gap");
+    assert(str(at(digit, "gap_kind")) == "raised", Some(shown(digit)));
+    assert(string_contains(str(at(digit, "gap")), "m.reader.refused"), Some(shown(digit)));
+    // Another package's `new` record is drawn as the record it is, which need not be one its
+    // module would have made.
+    let uuid = same("a uuid reads back", "gap");
+    assert(str(at(uuid, "schema")) == "m.reads_back", Some(shown(uuid)))
+  })
+}
+
+test "an instantiation is refused where it is written, for what it is given and what it quantifies" {
+  scratch(|| {
+    let over = |law: String|
+      "fn id(n: Int) -> Int = n\n\nfn held(c: Cell<Int>) -> Cell<Int> = c\n\nlaw schema same<a>(f: (a) -> a) forall (x: a) { f(x) == x }\n\n"
+        ++ law
+        ++ "\n";
+    let refused = |law: String, code: String, at_text: String| {
+      program(over(law));
+      let r = on_disk(["check"]);
+      assert(r.code != 0, Some(said(r)));
+      assert(
+        string_contains(said(r), "Error[" ++ code ++ "]") && string_contains(said(r), at_text),
+        Some(said(r)),
+      )
+    };
+    refused("law \"l\" = id(id)", "E0472", "`id` is not a law schema");
+    refused(
+      "law \"l\" = same(id, id)",
+      "E0202",
+      "the schema `same` takes 1 argument, but 2 were supplied",
+    );
+    refused("law \"l\" = same(int_to_string)", "E0201", "m.ply:7:16");
+    refused(
+      "law \"l\" = same(held)",
+      "E0418",
+      "the schema `same` binds `x`, which is a `Cell<Int>` here",
+    )
+  })
+}

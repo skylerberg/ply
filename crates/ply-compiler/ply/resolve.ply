@@ -3,18 +3,18 @@
 //! Ordered tables are lists in insertion order: the dump encodes that order and a `Map` sorts its keys.
 
 import parsing (Span, Ident, QName, span_to, dummy_span, is_bare, starts_upper, span_key)
-import type_syntax (TypeExpr, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad,
-                    mode_text)
+import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite,
+                    MBad, mode_text)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, Cases,
               TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, SCost, Binder, Vis, VPub, VPriv,
-              ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, parse,
-              dump_module, is_pub, TDNominal)
+              ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, LawDef,
+              OfSchema, schema_named, schema_guard_name, parse, dump_module, is_pub, TDNominal)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm,
               HandleClause, ReturnClause, RecField, expr_span, ETagged)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
-import std.list (at, contains, take, drop)
+import std.list (at, concat, contains, take, drop)
 import std.bin
 import types (last_dot)
 import std.bytes (ascii_of_int)
@@ -2372,6 +2372,7 @@ fn rows_item(
           guard: g.e,
           cost: d.cost,
           costs: d.costs,
+          of: d.of,
           body: b.e,
           span: d.span,
         }),
@@ -2379,6 +2380,182 @@ fn rows_item(
     },
     _ -> { expander: expander, it: item },
   }
+
+// --- Law schemas: what an instantiation states -------------------------------------------------
+
+fn has_instance(module: Module) -> Bool =
+  fold(module.items, false, |found: Bool, item: Item|
+    found || (match item { ILaw(d) -> d.of != None, _ -> false }))
+
+/// The schema's name for a binder, with `_` after it until nothing the arguments name, and no binder
+/// before it, is called that: an argument written here never reads a binder.
+fn apart(name: Bytes, args: List<Expr>, taken: List<Bytes>, room: Int) -> Bytes / {abort.raise} =
+  iterate(name, room, |n: Bytes|
+    if !contains(taken, n)
+        && fold(args, true, |free: Bool, x: Expr| free && len(mentions(x, [n], [], [])) == 0) {
+      Stop(n)
+    } else { Continue(bytes_concat(n, b"_")) })
+
+type Instantiation = { r: Resolved, law: LawDef, diags: List<Diag> }
+
+/// `law "label" = schema(f, g)` as the law it is: over the schema's binders, its guard and body
+/// the schema's definitions called with what it was given and then the binders. A name that
+/// resolves to nothing is left as written, for the checker to say what is in reach.
+fn instance(
+  r: Resolved,
+  mods: List<ParsedModule>,
+  m: Int,
+  d: LawDef,
+  i: OfSchema,
+  diags: List<Diag>,
+) -> Instantiation / {abort.raise} =
+  match find(r, m, ValueSpace, i.schema) {
+    None -> { r: r, law: d, diags: diags },
+    Some(b) -> {
+      let name = i.schema.name.name;
+      let home = at(mods, b.owner);
+      let args = match d.body { EApp(a) -> a.args, _ -> [] };
+      match schema_named(home.module, name) {
+        None ->
+          {
+            r: r,
+            law: d,
+            diags: push(
+              diags,
+              error_at_and(
+                b"E0472",
+                m,
+                i.schema.span,
+                bytes_concat_all([b"`", name, b"` is not a law schema"]),
+                b"a law instantiates a schema",
+                b.owner,
+                b.span,
+                b"declared here",
+                [
+                  b"a schema is declared `law schema name(f: (A) -> B) forall (x: A) { .. }`, and a law over a definition that is not one writes its own binders and body",
+                ],
+              ),
+            ),
+          },
+        Some(schema) -> if len(args) != len(schema.params) {
+          {
+            r: r,
+            law: d,
+            diags: push(
+              diags,
+              error_at_and(
+                b"E0202",
+                m,
+                i.span,
+                bytes_concat_all([
+                  b"the schema `",
+                  name,
+                  b"` takes ",
+                  counted(len(schema.params), b"argument"),
+                  b", but ",
+                  ascii_of_int(len(args)),
+                  if len(args) == 1 { b" was supplied" } else { b" were supplied" },
+                ]),
+                bytes_concat_all([
+                  b"expected ",
+                  ascii_of_int(len(schema.params)),
+                  b", found ",
+                  ascii_of_int(len(args)),
+                ]),
+                b.owner,
+                schema.name.span,
+                b"this is the schema being instantiated",
+                [],
+              ),
+            ),
+          }
+        } else {
+          let through = { name: reached_binder(home.name), span: i.schema.span };
+          let end = { start: i.span.end, end: i.span.end };
+          let names = fold(schema.binders, [], |acc: List<Bytes>, binder: Binder|
+            push(
+              acc,
+              apart(binder.name.name, args, acc, i.span.end - i.span.start + len(acc) + 2),
+            ));
+          let given = concat(
+            args,
+            map(names, |n: Bytes|
+              EVar({ span: end, name: { module: None, name: { name: n, span: end }, span: end } })),
+          );
+          let call = |callee: Bytes, at: Span|
+            EApp({
+              span: at,
+              func: EVar({
+                span: i.schema.span,
+                name: {
+                  module: Some(through),
+                  name: { name: callee, span: i.schema.name.span },
+                  span: i.schema.span,
+                },
+              }),
+              named: [],
+              args: given,
+              labels: [],
+            });
+          {
+            r: reach(r, m, through.name, b.owner),
+            law: {
+              ..d,
+              binders: map(names, |n: Bytes|
+                {
+                  name: { name: n, span: i.span },
+                  ty: TVar({ name: n, span: i.span }),
+                  span: i.span,
+                }),
+              guard: match schema.guard {
+                Some(_) -> Some(call(schema_guard_name(name), i.schema.span)),
+                None -> None,
+              },
+              of: Some({
+                ..i,
+                home: Some(home.name),
+                shown: map(schema.binders, |binder: Binder| binder.name.name),
+              }),
+              body: call(name, i.span),
+            },
+            diags: diags,
+          }
+        },
+      }
+    },
+  }
+
+fn counted(n: Int, what: Bytes) -> Bytes =
+  bytes_concat_all([ascii_of_int(n), b" ", what, if n == 1 { b"" } else { b"s" }])
+
+type Instantiated = { r: Resolved, mods: List<ParsedModule>, diags: List<Diag> }
+
+fn instantiated(r: Resolved, mods: List<ParsedModule>) -> Instantiated / {abort.raise} =
+  fold(range(0, len(mods)), { r: r, mods: [], diags: [] }, |acc: Instantiated, m: Int| {
+    let mod: ParsedModule = at(mods, m);
+    if !has_instance(mod.module) { { ..acc, mods: push(acc.mods, mod) } } else {
+      let walked = fold(
+        mod.module.items,
+        { r: acc.r, items: [], diags: acc.diags },
+        |w: { r: Resolved, items: List<Item>, diags: List<Diag> }, item: Item|
+          match item {
+            ILaw(d) -> match d.of {
+              None -> { ..w, items: push(w.items, item) },
+              Some(i) -> {
+                let o = instance(w.r, mods, m, d, i, w.diags);
+                { r: o.r, items: push(w.items, ILaw(o.law)), diags: o.diags }
+              },
+            },
+            _ -> { ..w, items: push(w.items, item) },
+          },
+      );
+      {
+        r: walked.r,
+        mods: push(acc.mods, { ..mod, module: { ..mod.module, items: walked.items } }),
+        diags: walked.diags,
+      }
+    }
+  })
 
 type SetsExpanded = { r: Resolved, mods: List<ParsedModule>, diags: List<Diag> }
 
@@ -3089,6 +3266,7 @@ fn fill_item(
           guard: g.expr,
           cost: d.cost,
           costs: d.costs,
+          of: d.of,
           body: body.expr,
           span: d.span,
         }),
@@ -3254,8 +3432,10 @@ fn resolve_with(
       imports: map(edges, |es: List<{ from: Int, target: Int, span: Span }>|
         map(es, |e: { from: Int, target: Int, span: Span }| e.target)),
     };
-    let sets = expand_sets(r, mods);
-    if len(sets.diags) > 0 { ResolveFailed(sets.diags) }
+    let made = instantiated(r, mods);
+    let sets = expand_sets(made.r, made.mods);
+    if len(made.diags) > 0 { ResolveFailed(made.diags) }
+    else if len(sets.diags) > 0 { ResolveFailed(sets.diags) }
     else if !defaults { ResolveSucceeded({ r: sets.r, mods: sets.mods, diags: [] }) } else {
       let x = expand(sets.r, sets.mods, []);
       if len(x.diags) > 0 { ResolveFailed(x.diags) } else { ResolveSucceeded(x) }
