@@ -1,8 +1,8 @@
 //! What a program wants over a `String` and the prelude does not carry.
 //!
 //! The prelude has the pieces (`string_len`, `string_slice`, `string_split`, `string_find`,
-//! `string_contains`) and no whole: no `join`, no `replace`, no trim. This is those, and every one
-//! is total: a `String` is characters, not bytes, so a slice lands on a character boundary by
+//! `string_contains`) and no whole: no `join`, no `replace`. This is those, and every one is
+//! total: a `String` is characters, not bytes, so a slice lands on a character boundary by
 //! construction, and `replace` with an empty needle is the text unchanged rather than a loop.
 //! `std.bytes.join` is `join` over `Bytes`.
 //!
@@ -11,9 +11,15 @@
 //! The prelude's `string_lower` and `string_upper` map by Unicode's tables: the one for text a
 //! person reads, and never for a name that is compared, since it maps characters outside ASCII
 //! onto ASCII letters (`string_lower` of the Kelvin sign `U+212A` is `k`).
+//!
+//! So has a trim. `ascii_trim` takes a space, a tab, a line feed and a carriage return, which is
+//! what stands around a token in a protocol's text. The prelude's `string_trim` takes every
+//! character Unicode calls white space, a no-break space among them: for text a person wrote, and
+//! never for a token, which another reader of the same bytes would not take the same way.
 
 import std.bytes (int_of_ascii)
 import std.laws (agrees, idempotent)
+import std.list (all, drop, drop_while, reverse, take)
 
 /// Every part, with `sep` between them and nowhere else.
 pub fn join(parts: List<String>, sep: String) -> String =
@@ -49,27 +55,32 @@ pub fn split_once(
     })
   } else { None }
 
-/// The text without whitespace at either end.
-pub fn trim(text: String) -> String / {abort.raise} = trim_start(trim_end(text))
+/// `text` without the spaces, tabs, line feeds and carriage returns at either end, and with every
+/// other character it has: the trim for a token or a value in a protocol's text.
+pub fn ascii_trim(text: String) -> String = ascii_trim_start(ascii_trim_end(text))
 
-/// The text without whitespace at its start.
-pub fn trim_start(text: String) -> String / {abort.raise} = trim_start_at(text, 0)
+/// `text` without the spaces, tabs, line feeds and carriage returns it starts with.
+pub fn ascii_trim_start(text: String) -> String =
+  if leads_blank(text) { string_of_chars(drop_while(string_chars(text), is_blank)) } else { text }
 
-/// The text without whitespace at its end.
-pub fn trim_end(text: String) -> String / {abort.raise} = trim_end_at(text, string_len(text))
+/// `text` without the spaces, tabs, line feeds and carriage returns it ends with.
+pub fn ascii_trim_end(text: String) -> String =
+  if ends_blank(text) {
+    string_of_chars(reverse(drop_while(reverse(string_chars(text)), is_blank)))
+  } else { text }
 
 /// `text` with each of `A` to `Z` as its lower-case letter and every other character as it is, a
 /// letter outside ASCII included, so the answer is as long as `text`. This is the fold for a name
 /// a protocol compares without case: a header's, a scheme's, a host's, a hex digit's.
 pub fn ascii_lower(text: String) -> String
   cost string_len(text)
-= string_of_chars(map(string_chars(text), lower_char))
+= if only_ascii(text) { string_lower(text) } else { string_of_chars(lowered_chars(text)) }
 
 /// `text` with each of `a` to `z` as its upper-case letter and every other character as it is, as
 /// `ascii_lower` leaves them.
 pub fn ascii_upper(text: String) -> String
   cost string_len(text)
-= string_of_chars(map(string_chars(text), upper_char))
+= if only_ascii(text) { string_upper(text) } else { string_of_chars(raised_chars(text)) }
 
 /// Whether two texts differ at most in the case of the letters `A` to `Z`.
 pub fn eq_ignore_ascii_case(a: String, b: String) -> Bool = ascii_lower(a) == ascii_lower(b)
@@ -159,16 +170,25 @@ fn words_from(
     } else { words_from(text, at + 1, current ++ c, out) }
   }
 
-fn trim_start_at(text: String, at: Int) -> String / {abort.raise} =
-  if at < string_len(text) && is_space(string_slice(text, at, at + 1)) {
-    trim_start_at(text, at + 1)
-  } else { string_slice(text, at, string_len(text)) }
-
-fn trim_end_at(text: String, at: Int) -> String / {abort.raise} =
-  if at > 0 && is_space(string_slice(text, at - 1, at)) { trim_end_at(text, at - 1) }
-  else { string_slice(text, 0, at) }
-
 fn is_space(c: String) -> Bool = string_contains(" \t\n\r", c)
+
+fn is_blank(c: Char) -> Bool = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+fn leads_blank(text: String) -> Bool =
+  string_starts_with(text, " ") || string_starts_with(text, "\t") || string_starts_with(text, "\n")
+    || string_starts_with(text, "\r")
+
+fn ends_blank(text: String) -> Bool =
+  string_ends_with(text, " ") || string_ends_with(text, "\t") || string_ends_with(text, "\n")
+    || string_ends_with(text, "\r")
+
+/// Whether `text` is ASCII alone, a character outside it being more than one byte: there
+/// Unicode's case is ASCII's, and the prelude answers it in one step.
+fn only_ascii(text: String) -> Bool = bytes_len(bytes_of_string(text)) == string_len(text)
+
+fn lowered_chars(text: String) -> List<Char> = map(string_chars(text), lower_char)
+
+fn raised_chars(text: String) -> List<Char> = map(string_chars(text), upper_char)
 
 fn lower_char(c: Char) -> Char = if c >= 'A' && c <= 'Z' { shifted(c, 32) } else { c }
 
@@ -207,14 +227,51 @@ test "replace is every occurrence and replace_first is one" {
   assert_eq(split_once("ab", "="), None)
 }
 
-test "trim takes the whitespace and nothing else" {
-  assert_eq(trim("  x \n"), "x");
-  assert_eq(trim("   "), "");
-  assert_eq(trim_start("  x "), "x ");
-  assert_eq(trim_end("  x "), "  x");
-  assert_eq(trim("\t\r\n"), "");
-  assert_eq(trim(""), "")
+test "the ASCII trim takes spaces, tabs, line feeds and carriage returns, and nothing else" {
+  assert_eq(ascii_trim("  x \n"), "x");
+  assert_eq(ascii_trim("   "), "");
+  assert_eq(ascii_trim_start("  x "), "x ");
+  assert_eq(ascii_trim_end("  x "), "  x");
+  assert_eq(ascii_trim("\t\r\n"), "");
+  assert_eq(ascii_trim(""), "");
+  assert_eq(ascii_trim(" a b "), "a b");
+  assert_eq(ascii_trim("\u{b}x\u{c}"), "\u{b}x\u{c}")
 }
+
+test "white space outside ASCII stays under the ASCII trim, where Unicode's takes it" {
+  let spaced = "\u{a0}chunked\u{2003}";
+  assert_eq(ascii_trim(spaced), spaced);
+  assert_eq(string_trim(spaced), "chunked");
+  assert_eq(ascii_trim(" " ++ spaced ++ "\t"), spaced);
+  assert_eq(ascii_trim("\u{85}x\u{3000}"), "\u{85}x\u{3000}");
+  assert_eq(string_trim("\u{85}x\u{3000}"), "x")
+}
+
+law "an ASCII trim is settled" = idempotent(ascii_trim)
+
+law "below 256 the ASCII trim takes a space, a tab, a line feed and a carriage return alone"
+  forall (b: U8) {
+    let n = int_of_u8(b);
+    ascii_trim(one(n)) == (if n == 32 || n == 9 || n == 10 || n == 13 { "" } else { one(n) })
+      && ascii_trim("a" ++ one(n) ++ "b") == "a" ++ one(n) ++ "b"
+  }
+
+law "an ASCII trim takes blanks alone from an end, and leaves none there"
+  forall (lead: Int, middle: String, tail: Int) {
+    let text = repeat(" \t\r\n", lead & 3) ++ middle ++ repeat("\n \t", tail & 3);
+    let whole = string_chars(text);
+    let led = len(whole) - string_len(ascii_trim_start(text));
+    let kept = string_len(ascii_trim_end(text));
+    string_ends_with(text, ascii_trim_start(text)) && all(take(whole, led), is_blank)
+      && !leads_blank(ascii_trim_start(text))
+      && string_starts_with(text, ascii_trim_end(text))
+      && all(drop(whole, kept), is_blank)
+      && !ends_blank(ascii_trim_end(text))
+      && ascii_trim(text) == ascii_trim_end(ascii_trim_start(text))
+  }
+
+law "Unicode's trim takes whatever the ASCII trim does" =
+  agrees(|text: String| string_trim(ascii_trim(text)), string_trim)
 
 test "the ASCII fold moves `A-Z` and `a-z`, and leaves every other character as it is" {
   assert_eq(ascii_lower("AbC1 É"), "abc1 É");
@@ -306,10 +363,18 @@ law "the ASCII fold keeps a text's length and every character outside ASCII, eit
   }
 
 law "a text of ASCII has the lower case Unicode gives it" =
-  agrees(|text: String| ascii_lower(plain(text)), |text: String| string_lower(plain(text)))
+  agrees(|text: String| string_of_chars(lowered_chars(plain(text))), |text: String|
+    string_lower(plain(text)))
 
 law "a text of ASCII has the upper case Unicode gives it" =
-  agrees(|text: String| ascii_upper(plain(text)), |text: String| string_upper(plain(text)))
+  agrees(|text: String| string_of_chars(raised_chars(plain(text))), |text: String|
+    string_upper(plain(text)))
+
+law "a text's ASCII lower case is each character's, whichever way it is reached" =
+  agrees(ascii_lower, |text: String| string_of_chars(lowered_chars(text)))
+
+law "a text's ASCII upper case is each character's, whichever way it is reached" =
+  agrees(ascii_upper, |text: String| string_of_chars(raised_chars(text)))
 
 law "texts are equal ignoring ASCII case exactly where their upper cases are equal"
   forall (a: String, b: String) {
