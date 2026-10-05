@@ -1,0 +1,725 @@
+//! A set of `Int`s from zero up, packed sixty-two to a word of an `Array`.
+//!
+//! `std.set`'s operations under its names, beside the ones only packed bits have: `next_set`, `rank`,
+//! `select`, `complement`, `insert_range` and `remove_range`. The laws below hold each to what
+//! `std.set` answers for the same elements, and `of_set` and `to_set` cross between the two. A word
+//! holds the sixty-two bits an `Int` carries without a box, so a set whose greatest element is `n` is
+//! `n / 62 + 1` words, and `size`, the two-set operations and the range updates take their steps by
+//! the word, however many elements the words hold.
+//!
+//! The universe grows and shrinks with the set: a set is as many words as its greatest element needs
+//! and never one more, so equal sets are equal values to `==`, `digest` and a `Map`'s keys. `compare`
+//! orders them by their words, which is not the order of their element lists. An update whose answer
+//! is as long as the set it is given writes into that set's array when nothing else holds it, and
+//! allocates nothing. An insert past the last word, or a removal that empties it, copies the words
+//! into an array of the new length, so build a large set with `of_list` or `insert_range`, which
+//! size it once. Whatever writes carries `abort.raise`, as the array builtins it is written with do;
+//! only an element below zero, or one past the `2^26` words an array holds, raises.
+
+import std.laws (agrees, refines)
+import std.list
+import std.set
+import std.set (Set)
+
+/// A set of `Int`s from zero up. Build one with `empty`, `of_list`, `of_set` or `insert_range`: a
+/// record written out skips the form that makes equal sets equal values.
+pub type Bitset = new {
+  /// Sixty-two elements a word, the lowest in the first; the last word is never zero.
+  words: Array<Int>,
+}
+
+/// What a two-set operation makes of the two words that stand beside each other.
+type Op = | Or | And | AndNot | Xor
+
+fn made(op: Op, held: Int, beside: Int) -> Int =
+  match op {
+    Or -> held | beside,
+    And -> held & beside,
+    AndNot -> held & ~beside,
+    Xor -> held ^ beside,
+  }
+
+/// How many bits of a word are set.
+fn ones(w: Int) -> Int = {
+  let twos = w - (w >> 1 & 0x1555_5555_5555_5555);
+  let fours = (twos & 0x3333_3333_3333_3333) + (twos >> 2 & 0x3333_3333_3333_3333);
+  let eights = fours + (fours >> 4) & 0x0F0F_0F0F_0F0F_0F0F;
+  let sixteens = eights + (eights >> 8);
+  let halves = sixteens + (sixteens >> 16);
+  halves + (halves >> 32) & 0x7F
+}
+
+/// Where a nonzero word's lowest set bit is.
+fn lowest(w: Int) -> Int = ones((w & -w) - 1)
+
+/// Where a nonzero word's highest set bit is.
+fn highest(w: Int) -> Int = {
+  let two = w | w >> 1;
+  let four = two | two >> 2;
+  let eight = four | four >> 4;
+  let sixteen = eight | eight >> 8;
+  let half = sixteen | sixteen >> 16;
+  ones(half | half >> 32) - 1
+}
+
+/// The word whose `n` lowest bits are set, for an `n` up to a word's sixty-two.
+fn below(n: Int) -> Int = if n >= 62 { 0x3FFF_FFFF_FFFF_FFFF } else { (1 << n) - 1 }
+
+/// `w` without its `n` lowest set bits.
+fn dropped(w: Int, n: Int) -> Int = if n <= 0 { w } else { dropped(w & w - 1, n - 1) }
+
+/// The word at `i`, which past the end is zero.
+fn word(words: Array<Int>, i: Int) -> Int = match array_at(words, i) { Some(w) -> w, None -> 0 }
+
+fn below_zero<t>(x: Int) -> t / {abort.raise} =
+  panic("a bit set holds no element below zero, and this one is " ++ int_to_string(x))
+
+/// `into` with the words of `from` over its own from `i` on, as many as both hold.
+reuse fn copied(into: Array<Int>, from: Array<Int>, i: Int) -> Array<Int> / {abort.raise} =
+  if i >= array_len(into) { into } else {
+    match array_at(from, i) { Some(w) -> copied(array_set(into, i, w), from, i + 1), None -> into }
+  }
+
+/// How many of the first `n` words are left once the zero ones at their end go.
+fn used(words: Array<Int>, n: Int) -> Int =
+  if n <= 0 { 0 } else if word(words, n - 1) == 0 { used(words, n - 1) } else { n }
+
+/// The words without the zero ones at their end, which is the array itself when it has none.
+fn trimmed(words: Array<Int>) -> Array<Int> / {abort.raise} = {
+  let n = used(words, array_len(words));
+  if n == array_len(words) { words } else { copied(array_new(n, 0), words, 0) }
+}
+
+/// The set with nothing in it.
+pub fn empty() -> Bitset = { words: array_of_list([]) }
+
+/// Whether the set holds nothing.
+pub fn is_empty(s: Bitset) -> Bool = array_len(s.words) == 0
+
+/// How many elements the set holds.
+pub fn size(s: Bitset) -> Int = counted(s.words, array_len(s.words), 0, 0)
+
+fn counted(words: Array<Int>, end: Int, i: Int, n: Int) -> Int =
+  if i >= end { n } else { counted(words, end, i + 1, n + ones(word(words, i))) }
+
+/// Whether `x` is in the set, which nothing below zero is.
+pub fn contains(s: Bitset, x: Int) -> Bool = x >= 0 && word(s.words, x / 62) >> x % 62 & 1 == 1
+
+/// `s` with `x` in it; one already there is the set itself. Raises for an `x` below zero.
+pub reuse fn insert(s: Bitset, x: Int) -> Bitset / {abort.raise} =
+  if x < 0 { below_zero(x) } else {
+    let held = s.words;
+    let at = x / 62;
+    let bit = 1 << x % 62;
+    if at < array_len(held) {
+      let w = array_get(held, at);
+      if w & bit != 0 { { words: held } } else { { words: array_set(held, at, w | bit) } }
+    } else { { words: array_set(copied(array_new(at + 1, 0), held, 0), at, bit) } }
+  }
+
+/// `s` without `x`; removing one that is absent is the set itself.
+pub reuse fn remove(s: Bitset, x: Int) -> Bitset / {abort.raise} =
+  if !contains(s, x) { s } else {
+    let held = s.words;
+    let at = x / 62;
+    let w = array_get(held, at) & ~(1 << x % 62);
+    { words: trimmed(array_set(held, at, w)) }
+  }
+
+/// `s` with every element from `lo` up to but not `hi` in it. Raises for an `lo` below zero, unless
+/// the range is empty.
+pub fn insert_range(s: Bitset, lo: Int, hi: Int) -> Bitset / {abort.raise} =
+  if lo >= hi { s }
+  else if lo < 0 { below_zero(lo) } else {
+    let held = s.words;
+    let end = (hi - 1) / 62 + 1;
+    let room = if end <= array_len(held) { held } else { copied(array_new(end, 0), held, 0) };
+    { words: spanned(room, lo, hi, Or, lo / 62, end) }
+  }
+
+/// `s` without any element from `lo` up to but not `hi`.
+pub fn remove_range(s: Bitset, lo: Int, hi: Int) -> Bitset / {abort.raise} = {
+  let from = if lo < 0 { 0 } else { lo };
+  let most = array_len(s.words) * 62;
+  let to = if hi > most { most } else { hi };
+  if from >= to { s } else {
+    let held = s.words;
+    { words: trimmed(spanned(held, from, to, AndNot, from / 62, (to - 1) / 62 + 1)) }
+  }
+}
+
+/// `words` with, in each word from `i` up to `end`, `op` made of it and the bits of `lo` up to `hi`
+/// that the word holds.
+reuse fn spanned(
+  words: Array<Int>,
+  lo: Int,
+  hi: Int,
+  op: Op,
+  i: Int,
+  end: Int,
+) -> Array<Int> / {abort.raise} =
+  if i >= end { words } else {
+    let from = if lo > i * 62 { lo - i * 62 } else { 0 };
+    let to = if hi < (i + 1) * 62 { hi - i * 62 } else { 62 };
+    let held = array_get(words, i);
+    spanned(array_set(words, i, made(op, held, below(to) & ~below(from))), lo, hi, op, i + 1, end)
+  }
+
+/// The elements below `n` that `s` lacks: its complement in the universe of zero up to `n`.
+pub fn complement(s: Bitset, n: Int) -> Bitset / {abort.raise} =
+  difference(insert_range(empty(), 0, n), s)
+
+/// The elements, in order.
+pub fn elements(s: Bitset) -> List<Int> = fold(s, [], |acc: List<Int>, x: Int| push(acc, x))
+
+/// The set of the elements of `xs`. Raises for one below zero.
+pub fn of_list(xs: List<Int>) -> Bitset / {abort.raise} = {
+  let top = greatest(xs, 0, -1);
+  if top < 0 { empty() } else { { words: marked(array_new(top / 62 + 1, 0), xs, 0) } }
+}
+
+/// The greatest of `best` and the elements from `i` on. Raises for one below zero.
+fn greatest(xs: List<Int>, i: Int, best: Int) -> Int / {abort.raise} =
+  match list_at(xs, i) {
+    Some(x) -> if x < 0 { below_zero(x) }
+    else { greatest(xs, i + 1, if x > best { x } else { best }) },
+    None -> best,
+  }
+
+reuse fn marked(words: Array<Int>, xs: List<Int>, i: Int) -> Array<Int> / {abort.raise} =
+  match list_at(xs, i) {
+    Some(x) -> {
+      let w = array_get(words, x / 62);
+      marked(array_set(words, x / 62, w | 1 << x % 62), xs, i + 1)
+    },
+    None -> words,
+  }
+
+/// The bit set of a set's elements. Raises for one below zero.
+pub fn of_set(s: Set<Int>) -> Bitset / {abort.raise} = of_list(set::elements(s))
+
+/// The set of a bit set's elements.
+pub fn to_set(s: Bitset) -> Set<Int> = set::of_list(elements(s))
+
+/// The least element, or `None` of the empty set.
+pub fn min(s: Bitset) -> Option<Int> = first_from(s.words, 0)
+
+fn first_from(words: Array<Int>, i: Int) -> Option<Int> =
+  match array_at(words, i) {
+    Some(w) -> if w == 0 { first_from(words, i + 1) } else { Some(i * 62 + lowest(w)) },
+    None -> None,
+  }
+
+/// The greatest element, or `None` of the empty set.
+pub fn max(s: Bitset) -> Option<Int> = {
+  let last = array_len(s.words) - 1;
+  match array_at(s.words, last) { Some(w) -> Some(last * 62 + highest(w)), None -> None }
+}
+
+/// The least element that is `from` or greater, or `None` when there is none.
+pub fn next_set(s: Bitset, from: Int) -> Option<Int> = {
+  let start = if from < 0 { 0 } else { from };
+  let at = start / 62;
+  let rest = word(s.words, at) >> start % 62 << start % 62;
+  if rest != 0 { Some(at * 62 + lowest(rest)) } else { first_from(s.words, at + 1) }
+}
+
+/// How many elements are below `x`.
+pub fn rank(s: Bitset, x: Int) -> Int =
+  if x <= 0 { 0 } else {
+    let at = x / 62;
+    let end = if at < array_len(s.words) { at } else { array_len(s.words) };
+    counted(s.words, end, 0, ones(word(s.words, at) & below(x % 62)))
+  }
+
+/// The element with `n` elements below it, or `None` when the set holds no more than `n`.
+pub fn select(s: Bitset, n: Int) -> Option<Int> = if n < 0 { None } else { selected(s.words, 0, n) }
+
+fn selected(words: Array<Int>, i: Int, n: Int) -> Option<Int> =
+  match array_at(words, i) {
+    Some(w) -> if n < ones(w) { Some(i * 62 + lowest(dropped(w, n))) }
+    else { selected(words, i + 1, n - ones(w)) },
+    None -> None,
+  }
+
+/// `step` over the elements in order, each handed what the last one answered, from `init`.
+pub fn fold<t | e>(s: Bitset, init: t, step: (t, Int) -> t / e) -> t / e =
+  folded(s.words, 0, init, step)
+
+fn folded<t | e>(words: Array<Int>, i: Int, acc: t, step: (t, Int) -> t / e) -> t / e =
+  match array_at(words, i) {
+    Some(w) -> folded(words, i + 1, word_folded(w, ones(w), i * 62, acc, step), step),
+    None -> acc,
+  }
+
+/// `step` over the `left` elements a word still holds, the word's first being `base`.
+fn word_folded<t | e>(w: Int, left: Int, base: Int, acc: t, step: (t, Int) -> t / e) -> t / e =
+  if left <= 0 { acc }
+  else { word_folded(w & w - 1, left - 1, base, step(acc, base + lowest(w)), step) }
+
+/// The set of what `f` answers for each element, which is smaller than `s` where `f` answers two of
+/// them alike. Raises where `f` answers below zero.
+pub fn map<| e>(s: Bitset, f: (Int) -> Int / e) -> Bitset / {abort.raise | e} =
+  of_list(fold(s, [], |acc: List<Int>, x: Int| push(acc, f(x))))
+
+/// The elements `keep` answers true for.
+pub fn filter<| e>(s: Bitset, keep: (Int) -> Bool / e) -> Bitset / {abort.raise | e} =
+  fold(s, s, |acc: Bitset, x: Int| if keep(x) { acc } else { remove(acc, x) })
+
+/// The elements `ok` answers true for, and the rest; `ok` is asked once of each.
+pub fn partition<| e>(
+  s: Bitset,
+  ok: (Int) -> Bool / e,
+) -> { yes: Bitset, no: Bitset } / {abort.raise | e} =
+  fold(s, { yes: s, no: s }, |acc: { yes: Bitset, no: Bitset }, x: Int| {
+    let yes = acc.yes;
+    let no = acc.no;
+    if ok(x) { { yes: yes, no: remove(no, x) } } else { { yes: remove(yes, x), no: no } }
+  })
+
+/// Whether `ok` answers true for an element, asked in order until one does. The empty set is `false`.
+pub fn any<| e>(s: Bitset, ok: (Int) -> Bool / e) -> Bool / e =
+  fold(s, false, |found: Bool, x: Int| found || ok(x))
+
+/// Whether `ok` answers true for every element, asked in order until one does not. The empty set is
+/// `true`.
+pub fn all<| e>(s: Bitset, ok: (Int) -> Bool / e) -> Bool / e =
+  fold(s, true, |held: Bool, x: Int| held && ok(x))
+
+/// Whether every element of `xs` is in the set, which an empty `xs` is.
+pub fn contains_all(s: Bitset, xs: List<Int>) -> Bool = list::all(xs, |x: Int| contains(s, x))
+
+/// Whether no element of `xs` is in the set, which an empty `xs` is.
+pub fn contains_none(s: Bitset, xs: List<Int>) -> Bool = !list::any(xs, |x: Int| contains(s, x))
+
+/// Everything in either set.
+pub fn union(a: Bitset, b: Bitset) -> Bitset / {abort.raise} = {
+  let x = a.words;
+  let y = b.words;
+  if array_len(x) >= array_len(y) { { words: applied(x, y, Or) } }
+  else { { words: applied(y, x, Or) } }
+}
+
+/// Everything in any of the sets.
+pub fn unions(sets: List<Bitset>) -> Bitset / {abort.raise} = unions_from(empty(), sets, 0)
+
+fn unions_from(acc: Bitset, sets: List<Bitset>, i: Int) -> Bitset / {abort.raise} =
+  match list_at(sets, i) { Some(s) -> unions_from(union(acc, s), sets, i + 1), None -> acc }
+
+/// The elements in both sets.
+pub fn intersection(a: Bitset, b: Bitset) -> Bitset / {abort.raise} = {
+  let x = a.words;
+  let y = b.words;
+  if array_len(x) <= array_len(y) { { words: applied(x, y, And) } }
+  else { { words: applied(y, x, And) } }
+}
+
+/// The elements of `a` that are not in `b`.
+pub fn difference(a: Bitset, b: Bitset) -> Bitset / {abort.raise} = {
+  let x = a.words;
+  let y = b.words;
+  { words: applied(x, y, AndNot) }
+}
+
+/// The elements in exactly one of the two sets.
+pub fn symmetric_difference(a: Bitset, b: Bitset) -> Bitset / {abort.raise} = {
+  let x = a.words;
+  let y = b.words;
+  if array_len(x) >= array_len(y) { { words: applied(x, y, Xor) } }
+  else { { words: applied(y, x, Xor) } }
+}
+
+/// The words `op` makes of `x`'s and the words of `y` beside them, in `x`'s own array where the
+/// answer is as long as `x`. None is made past `x`'s end, so `x` is the longer where `op` keeps what
+/// only one side holds.
+fn applied(x: Array<Int>, y: Array<Int>, op: Op) -> Array<Int> / {abort.raise} = {
+  let n = extent(x, y, op, array_len(x));
+  if n == array_len(x) { combined(x, y, op, 0) }
+  else { combined(copied(array_new(n, 0), x, 0), y, op, 0) }
+}
+
+/// How many of the first `n` words `op` makes are left once the zero ones at their end go.
+fn extent(x: Array<Int>, y: Array<Int>, op: Op, n: Int) -> Int =
+  if n <= 0 { 0 }
+  else if made(op, word(x, n - 1), word(y, n - 1)) == 0 { extent(x, y, op, n - 1) }
+  else { n }
+
+/// `into` with, from `i` on, each word `op` makes of it and the word of `other` beside it.
+reuse fn combined(
+  into: Array<Int>,
+  other: Array<Int>,
+  op: Op,
+  i: Int,
+) -> Array<Int> / {abort.raise} =
+  if i >= array_len(into) { into } else {
+    let held = array_get(into, i);
+    let next = made(op, held, word(other, i));
+    if next == held { combined(into, other, op, i + 1) }
+    else { combined(array_set(into, i, next), other, op, i + 1) }
+  }
+
+/// Whether every element of `a` is in `b`. The empty set is a subset of everything.
+pub fn is_subset(a: Bitset, b: Bitset) -> Bool = nothing(a.words, b.words, AndNot, 0)
+
+/// Whether every element of `b` is in `a`.
+pub fn is_superset(a: Bitset, b: Bitset) -> Bool = is_subset(b, a)
+
+/// Whether the two sets share no element, which the empty set does with every set.
+pub fn is_disjoint(a: Bitset, b: Bitset) -> Bool = nothing(a.words, b.words, And, 0)
+
+/// Whether `op` makes a zero of every word of `x` from `i` on and the word of `y` beside it.
+fn nothing(x: Array<Int>, y: Array<Int>, op: Op, i: Int) -> Bool =
+  match array_at(x, i) {
+    Some(w) -> made(op, w, word(y, i)) == 0 && nothing(x, y, op, i + 1),
+    None -> true,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+/// `n` words with every bit set.
+fn dense(n: Int) -> Bitset / {abort.raise} = insert_range(empty(), 0, n * 62)
+
+/// `n` words with one bit set in each.
+fn thin(n: Int) -> Bitset / {abort.raise} =
+  of_list(list::flat_map(range(0, n), |i: Int| [i * 62 + 7]))
+
+test "a word's bits are counted, and its lowest and highest found, at every place" {
+  assert_eq(ones(0), 0);
+  assert_eq(ones(below(62)), 62);
+  assert_eq(ones(0x2AAA_AAAA_AAAA_AAAA), 31);
+  assert_eq(dropped(13, 2), 8);
+  assert(
+    list::all(range(0, 62), |k: Int|
+      ones(1 << k) == 1 && lowest(1 << k) == k && highest(1 << k) == k && ones(below(k)) == k
+        && lowest(1 << k | 1 << 61) == k
+        && highest(1 << k | 1) == k),
+  )
+}
+
+test "a bit set holds each element once, and lists them in order" {
+  let s = of_list([200, 3, 61, 62, 3]);
+  assert_eq(elements(s), [3, 61, 62, 200]);
+  assert_eq(size(s), 4);
+  assert(!is_empty(s));
+  assert(is_empty(empty()));
+  assert(contains(s, 61));
+  assert(contains(s, 62));
+  assert(!contains(s, 63));
+  assert(!contains(s, -1));
+  assert(!contains(s, 100000));
+  assert_eq(to_set(s), #[3, 61, 62, 200]);
+  assert_eq(of_set(#[200, 3, 61, 62]), s);
+  assert_eq(elements(empty()), [])
+}
+
+test "equal sets are equal values, however they came to be" {
+  let grown = insert(insert(insert(empty(), 500), 7), 70);
+  let shrunk = remove(remove(of_list([7, 70, 500, 900, 9000]), 9000), 900);
+  assert_eq(grown, shrunk);
+  assert_eq(digest(grown), digest(shrunk));
+  assert_eq(map_get(#{grown: 1}, shrunk), Some(1));
+  assert_eq(remove(remove(of_list([5, 700]), 700), 5), empty());
+  assert_eq(intersection(of_list([1, 700]), of_list([1, 900])), of_list([1]));
+  assert_eq(intersection(of_list([700]), of_list([900])), empty());
+  assert_eq(difference(of_list([1, 700]), of_list([700])), of_list([1]));
+  assert_eq(symmetric_difference(of_list([1, 700]), of_list([2, 700])), of_list([1, 2]));
+  assert_eq(remove_range(of_list([1, 700]), 2, 5000), of_list([1]));
+  assert_eq(filter(of_list([1, 700]), |x: Int| x < 9), of_list([1]));
+  assert_eq(complement(of_list([0, 1, 2, 700]), 3), empty())
+}
+
+test "an element below zero is refused where it would go in, and is absent everywhere else" {
+  let refused = |x: Int|
+    Err("a bit set holds no element below zero, and this one is " ++ int_to_string(x));
+  assert_eq(try[abort.raise] { insert(of_list([3]), -1) }, refused(-1));
+  assert_eq(try[abort.raise] { of_list([3, -2]) }, refused(-2));
+  assert_eq(try[abort.raise] { insert_range(empty(), -3, 4) }, refused(-3));
+  assert_eq(try[abort.raise] { map(of_list([1]), |x: Int| x - 5) }, refused(-4));
+  assert_eq(remove(of_list([3]), -1), of_list([3]));
+  assert_eq(insert_range(of_list([3]), -5, -9), of_list([3]));
+  assert_eq(remove_range(of_list([3]), -5, 2), of_list([3]));
+  assert_eq(next_set(of_list([3]), -5), Some(3));
+  assert_eq(rank(of_list([3]), -5), 0);
+  assert_eq(select(of_list([3]), -1), None)
+}
+
+test "a range goes in and comes out across words" {
+  assert_eq(elements(insert_range(empty(), 60, 65)), [60, 61, 62, 63, 64]);
+  assert_eq(
+    insert_range(of_list([0, 300]), 60, 126),
+    of_list(list::concat([0, 300], range(60, 126))),
+  );
+  assert_eq(insert_range(of_list([5]), 9, 9), of_list([5]));
+  assert_eq(size(insert_range(empty(), 0, 1000)), 1000);
+  assert_eq(
+    remove_range(insert_range(empty(), 0, 1000), 10, 990),
+    of_list(list::concat(range(0, 10), range(990, 1000))),
+  );
+  assert_eq(remove_range(insert_range(empty(), 0, 1000), 10, 5000), of_list(range(0, 10)));
+  assert_eq(remove_range(of_list([5]), 9, 9), of_list([5]));
+  assert_eq(complement(of_list([1, 3, 500]), 5), of_list([0, 2, 4]));
+  assert_eq(complement(empty(), 0), empty());
+  assert_eq(complement(insert_range(empty(), 0, 200), 200), empty());
+  assert_eq(size(complement(of_list([61, 62, 124]), 186)), 183)
+}
+
+test "min, max and next_set find elements, and rank and select count them" {
+  let s = of_list([3, 61, 62, 200]);
+  assert_eq([min(s), max(s), min(empty()), max(empty())], [Some(3), Some(200), None, None]);
+  assert_eq([min(of_list([124])), max(of_list([124]))], [Some(124), Some(124)]);
+  let places = [0, 3, 4, 62, 63, 200, 201, 100000];
+  let next = list::flat_map(places, |from: Int| [next_set(s, from)]);
+  assert_eq(next, [Some(3), Some(3), Some(61), Some(62), Some(200), Some(200), None, None]);
+  let ranks = list::flat_map(places, |x: Int| [rank(s, x)]);
+  assert_eq(ranks, [0, 0, 1, 2, 3, 3, 4, 4]);
+  let nth = list::flat_map(range(0, 5), |n: Int| [select(s, n)]);
+  assert_eq(nth, [Some(3), Some(61), Some(62), Some(200), None])
+}
+
+test "map may shrink the set, filter keeps what it is told to and partition splits it" {
+  let s = of_list([1, 2, 3, 4, 70]);
+  assert_eq(map(s, |x: Int| x * 100), of_list([100, 200, 300, 400, 7000]));
+  assert_eq(map(s, |x: Int| x % 2), of_list([0, 1]));
+  assert_eq(filter(s, |x: Int| x > 3), of_list([4, 70]));
+  assert_eq(filter(s, |x: Int| x > 99), empty());
+  assert_eq(partition(s, |x: Int| x % 2 == 0), { yes: of_list([2, 4, 70]), no: of_list([1, 3]) });
+  assert_eq(partition(s, |x: Int| x < 99), { yes: s, no: empty() })
+}
+
+test "a fold walks in order, its step may perform, and any and all stop asking once settled" {
+  let s = of_list([200, 3, 62]);
+  assert_eq(fold(s, [], |acc: List<Int>, x: Int| push(acc, x)), [3, 62, 200]);
+  assert(any(s, |x: Int| x == 62));
+  assert(!any(s, |x: Int| x > 200));
+  assert(all(s, |x: Int| x > 0));
+  assert(!all(s, |x: Int| x < 200));
+  assert(!any(empty(), |_: Int| true));
+  assert(all(empty(), |_: Int| false));
+  let asked = with_cell[asked](0) { c -> {
+    let found = any(s, |x: Int| {
+      cell_set(c, cell_get(c) + 1);
+      x == 62
+    });
+    let held = all(s, |x: Int| {
+      cell_set(c, cell_get(c) + 1);
+      x < 3
+    });
+    { found: found, held: held, asked: cell_get(c) }
+  } };
+  assert_eq(asked, { found: true, held: false, asked: 3 })
+}
+
+test "the two-set operations answer what is shared and what is not" {
+  let a = of_list([1, 2, 300]);
+  let b = of_list([300, 4]);
+  assert_eq(union(a, b), of_list([1, 2, 4, 300]));
+  assert_eq(union(b, a), of_list([1, 2, 4, 300]));
+  assert_eq(unions([of_list([1]), of_list([300, 4]), empty(), of_list([1, 2])]), union(a, b));
+  assert_eq(unions([]), empty());
+  assert_eq(intersection(a, b), of_list([300]));
+  assert_eq(intersection(a, empty()), empty());
+  assert_eq(difference(a, b), of_list([1, 2]));
+  assert_eq(difference(b, a), of_list([4]));
+  assert_eq(difference(a, a), empty());
+  assert_eq(symmetric_difference(a, b), of_list([1, 2, 4]));
+  assert_eq(symmetric_difference(a, a), empty());
+  assert(is_subset(of_list([1, 300]), a));
+  assert(is_subset(empty(), a));
+  assert(!is_subset(b, a));
+  assert(!is_subset(of_list([1, 900]), a));
+  assert(is_superset(a, of_list([1])));
+  assert(!is_superset(a, b));
+  assert(is_disjoint(of_list([1, 2]), of_list([3, 900])));
+  assert(is_disjoint(a, empty()));
+  assert(!is_disjoint(a, b));
+  assert(contains_all(a, [1, 300]));
+  assert(contains_all(a, []));
+  assert(!contains_all(a, [1, 9]));
+  assert(contains_none(a, [8, 9, -1]));
+  assert(!contains_none(a, [8, 300]))
+}
+
+test "an update of a set nothing else holds allocates nothing" {
+  let built = metered(|| size(dense(50)) + size(thin(50))).allocations;
+  assert_eq(metered(|| size(union(dense(50), thin(50)))).allocations, built);
+  assert_eq(metered(|| size(union(thin(50), dense(50)))).allocations, built);
+  assert_eq(metered(|| size(intersection(dense(50), thin(50)))).allocations, built);
+  assert_eq(metered(|| size(difference(dense(50), thin(50)))).allocations, built);
+  assert_eq(metered(|| size(symmetric_difference(dense(50), thin(50)))).allocations, built);
+  let one = metered(|| size(thin(50))).allocations;
+  assert_eq(metered(|| size(insert(thin(50), 8))).allocations, one);
+  assert_eq(metered(|| size(remove(thin(50), 7))).allocations, one);
+  assert_eq(metered(|| size(insert_range(thin(50), 100, 900))).allocations, one);
+  assert_eq(metered(|| size(remove_range(thin(50), 100, 900))).allocations, one)
+}
+
+test "size and the two-set operations take their steps by the word, not the element" {
+  let full = dense(40);
+  let sparse = thin(40);
+  let steps = metered(|| size(sparse)).steps;
+  assert_eq(metered(|| size(full)).steps, steps);
+  assert(steps < 200);
+  assert_eq(metered(|| union(full, sparse)).steps, metered(|| union(sparse, sparse)).steps);
+  assert_eq(
+    metered(|| intersection(full, full)).steps,
+    metered(|| intersection(sparse, sparse)).steps,
+  );
+  let other = insert_range(empty(), 62 * 39, 62 * 39 + 5);
+  assert_eq(
+    metered(|| difference(full, sparse)).steps,
+    metered(|| difference(sparse, other)).steps,
+  );
+  assert_eq(metered(|| is_subset(sparse, full)).steps, metered(|| is_subset(full, full)).steps)
+}
+
+/// Which of 0, 61, 62 and 130 a set holds: both ends of a word, the start of the next and a word
+/// past it, in a type a claim can list.
+type Pick = { first: Bool, edge: Bool, next: Bool, far: Bool }
+
+type Two = { a: Pick, b: Pick }
+
+type Spot = | First | Edge | Next | Far
+
+fn spot(at: Spot) -> Int = match at { First -> 0, Edge -> 61, Next -> 62, Far -> 130 }
+
+fn listed(p: Pick) -> List<Int> = {
+  let first = if p.first { [0] } else { [] };
+  let edge = if p.edge { push(first, 61) } else { first };
+  let next = if p.next { push(edge, 62) } else { edge };
+  if p.far { push(next, 130) } else { next }
+}
+
+fn bits(p: Pick) -> Bitset / {abort.raise} = of_list(listed(p))
+
+fn model(p: Pick) -> Set<Int> = set::of_list(listed(p))
+
+fn pick_of(s: Bitset) -> Pick =
+  { first: contains(s, 0), edge: contains(s, 61), next: contains(s, 62), far: contains(s, 130) }
+
+/// What `op` makes of the bit sets two picks stand for.
+fn packed(op: (Bitset, Bitset) -> Bitset / {abort.raise}) -> (Two) -> Bitset / {abort.raise} =
+  |t: Two| op(bits(t.a), bits(t.b))
+
+/// The bit set of what `op` makes of the sets two picks stand for.
+fn modelled(op: (Set<Int>, Set<Int>) -> Set<Int>) -> (Two) -> Bitset / {abort.raise} =
+  |t: Two| of_set(op(model(t.a), model(t.b)))
+
+/// `s` after `op` with each element from `i` on, one at a time.
+fn one_by_one(
+  s: Bitset,
+  xs: List<Int>,
+  i: Int,
+  op: (Bitset, Int) -> Bitset / {abort.raise},
+) -> Bitset / {abort.raise} =
+  match list_at(xs, i) { Some(x) -> one_by_one(op(s, x), xs, i + 1, op), None -> s }
+
+/// Each element kept to ten bits, which spreads a drawn list over seventeen words.
+fn spread(xs: List<Int>) -> List<Int> = list::flat_map(xs, |x: Int| [x & 1023])
+
+law "a bit set lists the elements its set holds" = agrees(|p: Pick| to_set(bits(p)), model)
+
+law "insert does to a bit set what it does to a set" =
+  refines(model, |p: Pick, at: Spot| pick_of(insert(bits(p), spot(at))), |s: Set<Int>, at: Spot|
+    set::insert(s, spot(at)))
+
+law "remove does to a bit set what it does to a set" =
+  refines(model, |p: Pick, at: Spot| pick_of(remove(bits(p), spot(at))), |s: Set<Int>, at: Spot|
+    set::remove(s, spot(at)))
+
+law "inserting a set's elements one at a time is the union with it" =
+  agrees(|t: Two| one_by_one(bits(t.a), listed(t.b), 0, insert), modelled(set::union))
+
+law "removing a set's elements one at a time is the difference from it" =
+  agrees(|t: Two| one_by_one(bits(t.a), listed(t.b), 0, remove), modelled(set::difference))
+
+law "a union is the bit set of the sets' union" = agrees(packed(union), modelled(set::union))
+
+law "an intersection is the bit set of the sets' intersection" =
+  agrees(packed(intersection), modelled(set::intersection))
+
+law "a difference is the bit set of the sets' difference" =
+  agrees(packed(difference), modelled(set::difference))
+
+law "a symmetric difference is the bit set of the sets' symmetric difference" =
+  agrees(packed(symmetric_difference), modelled(set::symmetric_difference))
+
+law "a subset of bits is a subset of sets" =
+  agrees(|t: Two| is_subset(bits(t.a), bits(t.b)), |t: Two| set::is_subset(model(t.a), model(t.b)))
+
+law "disjoint bit sets are disjoint sets" =
+  agrees(|t: Two| is_disjoint(bits(t.a), bits(t.b)), |t: Two|
+    set::is_disjoint(model(t.a), model(t.b)))
+
+law "size, min and max are the set's" =
+  agrees(
+    |p: Pick| { size: size(bits(p)), least: min(bits(p)), greatest: max(bits(p)) },
+    |p: Pick|
+      { size: set::size(model(p)), least: set::min(model(p)), greatest: set::max(model(p)) },
+  )
+
+law "a complement is the universe without the set" =
+  agrees(|p: Pick| complement(bits(p), 131), |p: Pick|
+    of_set(set::difference(set::of_list(range(0, 131)), model(p))))
+
+law "what a union lacks is what both sets lack" =
+  agrees(
+    packed(|a: Bitset, b: Bitset| complement(union(a, b), 131)),
+    packed(|a: Bitset, b: Bitset| intersection(complement(a, 131), complement(b, 131))),
+  )
+
+law "what an intersection lacks is what either set lacks" =
+  agrees(
+    packed(|a: Bitset, b: Bitset| complement(intersection(a, b), 131)),
+    packed(|a: Bitset, b: Bitset| union(complement(a, 131), complement(b, 131))),
+  )
+
+law "rank counts the elements below, and select finds the one that many up"
+  forall (p: Pick, at: Spot) {
+    rank(bits(p), spot(at)) == set::size(set::filter(model(p), |x: Int| x < spot(at)))
+      && (!contains(bits(p), spot(at))
+      || select(bits(p), rank(bits(p), spot(at))) == Some(spot(at)))
+  }
+
+law "next_set is the least element at or past where it starts"
+  forall (p: Pick, at: Spot) {
+    next_set(bits(p), spot(at)) == set::min(set::filter(model(p), |x: Int| x >= spot(at)))
+      && next_set(bits(p), spot(at) + 1) == set::min(set::filter(model(p), |x: Int| x > spot(at)))
+  }
+
+law "a bit set of many words holds what the list's set holds" =
+  agrees(|xs: List<Int>| to_set(of_list(spread(xs))), |xs: List<Int>| set::of_list(spread(xs)))
+
+law "the two-set operations answer as sets do over many words"
+  forall (xs: List<Int>, ys: List<Int>) {
+    let a = of_list(spread(xs));
+    let b = of_list(spread(ys));
+    let x = set::of_list(spread(xs));
+    let y = set::of_list(spread(ys));
+    union(a, b) == of_set(set::union(x, y)) && intersection(a, b) == of_set(set::intersection(x, y))
+      && difference(a, b) == of_set(set::difference(x, y))
+      && symmetric_difference(a, b) == of_set(set::symmetric_difference(x, y))
+      && is_subset(a, b) == set::is_subset(x, y)
+      && is_disjoint(a, b) == set::is_disjoint(x, y)
+  }
+
+law "size takes its steps by the word" forall (n: Int) where n > 0 cost n { size(dense(n)) }
+
+law "a union takes its steps by the word"
+  forall (n: Int) where n > 0 cost n {
+    union(dense(n), thin(n))
+  }
+
+law "an intersection takes its steps by the word"
+  forall (n: Int) where n > 0 cost n {
+    intersection(dense(n), thin(n))
+  }
+
+law "a difference takes its steps by the word"
+  forall (n: Int) where n > 0 cost n {
+    difference(dense(n), thin(n))
+  }
+
+law "a complement takes its steps by the word"
+  forall (n: Int) where n > 0 cost n {
+    complement(dense(n), 124 * n)
+  }
