@@ -1,0 +1,626 @@
+//! Caches a program manages, as values: a bound kept by evicting the least recently used entry,
+//! and entries that expire.
+//!
+//! A `Cache` is a persistent value. Every operation answers the cache that results and leaves the
+//! one it was given as it was, so the answer is what a caller keeps: `get` answers the value and
+//! the cache whose order of use the read changed, and a caller that drops that cache reads the
+//! same values from the old one, in the order of use it had before the read. No operation reads a
+//! clock. One that asks about time takes the reading as an `Instant`.
+//!
+//! The bound is a total weight. `put` weighs every entry one, which makes the bound a count, and
+//! `insert` takes a weight of at least one. An entry that lifts the total past the capacity
+//! evicts the least recently used entries, the oldest first, until the rest fit, and one heavier
+//! than the whole capacity is not kept. A use is a `put`, an `insert` or a `get` that answers a
+//! value; `peek` and `contains` read without using.
+//!
+//! An entry may carry a deadline: its cache's lifetime from the reading it was put at, or the
+//! lifetime `insert` is given. From its deadline on it is never answered. It is dropped when a
+//! `get` asks for it, when `sweep` runs or when eviction reaches it, and until then it counts
+//! toward the bound: nothing drops the entry nearest its deadline first.
+//!
+//! `get`, `put`, `insert` and `remove` each read and write a fixed number of map entries, and a
+//! fixed number more for each entry evicted, so each is logarithmic in the entries held. Two
+//! caches of one capacity and lifetime that hold the same entries in the same order of use are
+//! equal, whatever each was put through: none carries a stamp or a counter.
+
+import std.laws (agrees, refines)
+import std.math (ilog2)
+import std.time (after, millis, nanos, nanos_at, seconds)
+
+/// One entry, as `held` lists it and `of_held` takes it.
+pub type Held<k, v> = {
+  key: k,
+  value: v,
+  /// What the entry counts toward its cache's capacity, at least one.
+  weight: Int,
+  /// The reading from which the entry is no longer answered; `None` for one that never expires.
+  expires: Option<Instant>,
+}
+
+/// How `insert` holds an entry: what it weighs, and how long it lives, which `None` leaves
+/// unbounded.
+pub type Terms = { weight: Int, lifetime: Option<Duration> }
+
+/// An entry among the others: the keys used just before it and just after.
+type Entry<k, v> = {
+  value: v,
+  weight: Int,
+  expires: Option<Instant>,
+  older: Option<k>,
+  newer: Option<k>,
+}
+
+/// A cache of at most `capacity` weight. `lru`, `expiring` and `of_held` make one.
+pub type Cache<k, v> = new {
+  capacity: Int,
+  /// How long an entry `put` lives; forever where `None`.
+  lifetime: Option<Duration>,
+  entries: Map<k, Entry<k, v>>,
+  /// The least recently used key, which eviction takes first.
+  oldest: Option<k>,
+  newest: Option<k>,
+  /// What the entries weigh together.
+  weight: Int,
+}
+
+/// What a read answers: the value, and the cache after the read.
+pub type Read<k, v> = { value: Option<v>, cache: Cache<k, v> }
+
+/// What a write answers: the cache after it, and the entries it pushed out, the first evicted
+/// first.
+pub type Placed<k, v> = { cache: Cache<k, v>, evicted: List<Held<k, v>> }
+
+/// An empty cache of at most `capacity` entries, none of which expires. One of no capacity holds
+/// nothing.
+pub fn lru<k, v>(capacity: Int) -> Cache<k, v>
+  where derivable(ord, k)
+= empty(capacity, None)
+
+/// An empty cache of at most `capacity` entries, each living `lifetime` from the reading it is
+/// put at.
+pub fn expiring<k, v>(capacity: Int, lifetime: Duration) -> Cache<k, v>
+  where derivable(ord, k)
+= empty(capacity, Some(lifetime))
+
+/// The cache these entries make, the least recently used first, each with the weight and the
+/// deadline it is listed with, so `of_held(capacity(c), lifetime(c), held(c))` is `c`. Entries
+/// past the capacity are evicted as they would be put.
+pub fn of_held<k, v>(
+  capacity: Int,
+  lifetime: Option<Duration>,
+  held: List<Held<k, v>>,
+) -> Cache<k, v> / {abort.raise}
+  where derivable(ord, k)
+= fold(held, empty(capacity, lifetime), |c: Cache<k, v>, h: Held<k, v>| placed(c, h).cache)
+
+fn empty<k, v>(capacity: Int, lifetime: Option<Duration>) -> Cache<k, v>
+  where derivable(ord, k)
+=
+  {
+    capacity: capacity,
+    lifetime: lifetime,
+    entries: map_new(),
+    oldest: None,
+    newest: None,
+    weight: 0,
+  }
+
+/// The total weight the cache holds at most.
+pub fn capacity<k, v>(c: Cache<k, v>) -> Int = c.capacity
+
+/// How long an entry `put` lives.
+pub fn lifetime<k, v>(c: Cache<k, v>) -> Option<Duration> = c.lifetime
+
+/// What the entries weigh together, never more than the capacity.
+pub fn weight<k, v>(c: Cache<k, v>) -> Int = c.weight
+
+/// How many entries the cache holds, those past their deadline and not yet dropped among them.
+pub fn size<k, v>(c: Cache<k, v>) -> Int
+  where derivable(ord, k)
+= map_len(c.entries)
+
+// --- Reading ----------------------------------------------------------------
+
+/// The value under `key` at the reading `now`, and the cache after the read. A value answered
+/// makes its entry the most recently used; an entry at or past its deadline answers `None` and
+/// is dropped; a key the cache does not hold answers `None` and the cache as it was.
+pub fn get<k, v>(c: Cache<k, v>, key: k, now: Instant) -> Read<k, v>
+  where derivable(ord, k)
+=
+  match map_get(c.entries, key) {
+    None -> { value: None, cache: c },
+    Some(e) -> if is_expired(e.expires, now) { { value: None, cache: unlinked(c, key, e) } } else {
+      {
+        value: Some(e.value),
+        cache: match e.newer { None -> c, Some(_) -> linked(unlinked(c, key, e), key, e) },
+      }
+    },
+  }
+
+/// The value under `key` at the reading `now`, with the order of use left as it was and nothing
+/// dropped.
+pub fn peek<k, v>(c: Cache<k, v>, key: k, now: Instant) -> Option<v>
+  where derivable(ord, k)
+=
+  match map_get(c.entries, key) {
+    Some(e) if !is_expired(e.expires, now) -> Some(e.value),
+    _ -> None,
+  }
+
+/// Whether `get` would answer a value for `key` at the reading `now`.
+pub fn contains<k, v>(c: Cache<k, v>, key: k, now: Instant) -> Bool
+  where derivable(ord, k)
+= match peek(c, key, now) { Some(_) -> true, None -> false }
+
+/// Every entry, the least recently used first, which is the order eviction takes them in.
+pub fn held<k, v>(c: Cache<k, v>) -> List<Held<k, v>>
+  where derivable(ord, k)
+=
+  fold(
+    range(0, map_len(c.entries)),
+    { at: c.oldest, listed: [] },
+    |s: { at: Option<k>, listed: List<Held<k, v>> }, _: Int|
+      match s.at {
+        None -> s,
+        Some(key) -> match map_get(c.entries, key) {
+          None -> { at: None, listed: s.listed },
+          Some(e) -> { at: e.newer, listed: push(s.listed, listing(key, e)) },
+        },
+      },
+  ).listed
+
+/// The keys, the least recently used first.
+pub fn keys<k, v>(c: Cache<k, v>) -> List<k>
+  where derivable(ord, k)
+= map(held(c), |h: Held<k, v>| h.key)
+
+fn listing<k, v>(key: k, e: Entry<k, v>) -> Held<k, v> =
+  { key: key, value: e.value, weight: e.weight, expires: e.expires }
+
+fn is_expired(expires: Option<Instant>, now: Instant) -> Bool =
+  match expires { None -> false, Some(deadline) -> nanos_at(now) >= nanos_at(deadline) }
+
+// --- Writing ----------------------------------------------------------------
+
+/// `c` with `value` under `key` as its most recently used entry, weighing one and living the
+/// cache's lifetime from `now`; what was under `key` is replaced, and the least recently used
+/// entries are evicted until the rest fit.
+pub fn put<k, v>(c: Cache<k, v>, key: k, value: v, now: Instant) -> Cache<k, v> / {abort.raise}
+  where derivable(ord, k)
+= insert(c, key, value, { weight: 1, lifetime: c.lifetime }, now).cache
+
+/// `put` on terms of the caller's, answering what it evicted as well. A weight below one is one.
+/// An entry heavier than the whole capacity is not kept: the cache answers without `key`, and
+/// the entry is the one evicted.
+pub fn insert<k, v>(
+  c: Cache<k, v>,
+  key: k,
+  value: v,
+  terms: Terms,
+  now: Instant,
+) -> Placed<k, v> / {abort.raise}
+  where derivable(ord, k)
+=
+  placed(c, {
+    key: key,
+    value: value,
+    weight: terms.weight,
+    expires: match terms.lifetime { None -> None, Some(span) -> Some(after(now, span)) },
+  })
+
+/// `c` without `key`; one it does not hold leaves it as it was.
+pub fn remove<k, v>(c: Cache<k, v>, key: k) -> Cache<k, v>
+  where derivable(ord, k)
+= match map_get(c.entries, key) { None -> c, Some(e) -> unlinked(c, key, e) }
+
+/// `c` without the entries at or past their deadline at the reading `now`. It reads every entry.
+pub fn sweep<k, v>(c: Cache<k, v>, now: Instant) -> Cache<k, v>
+  where derivable(ord, k)
+=
+  fold(held(c), c, |kept: Cache<k, v>, h: Held<k, v>|
+    if is_expired(h.expires, now) { remove(kept, h.key) } else { kept })
+
+/// `c` with no entries, its capacity and lifetime kept.
+pub fn clear<k, v>(c: Cache<k, v>) -> Cache<k, v>
+  where derivable(ord, k)
+= empty(c.capacity, c.lifetime)
+
+fn placed<k, v>(c: Cache<k, v>, h: Held<k, v>) -> Placed<k, v> / {abort.raise}
+  where derivable(ord, k)
+= {
+  let weighed = { ..h, weight: max(h.weight, 1) };
+  let without = remove(c, h.key);
+  if weighed.weight > c.capacity { { cache: without, evicted: [weighed] } } else {
+    fitted(
+      linked(without, h.key, {
+        value: h.value,
+        weight: weighed.weight,
+        expires: h.expires,
+        older: None,
+        newer: None,
+      }),
+    )
+  }
+}
+
+/// `c` with its least recently used entries evicted until the rest weigh no more than it holds.
+fn fitted<k, v>(c: Cache<k, v>) -> Placed<k, v> / {abort.raise}
+  where derivable(ord, k)
+=
+  iterate({ cache: c, evicted: [] }, map_len(c.entries) + 1, |s: Placed<k, v>|
+    if s.cache.weight <= s.cache.capacity { Stop(s) } else {
+      match s.cache.oldest {
+        None -> Stop(s),
+        Some(key) -> match map_get(s.cache.entries, key) {
+          None -> Stop(s),
+          Some(e) ->
+            Continue({
+              cache: unlinked(s.cache, key, e),
+              evicted: push(s.evicted, listing(key, e)),
+            }),
+        },
+      }
+    })
+
+/// `c` without the entry `e` it holds under `key`, its neighbours joined to each other.
+fn unlinked<k, v>(c: Cache<k, v>, key: k, e: Entry<k, v>) -> Cache<k, v>
+  where derivable(ord, k)
+= {
+  let apart = map_remove(c.entries, key);
+  let behind = match e.older {
+    None -> apart,
+    Some(older) -> map_update(apart, older, |o: Entry<k, v>| { ..o, newer: e.newer }),
+  };
+  {
+    ..c,
+    entries: match e.newer {
+      None -> behind,
+      Some(newer) -> map_update(behind, newer, |n: Entry<k, v>| { ..n, older: e.older }),
+    },
+    oldest: match e.older { None -> e.newer, Some(_) -> c.oldest },
+    newest: match e.newer { None -> e.older, Some(_) -> c.newest },
+    weight: c.weight - e.weight,
+  }
+}
+
+/// `c`, which does not hold `key`, with `e` under it as the most recently used entry.
+fn linked<k, v>(c: Cache<k, v>, key: k, e: Entry<k, v>) -> Cache<k, v>
+  where derivable(ord, k)
+=
+  {
+    ..c,
+    entries: map_insert(
+      match c.newest {
+        None -> c.entries,
+        Some(newest) -> map_update(c.entries, newest, |n: Entry<k, v>| { ..n, newer: Some(key) }),
+      },
+      key,
+      { ..e, older: c.newest, newer: None },
+    ),
+    oldest: match c.oldest { None -> Some(key), Some(_) -> c.oldest },
+    newest: Some(key),
+    weight: c.weight + e.weight,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn at(ms: Int) -> Instant = Instant(ms * 1000000)
+
+fn filled(capacity: Int, keys: List<String>) -> Cache<String, Int> / {abort.raise} =
+  fold(keys, lru(capacity), |c: Cache<String, Int>, key: String|
+    put(c, key, string_len(key), at(0)))
+
+test "a full cache evicts the entry used longest ago, and a read is a use" {
+  let c = filled(2, ["a", "bb"]);
+  assert_eq(keys(c), ["a", "bb"]);
+  assert_eq(keys(put(c, "ccc", 3, at(0))), ["bb", "ccc"]);
+  let read = get(c, "a", at(0));
+  assert_eq(read.value, Some(1));
+  assert_eq(keys(read.cache), ["bb", "a"]);
+  assert_eq(keys(put(read.cache, "ccc", 3, at(0))), ["a", "ccc"]);
+  let written = put(c, "a", 10, at(0));
+  assert_eq(keys(written), ["bb", "a"]);
+  assert_eq(peek(written, "a", at(0)), Some(10));
+  assert_eq(size(written), 2)
+}
+
+test "a cache dropped after a read still answers, in the order of use it had" {
+  let c = filled(2, ["a", "bb"]);
+  assert_eq(get(c, "a", at(0)).value, Some(1));
+  assert_eq(get(c, "a", at(0)).value, Some(1));
+  assert_eq(keys(c), ["a", "bb"]);
+  assert_eq(keys(put(c, "ccc", 3, at(0))), ["bb", "ccc"])
+}
+
+test "a miss, a peek and a read of the newest entry leave the cache as it was" {
+  let c = filled(3, ["a", "bb", "ccc"]);
+  assert_eq(get(c, "zz", at(0)), { value: None, cache: c });
+  assert_eq(get(c, "ccc", at(0)), { value: Some(3), cache: c });
+  assert_eq(peek(c, "a", at(0)), Some(1));
+  assert(contains(c, "a", at(0)));
+  assert(!contains(c, "zz", at(0)));
+  assert_eq(remove(c, "zz"), c);
+  assert_eq(keys(remove(c, "bb")), ["a", "ccc"]);
+  assert_eq(keys(remove(remove(c, "a"), "ccc")), ["bb"]);
+  assert_eq(clear(c), lru(3))
+}
+
+test "caches holding the same entries in the same order are equal, however each came to" {
+  let one = get(filled(3, ["a", "bb"]), "a", at(0)).cache;
+  let other = remove(put(filled(3, ["zz", "bb"]), "a", 1, at(5)), "zz");
+  assert_eq(keys(one), ["bb", "a"]);
+  assert_eq(one, other);
+  assert_eq(of_held(3, None, held(one)), one);
+  assert(one != filled(3, ["a", "bb"]));
+  assert(one != get(filled(4, ["a", "bb"]), "a", at(0)).cache)
+}
+
+test "a bound by weight evicts as many of the oldest as the newest needs" {
+  let weighing = |c: Cache<String, Int>, key: String, weight: Int|
+    insert(c, key, weight, { weight: weight, lifetime: None }, at(0));
+  let c = weighing(weighing(weighing(lru(10), "a", 4).cache, "b", 3).cache, "c", 3).cache;
+  assert_eq(weight(c), 10);
+  let pushed = weighing(c, "d", 5);
+  assert_eq(map(pushed.evicted, |h: Held<String, Int>| h.key), ["a", "b"]);
+  assert_eq(keys(pushed.cache), ["c", "d"]);
+  assert_eq(weight(pushed.cache), 8);
+  let refused = weighing(c, "b", 11);
+  assert_eq(refused.evicted, [{ key: "b", value: 11, weight: 11, expires: None }]);
+  assert_eq(keys(refused.cache), ["a", "c"]);
+  assert_eq(weight(weighing(lru(10), "light", 0).cache), 1);
+  let nothing: Cache<String, Int> = lru(0);
+  assert_eq(size(put(nothing, "a", 1, at(0))), 0)
+}
+
+test "an entry is answered until its deadline and never from it on" {
+  let c = put(expiring(4, seconds(60)), "a", 1, at(1000));
+  assert_eq(lifetime(c), Some(seconds(60)));
+  assert_eq(held(c), [{ key: "a", value: 1, weight: 1, expires: Some(at(61000)) }]);
+  assert_eq(get(c, "a", at(60999)).value, Some(1));
+  assert_eq(peek(c, "a", at(61000)), None);
+  assert(!contains(c, "a", at(61000)));
+  let late = get(c, "a", at(61000));
+  assert_eq(late.value, None);
+  assert_eq(size(late.cache), 0);
+  assert_eq(size(c), 1);
+  assert_eq(get(put(c, "a", 2, at(61000)), "a", at(120000)).value, Some(2))
+}
+
+test "a lifetime of an entry's own, and a sweep of the ones past theirs" {
+  let brief = { weight: 1, lifetime: Some(millis(10)) };
+  let lasting = { weight: 1, lifetime: None };
+  let c = insert(
+    insert(put(expiring(4, seconds(1)), "a", 1, at(0)), "b", 2, brief, at(0)).cache,
+    "c",
+    3,
+    lasting,
+    at(0),
+  ).cache;
+  assert_eq(keys(c), ["a", "b", "c"]);
+  assert_eq(keys(sweep(c, at(9))), ["a", "b", "c"]);
+  assert_eq(keys(sweep(c, at(10))), ["a", "c"]);
+  assert_eq(held(sweep(c, at(1000))), [{ key: "c", value: 3, weight: 1, expires: None }]);
+  let full = put(put(c, "d", 4, at(20)), "e", 5, at(20));
+  assert_eq(keys(full), ["b", "c", "d", "e"]);
+  assert_eq(get(full, "b", at(20)).value, None)
+}
+
+effect directory {
+  read name_of(id: Int) -> String
+}
+
+fn greeting(id: Int) -> String / {directory.name_of} = "hello " ++ directory.name_of(id)
+
+test "a handler that keeps a cache in its cell answers a question asked again from it" {
+  let none: Cache<Int, String> = lru(2);
+  with_cell[memo]({ cache: none, looked_up: [] }) { state -> {
+    let said = handle {
+      map([1, 2, 1, 3, 2], greeting)
+    } with {
+      directory.name_of(id) -> {
+        let s = cell_get(state);
+        let read = get(s.cache, id, at(0));
+        match read.value {
+          Some(name) -> {
+            cell_set(state, { ..s, cache: read.cache });
+            name
+          },
+          None -> {
+            let name = "user " ++ int_to_string(id);
+            cell_set(state, {
+              cache: put(read.cache, id, name, at(0)),
+              looked_up: push(s.looked_up, id),
+            });
+            name
+          },
+        }
+      },
+    };
+    assert_eq(said, [
+      "hello user 1",
+      "hello user 2",
+      "hello user 1",
+      "hello user 3",
+      "hello user 2",
+    ]);
+    assert_eq(cell_get(state).looked_up, [1, 2, 3, 2]);
+    assert_eq(keys(cell_get(state).cache), [3, 2])
+  } }
+}
+
+test "a write into a full cache takes the same steps whatever the cache holds" {
+  let full = |n: Int| fold(range(0, n), lru(n), |c: Cache<Int, Int>, i: Int| put(c, i, i, at(0)));
+  let small = full(8);
+  let large = full(2048);
+  let into_small = metered(|| put(small, -1, 0, at(0)));
+  let into_large = metered(|| put(large, -1, 0, at(0)));
+  assert_eq(size(into_large.value), 2048);
+  assert_eq(into_large.steps, into_small.steps);
+  assert_eq(metered(|| get(large, 0, at(0))).steps, metered(|| get(small, 0, at(0))).steps)
+}
+
+law "filling, reading and overflowing a cache grows as its entries' number times its logarithm"
+  forall (n: Int) where n > 1 cost n * ilog2(n) {
+    let full = fold(range(0, n), lru(n), |c: Cache<Int, Int>, i: Int| put(c, i, i, at(0)));
+    let read = fold(range(0, n), full, |c: Cache<Int, Int>, i: Int|
+      get(c, i * 7919 % n, at(0)).cache);
+    fold(range(0, n), read, |c: Cache<Int, Int>, i: Int| put(c, n + i, i, at(0)))
+  }
+
+/// One operation of a script a law runs a cache through. Keys, weights, lifetimes and waits are
+/// any integers, read down to a few so that scripts collide, overflow and expire.
+type Act = | Put(Int, Int) | Insert(Int, Int, Int, Int) | Get(Int) | Remove(Int) | Wait(Int) | Sweep
+
+/// A cache of weight three the scripts run against, and its model: the entries as a list in
+/// order of use, the clock in milliseconds, and what each `Get` answered.
+type Model = { now: Int, held: List<Held<Int, Int>>, answers: List<Option<Int>> }
+
+type Ran = { cache: Cache<Int, Int>, now: Int, answers: List<Option<Int>> }
+
+fn a_key(n: Int) -> Int = n & 3
+
+fn a_weight(n: Int) -> Int = (n & 3) + 1
+
+fn a_lifetime(n: Int) -> Option<Int> = if n & 7 == 0 { None } else { Some(n & 7) }
+
+fn span_of(ms: Option<Int>) -> Option<Duration> =
+  match ms { None -> None, Some(n) -> Some(millis(n)) }
+
+fn ran(lifetime: Option<Int>, script: List<Act>) -> Ran / {abort.raise} =
+  fold(
+    script,
+    { cache: of_held(3, span_of(lifetime), []), now: 0, answers: [] },
+    |r: Ran, a: Act|
+      match a {
+        Put(key, value) -> { ..r, cache: put(r.cache, a_key(key), value, at(r.now)) },
+        Insert(key, value, weight, life) ->
+          {
+            ..r,
+            cache: insert(
+              r.cache,
+              a_key(key),
+              value,
+              { weight: a_weight(weight), lifetime: span_of(a_lifetime(life)) },
+              at(r.now),
+            ).cache,
+          },
+        Get(key) -> {
+          let read = get(r.cache, a_key(key), at(r.now));
+          { ..r, cache: read.cache, answers: push(r.answers, read.value) }
+        },
+        Remove(key) -> { ..r, cache: remove(r.cache, a_key(key)) },
+        Wait(ms) -> { ..r, now: r.now + (ms & 3) },
+        Sweep -> { ..r, cache: sweep(r.cache, at(r.now)) },
+      },
+  )
+
+fn viewed(lifetime: Option<Int>, script: List<Act>) -> Model / {abort.raise} = {
+  let r = ran(lifetime, script);
+  { now: r.now, held: held(r.cache), answers: r.answers }
+}
+
+fn deadline(now: Int, lifetime: Option<Int>) -> Option<Instant> =
+  match lifetime { None -> None, Some(ms) -> Some(at(now + ms)) }
+
+fn past(h: Held<Int, Int>, now: Int) -> Bool =
+  match h.expires { None -> false, Some(Instant(nanoseconds)) -> now * 1000000 >= nanoseconds }
+
+fn without(held: List<Held<Int, Int>>, key: Int) -> List<Held<Int, Int>> =
+  filter(held, |h: Held<Int, Int>| h.key != key)
+
+fn heft(held: List<Held<Int, Int>>) -> Int =
+  fold(held, 0, |total: Int, h: Held<Int, Int>| total + h.weight)
+
+fn trimmed(held: List<Held<Int, Int>>) -> List<Held<Int, Int>> =
+  match held { [_, ..rest] if heft(held) > 3 -> trimmed(rest), _ -> held }
+
+fn model_placed(held: List<Held<Int, Int>>, h: Held<Int, Int>) -> List<Held<Int, Int>> =
+  if h.weight > 3 { without(held, h.key) } else { trimmed(push(without(held, h.key), h)) }
+
+fn modelled(lifetime: Option<Int>, m: Model, a: Act) -> Model =
+  match a {
+    Put(key, value) ->
+      {
+        ..m,
+        held: model_placed(m.held, {
+          key: a_key(key),
+          value: value,
+          weight: 1,
+          expires: deadline(m.now, lifetime),
+        }),
+      },
+    Insert(key, value, weight, life) ->
+      {
+        ..m,
+        held: model_placed(m.held, {
+          key: a_key(key),
+          value: value,
+          weight: a_weight(weight),
+          expires: deadline(m.now, a_lifetime(life)),
+        }),
+      },
+    Get(key) -> match filter(m.held, |h: Held<Int, Int>| h.key == a_key(key)) {
+      [h, ..] -> if past(h, m.now) {
+        { ..m, held: without(m.held, h.key), answers: push(m.answers, None) }
+      } else {
+        { ..m, held: push(without(m.held, h.key), h), answers: push(m.answers, Some(h.value)) }
+      },
+      [] -> { ..m, answers: push(m.answers, None) },
+    },
+    Remove(key) -> { ..m, held: without(m.held, a_key(key)) },
+    Wait(ms) -> { ..m, now: m.now + (ms & 3) },
+    Sweep -> { ..m, held: filter(m.held, |h: Held<Int, Int>| !past(h, m.now)) },
+  }
+
+fn model_ran(lifetime: Option<Int>, script: List<Act>) -> Model =
+  fold(script, { now: 0, held: [], answers: [] }, |m: Model, a: Act| modelled(lifetime, m, a))
+
+law "an operation does to a cache what it does to a list kept in order of use" =
+  refines(
+    |script: List<Act>| viewed(None, script),
+    |script: List<Act>, a: Act| push(script, a),
+    |m: Model, a: Act| modelled(None, m, a),
+  )
+
+law "a cache run through a script holds and answers what such a list does" =
+  agrees(|script: List<Act>| viewed(None, script), |script: List<Act>| model_ran(None, script))
+
+law "a cache whose entries live two milliseconds holds and answers what such a list does" =
+  agrees(|script: List<Act>| viewed(Some(2), script), |script: List<Act>|
+    model_ran(Some(2), script))
+
+law "what a cache holds weighs no more than its capacity, each entry at least one"
+  forall (script: List<Act>, lived: Int) {
+    let c = ran(a_lifetime(lived), script).cache;
+    weight(c) <= capacity(c) && size(c) <= weight(c) && weight(c) == heft(held(c))
+      && len(held(c)) == size(c)
+  }
+
+law "a value put is the value a get answers"
+  forall (script: List<Act>, lived: Int, key: Int, value: Int) {
+    let r = ran(a_lifetime(lived), script);
+    let read = get(put(r.cache, key, value, at(r.now)), key, at(r.now));
+    read.value == Some(value) && keys(read.cache) == keys(put(r.cache, key, value, at(r.now)))
+  }
+
+law "an entry is never answered from its deadline on"
+  forall (script: List<Act>, lived: Int, later: Int) {
+    let c = ran(a_lifetime(lived), script).cache;
+    fold(held(c), true, |ok: Bool, h: Held<Int, Int>|
+      ok
+        && (match h.expires {
+          None -> true,
+          Some(due) -> {
+            let now = after(due, nanos(later & 0xFFFF));
+            get(c, h.key, now).value == None && peek(c, h.key, now) == None
+              && !contains(c, h.key, now)
+              && size(sweep(c, now)) < size(c)
+          },
+        }))
+  }
+
+law "a cache rebuilt from what it holds is the cache"
+  forall (script: List<Act>, lived: Int) {
+    let c = ran(a_lifetime(lived), script).cache;
+    of_held(capacity(c), lifetime(c), held(c)) == c
+  }
