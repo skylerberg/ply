@@ -17,7 +17,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
               constraint_written, SpecKind, SRequires, SEnsures, SCost, SpecClause, ReturnsFresh,
               ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub, TDNominal, test_listing,
-              test_run, case_params, schema_of)
+              test_run, case_params, schema_of, IInstance, InstanceDef, InstanceKind, NKey, NShow,
+              instance_text)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
@@ -121,6 +122,8 @@ type ModuleItems = {
   types: Map<Bytes, Int>,
   effects: Map<Bytes, Int>,
   ctors: Map<Bytes, Int>,
+  // What the module states of each type it names: a type's hash covers these.
+  instances: Map<Bytes, List<InstanceDef>>,
 }
 type ScopeIndex = {
   values: Map<Bytes, Target>,
@@ -318,6 +321,7 @@ pub fn build_index(
           types: walked.types.map,
           effects: walked.effects.map,
           ctors: walked.ctors.map,
+          instances: instances_in(module.module.items),
         }),
       }
     },
@@ -350,6 +354,20 @@ pub fn build_index(
   };
   { index: { ..index, effect_sketches: sketch_effects(index) }, diags: built.diags }
 }
+
+/// Each type's `key` before its `show`, whatever order the module wrote them in.
+fn instances_in(items: List<Item>) -> Map<Bytes, List<InstanceDef>> =
+  fold(items, map_new(), |acc: Map<Bytes, List<InstanceDef>>, item: Item|
+    match item {
+      IInstance(d) -> {
+        let held = match map_get(acc, d.target.name) { Some(xs) -> xs, None -> [] };
+        map_insert(acc, d.target.name, match d.kind {
+          NKey -> concat([d], held),
+          NShow -> push(held, d),
+        })
+      },
+      _ -> acc,
+    })
 
 fn sketch_effects(index: Index) -> Map<Int, Bytes> / {abort.raise} =
   fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int| {
@@ -655,6 +673,9 @@ fn tag_cases() -> Int = 105
 // A type that binds, and one applied to, labels or rows beside its types.
 fn tag_type_over() -> Int = 120
 fn tag_ty_con_over() -> Int = 121
+/// The function a type's values are compared through, and the one they are shown through.
+fn tag_key() -> Int = 140
+fn tag_show() -> Int = 141
 
 /// An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -980,7 +1001,7 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
     row_params: concat(headed.row_params, map(g.effects, |ident: Ident| ident.name)),
     label_params: concat(headed.label_params, map(g.labels, |ident: Ident| ident.name)),
   };
-  match d.body {
+  let declared: Encoder = match d.body {
     TDAlias(t) -> type_expr(put_tag(counted, tag_type_alias()), t),
     TDSum(variants) ->
       fold(
@@ -994,6 +1015,18 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
           ),
       ),
     TDNominal(t) -> type_expr(put_text(put_tag(counted, tag_type_nominal()), d.name.name), t),
+  };
+  // What a value of the type compares and shows through is part of what the type is: each function
+  // is a reference, so the type's hash moves when the function it names does.
+  match map_get(at(declared.index.items, declared.module).instances, d.name.name) {
+    None -> declared,
+    Some(stated) ->
+      fold(stated, declared, |acc: Encoder, x: InstanceDef|
+        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), NShow -> tag_show() }), {
+          module: None,
+          name: x.by,
+          span: x.by.span,
+        })),
   }
 }
 
@@ -4635,18 +4668,50 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
       }
     });
     { decoder: vs.decoder, text: bytes_concat_all(vs.texts) }
+  } else if k.value == tag_type_nominal() {
+    let fields = print_type(printer, read_text(k.decoder).decoder);
+    { decoder: fields.decoder, text: bytes_concat(b"new ", fields.text) }
   } else { panic("a tag that does not begin a type body") };
+  let stated = instances_of(printer, body.decoder, name);
   {
-    decoder: body.decoder,
+    decoder: stated.decoder,
     text: bytes_concat_all([
       b"type ",
       name,
       generic_list(n.value, ec.value, lc.value),
       b" = ",
       body.text,
+      stated.text,
     ]),
   }
 }
+
+/// What follows a type's body: the `key` and the `show` its module states of it, a line each. Each
+/// one read is at least a byte, which bounds the rounds.
+fn instances_of(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.raise} =
+  iterate({ decoder: d, text: b"" }, bytes_len(d.bytes) - d.pos + 1, |acc: Decoded| {
+    let kind = if peek(acc.decoder) == tag_key() { Some(NKey) }
+    else if peek(acc.decoder) == tag_show() { Some(NShow) }
+    else { None };
+    match kind {
+      None -> Stop(acc),
+      Some(k) -> {
+        let by = read_value(printer, skip(acc.decoder));
+        Continue({
+          decoder: by.decoder,
+          text: bytes_concat_all([
+            acc.text,
+            b"\n",
+            instance_text(k),
+            b" for ",
+            name,
+            b" by ",
+            by.text,
+          ]),
+        })
+      },
+    }
+  })
 
 fn print_effect(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
   // The encoding carries the name the declaring program wrote; this printing uses the one it was
@@ -5952,6 +6017,23 @@ test "a `new` record is its name and its fields, and no alias of those fields" {
   assert_eq(map_get(vendored, b"a.Date"), map_get(vendored, b"b.Date"))
 }
 
+test "a `new` record prints back as one and hashes back to what it was stored under" {
+  let out = hash_index(
+    indexed([
+      {
+        name: b"m",
+        src: b"pub type Date<a> = new { day: Int, of: a }\npub fn mk() -> Date<Int> = { day: 1, of: 2 }",
+      },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b" = new {"));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
 test "an alias is transparent, so its name is no part of it" {
   let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
   // `conv_type` expands an alias in place, so these two declare one type and use it alike.
@@ -6025,4 +6107,61 @@ test "a call that leaves an argument to a default naming what its module keeps h
     dumped_hash(hash_dump([{ name: b"m", src: left }]), b"m.caller"),
     dumped_hash(hash_dump([{ name: b"m", src: written }]), b"m.caller"),
   )
+}
+
+test "a type's hash covers the key and the show it states, and what hold it move with them" {
+  let stating = |stated: Bytes, body: Bytes|
+    by_name(
+      named_hashes(
+        hash_index(
+          indexed([
+            {
+              name: b"m",
+              src: bytes_concat_all([
+                b"pub type Box = | Box(Int, Int)\n",
+                stated,
+                b"fn area(b: Box) -> Int = match b { Box(w, h) -> ",
+                body,
+                b" }\nfn edge(b: Box) -> Int = match b { Box(w, h) -> w + h }\n",
+                b"fn text(b: Box) -> String = \"box\"\n",
+                b"pub fn make() -> Box = Box(1, 2)\nfn same<a>(x: a, y: a) -> Bool = x == y\n",
+              ]),
+            },
+          ]),
+        ),
+      ),
+    );
+  let plain = stating(b"", b"w * h");
+  let keyed = stating(b"key for Box by area\n", b"w * h");
+  let edited = stating(b"key for Box by area\n", b"h * w");
+  let other = stating(b"key for Box by edge\n", b"w * h");
+  let shown = stating(b"show for Box by text\n", b"w * h");
+  let named = |m: Map<Bytes, Bytes>, n: Bytes| map_get(m, n);
+  // Stating a key, naming another function, and editing the function all move the type.
+  assert(named(plain, b"m.Box") != named(keyed, b"m.Box"));
+  assert(named(keyed, b"m.Box") != named(edited, b"m.Box"));
+  assert(named(keyed, b"m.Box") != named(other, b"m.Box"));
+  assert(named(plain, b"m.Box") != named(shown, b"m.Box"));
+  assert(named(keyed, b"m.Box") != named(shown, b"m.Box"));
+  // What can hold a `Box` follows its type, and what cannot does not.
+  assert(named(keyed, b"m.make") != named(edited, b"m.make"));
+  assert(named(plain, b"m.make") != named(keyed, b"m.make"));
+  assert_eq(named(plain, b"m.same"), named(edited, b"m.same"))
+}
+
+test "a key and a show print back after their type and hash back to what they were stored under" {
+  let out = hash_index(
+    indexed([
+      {
+        name: b"m",
+        src: b"pub type Box<a> = | Box(a, Int)\nkey for Box by count\nshow for Box by text\nfn count<a>(b: Box<a>) -> Int = match b { Box(_, n) -> n }\nfn text<a>(b: Box<a>) -> String = \"box\"\npub fn make() -> Box<Int> = Box(1, 2)",
+      },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b"\nkey for Box by count\nshow for Box by text"));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }

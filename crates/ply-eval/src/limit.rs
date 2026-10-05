@@ -18,6 +18,14 @@ pub fn grow<R>(f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)
 }
 
+/// The lowest address of the stack this frame is on, as [`grow`] knows it: this thread's own, or
+/// the segment a growth moved to. `None` where the platform does not say.
+pub fn stack_base() -> Option<usize> {
+    let here = 0u8;
+    let at = std::ptr::from_ref(&here) as usize;
+    stacker::remaining_stack().map(|left| at.saturating_sub(left))
+}
+
 pub(crate) fn err_value_depth(span: Span, max: usize) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,

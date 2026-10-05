@@ -191,6 +191,10 @@ pub type Offered = { name: Bytes, arity: Int, constant: Bool }
 
 pub type Ctor = { name: Bytes, arity: Int }
 
+/// A constructor whose type's module states what its values are compared and shown through, and the
+/// function of each.
+pub type Stated = { ctor: Bytes, key: Option<Bytes>, show: Option<Bytes> }
+
 /// What the fixpoint dropped and why: the emitter refused it, or it calls `missing`, which the unit
 /// does not take.
 pub type Dropped = { function: Bytes, construct: Bytes, missing: Option<Bytes> }
@@ -623,7 +627,14 @@ fn exports_text(
   dropped: List<Dropped>,
   p: Pools,
   buckets: List<BucketRow>,
-) -> Bytes / {abort.raise} =
+  stated: List<Stated>,
+) -> Bytes / {abort.raise} = {
+  let held = fold(taken, map_new(), |acc: Map<Bytes, Bool>, t: Taken|
+    map_insert(acc, t.name, true));
+  // `-` where the type states none, and `!` for a function the unit does not take, which a value
+  // read through it there is refused by.
+  let written = |f: Option<Bytes>|
+    match f { None -> b"-", Some(name) -> if map_contains(held, name) { name } else { b"!" } };
   bytes_concat_all([
     lines(
       b"helpers",
@@ -660,7 +671,16 @@ fn exports_text(
             push(push(acc, b" "), ascii_of_int(n))),
         )),
     ),
+    // Only a unit one of whose types states either says so, so any other reads as it always did.
+    if len(stated) == 0 { b"" } else {
+      lines(
+        b"instances",
+        map(stated, |x: Stated|
+          bytes_concat_all([x.ctor, b" ", written(x.key), b" ", written(x.show)])),
+      )
+    },
   ])
+}
 
 fn octal(b: Int) -> Bytes =
   bytes_concat_all([b"\\", ascii_of_int(b / 64), ascii_of_int(b / 8 % 8), ascii_of_int(b % 8)])
@@ -812,6 +832,7 @@ pub fn produce(
   offered: List<Offered>,
   modules: Int,
   answers: Map<Bytes, Answer>,
+  stated: List<Stated> = [],
 ) -> Produced / {abort.raise} = {
   let arity = fold(offered, map_new(), |acc: Map<Bytes, Offered>, o: Offered|
     map_insert(acc, o.name, o));
@@ -891,6 +912,7 @@ pub fn produce(
     s.dropped,
     pools,
     rows,
+    stated,
   );
   {
     text: assembled(
@@ -1369,6 +1391,11 @@ pub fn emitted<| e>(
         len(p.modules),
         map_fold(answered, kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
           map_insert(acc, n, a)),
+        fold(dump.emitter_ctors, [], |acc: List<Stated>, c: EmitterCtor|
+          match ((c.key, c.show)) {
+            (None, None) -> acc,
+            _ -> push(acc, { ctor: c.name, key: c.key, show: c.show }),
+          }),
       ),
       kept: map_len(kept),
       asked: len(missed),
@@ -1950,4 +1977,61 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
       != None,
     None,
   )
+}
+
+test "a unit says which constructors are read through a function, and which function it lacks" {
+  let p = produce(
+    { head: b"/* head */\n", tail: b"/* tail */\n", helpers: [], builtins: [], identity: b"r" },
+    [{ name: b"m.Box", arity: 2 }, { name: b"m.Dot", arity: 0 }],
+    [
+      { name: b"m.area", arity: 1, constant: false },
+      { name: b"m.make", arity: 0, constant: false },
+    ],
+    1,
+    map_of_entries([
+      { key: b"m.area", value: one_body(b"m.area", [b"m.area"]) },
+      { key: b"m.make", value: one_body(b"m.make", [b"m.area"]) },
+    ]),
+    [{ ctor: b"m.Box", key: Some(b"m.area"), show: Some(b"m.text") }],
+  );
+  assert_eq(p.taken, [b"m.area", b"m.make"]);
+  assert(bytes_index_of(p.text, b"\"instances 1\\n\"\n\"m.Box m.area !\\n\"") != None, None);
+  // A body that names the constructor is not taken without the key its type states.
+  let alone = produce(
+    { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" },
+    [{ name: b"m.Box", arity: 2 }],
+    [{ name: b"m.make", arity: 0, constant: false }],
+    1,
+    map_of_entries([{ key: b"m.make", value: one_body(b"m.make", [b"m.area"]) }]),
+    [{ ctor: b"m.Box", key: Some(b"m.area"), show: None }],
+  );
+  assert_eq(alone.taken, []);
+  assert_eq(map(alone.dropped, |d: Dropped| d.missing), [Some(b"m.area")]);
+  // A unit none of whose types states one says nothing of it.
+  let plain = produce(
+    { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" },
+    [],
+    [{ name: b"m.f", arity: 0, constant: false }],
+    1,
+    map_of_entries([{ key: b"m.f", value: one_body(b"m.f", []) }]),
+  );
+  assert(bytes_index_of(plain.text, b"instances") == None, None)
+}
+
+test "a root's code moves with the key a type it names states" {
+  let program = |key: Answer, calls: List<Bytes>|
+    codes_over(
+      [
+        { key: b"m.make", value: one_body(b"m.make", calls) },
+        { key: b"m.area", value: key },
+        { key: b"m.edge", value: one_body(b"m.edge", []) },
+      ],
+      [b"m.make", b"m.area", b"m.edge"],
+      [],
+    );
+  let keyed = program(one_body(b"m.area", []), [b"m.area"]);
+  let edited = program(edited_body(b"m.area"), [b"m.area"]);
+  let other = program(one_body(b"m.area", []), [b"m.edge"]);
+  assert(map_get(keyed, b"m.make") != map_get(edited, b"m.make"), None);
+  assert(map_get(keyed, b"m.make") != map_get(other, b"m.make"), None)
 }
