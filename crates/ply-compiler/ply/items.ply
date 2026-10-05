@@ -22,8 +22,8 @@ import type_syntax (TypeExpr, TRecord, TUnit, TCon, TFn, RowExpr, AtomExpr, Mode
                     dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span, no_expr,
-              fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, hidden_binder,
-              case_at, case_identity, case_body, listing)
+              fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, gen_binder,
+              hidden_binder, case_at, case_identity, case_body, listing)
 import patterns (LStr)
 
 // --- The tree ---------------------------------------------------------------
@@ -218,12 +218,25 @@ pub type DeriveDef = { deriver: Deriver, deriver_span: Span, target: Ident, span
 pub type Derived = { deriver: Deriver, target: Bytes, span: Span }
 
 /// What a nominal type's own module says its values go through: `key for Deque by to_list` for
-/// `==`, `compare`, `digest` and a `Map`'s order, `show for Date by render` for `show`.
-pub type InstanceKind = | NKey | NShow
+/// `==`, `compare`, `digest` and a `Map`'s order, `show for Date by render` for `show`, and
+/// `gen for Uuid by arbitrary` for what a sampled claim draws.
+pub type InstanceKind = | NKey | NShow | NGen
 
 pub type InstanceDef = { kind: InstanceKind, target: Ident, by: Ident, span: Span }
 
-pub fn instance_text(kind: InstanceKind) -> Bytes = match kind { NKey -> b"key", NShow -> b"show" }
+pub fn instance_text(kind: InstanceKind) -> Bytes =
+  match kind { NKey -> b"key", NShow -> b"show", NGen -> b"gen" }
+
+/// The definition a `gen for T by f` is beside its statement: `f`'s generator sampled at a seed,
+/// which is what a prover enters to draw a `T`. Led by `_`, so nothing reports it unused.
+pub fn sampler_name(target: Bytes) -> Bytes = bytes_concat(b"_sample_", target)
+
+/// The sampler a module's item states, by its simple name.
+pub fn sampler_of(item: Item) -> Option<Bytes> =
+  match item {
+    IInstance(d) -> match d.kind { NGen -> Some(sampler_name(d.target.name)), _ -> None },
+    _ -> None,
+  }
 
 /// One function a `numeric` names, and the operation it names it for.
 pub type NumericOp = { op: Ident, by: Ident }
@@ -483,7 +496,8 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
 /// `key` and `show` are contextual: one opens an item only before `for`, so `fn key(..)` and a field
 /// named `show` keep their meaning.
 pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
-  (at_ident_text(input, parser, b"key") || at_ident_text(input, parser, b"show"))
+  (at_ident_text(input, parser, b"key") || at_ident_text(input, parser, b"show")
+    || at_ident_text(input, parser, b"gen"))
     && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
 
 /// `numeric` is contextual as `key` is: a constraint `numeric(a)` and a definition of that name
@@ -1870,14 +1884,16 @@ pub fn derive_def(
   }
 }
 
-// --- `key` and `show` -----------------------------------------------------
+// --- `key`, `show` and `gen` ------------------------------------------------
 
-/// One `key for T by f` or `show for T by f`.
+/// One `key for T by f`, `show for T by f` or `gen for T by f`.
 pub fn instance_def(
   input: Input,
   parser: Parser,
 ) -> Result<Parsed<InstanceDef>, Parser> / {abort.raise} = {
-  let kind = if at_ident_text(input, parser, b"key") { NKey } else { NShow };
+  let kind = if at_ident_text(input, parser, b"key") { NKey }
+  else if at_ident_text(input, parser, b"show") { NShow }
+  else { NGen };
   let st = advance(input, parser);
   let f = advance(input, st.parser);
   let { parser, node: target } = expect_ident(input, f.parser, b"the type, after `for`")?;
@@ -2145,7 +2161,7 @@ pub fn item_at(
   } else if at_instance_start(input, parser) {
     let d = instance_def(
       input,
-      no_pub(parser, unexpected(), pub_span, b"a `key` or a `show` cannot be `pub`", [
+      no_pub(parser, unexpected(), pub_span, b"a `key`, a `show` or a `gen` cannot be `pub`", [
         b"it is part of what its type is, and reaches wherever the type does",
       ]),
     )?;
@@ -2163,7 +2179,7 @@ pub fn item_at(
       error_here(
         input,
         parser,
-        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `derive`, `key`, or `show`",
+        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `derive`, `key`, `show`, or `gen`",
       ),
     )
   }
@@ -2235,9 +2251,13 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
     None -> shown,
     Some(sp) -> push(shown, hidden_import(b"cases", cases_binder(), sp)),
   };
+  let drawn = match first_gen(done.items) {
+    None -> ranged,
+    Some(sp) -> push(ranged, hidden_import(b"gen", gen_binder(), sp)),
+  };
   {
     parser: done.parser,
-    node: { doc: module_doc(input), imports: ranged, items: published(done.items) },
+    node: { doc: module_doc(input), imports: drawn, items: published(done.items) },
   }
 }
 
@@ -2283,6 +2303,17 @@ fn published(items: List<Item>) -> List<Item> =
         _ -> item,
       })
   }
+
+/// Where the module first states a `gen`: its sampler calls `std.gen`.
+fn first_gen(items: List<Item>) -> Option<Span> =
+  fold(items, None, |acc: Option<Span>, item: Item|
+    match acc {
+      Some(_) -> acc,
+      None -> match item {
+        IInstance(d) -> match d.kind { NGen -> Some(d.span), _ -> None },
+        _ -> None,
+      },
+    })
 
 /// Where the module's first test over cases says `for`: listing and choosing a case call `std.cases`.
 fn first_cases(items: List<Item>) -> Option<Span> =
@@ -2385,15 +2416,27 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
           if after != label && ident(after, b"for") { Some(span_at(after)) } else { None }
         },
       });
+    // A `gen for T by f` is five tokens, and the span of the statement is its import's.
+    let drawn = fold(range(0, n), None, |acc: Option<Span>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> if ident(i, b"gen") && ident(i + 1, b"for") {
+          Some({ start: span_at(i).start, end: span_at(i + 4).end })
+        } else { None },
+      });
     let with_shown = match shown {
       None -> leading.node,
       Some(sp) -> push(leading.node, hidden_import(b"show", shown_binder(), sp)),
     };
+    let with_cased = match cased {
+      None -> with_shown,
+      Some(sp) -> push(with_shown, hidden_import(b"cases", cases_binder(), sp)),
+    };
     Some({
       doc: module_doc(input),
-      imports: match cased {
-        None -> with_shown,
-        Some(sp) -> push(with_shown, hidden_import(b"cases", cases_binder(), sp)),
+      imports: match drawn {
+        None -> with_cased,
+        Some(sp) -> push(with_cased, hidden_import(b"gen", gen_binder(), sp)),
       },
       items: [],
     })
@@ -3298,6 +3341,35 @@ test "a header holds the imports a whole parse finds, the hidden ones among them
   assert(same(b"test \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }\n"), None);
   assert(same(b"test/nondet \"each\" for n: Int in [1] { assert(n > 0) }\n"), None);
   assert(same(b"test \"plain\" { assert(true) }\nfn for_each() -> Int = 1\n"), None);
+  assert(same(b"type T = | T(Int)\ngen for T by f\nfn f() -> Int = 0\n"), None);
+  assert(same(b"type T = | T(Int)\nkey for T by gen\nfn gen(t: T) -> Int = 0\n"), None);
   assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None);
   assert_eq(header(b"type T = { a: Int }\nderive bin for T\n"), None)
+}
+
+test "`gen for T by f` is an item that brings `std.gen` under a name no source writes" {
+  let r = parse(b"type T = | T(Int)\ngen for T by f\nfn f() -> Int = 0\n");
+  assert_eq(len(r.parser.diags), 0);
+  match r.node.items {
+    [IType(_), IInstance(g), IFn(_)] -> {
+      assert_eq(instance_text(g.kind), b"gen");
+      assert_eq(g.target.name, b"T");
+      assert_eq(g.by.name, b"f");
+      assert_eq(g.span, { start: 18, end: 32 });
+      assert_eq(sampler_of(IInstance(g)), Some(b"_sample_T"))
+    },
+    _ -> panic("a type, a gen and a function"),
+  };
+  match r.node.imports {
+    [hidden] -> {
+      assert_eq(map(hidden.path, |part: Ident| part.name), [b"std", b"gen"]);
+      assert(!is_written(hidden))
+    },
+    _ -> panic("one import, the parser's"),
+  };
+  // A module that states none imports nothing, and `gen` is a name like any other.
+  let plain = parse(b"type T = | T(Int)\nkey for T by gen\nfn gen(t: T) -> Int = 0\n");
+  assert_eq(len(plain.parser.diags), 0);
+  assert_eq(len(plain.node.imports), 0);
+  assert_eq(map(plain.node.items, sampler_of), [None, None, None])
 }

@@ -1070,33 +1070,68 @@ test "a schema takes what raises a refusal of its own, and quantifies the `new` 
   })
 }
 
+fn reads_back() -> String =
+  "law schema reads_back<a, b | e>(shown: (a) -> b / e, read: (b) -> Option<a> / e)\n  forall (x: a) { read(shown(x)) == Some(x) }\n\n"
+
 // A value drawn for a binder is built where the law is, which an opaque type's module alone may do.
 test "a law does not quantify over a type another module keeps opaque, written or instantiated" {
   scratch(|| {
     let refused = |law: String, at_text: String| {
-      program(
-        "import std.uuid (Uuid, uuid_render, uuid_parse)\n\nlaw schema reads_back<a, b | e>(shown: (a) -> b / e, read: (b) -> Option<a> / e)\n  forall (x: a) { read(shown(x)) == Some(x) }\n\n"
-          ++ law
-          ++ "\n",
-      );
+      program("import std.html (Html, render)\n\n" ++ reads_back() ++ law ++ "\n");
       let r = on_disk(["check"]);
       assert(r.code != 0, Some(said(r)));
       assert(
         string_contains(said(r), "Error[E0418]")
-          && string_contains(said(r), "`std.uuid.Uuid` is opaque, so only `std.uuid` builds one")
+          && string_contains(said(r), "`std.html.Html` is opaque, so only `std.html` builds one")
           && string_contains(said(r), at_text),
         Some(said(r)),
       )
     };
     refused(
-      "law \"a uuid reads back\" forall (x: Uuid) { uuid_parse(uuid_render(x)) == Some(x) }",
+      "law \"a page reads back\" forall (x: Html) { string_len(render(x)) >= 0 }",
       "m.ply:6:36",
     );
-    refused("law \"some uuids read back\" forall (xs: List<Uuid>) { len(xs) >= 0 }", "m.ply:6:40");
+    refused("law \"some pages read back\" forall (xs: List<Html>) { len(xs) >= 0 }", "m.ply:6:40");
     refused(
-      "law \"a uuid reads back\" = reads_back(uuid_render, uuid_parse)",
-      "the schema `reads_back` binds `x`, which is a `std.uuid.Uuid` here",
+      "law \"a page reads back\" = reads_back(render, |s: String| -> Option<Html> { None })",
+      "the schema `reads_back` binds `x`, which is a `std.html.Html` here",
     )
+  })
+}
+
+// The generator an opaque type's module states is that module building the value.
+test "a law in any module quantifies over an opaque type that states a generator" {
+  scratch(|| {
+    program(
+      "import std.uuid (Uuid, uuid_render, uuid_parse)\n\n" ++ reads_back()
+        ++ "law \"a uuid reads back\" forall (x: Uuid) { uuid_parse(uuid_render(x)) == Some(x) }\n\nlaw \"some uuids read back\" forall (xs: List<Uuid>) {\n  fold(xs, true, |ok: Bool, x: Uuid| ok && uuid_parse(uuid_render(x)) == Some(x))\n}\n\nlaw \"a uuid reads back by the schema\" = reads_back(uuid_render, uuid_parse)\n",
+    );
+    let report = proved_json(["--no-cache"]);
+    assert(int(at(report, "exit_code")) == 0, Some(shown(report)));
+    assert(
+      map(items(at(report, "obligations")), |o: Json| str(at(o, "tier")))
+        == ["property", "property", "property"],
+      Some(shown(report)),
+    )
+  })
+}
+
+// A clause is no law to refuse, so the sample is what says nothing here builds the value.
+test "an ensures over an opaque type with no generator stated is sampled nowhere" {
+  scratch(|| {
+    program(
+      "import std.html (Html, render)\nimport std.uuid (Uuid, uuid_render)\n\nfn width(page: Html) -> Int / {abort.raise}\n  ensures result != 7\n= string_len(render(page))\n\nfn written(id: Uuid) -> Int / {abort.raise}\n  ensures result == 36\n= string_len(uuid_render(id))\n",
+    );
+    let report = proved_json(["--no-cache"]);
+    let width = owned(report, "m.width");
+    assert(str(at(width, "outcome")) == "unattempted", Some(shown(width)));
+    assert(str(at(width, "gap_kind")) == "ungeneratable", Some(shown(width)));
+    assert(
+      str(at(width, "gap")) == "no value of `std.html.Html` can be generated for `page`",
+      Some(shown(width)),
+    );
+    let written = owned(report, "m.written");
+    assert(str(at(written, "tier")) == "property", Some(shown(written)))
   })
 }
 
@@ -1126,6 +1161,204 @@ test "an instantiation is refused where it is written, for what it is given and 
       "law \"l\" = same(held)",
       "E0418",
       "the schema `same` binds `x`, which is a `Cell<Int>` here",
+    )
+  })
+}
+
+/// A type that holds only even numbers, with the generator that draws them, and `laws` over it.
+fn evens_with(span: String, laws: String) -> String =
+  "import std.gen\nimport std.gen (Gen)\nimport std.laws (agrees)\n\ntype Even = new { n: Int }\n\ngen for Even by evens\n\nfn evens() -> Gen<Even> = gen::map(gen::int_between(0, "
+    ++ span
+    ++ "), |k: Int| { n: 2 * k })\n\n"
+    ++ laws
+
+test "a type that states a generator is drawn through it at any depth, and a counterexample stays what it draws" {
+  scratch(|| {
+    program(
+      evens_with(
+        "500",
+        \\type Order = | Order(Even, Int)
+        \\
+        \\law "an even halves exactly" forall (e: Even) { e.n / 2 * 2 == e.n }
+        \\
+        \\law "an order's even halves exactly" forall (o: Order, es: List<Even>) {
+        \\  match o { Order(e, _) -> e.n % 2 == 0 } && fold(es, true, |ok: Bool, e: Even| ok && e.n % 2 == 0)
+        \\}
+        \\
+        \\law "every even is small" forall (es: List<Even>) {
+        \\  fold(es, true, |ok: Bool, e: Even| ok && e.n < 100)
+        \\}
+        \\
+      ),
+    );
+    let report = proved_json(["--no-cache"]);
+    // A drawn `{n: Int}` is odd half the time: only its generator makes every case one of the type's.
+    let halves = obligation(report, "law \"an even halves exactly\"");
+    assert(str(at(halves, "tier")) == "property", Some(shown(halves)));
+    assert(int(path(halves, ["cases", "discarded"])) == 0, Some(shown(halves)));
+    let held = obligation(report, "law \"an order's even halves exactly\"");
+    assert(str(at(held, "tier")) == "property", Some(shown(held)));
+    // The walk drops every element but one and lowers that one to the least even its generator
+    // makes that still fails, never to the 99 between.
+    let text = stdout(on_disk(["prove", "--no-cache"]));
+    assert(string_contains(text, "es = [{n: 100}]"), Some(text))
+  })
+}
+
+test "a generator that turns values away says how many, and one that draws none leaves a gap" {
+  scratch(|| {
+    program(
+      \\import std.gen
+      \\import std.gen (Gen)
+      \\
+      \\type Third = | Third(Int)
+      \\
+      \\gen for Third by thirds
+      \\
+      \\fn thirds() -> Gen<Third> =
+      \\  gen::map(gen::such_that(gen::int_between(0, 99), |n: Int| n % 3 == 0, 100), |n: Int| Third(n))
+      \\
+      \\type Never = | Never(Int)
+      \\
+      \\gen for Never by nevers
+      \\
+      \\fn nevers() -> Gen<Never> =
+      \\  gen::map(gen::such_that(gen::int_between(0, 9), |n: Int| n > 100, 5), |n: Int| Never(n))
+      \\
+      \\law "a third divides by three" forall (t: Third) { match t { Third(n) -> n % 3 == 0 } }
+      \\
+      \\law "a never is past a hundred" forall (v: Never) { match v { Never(n) -> n > 100 } }
+      \\
+    );
+    let report = proved_json(["--no-cache"]);
+    let third = obligation(report, "law \"a third divides by three\"");
+    assert(str(at(third, "tier")) == "property", Some(shown(third)));
+    assert(int(path(third, ["cases", "discarded"])) > 100, Some(shown(third)));
+    assert(
+      string_contains(str(path(third, ["cases", "summary"])), " discarded"),
+      Some(shown(third)),
+    );
+    // A budget spent is said, not narrowed past: nothing is claimed of the type.
+    let never = obligation(report, "law \"a never is past a hundred\"");
+    assert(str(at(never, "outcome")) == "unattempted", Some(shown(never)));
+    assert(str(at(never, "gap_kind")) == "gave_up", Some(shown(never)));
+    assert(
+      str(at(never, "gap")) == "the generator of `m.Never` drew no value, having discarded 5",
+      Some(shown(never)),
+    )
+  })
+}
+
+/// Where each obligation's answer came from, by its label, as `--explain` says under its row.
+fn answered_from(text: String, label: String) -> String / {abort.raise} =
+  match string::split_once(text, label) {
+    None -> "",
+    Some(p) -> match string::split_once(p.tail, "from: ") {
+      None -> "",
+      Some(q) -> match string_split(q.tail, "\n") { [line, ..] -> line, [] -> "" },
+    },
+  }
+
+test "an edit to a generator draws again exactly the samples drawn through it" {
+  scratch(|| {
+    let laws =
+      \\fn parity(e: Even) -> Int = e.n % 2
+      \\
+      \\fn halved(e: Even) -> Int
+      \\  ensures result * 2 == e.n
+      \\= e.n / 2
+      \\
+      \\fn same(e: Even) -> Even = e
+      \\
+      \\law "an even halves exactly" forall (e: Even) { e.n / 2 * 2 == e.n }
+      \\
+      \\law "an even's parity is none" = agrees(parity, |e: Even| 0)
+      \\
+      \\law "an even is itself" forall (e: Even) { same(same(e)) == same(e) }
+      \\
+      \\law "a map's key count is its length" forall (m: Map<String, Int>) {
+      \\  len(map_keys(m)) == map_len(m)
+      \\}
+      \\
+      \\law "summing is linear" forall (n: Int) where n > 1 cost n {
+      \\  fold(range(0, n), 0, |a: Int, x: Int| a + x)
+      \\}
+      \\
+    ;
+    program(evens_with("500", laws));
+    let first_run = proved_json([]);
+    assert(int(at(first_run, "exit_code")) == 0, Some(shown(first_run)));
+    let settled = stdout(on_disk(["prove", "--explain"]));
+    let rows = [
+      "m.halved ensures #0",
+      "law \"an even halves exactly\"",
+      "law \"an even's parity is none\"",
+      "law \"an even is itself\"",
+      "law \"a map's key count is its length\"",
+      "law \"summing is linear\"",
+    ];
+    assert(
+      map(rows, |row: String| answered_from(settled, row))
+        == [
+          "cached sample",
+          "cached sample",
+          "cached sample",
+          "cached proof",
+          "cached sample",
+          "cached sample",
+        ],
+      Some(settled),
+    );
+    // The generator draws wider: a clause, a law and an instantiation were sampled through it. The
+    // proof over the same type never read it, and the claims over other types never drew through it.
+    write("m.ply", evens_with("600", laws));
+    let edited = stdout(on_disk(["prove", "--explain"]));
+    assert(
+      map(rows, |row: String| answered_from(edited, row))
+        == ["new", "new", "new", "cached proof", "cached sample", "cached sample"],
+      Some(edited),
+    )
+  })
+}
+
+test "an edit to a generator runs no test again" {
+  scratch(|| {
+    let tested = "test \"an even is built\" { let e: Even = { n: 2 }; assert_eq(e.n, 2) }\n";
+    program(evens_with("500", tested));
+    assert(on_disk(["test"]).code == 0, None);
+    // A generator decides what a sample draws and nothing a program computes.
+    write("m.ply", evens_with("600", tested));
+    let again = json_of(on_disk(["test", "--json"]));
+    assert(int(path(again, ["summary", "cached"])) == 1, Some(shown(again)));
+    assert(int(path(again, ["summary", "passed"])) == 0, Some(shown(again)))
+  })
+}
+
+test "a gen is refused where it is stated: for its type, and for a function that is no generator of it" {
+  scratch(|| {
+    let refused = |text: String, code: String, said_text: String| {
+      program("import std.gen\nimport std.gen (Gen)\n\n" ++ text ++ "\n");
+      let r = on_disk(["check"]);
+      assert(r.code != 0, Some(said(r)));
+      assert(
+        string_contains(said(r), "Error[" ++ code ++ "]") && string_contains(said(r), said_text),
+        Some(said(r)),
+      )
+    };
+    refused(
+      "type Even = new { n: Int }\ngen for Even by ints\nfn ints() -> Gen<Int> = gen::int()",
+      "E0473",
+      "`ints` cannot be the `gen` of `Even`",
+    );
+    refused(
+      "type Id = Int\ngen for Id by ints\nfn ints() -> Gen<Int> = gen::int()",
+      "E0473",
+      "`Id` cannot state a `gen`",
+    );
+    refused(
+      "type Coin = | Heads | Tails\ngen for Coin by coins\ngen for Coin by coins\nfn coins() -> Gen<Coin> = gen::elements([Heads, Tails])",
+      "E0105",
+      "`Coin` states its `gen` twice",
     )
   })
 }

@@ -13,7 +13,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, is_predicate,
               deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
-              InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
+              InstanceDef, InstanceKind, NKey, NShow, NGen, instance_text, INumeric, NumericDef,
               NumericOp, numeric_ops, numeric_by, is_pub, Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -54,7 +54,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find_module_binding)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
-                expand_tagged)
+                expand_tagged, takes_gen)
 import embed (EmbedAt, embed_tables, rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -498,9 +498,11 @@ type Checker = {
   assumed: List<Assumed>,
   instances: List<InstanceInfo>,
   /// Filled as the declarations are collected, before any body is checked: an operator in a body
-  /// reads which types state `numeric`, and `keyed_names` which state a `key`.
+  /// reads which types state `numeric`, `keyed_names` which state a `key`, and a `forall`
+  /// `drawn_names`, which state a `gen`.
   numeric_types: List<NumericInfo>,
   keyed_names: List<Bytes>,
+  drawn_names: List<Bytes>,
   /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
   copied: Bool,
 }
@@ -10844,6 +10846,9 @@ fn ungeneratable_within(
       Some(
         b"a `Secret` is a credential: quantifying over one would have the generator mint credentials and the shrinker print counterexamples",
       )
+    } else if contains(checker.drawn_names, c.name) {
+      // Its values are what its generator draws, whatever it holds and whichever module asks.
+      first_reason(c.args, |a: Type| ungeneratable_within(checker, a, seen, room))
     } else {
       match closed_reason(checker, c.name) {
         Some(r) -> Some(r),
@@ -10882,14 +10887,19 @@ fn ungeneratable_within(
       }
     },
     TyRecord(fs) -> first_reason(fs, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
-    TyNominal(n) -> match closed_reason(checker, n.name) {
-      Some(r) -> Some(r),
-      None -> first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
+    TyNominal(n) -> if contains(checker.drawn_names, n.name) {
+      first_reason(n.args, |a: Type| ungeneratable_within(checker, a, seen, room))
+    } else {
+      match closed_reason(checker, n.name) {
+        Some(r) -> Some(r),
+        None -> first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
+      }
     },
   }
 
-/// Why a generator in this module makes no value of the type `name`: another module declared it
-/// `opaque`, so a value drawn here would be one that module never built.
+/// Why a draw in this module makes no value of the type `name`: another module declared it
+/// `opaque` and states no generator for it, so a value drawn here would be one that module never
+/// built.
 fn closed_reason(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise} =
   match closed_to(checker, name) {
     None -> None,
@@ -10900,7 +10910,7 @@ fn closed_reason(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise}
           name,
           b"` is opaque, so only `",
           closed.home,
-          b"` builds one: state the law there, or over what its functions take",
+          b"` builds one: state the law there, or over what its functions take, or a `gen` for the type in its module",
         ]),
       ),
   }
@@ -11996,7 +12006,7 @@ fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
 
 // --- What a type's module states of it ----------------------------------------------------------
 
-fn is_key(kind: InstanceKind) -> Bool = match kind { NKey -> true, NShow -> false }
+fn is_key(kind: InstanceKind) -> Bool = match kind { NKey -> true, NShow -> false, NGen -> false }
 
 fn instance_of(instances: List<InstanceInfo>, type_name: Bytes, key: Bool) -> Option<InstanceInfo> =
   fold(instances, None, |acc: Option<InstanceInfo>, x: InstanceInfo|
@@ -12092,9 +12102,77 @@ fn unfit(checker: Checker, def: InstanceDef, f: DefInfo, why: Bytes, note: Bytes
             def.target.name,
             b"` and answers the `String` that `show` and an interpolated string write",
           ]),
+        NGen -> b"a `gen` is judged by its sampler",
       },
     ],
   )
+
+/// One `gen for T by f`: the type is a sum or a `new` record of this module's own that binds no
+/// label and no row, and it states its generator once. That `f` takes a generator for each of the
+/// type's parameters and answers one of the type is what the statement's sampler is checked for.
+fn check_gen(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} = {
+  let declared = fold(m.module.items, None, |found: Option<TypeDef>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item {
+        IType(t) -> if t.name.name == def.target.name { Some(t) } else { None },
+        _ -> None,
+      },
+    });
+  let first = fold(m.module.items, None, |found: Option<InstanceDef>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item {
+        IInstance(x) -> if x.kind == NGen && x.target.name == def.target.name { Some(x) }
+        else { None },
+        _ -> None,
+      },
+    });
+  let refused = |why: Bytes, label: Bytes, at: Span|
+    report_error_at_and(
+      checker,
+      b"E0473",
+      def.target.span,
+      bytes_concat_all([b"`", def.target.name, b"` cannot state a `gen`"]),
+      label,
+      { module: checker.module, span: at },
+      b"declared here",
+      [why],
+    );
+  match declared {
+    None -> checker,
+    Some(t) -> match first {
+      Some(x) -> if x.span != def.span {
+        report_error_at_and(
+          checker,
+          b"E0105",
+          def.span,
+          bytes_concat_all([b"`", def.target.name, b"` states its `gen` twice"]),
+          b"stated again here",
+          { module: checker.module, span: x.span },
+          b"first stated here",
+          [b"a type has one, so that nothing has to choose between two; remove one"],
+        )
+      } else if takes_gen(t) { checker } else {
+        match t.body {
+          TDAlias(_) ->
+            refused(
+              b"an alias is the type it names, so a `gen` for one would be for every value of that type; declare a sum or a `new` record",
+              b"this type is an alias",
+              t.name.span,
+            ),
+          _ ->
+            refused(
+              b"a sampler is handed values for a type's type parameters, and nothing says which label or row a drawn value is at",
+              b"this type binds a label or a row",
+              t.name.span,
+            ),
+        }
+      },
+      None -> checker,
+    },
+  }
+}
 
 /// One `key for T by f` or `show for T by f`: the type is a sum of this module's own, it states
 /// each once, and `f` is a function of this module that takes the value alone and only answers.
@@ -12113,64 +12191,70 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
           bytes_concat_all([
             b"a `",
             what,
-            b"` may only name a type its own module declares, so that a type means one thing wherever its values are compared or shown",
+            if def.kind == NGen {
+              b"` may only name a type its own module declares, so that a type is drawn one way wherever a claim is about it"
+            } else {
+              b"` may only name a type its own module declares, so that a type means one thing wherever its values are compared or shown"
+            },
           ]),
         ],
       ),
-    Some(decl) -> match decl.declared {
-      DeclaredAlias(_) ->
-        not_a_sum(
-          checker,
-          def.target,
-          decl,
-          bytes_concat_all([
-            b"`",
-            def.target.name,
-            b"` is not a sum, and a `",
-            what,
-            b"` is for one",
-          ]),
-          b"an alias is the type it names, so a `key` or a `show` for one would be for every value of that type",
-        ),
-      DeclaredRecord(_) ->
-        not_a_sum(
-          checker,
-          def.target,
-          decl,
-          bytes_concat_all([
-            b"`",
-            def.target.name,
-            b"` is a `new` record, which cannot state a `",
-            what,
-            b"` yet",
-          ]),
-          b"a `new` record runs as the record it is written as, so nothing in a value says which type it is of where it is compared or shown",
-        ),
-      DeclaredSum -> match instance_of(checker.instances, type_name, is_key(def.kind)) {
-        Some(first) ->
-          report_error_at_and(
+    Some(decl) -> if def.kind == NGen { check_gen(checker, m, def) } else {
+      match decl.declared {
+        DeclaredAlias(_) ->
+          not_a_sum(
             checker,
-            b"E0105",
-            def.span,
-            bytes_concat_all([b"`", def.target.name, b"` states its `", what, b"` twice"]),
-            b"stated again here",
-            first.at,
-            b"first stated here",
-            [b"a type has one, so that nothing has to choose between two; remove one"],
+            def.target,
+            decl,
+            bytes_concat_all([
+              b"`",
+              def.target.name,
+              b"` is not a sum, and a `",
+              what,
+              b"` is for one",
+            ]),
+            b"an alias is the type it names, so a `key` or a `show` for one would be for every value of that type",
           ),
-        None -> match def_of(checker, qualify(m.name, def.by.name)) {
-          None ->
-            report_error_at(
+        DeclaredRecord(_) ->
+          not_a_sum(
+            checker,
+            def.target,
+            decl,
+            bytes_concat_all([
+              b"`",
+              def.target.name,
+              b"` is a `new` record, which cannot state a `",
+              what,
+              b"` yet",
+            ]),
+            b"a `new` record runs as the record it is written as, so nothing in a value says which type it is of where it is compared or shown",
+          ),
+        DeclaredSum -> match instance_of(checker.instances, type_name, is_key(def.kind)) {
+          Some(first) ->
+            report_error_at_and(
               checker,
-              b"E0101",
-              def.by.span,
-              bytes_concat_all([b"`", def.by.name, b"` is not a function this module declares"]),
-              bytes_concat_all([b"a `", what, b"` names a function of its type's own module"]),
-              [],
+              b"E0105",
+              def.span,
+              bytes_concat_all([b"`", def.target.name, b"` states its `", what, b"` twice"]),
+              b"stated again here",
+              first.at,
+              b"first stated here",
+              [b"a type has one, so that nothing has to choose between two; remove one"],
             ),
-          Some(f) -> fitted(checker, def, type_name, f),
+          None -> match def_of(checker, qualify(m.name, def.by.name)) {
+            None ->
+              report_error_at(
+                checker,
+                b"E0101",
+                def.by.span,
+                bytes_concat_all([b"`", def.by.name, b"` is not a function this module declares"]),
+                bytes_concat_all([b"a `", what, b"` names a function of its type's own module"]),
+                [],
+              ),
+            Some(f) -> fitted(checker, def, type_name, f),
+          },
         },
-      },
+      }
     },
   }
 }
@@ -12305,6 +12389,7 @@ fn collect_stated(checker: Checker, parsed: ParsedModule) -> Checker / {abort.ra
       IInstance(def) -> match def.kind {
         NKey -> { ..c, keyed_names: push(c.keyed_names, qualify(parsed.name, def.target.name)) },
         NShow -> c,
+        NGen -> { ..c, drawn_names: push(c.drawn_names, qualify(parsed.name, def.target.name)) },
       },
       INumeric(def) -> {
         let type_name = qualify(parsed.name, def.target.name);
@@ -12667,6 +12752,122 @@ fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
         }
       });
     { ..judged, module: checker.module }
+  }
+}
+
+/// The type a `gen` for `target` names a function of, over the type's own parameters as written.
+fn generator_shape(m: ParsedModule, target: Bytes) -> Bytes = {
+  let params = fold(m.module.items, [], |found: List<Bytes>, item: Item|
+    match item {
+      IType(t) -> if t.name.name == target { map(t.generics.types, |g: Ident| g.name) }
+      else { found },
+      _ -> found,
+    });
+  bytes_concat_all([
+    b"(",
+    bytes::join(map(params, |p: Bytes| bytes_concat_all([b"Gen<", p, b">"])), b", "),
+    b") -> Gen<",
+    target,
+    if len(params) == 0 { b"" } else { bytes_concat_all([b"<", bytes::join(params, b", "), b">"]) },
+    b">",
+  ])
+}
+
+/// A `gen`'s sampler is what holds its function to the type, so what the sampler fails on is said
+/// once, of the statement: a diagnostic placed inside one that the statement's own check did not
+/// write is the sampler's.
+fn attribute_samplers(checker: Checker) -> Checker / {abort.raise} = {
+  let stated = fold(
+    range(0, len(checker.modules)),
+    [],
+    |acc: List<{ module: Int, def: InstanceDef }>, i: Int|
+      fold(
+        at(checker.modules, i).module.items,
+        acc,
+        |found: List<{ module: Int, def: InstanceDef }>, item: Item|
+          match item {
+            IInstance(d) -> if d.kind == NGen { push(found, { module: i, def: d }) } else { found },
+            _ -> found,
+          },
+      ),
+  );
+  if len(stated) == 0 { checker } else {
+    let own = [b"E0473", b"E0105", b"E0208", b"E0101"];
+    let within = |d: Diag|
+      if contains(own, d.code) { None } else {
+        match fold(d.labels, None, |acc: Option<Label>, l: Label|
+            match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } }) {
+          None -> None,
+          Some(p) ->
+            fold(range(0, len(stated)), None, |hit: Option<Int>, k: Int|
+              match hit {
+                Some(_) -> hit,
+                None -> {
+                  let s = at(stated, k);
+                  if s.module == p.module && s.def.span.start <= p.start
+                      && p.end <= s.def.span.end { Some(k) }
+                  else { None }
+                },
+              }),
+        }
+      };
+    let said = |d: Diag| {
+      let label = fold(d.labels, b"", |acc: Bytes, l: Label|
+        if bytes_len(acc) == 0 && l.primary { l.text } else { acc });
+      if bytes_len(label) == 0 { d.message } else { bytes_concat_all([d.message, b": ", label]) }
+    };
+    let walked = fold(
+      checker.diags,
+      { diags: [], seen: [] },
+      |acc: { diags: List<Diag>, seen: List<Int> }, d: Diag|
+        match within(d) {
+          None -> { ..acc, diags: push(acc.diags, d) },
+          Some(k) -> if contains(acc.seen, k) { acc } else {
+            let s = at(stated, k);
+            let notes = fold(
+              filter(checker.diags, |x: Diag| within(x) == Some(k)),
+              [
+                bytes_concat_all([
+                  b"a `gen` names a function that takes a `std.gen.Gen` for each of its type's parameters and answers one of the type, here `",
+                  generator_shape(at(checker.modules, s.module), s.def.target.name),
+                  b"`, and performs nothing but `abort.raise`",
+                ]),
+              ],
+              |ns: List<Bytes>, x: Diag|
+                push(ns, bytes_concat(b"its sampler does not check: ", said(x))),
+            );
+            let named = match def_of(
+                checker,
+                qualify(at(checker.modules, s.module).name, s.def.by.name),
+              ) {
+              Some(f) -> [label_at(f.at.module, f.at.span, false, b"the function it names")],
+              None -> [],
+            };
+            {
+              diags: push(
+                acc.diags,
+                error_with_labels(
+                  b"E0473",
+                  bytes_concat_all([
+                    b"`",
+                    s.def.by.name,
+                    b"` cannot be the `gen` of `",
+                    s.def.target.name,
+                    b"`",
+                  ]),
+                  concat(
+                    [label_at(s.module, s.def.by.span, true, b"not a generator of the type")],
+                    named,
+                  ),
+                  notes,
+                ),
+              ),
+              seen: push(acc.seen, k),
+            }
+          },
+        },
+    );
+    { ..checker, diags: walked.diags }
   }
 }
 
@@ -13601,6 +13802,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     instances: [],
     numeric_types: [],
     keyed_names: [],
+    drawn_names: [],
     copied: false,
   })
 
@@ -14068,8 +14270,10 @@ pub fn check_program_with(
   let constrained: Checker = check_constraints(
     check_map_keys(check_comparisons(check_label_apps(settled))),
   );
-  let solved: Checker = check_parallels(
-    check_regions(check_simulations(attribute_generated(check_derives(constrained)))),
+  let solved: Checker = attribute_samplers(
+    check_parallels(
+      check_regions(check_simulations(attribute_generated(check_derives(constrained)))),
+    ),
   );
   { checker: solved, ok: !has_error(solved.diags) }
 }
@@ -17765,4 +17969,144 @@ test "a type that states a key is ordered, hashed and derived as its key is, wha
     ),
     [b"E0206"],
   )
+}
+
+/// A `std.gen` of the shapes a sampler is written with.
+fn gen_shipped() -> Source =
+  {
+    name: b"std.gen",
+    src: b"pub type Gen<a> = | Gen((Int) -> Option<a> / {abort.raise})\npub type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\npub fn sample<a>(g: Gen<a>, root: Int, key: Bytes, size: Int, replay: Option<List<Int>>) -> Sample<a> / {abort.raise} = match g { Gen(f) -> { value: f(root), record: [], discards: 0 } }\npub fn elements<a>(xs: List<a>) -> Gen<a> = Gen(|i: Int| list_at(xs, i))\npub fn constant<a>(x: a) -> Gen<a> = Gen(|_i: Int| Some(x))\n",
+  }
+
+/// What checking `sources` beside that `std.gen` says, each module importing `Gen` and `constant`.
+fn gen_checked(sources: List<Source>) -> List<Diag> / {abort.raise} = {
+  let parsed = parsed_all(
+    push(
+      map(sources, |s: Source|
+        { name: s.name, src: bytes_concat(b"import std.gen (Gen, constant)\n", s.src) }),
+      gen_shipped(),
+    ),
+    [],
+  );
+  let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
+  match resolve_modules(mods) {
+    ResolveFailed(ds) -> ds,
+    ResolveSucceeded(y) -> dedup_diags(check_program(y.r, y.mods).checker.diags),
+  }
+}
+
+fn gen_diags(src: Bytes) -> List<Diag> / {abort.raise} = gen_checked([{ name: b"m", src: src }])
+
+fn gen_codes(src: Bytes) -> List<Bytes> / {abort.raise} =
+  map(gen_diags(src), |diag: Diag| diag.code)
+
+test "a gen is stated once, by its type's own module, for a sum or a `new` record" {
+  let coin = b"type Coin = | Heads | Tails\nfn coins() -> Gen<Coin> = constant(Heads)\n";
+  assert_eq(gen_codes(bytes_concat(coin, b"gen for Coin by coins\n")), []);
+  assert_eq(
+    gen_codes(
+      b"type Even = new { n: Int }\nfn evens() -> Gen<Even> = constant({ n: 2 })\ngen for Even by evens\n",
+    ),
+    [],
+  );
+  // A parameterized type's takes a generator for each parameter.
+  assert_eq(
+    gen_codes(
+      b"type Pair<a, b> = | Pair(a, b)\nfn pairs<a, b>(x: Gen<a>, y: Gen<b>) -> Gen<Pair<a, b>> = match x { Gen(f) -> match y { Gen(g) -> Gen(|i: Int| match ((f(i), g(i))) { (Some(l), Some(r)) -> Some(Pair(l, r)), _ -> None }) } }\ngen for Pair by pairs\n",
+    ),
+    [],
+  );
+  assert_eq(gen_codes(bytes_concat(coin, b"gen for Coin by coins\ngen for Coin by coins\n")), [
+    b"E0105",
+  ]);
+  assert_eq(gen_codes(bytes_concat(coin, b"gen for Coin by mint\n")), [b"E0101"]);
+  assert_eq(gen_codes(b"fn f() -> Gen<Option<Int>> = constant(None)\ngen for Option by f\n"), [
+    b"E0208",
+  ]);
+  assert_eq(
+    gen_codes(b"type Id = Int\nfn ids() -> Gen<Int> = constant(1)\ngen for Id by ids\n"),
+    [b"E0473"],
+  );
+  // Nothing says which row or label a drawn value is at.
+  assert_eq(
+    gen_codes(
+      b"type Held<| e> = | Held(() -> Int / e) | Quiet\nfn held() -> Gen<Int> = constant(1)\ngen for Held by held\n",
+    ),
+    [b"E0473"],
+  );
+  // A generator holds a function, which no build keeps: the `const` rule refuses it, alone.
+  assert_eq(
+    gen_codes(
+      b"type Coin = | Heads | Tails\nconst fn coins() -> Gen<Coin> = constant(Heads)\ngen for Coin by coins\n",
+    ),
+    [b"E0156"],
+  );
+  // A gen is no key and no show: the type compares and prints as it did.
+  assert_eq(
+    gen_codes(
+      bytes_concat(coin, b"gen for Coin by coins\nfn m(c: Coin) -> Map<Coin, Int> = #{c: 1}\n"),
+    ),
+    [],
+  )
+}
+
+test "the function a gen names is held to its type by the statement's sampler, and refused once" {
+  let over = |f: Bytes|
+    gen_diags(bytes_concat_all([b"type Box<a> = | Box(a)\n", f, b"\ngen for Box by boxes\n"]));
+  let codes = |ds: List<Diag>| map(ds, |d: Diag| d.code);
+  // Another type's generator, one narrower than the type, and one that performs.
+  let wrong = over(b"fn boxes<a>(g: Gen<a>) -> Gen<a> = g");
+  assert_eq(codes(wrong), [b"E0473"]);
+  assert_eq(codes(over(b"fn boxes(g: Gen<Int>) -> Gen<Box<Int>> = constant(Box(1))")), [b"E0473"]);
+  assert_eq(codes(over(b"fn boxes<a>() -> Gen<Box<Int>> = constant(Box(1))")), [b"E0473"]);
+  assert_eq(
+    codes(
+      over(
+        b"effect log { write say(s: String) -> Unit }\nfn boxes<a>(g: Gen<a>) -> Gen<Box<Int>> / {log.write} = { log.say(\"x\"); constant(Box(1)) }",
+      ),
+    ),
+    [b"E0473"],
+  );
+  // It is said of the statement, naming the function, with what the sampler's check said.
+  match wrong {
+    [d] -> {
+      assert_eq(d.message, b"`boxes` cannot be the `gen` of `Box`");
+      assert(
+        fold(d.notes_text, false, |hit: Bool, n: Bytes|
+          hit || bytes::contains(n, b"here `(Gen<a>) -> Gen<Box<a>>`")),
+      );
+      assert(
+        fold(d.notes_text, false, |hit: Bool, n: Bytes|
+          hit || bytes_starts_with(n, b"its sampler does not check: ")),
+      )
+    },
+    _ -> panic("one diagnostic"),
+  }
+}
+
+test "a `forall` over an opaque type another module declares draws through the generator it states" {
+  let over = |vault: Bytes, law: Bytes|
+    map(
+      gen_checked([
+        { name: b"vault", src: vault },
+        { name: b"app", src: bytes_concat(b"import vault (Coin, Stamp, Purse, Token)\n", law) },
+      ]),
+      |d: Diag| d.code,
+    );
+  let closed = b"pub opaque type Coin = | Heads | Tails\npub opaque type Stamp = new { at: Int }\npub opaque type Purse<a> = | Purse(List<a>)\npub opaque type Token = | Token(Int)\nfn coins() -> Gen<Coin> = constant(Heads)\nfn stamps() -> Gen<Stamp> = constant({ at: 1 })\nfn purses<a>(g: Gen<a>) -> Gen<Purse<a>> = constant(Purse([]))\n";
+  let stated = bytes_concat(
+    closed,
+    b"gen for Coin by coins\ngen for Stamp by stamps\ngen for Purse by purses\n",
+  );
+  let coins = b"law \"l\" forall (c: Coin, cs: List<Coin>) { c == c }";
+  let stamps = b"law \"l\" forall (s: Stamp) { s.at == s.at }";
+  // With no generator stated, a value drawn in `app` would be one `vault` never built.
+  assert_eq(over(closed, coins), [b"E0418", b"E0418"]);
+  assert_eq(over(closed, stamps), [b"E0418"]);
+  // Its generator is `vault` building the value, wherever the law stands.
+  assert_eq(over(stated, coins), []);
+  assert_eq(over(stated, stamps), []);
+  // What the generator is handed for a parameter is still drawn where the law is.
+  assert_eq(over(stated, b"law \"l\" forall (p: Purse<Int>) { p == p }"), []);
+  assert_eq(over(stated, b"law \"l\" forall (p: Purse<Token>) { p == p }"), [b"E0418"])
 }
