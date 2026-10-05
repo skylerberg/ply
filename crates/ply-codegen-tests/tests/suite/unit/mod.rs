@@ -11,3 +11,4 @@ mod map;
 mod parallel;
 mod simulate;
 mod stack;
+mod stored;
