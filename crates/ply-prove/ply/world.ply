@@ -8,7 +8,8 @@
 // a report prints and in the sort the runtime reasons with.
 
 import compiler.diagnostics (parse_all)
-import compiler.front (Analysis, Analysed, Refused, analyse, literals_of)
+import compiler.front (Analysis, Analysed, Refused, analyse, guard_literals, literals_of,
+                       schema_definitions)
 import compiler.infer (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo)
 import compiler.items (Item, IFn, ILaw, SEnsures, SRequires, SpecClause)
 import compiler.exprs (Expr, Param, expr_span)
@@ -118,6 +119,8 @@ pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.ra
   let keys = by_name(analysis.hashes.spec_checks);
   let runs = by_name(analysis.hashes.specs);
   let defs = filter(analysis.checked.defs, |d: DefInfo| owned(d.module));
+  // A schema's definitions are what its instantiations claim, not definitions to carry a claim.
+  let schemas = schema_definitions(analysis.mods);
   let laws = filter(analysis.checked.laws, |l: LawInfo| owned(l.module));
   let clauses = fold(defs, { obligations: [], warnings: [] }, |acc: Owed, d: DefInfo|
     clauses_of(acc, d, written, requires, keys, runs, decls));
@@ -130,7 +133,7 @@ pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.ra
       obligations: owed.obligations,
       measures: measures_in(analysis, owned),
     },
-    defs: defined(defs, analysis.hashes),
+    defs: defined(filter(defs, |d: DefInfo| !map_contains(schemas, d.name)), analysis.hashes),
     laws: sentences_of(laws, analysis.hashes),
     warnings: owed.warnings,
   }
@@ -394,13 +397,19 @@ fn requires_of(mods: List<ParsedModule>) -> Map<Bytes, List<Expr>> =
         _ -> a,
       }))
 
-// Each law's `where`, by program-wide name.
-fn law_guards(mods: List<ParsedModule>) -> Map<Bytes, Expr> =
-  fold(mods, map_new(), |acc: Map<Bytes, Expr>, m: ParsedModule|
-    fold(m.module.items, acc, |a: Map<Bytes, Expr>, it: Item|
+type Guard = { at: Span, literals: List<Bytes> }
+
+// Each law's `where`, by program-wide name: where it stands, and the literals it is written with.
+fn law_guards(mods: List<ParsedModule>) -> Map<Bytes, Guard> / {abort.raise} =
+  fold(mods, map_new(), |acc: Map<Bytes, Guard>, m: ParsedModule|
+    fold(m.module.items, acc, |a: Map<Bytes, Guard>, it: Item|
       match it {
         ILaw(d) -> match d.guard {
-          Some(g) -> map_insert(a, qualify(m.name, d.name), g),
+          Some(g) ->
+            map_insert(a, qualify(m.name, d.name), {
+              at: expr_span(g),
+              literals: guard_literals(mods, d),
+            }),
           None -> a,
         },
         _ -> a,
@@ -521,7 +530,7 @@ fn law_of(
   acc: Owed,
   l: LawInfo,
   hashes: List<Bytes>,
-  wheres: Map<Bytes, Expr>,
+  wheres: Map<Bytes, Guard>,
   decls: List<Decl>,
 ) -> Owed / {abort.raise} =
   match list_at(hashes, l.index) {
@@ -541,10 +550,10 @@ fn law_of(
           result: None,
           variables: printed.variables,
           guards: match map_get(wheres, l.key) {
-            Some(g) -> [at_of(l.at.module, expr_span(g))],
+            Some(g) -> [at_of(l.at.module, g.at)],
             None -> [],
           },
-          literals: match map_get(wheres, l.key) { Some(g) -> literals_of([g]), None -> [] },
+          literals: match map_get(wheres, l.key) { Some(g) -> g.literals, None -> [] },
           host: l.host,
           footprint: footprint,
           frame: Pure,

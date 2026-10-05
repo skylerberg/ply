@@ -110,7 +110,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `as` | in an `import`, after the module path |
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `set` | `effect set X = {..}` |
-| `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
+| `law`, `host`, `schema`, `forall`, `cost` | `law "..."`, `law/host` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
@@ -218,7 +218,8 @@ Loosest to tightest; all binary operators are left-associative:
 ## 3. Modules and items
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
-`nondet effect`, `effect set`, `test`, `law` and `derive`, in any order.
+`nondet effect`, `effect set`, `test`, `law`, `law schema` and `derive`, in any
+order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -270,10 +271,10 @@ import is always this package's own: inside a dependency, `import fmt` names
 *its* `fmt`, never the importing package's — a package cannot reach back into
 what imports it.
 
-Items are private unless `pub` (`E0107`). `pub` applies to `fn`, `type` and
-`effect` only. Values (functions and constructors), types, effects and module
-binders are separate namespaces, so `fn size`, `type Size` and `effect size`
-coexist.
+Items are private unless `pub` (`E0107`). `pub` applies to `fn`, `type`,
+`effect` and `law schema` only. Values (functions, constructors and the
+definitions a schema declares, §10), types, effects and module binders are
+separate namespaces, so `fn size`, `type Size` and `effect size` coexist.
 
 ### 3.3 Packages and the manifest
 
@@ -1557,6 +1558,47 @@ first. Under `--json` a certificate's `rules` name each lemma as `lemma` with
 its `law` and `label`, each induction as `induction` with its `binder`,
 `def`, `over` (`int` or `list`) and `step`, and a `cost` clause read off its
 body (below) as `cost_bound` with its `def`.
+
+A `law schema` states a law once, over the definitions it is about, and a law
+instantiates it:
+
+```ply
+pub law schema round_trip<a, b>(encode: (a) -> b, decode: (b) -> Option<a>)
+  forall (x: a) { decode(encode(x)) == Some(x) }
+
+law "a URL round-trips" = round_trip(url_encode, url_decode)
+```
+
+A schema has a name, type parameters, parameters whose types are written, and
+then what a law has but a `cost`: binders, a guard and a body, pure as a law's
+are (`E0417`), so what a function parameter performs past a raise or `diverges`
+is refused where the body calls it. It may be `pub`, and is imported and
+qualified as a definition is. An instantiation gives one argument for each
+parameter, in order (`E0202`), each an expression of the parameter's type
+(`E0201`, or `E0302` for a function that performs more than the parameter's row
+admits): a definition's name, a lambda, a value. It writes no binders: the
+schema's are quantified at the types the arguments settle, which a `forall` must
+be able to range over (`E0418`, at the instantiation, naming the schema's
+binder), and a type parameter no argument settles stays a variable of the claim.
+What is instantiated must be a schema (`E0472`), and an instantiation is never
+`law/host`.
+
+An instantiation is the law its schema's guard and body are with each parameter
+replaced by what it was given. It has its own label, key, tier, certificate and
+cache entry; it is proved, sampled and shrunk as that law written out is, and,
+proved with no guard, it is a lemma by the trigger that body has. Its hash
+covers the schema's guard and body, in this package or another, with what it
+was given. Under `--json` its obligation carries `schema`, the schema's
+program-wide name, which `--explain` and a refutation print.
+
+A schema also declares the definition its body is, over its parameters and then
+its binders, so `round_trip(url_encode, url_decode, "a b")` is the claim at one
+point, and its guard as `<name>_where`. Both are `transparent` (below), are
+named among the module's other definitions (`E0105`), and are no part of what a
+run counts as carrying an obligation or not. What a schema's body calls in its
+own package is read from another package as any definition there is, by its
+clauses unless it is `transparent` too. `std.laws` (§13.41) ships the schemas
+the standard library states its laws with.
 
 A definition of another package
 — a dependency's, or outside `--std` a shipped module's — is claimed by its
@@ -3362,6 +3404,33 @@ domain of its own so it is never a signature over another protocol's message.
 signer, and `vouched_by` names the first trusted public key whose signature
 holds. `ply build --sign` writes one beside an artifact (§15.2).
 
+### 13.41 `std.laws`
+
+```ply
+pub law schema round_trip<a, b>(encode: (a) -> b, decode: (b) -> Option<a>)
+pub law schema inverse<a, b>(there: (a) -> b, back: (b) -> a)
+pub law schema idempotent<a>(f: (a) -> a)
+pub law schema agrees<a, b>(f: (a) -> b, g: (a) -> b)
+pub law schema total_order<a>(compare: (a, a) -> Ordering)
+pub law schema monoid<a>(op: (a, a) -> a, unit: a)
+pub law schema refines<s, m, i>(view: (s) -> m, op: (s, i) -> s, model_op: (m, i) -> m)
+```
+
+The properties a module's definitions are held to, each a schema (§10) a law
+instantiates: `law "a URL round-trips" = round_trip(url_encode, url_decode)`.
+Every function parameter's row admits a raise, so a definition that can fail on
+some input fits, and the input it fails on is a gap in the claim.
+
+| schema | claims, for every binder |
+| --- | --- |
+| `round_trip` | `decode(encode(x)) == Some(x)` |
+| `inverse` | `back(there(x)) == x` |
+| `idempotent` | `f(f(x)) == f(x)` |
+| `agrees` | `f(x) == g(x)` |
+| `total_order` | `compare(x, x)` is `Equal` and only equal values compare so, `compare(x, y)` is `compare(y, x)` reversed, and what is at most a value that is at most a third is at most the third |
+| `monoid` | `op(unit, x) == x`, `op(x, unit) == x` and `op(op(x, y), z) == op(x, op(y, z))` |
+| `refines` | `view(op(state, input)) == model_op(view(state), input)`: an operation does to a state what the model's does to what `view` shows of it |
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -3958,6 +4027,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0466` | `bounded` outside a definition's own row |
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0468` | `cost` bound on a definition whose row says it may not return |
+| `E0472` | a law instantiating a definition that is not a `law schema` |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
