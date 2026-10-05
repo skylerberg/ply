@@ -7,10 +7,10 @@ import parsing (Span, Ident, QName, ParseDiag, Label, span_to, dummy_span, bare,
                 error_at_and, parse_diag, parse_label, dump_diags, is_bare)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad)
-import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
-              TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures, SCost,
-              EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef, TestDef,
-              LawDef, parse, dump_module)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, FnDef,
+              TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures,
+              SCost, EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef,
+              TestDef, LawDef, SchemaDef, schema_guard_name, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
@@ -1539,10 +1539,23 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
           guard: g.expr,
           cost: d.cost,
           costs: d.costs,
+          of: d.of,
           body: b.expr,
           span: d.span,
         }),
       }
+    },
+    ISchema(d) -> {
+      let why = not_in_a_function(b"a `law schema`");
+      let g = match d.guard {
+        None -> { state: state, expr: None },
+        Some(x) -> {
+          let o = sweep(state, x, Some(why), None);
+          { state: o.state, expr: Some(o.expr) }
+        },
+      };
+      let b = sweep(g.state, d.body, Some(why), None);
+      { state: b.state, item: ISchema({ ..d, guard: g.expr, body: b.expr }) }
     },
     _ -> { state: state, item: item },
   }
@@ -1592,6 +1605,9 @@ fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
               b || (match param.default { None -> false, Some(v) -> count_in(v, p) > 0 })),
         ITest(d) -> count_in(d.body, p) > 0,
         ILaw(d) ->
+          count_in(d.body, p) > 0
+            || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
+        ISchema(d) ->
           count_in(d.body, p) > 0
             || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
         _ -> false,
@@ -1761,8 +1777,69 @@ pub fn expand(
   let tried = if has_try(module) { expand_try(module, diags) }
   else { { module: module, diags: diags } };
   let measured = measured_laws(tried.module, tried.diags);
-  cost_laws(measured.module, measured.diags)
+  let costed = cost_laws(measured.module, measured.diags);
+  { module: with_schema_fns(costed.module), diags: costed.diags }
 }
+
+// --- The law schema ----------------------------------------------------------------------------
+
+// A schema is also the definitions its instantiations call: its body over its parameters and then
+// its binders, and its guard the same as `<name>_where`. Each is `transparent`, so a claim in
+// another package reads the body it instantiates, and may raise or not return, as a law body may.
+fn schema_fns(d: SchemaDef) -> List<Item> = {
+  let at = d.name.span;
+  let ident = |t: Bytes| { name: t, span: at };
+  let params = map(concat(d.params, d.binders), |b: Binder|
+    { name: b.name, ty: Some(b.ty), cost: None, default: None, span: b.span });
+  let row = {
+    atoms: [
+      {
+        eff: bare(ident(b"abort")),
+        mode: MWrite,
+        op: Some(ident(b"raise")),
+        resource: None,
+        every: false,
+        bounded: false,
+        span: at,
+      },
+    ],
+    aliases: [bare(ident(b"diverges"))],
+    tail: None,
+    tail_bounded: false,
+    span: at,
+  };
+  let made = |name: Ident, body: Expr|
+    IFn({
+      vis: d.vis,
+      name: name,
+      generics: { types: d.generics, effects: [], labels: [] },
+      params: params,
+      ret: Some(TCon({ span: at, name: bare(ident(b"Bool")), args: [] })),
+      effects: Some(row),
+      constraints: [],
+      spec: [],
+      returns: None,
+      reuse: None,
+      transparent: Some(at),
+      decreases: None,
+      body: body,
+      span: d.span,
+    });
+  match d.guard {
+    None -> [made(d.name, d.body)],
+    Some(g) -> [made(d.name, d.body), made(ident(schema_guard_name(d.name.name)), g)],
+  }
+}
+
+fn with_schema_fns(module: Module) -> Module =
+  if !fold(module.items, false, |found: Bool, item: Item|
+      found || (match item { ISchema(_) -> true, _ -> false })) { module } else {
+    {
+      ..module,
+      items: fold(module.items, [], |acc: List<Item>, item: Item|
+        match item { ISchema(d) -> concat(push(acc, item), schema_fns(d)), _ -> push(acc, item) }),
+    }
+  }
 
 // --- The cost clause ---------------------------------------------------------------------------
 
@@ -1864,6 +1941,7 @@ fn cost_law(d: FnDef, clause: SpecClause, k: Int) -> LawDef = {
     ),
     cost: Some(EBlock({ span: at, stmts: made, tail: Some(clause.expr) })),
     costs: Some({ def: d.name, index: k }),
+    of: None,
     body: EBlock({
       span: at,
       stmts: made,
