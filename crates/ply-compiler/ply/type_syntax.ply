@@ -11,13 +11,15 @@ import parsing (positional, Span, Ident, QName, Input, Parser, Parsed, Eaten, So
                 token_slash, token_star, dump_node, dump_count, dump_presence, dump_payload,
                 dump_word, dump_list, dump_opt, dump_ident, dump_qname, dump_diags, start, is_bare)
 import lexer (TokenKind, Identifier, Punctuation)
+import std.bytes (join)
 
 // --- The AST ----------------------------------------------------------------
 
 /// Fields stay inline records: a named record alias mutually recursive with an ADT is an unexercised shape.
 pub type TypeExpr =
   | TVar(Ident)
-  | TCon({ span: Span, name: QName, args: List<TypeExpr> })
+  // `labels` and `rows` fill a declared type's label and row parameters: `Seq<a, [l] | e>`.
+  | TCon({ span: Span, name: QName, args: List<TypeExpr>, labels: List<Ident>, rows: List<RowExpr> })
   | TFn({ span: Span, params: List<TypeExpr>, ret: TypeExpr, effects: Option<RowExpr> })
   | TRecord({ span: Span, fields: List<{ name: Ident, ty: TypeExpr }> })
   | TUnit({ span: Span })
@@ -81,6 +83,29 @@ pub fn no_atom() -> AtomExpr =
   }
 
 pub fn no_generics() -> Generics = { types: [], effects: [], labels: [] }
+
+pub fn is_generic(generics: Generics) -> Bool =
+  len(generics.types) > 0 || len(generics.effects) > 0 || len(generics.labels) > 0
+
+// What sits between `<` and `>` in a generic list or after a type's name: the types, one bracket
+// a label, then the rows after `|`. Nothing at all when there is none of them.
+pub fn angled(types: List<Bytes>, labels: List<Bytes>, rows: List<Bytes>) -> Bytes / {abort.raise} =
+  if len(types) == 0 && len(labels) == 0 && len(rows) == 0 { b"" } else {
+    let ts = join(
+      fold(labels, types, |acc: List<Bytes>, label: Bytes|
+        push(acc, bytes_concat_all([b"[", label, b"]"]))),
+      b", ",
+    );
+    let rs = join(rows, b", ");
+    if len(rows) == 0 { bytes_concat_all([b"<", ts, b">"]) }
+    else if bytes_len(ts) == 0 { bytes_concat_all([b"<| ", rs, b">"]) }
+    else { bytes_concat_all([b"<", ts, b" | ", rs, b">"]) }
+  }
+
+pub fn generics_text(generics: Generics) -> Bytes / {abort.raise} =
+  angled(ident_names(generics.types), ident_names(generics.labels), ident_names(generics.effects))
+
+pub fn ident_names(idents: List<Ident>) -> List<Bytes> = map(idents, |ident: Ident| ident.name)
 
 // --- Modes ------------------------------------------------------------------
 
@@ -167,18 +192,88 @@ fn ty_named(
   let q = qname(input, parser, b"a type")?;
   if at_token(input, q.parser, token_lt()) {
     let o = advance(input, q.parser);
-    let args = comma_list(input, o.parser, token_gt(), ty)?;
-    let cl = expect_gt(input, args.parser, b"`>` to close the type arguments")?;
+    let { parser, node: args } = type_args(input, o.parser)?;
+    let pi = eat(input, parser, token_pipe());
+    let opt_rows = if pi.ok { row_args(input, pi.parser) }
+    else { Ok({ parser: pi.parser, node: [] }) };
+    let { parser, node: rows } = opt_rows?;
+    let cl = expect_gt(input, parser, b"`>` to close the type arguments")?;
     Ok({
       parser: cl.parser,
-      node: TCon({ span: span_to(span, cl.node), name: q.node, args: args.node }),
+      node: TCon({
+        span: span_to(span, cl.node),
+        name: q.node,
+        args: args.types,
+        labels: args.labels,
+        rows: rows,
+      }),
     })
   }
   // Type parameters are never qualified, so only a bare lowercase name is one.
   else if is_bare(q.node) && !starts_upper(q.node.name.name) {
     Ok({ parser: q.parser, node: TVar(q.node.name) })
-  } else { Ok({ parser: q.parser, node: TCon({ span: q.node.span, name: q.node, args: [] }) }) }
+  } else { Ok({ parser: q.parser, node: nullary(q.node) }) }
 }
+
+pub fn nullary(name: QName) -> TypeExpr =
+  TCon({ span: name.span, name: name, args: [], labels: [], rows: [] })
+
+type ArgAcc = { parser: Parser, types: List<TypeExpr>, labels: List<Ident> }
+
+type ArgOut = { types: List<TypeExpr>, labels: List<Ident> }
+
+// Not `comma_list`: a bracketed name is a label argument, and `|` ends the list as `>` does.
+fn type_args(input: Input, parser: Parser) -> Result<Parsed<ArgOut>, Parser> / {abort.raise} =
+  iterate(
+    { parser: parser, types: [], labels: [] },
+    input.token_count - parser.pos + 1,
+    |s: ArgAcc|
+      if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
+          || at_token(input, s.parser, token_pipe())
+          || at_eof(input, s.parser) {
+        Stop(Ok({ parser: s.parser, node: { types: s.types, labels: s.labels } }))
+      } else if at_token(input, s.parser, token_lbracket()) {
+        match label_params(input, s.parser) {
+          Err(q) -> Stop(Err(q)),
+          Ok(n) -> {
+            let e = eat(input, n.parser, token_comma());
+            let ls = fold(n.node, s.labels, |acc: List<Ident>, ident: Ident| push(acc, ident));
+            if e.ok { Continue({ parser: e.parser, types: s.types, labels: ls }) }
+            else { Stop(Ok({ parser: e.parser, node: { types: s.types, labels: ls } })) }
+          },
+        }
+      } else {
+        match ty(input, s.parser) {
+          Err(q) -> Stop(Err(q)),
+          Ok(t) -> {
+            let e = eat(input, t.parser, token_comma());
+            if e.ok {
+              Continue({ parser: e.parser, types: push(s.types, t.node), labels: s.labels })
+            } else {
+              Stop(
+                Ok({ parser: e.parser, node: { types: push(s.types, t.node), labels: s.labels } }),
+              )
+            }
+          },
+        }
+      },
+  )
+
+type RowsAcc = { parser: Parser, out: List<RowExpr> }
+
+fn row_args(input: Input, parser: Parser) -> Result<Parsed<List<RowExpr>>, Parser> / {abort.raise} =
+  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: RowsAcc|
+    if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
+        || at_eof(input, s.parser) { Stop(Ok({ parser: s.parser, node: s.out })) } else {
+      match row(input, s.parser) {
+        Err(q) -> Stop(Err(q)),
+        Ok(r) -> {
+          let e = eat(input, r.parser, token_comma());
+          if e.ok { Continue({ parser: e.parser, out: push(s.out, r.node) }) }
+          else { Stop(Ok({ parser: e.parser, node: push(s.out, r.node) })) }
+        },
+      }
+    })
 
 fn fn_ty(
   input: Input,
@@ -496,6 +591,13 @@ pub fn dump_ty(ty: TypeExpr) -> Bytes / {abort.raise} =
         dump_node(x.span, b"tcon"),
         dump_qname(x.name),
         dump_list(x.args, dump_ty),
+        if len(x.labels) == 0 && len(x.rows) == 0 { b"" } else {
+          bytes_concat_all([
+            dump_word(b"over"),
+            dump_list(x.labels, dump_ident),
+            dump_list(x.rows, dump_row),
+          ])
+        },
       ]),
     TFn(x) ->
       bytes_concat_all([
@@ -597,6 +699,47 @@ test "a `>=` closing a type argument list is split into `>` and `=`" {
     dump_type_of(b"Pair<a>="),
     "0:7:tcon;0:4:qname;?0;0:4:ident;@50616972;#1;5:6:tvar;5:6:ident;@61;#0;",
   )
+}
+
+test "a type's label arguments are bracketed among its type arguments, and its rows follow `|`" {
+  assert_eq(
+    dump_type_of(b"T<a | e>"),
+    "0:8:tcon;0:1:qname;?0;0:1:ident;@54;#1;2:3:tvar;2:3:ident;@61;%over;#0;#1;6:7:row;#0;#0;?1;6:7:ident;@65;#0;",
+  );
+  assert_eq(
+    dump_type_of(b"T<a, [l], b, [k, m] | e, {}>"),
+    "0:28:tcon;0:1:qname;?0;0:1:ident;@54;#2;2:3:tvar;2:3:ident;@61;10:11:tvar;10:11:ident;@62;"
+      ++ "%over;#3;6:7:ident;@6c;14:15:ident;@6b;17:18:ident;@6d;"
+      ++ "#2;22:23:row;#0;#0;?1;22:23:ident;@65;25:27:row;#0;#0;?0;#0;",
+  );
+  assert_eq(
+    dump_type_of(b"T<[l]>"),
+    "0:6:tcon;0:1:qname;?0;0:1:ident;@54;#0;%over;#1;3:4:ident;@6c;#0;#0;",
+  );
+  assert_eq(
+    dump_type_of(b"T<| {db.read[users] | e}>"),
+    "0:25:tcon;0:1:qname;?0;0:1:ident;@54;#0;%over;#0;#1;4:24:row;#1;5:19:atm;5:7:qname;?0;5:7:ident;@6462;%read;?1;13:18:ident;@7573657273;#0;?1;22:23:ident;@65;#0;",
+  );
+  // A `|` no row follows leaves the type applied to its types alone.
+  assert_eq(
+    dump_type_of(b"T<a |>"),
+    "0:6:tcon;0:1:qname;?0;0:1:ident;@54;#1;2:3:tvar;2:3:ident;@61;#0;",
+  )
+}
+
+test "a row argument ends at the `>` that closes its type, a nested one and a split `>=` alike" {
+  assert_eq(
+    dump_type_of(b"Map<K, T<a | e>>"),
+    "0:16:tcon;0:3:qname;?0;0:3:ident;@4d6170;#2;4:5:tcon;4:5:qname;?0;4:5:ident;@4b;#0;"
+      ++ "7:15:tcon;7:8:qname;?0;7:8:ident;@54;#1;9:10:tvar;9:10:ident;@61;%over;#0;#1;13:14:row;#0;#0;?1;13:14:ident;@65;#0;",
+  );
+  assert_eq(dump_type_of(b"T<a | e>="), dump_type_of(b"T<a | e>"))
+}
+
+test "a row argument is a row and a label argument a name, and neither closes without its `>`" {
+  assert_eq(dump_type_of(b"T<a | 3>"), "0:0:tbad;#1;!E0001:6:7:1:0;=6:7:1;");
+  assert_eq(dump_type_of(b"T<[*]>"), "0:0:tbad;#1;!E0001:3:4:1:0;=3:4:1;");
+  assert_eq(dump_type_of(b"T<a | e"), "0:0:tbad;#1;!E0001:7:7:1:0;=7:7:1;")
 }
 
 test "a parenthesised type keeps the inner node's own span" {
