@@ -14,9 +14,9 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 dump_word, dump_bool, dump_list, dump_opt, dump_ident, dump_qname, dump_diags)
 import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, Keyword, Punctuation,
               EndOfInput)
-import type_syntax (TypeExpr, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead, MWrite, RMAtom,
-                    RMSet, ty, ty_span, no_ty, mode, generics, row, row_member, no_generics,
-                    dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
+import type_syntax (TypeExpr, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead, MWrite, MRaise,
+                    RMAtom, RMSet, TUnit, ty, ty_span, no_ty, mode, generics, row, row_member,
+                    no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import exprs (Expr, Param, expr, scrutinee, block_expr, expr_span, no_expr, fn_param, param,
               dump_expr, dump_param, shown_binder)
@@ -1076,7 +1076,87 @@ fn op_resource_param(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parse
     Ok({ parser: parser, node: true })
   }
 
-pub fn op_def(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
+fn raise_refuses(input: Input, parser: Parser, label: Bytes, note: Bytes) -> Parser =
+  push_diag(
+    parser,
+    error_at(
+      unexpected(),
+      current_span(input, parser),
+      b"a `raise` operation is a name and its parameters",
+      label,
+      [note],
+    ),
+  )
+
+// A raise answers nothing, so it writes no result: `ret` is `Unit` there, and nothing reads it.
+fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let { parser, node: name } = expect_ident(input, st.parser, b"an operation name")?;
+  if at_token(input, parser, token_lbracket()) {
+    Err(
+      raise_refuses(
+        input,
+        parser,
+        b"a raise takes no resource",
+        b"a label says which performs conflict, and a raise conflicts with nothing",
+      ),
+    )
+  } else if at_token(input, parser, token_lt()) {
+    Err(
+      raise_refuses(
+        input,
+        parser,
+        b"a raise takes no type parameters",
+        b"its clause is handed the payload, so the payload's type is written out",
+      ),
+    )
+  } else {
+    let { parser, node: o } = expect(
+      input,
+      parser,
+      token_lparen(),
+      b"`(` to start the operation parameters",
+    )?;
+    let { parser, node: ps } = comma_list(input, parser, token_rparen(), op_param)?;
+    let { parser, node: cl } = expect_close(
+      input,
+      parser,
+      token_rparen(),
+      o,
+      b"`)` to close the operation parameters",
+    )?;
+    if at_token(input, parser, token_arrow()) {
+      Err(
+        raise_refuses(
+          input,
+          parser,
+          b"a raise writes no result",
+          b"a raise does not come back, so its perform has whatever type is asked of it",
+        ),
+      )
+    } else {
+      Ok({
+        parser: parser,
+        node: {
+          name: name,
+          mode: MRaise,
+          resource_param: false,
+          ty_params: [],
+          params: ps,
+          ret: TUnit({ span: cl }),
+          span: span_to(st.node, cl),
+        },
+      })
+    }
+  }
+}
+
+// `raise` is contextual, as `read` and `write` are.
+pub fn op_def(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} =
+  if at_ident_text(input, parser, b"raise") { raise_op(input, parser) }
+  else { moded_op(input, parser) }
+
+fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
   let start = current_span(input, parser);
   let { parser, node: m } = mode(input, parser)?;
   let { parser, node: name } = expect_ident(input, parser, b"an operation name")?;
@@ -1840,6 +1920,15 @@ test "`law` without a quoted label is not an item and `law` stays a name" {
 
 test "an import that selects names may not then rename the module" {
   assert_eq(dump(b"import a (b) as c\n"), "#0;#0;#1;!E0001:13:15:1:1;=13:15:1;")
+}
+
+test "a `raise` operation declares a name and its parameters, and nothing else" {
+  let declared = dump(b"effect E {\n  raise bad(at: Int)\n  raise eof()\n}\n");
+  assert(string_contains(declared, "13:31:op;19:22:ident;@626164;%raise;%false;#0;#1;"));
+  assert(string_contains(declared, "@656f66;%raise;%false;#0;#0;"));
+  assert(string_contains(dump(b"effect E { raise bad[r](at: Int) }"), "!E0001:"));
+  assert(string_contains(dump(b"effect E { raise bad<a>(at: a) }"), "!E0001:"));
+  assert(string_contains(dump(b"effect E { raise bad(at: Int) -> Int }"), "!E0001:"))
 }
 
 test "a line string is an expression, and never a pattern or a test's label" {

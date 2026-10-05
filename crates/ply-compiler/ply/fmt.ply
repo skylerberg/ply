@@ -11,11 +11,11 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               ReturnsParam, Vis, VPub, VPriv, item_span, parse, dump_module, is_written,
               constraint_written, is_pub, spec_kind_text)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, Generics, ty_span, mode_text)
+                    MWrite, MBad, Generics, ty_span, mode_text, is_raise)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, RecField, NamedArg, Param, Stmt, SLet, SLetElse, SExpr, MatchArm,
-              HandleClause, ReturnClause, expr_span, is_block_like)
+              EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt, SLet,
+              SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
 import std.list (at)
@@ -633,6 +633,7 @@ fn runs_on(expr: Expr) -> Bool =
     EHandle(_) -> true,
     EWithCell(_) -> true,
     ESimulate(_) -> true,
+    ETryBlock(_) -> true,
     _ -> false,
   }
 
@@ -735,6 +736,12 @@ fn param_head(input: PrintInput, param: Param) -> Bytes / {abort.raise} =
 
 fn perform_head(eff: QName, ident: Ident, r: Option<Ident>) -> Bytes =
   bytes_concat_all([qname_text(eff), b".", ident.name, resource_text(r)])
+
+fn try_head(raise: Option<RaiseName>) -> Bytes =
+  match raise {
+    None -> b"try ",
+    Some(r) -> bytes_concat_all([b"try[", qname_text(r.eff), b".", r.op.name, b"] "]),
+  }
 
 fn clause_head(clause: HandleClause) -> Bytes / {abort.raise} =
   bytes_concat_all([
@@ -975,6 +982,7 @@ fn flat_node(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
         Some(b" }"),
       ]),
     ESimulate(v) -> cat([Some(b"simulate "), flat_expr(input, v.body)]),
+    ETryBlock(v) -> cat([Some(try_head(v.raise)), flat_expr(input, v.body)]),
     EParallel(v) ->
       cat([
         Some(b"parallel { "),
@@ -1170,6 +1178,7 @@ fn broken_node(
     EHandle(v) -> handle_expr(input, printer, v.body, v.clauses, v.ret, v.span, indent),
     EWithCell(v) -> cell_expr(input, printer, v.resource, v.init, v.binder, v.body, v.span, indent),
     ESimulate(v) -> block(input, emit(printer, b"simulate "), v.body, indent),
+    ETryBlock(v) -> block(input, emit(printer, try_head(v.raise)), v.body, indent),
     // Trailing comments are read from the end of the keyword, where the braces' own span would start.
     EParallel(v) ->
       elements(
@@ -2017,8 +2026,8 @@ fn op_decl_text(input: PrintInput, op: OpDef) -> Bytes / {abort.raise} = {
     generics_text({ types: op.ty_params, effects: [], labels: [] }),
     b"(",
     join(ps, b", "),
-    b") -> ",
-    type_text(input, op.ret),
+    b")",
+    if is_raise(op.mode) { b"" } else { bytes_concat(b" -> ", type_text(input, op.ret)) },
   ])
 }
 
@@ -2728,6 +2737,34 @@ test "a `cost` clause prints on its own line among the spec clauses, in the orde
 test "an operation's type parameters print between its resource and its parameters" {
   let src = b"effect box {\n  read take[k]<a>() -> a\n  write put<a, b>(x: a, y: b) -> Unit\n}\n";
   assert_eq(formatted(src), src)
+}
+
+test "a `raise` operation prints its name and parameters, and no result" {
+  lays_out(
+    b"effect toml {\n  raise   syntax(e: SyntaxError)\n  raise eof( )\n  read peek() -> Int\n}\n",
+    b"effect toml {\n  raise syntax(e: SyntaxError)\n  raise eof()\n  read peek() -> Int\n}\n",
+  )
+}
+
+test "a `try` prints the raise it names, stands as a scrutinee, and is bracketed as an operand" {
+  lays_out(
+    b"fn f(b: Int) -> Result<Int, Int> = try   { digit(b) }\n",
+    b"fn f(b: Int) -> Result<Int, Int> = try { digit(b) }\n",
+  );
+  lays_out(
+    b"fn f(b: Int) -> Result<Int, Int> = try[ m::toml.syntax ]\n  { digit(b) }\n",
+    b"fn f(b: Int) -> Result<Int, Int> = try[m::toml.syntax] { digit(b) }\n",
+  );
+  let scrutinee = b"fn f(b: Int) -> Int = match try { digit(b) } { Ok(v) -> v, Err(e) -> e }\n";
+  assert_eq(formatted(scrutinee), scrutinee);
+  let operand = b"fn f(b: Int) -> Bool = (try { digit(b) }) == Ok(1)\n";
+  assert_eq(formatted(operand), operand);
+  let long = bytes_concat_all([
+    b"fn f(b: Int) -> Result<Int, Int> = try[toml.syntax] { let first = digit(b); ",
+    b"let second = digit(b + 1); let third = digit(b + 2); first + second + third }\n",
+  ]);
+  assert(stable(long));
+  assert(string_contains(string_of_bytes(formatted(long)), "\n  try[toml.syntax] {\n"))
 }
 
 test "a row naming operations prints them back, and a `let` bound to a `handle` keeps its shape" {
