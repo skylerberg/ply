@@ -2647,6 +2647,17 @@ beside the phases of a check that ran, with `filed`, whether the next check can
 take its answer back (false for a refused load, or when the entry could not be
 written).
 
+`ply test` keeps its answer for the next run over the same command line, files
+and `ply`, in the test store beside its passes: the answer of a run that ran no
+test in scope, or, for a `--json` run that ran some and passed, the one selecting
+again after it filed them gives. A later run whose key matches answers with it
+without loading the program while every pass it took still stands and every
+shipped definition its program reached hashes as it did (§13); otherwise it
+loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
+`--no-cache` and a configuration file or schema always load. In the `--json`
+document, `front_end` carries `reused` and `key` for an answer taken back,
+beside the phases of this run, all of it read.
+
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
 `ply run`, `ply test`, `ply build` and `ply prove` settle the literals of the
