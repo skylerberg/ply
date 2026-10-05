@@ -1,0 +1,175 @@
+//! Ascii85 in Adobe's dialect, the one PostScript and PDF carry binary data in: four bytes as five
+//! characters from `!` to `u`.
+//!
+//! Each four bytes are one number, first byte most significant, written in base 85 with `!` for
+//! zero. Four zero bytes are the one character `z`. A last group of one to three bytes is filled
+//! with zero bytes, written, and cut to one character more than it had bytes. `encode` answers the
+//! characters alone, and `encode_framed` puts PostScript's `<~` and `~>` around them. The older
+//! btoa dialect is neither written nor read: no `y` for four spaces, and no `xbtoa` lines.
+//!
+//! `decode` reads exactly what `encode` writes, so a decode of an encode is the bytes and an encode
+//! of a decode is the text. Five `!` where a `z` belongs, a `z` inside a group, a group past what
+//! four bytes hold, a last group of one character, a last group whose cut-off digits were not the
+//! ones `encode` cuts, and whitespace are each refused. A text a PostScript writer broke into
+//! lines is read once `unwrapped` has joined it.
+
+import std.bytes (join, replace, u32_be)
+import std.laws (idempotent, round_trip)
+import std.list (at_or, somes)
+
+/// `data` in Adobe's ascii85, with no frame.
+pub fn encode(data: Bytes) -> String / {abort.raise}
+  cost bytes_len(data)
+= {
+  let n = bytes_len(data);
+  string_of_bytes(
+    bytes_concat_all(map(range(0, (n + 3) / 4), |g: Int| group(data, g * 4, min(4, n - g * 4)))),
+  )
+}
+
+/// What `encode` wrote read back; `None` for any other text.
+pub fn decode(text: String) -> Option<Bytes> / {abort.raise}
+  cost string_len(text)
+= {
+  let runs = bytes_split(bytes_of_string(text), b"z");
+  let read = somes(
+    map(range(0, len(runs)), |i: Int| run_bytes(at_or(runs, i, b""), i + 1 == len(runs))),
+  );
+  // Each `z` between two runs is four zero bytes.
+  if len(read) == len(runs) { Some(join(read, b"\x00\x00\x00\x00")) } else { None }
+}
+
+/// `data` as PostScript writes it: `encode`'s characters between `<~` and `~>`.
+pub fn encode_framed(data: Bytes) -> String / {abort.raise} = "<~" ++ encode(data) ++ "~>"
+
+/// What `encode_framed` wrote read back; `None` for any other text, an unframed one included.
+pub fn decode_framed(text: String) -> Option<Bytes> / {abort.raise} = {
+  let n = string_len(text);
+  if n < 4 || !string_starts_with(text, "<~") || !string_ends_with(text, "~>") { None }
+  else { decode(string_slice(text, 2, n - 2)) }
+}
+
+/// `text` without the whitespace Adobe's readers skip: space, tab, line feed, form feed, carriage
+/// return and NUL. What a writer broke into lines is then the text a decoder here reads.
+pub fn unwrapped(text: String) -> String / {abort.raise} =
+  string_of_bytes(
+    fold(
+      [b" ", b"\t", b"\n", b"\x0c", b"\r", b"\x00"],
+      bytes_of_string(text),
+      |t: Bytes, w: Bytes| replace(t, w, b""),
+    ),
+  )
+
+/// The characters of the `have` bytes at `at`, one to four of them.
+fn group(data: Bytes, at: Int, have: Int) -> Bytes / {abort.raise} = {
+  let v = fold(range(0, 4), 0, |m: Int, k: Int|
+    m << 8 | (if k < have { bytes_at(data, at + k) } else { 0 }));
+  if v == 0 && have == 4 { b"z" } else { bytes_slice(digits(v), 0, have + 1) }
+}
+
+/// `v` in base 85, five characters, most significant first.
+fn digits(v: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(map([52200625, 614125, 7225, 85, 1], |p: Int| byte_of_int(v / p % 85 + 33)))
+
+/// The bytes of the characters between two `z`s, or after the last: whole groups, and after the
+/// last `z` a shorter group too.
+fn run_bytes(run: Bytes, last: Bool) -> Option<Bytes> / {abort.raise} = {
+  let n = bytes_len(run);
+  let whole = n / 5;
+  let rest = n % 5;
+  let values = map(range(0, whole), |g: Int| number(run, g * 5, 5));
+  if bytes_position(run, 0, |c: Int| c < 33 || c > 117) != None { None }
+  else if rest == 1 || (rest > 0 && !last) { None }
+  else if fold(values, false, |bad: Bool, v: Int| bad || v == 0 || v > 0xFFFF_FFFF) { None } else {
+    let full = bytes_concat_all(map(values, u32_be));
+    if rest == 0 { Some(full) } else {
+      let v = number(run, whole * 5, rest);
+      let tail = bytes_slice(u32_be(v & 0xFFFF_FFFF), 0, rest - 1);
+      if v > 0xFFFF_FFFF || group(tail, 0, rest - 1) != bytes_slice(run, whole * 5, n) { None }
+      else { Some(bytes_concat(full, tail)) }
+    }
+  }
+}
+
+/// The number the `have` characters at `at` write, a short group filled with `u`.
+fn number(run: Bytes, at: Int, have: Int) -> Int / {abort.raise} =
+  fold(range(0, 5), 0, |m: Int, k: Int|
+    m * 85 + (if k < have { bytes_at(run, at + k) - 33 } else { 84 }))
+
+// --- Tests ------------------------------------------------------------------
+
+law "a decode of an encode is the bytes encoded" = round_trip(encode, decode)
+
+law "a framed decode of a framed encode is the bytes encoded" =
+  round_trip(encode_framed, decode_framed)
+
+law "a text with its whitespace removed has none to remove" = idempotent(unwrapped)
+
+law "a text that decodes is the one its bytes encode to"
+  forall (text: String) {
+    match decode(text) { None -> true, Some(data) -> encode(data) == text }
+  }
+
+type Vector = { bytes: Bytes, text: String }
+
+/// Groups of every length, the zero group, the largest group, and each power of 85 alone.
+fn vectors() -> List<Vector> =
+  [
+    { bytes: b"\x03\x1c\x84\xb1", text: "\"!!!!" },
+    { bytes: b"\x00\x09\x5e\xed", text: "!\"!!!" },
+    { bytes: b"\x00\x00\x1c\x39", text: "!!\"!!" },
+    { bytes: b"\x00\x00\x00\x55", text: "!!!\"!" },
+    { bytes: b"\x00\x00\x00\x01", text: "!!!!\"" },
+    { bytes: b"", text: "" },
+    { bytes: b"M", text: "9`" },
+    { bytes: b"Ma", text: "9jn" },
+    { bytes: b"Man", text: "9jqo" },
+    { bytes: b"Man ", text: "9jqo^" },
+    { bytes: b"Man is", text: "9jqo^Bla" },
+    { bytes: b"hello world", text: "BOu!rD]j7BEbo7" },
+    { bytes: b"\x00\x00\x00\x00", text: "z" },
+    { bytes: b"\x00\x00\x00\x00\x00\x00\x00\x00", text: "zz" },
+    { bytes: b"\x00", text: "!!" },
+    { bytes: b"\x00\x00\x00", text: "!!!!" },
+    { bytes: b"a\x00\x00\x00\x00b", text: "@/p9-!+G" },
+    { bytes: b"\x00\x00\x00\x00\x00", text: "z!!" },
+    { bytes: b"\x00\x00\x00\x00a", text: "z@/" },
+    { bytes: b"ab\x00\x00\x00\x00", text: "@:B3:!!!" },
+    { bytes: b"\xff\xff\xff\xff", text: "s8W-!" },
+  ]
+
+test "{v.bytes} is written {v.text}, and read back" for v: Vector in vectors() {
+  assert_eq(encode(v.bytes), v.text);
+  assert_eq(decode(v.text), Some(v.bytes))
+}
+
+test "a decoder refuses what an encoder would not write" {
+  // Five `!` for a zero group, a `z` inside a group or after a short one, a character past `u`,
+  // a group past four bytes, one character alone, and a last group whose cut-off digits are not
+  // the encoder's.
+  assert_eq(decode("!!!!!"), None);
+  assert_eq(decode("9jzqo"), None);
+  assert_eq(decode("9`z9`"), None);
+  assert_eq(decode("9jqov"), None);
+  assert_eq(decode("s8W-\""), None);
+  assert_eq(decode("9"), None);
+  assert_eq(decode("!"), None);
+  assert_eq(decode("9jqo^B"), None);
+  assert_eq(decode("9a"), None);
+  assert_eq(decode("9jqo^ Bla"), None);
+  assert_eq(decode("<~9jqo^~>"), None)
+}
+
+test "the frame is PostScript's, and a wrapped text is read once it is unwrapped" {
+  assert_eq(encode_framed(b"Man "), "<~9jqo^~>");
+  assert_eq(decode_framed("<~9jqo^~>"), Some(b"Man "));
+  assert_eq(encode_framed(b""), "<~~>");
+  assert_eq(decode_framed("<~~>"), Some(b""));
+  assert_eq(decode_framed("9jqo^"), None);
+  assert_eq(decode_framed("<~9`!!"), None);
+  assert_eq(decode_framed("!!9`~>"), None);
+  assert_eq(decode_framed("<~>"), None);
+  assert_eq(decode_framed("<~9jqo^\n~>"), None);
+  assert_eq(unwrapped("<~9jqo^\r\n Bla\t~>\n"), "<~9jqo^Bla~>");
+  assert_eq(decode_framed(unwrapped("<~9jqo^\r\n Bla\t~>\n")), Some(b"Man is"))
+}
