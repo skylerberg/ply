@@ -15,6 +15,10 @@ Rust, so after editing Ply sources `cargo pack` is the rebuild.
 - Comments: default to none. Write one only for a non-obvious why, an invariant the types don't
   enforce, or a trap, and keep it to one line. No history ("used to", "since #123"), no
   references to PRs or documents, no figures.
+- Doc comments (`///` above a declaration, `//!` at the head of a module) are for callers, and
+  the rule above does not bound them: say what the signature cannot (what an answer means, when it
+  raises, units, edge cases), never restate the type or row, and open with a one-sentence summary.
+  No examples: the tests that name a definition are its examples, and `ply doc` lists them.
 - Correct in place. Never write "previously", "corrected" or "a draft of this said".
 - Measurements belong in the PR description of the change they decide, not in the tree.
 - Tests check the program, never a document.
