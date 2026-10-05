@@ -154,18 +154,20 @@ fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -
         bail!("two roots of this unit share a site id");
     }
     let mut tables = tables_of(unit, &ctors);
-    let by = |function: &str| match function {
-        "-" => Stated::No,
-        name => entries
-            .get(name)
-            .map_or(Stated::Absent, |(entry, _)| Stated::By(*entry as usize)),
+    let by = |function: &str| match (function, entries.get(function)) {
+        ("-", _) => Ok(Stated::No),
+        (_, None) => Ok(Stated::Absent),
+        (_, Some((entry, 1))) => Ok(Stated::By(*entry as usize)),
+        (name, Some((_, words))) => bail!(
+            "`{name}` is stated as a `key` or a `show` and takes {words} words, where it is called with the value alone"
+        ),
     };
     let mut stated = vec![(Stated::No, Stated::No); ctors.len()];
     for (ctor, key, show) in &instances {
         let Some(index) = tables.layouts.ctor_index(ctor) else {
             bail!("the unit states a `key` or a `show` of `{ctor}`, which it does not hold");
         };
-        stated[index as usize] = (by(key), by(show));
+        stated[index as usize] = (by(key)?, by(show)?);
     }
     tables.layouts.state(stated);
     tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
