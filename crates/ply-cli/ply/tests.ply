@@ -87,7 +87,8 @@ import sim.recording (Interleaving)
 import sim.search
 import sim.search (Exact, Exploration, Failure, Diverged, Unscheduled)
 import std.string (join, pad_right, repeat, pad_left)
-import std.math (pow)
+import std.fmt (fixed_point)
+import std.text (shell_join)
 import claims (located)
 import signature (atom_texts)
 import surface (parsed)
@@ -537,29 +538,19 @@ fn no_culprit() -> Culprit = { names: [], at: None }
 
 // --- Fixed point ------------------------------------------------------------
 
-fn zeroed(text: String, width: Int) -> String =
-  if string_len(text) >= width { text } else { repeat("0", width - string_len(text)) ++ text }
+fn ms_tenths(us: Int) -> String / {abort.raise} = fixed_point((us + 50) / 100, 1)
 
-fn fixed(scaled: Int, digits: Int) -> String / {abort.raise} = {
-  let unit = pow(10, digits);
-  let whole = scaled / unit;
-  if digits == 0 { int_to_string(whole) }
-  else { int_to_string(whole) ++ "." ++ zeroed(int_to_string(scaled - whole * unit), digits) }
-}
+fn ms_hundredths(us: Int) -> String / {abort.raise} = fixed_point((us + 5) / 10, 2)
 
-fn ms_tenths(us: Int) -> String / {abort.raise} = fixed((us + 50) / 100, 1)
+fn ms_thousandths(us: Int) -> String / {abort.raise} = fixed_point(us, 3)
 
-fn ms_hundredths(us: Int) -> String / {abort.raise} = fixed((us + 5) / 10, 2)
+fn secs_hundredths(us: Int) -> String / {abort.raise} = fixed_point((us + 5000) / 10000, 2)
 
-fn ms_thousandths(us: Int) -> String / {abort.raise} = fixed(us, 3)
-
-fn secs_hundredths(us: Int) -> String / {abort.raise} = fixed((us + 5000) / 10000, 2)
-
-fn ns_as_ms_tenths(ns: Int) -> String / {abort.raise} = fixed((ns + 50000) / 100000, 1)
+fn ns_as_ms_tenths(ns: Int) -> String / {abort.raise} = fixed_point((ns + 50000) / 100000, 1)
 
 /// Per mille is tenths of a percent, so one division answers both digits.
 fn share(part: Int, total: Int) -> String / {abort.raise} =
-  pad_left(fixed(if total == 0 { 0 } else { part * 1000 / total }, 1), 5, " ") ++ "%"
+  pad_left(fixed_point(if total == 0 { 0 } else { part * 1000 / total }, 1), 5, " ") ++ "%"
 
 fn millis(us: Int) -> Json / {abort.raise} =
   Number(option_unwrap_or(decimal_of_string(ms_thousandths(us)), decimal_of_int(0)))
@@ -1118,7 +1109,10 @@ fn reduction_part(e: Explored, naive: Cost) -> List<String> / {abort.raise} =
   match e.reduction_tenths {
     None -> [],
     Some(tenths) ->
-      [(if naive.bounded { ">= " } else { "" }) ++ fixed((tenths + 5) / 10, 0) ++ "× reduction"],
+      [
+        (if naive.bounded { ">= " } else { "" }) ++ fixed_point((tenths + 5) / 10, 0)
+          ++ "× reduction",
+      ],
   }
 
 /// What one test's search did, under its result line.
@@ -1457,7 +1451,8 @@ fn search_json(e: Explored) -> Json / {abort.raise} =
     {
       key: "reduction",
       value: match e.reduction_tenths {
-        Some(t) -> Number(option_unwrap_or(decimal_of_string(fixed(t, 1)), decimal_of_int(0))),
+        Some(t) ->
+          Number(option_unwrap_or(decimal_of_string(fixed_point(t, 1)), decimal_of_int(0))),
         None -> Null,
       },
     },
@@ -3966,7 +3961,7 @@ fn fault_of<| e>(
     unchanged: failed.unchanged,
     seed: failed.seed,
     race: failed.race,
-    replay: match failed.seed { Some(seed) -> Some(replay_of(seed, failed.name)), None -> None },
+    replay: match failed.seed { Some(seed) -> replay_of(seed, failed.name), None -> None },
     module: failed.module,
     test_hash: failed.test_hash,
     nondet: failed.nondet,
@@ -3975,9 +3970,10 @@ fn fault_of<| e>(
   }
 }
 
-/// The command that replays one interleaving of one test.
-fn replay_of(seed: String, name: String) -> String =
-  "ply test --seed " ++ seed ++ " --filter \"" ++ name ++ "\""
+/// The command that replays one interleaving of one test, spelled for a shell to read back as
+/// these words; none for a name no shell word can carry.
+fn replay_of(seed: String, name: String) -> Option<String> =
+  shell_join(["ply", "test", "--seed", seed, "--filter", name])
 
 /// A mixture's pass is filed under the test as it is now and as it last passed, the definitions
 /// taken, and the interleaving the failure took.
@@ -4551,7 +4547,7 @@ test "a failure's artifact says what failed, how to replay it, and what caused i
   let raced = {
     ..a_fault(),
     seed: Some("0:1.0"),
-    replay: Some(replay_of("0:1.0", "two is two")),
+    replay: replay_of("0:1.0", "two is two"),
     race: Some({ left: site, right: { ..site, task: "t2" }, step: 3 }),
     suspects: [{ ..a_suspect("m.bump"), change: Some(Edited), culprit: true }],
   };
@@ -4562,7 +4558,7 @@ test "a failure's artifact says what failed, how to replay it, and what caused i
   assert(string_contains(text, "\"module\":\"m\""));
   assert(string_contains(text, "\"status\":\"failed\""));
   assert(string_contains(text, "\"nondet\":false"));
-  assert(string_contains(text, "\"replay\":\"ply test --seed 0:1.0 --filter \\\"two is two\\\"\""));
+  assert(string_contains(text, "\"replay\":\"ply test --seed 0:1.0 --filter 'two is two'\""));
   assert(string_contains(text, "\"at\":3"));
   assert(string_contains(text, "\"task\":\"t2\""));
   assert(string_contains(text, "\"change\":\"edited\""));
@@ -4603,15 +4599,20 @@ test "a suspect is named with what changed" {
 }
 
 test "the repro is a seed and the command that replays it" {
-  let f = {
-    ..a_fault(),
-    seed: Some("0:0.1.0.2"),
-    replay: Some(replay_of("0:0.1.0.2", "two is two")),
-  };
+  let f = { ..a_fault(), seed: Some("0:0.1.0.2"), replay: replay_of("0:0.1.0.2", "two is two") };
   assert_eq(seed_lines(plain(), a_place(), f), [
     "  seed: 0:0.1.0.2",
-    "  replay: ply test --seed 0:0.1.0.2 --filter \"two is two\"",
+    "  replay: ply test --seed 0:0.1.0.2 --filter 'two is two'",
   ])
+}
+
+test "a replay is one command whatever the test is called" {
+  assert_eq(
+    replay_of("0:1", "it's \"$HOME\" `now`"),
+    Some("ply test --seed 0:1 --filter 'it'\\''s \"$HOME\" `now`'"),
+  );
+  assert_eq(replay_of("0:1", "plain"), Some("ply test --seed 0:1 --filter plain"));
+  assert_eq(replay_of("0:1", "a\0b"), None)
 }
 
 test "a search says what it explored and what a blind and an unpruned one would have cost" {
