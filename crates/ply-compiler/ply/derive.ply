@@ -2,7 +2,8 @@
 
 import parsing (Span, Ident, QName, span_to, is_bare, qname_text)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span, mode_text)
+                    MWrite, MBad, ty_span, mode_text, angled, generics_text, is_generic,
+                    ident_names)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -122,6 +123,9 @@ fn check_decl(deriver: Deriver, def: TypeDef) -> Option<Blocker> / {abort.raise}
         }),
   }
 
+// No generated call fills a label, and only a type that holds a function has a use for one.
+fn label_refusal() -> Bytes = b"a type that takes a label has no derivation"
+
 fn function_refusal(deriver: Deriver) -> Bytes =
   match deriver {
     DJson -> b"a function has no JSON encoding",
@@ -226,7 +230,9 @@ fn check_type_expr(deriver: Deriver, ty: TypeExpr) -> Option<Blocker> / {abort.r
             None -> None,
           },
         }),
-    TCon(c) -> {
+    TCon(c) -> if len(c.labels) > 0 {
+      Some({ span: c.span, reason: label_refusal(), note: None, variant: None })
+    } else {
       let simple = c.name.name.name;
       match constructor_shape(deriver, simple) {
         Refused(why) ->
@@ -300,22 +306,15 @@ fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
     match acc { Some(_) -> acc, None -> if alias.name == name { Some(alias.body) } else { None } })
 
 pub fn target_type(def: TypeDef) -> Bytes / {abort.raise} =
-  if len(def.params) == 0 { def.name.name } else {
-    bytes_concat_all([
-      def.name.name,
-      b"<",
-      join(map(def.params, |ident: Ident| ident.name), b", "),
-      b">",
-    ])
-  }
+  bytes_concat(def.name.name, generics_text(def.generics))
 
 // A codec on a cycle is two definitions: the named one starts `_at` at the runtime's `max_depth`, and
 // `_at` hands its cycle one less, so its recursion is seen to end.
 fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> Bytes / {abort.raise} = {
   let name = generated_name(emitter.d, def.name.name);
   let target = target_type(def);
-  let ps = map(def.params, |p: Ident| p.name);
-  let generics = if len(ps) == 0 { b"" } else { bytes_concat_all([b"<", join(ps, b", "), b">"]) };
+  let ps = map(def.generics.types, |p: Ident| p.name);
+  let generics = generics_text(def.generics);
   let dicts = map(ps, |p: Bytes| bytes_concat_all([p, b": ", dict_type(emitter, p)]));
   let constraints = if len(ps) == 0 { b"" } else {
     bytes_concat(b" where ", join(map(ps, |p: Bytes| constraint_written(emitter.d, p)), b", "))
@@ -864,7 +863,10 @@ fn bin_sum(
       shapes_of(emitter, v.fields),
       b"]}",
     ]));
-  let params = join(map(def.params, |ident: Ident| bytes_concat(ident.name, b".shape")), b", ");
+  let params = join(
+    map(def.generics.types, |ident: Ident| bytes_concat(ident.name, b".shape")),
+    b", ",
+  );
   bytes_concat_all([
     b"{put: |",
     emitter.b,
@@ -926,9 +928,11 @@ pub fn render_type(ty: TypeExpr) -> Bytes / {abort.raise} =
     TVar(i) -> i.name,
     TUnit(_) -> b"()",
     TBad(_) -> b"()",
-    TCon(c) -> if len(c.args) == 0 { qname_text(c.name) } else {
-      bytes_concat_all([qname_text(c.name), b"<", join(map(c.args, render_type), b", "), b">"])
-    },
+    TCon(c) ->
+      bytes_concat(
+        qname_text(c.name),
+        angled(map(c.args, render_type), ident_names(c.labels), map(c.rows, render_row)),
+      ),
     TRecord(r) ->
       bytes_concat_all([
         b"{",
@@ -1027,6 +1031,8 @@ fn retarget_ty(t: TypeExpr, span: Span) -> TypeExpr =
         span: span,
         name: qname_at(c.name, span),
         args: map(c.args, |a: TypeExpr| retarget_ty(a, span)),
+        labels: map(c.labels, |l: Ident| ident_at(l, span)),
+        rows: map(c.rows, |r: RowExpr| retarget_row(r, span)),
       }),
     TFn(f) ->
       TFn({
@@ -1300,7 +1306,7 @@ fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
             None -> push(acc.types, d),
           };
           let aliases = match d.body {
-            TDAlias(body) -> if len(d.params) == 0
+            TDAlias(body) -> if !is_generic(d.generics)
                 && (match find_alias(acc.aliases, d.name.name) { Some(_) -> false, None -> true }) {
               push(acc.aliases, { name: d.name.name, body: body })
             } else { acc.aliases },
@@ -1326,7 +1332,50 @@ fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
 
 fn run_expander(expander: Expander) -> Expander / {abort.raise} =
   fold(expander.module.items, expander, |acc: Expander, item: Item|
-    match item { IDerive(def) -> one(acc, def), _ -> acc })
+    match item { IDerive(def) -> unlabelled(acc, def), _ -> acc })
+
+// A target that binds a label is refused before its fields are read.
+fn unlabelled(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
+  match find_type(expander.types, def.target.name) {
+    None -> one(expander, def),
+    Some(target) -> match list_at(target.generics.labels, 0) {
+      None -> one(expander, def),
+      Some(label) ->
+        report(
+          expander,
+          error_at_and(
+            b"E0206",
+            expander.m,
+            label.span,
+            bytes_concat_all([
+              b"`",
+              deriver_text(def.deriver),
+              b"` cannot be derived for `",
+              def.target.name,
+              b"`",
+            ]),
+            label_refusal(),
+            expander.m,
+            def.span,
+            b"required by this derivation",
+            [
+              bytes_concat_all([
+                b"a label is what a function's row performs under, and a type that holds a function has no derivation, so `[",
+                label.name,
+                b"]` is used by no field a derivation could read",
+              ]),
+              bytes_concat_all([
+                b"drop `[",
+                label.name,
+                b"]` from `",
+                def.target.name,
+                b"`, or write the dictionary by hand",
+              ]),
+            ],
+          ),
+        ),
+    },
+  }
 
 fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
   match find_type(expander.types, def.target.name) {
@@ -1345,7 +1394,7 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
               Some(prefix) -> {
                 let cycle = cycle_of(codec_calls(ex1, def.deriver), def.target.name);
                 let source = emit_item(
-                  emitter(def.deriver, prefix, target.params, ex1.aliases, ex1.path, cycle),
+                  emitter(def.deriver, prefix, target.generics.types, ex1.aliases, ex1.path, cycle),
                   target,
                 );
                 match parse_generated(source, def.span, if len(cycle) == 0 { 1 } else { 2 }) {
@@ -1796,6 +1845,33 @@ test "every span in a generated definition is the derive item's" {
     },
     _ -> assert(false),
   }
+}
+
+test "a type that takes a row derives over it, and one that takes a label has no derivation" {
+  let out = preview(
+    b"t",
+    parse(
+      b"type Tagged<a | e> = | Tagged(a)\ntype Pair = {left: Tagged<Int | {}>}\nderive eq for Tagged\nderive eq for Pair",
+    ).node,
+  );
+  assert_eq(
+    at(out, 0),
+    b"fn tagged_eq<a | e>(a: {eq: (a, a) -> Bool}) -> {eq: (Tagged<a | e>, Tagged<a | e>) -> Bool} where derivable(eq, a) = {eq: |da: Tagged<a | e>, db: Tagged<a | e>| da == db}",
+  );
+  let refused = |src: Bytes|
+    map(expand_derives(0, b"t", parse(src).node).diags, |diag: Diag| {
+      let primary = at(diag.labels, 0);
+      [diag.code, bytes_slice(src, primary.start, primary.end)]
+    });
+  assert_eq(refused(b"type Tagged<a, [l]> = | Tagged(a)\nderive eq for Tagged"), [
+    [b"E0206", b"l"],
+  ]);
+  assert_eq(
+    refused(
+      b"type Tagged<a, [l]> = | Tagged(a)\ntype Pair = {left: Tagged<Int, [conn]>}\nderive eq for Pair",
+    ),
+    [[b"E0206", b"left: Tagged<Int, [conn]>"]],
+  )
 }
 
 test "an orphan, a collision, a missing runtime and a refused field each report as the reference does" {
