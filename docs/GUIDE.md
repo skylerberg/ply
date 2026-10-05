@@ -142,6 +142,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `raise` | opening an operation declaration (§6.8) |
 | `set` | `effect set X = {..}` |
+| `new` | right after the `=` of a `type` declaration |
 | `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
@@ -469,8 +470,8 @@ value past `Int` through its decimal text (`u128_of_string`).
 
 ### 4.2 Records and tuples
 
-Records are structural; `type` names an alias, not a new type. Field order does
-not matter.
+Records are structural; `type` names an alias, not a new type, unless its body
+opens with `new` (below). Field order does not matter.
 
 ```ply
 fn f(a: Account) -> Int = a.balance
@@ -490,6 +491,56 @@ constraint: each signature that uses it promises what its expansion needs,
 the alias. It may take label and row parameters too (§4.5):
 `type Step<a | e> = () -> Option<a> / e` is the function type it expands to, with
 the row a use gives it in place of `e`.
+
+`type T = new { .. }` declares a record of its own, with at least one field:
+
+```ply
+pub type Date = new { year: Int, month: Int, day: Int }
+
+fn epoch() -> Date = { year: 1970, month: 1, day: 1 }
+fn next(d: Date) -> Date = { ..d, year: d.year + 1 }
+fn held() -> Date = {
+  let r = { year: 1970, month: 1, day: 1 };   // a `{day: Int, month: Int, year: Int}`
+  r                                           // E0201: not a `Date`
+}
+```
+
+It is read (`d.year`), updated and matched as any record is, and it is no other
+type: not a record of the same fields, and not another declaration of them
+(`E0201`). A record literal is one where the place it is written in says so
+before the literal is checked:
+
+* the body of a `fn`, and of a lambda whose return type is written or expected;
+  a `let` with a written type; a parameter's default;
+* an argument of a call or an operation, at its parameter's type. A type
+  parameter of the callee is what the arguments before this one, and the type
+  the call is itself expected at, make it, so `assert_eq(d, {..})`,
+  `push(days, {..})` and a `Some({..})` answering `Option<Date>` each take one;
+* a field of a literal that is itself expected, and a field an update writes;
+* an element of a list, a branch of an `if` and an arm of a `match`, at the type
+  expected of the whole or of the elements, branches and arms before it; the
+  right side of an operator, at its left's;
+* a block's tail, a `let ... else` block, and the body of a `handle` (its
+  `return` clause, where it has one), a `with_cell` or a `simulate`, where the
+  whole is expected; the body of a `try`, where a `Result` of it is; a handler
+  clause, at what it answers: the operation's result, or the `handle`'s value
+  for a raise and for a clause that binds `resume`.
+
+Such a literal names every field (`E0201`) and no other (`E0101`). A record
+bound without its type is a plain record wherever it goes next.
+
+The declaration is closed, and judged where it is written: a field names only
+the declaration's own type, label and row parameters (§4.5), holds no `Cell`,
+`Task` or `Chan` (`E0446`, §4.6), and does not reach the record itself except
+through a sum (`E0214`), since whatever reads a record's shape reads its fields
+whole. A `Map` key it leaves to a parameter is promised where a value is built,
+as a constructor's is, not by each signature that names the type.
+
+At run time a `new` record is the record it is written as. `==`, `compare`,
+`digest`, `show`, `reflect` and every derived codec (§11) read its fields as
+they read a plain record's, so two `new` records of the same fields print,
+encode and digest alike, and only the checker tells them apart. A definition's
+hash does tell them apart: a `new` record is hashed with its name, as a sum is.
 
 ### 4.3 Lists, arrays and maps
 
@@ -517,16 +568,18 @@ type Level = Debug | Info | Warn | Error
 
 The leading `|` is optional. Constructors are values: `Circle(3)` is a call,
 `Point` a reference. `type Id = Int` (one name, no payload, no `|`) is an alias.
-Sums are the only nominal types: identical sums in two modules differ. A sum
-takes parameters as an alias does, `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`,
-and a use that fills them with other arguments is another type (§4.5).
+A sum is nominal, as a `new` record is (§4.2): identical sums in two modules
+differ. A sum takes parameters as an alias does,
+`type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`, and a use that fills them
+with other arguments is another type (§4.5).
 
 ### 4.5 Generics
 
 `fn apply<a, b | e>(x: a, f: (a) -> b / e) -> b / e = f(x)`: type parameters are
 lowercase names in `<...>`, and row parameters follow `|` (`<| e>` if there are
 no type parameters); a row variable among the type parameters is `E0301`.
-Aliases may be parameterized: `pub type Route<a> = { ... endpoint: a }`.
+Aliases may be parameterized, `pub type Route<a> = { ... endpoint: a }`, and so
+may `new` records, `type Pair<a> = new { first: a, second: a }`.
 
 A bracketed name binds a resource label:
 `fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)`. Binders sit
@@ -558,13 +611,14 @@ need the callee's type parameter at another type is polymorphic recursion, which
 Ply does not infer. That is `E0308` as well: break the cycle so the callee is
 checked on its own before the call, or monomorphise it.
 
-A `type` binds all three kinds where a `fn` does, on an alias and on a sum, and
-a use fills them in the same places:
+A `type` binds all three kinds where a `fn` does, on an alias, a sum and a `new`
+record, and a use fills them in the same places:
 
 ```ply
 type Step<a | e> = () -> Option<{ value: a, next: Seq<a | e> }> / e
 type Seq<a | e>  = | Seq(Step<a | e>)
 type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e}) | Quiet
+type Stepper<a | e> = new { step: () -> Option<a> / e }
 
 fn next<a | e>(s: Seq<a | e>) -> Option<{ value: a, next: Seq<a | e> }> / e =
   match s { Seq(step) -> step() }
@@ -580,9 +634,11 @@ row parameter has no short form that leaves it out. A declared type is closed: a
 row variable in it is one of its own row parameters (`E0301`), and a label in it is
 one of its own label parameters or the resource of that name, never a binder of
 the definition that uses the type. An alias's arguments are written into its
-expansion, so `Step<Int | {}>` is `() -> Option<..>`. A sum's arguments are part
-of which type it is, so a `Seq<Int | {}>` is not a `Seq<Int | {fs.read_at[src]}>`
-(§6.2). A printed type shows them as written, `m.Sink<Int, [conn] | {}>`.
+expansion, so `Step<Int | {}>` is `() -> Option<..>`. A sum's arguments, and a
+`new` record's, are part of which type it is, so a `Seq<Int | {}>` is not a
+`Seq<Int | {fs.read_at[src]}>` (§6.2), though a function a `Stepper<Int | e>`
+literal is built of may perform less than `e`, as any function meeting a type
+may. A printed type shows them as written, `m.Sink<Int, [conn] | {}>`.
 
 `where numeric(a)` lets a type parameter take arithmetic and the ordered
 comparisons: `+`, `-`, `*`, `%`, unary `-`, `<` and the rest, and
@@ -633,13 +689,16 @@ allows it (`E0439`).
 
 **`Cell<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are branded by their
 region and cannot outlive it; the brand prints as `Cell[users]<Int>`. A
-declaration is outside every region, so a variant's field or an operation's
-parameter or result that mentions any of them, at any depth, is `E0446`. Take it as a type parameter instead,
+declaration is outside every region, so a variant's field, a `new` record's
+field or an operation's parameter or result that mentions any of them, at any
+depth, is `E0446`. Take it as a type parameter instead,
 `type Held<t> = Held(t)`: the type argument carries the brand where the escape
 checks see it. A sum hides the rows its fields write, so a field whose function
 names `cell`, or joins a task or works a channel, in its row is `E0446` as well:
 take the row as a row parameter, `type Held<| e> = Held(() -> Int / e)`, and a
 closure that reaches a region is seen leaving it in the row the type is given.
+A `new` record's fields are read wherever it goes, so a row one of them writes
+is seen leaving a region as a plain record's is.
 
 ### 4.7 Function types, and what is written
 
@@ -770,6 +829,8 @@ a field path, or one call (the call runs once); its fields come from the type
 the checker infers for it, wherever that type was declared — another module's
 `type` included. A base whose type nothing in the program determines is
 `E0116`, and so is one that is not a record. A field the base lacks is `E0117`.
+An update of a `new` record (§4.2) answers that record, so a field it writes
+keeps its declared type (`E0201`).
 
 ### 5.6 Lists
 
@@ -1840,7 +1901,8 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 ```
 
 `where derivable(D, p)` goes after the row and before any `requires`. Codecs are
-plain values: `json::decode_bytes(body, order_json())`.
+plain values: `json::decode_bytes(body, order_json())`. A `new` record (§4.2)
+derives as an alias of its fields does: the same documents, bytes and shape.
 
 A `json` or `bin` codec whose type reaches itself, directly or through the
 other types the module derives, is two definitions: `tree_json()` starts
@@ -1879,7 +1941,7 @@ the authority when this page and it disagree. Only the prelude declares one; an
 | `panic<a>(message: String) -> a` | raises `message` (§6.8); unanswered, `E0502` |
 | `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
-| `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
+| `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), a constructor counts by the name its module declares, and a `new` record is the record it is written as; needs `derivable(hash, a)` |
 | `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
 | `min<a>(a: a, b: a) -> a`, `max` | in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)` |
 | `numeric_of_int<a>(n: Int) -> a` | `n` at the `numeric` type the call is at (§4.5); raises past a width's range, which a literal in `0..=127` never is |
@@ -2882,13 +2944,14 @@ the host's. A run that is not simulated draws here, and `--host` binds it.
 ### 13.19 `std.uuid`
 
 ```ply
-pub type Uuid = { octets: Bytes }
+pub type Uuid = new { octets: Bytes }
 pub fn uuid_render(u: Uuid) -> String
 pub fn uuid_parse(text: String) -> Option<Uuid>
 pub fn uuid_v4() -> Uuid / {entropy.next bounded}
 ```
 
-A 128-bit identifier as its sixteen octets. `uuid_render` writes the canonical
+A 128-bit identifier as its sixteen octets, a record of its own (§4.2): another
+record with an `octets` field is not one. `uuid_render` writes the canonical
 lower-case `8-4-4-4-12` form; `uuid_parse` reads it and accepts upper case, as
 RFC 9562 requires of a reader, while anything that is not that form is `None`
 rather than a raise. `uuid_v4` draws two machine words of `std.random` entropy
@@ -3381,7 +3444,8 @@ pub fn width_of(ty: String) -> Int
 A value of any type as data: what `machine.call` takes and answers, what a
 runtime diagnostic carries, and what a counterexample binds. `render` is the one
 way a value is shown, in the language's own spelling: a constructor by the name
-its module declares, an array as `array_of_list([..])`. In a diagnostic, a list
+its module declares, a `new` record as the literal it is built by, an array as
+`array_of_list([..])`. In a diagnostic, a list
 or map past `shown_items` items counts the rest, nesting past `shown_depth`
 shows as `…`, and a credential shows as `Secret(****)`; `render_all` writes
 every item at every depth, which is what a program shows (§13.38). A fixed
@@ -4037,6 +4101,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0211` | integer literal out of range for its fixed width |
 | `E0212` | the alternatives of an or-pattern bind different names |
 | `E0213` | a `let` whose or-pattern can fail has no `else` |
+| `E0214` | a `new` record whose fields reach the record itself |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |

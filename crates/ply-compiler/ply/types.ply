@@ -173,6 +173,9 @@ pub type Type =
   | TyFn({ params: List<Type>, ret: Type, effects: Row })
   // Sorted by field name.
   | TyRecord(List<Field>)
+  // A record a `type T = new { .. }` declares: `name` and `args` are all that tell two apart, and
+  // `fields` is what they stand for, sorted by field name and written over `args`.
+  | TyNominal({ name: Bytes, args: List<Type>, fields: List<Field> })
 
 pub type Scheme = { ty_vars: List<Int>, row_vars: List<Int>, label_vars: List<Int>, ty: Type }
 
@@ -212,6 +215,10 @@ pub fn field_get(fields: List<Field>, name: Bytes) -> Option<Type> =
   fold(fields, None, |acc: Option<Type>, field: Field|
     match acc { Some(_) -> acc, None -> if field.name == name { Some(field.ty) } else { None } })
 
+// The fields a value of this type is read by, whether or not the type is declared.
+pub fn record_fields(ty: Type) -> Option<List<Field>> =
+  match ty { TyRecord(fs) -> Some(fs), TyNominal(n) -> Some(n.fields), _ -> None }
+
 pub fn mentions_secret(t: Type) -> Bool =
   match t {
     TyCon(c) ->
@@ -220,6 +227,7 @@ pub fn mentions_secret(t: Type) -> Bool =
       fold(f.params, false, |acc: Bool, p: Type| acc || mentions_secret(p))
         || mentions_secret(f.ret),
     TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
+    TyNominal(n) -> fold(n.fields, false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
     TyVar(_) -> false,
   }
 
@@ -327,6 +335,14 @@ fn resolved_ty(subst: Subst, t: Type, room: Int) -> Type / {abort.raise} =
       }),
     TyRecord(fs) ->
       TyRecord(map(fs, |f: Field| { name: f.name, ty: resolved_ty(subst, f.ty, room) })),
+    // Its fields hold no variable its arguments do not.
+    TyNominal(n) -> if len(n.args) == 0 { t } else {
+      TyNominal({
+        name: n.name,
+        args: map(n.args, |a: Type| resolved_ty(subst, a, room)),
+        fields: map(n.fields, |f: Field| { name: f.name, ty: resolved_ty(subst, f.ty, room) }),
+      })
+    },
   }
 
 pub fn resolved_tail(subst: Subst, row: Row) -> Option<Int> / {abort.raise} = {
@@ -448,6 +464,7 @@ pub fn occurs_ty(v: Int, t: Type) -> Bool =
     TyFn(f) ->
       fold(f.params, false, |acc: Bool, p: Type| acc || occurs_ty(v, p)) || occurs_ty(v, f.ret),
     TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || occurs_ty(v, f.ty)),
+    TyNominal(n) -> fold(n.args, false, |acc: Bool, a: Type| acc || occurs_ty(v, a)),
   }
 
 pub type UnifyError =
@@ -529,6 +546,7 @@ fn free_vars_within(subst: Subst, ty: Type, acc: Free, room: Int) -> Free / {abo
     },
     TyRecord(fs) ->
       fold(fs, acc, |a: Free, field: Field| free_vars_within(subst, field.ty, a, room)),
+    TyNominal(n) -> fold(n.args, acc, |a: Free, x: Type| free_vars_within(subst, x, a, room)),
   }
 
 // Immutable containers, which may hold a narrower function than their type says.
@@ -584,6 +602,7 @@ fn type_size(t: Type) -> Int =
     TyCon(c) -> fold(c.args, 1, |n: Int, a: Type| n + type_size(a)),
     TyFn(f) -> fold(f.params, 1 + type_size(f.ret), |n: Int, p: Type| n + type_size(p)),
     TyRecord(fs) -> fold(fs, 1, |n: Int, f: Field| n + type_size(f.ty)),
+    TyNominal(x) -> fold(x.args, 1, |n: Int, a: Type| n + type_size(a)),
   }
 
 fn unify_structural(
@@ -651,6 +670,14 @@ fn unify_structural(
           tries,
         )
       },
+      _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
+    },
+    // By name, as a sum is: the fields follow from the arguments.
+    TyNominal(n1) -> match b {
+      TyNominal(n2) -> if n1.name != n2.name || len(n1.args) != len(n2.args) {
+        unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
+      } else if len(n1.args) == 0 { unified(subst, fresh) }
+      else { unify_all(subst, fresh, n1.args, n2.args, true, room, tries) },
       _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
     },
     TyVar(_) -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
@@ -886,6 +913,13 @@ fn rename(t: Type, tys: Map<Int, Type>, rows: Map<Int, Int>) -> Type / {abort.ra
         },
       }),
     TyRecord(fs) -> TyRecord(map(fs, |x: Field| { name: x.name, ty: rename(x.ty, tys, rows) })),
+    TyNominal(n) -> if len(n.args) == 0 { t } else {
+      TyNominal({
+        name: n.name,
+        args: map(n.args, |a: Type| rename(a, tys, rows)),
+        fields: map(n.fields, |x: Field| { name: x.name, ty: rename(x.ty, tys, rows) }),
+      })
+    },
   }
 
 fn rename_atom(atom: Atom, tys: Map<Int, Type>) -> Atom / {abort.raise} =
@@ -919,6 +953,13 @@ fn substituted(t: Type, tys: Map<Int, Type>, rows: Map<Int, Row>) -> Type / {abo
     },
     TyRecord(fs) ->
       TyRecord(map(fs, |x: Field| { name: x.name, ty: substituted(x.ty, tys, rows) })),
+    TyNominal(n) -> if len(n.args) == 0 { t } else {
+      TyNominal({
+        name: n.name,
+        args: map(n.args, |a: Type| substituted(a, tys, rows)),
+        fields: map(n.fields, |x: Field| { name: x.name, ty: substituted(x.ty, tys, rows) }),
+      })
+    },
   }
 
 // A declaration's type as one use of it holds it: the declaration's variables give way to the
@@ -1045,6 +1086,7 @@ fn name_in(n: Naming, ty: Type) -> Naming =
       match f.effects.tail { Some(v) -> name_row(m, v), None -> m }
     },
     TyRecord(fs) -> fold(fs, n, |m: Naming, field: Field| name_in(m, field.ty)),
+    TyNominal(x) -> fold(x.args, n, name_in),
   }
 
 fn as_types(naming: Naming) -> Map<Int, Type> =
@@ -1175,6 +1217,7 @@ fn reserve_ty(printer: Printer, t: Type) -> Printer / {abort.raise} =
         f.effects.atoms,
       ),
     TyRecord(fs) -> fold(fs, printer, |acc: Printer, f: Field| reserve_ty(acc, f.ty)),
+    TyNominal(n) -> fold(n.args, printer, |acc: Printer, a: Type| reserve_ty(acc, a)),
   }
 
 pub fn region_prefix() -> Bytes = b"#region:"
@@ -1254,18 +1297,10 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
           { printer: elem.printer, text: bytes_concat_all([b"Cell[", r, b"]<", elem.text, b">"]) },
         None -> { printer: elem.printer, text: bytes_concat_all([b"Cell<", elem.text, b">"]) },
       }
-    } else if len(c.args) == 0 { { printer: printer, text: c.name } } else if over_arg(ty) {
+    } else if len(c.args) > 0 && over_arg(ty) {
       let o = label_text(printer, at(c.args, 0));
       { printer: o.printer, text: bytes_concat_all([b"[", o.text, b"]"]) }
-    } else if fold(c.args, false, |any: Bool, a: Type| any || over_arg(a)) {
-      printed_over(printer, c.name, c.args)
-    } else {
-      let args = print_tys(printer, c.args);
-      {
-        printer: args.printer,
-        text: bytes_concat_all([c.name, b"<", join(args.texts, b", "), b">"]),
-      }
-    },
+    } else { applied(printer, c.name, c.args) },
     TyFn(f) -> match arg_row(ty) {
       Some(row) -> print_row(printer, row),
       None -> {
@@ -1305,6 +1340,20 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
         { printer: out.printer, text: bytes_concat_all([b"{", join(out.texts, b", "), b"}"]) }
       },
     },
+    TyNominal(n) -> applied(printer, n.name, n.args),
+  }
+
+fn applied(
+  printer: Printer,
+  name: Bytes,
+  args: List<Type>,
+) -> { printer: Printer, text: Bytes } / {abort.raise} =
+  if len(args) == 0 { { printer: printer, text: name } }
+  else if fold(args, false, |any: Bool, a: Type| any || over_arg(a)) {
+    printed_over(printer, name, args)
+  } else {
+    let shown = print_tys(printer, args);
+    { printer: shown.printer, text: bytes_concat_all([name, b"<", join(shown.texts, b", "), b">"]) }
   }
 
 // A declared type with the labels and rows it is given, each kind where a use writes it.
@@ -1811,6 +1860,37 @@ test "a declared type's labels and rows print in their places, unify as argument
     ),
     b"(a) -> m.Sink<Int, [conn] | {net.send[l] | e}> / {net.send[conn], net.send[l] | e}",
   )
+}
+
+test "a `new` record's labels and rows print, unify and fill its fields as a sum's do" {
+  let send = |r: Resource| { effect: b"net", resource: r, mode: MWrite, op: Some(b"send") };
+  let held = |label: Type, row: Row|
+    TyNominal({
+      name: b"m.Feed",
+      args: applied_args([int_type()], [label], [row]),
+      fields: [{ name: b"send", ty: fn_type([int_type()], unit_type(), row) }],
+    });
+  let open = held(TyVar(1), { atoms: [send(RVar(1))], tail: Some(2) });
+  let conn = held(label_type(b"conn"), row_singleton(send(RNamed(b"conn"))));
+  assert_eq(type_text(open), b"m.Feed<Int, [l] | {net.send[l] | e}>");
+  // The declaration at one use's arguments: its fields are written over what it was given.
+  let used = at_arguments(
+    held(TyVar(1), row_open(2)),
+    [1],
+    [2],
+    applied_args([], [label_type(b"conn")], [row_singleton(send(RNamed(b"conn")))]),
+  );
+  assert_eq(type_text(used), b"m.Feed<Int, [conn] | {net.send[conn]}>");
+  assert_eq(match used { TyNominal(n) -> map(n.fields, |f: Field| type_text(f.ty)), _ -> [] }, [
+    b"(Int) -> Unit / {net.send[conn]}",
+  ]);
+  let fresh = { next_ty: 3, next_row: 3 };
+  assert(unify(subst_new(), fresh, used, conn).error == None);
+  // What it is given is exact: a narrower row is another type, and so is another label.
+  let narrower = unify(subst_new(), fresh, conn, held(label_type(b"conn"), row_empty()));
+  assert(match narrower.error { Some(RowMismatch(_)) -> true, _ -> false });
+  let elsewhere = unify(subst_new(), fresh, conn, held(label_type(b"peer"), row_open(2)));
+  assert(match elsewhere.error { Some(Mismatch(_)) -> true, _ -> false })
 }
 
 test "generalization skips what the environment still reaches" {
