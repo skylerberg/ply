@@ -1,13 +1,20 @@
-// std.bin — a compact positional encoding, and what `derive bin for T` targets.
-//
-// Both ends know the type, so nothing names a field: a record is its fields in declared order, a
-// variant its constructor's index and then its fields. Every value takes at least one byte, so a
-// reader can refuse a count longer than the bytes left, and one value has one encoding.
+//! A compact positional encoding, and what `derive bin for T` targets.
+//!
+//! Both ends know the type, so nothing names a field: a record is its fields in declared order, a
+//! variant its constructor's index and then its fields. `Int`, counts, lengths and the 16- to 128-bit
+//! widths are varints, the signed ones zigzagged; `U8` and `I8` are one byte, `Float` its eight IEEE
+//! bytes, `Decimal` its text, `Char` its scalar value and `Unit` one zero byte, so every value takes at
+//! least a byte and a reader can refuse a count longer than the bytes left. One value has one encoding:
+//! `decode` refuses bytes that end inside the value, bytes left over, and anything no value writes (a
+//! constructor index past the type's, a map's keys out of order, an overlong varint, text that is not
+//! UTF-8). `shape_digest` keys what a store wrote by the shape of its type.
 
 // --- Errors -----------------------------------------------------------------
 
+/// Why bytes do not decode, and the offset where that was found.
 pub type BinError = { at: Int, message: String }
 
+/// How an error reads.
 pub fn error_to_string(e: BinError) -> String =
   e.message ++ " (at byte " ++ int_to_string(e.at) ++ ")"
 
@@ -17,20 +24,21 @@ fn refused(at: Int, message: String) -> BinError = { at: at, message: message }
 
 // --- Codecs -----------------------------------------------------------------
 
+/// A value read, and the offset after it.
 pub type Taken<a> = { value: a, at: Int }
 
-// `shape` digests the type's structure, names included, so bytes written under another
-// definition of a type are told apart from its own.
+/// `shape` digests the type's structure, names included, so bytes written under another
+/// definition of a type are told apart from its own.
 pub type BinCodec<a> = {
   put: (Bytes, a) -> Bytes / {abort.raise},
   take: (Bytes, Int) -> Result<Taken<a>, BinError> / {abort.raise},
   shape: Shape,
 }
 
-// The deepest a derived codec over a recursive type nests, which is as deep as calls nest.
+/// The deepest a derived codec over a recursive type nests, which is as deep as calls nest.
 pub fn max_depth() -> Int = 10000
 
-// A derived codec over a recursive type, past `max_depth` levels of it.
+/// A derived codec over a recursive type, past `max_depth` levels of it.
 pub fn too_deep<a>() -> BinCodec<a> =
   {
     put: |_w: Bytes, _x: a| panic(nested_too_deep()),
@@ -42,9 +50,8 @@ fn nested_too_deep() -> String = "nested deeper than " ++ int_to_string(max_dept
 
 // --- Varints ----------------------------------------------------------------
 
-// Seven bits a byte, low first, the high bit set on every byte but the last; `n` is read as its
-// 64 unsigned bits.
-// A negative value's first shift leaves it non-negative, and from there each shift lowers it.
+/// Appends seven bits a byte, low first, the high bit set on every byte but the last; `n` is read as
+/// its 64 unsigned bits.
 pub fn put_varint(w: Bytes, n: Int) -> Bytes / {abort.raise} =
   if n >= 0 { unsigned_varint(w, n) }
   else { unsigned_varint(w ++ byte_of_int(n & 127 | 128), n >>> 7) }
@@ -53,6 +60,7 @@ fn unsigned_varint(w: Bytes, n: Int) -> Bytes / {abort.raise} =
   if n < 128 { w ++ byte_of_int(n) }
   else { unsigned_varint(w ++ byte_of_int(n & 127 | 128), n >>> 7) }
 
+/// The varint at `at`, refusing an overlong one.
 pub fn take_varint(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> / {abort.raise} = {
   let b = byte_at(d, at);
   if b >= 0 && b < 128 { Ok({ value: b, at: at + 1 }) } else { varint_from(d, at, at, 0, 0) }
@@ -81,7 +89,7 @@ fn zig(n: Int) -> Int = n << 1 ^ n >> 63
 
 fn unzig(z: Int) -> Int = z >>> 1 ^ 0 - (z & 1)
 
-// A varint that must lie in `lo..=hi`.
+/// A varint that must lie in `lo..=hi`.
 fn take_ranged(
   d: Bytes,
   at: Int,
@@ -112,7 +120,7 @@ fn take_zigzag(
 
 fn t_ok<a>(value: a, at: Int) -> Result<Taken<a>, BinError> = Ok({ value: value, at: at })
 
-// A count of what follows: each takes at least a byte, so a count past the bytes left is refused.
+/// A count of what follows: each takes at least a byte, so a count past the bytes left is refused.
 pub fn take_count(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> / {abort.raise} =
   match take_varint(d, at) {
     Err(e) -> Err(e),
@@ -121,9 +129,10 @@ pub fn take_count(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> / {abort.ra
     } else { Ok(t) },
   }
 
+/// Appends a constructor index.
 pub fn put_tag(w: Bytes, index: Int) -> Bytes / {abort.raise} = put_varint(w, index)
 
-// The constructor index of a type with `count` constructors.
+/// The constructor index of a type with `count` constructors.
 pub fn take_tag(d: Bytes, at: Int, count: Int) -> Result<Taken<Int>, BinError> / {abort.raise} =
   match take_varint(d, at) {
     Err(e) -> Err(e),
@@ -139,8 +148,10 @@ pub fn take_tag(d: Bytes, at: Int, count: Int) -> Result<Taken<Int>, BinError> /
 
 // --- Scalars ----------------------------------------------------------------
 
+/// Appends `()`.
 pub fn put_unit(w: Bytes, u: Unit) -> Bytes / {abort.raise} = w ++ byte_of_int(0)
 
+/// Reads `()` at `at`.
 pub fn take_unit(d: Bytes, at: Int) -> Result<Taken<Unit>, BinError> / {abort.raise} = {
   let b = byte_at(d, at);
   if b == 0 { t_ok((), at + 1) }
@@ -148,9 +159,11 @@ pub fn take_unit(d: Bytes, at: Int) -> Result<Taken<Unit>, BinError> / {abort.ra
   else { Err(refused(at, "a unit is the byte 0")) }
 }
 
+/// Appends a `Bool`.
 pub fn put_bool(w: Bytes, b: Bool) -> Bytes / {abort.raise} =
   w ++ byte_of_int(if b { 1 } else { 0 })
 
+/// Reads a `Bool` at `at`.
 pub fn take_bool(d: Bytes, at: Int) -> Result<Taken<Bool>, BinError> / {abort.raise} = {
   let b = byte_at(d, at);
   if b == 0 { t_ok(false, at + 1) }
@@ -159,8 +172,10 @@ pub fn take_bool(d: Bytes, at: Int) -> Result<Taken<Bool>, BinError> / {abort.ra
   else { Err(refused(at, "a boolean is the byte 0 or 1")) }
 }
 
+/// Appends an `Int`, zigzagged.
 pub fn put_int(w: Bytes, n: Int) -> Bytes / {abort.raise} = put_varint(w, zig(n))
 
+/// Reads an `Int` at `at`.
 pub fn take_int(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> / {abort.raise} = {
   let b = byte_at(d, at);
   if b >= 0 && b < 128 { Ok({ value: unzig(b), at: at + 1 }) } else {
@@ -168,7 +183,7 @@ pub fn take_int(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> / {abort.rais
   }
 }
 
-// The IEEE-754 bits, little-endian, so every `NaN` keeps its payload.
+/// Appends a `Float`'s IEEE-754 bits, little-endian, so every `NaN` keeps its payload.
 pub fn put_float(w: Bytes, f: Float) -> Bytes / {abort.raise} = {
   let n = bits_of_float(f);
   bytes_concat_all([
@@ -184,6 +199,7 @@ pub fn put_float(w: Bytes, f: Float) -> Bytes / {abort.raise} = {
   ])
 }
 
+/// Reads a `Float` at `at`.
 pub fn take_float(d: Bytes, at: Int) -> Result<Taken<Float>, BinError> / {abort.raise} =
   if at + 8 > bytes_len(d) { Err(short(at)) } else {
     let low = int_of_u32(bytes_u32_le(d, at));
@@ -191,9 +207,10 @@ pub fn take_float(d: Bytes, at: Int) -> Result<Taken<Float>, BinError> / {abort.
     t_ok(float_of_bits(low | high << 32), at + 8)
   }
 
+/// Appends a length and the bytes.
 pub fn put_bytes(w: Bytes, b: Bytes) -> Bytes / {abort.raise} = put_varint(w, bytes_len(b)) ++ b
 
-// A length under 128 is one byte, which most are: read it in place.
+/// Reads a length and the bytes at `at`.
 pub fn take_bytes(d: Bytes, at: Int) -> Result<Taken<Bytes>, BinError> / {abort.raise} = {
   let n = byte_at(d, at);
   if n >= 0 && n < 128 && n <= bytes_len(d) - at - 1 {
@@ -206,8 +223,10 @@ pub fn take_bytes(d: Bytes, at: Int) -> Result<Taken<Bytes>, BinError> / {abort.
   }
 }
 
+/// Appends a `String` as its UTF-8 bytes.
 pub fn put_string(w: Bytes, s: String) -> Bytes / {abort.raise} = put_bytes(w, bytes_of_string(s))
 
+/// Reads a `String` as its UTF-8 bytes at `at`.
 pub fn take_string(d: Bytes, at: Int) -> Result<Taken<String>, BinError> / {abort.raise} =
   match take_bytes(d, at) {
     Err(e) -> Err(e),
@@ -215,10 +234,11 @@ pub fn take_string(d: Bytes, at: Int) -> Result<Taken<String>, BinError> / {abor
     else { Err(refused(at, "a string that is not UTF-8")) },
   }
 
-// The decimal text, which keeps the scale: `1.50` reads back as `1.50`.
+/// Appends a `Decimal` as its text, which keeps the scale: `1.50` reads back as `1.50`.
 pub fn put_decimal(w: Bytes, d: Decimal) -> Bytes / {abort.raise} =
   put_string(w, decimal_to_string(d))
 
+/// Reads a `Decimal` at `at`.
 pub fn take_decimal(d: Bytes, at: Int) -> Result<Taken<Decimal>, BinError> / {abort.raise} =
   match take_string(d, at) {
     Err(e) -> Err(e),
@@ -230,9 +250,10 @@ pub fn take_decimal(d: Bytes, at: Int) -> Result<Taken<Decimal>, BinError> / {ab
 
 // --- Fixed widths -----------------------------------------------------------
 
-// A byte holds the eight-bit widths whole; the rest are varints, zigzagged when signed.
+/// Appends a `Char`'s scalar value as a varint.
 pub fn put_char(w: Bytes, c: Char) -> Bytes / {abort.raise} = put_varint(w, int_of_char(c))
 
+/// Reads a `Char` at `at`.
 pub fn take_char(d: Bytes, at: Int) -> Result<Taken<Char>, BinError> / {abort.raise} =
   match take_varint(d, at) {
     Err(e) -> Err(e),
@@ -242,71 +263,88 @@ pub fn take_char(d: Bytes, at: Int) -> Result<Taken<Char>, BinError> / {abort.ra
     },
   }
 
+/// Appends a `U8`.
 pub fn put_u8(w: Bytes, n: U8) -> Bytes / {abort.raise} = w ++ byte_of_int(int_of_u8(n))
 
+/// Reads a `U8` at `at`.
 pub fn take_u8(d: Bytes, at: Int) -> Result<Taken<U8>, BinError> / {abort.raise} = {
   let b = byte_at(d, at);
   if b < 0 { Err(short(at)) } else { t_ok(u8_of_int(b), at + 1) }
 }
 
+/// Appends an `I8`.
 pub fn put_i8(w: Bytes, n: I8) -> Bytes / {abort.raise} = w ++ byte_of_int(int_of_i8(n) & 255)
 
+/// Reads an `I8` at `at`.
 pub fn take_i8(d: Bytes, at: Int) -> Result<Taken<I8>, BinError> / {abort.raise} = {
   let b = byte_at(d, at);
   if b < 0 { Err(short(at)) } else { t_ok(i8_of_int(if b > 127 { b - 256 } else { b }), at + 1) }
 }
 
+/// Appends a `U16`.
 pub fn put_u16(w: Bytes, n: U16) -> Bytes / {abort.raise} = put_varint(w, int_of_u16(n))
 
+/// Reads a `U16` at `at`.
 pub fn take_u16(d: Bytes, at: Int) -> Result<Taken<U16>, BinError> / {abort.raise} =
   match take_ranged(d, at, 0, 65535, "`U16`") {
     Err(e) -> Err(e),
     Ok(t) -> t_ok(u16_of_int(t.value), t.at),
   }
 
+/// Appends a `U32`.
 pub fn put_u32(w: Bytes, n: U32) -> Bytes / {abort.raise} = put_varint(w, int_of_u32(n))
 
+/// Reads a `U32` at `at`.
 pub fn take_u32(d: Bytes, at: Int) -> Result<Taken<U32>, BinError> / {abort.raise} =
   match take_ranged(d, at, 0, 4294967295, "`U32`") {
     Err(e) -> Err(e),
     Ok(t) -> t_ok(u32_of_int(t.value), t.at),
   }
 
-// A `U64` is the 64 bits a varint carries, moved through an `Int` in two halves.
+/// Appends a `U64`: the 64 bits a varint carries, moved through an `Int` in two halves.
 pub fn put_u64(w: Bytes, n: U64) -> Bytes / {abort.raise} =
   put_varint(w, int_of_u64(n >>> 32) << 32 | int_of_u64(n & 0xFFFF_FFFFu64))
 
+/// Reads a `U64` at `at`.
 pub fn take_u64(d: Bytes, at: Int) -> Result<Taken<U64>, BinError> / {abort.raise} =
   match take_varint(d, at) {
     Err(e) -> Err(e),
     Ok(t) -> t_ok(u64_of_int(t.value >>> 32) << 32 | u64_of_int(t.value & 0xFFFF_FFFF), t.at),
   }
 
+/// Appends an `I16`.
 pub fn put_i16(w: Bytes, n: I16) -> Bytes / {abort.raise} = put_varint(w, zig(int_of_i16(n)))
 
+/// Reads an `I16` at `at`.
 pub fn take_i16(d: Bytes, at: Int) -> Result<Taken<I16>, BinError> / {abort.raise} =
   match take_zigzag(d, at, 0 - 32768, 32767, "`I16`") {
     Err(e) -> Err(e),
     Ok(t) -> t_ok(i16_of_int(t.value), t.at),
   }
 
+/// Appends an `I32`.
 pub fn put_i32(w: Bytes, n: I32) -> Bytes / {abort.raise} = put_varint(w, zig(int_of_i32(n)))
 
+/// Reads an `I32` at `at`.
 pub fn take_i32(d: Bytes, at: Int) -> Result<Taken<I32>, BinError> / {abort.raise} =
   match take_zigzag(d, at, 0 - 2147483648, 2147483647, "`I32`") {
     Err(e) -> Err(e),
     Ok(t) -> t_ok(i32_of_int(t.value), t.at),
   }
 
+/// Appends an `I64`.
 pub fn put_i64(w: Bytes, n: I64) -> Bytes / {abort.raise} = put_int(w, int_of_i64(n))
 
+/// Reads an `I64` at `at`.
 pub fn take_i64(d: Bytes, at: Int) -> Result<Taken<I64>, BinError> / {abort.raise} =
   match take_int(d, at) { Err(e) -> Err(e), Ok(t) -> t_ok(i64_of_int(t.value), t.at) }
 
+/// Appends a `U128`.
 pub fn put_u128(w: Bytes, n: U128) -> Bytes / {abort.raise} =
   if n < 128u128 { w ++ byte_of_int(int_of_u128(n)) }
   else { put_u128(w ++ byte_of_int(int_of_u128(n & 127u128) | 128), n >>> 7) }
 
+/// Reads a `U128` at `at`.
 pub fn take_u128(d: Bytes, at: Int) -> Result<Taken<U128>, BinError> / {abort.raise} =
   u128_from(d, at, at, 0, 0u128)
 
@@ -327,7 +365,7 @@ fn u128_from(
   }
 }
 
-// Zigzagged in its own width, then written as its 128 unsigned bits.
+/// Appends an `I128`, zigzagged in its own width and then written as its 128 unsigned bits.
 pub fn put_i128(w: Bytes, n: I128) -> Bytes / {abort.raise} = i128_bits(w, n << 1 ^ n >> 127)
 
 fn i128_bits(w: Bytes, z: I128) -> Bytes / {abort.raise} =
@@ -338,6 +376,7 @@ fn unsigned_i128_bits(w: Bytes, z: I128) -> Bytes / {abort.raise} =
   if z < 128i128 { w ++ byte_of_int(int_of_i128(z)) }
   else { unsigned_i128_bits(w ++ byte_of_int(int_of_i128(z & 127i128) | 128), z >>> 7) }
 
+/// Reads an `I128` at `at`.
 pub fn take_i128(d: Bytes, at: Int) -> Result<Taken<I128>, BinError> / {abort.raise} =
   i128_from(d, at, at, 0, 0i128)
 
@@ -362,12 +401,16 @@ fn i128_from(
 
 // --- Shapes -----------------------------------------------------------------
 
-// A digest per sum type finished, and the sum types the walk is inside, which a reference back
-// names instead of re-entering.
+/// A digest per sum type finished, and the sum types the walk is inside, which a reference back
+/// names instead of re-entering.
 pub type Shapes = { done: Map<Bytes, Bytes>, open: List<Bytes> }
+/// A digest, and the sums finished along the way.
 pub type Shaped = { digest: Bytes, shapes: Shapes }
+/// How a type's digest is computed, given the sums already finished or open.
 pub type Shape = (Shapes) -> Shaped / {abort.raise}
+/// A record field's name and shape.
 pub type FieldShape = { name: String, shape: Shape }
+/// A constructor's name and its fields' shapes.
 pub type VariantShape = { name: String, fields: List<Shape> }
 
 type Digests = { digests: List<Bytes>, shapes: Shapes }
@@ -383,10 +426,11 @@ fn digests_of(s: Shapes, shapes: List<Shape>) -> Digests / {abort.raise} =
 fn digest(kind: Int, parts: List<Bytes>) -> Bytes / {abort.raise} =
   bytes_blake3(bytes_concat_all([byte_of_int(kind), bytes_concat_all(parts)]))
 
+/// The shape of a type with no parts, by its name.
 pub fn leaf_shape(name: String) -> Shape =
   |shapes: Shapes| { digest: digest(1, [named(name)]), shapes: shapes }
 
-// A type the language declares, applied to its arguments.
+/// A type the language declares, applied to its arguments.
 pub fn applied_shape(shapes: Shapes, name: String, args: List<Shape>) -> Shaped / {abort.raise} = {
   let a = digests_of(shapes, args);
   {
@@ -395,6 +439,7 @@ pub fn applied_shape(shapes: Shapes, name: String, args: List<Shape>) -> Shaped 
   }
 }
 
+/// The shape of a record: each field's name and shape, in order.
 pub fn record_shape(shapes: Shapes, fields: List<FieldShape>) -> Shaped / {abort.raise} = {
   let walked = fold(fields, { digests: [], shapes: shapes }, |acc: Digests, f: FieldShape| {
     let r = (f.shape)(acc.shapes);
@@ -406,8 +451,8 @@ pub fn record_shape(shapes: Shapes, fields: List<FieldShape>) -> Shaped / {abort
   }
 }
 
-// `key` tells apart two sums that share a simple name; only `name` enters the digest, so moving a
-// module leaves its shapes alone.
+/// `key` tells apart two sums that share a simple name; only `name` enters the digest, so moving a
+/// module leaves its shapes alone.
 pub fn sum_shape(
   shapes: Shapes,
   key: String,
@@ -454,37 +499,56 @@ pub fn sum_shape(
 
 // --- Scalar codecs ----------------------------------------------------------
 
+/// The codec of `Unit`.
 pub fn unit_bin() -> BinCodec<Unit> = { put: put_unit, take: take_unit, shape: leaf_shape("Unit") }
+/// The codec of `Bool`.
 pub fn bool_bin() -> BinCodec<Bool> = { put: put_bool, take: take_bool, shape: leaf_shape("Bool") }
+/// The codec of `Int`.
 pub fn int_bin() -> BinCodec<Int> = { put: put_int, take: take_int, shape: leaf_shape("Int") }
 
+/// The codec of `Float`.
 pub fn float_bin() -> BinCodec<Float> =
   { put: put_float, take: take_float, shape: leaf_shape("Float") }
 
+/// The codec of `Decimal`.
 pub fn decimal_bin() -> BinCodec<Decimal> =
   { put: put_decimal, take: take_decimal, shape: leaf_shape("Decimal") }
 
+/// The codec of `String`.
 pub fn string_bin() -> BinCodec<String> =
   { put: put_string, take: take_string, shape: leaf_shape("String") }
 
+/// The codec of `Bytes`.
 pub fn bytes_bin() -> BinCodec<Bytes> =
   { put: put_bytes, take: take_bytes, shape: leaf_shape("Bytes") }
 
+/// The codec of `Char`.
 pub fn char_bin() -> BinCodec<Char> = { put: put_char, take: take_char, shape: leaf_shape("Char") }
 
+/// The codec of `U8`.
 pub fn u8_bin() -> BinCodec<U8> = { put: put_u8, take: take_u8, shape: leaf_shape("U8") }
+/// The codec of `U16`.
 pub fn u16_bin() -> BinCodec<U16> = { put: put_u16, take: take_u16, shape: leaf_shape("U16") }
+/// The codec of `U32`.
 pub fn u32_bin() -> BinCodec<U32> = { put: put_u32, take: take_u32, shape: leaf_shape("U32") }
+/// The codec of `U64`.
 pub fn u64_bin() -> BinCodec<U64> = { put: put_u64, take: take_u64, shape: leaf_shape("U64") }
+/// The codec of `U128`.
 pub fn u128_bin() -> BinCodec<U128> = { put: put_u128, take: take_u128, shape: leaf_shape("U128") }
+/// The codec of `I8`.
 pub fn i8_bin() -> BinCodec<I8> = { put: put_i8, take: take_i8, shape: leaf_shape("I8") }
+/// The codec of `I16`.
 pub fn i16_bin() -> BinCodec<I16> = { put: put_i16, take: take_i16, shape: leaf_shape("I16") }
+/// The codec of `I32`.
 pub fn i32_bin() -> BinCodec<I32> = { put: put_i32, take: take_i32, shape: leaf_shape("I32") }
+/// The codec of `I64`.
 pub fn i64_bin() -> BinCodec<I64> = { put: put_i64, take: take_i64, shape: leaf_shape("I64") }
+/// The codec of `I128`.
 pub fn i128_bin() -> BinCodec<I128> = { put: put_i128, take: take_i128, shape: leaf_shape("I128") }
 
 // --- Structural codecs ------------------------------------------------------
 
+/// A count and the items.
 pub fn list_bin<a>(item: BinCodec<a>) -> BinCodec<List<a>> =
   {
     put: |w: Bytes, xs: List<a>| fold(xs, put_varint(w, len(xs)), item.put),
@@ -496,8 +560,8 @@ pub fn list_bin<a>(item: BinCodec<a>) -> BinCodec<List<a>> =
     shape: |shapes: Shapes| applied_shape(shapes, "List", [item.shape]),
   }
 
-// An array is written as a list is, under a shape of its own, so turning one into the other moves
-// the shape's digest.
+/// An array is written as a list is, under a shape of its own, so turning one into the other moves
+/// the shape's digest.
 pub fn array_bin<a>(item: BinCodec<a>) -> BinCodec<Array<a>> = {
   let items = list_bin(item);
   {
@@ -525,7 +589,7 @@ fn take_items<a | e>(
     }
   }
 
-// Entries in key order; a reader refuses keys out of order, so a map has one encoding.
+/// Entries in key order; a reader refuses keys out of order, so a map has one encoding.
 pub fn map_bin<k, v>(key: BinCodec<k>, value: BinCodec<v>) -> BinCodec<Map<k, v>>
   where derivable(ord, k)
 =
@@ -576,6 +640,7 @@ fn take_entries<k, v>(
     }
   }
 
+/// `None` or `Some`, tagged as a variant.
 pub fn option_bin<a>(item: BinCodec<a>) -> BinCodec<Option<a>> =
   {
     put: |w: Bytes, o: Option<a>|
@@ -590,6 +655,7 @@ pub fn option_bin<a>(item: BinCodec<a>) -> BinCodec<Option<a>> =
     shape: |shapes: Shapes| applied_shape(shapes, "Option", [item.shape]),
   }
 
+/// `Ok` or `Err`, tagged as a variant.
 pub fn result_bin<a, b>(ok: BinCodec<a>, err: BinCodec<b>) -> BinCodec<Result<a, b>> =
   {
     put: |w: Bytes, r: Result<a, b>|
@@ -606,6 +672,7 @@ pub fn result_bin<a, b>(ok: BinCodec<a>, err: BinCodec<b>) -> BinCodec<Result<a,
     shape: |shapes: Shapes| applied_shape(shapes, "Result", [ok.shape, err.shape]),
   }
 
+/// `Continue` or `Stop`, tagged as a variant.
 pub fn iter_bin<a, b>(more: BinCodec<a>, done: BinCodec<b>) -> BinCodec<Iter<a, b>> =
   {
     put: |w: Bytes, i: Iter<a, b>|
@@ -625,7 +692,7 @@ pub fn iter_bin<a, b>(more: BinCodec<a>, done: BinCodec<b>) -> BinCodec<Iter<a, 
     shape: |shapes: Shapes| applied_shape(shapes, "Iter", [more.shape, done.shape]),
   }
 
-// An `Instant` and a `Duration` are their nanoseconds.
+/// An `Instant` and a `Duration` are their nanoseconds.
 pub fn instant_bin() -> BinCodec<Instant> =
   {
     put: |w: Bytes, t: Instant| match t { Instant(n) -> put_int(w, n) },
@@ -634,6 +701,7 @@ pub fn instant_bin() -> BinCodec<Instant> =
     shape: |shapes: Shapes| applied_shape(shapes, "Instant", []),
   }
 
+/// The codec of `Duration`, as its nanoseconds.
 pub fn duration_bin() -> BinCodec<Duration> =
   {
     put: |w: Bytes, t: Duration| match t { Duration(n) -> put_int(w, n) },
@@ -642,6 +710,7 @@ pub fn duration_bin() -> BinCodec<Duration> =
     shape: |shapes: Shapes| applied_shape(shapes, "Duration", []),
   }
 
+/// The codec of `Ordering`.
 pub fn ordering_bin() -> BinCodec<Ordering> =
   {
     put: |w: Bytes, o: Ordering| put_tag(w, match o { Less -> 0, Equal -> 1, Greater -> 2 }),
@@ -653,6 +722,7 @@ pub fn ordering_bin() -> BinCodec<Ordering> =
     shape: |shapes: Shapes| applied_shape(shapes, "Ordering", []),
   }
 
+/// The codec of `Rounding`.
 pub fn rounding_bin() -> BinCodec<Rounding> =
   {
     put: |w: Bytes, r: Rounding|
@@ -685,9 +755,10 @@ pub fn rounding_bin() -> BinCodec<Rounding> =
 
 // --- The two ends together --------------------------------------------------
 
+/// `x` written with `codec`.
 pub fn encode<a>(x: a, codec: BinCodec<a>) -> Bytes / {abort.raise} = (codec.put)(b"", x)
 
-// Refuses bytes left over after the value as well as bytes that end inside it.
+/// Refuses bytes left over after the value as well as bytes that end inside it.
 pub fn decode<a>(data: Bytes, codec: BinCodec<a>) -> Result<a, BinError> / {abort.raise} =
   match (codec.take)(data, 0) {
     Err(e) -> Err(e),
@@ -695,8 +766,8 @@ pub fn decode<a>(data: Bytes, codec: BinCodec<a>) -> Result<a, BinError> / {abor
     else { Err(refused(t.at, "bytes follow the value")) },
   }
 
-// The 32-byte digest of the codec's type: equal for two codecs of one definition, and different
-// once a field, a constructor, a name or an order changes anywhere the type reaches.
+/// The 32-byte digest of the codec's type: equal for two codecs of one definition, and different
+/// once a field, a constructor, a name or an order changes anywhere the type reaches.
 pub fn shape_digest<a>(codec: BinCodec<a>) -> Bytes / {abort.raise} =
   (codec.shape)({ done: map_new(), open: [] }).digest
 
@@ -826,7 +897,7 @@ test "a shape tells types apart by structure and by name, and a recursive one fi
   assert(shape_digest(tree()) != shape_digest(list_bin(tree())))
 }
 
-// A hand-written recursive codec, as `derive bin` writes one: the shape names the type again.
+/// A hand-written recursive codec, as `derive bin` writes one: the shape names the type again.
 fn tree() -> BinCodec<List<Int>> = tree_at(max_depth())
 
 fn tree_at(depth: Int) -> BinCodec<List<Int>> =
