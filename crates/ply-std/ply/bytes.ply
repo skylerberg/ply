@@ -4,8 +4,9 @@
 //! big-endian.
 //!
 //! A read past either end answers `None` rather than raising, and so does a `u64` past what an `Int`
-//! holds, so an answer is never a negative length. `int_of_ascii` is the one integer parser the
-//! shipped modules share. Hex is `std.radix` at its lowercase alphabet.
+//! holds, so an answer is never a negative length. `int_of_ascii_radix` is the one integer parser
+//! the shipped modules share, `int_of_ascii` is it in decimal, and `std.math`'s `from_radix` is it
+//! over a `String`. Hex is `std.radix` at its lowercase alphabet.
 
 import std.radix
 
@@ -342,27 +343,45 @@ test "repeat repeats, and a non-positive count is the empty bytes" {
 
 /// A decimal integer in ASCII: an optional `-`, then one or more digits, and nothing else. `None`
 /// for anything else, and for a number past what an `Int` holds.
-pub fn int_of_ascii(b: Bytes) -> Option<Int> / {abort.raise} = {
-  let negative = bytes_len(b) > 0 && bytes_at(b, 0) == 45;
-  let start = if negative { 1 } else { 0 };
-  if start >= bytes_len(b) { None } else { negated_digits(b, start, 0, negative) }
-}
+pub fn int_of_ascii(b: Bytes) -> Option<Int> / {abort.raise} = int_of_ascii_radix(b, 10)
 
-/// Accumulated below zero, because the least `Int` has no positive twin.
-fn negated_digits(b: Bytes, i: Int, acc: Int, negative: Bool) -> Option<Int> / {abort.raise} =
-  if i >= bytes_len(b) {
-    if negative { Some(acc) } else if acc == least_int() { None } else { Some(0 - acc) }
-  } else {
-    let d = bytes_at(b, i) - 48;
-    if d < 0 || d > 9 { None }
-    // `acc * 10 - d` would pass the least `Int`: it is `least_tenth() * 10 - 8`.
-    else if acc < least_tenth() || (acc == least_tenth() && d > 8) { None }
-    else { negated_digits(b, i + 1, acc * 10 - d, negative) }
+/// An integer in ASCII in `radix`: an optional `-`, then one or more digits, each `0-9`, `a-z` or
+/// `A-Z` and below the radix, and nothing else: no `+`, no prefix such as `0x`, no separator and
+/// no blank. `None` for anything else, and for a number past what an `Int` holds. Raises for a
+/// radix outside `2..=36`.
+pub fn int_of_ascii_radix(b: Bytes, radix: Int) -> Option<Int> / {abort.raise} =
+  if radix < 2 || radix > 36 { panic("a radix is 2 to 36") } else {
+    let negative = bytes_len(b) > 0 && bytes_at(b, 0) == 45;
+    let start = if negative { 1 } else { 0 };
+    if start >= bytes_len(b) { None } else {
+      match digits_below(b, start, radix, 0) {
+        Some(below) -> if negative { Some(below) } else { checked_neg(below) },
+        None -> None,
+      }
+    }
   }
 
-fn least_int() -> Int = 0 - 9223372036854775807 - 1
+/// The value of the digit `c` of a radix up to 36, in either case, or `-1` for any other byte.
+pub fn digit_value(c: Int) -> Int =
+  if c >= 48 && c <= 57 { c - 48 }
+  else if c >= 97 && c <= 122 { c - 87 }
+  else if c >= 65 && c <= 90 { c - 55 }
+  else { -1 }
 
-fn least_tenth() -> Int = 0 - 922337203685477580
+/// The digits from `i` on, read below zero, because the least `Int` has no positive twin.
+fn digits_below(b: Bytes, i: Int, radix: Int, acc: Int) -> Option<Int> / {abort.raise} =
+  if i >= bytes_len(b) { Some(acc) } else {
+    let d = digit_value(bytes_at(b, i));
+    if d < 0 || d >= radix { None } else {
+      match checked_mul(acc, radix) {
+        None -> None,
+        Some(scaled) -> match checked_sub(scaled, d) {
+          None -> None,
+          Some(next) -> digits_below(b, i + 1, radix, next),
+        },
+      }
+    }
+  }
 
 test "a decimal integer reads back, signed, over the whole Int range" {
   assert_eq(int_of_ascii(b"0"), Some(0));
@@ -370,7 +389,32 @@ test "a decimal integer reads back, signed, over the whole Int range" {
   assert_eq(int_of_ascii(b"-42"), Some(0 - 42));
   assert_eq(int_of_ascii(b"007"), Some(7));
   assert_eq(int_of_ascii(b"9223372036854775807"), Some(9223372036854775807));
-  assert_eq(int_of_ascii(b"-9223372036854775808"), Some(least_int()))
+  assert_eq(int_of_ascii(b"-9223372036854775808"), Some(0 - 9223372036854775807 - 1))
+}
+
+test "an integer reads in any radix, in either case, and its digits are below the radix" {
+  assert_eq(int_of_ascii_radix(b"ff", 16), Some(255));
+  assert_eq(int_of_ascii_radix(b"-FF", 16), Some(0 - 255));
+  assert_eq(int_of_ascii_radix(b"-8000000000000000", 16), Some(0 - 9223372036854775807 - 1));
+  assert_eq(int_of_ascii_radix(b"8000000000000000", 16), None);
+  assert_eq(int_of_ascii_radix(b"zz", 36), Some(1295));
+  assert_eq(int_of_ascii_radix(b"12", 2), None);
+  assert_eq(int_of_ascii_radix(b"0x10", 16), None);
+  assert_eq(map([47, 48, 57, 58, 64, 65, 90, 91, 96, 97, 122, 123], digit_value), [
+    -1,
+    0,
+    9,
+    -1,
+    -1,
+    10,
+    35,
+    -1,
+    -1,
+    10,
+    35,
+    -1,
+  ]);
+  assert_eq(try[abort.raise] { int_of_ascii_radix(b"1", 37) }, Err("a radix is 2 to 36"))
 }
 
 test "anything but an optional minus and digits is refused, and so is a number past Int" {
