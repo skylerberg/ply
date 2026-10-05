@@ -1,10 +1,16 @@
-// The observability effect.
+//! Observability as an effect: events, spans and metrics, each on a channel label.
+//!
+//! Every perform is written at its call site. A span still open when its task retires or its entry
+//! point ends is closed `Abandoned`, innermost first, and written; the run warns of it (`W0609`), which
+//! changes no exit code. A test collects records in a `Sink` with the `_step` functions and reads them
+//! with `drain`, `named`, `on_channel` and `counter_total`.
 
 import std.json
 
+/// An event's severity.
 pub type Level = | Debug | Info | Warn | Error
 
-// One structured value.
+/// One structured value.
 pub type Field =
   | FInt(Int)
   | FBool(Bool)
@@ -14,29 +20,37 @@ pub type Field =
   | FBytes(Bytes)
   | FJson(json::Json)
 
-// A `Map`, so two field sets built in different orders are equal.
+/// A `Map`, so two field sets built in different orders are equal.
 pub type Fields = Map<String, Field>
 
-// A span's identity.
+/// A span's identity.
 pub type Span = { id: Int, channel: String }
 
-// How a span ended.
+/// How a span ended.
 pub type Outcome = | Ok | Failed(String) | Abandoned
 
+/// Structured records, on the channel the label names.
 pub nondet effect trace {
+  /// One event.
   write event[c](level: Level, name: String, fields: Fields) -> Unit
+  /// Opens a span, inside the innermost one open.
   write enter[c](name: String, fields: Fields) -> Span
+  /// Closes a span with how it ended, and every span opened inside it that is still open.
   write exit[c](span: Span, outcome: Outcome) -> Unit
+  /// Adds `delta` to a counter.
   write count[c](name: String, delta: Int, fields: Fields) -> Unit
+  /// Sets a gauge.
   write gauge[c](name: String, value: Decimal, fields: Fields) -> Unit
+  /// Records a duration in microseconds.
   write time[c](name: String, micros: Int, fields: Fields) -> Unit
 }
 
 // --- The collecting twin ---------------------------------------------------------
 
+/// Which operation wrote a record.
 pub type Kind = | KEvent | KEnter | KExit | KCount | KGauge | KTime
 
-// `span` is the record's span (for an event or a metric, the innermost one open); `parent` is its parent.
+/// `span` is the record's span (for an event or a metric, the innermost one open); `parent` is its parent.
 pub type Record = {
   seq: Int,
   kind: Kind,
@@ -51,29 +65,38 @@ pub type Record = {
   value: Decimal,
 }
 
-// Innermost first, so pushing and popping are both at the head.
+/// Innermost first, so pushing and popping are both at the head.
 type OpenSpan = { id: Int, channel: String, name: String, parent: Int }
 
+/// The records a test has collected, and the spans still open.
 pub type Sink = { records: List<Record>, open: List<OpenSpan>, next: Int }
 
+/// An empty sink.
 pub fn sink() -> Sink = { records: [], open: [], next: 1 }
 
+/// The sink after `enter_step`, and the span it opened.
 pub type Entered = { sink: Sink, span: Span }
 
+/// The sink after `exit_step`; `ok` is false when the span was not open.
 pub type Exited = { sink: Sink, ok: Bool }
 
+/// What `trace.event` records.
 pub fn event_step(s: Sink, c: String, l: Level, n: String, fs: Fields) -> Sink =
   append(s, record(s, KEvent, l, c, n, innermost(s), fs, Ok, 0, 0m))
 
+/// What `trace.count` records.
 pub fn count_step(s: Sink, c: String, n: String, d: Int, fs: Fields) -> Sink =
   append(s, record(s, KCount, Info, c, n, innermost(s), fs, Ok, d, 0m))
 
+/// What `trace.gauge` records.
 pub fn gauge_step(s: Sink, c: String, n: String, v: Decimal, fs: Fields) -> Sink =
   append(s, record(s, KGauge, Info, c, n, innermost(s), fs, Ok, 0, v))
 
+/// What `trace.time` records.
 pub fn time_step(s: Sink, c: String, n: String, us: Int, fs: Fields) -> Sink =
   append(s, record(s, KTime, Info, c, n, innermost(s), fs, Ok, us, 0m))
 
+/// What `trace.enter` records.
 pub fn enter_step(s: Sink, c: String, n: String, fs: Fields) -> Entered = {
   let opened = { id: s.next, channel: c, name: n, parent: current_id(s) };
   let pushed = { records: s.records, open: cons(opened, s.open), next: s.next + 1 };
@@ -83,21 +106,25 @@ pub fn enter_step(s: Sink, c: String, n: String, fs: Fields) -> Entered = {
   }
 }
 
-// Closes `sp` and every span opened above it, each of the latter `Abandoned`.
+/// Closes `sp` and every span opened above it, each of the latter `Abandoned`.
 pub fn exit_step(s: Sink, sp: Span, o: Outcome) -> Exited =
   if is_open(s.open, sp) { { sink: close_through(s, sp.id, o), ok: true } }
   else { { sink: s, ok: false } }
 
-// Closes every still-open span as `Abandoned`, then answers the records in `seq` order.
+/// Closes every still-open span as `Abandoned`, then answers the records in `seq` order.
 pub fn drain(s: Sink) -> List<Record> = abandon_all(s).records
 
+/// How many spans are open.
 pub fn open_spans(s: Sink) -> Int = len(s.open)
 
+/// The records named `n`.
 pub fn named(rs: List<Record>, n: String) -> List<Record> = filter(rs, |r: Record| r.name == n)
 
+/// The records on channel `c`.
 pub fn on_channel(rs: List<Record>, c: String) -> List<Record> =
   filter(rs, |r: Record| r.channel == c)
 
+/// The sum of every count recorded under `n`.
 pub fn counter_total(rs: List<Record>, n: String) -> Int =
   fold(rs, 0, |acc: Int, r: Record|
     match r.kind { KCount -> if r.name == n { acc + r.amount } else { acc }, _ -> acc })
@@ -139,7 +166,7 @@ fn innermost(s: Sink) -> Option<OpenSpan> = match s.open { [first, ..] -> Some(f
 
 fn current_id(s: Sink) -> Int = match s.open { [first, ..] -> first.id, _ -> 0 }
 
-// The channel is compared as well as the id.
+/// The channel is compared as well as the id.
 fn is_open(os: List<OpenSpan>, sp: Span) -> Bool =
   match os {
     [] -> false,
@@ -147,10 +174,10 @@ fn is_open(os: List<OpenSpan>, sp: Span) -> Bool =
     else { is_open(rest, sp) },
   }
 
-// Pops spans innermost-first, recording each, until `id` has been closed.
+/// Pops spans innermost-first, recording each, until `id` has been closed.
 fn close_through(s: Sink, id: Int, o: Outcome) -> Sink = closing(s, s.open, id, o)
 
-// `open` is `s.open`, walked as a list of its own.
+/// `open` is `s.open`, walked as a list of its own.
 fn closing(s: Sink, open: List<OpenSpan>, id: Int, o: Outcome) -> Sink =
   match open {
     [] -> s,
@@ -178,7 +205,7 @@ fn closing(s: Sink, open: List<OpenSpan>, id: Int, o: Outcome) -> Sink =
 
 fn abandon_all(s: Sink) -> Sink = abandoning(s, s.open)
 
-// `open` as in `closing`: each round closes its head, which leaves the rest open.
+/// `open` as in `closing`: each round closes its head, which leaves the rest open.
 fn abandoning(s: Sink, open: List<OpenSpan>) -> Sink =
   match open { [] -> s, [first, ..rest] -> abandoning(close_through(s, first.id, Abandoned), rest) }
 
