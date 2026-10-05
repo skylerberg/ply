@@ -1,0 +1,2116 @@
+//! ASN.1 in its distinguished encoding (DER): builders that write it, a cursor that reads it, and
+//! a tree for a document whose shape is not known.
+//!
+//! DER is the one encoding of each value, which is what lets a signature be checked over bytes: a
+//! certificate, a key and a signature are DER. Every rule that makes it the one is enforced here,
+//! on both sides. A builder computes its own length and writes the shortest form of everything, so
+//! what it answers is canonical by construction: `sequence([int(2), oid(o), set_of(names)])`. A
+//! reader refuses, saying why and at which byte, a length or a tag number not in its shortest
+//! form, an indefinite length, a `BOOLEAN` that is not `00` or `FF`, an `INTEGER` with an octet its
+//! sign makes redundant, a `BIT STRING` whose unused bits are set, an identifier arc with a leading
+//! `80`, a `SET OF` out of order, a character outside its string type's set, a time not written
+//! `YYMMDDHHMMSSZ` or `YYYYMMDDHHMMSS[.f]Z` or naming no real date, a string or a time in
+//! constructed form, a default written out, and anything after the value. Every length is checked
+//! against what remains before it is walked and nesting is bounded by the depth a reader is given.
+//!
+//! BER, the looser encoding DER is a subset of, is refused, and some files called DER are BER: a
+//! PKCS #7 or PKCS #12 bundle from an older tool uses indefinite lengths.
+//!
+//! The cursor is a `Reader`, a window onto the bytes. A read takes the element at its front and
+//! answers its value with the reader after it, so a parser threads one through a `SEQUENCE`'s
+//! fields; `read_sequence` answers a reader over the content, and `within` runs a parser on one and
+//! refuses what it left unread. `read_explicit` and `read_implicit` read a field a schema tags,
+//! `read_optional` and `read_default` one that may be absent. A read raises `asn1.refused`;
+//! `decode_with` answers it as an `Err`.
+//!
+//! `Value` is a whole document: `decode` and `encode` are each other's inverse, a refusal on
+//! either side an `Err`, and `read` and `write` raise it. The tree names the universal types this
+//! module checks; any other element is a `Primitive` or a `Constructed` under its tag. A `SET` is
+//! held to `SET OF`'s order, the order of its members' encodings; one whose schema orders it by tag
+//! is read with `read_constructed`.
+
+import std.bigint
+import std.bigint (BigInt)
+import std.bytes (bytes_of_hex, hex_of, is_digit, repeat, scan, u16_be, u32_be, u64_be, xor_byte)
+import std.laws (agrees, round_trip)
+import std.list (concat, is_sorted, reverse, sort)
+import std.oid
+import std.oid (Oid)
+import std.result (result_ok)
+import std.string (pad_left)
+
+// --- Tags -----------------------------------------------------------------------
+
+/// The four namespaces a tag's number is in.
+pub type Class =
+  /// The types ASN.1 itself defines: `INTEGER` is universal 2.
+  | Universal
+  /// Numbers one application's schemas share.
+  | Application
+  /// Numbers that mean what the enclosing type says, as `[0]` does.
+  | Context
+  /// Numbers one organisation keeps.
+  | Private
+
+/// What an element says its type is: a class, and a number in it.
+pub type Tag = new { class: Class, number: Int }
+
+/// The tag of a type ASN.1 defines.
+pub fn universal(number: Int) -> Tag = { class: Universal, number: number }
+
+/// An application tag, `[APPLICATION n]`.
+pub fn application(number: Int) -> Tag = { class: Application, number: number }
+
+/// A context-specific tag, `[n]`.
+pub fn context(number: Int) -> Tag = { class: Context, number: number }
+
+/// A private tag, `[PRIVATE n]`.
+pub fn private(number: Int) -> Tag = { class: Private, number: number }
+
+fn class_of(bits: Int) -> Class =
+  if bits == 0 { Universal }
+  else if bits == 1 { Application }
+  else if bits == 2 { Context }
+  else { Private }
+
+fn class_bits(class: Class) -> Int =
+  match class { Universal -> 0, Application -> 0x40, Context -> 0x80, Private -> 0xC0 }
+
+// --- Values ---------------------------------------------------------------------
+
+/// The string types whose characters this module checks.
+pub type StringKind =
+  /// Any text, in UTF-8.
+  | Utf8String
+  /// Digits and the space.
+  | NumericString
+  /// Letters, digits, the space and `'()+,-./:=?`.
+  | PrintableString
+  /// ASCII, control characters included.
+  | Ia5String
+  /// ASCII from the space to `~`.
+  | VisibleString
+  /// Any text, four octets a character.
+  | UniversalString
+  /// Text of the Basic Multilingual Plane, two octets a character.
+  | BmpString
+
+/// A `BIT STRING`: the bits of `bytes`, most significant first, less the last `unused` of them.
+/// `unused` is 0 to 7, zero where there are no octets, and the bits it leaves out are zero.
+pub type Bits = new { unused: Int, bytes: Bytes }
+
+/// A time of day on a date, in UTC. A `UTCTime` holds the years 1950 to 2049 and no fraction of a
+/// second; a `GeneralizedTime` holds the years 0 to 9999.
+pub type Time = new {
+  year: Int,
+  month: Int,
+  day: Int,
+  hour: Int,
+  minute: Int,
+  second: Int,
+  nanosecond: Int,
+}
+
+/// A document, or one element of it.
+pub type Value =
+  | Boolean(Bool)
+  /// An `INTEGER`, as its content: the number's two's complement, most significant octet first, in
+  /// the fewest octets. `int_of_integer` and `big_int_of_integer` read the number.
+  | Integer(Bytes)
+  /// An `ENUMERATED`, as an `Integer` holds its number.
+  | Enumerated(Bytes)
+  | BitString(Bits)
+  | OctetString(Bytes)
+  | Null
+  | ObjectId(Oid)
+  /// A string of one of the checked types.
+  | Text(StringKind, String)
+  | UtcTime(Time)
+  | GeneralizedTime(Time)
+  | Sequence(List<Value>)
+  /// A `SET OF`: its members in the order of their encodings.
+  | Set(List<Value>)
+  /// A constructed element of any other tag, as an explicitly tagged field is: what it holds.
+  | Constructed(Tag, List<Value>)
+  /// A primitive element of any other tag, as an implicitly tagged field is: its content.
+  | Primitive(Tag, Bytes)
+
+// --- Refusals -------------------------------------------------------------------
+
+/// Why a reader refused bytes, or a writer a value.
+pub type Why =
+  /// The input ends before the element does.
+  | Truncated
+  /// Bytes follow the last element.
+  | Trailing
+  /// Nested past the depth the reader was given.
+  | TooDeep
+  /// A length of the indefinite form, which only BER has.
+  | IndefiniteLength
+  /// A length not written in the fewest octets.
+  | LongLength
+  /// A tag number not written in the fewest octets.
+  | LongTag
+  /// A length, a tag number, an arc, a fraction of a second or an `INTEGER` past what its answer
+  /// holds.
+  | TooWide
+  /// An element tagged universal 0, which ends an indefinite length and is no element of DER.
+  | EndOfContents
+  /// An element of another tag than the one asked for, which this carries.
+  | WrongTag(Tag)
+  /// A constructed element where its type is primitive, as a string in pieces is, or the reverse.
+  | WrongForm
+  /// A `BOOLEAN` that is not the one octet `00` or `FF`.
+  | BadBoolean
+  /// An `INTEGER` of no octets.
+  | EmptyInteger
+  /// An `INTEGER` whose first octet only repeats the sign of its second.
+  | LongInteger
+  /// A negative `INTEGER` where a magnitude was asked for.
+  | Negative
+  /// A `BIT STRING` with no count of unused bits, a count past 7 or past its octets, or an unused
+  /// bit set.
+  | BadBits
+  /// A list of named bits that ends in a zero bit.
+  | TrailingZeroBits
+  /// A `NULL` with content.
+  | BadNull
+  /// An identifier of no octets, one that ends inside an arc, or arcs no identifier has.
+  | BadOid
+  /// An identifier arc with a leading `80`.
+  | LongArc
+  /// A string holding what its type does not: the kind, and for a reader the offset of the octet.
+  | BadText(StringKind)
+  /// A time not in the one form DER writes it, or naming no real date or time of day.
+  | BadTime
+  /// A `GeneralizedTime` where X.509 writes a `UTCTime`: a year from 1950 to 2049.
+  | TimeChoice
+  /// A `SET OF` whose members are not in the order of their encodings.
+  | Unsorted
+  /// A field written out with the value its schema says an absent one has.
+  | DefaultEncoded
+  /// A tag with a negative number or universal 0, or in a tree one the tree reads as another
+  /// value.
+  | BadTag
+
+/// A reader's refusal, and the offset in the input of what it refused.
+pub type Refusal = new { at: Int, why: Why }
+
+/// What this module raises where it refuses.
+pub effect asn1 {
+  /// The bytes are not the DER asked for.
+  raise refused(e: Refusal)
+  /// The value has no DER encoding.
+  raise unwritable(why: Why)
+}
+
+fn refuse<a>(at: Int, why: Why) -> a / {asn1.refused} = asn1.refused({ at: at, why: why })
+
+// --- Integers -------------------------------------------------------------------
+
+/// The content of the `INTEGER` `n`: its two's complement in the fewest octets.
+pub fn integer_of_int(n: Int) -> Bytes / {abort.raise} = minimal(u64_be(n))
+
+/// The `Int` an `INTEGER`'s content names; `None` for one past 64 bits, and for no octets.
+pub fn int_of_integer(content: Bytes) -> Option<Int> / {abort.raise} =
+  if bytes_len(content) == 0 || bytes_len(content) > 8 { None } else {
+    Some(
+      fold(
+        range(0, bytes_len(content)),
+        if bytes_at(content, 0) >= 0x80 { 0 - 1 } else { 0 },
+        |n: Int, i: Int| n << 8 | bytes_at(content, i),
+      ),
+    )
+  }
+
+/// The content of the `INTEGER` `n`, whatever its size.
+pub fn integer_of_big_int(n: BigInt) -> Bytes / {abort.raise} =
+  if bigint::is_negative(n) {
+    xor_byte(signed(octets_of(bigint::sub(bigint::neg(n), bigint::one()))), 0xFF)
+  } else { signed(octets_of(n)) }
+
+/// The number an `INTEGER`'s content names; zero for no octets.
+pub fn big_int_of_integer(content: Bytes) -> BigInt / {abort.raise} =
+  if bytes_len(content) > 0 && bytes_at(content, 0) >= 0x80 {
+    bigint::sub(bigint::neg(natural(xor_byte(content, 0xFF))), bigint::one())
+  } else { natural(content) }
+
+/// Whether the octet at `i` only repeats the sign of the one after it.
+fn redundant(content: Bytes, i: Int) -> Bool / {abort.raise} =
+  i + 1 < bytes_len(content)
+    && ((bytes_at(content, i) == 0 && bytes_at(content, i + 1) < 0x80)
+    || (bytes_at(content, i) == 0xFF && bytes_at(content, i + 1) >= 0x80))
+
+/// The two's complement `content` in the fewest octets; no octets are zero.
+fn minimal(content: Bytes) -> Bytes / {abort.raise} =
+  if bytes_len(content) == 0 { b"\x00" }
+  else { bytes_slice(content, lead(content, 0), bytes_len(content)) }
+
+fn lead(content: Bytes, i: Int) -> Int / {abort.raise} =
+  if i >= bytes_len(content) - 1 { i }
+  else if redundant(content, i) { lead(content, i + 1) }
+  else { i }
+
+/// `octets` without its leading zero octets.
+fn unpadded(octets: Bytes) -> Bytes / {abort.raise} =
+  bytes_slice(octets, scan(octets, 0, b"\x00"), bytes_len(octets))
+
+/// A magnitude with a zero octet before it where its own first would read as a sign, or where it
+/// has none.
+fn signed(magnitude: Bytes) -> Bytes / {abort.raise} =
+  if bytes_len(magnitude) == 0 || bytes_at(magnitude, 0) >= 0x80 {
+    bytes_concat(b"\x00", magnitude)
+  } else { magnitude }
+
+/// The number big-endian octets spell, seven octets at a time.
+fn natural(octets: Bytes) -> BigInt / {abort.raise} =
+  fold(range(0, (bytes_len(octets) + 6) / 7), bigint::zero(), |acc: BigInt, chunk: Int| {
+    let to = min(chunk * 7 + 7, bytes_len(octets));
+    bigint::add(
+      bigint::shift_left(acc, 8 * (to - chunk * 7)),
+      bigint::of_int(fold(range(chunk * 7, to), 0, |n: Int, i: Int| n << 8 | bytes_at(octets, i))),
+    )
+  })
+
+/// The big-endian octets of a number that is not negative, with no leading zero octet: none for
+/// zero.
+fn octets_of(n: BigInt) -> Bytes / {abort.raise} =
+  unpadded(bytes_concat_all(reverse(sevens(n, [], 9223372036854775807))))
+
+/// The number seven octets at a time, least significant first. `left` is only what the recursion
+/// descends by: a number in memory has fewer chunks than an `Int` counts.
+fn sevens(n: BigInt, acc: List<Bytes>, left: Int) -> List<Bytes> / {abort.raise} =
+  if bigint::is_zero(n) || left <= 0 { acc } else {
+    let rest = bigint::shift_right(n, 56);
+    let low = match bigint::to_int(bigint::sub(n, bigint::shift_left(rest, 56))) {
+      Some(v) -> v,
+      None -> panic("fifty-six bits are an Int"),
+    };
+    sevens(rest, push(acc, bytes_slice(u64_be(low), 1, 8)), left - 1)
+  }
+
+// --- Bits and times -------------------------------------------------------------
+
+/// Whether `b` is a bit string DER writes: what `Bits` says of its fields holds.
+pub fn bits_valid(b: Bits) -> Bool / {abort.raise} =
+  b.unused >= 0 && b.unused <= 7 && (b.unused == 0 || bytes_len(b.bytes) > 0)
+    && (b.unused == 0 || bytes_at(b.bytes, bytes_len(b.bytes) - 1) & (1 << b.unused) - 1 == 0)
+
+/// Bit `i` of the string, counting the first octet's most significant bit as 0; `false` past its
+/// end.
+pub fn bit_at(b: Bits, i: Int) -> Bool / {abort.raise} =
+  i >= 0 && i < 8 * bytes_len(b.bytes) - b.unused && bytes_at(b.bytes, i / 8) & 0x80 >> i % 8 != 0
+
+/// Whether `t` names a real date and time of day in the years 0 to 9999. No second is a leap
+/// second.
+pub fn time_valid(t: Time) -> Bool =
+  t.year >= 0 && t.year <= 9999 && t.month >= 1 && t.month <= 12 && t.day >= 1
+    && t.day <= days_in(t.year, t.month)
+    && t.hour >= 0
+    && t.hour <= 23
+    && t.minute >= 0
+    && t.minute <= 59
+    && t.second >= 0
+    && t.second <= 59
+    && t.nanosecond >= 0
+    && t.nanosecond <= 999999999
+
+fn days_in(year: Int, month: Int) -> Int =
+  if month == 2 { if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 29 } else { 28 } }
+  else if month == 4 || month == 6 || month == 9 || month == 11 { 30 }
+  else { 31 }
+
+/// The text of the `UTCTime` `t`, `YYMMDDHHMMSSZ`; `None` where it has none: a year outside 1950
+/// to 2049, a fraction of a second, or no real time.
+pub fn utc_time_text(t: Time) -> Option<String> =
+  if time_valid(t) && t.year >= 1950 && t.year <= 2049 && t.nanosecond == 0 {
+    Some(two(t.year % 100) ++ clock_text(t) ++ "Z")
+  } else { None }
+
+/// The text of the `GeneralizedTime` `t`, `YYYYMMDDHHMMSSZ` with the fraction of its second
+/// before the `Z` where it has one; `None` for no real time.
+pub fn generalized_time_text(t: Time) -> Option<String> =
+  if time_valid(t) {
+    Some(
+      pad_left(int_to_string(t.year), 4, "0") ++ clock_text(t)
+        ++ (if t.nanosecond == 0 { "" } else { "." ++ significant(t.nanosecond, 9) })
+        ++ "Z",
+    )
+  } else { None }
+
+fn two(n: Int) -> String = pad_left(int_to_string(n), 2, "0")
+
+fn clock_text(t: Time) -> String =
+  two(t.month) ++ two(t.day) ++ two(t.hour) ++ two(t.minute) ++ two(t.second)
+
+/// `n` in `digits` digits, less its trailing zeros.
+fn significant(n: Int, digits: Int) -> String =
+  if digits > 1 && n % 10 == 0 { significant(n / 10, digits - 1) }
+  else { pad_left(int_to_string(n), digits, "0") }
+
+// --- Writing --------------------------------------------------------------------
+
+/// A length in the fewest octets: itself below 128, and above that its octets after their count.
+fn length_octets(n: Int) -> Bytes / {abort.raise} =
+  if n < 0x80 { byte_of_int(n) } else {
+    let octets = unpadded(u64_be(n));
+    bytes_concat(byte_of_int(0x80 | bytes_len(octets)), octets)
+  }
+
+/// `n` in base 128, most significant first, the high bit set on every octet but the last.
+fn septets(n: Int) -> Bytes / {abort.raise} = septets_before(n / 128, byte_of_int(n & 0x7F))
+
+fn septets_before(n: Int, low: Bytes) -> Bytes / {abort.raise} =
+  if n <= 0 { low }
+  else { septets_before(n / 128, bytes_concat(byte_of_int(n & 0x7F | 0x80), low)) }
+
+fn identifier(tag: Tag, constructed: Bool) -> Bytes / {asn1.unwritable, abort.raise} = {
+  let lead = class_bits(tag.class) | (if constructed { 0x20 } else { 0 });
+  if tag.number < 0 || (tag.class == Universal && tag.number == 0) { asn1.unwritable(BadTag) }
+  else if tag.number < 31 { byte_of_int(lead | tag.number) }
+  else { bytes_concat(byte_of_int(lead | 0x1F), septets(tag.number)) }
+}
+
+/// An element whose identifier is the one octet `lead`.
+fn element(lead: Int, content: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([byte_of_int(lead), length_octets(bytes_len(content)), content])
+
+/// A `BOOLEAN`.
+pub fn boolean(b: Bool) -> Bytes / {abort.raise} = element(0x01, if b { b"\xff" } else { b"\x00" })
+
+/// The `INTEGER` whose two's complement `content` is, most significant octet first, written in
+/// the fewest octets whatever `content` pads it with; no octets are zero.
+pub fn integer(content: Bytes) -> Bytes / {abort.raise} = element(0x02, minimal(content))
+
+/// The `INTEGER` `n`.
+pub fn int(n: Int) -> Bytes / {abort.raise} = element(0x02, integer_of_int(n))
+
+/// The `INTEGER` `n`, whatever its size.
+pub fn big_int(n: BigInt) -> Bytes / {abort.raise} = element(0x02, integer_of_big_int(n))
+
+/// The `INTEGER` whose magnitude `magnitude` is, most significant octet first: never negative,
+/// whatever its first bit is. The form a modulus or a signature's half is held in.
+pub fn unsigned(magnitude: Bytes) -> Bytes / {abort.raise} =
+  element(0x02, signed(unpadded(magnitude)))
+
+/// The `ENUMERATED` `n`.
+pub fn enumerated(n: Int) -> Bytes / {abort.raise} = element(0x0A, integer_of_int(n))
+
+/// A `BIT STRING`. Raises `BadBits` unless `bits_valid`.
+pub fn bit_string(b: Bits) -> Bytes / {asn1.unwritable, abort.raise} =
+  if bits_valid(b) { element(0x03, bytes_concat(byte_of_int(b.unused), b.bytes)) }
+  else { asn1.unwritable(BadBits) }
+
+/// The `BIT STRING` of a list of named bits, as a key's usages are: the bits at the positions in
+/// `set` are one, and the string ends at the last of them. A negative position names no bit.
+pub fn named_bits(set: List<Int>) -> Bytes / {abort.raise} = {
+  let top = fold(set, 0 - 1, |highest: Int, position: Int| max(highest, position));
+  let octets = map(range(0, (top + 8) / 8), |i: Int|
+    byte_of_int(
+      fold(set, 0, |octet: Int, position: Int|
+        if position >= 0 && position / 8 == i { octet | 0x80 >> position % 8 } else { octet }),
+    ));
+  element(
+    0x03,
+    bytes_concat(byte_of_int(if top < 0 { 0 } else { 7 - top % 8 }), bytes_concat_all(octets)),
+  )
+}
+
+/// An `OCTET STRING`.
+pub fn octet_string(octets: Bytes) -> Bytes / {abort.raise} = element(0x04, octets)
+
+/// A `NULL`.
+pub fn null() -> Bytes = b"\x05\x00"
+
+/// An `OBJECT IDENTIFIER`. Raises `BadOid` for arcs no identifier has.
+pub fn oid(o: Oid) -> Bytes / {asn1.unwritable, abort.raise} =
+  match oid::arcs(o) {
+    [first, second, ..rest] if oid::is_valid(o) ->
+      element(0x06, bytes_concat_all(map(concat([first * 40 + second], rest), septets))),
+    _ -> asn1.unwritable(BadOid),
+  }
+
+/// A string of the type `kind`. Raises `BadText` for a character the type does not hold.
+pub fn string(kind: StringKind, text: String) -> Bytes / {asn1.unwritable, abort.raise} =
+  element(string_number(kind), match kind {
+    Utf8String -> bytes_of_string(text),
+    UniversalString -> bytes_concat_all(map(string_chars(text), |c: Char| u32_be(int_of_char(c)))),
+    BmpString ->
+      bytes_concat_all(
+        map(string_chars(text), |c: Char|
+          if int_of_char(c) > 0xFFFF { asn1.unwritable(BadText(kind)) }
+          else { u16_be(int_of_char(c)) }),
+      ),
+    _ -> match stray(kind, bytes_of_string(text)) {
+      None -> bytes_of_string(text),
+      Some(_) -> asn1.unwritable(BadText(kind)),
+    },
+  })
+
+/// A `UTCTime`. Raises `BadTime` where `utc_time_text` answers `None`.
+pub fn utc_time(t: Time) -> Bytes / {asn1.unwritable, abort.raise} =
+  match utc_time_text(t) {
+    Some(text) -> element(0x17, bytes_of_string(text)),
+    None -> asn1.unwritable(BadTime),
+  }
+
+/// A `GeneralizedTime`. Raises `BadTime` where `generalized_time_text` answers `None`.
+pub fn generalized_time(t: Time) -> Bytes / {asn1.unwritable, abort.raise} =
+  match generalized_time_text(t) {
+    Some(text) -> element(0x18, bytes_of_string(text)),
+    None -> asn1.unwritable(BadTime),
+  }
+
+/// The `Time` of an X.509 certificate: a `UTCTime` for the years 1950 to 2049 and a
+/// `GeneralizedTime` for any other. Raises `BadTime` for a fraction of a second, which it has no
+/// place for, and for no real time.
+pub fn time(t: Time) -> Bytes / {asn1.unwritable, abort.raise} =
+  if t.nanosecond != 0 { asn1.unwritable(BadTime) }
+  else if t.year >= 1950 && t.year <= 2049 { utc_time(t) }
+  else { generalized_time(t) }
+
+/// A `SEQUENCE` of the encoded elements `parts`, in order.
+pub fn sequence(parts: List<Bytes>) -> Bytes / {abort.raise} =
+  element(0x30, bytes_concat_all(parts))
+
+/// A `SET OF` the encoded elements `parts`, which it puts in the order of their encodings.
+pub fn set_of(parts: List<Bytes>) -> Bytes / {abort.raise} =
+  element(0x31, bytes_concat_all(sort(parts)))
+
+/// A primitive element of any tag: `content` as it is. Raises `BadTag` for a negative number and
+/// for universal 0.
+pub fn primitive(tag: Tag, content: Bytes) -> Bytes / {asn1.unwritable, abort.raise} =
+  bytes_concat_all([identifier(tag, false), length_octets(bytes_len(content)), content])
+
+/// A constructed element of any tag holding the encoded elements `parts`, in order. Raises
+/// `BadTag` as `primitive` does.
+pub fn constructed(tag: Tag, parts: List<Bytes>) -> Bytes / {asn1.unwritable, abort.raise} = {
+  let content = bytes_concat_all(parts);
+  bytes_concat_all([identifier(tag, true), length_octets(bytes_len(content)), content])
+}
+
+/// The encoded element `inner` tagged explicitly, `[n] EXPLICIT`: wrapped whole in an element of
+/// `tag`.
+pub fn explicit(tag: Tag, inner: Bytes) -> Bytes / {asn1.unwritable, abort.raise} =
+  constructed(tag, [inner])
+
+/// The encoded element `inner` tagged implicitly, `[n] IMPLICIT`: `tag` in place of its own.
+/// Raises `Truncated` for bytes that hold no tag to replace.
+pub fn implicit(tag: Tag, inner: Bytes) -> Bytes / {asn1.unwritable, abort.raise} =
+  if bytes_len(inner) == 0 { asn1.unwritable(Truncated) } else {
+    let first = bytes_at(inner, 0);
+    let after = if first & 0x1F != 0x1F { Some(1) } else {
+      match bytes_position(inner, 1, |octet: Int| octet < 0x80) {
+        Some(last) -> Some(last + 1),
+        None -> None,
+      }
+    };
+    match after {
+      Some(n) ->
+        bytes_concat(identifier(tag, first & 0x20 != 0), bytes_slice(inner, n, bytes_len(inner))),
+      None -> asn1.unwritable(Truncated),
+    }
+  }
+
+// --- Reading: one element's header ----------------------------------------------
+
+/// One element's header: its tag, its form, and where its content lies in the input.
+type Head = { tag: Tag, constructed: Bool, from: Int, to: Int }
+
+/// A base-128 number where a tag or an arc holds one: its value and where it ends, or that the
+/// input ended inside it, that it has a leading `80`, or that it is past 63 bits.
+type Septets = | Number(Int, Int) | Cut | Padded | Wide
+
+fn septets_at(data: Bytes, at: Int, end: Int) -> Septets / {abort.raise} =
+  if at >= end { Cut }
+  else if bytes_at(data, at) == 0x80 { Padded }
+  else { septets_from(data, at, end, 0, 9) }
+
+fn septets_from(data: Bytes, at: Int, end: Int, value: Int, left: Int) -> Septets / {abort.raise} =
+  if at >= end { Cut }
+  else if left <= 0 { Wide } else {
+    let octet = bytes_at(data, at);
+    let more = value << 7 | octet & 0x7F;
+    if octet < 0x80 { Number(more, at + 1) }
+    else { septets_from(data, at + 1, end, more, left - 1) }
+  }
+
+/// The header of the element at `at`, whose content must lie before `end`.
+fn head(data: Bytes, at: Int, end: Int) -> Head / {asn1.refused, abort.raise} =
+  if at >= end { refuse(at, Truncated) } else {
+    let first = bytes_at(data, at);
+    let id = if first & 0x1F != 0x1F { { number: first & 0x1F, next: at + 1 } } else {
+      match septets_at(data, at + 1, end) {
+        Number(number, next) -> if number < 31 { refuse(at, LongTag) }
+        else { { number: number, next: next } },
+        Cut -> refuse(end, Truncated),
+        Padded -> refuse(at, LongTag),
+        Wide -> refuse(at, TooWide),
+      }
+    };
+    if first < 0x40 && id.number == 0 { refuse(at, EndOfContents) } else {
+      let span = length_at(data, id.next, end);
+      if span.length > end - span.from { refuse(span.from, Truncated) } else {
+        {
+          tag: { class: class_of(first >> 6), number: id.number },
+          constructed: first & 0x20 != 0,
+          from: span.from,
+          to: span.from + span.length,
+        }
+      }
+    }
+  }
+
+/// The length at `at`, and where the content it measures starts.
+fn length_at(
+  data: Bytes,
+  at: Int,
+  end: Int,
+) -> { length: Int, from: Int } / {asn1.refused, abort.raise} =
+  if at >= end { refuse(at, Truncated) } else {
+    let first = bytes_at(data, at);
+    let octets = first & 0x7F;
+    if first < 0x80 { { length: first, from: at + 1 } }
+    else if octets == 0 { refuse(at, IndefiniteLength) }
+    else if octets > end - at - 1 { refuse(end, Truncated) }
+    else if bytes_at(data, at + 1) == 0 { refuse(at, LongLength) }
+    else if octets > 8 || (octets == 8 && bytes_at(data, at + 1) >= 0x80) { refuse(at, TooWide) }
+    else {
+      let length = fold(range(at + 1, at + 1 + octets), 0, |n: Int, i: Int|
+        n << 8 | bytes_at(data, i));
+      if length < 0x80 { refuse(at, LongLength) } else { { length: length, from: at + 1 + octets } }
+    }
+  }
+
+// --- Reading: what each type's content must be ----------------------------------
+
+fn boolean_of(content: Bytes, at: Int) -> Bool / {asn1.refused} =
+  if content == b"\x00" { false }
+  else if content == b"\xff" { true }
+  else { refuse(at, BadBoolean) }
+
+fn integer_of(content: Bytes, at: Int) -> Bytes / {asn1.refused, abort.raise} =
+  if bytes_len(content) == 0 { refuse(at, EmptyInteger) }
+  else if redundant(content, 0) { refuse(at, LongInteger) }
+  else { content }
+
+fn int_of(content: Bytes, at: Int) -> Int / {asn1.refused, abort.raise} =
+  match int_of_integer(integer_of(content, at)) { Some(n) -> n, None -> refuse(at, TooWide) }
+
+fn unsigned_of(content: Bytes, at: Int) -> Bytes / {asn1.refused, abort.raise} = {
+  let number = integer_of(content, at);
+  if bytes_at(number, 0) >= 0x80 { refuse(at, Negative) }
+  else if bytes_len(number) > 1 && bytes_at(number, 0) == 0 {
+    bytes_slice(number, 1, bytes_len(number))
+  } else { number }
+}
+
+fn bits_of(content: Bytes, at: Int) -> Bits / {asn1.refused, abort.raise} =
+  if bytes_len(content) == 0 { refuse(at, BadBits) } else {
+    let bits: Bits = {
+      unused: bytes_at(content, 0),
+      bytes: bytes_slice(content, 1, bytes_len(content)),
+    };
+    if bits_valid(bits) { bits } else { refuse(at, BadBits) }
+  }
+
+fn named_bits_of(content: Bytes, at: Int) -> Bits / {asn1.refused, abort.raise} = {
+  let bits = bits_of(content, at);
+  let octets = bytes_len(bits.bytes);
+  if octets > 0 && bytes_at(bits.bytes, octets - 1) >> bits.unused & 1 == 0 {
+    refuse(at, TrailingZeroBits)
+  } else { bits }
+}
+
+fn null_of(content: Bytes, at: Int) -> Unit / {asn1.refused} =
+  if bytes_len(content) == 0 { () } else { refuse(at, BadNull) }
+
+fn oid_of(content: Bytes, at: Int) -> Oid / {asn1.refused, abort.raise} =
+  match arcs_of(content, 0, at, [], bytes_len(content)) {
+    [] -> refuse(at, BadOid),
+    [first, ..rest] ->
+      oid::Oid(
+        concat(
+          if first < 40 { [0, first] }
+          else if first < 80 { [1, first - 40] }
+          else { [2, first - 80] },
+          rest,
+        ),
+      ),
+  }
+
+/// The numbers an identifier's content holds, the first of them its first two arcs. An arc is an
+/// octet at least, so `left`, the content's length, outlasts them.
+fn arcs_of(
+  content: Bytes,
+  i: Int,
+  at: Int,
+  acc: List<Int>,
+  left: Int,
+) -> List<Int> / {asn1.refused, abort.raise} =
+  if i >= bytes_len(content) || left <= 0 { acc } else {
+    match septets_at(content, i, bytes_len(content)) {
+      Number(arc, next) -> arcs_of(content, next, at, push(acc, arc), left - 1),
+      Cut -> refuse(at + i, BadOid),
+      Padded -> refuse(at + i, LongArc),
+      Wide -> refuse(at + i, TooWide),
+    }
+  }
+
+fn string_number(kind: StringKind) -> Int =
+  match kind {
+    Utf8String -> 12,
+    NumericString -> 18,
+    PrintableString -> 19,
+    Ia5String -> 22,
+    VisibleString -> 26,
+    UniversalString -> 28,
+    BmpString -> 30,
+  }
+
+fn string_kind(number: Int) -> Option<StringKind> =
+  match number {
+    12 -> Some(Utf8String),
+    18 -> Some(NumericString),
+    19 -> Some(PrintableString),
+    22 -> Some(Ia5String),
+    26 -> Some(VisibleString),
+    28 -> Some(UniversalString),
+    30 -> Some(BmpString),
+    _ -> None,
+  }
+
+/// Where the first octet is that a string of an ASCII kind does not hold.
+fn stray(kind: StringKind, content: Bytes) -> Option<Int> / {abort.raise} =
+  bytes_position(content, 0, |b: Int|
+    !(match kind {
+      NumericString -> is_digit(b) || b == 0x20,
+      PrintableString ->
+        is_digit(b) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+          || bytes_index_of_byte(b" '()+,-./:=?", b) != None,
+      VisibleString -> b >= 0x20 && b <= 0x7E,
+      _ -> b < 0x80,
+    }))
+
+fn text_of(kind: StringKind, content: Bytes, at: Int) -> String / {asn1.refused, abort.raise} =
+  match kind {
+    Utf8String -> if bytes_is_utf8(content) { string_of_bytes(content) }
+    else { refuse(at, BadText(kind)) },
+    UniversalString -> wide_text(kind, content, at, 4),
+    BmpString -> wide_text(kind, content, at, 2),
+    _ -> match stray(kind, content) {
+      None -> string_of_bytes(content),
+      Some(i) -> refuse(at + i, BadText(kind)),
+    },
+  }
+
+/// Text of `width` octets a character, most significant first.
+fn wide_text(
+  kind: StringKind,
+  content: Bytes,
+  at: Int,
+  width: Int,
+) -> String / {asn1.refused, abort.raise} =
+  if bytes_len(content) % width != 0 { refuse(at, BadText(kind)) } else {
+    string_of_chars(
+      map(range(0, bytes_len(content) / width), |i: Int|
+        match char_of_int(
+            fold(range(i * width, i * width + width), 0, |point: Int, j: Int|
+              point << 8 | bytes_at(content, j)),
+          ) {
+          Some(c) -> c,
+          None -> refuse(at + i * width, BadText(kind)),
+        }),
+    )
+  }
+
+/// The `n` decimal digits at `from`, which `content` reaches, as their number; `None` for
+/// anything else there.
+fn digits_at(content: Bytes, from: Int, n: Int) -> Option<Int> / {abort.raise} =
+  fold(range(from, from + n), Some(0), |so_far: Option<Int>, i: Int|
+    match so_far {
+      Some(v) if is_digit(bytes_at(content, i)) -> Some(v * 10 + bytes_at(content, i) - 48),
+      _ -> None,
+    })
+
+/// The time of `year` and the five two-digit fields at `from`, where they are a real one.
+fn moment(year: Int, content: Bytes, from: Int, nanosecond: Int) -> Option<Time> / {abort.raise} =
+  match map(range(0, 5), |i: Int| digits_at(content, from + 2 * i, 2)) {
+    [Some(month), Some(day), Some(hour), Some(minute), Some(second)] -> {
+      let t: Time = {
+        year: year,
+        month: month,
+        day: day,
+        hour: hour,
+        minute: minute,
+        second: second,
+        nanosecond: nanosecond,
+      };
+      if time_valid(t) { Some(t) } else { None }
+    },
+    _ -> None,
+  }
+
+/// A two-digit year is in 1950 to 2049, as X.509 reads one.
+fn utc_time_of(content: Bytes, at: Int) -> Time / {asn1.refused, abort.raise} = {
+  let read = if bytes_len(content) != 13 || bytes_at(content, 12) != 0x5A { None } else {
+    match digits_at(content, 0, 2) {
+      Some(year) -> moment(if year >= 50 { 1900 + year } else { 2000 + year }, content, 2, 0),
+      None -> None,
+    }
+  };
+  match read { Some(t) -> t, None -> refuse(at, BadTime) }
+}
+
+fn generalized_time_of(content: Bytes, at: Int) -> Time / {asn1.refused, abort.raise} = {
+  let z = bytes_len(content) - 1;
+  if z < 14 || bytes_at(content, z) != 0x5A { refuse(at, BadTime) } else {
+    let nanosecond = if z == 14 { 0 } else { fraction_of(content, at, z) };
+    let read = match digits_at(content, 0, 4) {
+      Some(year) -> moment(year, content, 4, nanosecond),
+      None -> None,
+    };
+    match read { Some(t) -> t, None -> refuse(at, BadTime) }
+  }
+}
+
+/// The nanoseconds a fraction between the seconds and the `Z` at `z` names: a `.`, then digits
+/// that do not end in a zero, of which a `Time` holds nine.
+fn fraction_of(content: Bytes, at: Int, z: Int) -> Int / {asn1.refused, abort.raise} =
+  if bytes_at(content, 14) != 0x2E || z < 16 || scan(content, 15, b"0123456789") < z
+      || bytes_at(content, z - 1) == 0x30 { refuse(at, BadTime) }
+  else if z > 24 { refuse(at, TooWide) } else {
+    fold(range(15, 24), 0, |n: Int, i: Int|
+      n * 10 + (if i < z { bytes_at(content, i) - 48 } else { 0 }))
+  }
+
+// --- Reading: the cursor --------------------------------------------------------
+
+/// A window onto DER: the elements from `at` up to `end` in `data`, and how many more levels a
+/// read may enter. `implicit` is the tag the next typed read takes in place of its type's own.
+pub type Reader = new { data: Bytes, at: Int, end: Int, room: Int, implicit: Option<Tag> }
+
+/// What a read answers: a value, and the reader past what it took.
+pub type Read<a> = { value: a, rest: Reader }
+
+/// A reader over all of `data` that enters at most `depth` nested elements.
+pub fn reader(data: Bytes, depth: Int) -> Reader =
+  { data: data, at: 0, end: bytes_len(data), room: depth, implicit: None }
+
+/// Whether nothing is left to read.
+pub fn is_empty(r: Reader) -> Bool = r.at >= r.end
+
+/// Refuses, as `Trailing`, a reader with anything left to read.
+pub fn finish(r: Reader) -> Unit / {asn1.refused} =
+  if is_empty(r) { () } else { refuse(r.at, Trailing) }
+
+/// The tag of the next element, or `None` where nothing is left.
+pub fn peek(r: Reader) -> Option<Tag> / {asn1.refused, abort.raise} =
+  if is_empty(r) { None } else { Some(head(r.data, r.at, r.end).tag) }
+
+fn after(r: Reader, h: Head) -> Reader = { ..r, at: h.to, implicit: None }
+
+/// The next element's header, which must have `tag` and the form asked for.
+fn expect(r: Reader, tag: Tag, constructed: Bool) -> Head / {asn1.refused, abort.raise} = {
+  let h = head(r.data, r.at, r.end);
+  if h.tag != tag { refuse(r.at, WrongTag(h.tag)) }
+  else if h.constructed != constructed { refuse(r.at, WrongForm) }
+  else { h }
+}
+
+/// The next element's header for a read of the universal type `number`, or under the tag a
+/// `read_implicit` around the read gave it.
+fn typed(r: Reader, number: Int, constructed: Bool) -> Head / {asn1.refused, abort.raise} =
+  expect(r, match r.implicit { Some(tag) -> tag, None -> universal(number) }, constructed)
+
+/// A primitive element of the universal type `number`, its content read by `of`.
+fn leaf<a>(
+  r: Reader,
+  number: Int,
+  of: (Bytes, Int) -> a / {asn1.refused, abort.raise},
+) -> Read<a> / {asn1.refused, abort.raise} = {
+  let h = typed(r, number, false);
+  { value: of(bytes_slice(r.data, h.from, h.to), h.from), rest: after(r, h) }
+}
+
+/// A `BOOLEAN`.
+pub fn read_boolean(r: Reader) -> Read<Bool> / {asn1.refused, abort.raise} = leaf(r, 1, boolean_of)
+
+/// An `INTEGER`, as its content: the number's two's complement in the fewest octets.
+pub fn read_integer(r: Reader) -> Read<Bytes> / {asn1.refused, abort.raise} = leaf(r, 2, integer_of)
+
+/// An `INTEGER` an `Int` holds; `TooWide` for any other.
+pub fn read_int(r: Reader) -> Read<Int> / {asn1.refused, abort.raise} = leaf(r, 2, int_of)
+
+/// An `INTEGER` of any size.
+pub fn read_big_int(r: Reader) -> Read<BigInt> / {asn1.refused, abort.raise} =
+  leaf(r, 2, |content: Bytes, at: Int| big_int_of_integer(integer_of(content, at)))
+
+/// An `INTEGER` that is not negative, as its magnitude: most significant octet first with no
+/// leading zero octet, and one zero octet for zero. `Negative` for one below zero.
+pub fn read_unsigned(r: Reader) -> Read<Bytes> / {asn1.refused, abort.raise} =
+  leaf(r, 2, unsigned_of)
+
+/// An `ENUMERATED` an `Int` holds.
+pub fn read_enumerated(r: Reader) -> Read<Int> / {asn1.refused, abort.raise} = leaf(r, 10, int_of)
+
+/// A `BIT STRING`.
+pub fn read_bit_string(r: Reader) -> Read<Bits> / {asn1.refused, abort.raise} = leaf(r, 3, bits_of)
+
+/// A `BIT STRING` that is a list of named bits, which DER ends at its last one bit:
+/// `TrailingZeroBits` for one that ends in a zero.
+pub fn read_named_bits(r: Reader) -> Read<Bits> / {asn1.refused, abort.raise} =
+  leaf(r, 3, named_bits_of)
+
+/// An `OCTET STRING`.
+pub fn read_octet_string(r: Reader) -> Read<Bytes> / {asn1.refused, abort.raise} =
+  leaf(r, 4, |content: Bytes, _: Int| content)
+
+/// A `NULL`.
+pub fn read_null(r: Reader) -> Read<Unit> / {asn1.refused, abort.raise} = leaf(r, 5, null_of)
+
+/// An `OBJECT IDENTIFIER`.
+pub fn read_oid(r: Reader) -> Read<Oid> / {asn1.refused, abort.raise} = leaf(r, 6, oid_of)
+
+/// A string of the type `kind`.
+pub fn read_string(r: Reader, kind: StringKind) -> Read<String> / {asn1.refused, abort.raise} =
+  leaf(r, string_number(kind), |content: Bytes, at: Int| text_of(kind, content, at))
+
+/// A `UTCTime`.
+pub fn read_utc_time(r: Reader) -> Read<Time> / {asn1.refused, abort.raise} =
+  leaf(r, 23, utc_time_of)
+
+/// A `GeneralizedTime`.
+pub fn read_generalized_time(r: Reader) -> Read<Time> / {asn1.refused, abort.raise} =
+  leaf(r, 24, generalized_time_of)
+
+/// The `Time` of an X.509 certificate: a `UTCTime`, or for a year outside 1950 to 2049 a
+/// `GeneralizedTime` without a fraction of a second. `TimeChoice` for a `GeneralizedTime` X.509
+/// writes the other way.
+pub fn read_time(r: Reader) -> Read<Time> / {asn1.refused, abort.raise} =
+  if peek(r) != Some(universal(24)) { read_utc_time(r) } else {
+    let read = read_generalized_time(r);
+    if (read.value.year >= 1950 && read.value.year <= 2049) || read.value.nanosecond != 0 {
+      refuse(r.at, TimeChoice)
+    } else { read }
+  }
+
+/// The content of a primitive element of `tag`, whatever it holds.
+pub fn read_primitive(r: Reader, tag: Tag) -> Read<Bytes> / {asn1.refused, abort.raise} = {
+  let h = expect(r, tag, false);
+  { value: bytes_slice(r.data, h.from, h.to), rest: after(r, h) }
+}
+
+fn entered(r: Reader, h: Head) -> Read<Reader> / {asn1.refused} =
+  if r.room <= 0 { refuse(r.at, TooDeep) } else {
+    {
+      value: { data: r.data, at: h.from, end: h.to, room: r.room - 1, implicit: None },
+      rest: after(r, h),
+    }
+  }
+
+/// A reader over what a constructed element of `tag` holds.
+pub fn read_constructed(r: Reader, tag: Tag) -> Read<Reader> / {asn1.refused, abort.raise} =
+  entered(r, expect(r, tag, true))
+
+/// A reader over the fields of a `SEQUENCE`.
+pub fn read_sequence(r: Reader) -> Read<Reader> / {asn1.refused, abort.raise} =
+  entered(r, typed(r, 16, true))
+
+/// `item` run on the reader `inner` answers, which it must leave empty: `Trailing` otherwise.
+/// Answers what `item` read, and the reader after the element `inner` was read from.
+pub fn within<a | e>(
+  inner: Read<Reader>,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Read<a> / {asn1.refused, abort.raise | e} = {
+  let read = item(inner.value);
+  finish(read.rest);
+  { value: read.value, rest: inner.rest }
+}
+
+/// A field tagged explicitly, `[n] EXPLICIT`: the one element inside a constructed element of
+/// `tag`, read by `item`.
+pub fn read_explicit<a | e>(
+  r: Reader,
+  tag: Tag,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Read<a> / {asn1.refused, abort.raise | e} = within(read_constructed(r, tag), item)
+
+/// A field tagged implicitly, `[n] IMPLICIT`: `item` reads the next element taking `tag` for its
+/// type's own. `item` is a read of one type of this module, or `read_sequence_of` or
+/// `read_set_of`; a read that asks for a tag itself is not changed.
+pub fn read_implicit<a | e>(
+  r: Reader,
+  tag: Tag,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Read<a> / {asn1.refused, abort.raise | e} = item({ ..r, implicit: Some(tag) })
+
+/// A field that may be absent: `item`'s reading of the next element where its tag is `tag`, and
+/// `None` with the reader as it was where it is not or nothing is left.
+pub fn read_optional<a | e>(
+  r: Reader,
+  tag: Tag,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Read<Option<a>> / {asn1.refused, abort.raise | e} =
+  if peek(r) != Some(tag) { { value: None, rest: r } } else {
+    let read = item(r);
+    { value: Some(read.value), rest: read.rest }
+  }
+
+/// A field with a default: `default` where it is absent, as `read_optional` finds it, and
+/// `DefaultEncoded` where it is written out with that value, which DER leaves out.
+pub fn read_default<a | e>(
+  r: Reader,
+  tag: Tag,
+  default: a,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Read<a> / {asn1.refused, abort.raise | e}
+  where derivable(eq, a)
+= {
+  let read = read_optional(r, tag, item);
+  match read.value {
+    None -> { value: default, rest: read.rest },
+    Some(value) -> if value == default { refuse(r.at, DefaultEncoded) }
+    else { { value: value, rest: read.rest } },
+  }
+}
+
+/// The members of the constructed element `inner` is over, each one element read whole by `item`.
+/// `sorted` holds them to the order of their encodings, `last` being the one before. An element
+/// is two octets at least, so `left`, the octets there are, outlasts them.
+fn members<a | e>(
+  inner: Reader,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+  sorted: Bool,
+  last: Bytes,
+  acc: List<a>,
+  left: Int,
+) -> List<a> / {asn1.refused, abort.raise | e} =
+  if is_empty(inner) || left <= 0 { acc } else {
+    let h = head(inner.data, inner.at, inner.end);
+    let whole = if sorted { bytes_slice(inner.data, inner.at, h.to) } else { b"" };
+    if compare(last, whole) == Greater { refuse(inner.at, Unsorted) } else {
+      let read = item({ ..inner, end: h.to });
+      finish(read.rest);
+      members({ ..inner, at: h.to }, item, sorted, whole, push(acc, read.value), left - 1)
+    }
+  }
+
+/// A `SEQUENCE OF`: each member read by `item`, which reads one element.
+pub fn read_sequence_of<a | e>(
+  r: Reader,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Read<List<a>> / {asn1.refused, abort.raise | e} = {
+  let inner = read_sequence(r);
+  {
+    value: members(inner.value, item, false, b"", [], inner.value.end - inner.value.at),
+    rest: inner.rest,
+  }
+}
+
+/// A `SET OF`: each member read by `item`, which reads one element. `Unsorted` unless the members
+/// are in the order of their encodings.
+pub fn read_set_of<a | e>(
+  r: Reader,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Read<List<a>> / {asn1.refused, abort.raise | e} = {
+  let inner = entered(r, typed(r, 17, true));
+  {
+    value: members(inner.value, item, true, b"", [], inner.value.end - inner.value.at),
+    rest: inner.rest,
+  }
+}
+
+/// The next element whole, header and all, as the bytes a signature is over are wanted.
+pub fn read_raw(r: Reader) -> Read<Bytes> / {asn1.refused, abort.raise} = {
+  let h = head(r.data, r.at, r.end);
+  { value: bytes_slice(r.data, r.at, h.to), rest: after(r, h) }
+}
+
+/// The next element, whatever it is, as a tree.
+pub fn read_any(r: Reader) -> Read<Value> / {asn1.refused, abort.raise} = {
+  let tree = tree_at(r.data, r.at, r.end, r.room);
+  { value: tree.value, rest: { ..r, at: tree.at, implicit: None } }
+}
+
+/// What `item` reads from all of `data`, entering at most `depth` nested elements: `Trailing` for
+/// anything it leaves.
+pub fn read_with<a | e>(
+  data: Bytes,
+  depth: Int,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> a / {asn1.refused, abort.raise | e} = {
+  let read = item(reader(data, depth));
+  finish(read.rest);
+  read.value
+}
+
+/// `read_with`, answering a refusal as an `Err`.
+pub fn decode_with<a | e>(
+  data: Bytes,
+  depth: Int,
+  item: (Reader) -> Read<a> / {asn1.refused, abort.raise | e},
+) -> Result<a, Refusal> / {abort.raise | e} = try { read_with(data, depth, item) }
+
+// --- The tree -------------------------------------------------------------------
+
+/// The universal types that are constructed: `EXTERNAL`, `EMBEDDED PDV`, `SEQUENCE`, `SET` and
+/// `CHARACTER STRING`. Every other is primitive in DER.
+fn grouped(number: Int) -> Bool =
+  number == 8 || number == 11 || number == 16 || number == 17 || number == 29
+
+/// Whether the tree reads an element of this tag and form as a `Primitive` or a `Constructed`,
+/// having no other value for it.
+fn untyped(tag: Tag, constructed: Bool) -> Bool =
+  if tag.class != Universal { true }
+  else if constructed { tag.number == 8 || tag.number == 11 || tag.number == 29 } else {
+    !grouped(tag.number) && (tag.number < 1 || tag.number > 6) && tag.number != 10
+      && tag.number != 23
+      && tag.number != 24
+      && string_kind(tag.number) == None
+  }
+
+fn leaf_value(tag: Tag, content: Bytes, at: Int) -> Value / {asn1.refused, abort.raise} =
+  if tag.class != Universal { Primitive(tag, content) } else {
+    match tag.number {
+      1 -> Boolean(boolean_of(content, at)),
+      2 -> Integer(integer_of(content, at)),
+      3 -> BitString(bits_of(content, at)),
+      4 -> OctetString(content),
+      5 -> {
+        null_of(content, at);
+        Null
+      },
+      6 -> ObjectId(oid_of(content, at)),
+      10 -> Enumerated(integer_of(content, at)),
+      23 -> UtcTime(utc_time_of(content, at)),
+      24 -> GeneralizedTime(generalized_time_of(content, at)),
+      number -> match string_kind(number) {
+        Some(kind) -> Text(kind, text_of(kind, content, at)),
+        None -> Primitive(tag, content),
+      },
+    }
+  }
+
+/// The element at `at` as a tree, and where it ends. `room` is how many levels deeper it may
+/// nest; each constructed element spends one.
+fn tree_at(
+  data: Bytes,
+  at: Int,
+  end: Int,
+  room: Int,
+) -> { value: Value, at: Int } / {asn1.refused, abort.raise} = {
+  let h = head(data, at, end);
+  if h.tag.class == Universal && h.constructed != grouped(h.tag.number) { refuse(at, WrongForm) }
+  else if !h.constructed {
+    { value: leaf_value(h.tag, bytes_slice(data, h.from, h.to), h.from), at: h.to }
+  } else if room <= 0 { refuse(at, TooDeep) } else {
+    let set = h.tag == universal(17);
+    let held = trees(data, h.from, h.to, room - 1, set, b"", [], h.to - h.from);
+    {
+      value: if set { Set(held) }
+      else if h.tag == universal(16) { Sequence(held) }
+      else { Constructed(h.tag, held) },
+      at: h.to,
+    }
+  }
+}
+
+/// The elements from `at` to `end`, as `members` reads a constructed element's.
+fn trees(
+  data: Bytes,
+  at: Int,
+  end: Int,
+  room: Int,
+  sorted: Bool,
+  last: Bytes,
+  acc: List<Value>,
+  left: Int,
+) -> List<Value> / {asn1.refused, abort.raise} =
+  if at >= end || left <= 0 { acc } else {
+    let tree = tree_at(data, at, end, room);
+    let whole = if sorted { bytes_slice(data, at, tree.at) } else { b"" };
+    if compare(last, whole) == Greater { refuse(at, Unsorted) }
+    else { trees(data, tree.at, end, room, sorted, whole, push(acc, tree.value), left - 1) }
+  }
+
+/// The document `data` is, nested at most `depth` deep, raising `asn1.refused` where `decode`
+/// answers `Err`.
+pub fn read(data: Bytes, depth: Int) -> Value / {asn1.refused, abort.raise} =
+  read_with(data, depth, read_any)
+
+/// The document `data` is, nested at most `depth` deep, or why it is not exactly one DER value.
+pub fn decode(data: Bytes, depth: Int) -> Result<Value, Refusal> / {abort.raise} =
+  try { read(data, depth) }
+
+/// An `INTEGER`'s content as a tree holds it, which is as a reader answers it.
+fn exact_integer(content: Bytes) -> Bytes / {asn1.unwritable, abort.raise} =
+  if bytes_len(content) == 0 { asn1.unwritable(EmptyInteger) }
+  else if redundant(content, 0) { asn1.unwritable(LongInteger) }
+  else { content }
+
+/// The encoding of `v`, raising `asn1.unwritable` where `encode` answers `Err`. A tree is written
+/// only as `read` would have answered it: an `Integer` in its fewest octets, a `Set` in order, a
+/// `Primitive` or a `Constructed` under a tag the tree has no other reading of.
+pub fn write(v: Value) -> Bytes / {asn1.unwritable, abort.raise} =
+  match v {
+    Boolean(b) -> boolean(b),
+    Integer(content) -> element(0x02, exact_integer(content)),
+    Enumerated(content) -> element(0x0A, exact_integer(content)),
+    BitString(b) -> bit_string(b),
+    OctetString(octets) -> octet_string(octets),
+    Null -> null(),
+    ObjectId(o) -> oid(o),
+    Text(kind, text) -> string(kind, text),
+    UtcTime(t) -> utc_time(t),
+    GeneralizedTime(t) -> generalized_time(t),
+    Sequence(held) -> sequence(map(held, write)),
+    Set(held) -> {
+      let parts = map(held, write);
+      if is_sorted(parts) { element(0x31, bytes_concat_all(parts)) }
+      else { asn1.unwritable(Unsorted) }
+    },
+    Constructed(tag, held) -> if untyped(tag, true) { constructed(tag, map(held, write)) }
+    else { asn1.unwritable(BadTag) },
+    Primitive(tag, content) -> if untyped(tag, false) { primitive(tag, content) }
+    else { asn1.unwritable(BadTag) },
+  }
+
+/// The encoding of `v`, or why it has none.
+pub fn encode(v: Value) -> Result<Bytes, Why> / {abort.raise} = try { write(v) }
+
+// --- Laws -----------------------------------------------------------------------
+
+/// How deep `v` nests: the depth a reader needs for it.
+fn height(v: Value) -> Int =
+  match v {
+    Sequence(held) | Set(held) | Constructed(_, held) ->
+      1 + fold(map(held, height), 0, |deepest: Int, h: Int| max(deepest, h)),
+    _ -> 0,
+  }
+
+fn writable(v: Value) -> Bool / {abort.raise} = match encode(v) { Ok(_) -> true, Err(_) -> false }
+
+/// Whether `data` is refused, or read as a value that writes back as exactly `data`.
+fn rewritten(data: Bytes) -> Bool / {abort.raise} =
+  match decode(data, 64) { Err(_) -> true, Ok(v) -> encode(v) == Ok(data) }
+
+/// `data` with the octet at `at`, wherever in it that lands, replaced by `octet`'s low eight bits.
+fn altered(data: Bytes, at: Int, octet: Int) -> Bytes / {abort.raise} =
+  if bytes_len(data) == 0 { data } else {
+    let i = (at & 9223372036854775807) % bytes_len(data);
+    bytes_concat_all([
+      bytes_slice(data, 0, i),
+      byte_of_int(octet & 0xFF),
+      bytes_slice(data, i + 1, bytes_len(data)),
+    ])
+  }
+
+law "a value that writes reads back as itself"
+  forall (v: Value) where writable(v) {
+    decode(write(v), height(v)) == Ok(v)
+  }
+
+law "bytes that read are the bytes their value writes" forall (data: Bytes) { rewritten(data) }
+
+law "a written value with one octet changed is refused or is another value's encoding"
+  forall (v: Value, at: Int, octet: Int) where writable(v) {
+    rewritten(altered(write(v), at, octet))
+  }
+
+law "what the builders write is one value's encoding"
+  forall (flag: Bool, n: Int, octets: Bytes, text: String, numbers: List<Int>) {
+    let der = sequence([
+      boolean(flag),
+      int(n),
+      integer(octets),
+      unsigned(octets),
+      enumerated(n),
+      octet_string(octets),
+      string(Utf8String, text),
+      named_bits(map(numbers, |position: Int| position & 63)),
+      set_of(map(numbers, int)),
+      explicit(context(n & 1023), null()),
+    ]);
+    match decode(der, 2) { Ok(v) -> encode(v) == Ok(der), Err(_) -> false }
+  }
+
+law "an Int reads back from the INTEGER written for it" =
+  round_trip(int, |der: Bytes| result_ok(decode_with(der, 0, read_int)))
+
+law "a Bool reads back from the BOOLEAN written for it" =
+  round_trip(boolean, |der: Bytes| result_ok(decode_with(der, 0, read_boolean)))
+
+law "octets read back from the OCTET STRING written for them" =
+  round_trip(octet_string, |der: Bytes| result_ok(decode_with(der, 0, read_octet_string)))
+
+law "an Int reads back from its content" = round_trip(integer_of_int, int_of_integer)
+
+law "an Int's content is the same written as a BigInt" =
+  agrees(integer_of_int, |n: Int| integer_of_big_int(bigint::of_int(n)))
+
+law "an INTEGER of any size reads back from the BigInt it names"
+  forall (octets: Bytes) {
+    integer_of_big_int(big_int_of_integer(minimal(octets))) == minimal(octets)
+  }
+
+law "reading and writing are linear in the elements"
+  forall (n: Int) where n > 0 cost n {
+    let der = sequence(
+      map(range(0, n), |i: Int| set_of([int(i), string(PrintableString, "x"), null()])),
+    );
+    match decode(der, 2) { Ok(v) -> encode(v) == Ok(der), Err(_) -> false }
+  }
+
+// --- Tests ----------------------------------------------------------------------
+
+type Vector = { name: String, der: Bytes, value: Value }
+
+fn vector(name: String, der: Bytes, value: Value) -> Vector = { name: name, der: der, value: value }
+
+fn zeros(n: Int) -> Bytes = repeat(b"\x00", n)
+
+fn vectors() -> List<Vector> / {abort.raise} =
+  [
+    vector("TRUE", bytes_of_hex("0101ff"), Boolean(true)),
+    vector("FALSE", bytes_of_hex("010100"), Boolean(false)),
+    vector("the INTEGER 0", bytes_of_hex("020100"), Integer(b"\x00")),
+    vector("the INTEGER 127", bytes_of_hex("02017f"), Integer(b"\x7f")),
+    vector("the INTEGER 128", bytes_of_hex("02020080"), Integer(b"\x00\x80")),
+    vector("the INTEGER -128", bytes_of_hex("020180"), Integer(b"\x80")),
+    vector("the INTEGER -129", bytes_of_hex("0202ff7f"), Integer(b"\xff\x7f")),
+    vector("an ENUMERATED", bytes_of_hex("0a0101"), Enumerated(b"\x01")),
+    vector(
+      "a BIT STRING of eighteen bits",
+      bytes_of_hex("0304066e5dc0"),
+      BitString({ unused: 6, bytes: bytes_of_hex("6e5dc0") }),
+    ),
+    vector("a BIT STRING of no bits", bytes_of_hex("030100"), BitString({ unused: 0, bytes: b"" })),
+    vector(
+      "an OCTET STRING",
+      bytes_of_hex("04080123456789abcdef"),
+      OctetString(bytes_of_hex("0123456789abcdef")),
+    ),
+    vector("NULL", bytes_of_hex("0500"), Null),
+    vector(
+      "the identifier 1.2.840.113549",
+      bytes_of_hex("06062a864886f70d"),
+      ObjectId(oid"1.2.840.113549"),
+    ),
+    vector("the identifier 2.999.3", bytes_of_hex("0603883703"), ObjectId(oid"2.999.3")),
+    vector("the identifier 0.39", bytes_of_hex("060127"), ObjectId(oid"0.39")),
+    vector("the identifier 1.0", bytes_of_hex("060128"), ObjectId(oid"1.0")),
+    vector("the identifier 1.39", bytes_of_hex("06014f"), ObjectId(oid"1.39")),
+    vector("the identifier 2.0", bytes_of_hex("060150"), ObjectId(oid"2.0")),
+    vector("the identifier 1.2.16384", bytes_of_hex("06042a818000"), ObjectId(oid"1.2.16384")),
+    vector("a UTF8String", bytes_of_hex("0c0668c3a96c6c6f"), Text(Utf8String, "héllo")),
+    vector("a NumericString", b"\x12\x0512 34", Text(NumericString, "12 34")),
+    vector("a PrintableString", b"\x13\x0bTest User 1", Text(PrintableString, "Test User 1")),
+    vector("an IA5String", b"\x16\x05a@b\x0a\x7f", Text(Ia5String, "a@b\n\u{7f}")),
+    vector("a VisibleString", b"\x1a\x03a~ ", Text(VisibleString, "a~ ")),
+    vector("a UniversalString", bytes_of_hex("1c040001f600"), Text(UniversalString, "\u{1F600}")),
+    vector("a BMPString", bytes_of_hex("1e0203c0"), Text(BmpString, "\u{3c0}")),
+    vector(
+      "a UTCTime",
+      b"\x17\x0d191216030210Z",
+      UtcTime({ year: 2019, month: 12, day: 16, hour: 3, minute: 2, second: 10, nanosecond: 0 }),
+    ),
+    vector(
+      "a UTCTime of 1950",
+      b"\x17\x0d500101000000Z",
+      UtcTime({ year: 1950, month: 1, day: 1, hour: 0, minute: 0, second: 0, nanosecond: 0 }),
+    ),
+    vector(
+      "a GeneralizedTime",
+      b"\x18\x0f20200229235959Z",
+      GeneralizedTime({
+        year: 2020,
+        month: 2,
+        day: 29,
+        hour: 23,
+        minute: 59,
+        second: 59,
+        nanosecond: 0,
+      }),
+    ),
+    vector(
+      "a GeneralizedTime with a fraction of its second",
+      b"\x18\x1320191216030210.025Z",
+      GeneralizedTime({
+        year: 2019,
+        month: 12,
+        day: 16,
+        hour: 3,
+        minute: 2,
+        second: 10,
+        nanosecond: 25000000,
+      }),
+    ),
+    vector(
+      "a GeneralizedTime to the nanosecond",
+      b"\x18\x1999991231235959.999999999Z",
+      GeneralizedTime({
+        ..day(9999, 12, 31),
+        hour: 23,
+        minute: 59,
+        second: 59,
+        nanosecond: 999999999,
+      }),
+    ),
+    vector(
+      "a GeneralizedTime of the year 0",
+      b"\x18\x0f00000101000000Z",
+      GeneralizedTime(day(0, 1, 1)),
+    ),
+    vector(
+      "a SEQUENCE",
+      bytes_of_hex("3006020101020102"),
+      Sequence([Integer(b"\x01"), Integer(b"\x02")]),
+    ),
+    vector("a SEQUENCE of nothing", bytes_of_hex("3000"), Sequence([])),
+    vector(
+      "a SET OF in order, a repeat included",
+      bytes_of_hex("310a020101020101020200ff"),
+      Set([Integer(b"\x01"), Integer(b"\x01"), Integer(b"\x00\xff")]),
+    ),
+    vector(
+      "an explicitly tagged field",
+      bytes_of_hex("a003020102"),
+      Constructed(context(0), [Integer(b"\x02")]),
+    ),
+    vector("an implicitly tagged field", bytes_of_hex("8203666f6f"), Primitive(context(2), b"foo")),
+    vector(
+      "an application tag past 30",
+      bytes_of_hex("7f814800"),
+      Constructed(application(200), []),
+    ),
+    vector("the application tag 0", bytes_of_hex("4000"), Primitive(application(0), b"")),
+    vector("the private tag 31", bytes_of_hex("df1f00"), Primitive(private(31), b"")),
+    vector(
+      "the largest tag number",
+      bytes_of_hex("9fffffffffffffffff7f00"),
+      Primitive(context(9223372036854775807), b""),
+    ),
+    vector(
+      "a universal type the tree does not check",
+      b"\x14\x03abc",
+      Primitive(universal(20), b"abc"),
+    ),
+    vector(
+      "a universal type that is constructed",
+      bytes_of_hex("28020500"),
+      Constructed(universal(8), [Null]),
+    ),
+    vector(
+      "a length of 127",
+      bytes_concat(bytes_of_hex("047f"), zeros(127)),
+      OctetString(zeros(127)),
+    ),
+    vector(
+      "a length of 128",
+      bytes_concat(bytes_of_hex("048180"), zeros(128)),
+      OctetString(zeros(128)),
+    ),
+    vector(
+      "a length of 256",
+      bytes_concat(bytes_of_hex("04820100"), zeros(256)),
+      OctetString(zeros(256)),
+    ),
+    vector(
+      "a length of 65536",
+      bytes_concat(bytes_of_hex("0483010000"), zeros(65536)),
+      OctetString(zeros(65536)),
+    ),
+  ]
+
+test "{c.name} reads as its value and writes back" for c: Vector in vectors() {
+  assert_eq(decode(c.der, 1), Ok(c.value));
+  assert_eq(encode(c.value), Ok(c.der))
+}
+
+type Refused = { name: String, der: Bytes, at: Int, why: Why }
+
+fn refused(name: String, der: Bytes, at: Int, why: Why) -> Refused =
+  { name: name, der: der, at: at, why: why }
+
+fn refusals() -> List<Refused> / {abort.raise} =
+  [
+    refused("no bytes at all", b"", 0, Truncated),
+    refused("a tag and no length", bytes_of_hex("02"), 1, Truncated),
+    refused("content cut short", bytes_of_hex("020201"), 2, Truncated),
+    refused("a length cut short", bytes_of_hex("0482"), 2, Truncated),
+    refused("a tag number cut short", bytes_of_hex("9f81"), 2, Truncated),
+    refused("a tag number that never starts", bytes_of_hex("9f"), 1, Truncated),
+    refused("a length claiming more than remains", bytes_of_hex("0484ffffffff00"), 6, Truncated),
+    refused(
+      "a length of eight octets an Int holds",
+      bytes_of_hex("04880100000000000000"),
+      10,
+      Truncated,
+    ),
+    refused("bytes after the value", bytes_of_hex("050000"), 2, Trailing),
+    refused("five levels where four are allowed", bytes_of_hex("30083006300430023000"), 8, TooDeep),
+    refused("an indefinite length", bytes_of_hex("30800000"), 1, IndefiniteLength),
+    refused("a length under 128 in the long form", bytes_of_hex("04810100"), 1, LongLength),
+    refused(
+      "a length with a leading zero octet",
+      bytes_concat(bytes_of_hex("04820080"), zeros(128)),
+      1,
+      LongLength,
+    ),
+    refused("a length of nine octets", bytes_of_hex("0489010000000000000000"), 1, TooWide),
+    refused("a length of sixty-four bits", bytes_of_hex("04888000000000000000"), 1, TooWide),
+    refused("a tag number under 31 in the long form", bytes_of_hex("1f0100"), 0, LongTag),
+    refused("a tag number with a leading 80", bytes_of_hex("9f807f00"), 0, LongTag),
+    refused("a tag number of seventy bits", bytes_of_hex("9fffffffffffffffffff7f00"), 0, TooWide),
+    refused("an end of contents", bytes_of_hex("0000"), 0, EndOfContents),
+    refused("a BOOLEAN of 01", bytes_of_hex("010101"), 2, BadBoolean),
+    refused("a BOOLEAN of two octets", bytes_of_hex("0102ffff"), 2, BadBoolean),
+    refused("a BOOLEAN of no octets", bytes_of_hex("0100"), 2, BadBoolean),
+    refused("an INTEGER of no octets", bytes_of_hex("0200"), 2, EmptyInteger),
+    refused("an INTEGER padded with 00", bytes_of_hex("02020001"), 2, LongInteger),
+    refused("an INTEGER padded with FF", bytes_of_hex("0202ff80"), 2, LongInteger),
+    refused("an ENUMERATED padded with 00", bytes_of_hex("0a020001"), 2, LongInteger),
+    refused("a BIT STRING with no count", bytes_of_hex("0300"), 2, BadBits),
+    refused("a BIT STRING leaving out eight bits", bytes_of_hex("03020800"), 2, BadBits),
+    refused("a BIT STRING leaving out bits it does not have", bytes_of_hex("030101"), 2, BadBits),
+    refused("a BIT STRING with an unused bit set", bytes_of_hex("03020101"), 2, BadBits),
+    refused("a NULL with content", bytes_of_hex("050100"), 2, BadNull),
+    refused("an identifier of no octets", bytes_of_hex("0600"), 2, BadOid),
+    refused("an identifier that ends inside an arc", bytes_of_hex("06022a86"), 3, BadOid),
+    refused("an identifier arc with a leading 80", bytes_of_hex("06032a8001"), 3, LongArc),
+    refused(
+      "an identifier arc of seventy bits",
+      bytes_of_hex("060b2affffffffffffffffff7f"),
+      3,
+      TooWide,
+    ),
+    refused("a UTF8String that is not UTF-8", bytes_of_hex("0c02c328"), 2, BadText(Utf8String)),
+    refused("a NumericString with a letter", b"\x12\x021a", 3, BadText(NumericString)),
+    refused("a PrintableString with an @", b"\x13\x03a@b", 3, BadText(PrintableString)),
+    refused(
+      "an IA5String with an octet past ASCII",
+      bytes_of_hex("16026180"),
+      3,
+      BadText(Ia5String),
+    ),
+    refused("a VisibleString with a line break", b"\x1a\x02a\x0a", 3, BadText(VisibleString)),
+    refused(
+      "a UniversalString past the last character",
+      bytes_of_hex("1c0400110000"),
+      2,
+      BadText(UniversalString),
+    ),
+    refused(
+      "a UniversalString of five octets",
+      bytes_of_hex("1c050000006100"),
+      2,
+      BadText(UniversalString),
+    ),
+    refused(
+      "a BMPString with half a surrogate pair",
+      bytes_of_hex("1e040061d83d"),
+      4,
+      BadText(BmpString),
+    ),
+    refused("a BMPString of three octets", bytes_of_hex("1e03006100"), 2, BadText(BmpString)),
+    refused("a UTCTime without its seconds", b"\x17\x0b1912160302Z", 2, BadTime),
+    refused("a UTCTime with an offset for its Z", b"\x17\x11191216030210+0000", 2, BadTime),
+    refused("a UTCTime on the 30th of February", b"\x17\x0d190230000000Z", 2, BadTime),
+    refused("a UTCTime at sixty seconds", b"\x17\x0d191216030260Z", 2, BadTime),
+    refused("a UTCTime with a letter in it", b"\x17\x0d1912160302x0Z", 2, BadTime),
+    refused("a GeneralizedTime without its Z", b"\x18\x0e20191216030210", 2, BadTime),
+    refused(
+      "a GeneralizedTime with an offset for its Z",
+      b"\x18\x1320191216030210+0100",
+      2,
+      BadTime,
+    ),
+    refused("a GeneralizedTime without its seconds", b"\x18\x0d201912160302Z", 2, BadTime),
+    refused("a GeneralizedTime at hour 24", b"\x18\x0f20191216240000Z", 2, BadTime),
+    refused(
+      "a GeneralizedTime on the 29th of February in 1900",
+      b"\x18\x0f19000229000000Z",
+      2,
+      BadTime,
+    ),
+    refused("a GeneralizedTime with a fraction of zero", b"\x18\x1120191216030210.0Z", 2, BadTime),
+    refused(
+      "a GeneralizedTime with a fraction ending in zero",
+      b"\x18\x1220191216030210.50Z",
+      2,
+      BadTime,
+    ),
+    refused(
+      "a GeneralizedTime with a point and no fraction",
+      b"\x18\x1020191216030210.Z",
+      2,
+      BadTime,
+    ),
+    refused(
+      "a GeneralizedTime with a comma for its point",
+      b"\x18\x1120191216030210,5Z",
+      2,
+      BadTime,
+    ),
+    refused(
+      "a GeneralizedTime with a letter in its fraction",
+      b"\x18\x1220191216030210.x5Z",
+      2,
+      BadTime,
+    ),
+    refused("a GeneralizedTime at minute 60", b"\x18\x0f20191216036000Z", 2, BadTime),
+    refused(
+      "a GeneralizedTime with a fraction of ten digits",
+      b"\x18\x1a20191216030210.1234567891Z",
+      2,
+      TooWide,
+    ),
+    refused("a SET OF out of order", bytes_of_hex("3106020102020101"), 5, Unsorted),
+    refused(
+      "a SET OF with its longer member first",
+      bytes_of_hex("310702020080020101"),
+      6,
+      Unsorted,
+    ),
+    refused("a UTF8String in pieces", bytes_of_hex("2c050c03616263"), 0, WrongForm),
+    refused("an OCTET STRING in pieces", bytes_of_hex("24050403616263"), 0, WrongForm),
+    refused("a UTCTime in pieces", bytes_of_hex("3700"), 0, WrongForm),
+    refused("a primitive SEQUENCE", bytes_of_hex("1000"), 0, WrongForm),
+    refused("a primitive SET", bytes_of_hex("1100"), 0, WrongForm),
+    refused("a refusal inside a nested value", bytes_of_hex("3007a0050101010500"), 6, BadBoolean),
+  ]
+
+test "the tree refuses {c.name}" for c: Refused in refusals() {
+  assert_eq(decode(c.der, 4), Err({ at: c.at, why: c.why }))
+}
+
+/// A read of the cursor, for a table to name.
+type Asked =
+  | AnInt
+  | AMagnitude
+  | ATime
+  | NamedBits
+  | AnOctetString
+  | ADefaultOfFalse
+  | ASequence
+  | IntsInSequence
+  | PairsInSequence
+  | IntsInSet
+  | AnExplicitInt
+  | AnImplicitInt
+
+fn unit<a>(read: Read<a>) -> Read<Unit> = { value: (), rest: read.rest }
+
+fn two_ints(r: Reader) -> Read<Int> / {asn1.refused, abort.raise} = read_int(read_int(r).rest)
+
+fn asked(ask: Asked, r: Reader) -> Read<Unit> / {asn1.refused, abort.raise} =
+  match ask {
+    AnInt -> unit(read_int(r)),
+    AMagnitude -> unit(read_unsigned(r)),
+    ATime -> unit(read_time(r)),
+    NamedBits -> unit(read_named_bits(r)),
+    AnOctetString -> unit(read_octet_string(r)),
+    ADefaultOfFalse -> unit(read_default(r, universal(1), false, read_boolean)),
+    ASequence -> unit(within(read_sequence(r), read_null)),
+    IntsInSequence -> unit(read_sequence_of(r, read_int)),
+    PairsInSequence -> unit(read_sequence_of(r, two_ints)),
+    IntsInSet -> unit(read_set_of(r, read_int)),
+    AnExplicitInt -> unit(read_explicit(r, context(0), read_int)),
+    AnImplicitInt -> unit(read_implicit(r, context(2), read_int)),
+  }
+
+type Declined = { name: String, ask: Asked, der: Bytes, at: Int, why: Why }
+
+fn declines(name: String, ask: Asked, der: Bytes, at: Int, why: Why) -> Declined =
+  { name: name, ask: ask, der: der, at: at, why: why }
+
+fn declined() -> List<Declined> / {abort.raise} =
+  [
+    declines(
+      "an INTEGER of sixty-five bits as an Int",
+      AnInt,
+      bytes_of_hex("0209008000000000000000"),
+      2,
+      TooWide,
+    ),
+    declines("a BOOLEAN as an INTEGER", AnInt, bytes_of_hex("0101ff"), 0, WrongTag(universal(1))),
+    declines("nothing as an INTEGER", AnInt, b"", 0, Truncated),
+    declines("a negative INTEGER as a magnitude", AMagnitude, bytes_of_hex("020180"), 2, Negative),
+    declines(
+      "a GeneralizedTime in 2049 as a certificate's time",
+      ATime,
+      b"\x18\x0f20491231235959Z",
+      0,
+      TimeChoice,
+    ),
+    declines(
+      "a GeneralizedTime in 1950 as a certificate's time",
+      ATime,
+      b"\x18\x0f19500101000000Z",
+      0,
+      TimeChoice,
+    ),
+    declines(
+      "a GeneralizedTime with a fraction as a certificate's time",
+      ATime,
+      b"\x18\x1120500101000000.5Z",
+      0,
+      TimeChoice,
+    ),
+    declines(
+      "a string as a certificate's time",
+      ATime,
+      bytes_of_hex("0c00"),
+      0,
+      WrongTag(universal(12)),
+    ),
+    declines(
+      "named bits ending in a zero bit",
+      NamedBits,
+      bytes_of_hex("03020680"),
+      2,
+      TrailingZeroBits,
+    ),
+    declines(
+      "named bits ending in a zero octet",
+      NamedBits,
+      bytes_of_hex("0303008000"),
+      2,
+      TrailingZeroBits,
+    ),
+    declines(
+      "an OCTET STRING in pieces as an OCTET STRING",
+      AnOctetString,
+      bytes_of_hex("24050403616263"),
+      0,
+      WrongForm,
+    ),
+    declines("a default written out", ADefaultOfFalse, bytes_of_hex("010100"), 0, DefaultEncoded),
+    declines("a SET as a SEQUENCE", ASequence, bytes_of_hex("3100"), 0, WrongTag(universal(17))),
+    declines(
+      "a SEQUENCE with a field too many",
+      ASequence,
+      bytes_of_hex("300405000500"),
+      4,
+      Trailing,
+    ),
+    declines(
+      "a SEQUENCE OF with a member of another type",
+      IntsInSequence,
+      bytes_of_hex("30030101ff"),
+      2,
+      WrongTag(universal(1)),
+    ),
+    declines(
+      "a member read as two elements",
+      PairsInSequence,
+      bytes_of_hex("3006020101020102"),
+      5,
+      Truncated,
+    ),
+    declines(
+      "a SET OF out of order, to the cursor",
+      IntsInSet,
+      bytes_of_hex("3106020102020101"),
+      5,
+      Unsorted,
+    ),
+    declines(
+      "two elements under an explicit tag",
+      AnExplicitInt,
+      bytes_of_hex("a006020101020102"),
+      5,
+      Trailing,
+    ),
+    declines(
+      "a primitive element as an explicit tag",
+      AnExplicitInt,
+      bytes_of_hex("8000"),
+      0,
+      WrongForm,
+    ),
+    declines(
+      "the type's own tag where an implicit one is asked",
+      AnImplicitInt,
+      bytes_of_hex("020101"),
+      0,
+      WrongTag(universal(2)),
+    ),
+  ]
+
+test "the cursor refuses {c.name}" for c: Declined in declined() {
+  assert_eq(decode_with(c.der, 2, |r: Reader| asked(c.ask, r)), Err({ at: c.at, why: c.why }))
+}
+
+test "an INTEGER is the fewest octets of its two's complement, as an Int, a BigInt or octets" {
+  let ints = [
+    { n: 0, der: "020100" },
+    { n: 127, der: "02017f" },
+    { n: 128, der: "02020080" },
+    { n: 256, der: "02020100" },
+    { n: 0 - 1, der: "0201ff" },
+    { n: 0 - 128, der: "020180" },
+    { n: 0 - 129, der: "0202ff7f" },
+    { n: 9223372036854775807, der: "02087fffffffffffffff" },
+    { n: 0 - 9223372036854775807 - 1, der: "02088000000000000000" },
+  ];
+  assert_eq(
+    map(ints, |c: { n: Int, der: String }| hex_of(int(c.n))),
+    map(ints, |c: { n: Int, der: String }| c.der),
+  );
+  assert_eq(
+    map(ints, |c: { n: Int, der: String }| decode_with(bytes_of_hex(c.der), 0, read_int)),
+    map(ints, |c: { n: Int, der: String }| Ok(c.n)),
+  );
+  assert_eq(
+    map(ints, |c: { n: Int, der: String }| hex_of(big_int(bigint::of_int(c.n)))),
+    map(ints, |c: { n: Int, der: String }| c.der),
+  );
+  let two = bigint::of_int(2);
+  let bigs = [
+    { n: bigint::pow(two, 55), der: "02080080000000000000" },
+    { n: bigint::neg(bigint::pow(two, 55)), der: "020780000000000000" },
+    { n: bigint::pow(two, 56), der: "02080100000000000000" },
+    { n: bigint::pow(two, 64), der: "0209010000000000000000" },
+    { n: bigint::neg(bigint::pow(two, 64)), der: "0209ff0000000000000000" },
+    { n: bigint"123456789012345678901234567890", der: "020d018ee90ff6c373e0ee4e3f0ad2" },
+    { n: bigint"-1", der: "0201ff" },
+    { n: bigint::pow(two, 200), der: "021a01" ++ hex_of(zeros(25)) },
+    { n: bigint::neg(bigint::pow(two, 200)), der: "021aff" ++ hex_of(zeros(25)) },
+    {
+      n: bigint::sub(bigint::pow(two, 200), bigint::one()),
+      der: "021a00" ++ hex_of(repeat(b"\xff", 25)),
+    },
+  ];
+  assert_eq(
+    map(bigs, |c: { n: BigInt, der: String }| hex_of(big_int(c.n))),
+    map(bigs, |c: { n: BigInt, der: String }| c.der),
+  );
+  assert_eq(
+    map(bigs, |c: { n: BigInt, der: String }| decode_with(bytes_of_hex(c.der), 0, read_big_int)),
+    map(bigs, |c: { n: BigInt, der: String }| Ok(c.n)),
+  );
+  assert_eq(integer(b""), bytes_of_hex("020100"));
+  assert_eq(integer(b"\x00\x00\x01"), bytes_of_hex("020101"));
+  assert_eq(integer(b"\xff\xff\x80"), bytes_of_hex("020180"));
+  assert_eq(integer(b"\x00\x80"), bytes_of_hex("02020080"));
+  assert_eq(unsigned(b"\x80"), bytes_of_hex("02020080"));
+  assert_eq(unsigned(b"\x00\x00\x7f"), bytes_of_hex("02017f"));
+  assert_eq(unsigned(b""), bytes_of_hex("020100"));
+  assert_eq(decode_with(bytes_of_hex("02020080"), 0, read_unsigned), Ok(b"\x80"));
+  assert_eq(decode_with(bytes_of_hex("020100"), 0, read_unsigned), Ok(b"\x00"));
+  assert_eq(decode_with(bytes_of_hex("02020080"), 0, read_integer), Ok(b"\x00\x80"));
+  assert_eq(int_of_integer(b""), None);
+  assert_eq(hex_of(enumerated(3)), "0a0103");
+  assert_eq(decode_with(bytes_of_hex("0a0103"), 0, read_enumerated), Ok(3))
+}
+
+test "a builder writes the shortest length and tag, and a tag takes another's place or wraps it" {
+  let head = |der: Bytes, n: Int| hex_of(bytes_slice(der, 0, n));
+  assert_eq(head(octet_string(zeros(127)), 2), "047f");
+  assert_eq(head(octet_string(zeros(128)), 3), "048180");
+  assert_eq(head(octet_string(zeros(255)), 3), "0481ff");
+  assert_eq(head(octet_string(zeros(256)), 4), "04820100");
+  assert_eq(head(octet_string(zeros(65536)), 5), "0483010000");
+  let made = |r: Result<Bytes, Why>| match r { Ok(der) -> hex_of(der), Err(_) -> "unwritable" };
+  assert_eq(made(try { primitive(context(30), b"") }), "9e00");
+  assert_eq(made(try { primitive(context(31), b"") }), "9f1f00");
+  assert_eq(made(try { primitive(context(127), b"") }), "9f7f00");
+  assert_eq(made(try { primitive(context(128), b"") }), "9f810000");
+  assert_eq(made(try { constructed(application(1), [null()]) }), "61020500");
+  assert_eq(made(try { explicit(context(3), null()) }), "a3020500");
+  assert_eq(made(try { implicit(context(2), string(Ia5String, "a")) }), "820161");
+  assert_eq(made(try { implicit(context(0), sequence([null()])) }), "a0020500");
+  assert_eq(made(try { implicit(universal(4), primitive(private(200), b"x")) }), "040178");
+  assert_eq(made(try { implicit(universal(4), primitive(private(31), b"x")) }), "040178");
+  assert_eq(made(try { implicit(universal(4), primitive(private(16384), b"x")) }), "040178");
+  assert_eq(try { primitive(context(0 - 1), b"") }, Err(BadTag));
+  assert_eq(try { constructed(universal(0), []) }, Err(BadTag));
+  assert_eq(try { implicit(context(1), b"") }, Err(Truncated));
+  assert_eq(try { implicit(context(1), bytes_of_hex("9f81")) }, Err(Truncated));
+  assert_eq(hex_of(sequence([int(1), null()])), "30050201010500");
+  assert_eq(hex_of(set_of([int(2), int(1), boolean(true), int(1)])), "310c0101ff020101020101020102")
+}
+
+test "a string holds its type's characters, and a writer refuses one it does not" {
+  let kinds = [
+    Utf8String,
+    NumericString,
+    PrintableString,
+    Ia5String,
+    VisibleString,
+    UniversalString,
+    BmpString,
+  ];
+  assert(
+    fold(kinds, true, |ok: Bool, kind: StringKind|
+      ok && decode_with(string(kind, "12 34"), 0, |r: Reader| read_string(r, kind)) == Ok("12 34")),
+  );
+  let refused = |kind: StringKind, text: String|
+    assert_eq(try { string(kind, text) }, Err(BadText(kind)));
+  refused(NumericString, "1a");
+  refused(PrintableString, "a*b");
+  refused(PrintableString, "@");
+  refused(PrintableString, "[");
+  refused(PrintableString, "`");
+  refused(PrintableString, "{");
+  refused(PrintableString, "é");
+  refused(VisibleString, "\u{7f}");
+  refused(Ia5String, "é");
+  refused(VisibleString, "a\tb");
+  refused(BmpString, "\u{1F600}");
+  assert_eq(
+    try { string(PrintableString, "AZaz09 '()+,-./:=?") },
+    Ok(b"\x13\x12AZaz09 '()+,-./:=?"),
+  );
+  assert_eq(
+    try { string(UniversalString, "a\u{1F600}") },
+    Ok(bytes_of_hex("1c08000000610001f600")),
+  );
+  assert_eq(try { string(BmpString, "a\u{3c0}") }, Ok(bytes_of_hex("1e04006103c0")));
+  assert_eq(try { string(BmpString, "\u{ffff}") }, Ok(bytes_of_hex("1e02ffff")))
+}
+
+fn day(year: Int, month: Int, day: Int) -> Time =
+  { year: year, month: month, day: day, hour: 0, minute: 0, second: 0, nanosecond: 0 }
+
+test "a time is written in the one form DER has, and a certificate's by its year" {
+  let t: Time = { year: 2019, month: 12, day: 16, hour: 3, minute: 2, second: 10, nanosecond: 0 };
+  assert_eq(utc_time_text(t), Some("191216030210Z"));
+  assert_eq(generalized_time_text(t), Some("20191216030210Z"));
+  assert_eq(generalized_time_text({ ..t, nanosecond: 500000000 }), Some("20191216030210.5Z"));
+  assert_eq(generalized_time_text({ ..t, nanosecond: 1 }), Some("20191216030210.000000001Z"));
+  assert_eq(generalized_time_text({ ..t, year: 33 }), Some("00331216030210Z"));
+  assert_eq(utc_time_text({ ..t, nanosecond: 1 }), None);
+  assert_eq(utc_time_text(day(1949, 12, 31)), None);
+  assert_eq(utc_time_text(day(2050, 1, 1)), None);
+  assert_eq(utc_time_text(day(2049, 12, 31)), Some("491231000000Z"));
+  assert_eq(utc_time_text(day(1950, 1, 1)), Some("500101000000Z"));
+  assert(time_valid(day(2000, 2, 29)) && time_valid(day(2024, 2, 29)));
+  assert(!time_valid(day(1900, 2, 29)) && !time_valid(day(2023, 2, 29)));
+  let days = |year: Int|
+    map(range(1, 13), |month: Int|
+      len(filter(range(0, 40), |date: Int| time_valid(day(year, month, date)))));
+  assert_eq(days(2023), [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]);
+  assert_eq(days(2024), [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]);
+  assert(!time_valid(day(2023, 4, 31)) && !time_valid(day(2023, 13, 1)));
+  assert(!time_valid(day(2023, 1, 0)) && !time_valid(day(10000, 1, 1)));
+  assert(!time_valid({ ..t, hour: 24 }) && !time_valid({ ..t, second: 60 }));
+  assert(!time_valid({ ..t, minute: 60 }) && !time_valid({ ..t, nanosecond: 1000000000 }));
+  assert(!time_valid({ ..t, month: 0 }) && !time_valid({ ..t, year: 0 - 1 }));
+  assert_eq(try { generalized_time(day(2023, 2, 29)) }, Err(BadTime));
+  assert_eq(try { utc_time(day(2050, 1, 1)) }, Err(BadTime));
+  assert_eq(try { time(day(2049, 12, 31)) }, Ok(b"\x17\x0d491231000000Z"));
+  assert_eq(try { time(day(1950, 1, 1)) }, Ok(b"\x17\x0d500101000000Z"));
+  assert_eq(try { time(day(2050, 1, 1)) }, Ok(b"\x18\x0f20500101000000Z"));
+  assert_eq(try { time(day(1949, 12, 31)) }, Ok(b"\x18\x0f19491231000000Z"));
+  assert_eq(try { time({ ..t, nanosecond: 5 }) }, Err(BadTime));
+  assert_eq(decode_with(b"\x17\x0d491231000000Z", 0, read_time), Ok(day(2049, 12, 31)));
+  assert_eq(decode_with(b"\x18\x0f20500101000000Z", 0, read_time), Ok(day(2050, 1, 1)));
+  assert_eq(decode_with(b"\x18\x0f19491231000000Z", 0, read_time), Ok(day(1949, 12, 31)));
+  assert_eq(
+    decode_with(b"\x18\x1120191216030210.5Z", 0, read_generalized_time),
+    Ok({ ..t, nanosecond: 500000000 }),
+  )
+}
+
+test "bits are counted from the first octet's top, and named bits end at the last one set" {
+  let bits: Bits = { unused: 6, bytes: bytes_of_hex("6e5dc0") };
+  assert_eq(map(range(0, 20), |i: Int| bit_at(bits, i)), [
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    false,
+    false,
+    true,
+    false,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    false,
+    false,
+  ]);
+  assert(!bit_at(bits, 0 - 1));
+  assert(bit_at({ unused: 7, bytes: b"\x80" }, 0) && !bit_at({ unused: 1, bytes: b"\x01" }, 7));
+  assert(bits_valid({ unused: 7, bytes: b"\x80" }));
+  assert(
+    bits_valid(bits) && !bits_valid({ ..bits, unused: 7 }) && !bits_valid({ ..bits, unused: 8 }),
+  );
+  assert(bits_valid({ unused: 0, bytes: b"" }) && !bits_valid({ unused: 1, bytes: b"" }));
+  assert_eq(try { bit_string({ unused: 8, bytes: b"\x00" }) }, Err(BadBits));
+  assert_eq(try { bit_string(bits) }, Ok(bytes_of_hex("0304066e5dc0")));
+  assert_eq(hex_of(named_bits([])), "030100");
+  assert_eq(hex_of(named_bits([0])), "03020780");
+  assert_eq(hex_of(named_bits([5, 0])), "03020284");
+  assert_eq(hex_of(named_bits([8, 0 - 3])), "0303070080");
+  assert_eq(hex_of(named_bits([7, 0])), "03020081");
+  let usage = decode_with(named_bits([5, 0]), 0, read_named_bits);
+  assert_eq(usage, Ok({ unused: 2, bytes: b"\x84" }));
+  assert_eq(decode_with(named_bits([]), 0, read_named_bits), Ok({ unused: 0, bytes: b"" }))
+}
+
+type Entry = { id: Oid, critical: Bool, value: Bytes }
+
+type Card = {
+  version: Int,
+  serial: Bytes,
+  algorithm: Bytes,
+  names: List<String>,
+  key_id: Option<Bytes>,
+  host: Option<String>,
+  entries: List<Entry>,
+  rest: Value,
+}
+
+fn entry(r: Reader) -> Read<Entry> / {asn1.refused, abort.raise} =
+  within(read_sequence(r), |fields: Reader| {
+    let id = read_oid(fields);
+    let critical = read_default(id.rest, universal(1), false, read_boolean);
+    let value = read_octet_string(critical.rest);
+    { value: { id: id.value, critical: critical.value, value: value.value }, rest: value.rest }
+  })
+
+fn card(r: Reader) -> Read<Card> / {asn1.refused, abort.raise} =
+  within(read_sequence(r), |fields: Reader| {
+    let version = read_default(fields, context(0), 0, |x: Reader|
+      read_explicit(x, context(0), read_int));
+    let serial = read_unsigned(version.rest);
+    let algorithm = read_raw(serial.rest);
+    let names = read_set_of(algorithm.rest, |x: Reader| read_string(x, Utf8String));
+    let key_id = read_optional(names.rest, context(1), |x: Reader|
+      read_implicit(x, context(1), read_octet_string));
+    let host = read_optional(key_id.rest, context(2), |x: Reader|
+      read_implicit(x, context(2), |y: Reader| read_string(y, Ia5String)));
+    let entries = read_optional(host.rest, context(3), |x: Reader|
+      read_implicit(x, context(3), |y: Reader| read_sequence_of(y, entry)));
+    let rest = read_any(entries.rest);
+    {
+      value: {
+        version: version.value,
+        serial: serial.value,
+        algorithm: algorithm.value,
+        names: names.value,
+        key_id: key_id.value,
+        host: host.value,
+        entries: match entries.value { Some(found) -> found, None -> [] },
+        rest: rest.value,
+      },
+      rest: rest.rest,
+    }
+  })
+
+test "a cursor reads a schema's fields: tagged, optional, defaulted, repeated and raw" {
+  let algorithm = try { sequence([oid(oid::sha256_with_rsa_encryption()), null()]) };
+  let full = try {
+    sequence([
+      explicit(context(0), int(2)),
+      unsigned(bytes_of_hex("c0ffee")),
+      sequence([oid(oid::sha256_with_rsa_encryption()), null()]),
+      set_of([string(Utf8String, "b"), string(Utf8String, "a")]),
+      implicit(context(1), octet_string(b"\x01\x02")),
+      implicit(context(2), string(Ia5String, "asn1.example")),
+      implicit(
+        context(3),
+        sequence([
+          sequence([oid(oid::key_usage()), boolean(true), octet_string(named_bits([0, 5]))]),
+          sequence([oid(oid::subject_key_identifier()), octet_string(b"\x04\x01\x09")]),
+        ]),
+      ),
+      boolean(true),
+    ])
+  };
+  let read = match full { Ok(der) -> decode_with(der, 4, card), Err(_) -> panic("it writes") };
+  assert_eq(
+    read,
+    Ok({
+      version: 2,
+      serial: bytes_of_hex("c0ffee"),
+      algorithm: match algorithm { Ok(der) -> der, Err(_) -> b"" },
+      names: ["a", "b"],
+      key_id: Some(b"\x01\x02"),
+      host: Some("asn1.example"),
+      entries: [
+        { id: oid"2.5.29.15", critical: true, value: bytes_of_hex("03020284") },
+        { id: oid"2.5.29.14", critical: false, value: b"\x04\x01\x09" },
+      ],
+      rest: Boolean(true),
+    }),
+  );
+  assert_eq(
+    decode_with(sequence([int(7), sequence([]), set_of([]), null()]), 4, card),
+    Ok({
+      version: 0,
+      serial: b"\x07",
+      algorithm: bytes_of_hex("3000"),
+      names: [],
+      key_id: None,
+      host: None,
+      entries: [],
+      rest: Null,
+    }),
+  );
+  let nested = |depth: Int|
+    decode_with(bytes_of_hex("30023000"), depth, |r: Reader|
+      read_sequence_of(r, |x: Reader| read_sequence_of(x, read_null)));
+  assert_eq(nested(0), Err({ at: 0, why: TooDeep }));
+  assert_eq(nested(1), Err({ at: 2, why: TooDeep }));
+  assert_eq(nested(2), Ok([[]]));
+  let reading = reader(bytes_of_hex("0500"), 0);
+  assert_eq(peek(reading), Some(universal(5)));
+  assert(!is_empty(reading) && is_empty(read_null(reading).rest));
+  assert_eq(peek(read_null(reading).rest), None);
+  assert_eq(decode_with(b"\x14\x02hi", 0, |r: Reader| read_primitive(r, universal(20))), Ok(b"hi"))
+}
+
+test "a tree is written only as it would have been read, and nests as deep as it is given" {
+  assert_eq(encode(Integer(b"")), Err(EmptyInteger));
+  assert_eq(encode(Integer(b"\x00\x01")), Err(LongInteger));
+  assert_eq(encode(Enumerated(b"\xff\xff")), Err(LongInteger));
+  assert_eq(encode(Set([Integer(b"\x02"), Integer(b"\x01")])), Err(Unsorted));
+  assert_eq(encode(Primitive(universal(2), b"\x01")), Err(BadTag));
+  let unchecked = [7, 9, 13, 14, 15, 20, 21, 25, 27];
+  assert_eq(
+    filter(range(0, 31), |n: Int| encode(Primitive(universal(n), b"")) != Err(BadTag)),
+    unchecked,
+  );
+  assert_eq(
+    filter(range(1, 31), |n: Int|
+      decode(bytes_concat(byte_of_int(n), b"\x00"), 0) == Ok(Primitive(universal(n), b""))),
+    unchecked,
+  );
+  assert_eq(filter(range(0, 31), |n: Int| encode(Constructed(universal(n), [])) != Err(BadTag)), [
+    8,
+    11,
+    29,
+  ]);
+  assert_eq(
+    filter(range(1, 31), |n: Int|
+      decode(bytes_concat(byte_of_int(n | 0x20), b"\x00"), 1) == Ok(Constructed(universal(n), []))),
+    [8, 11, 29],
+  );
+  assert_eq(encode(Primitive(universal(36), b"")), Ok(bytes_of_hex("1f2400")));
+  assert_eq(encode(Primitive(context(0 - 1), b"")), Err(BadTag));
+  assert_eq(encode(ObjectId(oid::Oid([3, 1]))), Err(BadOid));
+  assert_eq(encode(Text(NumericString, "x")), Err(BadText(NumericString)));
+  assert_eq(encode(Sequence([Null, BitString({ unused: 3, bytes: b"" })])), Err(BadBits));
+  let nested = |levels: Int| fold(range(0, levels), Null, |held: Value, _: Int| Sequence([held]));
+  let der = match encode(nested(64)) { Ok(written) -> written, Err(_) -> panic("it writes") };
+  assert_eq(height(nested(64)), 64);
+  assert_eq(decode(der, 64), Ok(nested(64)));
+  assert_eq(decode(der, 63), Err({ at: 127, why: TooDeep }));
+  assert_eq(try { read(der, 63) }, Err({ at: 127, why: TooDeep }));
+  assert_eq(decode(bytes_of_hex("0500"), 0), Ok(Null));
+  assert_eq(decode(bytes_of_hex("3000"), 0), Err({ at: 0, why: TooDeep }));
+  assert_eq(int_of_integer(b"\xff\x7f"), Some(0 - 129));
+  assert_eq(big_int_of_integer(b"\xff\x7f"), bigint::of_int(0 - 129));
+  assert_eq(big_int_of_integer(b""), bigint::zero())
+}
