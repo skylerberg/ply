@@ -173,6 +173,9 @@ pub type Type =
   | TyFn({ params: List<Type>, ret: Type, effects: Row })
   // Sorted by field name.
   | TyRecord(List<Field>)
+  // A record a `type T = new { .. }` declares: `name` and `args` are all that tell two apart, and
+  // `fields` is what they stand for, sorted by field name and written over `args`.
+  | TyNominal({ name: Bytes, args: List<Type>, fields: List<Field> })
 
 pub type Scheme = { ty_vars: List<Int>, row_vars: List<Int>, label_vars: List<Int>, ty: Type }
 
@@ -212,6 +215,10 @@ pub fn field_get(fields: List<Field>, name: Bytes) -> Option<Type> =
   fold(fields, None, |acc: Option<Type>, field: Field|
     match acc { Some(_) -> acc, None -> if field.name == name { Some(field.ty) } else { None } })
 
+// The fields a value of this type is read by, whether or not the type is declared.
+pub fn record_fields(ty: Type) -> Option<List<Field>> =
+  match ty { TyRecord(fs) -> Some(fs), TyNominal(n) -> Some(n.fields), _ -> None }
+
 pub fn mentions_secret(t: Type) -> Bool =
   match t {
     TyCon(c) ->
@@ -220,6 +227,7 @@ pub fn mentions_secret(t: Type) -> Bool =
       fold(f.params, false, |acc: Bool, p: Type| acc || mentions_secret(p))
         || mentions_secret(f.ret),
     TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
+    TyNominal(n) -> fold(n.fields, false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
     TyVar(_) -> false,
   }
 
@@ -327,6 +335,14 @@ fn resolved_ty(subst: Subst, t: Type, room: Int) -> Type / {abort.raise} =
       }),
     TyRecord(fs) ->
       TyRecord(map(fs, |f: Field| { name: f.name, ty: resolved_ty(subst, f.ty, room) })),
+    // Its fields hold no variable its arguments do not.
+    TyNominal(n) -> if len(n.args) == 0 { t } else {
+      TyNominal({
+        name: n.name,
+        args: map(n.args, |a: Type| resolved_ty(subst, a, room)),
+        fields: map(n.fields, |f: Field| { name: f.name, ty: resolved_ty(subst, f.ty, room) }),
+      })
+    },
   }
 
 pub fn resolved_tail(subst: Subst, row: Row) -> Option<Int> / {abort.raise} = {
@@ -414,6 +430,7 @@ pub fn occurs_ty(v: Int, t: Type) -> Bool =
     TyFn(f) ->
       fold(f.params, false, |acc: Bool, p: Type| acc || occurs_ty(v, p)) || occurs_ty(v, f.ret),
     TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || occurs_ty(v, f.ty)),
+    TyNominal(n) -> fold(n.args, false, |acc: Bool, a: Type| acc || occurs_ty(v, a)),
   }
 
 pub type UnifyError =
@@ -495,6 +512,7 @@ fn free_vars_within(subst: Subst, ty: Type, acc: Free, room: Int) -> Free / {abo
     },
     TyRecord(fs) ->
       fold(fs, acc, |a: Free, field: Field| free_vars_within(subst, field.ty, a, room)),
+    TyNominal(n) -> fold(n.args, acc, |a: Free, x: Type| free_vars_within(subst, x, a, room)),
   }
 
 // Immutable containers, which may hold a narrower function than their type says.
@@ -550,6 +568,7 @@ fn type_size(t: Type) -> Int =
     TyCon(c) -> fold(c.args, 1, |n: Int, a: Type| n + type_size(a)),
     TyFn(f) -> fold(f.params, 1 + type_size(f.ret), |n: Int, p: Type| n + type_size(p)),
     TyRecord(fs) -> fold(fs, 1, |n: Int, f: Field| n + type_size(f.ty)),
+    TyNominal(x) -> fold(x.args, 1, |n: Int, a: Type| n + type_size(a)),
   }
 
 fn unify_structural(
@@ -603,6 +622,14 @@ fn unify_structural(
           tries,
         )
       },
+      _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
+    },
+    // By name, as a sum is: the fields follow from the arguments.
+    TyNominal(n1) -> match b {
+      TyNominal(n2) -> if n1.name != n2.name || len(n1.args) != len(n2.args) {
+        unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
+      } else if len(n1.args) == 0 { unified(subst, fresh) }
+      else { unify_all(subst, fresh, n1.args, n2.args, true, room, tries) },
       _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
     },
     TyVar(_) -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
@@ -838,6 +865,13 @@ fn rename(t: Type, tys: Map<Int, Type>, rows: Map<Int, Int>) -> Type / {abort.ra
         },
       }),
     TyRecord(fs) -> TyRecord(map(fs, |x: Field| { name: x.name, ty: rename(x.ty, tys, rows) })),
+    TyNominal(n) -> if len(n.args) == 0 { t } else {
+      TyNominal({
+        name: n.name,
+        args: map(n.args, |a: Type| rename(a, tys, rows)),
+        fields: map(n.fields, |x: Field| { name: x.name, ty: rename(x.ty, tys, rows) }),
+      })
+    },
   }
 
 fn rename_atom(atom: Atom, tys: Map<Int, Type>) -> Atom / {abort.raise} =
@@ -952,6 +986,7 @@ fn name_in(n: Naming, ty: Type) -> Naming =
       match f.effects.tail { Some(v) -> name_row(m, v), None -> m }
     },
     TyRecord(fs) -> fold(fs, n, |m: Naming, field: Field| name_in(m, field.ty)),
+    TyNominal(x) -> fold(x.args, n, name_in),
   }
 
 fn as_types(naming: Naming) -> Map<Int, Type> =
@@ -1076,6 +1111,7 @@ fn reserve_ty(printer: Printer, t: Type) -> Printer =
         f.effects.atoms,
       ),
     TyRecord(fs) -> fold(fs, printer, |acc: Printer, f: Field| reserve_ty(acc, f.ty)),
+    TyNominal(n) -> fold(n.args, printer, |acc: Printer, a: Type| reserve_ty(acc, a)),
   }
 
 pub fn region_prefix() -> Bytes = b"#region:"
@@ -1145,13 +1181,7 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
           { printer: elem.printer, text: bytes_concat_all([b"Cell[", r, b"]<", elem.text, b">"]) },
         None -> { printer: elem.printer, text: bytes_concat_all([b"Cell<", elem.text, b">"]) },
       }
-    } else if len(c.args) == 0 { { printer: printer, text: c.name } } else {
-      let args = print_tys(printer, c.args);
-      {
-        printer: args.printer,
-        text: bytes_concat_all([c.name, b"<", join(args.texts, b", "), b">"]),
-      }
-    },
+    } else { applied(printer, c.name, c.args) },
     TyFn(f) -> {
       let ps = print_tys(printer, f.params);
       let r = printed(ps.printer, f.ret);
@@ -1188,6 +1218,17 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
         { printer: out.printer, text: bytes_concat_all([b"{", join(out.texts, b", "), b"}"]) }
       },
     },
+    TyNominal(n) -> applied(printer, n.name, n.args),
+  }
+
+fn applied(
+  printer: Printer,
+  name: Bytes,
+  args: List<Type>,
+) -> { printer: Printer, text: Bytes } / {abort.raise} =
+  if len(args) == 0 { { printer: printer, text: name } } else {
+    let shown = print_tys(printer, args);
+    { printer: shown.printer, text: bytes_concat_all([name, b"<", join(shown.texts, b", "), b">"]) }
   }
 
 fn print_tys(
