@@ -1,0 +1,1131 @@
+//! Text as a person reads it, and names as a person types them.
+//!
+//! Prose laid out in a width (`wrap`, `fill`, `indent`, `dedent`, `truncate`, `aligned`, `table`),
+//! how far one spelling is from another (`edit_distance`, `typo_distance`, `closest`), a name in
+//! another case style (`snake_case` and its siblings), and words spelled for a POSIX shell
+//! (`shell_quote`, `shell_join`, `shell_split`). Every function is total and performs nothing.
+//!
+//! A width counts columns, and a `Measure` says how many each character prints in. With none a
+//! character is one column, which is right for ASCII and wrong for a wide or a combining
+//! character: a measure that knows those is passed in where the text may hold them, so no layout
+//! is written a second time for it. An escape sequence is measured as the characters it is.
+//!
+//! The case styles read ASCII, as `std.string`'s fold does: a letter is `A-Z` or `a-z`, and a
+//! character outside ASCII belongs to the word it stands in and is never changed.
+//!
+//! `std.sh` writes an argument list in source, and no shell ever reads it. The shell functions
+//! here go the other way: `shell_quote` and `shell_join` spell arguments for a person to paste
+//! into a shell or a log to show, and `shell_split` reads such a line as the arguments it names.
+//! Nothing here starts a shell: a program is started with a list (`std.process`).
+
+import std.laws (agrees, idempotent)
+import std.list (all, at_or, contains, drop, prepend, take, take_while)
+import std.show (show)
+import std.string (join, repeat)
+
+// --- Columns ----------------------------------------------------------------
+
+/// The columns a character prints in; `None`, which is what a `measure` left out is, counts one
+/// for every character.
+///
+/// A function answers zero for a character that joins the one before it and two for a wide one.
+/// An answer below zero counts as zero.
+pub type Measure = Option<(Char) -> Int>
+
+/// Which side of its width a text stands on.
+pub type Align =
+  /// At the start, blanks after it.
+  | Left
+  /// At the end, blanks before it: how a column of numbers lines up.
+  | Right
+  /// In the middle, the odd blank after it.
+  | Center
+
+fn columns(measure: Measure, c: Char) -> Int =
+  match measure { None -> 1, Some(wide) -> max(wide(c), 0) }
+
+fn measured(text: String, measure: Measure) -> Int =
+  match measure {
+    None -> string_len(text),
+    Some(_) -> fold(string_chars(text), 0, |sum: Int, c: Char| sum + columns(measure, c)),
+  }
+
+/// The columns `text` prints in.
+pub fn width(text: String, measure: Measure = None) -> Int = measured(text, measure)
+
+// --- Wrapping ---------------------------------------------------------------
+
+type Wrapping = { lines: List<String>, line: String, used: Int, bare: Bool }
+
+/// The words of `text` in lines of at most `width` columns, each line taking the words that fit
+/// it, one space apart. The first line starts with `first` and every later one with `rest`, whose
+/// columns count, so a hanging indent is a `rest` of blanks; each is empty where it is left out.
+///
+/// The text is one paragraph: a word is a run between spaces, tabs and line breaks, and a text
+/// with no word has no line. A word wider than a line stands whole on a line of its own, over
+/// the width, unless `break_words`, false where it is left out, cuts it at the width; a line
+/// holds one character at least, so a width nothing fits in still ends.
+pub fn wrap(
+  text: String,
+  width: Int,
+  first: String = "",
+  rest: String = "",
+  break_words: Bool = false,
+  measure: Measure = None,
+) -> List<String> = {
+  let laid = fold(
+    spaced(text),
+    { lines: [], line: first, used: measured(first, measure), bare: true },
+    |s: Wrapping, word: String| placed(s, word, width, rest, break_words, measure),
+  );
+  if laid.bare { laid.lines } else { push(laid.lines, laid.line) }
+}
+
+/// `wrap`'s lines as one text, a line feed between them and none after the last. The options are
+/// `wrap`'s.
+pub fn fill(
+  text: String,
+  width: Int,
+  first: String = "",
+  rest: String = "",
+  break_words: Bool = false,
+  measure: Measure = None,
+) -> String = join(wrap(text, width, first, rest, break_words, measure), "\n")
+
+fn placed(
+  s: Wrapping,
+  word: String,
+  width: Int,
+  rest: String,
+  break_words: Bool,
+  measure: Measure,
+) -> Wrapping = {
+  let wide = measured(word, measure);
+  if !s.bare && s.used + 1 + wide <= width {
+    { ..s, line: s.line ++ " " ++ word, used: s.used + 1 + wide }
+  } else {
+    let fresh = if s.bare { s } else { turned(s, rest, measure) };
+    if break_words && fresh.used + wide > width {
+      fold(string_chars(word), fresh, |acc: Wrapping, c: Char| {
+        let one = columns(measure, c);
+        let at = if !acc.bare && acc.used + one > width { turned(acc, rest, measure) } else { acc };
+        { ..at, line: at.line ++ string_of_chars([c]), used: at.used + one, bare: false }
+      })
+    } else { { ..fresh, line: fresh.line ++ word, used: fresh.used + wide, bare: false } }
+  }
+}
+
+/// The line ended, and the next one begun with `rest`.
+fn turned(s: Wrapping, rest: String, measure: Measure) -> Wrapping =
+  { lines: push(s.lines, s.line), line: rest, used: measured(rest, measure), bare: true }
+
+/// The runs of `text` between spaces, tabs and line breaks, in order; never an empty one.
+fn spaced(text: String) -> List<String> = {
+  let read = fold(
+    string_chars(text),
+    { done: [], word: [] },
+    |s: { done: List<String>, word: List<Char> }, c: Char|
+      if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+        { done: ended(s.done, s.word), word: [] }
+      } else { { done: s.done, word: push(s.word, c) } },
+  );
+  ended(read.done, read.word)
+}
+
+fn ended(done: List<String>, word: List<Char>) -> List<String> =
+  if len(word) == 0 { done } else { push(done, string_of_chars(word)) }
+
+// --- Indents ----------------------------------------------------------------
+
+/// `text` with `prefix` before each of its lines. A line of nothing but spaces and tabs is left
+/// as it is, so no line gains blanks at its end.
+pub fn indent(text: String, prefix: String) -> String =
+  join(
+    map(lines_of(text), |line: List<Char>|
+      if hollow(line) { string_of_chars(line) } else { prefix ++ string_of_chars(line) }),
+    "\n",
+  )
+
+/// `text` without the spaces and tabs every line of it starts with, compared character by
+/// character, so a tab is not eight spaces. A line of nothing but spaces and tabs has no say in
+/// what is shared, and loses all of them.
+pub fn dedent(text: String) -> String = {
+  let lines = lines_of(text);
+  let shared = fold(lines, None, |seen: Option<List<Char>>, line: List<Char>|
+    if hollow(line) { seen } else {
+      let own = take(line, margin(line));
+      match seen { None -> Some(own), Some(so_far) -> Some(alike(so_far, own)) }
+    });
+  let cut = match shared { None -> 0, Some(m) -> len(m) };
+  join(
+    map(lines, |line: List<Char>|
+      string_of_chars(drop(line, if hollow(line) { margin(line) } else { cut }))),
+    "\n",
+  )
+}
+
+/// The pieces of `text` between line feeds, an empty one included, so joining them with a line
+/// feed is the text.
+fn lines_of(text: String) -> List<List<Char>> = {
+  let read = fold(
+    string_chars(text),
+    { done: [], line: [] },
+    |s: { done: List<List<Char>>, line: List<Char> }, c: Char|
+      if c == '\n' { { done: push(s.done, s.line), line: [] } }
+      else { { done: s.done, line: push(s.line, c) } },
+  );
+  push(read.done, read.line)
+}
+
+/// How many spaces and tabs a line starts with.
+fn margin(line: List<Char>) -> Int = len(take_while(line, |c: Char| c == ' ' || c == '\t'))
+
+/// Whether a line holds nothing past its margin but the carriage return of a CRLF ending.
+fn hollow(line: List<Char>) -> Bool = {
+  let body = drop(line, margin(line));
+  body == [] || body == ['\r']
+}
+
+/// What two margins start with alike.
+fn alike(a: List<Char>, b: List<Char>) -> List<Char> =
+  take(
+    a,
+    fold(
+      range(0, min(len(a), len(b))),
+      { n: 0, same: true },
+      |s: { n: Int, same: Bool }, i: Int|
+        if s.same && list_at(a, i) == list_at(b, i) { { n: s.n + 1, same: true } }
+        else { { n: s.n, same: false } },
+    ).n,
+  )
+
+// --- Cutting and padding ----------------------------------------------------
+
+/// `text` in at most `width` columns: itself where it fits, and otherwise its longest start that
+/// leaves room for `ellipsis`, then the ellipsis, which is `…` where none is given. An ellipsis
+/// wider than the width is left out, and a width below one is the empty text.
+pub fn truncate(
+  text: String,
+  width: Int,
+  ellipsis: String = "\u{2026}",
+  measure: Measure = None,
+) -> String =
+  if measured(text, measure) <= width { text } else {
+    let room = width - measured(ellipsis, measure);
+    if room < 0 { leading(text, width, measure) } else { leading(text, room, measure) ++ ellipsis }
+  }
+
+/// The longest start of `text` that prints in `room` columns.
+fn leading(text: String, room: Int, measure: Measure) -> String =
+  string_of_chars(
+    fold(
+      string_chars(text),
+      { kept: [], used: 0, open: true },
+      |s: { kept: List<Char>, used: Int, open: Bool }, c: Char| {
+        let one = columns(measure, c);
+        if s.open && s.used + one <= room {
+          { kept: push(s.kept, c), used: s.used + one, open: true }
+        } else { { kept: s.kept, used: s.used, open: false } }
+      },
+    ).kept,
+  )
+
+/// `text` in `width` columns, spaces making up what it lacks on the side `side` leaves free,
+/// which is after it where no side is given. A text already that wide is itself.
+pub fn aligned(text: String, width: Int, side: Align = Left, measure: Measure = None) -> String = {
+  let missing = width - measured(text, measure);
+  if missing <= 0 { text } else {
+    match side {
+      Left -> text ++ repeat(" ", missing),
+      Right -> repeat(" ", missing) ++ text,
+      Center -> repeat(" ", missing / 2) ++ text ++ repeat(" ", missing - missing / 2),
+    }
+  }
+}
+
+/// `rows` as lines whose cells stand in columns: each column as wide as its widest cell, `gap`
+/// between two, which is two spaces where none is given, and a cell on the side `sides` names
+/// for its column, `Left` where it names none. A row short of cells has empty ones, and no line
+/// ends in a space.
+pub fn table(
+  rows: List<List<String>>,
+  sides: List<Align> = [],
+  gap: String = "  ",
+  measure: Measure = None,
+) -> List<String> = {
+  let count = fold(rows, 0, |most: Int, row: List<String>| max(most, len(row)));
+  let widths = map(range(0, count), |i: Int|
+    fold(rows, 0, |most: Int, row: List<String>| max(most, measured(at_or(row, i, ""), measure))));
+  map(rows, |row: List<String>|
+    without_trailing_spaces(
+      join(
+        map(range(0, count), |i: Int|
+          aligned(at_or(row, i, ""), at_or(widths, i, 0), at_or(sides, i, Left), measure)),
+        gap,
+      ),
+    ))
+}
+
+fn without_trailing_spaces(line: String) -> String = {
+  let cs = string_chars(line);
+  let kept = fold(cs, { at: 0, keep: 0 }, |s: { at: Int, keep: Int }, c: Char|
+    { at: s.at + 1, keep: if c == ' ' { s.keep } else { s.at + 1 } }).keep;
+  if kept == len(cs) { line } else { string_of_chars(take(cs, kept)) }
+}
+
+// --- Distance ---------------------------------------------------------------
+
+/// One row of the table of distances, held only where it can still be within the limit: the
+/// cells from column `from` on.
+type Band = { from: Int, cells: List<Int> }
+
+type Rows = { before: Band, above: Band, live: Bool }
+
+/// How many characters must be inserted, deleted or replaced to turn `a` into `b`: Levenshtein's
+/// distance, over characters. It is a metric: zero exactly between equal texts, the same both
+/// ways, and never more by way of a third text than directly.
+pub fn edit_distance(a: String, b: String) -> Int
+  cost (string_len(a) + 1) * (string_len(b) + 1)
+= whole(string_chars(a), string_chars(b), false)
+
+/// `edit_distance`, where it is at most `limit`, and `None` where it is more. The search keeps
+/// to the cells that can still be within the limit and stops at the first row none of them is.
+pub fn edit_distance_within(a: String, b: String, limit: Int) -> Option<Int>
+  cost (limit + 1) * (string_len(a) + 1)
+= banded(string_chars(a), string_chars(b), limit, false)
+
+/// `edit_distance` with one more edit: two neighbouring characters swapped, the commonest slip
+/// of a hand, so `"form"` is one from `"from"` and not two. No character is edited twice (the
+/// optimal string alignment distance), which makes it no metric: by way of a third text it can
+/// be less than directly. It is never more than `edit_distance`.
+pub fn typo_distance(a: String, b: String) -> Int
+  cost (string_len(a) + 1) * (string_len(b) + 1)
+= whole(string_chars(a), string_chars(b), true)
+
+/// `typo_distance`, where it is at most `limit`, and `None` where it is more, searched as
+/// `edit_distance_within` searches.
+pub fn typo_distance_within(a: String, b: String, limit: Int) -> Option<Int>
+  cost (limit + 1) * (string_len(a) + 1)
+= banded(string_chars(a), string_chars(b), limit, true)
+
+/// The candidate nearest `word` by `typo_distance`, among those within `limit` of it, and the
+/// earliest of them where several are as near; `None` where none is within the limit. A
+/// candidate that is the word itself is at distance zero and is answered.
+pub fn closest(word: String, candidates: List<String>, limit: Int) -> Option<String> = {
+  let letters = string_chars(word);
+  fold(
+    candidates,
+    { best: None, within: limit },
+    |s: { best: Option<String>, within: Int }, candidate: String|
+      match banded(letters, string_chars(candidate), s.within, true) {
+        Some(d) -> { best: Some(candidate), within: d - 1 },
+        None -> s,
+      },
+  ).best
+}
+
+fn whole(a: List<Char>, b: List<Char>, swaps: Bool) -> Int = {
+  let most = max(len(a), len(b));
+  match banded(a, b, most, swaps) { Some(d) -> d, None -> most }
+}
+
+/// The distance from `a` to `b` where it is at most `limit`, a swap of neighbours counting as
+/// one edit where `swaps` says so. Row `i` holds the distances from the first `i` characters of
+/// `a`, in the columns within the limit of `i`; a cell outside a row counts as over the limit.
+fn banded(a: List<Char>, b: List<Char>, limit: Int, swaps: Bool) -> Option<Int> = {
+  let n = len(a);
+  let m = len(b);
+  let bound = min(limit, max(n, m));
+  if bound < 0 || n - m > bound || m - n > bound { None } else {
+    let top = { from: 0, cells: range(0, min(m, bound) + 1) };
+    let last = fold(range(1, n + 1), { before: top, above: top, live: true }, |s: Rows, i: Int|
+      if !s.live { s } else {
+        let row = row_below(a, b, bound, swaps, i, s.before, s.above);
+        { before: s.above, above: row, live: least(row.cells, bound + 1) <= bound }
+      });
+    let d = held(last.above, m, bound + 1);
+    if last.live && d <= bound { Some(d) } else { None }
+  }
+}
+
+fn row_below(
+  a: List<Char>,
+  b: List<Char>,
+  bound: Int,
+  swaps: Bool,
+  i: Int,
+  before: Band,
+  above: Band,
+) -> Band = {
+  let over = bound + 1;
+  let from = max(0, i - bound);
+  let x = at_or(a, i - 1, ' ');
+  {
+    from: from,
+    cells: fold(
+      range(from, min(len(b), i + bound) + 1),
+      { cells: [], left: over },
+      |s: { cells: List<Int>, left: Int }, j: Int| {
+        let cell = if j == 0 { i } else {
+          let y = at_or(b, j - 1, ' ');
+          let edited = min(
+            min(held(above, j, over), s.left) + 1,
+            held(above, j - 1, over) + (if x == y { 0 } else { 1 }),
+          );
+          if swaps && i > 1 && j > 1 && x == at_or(b, j - 2, ' ') && y == at_or(a, i - 2, ' ') {
+            min(edited, held(before, j - 2, over) + 1)
+          } else { edited }
+        };
+        { cells: push(s.cells, min(cell, over)), left: min(cell, over) }
+      },
+    ).cells,
+  }
+}
+
+fn held(row: Band, j: Int, spare: Int) -> Int =
+  match list_at(row.cells, j - row.from) { Some(cell) -> cell, None -> spare }
+
+fn least(cells: List<Int>, spare: Int) -> Int = fold(cells, spare, |low: Int, v: Int| min(low, v))
+
+// --- Case styles ------------------------------------------------------------
+
+/// The words a name is made of, in order and spelled as they are. A word ends at a character of
+/// ASCII that is neither a letter nor a digit, which belongs to no word, and before an
+/// upper-case letter that follows a lower-case letter, a digit or a character outside ASCII, or
+/// that is the last of an upper-case run a lower-case letter follows: `HTTPRequest2Line_id` is
+/// `HTTP`, `Request2`, `Line` and `id`.
+pub fn name_words(name: String) -> List<String> = {
+  let cs = string_chars(name);
+  let read = fold(
+    range(0, len(cs)),
+    { done: [], word: [] },
+    |s: { done: List<String>, word: List<Char> }, i: Int| {
+      let c = at_or(cs, i, ' ');
+      if parts(c) { { done: ended(s.done, s.word), word: [] } }
+      else if len(s.word) > 0 && begins(at_or(cs, i - 1, ' '), c, at_or(cs, i + 1, ' ')) {
+        { done: ended(s.done, s.word), word: [c] }
+      } else { { done: s.done, word: push(s.word, c) } }
+    },
+  );
+  ended(read.done, read.word)
+}
+
+/// `name`'s words in lower case with `_` between them: `HTTPRequest` is `http_request`. This is
+/// the name `derive` gives a type's functions.
+pub fn snake_case(name: String) -> String = join(map(name_words(name), small), "_")
+
+/// `name`'s words in lower case with `-` between them: `HTTPRequest` is `http-request`.
+pub fn kebab_case(name: String) -> String = join(map(name_words(name), small), "-")
+
+/// `name`'s words run together, each after the first with a capital: `http_request` is
+/// `httpRequest`. Two words of one letter run into one, so only a name without them reads back.
+pub fn camel_case(name: String) -> String =
+  match name_words(name) { [] -> "", [head, ..tail] -> small(head) ++ join(map(tail, capital), "") }
+
+/// `name`'s words run together, each with a capital: `http_request` is `HttpRequest`, the style
+/// of a type's name. Two words of one letter run into one, as in `camel_case`.
+pub fn pascal_case(name: String) -> String = join(map(name_words(name), capital), "")
+
+/// `name`'s words, each with a capital, a space between them: `http_request` is `Http Request`.
+pub fn title_case(name: String) -> String = join(map(name_words(name), capital), " ")
+
+fn upper(c: Char) -> Bool = c >= 'A' && c <= 'Z'
+
+fn lower(c: Char) -> Bool = c >= 'a' && c <= 'z'
+
+fn digit(c: Char) -> Bool = c >= '0' && c <= '9'
+
+/// Whether a character stands between words and in none.
+fn parts(c: Char) -> Bool = int_of_char(c) < 128 && !upper(c) && !lower(c) && !digit(c)
+
+/// Whether `c`, after `before` in a word and with `after` behind it, begins a word of its own.
+fn begins(before: Char, c: Char, after: Char) -> Bool =
+  upper(c)
+    && (lower(before) || digit(before) || int_of_char(before) >= 128
+    || (upper(before) && lower(after)))
+
+fn moved(c: Char, by: Int) -> Char =
+  match char_of_int(int_of_char(c) + by) { Some(other) -> other, None -> c }
+
+fn lowered(c: Char) -> Char = if upper(c) { moved(c, 32) } else { c }
+
+fn raised(c: Char) -> Char = if lower(c) { moved(c, 0 - 32) } else { c }
+
+fn small(word: String) -> String = string_of_chars(map(string_chars(word), lowered))
+
+fn capital(word: String) -> String =
+  match string_chars(word) {
+    [] -> "",
+    [head, ..tail] -> string_of_chars(prepend(raised(head), map(tail, lowered))),
+  }
+
+// --- Shell words ------------------------------------------------------------
+
+/// `word` spelled so a POSIX shell reads it as that one word and nothing else: as it is where
+/// every character is a letter, a digit or one of `_@%+:,./-`, and otherwise between single
+/// quotes, a single quote inside it as `'\''`, so the empty word is `''`. What a shell would
+/// take for its own grammar in a command's place is quoted too: a word such as `if` or `time`,
+/// and an `=` in any word that does not start with `-`, which could be an assignment. `None` for
+/// a word holding the zero character, which no shell word can carry.
+///
+/// This is for showing a command and for a shell someone else runs. To start a program, hand
+/// `std.process` the list; to write a list in source, `std.sh`.
+pub fn shell_quote(word: String) -> Option<String> = {
+  let cs = string_chars(word);
+  if contains(cs, '\0') { None }
+  else if len(cs) > 0 && !reserved(word)
+      && all(cs, |c: Char| plain(c) || (c == '=' && list_at(cs, 0) == Some('-'))) { Some(word) }
+  else {
+    Some(
+      "'" ++ join(map(cs, |c: Char| if c == '\'' { "'\\''" } else { string_of_chars([c]) }), "")
+        ++ "'",
+    )
+  }
+}
+
+/// `args` as one line a POSIX shell reads back as those words: each as `shell_quote` spells it,
+/// a space between them. `None` where a word holds the zero character.
+pub fn shell_join(args: List<String>) -> Option<String> = {
+  let quoted = fold(args, Some([]), |done: Option<List<String>>, arg: String|
+    match done {
+      None -> None,
+      Some(words) -> match shell_quote(arg) { Some(q) -> Some(push(words, q)), None -> None },
+    });
+  match quoted { Some(words) -> Some(join(words, " ")), None -> None }
+}
+
+/// The words a POSIX shell would hand a program for `line`, where splitting and unquoting is all
+/// it would do: words apart by spaces and tabs, single quotes, double quotes, and a backslash
+/// taking the character after it (Shell Command Language, 2.2).
+///
+/// `None` for a quote or a backslash left open, and for anything a shell would do more with: an
+/// unquoted character that is no letter, digit or one of `_@%+:,./-=`, so an operator, an
+/// expansion, a pattern, a comment or a line break; a `$` or a backquote between double quotes;
+/// a first word that is an assignment (`NAME=value`) or one of the shell's own (`if`, `time`);
+/// white space outside ASCII, which a shell splits at or not by its locale; and the zero
+/// character. Nothing is expanded, so what is answered is what was written.
+pub fn shell_split(line: String) -> Option<List<String>> = {
+  let read = fold(
+    string_chars(line),
+    { done: [], word: [], open: false, quoting: Bare, escaped: false, name: false, refused: false },
+    |r: Reading, c: Char| if r.refused { r } else { stepped(r, c) },
+  );
+  if read.escaped || read.quoting != Bare || closed(read).refused { None }
+  else { Some(closed(read).done) }
+}
+
+type Quoting = | Bare | Single | Double
+
+/// `open` says a word has begun, which an empty pair of quotes does; `name` that the word so far
+/// is the bare start of a variable's name, so an `=` next would assign and the word may be one
+/// of the shell's own.
+type Reading = {
+  done: List<String>,
+  word: List<Char>,
+  open: Bool,
+  quoting: Quoting,
+  escaped: Bool,
+  name: Bool,
+  refused: Bool,
+}
+
+fn plain(c: Char) -> Bool =
+  upper(c) || lower(c) || digit(c) || c == '_' || c == '@' || c == '%' || c == '+' || c == ':'
+    || c == ','
+    || c == '.'
+    || c == '/'
+    || c == '-'
+
+/// The words a shell reads as its own grammar where a command's name stands: POSIX's, and those
+/// bash and zsh add.
+fn reserved(word: String) -> Bool =
+  contains(
+    [
+      "case",
+      "coproc",
+      "do",
+      "done",
+      "elif",
+      "else",
+      "esac",
+      "fi",
+      "for",
+      "function",
+      "if",
+      "in",
+      "select",
+      "then",
+      "time",
+      "until",
+      "while",
+    ],
+    word,
+  )
+
+/// The word in hand ended, if there is one: refused where it is a line's first and the shell's
+/// own.
+fn closed(r: Reading) -> Reading =
+  if !r.open { r }
+  else if r.name && len(r.done) == 0 && reserved(string_of_chars(r.word)) { { ..r, refused: true } }
+  else { { ..r, done: push(r.done, string_of_chars(r.word)), word: [], open: false, name: false } }
+
+fn stepped(r: Reading, c: Char) -> Reading =
+  if c == '\0' { { ..r, refused: true } } else {
+    match r.quoting {
+      Single -> if c == '\'' { { ..r, quoting: Bare } } else { taken(r, c) },
+      Double -> double_quoted(r, c),
+      Bare -> unquoted(r, c),
+    }
+  }
+
+/// `c` as a character of the word, which is then no bare name.
+fn taken(r: Reading, c: Char) -> Reading =
+  { ..r, word: push(r.word, c), open: true, escaped: false, name: false }
+
+fn double_quoted(r: Reading, c: Char) -> Reading =
+  if r.escaped {
+    if c == '\n' { { ..r, escaped: false } }
+    else if c == '$' || c == '`' || c == '"' || c == '\\' { taken(r, c) }
+    else { taken(taken(r, '\\'), c) }
+  } else if c == '"' { { ..r, quoting: Bare } }
+  else if c == '\\' { { ..r, escaped: true } }
+  else if c == '$' || c == '`' { { ..r, refused: true } }
+  else { taken(r, c) }
+
+fn unquoted(r: Reading, c: Char) -> Reading =
+  if r.escaped { if c == '\n' { { ..r, escaped: false } } else { taken(r, c) } }
+  else if c == '\\' { { ..r, escaped: true } }
+  else if c == '\'' { { ..r, quoting: Single, open: true, name: false } }
+  else if c == '"' { { ..r, quoting: Double, open: true, name: false } }
+  else if c == ' ' || c == '\t' { closed(r) }
+  else if c == '=' { if r.name && len(r.done) == 0 { { ..r, refused: true } } else { taken(r, c) } }
+  else if plain(c) {
+    let named = upper(c) || lower(c) || c == '_' || (r.open && digit(c));
+    { ..r, word: push(r.word, c), open: true, name: named && (r.name || !r.open) }
+  } else if int_of_char(c) >= 128 && string_trim(string_of_chars([c])) != "" { taken(r, c) }
+  else { { ..r, refused: true } }
+
+// --- Tests ------------------------------------------------------------------
+
+/// `n` brought into `0..top`, whatever its sign.
+fn within(n: Int, top: Int) -> Int / {abort.raise} = (n % top + top) % top
+
+/// The text `codes` spell in `alphabet`, each code picking one of its characters.
+fn spelled(codes: List<Int>, alphabet: String) -> String / {abort.raise} = {
+  let letters = string_chars(alphabet);
+  string_of_chars(map(codes, |code: Int| at_or(letters, within(code, len(letters)), ' ')))
+}
+
+fn prose(codes: List<Int>) -> String / {abort.raise} = spelled(codes, "ab cd ef\n")
+
+/// Two columns for a CJK ideograph, none for a combining acute accent, one for anything else.
+fn east() -> Measure =
+  Some(|c: Char| if int_of_char(c) >= 0x4E00 { 2 } else if c == '\u{301}' { 0 } else { 1 })
+
+test "each line takes the words that fit it, one space apart" {
+  assert_eq(wrap("the quick brown fox jumps", 10), ["the quick", "brown fox", "jumps"]);
+  assert_eq(wrap("  the\tquick \n brown  ", 80), ["the quick brown"]);
+  assert_eq(wrap("a bb ccc", 0), ["a", "bb", "ccc"]);
+  assert_eq(wrap("", 10), []);
+  assert_eq(wrap(" \n\t", 10), []);
+  assert_eq(fill("the quick brown fox", 10), "the quick\nbrown fox");
+  assert_eq(fill("", 10), "")
+}
+
+test "a hanging indent starts every line after the first, and its columns count" {
+  assert_eq(wrap("one two three four five", 12, first: "* ", rest: "  "), [
+    "* one two",
+    "  three four",
+    "  five",
+  ]);
+  assert_eq(wrap("", 12, first: "* "), [])
+}
+
+test "a word wider than a line stands whole unless it is to be broken" {
+  assert_eq(wrap("a abcdefghij b", 4), ["a", "abcdefghij", "b"]);
+  assert_eq(wrap("a abcdefghij b", 4, break_words: true), ["a", "abcd", "efgh", "ij b"]);
+  assert_eq(wrap("abc", 0, break_words: true), ["a", "b", "c"]);
+  assert_eq(wrap("abcdef", 4, rest: "> ", break_words: true), ["abcd", "> ef"])
+}
+
+test "a measure counts a wide character twice and a combining one not at all" {
+  assert_eq(width("a\u{4E16}\u{754C}"), 3);
+  assert_eq(width("a\u{4E16}\u{754C}", measure: east()), 5);
+  assert_eq(width("e\u{301}", measure: east()), 1);
+  assert_eq(wrap("\u{4E16}\u{754C} \u{4E16}\u{754C} ab", 5, measure: east()), [
+    "\u{4E16}\u{754C}",
+    "\u{4E16}\u{754C}",
+    "ab",
+  ]);
+  assert_eq(
+    truncate("\u{4E16}\u{754C}\u{4E16}\u{754C}", 5, measure: east()),
+    "\u{4E16}\u{754C}\u{2026}",
+  );
+  assert_eq(aligned("\u{4E16}", 4, side: Right, measure: east()), "  \u{4E16}")
+}
+
+test "indent prefixes the lines that hold something" {
+  assert_eq(indent("a\n\n  b\n", "> "), "> a\n\n>   b\n");
+  assert_eq(indent("a\n \t\nb", "  "), "  a\n \t\n  b");
+  assert_eq(indent("a\r\n\r\nb", "  "), "  a\r\n\r\n  b");
+  assert_eq(indent("", "  "), "")
+}
+
+test "dedent takes off what every line starts with, and all of a blank line's blanks" {
+  assert_eq(dedent("  a\n    b\n\n  c"), "a\n  b\n\nc");
+  assert_eq(dedent("  a\n \t \n  b"), "a\n\nb");
+  assert_eq(dedent("\ta\n  b"), "\ta\n  b");
+  assert_eq(dedent("    a\r\n    \r\n    b\r\n"), "a\r\n\r\nb\r\n");
+  assert_eq(dedent("a\n  b"), "a\n  b");
+  assert_eq(dedent("   "), "");
+  assert_eq(dedent(""), "")
+}
+
+test "a text is cut to its width with the ellipsis inside it" {
+  assert_eq(truncate("hello world", 8), "hello w\u{2026}");
+  assert_eq(truncate("hello", 5), "hello");
+  assert_eq(truncate("hello", 4), "hel\u{2026}");
+  assert_eq(truncate("hello", 1), "\u{2026}");
+  assert_eq(truncate("hello", 0), "");
+  assert_eq(truncate("hello", 0 - 3), "");
+  assert_eq(truncate("hello world", 8, ellipsis: "..."), "hello...");
+  assert_eq(truncate("hello", 2, ellipsis: "..."), "he")
+}
+
+test "a text stands on the side of its width it is told to" {
+  assert_eq(aligned("ab", 5), "ab   ");
+  assert_eq(aligned("ab", 5, side: Right), "   ab");
+  assert_eq(aligned("ab", 5, side: Center), " ab  ");
+  assert_eq(aligned("abcdef", 3, side: Right), "abcdef")
+}
+
+test "a table's columns are as wide as their widest cell, and numbers line up on the right" {
+  assert_eq(table([["name", "size"], ["a", "10"], ["bbb", "7"]], sides: [Left, Right]), [
+    "name  size",
+    "a       10",
+    "bbb      7",
+  ]);
+  assert_eq(table([["a", "b"], ["c"], []]), ["a  b", "c", ""]);
+  assert_eq(table([["a", "bb"], ["ccc", "d"]], sides: [Center], gap: " | "), [
+    " a  | bb",
+    "ccc | d",
+  ]);
+  assert_eq(table([]), [])
+}
+
+test "the edit distance counts characters inserted, deleted and replaced" {
+  assert_eq(edit_distance("kitten", "sitting"), 3);
+  assert_eq(edit_distance("flaw", "lawn"), 2);
+  assert_eq(edit_distance("", "abc"), 3);
+  assert_eq(edit_distance("abc", ""), 3);
+  assert_eq(edit_distance("", ""), 0);
+  assert_eq(edit_distance("na\u{ef}ve", "naive"), 1);
+  assert_eq(edit_distance("form", "from"), 2)
+}
+
+test "a swap of neighbours is one slip, and no character is edited twice" {
+  assert_eq(typo_distance("form", "from"), 1);
+  assert_eq(typo_distance("abcd", "badc"), 2);
+  assert_eq(typo_distance("kitten", "sitting"), 3);
+  assert_eq(typo_distance("ca", "ac"), 1);
+  assert_eq(typo_distance("ac", "abc"), 1);
+  assert_eq(typo_distance("ca", "abc"), 3)
+}
+
+test "a bounded search answers the distance within its limit and nothing past it" {
+  assert_eq(edit_distance_within("kitten", "sitting", 3), Some(3));
+  assert_eq(edit_distance_within("kitten", "sitting", 2), None);
+  assert_eq(edit_distance_within("abc", "abc", 0), Some(0));
+  assert_eq(edit_distance_within("abc", "abd", 0), None);
+  assert_eq(edit_distance_within("abc", "abc", 0 - 1), None);
+  assert_eq(edit_distance_within("a", "abcdefgh", 3), None);
+  assert_eq(edit_distance_within("abc", "xyz", 9223372036854775807), Some(3));
+  assert_eq(typo_distance_within("form", "from", 1), Some(1));
+  assert_eq(edit_distance_within("form", "from", 1), None)
+}
+
+test "the closest candidate is the nearest within the limit, the earliest of equals" {
+  assert_eq(closest("verbse", ["verbose", "jobs"], 3), Some("verbose"));
+  assert_eq(closest("tset", ["rest", "test", "best"], 2), Some("test"));
+  assert_eq(closest("cat", ["bat", "hat", "cot"], 1), Some("bat"));
+  assert_eq(closest("xyz", ["abc"], 1), None);
+  assert_eq(closest("run", ["ruin", "run"], 1), Some("run"));
+  assert_eq(closest("run", [], 3), None);
+  assert_eq(closest("run", ["run"], 0 - 1), None)
+}
+
+type Styled = {
+  name: String,
+  words: List<String>,
+  snake: String,
+  kebab: String,
+  camel: String,
+  pascal: String,
+  title: String,
+}
+
+fn styled() -> List<Styled> =
+  [
+    {
+      name: "HTTPRequest",
+      words: ["HTTP", "Request"],
+      snake: "http_request",
+      kebab: "http-request",
+      camel: "httpRequest",
+      pascal: "HttpRequest",
+      title: "Http Request",
+    },
+    {
+      name: "orderLine",
+      words: ["order", "Line"],
+      snake: "order_line",
+      kebab: "order-line",
+      camel: "orderLine",
+      pascal: "OrderLine",
+      title: "Order Line",
+    },
+    {
+      name: "Order2Line",
+      words: ["Order2", "Line"],
+      snake: "order2_line",
+      kebab: "order2-line",
+      camel: "order2Line",
+      pascal: "Order2Line",
+      title: "Order2 Line",
+    },
+    {
+      name: "sha256_hash",
+      words: ["sha256", "hash"],
+      snake: "sha256_hash",
+      kebab: "sha256-hash",
+      camel: "sha256Hash",
+      pascal: "Sha256Hash",
+      title: "Sha256 Hash",
+    },
+    {
+      name: "  hello, world! ",
+      words: ["hello", "world"],
+      snake: "hello_world",
+      kebab: "hello-world",
+      camel: "helloWorld",
+      pascal: "HelloWorld",
+      title: "Hello World",
+    },
+    {
+      name: "__init__",
+      words: ["init"],
+      snake: "init",
+      kebab: "init",
+      camel: "init",
+      pascal: "Init",
+      title: "Init",
+    },
+    {
+      name: "caf\u{e9}Bar",
+      words: ["caf\u{e9}", "Bar"],
+      snake: "caf\u{e9}_bar",
+      kebab: "caf\u{e9}-bar",
+      camel: "caf\u{e9}Bar",
+      pascal: "Caf\u{e9}Bar",
+      title: "Caf\u{e9} Bar",
+    },
+    { name: "A", words: ["A"], snake: "a", kebab: "a", camel: "a", pascal: "A", title: "A" },
+    { name: "", words: [], snake: "", kebab: "", camel: "", pascal: "", title: "" },
+  ]
+
+test "{show(c.name)} in each case style" for c: Styled in styled() {
+  assert_eq(name_words(c.name), c.words);
+  assert_eq(snake_case(c.name), c.snake);
+  assert_eq(kebab_case(c.name), c.kebab);
+  assert_eq(camel_case(c.name), c.camel);
+  assert_eq(pascal_case(c.name), c.pascal);
+  assert_eq(title_case(c.name), c.title)
+}
+
+type Quoted = { word: String, quoted: Option<String> }
+
+fn quotings() -> List<Quoted> =
+  [
+    { word: "", quoted: Some("''") },
+    { word: "abc", quoted: Some("abc") },
+    { word: "src/main.ply:12", quoted: Some("src/main.ply:12") },
+    { word: "a b", quoted: Some("'a b'") },
+    { word: "it's", quoted: Some("'it'\\''s'") },
+    { word: "'", quoted: Some("''\\'''") },
+    { word: "$HOME", quoted: Some("'$HOME'") },
+    { word: "{a,b}", quoted: Some("'{a,b}'") },
+    { word: "~", quoted: Some("'~'") },
+    { word: "*.ply", quoted: Some("'*.ply'") },
+    { word: "a\nb", quoted: Some("'a\nb'") },
+    { word: "a\\b", quoted: Some("'a\\b'") },
+    { word: "CC=gcc", quoted: Some("'CC=gcc'") },
+    { word: "if", quoted: Some("'if'") },
+    { word: "time", quoted: Some("'time'") },
+    { word: "iffy", quoted: Some("iffy") },
+    { word: "=ls", quoted: Some("'=ls'") },
+    { word: "--jobs=4", quoted: Some("--jobs=4") },
+    { word: "-", quoted: Some("-") },
+    { word: "caf\u{e9}", quoted: Some("'caf\u{e9}'") },
+    { word: "a\0b", quoted: None },
+  ]
+
+test "the word {show(c.word)} is quoted for a shell" for c: Quoted in quotings() {
+  assert_eq(shell_quote(c.word), c.quoted)
+}
+
+type Split = { line: String, words: Option<List<String>> }
+
+fn splits() -> List<Split> =
+  [
+    { line: "", words: Some([]) },
+    { line: " \t ", words: Some([]) },
+    { line: "  a  b\tc ", words: Some(["a", "b", "c"]) },
+    { line: "'a b' \"c d\" e\\ f", words: Some(["a b", "c d", "e f"]) },
+    { line: "'' \"\"", words: Some(["", ""]) },
+    { line: "a'b'\"c\"d", words: Some(["abcd"]) },
+    { line: "\"a\\\"b\\\\c\\$d\\`e\"", words: Some(["a\"b\\c$d`e"]) },
+    { line: "\"a\\nb\"", words: Some(["a\\nb"]) },
+    { line: "'a\\nb'", words: Some(["a\\nb"]) },
+    { line: "'it'\\''s'", words: Some(["it's"]) },
+    { line: "\\$HOME \\*", words: Some(["$HOME", "*"]) },
+    { line: "'a\nb' \"c\nd\"", words: Some(["a\nb", "c\nd"]) },
+    { line: "a \\\n b", words: Some(["a", "b"]) },
+    { line: "a\\\nb \"c\\\nd\"", words: Some(["ab", "cd"]) },
+    { line: "make CC=gcc --jobs=4", words: Some(["make", "CC=gcc", "--jobs=4"]) },
+    { line: "'CC=gcc' make", words: Some(["CC=gcc", "make"]) },
+    { line: "caf\u{e9} \u{1F600}", words: Some(["caf\u{e9}", "\u{1F600}"]) },
+    { line: "'abc", words: None },
+    { line: "\"abc", words: None },
+    { line: "abc\\", words: None },
+    { line: "echo $HOME", words: None },
+    { line: "echo \"$HOME\"", words: None },
+    { line: "echo `date`", words: None },
+    { line: "echo \"`date`\"", words: None },
+    { line: "ls *.ply", words: None },
+    { line: "a | b", words: None },
+    { line: "a; b", words: None },
+    { line: "a > b", words: None },
+    { line: "a && b", words: None },
+    { line: "(a)", words: None },
+    { line: "~/bin/x", words: None },
+    { line: "a # b", words: None },
+    { line: "{a,b}", words: None },
+    { line: "! a", words: None },
+    { line: "a\nb", words: None },
+    { line: "a\r", words: None },
+    { line: "CC=gcc make", words: None },
+    { line: "if x", words: None },
+    { line: "time make", words: None },
+    { line: "done", words: None },
+    { line: "'if' x", words: Some(["if", "x"]) },
+    { line: "i\\f x", words: Some(["if", "x"]) },
+    { line: "x if done", words: Some(["x", "if", "done"]) },
+    { line: "iffy", words: Some(["iffy"]) },
+    { line: "_x1=2", words: None },
+    { line: "a\u{3000}b", words: None },
+    { line: "a\0b", words: None },
+    { line: "'a\0b'", words: None },
+  ]
+
+test "a shell reads {show(c.line)} as its words, or as more than words" for c: Split in splits() {
+  assert_eq(shell_split(c.line), c.words)
+}
+
+law "a wrapped line is within the width unless it is one word"
+  forall (codes: List<Int>, w: Int) {
+    let width = 1 + within(w, 24);
+    all(wrap(prose(codes), width), |line: String|
+      string_len(line) <= width || !string_contains(line, " "))
+  }
+
+law "wrapping keeps every word, in order"
+  forall (codes: List<Int>, w: Int) {
+    join(wrap(prose(codes), 1 + within(w, 24)), " ") == join(spaced(prose(codes)), " ")
+  }
+
+law "a broken word leaves no line over the width and no character out"
+  forall (codes: List<Int>, w: Int) {
+    let width = 1 + within(w, 24);
+    let lines = wrap(prose(codes), width, break_words: true);
+    all(lines, |line: String| string_len(line) <= width)
+      && join(spaced(join(lines, " ")), "") == join(spaced(prose(codes)), "")
+  }
+
+/// Lines at the depths the codes pick, the first at none, and none of blanks alone.
+fn staggered(codes: List<Int>) -> String / {abort.raise} =
+  join(
+    prepend(
+      "x",
+      map(codes, |code: Int|
+        if within(code, 5) == 0 { "" } else { repeat(" ", within(code, 4)) ++ "y" }),
+    ),
+    "\n",
+  )
+
+law "an indent taken off again is the text"
+  forall (codes: List<Int>, n: Int) {
+    dedent(indent(staggered(codes), repeat(" ", within(n, 9)))) == staggered(codes)
+  }
+
+law "a dedented text has no more to lose" = idempotent(dedent)
+
+law "a cut text fits its width, and a text that fits is not cut"
+  forall (text: String, w: Int) {
+    let width = within(w, 12) - 2;
+    let cut = truncate(text, width);
+    string_len(cut) <= max(width, 0) && (string_len(text) > width || cut == text)
+  }
+
+law "a table's lines hold their rows' cells, in order"
+  forall (codes: List<List<List<Int>>>) {
+    let rows = map(codes, |row: List<List<Int>>| map(row, |cell: List<Int>| spelled(cell, "abc")));
+    map(table(rows, sides: [Right, Center]), spaced)
+      == map(rows, |row: List<String>| filter(row, |cell: String| cell != ""))
+  }
+
+fn word_of(codes: List<Int>) -> String / {abort.raise} = spelled(codes, "abc")
+
+/// The fewest edits, by trying each at the first place the two differ.
+fn fewest(a: List<Char>, b: List<Char>, swaps: Bool) -> Int =
+  match a {
+    [] -> len(b),
+    [x, ..xs] -> match b {
+      [] -> len(a),
+      [y, ..ys] -> if x == y { fewest(xs, ys, swaps) } else {
+        let edited = 1
+          + min(fewest(xs, b, swaps), min(fewest(a, ys, swaps), fewest(xs, ys, swaps)));
+        match xs {
+          [x2, ..xs2] -> match ys {
+            [y2, ..ys2] -> if swaps && x == y2 && x2 == y {
+              min(edited, 1 + fewest(xs2, ys2, swaps))
+            } else { edited },
+            [] -> edited,
+          },
+          [] -> edited,
+        }
+      },
+    },
+  }
+
+type Two = { a: List<Int>, b: List<Int> }
+
+law "the edit distance is the fewest edits, tried every way" =
+  agrees(|p: Two| edit_distance(word_of(take(p.a, 5)), word_of(take(p.b, 5))), |p: Two|
+    fewest(string_chars(word_of(take(p.a, 5))), string_chars(word_of(take(p.b, 5))), false))
+
+law "the distance with swaps is the fewest edits and swaps, tried every way" =
+  agrees(|p: Two| typo_distance(word_of(take(p.a, 5)), word_of(take(p.b, 5))), |p: Two|
+    fewest(string_chars(word_of(take(p.a, 5))), string_chars(word_of(take(p.b, 5))), true))
+
+law "the edit distance is a metric"
+  forall (x: List<Int>, y: List<Int>, z: List<Int>) {
+    let a = word_of(x);
+    let b = word_of(y);
+    let c = word_of(z);
+    edit_distance(a, a) == 0 && (edit_distance(a, b) > 0 || a == b)
+      && edit_distance(a, b) == edit_distance(b, a)
+      && edit_distance(a, c) <= edit_distance(a, b) + edit_distance(b, c)
+  }
+
+law "a swap costs no more than the edits it stands for, either way round"
+  forall (x: List<Int>, y: List<Int>) {
+    let a = word_of(x);
+    let b = word_of(y);
+    typo_distance(a, b) <= edit_distance(a, b) && typo_distance(a, b) == typo_distance(b, a)
+      && (typo_distance(a, b) > 0 || a == b)
+  }
+
+law "a bounded search agrees with the distance within its limit"
+  forall (x: List<Int>, y: List<Int>, k: Int) {
+    let a = word_of(x);
+    let b = word_of(y);
+    let limit = within(k, 9) - 1;
+    edit_distance_within(a, b, limit)
+      == (if edit_distance(a, b) <= limit { Some(edit_distance(a, b)) } else { None })
+      && typo_distance_within(a, b, limit)
+      == (if typo_distance(a, b) <= limit { Some(typo_distance(a, b)) } else { None })
+  }
+
+law "the closest candidate is within the limit, none is nearer, and none as near comes first"
+  forall (x: List<Int>, ys: List<List<Int>>, k: Int) {
+    let word = word_of(x);
+    let candidates = map(ys, |y: List<Int>| word_of(y));
+    let limit = within(k, 6);
+    match closest(word, candidates, limit) {
+      None -> all(candidates, |c: String| typo_distance(word, c) > limit),
+      Some(best) ->
+        typo_distance(word, best) <= limit
+          && all(candidates, |c: String| typo_distance(word, c) >= typo_distance(word, best))
+          && list_at(
+            filter(candidates, |c: String| typo_distance(word, c) == typo_distance(word, best)),
+            0,
+          )
+          == Some(best),
+    }
+  }
+
+law "a bounded search is linear in the words it compares"
+  forall (n: Int) where n > 0 cost n {
+    edit_distance_within(repeat("ab", n), repeat("ba", n), 2)
+  }
+
+fn mixed(codes: List<Int>) -> String / {abort.raise} = spelled(codes, "abXY12_- .\u{e9}")
+
+law "snake_case is settled after one pass" = idempotent(snake_case)
+
+law "snake_case, kebab-case and Title Case are settled after one pass, and keep the words"
+  forall (codes: List<Int>) {
+    let name = mixed(codes);
+    let words = map(name_words(name), small);
+    snake_case(snake_case(name)) == snake_case(name)
+      && kebab_case(kebab_case(name)) == kebab_case(name)
+      && title_case(title_case(name)) == title_case(name)
+      && name_words(snake_case(name)) == words
+      && name_words(kebab_case(name)) == words
+      && map(name_words(title_case(name)), small) == words
+  }
+
+/// A name in snake_case whose every word starts with two letters, so no style runs two together.
+fn named(picks: List<Int>) -> String / {abort.raise} = {
+  let vocabulary = ["http", "request", "id", "sha256", "line", "to", "utf8"];
+  join(map(picks, |p: Int| at_or(vocabulary, within(p, 7), "")), "_")
+}
+
+law "camelCase reads back as the snake_case it was made of" =
+  agrees(|picks: List<Int>| snake_case(camel_case(named(picks))), named)
+
+law "PascalCase reads back as the snake_case it was made of" =
+  agrees(|picks: List<Int>| snake_case(pascal_case(named(picks))), named)
+
+law "kebab-case reads back as the snake_case it was made of" =
+  agrees(|picks: List<Int>| snake_case(kebab_case(named(picks))), named)
+
+law "Title Case reads back as the snake_case it was made of" =
+  agrees(|picks: List<Int>| snake_case(title_case(named(picks))), named)
+
+law "a word is refused exactly where it holds the zero character"
+  forall (word: String) {
+    shell_quote(word) == None == string_contains(word, "\0")
+  }
+
+law "a line of quoted words splits back into them"
+  forall (args: List<String>) {
+    match shell_join(args) {
+      Some(line) -> shell_split(line) == Some(args),
+      None -> !all(args, |arg: String| !string_contains(arg, "\0")),
+    }
+  }
+
+law "a word a shell would take for its own grammar is quoted, and splits back"
+  forall (picks: List<Int>) {
+    let own = ["if", "do", "time", "in", "CC=1", "=x", "x", "", "-o=1", "~", "#"];
+    let args = map(picks, |p: Int| at_or(own, within(p, 11), ""));
+    match shell_join(args) { Some(line) -> shell_split(line) == Some(args), None -> false }
+  }
+
+law "what a shell reads into is quoted, and splits back whole"
+  forall (codes: List<List<Int>>) {
+    let args = map(codes, |word: List<Int>|
+      spelled(word, "ab '\"\\$`\n\t*?[]{}~#!&|;<>()=-%\u{e9}\u{3000}"));
+    match shell_join(args) { Some(line) -> shell_split(line) == Some(args), None -> false }
+  }

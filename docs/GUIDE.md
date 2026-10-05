@@ -1873,7 +1873,7 @@ Results are cached per search plan; a search that spends its budget passes but
 is not cached. A failure prints the racing steps — each one's task, and the
 definition and position where it first touched shared state — and a replay
 command such as
-`ply test --seed 0:0.1.0.2 --filter "no account is ever overdrawn"`.
+`ply test --seed 0:0.1.0.2 --filter 'no account is ever overdrawn'`.
 
 ## 10. Specifications, laws and proof
 
@@ -2152,8 +2152,9 @@ derive json for Line
 | `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
 | `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
 
-There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
-`HttpRequest` both give `http_request`) is `E0105`. A `derive` must be in the
+There are no other derivers (`E0207`). `snake_case` is `std.text`'s, so a
+name collision (`HTTPRequest` and `HttpRequest` both give `http_request`) is
+`E0105`. A `derive` must be in the
 module declaring its type (`E0208`). A parameterized type's function takes one
 dictionary per parameter:
 
