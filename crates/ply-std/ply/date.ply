@@ -1,0 +1,2925 @@
+//! Calendar dates, times of day and date-times, and the texts that carry them.
+//!
+//! There is a type for each thing a text can mean, so no value has a zone it may or may not hold. A
+//! `Date` is a day of the calendar, a `Time` a time of day, a `DateTime` the two together with no
+//! zone, and an `OffsetDateTime` a `DateTime` at a stated offset from UTC, which names an instant. A
+//! `Period` is a count of calendar months and days, apart from the prelude's exact `Duration`. Named
+//! zones are not here.
+//!
+//! The calendar is the proleptic Gregorian one over the years 0000 to 9999, which is what every
+//! format here can write, and a time is kept to the nanosecond. An offset is whole minutes, within a
+//! day either side of UTC. Values of one type order as they fall, an `OffsetDateTime` by its instant
+//! and then its offset, and `show` writes each as ISO 8601 does. The functions here are what make
+//! one: they check its range and answer `None` outside it, which a constructor written by hand does
+//! not. `date"2026-10-04"` is this module's literal, and `std.timeofday`, `std.datetime`,
+//! `std.timestamp` and `std.strftime` are the tags of a `Time`, a `DateTime`, an `OffsetDateTime` and
+//! a `Pattern`.
+//!
+//! Nothing here reads a clock: the one reader that needs the present, `parse_http_date`, takes it.
+//! A second of `60` is read only from a text with an offset, and only where UTC's clock can show
+//! one, 23:59:60 on the last day of a month; it is read as 23:59:59 with its fraction, and nothing
+//! writes one. Month and weekday names are English, in every format and pattern.
+
+import std.bytes (is_digit)
+import std.laws (agrees, idempotent, round_trip)
+import std.list (concat, drop, take)
+import std.math (clamp, pow)
+import std.option (option_and_then, option_expect, option_map, option_unwrap_or)
+import std.result (result_err, result_ok)
+import std.string (pad_left)
+import std.time (as_nanos, nanos, nanos_at)
+
+/// A day of the calendar, 0000-01-01 to 9999-12-31, as its count of days from 1970-01-01.
+pub type Date = | Date(Int)
+
+/// A time of day to the nanosecond, 00:00:00 up to but not 24:00:00, as nanoseconds from midnight.
+pub type Time = | Time(Int)
+
+/// A date and a time of day with no zone: a reading of some wall clock, and no instant.
+pub type DateTime = | DateTime(Date, Time)
+
+/// An instant as a wall clock at a fixed offset from UTC read it: the UTC reading, and the minutes
+/// the wall clock stood east of it. Two that name one instant at different offsets are not `==`.
+pub type OffsetDateTime = | OffsetDateTime(DateTime, Int)
+
+/// A span of the calendar: whole months, then whole days. A year is twelve months and a week seven
+/// days; how long either is in hours depends on where it starts, which is why it is no `Duration`.
+pub type Period = new { months: Int, days: Int }
+
+/// A day of the week.
+pub type Weekday = | Monday | Tuesday | Wednesday | Thursday | Friday | Saturday | Sunday
+
+/// A month of the year.
+pub type Month =
+  | January
+  | February
+  | March
+  | April
+  | May
+  | June
+  | July
+  | August
+  | September
+  | October
+  | November
+  | December
+
+/// What adding months does when the day it lands on is past the end of its month.
+pub type Overflow =
+  /// The month's last day: a month after 31 January is 28 or 29 February.
+  | Clamp
+  /// No date.
+  | Reject
+
+/// A length of time a `Time` or a `DateTime` is truncated or rounded to.
+pub type TimeUnit = | Days | Hours | Minutes | Seconds | Milliseconds | Microseconds | Nanoseconds
+
+/// A date as its year, its month from 1 and its day of the month from 1.
+pub type YearMonthDay = { year: Int, month: Int, day: Int }
+
+/// An ISO 8601 week: its week-numbering year, and the week from 1.
+pub type IsoWeek = { year: Int, week: Int }
+
+/// Why a text is not what it was read as, and the character it stops being so at.
+pub type Refusal = { message: String, offset: Int }
+
+show for Date by text
+
+show for Time by time_text
+
+show for DateTime by date_time_text
+
+show for OffsetDateTime by rfc3339
+
+// --- Day counts -------------------------------------------------------------
+
+fn first_day() -> Int = -719528
+
+fn last_day() -> Int = 2932896
+
+fn day_nanos() -> Int = 86400000000000
+
+/// Howard Hinnant's `days_from_civil`: the days from 1970-01-01 to a date of the proleptic Gregorian
+/// calendar, counting years from March so a leap day ends its year.
+fn days_from_civil(year: Int, month: Int, day: Int) -> Int = {
+  let y = if month <= 2 { year - 1 } else { year };
+  let era = (if y >= 0 { y } else { y - 399 }) / 400;
+  let year_of_era = y - era * 400;
+  let month_from_march = if month > 2 { month - 3 } else { month + 9 };
+  let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+  let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+  era * 146097 + day_of_era - 719468
+}
+
+/// Its inverse, `civil_from_days`.
+fn civil_from_days(days: Int) -> YearMonthDay = {
+  let z = days + 719468;
+  let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+  let day_of_era = z - era * 146097;
+  let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096)
+    / 365;
+  let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+  let month_from_march = (5 * day_of_year + 2) / 153;
+  let month = if month_from_march < 10 { month_from_march + 3 } else { month_from_march - 9 };
+  {
+    year: year_of_era + era * 400 + (if month <= 2 { 1 } else { 0 }),
+    month: month,
+    day: day_of_year - (153 * month_from_march + 2) / 5 + 1,
+  }
+}
+
+fn month_length(year: Int, month: Int) -> Int =
+  if month == 2 { if is_leap_year(year) { 29 } else { 28 } }
+  else if month == 4 || month == 6 || month == 9 || month == 11 { 30 }
+  else { 31 }
+
+fn in_years(year: Int) -> Bool = year >= 0 && year <= 9999
+
+fn in_days(days: Int) -> Bool = days >= first_day() && days <= last_day()
+
+// --- Dates ------------------------------------------------------------------
+
+/// The date of a year, a month from 1 and a day of the month from 1; `None` for a day its month
+/// does not have, a month past 12 or a year outside 0000 to 9999.
+pub fn of(year: Int, month: Int, day: Int) -> Option<Date> =
+  if !in_years(year) || month < 1 || month > 12 || day < 1 || day > month_length(year, month) {
+    None
+  } else { Some(Date(days_from_civil(year, month, day))) }
+
+/// The date of a year and a day of the year from 1, an ISO 8601 ordinal date; `None` for a day the
+/// year does not have.
+pub fn of_ordinal(year: Int, day_of_year: Int) -> Option<Date> =
+  if !in_years(year) || day_of_year < 1 || day_of_year > days_in_year(year) { None }
+  else { Some(Date(days_from_civil(year, 1, 1) + day_of_year - 1)) }
+
+/// The date of an ISO 8601 week date: a week-numbering year, a week from 1 and a weekday; `None`
+/// for a week the year does not have.
+pub fn of_week(year: Int, week: Int, day: Weekday) -> Option<Date> =
+  if year < -1 || year > 10000 || week < 1 || week > 53 { None } else {
+    let fourth = days_from_civil(year, 1, 4);
+    let days = fourth - weekday_index(fourth) + (week - 1) * 7 + weekday_number(day) - 1;
+    let found: IsoWeek = { year: year, week: week };
+    if in_days(days) && week_of_days(days) == found { Some(Date(days)) } else { None }
+  }
+
+/// The date `days` days after 1970-01-01, or before it for a negative count.
+pub fn of_unix_days(days: Int) -> Option<Date> = if in_days(days) { Some(Date(days)) } else { None }
+
+/// The days from 1970-01-01 to the date, negative before it.
+pub fn unix_days(d: Date) -> Int = match d { Date(days) -> days }
+
+/// 0000-01-01, the first date there is.
+pub fn earliest() -> Date = Date(first_day())
+
+/// 9999-12-31, the last.
+pub fn latest() -> Date = Date(last_day())
+
+/// The date's year, month and day as numbers.
+pub fn parts(d: Date) -> YearMonthDay = civil_from_days(unix_days(d))
+
+/// The year, 0 to 9999.
+pub fn year(d: Date) -> Int = parts(d).year
+
+/// The month.
+pub fn month(d: Date) -> Month = month_at(parts(d).month)
+
+/// The day of the month, from 1.
+pub fn day(d: Date) -> Int = parts(d).day
+
+/// The day of the week.
+pub fn weekday(d: Date) -> Weekday = weekday_at(weekday_index(unix_days(d)))
+
+/// The day of the year, from 1: 366 on 31 December of a leap year.
+pub fn day_of_year(d: Date) -> Int = unix_days(d) - days_from_civil(year(d), 1, 1) + 1
+
+/// The ISO 8601 week the date is in. A week runs Monday to Sunday and belongs to the year its
+/// Thursday is in, so the first days of January may be in the last week of the year before, and
+/// the last of December in the first week of the year after.
+pub fn week(d: Date) -> IsoWeek = week_of_days(unix_days(d))
+
+/// Whether the year has a 29 February: every fourth year, but of the centuries only every fourth.
+pub fn is_leap_year(year: Int) -> Bool = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+
+/// How many days the year has.
+pub fn days_in_year(year: Int) -> Int = if is_leap_year(year) { 366 } else { 365 }
+
+/// How many days the month has in that year.
+pub fn days_in_month(year: Int, month: Month) -> Int = month_length(year, month_number(month))
+
+/// The month's number, January 1 to December 12.
+pub fn month_number(m: Month) -> Int =
+  match m {
+    January -> 1,
+    February -> 2,
+    March -> 3,
+    April -> 4,
+    May -> 5,
+    June -> 6,
+    July -> 7,
+    August -> 8,
+    September -> 9,
+    October -> 10,
+    November -> 11,
+    December -> 12,
+  }
+
+/// The month of a number from 1 to 12.
+pub fn month_of_number(n: Int) -> Option<Month> =
+  if n < 1 || n > 12 { None } else { Some(month_at(n)) }
+
+/// The month's English name.
+pub fn month_name(m: Month) -> String =
+  match m {
+    January -> "January",
+    February -> "February",
+    March -> "March",
+    April -> "April",
+    May -> "May",
+    June -> "June",
+    July -> "July",
+    August -> "August",
+    September -> "September",
+    October -> "October",
+    November -> "November",
+    December -> "December",
+  }
+
+/// The weekday's ISO 8601 number, Monday 1 to Sunday 7.
+pub fn weekday_number(day: Weekday) -> Int =
+  match day {
+    Monday -> 1,
+    Tuesday -> 2,
+    Wednesday -> 3,
+    Thursday -> 4,
+    Friday -> 5,
+    Saturday -> 6,
+    Sunday -> 7,
+  }
+
+/// The weekday of an ISO 8601 number from 1 to 7.
+pub fn weekday_of_number(n: Int) -> Option<Weekday> =
+  if n < 1 || n > 7 { None } else { Some(weekday_at(n - 1)) }
+
+/// The weekday's English name.
+pub fn weekday_name(day: Weekday) -> String =
+  match day {
+    Monday -> "Monday",
+    Tuesday -> "Tuesday",
+    Wednesday -> "Wednesday",
+    Thursday -> "Thursday",
+    Friday -> "Friday",
+    Saturday -> "Saturday",
+    Sunday -> "Sunday",
+  }
+
+fn month_at(n: Int) -> Month =
+  match n {
+    1 -> January,
+    2 -> February,
+    3 -> March,
+    4 -> April,
+    5 -> May,
+    6 -> June,
+    7 -> July,
+    8 -> August,
+    9 -> September,
+    10 -> October,
+    11 -> November,
+    _ -> December,
+  }
+
+fn weekday_at(index: Int) -> Weekday =
+  match index {
+    0 -> Monday,
+    1 -> Tuesday,
+    2 -> Wednesday,
+    3 -> Thursday,
+    4 -> Friday,
+    5 -> Saturday,
+    _ -> Sunday,
+  }
+
+/// Monday 0 to Sunday 6: 1970-01-01 was a Thursday.
+fn weekday_index(days: Int) -> Int = {
+  let from_monday = days + 3;
+  from_monday - weeks_floor(from_monday) * 7
+}
+
+fn weeks_floor(days: Int) -> Int = if days >= 0 { days / 7 } else { (days + 1) / 7 - 1 }
+
+fn week_of_days(days: Int) -> IsoWeek = {
+  let thursday = days - weekday_index(days) + 3;
+  let year = civil_from_days(thursday).year;
+  { year: year, week: (thursday - days_from_civil(year, 1, 1)) / 7 + 1 }
+}
+
+// --- Calendar arithmetic ----------------------------------------------------
+
+/// `n` years.
+pub fn years(n: Int) -> Period = { months: n * 12, days: 0 }
+
+/// `n` months.
+pub fn months(n: Int) -> Period = { months: n, days: 0 }
+
+/// `n` weeks.
+pub fn weeks(n: Int) -> Period = { months: 0, days: n * 7 }
+
+/// `n` days.
+pub fn days(n: Int) -> Period = { months: 0, days: n }
+
+/// The two spans together.
+pub fn plus(a: Period, b: Period) -> Period = { months: a.months + b.months, days: a.days + b.days }
+
+/// The date `n` days later, or earlier for a negative `n`; `None` past either end of the calendar.
+pub fn add_days(d: Date, n: Int) -> Option<Date> =
+  match checked_add(unix_days(d), n) { Some(days) -> of_unix_days(days), None -> None }
+
+/// The same day of the month `n` months later, or earlier for a negative `n`. Where that month is
+/// too short to have the day, `overflow` says whether the answer is its last day or `None`; past
+/// either end of the calendar it is `None`.
+pub fn add_months(d: Date, n: Int, overflow: Overflow) -> Option<Date> = {
+  let from = parts(d);
+  match checked_add(from.year * 12 + from.month - 1, n) {
+    None -> None,
+    Some(index) -> if index < 0 || index > 119999 { None } else {
+      let year = index / 12;
+      let month = index % 12 + 1;
+      let length = month_length(year, month);
+      if from.day <= length { of(year, month, from.day) }
+      else { match overflow { Clamp -> of(year, month, length), Reject -> None } }
+    },
+  }
+}
+
+/// The same day `n` years later: `add_months` of twelve times as many, so 29 February meets
+/// `overflow` in a year that has none.
+pub fn add_years(d: Date, n: Int, overflow: Overflow) -> Option<Date> =
+  match checked_mul(n, 12) { Some(count) -> add_months(d, count, overflow), None -> None }
+
+/// The date a period later: its months first, as `add_months` adds them, and then its days.
+pub fn add(d: Date, p: Period, overflow: Overflow) -> Option<Date> =
+  match add_months(d, p.months, overflow) { Some(moved) -> add_days(moved, p.days), None -> None }
+
+/// The days from one date to another, negative when `to` is the earlier.
+pub fn days_between(from: Date, to: Date) -> Int = unix_days(to) - unix_days(from)
+
+/// The whole months from one date to another and the days left over, both negative when `to` is
+/// the earlier: what `add` with `Clamp` takes `from` to `to` by. A month is whole once the day of
+/// the month has come round again, so 31 January to 28 February is 28 days and no month.
+pub fn period_between(from: Date, to: Date) -> Period = {
+  let a = parts(from);
+  let b = parts(to);
+  let apart = (b.year - a.year) * 12 + b.month - a.month;
+  let whole = if unix_days(to) >= unix_days(from) { if b.day < a.day { apart - 1 } else { apart } }
+  else if b.day > a.day { apart + 1 }
+  else { apart };
+  match add_months(from, whole, Clamp) {
+    Some(reached) -> { months: whole, days: days_between(reached, to) },
+    None -> { months: 0, days: days_between(from, to) },
+  }
+}
+
+/// The first day of the date's month.
+pub fn start_of_month(d: Date) -> Date = Date(unix_days(d) - day(d) + 1)
+
+/// The last day of the date's month.
+pub fn end_of_month(d: Date) -> Date = {
+  let at = parts(d);
+  Date(unix_days(d) - at.day + month_length(at.year, at.month))
+}
+
+/// The first day of the date's year.
+pub fn start_of_year(d: Date) -> Date = Date(unix_days(d) - day_of_year(d) + 1)
+
+// --- Times of day -----------------------------------------------------------
+
+/// The time of an hour from 0 to 23, a minute and a second from 0 to 59, and a nanosecond below a
+/// thousand million.
+pub fn time(hour: Int, minute: Int, second: Int, nanosecond: Int) -> Option<Time> =
+  if hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59
+      || nanosecond < 0
+      || nanosecond > 999999999 { None }
+  else { Some(Time(((hour * 60 + minute) * 60 + second) * 1000000000 + nanosecond)) }
+
+/// 00:00:00, the first time of a day.
+pub fn midnight() -> Time = Time(0)
+
+/// The time `nanos` nanoseconds after midnight; `None` for a negative count or a day's worth.
+pub fn time_of_nanos(nanos: Int) -> Option<Time> =
+  if nanos >= 0 && nanos < day_nanos() { Some(Time(nanos)) } else { None }
+
+/// The nanoseconds from midnight to the time.
+pub fn nanos_of_day(t: Time) -> Int = match t { Time(nanos) -> nanos }
+
+/// The hour, 0 to 23.
+pub fn hour(t: Time) -> Int = nanos_of_day(t) / 3600000000000
+
+/// The minute of the hour, 0 to 59.
+pub fn minute(t: Time) -> Int = nanos_of_day(t) / 60000000000 % 60
+
+/// The second of the minute, 0 to 59.
+pub fn second(t: Time) -> Int = nanos_of_day(t) / 1000000000 % 60
+
+/// The nanosecond of the second.
+pub fn nanosecond(t: Time) -> Int = nanos_of_day(t) % 1000000000
+
+/// The time a duration later on a clock that turns over at midnight, or earlier for a negative one.
+pub fn time_after(t: Time, d: Duration) -> Time =
+  Time(nanos_in_day(nanos_of_day(t) + nanos_in_day(as_nanos(d))))
+
+/// From one time to another of the same day, negative when `to` is the earlier.
+pub fn time_between(from: Time, to: Time) -> Duration = nanos(nanos_of_day(to) - nanos_of_day(from))
+
+/// The time with everything finer than the unit dropped; `Days` is midnight.
+pub fn truncate_time(t: Time, to: TimeUnit) -> Time = Time(rounded(nanos_of_day(t), to, Down))
+
+/// The time at the nearest whole unit, as `mode` chooses between the one before and the one after;
+/// `HalfEven` takes the even count of units since midnight. A time rounded up past the end of the
+/// day is midnight.
+pub fn round_time(t: Time, to: TimeUnit, mode: Rounding) -> Time =
+  Time(nanos_in_day(rounded(nanos_of_day(t), to, mode)))
+
+fn whole_days(nanos: Int) -> Int =
+  if nanos >= 0 { nanos / 86400000000000 } else { (nanos + 1) / 86400000000000 - 1 }
+
+fn nanos_in_day(nanos: Int) -> Int =
+  if nanos >= 0 { nanos % 86400000000000 } else { (nanos + 1) % 86400000000000 + 86399999999999 }
+
+type Split = { whole: Int, rest: Int, size: Int }
+
+fn split(nanos: Int, unit: TimeUnit) -> Split =
+  match unit {
+    Days -> { whole: nanos / 86400000000000, rest: nanos % 86400000000000, size: 86400000000000 },
+    Hours -> { whole: nanos / 3600000000000, rest: nanos % 3600000000000, size: 3600000000000 },
+    Minutes -> { whole: nanos / 60000000000, rest: nanos % 60000000000, size: 60000000000 },
+    Seconds -> { whole: nanos / 1000000000, rest: nanos % 1000000000, size: 1000000000 },
+    Milliseconds -> { whole: nanos / 1000000, rest: nanos % 1000000, size: 1000000 },
+    Microseconds -> { whole: nanos / 1000, rest: nanos % 1000, size: 1000 },
+    Nanoseconds -> { whole: nanos, rest: 0, size: 1 },
+  }
+
+/// A day's nanoseconds at a whole number of units, which may be the whole day.
+fn rounded(nanos: Int, unit: TimeUnit, mode: Rounding) -> Int = {
+  let s = split(nanos, unit);
+  let twice = s.rest * 2;
+  let up = match mode {
+    Down | Floor -> false,
+    Up | Ceiling -> s.rest > 0,
+    HalfUp -> twice >= s.size,
+    HalfEven -> twice > s.size || (twice == s.size && s.whole % 2 == 1),
+  };
+  (if up { s.whole + 1 } else { s.whole }) * s.size
+}
+
+// --- Date-times -------------------------------------------------------------
+
+/// The date at that time of day.
+pub fn at(d: Date, t: Time) -> DateTime = DateTime(d, t)
+
+/// The date-time of a year, month, day, hour, minute and second, each as `of` and `time` take it.
+pub fn date_time(
+  year: Int,
+  month: Int,
+  day: Int,
+  hour: Int,
+  minute: Int,
+  second: Int,
+) -> Option<DateTime> =
+  match of(year, month, day) {
+    Some(d) -> match time(hour, minute, second, 0) {
+      Some(t) -> Some(DateTime(d, t)),
+      None -> None,
+    },
+    None -> None,
+  }
+
+/// The date-time's date.
+pub fn date_of(dt: DateTime) -> Date = match dt { DateTime(d, _) -> d }
+
+/// The date-time's time of day.
+pub fn time_of(dt: DateTime) -> Time = match dt { DateTime(_, t) -> t }
+
+/// The date-time a duration later, every day twenty-four hours long, or earlier for a negative
+/// one; `None` past either end of the calendar.
+pub fn date_time_after(dt: DateTime, d: Duration) -> Option<DateTime> =
+  ranged(moved(dt, as_nanos(d)))
+
+/// The date-time a period later at the same time of day, as `add` moves its date.
+pub fn date_time_add(dt: DateTime, p: Period, overflow: Overflow) -> Option<DateTime> =
+  match add(date_of(dt), p, overflow) { Some(d) -> Some(DateTime(d, time_of(dt))), None -> None }
+
+/// From one date-time to another, every day twenty-four hours long; `None` where the span is more
+/// than a `Duration` holds, about 292 years.
+pub fn date_time_between(from: DateTime, to: DateTime) -> Option<Duration> = {
+  let apart = days_between(date_of(from), date_of(to));
+  let rest = nanos_of_day(time_of(to)) - nanos_of_day(time_of(from));
+  let span = if rest >= 0 { nanos_of_span(apart, rest) }
+  else { nanos_of_span(apart - 1, rest + day_nanos()) };
+  match span { Some(n) -> Some(nanos(n)), None -> None }
+}
+
+/// The date-time with everything finer than the unit dropped; `Days` is the date's midnight.
+pub fn truncate_date_time(dt: DateTime, to: TimeUnit) -> DateTime =
+  DateTime(date_of(dt), truncate_time(time_of(dt), to))
+
+/// The date-time at the nearest whole unit, as `round_time` chooses it, on the next day where that
+/// is past the end of this one; `None` where the next day is past the end of the calendar.
+pub fn round_date_time(dt: DateTime, to: TimeUnit, mode: Rounding) -> Option<DateTime> = {
+  let reached = rounded(nanos_of_day(time_of(dt)), to, mode);
+  if reached < day_nanos() { Some(DateTime(date_of(dt), Time(reached))) } else {
+    match add_days(date_of(dt), 1) { Some(next) -> Some(DateTime(next, Time(0))), None -> None }
+  }
+}
+
+/// The reading `by` nanoseconds later, in range or not.
+fn moved(dt: DateTime, by: Int) -> DateTime =
+  match dt {
+    DateTime(Date(days), Time(of_day)) -> {
+      let within = of_day + nanos_in_day(by);
+      if within < day_nanos() { DateTime(Date(days + whole_days(by)), Time(within)) }
+      else { DateTime(Date(days + whole_days(by) + 1), Time(within - day_nanos())) }
+    },
+  }
+
+fn ranged(dt: DateTime) -> Option<DateTime> =
+  if in_days(unix_days(date_of(dt))) { Some(dt) } else { None }
+
+// --- Date-times at an offset ------------------------------------------------
+
+/// The date-time as UTC read it.
+pub fn utc(dt: DateTime) -> OffsetDateTime = OffsetDateTime(dt, 0)
+
+/// The date-time as a clock `minutes` minutes east of UTC read it, negative for west; `None` for
+/// an offset of a day or more, and where the instant is past either end of the calendar in UTC.
+pub fn at_offset(local: DateTime, minutes: Int) -> Option<OffsetDateTime> =
+  if minutes < -1439 || minutes > 1439 { None }
+  else { stamped(moved(local, -minutes * 60000000000), minutes) }
+
+/// The same instant as a clock at another offset reads it; `None` as `at_offset` is.
+pub fn in_offset(o: OffsetDateTime, minutes: Int) -> Option<OffsetDateTime> =
+  match o { OffsetDateTime(universal, _) -> stamped(universal, minutes) }
+
+/// The same instant as UTC reads it.
+pub fn in_utc(o: OffsetDateTime) -> OffsetDateTime =
+  match o { OffsetDateTime(universal, _) -> OffsetDateTime(universal, 0) }
+
+/// What the clock at the offset read: the date-time written before the offset.
+pub fn local(o: OffsetDateTime) -> DateTime =
+  match o { OffsetDateTime(universal, minutes) -> moved(universal, minutes * 60000000000) }
+
+/// The minutes the clock stood east of UTC, negative for west.
+pub fn offset_minutes(o: OffsetDateTime) -> Int = match o { OffsetDateTime(_, minutes) -> minutes }
+
+/// Whether the two name one instant, whatever their offsets.
+pub fn same_instant(a: OffsetDateTime, b: OffsetDateTime) -> Bool = in_utc(a) == in_utc(b)
+
+/// The instant a duration later, at the same offset; `None` past either end of the calendar.
+pub fn offset_after(o: OffsetDateTime, d: Duration) -> Option<OffsetDateTime> =
+  match o { OffsetDateTime(universal, minutes) -> stamped(moved(universal, as_nanos(d)), minutes) }
+
+/// The same reading of the clock a period later, as `add` moves its date, at the same offset.
+pub fn offset_add(o: OffsetDateTime, p: Period, overflow: Overflow) -> Option<OffsetDateTime> =
+  match date_time_add(local(o), p, overflow) {
+    Some(reading) -> at_offset(reading, offset_minutes(o)),
+    None -> None,
+  }
+
+/// From one instant to another; `None` where the span is more than a `Duration` holds.
+pub fn offset_between(from: OffsetDateTime, to: OffsetDateTime) -> Option<Duration> =
+  date_time_between(local(in_utc(from)), local(in_utc(to)))
+
+/// The instant `seconds` seconds after 1970-01-01T00:00:00Z, as UTC reads it.
+pub fn of_unix_seconds(seconds: Int) -> Option<OffsetDateTime> = {
+  let days = if seconds >= 0 { seconds / 86400 } else { (seconds + 1) / 86400 - 1 };
+  let of_day = if seconds >= 0 { seconds % 86400 } else { (seconds + 1) % 86400 + 86399 };
+  stamped(DateTime(Date(days), Time(of_day * 1000000000)), 0)
+}
+
+/// The whole seconds from 1970-01-01T00:00:00Z to the instant, negative before it.
+pub fn unix_seconds(o: OffsetDateTime) -> Int =
+  match o {
+    OffsetDateTime(DateTime(Date(days), Time(of_day)), _) -> days * 86400 + of_day / 1000000000,
+  }
+
+/// The instant `millis` milliseconds after 1970-01-01T00:00:00Z, as UTC reads it.
+pub fn of_unix_millis(millis: Int) -> Option<OffsetDateTime> = {
+  let days = if millis >= 0 { millis / 86400000 } else { (millis + 1) / 86400000 - 1 };
+  let of_day = if millis >= 0 { millis % 86400000 } else { (millis + 1) % 86400000 + 86399999 };
+  stamped(DateTime(Date(days), Time(of_day * 1000000)), 0)
+}
+
+/// The whole milliseconds from 1970-01-01T00:00:00Z to the instant.
+pub fn unix_millis(o: OffsetDateTime) -> Int =
+  match o {
+    OffsetDateTime(DateTime(Date(days), Time(of_day)), _) -> days * 86400000 + of_day / 1000000,
+  }
+
+/// The instant as UTC reads it, taking an `Instant` as nanoseconds from 1970-01-01T00:00:00Z.
+pub fn of_instant(i: Instant) -> OffsetDateTime =
+  OffsetDateTime(DateTime(Date(whole_days(nanos_at(i))), Time(nanos_in_day(nanos_at(i)))), 0)
+
+/// The instant as nanoseconds from 1970-01-01T00:00:00Z; `None` outside what an `Instant` holds,
+/// which is 1677-09-21 to 2262-04-11.
+pub fn instant(o: OffsetDateTime) -> Option<Instant> =
+  match o {
+    OffsetDateTime(DateTime(Date(days), Time(of_day)), _) -> match nanos_of_span(days, of_day) {
+      Some(n) -> Some(Instant(n)),
+      None -> None,
+    },
+  }
+
+/// The nanoseconds in whole days and a part of one, wherever an `Int` holds them: a span that
+/// ends in the earliest day an `Int` reaches is counted back from the day after.
+fn nanos_of_span(days: Int, rest: Int) -> Option<Int> = {
+  let whole = if days >= 0 { days } else { days + 1 };
+  let part = if days >= 0 { rest } else { rest - day_nanos() };
+  match checked_mul(whole, day_nanos()) { Some(n) -> checked_add(n, part), None -> None }
+}
+
+/// The UTC reading at the offset, where both it and the offset's own reading are in the calendar.
+fn stamped(universal: DateTime, minutes: Int) -> Option<OffsetDateTime> =
+  if minutes < -1439 || minutes > 1439 { None } else {
+    match ranged(universal) {
+      None -> None,
+      Some(_) -> match ranged(moved(universal, minutes * 60000000000)) {
+        Some(_) -> Some(OffsetDateTime(universal, minutes)),
+        None -> None,
+      },
+    }
+  }
+
+// --- ISO 8601 and RFC 3339 --------------------------------------------------
+
+/// The date as ISO 8601 and RFC 3339 write it, `2026-10-04`.
+pub fn text(d: Date) -> String = {
+  let at = parts(d);
+  numeral(at.year, 4) ++ "-" ++ numeral(at.month, 2) ++ "-" ++ numeral(at.day, 2)
+}
+
+/// The date an RFC 3339 `full-date` names: four digits, two and two, and a day its month has.
+pub fn parse(text: String) -> Option<Date> = result_ok(literal(text))
+
+/// What a `date"..."` literal is checked by: the date `parse` reads, or why the text is none and
+/// the character it stops being one at.
+pub fn literal(text: String) -> Result<Date, Refusal> = {
+  let cs = scanned(text);
+  let read = read_date(cs, 0)?;
+  let _ = ended(cs, read.at)?;
+  Ok(read.value)
+}
+
+/// The time as RFC 3339 writes it, `12:30:00`, with as many digits of a fraction as it has.
+pub fn time_text(t: Time) -> String = {
+  let fraction = nanosecond(t);
+  numeral(hour(t), 2) ++ ":" ++ numeral(minute(t), 2) ++ ":" ++ numeral(second(t), 2)
+    ++ (if fraction == 0 { "" } else { "." ++ shortest(fraction, 9) })
+}
+
+/// The time an RFC 3339 `partial-time` names: `hh:mm:ss`, then a fraction of one to nine digits or
+/// none. A second of `60` is refused, since no offset says whether UTC could show one.
+pub fn parse_time(text: String) -> Option<Time> = result_ok(time_literal(text))
+
+/// `parse_time`, saying why a text is no time and where: what a tag of times is checked by.
+pub fn time_literal(text: String) -> Result<Time, Refusal> = {
+  let cs = scanned(text);
+  let read = read_time(cs, 0)?;
+  let _ = ended(cs, read.at)?;
+  no_leap(read.value, 6)
+}
+
+/// The date-time as ISO 8601 writes it, `2026-10-04T12:30:00`.
+pub fn date_time_text(dt: DateTime) -> String = text(date_of(dt)) ++ "T" ++ time_text(time_of(dt))
+
+/// The date-time an RFC 3339 `full-date`, a `T` or `t` and a `partial-time` name, with no offset.
+pub fn parse_date_time(text: String) -> Option<DateTime> = result_ok(date_time_literal(text))
+
+/// `parse_date_time`, saying why a text is no date-time and where.
+pub fn date_time_literal(text: String) -> Result<DateTime, Refusal> = {
+  let cs = scanned(text);
+  let date = read_date(cs, 0)?;
+  let _ = one_of(cs, 10, 84, 116, "a `T` goes here")?;
+  let clock = read_time(cs, 11)?;
+  let _ = ended(cs, clock.at)?;
+  let time = no_leap(clock.value, 17)?;
+  Ok(DateTime(date.value, time))
+}
+
+/// The instant as RFC 3339 writes it: the clock's reading and its offset, `Z` for none,
+/// `2026-10-04T12:30:00+02:00`.
+pub fn rfc3339(o: OffsetDateTime) -> String =
+  date_time_text(local(o))
+    ++ (if offset_minutes(o) == 0 { "Z" } else { offset_text(offset_minutes(o), ":") })
+
+/// The instant an RFC 3339 `date-time` names, strictly: `T` and `Z` in either case, an offset of
+/// `Z` or a sign and `hh:mm`, and nothing ISO 8601 allows beyond that. `-00:00` is read as UTC.
+pub fn parse_rfc3339(text: String) -> Option<OffsetDateTime> = result_ok(rfc3339_literal(text))
+
+/// `parse_rfc3339`, saying why a text is no instant and where.
+pub fn rfc3339_literal(text: String) -> Result<OffsetDateTime, Refusal> = {
+  let cs = scanned(text);
+  let read = read_rfc3339(cs)?;
+  let _ = ended(cs, read.at)?;
+  Ok(read.value)
+}
+
+/// A time zone an RFC 9557 suffix names, as its text: an IANA name or a numeric offset.
+pub type ZoneTag = { name: String, critical: Bool }
+
+/// Any other RFC 9557 suffix tag: a key and its value.
+pub type SuffixTag = { key: String, value: String, critical: Bool }
+
+/// An RFC 3339 instant with the bracketed suffix RFC 9557 adds to it, kept as text. `critical` is
+/// the `!` a tag was written with: a reader that does not act on such a tag is to refuse the
+/// whole, and this module acts on none.
+pub type Extended = { instant: OffsetDateTime, zone: Option<ZoneTag>, tags: List<SuffixTag> }
+
+/// The instant and its suffix as RFC 9557 writes them,
+/// `2022-07-08T00:14:07+01:00[Europe/Paris][u-ca=gregory]`.
+pub fn rfc9557(e: Extended) -> String =
+  rfc3339(e.instant)
+    ++ (match e.zone { Some(zone) -> bracketed(zone.critical, zone.name), None -> "" })
+    ++ fold(e.tags, "", |written: String, tag: SuffixTag|
+      written ++ bracketed(tag.critical, tag.key ++ "=" ++ tag.value))
+
+/// The instant and suffix an RFC 9557 text names: an RFC 3339 `date-time`, then a zone in brackets
+/// or none, then any number of `key=value` tags in brackets. Whether a zone agrees with the offset
+/// is not judged here.
+pub fn parse_rfc9557(text: String) -> Option<Extended> = {
+  let cs = scanned(text);
+  match read_rfc3339(cs) {
+    Err(_) -> None,
+    Ok(read) ->
+      suffixed(
+        string_chars(text),
+        cs,
+        read.at,
+        { instant: read.value, zone: None, tags: [] },
+        array_len(cs),
+      ),
+  }
+}
+
+fn bracketed(critical: Bool, inside: String) -> String =
+  "[" ++ (if critical { "!" } else { "" }) ++ inside ++ "]"
+
+/// Each tag takes at least a character, so the characters left bound the tags: `left`.
+fn suffixed(
+  chars: List<Char>,
+  cs: Array<Int>,
+  at: Int,
+  so_far: Extended,
+  left: Int,
+) -> Option<Extended> =
+  if at == array_len(cs) { Some(so_far) }
+  else if left <= 0 || code_at(cs, at) != 91 { None } else {
+    let critical = code_at(cs, at + 1) == 33;
+    let from = if critical { at + 2 } else { at + 1 };
+    let close = first_of(cs, from, 93);
+    let equals = first_of(cs, from, 61);
+    if close < 0 { None } else if equals >= 0 && equals < close {
+      if is_suffix_key(cs, from, equals) && is_suffix_values(cs, equals + 1, close) {
+        suffixed(
+          chars,
+          cs,
+          close + 1,
+          {
+            ..so_far,
+            tags: push(so_far.tags, {
+              key: cut(chars, from, equals),
+              value: cut(chars, equals + 1, close),
+              critical: critical,
+            }),
+          },
+          left - 1,
+        )
+      } else { None }
+    } else if so_far.zone == None && so_far.tags == [] && is_zone(cs, from, close) {
+      suffixed(
+        chars,
+        cs,
+        close + 1,
+        { ..so_far, zone: Some({ name: cut(chars, from, close), critical: critical }) },
+        left - 1,
+      )
+    } else { None }
+  }
+
+fn cut(chars: List<Char>, from: Int, to: Int) -> String =
+  string_of_chars(take(drop(chars, from), to - from))
+
+/// Where `code` first stands at or after `at`, or `-1`.
+fn first_of(cs: Array<Int>, at: Int, code: Int) -> Int =
+  match array_at(cs, at) {
+    None -> -1,
+    Some(c) -> if c == code { at } else { first_of(cs, at + 1, code) },
+  }
+
+fn every(cs: Array<Int>, from: Int, to: Int, ok: (Int) -> Bool) -> Bool =
+  fold(range(from, to), true, |so_far: Bool, i: Int| so_far && ok(code_at(cs, i)))
+
+/// Whether the character is an ASCII letter: one whose lower case is `a` to `z`.
+fn is_alpha(c: Int) -> Bool = {
+  let lowered = c | 32;
+  lowered >= 97 && lowered <= 122
+}
+
+/// A lower-case letter or `_`, then any of those, digits and `-`.
+fn is_suffix_key(cs: Array<Int>, from: Int, to: Int) -> Bool = {
+  let initial = |c: Int| (c >= 97 && c <= 122) || c == 95;
+  from < to && initial(code_at(cs, from))
+    && every(cs, from, to, |c: Int| initial(c) || is_digit(c) || c == 45)
+}
+
+/// Runs of letters and digits with one `-` between each.
+fn is_suffix_values(cs: Array<Int>, from: Int, to: Int) -> Bool =
+  from < to && code_at(cs, from) != 45 && code_at(cs, to - 1) != 45
+    && every(cs, from, to, |c: Int| is_alpha(c) || is_digit(c) || c == 45)
+    && fold(range(from, to - 1), true, |so_far: Bool, i: Int|
+      so_far && !(code_at(cs, i) == 45 && code_at(cs, i + 1) == 45))
+
+fn is_zone(cs: Array<Int>, from: Int, to: Int) -> Bool = {
+  let first = code_at(cs, from);
+  if first == 43 || first == 45 {
+    match read_numeric_offset(cs, from) { Ok(read) -> read.at == to, Err(_) -> false }
+  } else { from < to && is_zone_name(cs, from, to) }
+}
+
+/// Parts between `/`, each starting with a letter, `.` or `_`, going on with those, digits, `-`
+/// and `+`, and none of them `.` or `..`.
+fn is_zone_name(cs: Array<Int>, from: Int, to: Int) -> Bool =
+  fold(range(from, to), true, |so_far: Bool, i: Int| {
+    let c = code_at(cs, i);
+    let starts = i == from || code_at(cs, i - 1) == 47;
+    let ends = i + 1 == to || code_at(cs, i + 1) == 47;
+    let initial = is_alpha(c) || c == 46 || c == 95;
+    so_far
+      && (if c == 47 { !starts && !ends }
+      else if starts { initial && !(c == 46 && (ends || is_dots_part(cs, i, to))) }
+      else { initial || is_digit(c) || c == 45 || c == 43 })
+  })
+
+fn is_dots_part(cs: Array<Int>, at: Int, to: Int) -> Bool =
+  code_at(cs, at + 1) == 46 && (at + 2 == to || code_at(cs, at + 2) == 47)
+
+// --- Reading ----------------------------------------------------------------
+
+type Read<a> = { value: a, at: Int }
+
+/// A time as it was written, and whether its second was written `60`.
+type Clock = { time: Time, leap: Bool }
+
+fn scanned(text: String) -> Array<Int> = array_of_list(map(string_chars(text), int_of_char))
+
+/// The character at `at`, or `-1` past the end.
+fn code_at(cs: Array<Int>, at: Int) -> Int = match array_at(cs, at) { Some(c) -> c, None -> -1 }
+
+fn refused<a>(message: String, offset: Int) -> Result<a, Refusal> =
+  Err({ message: message, offset: offset })
+
+fn ended(cs: Array<Int>, at: Int) -> Result<Int, Refusal> =
+  if at == array_len(cs) { Ok(at) } else { refused("nothing follows here", at) }
+
+fn one(cs: Array<Int>, at: Int, code: Int, message: String) -> Result<Int, Refusal> =
+  one_of(cs, at, code, code, message)
+
+fn one_of(cs: Array<Int>, at: Int, a: Int, b: Int, message: String) -> Result<Int, Refusal> =
+  if code_at(cs, at) == a || code_at(cs, at) == b { Ok(at + 1) } else { refused(message, at) }
+
+/// Where the digits from `at` end.
+fn digits_end(cs: Array<Int>, at: Int) -> Int =
+  match array_at(cs, at) {
+    Some(c) -> if is_digit(c) { digits_end(cs, at + 1) } else { at },
+    None -> at,
+  }
+
+/// The number `count` digits from `at` write, where there are that many.
+fn number_at(cs: Array<Int>, at: Int, count: Int) -> Option<Int> =
+  if digits_end(cs, at) < at + count { None }
+  else { Some(fold(range(at, at + count), 0, |n: Int, i: Int| n * 10 + code_at(cs, i) - 48)) }
+
+fn digits(cs: Array<Int>, at: Int, count: Int, message: String) -> Result<Int, Refusal> =
+  match number_at(cs, at, count) { Some(n) -> Ok(n), None -> refused(message, digits_end(cs, at)) }
+
+fn read_date(cs: Array<Int>, at: Int) -> Result<Read<Date>, Refusal> = {
+  let year = digits(cs, at, 4, "a year is four digits")?;
+  let _ = one(cs, at + 4, 45, "a `-` goes here")?;
+  let month = digits(cs, at + 5, 2, "a month is two digits")?;
+  let _ = one(cs, at + 7, 45, "a `-` goes here")?;
+  let day = digits(cs, at + 8, 2, "a day is two digits")?;
+  if month < 1 || month > 12 { refused("a month is 01 to 12", at + 5) } else {
+    match of(year, month, day) {
+      Some(d) -> Ok({ value: d, at: at + 10 }),
+      None ->
+        refused(
+          month_name(month_at(month)) ++ " " ++ numeral(year, 4) ++ " has days 01 to "
+            ++ int_to_string(month_length(year, month)),
+          at + 8,
+        ),
+    }
+  }
+}
+
+fn read_time(cs: Array<Int>, at: Int) -> Result<Read<Clock>, Refusal> = {
+  let clock = read_clock(cs, at)?;
+  let fraction = read_fraction(cs, at + 8)?;
+  Ok({
+    value: { time: Time(nanos_of_day(clock.time) + fraction.value), leap: clock.leap },
+    at: fraction.at,
+  })
+}
+
+/// `hh:mm:ss`, a second of `60` read as `59` and said to have been one.
+fn read_clock(cs: Array<Int>, at: Int) -> Result<Clock, Refusal> = {
+  let hour = digits(cs, at, 2, "an hour is two digits")?;
+  let _ = one(cs, at + 2, 58, "a `:` goes here")?;
+  let minute = digits(cs, at + 3, 2, "a minute is two digits")?;
+  let _ = one(cs, at + 5, 58, "a `:` goes here")?;
+  let second = digits(cs, at + 6, 2, "a second is two digits")?;
+  clock_of(hour, minute, second, at)
+}
+
+fn clock_of(hour: Int, minute: Int, second: Int, at: Int) -> Result<Clock, Refusal> =
+  if hour > 23 { refused("an hour is 00 to 23", at) }
+  else if minute > 59 { refused("a minute is 00 to 59", at + 3) }
+  else if second > 60 { refused("a second is 00 to 59", at + 6) } else {
+    Ok({
+      time: Time(((hour * 60 + minute) * 60 + min(second, 59)) * 1000000000),
+      leap: second == 60,
+    })
+  }
+
+fn read_fraction(cs: Array<Int>, at: Int) -> Result<Read<Int>, Refusal> =
+  if code_at(cs, at) != 46 { Ok({ value: 0, at: at }) } else {
+    let end = digits_end(cs, at + 1);
+    let count = end - at - 1;
+    if count == 0 { refused("a fraction has a digit", end) }
+    else if count > 9 { refused("a fraction is nine digits at most", at + 10) } else {
+      match number_at(cs, at + 1, count) {
+        Some(n) -> Ok({ value: n * pow(10, 9 - count), at: end }),
+        None -> refused("a fraction has a digit", end),
+      }
+    }
+  }
+
+fn no_leap(clock: Clock, at: Int) -> Result<Time, Refusal> =
+  if clock.leap { refused("a second is 00 to 59", at) } else { Ok(clock.time) }
+
+fn read_offset(cs: Array<Int>, at: Int) -> Result<Read<Int>, Refusal> =
+  if code_at(cs, at) == 90 || code_at(cs, at) == 122 { Ok({ value: 0, at: at + 1 }) }
+  else { read_numeric_offset(cs, at) }
+
+/// A sign and `hh:mm`, as minutes east.
+fn read_numeric_offset(cs: Array<Int>, at: Int) -> Result<Read<Int>, Refusal> = {
+  let _ = one_of(cs, at, 43, 45, "an offset is `Z`, or `+` or `-` and hh:mm")?;
+  let hours = digits(cs, at + 1, 2, "an offset's hours are two digits")?;
+  let _ = one(cs, at + 3, 58, "a `:` goes here")?;
+  let minutes = digits(cs, at + 4, 2, "an offset's minutes are two digits")?;
+  if hours > 23 { refused("an offset's hours are 00 to 23", at + 1) }
+  else if minutes > 59 { refused("an offset's minutes are 00 to 59", at + 4) } else {
+    let east = hours * 60 + minutes;
+    Ok({ value: if code_at(cs, at) == 45 { -east } else { east }, at: at + 6 })
+  }
+}
+
+fn read_rfc3339(cs: Array<Int>) -> Result<Read<OffsetDateTime>, Refusal> = {
+  let date = read_date(cs, 0)?;
+  let _ = one_of(cs, 10, 84, 116, "a `T` goes here")?;
+  let clock = read_time(cs, 11)?;
+  let offset = read_offset(cs, clock.at)?;
+  let instant = instant_of(date.value, clock.value, offset.value, 17)?;
+  Ok({ value: instant, at: offset.at })
+}
+
+/// The instant a date, a clock's reading and an offset name. A second written `60` stands only
+/// where UTC's clock can show one, and `seconds_at` is where it was written.
+fn instant_of(
+  date: Date,
+  clock: Clock,
+  minutes: Int,
+  seconds_at: Int,
+) -> Result<OffsetDateTime, Refusal> =
+  match at_offset(DateTime(date, clock.time), minutes) {
+    None -> refused("in UTC this is outside the years 0000 to 9999", 0),
+    Some(o) -> if clock.leap && !ends_utc_month(o) {
+      refused("a second of 60 is the last of a UTC month, and no other", seconds_at)
+    } else { Ok(o) },
+  }
+
+fn ends_utc_month(o: OffsetDateTime) -> Bool = {
+  let universal = local(in_utc(o));
+  let time = time_of(universal);
+  hour(time) == 23 && minute(time) == 59 && end_of_month(date_of(universal)) == date_of(universal)
+}
+
+// --- Writing ----------------------------------------------------------------
+
+fn numeral(n: Int, width: Int) -> String = pad_left(int_to_string(n), width, "0")
+
+/// `n` in `width` digits, less the zeros it ends with.
+fn shortest(n: Int, width: Int) -> String =
+  if width > 1 && n % 10 == 0 { shortest(n / 10, width - 1) } else { numeral(n, width) }
+
+/// `+hh` and `mm` with `between` between them.
+fn offset_text(minutes: Int, between: String) -> String = {
+  let east = if minutes < 0 { -minutes } else { minutes };
+  (if minutes < 0 { "-" } else { "+" }) ++ numeral(east / 60, 2) ++ between ++ numeral(east % 60, 2)
+}
+
+/// The first three letters of a name, which is how every format here shortens one.
+fn abbreviated(name: String) -> String = string_of_chars(take(string_chars(name), 3))
+
+/// The month's name as the RFCs shorten it, `Jan` to `Dec`.
+pub fn month_abbreviation(m: Month) -> String = abbreviated(month_name(m))
+
+/// The weekday's name as the RFCs shorten it, `Mon` to `Sun`.
+pub fn weekday_abbreviation(day: Weekday) -> String = abbreviated(weekday_name(day))
+
+/// Whether `word` stands at `at`, letter for letter or, with `any_case`, in either case.
+fn word_at(cs: Array<Int>, at: Int, word: String, any_case: Bool) -> Bool =
+  fold(string_chars(word), at, |i: Int, c: Char|
+      if i >= 0 && same_letter(code_at(cs, i), int_of_char(c), any_case) { i + 1 } else { -1 })
+    >= 0
+
+/// Whether two characters are one, or with `any_case` one letter in either case.
+fn same_letter(a: Int, b: Int, any_case: Bool) -> Bool =
+  a == b || (any_case && is_alpha(a) && a | 32 == b | 32)
+
+/// Which of `names` stands at `at`, counted from 1.
+fn named(cs: Array<Int>, at: Int, names: List<String>, any_case: Bool) -> Option<Read<Int>> =
+  fold(range(0, len(names)), None, |found: Option<Read<Int>>, i: Int|
+    match found {
+      Some(read) -> Some(read),
+      None -> match list_at(names, i) {
+        Some(name) -> if word_at(cs, at, name, any_case) {
+          Some({ value: i + 1, at: at + string_len(name) })
+        } else { None },
+        None -> None,
+      },
+    })
+
+fn month_names() -> List<String> = map(range(1, 13), |n: Int| month_name(month_at(n)))
+
+fn weekday_names() -> List<String> = map(range(0, 7), |n: Int| weekday_name(weekday_at(n)))
+
+fn short_month(cs: Array<Int>, at: Int, any_case: Bool) -> Result<Read<Int>, Refusal> =
+  match named(cs, at, map(month_names(), abbreviated), any_case) {
+    Some(read) -> Ok(read),
+    None -> refused("a month is `Jan` to `Dec`", at),
+  }
+
+fn short_weekday(cs: Array<Int>, at: Int, any_case: Bool) -> Result<Read<Int>, Refusal> =
+  match named(cs, at, map(weekday_names(), abbreviated), any_case) {
+    Some(read) -> Ok(read),
+    None -> refused("a weekday is `Mon` to `Sun`", at),
+  }
+
+fn words(cs: Array<Int>, at: Int, word: String) -> Result<Int, Refusal> =
+  if word_at(cs, at, word, false) { Ok(at + string_len(word)) }
+  else { refused("`" ++ word ++ "` goes here", at) }
+
+/// The instant of a date's numbers, a clock's reading and an offset, where the weekday written
+/// beside them, if one was, is the date's.
+fn dated(
+  year: Int,
+  month: Int,
+  day: Int,
+  clock: Clock,
+  minutes: Int,
+  written_day: Option<Int>,
+) -> Result<OffsetDateTime, Refusal> =
+  match of(year, month, day) {
+    None -> refused("no such day", 0),
+    Some(d) -> if written_day != None && written_day != Some(weekday_number(weekday(d))) {
+      refused("the date is another day of the week", 0)
+    } else { instant_of(d, clock, minutes, 0) },
+  }
+
+// --- HTTP -------------------------------------------------------------------
+
+/// The instant as an HTTP field carries it, RFC 9110's `IMF-fixdate`: in GMT, to the second,
+/// `Sun, 06 Nov 1994 08:49:37 GMT`. Anything finer than a second is dropped.
+pub fn http_date(o: OffsetDateTime) -> String = {
+  let universal = local(in_utc(o));
+  let date = date_of(universal);
+  weekday_abbreviation(weekday(date)) ++ ", " ++ numeral(day(date), 2) ++ " "
+    ++ month_abbreviation(month(date))
+    ++ " "
+    ++ numeral(year(date), 4)
+    ++ " "
+    ++ time_text(truncate_time(time_of(universal), Seconds))
+    ++ " GMT"
+}
+
+/// The instant an RFC 9110 `HTTP-date` names, in any of its three forms, as UTC reads it:
+/// `Sun, 06 Nov 1994 08:49:37 GMT`, the obsolete `Sunday, 06-Nov-94 08:49:37 GMT` and `asctime`'s
+/// `Sun Nov  6 08:49:37 1994`. Each is read letter for letter, and its weekday is the date's.
+///
+/// The second form writes two digits of a year, which the RFC reads against the present: `now`
+/// says when that is, and a date that would be more than fifty years after it is the one a
+/// century earlier.
+pub fn parse_http_date(text: String, now: Instant) -> Option<OffsetDateTime> = {
+  let cs = scanned(text);
+  match read_fixdate(cs) {
+    Ok(o) -> Some(o),
+    Err(_) -> match read_rfc850(cs, of_instant(now)) {
+      Ok(o) -> Some(o),
+      Err(_) -> result_ok(read_asctime(cs)),
+    },
+  }
+}
+
+fn read_fixdate(cs: Array<Int>) -> Result<OffsetDateTime, Refusal> = {
+  let weekday = short_weekday(cs, 0, false)?;
+  let _ = words(cs, 3, ", ")?;
+  let day = digits(cs, 5, 2, "a day is two digits")?;
+  let _ = one(cs, 7, 32, "a space goes here")?;
+  let month = short_month(cs, 8, false)?;
+  let _ = one(cs, 11, 32, "a space goes here")?;
+  let year = digits(cs, 12, 4, "a year is four digits")?;
+  let _ = one(cs, 16, 32, "a space goes here")?;
+  let clock = read_clock(cs, 17)?;
+  let _ = words(cs, 25, " GMT")?;
+  let _ = ended(cs, 29)?;
+  dated(year, month.value, day, clock, 0, Some(weekday.value))
+}
+
+fn long_weekday(cs: Array<Int>) -> Result<Read<Int>, Refusal> =
+  match named(cs, 0, weekday_names(), false) {
+    Some(read) -> Ok(read),
+    None -> refused("a weekday is `Monday` to `Sunday`", 0),
+  }
+
+fn read_rfc850(cs: Array<Int>, now: OffsetDateTime) -> Result<OffsetDateTime, Refusal> = {
+  let weekday = long_weekday(cs)?;
+  let at = words(cs, weekday.at, ", ")?;
+  let day = digits(cs, at, 2, "a day is two digits")?;
+  let _ = one(cs, at + 2, 45, "a `-` goes here")?;
+  let month = short_month(cs, at + 3, false)?;
+  let _ = one(cs, at + 6, 45, "a `-` goes here")?;
+  let year = digits(cs, at + 7, 2, "a year is two digits here")?;
+  let _ = one(cs, at + 9, 32, "a space goes here")?;
+  let clock = read_clock(cs, at + 10)?;
+  let _ = words(cs, at + 18, " GMT")?;
+  let _ = ended(cs, at + 22)?;
+  dated(
+    century_of(year, month.value, day, clock, now),
+    month.value,
+    day,
+    clock,
+    0,
+    Some(weekday.value),
+  )
+}
+
+/// The year two digits name beside `now`: in its century, unless that is more than fifty years
+/// after it, and then a century earlier.
+fn century_of(two: Int, month: Int, day: Int, clock: Clock, now: OffsetDateTime) -> Int = {
+  let present = local(now);
+  let today = parts(date_of(present));
+  let year = today.year / 100 * 100 + two;
+  let limit = (today.year + 50, today.month, today.day, nanos_of_day(time_of(present)));
+  if compare((year, month, day, nanos_of_day(clock.time)), limit) == Greater { year - 100 }
+  else { year }
+}
+
+/// Two digits, or a space and one.
+fn padded_day(cs: Array<Int>) -> Result<Int, Refusal> =
+  match number_at(cs, 8, 2) {
+    Some(n) -> Ok(n),
+    None -> if code_at(cs, 8) == 32 { digits(cs, 9, 1, "a day goes here") }
+    else { refused("a day goes here", 8) },
+  }
+
+fn read_asctime(cs: Array<Int>) -> Result<OffsetDateTime, Refusal> = {
+  let weekday = short_weekday(cs, 0, false)?;
+  let _ = one(cs, 3, 32, "a space goes here")?;
+  let month = short_month(cs, 4, false)?;
+  let _ = one(cs, 7, 32, "a space goes here")?;
+  let day = padded_day(cs)?;
+  let _ = one(cs, 10, 32, "a space goes here")?;
+  let clock = read_clock(cs, 11)?;
+  let _ = one(cs, 19, 32, "a space goes here")?;
+  let year = digits(cs, 20, 4, "a year is four digits")?;
+  let _ = ended(cs, 24)?;
+  dated(year, month.value, day, clock, 0, Some(weekday.value))
+}
+
+// --- Internet messages ------------------------------------------------------
+
+/// The instant as an Internet message carries it, RFC 5322's `date-time`: the clock's reading
+/// and its offset, to the second, `Fri, 21 Nov 1997 09:55:06 -0600`.
+pub fn rfc5322(o: OffsetDateTime) -> String = {
+  let reading = local(o);
+  let date = date_of(reading);
+  weekday_abbreviation(weekday(date)) ++ ", " ++ numeral(day(date), 2) ++ " "
+    ++ month_abbreviation(month(date))
+    ++ " "
+    ++ numeral(year(date), 4)
+    ++ " "
+    ++ time_text(truncate_time(time_of(reading), Seconds))
+    ++ " "
+    ++ offset_text(offset_minutes(o), "")
+}
+
+/// The instant an RFC 5322 `date-time` names, its obsolete forms among them: a weekday or none, a
+/// day of one or two digits, names in either case, a year of two digits (`00` to `49` are the
+/// 2000s, the rest the 1900s) or of three (counted from 1900), seconds or none, and white space
+/// and comments in parentheses between any two of them. A zone is a sign and `hhmm`, or a name:
+/// `UT` and `GMT`, the eight North American ones at the offsets the RFC gives them, and any other
+/// run of letters, which it says to read as UTC. A weekday that is written is the date's.
+pub fn parse_rfc5322(text: String) -> Option<OffsetDateTime> =
+  result_ok(read_rfc5322(scanned(text)))
+
+fn read_rfc5322(cs: Array<Int>) -> Result<OffsetDateTime, Refusal> = {
+  let weekday = leading_weekday(cs, blank(cs, 0))?;
+  let day_at = blank(cs, weekday.at);
+  let day_end = digits_end(cs, day_at);
+  let day = digits(cs, day_at, clamp(day_end - day_at, 1, 2), "a day goes here")?;
+  let month = short_month(cs, blank(cs, min(day_end, day_at + 2)), true)?;
+  let year = message_year(cs, blank(cs, month.at))?;
+  let hour_at = blank(cs, year.at);
+  let hour = digits(cs, hour_at, 2, "an hour is two digits")?;
+  let colon_end = one(cs, blank(cs, hour_at + 2), 58, "a `:` goes here")?;
+  let minute_at = blank(cs, colon_end);
+  let minute = digits(cs, minute_at, 2, "a minute is two digits")?;
+  let second = message_second(cs, blank(cs, minute_at + 2))?;
+  let clock = clock_of(hour, minute, second.value, hour_at)?;
+  let zone = message_zone(cs, blank(cs, second.at))?;
+  let _ = ended(cs, blank(cs, zone.at))?;
+  dated(year.value, month.value, day, clock, zone.value, weekday.value)
+}
+
+/// Where the white space and comments from `at` end: spaces, tabs, a line break before either,
+/// and parentheses that nest, a `\` in one taking the character after it. A comment nothing
+/// closes ends nowhere, which is past the end.
+fn blank(cs: Array<Int>, at: Int) -> Int = blank_end(cs, at, 0)
+
+fn blank_end(cs: Array<Int>, at: Int, depth: Int) -> Int =
+  match array_at(cs, at) {
+    None -> if depth == 0 { at } else { at + 1 },
+    Some(c) -> if depth > 0 {
+      if c == 92 { blank_end(cs, at + 2, depth) }
+      else if c == 40 { blank_end(cs, at + 1, depth + 1) }
+      else if c == 41 { blank_end(cs, at + 1, depth - 1) }
+      else { blank_end(cs, at + 1, depth) }
+    } else if c == 32 || c == 9 { blank_end(cs, at + 1, 0) }
+    else if c == 13 && code_at(cs, at + 1) == 10
+        && (code_at(cs, at + 2) == 32 || code_at(cs, at + 2) == 9) { blank_end(cs, at + 3, 0) }
+    else if c == 40 { blank_end(cs, at + 1, 1) }
+    else { at },
+  }
+
+fn leading_weekday(cs: Array<Int>, at: Int) -> Result<Read<Option<Int>>, Refusal> =
+  if !is_alpha(code_at(cs, at)) { Ok({ value: None, at: at }) } else {
+    let name = short_weekday(cs, at, true)?;
+    let after = one(cs, blank(cs, name.at), 44, "a `,` goes here")?;
+    Ok({ value: Some(name.value), at: after })
+  }
+
+fn message_year(cs: Array<Int>, at: Int) -> Result<Read<Int>, Refusal> = {
+  let end = digits_end(cs, at);
+  let count = end - at;
+  if count < 2 { refused("a year is two digits or more", end) }
+  else if count > 4 { refused("a year is 0000 to 9999", at) } else {
+    let written = digits(cs, at, count, "a year is two digits or more")?;
+    Ok({
+      value: if count == 4 { written }
+      else if count == 2 && written < 50 { written + 2000 }
+      else { written + 1900 },
+      at: end,
+    })
+  }
+}
+
+fn message_second(cs: Array<Int>, at: Int) -> Result<Read<Int>, Refusal> =
+  if code_at(cs, at) != 58 { Ok({ value: 0, at: at }) } else {
+    let second_at = blank(cs, at + 1);
+    let second = digits(cs, second_at, 2, "a second is two digits")?;
+    Ok({ value: second, at: second_at + 2 })
+  }
+
+fn message_zone(cs: Array<Int>, at: Int) -> Result<Read<Int>, Refusal> =
+  if is_alpha(code_at(cs, at)) { Ok(named_zone(cs, at)) } else {
+    let _ = one_of(cs, at, 43, 45, "a zone is a sign and four digits, or a name")?;
+    let hours = digits(cs, at + 1, 2, "a zone is four digits")?;
+    let minutes = digits(cs, at + 3, 2, "a zone is four digits")?;
+    if hours > 23 || minutes > 59 { refused("a zone is under a day, its minutes 00 to 59", at + 1) }
+    else {
+      let east = hours * 60 + minutes;
+      Ok({ value: if code_at(cs, at) == 45 { -east } else { east }, at: at + 5 })
+    }
+  }
+
+fn named_zone(cs: Array<Int>, at: Int) -> Read<Int> = {
+  let end = letters_end(cs, at);
+  let hours = fold(north_american(), 0, |found: Int, zone: { name: String, hours: Int }|
+    if end - at == 3 && word_at(cs, at, zone.name, true) { zone.hours } else { found });
+  { value: hours * 60, at: end }
+}
+
+fn north_american() -> List<{ name: String, hours: Int }> =
+  [
+    { name: "EDT", hours: -4 },
+    { name: "EST", hours: -5 },
+    { name: "CDT", hours: -5 },
+    { name: "CST", hours: -6 },
+    { name: "MDT", hours: -6 },
+    { name: "MST", hours: -7 },
+    { name: "PDT", hours: -7 },
+    { name: "PST", hours: -8 },
+  ]
+
+fn letters_end(cs: Array<Int>, at: Int) -> Int =
+  match array_at(cs, at) {
+    Some(c) -> if is_alpha(c) { letters_end(cs, at + 1) } else { at },
+    None -> at,
+  }
+
+// --- Patterns ---------------------------------------------------------------
+
+/// A `strftime` pattern, read once: what `pattern` answers, and what the formatters and
+/// `parse_with` go by.
+pub type Pattern = new { items: List<Item> }
+
+/// One piece of a pattern: text as it stands, or a field of a date, a time or an offset.
+type Item =
+  | Verbatim(String)
+  | OfDate(DateField, Padding)
+  | OfTime(TimeField, Padding)
+  /// An offset as `+hhmm`, or with `true` as `+hh:mm`.
+  | OfOffset(Bool)
+
+/// A field a date has.
+type DateField =
+  | FullYear
+  | ShortYear
+  | MonthNumber
+  | MonthName
+  | MonthAbbreviation
+  | DayOfMonth
+  | DayOfYear
+  | WeekdayName
+  | WeekdayAbbreviation
+  | WeekdayNumber
+  | WeekdayFromSunday
+  | WeekYear
+  | WeekOfYear
+
+/// A field a time of day has.
+type TimeField =
+  | Hour24
+  | Hour12
+  | Meridiem
+  | MinuteOfHour
+  | SecondOfMinute
+  /// The fraction of the second, in that many digits.
+  | Fraction(Int)
+
+/// How a number narrower than its field is written.
+type Padding = | Zeros | Spaces | Bare
+
+/// What a text read by a pattern said: a date where the pattern names one whole, a time of day
+/// where it names an hour, and an offset where it has one.
+pub type Parsed = { date: Option<Date>, time: Option<Time>, offset: Option<Int> }
+
+/// The pattern a `strftime` text writes, or why it is none and the `%` it stops being one at: what
+/// a tag of patterns is checked by.
+///
+/// A `%` and a letter is a field, and anything else is text. Of a date: `%Y` the year in four
+/// digits and `%y` its last two, `%m` the month, `%d` the day, `%e` the day padded with a space,
+/// `%j` the day of the year, `%B` and `%b` the month's name and its first three letters, `%A`
+/// and `%a` the weekday's, `%u` the weekday from Monday as 1 and `%w` from Sunday as 0, `%G`
+/// and `%V` the ISO 8601 week's year and number. Of a time: `%H` the hour, `%I` and `%p` the hour
+/// of twelve and `AM` or `PM`, `%M` the minute, `%S` the second, `%N` the nanoseconds and `%3N`
+/// or any count from 1 to 9 that many digits of them. Of an offset: `%z` as `+hhmm` and `%:z` as
+/// `+hh:mm`. `%F` is `%Y-%m-%d`, `%T` is `%H:%M:%S`, `%R` is `%H:%M`, and `%%`, `%n` and `%t` are
+/// a percent sign, a line break and a tab. A `-` after the `%` of a number writes it with no
+/// padding and a `_` pads it with spaces.
+///
+/// Whatever depends on a locale or a zone's name (`%c`, `%x`, `%X`, `%Z`) is no pattern here.
+pub fn pattern(text: String) -> Result<Pattern, Refusal> = {
+  let start: Compiling = { at: 0, items: [], run: [], open: None, refusal: None };
+  let end = fold(string_chars(text), start, compiled);
+  match end.refusal {
+    Some(refusal) -> Err(refusal),
+    None -> match end.open {
+      Some(open) -> refused("a `%` wants a letter after it", open.at),
+      None -> Ok({ items: closed_run(end) }),
+    },
+  }
+}
+
+/// A directive being read: where its `%` stood and the flags written so far.
+type Directive = { at: Int, padding: Option<Padding>, width: Option<Int>, colon: Bool }
+
+type Compiling = {
+  at: Int,
+  items: List<Item>,
+  run: List<Char>,
+  open: Option<Directive>,
+  refusal: Option<Refusal>,
+}
+
+fn closed_run(c: Compiling) -> List<Item> =
+  if c.run == [] { c.items } else { push(c.items, Verbatim(string_of_chars(c.run))) }
+
+fn compiled(c: Compiling, letter: Char) -> Compiling = {
+  let next = { ..c, at: c.at + 1 };
+  if c.refusal != None { c } else {
+    match c.open {
+      None -> if letter == '%' {
+        { ..next, open: Some({ at: c.at, padding: None, width: None, colon: false }) }
+      } else { { ..next, run: push(c.run, letter) } },
+      Some(open) -> match flagged(open, letter) {
+        Some(more) -> { ..next, open: Some(more) },
+        None -> match items_of(open, string_of_chars([letter])) {
+          Ok(items) -> { ..next, open: None, run: [], items: concat(closed_run(c), items) },
+          Err(message) -> { ..next, refusal: Some({ message: message, offset: open.at }) },
+        },
+      },
+    }
+  }
+}
+
+/// The directive with one more flag, where the letter is one it can still take.
+fn flagged(open: Directive, letter: Char) -> Option<Directive> = {
+  let bare = open.padding == None && open.width == None && !open.colon;
+  if letter == '-' && bare { Some({ ..open, padding: Some(Bare) }) }
+  else if letter == '_' && bare { Some({ ..open, padding: Some(Spaces) }) }
+  else if letter == ':' && bare { Some({ ..open, colon: true }) }
+  else if letter >= '1' && letter <= '9' && bare {
+    Some({ ..open, width: Some(int_of_char(letter) - 48) })
+  } else { None }
+}
+
+fn items_of(open: Directive, letter: String) -> Result<List<Item>, String> = {
+  let plain = open.padding == None && open.width == None && !open.colon;
+  let padding = match open.padding { Some(chosen) -> chosen, None -> Zeros };
+  match numbered_field(letter) {
+    Some(item) -> if open.width == None && !open.colon { Ok([item(padding)]) }
+    else { Err("`%" ++ letter ++ "` takes `-` or `_` and nothing else") },
+    None -> if letter == "N" {
+      if open.padding == None && !open.colon {
+        Ok([OfTime(Fraction(match open.width { Some(width) -> width, None -> 9 }), Zeros)])
+      } else { Err("`%N` takes a count of digits from 1 to 9 and nothing else") }
+    } else if letter == "z" {
+      if open.padding == None && open.width == None { Ok([OfOffset(open.colon)]) }
+      else { Err("`%z` takes `:` and nothing else") }
+    } else {
+      match unflagged(letter) {
+        Ok(items) -> if plain { Ok(items) } else { Err("`%" ++ letter ++ "` takes no flag") },
+        Err(message) -> Err(message),
+      }
+    },
+  }
+}
+
+/// The fields written as numbers, each waiting for its padding.
+fn numbered_field(letter: String) -> Option<(Padding) -> Item> =
+  match letter {
+    "Y" -> Some(|p: Padding| OfDate(FullYear, p)),
+    "y" -> Some(|p: Padding| OfDate(ShortYear, p)),
+    "m" -> Some(|p: Padding| OfDate(MonthNumber, p)),
+    "d" -> Some(|p: Padding| OfDate(DayOfMonth, p)),
+    "j" -> Some(|p: Padding| OfDate(DayOfYear, p)),
+    "G" -> Some(|p: Padding| OfDate(WeekYear, p)),
+    "V" -> Some(|p: Padding| OfDate(WeekOfYear, p)),
+    "H" -> Some(|p: Padding| OfTime(Hour24, p)),
+    "I" -> Some(|p: Padding| OfTime(Hour12, p)),
+    "M" -> Some(|p: Padding| OfTime(MinuteOfHour, p)),
+    "S" -> Some(|p: Padding| OfTime(SecondOfMinute, p)),
+    _ -> None,
+  }
+
+fn unflagged(letter: String) -> Result<List<Item>, String> =
+  match letter {
+    "e" -> Ok([OfDate(DayOfMonth, Spaces)]),
+    "B" -> Ok([OfDate(MonthName, Bare)]),
+    "b" -> Ok([OfDate(MonthAbbreviation, Bare)]),
+    "A" -> Ok([OfDate(WeekdayName, Bare)]),
+    "a" -> Ok([OfDate(WeekdayAbbreviation, Bare)]),
+    "u" -> Ok([OfDate(WeekdayNumber, Bare)]),
+    "w" -> Ok([OfDate(WeekdayFromSunday, Bare)]),
+    "p" -> Ok([OfTime(Meridiem, Bare)]),
+    "F" ->
+      Ok([
+        OfDate(FullYear, Zeros),
+        Verbatim("-"),
+        OfDate(MonthNumber, Zeros),
+        Verbatim("-"),
+        OfDate(DayOfMonth, Zeros),
+      ]),
+    "T" ->
+      Ok([
+        OfTime(Hour24, Zeros),
+        Verbatim(":"),
+        OfTime(MinuteOfHour, Zeros),
+        Verbatim(":"),
+        OfTime(SecondOfMinute, Zeros),
+      ]),
+    "R" -> Ok([OfTime(Hour24, Zeros), Verbatim(":"), OfTime(MinuteOfHour, Zeros)]),
+    "%" -> Ok([Verbatim("%")]),
+    "n" -> Ok([Verbatim("\n")]),
+    "t" -> Ok([Verbatim("\t")]),
+    "c" | "x" | "X" -> Err("`%" ++ letter ++ "` depends on a locale, and there is none here"),
+    "Z" -> Err("`%Z` is a zone's name, and an offset has none: `%z` writes the offset"),
+    "f" -> Err("`%f` is no directive: `%N` is the nanoseconds and `%6N` six digits of them"),
+    _ -> Err("`%" ++ letter ++ "` is no directive"),
+  }
+
+/// The instant written by the pattern, every field read off the clock at its offset.
+pub fn format(p: Pattern, o: OffsetDateTime) -> String = {
+  let reading = local(o);
+  written(p, {
+    date: Some(date_of(reading)),
+    time: Some(time_of(reading)),
+    offset: Some(offset_minutes(o)),
+  })
+}
+
+/// The date written by the pattern; `None` where the pattern asks for a time or an offset.
+pub fn format_date(p: Pattern, d: Date) -> Option<String> =
+  if needs_only(p, true, false) { Some(written(p, { date: Some(d), time: None, offset: None })) }
+  else { None }
+
+/// The time written by the pattern; `None` where the pattern asks for a date or an offset.
+pub fn format_time(p: Pattern, t: Time) -> Option<String> =
+  if needs_only(p, false, true) { Some(written(p, { date: None, time: Some(t), offset: None })) }
+  else { None }
+
+/// The date-time written by the pattern; `None` where the pattern asks for an offset.
+pub fn format_date_time(p: Pattern, dt: DateTime) -> Option<String> =
+  if needs_only(p, true, true) {
+    Some(written(p, { date: Some(date_of(dt)), time: Some(time_of(dt)), offset: None }))
+  } else { None }
+
+/// Whether the pattern asks for nothing but text and, where allowed, a date's and a time's fields.
+fn needs_only(p: Pattern, date: Bool, time: Bool) -> Bool =
+  fold(p.items, true, |so_far: Bool, item: Item|
+    so_far
+      && (match item {
+        Verbatim(_) -> true,
+        OfDate(_, _) -> date,
+        OfTime(_, _) -> time,
+        OfOffset(_) -> false,
+      }))
+
+fn written(p: Pattern, of: Parsed) -> String =
+  fold(p.items, "", |so_far: String, item: Item|
+    so_far
+      ++ (match item {
+        Verbatim(text) -> text,
+        OfDate(field, padding) -> match of.date {
+          Some(d) -> date_piece(field, padding, d),
+          None -> "",
+        },
+        OfTime(field, padding) -> match of.time {
+          Some(t) -> time_piece(field, padding, t),
+          None -> "",
+        },
+        OfOffset(colon) -> match of.offset {
+          Some(minutes) -> offset_text(minutes, if colon { ":" } else { "" }),
+          None -> "",
+        },
+      }))
+
+fn date_piece(field: DateField, padding: Padding, d: Date) -> String =
+  match field {
+    FullYear -> padded(year(d), 4, padding),
+    ShortYear -> padded(year(d) % 100, 2, padding),
+    MonthNumber -> padded(month_number(month(d)), 2, padding),
+    MonthName -> month_name(month(d)),
+    MonthAbbreviation -> month_abbreviation(month(d)),
+    DayOfMonth -> padded(day(d), 2, padding),
+    DayOfYear -> padded(day_of_year(d), 3, padding),
+    WeekdayName -> weekday_name(weekday(d)),
+    WeekdayAbbreviation -> weekday_abbreviation(weekday(d)),
+    WeekdayNumber -> int_to_string(weekday_number(weekday(d))),
+    WeekdayFromSunday -> int_to_string(weekday_number(weekday(d)) % 7),
+    WeekYear -> padded(week(d).year, 4, padding),
+    WeekOfYear -> padded(week(d).week, 2, padding),
+  }
+
+fn time_piece(field: TimeField, padding: Padding, t: Time) -> String =
+  match field {
+    Hour24 -> padded(hour(t), 2, padding),
+    Hour12 -> padded((hour(t) + 11) % 12 + 1, 2, padding),
+    Meridiem -> if hour(t) < 12 { "AM" } else { "PM" },
+    MinuteOfHour -> padded(minute(t), 2, padding),
+    SecondOfMinute -> padded(second(t), 2, padding),
+    Fraction(count) -> numeral(leading(nanosecond(t), count), count),
+  }
+
+/// The first `count` of a nanosecond count's nine digits.
+fn leading(nanosecond: Int, count: Int) -> Int =
+  match count {
+    1 -> nanosecond / 100000000,
+    2 -> nanosecond / 10000000,
+    3 -> nanosecond / 1000000,
+    4 -> nanosecond / 100000,
+    5 -> nanosecond / 10000,
+    6 -> nanosecond / 1000,
+    7 -> nanosecond / 100,
+    8 -> nanosecond / 10,
+    _ -> nanosecond,
+  }
+
+fn padded(n: Int, width: Int, padding: Padding) -> String =
+  match padding {
+    Zeros -> numeral(n, width),
+    Spaces -> pad_left(int_to_string(n), width, " "),
+    Bare -> int_to_string(n),
+  }
+
+/// What a text the pattern wrote says, read field by field as the pattern orders them: text
+/// letter for letter, a number in as many digits as it was written with (one or more, up to its
+/// width, under `-`), a name as it is spelled here. `%y` is read as POSIX reads it, `69` to `99`
+/// in the 1900s and the rest in the 2000s.
+///
+/// `None` where the text is not the pattern's, where two fields disagree (a weekday that is not
+/// the date's, a day of the year that is not the month's day), where a date's fields are fewer
+/// than name one, or a time's are there with no hour.
+pub fn parse_with(p: Pattern, text: String) -> Option<Parsed> = {
+  let cs = scanned(text);
+  let start: Option<Scanning> = Some({ at: 0, seen: map_new() });
+  match fold(p.items, start, |so_far: Option<Scanning>, item: Item|
+      match so_far { Some(s) -> scanned_item(cs, s, item), None -> None }) {
+    Some(s) -> if s.at == array_len(cs) { settled(s.seen) } else { None },
+    None -> None,
+  }
+}
+
+/// Where a reading of a text stands, and the fields read so far by name.
+type Scanning = { at: Int, seen: Map<String, Int> }
+
+fn scanned_item(cs: Array<Int>, s: Scanning, item: Item) -> Option<Scanning> =
+  match item {
+    Verbatim(text) -> if word_at(cs, s.at, text, false) {
+      Some({ ..s, at: s.at + string_len(text) })
+    } else { None },
+    OfDate(field, padding) -> match field {
+      FullYear -> number_seen(cs, s, "year", 4, padding),
+      ShortYear -> match numbered(cs, s.at, 2, padding) {
+        Some(read) ->
+          seen(
+            s,
+            "year",
+            if read.value >= 69 { read.value + 1900 } else { read.value + 2000 },
+            read.at,
+          ),
+        None -> None,
+      },
+      MonthNumber -> number_seen(cs, s, "month", 2, padding),
+      MonthName -> name_seen(cs, s, "month", month_names()),
+      MonthAbbreviation -> name_seen(cs, s, "month", map(month_names(), abbreviated)),
+      DayOfMonth -> number_seen(cs, s, "day", 2, padding),
+      DayOfYear -> number_seen(cs, s, "day of year", 3, padding),
+      WeekdayName -> name_seen(cs, s, "weekday", weekday_names()),
+      WeekdayAbbreviation -> name_seen(cs, s, "weekday", map(weekday_names(), abbreviated)),
+      WeekdayNumber -> number_seen(cs, s, "weekday", 1, Zeros),
+      WeekdayFromSunday -> match numbered(cs, s.at, 1, Zeros) {
+        Some(read) -> seen(s, "weekday", if read.value == 0 { 7 } else { read.value }, read.at),
+        None -> None,
+      },
+      WeekYear -> number_seen(cs, s, "week year", 4, padding),
+      WeekOfYear -> number_seen(cs, s, "week", 2, padding),
+    },
+    OfTime(field, padding) -> match field {
+      Hour24 -> number_seen(cs, s, "hour", 2, padding),
+      Hour12 -> number_seen(cs, s, "hour of twelve", 2, padding),
+      Meridiem -> name_seen(cs, s, "half", ["AM", "PM"]),
+      MinuteOfHour -> number_seen(cs, s, "minute", 2, padding),
+      SecondOfMinute -> number_seen(cs, s, "second", 2, padding),
+      Fraction(count) -> match number_at(cs, s.at, count) {
+        Some(n) -> seen(s, "nanosecond", n * pow(10, 9 - count), s.at + count),
+        None -> None,
+      },
+    },
+    OfOffset(colon) -> offset_seen(cs, s, colon),
+  }
+
+/// The reading with one more field, where it is the first of its name or says what the first did.
+fn seen(s: Scanning, name: String, value: Int, at: Int) -> Option<Scanning> =
+  match map_get(s.seen, name) {
+    Some(earlier) -> if earlier == value { Some({ ..s, at: at }) } else { None },
+    None -> Some({ at: at, seen: map_insert(s.seen, name, value) }),
+  }
+
+fn number_seen(
+  cs: Array<Int>,
+  s: Scanning,
+  name: String,
+  width: Int,
+  padding: Padding,
+) -> Option<Scanning> =
+  match numbered(cs, s.at, width, padding) {
+    Some(read) -> seen(s, name, read.value, read.at),
+    None -> None,
+  }
+
+fn name_seen(cs: Array<Int>, s: Scanning, name: String, names: List<String>) -> Option<Scanning> =
+  match named(cs, s.at, names, false) {
+    Some(read) -> seen(s, name, read.value, read.at),
+    None -> None,
+  }
+
+fn offset_seen(cs: Array<Int>, s: Scanning, colon: Bool) -> Option<Scanning> = {
+  let minutes_at = if colon { s.at + 4 } else { s.at + 3 };
+  let sign = code_at(cs, s.at);
+  if (sign != 43 && sign != 45) || (colon && code_at(cs, s.at + 3) != 58) { None } else {
+    match number_at(cs, s.at + 1, 2) {
+      None -> None,
+      Some(hours) -> match number_at(cs, minutes_at, 2) {
+        None -> None,
+        Some(minutes) -> if hours > 23 || minutes > 59 { None } else {
+          let east = hours * 60 + minutes;
+          seen(s, "offset", if sign == 45 { -east } else { east }, minutes_at + 2)
+        },
+      },
+    }
+  }
+}
+
+/// A number of `width` digits as its padding writes it: all of them, spaces and then the rest, or
+/// as many as stand there.
+fn numbered(cs: Array<Int>, at: Int, width: Int, padding: Padding) -> Option<Read<Int>> =
+  match padding {
+    Zeros -> match number_at(cs, at, width) {
+      Some(n) -> Some({ value: n, at: at + width }),
+      None -> None,
+    },
+    Spaces -> {
+      let from = spaces_end(cs, at, at + width - 1);
+      match number_at(cs, from, at + width - from) {
+        Some(n) -> if digits_end(cs, from) >= at + width { Some({ value: n, at: at + width }) }
+        else { None },
+        None -> None,
+      }
+    },
+    Bare -> {
+      let count = min(digits_end(cs, at) - at, width);
+      match number_at(cs, at, count) {
+        Some(n) -> if count > 0 { Some({ value: n, at: at + count }) } else { None },
+        None -> None,
+      }
+    },
+  }
+
+/// Where the spaces from `at` end, looking no further than `limit`.
+fn spaces_end(cs: Array<Int>, at: Int, limit: Int) -> Int =
+  match array_at(cs, at) {
+    Some(c) -> if c == 32 && at < limit { spaces_end(cs, at + 1, limit) } else { at },
+    None -> at,
+  }
+
+fn settled(fields: Map<String, Int>) -> Option<Parsed> =
+  match settled_date(fields) {
+    None -> None,
+    Some(date) -> match settled_time(fields) {
+      None -> None,
+      Some(time) -> Some({ date: date, time: time, offset: map_get(fields, "offset") }),
+    },
+  }
+
+/// The date the fields name, `Some(None)` where they name none and hold nothing of one.
+fn settled_date(fields: Map<String, Int>) -> Option<Option<Date>> = {
+  let year = map_get(fields, "year");
+  let month = map_get(fields, "month");
+  let day = map_get(fields, "day");
+  let ordinal = map_get(fields, "day of year");
+  let named_day = map_get(fields, "weekday");
+  let week_year = map_get(fields, "week year");
+  let in_week = map_get(fields, "week");
+  let by_month: List<Option<Date>> = if month == None && day == None { [] }
+  else { [whole_date(year, month, day)] };
+  let by_ordinal: List<Option<Date>> = match ordinal {
+    None -> [],
+    Some(n) -> [match year { Some(y) -> of_ordinal(y, n), None -> None }],
+  };
+  let by_week: List<Option<Date>> = if week_year == None && in_week == None { [] }
+  else { [week_date(week_year, in_week, named_day)] };
+  match concat(by_month, concat(by_ordinal, by_week)) {
+    [] -> if year == None && named_day == None { Some(None) } else { None },
+    [first, ..rest] -> match first {
+      None -> None,
+      Some(d) -> if fold(rest, true, |same: Bool, other: Option<Date>| same && other == first)
+          && (named_day == None || named_day == Some(weekday_number(weekday(d)))) { Some(Some(d)) }
+      else { None },
+    },
+  }
+}
+
+fn whole_date(year: Option<Int>, month: Option<Int>, day: Option<Int>) -> Option<Date> =
+  match ((year, month, day)) { (Some(y), Some(m), Some(d)) -> of(y, m, d), _ -> None }
+
+fn week_date(year: Option<Int>, week: Option<Int>, day: Option<Int>) -> Option<Date> =
+  match ((year, week, day)) {
+    (Some(y), Some(w), Some(d)) -> match weekday_of_number(d) {
+      Some(on) -> of_week(y, w, on),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+/// The time the fields name, `Some(None)` where they hold nothing of one.
+fn settled_time(fields: Map<String, Int>) -> Option<Option<Time>> = {
+  let of_twelve = match ((map_get(fields, "hour of twelve"), map_get(fields, "half"))) {
+    (Some(h), Some(half)) -> if h >= 1 && h <= 12 { [h % 12 + (half - 1) * 12] } else { [-1] },
+    (None, None) -> [],
+    _ -> [-1],
+  };
+  let hours = concat(match map_get(fields, "hour") { Some(h) -> [h], None -> [] }, of_twelve);
+  let part = |name: String| option_unwrap_or(map_get(fields, name), 0);
+  match hours {
+    [] -> if map_contains(fields, "minute") || map_contains(fields, "second")
+        || map_contains(fields, "nanosecond") { None }
+    else { Some(None) },
+    [h, ..rest] -> if rest != [] && rest != [h] { None } else {
+      option_map(time(h, part("minute"), part("second"), part("nanosecond")), |t: Time| Some(t))
+    },
+  }
+}
+
+// --- Laws -------------------------------------------------------------------
+
+/// Any count as one of 3,720,000: enough to pick a year, a month and a day from.
+fn drawn(n: Int) -> Int = if n >= 0 { n % 3720000 } else { (n + 1) % 3720000 + 3719999 }
+
+/// A date a law draws, brought into the calendar: itself where it is in it, and any other count
+/// of days as the day that far round the calendar's 3,652,425.
+fn some_date(d: Date) -> Date = {
+  let n = unix_days(d);
+  let round = if n >= 0 { n % 3652425 } else { (n + 1) % 3652425 + 3652424 };
+  Date(if round > last_day() { round - 3652425 } else { round })
+}
+
+fn some_time(t: Time) -> Time = Time(nanos_in_day(nanos_of_day(t)))
+
+fn some_date_time(dt: DateTime) -> DateTime =
+  DateTime(some_date(date_of(dt)), some_time(time_of(dt)))
+
+/// An offset a law draws, brought within a day of UTC the same way.
+fn some_offset(minutes: Int) -> Int = {
+  let round = if minutes >= 0 { minutes % 2879 } else { (minutes + 1) % 2879 + 2878 };
+  if round > 1439 { round - 2879 } else { round }
+}
+
+/// An instant a law draws, brought into what `at_offset` makes: itself where it is one, and at
+/// UTC where its offset would read it past an end of the calendar.
+fn some_instant(o: OffsetDateTime) -> OffsetDateTime =
+  match o {
+    OffsetDateTime(universal, minutes) -> {
+      let reading = some_date_time(universal);
+      match stamped(reading, some_offset(minutes)) {
+        Some(made) -> made,
+        None -> OffsetDateTime(reading, 0),
+      }
+    },
+  }
+
+fn to_the_second(o: OffsetDateTime) -> Option<OffsetDateTime> =
+  at_offset(truncate_date_time(local(o), Seconds), offset_minutes(o))
+
+law "a day's civil date counts back to the day"
+  forall (d: Date) {
+    let days = unix_days(some_date(d));
+    let civil = civil_from_days(days);
+    days_from_civil(civil.year, civil.month, civil.day) == days
+  }
+
+law "a civil date's day is that date again"
+  forall (year: Int, month: Int, day: Int) {
+    let y = drawn(year) % 10000;
+    let m = drawn(month) % 12 + 1;
+    let civil: YearMonthDay = {
+      year: y,
+      month: m,
+      day: min(drawn(day) % 31 + 1, month_length(y, m)),
+    };
+    civil_from_days(days_from_civil(civil.year, civil.month, civil.day)) == civil
+  }
+
+law "a date moved by days and moved back is the date"
+  forall (d: Date, n: Int) {
+    let from = some_date(d);
+    let by = drawn(n) - 1860000;
+    match add_days(from, by) { Some(there) -> add_days(there, -by) == Some(from), None -> true }
+  }
+
+law "the day after is the next day of the week"
+  forall (d: Date) {
+    let today = some_date(d);
+    match add_days(today, 1) {
+      Some(next) -> weekday_number(weekday(next)) == weekday_number(weekday(today)) % 7 + 1,
+      None -> today == latest(),
+    }
+  }
+
+law "the period between two dates takes the first to the second"
+  forall (a: Date, b: Date) {
+    let from = some_date(a);
+    let to = some_date(b);
+    add(from, period_between(from, to), Clamp) == Some(to)
+  }
+
+law "a year and a day of it name the date they are read off"
+  forall (d: Date) {
+    let date = some_date(d);
+    of_ordinal(year(date), day_of_year(date)) == Some(date)
+  }
+
+law "a week and a weekday name the date they are read off"
+  forall (d: Date) {
+    let date = some_date(d);
+    of_week(week(date).year, week(date).week, weekday(date)) == Some(date)
+  }
+
+law "a date reads back from its text" =
+  agrees(|d: Date| parse(text(some_date(d))), |d: Date| Some(some_date(d)))
+
+law "a time reads back from its text" =
+  agrees(|t: Time| parse_time(time_text(some_time(t))), |t: Time| Some(some_time(t)))
+
+law "a date-time reads back from its text" =
+  agrees(|dt: DateTime| parse_date_time(date_time_text(some_date_time(dt))), |dt: DateTime|
+    Some(some_date_time(dt)))
+
+law "an instant reads back from its RFC 3339 text" =
+  agrees(|o: OffsetDateTime| parse_rfc3339(rfc3339(some_instant(o))), |o: OffsetDateTime|
+    Some(some_instant(o)))
+
+fn in_paris(o: OffsetDateTime) -> Extended =
+  {
+    instant: some_instant(o),
+    zone: Some({ name: "Europe/Paris", critical: true }),
+    tags: [{ key: "u-ca", value: "gregory", critical: false }],
+  }
+
+law "an instant and its suffix read back from their RFC 9557 text" =
+  agrees(|o: OffsetDateTime| parse_rfc9557(rfc9557(in_paris(o))), |o: OffsetDateTime|
+    Some(in_paris(o)))
+
+law "an instant reads back from its HTTP date, in UTC and to the second" =
+  agrees(
+    |o: OffsetDateTime| parse_http_date(http_date(some_instant(o)), Instant(0)),
+    |o: OffsetDateTime| to_the_second(in_utc(some_instant(o))),
+  )
+
+law "an instant reads back from its RFC 5322 date, to the second" =
+  agrees(|o: OffsetDateTime| parse_rfc5322(rfc5322(some_instant(o))), |o: OffsetDateTime|
+    to_the_second(some_instant(o)))
+
+law "an instant reads back by the pattern that wrote it" =
+  agrees(
+    |o: OffsetDateTime|
+      parse_with(the_pattern("%FT%T.%N%:z"), format(the_pattern("%FT%T.%N%:z"), some_instant(o))),
+    |o: OffsetDateTime| {
+      let reading = local(some_instant(o));
+      Some({
+        date: Some(date_of(reading)),
+        time: Some(time_of(reading)),
+        offset: Some(offset_minutes(some_instant(o))),
+      })
+    },
+  )
+
+law "a date reads back by a pattern of names, and its weekday with it" =
+  agrees(
+    |d: Date|
+      option_and_then(format_date(the_pattern("%A, %-d %B %Y"), some_date(d)), |written: String|
+        parse_with(the_pattern("%A, %-d %B %Y"), written)),
+    |d: Date| Some({ date: Some(some_date(d)), time: None, offset: None }),
+  )
+
+law "an `Instant` is the instant its UTC reading names" = round_trip(of_instant, instant)
+
+law "Unix seconds name their instant to the second" =
+  agrees(|o: OffsetDateTime| of_unix_seconds(unix_seconds(some_instant(o))), |o: OffsetDateTime|
+    to_the_second(in_utc(some_instant(o))))
+
+law "another offset reads the same instant"
+  forall (o: OffsetDateTime, minutes: Int) {
+    let from = some_instant(o);
+    match in_offset(from, some_offset(minutes)) {
+      Some(moved_to) ->
+        same_instant(from, moved_to) && offset_minutes(moved_to) == some_offset(minutes)
+          && at_offset(local(moved_to), some_offset(minutes)) == Some(moved_to),
+      None -> true,
+    }
+  }
+
+law "an instant a duration later is that duration after"
+  forall (o: OffsetDateTime, n: Int) {
+    let from = some_instant(o);
+    match offset_after(from, nanos(n)) {
+      Some(later) -> offset_between(from, later) == Some(nanos(n)),
+      None -> true,
+    }
+  }
+
+law "truncating a time twice is truncating it once" =
+  idempotent(|t: Time| truncate_time(some_time(t), Minutes))
+
+law "a date-time rounds to a whole hour no more than half an hour away"
+  forall (dt: DateTime) {
+    let from = some_date_time(dt);
+    match round_date_time(from, Hours, HalfEven) {
+      Some(whole) -> match date_time_between(from, whole) {
+        Some(apart) ->
+          nanos_of_day(time_of(whole)) % 3600000000000 == 0 && as_nanos(apart) >= -1800000000000
+            && as_nanos(apart) <= 1800000000000,
+        None -> false,
+      },
+      None -> date_of(from) == latest(),
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn the_date(text: String) -> Date / {abort.raise} = option_expect(parse(text), text)
+
+fn the_time(text: String) -> Time / {abort.raise} = option_expect(parse_time(text), text)
+
+fn the_date_time(text: String) -> DateTime / {abort.raise} =
+  option_expect(parse_date_time(text), text)
+
+fn the_instant(text: String) -> OffsetDateTime / {abort.raise} =
+  option_expect(parse_rfc3339(text), text)
+
+fn the_pattern(text: String) -> Pattern / {abort.raise} =
+  option_expect(result_ok(pattern(text)), text)
+
+/// Whether every day from `days` to `last` is the date given and the dates after it in turn, and
+/// counts back to itself.
+fn walked(days: Int, last: Int, year: Int, month: Int, day: Int) -> Bool =
+  if days > last { true }
+  else if days_from_civil(year, month, day) != days || !is_civil(days, year, month, day) { false }
+  else if day < month_length(year, month) { walked(days + 1, last, year, month, day + 1) }
+  else if month < 12 { walked(days + 1, last, year, month + 1, 1) }
+  else { walked(days + 1, last, year + 1, 1, 1) }
+
+fn is_civil(days: Int, year: Int, month: Int, day: Int) -> Bool = {
+  let civil = civil_from_days(days);
+  civil.year == year && civil.month == month && civil.day == day
+}
+
+test "every day of the calendar is the day after the one before, and counts back to itself" {
+  assert(walked(first_day(), last_day(), 0, 1, 1));
+  assert_eq(parts(latest()), { year: 9999, month: 12, day: 31 })
+}
+
+test "a date is made of a year, a month and a day its month has" {
+  assert_eq(of(1970, 1, 1), of_unix_days(0));
+  assert_eq(option_map(of(2026, 10, 4), unix_days), Some(20730));
+  assert_eq(option_map(of(2000, 2, 29), text), Some("2000-02-29"));
+  assert_eq(of(1900, 2, 29), None);
+  assert_eq(of(2026, 13, 1), None);
+  assert_eq(of(2026, 4, 31), None);
+  assert_eq(of(2026, 4, 0), None);
+  assert_eq(of(-1, 12, 31), None);
+  assert_eq(of(10000, 1, 1), None);
+  assert_eq(of(0, 1, 1), Some(earliest()));
+  assert_eq(of(9999, 12, 31), Some(latest()));
+  assert_eq(of_unix_days(2932897), None)
+}
+
+test "a date reads as its year, month, day and weekday" {
+  let d = the_date("2026-10-04");
+  assert_eq(year(d), 2026);
+  assert_eq(month(d), October);
+  assert_eq(day(d), 4);
+  assert_eq(parts(d), { year: 2026, month: 10, day: 4 });
+  assert_eq(weekday(d), Sunday);
+  assert_eq(weekday(the_date("1970-01-01")), Thursday);
+  assert_eq(weekday(earliest()), Saturday);
+  assert_eq(weekday(latest()), Friday);
+  assert_eq(day_of_year(d), 277);
+  assert_eq(day_of_year(the_date("2020-12-31")), 366);
+  assert_eq(days_in_month(2024, February), 29);
+  assert_eq(days_in_month(2100, February), 28);
+  assert_eq(days_in_year(2000), 366);
+  assert_eq(month_of_number(13), None);
+  assert_eq(weekday_of_number(7), Some(Sunday));
+  assert_eq(month_abbreviation(September) ++ " " ++ weekday_abbreviation(Wednesday), "Sep Wed")
+}
+
+type WeekDate = { date: String, year: Int, week: Int, day: Weekday }
+
+fn week_dates() -> List<WeekDate> =
+  [
+    { date: "1970-01-01", year: 1970, week: 1, day: Thursday },
+    { date: "2021-01-03", year: 2020, week: 53, day: Sunday },
+    { date: "2024-12-30", year: 2025, week: 1, day: Monday },
+    { date: "2026-01-01", year: 2026, week: 1, day: Thursday },
+    { date: "2026-10-04", year: 2026, week: 40, day: Sunday },
+    { date: "2027-01-01", year: 2026, week: 53, day: Friday },
+    { date: "9999-12-31", year: 9999, week: 52, day: Friday },
+  ]
+
+test "{c.date} is in ISO week {c.week} of {c.year}" for c: WeekDate in week_dates() {
+  let d = the_date(c.date);
+  assert_eq(week(d), { year: c.year, week: c.week });
+  assert_eq(weekday(d), c.day);
+  assert_eq(of_week(c.year, c.week, c.day), Some(d))
+}
+
+test "a week or a day of the year a year does not have names no date" {
+  assert_eq(of_week(2026, 54, Monday), None);
+  assert_eq(of_week(2025, 53, Monday), None);
+  assert_eq(of_week(2026, 0, Monday), None);
+  // The calendar's first two days are in the last week of the year before it.
+  assert_eq(week(earliest()), { year: -1, week: 52 });
+  assert_eq(of_week(-1, 52, Saturday), Some(earliest()));
+  assert_eq(of_week(-1, 52, Friday), None);
+  assert_eq(of_ordinal(2026, 277), Some(the_date("2026-10-04")));
+  assert_eq(of_ordinal(2026, 366), None);
+  assert_eq(of_ordinal(2024, 366), Some(the_date("2024-12-31")));
+  assert_eq(of_ordinal(2026, 0), None)
+}
+
+test "adding months says what a short month does, and adding days never asks" {
+  let end_of_january = the_date("2026-01-31");
+  assert_eq(add_months(end_of_january, 1, Clamp), Some(the_date("2026-02-28")));
+  assert_eq(add_months(end_of_january, 1, Reject), None);
+  assert_eq(add_months(end_of_january, 2, Reject), Some(the_date("2026-03-31")));
+  assert_eq(add_months(end_of_january, -2, Clamp), Some(the_date("2025-11-30")));
+  assert_eq(add_months(end_of_january, 13, Clamp), Some(the_date("2027-02-28")));
+  assert_eq(add_years(the_date("2024-02-29"), 1, Clamp), Some(the_date("2025-02-28")));
+  assert_eq(add_years(the_date("2024-02-29"), 4, Reject), Some(the_date("2028-02-29")));
+  assert_eq(add_days(end_of_january, 29), Some(the_date("2026-03-01")));
+  assert_eq(add_days(the_date("2024-02-28"), 2), Some(the_date("2024-03-01")));
+  assert_eq(add_days(latest(), 1), None);
+  assert_eq(add_days(earliest(), -1), None);
+  assert_eq(add_months(the_date("9999-12-01"), 1, Clamp), None);
+  assert_eq(add_months(the_date("0000-01-31"), -1, Clamp), None);
+  assert_eq(add_days(earliest(), 9223372036854775807), None)
+}
+
+test "a period is months and then days, and the one between two dates leads from one to the other" {
+  assert_eq(years(2), months(24));
+  assert_eq(weeks(2), days(14));
+  assert_eq(plus(months(1), days(3)), { months: 1, days: 3 });
+  let from = the_date("2026-01-31");
+  assert_eq(add(from, plus(months(1), days(1)), Clamp), Some(the_date("2026-03-01")));
+  assert_eq(add(from, plus(months(1), days(1)), Reject), None);
+  assert_eq(period_between(from, the_date("2026-02-28")), { months: 0, days: 28 });
+  assert_eq(period_between(from, the_date("2026-03-31")), { months: 2, days: 0 });
+  assert_eq(period_between(from, the_date("2026-03-01")), { months: 1, days: 1 });
+  assert_eq(period_between(the_date("2026-03-31"), from), { months: -2, days: 0 });
+  assert_eq(period_between(the_date("2026-03-01"), from), { months: -1, days: -1 });
+  assert_eq(period_between(earliest(), latest()), { months: 119999, days: 30 });
+  assert_eq(days_between(the_date("2026-01-01"), the_date("2027-01-01")), 365);
+  assert_eq(days_between(the_date("2027-01-01"), the_date("2026-01-01")), -365);
+  assert_eq(start_of_month(the_date("2024-02-17")), the_date("2024-02-01"));
+  assert_eq(end_of_month(the_date("2024-02-17")), the_date("2024-02-29"));
+  assert_eq(start_of_year(the_date("2024-02-17")), the_date("2024-01-01"))
+}
+
+test "values order as they fall, and an instant before its offset" {
+  assert_eq(compare(the_date("2026-10-04"), the_date("2026-10-05")), Less);
+  assert_eq(compare(the_date("2027-01-01"), the_date("2026-12-31")), Greater);
+  assert_eq(compare(the_time("09:00:00"), the_time("10:00:00")), Less);
+  assert_eq(
+    compare(the_date_time("2026-10-04T23:59:59"), the_date_time("2026-10-05T00:00:00")),
+    Less,
+  );
+  let noon = the_instant("2026-10-04T12:00:00Z");
+  let same = the_instant("2026-10-04T14:00:00+02:00");
+  assert_eq(compare(the_instant("2026-10-04T13:59:59+02:00"), noon), Less);
+  assert_eq(compare(noon, same), Less);
+  assert(noon != same);
+  assert(same_instant(noon, same));
+  assert_eq(in_utc(same), noon);
+  assert_eq(in_offset(noon, 120), Some(same))
+}
+
+test "`show` writes each value as ISO 8601 does" {
+  let d = the_date("2026-10-04");
+  let t = the_time("12:30:00.5");
+  assert_eq(f"{d}", "2026-10-04");
+  assert_eq(f"{t}", "12:30:00.5");
+  assert_eq(f"{at(d, t)}", "2026-10-04T12:30:00.5");
+  assert_eq(f"{utc(at(d, t))}", "2026-10-04T12:30:00.5Z");
+  assert_eq(f"{[earliest(), latest()]}", "[0000-01-01, 9999-12-31]")
+}
+
+test "a time of day is an hour, a minute, a second and a nanosecond" {
+  assert_eq(time(12, 30, 15, 250000000), Some(the_time("12:30:15.25")));
+  assert_eq(time(24, 0, 0, 0), None);
+  assert_eq(time(23, 60, 0, 0), None);
+  assert_eq(time(23, 59, 60, 0), None);
+  assert_eq(time(0, 0, 0, 1000000000), None);
+  assert_eq(time(0, 0, 0, 0), Some(midnight()));
+  let t = the_time("23:59:58.123456789");
+  assert_eq(hour(t), 23);
+  assert_eq(minute(t), 59);
+  assert_eq(second(t), 58);
+  assert_eq(nanosecond(t), 123456789);
+  assert_eq(time_of_nanos(nanos_of_day(t)), Some(t));
+  assert_eq(time_of_nanos(86400000000000), None);
+  assert_eq(time_after(the_time("23:30:00"), nanos(3600000000000)), the_time("00:30:00"));
+  assert_eq(time_after(the_time("00:30:00"), nanos(-3600000000000)), the_time("23:30:00"));
+  assert_eq(as_nanos(time_between(the_time("09:00:00"), the_time("08:59:59"))), -1000000000);
+  assert_eq(time_text(the_time("07:08:09.000000100")), "07:08:09.0000001")
+}
+
+type Rounded = { time: String, unit: TimeUnit, mode: Rounding, to: String }
+
+fn roundings() -> List<Rounded> =
+  [
+    { time: "12:34:56.789", unit: Hours, mode: Down, to: "12:00:00" },
+    { time: "12:34:56.789", unit: Hours, mode: HalfUp, to: "13:00:00" },
+    { time: "12:34:56.789", unit: Minutes, mode: Ceiling, to: "12:35:00" },
+    { time: "12:34:56.789", unit: Seconds, mode: HalfEven, to: "12:34:57" },
+    { time: "12:34:56.789", unit: Milliseconds, mode: Up, to: "12:34:56.789" },
+    { time: "12:34:56.7895", unit: Milliseconds, mode: HalfEven, to: "12:34:56.79" },
+    { time: "12:34:56.7885", unit: Milliseconds, mode: HalfEven, to: "12:34:56.788" },
+    { time: "12:34:56.7885", unit: Milliseconds, mode: HalfUp, to: "12:34:56.789" },
+    { time: "12:34:56.0000005", unit: Microseconds, mode: Floor, to: "12:34:56" },
+    { time: "12:34:56.000000001", unit: Nanoseconds, mode: Up, to: "12:34:56.000000001" },
+    { time: "12:30:00", unit: Hours, mode: HalfEven, to: "12:00:00" },
+    { time: "13:30:00", unit: Hours, mode: HalfEven, to: "14:00:00" },
+    { time: "12:00:00", unit: Days, mode: HalfEven, to: "00:00:00" },
+    { time: "23:59:59.5", unit: Seconds, mode: HalfUp, to: "00:00:00" },
+  ]
+
+test "{c.time} at whole {c.unit}, {c.mode}, is {c.to}" for c: Rounded in roundings() {
+  assert_eq(round_time(the_time(c.time), c.unit, c.mode), the_time(c.to))
+}
+
+test "a date-time rounds onto the next day, and truncates within its own" {
+  let late = the_date_time("2026-12-31T23:59:59.5");
+  assert_eq(round_date_time(late, Seconds, HalfUp), Some(the_date_time("2027-01-01T00:00:00")));
+  assert_eq(round_date_time(late, Days, HalfUp), Some(the_date_time("2027-01-01T00:00:00")));
+  assert_eq(round_date_time(late, Seconds, Down), Some(the_date_time("2026-12-31T23:59:59")));
+  assert_eq(truncate_date_time(late, Days), the_date_time("2026-12-31T00:00:00"));
+  assert_eq(truncate_date_time(late, Minutes), the_date_time("2026-12-31T23:59:00"));
+  assert_eq(round_date_time(at(latest(), the_time("23:59:59.5")), Seconds, HalfUp), None);
+  assert_eq(truncate_time(the_time("12:34:56.789"), Seconds), the_time("12:34:56"))
+}
+
+test "a calendar day and twenty-four hours are added by different functions" {
+  let start = the_date_time("2026-01-31T18:00:00");
+  let a_day = nanos(86400000000000);
+  assert_eq(date_time_add(start, days(1), Clamp), Some(the_date_time("2026-02-01T18:00:00")));
+  assert_eq(date_time_after(start, a_day), Some(the_date_time("2026-02-01T18:00:00")));
+  assert_eq(date_time_add(start, months(1), Clamp), Some(the_date_time("2026-02-28T18:00:00")));
+  assert_eq(date_time_add(start, months(1), Reject), None);
+  assert_eq(
+    date_time_after(start, nanos(-64800000000001)),
+    Some(the_date_time("2026-01-30T23:59:59.999999999")),
+  );
+  assert_eq(date_time_between(start, the_date_time("2026-02-01T18:00:00")), Some(a_day));
+  assert_eq(date_time_between(at(earliest(), midnight()), at(latest(), midnight())), None);
+  assert_eq(date_time_after(at(latest(), the_time("23:00:00")), nanos(3600000000000)), None);
+  let there = the_instant("2026-01-31T18:00:00+05:30");
+  assert_eq(offset_add(there, months(1), Clamp), Some(the_instant("2026-02-28T18:00:00+05:30")));
+  assert_eq(offset_after(there, a_day), Some(the_instant("2026-02-01T18:00:00+05:30")));
+  assert_eq(offset_between(there, the_instant("2026-01-31T12:30:00Z")), Some(nanos(0)));
+  assert_eq(date_time(2026, 1, 31, 18, 0, 0), Some(start));
+  assert_eq(date_time(2026, 1, 32, 18, 0, 0), None)
+}
+
+test "an instant is a reading at an offset, and Unix time counts from 1970 in UTC" {
+  let reading = the_date_time("2026-10-04T12:30:00");
+  let there = option_expect(at_offset(reading, 120), "an offset of two hours");
+  assert_eq(local(there), reading);
+  assert_eq(offset_minutes(there), 120);
+  assert_eq(local(in_utc(there)), the_date_time("2026-10-04T10:30:00"));
+  assert_eq(unix_seconds(there), 1791109800);
+  assert_eq(unix_seconds(utc(reading)), 1791117000);
+  assert_eq(of_unix_seconds(0), Some(the_instant("1970-01-01T00:00:00Z")));
+  assert_eq(of_unix_seconds(-1), Some(the_instant("1969-12-31T23:59:59Z")));
+  assert_eq(of_unix_seconds(253402300799), Some(the_instant("9999-12-31T23:59:59Z")));
+  assert_eq(of_unix_seconds(253402300800), None);
+  assert_eq(of_unix_millis(-1), Some(the_instant("1969-12-31T23:59:59.999Z")));
+  assert_eq(unix_millis(the_instant("1970-01-01T00:00:01.5Z")), 1500);
+  assert_eq(unix_seconds(the_instant("1969-12-31T23:59:59.5Z")), -1);
+  assert_eq(of_instant(Instant(1500000000)), the_instant("1970-01-01T00:00:01.5Z"));
+  assert_eq(of_instant(Instant(-1)), the_instant("1969-12-31T23:59:59.999999999Z"));
+  assert_eq(instant(the_instant("1970-01-01T01:00:00+01:00")), Some(Instant(0)));
+  assert_eq(
+    instant(the_instant("2262-04-11T23:47:16.854775807Z")),
+    Some(Instant(9223372036854775807)),
+  );
+  assert_eq(instant(the_instant("2262-04-11T23:47:16.854775808Z")), None);
+  assert_eq(
+    instant(the_instant("1677-09-21T00:12:43.145224192Z")),
+    Some(Instant(-9223372036854775807 - 1)),
+  );
+  assert_eq(instant(the_instant("1677-09-21T00:12:43.145224191Z")), None)
+}
+
+test "an offset is under a day, and both its reading and UTC's are in the calendar" {
+  let reading = the_date_time("2026-10-04T12:30:00");
+  assert_eq(at_offset(reading, 1440), None);
+  assert_eq(at_offset(reading, -1440), None);
+  assert_eq(option_map(at_offset(reading, -1439), rfc3339), Some("2026-10-04T12:30:00-23:59"));
+  assert_eq(at_offset(at(earliest(), midnight()), 1), None);
+  assert_eq(at_offset(at(latest(), the_time("23:59:59")), -1), None);
+  assert_eq(parse_rfc3339("0000-01-01T00:00:00+00:01"), None);
+  assert_eq(in_offset(utc(at(latest(), the_time("23:59:59"))), 1), None);
+  assert_eq(
+    option_map(in_offset(utc(at(earliest(), midnight())), 1), rfc3339),
+    Some("0000-01-01T00:01:00+00:01"),
+  )
+}
+
+type Stamp = { text: String, unix_seconds: Int, nanosecond: Int, offset: Int, written: String }
+
+/// RFC 3339, section 5.8.
+fn rfc_3339_examples() -> List<Stamp> =
+  [
+    {
+      text: "1985-04-12T23:20:50.52Z",
+      unix_seconds: 482196050,
+      nanosecond: 520000000,
+      offset: 0,
+      written: "1985-04-12T23:20:50.52Z",
+    },
+    {
+      text: "1996-12-19T16:39:57-08:00",
+      unix_seconds: 851042397,
+      nanosecond: 0,
+      offset: -480,
+      written: "1996-12-19T16:39:57-08:00",
+    },
+    {
+      text: "1990-12-31T23:59:60Z",
+      unix_seconds: 662687999,
+      nanosecond: 0,
+      offset: 0,
+      written: "1990-12-31T23:59:59Z",
+    },
+    {
+      text: "1990-12-31T15:59:60-08:00",
+      unix_seconds: 662687999,
+      nanosecond: 0,
+      offset: -480,
+      written: "1990-12-31T15:59:59-08:00",
+    },
+    {
+      text: "1937-01-01T12:00:27.87+00:20",
+      unix_seconds: -1041337173,
+      nanosecond: 870000000,
+      offset: 20,
+      written: "1937-01-01T12:00:27.87+00:20",
+    },
+  ]
+
+test "RFC 3339's example {c.text} is read and written" for c: Stamp in rfc_3339_examples() {
+  let o = the_instant(c.text);
+  assert_eq(unix_seconds(o), c.unix_seconds);
+  assert_eq(nanosecond(time_of(local(o))), c.nanosecond);
+  assert_eq(offset_minutes(o), c.offset);
+  assert_eq(rfc3339(o), c.written)
+}
+
+test "RFC 3339's second example is the instant its text says it is in UTC" {
+  assert(
+    same_instant(the_instant("1996-12-19T16:39:57-08:00"), the_instant("1996-12-20T00:39:57Z")),
+  )
+}
+
+fn not_rfc_3339() -> List<String> =
+  [
+    "",
+    "1985-04-12",
+    "1985-04-12T23:20:50",
+    "1985-04-12 23:20:50Z",
+    "1985-04-12T23:20Z",
+    "1985-4-12T23:20:50Z",
+    "19850412T232050Z",
+    "1985-04-12T24:00:00Z",
+    "1985-04-12T23:60:00Z",
+    "1985-04-31T23:20:50Z",
+    "1985-02-29T23:20:50Z",
+    "1985-00-12T23:20:50Z",
+    "1985-04-12T23:20:50.Z",
+    "1985-04-12T23:20:50,5Z",
+    "1985-04-12T23:20:50.1234567890Z",
+    "1985-04-12T23:20:50+0800",
+    "1985-04-12T23:20:50+08",
+    "1985-04-12T23:20:50+24:00",
+    "1985-04-12T23:20:50+08:60",
+    "+1985-04-12T23:20:50Z",
+    "1985-04-12T23:20:50Z ",
+    "1985-04-12T23:20:50ZZ",
+    "1985-04-12T23:20:61Z",
+    "1985-W15-5T23:20:50Z",
+  ]
+
+test "RFC 3339 does not allow `{c}`" for c: String in not_rfc_3339() {
+  assert_eq(parse_rfc3339(c), None)
+}
+
+test "RFC 3339 allows a lower-case `t` and `z`, any offset under a day, and `-00:00`" {
+  let o = the_instant("1985-04-12T23:20:50.52Z");
+  assert_eq(parse_rfc3339("1985-04-12t23:20:50.52z"), Some(o));
+  assert_eq(parse_rfc3339("1985-04-12T23:20:50.52-00:00"), Some(o));
+  assert_eq(parse_rfc3339("1985-04-12T23:20:50.520000000+00:00"), Some(o));
+  assert_eq(
+    option_map(parse_rfc3339("1985-04-12T23:20:50+23:59"), unix_seconds),
+    Some(482196050 - 86340),
+  );
+  assert_eq(rfc3339(the_instant("0000-01-01T00:00:00Z")), "0000-01-01T00:00:00Z");
+  assert_eq(
+    rfc3339(the_instant("9999-12-31T23:59:59.999999999Z")),
+    "9999-12-31T23:59:59.999999999Z",
+  )
+}
+
+test "a second of 60 is read where UTC can show one, as 59, and is never written" {
+  assert_eq(parse_rfc3339("2016-12-31T23:59:60Z"), Some(the_instant("2016-12-31T23:59:59Z")));
+  assert_eq(parse_rfc3339("2016-12-31T23:59:60.25Z"), Some(the_instant("2016-12-31T23:59:59.25Z")));
+  assert_eq(
+    parse_rfc3339("2017-01-01T09:29:60+09:30"),
+    Some(the_instant("2017-01-01T09:29:59+09:30")),
+  );
+  assert_eq(parse_rfc3339("2015-06-30T23:59:60Z"), Some(the_instant("2015-06-30T23:59:59Z")));
+  assert_eq(parse_rfc3339("2016-12-30T23:59:60Z"), None);
+  assert_eq(parse_rfc3339("2016-12-31T22:59:60Z"), None);
+  assert_eq(parse_rfc3339("2016-12-31T23:58:60Z"), None);
+  assert_eq(parse_rfc3339("2016-12-31T23:59:60+01:00"), None);
+  assert_eq(parse_time("23:59:60"), None);
+  assert_eq(parse_date_time("2016-12-31T23:59:60"), None);
+  let now = Instant(0);
+  assert_eq(
+    parse_http_date("Sat, 31 Dec 2016 23:59:60 GMT", now),
+    Some(the_instant("2016-12-31T23:59:59Z")),
+  );
+  assert_eq(parse_http_date("Fri, 30 Dec 2016 23:59:60 GMT", now), None);
+  assert_eq(
+    parse_rfc5322("Sat, 31 Dec 2016 15:59:60 -0800"),
+    Some(the_instant("2016-12-31T15:59:59-08:00")),
+  );
+  assert_eq(parse_rfc5322("Sat, 31 Dec 2016 15:59:60 +0000"), None)
+}
+
+test "a civil text is a date, a time, or the two with a `T` between them" {
+  assert_eq(parse("2026-10-04"), of(2026, 10, 4));
+  assert_eq(parse("2026-10-4"), None);
+  assert_eq(parse("2026-10-04T00:00:00"), None);
+  assert_eq(parse(" 2026-10-04"), None);
+  assert_eq(parse("२०२६-10-04"), None);
+  assert_eq(parse_time("12:30:00"), time(12, 30, 0, 0));
+  assert_eq(parse_time("12:30:00.000000001"), time(12, 30, 0, 1));
+  assert_eq(parse_time("12:30"), None);
+  assert_eq(parse_time("12:30:00Z"), None);
+  assert_eq(parse_time("24:00:00"), None);
+  assert_eq(parse_date_time("2026-10-04T12:30:00"), date_time(2026, 10, 4, 12, 30, 0));
+  assert_eq(parse_date_time("2026-10-04t12:30:00"), date_time(2026, 10, 4, 12, 30, 0));
+  assert_eq(parse_date_time("2026-10-04 12:30:00"), None);
+  assert_eq(parse_date_time("2026-10-04T12:30:00Z"), None)
+}
+
+type Faulty = { text: String, message: String, offset: Int }
+
+fn faulty_dates() -> List<Faulty> =
+  [
+    { text: "2026-13-04", message: "a month is 01 to 12", offset: 5 },
+    { text: "2026-02-30", message: "February 2026 has days 01 to 28", offset: 8 },
+    { text: "2024-02-30", message: "February 2024 has days 01 to 29", offset: 8 },
+    { text: "2026-04-00", message: "April 2026 has days 01 to 30", offset: 8 },
+    { text: "26-10-04", message: "a year is four digits", offset: 2 },
+    { text: "2026/10/04", message: "a `-` goes here", offset: 4 },
+    { text: "2026-1O-04", message: "a month is two digits", offset: 6 },
+    { text: "2026-10-04Z", message: "nothing follows here", offset: 10 },
+    { text: "2026-10", message: "a `-` goes here", offset: 7 },
+    { text: "", message: "a year is four digits", offset: 0 },
+  ]
+
+test "a date literal `{c.text}` is refused at {c.offset}: {c.message}" for c: Faulty in faulty_dates(
+  ) { assert_eq(literal(c.text), Err({ message: c.message, offset: c.offset })) }
+
+test "the other literals' checks answer the value, or where and why the text is none" {
+  assert_eq(literal("2026-10-04"), Ok(the_date("2026-10-04")));
+  assert_eq(time_literal("12:30:00.5"), Ok(the_time("12:30:00.5")));
+  assert_eq(time_literal("25:30:00"), Err({ message: "an hour is 00 to 23", offset: 0 }));
+  assert_eq(time_literal("12:60:00"), Err({ message: "a minute is 00 to 59", offset: 3 }));
+  assert_eq(time_literal("12:30:60"), Err({ message: "a second is 00 to 59", offset: 6 }));
+  assert_eq(time_literal("12:30:00."), Err({ message: "a fraction has a digit", offset: 9 }));
+  assert_eq(
+    time_literal("12:30:00.0123456789"),
+    Err({ message: "a fraction is nine digits at most", offset: 18 }),
+  );
+  assert_eq(
+    date_time_literal("2026-10-04 12:30:00"),
+    Err({ message: "a `T` goes here", offset: 10 }),
+  );
+  assert_eq(
+    date_time_literal("2026-10-04T12:30:60"),
+    Err({ message: "a second is 00 to 59", offset: 17 }),
+  );
+  assert_eq(
+    rfc3339_literal("2026-10-04T12:30:00"),
+    Err({ message: "an offset is `Z`, or `+` or `-` and hh:mm", offset: 19 }),
+  );
+  assert_eq(
+    rfc3339_literal("2026-10-04T12:30:00+2:00"),
+    Err({ message: "an offset's hours are two digits", offset: 21 }),
+  );
+  assert_eq(
+    rfc3339_literal("2026-10-04T12:30:60Z"),
+    Err({ message: "a second of 60 is the last of a UTC month, and no other", offset: 17 }),
+  );
+  assert_eq(
+    rfc3339_literal("9999-12-31T23:59:59-00:01"),
+    Err({ message: "in UTC this is outside the years 0000 to 9999", offset: 0 }),
+  )
+}
+
+type Suffixed = { text: String, instant: String, zone: Option<ZoneTag>, tags: List<SuffixTag> }
+
+/// RFC 9557, sections 2.2, 3.3 and 4.2.
+fn rfc_9557_examples() -> List<Suffixed> =
+  [
+    {
+      text: "1996-12-19T16:39:57-08:00",
+      instant: "1996-12-19T16:39:57-08:00",
+      zone: None,
+      tags: [],
+    },
+    {
+      text: "1996-12-19T16:39:57-08:00[America/Los_Angeles]",
+      instant: "1996-12-19T16:39:57-08:00",
+      zone: Some({ name: "America/Los_Angeles", critical: false }),
+      tags: [],
+    },
+    {
+      text: "1996-12-19T16:39:57-08:00[America/Los_Angeles][u-ca=hebrew]",
+      instant: "1996-12-19T16:39:57-08:00",
+      zone: Some({ name: "America/Los_Angeles", critical: false }),
+      tags: [{ key: "u-ca", value: "hebrew", critical: false }],
+    },
+    {
+      text: "1996-12-19T16:39:57-08:00[_foo=bar][_baz=bat]",
+      instant: "1996-12-19T16:39:57-08:00",
+      zone: None,
+      tags: [
+        { key: "_foo", value: "bar", critical: false },
+        { key: "_baz", value: "bat", critical: false },
+      ],
+    },
+    {
+      text: "2022-07-08T00:14:07+08:45[+08:45]",
+      instant: "2022-07-08T00:14:07+08:45",
+      zone: Some({ name: "+08:45", critical: false }),
+      tags: [],
+    },
+    {
+      text: "2022-07-08T00:14:07+01:00[!Europe/Paris]",
+      instant: "2022-07-08T00:14:07+01:00",
+      zone: Some({ name: "Europe/Paris", critical: true }),
+      tags: [],
+    },
+    {
+      text: "2022-07-08T00:14:07Z[Europe/London]",
+      instant: "2022-07-08T00:14:07Z",
+      zone: Some({ name: "Europe/London", critical: false }),
+      tags: [],
+    },
+    {
+      text: "2022-07-08T00:14:07+01:00[knort=blargel]",
+      instant: "2022-07-08T00:14:07+01:00",
+      zone: None,
+      tags: [{ key: "knort", value: "blargel", critical: false }],
+    },
+    {
+      text: "2022-07-08T00:14:07Z[!u-ca=chinese][u-ca=japanese]",
+      instant: "2022-07-08T00:14:07Z",
+      zone: None,
+      tags: [
+        { key: "u-ca", value: "chinese", critical: true },
+        { key: "u-ca", value: "japanese", critical: false },
+      ],
+    },
+  ]
+
+test "RFC 9557's example {c.text} is read and written" for c: Suffixed in rfc_9557_examples() {
+  let want: Extended = { instant: the_instant(c.instant), zone: c.zone, tags: c.tags };
+  assert_eq(parse_rfc9557(c.text), Some(want));
+  assert_eq(rfc9557(want), c.text)
+}
+
+fn not_rfc_9557() -> List<String> =
+  [
+    "1996-12-19T16:39:57-08:00[America/Los_Angeles",
+    "1996-12-19T16:39:57-08:00[]",
+    "1996-12-19T16:39:57-08:00[!]",
+    "1996-12-19T16:39:57-08:00[u-ca=hebrew][America/Los_Angeles]",
+    "1996-12-19T16:39:57-08:00[America/Los_Angeles][Europe/Paris]",
+    "1996-12-19T16:39:57-08:00[America//Los_Angeles]",
+    "1996-12-19T16:39:57-08:00[America/]",
+    "1996-12-19T16:39:57-08:00[..]",
+    "1996-12-19T16:39:57-08:00[America/./Los_Angeles]",
+    "1996-12-19T16:39:57-08:00[9to5]",
+    "1996-12-19T16:39:57-08:00[-08]",
+    "1996-12-19T16:39:57-08:00[U-CA=hebrew]",
+    "1996-12-19T16:39:57-08:00[u-ca=]",
+    "1996-12-19T16:39:57-08:00[u-ca=he--brew]",
+    "1996-12-19T16:39:57-08:00[u-ca=hebrew-]",
+    "1996-12-19T16:39:57-08:00[u-ca=he_brew]",
+    "1996-12-19T16:39:57-08:00 [America/Los_Angeles]",
+    "1996-12-19T16:39:57[America/Los_Angeles]",
+  ]
+
+test "RFC 9557 does not allow `{c}`" for c: String in not_rfc_9557() {
+  assert_eq(parse_rfc9557(c), None)
+}
+
+/// RFC 9110, section 5.6.7.
+fn http_examples() -> List<String> =
+  ["Sun, 06 Nov 1994 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"]
+
+test "RFC 9110's example `{c}` is read, and written in the first form" for c: String in http_examples(
+  ) {
+  let o = option_expect(parse_http_date(c, Instant(1791117000000000000)), c);
+  assert_eq(Some(o), of_unix_seconds(784111777));
+  assert_eq(http_date(o), "Sun, 06 Nov 1994 08:49:37 GMT")
+}
+
+test "two digits of a year are read against the present, fifty years ahead at most" {
+  let in_2019 = Instant(1546300800000000000);
+  let in_2026 = Instant(1791117000000000000);
+  let written = "Thursday, 01-Jan-70 00:00:00 GMT";
+  assert_eq(parse_http_date(written, in_2019), of_unix_seconds(0));
+  // From 2026 the same digits are 2070, whose first day is a Wednesday.
+  assert_eq(parse_http_date(written, in_2026), None);
+  assert_eq(
+    parse_http_date("Wednesday, 01-Jan-70 00:00:00 GMT", in_2026),
+    Some(the_instant("2070-01-01T00:00:00Z")),
+  );
+  assert_eq(
+    parse_http_date("Sunday, 04-Oct-76 12:30:00 GMT", in_2026),
+    Some(the_instant("2076-10-04T12:30:00Z")),
+  );
+  assert_eq(
+    parse_http_date("Monday, 04-Oct-76 12:30:01 GMT", in_2026),
+    Some(the_instant("1976-10-04T12:30:01Z")),
+  )
+}
+
+fn not_http_dates() -> List<String> =
+  [
+    "",
+    "sun, 06 Nov 1994 08:49:37 GMT",
+    "Sun, 06 nov 1994 08:49:37 GMT",
+    "Sun, 06 Nov 1994 08:49:37 gmt",
+    "Sun, 06 Nov 1994 08:49:37 UTC",
+    "Sun, 06 Nov 1994 08:49:37 +0000",
+    "Sun, 06 Nov 1994 08:49:37",
+    "Sun, 6 Nov 1994 08:49:37 GMT",
+    "Sun,  06 Nov 1994 08:49:37 GMT",
+    "Sun, 06 Nov 1994 8:49:37 GMT",
+    "Sun, 06 Nov 1994 08:49:37.5 GMT",
+    "Sun, 06 Nov 1994 24:00:00 GMT",
+    "Mon, 06 Nov 1994 08:49:37 GMT",
+    "Sun, 31 Nov 1994 08:49:37 GMT",
+    "Sun, 06 Nov 94 08:49:37 GMT",
+    "Sun, 06-Nov-94 08:49:37 GMT",
+    "Sunday, 06-Nov-1994 08:49:37 GMT",
+    "Sun Nov 6 08:49:37 1994",
+    "Sun Nov 06 08:49:37 1994 GMT",
+    " Sun, 06 Nov 1994 08:49:37 GMT",
+  ]
+
+test "RFC 9110 does not allow `{c}`" for c: String in not_http_dates() {
+  assert_eq(parse_http_date(c, Instant(1791117000000000000)), None)
+}
+
+test "an HTTP date is written in GMT, to the second, in years of four digits" {
+  assert_eq(
+    http_date(the_instant("2026-10-04T14:30:00.999+02:00")),
+    "Sun, 04 Oct 2026 12:30:00 GMT",
+  );
+  assert_eq(http_date(the_instant("0000-01-01T00:00:00Z")), "Sat, 01 Jan 0000 00:00:00 GMT");
+  assert_eq(http_date(the_instant("9999-12-31T23:59:59Z")), "Fri, 31 Dec 9999 23:59:59 GMT");
+  assert_eq(parse_http_date("Sun Nov 16 08:49:37 1994", Instant(0)), None);
+  assert_eq(
+    parse_http_date("Wed Nov 16 08:49:37 1994", Instant(0)),
+    Some(the_instant("1994-11-16T08:49:37Z")),
+  )
+}
+
+type Message = { text: String, instant: String }
+
+/// RFC 5322, appendix A: sections 1.1, 1.2, 1.3, 3, 5, 6.2 and 6.3.
+fn rfc_5322_examples() -> List<Message> =
+  [
+    { text: "Fri, 21 Nov 1997 09:55:06 -0600", instant: "1997-11-21T09:55:06-06:00" },
+    { text: "Tue, 1 Jul 2003 10:52:37 +0200", instant: "2003-07-01T10:52:37+02:00" },
+    { text: "Thu, 13 Feb 1969 23:32:54 -0330", instant: "1969-02-13T23:32:54-03:30" },
+    { text: "Mon, 24 Nov 1997 14:22:01 -0800", instant: "1997-11-24T14:22:01-08:00" },
+    {
+      text: "Thu,\r\n      13\r\n        Feb\r\n          1969\r\n      23:32\r\n               -0330 (Newfoundland Time)",
+      instant: "1969-02-13T23:32:00-03:30",
+    },
+    { text: "21 Nov 97 09:55:06 GMT", instant: "1997-11-21T09:55:06Z" },
+    {
+      text: "Fri, 21 Nov 1997 09(comment):   55  :  06 -0600",
+      instant: "1997-11-21T09:55:06-06:00",
+    },
+  ]
+
+test "RFC 5322's example `{c.instant}` is read as written there" for c: Message in rfc_5322_examples(
+  ) { assert_eq(option_map(parse_rfc5322(c.text), rfc3339), Some(c.instant)) }
+
+fn obsolete_dates() -> List<Message> =
+  [
+    { text: "1 Jan 49 00:00 UT", instant: "2049-01-01T00:00:00Z" },
+    { text: "1 Jan 50 00:00 UT", instant: "1950-01-01T00:00:00Z" },
+    { text: "1 Jan 100 00:00 UT", instant: "2000-01-01T00:00:00Z" },
+    { text: "1 Jan 126 00:00 UT", instant: "2026-01-01T00:00:00Z" },
+    { text: "4 Oct 2026 12:30 EDT", instant: "2026-10-04T12:30:00-04:00" },
+    { text: "4 Oct 2026 12:30 est", instant: "2026-10-04T12:30:00-05:00" },
+    { text: "4 Oct 2026 12:30 CDT", instant: "2026-10-04T12:30:00-05:00" },
+    { text: "4 Oct 2026 12:30 CST", instant: "2026-10-04T12:30:00-06:00" },
+    { text: "4 Oct 2026 12:30 MDT", instant: "2026-10-04T12:30:00-06:00" },
+    { text: "4 Oct 2026 12:30 MST", instant: "2026-10-04T12:30:00-07:00" },
+    { text: "4 Oct 2026 12:30 PDT", instant: "2026-10-04T12:30:00-07:00" },
+    { text: "4 Oct 2026 12:30 PST", instant: "2026-10-04T12:30:00-08:00" },
+    { text: "4 Oct 2026 12:30 A", instant: "2026-10-04T12:30:00Z" },
+    { text: "4 Oct 2026 12:30 CET", instant: "2026-10-04T12:30:00Z" },
+    { text: "4 Oct 2026 12:30 -0000", instant: "2026-10-04T12:30:00Z" },
+    { text: "SUN , 4 oct 2026 12:30:15 +0530", instant: "2026-10-04T12:30:15+05:30" },
+    {
+      text: "(a (nested \\) one)) 4 Oct 2026 12:30 +0000 (and after)",
+      instant: "2026-10-04T12:30:00Z",
+    },
+    { text: "4Oct2026 12:30+0000", instant: "2026-10-04T12:30:00Z" },
+  ]
+
+test "RFC 5322 reads `{c.text}` as {c.instant}" for c: Message in obsolete_dates() {
+  assert_eq(option_map(parse_rfc5322(c.text), rfc3339), Some(c.instant))
+}
+
+fn not_rfc_5322() -> List<String> =
+  [
+    "",
+    "Sat, 4 Oct 2026 12:30 +0000",
+    "4 Oct 2026 12:30",
+    "4 Oct 2026 12 +0000",
+    "4 Oct 2026 1230 +0000",
+    "4 October 2026 12:30 +0000",
+    "4 Oct 6 12:30 +0000",
+    "4 Oct 20260 12:30 +0000",
+    "32 Oct 2026 12:30 +0000",
+    "004 Oct 2026 12:30 +0000",
+    "4 Oct 2026 24:00 +0000",
+    "4 Oct 2026 12:30 +2400",
+    "4 Oct 2026 12:30 +0060",
+    "4 Oct 2026 12:30 +00:00",
+    "4 Oct 2026 12:30 +0000 trailing",
+    "4 Oct 2026 12:30 +0000 (unclosed",
+    "Sun 4 Oct 2026 12:30 +0000",
+    "4 Oct 2026\r\n12:30 +0000",
+  ]
+
+test "RFC 5322 does not allow `{c}`" for c: String in not_rfc_5322() {
+  assert_eq(parse_rfc5322(c), None)
+}
+
+test "an RFC 5322 date is written with its weekday and offset, to the second" {
+  assert_eq(
+    rfc5322(the_instant("1997-11-21T09:55:06.75-06:00")),
+    "Fri, 21 Nov 1997 09:55:06 -0600",
+  );
+  assert_eq(rfc5322(the_instant("2026-10-04T12:30:00Z")), "Sun, 04 Oct 2026 12:30:00 +0000");
+  assert_eq(rfc5322(the_instant("2026-10-04T12:30:00+05:30")), "Sun, 04 Oct 2026 12:30:00 +0530")
+}
+
+fn faulty_patterns() -> List<Faulty> =
+  [
+    { text: "%Y-%m-%", message: "a `%` wants a letter after it", offset: 6 },
+    { text: "%Y %Q", message: "`%Q` is no directive", offset: 3 },
+    { text: "at %c", message: "`%c` depends on a locale, and there is none here", offset: 3 },
+    {
+      text: "%H:%M %Z",
+      message: "`%Z` is a zone's name, and an offset has none: `%z` writes the offset",
+      offset: 6,
+    },
+    {
+      text: "%S.%f",
+      message: "`%f` is no directive: `%N` is the nanoseconds and `%6N` six digits of them",
+      offset: 3,
+    },
+    { text: "%-B", message: "`%B` takes no flag", offset: 0 },
+    { text: "%3Y", message: "`%Y` takes `-` or `_` and nothing else", offset: 0 },
+    { text: "%:H", message: "`%H` takes `-` or `_` and nothing else", offset: 0 },
+    {
+      text: "%-N",
+      message: "`%N` takes a count of digits from 1 to 9 and nothing else",
+      offset: 0,
+    },
+    { text: "%3z", message: "`%z` takes `:` and nothing else", offset: 0 },
+    { text: "%--d", message: "`%-` is no directive", offset: 0 },
+    { text: "%0d", message: "`%0` is no directive", offset: 0 },
+  ]
+
+test "the pattern `{c.text}` is refused at {c.offset}: {c.message}" for c: Faulty in faulty_patterns(
+  ) { assert_eq(result_err(pattern(c.text)), Some({ message: c.message, offset: c.offset })) }
+
+type Written = { pattern: String, text: String }
+
+fn written_patterns() -> List<Written> =
+  [
+    { pattern: "%Y-%m-%dT%H:%M:%S%:z", text: "2026-03-04T05:06:07+05:30" },
+    { pattern: "%FT%T.%3N%z", text: "2026-03-04T05:06:07.089+0530" },
+    { pattern: "%A, %-d %B %Y", text: "Wednesday, 4 March 2026" },
+    { pattern: "%a %b %e %R %y", text: "Wed Mar  4 05:06 26" },
+    { pattern: "%I:%M %p", text: "05:06 AM" },
+    { pattern: "%-I.%M%p", text: "5.06AM" },
+    { pattern: "%_H|%_m|%-j|%j", text: " 5| 3|63|063" },
+    { pattern: "%G-W%V-%u (%w)", text: "2026-W10-3 (3)" },
+    { pattern: "%N %6N %1N", text: "089123456 089123 0" },
+    { pattern: "100%% done%n%t.", text: "100% done\n\t." },
+    { pattern: "", text: "" },
+  ]
+
+test "`{c.pattern}` writes {c.text}" for c: Written in written_patterns() {
+  assert_eq(
+    format(the_pattern(c.pattern), the_instant("2026-03-04T05:06:07.089123456+05:30")),
+    c.text,
+  )
+}
+
+test "a pattern writes a date, a time or a date-time where it asks for nothing they lack" {
+  let d = the_date("2026-03-04");
+  let t = the_time("17:06:07");
+  assert_eq(format_date(the_pattern("%d/%m/%Y"), d), Some("04/03/2026"));
+  assert_eq(format_date(the_pattern("%d/%m/%Y %H"), d), None);
+  assert_eq(format_time(the_pattern("%-I %p"), t), Some("5 PM"));
+  assert_eq(format_time(the_pattern("%I %p"), midnight()), Some("12 AM"));
+  assert_eq(format_time(the_pattern("%I %p"), the_time("12:00:00")), Some("12 PM"));
+  assert_eq(format_time(the_pattern("%F"), t), None);
+  assert_eq(format_date_time(the_pattern("%F %T"), at(d, t)), Some("2026-03-04 17:06:07"));
+  assert_eq(format_date_time(the_pattern("%F %T %z"), at(d, t)), None)
+}
+
+test "a pattern reads back what it names: a date whole, a time by its hour, an offset" {
+  let d = the_date("2026-03-04");
+  assert_eq(
+    parse_with(the_pattern("%d/%m/%Y"), "04/03/2026"),
+    Some({ date: Some(d), time: None, offset: None }),
+  );
+  assert_eq(
+    parse_with(the_pattern("%Y-%j"), "2026-063"),
+    Some({ date: Some(d), time: None, offset: None }),
+  );
+  assert_eq(
+    parse_with(the_pattern("%G-W%V-%u"), "2026-W10-3"),
+    Some({ date: Some(d), time: None, offset: None }),
+  );
+  assert_eq(
+    parse_with(the_pattern("%a %b %e %y, %-I.%M%p"), "Wed Mar  4 26, 5.06PM"),
+    Some({ date: Some(d), time: time(17, 6, 0, 0), offset: None }),
+  );
+  assert_eq(
+    parse_with(the_pattern("%H:%M:%S.%3N %z"), "05:06:07.089 -0330"),
+    Some({ date: None, time: time(5, 6, 7, 89000000), offset: Some(-210) }),
+  );
+  assert_eq(
+    parse_with(the_pattern("%I %p"), "12 AM"),
+    Some({ date: None, time: Some(midnight()), offset: None }),
+  );
+  assert_eq(
+    parse_with(the_pattern("%d %b %y"), "04 Mar 69"),
+    Some({ date: of(1969, 3, 4), time: None, offset: None }),
+  );
+  assert_eq(
+    parse_with(the_pattern("at %%"), "at %"),
+    Some({ date: None, time: None, offset: None }),
+  )
+}
+
+type Unread = { pattern: String, text: String }
+
+fn unread() -> List<Unread> =
+  [
+    { pattern: "%d/%m/%Y", text: "4/3/2026" },
+    { pattern: "%d/%m/%Y", text: "04/03/2026 " },
+    { pattern: "%d/%m/%Y", text: "31/04/2026" },
+    { pattern: "%d/%m", text: "04/03" },
+    { pattern: "%Y", text: "2026" },
+    { pattern: "%A", text: "Wednesday" },
+    { pattern: "%A %F", text: "Thursday 2026-03-04" },
+    { pattern: "%A %F", text: "wednesday 2026-03-04" },
+    { pattern: "%F %j", text: "2026-03-04 064" },
+    { pattern: "%F %Y", text: "2026-03-04 2027" },
+    { pattern: "%M:%S", text: "06:07" },
+    { pattern: "%I:%M", text: "05:06" },
+    { pattern: "%H %p", text: "05 AM" },
+    { pattern: "%I %p", text: "13 PM" },
+    { pattern: "%H %I %p", text: "17 05 AM" },
+    { pattern: "%H:%M", text: "24:00" },
+    { pattern: "%z", text: "Z" },
+    { pattern: "%z", text: "+05:30" },
+    { pattern: "%:z", text: "+0530" },
+    { pattern: "%-d", text: "" },
+    { pattern: "%e/%m/%Y", text: "4/03/2026" },
+  ]
+
+test "`{c.pattern}` does not read `{c.text}`" for c: Unread in unread() {
+  assert_eq(parse_with(the_pattern(c.pattern), c.text), None)
+}
