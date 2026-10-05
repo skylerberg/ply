@@ -13,8 +13,9 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 keyword_test, keyword_import, dump_node, dump_count, dump_presence, dump_payload,
                 dump_word, dump_bool, dump_list, dump_opt, dump_ident, dump_qname, dump_diags, Doc,
                 doc_at, module_doc, token_between, dump_doc, primary_span_of)
-import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, Keyword, Punctuation,
-              EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark, follows_name)
+import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, InterpolatedTail,
+              Keyword, Punctuation, EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark,
+              follows_name)
 import type_syntax (TypeExpr, TRecord, TUnit, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead,
                     MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row,
                     row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
@@ -2223,6 +2224,74 @@ fn hidden_import(module: Bytes, binder: Bytes, span: Span) -> ImportDecl =
 pub fn is_written(decl: ImportDecl) -> Bool =
   match decl.kind { IAlias(a) -> !hidden_binder(a.name), _ -> true }
 
+/// The module `src` with its imports alone, the hidden ones among them, and none of its items:
+/// what a load reads to find the modules a program pulls, without parsing a body. `None` where only
+/// a whole parse says what it imports: an `import` after an item, or a `derive`, whose expansion
+/// imports the runtime it calls.
+pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
+  let s = start(src);
+  let input = s.input;
+  let leading = imports(input, s.parser);
+  let n = input.token_count;
+  let kind = |i: Int| match list_at(input.tokens, i) { Some(t) -> t.kind, None -> EndOfInput };
+  let ident = |i: Int, text: Bytes| kind(i) == Identifier(text);
+  let whole = fold(range(leading.parser.pos, n), false, |acc: Bool, i: Int|
+    acc || kind(i) == keyword_import() || (ident(i, b"derive") && tok_is_ident(kind(i + 1))));
+  if whole { None } else {
+    let span_at = |i: Int|
+      match list_at(input.tokens, i) {
+        Some(t) -> { start: t.start, end: t.end },
+        None -> { start: 0, end: 0 },
+      };
+    // Past an interpolated string the token opens at `i`: its holes may hold strings of their own.
+    let past_string = |i: Int|
+      iterate({ at: i, depth: 0 }, n + 1, |s: { at: Int, depth: Int }|
+        match kind(s.at) {
+          InterpolatedHead(_) -> Continue({ at: s.at + 1, depth: s.depth + 1 }),
+          InterpolatedTail(_) -> if s.depth == 1 { Stop({ at: s.at + 1, depth: 0 }) }
+          else { Continue({ at: s.at + 1, depth: s.depth - 1 }) },
+          EndOfInput -> Stop(s),
+          _ -> Continue({ at: s.at + 1, depth: s.depth }),
+        }).at;
+    let shown = fold(range(0, n), None, |acc: Option<Span>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> match kind(i) {
+          InterpolatedHead(_) -> {
+            let sp = span_at(i);
+            if follows_name(input.source, sp.start) { None } else { Some(sp) }
+          },
+          _ -> None,
+        },
+      });
+    let cased = fold(range(0, n), None, |acc: Option<Span>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> if kind(i) != keyword_test() { None } else {
+          let label = if kind(i + 1) == token_slash() { i + 3 } else { i + 1 };
+          let after = match kind(label) {
+            StringLiteral(_) -> label + 1,
+            InterpolatedHead(_) -> past_string(label),
+            _ -> label,
+          };
+          if after != label && ident(after, b"for") { Some(span_at(after)) } else { None }
+        },
+      });
+    let with_shown = match shown {
+      None -> leading.node,
+      Some(sp) -> push(leading.node, hidden_import(b"show", shown_binder(), sp)),
+    };
+    Some({
+      doc: module_doc(input),
+      imports: match cased {
+        None -> with_shown,
+        Some(sp) -> push(with_shown, hidden_import(b"cases", cases_binder(), sp)),
+      },
+      items: [],
+    })
+  }
+}
+
 pub fn parse(src: Bytes) -> Parsed<Module> / {abort.raise} = {
   let s = start(src);
   let r = run(s.input, s.parser);
@@ -3069,4 +3138,17 @@ test "`key for T by f` and `show for T by f` are items, and neither word is rese
     ),
     [b"E0003"],
   )
+}
+
+test "a header holds the imports a whole parse finds, the hidden ones among them" {
+  let same = |src: Bytes|
+    match header(src) { None -> false, Some(m) -> m.imports == parse(src).node.imports };
+  assert(same(b"import std.list (at)\nimport std.json as j\nfn f() -> Int = 1\n"), None);
+  assert(same(b"fn f(n: Int) -> String = \"n is {n}\"\n"), None);
+  assert(same(b"fn f(n: Int) -> Q = q\"n is {n}\"\n"), None);
+  assert(same(b"test \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }\n"), None);
+  assert(same(b"test/nondet \"each\" for n: Int in [1] { assert(n > 0) }\n"), None);
+  assert(same(b"test \"plain\" { assert(true) }\nfn for_each() -> Int = 1\n"), None);
+  assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None);
+  assert_eq(header(b"type T = { a: Int }\nderive bin for T\n"), None)
 }
