@@ -1,6 +1,6 @@
 //! The type language, unification, the type environment and the type printer `infer.ply` checks with.
 
-import type_syntax (Mode, MRead, MWrite, MBad)
+import type_syntax (Mode, MRead, MWrite, MBad, angled)
 import std.list (at, concat, contains, drop, take)
 import std.bytes (join)
 
@@ -389,6 +389,40 @@ pub fn label_of(ty: Type) -> Option<Bytes> / {abort.raise} =
     _ -> None,
   }
 
+/// A declared type's label and row arguments ride after its type arguments, so whatever walks a
+/// type's arguments meets them: a label under `#label`, a row as the row of a function answering
+/// `#row`. No source can spell either name.
+fn label_arg(label: Type) -> Type = applied_type(b"#label", label)
+
+fn row_arg(row: Row) -> Type = fn_type([], named_type(b"#row"), row)
+
+fn arg_label(ty: Type) -> Option<Type> =
+  match ty { TyCon(c) -> if c.name == b"#label" { list_at(c.args, 0) } else { None }, _ -> None }
+
+fn arg_row(ty: Type) -> Option<Row> =
+  match ty {
+    TyFn(f) -> match f.ret {
+      TyCon(c) -> if c.name == b"#row" { Some(f.effects) } else { None },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+pub fn applied_args(tys: List<Type>, labels: List<Type>, rows: List<Row>) -> List<Type> =
+  if len(labels) == 0 && len(rows) == 0 { tys }
+  else { concat(concat(tys, map(labels, label_arg)), map(rows, row_arg)) }
+
+/// Whether an argument is a label or a row rather than a type.
+pub fn over_arg(ty: Type) -> Bool =
+  match ty {
+    TyCon(c) -> c.name == b"#label",
+    TyFn(f) -> match f.ret { TyCon(c) -> c.name == b"#row", _ -> false },
+    _ -> false,
+  }
+
+/// The arguments that are types: what a value's shape turns on.
+pub fn type_args(args: List<Type>) -> List<Type> = filter(args, |a: Type| !over_arg(a))
+
 pub fn resolve_atom(subst: Subst, atom: Atom) -> Atom / {abort.raise} =
   match atom.resource {
     RVar(v) ->
@@ -566,7 +600,21 @@ fn unify_structural(
       TyCon(c2) -> if c1.name != c2.name || len(c1.args) != len(c2.args) {
         unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
       } else if len(c1.args) == 0 { unified(subst, fresh) } else {
-        unify_all(subst, fresh, c1.args, c2.args, exact || !covariant_con(c1.name), room, tries)
+        let u = unify_all(
+          subst,
+          fresh,
+          c1.args,
+          c2.args,
+          exact || !covariant_con(c1.name),
+          room,
+          tries,
+        );
+        // Two labels that differ are told as the label arguments they are.
+        match u.error {
+          None -> u,
+          Some(_) -> if !over_arg(a) { u }
+          else { unify_failed(u.subst, u.fresh, Mismatch({ expected: a, found: b })) },
+        }
       },
       _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
     },
@@ -849,6 +897,51 @@ fn rename_atom(atom: Atom, tys: Map<Int, Type>) -> Atom / {abort.raise} =
     _ -> atom,
   }
 
+/// As `rename`, with a row in place of a row variable: the row's atoms join the ones written
+/// beside the variable, and its tail takes the variable's place. One pass, so what a variable gives
+/// way to may name that variable.
+fn substituted(t: Type, tys: Map<Int, Type>, rows: Map<Int, Row>) -> Type / {abort.raise} =
+  match t {
+    TyVar(v) -> match map_get(tys, v) { Some(x) -> x, None -> t },
+    TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| substituted(a, tys, rows)) }),
+    TyFn(f) -> {
+      let atoms = fold(f.effects.atoms, [], |acc: List<Atom>, a: Atom|
+        atoms_insert(acc, rename_atom(a, tys)));
+      let filled = match f.effects.tail { None -> None, Some(v) -> map_get(rows, v) };
+      TyFn({
+        params: map(f.params, |p: Type| substituted(p, tys, rows)),
+        ret: substituted(f.ret, tys, rows),
+        effects: match filled {
+          Some(row) -> { atoms: atoms_union(atoms, row.atoms), tail: row.tail },
+          None -> { atoms: atoms, tail: f.effects.tail },
+        },
+      })
+    },
+    TyRecord(fs) ->
+      TyRecord(map(fs, |x: Field| { name: x.name, ty: substituted(x.ty, tys, rows) })),
+  }
+
+/// A declaration's type as one use of it holds it: the declaration's variables give way to the
+/// use's arguments, which ride in the order it binds them, types and labels, then rows.
+pub fn at_arguments(
+  ty: Type,
+  ty_vars: List<Int>,
+  row_vars: List<Int>,
+  args: List<Type>,
+) -> Type / {abort.raise} = {
+  let tys = fold(range(0, len(ty_vars)), map_new(), |m: Map<Int, Type>, i: Int|
+    match list_at(args, i) {
+      Some(a) -> map_insert(m, at(ty_vars, i), match arg_label(a) { Some(l) -> l, None -> a }),
+      None -> m,
+    });
+  let rows = fold(range(0, len(row_vars)), map_new(), |m: Map<Int, Row>, i: Int|
+    match list_at(args, len(ty_vars) + i) {
+      Some(a) -> match arg_row(a) { Some(r) -> map_insert(m, at(row_vars, i), r), None -> m },
+      None -> m,
+    });
+  substituted(ty, tys, rows)
+}
+
 /// `labels` are the fresh variables the scheme's label parameters became, in declaration order.
 pub type Instantiated = { fresh: Fresh, ty: Type, args: List<Type>, labels: List<Type> }
 
@@ -1066,10 +1159,16 @@ fn reserve_resource(printer: Printer, resource: Resource) -> Printer =
 pub fn reserve_atoms(printer: Printer, atoms: List<Atom>) -> Printer =
   fold(atoms, printer, |acc: Printer, atom: Atom| reserve_resource(acc, atom.resource))
 
-fn reserve_ty(printer: Printer, t: Type) -> Printer =
+fn reserve_ty(printer: Printer, t: Type) -> Printer / {abort.raise} =
   match t {
     TyVar(_) -> printer,
-    TyCon(c) -> fold(c.args, printer, |acc: Printer, a: Type| reserve_ty(acc, a)),
+    TyCon(c) -> match arg_label(t) {
+      Some(l) -> match label_of(l) {
+        Some(n) -> reserve_resource(printer, RNamed(n)),
+        None -> printer,
+      },
+      None -> fold(c.args, printer, |acc: Printer, a: Type| reserve_ty(acc, a)),
+    },
     TyFn(f) ->
       reserve_atoms(
         reserve_ty(fold(f.params, printer, |acc: Printer, x: Type| reserve_ty(acc, x)), f.ret),
@@ -1131,6 +1230,19 @@ pub fn resource_text(resource: Resource) -> Bytes / {abort.raise} =
 pub fn print_ty(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {abort.raise} =
   printed(reserve_ty(printer, ty), ty)
 
+/// A label argument: the resource it names, or the name its variable prints under.
+fn label_text(printer: Printer, label: Type) -> { printer: Printer, text: Bytes } / {abort.raise} =
+  match label_of(label) {
+    Some(n) -> { printer: printer, text: n },
+    None -> match label {
+      TyVar(v) -> {
+        let o = label_name(printer, v);
+        { printer: o.printer, text: o.name }
+      },
+      _ -> printed(printer, label),
+    },
+  }
+
 /// Its resources already reserved, all of them at once, so no part of the type walks them again.
 fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {abort.raise} =
   match ty {
@@ -1145,21 +1257,29 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
           { printer: elem.printer, text: bytes_concat_all([b"Cell[", r, b"]<", elem.text, b">"]) },
         None -> { printer: elem.printer, text: bytes_concat_all([b"Cell<", elem.text, b">"]) },
       }
-    } else if len(c.args) == 0 { { printer: printer, text: c.name } } else {
+    } else if len(c.args) == 0 { { printer: printer, text: c.name } } else if over_arg(ty) {
+      let o = label_text(printer, at(c.args, 0));
+      { printer: o.printer, text: bytes_concat_all([b"[", o.text, b"]"]) }
+    } else if fold(c.args, false, |any: Bool, a: Type| any || over_arg(a)) {
+      printed_over(printer, c.name, c.args)
+    } else {
       let args = print_tys(printer, c.args);
       {
         printer: args.printer,
         text: bytes_concat_all([c.name, b"<", join(args.texts, b", "), b">"]),
       }
     },
-    TyFn(f) -> {
-      let ps = print_tys(printer, f.params);
-      let r = printed(ps.printer, f.ret);
-      let head = bytes_concat_all([b"(", join(ps.texts, b", "), b") -> ", r.text]);
-      if row_is_pure(f.effects) { { printer: r.printer, text: head } } else {
-        let row = print_row(r.printer, f.effects);
-        { printer: row.printer, text: bytes_concat_all([head, b" / ", row.text]) }
-      }
+    TyFn(f) -> match arg_row(ty) {
+      Some(row) -> print_row(printer, row),
+      None -> {
+        let ps = print_tys(printer, f.params);
+        let r = printed(ps.printer, f.ret);
+        let head = bytes_concat_all([b"(", join(ps.texts, b", "), b") -> ", r.text]);
+        if row_is_pure(f.effects) { { printer: r.printer, text: head } } else {
+          let row = print_row(r.printer, f.effects);
+          { printer: row.printer, text: bytes_concat_all([head, b" / ", row.text]) }
+        }
+      },
     },
     TyRecord(fs) -> match tuple_arity(fs) {
       Some(n) -> {
@@ -1189,6 +1309,40 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
       },
     },
   }
+
+/// A declared type with the labels and rows it is given, each kind where a use writes it.
+fn printed_over(
+  printer: Printer,
+  name: Bytes,
+  args: List<Type>,
+) -> { printer: Printer, text: Bytes } / {abort.raise} = {
+  let types = print_tys(printer, type_args(args));
+  let labels = fold(
+    args,
+    { printer: types.printer, texts: [] },
+    |acc: { printer: Printer, texts: List<Bytes> }, a: Type|
+      match arg_label(a) {
+        Some(l) -> {
+          let o = label_text(acc.printer, l);
+          { printer: o.printer, texts: push(acc.texts, o.text) }
+        },
+        None -> acc,
+      },
+  );
+  let rows = fold(
+    args,
+    { printer: labels.printer, texts: [] },
+    |acc: { printer: Printer, texts: List<Bytes> }, a: Type|
+      match arg_row(a) {
+        Some(r) -> {
+          let o = print_row(acc.printer, r);
+          { printer: o.printer, texts: push(acc.texts, o.text) }
+        },
+        None -> acc,
+      },
+  );
+  { printer: rows.printer, text: bytes_concat(name, angled(types.texts, labels.texts, rows.texts)) }
+}
 
 fn print_tys(
   printer: Printer,
@@ -1618,6 +1772,48 @@ test "instantiating a scheme freshens its label parameters and hands them back" 
     rigid_row: map_new(),
   };
   assert_eq(type_text(resolve_ty(s, inst.ty)), b"() -> Unit / {net.send[conn]}")
+}
+
+test "a declared type's labels and rows print in their places, unify as arguments and fill its fields" {
+  let send = |r: Resource| { effect: b"net", resource: r, mode: MWrite, op: Some(b"send") };
+  let held = |label: Type, row: Row|
+    TyCon({ name: b"m.Sink", args: applied_args([int_type()], [label], [row]) });
+  let open = held(TyVar(1), row_open(2));
+  let conn = held(label_type(b"conn"), row_singleton(send(RNamed(b"conn"))));
+  assert_eq(type_text(open), b"m.Sink<Int, [l] | e>");
+  assert_eq(type_text(conn), b"m.Sink<Int, [conn] | {net.send[conn]}>");
+  assert_eq(
+    type_text(TyCon({ name: b"m.Box", args: applied_args([], [], [row_empty()]) })),
+    b"m.Box<| {}>",
+  );
+  let fresh = { next_ty: 3, next_row: 3 };
+  let u = unify(subst_new(), fresh, open, conn);
+  assert(u.error == None);
+  assert_eq(type_text(resolve_ty(u.subst, open)), type_text(conn));
+  // A sum holds what it is given exactly: a narrower row is another type, and so is another label.
+  let narrower = unify(subst_new(), fresh, conn, held(label_type(b"conn"), row_empty()));
+  assert(match narrower.error { Some(RowMismatch(_)) -> true, _ -> false });
+  let elsewhere = unify(subst_new(), fresh, conn, held(label_type(b"peer"), row_open(2)));
+  assert(match elsewhere.error {
+    Some(Mismatch(m)) -> type_text(m.expected) == b"[conn]" && type_text(m.found) == b"[peer]",
+    _ -> false,
+  });
+  // A field written over the declaration's variables, as one use holds it. An argument may name a
+  // variable it replaces.
+  let field = fn_type([TyVar(0)], open, { atoms: [send(RVar(1))], tail: Some(2) });
+  assert_eq(
+    type_text(
+      at_arguments(
+        field,
+        [0, 1],
+        [2],
+        applied_args([TyVar(5)], [label_type(b"conn")], [
+          { atoms: [send(RVar(1))], tail: Some(2) },
+        ]),
+      ),
+    ),
+    b"(a) -> m.Sink<Int, [conn] | {net.send[l] | e}> / {net.send[conn], net.send[l] | e}",
+  )
 }
 
 test "generalization skips what the environment still reaches" {
