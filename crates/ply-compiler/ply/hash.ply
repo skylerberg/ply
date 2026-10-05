@@ -19,7 +19,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               constraint_written, SpecKind, SRequires, SEnsures, SCost, SpecClause, ReturnsFresh,
               ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub, TDNominal, test_listing,
               test_run, case_params, schema_of, IInstance, InstanceDef, InstanceKind, NKey, NShow,
-              instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
+              NGen, instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
@@ -363,16 +363,18 @@ pub fn build_index(
   { index: { ..index, effect_sketches: sketch_effects(index) }, diags: built.diags }
 }
 
-/// Each type's `key` before its `show`, whatever order the module wrote them in.
+/// Each type's `key` before its `show`, whatever order the module wrote them in. A `gen` is no part
+/// of what its type is: it decides what a sample draws and nothing a program computes.
 fn instances_in(items: List<Item>) -> Map<Bytes, List<InstanceDef>> =
   fold(items, map_new(), |acc: Map<Bytes, List<InstanceDef>>, item: Item|
     match item {
       IInstance(d) -> {
         let held = match map_get(acc, d.target.name) { Some(xs) -> xs, None -> [] };
-        map_insert(acc, d.target.name, match d.kind {
-          NKey -> concat([d], held),
-          NShow -> push(held, d),
-        })
+        match d.kind {
+          NKey -> map_insert(acc, d.target.name, concat([d], held)),
+          NShow -> map_insert(acc, d.target.name, push(held, d)),
+          NGen -> acc,
+        }
       },
       _ -> acc,
     })
@@ -1051,7 +1053,7 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
     None -> closed,
     Some(stated) ->
       fold(stated, closed, |acc: Encoder, x: InstanceDef|
-        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), NShow -> tag_show() }), {
+        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), _ -> tag_show() }), {
           module: None,
           name: x.by,
           span: x.by.span,
@@ -6549,4 +6551,42 @@ test "a key and a show print back after their type and hash back to what they we
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a gen is no part of its type's hash, and its sampler's covers the generator" {
+  let stating = |stated: Bytes, drawn: Bytes|
+    by_name(
+      named_hashes(
+        hash_index(
+          indexed([
+            {
+              name: b"m",
+              src: bytes_concat_all([
+                b"import std.gen (Gen, constant)\npub type Box = | Box(Int)\n",
+                stated,
+                b"pub fn boxes() -> Gen<Box> = constant(Box(",
+                drawn,
+                b"))\npub fn make() -> Box = Box(1)\n",
+              ]),
+            },
+            {
+              name: b"std.gen",
+              src: b"pub type Gen<a> = | Gen((Int) -> Option<a>)\npub type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\npub fn sample<a>(g: Gen<a>, root: Int, key: Bytes, size: Int, replay: Option<List<Int>>) -> Sample<a> = match g { Gen(f) -> { value: f(root), record: [], discards: 0 } }\npub fn elements<a>(xs: List<a>) -> Gen<a> = Gen(|i: Int| list_at(xs, i))\npub fn constant<a>(x: a) -> Gen<a> = Gen(|_i: Int| Some(x))\n",
+            },
+          ]),
+        ),
+      ),
+    );
+  let plain = stating(b"", b"1");
+  let stated = stating(b"gen for Box by boxes\n", b"1");
+  let edited = stating(b"gen for Box by boxes\n", b"2");
+  let named = |m: Map<Bytes, Bytes>, n: Bytes| map_get(m, n);
+  // Stating one, and editing it, leave the type and what can hold it where they were.
+  assert_eq(named(plain, b"m.Box"), named(stated, b"m.Box"));
+  assert_eq(named(stated, b"m.Box"), named(edited, b"m.Box"));
+  assert_eq(named(plain, b"m.make"), named(edited, b"m.make"));
+  // The sampler is a definition beside the statement, and moves with the generator it samples.
+  assert_eq(named(plain, b"m._sample_Box"), None);
+  assert(named(stated, b"m._sample_Box") != None);
+  assert(named(stated, b"m._sample_Box") != named(edited, b"m._sample_Box"))
 }

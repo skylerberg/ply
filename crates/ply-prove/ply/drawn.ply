@@ -1,0 +1,462 @@
+//! `drawn` — a value a stated generator draws, as the prover carries it among a point's values.
+//!
+//! A type that states a generator (`gen for T by f`) is drawn by its sampler, a definition of the
+//! program the claim is about, so the prover cannot make the value itself. It draws where the value
+//! goes and the stream it comes from; the runtime enters the sampler; and what comes back is the
+//! value beside the record of draws that made it. The two travel together wherever the point's values
+//! go, so a counterexample shrinks by replaying a shorter or lower record through the same generator,
+//! and never to a value the generator would not make. A carried value is this module's to read:
+//! the runtime and a report are handed `bare`.
+
+import std.list (concat)
+import std.value (Entry, FAnonymous, FConst, FProject, FTable, Field, VArray, VBytes, VCell, VChan,
+                  VCtor, VElided, VFn, VInt, VList, VMap, VRecord, VSecret, VShown, VStr, VTask,
+                  Value, field_named, map_of)
+
+/// One value a sampler draws: the type, the definition that samples it, the values each of the
+/// type's parameters is chosen among, how large it may grow, and how far the draw has come.
+pub type Draw = { ty: String, sampler: String, pools: List<List<Value>>, size: Int, state: State }
+
+pub type State =
+  /// To be drawn from the stream `key` names under `root`.
+  | Fresh({ root: Int, key: Bytes })
+  /// To be drawn from a record.
+  | Replay(List<Int>)
+  /// Drawn: the draws it took, and the value they made.
+  | Made({ record: List<Int>, value: Value })
+
+/// What one entry of a sampler answered.
+pub type Sampled = { value: Option<Value>, record: List<Int>, discards: Int }
+
+/// The constructor a carried value is under, which no program declares.
+fn mark() -> String = "?drawn"
+
+fn ints(xs: List<Int>) -> Value = VList(map(xs, |n: Int| VInt(n)))
+
+pub fn carried(d: Draw) -> Value =
+  VCtor(mark(), [
+    VStr(d.ty),
+    VStr(d.sampler),
+    VList(map(d.pools, |pool: List<Value>| VList(pool))),
+    VInt(d.size),
+    match d.state {
+      Fresh(f) -> VCtor("?fresh", [VInt(f.root), VBytes(f.key)]),
+      Replay(record) -> VCtor("?replay", [ints(record)]),
+      Made(m) -> VCtor("?made", [ints(m.record), m.value]),
+    },
+  ])
+
+fn ints_of(v: Value) -> List<Int> =
+  match v {
+    VList(items) ->
+      fold(items, [], |acc: List<Int>, x: Value| match x { VInt(n) -> push(acc, n), _ -> acc }),
+    _ -> [],
+  }
+
+pub fn draw_of(v: Value) -> Option<Draw> =
+  match v {
+    VCtor(name, [VStr(ty), VStr(sampler), VList(pools), VInt(size), VCtor(state, held)]) -> if name
+        != mark() { None } else {
+      let shaped = match ((state, held)) {
+        ("?fresh", [VInt(root), VBytes(key)]) -> Some(Fresh({ root: root, key: key })),
+        ("?replay", [record]) -> Some(Replay(ints_of(record))),
+        ("?made", [record, value]) -> Some(Made({ record: ints_of(record), value: value })),
+        _ -> None,
+      };
+      match shaped {
+        None -> None,
+        Some(s) ->
+          Some({
+            ty: ty,
+            sampler: sampler,
+            pools: map(pools, |pool: Value| match pool { VList(items) -> items, _ -> [] }),
+            size: size,
+            state: s,
+          }),
+      }
+    },
+    _ -> None,
+  }
+
+/// `f` over each value a carried value's generator chose among, from `start`.
+pub fn over_pools<a | e>(v: Value, start: a, f: (a, Value) -> a / e) -> a / e =
+  match v {
+    VCtor(_, [_, _, VList(pools), ..]) ->
+      fold(pools, start, |acc: a, pool: Value|
+        match pool {
+          VList(items) -> fold(items, acc, |inner: a, x: Value| f(inner, x)),
+          _ -> acc,
+        }),
+    _ -> start,
+  }
+
+/// What the sampler is entered with: its name, each pool, then the stream and the record.
+pub fn entry(d: Draw) -> List<Value> = {
+  let pools = map(d.pools, |pool: List<Value>| VList(map(pool, bare)));
+  concat(concat([VStr(d.sampler)], pools), match d.state {
+    Fresh(f) -> [VInt(f.root), VBytes(f.key), VInt(d.size), VCtor("None", [])],
+    Replay(record) -> [VInt(0), VBytes(b""), VInt(d.size), VCtor("Some", [ints(record)])],
+    Made(m) -> [VInt(0), VBytes(b""), VInt(d.size), VCtor("Some", [ints(m.record)])],
+  })
+}
+
+/// What a sampler answered, read from the `std.gen.Sample` it is.
+pub fn sampled_of(answer: Value) -> Option<Sampled> =
+  match answer {
+    VRecord(fields) -> match ((
+        field_named(fields, "value"),
+        field_named(fields, "record"),
+        field_named(fields, "discards"),
+      )) {
+      (Some(VCtor(some, held)), Some(record), Some(VInt(discards))) ->
+        Some({
+          value: match ((some, held)) { ("Some", [v]) -> Some(v), _ -> None },
+          record: ints_of(record),
+          discards: discards,
+        }),
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// Whether the runtime can be handed `v` back: no function the program wrote, handle or credential
+/// is in it.
+pub fn crosses(v: Value) -> Bool =
+  match v {
+    VList(items) -> fold(items, true, |ok: Bool, x: Value| ok && crosses(x)),
+    VArray(items) -> fold(items, true, |ok: Bool, x: Value| ok && crosses(x)),
+    VRecord(fields) -> fold(fields, true, |ok: Bool, f: Field| ok && crosses(f.value)),
+    VCtor(_, args) -> fold(args, true, |ok: Bool, x: Value| ok && crosses(x)),
+    VMap(entries) ->
+      fold(entries, true, |ok: Bool, e: Entry| ok && crosses(e.key) && crosses(e.value)),
+    VFn(FConst(c)) -> crosses(c.value),
+    VFn(FProject(_)) -> true,
+    VFn(FTable(t)) ->
+      crosses(t.default)
+        && fold(t.entries, true, |ok: Bool, e: Entry| ok && crosses(e.key) && crosses(e.value)),
+    VFn(_) -> false,
+    VCell(_) -> false,
+    VTask(_) -> false,
+    VChan(_) -> false,
+    VSecret -> false,
+    VElided(_) -> false,
+    VShown(_) -> false,
+    _ -> true,
+  }
+
+/// `v` as the runtime and a report read it: each carried value the value it made, at any depth.
+pub fn bare(v: Value) -> Value = if carries(v) { stripped(v) } else { v }
+
+/// Whether `v` holds a carried value at all.
+fn carries(v: Value) -> Bool =
+  match v {
+    VList(items) -> fold(items, false, |hit: Bool, x: Value| hit || carries(x)),
+    VArray(items) -> fold(items, false, |hit: Bool, x: Value| hit || carries(x)),
+    VRecord(fields) -> fold(fields, false, |hit: Bool, x: Field| hit || carries(x.value)),
+    VCtor(name, args) ->
+      name == mark() || fold(args, false, |hit: Bool, x: Value| hit || carries(x)),
+    VMap(entries) ->
+      fold(entries, false, |hit: Bool, x: Entry| hit || carries(x.key) || carries(x.value)),
+    VFn(FConst(c)) -> carries(c.value),
+    VFn(FTable(t)) ->
+      carries(t.default)
+        || fold(t.entries, false, |hit: Bool, x: Entry| hit || carries(x.key) || carries(x.value)),
+    _ -> false,
+  }
+
+fn stripped(v: Value) -> Value =
+  match v {
+    VList(items) -> VList(map(items, stripped)),
+    VArray(items) -> VArray(map(items, stripped)),
+    VRecord(fields) -> VRecord(map(fields, |f: Field| { name: f.name, value: stripped(f.value) })),
+    VCtor(name, args) -> if name != mark() { VCtor(name, map(args, stripped)) } else {
+      match draw_of(v) { Some(d) -> match d.state { Made(m) -> m.value, _ -> v }, None -> v }
+    },
+    // A carried key sorts as what it carries, not as the value it made.
+    VMap(entries) ->
+      map_of(map(entries, |e: Entry| { key: stripped(e.key), value: stripped(e.value) })),
+    VFn(FConst(c)) -> VFn(FConst({ arity: c.arity, value: stripped(c.value) })),
+    VFn(FTable(t)) ->
+      VFn(
+        FTable({
+          arity: t.arity,
+          entries: map(t.entries, |e: Entry| { key: stripped(e.key), value: stripped(e.value) }),
+          default: stripped(t.default),
+        }),
+      ),
+    _ -> v,
+  }
+
+/// A value walked, and what the walk has come to.
+pub type Walk<s> = { value: Value, state: s }
+
+type Walked<s> = { values: List<Value>, state: s }
+
+type Paired<s> = { entries: List<Entry>, state: s }
+
+/// `v` with `f` over each draw in it that is ready to be made, in one order: a draw not made yet
+/// whose pools hold none. A draw whose pools hold one is walked into, and is ready once they are
+/// made.
+pub fn each_ready<s | e>(v: Value, state: s, f: (Draw, s) -> Walk<s> / e) -> Walk<s> / e =
+  match v {
+    VList(items) -> {
+      let w = fold(items, { values: [], state: state }, |acc: Walked<s>, x: Value| {
+        let made = each_ready(x, acc.state, f);
+        { values: push(acc.values, made.value), state: made.state }
+      });
+      { value: VList(w.values), state: w.state }
+    },
+    VArray(items) -> {
+      let w = fold(items, { values: [], state: state }, |acc: Walked<s>, x: Value| {
+        let made = each_ready(x, acc.state, f);
+        { values: push(acc.values, made.value), state: made.state }
+      });
+      { value: VArray(w.values), state: w.state }
+    },
+    VRecord(fields) -> {
+      let w = fold(
+        fields,
+        { fields: [], state: state },
+        |acc: { fields: List<Field>, state: s }, x: Field| {
+          let made = each_ready(x.value, acc.state, f);
+          { fields: push(acc.fields, { name: x.name, value: made.value }), state: made.state }
+        },
+      );
+      { value: VRecord(w.fields), state: w.state }
+    },
+    VCtor(name, args) -> if name != mark() {
+      let w = fold(args, { values: [], state: state }, |acc: Walked<s>, x: Value| {
+        let made = each_ready(x, acc.state, f);
+        { values: push(acc.values, made.value), state: made.state }
+      });
+      { value: VCtor(name, w.values), state: w.state }
+    } else {
+      match args {
+        [ty, sampler, VList(pools), size, VCtor(shape, held)] -> if shape == "?made" {
+          { value: v, state: state }
+        } else if !fold(pools, false, |any: Bool, pool: Value| any || unmade(pool)) {
+          match draw_of(v) { Some(d) -> f(d, state), None -> { value: v, state: state } }
+        } else {
+          let w = fold(pools, { values: [], state: state }, |acc: Walked<s>, pool: Value|
+            match pool {
+              VList(items) -> {
+                let p = fold(
+                  items,
+                  { values: [], state: acc.state },
+                  |inner: Walked<s>, x: Value| {
+                    let made = each_ready(x, inner.state, f);
+                    { values: push(inner.values, made.value), state: made.state }
+                  },
+                );
+                { values: push(acc.values, VList(p.values)), state: p.state }
+              },
+              other -> { values: push(acc.values, other), state: acc.state },
+            });
+          {
+            value: VCtor(name, [ty, sampler, VList(w.values), size, VCtor(shape, held)]),
+            state: w.state,
+          }
+        },
+        _ -> { value: v, state: state },
+      }
+    },
+    VMap(entries) -> {
+      let w = fold(entries, { entries: [], state: state }, |acc: Paired<s>, x: Entry| {
+        let k = each_ready(x.key, acc.state, f);
+        let made = each_ready(x.value, k.state, f);
+        { entries: push(acc.entries, { key: k.value, value: made.value }), state: made.state }
+      });
+      { value: VMap(w.entries), state: w.state }
+    },
+    VFn(FConst(c)) -> {
+      let w = each_ready(c.value, state, f);
+      { value: VFn(FConst({ arity: c.arity, value: w.value })), state: w.state }
+    },
+    VFn(FTable(t)) -> {
+      let es = fold(t.entries, { entries: [], state: state }, |acc: Paired<s>, x: Entry| {
+        let k = each_ready(x.key, acc.state, f);
+        let made = each_ready(x.value, k.state, f);
+        { entries: push(acc.entries, { key: k.value, value: made.value }), state: made.state }
+      });
+      let d = each_ready(t.default, es.state, f);
+      {
+        value: VFn(FTable({ arity: t.arity, entries: es.entries, default: d.value })),
+        state: d.state,
+      }
+    },
+    _ -> { value: v, state: state },
+  }
+
+/// Whether `v` holds a draw not made yet.
+pub fn unmade(v: Value) -> Bool =
+  match v {
+    VList(items) -> fold(items, false, |hit: Bool, x: Value| hit || unmade(x)),
+    VArray(items) -> fold(items, false, |hit: Bool, x: Value| hit || unmade(x)),
+    VRecord(fields) -> fold(fields, false, |hit: Bool, x: Field| hit || unmade(x.value)),
+    VCtor(name, args) -> if name != mark() {
+      fold(args, false, |hit: Bool, x: Value| hit || unmade(x))
+    } else {
+      match draw_of(v) { Some(d) -> match d.state { Made(_) -> false, _ -> true }, None -> false }
+    },
+    VMap(entries) ->
+      fold(entries, false, |hit: Bool, x: Entry| hit || unmade(x.key) || unmade(x.value)),
+    VFn(FConst(c)) -> unmade(c.value),
+    VFn(FTable(t)) ->
+      unmade(t.default)
+        || fold(t.entries, false, |hit: Bool, x: Entry| hit || unmade(x.key) || unmade(x.value)),
+    _ -> false,
+  }
+
+/// The draws of `v` ready to be made, in the order `each_ready` meets them.
+pub fn ready(v: Value) -> List<Draw> =
+  each_ready(v, [], |d: Draw, acc: List<Draw>| { value: carried(d), state: push(acc, d) }).state
+
+// --- A record made smaller ---------------------------------------------------------------------
+
+/// A record without the zeros it ends in: past its end every draw is zero, so they say nothing.
+pub fn trimmed(record: List<Int>) -> List<Int> = {
+  let kept = fold(range(0, len(record)), 0, |last: Int, i: Int|
+    match list_at(record, i) { Some(n) -> if n != 0 { i + 1 } else { last }, None -> last });
+  fold(range(0, kept), [], |acc: List<Int>, i: Int|
+    match list_at(record, i) { Some(n) -> push(acc, n), None -> acc })
+}
+
+/// A record's measure: shorter is smaller, and of two as long the one whose draws sum lower.
+pub fn record_size(record: List<Int>) -> U128 / {abort.raise} = {
+  let r = trimmed(record);
+  let sum = fold(r, 0u128, |acc: U128, n: Int| acc + u128_of_int(max(n, 0)));
+  (u128_of_int(min(len(r), 1048576)) << 80) + min(sum, (1u128 << 80) - 1u128)
+}
+
+fn without(record: List<Int>, from: Int, to: Int) -> List<Int> =
+  fold(range(0, len(record)), [], |acc: List<Int>, i: Int|
+    if i >= from && i < to { acc }
+    else { match list_at(record, i) { Some(n) -> push(acc, n), None -> acc } })
+
+/// The records a smaller value is looked for at, each smaller than `record`: none of it, then it
+/// without a run of its draws, by halves down to one, then each draw at zero, at half and one lower.
+pub fn record_candidates(record: List<Int>) -> List<List<Int>> / {abort.raise} = {
+  let r = trimmed(record);
+  let n = len(r);
+  if n == 0 { [] } else {
+    let widths = iterate({ out: [], width: n / 2 }, 64, |s: { out: List<Int>, width: Int }|
+      if s.width <= 0 { Stop(s.out) }
+      else { Continue({ out: push(s.out, s.width), width: s.width / 2 }) });
+    let cut = fold(widths, [[]], |out: List<List<Int>>, width: Int|
+      fold(range(0, (n + width - 1) / width), out, |acc: List<List<Int>>, k: Int|
+        push(acc, trimmed(without(r, k * width, k * width + width)))));
+    let lowered = fold(range(0, n), cut, |out: List<List<Int>>, i: Int|
+      match list_at(r, i) {
+        None -> out,
+        Some(draw) ->
+          fold([0, draw / 2, draw - 1], out, |acc: List<List<Int>>, lower: Int|
+            if lower < 0 || lower >= draw { acc }
+            else { push(acc, trimmed(list_set(r, i, lower))) }),
+      });
+    let here = record_size(r);
+    fold(lowered, [], |acc: List<List<Int>>, c: List<Int>|
+      if record_size(c) >= here || fold(acc, false, |seen: Bool, x: List<Int>| seen || x == c) {
+        acc
+      } else { push(acc, c) })
+  }
+}
+
+// --- Tests ---------------------------------------------------------------------------------------
+
+fn a_draw(state: State) -> Draw =
+  { ty: "m.Even", sampler: "m._sample_Even", pools: [], size: 9, state: state }
+
+test "a carried value reads back as the draw it is, and nothing else reads as one" {
+  let fresh = a_draw(Fresh({ root: 3, key: b"k" }));
+  let made = a_draw(Made({ record: [4, 0, 2], value: VInt(8) }));
+  let pooled = { ..a_draw(Replay([1])), pools: [[VInt(1), carried(fresh)], []] };
+  assert_eq(draw_of(carried(fresh)), Some(fresh));
+  assert_eq(draw_of(carried(made)), Some(made));
+  assert_eq(draw_of(carried(pooled)), Some(pooled));
+  assert_eq(draw_of(VCtor("m.Even", [VInt(2)])), None);
+  assert_eq(draw_of(VInt(2)), None)
+}
+
+test "a sampler is entered with its pools bare, then its stream or its record" {
+  assert_eq(entry(a_draw(Fresh({ root: 3, key: b"k" }))), [
+    VStr("m._sample_Even"),
+    VInt(3),
+    VBytes(b"k"),
+    VInt(9),
+    VCtor("None", []),
+  ]);
+  let inner = carried(a_draw(Made({ record: [1], value: VInt(2) })));
+  assert_eq(entry({ ..a_draw(Replay([5, 1])), pools: [[inner, VInt(7)]] }), [
+    VStr("m._sample_Even"),
+    VList([VInt(2), VInt(7)]),
+    VInt(0),
+    VBytes(b""),
+    VInt(9),
+    VCtor("Some", [VList([VInt(5), VInt(1)])]),
+  ])
+}
+
+test "a sampler's answer is read as the sample it is" {
+  let answer = |value: Value|
+    VRecord([
+      { name: "discards", value: VInt(2) },
+      { name: "record", value: VList([VInt(4), VInt(1)]) },
+      { name: "value", value: value },
+    ]);
+  assert_eq(
+    sampled_of(answer(VCtor("Some", [VInt(8)]))),
+    Some({ value: Some(VInt(8)), record: [4, 1], discards: 2 }),
+  );
+  assert_eq(
+    sampled_of(answer(VCtor("None", []))),
+    Some({ value: None, record: [4, 1], discards: 2 }),
+  );
+  assert_eq(sampled_of(VInt(8)), None)
+}
+
+test "bare is each made value in place, and a map keyed by them is in their order" {
+  let made = |n: Int| carried(a_draw(Made({ record: [9 - n], value: VInt(n) })));
+  assert_eq(bare(VList([made(2), VInt(1)])), VList([VInt(2), VInt(1)]));
+  assert_eq(
+    bare(VRecord([{ name: "x", value: VCtor("Some", [made(4)]) }])),
+    VRecord([{ name: "x", value: VCtor("Some", [VInt(4)]) }]),
+  );
+  assert_eq(
+    bare(VMap([{ key: made(5), value: VInt(0) }, { key: made(3), value: made(1) }])),
+    VMap([{ key: VInt(3), value: VInt(1) }, { key: VInt(5), value: VInt(0) }]),
+  )
+}
+
+test "a draw is ready once its pools are made, and each is met in one order" {
+  let inner = a_draw(Fresh({ root: 0, key: b"a" }));
+  let outer = { ..a_draw(Fresh({ root: 0, key: b"b" })), pools: [[carried(inner)]] };
+  let other = a_draw(Replay([2]));
+  let point = VList([carried(outer), VCtor("Some", [carried(other)])]);
+  assert_eq(ready(point), [inner, other]);
+  let made = each_ready(point, 0, |d: Draw, n: Int|
+    { value: carried({ ..d, state: Made({ record: [n], value: VInt(n) }) }), state: n + 1 });
+  assert_eq(made.state, 2);
+  assert_eq(map(ready(made.value), |d: Draw| d.pools), [
+    [[carried({ ..inner, state: Made({ record: [0], value: VInt(0) }) })]],
+  ]);
+  assert(unmade(made.value));
+  assert(!unmade(bare(VList([carried(a_draw(Made({ record: [], value: VInt(1) })))]))))
+}
+
+test "every candidate of a record is smaller than it, the shortest first" {
+  let cs = record_candidates([3, 0, 5, 0, 0]);
+  assert_eq(list_at(cs, 0), Some([]));
+  assert_eq(cs, [[], [0, 5], [3, 5], [3], [0, 0, 5], [1, 0, 5], [2, 0, 5], [3, 0, 2], [3, 0, 4]]);
+  assert(fold(cs, true, |ok: Bool, c: List<Int>| ok && record_size(c) < record_size([3, 0, 5])));
+  assert_eq(record_candidates([0, 0]), []);
+  assert_eq(record_candidates([1]), [[]])
+}
+
+test "what a value holds that the runtime cannot be handed back is told" {
+  assert(crosses(VList([VInt(1), VRecord([{ name: "a", value: VStr("x") }])])));
+  assert(crosses(VFn(FConst({ arity: 1, value: VInt(1) }))));
+  assert(!crosses(VFn(FAnonymous)));
+  assert(!crosses(VFn(FConst({ arity: 1, value: VFn(FAnonymous) }))));
+  assert(!crosses(VCtor("Some", [VSecret])));
+  assert(!crosses(VList([VElided(3)])))
+}
