@@ -132,6 +132,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
+| `uuid"6ba7b810-.."` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
 | `#[1, 2]` | `Map<a, Unit>` | A set: each element a key whose value is `()`. |
@@ -157,6 +158,35 @@ write, so `std.show` and the modules it imports cannot interpolate.
 A map literal is the call `map_of_entries([{key: k, value: v}, ..])` and a set literal the same
 with `()` for each value, so either spelling is one definition with one hash; `ply fmt` keeps the
 one written.
+
+A tagged literal `tag"text"` is a name touching a string: `uuid"..."` is one, and `uuid "..."` a
+name and then a string. It is the call `tag::literal("text")`, where `tag` is a module binder in
+scope (§3.2) and the text a string's, escapes and all, and a load runs that call before anything
+else runs (§16):
+
+```ply
+import std.uuid
+import std.uuid (Uuid)
+
+fn dns() -> Uuid = uuid"6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+```
+
+`literal` is a `pub fn` of one `String` answering `Result<T, {message: String, offset: Int}>`,
+with no type, row or label parameter and a row that holds at most `abort.raise`; anything else is
+`E0152`, as is one in a recursion with the definition that holds the literal; a tag no import
+binds is `E0106`, and a module with no `literal`, or a private one, `E0101` or `E0107`. Where it
+answers `Ok(v)` the literal has type `T`, is `v`, and performs nothing: what the call could raise,
+the check saw it not raise. Where it answers `Err`, the literal is `E0153`, placed at character
+`offset` of the text as the source spells it, an escape being one character, or at the closing
+quote for the offset just past the text, with `message` beside it. A parser that raises, or that
+makes more than ten million calls, is `E0154`.
+
+The literal hashes with its parser and its text, so an edit to anything the parser reaches moves
+every definition that writes the tag, and apart from the call written out, which has another type
+and another row. `f` and `b` are no tags, since `f"` and `b"` open the two strings above. A tagged
+literal is an expression: no pattern, label or parameter default (`E0121`) is one. It runs as
+`let Ok(v) = tag::literal("text")`, so a module that binds its own `Ok` holds none (`E0155`).
+`std.uuid`, `std.base64` and `std.bigint` are tags (§13.19, §13.20, §13.32).
 
 A line string is a run of lines that each start with `\\`, led only by blanks.
 Everything after the `\\` to the end of its line is text, verbatim: nothing is
@@ -561,7 +591,8 @@ nanoseconds; they are separate types so a deadline cannot be added to a byte
 count. `std.time` builds and reads them (§13.10).
 
 A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
-`None` loses `?`; one that declares its own `Stop` loses `iterate`.
+`None` loses `?`; one that binds its own `Ok` loses tagged literals (§2.3); one
+that declares its own `Stop` loses `iterate`.
 
 **`Secret<a>`** is made by `secret_of_string` and observed only by
 `secret_verify`, `secret_is_empty` and `==`. It cannot be rendered, encoded or
@@ -1360,7 +1391,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, and the cost checker's report on a program, kept under the checker's hash and the program's text (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each tagged literal's verdict, kept under the hash of all its parser reaches and its text (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -2757,6 +2788,7 @@ the host's. A run that is not simulated draws here, and `--host` binds it.
 pub type Uuid = { octets: Bytes }
 pub fn uuid_render(u: Uuid) -> String
 pub fn uuid_parse(text: String) -> Option<Uuid>
+pub fn literal(text: String) -> Result<Uuid, { message: String, offset: Int }>
 pub fn uuid_v4() -> Uuid / {entropy.next bounded}
 ```
 
@@ -2765,7 +2797,9 @@ lower-case `8-4-4-4-12` form; `uuid_parse` reads it and accepts upper case, as
 RFC 9562 requires of a reader, while anything that is not that form is `None`
 rather than a raise. `uuid_v4` draws two machine words of `std.random` entropy
 and overwrites the version and variant bits, so a test pins it by handling
-`entropy.next`.
+`entropy.next`. `literal` is what makes the module a tag (§2.3): `uuid"..."` is
+a `Uuid` the check read, and a text that is not one is refused at its first
+character out of place.
 
 ### 13.20 `std.base64`
 
@@ -2774,6 +2808,7 @@ pub fn base64_encode(data: Bytes) -> String
 pub fn base64_decode(text: String) -> Option<Bytes>
 pub fn base64url_encode(data: Bytes) -> String
 pub fn base64url_decode(text: String) -> Option<Bytes>
+pub fn literal(text: String) -> Result<Bytes, { message: String, offset: Int }>
 ```
 
 RFC 4648: the standard alphabet (`A-Za-z0-9+/`) with padding, and the URL-safe
@@ -2782,7 +2817,8 @@ decoder is total and answers `None` for what the RFC does not call canonical —
 padding character anywhere but the end, a length not divisible by four (for the
 padded form), a letter outside the alphabet, or bits left over in the final
 group. So a decode of an encode is the identity, and so is an encode of a
-decode.
+decode. `literal` makes the module a tag (§2.3): `base64"aGVsbG8="` is the
+`Bytes` the padded standard form names, refused where it stops being canonical.
 
 ### 13.21 `std.url`
 
@@ -3139,6 +3175,7 @@ pub fn of_int(n: Int) -> BigInt
 pub fn to_int(value: BigInt) -> Option<Int>
 pub fn to_string(value: BigInt) -> String
 pub fn of_string(text: String) -> Option<BigInt>
+pub fn literal(text: String) -> Result<BigInt, { message: String, offset: Int }>
 pub fn compare(a: BigInt, b: BigInt) -> Ordering
 pub fn less_than(a: BigInt, b: BigInt) -> Bool
 pub fn add(a: BigInt, b: BigInt) -> BigInt
@@ -3164,7 +3201,8 @@ base. `ord` is deliberately **not** derived: the number's order is not the
 record's (with the sign first, `-10` would sort after `-5` by magnitude), so
 `compare` is the ordering.
 `of_string` takes an optional sign and refuses anything else, `to_string` is its
-inverse, and `-0` is zero. Division is truncated toward zero — `q` takes the sign
+inverse, and `-0` is zero. `literal` is `of_string` as a tag (§2.3), so
+`bigint"18446744073709551616"` is a number the check read. Division is truncated toward zero — `q` takes the sign
 of `a * b` and `r` the sign of `a`, so `a == q * b + r` and `|r| < |b|` — and a
 zero divisor is `None` rather than a raise; `floor_mod` is the remainder with the
 divisor's sign, which is what `mod_pow` reduces with. A negative exponent is one,
@@ -3786,6 +3824,22 @@ beside the phases of a check that ran, with `filed`, whether the next check can
 take its answer back (false for a refused load, or when the entry could not be
 written).
 
+A load that checked has not yet run a tagged literal's parser (§2.3). `ply check`,
+`ply run`, `ply test`, `ply build` and `ply prove` settle the literals of the
+root package's modules before they do anything else with the load, and refuse it
+with what a parser refused (`E0153`, `E0154`): each literal is the call of its
+parser, entered on a machine of its own, lent to nothing, over a unit of the
+definitions the parsers reach, under a budget of ten million calls a literal.
+A verdict is a function of the parser and the text, so it is kept in the
+toolchain's cache (§8.6) under the hash of all the parser reaches, the text and
+the toolchain, and a parser is entered again only for a text it has not read or
+after an edit to something it reaches; a check that touches no literal's parser
+enters nothing. A module that writes a tagged literal is read from its source
+by every check, never as its stub. A dependency's literals are its own run's
+to settle, as its tests are, and `compiler.load` settles none: there, as in any
+load nothing settled, a literal whose parser refuses it ends the run where it
+is read (`E0502`).
+
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
@@ -3887,6 +3941,10 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
 | `E0151` | an `extern fn` outside the prelude |
+| `E0152` | a tagged literal whose tag's `literal` is not a parser a check can run |
+| `E0153` | a tagged literal its parser refuses |
+| `E0154` | a tagged literal whose parser raised or spent its budget |
+| `E0155` | a tagged literal in a module that binds its own `Ok` |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
