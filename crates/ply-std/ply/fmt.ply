@@ -1,0 +1,908 @@
+//! Numbers, sizes and spans of time as text a person reads.
+//!
+//! The prelude writes a number one way: `int_to_string`, `decimal_to_string` at the value's own
+//! scale, and `float_to_string`, the shortest text that reads back. Here a number is written to a
+//! count of places (`fixed`), in scientific notation (`scientific`), to a count of significant
+//! digits (`general`) or as a percentage (`percent`), and a number's text is grouped, signed and
+//! zero-padded (`grouped`, `signed`, `zero_padded`). A `Decimal` and an `Int` are written the
+//! same ways (`fixed_decimal`, `scientific_decimal`, `scientific_int`), and an `Int` that counts
+//! small units in whole ones (`fixed_point`). A count of bytes is written in the units a person
+//! reads (`size`, read back by `parse_size`), and a `Duration` roughly (`duration`).
+//!
+//! Each is a function with its options named, not a format string, so a wrong option does not
+//! check. Every one is total and performs nothing, and none reads a locale: a separator is an
+//! argument, and each doc says what it is where none is given.
+//!
+//! The digits are exact. A `Float` is a whole number over a power of two, so it has a last
+//! decimal digit, and what is written is that expansion rounded once, by the `Rounding` given:
+//! `0.125` to two places is `0.12` under `HalfEven` and `0.13` under `HalfUp`, and `2.675`, whose
+//! nearest float lies just below it, is `2.67` under both. `HalfEven`, which a `rounding` left
+//! out is, and `HalfUp` take the nearest, a tie going to the even digit or away from zero; `Down`
+//! is toward zero, `Up` away from it, `Ceiling` toward positive infinity and `Floor` toward
+//! negative. A sign is the value's own, so `-0.0` and a negative number that rounds to nothing
+//! are written `-0`; `NaN`, `Infinity` and `-Infinity` are written as `float_to_string` writes
+//! them, in every notation.
+//!
+//! Padding to a width and standing in a column are text's to do: `std.string`'s `pad_left` and
+//! `pad_right`, and `std.text`'s `aligned` and `table`.
+
+import std.bigint
+import std.bytes (is_digit)
+import std.decimal (of_parts)
+import std.laws (round_trip)
+import std.list (all, at_or, chunks, concat, drop, drop_while, reverse, take, take_while)
+import std.string (int_of_string, join, repeat)
+
+// --- A number, exactly ------------------------------------------------------
+
+/// A finite number: whether it is below zero, and its decimal digits, most significant first
+/// and with no leading zero, the last `scale` of them after the point. A scale below zero
+/// stands for that many zeros past the last digit; zero has no digits.
+type Exact = { negative: Bool, digits: List<Char>, scale: Int }
+
+/// The float's own value, which is its 53-bit mantissa times a power of two: times two to a
+/// power it is a whole number, and over one it is that many decimal places of the mantissa times
+/// five to the same power. `None` for a NaN or an infinity.
+fn exact_of_float(x: Float) -> Option<Exact> = {
+  let bits = bits_of_float(x);
+  let biased = bits >>> 52 & 0x7FF;
+  let fraction = bits & 0xF_FFFF_FFFF_FFFF;
+  if biased == 0x7FF { None } else {
+    let mantissa = limbs_of(if biased == 0 { fraction } else { fraction | 1 << 52 });
+    let twos = if biased == 0 { 0 - 1074 } else { biased - 1075 };
+    Some(if twos >= 0 {
+      { negative: bits < 0, digits: digits_of(doubled(mantissa, twos)), scale: 0 }
+    } else {
+      { negative: bits < 0, digits: digits_of(quintupled(mantissa, 0 - twos)), scale: 0 - twos }
+    })
+  }
+}
+
+fn exact_of_decimal(d: Decimal) -> Exact = {
+  let text = string_chars(decimal_to_string(d));
+  let body = filter(text, |c: Char| c != '-');
+  {
+    negative: list_at(text, 0) == Some('-'),
+    digits: drop_while(filter(body, |c: Char| c != '.'), |c: Char| c == '0'),
+    scale: len(drop(drop_while(body, |c: Char| c != '.'), 1)),
+  }
+}
+
+fn exact_of_int(n: Int, scale: Int) -> Exact =
+  { negative: n < 0, digits: digits_of(limbs_of(n)), scale: scale }
+
+/// A whole number's size as its decimal digits nine at a time, least significant first and
+/// with no zero at the top: the form a multiplication by a small number is one pass over.
+fn limbs_of(n: Int) -> List<Int> = {
+  let below = if n > 0 { 0 - n } else { n };
+  let all = [
+    0 - below % 1000000000,
+    0 - below / 1000000000 % 1000000000,
+    0 - below / 1000000000000000000,
+  ];
+  take(all, if below / 1000000000000000000 != 0 { 3 }
+  else if below / 1000000000 != 0 { 2 }
+  else if below != 0 { 1 }
+  else { 0 })
+}
+
+/// `limbs` times `factor`, which is at most `5^13`: a limb times it, and what the limb below
+/// carried, is within an `Int`.
+fn times(limbs: List<Int>, factor: Int) -> List<Int> = {
+  let run = fold(limbs, { out: [], carry: 0 }, |s: { out: List<Int>, carry: Int }, limb: Int| {
+    let product = limb * factor + s.carry;
+    { out: push(s.out, product % 1000000000), carry: product / 1000000000 }
+  });
+  if run.carry == 0 { run.out }
+  else if run.carry < 1000000000 { push(run.out, run.carry) }
+  else { push(push(run.out, run.carry % 1000000000), run.carry / 1000000000) }
+}
+
+/// `limbs` times two to the `n`, thirty doublings at a time.
+fn doubled(limbs: List<Int>, n: Int) -> List<Int> =
+  times(fold(range(0, n / 30), limbs, |acc: List<Int>, _: Int| times(acc, 1073741824)), 1 << n % 30)
+
+/// `limbs` times five to the `n`, thirteen at a time.
+fn quintupled(limbs: List<Int>, n: Int) -> List<Int> =
+  times(
+    fold(range(0, n / 13), limbs, |acc: List<Int>, _: Int| times(acc, 1220703125)),
+    fold(range(0, n % 13), 1, |power: Int, _: Int| power * 5),
+  )
+
+fn digits_of(limbs: List<Int>) -> List<Char> =
+  fold(reverse(limbs), [], |acc: List<Char>, limb: Int| {
+    let written = string_chars(int_to_string(limb));
+    if len(acc) == 0 { written } else { concat(concat(acc, zeros(9 - len(written))), written) }
+  })
+
+fn zeros(n: Int) -> List<Char> = map(range(0, n), |_: Int| '0')
+
+fn digit(c: Char) -> Bool = is_digit(int_of_char(c))
+
+// --- Rounding ---------------------------------------------------------------
+
+/// Whether a number goes to the next step away from zero: `half` says where what is dropped
+/// stands against half a step, `any` whether anything is dropped at all, and `odd` whether the
+/// step it would otherwise stay on is an odd one.
+fn rounds_away(rounding: Rounding, negative: Bool, odd: Bool, half: Ordering, any: Bool) -> Bool =
+  match rounding {
+    HalfEven -> half == Greater || (half == Equal && odd),
+    HalfUp -> half != Less,
+    Down -> false,
+    Up -> any,
+    Ceiling -> any && !negative,
+    Floor -> any && negative,
+  }
+
+/// `e` times ten to the `places`, rounded to a whole number: its digits, none for zero.
+fn scaled(e: Exact, places: Int, rounding: Rounding) -> List<Char> = {
+  let keep = len(e.digits) - e.scale + places;
+  if len(e.digits) == 0 { [] }
+  else if keep >= len(e.digits) { concat(e.digits, zeros(keep - len(e.digits))) } else {
+    let kept = take(e.digits, keep);
+    let next = if keep < 0 { '0' } else { at_or(e.digits, keep, '0') };
+    let more = keep < 0 || !all(drop(e.digits, keep + 1), |c: Char| c == '0');
+    let half = if next > '5' || (next == '5' && more) { Greater }
+    else if next == '5' { Equal }
+    else { Less };
+    let odd = int_of_char(at_or(kept, len(kept) - 1, '0')) % 2 == 1;
+    if rounds_away(rounding, e.negative, odd, half, more || next != '0') { bumped(kept) }
+    else { kept }
+  }
+}
+
+/// The whole number `digits` and one.
+fn bumped(digits: List<Char>) -> List<Char> = {
+  let run = fold(
+    reverse(digits),
+    { out: [], carry: true },
+    |s: { out: List<Char>, carry: Bool }, c: Char|
+      if !s.carry { { out: push(s.out, c), carry: false } }
+      else if c == '9' { { out: push(s.out, '0'), carry: true } } else {
+        {
+          out: push(s.out, match char_of_int(int_of_char(c) + 1) { Some(up) -> up, None -> c }),
+          carry: false,
+        }
+      },
+  );
+  reverse(if run.carry { push(run.out, '1') } else { run.out })
+}
+
+/// The whole number `digits` with a point `places` from its end, a digit before it at least.
+fn pointed(digits: List<Char>, places: Int) -> String =
+  if places <= 0 {
+    if len(digits) == 0 { "0" } else { string_of_chars(concat(digits, zeros(0 - places))) }
+  } else {
+    let all = concat(zeros(places + 1 - len(digits)), digits);
+    string_of_chars(take(all, len(all) - places)) ++ "."
+      ++ string_of_chars(drop(all, len(all) - places))
+  }
+
+fn sign_of(e: Exact) -> String = if e.negative { "-" } else { "" }
+
+fn in_fixed(e: Exact, digits: Int, rounding: Rounding) -> String =
+  sign_of(e) ++ pointed(scaled(e, max(digits, 0), rounding), max(digits, 0))
+
+/// A number's digits to `count` significant ones, and the power of ten its first stands at.
+fn leading(e: Exact, count: Int, rounding: Rounding) -> { digits: List<Char>, power: Int } =
+  if len(e.digits) == 0 { { digits: zeros(count), power: 0 } } else {
+    let power = len(e.digits) - e.scale - 1;
+    let all = scaled(e, count - 1 - power, rounding);
+    if len(all) > count { { digits: take(all, count), power: power + 1 } }
+    else { { digits: all, power: power } }
+  }
+
+fn in_scientific(e: Exact, digits: Int, rounding: Rounding) -> String = {
+  let places = max(digits, 0);
+  let led = leading(e, places + 1, rounding);
+  sign_of(e) ++ pointed(led.digits, places) ++ "e" ++ int_to_string(led.power)
+}
+
+fn in_general(e: Exact, digits: Int, rounding: Rounding) -> String = {
+  let count = max(digits, 1);
+  let led = leading(e, count, rounding);
+  if led.power < 0 - 4 || led.power >= count {
+    sign_of(e) ++ shortened(pointed(led.digits, count - 1)) ++ "e" ++ int_to_string(led.power)
+  } else { sign_of(e) ++ shortened(pointed(led.digits, count - 1 - led.power)) }
+}
+
+/// A decimal text without the zeros that end its fraction, and without the point where none is
+/// left after it.
+fn shortened(text: String) -> String = {
+  let cs = string_chars(text);
+  let whole = take_while(cs, |c: Char| c != '.');
+  let fraction = reverse(drop_while(reverse(drop(cs, len(whole) + 1)), |c: Char| c == '0'));
+  if len(fraction) == 0 { string_of_chars(whole) }
+  else { string_of_chars(whole) ++ "." ++ string_of_chars(fraction) }
+}
+
+// --- Floats -----------------------------------------------------------------
+
+/// `x` with exactly `digits` digits after the point, and no point where that is none: `1.5` to
+/// two is `1.50`. A count below zero is none.
+pub fn fixed(x: Float, digits: Int, rounding: Rounding = HalfEven) -> String =
+  match exact_of_float(x) { Some(e) -> in_fixed(e, digits, rounding), None -> float_to_string(x) }
+
+/// `x` as one digit, `digits` more after the point, and the power of ten they stand at:
+/// `1234.5` to two is `1.23e3`, and `0.00012` to one is `1.2e-4`. The text is a `Float`
+/// literal's, so `float_of_string` reads it. Zero stands at `e0`.
+pub fn scientific(x: Float, digits: Int, rounding: Rounding = HalfEven) -> String =
+  match exact_of_float(x) {
+    Some(e) -> in_scientific(e, digits, rounding),
+    None -> float_to_string(x),
+  }
+
+/// `x` to `digits` significant digits, one at least and six where none is given, without the
+/// zeros that would end its fraction: plainly where its first digit stands from the
+/// ten-thousandths up to the last of those digits, and in `scientific`'s notation outside that,
+/// as C's `%g` chooses.
+pub fn general(x: Float, digits: Int = 6, rounding: Rounding = HalfEven) -> String =
+  match exact_of_float(x) { Some(e) -> in_general(e, digits, rounding), None -> float_to_string(x) }
+
+/// `x` as so many in a hundred, to `digits` places, with a `%` after it: `0.125` to one is
+/// `12.5%`, and to none, which is what `digits` left out asks for, `12%`. The hundredfold is
+/// exact, not the float product.
+pub fn percent(x: Float, digits: Int = 0, rounding: Rounding = HalfEven) -> String =
+  match exact_of_float(x) {
+    Some(e) -> in_fixed({ ..e, scale: e.scale - 2 }, digits, rounding) ++ "%",
+    None -> float_to_string(x) ++ "%",
+  }
+
+// --- Decimals and integers --------------------------------------------------
+
+/// `d` with exactly `digits` digits after the point, rounded or filled with zeros to them.
+/// `decimal_to_string` is the one that keeps the scale `d` has.
+pub fn fixed_decimal(d: Decimal, digits: Int, rounding: Rounding = HalfEven) -> String =
+  in_fixed(exact_of_decimal(d), digits, rounding)
+
+/// `d` in `scientific`'s notation.
+pub fn scientific_decimal(d: Decimal, digits: Int, rounding: Rounding = HalfEven) -> String =
+  in_scientific(exact_of_decimal(d), digits, rounding)
+
+/// `n` in `scientific`'s notation: `123456` to two is `1.23e5`.
+pub fn scientific_int(n: Int, digits: Int, rounding: Rounding = HalfEven) -> String =
+  in_scientific(exact_of_int(n, 0), digits, rounding)
+
+/// `n` counted in units of ten to the minus `places`, written in whole units: `1234` at two
+/// places is `12.34`, and `-5` at three is `-0.005`. Nothing is rounded.
+pub fn fixed_point(n: Int, places: Int) -> String = {
+  let e = exact_of_int(n, places);
+  sign_of(e) ++ pointed(scaled(e, places, Down), places)
+}
+
+// --- A number's text --------------------------------------------------------
+
+type Parts = { sign: List<Char>, whole: List<Char>, rest: List<Char> }
+
+/// A number's text as its sign, the decimal digits that follow it, and whatever follows those.
+fn parts_of(number: String) -> Parts = {
+  let cs = string_chars(number);
+  let signed = list_at(cs, 0) == Some('-') || list_at(cs, 0) == Some('+');
+  let body = if signed { drop(cs, 1) } else { cs };
+  let whole = take_while(body, digit);
+  { sign: if signed { take(cs, 1) } else { [] }, whole: whole, rest: drop(body, len(whole)) }
+}
+
+/// `number` with `separator` between each `size` digits of its whole part, counted from the
+/// point: `1234567.891` is `1,234,567.891`, a comma and three being what is used where neither
+/// is given. The whole part is the decimal digits after the sign, so a fraction, an exponent and
+/// a unit are left as they are, and so is a text that starts with none. A size below one groups
+/// nothing.
+pub fn grouped(number: String, separator: String = ",", size: Int = 3) -> String = {
+  let parts = parts_of(number);
+  if size < 1 || len(parts.whole) <= size { number } else {
+    let groups = map(reverse(chunks(reverse(parts.whole), size)), |group: List<Char>|
+      string_of_chars(reverse(group)));
+    string_of_chars(parts.sign) ++ join(groups, separator) ++ string_of_chars(parts.rest)
+  }
+}
+
+/// `number` with `plus` before it unless it starts with `-`: every number then carries a sign.
+/// `plus` is `+` where none is given, and one space keeps a column of both signs aligned.
+pub fn signed(number: String, plus: String = "+") -> String =
+  if string_starts_with(number, "-") { number } else { plus ++ number }
+
+/// `number` in `width` characters, zeros between its sign and its digits making up what it
+/// lacks: `-42` in six is `-00042`, and so is a text in another base (`-ff` is `-000ff`). A
+/// text that is no number (`NaN`, `Infinity`) takes spaces before it instead, and one already
+/// that wide is itself. Pad before grouping.
+pub fn zero_padded(number: String, width: Int) -> String = {
+  let cs = string_chars(number);
+  let signed = list_at(cs, 0) == Some('-') || list_at(cs, 0) == Some('+');
+  let body = string_of_chars(if signed { drop(cs, 1) } else { cs });
+  let missing = width - len(cs);
+  if missing <= 0 { number }
+  else if body == "NaN" || body == "Infinity" { repeat(" ", missing) ++ number }
+  else { string_of_chars(concat(if signed { take(cs, 1) } else { [] }, zeros(missing))) ++ body }
+}
+
+// --- Sizes ------------------------------------------------------------------
+
+/// The multiples a count of bytes is written in.
+pub type Units =
+  /// Powers of 1024, named as IEC 80000-13 names them: `KiB`, `MiB`, `GiB`, `TiB`, `PiB`, `EiB`.
+  | Iec
+  /// Powers of 1000, with the SI prefixes: `kB`, `MB`, `GB`, `TB`, `PB`, `EB`.
+  | Si
+
+fn names(units: Units) -> List<String> =
+  match units {
+    Iec -> ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"],
+    Si -> ["B", "kB", "MB", "GB", "TB", "PB", "EB"],
+  }
+
+fn steps(units: Units) -> List<Int> =
+  match units {
+    Iec -> [1, 1024, 1048576, 1073741824, 1099511627776, 1125899906842624, 1152921504606846976],
+    Si -> [1, 1000, 1000000, 1000000000, 1000000000000, 1000000000000000, 1000000000000000000],
+  }
+
+/// `bytes` in the unit at `power`, exactly: a division by a power of 1000 moves the point, and
+/// one by a power of 1024 is as many places of the count times five to that power.
+fn in_unit(bytes: Int, units: Units, power: Int) -> Exact =
+  match units {
+    Si -> exact_of_int(bytes, 3 * power),
+    Iec ->
+      {
+        negative: bytes < 0,
+        digits: digits_of(quintupled(limbs_of(bytes), 10 * power)),
+        scale: 10 * power,
+      },
+  }
+
+/// A count of bytes in the largest unit it fills, to `digits` places: `1572864` is `1.5 MiB`,
+/// and `1.6 MB` in `Si` units. The units are `Iec` and the places one where they are not given.
+/// Below the first multiple it is the exact count, `512 B`. A count that rounds up to the next
+/// unit is written in it, so `1048575` is `1.0 MiB` and never `1024.0 KiB`.
+pub fn size(
+  bytes: Int,
+  units: Units = Iec,
+  digits: Int = 1,
+  rounding: Rounding = HalfEven,
+) -> String = {
+  let places = max(digits, 0);
+  let power = fold(range(1, 7), 0, |most: Int, i: Int|
+    if bytes >= at_or(steps(units), i, 0) || bytes <= 0 - at_or(steps(units), i, 0) { i }
+    else { most });
+  if power == 0 { int_to_string(bytes) ++ " B" } else {
+    let shown = scaled(in_unit(bytes, units, power), places, rounding);
+    let over = power < 6 && whole_of(take(shown, len(shown) - places)) >= at_or(steps(units), 1, 0);
+    let at = if over { power + 1 } else { power };
+    (if bytes < 0 { "-" } else { "" })
+      ++ pointed(
+        if over { scaled(in_unit(bytes, units, at), places, rounding) } else { shown },
+        places,
+      )
+      ++ " "
+      ++ at_or(names(units), at, "")
+  }
+}
+
+/// The small whole number these digits spell.
+fn whole_of(digits: List<Char>) -> Int =
+  fold(take(digits, 9), 0, |n: Int, c: Char| n * 10 + int_of_char(c) - 48)
+
+/// The count of bytes a size names: digits, a fraction after a point if there is one, and a
+/// unit of either system after any spaces, `B` or none meaning bytes; a `-` may lead. `kB` may
+/// be spelled `KB`. A count that is no whole number of bytes is rounded to the nearest, a half
+/// to the even one. `None` for any other text, and for a count past an `Int`.
+pub fn parse_size(text: String) -> Option<Int> = {
+  let cs = string_chars(text);
+  let negative = list_at(cs, 0) == Some('-');
+  let body = if negative { drop(cs, 1) } else { cs };
+  let whole = take_while(body, digit);
+  let after = drop(body, len(whole));
+  let has_point = list_at(after, 0) == Some('.');
+  let fraction = if has_point { take_while(drop(after, 1), digit) } else { [] };
+  let unit = string_of_chars(
+    drop_while(drop(after, if has_point { 1 + len(fraction) } else { 0 }), |c: Char| c == ' '),
+  );
+  if len(whole) == 0 || (has_point && len(fraction) == 0) { None } else {
+    match multiple_named(unit) {
+      None -> None,
+      Some(m) -> {
+        let digits = drop_while(concat(whole, fraction), |c: Char| c == '0');
+        let e = match m.units {
+          Si -> { negative: negative, digits: digits, scale: len(fraction) - 3 * m.power },
+          Iec ->
+            {
+              negative: negative,
+              digits: digits_of(doubled(limbs_of_digits(digits), 10 * m.power)),
+              scale: len(fraction),
+            },
+        };
+        int_of_digits(negative, scaled(e, 0, HalfEven))
+      },
+    }
+  }
+}
+
+fn multiple_named(unit: String) -> Option<{ units: Units, power: Int }> =
+  if unit == "" || unit == "KB" { Some({ units: Si, power: if unit == "" { 0 } else { 1 } }) }
+  else {
+    fold(range(0, 7), None, |found: Option<{ units: Units, power: Int }>, i: Int|
+      if at_or(names(Si), i, "") == unit { Some({ units: Si, power: i }) }
+      else if at_or(names(Iec), i, "") == unit { Some({ units: Iec, power: i }) }
+      else { found })
+  }
+
+fn limbs_of_digits(digits: List<Char>) -> List<Int> =
+  map(chunks(reverse(digits), 9), |group: List<Char>| whole_of(reverse(group)))
+
+/// The `Int` these digits spell under a sign, or `None` past one.
+fn int_of_digits(negative: Bool, digits: List<Char>) -> Option<Int> =
+  fold(digits, Some(0), |acc: Option<Int>, c: Char|
+    match acc {
+      None -> None,
+      Some(n) -> match checked_mul(n, 10) {
+        None -> None,
+        Some(tens) -> if negative { checked_sub(tens, int_of_char(c) - 48) }
+        else { checked_add(tens, int_of_char(c) - 48) },
+      },
+    })
+
+// --- Durations --------------------------------------------------------------
+
+/// `whole` steps and `left` over of a step of `step`, as a count of steps rounded.
+fn stepped(whole: Int, left: Int, step: Int, rounding: Rounding, negative: Bool) -> Int =
+  if rounds_away(rounding, negative, whole % 2 == 1, compare(left * 2, step), left > 0) {
+    whole + 1
+  } else { whole }
+
+/// A count of tenths as a number: `15` is `1.5`, and `20` is `2`.
+fn tenths(n: Int) -> String =
+  if n % 10 == 0 { int_to_string(n / 10) }
+  else { int_to_string(n / 10) ++ "." ++ int_to_string(n % 10) }
+
+/// Two units, the smaller left out where there is none of it.
+fn paired(big: Int, big_unit: String, small: Int, small_unit: String) -> String =
+  if small == 0 { int_to_string(big) ++ " " ++ big_unit }
+  else { int_to_string(big) ++ " " ++ big_unit ++ " " ++ int_to_string(small) ++ " " ++ small_unit }
+
+/// The span as a person says it, roughly. Under a minute it is in the largest unit it fills, to
+/// a tenth where it is not whole: `1.5 s`, `250 ms`, `40 ns`, and microseconds under the micro
+/// sign. From a minute up it is in that unit and the next one down, to the nearest of the
+/// smaller: `3 min`, `2 h 5 min`, `3 d 4 h`. A span that rounds up to the next unit is written
+/// in it, a negative one has a `-` before it, and none at all is `0 s`. The text is for reading:
+/// it does not say the span exactly.
+pub fn duration(d: Duration, rounding: Rounding = HalfEven) -> String = {
+  let nanos = match d { Duration(n) -> n };
+  let negative = nanos < 0;
+  let below = if negative { nanos } else { 0 - nanos };
+  let said = if below > 0 - 1000 { int_to_string(0 - below) ++ " ns" } else if below > 0 - 1000000 {
+    let n = stepped(0 - below / 100, 0 - below % 100, 100, rounding, negative);
+    if n >= 10000 { "1 ms" } else { tenths(n) ++ " \u{b5}s" }
+  } else if below > 0 - 1000000000 {
+    let n = stepped(0 - below / 100000, 0 - below % 100000, 100000, rounding, negative);
+    if n >= 10000 { "1 s" } else { tenths(n) ++ " ms" }
+  } else if below > 0 - 60000000000 {
+    let n = stepped(0 - below / 100000000, 0 - below % 100000000, 100000000, rounding, negative);
+    if n >= 600 { "1 min" } else { tenths(n) ++ " s" }
+  } else if below > 0 - 3600000000000 {
+    let n = stepped(0 - below / 1000000000, 0 - below % 1000000000, 1000000000, rounding, negative);
+    if n >= 3600 { "1 h" } else { paired(n / 60, "min", n % 60, "s") }
+  } else if below > 0 - 86400000000000 {
+    let n = stepped(
+      0 - below / 60000000000,
+      0 - below % 60000000000,
+      60000000000,
+      rounding,
+      negative,
+    );
+    if n >= 1440 { "1 d" } else { paired(n / 60, "h", n % 60, "min") }
+  } else {
+    let n = stepped(
+      0 - below / 3600000000000,
+      0 - below % 3600000000000,
+      3600000000000,
+      rounding,
+      negative,
+    );
+    paired(n / 24, "d", n % 24, "h")
+  };
+  if nanos == 0 { "0 s" } else if negative { "-" ++ said } else { said }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+type Tie = { rounding: Rounding, above: String, below: String }
+
+/// An eighth is a tie at two places, and a float holds it exactly.
+fn eighths() -> List<Tie> =
+  [
+    { rounding: HalfEven, above: "0.12", below: "-0.12" },
+    { rounding: HalfUp, above: "0.13", below: "-0.13" },
+    { rounding: Down, above: "0.12", below: "-0.12" },
+    { rounding: Up, above: "0.13", below: "-0.13" },
+    { rounding: Ceiling, above: "0.13", below: "-0.12" },
+    { rounding: Floor, above: "0.12", below: "-0.13" },
+  ]
+
+test "0.125 to two places is {c.above}, and its negation {c.below}" for c: Tie in eighths() {
+  assert_eq(fixed(0.125, 2, c.rounding), c.above);
+  assert_eq(fixed(0.0 - 0.125, 2, c.rounding), c.below);
+  assert_eq(fixed_decimal(0.125m, 2, c.rounding), c.above);
+  assert_eq(fixed_decimal(0m - 0.125m, 2, c.rounding), c.below)
+}
+
+test "a tie goes to the even digit or away from zero, and a float just short of one does not tie" {
+  assert_eq(fixed(0.375, 2), "0.38");
+  assert_eq(fixed(2.5, 0), "2");
+  assert_eq(fixed(3.5, 0), "4");
+  assert_eq(fixed(2.5, 0, HalfUp), "3");
+  assert_eq(fixed(0.5, 0), "0");
+  assert_eq(fixed(0.0 - 0.5, 0), "-0");
+  assert_eq(fixed(2.675, 2), "2.67");
+  assert_eq(fixed(2.675, 2, HalfUp), "2.67");
+  assert_eq(fixed(1.005, 2, HalfUp), "1.00");
+  assert_eq(fixed_decimal(1.005m, 2), "1.00");
+  assert_eq(fixed_decimal(1.005m, 2, HalfUp), "1.01");
+  assert_eq(fixed_decimal(1.015m, 2), "1.02")
+}
+
+test "fixed writes exactly the places asked for, from the float's own digits" {
+  assert_eq(fixed(1.5, 2), "1.50");
+  assert_eq(fixed(1234.5678, 0), "1235");
+  assert_eq(fixed(1.0, 0 - 3), "1");
+  assert_eq(fixed(0.004, 1), "0.0");
+  assert_eq(fixed(0.004, 1, Up), "0.1");
+  assert_eq(fixed(0.1, 20), "0.10000000000000000555");
+  assert_eq(fixed(0.1, 55), "0.1000000000000000055511151231257827021181583404541015625");
+  assert_eq(fixed(0.1, 57), "0.100000000000000005551115123125782702118158340454101562500");
+  assert_eq(fixed(1.0e21, 0), "1000000000000000000000");
+  assert_eq(fixed(4.0e-324, 3), "0.000");
+  assert_eq(fixed(9007199254740993.0, 1), "9007199254740992.0")
+}
+
+test "negative zero keeps its sign, and what is no number is written as float_to_string writes it" {
+  let minus_zero = float_of_bits(0x8000_0000_0000_0000);
+  let nan = float_of_bits(0x7FF8_0000_0000_0000);
+  let infinity = float_of_bits(0x7FF0_0000_0000_0000);
+  assert_eq(fixed(minus_zero, 2), "-0.00");
+  assert_eq(fixed(0.0, 2), "0.00");
+  assert_eq(fixed(0.0 - 0.001, 2), "-0.00");
+  assert_eq(scientific(minus_zero, 1), "-0.0e0");
+  assert_eq(general(minus_zero), "-0");
+  assert_eq(percent(minus_zero), "-0%");
+  assert_eq(fixed(nan, 2), "NaN");
+  assert_eq(scientific(nan, 2), "NaN");
+  assert_eq(general(nan), "NaN");
+  assert_eq(percent(nan, 1), "NaN%");
+  assert_eq(fixed(infinity, 2), "Infinity");
+  assert_eq(fixed(0.0 - infinity, 2), "-Infinity");
+  assert_eq(scientific(0.0 - infinity, 2), "-Infinity");
+  assert_eq(general(infinity), "Infinity");
+  assert_eq(fixed_decimal(0m - 0.001m, 2), "-0.00")
+}
+
+test "scientific notation is one digit, the places asked for, and a power of ten" {
+  assert_eq(scientific(1234.5, 2), "1.23e3");
+  assert_eq(scientific(0.00012, 1), "1.2e-4");
+  assert_eq(scientific(9.999, 2), "1.00e1");
+  assert_eq(scientific(0.0, 2), "0.00e0");
+  assert_eq(scientific(1.0, 0), "1e0");
+  assert_eq(scientific(123456.0, 0), "1e5");
+  assert_eq(scientific(0.25, 0), "2e-1");
+  assert_eq(scientific(0.25, 0, HalfUp), "3e-1");
+  assert_eq(scientific(4.0e-324, 3), "4.941e-324");
+  assert_eq(scientific(1.7976931348623157e308, 3), "1.798e308");
+  assert_eq(scientific(0.0 - 1234.5, 1), "-1.2e3");
+  assert_eq(scientific_decimal(1234.5m, 2), "1.23e3");
+  assert_eq(scientific_decimal(0.00012m, 1), "1.2e-4");
+  assert_eq(scientific_decimal(0.00m, 1), "0.0e0");
+  assert_eq(scientific_int(123456, 2), "1.23e5");
+  assert_eq(scientific_int(999, 1), "1.0e3");
+  assert_eq(scientific_int(0, 0), "0e0");
+  assert_eq(scientific_int(0 - 9223372036854775807 - 1, 3), "-9.223e18")
+}
+
+test "general keeps the significant digits and chooses the notation by where the first one stands" {
+  assert_eq(general(0.0001), "0.0001");
+  assert_eq(general(0.00001), "1e-5");
+  assert_eq(general(123456.0), "123456");
+  assert_eq(general(1234567.0), "1.23457e6");
+  assert_eq(general(999999.5), "1e6");
+  assert_eq(general(100.0), "100");
+  assert_eq(general(1.5), "1.5");
+  assert_eq(general(0.1 + 0.2), "0.3");
+  assert_eq(general(0.1 + 0.2, 17), "0.30000000000000004");
+  assert_eq(general(1234.5678, 2), "1.2e3");
+  assert_eq(general(1234.5678, 0), "1e3");
+  assert_eq(general(0.0), "0");
+  assert_eq(general(0.0 - 2.5, 1), "-2");
+  assert_eq(general(1.0e21), "1e21")
+}
+
+test "a percentage is the exact hundredfold, rounded once" {
+  assert_eq(percent(0.125, 1), "12.5%");
+  assert_eq(percent(0.125), "12%");
+  assert_eq(percent(0.125, 0, HalfUp), "13%");
+  assert_eq(percent(0.07), "7%");
+  assert_eq(percent(0.07, 2), "7.00%");
+  assert_eq(percent(1.0), "100%");
+  assert_eq(percent(0.0 - 0.5, 1), "-50.0%");
+  assert_eq(percent(12.0), "1200%")
+}
+
+test "a decimal is written to the places asked for, filled or rounded" {
+  assert_eq(fixed_decimal(1.5m, 3), "1.500");
+  assert_eq(fixed_decimal(123m, 0), "123");
+  assert_eq(fixed_decimal(123m, 2), "123.00");
+  assert_eq(fixed_decimal(0m, 2), "0.00");
+  assert_eq(fixed_decimal(0.999m, 2), "1.00");
+  assert_eq(fixed_decimal(0m - 12.345m, 1), "-12.3");
+  assert_eq(fixed_decimal(1.50m, 30), "1.500000000000000000000000000000")
+}
+
+test "an integer counting small units is written in whole ones" {
+  assert_eq(fixed_point(1234, 2), "12.34");
+  assert_eq(fixed_point(0 - 5, 3), "-0.005");
+  assert_eq(fixed_point(7, 0), "7");
+  assert_eq(fixed_point(0, 2), "0.00");
+  assert_eq(fixed_point(12, 0 - 2), "1200");
+  assert_eq(fixed_point(0, 0 - 2), "0");
+  assert_eq(fixed_point(0 - 9223372036854775807 - 1, 2), "-92233720368547758.08")
+}
+
+test "digits are grouped from the point, and nothing else is touched" {
+  assert_eq(grouped("1234567"), "1,234,567");
+  assert_eq(grouped("-1234"), "-1,234");
+  assert_eq(grouped("+1234"), "+1,234");
+  assert_eq(grouped("123"), "123");
+  assert_eq(grouped(""), "");
+  assert_eq(grouped("1234567.891"), "1,234,567.891");
+  assert_eq(grouped(fixed(1234567.891, 2)), "1,234,567.89");
+  assert_eq(grouped("12345%"), "12,345%");
+  assert_eq(grouped("1e21"), "1e21");
+  assert_eq(grouped("NaN"), "NaN");
+  assert_eq(grouped("1234567", separator: "_"), "1_234_567");
+  assert_eq(grouped("1234567", separator: "."), "1.234.567");
+  assert_eq(grouped("1234567", separator: " ", size: 4), "123 4567");
+  assert_eq(grouped("1234567", size: 0), "1234567")
+}
+
+test "a sign is shown on request, and zeros stand between it and the digits" {
+  assert_eq(signed("5"), "+5");
+  assert_eq(signed("-5"), "-5");
+  assert_eq(signed("0.0"), "+0.0");
+  assert_eq(signed("5", plus: " "), " 5");
+  assert_eq(zero_padded("42", 5), "00042");
+  assert_eq(zero_padded("-42", 6), "-00042");
+  assert_eq(zero_padded("+42", 6), "+00042");
+  assert_eq(zero_padded("ff", 4), "00ff");
+  assert_eq(zero_padded("-ff", 6), "-000ff");
+  assert_eq(zero_padded("1.50", 6), "001.50");
+  assert_eq(zero_padded("12345", 3), "12345");
+  assert_eq(zero_padded("NaN", 6), "   NaN");
+  assert_eq(zero_padded("-Infinity", 12), "   -Infinity");
+  assert_eq(grouped(zero_padded("1234", 8)), "00,001,234")
+}
+
+test "a size is written in the largest unit it fills, in the system asked for" {
+  assert_eq(size(0), "0 B");
+  assert_eq(size(512), "512 B");
+  assert_eq(size(1023), "1023 B");
+  assert_eq(size(1024), "1.0 KiB");
+  assert_eq(size(1536), "1.5 KiB");
+  assert_eq(size(1572864), "1.5 MiB");
+  assert_eq(size(1572864, Si), "1.6 MB");
+  assert_eq(size(999, Si), "999 B");
+  assert_eq(size(1000, Si), "1.0 kB");
+  assert_eq(size(0 - 1536), "-1.5 KiB");
+  assert_eq(size(12750000, digits: 2), "12.16 MiB");
+  assert_eq(size(3145728, digits: 0), "3 MiB");
+  assert_eq(size(9223372036854775807), "8.0 EiB");
+  assert_eq(size(9223372036854775807, Si), "9.2 EB");
+  assert_eq(size(0 - 9223372036854775807 - 1), "-8.0 EiB")
+}
+
+test "a size that rounds up to the next unit is written in it, and a half goes as told" {
+  assert_eq(size(1048575), "1.0 MiB");
+  assert_eq(size(1048575, rounding: Down), "1023.9 KiB");
+  assert_eq(size(999999, Si), "1.0 MB");
+  assert_eq(size(999949, Si), "999.9 kB");
+  assert_eq(size(2560, digits: 0), "2 KiB");
+  assert_eq(size(2560, digits: 0, rounding: HalfUp), "3 KiB");
+  assert_eq(size(1088, digits: 1), "1.1 KiB");
+  assert_eq(size(1126, digits: 1), "1.1 KiB");
+  assert_eq(size(1127, digits: 1, rounding: Up), "1.2 KiB")
+}
+
+type Sized = { text: String, bytes: Option<Int> }
+
+fn sizes() -> List<Sized> =
+  [
+    { text: "512", bytes: Some(512) },
+    { text: "512 B", bytes: Some(512) },
+    { text: "1.5 MiB", bytes: Some(1572864) },
+    { text: "1.6 MB", bytes: Some(1600000) },
+    { text: "1.5KiB", bytes: Some(1536) },
+    { text: "1 kB", bytes: Some(1000) },
+    { text: "1 KB", bytes: Some(1000) },
+    { text: "-1.5 KiB", bytes: Some(0 - 1536) },
+    { text: "0.3 kB", bytes: Some(300) },
+    { text: "1.1 KiB", bytes: Some(1126) },
+    { text: "0.5 B", bytes: Some(0) },
+    { text: "1.5 B", bytes: Some(2) },
+    { text: "2.5 B", bytes: Some(2) },
+    { text: "0.00000000000000000000000000001 EB", bytes: Some(0) },
+    { text: "007 B", bytes: Some(7) },
+    { text: "7.9 EiB", bytes: Some(9108079886394091110) },
+    { text: "8 EiB", bytes: None },
+    { text: "-8 EiB", bytes: Some(0 - 9223372036854775807 - 1) },
+    { text: "99999999999999999999 B", bytes: None },
+    { text: "", bytes: None },
+    { text: "MiB", bytes: None },
+    { text: "1.", bytes: None },
+    { text: ".5 MiB", bytes: None },
+    { text: "1 mib", bytes: None },
+    { text: "1 MiB ", bytes: None },
+    { text: " 1 MiB", bytes: None },
+    { text: "1e3", bytes: None },
+    { text: "1,024", bytes: None },
+    { text: "+5", bytes: None },
+  ]
+
+test "the size {c.text} is read as its bytes" for c: Sized in sizes() {
+  assert_eq(parse_size(c.text), c.bytes)
+}
+
+type Span = { nanos: Int, text: String }
+
+fn spans() -> List<Span> =
+  [
+    { nanos: 0, text: "0 s" },
+    { nanos: 40, text: "40 ns" },
+    { nanos: 999, text: "999 ns" },
+    { nanos: 1000, text: "1 \u{b5}s" },
+    { nanos: 1500, text: "1.5 \u{b5}s" },
+    { nanos: 12340, text: "12.3 \u{b5}s" },
+    { nanos: 999949, text: "999.9 \u{b5}s" },
+    { nanos: 999950, text: "1 ms" },
+    { nanos: 250000000, text: "250 ms" },
+    { nanos: 1500000000, text: "1.5 s" },
+    { nanos: 2000000000, text: "2 s" },
+    { nanos: 1250000000, text: "1.2 s" },
+    { nanos: 1350000000, text: "1.4 s" },
+    { nanos: 59940000000, text: "59.9 s" },
+    { nanos: 59960000000, text: "1 min" },
+    { nanos: 60000000000, text: "1 min" },
+    { nanos: 180000000000, text: "3 min" },
+    { nanos: 185400000000, text: "3 min 5 s" },
+    { nanos: 3599600000000, text: "1 h" },
+    { nanos: 7200000000000, text: "2 h" },
+    { nanos: 7500000000000, text: "2 h 5 min" },
+    { nanos: 86399000000000, text: "1 d" },
+    { nanos: 86400000000000, text: "1 d" },
+    { nanos: 273600000000000, text: "3 d 4 h" },
+    { nanos: 0 - 1500000000, text: "-1.5 s" },
+    { nanos: 0 - 7500000000000, text: "-2 h 5 min" },
+    { nanos: 0 - 9223372036854775807 - 1, text: "-106752 d" },
+  ]
+
+test "{c.nanos} nanoseconds are said as {c.text}" for c: Span in spans() {
+  assert_eq(duration(Duration(c.nanos)), c.text)
+}
+
+test "a span at a tie goes as the rounding says" {
+  assert_eq(duration(Duration(1250000000), HalfUp), "1.3 s");
+  assert_eq(duration(Duration(1210000000), Up), "1.3 s");
+  assert_eq(duration(Duration(1290000000), Down), "1.2 s");
+  assert_eq(duration(Duration(0 - 1210000000), Floor), "-1.3 s");
+  assert_eq(duration(Duration(0 - 1290000000), Ceiling), "-1.2 s");
+  assert_eq(duration(Duration(90000000000), HalfUp), "1 min 30 s");
+  assert_eq(duration(Duration(5430000000000)), "1 h 30 min");
+  assert_eq(duration(Duration(5370000000000)), "1 h 30 min")
+}
+
+fn roundings() -> List<Rounding> = [HalfEven, HalfUp, Down, Up, Ceiling, Floor]
+
+/// A decimal text with exactly `digits` after its point, zeros filling what it lacks, and the
+/// sign of a negative number that rounded to nothing put back.
+fn filled(text: String, digits: Int, negative: Bool) -> String / {abort.raise} = {
+  let have = if string_contains(text, ".") { string_len(text) - string_find(text, ".") - 1 }
+  else { 0 };
+  let pointed = if have == 0 && digits > 0 { text ++ "." } else { text };
+  (if negative && !string_starts_with(text, "-") { "-" } else { "" }) ++ pointed
+    ++ repeat("0", digits - have)
+}
+
+law "a float's places are those the prelude rounds its exact decimal to"
+  forall (n: Int, d: Int, r: Int) {
+    let v = (n & 0xFF_FFFF_FFFF) - 0x80_0000_0000;
+    let rounding = at_or(roundings(), r & 7, HalfEven);
+    let exact = decimal_div(decimal_of_int(v), decimal_of_int(1024), 10, Down);
+    fixed(float_of_int(v) / 1024.0, d & 15, rounding)
+      == filled(decimal_to_string(decimal_round(exact, d & 15, rounding)), d & 15, v < 0)
+      && percent(float_of_int(v) / 1024.0, d & 7, rounding)
+      == filled(decimal_to_string(decimal_round(exact * 100m, d & 7, rounding)), d & 7, v < 0)
+      ++ "%"
+  }
+
+fn spelled(limbs: List<Int>) -> String =
+  if len(limbs) == 0 { "0" } else { string_of_chars(digits_of(limbs)) }
+
+law "a float's digits are its mantissa times a power of two or of five, as std.bigint multiplies"
+  forall (m: Int, k: Int) {
+    let mantissa = m & 0x1F_FFFF_FFFF_FFFF;
+    let power = k & 1023;
+    spelled(doubled(limbs_of(mantissa), power))
+      == bigint::to_string(
+        bigint::mul(bigint::of_int(mantissa), bigint::pow(bigint::of_int(2), power)),
+      )
+      && spelled(quintupled(limbs_of(mantissa), power))
+      == bigint::to_string(
+        bigint::mul(bigint::of_int(mantissa), bigint::pow(bigint::of_int(5), power)),
+      )
+  }
+
+law "seventeen significant digits read back as the float"
+  forall (x: Float) where x - x == 0.0 {
+    float_of_string(scientific(x, 16)) == Some(x)
+  }
+
+law "a decimal's places are those the prelude rounds it to"
+  forall (d: Decimal, k: Int, r: Int) {
+    let rounding = at_or(roundings(), r & 7, HalfEven);
+    fixed_decimal(d, k & 15, rounding)
+      == filled(decimal_to_string(decimal_round(d, k & 15, rounding)), k & 15, d < 0m)
+  }
+
+law "an integer in small units is the decimal of those parts, to that many places"
+  forall (n: Int, k: Int) {
+    let text = fixed_point(n, k & 15);
+    let places = if string_contains(text, ".") { string_len(text) - string_find(text, ".") - 1 }
+    else { 0 };
+    places == k & 15 && decimal_of_string(text) == of_parts(n, k & 15)
+  }
+
+law "grouping adds separators and nothing else, three digits to a group"
+  forall (n: Int) {
+    let text = grouped(int_to_string(n));
+    join(string_split(text, ","), "") == int_to_string(n)
+      && all(drop(string_split(text, ","), 1), |group: String| string_len(group) == 3)
+      && grouped(text) == text
+  }
+
+law "zero padding fills the width and keeps the number"
+  forall (n: Int, w: Int) {
+    let text = zero_padded(int_to_string(n), w & 31);
+    string_len(text) == max(w & 31, string_len(int_to_string(n))) && int_of_string(text) == Some(n)
+  }
+
+law "a count of bytes written in bytes reads back" =
+  round_trip(|n: Int| int_to_string(n) ++ " B", parse_size)
+
+law "a whole count of a unit reads back as it was"
+  forall (n: Int, p: Int, binary: Bool) {
+    let units = if binary { Iec } else { Si };
+    let bytes = (n & 511) * at_or(steps(units), (p & 7) % 6, 1);
+    parse_size(size(bytes, units)) == Some(bytes)
+      && parse_size(size(0 - bytes, units)) == Some(0 - bytes)
+  }
+
+law "a size reads back within the last digit it shows"
+  forall (n: Int, d: Int, binary: Bool) {
+    let bytes = (n & 0x3_FFFF_FFFF_FFFF) - 0x2_0000_0000_0000;
+    let unit = fold(range(0, d & 3), 1, |ten: Int, _: Int| ten * 10);
+    match parse_size(size(bytes, if binary { Iec } else { Si }, d & 3)) {
+      Some(back) ->
+        (if back > bytes { back - bytes } else { bytes - back }) * unit
+          <= (if bytes < 0 { 0 - bytes } else { bytes }) + unit,
+      None -> false,
+    }
+  }
+
+law "a span before is said as the span after, behind a sign"
+  forall (n: Int) where n > 0 {
+    duration(Duration(0 - n)) == "-" ++ duration(Duration(n))
+  }
+
+law "a whole count of a unit is said as that count"
+  forall (n: Int) {
+    let k = 1 + (n & 15);
+    duration(Duration(k * 1000000000)) == int_to_string(k) ++ " s"
+      && duration(Duration(k * 60000000000)) == int_to_string(k) ++ " min"
+      && duration(Duration(k * 3600000000000)) == int_to_string(k) ++ " h"
+      && duration(Duration(k * 86400000000000)) == int_to_string(k) ++ " d"
+  }

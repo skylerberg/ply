@@ -5,6 +5,7 @@ import parsing (Span, Ident, QName, span_to, dummy_span, span_key, span_bin, is_
 import std.bin
 import std.hash (blake3)
 import std.list (at, concat, contains, drop, push_unique, sort, sort_by, take, prepend)
+import std.graph
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
@@ -62,6 +63,8 @@ import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrai
                secret_reason, float_reason, null_in_option_note, same_deriver)
 import std.bytes
 import std.bytes (ascii_of_int)
+import std.option (option_traverse)
+import std.text (closest)
 
 // --- What the checker keeps ----------------------------------------------------------
 
@@ -1474,32 +1477,17 @@ fn exporter(checker: Checker, namespace: Namespace, name: Bytes) -> Option<Int> 
       },
     })
 
+/// The name in scope a slip of the hand makes `name` of: an edit for every three characters.
 fn nearest_name(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let n = bytes_len(name);
-  let best = fold(
-    scope_of(checker).bound.values,
-    None,
-    |acc: Option<{ d: Int, name: Bytes }>, binding: Binding| {
-      let d = edit_distance(name, binding.name);
-      if d > 0 && d * 3 <= max(n, 1) && (match acc { None -> true, Some(x) -> d < x.d }) {
-        Some({ d: d, name: binding.name })
-      } else { acc }
-    },
+  let written = string_of_bytes_lossy(name);
+  let others = filter(
+    map(scope_of(checker).bound.values, |binding: Binding| string_of_bytes_lossy(binding.name)),
+    |other: String| other != written,
   );
-  match best { Some(x) -> Some(x.name), None -> None }
-}
-
-fn edit_distance(a: Bytes, b: Bytes) -> Int / {abort.raise} = {
-  let n = bytes_len(a);
-  let m = bytes_len(b);
-  let first = range(0, m + 1);
-  let final = fold(range(0, n), first, |prev: List<Int>, i: Int|
-    fold(range(0, m), [i + 1], |cur: List<Int>, j: Int| {
-      let cost = if bytes_at(a, i) == bytes_at(b, j) { 0 } else { 1 };
-      let v = min(min(at(prev, j + 1) + 1, at(cur, j) + 1), at(prev, j) + cost);
-      push(cur, v)
-    }));
-  at(final, m)
+  match closest(written, others, bytes_len(name) / 3) {
+    Some(near) -> Some(bytes_of_string(near)),
+    None -> None,
+  }
 }
 
 fn unknown_name(checker: Checker, qname: QName) -> Checker / {abort.raise} =
@@ -7882,97 +7870,6 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
     ETryBlock(t) -> collect_refs(t.body, bound, out),
   }
 
-/// Tarjan's components in completion order, so the checker solves a callee before its callers.
-type Tarjan = {
-  index: List<Int>,
-  low: List<Int>,
-  on_stack: List<Bool>,
-  stack: List<Int>,
-  call: List<{ v: Int, edge: Int }>,
-  out: List<List<Int>>,
-  next: Int,
-}
-
-pub fn sccs(n: Int, adj: List<List<Int>>) -> List<List<Int>> / {abort.raise} = {
-  let unvisited = 0 - 1;
-  let start = {
-    index: map(range(0, n), |i: Int| unvisited),
-    low: map(range(0, n), |i: Int| 0),
-    on_stack: map(range(0, n), |i: Int| false),
-    stack: [],
-    call: [],
-    out: [],
-    next: 0,
-  };
-  let edges = fold(adj, 0, |acc: Int, es: List<Int>| acc + len(es));
-  let done = fold(range(0, n), start, |t: Tarjan, root: Int|
-    if at(t.index, root) != unvisited { t } else {
-      let opened: Tarjan = {
-        ..t,
-        index: list_set(t.index, root, t.next),
-        low: list_set(t.low, root, t.next),
-        next: t.next + 1,
-        stack: push(t.stack, root),
-        on_stack: list_set(t.on_stack, root, true),
-        call: [{ v: root, edge: 0 }],
-      };
-      iterate(opened, 2 * (n + edges) + 4, |x: Tarjan|
-        if len(x.call) == 0 { Stop(x) } else { Continue(tarjan_step(adj, x)) })
-    });
-  done.out
-}
-
-fn tarjan_step(adj: List<List<Int>>, t: Tarjan) -> Tarjan / {abort.raise} = {
-  let top = at(t.call, len(t.call) - 1);
-  let rest = take(t.call, len(t.call) - 1);
-  let out = at(adj, top.v);
-  if top.edge < len(out) {
-    let again = push(rest, { v: top.v, edge: top.edge + 1 });
-    let w = at(out, top.edge);
-    if at(t.index, w) == 0 - 1 {
-      {
-        ..t,
-        index: list_set(t.index, w, t.next),
-        low: list_set(t.low, w, t.next),
-        next: t.next + 1,
-        stack: push(t.stack, w),
-        on_stack: list_set(t.on_stack, w, true),
-        call: push(again, { v: w, edge: 0 }),
-      }
-    } else if at(t.on_stack, w) {
-      { ..t, low: list_set(t.low, top.v, min(at(t.low, top.v), at(t.index, w))), call: again }
-    } else { { ..t, call: again } }
-  } else {
-    let popped: Tarjan = if at(t.low, top.v) == at(t.index, top.v) {
-      let split = iterate(
-        { stack: t.stack, on: t.on_stack, comp: [] },
-        len(t.stack) + 1,
-        |s: { stack: List<Int>, on: List<Bool>, comp: List<Int> }| {
-          let w = at(s.stack, len(s.stack) - 1);
-          let next = {
-            stack: take(s.stack, len(s.stack) - 1),
-            on: list_set(s.on, w, false),
-            comp: push(s.comp, w),
-          };
-          if w == top.v { Stop(next) } else { Continue(next) }
-        },
-      );
-      { ..t, stack: split.stack, on_stack: split.on, out: push(t.out, reverse_ints(split.comp)) }
-    } else { t };
-    let lowered: Tarjan = if len(rest) > 0 {
-      let parent = at(rest, len(rest) - 1).v;
-      {
-        ..popped,
-        low: list_set(popped.low, parent, min(at(popped.low, parent), at(popped.low, top.v))),
-      }
-    } else { popped };
-    { ..lowered, call: rest }
-  }
-}
-
-fn reverse_ints(xs: List<Int>) -> List<Int> / {abort.raise} =
-  map(range(0, len(xs)), |i: Int| at(xs, len(xs) - 1 - i))
-
 fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let collected = fold(
     parsed.module.items,
@@ -8093,7 +7990,8 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
           })
       },
     });
-  fold(sccs(len(fns), adj), collected.checker, |c: Checker, comp: List<Int>|
+  // Components come callees first, so a callee is solved before its callers.
+  fold(graph::components({ out: adj }), collected.checker, |c: Checker, comp: List<Int>|
     check_component(c, parsed, fns, comp))
 }
 
@@ -9211,14 +9109,7 @@ fn set_atoms_of(checker: Checker, owner: Int, name: Bytes) -> Option<List<Atom>>
           None -> match item {
             IEffectSet(d) -> if d.name.name == name {
               let there: Checker = { ..checker, module: owner, label_params: map_new(), diags: [] };
-              fold(d.expansion, Some([]), |acc: Option<List<Atom>>, a: AtomExpr|
-                match acc {
-                  None -> None,
-                  Some(xs) -> match conv_atom(there, a).atom {
-                    Some(atom) -> Some(push(xs, atom)),
-                    None -> None,
-                  },
-                })
+              option_traverse(d.expansion, |a: AtomExpr| conv_atom(there, a).atom)
             } else { None },
             _ -> None,
           },
@@ -14156,6 +14047,17 @@ test "a clause on a label parameter discharges what the generic body performs" {
       ++ "F;m.quiet;<[l]>(Bytes) -> Unit;;;;"
       ++ "E;m.net;0;send:write:1:Bytes:Unit;",
   )
+}
+
+test "an unknown name is told the name in scope a slip of the hand would make it" {
+  let noted = |call: Bytes|
+    check_dump([
+      { name: b"m", src: bytes_concat(b"fn count(n: Int) -> Int = n\nfn go() -> Int = ", call) },
+    ]);
+  assert(string_contains(noted(b"cuont(2)"), "!E0101:0:45:50:1:1;"));
+  assert(string_contains(noted(b"counts(2)"), "!E0101:0:45:51:1:1;"));
+  assert(string_contains(noted(b"breadth(2)"), "!E0101:0:45:52:1:0;"));
+  assert(string_contains(noted(b"cnt(2)"), "!E0101:0:45:48:1:0;"))
 }
 
 test "`[*]` on an operation that takes no resource is refused" {

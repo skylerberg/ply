@@ -621,7 +621,7 @@ types, values and patterns, accessed as `t._0`. `(A)` only groups; `()` is
 `Unit`.
 
 An alias may take parameters and name a type that constrains them, as
-`type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
+`std.set`'s `type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
 constraint: each signature that uses it promises what its expansion needs,
 `where derivable(ord, a)` here, and one that does not is `E0206` where it names
 the alias. It may take label and row parameters too (§4.5):
@@ -687,7 +687,7 @@ compared, ordered and derived element by element, and has no literal: build it
 with `array_new` or `array_of_list` (§12). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
-written `#[a, b]`. It iterates in `compare` order. Its key type
+written `#[a, b]`, and `std.set` names its type `Set<a>`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
 `Task` and `Chan` are refused (`E0206`).
 
@@ -1964,7 +1964,7 @@ Results are cached per search plan; a search that spends its budget passes but
 is not cached. A failure prints the racing steps — each one's task, and the
 definition and position where it first touched shared state — and a replay
 command such as
-`ply test --seed 0:0.1.0.2 --filter "no account is ever overdrawn"`.
+`ply test --seed 0:0.1.0.2 --filter 'no account is ever overdrawn'`.
 
 ## 10. Specifications, laws and proof
 
@@ -2243,8 +2243,9 @@ derive json for Line
 | `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
 | `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
 
-There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
-`HttpRequest` both give `http_request`) is `E0105`. A `derive` must be in the
+There are no other derivers (`E0207`). `snake_case` is `std.text`'s, so a
+name collision (`HTTPRequest` and `HttpRequest` both give `http_request`) is
+`E0105`. A `derive` must be in the
 module declaring its type (`E0208`). A parameterized type's function takes one
 dictionary per parameter:
 
@@ -2559,7 +2560,7 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
-| 4 | `ply test --kept`: no answer a run kept stands |
+| 4 | `ply test --kept`: what earlier runs kept does not answer the run |
 | *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
@@ -2754,8 +2755,12 @@ shipped definition its program reached hashes as it did (§13); otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 `--no-cache` and a configuration file or schema always load. In the `--json`
 document, `front_end` carries `reused` and `key` for an answer taken back,
-beside the phases of this run, all of it read. `--kept` answers only that way:
-where no kept answer stands it loads nothing and exits 4, so a caller can tell
+beside the phases of this run, all of it read. A `--json` run of several
+`--filter`s also keeps, for each, the answer a run of it alone gives. `--kept`
+answers only from what was kept: where no kept answer of the whole command line
+stands, a run of several filters asks each what a run of it alone kept, exits 0
+where every one is answered and otherwise lists the rest under `unanswered`;
+exit 4 is a run nothing kept answers, with nothing loaded, so a caller can tell
 which runs have work before starting them. `ply defs` keeps its listing the same
 way, beside every embed the program read, and a later listing over the same
 command line, files and `ply` takes it back while every shipped definition the
