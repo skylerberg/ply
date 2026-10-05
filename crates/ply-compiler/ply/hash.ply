@@ -5,13 +5,13 @@ import parsing (Span, Ident, QName, is_bare, starts_upper)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, angled)
+                    MWrite, MBad, MRaise, angled)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, MatchArm, HandleClause,
-              ReturnClause, RecField)
+              EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
+              HandleClause, ReturnClause, RecField)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
@@ -617,6 +617,7 @@ fn tag_e_handle() -> Int = 63
 fn tag_e_with_cell() -> Int = 64
 fn tag_e_simulate() -> Int = 65
 fn tag_e_parallel() -> Int = 100
+fn tag_e_try_block() -> Int = 131
 fn tag_e_record_update() -> Int = 67
 fn tag_s_let() -> Int = 70
 fn tag_s_expr() -> Int = 71
@@ -669,7 +670,7 @@ fn binop_byte(op: Bytes) -> Int =
 
 fn unop_byte(op: Bytes) -> Int = if op == b"neg" { 1 } else if op == b"not" { 2 } else { 3 }
 
-fn mode_byte(mode: Mode) -> Int = match mode { MRead -> 0, MWrite -> 1, MBad -> 0 }
+fn mode_byte(mode: Mode) -> Int = match mode { MRead -> 0, MWrite -> 1, MBad -> 0, MRaise -> 2 }
 
 fn spec_tag(k: SpecKind) -> Int = match k { SRequires -> 1, SEnsures -> 2, SCost -> 3 }
 
@@ -1364,6 +1365,15 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
         |acc: Encoder, x: Expr| expr(acc, x),
       ),
     EBad(_) -> panic("a placeholder reached the hasher"),
+    // A `try` that names no raise answers the one its body's row names, which the body settles.
+    ETryBlock(t) -> {
+      let tagged: Encoder = put_tag(encoder, tag_e_try_block());
+      let named: Encoder = match t.raise {
+        None -> put_tag(tagged, tag_none()),
+        Some(r) -> put_text(effect_ref(put_tag(tagged, tag_some()), r.eff), r.op.name),
+      };
+      expr(named, t.body)
+    },
   }
 
 fn block(encoder: Encoder, stmts: List<Stmt>, tail: Option<Expr>) -> Encoder / {abort.raise} = {
@@ -1598,6 +1608,7 @@ pub fn is_pure(e: Expr) -> Bool =
     EHandle(_) -> false,
     EWithCell(_) -> false,
     ESimulate(_) -> false,
+    ETryBlock(_) -> false,
     EParallel(v) -> fold(v.branches, true, |acc: Bool, x: Expr| acc && is_pure(x)),
     ETry(_) -> false,
     EBad(_) -> false,
@@ -1680,6 +1691,7 @@ fn mentions(e: Expr, names: List<Bytes>) -> Bool =
     EWithCell(c) ->
       contains(names, c.binder.name) || mentions(c.init, names) || mentions(c.body, names),
     ESimulate(s) -> mentions(s.body, names),
+    ETryBlock(t) -> mentions(t.body, names),
     EParallel(v) -> fold(v.branches, false, |acc: Bool, x: Expr| acc || mentions(x, names)),
   }
 
@@ -3171,6 +3183,7 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
     },
     EWithCell(c) -> lambda_rets(c.body, lambda_rets(c.init, out)),
     ESimulate(s) -> lambda_rets(s.body, out),
+    ETryBlock(t) -> lambda_rets(t.body, out),
     EParallel(v) -> fold(v.branches, out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
   }
 
@@ -3681,6 +3694,7 @@ fn read_mode(decoder: Decoder) -> Decoded / {abort.raise} = {
   let m = read_u8(decoder);
   if m.value == 0 { { decoder: m.decoder, text: b"read" } }
   else if m.value == 1 { { decoder: m.decoder, text: b"write" } }
+  else if m.value == 2 { { decoder: m.decoder, text: b"raise" } }
   else { panic("a byte that is not an access mode") }
 }
 
@@ -4350,6 +4364,14 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
         decoder: branches.decoder,
         text: bytes_concat_all([b"parallel { ", joined(branches.texts, b", "), b" }"]),
       }
+    } else if t.value == tag_e_try_block() {
+      let named = read_opt(e, |g: Decoder| {
+        let eff = read_effect(printer, g);
+        let op = read_text(eff.decoder);
+        { decoder: op.decoder, text: bytes_concat_all([b"[", eff.text, b".", op.text, b"]"]) }
+      });
+      let body = print_block(printer, named.decoder, depth);
+      { decoder: body.decoder, text: bytes_concat_all([b"try", named.text, b" ", body.text]) }
     } else {
       panic(
         string_of_bytes(
@@ -4515,8 +4537,9 @@ fn print_effect(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abo
         type_binders(tc.value),
         b"(",
         joined(ps.texts, b", "),
-        b") -> ",
-        ret.text,
+        b")",
+        // A raise writes no result; the `Unit` its encoding holds in that place is read past.
+        if m.text == b"raise" { b"" } else { bytes_concat(b" -> ", ret.text) },
       ]),
     }
   });
@@ -5401,6 +5424,31 @@ test "a parallel block prints back as written and hashes back to what it was sto
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a `try` and a `raise` operation print back as written and hash back to what they were stored under" {
+  let src = |tried: Bytes|
+    bytes_concat_all([
+      b"pub effect p { raise bad(n: Int) }\npub fn g(n: Int) -> Int / {p.bad} = p.bad(n)\n",
+      b"pub fn f(n: Int) -> Result<Int, Int> = ",
+      tried,
+    ]);
+  let hash_of = |out: HashOutput| {
+    match map_get(by_name(named_hashes(out)), b"m.f") {
+      Some(h) -> h,
+      None -> panic("the index names f"),
+    }
+  };
+  let out = hash_index(indexed([{ name: b"m", src: src(b"try[p.bad] { g(n) }") }]));
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b"raise bad(Int)\n"));
+  assert(bytes::contains(at(ms, 0).text, b"try[p.bad] {"));
+  let again = hash_index(indexed([{ name: b"m", src: at(ms, 0).text }]));
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
+  // One that names no raise reads it off its body, which is all its hash holds.
+  let unnamed = hash_index(indexed([{ name: b"m", src: src(b"try { g(n) }") }]));
+  assert(bytes::contains(at(printed_of(unnamed, []), 0).text, b"try {"));
+  assert(hash_of(unnamed) != hash_of(out))
 }
 
 test "a reference is printed under a name the module holding it exports" {

@@ -6,7 +6,7 @@ import std.bin
 import std.hash (blake3)
 import std.list (at, concat, contains, drop, sort_by, take, prepend)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span, mode_text, ident_names)
+                    MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
               ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
               EffectDef, OpDef, TestDef, LawDef, Binder, Constraint, Deriver, DJson, DEq, DOrd,
@@ -14,15 +14,15 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               SpecKind, SRequires, SEnsures, SCost, SpecClause, Derived, DeriveDef, parse)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
-              ReturnClause, RecField, expr_span, is_arithmetic, is_ordered)
+              EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
+              MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
               TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
               OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
               atoms_sorted, atoms_union, atoms_difference, resource_covers, row_empty, row_open,
-              row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_abort,
+              row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_raises,
               run_needs, is_diverges, row_union, row_without, row_without_covered, atom_conflicts,
               atom_covers, named_type, applied_type, int_type, bool_type, string_type, bytes_type,
               float_type, decimal_type, unit_type, list_type, option_type, map_type, iter_type,
@@ -45,8 +45,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find, lookup, lookup_declared, space, qualify, default_binder, dump_diags,
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error)
-import rewrite (expand, expand_record_updates, expand_witnesses, NumericWitness, ConcreteWitness,
-                ParamWitness, numeric_witness_bin)
+import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
+                NumericWitness, ConcreteWitness, ParamWitness, numeric_witness_bin)
 import embed (EmbedAt, embed_tables, rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -198,6 +198,8 @@ type UpdateSite = {
 }
 // What the lowering needs: the field list of the record an update copies, in the record's own order.
 pub type UpdateShape = { module: Int, span: Span, names: List<Bytes>, owner: Bytes }
+// The raise a `try` answers, by its effect's program-wide name, and how many values it carries.
+pub type TrySite = { module: Int, span: Span, effect: Bytes, op: Bytes, arity: Int, owner: Bytes }
 type Signature = {
   ty_params: Map<Bytes, Type>,
   row_params: Map<Bytes, Int>,
@@ -418,6 +420,7 @@ type Checker = {
   concats: List<ConcatSite>,
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
+  try_sites: List<TrySite>,
   simulate_depth: Int,
   // The scopes open around the innermost `simulate` body, and the locals of those it names.
   sim_scope: Int,
@@ -600,18 +603,10 @@ fn prelude_effect_names() -> List<Bytes> =
 pub fn is_prelude_effect(name: Bytes) -> Bool = contains(prelude_effect_names(), name)
 fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
 
-fn is_abort(effect_info: EffectInfo) -> Bool =
-  effect_info.name == b"abort" && effect_info.module == b""
-
-// A raise does not come back, so a clause for it answers for the whole `handle`, as one that binds
-// `resume` does.
-fn answers_abort(clause: HandleClause) -> Bool =
-  is_bare(clause.eff) && clause.eff.name.name == b"abort"
-
 fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead, op: None }
 
 pub fn abort_atom() -> Atom =
-  { effect: b"abort", resource: RSingleton, mode: MRead, op: Some(b"raise") }
+  { effect: b"abort", resource: RSingleton, mode: MRaise, op: Some(b"raise") }
 
 fn abort_row() -> Row = row_singleton(abort_atom())
 
@@ -865,7 +860,7 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       simple_name: b"abort",
       nondet: false,
       at: none,
-      ops: [prelude_op(b"raise", MRead, [0], [], [string_type()], ta, row_empty())],
+      ops: [prelude_op(b"raise", MRaise, [0], [], [string_type()], ta, row_empty())],
     },
     // Divergence names no operation: nothing performs it, and nothing handles it.
     { name: b"diverges", module: b"", simple_name: b"diverges", nondet: false, at: none, ops: [] },
@@ -2090,7 +2085,7 @@ fn conv_atom(
           None -> {
             let known = match info {
               Some(i) -> match a.op {
-                Some(_) -> concat(known_modes(i), known_ops(i)),
+                Some(_) -> concat(known_modes(i), known_moded_ops(i)),
                 None -> known_modes(i),
               },
               None -> [],
@@ -2130,11 +2125,19 @@ fn conv_atom(
     }
   }
 
+// No mode atom stands for a raise, so each one is named.
 fn known_modes(info: EffectInfo) -> List<Bytes> =
   fold(info.ops, [], |acc: List<Bytes>, op_info: OpInfo| {
-    let k = bytes_concat_all([info.simple_name, b".", mode_text(op_info.mode)]);
+    let k = bytes_concat_all([
+      info.simple_name,
+      b".",
+      if is_raise(op_info.mode) { op_info.name } else { mode_text(op_info.mode) },
+    ]);
     if contains(acc, k) { acc } else { push(acc, k) }
   })
+
+fn known_moded_ops(info: EffectInfo) -> List<Bytes> =
+  known_ops({ ..info, ops: filter(info.ops, |op_info: OpInfo| !is_raise(op_info.mode)) })
 
 fn known_ops(info: EffectInfo) -> List<Bytes> =
   map(info.ops, |op_info: OpInfo| bytes_concat_all([info.simple_name, b".", op_info.name]))
@@ -2148,6 +2151,7 @@ fn mode_eq(a: Mode, b: Mode) -> Bool =
     MRead -> match b { MRead -> true, _ -> false },
     MWrite -> match b { MWrite -> true, _ -> false },
     MBad -> false,
+    MRaise -> is_raise(b),
   }
 
 fn effect_name(
@@ -2406,7 +2410,9 @@ fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                       op.ty_params,
                     );
                     let ps: WithTys = conv_types(c1, op.params);
-                    let r: WithTy = conv_type(ps.checker, op.ret);
+                    // A raise answers nothing, so each perform of it has the type asked of it.
+                    let r: WithTy = if is_raise(op.mode) { new_ty(ps.checker) }
+                    else { conv_type(ps.checker, op.ret) };
                     let c2: Checker = { ..r.checker, ty_params: map_new() };
                     let c3: Checker = fold(range(0, len(ps.tys)), c2, |cc: Checker, i: Int|
                       reject_declared_brand(
@@ -3516,6 +3522,7 @@ fn infer(checker: Checker, expr: Expr) -> Inferred / {abort.raise} =
     EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body),
     ESimulate(s) -> infer_simulate(checker, s.span, s.body),
     EParallel(v) -> infer_parallel(checker, v.span, v.branches),
+    ETryBlock(t) -> infer_try_block(checker, t.span, t.raise, t.body),
   }
 
 // The branches' answers as a tuple, which is what evaluating them left to right answers.
@@ -4725,7 +4732,7 @@ fn infer_app_general(
       } else { checked };
       let resolved = resolve_row_in(obliged, fn_.effects);
       let effects = if narrows_a_literal_it_holds(obliged, func, args) {
-        { ..resolved, atoms: without_abort(resolved.atoms) }
+        { ..resolved, atoms: without_raises(resolved.atoms) }
       } else { resolved };
       let scaled = repeated_rows(obliged, fn_.params, repeats);
       let scales = match source {
@@ -5930,6 +5937,14 @@ type HandleAcc = {
 fn spawn_counts(checker: Checker) -> List<Int> =
   map(checker.open_regions, |region: OpenRegion| len(region.spawns))
 
+// A raise does not come back, so a clause for it answers for the whole `handle`, as one that binds
+// `resume` does.
+fn answers_raise(checker: Checker, clause: HandleClause) -> Bool / {abort.raise} =
+  match resolve_op(checker, clause.eff, clause.op).hit {
+    Some(hit) -> is_raise(hit.op.mode),
+    None -> false,
+  }
+
 fn infer_handle(
   checker: Checker,
   span: Span,
@@ -5942,7 +5957,8 @@ fn infer_handle(
   let spawned = { before: spawn_counts(checker), after: spawn_counts(b.checker) };
   let general = fold(clauses, false, |acc: Bool, c: HandleClause|
     acc || (match c.resume { Some(_) -> true, None -> false }));
-  let escapes = fold(clauses, general, |acc: Bool, c: HandleClause| acc || answers_abort(c));
+  let escapes = fold(clauses, general, |acc: Bool, c: HandleClause|
+    acc || answers_raise(checker, c));
   let cont: { checker: Checker, v: Option<Int> } = if general {
     let o: WithVar = new_row_var(b.checker);
     { checker: o.checker, v: Some(o.var) }
@@ -6066,7 +6082,14 @@ fn infer_handle(
                     { ..bound, env: env_bind(bound.env, t.name, monomorphic(string_type())) },
                   None -> bound,
                 };
-                let raise = is_abort(hit.info);
+                let raise = is_raise(hit.op.mode);
+                let raised = bytes_concat_all([
+                  b"`",
+                  as_written(with_label, hit.info.name),
+                  b".",
+                  hit.op.name,
+                  b"`",
+                ]);
                 let with_resume: Checker = match clause.resume {
                   Some(k) -> {
                     let result = match result_var.t {
@@ -6090,7 +6113,7 @@ fn infer_handle(
                         bound_k,
                         b"E0201",
                         k.span,
-                        b"a clause for `abort.raise` cannot bind `resume`",
+                        bytes_concat_all([b"a clause for ", raised, b" cannot bind `resume`"]),
                         b"a raise does not come back to be resumed",
                         [b"drop `resume`: the clause's value is the `handle`'s"],
                       )
@@ -6115,7 +6138,11 @@ fn infer_handle(
                       expr_span(clause.body),
                       match result_var.t { Some(t) -> t, None -> shape.ret },
                       body_.ty,
-                      b"a clause for `abort.raise` answers for the whole `handle`",
+                      bytes_concat_all([
+                        b"a clause for ",
+                        raised,
+                        b" answers for the whole `handle`",
+                      ]),
                     ).checker
                   } else {
                     let x: Expected = expect(
@@ -6133,7 +6160,8 @@ fn infer_handle(
                 let j: WithRow = join(checked, span, acc.clause_rows, body_.row);
                 {
                   checker: j.checker,
-                  handled: atoms_insert(acc.handled, atom),
+                  // No mode atom stands for a raise, so a clause for one leaves the effect's others be.
+                  handled: if raise { acc.handled } else { atoms_insert(acc.handled, atom) },
                   selected: push(acc.selected, key),
                   clause_rows: j.row,
                   around: push(acc.around, {
@@ -6206,6 +6234,222 @@ fn infer_handle(
     None -> j2.checker,
   };
   { checker: solved, ty: returned.ty, row: j2.row }
+}
+
+// `Ok` and `Err` are written into the `handle` a `try` stands for, where a module's own would
+// capture them.
+fn try_captured(checker: Checker, span: Span) -> Checker / {abort.raise} = {
+  let bound = scope_of(checker).bound;
+  match fold([b"Ok", b"Err"], None, |acc: Option<Bytes>, name: Bytes|
+      match acc {
+        Some(_) -> acc,
+        None -> match lookup(bound, ValueSpace, name) { Some(_) -> Some(name), None -> None },
+      }) {
+    None -> checker,
+    Some(name) ->
+      report_error_at(
+        checker,
+        b"E0118",
+        span,
+        b"this file gives `try` no meaning here",
+        b"no `Result` to answer with",
+        [
+          bytes_concat_all([
+            b"this module binds its own `",
+            name,
+            b"`, which would capture the `Ok` and `Err` a `try` answers with; rename it or qualify it, or write the `handle` out",
+          ]),
+        ],
+      ),
+  }
+}
+
+// The raise a `try` names.
+fn named_raise(checker: Checker, name: RaiseName) -> WithHit / {abort.raise} = {
+  let r: WithHit = resolve_op(checker, name.eff, name.op);
+  match r.hit {
+    None -> r,
+    Some(hit) -> if is_raise(hit.op.mode) { r } else {
+      {
+        checker: report_error_at_and(
+          r.checker,
+          b"E0313",
+          span_to(name.eff.span, name.op.span),
+          bytes_concat_all([
+            b"`",
+            qname_text(name.eff),
+            b".",
+            name.op.name,
+            b"` is not a `raise` operation",
+          ]),
+          b"a `try` answers a raise",
+          hit.op.at,
+          bytes_concat_all([b"declared `", mode_text(hit.op.mode), b"` here"]),
+          [
+            b"a `read` or `write` operation comes back to where it was performed, so there is nothing for a `try` to turn into an `Err`: answer it with a `handle` clause",
+          ],
+        ),
+        hit: None,
+      }
+    },
+  }
+}
+
+// The one raise a body's row names, `abort.raise` aside: what can fail on a value raises that, so a
+// `try` answers it only by name.
+fn one_raise(checker: Checker, span: Span, row: Row) -> WithHit / {abort.raise} = {
+  let raises = filter(row.atoms, |a: Atom| is_raise(a.mode) && a != abort_atom());
+  let found = |a: Atom|
+    match effect_of(checker, a.effect) {
+      None -> None,
+      Some(info) -> match a.op {
+        None -> None,
+        Some(op) -> match op_named(info, op) {
+          Some(o) -> Some({ info: info, op: o }),
+          None -> None,
+        },
+      },
+    };
+  match raises {
+    [one] -> { checker: checker, hit: found(one) },
+    [] -> {
+      let aborts = contains(row.atoms, abort_atom());
+      let notes = concat(
+        if aborts {
+          [
+            b"what can fail on a value raises `abort.raise`, so a `try` answers it only by name: `try[abort.raise] { .. }`",
+          ]
+        } else { [] },
+        match row.tail {
+          Some(_) ->
+            [
+              b"what a row variable carries is named by the caller, not here, so it passes through: name the operation, `try[effect.op] { .. }`",
+            ],
+          None -> [],
+        },
+      );
+      {
+        checker: report_error_at(
+          checker,
+          b"E0311",
+          span,
+          b"this `try` has no raise to answer",
+          b"its body names no `raise` operation",
+          if len(notes) == 0 { [b"drop the `try`, or raise in its body"] } else { notes },
+        ),
+        hit: None,
+      }
+    },
+    _ -> {
+      let names = map(raises, |a: Atom| backticked_text(atom_written(checker, a)));
+      let d = error_with_labels(
+        b"E0312",
+        bytes_concat_all([
+          b"this `try` could answer ",
+          bytes::join(take(names, len(names) - 1), b", "),
+          b" or ",
+          at(names, len(names) - 1),
+        ]),
+        [
+          label_at(
+            checker.module,
+            span,
+            true,
+            bytes_concat_all([
+              b"its body names ",
+              ascii_of_int(len(raises)),
+              b" `raise` operations",
+            ]),
+          ),
+        ],
+        [b"name the one to answer, `try[effect.op] { .. }`; the others pass through"],
+      );
+      let fixed = fold(raises, d, |acc: Diag, a: Atom|
+        match written_as(checker, a.effect) {
+          None -> acc,
+          Some(_) -> {
+            let written = atom_written(checker, a);
+            with_fix(acc, bytes_concat(b"answer ", backticked_text(written)), [
+              insertion(checker.module, span.start + 3, bytes_concat_all([b"[", written, b"]"])),
+            ])
+          },
+        });
+      { checker: report(checker, fixed), hit: None }
+    },
+  }
+}
+
+fn carried_type(params: List<Type>) -> Type / {abort.raise} =
+  match params {
+    [] -> unit_type(),
+    [one] -> one,
+    _ ->
+      TyRecord(
+        fields_sorted(
+          map(range(0, len(params)), |i: Int|
+            { name: bytes_concat(b"_", ascii_of_int(i)), ty: at(params, i) }),
+        ),
+      ),
+  }
+
+// `try { body }` is the `handle` whose clause for one raise answers `Err` of what it carried and
+// whose `return` answers `Ok`: the body's row loses that raise and keeps the rest.
+fn infer_try_block(
+  checker: Checker,
+  span: Span,
+  raise: Option<RaiseName>,
+  body: Expr,
+) -> Inferred / {abort.raise} = {
+  let mark = len(checker.performs);
+  let b: Inferred = infer(checker, body);
+  let body_mark = len(b.checker.performs);
+  let body_row = resolve_row_in(b.checker, b.row);
+  let free: Checker = try_captured(b.checker, span);
+  let chosen: WithHit = match raise {
+    Some(name) -> named_raise(free, name),
+    None -> one_raise(free, span, body_row),
+  };
+  match chosen.hit {
+    // A `try` that could not say which raise it answers takes each it might have, so the refusal
+    // is the one report.
+    None -> {
+      let o: WithTy = new_ty(chosen.checker);
+      let might = match raise {
+        Some(_) -> [],
+        None -> filter(body_row.atoms, |a: Atom| is_raise(a.mode) && a != abort_atom()),
+      };
+      {
+        checker: discharge(o.checker, mark, body_mark, might),
+        ty: TyCon({ name: b"Result", args: [b.ty, o.ty] }),
+        row: { atoms: atoms_difference(body_row.atoms, might), tail: body_row.tail },
+      }
+    },
+    Some(hit) -> {
+      let atom = {
+        effect: hit.info.name,
+        resource: RSingleton,
+        mode: hit.op.mode,
+        op: Some(hit.op.name),
+      };
+      let c: Checker = chosen.checker;
+      let filed: Checker = {
+        ..c,
+        try_sites: push(c.try_sites, {
+          module: c.module,
+          span: span,
+          effect: hit.info.name,
+          op: hit.op.name,
+          arity: len(hit.op.params),
+          owner: c.walking,
+        }),
+      };
+      {
+        checker: discharge(filed, mark, body_mark, [atom]),
+        ty: TyCon({ name: b"Result", args: [b.ty, carried_type(hit.op.params)] }),
+        row: { atoms: filter(body_row.atoms, |a: Atom| a != atom), tail: body_row.tail },
+      }
+    },
+  }
 }
 
 fn reach_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise} = {
@@ -6755,6 +6999,7 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
       collect_refs(c.body, push(bound, c.binder.name), collect_refs(c.init, bound, out)),
     ESimulate(s) -> collect_refs(s.body, bound, out),
     EParallel(v) -> fold(v.branches, out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
+    ETryBlock(t) -> collect_refs(t.body, bound, out),
   }
 
 // Tarjan's components in completion order, so the checker solves a callee before its callers.
@@ -11107,6 +11352,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     concats: [],
     updates: [],
     update_shapes: [],
+    try_sites: [],
     simulate_depth: 0,
     sim_scope: 0,
     crossings: [],
@@ -11198,7 +11444,7 @@ pub fn check_front_with(
 
 // The one purity the root keys, the emitter's constant table and the seam's memo all read.
 pub fn published_pure(def_info: DefInfo) -> Bool =
-  len(without_abort(def_info.footprint)) == 0 && len(def_info.constraints) == 0
+  len(without_raises(def_info.footprint)) == 0 && len(def_info.constraints) == 0
 
 // What the emitter needs from the checker: the definitions published pure, for its constant table,
 // the labels every call fills, the shape of every record update, and every operator's operand type.
@@ -11209,17 +11455,20 @@ pub type EmitFacts = {
   operands: List<OperandSite>,
 }
 
-// What lowering reads that only the checker knows: the shape of every record update, and where a
-// `numeric` or `integer` parameter's witness is read and what each call passes for it.
+// What lowering reads that only the checker knows: the shape of every record update, the raise
+// every `try` answers, and where a `numeric` or `integer` parameter's witness is read and what each
+// call passes for it.
 pub type Elaboration = {
   updates: List<UpdateShape>,
   ops: List<WitnessOp>,
   refs: List<WitnessRef>,
   orders: List<WitnessOrder>,
+  tries: List<TrySite>,
 }
 
 fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
   {
+    tries: checker.try_sites,
     updates: checker.update_shapes,
     ops: fold(checker.operands, [], |acc: List<WitnessOp>, o: OperandAt|
       match resolve(checker, o.ty) {
@@ -11236,6 +11485,7 @@ fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
 // The facts cross from the program that checked to the one that lowers as bytes: a constructor's
 // name is each program's own, its index in its type is not.
 derive bin for UpdateShape
+derive bin for TrySite
 derive bin for LabelSite
 derive bin for OperandSite
 derive bin for WitnessOp
@@ -11251,12 +11501,13 @@ pub type RootFacts = {
   ops: List<WitnessOp>,
   refs: List<WitnessRef>,
   operands: List<OperandSite>,
+  tries: List<TrySite>,
 }
 
 derive bin for RootFacts
 
 pub fn no_root_facts() -> RootFacts =
-  { label_sites: [], updates: [], ops: [], refs: [], operands: [] }
+  { label_sites: [], updates: [], ops: [], refs: [], operands: [], tries: [] }
 
 fn owned(m: Map<Bytes, RootFacts>, owner: Bytes) -> RootFacts =
   match map_get(m, owner) { Some(f) -> f, None -> no_root_facts() }
@@ -11288,7 +11539,11 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
       map_insert(m, x.owner, { ..f, refs: push(f.refs, x) })
     },
   );
-  fold(facts.operands, referenced, |m: Map<Bytes, RootFacts>, x: OperandSite| {
+  let tried = fold(facts.elaboration.tries, referenced, |m: Map<Bytes, RootFacts>, x: TrySite| {
+    let f = owned(m, x.owner);
+    map_insert(m, x.owner, { ..f, tries: push(f.tries, x) })
+  });
+  fold(facts.operands, tried, |m: Map<Bytes, RootFacts>, x: OperandSite| {
     let f = owned(m, x.owner);
     map_insert(m, x.owner, { ..f, operands: push(f.operands, x) })
   })
@@ -11309,6 +11564,8 @@ fn placed_facts(facts: RootFacts, module: Int, by: Int, owner: Bytes) -> RootFac
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     operands: map(facts.operands, |x: OperandSite|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
+    tries: map(facts.tries, |x: TrySite|
+      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
   }
 
 fn within(span: Span, at: Span) -> Bool = span.start >= at.start && span.end <= at.end
@@ -11319,6 +11576,7 @@ fn all_within(facts: RootFacts, at: Span) -> Bool =
     && fold(facts.ops, true, |b: Bool, x: WitnessOp| b && within(x.span, at))
     && fold(facts.refs, true, |b: Bool, x: WitnessRef| b && within(x.span, at))
     && fold(facts.operands, true, |b: Bool, x: OperandSite| b && within(x.span, at))
+    && fold(facts.tries, true, |b: Bool, x: TrySite| b && within(x.span, at))
 
 // One body's sites as its row files them, behind a byte that says how. Each span is counted from
 // where the body's definition starts, so they hold wherever the definition moves to. A site
@@ -11415,9 +11673,15 @@ fn shapes_in(all: List<UpdateShape>, module: Int) -> Map<Bytes, List<Bytes>> =
   fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, s: UpdateShape|
     if s.module != module { acc } else { map_insert(acc, span_key(s.span), s.names) })
 
-// The modules with every record update written out as the literal it stands for, and every
-// `numeric` or `integer` parameter's witness passed and read: what the emitter lowers, and what
-// only the checker knows.
+// One module's `try` blocks, keyed by span, as `expand_try_blocks` reads them.
+fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
+  fold(all, map_new(), |acc: Map<Bytes, Answered>, s: TrySite|
+    if s.module != module { acc }
+    else { map_insert(acc, span_key(s.span), { effect: s.effect, op: s.op, arity: s.arity }) })
+
+// The modules with every record update written out as the literal it stands for, every `try` as
+// its `handle`, and every `numeric` or `integer` parameter's witness passed and read: what the
+// emitter lowers, and what only the checker knows.
 pub fn expanded_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
@@ -11427,7 +11691,10 @@ pub fn expanded_mods(
     {
       name: m.name,
       module: expand_witnesses(
-        expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
+        expand_try_blocks(
+          expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
+          answered_in(elaboration.tries, i),
+        ),
         ops_in(elaboration.ops, i),
         refs_in(elaboration.refs, i),
         orders_in(elaboration.orders, i),
@@ -11446,7 +11713,10 @@ pub fn updated_mods(
     let m: ParsedModule = at(mods, i);
     {
       name: m.name,
-      module: expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
+      module: expand_try_blocks(
+        expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
+        answered_in(elaboration.tries, i),
+      ),
       derived: m.derived,
     }
   })
@@ -11597,7 +11867,7 @@ fn dump_op(op_info: OpInfo) -> Bytes / {abort.raise} =
   bytes_concat_all([
     op_info.name,
     b":",
-    match op_info.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" },
+    mode_text(op_info.mode),
     b":",
     dump_flag(op_info.resource_param),
     b":",
@@ -13046,6 +13316,98 @@ test "a clause for `abort.raise` answers for the whole `handle`, and binds no `r
     ),
     [b"E0201"],
   )
+}
+
+fn raising(rest: Bytes) -> List<Bytes> / {abort.raise} =
+  check_codes(
+    bytes_concat(
+      b"effect p { raise bad(n: Int) raise eof() read get() -> Int }\nfn digit(b: Int) -> Int / {p.bad} = if b < 48 { p.bad(b) } else { b - 48 }\nfn end() -> Int / {p.eof} = p.eof()\n",
+      rest,
+    ),
+  )
+
+test "a `raise` operation is in the row, and its clause answers for the whole `handle`" {
+  assert_eq(raising(b"fn f(b: Int) -> Int / {} = digit(b)"), [b"E0302"]);
+  assert_eq(raising(b"fn f(b: Int) -> Int / {p.read} = digit(b)"), [b"E0302"]);
+  assert_eq(
+    raising(
+      b"fn f(b: Int) -> Result<Int, Int> / {} = handle { digit(b) } with { p.bad(n) -> Err(n), return v -> Ok(v) }",
+    ),
+    [],
+  );
+  assert_eq(
+    raising(b"fn f(b: Int) -> Int / {} = handle { digit(b) } with { p.bad(n) -> \"x\" }"),
+    [b"E0201"],
+  );
+  assert_eq(
+    raising(b"fn f(b: Int) -> Int / {} = handle { digit(b) } with { p.bad(n) resume k -> 0 }"),
+    [b"E0201"],
+  );
+  assert_eq(raising(b"fn f() -> String / {p.eof} = p.eof()"), [])
+}
+
+test "a clause for one raise leaves the effect's other operations to the row" {
+  assert_eq(
+    raising(b"fn f(b: Int) -> Int / {p.eof} = handle { digit(b) + end() } with { p.bad(n) -> n }"),
+    [],
+  );
+  assert_eq(
+    raising(b"fn f(b: Int) -> Int / {p.bad} = handle { digit(b) + p.get() } with { p.get() -> 1 }"),
+    [],
+  );
+  assert_eq(
+    raising(b"fn f(b: Int) -> Int / {} = handle { digit(b) + end() } with { p.bad(n) -> n }"),
+    [b"E0302"],
+  )
+}
+
+test "a `try` answers the one raise its body's row names, as an `Err` of what it carried" {
+  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {} = try { digit(b) }"), []);
+  assert_eq(raising(b"fn f() -> Result<Int, Unit> / {} = try { end() }"), []);
+  assert_eq(raising(b"fn f(b: Int) -> Result<Int, String> / {} = try { digit(b) }"), [b"E0201"]);
+  assert_eq(raising(b"fn f() -> Result<Int, Int> / {} = try { 1 }"), [b"E0311"]);
+  assert_eq(
+    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {abort.raise} = try { 1 / len(xs) }"),
+    [b"E0311"],
+  );
+  assert_eq(
+    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {} = try[abort.raise] { 1 / len(xs) }"),
+    [],
+  );
+  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {abort.raise} = try { digit(b) / b }"), [])
+}
+
+test "a `try` over several raises names the one it answers, and the others stay in the row" {
+  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {} = try { digit(b) + end() }"), [
+    b"E0312",
+  ]);
+  assert_eq(
+    raising(b"fn f(b: Int) -> Result<Int, Int> / {p.eof} = try[p.bad] { digit(b) + end() }"),
+    [],
+  );
+  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {} = try[p.bad] { digit(b) + end() }"), [
+    b"E0302",
+  ]);
+  assert_eq(raising(b"fn f() -> Result<Int, Int> / {p.get} = try[p.get] { p.get() }"), [b"E0313"]);
+  assert_eq(raising(b"fn f() -> Result<Int, Int> / {} = try[p.nope] { 1 }"), [b"E0104"])
+}
+
+test "a `try` is refused where its `Ok` and `Err` would be a module's own" {
+  assert_eq(
+    raising(
+      b"type Mine = | Err(Int) | Fine\nfn f(b: Int) -> Int / {} = match try { digit(b) } { _ -> 1 }",
+    ),
+    [b"E0118"],
+  )
+}
+
+test "the lowering reads which raise a `try` answers, by its effect's program-wide name" {
+  let out = checked_cx(
+    b"effect p { raise bad(n: Int, why: String) }\nfn f(n: Int) -> Result<Int, (Int, String)> / {} = try { p.bad(n, \"no\") }",
+  );
+  assert_eq(map(out.try_sites, |s: TrySite| (s.effect, s.op, s.arity, s.owner)), [
+    (b"m.p", b"bad", 2, b"m.f"),
+  ])
 }
 
 test "a raise is in the row, and a clause for it discharges it" {

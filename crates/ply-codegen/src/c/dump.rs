@@ -383,7 +383,10 @@ impl Reader<'_> {
             mode: match mode.utf8()? {
                 "read" => Mode::Read,
                 "write" => Mode::Write,
-                other => return Err(mode.error(format!("`{other}` is not `read` or `write`"))),
+                "raise" => Mode::Raise,
+                other => {
+                    return Err(mode.error(format!("`{other}` is not `read`, `write` or `raise`")));
+                }
             },
             resource_param: o.field("resource_param")?.bool()?,
             span: self.span(o.field("at")?)?,
@@ -451,6 +454,7 @@ fn atom(a: AnswerValue<'_>, labels: &mut Vec<i64>) -> Result<EffectAtom, Error> 
     let mode = match mode.name() {
         "MRead" => Mode::Read,
         "MWrite" => Mode::Write,
+        "MRaise" => Mode::Raise,
         _ => return Err(mode.unknown()),
     };
     Ok(EffectAtom::new(effect, resource, mode))
