@@ -305,10 +305,6 @@ fn the_builder_these_sources_make_builds_the_program_and_it_runs() {
     .expect("the project is written");
     let program = ply_launcher::Program {
         runnable,
-        shipped_modules: ply_machine::shipped_modules::sources()
-            .into_iter()
-            .map(|(name, text)| (name, text.to_string()))
-            .collect(),
         stage: ply_launcher::shipped::own_stage_name(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };

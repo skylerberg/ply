@@ -57,6 +57,10 @@ Rust, so after editing Ply sources `cargo pack` is the rebuild.
   builtins: the compiler embeds its text and parses it itself. The runtime reads the front end's
   answer the committed builder wrote, so a field it comes to require of one lands after main's
   builder writes it.
+- A file below `crates/ply-std/ply` that is not a `.ply` is data a shipped module embeds by its
+  path from the module (`embed("oid/names.txt")` in `oid.ply`). It ships in every binary and a
+  load reads it whenever it pulls the module, so a test's fixtures stay in
+  `crates/ply-corpus/stdlib`.
 - `crates/ply-cli` is the CLI as a Ply program plus the runnable `ply bootstrap` makes of it
   (`bootstrap/ply.run`); it is not a cargo crate. The `refresh` job rebuilds both runnables on
   main by driving the released binary, so the checkout can rebuild itself without cargo.
