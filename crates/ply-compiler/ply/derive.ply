@@ -1,8 +1,9 @@
-// `derive D for T` becomes an ordinary definition: generated as source, parsed back, and retargeted.
+//! `derive D for T` becomes an ordinary definition: generated as source, parsed back, and retargeted.
 
 import parsing (Span, Ident, QName, span_to, is_bare, qname_text)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span, mode_text)
+                    MWrite, MBad, ty_span, mode_text, angled, generics_text, is_generic,
+                    ident_names)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -29,7 +30,7 @@ pub type DeriveRefusal =
   | HoldsSecret
 pub type ConstructorShape = | Leaf | Structural | Refused(DeriveRefusal) | Nominal
 
-// The one table the deriver and the checker's `derivable` both read, so the two cannot disagree.
+/// The one table the deriver and the checker's `derivable` both read, so the two cannot disagree.
 pub fn constructor_shape(deriver: Deriver, name: Bytes) -> ConstructorShape =
   if name == b"Int" || name == b"Bool" || name == b"String" || name == b"Bytes" || name == b"Unit"
       || name == b"Decimal"
@@ -47,7 +48,7 @@ pub fn constructor_shape(deriver: Deriver, name: Bytes) -> ConstructorShape =
   else if name == b"Secret" { match deriver { DEq -> Leaf, _ -> Refused(HoldsSecret) } }
   else { Nominal }
 
-// Whether a type constructor's JSON encoding can be the document `null`.
+/// Whether a type constructor's JSON encoding can be the document `null`.
 pub fn null_encoded_name(name: Bytes) -> Bool = name == b"Unit" || name == b"Option"
 
 fn is_fixed_width(name: Bytes) -> Bool =
@@ -60,7 +61,7 @@ fn is_fixed_width(name: Bytes) -> Bool =
 
 pub fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_tag(a) == deriver_tag(b)
 
-// The module whose definitions a generated body calls, if any.
+/// The module whose definitions a generated body calls, if any.
 fn runtime_module(deriver: Deriver) -> Option<Bytes> =
   match deriver {
     DJson -> Some(b"std.json"),
@@ -81,7 +82,7 @@ fn is_upper_byte(c: Int) -> Bool = c >= 65 && c <= 90
 fn is_lower_byte(c: Int) -> Bool = c >= 97 && c <= 122
 fn lower_byte(c: Int) -> Int = if is_upper_byte(c) { c + 32 } else { c }
 
-// `_` before an uppercase after a lowercase or digit, and before the last of an uppercase run a lowercase follows.
+/// `_` before an uppercase after a lowercase or digit, and before the last of an uppercase run a lowercase follows.
 pub fn snake_case(name: Bytes) -> Bytes / {abort.raise} = {
   let n = bytes_len(name);
   fold(range(0, n), b"", |out: Bytes, i: Int| {
@@ -100,7 +101,7 @@ pub fn generated_name(deriver: Deriver, type_name: Bytes) -> Bytes / {abort.rais
 
 // --- The syntactic half of `derivable(D, t)` ---------------------------------------------------
 
-// `reason` completes the label at `span`; `note` is the advice only a `Secret` refusal carries.
+/// `reason` completes the label at `span`; `note` is the advice only a `Secret` refusal carries.
 type Blocker = { span: Span, reason: Bytes, note: Option<Bytes>, variant: Option<Bytes> }
 
 fn check_decl(deriver: Deriver, def: TypeDef) -> Option<Blocker> / {abort.raise} =
@@ -123,9 +124,9 @@ fn check_decl(deriver: Deriver, def: TypeDef) -> Option<Blocker> / {abort.raise}
         }),
   }
 
-// Whether the module states what `deriver` reads of `target`: its `key` for `eq`, `ord` and `hash`,
-// its `show` for `show`. The fields are then not what is derived from, and the checker judges what
-// the stated function answers.
+/// Whether the module states what `deriver` reads of `target`: its `key` for `eq`, `ord` and `hash`,
+/// its `show` for `show`. The fields are then not what is derived from, and the checker judges what
+/// the stated function answers.
 fn has_instance(module: Module, deriver: Deriver, target: Bytes) -> Bool =
   fold(module.items, false, |found: Bool, item: Item|
     found
@@ -140,6 +141,9 @@ fn has_instance(module: Module, deriver: Deriver, target: Bytes) -> Bool =
             }),
         _ -> false,
       }))
+
+// No generated call fills a label, and only a type that holds a function has a use for one.
+fn label_refusal() -> Bytes = b"a type that takes a label has no derivation"
 
 fn function_refusal(deriver: Deriver) -> Bytes =
   match deriver {
@@ -223,7 +227,7 @@ fn first_blocked_type_expr(
 fn null_encoded_type_expr(ty: TypeExpr) -> Bool =
   match ty { TUnit(_) -> true, TCon(c) -> null_encoded_name(c.name.name.name), _ -> false }
 
-// A type parameter is derivable by assumption; a record field is blamed as a whole.
+/// A type parameter is derivable by assumption; a record field is blamed as a whole.
 fn check_type_expr(deriver: Deriver, ty: TypeExpr) -> Option<Blocker> / {abort.raise} =
   match ty {
     TVar(_) -> None,
@@ -245,7 +249,9 @@ fn check_type_expr(deriver: Deriver, ty: TypeExpr) -> Option<Blocker> / {abort.r
             None -> None,
           },
         }),
-    TCon(c) -> {
+    TCon(c) -> if len(c.labels) > 0 {
+      Some({ span: c.span, reason: label_refusal(), note: None, variant: None })
+    } else {
       let simple = c.name.name.name;
       match constructor_shape(deriver, simple) {
         Refused(why) ->
@@ -288,8 +294,8 @@ fn check_type_expr(deriver: Deriver, ty: TypeExpr) -> Option<Blocker> / {abort.r
 
 type Alias = { name: Bytes, body: TypeExpr }
 
-// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the
-// module's; `cycle` holds the types whose codecs call the target's and are called back by it.
+/// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the
+/// module's; `cycle` holds the types whose codecs call the target's and are called back by it.
 type DeriveEmitter = {
   d: Deriver,
   rt: Bytes,
@@ -319,22 +325,15 @@ fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
     match acc { Some(_) -> acc, None -> if alias.name == name { Some(alias.body) } else { None } })
 
 pub fn target_type(def: TypeDef) -> Bytes / {abort.raise} =
-  if len(def.params) == 0 { def.name.name } else {
-    bytes_concat_all([
-      def.name.name,
-      b"<",
-      join(map(def.params, |ident: Ident| ident.name), b", "),
-      b">",
-    ])
-  }
+  bytes_concat(def.name.name, generics_text(def.generics))
 
-// A codec on a cycle is two definitions: the named one starts `_at` at the runtime's `max_depth`, and
-// `_at` hands its cycle one less, so its recursion is seen to end.
+/// A codec on a cycle is two definitions: the named one starts `_at` at the runtime's `max_depth`, and
+/// `_at` hands its cycle one less, so its recursion is seen to end.
 fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> Bytes / {abort.raise} = {
   let name = generated_name(emitter.d, def.name.name);
   let target = target_type(def);
-  let ps = map(def.params, |p: Ident| p.name);
-  let generics = if len(ps) == 0 { b"" } else { bytes_concat_all([b"<", join(ps, b", "), b">"]) };
+  let ps = map(def.generics.types, |p: Ident| p.name);
+  let generics = generics_text(def.generics);
   let dicts = map(ps, |p: Bytes| bytes_concat_all([p, b": ", dict_type(emitter, p)]));
   let constraints = if len(ps) == 0 { b"" } else {
     bytes_concat(b" where ", join(map(ps, |p: Bytes| constraint_written(emitter.d, p)), b", "))
@@ -375,7 +374,7 @@ fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> Bytes / {abort.raise} = {
   }
 }
 
-// `JsonCodec<a>` and `BinCodec<a>` ship with their runtime modules; `EqDict` and `OrdDict` are structural.
+/// `JsonCodec<a>` and `BinCodec<a>` ship with their runtime modules; `EqDict` and `OrdDict` are structural.
 fn dict_type(emitter: DeriveEmitter, arg: Bytes) -> Bytes =
   match emitter.d {
     DJson -> bytes_concat_all([emitter.rt, b"JsonCodec<", arg, b">"]),
@@ -447,7 +446,7 @@ fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes / {a
     _ -> b"()",
   }
 
-// An expression of the codec type of `te`: `JsonCodec<te>` or `BinCodec<te>`.
+/// An expression of the codec type of `te`: `JsonCodec<te>` or `BinCodec<te>`.
 fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {abort.raise} =
   match te {
     TVar(p) -> p.name,
@@ -495,7 +494,7 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
     },
   }
 
-// Whether a written type *is* `String`, following the module's own parameterless aliases.
+/// Whether a written type *is* `String`, following the module's own parameterless aliases.
 fn is_string(emitter: DeriveEmitter, ty: TypeExpr) -> Bool / {abort.raise} =
   iterate({ cur: ty, n: 0 }, 66, |s: { cur: TypeExpr, n: Int }|
     if s.n >= 64 { Stop(false) } else {
@@ -582,7 +581,7 @@ fn json_record(
   ])
 }
 
-// A variant is encoded by its declared name and its fields in order.
+/// A variant is encoded by its declared name and its fields in order.
 fn json_sum(
   emitter: DeriveEmitter,
   variants: List<VariantDef>,
@@ -707,7 +706,7 @@ fn json_sum(
   bytes_concat_all([b"{encode: ", encode, b", decode: ", decode, b"}"])
 }
 
-// A scalar is written and read by `std.bin`'s own functions rather than through a codec.
+/// A scalar is written and read by `std.bin`'s own functions rather than through a codec.
 fn bin_scalar(ty: TypeExpr) -> Option<Bytes> / {abort.raise} =
   match ty {
     TUnit(_) -> Some(b"unit"),
@@ -740,7 +739,7 @@ fn bin_take(emitter: DeriveEmitter, ty: TypeExpr, from: Bytes) -> Bytes / {abort
       ]),
   }
 
-// Each of `tys` read where the last ended, the first at `start`, then `built` over their values.
+/// Each of `tys` read where the last ended, the first at `start`, then `built` over their values.
 fn bin_takes(
   emitter: DeriveEmitter,
   tys: List<TypeExpr>,
@@ -835,7 +834,7 @@ fn bin_record(
   ])
 }
 
-// A variant is its index among the declared constructors, then its fields in order.
+/// A variant is its index among the declared constructors, then its fields in order.
 fn bin_sum(
   emitter: DeriveEmitter,
   def: TypeDef,
@@ -883,7 +882,10 @@ fn bin_sum(
       shapes_of(emitter, v.fields),
       b"]}",
     ]));
-  let params = join(map(def.params, |ident: Ident| bytes_concat(ident.name, b".shape")), b", ");
+  let params = join(
+    map(def.generics.types, |ident: Ident| bytes_concat(ident.name, b".shape")),
+    b", ",
+  );
   bytes_concat_all([
     b"{put: |",
     emitter.b,
@@ -939,15 +941,17 @@ fn bin_sum(
   ])
 }
 
-// A type back as source, for the annotations a generated lambda needs.
+/// A type back as source, for the annotations a generated lambda needs.
 pub fn render_type(ty: TypeExpr) -> Bytes / {abort.raise} =
   match ty {
     TVar(i) -> i.name,
     TUnit(_) -> b"()",
     TBad(_) -> b"()",
-    TCon(c) -> if len(c.args) == 0 { qname_text(c.name) } else {
-      bytes_concat_all([qname_text(c.name), b"<", join(map(c.args, render_type), b", "), b">"])
-    },
+    TCon(c) ->
+      bytes_concat(
+        qname_text(c.name),
+        angled(map(c.args, render_type), ident_names(c.labels), map(c.rows, render_row)),
+      ),
     TRecord(r) ->
       bytes_concat_all([
         b"{",
@@ -1024,10 +1028,11 @@ fn retarget_fn(def: FnDef, span: Span) -> FnDef =
     transparent: def.transparent,
     decreases: match def.decreases { Some(e) -> Some(retarget_expr(e, span)), None -> None },
     body: retarget_expr(def.body, span),
+    doc: def.doc,
     span: span,
   }
 
-// A parameter's default is deliberately not retargeted.
+/// A parameter's default is deliberately not retargeted.
 fn retarget_param(param: Param, span: Span) -> Param =
   {
     name: ident_at(param.name, span),
@@ -1045,6 +1050,8 @@ fn retarget_ty(t: TypeExpr, span: Span) -> TypeExpr =
         span: span,
         name: qname_at(c.name, span),
         args: map(c.args, |a: TypeExpr| retarget_ty(a, span)),
+        labels: map(c.labels, |l: Ident| ident_at(l, span)),
+        rows: map(c.rows, |r: RowExpr| retarget_row(r, span)),
       }),
     TFn(f) ->
       TFn({
@@ -1291,7 +1298,7 @@ fn find_import(imports: List<ImportDecl>, wanted: Bytes) -> Option<ImportDecl> /
   fold(imports, None, |acc: Option<ImportDecl>, decl: ImportDecl|
     match acc { Some(_) -> acc, None -> if dotted(decl) == wanted { Some(decl) } else { None } })
 
-// The hidden import an interpolating module gets has no binder generated source can spell.
+/// The hidden import an interpolating module gets has no binder generated source can spell.
 fn import_binder(decl: ImportDecl) -> Option<Bytes> / {abort.raise} =
   match decl.kind {
     IModule -> if len(decl.path) == 0 { None }
@@ -1305,7 +1312,7 @@ fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
     && fold(range(0, bytes_len(a)), true, |acc: Bool, i: Int|
       acc && lower_byte(bytes_at(a, i)) == lower_byte(bytes_at(b, i)))
 
-// Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
+/// Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
 fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
   let walked = fold(
     module.items,
@@ -1318,7 +1325,7 @@ fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
             None -> push(acc.types, d),
           };
           let aliases = match d.body {
-            TDAlias(body) -> if len(d.params) == 0
+            TDAlias(body) -> if !is_generic(d.generics)
                 && (match find_alias(acc.aliases, d.name.name) { Some(_) -> false, None -> true }) {
               push(acc.aliases, { name: d.name.name, body: body })
             } else { acc.aliases },
@@ -1344,7 +1351,50 @@ fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
 
 fn run_expander(expander: Expander) -> Expander / {abort.raise} =
   fold(expander.module.items, expander, |acc: Expander, item: Item|
-    match item { IDerive(def) -> one(acc, def), _ -> acc })
+    match item { IDerive(def) -> unlabelled(acc, def), _ -> acc })
+
+// A target that binds a label is refused before its fields are read.
+fn unlabelled(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
+  match find_type(expander.types, def.target.name) {
+    None -> one(expander, def),
+    Some(target) -> match list_at(target.generics.labels, 0) {
+      None -> one(expander, def),
+      Some(label) ->
+        report(
+          expander,
+          error_at_and(
+            b"E0206",
+            expander.m,
+            label.span,
+            bytes_concat_all([
+              b"`",
+              deriver_text(def.deriver),
+              b"` cannot be derived for `",
+              def.target.name,
+              b"`",
+            ]),
+            label_refusal(),
+            expander.m,
+            def.span,
+            b"required by this derivation",
+            [
+              bytes_concat_all([
+                b"a label is what a function's row performs under, and a type that holds a function has no derivation, so `[",
+                label.name,
+                b"]` is used by no field a derivation could read",
+              ]),
+              bytes_concat_all([
+                b"drop `[",
+                label.name,
+                b"]` from `",
+                def.target.name,
+                b"`, or write the dictionary by hand",
+              ]),
+            ],
+          ),
+        ),
+    },
+  }
 
 fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
   match find_type(expander.types, def.target.name) {
@@ -1364,7 +1414,7 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
               Some(prefix) -> {
                 let cycle = cycle_of(codec_calls(ex1, def.deriver), def.target.name);
                 let source = emit_item(
-                  emitter(def.deriver, prefix, target.params, ex1.aliases, ex1.path, cycle),
+                  emitter(def.deriver, prefix, target.generics.types, ex1.aliases, ex1.path, cycle),
                   target,
                 );
                 match parse_generated(source, def.span, if len(cycle) == 0 { 1 } else { 2 }) {
@@ -1388,7 +1438,7 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
     },
   }
 
-// Parsing what was just printed is the deriver's own round-trip check.
+/// Parsing what was just printed is the deriver's own round-trip check.
 fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>> / {abort.raise} = {
   let r = parse(source);
   let x = expand(r.node, r.parser.diags);
@@ -1400,7 +1450,7 @@ fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>>
 
 // --- Codecs on a cycle ---------------------------------------------------------------------------
 
-// A type this module derives with a codec deriver, and the derived types its codec calls by name.
+/// A type this module derives with a codec deriver, and the derived types its codec calls by name.
 type Calls = { name: Bytes, calls: List<Bytes> }
 
 fn codec_calls(expander: Expander, deriver: Deriver) -> List<Calls> =
@@ -1432,7 +1482,7 @@ fn named_in_def(deriver: Deriver, type_def: TypeDef) -> List<Bytes> =
           concat(inner, named_in(deriver, ty)))),
   }
 
-// The types `codec` composes through by a name of this module's.
+/// The types `codec` composes through by a name of this module's.
 fn named_in(deriver: Deriver, te: TypeExpr) -> List<Bytes> =
   match te {
     TCon(c) -> {
@@ -1453,18 +1503,18 @@ fn callees(calls: List<Calls>, name: Bytes) -> List<Bytes> =
   fold(calls, [], |acc: List<Bytes>, c: Calls|
     if c.name == name { concat(acc, c.calls) } else { acc })
 
-// Every type a chain of one or more calls leads to from `from`: no chain is longer than the types.
+/// Every type a chain of one or more calls leads to from `from`: no chain is longer than the types.
 fn reached(calls: List<Calls>, from: Bytes) -> List<Bytes> =
   fold(range(0, len(calls)), callees(calls, from), |seen: List<Bytes>, _: Int|
     fold(seen, seen, |acc: List<Bytes>, n: Bytes|
       fold(callees(calls, n), acc, |more: List<Bytes>, m: Bytes|
         if contains(more, m) { more } else { push(more, m) })))
 
-// Empty unless `target`'s codec calls itself, through any of the others.
+/// Empty unless `target`'s codec calls itself, through any of the others.
 fn cycle_of(calls: List<Calls>, target: Bytes) -> List<Bytes> =
   filter(reached(calls, target), |n: Bytes| contains(reached(calls, n), target))
 
-// How this module writes a name that lives in the deriver's runtime module.
+/// How this module writes a name that lives in the deriver's runtime module.
 fn runtime_prefix(expander: Expander, def: DeriveDef) -> WithPrefix / {abort.raise} =
   match runtime_module(def.deriver) {
     None -> { ex: expander, prefix: Some(b"") },
@@ -1531,7 +1581,7 @@ fn runtime_prefix(expander: Expander, def: DeriveDef) -> WithPrefix / {abort.rai
     },
   }
 
-// A module binder nothing in this file already binds.
+/// A module binder nothing in this file already binds.
 fn free_binder(expander: Expander, deriver: Deriver) -> Bytes / {abort.raise} = {
   let path = runtime_path(deriver);
   let base = if len(path) == 0 { b"" } else { at(path, len(path) - 1) };
@@ -1669,7 +1719,7 @@ fn internal(expander: Expander, def: DeriveDef, source: Bytes) -> Expander =
     ),
   )
 
-// Appends the generated definitions and any import a runtime module needed; `path` names the module.
+/// Appends the generated definitions and any import a runtime module needed; `path` names the module.
 pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion / {abort.raise} =
   if !fold(module.items, false, |b: Bool, item: Item|
       b || (match item { IDerive(_) -> true, _ -> false })) {
@@ -1680,6 +1730,7 @@ pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion / {abort
       match runtime.added { Some(i) -> push(acc, i), None -> acc });
     {
       module: {
+        doc: module.doc,
         imports: concat(module.imports, added),
         items: fold(ex.generated, module.items, |acc: List<Item>, generated: Generated|
           concat(acc, map(generated.defs, |def: FnDef| IFn(def)))),
@@ -1689,12 +1740,12 @@ pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion / {abort
     }
   }
 
-// The source each of this module's derivations generates, in `derive` order.
+/// The source each of this module's derivations generates, in `derive` order.
 pub fn preview(path: Bytes, module: Module) -> List<Bytes> / {abort.raise} =
   map(run_expander(new_expander(0, path, module)).generated, |generated: Generated|
     generated.source)
 
-// Each module expanded on its own: its generated sources length-prefixed, then its diagnostics.
+/// Each module expanded on its own: its generated sources length-prefixed, then its diagnostics.
 pub fn derive_dump(sources: List<Source>) -> String / {abort.raise} = {
   let out = fold(range(0, len(sources)), b"", |acc: Bytes, i: Int| {
     let s = at(sources, i);
@@ -1814,6 +1865,33 @@ test "every span in a generated definition is the derive item's" {
     },
     _ -> assert(false),
   }
+}
+
+test "a type that takes a row derives over it, and one that takes a label has no derivation" {
+  let out = preview(
+    b"t",
+    parse(
+      b"type Tagged<a | e> = | Tagged(a)\ntype Pair = {left: Tagged<Int | {}>}\nderive eq for Tagged\nderive eq for Pair",
+    ).node,
+  );
+  assert_eq(
+    at(out, 0),
+    b"fn tagged_eq<a | e>(a: {eq: (a, a) -> Bool}) -> {eq: (Tagged<a | e>, Tagged<a | e>) -> Bool} where derivable(eq, a) = {eq: |da: Tagged<a | e>, db: Tagged<a | e>| da == db}",
+  );
+  let refused = |src: Bytes|
+    map(expand_derives(0, b"t", parse(src).node).diags, |diag: Diag| {
+      let primary = at(diag.labels, 0);
+      [diag.code, bytes_slice(src, primary.start, primary.end)]
+    });
+  assert_eq(refused(b"type Tagged<a, [l]> = | Tagged(a)\nderive eq for Tagged"), [
+    [b"E0206", b"l"],
+  ]);
+  assert_eq(
+    refused(
+      b"type Tagged<a, [l]> = | Tagged(a)\ntype Pair = {left: Tagged<Int, [conn]>}\nderive eq for Pair",
+    ),
+    [[b"E0206", b"left: Tagged<Int, [conn]>"]],
+  )
 }
 
 test "an orphan, a collision, a missing runtime and a refused field each report as the reference does" {

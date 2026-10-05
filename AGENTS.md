@@ -15,6 +15,10 @@ Rust, so after editing Ply sources `cargo pack` is the rebuild.
 - Comments: default to none. Write one only for a non-obvious why, an invariant the types don't
   enforce, or a trap, and keep it to one line. No history ("used to", "since #123"), no
   references to PRs or documents, no figures.
+- Doc comments (`///` above a declaration, `//!` at the head of a module) are for callers, and
+  the rule above does not bound them: say what the signature cannot (what an answer means, when it
+  raises, units, edge cases), never restate the type or row, and open with a one-sentence summary.
+  No examples: the tests that name a definition are its examples, and `ply doc` lists them.
 - Correct in place. Never write "previously", "corrected" or "a draft of this said".
 - Measurements belong in the PR description of the change they decide, not in the tree.
 - Tests check the program, never a document.
@@ -56,7 +60,8 @@ Rust, so after editing Ply sources `cargo pack` is the rebuild.
 - `crates/ply-cli` is the CLI as a Ply program plus the runnable `ply bootstrap` makes of it
   (`bootstrap/ply.run`); it is not a cargo crate. The `refresh` job rebuilds both runnables on
   main by driving the released binary, so the checkout can rebuild itself without cargo.
-- `docs/GUIDE.md` is the user manual. A change to syntax, types, builtins, the standard library,
-  CLI commands, flags or exit codes, or diagnostic codes updates it in the same PR.
+- `docs/GUIDE.md` is the user manual. A change to syntax, types, CLI commands, flags or exit
+  codes, or diagnostic codes updates it in the same PR. The builtins and the standard library are
+  documented by their doc comments, which a change to them updates.
 
 This file stays short. Don't add a rule in response to one incident; fix the cause instead.

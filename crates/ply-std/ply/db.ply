@@ -1,4 +1,36 @@
-// The database effect.
+//! PostgreSQL: the `db` effect, its driver over `std.pg`, and an in-memory twin.
+//!
+//! The resource label is a table: `db.query[items]` is `db.read[items]`. Transaction control is on the
+//! singleton resource, so transactions conflict. SQL errors are values: a `DbError` names the SQLSTATE,
+//! the constraint a violation names, and the server's message and detail.
+//!
+//! The driver reads a statement before it sends it. A statement that writes, performed as `db.query`,
+//! is refused, because the endpoints that perform it would be scheduled as if they only read; so is
+//! text the reader cannot account for (a second statement after a `;`, `for update`, `on conflict`, a
+//! call it will not vouch for, a function whose value is not a function of the program's state),
+//! because a footprint it guessed at is a scheduler that runs two writers beside each other; and so
+//! is a statement whose tables do not include the label the call site named. Each refusal is raised,
+//! so a program cannot ignore it.
+//!
+//! `with_server(url, size, body)` serves the effect from a connection string: the pool, the transaction
+//! scope and the text of every value are Ply's, and the host is left with `net`. A statement outside a
+//! transaction takes an idle connection, or opens one while fewer than `size` are open, and gives it
+//! back once the server has answered; with none to take it is `53300`. A `begin` takes a connection for
+//! its transaction, a `begin` inside it is a savepoint on that connection, and the `commit` or `abort`
+//! that closes the transaction gives the connection back whatever the server answered. A `commit` the
+//! server turned into a rollback is `25P02`, as it is in the twin. A handler cannot see which task
+//! performs an operation, so `serve` takes an operation to belong to the one open transaction whose
+//! connection is not waiting on the server: a task holding a transaction open must wait on nothing but
+//! its own statements, and an operation performed while two transactions are between statements is
+//! raised.
+//!
+//! A connection that fails is class `08`: `08001` it could not be opened, `08006` it broke, `08P01` a
+//! reply could not be read, `08003` the transaction's connection is gone and the transaction with it,
+//! and `08007` a `commit` whose outcome is unknown. A server that asks for a password when none was
+//! given is `28000`.
+//!
+//! `MemDb` is the in-memory twin: `open` a schema, then `step`, `begin_step`, `commit_step` and
+//! `abort_step` answer what a server would.
 
 import std.bytes (u32_be, u32_be_at, is_digit, cstring, peek)
 import std.json
@@ -10,28 +42,39 @@ import std.list (concat, contains)
 import std.bytes
 import std.option (option_unwrap_or)
 
+/// The database, one table per label.
 pub nondet effect db {
+  /// Runs a statement that only reads, its `$n` placeholders bound to `ps`.
   read query[t](s: Stmt, ps: List<Param>) -> Answer
-  // The statement once for each parameter list, each answer what its own `query` would have had.
+  /// The statement once for each parameter list, each answer what its own `query` would have had.
   read batch[t](s: Stmt, each: List<List<Param>>) -> List<Answer>
+  /// Runs a statement that writes, answering the rows it touched as `Count`.
   write execute[t](s: Stmt, ps: List<Param>) -> Answer
+  /// Runs a statement that writes and answers rows, as one with `returning` does.
   write returning[t](s: Stmt, ps: List<Param>) -> Answer
-  // Transaction control takes no resource, so its atom is the singleton `db.write`.
+  /// Transaction control takes no resource, so its atom is the singleton `db.write`.
   write begin(level: Isolation, access: Access) -> Answer
+  /// Commits the innermost open transaction or savepoint.
   write commit() -> Answer
+  /// Rolls back the innermost open transaction or savepoint.
   write abort() -> Answer
-  // Handled by `transaction`, never by the host: a host binding for it is a defect.
+  /// Handled by `transaction`, never by the host: a host binding for it is a defect.
   write rollback(reason: String) -> Unit
 }
 
+/// A transaction's isolation level, as postgres names them.
 pub type Isolation = | ReadCommitted | RepeatableRead | Serializable
 
+/// Whether a transaction may write.
 pub type Access = | ReadWrite | ReadOnly
 
+/// A statement's text, with `$1`, `$2`.. where its parameters go.
 pub type Stmt = { sql: String }
 
+/// A statement of this text.
 pub fn stmt(sql: String) -> Stmt = { sql: sql }
 
+/// A value bound to a statement's placeholder.
 pub type Param =
   | PNull
   | PInt(Int)
@@ -43,7 +86,7 @@ pub type Param =
   | PJson(json::Json)
   | PArray(List<Param>)
 
-// One value out of one column.
+/// One value out of one column.
 pub type Datum =
   | CNull
   | CInt(Int)
@@ -55,20 +98,25 @@ pub type Datum =
   | CJson(json::Json)
   | CArray(List<Datum>)
 
+/// One row, by column name.
 pub type Row = Map<String, Datum>
 
-// The SQLSTATE the server returned and the object it named.
+/// The SQLSTATE the server returned and the object it named.
 pub type DbError = { code: String, constraint: String, detail: String }
 
+/// Rows for a statement that answers them, a count for one that writes, or the server's error.
 pub type Answer = | Rows(List<Row>) | Count(Int) | Failed(DbError)
 
 // --- Transactions -----------------------------------------------------------
 
+/// Why a transaction rolled back: the reason `db.rollback` gave, and the error that caused it, if one
+/// did.
 pub type Rollback = { reason: String, error: Option<DbError> }
 
-// A `db.rollback` anywhere inside the body, however deep, discards the rest of it, and the
-// transaction is aborted however the body ends short of its commit: a clause unwinding out of it, or
-// a cancel, included.
+/// A `db.rollback` anywhere inside the body, however deep, discards the rest of it, and the
+/// transaction is aborted however the body ends short of its commit: a clause unwinding out of it, or
+/// a cancel, included. A `rollback` performed in the body still reaches the caller's row through `e`,
+/// so a handler around a transaction names it too.
 pub fn transaction<a | e>(
   level: Isolation,
   access: Access,
@@ -98,14 +146,14 @@ fn attempt<a | e>(body: () -> a / e) -> Result<a, Rollback> / e =
     db.rollback(reason) resume k -> Err({ reason: reason, error: None }),
   }
 
-// A transaction that always rolls back, whatever the body did.
+/// A transaction that always rolls back, whatever the body did.
 pub fn sandbox<a | e>(
   body: () -> a / e,
 ) -> a / {abort.raise, db.begin bounded, db.abort bounded | e bounded} =
   bracket(|| assert(opened(db.begin(ReadCommitted, ReadWrite))), |u: Unit| aborted(), |u: Unit|
     body())
 
-// Whatever the server said, the transaction is over: its answer is a warning at most.
+/// Whatever the server said, the transaction is over: its answer is a warning at most.
 fn aborted() -> Unit / {db.abort} = {
   db.abort();
   ()
@@ -113,17 +161,17 @@ fn aborted() -> Unit / {db.abort} = {
 
 fn opened(a: Answer) -> Bool = match a { Failed(_) -> false, _ -> true }
 
-// A serialization failure or a deadlock: the server is asking the program to retry.
+/// A serialization failure or a deadlock: the server is asking the program to retry.
 pub fn is_retryable(e: DbError) -> Bool = e.code == "40001" || e.code == "40P01"
 
 // --- Batching ----------------------------------------------------------------------
 
-// A lookup stepped to the ask it waits on, and what it does with the answer.
+/// A lookup stepped to the ask it waits on, and what it does with the answer.
 type Pending<b> = | Looked(b) | Asking({ s: Stmt, ps: List<Param>, next: (Answer) -> Pending<b> })
 
-// `lookup` over each of `xs`, answering what `map` would. Each lookup runs until it asks the store,
-// and the asks of one round that share a statement are one `db.batch`. A lookup only reads, so its
-// asks may be answered in any order, and each answer is the one its own `db.query` would have had.
+/// `lookup` over each of `xs`, answering what `map` would. Each lookup runs until it asks the store,
+/// and the asks of one round that share a statement are one `db.batch`. A lookup only reads, so its
+/// asks may be answered in any order, and each answer is the one its own `db.query` would have had.
 pub fn batched<a, b, [t]>(
   xs: List<a>,
   lookup: (a) -> b / {db.query[t]},
@@ -157,8 +205,8 @@ fn rounds<b, [t]>(
   }
 }
 
-// One round's asks answered, by their place: a statement asked once is a `db.query`, and one asked
-// more is a `db.batch` of all its parameter lists, in the order the asks were made.
+/// One round's asks answered, by their place: a statement asked once is a `db.query`, and one asked
+/// more is a `db.batch` of all its parameter lists, in the order the asks were made.
 fn asked<b, [t]>(
   ps: List<Pending<b>>,
   waiting: List<Int>,
@@ -204,7 +252,7 @@ fn asked<b, [t]>(
 
 // --- Tests ------------------------------------------------------------------
 
-// A rollback raised two calls deep, out of sight of the `handle` that answers it.
+/// A rollback raised two calls deep, out of sight of the `handle` that answers it.
 fn charge(stock: Bool) -> Int / {db.execute[items], db.rollback} = {
   db.execute[items](stmt("insert one"), []);
   reserve(stock);
@@ -567,6 +615,7 @@ test "is_retryable names the two the server is telling the program to try again"
 
 // --- A schema is a value --------------------------------------------------------
 
+/// A column's type in a `Schema`; `TNumeric(precision, scale)`.
 pub type ColumnType =
   | TInt
   | TBool
@@ -577,10 +626,13 @@ pub type ColumnType =
   | TJson
   | TArray(ColumnType)
 
+/// What a column holds when an insert names none: nothing, the next value of a sequence, or a literal.
 pub type Default = | DNone | DSequence(String) | DLiteral(Param)
 
+/// A column: its name, its type, whether it may be null, and its default.
 pub type Column = { name: String, ty: ColumnType, nullable: Bool, default: Default }
 
+/// A foreign key: `columns` of this table refer to `refers_to` of the table `references`.
 pub type ForeignKey = {
   name: String,
   columns: List<String>,
@@ -588,10 +640,13 @@ pub type ForeignKey = {
   refers_to: List<String>,
 }
 
+/// A named check constraint over SQL text.
 pub type Check = { name: String, expr: String }
 
+/// A named unique constraint.
 pub type Unique = { name: String, columns: List<String> }
 
+/// A table as a value, which `create_schema` renders and the twin enforces.
 pub type Table = {
   name: String,
   columns: List<Column>,
@@ -601,26 +656,32 @@ pub type Table = {
   checks: List<Check>,
 }
 
+/// The tables of a database, in the order they are created.
 pub type Schema = { tables: List<Table> }
 
-// Deeper savepoint nesting is a program that recursed, so it is `Failed` with `54000`.
+/// Deeper savepoint nesting is a program that recursed, so it is `Failed` with `54000`.
 pub fn max_savepoints() -> Int = 16
 
+/// An error with this SQLSTATE, constraint and detail, as the twin answers one.
 pub fn db_error(code: String, constraint: String, detail: String) -> DbError =
   { code: code, constraint: constraint, detail: detail }
 
+/// A column with no default.
 pub fn column(name: String, ty: ColumnType, nullable: Bool) -> Column =
   { name: name, ty: ty, nullable: nullable, default: DNone }
 
+/// A column with a default.
 pub fn column_default(name: String, ty: ColumnType, nullable: Bool, d: Default) -> Column =
   { name: name, ty: ty, nullable: nullable, default: d }
 
 // --- The DDL a schema renders to ------------------------------------------------
 
+/// The statements that create a schema's sequences and then its tables, in order.
 pub fn create_schema(s: Schema) -> List<Stmt> / {abort.raise} =
   fold(s.tables, sequence_statements(s), |acc: List<Stmt>, t: Table|
     push(acc, stmt(create_table_sql(t))))
 
+/// The statements that drop a schema's tables, last created first, and then its sequences.
 pub fn drop_schema(s: Schema) -> List<Stmt> / {abort.raise} = {
   let drops = fold(reverse_list(s.tables), [], |acc: List<Stmt>, t: Table|
     push(acc, stmt("drop table if exists " ++ quote_ident(t.name) ++ " cascade")));
@@ -680,7 +741,7 @@ fn type_sql(t: ColumnType) -> String =
     TArray(inner) -> type_sql(inner) ++ "[]",
   }
 
-// Only for a `CREATE TABLE`'s `DEFAULT` clause, never for a value a request supplied.
+/// Only for a `CREATE TABLE`'s `DEFAULT` clause, never for a value a request supplied.
 fn literal_sql(p: Param) -> String / {abort.raise} =
   match p {
     PNull -> "null",
@@ -710,11 +771,13 @@ fn drop_last<a>(xs: List<a>) -> List<a> =
 
 // --- The in-memory twin ---------------------------------------------------------
 
+/// A table of the twin and the rows it holds.
 pub type MemTable = { def: Table, rows: List<Row> }
 
-// One entry per open scope.
+/// One entry per open scope.
 pub type Frame = { tables: List<MemTable>, failed: Bool, level: Isolation, access: Access }
 
+/// The in-memory twin of a database: its tables, sequences, and the transaction scopes open on it.
 pub type MemDb = {
   tables: List<MemTable>,
   sequences: Map<String, Int>,
@@ -722,8 +785,10 @@ pub type MemDb = {
   failed: Bool,
 }
 
+/// The twin after an operation, and what the operation answered.
 pub type Outcome = { db: MemDb, out: Answer }
 
+/// An empty twin of a schema, every sequence at zero.
 pub fn open(s: Schema) -> MemDb =
   {
     tables: map(s.tables, |t: Table| { def: t, rows: [] }),
@@ -782,7 +847,7 @@ fn sql_digits() -> Bytes = b"0123456789"
 fn ident_rest() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789$"
 fn ident_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
-// `-1` is the end of the input, which is in no set.
+/// `-1` is the end of the input, which is in no set.
 fn in_set(set: Bytes, c: Int) -> Bool / {abort.raise} =
   if c < 0 { false } else { match bytes_index_of_byte(set, c) { Some(_) -> true, None -> false } }
 
@@ -792,7 +857,7 @@ fn lex_all(sql: String) -> Result<List<Token>, DbError> / {abort.raise} = {
   else { lex(src, 0, [], 2 * bytes_len(src) + 2) }
 }
 
-// A token takes a byte at least and two calls at most, so twice the bytes bound the calls: `left`.
+/// A token takes a byte at least and two calls at most, so twice the bytes bound the calls: `left`.
 reuse fn lex(
   src: Bytes,
   i: Int,
@@ -829,7 +894,7 @@ reuse fn lex(
 fn line_comment_end(src: Bytes, i: Int) -> Int / {abort.raise} =
   if i >= bytes_len(src) || peek(src, i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
 
-// Postgres nests block comments, so scanning to the first `*/` would leak an outer comment's tail.
+/// Postgres nests block comments, so scanning to the first `*/` would leak an outer comment's tail.
 fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> / {abort.raise} =
   if depth == 0 { Some(i) }
   else if i >= bytes_len(src) { None }
@@ -853,7 +918,7 @@ reuse fn lex_number(
     else { lex(src, end, push(acc, TNum(string_of_bytes(bytes_slice(src, i, end)))), left - 1) }
   }
 
-// `''` is an escaped quote, which is the only escape a standard-conforming string has.
+/// `''` is an escaped quote, which is the only escape a standard-conforming string has.
 reuse fn lex_string(
   src: Bytes,
   i: Int,
@@ -938,7 +1003,7 @@ reuse fn lex_symbol(
 
 // --- The statement, as the twin understands it -----------------------------------
 
-// One item of a select list: the column it reads and the name it comes back under.
+/// One item of a select list: the column it reads and the name it comes back under.
 type Target = { column: String, name: String }
 
 type Projection = | PStar | PCols(List<Target>) | PCount(String)
@@ -1029,14 +1094,14 @@ fn parse_name(ts: List<Token>) -> Result<Parsed<String>, DbError> =
     _ -> Err(expected("a name", ts)),
   }
 
-// `t.c` names the column `c`.
+/// `t.c` names the column `c`.
 fn parse_colref(ts: List<Token>) -> Result<Parsed<String>, DbError> = {
   let c = parse_name(ts)?;
   if token_symbol(c.rest) == "." { parse_name(rest_of(c.rest)) } else { Ok(c) }
 }
 
-// Every cycle through the expression parser takes a token, so a path meets each of its eleven
-// functions once per token at most: the room each starts with.
+/// Every cycle through the expression parser takes a token, so a path meets each of its eleven
+/// functions once per token at most: the room each starts with.
 fn expr_room(ts: List<Token>) -> Int = (len(ts) + 1) * 11
 
 fn parse_expr_text(s: String) -> Result<Expr, DbError> / {abort.raise} = {
@@ -1199,7 +1264,7 @@ fn parse_column_tail(name: String, ts: List<Token>) -> Result<Parsed<Expr>, DbEr
   } else if token_symbol(ts) == "(" { Err(unsupported("the function `" ++ name ++ "`")) }
   else { Ok(parsed(XCol(name), ts)) }
 
-// A literal with a `.` is `numeric` and one without is `integer`, as in postgres.
+/// A literal with a `.` is `numeric` and one without is `integer`, as in postgres.
 fn num_literal(
   s: String,
   negative: Bool,
@@ -1281,7 +1346,7 @@ fn parse_proj(ts: List<Token>) -> Result<Parsed<Projection>, DbError> =
     }
   } else { parse_proj_columns(ts, [], len(ts) + 1) }
 
-// `left` bounds the items: each but the last takes its comma.
+/// `left` bounds the items: each but the last takes its comma.
 fn parse_proj_columns(
   ts: List<Token>,
   acc: List<Target>,
@@ -1313,7 +1378,7 @@ fn parse_order(ts: List<Token>) -> Result<Parsed<List<OrderKey>>, DbError> =
     parse_order_keys(after, [], len(after) + 1)
   } else { Ok(parsed([], ts)) }
 
-// `left` bounds the items: each but the last takes its comma.
+/// `left` bounds the items: each but the last takes its comma.
 fn parse_order_keys(
   ts: List<Token>,
   acc: List<OrderKey>,
@@ -1332,7 +1397,7 @@ fn parse_order_keys(
     }
   }
 
-// Postgres's default is `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC`.
+/// Postgres's default is `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC`.
 fn parse_nulls(ts: List<Token>, desc: Bool) -> Result<Parsed<Bool>, DbError> =
   if token_word(ts) == "nulls" {
     let w = token_word(rest_of(ts));
@@ -1386,7 +1451,7 @@ fn parse_insert_columns(ts: List<Token>) -> Result<Parsed<List<String>>, DbError
   if token_symbol(ts) == "(" { parse_name_list(rest_of(ts), [], len(ts) + 1) }
   else { Ok(parsed([], ts)) }
 
-// `left` bounds the items: each but the last takes its comma.
+/// `left` bounds the items: each but the last takes its comma.
 fn parse_name_list(
   ts: List<Token>,
   acc: List<String>,
@@ -1401,7 +1466,7 @@ fn parse_name_list(
     }
   }
 
-// `left` bounds the items: each but the last takes its comma.
+/// `left` bounds the items: each but the last takes its comma.
 fn parse_tuples(
   ts: List<Token>,
   acc: List<List<Expr>>,
@@ -1441,7 +1506,7 @@ fn parse_update(ts: List<Token>) -> Result<Parsed<Query>, DbError> / {abort.rais
   }
 }
 
-// `left` bounds the items: each but the last takes its comma.
+/// `left` bounds the items: each but the last takes its comma.
 fn parse_assignments(
   ts: List<Token>,
   acc: List<Assign>,
@@ -1491,6 +1556,7 @@ fn tri_or(a: Tri, b: Tri) -> Tri =
     TriUnknown -> match b { TriTrue -> TriTrue, _ -> TriUnknown },
   }
 
+/// The value a parameter stores as.
 pub fn param_datum(p: Param) -> Datum =
   match p {
     PNull -> CNull,
@@ -1530,7 +1596,7 @@ fn eval_value(row: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {a
     _ -> leaf_value(row, ps, e),
   }
 
-// What a literal, a column or a parameter is; the rest are predicates.
+/// What a literal, a column or a parameter is; the rest are predicates.
 fn leaf_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} =
   match e {
     XLit(v) -> Ok(v),
@@ -1684,7 +1750,7 @@ fn like_of(xv: Datum, pv: Datum, negated: Bool) -> Result<Tri, DbError> / {abort
     _ -> Err(db_error("42883", "", "operator does not exist: " ++ datum_type(xv) ++ " like ...")),
   }
 
-// `_` matches one character, not one byte, or non-ASCII text stops matching.
+/// `_` matches one character, not one byte, or non-ASCII text stops matching.
 fn like_match(s: String, p: String, si: Int, pi: Int) -> Bool / {abort.raise} =
   if pi >= string_len(p) { si >= string_len(s) } else {
     let pc = string_slice(p, pi, pi + 1);
@@ -1718,7 +1784,7 @@ fn float_cmp(a: Float, b: Float) -> Int =
 
 fn decimal_cmp(a: Decimal, b: Decimal) -> Int = if a < b { -1 } else if a > b { 1 } else { 0 }
 
-// `None` is SQL's unknown: a comparison with a `NULL` operand has no answer.
+/// `None` is SQL's unknown: a comparison with a `NULL` operand has no answer.
 fn datum_cmp(a: Datum, b: Datum) -> Result<Option<Int>, DbError> =
   match a {
     CNull -> Ok(None),
@@ -1774,7 +1840,7 @@ fn decimal_scale_of(d: Decimal) -> Int / {abort.raise} = {
 
 fn zeros(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ "0")
 
-// A `numeric(p, s)` column stores exactly `s` fractional digits: `1.00` becomes `1.0000`.
+/// A `numeric(p, s)` column stores exactly `s` fractional digits: `1.00` becomes `1.0000`.
 fn rescale(d: Decimal, s: Int) -> Option<Decimal> / {abort.raise} = {
   let reduced = if decimal_scale_of(d) > s { decimal_round(d, s, HalfUp) } else { d };
   let text = decimal_to_string(reduced);
@@ -1803,7 +1869,7 @@ fn numeric_fits(d: Decimal, p: Int, s: Int) -> Bool / {abort.raise} = {
 
 fn is_text(v: Datum) -> Bool = match v { CText(_) -> true, _ -> false }
 
-// A string literal in statement text is `unknown`-typed and coerced, so a bad one is `22P02`.
+/// A string literal in statement text is `unknown`-typed and coerced, so a bad one is `22P02`.
 fn wrong_type(c: Column, v: Datum, from_param: Bool, want: String) -> DbError =
   if !from_param && is_text(v) { db_error("22P02", "", "invalid input syntax for type " ++ want) }
   else {
@@ -1823,7 +1889,7 @@ fn coerce(
 ) -> Result<Datum, DbError> / {abort.raise} =
   match v { CNull -> Ok(CNull), _ -> coerce_value(c, ty, v, from_param) }
 
-// The name postgres prints for a column type in a `22P02` or `42804`.
+/// The name postgres prints for a column type in a `22P02` or `42804`.
 pub fn type_name(ty: ColumnType) -> String =
   match ty {
     TInt -> "bigint",
@@ -1836,7 +1902,7 @@ pub fn type_name(ty: ColumnType) -> String =
     TArray(_) -> "array",
   }
 
-// Postgres parses an `unknown` string at the type it is assigned or compared to.
+/// Postgres parses an `unknown` string at the type it is assigned or compared to.
 fn coerce_value(
   c: Column,
   ty: ColumnType,
@@ -1858,7 +1924,7 @@ fn coerce_unknown(c: Column, ty: ColumnType, s: String) -> Result<Datum, DbError
 fn bad_input(ty: ColumnType, s: String) -> DbError =
   db_error("22P02", "", "invalid input syntax for type " ++ type_name(ty) ++ ": \"" ++ s ++ "\"")
 
-// What an `unknown` literal becomes at a given type, or `None` when postgres would refuse the text.
+/// What an `unknown` literal becomes at a given type, or `None` when postgres would refuse the text.
 fn unknown_datum(ty: ColumnType, s: String) -> Option<Datum> =
   match ty {
     TInt -> {
@@ -1880,7 +1946,7 @@ fn unknown_datum(ty: ColumnType, s: String) -> Option<Datum> =
     TArray(_) -> None,
   }
 
-// Text is read at the target type, so `'2.6'` as `bigint` is refused rather than rounded.
+/// Text is read at the target type, so `'2.6'` as `bigint` is refused rather than rounded.
 fn whole_of_string(s: String) -> Option<Int> = {
   let d = decimal_of_string(s)?;
   let n = int_of_decimal(d, Down)?;
@@ -1934,7 +2000,7 @@ fn int_from_decimal(d: Decimal) -> Result<Datum, DbError> / {abort.raise} =
     Some(n) -> Ok(CInt(n)),
   }
 
-// Overflow is checked before the rescale, which would exhaust `Decimal` and answer `0A000`.
+/// Overflow is checked before the rescale, which would exhaust `Decimal` and answer `0A000`.
 fn numeric_into(c: Column, d: Decimal, p: Int, s: Int) -> Result<Datum, DbError> / {abort.raise} =
   if !numeric_fits(d, p, s) { Err(numeric_overflow(p, s)) } else {
     match rescale(d, s) {
@@ -1992,10 +2058,10 @@ fn index_from(xs: List<String>, s: String, i: Int) -> Option<Int> =
 
 fn cell_of(r: Row, n: String) -> Datum = match map_get(r, n) { None -> CNull, Some(v) -> v }
 
-// A primary key column is not-null whether or not the schema says so.
+/// A primary key column is not-null whether or not the schema says so.
 fn not_null_here(def: Table, c: Column) -> Bool = !c.nullable || contains(def.primary_key, c.name)
 
-// Postgres's order: not-null, check, unique; referential integrity runs after the statement.
+/// Postgres's order: not-null, check, unique; referential integrity runs after the statement.
 fn validate_row(
   def: Table,
   rows: List<Row>,
@@ -2026,7 +2092,7 @@ fn check_not_null(def: Table, cs: List<Column>, row: Row) -> Option<DbError> =
     } else { check_not_null(def, t, row) },
   }
 
-// A `CHECK` fails only when false and passes when unknown, the opposite of a `WHERE`.
+/// A `CHECK` fails only when false and passes when unknown, the opposite of a `WHERE`.
 fn check_checks(def: Table, cs: List<Check>, row: Row) -> Option<DbError> / {abort.raise} =
   match cs {
     [] -> None,
@@ -2069,7 +2135,7 @@ fn check_unique_list(
     },
   }
 
-// Two NULLs are distinct in a unique index, so a key with any NULL in it never collides.
+/// Two NULLs are distinct in a unique index, so a key with any NULL in it never collides.
 fn unique_violation(
   def: Table,
   rows: List<Row>,
@@ -2097,7 +2163,7 @@ fn collides(rows: List<Row>, row: Row, cols: List<String>, skip: Int, i: Int) ->
 fn key_equal(a: Row, b: Row, cols: List<String>) -> Bool =
   fold(cols, true, |acc: Bool, c: String| acc && cell_of(a, c) == cell_of(b, c))
 
-// `NO ACTION` is checked once after the statement, not per row.
+/// `NO ACTION` is checked once after the statement, not per row.
 fn check_referential(ts: List<MemTable>) -> Option<DbError> = check_ref_from(ts, ts)
 
 fn check_ref_from(all: List<MemTable>, ts: List<MemTable>) -> Option<DbError> =
@@ -2157,7 +2223,7 @@ fn fk_pairs(parent: Row, child: Row, cs: List<String>, rs: List<String>) -> Bool
 
 // --- Executing a statement -------------------------------------------------------
 
-// The answer's shape follows the statement: a `RETURNING` answers `Rows` and a bare write `Count`.
+/// The answer's shape follows the statement: a `RETURNING` answers `Rows` and a bare write `Count`.
 pub fn step(d: MemDb, s: Stmt, ps: List<Param>) -> Outcome / {abort.raise} =
   if d.failed { fail(d, in_failed_txn()) }
   else { match parse_statement(s.sql) { Err(e) -> fail(d, e), Ok(q) -> exec(d, q, ps) } }
@@ -2173,7 +2239,7 @@ fn exec(db: MemDb, q: Query, ps: List<Param>) -> Outcome / {abort.raise} =
     else { exec_delete(db, dq, ps) },
   }
 
-// The **outermost** scope decides, because a savepoint has no access mode.
+/// The **outermost** scope decides, because a savepoint has no access mode.
 fn read_only(db: MemDb) -> Bool =
   match list_at(db.stack, 0) {
     None -> false,
@@ -2248,7 +2314,7 @@ fn plan_operands(def: Table, a: Expr, b: Expr) -> Result<Planned, DbError> = {
   paired(def, pa, pb)
 }
 
-// Two planned operands, where an `unknown` literal takes its type from the column on the other side.
+/// Two planned operands, where an `unknown` literal takes its type from the column on the other side.
 fn paired(def: Table, pa: Expr, pb: Expr) -> Result<Planned, DbError> =
   match column_type_of(def, pa) {
     Some(ty) -> {
@@ -2293,7 +2359,7 @@ fn column_type_of(def: Table, e: Expr) -> Option<ColumnType> =
     _ -> None,
   }
 
-// Only a string literal is `unknown`; a parameter and any other literal carry their own type.
+/// Only a string literal is `unknown`; a parameter and any other literal carry their own type.
 fn retype(ty: ColumnType, e: Expr) -> Result<Expr, DbError> =
   match e {
     XLit(v) -> match v {
@@ -2306,7 +2372,7 @@ fn retype(ty: ColumnType, e: Expr) -> Result<Expr, DbError> =
     _ -> Ok(e),
   }
 
-// Duplicate output names and unknown columns are the statement's shape, so they are refused here.
+/// Duplicate output names and unknown columns are the statement's shape, so they are refused here.
 fn check_projection(def: Table, proj: Projection) -> Option<DbError> =
   match proj { PStar -> None, PCount(_) -> None, PCols(ns) -> check_result_columns(def, ns, []) }
 
@@ -2472,7 +2538,7 @@ fn drop_n<a>(xs: List<a>, n: Int) -> List<a> =
 fn take_n<a>(xs: List<a>, n: Int, acc: List<a>) -> List<a> =
   if n <= 0 { acc } else { match xs { [] -> acc, [h, ..t] -> take_n(t, n - 1, push(acc, h)) } }
 
-// Insertion sort, and stable by construction: a row goes after every row it compares equal to.
+/// Insertion sort, and stable by construction: a row goes after every row it compares equal to.
 fn sort_rows(rows: List<Row>, keys: List<OrderKey>, acc: List<Row>) -> Result<List<Row>, DbError> =
   if len(keys) == 0 { Ok(concat(acc, rows)) } else {
     match rows {
@@ -2508,7 +2574,7 @@ fn rows_cmp(a: Row, b: Row, keys: List<OrderKey>) -> Result<Int, DbError> =
     },
   }
 
-// `NULLS FIRST` / `NULLS LAST` is absolute, so the null arms sit outside the `desc` flip.
+/// `NULLS FIRST` / `NULLS LAST` is absolute, so the null arms sit outside the `desc` flip.
 fn key_cmp(a: Row, b: Row, k: OrderKey) -> Result<Int, DbError> = {
   let av = cell_of(a, k.column);
   let bv = cell_of(b, k.column);
@@ -2532,7 +2598,7 @@ fn project_rows(rows: List<Row>, proj: Projection, acc: List<Row>) -> Result<Lis
 fn project_row(r: Row, proj: Projection) -> Result<Row, DbError> =
   match proj { PStar -> Ok(r), PCount(_) -> Ok(r), PCols(ns) -> project_cols(r, ns, map_new()) }
 
-// A `Row` is a `Map`, so two output columns of one name would silently keep one.
+/// A `Row` is a `Map`, so two output columns of one name would silently keep one.
 fn project_cols(row: Row, ns: List<Target>, acc: Row) -> Result<Row, DbError> =
   match ns {
     [] -> Ok(acc),
@@ -2575,7 +2641,7 @@ fn check_column_list(def: Table, cols: List<String>, seen: List<String>) -> Opti
     },
   }
 
-// A sequence stays advanced even when the row is refused: postgres sequences are not transactional.
+/// A sequence stays advanced even when the row is refused: postgres sequences are not transactional.
 fn insert_build(
   db: MemDb,
   mt: MemTable,
@@ -2771,7 +2837,7 @@ fn plan_update(
     },
   }
 
-// A constant `set` is coerced at plan time, so one that cannot fit fails even when no row matches.
+/// A constant `set` is coerced at plan time, so one that cannot fit fails even when no row matches.
 fn constant_sets(
   def: Table,
   sets: List<Assign>,
@@ -2864,7 +2930,7 @@ fn apply_sets(
     },
   }
 
-// Sequences are threaded through `insert` only, so `set c = default` on one is refused.
+/// Sequences are threaded through `insert` only, so `set c = default` on one is refused.
 fn set_value(
   c: Column,
   row: Row,
@@ -2979,7 +3045,7 @@ fn delete_walk(
 
 // --- The scope stack -------------------------------------------------------------
 
-// A refused `begin` does not abort the transaction it is nested inside.
+/// A refused `begin` does not abort the transaction it is nested inside.
 pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
   let frame = { tables: db.tables, failed: false, level: level, access: access };
   match list_at(db.stack, 0) {
@@ -2998,8 +3064,8 @@ pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
   }
 }
 
-// Why a `begin` cannot be a savepoint of the transaction it is nested in, where `depth` scopes are
-// open and `outer` is what the transaction's own `begin` asked for; the twin and the driver share it.
+/// Why a `begin` cannot be a savepoint of the transaction it is nested in, where `depth` scopes are
+/// open and `outer` is what the transaction's own `begin` asked for; the twin and the driver share it.
 fn nested_refusal(
   failed: Bool,
   depth: Int,
@@ -3039,6 +3105,7 @@ fn widens(outer: Access, inner: Access) -> Bool =
     ReadWrite -> false,
   }
 
+/// The access mode as `begin` spells it.
 pub fn access_name(a: Access) -> String =
   match a { ReadWrite -> "read write", ReadOnly -> "read only" }
 
@@ -3049,6 +3116,7 @@ fn same_isolation(a: Isolation, b: Isolation) -> Bool =
     Serializable -> match b { Serializable -> true, _ -> false },
   }
 
+/// The isolation level as `begin` spells it.
 pub fn isolation_name(a: Isolation) -> String =
   match a {
     ReadCommitted -> "read committed",
@@ -3056,7 +3124,7 @@ pub fn isolation_name(a: Isolation) -> String =
     Serializable -> "serializable",
   }
 
-// Committing an aborted transaction is `25P02`, stricter on purpose than the bare server.
+/// Committing an aborted transaction is `25P02`, stricter on purpose than the bare server.
 pub fn commit_step(db: MemDb) -> Outcome =
   match last(db.stack) {
     None -> fail_open(db, no_transaction("`db.commit`")),
@@ -3073,6 +3141,7 @@ pub fn commit_step(db: MemDb) -> Outcome =
     } else { done(memdb(db.tables, db.sequences, drop_last(db.stack), db.failed), Count(0)) },
   }
 
+/// `db.abort` on the twin: the innermost scope's changes undone.
 pub fn abort_step(db: MemDb) -> Outcome =
   match last(db.stack) {
     None -> fail_open(db, no_transaction("`db.abort`")),
@@ -3083,7 +3152,7 @@ pub fn abort_step(db: MemDb) -> Outcome =
 fn no_transaction(what: String) -> DbError =
   db_error("25P01", "", what ++ " with no transaction open")
 
-// With no open scope there is no transaction to poison, so the database is left as it was.
+/// With no open scope there is no transaction to poison, so the database is left as it was.
 fn fail_open(db: MemDb, e: DbError) -> Outcome = { db: db, out: Failed(e) }
 
 // --- The twin's own tests --------------------------------------------------------
@@ -3472,22 +3541,25 @@ test "a parameter numbered past the ones given, or below one, is refused" {
 // pool, the transaction scope, the text of every value and the tables a statement names. What is
 // left to the host is `net`.
 
+/// Where the driver connects, and what each connection starts with; `server` makes one with no
+/// settings, and `server_of` reads one from a connection string.
 pub type Server = {
   host: String,
   port: Int,
   user: String,
   database: String,
   password: Option<String>,
-  // Told to the server as each connection starts, so every connection the pool opens runs under
-  // them: how long one statement may run, and a transaction sit idle between statements, before the
-  // server ends it, in milliseconds (`None` leaves the server's own), and the name its sessions are
-  // listed under.
+  /// Told to the server as each connection starts, so every connection the pool opens runs under
+  /// them: how long one statement may run, and a transaction sit idle between statements, before the
+  /// server ends it, in milliseconds (`None` leaves the server's own), and the name its sessions are
+  /// listed under.
   statement_timeout_ms: Option<Int>,
   idle_in_transaction_timeout_ms: Option<Int>,
   application_name: Option<String>,
   client: pg::Client,
 }
 
+/// A server with none of the start-up settings.
 pub fn server(
   host: String,
   port: Int,
@@ -3507,7 +3579,7 @@ pub fn server(
     client: pg::default_client(),
   }
 
-// The settings a connection starts with, under the names postgres gives them.
+/// The settings a connection starts with, under the names postgres gives them.
 pub fn startup_parameters(s: Server) -> List<pg::Set> =
   concat(
     concat(
@@ -3523,12 +3595,12 @@ fn parameter(name: String, value: Option<String>) -> List<pg::Set> =
 fn millis_text(ms: Option<Int>) -> Option<String> =
   match ms { Some(n) -> Some(int_to_string(n)), None -> None }
 
-// `n` numbers a connection among every one the pool has opened.
+/// `n` numbers a connection among every one the pool has opened.
 type Link = { n: Int, session: pg::Session }
 
-// A transaction on connection `n`: `session` is `None` once the connection is lost, which ended the
-// transaction on the server; `depth` counts the transaction and its savepoints; `level` and
-// `access` are its outermost `begin`'s; `busy` while one of its operations is on the wire.
+/// A transaction on connection `n`: `session` is `None` once the connection is lost, which ended the
+/// transaction on the server; `depth` counts the transaction and its savepoints; `level` and
+/// `access` are its outermost `begin`'s; `busy` while one of its operations is on the wire.
 type Scope = {
   n: Int,
   session: Option<pg::Session>,
@@ -3538,7 +3610,7 @@ type Scope = {
   busy: Bool,
 }
 
-// `opened` counts the connections open, which `size` bounds, and `made` every one ever opened.
+/// `opened` counts the connections open, which `size` bounds, and `made` every one ever opened.
 type Pool = { idle: List<Link>, opened: Int, made: Int, open: List<Scope> }
 
 // --- The text of a value ---------------------------------------------------------
@@ -3564,7 +3636,7 @@ fn unhex_text(text: String) -> Bytes / {abort.raise} = {
   )
 }
 
-// Bytea's hex output is introduced by `\x`; the older escape format is read as its own bytes.
+/// Bytea's hex output is introduced by `\x`; the older escape format is read as its own bytes.
 fn bytes_of_bytea(text: String) -> Bytes / {abort.raise} =
   if string_starts_with(text, "\\x") { unhex_text(string_slice(text, 2, string_len(text))) }
   else { bytes_of_string(text) }
@@ -3591,7 +3663,7 @@ fn float_of_text(text: String) -> Float = match float_of_string(text) { Some(f) 
 fn json_of_text(text: String) -> json::Json / {abort.raise} =
   match json::parse_string(text) { Ok(j) -> j, Err(_) -> json::Str(text) }
 
-// The element type of an array type, or `0` when the OID is not one this reads.
+/// The element type of an array type, or `0` when the OID is not one this reads.
 fn element_oid(oid: Int) -> Int =
   if oid == 1000 { 16 }
   else if oid == 1001 { 17 }
@@ -3607,8 +3679,8 @@ fn element_oid(oid: Int) -> Int =
   else if oid == 3807 { 3802 }
   else { 0 }
 
-// An array's text is `{...}`, elements separated by commas, quoted when they need to be, and the
-// word `NULL` bare — so a quoted `NULL` is the text and an unquoted one is nothing.
+/// An array's text is `{...}`, elements separated by commas, quoted when they need to be, and the
+/// word `NULL` bare — so a quoted `NULL` is the text and an unquoted one is nothing.
 type Scanning = {
   items: List<Datum>,
   piece: String,
@@ -3643,7 +3715,7 @@ fn array_values(element: Int, text: String) -> List<Datum> / {abort.raise} = {
   else { push(end.items, array_value(element, end.piece, end.was_quoted)) }
 }
 
-// An element is never an array itself: `element_oid` answers only scalar types.
+/// An element is never an array itself: `element_oid` answers only scalar types.
 fn array_value(element: Int, piece: String, was_quoted: Bool) -> Datum / {abort.raise} =
   if !was_quoted && piece == "NULL" { CNull } else { scalar_datum(element, piece) }
 
@@ -3663,8 +3735,8 @@ fn scalar_datum(oid: Int, t: String) -> Datum / {abort.raise} =
   else if oid == 114 || oid == 3802 { CJson(json_of_text(t)) }
   else { CText(t) }
 
-// What the server sent for one column: text, except that bytea's hex form and the text of every
-// other type are read by `datum_of`. `string_of_bytes_lossy` because a bytea is bytes, not text.
+/// What the server sent for one column: text, except that bytea's hex form and the text of every
+/// other type are read by `datum_of`. `string_of_bytes_lossy` because a bytea is bytes, not text.
 fn datum_bytes(oid: Int, raw: Option<Bytes>) -> Datum / {abort.raise} =
   match raw { None -> CNull, Some(b) -> datum_of(oid, Some(string_of_bytes_lossy(b))) }
 
@@ -3682,7 +3754,7 @@ fn param_text(p: Param) -> Option<String> / {abort.raise} =
       Some("{" ++ string::join(map(items, |p: Param| array_element_text(p)), ",") ++ "}"),
   }
 
-// An array element is always quoted, which is the one form whose escaping is two characters.
+/// An array element is always quoted, which is the one form whose escaping is two characters.
 fn array_element_text(p: Param) -> String / {abort.raise} =
   match param_text(p) {
     None -> "NULL",
@@ -3701,8 +3773,8 @@ fn last_word(text: String) -> Option<String> / {abort.raise} =
   fold(string_split(text, " "), None, |acc: Option<String>, w: String|
     if string_len(w) > 0 { Some(w) } else { acc })
 
-// `SELECT 3`, `INSERT 0 1`, `UPDATE 2`: the count is the tag's last number, and a tag with none
-// (`BEGIN`) counts nothing.
+/// `SELECT 3`, `INSERT 0 1`, `UPDATE 2`: the count is the tag's last number, and a tag with none
+/// (`BEGIN`) counts nothing.
 fn count_of(tag: String) -> Int / {abort.raise} =
   match last_word(tag) { Some(w) -> nat_of_text(w), None -> 0 }
 
@@ -3747,8 +3819,8 @@ fn savepoint_name(depth: Int) -> String = "ply_sp" ++ int_to_string(depth)
 // Every operation takes what it will use from the pool before it sends a byte and settles what it
 // used after, because a task parked on the wire lets another task's operation run in between.
 
-// A handler cannot see which task performs an operation, so it goes by which transactions are
-// between statements: the performer's own is never on the wire, because its task is the one running.
+/// A handler cannot see which task performs an operation, so it goes by which transactions are
+/// between statements: the performer's own is never on the wire, because its task is the one running.
 type Route = | Own(Scope) | NoTransaction | Ambiguous
 
 fn route(open: List<Scope>) -> Route =
@@ -3758,7 +3830,7 @@ fn ambiguous(what: String) -> String =
   what
     ++ " was performed while two transactions were between statements, so which one it belongs to is unknown: a transaction is told apart by being the one not waiting on the server, so a task that holds one open must wait on nothing but its own statements"
 
-// A connection for an operation outside any transaction, idle or still to be opened.
+/// A connection for an operation outside any transaction, idle or still to be opened.
 type Claim = | Idle(Link) | Fresh(Int)
 
 fn claim_n(c: Claim) -> Int = match c { Idle(l) -> l.n, Fresh(n) -> n }
@@ -3794,8 +3866,8 @@ fn for_statement(p: Pool, size: Int, what: String) -> Decided / {abort.raise} =
     NoTransaction -> outside(p, size),
   }
 
-// A `begin` inside the performer's transaction is a savepoint of it; any other opens a transaction
-// on a connection of its own.
+/// A `begin` inside the performer's transaction is a savepoint of it; any other opens a transaction
+/// on a connection of its own.
 fn for_begin(p: Pool, size: Int, level: Isolation, access: Access) -> Decided / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous("`db.begin`")),
@@ -3820,8 +3892,8 @@ type Closing = | Settled(Answer) | Closes(Scope, pg::Session)
 
 type ToClose = { pool: Pool, closing: Closing }
 
-// A transaction whose connection is lost has nothing to send: the server ended it when the
-// connection went, and `lost` is the answer.
+/// A transaction whose connection is lost has nothing to send: the server ended it when the
+/// connection went, and `lost` is the answer.
 fn for_close(p: Pool, what: String, lost: Answer) -> ToClose / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
@@ -3837,11 +3909,11 @@ fn without_scope(open: List<Scope>, scope: Scope) -> List<Scope> = {
   if scope.depth > 1 { push(others, { ..scope, depth: scope.depth - 1 }) } else { others }
 }
 
-// A connection let go of: still talking, and so back to the pool, or closed.
+/// A connection let go of: still talking, and so back to the pool, or closed.
 type Freed = | Reuse(Link) | Lost
 
-// What an operation on connection `n` leaves: `scope` is its transaction as it now stands, `None`
-// when there is none or it ended.
+/// What an operation on connection `n` leaves: `scope` is its transaction as it now stands, `None`
+/// when there is none or it ended.
 type Left = { answer: Answer, n: Int, scope: Option<Scope>, freed: Option<Freed> }
 
 fn settle(p: Pool, left: Left) -> Pool = {
@@ -3856,8 +3928,8 @@ fn settle(p: Pool, left: Left) -> Pool = {
 
 // --- The errors a connection makes -----------------------------------------------
 
-// A refusal is the server's own SQLSTATE; a conversation that failed is class `08`, the connection
-// exceptions.
+/// A refusal is the server's own SQLSTATE; a conversation that failed is class `08`, the connection
+/// exceptions.
 fn client_error(e: pg::ClientError) -> DbError =
   match e {
     pg::Rejected(_, s) -> server_error(s),
@@ -3879,7 +3951,7 @@ fn connection_lost() -> DbError =
     "the connection this transaction ran on was lost, and the transaction with it",
   )
 
-// A `commit` the connection failed under may have been applied or not.
+/// A `commit` the connection failed under may have been applied or not.
 fn unresolved(e: pg::ClientError) -> DbError =
   db_error(
     "08007",
@@ -3899,12 +3971,14 @@ fn is_word_byte(c: Int) -> Bool =
 // one that under-reports. The reader is a tokenizer and a small parser over it, and it refuses far
 // more than it accepts: `with` is the only admitted construct that can hide a verb.
 
-// What a statement does, which decides the operations that may perform it.
+/// What a statement does, which decides the operations that may perform it.
 pub type ScanKind = | KSelect | KInsert | KUpdate | KDelete | KValues
 
+/// Whether a statement of this kind writes.
 pub fn kind_writes(k: ScanKind) -> Bool =
   match k { KSelect -> false, KValues -> false, KInsert -> true, KUpdate -> true, KDelete -> true }
 
+/// The verb a statement of this kind opens with.
 pub fn kind_text(k: ScanKind) -> String =
   match k {
     KSelect -> "select",
@@ -3914,10 +3988,11 @@ pub fn kind_text(k: ScanKind) -> String =
     KDelete -> "delete",
   }
 
-// The tables a statement names, split by what it does to them and deduplicated: one name is one
-// entry, and a table that is written is not also reported as read.
+/// The tables a statement names, split by what it does to them and deduplicated: one name is one
+/// entry, and a table that is written is not also reported as read.
 pub type SqlTables = { written: List<String>, read: List<String> }
 
+/// A statement that names no table.
 pub fn no_sql_tables() -> SqlTables = { written: [], read: [] }
 
 fn sql_note_written(t: SqlTables, name: String) -> SqlTables / {abort.raise} =
@@ -3933,8 +4008,8 @@ fn sql_absorb_tables(t: SqlTables, other: SqlTables) -> SqlTables / {abort.raise
     |acc: SqlTables, n: String| sql_note_written(acc, n),
   )
 
-// Sorted, so one set is one list: two statements that touch the same tables read the same however
-// they were written, and a comparison against a row does not depend on the order of the text.
+/// Sorted, so one set is one list: two statements that touch the same tables read the same however
+/// they were written, and a comparison against a row does not depend on the order of the text.
 fn sql_insert_table(names: List<String>, name: String) -> List<String> / {abort.raise} =
   if contains(names, name) { names } else { sql_in_order(names, name, []) }
 
@@ -3949,8 +4024,8 @@ fn sql_in_order(
     else { sql_in_order(rest, name, push(before, h)) },
   }
 
-// A name's bytes, compared as postgres compares them: byte by byte, so `"Items"` sorts before
-// `items`.
+/// A name's bytes, compared as postgres compares them: byte by byte, so `"Items"` sorts before
+/// `items`.
 fn sql_name_before(a: String, b: String) -> Bool / {abort.raise} =
   sql_bytes_cmp(bytes_of_string(a), bytes_of_string(b)) < 0
 
@@ -3967,7 +4042,7 @@ fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int / {abort.raise} = {
   else { 0 }
 }
 
-// Every table the statement names, written and read as one sorted list.
+/// Every table the statement names, written and read as one sorted list.
 pub fn scan_table_names(t: SqlTables) -> List<String> / {abort.raise} =
   sql_merge_names(t.written, t.read)
 
@@ -3987,7 +4062,7 @@ fn sql_without_table(names: List<String>, name: String) -> List<String> =
 
 // --- The tokens --------------------------------------------------------------------
 
-// A token, with the source text it was read from, so a refusal can name it.
+/// A token, with the source text it was read from, so a refusal can name it.
 pub type SqlTok =
   | SqlWord({ text: String, quoted: Bool })
   | SqlNumber
@@ -3996,23 +4071,27 @@ pub type SqlTok =
   | SqlPunct(String)
   | SqlSemi
 
+/// A token, where it starts in the statement, and its text.
 pub type SqlTokAt = { tok: SqlTok, at: Int, text: String }
 
+/// Whether the token is the unquoted word `word`.
 pub fn sql_is_word(t: SqlTok, word: String) -> Bool =
   match t { SqlWord(w) -> if w.quoted { false } else { w.text == word }, _ -> false }
 
+/// Whether the token is the punctuation `p`.
 pub fn sql_is_punct(t: SqlTok, p: String) -> Bool = match t { SqlPunct(x) -> x == p, _ -> false }
 
+/// Whether the token is a `;`.
 pub fn sql_is_semi(t: SqlTok) -> Bool = match t { SqlSemi -> true, _ -> false }
 
-// The tokens of `sql`, in order. Whitespace and comments are dropped, and a quote that is never
-// closed is refused rather than guessed at: past one, the reader cannot tell text from statement.
+/// The tokens of `sql`, in order. Whitespace and comments are dropped, and a quote that is never
+/// closed is refused rather than guessed at: past one, the reader cannot tell text from statement.
 pub fn tokenize(sql: String) -> Result<List<SqlTokAt>, DbError> / {abort.raise} = {
   let b = bytes_of_string(sql);
   sql_tokens_from(b, 0, [], bytes_len(b) + 1)
 }
 
-// `left` bounds the tokens: each takes a byte at least.
+/// `left` bounds the tokens: each takes a byte at least.
 fn sql_tokens_from(
   b: Bytes,
   at: Int,
@@ -4027,7 +4106,7 @@ fn sql_tokens_from(
     }
   }
 
-// `left` bounds the rounds: each takes a byte at least.
+/// `left` bounds the rounds: each takes a byte at least.
 fn sql_skip_trivia(b: Bytes, at: Int, left: Int) -> Result<Int, DbError> / {abort.raise} =
   if left <= 0 { panic("more rounds than input") } else {
     if at >= bytes_len(b) { Ok(at) }
@@ -4050,7 +4129,7 @@ fn sql_past_line(b: Bytes, at: Int) -> Int / {abort.raise} =
   else if bytes_at(b, at) == 10 { at + 1 }
   else { sql_past_line(b, at + 1) }
 
-// Postgres nests block comments, so stopping at the first `*/` would leave statement text behind.
+/// Postgres nests block comments, so stopping at the first `*/` would leave statement text behind.
 fn sql_past_comment(b: Bytes, at: Int, depth: Int) -> Result<Int, Int> / {abort.raise} =
   if at >= bytes_len(b) { Err(at) } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
     sql_past_comment(b, at + 2, depth + 1)
@@ -4113,7 +4192,7 @@ fn sql_lower_bytes(b: Bytes, at: Int, end: Int) -> String / {abort.raise} =
     }),
   )
 
-// The end of a string sql_literal, from just after its opening quote.
+/// The end of a string sql_literal, from just after its opening quote.
 fn sql_end_of_literal(
   b: Bytes,
   at: Int,
@@ -4159,18 +4238,18 @@ fn sql_quoted_word(
       ),
   }
 
-// The name inside `"…"`, with a doubled quote standing for one.
+/// The name inside `"…"`, with a doubled quote standing for one.
 fn sql_unquoted(b: Bytes, at: Int, end: Int, acc: Bytes) -> String / {abort.raise} =
   if at >= end { string_of_bytes(acc) }
   else if bytes_at(b, at) == 34 && sql_byte_is(b, at + 1, 34) {
     sql_unquoted(b, at + 2, end, bytes_concat(acc, byte_of_int(34)))
   } else { sql_unquoted(b, at + 1, end, bytes_concat(acc, byte_of_int(bytes_at(b, at)))) }
 
-// `$1` … `$9`: where the digits end, or `None` when this is a dollar quote instead.
+/// `$1` … `$9`: where the digits end, or `None` when this is a dollar quote instead.
 fn sql_digit_end(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
   if at >= bytes_len(b) || !is_digit(bytes_at(b, at)) { None } else { Some(sql_past_number(b, at)) }
 
-// `$tag$ … $tag$`, where the tag may be empty.
+/// `$tag$ … $tag$`, where the tag may be empty.
 fn sql_dollar_quoted(
   b: Bytes,
   at: Int,
@@ -4200,7 +4279,7 @@ fn sql_tag_at(b: Bytes, tag: Bytes, at: Int) -> Bool / {abort.raise} =
   fold(range(0, bytes_len(tag)), true, |acc: Bool, i: Int|
     acc && bytes_at(b, at + i) == bytes_at(tag, i))
 
-// A number runs to the next byte that is not part of one, as postgres' own lexer reads it.
+/// A number runs to the next byte that is not part of one, as postgres' own lexer reads it.
 fn sql_past_number(b: Bytes, at: Int) -> Int / {abort.raise} =
   if at < bytes_len(b) && (is_word_byte(bytes_at(b, at)) || bytes_at(b, at) == 46) {
     sql_past_number(b, at + 1)
@@ -4215,8 +4294,8 @@ fn sql_past_word(b: Bytes, at: Int) -> Int / {abort.raise} =
 fn sql_is_name_byte(c: Int) -> Bool =
   (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c >= 128
 
-// What each token of `sql` is, which is what a test of the reader compares and what a refusal
-// quotes back.
+/// What each token of `sql` is, which is what a test of the reader compares and what a refusal
+/// quotes back.
 pub fn sql_token_summary(t: SqlTokAt) -> String =
   match t.tok {
     SqlWord(w) -> if w.quoted { "quoted:" ++ w.text } else { "word:" ++ w.text },
@@ -4227,6 +4306,7 @@ pub fn sql_token_summary(t: SqlTokAt) -> String =
     SqlSemi -> "semi",
   }
 
+/// `tokenize`, each token as `sql_token_summary` writes it.
 pub fn sql_tokenize_summary(sql: String) -> Result<List<String>, DbError> / {abort.raise} =
   match tokenize(sql) {
     Err(e) -> Err(e),
@@ -4235,16 +4315,16 @@ pub fn sql_tokenize_summary(sql: String) -> Result<List<String>, DbError> / {abo
 
 // --- The parser --------------------------------------------------------------------
 
-// What a statement does and which tables its text reaches. `written` and `read` are what the row of
-// the definition that reached the call site is checked against, so a construct the reader cannot
-// account for is refused rather than run with a footprint that under-reports.
+/// What a statement does and which tables its text reaches. `written` and `read` are what the row of
+/// the definition that reached the call site is checked against, so a construct the reader cannot
+/// account for is refused rather than run with a footprint that under-reports.
 pub type SqlScan = { kind: ScanKind, tables: SqlTables }
 
-// A statement that writes anywhere — including inside a `with` — is a write wherever it leads.
+/// A statement that writes anywhere — including inside a `with` — is a write wherever it leads.
 pub fn scan_writes(s: SqlScan) -> Bool = kind_writes(s.kind) || len(s.tables.written) > 0
 
-// The reader's position: the tokens left, the common table expressions in scope, and how deep the
-// statement has nested.
+/// The reader's position: the tokens left, the common table expressions in scope, and how deep the
+/// statement has nested.
 type SqlParser = { toks: List<SqlTokAt>, ctes: List<String>, depth: Int, end_pos: Int }
 
 fn sql_nesting() -> Int = 32
@@ -4320,7 +4400,7 @@ fn sql_identifier(
     None -> Err(sql_here(parser, what ++ " was expected here")),
   }
 
-// `[schema.]name`, answering the last segment.
+/// `[schema.]name`, answering the last segment.
 fn sql_qualified_name(
   parser: SqlParser,
   rest: Int,
@@ -4329,7 +4409,7 @@ fn sql_qualified_name(
   sql_more_names(first.parser, first.name, len(first.parser.toks) + 1)
 }
 
-// `left` bounds the rounds: each takes a token at least.
+/// `left` bounds the rounds: each takes a token at least.
 fn sql_more_names(
   parser: SqlParser,
   name: String,
@@ -4350,8 +4430,8 @@ fn sql_more_names(
     }
   }
 
-// `[AS] alias [(columns)]`, if there is one. A word that is reserved cannot be an alias without
-// `AS`, so a statement is not read as though a clause word were a name.
+/// `[AS] alias [(columns)]`, if there is one. A word that is reserved cannot be an alias without
+/// `AS`, so a statement is not read as though a clause word were a name.
 fn sql_alias(parser: SqlParser) -> Result<SqlParser, DbError> = {
   let as_ = sql_eat_word(parser, "as");
   if as_.ate {
@@ -4374,8 +4454,8 @@ fn sql_alias_columns(parser: SqlParser) -> Result<SqlParser, DbError> = {
   if open.ate { sql_name_list(open.parser, len(open.parser.toks) + 1) } else { Ok(parser) }
 }
 
-// A column list, which consumes its own `)`.
-// `left` bounds the rounds: each takes a token at least.
+/// A column list, which consumes its own `)`.
+/// `left` bounds the rounds: each takes a token at least.
 fn sql_name_list(parser: SqlParser, left: Int) -> Result<SqlParser, DbError> =
   if left <= 0 { Err(db_error("XX000", "", "more rounds than input")) } else {
     let first = sql_identifier(parser, "a column name")?;
@@ -4386,11 +4466,11 @@ fn sql_name_list(parser: SqlParser, left: Int) -> Result<SqlParser, DbError> =
 
 // --- What the reader vouches for ----------------------------------------------------
 
-// Words that may precede a `(` without being a call.
+/// Words that may precede a `(` without being a call.
 fn sql_syntactic() -> List<String> = ["array", "cast", "exists", "row", "any", "some", "nullif"]
 
-// Functions whose value is not a function of the program's state. Refused inside statement text:
-// a timestamp belongs in the row as a parameter, where the effect system can see it.
+/// Functions whose value is not a function of the program's state. Refused inside statement text:
+/// a timestamp belongs in the row as a parameter, where the effect system can see it.
 fn sql_nondeterministic() -> List<String> =
   [
     "now",
@@ -4407,8 +4487,8 @@ fn sql_nondeterministic() -> List<String> =
     "gen_random_uuid",
   ]
 
-// The calls a statement may make. A call is the one place an admitted statement can reach outside
-// its own table set, so the list is closed.
+/// The calls a statement may make. A call is the one place an admitted statement can reach outside
+/// its own table set, so the list is closed.
 fn sql_callable() -> List<String> =
   [
     "avg",
@@ -4477,7 +4557,7 @@ fn sql_callable() -> List<String> =
     "to_jsonb",
   ]
 
-// Words that end an expression at depth zero.
+/// Words that end an expression at depth zero.
 fn sql_clause_words() -> List<String> =
   [
     "from",
@@ -4554,8 +4634,8 @@ fn sql_reserved(word: String) -> Bool =
       word,
     )
 
-// A word followed by `(` is a call unless it is reserved, a syntactic form, or one of the names
-// above. Everything else is refused where it is written.
+/// A word followed by `(` is a call unless it is reserved, a syntactic form, or one of the names
+/// above. Everything else is refused where it is written.
 fn sql_check_call(parser: SqlParser) -> Result<SqlParser, DbError> =
   match sql_head(parser.toks) {
     None -> Ok(parser),
@@ -4612,8 +4692,8 @@ fn sql_statement(
     }
   }
 
-// `with` is the one admitted construct that can hide a verb: a CTE's body is a whole statement, so
-// a `delete` inside one makes a statement led by `select` a write.
+/// `with` is the one admitted construct that can hide a verb: a CTE's body is a whole statement, so
+/// a `delete` inside one makes a statement led by `select` a write.
 fn sql_with_clause(
   parser: SqlParser,
   left: Int,
@@ -4689,13 +4769,13 @@ fn sql_cte(
     }
   }
 
-// The column list after a table name, if there is one.
+/// The column list after a table name, if there is one.
 fn sql_after_columns(columns: { parser: SqlParser, ate: Bool }) -> Result<SqlParser, DbError> =
   if columns.ate { sql_name_list(columns.parser, len(columns.parser.toks) + 1) }
   else { Ok(columns.parser) }
 
-// A nested statement, which inherits the enclosing `WITH`'s names: a reference to a CTE names that
-// expression rather than a table.
+/// A nested statement, which inherits the enclosing `WITH`'s names: a reference to a CTE names that
+/// expression rather than a table.
 fn sql_without_names(tables: SqlTables, names: List<String>) -> SqlTables =
   {
     written: fold(names, tables.written, |acc: List<String>, n: String| sql_without_table(acc, n)),
@@ -5134,7 +5214,7 @@ fn sql_insert(
     }
   }
 
-// `default values`, or a `select` that answers the rows.
+/// `default values`, or a `select` that answers the rows.
 fn sql_insert_source(
   default: { parser: SqlParser, ate: Bool },
   after_columns: SqlParser,
@@ -5230,8 +5310,8 @@ fn sql_returning(
     else { Ok({ parser: parser, tables: tables }) }
   }
 
-// `values (…), (…)`: the rows are expressions, but a subquery inside one is still a statement.
-// `left` bounds the rows: each but the last takes its comma.
+/// `values (…), (…)`: the rows are expressions, but a subquery inside one is still a statement.
+/// `left` bounds the rows: each but the last takes its comma.
 fn sql_values_rows(
   parser: SqlParser,
   tables: SqlTables,
@@ -5251,7 +5331,7 @@ fn sql_values_rows(
     }
   }
 
-// `left` bounds the rounds: each takes a token at least.
+/// `left` bounds the rounds: each takes a token at least.
 fn sql_row_body(
   parser: SqlParser,
   tables: SqlTables,
@@ -5277,8 +5357,8 @@ fn sql_row_body(
 
 // --- Expressions ----------------------------------------------------------------------
 
-// Walk an expression, following subqueries, up to the next stop word at depth zero. This is where
-// a subquery's tables are absorbed: a `select` inside a `where` reaches tables of its own.
+/// Walk an expression, following subqueries, up to the next stop word at depth zero. This is where
+/// a subquery's tables are absorbed: a `select` inside a `where` reaches tables of its own.
 fn sql_skip_expr(
   parser: SqlParser,
   tables: SqlTables,
@@ -5322,8 +5402,8 @@ fn sql_skip_word(
     }
   }
 
-// A `(` inside an expression opens either a subquery, whose tables count, or a group, whose
-// contents are walked but whose depth the stops do not see into.
+/// A `(` inside an expression opens either a subquery, whose tables count, or a group, whose
+/// contents are walked but whose depth the stops do not see into.
 fn sql_skip_paren(
   parser: SqlParser,
   tables: SqlTables,
@@ -5357,7 +5437,7 @@ fn sql_skip_paren(
     }
   }
 
-// The body of a group, from just after its `(`, to just past the `)` that closes it.
+/// The body of a group, from just after its `(`, to just past the `)` that closes it.
 fn sql_skip_group(
   parser: SqlParser,
   tables: SqlTables,
@@ -5400,7 +5480,7 @@ fn sql_skip_group(
     }
   }
 
-// The body of a parenthesised group whose opening paren is already eaten.
+/// The body of a parenthesised group whose opening paren is already eaten.
 fn sql_skip_parens(
   parser: SqlParser,
   tables: SqlTables,
@@ -5415,13 +5495,13 @@ fn sql_skip_parens(
 
 // --- The entry point ------------------------------------------------------------------
 
-// Every cycle through the reader takes a token, so a path meets each of its thirty functions once
-// per token at most: the room the reader starts with is the tokens and one, thirty times over.
+/// Every cycle through the reader takes a token, so a path meets each of its thirty functions once
+/// per token at most: the room the reader starts with is the tokens and one, thirty times over.
 fn reader_functions() -> Int = 30
 
-// What `sql` does and which tables it reaches, or why it is refused. Nothing below the driver's
-// own read of the verb depends on a guess: an unmodelled construct is a table set that would be
-// wrong, and a wrong table set is a scheduler that runs two writers beside each other.
+/// What `sql` does and which tables it reaches, or why it is refused. Nothing below the driver's
+/// own read of the verb depends on a guess: an unmodelled construct is a table set that would be
+/// wrong, and a wrong table set is a scheduler that runs two writers beside each other.
 pub fn scan_statement(sql: String) -> Result<SqlScan, DbError> / {abort.raise} =
   match tokenize(sql) {
     Err(e) -> Err(e),
@@ -5434,8 +5514,8 @@ pub fn scan_statement(sql: String) -> Result<SqlScan, DbError> / {abort.raise} =
     },
   }
 
-// A statement ends where the first one does: a `;` after it is a second statement, and any other
-// token is a construct the reader did not account for.
+/// A statement ends where the first one does: a `;` after it is a second statement, and any other
+/// token is a construct the reader did not account for.
 fn sql_nothing_left(parser: SqlParser) -> Result<(), DbError> =
   match sql_head(parser.toks) {
     None -> Ok(()),
@@ -5445,9 +5525,9 @@ fn sql_nothing_left(parser: SqlParser) -> Result<(), DbError> =
 
 type Ran = { session: pg::Session, answer: Answer }
 
-// The statement's own check, before it takes a connection. A statement's tables are a function of
-// its text rather than of the call site's label, so a join reaches tables the label never named —
-// and the atom the scheduler records is the label's, so the label has to be one of them.
+/// The statement's own check, before it takes a connection. A statement's tables are a function of
+/// its text rather than of the call site's label, so a join reaches tables the label never named —
+/// and the atom the scheduler records is the label's, so the label has to be one of them.
 fn check_statement(s: Stmt, reads_only: Bool, label: String) -> Unit / {abort.raise} = {
   let scanned = match scan_statement(s.sql) { Err(e) -> panic(e.detail), Ok(scanned) -> scanned };
   if !contains(scan_table_names(scanned.tables), label) {
@@ -5464,7 +5544,7 @@ fn check_statement(s: Stmt, reads_only: Bool, label: String) -> Unit / {abort.ra
   }
 }
 
-// What a statement touches, for a refusal that says why a label does not fit.
+/// What a statement touches, for a refusal that says why a label does not fit.
 fn describe_tables(t: SqlTables) -> String =
   if len(t.written) > 0 && len(t.read) > 0 {
     "`" ++ string::join(t.written, "`, `") ++ "` (written) and `" ++ string::join(t.read, "`, `")
@@ -5495,7 +5575,7 @@ fn run_checked(
       }),
   }
 
-// A statement the driver itself sends.
+/// A statement the driver itself sends.
 fn control(
   session: pg::Session,
   sql: String,
@@ -5525,8 +5605,8 @@ fn linked(
     },
   }
 
-// An exchange outside any transaction that failed: a refusal leaves the server talking on the
-// connection, and anything else ends it.
+/// An exchange outside any transaction that failed: a refusal leaves the server talking on the
+/// connection, and anything else ends it.
 fn let_go(
   l: Link,
   e: pg::ClientError,
@@ -5546,12 +5626,12 @@ fn let_go(
     },
   }
 
-// A transaction's scope after an exchange on its connection, `deeper` scopes more or fewer.
+/// A transaction's scope after an exchange on its connection, `deeper` scopes more or fewer.
 fn kept(scope: Scope, session: pg::Session, deeper: Int) -> Scope =
   { ..scope, session: Some(session), depth: scope.depth + deeper, busy: false }
 
-// An exchange inside a transaction that failed: a refusal leaves the transaction where it stood,
-// and anything else loses its connection and the transaction with it.
+/// An exchange inside a transaction that failed: a refusal leaves the transaction where it stood,
+/// and anything else loses its connection and the transaction with it.
 fn failed_within(
   scope: Scope,
   session: pg::Session,
@@ -5657,12 +5737,12 @@ fn nesting(
     Err(e) -> failed_within(scope, session, e, cfg, 0),
   }
 
-// A transaction that has ended, its connection back in the pool.
+/// A transaction that has ended, its connection back in the pool.
 fn ended(scope: Scope, session: pg::Session, answer: Answer) -> Left =
   { answer: answer, n: scope.n, scope: None, freed: Some(Reuse({ n: scope.n, session: session })) }
 
-// A `commit` closes its scope whatever the server answers: a savepoint's leaves the scope around
-// it, and a transaction's gives its connection back.
+/// A `commit` closes its scope whatever the server answers: a savepoint's leaves the scope around
+/// it, and a transaction's gives its connection back.
 fn committing(
   cfg: Server,
   scope: Scope,
@@ -5685,7 +5765,7 @@ fn committing(
     }
   }
 
-// The server ends an aborted transaction's `COMMIT` with a rollback, and no error.
+/// The server ends an aborted transaction's `COMMIT` with a rollback, and no error.
 fn committed(tag: String) -> Answer =
   if tag == "ROLLBACK" { Failed(in_failed_txn()) } else { Count(0) }
 
@@ -5713,8 +5793,8 @@ fn aborting(
     }
   }
 
-// The `db` effect served from a live server. `nonce` is the caller's, so a run's seed decides it
-// and a test can fix it; each connection's nonce is that text and its own number.
+/// The `db` effect served from a live server. `nonce` is the caller's, so a run's seed decides it
+/// and a test can fix it; each connection's nonce is that text and its own number.
 pub fn serve<a | e>(
   cfg: Server,
   size: Int,
@@ -5826,11 +5906,11 @@ pub fn serve<a | e>(
 
 // --- One statement for a batch -----------------------------------------------------
 
-// The statement once for each ask, joined with `union all`: each arm's placeholders numbered on
-// from the asks before it, and each row marked with the ask it answers and its place among that
-// ask's rows, so the answers come apart in order. `None` when the asks cannot share one statement:
-// text the reader cannot take apart, an ask whose parameters are not the placeholders', or more
-// parameters than one statement may carry.
+/// The statement once for each ask, joined with `union all`: each arm's placeholders numbered on
+/// from the asks before it, and each row marked with the ask it answers and its place among that
+/// ask's rows, so the answers come apart in order. `None` when the asks cannot share one statement:
+/// text the reader cannot take apart, an ask whose parameters are not the placeholders', or more
+/// parameters than one statement may carry.
 fn coalesced(
   s: Stmt,
   each: List<List<Param>>,
@@ -5861,7 +5941,7 @@ fn coalesced(
     },
   }
 
-// The statement's text short of a closing `;`; `None` when a `;` comes before its end.
+/// The statement's text short of a closing `;`; `None` when a `;` comes before its end.
 fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> / {abort.raise} = {
   let semis = filter(range(0, len(ts)), |i: Int|
     match list_at(ts, i) { Some(t) -> sql_is_semi(t.tok), None -> false });
@@ -5880,7 +5960,7 @@ fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> / {abort.ra
 fn placeholder_number(text: String) -> Int / {abort.raise} =
   match string::int_of_string(string_slice(text, 1, string_len(text))) { Some(n) -> n, None -> 0 }
 
-// Each placeholder `$k` of `body` written `$(k + by)`.
+/// Each placeholder `$k` of `body` written `$(k + by)`.
 fn renumbered(body: String, places: List<SqlTokAt>, by: Int) -> String / {abort.raise} = {
   let b = bytes_of_string(body);
   let walked = fold(places, { at: 0, out: b"" }, |acc: { at: Int, out: Bytes }, t: SqlTokAt|
@@ -5897,7 +5977,7 @@ fn renumbered(body: String, places: List<SqlTokAt>, by: Int) -> String / {abort.
   string_of_bytes(bytes_concat(walked.out, bytes_slice(b, walked.at, bytes_len(b))))
 }
 
-// The rows of a batch's statement, each ask's in order and without the batch's own columns.
+/// The rows of a batch's statement, each ask's in order and without the batch's own columns.
 fn split_asks(rows: List<Row>, asks: Int) -> List<Answer> = {
   let held = fold(rows, map_new(), |acc: Map<Int, List<Row>>, row: Row|
     match map_get(row, "ply.ask") {
@@ -5915,8 +5995,8 @@ fn split_asks(rows: List<Row>, asks: Int) -> List<Answer> = {
   map(range(0, asks), |i: Int| Rows(match map_get(held, i) { Some(xs) -> xs, None -> [] }))
 }
 
-// Every connection the pool still holds once its body has returned, told it is done and closed:
-// the idle ones, and one a body returned from inside its transaction, which the server rolls back.
+/// Every connection the pool still holds once its body has returned, told it is done and closed:
+/// the idle ones, and one a body returned from inside its transaction, which the server rolls back.
 fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link], abort.raise} = {
   fold(p.idle, (), |done: Unit, l: Link| pg::finish[link](l.session, cfg.client));
   fold(p.open, (), |done: Unit, scope: Scope|
@@ -5930,7 +6010,7 @@ fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link], ab
 
 type Split = { head: String, tail: String }
 
-// Around the first `sep`; the URL grammar needs no regular expressions.
+/// Around the first `sep`; the URL grammar needs no regular expressions.
 fn split_at(text: String, sep: String) -> Option<Split> / {abort.raise} =
   match bytes_index_of(bytes_of_string(text), bytes_of_string(sep)) {
     None -> None,
@@ -5944,8 +6024,8 @@ fn split_at(text: String, sep: String) -> Option<Split> / {abort.raise} =
     },
   }
 
-// Around the last `sep`, which is what separates the userinfo from the host: a password may
-// hold an `@`.
+/// Around the last `sep`, which is what separates the userinfo from the host: a password may
+/// hold an `@`.
 fn rsplit_at(text: String, sep: String) -> Option<Split> / {abort.raise} = {
   let whole = bytes_of_string(text);
   let needle = bytes_of_string(sep);
@@ -5961,7 +6041,7 @@ fn rsplit_at(text: String, sep: String) -> Option<Split> / {abort.raise} = {
   }
 }
 
-// `%XX` as the byte it names; anything else is itself, so a password may hold a `:` or an `@`.
+/// `%XX` as the byte it names; anything else is itself, so a password may hold a `:` or an `@`.
 fn unpercent(text: String) -> Result<String, String> / {abort.raise} =
   match unpercent_from(bytes_of_string(text), 0, b"") {
     Err(why) -> Err(why),
@@ -5993,6 +6073,10 @@ fn url_refusal(url: String) -> String =
     "this is libpq's keyword/value form; the URI form is `postgres://user@host:5432/database`"
   } else { "a connection string begins `postgres://`, as in `postgres://user@host:5432/database`" }
 
+/// A `Server` from `postgres://user[:password]@host[:port]/database`, whose query may set
+/// `statement_timeout`, `idle_in_transaction_session_timeout` (whole milliseconds, `0` for none, at
+/// most 2147483647), `application_name` and `sslmode=disable|prefer` (read and nothing more: TLS to
+/// postgres is not wired up). Any other key, or a key given twice, is refused.
 pub fn server_of(url: String) -> Result<Server, String> / {abort.raise} =
   match split_at(url, "://") {
     None -> Err(url_refusal(url)),
@@ -6037,7 +6121,7 @@ fn hostport_of(text: String) -> Result<HostPort, String> / {abort.raise} =
     },
   }
 
-// A decimal number, and nothing that merely begins with one.
+/// A decimal number, and nothing that merely begins with one.
 fn natural_of(text: String) -> Option<Int> / {abort.raise} =
   if string_len(text) == 0 { None } else {
     let value = nat_of_text(text);
@@ -6083,8 +6167,8 @@ fn server_parts(rest: String) -> Result<Server, String> / {abort.raise} = {
   }
 }
 
-// `sslmode` is read and nothing more: TLS to postgres is not wired up. Every other parameter is a
-// setting the server is told at start-up, under the name postgres gives it.
+/// `sslmode` is read and nothing more: TLS to postgres is not wired up. Every other parameter is a
+/// setting the server is told at start-up, under the name postgres gives it.
 fn with_query(query: String, s: Server) -> Result<Server, String> / {abort.raise} =
   if string_len(query) == 0 { Ok(s) } else {
     fold(string_split(query, "&"), Ok(s), |acc: Result<Server, String>, pair: String|
@@ -6131,7 +6215,7 @@ fn with_setting(s: Server, key: String, value: String) -> Result<Server, String>
 fn once<a>(given: Option<a>, key: String, set: Server) -> Result<Server, String> =
   match given { Some(_) -> Err("`" ++ key ++ "` is given twice"), None -> Ok(set) }
 
-// Postgres reads a timeout written without a unit as milliseconds, and `0` as none at all.
+/// Postgres reads a timeout written without a unit as milliseconds, and `0` as none at all.
 fn millis_of(key: String, text: String) -> Result<Int, String> / {abort.raise} =
   match natural_of(text) {
     None -> Err("`" ++ key ++ "=" ++ text ++ "`: a timeout is a whole number of milliseconds"),
@@ -6146,8 +6230,8 @@ fn millis_of(key: String, text: String) -> Result<Int, String> / {abort.raise} =
 
 fn most_millis() -> Int = 2147483647
 
-// The `db` effect served from a connection string: the driver, wrapped for a program that was
-// told where the server is rather than handling the effect's clauses itself.
+/// The `db` effect served from a connection string: the driver, wrapped for a program that was
+/// told where the server is rather than handling the effect's clauses itself.
 pub fn with_server<a | e>(
   url: String,
   size: Int,
@@ -6680,8 +6764,8 @@ fn assert_err(url: String, wanted: String) -> Unit / {abort.raise} =
 // statement the script names is refused. A statement's reply is read after a `task.yield`, which is
 // where a socket parks the task waiting on it.
 
-// A refusal the script holds for the first statement that begins with `on`; a `fatal` one ends the
-// session rather than the statement.
+/// A refusal the script holds for the first statement that begins with `on`; a `fatal` one ends the
+/// session rather than the statement.
 type Refusal = {
   on: String,
   code: String,
@@ -6703,9 +6787,9 @@ fn refuse(
 fn hang_up(on: String, code: String) -> Refusal =
   { on: on, code: code, constraint: "", message: "terminating connection", detail: "", fatal: true }
 
-// One connection: the bytes sent that are not yet a whole message, the replies not yet read, the
-// transaction's status (73 idle, 84 in one, 69 in a failed one), the statement the extended cycle
-// parsed, what it was sent, and whether the server still talks on it.
+/// One connection: the bytes sent that are not yet a whole message, the replies not yet read, the
+/// transaction's status (73 idle, 84 in one, 69 in a failed one), the statement the extended cycle
+/// parsed, what it was sent, and whether the server still talks on it.
 type Wire = {
   inbox: Bytes,
   outbox: Bytes,
@@ -6772,7 +6856,7 @@ fn t_tagged(tag: String, status: Int) -> Said / {abort.raise} =
 
 fn t_in_failed() -> Said / {abort.raise} = { bytes: t_error("ERROR", t_aborted()), status: 69 }
 
-// Rolling back to a savepoint un-aborts the transaction, and the release that follows closes it.
+/// Rolling back to a savepoint un-aborts the transaction, and the release that follows closes it.
 fn t_rolled_back_to() -> Said / {abort.raise} =
   { bytes: bytes_concat(t_done("ROLLBACK"), t_done("RELEASE")), status: 84 }
 
@@ -6806,7 +6890,7 @@ fn t_tag(sql: String) -> String =
   else if string_starts_with(sql, "update") { "UPDATE 1" }
   else { "DELETE 1" }
 
-// An error in a transaction fails it, and a `COMMIT` that errs ends it.
+/// An error in a transaction fails it, and a `COMMIT` that errs ends it.
 fn t_after_error(sql: String, status: Int) -> Int =
   if sql == "commit" { 73 } else if status == 84 { 69 } else { status }
 
@@ -6862,7 +6946,7 @@ fn t_statement(
 fn t_cstring(b: Bytes, at: Int) -> String / {abort.raise} =
   match pg::read_cstring(b, at) { Some(c) -> c.text, None -> "" }
 
-// A `Query` or a `Parse` while a reply is unread is a second conversation on the connection.
+/// A `Query` or a `Parse` while a reply is unread is a second conversation on the connection.
 fn t_message(w: Wire, refusals: List<Refusal>, kind: Int, body: Bytes) -> Fed / {abort.raise} =
   if (kind == 81 || kind == 80) && bytes_len(w.outbox) > 0 {
     panic("a connection was sent a statement before its last one was answered")
@@ -6876,8 +6960,8 @@ fn t_message(w: Wire, refusals: List<Refusal>, kind: Int, body: Bytes) -> Fed / 
   else if kind == 88 { { wire: { ..w, open: false }, refusals: refusals } }
   else { { wire: w, refusals: refusals } }
 
-// Every whole message in the inbox; the start-up message has no kind byte, and a length under
-// its own four bytes is no message. `left` bounds the rounds: each takes four bytes at least.
+/// Every whole message in the inbox; the start-up message has no kind byte, and a length under
+/// its own four bytes is no message. `left` bounds the rounds: each takes four bytes at least.
 fn t_feed(w: Wire, refusals: List<Refusal>, left: Int) -> Fed / {abort.raise} =
   if left <= 0 { panic("more rounds than input") } else {
     if !w.started {
@@ -6934,8 +7018,8 @@ fn t_closed(f: Fake, c: Int) -> Fake / {abort.raise} =
     Some(w) -> { ..f, wires: list_set(f.wires, c, { ..w, open: false }) },
   }
 
-// `body` served by `serve` over the script; a test runs it in a `simulate` region, so every
-// interleaving of its tasks at the replies is run.
+/// `body` served by `serve` over the script; a test runs it in a `simulate` region, so every
+/// interleaving of its tasks at the replies is run.
 fn over_script<a | e>(
   size: Int,
   refusals: List<Refusal>,
@@ -6965,7 +7049,7 @@ fn over_script<a | e>(
     { value: value, wires: cell_get(fake).wires }
   } }
 
-// A connection past its greeting, whose replies park the task reading them.
+/// A connection past its greeting, whose replies park the task reading them.
 fn t_talking(f: Fake, c: Int) -> Bool =
   match list_at(f.wires, c) { Some(w) -> len(w.said) > 0, None -> false }
 
@@ -6975,7 +7059,7 @@ fn t_insert(sku: String) -> Stmt = stmt("insert into part (sku) values ('" ++ sk
 
 fn t_begin(level: String) -> String = "begin isolation level " ++ level ++ " read write"
 
-// Every connection's statements, cut where a transaction ends.
+/// Every connection's statements, cut where a transaction ends.
 fn t_runs(wires: List<Wire>) -> List<List<String>> =
   fold(wires, [], |acc: List<List<String>>, w: Wire| concat(acc, t_cut(w.said, [], [])))
 
@@ -6989,7 +7073,7 @@ fn t_cut(said: List<String>, run: List<String>, acc: List<List<String>>) -> List
 fn t_has_run(runs: List<List<String>>, run: List<String>) -> Bool =
   fold(runs, false, |acc: Bool, r: List<String>| acc || r == run)
 
-// A serialization failure is the server asking for the transaction again, from its `begin`.
+/// A serialization failure is the server asking for the transaction again, from its `begin`.
 fn retried(
   left: Int,
   seen: List<String>,
@@ -7244,7 +7328,7 @@ test "a connection lost inside a transaction fails the rest of it, and nothing o
 
 // --- Batching's own tests --------------------------------------------------------
 
-// A store of `id * 10` for every id, answering each ask alone, counting what it was asked.
+/// A store of `id * 10` for every id, answering each ask alone, counting what it was asked.
 fn tens<a>(
   go: () -> a / {db.query[items], db.batch[items], abort.raise, diverges},
 ) -> { value: a, queries: Int, batches: Int } / {abort.raise, diverges} =
