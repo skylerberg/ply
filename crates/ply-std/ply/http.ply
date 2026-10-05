@@ -1,4 +1,9 @@
-// std.http — HTTP/1.1 framing.
+//! HTTP/1.1: messages as values, framing, a serve loop and a client.
+//!
+//! Parsing and encoding are pure; the serve loop and the client perform `net` under the labels a caller
+//! fills. An ambiguous message is refused and the connection closed, and every loop is bounded by
+//! `Limits`. Every connection the module opens or accepts is closed however serving it ends, an `app`
+//! a clause unwinds out of included. There is no compression, `Upgrade` or `Content-Encoding`.
 
 import std.bytes (int_of_ascii, is_digit)
 import std.net (net, send_all)
@@ -6,46 +11,65 @@ import std.list (contains)
 
 // --- The message ------------------------------------------------------------
 
+/// A request's method; `Other` holds any token the standard methods are not.
 pub type Method = | Get | Head | Post | Put | Patch | Delete | Options | Other(String)
 
+/// The protocol version a message names; an HTTP/1.0 connection closes after one answer.
 pub type Version = | Http10 | Http11
 
-// Names are lowercased on parse; a name may repeat, so it maps to its field lines in order.
+/// Names are lowercased on parse; a name may repeat, so it maps to its field lines in order.
 pub type Headers = Map<String, List<String>>
 
+/// A request as the server reads it, or as a client builds it with `request_to`.
 pub type Request = {
   method: Method,
+  /// The request target as sent: the path with its query.
   target: String,
   path: String,
+  /// What follows the `?`, without it; empty when there is none.
   query: String,
+  /// The `Host` the request names.
   authority: String,
   version: Version,
   headers: Headers,
+  /// The fields a chunked body sent after its last chunk.
   trailers: Headers,
   body: Bytes,
 }
 
+/// A response to encode, or one a client read; `encode` adds the framing fields.
 pub type Response = { status: Int, headers: Headers, body: Bytes }
 
 // --- Limits -----------------------------------------------------------------
 
+/// What one connection may cost: a message past a size bound is refused, and a wait past a deadline
+/// ends it. Every limit must be positive (`check_limits`).
 pub type Limits = {
+  /// Bytes in the request line (414 past it), and in a response's status line.
   max_request_line: Int,
+  /// Bytes in the header fields after the request line (431 past it).
   max_header_bytes: Int,
   max_header_count: Int,
+  /// Bytes in a body, decoded (413 past it).
   max_body: Int,
   max_chunk_size: Int,
   max_chunk_line: Int,
   max_trailer_bytes: Int,
+  /// Requests one connection answers before the server closes it.
   max_keep_alive: Int,
+  /// Chunks one streamed response writes.
   max_stream_chunks: Int,
+  /// From a head's first byte to its last (408 past it).
   header_timeout_ms: Int,
   body_timeout_ms: Int,
+  /// The wait for the next request on a kept-alive connection, which closes it silently.
   idle_timeout_ms: Int,
   write_timeout_ms: Int,
   connect_timeout_ms: Int,
 }
 
+/// Eight KiB request lines, 64 KiB of headers, 1 MiB bodies, five-second head and idle deadlines and
+/// thirty-second body and write ones.
 pub fn default_limits() -> Limits =
   {
     max_request_line: 8192,
@@ -64,7 +88,7 @@ pub fn default_limits() -> Limits =
     connect_timeout_ms: 5000,
   }
 
-// A non-positive limit is a configuration mistake, so it panics at `serve` naming the field.
+/// A non-positive limit is a configuration mistake, so it panics at `serve` naming the field.
 pub fn check_limits(l: Limits) -> Unit / {abort.raise} = {
   bad_limit("max_request_line", l.max_request_line);
   bad_limit("max_header_bytes", l.max_header_bytes);
@@ -90,44 +114,49 @@ fn bad_limit(field: String, value: Int) -> Unit / {abort.raise} =
     )
   } else { () }
 
-// The most `net.recv` calls one head or body is read in; a deadline is split into this many slices.
+/// The most `net.recv` calls one head or body is read in; a deadline is split into this many slices.
 pub fn max_reads() -> Int = 2048
 
-// The most chunks one `body_step` will decode before answering `Await`.
+/// The most chunks one `body_step` will decode before answering `Await`.
 pub fn chunk_budget() -> Int = 512
 
-// The most bytes one `net.recv` asks for.
+/// The most bytes one `net.recv` asks for.
 pub fn read_size() -> Int = 65536
 
 // --- Refusals ---------------------------------------------------------------
 
-// Every framing refusal closes the connection.
+/// Every framing refusal closes the connection.
 pub type Refusal = { status: Int, reason: String }
 
-// `UntilClose` is a response without a length field: a client reads it until the server closes.
+/// `UntilClose` is a response without a length field: a client reads it until the server closes.
 pub type Framing = | NoBody | Length(Int) | Chunked | UntilClose
 
+/// A parsed request head: the request without its body, how the body is framed, and how many bytes of
+/// the buffer the head took.
 pub type Head = {
   request: Request,
   framing: Framing,
   consumed: Int,
   keep_alive: Bool,
+  /// The client sent `Expect: 100-continue` and waits for `continue_response` before its body.
   expects_continue: Bool,
 }
 
+/// `Incomplete` asks for more bytes; `Refused` names the status the connection is closed with.
 pub type HeadResult = | Incomplete | Parsed(Head) | Refused(Refusal)
 
 fn refuse(status: Int, reason: String) -> HeadResult = Refused({ status: status, reason: reason })
 
+/// Headers with no field.
 pub fn empty_headers() -> Headers = map_new()
 
 // --- Byte classes -----------------------------------------------------------
 
-// CR, LF, DEL and every other control byte except HTAB: what ends or is illegal in a header line.
+/// CR, LF, DEL and every other control byte except HTAB: what ends or is illegal in a header line.
 fn line_stops() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
 
-// RFC 9110's `tchar`. A field name and a method are tokens and nothing else.
+/// RFC 9110's `tchar`. A field name and a method are tokens and nothing else.
 fn tchars() -> Bytes =
   b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -145,14 +174,14 @@ fn all_digits(b: Bytes) -> Bool / {abort.raise} =
 
 // --- Lines ------------------------------------------------------------------
 
-// A line is terminated by CRLF and by nothing else.
+/// A line is terminated by CRLF and by nothing else.
 pub type Line =
   | LineAt({ start: Int, stop: Int, next: Int })
   | LineIncomplete
   | LineTooLong
   | LineIllegal({ at: Int, why: String })
 
-// The scan is one byte wider than `budget`, so a terminator exactly at the bound differs from none.
+/// The scan is one byte wider than `budget`, so a terminator exactly at the bound differs from none.
 fn read_line(buf: Bytes, from: Int, budget: Int) -> Line / {abort.raise} = {
   let n = bytes_len(buf);
   if from > n { LineIncomplete } else {
@@ -176,6 +205,8 @@ fn line_at(buf: Bytes, from: Int, stop: Int, n: Int) -> Line / {abort.raise} = {
 
 // --- The head ---------------------------------------------------------------
 
+/// The request head at the start of `buf`, refused rather than guessed at when it is ambiguous: a bare
+/// LF, a duplicate `Content-Length`, both a length and chunked framing, an unknown transfer coding.
 pub fn parse_head(buf: Bytes, limits: Limits) -> HeadResult / {abort.raise} =
   match read_line(buf, 0, limits.max_request_line) {
     LineIncomplete -> Incomplete,
@@ -239,7 +270,7 @@ type Start = {
 
 // --- The request line -------------------------------------------------------
 
-// HTAB is legal in a field value but not here: splitting a request line on it is a smuggle vector.
+/// HTAB is legal in a field value but not here: splitting a request line on it is a smuggle vector.
 fn request_line(line: Bytes) -> Result<Start, Refusal> / {abort.raise} = {
   let n = bytes_len(line);
   let sp1 = bytes_scan_until(line, 0, b" ", n);
@@ -275,7 +306,7 @@ fn request_parts(
     with_target(method_of(method), target, v)
   }
 
-// A token-valid unknown method parses as `Other(name)`, and routing answers 405.
+/// A token-valid unknown method parses as `Other(name)`, and routing answers 405.
 fn method_of(m: Bytes) -> Method / {abort.raise} =
   if m == b"GET" { Get }
   else if m == b"POST" { Post }
@@ -286,6 +317,7 @@ fn method_of(m: Bytes) -> Method / {abort.raise} =
   else if m == b"OPTIONS" { Options }
   else { Other(string_of_bytes(m)) }
 
+/// The method as the request line spells it.
 pub fn method_name(m: Method) -> String =
   match m {
     Get -> "GET",
@@ -298,7 +330,7 @@ pub fn method_name(m: Method) -> String =
     Other(name) -> name,
   }
 
-// No version is HTTP/0.9, which is not served; an unknown `HTTP/x.y` is well formed, so 505.
+/// No version is HTTP/0.9, which is not served; an unknown `HTTP/x.y` is well formed, so 505.
 fn version_of(v: Bytes) -> Result<Version, Refusal> / {abort.raise} =
   if v == b"HTTP/1.1" { Ok(Http11) }
   else if v == b"HTTP/1.0" { Ok(Http10) }
@@ -321,7 +353,7 @@ fn with_target(
     Err({ status: 400, reason: "a request target carries no fragment" })
   } else { target_form(method, target, version) }
 
-// Origin-form, absolute-form, or asterisk-form and only with OPTIONS.
+/// Origin-form, absolute-form, or asterisk-form and only with OPTIONS.
 fn target_form(
   method: Method,
   target: Bytes,
@@ -365,7 +397,7 @@ fn origin_form(method: Method, target: Bytes, version: Version) -> Start / {abor
   )
 }
 
-// The target's authority is the request's (RFC 9112 §3.2.2); `Host` stays visible for comparison.
+/// The target's authority is the request's (RFC 9112 §3.2.2); `Host` stays visible for comparison.
 fn absolute_form(
   method: Method,
   target: Bytes,
@@ -431,7 +463,7 @@ type FieldsResult = | FieldsDone(FieldsBlock) | FieldsIncomplete | FieldsRefused
 fn fields(buf: Bytes, block_start: Int, from: Int, limits: Limits) -> FieldsResult / {abort.raise} =
   field_lines(buf, block_start, from, limits, empty_headers(), 0)
 
-// A line's scan budget is the block's remainder, so a long line costs the bound, not the buffer.
+/// A line's scan budget is the block's remainder, so a long line costs the bound, not the buffer.
 fn field_lines(
   buf: Bytes,
   block_start: Int,
@@ -530,22 +562,26 @@ fn add_field(headers: Headers, name: String, value: String) -> Headers =
 
 // --- Reading a header -------------------------------------------------------
 
-// Every field line under this name, in order of appearance.
+/// Every field line under this name, in order of appearance.
 pub fn header_lines(h: Headers, name: String) -> List<String> =
   match map_get(h, name) { Some(vs) -> vs, None -> [] }
 
+/// The first field line under `name`, which must be lowercase, as parsed names are.
 pub fn header(h: Headers, name: String) -> Option<String> =
   match map_get(h, name) { Some([v, ..]) -> Some(v), _ -> None }
 
+/// Whether a field named `name` (lowercase) is present.
 pub fn has_header(headers: Headers, name: String) -> Bool = map_contains(headers, name)
 
+/// `headers` with every line under `name` replaced by `value`; the name is lowercased.
 pub fn set_header(headers: Headers, name: String, value: String) -> Headers =
   map_insert(headers, string_lower(name), [value])
 
+/// `headers` with `value` appended under `name`, keeping the lines already there.
 pub fn add_header(headers: Headers, name: String, value: String) -> Headers =
   add_field(headers, string_lower(name), value)
 
-// A comma-separated list field, split, trimmed and lowercased.
+/// A comma-separated list field, split, trimmed and lowercased.
 fn list_field(headers: Headers, name: String) -> List<String> / {abort.raise} =
   fold(header_lines(headers, name), [], |acc: List<String>, line: String|
     fold(string_split(line, ","), acc, |inner: List<String>, part: String|
@@ -553,7 +589,7 @@ fn list_field(headers: Headers, name: String) -> List<String> / {abort.raise} =
 
 // --- Host -------------------------------------------------------------------
 
-// An HTTP/1.1 request needs exactly one `Host`.
+/// An HTTP/1.1 request needs exactly one `Host`.
 fn host_of(start: Start, headers: Headers) -> Result<String, Refusal> = {
   let lines = header_lines(headers, "host");
   if len(lines) > 1 { Err({ status: 400, reason: "a request carries at most one `Host` field" }) }
@@ -570,7 +606,7 @@ fn host_of(start: Start, headers: Headers) -> Result<String, Refusal> = {
 
 // --- Framing ----------------------------------------------------------------
 
-// Where RFC 9112 §6 permits a choice, this refuses.
+/// Where RFC 9112 §6 permits a choice, this refuses.
 fn framing_of(headers: Headers, limits: Limits) -> Result<Framing, Refusal> / {abort.raise} = {
   let cl = header_lines(headers, "content-length");
   let te = header_lines(headers, "transfer-encoding");
@@ -585,7 +621,7 @@ fn framing_of(headers: Headers, limits: Limits) -> Result<Framing, Refusal> / {a
   } else { match cl { [only] -> length_of(only, limits), _ -> Ok(NoBody) } }
 }
 
-// A coding list not ending in `chunked` has no decidable length (400); any other coding is 501.
+/// A coding list not ending in `chunked` has no decidable length (400); any other coding is 501.
 fn chunked_of(codings: List<String>) -> Result<Framing, Refusal> =
   if !contains(codings, "chunked") {
     Err({ status: 501, reason: "the only transfer coding this server decodes is `chunked`" })
@@ -605,7 +641,7 @@ fn count_string(xs: List<String>, want: String) -> Int =
 
 fn last_string(xs: List<String>) -> String = fold(xs, "", |prev: String, x: String| x)
 
-// ASCII digits only: no sign, whitespace or `0x`, and a comma makes it a list rather than a length.
+/// ASCII digits only: no sign, whitespace or `0x`, and a comma makes it a list rather than a length.
 fn length_of(raw: String, limits: Limits) -> Result<Framing, Refusal> / {abort.raise} = {
   let b = bytes_of_string(raw);
   if !all_digits(b) {
@@ -624,7 +660,7 @@ fn too_long(limits: Limits) -> Refusal =
 
 // --- Expect and Connection --------------------------------------------------
 
-// A client waiting for a `100` it never gets hangs, so any other expectation is 417.
+/// A client waiting for a `100` it never gets hangs, so any other expectation is 417.
 fn expect_of(headers: Headers) -> Result<Bool, Refusal> = {
   let lines = header_lines(headers, "expect");
   if len(lines) == 0 { Ok(false) }
@@ -637,7 +673,7 @@ fn expect_of(headers: Headers) -> Result<Bool, Refusal> = {
 
 fn first_string(xs: List<String>) -> String = match xs { [x, ..] -> x, _ -> "" }
 
-// HTTP/1.1 is persistent by default; HTTP/1.0 closes by default and opts in.
+/// HTTP/1.1 is persistent by default; HTTP/1.0 closes by default and opts in.
 fn keep_alive_of(version: Version, headers: Headers) -> Bool / {abort.raise} = {
   let tokens = list_field(headers, "connection");
   match version { Http11 -> !contains(tokens, "close"), Http10 -> contains(tokens, "keep-alive") }
@@ -647,6 +683,7 @@ fn keep_alive_of(version: Version, headers: Headers) -> Bool / {abort.raise} = {
 
 type ChunkPhase = | AtSize | InData | AfterData | InTrailers | Finished
 
+/// Where a body's decoding stands between buffers, which `body_start` begins and `body_step` advances.
 pub type BodyState = {
   framing: Framing,
   phase: ChunkPhase,
@@ -655,11 +692,14 @@ pub type BodyState = {
   limits: Limits,
 }
 
+/// `Await` has decoded what `buf` held and needs more; `consumed` is how many of its bytes are done
+/// with and `out` what they decoded to.
 pub type BodyStep =
   | Await({ state: BodyState, consumed: Int, out: Bytes })
   | Complete({ consumed: Int, out: Bytes, trailers: Headers })
   | Rejected(Refusal)
 
+/// The state before a body's first byte.
 pub fn body_start(framing: Framing, limits: Limits) -> BodyState =
   {
     framing: framing,
@@ -669,7 +709,7 @@ pub fn body_start(framing: Framing, limits: Limits) -> BodyState =
     limits: limits,
   }
 
-// Decoding is pure; only refilling the buffer performs `net`.
+/// Decoding is pure; only refilling the buffer performs `net`.
 pub fn body_step(state: BodyState, buf: Bytes) -> BodyStep / {abort.raise} =
   match state.framing {
     NoBody -> Complete({ consumed: 0, out: b"", trailers: empty_headers() }),
@@ -678,7 +718,7 @@ pub fn body_step(state: BodyState, buf: Bytes) -> BodyStep / {abort.raise} =
     UntilClose -> until_close_step(state, buf),
   }
 
-// Every byte is body; the reader turns the close into the end.
+/// Every byte is body; the reader turns the close into the end.
 fn until_close_step(state: BodyState, buf: Bytes) -> BodyStep = {
   let n = bytes_len(buf);
   if state.received + n > state.limits.max_body {
@@ -708,7 +748,7 @@ fn length_step(state: BodyState, buf: Bytes) -> BodyStep / {abort.raise} = {
   }
 }
 
-// At most `chunk_budget()` chunks per step, so tiny chunks cost the caller a loop, not the stack.
+/// At most `chunk_budget()` chunks per step, so tiny chunks cost the caller a loop, not the stack.
 fn chunk_step(
   state: BodyState,
   buf: Bytes,
@@ -738,7 +778,7 @@ fn phased(state: BodyState, phase: ChunkPhase, remaining: Int, received: Int) ->
     limits: state.limits,
   }
 
-// A chunk-size line is hex digits, optionally followed by `;` and extensions, terminated by CRLF.
+/// A chunk-size line is hex digits, optionally followed by `;` and extensions, terminated by CRLF.
 fn chunk_size(
   state: BodyState,
   buf: Bytes,
@@ -779,7 +819,7 @@ fn sized(
   else { chunk_sized(state, buf, out, fuel, hex_to_int(digits, 0, 0), next) }
 }
 
-// Sixteen hex digits can exceed a signed `Int`, so the digit bound alone does not prevent overflow.
+/// Sixteen hex digits can exceed a signed `Int`, so the digit bound alone does not prevent overflow.
 fn fits_in_int(b: Bytes, i: Int, n: Int) -> Bool / {abort.raise} =
   if i >= n { true }
   else if bytes_at(b, i) == 48 { fits_in_int(b, i + 1, n) }
@@ -809,7 +849,7 @@ fn chunk_sized(
     chunk_step(phased(state, InTrailers, 0, state.received), buf, next, out, fuel - 1)
   } else { chunk_step(phased(state, InData, size, state.received), buf, next, out, fuel - 1) }
 
-// Only called after `fits_in_int`; the digit bound alone would let this overflow.
+/// Only called after `fits_in_int`; the digit bound alone would let this overflow.
 fn hex_to_int(b: Bytes, i: Int, acc: Int) -> Int / {abort.raise} =
   if i >= bytes_len(b) { acc } else { hex_to_int(b, i + 1, acc * 16 + hex_value(bytes_at(b, i))) }
 
@@ -847,7 +887,7 @@ fn chunk_crlf(
     Rejected({ status: 400, reason: "a chunk's data must be followed by CRLF" })
   } else { chunk_step(phased(state, AtSize, 0, state.received), buf, at + 2, out, fuel - 1) }
 
-// Trailers follow the header block's rules under `max_trailer_bytes` and are returned separately.
+/// Trailers follow the header block's rules under `max_trailer_bytes` and are returned separately.
 fn chunk_trailers(
   state: BodyState,
   buf: Bytes,
@@ -865,9 +905,11 @@ fn chunk_trailers(
 
 // --- Responses --------------------------------------------------------------
 
+/// A response with no header fields.
 pub fn response(status: Int, body: Bytes) -> Response =
   { status: status, headers: empty_headers(), body: body }
 
+/// A `text/plain` UTF-8 response.
 pub fn text_response(status: Int, text: String) -> Response = {
   let body = bytes_of_string(text);
   {
@@ -877,19 +919,22 @@ pub fn text_response(status: Int, text: String) -> Response = {
   }
 }
 
+/// The response a refused message is answered with: its status, and its reason as the body.
 pub fn refusal_response(r: Refusal) -> Response = text_response(r.status, r.reason ++ "\n")
 
-// A 405 carrying the `Allow` field it must.
+/// A 405 carrying the `Allow` field it must.
 pub fn method_not_allowed(ms: List<Method>) -> Response = {
   let allow = allow_field(ms);
   let body = text_response(405, "the methods this resource allows are " ++ allow ++ "\n");
   { status: body.status, headers: set_header(body.headers, "allow", allow), body: body.body }
 }
 
+/// The methods as an `Allow` field lists them.
 pub fn allow_field(ms: List<Method>) -> String =
   fold(ms, "", |acc: String, m: Method|
     if string_len(acc) == 0 { method_name(m) } else { acc ++ ", " ++ method_name(m) })
 
+/// The standard reason for a status; `Unknown` for one this module does not name.
 pub fn reason_phrase(status: Int) -> String =
   if status == 100 { "Continue" }
   else if status == 200 { "OK" }
@@ -916,10 +961,10 @@ pub fn reason_phrase(status: Int) -> String =
   else if status == 505 { "HTTP Version Not Supported" }
   else { "Unknown" }
 
-// 1xx, 204 and 304 carry no body or `Content-Length`: a client would read one as the next message.
+/// 1xx, 204 and 304 carry no body or `Content-Length`: a client would read one as the next message.
 fn bodiless(status: Int) -> Bool = (status >= 100 && status < 200) || status == 204 || status == 304
 
-// Panics on a header the program may not set: a bad name, a framing field, or CR/LF in a value.
+/// Panics on a header the program may not set: a bad name, a framing field, or CR/LF in a value.
 pub reuse fn encode(
   method: Method,
   version: Version,
@@ -961,7 +1006,7 @@ fn reserved_field(name: String) -> Bool = {
   lower == "content-length" || lower == "transfer-encoding" || lower == "connection"
 }
 
-// A response to `HEAD` carries the `Content-Length` a `GET` would have produced, and no body.
+/// A response to `HEAD` carries the `Content-Length` a `GET` would have produced, and no body.
 fn framing_fields(r: Response) -> Bytes =
   if bodiless(r.status) { b"" }
   else { bytes_of_string("Content-Length: " ++ int_to_string(bytes_len(r.body)) ++ "\r\n") }
@@ -973,7 +1018,7 @@ fn connection_field(version: Version, keep_alive: Bool) -> Bytes =
   if !keep_alive { b"Connection: close\r\n" }
   else { match version { Http10 -> b"Connection: keep-alive\r\n", Http11 -> b"" } }
 
-// The head of a streamed response.
+/// The head of a streamed response.
 pub reuse fn encode_chunked_head(
   version: Version,
   keep_alive: Bool,
@@ -1002,11 +1047,14 @@ pub reuse fn encode_chunked_head(
   }
 }
 
+/// One chunk of a streamed body; an empty chunk encodes to nothing, since a zero-length chunk ends
+/// the stream.
 pub fn encode_chunk(chunk: Bytes) -> Bytes / {abort.raise} =
   if bytes_len(chunk) == 0 { b"" } else {
     bytes_concat_all([bytes_of_string(int_to_hex(bytes_len(chunk))), b"\r\n", chunk, b"\r\n"])
   }
 
+/// The chunk that ends a streamed body.
 pub fn last_chunk() -> Bytes = b"0\r\n\r\n"
 
 fn int_to_hex(n: Int) -> String / {abort.raise} =
@@ -1014,22 +1062,26 @@ fn int_to_hex(n: Int) -> String / {abort.raise} =
 
 fn hex_digit(v: Int) -> String / {abort.raise} = string_slice("0123456789abcdef", v, v + 1)
 
+/// The interim answer that tells a client sending `Expect: 100-continue` to send its body.
 pub fn continue_response() -> Bytes = b"HTTP/1.1 100 Continue\r\n\r\n"
 
 // --- The read loop ----------------------------------------------------------
 
-// Reading a head never re-scans its buffer, which would make it quadratic.
+/// Reading a head never re-scans its buffer, which would make it quadratic.
 pub type HeadRead =
+  /// What arrived up to the end of the head; `complete` is false when the head ran past the size bound,
+  /// which `parse_head` then refuses with 431 or 414.
   | HeadBytes({ buf: Bytes, complete: Bool })
-  // The head began arriving and did not finish inside `header_timeout_ms`: 408.
+  /// The head began arriving and did not finish inside `header_timeout_ms`: 408.
   | HeadTimedOut
-  // Nothing arrived between messages on a kept-alive connection: close without writing.
+  /// Nothing arrived between messages on a kept-alive connection: close without writing.
   | HeadIdle
+  /// The peer closed before the head ended, after sending these bytes.
   | HeadClosed(Bytes)
 
 type Reading = { pieces: List<Bytes>, total: Int, tail: Bytes, found: Bool }
 
-// `idle` is the wait for the first byte of a message on a connection that has already answered one.
+/// `idle` is the wait for the first byte of a message on a connection that has already answered one.
 pub fn read_head<[l]>(
   c: Int,
   carried: Bytes,
@@ -1067,7 +1119,7 @@ fn head_deadline<[l]>(
     r,
   )
 
-// Each read waits one slice of the timeout, so the deadline bounds the whole head, not each read.
+/// Each read waits one slice of the timeout, so the deadline bounds the whole head, not each read.
 fn slice_ms(timeout_ms: Int) -> Int / {abort.raise} =
   if timeout_ms / max_reads() < 1 { 1 } else { timeout_ms / max_reads() }
 
@@ -1105,7 +1157,7 @@ fn absorb(r: Reading, chunk: Bytes) -> Reading / {abort.raise} = {
   }
 }
 
-// A blank line ends the head.
+/// A blank line ends the head.
 fn terminated(b: Bytes, from: Int) -> Bool / {abort.raise} =
   match bytes_index_of_from(b, b"\r\n\r\n", from) {
     Some(_) -> true,
@@ -1119,13 +1171,14 @@ fn keep_tail(b: Bytes) -> Bytes / {abort.raise} = {
 
 // --- Reading a body ---------------------------------------------------------
 
+/// A whole body and the bytes after it, which begin the next message; or why there is none.
 pub type BodyResult =
   | Body({ bytes: Bytes, rest: Bytes, trailers: Headers })
   | BodyRefused(Refusal)
   | BodyTimedOut
   | BodyClosed
 
-// The buffered form, for a handler that wants a whole body.
+/// The buffered form, for a handler that wants a whole body.
 pub fn read_body<[l]>(
   c: Int,
   framing: Framing,
@@ -1189,6 +1242,7 @@ reuse fn body_more<[l]>(
 
 // --- Responses, as a client reads them --------------------------------------
 
+/// A response's status line and fields, as a client reads them, with how its body is framed.
 pub type ResponseHead = {
   version: Version,
   status: Int,
@@ -1199,12 +1253,14 @@ pub type ResponseHead = {
   keep_alive: Bool,
 }
 
+/// `ResponseIncomplete` asks for more bytes; a refused response carries the status a gateway answers
+/// with.
 pub type ResponseHeadResult =
   | ResponseIncomplete
   | ResponseParsed(ResponseHead)
   | ResponseRefused(Refusal)
 
-// `method` decides the framing: an answer to `HEAD` carries no body whatever its fields say.
+/// `method` decides the framing: an answer to `HEAD` carries no body whatever its fields say.
 pub fn parse_response_head(
   buf: Bytes,
   method: Method,
@@ -1249,12 +1305,12 @@ fn after_status_line(
     },
   }
 
-// A fault in a response is the server's, reported as a gateway would relay it: 502.
+/// A fault in a response is the server's, reported as a gateway would relay it: 502.
 fn relayed(r: Refusal) -> Refusal = { status: 502, reason: r.reason }
 
 type StatusLine = { version: Version, status: Int, reason: String }
 
-// `VERSION SP 3DIGIT SP REASON`; the reason may be empty and may hold spaces.
+/// `VERSION SP 3DIGIT SP REASON`; the reason may be empty and may hold spaces.
 fn status_line(line: Bytes) -> Result<StatusLine, Refusal> / {abort.raise} = {
   let n = bytes_len(line);
   let sp = bytes_scan_until(line, 0, b" ", n);
@@ -1285,8 +1341,8 @@ fn response_version(v: Bytes) -> Result<Version, Refusal> / {abort.raise} =
     Err(_) -> Err({ status: 502, reason: "a status line begins with `HTTP/1.1` or `HTTP/1.0`" }),
   }
 
-// 1xx, 204, 304 and any answer to `HEAD` carry no body; without a length field the body runs
-// until the server closes.
+/// 1xx, 204, 304 and any answer to `HEAD` carry no body; without a length field the body runs
+/// until the server closes.
 fn response_framing(
   method: Method,
   status: Int,
@@ -1302,7 +1358,7 @@ fn response_framing(
 
 // --- Requests, as a client sends them ---------------------------------------
 
-// `target` is the path with its query; `authority` is the `Host` the request carries.
+/// `target` is the path with its query; `authority` is the `Host` the request carries.
 pub fn request_to(
   method: Method,
   authority: String,
@@ -1327,13 +1383,13 @@ pub fn request_to(
   }
 }
 
-// One request per connection, so it says `Connection: close`. Panics on a header the program may
-// not set: `Host` comes from `authority`, and the rest as in `encode`.
+/// One request per connection, so it says `Connection: close`. Panics on a header the program may
+/// not set: `Host` comes from `authority`, and the rest as in `encode`.
 pub reuse fn encode_request(r: Request) -> Bytes / {abort.raise} =
   bytes_concat_all([request_head(r), b"Connection: close\r\n", b"\r\n", r.body])
 
-// The same request on a connection that stays open. HTTP/1.1 keeps a connection by default, so the
-// difference is the field `encode_request` adds rather than one this leaves out.
+/// The same request on a connection that stays open. HTTP/1.1 keeps a connection by default, so the
+/// difference is the field `encode_request` adds rather than one this leaves out.
 pub reuse fn encode_request_kept(r: Request) -> Bytes / {abort.raise} =
   bytes_concat_all([request_head(r), b"\r\n", r.body])
 
@@ -1357,7 +1413,7 @@ fn request_target(r: Request) -> String =
   else if string_len(r.path) > 0 { r.path }
   else { "/" }
 
-// A body, or a method that usually carries one, is framed by its length; `GET` without a body is not.
+/// A body, or a method that usually carries one, is framed by its length; `GET` without a body is not.
 fn request_framing(r: Request) -> Bytes =
   if bytes_len(r.body) > 0 || carries_body(r.method) {
     bytes_of_string("Content-Length: " ++ int_to_string(bytes_len(r.body)) ++ "\r\n")
@@ -1368,10 +1424,13 @@ fn carries_body(m: Method) -> Bool =
 
 // --- The client -------------------------------------------------------------
 
+/// Why a client exchange has no answer: the host was not reached, the request could not be written,
+/// the answer did not arrive in time, the server closed before answering in full, or the answer was
+/// malformed (its refusal carries 502).
 pub type ClientError = | Unreachable | NotSent | TimedOut | Closed | Malformed(Refusal)
 
-// One exchange on a fresh connection, closed afterwards whatever happened. A `1xx` answer is
-// returned as it is.
+/// One exchange on a fresh connection, closed afterwards whatever happened. A `1xx` answer is
+/// returned as it is.
 pub fn request<[l]>(
   host: String,
   port: Int,
@@ -1383,11 +1442,12 @@ pub fn request<[l]>(
     Some(c) -> bracket(|| c, |h: Int| net.close[l](h), |h: Int| exchange[l](h, req, limits)),
   }
 
-// A connection kept open for more than one exchange: `dial`, then `ask` as many times as the server
-// allows, then `close`. A load generator wants this — a request on a fresh connection measures the
-// handshake as much as it measures the request — and `request` above is its one-shot case.
+/// A connection kept open for more than one exchange: `dial`, then `ask` as many times as the server
+/// allows, then `close`. A load generator wants this — a request on a fresh connection measures the
+/// handshake as much as it measures the request — and `request` above is its one-shot case.
 pub type Connection = { handle: Int, host: String, port: Int }
 
+/// Opens a connection for `ask`, within `connect_timeout_ms`.
 pub fn dial<[l]>(
   host: String,
   port: Int,
@@ -1433,6 +1493,7 @@ pub fn ask_last<[l]>(
 ) -> Result<Response, ClientError> / {net.send[l], net.recv[l], abort.raise} =
   exchange_over[l](c.handle, req, limits, true)
 
+/// Closes a connection `dial` opened.
 pub fn close<[l]>(c: Connection) -> Unit / {net.close[l] bounded} = net.close[l](c.handle)
 
 fn exchange<[l]>(
@@ -1487,8 +1548,8 @@ fn read_answer<[l]>(
 
 // --- Serving ----------------------------------------------------------------
 
-// One connection: read a head, answer it, then close or go round again with the leftover bytes.
-// The connection is closed however serving it ends, an `app` a clause unwinds out of included.
+/// One connection: read a head, answer it, then close or go round again with the leftover bytes.
+/// The connection is closed however serving it ends, an `app` a clause unwinds out of included.
 pub fn serve_connection<[l] | e>(
   c: Int,
   limits: Limits,
@@ -1524,7 +1585,7 @@ fn connection_loop<[l] | e>(
     }
   }
 
-// From here on `left` is how many requests the connection may serve after this one.
+/// From here on `left` is how many requests the connection may serve after this one.
 fn after_head<[l] | e>(
   c: Int,
   limits: Limits,
@@ -1638,7 +1699,7 @@ fn write_response<[l]>(
   ()
 }
 
-// Streams `produce`'s chunks (raw under HTTP/1.0); answers whether the connection may be reused.
+/// Streams `produce`'s chunks (raw under HTTP/1.0); answers whether the connection may be reused.
 pub fn respond_chunked<s, [l] | e>(
   c: Int,
   version: Version,
@@ -1660,7 +1721,7 @@ pub fn respond_chunked<s, [l] | e>(
     } else { stream_raw[l](c, limits, seed, produce, limits.max_stream_chunks) },
   }
 
-// Always write the terminating chunk: a chunked response without one is response smuggling.
+/// Always write the terminating chunk: a chunked response without one is response smuggling.
 fn stream_chunks<s, [l] | e>(
   c: Int,
   limits: Limits,
@@ -1687,7 +1748,7 @@ fn stream_chunks<s, [l] | e>(
       })
   }
 
-// HTTP/1.0 has no chunked coding: the body is raw and the close frames it, so this answers `false`.
+/// HTTP/1.0 has no chunked coding: the body is raw and the close frames it, so this answers `false`.
 fn stream_raw<s, [l] | e>(
   c: Int,
   limits: Limits,
@@ -1707,7 +1768,7 @@ fn stream_raw<s, [l] | e>(
       })
   }
 
-// Accept `count` connections and answer each. `l` is the listener's label and `k` each connection's.
+/// Accept `count` connections and answer each. `l` is the listener's label and `k` each connection's.
 pub fn serve<[l], [k] | e>(
   listener: Int,
   count: Int,
@@ -1722,6 +1783,8 @@ pub fn serve<[l], [k] | e>(
     }
   }
 
+/// Listens on `port` and serves `count` connections, as `serve` does, after `check_limits`; the
+/// listener is closed however serving ends. It answers how many connections it served.
 pub fn listen_and_serve<[l], [k] | e>(
   port: Int,
   count: Int,
@@ -1737,7 +1800,7 @@ pub fn listen_and_serve<[l], [k] | e>(
 
 fn head_status(raw: Bytes) -> Int / {abort.raise} = head_status_with(raw, default_limits())
 
-// `-1` is incomplete and `0` is accepted, so a table of cases reads as the status each input earns.
+/// `-1` is incomplete and `0` is accepted, so a table of cases reads as the status each input earns.
 fn head_status_with(raw: Bytes, limits: Limits) -> Int / {abort.raise} =
   match parse_head(raw, limits) { Refused(r) -> r.status, Incomplete -> -1, Parsed(_) -> 0 }
 
@@ -1755,7 +1818,7 @@ fn parsed(raw: Bytes) -> Head / {abort.raise} =
     Incomplete -> panic("expected a parse, got an incomplete head"),
   }
 
-// Spreads `default_limits()`: every field is `Int`, so a hand-spelled record can mispair silently.
+/// Spreads `default_limits()`: every field is `Int`, so a hand-spelled record can mispair silently.
 fn limits_with(
   request_line: Int,
   header_bytes: Int,
@@ -2023,7 +2086,7 @@ fn decode_body_with(
 ) -> Result<Decoded, Refusal> / {abort.raise} =
   decode_from(body_start(framing, limits), buf, 0, [], 64)
 
-// Step until `Complete`; a step that consumed and produced nothing means truncated, not loop again.
+/// Step until `Complete`; a step that consumed and produced nothing means truncated, not loop again.
 reuse fn decode_from(
   state: BodyState,
   buf: Bytes,
@@ -2238,7 +2301,7 @@ fn adversarial() -> List<Bytes> =
     b"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n",
   ]
 
-// The oracle: the message length read off the field lines, without calling the parser.
+/// The oracle: the message length read off the field lines, without calling the parser.
 fn reference_length(raw: Bytes) -> Int / {abort.raise} = {
   let head_end = match bytes_index_of(raw, b"\r\n\r\n") { Some(at) -> at + 4, None -> -1 };
   if head_end < 0 { -1 } else {
@@ -2431,7 +2494,7 @@ fn echo_app(req: Request) -> Response =
     method_name(req.method) ++ " " ++ req.path ++ "|" ++ string_of_bytes_lossy(req.body),
   )
 
-// Ignores the body: decides whether an unread body gets framed as the next request.
+/// Ignores the body: decides whether an unread body gets framed as the next request.
 fn ignore_body_app(req: Request) -> Response = text_response(200, req.path)
 
 fn limits_keeping(n: Int) -> Limits = {
@@ -2881,7 +2944,7 @@ test "a streamed response stops at a dead peer rather than writing into it" {
   }
 }
 
-// A producer with more chunks than `max_stream_chunks`.
+/// A producer with more chunks than `max_stream_chunks`.
 fn endless(seed: Int) -> Option<{ chunk: Bytes, next: Int }> = Some({ chunk: b"x", next: seed + 1 })
 
 test "a streamed response always ends with its terminating chunk" {
