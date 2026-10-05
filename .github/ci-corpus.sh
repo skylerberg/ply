@@ -13,8 +13,15 @@
 #       cache, which tells `ci-shards.sh timings` whether the run's costs are a cold run's.
 #   ci-corpus.sh desks K TIMINGS CUT [ARG...]
 #       the desk runs runner K takes (`ci-shards.sh desks-for-runner K CUT`, round robin when CUT is
-#       empty) in one `ply test` with ARGs added, their milliseconds onto TIMINGS as a partition's
+#       empty) in one `ply test` with the desk's grants and ARGs added, their milliseconds onto
+#       TIMINGS as a partition's
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
+#   ci-corpus.sh select [CUT]
+#       the jobs a run has to start, as `KEY=VALUE` lines for the workflow's outputs: `partitions`
+#       and `corpus`, the matrices of the partitions, desk runners and runs alone holding a run no
+#       kept answer stands for, and `lanes` and `solo`, whether either holds one. Every `ply test`
+#       is the one `partition`, `desks` or `run` starts, asked only what an earlier run kept
+#       (`--kept`), so a job none of whose runs has work is never started.
 #   ci-corpus.sh mark                  the moment `keep` gathers from
 #   ci-corpus.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
 #                                      since `mark`, into DIR for a later run: a body is keyed by its
@@ -62,6 +69,16 @@ cli_grants=(--host --timeout 900000 --steps 0 --json
   --fs cwd=. --fs abs=/ --fs "repo=$root"
   --allow machine --allow tester --allow claims --allow hosts
   --allow shipped)
+
+# What a desk run is given beside the checks' grants: the floors the served tables are compared with,
+# built where the workflow builds them, and the database the desk's schema is in.
+desk_grants=(--exec "http_floor=$root/target/http-floor" --exec "pg_floor=$root/target/pg-floor"
+  --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk)
+
+# What every `ply test` a lane starts is also asked: `select` asks only what an earlier run kept,
+# and takes each run's exit code as its answer.
+asked=()
+selecting=0
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
 # directory of its own, which its harness empties before each test and refuses without the marker.
@@ -133,13 +150,18 @@ run_one() {
     "$ply" test "$path" --json "$@" > "$out" || status=$?
   elif [[ $id == stdlib ]]; then
     "$ply" test --std "$path" --json "$@" > "$out" || status=$?
+    # A kept answer of the tests stands only while the library and the `ply` its proofs ran on do.
     local proved
-    if ! proved=$("$ply" prove --std "$path" 2>&1); then
+    if ((!selecting)) && ! proved=$("$ply" prove --std "$path" 2>&1); then
       printf '%s\n' "$proved" >&2
       status=1
     fi
   else
     tested "$path" ${filter:+--filter "$filter"} "$@" > "$out" || status=$?
+  fi
+  if ((selecting)); then
+    rm -f "$out"
+    return "$status"
   fi
   listed "$out"
   timed "$out" "$path" >> "$durations"
@@ -179,6 +201,10 @@ run_modules() {
   out=$(mktemp)
   started=$(date +%s%3N)
   tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} > "$out" || status=$?
+  if ((selecting)); then
+    rm -f "$out"
+    return "$status"
+  fi
   wall=$(($(date +%s%3N) - started))
   listed "$out"
   timed "$out" "$path" >> "$durations"
@@ -219,7 +245,7 @@ lane() {
       program | stdlib | package-* | fixture-*)
         echo "::group::corpus $id"
         started=$(date +%s%3N)
-        run_one "$timings" "$id" || failed=1
+        run_one "$timings" "$id" ${asked[@]+"${asked[@]}"} || failed=1
         printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
         echo "::endgroup::"
         ;;
@@ -229,12 +255,12 @@ lane() {
   done
   if [ "${#checks[@]}" -gt 0 ]; then
     echo "::group::corpus checks ${checks[*]}"
-    run_modules "$timings" "${checks[@]}" || failed=1
+    run_modules "$timings" "${checks[@]}" -- ${asked[@]+"${asked[@]}"} || failed=1
     echo "::endgroup::"
   fi
   if [ "${#cli[@]}" -gt 0 ]; then
     echo "::group::the CLI's suite ${cli[*]}"
-    run_modules "$timings" "${cli[@]}" || failed=1
+    run_modules "$timings" "${cli[@]}" -- ${asked[@]+"${asked[@]}"} || failed=1
     echo "::endgroup::"
   fi
   return "$failed"
@@ -295,9 +321,66 @@ case "${1:-}" in
     read -ra runs <<< "$(tr '\n' ' ' <<< "$taken")"
     echo "::group::corpus desks ${runs[*]}"
     failed=0
-    run_modules "$timings" "${runs[@]}" -- "$@" || failed=1
+    run_modules "$timings" "${runs[@]}" -- "${desk_grants[@]}" "$@" || failed=1
     echo "::endgroup::"
     exit "$failed"
+    ;;
+  select)
+    cut=${2:-}
+    selecting=1
+    asked=(--kept)
+    work=$(mktemp -d)
+    : > "$durations"
+    # Each partition's lanes as `partition` runs them, each desk runner's runs as `desks` does and
+    # each run alone as `run` does, all at once.
+    pids=()
+    asking=()
+    for k in $(jq -r '.include[].shard' <<< "$("$shards" partitions)"); do
+      (
+        placed=$("$shards" corpus-for-partition "$k" "$cut") || exit 2
+        for l in $(cut -d' ' -f1 <<< "$placed" | sort -un); do
+          read -ra ids <<< "$(awk -v l="$l" '$1 == l { printf "%s ", $2 }' <<< "$placed")"
+          lane "$work/lane-$k-$l.tsv" "${ids[@]}" > /dev/null 2>&1 || exit 1
+        done
+      ) &
+      pids+=("$!")
+      asking+=("partition $k")
+    done
+    for id in $(jq -r '.include[].id' <<< "$("$shards" corpus-matrix)"); do
+      case "$id" in
+        desks-*)
+          taken=$("$shards" desks-for-runner "${id#desks-}" "$cut") || exit 2
+          [ -n "$taken" ] || { echo "$id: takes no run" >&2; continue; }
+          read -ra runs <<< "$(tr '\n' ' ' <<< "$taken")"
+          run_modules "$work/$id.tsv" "${runs[@]}" -- "${desk_grants[@]}" --kept > /dev/null 2>&1 &
+          ;;
+        *) run_one "" "$id" --kept > /dev/null 2>&1 & ;;
+      esac
+      pids+=("$!")
+      asking+=("$id")
+    done
+    working=()
+    ids=()
+    for i in "${!pids[@]}"; do
+      if wait "${pids[$i]}"; then
+        echo "${asking[$i]}: answered by what was kept" >&2
+      else
+        echo "${asking[$i]}: has runs to run" >&2
+        case "${asking[$i]}" in
+          partition\ *) working+=("${asking[$i]#partition }") ;;
+          *) ids+=("${asking[$i]}") ;;
+        esac
+      fi
+    done
+    rm -rf "$work"
+    printf 'partitions=%s\n' "$(jq -c --arg keep "${working[*]-}" \
+      '($keep | split(" ")) as $k | { include: [.include[] | select(.shard | IN($k[]))] }' \
+      <<< "$("$shards" partitions)")"
+    printf 'lanes=%s\n' "$([ "${#working[@]}" -gt 0 ] && echo true || echo false)"
+    printf 'corpus=%s\n' "$(jq -c --arg keep "${ids[*]-}" \
+      '($keep | split(" ")) as $k | { include: [.include[] | select(.id | IN($k[]))] }' \
+      <<< "$("$shards" corpus-matrix)")"
+    printf 'solo=%s\n' "$([ "${#ids[@]}" -gt 0 ] && echo true || echo false)"
     ;;
   run)
     : > "$durations"
@@ -397,7 +480,7 @@ case "${1:-}" in
     find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
     ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | desks K TIMINGS CUT [ARG...] | run ID [ARG...] | mark | keep DIR | pack TAR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | desks K TIMINGS CUT [ARG...] | run ID [ARG...] | select [CUT] | mark | keep DIR | pack TAR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
     exit 2
     ;;
 esac
