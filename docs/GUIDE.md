@@ -2660,7 +2660,11 @@ loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 document, `front_end` carries `reused` and `key` for an answer taken back,
 beside the phases of this run, all of it read. `--kept` answers only that way:
 where no kept answer stands it loads nothing and exits 4, so a caller can tell
-which runs have work before starting them.
+which runs have work before starting them. `ply defs` keeps its listing the same
+way, beside every embed the program read, and a later listing over the same
+command line, files and `ply` takes it back while every shipped definition the
+program reached hashes as it did; its `--json` document then carries
+`front_end` with `reused` and `key`.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
