@@ -1,13 +1,19 @@
 //! What a program wants over a `String` and the prelude does not carry.
 //!
 //! The prelude has the pieces (`string_len`, `string_slice`, `string_split`, `string_find`,
-//! `string_contains`) and no whole: no `join`, no `replace`, no trim, no case fold. This is those, and
-//! every one is total: a `String` is characters, not bytes, so a slice lands on a character boundary
-//! by construction, and `replace` with an empty needle is the text unchanged rather than a loop. The
-//! case fold touches `A-Z` and `a-z` and leaves every other character as it is. `std.bytes.join` is
-//! `join` over `Bytes`.
+//! `string_contains`) and no whole: no `join`, no `replace`, no trim. This is those, and every one
+//! is total: a `String` is characters, not bytes, so a slice lands on a character boundary by
+//! construction, and `replace` with an empty needle is the text unchanged rather than a loop.
+//! `std.bytes.join` is `join` over `Bytes`.
+//!
+//! Case has two meanings and a name for each. `ascii_lower` and `ascii_upper` move `A-Z` and `a-z`
+//! and leave every other character as it is: the fold for a name a protocol compares without case.
+//! The prelude's `string_lower` and `string_upper` map by Unicode's tables: the one for text a
+//! person reads, and never for a name that is compared, since it maps characters outside ASCII
+//! onto ASCII letters (`string_lower` of the Kelvin sign `U+212A` is `k`).
 
 import std.bytes (int_of_ascii)
+import std.laws (agrees, idempotent)
 
 /// Every part, with `sep` between them and nowhere else.
 pub fn join(parts: List<String>, sep: String) -> String =
@@ -52,14 +58,21 @@ pub fn trim_start(text: String) -> String / {abort.raise} = trim_start_at(text, 
 /// The text without whitespace at its end.
 pub fn trim_end(text: String) -> String / {abort.raise} = trim_end_at(text, string_len(text))
 
-/// Every letter folded to lower case; ASCII only, which is what a byte-per-character fold can
-/// answer for. Anything else is left as it is.
-pub fn to_lower(text: String) -> String / {abort.raise} =
-  folded(text, lower(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+/// `text` with each of `A` to `Z` as its lower-case letter and every other character as it is, a
+/// letter outside ASCII included, so the answer is as long as `text`. This is the fold for a name
+/// a protocol compares without case: a header's, a scheme's, a host's, a hex digit's.
+pub fn ascii_lower(text: String) -> String
+  cost string_len(text)
+= string_of_chars(map(string_chars(text), lower_char))
 
-/// Every letter folded to upper case; ASCII only, as `to_lower` is.
-pub fn to_upper(text: String) -> String / {abort.raise} =
-  folded(text, upper(), "abcdefghijklmnopqrstuvwxyz")
+/// `text` with each of `a` to `z` as its upper-case letter and every other character as it is, as
+/// `ascii_lower` leaves them.
+pub fn ascii_upper(text: String) -> String
+  cost string_len(text)
+= string_of_chars(map(string_chars(text), upper_char))
+
+/// Whether two texts differ at most in the case of the letters `A` to `Z`.
+pub fn eq_ignore_ascii_case(a: String, b: String) -> Bool = ascii_lower(a) == ascii_lower(b)
 
 /// `text` repeated `n` times; `n` at or below zero is the empty string.
 pub fn repeat(text: String, n: Int) -> String =
@@ -121,10 +134,13 @@ pub fn words(text: String) -> List<String> / {abort.raise} = words_from(text, 0,
 pub fn count(text: String, needle: String) -> Int / {abort.raise} =
   if is_empty(needle) { 0 } else { len(string_split(text, needle)) - 1 }
 
-/// The first character upper-cased and the rest left as they are; an empty text stays empty.
-pub fn capitalize(text: String) -> String / {abort.raise} =
-  if is_empty(text) { text }
-  else { to_upper(string_slice(text, 0, 1)) ++ string_slice(text, 1, string_len(text)) }
+/// `text` with its first character upper-cased as `ascii_upper` does it, and the rest left as
+/// they are; an empty text stays empty.
+pub fn capitalize(text: String) -> String =
+  match string_chars(text) {
+    [] -> "",
+    [head, ..tail] -> string_of_chars([upper_char(head)]) ++ string_of_chars(tail),
+  }
 
 fn without_cr(line: String) -> String / {abort.raise} =
   if string_ends_with(line, "\r") { string_slice(line, 0, string_len(line) - 1) } else { line }
@@ -154,19 +170,12 @@ fn trim_end_at(text: String, at: Int) -> String / {abort.raise} =
 
 fn is_space(c: String) -> Bool = string_contains(" \t\n\r", c)
 
-fn folded(text: String, to: String, from: String) -> String / {abort.raise} =
-  fold(range(0, string_len(text)), "", |acc: String, i: Int|
-    acc ++ folded_char(string_slice(text, i, i + 1), to, from))
+fn lower_char(c: Char) -> Char = if c >= 'A' && c <= 'Z' { shifted(c, 32) } else { c }
 
-fn folded_char(c: String, to: String, from: String) -> String / {abort.raise} =
-  if string_contains(from, c) {
-    let at = string_find(from, c);
-    string_slice(to, at, at + 1)
-  } else { c }
+fn upper_char(c: Char) -> Char = if c >= 'a' && c <= 'z' { shifted(c, -32) } else { c }
 
-fn lower() -> String = "abcdefghijklmnopqrstuvwxyz"
-
-fn upper() -> String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+fn shifted(c: Char, by: Int) -> Char =
+  match char_of_int(int_of_char(c) + by) { Some(other) -> other, None -> c }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -207,11 +216,106 @@ test "trim takes the whitespace and nothing else" {
   assert_eq(trim(""), "")
 }
 
-test "case fold is ASCII, and leave anything else as it is" {
-  assert_eq(to_lower("AbC1 é"), "abc1 é");
-  assert_eq(to_upper("AbC1 é"), "ABC1 é");
-  assert_eq(to_lower(""), "")
+test "the ASCII fold moves `A-Z` and `a-z`, and leaves every other character as it is" {
+  assert_eq(ascii_lower("AbC1 É"), "abc1 É");
+  assert_eq(ascii_upper("AbC1 é"), "ABC1 é");
+  assert_eq(ascii_lower("@[`{"), "@[`{");
+  assert_eq(ascii_upper("@[`{"), "@[`{");
+  assert_eq(ascii_lower(""), "");
+  assert_eq(ascii_upper(""), "")
 }
+
+type Cased = { text: String, ascii: String, unicode: String }
+
+/// Texts whose two lower cases differ: each is a name the ASCII fold must not move.
+fn lowered() -> List<Cased> =
+  [
+    { text: "\u{212A}", ascii: "\u{212A}", unicode: "k" },
+    { text: "\u{130}", ascii: "\u{130}", unicode: "i\u{307}" },
+    { text: "ÉCOLE", ascii: "École", unicode: "école" },
+    { text: "ΟΔΟΣ", ascii: "ΟΔΟΣ", unicode: "οδος" },
+  ]
+
+/// Texts whose two upper cases differ, the first three by growing.
+fn raised() -> List<Cased> =
+  [
+    { text: "straße", ascii: "STRAßE", unicode: "STRASSE" },
+    { text: "ﬁn", ascii: "ﬁN", unicode: "FIN" },
+    { text: "ŉ", ascii: "ŉ", unicode: "ʼN" },
+    { text: "\u{17F}et", ascii: "\u{17F}ET", unicode: "SET" },
+    { text: "\u{131}d", ascii: "\u{131}D", unicode: "ID" },
+  ]
+
+test "outside ASCII the fold leaves a text as it is where Unicode's lower case moves it" {
+  fold(lowered(), (), |_: Unit, c: Cased| {
+    assert_eq(ascii_lower(c.text), c.ascii);
+    assert_eq(string_lower(c.text), c.unicode);
+    assert_eq(string_len(ascii_lower(c.text)), string_len(c.text))
+  })
+}
+
+test "outside ASCII the fold leaves a text as it is where Unicode's upper case moves it" {
+  fold(raised(), (), |_: Unit, c: Cased| {
+    assert_eq(ascii_upper(c.text), c.ascii);
+    assert_eq(string_upper(c.text), c.unicode);
+    assert_eq(string_len(ascii_upper(c.text)), string_len(c.text))
+  })
+}
+
+test "texts are equal ignoring ASCII case where only `A-Z` and `a-z` differ" {
+  assert(eq_ignore_ascii_case("Content-Length", "content-length"));
+  assert(eq_ignore_ascii_case("", ""));
+  assert(!eq_ignore_ascii_case("content-length", "content-length "));
+  assert(!eq_ignore_ascii_case("\u{212A}", "k"));
+  assert(!eq_ignore_ascii_case("É", "é"))
+}
+
+law "a text in ASCII lower case is settled" = idempotent(ascii_lower)
+
+law "a text in ASCII upper case is settled" = idempotent(ascii_upper)
+
+/// The one character `n` is the scalar value of, as a text; empty where it is no character's.
+fn one(n: Int) -> String = match char_of_int(n) { Some(c) -> string_of_chars([c]), None -> "" }
+
+law "below 256 the ASCII fold lowers `A-Z` as Unicode does, and moves no other character"
+  forall (b: U8) {
+    let n = int_of_u8(b);
+    ascii_lower(one(n)) == one(if n >= 65 && n <= 90 { n + 32 } else { n })
+      && (n >= 128 || ascii_lower(one(n)) == string_lower(one(n)))
+  }
+
+law "below 256 the ASCII fold raises `a-z` as Unicode does, and moves no other character"
+  forall (b: U8) {
+    let n = int_of_u8(b);
+    ascii_upper(one(n)) == one(if n >= 97 && n <= 122 { n - 32 } else { n })
+      && (n >= 128 || ascii_upper(one(n)) == string_upper(one(n)))
+  }
+
+/// The characters of `text` outside ASCII, in order.
+fn beyond(text: String) -> List<Char> = filter(string_chars(text), |c: Char| int_of_char(c) >= 128)
+
+/// `text` without its characters outside ASCII.
+fn plain(text: String) -> String =
+  string_of_chars(filter(string_chars(text), |c: Char| int_of_char(c) < 128))
+
+law "the ASCII fold keeps a text's length and every character outside ASCII, either way"
+  forall (text: String) {
+    string_len(ascii_lower(text)) == string_len(text) && beyond(ascii_lower(text)) == beyond(text)
+      && string_len(ascii_upper(text)) == string_len(text)
+      && beyond(ascii_upper(text)) == beyond(text)
+  }
+
+law "a text of ASCII has the lower case Unicode gives it" =
+  agrees(|text: String| ascii_lower(plain(text)), |text: String| string_lower(plain(text)))
+
+law "a text of ASCII has the upper case Unicode gives it" =
+  agrees(|text: String| ascii_upper(plain(text)), |text: String| string_upper(plain(text)))
+
+law "texts are equal ignoring ASCII case exactly where their upper cases are equal"
+  forall (a: String, b: String) {
+    eq_ignore_ascii_case(a, b) == (ascii_upper(a) == ascii_upper(b))
+      && eq_ignore_ascii_case(a, ascii_upper(a))
+  }
 
 test "repeat and pad are total, and both treat a width of zero as the text" {
   assert_eq(repeat("ab", 3), "ababab");
