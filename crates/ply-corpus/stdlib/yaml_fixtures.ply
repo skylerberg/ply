@@ -1,0 +1,420 @@
+//! `std.yaml` against the YAML Test Suite, the cases YAML's implementations share: every case of
+//! its `data` branch as it stood at commit `6ad3d2c62885d82fc349026c136ef560838fdf3d` of
+//! `github.com/yaml/yaml-test-suite`, with its licence beside them. A case is a directory: the
+//! stream (`in.yaml`), the events a parser says of it in the suite's notation (`test.event`),
+//! the JSON its documents mean where JSON can say it (`in.json`), the suite's own writing of it
+//! (`out.yaml`), and an `error` file where the stream is one a reader must refuse. A shipped
+//! module embeds no file, so the tests that read files stand here.
+//!
+//! What is held to the suite: every case's events, every refusal, and the value of every case
+//! with an `in.json` or an `out.yaml`. A case whose nodes carry tags the core schema does not
+//! define is refused as the reader stands, which is its contract, and read with exactly those
+//! tags kept to be compared. The cases in `declined` are valid YAML whose values
+//! `std.yaml` refuses, each for the reason beside it.
+
+import std.bytes
+import std.json
+import std.json (Json)
+import std.list (any, unique)
+import std.place
+import std.string (join, strip_suffix)
+import std.yaml
+import std.yaml (Event, Kind, Limits, Options, Properties, Yaml)
+
+type File = { name: String, bytes: Bytes }
+
+/// A case of the suite: its directory, its stream, the events the suite says of it, and whether
+/// a reader must refuse it.
+type Case = { id: String, yaml: Bytes, events: String, error: Bool }
+
+/// A case and another text beside it: the suite's JSON, or the suite's own writing of the stream.
+type Beside = { id: String, yaml: Bytes, other: Bytes }
+
+fn files() -> List<File> = embed_dir("yaml")
+
+fn limits() -> Limits = { bytes: 65536, depth: 32, nodes: 10000, scalar: 8192, documents: 32 }
+
+fn by_name() -> Map<String, Bytes> =
+  map_of_entries(map(files(), |f: File| { key: f.name, value: f.bytes }))
+
+fn cases() -> List<Case> / {abort.raise} = {
+  let found = by_name();
+  fold(files(), [], |acc: List<Case>, f: File|
+    if string_ends_with(f.name, "/in.yaml") {
+      let id = strip_suffix(f.name, "/in.yaml");
+      push(acc, {
+        id: id,
+        yaml: f.bytes,
+        events: match map_get(found, id ++ "/test.event") {
+          Some(text) -> string_of_bytes(text),
+          None -> panic(f"{id} has no test.event beside it"),
+        },
+        error: map_contains(found, id ++ "/error"),
+      })
+    } else { acc })
+}
+
+fn valid() -> List<Case> / {abort.raise} = filter(cases(), |c: Case| !c.error)
+
+fn invalid() -> List<Case> / {abort.raise} = filter(cases(), |c: Case| c.error)
+
+/// The valid cases whose nodes carry a tag the core schema does not define.
+fn tagged() -> List<Case> / {abort.raise} = filter(valid(), |c: Case| len(foreign_tags(c.yaml)) > 0)
+
+/// The valid cases that have the file `other` beside them, with it.
+fn beside(other: String) -> List<Beside> / {abort.raise} = {
+  let found = by_name();
+  fold(valid(), [], |acc: List<Beside>, c: Case|
+    match map_get(found, c.id ++ "/" ++ other) {
+      Some(text) -> push(acc, { id: c.id, yaml: c.yaml, other: text }),
+      None -> acc,
+    })
+}
+
+/// A case `std.yaml` refuses the value of though the suite calls it valid, and why.
+type Declined = { id: String, why: String }
+
+/// The suite holds a parser to the syntax alone, and these two streams are well formed. Their
+/// mappings hold a key twice, which YAML 1.2.2 says no mapping does, so the events are read and
+/// the value is refused.
+fn declined() -> List<Declined> =
+  [
+    { id: "2JQS", why: "a block mapping with two empty keys" },
+    { id: "X38W", why: "a flow mapping whose alias repeats the key it stands for" },
+  ]
+
+fn is_declined(id: String) -> Bool = any(declined(), |d: Declined| d.id == id)
+
+// --- The suite's notation for events ----------------------------------------
+
+fn escaped(text: String) -> String / {abort.raise} =
+  string_of_bytes(
+    fold(
+      [
+        { from: b"\\", to: b"\\\\" },
+        { from: b"\n", to: b"\\n" },
+        { from: b"\t", to: b"\\t" },
+        { from: b"\r", to: b"\\r" },
+        { from: b"\x08", to: b"\\b" },
+      ],
+      bytes_of_string(text),
+      |raw: Bytes, e: { from: Bytes, to: Bytes }| bytes::replace(raw, e.from, e.to),
+    ),
+  )
+
+fn properties(p: Properties) -> String =
+  (match p.anchor { Some(name) -> " &" ++ name, None -> "" })
+    ++ (match p.tag { Some(tag) -> " <" ++ tag ++ ">", None -> "" })
+
+fn noted(kind: Kind) -> Option<String> / {abort.raise} =
+  match kind {
+    yaml::StreamStart -> Some("+STR"),
+    yaml::StreamEnd -> Some("-STR"),
+    yaml::DocumentStart(explicit) -> Some(if explicit { "+DOC ---" } else { "+DOC" }),
+    yaml::DocumentEnd(explicit) -> Some(if explicit { "-DOC ..." } else { "-DOC" }),
+    yaml::Alias(name) -> Some("=ALI *" ++ name),
+    yaml::Scalar(p, text, style) ->
+      Some(
+        "=VAL" ++ properties(p) ++ " "
+          ++ (match style {
+            yaml::Plain -> ":",
+            yaml::SingleQuoted -> "'",
+            yaml::DoubleQuoted -> "\"",
+            yaml::Literal -> "|",
+            yaml::Folded -> ">",
+          })
+          ++ escaped(text),
+      ),
+    yaml::SequenceStart(p, flow) ->
+      Some("+SEQ" ++ (if flow { " []" } else { "" }) ++ properties(p)),
+    yaml::SequenceEnd -> Some("-SEQ"),
+    yaml::MappingStart(p, flow) -> Some("+MAP" ++ (if flow { " {}" } else { "" }) ++ properties(p)),
+    yaml::MappingEnd -> Some("-MAP"),
+    yaml::Comment(_) -> None,
+  }
+
+/// Events as the suite writes them, one to a line; a comment is none of the suite's.
+fn notation(events: List<Event>) -> String / {abort.raise} =
+  fold(events, "", |written: String, e: Event|
+    match noted(e.kind) { Some(line) -> written ++ line ++ "\n", None -> written })
+
+// --- The suite's JSON -------------------------------------------------------
+
+type Split = { depth: Int, quoted: Bool, escaped: Bool, start: Int, out: List<Bytes> }
+
+fn is_space(c: Int) -> Bool = c == b' ' || c == b'\n' || c == b'\r' || c == b'\t'
+
+/// The JSON values written one after another in `text`, which is how the suite says what the
+/// documents of a stream mean.
+fn json_values(text: Bytes) -> List<Bytes> / {abort.raise} = {
+  let n = bytes_len(text);
+  let done = fold(
+    range(0, n),
+    { depth: 0, quoted: false, escaped: false, start: -1, out: [] },
+    |s: Split, i: Int| {
+      let c = bytes_at(text, i);
+      let start = if s.start < 0 && !is_space(c) { i } else { s.start };
+      if s.quoted {
+        if s.escaped { { ..s, escaped: false } }
+        else if c == 92 { { ..s, escaped: true } }
+        else if c != 34 { s }
+        else if s.depth > 0 { { ..s, quoted: false } } else {
+          { ..s, quoted: false, start: -1, out: push(s.out, bytes_slice(text, start, i + 1)) }
+        }
+      } else if c == 34 { { ..s, quoted: true, start: start } }
+      else if c == b'{' || c == b'[' { { ..s, depth: s.depth + 1, start: start } }
+      else if c == b'}' || c == b']' {
+        if s.depth > 1 { { ..s, depth: s.depth - 1 } }
+        else { { ..s, depth: 0, start: -1, out: push(s.out, bytes_slice(text, start, i + 1)) } }
+      } else if is_space(c) && s.depth == 0 && s.start >= 0 {
+        { ..s, start: -1, out: push(s.out, bytes_slice(text, s.start, i)) }
+      } else { { ..s, start: start } }
+    },
+  );
+  if done.start >= 0 { push(done.out, bytes_slice(text, done.start, n)) } else { done.out }
+}
+
+/// Whether a value is what the suite's JSON says: a tag is looked through, since JSON has none,
+/// and a number is the number, written as an integer or a float.
+fn means(v: Yaml, j: Json) -> Bool =
+  match v {
+    yaml::Tagged(_, held) -> means(held, j),
+    yaml::Null -> j == json::Null,
+    yaml::Boolean(flag) -> j == json::Bool(flag),
+    yaml::String(text) -> j == json::Str(text),
+    yaml::Integer(n) -> j == json::Number(decimal_of_int(n)),
+    yaml::Float(f) -> match j { json::Number(d) -> float_of_decimal(d) == f, _ -> false },
+    yaml::Sequence(items) -> match j {
+      json::Array(wanted) ->
+        len(items) == len(wanted)
+          && fold(range(0, len(items)), true, |same: Bool, i: Int|
+            same
+              && (match list_at(items, i) {
+                Some(item) -> match list_at(wanted, i) { Some(w) -> means(item, w), None -> false },
+                None -> false,
+              })),
+      _ -> false,
+    },
+    yaml::Mapping(entries) -> match j {
+      json::Object(members) ->
+        len(entries) == map_len(members)
+          && fold(entries, true, |same: Bool, e: yaml::Entry|
+            same
+              && (match e.key {
+                yaml::String(name) -> match map_get(members, name) {
+                  Some(w) -> means(e.value, w),
+                  None -> false,
+                },
+                _ -> false,
+              })),
+      _ -> false,
+    },
+  }
+
+/// Every tag the stream's nodes carry that the core schema does not define: what a reader is
+/// asked to keep so that the stream's value can be read at all.
+fn foreign_tags(text: Bytes) -> List<String> =
+  match try { yaml::events(text, limits()) } {
+    Err(_) -> [],
+    Ok(events) ->
+      unique(
+        fold(events, [], |tags: List<String>, e: Event| {
+          let tag = match e.kind {
+            yaml::Scalar(p, _, _) -> p.tag,
+            yaml::SequenceStart(p, _) -> p.tag,
+            yaml::MappingStart(p, _) -> p.tag,
+            _ -> None,
+          };
+          match tag {
+            Some(named) -> if named == "!"
+                || (string_starts_with(named, "tag:yaml.org,2002:")
+                && any(["null", "bool", "int", "float", "str", "seq", "map"], |core: String|
+                  named == "tag:yaml.org,2002:" ++ core)) { tags }
+            else { push(tags, named) },
+            None -> tags,
+          }
+        }),
+      ),
+  }
+
+fn keeping(text: Bytes) -> Options = { merge_keys: false, keep_tags: foreign_tags(text) }
+
+fn said(r: Result<List<Yaml>, yaml::Refusal>) -> List<Yaml> / {abort.raise} =
+  match r { Ok(documents) -> documents, Err(e) -> panic(yaml::refusal_to_string(e)) }
+
+// --- The tests --------------------------------------------------------------
+
+test "the suite is the cases counted here" {
+  let all = cases();
+  assert_eq(
+    {
+      cases: len(all),
+      valid: len(valid()),
+      refused: len(invalid()),
+      with_json: len(beside("in.json")),
+      rewritten: len(beside("out.yaml")),
+      tagged: len(tagged()),
+      declined: len(declined()),
+    },
+    {
+      cases: 402,
+      valid: 308,
+      refused: 94,
+      with_json: 279,
+      rewritten: 242,
+      tagged: 16,
+      declined: 2,
+    },
+  )
+}
+
+test "{c.id} is refused" for c: Case in invalid() {
+  assert(match yaml::parse_all(c.yaml, limits()) { Ok(_) -> false, Err(_) -> true });
+  assert(match try { yaml::events(c.yaml, limits()) } { Ok(_) -> false, Err(_) -> true })
+}
+
+test "{c.id} is read as the events the suite says" for c: Case in valid() {
+  assert_eq(
+    match try { yaml::events(c.yaml, limits()) } {
+      Ok(events) -> notation(events),
+      Err(e) -> yaml::refusal_to_string(e),
+    },
+    c.events,
+  )
+}
+
+test "{c.id} is read alike however its lines end" for c: Case in cases() {
+  let ended = |ending: Bytes|
+    match try { yaml::events(bytes::replace(c.yaml, b"\n", ending), limits()) } {
+      Ok(events) -> notation(events),
+      Err(_) -> "refused",
+    };
+  let wanted = if c.error { "refused" } else { c.events };
+  assert_eq(ended(b"\r\n"), wanted);
+  assert_eq(ended(b"\r"), wanted)
+}
+
+test "{c.id} means what the suite's JSON says" for c: Beside in beside("in.json") {
+  let wanted = map(json_values(c.other), |text: Bytes|
+    match json::parse(text) { Ok(j) -> j, Err(e) -> panic(json::error_to_string(e)) });
+  let read = said(yaml::parse_all(c.yaml, limits(), keeping(c.yaml)));
+  assert_eq(len(read), len(wanted));
+  assert_eq(
+    filter(range(0, len(read)), |i: Int|
+      match list_at(read, i) {
+        Some(v) -> match list_at(wanted, i) { Some(w) -> !means(v, w), None -> true },
+        None -> true,
+      }),
+    [],
+  )
+}
+
+test "{c.id} is well formed, and refused for the key it holds twice" for c: Declined in declined() {
+  let text = match map_get(by_name(), c.id ++ "/in.yaml") {
+    Some(found) -> found,
+    None -> panic(f"{c.id} is no case of the suite"),
+  };
+  assert(match try { yaml::events(text, limits()) } { Ok(_) -> true, Err(_) -> false });
+  assert(match yaml::parse_all(text, limits(), keeping(text)) {
+    Err(e) -> match e.why { yaml::Duplicate(_) -> true, _ -> false },
+    Ok(_) -> false,
+  })
+}
+
+test "{c.id} is refused for its tag until the reader keeps it" for c: Case in tagged() {
+  let tags = foreign_tags(c.yaml);
+  assert(match yaml::parse_all(c.yaml, limits()) {
+    Err(e) -> match e.why { yaml::UnknownTag(tag) -> any(tags, |t: String| t == tag), _ -> false },
+    Ok(_) -> false,
+  });
+  assert(match yaml::parse_all(c.yaml, limits(), keeping(c.yaml)) {
+    Ok(_) -> true,
+    Err(_) -> false,
+  })
+}
+
+test "{c.id} means what the suite's own writing of it means" for c: Beside in beside("out.yaml") {
+  if !is_declined(c.id) {
+    assert_eq(
+      yaml::parse_all(c.other, limits(), keeping(c.other)),
+      yaml::parse_all(c.yaml, limits(), keeping(c.yaml)),
+    )
+  }
+}
+
+test "{c.id} reads back from what is written of it" for c: Case in valid() {
+  if !is_declined(c.id) {
+    let read = said(yaml::parse_all(c.yaml, limits(), keeping(c.yaml)));
+    assert_eq(yaml::parse_all(yaml::stream_to_bytes(read), limits(), keeping(c.yaml)), Ok(read));
+    assert_eq(
+      map(read, |v: Yaml| yaml::parse_string(yaml::inline(v), limits(), keeping(c.yaml))),
+      map(read, |v: Yaml| Ok(v)),
+    )
+  }
+}
+
+/// What is wrong with how the reader took `text`, if anything: a failure of its own answered as
+/// a refusal, a refusal placed outside the text, or values that do not write back.
+fn mistaken(text: Bytes) -> Option<String> =
+  match yaml::parse_all(text, limits(), keeping(text)) {
+    Err(e) -> match e.why {
+      yaml::Defect(said) -> Some(said),
+      _ -> if e.line < 1 || e.column < 1 || e.offset < 0 || e.offset > bytes_len(text) {
+        Some("a refusal placed outside the text")
+      } else { None },
+    },
+    Ok(read) -> if yaml::parse_all(yaml::stream_to_bytes(read), limits(), keeping(text))
+        == Ok(read) { None }
+    else { Some("values that do not read back from what is written of them") },
+  }
+
+test "{c.id} cut short is read, or refused for a reason" for c: Case in cases() {
+  let n = bytes_len(c.yaml);
+  // At most 96 cuts: a run that answers a thousand refusals runs out of call depth.
+  let stride = n / 96 + 1;
+  assert_eq(
+    fold(range(0, n / stride + 1), [], |faults: List<String>, k: Int|
+      match mistaken(bytes_slice(c.yaml, 0, k * stride)) {
+        Some(said) -> push(faults, f"cut at {k * stride}: {said}"),
+        None -> faults,
+      }),
+    [],
+  )
+}
+
+test "{c.id} with a byte taken out is read, or refused for a reason" for c: Case in cases() {
+  let n = bytes_len(c.yaml);
+  let stride = n / 96 + 1;
+  assert_eq(
+    fold(range(0, (n - 1) / stride + 1), [], |faults: List<String>, k: Int| {
+      let at = k * stride;
+      if at >= n { faults } else {
+        match mistaken(bytes_concat(bytes_slice(c.yaml, 0, at), bytes_slice(c.yaml, at + 1, n))) {
+          Some(said) -> push(faults, f"without the byte at {at}: {said}"),
+          None -> faults,
+        }
+      }
+    }),
+    [],
+  )
+}
+
+test "{c.id} is a document that keeps its bytes, and a key set in it" for c: Case in valid() {
+  let path = [place::Key("a key no case holds")];
+  match yaml::parse_document(c.yaml, limits(), keeping(c.yaml)) {
+    Err(_) -> (),
+    Ok(d) -> {
+      assert_eq(yaml::source(d), c.yaml);
+      match yaml::value(d) {
+        yaml::Mapping(_) -> match try { yaml::set(d, path, yaml::Integer(7)) } {
+          Err(e) -> panic(yaml::refusal_to_string(e)),
+          Ok(added) -> {
+            assert_eq(yaml::at(yaml::value(added), path), Some(yaml::Integer(7)));
+            assert_eq(try { yaml::value(yaml::remove(added, path)) }, Ok(yaml::value(d)))
+          },
+        },
+        _ -> (),
+      }
+    },
+  }
+}

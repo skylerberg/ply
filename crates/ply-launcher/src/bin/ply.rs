@@ -16,10 +16,6 @@ fn main() {
     let program = match ply_launcher::shipped::program() {
         Ok(runnable) => Program {
             runnable,
-            shipped_modules: ply_machine::shipped_modules::sources()
-                .into_iter()
-                .map(|(name, text)| (name, text.to_string()))
-                .collect(),
             stage: ply_launcher::shipped::stage_name(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
