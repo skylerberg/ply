@@ -1,9 +1,15 @@
-// std.json — the JSON value, a parser, a serializer, and what `derive json for T` targets.
+//! JSON: the value, a parser, a serializer, and the codecs `derive json for T` builds on.
+//!
+//! Numbers are `Decimal`, so a document's numbers read back exactly, and objects are maps, so key order
+//! is canonical. A `JsonCodec<a>` pairs an encoder with a decoder; the codecs here are the ones a
+//! derived codec is made of, and `decode_bytes`, `decode_string`, `encode_bytes` and `encode_string`
+//! run one end to end.
 
 // --- The value --------------------------------------------------------------
 
 import std.bytes
 import std.bytes (hex_value, peek, scan, scan_until)
+/// A JSON value.
 pub type Json =
   | Null
   | Bool(Bool)
@@ -12,22 +18,26 @@ pub type Json =
   | Array(List<Json>)
   | Object(Map<String, Json>)
 
-// The deepest nesting `parse` will accept.
+/// The deepest nesting `parse` will accept.
 pub fn max_depth() -> Int = 128
 
 // --- Errors -----------------------------------------------------------------
 
-// `offset` is set only by the parser; a codec over a parsed `Json` locates an error by `path`.
+/// `offset` is set only by the parser; a codec over a parsed `Json` locates an error by `path`.
 pub type DecodeError = { path: String, offset: Option<Int>, message: String }
 
+/// An error with no place yet; the decoders around it add the path.
 pub fn decode_error(message: String) -> DecodeError = { path: "", offset: None, message: message }
 
+/// An error at a byte offset of the parsed text.
 pub fn error_at(offset: Int, message: String) -> DecodeError =
   { path: "", offset: Some(offset), message: message }
 
+/// An error saying `what` was expected and naming the kind of value `found` is instead.
 pub fn expected(what: String, found: Json) -> DecodeError =
   decode_error("expected " ++ what ++ ", found " ++ kind_of(found))
 
+/// What a value is, as an error names it: `null`, `a number`, `an object`.
 pub fn kind_of(j: Json) -> String =
   match j {
     Null -> "null",
@@ -38,29 +48,35 @@ pub fn kind_of(j: Json) -> String =
     Object(_) -> "an object",
   }
 
-// A path is built inside out: each enclosing decoder prefixes the step it took.
+/// A path is built inside out: each enclosing decoder prefixes the step it took.
 pub fn in_field(name: String, e: DecodeError) -> DecodeError =
   { path: "." ++ name ++ e.path, offset: e.offset, message: e.message }
 
+/// `e`, one array index further in.
 pub fn in_index(index: Int, e: DecodeError) -> DecodeError =
   { path: "[" ++ int_to_string(index) ++ "]" ++ e.path, offset: e.offset, message: e.message }
 
+/// `$.lines[2].unit_price: expected a number, found a string`, with the byte offset when the parser
+/// found it.
 pub fn error_to_string(e: DecodeError) -> String =
   "$" ++ e.path ++ ": " ++ e.message
     ++ (match e.offset { Some(n) -> " (at byte " ++ int_to_string(n) ++ ")", None -> "" })
 
 // --- Codecs -----------------------------------------------------------------
 
+/// How to write an `a` as JSON and read one back.
 pub type JsonCodec<a> = {
   encode: (a) -> Json / {abort.raise},
   decode: (Json) -> Result<a, DecodeError> / {abort.raise},
 }
 
+/// A decoded value through `f`; an error passes through.
 pub fn decode_map<a, b | e>(
   r: Result<a, DecodeError>,
   f: (a) -> b / e,
 ) -> Result<b, DecodeError> / e = match r { Ok(x) -> Ok(f(x)), Err(e) -> Err(e) }
 
+/// A decoded value through a further decoding step; the first error wins.
 pub fn decode_and_then<a, b | e>(
   r: Result<a, DecodeError>,
   f: (a) -> Result<b, DecodeError> / e,
@@ -74,16 +90,19 @@ type Text = { text: String, next: Int }
 
 type Piece = { bytes: Bytes, next: Int }
 
+/// One JSON document: valid UTF-8, nested at most `max_depth` deep, with nothing but whitespace after
+/// its value.
 pub fn parse(src: Bytes) -> Result<Json, DecodeError> / {abort.raise} =
   if !bytes_is_utf8(src) { Err(error_at(0, "a JSON document must be valid UTF-8")) } else {
     let step = value(src, skip_ws(src, 0), 0)?;
     parse_end(src, step)
   }
 
+/// `parse` over a string's bytes.
 pub fn parse_string(src: String) -> Result<Json, DecodeError> / {abort.raise} =
   parse(bytes_of_string(src))
 
-// Anything but whitespace after the value is an error, so `Ok` means the input was one document.
+/// Anything but whitespace after the value is an error, so `Ok` means the input was one document.
 fn parse_end(src: Bytes, step: Step) -> Result<Json, DecodeError> / {abort.raise} = {
   let end = skip_ws(src, step.next);
   if end == bytes_len(src) { Ok(step.value) }
@@ -96,7 +115,7 @@ fn digits() -> Bytes = b"0123456789"
 
 fn skip_ws(src: Bytes, i: Int) -> Int / {abort.raise} = scan(src, i, ws())
 
-// Tests are ordered by how often a payload holds them: strings and numbers first.
+/// Tests are ordered by how often a payload holds them: strings and numbers first.
 fn value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} = {
   let c = peek(src, i);
   if c == 34 { string_value(src, i) }
@@ -124,7 +143,7 @@ fn array_value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {a
     Err(error_at(i, "nested deeper than " ++ int_to_string(max_depth()) ++ " levels"))
   } else { array_start(src, skip_ws(src, i + 1), depth + 1) }
 
-// An item and its comma take two bytes at least, so the bytes left bound the items: `left`.
+/// An item and its comma take two bytes at least, so the bytes left bound the items: `left`.
 fn array_start(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) == 93 { Ok({ value: Array([]), next: i + 1 }) }
   else { array_items(src, i, depth, [], bytes_len(src) - i) }
@@ -163,7 +182,7 @@ fn object_value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {
     Err(error_at(i, "nested deeper than " ++ int_to_string(max_depth()) ++ " levels"))
   } else { object_start(src, skip_ws(src, i + 1), depth + 1) }
 
-// `left` as in `array_start`.
+/// `left` as in `array_start`.
 fn object_start(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) == 125 { Ok({ value: Object(map_new()), next: i + 1 }) }
   else { object_members(src, i, depth, map_new(), bytes_len(src) - i) }
@@ -192,7 +211,7 @@ fn object_colon(
   else { object_member(src, key.text, skip_ws(src, j + 1), depth, acc, left) }
 }
 
-// A repeated key keeps the last value, as every mainstream JSON parser does.
+/// A repeated key keeps the last value, as every mainstream JSON parser does.
 fn object_member(
   src: Bytes,
   key: String,
@@ -223,7 +242,7 @@ fn object_more(
 
 // --- The parser: strings ----------------------------------------------------
 
-// A quote, a backslash, or a control byte: everything that ends a run of plain string content.
+/// A quote, a backslash, or a control byte: everything that ends a run of plain string content.
 fn string_stops() -> Bytes =
   b"\"\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
 
@@ -232,12 +251,12 @@ fn string_value(src: Bytes, i: Int) -> Result<Step, DecodeError> / {abort.raise}
   Ok({ value: Str(t.text), next: t.next })
 }
 
-// `i` is the first byte of the content, one past the opening quote. An escape takes two bytes at
-// least, so the bytes left bound the escapes: `left`.
+/// `i` is the first byte of the content, one past the opening quote. An escape takes two bytes at
+/// least, so the bytes left bound the escapes: `left`.
 fn string_body(src: Bytes, i: Int) -> Result<Text, DecodeError> / {abort.raise} =
   string_chunks(src, i, b"", bytes_len(src) - i)
 
-// One native scan per run, so the recursion runs once per escape rather than once per byte.
+/// One native scan per run, so the recursion runs once per escape rather than once per byte.
 fn string_chunks(
   src: Bytes,
   i: Int,
@@ -250,7 +269,7 @@ fn string_chunks(
   else { string_stop(src, stop, bytes_concat(acc, bytes_slice(src, i, stop)), left) }
 }
 
-// `string_of_bytes` cannot fail: valid UTF-8 input, cuts at ASCII bytes, no surrogate escapes.
+/// `string_of_bytes` cannot fail: valid UTF-8 input, cuts at ASCII bytes, no surrogate escapes.
 fn string_stop(
   src: Bytes,
   stop: Int,
@@ -288,7 +307,7 @@ fn escape(src: Bytes, i: Int) -> Result<Piece, DecodeError> / {abort.raise} = {
   else { Err(error_at(i - 1, "the escapes are \\\" \\\\ \\/ \\b \\f \\n \\r \\t and \\uXXXX")) }
 }
 
-// A `\u` escape is a UTF-16 unit: past the BMP it is a surrogate pair, and a lone half is refused.
+/// A `\u` escape is a UTF-16 unit: past the BMP it is a surrogate pair, and a lone half is refused.
 fn unicode_escape(src: Bytes, i: Int) -> Result<Piece, DecodeError> / {abort.raise} = {
   let cp = hex4(src, i);
   if cp < 0 { Err(error_at(i, "a \\u escape needs exactly four hexadecimal digits")) }
@@ -323,7 +342,7 @@ fn hex4(src: Bytes, i: Int) -> Int / {abort.raise} = {
 
 // --- The parser: numbers ----------------------------------------------------
 
-// JSON's number grammar is stricter than a decimal parser's, so the syntax is checked here.
+/// JSON's number grammar is stricter than a decimal parser's, so the syntax is checked here.
 fn number(src: Bytes, i: Int) -> Result<Step, DecodeError> / {abort.raise} = {
   let start = if peek(src, i) == 45 { i + 1 } else { i };
   let int_end = scan(src, start, digits());
@@ -371,7 +390,7 @@ fn number_exponent_digits(
   else { number_of(src, i, end) }
 }
 
-// A number outside `Decimal` rejects the whole document, even a field no codec would read.
+/// A number outside `Decimal` rejects the whole document, even a field no codec would read.
 fn number_of(src: Bytes, i: Int, end: Int) -> Result<Step, DecodeError> / {abort.raise} = {
   let text = string_of_bytes(bytes_slice(src, i, end));
   match decimal_of_string(text) {
@@ -388,7 +407,7 @@ fn number_of(src: Bytes, i: Int, end: Int) -> Result<Step, DecodeError> / {abort
 
 // --- The serializer ---------------------------------------------------------
 
-// Bounded by the parser's `max_depth`, so nothing is written that `parse` would refuse.
+/// Bounded by the parser's `max_depth`, so nothing is written that `parse` would refuse.
 pub fn to_bytes(j: Json) -> Bytes / {abort.raise} = write(j, 0)
 
 fn unwritable<a>() -> a / {abort.raise} =
@@ -410,10 +429,10 @@ fn write(j: Json, depth: Int) -> Bytes / {abort.raise} =
     },
   }
 
-// Valid UTF-8 by construction: every emitted byte is ASCII or comes from a `String`.
+/// Valid UTF-8 by construction: every emitted byte is ASCII or comes from a `String`.
 pub fn to_string(j: Json) -> String / {abort.raise} = string_of_bytes(to_bytes(j))
 
-// One member of a JSON object, as `map_entries` yields it and `object` takes it.
+/// One member of a JSON object, as `map_entries` yields it and `object` takes it.
 pub type Member = { key: String, value: Json }
 
 fn member(e: Member, depth: Int) -> Bytes / {abort.raise} =
@@ -433,8 +452,8 @@ fn quote(s: String) -> Bytes / {abort.raise} = {
   )
 }
 
-// The mirror of `string_chunks`: one native scan per run of bytes that need no escape. Each run
-// takes the byte it escapes, so the bytes left bound the runs: `left`.
+/// The mirror of `string_chunks`: one native scan per run of bytes that need no escape. Each run
+/// takes the byte it escapes, so the bytes left bound the runs: `left`.
 reuse fn escape_runs(
   raw: Bytes,
   i: Int,
@@ -481,10 +500,11 @@ fn utf8(cp: Int) -> Bytes / {abort.raise} =
 
 // --- Reading a value --------------------------------------------------------
 
+/// An object's member named `name`; `None` for an absent one and for any value not an object.
 pub fn get(j: Json, name: String) -> Option<Json> =
   match j { Object(m) -> map_get(m, name), _ -> None }
 
-// What a derived record decoder calls per field.
+/// What a derived record decoder calls per field.
 pub fn field<a>(
   j: Json,
   name: String,
@@ -505,7 +525,7 @@ fn field_of<a>(
 fn decode_in_field<a>(name: String, r: Result<a, DecodeError>) -> Result<a, DecodeError> =
   match r { Ok(x) -> Ok(x), Err(e) -> Err(in_field(name, e)) }
 
-// An absent field and a `null` field are one answer.
+/// An absent field and a `null` field are one answer.
 pub fn optional_field<a>(
   j: Json,
   name: String,
@@ -524,33 +544,39 @@ fn optional_field_of<a>(
     Some(v) -> decode_in_field(name, decode_map((codec.decode)(v), |x: a| Some(x))),
   }
 
+/// An object of these members; a repeated key keeps the last.
 pub fn object(fields: List<Member>) -> Json = Object(map_of_entries(fields))
 
+/// An array of these items.
 pub fn array(items: List<Json>) -> Json = Array(items)
 
+/// A number holding `n`.
 pub fn int(n: Int) -> Json = Number(decimal_of_int(n))
 
+/// An array of strings.
 pub fn strings(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
 
-// `Null` where there is no string.
+/// `Null` where there is no string.
 pub fn string_or_null(s: Option<String>) -> Json = match s { Some(x) -> Str(x), None -> Null }
 
-// `Null` where there is no number.
+/// `Null` where there is no number.
 pub fn int_or_null(n: Option<Int>) -> Json = match n { Some(x) -> int(x), None -> Null }
 
-// `Null` where there are no strings, which is not an empty list of them.
+/// `Null` where there are no strings, which is not an empty list of them.
 pub fn strings_or_null(xs: Option<List<String>>) -> Json =
   match xs { Some(x) -> strings(x), None -> Null }
 
 // --- ADTs -------------------------------------------------------------------
 
-// A derived ADT codec's form: a fieldless variant is its tag, else `{"tag": .., "values": [..]}`.
+/// A derived ADT codec's form: a fieldless variant is its tag, else `{"tag": .., "values": [..]}`.
 pub type Tagged = { tag: String, values: List<Json> }
 
+/// A variant as a derived codec writes it: its tag alone, or `{"tag", "values"}`.
 pub fn variant(tag: String, values: List<Json>) -> Json =
   if len(values) == 0 { Str(tag) }
   else { object([{ key: "tag", value: Str(tag) }, { key: "values", value: Array(values) }]) }
 
+/// A variant written by `variant`, read back.
 pub fn variant_of(j: Json) -> Result<Tagged, DecodeError> =
   match j {
     Str(tag) -> Ok({ tag: tag, values: [] }),
@@ -568,8 +594,10 @@ fn tagged_of(j: Json, m: Map<String, Json>) -> Result<Tagged, DecodeError> =
 fn tagged_values(m: Map<String, Json>) -> List<Json> =
   match map_get(m, "values") { Some(Array(vs)) -> vs, _ -> [] }
 
+/// Whether a variant is the one tagged `tag`.
 pub fn has_tag(v: Tagged, tag: String) -> Bool = v.tag == tag
 
+/// A variant's value at `index`, refused when it carries fewer.
 pub fn variant_value(v: Tagged, index: Int) -> Result<Json, DecodeError> =
   match list_at(v.values, index) {
     Some(x) -> Ok(x),
@@ -582,6 +610,7 @@ pub fn variant_value(v: Tagged, index: Int) -> Result<Json, DecodeError> =
       ),
   }
 
+/// The error a derived decoder answers for a tag its type does not have.
 pub fn unknown_variant<a>(tag: String, expected_tags: List<String>) -> Result<a, DecodeError> =
   Err(
     decode_error(
@@ -589,7 +618,7 @@ pub fn unknown_variant<a>(tag: String, expected_tags: List<String>) -> Result<a,
     ),
   )
 
-// A derived codec over a recursive type, past `max_depth` levels of it: no deeper than `parse` reads.
+/// A derived codec over a recursive type, past `max_depth` levels of it: no deeper than `parse` reads.
 pub fn too_deep<a>() -> JsonCodec<a> =
   {
     encode: |_: a| unwritable(),
@@ -602,33 +631,38 @@ fn comma_list(names: List<String>) -> String =
 
 // --- Leaf codecs ------------------------------------------------------------
 
+/// The value itself.
 pub fn json_json() -> JsonCodec<Json> = { encode: |j: Json| j, decode: |j: Json| Ok(j) }
 
+/// A boolean.
 pub fn bool_json() -> JsonCodec<Bool> =
   {
     encode: |b: Bool| Bool(b),
     decode: |j: Json| match j { Bool(b) -> Ok(b), _ -> Err(expected("a boolean", j)) },
   }
 
+/// `()` as `null`.
 pub fn unit_json() -> JsonCodec<Unit> =
   {
     encode: |u: Unit| Null,
     decode: |j: Json| match j { Null -> Ok(()), _ -> Err(expected("null", j)) },
   }
 
+/// A string.
 pub fn string_json() -> JsonCodec<String> =
   {
     encode: |s: String| Str(s),
     decode: |j: Json| match j { Str(s) -> Ok(s), _ -> Err(expected("a string", j)) },
   }
 
+/// A number, exactly.
 pub fn decimal_json() -> JsonCodec<Decimal> =
   {
     encode: |d: Decimal| Number(d),
     decode: |j: Json| match j { Number(d) -> Ok(d), _ -> Err(expected("a number", j)) },
   }
 
-// `int_of_decimal` truncates, so the round trip through `decimal_of_int` is what refuses `1.5`.
+/// `int_of_decimal` truncates, so the round trip through `decimal_of_int` is what refuses `1.5`.
 pub fn int_json() -> JsonCodec<Int> =
   {
     encode: |n: Int| Number(decimal_of_int(n)),
@@ -642,6 +676,7 @@ fn int_of(d: Decimal) -> Result<Int, DecodeError> =
     else { Err(decode_error("expected a whole number, found `" ++ decimal_to_string(d) ++ "`")) },
   }
 
+/// A string of exactly one character.
 pub fn char_json() -> JsonCodec<Char> =
   {
     encode: |c: Char| Str(string_of_chars([c])),
@@ -655,20 +690,21 @@ pub fn char_json() -> JsonCodec<Char> =
       },
   }
 
-// An `Instant` and a `Duration` are their nanoseconds.
+/// An `Instant` and a `Duration` are their nanoseconds.
 pub fn instant_json() -> JsonCodec<Instant> =
   {
     encode: |t: Instant| match t { Instant(n) -> int_json().encode(n) },
     decode: |j: Json| decode_map(int_json().decode(j), |n: Int| Instant(n)),
   }
 
+/// A number of nanoseconds.
 pub fn duration_json() -> JsonCodec<Duration> =
   {
     encode: |t: Duration| match t { Duration(n) -> int_json().encode(n) },
     decode: |j: Json| decode_map(int_json().decode(j), |n: Int| Duration(n)),
   }
 
-// JSON has no non-finite literals, so there is nothing to write for a NaN or an infinity.
+/// JSON has no non-finite literals, so there is nothing to write for a NaN or an infinity.
 pub fn float_json() -> JsonCodec<Float> =
   {
     encode: |f: Float|
@@ -687,6 +723,7 @@ fn float_reason(f: Float) -> String =
 
 // --- Structural codecs ------------------------------------------------------
 
+/// An array of items.
 pub fn list_json<a>(item: JsonCodec<a>) -> JsonCodec<List<a>> =
   {
     encode: |xs: List<a>| Array(map(xs, |x: a| (item.encode)(x))),
@@ -694,7 +731,7 @@ pub fn list_json<a>(item: JsonCodec<a>) -> JsonCodec<List<a>> =
       match j { Array(items) -> collect(items, item, 0, []), _ -> Err(expected("an array", j)) },
   }
 
-// A JSON array, read back as an array of the length the document gives it.
+/// A JSON array, read back as an array of the length the document gives it.
 pub fn array_json<a>(item: JsonCodec<a>) -> JsonCodec<Array<a>> = {
   let items = list_json(item);
   {
@@ -717,7 +754,7 @@ fn collect<a>(
     },
   }
 
-// `None` is `null` and `Some(x)` is `x`.
+/// `None` is `null` and `Some(x)` is `x`.
 pub fn option_json<a>(item: JsonCodec<a>) -> JsonCodec<Option<a>> =
   {
     encode: |o: Option<a>| match o { None -> Null, Some(x) -> (item.encode)(x) },
@@ -725,6 +762,7 @@ pub fn option_json<a>(item: JsonCodec<a>) -> JsonCodec<Option<a>> =
       match j { Null -> Ok(None), _ -> decode_map((item.decode)(j), |x: a| Some(x)) },
   }
 
+/// A variant tagged `Ok` or `Err`, as a derived codec writes a sum type.
 pub fn result_json<a, b>(ok: JsonCodec<a>, err: JsonCodec<b>) -> JsonCodec<Result<a, b>> =
   {
     encode: |r: Result<a, b>|
@@ -746,7 +784,7 @@ fn result_of<a, b>(
     decode_and_then(variant_value(t, 0), |v: Json| decode_map((err.decode)(v), |x: b| Err(x)))
   } else { unknown_variant(t.tag, ["Ok", "Err"]) }
 
-// A map keyed by `String` is a JSON object.
+/// A map keyed by `String` is a JSON object.
 pub fn string_map_json<v>(value: JsonCodec<v>) -> JsonCodec<Map<String, v>> =
   {
     encode: |m: Map<String, v>|
@@ -776,7 +814,7 @@ fn collect_members<v>(
     },
   }
 
-// Other keys have no object form: an array of `{"key", "value"}` objects in ascending key order.
+/// Other keys have no object form: an array of `{"key", "value"}` objects in ascending key order.
 pub fn map_json<k, v>(key: JsonCodec<k>, value: JsonCodec<v>) -> JsonCodec<Map<k, v>>
   where derivable(ord, k)
 =
@@ -823,7 +861,7 @@ fn pair_of<k, v>(
 
 // --- Bytes ------------------------------------------------------------------
 
-// JSON has no byte string, so `Bytes` is padded base64 (RFC 4648).
+/// JSON has no byte string, so `Bytes` is padded base64 (RFC 4648).
 pub fn bytes_json() -> JsonCodec<Bytes> =
   {
     encode: |b: Bytes| Str(base64_encode(b)),
@@ -835,6 +873,7 @@ fn b64_alphabet() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 fn b64_symbol(v: Int) -> Bytes / {abort.raise} = bytes_slice(b64_alphabet(), v, v + 1)
 
+/// Padded base64 (RFC 4648), as `bytes_json` writes `Bytes`.
 pub fn base64_encode(raw: Bytes) -> String / {abort.raise} =
   string_of_bytes(
     bytes_concat_all(map(range(0, (bytes_len(raw) + 2) / 3), |g: Int| b64_group(raw, g * 3))),
@@ -863,6 +902,8 @@ fn b64_two(a: Int, b: Int) -> Bytes / {abort.raise} =
 fn b64_one(a: Int) -> Bytes / {abort.raise} =
   bytes_concat(bytes_concat(b64_symbol(a / 4), b64_symbol(a % 4 * 16)), b"==")
 
+/// Padded base64 read back; a length not a multiple of four or a symbol outside the alphabet is an
+/// error.
 pub fn base64_decode(text: String) -> Result<Bytes, DecodeError> / {abort.raise} = {
   let raw = bytes_of_string(text);
   if bytes_len(raw) % 4 != 0 {
@@ -911,17 +952,21 @@ fn b64_value(c: Int) -> Int / {abort.raise} =
 
 // --- The two ends together --------------------------------------------------
 
+/// Parses a document and decodes it with `codec`.
 pub fn decode_bytes<a>(src: Bytes, codec: JsonCodec<a>) -> Result<a, DecodeError> / {abort.raise} =
   decode_and_then(parse(src), |j: Json| (codec.decode)(j))
 
+/// `decode_bytes` over a string's bytes.
 pub fn decode_string<a>(
   src: String,
   codec: JsonCodec<a>,
 ) -> Result<a, DecodeError> / {abort.raise} = decode_bytes(bytes_of_string(src), codec)
 
+/// `x` written with `codec`, as bytes.
 pub fn encode_bytes<a>(x: a, codec: JsonCodec<a>) -> Bytes / {abort.raise} =
   to_bytes((codec.encode)(x))
 
+/// `x` written with `codec`, as a string.
 pub fn encode_string<a>(x: a, codec: JsonCodec<a>) -> String / {abort.raise} =
   to_string((codec.encode)(x))
 
@@ -1016,7 +1061,7 @@ test "a repeated key keeps the last value" {
 
 // --- Tests: strings and escapes ---------------------------------------------
 
-// A Ply string literal has no `\x`, so these two are written as bytes.
+/// A Ply string literal has no `\x`, so these two are written as bytes.
 fn backspace() -> String / {abort.raise} = string_of_bytes(b"\x08")
 
 fn form_feed() -> String / {abort.raise} = string_of_bytes(b"\x0c")

@@ -1,54 +1,109 @@
-// What a path names, read without following a symlink; `Missing` is also what this run cannot read.
+//! The filesystem, as an effect whose label is a root the run binds with `--fs NAME=PATH`.
+//!
+//! An unbound label is `E0451`, and a path escaping its root (`..`, absolute, or through a symlink that
+//! leads outside) is `E0452`, refused before any operation runs, so following a symlink can never leave
+//! the root. Different roots never conflict. `kind`, `exists`, `remove`, `remove_tree`, `rename`,
+//! `symlink` and `read_link` act on a link itself; every other operation follows one. `E0453` bounds one
+//! call rather than a file: `read_file`, `read_at` and `walk` refuse an answer above 64 MiB, so a
+//! larger file is read a range at a time and a larger tree a directory at a time.
+//!
+//! `append` and `read_at` are what make a file a log rather than a value, and `sync` and `lock` what
+//! make a paired cache honest: sync the data file before the index that names it, and serialise a
+//! read-merge-write across processes with `lock`.
+//!
+//! The twin is `MemFs`, with a `mem_` function for every operation, and `on_mem` runs code written
+//! against any root over one. It follows symlinks and refuses paths that leave its root as the host
+//! does, raising with `E0452`'s words, and holds its owner to a path's owner bits (a fresh file
+//! `rw-r--r--`, a fresh directory `rwxr-xr-x`), so a test over it fails where the same code fails on a
+//! disk. It has no wall clock, so no lock in it goes stale. A test imports both `std.fs` and
+//! `std.fs (fs)` to name the module and the effect.
 
 import std.list (concat, drop, take)
 import std.path (segments)
 
+/// What a path names, read without following a symlink; `Missing` is also what this run cannot read.
 pub type Kind = | File | Dir | Symlink | Missing
 
-// One entry a walk found: its path from the root, and what it is, a symlink unfollowed.
+/// One entry a walk found: its path from the root, and what it is, a symlink unfollowed.
 pub type Entry = { path: String, kind: Kind }
 
-// Who may do what with a path: its owner, the owner's group, and everyone else.
+/// Who may do what with a path: its owner, the owner's group, and everyone else.
 pub type Mode = { owner: Access, group: Access, other: Access }
 
+/// Whether a class of user may read, write and execute.
 pub type Access = { read: Bool, write: Bool, execute: Bool }
 
-// The filesystem effect, rooted: a resource label names a directory the run binds with `--fs`.
+/// The files under the root the label names.
 pub nondet effect fs {
+  /// A file's whole contents; `None` for anything that is not a readable file.
   read read_file[r](path: String) -> Option<Bytes>
+  /// What is there of `len` bytes from `offset`, which may be less than was asked for: a range that runs
+  /// past the end is short, and one that starts at or past it is empty, since a file's length can change
+  /// under a reader holding an old offset. Compare the answer's length with `len` to tell a short read.
+  /// A negative offset or length raises `E0502`.
   read read_at[r](path: String, offset: Int, len: Int) -> Option<Bytes>
+  /// The names in one directory, not its subtree; `None` when the path is not a directory.
   read list_dir[r](path: String) -> Option<List<String>>
+  /// What the path names, a symlink reported as `Symlink` rather than followed, so a walk that must not
+  /// leave the root can refuse one.
   read kind[r](path: String) -> Kind
-  // What the path resolves to, following a symlink to its target. `kind` reports the symlink
-  // itself; a caller that must not leave the root wants that one.
+  /// What the path resolves to, following a symlink to its target. `kind` reports the symlink
+  /// itself; a caller that must not leave the root wants that one.
   read resolved[r](path: String) -> Kind
+  /// Whether anything is at the path, a dangling link included.
   read exists[r](path: String) -> Bool
+  /// A file's size in bytes.
   read file_size[r](path: String) -> Option<Int>
+  /// When the path was last modified, in milliseconds since the Unix epoch.
   read modified_ms[r](path: String) -> Option<Int>
+  /// Writes a whole file, replacing what was there.
   write write_file[r](path: String, body: Bytes) -> Bool
+  /// Appends to a file, creating it if it is not there, and answers the offset the bytes landed at. It
+  /// costs the size of what is new rather than the size of the file, and a second appender racing it
+  /// moves neither the bytes nor the answer.
   write append[r](path: String, body: Bytes) -> Option<Int>
+  /// Makes the directory and every missing ancestor; `true` for a directory already there.
   write create_dir[r](path: String) -> Bool
+  /// Removes one file, one symlink or one empty directory, never the root.
   write remove[r](path: String) -> Bool
+  /// Moves a path within its root.
   write rename[r](from: String, to: String) -> Bool
+  /// Makes what was written to the path durable; on a directory, the names in it, which is what makes a
+  /// `rename` itself durable. `false` when the path names nothing.
   write sync[r](path: String) -> Bool
+  /// Takes the lock file at `path`: `true` when this run created it, `false` when a holder still had it
+  /// after two seconds of waiting. There is no reentrancy, and a lock file older than thirty seconds is
+  /// one whose holder died, which the next taker removes and takes.
   write lock[r](path: String) -> Bool
+  /// Releases a lock this run took; `false`, removing nothing, for one it does not hold.
   write unlock[r](path: String) -> Bool
+  /// Copies a file's bytes and permission bits over whatever file the destination held; never a
+  /// directory.
   write copy[r](from: String, to: String) -> Bool
+  /// Removes a directory with everything under it, a symlink in it removed rather than followed; never
+  /// the root.
   write remove_tree[r](path: String) -> Bool
-  // A new directory under `dir`, its name starting with `prefix`, answered as the root names it.
+  /// A new directory under `dir`, its name starting with `prefix`, answered as the root names it.
   write temp_dir[r](dir: String, prefix: String) -> Option<String>
-  // The host's absolute path, symlinks resolved: what a program hands another program.
+  /// The host's absolute path, symlinks resolved: what a program hands another program.
   read canonical[r](path: String) -> Option<String>
+  /// The path's nine permission bits.
   read mode[r](path: String) -> Option<Mode>
+  /// Sets the nine permission bits, keeping the set-id and sticky bits.
   write set_mode[r](path: String, mode: Mode) -> Bool
-  // `path` made a link to `target`, which is read from the link's own directory.
+  /// `path` made a link to `target`, which is read from the link's own directory.
   write symlink[r](path: String, target: String) -> Bool
+  /// The target a link holds as written; `None` for anything but a link.
   read read_link[r](path: String) -> Option<String>
+  /// Every entry under a directory, not the directory itself: depth first, each directory's names in byte
+  /// order, each path from the root as the call named the directory. A symlink is an entry and never
+  /// followed, so a walk neither leaves its root nor loops. `None` when the path is not a directory.
   read walk[r](path: String) -> Option<List<Entry>>
+  /// Stamps the path's modification time in milliseconds since the epoch; a negative one is `E0502`.
   write set_modified[r](path: String, ms: Int) -> Bool
 }
 
-// The nine letters `ls -l` spells a mode with, `rwxr-xr-x`.
+/// The nine letters `ls -l` spells a mode with, `rwxr-xr-x`.
 pub fn mode_text(m: Mode) -> String =
   access_text(m.owner) ++ access_text(m.group) ++ access_text(m.other)
 
@@ -56,7 +111,7 @@ fn access_text(a: Access) -> String =
   (if a.read { "r" } else { "-" }) ++ (if a.write { "w" } else { "-" })
     ++ (if a.execute { "x" } else { "-" })
 
-// `None` for anything but nine of those letters and dashes.
+/// `None` for anything but nine of those letters and dashes.
 pub fn mode_of_text(text: String) -> Option<Mode> / {abort.raise} = {
   let b = bytes_of_string(text);
   if bytes_len(b) != 9 { None }
@@ -75,8 +130,8 @@ fn flag(b: Bytes, i: Int, letter: Int) -> Option<Bool> / {abort.raise} =
   else if bytes_at(b, i) == 45 { Some(false) }
   else { None }
 
-// One directory tree, as a value. A link maps to its target as written; a path `modes` holds no
-// entry for has the mode a fresh file or directory gets.
+/// One directory tree, as a value. A link maps to its target as written; a path `modes` holds no
+/// entry for has the mode a fresh file or directory gets.
 pub type MemFs = {
   files: Map<String, Bytes>,
   dirs: Map<String, Int>,
@@ -87,15 +142,16 @@ pub type MemFs = {
   clock: Int,
 }
 
-// A write's two answers: the tree it produced and whether it happened.
+/// A write's two answers: the tree it produced and whether it happened.
 pub type Written = { fs: MemFs, ok: Bool }
 
-// An append's two answers: the tree it produced and the offset the bytes landed at.
+/// An append's two answers: the tree it produced and the offset the bytes landed at.
 pub type Appended = { fs: MemFs, at: Option<Int> }
 
-// A temporary directory's two answers: the tree it produced and the path it made.
+/// A temporary directory's two answers: the tree it produced and the path it made.
 pub type Made = { fs: MemFs, path: Option<String> }
 
+/// A tree holding only its root.
 pub fn mem_empty() -> MemFs =
   {
     files: map_new(),
@@ -107,32 +163,34 @@ pub fn mem_empty() -> MemFs =
     clock: 1,
   }
 
-// A tree seeded with files, every parent directory created along the way.
+/// A tree seeded with files, every parent directory created along the way.
 pub fn mem_of(files: List<{ path: String, body: Bytes }>) -> MemFs / {abort.raise} =
   fold(files, mem_empty(), |tree: MemFs, entry: { path: String, body: Bytes }|
     mem_write(mem_create_dir(tree, parent_of(entry.path)).fs, entry.path, entry.body).fs)
 
-// The lexical half of the host's confinement check.
+/// The lexical half of the host's confinement check.
 pub fn mem_confined(path: String) -> Bool / {abort.raise} =
   !string_starts_with(path, "/") && len(filter(string_split(path, "/"), |s: String| s == "..")) == 0
 
+/// What `fs.read_file` answers over the tree.
 pub fn mem_read(tree: MemFs, path: String) -> Option<Bytes> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   if readable(tree, key) { map_get(tree.files, key) } else { None }
 }
 
+/// What `fs.exists` answers over the tree.
 pub fn mem_exists(f: MemFs, path: String) -> Bool / {abort.raise} =
   match key_of(f, path, false) { Some(key) -> kind_at(f, key) != Missing, None -> false }
 
-// A size is the inode's, so no permission is needed to read it.
+/// A size is the inode's, so no permission is needed to read it.
 pub fn mem_size(tree: MemFs, path: String) -> Option<Int> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   let body = map_get(tree.files, key)?;
   Some(bytes_len(body))
 }
 
-// What is there, which may be less than was asked for: a file can end before the range does, and
-// a caller that wanted all of it compares the answer's length with the one it asked for.
+/// What is there, which may be less than was asked for: a file can end before the range does, and
+/// a caller that wanted all of it compares the answer's length with the one it asked for.
 pub fn mem_read_at(
   tree: MemFs,
   path: String,
@@ -147,35 +205,38 @@ pub fn mem_read_at(
 
 fn at_most(n: Int, hi: Int) -> Int = if n > hi { hi } else { n }
 
-// A directory's stamp is its creation, a file's its last write.
+/// A directory's stamp is its creation, a file's its last write.
 pub fn mem_modified(tree: MemFs, path: String) -> Option<Int> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   match map_get(tree.modified, key) { Some(at) -> Some(at), None -> map_get(tree.dirs, key) }
 }
 
+/// What `fs.resolved` answers over the tree, a chain of more than forty links being a loop that names
+/// nothing.
 pub fn mem_resolved(tree: MemFs, path: String) -> Kind / {abort.raise} =
   match key_of(tree, path, true) {
     Some(key) -> match kind_at(tree, key) { Symlink -> Missing, k -> k },
     None -> Missing,
   }
 
+/// What `fs.kind` answers over the tree.
 pub fn mem_kind(f: MemFs, path: String) -> Kind / {abort.raise} =
   match key_of(f, path, false) { Some(key) -> kind_at(f, key), None -> Missing }
 
-// One directory, never its subtree, ascending so the order is a fact about the contents.
+/// One directory, never its subtree, ascending so the order is a fact about the contents.
 pub fn mem_list(tree: MemFs, path: String) -> Option<List<String>> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   if kind_at(tree, key) != Dir || !readable(tree, key) { None } else { Some(names_in(tree, key)) }
 }
 
-// Depth first, each directory's names ascending, a link listed and never followed.
+/// Depth first, each directory's names ascending, a link listed and never followed.
 pub fn mem_walk(tree: MemFs, path: String) -> Option<List<Entry>> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   if kind_at(tree, key) != Dir { None }
   else { Some(walked(tree, key, normal(path), [], map_len(tree.dirs))) }
 }
 
-// `room` is how many directories deeper the walk may go: each is one of the tree's, met once.
+/// `room` is how many directories deeper the walk may go: each is one of the tree's, met once.
 fn walked(
   tree: MemFs,
   key: String,
@@ -195,7 +256,7 @@ fn walked(
     })
   }
 
-// `false` when the parent is missing, a directory occupies the path, or the path leaves the root.
+/// `false` when the parent is missing, a directory occupies the path, or the path leaves the root.
 pub fn mem_write(tree: MemFs, path: String, body: Bytes) -> Written / {abort.raise} =
   match key_of(tree, path, true) {
     Some(key) -> if writes_file(tree, key) {
@@ -212,8 +273,8 @@ pub fn mem_write(tree: MemFs, path: String, body: Bytes) -> Written / {abort.rai
     None -> { fs: tree, ok: false },
   }
 
-// Costs what is new rather than what is there, and creates the file, so a log's first frame needs
-// no write before it. `None` is what `mem_write` refuses for, and the offset is where it landed.
+/// Costs what is new rather than what is there, and creates the file, so a log's first frame needs
+/// no write before it. `None` is what `mem_write` refuses for, and the offset is where it landed.
 pub fn mem_append(tree: MemFs, path: String, body: Bytes) -> Appended / {abort.raise} =
   match key_of(tree, path, true) {
     Some(key) -> if writes_file(tree, key) {
@@ -231,7 +292,7 @@ pub fn mem_append(tree: MemFs, path: String, body: Bytes) -> Appended / {abort.r
     None -> { fs: tree, at: None },
   }
 
-// A file's bytes and mode, over whatever file the destination held; never a directory.
+/// A file's bytes and mode, over whatever file the destination held; never a directory.
 pub fn mem_copy(tree: MemFs, from: String, to: String) -> Written / {abort.raise} =
   match key_of(tree, from, true) {
     Some(src) -> match key_of(tree, to, true) {
@@ -255,12 +316,12 @@ pub fn mem_copy(tree: MemFs, from: String, to: String) -> Written / {abort.raise
     None -> { fs: tree, ok: false },
   }
 
-// Nothing in a tree was ever on a disk, so a sync only answers whether the path names something.
+/// Nothing in a tree was ever on a disk, so a sync only answers whether the path names something.
 pub fn mem_sync(f: MemFs, path: String) -> Bool / {abort.raise} =
   match key_of(f, path, true) { Some(key) -> kind_at(f, key) != Missing, None -> false }
 
-// The directory and every missing ancestor, as the host's `create_dir` does; nothing is made when
-// one of them cannot be.
+/// The directory and every missing ancestor, as the host's `create_dir` does; nothing is made when
+/// one of them cannot be.
 pub fn mem_create_dir(tree: MemFs, path: String) -> Written / {abort.raise} =
   match key_of(tree, path, true) {
     Some(key) -> {
@@ -282,7 +343,7 @@ pub fn mem_create_dir(tree: MemFs, path: String) -> Written / {abort.raise} =
     None -> { fs: tree, ok: false },
   }
 
-// Named from `prefix` and the tree's clock, so a test can say what it will be called.
+/// Named from `prefix` and the tree's clock, so a test can say what it will be called.
 pub fn mem_temp_dir(tree: MemFs, dir: String, prefix: String) -> Made / {abort.raise} =
   match key_of(tree, dir, true) {
     Some(key) -> if string_contains(prefix, "/") || kind_at(tree, key) != Dir
@@ -298,7 +359,7 @@ pub fn mem_temp_dir(tree: MemFs, dir: String, prefix: String) -> Made / {abort.r
     None -> { fs: tree, path: None },
   }
 
-// One file, one link, or one empty directory.
+/// One file, one link, or one empty directory.
 pub fn mem_remove(tree: MemFs, path: String) -> Written / {abort.raise} =
   match key_of(tree, path, false) {
     Some(key) -> if key == "" || !writable(tree, parent_of(key)) { { fs: tree, ok: false } } else {
@@ -312,7 +373,7 @@ pub fn mem_remove(tree: MemFs, path: String) -> Written / {abort.raise} =
     None -> { fs: tree, ok: false },
   }
 
-// A link as itself, or a directory with everything under it; never the root.
+/// A link as itself, or a directory with everything under it; never the root.
 pub fn mem_remove_tree(f: MemFs, path: String) -> Written / {abort.raise} =
   match key_of(f, path, false) {
     Some(key) -> if key == "" || kind_at(f, key) == Missing || !writable(f, parent_of(key)) {
@@ -327,8 +388,8 @@ pub fn mem_remove_tree(f: MemFs, path: String) -> Written / {abort.raise} =
     None -> { fs: f, ok: false },
   }
 
-// A move within one root, which is what makes a cache write atomic: a file or a link over a file
-// or a link, or a directory to where nothing is and never into itself.
+/// A move within one root, which is what makes a cache write atomic: a file or a link over a file
+/// or a link, or a directory to where nothing is and never into itself.
 pub fn mem_rename(tree: MemFs, from: String, to: String) -> Written / {abort.raise} =
   match key_of(tree, from, false) {
     Some(src) -> match key_of(tree, to, false) {
@@ -350,7 +411,7 @@ fn movable(tree: MemFs, src: String, dst: String) -> Bool / {abort.raise} = {
     && (to == Missing || (from != Dir && to != Dir))
 }
 
-// `src` and everything under it, keyed under `dst`, and the move stamped on `dst`.
+/// `src` and everything under it, keyed under `dst`, and the move stamped on `dst`.
 fn moved(f: MemFs, src: String, dst: String) -> MemFs / {abort.raise} = {
   let cleared = if kind_at(f, dst) == Missing { f } else { dropped(f, dst) };
   let keyed = fold(all_keys(cleared), cleared, |t: MemFs, k: String|
@@ -360,7 +421,7 @@ fn moved(f: MemFs, src: String, dst: String) -> MemFs / {abort.raise} = {
   { ..keyed, modified: map_insert(keyed.modified, dst, keyed.clock), clock: keyed.clock + 1 }
 }
 
-// The lock is the file's existence, so a second taker finds it there and gets `false`.
+/// The lock is the file's existence, so a second taker finds it there and gets `false`.
 pub fn mem_lock(tree: MemFs, path: String) -> Written / {abort.raise} =
   match key_of(tree, path, false) {
     Some(key) -> if kind_at(tree, key) == Missing && placeable(tree, key) {
@@ -378,7 +439,7 @@ pub fn mem_lock(tree: MemFs, path: String) -> Written / {abort.raise} =
     None -> { fs: tree, ok: false },
   }
 
-// Only what this tree took: a lock left behind by another holder is broken by removing its file.
+/// Only what this tree took: a lock left behind by another holder is broken by removing its file.
 pub fn mem_unlock(tree: MemFs, path: String) -> Written / {abort.raise} =
   match key_of(tree, path, false) {
     Some(key) -> if map_contains(tree.locks, key) {
@@ -395,7 +456,7 @@ pub fn mem_unlock(tree: MemFs, path: String) -> Written / {abort.raise} =
     None -> { fs: tree, ok: false },
   }
 
-// `at` is the absolute path the tree stands for, which a twin has no disk to say.
+/// `at` is the absolute path the tree stands for, which a twin has no disk to say.
 pub fn mem_canonical(tree: MemFs, at: String, path: String) -> Option<String> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   if kind_at(tree, key) == Missing { None }
@@ -403,11 +464,13 @@ pub fn mem_canonical(tree: MemFs, at: String, path: String) -> Option<String> / 
   else { Some(at ++ "/" ++ key) }
 }
 
+/// What `fs.mode` answers over the tree.
 pub fn mem_mode(tree: MemFs, path: String) -> Option<Mode> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   if kind_at(tree, key) == Missing { None } else { Some(mode_at(tree, key)) }
 }
 
+/// What `fs.set_mode` does to the tree.
 pub fn mem_set_mode(tree: MemFs, path: String, mode: Mode) -> Written / {abort.raise} =
   match key_of(tree, path, true) {
     Some(key) -> if kind_at(tree, key) == Missing { { fs: tree, ok: false } }
@@ -415,7 +478,7 @@ pub fn mem_set_mode(tree: MemFs, path: String, mode: Mode) -> Written / {abort.r
     None -> { fs: tree, ok: false },
   }
 
-// A target that names its own root or climbs out of the tree is refused, as the host refuses it.
+/// A target that names its own root or climbs out of the tree is refused, as the host refuses it.
 pub fn mem_symlink(tree: MemFs, path: String, target: String) -> Written / {abort.raise} =
   match key_of(tree, path, false) {
     Some(key) -> match lexical(segments(parent_of(key)), target) {
@@ -427,12 +490,13 @@ pub fn mem_symlink(tree: MemFs, path: String, target: String) -> Written / {abor
     None -> { fs: tree, ok: false },
   }
 
+/// What `fs.read_link` answers over the tree.
 pub fn mem_read_link(tree: MemFs, path: String) -> Option<String> / {abort.raise} = {
   let key = key_of(tree, path, false)?;
   map_get(tree.links, key)
 }
 
-// A time before the epoch panics, as the host refuses one.
+/// A time before the epoch panics, as the host refuses one.
 pub fn mem_set_modified(tree: MemFs, path: String, ms: Int) -> Written / {abort.raise} =
   if ms < 0 { panic("a modification time is milliseconds since the Unix epoch, never before it") }
   else {
@@ -443,11 +507,11 @@ pub fn mem_set_modified(tree: MemFs, path: String, ms: Int) -> Written / {abort.
     }
   }
 
-// What `go` answered over a twin, and the tree it left.
+/// What `go` answered over a twin, and the tree it left.
 pub type Over<a> = { value: a, tree: MemFs }
 
-// `go` run over `tree` as the label its row names, every operation answered by the twin: what a
-// test hands code that may perform any operation of a root. `canonical` answers under `/mem`.
+/// `go` run over `tree` as the label its row names, every operation answered by the twin: what a
+/// test hands code that may perform any operation of a root. `canonical` answers under `/mem`.
 pub fn on_mem<a, [l] | e>(
   tree: MemFs,
   go: () -> a / {fs.read[l], fs.write[l] | e},
@@ -500,12 +564,12 @@ pub fn on_mem<a, [l] | e>(
 
 // --- Resolving: links followed as the host follows them ---------------------
 
-// As many links as one path may pass through before it is a loop, where `ELOOP` stops.
+/// As many links as one path may pass through before it is a loop, where `ELOOP` stops.
 fn link_hops() -> Int = 40
 
-// The key a path names with every link along it followed, the last one too when `last` is set;
-// `None` for a loop. A path that leaves the tree is refused in the host's words, so a twin run
-// fails where a host run would.
+/// The key a path names with every link along it followed, the last one too when `last` is set;
+/// `None` for a loop. A path that leaves the tree is refused in the host's words, so a twin run
+/// fails where a host run would.
 fn key_of(tree: MemFs, path: String, last: Bool) -> Option<String> / {abort.raise} =
   if mem_confined(path) { followed(tree, segments(path), last, 0) }
   else { panic("`" ++ path ++ "` leaves the root it was given") }
@@ -529,7 +593,7 @@ fn followed(
   }
 }
 
-// `target` read from the directory whose segments are `at`.
+/// `target` read from the directory whose segments are `at`.
 fn lexical(at: List<String>, target: String) -> Option<List<String>> / {abort.raise} =
   if string_starts_with(target, "/") { None } else {
     fold(string_split(target, "/"), Some(at), |acc: Option<List<String>>, s: String|
@@ -550,7 +614,7 @@ fn kind_at(tree: MemFs, key: String) -> Kind =
 fn access(read: Bool, write: Bool, execute: Bool) -> Access =
   { read: read, write: write, execute: execute }
 
-// What a umask of 022 leaves a fresh file and a fresh directory: `rw-r--r--` and `rwxr-xr-x`.
+/// What a umask of 022 leaves a fresh file and a fresh directory: `rw-r--r--` and `rwxr-xr-x`.
 fn fresh_mode(k: Kind) -> Mode =
   match k {
     Dir ->
@@ -570,16 +634,16 @@ fn fresh_mode(k: Kind) -> Mode =
 fn mode_at(tree: MemFs, key: String) -> Mode =
   match map_get(tree.modes, key) { Some(m) -> m, None -> fresh_mode(kind_at(tree, key)) }
 
-// The twin is its files' owner, so the owner's bits are the ones it is held to.
+/// The twin is its files' owner, so the owner's bits are the ones it is held to.
 fn readable(tree: MemFs, key: String) -> Bool = mode_at(tree, key).owner.read
 
 fn writable(tree: MemFs, key: String) -> Bool = mode_at(tree, key).owner.write
 
-// A new entry needs its directory there and writable.
+/// A new entry needs its directory there and writable.
 fn placeable(tree: MemFs, key: String) -> Bool / {abort.raise} =
   key != "" && kind_at(tree, parent_of(key)) == Dir && writable(tree, parent_of(key))
 
-// A file there the tree may write, or a new one its directory may take.
+/// A file there the tree may write, or a new one its directory may take.
 fn writes_file(tree: MemFs, key: String) -> Bool / {abort.raise} =
   match kind_at(tree, key) {
     File -> writable(tree, key),
@@ -587,7 +651,7 @@ fn writes_file(tree: MemFs, key: String) -> Bool / {abort.raise} =
     _ -> false,
   }
 
-// Every trace of one key but a lock, which is released rather than removed.
+/// Every trace of one key but a lock, which is released rather than removed.
 fn dropped(tree: MemFs, key: String) -> MemFs =
   {
     ..tree,
@@ -612,7 +676,7 @@ fn rekeyed(tree: MemFs, from: String, to: String) -> MemFs =
 fn moved_key<v>(m: Map<String, v>, from: String, to: String) -> Map<String, v> =
   match map_get(m, from) { Some(x) -> map_insert(map_remove(m, from), to, x), None -> m }
 
-// The canonical spelling of a path: no empty segments, no `.`, no trailing slash.
+/// The canonical spelling of a path: no empty segments, no `.`, no trailing slash.
 fn normal(p: String) -> String / {abort.raise} = joined(segments(p))
 
 fn joined(segs: List<String>) -> String =
@@ -620,14 +684,14 @@ fn joined(segs: List<String>) -> String =
 
 fn under(dir: String, name: String) -> String = if dir == "" { name } else { dir ++ "/" ++ name }
 
-// Every prefix of a path, shallowest first.
+/// Every prefix of a path, shallowest first.
 fn ancestors(p: String) -> List<String> / {abort.raise} =
   fold(segments(p), { at: "", out: [] }, |acc: { at: String, out: List<String> }, s: String| {
     let next = if acc.at == "" { s } else { acc.at ++ "/" ++ s };
     { at: next, out: push(acc.out, next) }
   }).out
 
-// The directory a path sits in, and `""` — the root — for a path with one segment.
+/// The directory a path sits in, and `""` — the root — for a path with one segment.
 fn parent_of(p: String) -> String / {abort.raise} = {
   let segs = segments(p);
   joined(take(segs, len(segs) - 1))
@@ -639,7 +703,7 @@ fn base_of(p: String) -> String / {abort.raise} =
 fn all_keys(tree: MemFs) -> List<String> =
   concat(concat(map_keys(tree.files), map_keys(tree.dirs)), map_keys(tree.links))
 
-// One directory's names, ascending, so the order is a fact about the contents.
+/// One directory's names, ascending, so the order is a fact about the contents.
 fn names_in(tree: MemFs, dir: String) -> List<String> / {abort.raise} =
   map_keys(
     fold(all_keys(tree), map_new(), |acc: Map<String, Bool>, k: String|
@@ -720,7 +784,7 @@ test "a handled fs write is det and the next read sees it" {
   }
 }
 
-// What a run says when it raises, or `None` when it answers.
+/// What a run says when it raises, or `None` when it answers.
 fn raised<a>(run: () -> a / {abort.raise}) -> Option<String> =
   handle { run() } with { abort.raise(m) -> Some(m), return v -> None }
 

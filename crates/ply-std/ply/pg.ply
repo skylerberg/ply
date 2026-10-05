@@ -1,9 +1,17 @@
-// std.pg — the postgres wire protocol, framed in Ply.
-//
-// Every message the front end sends after start-up is one byte of kind, an `Int32` length that
-// counts itself, and a body. The start-up message is the exception: no kind byte, the length
-// first. Values travel as text here, so a parameter is the text the server would have printed
-// and a column is the text it printed, which is what makes this layer only about framing.
+//! The postgres wire protocol, as framing and nothing else.
+//!
+//! Every message the front end sends after start-up is one byte of kind, an `Int32` length that counts
+//! itself, and a body; the start-up, SSL and cancel requests are the exceptions, their length first.
+//! Values travel as text both ways, so a parameter is the text the server would have printed and a
+//! column the text it printed: this layer never decodes a value. `read` takes what a socket returned
+//! and answers the whole messages in it and the bytes not yet one, so a short read is not an error.
+//!
+//! `connect` gets a session to where the server answers a query, authenticating with a clear-text
+//! password or SCRAM-SHA-256 (md5 is refused with a message naming it); the client's SCRAM nonce is
+//! the caller's to draw, so a run's `random` seed decides it and a test can fix it. `simple_query` and
+//! `extended_query` answer the columns, the rows and the command tag. The SCRAM steps are exposed
+//! because they are pure, and RFC 7677's worked example is their test. A connection is `std.net`'s;
+//! which statements to send, what a transaction is and when to retry are `std.db`'s.
 
 import std.bytes (u16_be, u32_be, i32_be, u16_be_at, u32_be_at, i32_be_at, slice_at, xor, cstring)
 import std.hash (sha256, hmac_sha256, pbkdf2_sha256)
@@ -13,9 +21,10 @@ import std.list (concat)
 
 // --- Kinds --------------------------------------------------------------------
 
-// What the front end sends.
+/// What the front end sends.
 pub type Frontend = | Query | Parse | Bind | Describe | Execute | Sync | Close | Flush | Terminate
 
+/// The kind byte a front-end message is sent with.
 pub fn frontend_byte(f: Frontend) -> Int =
   match f {
     Query -> 81,
@@ -29,6 +38,7 @@ pub fn frontend_byte(f: Frontend) -> Int =
     Terminate -> 88,
   }
 
+/// The message's name as the protocol documents it.
 pub fn frontend_name(f: Frontend) -> String =
   match f {
     Query -> "Query",
@@ -42,8 +52,8 @@ pub fn frontend_name(f: Frontend) -> String =
     Terminate -> "Terminate",
   }
 
-// What the back end sends. `Other` keeps the byte, so a message this module does not name is
-// still reportable rather than silently dropped.
+/// What the back end sends. `Other` keeps the byte, so a message this module does not name is
+/// still reportable rather than silently dropped.
 pub type Backend =
   | Authentication
   | ParameterStatus
@@ -62,6 +72,7 @@ pub type Backend =
   | EmptyQueryResponse
   | Other(Int)
 
+/// The kind byte a back-end message arrives with.
 pub fn backend_byte(k: Backend) -> Int =
   match k {
     Authentication -> 82,
@@ -82,6 +93,7 @@ pub fn backend_byte(k: Backend) -> Int =
     Other(b) -> b,
   }
 
+/// The message's name as the protocol documents it.
 pub fn backend_name(k: Backend) -> String =
   match k {
     Authentication -> "Authentication",
@@ -102,6 +114,7 @@ pub fn backend_name(k: Backend) -> String =
     Other(b) -> "Other(" ++ int_to_string(b) ++ ")",
   }
 
+/// The back-end message a kind byte names; `Other` for one this module does not.
 pub fn backend_of(b: Int) -> Backend =
   if b == 82 { Authentication }
   else if b == 83 { ParameterStatus }
@@ -122,20 +135,21 @@ pub fn backend_of(b: Int) -> Backend =
 
 // --- Framing ------------------------------------------------------------------
 
+/// One back-end message: its kind and its body, without the length.
 pub type Message = { kind: Backend, body: Bytes }
 
-// A buffer read into whole messages, with whatever trailing bytes are not yet a whole one.
+/// A buffer read into whole messages, with whatever trailing bytes are not yet a whole one.
 pub type Frames = { done: List<Message>, rest: Bytes }
 
-// A length that counts itself, which is what every frame's header is.
+/// A length that counts itself, which is what every frame's header is.
 fn counted(body: Bytes) -> Bytes / {abort.raise} = bytes_concat(u32_be(bytes_len(body) + 4), body)
 
 fn frontend(f: Frontend, body: Bytes) -> Bytes / {abort.raise} =
   bytes_concat(byte_of_int(frontend_byte(f)), counted(body))
 
-// The start-up message: the protocol version, then the parameters, then a zero byte. No kind
-// byte, because the server has no connection to have agreed one on yet. A parameter past `user`
-// and `database` is a run-time setting the server applies to the session before it answers.
+/// The start-up message: the protocol version, then the parameters, then a zero byte. No kind
+/// byte, because the server has no connection to have agreed one on yet. A parameter past `user`
+/// and `database` is a run-time setting the server applies to the session before it answers.
 pub fn startup(user: String, database: String, parameters: List<Set>) -> Bytes / {abort.raise} =
   counted(
     bytes_concat_all([
@@ -149,20 +163,22 @@ pub fn startup(user: String, database: String, parameters: List<Set>) -> Bytes /
     ]),
   )
 
-// The byte a server answers a start-up with to say it will speak TLS; 1234 5679, the magic the
-// protocol reserves so that it can never be mistaken for a supported version.
+/// The byte a server answers a start-up with to say it will speak TLS; 1234 5679, the magic the
+/// protocol reserves so that it can never be mistaken for a supported version.
 pub fn ssl_request() -> Bytes / {abort.raise} = counted(u32_be(80877103))
 
+/// The byte a server answers an SSL request with when it will speak TLS.
 pub fn ssl_response() -> Bytes / {abort.raise} = byte_of_int(83)
 
+/// The request that cancels the statement a session is running, named by its backend key.
 pub fn cancel_request(pid: Int, secret: Int) -> Bytes / {abort.raise} =
   counted(bytes_concat_all([u32_be(80877102), u32_be(pid), u32_be(secret)]))
 
-// The simple query protocol: one statement, answered with rows and a command tag.
+/// The simple query protocol: one statement, answered with rows and a command tag.
 pub fn query(sql: String) -> Bytes / {abort.raise} = frontend(Query, cstring(sql))
 
-// The extended protocol: `parse` names a statement, `bind` names a portal over it, `execute`
-// runs the portal, and `sync` is what makes the server answer. Text format both ways.
+/// The extended protocol: `parse` names a statement, `bind` names a portal over it, `execute`
+/// runs the portal, and `sync` is what makes the server answer. Text format both ways.
 pub fn parse(statement: String, sql: String, param_types: List<Int>) -> Bytes / {abort.raise} =
   frontend(
     Parse,
@@ -183,6 +199,8 @@ fn bound_value(p: Option<String>) -> Bytes / {abort.raise} =
     },
   }
 
+/// `Bind` of a portal over a prepared statement, every parameter in text and `None` for NULL, and every
+/// result in text.
 pub fn bind(
   portal: String,
   statement: String,
@@ -201,28 +219,33 @@ pub fn bind(
     ]),
   )
 
-// `statement` describes the prepared statement, otherwise the portal.
+/// `statement` describes the prepared statement, otherwise the portal.
 pub fn describe(statement: Bool, name: String) -> Bytes / {abort.raise} =
   frontend(Describe, bytes_concat(byte_of_int(if statement { 83 } else { 80 }), cstring(name)))
 
-// `max_rows` of zero is no limit.
+/// `max_rows` of zero is no limit.
 pub fn execute(portal: String, max_rows: Int) -> Bytes / {abort.raise} =
   frontend(Execute, bytes_concat(cstring(portal), u32_be(max_rows)))
 
+/// `Sync`, which ends an extended-protocol exchange and makes the server answer.
 pub fn sync() -> Bytes / {abort.raise} = frontend(Sync, b"")
 
+/// `Flush`, which asks the server for what it has without ending the exchange.
 pub fn flush() -> Bytes / {abort.raise} = frontend(Flush, b"")
 
+/// `Close` of a prepared statement, or of a portal.
 pub fn close(statement: Bool, name: String) -> Bytes / {abort.raise} =
   frontend(Close, bytes_concat(byte_of_int(if statement { 83 } else { 80 }), cstring(name)))
 
+/// `Terminate`, after which the server expects nothing more.
 pub fn terminate() -> Bytes / {abort.raise} = frontend(Terminate, b"")
 
-// The first whole frame in `buf`, and the bytes after it. `None` leaves the buffer untouched:
-// a length that is not yet present, or is not a length, is a read that returned short rather
-// than a protocol error.
+/// The first whole frame in `buf`, and the bytes after it. `None` leaves the buffer untouched:
+/// a length that is not yet present, or is not a length, is a read that returned short rather
+/// than a protocol error.
 pub type Partial = { frame: Option<Message>, rest: Bytes }
 
+/// The first whole frame in `buf`, and the bytes after it.
 pub fn first(buf: Bytes) -> Partial / {abort.raise} = {
   let n = bytes_len(buf);
   if n < 5 { { frame: None, rest: buf } } else {
@@ -238,10 +261,10 @@ pub fn first(buf: Bytes) -> Partial / {abort.raise} = {
   }
 }
 
-// Every whole frame in `buf`, and the bytes that are not yet one.
+/// Every whole frame in `buf`, and the bytes that are not yet one.
 pub fn read(buf: Bytes) -> Frames / {abort.raise} = read_all(buf, [], bytes_len(buf))
 
-// A frame is five bytes at least, so the bytes bound the frames: `left`.
+/// A frame is five bytes at least, so the bytes bound the frames: `left`.
 fn read_all(buf: Bytes, acc: List<Message>, left: Int) -> Frames / {abort.raise} = {
   let p = first(buf);
   match p.frame {
@@ -253,9 +276,10 @@ fn read_all(buf: Bytes, acc: List<Message>, left: Int) -> Frames / {abort.raise}
 
 // --- Reading a body -----------------------------------------------------------
 
-// A zero-terminated string starting at `at`, and where the next field begins.
+/// A zero-terminated string starting at `at`, and where the next field begins.
 pub type CString = { text: String, next: Int }
 
+/// The zero-terminated string at `at`; `None` when no zero byte ends it.
 pub fn read_cstring(b: Bytes, at: Int) -> Option<CString> / {abort.raise} =
   if at < 0 || at >= bytes_len(b) { None } else {
     match bytes_index_of_byte(bytes_slice(b, at, bytes_len(b)), 0) {
@@ -264,10 +288,11 @@ pub fn read_cstring(b: Bytes, at: Int) -> Option<CString> / {abort.raise} =
     }
   }
 
-// What the server says before it will talk: 0 is authenticated, 3 wants a clear-text password,
-// 5 wants md5, 10 offers SASL, 11 and 12 are its two SASL steps.
+/// What the server says before it will talk: 0 is authenticated, 3 wants a clear-text password,
+/// 5 wants md5, 10 offers SASL, 11 and 12 are its two SASL steps.
 pub fn auth_code(message: Message) -> Option<Int> / {abort.raise} = u32_be_at(message.body, 0)
 
+/// What an authentication code asks for, as an error names it.
 pub fn auth_name(code: Int) -> String =
   if code == 0 { "AuthenticationOk" }
   else if code == 3 { "AuthenticationCleartextPassword" }
@@ -277,23 +302,26 @@ pub fn auth_name(code: Int) -> String =
   else if code == 12 { "AuthenticationSASLFinal" }
   else { "Authentication(" ++ int_to_string(code) ++ ")" }
 
-// The bytes after the code, which is what a SASL step carries.
+/// The bytes after the code, which is what a SASL step carries.
 pub fn auth_body(message: Message) -> Option<Bytes> / {abort.raise} =
   slice_at(message.body, 4, bytes_len(message.body) - 4)
 
-// 'I' idle, 'T' in a transaction, 'E' in a failed transaction, which refuses everything but
-// `ROLLBACK` until it ends.
+/// 'I' idle, 'T' in a transaction, 'E' in a failed transaction, which refuses everything but
+/// `ROLLBACK` until it ends.
 pub fn ready_status(message: Message) -> Option<Int> / {abort.raise} =
   if bytes_len(message.body) < 1 { None } else { Some(bytes_at(message.body, 0)) }
 
+/// Where a session's transaction stands, as `ReadyForQuery` says.
 pub type Status = | Idle | InTransaction | FailedTransaction | Unknown(Int)
 
+/// The status a `ReadyForQuery` byte names.
 pub fn status_of(b: Int) -> Status =
   if b == 73 { Idle }
   else if b == 84 { InTransaction }
   else if b == 69 { FailedTransaction }
   else { Unknown(b) }
 
+/// A status as a refusal names it.
 pub fn status_name(s: Status) -> String =
   match s {
     Idle -> "idle",
@@ -302,8 +330,10 @@ pub fn status_name(s: Status) -> String =
     Unknown(b) -> "unknown(" ++ int_to_string(b) ++ ")",
   }
 
+/// The process and secret a server names a session by, which `cancel_request` needs.
 pub type BackendKey = { pid: Int, secret: Int }
 
+/// The key a `BackendKeyData` message carries.
 pub fn backend_key(message: Message) -> Option<BackendKey> / {abort.raise} =
   match u32_be_at(message.body, 0) {
     None -> None,
@@ -313,8 +343,10 @@ pub fn backend_key(message: Message) -> Option<BackendKey> / {abort.raise} =
     },
   }
 
+/// A run-time parameter and its value.
 pub type Set = { name: String, value: String }
 
+/// The parameter a `ParameterStatus` message sets.
 pub fn parameter_status(message: Message) -> Option<Set> / {abort.raise} =
   match read_cstring(message.body, 0) {
     None -> None,
@@ -324,9 +356,10 @@ pub fn parameter_status(message: Message) -> Option<Set> / {abort.raise} =
     },
   }
 
-// A column's name, its type's OID and the format its values arrive in: 0 text, 1 binary.
+/// A column's name, its type's OID and the format its values arrive in: 0 text, 1 binary.
 pub type Column = { name: String, ty: Int, format: Int }
 
+/// The columns a `RowDescription` describes.
 pub fn row_description(message: Message) -> Option<List<Column>> / {abort.raise} =
   match u16_be_at(message.body, 0) {
     None -> None,
@@ -359,7 +392,7 @@ fn columns(
     }
   }
 
-// One row, with `None` for a NULL column. The length is a count of bytes, and -1 is NULL.
+/// One row, with `None` for a NULL column. The length is a count of bytes, and -1 is NULL.
 pub fn data_row(message: Message) -> Option<List<Option<Bytes>>> / {abort.raise} =
   match u16_be_at(message.body, 0) {
     None -> None,
@@ -384,10 +417,11 @@ fn values(
     }
   }
 
-// The tag a completed command answers with: `SELECT 3`, `INSERT 0 1`, `BEGIN`.
+/// The tag a completed command answers with: `SELECT 3`, `INSERT 0 1`, `BEGIN`.
 pub fn command_tag(message: Message) -> Option<String> / {abort.raise} =
   match read_cstring(message.body, 0) { None -> None, Some(tag) -> Some(tag.text) }
 
+/// The type OIDs a `ParameterDescription` lists for a statement's parameters.
 pub fn parameter_types(message: Message) -> Option<List<Int>> / {abort.raise} =
   match u16_be_at(message.body, 0) { None -> None, Some(count) -> oids(message.body, 2, count, []) }
 
@@ -399,15 +433,16 @@ fn oids(body: Bytes, at: Int, left: Int, acc: List<Int>) -> Option<List<Int>> / 
     }
   }
 
-// An `ErrorResponse` and a `NoticeResponse` are the same shape: a field type byte, the field's
-// text, and a zero byte at the end. `S` is severity, `C` the SQLSTATE, `M` the message, `D` its
-// detail and `n` the constraint a violation names.
+/// An `ErrorResponse` and a `NoticeResponse` are the same shape: a field type byte, the field's
+/// text, and a zero byte at the end. `S` is severity, `C` the SQLSTATE, `M` the message, `D` its
+/// detail and `n` the constraint a violation names.
 pub type Field = { code: Int, text: String }
 
+/// Every field of an `ErrorResponse` or a `NoticeResponse`.
 pub fn diagnostic_fields(message: Message) -> List<Field> / {abort.raise} =
   fields_of(message.body, 0, [], bytes_len(message.body))
 
-// A field is its code and its text's end at least, so the bytes bound the fields: `left`.
+/// A field is its code and its text's end at least, so the bytes bound the fields: `left`.
 fn fields_of(b: Bytes, at: Int, acc: List<Field>, left: Int) -> List<Field> / {abort.raise} =
   if at >= bytes_len(b) { acc }
   else if bytes_at(b, at) == 0 { acc } else {
@@ -419,20 +454,24 @@ fn fields_of(b: Bytes, at: Int, acc: List<Field>, left: Int) -> List<Field> / {a
     }
   }
 
+/// The diagnostic field with this type byte, such as the SQLSTATE under `C`.
 pub fn field_of(message: Message, code: Int) -> Option<String> / {abort.raise} =
   fold(diagnostic_fields(message), None, |acc: Option<String>, f: Field|
     if f.code == code { Some(f.text) } else { acc })
 
 // --- A connection ---------------------------------------------------------------
 
+/// How long a client waits, in milliseconds: to connect, for a read, for a write.
 pub type Client = { connect_ms: Int, read_ms: Int, write_ms: Int }
 
+/// Five seconds to connect, thirty to read or write.
 pub fn default_client() -> Client = { connect_ms: 5000, read_ms: 30000, write_ms: 30000 }
 
+/// The most bytes one `net.recv` asks for.
 pub fn read_size() -> Int = 65536
 
-// What the server said when it refused: the SQLSTATE is what a program branches on, the
-// constraint is the one a violation names, and the rest is what it prints.
+/// What the server said when it refused: the SQLSTATE is what a program branches on, the
+/// constraint is the one a violation names, and the rest is what it prints.
 pub type Server = {
   severity: String,
   code: String,
@@ -441,8 +480,8 @@ pub type Server = {
   constraint: String,
 }
 
-// A connection with a server, the bytes read from it that are not yet a whole frame, the
-// parameters it set at start-up, and where its transaction stood at the last `ReadyForQuery`.
+/// A connection with a server, the bytes read from it that are not yet a whole frame, the
+/// parameters it set at start-up, and where its transaction stood at the last `ReadyForQuery`.
 pub type Session = {
   conn: Int,
   buffer: Bytes,
@@ -452,23 +491,25 @@ pub type Session = {
   status: Status,
 }
 
+/// Why a client operation has no answer.
 pub type ClientError =
   | Unreachable
   | NotSent
   | TimedOut
   | Closed
-  // The server refused and there is no connection left to use: it refused before it would talk,
-  // or its error ended the session.
+  /// The server refused and there is no connection left to use: it refused before it would talk,
+  /// or its error ended the session.
   | Refused(Server)
-  // A statement was refused. The connection is still usable — the server is waiting for the
-  // next one — so the session comes back with the refusal for the caller to decide about.
+  /// A statement was refused. The connection is still usable — the server is waiting for the
+  /// next one — so the session comes back with the refusal for the caller to decide about.
   | Rejected(Session, Server)
   | Unexpected(String)
 
-// How a refusal reads: the severity, the message, and the SQLSTATE a program branches on.
+/// How a refusal reads: the severity, the message, and the SQLSTATE a program branches on.
 pub fn server_text(server: Server) -> String =
   server.severity ++ ": " ++ server.message ++ " (" ++ server.code ++ ")"
 
+/// How a client error reads.
 pub fn client_error_text(e: ClientError) -> String =
   match e {
     Unreachable -> "the server could not be reached",
@@ -480,11 +521,12 @@ pub fn client_error_text(e: ClientError) -> String =
     Unexpected(what) -> what,
   }
 
+/// The value the server set `name` to at start-up.
 pub fn setting(s: Session, name: String) -> Option<String> =
   fold(s.settings, None, |acc: Option<String>, set: Set|
     if set.name == name { Some(set.value) } else { acc })
 
-// A message read, and the buffer after it.
+/// A message read, and the buffer after it.
 type Received = { message: Message, rest: Bytes }
 
 fn read_message<[l]>(
@@ -494,8 +536,8 @@ fn read_message<[l]>(
 ) -> Result<Received, ClientError> / {net.recv[l], abort.raise} =
   awaiting[l](c, buf, timeout_ms, 4294967297)
 
-// A frame is at most 2^32 bytes past its kind, and a round adds a byte at least, so a well-formed
-// one is whole within `room` rounds.
+/// A frame is at most 2^32 bytes past its kind, and a round adds a byte at least, so a well-formed
+/// one is whole within `room` rounds.
 fn awaiting<[l]>(
   c: Int,
   buf: Bytes,
@@ -527,15 +569,15 @@ fn server_of(message: Message) -> Server / {abort.raise} =
     constraint: field_or(message, 110, ""),
   }
 
-// A `ReadyForQuery` without its status byte says nothing about the transaction.
+/// A `ReadyForQuery` without its status byte says nothing about the transaction.
 fn status_after(message: Message) -> Status / {abort.raise} =
   match ready_status(message) { Some(b) -> status_of(b), None -> Unknown(0) }
 
 fn field_or(m: Message, code: Int, fallback: String) -> String / {abort.raise} =
   match field_of(m, code) { Some(text) -> text, None -> fallback }
 
-// Open a socket and get to where the server will answer a query: start-up, whatever
-// authentication it asks for, its parameters, and `ReadyForQuery`.
+/// Open a socket and get to where the server will answer a query: start-up, whatever
+/// authentication it asks for, its parameters, and `ReadyForQuery`.
 pub fn connect<[l]>(
   host: String,
   port: Int,
@@ -636,7 +678,7 @@ fn no_password(user: String, what: String) -> Server =
     constraint: "",
   }
 
-// `PasswordMessage`, which is also the frame a SASL step travels in.
+/// `PasswordMessage`, which is also the frame a SASL step travels in.
 pub fn password_message(text: String) -> Bytes / {abort.raise} =
   bytes_concat(byte_of_int(112), counted(cstring(text)))
 
@@ -645,18 +687,19 @@ pub fn password_message(text: String) -> Bytes / {abort.raise} =
 // RFC 5802's exchange with RFC 7677's SHA-256: the client proves it knows the password without
 // sending it, and then the server proves it knows the verifier. Four messages.
 
-// What the greeting has collected: the parameters the server set, and where SASL has got to.
+/// What the greeting has collected: the parameters the server set, and where SASL has got to.
 type Greeting = { settings: List<Set>, sasl: Sasl }
 
 type Sasl = { first_bare: String, expected: Option<Bytes> }
 
 fn nothing_said() -> Greeting = { settings: [], sasl: { first_bare: "", expected: None } }
 
-// The GS2 header says no channel binding is in use, and the bare message names the user and the
-// client's nonce. `=` and `,` are escaped, because they separate the fields.
+/// The GS2 header says no channel binding is in use, and the bare message names the user and the
+/// client's nonce. `=` and `,` are escaped, because they separate the fields.
 pub fn scram_first(user: String, nonce: String) -> String / {abort.raise} =
   "n,," ++ scram_first_bare(user, nonce)
 
+/// The client's first message without its GS2 header, which the signatures cover.
 pub fn scram_first_bare(user: String, nonce: String) -> String / {abort.raise} =
   "n=" ++ scram_name(user) ++ ",r=" ++ nonce
 
@@ -666,7 +709,7 @@ fn scram_name(user: String) -> String / {abort.raise} =
     if c == "=" { acc ++ "=3D" } else if c == "," { acc ++ "=2C" } else { acc ++ c }
   })
 
-// One `name=value` out of a comma-separated message, or `None` when it is not there.
+/// One `name=value` out of a comma-separated message, or `None` when it is not there.
 fn scram_attribute(text: String, name: String) -> Option<String> / {abort.raise} =
   fold(string_split(text, ","), None, |acc: Option<String>, part: String|
     match acc {
@@ -676,7 +719,7 @@ fn scram_attribute(text: String, name: String) -> Option<String> / {abort.raise}
       } else { None },
     })
 
-// A decimal count, refused rather than defaulted when it is not one.
+/// A decimal count, refused rather than defaulted when it is not one.
 fn nat_text(text: String) -> Option<Int> / {abort.raise} =
   if string_len(text) == 0 { None } else {
     fold(range(0, string_len(text)), Some(0), |acc: Option<Int>, i: Int|
@@ -689,9 +732,10 @@ fn nat_text(text: String) -> Option<Int> / {abort.raise} =
       })
   }
 
-// `r`, `s` and `i` out of the server's first message; the salt is base64 there.
+/// `r`, `s` and `i` out of the server's first message; the salt is base64 there.
 pub type Challenge = { nonce: String, salt: Bytes, iterations: Int }
 
+/// The nonce, salt and iteration count out of the server's first SCRAM message.
 pub fn scram_challenge(server_first: String) -> Option<Challenge> / {abort.raise} =
   match scram_attribute(server_first, "r") {
     None -> None,
@@ -710,12 +754,12 @@ pub fn scram_challenge(server_first: String) -> Option<Challenge> / {abort.raise
     },
   }
 
-// The two things the keys are for: the reply that carries the proof, and the signature the
-// server is about to prove itself with.
+/// The two things the keys are for: the reply that carries the proof, and the signature the
+/// server is about to prove itself with.
 pub type Proof = { reply: String, expected: Bytes }
 
-// What both sides sign: the client's bare message, the server's first message, and the final
-// message without its proof, joined by commas.
+/// What both sides sign: the client's bare message, the server's first message, and the final
+/// message without its proof, joined by commas.
 pub fn scram_final(
   password: String,
   first_bare: String,
@@ -733,22 +777,22 @@ pub fn scram_final(
   }
 }
 
-// `v=` out of the server's last message, checked against what the keys said it would be.
+/// `v=` out of the server's last message, checked against what the keys said it would be.
 pub fn scram_verify(server_final: String, expected: Bytes) -> Bool / {abort.raise} =
   match scram_attribute(server_final, "v") {
     None -> false,
     Some(text) -> match base64_decode(text) { Err(_) -> false, Ok(got) -> got == expected },
   }
 
-// The bytes after an authentication code, as the text a SASL step carries.
+/// The bytes after an authentication code, as the text a SASL step carries.
 fn auth_text(message: Message) -> Option<String> / {abort.raise} =
   match auth_body(message) { None -> None, Some(bytes) -> Some(string_of_bytes(bytes)) }
 
-// The mechanisms an `AuthenticationSASL` offers: cstrings until an empty one.
+/// The mechanisms an `AuthenticationSASL` offers: cstrings until an empty one.
 fn mechanisms(message: Message) -> List<String> / {abort.raise} =
   match auth_body(message) { None -> [], Some(bytes) -> names_from(bytes, 0, [], bytes_len(bytes)) }
 
-// `left` as in `fields_of`: a name that goes on is a byte and its end at least.
+/// `left` as in `fields_of`: a name that goes on is a byte and its end at least.
 fn names_from(b: Bytes, at: Int, acc: List<String>, left: Int) -> List<String> / {abort.raise} =
   if at >= bytes_len(b) { acc } else {
     match read_cstring(b, at) {
@@ -762,7 +806,7 @@ fn names_from(b: Bytes, at: Int, acc: List<String>, left: Int) -> List<String> /
 fn offers_scram(message: Message) -> Bool / {abort.raise} =
   fold(mechanisms(message), false, |acc: Bool, name: String| acc || name == "SCRAM-SHA-256")
 
-// The client's first message: the mechanism, then the length-prefixed first message.
+/// The client's first message: the mechanism, then the length-prefixed first message.
 fn scram_begin<[l]>(
   s: Session,
   password: Option<String>,
@@ -790,7 +834,7 @@ fn scram_begin<[l]>(
     },
   }
 
-// The client's last message: the proof, and nothing else in the frame.
+/// The client's last message: the proof, and nothing else in the frame.
 fn scram_continue<[l]>(
   s: Session,
   password: Option<String>,
@@ -823,11 +867,13 @@ fn scram_continue<[l]>(
 
 // --- Queries --------------------------------------------------------------------
 
+/// What a query answered: its columns, its rows with `None` for NULL, and its command tag.
 pub type Answer = { columns: List<Column>, rows: List<List<Option<Bytes>>>, tag: String }
 
+/// The session after a query, and its answer.
 pub type Reply = { session: Session, answer: Answer }
 
-// The simple query protocol: one statement, no parameters.
+/// The simple query protocol: one statement, no parameters.
 pub fn simple_query<[l]>(
   s: Session,
   sql: String,
@@ -836,9 +882,9 @@ pub fn simple_query<[l]>(
   if !send_all[l](s.conn, query(sql), client.write_ms) { Err(NotSent) }
   else { gather[l](s, client, nothing()) }
 
-// The extended query protocol, every parameter and every result in text format, so a parameter
-// is the text the server would have printed. The statement and the portal are unnamed, which is
-// what makes this one exchange at a time.
+/// The extended query protocol, every parameter and every result in text format, so a parameter
+/// is the text the server would have printed. The statement and the portal are unnamed, which is
+/// what makes this one exchange at a time.
 pub fn extended_query<[l]>(
   s: Session,
   sql: String,
@@ -867,9 +913,9 @@ type Reading = {
 
 fn nothing() -> Reading = { columns: [], rows: [], tag: "", refused: None }
 
-// Everything a query answers, up to the `ReadyForQuery` that ends it. A refusal is carried to
-// that point rather than raised where it arrives, so the connection is left usable; a server that
-// hangs up after its refusal instead, as a `FATAL` one does, is answered with that refusal.
+/// Everything a query answers, up to the `ReadyForQuery` that ends it. A refusal is carried to
+/// that point rather than raised where it arrives, so the connection is left usable; a server that
+/// hangs up after its refusal instead, as a `FATAL` one does, is answered with that refusal.
 fn gather<[l]>(
   s: Session,
   client: Client,
@@ -914,7 +960,7 @@ fn gather<[l]>(
     },
   }
 
-// The connection is done; the server expects nothing more.
+/// The connection is done; the server expects nothing more.
 pub fn finish<[l]>(s: Session, client: Client) -> Unit / {net.send[l], net.close[l], abort.raise} = {
   send_all[l](s.conn, terminate(), client.write_ms);
   net.close[l](s.conn)
@@ -1130,8 +1176,8 @@ fn t_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
 fn t_session() -> Session =
   { conn: 1, buffer: b"", user: "ply", database: "ply", settings: [], status: Idle }
 
-// Simple queries over a scripted connection: each `recv` takes the next chunk, and once they run
-// out the server has hung up.
+/// Simple queries over a scripted connection: each `recv` takes the next chunk, and once they run
+/// out the server has hung up.
 fn t_queries(
   chunks: List<Bytes>,
   sqls: List<String>,
