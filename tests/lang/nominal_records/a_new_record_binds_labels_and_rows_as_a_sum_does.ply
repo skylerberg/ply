@@ -1,0 +1,74 @@
+// A `new` record takes type, label and row parameters where a sum does, and a use fills them in
+// the same places. The row it is given is part of which type it is; a function it is built of may
+// perform less.
+
+effect net {
+  write send[r](Bytes) -> Unit
+}
+
+effect count {
+  read next() -> Int
+}
+
+pub type Stepper<a | e> = new { step: () -> Option<a> / e, taken: Int }
+
+pub type Sender<[l]> = new { send: (Bytes) -> Unit / {net.send[l]} }
+
+pub type Feed<a, [l] | e> = new { read: () -> a / e, send: (a) -> Unit / {net.send[l] | e} }
+
+fn always(n: Int) -> Stepper<Int | {}> = { step: || Some(n), taken: 0 }
+
+fn counting() -> Stepper<Int | {count.next}> = { step: || Some(count.next()), taken: 0 }
+
+// A step that performs nothing meets a row that permits a raise.
+fn guarded(n: Int) -> Stepper<Int | {abort.raise}> = { step: || Some(n), taken: 0 }
+
+fn stepped<a | e>(s: Stepper<a | e>) -> Option<a> / e = (s.step)()
+
+fn taken<a | e>(s: Stepper<a | e>) -> Stepper<a | e> = { ..s, taken: s.taken + 1 }
+
+fn replaced<a | e>(s: Stepper<a | e>, step: () -> Option<a> / e) -> Stepper<a | e> =
+  { ..s, step: step }
+
+fn to<[l]>() -> Sender<[l]> = { send: |b: Bytes| net.send[l](b) }
+
+fn feed<[l]>(n: Int) -> Feed<Int, [l] | {count.next}> =
+  { read: || n + count.next(), send: |v: Int| net.send[l](bytes_of_string(int_to_string(v))) }
+
+fn pumped<a, [l] | e>(f: Feed<a, [l] | e>) -> Unit / {net.send[l] | e} = (f.send)((f.read)())
+
+test "a record with a row parameter is built, read and updated at the row it is given" {
+  assert_eq(stepped(always(3)), Some(3));
+  assert_eq(taken(taken(always(3))).taken, 2);
+  assert_eq(stepped(replaced(always(3), || Some(9))), Some(9));
+  assert_eq(stepped(guarded(4)), Some(4))
+}
+
+test "the row a record is given is what calling its function performs" {
+  let drawn = handle { stepped(taken(counting())) } with { count.next() -> 7 };
+  assert_eq(drawn, Some(7))
+}
+
+test "a label parameter is filled where the record is used, by name or from a binder" {
+  let sent = handle {
+    to[conn]().send(b"one");
+    let s: Sender<[peer]> = { send: |b: Bytes| net.send[peer](b) };
+    (s.send)(b"two");
+    0
+  } with {
+    net.send[conn](b) resume k -> k(()) + bytes_len(b),
+    net.send[peer](b) resume k -> k(()) + 10 * bytes_len(b),
+  };
+  assert_eq(sent, 33)
+}
+
+test "a record binds all three kinds at once, and a call fills them from its argument" {
+  let wrote = handle {
+    pumped(feed[conn](40));
+    0
+  } with {
+    count.next() -> 2,
+    net.send[conn](b) resume k -> k(()) + bytes_len(b),
+  };
+  assert_eq(wrote, 2)
+}

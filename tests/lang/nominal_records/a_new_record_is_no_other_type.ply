@@ -1,0 +1,152 @@
+// What a `new` record refuses: any other type where it is expected, itself where any other is, a
+// literal that is not all of its fields, and a declaration that reaches itself.
+
+import compiler.infer (check_dump, check_dump_known)
+import compiler.items (parse)
+
+fn calendar() -> String =
+  \\pub type Date = new { year: Int, month: Int, day: Int }
+  \\pub type Day = new { year: Int, month: Int, day: Int }
+  \\pub type Plain = { year: Int, month: Int, day: Int }
+  \\pub fn epoch() -> Date = { year: 1970, month: 1, day: 1 }
+  \\pub fn year_of(d: Date) -> Int = d.year
+  \\
+
+// What the checker says of `calendar` with `body` after it.
+fn checked(body: Bytes) -> String / {abort.raise} =
+  check_dump([{ name: b"m", src: bytes_concat(bytes_of_string(calendar()), body) }])
+
+// A refusal is `X;` and its diagnostics after the count of modules.
+fn refused(body: Bytes, code: String) -> Bool / {abort.raise} =
+  !accepted(body) && string_contains(checked(body), code)
+
+fn accepted(body: Bytes) -> Bool / {abort.raise} = !string_starts_with(checked(body), "K;1;X;")
+
+test "the declarations and a literal where a `Date` is expected check" {
+  assert(accepted(b""));
+  assert(accepted(b"fn a() -> Int = year_of({ year: 1, month: 2, day: 3 })"))
+}
+
+test "a record with a `new` record's fields is not one unless it is written where one is expected" {
+  let held = b"fn a() -> Int = {\n  let r = { year: 1, month: 2, day: 3 };\n  year_of(r)\n}";
+  assert(refused(held, "E0201"));
+  assert(refused(b"fn a(p: Plain) -> Int = year_of(p)", "E0201"));
+  assert(refused(b"fn a(p: Plain) -> Date = p", "E0201"))
+}
+
+test "a `new` record is no other record, of the same fields or of another declaration" {
+  assert(refused(b"fn a() -> Plain = epoch()", "E0201"));
+  assert(refused(b"fn a() -> { year: Int, month: Int, day: Int } = epoch()", "E0201"));
+  assert(refused(b"fn a(d: Day) -> Date = d", "E0201"));
+  assert(refused(b"fn a(d: Day) -> Bool = d == epoch()", "E0201"))
+}
+
+test "a literal names every field of the record it is expected to be, and no other" {
+  assert(refused(b"fn a() -> Date = { year: 1, month: 2 }", "E0201"));
+  assert(refused(b"fn a() -> Date = { year: 1, month: 2, day: 3, hour: 4 }", "E0101"));
+  assert(refused(b"fn a() -> Date = { year: 1, month: 2, day: \"three\" }", "E0201"))
+}
+
+test "an update writes only the record's fields, each at its declared type" {
+  assert(accepted(b"fn a(d: Date) -> Date = { ..d, day: 1 }"));
+  assert(refused(b"fn a(d: Date) -> Date = { ..d, hour: 1 }", "E0117"));
+  assert(refused(b"fn a(d: Date) -> Date = { ..d, day: \"one\" }", "E0201"));
+  assert(refused(b"fn a(d: Date) -> Day = { ..d, day: 1 }", "E0201"))
+}
+
+test "a field it lacks is not read, and a pattern names every field or ends with `..`" {
+  assert(refused(b"fn a(d: Date) -> Int = d.hour", "E0101"));
+  assert(
+    refused(b"fn a(d: Date) -> Int = {\n  let { year, month } = d;\n  year + month\n}", "E0201"),
+  );
+  assert(accepted(b"fn a(d: Date) -> Int = {\n  let { year, month, .. } = d;\n  year + month\n}"))
+}
+
+test "a `new` record whose fields reach it is refused, and one that reaches it through a sum is not" {
+  assert(refused(b"type Tree = new { kids: List<Tree> }", "E0214"));
+  assert(
+    refused(b"type Ping = new { pong: Pong }\ntype Pong = new { ping: Option<Ping> }", "E0214"),
+  );
+  assert(refused(b"type Wrap = { inner: Loop }\ntype Loop = new { wrap: Option<Wrap> }", "E0214"));
+  assert(accepted(b"type Tree = new { root: Node }\ntype Node = | Leaf | Fork(Tree, Tree)"))
+}
+
+test "its declaration is closed: no region's handle, no row variable, no unordered `Map` key" {
+  assert(refused(b"type Held = new { cell: Cell<Int> }", "E0446"));
+  assert(refused(b"type Open = new { run: (Int) -> Int / e }", "E0301"));
+  assert(refused(b"type Keyed = new { by: Map<Float, Int> }", "E0206"));
+  let index = b"type Index<k> = new { by: Map<k, Int> }\n";
+  assert(refused(bytes_concat(index, b"fn none<k>() -> Index<k> = { by: map_new() }"), "E0206"));
+  assert(
+    accepted(
+      bytes_concat(
+        index,
+        b"fn none<k>() -> Index<k>\n  where derivable(ord, k)\n= { by: map_new() }",
+      ),
+    ),
+  );
+  // The promise is made where a value is built, not wherever the type is named.
+  assert(accepted(bytes_concat(index, b"fn kept<k>(i: Index<k>) -> Index<k> = i")))
+}
+
+fn stepper() -> Bytes =
+  b"type Stepper<a | e> = new { step: () -> Option<a> / e }\nfn raising() -> Stepper<Int | {abort.raise}> = { step: || panic(\"spent\") }\n"
+
+fn stepping(body: Bytes) -> Bytes = bytes_concat(stepper(), body)
+
+test "the row a `new` record is given is part of which type it is, as a sum's is" {
+  assert(accepted(stepper()));
+  let pure = b"fn pure(s: Stepper<Int | {}>) -> Option<Int> = (s.step)()\n";
+  assert(
+    refused(stepping(bytes_concat(pure, b"fn a() -> Option<Int> = pure(raising())")), "E0302"),
+  );
+  assert(
+    refused(stepping(b"fn a() -> Stepper<Int | {}> = { step: || panic(\"spent\") }"), "E0302"),
+  );
+  assert(accepted(stepping(b"fn a() -> Stepper<Int | {abort.raise}> = { step: || Some(1) }")))
+}
+
+test "a use fills every parameter a `new` record binds, and its declaration names only its own" {
+  assert(refused(stepping(b"fn a(s: Stepper<Int>) -> Int = 1"), "E0202"));
+  let sender = b"effect net { write send[r](Bytes) -> Unit }\ntype Sender<[l]> = new { send: (Bytes) -> Unit / {net.send[l]} }\n";
+  assert(accepted(sender));
+  assert(refused(bytes_concat(sender, b"fn a(s: Sender) -> Int = 1"), "E0202"));
+  assert(refused(bytes_concat(sender, b"fn a(s: Sender<[conn]>) -> Sender<[peer]> = s"), "E0201"));
+  assert(refused(b"type Free = new { run: () -> Int / e }", "E0301"))
+}
+
+test "a row a field writes is seen leaving a region, as a plain record's is" {
+  let reader = b"type Reader = new { read: () -> Int / {cell.read[counter]} }\n";
+  assert(accepted(reader));
+  let escaping = b"fn a() -> Reader = with_cell[counter](0) { c -> { read: || cell_get(c) } }";
+  assert(refused(bytes_concat(reader, escaping), "E0201"));
+  // A sum hides its fields, so it is refused the record where it is declared.
+  assert(refused(bytes_concat(reader, b"type Kept = | Kept(Reader)"), "E0446"))
+}
+
+test "a tuple where a `new` record is expected is another type, not a record misnamed" {
+  let dump = checked(b"fn a() -> Date = (1, 2, 3)");
+  assert(string_contains(dump, "E0201"));
+  assert(!string_contains(dump, "E0101"))
+}
+
+test "a program of `new` records checked again from what it published answers the same" {
+  let program = [
+    {
+      name: b"m",
+      src: bytes_concat(
+        bytes_of_string(calendar()),
+        b"pub fn later(d: Date) -> Date = { ..d, year: year_of({ ..d, day: 1 }) + 1 }",
+      ),
+    },
+  ];
+  assert_eq(check_dump_known(program), check_dump(program))
+}
+
+test "`new` is followed by a record type that names a field" {
+  let diagnosed = |src: Bytes| len(parse(src).parser.diags);
+  assert_eq(diagnosed(b"type Date = new { year: Int }\n"), 0);
+  assert_eq(diagnosed(b"type Date = new {}\n"), 1);
+  assert_eq(diagnosed(b"type Date = new (Int, Int)\n"), 1);
+  assert_eq(diagnosed(b"type Year = new Int\n"), 1)
+}
