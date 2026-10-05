@@ -264,6 +264,8 @@ pub enum Judgement {
     Spent {
         limit: i64,
     },
+    /// What the definition a point named answered at its arguments.
+    Drew(ply_eval::Plain),
 }
 
 impl Judgement {
@@ -287,6 +289,9 @@ pub enum Mode {
     Domain,
     /// A cost law's sizes, each within `limit` steps, until one raises or takes more.
     Cost { limit: i64 },
+    /// Each point a definition's name and then its arguments, answered with what the definition
+    /// answers there: how a type's stated generator draws.
+    Drawn,
 }
 
 impl Mode {
@@ -360,6 +365,7 @@ impl Prover {
             let judgement = match mode {
                 Mode::Whole => cases.judge(values),
                 Mode::Cost { limit } => cases.measure(values, limit),
+                Mode::Drawn => cases.drawn(values),
                 Mode::Witness | Mode::Domain => match cases.guard(values) {
                     Ok(true) => Judgement::Held,
                     Ok(false) => Judgement::Rejected,
@@ -536,6 +542,18 @@ impl Cases<'_> {
         }
     }
 
+    /// The definition a point names, entered at the arguments after its name.
+    fn drawn(&mut self, point: &[Value]) -> Judgement {
+        let Some((Value::Str(name), args)) = point.split_first() else {
+            return Judgement::Faulted(unnamed_draw(self.span));
+        };
+        let root = Symbol::new(&**name);
+        match self.enter(&root, args.to_vec()) {
+            Ok(value) => Judgement::Drew(ply_eval::Plain::of(&value)),
+            Err(d) => Judgement::stopped(d),
+        }
+    }
+
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         for at in 0..self.guard_roots.len() {
             let root = self.guard_roots[at].clone();
@@ -579,6 +597,14 @@ impl Interleaved {
             warnings: Vec::new(),
         }
     }
+}
+
+/// A draw that names no definition: the program and this reader disagree about a point's shape.
+#[cold]
+fn unnamed_draw(span: Span) -> Diagnostic {
+    Diagnostic::error(codes::INTERNAL_ERROR, "a draw names no definition to enter")
+        .primary(span, "a point of this claim was to be drawn")
+        .note("`proof.drawn` and this reader are written together; this is Ply's fault")
 }
 
 /// A cost law's body answers `{bound, steps}`.
