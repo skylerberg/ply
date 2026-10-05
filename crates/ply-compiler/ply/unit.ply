@@ -9,7 +9,8 @@ import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBy
 import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow, analyse, dump_of)
 import diagnostics (parse_all)
 import infer (sccs, dump_flag)
-import interface (stubbed)
+import interface (read_key, sized, stubbed)
+import embed (EmbedAt)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
 import std.bin
 import std.list (sort_by, take, at, concat)
@@ -1008,11 +1009,26 @@ type Program = {
   modules: List<ModuleRow>,
   imports: Map<Bytes, List<Bytes>>,
   sources: List<Bytes>,
+  /// A digest of what each module embeds, by its index: the emitter writes each call out as its bytes.
+  embeds: Map<Int, Bytes>,
 }
 
-fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
+fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
   let by_name = fold(dump.modules, map_new(), |acc: Map<Bytes, ModuleRow>, m: ModuleRow|
     map_insert(acc, m.name, m));
+  let reads = fold(dump.embeds, map_new(), |acc: Map<Int, List<Bytes>>, e: EmbedAt|
+    match map_get(by_name, e.module) {
+      None -> acc,
+      Some(m) ->
+        map_insert(
+          acc,
+          m.index,
+          push(
+            match map_get(acc, m.index) { Some(xs) -> xs, None -> [] },
+            bytes_concat(sized(e.key), read_key(e.read)),
+          ),
+        ),
+    });
   {
     roots: fold(dump.emitter_roots, map_new(), |acc: Map<Bytes, EmitterRoot>, root: EmitterRoot|
       map_insert(acc, root.root, root)),
@@ -1024,6 +1040,8 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
     imports: map_fold(by_name, map_new(), |acc: Map<Bytes, List<Bytes>>, n: Bytes, m: ModuleRow|
       map_insert(acc, n, m.imports)),
     sources: sources,
+    embeds: map_fold(reads, map_new(), |acc: Map<Int, Bytes>, i: Int, parts: List<Bytes>|
+      map_insert(acc, i, blake3(bytes_concat_all(ordered(parts))))),
   }
 }
 
@@ -1050,8 +1068,9 @@ fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort
 }
 
 /// What a kept answer is a function of beyond the emitter and the runtime: the root's name, the key
-/// the front end gave it, and the text it is written in, since its sites are offsets into that text.
-/// `None` for a root with no key or no place, which is asked again every time.
+/// the front end gave it, the text it is written in, since its sites are offsets into that text, and
+/// what its module embeds, which that text's calls are written out as. `None` for a root with no key
+/// or no place, which is asked again every time.
 fn root_material(program: Program, name: Bytes) -> Option<Bytes> / {abort.raise} =
   match map_get(program.keys, name) {
     None -> None,
@@ -1069,6 +1088,7 @@ fn root_material(program: Program, name: Bytes) -> Option<Bytes> / {abort.raise}
               key,
               b"\x00",
               blake3(bytes_slice(text, r.at.start, r.at.end)),
+              match map_get(program.embeds, r.at.module) { Some(d) -> d, None -> b"" },
             ]),
           )
         },
@@ -1908,6 +1928,25 @@ test "roots are dealt a module at a time, each once, over no more lists than the
   );
   let many = map(range(0, 3 * pieces()), |i: Int| bytes_concat_all([b"m", ascii_of_int(i), b".f"]));
   assert_eq(len(dealt(p, many)), pieces())
+}
+
+test "a root's kept answer moves with what its module embeds, and with no other module's" {
+  let dump = three_modules_dump();
+  let embedding = |bytes: Bytes|
+    program_of(
+      {
+        ..dump,
+        embeds: [{ module: b"c", key: b"file:data.txt", read: Ok([{ name: b"", bytes: bytes }]) }],
+      },
+      three_modules(),
+    );
+  let one = root_material(embedding(b"one"), b"c.h");
+  assert(one != None, None);
+  assert(one != root_material(embedding(b"two"), b"c.h"), None);
+  assert_eq(
+    root_material(embedding(b"one"), b"a.f"),
+    root_material(program_of(dump, three_modules()), b"a.f"),
+  )
 }
 
 test "the emitter answers roots dealt over calls as it answers them in one" {
