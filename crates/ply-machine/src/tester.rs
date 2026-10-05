@@ -1,6 +1,7 @@
 //! What `ply test` loads, binds and runs, as `crates/ply-cli/ply/tests.ply` asks for it through the
 //! effect `tester.ply` declares: a unit per program its tests run in, the host binding over the
-//! first, and one test or one interleaving of one on whichever thread asks.
+//! first, the cases a test ranges over, and one test or one interleaving of one on whichever
+//! thread asks.
 //!
 //! A compiled unit, the host binding and a Rust unwind are not values a program can hold, so those
 //! stay here. Which tests run, the keys each result is read and filed under, what the cache keeps,
@@ -11,7 +12,7 @@ use crate::hosts::{self, Hosts, LentOp};
 use crate::payload::{count, diags_value, field_of, json, option, raised_value, record, strings};
 use crate::support::{select_profile, unit_of};
 use crate::testrun::{
-    Executed, Executor, Hosting, Interleaved, Usage, executed, interleaved, status_word,
+    Executed, Executor, Hosting, Interleaved, Usage, executed, interleaved, listed, status_word,
 };
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity, MachineId};
 use ply_eval::{Diagnostic, Seed, Span, Value as PlyValue, codes};
@@ -23,7 +24,7 @@ const EFFECT: &str = "tester";
 
 const HERMETIC: &str = "hermetic_tester";
 
-const OPERATIONS: [(&str, &str); 9] = [
+const OPERATIONS: [(&str, &str); 10] = [
     ("configure", "ply_machine::tester::configure"),
     // The programs tests run in, the schema the first one enters, the binding over it, and what
     // it came to.
@@ -32,20 +33,22 @@ const OPERATIONS: [(&str, &str); 9] = [
     ("bound", "ply_machine::tester::bound"),
     ("hosted", "ply_machine::tester::hosted"),
     ("ended", "ply_machine::tester::ended"),
-    // A test once, or one interleaving of it, on whichever thread asks.
+    // A test's cases, and a test once or one interleaving of it, on whichever thread asks.
+    ("cases", "ply_machine::tester::cases"),
     ("executed", "ply_machine::tester::executed"),
     ("interleaved", "ply_machine::tester::interleaved"),
     // The first read a pass's run made that no longer answers as it did.
     ("moved", "ply_machine::tester::moved"),
 ];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 9] = [
+const HERMETIC_OPERATIONS: [(&str, &str); 10] = [
     ("configure", "ply_machine::tester::hermetic::configure"),
     ("unit", "ply_machine::tester::hermetic::unit"),
     ("schema", "ply_machine::tester::hermetic::schema"),
     ("bound", "ply_machine::tester::hermetic::bound"),
     ("hosted", "ply_machine::tester::hermetic::hosted"),
     ("ended", "ply_machine::tester::hermetic::ended"),
+    ("cases", "ply_machine::tester::hermetic::cases"),
     ("executed", "ply_machine::tester::hermetic::executed"),
     ("interleaved", "ply_machine::tester::hermetic::interleaved"),
     ("moved", "ply_machine::tester::hermetic::moved"),
@@ -190,19 +193,34 @@ impl HostHandler for TesterHandler {
                 *self.run.write().unwrap_or_else(|e| e.into_inner()) = Run::default();
                 PlyValue::Unit
             }
+            "cases" => {
+                let unit = index_arg(req, 0, "a unit")?;
+                let test = index_arg(req, 1, "a test index")?;
+                self.cases(unit, test)?
+            }
             "executed" => {
                 let unit = index_arg(req, 0, "a unit")?;
                 let test = index_arg(req, 1, "a test index")?;
-                self.executed(unit, test, req.machine)?
+                let case = case_arg(req, 2)?;
+                self.executed(unit, test, case.as_ref(), req.machine)?
             }
             "interleaved" => {
                 let unit = index_arg(req, 0, "a unit")?;
                 let test = index_arg(req, 1, "a test index")?;
-                let seed = crate::recording::seed_of(arg(req, 2)?, span)?;
-                let steps = arg(req, 3)?.as_int(span, "a step bound")?;
-                let re_executed = arg(req, 4)?.as_bool(span, "whether the test re-runs")?;
+                let case = case_arg(req, 2)?;
+                let seed = crate::recording::seed_of(arg(req, 3)?, span)?;
+                let steps = arg(req, 4)?.as_int(span, "a step bound")?;
+                let re_executed = arg(req, 5)?.as_bool(span, "whether the test re-runs")?;
                 let steps = u32::try_from(steps.max(1)).unwrap_or(u32::MAX);
-                self.interleaved(unit, test, &seed, steps, re_executed, req.machine)?
+                self.interleaved(
+                    unit,
+                    test,
+                    case.as_ref(),
+                    &seed,
+                    steps,
+                    re_executed,
+                    req.machine,
+                )?
             }
             "moved" => {
                 let trace = arg(req, 0)?.as_bytes(span, "a trace")?;
@@ -235,6 +253,21 @@ fn arg<'a>(req: &'a HostRequest<'_>, at: usize) -> Result<&'a PlyValue, Diagnost
 fn index_arg(req: &HostRequest<'_>, at: usize, what: &str) -> Result<usize, Diagnostic> {
     let n = arg(req, at)?.as_int(req.span, what)?;
     usize::try_from(n).map_err(|_| crate::payload::missing(what, req.span))
+}
+
+/// The case a test over cases is run for: `None` for a test that ranges over nothing.
+fn case_arg(req: &HostRequest<'_>, at: usize) -> Result<Option<ply_eval::Case>, Diagnostic> {
+    let span = req.span;
+    crate::payload::option_of(arg(req, at)?, "a case", span)?
+        .map(|case| {
+            Ok(ply_eval::Case {
+                at: field_of(case, "at", span)?.as_int(span, "a case's place")?,
+                identity: field_of(case, "identity", span)?
+                    .as_bytes(span, "a case's identity")?
+                    .to_vec(),
+            })
+        })
+        .transpose()
 }
 
 fn ok(value: PlyValue) -> PlyValue {
@@ -468,10 +501,41 @@ impl TesterHandler {
         ply_host::observe::finished(observed, &self.world(&roots), usage.host)
     }
 
+    /// The cases a test of `unit` ranges over, or why they could not be listed. A listing
+    /// performs nothing, so it reaches no binding and reads nothing a pass would stand on.
+    fn cases(&self, unit: usize, test: usize) -> Result<PlyValue, Diagnostic> {
+        let (unit, _) = self.unit_at(unit)?;
+        let cases = match unit.provider {
+            Some(provider) => {
+                let executor = Executor {
+                    front: &unit.front,
+                    hosting: Hosting::default(),
+                    provider,
+                };
+                self.budgeted(|| listed(&executor, test))
+            }
+            None => Err(crate::testrun::Unlisted {
+                failure: nothing_built(),
+                panicked: false,
+            }),
+        };
+        Ok(match cases {
+            Ok(cases) => ok(cases),
+            Err(unlisted) => err(record(vec![
+                (
+                    "status",
+                    PlyValue::str(status_word(Some(&unlisted.failure), unlisted.panicked)),
+                ),
+                ("failure", raised_value(&unlisted.failure)),
+            ])),
+        })
+    }
+
     fn executed(
         &self,
         unit: usize,
         test: usize,
+        case: Option<&ply_eval::Case>,
         caller: MachineId,
     ) -> Result<PlyValue, Diagnostic> {
         let (unit, hosting) = self.unit_at(unit)?;
@@ -482,7 +546,7 @@ impl TesterHandler {
                     hosting,
                     provider,
                 };
-                self.budgeted(|| executed(&executor, test))
+                self.budgeted(|| executed(&executor, test, case))
             }
             None => Executed::refused(nothing_built()),
         };
@@ -498,10 +562,12 @@ impl TesterHandler {
         Ok(executed_value(&once, trace))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn interleaved(
         &self,
         unit: usize,
         test: usize,
+        case: Option<&ply_eval::Case>,
         seed: &Seed,
         steps: u32,
         re_executed: bool,
@@ -515,7 +581,7 @@ impl TesterHandler {
                     hosting,
                     provider,
                 };
-                self.budgeted(|| interleaved(&executor, test, seed, steps, re_executed))
+                self.budgeted(|| interleaved(&executor, test, case, seed, steps, re_executed))
             }
             None => Interleaved::refused(nothing_built()),
         };

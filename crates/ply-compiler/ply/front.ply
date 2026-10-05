@@ -2,9 +2,10 @@
 
 import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_label, span_key,
                 is_bare, no_module)
-import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
-              SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis, VPub, VPriv, FnDef,
-              LawDef, Binder, is_predicate, Derived, is_pub, spec_kind_text, dump_item)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet, TDSum,
+              VariantDef, SpecClause, SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis,
+              VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub,
+              spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -14,11 +15,11 @@ import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, CodeField,
              CodeArm, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodePattern, CodePatternField,
-             PxCtor, PxRecord, PxList, lower_fn, dump)
+             Capture, PxCtor, PxRecord, PxList, lower_fn, dump)
 import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
               atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
               print_ty, Field, canonical_atoms, canonical_scheme, canonical_type, bool_type,
-              int_type, unit_type, named_type, TyNominal)
+              int_type, bytes_type, unit_type, named_type, TyNominal)
 import resolve (Source, ParsedModule, Diag, Resolved, ResolveSucceeded, ResolveFailed, Namespace,
                 ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find, error_at,
                 backticked, import_module_name, path_span)
@@ -29,9 +30,10 @@ import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOut
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, facts_by_owner, filed_facts, foreign_facts, no_root_facts,
-              root_facts_bin, test_owner, witness_order_bin, elaborated, ended, stated,
-              elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
-              builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts)
+              root_facts_bin, test_owner, cases_root, listing_ty, witness_order_bin, elaborated,
+              ended, stated, elaboration_with, updated_mods, check_front_with, is_prelude_effect,
+              Builtin, builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin,
+              written_counts, InstanceInfo)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of,
@@ -40,7 +42,7 @@ import resolve (PackageDeps, resolve_packaged, no_packages)
 import std.bin
 import std.hash (blake3)
 import std.pkg (Manifest)
-import std.list (at, concat, contains, push_unique, sort_by, take)
+import std.list (at, concat, contains, drop, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update, tagged_in)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_key, embed_tables, embedded,
@@ -203,13 +205,58 @@ fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
 pub fn literals_of(guards: List<Expr>) -> List<Bytes> / {abort.raise} =
   fold(guards, [], |acc: List<Bytes>, expr: Expr| lits(acc, expr))
 
+/// The definitions a program's schemas are, by program-wide name: what a claim states, which is not
+/// itself something to carry one.
+pub fn schema_definitions(mods: List<ParsedModule>) -> Map<Bytes, Bool> =
+  fold(mods, map_new(), |acc: Map<Bytes, Bool>, parsed: ParsedModule|
+    fold(parsed.module.items, acc, |a: Map<Bytes, Bool>, item: Item|
+      match item {
+        ISchema(d) -> {
+          let named = map_insert(a, qualify(parsed.name, d.name.name), true);
+          match d.guard {
+            Some(_) ->
+              map_insert(named, qualify(parsed.name, schema_guard_name(d.name.name)), true),
+            None -> named,
+          }
+        },
+        _ -> a,
+      }))
+
+/// The schema each instantiation is of, by the law's program-wide name.
+pub fn schemas_instantiated(mods: List<ParsedModule>) -> Map<Bytes, Bytes> =
+  fold(mods, map_new(), |acc: Map<Bytes, Bytes>, parsed: ParsedModule|
+    fold(parsed.module.items, acc, |a: Map<Bytes, Bytes>, item: Item|
+      match item {
+        ILaw(d) -> match d.of {
+          Some(of) -> match of.home {
+            Some(home) ->
+              map_insert(a, qualify(parsed.name, d.name), qualify(home, of.schema.name.name)),
+            None -> a,
+          },
+          None -> a,
+        },
+        _ -> a,
+      }))
+
+/// The literals a law's guard is written with: its own, or of an instantiation its schema's.
+pub fn guard_literals(mods: List<ParsedModule>, law_def: LawDef) -> List<Bytes> / {abort.raise} = {
+  let schema = match law_def.of {
+    Some(of) -> match home_of(mods, of) {
+      Some(home) -> schema_named(at(mods, home).module, of.schema.name.name),
+      None -> None,
+    },
+    None -> None,
+  };
+  match match schema { Some(s) -> s.guard, None -> law_def.guard } {
+    Some(g) -> lits([], g),
+    None -> [],
+  }
+}
+
 fn law_literals(mods: List<ParsedModule>) -> List<List<Bytes>> / {abort.raise} =
   fold(mods, [], |acc: List<List<Bytes>>, parsed: ParsedModule|
     fold(parsed.module.items, acc, |a: List<List<Bytes>>, item: Item|
-      match item {
-        ILaw(d) -> push(a, match d.guard { Some(g) -> lits([], g), None -> [] }),
-        _ -> a,
-      }))
+      match item { ILaw(d) -> push(a, guard_literals(mods, d)), _ -> a }))
 
 // --- A module's effect sets ---------------------------------------------------
 // An atom whose effect resolves to nothing is dropped; a bare `cell` resolves to itself.
@@ -770,13 +817,13 @@ fn root_keys(
             ITest(d) -> {
               let name = qualify(parsed.name, d.name);
               let read = key_reads(published, deps, decls, name, None);
+              let root = qualify(parsed.name, key_test_root(a.ordinal));
+              let run = push(a.out, { root: root, key: bytes_concat(b"test+", read) });
               {
                 ..a,
                 ordinal: a.ordinal + 1,
-                out: push(a.out, {
-                  root: qualify(parsed.name, key_test_root(a.ordinal)),
-                  key: bytes_concat(b"test+", read),
-                }),
+                out: if d.cases == None { run }
+                else { push(run, { root: cases_root(root), key: bytes_concat(b"cases+", read) }) },
               }
             },
             ILaw(d) -> {
@@ -814,8 +861,8 @@ fn root_keys(
 
 // --- The emitter's roots -----------------------------------------------------
 
-/// One root the emitter offers: a definition, a spec clause, a test or a law part, with the arity
-/// its body is emitted at. `pure` is a definition's published purity, which lets a memo answer for
+/// One root the emitter offers: a definition, a spec clause, a test, the listing of a test's cases
+/// or a law part, with the arity its body is emitted at. `pure` is a definition's published purity, which lets a memo answer for
 /// it; any other root runs each time. `params` and `answer` say how what it is entered with and
 /// answers read at the seam. `witnesses` are the type variables whose witnesses lead `params`, which
 /// an entry from outside fills from what its arguments show of each.
@@ -833,8 +880,15 @@ pub type EmitterRoot = {
 pub fn no_module_span() -> ModuleSpan = { module: no_module(), start: 0, end: 0 }
 
 /// One constructor, with its arity and how its fields read over its type's parameters; the
-/// emitter orders tags by position here.
-pub type EmitterCtor = { name: Bytes, arity: Int, fields: List<Carry> }
+/// emitter orders tags by position here. `key` and `show` are the functions its type's module
+/// states its values are compared and shown through.
+pub type EmitterCtor = {
+  name: Bytes,
+  arity: Int,
+  fields: List<Carry>,
+  key: Option<Bytes>,
+  show: Option<Bytes>,
+}
 
 /// The walk's per-module place and its running place; `ordinal` counts tests, `law_ordinal` laws.
 type EmitTables = { fns: List<EmitterRoot>, tests: List<EmitterRoot>, specs: List<EmitterRoot> }
@@ -856,11 +910,17 @@ fn emitter_ctors_of(
   let prelude = filter(checked.ctors, |ctor_info: CtorInfo| bytes_len(ctor_info.module) == 0);
   let rest = fold(mods, [], |acc: List<CtorInfo>, parsed: ParsedModule|
     concat(acc, filter(checked.ctors, |ctor_info: CtorInfo| ctor_info.module == parsed.name)));
+  let through = |type_name: Bytes, key: Bool|
+    fold(checked.instances, None, |acc: Option<Bytes>, x: InstanceInfo|
+      if x.type_name == type_name && (match x.kind { NKey -> key, NShow -> !key }) { Some(x.by) }
+      else { acc });
   map(concat(prelude, rest), |ctor_info: CtorInfo|
     {
       name: ctor_info.name,
       arity: ctor_info.arity,
       fields: carries(cr, ctor_info.scheme.ty_vars, ctor_info.fields),
+      key: through(ctor_info.type_name, true),
+      show: through(ctor_info.type_name, false),
     })
 }
 
@@ -1074,8 +1134,8 @@ fn witness_vars(def: DefInfo) -> List<Int> =
     if !is_predicate(c.deriver) || contains(acc, c.param) { acc } else { push(acc, c.param) })
 
 /// Every root the emitter offers: the functions in source order, then the tests, then the spec
-/// clauses and law parts. A label parameter is a trailing `Word` of the emitted body, so an
-/// arity counts it.
+/// clauses, law parts and the roots that list a test's cases. A label parameter is a trailing
+/// `Word` of the emitted body, so an arity counts it.
 fn emitter_roots(
   mods: List<ParsedModule>,
   checked: CheckOutput,
@@ -1150,8 +1210,16 @@ fn emitter_roots(
                 None -> no_module_span(),
               };
               let root = qualify(parsed.name, key_test_root(a.ordinal));
-              let row = emit_root(cr, [], [], root, [], unit_type(), 0, false, place);
-              { ..a, tests: push(a.tests, row), ordinal: a.ordinal + 1 }
+              // Over cases it is entered with a case's place and identity; a second root lists them.
+              let taken = if d.cases == None { [] } else { [int_type(), bytes_type()] };
+              let row = emit_root(cr, [], [], root, taken, unit_type(), 0, false, place);
+              let listed = if d.cases == None { a.specs } else {
+                push(
+                  a.specs,
+                  emit_root(cr, [], [], cases_root(root), [], listing_ty(), 0, false, place),
+                )
+              };
+              { ..a, tests: push(a.tests, row), specs: listed, ordinal: a.ordinal + 1 }
             },
             ILaw(d) -> {
               let name = qualify(parsed.name, d.name);
@@ -2568,18 +2636,247 @@ fn def_claim(
   })
 }
 
-fn law_claim(r: Resolved, m: Int, module: Bytes, law_def: LawDef) -> Claim / {abort.raise} = {
+fn given_opt(c: Option<Code>, given: Map<Int, Code>) -> Option<Code> =
+  match c { Some(x) -> Some(given_in(x, given)), None -> None }
+
+fn given_fields(fs: List<CodeField>, given: Map<Int, Code>) -> List<CodeField> =
+  map(fs, |field: CodeField| { name: field.name, value: given_in(field.value, given) })
+
+/// What a barrier copies in of what was given is given inside it, where it was copied to.
+fn given_past(
+  captures: List<Capture>,
+  given: Map<Int, Code>,
+) -> { captures: List<Capture>, given: Map<Int, Code> } =
+  fold(
+    captures,
+    { captures: [], given: map_new() },
+    |acc: { captures: List<Capture>, given: Map<Int, Code> }, capture: Capture|
+      match map_get(given, capture.src) {
+        Some(c) -> { ..acc, given: map_insert(acc.given, capture.dst, c) },
+        None -> { ..acc, captures: push(acc.captures, capture) },
+      },
+  )
+
+/// `c` with each read of a slot `given` holds replaced by what it holds: closed code, which reads the
+/// same wherever it stands.
+fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
+  let g = |x: Code| given_in(x, given);
+  let gs = |codes: List<Code>| map(codes, |x: Code| given_in(x, given));
+  match c.node {
+    NLit(_) -> c,
+    NLabel(_) -> c,
+    NVar(v) -> match v.slot {
+      Some(s) -> match map_get(given, s) { Some(x) -> x, None -> c },
+      None -> c,
+    },
+    NUnary(u) -> { ..c, node: NUnary({ op: u.op, operand: g(u.operand) }) },
+    NBinary(b) -> { ..c, node: NBinary({ op: b.op, lhs: g(b.lhs), rhs: g(b.rhs) }) },
+    NApp(a) -> { ..c, node: NApp({ func: g(a.func), args: gs(a.args) }) },
+    NIf(i) ->
+      {
+        ..c,
+        node: NIf({
+          cond: g(i.cond),
+          then_branch: g(i.then_branch),
+          else_branch: g(i.else_branch),
+        }),
+      },
+    NBlock(b) ->
+      {
+        ..c,
+        node: NBlock({
+          stmts: map(b.stmts, |stmt: CodeStmt|
+            match stmt {
+              CLet(l) -> CLet({ name: l.name, slot: l.slot, value: g(l.value) }),
+              CLetPat(l) -> CLetPat({ span: l.span, pat: l.pat, value: g(l.value) }),
+              CDo(d) -> CDo({ code: g(d.code) }),
+            }),
+          tail: given_opt(b.tail, given),
+        }),
+      },
+    NList(l) -> { ..c, node: NList({ items: gs(l.items) }) },
+    NRecord(rc) -> { ..c, node: NRecord({ fields: given_fields(rc.fields, given) }) },
+    NMatch(x) ->
+      {
+        ..c,
+        node: NMatch({
+          scrutinee: g(x.scrutinee),
+          arms: map(x.arms, |a: CodeArm|
+            { pat: a.pat, guard: given_opt(a.guard, given), body: g(a.body) }),
+        }),
+      },
+    NPerform(p) ->
+      {
+        ..c,
+        node: NPerform({
+          effect: p.effect,
+          op: p.op,
+          resource: p.resource,
+          label: given_opt(p.label, given),
+          args: gs(p.args),
+        }),
+      },
+    NCell(x) ->
+      {
+        ..c,
+        node: NCell({
+          resource: x.resource,
+          binder: x.binder,
+          slot: x.slot,
+          init: g(x.init),
+          body: g(x.body),
+        }),
+      },
+    NLambda(l) -> {
+      let past = given_past(l.captures, given);
+      {
+        ..c,
+        node: NLambda({
+          params: l.params,
+          size: l.size,
+          captures: past.captures,
+          body: given_in(l.body, past.given),
+        }),
+      }
+    },
+    NSimulate(x) -> {
+      let past = given_past(x.captures, given);
+      {
+        ..c,
+        node: NSimulate({
+          size: x.size,
+          captures: past.captures,
+          body: given_in(x.body, past.given),
+        }),
+      }
+    },
+    NParallel(x) -> { ..c, node: NParallel({ branches: gs(x.branches) }) },
+    NHandle(h) ->
+      {
+        ..c,
+        node: NHandle({
+          body: g(h.body),
+          clauses: map(h.clauses, |clause: CodeClause| {
+            let past = given_past(clause.captures, given);
+            { ..clause, captures: past.captures, body: given_in(clause.body, past.given) }
+          }),
+          ret: match h.ret {
+            Some(x) -> {
+              let past = given_past(x.captures, given);
+              Some({ size: x.size, captures: past.captures, body: given_in(x.body, past.given) })
+            },
+            None -> None,
+          },
+        }),
+      },
+    NField(f) -> { ..c, node: NField({ base: g(f.base), field: f.field }) },
+    NUpdate(u) ->
+      {
+        ..c,
+        node: NUpdate({ base: g(u.base), copies: u.copies, sets: given_fields(u.sets, given) }),
+      },
+  }
+}
+
+/// The module an instantiation's schema is declared in, once the resolver has found it.
+fn home_of(mods: List<ParsedModule>, of: OfSchema) -> Option<Int> =
+  match of.home {
+    None -> None,
+    Some(name) ->
+      fold(range(0, len(mods)), None, |found: Option<Int>, i: Int|
+        match found {
+          Some(_) -> found,
+          None -> match list_at(mods, i) {
+            Some(m) -> if m.name == name { Some(i) } else { None },
+            None -> None,
+          },
+        }),
+  }
+
+fn fn_named(module: Module, name: Bytes) -> Option<FnDef> =
+  fold(module.items, None, |found: Option<FnDef>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item { IFn(d) -> if d.name.name == name { Some(d) } else { None }, _ -> None },
+    })
+
+/// What an instantiation's guard or body states: its schema's, with what it was given written where
+/// the schema names its parameters, so the claim reads, proves and is cited as that law written out.
+/// `call` is the schema's definition called with the arguments and then the binders.
+fn instantiated(
+  mods: List<ParsedModule>,
+  r: Resolved,
+  m: Int,
+  binders: Int,
+  of: OfSchema,
+  call: Expr,
+) -> Option<Code> / {abort.raise} =
+  match ((call, home_of(mods, of))) {
+    (EApp(a), Some(home)) -> match a.func {
+      EVar(callee) -> match fn_named(at(mods, home).module, callee.name.name.name) {
+        None -> None,
+        Some(def) -> {
+          let params = len(def.params) - binders;
+          let names = map(def.params, |param: Param| param.name.name);
+          let body = lowered(r, home, concat(drop(names, params), take(names, params)), def.body);
+          let given = fold(
+            range(0, params),
+            Some(map_new()),
+            |acc: Option<Map<Int, Code>>, k: Int|
+              match ((acc, list_at(a.args, k))) {
+                (Some(held), Some(arg)) -> match lowered(r, m, [], arg) {
+                  Some(c) -> Some(map_insert(held, binders + k, c)),
+                  None -> None,
+                },
+                _ -> None,
+              },
+          );
+          match ((body, given)) {
+            (Some(code), Some(held)) -> Some(given_in(code, held)),
+            _ -> None,
+          }
+        },
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// A law's guard or body as the prover reads it.
+fn stating(
+  mods: List<ParsedModule>,
+  r: Resolved,
+  m: Int,
+  law_def: LawDef,
+  expr: Expr,
+) -> Option<Code> / {abort.raise} = {
   let names = map(law_def.binders, |binder: Binder| binder.name.name);
+  let written = match law_def.of {
+    Some(of) -> instantiated(mods, r, m, len(names), of, expr),
+    None -> None,
+  };
+  match written { Some(_) -> written, None -> lowered(r, m, names, expr) }
+}
+
+fn law_claim(
+  mods: List<ParsedModule>,
+  r: Resolved,
+  m: Int,
+  module: Bytes,
+  law_def: LawDef,
+) -> Claim / {abort.raise} =
   ClaimLaw({
     key: qualify(module, law_def.name),
-    guard: match law_def.guard { Some(g) -> Some(lowered_at(r, m, names, g)), None -> None },
-    body: lowered(r, m, names, law_def.body),
+    guard: match law_def.guard {
+      Some(g) -> Some({ at: span_at(m, expr_span(g)), code: stating(mods, r, m, law_def, g) }),
+      None -> None,
+    },
+    body: stating(mods, r, m, law_def, law_def.body),
     costs: match law_def.costs {
       Some(c) -> Some({ def: qualify(module, c.def.name), index: c.index }),
       None -> None,
     },
   })
-}
 
 fn claims_of_modules(
   mods: List<ParsedModule>,
@@ -2613,7 +2910,7 @@ fn claims_of_modules(
           TDSum(vs) -> push(a, ClaimSum({ name: qualify(m.name, d.name.name), variants: len(vs) })),
           _ -> a,
         },
-        ILaw(d) -> push(a, law_claim(resolved, i, m.name, d)),
+        ILaw(d) -> push(a, law_claim(mods, resolved, i, m.name, d)),
         _ -> a,
       })
   })
@@ -4401,6 +4698,35 @@ test "a claim is lowered with each global named program-wide, and a builtin and 
     },
     _ -> assert(false),
   }
+}
+
+test "an instantiation claims its schema's guard and body with what it was given written in place" {
+  let out = claims([
+    {
+      name: b"lib",
+      src: b"pub fn limit() -> Int = 100\npub law schema fixed(f: (Int) -> Int, low: Int) forall (x: Int) where x > low && x < limit() { f(x) == x }",
+    },
+    {
+      name: b"app",
+      src: b"import lib\nfn id(n: Int) -> Int = n\nlaw \"made\" = lib::fixed(id, 0)\nlaw \"written\" forall (x: Int) where x > 0 && x < lib::limit() { id(x) == x }\nlaw \"through a lambda\" = lib::fixed(|n: Int| id(n), 0)",
+    },
+  ]);
+  let body_of = |key: Bytes|
+    fold(out, b"", |found: Bytes, c: Claim|
+      match c { ClaimLaw(l) -> if l.key == key { code_text(l.body) } else { found }, _ -> found });
+  let guard_of = |key: Bytes|
+    fold(out, b"", |found: Bytes, c: Claim|
+      match c {
+        ClaimLaw(l) -> if l.key != key { found }
+        else { match l.guard { Some(g) -> code_text(g.code), None -> b"" } },
+        _ -> found,
+      });
+  assert_eq(body_of(b"app.made"), body_of(b"app.written"));
+  assert_eq(guard_of(b"app.made"), guard_of(b"app.written"));
+  assert(bytes_index_of(guard_of(b"app.made"), b"lib.limit") != None);
+  // A lambda given stands where the parameter was called, so the prover applies it there.
+  assert(bytes_index_of(body_of(b"app.through a lambda"), b"lam(") != None);
+  assert(bytes_index_of(body_of(b"app.through a lambda"), b"lib.fixed") == None)
 }
 
 test "a record update reaches a claim as the literal it stands for" {

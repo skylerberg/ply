@@ -91,8 +91,9 @@ A comment is `//` to end of line.
 
 A *doc comment* documents a declaration for whoever calls or names it. `///`
 lines document the `fn`, `extern fn`, `type`, `effect`, effect operation, `effect
-set`, variant, or field of a declared record directly below them; `//!` lines at
-the head of a file, before its first import or item, document the module.
+set`, `law schema`, variant, or field of a declared record directly below them;
+`//!` lines at the head of a file, before its first import or item, document the
+module.
 `////` is a plain comment.
 
 ```ply
@@ -115,9 +116,9 @@ signature cannot — what an answer means, when the function raises, units, edge
 cases — and holds no examples: the tests and laws that name a definition are
 its examples, and `ply doc` lists them (§16). A blank line between a doc and its
 declaration does not part them, and `ply fmt` removes it. A doc comment that
-documents nothing — one inside a body, above an import, a `test`, a `law` or a
-`derive`, or at the end of a file, or a `//!` line below the head of its file —
-is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
+documents nothing — one inside a body, above an import, a `test`, a `law`, a
+`derive`, a `key` or a `show`, or at the end of a file, or a `//!` line below
+the head of its file — is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
 answer.
 
 An identifier starts with an ASCII letter or `_` and continues with ASCII
@@ -143,9 +144,11 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `raise` | opening an operation declaration (§6.8) |
 | `set` | `effect set X = {..}` |
 | `new` | right after the `=` of a `type` declaration |
-| `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
+| `law`, `host`, `schema`, `forall`, `cost` | `law "..."`, `law/host` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
+| `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
+| `key`, `show`, `by` | `key for <Type> by <function>` and `show for <Type> by <function>` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -259,7 +262,8 @@ Loosest to tightest; all binary operators are left-associative:
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
-* `==`/`!=` are structural at every type except functions. `Float` equality is
+* `==`/`!=` are structural at every type except functions, and a type that
+  states a `key` is compared through it (§4.4). `Float` equality is
   IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work on numeric types and on `Char`,
   by scalar value; order anything else with `compare`. Arithmetic on a `Char` is
   `E0201`: go through `int_of_char`.
@@ -283,7 +287,8 @@ Loosest to tightest; all binary operators are left-associative:
 ## 3. Modules and items
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
-`nondet effect`, `effect set`, `test`, `law` and `derive`, in any order.
+`nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key` and
+`show`, in any order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -335,10 +340,10 @@ import is always this package's own: inside a dependency, `import fmt` names
 *its* `fmt`, never the importing package's — a package cannot reach back into
 what imports it.
 
-Items are private unless `pub` (`E0107`). `pub` applies to `fn`, `type` and
-`effect` only. Values (functions and constructors), types, effects and module
-binders are separate namespaces, so `fn size`, `type Size` and `effect size`
-coexist.
+Items are private unless `pub` (`E0107`). `pub` applies to `fn`, `type`,
+`effect` and `law schema` only. Values (functions, constructors and the
+definitions a schema declares, §10), types, effects and module binders are
+separate namespaces, so `fn size`, `type Size` and `effect size` coexist.
 
 ### 3.3 Packages and the manifest
 
@@ -603,6 +608,58 @@ A sum is nominal, as a `new` record is (§4.2): identical sums in two modules
 differ. A sum takes parameters as an alias does,
 `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`, and a use that fills them
 with other arguments is another type (§4.5).
+
+A value is compared, ordered, digested and shown as its constructor and fields
+say, which is wrong for a type that can hold one thing two ways. The module that
+declares a sum may state what its values are read through instead:
+
+```ply
+pub type Deque<a> = | Deque(List<a>, List<a>)   // a front, and a back reversed
+
+key for Deque by to_list       // `==`, `!=`, `compare`, `min`, `max`, `digest`, a `Map`'s keys
+show for Date by written       // `show`, `display`, an interpolated string's hole
+
+pub fn to_list<a>(d: Deque<a>) -> List<a> = ..
+fn written(d: Date) -> String = ..
+```
+
+`key for T by f` names a function of the same module, `f: (T<a, ..>) -> K`. Two
+values of `T` are equal exactly when `f` answers equal keys for them, they order
+as their keys do, and a value's digest is its key's, so the three cannot
+disagree: two deques holding one sequence in different splits are `==`, share a
+`digest` and are one `Map` key. The key is read wherever a `T` sits — in a
+list, a record, a `new` record, a tuple, another sum, a map's key or value, the key of another
+type, or behind a type parameter — and by `assert_eq`, which tells two keyed
+values apart as wholes. `derivable(eq, T)`, `derivable(ord, T)` and
+`derivable(hash, T)` hold exactly when they hold of `K`, whatever `T`'s fields
+are, and `K` is both ordered and hashed (`E0206`). A `match` still reads the
+value as it was built, as `reflect` does, and a test over cases tells its cases
+apart that way (§8.1). Each comparison calls `f`, so a key is worth keeping
+cheap.
+
+`show for T by g` names `g: (T<a, ..>) -> String`: `show`, `display` and a hole
+write what `g` answers wherever a `T` is shown, and `derivable(show, T)` holds
+whatever `T` holds. It decides nothing about comparison, `reflect` (§12) still
+answers the value as it was built, and a diagnostic prints that.
+
+Both are found by the type alone, with no search, so only the module declaring
+`T` may write them (`E0208`), and it states each at most once (`E0105`). `T` is
+a sum: an alias is the type it names, and a `new` record (§4.2) runs as its
+plain record, with no constructor in a value to find them by, so it cannot
+state one yet (`E0217`). The function is one that module declares
+(`E0101`); it takes one `T`, at the type's own type and row parameters and
+nothing narrower (`f: (Held<a | e>) -> K` for `type Held<a | e>`), answers a type
+over those parameters alone, has no `where`, and its row is empty, with no
+raise of any kind (§6.8) and no `diverges`: `==` and `show` perform nothing,
+cannot raise and always return, and a key that raised inside a `Map` insert
+would have nowhere to go (`E0218`). It binds
+no resource label either: a value does not carry the label its type was given,
+so nothing could call the function at it, and a type that binds a label states
+neither (`E0218`). A key that is, or holds, a value of
+its own type would be compared by asking for its key again, and is refused
+where it is stated, through whatever types and keys lie between (`E0219`). A
+type's hash covers the functions it states, so a definition that can hold a
+`T` is re-checked and its tests re-run when either changes.
 
 ### 4.5 Generics
 
@@ -1478,6 +1535,40 @@ test "ten more elements cost twenty more steps: one in each closure" {
 
 A cost law (§10) states how `steps` grows with a size instead of pinning it.
 
+A test may range over a table, and is then a test for each of its elements, a
+*case*:
+
+```ply
+type Resolution = { reference: String, target: String }
+
+test "resolves {c.reference}" for c: Resolution in resolutions() {
+  assert_eq(url_resolve(base(), c.reference), c.target)
+}
+```
+
+`for <name>: <Type> in <table>` stands between the label and the body, on a
+`test/nondet` too. The table is an expression of type `List<Type>` (`E0201`),
+usually a call of the definition that builds it, often from `embed_dir` (§3.4);
+a nullary definition is computed once however many cases read it, and a record
+literal in it is a `new` record where the case's type is one (§4.2). The name is
+bound in the body and in the label, and a label before `for` is read as an
+interpolated string is (§2.3): each `{expr}` is a hole, `{{` and `}}` are
+braces, and a label with no hole names every case alike. A case is told from
+another by its value as it was built, which is finer than `==`: `1.5m` and
+`1.50m` are two cases, as are two values of a type whose `key` (§4.4) answers
+the same, so no case's pass stands for a case its body can tell from it. Two
+cases built alike are one. A case's type is `derivable(hash, ·)` read through
+no `key` (`E0206`): it holds no `Float`, function, `Cell`, `Task`, `Chan` or
+`Secret`, and neither does a keyed type in it. The cases
+are listed before any test runs, so
+the table and the label may raise, by any `raise` operation (§6.8), and perform
+nothing else (`E0469`). A table that raises fails as one test, under the label
+as written, and an empty one is no test. A tagged literal (§2.3) in a table, a
+label's hole or a body is settled with the load, as any other is.
+A module with a test over cases imports `std.cases` itself, under a name
+no source can write, so `std.cases` cannot hold one. A doc comment above a test
+over cases documents nothing, as above any `test` (`E0003`, §2.1).
+
 ### 8.2 Selection
 
 A definition's hash covers its normalized form: names, comments, formatting,
@@ -1505,6 +1596,16 @@ from the process's start (`phases` in the `--json` report);
 `--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
 any of them matches; `--no-cache` bypasses both the result and the front-end
 cache.
+
+A case of a test over cases (§8.1) is selected as a test of its own. Its hash is
+its test's, which covers the body and the case's type and neither the table nor
+the label, taken with the case's value as built. A case added to the table runs
+alone, wherever it is added; a reordered table or a reworded label runs
+nothing; an edit to the body runs every case, and an edit to what the table is
+built from runs the cases whose values it changed. Its label is the one its
+holes make, which is what `--filter` reads. Listing the cases runs the table,
+so a run that reports on a test over cases builds the program even when every
+case stands on a pass.
 
 ### 8.3 Determinism
 
@@ -1549,6 +1650,15 @@ hash only moved. Each result counts the operations its test performed,
 handled ones included, as `performs`. `--watch` re-runs on every `.ply` change
 and on every change to what the last run embedded, keeping caches in memory.
 
+Each case of a test over cases (§8.1) passes, fails and is reported under its
+own label, so a failing table names every failing case. In `--json` a case's
+entry under `selection.tests` carries `case`: the key of the test it is a case
+of (`of`), its place in the table (`at`) and its `identity`, the BLAKE3 of its
+value as built. A failing case is
+suspected against what it runs, which leaves out its table, and is named a
+culprit when one change explains it; it is otherwise not bisected (`skipped`
+is `case`), since a mixture is printed from a test's body, which holds no case.
+
 ### 8.5 Coverage and mutants
 
 `--coverage` reports, from the hash closure alone, which tests reach each
@@ -1560,7 +1670,9 @@ the program is checked again, and the tests that reach the definition run
 against the mutant on a scratch store that never touches the cache. A mutant
 every one of them passes is a survivor, reported with its place and the tests
 that let it through, and fails the run. A mutant that does not check is
-skipped; `--mutate-budget N` (default 64) caps how many are judged.
+skipped; `--mutate-budget N` (default 64) caps how many are judged. A case
+(§8.1) reaches what its test does, its table included, and a mutant that
+changes a case's value is killed by that case, which the table no longer holds.
 
 ### 8.6 Compiled backend
 
@@ -1755,6 +1867,12 @@ A kernel checks each induction from the claim alone before refuting its cases,
 whatever proposed it: the binder it names, a hypothesis strictly below the case
 it proves, and only definitions the checker reads as ending unrolled.
 
+Congruence and injectivity read `==` as what a value's constructors and fields
+say, which a `Float` (`NaN != NaN`) and a type that states a `key` (§4.4) are
+not. A claim that holds a value of either, at any depth, is never `proved`: it
+is run, over every point of a finite domain or over a sample. Under `--reach`
+the place is `float_term` or `keyed_term`.
+
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
 arguments name every binder; where a claim makes a call that fits it, the law
@@ -1777,6 +1895,50 @@ first. Under `--json` a certificate's `rules` name each lemma as `lemma` with
 its `law` and `label`, each induction as `induction` with its `binder`,
 `def`, `over` (`int` or `list`) and `step`, and a `cost` clause read off its
 body (below) as `cost_bound` with its `def`.
+
+A `law schema` states a law once, over the definitions it is about, and a law
+instantiates it:
+
+```ply
+pub law schema round_trip<a, b | e>(encode: (a) -> b / e, decode: (b) -> Option<a> / e)
+  forall (x: a) { decode(encode(x)) == Some(x) }
+
+law "a URL round-trips" = round_trip(url_encode, url_decode)
+```
+
+A schema has a name, type parameters and at most one row parameter, parameters
+whose types are written, and then what a law has but a `cost`: binders, a guard
+and a body, pure as a law's are (`E0417`), so what a function parameter's
+written row performs past a raise or `diverges` is refused where the body calls
+it. The row parameter is what the definitions a schema is given may raise:
+`abort.raise`, a raise of their own (§6.8), or nothing, and an instantiation
+that fills it with anything else is `E0417`. A schema binds no label. It may be
+`pub`, and is imported and qualified as a definition is. An instantiation gives
+one argument for each parameter, in order (`E0202`), each an expression of the
+parameter's type (`E0201`, or `E0302` for a function that performs more than a
+written row admits): a definition's name, a lambda, a value. It writes no
+binders: the schema's are quantified at the types the arguments settle, a `new`
+record's among them, which a `forall` must be able to range over (`E0418`, at
+the instantiation, naming the schema's binder), and a type parameter no argument
+settles stays a variable of the claim. What is instantiated must be a schema
+(`E0472`), and an instantiation is never `law/host`.
+
+An instantiation is the law its schema's guard and body are with each parameter
+replaced by what it was given. It has its own label, key, tier, certificate and
+cache entry; it is proved, sampled and shrunk as that law written out is, and,
+proved with no guard, it is a lemma by the trigger that body has. Its hash
+covers the schema's guard and body, in this package or another, with what it
+was given. Under `--json` its obligation carries `schema`, the schema's
+program-wide name, which `--explain` and a refutation print.
+
+A schema also declares the definition its body is, over its parameters and then
+its binders, so `round_trip(url_encode, url_decode, "a b")` is the claim at one
+point, and its guard as `<name>_where`. Both are `transparent` (below), are
+named among the module's other definitions (`E0105`), and are no part of what a
+run counts as carrying an obligation or not. What a schema's body calls in its
+own package is read from another package as any definition there is, by its
+clauses unless it is `transparent` too. `std.laws` ships the schemas the
+standard library states its laws with (`ply doc std.laws`).
 
 A definition of another package
 — a dependency's, or outside `--std` a shipped module's — is claimed by its
@@ -1888,8 +2050,10 @@ calls. The bound is read from below: the lengths of parameters (`len`,
 and `ilog2` alone or beside sizes of the one length it is of. Steps within the
 bound are `proved`. Anything else, such as another operation, a call of a
 function value with no cost name, a group of definitions calling each other, a
-body another package keeps with no `cost` bound, or an `Int` parameter the steps
-grow with, leaves the clause to the cost law `cost of <name>` (`#2` and on for
+body another package keeps with no `cost` bound, an `Int` parameter the steps
+grow with, or a definition that takes, answers or builds a value of a type that
+states a `key` (§4.4), whose comparisons call it unseen, leaves the clause to
+the cost law `cost of <name>` (`#2` and on for
 later clauses): it makes each parameter of one size `n`, an `Int` being `n` and
 a list, map, string or bytes holding `n` elements made of their index, and a
 function parameter with a cost name a closure of one step, its cost name 1, and
@@ -1954,6 +2118,11 @@ the `derive` is `E0206`; `show` imports `std.show` itself. A type that binds a
 label (§4.5), or a field whose type is given one, is `E0206` too: only a function's
 row has a use for a label. A row parameter the fields leave unused is carried
 through, `tagged_eq : <a | e>({eq: ..}) -> {eq: (Tagged<a | e>, ..) -> Bool}`.
+
+A type that states a `key` (§4.4) derives `eq`, `ord` and `hash` from what the
+key answers, and one that states a `show` derives `show` from that function: the
+dictionaries call `==`, `compare`, `digest` and `show`, which read them. `json`
+and `bin` encode the fields as they are.
 
 ## 12. Builtins
 
@@ -2243,7 +2412,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
-| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a type with its fields or variants, an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
+| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants, an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
@@ -2536,15 +2705,18 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0203` | occurs check |
 | `E0204` | not a function |
 | `E0205` | non-exhaustive match |
-| `E0206` | not derivable, including an unordered `Map` key |
+| `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case of a type hashed only through a `key` |
 | `E0207` | unknown deriver |
-| `E0208` | orphan `derive` |
+| `E0208` | orphan `derive`, `key` or `show` |
 | `E0209` | `/` on `Decimal` |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
 | `E0212` | the alternatives of an or-pattern bind different names |
 | `E0213` | a `let` whose or-pattern can fail has no `else` |
 | `E0214` | a `new` record whose fields reach the record itself |
+| `E0217` | a `key` or a `show` for a type that is not a sum |
+| `E0218` | a `key` or a `show` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer |
+| `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
@@ -2606,6 +2778,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0466` | `bounded` outside a definition's own row |
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0468` | `cost` bound on a definition whose row says it may not return |
+| `E0469` | a test's table or label that performs more than raises |
+| `E0472` | a law instantiating a definition that is not a `law schema` |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
