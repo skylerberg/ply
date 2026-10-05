@@ -9,13 +9,14 @@ import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, At
                     MWrite, MBad, ty_span, mode_text)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
               ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
-              EffectDef, OpDef, TestDef, LawDef, Binder, Constraint, Deriver, DJson, DEq, DOrd,
-              DBin, DShow, DHash, DNumeric, DInteger, is_predicate, deriver_text, deriver_tag,
-              SpecKind, SRequires, SEnsures, SCost, SpecClause, Derived, DeriveDef, parse)
+              EffectDef, OpDef, TestDef, Cases, LawDef, Binder, Constraint, Deriver, DJson, DEq,
+              DOrd, DBin, DShow, DHash, DNumeric, DInteger, is_predicate, deriver_text, deriver_tag,
+              SpecKind, SRequires, SEnsures, SCost, SpecClause, Derived, DeriveDef, parse, test_run,
+              test_listing)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
-              ReturnClause, RecField, expr_span, is_arithmetic, is_ordered)
+              ReturnClause, RecField, expr_span, is_arithmetic, is_ordered, case_at, case_digest)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -120,6 +121,8 @@ pub type TestInfo = {
   key: Bytes,
   index: Int,
   nondet: Bool,
+  // Over cases: `name` is its label's template, and a run makes a test of each case it lists.
+  cases: Bool,
   // What a run of it must be given: no raise, which fails it, and no `diverges`, which its steps bound.
   footprint: List<Atom>,
   at: Location,
@@ -346,6 +349,17 @@ pub type KeptFacts = { name: Bytes, facts: Bytes }
 // since two tests may share a label and a test may share a definition's name.
 pub fn test_owner(module: Bytes, position: Int) -> Bytes =
   bytes_concat_all([module, b".test#", ascii_of_int(position)])
+
+// The root a test over cases lists its cases by, beside the root that runs one.
+pub fn cases_root(owner: Bytes) -> Bytes = bytes_concat(owner, b".cases")
+
+// What that root answers: each case's label and digest, in the table's order.
+pub fn listing_ty() -> Type / {abort.raise} =
+  list_type(
+    TyRecord(
+      fields_sorted([{ name: b"digest", ty: bytes_type() }, { name: b"label", ty: string_type() }]),
+    ),
+  )
 // `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own,
 // whose promises are checked here; a dependency's were checked when its package was.
 pub type Known = {
@@ -8443,12 +8457,30 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                 walking: owner,
               };
               let pushed: Checker = { ..c1, env: env_push(c1.env) };
-              let o: Inferred = infer(pushed, def.body);
+              let entered: Checker = match def.cases {
+                None -> pushed,
+                Some(_) ->
+                  {
+                    ..pushed,
+                    env: env_bind(
+                      env_bind(pushed.env, case_at(), monomorphic(int_type())),
+                      case_digest(),
+                      monomorphic(bytes_type()),
+                    ),
+                  },
+              };
+              let o: Inferred = infer(entered, test_run(def));
               let answered: Checker = check_test_answer(o.checker, def, o.ty);
-              let popped: Checker = { ..answered, env: env_pop(answered.env) };
+              let listed: Checker = match def.cases {
+                None -> answered,
+                Some(cases) -> check_listing(answered, def, cases),
+              };
+              let popped: Checker = { ..listed, env: env_pop(listed.env) };
               let row = resolve_row_in(popped, o.row);
+              // A table refused for what it performs is not also held to the test's determinism.
+              let unlisted = len(listed.diags) > len(answered.diags);
               {
-                checker: if def.is_nondet { popped }
+                checker: if def.is_nondet || unlisted { popped }
                 else { check_determinism(popped, def, row.atoms) },
                 atoms: run_needs(row.atoms),
               }
@@ -8464,6 +8496,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                 key: qualify(parsed.name, def.name),
                 index: len(checked.tests),
                 nondet: def.is_nondet,
+                cases: def.cases != None,
                 footprint: footprint.atoms,
                 at: location_of(checked, def.span),
               }),
@@ -8508,6 +8541,34 @@ fn check_test_answer(checker: Checker, def: TestDef, ty: Type) -> Checker / {abo
 
 fn tail_value(expr: Expr) -> Expr =
   match expr { EBlock(b) -> match b.tail { Some(t) -> tail_value(t), None -> expr }, _ -> expr }
+
+// A test's cases are listed before any of them runs, where nothing answers an effect: the table
+// and the label may raise, and perform nothing else.
+fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abort.raise} = {
+  let o: Inferred = infer(checker, test_listing(cases));
+  let c = o.checker;
+  match list_at(run_needs(resolve_row_in(c, o.row).atoms), 0) {
+    None -> c,
+    Some(atom) ->
+      err_labels(
+        c,
+        b"E0469",
+        bytes_concat_all([b"the cases of test `", def.name, b"` perform `", atom_text(atom), b"`"]),
+        [
+          label_at(
+            c.module,
+            match site_for(c, atom) { Some(s) -> s.span, None -> expr_span(cases.table) },
+            true,
+            b"performed while the cases are listed",
+          ),
+        ],
+        [
+          b"a test's cases are listed before any test runs, to decide which of them run: its table and its label are pure, or only raise",
+          b"handle the effect inside the table, or build the table from what `embed_dir` read",
+        ],
+      ),
+  }
+}
 
 type WithAtoms = { checker: Checker, atoms: List<Atom> }
 

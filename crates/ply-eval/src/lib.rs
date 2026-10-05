@@ -53,7 +53,7 @@ pub use carry::{Carry, CtorCarries};
 pub use compiled::{Compiled, Entered};
 pub use escape::{Boundary, Escapee, Handle};
 pub use evaluator::{
-    Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
+    Case, Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
     err_host_in_simulation, err_nested_simulation, err_no_runtime, err_not_compiled,
     err_secret_to_host, err_unenumerated_atom,
 };
