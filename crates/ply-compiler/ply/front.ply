@@ -3,8 +3,8 @@
 import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_label, span_key,
                 is_bare, no_module)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
-              SpecKind, SRequires, SEnsures, SCost, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef,
-              Binder, is_predicate, Derived, is_pub, spec_kind_text)
+              SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis, VPub, VPriv, FnDef,
+              LawDef, Binder, is_predicate, Derived, is_pub, spec_kind_text)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -23,7 +23,7 @@ import resolve (Source, ParsedModule, Diag, Resolved, ResolveSucceeded, ResolveF
                 backticked, import_module_name, path_span)
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, Prior, Rehash, Rehashed,
-             rehash_index, by_name)
+             rehash_index, by_name, closure_of, LawNode)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, facts_by_owner, filed_facts, foreign_facts, no_root_facts,
@@ -360,8 +360,9 @@ fn module_row(
 // A module with its bodies blanked, every byte of a cut but a newline a space, so every offset
 // holds: what a compiled package ships, and what the emitter reads of a module it does not lower.
 
-// A braced cut keeps `{` and `}` at its ends: an empty block over exactly the body's own span.
-pub type Cut = { start: Int, end: Int, braced: Bool }
+// A braced cut keeps `{` and `}` at its ends: an empty block over exactly the body's own span. It
+// names the function whose body it blanks, which a stub is read only with a row and a hash for.
+pub type Cut = { start: Int, end: Int, braced: Bool, name: Bytes }
 
 derive bin for Cut
 
@@ -378,11 +379,17 @@ pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
     match item {
       IFn(d) -> if map_contains(generated, span_key(d.span)) || keeps_body(d) { acc } else {
         let b = expr_span(d.body);
-        if b.end - b.start < 2 { acc }
-        else { push(acc, { start: b.start, end: b.end, braced: true }) }
+        if b.end - b.start < 2 { acc } else {
+          push(acc, {
+            start: b.start,
+            end: b.end,
+            braced: true,
+            name: qualify(parsed.name, d.name.name),
+          })
+        }
       },
-      ITest(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false }),
-      ILaw(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false }),
+      ITest(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"" }),
+      ILaw(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"" }),
       _ -> acc,
     })
 }
@@ -3072,6 +3079,9 @@ pub fn staged_pulling_std_with(
   // The shipped modules there are and `shipped` does not hold, because this load pulls none of them
   // (`shipped_pulled`).
   unread: List<Bytes> = [],
+  // Whether a shipped module is read only for what the program reaches. `ply test --std` reads
+  // every one whole, its tests and laws among them, and the toolchain's own tree always does.
+  reached: Bool = true,
 ) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
@@ -3113,20 +3123,102 @@ pub fn staged_pulling_std_with(
     { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, diags: [] },
     map_len(texts),
   );
+  let hashed = |parsed: List<ParsedSource>|
+    hashed_closure(
+      parsed,
+      clo,
+      len(user),
+      toolchain,
+      ifaces,
+      concat(written.at, x.embeds),
+      priors,
+      x.cuts,
+    );
   {
     pulled: x.pulled,
     hashed: if len(x.diags) > 0 { Err(x.diags) } else {
-      hashed_closure(
-        x.parsed,
-        clo,
-        len(user),
-        toolchain,
-        ifaces,
-        concat(written.at, x.embeds),
-        priors,
-        x.cuts,
-      )
+      match hashed(x.parsed) {
+        Err(diags) -> Err(diags),
+        Ok(h) -> if !reached || toolchain { Ok(h) } else {
+          match reached_only(x.parsed, len(user) + len(clo.modules), h) {
+            None -> Ok(h),
+            Some(cut) -> hashed(cut),
+          }
+        },
+      }
     },
+  }
+}
+
+// A program reads of a shipped module the functions it reaches and the names any module imports,
+// beside the module's types and effects: a function nothing of its own reaches, and the module's
+// tests and laws, are left out, so they are neither checked nor counted, and the program does not
+// depend on them. `None` when nothing is left out. `first` is the first shipped module's slot.
+fn reached_only(
+  parsed: List<ParsedSource>,
+  first: Int,
+  h: Hashed,
+) -> Option<List<ParsedSource>> / {abort.raise} = {
+  let shipped = map(range(first, len(parsed)), |i: Int| at(parsed, i));
+  let named = |p: ParsedSource, name: Bytes| bytes_concat_all([p.name, b".", name]);
+  let candidates = fold(shipped, map_new(), |acc: Map<Bytes, Bool>, p: ParsedSource|
+    fold(p.module.module.items, acc, |a: Map<Bytes, Bool>, item: Item|
+      match item { IFn(d) -> map_insert(a, named(p, d.name.name), true), _ -> a }));
+  // A compiler module names its siblings bare, so an import of one is spelled both ways.
+  let imported = fold(range(0, len(parsed)), [], |acc: List<Bytes>, i: Int| {
+    let sibling = is_compiler(at(parsed, i).name);
+    fold(at(parsed, i).module.module.imports, acc, |a: List<Bytes>, d: ImportDecl|
+      match d.kind {
+        INames(names) -> {
+          let module = join(map(d.path, |part: Ident| part.name), b".");
+          fold(names, a, |b: List<Bytes>, n: Ident| {
+            let name = bytes_concat_all([module, b".", n.name]);
+            if sibling { push(push(b, name), bytes_concat(b"compiler.", name)) }
+            else { push(b, name) }
+          })
+        },
+        _ -> a,
+      })
+  });
+  let roots = concat(
+    concat(
+      fold(h.hashes.defs, [], |acc: List<Bytes>, d: { name: Bytes, hash: Bytes }|
+        if map_contains(candidates, d.name) { acc } else { push(acc, d.name) }),
+      concat(
+        map(filter(h.index.tests, |t: TestNode| t.module < first), |t: TestNode| t.key),
+        map(filter(h.index.laws, |l: LawNode| l.module < first), |l: LawNode| l.key),
+      ),
+    ),
+    imported,
+  );
+  let reach = closure_of(h.hashes, roots);
+  let kept = |p: ParsedSource, item: Item|
+    match item {
+      IFn(d) -> map_contains(reach, named(p, d.name.name)),
+      ITest(_) -> false,
+      ILaw(_) -> false,
+      _ -> true,
+    };
+  let cut = fold(shipped, false, |acc: Bool, p: ParsedSource|
+    acc || fold(p.module.module.items, false, |b: Bool, item: Item| b || !kept(p, item)));
+  if !cut { None } else {
+    Some(
+      map(range(0, len(parsed)), |i: Int| {
+        let p = at(parsed, i);
+        if i < first { p } else {
+          {
+            ..p,
+            module: {
+              ..p.module,
+              module: {
+                ..p.module.module,
+                items: filter(p.module.module.items, |item: Item| kept(p, item)),
+              },
+            },
+          }
+        }
+      }),
+    )
   }
 }
 
@@ -3155,9 +3247,19 @@ pub fn analyse_pulling_std_with(
   // What an earlier load of the same program hashed, which this one takes where it stands.
   priors: List<Prior> = [],
   unread: List<Bytes> = [],
+  reached: Bool = true,
 ) -> Pulled / {abort.raise} =
   checked_staged(
-    staged_pulling_std_with(user, shipped, pkgs, ifaces, embeds, priors, unread: unread),
+    staged_pulling_std_with(
+      user,
+      shipped,
+      pkgs,
+      ifaces,
+      embeds,
+      priors,
+      unread: unread,
+      reached: reached,
+    ),
     defs,
     tests,
   )
@@ -3741,7 +3843,10 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       imports: [],
       sets: [],
       // `say`'s body and the whole test, which a stub of the module blanks.
-      cuts: [{ start: 115, end: 126, braced: true }, { start: 127, end: 152, braced: false }],
+      cuts: [
+        { start: 115, end: 126, braced: true, name: b"m.say" },
+        { start: 127, end: 152, braced: false, name: b"" },
+      ],
     },
   ])
 }
@@ -4133,6 +4238,48 @@ fn shipped_modules() -> List<Source> =
     { name: b"std.c", src: b"pub fn c() -> Int = 3" },
     { name: b"std.d", src: b"pub fn d() -> Int = 4" },
   ]
+
+fn reached_fixture() -> List<Source> =
+  [
+    {
+      name: b"std.r",
+      src: b"import std.s (helper)\npub fn used() -> Int = helper()\npub fn unused() -> Int = 2\npub fn imported() -> Int = 3\ntest \"r holds\" { assert(used() == 1) }\n",
+    },
+    { name: b"std.s", src: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\n" },
+  ]
+
+fn pulled_hashes(p: Pulled) -> List<{ name: Bytes, hash: Bytes }> =
+  match p.out { Analysed(w) -> w.hashes.defs, Refused(_) -> [] }
+
+fn def_names(p: Pulled) -> List<Bytes> / {abort.raise} =
+  list::sort(map(pulled_hashes(p), |d: { name: Bytes, hash: Bytes }| d.name))
+
+test "a program reads of a shipped module the functions it reaches and the names it imports" {
+  let user = [{ name: b"m", src: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" }];
+  let cut = analyse_pulling_std_with(user, reached_fixture(), [], []);
+  assert_eq(def_names(cut), [b"m.f", b"std.r.imported", b"std.r.used", b"std.s.helper"]);
+  let whole = analyse_pulling_std_with(user, reached_fixture(), [], [], reached: false);
+  assert_eq(def_names(whole), [
+    b"m.f",
+    b"std.r.imported",
+    b"std.r.unused",
+    b"std.r.used",
+    b"std.s.helper",
+    b"std.s.other",
+  ]);
+  // What the program reaches is left whole, so it hashes alike either way.
+  let hash_of = |p: Pulled, name: Bytes|
+    fold(pulled_hashes(p), None, |acc: Option<Bytes>, d: { name: Bytes, hash: Bytes }|
+      if d.name == name { Some(d.hash) } else { acc });
+  assert_eq(hash_of(cut, b"std.r.used"), hash_of(whole, b"std.r.used"));
+  assert(hash_of(cut, b"std.r.used") != None)
+}
+
+test "a shipped compiler module keeps the names its bare sibling imports name" {
+  let user = [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()\n" }];
+  let cut = analyse_pulling_std_with(user, compiler_shipped(), [], []);
+  assert_eq(def_names(cut), [b"compiler.a.first", b"compiler.b.second", b"m.f"])
+}
 
 test "the shipped modules a program imports follow it a round at a time, each round in byte order" {
   let a = answer_pulling_std_with(

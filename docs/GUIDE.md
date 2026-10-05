@@ -1880,7 +1880,10 @@ std.<name>`. Its tests and obligations are skipped unless you pass `--std`.
 `ply std` lists it, `ply std --show std.json` prints one source and `ply std
 --show` alone prints every one. A load reads only the shipped modules its
 modules import, what those import in turn, and what they embed, so a change to
-any other leaves it alone; a change to one it reads warns `W0605`.
+any other leaves it alone; a change to one it reads warns `W0605`. Of those it
+checks, counts and hashes only the functions the program reaches and the names
+its modules import, beside every type and effect, and none of their tests or
+laws; `--std` reads each one whole.
 
 ### 13.1 `std.net` — sockets
 
