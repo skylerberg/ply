@@ -14,7 +14,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
               InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
-              NumericOp, numeric_ops, numeric_by)
+              NumericOp, numeric_ops, numeric_by, is_pub, Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
@@ -50,7 +50,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 TypeSpace, EffectSpace, resolve_modules, ResolveSucceeded, ResolveFailed, Expanded,
                 find, lookup, lookup_declared, space, qualify, default_binder, dump_diags,
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
-                private_name, pattern_binders, has_error)
+                private_name, pattern_binders, has_error, closed_ctor, closed_notes,
+                find_module_binding)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
                 expand_tagged)
@@ -69,11 +70,13 @@ import std.bytes (ascii_of_int)
 pub type Location = { module: Int, span: Span }
 /// What a `type` declares: an alias each use expands, a record of its own, or a sum.
 type Declaration = | DeclaredAlias(TypeExpr) | DeclaredRecord(TypeExpr) | DeclaredSum
+/// `opaque` is what the declaration says of it: only `owner` builds a value of the type.
 type TypeDecl = {
   params: List<Bytes>,
   labels: List<Bytes>,
   rows: List<Bytes>,
   declared: Declaration,
+  opaque: Option<Opaque>,
   owner: Int,
   span: Span,
 }
@@ -498,6 +501,8 @@ type Checker = {
   /// reads which types state `numeric`, and `keyed_names` which state a `key`.
   numeric_types: List<NumericInfo>,
   keyed_names: List<Bytes>,
+  /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
+  copied: Bool,
 }
 
 type Inferred = { checker: Checker, ty: Type, row: Row }
@@ -1359,18 +1364,19 @@ fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Check
               )
             },
             Some(d) -> if !d.public {
-              report(
-                checker,
-                private_name(
-                  checker.module,
-                  qname.span,
-                  owner,
-                  d.span,
-                  namespace,
-                  qname.name.name,
-                  module,
-                ),
-              )
+              report(checker, match kept_ctor(checker, namespace, qname, [owner]) {
+                Some(closed) -> closed,
+                None ->
+                  private_name(
+                    checker.module,
+                    qname.span,
+                    owner,
+                    d.span,
+                    namespace,
+                    qname.name.name,
+                    module,
+                  ),
+              })
             } else { checker },
           }
         },
@@ -1502,10 +1508,48 @@ fn edit_distance(a: Bytes, b: Bytes) -> Int / {abort.raise} = {
   at(final, m)
 }
 
+/// The modules this one imports, whether by a binder or for some of their names.
+fn imported(checker: Checker) -> List<Int> / {abort.raise} = {
+  let scope = scope_of(checker);
+  map(concat(scope.selective, scope.modules), |binding: ModuleBinding| binding.target)
+}
+
+/// What to say of a name that is a constructor one of `owners` keeps, its type being `opaque`.
+fn kept_ctor(
+  checker: Checker,
+  namespace: Namespace,
+  qname: QName,
+  owners: List<Int>,
+) -> Option<Diag> / {abort.raise} =
+  match namespace {
+    ValueSpace ->
+      fold(owners, None, |found: Option<Diag>, owner: Int|
+        match found {
+          Some(_) -> found,
+          None -> if owner == checker.module { None }
+          else { closed_ctor(checker.modules, checker.module, qname.span, owner, qname.name.name) },
+        }),
+    _ -> None,
+  }
+
 fn unknown_name(checker: Checker, qname: QName) -> Checker / {abort.raise} =
   match checker.derived {
     Some(_) -> unresolved_in_derived(checker, qname, b"definition"),
-    None -> unknown_name_here(checker, qname),
+    None -> match kept_named(checker, qname) {
+      Some(closed) -> report(checker, closed),
+      None -> unknown_name_here(checker, qname),
+    },
+  }
+
+/// What to say of a name no scope binds where its type's module keeps it: a bare name's may be any
+/// module imported here, a qualified one's is the module it names.
+fn kept_named(checker: Checker, qname: QName) -> Option<Diag> / {abort.raise} =
+  match qname.module {
+    None -> kept_ctor(checker, ValueSpace, qname, imported(checker)),
+    Some(binder) -> match find_module_binding(scope_of(checker).modules, binder.name) {
+      Some(binding) -> kept_ctor(checker, ValueSpace, qname, [binding.target]),
+      None -> None,
+    },
   }
 
 fn unknown_name_here(checker: Checker, qname: QName) -> Checker / {abort.raise} = {
@@ -2435,6 +2479,7 @@ fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker 
             labels: ident_names(def.generics.labels),
             rows: ident_names(def.generics.effects),
             declared: declared,
+            opaque: def.opaque,
             owner: checker.module,
             span: def.span,
           }),
@@ -3128,7 +3173,7 @@ fn report_unify(
         bytes_concat_all([context, b"|", pe.text, b"|", pf.text]),
         bytes_concat(b"type mismatch: ", context),
         bytes_concat_all([b"expected `", pe.text, b"`, found `", pf.text, b"`"]),
-        declared_apart(expected, found),
+        declared_apart(checker, expected, found),
       )
     },
     Arity(a) ->
@@ -3192,18 +3237,51 @@ fn report_unify(
     },
   }
 
+/// The module that declared the type `name` `opaque`, where that is not this one, and what it
+/// publishes for the type.
+fn closed_to(
+  checker: Checker,
+  name: Bytes,
+) -> Option<{ home: Bytes, opaque: Opaque }> / {abort.raise} =
+  match map_get(checker.types, name) {
+    None -> None,
+    Some(decl) -> match decl.opaque {
+      None -> None,
+      Some(opaque) -> if decl.owner == checker.module { None }
+      else { Some({ home: module_name(checker, decl.owner), opaque: opaque }) },
+    },
+  }
+
 /// What to say of a mismatch where one side is a `new` record and the other a record of any fields.
-fn declared_apart(expected: Type, found: Type) -> List<Bytes> = {
+fn declared_apart(checker: Checker, expected: Type, found: Type) -> List<Bytes> / {abort.raise} = {
+  let apart = |name: Bytes|
+    bytes_concat_all([
+      b"`",
+      name,
+      b"` is declared with `new`, so no other record is one whatever its fields",
+    ]);
   let note = |name: Bytes|
-    [
-      bytes_concat_all([
-        b"`",
-        name,
-        b"` is declared with `new`, so no other record is one whatever its fields; a record literal is one where a `",
-        name,
-        b"` is expected",
-      ]),
-    ];
+    match closed_to(checker, name) {
+      Some(closed) ->
+        prepend(
+          bytes_concat_all([
+            apart(name),
+            b", and it is opaque, so only `",
+            closed.home,
+            b"` builds one",
+          ]),
+          closed_notes(closed.home, closed.opaque),
+        ),
+      None ->
+        [
+          bytes_concat_all([
+            apart(name),
+            b"; a record literal is one where a `",
+            name,
+            b"` is expected",
+          ]),
+        ],
+    };
   match expected {
     TyNominal(n) -> match found { TyRecord(_) -> note(n.name), _ -> [] },
     TyRecord(_) -> match found { TyNominal(n) -> note(n.name), _ -> [] },
@@ -3825,8 +3903,19 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
     ERecord(r) -> {
       let met = met_of(hint);
       match hinted(checker, hint) {
-        Some(TyNominal(n)) if !tuple_apart(r.fields, n.fields) ->
-          infer_nominal(checker, r.span, r.fields, n, met),
+        Some(TyNominal(n)) if !tuple_apart(r.fields, n.fields) -> match closed_record(
+            checker,
+            r.span,
+            n.name,
+            b"this literal would be one",
+          ) {
+          // Its values are still walked, and nothing more is said of the record they would make.
+          Some(refused) -> {
+            let values = infer_all(refused, map(r.fields, |f: RecField| f.value), r.span);
+            { checker: values.checker, ty: TyNominal(n), row: values.row }
+          },
+          None -> infer_nominal(checker, r.span, r.fields, n, met),
+        },
         expected -> {
           let known = match expected { Some(TyRecord(fs)) -> fs, _ -> [] };
           let fs = fold(
@@ -4092,6 +4181,54 @@ fn tuple_apart(written: List<RecField>, fields: List<Field>) -> Bool =
     [] -> false,
   }
 
+/// The refusal of a literal or an update that would make a value of the `opaque` record `name`
+/// outside the module that declares it, or in a `pub fn`'s default, which each caller that omits
+/// the argument is handed. `None` where the record may be built here.
+fn closed_record(
+  checker: Checker,
+  span: Span,
+  name: Bytes,
+  how: Bytes,
+) -> Option<Checker> / {abort.raise} =
+  match map_get(checker.types, name) {
+    None -> None,
+    Some(decl) -> match decl.opaque {
+      None -> None,
+      Some(opaque) -> if decl.owner != checker.module {
+        let home = module_name(checker, decl.owner);
+        Some(
+          report_error_at_and(
+            checker,
+            b"E0220",
+            span,
+            bytes_concat_all([b"only `", home, b"` builds a `", name, b"`"]),
+            how,
+            { module: decl.owner, span: opaque.span },
+            b"declared `opaque` here",
+            closed_notes(home, opaque),
+          ),
+        )
+      } else if checker.copied {
+        Some(
+          report_error_at(
+            checker,
+            b"E0122",
+            span,
+            bytes_concat_all([
+              b"a default on a `pub fn` cannot build `",
+              simple_name_of(name),
+              b"`",
+            ]),
+            b"an opaque type, built only in this module",
+            [
+              b"the default is copied into every call site that omits the argument, and a caller in another module may not build one",
+            ],
+          ),
+        )
+      } else { None },
+    },
+  }
+
 /// A record literal where a `new` record is expected is one: it names each of that record's fields,
 /// and each value meets the type the declaration gives its field.
 fn infer_nominal(
@@ -4272,7 +4409,10 @@ fn update_shape(
     TyNominal(n) ->
       {
         checker: update_shaped(
-          update_fields(checker, base_span, n.fields, written, true),
+          match closed_record(checker, span, n.name, b"this update would answer a new one") {
+            Some(refused) -> refused,
+            None -> update_fields(checker, base_span, n.fields, written, true),
+          },
           span,
           n.fields,
         ),
@@ -5591,6 +5731,25 @@ fn infer_cell_op(
 
 type Bound = { checker: Checker, out: List<{ name: Bytes, ty: Type }> }
 
+/// A pattern on a constructor its type's module keeps. A bare name's refusal is said here and a
+/// qualified one's where it was looked up; what the pattern binds is bound all the same, so that
+/// is all that is said of it.
+fn bind_kept(
+  checker: Checker,
+  name: QName,
+  args: List<Pattern>,
+  closed: Diag,
+  out: List<{ name: Bytes, ty: Type }>,
+) -> Bound / {abort.raise} =
+  fold(
+    args,
+    { checker: if is_bare(name) { report(checker, closed) } else { checker }, out: out },
+    |acc: Bound, arg: Pattern| {
+      let t: WithTy = new_ty(acc.checker);
+      bind_pattern(t.checker, arg, t.ty, acc.out)
+    },
+  )
+
 fn bind_pattern(
   checker: Checker,
   p: Pattern,
@@ -5610,8 +5769,10 @@ fn bind_pattern(
     PCtor(c) -> {
       let n: WithName = ctor_name(checker, c.name);
       let info = match n.name { Some(q) -> ctor_of(n.checker, q), None -> None };
-      match info {
-        None -> if is_bare(c.name)
+      let kept = match info { Some(_) -> None, None -> kept_named(n.checker, c.name) };
+      match ((info, kept)) {
+        (None, Some(closed)) -> bind_kept(n.checker, c.name, c.args, closed, out),
+        (None, None) -> if is_bare(c.name)
             || (match declared_value(n.checker, c.name) { Some(_) -> true, None -> false }) {
           let nm = c.name.name.name;
           let base = [b"constructors come from a `type` declaration with variants"];
@@ -5645,7 +5806,7 @@ fn bind_pattern(
             out: out,
           }
         } else { { checker: n.checker, out: out } },
-        Some(ci) -> {
+        (Some(ci), _) -> {
           let inst = instantiate(ci.scheme, n.checker.fresh);
           let c1: Checker = { ..n.checker, fresh: inst.fresh };
           let shape = match inst.ty {
@@ -6030,7 +6191,8 @@ fn coverage_pat(checker: Checker, p: Pattern) -> CoveragePattern / {abort.raise}
             name: k.simple_name,
             args: map(c.args, |a: Pattern| coverage_pat(checker, a)),
           }),
-        None -> CoverNothing,
+        // A constructor its type's module keeps is refused where it is named, and said once.
+        None -> match kept_named(checker, c.name) { Some(_) -> CoverAny, None -> CoverNothing },
       }
     },
     PLit(l) -> match l.lit {
@@ -8853,8 +9015,18 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
     match at(def.params, i).default {
       None -> c,
       Some(d) -> {
-        let o: Inferred = infer(c, d, hint_of(at(signature.params, i)));
-        expect(o.checker, expr_span(d), at(signature.params, i), o.ty, b"parameter default").checker
+        let o: Inferred = infer(
+          { ..c, copied: is_pub(def.vis) },
+          d,
+          hint_of(at(signature.params, i)),
+        );
+        expect(
+          { ..o.checker, copied: false },
+          expr_span(d),
+          at(signature.params, i),
+          o.ty,
+          b"parameter default",
+        ).checker
       },
     });
   let pushed: Checker = { ..defaults, env: env_push(defaults.env) };
@@ -10673,17 +10845,20 @@ fn ungeneratable_within(
         b"a `Secret` is a credential: quantifying over one would have the generator mint credentials and the shrinker print counterexamples",
       )
     } else {
-      match first_reason(c.args, |a: Type| ungeneratable_within(checker, a, seen, room)) {
+      match closed_reason(checker, c.name) {
         Some(r) -> Some(r),
-        None -> if contains(seen, c.name) { None } else {
-          let ctors = filter(checker.ctors, |ctor_info: CtorInfo| ctor_info.type_name == c.name);
-          if len(ctors) == 0 { None }
-          else if room <= 0 { panic("a type entered twice on one path") } else {
-            let inner = push(seen, c.name);
-            first_reason(ctors, |ctor_info: CtorInfo|
-              first_reason(ctor_info.fields, |f: Type|
-                ungeneratable_within(checker, f, inner, room - 1)))
-          }
+        None -> match first_reason(c.args, |a: Type| ungeneratable_within(checker, a, seen, room)) {
+          Some(r) -> Some(r),
+          None -> if contains(seen, c.name) { None } else {
+            let ctors = filter(checker.ctors, |ctor_info: CtorInfo| ctor_info.type_name == c.name);
+            if len(ctors) == 0 { None }
+            else if room <= 0 { panic("a type entered twice on one path") } else {
+              let inner = push(seen, c.name);
+              first_reason(ctors, |ctor_info: CtorInfo|
+                first_reason(ctor_info.fields, |f: Type|
+                  ungeneratable_within(checker, f, inner, room - 1)))
+            }
+          },
         },
       }
     },
@@ -10707,8 +10882,27 @@ fn ungeneratable_within(
       }
     },
     TyRecord(fs) -> first_reason(fs, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
-    TyNominal(n) ->
-      first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
+    TyNominal(n) -> match closed_reason(checker, n.name) {
+      Some(r) -> Some(r),
+      None -> first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
+    },
+  }
+
+/// Why a generator in this module makes no value of the type `name`: another module declared it
+/// `opaque`, so a value drawn here would be one that module never built.
+fn closed_reason(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise} =
+  match closed_to(checker, name) {
+    None -> None,
+    Some(closed) ->
+      Some(
+        bytes_concat_all([
+          b"`",
+          name,
+          b"` is opaque, so only `",
+          closed.home,
+          b"` builds one: state the law there, or over what its functions take",
+        ]),
+      ),
   }
 
 type SpecSite = | InRequires | InEnsures | InCost | SSDecreases | InWhere | InLawBody | InSchemaBody
@@ -13407,6 +13601,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     instances: [],
     numeric_types: [],
     keyed_names: [],
+    copied: false,
   })
 
 /// `ok` is `false` when the program has an *error* in it. A warning is not one: the program

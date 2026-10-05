@@ -15,9 +15,10 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 doc_at, module_doc, token_between, dump_doc, primary_span_of)
 import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, Keyword, Punctuation,
               EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark, follows_name)
-import type_syntax (TypeExpr, TRecord, TUnit, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead,
-                    MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row,
-                    row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
+import type_syntax (TypeExpr, TRecord, TUnit, TCon, TFn, RowExpr, AtomExpr, Mode, Generics,
+                    RowMember, MRead, MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode,
+                    generics, row, row_member, no_generics, dump_ty, dump_row, dump_atom,
+                    dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span, no_expr,
               fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, hidden_binder,
@@ -151,9 +152,16 @@ pub type TypeDefBody = | TDAlias(TypeExpr) | TDSum(List<VariantDef>) | TDNominal
 /// A field of the record a `type` declares, with the doc above it.
 pub type FieldDoc = { name: Bytes, doc: Doc }
 
-/// `field_docs` holds a doc for each field of a declared record that has one.
+/// An `opaque` before `type`, where it is written, with all another module has of the type: the
+/// module's `pub fn`s that answer one, and those that only take one. They are named here because a
+/// load reads a shipped module without the functions the program does not reach.
+pub type Opaque = { span: Span, answer: List<Bytes>, take: List<Bytes> }
+
+/// `field_docs` holds a doc for each field of a declared record that has one. Only the module
+/// declaring an `opaque` type builds a value of it, or names a constructor of one.
 pub type TypeDef = {
   vis: Vis,
+  opaque: Option<Opaque>,
   name: Ident,
   generics: Generics,
   body: TypeDefBody,
@@ -319,6 +327,7 @@ pub fn no_fn() -> FnDef =
 pub fn no_type_def() -> TypeDef =
   {
     vis: VPriv,
+    opaque: None,
     name: no_ident(),
     generics: no_generics(),
     body: TDAlias(no_ty()),
@@ -464,6 +473,7 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_reuse_start(input, parser)
     || at_transparent_start(input, parser)
     || at_const_start(input, parser)
+    || at_opaque_start(input, parser)
     || at_extern_start(input, parser)
     || at_instance_start(input, parser)
     || at_numeric_start(input, parser)
@@ -513,6 +523,10 @@ pub fn at_transparent_start(input: Input, parser: Parser) -> Bool =
 /// `const` is contextual: it opens an item only when `fn` follows.
 pub fn at_const_start(input: Input, parser: Parser) -> Bool =
   at_ident_text(input, parser, b"const") && token_kind_at(input, parser, 1) == keyword_fn()
+
+/// `opaque` is contextual: it opens an item only before `type`.
+pub fn at_opaque_start(input: Input, parser: Parser) -> Bool =
+  at_ident_text(input, parser, b"opaque") && token_kind_at(input, parser, 1) == keyword_type()
 
 /// `set` is contextual: only a third identifier opens a set, so `effect set { .. }` is an effect named `set`.
 pub fn at_effect_set_start(input: Input, parser: Parser) -> Bool =
@@ -1465,20 +1479,47 @@ fn type_body(input: Input, parser: Parser) -> Result<Parsed<TypeDefBody>, Parser
     Ok({ parser: t.parser, node: TDAlias(t.node) })
   }
 
+/// An alias is the type it names, so there is nothing of its own for `opaque` to close.
+fn opaque_alias(parser: Parser, opaque: Option<Span>, body: TypeDefBody, name: Ident) -> Parser =
+  match ((opaque, body)) {
+    (Some(span), TDAlias(_)) ->
+      push_diag(
+        parser,
+        error_at(
+          b"E0221",
+          span,
+          bytes_concat_all([b"the alias `", name.name, b"` cannot be `opaque`"]),
+          b"an alias has no values of its own to close",
+          [
+            b"`opaque` closes a sum or a `new` record: write `= new { .. }` for a record of its own, or `= | Name(..)` for a sum",
+          ],
+        ),
+      ),
+    _ -> parser,
+  }
+
+/// A `type`, entered at `opaque` where that is written before it.
 pub fn type_def(
   input: Input,
   parser: Parser,
   vis: Vis,
 ) -> Result<Parsed<TypeDef>, Parser> / {abort.raise} = {
-  let st = advance(input, parser);
+  let opaque = if at_opaque_start(input, parser) { Some(current_span(input, parser)) }
+  else { None };
+  let st = advance(input, match opaque { Some(_) -> bump(input, parser), None -> parser });
   let { parser, node: name } = expect_ident(input, st.parser, b"a type name after `type`")?;
   let { parser, node: g } = opt_generics(input, parser)?;
   let { parser, .. } = expect(input, parser, token_eq(), b"`=` after the type name")?;
   let { parser, node: body } = type_body(input, parser)?;
   Ok({
-    parser: parser,
+    parser: opaque_alias(parser, opaque, body, name),
     node: {
       vis: vis,
+      opaque: match ((opaque, body)) {
+        (_, TDAlias(_)) -> None,
+        (Some(span), _) -> Some({ span: span, answer: [], take: [] }),
+        (None, _) -> None,
+      },
       name: name,
       generics: g,
       body: body,
@@ -2022,34 +2063,41 @@ pub fn no_pub(
     None -> parser,
   }
 
+fn at_fn_start(input: Input, parser: Parser) -> Bool =
+  at_transparent_start(input, parser) || at_reuse_start(input, parser)
+    || at_const_start(input, parser)
+    || at_token(input, parser, keyword_fn())
+
+/// A `fn` with whichever of `transparent`, `reuse` and `const` is written before it.
+fn written_fn(
+  input: Input,
+  parser: Parser,
+  vis: Vis,
+) -> Result<Parsed<FnDef>, Parser> / {abort.raise} =
+  if at_transparent_start(input, parser) {
+    let t = advance(input, parser);
+    if at_reuse_start(input, t.parser) {
+      let a = advance(input, t.parser);
+      fn_def(input, a.parser, vis, Some(a.node), Some(t.node))
+    } else { fn_def(input, t.parser, vis, None, Some(t.node)) }
+  } else if at_reuse_start(input, parser) {
+    let a = advance(input, parser);
+    fn_def(input, a.parser, vis, Some(a.node), None)
+  } else if at_const_start(input, parser) {
+    let a = advance(input, parser);
+    fn_def(input, a.parser, vis, None, None, Some(a.node))
+  } else { fn_def(input, parser, vis, None, None) }
+
 pub fn item_at(
   input: Input,
   parser: Parser,
   vis: Vis,
   pub_span: Option<Span>,
 ) -> Result<Parsed<Item>, Parser> / {abort.raise} =
-  if at_transparent_start(input, parser) {
-    let t = advance(input, parser);
-    if at_reuse_start(input, t.parser) {
-      let a = advance(input, t.parser);
-      let d = fn_def(input, a.parser, vis, Some(a.node), Some(t.node))?;
-      Ok({ parser: d.parser, node: IFn(d.node) })
-    } else {
-      let d = fn_def(input, t.parser, vis, None, Some(t.node))?;
-      Ok({ parser: d.parser, node: IFn(d.node) })
-    }
-  } else if at_reuse_start(input, parser) {
-    let a = advance(input, parser);
-    let d = fn_def(input, a.parser, vis, Some(a.node), None)?;
+  if at_fn_start(input, parser) {
+    let d = written_fn(input, parser, vis)?;
     Ok({ parser: d.parser, node: IFn(d.node) })
-  } else if at_const_start(input, parser) {
-    let a = advance(input, parser);
-    let d = fn_def(input, a.parser, vis, None, None, Some(a.node))?;
-    Ok({ parser: d.parser, node: IFn(d.node) })
-  } else if at_token(input, parser, keyword_fn()) {
-    let d = fn_def(input, parser, vis, None, None)?;
-    Ok({ parser: d.parser, node: IFn(d.node) })
-  } else if at_token(input, parser, keyword_type()) {
+  } else if at_opaque_start(input, parser) || at_token(input, parser, keyword_type()) {
     let d = type_def(input, parser, vis)?;
     Ok({ parser: d.parser, node: IType(d.node) })
   } else if at_effect_set_start(input, parser) {
@@ -2186,8 +2234,54 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
     None -> shown,
     Some(sp) -> push(shown, hidden_import(b"cases", cases_binder(), sp)),
   };
-  { parser: done.parser, node: { doc: module_doc(input), imports: ranged, items: done.items } }
+  {
+    parser: done.parser,
+    node: { doc: module_doc(input), imports: ranged, items: published(done.items) },
+  }
 }
+
+/// Whether a written type names `name` as the module that declares it does, at any depth.
+fn names_type(t: TypeExpr, name: Bytes) -> Bool =
+  match t {
+    TCon(c) ->
+      (c.name.module == None && c.name.name.name == name)
+        || fold(c.args, false, |found: Bool, a: TypeExpr| found || names_type(a, name)),
+    TFn(f) ->
+      names_type(f.ret, name)
+        || fold(f.params, false, |found: Bool, p: TypeExpr| found || names_type(p, name)),
+    TRecord(r) ->
+      fold(r.fields, false, |found: Bool, f: { name: Ident, ty: TypeExpr }|
+        found || names_type(f.ty, name)),
+    _ -> false,
+  }
+
+/// What the module's `pub fn`s say of the type `name`: which answer one, and which only take one.
+fn publishing(items: List<Item>, name: Bytes, span: Span) -> Opaque =
+  fold(items, { span: span, answer: [], take: [] }, |acc: Opaque, item: Item|
+    match item {
+      IFn(d) -> if !is_pub(d.vis) { acc }
+      else if match d.ret { Some(t) -> names_type(t, name), None -> false } {
+        { ..acc, answer: push(acc.answer, d.name.name) }
+      } else if fold(d.params, false, |found: Bool, p: Param|
+          found || (match p.ty { Some(t) -> names_type(t, name), None -> false })) {
+        { ..acc, take: push(acc.take, d.name.name) }
+      } else { acc },
+      _ -> acc,
+    })
+
+/// Each `opaque` type with what its module publishes for it.
+fn published(items: List<Item>) -> List<Item> =
+  if !fold(items, false, |any: Bool, item: Item|
+      any || (match item { IType(d) -> d.opaque != None, _ -> false })) { items } else {
+    map(items, |item: Item|
+      match item {
+        IType(d) -> match d.opaque {
+          Some(o) -> IType({ ..d, opaque: Some(publishing(items, d.name.name, o.span)) }),
+          None -> item,
+        },
+        _ -> item,
+      })
+  }
 
 /// Where the module's first test over cases says `for`: listing and choosing a case call `std.cases`.
 fn first_cases(items: List<Item>) -> Option<Span> =
@@ -2448,10 +2542,14 @@ pub fn dump_type_body(b: TypeDefBody) -> Bytes / {abort.raise} =
     TDNominal(t) -> bytes_concat(dump_word(b"new"), dump_ty(t)),
   }
 
+/// Dumped only where it is written, so a declaration without it dumps as it always has.
+pub fn dump_opaque(span: Span) -> Bytes = dump_node(span, b"opq")
+
 pub fn dump_type(type_def: TypeDef) -> Bytes / {abort.raise} =
   bytes_concat_all([
     dump_node(type_def.span, b"ty"),
     dump_vis(type_def.vis),
+    match type_def.opaque { Some(o) -> dump_opaque(o.span), None -> b"" },
     dump_ident(type_def.name),
     dump_generics(type_def.generics),
     dump_type_body(type_def.body),
@@ -2670,6 +2768,31 @@ test "`new` after the `=` opens a nominal record, which names at least one field
   assert_eq(refused(b"type T = new Int\n"), 1);
   assert_eq(refused(b"type T<new> = List<new>\n"), 0);
   assert_eq(refused(b"type T<a, [l] | e> = new { f: (a) -> Unit / {net.send[l] | e} }\n"), 0)
+}
+
+test "`opaque` before `type` closes a sum or a `new` record, never an alias, and is a name elsewhere" {
+  assert(
+    string_contains(
+      dump(b"pub opaque type T = new { a: A }\n"),
+      "11:32:ty;%pub;4:10:opq;16:17:ident;",
+    ),
+  );
+  let refused = |src: Bytes| map(parse(src).parser.diags, |d: ParseDiag| d.code);
+  assert_eq(refused(b"opaque type T = | A | B(Int)\n"), []);
+  assert_eq(refused(b"pub opaque type T = Int\n"), [b"E0221"]);
+  assert_eq(refused(b"opaque type T = { a: Int }\n"), [b"E0221"]);
+  assert_eq(refused(b"fn opaque(opaque: Int) -> Int = opaque\n"), []);
+  let published = parse(
+    b"pub opaque type T = | T(Int)\npub fn make() -> Option<T> = None\nfn kept(t: T) -> T = t\npub fn read(t: T) -> Int = 1\npub fn other() -> Int = 1\n",
+  );
+  match item_at_index(published.node, 0) {
+    IType(d) ->
+      assert_eq(
+        d.opaque,
+        Some({ span: { start: 4, end: 10 }, answer: [b"make"], take: [b"read"] }),
+      ),
+    _ -> panic("the first item is `T`"),
+  }
 }
 
 test "`type Pair<a>= a` splits the `>=` into `>` and `=`" {
