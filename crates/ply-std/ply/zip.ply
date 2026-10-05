@@ -10,15 +10,26 @@
 //! archive's bytes.
 //!
 //! It reads stored and deflated members, zip64 in every record that has a form of it, and data
-//! descriptors in each of their four forms. A name is UTF-8 where the header's flag says so, the
-//! Info-ZIP Unicode path field's where there is one for the header's name, and code page 437
-//! otherwise, which is what the format says an unflagged name is. Nothing is guessed: a UTF-8
-//! name written without the flag, as macOS's `zip` and Finder write one, reads as the code
-//! page spells its bytes, and `Member.name` holds the bytes for a caller who knows who wrote
-//! them. A member's time is MS-DOS's date and time, the wall clock of whoever wrote it, with no
-//! zone and so no instant; the extended timestamp field and the NTFS field hold instants, read
-//! where they are. A Unix's mode says what a member is and may do, and a directory is also any
-//! name that ends in `/`. A header's other flags and its version numbers are read past.
+//! descriptors in each of their four forms. A member's time is MS-DOS's date and time, the wall
+//! clock of whoever wrote it, with no zone and so no instant; the extended timestamp field and
+//! the NTFS field hold instants, read where they are. A Unix's mode says what a member is and
+//! may do, and a directory is also any name that ends in `/`. A header's other flags and its
+//! version numbers are read past.
+//!
+//! A name is UTF-8 where its header's flag says so, and the Info-ZIP Unicode path field's where
+//! there is one for the header's name. Any other name the format declares to be code page 437,
+//! and the two commonest writers, macOS's `zip` and Finder, write UTF-8 there all the same. So
+//! a reader chooses, by a `Names` it is handed: `Utf8IfValid`, the default, reads such a name
+//! as UTF-8 where its bytes are UTF-8 and as code page 437 where they are not, and `Declared`
+//! reads it as the format says and never guesses. What the default costs is a code page 437
+//! name that is also UTF-8, which it misreads: every character of that name outside ASCII
+//! would have to stand in a run of a box-drawing, Greek or mathematical character and the one
+//! to three accented letters or signs it calls for, which a name written in that code page all
+//! but never does. `Listed.name` and `Member.name` hold the bytes under either rule, and a
+//! member's comment is read by the same rule as its name. The two readings agree on every
+//! ASCII character, so a path has the same `/`, `.`, `\` and `:` in the same places under
+//! both, and alone is as safe under one as under the other; they differ in which letters are
+//! one letter in two cases, and a plan is made, and judged, over the names as they were read.
 //!
 //! An archive that says two things is refused, since each of two readers may believe one of
 //! them. A member's own header must say what the directory says of it: its name, its flags, its
@@ -94,8 +105,8 @@ pub type Times = new {
 
 /// What an archive's directory says of one member, apart from its data.
 pub type Header = new {
-  /// As the archive spells it, a directory's without its trailing `/`. `plan` is what makes it
-  /// safe to use.
+  /// As the archive spells it, read as the reader's `Names` says where no flag marks it, and a
+  /// directory's without its trailing `/`. `plan` is what makes it safe to use.
   path: String,
   kind: Kind,
   /// The permission, set-id and sticky bits a Unix wrote. From any other system, which writes
@@ -324,6 +335,16 @@ fn widened(
 
 // --- Names ----------------------------------------------------------------------
 
+/// How a reader takes a name, or a member's comment, that its header does not flag as UTF-8
+/// and no Unicode path field spells.
+pub type Names =
+  /// As the format declares it: code page 437, whatever else its bytes could be.
+  | Declared
+  /// As UTF-8 where its bytes are UTF-8, and as code page 437 where they are not. ASCII reads
+  /// alike either way, and bytes that are UTF-8 only by an overlong form or a surrogate are not
+  /// UTF-8.
+  | Utf8IfValid
+
 /// The character each byte of code page 437 from `0x80` is.
 const fn cp437() -> Array<Int> =
   array_of_list(
@@ -367,6 +388,10 @@ fn of_cp437(raw: Bytes) -> String / {abort.raise} =
 
 fn utf8(where: Int, raw: Bytes) -> String / {zip.refused, abort.raise} =
   if bytes_is_utf8(raw) { string_of_bytes(raw) } else { refuse(where, NotUtf8) }
+
+/// A name or a comment no flag marks, as `names` takes one.
+fn unflagged(raw: Bytes, names: Names) -> String / {abort.raise} =
+  if names == Utf8IfValid && bytes_is_utf8(raw) { string_of_bytes(raw) } else { of_cp437(raw) }
 
 // --- Times ----------------------------------------------------------------------
 
@@ -675,7 +700,8 @@ pub type Method =
 pub type Listed = new {
   header: Header,
   /// Its name as the directory spells it and its header's flags, which the member's own header
-  /// is held to. Bit 11 of the flags says the name is UTF-8.
+  /// is held to. Bit 11 of the flags says the name is UTF-8; without it these are the bytes a
+  /// caller who must not guess reads for itself.
   name: Bytes,
   flags: Int,
   method: Method,
@@ -761,6 +787,7 @@ fn unicode_path(r: Raw) -> Option<Bytes> / {abort.raise} =
 fn named(
   where: Int,
   r: Raw,
+  names: Names,
 ) -> { path: String, kind: Kind, mode: Int } / {zip.refused, abort.raise} = {
   let flagged = r.flags & 0x800 != 0;
   let unicode = if flagged { None } else { unicode_path(r) };
@@ -778,7 +805,7 @@ fn named(
   else if bits == 10 { Symlink }
   else { Other(bits) };
   {
-    path: if flagged || unicode != None { utf8(where, spelled) } else { of_cp437(spelled) },
+    path: if flagged || unicode != None { utf8(where, spelled) } else { unflagged(spelled, names) },
     kind: kind,
     mode: if unix { r.external >> 16 & 0xFFF }
     else { (if slashed { 493 } else { 420 }) & (if r.external & 1 == 0 { 0xFFF } else { 0x16D }) },
@@ -791,6 +818,7 @@ fn listed_of(
   r: Raw,
   d: Directory,
   limits: Limits,
+  names: Names,
 ) -> Listed / {zip.refused, abort.raise} = {
   let w = r.wide;
   let dense = match checked_mul(w.stored, limits.ratio) {
@@ -806,7 +834,7 @@ fn listed_of(
   else if dense { refuse(where, TooDense) }
   else if r.method == 0 && w.stored != w.size { refuse(where, BadNumber) }
   else if w.at > d.at || w.stored > d.at { refuse(where, Overlaps) } else {
-    let name = named(where, r);
+    let name = named(where, r, names);
     if name.kind == Directory && w.size != 0 { refuse(where, StrayData) } else {
       {
         header: {
@@ -815,7 +843,8 @@ fn listed_of(
           mode: name.mode,
           modified: clock(r.date, r.time),
           times: times_of(where, r.extra),
-          comment: if r.flags & 0x800 != 0 { utf8(where, r.comment) } else { of_cp437(r.comment) },
+          comment: if r.flags & 0x800 != 0 { utf8(where, r.comment) }
+          else { unflagged(r.comment, names) },
           extra: filter(r.extra, |f: Field| !read_here(f.id)),
         },
         name: r.name,
@@ -846,13 +875,14 @@ fn walk(
   held: Bytes,
   d: Directory,
   limits: Limits,
+  names: Names,
   w: Walk,
   left: Int,
 ) -> Walk / {zip.refused, abort.raise} =
   if left <= 0 { w } else {
     let where = d.at + w.at;
     let r = central(held, w.at, where);
-    let l = listed_of(where, r, d, limits);
+    let l = listed_of(where, r, d, limits, names);
     if map_contains(w.names, l.header.path) { refuse(where, Duplicate) }
     else if map_contains(w.least, l.at) { refuse(where, Overlaps) }
     else if l.size > limits.total - w.total { refuse(where, TooMuch) } else {
@@ -860,6 +890,7 @@ fn walk(
         held,
         d,
         limits,
+        names,
         {
           at: w.at + r.length,
           listed: push(w.listed, l),
@@ -902,12 +933,14 @@ fn bounded(
 }
 
 /// The members a directory lists, in its order. `held` is the directory's bytes, `d.size` of
-/// them from `d.at`. Raises `zip.refused` for a header that is none, a member this does not
-/// read or that passes a limit, two of one name, and two whose bytes overlap.
+/// them from `d.at`, and `names` how a name no flag marks is read. Raises `zip.refused` for a
+/// header that is none, a member this does not read or that passes a limit, two of one name as
+/// read, and two whose bytes overlap.
 pub fn listing(
   held: Bytes,
   d: Directory,
   limits: Limits,
+  names: Names = Utf8IfValid,
 ) -> List<Listed> / {zip.refused, abort.raise} =
   if bytes_len(held) != d.size { refuse(d.at, Truncated) }
   else if d.entries > limits.entries { refuse(d.at, TooMany) } else {
@@ -915,6 +948,7 @@ pub fn listing(
       held,
       d,
       limits,
+      names,
       { at: 0, listed: [], names: map_new(), least: map_new(), total: 0 },
       d.entries,
     );
@@ -1048,13 +1082,17 @@ pub fn unpack(m: Member, held: Bytes) -> Bytes / {zip.refused, abort.raise} =
 
 /// Every member of `archive`, in its directory's order, its header and where its data lies,
 /// with no data unpacked: a listing. Every member's own header is read and held to the
-/// directory.
-pub fn members(archive: Bytes, limits: Limits) -> List<Member> / {zip.refused, abort.raise} = {
+/// directory, and a name no flag marks is read as `names` says.
+pub fn members(
+  archive: Bytes,
+  limits: Limits,
+  names: Names = Utf8IfValid,
+) -> List<Member> / {zip.refused, abort.raise} = {
   let length = bytes_len(archive);
   match locate(archive, length, limits) {
     More(_) -> refuse(length, Truncated),
     Found(d) ->
-      map(listing(bytes_slice(archive, d.at, d.at + d.size), d, limits), |l: Listed|
+      map(listing(bytes_slice(archive, d.at, d.at + d.size), d, limits, names), |l: Listed|
         match open(l, bytes_slice(archive, l.at, l.until), limits) {
           Found(m) -> m,
           More(_) -> refuse(l.at, Truncated),
@@ -1063,14 +1101,22 @@ pub fn members(archive: Bytes, limits: Limits) -> List<Member> / {zip.refused, a
 }
 
 /// The entries of `archive`, raising `zip.refused` where `decode` answers `Err`.
-pub fn read(archive: Bytes, limits: Limits) -> List<Entry> / {zip.refused, abort.raise} =
-  map(members(archive, limits), |m: Member| -> Entry {
+pub fn read(
+  archive: Bytes,
+  limits: Limits,
+  names: Names = Utf8IfValid,
+) -> List<Entry> / {zip.refused, abort.raise} =
+  map(members(archive, limits, names), |m: Member| -> Entry {
     { header: m.header, data: unpack(m, bytes_slice(archive, m.data, m.data + m.stored)) }
   })
 
-/// The entries of `archive`, or why it is not an archive within `limits`.
-pub fn decode(archive: Bytes, limits: Limits) -> Result<List<Entry>, Refusal> / {abort.raise} =
-  try { read(archive, limits) }
+/// The entries of `archive`, or why it is not an archive within `limits`. A name no flag marks
+/// is read as `names` says: as UTF-8 where its bytes are, unless told to read it as declared.
+pub fn decode(
+  archive: Bytes,
+  limits: Limits,
+  names: Names = Utf8IfValid,
+) -> Result<List<Entry>, Refusal> / {abort.raise} = try { read(archive, limits, names) }
 
 // --- Writing --------------------------------------------------------------------
 
@@ -1454,10 +1500,11 @@ fn drawn(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
 fn drawn_all(picks: List<Int>, data: Bytes) -> List<Entry> =
   map(enumerate(picks), |p: { index: Int, value: Int }| drawn(p.index, p.value, data))
 
-law "what is written reads back as the entries it was written from"
+law "what is written reads back as the entries it was written from, by either rule for names"
   forall (picks: List<Int>, data: Bytes) {
     let entries = drawn_all(picks, data);
-    decode(write(entries), roomy()) == Ok(entries)
+    let whole = write(entries);
+    decode(whole, roomy()) == Ok(entries) && decode(whole, roomy(), Declared) == Ok(entries)
   }
 
 law "an archive's last bytes find its directory, or say how many more would"
@@ -1539,6 +1586,27 @@ law "a plan is std.tar's of the same entries, where no path or target is a forei
     }
   }
 
+/// Path segments a law winds into one path to judge under both readings: plain, staying,
+/// climbing, empty, outside ASCII, a drive's, and any text at all.
+fn windings(text: String) -> List<String> =
+  ["a", "..", ".", "", "caf\u{e9}", "\u{6c34}\u{df}", "c:", text]
+
+/// A UTF-8 text as a reader takes it that reads its bytes as code page 437.
+fn misread(text: String) -> String / {abort.raise} = of_cp437(bytes_of_string(text))
+
+law "a path alone is as safe read as code page 437 as read as the UTF-8 it is"
+  forall (picks: List<Int>, text: String) {
+    let path = join(
+      map(picks, |pick: Int|
+        match list_at(windings(text), pick & 7) { Some(name) -> name, None -> "a" }),
+      "/",
+    );
+    match safe_path(path) {
+      Ok(safe) -> safe_path(misread(path)) == Ok(misread(safe)),
+      Err(why) -> safe_path(misread(path)) == Err(why),
+    }
+  }
+
 law "reading and writing are linear in the entries"
   forall (n: Int) where n > 0 cost n {
     let entries = map(range(0, n), |i: Int| file(int_to_string(i), b"x"));
@@ -1569,6 +1637,40 @@ fn alone(listed: Image, own: Image, stored: Bytes, after: Bytes) -> Bytes / {abo
   let said = central_header(listed, 0);
   bytes_concat_all([body, said, end_records(1, bytes_len(said), bytes_len(body), b"")])
 }
+
+/// A member as a test lays one out: what its headers say, and its data as stored.
+type Laid = { image: Image, data: Bytes }
+
+/// A member of no data whose headers say what `i` holds.
+fn bare(i: Image) -> Laid = { image: i, data: b"" }
+
+/// An archive of `members`, each as its image says, whatever a writer would say.
+fn laid(members: List<Laid>) -> Bytes / {abort.raise} = {
+  let put = fold(
+    members,
+    { body: [], directory: [], at: 0 },
+    |so_far: { body: List<Bytes>, directory: List<Bytes>, at: Int }, m: Laid| {
+      let own = local_header(m.image);
+      {
+        body: push(push(so_far.body, own), m.data),
+        directory: push(so_far.directory, central_header(m.image, so_far.at)),
+        at: so_far.at + bytes_len(own) + bytes_len(m.data),
+      }
+    },
+  );
+  let directory = bytes_concat_all(put.directory);
+  bytes_concat_all(
+    concat(put.body, [directory, end_records(len(members), bytes_len(directory), put.at, b"")]),
+  )
+}
+
+/// The archive of `entries`, stored, as a writer that never flags a name writes it.
+fn unmarked(entries: List<Entry>) -> Bytes / {abort.raise} =
+  laid(
+    map(entries, |e: Entry| -> Laid {
+      { image: { ..image(e, false, bytes_len(e.data)), flags: 0 }, data: e.data }
+    }),
+  )
 
 test "an archive of one file is its header, its data, the directory's header and an end record" {
   let archive = write([file("hello.txt", b"hi\n")]);
@@ -1671,7 +1773,7 @@ test "a header's date and time are a wall clock from 1980 to 2107, to two second
   assert_eq(read(write([unset]), roomy()), [unset])
 }
 
-test "an unflagged name is code page 437, a flagged one UTF-8, and a Unicode path field its own" {
+test "a name that is no UTF-8 is code page 437, a flagged one UTF-8, a Unicode path field its own" {
   assert_eq(
     of_cp437(bytes_concat_all(map(range(128, 256), |byte: Int| byte_of_int(byte)))),
     "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒ"
@@ -1683,7 +1785,6 @@ test "an unflagged name is code page 437, a flagged one UTF-8, and a Unicode pat
   let plainly = image(file("caf_.txt", b""), false, 0);
   let paths = |i: Image| map(read(alone(i, i, b"", b""), roomy()), |e: Entry| e.header.path);
   assert_eq(paths({ ..plainly, name: b"caf\x82.txt" }), ["caf\u{e9}.txt"]);
-  assert_eq(paths({ ..plainly, name: b"caf\xc3\xa9.txt" }), ["caf\u{251c}\u{2310}.txt"]);
   assert_eq(paths({ ..plainly, name: b"caf\xc3\xa9.txt", flags: 0x800 }), ["caf\u{e9}.txt"]);
   assert_eq(
     refusal(alone({ ..plainly, name: b"caf\x82.txt", flags: 0x800 }, plainly, b"", b""), roomy()),
@@ -1708,6 +1809,95 @@ test "an unflagged name is code page 437, a flagged one UTF-8, and a Unicode pat
   assert_eq(flags(file("caf\u{e9}", b"")), [(0x800, b"caf\xc3\xa9")]);
   assert_eq(flags(noted), [(0, b"a")]);
   assert_eq(flags({ ..noted, header: { ..noted.header, comment: "\u{e9}" } }), [(0x800, b"a")])
+}
+
+test "a name no flag marks is read as UTF-8 where it is UTF-8, or as declared where a reader says" {
+  let plainly = image(file("a", b""), false, 0);
+  let told = |i: Image, names: Names|
+    map(read(laid([bare(i)]), roomy(), names), |e: Entry| (e.header.path, e.header.comment));
+  let both = |i: Image| (told(i, Utf8IfValid), told(i, Declared));
+  let accented = { ..plainly, name: b"caf\xc3\xa9-\xe6\xb0\xb4.txt", comment: b"na\xc3\xafve" };
+  assert_eq(both(accented), (
+    [("caf\u{e9}-\u{6c34}.txt", "na\u{ef}ve")],
+    [("caf\u{251c}\u{2310}-\u{b5}\u{2591}\u{2524}.txt", "na\u{251c}\u{bb}ve")],
+  ));
+  // The reading asked for by nothing is the first.
+  assert_eq(map(read(laid([bare(accented)]), roomy()), |e: Entry| e.header.path), [
+    "caf\u{e9}-\u{6c34}.txt",
+  ]);
+  assert_eq(map(members(laid([bare(accented)]), roomy()), |m: Member| (m.flags, m.name)), [
+    (0, b"caf\xc3\xa9-\xe6\xb0\xb4.txt"),
+  ]);
+  // A name and its comment are each read by their own bytes.
+  assert_eq(both({ ..plainly, name: b"caf\x82", comment: b"\xc3\xa9" }), (
+    [("caf\u{e9}", "\u{e9}")],
+    [("caf\u{e9}", "\u{251c}\u{2310}")],
+  ));
+  assert_eq(both({ ..plainly, name: b"plain", comment: b"too" }), (
+    [("plain", "too")],
+    [("plain", "too")],
+  ));
+  // Bytes that spell `/` and `..` the long way, a surrogate, and a number past the last
+  // character are no UTF-8, so no reading finds a `/` in them.
+  assert_eq(
+    map(
+      [b"a\xc0\xafb", b"\xc0\xae\xc0\xae", b"\xe0\x80\xaf", b"\xed\xa0\x80", b"\xf4\x90\x80\x80"],
+      |name: Bytes| both({ ..plainly, name: name }),
+    ),
+    map(
+      [
+        "a\u{2514}\u{bb}b",
+        "\u{2514}\u{ab}\u{2514}\u{ab}",
+        "\u{3b1}\u{c7}\u{bb}",
+        "\u{3c6}\u{e1}\u{c7}",
+        "\u{2320}\u{c9}\u{c7}\u{c7}",
+      ],
+      |path: String| ([(path, "")], [(path, "")]),
+    ),
+  );
+  // Two names are one name where they read alike, whatever their bytes.
+  let twice = laid([bare({ ..plainly, name: b"\xc3\xa9" }), bare({ ..plainly, name: b"\x82" })]);
+  assert_eq(refusal(twice, roomy()), Some({ at: 111, why: Duplicate }));
+  assert_eq(map(read(twice, roomy(), Declared), |e: Entry| e.header.path), [
+    "\u{251c}\u{2310}",
+    "\u{e9}",
+  ]);
+  // What this writes is flagged, and reads alike by either rule.
+  let written = write([file("caf\u{e9}", b"")]);
+  assert_eq(read(written, roomy(), Declared), read(written, roomy(), Utf8IfValid))
+}
+
+test "a plan is made over names as they were read, which settles the letters it takes for one" {
+  // `É` and `é` are one letter in two cases, read as UTF-8; as code page 437 their bytes spell
+  // `├ë` and `├⌐`, which are not.
+  let through = unmarked([symlink("\u{c9}", "x"), file("\u{e9}/planted", b"")]);
+  assert_eq(
+    plan(read(through, roomy())),
+    Err({ index: 1, path: "\u{e9}/planted", why: ThroughLink }),
+  );
+  assert_eq(
+    plan(read(through, roomy(), Declared)),
+    Ok([
+      MakeSymlink("\u{251c}\u{eb}", "x"),
+      MakeDirectory("\u{251c}\u{2310}", 493),
+      WriteFile("\u{251c}\u{2310}/planted", 420, b""),
+    ]),
+  );
+  // And `À` and `Ç` are two letters, read as UTF-8; as code page 437 their bytes spell `├Ç`
+  // and `├ç`, which are one.
+  let apart = unmarked([symlink("\u{c0}", "x"), file("\u{c7}/planted", b"")]);
+  assert_eq(
+    plan(read(apart, roomy())),
+    Ok([
+      MakeSymlink("\u{c0}", "x"),
+      MakeDirectory("\u{c7}", 493),
+      WriteFile("\u{c7}/planted", 420, b""),
+    ]),
+  );
+  assert_eq(
+    plan(read(apart, roomy(), Declared)),
+    Err({ index: 1, path: "\u{251c}\u{e7}/planted", why: ThroughLink }),
+  )
 }
 
 test "a reader keeps to the entries, the sizes, the ratio and the lengths it was given" {
