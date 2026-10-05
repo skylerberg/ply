@@ -17,9 +17,10 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt, SLet,
               SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
-              ETagged, Tagged, Hole)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
-                 LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
+              ETagged, Tagged, Hole, written_operator, call_operator)
+import rewrite (map_expr, map_item)
+import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
+                 LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
 import std.list (at)
 import std.bytes (is_digit, join, ascii_of_int)
 
@@ -30,7 +31,10 @@ pub fn fmt_source(src: Bytes) -> Result<Bytes, Bytes> / {abort.raise} = {
   match list_at(r.parser.diags, 0) {
     Some(d) -> Err(render_diag(src, d)),
     None -> {
-      let out = module({ source: src, comments: lex(src).comments }, r.node);
+      let out = module({ source: src, comments: lex(src).comments }, {
+        ..r.node,
+        items: map(r.node.items, with_operators),
+      });
       let again = parse(out);
       match list_at(again.parser.diags, 0) {
         Some(d) ->
@@ -45,6 +49,29 @@ pub fn fmt_source(src: Bytes) -> Result<Bytes, Bytes> / {abort.raise} = {
         } else { Ok(out) },
       }
     },
+  }
+}
+
+/// A call the parser wrote for an operator, as that operator over its operands, so it prints as
+/// any binary operator does; its `op` is the builtin's name.
+fn as_operator(e: Expr) -> Expr =
+  match e {
+    EApp(a) -> match ((written_operator(a.func, a.args), a.args)) {
+      (Some(o), [lhs, rhs]) -> EBinary({ span: a.span, op: o.name, lhs: lhs, rhs: rhs }),
+      _ -> e,
+    },
+    _ -> e,
+  }
+
+/// An item with every operator the parser wrote as a call read back as the operator.
+fn with_operators(item: Item) -> Item = {
+  let go = |x: Expr| map_expr(x, as_operator);
+  let opt = |x: Option<Expr>| match x { Some(y) -> Some(go(y)), None -> None };
+  match map_item(item, as_operator) {
+    IFn(d) -> IFn({ ..d, decreases: opt(d.decreases) }),
+    ILaw(d) -> ILaw({ ..d, cost: opt(d.cost) }),
+    ISchema(d) -> ISchema({ ..d, guard: opt(d.guard), body: go(d.body) }),
+    other -> other,
   }
 }
 
@@ -473,8 +500,22 @@ fn unparen_text(t: Bytes) -> Bytes / {abort.raise} =
     } else { Stop(cur) }
   })
 
+/// A number without the blanks after its sign, and a range without those around its dots; a
+/// quoted byte keeps its own.
 fn strip_blanks(t: Bytes) -> Bytes / {abort.raise} =
-  bytes_concat_all(bytes_split(bytes_concat_all(bytes_split(t, b" ")), b"\t"))
+  fold(
+    range(0, bytes_len(t)),
+    { out: b"", quoted: false, escaped: false },
+    |s: { out: Bytes, quoted: Bool, escaped: Bool }, i: Int| {
+      let c = bytes_at(t, i);
+      {
+        out: if s.quoted || (c != 32 && c != 9) { bytes_concat(s.out, bytes_slice(t, i, i + 1)) }
+        else { s.out },
+        quoted: if c == 39 && !s.escaped { !s.quoted } else { s.quoted },
+        escaped: s.quoted && c == 92 && !s.escaped,
+      }
+    },
+  ).out
 
 /// A literal written as a line string: the AST holds only its value, so the source says which.
 fn is_lines(input: PrintInput, expr: Expr) -> Bool / {abort.raise} =
@@ -560,6 +601,7 @@ fn pattern_text(input: PrintInput, x: Pattern) -> Bytes / {abort.raise} =
     PWild(_) -> b"_",
     PVar(v) -> v.name.name,
     PLit(v) -> lit_text(input, v.span, v.lit),
+    PRange(v) -> strip_blanks(unparen(input, v.span)),
     PCtor(v) -> if len(v.args) == 0 { qname_text(v.name) } else {
       bytes_concat_all([
         qname_text(v.name),
@@ -616,7 +658,7 @@ fn bp(op: Bytes) -> Int =
   else if op == b"shl" || op == b"shr" || op == b"ushr" { 7 }
   else if op == b"concat" { 8 }
   else if op == b"add" || op == b"sub" { 9 }
-  else { 10 }
+  else { match call_operator(op) { Some(o) -> o.bp, None -> 10 } }
 
 fn op_text(op: Bytes) -> Bytes = {
   let table = [
@@ -641,7 +683,11 @@ fn op_text(op: Bytes) -> Bytes = {
     { n: b"div", t: b"/" },
     { n: b"rem", t: b"%" },
   ];
-  fold(table, b"", |acc: Bytes, e: { n: Bytes, t: Bytes }| if e.n == op { e.t } else { acc })
+  match call_operator(op) {
+    Some(o) -> o.text,
+    None ->
+      fold(table, b"", |acc: Bytes, e: { n: Bytes, t: Bytes }| if e.n == op { e.t } else { acc }),
+  }
 }
 
 fn unary_text(op: Bytes) -> Bytes =
@@ -1848,10 +1894,12 @@ fn param(input: PrintInput, printer: Printer, x: Param, indent: Int) -> Printer 
 fn fn_def(input: PrintInput, printer: Printer, def: FnDef) -> Printer / {abort.raise} = {
   let reuse_kw = match def.reuse { Some(_) -> b"reuse ", None -> b"" };
   let transparent_kw = match def.transparent { Some(_) -> b"transparent ", None -> b"" };
+  let const_kw = match def.baked { Some(_) -> b"const ", None -> b"" };
   let head = bytes_concat_all([
     vis_text(def.vis),
     transparent_kw,
     reuse_kw,
+    const_kw,
     b"fn ",
     def.name.name,
     generics_text(def.generics),
@@ -2295,13 +2343,16 @@ fn line_start(src: Bytes, i: Int) -> Int / {abort.raise} =
 fn line_end(src: Bytes, i: Int) -> Int / {abort.raise} =
   match bytes_index_of_from(src, b"\n", i) { Some(j) -> j + 1, None -> bytes_len(src) }
 
-/// Where the item's own text starts: at its `pub`, `transparent` or `reuse` when it has one, else its
-/// keyword.
+/// Where the item's own text starts: at its `pub`, `transparent`, `reuse` or `const` when it has one,
+/// else its keyword.
 fn head_start(src: Bytes, item: Item) -> Int / {abort.raise} = {
   let kw = match item {
     IFn(d) -> match d.transparent {
       Some(t) -> t.start,
-      None -> match d.reuse { Some(s) -> s.start, None -> d.span.start },
+      None -> match d.reuse {
+        Some(s) -> s.start,
+        None -> match d.baked { Some(s) -> s.start, None -> d.span.start },
+      },
     },
     _ -> item_span(item).start,
   };
@@ -2493,6 +2544,53 @@ test "an or-pattern parts its alternatives with ` | `, keeping a parenthesised c
     b"fn f(n: Int) -> Int = match n { 1|2 -> 0, (3 | (4|5)) -> 1, _ -> 2 }\n",
     b"fn f(n: Int) -> Int = match n { 1 | 2 -> 0, 3 | (4 | 5) -> 1, _ -> 2 }\n",
   )
+}
+
+test "a byte literal keeps its spelling, a blank included, and a range closes up around its dots" {
+  lays_out(
+    b"fn f(c: Int) -> Int = match c { b' ' -> 0, b'0' ..= b'9' -> 1, - 5 ..= -1 -> 2, _ -> 3 }\n",
+    b"fn f(c: Int) -> Int = match c { b' ' -> 0, b'0'..=b'9' -> 1, -5..=-1 -> 2, _ -> 3 }\n",
+  );
+  lays_out(
+    b"fn f() -> List<Int> = [ b' ',b'\\'' , b'\\\\' ,b'\\x20' ]\n",
+    b"fn f() -> List<Int> = [b' ', b'\\'', b'\\\\', b'\\x20']\n",
+  );
+  lays_out(
+    b"fn f(b: U8) -> Int = match b { (0u8..=9u8) | 20u8 ..=29u8 -> 1, _ -> 0 }\n",
+    b"fn f(b: U8) -> Int = match b { 0u8..=9u8 | 20u8..=29u8 -> 1, _ -> 0 }\n",
+  )
+}
+
+test "a wrapping or saturating operator prints as it was written, and its call as a call" {
+  lays_out(
+    b"fn f(a: U32, b: U32) -> U32 = a+%b *% a -% b\n",
+    b"fn f(a: U32, b: U32) -> U32 = a +% b *% a -% b\n",
+  );
+  lays_out(
+    b"fn f(a: U8, b: U8) -> U8 = (a +| b) *| (a -| b)\n",
+    b"fn f(a: U8, b: U8) -> U8 = (a +| b) *| (a -| b)\n",
+  );
+  lays_out(
+    b"fn f(a: Int, b: Int) -> Int = wrap_add(a,b) +% saturating_mul(a, b)\n",
+    b"fn f(a: Int, b: Int) -> Int = wrap_add(a, b) +% saturating_mul(a, b)\n",
+  );
+  lays_out(
+    b"fn f(a: Int, b: Int) -> Int = (a +% b) -% (a -% b) + (a *% b)\n",
+    b"fn f(a: Int, b: Int) -> Int = a +% b -% (a -% b) + a *% b\n",
+  )
+}
+
+test "a wrapping operator binds as the arithmetic operator beside it, and is its builtin's call" {
+  let body = |text: Bytes|
+    tree_of(bytes_concat_all([b"fn f(a: Int, b: Int, c: Int) -> Int = ", text]));
+  let same = |written: Bytes, call: Bytes| body(written) == body(call);
+  assert(same(b"a +% b *% c", b"wrap_add(a, wrap_mul(b, c))"));
+  assert(same(b"a *| b +| c", b"saturating_add(saturating_mul(a, b), c)"));
+  assert(same(b"a -% b -% c", b"wrap_sub(wrap_sub(a, b), c)"));
+  assert(same(b"a +% b * c", b"wrap_add(a, b * c)"));
+  assert(same(b"a * b -| c", b"saturating_sub(a * b, c)"));
+  assert(same(b"a & b +% c << 1", b"a & wrap_add(b, c) << 1"));
+  assert(same(b"-a *% b", b"wrap_mul(-a, b)"))
 }
 
 test "a short `let ... else` keeps its `else` on the line, and a longer one opens a block" {
@@ -2845,6 +2943,7 @@ test "every item kind prints back to the same tree" {
     b"fn h(t: (Int, Bool)) -> (Bool, Int) = match t { (n, b) -> (b, n) }\n",
     b"pub transparent fn k(x: Int) -> Int = x\n",
     b"transparent reuse fn q(xs: List<Int>) -> List<Int> = xs\n",
+    b"pub const fn table() -> List<Int> = [1, 2]\n",
     b"fn r(xs: List<Int>, n: Int) -> List<Int>\n  returns xs\n  requires n > 0\n= xs\n",
     b"fn s() -> List<Int>\n  returns fresh\n= []\n",
     b"derive json for P\n",

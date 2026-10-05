@@ -5,15 +5,16 @@
 import hash (hex)
 import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, answer_bin,
-             tables_bin, emit_roots_answer, module_of_root)
+             tables_bin, emit_roots_answer, module_of_root, symbol_of, entry_of, no_tables)
 import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow, analyse, dump_of)
 import diagnostics (parse_all)
-import infer (sccs, dump_flag)
+import infer (dump_flag)
 import interface (read_key, sized, stubbed)
 import embed (EmbedAt)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
 import std.bin
 import std.list (sort_by, take, at, concat)
+import std.graph
 import std.bytes (hex_of, u32_at, u64_le, hex_digit, ascii_of_int)
 import std.fs (fs)
 import std.hash (blake3)
@@ -979,7 +980,8 @@ pub fn codes(made: Made) -> Map<Bytes, Bytes> / {abort.raise} = {
     fold(b.tables.calls, [], |acc: List<Int>, c: Bytes|
       match map_get(index, c) { Some(j) -> push(acc, j), None -> acc }));
   // Components come callees first, so each folds in the digests of those it reaches.
-  let reached = fold(sccs(n, adj), map_new(), |done: Map<Int, Bytes>, comp: List<Int>| {
+  let components = graph::components({ out: adj });
+  let reached = fold(components, map_new(), |done: Map<Int, Bytes>, comp: List<Int>| {
     let inside = fold(comp, map_new(), |m: Map<Int, Bool>, i: Int| map_insert(m, i, true));
     let below = fold(comp, [], |acc: List<Bytes>, i: Int|
       fold(at(adj, i), acc, |a: List<Bytes>, j: Int|
@@ -1324,21 +1326,116 @@ fn answers_at_once(
     concat(halves._0, halves._1)
   }
 
-/// The unit over `offered`: each root's answer taken from what an earlier run kept where it stands,
-/// the emitter entered once for the rest, what it answered kept for the next run, and the unit
-/// produced over all of it. `emitter` is what the emitter's answers are a function of on its side,
-/// which every kept answer is filed under. `Err` says why the emitter answered nothing at all.
+// --- Values a build kept ----------------------------------------------------------
+
+/// A `const` definition and the text a build kept its value as, which the runtime wrote and reads.
+pub type Baked = { name: Bytes, text: Bytes }
+
+/// The root that answers a `const` definition's value as that text: what a build enters to keep it.
+pub fn stored_root(name: Bytes) -> Bytes = bytes_concat(name, b"#stored")
+
+fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} =
+  if bytes_ends_with(root, b"#stored") { Some(bytes_slice(root, 0, bytes_len(root) - 7)) }
+  else { None }
+
+/// `text` as adjacent C string literals, none longer than a compiler accepts. It is hex digits, so
+/// no byte of it needs an escape or reads as a placeholder.
+fn quoted(text: Bytes) -> Bytes / {abort.raise} = {
+  let n = bytes_len(text);
+  let count = if n == 0 { 1 } else { (n + piece_len() - 1) / piece_len() };
+  bytes_concat_all(
+    map(range(0, count), |i: Int|
+      bytes_concat_all([
+        b"\"",
+        bytes_slice(text, i * piece_len(), min(n, (i + 1) * piece_len())),
+        b"\"\n",
+      ])),
+  )
+}
+
+fn entered_by(symbol: Bytes, entry: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"Word ",
+    entry,
+    b"(PlyCtx *ctx, const Word *args) {\n  return ",
+    symbol,
+    b"(ctx);\n}",
+  ])
+
+/// A `const` definition as the value a build kept: its unit holds the text and reads it once, where
+/// the definition's own body would have run. It calls nothing, so the unit need not hold what the
+/// body reaches.
+fn baked_body(b: Baked) -> Answer / {abort.raise} = {
+  let symbol = symbol_of(b.name);
+  let entry = entry_of(b.name);
+  let held = bytes_concat(symbol, b"_baked");
+  Body({
+    text: bytes_concat_all([
+      b"static const char ",
+      held,
+      b"[] =\n",
+      quoted(b.text),
+      b";\nWord ",
+      entry,
+      b"(PlyCtx *ctx, const Word *args);\nWord ",
+      symbol,
+      b"(PlyCtx *ctx) {\n  return rt_baked_p(ctx, (Word)(intptr_t)",
+      held,
+      b", INT64_C(",
+      ascii_of_int(bytes_len(b.text)),
+      b"));\n}\n",
+      entered_by(symbol, entry),
+    ]),
+    tables: { ..no_tables(), symbols: [{ symbol: symbol, entry: entry }] },
+  })
+}
+
+/// The body of `root`, the stored root of `of`: the definition read as any body reads a constant,
+/// and what it answers written as the text a unit holds a value by.
+fn stored_body(root: Bytes, of: Bytes) -> Answer / {abort.raise} = {
+  let symbol = symbol_of(root);
+  let entry = entry_of(root);
+  Body({
+    text: bytes_concat_all([
+      b"Word ",
+      entry,
+      b"(PlyCtx *ctx, const Word *args);\nWord ",
+      symbol,
+      b"(PlyCtx *ctx) {\n  Word held = rt_constant_p(ctx, @@l0@@);\n",
+      b"  if (ctx->failed) return 0;\n  return rt_stored_p(ctx, held);\n}\n",
+      entered_by(symbol, entry),
+    ]),
+    tables: {
+      ..no_tables(),
+      lambdas: [entry_of(of)],
+      calls: [of],
+      symbols: [{ symbol: symbol, entry: entry }],
+    },
+  })
+}
+
+/// The unit over `every` root offered: each one's answer taken from what an earlier run kept where it
+/// stands, the emitter entered once for the rest, what it answered kept for the next run, and the
+/// unit produced over all of it. `emitter` is what the emitter's answers are a function of on its
+/// side, which every kept answer is filed under. `Err` says why the emitter answered nothing at all.
+/// A root `baked` names is held as that value in place of its body, and a `stored_root` offered is
+/// made here: the emitter is asked for neither.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
   sources: List<Bytes>,
-  offered: List<Bytes>,
+  every: List<Bytes>,
   emitter: Bytes,
   read: (Bytes) -> Option<Bytes> / e,
   write: (Bytes, Bytes) -> Unit / e,
+  baked: List<Baked> = [],
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
   let ctors = map(dump.emitter_ctors, |c: EmitterCtor| { name: c.name, arity: c.arity });
+  let wanted = fold(every, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+  let values = fold(baked, map_new(), |acc: Map<Bytes, Baked>, b: Baked|
+    if map_contains(wanted, b.name) { map_insert(acc, b.name, b) } else { acc });
+  let offered = filter(every, |n: Bytes| !map_contains(values, n) && stored_of(n) == None);
   let asked = fold(offered, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
   // No constructor table: a body names each tag by its constructor, which its key's read
   // declarations already cover, so one answer serves every program that holds the root.
@@ -1403,18 +1500,22 @@ pub fn emitted<| e>(
       });
     fold(repacked(p.keys, buckets, packs, looked, answered), (), |_: Unit, r: Repack|
       write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
+    let lowered = map_fold(answered, kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+      map_insert(acc, n, a));
+    let held = map_fold(values, lowered, |acc: Map<Bytes, Answer>, n: Bytes, b: Baked|
+      map_insert(acc, n, baked_body(b)));
     Ok({
       produced: produce(
         runtime,
         ctors,
-        map(offered, |n: Bytes|
+        map(every, |n: Bytes|
           match map_get(p.roots, n) {
             Some(r) -> { name: n, arity: r.arity, constant: r.pure && r.arity == 0 },
             None -> { name: n, arity: 0, constant: false },
           }),
         len(p.modules),
-        map_fold(answered, kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
-          map_insert(acc, n, a)),
+        fold(every, held, |acc: Map<Bytes, Answer>, n: Bytes|
+          match stored_of(n) { Some(of) -> map_insert(acc, n, stored_body(n, of)), None -> acc }),
         fold(dump.emitter_ctors, [], |acc: List<Stated>, c: EmitterCtor|
           if c.key == None && c.show == None && len(c.numeric) == 0 { acc }
           else { push(acc, { ctor: c.name, key: c.key, show: c.show, numeric: c.numeric }) }),
@@ -1969,6 +2070,61 @@ test "the emitter answers roots dealt over calls as it answers them in one" {
     None,
   );
   assert_eq(rows(answers_at_once(runtime, dump, p, [], lists, 0, len(lists), 64)), together)
+}
+
+test "a unit holds a `const` definition as the value a build kept, and makes its stored root" {
+  let source = b"const fn table() -> List<Int> = spread(3)\nfn spread(n: Int) -> List<Int> = [n, n + 1]\nfn first() -> Int = match table() { [x, ..] -> x, [] -> 0 }\n";
+  let dump = dump_of(analyse(parse_all([{ name: b"m", src: source }])));
+  assert_eq(map(dump.baked, |row: { name: Bytes, hash: Bytes }| row.name), [b"m.table"]);
+  let runtime = { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" };
+  let unit = |every: List<Bytes>, baked: List<Baked>|
+    match emitted(
+        runtime,
+        dump,
+        [source],
+        every,
+        b"",
+        |_: Bytes| None,
+        |_: Bytes, _: Bytes| (),
+        baked,
+      ) {
+      Ok(e) -> e,
+      Err(why) -> panic(string_of_bytes_lossy(why)),
+    };
+  let held = unit([b"m.table", b"m.first"], [{ name: b"m.table", text: b"78da" }]);
+  // The value stands where the body would: nothing asks the emitter for it, or for what it calls.
+  assert_eq(held.asked, 1);
+  assert_eq(held.produced.taken, [b"m.first", b"m.table"]);
+  assert(
+    bytes_index_of(
+        held.produced.text,
+        bytes_concat_all([
+          b"static const char ",
+          symbol_of(b"m.table"),
+          b"_baked[] =\n\"78da\"\n;",
+        ]),
+      )
+      != None,
+    None,
+  );
+  assert(bytes_index_of(held.produced.text, b", INT64_C(4));") != None, None);
+  // A value for a root the unit does not hold is no part of it.
+  let apart = unit([b"m.spread"], [{ name: b"m.table", text: b"78da" }]);
+  assert_eq(bytes_index_of(apart.produced.text, b"_baked"), None);
+  // The stored root reads the definition as any body reads a constant, and needs it held.
+  let storing = unit([b"m.table", b"m.spread", stored_root(b"m.table")], []);
+  assert_eq(storing.asked, 2);
+  assert_eq(storing.produced.taken, [b"m.spread", b"m.table", b"m.table#stored"]);
+  assert(bytes_index_of(storing.produced.text, b"rt_stored_p(ctx, held)") != None, None);
+  let alone = unit([stored_root(b"m.table")], []);
+  assert_eq(map(alone.produced.dropped, |d: Dropped| d.function), [b"m.table#stored"])
+}
+
+test "a value's text is cut into literals no longer than a compiler takes" {
+  assert_eq(quoted(b"ab"), b"\"ab\"\n");
+  assert_eq(quoted(b""), b"\"\"\n");
+  let long = bytes_concat_all(map(range(0, piece_len() + 1), |_: Int| b"0"));
+  assert_eq(len(bytes_split(quoted(long), b"\n")), 3)
 }
 
 test "a unit takes what its callees let it, resolves its bodies and says what it holds" {
