@@ -117,7 +117,7 @@ cases — and holds no examples: the tests and laws that name a definition are
 its examples, and `ply doc` lists them (§16). A blank line between a doc and its
 declaration does not part them, and `ply fmt` removes it. A doc comment that
 documents nothing — one inside a body, above an import, a `test`, a `law`, a
-`derive`, a `key`, a `show` or a `numeric`, or at the end of a file, or a `//!` line below
+`derive`, a `key`, a `show`, a `gen` or a `numeric`, or at the end of a file, or a `//!` line below
 the head of its file — is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
 answer.
 
@@ -144,11 +144,12 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `raise` | opening an operation declaration (§6.8) |
 | `set` | `effect set X = {..}` |
 | `new` | right after the `=` of a `type` declaration |
+| `opaque` | before `type` at item position (§3.2) |
 | `law`, `host`, `schema`, `forall`, `cost` | `law "..."`, `law/host` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
-| `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
+| `key`, `show`, `gen`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>`, `gen for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -343,7 +344,7 @@ Loosest to tightest; all binary operators are left-associative:
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
 `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`,
-`show` and `numeric`, in any order.
+`show`, `gen` and `numeric`, in any order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -399,6 +400,51 @@ Items are private unless `pub` (`E0107`). `pub` applies to `fn`, `type`,
 `effect` and `law schema` only. Values (functions, constructors and the
 definitions a schema declares, §10), types, effects and module binders are
 separate namespaces, so `fn size`, `type Size` and `effect size` coexist.
+
+A `pub type` exports a sum's constructors with it, and a `new` record (§4.2) is
+built by any module that writes a literal where one is expected. `opaque` before
+`type` keeps the building to the declaring module, so a value of the type is
+one that module's functions answered, and whatever they hold of it holds:
+
+```ply
+pub opaque type Token = | Token(String)
+pub opaque type Date = new { year: Int, month: Int, day: Int }
+
+pub fn mint(s: String) -> Option<Token> = if s == "" { None } else { Some(Token(s)) }
+pub fn text_of(t: Token) -> String = match t { Token(s) -> s }
+pub fn of_ymd(year: Int, month: Int, day: Int) -> Option<Date> = ..
+```
+
+Inside the module nothing changes. Another module names the type, holds and
+passes its values and calls the module's functions, and is refused what would
+make a value or take a sum apart, each time with the functions the module
+publishes for the type:
+
+* a constructor of an opaque sum, called, passed, imported or matched, is
+  `E0107`: the type's module keeps it, as it keeps a private name;
+* a record literal where an opaque record is expected, and an update of one,
+  is `E0220`;
+* a `forall` over a type that holds one is `E0418` (§10): a value drawn there
+  would be built there. The law is stated in the type's module, or over what
+  its functions take; or the module states a `gen` for the type (§4.4), whose
+  values are then the module's own wherever they are drawn.
+
+An opaque record's fields are still read, by `d.year` and by a record pattern,
+in any module; a module that keeps what a value holds to itself declares a sum
+of one constructor. `opaque` is not secrecy: `==`, `compare`, `digest`, `show`
+and `reflect` read a whole value as they read any other, through a `key` and a
+`show` where the module states them (§4.4), and a `Secret` is the type nothing
+reads (§4.6). A codec the module derives (§11) is one it publishes, and its
+decoder builds a value of any document of the type's shape, so a type whose
+functions hold more than its shape says writes its codec by hand.
+
+A default on a `pub fn` is copied into each caller, so one that names an opaque
+constructor or builds an opaque record is `E0122`. A type need not be `pub` to
+be opaque: its values still leave the module in what its functions answer. An
+alias is the type it names and has no values of its own to keep, so `opaque` on
+one is `E0221`. Unlike `pub`, `opaque` is part of a type's hash (§4.2): it
+decides what a definition that never names the type may write, so every
+definition that can hold one is checked again when a type is opened or closed.
 
 ### 3.3 Packages and the manifest
 
@@ -676,7 +722,8 @@ At run time a `new` record is the record it is written as. `==`, `compare`,
 `digest`, `show`, `reflect` and every derived codec (§11) read its fields as
 they read a plain record's, so two `new` records of the same fields print,
 encode and digest alike, and only the checker tells them apart. A definition's
-hash does tell them apart: a `new` record is hashed with its name, as a sum is.
+hash does tell them apart: a `new` record is hashed with its name, as a sum is,
+and either with whether it is `opaque` (§3.2).
 
 ### 4.3 Lists, arrays and maps
 
@@ -703,7 +750,8 @@ type Level = Debug | Info | Warn | Error
 ```
 
 The leading `|` is optional. Constructors are values: `Circle(3)` is a call,
-`Point` a reference. `type Id = Int` (one name, no payload, no `|`) is an alias.
+`Point` a reference; an `opaque` sum's are its module's alone (§3.2).
+`type Id = Int` (one name, no payload, no `|`) is an alias.
 A sum is nominal, as a `new` record is (§4.2): identical sums in two modules
 differ. A sum takes parameters as an alias does,
 `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`, and a use that fills them
@@ -791,6 +839,49 @@ a numeric type: it fills `numeric(a)` (§4.5), as `std.math.sum(xs)` over a
 `numeric(a)`, which holds the ordered comparisons. `==`, `compare` and `digest`
 are the key's, whatever arithmetic is stated. Each of these is `E0201` where
 the type does not have it.
+
+A type states how its values are drawn, where a claim over it is sampled (§10):
+
+```ply
+import std.gen
+import std.gen (Gen)
+
+pub type Date = new { year: Int, month: Int, day: Int }
+
+gen for Date by dates
+
+fn dates() -> Gen<Date> =
+  gen::map2(gen::int_between(1, 12), gen::int_between(1, 28), |month: Int, day: Int|
+    { year: 2000, month: month, day: day })
+```
+
+`gen for T by f` names a function of the same module that answers a `std.gen`
+generator of the type (`ply doc std.gen`): `f: () -> Gen<T>`, or for a type with
+parameters one that takes a generator for each, `f: (Gen<a>, Gen<b>) -> Gen<T<a, b>>`.
+It performs nothing but `abort.raise`. A `forall` over `T` then draws each `T`
+through `f` and never from the type's fields, wherever the type sits in a
+binder: a `List<T>`, a record or a sum that holds one, a `T<U>`. So a sampled
+claim sees only values the module makes, a month 13 never among them, and a law
+in any module may quantify over an `opaque` type (§3.2) that states one: its
+generator is the module building the value. A module
+that states a `gen` imports `std.gen` itself, under a name no source can write,
+so `std.gen` states none.
+
+`T` is a sum or a `new` record the module declares (`E0208`), and states one
+generator (`E0105`). An alias is the type it names, and nothing says which label
+or row a drawn value of a type that binds one is at, so neither states one; a
+function that is no generator of the type is refused where it is stated, with
+what it was held to (`E0473`). A generator holds a function, which no build
+keeps, so `f` is no `const fn` (`E0156`, §3.5). The statement is also the definition `_sample_T`
+(`E0105` if the module declares one): `f`'s generator sampled at a root, a key
+and a size, or from a record of draws, each generator `f` takes choosing among
+values handed in. It is what `ply prove` enters to draw a `T`, and what a test
+calls to see what a generator makes.
+
+A generator decides what a sample draws and nothing a program computes. It is
+no part of its type's hash: an edit to one re-checks no definition that holds a
+`T` and re-runs no test, and draws again exactly the samples drawn through it
+(§10).
 
 ### 4.5 Generics
 
@@ -1073,7 +1164,8 @@ the checker infers for it, wherever that type was declared — another module's
 `type` included. A base whose type nothing in the program determines is
 `E0116`, and so is one that is not a record. A field the base lacks is `E0117`.
 An update of a `new` record (§4.2) answers that record, so a field it writes
-keeps its declared type (`E0201`).
+keeps its declared type (`E0201`), and it builds one: outside the module of an
+`opaque` record it is `E0220` (§3.2).
 
 ### 5.6 Lists
 
@@ -1988,8 +2080,9 @@ law "a credit and a matching debit leave an account exactly as it was"
   `ensures`; it is not checked at call sites and laws do not inherit it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
   be quantified, as a sum whose function performs the type's row parameter
-  cannot, whatever row it is given), an optional `where` guard, an optional
-  `cost` bound (below) and a block body.
+  cannot, whatever row it is given, nor a type that holds one another module
+  declares `opaque` and states no `gen` for, §3.2), an optional `where` guard,
+  an optional `cost` bound (below) and a block body.
 * Specs, guards and law bodies must be pure (`E0417`), except that they may
   raise (§6.8) or may not return (§5.10), and a law body may be a `simulate`
   region; a proposition that raises, or runs past its steps, is a gap in the
@@ -2030,6 +2123,25 @@ not, and arithmetic as the integers', which an operator at a type that states
 `numeric` is not. A claim that holds a value of any of them, at any depth, is
 never `proved`: it is run, over every point of a finite domain or over a sample.
 Under `--reach` the place is `float_term` or `keyed_term`.
+
+A sampled claim draws each binder from its type: a scalar, a list, a record or
+a sum from its structure, and a type that states a generator (§4.4) through it,
+at any depth. The generator is handed a size, the case's place in its run up to
+63, so early cases are small, and for each of its type's parameters a generator
+that chooses among sixteen values drawn of the argument. A counterexample
+shrinks as it was drawn: a structural value by its parts, and a generated one by
+replaying a shorter or lower record of the draws that made it, and by shrinking
+the values it chose among, so what a refutation shows is still a value its
+generator makes. A domain that holds such a type is what its generator draws,
+so it is sampled, however small, and never enumerated; the static tier reads
+the type as it reads any other. A generator that draws no value, as
+`such_that` does past its budget, leaves the claim `unattempted` (`gave_up`)
+rather than narrowed, and a sample counts the values its generators turned away
+as `discarded`. A value of a type another module declares `opaque` (§3.2) is
+drawn through the generator that module states and no other way: an `ensures`
+over a parameter that holds one with none stated is sampled nowhere
+(`ungeneratable`), where a law would be `E0418`. Inside the type's own module
+it is drawn from its structure, as any type that states no generator is.
 
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
@@ -2112,7 +2224,7 @@ declines, or any other failure that is Ply's own, is a `defect` reported under
 Ply's code (`E0505`), as `ply test` reports one. Under `--json` a gap carries
 its sentence as `gap` and its kind as `gap_kind` (`unhandled_effect`,
 `ungeneratable`, `raised`, `guard_not_sampled`, `reaches_host`, `not_drawn`,
-`unfitted`), a
+`unfitted`, `gave_up`), a
 defect carries `defect` — its `code`, `message`, the `bindings` Ply failed at,
 and a `summary` — and `summary` counts defects as `defect`. A claim's type
 variables are lettered by where they first appear among
@@ -2126,7 +2238,8 @@ number keys the cached result, so more budget is a stronger claim). A `proved`
 obligation is cached under its claim's hash, which reads another package's
 definitions by their contracts, so it stands across an edit to a dependency's
 body; a sampled one is cached under the hash of every implementation its cases
-run, and is drawn again. `--reach`
+run and of each generator its points are drawn through, and is drawn again when
+any of them moves. `--reach`
 asks the static tier alone about every obligation the run reports on, cached or
 not, and under `--json` each then carries `reach`: what it decided (`proved`,
 `guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
@@ -2313,9 +2426,9 @@ import, what those import in turn, and what they embed, so a change to any other
 leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
-`show` or `numeric` names (§4.4), and none of their tests or laws; a function
-it reaches is read with what its specifications name (§10), which a dependent's
-proof is owed; `--std` reads each one whole.
+`show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
+function it reaches is read with what its specifications name (§10), which a
+dependent's proof is owed; `--std` reads each one whole.
 
 ## 14. The host boundary
 
@@ -2580,7 +2693,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
-| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants, an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
+| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
@@ -2854,7 +2967,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0104` | unknown operation |
 | `E0105` | duplicate definition, or a reserved name |
 | `E0106` | unknown module |
-| `E0107` | private name |
+| `E0107` | private name, or a constructor of an `opaque` type outside its module |
 | `E0108` | ambiguous import |
 | `E0109` | module cycle |
 | `E0110` | duplicate import |
@@ -2868,7 +2981,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0119` | `?` where its early exit would change what runs or drop an annotation |
 | `E0120` | parameter default on a lambda, operation or handler clause |
 | `E0121` | parameter default that is not a pure, closed value |
-| `E0122` | default on a `pub fn` naming something its module does not export |
+| `E0122` | default on a `pub fn` naming something its module does not export, or building an `opaque` record |
 | `E0123` | named argument naming no parameter, or one twice |
 | `E0124` | positional argument after a named one |
 | `E0125` | parameter left unfilled by a call that used a name |
@@ -2922,6 +3035,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum |
 | `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
+| `E0220` | a record literal or an update that would build an `opaque` record outside its module |
+| `E0221` | `opaque` on an alias, which has no values of its own |
 | `E0222` | a range pattern whose bounds are not two integer literals of one type, the first no greater than the second |
 | `E0223` | a wrapping, saturating or checked builtin, an operator written in one, or a rotation at a type that states its own arithmetic |
 | `E0301` | unbound row variable |
@@ -2987,6 +3102,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0469` | a test's table or label that performs more than raises |
 | `E0472` | a law instantiating a definition that is not a `law schema` |
+| `E0473` | `gen` for an alias or a type that binds a label or a row, or one whose function is no generator of the type |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
@@ -3028,7 +3144,7 @@ record update needs the base's type to be known where it stands; two allocating 
 ## 19. Examples
 
 In `examples/`: `clock.ply` (a `nondet` effect, a handler, `test/nondet`);
-`ledger.ply` and `report.ply` (modules, specs, laws); `pipeline.ply`, `bank.ply`
+`ledger.ply` and `report.ply` (modules, an `opaque` type, specs, laws); `pipeline.ply`, `bank.ply`
 and `timeout.ply` (simulation, a race and its fix, a virtual clock); `echo.ply`
 and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 `relay.ply` (one forwarder generic over the label it writes under);
