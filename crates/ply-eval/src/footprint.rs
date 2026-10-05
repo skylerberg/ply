@@ -8,6 +8,8 @@ use std::fmt;
 pub enum Mode {
     Read,
     Write,
+    /// An operation that does not come back; no mode atom stands for it.
+    Raise,
 }
 
 impl Mode {
@@ -15,6 +17,7 @@ impl Mode {
         match self {
             Mode::Read => "read",
             Mode::Write => "write",
+            Mode::Raise => "raise",
         }
     }
 }

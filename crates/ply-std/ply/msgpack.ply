@@ -3,14 +3,16 @@
 // The subset here is the one a program needs and not the whole format: nil, booleans, integers in
 // every width, float64, UTF-8 text, binary, arrays and maps. MessagePack's extension types
 // (`0xc7`–`0xc9`, `0xd4`–`0xd8`), `float32` (`0xca`) and the reserved `0xc1` are refused by the
-// reader rather than guessed at — `None`, not a nearest value — and the writer never produces one.
+// reader rather than guessed at — a `Refusal`, not a nearest value — and the writer never produces
+// one.
 //
 // The writer chooses the shortest *signed* encoding the value fits — it never emits a
 // `uint` — and one value has one encoding. The reader accepts `uint` widths, because another
 // writer will use them. The
-// reader is total: it answers `None` for a truncated input, a length that claims more bytes than
-// are left, a value nested past `max_depth()`, or a tag in the extension range. Every length is
-// checked against what remains before it is walked, so a hostile header cannot make it loop.
+// reader is total: it refuses a truncated input, a length that claims more bytes than are left, a
+// value nested past `max_depth()`, or a tag in the extension range, saying which and where. Every
+// length is checked against what remains before it is walked, so a hostile header cannot make it
+// loop. Inside, a refusal is the raise `msgpack.refused`, so no reader hands another's on.
 
 import std.bytes (bytes_of_hex, hex_of, i16_be, i32_be, i64_be, u16_be, u32_be)
 
@@ -82,12 +84,29 @@ fn fields_head(n: Int) -> Bytes / {abort.raise} =
 
 // --- Reading ----------------------------------------------------------------
 
-/// The value `data` holds, or `None` if it is not exactly one value of this subset.
-pub fn msgpack_decode(data: Bytes) -> Option<Value> / {abort.raise} =
-  match read_at(data, 0, max_depth()) {
-    None -> None,
-    Some(read) -> if read.at == bytes_len(data) { Some(read.value) } else { None },
-  }
+/// Why a reader refused: the input ends before a value does, a value nests past `max_depth()`, a
+/// tag is not of this subset, a `uint64` is past what an `Int` holds, text is not UTF-8, or bytes
+/// follow the one value.
+pub type Why = | Truncated | TooDeep | Unsupported(Int) | TooWide | NotUtf8 | Trailing
+
+/// A refusal, and the offset of the byte the reader stood at.
+pub type Refusal = { at: Int, why: Why }
+
+pub effect msgpack {
+  raise refused(e: Refusal)
+}
+
+/// The value `data` holds, or why it is not exactly one value of this subset.
+pub fn msgpack_decode(data: Bytes) -> Result<Value, Refusal> / {abort.raise} =
+  try { msgpack_read(data) }
+
+/// The value `data` holds, raising `msgpack.refused` where `msgpack_decode` answers `Err`.
+pub fn msgpack_read(data: Bytes) -> Value / {msgpack.refused, abort.raise} = {
+  let read = read_at(data, 0, max_depth());
+  if read.at == bytes_len(data) { read.value } else { refuse(read.at, Trailing) }
+}
+
+fn refuse<a>(at: Int, why: Why) -> a / {msgpack.refused} = msgpack.refused({ at: at, why: why })
 
 pub type Read = { value: Value, at: Int }
 
@@ -96,11 +115,12 @@ pub type Read = { value: Value, at: Int }
 fn max_depth() -> Int = 64
 
 // `room` is how many levels deeper a value may nest; each level below this one spends one.
-fn read_at(data: Bytes, at: Int, room: Int) -> Option<Read> / {abort.raise} =
-  if room < 0 || at >= bytes_len(data) { None } else {
+fn read_at(data: Bytes, at: Int, room: Int) -> Read / {msgpack.refused, abort.raise} =
+  if room < 0 { refuse(at, TooDeep) }
+  else if at >= bytes_len(data) { refuse(at, Truncated) } else {
     let tag = bytes_at(data, at);
-    if tag <= 0x7F { Some({ value: Int(tag), at: at + 1 }) }
-    else if tag >= 0xE0 { Some({ value: Int(tag - 256), at: at + 1 }) }
+    if tag <= 0x7F { { value: Int(tag), at: at + 1 } }
+    else if tag >= 0xE0 { { value: Int(tag - 256), at: at + 1 } }
     else if tag >= 0x80 && tag <= 0x8F { read_fields(data, at + 1, tag & 0x0F, room - 1) }
     else if tag >= 0x90 && tag <= 0x9F { read_items(data, at + 1, tag & 0x0F, room - 1) }
     else if tag >= 0xA0 && tag <= 0xBF { read_text(data, at + 1, tag & 0x1F) }
@@ -111,11 +131,11 @@ fn read_at(data: Bytes, at: Int, room: Int) -> Option<Read> / {abort.raise} =
     }
   }
 
-fn read_tagged(data: Bytes, at: Int, tag: Int, room: Int) -> Option<Read> / {abort.raise} =
+fn read_tagged(data: Bytes, at: Int, tag: Int, room: Int) -> Read / {msgpack.refused, abort.raise} =
   match tag {
-    0xC0 -> Some({ value: Nil, at: at + 1 }),
-    0xC2 -> Some({ value: Flag(false), at: at + 1 }),
-    0xC3 -> Some({ value: Flag(true), at: at + 1 }),
+    0xC0 -> { value: Nil, at: at + 1 },
+    0xC2 -> { value: Flag(false), at: at + 1 },
+    0xC3 -> { value: Flag(true), at: at + 1 },
     0xC4 -> read_length(data, at + 1, 1, KBits, room),
     0xC5 -> read_length(data, at + 1, 2, KBits, room),
     0xC6 -> read_length(data, at + 1, 4, KBits, room),
@@ -136,29 +156,22 @@ fn read_tagged(data: Bytes, at: Int, tag: Int, room: Int) -> Option<Read> / {abo
     0xDE -> read_length(data, at + 1, 2, KFields, room),
     0xDF -> read_length(data, at + 1, 4, KFields, room),
     // `float32`, the extension types, the reserved `0xc1`, and everything above `0xdf`.
-    _ -> None,
+    _ -> refuse(at, Unsupported(tag)),
   }
 
-fn read_float(data: Bytes, at: Int) -> Option<Read> / {abort.raise} =
-  match read_n(data, at + 1, 8) {
-    None -> None,
-    Some(eight) -> Some({ value: Float(float_of_bits(be_int(eight))), at: at + 9 }),
-  }
+fn read_float(data: Bytes, at: Int) -> Read / {msgpack.refused, abort.raise} =
+  { value: Float(float_of_bits(be_int(read_n(data, at + 1, 8)))), at: at + 9 }
 
-fn read_int64(data: Bytes, at: Int) -> Option<Read> / {abort.raise} =
-  match read_n(data, at + 1, 8) {
-    None -> None,
-    // Eight bytes are the two's complement an `Int` already is.
-    Some(eight) -> Some({ value: Int(be_int(eight)), at: at + 9 }),
-  }
+// Eight bytes are the two's complement an `Int` already is.
+fn read_int64(data: Bytes, at: Int) -> Read / {msgpack.refused, abort.raise} =
+  { value: Int(be_int(read_n(data, at + 1, 8))), at: at + 9 }
 
-fn read_uint64(data: Bytes, at: Int) -> Option<Read> / {abort.raise} =
-  match read_n(data, at + 1, 8) {
-    None -> None,
-    // A `uint64` above `i63` is not an `Int`, and answering the wrapped bits would be a lie.
-    Some(eight) -> if bytes_at(eight, 0) & 0x80 != 0 { None }
-    else { Some({ value: Int(be_int(eight)), at: at + 9 }) },
-  }
+// A `uint64` above `i63` is not an `Int`, and answering the wrapped bits would be a lie.
+fn read_uint64(data: Bytes, at: Int) -> Read / {msgpack.refused, abort.raise} = {
+  let eight = read_n(data, at + 1, 8);
+  if bytes_at(eight, 0) & 0x80 != 0 { refuse(at, TooWide) }
+  else { { value: Int(be_int(eight)), at: at + 9 } }
+}
 
 fn read_signed(
   data: Bytes,
@@ -166,11 +179,8 @@ fn read_signed(
   width: Int,
   high: Int,
   span: Int,
-) -> Option<Read> / {abort.raise} =
-  match read_n(data, at + 1, width) {
-    None -> None,
-    Some(prefix) -> Some({ value: Int(signed(be_int(prefix), high, span)), at: at + 1 + width }),
-  }
+) -> Read / {msgpack.refused, abort.raise} =
+  { value: Int(signed(be_int(read_n(data, at + 1, width)), high, span)), at: at + 1 + width }
 
 // What a length-prefixed tag says its payload is.
 type Kind = | KBits | KText | KItems | KFields
@@ -183,46 +193,34 @@ fn read_length(
   width: Int,
   kind: Kind,
   room: Int,
-) -> Option<Read> / {abort.raise} =
-  match read_n(data, at, width) {
-    None -> None,
-    Some(prefix) -> {
-      let n = be_int(prefix);
-      let from = at + width;
-      if n < 0 || n > bytes_len(data) - from { None } else if kind == KBits {
-        match read_n(data, from, n) {
-          None -> None,
-          Some(payload) -> Some({ value: Bits(payload), at: from + n }),
-        }
-      } else if kind == KText { read_text(data, from, n) }
-      else if kind == KItems { read_items(data, from, n, room) }
-      else { read_fields(data, from, n, room) }
-    },
-  }
+) -> Read / {msgpack.refused, abort.raise} = {
+  let n = be_int(read_n(data, at, width));
+  let from = at + width;
+  if n < 0 || n > bytes_len(data) - from { refuse(from, Truncated) }
+  else if kind == KBits { { value: Bits(read_n(data, from, n)), at: from + n } }
+  else if kind == KText { read_text(data, from, n) }
+  else if kind == KItems { read_items(data, from, n, room) }
+  else { read_fields(data, from, n, room) }
+}
 
 // A `uint8`/`uint16`/`uint32`, which fit an `Int` whatever their bits say.
-fn unsigned(data: Bytes, at: Int, width: Int, after: Int) -> Option<Read> / {abort.raise} =
-  match read_n(data, at + 1, width) {
-    None -> None,
-    Some(prefix) -> Some({ value: Int(be_int(prefix)), at: at + after }),
-  }
+fn unsigned(data: Bytes, at: Int, width: Int, after: Int) -> Read / {msgpack.refused, abort.raise} =
+  { value: Int(be_int(read_n(data, at + 1, width))), at: at + after }
 
-fn read_n(data: Bytes, at: Int, n: Int) -> Option<Bytes> / {abort.raise} =
-  if n < 0 || at + n > bytes_len(data) { None } else { Some(bytes_slice(data, at, at + n)) }
+fn read_n(data: Bytes, at: Int, n: Int) -> Bytes / {msgpack.refused, abort.raise} =
+  if n < 0 || at + n > bytes_len(data) { refuse(at, Truncated) }
+  else { bytes_slice(data, at, at + n) }
 
-fn read_text(data: Bytes, at: Int, n: Int) -> Option<Read> / {abort.raise} =
-  match read_n(data, at, n) {
-    None -> None,
-    Some(payload) -> if bytes_is_utf8(payload) {
-      Some({ value: Text(string_of_bytes(payload)), at: at + n })
-    } else { None },
-  }
+fn read_text(data: Bytes, at: Int, n: Int) -> Read / {msgpack.refused, abort.raise} = {
+  let payload = read_n(data, at, n);
+  if bytes_is_utf8(payload) { { value: Text(string_of_bytes(payload)), at: at + n } }
+  else { refuse(at, NotUtf8) }
+}
 
-fn read_items(data: Bytes, at: Int, n: Int, room: Int) -> Option<Read> / {abort.raise} =
-  match read_values(data, at, n, room, []) {
-    None -> None,
-    Some(done) -> Some({ value: Items(done.items), at: done.at }),
-  }
+fn read_items(data: Bytes, at: Int, n: Int, room: Int) -> Read / {msgpack.refused, abort.raise} = {
+  let done = read_values(data, at, n, room, []);
+  { value: Items(done.items), at: done.at }
+}
 
 fn read_values(
   data: Bytes,
@@ -230,19 +228,16 @@ fn read_values(
   n: Int,
   room: Int,
   acc: List<Value>,
-) -> Option<{ items: List<Value>, at: Int }> / {abort.raise} =
-  if n <= 0 { Some({ items: acc, at: at }) } else {
-    match read_at(data, at, room) {
-      None -> None,
-      Some(read) -> read_values(data, read.at, n - 1, room, push(acc, read.value)),
-    }
+) -> { items: List<Value>, at: Int } / {msgpack.refused, abort.raise} =
+  if n <= 0 { { items: acc, at: at } } else {
+    let read = read_at(data, at, room);
+    read_values(data, read.at, n - 1, room, push(acc, read.value))
   }
 
-fn read_fields(data: Bytes, at: Int, n: Int, room: Int) -> Option<Read> / {abort.raise} =
-  match read_pairs(data, at, n, room, []) {
-    None -> None,
-    Some(done) -> Some({ value: Fields(done.fields), at: done.at }),
-  }
+fn read_fields(data: Bytes, at: Int, n: Int, room: Int) -> Read / {msgpack.refused, abort.raise} = {
+  let done = read_pairs(data, at, n, room, []);
+  { value: Fields(done.fields), at: done.at }
+}
 
 fn read_pairs(
   data: Bytes,
@@ -250,22 +245,11 @@ fn read_pairs(
   n: Int,
   room: Int,
   acc: List<Field>,
-) -> Option<{ fields: List<Field>, at: Int }> / {abort.raise} =
-  if n <= 0 { Some({ fields: acc, at: at }) } else {
-    match read_at(data, at, room) {
-      None -> None,
-      Some(key) -> match read_at(data, key.at, room) {
-        None -> None,
-        Some(value) ->
-          read_pairs(
-            data,
-            value.at,
-            n - 1,
-            room,
-            push(acc, { key: key.value, value: value.value }),
-          ),
-      },
-    }
+) -> { fields: List<Field>, at: Int } / {msgpack.refused, abort.raise} =
+  if n <= 0 { { fields: acc, at: at } } else {
+    let key = read_at(data, at, room);
+    let value = read_at(data, key.at, room);
+    read_pairs(data, value.at, n - 1, room, push(acc, { key: key.value, value: value.value }))
   }
 
 // The big-endian integer a byte string names, as the `Int` its bits are.
@@ -290,10 +274,10 @@ test "the shortest signed encoding of each width, and each reads back" {
   assert_eq(msgpack_encode(Int(-32768)), bytes_of_hex("d18000"));
   assert_eq(msgpack_encode(Int(-32769)), bytes_of_hex("d2ffff7fff"));
   assert_eq(msgpack_encode(Float(1.5)), bytes_of_hex("cb3ff8000000000000"));
-  assert_eq(msgpack_decode(msgpack_encode(Int(70000))), Some(Int(70000)));
-  assert_eq(msgpack_decode(msgpack_encode(Float(-0.5))), Some(Float(-0.5)));
-  assert_eq(msgpack_decode(msgpack_encode(Text("héllo"))), Some(Text("héllo")));
-  assert_eq(msgpack_decode(msgpack_encode(Bits(b"\x00\xff"))), Some(Bits(b"\x00\xff")))
+  assert_eq(msgpack_decode(msgpack_encode(Int(70000))), Ok(Int(70000)));
+  assert_eq(msgpack_decode(msgpack_encode(Float(-0.5))), Ok(Float(-0.5)));
+  assert_eq(msgpack_decode(msgpack_encode(Text("héllo"))), Ok(Text("héllo")));
+  assert_eq(msgpack_decode(msgpack_encode(Bits(b"\x00\xff"))), Ok(Bits(b"\x00\xff")))
 }
 
 test "text, binary, arrays and maps round-trip, and two values are not one" {
@@ -302,24 +286,43 @@ test "text, binary, arrays and maps round-trip, and two values are not one" {
   assert_eq(msgpack_encode(Items([Int(1), Int(2)])), bytes_of_hex("920102"));
   assert_eq(msgpack_encode(Fields([field(Text("a"), Int(1))])), bytes_of_hex("81a16101"));
   let nested = Items([Int(1), Items([Flag(true)]), Fields([field(Text("k"), Bits(b"v"))])]);
-  assert_eq(msgpack_decode(msgpack_encode(nested)), Some(nested));
+  assert_eq(msgpack_decode(msgpack_encode(nested)), Ok(nested));
   // `decode` is one value: two concatenated is not a value this reader answers.
   let two = bytes_concat(msgpack_encode(Int(1)), msgpack_encode(Int(2)));
-  assert_eq(msgpack_decode(two), None)
+  assert_eq(msgpack_decode(two), Err({ at: 1, why: Trailing }))
 }
 
 test "a reader accepts the unsigned widths and refuses what this subset does not name" {
-  assert_eq(msgpack_decode(bytes_of_hex("cc80")), Some(Int(128)));
-  assert_eq(msgpack_decode(bytes_of_hex("cd0100")), Some(Int(256)));
-  assert_eq(msgpack_decode(bytes_of_hex("ce00010000")), Some(Int(65536)));
+  assert_eq(msgpack_decode(bytes_of_hex("cc80")), Ok(Int(128)));
+  assert_eq(msgpack_decode(bytes_of_hex("cd0100")), Ok(Int(256)));
+  assert_eq(msgpack_decode(bytes_of_hex("ce00010000")), Ok(Int(65536)));
+  let refused = |hex: String, at: Int, why: Why|
+    assert_eq(msgpack_decode(bytes_of_hex(hex)), Err({ at: at, why: why }));
   // float32, an extension type, the reserved byte, a truncated string, a length past the end, a
-  // `uint64` above i63, a truncated array, and nothing at all.
-  assert_eq(msgpack_decode(bytes_of_hex("ca3fc00000")), None);
-  assert_eq(msgpack_decode(bytes_of_hex("c70102ff")), None);
-  assert_eq(msgpack_decode(bytes_of_hex("c1")), None);
-  assert_eq(msgpack_decode(bytes_of_hex("d90561")), None);
-  assert_eq(msgpack_decode(bytes_of_hex("db0000000561")), None);
-  assert_eq(msgpack_decode(bytes_of_hex("cfffffffffffffffff")), None);
-  assert_eq(msgpack_decode(bytes_of_hex("9201")), None);
-  assert_eq(msgpack_decode(bytes_of_hex("")), None)
+  // `uint64` above i63, a truncated array, text that is not UTF-8, and nothing at all.
+  refused("ca3fc00000", 0, Unsupported(0xCA));
+  refused("c70102ff", 0, Unsupported(0xC7));
+  refused("c1", 0, Unsupported(0xC1));
+  refused("d90561", 2, Truncated);
+  refused("db0000000561", 5, Truncated);
+  refused("cfffffffffffffffff", 0, TooWide);
+  refused("9201", 2, Truncated);
+  refused("a1ff", 1, NotUtf8);
+  refused("", 0, Truncated)
+}
+
+test "a value nested past the depth is refused where the depth ran out" {
+  let nested = |levels: Int|
+    bytes_concat(bytes_concat_all(map(range(0, levels), |_: Int| byte_of_int(0x91))), b"\xc0");
+  assert(match msgpack_decode(nested(64)) { Ok(_) -> true, Err(_) -> false });
+  assert_eq(msgpack_decode(nested(65)), Err({ at: 65, why: TooDeep }))
+}
+
+test "the raising reader raises what the other answers, and a task may perform it" {
+  assert_eq(try { msgpack_read(bytes_of_hex("c1")) }, Err({ at: 0, why: Unsupported(0xC1) }));
+  let read = simulate {
+    let t = task.spawn(|| try { msgpack_read(bytes_of_hex("9201")) });
+    task.join(t)
+  };
+  assert_eq(read, Err({ at: 2, why: Truncated }))
 }
