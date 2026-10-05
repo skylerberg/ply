@@ -4,17 +4,21 @@
 
 import compiler.code
 import compiler.derive
-import compiler.embed (EmbedAt, embed_key)
+import compiler.front (Dump, Embedded, KnownDefRow, Analysed, Refused, checked_staged, dump_of,
+                       rows_of, shipped_pulled, staged_pulling_std_with)
 import compiler.hash
 import compiler.infer
 import compiler.items
 import compiler.lexer
+import compiler.load (tell_viewed)
 import compiler.resolve
-import compiler.resolve (Source)
+import compiler.resolve (Source, Diag)
 import compiler.rewrite
+import compiler.unit (shipped)
 import harness (compiler_tree, example_files, phase_files, prelude_file, std_tree)
 import std.bytes
-import std.list (any, find, flatten, last, take)
+import std.list (any, concat, find, flatten, last, somes, take)
+import std.show (show)
 import std.string
 import cli.sources (stem)
 
@@ -276,86 +280,170 @@ fn first_difference(walked: Bytes, seeded: Bytes) -> String / {abort.raise} = {
   }
 }
 
+type Unlike = { name: String, dumps: infer::Dumps }
+
 // What a definition-granular cache is built on: a program checked again from the interfaces its
 // first check published answers as walking the bodies did, diagnostics included.
 test "a mined program checked from its own interfaces answers as its walked bodies do" {
-  match find(corpus_programs(), |p: Program|
-      infer::check_dump_known(p.modules) != infer::check_dump(p.modules)) {
+  let unlike = fold(corpus_programs(), None, |found: Option<Unlike>, p: Program|
+    match found {
+      Some(_) -> found,
+      None -> {
+        let dumps = infer::check_dumps(p.modules);
+        if dumps.seeded == dumps.walked { None } else { Some({ name: p.name, dumps: dumps }) }
+      },
+    });
+  match unlike {
     None -> (),
-    Some(p) ->
+    Some(u) ->
       panic(
-        p.name ++ " checks otherwise from its own interfaces:\n"
-          ++ first_difference(
-            bytes_of_string(infer::check_dump(p.modules)),
-            bytes_of_string(infer::check_dump_known(p.modules)),
-          ),
+        u.name ++ " checks otherwise from its own interfaces:\n"
+          ++ first_difference(bytes_of_string(u.dumps.walked), bytes_of_string(u.dumps.seeded)),
       ),
   }
 }
 
-/// What the compiler's modules embed, as a driver that read its tree hands it over.
-fn compiler_embeds() -> List<EmbedAt> =
-  [
-    {
-      module: b"prelude_source",
-      key: embed_key({ path: b"../prelude.ply", dir: false }),
-      read: Ok([{ name: b"", bytes: prelude_file() }]),
-    },
-  ]
+/// Each module of the toolchain's tree: the standard library's under `std.`, the compiler's as its
+/// own modules import one another.
+fn tree_modules() -> List<Source> / {abort.raise} =
+  concat(modules_of(std_tree(), "std."), modules_of(compiler_tree(), ""))
 
 // What a load reads a module's imports from: its header alone, wherever that says all of them.
-test "each shipped module's header holds the imports its whole parse finds" {
-  let differs = filter(
-    flatten([modules_of(std_tree(), "std."), modules_of(compiler_tree(), "")]),
-    |s: Source|
-      match items::header(s.src) {
-        None -> false,
-        Some(m) -> m.imports != items::parse(s.src).node.imports,
-      },
-  );
-  assert_eq(map(differs, |s: Source| s.name), [])
+test "{string_of_bytes_lossy(s.name)}'s header holds the imports its whole parse finds" for s: Source in tree_modules(
+  ) {
+  match items::header(s.src) {
+    None -> (),
+    Some(m) -> assert_eq(m.imports, items::parse(s.src).node.imports),
+  }
 }
 
-// The same seam over the largest program there is.
-test "the checker seeded from its own interfaces agrees on the compiler and the library" {
-  let program = flatten([modules_of(std_tree(), "std."), modules_of(compiler_tree(), "")]);
-  let head = bytes_of_string("K;" ++ int_to_string(len(program)) ++ ";");
-  let both = parallel {
-    infer::check_dump(program, compiler_embeds()),
-    infer::check_dump_known(program, compiler_embeds()),
-  };
-  let walked = bytes_of_string(both._0);
-  assert(
-    bytes_starts_with(walked, head)
-      && !bytes_starts_with(bytes_slice(walked, bytes_len(head), bytes_len(walked)), b"X;"),
-    Some(
-      "the standard library and the compiler do not check as one program:\n"
-        ++ string_of_bytes_lossy(bytes_slice(walked, 0, min(4000, bytes_len(walked)))),
-    ),
-  );
-  let seeded = bytes_of_string(both._1);
-  assert(
-    seeded == walked,
-    Some(
-      "over " ++ int_to_string(len(program))
-        ++ " modules, a definition published from its stored interface does not answer as the walked body did:\n"
-        ++ first_difference(walked, seeded),
-    ),
+/// A program the checker is run over: a standard library module under its bare name, as no project
+/// module may be named under `std`, its imports pulled from the shipped modules for what it
+/// reaches; or the compiler with what it embeds.
+type Part = { name: String, modules: List<Source>, embeds: List<Embedded> }
+
+fn parts() -> List<Part> / {abort.raise} =
+  push(
+    map(modules_of(std_tree(), ""), |s: Source|
+      { name: "std." ++ string_of_bytes_lossy(s.name), modules: [s], embeds: [] }),
+    {
+      name: "the compiler",
+      modules: modules_of(compiler_tree(), ""),
+      embeds: [
+        {
+          root: b"",
+          module: b"prelude_source",
+          want: { path: b"../prelude.ply", dir: false },
+          read: Ok([{ name: b"", bytes: prelude_file() }]),
+        },
+      ],
+    },
   )
+
+fn refusal(diags: List<Diag>) -> String / {abort.raise} =
+  string::join(
+    map(take(diags, 10), |d: Diag|
+      string_of_bytes_lossy(d.code) ++ " " ++ string_of_bytes_lossy(d.message)),
+    "\n",
+  )
+
+/// The first entry two tables part at, each as `show` writes it.
+fn parting<a>(table: String, walked: List<a>, seeded: List<a>) -> Option<String> / {abort.raise}
+  where derivable(eq, a), derivable(show, a)
+=
+  if walked == seeded { None } else {
+    let n = max(len(walked), len(seeded));
+    let at = match find(range(0, n), |i: Int| list_at(walked, i) != list_at(seeded, i)) {
+      Some(i) -> i,
+      None -> n,
+    };
+    let shown = |row: Option<a>| {
+      let s = show(row);
+      if string_len(s) > 1500 { string_slice(s, 0, 1500) ++ "..." } else { s }
+    };
+    Some(
+      table ++ " " ++ int_to_string(at) ++ "\n  walked: " ++ shown(list_at(walked, at))
+        ++ "\n  seeded: "
+        ++ shown(list_at(seeded, at)),
+    )
+  }
+
+/// Where the answer a walk made parts from the one made from the rows that walk published.
+fn partings(walked: Dump, seeded: Dump) -> List<String> / {abort.raise} =
+  somes([
+    parting("diagnostic", walked.diags, seeded.diags),
+    parting("definition", walked.defs, seeded.defs),
+    parting("test", walked.tests, seeded.tests),
+    parting("law", walked.laws, seeded.laws),
+    parting("effect", walked.effects, seeded.effects),
+    parting("constructor", walked.ctors, seeded.ctors),
+    parting("definition's rows", walked.rows.defs, seeded.rows.defs),
+    parting("test's rows", walked.rows.tests, seeded.rows.tests),
+    parting("root", walked.emitter_roots, seeded.emitter_roots),
+    parting("body", walked.bodies, seeded.bodies),
+    parting("key", walked.keys, seeded.keys),
+    if walked.walked == seeded.walked { None }
+    else { Some("what the emitter reads of the bodies") },
+  ])
+
+// The same seam over the toolchain's own tree, a part at a time, and through the front end as the
+// CLI seeds it: the rows a load files under their check keys, handed to the next load.
+test "{p.name} checked from the rows its walk published answers as the walk did" for p: Part in parts(
+  ) {
+  let pkgs = { root: b"", manifest: None, supplied: [] };
+  let shipping = shipped_pulled(
+    p.modules,
+    pkgs,
+    map(shipped.names(), bytes_of_string),
+    |name: Bytes| shipped.module(string_of_bytes_lossy(name)),
+  );
+  let staged = staged_pulling_std_with(
+    p.modules,
+    shipping.read,
+    pkgs,
+    embeds: p.embeds,
+    unread: shipping.unread,
+  );
+  tell_viewed(staged.viewed, true);
+  match checked_staged(staged, [], []).out {
+    Refused(diags) -> panic(p.name ++ " does not check:\n" ++ refusal(diags)),
+    Analysed(walk) -> {
+      let rows = rows_of(walk);
+      match checked_staged(staged, rows.defs, rows.tests).out {
+        Refused(diags) ->
+          panic(p.name ++ " does not check from the rows its walk published:\n" ++ refusal(diags)),
+        Analysed(seeding) -> {
+          let walked = dump_of(Analysed(walk));
+          let seeded = dump_of(Analysed(seeding));
+          assert(
+            walked == seeded,
+            Some(
+              "a definition published from its rows does not answer as its walked body did:\n"
+                ++ string::join(partings(walked, seeded), "\n"),
+            ),
+          );
+          let taken = fold(seeding.checked.seeded, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+            map_insert(acc, n, true));
+          assert_eq(
+            filter(map(rows.defs, |r: KnownDefRow| r.name), |n: Bytes| !map_contains(taken, n)),
+            [],
+          );
+          assert_eq(len(seeding.checked.seeded_tests), len(rows.tests))
+        },
+      }
+    },
+  }
 }
 
 // --- Effects ---------------------------------------------------------------------------------
 
 // What this arms is the corpus, not a backend: if the last `handle` or the last `with cell` left
-// it, effect work in the C backend would have nothing to be checked against. Counted on the
-// lowering rather than the surface text: `with cell` reaches a `cell(` node its spelling does not
-// contain, and `$` is how the lowering spells a resource a label parameter names.
+// the examples and the fixtures, effect work in the C backend would have nothing to be checked
+// against. Counted on the lowering rather than the surface text: `with cell` reaches a `cell(` node
+// its spelling does not contain, and `$` is how the lowering spells a resource a label parameter
+// names.
 test "the corpus still exercises every effect construct a backend has to carry" {
-  let inputs = flatten([
-    top_level(std_tree()),
-    top_level(example_files()),
-    top_level(phase_files()),
-  ]);
+  let inputs = concat(top_level(example_files()), top_level(phase_files()));
   let bodies = flatten(
     map(inputs, |file: File|
       match bytes_split(bytes_of_string(code::lower_dump(file.bytes)), b"f:") {
