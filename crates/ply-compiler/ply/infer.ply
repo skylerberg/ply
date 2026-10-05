@@ -18,7 +18,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
               MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered,
-              ETagged, Tagged, tagged_callee, case_at, case_identity)
+              ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at, case_identity)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -3885,95 +3885,145 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
     ETagged(t) -> infer_tagged(checker, t),
   }
 
-/// What a tag's `literal` answers of a text it refuses: where in the text, in characters, and why.
-pub fn refusal_type() -> Type / {abort.raise} =
-  TyRecord(
-    fields_sorted([{ name: b"message", ty: string_type() }, { name: b"offset", ty: int_type() }]),
-  )
+/// What a tag answers of a text it refuses: why, and where in the text, in characters. Of the
+/// texts around holes it says which one too.
+fn refusal_type(holed: Bool) -> Type / {abort.raise} = {
+  let said = [{ name: b"message", ty: string_type() }, { name: b"offset", ty: int_type() }];
+  TyRecord(fields_sorted(if holed { push(said, { name: b"part", ty: int_type() }) } else { said }))
+}
 
-fn not_a_parser(checker: Checker, t: Tagged, message: Bytes, label: Bytes) -> Checker =
+fn tag_rule(t: Tagged) -> Bytes =
+  if len(t.holes) == 0 {
+    bytes_concat_all([
+      b"`",
+      t.tag.name,
+      b"\"..\"` is the call `",
+      t.tag.name,
+      b"::literal(\"..\")`, which the check runs: a function of one `String` answering `Result<T, {message: String, offset: Int}>`, with no parameters of its own and a row that holds nothing but raises",
+    ])
+  } else {
+    bytes_concat_all([
+      b"`",
+      t.tag.name,
+      b"\"..{h}..\"` is the call `",
+      t.tag.name,
+      b"::fill(c, [h])` of what `",
+      t.tag.name,
+      b"::compile([\"..\", \"..\"])` answered the check: `compile` a function of one `List<String>` answering `Result<C, {message: String, offset: Int, part: Int}>` and `fill` one of a `C` and a `List<H>`, each with no parameters of its own and a row that holds nothing but raises",
+    ])
+  }
+
+fn not_a_tag(checker: Checker, t: Tagged, callee: QName, message: Bytes, label: Bytes) -> Checker =
   report_error_at(
     checker,
     b"E0152",
     t.tag.span,
-    bytes_concat_all([b"`", t.tag.name, b"::literal` ", message]),
+    bytes_concat_all([b"`", t.tag.name, b"::", callee.name.name, b"` ", message]),
     label,
-    [
-      bytes_concat_all([
-        b"`",
-        t.tag.name,
-        b"\"..\"` is the call `",
-        t.tag.name,
-        b"::literal(\"..\")`, which the check runs: a function of one `String` answering `Result<T, {message: String, offset: Int}>`, with no parameters of its own and a row that holds nothing but raises",
-      ]),
-    ],
+    [tag_rule(t)],
   )
 
-/// `tag"text"` is the call `tag::literal("text")`, whose answer the check reads before anything
-/// runs: its value is what the call answers `Ok` of, and nothing is left for it to perform.
-fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
-  let callee = tagged_callee(t.tag);
+/// What a tagged literal calls of its tag, held to what a tag's function is: `takes` in and
+/// `answers` out, with no parameter of its own, nothing performed but raises, and no recursion
+/// with what holds the literal. `row` is what it raises, and `name` what it is declared as.
+fn tag_fn(
+  checker: Checker,
+  t: Tagged,
+  callee: QName,
+  takes: List<Type>,
+  answers: Type,
+) -> { checker: Checker, row: Row, name: Bytes } / {abort.raise} = {
   let f: Inferred = infer_var(checker, callee);
-  let value: WithTy = new_ty(called(f.checker, t.tag.span));
-  let c: Checker = value.checker;
-  let shaped: Checker = match declared_value(c, callee) {
+  let c: Checker = called(f.checker, t.tag.span);
+  match declared_value(c, callee) {
     // A name that names nothing is said by the lookup.
-    None -> c,
-    Some(name) -> if group_member(c, name) {
-      not_a_parser(
-        c,
-        t,
-        b"is in a recursion with what holds the literal",
-        b"runs before it is whole",
-      )
-    } else {
+    None -> { checker: c, row: row_empty(), name: b"" },
+    Some(name) -> {
+      let refused = |cc: Checker, message: Bytes, label: Bytes|
+        { checker: not_a_tag(cc, t, callee, message, label), row: row_empty(), name: name };
       let generic = match env_lookup(c.env, name) {
         Some(sc) -> len(sc.ty_vars) + len(sc.row_vars) + len(sc.label_vars) > 0,
         None -> false,
       };
-      match resolve(c, f.ty) {
-        TyFn(fn_) -> {
-          let unified = unify(
-            c.subst,
-            c.fresh,
-            fn_type(
-              [string_type()],
-              TyCon({ name: b"Result", args: [value.ty, refusal_type()] }),
-              fn_.effects,
+      if group_member(c, name) {
+        refused(
+          c,
+          b"is in a recursion with what holds the literal",
+          b"a tag is whole before a literal of it is checked",
+        )
+      } else {
+        match resolve(c, f.ty) {
+          TyFn(fn_) -> {
+            let unified = unify(c.subst, c.fresh, fn_type(takes, answers, fn_.effects), f.ty);
+            let u: Checker = with_unified(c, unified);
+            let row = resolve_row_in(u, fn_.effects);
+            if generic { refused(u, b"takes parameters of its own", b"a literal gives it none") }
+            else if unified.error != None {
+              refused(
+                u,
+                bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
+                b"not what a tagged literal calls",
+              )
+            } else if !row_is_pure_but_raise(row) {
+              refused(
+                u,
+                bytes_concat_all([b"performs `", row_text(row), b"`"]),
+                b"a tag's function only raises",
+              )
+            } else { { checker: u, row: row, name: name } }
+          },
+          other ->
+            refused(
+              c,
+              bytes_concat_all([b"has type `", type_text(other), b"`"]),
+              b"not what a tagged literal calls",
             ),
-            f.ty,
-          );
-          let u: Checker = with_unified(c, unified);
-          let row = resolve_row_in(u, fn_.effects);
-          if generic {
-            not_a_parser(u, t, b"takes parameters of its own", b"no call says what they are")
-          } else if unified.error != None {
-            not_a_parser(
-              u,
-              t,
-              bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
-              b"not a literal's parser",
-            )
-          } else if !row_is_pure_but_raise(row) {
-            not_a_parser(
-              u,
-              t,
-              bytes_concat_all([b"performs `", row_text(row), b"`"]),
-              b"a check cannot answer this",
-            )
-          } else { u }
-        },
-        other ->
-          not_a_parser(
-            c,
-            t,
-            bytes_concat_all([b"has type `", type_text(other), b"`"]),
-            b"not a literal's parser",
-          ),
+        }
       }
     },
-  };
-  { checker: shaped, ty: value.ty, row: row_empty() }
+  }
+}
+
+/// `tag"text"` is the call `tag::literal("text")`, whose answer the check reads before anything
+/// runs: its value is what the call answers `Ok` of, and nothing is left for it to perform. With
+/// holes it is `tag::fill` called on what `tag::compile` answers `Ok` of for the texts, and on the
+/// holes, each of the one type `fill` takes: it performs what they perform, and raises as `fill` does.
+fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
+  let holed = len(t.holes) > 0;
+  let value: WithTy = new_ty(checker);
+  let parsed = tag_fn(
+    value.checker,
+    t,
+    tagged_parser(t),
+    [if holed { list_type(string_type()) } else { string_type() }],
+    TyCon({ name: b"Result", args: [value.ty, refusal_type(holed)] }),
+  );
+  if !holed { { checker: parsed.checker, ty: value.ty, row: row_empty() } } else {
+    let hole: WithTy = new_ty(parsed.checker);
+    let answer: WithTy = new_ty(hole.checker);
+    // A tag with no parser is said once, by the lookup of the parser.
+    let filled = if parsed.name == b"" { { checker: answer.checker, row: row_empty(), name: b"" } }
+    else { tag_fn(answer.checker, t, tagged_filler(t), [value.ty, list_type(hole.ty)], answer.ty) };
+    let held: WithRow = fold(
+      t.holes,
+      { checker: filled.checker, row: row_empty() },
+      |acc: WithRow, h: Hole| {
+        let o: Inferred = infer(acc.checker, h.value, hint_of(hole.ty));
+        let met: Checker = expect_met(
+          o.checker,
+          expr_span(h.value),
+          hole.ty,
+          o.ty,
+          b"a hole of a tagged literal",
+        );
+        join(met, t.span, acc.row, o.row)
+      },
+    );
+    let recorded: Checker = fold(filled.row.atoms, held.checker, |cc: Checker, atom: Atom|
+      record_site(cc, atom, t.span, PerformVia(filled.name)));
+    let j: WithRow = join(recorded, t.span, held.row, filled.row);
+    { checker: j.checker, ty: answer.ty, row: j.row }
+  }
 }
 
 /// The branches' answers as a tuple, which is what evaluating them left to right answers.
@@ -7507,7 +7557,15 @@ fn param_names(params: List<Param>) -> List<Bytes> = map(params, |param: Param| 
 fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
   match e {
     ELit(_) -> out,
-    ETagged(t) -> { names: push(out.names, tagged_callee(t.tag)) },
+    ETagged(t) ->
+      fold(
+        t.holes,
+        {
+          names: if len(t.holes) == 0 { push(out.names, tagged_parser(t)) }
+          else { push(push(out.names, tagged_parser(t)), tagged_filler(t)) },
+        },
+        |acc: Refs, h: Hole| collect_refs(h.value, bound, acc),
+      ),
     EBad(_) -> out,
     EVar(v) -> if is_bare(v.name) && contains(bound, v.name.name.name) { out }
     else { { names: push(out.names, v.name) } },

@@ -15,7 +15,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm,
-              HandleClause, ReturnClause, RecField, expr_span, ETagged, Tagged, tagged_call)
+              HandleClause, ReturnClause, RecField, expr_span, ETagged, Tagged, tagged_call,
+              tagged_fill, Hole, with_hole_values)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt, LStr,
                  LBool)
 import std.bytes (ascii_of_int)
@@ -51,7 +52,7 @@ pub fn is_pure(e: Expr) -> Bool =
     ETry(_) -> false,
     ETryBlock(_) -> false,
     ELit(_) -> true,
-    ETagged(_) -> true,
+    ETagged(t) -> len(t.holes) == 0,
     EVar(_) -> true,
     EBad(_) -> true,
     EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
@@ -204,6 +205,7 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
     ESimulate(x) -> ESimulate({ span: x.span, body: go(x.body) }),
     EParallel(x) -> EParallel({ span: x.span, branches: map(x.branches, go) }),
     ETryBlock(t) -> ETryBlock({ ..t, body: go(t.body) }),
+    ETagged(t) -> ETagged({ ..t, holes: map(t.holes, |h: Hole| { ..h, value: go(h.value) }) }),
     _ -> e,
   })
 }
@@ -261,7 +263,8 @@ pub fn expand_record_updates(module: Module, shapes: Map<Bytes, List<Bytes>>) ->
   }
 
 // --- Tagged literals -----------------------------------------------------------------------
-// `tag"text"` runs as its call read through `Ok`, which the check that ran the call saw it answer.
+// `tag"text"` runs as its call read through `Ok`, which the check that ran the call saw it answer;
+// one with holes hands what it read, and the holes, to its tag's `fill`.
 
 fn settled(expr: Expr) -> Expr =
   match expr {
@@ -269,7 +272,7 @@ fn settled(expr: Expr) -> Expr =
       let held = { name: b"?literal", span: t.span };
       EBlock({
         span: t.span,
-        tail: Some(var_of(held)),
+        tail: Some(if len(t.holes) == 0 { var_of(held) } else { tagged_fill(t, var_of(held)) }),
         stmts: [
           SLet({
             span: t.span,
@@ -365,7 +368,7 @@ fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
     ESimulate(x) -> picked(x.body, wanted, out),
     EParallel(x) -> all(x.branches, out),
     ETryBlock(t) -> picked(t.body, wanted, out),
-    ETagged(_) -> out,
+    ETagged(t) -> fold(t.holes, out, |acc: List<Expr>, h: Hole| picked(h.value, wanted, acc)),
     ELit(_) -> out,
     EVar(_) -> out,
     EBad(_) -> out,
@@ -1065,6 +1068,14 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
           },
       }
     },
+    ETagged(t) -> {
+      let o = sequence(state, map(t.holes, |h: Hole| h.value));
+      let rebuilt = ETagged(with_hole_values(t, o.exprs));
+      match o.scan {
+        ScanFound(_) -> { state: o.state, scan: o.scan, expr: rebuilt },
+        _ -> { state: o.state, scan: purity(len(t.holes) == 0), expr: rebuilt },
+      }
+    },
     // A nested block is not entered; a lambda, handler, cell, region, `simulate` or `parallel` is a
     // barrier to `?`.
     _ -> { state: state, scan: purity(is_pure(expr)), expr: expr },
@@ -1700,6 +1711,17 @@ fn sweep_inner(
       let o = sweep_within(state, x.body, scope, under(barrier, b"a `try` body"), room);
       { state: o.state, expr: ETryBlock({ ..x, body: o.expr }) }
     },
+    ETagged(t) -> {
+      let filled = fold(
+        t.holes,
+        { state: state, holes: [] },
+        |acc: { state: TryState, holes: List<Hole> }, h: Hole| {
+          let o = sweep_within(acc.state, h.value, scope, barrier, room);
+          { state: o.state, holes: push(acc.holes, { ..h, value: o.expr }) }
+        },
+      );
+      { state: filled.state, expr: ETagged({ ..t, holes: filled.holes }) }
+    },
     _ -> { state: state, expr: expr },
   }
 
@@ -1944,6 +1966,7 @@ fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
       ESimulate(x) -> count_in(x.body, p),
       EParallel(x) -> all(x.branches),
       ETryBlock(x) -> count_in(x.body, p),
+      ETagged(t) -> fold(t.holes, 0, |n: Int, h: Hole| n + count_in(h.value, p)),
       _ -> 0,
     })
 }
@@ -2494,6 +2517,26 @@ test "a tagged literal and a `try` in a test's label or its table are read as th
   assert(!refused(labelled) && !refused(tabled));
   assert(refused(bytes_concat(b"type Mine = | Ok(Int) | Fine\n", labelled)));
   assert(refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tabled)))
+}
+
+test "a tagged literal's holes are read as a call's arguments are, and it runs as its tag's `fill`" {
+  let holding = b"fn f(n: Int) -> Result<Int, Bytes> = Ok(len(sh\"a {g(n)?} {sh\"b\"} {try { sh\"c {n}\" }}\"))";
+  // One that holds another is read before it.
+  assert_eq(map(tagged_in(parse(holding).node), |t: Tagged| t.text), [b"a ", b"b", b"c "]);
+  // A `?` in a hole is lifted to the head of what holds the literal.
+  let out = dump_expanded(holding);
+  assert(!string_contains(out, ":etry;") && string_contains(out, ":emat;"));
+  assert(!string_contains(out, "!E0118") && !string_contains(out, "!E0119"));
+  // Each is read through `Ok`, one inside a hole included.
+  let nested = b"type Mine = | Ok(Int) | Fine\nfn f(n: Int) -> Int = sh\"a {sh\"b {n}\"}\"";
+  assert_eq(len(string_split(dump_expanded(nested), "!E0118")), 3);
+  // Written out, its texts go to `compile`, and what that answers to `fill` with the holes.
+  let written = string_of_bytes(
+    dump_module(expand_tagged(parse(b"fn f(n: Int) -> Int = sh\"a {sh\"b\"}\"").node)),
+  );
+  assert(!string_contains(written, ":etag;"));
+  assert(string_contains(written, "@636f6d70696c65;") && string_contains(written, "@66696c6c;"));
+  assert(string_contains(written, "@6c69746572616c;"))
 }
 
 test "a `try` the checker read is written out as its `handle`, and one it did not is left" {

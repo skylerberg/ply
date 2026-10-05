@@ -17,7 +17,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt, SLet,
               SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
-              ETagged, Tagged)
+              ETagged, Tagged, Hole)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
 import std.list (at)
@@ -501,9 +501,34 @@ fn line_string(printer: Printer, value: Bytes, indent: Int, cont: Int) -> Printe
   { ..printed, closed: indent }
 }
 
-/// A tagged literal as written: its tag, touching its string.
-fn tagged_text(input: PrintInput, t: Tagged) -> Bytes / {abort.raise} =
-  bytes_concat(t.tag.name, bytes_slice(input.source, t.quoted.start, t.quoted.end))
+/// A hole between its braces, set off by a space where it begins with a brace of its own, which
+/// beside the hole's would read as a brace of the text.
+fn hole_text(flat: Bytes) -> Bytes =
+  if bytes_starts_with(flat, b"{") { bytes_concat_all([b"{ ", flat, b" }"]) }
+  else { bytes_concat_all([b"{", flat, b"}"]) }
+
+/// A tagged literal as written: its tag touching its string, each text kept and each hole printed
+/// flat, or kept too where it has no flat form.
+fn tagged_text(input: PrintInput, t: Tagged) -> Bytes / {abort.raise} = {
+  let text = |quoted: Span| bytes_slice(input.source, quoted.start + 1, quoted.end - 1);
+  let filled = fold(
+    t.holes,
+    { out: text(t.quoted), from: t.quoted.end },
+    |acc: { out: Bytes, from: Int }, h: Hole|
+      {
+        out: bytes_concat_all([
+          acc.out,
+          match flat_expr(input, h.value) {
+            Some(flat) -> hole_text(flat),
+            None -> bytes_slice(input.source, acc.from - 1, h.quoted.start + 1),
+          },
+          text(h.quoted),
+        ]),
+        from: h.quoted.end,
+      },
+  );
+  bytes_concat_all([t.tag.name, b"\"", filled.out, b"\""])
+}
 
 fn lit_text(input: PrintInput, span: Span, literal: Lit) -> Bytes / {abort.raise} =
   match literal {
@@ -869,7 +894,7 @@ fn piece(input: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
       Some(bytes_slice(input.source, v.span.start + lead, v.span.end - 1))
     },
     EApp(v) -> match v.args {
-      [x] -> cat([Some(b"{"), flat_expr(input, x), Some(b"}")]),
+      [x] -> match flat_expr(input, x) { Some(flat) -> Some(hole_text(flat)), None -> None },
       _ -> None,
     },
     _ -> None,
@@ -2998,6 +3023,19 @@ test "a tagged literal is kept as written, its tag touching its string" {
   let src = b"fn f() -> Int =   len((hex\"de\\u{61}d\").nibbles)   +   len( [ uuid\"\" ] )\n";
   assert_eq(formatted(src), b"fn f() -> Int = len(hex\"de\\u{61}d\".nibbles) + len([uuid\"\"])\n");
   assert(stable(src))
+}
+
+test "a tagged literal's texts are kept as written and its holes printed flat" {
+  let src = b"fn f(x: Int) -> Int =   sh\"a {{b}} \\n {x   +   1}{ sh\"in {x}\" } z\"\n";
+  assert_eq(formatted(src), b"fn f(x: Int) -> Int = sh\"a {{b}} \\n {x + 1}{sh\"in {x}\"} z\"\n");
+  assert(stable(src));
+  // A hole that opens with a brace of its own keeps a space beside the hole's.
+  let braced = b"fn g() -> Int = sh\"{ {n: 1}.n }{  {n: 2}  }\" + len(f\"{ {n: 3}.n } { {n: 4} }\")\n";
+  assert_eq(
+    formatted(braced),
+    b"fn g() -> Int = sh\"{ { n: 1 }.n }{ { n: 2 } }\" + len(f\"{ { n: 3 }.n } { { n: 4 } }\")\n",
+  );
+  assert(stable(braced))
 }
 
 test "a file that does not parse is refused with the first diagnostic, and never rewritten" {
