@@ -10,9 +10,11 @@ import paths
 import report (count_of)
 import std.config (Key, Shape, SText, SInt, SBool, SSecret, optional)
 import std.fs (fs)
+import std.ini
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
 import std.list (sort)
-import std.string (int_of_string, lines, split_once, join, code_points, of_code_points)
+import std.result (result_traverse)
+import std.string (int_of_string, lines, join, code_points, of_code_points)
 import std.value (Value, VRecord, VList, VStr, VCtor, VBool, Field)
 import std.bytes (is_digit)
 import std.json
@@ -141,26 +143,34 @@ fn trimmed(text: String, drop: List<Int>) -> String / {abort.raise} = {
   string_of_bytes(bytes_slice(b, start, end))
 }
 
-fn blanks() -> List<Int> = [32, 9]
+/// What a `--config` file and a `--set` argument are written in: `std.ini`'s lines with `#` the
+/// one comment character, no sections and no quoting.
+fn dialect() -> ini::Options = { ..ini::defaults(), semicolon: false }
 
 /// One `KEY=VALUE` line, or `None` for a blank line or a comment.
 fn parsed_line(
   line: String,
 ) -> Result<Option<{ key: String, value: String }>, String> / {abort.raise} = {
-  let t = trimmed(line, [32, 9, 13]);
-  if t == "" || string_starts_with(t, "#") { Ok(None) } else {
-    match split_once(t, "=") {
-      None -> Err("it has no `=`"),
-      Some(cut) -> {
-        let key = trimmed(cut.head, blanks());
-        match key_refusal(key) {
-          Some(why) -> Err(why),
-          None -> Ok(Some({ key: key, value: trimmed(cut.tail, blanks()) })),
-        }
+  let read = try { ini::line(line, 1, dialect()) };
+  match read {
+    Err(refusal) -> Err(not_a_pair(refusal.why)),
+    Ok(l) -> match l.what {
+      ini::Entry(e) -> match key_refusal(e.key) {
+        Some(why) -> Err(why),
+        None -> Ok(Some({ key: e.key, value: match e.value { Some(v) -> v, None -> "" } })),
       },
-    }
+      ini::Header(_) -> Err(not_a_pair(ini::BadHeader)),
+      _ -> Ok(None),
+    },
   }
 }
+
+fn not_a_pair(why: ini::Why) -> String =
+  match why {
+    ini::NoKey -> "it has an empty key",
+    ini::BadHeader -> "it opens a `[section]`, and this configuration has none",
+    _ -> "it has no `=`",
+  }
 
 fn unreadable(path: String, why: Option<String>) -> Diag =
   unavailable(
@@ -339,22 +349,12 @@ fn declared_once(keys: List<Key>) -> Option<Diag> = {
 pub fn schema_of(value: Value, function: String) -> Result<Schema, Diag> =
   match value {
     VRecord(fields) -> match field(fields, "keys") {
-      Some(VList(items)) -> {
-        let keys = fold(items, Ok([]), |acc: Result<List<Key>, Diag>, item: Value|
-          match acc {
-            Err(d) -> Err(d),
-            Ok(done) -> match key_of(item, function) {
-              Ok(k) -> Ok(push(done, k)),
-              Err(d) -> Err(d),
-            },
-          });
-        match keys {
-          Err(d) -> Err(d),
-          Ok(ks) -> match declared_once(ks) {
-            Some(d) -> Err(d),
-            None -> Ok({ function: function, keys: ks }),
-          },
-        }
+      Some(VList(items)) -> match result_traverse(items, |item: Value| key_of(item, function)) {
+        Err(d) -> Err(d),
+        Ok(ks) -> match declared_once(ks) {
+          Some(d) -> Err(d),
+          None -> Ok({ function: function, keys: ks }),
+        },
       },
       _ -> Err(malformed(function, "it has no `keys` list")),
     },
@@ -769,6 +769,19 @@ test "a malformed file names the file, the line and what is wrong with it" {
   assert(says(at(0), "`deploy.env` line 2 is not `KEY=VALUE`: it has no `=`"));
   assert(says(at(1), "line 3") && says(at(1), "empty key"));
   assert(says(at(2), "line 4") && says(at(2), "contains `-`"))
+}
+
+test "a section header is no line of a configuration, closed or not" {
+  let ds = read_err(
+    [],
+    [file("deploy.ini", "[desk]\nDESK_REGION=eu\n  [desk\n; DESK_PORT=1\n")],
+    [],
+  );
+  assert_eq(codes(ds), [b"E0440", b"E0440", b"E0440"]);
+  let at = |i: Int| match list_at(ds, i) { Some(d) -> d, None -> panic("three were raised") };
+  assert(says(at(0), "`deploy.ini` line 1 is not `KEY=VALUE`: it opens a `[section]`"));
+  assert(says(at(1), "line 3") && says(at(1), "it opens a `[section]`"));
+  assert(says(at(2), "line 4") && says(at(2), "starts with `;`"))
 }
 
 test "a file that will not read, or is not text, is E0440 naming it" {

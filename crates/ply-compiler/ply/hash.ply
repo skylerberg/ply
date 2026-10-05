@@ -27,7 +27,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, Module
 import derive (Expansion, expand_derives)
 import std.bytes (u32_at, is_digit, replace, ascii_of_int, u32_le, u64_le)
 import std.hash (blake3)
-import std.list (at, concat, contains, take, push_unique)
+import std.list (at, concat, contains, take, push_unique, reverse)
+import std.graph
 import std.bytes
 
 // --- Bytes ------------------------------------------------------------------------------------
@@ -504,91 +505,6 @@ fn effect_target(index: Index, module: Int, qname: QName) -> Option<Int> / {abor
     Some(t) ->
       exported(index, qualifier(qname), module, map_get(at(index.items, t.owner).effects, t.name)),
   }
-
-/// Tarjan's components, iterative: completion order, each component's members as they left the stack.
-type Tarjan = {
-  index: List<Int>,
-  low: List<Int>,
-  on_stack: List<Bool>,
-  stack: List<Int>,
-  call: List<{ v: Int, edge: Int }>,
-  out: List<List<Int>>,
-  next: Int,
-}
-
-pub fn tarjan(n: Int, edges: List<List<Int>>) -> List<List<Int>> / {abort.raise} = {
-  let unvisited = 0 - 1;
-  let start = {
-    index: map(range(0, n), |i: Int| unvisited),
-    low: map(range(0, n), |i: Int| 0),
-    on_stack: map(range(0, n), |i: Int| false),
-    stack: [],
-    call: [],
-    out: [],
-    next: 0,
-  };
-  let total = fold(edges, 0, |acc: Int, es: List<Int>| acc + len(es));
-  let done = fold(range(0, n), start, |t: Tarjan, root: Int|
-    if at(t.index, root) != unvisited { t } else {
-      let opened: Tarjan = {
-        ..t,
-        index: list_set(t.index, root, t.next),
-        low: list_set(t.low, root, t.next),
-        next: t.next + 1,
-        stack: push(t.stack, root),
-        on_stack: list_set(t.on_stack, root, true),
-        call: [{ v: root, edge: 0 }],
-      };
-      iterate(opened, 2 * (n + total) + 4, |x: Tarjan|
-        if len(x.call) == 0 { Stop(x) } else { Continue(tarjan_step(n, edges, x)) })
-    });
-  done.out
-}
-
-fn tarjan_step(n: Int, edges: List<List<Int>>, t: Tarjan) -> Tarjan / {abort.raise} = {
-  let top = at(t.call, len(t.call) - 1);
-  let rest = take(t.call, len(t.call) - 1);
-  let out = at(edges, top.v);
-  if top.edge < len(out) {
-    let again = push(rest, { v: top.v, edge: top.edge + 1 });
-    let w = at(out, top.edge);
-    if w >= n { { ..t, call: again } } else if at(t.index, w) == 0 - 1 {
-      {
-        ..t,
-        index: list_set(t.index, w, t.next),
-        low: list_set(t.low, w, t.next),
-        next: t.next + 1,
-        stack: push(t.stack, w),
-        on_stack: list_set(t.on_stack, w, true),
-        call: push(again, { v: w, edge: 0 }),
-      }
-    } else if at(t.on_stack, w) {
-      { ..t, low: list_set(t.low, top.v, min(at(t.low, top.v), at(t.index, w))), call: again }
-    } else { { ..t, call: again } }
-  } else {
-    let lowered: Tarjan = if len(rest) > 0 {
-      let parent = at(rest, len(rest) - 1).v;
-      { ..t, low: list_set(t.low, parent, min(at(t.low, parent), at(t.low, top.v))) }
-    } else { t };
-    let popped: Tarjan = if at(lowered.low, top.v) == at(lowered.index, top.v) {
-      let split = iterate(
-        { stack: lowered.stack, on: lowered.on_stack, comp: [] },
-        len(lowered.stack) + 1,
-        |s: { stack: List<Int>, on: List<Bool>, comp: List<Int> }| {
-          let w = at(s.stack, len(s.stack) - 1);
-          let next = {
-            stack: take(s.stack, len(s.stack) - 1),
-            on: list_set(s.on, w, false),
-            comp: push(s.comp, w),
-          };
-          if w == top.v { Stop(next) } else { Continue(next) }
-        },
-      );
-      { ..lowered, stack: split.stack, on_stack: split.on, out: push(lowered.out, split.comp) }
-    } else { lowered };
-    { ..popped, call: rest }
-  }
-}
 
 fn is_cyclic(component: List<Int>, edges: List<List<Int>>) -> Bool / {abort.raise} =
   if len(component) != 1 { true } else {
@@ -2206,7 +2122,8 @@ fn graph_with(
   let edges = map(range(0, n), |v: Int|
     match map_get(extra, v) { Some(es) -> es, None -> at(first, v).refs });
   let sketches = map(first, |f: Finished| f.bytes);
-  let components = tarjan(n, edges);
+  // A cycle's members last met first: the order the keys below are taken in.
+  let components = map(graph::components({ out: edges }), |c: List<Int>| reverse(c));
   let component_of = fold(
     range(0, len(components)),
     map(range(0, n), |i: Int| 0 - 1),

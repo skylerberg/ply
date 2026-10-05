@@ -8,8 +8,9 @@
 //! value, a duplicate, a conflict, an unmet requirement — as an `error:` line, a usage line, and the
 //! way to `--help`: the shape a command-line reader already knows.
 
-import std.string (int_of_string, split_once, join, strip_suffix)
+import std.string (count, int_of_string, split_once, join, strip_suffix)
 import std.list (at_or, concat)
+import std.text (closest, table)
 
 /// What a flag's value must be to parse. `Nat` is zero or more, `Pos` is one or more; anything
 /// further (a seed, a credential) is the flag's `check`.
@@ -720,15 +721,15 @@ pub fn refused(spec: Spec, path: List<String>, message: String) -> String =
     ++ "\n\nFor more information, try '--help'."
 
 /// The nearest flag to what was written, when one is near: an edit away is a typo, not a guess.
-fn flag_tip(root: Command, node: Body, name: String) -> String / {abort.raise} =
-  match nearest(name, concat(long_names(node.flags), long_names(body(root).flags))) {
+fn flag_tip(root: Command, node: Body, name: String) -> String =
+  match closest(name, concat(long_names(node.flags), long_names(body(root).flags)), slips()) {
     Some(near) -> "\n\n  tip: a similar argument exists: '--" ++ near ++ "'",
     None -> "",
   }
 
 fn sub_tip(root: Command, path: List<String>, name: String) -> String / {abort.raise} =
   match node_at(root, path) {
-    Some(node) -> match nearest(name, map(node.subs, |s: Command| body(s).name)) {
+    Some(node) -> match closest(name, map(node.subs, |s: Command| body(s).name), slips()) {
       Some(near) -> "\n\n  tip: a similar subcommand exists: '" ++ near ++ "'",
       None -> "",
     },
@@ -737,53 +738,24 @@ fn sub_tip(root: Command, path: List<String>, name: String) -> String / {abort.r
 
 fn long_names(flags: List<Flag>) -> List<String> = map(flags, |flag: Flag| flag.long)
 
-/// Levenshtein's distance over characters; both words are flag names, so this stays small.
-pub fn distance(a: String, b: String) -> Int / {abort.raise} =
-  last_of(
-    fold(range(0, string_len(b)), row_zero(string_len(a)), |row: List<Int>, j: Int|
-      step_row(a, b, j, row)),
-  )
-
-fn row_zero(width: Int) -> List<Int> = map(range(0, width + 1), |i: Int| i)
-
-fn step_row(a: String, b: String, j: Int, prev: List<Int>) -> List<Int> / {abort.raise} =
-  fold(range(0, string_len(a)), [j + 1], |row: List<Int>, i: Int|
-    push(row, cell(a, b, i, j, prev, row)))
-
-fn cell(
-  a: String,
-  b: String,
-  i: Int,
-  j: Int,
-  prev: List<Int>,
-  row: List<Int>,
-) -> Int / {abort.raise} = {
-  let deletion = at_or(prev, i + 1, 0) + 1;
-  let insertion = at_or(row, i, 0) + 1;
-  let same = string_slice(a, i, i + 1) == string_slice(b, j, j + 1);
-  let substitution = at_or(prev, i, 0) + (if same { 0 } else { 1 });
-  min(deletion, min(insertion, substitution))
-}
-
-fn last_of(row: List<Int>) -> Int = match list_at(row, len(row) - 1) { Some(x) -> x, None -> 0 }
-
-/// A suggestion at distance three or less, which is what "did you mean" means for a flag name.
-fn nearest(name: String, candidates: List<String>) -> Option<String> / {abort.raise} =
-  match candidates {
-    [] -> None,
-    [candidate, ..rest] -> if distance(name, candidate) <= 3 { Some(candidate) }
-    else { nearest(name, rest) },
-  }
+/// How far a name may be from what was written and still be what was meant.
+fn slips() -> Int = 3
 
 // --- Help and usage ---------------------------------------------------------------
 
 pub fn help_of(spec: Spec, path: List<String>) -> String / {abort.raise} = {
-  let node: Body = match node_at(spec.root, path) { Some(n) -> n, None -> body(spec.root) };
+  let found = node_at(spec.root, path);
+  let node: Body = match found { Some(n) -> n, None -> body(spec.root) };
+  // A command takes the root's flags beside its own; the root's own are listed once.
+  let inherited = match found {
+    Some(_) -> if len(path) == 0 { [] } else { body(spec.root).flags },
+    None -> [],
+  };
   let sections = [
     about_line(node.about),
     usage_of(spec, path),
     arguments_section(node),
-    options_section(spec, node),
+    options_section(concat(node.flags, inherited)),
     commands_section(node),
   ];
   strip_suffix(
@@ -804,8 +776,7 @@ fn positional_left(p: Positional) -> String = {
   if p.many { inner ++ "..." } else { inner }
 }
 
-fn options_section(spec: Spec, node: Body) -> String / {abort.raise} = {
-  let flags = concat(node.flags, body(spec.root).flags);
+fn options_section(flags: List<Flag>) -> String / {abort.raise} = {
   let rows = map(flags, |flag: Flag| { left: flag_left(flag), right: flag_help(flag) });
   let builtin = [
     { left: "-h, --help", right: "Print help" },
@@ -850,17 +821,8 @@ fn flag_help(flag: Flag) -> String = {
 }
 
 /// A two-column block: every right side starts one padding past the widest left.
-fn aligned(rows: List<{ left: String, right: String }>) -> String / {abort.raise} = {
-  let width = fold(rows, 0, |acc: Int, r: { left: String, right: String }|
-    max(acc, string_len(r.left)));
-  strip_suffix(
-    fold(rows, "", |acc: String, r: { left: String, right: String }|
-      acc ++ "  " ++ r.left ++ pad(width - string_len(r.left) + 2) ++ r.right ++ "\n"),
-    "\n",
-  )
-}
-
-fn pad(n: Int) -> String = if n <= 0 { "" } else { " " ++ pad(n - 1) }
+fn aligned(rows: List<{ left: String, right: String }>) -> String =
+  join(table(map(rows, |r: { left: String, right: String }| ["  " ++ r.left, r.right])), "\n")
 
 pub fn usage_of(spec: Spec, path: List<String>) -> String = {
   let node: Body = match node_at(spec.root, path) { Some(n) -> n, None -> body(spec.root) };
@@ -1071,7 +1033,7 @@ test "help answers at any level and stops the parse" {
       assert(string_contains(text, "the fixture tool"));
       assert(string_contains(text, "Usage: fx [OPTIONS] <COMMAND>"));
       assert(string_contains(text, "run"));
-      assert(string_contains(text, "--color"))
+      assert_eq(count(text, "--color <COLOR>"), 1)
     },
     _ -> panic("--help is help"),
   };
@@ -1080,6 +1042,7 @@ test "help answers at any level and stops the parse" {
       assert(string_contains(text, "Run it"));
       assert(string_contains(text, "Usage: fx run [OPTIONS] [PATH] [-- ARGS]"));
       assert(string_contains(text, "-j, --jobs <N>"));
+      assert_eq(count(text, "--color <COLOR>"), 1);
       assert(string_contains(text, "[default: auto]"));
       assert(string_contains(text, "[possible values: auto, never]"));
       assert(string_contains(text, "Print help"))
@@ -1122,12 +1085,11 @@ test "the usage line says what the command takes" {
   assert_eq(usage_of(fixture(), ["cache", "inspect"]), "Usage: fx cache inspect [OPTIONS] <DEF>")
 }
 
-test "the distance a suggestion is allowed is an edit of three" {
-  assert_eq(distance("job", "jobs"), 1);
-  assert_eq(distance("rn", "run"), 1);
-  assert_eq(distance("frobnicate", "verbose"), 8);
-  assert_eq(nearest("verbse", ["verbose", "jobs"]), Some("verbose"));
-  assert_eq(nearest("xyzzy", ["verbose", "jobs"]), None)
+test "a tip is the nearest name within three slips, not the first" {
+  let near = refused_of(parse(fixture(), ["buil"]));
+  assert(string_contains(near, "tip: a similar subcommand exists: 'build'"));
+  let swapped = refused_of(parse(fixture(), ["cahce"]));
+  assert(string_contains(swapped, "tip: a similar subcommand exists: 'cache'"))
 }
 
 test "a number that overflows the integer is not one" {
