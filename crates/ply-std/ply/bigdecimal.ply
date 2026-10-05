@@ -1,0 +1,1260 @@
+//! Decimal numbers of any size: a `BigInt` and how many of its digits follow the point.
+//!
+//! A `BigDecimal` is `unscaled / 10^scale`, as a `Decimal` is, with no bound on either part and a
+//! scale that is never negative: a whole number of tens is held with its zeros written out. Make
+//! one with `of_parts`, a conversion or `read`, never with the constructor, which checks nothing.
+//!
+//! A value keeps the scale it was written or computed at, and equality does not read it. The type
+//! states a `key`, so `1.5` and `1.50` are `==`, order as one number, share a `digest` and are one
+//! `Map` key, as `1.5m` and `1.50m` are; `to_string`, which `show` writes, is what tells them
+//! apart, `scale` reads it and `strip_trailing_zeros` drops what it need not hold. `compare` here
+//! answers what the language's does and is cheaper, since a key is read from the digits.
+//!
+//! Addition, subtraction and multiplication are exact and are the operators, by the type's
+//! `numeric`: a sum is at the larger scale and a product at the sum of the two, zero included.
+//! Whatever cannot be exact is told where to stop and how to round, and reads no context: a
+//! number of places after the point, a negative one counting whole tens, or a precision in
+//! significant digits, and the prelude's `Rounding`, which means here what it does to
+//! `decimal_div`. A quotient or a root to a precision is written as the General Decimal Arithmetic
+//! specification writes it: at the precision where it is rounded, and without the zeros an exact
+//! answer does not need.
+
+import std.bigint
+import std.bigint (BigInt)
+import std.bytes (int_of_ascii, peek, scan)
+import std.decimal
+import std.laws (monoid, total_order)
+import std.list (at_or, drop, take)
+import std.math
+import std.option (option_map)
+import std.rational
+import std.rational (Rational)
+import std.result (result_ok)
+
+/// A decimal number: its digits as a whole number, and how many of them follow the point, which
+/// is never negative.
+pub type BigDecimal = | BigDecimal(BigInt, Int)
+
+key for BigDecimal by order_key
+
+show for BigDecimal by to_string
+
+numeric for BigDecimal by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }
+
+/// Why a text names no decimal number.
+pub type Why =
+  /// A character that is no part of a number, or the text ending where a digit is due.
+  | Stray
+  /// An exponent past the bound the reader was given.
+  | TooWide
+
+/// A refusal, and the character of the text it is about.
+pub type Refusal = new { at: Int, why: Why }
+
+/// What this module raises where it refuses.
+pub effect bigdecimal {
+  /// The text names no decimal number the reader's bound admits.
+  raise refused(e: Refusal)
+}
+
+// --- Making and reading one -------------------------------------------------
+
+/// Zero, at scale zero.
+pub fn zero() -> BigDecimal = BigDecimal(bigint::zero(), 0)
+
+/// One, at scale zero.
+pub fn one() -> BigDecimal = BigDecimal(bigint::one(), 0)
+
+/// The whole number `n`, at scale zero.
+pub fn of_int(n: Int) -> BigDecimal = BigDecimal(bigint::of_int(n), 0)
+
+/// The whole number `n`, at scale zero.
+pub fn of_bigint(n: BigInt) -> BigDecimal = BigDecimal(n, 0)
+
+/// `unscaled / 10^scale`, at that scale. A scale below zero is that many whole tens, and the
+/// value is held at scale zero with them written out.
+pub fn of_parts(unscaled: BigInt, scale: Int) -> BigDecimal =
+  if scale >= 0 { BigDecimal(unscaled, scale) } else { BigDecimal(unscaled * ten_to(0 - scale), 0) }
+
+/// The digits as a whole number: the value times `10^scale`.
+pub fn unscaled(value: BigDecimal) -> BigInt = match value { BigDecimal(digits, _) -> digits }
+
+/// How many digits follow the point.
+pub fn scale(value: BigDecimal) -> Int = match value { BigDecimal(_, places) -> places }
+
+/// How many digits the unscaled value has, which is one for zero: the significant digits, a
+/// trailing zero counted.
+pub fn precision(value: BigDecimal) -> Int = len(digits_of(value))
+
+/// Whether the value is zero, at any scale.
+pub fn is_zero(value: BigDecimal) -> Bool = bigint::is_zero(unscaled(value))
+
+/// Whether the value is below zero.
+pub fn is_negative(value: BigDecimal) -> Bool = bigint::is_negative(unscaled(value))
+
+/// `-1`, `0` or `1`.
+pub fn sign(value: BigDecimal) -> Int = bigint::sign(unscaled(value))
+
+// --- Exact arithmetic -------------------------------------------------------
+
+/// `a + b`, exactly, at the larger of the two scales.
+pub fn add(a: BigDecimal, b: BigDecimal) -> BigDecimal = {
+  let places = max(scale(a), scale(b));
+  BigDecimal(lifted(a, places) + lifted(b, places), places)
+}
+
+/// `a - b`, exactly, at the larger of the two scales.
+pub fn sub(a: BigDecimal, b: BigDecimal) -> BigDecimal = add(a, neg(b))
+
+/// `a * b`, exactly, at the sum of the two scales.
+pub fn mul(a: BigDecimal, b: BigDecimal) -> BigDecimal =
+  BigDecimal(unscaled(a) * unscaled(b), scale(a) + scale(b))
+
+/// The value with its sign flipped, at its scale.
+pub fn neg(value: BigDecimal) -> BigDecimal = BigDecimal(bigint::neg(unscaled(value)), scale(value))
+
+/// The distance from zero, at the value's scale.
+pub fn abs(value: BigDecimal) -> BigDecimal =
+  BigDecimal(bigint::abs_value(unscaled(value)), scale(value))
+
+/// The value to a whole power, exactly, at its scale times the exponent; `None` for an exponent
+/// below zero, whose answer need not be a decimal number.
+pub fn pow(value: BigDecimal, exponent: Int) -> Option<BigDecimal> =
+  if exponent < 0 { None }
+  else { Some(BigDecimal(power(unscaled(value), exponent), scale(value) * exponent)) }
+
+/// The order of the numbers, whatever their scales.
+pub fn compare(a: BigDecimal, b: BigDecimal) -> Ordering = {
+  let places = max(scale(a), scale(b));
+  bigint::compare(lifted(a, places), lifted(b, places))
+}
+
+/// The same value at the least scale that holds it: `1.50` is `1.5`, and `2.00` and `0.000` are
+/// `2` and `0`.
+pub fn strip_trailing_zeros(value: BigDecimal) -> BigDecimal = trimmed(value, 0)
+
+// --- Rounding ---------------------------------------------------------------
+
+/// The value at no more than `places` digits after the point, rounded by `mode`; a value that
+/// has no more than that is itself, with no zeros added, as `decimal_round` leaves one. A negative
+/// `places` rounds to that many whole tens.
+pub fn round(value: BigDecimal, places: Int, mode: Rounding) -> BigDecimal =
+  if places >= scale(value) { value }
+  else { rounded_ratio(unscaled(value), ten_to(scale(value)), places, mode) }
+
+/// The value at exactly `places` digits after the point: rounded by `mode` where it has more, and
+/// with zeros added where it has fewer. A negative `places` rounds to that many whole tens, held
+/// at scale zero.
+pub fn rescale(value: BigDecimal, places: Int, mode: Rounding) -> BigDecimal =
+  if places >= scale(value) { BigDecimal(lifted(value, places), places) }
+  else { round(value, places, mode) }
+
+/// The value at the scale `like` has, rounded by `mode`: `rescale` by example.
+pub fn quantize(value: BigDecimal, like: BigDecimal, mode: Rounding) -> BigDecimal =
+  rescale(value, scale(like), mode)
+
+/// The value at no more than `digits` significant digits, rounded by `mode`; a value that has no
+/// more is itself. A `digits` below one is one.
+pub fn round_to_precision(value: BigDecimal, digits: Int, mode: Rounding) -> BigDecimal =
+  if precision(value) <= max(digits, 1) { value }
+  else { carried(ratio_to_precision(unscaled(value), ten_to(scale(value)), digits, mode), digits) }
+
+// --- Division and roots -----------------------------------------------------
+
+/// `a / b` at exactly `places` digits after the point, rounded by `mode`: the number `decimal_div`
+/// answers, with the zeros that fill the scale written. A negative `places` rounds to that many
+/// whole tens. `None` for a zero divisor.
+pub fn div(a: BigDecimal, b: BigDecimal, places: Int, mode: Rounding) -> Option<BigDecimal> =
+  if is_zero(b) { None } else {
+    Some(
+      rounded_ratio(unscaled(a) * ten_to(scale(b)), unscaled(b) * ten_to(scale(a)), places, mode),
+    )
+  }
+
+/// `a / b` at `digits` significant digits, rounded by `mode`. A quotient that is exact in fewer
+/// is written without the zeros, down to the scale of `a` less that of `b`. A `digits` below one is
+/// one. `None` for a zero divisor.
+pub fn div_to_precision(
+  a: BigDecimal,
+  b: BigDecimal,
+  digits: Int,
+  mode: Rounding,
+) -> Option<BigDecimal> =
+  if is_zero(b) { None }
+  else if is_zero(a) { Some(BigDecimal(bigint::zero(), max(scale(a) - scale(b), 0))) } else {
+    let quotient = ratio_to_precision(
+      unscaled(a) * ten_to(scale(b)),
+      unscaled(b) * ten_to(scale(a)),
+      digits,
+      mode,
+    );
+    if compare(mul(quotient, b), a) == Equal { Some(trimmed(quotient, scale(a) - scale(b))) }
+    else { Some(carried(quotient, digits)) }
+  }
+
+/// `a / b` where it is a decimal number, at the least scale that holds it; `None` where its digits
+/// never end, as a third's do not, and for a zero divisor.
+pub fn div_exact(a: BigDecimal, b: BigDecimal) -> Option<BigDecimal> =
+  match rational::div(to_rational(a), to_rational(b)) {
+    Some(quotient) -> of_rational_exact(quotient),
+    None -> None,
+  }
+
+/// The square root at exactly `places` digits after the point, rounded by `mode`; `None` for a
+/// value below zero.
+pub fn sqrt(value: BigDecimal, places: Int, mode: Rounding) -> Option<BigDecimal> =
+  if is_negative(value) { None } else { Some(root(value, places, mode)) }
+
+/// The square root at `digits` significant digits, rounded by `mode`. A root that is exact in
+/// fewer is written without the zeros, down to half the value's scale. A `digits` below one is one.
+/// `None` for a value below zero.
+pub fn sqrt_to_precision(value: BigDecimal, digits: Int, mode: Rounding) -> Option<BigDecimal> =
+  if is_negative(value) { None }
+  else if is_zero(value) { Some(BigDecimal(bigint::zero(), (scale(value) + 1) / 2)) } else {
+    let found = root(value, max(digits, 1) - half_up(precision(value) - scale(value)), mode);
+    if compare(mul(found, found), value) == Equal { Some(trimmed(found, (scale(value) + 1) / 2)) }
+    else { Some(carried(found, digits)) }
+  }
+
+// --- Other numbers ----------------------------------------------------------
+
+/// The `Decimal`'s value at the `Decimal`'s scale.
+pub fn of_decimal(d: Decimal) -> BigDecimal / {abort.raise} =
+  match parse(decimal_to_string(d), 0) { Ok(value) -> value, Err(_) -> zero() }
+
+/// The value as a `Decimal`, at its scale where a `Decimal` holds that and without its trailing
+/// zeros otherwise. `None` where it fits neither way: more than 28 digits after the point that
+/// are not zeros, or digits past 96 bits.
+pub fn to_decimal(value: BigDecimal) -> Option<Decimal> =
+  match decimal_of_string(to_string(value)) {
+    Some(d) -> Some(d),
+    None -> decimal_of_string(to_string(strip_trailing_zeros(value))),
+  }
+
+/// The fraction the value is, exactly.
+pub fn to_rational(value: BigDecimal) -> Rational =
+  match rational::ratio(unscaled(value), ten_to(scale(value))) {
+    Some(r) -> r,
+    None -> rational::zero(),
+  }
+
+/// The fraction at `places` digits after the point, rounded by `mode`.
+pub fn of_rational(r: Rational, places: Int, mode: Rounding) -> BigDecimal =
+  rounded_ratio(rational::numerator(r), rational::denominator(r), places, mode)
+
+/// The fraction where it is a decimal number, at the least scale that holds it; `None` where its
+/// denominator has a factor other than two and five, so its digits never end.
+pub fn of_rational_exact(r: Rational) -> Option<BigDecimal> = {
+  let left = bigint::bit_length(rational::denominator(r)) + 1;
+  let twos = without_factor(rational::denominator(r), 2, 0, left);
+  let fives = without_factor(twos.rest, 5, 0, left);
+  let places = max(twos.count, fives.count);
+  if bigint::compare(fives.rest, bigint::one()) != Equal { None }
+  else { Some(of_rational(r, places, Down)) }
+}
+
+/// The `Float`'s value, exactly, which every finite one has as a decimal number; `None` for a
+/// `NaN` and for an infinity.
+pub fn of_float(f: Float) -> Option<BigDecimal> =
+  match rational::of_float(f) { Some(r) -> of_rational_exact(r), None -> None }
+
+/// The `Float` nearest the value, a tie going to the one whose last bit is zero.
+pub fn to_float(value: BigDecimal) -> Float = rational::to_float(to_rational(value))
+
+// --- Text -------------------------------------------------------------------
+
+/// The value in plain decimal at its scale, so `1.50` is written `1.50`, with a leading `-` when
+/// negative and a zero before a point that would otherwise lead.
+pub fn to_string(value: BigDecimal) -> String = {
+  let digits = digits_of(value);
+  let padded = if len(digits) > scale(value) { digits } else {
+    fold(
+      digits,
+      map(range(0, scale(value) + 1 - len(digits)), |_i: Int| '0'),
+      |all: List<Char>, c: Char| push(all, c),
+    )
+  };
+  let whole = take(padded, len(padded) - scale(value));
+  let signed = if is_negative(value) { fold(whole, ['-'], |all: List<Char>, c: Char| push(all, c)) }
+  else { whole };
+  string_of_chars(if scale(value) == 0 { signed } else {
+    fold(drop(padded, len(padded) - scale(value)), push(signed, '.'), |all: List<Char>, c: Char|
+      push(all, c))
+  })
+}
+
+/// The value in scientific notation: its digits with a point after the first, then `E` and the
+/// power of ten that first digit counts, signed, so `123.45` is `1.2345E+2` and `0.00` is `0E-2`.
+pub fn to_scientific(value: BigDecimal) -> String = {
+  let digits = digits_of(value);
+  let power = len(digits) - 1 - scale(value);
+  let lead = if is_negative(value) { ['-'] } else { [] };
+  let first = push(lead, at_or(digits, 0, '0'));
+  let mantissa = if len(digits) == 1 { first }
+  else { fold(drop(digits, 1), push(first, '.'), |all: List<Char>, c: Char| push(all, c)) };
+  string_of_chars(mantissa) ++ (if power < 0 { "E-" } else { "E+" })
+    ++ int_to_string(if power < 0 { 0 - power } else { power })
+}
+
+/// The number a text names: digits with an optional sign before them, an optional point among
+/// them and an optional exponent after them, `e` or `E` and a whole number, as `decimal_of_string`
+/// reads one. The scale is the digits written after the point less the exponent. Raises `refused`
+/// for any other text, at the character that is no part of a number, and for an exponent past
+/// `max_exponent` either way, since `1e1000000000` would be written out in full.
+pub fn read(text: String, max_exponent: Int) -> BigDecimal / {bigdecimal.refused, abort.raise} = {
+  let bytes = bytes_of_string(text);
+  let from = if is_sign(peek(bytes, 0)) { 1 } else { 0 };
+  let whole_end = scan(bytes, from, b"0123456789");
+  let part_from = if peek(bytes, whole_end) == 46 { whole_end + 1 } else { whole_end };
+  let part_end = scan(bytes, part_from, b"0123456789");
+  if whole_end - from + part_end - part_from == 0 { refuse(part_end, Stray) } else {
+    let digits = bytes_slice(bytes, from, whole_end) ++ bytes_slice(bytes, part_from, part_end);
+    let magnitude = match bigint::of_string(string_of_bytes(digits)) {
+      Some(n) -> n,
+      None -> bigint::zero(),
+    };
+    let coefficient = if peek(bytes, 0) == 45 { bigint::neg(magnitude) } else { magnitude };
+    if part_end == bytes_len(bytes) { of_parts(coefficient, part_end - part_from) }
+    else if peek(bytes, part_end) != 69 && peek(bytes, part_end) != 101 { refuse(part_end, Stray) }
+    else {
+      let exponent = read_exponent(bytes, part_end + 1, max_exponent);
+      of_parts(coefficient, part_end - part_from - exponent)
+    }
+  }
+}
+
+/// The number a text names, as `read` reads one under the same bound, or why it names none.
+pub fn parse(text: String, max_exponent: Int) -> Result<BigDecimal, Refusal> / {abort.raise} =
+  try { read(text, max_exponent) }
+
+/// What a `bigdecimal"..."` literal is checked by: the number `read` reads with exponents up to
+/// 6144, or why the text is none and the character it stops being one at.
+pub fn literal(
+  text: String,
+) -> Result<BigDecimal, { message: String, offset: Int }> / {abort.raise} =
+  match parse(text, 6144) {
+    Ok(value) -> Ok(value),
+    Err(e) ->
+      Err({
+        message: match e.why {
+          Stray -> "a decimal number is digits, with an optional sign, point and exponent",
+          TooWide -> "an exponent is at most 6144 either way",
+        },
+        offset: e.at,
+      }),
+  }
+
+// --- The parts --------------------------------------------------------------
+
+fn refuse<a>(at: Int, why: Why) -> a / {bigdecimal.refused} =
+  bigdecimal.refused({ at: at, why: why })
+
+fn is_sign(byte: Int) -> Bool = byte == 43 || byte == 45
+
+/// The exponent written from `from` to the end of the bytes: an optional sign and digits.
+fn read_exponent(
+  bytes: Bytes,
+  from: Int,
+  max_exponent: Int,
+) -> Int / {bigdecimal.refused, abort.raise} = {
+  let digits_from = if is_sign(peek(bytes, from)) { from + 1 } else { from };
+  let end = scan(bytes, digits_from, b"0123456789");
+  if end == digits_from || end != bytes_len(bytes) { refuse(end, Stray) } else {
+    match int_of_ascii(bytes_slice(bytes, digits_from, end)) {
+      Some(n) -> if n > max_exponent { refuse(from, TooWide) }
+      else if peek(bytes, from) == 45 { 0 - n }
+      else { n },
+      None -> refuse(from, TooWide),
+    }
+  }
+}
+
+/// `base` to a power that is not negative, which `bigint::pow` answers and never raises for.
+fn power(base: BigInt, exponent: Int) -> BigInt =
+  handle { bigint::pow(base, exponent) } with { abort.raise(_) -> bigint::zero() }
+
+/// `10^k`, and one for a `k` below one.
+fn ten_to(k: Int) -> BigInt = power(bigint::of_int(10), k)
+
+/// The value's digits as a whole number at `places` after the point, which is no fewer than it has.
+fn lifted(value: BigDecimal, places: Int) -> BigInt =
+  unscaled(value) * ten_to(places - scale(value))
+
+/// The digits of the unscaled value, its sign aside.
+fn digits_of(value: BigDecimal) -> List<Char> =
+  string_chars(bigint::to_string(bigint::abs_value(unscaled(value))))
+
+/// How many zeros end the digits.
+fn zeros_ending(digits: List<Char>) -> Int =
+  fold(range(0, len(digits)), 0, |count: Int, k: Int|
+    if count == k && at_or(digits, len(digits) - 1 - k, '1') == '0' { k + 1 } else { count })
+
+/// The same value without its trailing zeros, down to `least` digits after the point and no
+/// further; zero is written at `least`, or at scale zero where that is below it.
+fn trimmed(value: BigDecimal, least: Int) -> BigDecimal = {
+  let kept = max(least, 0);
+  let cut = min(zeros_ending(digits_of(value)), scale(value) - kept);
+  if is_zero(value) { BigDecimal(bigint::zero(), min(scale(value), kept)) }
+  else if cut <= 0 { value }
+  else { rounded_ratio(unscaled(value), ten_to(scale(value)), scale(value) - cut, Down) }
+}
+
+/// `n / d` rounded at `places` digits after the point, for a `d` that is not zero.
+fn rounded_ratio(n: BigInt, d: BigInt, places: Int, mode: Rounding) -> BigDecimal = {
+  let rounded = if places >= 0 { bigint::div_round(n * ten_to(places), d, mode) }
+  else { bigint::div_round(n, d * ten_to(0 - places), mode) };
+  of_parts(match rounded { Some(q) -> q, None -> bigint::zero() }, places)
+}
+
+/// `n / d` rounded at `digits` significant digits, for an `n` and a `d` that are not zero: the
+/// place of the quotient's first digit says how many follow the point.
+fn ratio_to_precision(n: BigInt, d: BigInt, digits: Int, mode: Rounding) -> BigDecimal =
+  rounded_ratio(
+    n,
+    d,
+    max(digits, 1) - first_place(bigint::abs_value(n), bigint::abs_value(d)),
+    mode,
+  )
+
+/// The `e` with `10^(e - 1) <= n / d < 10^e`, for an `n` and a `d` above zero: the difference of
+/// their digit counts, or one more where the quotient reaches that power of ten.
+fn first_place(n: BigInt, d: BigInt) -> Int = {
+  let apart = string_len(bigint::to_string(n)) - string_len(bigint::to_string(d));
+  let reaches = if apart >= 0 { bigint::compare(n, d * ten_to(apart)) != Less }
+  else { bigint::compare(n * ten_to(0 - apart), d) != Less };
+  if reaches { apart + 1 } else { apart }
+}
+
+/// A value rounded to `digits` significant digits that rounding carried into one digit more, as
+/// `9.99` to two is `10.0`, without the zero that carry added.
+fn carried(value: BigDecimal, digits: Int) -> BigDecimal =
+  if precision(value) > max(digits, 1) && scale(value) > 0 {
+    rounded_ratio(unscaled(value), ten_to(scale(value)), scale(value) - 1, Down)
+  } else { value }
+
+/// Half of `n`, rounded toward positive infinity.
+fn half_up(n: Int) -> Int = if n >= 0 { (n + 1) / 2 } else { 0 - (0 - n) / 2 }
+
+/// The square root of a value that is not negative, at `places` digits after the point. The root
+/// is found to one digit more, rounded down, and that digit and whether anything was dropped
+/// below it say which way `mode` goes.
+fn root(value: BigDecimal, places: Int, mode: Rounding) -> BigDecimal = {
+  let shift = 2 * (places + 1) - scale(value);
+  let whole = if shift >= 0 { { q: unscaled(value) * ten_to(shift), r: bigint::zero() } } else {
+    match bigint::div_mod(unscaled(value), ten_to(0 - shift)) {
+      Some(split) -> split,
+      None -> { q: bigint::zero(), r: bigint::zero() },
+    }
+  };
+  let found = match bigint::isqrt(whole.q) { Some(r) -> r, None -> bigint::zero() };
+  let dropped = !bigint::is_zero(whole.r) || bigint::compare(found * found, whole.q) != Equal;
+  of_parts(guarded(found, dropped, mode), places)
+}
+
+/// A number that is not negative, written with one digit more than is wanted, without that digit:
+/// rounded by `mode`, where `dropped` says digits that were not zero lay below it.
+fn guarded(with_guard: BigInt, dropped: Bool, mode: Rounding) -> BigInt =
+  match bigint::div_mod(with_guard, bigint::of_int(10)) {
+    None -> with_guard,
+    Some(split) -> {
+      let guard = match bigint::to_int(split.r) { Some(g) -> g, None -> 0 };
+      let up = match mode {
+        Down -> false,
+        Floor -> false,
+        Up -> guard > 0 || dropped,
+        Ceiling -> guard > 0 || dropped,
+        HalfUp -> guard >= 5,
+        HalfEven -> guard > 5 || (guard == 5 && (dropped || bigint::test_bit(split.q, 0))),
+      };
+      if up { split.q + bigint::one() } else { split.q }
+    },
+  }
+
+/// A number without every factor `p` it has, and how many it had. `left` is only what the
+/// recursion descends by: a number has fewer factors than bits.
+fn without_factor(n: BigInt, p: Int, count: Int, left: Int) -> { rest: BigInt, count: Int } =
+  if left <= 0 { { rest: n, count: count } } else {
+    match bigint::div_mod(n, bigint::of_int(p)) {
+      Some(split) -> if bigint::is_zero(split.r) && !bigint::is_zero(n) {
+        without_factor(split.q, p, count + 1, left - 1)
+      } else { { rest: n, count: count } },
+      None -> { rest: n, count: count },
+    }
+  }
+
+/// What orders as the numbers do, whatever their scales: the sign, the power of ten the first
+/// digit counts, and the digits without their trailing zeros. A negative number's power and digits
+/// are negated, and a mark past every digit ends them, so that the longer of two that agree, which
+/// is further from zero, comes first.
+fn order_key(value: BigDecimal) -> (Int, Int, List<Int>) = {
+  let digits = digits_of(value);
+  let kept = take(digits, len(digits) - zeros_ending(digits));
+  if is_zero(value) { (0, 0, []) } else if is_negative(value) {
+    (0 - 1, scale(value) - len(digits), push(map(kept, |c: Char| 0 - int_of_char(c)), 1))
+  } else { (1, len(digits) - scale(value), map(kept, |c: Char| int_of_char(c))) }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+/// The number a text names, for a test that writes one.
+fn dec(text: String) -> BigDecimal / {abort.raise} =
+  match parse(text, 400) { Ok(value) -> value, Err(_) -> panic("a decimal number") }
+
+fn text_of(value: Option<BigDecimal>) -> String =
+  match value { Some(v) -> to_string(v), None -> "none" }
+
+test "a value keeps its scale, and a scale below zero is whole tens written out" {
+  assert_eq(to_string(of_parts(bigint::of_int(150), 2)), "1.50");
+  assert_eq(to_string(of_parts(bigint::of_int(0 - 5), 3)), "-0.005");
+  assert_eq(to_string(of_parts(bigint::of_int(12), 0 - 3)), "12000");
+  assert_eq(scale(of_parts(bigint::of_int(12), 0 - 3)), 0);
+  assert_eq(to_string(of_int(0 - 42)), "-42");
+  assert_eq(to_string(zero()), "0");
+  assert_eq(to_string(of_parts(bigint::zero(), 2)), "0.00");
+  assert_eq(unscaled(dec("1.50")), bigint::of_int(150));
+  assert_eq(scale(dec("1.50")), 2);
+  assert_eq(map(["0", "0.00", "1.50", "-123.456", "100"], |t: String| precision(dec(t))), [
+    1,
+    1,
+    3,
+    6,
+    3,
+  ]);
+  assert(is_zero(dec("0.000")) && is_negative(dec("-0.1")) && !is_negative(dec("0.0")));
+  assert_eq(map(["-0.1", "0.00", "7"], |t: String| sign(dec(t))), [0 - 1, 0, 1])
+}
+
+test "equality, order, digest and a Map read the number and never the scale; show keeps it" {
+  assert(dec("1.5") == dec("1.50") && dec("1.5") != dec("1.51"));
+  assert_eq(digest(dec("1.5")), digest(dec("1.500")));
+  assert_eq(digest(dec("0")), digest(dec("0.00")));
+  assert_eq(f"{dec("1.5")} and {dec("1.50")}", "1.5 and 1.50");
+  let ordered = map(
+    [
+      "-100",
+      "-12.5",
+      "-12.34",
+      "-1.234",
+      "-0.001",
+      "0",
+      "0.0009",
+      "0.001",
+      "0.12",
+      "0.123",
+      "9",
+      "10",
+      "10.01",
+    ],
+    dec,
+  );
+  let keyed = fold(ordered, map_new(), |m: Map<BigDecimal, Int>, v: BigDecimal|
+    map_insert(m, v, 0));
+  assert_eq(map(map_keys(keyed), to_string), map(ordered, to_string));
+  assert_eq(map_get(keyed, dec("-12.500")), Some(0));
+  assert_eq(map_len(map_insert(keyed, dec("10.0100"), 1)), len(ordered));
+  assert(
+    fold(range(0, len(ordered) - 1), true, |ok: Bool, i: Int|
+      ok && at_or(ordered, i, zero()) < at_or(ordered, i + 1, zero())
+        && compare(at_or(ordered, i, zero()), at_or(ordered, i + 1, zero())) == Less),
+  );
+  assert_eq(compare(dec("1.50"), dec("1.5")), Equal);
+  assert_eq(to_string(max(dec("1.5"), dec("2.50"))), "2.50")
+}
+
+test "sums, differences and products are exact: a sum at the larger scale, a product at their sum" {
+  assert_eq(to_string(dec("1.50") + dec("2")), "3.50");
+  assert_eq(to_string(dec("1.50") - dec("1.5")), "0.00");
+  assert_eq(to_string(dec("1.50") * dec("2.0")), "3.000");
+  assert_eq(to_string(-dec("1.50")), "-1.50");
+  assert_eq(to_string(abs(dec("-1.50"))), "1.50");
+  assert_eq(to_string(dec("0.1") + dec("0.2")), "0.3");
+  assert_eq(
+    to_string(
+      dec("123456789012345678901234567890.123456789") * dec("-1000000000000000000000.000001"),
+    ),
+    "-123456789012345678901234568013580245801345678901234.567890123456789",
+  );
+  assert_eq(to_string(math::sum([dec("0.1"), dec("0.20"), dec("0.300")])), "0.600");
+  assert_eq(text_of(pow(dec("-1.5"), 3)), "-3.375");
+  assert_eq(text_of(pow(dec("1.5"), 0)), "1");
+  assert_eq(text_of(pow(dec("2"), 100)), "1267650600228229401496703205376");
+  assert_eq(pow(dec("2"), 0 - 1), None)
+}
+
+/// One case of an operation, and what Python's `decimal` answered for it, which is the General
+/// Decimal Arithmetic specification's arithmetic: the operands, the places or digits asked for,
+/// the rounding, and the answer written plain.
+type Vector = { a: String, b: String, n: Int, mode: Rounding, want: String }
+
+/// `a / b` at `n` places after the point: the quotient to four hundred digits, quantized.
+fn quotients_at_places() -> List<Vector> =
+  [
+    { a: "1", b: "3", n: 5, mode: HalfEven, want: "0.33333" },
+    { a: "1", b: "3", n: 5, mode: HalfUp, want: "0.33333" },
+    { a: "1", b: "3", n: 5, mode: Down, want: "0.33333" },
+    { a: "1", b: "3", n: 5, mode: Up, want: "0.33334" },
+    { a: "1", b: "3", n: 5, mode: Ceiling, want: "0.33334" },
+    { a: "1", b: "3", n: 5, mode: Floor, want: "0.33333" },
+    { a: "-2", b: "3", n: 3, mode: HalfEven, want: "-0.667" },
+    { a: "-2", b: "3", n: 3, mode: HalfUp, want: "-0.667" },
+    { a: "-2", b: "3", n: 3, mode: Down, want: "-0.666" },
+    { a: "-2", b: "3", n: 3, mode: Up, want: "-0.667" },
+    { a: "-2", b: "3", n: 3, mode: Ceiling, want: "-0.666" },
+    { a: "-2", b: "3", n: 3, mode: Floor, want: "-0.667" },
+    { a: "1", b: "8", n: 2, mode: HalfEven, want: "0.12" },
+    { a: "1", b: "8", n: 2, mode: HalfUp, want: "0.13" },
+    { a: "1", b: "8", n: 2, mode: Down, want: "0.12" },
+    { a: "1", b: "8", n: 2, mode: Up, want: "0.13" },
+    { a: "1", b: "8", n: 2, mode: Ceiling, want: "0.13" },
+    { a: "1", b: "8", n: 2, mode: Floor, want: "0.12" },
+    { a: "-1", b: "8", n: 2, mode: HalfEven, want: "-0.12" },
+    { a: "-1", b: "8", n: 2, mode: HalfUp, want: "-0.13" },
+    { a: "-1", b: "8", n: 2, mode: Down, want: "-0.12" },
+    { a: "-1", b: "8", n: 2, mode: Up, want: "-0.13" },
+    { a: "-1", b: "8", n: 2, mode: Ceiling, want: "-0.12" },
+    { a: "-1", b: "8", n: 2, mode: Floor, want: "-0.13" },
+    { a: "5", b: "2", n: 0, mode: HalfEven, want: "2" },
+    { a: "5", b: "2", n: 0, mode: HalfUp, want: "3" },
+    { a: "5", b: "2", n: 0, mode: Down, want: "2" },
+    { a: "5", b: "2", n: 0, mode: Up, want: "3" },
+    { a: "5", b: "2", n: 0, mode: Ceiling, want: "3" },
+    { a: "5", b: "2", n: 0, mode: Floor, want: "2" },
+    { a: "-7", b: "2", n: 0, mode: HalfEven, want: "-4" },
+    { a: "-7", b: "2", n: 0, mode: HalfUp, want: "-4" },
+    { a: "-7", b: "2", n: 0, mode: Down, want: "-3" },
+    { a: "-7", b: "2", n: 0, mode: Up, want: "-4" },
+    { a: "-7", b: "2", n: 0, mode: Ceiling, want: "-3" },
+    { a: "-7", b: "2", n: 0, mode: Floor, want: "-4" },
+    {
+      a: "123456789012345678901234567890.123",
+      b: "-0.007",
+      n: 4,
+      mode: HalfEven,
+      want: "-17636684144620811271604938270017.5714",
+    },
+    {
+      a: "123456789012345678901234567890.123",
+      b: "-0.007",
+      n: 4,
+      mode: HalfUp,
+      want: "-17636684144620811271604938270017.5714",
+    },
+    {
+      a: "123456789012345678901234567890.123",
+      b: "-0.007",
+      n: 4,
+      mode: Down,
+      want: "-17636684144620811271604938270017.5714",
+    },
+    {
+      a: "123456789012345678901234567890.123",
+      b: "-0.007",
+      n: 4,
+      mode: Up,
+      want: "-17636684144620811271604938270017.5715",
+    },
+    {
+      a: "123456789012345678901234567890.123",
+      b: "-0.007",
+      n: 4,
+      mode: Ceiling,
+      want: "-17636684144620811271604938270017.5714",
+    },
+    {
+      a: "123456789012345678901234567890.123",
+      b: "-0.007",
+      n: 4,
+      mode: Floor,
+      want: "-17636684144620811271604938270017.5715",
+    },
+    { a: "1", b: "7", n: 40, mode: HalfEven, want: "0.1428571428571428571428571428571428571429" },
+    { a: "1", b: "7", n: 40, mode: HalfUp, want: "0.1428571428571428571428571428571428571429" },
+    { a: "1", b: "7", n: 40, mode: Down, want: "0.1428571428571428571428571428571428571428" },
+    { a: "1", b: "7", n: 40, mode: Up, want: "0.1428571428571428571428571428571428571429" },
+    { a: "1", b: "7", n: 40, mode: Ceiling, want: "0.1428571428571428571428571428571428571429" },
+    { a: "1", b: "7", n: 40, mode: Floor, want: "0.1428571428571428571428571428571428571428" },
+    { a: "12345", b: "7", n: 0 - 2, mode: HalfEven, want: "1800" },
+    { a: "12345", b: "7", n: 0 - 2, mode: HalfUp, want: "1800" },
+    { a: "12345", b: "7", n: 0 - 2, mode: Down, want: "1700" },
+    { a: "12345", b: "7", n: 0 - 2, mode: Up, want: "1800" },
+    { a: "12345", b: "7", n: 0 - 2, mode: Ceiling, want: "1800" },
+    { a: "12345", b: "7", n: 0 - 2, mode: Floor, want: "1700" },
+    { a: "0.000123", b: "45.6", n: 9, mode: HalfEven, want: "0.000002697" },
+    { a: "0.000123", b: "45.6", n: 9, mode: HalfUp, want: "0.000002697" },
+    { a: "0.000123", b: "45.6", n: 9, mode: Down, want: "0.000002697" },
+    { a: "0.000123", b: "45.6", n: 9, mode: Up, want: "0.000002698" },
+    { a: "0.000123", b: "45.6", n: 9, mode: Ceiling, want: "0.000002698" },
+    { a: "0.000123", b: "45.6", n: 9, mode: Floor, want: "0.000002697" },
+  ]
+
+/// `a / b` at `n` significant digits: `divide` under a context of that precision.
+fn quotients_to_precision() -> List<Vector> =
+  [
+    { a: "1", b: "3", n: 9, mode: HalfEven, want: "0.333333333" },
+    { a: "1", b: "3", n: 9, mode: HalfUp, want: "0.333333333" },
+    { a: "1", b: "3", n: 9, mode: Down, want: "0.333333333" },
+    { a: "1", b: "3", n: 9, mode: Up, want: "0.333333334" },
+    { a: "1", b: "3", n: 9, mode: Ceiling, want: "0.333333334" },
+    { a: "1", b: "3", n: 9, mode: Floor, want: "0.333333333" },
+    { a: "2", b: "3", n: 9, mode: HalfEven, want: "0.666666667" },
+    { a: "2", b: "3", n: 9, mode: HalfUp, want: "0.666666667" },
+    { a: "2", b: "3", n: 9, mode: Down, want: "0.666666666" },
+    { a: "2", b: "3", n: 9, mode: Up, want: "0.666666667" },
+    { a: "2", b: "3", n: 9, mode: Ceiling, want: "0.666666667" },
+    { a: "2", b: "3", n: 9, mode: Floor, want: "0.666666666" },
+    { a: "-2", b: "3", n: 4, mode: HalfEven, want: "-0.6667" },
+    { a: "-2", b: "3", n: 4, mode: HalfUp, want: "-0.6667" },
+    { a: "-2", b: "3", n: 4, mode: Down, want: "-0.6666" },
+    { a: "-2", b: "3", n: 4, mode: Up, want: "-0.6667" },
+    { a: "-2", b: "3", n: 4, mode: Ceiling, want: "-0.6666" },
+    { a: "-2", b: "3", n: 4, mode: Floor, want: "-0.6667" },
+    { a: "1", b: "2", n: 9, mode: HalfEven, want: "0.5" },
+    { a: "1", b: "2", n: 9, mode: HalfUp, want: "0.5" },
+    { a: "1", b: "2", n: 9, mode: Down, want: "0.5" },
+    { a: "1", b: "2", n: 9, mode: Up, want: "0.5" },
+    { a: "1", b: "2", n: 9, mode: Ceiling, want: "0.5" },
+    { a: "1", b: "2", n: 9, mode: Floor, want: "0.5" },
+    { a: "1", b: "8", n: 2, mode: HalfEven, want: "0.12" },
+    { a: "1", b: "8", n: 2, mode: HalfUp, want: "0.13" },
+    { a: "1", b: "8", n: 2, mode: Down, want: "0.12" },
+    { a: "1", b: "8", n: 2, mode: Up, want: "0.13" },
+    { a: "1", b: "8", n: 2, mode: Ceiling, want: "0.13" },
+    { a: "1", b: "8", n: 2, mode: Floor, want: "0.12" },
+    { a: "-1", b: "8", n: 2, mode: HalfEven, want: "-0.12" },
+    { a: "-1", b: "8", n: 2, mode: HalfUp, want: "-0.13" },
+    { a: "-1", b: "8", n: 2, mode: Down, want: "-0.12" },
+    { a: "-1", b: "8", n: 2, mode: Up, want: "-0.13" },
+    { a: "-1", b: "8", n: 2, mode: Ceiling, want: "-0.12" },
+    { a: "-1", b: "8", n: 2, mode: Floor, want: "-0.13" },
+    { a: "100", b: "4", n: 9, mode: HalfEven, want: "25" },
+    { a: "100", b: "4", n: 9, mode: HalfUp, want: "25" },
+    { a: "100", b: "4", n: 9, mode: Down, want: "25" },
+    { a: "100", b: "4", n: 9, mode: Up, want: "25" },
+    { a: "100", b: "4", n: 9, mode: Ceiling, want: "25" },
+    { a: "100", b: "4", n: 9, mode: Floor, want: "25" },
+    { a: "2.400", b: "1.0", n: 9, mode: HalfEven, want: "2.40" },
+    { a: "2.400", b: "1.0", n: 9, mode: HalfUp, want: "2.40" },
+    { a: "2.400", b: "1.0", n: 9, mode: Down, want: "2.40" },
+    { a: "2.400", b: "1.0", n: 9, mode: Up, want: "2.40" },
+    { a: "2.400", b: "1.0", n: 9, mode: Ceiling, want: "2.40" },
+    { a: "2.400", b: "1.0", n: 9, mode: Floor, want: "2.40" },
+    { a: "9.99", b: "1", n: 2, mode: HalfEven, want: "10" },
+    { a: "9.99", b: "1", n: 2, mode: HalfUp, want: "10" },
+    { a: "9.99", b: "1", n: 2, mode: Down, want: "9.9" },
+    { a: "9.99", b: "1", n: 2, mode: Up, want: "10" },
+    { a: "9.99", b: "1", n: 2, mode: Ceiling, want: "10" },
+    { a: "9.99", b: "1", n: 2, mode: Floor, want: "9.9" },
+    { a: "-99.95", b: "1", n: 3, mode: HalfEven, want: "-100" },
+    { a: "-99.95", b: "1", n: 3, mode: HalfUp, want: "-100" },
+    { a: "-99.95", b: "1", n: 3, mode: Down, want: "-99.9" },
+    { a: "-99.95", b: "1", n: 3, mode: Up, want: "-100" },
+    { a: "-99.95", b: "1", n: 3, mode: Ceiling, want: "-99.9" },
+    { a: "-99.95", b: "1", n: 3, mode: Floor, want: "-100" },
+    {
+      a: "1",
+      b: "7",
+      n: 50,
+      mode: HalfEven,
+      want: "0.14285714285714285714285714285714285714285714285714",
+    },
+    {
+      a: "1",
+      b: "7",
+      n: 50,
+      mode: HalfUp,
+      want: "0.14285714285714285714285714285714285714285714285714",
+    },
+    {
+      a: "1",
+      b: "7",
+      n: 50,
+      mode: Down,
+      want: "0.14285714285714285714285714285714285714285714285714",
+    },
+    {
+      a: "1",
+      b: "7",
+      n: 50,
+      mode: Up,
+      want: "0.14285714285714285714285714285714285714285714285715",
+    },
+    {
+      a: "1",
+      b: "7",
+      n: 50,
+      mode: Ceiling,
+      want: "0.14285714285714285714285714285714285714285714285715",
+    },
+    {
+      a: "1",
+      b: "7",
+      n: 50,
+      mode: Floor,
+      want: "0.14285714285714285714285714285714285714285714285714",
+    },
+    { a: "123456789", b: "0.000013", n: 5, mode: HalfEven, want: "9496700000000" },
+    { a: "123456789", b: "0.000013", n: 5, mode: HalfUp, want: "9496700000000" },
+    { a: "123456789", b: "0.000013", n: 5, mode: Down, want: "9496600000000" },
+    { a: "123456789", b: "0.000013", n: 5, mode: Up, want: "9496700000000" },
+    { a: "123456789", b: "0.000013", n: 5, mode: Ceiling, want: "9496700000000" },
+    { a: "123456789", b: "0.000013", n: 5, mode: Floor, want: "9496600000000" },
+    { a: "0.00", b: "7", n: 5, mode: HalfEven, want: "0.00" },
+    { a: "0.00", b: "7", n: 5, mode: HalfUp, want: "0.00" },
+    { a: "0.00", b: "7", n: 5, mode: Down, want: "0.00" },
+    { a: "0.00", b: "7", n: 5, mode: Up, want: "0.00" },
+    { a: "0.00", b: "7", n: 5, mode: Ceiling, want: "0.00" },
+    { a: "0.00", b: "7", n: 5, mode: Floor, want: "0.00" },
+    { a: "5", b: "20000", n: 3, mode: HalfEven, want: "0.00025" },
+    { a: "5", b: "20000", n: 3, mode: HalfUp, want: "0.00025" },
+    { a: "5", b: "20000", n: 3, mode: Down, want: "0.00025" },
+    { a: "5", b: "20000", n: 3, mode: Up, want: "0.00025" },
+    { a: "5", b: "20000", n: 3, mode: Ceiling, want: "0.00025" },
+    { a: "5", b: "20000", n: 3, mode: Floor, want: "0.00025" },
+    { a: "1000", b: "3", n: 2, mode: HalfEven, want: "330" },
+    { a: "1000", b: "3", n: 2, mode: HalfUp, want: "330" },
+    { a: "1000", b: "3", n: 2, mode: Down, want: "330" },
+    { a: "1000", b: "3", n: 2, mode: Up, want: "340" },
+    { a: "1000", b: "3", n: 2, mode: Ceiling, want: "340" },
+    { a: "1000", b: "3", n: 2, mode: Floor, want: "330" },
+  ]
+
+/// The square root of `a` at `n` significant digits: `sqrt` under a context of that precision,
+/// which rounds half to even whatever the context says.
+fn roots_to_precision() -> List<Vector> =
+  [
+    { a: "2", b: "", n: 9, mode: HalfEven, want: "1.41421356" },
+    { a: "2", b: "", n: 40, mode: HalfEven, want: "1.414213562373095048801688724209698078570" },
+    { a: "4", b: "", n: 9, mode: HalfEven, want: "2" },
+    { a: "0.25", b: "", n: 9, mode: HalfEven, want: "0.5" },
+    { a: "6.25", b: "", n: 1, mode: HalfEven, want: "2" },
+    { a: "0.0625", b: "", n: 5, mode: HalfEven, want: "0.25" },
+    { a: "1000", b: "", n: 4, mode: HalfEven, want: "31.62" },
+    { a: "10", b: "", n: 7, mode: HalfEven, want: "3.162278" },
+    { a: "0.001", b: "", n: 6, mode: HalfEven, want: "0.0316228" },
+    { a: "99.99", b: "", n: 2, mode: HalfEven, want: "10" },
+    { a: "0.9999", b: "", n: 2, mode: HalfEven, want: "1.0" },
+    {
+      a: "152415787532388367501905199875019052100",
+      b: "",
+      n: 20,
+      mode: HalfEven,
+      want: "12345678901234567890",
+    },
+    { a: "7", b: "", n: 1, mode: HalfEven, want: "3" },
+    { a: "2.25", b: "", n: 1, mode: HalfEven, want: "2" },
+    { a: "12.25", b: "", n: 1, mode: HalfEven, want: "4" },
+    { a: "0", b: "", n: 5, mode: HalfEven, want: "0" },
+    { a: "0.00", b: "", n: 5, mode: HalfEven, want: "0.0" },
+    { a: "100", b: "", n: 9, mode: HalfEven, want: "10" },
+    { a: "123456789", b: "", n: 3, mode: HalfEven, want: "11100" },
+  ]
+
+/// `a` at `n` significant digits: `plus` under a context of that precision.
+fn roundings_to_precision() -> List<Vector> =
+  [
+    { a: "123.456", b: "", n: 4, mode: HalfEven, want: "123.5" },
+    { a: "123.456", b: "", n: 4, mode: HalfUp, want: "123.5" },
+    { a: "123.456", b: "", n: 4, mode: Down, want: "123.4" },
+    { a: "123.456", b: "", n: 4, mode: Up, want: "123.5" },
+    { a: "123.456", b: "", n: 4, mode: Ceiling, want: "123.5" },
+    { a: "123.456", b: "", n: 4, mode: Floor, want: "123.4" },
+    { a: "-123.456", b: "", n: 4, mode: HalfEven, want: "-123.5" },
+    { a: "-123.456", b: "", n: 4, mode: HalfUp, want: "-123.5" },
+    { a: "-123.456", b: "", n: 4, mode: Down, want: "-123.4" },
+    { a: "-123.456", b: "", n: 4, mode: Up, want: "-123.5" },
+    { a: "-123.456", b: "", n: 4, mode: Ceiling, want: "-123.4" },
+    { a: "-123.456", b: "", n: 4, mode: Floor, want: "-123.5" },
+    { a: "0.0012345", b: "", n: 2, mode: HalfEven, want: "0.0012" },
+    { a: "0.0012345", b: "", n: 2, mode: HalfUp, want: "0.0012" },
+    { a: "0.0012345", b: "", n: 2, mode: Down, want: "0.0012" },
+    { a: "0.0012345", b: "", n: 2, mode: Up, want: "0.0013" },
+    { a: "0.0012345", b: "", n: 2, mode: Ceiling, want: "0.0013" },
+    { a: "0.0012345", b: "", n: 2, mode: Floor, want: "0.0012" },
+    { a: "9.99", b: "", n: 2, mode: HalfEven, want: "10" },
+    { a: "9.99", b: "", n: 2, mode: HalfUp, want: "10" },
+    { a: "9.99", b: "", n: 2, mode: Down, want: "9.9" },
+    { a: "9.99", b: "", n: 2, mode: Up, want: "10" },
+    { a: "9.99", b: "", n: 2, mode: Ceiling, want: "10" },
+    { a: "9.99", b: "", n: 2, mode: Floor, want: "9.9" },
+    { a: "-9.95", b: "", n: 2, mode: HalfEven, want: "-10" },
+    { a: "-9.95", b: "", n: 2, mode: HalfUp, want: "-10" },
+    { a: "-9.95", b: "", n: 2, mode: Down, want: "-9.9" },
+    { a: "-9.95", b: "", n: 2, mode: Up, want: "-10" },
+    { a: "-9.95", b: "", n: 2, mode: Ceiling, want: "-9.9" },
+    { a: "-9.95", b: "", n: 2, mode: Floor, want: "-10" },
+    { a: "12345", b: "", n: 2, mode: HalfEven, want: "12000" },
+    { a: "12345", b: "", n: 2, mode: HalfUp, want: "12000" },
+    { a: "12345", b: "", n: 2, mode: Down, want: "12000" },
+    { a: "12345", b: "", n: 2, mode: Up, want: "13000" },
+    { a: "12345", b: "", n: 2, mode: Ceiling, want: "13000" },
+    { a: "12345", b: "", n: 2, mode: Floor, want: "12000" },
+    { a: "125", b: "", n: 2, mode: HalfEven, want: "120" },
+    { a: "125", b: "", n: 2, mode: HalfUp, want: "130" },
+    { a: "125", b: "", n: 2, mode: Down, want: "120" },
+    { a: "125", b: "", n: 2, mode: Up, want: "130" },
+    { a: "125", b: "", n: 2, mode: Ceiling, want: "130" },
+    { a: "125", b: "", n: 2, mode: Floor, want: "120" },
+    { a: "135", b: "", n: 2, mode: HalfEven, want: "140" },
+    { a: "135", b: "", n: 2, mode: HalfUp, want: "140" },
+    { a: "135", b: "", n: 2, mode: Down, want: "130" },
+    { a: "135", b: "", n: 2, mode: Up, want: "140" },
+    { a: "135", b: "", n: 2, mode: Ceiling, want: "140" },
+    { a: "135", b: "", n: 2, mode: Floor, want: "130" },
+    { a: "-0.5", b: "", n: 1, mode: HalfEven, want: "-0.5" },
+    { a: "-0.5", b: "", n: 1, mode: HalfUp, want: "-0.5" },
+    { a: "-0.5", b: "", n: 1, mode: Down, want: "-0.5" },
+    { a: "-0.5", b: "", n: 1, mode: Up, want: "-0.5" },
+    { a: "-0.5", b: "", n: 1, mode: Ceiling, want: "-0.5" },
+    { a: "-0.5", b: "", n: 1, mode: Floor, want: "-0.5" },
+    { a: "1.5", b: "", n: 5, mode: HalfEven, want: "1.5" },
+    { a: "1.5", b: "", n: 5, mode: HalfUp, want: "1.5" },
+    { a: "1.5", b: "", n: 5, mode: Down, want: "1.5" },
+    { a: "1.5", b: "", n: 5, mode: Up, want: "1.5" },
+    { a: "1.5", b: "", n: 5, mode: Ceiling, want: "1.5" },
+    { a: "1.5", b: "", n: 5, mode: Floor, want: "1.5" },
+    { a: "999999", b: "", n: 3, mode: HalfEven, want: "1000000" },
+    { a: "999999", b: "", n: 3, mode: HalfUp, want: "1000000" },
+    { a: "999999", b: "", n: 3, mode: Down, want: "999000" },
+    { a: "999999", b: "", n: 3, mode: Up, want: "1000000" },
+    { a: "999999", b: "", n: 3, mode: Ceiling, want: "1000000" },
+    { a: "999999", b: "", n: 3, mode: Floor, want: "999000" },
+  ]
+
+/// `a` at the scale of `b`: `quantize`.
+fn quantizings() -> List<Vector> =
+  [
+    { a: "2.5", b: "1", n: 0, mode: HalfEven, want: "2" },
+    { a: "2.5", b: "1", n: 0, mode: HalfUp, want: "3" },
+    { a: "2.5", b: "1", n: 0, mode: Down, want: "2" },
+    { a: "2.5", b: "1", n: 0, mode: Up, want: "3" },
+    { a: "2.5", b: "1", n: 0, mode: Ceiling, want: "3" },
+    { a: "2.5", b: "1", n: 0, mode: Floor, want: "2" },
+    { a: "-2.5", b: "1", n: 0, mode: HalfEven, want: "-2" },
+    { a: "-2.5", b: "1", n: 0, mode: HalfUp, want: "-3" },
+    { a: "-2.5", b: "1", n: 0, mode: Down, want: "-2" },
+    { a: "-2.5", b: "1", n: 0, mode: Up, want: "-3" },
+    { a: "-2.5", b: "1", n: 0, mode: Ceiling, want: "-2" },
+    { a: "-2.5", b: "1", n: 0, mode: Floor, want: "-3" },
+    { a: "3.5", b: "1", n: 0, mode: HalfEven, want: "4" },
+    { a: "3.5", b: "1", n: 0, mode: HalfUp, want: "4" },
+    { a: "3.5", b: "1", n: 0, mode: Down, want: "3" },
+    { a: "3.5", b: "1", n: 0, mode: Up, want: "4" },
+    { a: "3.5", b: "1", n: 0, mode: Ceiling, want: "4" },
+    { a: "3.5", b: "1", n: 0, mode: Floor, want: "3" },
+    { a: "1.2345", b: "0.01", n: 0, mode: HalfEven, want: "1.23" },
+    { a: "1.2345", b: "0.01", n: 0, mode: HalfUp, want: "1.23" },
+    { a: "1.2345", b: "0.01", n: 0, mode: Down, want: "1.23" },
+    { a: "1.2345", b: "0.01", n: 0, mode: Up, want: "1.24" },
+    { a: "1.2345", b: "0.01", n: 0, mode: Ceiling, want: "1.24" },
+    { a: "1.2345", b: "0.01", n: 0, mode: Floor, want: "1.23" },
+    { a: "-1.2355", b: "0.001", n: 0, mode: HalfEven, want: "-1.236" },
+    { a: "-1.2355", b: "0.001", n: 0, mode: HalfUp, want: "-1.236" },
+    { a: "-1.2355", b: "0.001", n: 0, mode: Down, want: "-1.235" },
+    { a: "-1.2355", b: "0.001", n: 0, mode: Up, want: "-1.236" },
+    { a: "-1.2355", b: "0.001", n: 0, mode: Ceiling, want: "-1.235" },
+    { a: "-1.2355", b: "0.001", n: 0, mode: Floor, want: "-1.236" },
+    { a: "1.5", b: "0.0000", n: 0, mode: HalfEven, want: "1.5000" },
+    { a: "1.5", b: "0.0000", n: 0, mode: HalfUp, want: "1.5000" },
+    { a: "1.5", b: "0.0000", n: 0, mode: Down, want: "1.5000" },
+    { a: "1.5", b: "0.0000", n: 0, mode: Up, want: "1.5000" },
+    { a: "1.5", b: "0.0000", n: 0, mode: Ceiling, want: "1.5000" },
+    { a: "1.5", b: "0.0000", n: 0, mode: Floor, want: "1.5000" },
+    { a: "0.05", b: "0.1", n: 0, mode: HalfEven, want: "0.0" },
+    { a: "0.05", b: "0.1", n: 0, mode: HalfUp, want: "0.1" },
+    { a: "0.05", b: "0.1", n: 0, mode: Down, want: "0.0" },
+    { a: "0.05", b: "0.1", n: 0, mode: Up, want: "0.1" },
+    { a: "0.05", b: "0.1", n: 0, mode: Ceiling, want: "0.1" },
+    { a: "0.05", b: "0.1", n: 0, mode: Floor, want: "0.0" },
+    { a: "-0.15", b: "0.1", n: 0, mode: HalfEven, want: "-0.2" },
+    { a: "-0.15", b: "0.1", n: 0, mode: HalfUp, want: "-0.2" },
+    { a: "-0.15", b: "0.1", n: 0, mode: Down, want: "-0.1" },
+    { a: "-0.15", b: "0.1", n: 0, mode: Up, want: "-0.2" },
+    { a: "-0.15", b: "0.1", n: 0, mode: Ceiling, want: "-0.1" },
+    { a: "-0.15", b: "0.1", n: 0, mode: Floor, want: "-0.2" },
+    { a: "12", b: "0.00", n: 0, mode: HalfEven, want: "12.00" },
+    { a: "12", b: "0.00", n: 0, mode: HalfUp, want: "12.00" },
+    { a: "12", b: "0.00", n: 0, mode: Down, want: "12.00" },
+    { a: "12", b: "0.00", n: 0, mode: Up, want: "12.00" },
+    { a: "12", b: "0.00", n: 0, mode: Ceiling, want: "12.00" },
+    { a: "12", b: "0.00", n: 0, mode: Floor, want: "12.00" },
+  ]
+
+test "{c.a} / {c.b} at {c.n} places, {c.mode}" for c: Vector in quotients_at_places() {
+  assert_eq(text_of(div(dec(c.a), dec(c.b), c.n, c.mode)), c.want)
+}
+
+test "{c.a} / {c.b} to {c.n} digits, {c.mode}" for c: Vector in quotients_to_precision() {
+  assert_eq(text_of(div_to_precision(dec(c.a), dec(c.b), c.n, c.mode)), c.want)
+}
+
+test "the root of {c.a} to {c.n} digits" for c: Vector in roots_to_precision() {
+  assert_eq(text_of(sqrt_to_precision(dec(c.a), c.n, c.mode)), c.want)
+}
+
+test "{c.a} to {c.n} digits, {c.mode}" for c: Vector in roundings_to_precision() {
+  assert_eq(to_string(round_to_precision(dec(c.a), c.n, c.mode)), c.want)
+}
+
+test "{c.a} at the scale of {c.b}, {c.mode}" for c: Vector in quantizings() {
+  assert_eq(to_string(quantize(dec(c.a), dec(c.b), c.mode)), c.want)
+}
+
+test "a zero divisor and a root below zero have no answer, and an exact quotient need not exist" {
+  assert_eq(div(one(), zero(), 5, HalfEven), None);
+  assert_eq(div(one(), dec("0.00"), 5, HalfEven), None);
+  assert_eq(div_to_precision(one(), zero(), 5, HalfEven), None);
+  assert_eq(div_exact(one(), zero()), None);
+  assert_eq(text_of(div_exact(dec("1"), dec("8"))), "0.125");
+  assert_eq(text_of(div_exact(dec("-7.5"), dec("0.25"))), "-30");
+  assert_eq(text_of(div_exact(dec("1"), dec("1024"))), "0.0009765625");
+  assert_eq(div_exact(dec("1"), dec("3")), None);
+  assert_eq(sqrt(dec("-0.01"), 5, HalfEven), None);
+  assert_eq(sqrt_to_precision(dec("-4"), 5, HalfEven), None);
+  assert_eq(text_of(sqrt(dec("2"), 10, Down)), "1.4142135623");
+  assert_eq(text_of(sqrt(dec("2"), 10, Up)), "1.4142135624");
+  assert_eq(text_of(sqrt(dec("4"), 3, Up)), "2.000");
+  assert_eq(text_of(sqrt(dec("152399025"), 0 - 2, HalfUp)), "12300")
+}
+
+test "rounding to places leaves a shorter value alone, and rescaling writes its zeros" {
+  assert_eq(to_string(round(dec("1.5"), 3, Down)), "1.5");
+  assert_eq(to_string(rescale(dec("1.5"), 3, Down)), "1.500");
+  assert_eq(to_string(round(dec("1.2345"), 2, HalfEven)), "1.23");
+  assert_eq(to_string(round(dec("12345"), 0 - 2, HalfEven)), "12300");
+  assert_eq(to_string(rescale(dec("12355.5"), 0 - 1, HalfUp)), "12360");
+  assert_eq(to_string(strip_trailing_zeros(dec("1.500"))), "1.5");
+  assert_eq(to_string(strip_trailing_zeros(dec("200.00"))), "200");
+  assert_eq(to_string(strip_trailing_zeros(dec("0.000"))), "0");
+  assert_eq(to_string(strip_trailing_zeros(dec("-0.0120"))), "-0.012")
+}
+
+test "a number is read plain or with an exponent, and written either way" {
+  assert_eq(to_string(dec("123.45")), "123.45");
+  assert_eq(to_string(dec("+.5")), "0.5");
+  assert_eq(to_string(dec("5.")), "5");
+  assert_eq(to_string(dec("-0.00")), "0.00");
+  assert_eq(to_string(dec("1.5E2")), "150");
+  assert_eq(to_string(dec("1.50e-3")), "0.00150");
+  assert_eq(to_string(dec("12e+3")), "12000");
+  assert_eq(to_string(dec("0e-5")), "0.00000");
+  assert_eq(
+    map(["123.45", "1.50", "0.00", "0", "-0.0012", "12345678901234567890", "100"], |t: String|
+      to_scientific(dec(t))),
+    ["1.2345E+2", "1.50E+0", "0E-2", "0E+0", "-1.2E-3", "1.2345678901234567890E+19", "1.00E+2"],
+  );
+  assert_eq(parse("1e400", 400), Ok(of_parts(bigint::one(), 0 - 400)));
+  assert_eq(scale(dec("1e-400")), 400)
+}
+
+type Refused = { text: String, at: Int, why: Why }
+
+fn refusals() -> List<Refused> =
+  [
+    { text: "", at: 0, why: Stray },
+    { text: "-", at: 1, why: Stray },
+    { text: ".", at: 1, why: Stray },
+    { text: "x", at: 0, why: Stray },
+    { text: "1x", at: 1, why: Stray },
+    { text: "1.2.3", at: 3, why: Stray },
+    { text: "--1", at: 1, why: Stray },
+    { text: "1e", at: 2, why: Stray },
+    { text: "1e+", at: 3, why: Stray },
+    { text: "1e5x", at: 3, why: Stray },
+    { text: "1 000", at: 1, why: Stray },
+    { text: "1e401", at: 2, why: TooWide },
+    { text: "1e-401", at: 2, why: TooWide },
+    { text: "1e99999999999999999999", at: 2, why: TooWide },
+  ]
+
+test "`{c.text}` names no decimal number" for c: Refused in refusals() {
+  assert_eq(parse(c.text, 400), Err({ at: c.at, why: c.why }))
+}
+
+test "a literal's check answers the number, or where the text stops being one" {
+  assert_eq(result_ok(literal("-1.50")), Some(dec("-1.50")));
+  assert_eq(
+    literal("1,5"),
+    Err({
+      message: "a decimal number is digits, with an optional sign, point and exponent",
+      offset: 1,
+    }),
+  );
+  assert_eq(
+    literal("1e7000"),
+    Err({ message: "an exponent is at most 6144 either way", offset: 2 }),
+  )
+}
+
+test "a Decimal keeps its scale both ways, and a value past one is refused" {
+  assert_eq(to_string(of_decimal(1.50m)), "1.50");
+  assert_eq(to_string(of_decimal(0m - 0.0070m)), "-0.0070");
+  assert_eq(option_map(to_decimal(dec("1.50")), decimal_to_string), Some("1.50"));
+  assert_eq(
+    option_map(to_decimal(dec("-79228162514264337593543950335")), decimal_to_string),
+    Some("-79228162514264337593543950335"),
+  );
+  assert_eq(to_decimal(dec("79228162514264337593543950336")), None);
+  assert_eq(to_decimal(dec("0.00000000000000000000000000001")), None);
+  // Thirty digits after the point that a Decimal need not hold.
+  assert_eq(
+    option_map(to_decimal(dec("2.500000000000000000000000000000")), decimal_to_string),
+    Some("2.5"),
+  )
+}
+
+test "a fraction and a Float are exact one way and rounded the other" {
+  assert_eq(to_rational(dec("0.75")), fraction("3/4"));
+  assert_eq(text_of(of_rational_exact(fraction("-3/8"))), "-0.375");
+  assert_eq(of_rational_exact(fraction("1/3")), None);
+  assert_eq(to_string(of_rational(fraction("2/3"), 4, HalfEven)), "0.6667");
+  assert_eq(to_string(of_rational(fraction("-2/3"), 0 - 1, Up)), "-10");
+  assert_eq(text_of(of_float(0.1)), "0.1000000000000000055511151231257827021181583404541015625");
+  assert_eq(text_of(of_float(0.0 - 2.5)), "-2.5");
+  assert_eq(of_float(0.0 / 0.0), None);
+  assert_eq(to_float(dec("0.1")), 0.1);
+  assert_eq(to_float(dec("-1e-400")), 0.0);
+  assert_eq(to_float(dec("123456789012345678901234567890")), 1.2345678901234568e29)
+}
+
+/// The fraction a text names, for a test that writes one.
+fn fraction(text: String) -> Rational / {abort.raise} =
+  match rational::parse(text) { Ok(r) -> r, Err(_) -> panic("a fraction") }
+
+/// A value past a `Decimal` from three `Int`s a law draws: the product of two as its digits, and
+/// up to sixty-three of them after the point.
+type Wide = { high: Int, low: Int, places: Int }
+
+fn made(w: Wide) -> BigDecimal =
+  of_parts(bigint::of_int(w.high) * bigint::of_int(w.low), w.places & 63)
+
+/// Two `Decimal`s a law draws from `Int`s, small enough that a `Decimal` holds their sum and
+/// product, with the places and the mode an operation is told.
+type Drawn = { a: Int, b: Int, scales: Int, mode: Rounding }
+
+fn first(c: Drawn) -> Decimal / {abort.raise} =
+  match decimal::of_parts(c.a >> 34, c.scales & 7) {
+    Some(d) -> d,
+    None -> panic("a scale in range"),
+  }
+
+fn second(c: Drawn) -> Decimal / {abort.raise} =
+  match decimal::of_parts(c.b >> 34, c.scales >> 3 & 7) {
+    Some(d) -> d,
+    None -> panic("a scale in range"),
+  }
+
+fn places_of(c: Drawn) -> Int = c.scales >> 6 & 15
+
+law "a sum, a difference and a product are a Decimal's, digit for digit"
+  forall (c: Drawn) {
+    let product = of_decimal(first(c)) * of_decimal(second(c));
+    to_string(of_decimal(first(c)) + of_decimal(second(c)))
+      == decimal_to_string(first(c) + second(c))
+      && to_string(of_decimal(first(c)) - of_decimal(second(c)))
+      == decimal_to_string(first(c) - second(c))
+      && product == of_decimal(first(c) * second(c))
+      && (is_zero(product) || to_string(product) == decimal_to_string(first(c) * second(c)))
+  }
+
+law "a quotient at a scale is decimal_div's under every mode, written to the scale"
+  forall (c: Drawn) {
+    match div(of_decimal(first(c)), of_decimal(second(c)), places_of(c), c.mode) {
+      Some(q) ->
+        scale(q) == places_of(c)
+          && q == of_decimal(decimal_div(first(c), second(c), places_of(c), c.mode)),
+      None -> second(c) == 0m,
+    }
+  }
+
+law "a value rounded to a scale is decimal_round's under every mode"
+  forall (c: Drawn) {
+    to_string(round(of_decimal(first(c)), places_of(c), c.mode))
+      == decimal_to_string(decimal_round(first(c), places_of(c), c.mode))
+  }
+
+law "two values compare, and are equal, as their Decimals do"
+  forall (c: Drawn) {
+    compare(of_decimal(first(c)), of_decimal(second(c))) == compare_values(first(c), second(c))
+      && compare_values(of_decimal(first(c)), of_decimal(second(c)))
+      == compare_values(first(c), second(c))
+      && of_decimal(first(c)) == of_decimal(second(c)) == (first(c) == second(c))
+  }
+
+law "a Decimal reads back from its value at its own scale"
+  forall (d: Decimal) {
+    match to_decimal(of_decimal(d)) {
+      Some(back) -> decimal_to_string(back) == decimal_to_string(d),
+      None -> false,
+    }
+  }
+
+law "the key reads no scale, and orders as comparing does"
+  forall (x: Wide, y: Wide) {
+    made(x) == rescale(made(x), 70, Down) && digest(made(x)) == digest(rescale(made(x), 70, Down))
+      && compare_values(made(x), made(y)) == compare(made(x), made(y))
+  }
+
+law "comparing is a total order"
+  forall (x: Wide, y: Wide, z: Wide) {
+    total_order(compare, made(x), made(y), made(z))
+  }
+
+law "addition is a monoid over zero"
+  forall (x: Wide, y: Wide, z: Wide) {
+    monoid(add, zero(), made(x), made(y), made(z))
+  }
+
+law "multiplication is a monoid over one, and distributes over addition"
+  forall (x: Wide, y: Wide, z: Wide) {
+    monoid(mul, one(), made(x), made(y), made(z))
+      && made(x) * (made(y) + made(z)) == made(x) * made(y) + made(x) * made(z)
+  }
+
+law "a value reads back from its text, plain and scientific, at its scale"
+  forall (x: Wide) {
+    (match parse(to_string(made(x)), 0) {
+        Ok(back) -> back == made(x) && scale(back) == scale(made(x)),
+        Err(_) -> false,
+      })
+      && (match parse(to_scientific(made(x)), 200) {
+        Ok(back) -> back == made(x) && scale(back) == scale(made(x)),
+        Err(_) -> false,
+      })
+  }
+
+law "a value is the fraction it names, and reads back from it"
+  forall (x: Wide) {
+    of_rational_exact(to_rational(made(x))) == Some(made(x))
+      && of_rational(to_rational(made(x)), scale(made(x)), Down) == made(x)
+  }
+
+law "a finite Float reads back from its value, and no other Float has one"
+  forall (f: Float) {
+    match of_float(f) { Some(value) -> to_float(value) == f, None -> f != f || f - f != 0.0 }
+  }
+
+law "a root rounded down squares to the last value at or below, at every scale"
+  forall (x: Wide) {
+    let value = abs(made(x));
+    let places = x.places >> 6 & 15;
+    match sqrt(value, places, Down) {
+      Some(r) ->
+        compare(r * r, value) != Greater
+          && compare(
+            value,
+            (r + of_parts(bigint::one(), places)) * (r + of_parts(bigint::one(), places)),
+          )
+          == Less,
+      None -> false,
+    }
+  }
+
+law "a quotient times its divisor is within one last place of the dividend's worth"
+  forall (x: Wide, y: Wide, mode: Rounding) {
+    let places = x.places >> 6 & 31;
+    match div(made(x), made(y), places, mode) {
+      Some(q) ->
+        compare(abs(q * made(y) - made(x)), abs(made(y)) * of_parts(bigint::one(), places)) == Less,
+      None -> is_zero(made(y)),
+    }
+  }
