@@ -2,7 +2,16 @@
 //!
 //! `Result`'s constructors are the prelude's (`Ok`, `Err`) and `?` propagates one. The combinators are
 //! `result_`-prefixed for the same reason `option`'s are: `map` is a name a program already has.
-//! `result_all` reads a whole list of results or answers the first failure.
+//!
+//! Over a list there are two policies. One ends at the first failure: `result_all` reads nothing
+//! past it, and `result_traverse` and `result_try_fold` call their callback for nothing past it;
+//! those two are a `fold` underneath, so a definition that recurses through the callback is seen to
+//! end as it is through `fold`. The other reads every element and answers every failure, which is
+//! what validating a form or a configuration file wants: `result_partition` and
+//! `result_accumulate`.
+
+import std.laws (agrees, inverse)
+import std.list (first, somes)
 
 /// The success through `f`; a failure passes through.
 pub fn result_map<a, b, e | row>(r: Result<a, e>, f: (a) -> b / row) -> Result<b, e> / row bounded =
@@ -62,13 +71,72 @@ pub fn result_map_or<a, b, e | row>(
   f: (a) -> b / row,
 ) -> b / row bounded = match r { Ok(x) -> f(x), Err(_) -> fallback }
 
-/// Every success in order, or the first failure.
-pub fn result_all<a, e>(rs: List<Result<a, e>>) -> Result<List<a>, e> =
-  fold(rs, Ok([]), |acc: Result<List<a>, e>, r: Result<a, e>|
-    match acc {
-      Err(e) -> Err(e),
-      Ok(xs) -> match r { Ok(x) -> Ok(push(xs, x)), Err(e) -> Err(e) },
+/// The result a success holds; a failure at either layer is the failure.
+pub fn result_flatten<a, e>(r: Result<Result<a, e>, e>) -> Result<a, e> =
+  match r { Ok(inner) -> inner, Err(e) -> Err(e) }
+
+/// Both successes as a pair, or the failure: `r`'s where both failed.
+pub fn result_zip<a, b, e>(r: Result<a, e>, s: Result<b, e>) -> Result<(a, b), e> =
+  match r { Err(e) -> Err(e), Ok(x) -> match s { Err(e) -> Err(e), Ok(y) -> Ok((x, y)) } }
+
+/// The layers the other way round: a success that holds nothing is nothing, and a failure is a
+/// failure that is there. `std.option`'s `option_transpose` goes back.
+pub fn result_transpose<a, e>(r: Result<Option<a>, e>) -> Option<Result<a, e>> =
+  match r { Ok(None) -> None, Ok(Some(x)) -> Some(Ok(x)), Err(e) -> Some(Err(e)) }
+
+/// A fold whose step may fail: `f` of the state and each element in order, or the first failure.
+/// `f` is not called for what follows.
+pub fn result_try_fold<a, s, e | row>(
+  xs: List<a>,
+  init: s,
+  f: (s, a) -> Result<s, e> / row cost k,
+) -> Result<s, e> / row
+  cost len(xs) * k
+=
+  fold(xs, Ok(init), |acc: Result<s, e>, x: a|
+    match acc { Err(e) -> Err(e), Ok(state) -> f(state, x) })
+
+/// `f` of each element in order, or the first failure. `f` is not called past its first failure.
+pub fn result_traverse<a, b, e | row>(
+  xs: List<a>,
+  f: (a) -> Result<b, e> / row cost k,
+) -> Result<List<b>, e> / row
+  cost len(xs) * k
+=
+  result_try_fold(xs, [], |done: List<b>, x: a|
+    match f(x) { Err(e) -> Err(e), Ok(y) -> Ok(push(done, y)) })
+
+/// Every success in order, or the first failure. What follows the first failure is not read.
+pub fn result_all<a, e>(rs: List<Result<a, e>>) -> Result<List<a>, e>
+  cost len(rs)
+= all_onto(rs, [])
+
+fn all_onto<a, e>(rs: List<Result<a, e>>, done: List<a>) -> Result<List<a>, e> =
+  match rs {
+    [] -> Ok(done),
+    [Err(e), ..] -> Err(e),
+    [Ok(x), ..rest] -> all_onto(rest, push(done, x)),
+  }
+
+/// The successes and the failures apart, each in the order it came.
+pub fn result_partition<a, e>(rs: List<Result<a, e>>) -> { oks: List<a>, errs: List<e> }
+  cost len(rs)
+=
+  fold(rs, { oks: [], errs: [] }, |acc: { oks: List<a>, errs: List<e> }, r: Result<a, e>|
+    match r {
+      Ok(x) -> { oks: push(acc.oks, x), errs: acc.errs },
+      Err(e) -> { oks: acc.oks, errs: push(acc.errs, e) },
     })
+
+/// Every success in order, or every failure in order where there is one. `result_all` answers the
+/// first of them and stops; this reads the whole list, so a caller can report all that is wrong
+/// at once.
+pub fn result_accumulate<a, e>(rs: List<Result<a, e>>) -> Result<List<a>, List<e>>
+  cost len(rs)
+= {
+  let parts = result_partition(rs);
+  if len(parts.errs) == 0 { Ok(parts.oks) } else { Err(parts.errs) }
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -122,3 +190,149 @@ test "a callback may perform effects, and runs only where the value calls for it
   } };
   assert_eq(calls, 2)
 }
+
+test "a nested result flattens to its inner one, and a failure at either layer is the failure" {
+  let both: Result<Result<Int, String>, String> = Ok(Ok(1));
+  assert_eq(result_flatten(both), Ok(1));
+  let inner: Result<Result<Int, String>, String> = Ok(Err("inner"));
+  assert_eq(result_flatten(inner), Err("inner"));
+  let outer: Result<Result<Int, String>, String> = Err("outer");
+  assert_eq(result_flatten(outer), Err("outer"))
+}
+
+test "two results zip into a pair, or the first of their failures" {
+  let one: Result<Int, String> = Ok(1);
+  let word: Result<String, String> = Ok("one");
+  assert_eq(result_zip(one, word), Ok((1, "one")));
+  assert_eq(result_zip(one, Err("right")), Err("right"));
+  assert_eq(result_zip(Err("left"), word), Err("left"));
+  let left: Result<Int, String> = Err("left");
+  let right: Result<Int, String> = Err("right");
+  assert_eq(result_zip(left, right), Err("left"))
+}
+
+test "the layers of an optional success swap" {
+  let found: Result<Option<Int>, String> = Ok(Some(1));
+  assert_eq(result_transpose(found), Some(Ok(1)));
+  let absent: Result<Option<Int>, String> = Ok(None);
+  assert_eq(result_transpose(absent), None);
+  let failed: Result<Option<Int>, String> = Err("bad");
+  assert_eq(result_transpose(failed), Some(Err("bad")))
+}
+
+test "a traverse maps and gathers, and a fold threads its state until a step fails" {
+  assert_eq(result_traverse([1, 2, 3], halved), Err("1 is odd"));
+  assert_eq(result_traverse([2, 4, 6], halved), Ok([1, 2, 3]));
+  let none: List<Int> = [];
+  assert_eq(result_traverse(none, halved), Ok([]));
+  let summed = |sum: Int, x: Int| if x < 0 { Err(x) } else { Ok(sum + x) };
+  assert_eq(result_try_fold([1, 2, 3], 10, summed), Ok(16));
+  assert_eq(result_try_fold([1, 0 - 2, 0 - 3], 10, summed), Err(0 - 2))
+}
+
+test "a walk calls nothing past the first element that fails" {
+  let calls = with_cell[calls](0) { c -> {
+    let seen = |x: Int| {
+      cell_update(c, |n: Int| n + 1);
+      halved(x)
+    };
+    assert_eq(result_traverse([2, 4, 5, 6, 7], seen), Err("5 is odd"));
+    cell_get(c)
+  } };
+  assert_eq(calls, 3)
+}
+
+test "a failure at the front ends the walk in the same steps whatever follows it" {
+  let short = failed_first(4);
+  let long = failed_first(4000);
+  assert_eq(metered(|| result_all(long)).steps, metered(|| result_all(short)).steps)
+}
+
+test "a partition keeps both sides in order, and accumulating answers every failure" {
+  let mixed = [Ok(1), Err("second"), Ok(3), Err("fourth")];
+  assert_eq(result_partition(mixed), { oks: [1, 3], errs: ["second", "fourth"] });
+  assert_eq(result_accumulate(mixed), Err(["second", "fourth"]));
+  let clean: List<Result<Int, String>> = [Ok(1), Ok(2)];
+  assert_eq(result_accumulate(clean), Ok([1, 2]));
+  let none: List<Result<Int, String>> = [];
+  assert_eq(result_accumulate(none), Ok([]));
+  assert_eq(result_partition(none), { oks: [], errs: [] })
+}
+
+type Nested = | Leaf(Int) | Branch(List<Nested>)
+
+/// The leaves halved, in order, or the first odd one: a recursion through `result_traverse`.
+fn halves(t: Nested) -> Result<List<Int>, String> =
+  match t {
+    Leaf(n) -> result_map(halved(n), |half: Int| [half]),
+    Branch(kids) ->
+      result_map(result_traverse(kids, halves), |found: List<List<Int>>|
+        fold(found, [], |all: List<Int>, some: List<Int>|
+          fold(some, all, |acc: List<Int>, n: Int| push(acc, n)))),
+  }
+
+test "a definition that recurses through a traverse is seen to end" {
+  assert_eq(halves(Branch([Leaf(2), Branch([Leaf(4), Leaf(6)]), Leaf(8)])), Ok([1, 2, 3, 4]));
+  assert_eq(halves(Branch([Leaf(2), Branch([Leaf(5), Leaf(7)])])), Err("5 is odd"))
+}
+
+fn halved(x: Int) -> Result<Int, String> =
+  if x % 2 == 0 { Ok(x / 2) } else { Err(int_to_string(x) ++ " is odd") }
+
+fn failed_first(n: Int) -> List<Result<Int, Int>> =
+  map(range(0, n), |i: Int| if i == 0 { Err(i) } else { Ok(i) })
+
+/// What `result_all` answers, by a fold that reads every element.
+fn all_by_fold(rs: List<Result<Int, Bool>>) -> Result<List<Int>, Bool> =
+  fold(rs, Ok([]), |acc: Result<List<Int>, Bool>, r: Result<Int, Bool>|
+    match acc {
+      Err(e) -> Err(e),
+      Ok(xs) -> match r { Ok(x) -> Ok(push(xs, x)), Err(e) -> Err(e) },
+    })
+
+law "result_all answers what a fold over every element does" = agrees(result_all, all_by_fold)
+
+law "a traverse is the map and then result_all"
+  forall (xs: List<Int>) {
+    result_traverse(xs, halved) == result_all(map(xs, halved))
+  }
+
+law "a fold whose step never fails is the fold"
+  forall (xs: List<Int>) {
+    let kept: Result<List<Int>, Bool> = result_try_fold(xs, [], |done: List<Int>, x: Int|
+      Ok(push(done, x)));
+    kept == Ok(xs)
+  }
+
+law "a partition is the successes and the failures, each as a filter keeps them"
+  forall (rs: List<Result<Int, Bool>>) {
+    result_partition(rs) == { oks: somes(map(rs, result_ok)), errs: somes(map(rs, result_err)) }
+  }
+
+law "accumulating answers every failure, of which result_all answers the first"
+  forall (rs: List<Result<Int, Bool>>) {
+    match result_accumulate(rs) {
+      Ok(xs) -> result_all(rs) == Ok(xs),
+      Err(es) -> es == result_partition(rs).errs && result_err(result_all(rs)) == first(es),
+    }
+  }
+
+law "a result wrapped in a success flattens to itself" =
+  inverse(|r: Result<Int, Bool>| Ok(r), result_flatten)
+
+law "a zip holds both successes, or the failure a walk over the two meets first"
+  forall (r: Result<Int, Bool>, s: Result<Int, Bool>) {
+    match result_zip(r, s) {
+      Ok(pair) -> r == Ok(pair._0) && s == Ok(pair._1),
+      Err(e) -> result_all([r, s]) == Err(e),
+    }
+  }
+
+law "a transpose keeps what each layer held"
+  forall (r: Result<Option<Int>, Bool>) {
+    match result_transpose(r) {
+      None -> r == Ok(None),
+      Some(Ok(x)) -> r == Ok(Some(x)),
+      Some(Err(e)) -> r == Err(e),
+    }
+  }

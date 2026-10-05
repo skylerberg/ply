@@ -1,0 +1,283 @@
+//! `std.tar` against archives other programs wrote, and against what another program makes of
+//! its own. `tar/` holds archives made for this suite by bsdtar in each of its formats and by
+//! Python's `tarfile` in GNU's, and `written.tar`, which `std.tar` wrote and bsdtar listed as
+//! `written.listing` says. A shipped module embeds no file, so the tests that read files stand
+//! here, beside the program that runs the standard library's own.
+
+import std.list (drop, take)
+import std.result (result_err, result_is_ok)
+import std.string
+import std.string (join)
+import std.tar
+import std.tar (tar, Cursor, Entry, Limits, Member, Operation, MakeDirectory, MakeHardLink,
+                MakeSymlink, WriteFile)
+
+type Fixture = { name: String, bytes: Bytes }
+
+fn archives() -> List<Fixture> =
+  filter(embed_dir("tar"), |f: Fixture| string_ends_with(f.name, ".tar"))
+
+fn archive(name: String) -> Bytes / {abort.raise} =
+  match filter(archives(), |f: Fixture| f.name == name) {
+    [found, ..] -> found.bytes,
+    [] -> panic(f"no archive {name}"),
+  }
+
+fn roomy() -> Limits = { entries: 100, total: 1000000, size: 1000000, path: 4096 }
+
+/// A member as one line: what it is, its mode in decimal, who owns it, its size, the second it
+/// was modified at, its path, and its link.
+fn line(m: Member) -> String = {
+  let h = m.header;
+  let seconds = match h.modified { Instant(nanos) -> nanos / 1000000000 };
+  f"{h.kind} {h.mode} {h.uid}:{h.gid} {h.uname}:{h.gname} {m.size} {seconds} {h.path} {h.link}"
+}
+
+fn lines(name: String) -> List<String> / {tar.refused, abort.raise} =
+  map(tar::members(archive(name), roomy()), line)
+
+/// What a driver finds that is handed an archive `chunk` bytes at a time and asks `step` again
+/// as more arrives, never holding a member's data.
+fn fed(
+  whole: Bytes,
+  chunk: Int,
+  seen: Int,
+  at: Cursor,
+  found: List<String>,
+  budget: Int,
+) -> List<String> / {tar.refused, abort.raise} =
+  if budget <= 0 { found } else {
+    match tar::step(bytes_slice(whole, 0, seen), at, roomy()) {
+      tar::End -> found,
+      tar::More(_) -> if seen >= bytes_len(whole) { found }
+      else { fed(whole, chunk, min(seen + chunk, bytes_len(whole)), at, found, budget - 1) },
+      tar::Next(m) -> fed(whole, chunk, seen, m.next, push(found, m.header.path), budget - 1),
+    }
+  }
+
+test "{f.name} reads, and what was read of it is written and read back the same" for f: Fixture in archives(
+  ) {
+  let entries = tar::read(f.bytes, roomy());
+  assert(len(entries) > 0);
+  assert_eq(tar::decode(tar::write(entries), roomy()), Ok(entries))
+}
+
+test "{f.name} is found member by member as its bytes arrive" for f: Fixture in archives() {
+  assert_eq(
+    fed(f.bytes, 300, 0, tar::start(), [], 1000),
+    map(tar::members(f.bytes, roomy()), |m: Member| m.header.path),
+  )
+}
+
+/// The tree every format's archive was made of, as `line` writes a ustar reading of it.
+fn tree(owner: String) -> List<String> =
+  [
+    f"Directory 493 1000:1000 {owner} 0 1704193445 docs ",
+    f"File 420 1000:1000 {owner} 11 1704193445 docs/hard ",
+    f"Directory 488 1000:1000 {owner} 0 1704193445 docs/deep ",
+    f"Symlink 493 1000:1000 {owner} 0 1704193445 docs/link hello.txt",
+    f"HardLink 420 1000:1000 {owner} 0 1704193445 docs/hello.txt docs/hard",
+    f"File 420 1000:1000 {owner} 7 1704193445 docs/deep/note.txt ",
+    f"File 420 1000:1000 {owner} 0 1704193445 empty ",
+  ]
+
+test "one tree reads alike from bsdtar's ustar, GNU and v7 archives, v7 naming no owner" {
+  assert_eq(lines("ustar.tar"), tree("ply:staff"));
+  assert_eq(lines("gnutar.tar"), tree("ply:staff"));
+  assert_eq(lines("v7.tar"), tree(":"));
+  assert_eq(map(tar::read(archive("v7.tar"), roomy()), |e: Entry| e.data), [
+    b"",
+    b"hello, tar\n",
+    b"",
+    b"",
+    b"",
+    b"deeper\n",
+    b"",
+  ])
+}
+
+test "a tree's plan makes its directories, files and links in the archive's order" {
+  assert_eq(
+    tar::plan(tar::read(archive("ustar.tar"), roomy())),
+    Ok([
+      MakeDirectory("docs", 493),
+      WriteFile("docs/hard", 420, b"hello, tar\n"),
+      MakeDirectory("docs/deep", 488),
+      MakeSymlink("docs/link", "hello.txt"),
+      MakeHardLink("docs/hello.txt", "docs/hard"),
+      WriteFile("docs/deep/note.txt", 420, b"deeper\n"),
+      WriteFile("empty", 420, b""),
+    ]),
+  )
+}
+
+fn long_directory() -> String = string::repeat("d", 60) ++ "/" ++ string::repeat("e", 60)
+
+fn long_file() -> String = long_directory() ++ "/" ++ string::repeat("f", 120) ++ ".txt"
+
+test "a pax archive's records carry long and non-ASCII paths and times finer than a second" {
+  let read = tar::read(archive("pax.tar"), roomy());
+  assert_eq(map(read, |e: Entry| (e.header.path, e.header.kind, e.header.modified)), [
+    (string::repeat("d", 60), tar::Directory, Instant(1704164645000000000)),
+    (long_directory(), tar::Directory, Instant(1704164645000000000)),
+    (long_file(), tar::File, Instant(1704164645123456789)),
+    ("caf\u{e9}-\u{6c34}.txt", tar::File, Instant(1704164645500000000)),
+    ("far", tar::Symlink, Instant(1704164645000000000)),
+  ]);
+  assert_eq(map(drop(read, 4), |e: Entry| e.header.link), [long_file()]);
+  assert_eq(map(drop(take(read, 4), 2), |e: Entry| e.data), [b"long\n", b"caf\xc3\xa9\n"]);
+  // What no field holds stays with the entry: bsdtar's access and change times.
+  assert_eq(
+    map(read, |e: Entry| map(e.header.extended, |r: tar::Record| r.keyword)),
+    map(read, |_: Entry| ["atime", "ctime"]),
+  )
+}
+
+test "GNU's long name and long link members name the member after them" {
+  assert_eq(
+    map(tar::members(archive("gnu_long.tar"), roomy()), |m: Member|
+      (m.header.path, m.header.link, m.size)),
+    [
+      (string::repeat("d", 60), "", 0),
+      (long_directory(), "", 0),
+      (long_file(), "", 5),
+      ("far", long_file(), 0),
+    ],
+  )
+}
+
+test "a long name is held to the path a reader was given, wherever the archive wrote it" {
+  let held = |name: String, path: Int|
+    tar::decode(archive(name), { entries: 100, total: 1000000, size: 1000000, path: path });
+  assert_eq(result_is_ok(held("gnu_long.tar", 246)), true);
+  assert_eq(result_err(held("gnu_long.tar", 245)), Some({ at: 3072, why: tar::TooLong }));
+  assert_eq(result_is_ok(held("pax.tar", 246)), true);
+  assert_eq(result_err(held("pax.tar", 245)), Some({ at: 4096, why: tar::TooLong }))
+}
+
+test "GNU's base-256 numbers read where octal digits do not reach: Python's tarfile" {
+  assert_eq(lines("gnu_python.tar"), [
+    "File 384 3000000000:4000000000 big:bigger 9 1704164645 wide-owner.txt ",
+    "File 384 0:0 : 4 -86400 before-the-epoch.txt ",
+    "File 384 0:0 : 5 1704164645 " ++ string::repeat("n", 180) ++ ".txt ",
+    "Symlink 511 0:0 : 0 1704164645 points-far " ++ string::repeat("t", 150),
+  ])
+}
+
+test "a FIFO and a device are carried as their headers say, and no plan makes one" {
+  let read = tar::read(archive("special.tar"), roomy());
+  assert_eq(
+    map(read, |e: Entry| (e.header.path, e.header.kind, e.header.major, e.header.minor, e.data)),
+    [("pipe", tar::Fifo, 0, 0, b""), ("null", tar::CharDevice, 3, 2, b"")],
+  );
+  assert_eq(tar::plan(read), Err({ index: 0, path: "pipe", why: tar::Special }));
+  assert_eq(tar::plan(drop(read, 1)), Err({ index: 0, path: "null", why: tar::Special }))
+}
+
+test "an archive with a path that climbs out of the root reads, and is not planned" {
+  let read = tar::read(archive("traversal.tar"), roomy());
+  assert_eq(map(read, |e: Entry| (e.header.path, e.data)), [
+    ("inside.txt", b"fine\n"),
+    ("../outside.txt", b"gotcha\n"),
+  ]);
+  assert_eq(tar::plan(read), Err({ index: 1, path: "../outside.txt", why: tar::Escapes }));
+  assert_eq(tar::plan(take(read, 1)), Ok([WriteFile("inside.txt", 420, b"fine\n")]))
+}
+
+test "an archive that makes a link and then writes beneath it reads, and is not planned" {
+  let read = tar::read(archive("through_link.tar"), roomy());
+  assert_eq(map(read, |e: Entry| (e.header.path, e.header.kind, e.header.link)), [
+    ("way", tar::Symlink, "elsewhere"),
+    ("way/planted.txt", tar::File, ""),
+  ]);
+  assert_eq(tar::plan(read), Err({ index: 1, path: "way/planted.txt", why: tar::ThroughLink }))
+}
+
+// --- What `std.tar` writes, and what bsdtar says of it ---------------------------
+
+/// Entries that take every way a header is written: a directory, modes, both links, an owner,
+/// a path split at a slash, a path only a pax record holds, a path outside ASCII with a time
+/// finer than a second, and a link target past a header's field.
+fn written_entries() -> List<Entry> = {
+  let script = tar::file("project/bin/run", b"#!/bin/sh\nexec true\n", mode: 493);
+  let owned = tar::file(
+    "project/owned.txt",
+    b"whose\n",
+    mode: 384,
+    modified: Instant(1704164645000000000),
+  );
+  [
+    tar::directory("project"),
+    tar::file("project/README.md", b"# project\n"),
+    tar::directory("project/bin", mode: 448),
+    script,
+    tar::symlink("project/latest", "bin/run"),
+    tar::hard_link("project/bin/again", "project/bin/run"),
+    { ..owned, header: { ..owned.header, uid: 1000, gid: 100, uname: "ply", gname: "staff" } },
+    tar::file(
+      "project/" ++ string::repeat("d", 120) ++ "/" ++ string::repeat("f", 90) ++ ".txt",
+      b"split\n",
+    ),
+    tar::file(
+      "project/" ++ string::repeat("p", 200) ++ "/" ++ string::repeat("q", 110) ++ ".txt",
+      b"carried\n",
+    ),
+    tar::file(
+      "project/stra\u{df}e-\u{6c34}.txt",
+      b"stra\xc3\x9fe\n",
+      modified: Instant(1704164645123456789),
+    ),
+    tar::symlink("project/far", string::repeat("t", 150)),
+  ]
+}
+
+fn written_listing() -> Bytes = embed("tar/written.listing")
+
+/// A member as `tar -tv` lists one, column by column, the day it prints taken from the two
+/// instants `written_entries` uses.
+fn listed(m: Member) -> List<String> / {abort.raise} = {
+  let h = m.header;
+  let letter = match h.kind {
+    tar::Directory -> "d",
+    tar::Symlink -> "l",
+    tar::HardLink -> "h",
+    _ -> "-",
+  };
+  let bits = join(
+    map(range(0, 9), |i: Int|
+      if h.mode >> 8 - i & 1 == 0 { "-" } else { string_slice("rwxrwxrwx", i, i + 1) }),
+    "",
+  );
+  let day = if h.modified == Instant(0) { ["Jan", "1", "1970"] } else { ["Jan", "2", "2024"] };
+  let after = match h.kind {
+    tar::Directory -> [h.path ++ "/"],
+    tar::Symlink -> [h.path, "->", h.link],
+    tar::HardLink -> [h.path, "link", "to", h.link],
+    _ -> [h.path],
+  };
+  fold(
+    [
+      [letter ++ bits, "0"],
+      [if h.uname == "" { int_to_string(h.uid) } else { h.uname }],
+      [if h.gname == "" { int_to_string(h.gid) } else { h.gname }],
+      [int_to_string(m.size)],
+      day,
+      after,
+    ],
+    [],
+    |columns: List<String>, more: List<String>|
+      fold(more, columns, |so_far: List<String>, column: String| push(so_far, column)),
+  )
+}
+
+test "what write emits is the archive bsdtar listed, and lists as bsdtar listed it" {
+  let whole = tar::write(written_entries());
+  assert_eq(whole, archive("written.tar"));
+  assert_eq(
+    map(tar::members(whole, roomy()), listed),
+    map(
+      filter(string_split(string_of_bytes(written_listing()), "\n"), |row: String| row != ""),
+      |row: String| filter(string_split(row, " "), |column: String| column != ""),
+    ),
+  )
+}
