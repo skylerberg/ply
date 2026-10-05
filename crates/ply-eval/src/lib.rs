@@ -21,6 +21,7 @@ mod footprint;
 pub mod handler;
 mod hash;
 pub mod host;
+pub mod instances;
 pub mod intty;
 pub mod limit;
 pub mod list;
@@ -53,7 +54,7 @@ pub use carry::{Carry, CtorCarries};
 pub use compiled::{Compiled, Entered};
 pub use escape::{Boundary, Escapee, Handle};
 pub use evaluator::{
-    Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
+    Case, Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
     err_host_in_simulation, err_nested_simulation, err_no_runtime, err_not_compiled,
     err_secret_to_host, err_unenumerated_atom,
 };
@@ -64,6 +65,7 @@ pub use host::{
     HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
     ShutdownReport,
 };
+pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{

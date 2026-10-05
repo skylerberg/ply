@@ -4,12 +4,13 @@
 
 import parsing (Span, Ident, QName, ParseDiag, primary_span_of, qname_text)
 import lexer (Comment, Token, InterpolatedHead, InterpolatedTail, ItemDoc, lex, doc_mark)
-import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern,
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               ImportDecl, IModule, IAlias, INames, FnDef, ExternDef, TypeDef, TDAlias, TDSum,
-              VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder, Deriver, deriver_text,
-              Constraint, SpecClause, SpecKind, SRequires, SEnsures, SCost, ReturnsFresh,
-              ReturnsParam, Vis, VPub, VPriv, item_span, item_doc, parse, dump_module, is_written,
-              constraint_written, is_pub, spec_kind_text, TDNominal)
+              VariantDef, EffectDef, OpDef, TestDef, LawDef, SchemaDef, Binder, Deriver,
+              deriver_text, Constraint, SpecClause, SpecKind, SRequires, SEnsures, SCost,
+              ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, item_span, item_doc, parse, dump_module,
+              is_written, constraint_written, is_pub, spec_kind_text, TDNominal, IInstance,
+              instance_text)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, ty_span, mode_text, is_raise, angled, generics_text, ident_names)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
@@ -1752,6 +1753,7 @@ fn item(input: PrintInput, printer: Printer, it: Item) -> Printer / {abort.raise
     IEffect(d) -> effect_def(input, s1, d),
     ITest(d) -> test_def(input, s1, d),
     ILaw(d) -> law_def(input, s1, d),
+    ISchema(d) -> schema_def(input, s1, d),
     IDerive(d) ->
       emit(s1, bytes_concat_all([b"derive ", deriver_text(d.deriver), b" for ", d.target.name])),
     IEffectSet(d) ->
@@ -1767,6 +1769,11 @@ fn item(input: PrintInput, printer: Printer, it: Item) -> Printer / {abort.raise
         ]),
       ),
     IExtern(d) -> extern_def(input, s1, d),
+    IInstance(d) ->
+      emit(
+        s1,
+        bytes_concat_all([instance_text(d.kind), b" for ", d.target.name, b" by ", d.by.name]),
+      ),
   };
   trail(input, set_prev(absorb(input, s2, sp.end), sp.end), sp.end)
 }
@@ -2048,69 +2055,161 @@ fn effect_def(input: PrintInput, printer: Printer, d: EffectDef) -> Printer / {a
   }
 }
 
+/// A label is kept as written, holes and all: over cases it is the test's name.
 fn test_def(input: PrintInput, printer: Printer, d: TestDef) -> Printer / {abort.raise} = {
   let kw = if d.is_nondet { b"test/nondet " } else { b"test " };
-  def_body(
-    input,
-    emit(
-      printer,
-      bytes_concat_all([kw, bytes_slice(input.source, d.name_span.start, d.name_span.end), b" "]),
-    ),
-    d.body,
-    0,
-  )
+  let head = emit(
+    printer,
+    bytes_concat_all([kw, bytes_slice(input.source, d.name_span.start, d.name_span.end), b" "]),
+  );
+  match d.cases {
+    None -> def_body(input, head, d.body, 0),
+    Some(c) -> {
+      let ranged = emit(
+        head,
+        bytes_concat_all([b"for ", c.binder.name, b": ", type_text(input, c.ty), b" in "]),
+      );
+      let table = match try_flat(
+          input,
+          ranged,
+          flat_scrutinee(input, c.table),
+          expr_span(c.table).end,
+          2,
+        ) {
+        Some(f) -> emit(ranged, f),
+        None -> expr(input, ranged, c.table, 2, 2),
+      };
+      def_body(input, emit(table, b" "), d.body, 0)
+    },
+  }
 }
 
 fn binder_text(input: PrintInput, binder: Binder) -> Bytes / {abort.raise} =
   bytes_concat_all([binder.name.name, b": ", type_text(input, binder.ty)])
 
+fn binders_text(input: PrintInput, binders: List<Binder>) -> Bytes / {abort.raise} =
+  if len(binders) == 0 { b"" } else {
+    bytes_concat_all([
+      b"forall (",
+      join(map(binders, |binder: Binder| binder_text(input, binder)), b", "),
+      b")",
+    ])
+  }
+
+fn clause_flat(input: PrintInput, word: Bytes, e: Option<Expr>) -> Option<Bytes> / {abort.raise} =
+  match e { Some(x) -> cat([Some(word), flat_expr(input, x)]), None -> Some(b"") }
+
+/// A claim on its head's line: the binders, the guard, the bound and the body.
+fn claim_flat(
+  input: PrintInput,
+  binders: List<Binder>,
+  guard: Option<Expr>,
+  cost: Option<Expr>,
+  body: Expr,
+) -> Option<Bytes> / {abort.raise} = {
+  let quantified = binders_text(input, binders);
+  cat([
+    Some(if bytes_len(quantified) == 0 { b"" } else { bytes_concat(b" ", quantified) }),
+    clause_flat(input, b" where ", guard),
+    clause_flat(input, b" cost ", cost),
+    Some(b" "),
+    flat_expr(input, body),
+  ])
+}
+
+/// The same where one line does not hold it: the binders under the head, each clause beside them
+/// if it fits.
+fn claim_lines(
+  input: PrintInput,
+  s1: Printer,
+  binders: List<Binder>,
+  guard: Option<Expr>,
+  cost: Option<Expr>,
+  body: Expr,
+) -> Printer / {abort.raise} = {
+  let written = binders_text(input, binders);
+  let quantified = bytes_len(written) > 0 || guard != None || cost != None;
+  let s2 = if bytes_len(written) == 0 { s1 } else { emit(nl(s1, 2, false), written) };
+  let s3 = match guard {
+    Some(g) -> match try_flat(
+        input,
+        s2,
+        clause_flat(input, b" where ", guard),
+        expr_span(g).end,
+        2,
+      ) {
+      Some(f) -> emit(s2, f),
+      None -> expr(input, emit(nl(s2, 2, false), b"where "), g, 2, 2),
+    },
+    None -> s2,
+  };
+  let s4 = match cost {
+    Some(k) -> match try_flat(input, s3, clause_flat(input, b" cost ", cost), expr_span(k).end, 2) {
+      Some(f) -> emit(s3, f),
+      None -> expr(input, emit(nl(s3, 2, false), b"cost "), k, 2, 2),
+    },
+    None -> s3,
+  };
+  block(input, emit(s4, b" "), body, if quantified { 2 } else { 0 })
+}
+
 fn law_def(input: PrintInput, printer: Printer, d: LawDef) -> Printer / {abort.raise} = {
   let kw = if d.host { b"law/host " } else { b"law " };
   let head = bytes_concat(kw, bytes_slice(input.source, d.name_span.start, d.name_span.end));
-  let binders = if len(d.binders) == 0 { b"" } else {
-    bytes_concat_all([
-      b"forall (",
-      join(map(d.binders, |binder: Binder| binder_text(input, binder)), b", "),
-      b")",
-    ])
-  };
-  let guard = match d.guard {
-    Some(g) -> cat([Some(b" where "), flat_expr(input, g)]),
-    None -> Some(b""),
-  };
-  let cost = match d.cost {
-    Some(k) -> cat([Some(b" cost "), flat_expr(input, k)]),
-    None -> Some(b""),
-  };
-  let flat = cat([
-    Some(head),
-    Some(if bytes_len(binders) == 0 { b"" } else { bytes_concat(b" ", binders) }),
-    guard,
-    cost,
-    Some(b" "),
-    flat_expr(input, d.body),
+  match d.of {
+    Some(_) -> def_body(input, emit(printer, bytes_concat(head, b" = ")), d.body, 0),
+    None -> {
+      let flat = cat([Some(head), claim_flat(input, d.binders, d.guard, d.cost, d.body)]);
+      match try_flat(input, printer, flat, d.span.end, 0) {
+        Some(f) -> emit(printer, f),
+        None -> claim_lines(input, emit(printer, head), d.binders, d.guard, d.cost, d.body),
+      }
+    },
+  }
+}
+
+fn schema_param(
+  input: PrintInput,
+  printer: Printer,
+  x: Binder,
+  indent: Int,
+) -> Printer / {abort.raise} = {
+  let s1 = emit(open_line(input, printer, x.span.start, indent, false), binder_text(input, x));
+  trail(input, set_prev(emit(absorb(input, s1, x.span.end), b","), x.span.end), x.span.end)
+}
+
+fn schema_def(input: PrintInput, printer: Printer, d: SchemaDef) -> Printer / {abort.raise} = {
+  let head = bytes_concat_all([
+    vis_text(d.vis),
+    b"law schema ",
+    d.name.name,
+    generics_text(d.generics),
   ]);
+  let params = bytes_concat_all([
+    b"(",
+    join(map(d.params, |x: Binder| binder_text(input, x)), b", "),
+    b")",
+  ]);
+  let flat = cat([Some(head), Some(params), claim_flat(input, d.binders, d.guard, None, d.body)]);
   match try_flat(input, printer, flat, d.span.end, 0) {
     Some(f) -> emit(printer, f),
     None -> {
       let s1 = emit(printer, head);
-      let quantified = bytes_len(binders) > 0 || d.guard != None || d.cost != None;
-      let s2 = if bytes_len(binders) == 0 { s1 } else { emit(nl(s1, 2, false), binders) };
-      let s3 = match d.guard {
-        Some(g) -> match try_flat(input, s2, guard, expr_span(g).end, 2) {
-          Some(f) -> emit(s2, f),
-          None -> expr(input, emit(nl(s2, 2, false), b"where "), g, 2, 2),
-        },
-        None -> s2,
+      let params_end = match list_at(d.params, len(d.params) - 1) {
+        Some(x) -> x.span.end,
+        None -> d.name.span.end,
       };
-      let s4 = match d.cost {
-        Some(k) -> match try_flat(input, s3, cost, expr_span(k).end, 2) {
-          Some(f) -> emit(s3, f),
-          None -> expr(input, emit(nl(s3, 2, false), b"cost "), k, 2, 2),
+      let fit = if len(d.params) == 0 { Some(params) }
+      else { try_flat(input, s1, Some(params), params_end, 0) };
+      let s2 = match fit {
+        Some(f) -> emit(s1, f),
+        None -> {
+          let ps = fold(d.params, emit(s1, b"("), |s: Printer, x: Binder|
+            schema_param(input, s, x, 2));
+          close(input, ps, params_end, 0, b")")
         },
-        None -> s3,
       };
-      block(input, emit(s4, b" "), d.body, if quantified { 2 } else { 0 })
+      claim_lines(input, s2, d.binders, d.guard, None, d.body)
     },
   }
 }
@@ -2126,9 +2225,11 @@ fn item_kind(item: Item) -> Bytes =
     IEffect(_) -> b"effect",
     ITest(_) -> b"test",
     ILaw(_) -> b"law",
+    ISchema(_) -> b"law schema",
     IDerive(_) -> b"derive",
     IEffectSet(_) -> b"effect set",
     IExtern(_) -> b"extern fn",
+    IInstance(d) -> instance_text(d.kind),
   }
 
 /// A test, a law or a derive has no identifier to be found by.
@@ -2137,6 +2238,7 @@ fn item_name(item: Item) -> Option<Bytes> =
     IFn(d) -> Some(d.name.name),
     IType(d) -> Some(d.name.name),
     IEffect(d) -> Some(d.name.name),
+    ISchema(d) -> Some(d.name.name),
     IEffectSet(d) -> Some(d.name.name),
     IExtern(d) -> Some(d.name.name),
     _ -> None,
@@ -2737,6 +2839,27 @@ test "a cost law prints its bound after its guard, on the head's line while it f
   lays_out(b"law \"c\" forall (n: Int) cost n { n }\n", b"law \"c\" forall (n: Int) cost n { n }\n")
 }
 
+test "a schema prints as a law does after its parameters, and an instantiation as a definition's body" {
+  lays_out(
+    b"pub  law schema  s<a>(f: (a)->a)   forall (x: a) where x==x { f(x)==x }\n",
+    b"pub law schema s<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\n",
+  );
+  lays_out(b"law schema g(f: ()->Bool) { f() }\n", b"law schema g(f: () -> Bool) { f() }\n");
+  lays_out(
+    b"law schema h<a|e>(f: (a)->a/e) forall (x: a) { f(f(x))==f(x) }\n",
+    b"law schema h<a | e>(f: (a) -> a / e) forall (x: a) { f(f(x)) == f(x) }\n",
+  );
+  lays_out(
+    b"law schema round_trip<a, b>(encode: (a) -> b / {abort.raise}, decode: (b) -> Option<a> / {abort.raise}) forall (x: a) { decode(encode(x)) == Some(x) }\n",
+    b"law schema round_trip<a, b>(\n  encode: (a) -> b / {abort.raise},\n  decode: (b) -> Option<a> / {abort.raise},\n)\n  forall (x: a) {\n    decode(encode(x)) == Some(x)\n  }\n",
+  );
+  lays_out(b"law \"l\"   =  m::s( f,1 )\n", b"law \"l\" = m::s(f, 1)\n");
+  lays_out(
+    b"law \"a query string parses back to the pairs it was built of, in the order it names them\" = round_trip(query_build, query_parse)\n",
+    b"law \"a query string parses back to the pairs it was built of, in the order it names them\" =\n  round_trip(query_build, query_parse)\n",
+  )
+}
+
 test "a function parameter's cost name prints after its type" {
   lays_out(
     b"fn f<| e>(xs: List<Int>,  g: (Int) -> Int / e cost  k) -> Int / e cost len(xs)*k = 0\n",
@@ -3041,5 +3164,12 @@ test "an `extern fn` prints as its declaration, a `where` on a line of its own" 
   lays_out(
     b"// kept\nextern   fn len<a>(xs:List<a>)->Int\n\nextern fn compare<a>(x: a, y: a) -> Ordering where derivable(ord, a)\n",
     b"// kept\nextern fn len<a>(xs: List<a>) -> Int\n\nextern fn compare<a>(x: a, y: a) -> Ordering\n  where derivable(ord, a)\n",
+  )
+}
+
+test "a `key` and a `show` print on a line each, as written" {
+  lays_out(
+    b"type T = | T(Int)\n// read through\nkey   for T   by f\nshow for T by\n  g\n",
+    b"type T = | T(Int)\n// read through\nkey for T by f\nshow for T by g\n",
   )
 }

@@ -298,6 +298,43 @@ fn a_units_bucket_tables_read_back_and_a_table_without_them_names_none() {
     assert_eq!(read.encode(), with);
     let without = ply_codegen::c::Exports::decode(tables).expect("the table reads");
     assert!(without.buckets.is_empty());
+    assert!(without.instances.is_empty());
+    // What a type's module states its values are read through follows the buckets, in a unit
+    // that holds such a type: `-` for none, `!` for a function the unit does not take.
+    let stating = format!("{with}instances 2\nm.Box m.area !\nm.Date - m.written\n");
+    let read = ply_codegen::c::Exports::decode(&stating).expect("the table reads");
+    assert_eq!(
+        read.instances,
+        vec![
+            ("m.Box".into(), "m.area".to_string(), "!".to_string()),
+            ("m.Date".into(), "-".to_string(), "m.written".to_string()),
+        ]
+    );
+    assert_eq!(read.encode(), stating);
+}
+
+/// A stated function is called with the value alone, so a unit that states one taking more words
+/// is not loaded.
+#[test]
+fn a_unit_stating_a_function_of_more_than_the_value_is_refused() {
+    let mut made = fixture::answered(&[(
+        "m",
+        "type Box = | Box(Int)\n\
+         fn area(b: Box) -> Int = match b { Box(n) -> n }\n\
+         pub fn scaled(b: Box, by: Int) -> Int = area(b) * by\n\
+         key for Box by area\n",
+    )]);
+    let stated = "\"m.Box m.area -\\n\"";
+    assert!(made.unit.contains(stated), "the unit states `Box`'s key");
+    made.unit = made.unit.replace(stated, "\"m.Box m.scaled -\\n\"");
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(made.front.answer));
+    let source = ply_codegen::source::Source::from_analysis(front);
+    let _config = fixture::CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    match ply_codegen::c::load_unit(&made.unit, Some(&source), "unit") {
+        Ok(_) => panic!("a key that takes two words was bound"),
+        Err(e) if e.to_string().contains("could not run") => {}
+        Err(e) => assert!(e.to_string().contains("`m.scaled`"), "{e}"),
+    }
 }
 
 /// A unit handed over is loaded once, to read what it holds; the first backend on that thread takes

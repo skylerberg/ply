@@ -216,8 +216,11 @@ builtins! { $
     ArrayGet = "array_get", 2, raises;
     /// In place while the array has one holder; raises out of range.
     ArraySet = "array_set", 3, raises;
-    /// The value as a `std.value.Value`, whole: what `std.show.show` renders.
+    /// The value as a `std.value.Value`, whole.
     Reflect = "reflect", 1, ends;
+    /// As `reflect`, with a value whose type states a `show` as `VShown` of what that function
+    /// writes: what `std.show.show` renders.
+    Shown = "shown", 1, ends;
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
     Digest = "digest", 1, ends;
     /// `bracket(acquire, release, body)`: `release` runs on every exit from `body` but a failure.
@@ -920,6 +923,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::ArraySet => array_set(args, span),
 
         Builtin::Reflect => Ok(crate::reflect::value_of(&Plain::of(&args[0]))),
+
+        Builtin::Shown => Ok(crate::reflect::shown_of(&args[0])),
 
         Builtin::Digest => Ok(Value::bytes(crate::digest::digest(&args[0], span)?)),
 
