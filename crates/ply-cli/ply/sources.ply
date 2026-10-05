@@ -7,7 +7,8 @@ import std.bytes (u64_le)
 import std.hash (blake3)
 import compiler.hash (hex)
 import std.path (join, is_absolute, normalize, parent)
-import compiler.front (module_of, Embedded, Shipping, embeds_wanted, shipped_pulled)
+import compiler.front (module_of, Embedded, Shipping, ShippedData, embeds_wanted,
+                       shipped_data_wanted, shipped_pulled)
 import compiler.embed (EmbedRead, EmbedWant)
 import compiler.resolve (Source, Diag, Label, error_at)
 import builder (builder)
@@ -467,21 +468,21 @@ fn merge(a: Project, b: Project) -> Project = {
 }
 
 // --- The shipped modules ------------------------------------------------------
-// The modules this binary ships, one flat directory of `<dotted name>.ply`, bound as `shipped`.
+// The modules this binary ships, one flat directory of `<dotted name>.ply`, bound as `shipped`, and
+// below it each data file one of them embeds, under its name (`std/oid/names.txt`).
 
 pub fn stem(name: String) -> String / {abort.raise} = string_slice(name, 0, string_len(name) - 4)
 
-/// The digest over the shipped modules among `srcs`: each module as its name's length and bytes then
-/// its source's own hash, hashed in name order.
-pub fn shipped_digest_of(srcs: List<Source>) -> String / {abort.raise} = {
-  let parts = map(
-    filter(srcs, |src: Source| is_std(string_of_bytes_lossy(src.name))),
-    |src: Source|
-      bytes_concat_all([
-        u64_le(string_len(string_of_bytes_lossy(src.name))),
-        src.name,
-        blake3(src.src),
-      ]),
+/// The digest over the shipped modules among `srcs` and `data`, the data files they embed: each as
+/// its name's length and bytes then its own hash, the modules hashed in name order and the data
+/// files after them.
+pub fn shipped_digest_of(srcs: List<Source>, data: List<ShippedData>) -> String / {abort.raise} = {
+  let part = |name: Bytes, bytes: Bytes|
+    bytes_concat_all([u64_le(string_len(string_of_bytes_lossy(name))), name, blake3(bytes)]);
+  let parts = concat(
+    map(filter(srcs, |src: Source| is_std(string_of_bytes_lossy(src.name))), |src: Source|
+      part(src.name, src.src)),
+    map(data, |d: ShippedData| part(d.name, d.bytes)),
   );
   "b3:" ++ string_of_bytes(bytes_slice(hex(blake3(bytes_concat_all(parts))), 0, 12))
 }
@@ -493,16 +494,34 @@ pub fn shipped_names() -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
     Some(names) -> map(filter(names, is_ply), |name: String| bytes_of_string(stem(name))),
   }
 
-pub fn no_shipping() -> Shipping = { read: [], unread: [] }
+pub fn no_shipping() -> Shipping = { read: [], unread: [], data: [] }
 
-/// The shipped modules a load of `user` and `pkgs` pulls, each read off the directory bound as
-/// `shipped` when it is pulled.
+/// The shipped modules a load of `user` and `pkgs` pulls and the data files those embed, each read
+/// off the directory bound as `shipped` when it is pulled.
 pub fn shipping_for(
   user: List<Source>,
   pkgs: PackageSources,
 ) -> Shipping / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  shipped_pulled(user, pkgs, shipped_names(), |name: Bytes|
-    fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply"))
+  shipped_pulled(
+    user,
+    pkgs,
+    shipped_names(),
+    |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply"),
+    |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name)),
+  )
+
+/// The data files `modules` embed, each read once off the directory bound as `shipped`.
+pub fn shipped_data(
+  modules: List<Source>,
+) -> List<ShippedData> / {fs.read_file[shipped], abort.raise} =
+  fold(modules, [], |acc: List<ShippedData>, module: Source|
+    fold(shipped_data_wanted(module), acc, |held: List<ShippedData>, name: Bytes|
+      if len(filter(held, |d: ShippedData| d.name == name)) > 0 { held } else {
+        match fs.read_file[shipped](string_of_bytes_lossy(name)) {
+          Some(bytes) -> push(held, { name: name, bytes: bytes }),
+          None -> held,
+        }
+      }))
 
 /// Every shipped module's name, read or not.
 pub fn shipped_listed(s: Shipping) -> List<Bytes> =
@@ -663,6 +682,47 @@ test "a load reads the shipped modules it pulls and what they embed, and only th
     cell_get(c)
   } };
   assert_eq(read, ["std.json.ply", "std.bytes.ply"])
+}
+
+fn embedding_words() -> Bytes = b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n"
+
+test "a load reads the data file a shipped module it pulls embeds, under its name below them" {
+  let read = with_cell[reads]([]) { c -> {
+    let shipping = handle {
+      shipping_for([{ name: b"main", src: b"import std.words\nfn main() -> Unit = ()\n" }], {
+        root: b"",
+        manifest: None,
+        supplied: [],
+      })
+    } with {
+      fs.list_dir[shipped](p) -> Some(["std", "std.idle.ply", "std.words.ply"]),
+      fs.read_file[shipped](p) -> {
+        cell_update(c, |xs: List<String>| push(xs, p));
+        if p == "std.words.ply" { Some(embedding_words()) }
+        else if p == "std/words/list.txt" { Some(b"one\n") }
+        else { None }
+      },
+    };
+    assert_eq(shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\n" }]);
+    assert_eq(shipping.unread, [b"std.idle"]);
+    cell_get(c)
+  } };
+  assert_eq(read, ["std.words.ply", "std/words/list.txt"])
+}
+
+test "the digest of the shipped modules covers the data files they embed" {
+  let srcs = [{ name: b"std.words", src: embedding_words() }];
+  let over = |bytes: Bytes|
+    shipped_digest_of(srcs, [{ name: b"std/words/list.txt", bytes: bytes }]);
+  assert_eq(over(b"one\n"), over(b"one\n"));
+  assert(over(b"one\n") != over(b"two\n"));
+  assert(over(b"one\n") != shipped_digest_of(srcs, []));
+  let held = handle {
+    shipped_data(concat(srcs, srcs))
+  } with {
+    fs.read_file[shipped](p) -> if p == "std/words/list.txt" { Some(b"one\n") } else { None },
+  };
+  assert_eq(held, [{ name: b"std/words/list.txt", bytes: b"one\n" }])
 }
 
 test "the shipped modules come back one source per `.ply` file, named by its stem" {
