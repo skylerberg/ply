@@ -1,0 +1,261 @@
+//! A command-line tool whose line is declared once, with `std.cli`.
+
+import std.cli
+import std.cli (Arg, Bash, Codec, Fish, Flag, Outcome, Parsed, Pos, Refused, Rejected, Run, Shell,
+                Spec, Text, Zsh)
+import std.list (at_or)
+import std.process (process, Captured, args_step, captured, err_step, exit_step, out_step)
+import std.string (join, to_lower, to_upper)
+
+// --- What the line asks for -------------------------------------------------
+
+type Voice = | Plain | Upper | Lower
+
+type Saying = {
+  words: List<String>,
+  times: Int,
+  voice: Voice,
+  between: String,
+  marks: List<String>,
+}
+
+type Asked = | Say(Saying) | Completions(Shell) | Manual(List<String>)
+
+// --- The line ---------------------------------------------------------------
+
+/// Declared once, so the command that lists it and the decoder that reads it cannot disagree.
+fn times() -> Arg<Int> =
+  cli::arg(
+    cli::falling_back(
+      cli::with_short(
+        cli::with_default(cli::valued("times", "N", Pos, "How many lines to say."), "1"),
+        "n",
+      ),
+      "SHOUT_TIMES",
+    ),
+    cli::int(),
+  )
+
+fn between() -> Arg<String> =
+  cli::arg(cli::valued("between", "TEXT", Text, "What stands between two words."), cli::text())
+
+fn mark() -> Arg<String> =
+  cli::arg(
+    cli::with_short(
+      cli::repeated(cli::valued("mark", "TEXT", Text, "A mark to end each line with. Repeatable.")),
+      "m",
+    ),
+    cli::text(),
+  )
+
+fn upper() -> Flag = cli::with_short(cli::switch("upper", "Say it in capitals."), "u")
+
+fn lower() -> Flag =
+  cli::conflicting(cli::with_short(cli::switch("lower", "Say it in small letters."), "l"), [
+    "upper",
+  ])
+
+fn shells() -> Codec<Shell> =
+  cli::one_of([
+    { name: "bash", value: Bash },
+    { name: "zsh", value: Zsh },
+    { name: "fish", value: Fish },
+  ])
+
+fn line() -> Spec = {
+  let say = cli::with_positionals(
+    cli::command("say", "Print the words on a line.", [
+      times().flag,
+      between().flag,
+      mark().flag,
+      upper(),
+      lower(),
+    ]),
+    [cli::many(cli::positional("WORDS", "What to say."))],
+  );
+  let completions = cli::with_positionals(
+    cli::command("completions", "Print a script that completes this line in a shell.", []),
+    [cli::positional("SHELL", "`bash`, `zsh` or `fish`.")],
+  );
+  let manual = cli::with_positionals(
+    cli::command("manual", "Print a command's manual page.", []),
+    [cli::many(cli::defaulted("COMMAND", "The command's words; none is the program's page.", ""))],
+  );
+  {
+    bin: "shout",
+    version: "0.1.0",
+    root: cli::with_subs(cli::command("", "Say words, loudly or not.", []), [
+      say,
+      completions,
+      manual,
+    ]),
+  }
+}
+
+/// The decoder: a line that parsed, as what it asks for.
+fn asked_of(p: Parsed) -> Result<Asked, String> / {abort.raise} =
+  match at_or(p.path, 0, "") {
+    "say" -> said_of(p),
+    "completions" -> match shells().decode(at_or(p.positionals, 0, "")) {
+      Ok(shell) -> Ok(Completions(shell)),
+      Err(why) -> Err("`" ++ at_or(p.positionals, 0, "") ++ "` is no shell: " ++ why),
+    },
+    _ -> Ok(Manual(p.positionals)),
+  }
+
+fn said_of(p: Parsed) -> Result<Asked, String> / {abort.raise} = {
+  let times = cli::required(p, times())?;
+  Ok(
+    Say({
+      words: p.positionals,
+      times: times,
+      voice: if cli::has(p, "upper") { Upper }
+      else if cli::has(p, "lower") { Lower }
+      else { Plain },
+      between: cli::get_or(p, between(), " "),
+      marks: cli::all(p, mark()),
+    }),
+  )
+}
+
+fn asked(
+  argv: List<String>,
+  settings: List<{ key: String, value: String }>,
+) -> Outcome<Asked> / {abort.raise} = cli::parse_with(line(), argv, asked_of, settings)
+
+// --- What it answers --------------------------------------------------------
+
+fn spoken(s: Saying) -> List<String> / {abort.raise} = {
+  let said = join(s.words, s.between) ++ join(s.marks, "");
+  let voiced = match s.voice { Plain -> said, Upper -> to_upper(said), Lower -> to_lower(said) };
+  map(range(0, s.times), |_: Int| voiced)
+}
+
+fn answer(a: Asked) -> List<String> / {abort.raise} =
+  match a {
+    Say(s) -> spoken(s),
+    Completions(shell) -> [cli::completion(line(), shell)],
+    Manual(path) -> [cli::man_page(line(), path)],
+  }
+
+/// Run as `ply run examples/shout.ply --host -- say -u hello world`. Help and the version go to
+/// the output stream; a refusal goes to the error stream and exits 2.
+fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], abort.raise} =
+  match cli::reply(line(), asked(process.args[proc](), []), Some(80)) {
+    Ok(a) -> {
+      fold(answer(a), (), |_: Unit, said: String| process.out[proc](said));
+      process.exit[proc](0)
+    },
+    Err(said) -> {
+      if said.code == 0 { process.out[proc](said.text) } else { process.err[proc](said.text) };
+      process.exit[proc](said.code)
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn plainly(words: List<String>) -> Saying =
+  { words: words, times: 1, voice: Plain, between: " ", marks: [] }
+
+type Line = { argv: List<String>, asks: Asked }
+
+fn lines() -> List<Line> =
+  [
+    { argv: ["say", "hello", "world"], asks: Say(plainly(["hello", "world"])) },
+    {
+      argv: ["say", "-un3", "hello", "--between=, ", "-m!", "--mark", "?"],
+      asks: Say({ words: ["hello"], times: 3, voice: Upper, between: ", ", marks: ["!", "?"] }),
+    },
+    {
+      argv: ["say", "--lower", "--", "-HELLO-"],
+      asks: Say({ ..plainly(["-HELLO-"]), voice: Lower }),
+    },
+    { argv: ["completions", "fish"], asks: Completions(Fish) },
+    { argv: ["manual"], asks: Manual([]) },
+    { argv: ["manual", "say"], asks: Manual(["say"]) },
+  ]
+
+test "shout {join(c.argv, " ")} asks for what it writes" for c: Line in lines() {
+  assert_eq(asked(c.argv, []), Run(c.asks))
+}
+
+test "the declaration has no fault" { assert_eq(cli::faults(line()), []) }
+
+test "a line that breaks a rule is refused with the rule" {
+  assert_eq(
+    asked(["say", "-ul", "hello"], []),
+    Refused({ path: ["say"], why: cli::Conflict("lower", "upper") }),
+  );
+  assert_eq(
+    asked(["say", "--times", "0", "hello"], []),
+    Refused({ path: ["say"], why: cli::InvalidValue("times", "0", "0 is not in 1..") }),
+  );
+  assert_eq(
+    asked(["say"], []),
+    Refused({ path: ["say"], why: cli::MissingPositionals(["WORDS"]) }),
+  );
+  assert_eq(
+    asked(["completions", "tcsh"], []),
+    Refused({
+      path: ["completions"],
+      why: Rejected("`tcsh` is no shell: not one of bash, zsh, fish"),
+    }),
+  )
+}
+
+test "a flag left off the line stands at its setting" {
+  let held = [{ key: "SHOUT_TIMES", value: "2" }];
+  assert_eq(asked(["say", "hi"], held), Run(Say({ ..plainly(["hi"]), times: 2 })));
+  assert_eq(asked(["say", "hi", "-n4"], held), Run(Say({ ..plainly(["hi"]), times: 4 })))
+}
+
+test "the words are said as the line asks" {
+  assert_eq(spoken(plainly(["hello", "world"])), ["hello world"]);
+  assert_eq(
+    spoken({ words: ["a", "b"], times: 2, voice: Upper, between: "-", marks: ["!", "?"] }),
+    ["A-B!?", "A-B!?"],
+  )
+}
+
+/// What a run with these arguments wrote, and the code it asked to exit with.
+fn ran(argv: List<String>) -> Captured / {abort.raise} =
+  with_cell[twin](captured(argv)) { io -> {
+    handle {
+      main()
+    } with {
+      process.args[proc]() -> args_step(cell_get(io)),
+      process.out[proc](text) -> cell_set(io, out_step(cell_get(io), text)),
+      process.err[proc](text) -> cell_set(io, err_step(cell_get(io), text)),
+      process.exit[proc](code) resume k -> cell_set(io, exit_step(cell_get(io), code)),
+    };
+    cell_get(io)
+  } }
+
+test "the program says its words and exits clean" {
+  let run = ran(["say", "-n2", "hello", "world", "-m", "!"]);
+  assert_eq(run.out, ["hello world!", "hello world!"]);
+  assert_eq(run.err, []);
+  assert_eq(run.code, Some(0))
+}
+
+test "help goes to the output stream and a refusal to the error stream, with exit 2" {
+  let helped = ran(["say", "--help"]);
+  assert_eq(helped.code, Some(0));
+  assert_eq(helped.err, []);
+  assert(
+    string_starts_with(at_or(helped.out, 0, ""), "Print the words on a line\n\nUsage: shout say"),
+  );
+  let refused = ran(["say", "--tmies", "2", "hi"]);
+  assert_eq(refused.code, Some(2));
+  assert_eq(refused.out, []);
+  assert_eq(refused.err, [
+    "error: unexpected argument '--tmies' found\n\n  tip: a similar argument exists: '--times'\n\nUsage: shout say [OPTIONS] <WORDS>...\n\nFor more information, try '--help'.",
+  ])
+}
+
+test "the program writes its own completion script and manual page" {
+  let script = at_or(ran(["completions", "bash"]).out, 0, "");
+  assert(string_contains(script, "complete -o default -F _shout shout"));
+  let page = at_or(ran(["manual", "say"]).out, 0, "");
+  assert(string_starts_with(page, ".TH \"SHOUT\\-SAY\" 1"))
+}

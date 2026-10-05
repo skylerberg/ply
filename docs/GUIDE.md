@@ -387,8 +387,8 @@ Reach through a binder with `::` (`orders::place(...)`). `as` and a name list
 cannot be combined; write two imports. Imports precede every item.
 
 The first segment of a module path may be a package: a dependency declared in
-`ply.pkg` (§3.3) grants its own prefix, and `import cli.cmdline` reaches the
-`cmdline` module of the package `cli`. A path whose first segment is neither a
+`ply.pkg` (§3.3) grants its own prefix, and `import cli.surface` reaches the
+`surface` module of the package `cli`. A path whose first segment is neither a
 module of this package, the root of one, nor a granted prefix is `E0106`; a
 dependency's prefix used without the manifest declaring it is `E0132`. A bare
 import is always this package's own: inside a dependency, `import fmt` names
@@ -430,7 +430,7 @@ may be imported. A package's own modules answer to its sibling names:
 
 ```ply
 import store.orders        // a module of this package, as before
-import cli.cmdline         // a module of the declared dependency `cli`
+import cli.surface         // a module of the declared dependency `cli`
 ```
 
 A dependency is another package root: `Path("../cli")` names the directory
@@ -3029,6 +3029,8 @@ In `examples/`: `clock.ply` (a `nondet` effect, a handler, `test/nondet`);
 and `timeout.ply` (simulation, a race and its fix, a virtual clock); `echo.ply`
 and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 `relay.ply` (one forwarder generic over the label it writes under);
+`shout.ply` (a command line declared with `std.cli`, read into the program's
+own type);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
 answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose
