@@ -21,6 +21,10 @@ pub type Ident = { name: Bytes, span: Span }
 
 pub type QName = { module: Option<Ident>, name: Ident, span: Span }
 
+// A doc comment block: its lines' words, and the span from its first marker to its last line's end.
+// It is trivia: no hash, key or check reads it.
+pub type Doc = { lines: List<Bytes>, span: Span }
+
 pub fn dummy_span() -> Span = { start: 0, end: 0 }
 
 pub fn span_between(s: Int, e: Int) -> Span = { start: s, end: e }
@@ -131,7 +135,13 @@ pub fn primary_span_of(diag: ParseDiag) -> Span = {
 
 // What a parse reads, which flows down into what it parses: the tokens, and `room`, how many levels
 // deeper the grammar may nest from here, which every rule that nests spends one of.
-pub type Input = { token_count: Int, source: Bytes, tokens: List<lexer::Token>, room: Int }
+pub type Input = {
+  token_count: Int,
+  source: Bytes,
+  tokens: List<lexer::Token>,
+  comments: List<lexer::Comment>,
+  room: Int,
+}
 
 // `gt_split` is the index where `expect_gt` split a `>=`: `token_index` reads it as `=` over its
 // second byte. One slot suffices because `pos` must pass a split before another can happen.
@@ -157,7 +167,13 @@ pub fn start(src: Bytes) -> ParseStart / {abort.raise} = {
   let d = map(lx.diags, |diag: lexer::Diag|
     error_at(diag.code, { start: diag.start, end: diag.end }, diag.message, diag.label, []));
   {
-    input: { token_count: len(lx.tokens), source: src, tokens: lx.tokens, room: max_depth() },
+    input: {
+      token_count: len(lx.tokens),
+      source: src,
+      tokens: lx.tokens,
+      comments: lx.comments,
+      room: max_depth(),
+    },
     parser: { pos: 0, no_brace: false, no_pipe: false, gt_split: -1, diags: d },
   }
 }
@@ -274,6 +290,73 @@ pub fn previous_span(input: Input, parser: Parser) -> Span = {
 
 pub fn token_bytes(input: Input, token: lexer::Token) -> Bytes / {abort.raise} =
   bytes_slice(input.source, token.start, token.end)
+
+// --- Doc comments -----------------------------------------------------------
+
+// The first of `n` ascending starts, read by `start_of`, that is at least `at`; `n` when none is.
+fn first_from(n: Int, at: Int, start_of: (Int) -> Int) -> Int / {abort.raise} =
+  iterate({ lo: 0, hi: n }, 64, |s: { lo: Int, hi: Int }|
+    if s.lo >= s.hi { Stop(s.lo) } else {
+      let mid = (s.lo + s.hi) / 2;
+      if start_of(mid) < at { Continue({ lo: mid + 1, hi: s.hi }) }
+      else { Continue({ lo: s.lo, hi: mid }) }
+    })
+
+fn token_start(input: Input, i: Int) -> Int =
+  match list_at(input.tokens, i) { Some(t) -> t.start, None -> 0 }
+
+fn comment_start(input: Input, i: Int) -> Int =
+  match list_at(input.comments, i) { Some(c) -> c.start, None -> 0 }
+
+// The comments marked `mark` from `from` up to `to`, as one block.
+fn docs_between(
+  input: Input,
+  from: Int,
+  to: Int,
+  mark: lexer::DocMark,
+) -> Option<Doc> / {abort.raise} = {
+  let first = first_from(len(input.comments), from, |i: Int| comment_start(input, i));
+  let found = iterate(
+    { i: first, out: [] },
+    len(input.comments) - first + 1,
+    |s: { i: Int, out: List<lexer::Comment> }|
+      match list_at(input.comments, s.i) {
+        Some(c) -> if c.start >= to { Stop(s.out) } else {
+          let taken = lexer::doc_mark(input.source, c) == Some(mark);
+          Continue({ i: s.i + 1, out: if taken { push(s.out, c) } else { s.out } })
+        },
+        None -> Stop(s.out),
+      },
+  );
+  match list_at(found, 0) {
+    None -> None,
+    Some(head) -> {
+      let last = match list_at(found, len(found) - 1) { Some(c) -> c, None -> head };
+      Some({
+        lines: map(found, |c: lexer::Comment| lexer::doc_line(input.source, c)),
+        span: { start: head.start, end: last.end },
+      })
+    },
+  }
+}
+
+// The `///` lines in the trivia before the token that starts at `at`.
+pub fn doc_at(input: Input, at: Int) -> Option<Doc> / {abort.raise} = {
+  let i = first_from(input.token_count, at, |k: Int| token_start(input, k));
+  let from = if i == 0 { 0 }
+  else { match list_at(input.tokens, i - 1) { Some(t) -> t.end, None -> 0 } };
+  docs_between(input, from, at, lexer::ItemDoc)
+}
+
+// The `//!` lines before the module's first token.
+pub fn module_doc(input: Input) -> Option<Doc> / {abort.raise} =
+  docs_between(input, 0, token_start(input, 0), lexer::ModuleDoc)
+
+// Whether a token starts after `from` and before `to`: two comments with none between share a gap.
+pub fn token_between(input: Input, from: Int, to: Int) -> Bool / {abort.raise} = {
+  let i = first_from(input.token_count, from, |k: Int| token_start(input, k));
+  i < input.token_count && token_start(input, i) < to
+}
 
 // Answers the current span and moves on, except at the last token, where it stays.
 pub fn advance(input: Input, parser: Parser) -> Parsed<Span> =
@@ -719,6 +802,9 @@ pub fn dump_list<a | e>(xs: List<a>, f: (a) -> Bytes / e) -> Bytes / e =
 
 pub fn dump_opt<a | e>(o: Option<a>, f: (a) -> Bytes / e) -> Bytes / e =
   match o { None -> dump_presence(false), Some(x) -> bytes_concat(dump_presence(true), f(x)) }
+
+pub fn dump_doc(doc: Doc) -> Bytes / {abort.raise} =
+  bytes_concat(dump_node(doc.span, b"doc"), dump_list(doc.lines, dump_payload))
 
 pub fn dump_ident(ident: Ident) -> Bytes / {abort.raise} =
   bytes_concat(dump_node(ident.span, b"ident"), dump_payload(ident.name))
