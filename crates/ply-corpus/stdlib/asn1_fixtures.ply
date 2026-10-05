@@ -1,0 +1,345 @@
+//! `std.asn1` against DER another program wrote: two self-signed certificates and their keys, made
+//! with `openssl` for this suite and protecting nothing. A shipped module embeds no file, so the
+//! tests that read files stand here, beside the program that runs the standard library's own.
+
+import std.asn1
+import std.asn1 (asn1, Bits, Read, Reader, Text, Time, Value)
+import std.bigint
+import std.bytes (bytes_of_hex)
+import std.list (flatten)
+import std.oid
+import std.oid (Oid)
+
+type Fixture = { name: String, bytes: Bytes }
+
+fn fixtures() -> List<Fixture> = embed_dir("asn1")
+
+fn rsa_certificate() -> Bytes = embed("asn1/rsa_certificate.der")
+
+fn rsa_key() -> Bytes = embed("asn1/rsa_key.der")
+
+fn ec_certificate() -> Bytes = embed("asn1/ec_certificate.der")
+
+fn ec_key() -> Bytes = embed("asn1/ec_key.der")
+
+type Attribute = { id: Oid, value: String }
+
+type Algorithm = { id: Oid, parameters: Option<Value> }
+
+type Extension = { id: Oid, critical: Bool, value: Bytes }
+
+type Body = {
+  version: Int,
+  serial: Bytes,
+  signed_with: Algorithm,
+  issuer: List<Attribute>,
+  not_before: Time,
+  not_after: Time,
+  subject: List<Attribute>,
+  key_algorithm: Algorithm,
+  key: Bits,
+  extensions: List<Extension>,
+}
+
+type Certificate = { signed: Bytes, body: Body, algorithm: Algorithm, signature: Bits }
+
+fn algorithm(r: Reader) -> Read<Algorithm> / {asn1.refused, abort.raise} =
+  asn1::within(asn1::read_sequence(r), |fields: Reader| {
+    let id = asn1::read_oid(fields);
+    if asn1::is_empty(id.rest) { { value: { id: id.value, parameters: None }, rest: id.rest } }
+    else {
+      let parameters = asn1::read_any(id.rest);
+      { value: { id: id.value, parameters: Some(parameters.value) }, rest: parameters.rest }
+    }
+  })
+
+fn attribute(r: Reader) -> Read<Attribute> / {asn1.refused, abort.raise} =
+  asn1::within(asn1::read_sequence(r), |fields: Reader| {
+    let id = asn1::read_oid(fields);
+    let value = asn1::read_any(id.rest);
+    {
+      value: { id: id.value, value: match value.value { Text(_, text) -> text, _ -> "" } },
+      rest: value.rest,
+    }
+  })
+
+fn name(r: Reader) -> Read<List<Attribute>> / {asn1.refused, abort.raise} = {
+  let sets = asn1::read_sequence_of(r, |x: Reader| asn1::read_set_of(x, attribute));
+  { value: flatten(sets.value), rest: sets.rest }
+}
+
+fn extension(r: Reader) -> Read<Extension> / {asn1.refused, abort.raise} =
+  asn1::within(asn1::read_sequence(r), |fields: Reader| {
+    let id = asn1::read_oid(fields);
+    let critical = asn1::read_default(id.rest, asn1::universal(1), false, asn1::read_boolean);
+    let value = asn1::read_octet_string(critical.rest);
+    { value: { id: id.value, critical: critical.value, value: value.value }, rest: value.rest }
+  })
+
+fn body(r: Reader) -> Read<Body> / {asn1.refused, abort.raise} =
+  asn1::within(asn1::read_sequence(r), |fields: Reader| {
+    let version = asn1::read_default(fields, asn1::context(0), 0, |x: Reader|
+      asn1::read_explicit(x, asn1::context(0), asn1::read_int));
+    let serial = asn1::read_unsigned(version.rest);
+    let signed_with = algorithm(serial.rest);
+    let issuer = name(signed_with.rest);
+    let validity = asn1::read_sequence(issuer.rest);
+    let not_before = asn1::read_time(validity.value);
+    let not_after = asn1::read_time(not_before.rest);
+    asn1::finish(not_after.rest);
+    let subject = name(validity.rest);
+    let key_info = asn1::read_sequence(subject.rest);
+    let key_algorithm = algorithm(key_info.value);
+    let key = asn1::read_bit_string(key_algorithm.rest);
+    asn1::finish(key.rest);
+    let extensions = asn1::read_optional(key_info.rest, asn1::context(3), |x: Reader|
+      asn1::read_explicit(x, asn1::context(3), |y: Reader| asn1::read_sequence_of(y, extension)));
+    {
+      value: {
+        version: version.value,
+        serial: serial.value,
+        signed_with: signed_with.value,
+        issuer: issuer.value,
+        not_before: not_before.value,
+        not_after: not_after.value,
+        subject: subject.value,
+        key_algorithm: key_algorithm.value,
+        key: key.value,
+        extensions: match extensions.value { Some(found) -> found, None -> [] },
+      },
+      rest: extensions.rest,
+    }
+  })
+
+fn certificate(r: Reader) -> Read<Certificate> / {asn1.refused, abort.raise} =
+  asn1::within(asn1::read_sequence(r), |fields: Reader| {
+    let signed = asn1::read_raw(fields);
+    let read = body(fields);
+    let signed_with = algorithm(read.rest);
+    let signature = asn1::read_bit_string(signed_with.rest);
+    {
+      value: {
+        signed: signed.value,
+        body: read.value,
+        algorithm: signed_with.value,
+        signature: signature.value,
+      },
+      rest: signature.rest,
+    }
+  })
+
+fn at_midnight(year: Int, month: Int, day: Int) -> Time =
+  { year: year, month: month, day: day, hour: 0, minute: 0, second: 0, nanosecond: 0 }
+
+fn value_of(extensions: List<Extension>, id: Oid) -> Bytes / {abort.raise} =
+  match filter(extensions, |e: Extension| e.id == id) {
+    [found, ..] -> found.value,
+    [] -> panic(f"no extension {id}"),
+  }
+
+test "{f.name} reads as a tree and writes back byte for byte" for f: Fixture in fixtures() {
+  assert_eq(asn1::write(asn1::read(f.bytes, 12)), f.bytes)
+}
+
+test "a certificate's fields are what openssl printed of it" {
+  let c = asn1::read_with(rsa_certificate(), 12, certificate);
+  let names = [
+    { id: oid::country_name(), value: "US" },
+    { id: oid::organization_name(), value: "Ply Fixtures" },
+    { id: oid::common_name(), value: "asn1.example" },
+  ];
+  assert_eq(c.body.version, 2);
+  assert_eq(c.body.serial, bytes_of_hex("c0ffee0123456789abcdef"));
+  assert_eq(c.body.signed_with, { id: oid"1.2.840.113549.1.1.11", parameters: Some(asn1::Null) });
+  assert_eq(c.algorithm, c.body.signed_with);
+  assert_eq(c.body.issuer, names);
+  assert_eq(c.body.subject, names);
+  assert_eq(c.body.not_before, at_midnight(2026, 1, 1));
+  assert_eq(c.body.not_after, at_midnight(2036, 1, 1));
+  assert_eq(c.body.key_algorithm.id, oid::rsa_encryption());
+  assert_eq(map(c.body.extensions, |e: Extension| { id: f"{e.id}", critical: e.critical }), [
+    { id: "2.5.29.14", critical: false },
+    { id: "2.5.29.35", critical: false },
+    { id: "2.5.29.17", critical: false },
+    { id: "2.5.29.19", critical: true },
+    { id: "2.5.29.15", critical: true },
+  ]);
+  assert_eq((c.signature.unused, bytes_len(c.signature.bytes)), (0, 256));
+  assert_eq(bytes_len(c.signed), 639)
+}
+
+test "a certificate's extensions are DER inside an OCTET STRING" {
+  let extensions = asn1::read_with(rsa_certificate(), 12, certificate).body.extensions;
+  assert_eq(
+    asn1::read_with(
+      value_of(extensions, oid::subject_key_identifier()),
+      1,
+      asn1::read_octet_string,
+    ),
+    bytes_of_hex("6f071f05d85f23f2021815a89080801ec4077902"),
+  );
+  let constraints = asn1::read_with(
+    value_of(extensions, oid::basic_constraints()),
+    1,
+    |r: Reader|
+      asn1::within(asn1::read_sequence(r), |fields: Reader| {
+        let authority = asn1::read_default(fields, asn1::universal(1), false, asn1::read_boolean);
+        let path = asn1::read_optional(authority.rest, asn1::universal(2), asn1::read_int);
+        { value: { authority: authority.value, path: path.value }, rest: path.rest }
+      }),
+  );
+  assert_eq(constraints, { authority: true, path: Some(0) });
+  let usage = asn1::read_with(value_of(extensions, oid::key_usage()), 1, asn1::read_named_bits);
+  assert_eq(map(range(0, 9), |i: Int| asn1::bit_at(usage, i)), [
+    true,
+    false,
+    false,
+    false,
+    false,
+    true,
+    false,
+    false,
+    false,
+  ]);
+  let names = asn1::read_with(value_of(extensions, oid::subject_alt_name()), 1, |r: Reader|
+    asn1::read_sequence_of(r, |x: Reader|
+      if asn1::peek(x) == Some(asn1::context(2)) {
+        asn1::read_implicit(x, asn1::context(2), |y: Reader| asn1::read_string(y, asn1::Ia5String))
+      } else {
+        let address = asn1::read_primitive(x, asn1::context(7));
+        { value: f"{bytes_len(address.value)} octets", rest: address.rest }
+      }));
+  assert_eq(names, ["asn1.example", "*.asn1.example", "4 octets"]);
+  let key_id = asn1::read_with(
+    value_of(extensions, oid::authority_key_identifier()),
+    1,
+    |r: Reader|
+      asn1::within(asn1::read_sequence(r), |fields: Reader|
+        asn1::read_implicit(fields, asn1::context(0), asn1::read_octet_string)),
+  );
+  assert_eq(key_id, bytes_of_hex("6f071f05d85f23f2021815a89080801ec4077902"))
+}
+
+test "a certificate is rebuilt from what was read of it" {
+  let c = asn1::read_with(rsa_certificate(), 12, certificate);
+  assert_eq(
+    asn1::sequence([
+      c.signed,
+      asn1::sequence([asn1::oid(c.algorithm.id), asn1::null()]),
+      asn1::bit_string(c.signature),
+    ]),
+    rsa_certificate(),
+  );
+  let names = map(c.body.subject, |a: Attribute|
+    asn1::set_of([
+      asn1::sequence([
+        asn1::oid(a.id),
+        asn1::string(
+          if a.id == oid::country_name() { asn1::PrintableString } else { asn1::Utf8String },
+          a.value,
+        ),
+      ]),
+    ]));
+  assert_eq(
+    asn1::sequence([
+      asn1::explicit(asn1::context(0), asn1::int(c.body.version)),
+      asn1::unsigned(c.body.serial),
+      asn1::sequence([asn1::oid(c.body.signed_with.id), asn1::null()]),
+      asn1::sequence(names),
+      asn1::sequence([asn1::time(c.body.not_before), asn1::time(c.body.not_after)]),
+      asn1::sequence(names),
+      asn1::sequence([
+        asn1::sequence([asn1::oid(c.body.key_algorithm.id), asn1::null()]),
+        asn1::bit_string(c.body.key),
+      ]),
+      asn1::explicit(
+        asn1::context(3),
+        asn1::sequence(
+          map(c.body.extensions, |e: Extension|
+            asn1::sequence(if e.critical {
+              [asn1::oid(e.id), asn1::boolean(true), asn1::octet_string(e.value)]
+            } else { [asn1::oid(e.id), asn1::octet_string(e.value)] })),
+        ),
+      ),
+    ]),
+    c.signed,
+  )
+}
+
+test "an RSA key's primes multiply to the modulus its certificate carries" {
+  // An `RSAPrivateKey` is nine numbers: its version, the modulus, the two exponents, the two
+  // primes, and what the Chinese remainder theorem keeps of them.
+  let numbers = asn1::read_with(rsa_key(), 1, |r: Reader|
+    asn1::read_sequence_of(r, asn1::read_big_int));
+  match numbers {
+    [version, modulus, public, private, p, q, private_mod_p, private_mod_q, _] -> {
+      assert_eq(version, bigint::zero());
+      assert_eq(p * q, modulus);
+      assert_eq(public, bigint::of_int(65537));
+      assert_eq(bigint::modulo(private, p - bigint::one()), Some(private_mod_p));
+      assert_eq(bigint::modulo(private, q - bigint::one()), Some(private_mod_q));
+      let carried = asn1::read_with(
+        asn1::read_with(rsa_certificate(), 12, certificate).body.key.bytes,
+        1,
+        |r: Reader|
+          asn1::within(asn1::read_sequence(r), |fields: Reader| {
+            let n = asn1::read_big_int(fields);
+            let e = asn1::read_int(n.rest);
+            { value: { modulus: n.value, exponent: e.value }, rest: e.rest }
+          }),
+      );
+      assert_eq(carried, { modulus: modulus, exponent: 65537 });
+      assert_eq(bytes_len(asn1::integer_of_big_int(modulus)), 257)
+    },
+    _ -> panic("an RSA key holds nine numbers"),
+  };
+  assert_eq(asn1::sequence(map(numbers, asn1::big_int)), rsa_key())
+}
+
+test "a certificate past 2049 writes its time the other way, and its key is its signer's" {
+  let c = asn1::read_with(ec_certificate(), 12, certificate);
+  assert_eq(c.body.not_before, {
+    year: 2049,
+    month: 12,
+    day: 31,
+    hour: 23,
+    minute: 59,
+    second: 59,
+    nanosecond: 0,
+  });
+  assert_eq(c.body.not_after, at_midnight(2060, 1, 1));
+  assert_eq(asn1::time(c.body.not_before), b"\x17\x0d491231235959Z");
+  assert_eq(asn1::time(c.body.not_after), b"\x18\x0f20600101000000Z");
+  assert_eq(c.body.key_algorithm, {
+    id: oid::ec_public_key(),
+    parameters: Some(asn1::ObjectId(oid::prime256v1())),
+  });
+  assert_eq(c.algorithm, { id: oid::ecdsa_with_sha256(), parameters: None });
+  let halves = asn1::read_with(c.signature.bytes, 1, |r: Reader|
+    asn1::read_sequence_of(r, asn1::read_unsigned));
+  assert_eq(map(halves, bytes_len), [32, 32]);
+  let key = asn1::read_with(ec_key(), 2, |r: Reader|
+    asn1::within(asn1::read_sequence(r), |fields: Reader| {
+      let version = asn1::read_int(fields);
+      let of = algorithm(version.rest);
+      let held = asn1::read_octet_string(of.rest);
+      { value: { version: version.value, algorithm: of.value, held: held.value }, rest: held.rest }
+    }));
+  assert_eq((key.version, key.algorithm), (0, c.body.key_algorithm));
+  let private = asn1::read_with(key.held, 2, |r: Reader|
+    asn1::within(asn1::read_sequence(r), |fields: Reader| {
+      let version = asn1::read_int(fields);
+      let scalar = asn1::read_octet_string(version.rest);
+      let point = asn1::read_explicit(scalar.rest, asn1::context(1), asn1::read_bit_string);
+      {
+        value: { version: version.value, scalar: bytes_len(scalar.value), point: point.value },
+        rest: point.rest,
+      }
+    }));
+  assert_eq(private, { version: 1, scalar: 32, point: c.body.key });
+  assert_eq((c.body.key.unused, bytes_len(c.body.key.bytes), bytes_at(c.body.key.bytes, 0)), (
+    0,
+    65,
+    4,
+  ))
+}
