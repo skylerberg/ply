@@ -4,7 +4,7 @@
 import std.bin
 import std.list (at, concat, drop, take)
 import parsing (Span, Ident, QName, ParseDiag, Label, span_to, dummy_span, bare, span_key, error_at,
-                error_at_and, parse_diag, parse_label, dump_diags, is_bare)
+                error_at_and, parse_diag, parse_label, dump_diags, is_bare, positional)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, nullary, is_generic)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
@@ -13,8 +13,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               LawDef, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
-              ReturnClause, RecField, expr_span)
+              EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm,
+              HandleClause, ReturnClause, RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt, LStr,
                  LBool)
 import std.bytes (ascii_of_int)
@@ -48,6 +48,7 @@ pub fn is_pure(e: Expr) -> Bool =
     ESimulate(_) -> false,
     EParallel(v) -> fold(v.branches, true, |acc: Bool, x: Expr| acc && is_pure(x)),
     ETry(_) -> false,
+    ETryBlock(_) -> false,
     ELit(_) -> true,
     EVar(_) -> true,
     EBad(_) -> true,
@@ -200,6 +201,7 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
       }),
     ESimulate(x) -> ESimulate({ span: x.span, body: go(x.body) }),
     EParallel(x) -> EParallel({ span: x.span, branches: map(x.branches, go) }),
+    ETryBlock(t) -> ETryBlock({ ..t, body: go(t.body) }),
     _ -> e,
   })
 }
@@ -416,6 +418,94 @@ pub fn expand_witnesses(
       ..module,
       items: map(module.items, |item: Item|
         witness_params(orders, map_item(item, |expr: Expr| witnessed(ops, refs, expr)))),
+    }
+  }
+
+// --- The try block ---------------------------------------------------------------------------
+// `try { body }` is the `handle` whose one clause answers `Err` of what the raise carried and whose
+// `return` answers `Ok`. Which raise is the checker's to say: a `try` that names none reads it off
+// its body's row, and the module writing it may have no name for that effect.
+
+// A raise by its effect's program-wide name, and how many values it carries.
+pub type Answered = { effect: Bytes, op: Bytes, arity: Int }
+
+// No source can spell it, so it names an effect the same in every module.
+pub fn program_wide(name: Bytes) -> Bytes = bytes_concat(b"?", name)
+
+// The effect a clause names program-wide, for a name `program_wide` wrote.
+pub fn named_program_wide(written: Bytes) -> Option<Bytes> / {abort.raise} =
+  if bytes_starts_with(written, b"?") { Some(bytes_slice(written, 1, bytes_len(written))) }
+  else { None }
+
+fn carried(binders: List<Ident>, span: Span) -> Expr =
+  match binders {
+    [] -> ELit({ span: span, lit: LUnit }),
+    [one] -> var_of(one),
+    _ ->
+      ERecord({
+        span: span,
+        fields: map(range(0, len(binders)), |i: Int|
+          match list_at(binders, i) {
+            Some(b) -> { name: positional(i, span), value: var_of(b) },
+            None -> { name: positional(i, span), value: ELit({ span: span, lit: LUnit }) },
+          }),
+      }),
+  }
+
+fn answer(ctor: Bytes, value: Expr, span: Span) -> Expr =
+  EApp({
+    span: span,
+    func: var_of({ name: ctor, span: span }),
+    named: [],
+    args: [value],
+    labels: [],
+  })
+
+// A span the table does not hold belongs to a program that did not check; the lowering declines it.
+fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
+  match expr {
+    ETryBlock(t) -> match map_get(answered, span_key(t.span)) {
+      None -> expr,
+      Some(a) -> {
+        let binders = map(range(0, a.arity), |i: Int|
+          { name: bytes_concat(b"?r", ascii_of_int(i)), span: t.span });
+        let returned = { name: b"?v", span: t.span };
+        EHandle({
+          span: t.span,
+          body: t.body,
+          ret: Some({
+            binder: returned,
+            body: answer(b"Ok", var_of(returned), t.span),
+            span: t.span,
+          }),
+          clauses: [
+            {
+              eff: bare({ name: program_wide(a.effect), span: t.span }),
+              op: { name: a.op, span: t.span },
+              resource: None,
+              every_label: false,
+              label_binder: None,
+              resume: None,
+              body: answer(b"Err", carried(binders, t.span), t.span),
+              span: t.span,
+              params: binders,
+            },
+          ],
+        })
+      },
+    },
+    _ -> expr,
+  }
+
+fn is_try_block(expr: Expr) -> Bool = match expr { ETryBlock(_) -> true, _ -> false }
+
+// Every `try` of a checked module replaced by the `handle` it stands for.
+pub fn expand_try_blocks(module: Module, answered: Map<Bytes, Answered>) -> Module =
+  if !any_expr(module, is_try_block) { module } else {
+    {
+      ..module,
+      items: map(module.items, |item: Item|
+        map_item(item, |expr: Expr| expanded_try(answered, expr))),
     }
   }
 
@@ -1410,6 +1500,10 @@ fn sweep_inner(
       let o = sweep_all(state, x.branches, scope, under(barrier, b"a `parallel` branch"), room);
       { state: o.state, expr: EParallel({ span: x.span, branches: o.exprs }) }
     },
+    ETryBlock(x) -> {
+      let o = sweep_within(state, x.body, scope, under(barrier, b"a `try` body"), room);
+      { state: o.state, expr: ETryBlock({ ..x, body: o.expr }) }
+    },
     _ -> { state: state, expr: expr },
   }
 
@@ -1632,6 +1726,7 @@ fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
       EWithCell(c) -> count_in(c.init, p) + count_in(c.body, p),
       ESimulate(x) -> count_in(x.body, p),
       EParallel(x) -> all(x.branches),
+      ETryBlock(x) -> count_in(x.body, p),
       _ -> 0,
     })
 }
@@ -2079,6 +2174,32 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
     dump_expanded(b"fn f(n: Int) = g(n)?"),
     "#0;#1;0:20:fn;%priv;?0;?0;?0;3:4:ident;@66;%gen;#0;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?0;?0;#0;#0;15:19:eapp;15:16:evar;15:16:qname;?0;15:16:ident;@67;#1;17:18:evar;17:18:qname;?0;17:18:ident;@6e;#0;#0;#1;!E0118:15:20:1:1;=15:20:1;",
   )
+}
+
+test "a `?` inside a `try` is refused, as one inside a `handle` is" {
+  let out = dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let r = try { g(n)? }; Ok(1) }");
+  assert(string_contains(out, "!E0118"))
+}
+
+test "a `try` the checker read is written out as its `handle`, and one it did not is left" {
+  let module = parse(b"fn f(n: Int) -> Int = try { g(n) }").node;
+  let written = |answered: Map<Bytes, Answered>|
+    string_of_bytes(dump_module(expand_try_blocks(module, answered)));
+  let left = written(map_new());
+  assert(string_contains(left, "22:34:etrb;"));
+  let out = written(
+    map_insert(map_new(), span_key({ start: 22, end: 34 }), {
+      effect: b"m.p",
+      op: b"bad",
+      arity: 2,
+    }),
+  );
+  assert(string_contains(out, "22:34:ehnd;"));
+  // The clause names its effect program-wide, as `?m.p`, and answers the tuple of what it binds.
+  assert(string_contains(out, "@3f6d2e70;"));
+  assert(string_contains(out, "@5f31;"));
+  assert_eq(named_program_wide(program_wide(b"m.p")), Some(b"m.p"));
+  assert_eq(named_program_wide(b"p"), None)
 }
 
 test "a `?` on a `let` with a written type keeps the annotation" {

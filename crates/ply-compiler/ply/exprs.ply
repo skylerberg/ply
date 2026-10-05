@@ -9,11 +9,11 @@ import parsing (positional, Span, Ident, QName, Input, Parser, Parsed, Eaten, So
                 expect_close, expect_ident, expect_binder, expect_field_name, keyword_pun_refusal,
                 with_no_brace, too_deep, start, qname, comma_list, token_lparen, token_rparen,
                 token_lbrace, token_rbrace, token_lbracket, token_rbracket, token_comma, token_semi,
-                token_colon, token_dot, token_dotdot, token_arrow, token_eq, token_pipe,
-                token_pipepipe, token_question, token_star, keyword_let, keyword_if, keyword_else,
-                keyword_with, dump_node, dump_count, dump_presence, dump_word, dump_list, dump_opt,
-                dump_ident, dump_qname, dump_diags, with_no_pipe, advance_n, token_at, token_gt,
-                token_lt, max_depth)
+                token_colon, token_coloncolon, token_dot, token_dotdot, token_arrow, token_eq,
+                token_pipe, token_pipepipe, token_question, token_star, keyword_let, keyword_if,
+                keyword_else, keyword_with, dump_node, dump_count, dump_presence, dump_word,
+                dump_list, dump_opt, dump_ident, dump_qname, dump_diags, with_no_pipe, advance_n,
+                token_at, token_gt, token_lt, max_depth)
 import lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLiteral, FloatLiteral,
               DecimalLiteral, StringLiteral, LineString, BytesLiteral, InterpolatedHead,
               InterpolatedMiddle, InterpolatedTail, CharLiteral, Keyword, Punctuation, EndOfInput)
@@ -46,6 +46,11 @@ pub type Expr =
   // `parallel { a, b }`: the branches' answers as a tuple, which means evaluating them left to right.
   | EParallel({ span: Span, branches: List<Expr> })
   | EBad({ span: Span })
+  // `try { body }`: `Ok` of what the body answers, or `Err` of what one raise in it carried. With
+  // no `raise` written, the checker reads which one off the body's row.
+  | ETryBlock({ span: Span, raise: Option<RaiseName>, body: Expr })
+
+pub type RaiseName = { eff: QName, op: Ident }
 
 pub type RecField = { name: Ident, value: Expr }
 
@@ -115,6 +120,7 @@ pub fn expr_span(expr: Expr) -> Span =
     ESimulate(v) -> v.span,
     EParallel(v) -> v.span,
     EBad(v) -> v.span,
+    ETryBlock(v) -> v.span,
   }
 
 fn set_span(expr: Expr, span: Span) -> Expr =
@@ -142,6 +148,7 @@ fn set_span(expr: Expr, span: Span) -> Expr =
     ESimulate(v) -> ESimulate({ span: span, body: v.body }),
     EParallel(v) -> EParallel({ span: span, branches: v.branches }),
     EBad(v) -> EBad({ span: span }),
+    ETryBlock(v) -> ETryBlock({ ..v, span: span }),
   }
 
 // Ends in `}`, so it may stand as a statement without `;` and as a match arm without `,`.
@@ -154,6 +161,7 @@ pub fn is_block_like(expr: Expr) -> Bool =
     EWithCell(v) -> true,
     ESimulate(v) -> true,
     EParallel(v) -> true,
+    ETryBlock(v) -> true,
     _ -> false,
   }
 
@@ -603,7 +611,8 @@ fn primary_ident(
   } else if name == b"simulate" && !parser.no_brace
       && token_kind_at(input, parser, 1) == token_lbrace() { simulate_expr(input, parser) }
   else if name == b"parallel" && !parser.no_brace
-      && token_kind_at(input, parser, 1) == token_lbrace() { parallel_expr(input, parser) } else {
+      && token_kind_at(input, parser, 1) == token_lbrace() { parallel_expr(input, parser) }
+  else if name == b"try" && opens_try(input, parser) { try_expr(input, parser) } else {
     let { parser, node: q } = qname(input, parser, b"an expression")?;
     Ok({ parser: parser, node: EVar({ span: q.span, name: q }) })
   }
@@ -1661,6 +1670,50 @@ fn simulate_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> /
   Ok({ parser: parser, node: ESimulate({ span: span_to(st.node, expr_span(body)), body: body }) })
 }
 
+// `try` is the block's wherever a `{` follows it, a scrutinee included, so `match try { .. } { .. }`
+// reads; before `[` it is one only when the bracket names an operation, which no label does.
+fn opens_try(input: Input, parser: Parser) -> Bool =
+  token_kind_at(input, parser, 1) == token_lbrace()
+    || (token_kind_at(input, parser, 1) == token_lbracket()
+    && (match token_kind_at(input, parser, 2) { Identifier(_) -> true, _ -> false })
+    && (token_kind_at(input, parser, 3) == token_dot()
+    || token_kind_at(input, parser, 3) == token_coloncolon()))
+
+fn try_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let saved = st.parser.no_brace;
+  match try_rest(input, with_no_brace(st.parser, false), st.node) {
+    Err(q) -> Err(with_no_brace(q, saved)),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
+  }
+}
+
+fn try_rest(
+  input: Input,
+  parser: Parser,
+  start: Span,
+) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
+  let { parser, node: raise } = try_raise(input, parser)?;
+  let { parser, node: body } = block_expr(input, parser)?;
+  Ok({
+    parser: parser,
+    node: ETryBlock({ span: span_to(start, expr_span(body)), raise: raise, body: body }),
+  })
+}
+
+fn try_raise(
+  input: Input,
+  parser: Parser,
+) -> Result<Parsed<Option<RaiseName>>, Parser> / {abort.raise} =
+  if !at_token(input, parser, token_lbracket()) { Ok({ parser: parser, node: None }) } else {
+    let o = advance(input, parser);
+    let { parser, node: eff } = qname(input, o.parser, b"an effect name")?;
+    let { parser, .. } = expect(input, parser, token_dot(), b"`.` and the operation name")?;
+    let { parser, node: op } = expect_ident(input, parser, b"an operation name")?;
+    let { parser, .. } = expect_close(input, parser, token_rbracket(), o.node, b"`]`")?;
+    Ok({ parser: parser, node: Some({ eff: eff, op: op }) })
+  }
+
 fn parallel_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let saved = st.parser.no_brace;
@@ -1773,6 +1826,12 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
     ESimulate(v) -> bytes_concat(dump_node(v.span, b"esim"), dump_expr(v.body)),
     EParallel(v) -> bytes_concat(dump_node(v.span, b"epar"), dump_list(v.branches, dump_expr)),
     EBad(v) -> dump_node(v.span, b"ebad"),
+    ETryBlock(v) ->
+      bytes_concat_all([
+        dump_node(v.span, b"etrb"),
+        dump_opt(v.raise, |r: RaiseName| bytes_concat(dump_qname(r.eff), dump_ident(r.op))),
+        dump_expr(v.body),
+      ]),
   }
 
 fn dump_field(field: RecField) -> Bytes / {abort.raise} =
@@ -1898,6 +1957,7 @@ pub fn node_count(expr: Expr) -> Int =
     ESimulate(v) -> 1 + node_count(v.body),
     EParallel(v) -> 1 + count_all(v.branches),
     EBad(v) -> 1,
+    ETryBlock(v) -> 1 + node_count(v.body),
   }
 
 fn count_all(exprs: List<Expr>) -> Int = fold(exprs, 0, |n: Int, expr: Expr| n + node_count(expr))
@@ -2424,4 +2484,15 @@ test "`parallel` is contextual, takes two or more branches, and nests" {
   assert_eq(dump_expr_of(b"parallel"), "0:8:evar;0:8:qname;?0;0:8:ident;@706172616c6c656c;#0;");
   assert(string_contains(dump_expr_of(b"if parallel { 1 }"), "3:11:evar;"));
   assert(string_contains(dump_expr_of(b"parallel { 1 }"), "!E0001:"))
+}
+
+test "`try` opens a block wherever a `{` follows it, and names a raise in brackets" {
+  assert(string_contains(dump_expr_of(b"try { 1 }"), "0:9:etrb;?0;"));
+  assert(string_contains(dump_expr_of(b"try[m::p.bad] { 1 }"), "0:19:etrb;?1;"));
+  // A scrutinee may be one: no name is followed by a block there.
+  assert(string_contains(dump_expr_of(b"match try { 1 } { _ -> 2 }"), "6:15:etrb;?0;"));
+  // A name wherever neither shape holds: alone, and before a label.
+  assert_eq(dump_expr_of(b"try"), "0:3:evar;0:3:qname;?0;0:3:ident;@747279;#0;");
+  assert(string_contains(dump_expr_of(b"try[conn](1)"), "0:3:evar;"));
+  assert(string_contains(dump_expr_of(b"try[p.bad] 1"), "!E0001:"))
 }

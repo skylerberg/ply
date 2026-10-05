@@ -140,6 +140,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | --- | --- |
 | `as` | in an `import`, after the module path |
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
+| `raise` | opening an operation declaration (§6.8) |
 | `set` | `effect set X = {..}` |
 | `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
@@ -150,6 +151,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
 | `with_cell` | before `[` |
 | `simulate` | before `{` where an expression can start |
+| `try` | before `{`, or before `[` and an operation's name, where an expression can start (§6.8) |
 
 ### 2.3 Literals
 
@@ -861,7 +863,7 @@ it and the function's result and everything evaluated before it is pure:
 `let x = e?;`, or `parse_or_more(parse_and(ts)?)`.
 
 * It converts no errors: `Result<_, E1>` inside `-> Result<_, E2>` is `E0201`.
-* `E0118`: inside a `handle`, `with_cell` or `simulate`; inside a
+* `E0118`: inside a `handle`, `try`, `with_cell` or `simulate`; inside a
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
@@ -992,12 +994,19 @@ effect db {
 nondet effect clock {
   read now() -> Int
 }
+
+effect toml {
+  raise syntax(e: SyntaxError)
+}
 ```
 
-Each operation is `read` or `write`. `[r]` makes it resource-parameterized: a
-perform must supply a label (`E0304`). `nondet` marks results that are not a
-function of program state (§8.3). Effects are nominal. `task`, `clock`,
-`random`, `sim`, `abort`, `diverges` and `cell` are taken (`E0105`).
+Each operation is `read`, `write` or `raise`. A `read` or a `write` answers
+where it was performed; a `raise` does not come back, so it writes a name and
+its parameters and no result (§6.8). `[r]` makes a `read` or a `write`
+resource-parameterized: a perform must supply a label (`E0304`). `nondet` marks
+results that are not a function of program state (§8.3). Effects are nominal.
+`task`, `clock`, `random`, `sim`, `abort`, `diverges` and `cell` are taken
+(`E0105`).
 
 An operation's type parameters sit just before its parameters,
 `read take[r]<a>(key: Int) -> a`, and are its only type variables: its
@@ -1013,8 +1022,10 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `/ {store::db.read[users]}`. An atom may instead name an operation,
 `net.send[conn]`, which the mode atom of the same effect and resource
 (`net.write[conn]`) covers; naming an operation the effect does not declare is
-`E0104`. `diverges`, written bare, is the atom of a call that may not return
-(§5.10); it names no operation, and nothing handles it.
+`E0104`. No mode atom stands for a `raise`: a row names each one, `toml.syntax`,
+so a row is the set of ways a call can fail (§6.8). `diverges`, written bare,
+is the atom of a call that may not return (§5.10); it names no operation, and
+nothing handles it.
 
 An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
 a call adds the callee's row as written (a mode atom stays a mode atom), and a
@@ -1075,8 +1086,8 @@ label and talk upstream under another, over one serve loop and one writer
 (§13.1, §13.2).
 
 Two atoms **conflict** iff they name the same resource of the same effect and
-one is a `write`. A label parameter or `[*]` may be any label, so it conflicts
-with every label of its effect. `parallel` (§5.9) and the test scheduler (§8.4)
+one is a `write`; a `raise` conflicts with nothing. A label parameter or `[*]`
+may be any label, so it conflicts with every label of its effect. `parallel` (§5.9) and the test scheduler (§8.4)
 both decide by this.
 
 A row also counts. Each atom a call performs runs a `bounded` number of times,
@@ -1202,7 +1213,7 @@ by its type.
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
-except a clause for `abort.raise` (§6.8).
+except a clause for a `raise` operation (§6.8).
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it
@@ -1224,39 +1235,73 @@ reached the host boundary with nothing bound — pass `--host` or handle it
 ### 6.8 Raising
 
 ```ply
-fn digit(b: Int) -> Int / {abort.raise} =
-  if b >= 48 && b <= 57 { b - 48 } else { abort.raise("not a digit") }
+type SyntaxError = { line: Int, why: String }
+
+effect toml {
+  raise syntax(e: SyntaxError)
+}
+
+fn digit(b: Int, line: Int) -> Int / {toml.syntax} =
+  if b >= 48 && b <= 57 { b - 48 } else { toml.syntax({ line: line, why: "not a digit" }) }
 
 fn digit_or(b: Int, fallback: Int) -> Int / {} =
-  handle { digit(b) } with { abort.raise(reason) -> fallback }
+  handle { digit(b, 1) } with { toml.syntax(e) -> fallback }
+
+fn checked(b: Int) -> Result<Int, SyntaxError> = try { digit(b, 1) }
 ```
 
-The prelude declares `effect abort { read raise<a>(message: String) -> a }`.
-`abort.raise(m)` puts `abort.raise` in the row as any perform does, and does not
-come back. So does everything else that can fail on a value it is given: `panic`,
-`assert` and `assert_eq`, a builtin outside what it is defined for (§12), a `/`
-or `%` by zero (§2.4), a `let` whose pattern misses (§5.1), an `iterate` past
-its budget, a `task.join` of a cancelled task, a `task.channel` of a negative
-capacity and a `random.below` of a bound below one (§9). What a literal argument
-settles does not raise: a divisor other than zero, a capacity or bound in range,
-and a narrowing such as `u8_of_int(200)` of a value its type holds. A signature
-that leaves `abort.raise` out of its row where its body can raise is `E0302`,
-which names the operation and offers the row to write. Overflow, the call
-ceiling and a spent step budget end the run whatever the row says.
+A `raise` operation does not come back to where it was performed. Its perform
+has whatever type is asked of it and puts the operation in the row, as any
+perform does, so a row names each way a call can fail: inference unions them,
+and they pass through a row variable, so `map(lines, parse_line)` raises what
+`parse_line` raises. A declaration is the name and its parameters; it writes no
+result, and takes no resource label and no type parameters (`E0001`).
 
-A clause for `abort.raise` has the `handle`'s type: its value is the `handle`'s,
+A clause for a raise has the `handle`'s type: its value is the `handle`'s,
 `return` is not applied to it, and it cannot bind `resume` (`E0201`). Its
-parameter is the message: `panic`'s argument, or what the run would otherwise
-have reported, a value it names told by its kind. The clause runs outside its
-`handle`, once the body is abandoned and the regions the body opened are closed,
-so a raise in another clause goes to a `handle` further out than the one whose
-clause raised. A raise no clause answers ends the run: `E0501` for an assertion
-and `E0502` for anything else.
+parameters are what the raise carried. The clause runs outside its `handle`,
+once the body is abandoned and the regions the body opened are closed, so a
+raise in another clause goes to a `handle` further out than the one whose
+clause raised. A clause answers the raise it names and leaves the effect's
+others to pass. A raise no clause answers ends the run with `E0502`, naming the
+operation and what it carried; a test's is its failure, which is why a raise is
+in no footprint (§8.4).
 
-A `parallel` branch's raise is answered around the block. A task's raise goes
-to the task's own `handle`s and then to those around its `simulate` region,
-never to the copies its spawn inherited (§9); outside `simulate` it ends the
-run. A `cell_update` whose function raised leaves the cell as it was.
+`try { body }` answers `Ok` of what `body` answers, or `Err` of what a raise in
+it carried: the value for a raise of one parameter, `()` for one of none, and
+the tuple for one of several. It answers the one `raise` operation the body's
+row names, `abort.raise` aside, and takes that atom out of the row; a body that
+names none is `E0311`, and one that names several is `E0312`, where
+`try[toml.syntax] { body }` says which and lets the others pass. Naming an
+operation that is not a `raise` is `E0313`. A `try` is the `handle` with that
+one clause and `return v -> Ok(v)`, so what holds of a `handle` holds of it: a
+recursive group with one in a member's body nests (§5.7), a `?` inside one is
+`E0118`, and so is a `try` in a module that binds an `Ok` or an `Err` of its
+own. An `Err` goes back to its raise through a function:
+`result_unwrap_or_else(r, |e: SyntaxError| toml.syntax(e))` (§13.27).
+
+The prelude declares `effect abort { raise raise(message: String) }`.
+`abort.raise(m)` is that raise, and so is everything else that can fail on a
+value it is given: `panic`, `assert` and `assert_eq`, a builtin outside what it
+is defined for (§12), a `/` or `%` by zero (§2.4), a `let` whose pattern misses
+(§5.1), an `iterate` past its budget, a `task.join` of a cancelled task, a
+`task.channel` of a negative capacity and a `random.below` of a bound below one
+(§9). What a literal argument settles does not raise: a divisor other than
+zero, a capacity or bound in range, and a narrowing such as `u8_of_int(200)` of
+a value its type holds. A signature that leaves `abort.raise` out of its row
+where its body can raise is `E0302`, which names the operation and offers the
+row to write. Overflow, the call ceiling and a spent step budget end the run
+whatever the row says. A clause for `abort.raise` is handed the message:
+`panic`'s argument, or what the run would otherwise have reported, a value it
+names told by its kind. Unanswered, it is `E0501` for an assertion and `E0502`
+for anything else. Nearly every body can raise it, so a `try` answers it only
+by name: `try[abort.raise] { body }`.
+
+A `parallel` branch's raise is answered around the block. A task may raise:
+its raise goes to the task's own `handle`s and then to those around its
+`simulate` region, never to the copies its spawn inherited (§9); outside
+`simulate` it ends the run. A `cell_update` whose function raised leaves the
+cell as it was.
 
 ## 7. Cells and regions
 
@@ -1485,7 +1530,8 @@ effect sim           { read  seed() -> Int }
   wall clock.
 * A task performs against the handlers around its `task.spawn`, so a clause it
   reaches touches only the cells the task itself may (§7); a clause that binds
-  `resume` is unreachable from a task (`E0502`).
+  `resume` is unreachable from a task (`E0502`), and a clause for a raise is
+  not among them (§6.8).
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
   inside a value, or inside a closure that captured it. A closure's type shows a
   captured task only as the `task.join`, `task.await` or `task.cancel` in its
@@ -2908,18 +2954,25 @@ pub type Value =
   | Nil | Flag(Bool) | Int(Int) | Float(Float)
   | Text(String) | Bits(Bytes) | Items(List<Value>) | Fields(List<Field>)
 pub type Field = { key: Value, value: Value }
+pub type Why = | Truncated | TooDeep | Unsupported(Int) | TooWide | NotUtf8 | Trailing
+pub type Refusal = { at: Int, why: Why }
+pub effect msgpack { raise refused(e: Refusal) }
 pub fn msgpack_encode(v: Value) -> Bytes
-pub fn msgpack_decode(data: Bytes) -> Option<Value>
+pub fn msgpack_decode(data: Bytes) -> Result<Value, Refusal>
+pub fn msgpack_read(data: Bytes) -> Value / {msgpack.refused}
 ```
 
 MessagePack: the compact binary form of the same data JSON carries. The subset
 is nil, booleans, integers in every width, float64, UTF-8 text, binary, arrays
 and maps; the writer emits the shortest *signed* encoding a value fits, and the
-reader accepts the `uint` widths too. A reader is total and answers `None` for a
-truncated input, a length that claims more bytes than remain, a value nested
-past 64, a `float32` or an extension type, or a `uint64` above `i63` — checking
-every length against what is left before walking it, so a hostile header cannot
-make it loop.
+reader accepts the `uint` widths too. A reader is total and refuses, with the
+offset it stood at, a truncated input or a length that claims more bytes than
+remain (`Truncated`), a value nested past 64 (`TooDeep`), a `float32`, an
+extension type or the reserved tag (`Unsupported` of the tag), a `uint64` above
+`i63` (`TooWide`), text that is not UTF-8 (`NotUtf8`) and bytes after the one
+value (`Trailing`) — checking every length against what is left before walking
+it, so a hostile header cannot make it loop. `msgpack_read` raises the refusal
+`msgpack_decode` answers as an `Err`, which is the `try` of it (§6.8).
 
 ### 13.24 `std.parse`
 
@@ -3938,7 +3991,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0115` | `effect set` cycle |
 | `E0116` | record update base that is not a record of a known type |
 | `E0117` | record update naming a field the base lacks |
-| `E0118` | `?` with no written `Result`/`Option` return type to exit through |
+| `E0118` | `?` with no written `Result`/`Option` return type to exit through, or a `try` where `Ok` or `Err` is rebound |
 | `E0119` | `?` where its early exit would change what runs or drop an annotation |
 | `E0120` | parameter default on a lambda, operation or handler clause |
 | `E0121` | parameter default that is not a pure, closed value |
@@ -3994,6 +4047,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, a parameter its signature never mentions, or a call from another member of its recursive group |
+| `E0311` | `try` whose body's row names no `raise` operation to answer |
+| `E0312` | `try` whose body's row names several `raise` operations, and it names none |
+| `E0313` | `try` naming an operation that is not a `raise` |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` or `Chan` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
@@ -4043,7 +4099,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0501` | assertion failed |
-| `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
+| `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
 | `E0505` | Ply broke one of its own invariants |
 | `W0601` | cache unreadable |
@@ -4060,8 +4116,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 
 ## 18. What Ply does not have
 
-* No loops, `break` or `return` (`?` is the only early exit, and `abort.raise`
-  the only one past the caller, §6.8); no mutable variables; no exceptions
+* No loops, `break` or `return` (`?` is the only early exit, and a raise the
+  only one past the caller, §6.8); no mutable variables; no exceptions
   outside the row; no typeclasses, implicits or method syntax; no
   modules-as-values or first-class effects; no `unsafe` or FFI: what a program
   reaches outside itself is an effect a handler answers, and the builtins are the

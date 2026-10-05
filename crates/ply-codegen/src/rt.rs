@@ -14,8 +14,8 @@ use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::region::StepSite;
 use ply_eval::sim::Access;
 use ply_eval::{
-    BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Resource, Span, Symbol,
-    Value, codes, values_equal,
+    BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Plain, Resource, Span,
+    Symbol, Value, codes, values_equal,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -280,8 +280,12 @@ pub const FAILED_ABANDONED: i64 = 5;
 pub const FAILED_OUT_OF_STEPS: i64 = 6;
 /// The task was cancelled: it unwinds to its entry, which reports it cancelled rather than failed.
 pub const FAILED_CANCELLED: i64 = 7;
-/// A raise of `abort.raise`: `Ctx::aborting` names the `handle` whose clause answers it.
+/// A raise: `Ctx::aborting` names the `handle` whose clause answers it.
 pub const FAILED_ABORT: i64 = 8;
+
+/// The mode a compiled `perform` of a `raise` operation passes, beside 0 for a read and 1 for a
+/// write.
+const MODE_RAISE: i64 = 2;
 
 /// An installed handler: pushed by a `handle` site, searched innermost-out by a `perform`.
 pub struct HandlerFrame {
@@ -299,13 +303,9 @@ pub struct HandlerFrame {
 }
 
 impl HandlerFrame {
-    /// The closure of the clause for `abort.raise`, taken out of the frame, which keeps the rest.
-    pub(crate) fn take_abort_clause(&mut self) -> Word {
-        let at = self
-            .clauses
-            .iter()
-            .position(FrameClause::answers_abort)
-            .expect("a raise is bound for a frame with a clause for it");
+    /// The closure of the clause a raise is bound for, taken out of the frame, which keeps the
+    /// rest.
+    pub(crate) fn take_clause(&mut self, at: usize) -> Word {
         self.clauses.swap_remove(at).closure
     }
 
@@ -355,13 +355,25 @@ impl Frames {
     }
 }
 
-/// A raise on its way to the `handle` that answers it: that frame's stack and depth, the message
-/// its clause is given, and what the entry fails with should the frame be gone.
+/// A raise on its way to the `handle` that answers it: that frame's stack and depth, which of its
+/// clauses, what the clause is given, and what the entry fails with should the frame be gone.
 pub(crate) struct Aborting {
     pub(crate) stack: usize,
     pub(crate) depth: usize,
-    pub(crate) message: String,
+    pub(crate) clause: usize,
+    /// Held for the clause, which takes them.
+    pub(crate) args: Vec<Word>,
     pub(crate) diagnostic: Diagnostic,
+}
+
+impl Aborting {
+    /// The failure a raise no clause will now answer carries, with what it held let go.
+    pub(crate) fn into_failure(self) -> Diagnostic {
+        for w in self.args {
+            heap::dec(w);
+        }
+        self.diagnostic
+    }
 }
 
 /// One clause, under program-wide effect and resource names.
@@ -370,15 +382,26 @@ pub(crate) struct FrameClause {
     resource: Option<Symbol>,
     op: Symbol,
     closure: Word,
-    /// 0: never resumes; 1: resumes in tail position; 2: elsewhere (only in a detached frame).
+    /// 0: never resumes; 1: resumes in tail position; 2: elsewhere (only in a detached frame);
+    /// 3: answers a raise, once its `handle`'s body is abandoned.
     resumes: u8,
     /// `[*t]`: the clause's first slot after the parameters is the label the call site named.
     binds_label: bool,
 }
 
+/// `abort.raise`, which the runtime itself raises for what fails on a value.
+fn is_abort(effect: &str, op: &str) -> bool {
+    effect == "abort" && op == "raise"
+}
+
 impl FrameClause {
-    fn answers_abort(&self) -> bool {
-        self.effect.as_str() == "abort" && self.op.as_str() == "raise"
+    /// `abort.raise` is a raise whatever its clause is marked: the runtime raises it itself.
+    fn raises(&self) -> bool {
+        self.resumes == 3 || is_abort(self.effect.as_str(), self.op.as_str())
+    }
+
+    fn answers_raise(&self, effect: &str, op: &str) -> bool {
+        self.raises() && self.effect.as_str() == effect && self.op.as_str() == op
     }
 
     fn answers(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) -> bool {
@@ -435,7 +458,7 @@ pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
             // The `handle` a copy stands for may be over before the task raises, so a raise the task
             // does not answer itself leaves for the region's own surroundings instead.
             let (raises, clauses): (Vec<FrameClause>, Vec<FrameClause>) =
-                f.clauses.into_iter().partition(FrameClause::answers_abort);
+                f.clauses.into_iter().partition(FrameClause::raises);
             for cl in raises {
                 heap::dec(cl.closure);
             }
@@ -979,33 +1002,68 @@ impl Ctx {
         if self.failed != 0 {
             return 0;
         }
-        let Some((stack, depth)) = self.abort_handler() else {
+        let Some(at) = self.raise_handler("abort", "raise") else {
             return self.fail(d);
         };
+        let message = self.word(&Value::str(message));
+        self.bind_raise(at, vec![message], d)
+    }
+
+    /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
+    /// entry fails with should that frame be gone.
+    fn bind_raise(&mut self, at: (usize, usize, usize), args: Vec<Word>, d: Diagnostic) -> i64 {
+        let (stack, depth, clause) = at;
         let diagnostic = self.placed(d);
         self.aborting = Some(Aborting {
             stack,
             depth,
-            message,
+            clause,
+            args,
             diagnostic,
         });
         self.failed = FAILED_ABORT;
         0
     }
 
-    /// Searched as a `perform` searches, so frames hidden while a clause runs are passed over.
-    fn abort_handler(&self) -> Option<(usize, usize)> {
+    /// The stack, depth and clause that answer a raise of `effect.op`. Searched as a `perform`
+    /// searches, so frames hidden while a clause runs are passed over.
+    fn raise_handler(&self, effect: &str, op: &str) -> Option<(usize, usize, usize)> {
         let mut stack = self.current;
         loop {
-            let frames = &self.stacks[stack].list;
-            if let Some(depth) = frames
+            let found = self.stacks[stack]
+                .list
                 .iter()
-                .rposition(|f| f.clauses.iter().any(FrameClause::answers_abort))
-            {
-                return Some((stack, depth));
+                .enumerate()
+                .rev()
+                .find_map(|(depth, f)| {
+                    let clause = f
+                        .clauses
+                        .iter()
+                        .position(|cl| cl.answers_raise(effect, op))?;
+                    Some((stack, depth, clause))
+                });
+            if found.is_some() {
+                return found;
             }
             stack = self.stacks[stack].parent?;
         }
+    }
+
+    /// Whether a clause for any raise is in reach.
+    fn raise_in_reach(&self) -> bool {
+        let mut stack = Some(self.current);
+        while let Some(s) = stack {
+            let frames = &self.stacks[s];
+            if frames
+                .list
+                .iter()
+                .any(|f| f.clauses.iter().any(FrameClause::raises))
+            {
+                return true;
+            }
+            stack = frames.parent;
+        }
+        false
     }
 
     /// How a finished branch failed, a raise bound past it as the failure it carries.
@@ -1014,7 +1072,7 @@ impl Ctx {
             return None;
         }
         Some(match self.aborting.take() {
-            Some(a) if self.failed == FAILED_ABORT => (1, Some(a.diagnostic)),
+            Some(a) if self.failed == FAILED_ABORT => (1, Some(a.into_failure())),
             _ => (self.failed, self.diagnostic.take()),
         })
     }
@@ -1898,7 +1956,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             };
             // A raise caught while the cell is still open must find it as it was, so with a clause
             // for one in reach the contents are held twice, and `f` updates a copy.
-            let kept = ctx.abort_handler().is_some().then(|| current.clone());
+            let kept = ctx.raise_in_reach().then(|| current.clone());
             let updated = call_value(std::ptr::from_mut(ctx), *f, &[current.into_word()]);
             let held = match kept {
                 Some(old) if ctx.failed == FAILED_ABORT => old,
@@ -2772,8 +2830,8 @@ pub unsafe extern "C" fn rt_perform(
     let c = unsafe { &mut *ctx };
     let effect = c.tables.fields[effect as usize].clone();
     let op = c.tables.fields[op as usize].clone();
-    if effect.as_str() == "abort" && op.as_str() == "raise" {
-        return raise_from_perform(c, args_of(args, n));
+    if mode == MODE_RAISE || is_abort(effect.as_str(), op.as_str()) {
+        return raise_from_perform(c, &effect, &op, args_of(args, n));
     }
     let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
     let atom = EffectAtom::operation(
@@ -2894,16 +2952,47 @@ pub unsafe extern "C" fn rt_perform(
     }
 }
 
-/// `abort.raise(message)`, which no clause answers where it is performed: the frame whose clause
-/// does is unwound to first. Takes the message.
-fn raise_from_perform(c: &mut Ctx, args: &[Word]) -> i64 {
-    let message = match values_taken(c, args).first() {
-        Some(Value::Str(s)) => s.to_string(),
-        _ => String::new(),
+/// A raise, which no clause answers where it is performed: the frame whose clause does is unwound
+/// to first, and with none in reach the entry fails. Takes the arguments.
+fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]) -> i64 {
+    let release = |args: &[Word]| args.iter().for_each(|w| heap::dec(*w));
+    if c.failed != 0 {
+        release(args);
+        return 0;
+    }
+    let at = c.raise_handler(effect.as_str(), op.as_str());
+    let d = if is_abort(effect.as_str(), op.as_str()) {
+        let message = match args.first().map(|w| c.value(*w)) {
+            Some(Value::Str(ref s)) => s.to_string(),
+            _ => String::new(),
+        };
+        Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
+    } else if at.is_some() {
+        Diagnostic::error(codes::RUNTIME_ERROR, format!("`{effect}.{op}` was raised"))
+    } else {
+        // Only a raise nothing answers is shown what it carried: one a clause takes is not read.
+        let carried: Vec<Plain> = args.iter().map(|w| Plain::shown(&c.value(*w))).collect();
+        let slots: Vec<String> = (0..carried.len()).map(ply_eval::slot).collect();
+        let with = if slots.is_empty() {
+            String::new()
+        } else {
+            format!(" with {}", slots.join(", "))
+        };
+        Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("`{effect}.{op}` was raised{with}, and nothing answers it"),
+        )
+        .note("a `try` around the call answers it as an `Err`, and a `handle` clause as it likes")
+        .showing(carried)
     };
-    let d = Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
-        .primary(c.site(), "raised here");
-    c.raise(d, message)
+    let d = d.primary(c.site(), "raised here");
+    match at {
+        Some(at) => c.bind_raise(at, args.to_vec(), d),
+        None => {
+            release(args);
+            c.fail(d)
+        }
+    }
 }
 
 /// `simulate { body }`: runs the nullary `body` as a region's root task on this stack.
@@ -2966,11 +3055,10 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         let mut f = mine.expect("a raise is bound for a frame still installed");
         let owner = c.owner();
         c.cells.close_regions_above(owner, f.regions);
-        let closure = f.take_abort_clause();
+        let closure = f.take_clause(a.clause);
         drop_frame(f);
         // The clause runs outside its `handle`, which is over: its value is the `handle`'s.
-        let message = c.word(&Value::str(a.message));
-        let r = call_value(ctx, closure, &[message]);
+        let r = call_value(ctx, closure, &a.args);
         heap::dec(closure);
         return r;
     }
@@ -3523,6 +3611,9 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     if c.failed != 0 {
         if let Some((_, _, carried)) = unwinding {
             heap::dec(carried);
+        }
+        if let Some(raise) = raising {
+            raise.into_failure();
         }
         heap::dec(answer);
         return 0;
