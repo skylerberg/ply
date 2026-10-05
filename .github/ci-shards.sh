@@ -481,7 +481,8 @@ cmd_durations() {
 # The table the next run is cut by, from this run's rows on stdin and BEFORE, the table this run was
 # cut by: one duration a test, the longest any job measured. A corpus or startup row is what it cost
 # when no corpus test came from the cache, so a run that took some keeps BEFORE's: cut by a warm
-# run's costs, a cold run piles what the cache had saved onto one partition. `cached` rows only say
+# run's costs, a cold run piles what the cache had saved onto one partition. A corpus or startup row
+# no job reported, its job left unstarted by the selection, keeps BEFORE's. `cached` rows only say
 # which run this was.
 cmd_timings() {
   local before=$1
@@ -499,6 +500,7 @@ cmd_timings() {
         split(k, f, OFS)
         print k, ((warm && (f[1] == "corpus" || f[1] == "startup") && (k in kept)) ? kept[k] : ms[k])
       }
+      for (k in kept) if (!(k in ms)) print k, kept[k]
     }
   ' | LC_ALL=C sort -t"$TAB" -k1,1 -k2,2
 }
