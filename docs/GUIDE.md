@@ -1821,6 +1821,28 @@ A module with a test over cases imports `std.cases` itself, under a name
 no source can write, so `std.cases` cannot hold one. A doc comment above a test
 over cases documents nothing, as above any `test` (`E0003`, §2.1).
 
+A test may hold a rendering to a file the package stores, a *snapshot*, read
+with `embed_dir` (§3.4), so the test performs nothing, is cached, and runs
+again when a stored file changes:
+
+```ply
+import std.snapshot
+import std.snapshot (Stored)
+
+fn stored() -> Stored = { dir: "snapshots", files: embed_dir("snapshots") }
+
+test "an order renders as stored" {
+  snapshot::check(stored(), "order.txt", snapshot::render(order()))
+}
+```
+
+`check` fails with the unified diff from the stored text to the rendering, or
+with the diff that creates a file nothing stores yet, and never writes one.
+Storing is `snapshot::accept`, which writes through `std.fs`: an entry calls
+it, and a person runs that entry with the directory lent, as
+`ply run . --host --fs snapshots=snapshots` lends it (§14). `ply doc
+std.snapshot` has the rest.
+
 ### 8.2 Selection
 
 A definition's hash covers its normalized form: names, comments, formatting,
