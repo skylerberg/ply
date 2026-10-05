@@ -15,6 +15,7 @@ import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, 
 import std.hash (blake3)
 import std.pkg (Manifest, Version, Dep, Path, Git, Registry, manifest_json, prefix_of)
 import std.list (at, take, contains)
+import std.graph
 import std.string (join)
 import std.bytes
 
@@ -416,14 +417,23 @@ test "a registry slot never fetched, fetched below the floor, or holding another
   )
 }
 
-test "a package two others depend on is not a cycle" {
-  let edges = [
-    { from: 0, target: 1 },
-    { from: 0, target: 2 },
-    { from: 1, target: 3 },
-    { from: 2, target: 3 },
-  ];
-  assert_eq(find_cycle(4, edges), None)
+test "a cycle is named from the package it comes back to, without the one that only leads there" {
+  let pkgs: PackageSources = {
+    root: b"/x/app",
+    manifest: Some(a_manifest("app", [a_dep("mid", 1, "../mid")])),
+    supplied: [
+      supplied_at("/x/mid", "mid", [a_dep("lib", 1, "../lib")]),
+      supplied_at("/x/lib", "lib", [a_dep("mid", 1, "../mid")]),
+    ],
+  };
+  let clo = closure(pkgs, []);
+  assert_eq(codes_of(clo), [b"E0134"]);
+  assert(
+    string_contains(
+      string_of_bytes_lossy(at(clo.diags, 0).diag.message),
+      "in a cycle: /x/mid -> /x/lib -> /x/mid",
+    ),
+  )
 }
 
 test "a diamond of one version is what a closure pins: both requesters, one package" {
@@ -810,7 +820,7 @@ fn judge(
   );
   let versioned = version_judgments(texts, roots, built.packages, built.edges, built.diags);
   let collided = prefix_judgments(texts, roots, built.packages, root_modules, versioned);
-  let cycled = match find_cycle(len(roots), built.edges) {
+  let cycled = match graph::cycle(graph::of_edges(len(roots), built.edges)) {
     None -> collided,
     Some(c) ->
       push(collided, {
@@ -1182,70 +1192,3 @@ fn find_prefix(packages: List<Package>, prefix: Bytes, i: Int) -> Option<Int> / 
   if i >= len(packages) { None }
   else if at(packages, i).manifest != None && at(packages, i).prefix == prefix { Some(i) }
   else { find_prefix(packages, prefix, i + 1) }
-
-/// A back edge in a depth-first walk, as the stack from the gray node; white 0, gray 1, black 2.
-fn find_cycle(
-  n: Int,
-  edges: List<{ from: Int, target: Int }>,
-) -> Option<List<Int>> / {abort.raise} =
-  visit(range(0, n), edges, map(range(0, n), |_i: Int| 0), [], 0)
-
-fn visit(
-  nodes: List<Int>,
-  edges: List<{ from: Int, target: Int }>,
-  colors: List<Int>,
-  stack: List<Int>,
-  _u: Int,
-) -> Option<List<Int>> / {abort.raise} =
-  match nodes {
-    [] -> None,
-    [u, ..rest] -> if at(colors, u) != 0 { visit(rest, edges, colors, stack, 0) } else {
-      match dfs(u, edges, list_set(colors, u, 1), push(stack, u), len(colors) - 1) {
-        { colors: c2, cycle: Some(c) } -> Some(c),
-        { colors: c2, cycle: None } -> visit(rest, edges, list_set(c2, u, 2), stack, 0),
-      }
-    },
-  }
-
-/// `room` is how many more packages the walk may go down into: each one it does turns gray, and a
-/// gray one is never gone into again.
-fn dfs(
-  u: Int,
-  edges: List<{ from: Int, target: Int }>,
-  colors: List<Int>,
-  stack: List<Int>,
-  room: Int,
-) -> { colors: List<Int>, cycle: Option<List<Int>> } / {abort.raise} =
-  fold(
-    edges,
-    { colors: colors, cycle: None },
-    |acc: { colors: List<Int>, cycle: Option<List<Int>> }, e: { from: Int, target: Int }|
-      match acc.cycle {
-        Some(_) -> acc,
-        None -> if e.from != u { acc } else if at(acc.colors, e.target) == 1 {
-          { colors: acc.colors, cycle: Some(stack_from(stack, e.target)) }
-        } else if at(acc.colors, e.target) == 0 {
-          if room <= 0 { panic("a walk down past the packages there are") } else {
-            match dfs(
-                e.target,
-                edges,
-                list_set(acc.colors, e.target, 1),
-                push(stack, e.target),
-                room - 1,
-              ) {
-              // Black once its own edges are done: a package two others both depend on is reached
-              // twice, and only a gray target is a back edge.
-              { colors: c2, cycle: c } -> { colors: list_set(c2, e.target, 2), cycle: c },
-            }
-          }
-        } else { acc },
-      },
-  )
-
-/// The path from `u` down to where the walk is: what a back edge closes into a cycle. A gray node
-/// is always on the walk's stack, so a call that reaches the end is the walk having lost it.
-fn stack_from(stack: List<Int>, u: Int) -> List<Int> / {abort.raise} =
-  match stack {
-    [] -> panic("the walk's stack lost a package it had not finished"),
-    [x, ..rest] -> if x == u { stack } else { stack_from(rest, u) },
-  }
