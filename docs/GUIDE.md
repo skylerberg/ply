@@ -146,6 +146,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
+| `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -1478,6 +1479,35 @@ test "ten more elements cost twenty more steps: one in each closure" {
 
 A cost law (§10) states how `steps` grows with a size instead of pinning it.
 
+A test may range over a table, and is then a test for each of its elements, a
+*case*:
+
+```ply
+type Resolution = { reference: String, target: String }
+
+test "resolves {c.reference}" for c: Resolution in resolutions() {
+  assert_eq(url_resolve(base(), c.reference), c.target)
+}
+```
+
+`for <name>: <Type> in <table>` stands between the label and the body, on a
+`test/nondet` too. The table is an expression of type `List<Type>` (`E0201`),
+usually a call of the definition that builds it, often from `embed_dir` (§3.4);
+a nullary definition is computed once however many cases read it, and a record
+literal in it is a `new` record where the case's type is one (§4.2). The name is
+bound in the body and in the label, and a label before `for` is read as an
+interpolated string is (§2.3): each `{expr}` is a hole, `{{` and `}}` are
+braces, and a label with no hole names every case alike. A case is told from
+another by its value's `digest` (§12), so its type is `derivable(hash, ·)`
+(`E0206`) and holds no `Float`. The cases are listed before any test runs, so
+the table and the label may raise, by any `raise` operation (§6.8), and perform
+nothing else (`E0469`). A table that raises fails as one test, under the label
+as written, and an empty one is no test. A tagged literal (§2.3) in a table, a
+label's hole or a body is settled with the load, as any other is.
+A module with a test over cases imports `std.cases` itself, under a name
+no source can write, so `std.cases` cannot hold one. A doc comment above a test
+over cases documents nothing, as above any `test` (`E0003`, §2.1).
+
 ### 8.2 Selection
 
 A definition's hash covers its normalized form: names, comments, formatting,
@@ -1503,6 +1533,16 @@ from the process's start (`phases` in the `--json` report);
 `--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
 any of them matches; `--no-cache` bypasses both the result and the front-end
 cache.
+
+A case of a test over cases (§8.1) is selected as a test of its own. Its hash is
+its test's, which covers the body and the case's type and neither the table nor
+the label, taken with the case's `digest`. A case added to the table runs
+alone, wherever it is added; a reordered table or a reworded label runs
+nothing; an edit to the body runs every case, and an edit to what the table is
+built from runs the cases whose values it changed. Its label is the one its
+holes make, which is what `--filter` reads. Listing the cases runs the table,
+so a run that reports on a test over cases builds the program even when every
+case stands on a pass.
 
 ### 8.3 Determinism
 
@@ -1547,6 +1587,14 @@ hash only moved. Each result counts the operations its test performed,
 handled ones included, as `performs`. `--watch` re-runs on every `.ply` change
 and on every change to what the last run embedded, keeping caches in memory.
 
+Each case of a test over cases (§8.1) passes, fails and is reported under its
+own label, so a failing table names every failing case. In `--json` a case's
+entry under `selection.tests` carries `case`: the key of the test it is a case
+of (`of`), its place in the table (`at`) and its `digest`. A failing case is
+suspected against what it runs, which leaves out its table, and is named a
+culprit when one change explains it; it is otherwise not bisected (`skipped`
+is `case`), since a mixture is printed from a test's body, which holds no case.
+
 ### 8.5 Coverage and mutants
 
 `--coverage` reports, from the hash closure alone, which tests reach each
@@ -1558,7 +1606,9 @@ the program is checked again, and the tests that reach the definition run
 against the mutant on a scratch store that never touches the cache. A mutant
 every one of them passes is a survivor, reported with its place and the tests
 that let it through, and fails the run. A mutant that does not check is
-skipped; `--mutate-budget N` (default 64) caps how many are judged.
+skipped; `--mutate-budget N` (default 64) caps how many are judged. A case
+(§8.1) reaches what its test does, its table included, and a mutant that
+changes a case's value is killed by that case, which the table no longer holds.
 
 ### 8.6 Compiled backend
 
@@ -2601,6 +2651,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0466` | `bounded` outside a definition's own row |
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0468` | `cost` bound on a definition whose row says it may not return |
+| `E0469` | a test's table or label that performs more than raises |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

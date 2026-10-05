@@ -221,7 +221,15 @@ fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
           { kind: clause.kind, expr: go(clause.expr), span: clause.span }),
         body: go(d.body),
       }),
-    ITest(d) -> ITest({ ..d, body: go(d.body) }),
+    ITest(d) ->
+      ITest({
+        ..d,
+        cases: match d.cases {
+          None -> None,
+          Some(c) -> Some({ ..c, table: go(c.table), label: go(c.label) }),
+        },
+        body: go(d.body),
+      }),
     ILaw(d) ->
       ILaw({
         ..d,
@@ -292,7 +300,12 @@ fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> =
       IFn(d) ->
         fold(d.spec, picked(d.body, wanted, acc), |out: List<Expr>, clause: SpecClause|
           picked(clause.expr, wanted, out)),
-      ITest(d) -> picked(d.body, wanted, acc),
+      // Over cases, the label and the table are written before the body.
+      ITest(d) ->
+        picked(d.body, wanted, match d.cases {
+          None -> acc,
+          Some(c) -> picked(c.table, wanted, picked(c.label, wanted, acc)),
+        }),
       ILaw(d) -> {
         let guarded = match d.guard { None -> acc, Some(g) -> picked(g, wanted, acc) };
         picked(d.body, wanted, guarded)
@@ -1775,17 +1788,17 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
       }
     },
     ITest(d) -> {
-      let o = sweep(state, d.body, Some(not_in_a_function(b"a `test`")), None);
-      {
-        state: o.state,
-        item: ITest({
-          name: d.name,
-          name_span: d.name_span,
-          is_nondet: d.is_nondet,
-          body: o.expr,
-          span: d.span,
-        }),
-      }
+      let why = not_in_a_function(b"a `test`");
+      let ranged = match d.cases {
+        None -> { state: state, cases: None },
+        Some(c) -> {
+          let table = sweep(state, c.table, Some(why), None);
+          let label = sweep(table.state, c.label, Some(why), None);
+          { state: label.state, cases: Some({ ..c, table: table.expr, label: label.expr }) }
+        },
+      };
+      let o = sweep(ranged.state, d.body, Some(why), None);
+      { state: o.state, item: ITest({ ..d, cases: ranged.cases, body: o.expr }) }
     },
     ILaw(d) -> {
       let why = not_in_a_function(b"a `law`");
@@ -1859,7 +1872,12 @@ fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
             || fold(d.spec, false, |b: Bool, clause: SpecClause| b || count_in(clause.expr, p) > 0)
             || fold(d.params, false, |b: Bool, param: Param|
               b || (match param.default { None -> false, Some(v) -> count_in(v, p) > 0 })),
-        ITest(d) -> count_in(d.body, p) > 0,
+        ITest(d) ->
+          count_in(d.body, p) > 0
+            || (match d.cases {
+              None -> false,
+              Some(c) -> count_in(c.table, p) > 0 || count_in(c.label, p) > 0,
+            }),
         ILaw(d) ->
           count_in(d.body, p) > 0
             || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
@@ -2376,6 +2394,20 @@ test "a `try` and a tagged literal are refused where the module binds what they 
   assert(!refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tagged)));
   // A type imported by name brings no constructor with it.
   assert(!refused(bytes_concat(b"import m (Mine)\n", tried)))
+}
+
+test "a tagged literal and a `try` in a test's label or its table are read as those in its body are" {
+  let over = parse(
+    b"test \"t {hex\"01\"}\" for n: Int in [hex\"02\"] { assert(n > hex\"03\") }",
+  ).node;
+  assert(has_tagged(over));
+  assert_eq(map(tagged_in(over), |t: Tagged| t.text), [b"01", b"02", b"03"]);
+  let refused = |src: Bytes| string_contains(dump_expanded(src), "!E0118");
+  let labelled = b"test \"t {hex\"01\"}\" for n: Int in [1] { () }";
+  let tabled = b"test \"t {n}\" for n: Int in [try { g(1) }] { () }";
+  assert(!refused(labelled) && !refused(tabled));
+  assert(refused(bytes_concat(b"type Mine = | Ok(Int) | Fine\n", labelled)));
+  assert(refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tabled)))
 }
 
 test "a `try` the checker read is written out as its `handle`, and one it did not is left" {

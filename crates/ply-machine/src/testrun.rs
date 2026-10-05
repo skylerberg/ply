@@ -1,9 +1,10 @@
-//! One test, or one interleaving of one, run on whichever thread asks: a fresh machine over the
-//! unit attached to this thread, the binding it may reach, and a Rust unwind out of it caught and
-//! reported as Ply's defect at the test's source. What the run comes to is the program's to say.
+//! One test, one interleaving of one, or the cases one ranges over, run on whichever thread asks: a
+//! fresh machine over the unit attached to this thread, the binding it may reach, and a Rust unwind
+//! out of it caught and reported as Ply's defect at the test's source. What the run comes to is
+//! the program's to say.
 
 use ply_eval::host::{HostBinding, HostUse};
-use ply_eval::{Diagnostic, Interleaving, Seed, Span, codes};
+use ply_eval::{Case, Diagnostic, Interleaving, Seed, Span, Value, codes};
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -94,6 +95,7 @@ impl Drop for Observing {
 fn entered(
     executor: &Executor<'_>,
     index: usize,
+    case: Option<&Case>,
     seeded: Option<(&Seed, u32, bool)>,
 ) -> Result<Entered, Diagnostic> {
     let mut machine = executor.machine(index)?;
@@ -102,7 +104,11 @@ fn entered(
         machine.set_re_executed(re_executed);
         machine.set_seed(seed.clone(), steps);
     }
-    let (outcome, warnings) = machine.eval_test(index).into_parts();
+    let (outcome, warnings) = match case {
+        Some(case) => machine.eval_case(index, case),
+        None => machine.eval_test(index),
+    }
+    .into_parts();
     let (entries, declines) = machine.compiled_counts();
     let mut teardown = ply_eval::rc::take_cycles();
     teardown.extend(warnings);
@@ -149,9 +155,10 @@ impl Executed {
 }
 
 /// One test run once on this thread, an unwind out of it reported as Ply's defect at its source.
-pub fn executed(executor: &Executor<'_>, index: usize) -> Executed {
+/// A test over cases runs the one `case` names.
+pub fn executed(executor: &Executor<'_>, index: usize, case: Option<&Case>) -> Executed {
     let started = Instant::now();
-    let result = catch_unwind(AssertUnwindSafe(|| entered(executor, index, None)));
+    let result = catch_unwind(AssertUnwindSafe(|| entered(executor, index, case, None)));
     let duration = started.elapsed();
     match result {
         Ok(Ok(e)) => Executed {
@@ -202,13 +209,14 @@ impl Interleaved {
 pub fn interleaved(
     executor: &Executor<'_>,
     index: usize,
+    case: Option<&Case>,
     seed: &Seed,
     steps: u32,
     re_executed: bool,
 ) -> Interleaved {
     let started = Instant::now();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        entered(executor, index, Some((seed, steps, re_executed)))
+        entered(executor, index, case, Some((seed, steps, re_executed)))
     }));
     let duration = started.elapsed();
     match result {
@@ -243,6 +251,31 @@ pub fn interleaved(
             },
             ..Interleaved::refused(panic_diagnostic(payload, executor.front, index))
         },
+    }
+}
+
+/// Why a test's cases could not be listed, and whether Ply unwound rather than the table failing.
+pub struct Unlisted {
+    pub failure: Diagnostic,
+    pub panicked: bool,
+}
+
+/// The cases the test at `index` ranges over, listed on this thread: each one's label and digest.
+pub fn listed(executor: &Executor<'_>, index: usize) -> Result<Value, Unlisted> {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Value, Diagnostic> {
+        let answer = executor.machine(index)?.eval_cases(index).into_parts().0;
+        ply_eval::rc::take_cycles();
+        answer
+    }));
+    match result {
+        Ok(listed) => listed.map_err(|failure| Unlisted {
+            failure,
+            panicked: false,
+        }),
+        Err(payload) => Err(Unlisted {
+            failure: panic_diagnostic(payload, executor.front, index),
+            panicked: true,
+        }),
     }
 }
 
