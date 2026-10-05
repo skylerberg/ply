@@ -14,7 +14,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
-              ReturnClause, RecField, expr_span)
+              ReturnClause, RecField, expr_span, ETagged, Tagged, tagged_call)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt, LStr,
                  LBool)
 import std.bytes (ascii_of_int)
@@ -49,6 +49,7 @@ pub fn is_pure(e: Expr) -> Bool =
     EParallel(v) -> fold(v.branches, true, |acc: Bool, x: Expr| acc && is_pure(x)),
     ETry(_) -> false,
     ELit(_) -> true,
+    ETagged(_) -> true,
     EVar(_) -> true,
     EBad(_) -> true,
     EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
@@ -246,6 +247,141 @@ pub fn expand_record_updates(module: Module, shapes: Map<Bytes, List<Bytes>>) ->
       items: map(module.items, |item: Item|
         map_item(item, |expr: Expr| expanded_update(shapes, expr))),
     }
+  }
+
+// --- Tagged literals -----------------------------------------------------------------------
+// `tag"text"` runs as its call read through `Ok`, which the check that ran the call saw it answer.
+
+fn settled(expr: Expr) -> Expr =
+  match expr {
+    ETagged(t) -> {
+      let held = { name: b"?literal", span: t.span };
+      EBlock({
+        span: t.span,
+        tail: Some(var_of(held)),
+        stmts: [
+          SLet({
+            span: t.span,
+            pat: ctor_pattern(b"Ok", [var_pattern(held)], t.span),
+            ty: None,
+            value: tagged_call(t),
+          }),
+        ],
+      })
+    },
+    _ -> expr,
+  }
+
+pub fn has_tagged(module: Module) -> Bool = len(tagged_in(module)) > 0
+
+// Whether the module binds an `Ok` of its own: a variant it declares, or one it imports by name.
+fn binds_ok(module: Module) -> Bool =
+  fold(module.imports, false, |found: Bool, d: ImportDecl|
+      found
+        || (match d.kind {
+          INames(ns) -> fold(ns, false, |b: Bool, ident: Ident| b || ident.name == b"Ok"),
+          _ -> false,
+        }))
+    || fold(module.items, false, |found: Bool, item: Item|
+      found
+        || (match item {
+          IType(d) -> match d.body {
+            TDSum(vs) -> fold(vs, false, |b: Bool, v: VariantDef| b || v.name.name == b"Ok"),
+            _ -> false,
+          },
+          _ -> false,
+        }))
+
+// A tagged literal is read through `Ok`, which a module that binds its own would capture.
+fn rebound(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> =
+  if !binds_ok(module) { diags } else {
+    fold(tagged_in(module), diags, |acc: List<ParseDiag>, t: Tagged|
+      push(
+        acc,
+        error_at(
+          b"E0155",
+          t.span,
+          b"a tagged literal in a module that binds its own `Ok`",
+          b"read through `Ok`",
+          [
+            b"a tagged literal runs as `let Ok(value) = tag::literal(\"..\")`, which this module's `Ok` would capture: rename it, or import it qualified",
+          ],
+        ),
+      ))
+  }
+
+// Every tagged literal a module's definitions, tests and laws hold, in the order they are written.
+pub fn tagged_in(module: Module) -> List<Tagged> =
+  fold(module.items, [], |acc: List<Tagged>, item: Item|
+    match item {
+      IFn(d) ->
+        fold(d.spec, tagged_within(d.body, acc), |out: List<Tagged>, clause: SpecClause|
+          tagged_within(clause.expr, out)),
+      ITest(d) -> tagged_within(d.body, acc),
+      ILaw(d) -> {
+        let guarded = match d.guard { None -> acc, Some(g) -> tagged_within(g, acc) };
+        tagged_within(d.body, guarded)
+      },
+      _ -> acc,
+    })
+
+fn tagged_within(e: Expr, out: List<Tagged>) -> List<Tagged> = {
+  let all = |es: List<Expr>, acc: List<Tagged>|
+    fold(es, acc, |a: List<Tagged>, x: Expr| tagged_within(x, a));
+  let maybe = |o: Option<Expr>, acc: List<Tagged>|
+    match o { None -> acc, Some(x) -> tagged_within(x, acc) };
+  let fields = |fs: List<RecField>, acc: List<Tagged>|
+    fold(fs, acc, |a: List<Tagged>, f: RecField| tagged_within(f.value, a));
+  match e {
+    ETagged(t) -> push(out, t),
+    EBinary(b) -> tagged_within(b.rhs, tagged_within(b.lhs, out)),
+    EUnary(u) -> tagged_within(u.operand, out),
+    ELambda(l) -> tagged_within(l.body, out),
+    EApp(a) ->
+      fold(a.named, all(a.args, tagged_within(a.func, out)), |acc: List<Tagged>, arg: NamedArg|
+        tagged_within(arg.value, acc)),
+    EIf(i) ->
+      tagged_within(i.else_branch, tagged_within(i.then_branch, tagged_within(i.cond, out))),
+    EMatch(m) ->
+      fold(m.arms, tagged_within(m.scrutinee, out), |acc: List<Tagged>, arm: MatchArm|
+        tagged_within(arm.body, maybe(arm.guard, acc))),
+    EBlock(b) ->
+      maybe(
+        b.tail,
+        fold(b.stmts, out, |acc: List<Tagged>, stmt: Stmt|
+          match stmt {
+            SLet(l) -> tagged_within(l.value, acc),
+            SLetElse(l) -> tagged_within(l.fallback, tagged_within(l.value, acc)),
+            SExpr(x) -> tagged_within(x, acc),
+          }),
+      ),
+    ERecord(r) -> fields(r.fields, out),
+    ERecordUpdate(r) -> fields(r.fields, tagged_within(r.base, out)),
+    ETry(t) -> tagged_within(t.operand, out),
+    EField(f) -> tagged_within(f.base, out),
+    EList(l) -> all(l.items, out),
+    EPerform(x) -> all(x.args, out),
+    EHandle(h) -> {
+      let clauses = fold(
+        h.clauses,
+        tagged_within(h.body, out),
+        |acc: List<Tagged>, c: HandleClause| tagged_within(c.body, acc),
+      );
+      match h.ret { None -> clauses, Some(rc) -> tagged_within(rc.body, clauses) }
+    },
+    EWithCell(c) -> tagged_within(c.body, tagged_within(c.init, out)),
+    ESimulate(x) -> tagged_within(x.body, out),
+    EParallel(x) -> all(x.branches, out),
+    ELit(_) -> out,
+    EVar(_) -> out,
+    EBad(_) -> out,
+  }
+}
+
+// Every tagged literal of a checked module replaced by what it runs as.
+pub fn expand_tagged(module: Module) -> Module =
+  if !has_tagged(module) { module } else {
+    { imports: module.imports, items: map(module.items, |item: Item| map_item(item, settled)) }
   }
 
 // --- Witnesses -----------------------------------------------------------------------------
@@ -1761,7 +1897,8 @@ pub fn expand(
   let tried = if has_try(module) { expand_try(module, diags) }
   else { { module: module, diags: diags } };
   let measured = measured_laws(tried.module, tried.diags);
-  cost_laws(measured.module, measured.diags)
+  let costed = cost_laws(measured.module, measured.diags);
+  { module: costed.module, diags: rebound(costed.module, costed.diags) }
 }
 
 // --- The cost clause ---------------------------------------------------------------------------

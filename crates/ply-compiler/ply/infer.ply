@@ -15,7 +15,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
-              ReturnClause, RecField, expr_span, is_arithmetic, is_ordered)
+              ReturnClause, RecField, expr_span, is_arithmetic, is_ordered, ETagged, Tagged,
+              tagged_callee)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -46,7 +47,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error)
 import rewrite (expand, expand_record_updates, expand_witnesses, NumericWitness, ConcreteWitness,
-                ParamWitness, numeric_witness_bin)
+                ParamWitness, numeric_witness_bin, expand_tagged)
 import embed (EmbedAt, embed_tables, rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -3344,7 +3345,99 @@ fn infer(checker: Checker, expr: Expr) -> Inferred / {abort.raise} =
     EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body),
     ESimulate(s) -> infer_simulate(checker, s.span, s.body),
     EParallel(v) -> infer_parallel(checker, v.span, v.branches),
+    ETagged(t) -> infer_tagged(checker, t),
   }
+
+// What a tag's `literal` answers of a text it refuses: where in the text, in characters, and why.
+pub fn refusal_type() -> Type / {abort.raise} =
+  TyRecord(
+    fields_sorted([{ name: b"message", ty: string_type() }, { name: b"offset", ty: int_type() }]),
+  )
+
+fn not_a_parser(checker: Checker, t: Tagged, message: Bytes, label: Bytes) -> Checker =
+  report_error_at(
+    checker,
+    b"E0152",
+    t.tag.span,
+    bytes_concat_all([b"`", t.tag.name, b"::literal` ", message]),
+    label,
+    [
+      bytes_concat_all([
+        b"`",
+        t.tag.name,
+        b"\"..\"` is the call `",
+        t.tag.name,
+        b"::literal(\"..\")`, which the check runs: a function of one `String` answering `Result<T, {message: String, offset: Int}>`, with no parameters of its own and a row that holds at most `abort.raise`",
+      ]),
+    ],
+  )
+
+// `tag"text"` is the call `tag::literal("text")`, whose answer the check reads before anything
+// runs: its value is what the call answers `Ok` of, and nothing is left for it to perform.
+fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
+  let callee = tagged_callee(t.tag);
+  let f: Inferred = infer_var(checker, callee);
+  let value: WithTy = new_ty(called(f.checker, t.tag.span));
+  let c: Checker = value.checker;
+  let shaped: Checker = match declared_value(c, callee) {
+    // A name that names nothing is said by the lookup.
+    None -> c,
+    Some(name) -> if group_member(c, name) {
+      not_a_parser(
+        c,
+        t,
+        b"is in a recursion with what holds the literal",
+        b"runs before it is whole",
+      )
+    } else {
+      let generic = match env_lookup(c.env, name) {
+        Some(sc) -> len(sc.ty_vars) + len(sc.row_vars) + len(sc.label_vars) > 0,
+        None -> false,
+      };
+      match resolve(c, f.ty) {
+        TyFn(fn_) -> {
+          let unified = unify(
+            c.subst,
+            c.fresh,
+            fn_type(
+              [string_type()],
+              TyCon({ name: b"Result", args: [value.ty, refusal_type()] }),
+              fn_.effects,
+            ),
+            f.ty,
+          );
+          let u: Checker = with_unified(c, unified);
+          let row = resolve_row_in(u, fn_.effects);
+          if generic {
+            not_a_parser(u, t, b"takes parameters of its own", b"no call says what they are")
+          } else if unified.error != None {
+            not_a_parser(
+              u,
+              t,
+              bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
+              b"not a literal's parser",
+            )
+          } else if row.tail != None || len(without_abort(row.atoms)) > 0 {
+            not_a_parser(
+              u,
+              t,
+              bytes_concat_all([b"performs `", row_text(row), b"`"]),
+              b"a check cannot answer this",
+            )
+          } else { u }
+        },
+        other ->
+          not_a_parser(
+            c,
+            t,
+            bytes_concat_all([b"has type `", type_text(other), b"`"]),
+            b"not a literal's parser",
+          ),
+      }
+    },
+  };
+  { checker: shaped, ty: value.ty, row: row_empty() }
+}
 
 // The branches' answers as a tuple, which is what evaluating them left to right answers.
 fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferred / {abort.raise} = {
@@ -6514,6 +6607,7 @@ fn param_names(params: List<Param>) -> List<Bytes> = map(params, |param: Param| 
 fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
   match e {
     ELit(_) -> out,
+    ETagged(t) -> { names: push(out.names, tagged_callee(t.tag)) },
     EBad(_) -> out,
     EVar(v) -> if is_bare(v.name) && contains(bound, v.name.name.name) { out }
     else { { names: push(out.names, v.name) } },
@@ -11243,9 +11337,9 @@ fn shapes_in(all: List<UpdateShape>, module: Int) -> Map<Bytes, List<Bytes>> =
   fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, s: UpdateShape|
     if s.module != module { acc } else { map_insert(acc, span_key(s.span), s.names) })
 
-// The modules with every record update written out as the literal it stands for, and every
-// `numeric` or `integer` parameter's witness passed and read: what the emitter lowers, and what
-// only the checker knows.
+// The modules with every record update written out as the literal it stands for, every tagged
+// literal as the call it runs as, and every `numeric` or `integer` parameter's witness passed and
+// read: what the emitter lowers, and what only the checker knows.
 pub fn expanded_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
@@ -11255,7 +11349,7 @@ pub fn expanded_mods(
     {
       name: m.name,
       module: expand_witnesses(
-        expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
+        expand_record_updates(expand_tagged(m.module), shapes_in(elaboration.updates, i)),
         ops_in(elaboration.ops, i),
         refs_in(elaboration.refs, i),
         orders_in(elaboration.orders, i),
@@ -11264,8 +11358,9 @@ pub fn expanded_mods(
     }
   })
 
-// The modules with every record update written out and no witness passed: what a claim lowers,
-// since the prover draws every type parameter as `Int` and reads an operator over one as `Int`'s.
+// The modules with every record update and tagged literal written out and no witness passed: what a
+// claim lowers, since the prover draws every type parameter as `Int` and reads an operator over one
+// as `Int`'s.
 pub fn updated_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
@@ -11274,7 +11369,7 @@ pub fn updated_mods(
     let m: ParsedModule = at(mods, i);
     {
       name: m.name,
-      module: expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
+      module: expand_record_updates(expand_tagged(m.module), shapes_in(elaboration.updates, i)),
       derived: m.derived,
     }
   })
