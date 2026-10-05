@@ -45,12 +45,17 @@ pub type Expr =
   | ESimulate({ span: Span, body: Expr })
   // `parallel { a, b }`: the branches' answers as a tuple, which means evaluating them left to right.
   | EParallel({ span: Span, branches: List<Expr> })
+  // `tag"text"`: the call `tag::literal("text")` a check ran, read as the value it answered.
+  | ETagged(Tagged)
   | EBad({ span: Span })
   // `try { body }`: `Ok` of what the body answers, or `Err` of what one raise in it carried. With
   // no `raise` written, the checker reads which one off the body's row.
   | ETryBlock({ span: Span, raise: Option<RaiseName>, body: Expr })
 
 pub type RaiseName = { eff: QName, op: Ident }
+
+// `quoted` is the string as written, quotes included, which `span` outgrows inside parentheses.
+pub type Tagged = { span: Span, tag: Ident, text: Bytes, quoted: Span }
 
 pub type RecField = { name: Ident, value: Expr }
 
@@ -119,9 +124,24 @@ pub fn expr_span(expr: Expr) -> Span =
     EWithCell(v) -> v.span,
     ESimulate(v) -> v.span,
     EParallel(v) -> v.span,
+    ETagged(v) -> v.span,
     EBad(v) -> v.span,
     ETryBlock(v) -> v.span,
   }
+
+// The function a tagged literal's check runs, as the literal's module names it.
+pub fn tagged_callee(tag: Ident) -> QName =
+  { module: Some(tag), name: { name: b"literal", span: tag.span }, span: tag.span }
+
+// The call a tagged literal stands for.
+pub fn tagged_call(t: Tagged) -> Expr =
+  EApp({
+    span: t.span,
+    func: EVar({ span: t.tag.span, name: tagged_callee(t.tag) }),
+    named: [],
+    args: [ELit({ span: t.quoted, lit: LStr(t.text) })],
+    labels: [],
+  })
 
 fn set_span(expr: Expr, span: Span) -> Expr =
   match expr {
@@ -147,6 +167,7 @@ fn set_span(expr: Expr, span: Span) -> Expr =
       EWithCell({ span: span, resource: v.resource, init: v.init, binder: v.binder, body: v.body }),
     ESimulate(v) -> ESimulate({ span: span, body: v.body }),
     EParallel(v) -> EParallel({ span: span, branches: v.branches }),
+    ETagged(v) -> ETagged({ ..v, span: span }),
     EBad(v) -> EBad({ span: span }),
     ETryBlock(v) -> ETryBlock({ ..v, span: span }),
   }
@@ -613,8 +634,35 @@ fn primary_ident(
   else if name == b"parallel" && !parser.no_brace
       && token_kind_at(input, parser, 1) == token_lbrace() { parallel_expr(input, parser) }
   else if name == b"try" && opens_try(input, parser) { try_expr(input, parser) } else {
-    let { parser, node: q } = qname(input, parser, b"an expression")?;
-    Ok({ parser: parser, node: EVar({ span: q.span, name: q }) })
+    match tagged_text(input, parser) {
+      Some(text) -> {
+        let tag = current_span(input, parser);
+        let quoted = advance(input, advance(input, parser).parser);
+        Ok({
+          parser: quoted.parser,
+          node: ETagged({
+            span: span_to(tag, quoted.node),
+            tag: { name: name, span: tag },
+            text: text,
+            quoted: quoted.node,
+          }),
+        })
+      },
+      None -> {
+        let { parser, node: q } = qname(input, parser, b"an expression")?;
+        Ok({ parser: parser, node: EVar({ span: q.span, name: q }) })
+      },
+    }
+  }
+
+// The text of the string literal that touches the name the parser is at, which makes the two a
+// tagged literal: `uuid"..."` is one, and `uuid "..."` a name and then a string.
+fn tagged_text(input: Input, parser: Parser) -> Option<Bytes> =
+  match token_kind_at(input, parser, 1) {
+    StringLiteral(text) -> if token_at(input, parser, 1).start == token_at(input, parser, 0).end {
+      Some(text)
+    } else { None },
+    _ -> None,
   }
 
 fn primary_paren(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
@@ -1825,6 +1873,8 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
       ]),
     ESimulate(v) -> bytes_concat(dump_node(v.span, b"esim"), dump_expr(v.body)),
     EParallel(v) -> bytes_concat(dump_node(v.span, b"epar"), dump_list(v.branches, dump_expr)),
+    ETagged(v) ->
+      bytes_concat_all([dump_node(v.span, b"etag"), dump_ident(v.tag), dump_lit(LStr(v.text))]),
     EBad(v) -> dump_node(v.span, b"ebad"),
     ETryBlock(v) ->
       bytes_concat_all([
@@ -1956,6 +2006,7 @@ pub fn node_count(expr: Expr) -> Int =
     EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
     ESimulate(v) -> 1 + node_count(v.body),
     EParallel(v) -> 1 + count_all(v.branches),
+    ETagged(v) -> 1,
     EBad(v) -> 1,
     ETryBlock(v) -> 1 + node_count(v.body),
   }
@@ -2169,6 +2220,16 @@ test "a literal keeps its own span and its decoded value" {
   assert_eq(dump_expr_of(b"true"), "0:4:elit;%bool;@31;#0;");
   assert_eq(dump_expr_of(b"()"), "0:2:elit;%unit;#0;");
   assert_eq(dump_expr_of(b"\"a\\n\""), "0:5:elit;%str;@610a;#0;");
+}
+
+test "a name touching a string is a tagged literal, and a postfix follows it as it follows any" {
+  assert_eq(dump_expr_of(b"hex\"a\\n\""), "0:8:etag;0:3:ident;@686578;%str;@610a;#0;");
+  assert_eq(
+    dump_expr_of(b"hex\"\".n"),
+    "0:7:efld;0:5:etag;0:3:ident;@686578;%str;@;6:7:ident;@6e;#0;",
+  );
+  // A space apart they are a name and then a string, which is no one expression.
+  assert_eq(dump_expr_of(b"hex \"a\""), "#1;!E0001:4:7:1:0;=4:7:1;")
 }
 
 test "a float and a decimal are the source text, and no value is ever built" {

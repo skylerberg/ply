@@ -1,0 +1,303 @@
+// Tagged literals as a load settles them: `tag"text"` is the call `tag::literal("text")`, run
+// before the program is, and a text its parser refuses is refused where the parser says, by every
+// command that would otherwise run it.
+
+import harness (Source, in_memory, kept_in_memory, tree, scratch, project, on_disk, json_of, at,
+                nth, str, int, codes, diagnostic, stdout, said, assert_ok, Hermetic, Shipped)
+import std.fs
+import std.json (Json)
+import std.string
+
+// A tag: the number a text of hex digits spells, or the first character that is not one.
+fn parser(digits: String) -> Source =
+  {
+    path: "hex.ply",
+    text:
+      \\pub type Refusal = { message: String, offset: Int }
+      \\
+      \\pub fn literal(text: String) -> Result<Int, Refusal> / {abort.raise} =
+      \\  fold(range(0, string_len(text)), Ok(0), |read: Result<Int, Refusal>, i: Int|
+      \\    match read {
+      \\      Err(_) -> read,
+      \\      Ok(n) -> {
+      \\        let digit = string_slice(text, i, i + 1);
+      \\        if string_contains(digits(), digit) { Ok(n * 16 + string_find(digits(), digit)) }
+      \\        else { Err({ message: "not a hex digit", offset: i }) }
+      \\      },
+      \\    })
+      \\
+      \\fn digits() -> String = "
+      ++ digits
+      ++ "\"\n",
+  }
+
+fn hex() -> Source = parser("0123456789abcdef")
+
+fn holding(body: String) -> Source =
+  { path: "m.ply", text: "import hex\n\nfn main() -> Int = " ++ body ++ "\n" }
+
+fn checked(files: List<Source>) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
+  json_of(in_memory(tree(files), ["check", "--json"]))
+
+// A module `tag` holding `text`, and a `main` that writes one `tag"abc"`.
+fn tagged(text: String) -> List<Source> =
+  [
+    { path: "tag.ply", text: text },
+    { path: "m.ply", text: "import tag\n\nfn main() -> Int = tag\"abc\"\n" },
+  ]
+
+fn refusal() -> String = "Result<Int, { message: String, offset: Int }>"
+
+test "a literal its parser accepts is its value, and performs nothing" {
+  let files = [hex(), holding("hex\"ff\" + hex\"0a\"")];
+  assert_ok(in_memory(tree(files), ["check"]));
+  let ran = in_memory(tree(files), ["run"]);
+  assert_ok(ran);
+  assert(string_contains(stdout(ran), "265"), Some(said(ran)));
+  let types = stdout(in_memory(tree(files), ["check", "--types"]));
+  match string::split_once(types, "   m m.ply") {
+    None -> panic("no heading for `m` in:\n" ++ types),
+    Some(cut) -> {
+      assert(string_contains(cut.tail, "main : () -> Int"), Some(types));
+      assert(!string_contains(cut.tail, "abort"), Some(types))
+    },
+  }
+}
+
+test "a literal its parser refuses is a check error at the place in its text" {
+  let files = [hex(), holding("hex\"1\\u{66}g0\"")];
+  let ran = in_memory(tree(files), ["check", "--json"]);
+  assert_eq(ran.code, 2);
+  let v = json_of(ran);
+  assert_eq(codes(v), ["E0153"]);
+  let label = nth(at(diagnostic(v), "labels"), 0);
+  assert_eq(str(at(label, "message")), "not a hex digit");
+  assert_eq(str(at(label, "file")), "m.ply");
+  assert_eq(int(at(at(label, "start"), "line")), 3);
+  // Past the escape, which is one character of the text and six of the source.
+  assert_eq(int(at(at(label, "start"), "col")), 31);
+  assert_eq(int(at(at(label, "end"), "col")), 32)
+}
+
+test "a text that ends too soon is refused at its closing quote" {
+  let tag =
+    \\pub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> / {abort.raise} =
+    \\  if string_len(text) < 4 { Err({ message: "four characters", offset: string_len(text) }) }
+    \\  else { Ok(4) }
+    \\
+  ;
+  let v = checked(tagged(tag));
+  assert_eq(codes(v), ["E0153"]);
+  let label = nth(at(diagnostic(v), "labels"), 0);
+  assert_eq(int(at(at(label, "start"), "col")), 27);
+  assert_eq(str(at(label, "snippet")), "\"")
+}
+
+test "every command that would run a literal refuses the one a check refuses" {
+  let files = [hex(), holding("hex\"xyz\"")];
+  fold(
+    [["run"], ["test"], ["prove"], ["build", ".", "-o", "m.plyx"]],
+    (),
+    |_: Unit, line: List<String>| {
+      let ran = in_memory(tree(files), line);
+      assert_eq(ran.code, 2);
+      assert(string_contains(said(ran), "E0153"), Some(said(ran)))
+    },
+  )
+}
+
+test "an artifact holds a tagged literal as it is written, and runs to its value" {
+  scratch(|| {
+    project([hex(), holding("hex\"ff\" + hex\"0a\"")]);
+    assert_ok(on_disk(["build", ".", "-o", "m.plyx"]));
+    let ran = on_disk(["run", "m.plyx"]);
+    assert_ok(ran);
+    assert(string_contains(stdout(ran), "265"), Some(said(ran)))
+  })
+}
+
+test "a refused literal is refused again by a check that reads its module's stub" {
+  let files = [hex(), holding("hex\"xyz\"")];
+  let first = kept_in_memory(tree(files), ["check", "--explain"], [], None);
+  assert_eq(first.ran.code, 2);
+  let second = kept_in_memory(first.tree, ["check", "--explain"], [], None);
+  assert_eq(second.ran.code, 2);
+  assert(string_contains(said(second.ran), "E0153"), Some(said(second.ran)));
+  assert_eq(in_memory(second.tree, ["check"]).code, 2)
+}
+
+test "a literal is checked again when its parser moves, and answered as it was while it stands" {
+  let files = [hex(), holding("hex\"ff\"")];
+  let first = kept_in_memory(tree(files), ["check"], [], None);
+  assert_ok(first.ran);
+  let narrowed = parser("0123456789");
+  let moved = fs::mem_write(first.tree, "w/" ++ narrowed.path, bytes_of_string(narrowed.text)).fs;
+  let second = kept_in_memory(moved, ["check", "--json"], [], None);
+  assert_eq(codes(json_of(second.ran)), ["E0153"]);
+  let back = fs::mem_write(second.tree, "w/" ++ hex().path, bytes_of_string(hex().text)).fs;
+  let third = kept_in_memory(back, ["check", "--explain"], [], None);
+  assert_ok(third.ran);
+  assert_ok(in_memory(third.tree, ["check", "--explain"]))
+}
+
+test "a literal checked before is refused once its module binds `Ok` or its parser changes shape" {
+  let holder = "import tag\n\nfn main() -> Int = tag\"abc\"\n";
+  let first = kept_in_memory(
+    tree([
+      { path: "tag.ply", text: "pub fn literal(text: String) -> " ++ refusal() ++ " = Ok(1)\n" },
+      { path: "m.ply", text: holder },
+    ]),
+    ["check", "--explain"],
+    [],
+    None,
+  );
+  assert_ok(first.ran);
+  let bound = fs::mem_write(
+    first.tree,
+    "w/m.ply",
+    bytes_of_string(holder ++ "\ntype Mine = | Ok(Int) | No\n"),
+  ).fs;
+  assert_eq(codes(json_of(in_memory(bound, ["check", "--json"]))), ["E0118"]);
+  let reshaped = fs::mem_write(
+    first.tree,
+    "w/tag.ply",
+    b"pub fn literal(text: String) -> Option<Int> = Some(1)\n",
+  ).fs;
+  assert_eq(codes(json_of(in_memory(reshaped, ["check", "--json"]))), ["E0152"])
+}
+
+// A raise and what raises it, for a module that answers the raise around a literal.
+fn raising() -> String =
+  \\effect p { raise bad(n: Int) }
+  \\
+  \\fn g(n: Int) -> Int / {p.bad} = if n > 0 { n } else { p.bad(n) }
+  \\
+  \\
+
+test "a `try` checked before is refused once its module binds `Ok`, as a literal is" {
+  let tried = raising() ++ "pub fn f(n: Int) -> Result<Int, Int> = try { g(n) }\n";
+  let first = kept_in_memory(
+    tree([
+      { path: "lib.ply", text: tried },
+      {
+        path: "m.ply",
+        text: "import lib\n\nfn main() -> Int = match lib::f(3) { Ok(n) -> n, Err(e) -> e }\n",
+      },
+    ]),
+    ["check", "--explain"],
+    [],
+    None,
+  );
+  assert_ok(first.ran);
+  let bound = fs::mem_write(
+    first.tree,
+    "w/lib.ply",
+    bytes_of_string(tried ++ "\npub type Mine = | Ok(Int) | No\n\npub fn mine() -> Mine = No\n"),
+  ).fs;
+  assert_eq(codes(json_of(in_memory(bound, ["check", "--json"]))), ["E0118"])
+}
+
+test "a literal in a `try` body or a handler clause is settled as any other is" {
+  let within = |main: String|
+    [hex(), { path: "m.ply", text: "import hex\n\n" ++ raising() ++ main ++ "\n" }];
+  let tried = |text: String|
+    within("fn main() -> Int = match try { g(hex\"" ++ text ++ "\") } { Ok(n) -> n, Err(_) -> 0 }");
+  let handled = |text: String|
+    within("fn main() -> Int = handle { g(0) } with { p.bad(n) -> hex\"" ++ text ++ "\" }");
+  let in_try = in_memory(tree(tried("ff")), ["run"]);
+  assert_ok(in_try);
+  assert(string_contains(stdout(in_try), "255"), Some(said(in_try)));
+  let in_clause = in_memory(tree(handled("0a")), ["run"]);
+  assert_ok(in_clause);
+  assert(string_contains(stdout(in_clause), "10"), Some(said(in_clause)));
+  assert_eq(codes(checked(tried("fg"))), ["E0153"]);
+  assert_eq(codes(checked(handled("0g"))), ["E0153"])
+}
+
+test "a literal whose parser answers a `new` record is that record, and refused where it is none" {
+  let holding = |text: String|
+    [
+      {
+        path: "m.ply",
+        text: "import std.uuid\nimport std.uuid (Uuid)\n\nfn id() -> Uuid = uuid\"" ++ text
+          ++ "\"\n\nfn main() -> Int = bytes_len(id().octets)\n",
+      },
+    ];
+  let ran = in_memory(tree(holding("6ba7b810-9dad-11d1-80b4-00c04fd430c8")), ["run"]);
+  assert_ok(ran);
+  assert(string_contains(stdout(ran), "16"), Some(said(ran)));
+  let v = checked(holding("6ba7b810-9dad-11d1-80b4-00c04fd430cZ"));
+  assert_eq(codes(v), ["E0153"]);
+  assert_eq(str(at(nth(at(diagnostic(v), "labels"), 0), "message")), "not a hex digit")
+}
+
+test "a parser that raises, or spends its budget, leaves a literal undecided" {
+  let raising = checked(
+    tagged("pub fn literal(text: String) -> " ++ refusal() ++ " / {abort.raise} = panic(\"no\")\n"),
+  );
+  assert_eq(codes(raising), ["E0154"]);
+  assert(string_contains(str(at(diagnostic(raising), "message")), "raised on this literal: panic"));
+  let counting =
+    \\pub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> =
+    \\  Ok(count(100000000, 0))
+    \\
+    \\fn count(n: Int, counted: Int) -> Int = if n <= 0 { counted } else { count(n - 1, counted + 1) }
+    \\
+  ;
+  let spent = checked(tagged(counting));
+  assert_eq(codes(spent), ["E0154"]);
+  assert(string_contains(str(at(diagnostic(spent), "message")), "within 10000000 calls"))
+}
+
+test "a tag whose `literal` is no parser a check can run is refused where the literal is" {
+  let shaped = checked(tagged("pub fn literal(text: String) -> Option<Int> = Some(1)\n"));
+  assert_eq(codes(shaped), ["E0152"]);
+  assert(string_contains(str(at(diagnostic(shaped), "message")), "(String) -> Option<Int>"));
+  let performing =
+    \\pub effect ticks { read now() -> Int }
+    \\
+    \\pub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> / {ticks.now} =
+    \\  Ok(ticks.now())
+    \\
+  ;
+  let impure = json_of(
+    in_memory(
+      tree([
+        { path: "tag.ply", text: performing },
+        { path: "m.ply", text: "import tag\n\nfn main() -> Int / {tag::ticks.now} = tag\"abc\"\n" },
+      ]),
+      ["check", "--json"],
+    ),
+  );
+  assert_eq(codes(impure), ["E0152"]);
+  assert(string_contains(str(at(diagnostic(impure), "message")), "performs `{tag.ticks.now}`"));
+  let generic = checked(
+    tagged(
+      "pub fn literal<a>(text: String) -> Result<List<a>, { message: String, offset: Int }> = Ok([])\n",
+    ),
+  );
+  assert(string_contains(str(at(diagnostic(generic), "message")), "parameters of its own"));
+  let taking = checked(
+    tagged("pub fn literal(text: String, strict: Bool = false) -> " ++ refusal() ++ " = Ok(1)\n"),
+  );
+  assert_eq(codes(taking), ["E0152"])
+}
+
+test "a tag is a module binder, and its `literal` a public function of that module" {
+  assert_eq(codes(checked(tagged("pub fn other() -> Int = 1\n"))), ["E0101"]);
+  assert_eq(codes(checked(tagged("fn literal(text: String) -> " ++ refusal() ++ " = Ok(1)\n"))), [
+    "E0107",
+  ]);
+  assert_eq(codes(checked([{ path: "m.ply", text: "fn main() -> Int = tag\"abc\"\n" }])), ["E0106"])
+}
+
+test "a module that binds its own `Ok` holds no tagged literal" {
+  let files = [
+    { path: "tag.ply", text: "pub fn literal(text: String) -> " ++ refusal() ++ " = Ok(1)\n" },
+    {
+      path: "m.ply",
+      text: "import tag\n\ntype Mine = | Ok(Int) | No\n\nfn main() -> Int = tag\"abc\"\n",
+    },
+  ];
+  assert_eq(codes(checked(files)), ["E0118"])
+}

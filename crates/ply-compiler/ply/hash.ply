@@ -11,7 +11,7 @@ import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, L
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
-              HandleClause, ReturnClause, RecField)
+              HandleClause, ReturnClause, RecField, ETagged, tagged_callee)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
@@ -437,6 +437,13 @@ fn value_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> 
     },
   }
 
+// The definition a tagged literal's check runs, by its program-wide name, as `module` names it.
+pub fn tagged_target(index: Index, module: Int, tag: Ident) -> Option<Bytes> / {abort.raise} =
+  match value_target(index, module, tagged_callee(tag)) {
+    Some(FnTarget(node)) -> Some(at(index.nodes, node).name),
+    _ -> None,
+  }
+
 fn ctor_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> / {abort.raise} =
   match target(index, module, 0, qualifier(qname), qname.name.name) {
     None -> None,
@@ -616,6 +623,7 @@ fn tag_e_perform() -> Int = 62
 fn tag_e_handle() -> Int = 63
 fn tag_e_with_cell() -> Int = 64
 fn tag_e_simulate() -> Int = 65
+fn tag_e_tagged() -> Int = 66
 fn tag_e_parallel() -> Int = 100
 fn tag_e_try_block() -> Int = 131
 fn tag_e_record_update() -> Int = 67
@@ -1367,6 +1375,9 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
         put_u32(put_tag(encoder, tag_e_parallel()), len(v.branches)),
         |acc: Encoder, x: Expr| expr(acc, x),
       ),
+    // Apart from the call it stands for, which has another type and another row.
+    ETagged(t) ->
+      lit(value_ref(put_tag(encoder, tag_e_tagged()), tagged_callee(t.tag)), LStr(t.text)),
     EBad(_) -> panic("a placeholder reached the hasher"),
     // A `try` that names no raise answers the one its body's row names, which the body settles.
     ETryBlock(t) -> {
@@ -1616,6 +1627,7 @@ pub fn is_pure(e: Expr) -> Bool =
     ETry(_) -> false,
     EBad(_) -> false,
     ELit(_) -> true,
+    ETagged(_) -> true,
     EVar(_) -> true,
     EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
     EUnary(u) -> is_pure(u.operand),
@@ -1645,6 +1657,7 @@ pub fn is_pure(e: Expr) -> Bool =
 fn mentions(e: Expr, names: List<Bytes>) -> Bool =
   match e {
     ELit(_) -> false,
+    ETagged(_) -> false,
     EBad(_) -> false,
     EVar(v) -> is_bare(v.name) && contains(names, v.name.name.name),
     EBinary(b) -> mentions(b.lhs, names) || mentions(b.rhs, names),
@@ -3149,6 +3162,7 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
   match e {
     ELambda(l) -> lambda_rets(l.body, match l.ret { Some(t) -> push(out, t), None -> out }),
     ELit(_) -> out,
+    ETagged(_) -> out,
     EVar(_) -> out,
     EBad(_) -> out,
     EBinary(b) -> lambda_rets(b.rhs, lambda_rets(b.lhs, out)),
@@ -3513,6 +3527,7 @@ fn pick(
   mine: Map<Bytes, Bytes>,
   h: Bytes,
   own: Bytes,
+  wanted: (Slot) -> Bool / {abort.raise},
 ) -> Option<Slot> / {abort.raise} = {
   // A home is safe when pointing at it adds no import edge that closes a cycle: the module's own,
   // one it already imports, or one that cannot reach it in the print so far. When every home
@@ -3531,7 +3546,7 @@ fn pick(
   match map_get(layout.by_hash, h) {
     None -> None,
     Some(found) -> {
-      let named = filter(found, |s: Slot| nameable(layout, s, own));
+      let named = filter(found, |s: Slot| nameable(layout, s, own) && wanted(s));
       let pool = match filter(named, safe) { [] -> named, homes -> homes };
       fold(pool, None, |best: Option<Slot>, s: Slot|
         match best { Some(b) -> if score(s) < score(b) { Some(s) } else { best }, None -> Some(s) })
@@ -3544,8 +3559,16 @@ fn qname(
   decoded: DecodedRef,
   ctor: Option<Bytes>,
 ) -> Decoded / {abort.raise} = {
-  let found = if decoded.class >= 0 { Some({ part: printer.part, class: decoded.class }) }
-  else { pick(printer.layout, printer.graph, decoded.decoder.imports, decoded.hash, printer.own) };
+  let found = if decoded.class >= 0 { Some({ part: printer.part, class: decoded.class }) } else {
+    pick(
+      printer.layout,
+      printer.graph,
+      decoded.decoder.imports,
+      decoded.hash,
+      printer.own,
+      |_: Slot| true,
+    )
+  };
   match found {
     // A body with no name this module may write is filed with the ones it has no body for: either
     // way the reference cannot be printed, and a refusal names it rather than a hex string standing
@@ -3569,6 +3592,44 @@ fn qname(
           },
           text: bytes_concat_all([p.binder, b"::", name]),
         }
+      }
+    },
+  }
+}
+
+// The binder a tagged literal is written with: one of another module that names the literal's
+// parser `literal`, and that a string can touch without making an interpolated or a byte string.
+fn tag_binder(printer: BodyPrinter, decoded: DecodedRef) -> Decoded / {abort.raise} = {
+  let layout = printer.layout;
+  let found = pick(
+    layout,
+    printer.graph,
+    decoded.decoder.imports,
+    decoded.hash,
+    printer.own,
+    |s: Slot| {
+      let p = at(layout.parts, s.part);
+      p.module != printer.own && at(p.names, s.class) == b"literal" && p.binder != b"f"
+        && p.binder != b"b"
+    },
+  );
+  match found {
+    None ->
+      {
+        decoder: {
+          ..decoded.decoder,
+          missing: map_insert(decoded.decoder.missing, decoded.hash, true),
+        },
+        text: short_hex(decoded.hash),
+      },
+    Some(s) -> {
+      let p = at(layout.parts, s.part);
+      {
+        decoder: {
+          ..decoded.decoder,
+          imports: map_insert(decoded.decoder.imports, p.module, p.binder),
+        },
+        text: p.binder,
       }
     },
   }
@@ -4049,6 +4110,7 @@ fn is_atomic(decoder: Decoder) -> Bool / {abort.raise} = {
   t == tag_e_lit() || t == tag_e_var() || t == tag_e_app() || t == tag_e_field()
     || t == tag_e_list()
     || t == tag_e_perform()
+    || t == tag_e_tagged()
 }
 
 fn is_base(decoder: Decoder) -> Bool / {abort.raise} = {
@@ -4375,6 +4437,10 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
       });
       let body = print_block(printer, named.decoder, depth);
       { decoder: body.decoder, text: bytes_concat_all([b"try", named.text, b" ", body.text]) }
+    } else if t.value == tag_e_tagged() {
+      let tag = tag_binder(printer, read_ref(printer, e));
+      let text = print_lit(tag.decoder);
+      { decoder: text.decoder, text: bytes_concat(tag.text, text.text) }
     } else {
       panic(
         string_of_bytes(
@@ -5208,6 +5274,32 @@ test "an interpolated string hashes as the concatenation it stands for" {
   assert_eq(dumped_hash(a, b"m.f"), dumped_hash(b, b"m.f"))
 }
 
+test "a tagged literal hashes with its parser and its text, apart from the call it stands for" {
+  let tag = |accepted: Bytes|
+    {
+      name: b"hex",
+      src: bytes_concat_all([
+        b"pub fn literal(t: String) -> Result<Int, { message: String, offset: Int }> = Ok(",
+        accepted,
+        b")",
+      ]),
+    };
+  let holding = |body: Bytes|
+    { name: b"m", src: bytes_concat(b"import hex\nfn f() -> Int = ", body) };
+  let of = |parser: Bytes, body: Bytes|
+    dumped_hash(hash_dump([tag(parser), holding(body)]), b"m.f");
+  let literal = of(b"1", b"hex\"ab\"");
+  assert_eq(of(b"1", b"(hex\"ab\")"), literal);
+  assert(of(b"1", b"hex\"ac\"") != literal);
+  assert(of(b"2", b"hex\"ab\"") != literal);
+  assert(of(b"1", b"match hex::literal(\"ab\") { Ok(n) -> n, Err(_) -> 0 }") != literal);
+  let renamed = hash_dump([
+    tag(b"1"),
+    { name: b"m", src: b"import hex as h\nfn f() -> Int = h\"ab\"" },
+  ]);
+  assert_eq(dumped_hash(renamed, b"m.f"), literal)
+}
+
 test "a record update of another module's record hashes stably, and follows that module's type" {
   let app = b"import shapes\npub fn bumped() -> shapes::P = { let p = shapes::mk(); {..p, a: 3} }";
   let narrow = [
@@ -5452,6 +5544,24 @@ test "a `try` and a `raise` operation print back as written and hash back to wha
   let unnamed = hash_index(indexed([{ name: b"m", src: src(b"try { g(n) }") }]));
   assert(bytes::contains(at(printed_of(unnamed, []), 0).text, b"try {"));
   assert(hash_of(unnamed) != hash_of(out))
+}
+
+test "a tagged literal prints back under a binder whose module names its parser `literal`" {
+  // One body under two names: only a module that calls it `literal` can be the literal's tag.
+  let parser = b"(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)";
+  let out = hash_index(
+    indexed([
+      { name: b"aaa", src: bytes_concat(b"pub fn of_text", parser) },
+      { name: b"hex", src: bytes_concat(b"pub fn literal", parser) },
+      { name: b"app", src: b"import hex as h\npub fn two() -> Int = h\"a\\\"b\" + h\"\"" },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 1).text, b"hex\"a\\\"b\" + hex\"\""));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
 test "a reference is printed under a name the module holding it exports" {
