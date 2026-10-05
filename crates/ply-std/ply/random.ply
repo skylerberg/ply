@@ -11,8 +11,22 @@
 //! of the root on every machine and every version. A key names one stream among many from a root, and
 //! no two keys, nor a key and the simulation, share a block; `rand` is the empty key, the simulation's
 //! own stream. The counter is a field, so a stream may start at any draw.
+//!
+//! Every distribution is here twice, drawing alike: under a plain name from `entropy` (`uniform`,
+//! `shuffle`, `sample`, `choice`, `weighted_choice`, `normal`, `exponential`), and `rand_`-prefixed
+//! from a `Rand`, answering the stream after its draws. `with_rand` answers `entropy` from a `Rand`,
+//! so code written against the effect runs seeded, and under it a plain name draws what its
+//! `rand_` twin does.
+//!
+//! A token (`token_bytes`, `token_hex`, `token_urlsafe`) is the operating system's entropy and
+//! nothing else, which is what a session identifier, a reset link or an API key has to be. A `Rand`
+//! is a function of its root, so nothing drawn from one is a secret.
 
 import std.bytes (hex_of, u32_le, u64_at, u64_le)
+import std.float (pow2, tau)
+import std.list (last, sort, take, unique)
+import std.math (ilog2)
+import std.radix
 
 /// The operating system's randomness.
 pub nondet effect entropy {
@@ -33,6 +47,192 @@ pub fn below(n: Int) -> Int / {entropy.below bounded} = entropy.below(n)
 /// A nonce: unpredicted and printable, which is what a SASL exchange and a cache key want.
 pub fn nonce() -> String / {entropy.next bounded} =
   int_to_string(next()) ++ "-" ++ int_to_string(next())
+
+/// `n` bytes of the operating system's entropy, so `8 * n` bits a guesser has to find: 16 bytes is
+/// the least a session identifier, a reset link or an API key should carry. Nothing for an `n` at
+/// or below zero.
+pub fn token_bytes(n: Int) -> Bytes / {entropy.next, abort.raise} =
+  bytes_of_draws(map(range(0, (n + 6) / 7), |_i: Int| entropy.next()), n)
+
+/// A token of `n` bytes in lower-case hex: `2 * n` characters.
+pub fn token_hex(n: Int) -> String / {entropy.next, abort.raise} = hex_of(token_bytes(n))
+
+/// A token of `n` bytes in the URL-safe base64 alphabet, unpadded, as `std.base64`'s
+/// `base64url_encode` writes it: `(4 * n + 2) / 3` characters, none of which a URL, a cookie or a
+/// header has to escape.
+pub fn token_urlsafe(n: Int) -> String / {entropy.next, abort.raise} =
+  radix::encode(radix::base64url(), token_bytes(n))
+
+/// Uniform in `[0, 1)`: one of the `2^53` multiples of `2^-53` there, each as likely as another.
+pub fn uniform() -> Float / {entropy.next bounded} = uniform_of(entropy.next())
+
+/// Uniform in `(0, 1)`: one of the `2^52` midpoints between the multiples of `2^-52`, so neither
+/// end is drawn and its logarithm is finite.
+pub fn uniform_open() -> Float / {entropy.next bounded} = uniform_open_of(entropy.next())
+
+/// A draw from the standard normal distribution, of mean zero and deviation one, so
+/// `mean + deviation * normal()` is a draw from any other. Two draws of `entropy.next`.
+pub fn normal() -> Float / {entropy.next bounded} = {
+  let u = uniform_open();
+  normal_of(u, uniform())
+}
+
+/// A draw from the exponential distribution of rate one: the wait for an event that comes once a
+/// unit of time on average, so `exponential() / rate` is a draw at any other rate. Always above
+/// zero.
+pub fn exponential() -> Float / {entropy.next bounded} = exponential_of(uniform_open())
+
+/// One element, each as likely as another; `None` for an empty list.
+pub fn choice<a>(xs: List<a>) -> Option<a> / {entropy.below bounded} =
+  if len(xs) == 0 { None } else { list_at(xs, entropy.below(len(xs))) }
+
+/// `xs` in an order every one of which is as likely as another: a Fisher–Yates shuffle, one draw
+/// for each element but the last.
+pub fn shuffle<a>(xs: List<a>) -> List<a> / {entropy.below, abort.raise} =
+  dealt(xs, picks(len(xs), draws_for(len(xs), len(xs))))
+
+/// `k` of the elements, no position drawn twice, in the order drawn; every such draw is as likely
+/// as another. A `k` at or below zero is none of them and a `k` past the length is all of them,
+/// shuffled. It draws once for each element it answers, and not at all for the last of a whole
+/// list.
+pub fn sample<a>(xs: List<a>, k: Int) -> List<a> / {entropy.below, abort.raise} =
+  take(dealt(xs, picks(len(xs), draws_for(len(xs), k))), k)
+
+/// One item of the table, each in proportion to its weight. Raises for a table `weighted` did not
+/// make.
+pub fn weighted_choice<a>(w: Weighted<a>) -> a / {entropy.below bounded, abort.raise} = {
+  let total = total_of(w);
+  if total < 1 { not_a_table() } else { weighed(w, entropy.below(total)) }
+}
+
+/// What `body` answers when each draw it asks of `entropy` is answered from `r` in turn, and the
+/// stream after those draws. Under it a plain name draws what its `rand_` twin does, so
+/// `shuffle(xs)` is `rand_shuffle(r, xs)`. An `entropy.below` of a bound below one raises.
+pub fn with_rand<a | e>(
+  r: Rand,
+  body: () -> a / {entropy.next, entropy.below | e},
+) -> { value: a, rand: Rand } / {abort.raise | e} =
+  with_cell[stream](r) { c ->
+    handle {
+      let value = body();
+      { value: value, rand: cell_get(c) }
+    } with {
+      entropy.next() -> {
+        let step = rand_int(cell_get(c));
+        cell_set(c, step.rand);
+        step.value
+      },
+      entropy.below(n) -> match rand_below(cell_get(c), n) {
+        Some(step) -> {
+          cell_set(c, step.rand);
+          step.value
+        },
+        None -> panic("`entropy.below` needs a bound above zero"),
+      },
+    }
+  }
+
+// --- What a draw is made into -----------------------------------------------
+//
+// Each distribution is a pure function of the draws it is handed, so the two families share it and
+// a law holds of it whatever is drawn.
+
+/// The first `n` bytes of the low seven of each draw: a draw is sixty-three bits, so its eighth
+/// byte is not uniform.
+fn bytes_of_draws(draws: List<Int>, n: Int) -> Bytes / {abort.raise} = {
+  let all = bytes_concat_all(map(draws, |d: Int| bytes_slice(u64_le(d), 0, 7)));
+  bytes_slice(all, 0, min(max(n, 0), bytes_len(all)))
+}
+
+/// The top fifty-three bits of a sixty-three-bit draw, as a multiple of `2^-53`.
+fn uniform_of(draw: Int) -> Float = float_of_int(draw >>> 10 & 0x1F_FFFF_FFFF_FFFF) * pow2(0 - 53)
+
+/// The top fifty-two bits of a sixty-three-bit draw, as the midpoint after that multiple of
+/// `2^-52`: a `Float` holds it exactly, so it never rounds onto an end.
+fn uniform_open_of(draw: Int) -> Float =
+  (float_of_int(draw >>> 11 & 0xF_FFFF_FFFF_FFFF) + 0.5) * pow2(0 - 52)
+
+/// Box–Muller: a radius from `u` in `(0, 1)` and an angle from `v` in `[0, 1)`.
+fn normal_of(u: Float, v: Float) -> Float = sqrt(0.0 - 2.0 * ln(u)) * cos(tau() * v)
+
+/// By inversion, of `u` in `(0, 1)`.
+fn exponential_of(u: Float) -> Float = 0.0 - ln(u)
+
+/// How many draws a deal of `k` elements from `n` takes: one each, and none for the last of all.
+fn draws_for(n: Int, k: Int) -> Int = min(max(k, 0), n - 1)
+
+/// The picks a deal of `draws` positions from `n` elements takes: the `i`th uniformly below
+/// `n - i`.
+fn picks(n: Int, draws: Int) -> List<Int> / {entropy.below} =
+  map(range(0, draws), |i: Int| entropy.below(n - i))
+
+/// A Fisher–Yates deal: for each pick in order, position `i` takes the element `picks[i]` places
+/// on and gives up its own, so the first `len(picks)` positions hold a draw without replacement.
+/// A pick below zero, or one that reaches past the end, moves nothing.
+fn dealt<a>(xs: List<a>, picks: List<Int>) -> List<a> / {abort.raise}
+  cost len(picks)
+=
+  fold(range(0, len(picks)), xs, |acc: List<a>, i: Int|
+    match list_at(picks, i) {
+      Some(p) -> if p < 0 || p >= len(acc) - i { acc } else { swapped(acc, i, i + p) },
+      None -> acc,
+    })
+
+fn swapped<a>(xs: List<a>, i: Int, j: Int) -> List<a> / {abort.raise} =
+  match ((list_at(xs, i), list_at(xs, j))) {
+    (Some(x), Some(y)) -> list_set(list_set(xs, i, y), j, x),
+    _ -> xs,
+  }
+
+/// Items under the running totals of their weights, which a weighted draw searches. `weighted`
+/// makes one, and only what it made is a distribution: the totals ascend, one for each item.
+pub type Weighted<a> = new { items: List<a>, totals: List<Int> }
+
+/// The table that draws each item in proportion to its weight; an item of weight zero is never
+/// drawn. `None` unless every weight is at least zero, one is above it, and they sum to an `Int`.
+pub fn weighted<a>(pairs: List<{ item: a, weight: Int }>) -> Option<Weighted<a>>
+  cost len(pairs)
+= {
+  let start: Option<Weighted<a>> = Some({ items: [], totals: [] });
+  let table = fold(pairs, start, |acc: Option<Weighted<a>>, p: { item: a, weight: Int }|
+    match acc {
+      None -> None,
+      Some(w) -> if p.weight < 0 { None }
+      else if p.weight == 0 { Some(w) } else {
+        match checked_add(total_of(w), p.weight) {
+          None -> None,
+          Some(sum) -> Some({ ..w, items: push(w.items, p.item), totals: push(w.totals, sum) }),
+        }
+      },
+    });
+  match table { Some(w) -> if len(w.items) == 0 { None } else { table }, None -> None }
+}
+
+/// The sum of the weights: one past the last point a draw can land on.
+fn total_of<a>(w: Weighted<a>) -> Int = match last(w.totals) { Some(t) -> t, None -> 0 }
+
+/// The item whose share of the total holds `point`, counted from zero.
+fn weighed<a>(w: Weighted<a>, point: Int) -> a / {abort.raise} =
+  match list_at(w.items, first_above(w.totals, point)) { Some(x) -> x, None -> not_a_table() }
+
+fn not_a_table<a>() -> a / {abort.raise} =
+  panic("std.random: a weighted draw from a table `weighted` did not make")
+
+/// The first position whose total is above `point` in an ascending list, which is how many are
+/// at or below it: found a bit at a time from the largest power of two the list holds.
+fn first_above(totals: List<Int>, point: Int) -> Int
+  cost ilog2(len(totals))
+= above_from(totals, point, 0, 1 << ilog2(len(totals)))
+
+/// `known` of the totals are at or below `point`; whether `stride` more are, then half as many.
+fn above_from(totals: List<Int>, point: Int, known: Int, stride: Int) -> Int =
+  if stride < 1 { known } else {
+    match list_at(totals, known + stride - 1) {
+      Some(t) -> if t <= point { above_from(totals, point, known + stride, stride / 2) }
+      else { above_from(totals, point, known, stride / 2) },
+      None -> above_from(totals, point, known, stride / 2),
+    }
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -124,6 +324,78 @@ fn below_draw(r: Rand, n: Int, limit: Int) -> { value: Int, rand: Rand } / {abor
     else { Continue(step.rand) }
   })
 
+/// Uniform in `[0, 1)`, as `uniform` is, and the stream after its one draw.
+pub fn rand_uniform(r: Rand) -> { value: Float, rand: Rand } / {abort.raise} = {
+  let step = rand_int(r);
+  { value: uniform_of(step.value), rand: step.rand }
+}
+
+/// Uniform in `(0, 1)`, as `uniform_open` is, and the stream after its one draw.
+pub fn rand_uniform_open(r: Rand) -> { value: Float, rand: Rand } / {abort.raise} = {
+  let step = rand_int(r);
+  { value: uniform_open_of(step.value), rand: step.rand }
+}
+
+/// A standard normal draw, as `normal` is, and the stream after its two draws.
+pub fn rand_normal(r: Rand) -> { value: Float, rand: Rand } / {abort.raise} = {
+  let u = rand_uniform_open(r);
+  let v = rand_uniform(u.rand);
+  { value: normal_of(u.value, v.value), rand: v.rand }
+}
+
+/// An exponential draw of rate one, as `exponential` is, and the stream after its one draw.
+pub fn rand_exponential(r: Rand) -> { value: Float, rand: Rand } / {abort.raise} = {
+  let u = rand_uniform_open(r);
+  { value: exponential_of(u.value), rand: u.rand }
+}
+
+/// One element, each as likely as another, and the stream after its draw; `None` for an empty
+/// list.
+pub fn rand_choice<a>(r: Rand, xs: List<a>) -> Option<{ value: a, rand: Rand }> / {abort.raise} =
+  match rand_below(r, len(xs)) {
+    None -> None,
+    Some(step) -> match list_at(xs, step.value) {
+      Some(x) -> Some({ value: x, rand: step.rand }),
+      None -> None,
+    },
+  }
+
+/// `xs` shuffled, as `shuffle` does it, and the stream after its draws.
+pub fn rand_shuffle<a>(r: Rand, xs: List<a>) -> { value: List<a>, rand: Rand } / {abort.raise} = {
+  let drawn = rand_picks(r, len(xs), draws_for(len(xs), len(xs)));
+  { value: dealt(xs, drawn.value), rand: drawn.rand }
+}
+
+/// `k` of the elements without replacement, as `sample` draws them, and the stream after its
+/// draws.
+pub fn rand_sample<a>(
+  r: Rand,
+  xs: List<a>,
+  k: Int,
+) -> { value: List<a>, rand: Rand } / {abort.raise} = {
+  let drawn = rand_picks(r, len(xs), draws_for(len(xs), k));
+  { value: take(dealt(xs, drawn.value), k), rand: drawn.rand }
+}
+
+/// One item of the table, each in proportion to its weight, and the stream after its draw. Raises
+/// for a table `weighted` did not make.
+pub fn rand_weighted_choice<a>(
+  r: Rand,
+  w: Weighted<a>,
+) -> { value: a, rand: Rand } / {abort.raise} =
+  match rand_below(r, total_of(w)) {
+    Some(step) -> { value: weighed(w, step.value), rand: step.rand },
+    None -> not_a_table(),
+  }
+
+/// `picks`, drawn from a stream.
+fn rand_picks(r: Rand, n: Int, draws: Int) -> { value: List<Int>, rand: Rand } / {abort.raise} =
+  fold(range(0, draws), { value: [], rand: r }, |s: { value: List<Int>, rand: Rand }, i: Int|
+    match rand_below(s.rand, n - i) {
+      Some(step) -> { value: push(s.value, step.value), rand: step.rand },
+      None -> s,
+    })
+
 /// The four words of one block: the domain `ply-eval`'s `sim::Stream` uses, the root, the random
 /// domain's tag, and the counter, each little-endian as that stream writes them. A keyed stream
 /// takes tag 2, which the simulation never writes, and its key length-prefixed, so no two keys and
@@ -203,5 +475,336 @@ test "a stream started at a counter draws what the stream reaches there" {
   let third = rand_int(rand_int(rand_int(rand_keyed(5, b"k")).rand).rand);
   assert_eq(rand_int({ ..rand_keyed(5, b"k"), counter: 2 }).value, third.value)
 }
+
+// --- Tokens -------------------------------------------------------------------
+
+/// A draw whose bytes, least significant first, count up from zero.
+fn counting() -> Int = 0x0706_0504_0302_0100
+
+test "a token is the low seven bytes of each draw, cut to the length asked" {
+  let drawn = |n: Int| handle { token_bytes(n) } with { entropy.next() -> counting() };
+  assert_eq(drawn(3), b"\x00\x01\x02");
+  assert_eq(drawn(7), b"\x00\x01\x02\x03\x04\x05\x06");
+  assert_eq(drawn(9), b"\x00\x01\x02\x03\x04\x05\x06\x00\x01");
+  assert_eq(drawn(0), b"");
+  assert_eq(drawn(0 - 4), b"")
+}
+
+test "a token in hex is two characters a byte, and one in base64 has the URL's two letters" {
+  assert_eq(handle { token_hex(4) } with { entropy.next() -> counting() }, "00010203");
+  assert_eq(handle { token_urlsafe(3) } with { entropy.next() -> 0xFE_FFFF }, "___-");
+  assert_eq(handle { token_urlsafe(4) } with { entropy.next() -> 0xFE_FFFF }, "___-AA")
+}
+
+/// How many times `body` asked `entropy` for a draw, each answered zero.
+fn asked<a>(body: () -> a / {entropy.next, entropy.below, abort.raise}) -> Int / {abort.raise} =
+  with_cell[asked](0) { c ->
+    handle {
+      let _answer = body();
+      cell_get(c)
+    } with {
+      entropy.next() -> {
+        cell_update(c, |n: Int| n + 1);
+        0
+      },
+      entropy.below(_) -> {
+        cell_update(c, |n: Int| n + 1);
+        0
+      },
+    }
+  }
+
+test "a token draws once for every seven bytes it holds" {
+  assert_eq(asked(|| token_bytes(0)), 0);
+  assert_eq(asked(|| token_bytes(1)), 1);
+  assert_eq(asked(|| token_bytes(7)), 1);
+  assert_eq(asked(|| token_bytes(8)), 2);
+  assert_eq(asked(|| token_urlsafe(32)), 5)
+}
+
+law "a token has the length asked for"
+  forall (root: Int, sized: List<Bool>) {
+    let n = len(sized);
+    let drawn = with_rand(rand(root), || {
+      let raw = token_bytes(n);
+      let hex = token_hex(n);
+      { raw: bytes_len(raw), hex: string_len(hex), urlsafe: string_len(token_urlsafe(n)) }
+    }).value;
+    drawn == { raw: n, hex: 2 * n, urlsafe: (4 * n + 2) / 3 }
+  }
+
+law "the bytes of draws are as many as asked, as far as the draws reach"
+  forall (draws: List<Int>, n: Int) {
+    bytes_len(bytes_of_draws(draws, n)) == min(max(n, 0), 7 * len(draws))
+  }
+
+// --- Floats -------------------------------------------------------------------
+
+test "a uniform float is a draw's top bits: zero at the least, and never one" {
+  assert_eq(uniform_of(0), 0.0);
+  assert_eq(uniform_of(max_63()), 0.9999999999999999);
+  assert_eq(uniform_of(1 << 62), 0.5);
+  assert_eq(uniform_open_of(0), pow2(0 - 53));
+  assert_eq(uniform_open_of(max_63()), 0.9999999999999999);
+  assert_eq(handle { uniform() } with { entropy.next() -> 1 << 62 }, 0.5);
+  assert_eq(handle { uniform_open() } with { entropy.next() -> 0 }, pow2(0 - 53))
+}
+
+law "a uniform float is at least zero and below one, whatever is drawn"
+  forall (draw: Int) {
+    uniform_of(draw) >= 0.0 && uniform_of(draw) < 1.0
+  }
+
+law "an open uniform float is strictly between zero and one, whatever is drawn"
+  forall (draw: Int) {
+    uniform_open_of(draw) > 0.0 && uniform_open_of(draw) < 1.0
+  }
+
+law "an exponential draw is above zero and a normal one is finite, whatever is drawn"
+  forall (a: Int, b: Int) {
+    let wait = exponential_of(uniform_open_of(a));
+    let z = normal_of(uniform_open_of(a), uniform_of(b));
+    wait > 0.0 && wait < 40.0 && z > 0.0 - 9.0 && z < 9.0
+  }
+
+// --- Uniformity ---------------------------------------------------------------
+//
+// Each of these draws a fixed number of values from one root and holds the chi-square statistic
+// under the value a uniform source passes 999 times in 1000. The root is fixed, so a run is not
+// one of the thousand: it passes or it fails, the same every time.
+
+/// How many of `draws` are each of `0..kinds`.
+fn tally(kinds: Int, draws: List<Int>) -> List<Int> / {abort.raise} =
+  fold(draws, map(range(0, kinds), |_k: Int| 0), |counts: List<Int>, d: Int|
+    match list_at(counts, d) { Some(c) -> list_set(counts, d, c + 1), None -> counts })
+
+/// The chi-square statistic of `counts` against `expected` for each, times `expected`.
+fn squared_error(counts: List<Int>, expected: Int) -> Int =
+  fold(counts, 0, |sum: Int, c: Int| sum + (c - expected) * (c - expected))
+
+test "six thousand draws below six pass chi-square at five degrees of freedom (20.52)" {
+  let draws = with_rand(rand(11), || map(range(0, 6000), |_i: Int| below(6))).value;
+  let counts = tally(6, draws);
+  assert_eq(fold(counts, 0, |n: Int, c: Int| n + c), 6000);
+  assert(squared_error(counts, 1000) < 20520)
+}
+
+/// Which of the six orders of `[0, 1, 2]` this is.
+fn order_of(p: List<Int>) -> Int =
+  match p {
+    [0, 1, 2] -> 0,
+    [0, 2, 1] -> 1,
+    [1, 0, 2] -> 2,
+    [1, 2, 0] -> 3,
+    [2, 0, 1] -> 4,
+    [2, 1, 0] -> 5,
+    _ -> 6,
+  }
+
+test "six thousand shuffles of three pass chi-square over the six orders (20.52)" {
+  let orders = with_rand(rand(12), || map(range(0, 6000), |_i: Int| order_of(shuffle([0, 1, 2]))));
+  let counts = tally(6, orders.value);
+  assert_eq(fold(counts, 0, |n: Int, c: Int| n + c), 6000);
+  assert(squared_error(counts, 1000) < 20520)
+}
+
+test "ten thousand uniform floats pass chi-square over ten equal bins (27.88)" {
+  let bins = with_rand(rand(13), ||
+    map(range(0, 10000), |_i: Int|
+      match int_of_float(uniform() * 10.0, Down) { Some(bin) -> bin, None -> 10 }));
+  let counts = tally(10, bins.value);
+  assert_eq(fold(counts, 0, |n: Int, c: Int| n + c), 10000);
+  assert(squared_error(counts, 1000) < 27880)
+}
+
+test "six thousand draws weighted one, two and three pass chi-square at two degrees (13.82)" {
+  let table = weighted([{ item: 0, weight: 1 }, { item: 1, weight: 2 }, { item: 2, weight: 3 }]);
+  let draws = match table {
+    Some(w) -> with_rand(rand(14), || map(range(0, 6000), |_i: Int| weighted_choice(w))).value,
+    None -> [],
+  };
+  let off = |counts: List<Int>, i: Int, expected: Int|
+    match list_at(counts, i) { Some(c) -> (c - expected) * (c - expected), None -> 0 };
+  let counts = tally(3, draws);
+  assert_eq(fold(counts, 0, |n: Int, c: Int| n + c), 6000);
+  // Each term over its own expected count, the whole times six thousand.
+  assert(6 * off(counts, 0, 1000) + 3 * off(counts, 1, 2000) + 2 * off(counts, 2, 3000) < 82900)
+}
+
+test "four thousand normal draws have a mean near zero and a deviation near one" {
+  let mean = |xs: List<Float>| fold(xs, 0.0, |sum: Float, x: Float| sum + x) / 4000.0;
+  let zs = with_rand(rand(15), || map(range(0, 4000), |_i: Int| normal())).value;
+  let m = mean(zs);
+  let variance = mean(map(zs, |z: Float| (z - m) * (z - m)));
+  let within_one = len(filter(zs, |z: Float| z > 0.0 - 1.0 && z < 1.0));
+  // Five standard errors each way: 0.016 for the mean, 0.022 for the variance, 29 for the count.
+  assert(m > 0.0 - 0.08 && m < 0.08);
+  assert(variance > 0.89 && variance < 1.11);
+  assert(within_one > 2731 - 150 && within_one < 2731 + 150)
+}
+
+test "four thousand exponential draws are above zero with a mean near one" {
+  let waits = with_rand(rand(16), || map(range(0, 4000), |_i: Int| exponential())).value;
+  let m = fold(waits, 0.0, |sum: Float, w: Float| sum + w) / 4000.0;
+  assert_eq(len(filter(waits, |w: Float| w > 0.0)), 4000);
+  assert(m > 0.92 && m < 1.08)
+}
+
+// --- Shuffling and sampling ---------------------------------------------------
+
+test "a shuffle, a sample and a choice of little or nothing are total" {
+  let none: List<Int> = [];
+  assert_eq(asked(|| assert_eq(shuffle(none), [])), 0);
+  assert_eq(asked(|| assert_eq(shuffle([7]), [7])), 0);
+  assert_eq(asked(|| assert_eq(choice(none), None)), 0);
+  assert_eq(asked(|| assert_eq(choice([7]), Some(7))), 1);
+  assert_eq(asked(|| assert_eq(sample(none, 3), [])), 0);
+  assert_eq(rand_choice(rand(1), none), None);
+  assert_eq(rand_shuffle(rand(1), none), { value: [], rand: rand(1) });
+  assert_eq(rand_sample(rand(1), [7], 1), { value: [7], rand: rand(1) })
+}
+
+test "a sample draws once for each element it answers, and a shuffle once for all but the last" {
+  let five = [1, 2, 3, 4, 5];
+  assert_eq(asked(|| assert_eq(sample(five, 2), [1, 2])), 2);
+  assert_eq(asked(|| assert_eq(sample(five, 0), [])), 0);
+  assert_eq(asked(|| assert_eq(sample(five, 0 - 3), [])), 0);
+  assert_eq(asked(|| assert_eq(sample(five, 5), five)), 4);
+  assert_eq(asked(|| assert_eq(sample(five, 9), five)), 4);
+  assert_eq(asked(|| assert_eq(shuffle(five), five)), 4)
+}
+
+test "a deal swaps each position with the one its pick names" {
+  assert_eq(dealt([1, 2, 3, 4], [3, 0, 1]), [4, 2, 1, 3]);
+  assert_eq(dealt([1, 2, 3, 4], [0, 0, 0]), [1, 2, 3, 4]);
+  assert_eq(dealt([1, 2, 3, 4], [9, 0 - 5, max_63()]), [1, 2, 3, 4])
+}
+
+law "a deal is a permutation, whatever the picks"
+  forall (xs: List<Int>, picks: List<Int>) {
+    sort(dealt(xs, picks)) == sort(xs)
+  }
+
+law "a shuffle is a permutation"
+  forall (root: Int, xs: List<Int>) {
+    sort(rand_shuffle(rand(root), xs).value) == sort(xs)
+  }
+
+law "a sample has the length asked for and no position twice"
+  forall (root: Int, xs: List<Bool>, sized: List<Bool>) {
+    let n = len(xs);
+    let k = len(sized);
+    let drawn = rand_sample(rand(root), range(0, n), k).value;
+    len(drawn) == min(k, n) && unique(drawn) == drawn
+      && fold(drawn, true, |ok: Bool, at: Int| ok && at >= 0 && at < n)
+  }
+
+law "a sample is the front of the shuffle its stream deals"
+  forall (root: Int, xs: List<Int>, sized: List<Bool>) {
+    let k = len(sized);
+    rand_sample(rand(root), xs, k).value == take(rand_shuffle(rand(root), xs).value, k)
+  }
+
+// --- Bounds -------------------------------------------------------------------
+
+test "a draw below one is zero, and one below the largest Int is in range" {
+  assert_eq(rand_below(rand(3), 1), Some({ value: 0, rand: { ..rand(3), counter: 1 } }));
+  let wide = rand_below(rand(3), max_63());
+  assert(match wide { Some(step) -> step.value >= 0 && step.value < max_63(), None -> false });
+  assert_eq(rand_below(rand(3), 0 - 1), None)
+}
+
+law "a draw below a bound is in range, and no bound at or below zero has one"
+  forall (root: Int, n: Int) {
+    match rand_below(rand(root), n) {
+      Some(step) -> n > 0 && step.value >= 0 && step.value < n,
+      None -> n <= 0,
+    }
+  }
+
+// --- Weights ------------------------------------------------------------------
+
+test "a table is made of weights that are a distribution, and of no others" {
+  let none: List<{ item: String, weight: Int }> = [];
+  assert_eq(weighted(none), None);
+  assert_eq(weighted([{ item: "a", weight: 0 }]), None);
+  assert_eq(weighted([{ item: "a", weight: 1 }, { item: "b", weight: 0 - 1 }]), None);
+  assert_eq(weighted([{ item: "a", weight: max_63() }, { item: "b", weight: 1 }]), None);
+  assert_eq(
+    weighted([{ item: "a", weight: 2 }, { item: "b", weight: 0 }, { item: "c", weight: 3 }]),
+    Some({ items: ["a", "c"], totals: [2, 5] }),
+  )
+}
+
+test "a point of the total lands on the item whose share holds it" {
+  let table: Weighted<String> = { items: ["a", "c"], totals: [2, 5] };
+  assert_eq(map(range(0, 5), |point: Int| weighed(table, point)), ["a", "a", "c", "c", "c"]);
+  assert_eq(handle { weighted_choice(table) } with { entropy.below(n) -> n - 1 }, "c");
+  assert_eq(first_above([2, 5], 5), 2);
+  assert_eq(first_above([], 0), 0)
+}
+
+/// Each position as an item, weighted by the low two bits of what `ws` holds there.
+fn small_weights(ws: List<Int>) -> List<{ item: Int, weight: Int }> =
+  map(range(0, len(ws)), |i: Int|
+    { item: i, weight: match list_at(ws, i) { Some(w) -> w & 3, None -> 0 } })
+
+law "an item takes as many points of the total as its weight"
+  forall (ws: List<Int>) {
+    let pairs = small_weights(ws);
+    let spread = fold(pairs, [], |out: List<Int>, p: { item: Int, weight: Int }|
+      fold(range(0, p.weight), out, |acc: List<Int>, _k: Int| push(acc, p.item)));
+    match weighted(pairs) {
+      Some(w) -> map(range(0, total_of(w)), |point: Int| weighed(w, point)) == spread,
+      None -> spread == [],
+    }
+  }
+
+// --- One distribution, two sources --------------------------------------------
+
+test "a seeded handler answers entropy from the stream, and hands the stream back" {
+  let first = rand_int(rand_keyed(7, b"k"));
+  let second = rand_int(first.rand);
+  let under = with_rand(rand_keyed(7, b"k"), || nonce());
+  assert_eq(under.value, int_to_string(first.value) ++ "-" ++ int_to_string(second.value));
+  assert_eq(under.rand, second.rand);
+  assert_eq(with_rand(rand(7), || 1).rand, rand(7))
+}
+
+law "under a seeded handler a float is what its seeded twin draws"
+  forall (root: Int) {
+    let r = rand(root);
+    with_rand(r, || uniform()) == rand_uniform(r)
+      && with_rand(r, || uniform_open()) == rand_uniform_open(r)
+      && with_rand(r, || normal()) == rand_normal(r)
+      && with_rand(r, || exponential()) == rand_exponential(r)
+  }
+
+law "under a seeded handler a shuffle and a sample are what their seeded twins draw"
+  forall (root: Int, xs: List<Int>, sized: List<Bool>) {
+    let r = rand(root);
+    let k = len(sized);
+    with_rand(r, || shuffle(xs)) == rand_shuffle(r, xs)
+      && with_rand(r, || sample(xs, k)) == rand_sample(r, xs, k)
+  }
+
+law "under a seeded handler a choice is what its seeded twin draws"
+  forall (root: Int, xs: List<Int>) {
+    let r = rand(root);
+    let under = with_rand(r, || choice(xs));
+    match rand_choice(r, xs) {
+      Some(step) -> under == { value: Some(step.value), rand: step.rand },
+      None -> under == { value: None, rand: r },
+    }
+  }
+
+law "under a seeded handler a weighted choice is what its seeded twin draws"
+  forall (root: Int, ws: List<Int>) {
+    let r = rand(root);
+    match weighted(small_weights(ws)) {
+      Some(w) -> with_rand(r, || weighted_choice(w)) == rand_weighted_choice(r, w),
+      None -> true,
+    }
+  }
 
 fn main() -> Int = 0
