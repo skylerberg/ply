@@ -2293,9 +2293,9 @@ it, a name with no body, a closure or runnable that is not the one these
 definitions make — is `E0443`, as is a build whose closure holds two identical
 declarations it cannot tell apart (two effects, or two members of one recursive
 group); an artifact built by another compiler, or compiled for another runtime,
-is `E0444`: rebuild it with this `ply`. One built against other text of a standard
-library module its definitions are drawn from runs as it was built, and warns
-`W0605`.
+is `E0444`: rebuild it with this `ply`. The standard library definitions it draws
+on are its own, so a `ply` that ships other ones runs it as it was built, reading
+none of its own; `--diff` names what a rebuild would change.
 `--config-schema` ships that function too, resolved as a run resolves it: a name
 that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 

@@ -120,13 +120,35 @@ const VCS: &str = ".git";
 /// Where this `ply` lays its shipped modules out as files, and the directories it keeps what one
 /// run leaves for the next in.
 pub fn laid_out(shipped_dir: &Path, kept: Vec<PathBuf>) {
-    let _ = SHIPPED_DIR.set(shipped_dir.to_path_buf());
+    let _ = SHIPPED_DIR.set(resolved(shipped_dir));
     keeps(kept);
 }
 
 /// The directories this process keeps what one run leaves for the next in.
 pub fn keeps(kept: Vec<PathBuf>) {
-    let _ = KEPT.set(kept);
+    let _ = KEPT.set(
+        kept.into_iter()
+            .flat_map(|dir| [resolved(&dir), dir])
+            .collect(),
+    );
+}
+
+/// `dir` as a root names what is below it, its links resolved, though its tail need not exist yet.
+fn resolved(dir: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = dir;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            return rest.iter().rev().fold(real, |path, name| path.join(name));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return dir.to_path_buf(),
+        }
+    }
 }
 
 /// `f` runs as the process exits normally, after its `main` returns.
