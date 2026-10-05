@@ -1,6 +1,7 @@
 //! Tagged literals as a load settles them: `tag"text"` is the call `tag::literal("text")`, run
 //! before the program is, and a text its parser refuses is refused where the parser says, by every
-//! command that would otherwise run it.
+//! command that would otherwise run it. One with holes is settled on its texts alone, by its tag's
+//! `compile`, and its holes are its tag's `fill`'s when the program runs.
 
 import harness (Source, in_memory, kept_in_memory, tree, scratch, project, on_disk, json_of, at,
                 nth, str, int, codes, diagnostic, stdout, said, assert_ok, Hermetic, Shipped)
@@ -300,4 +301,158 @@ test "a module that binds its own `Ok` holds no tagged literal" {
     },
   ];
   assert_eq(codes(checked(files)), ["E0118"])
+}
+
+/// A tag with holes: its texts are refused at a `!`, and a literal is how many texts and holes it
+/// has, each hole of the type `hole`.
+fn counting(hole: String) -> Source =
+  {
+    path: "count.ply",
+    text:
+      \\pub type Refusal = { message: String, offset: Int, part: Int }
+      \\
+      \\pub fn compile(parts: List<String>) -> Result<List<String>, Refusal> / {abort.raise} =
+      \\  fold(range(0, len(parts)), Ok(parts), |read: Result<List<String>, Refusal>, part: Int|
+      \\    match ((read, list_at(parts, part))) {
+      \\      (Ok(_), Some(text)) -> if !string_contains(text, "!") { read } else {
+      \\        Err({ message: "no `!` in a count", offset: string_find(text, "!"), part: part })
+      \\      },
+      \\      _ -> read,
+      \\    })
+      \\
+      \\pub fn fill(parts: List<String>, holes: List<
+      ++ hole
+      ++ ">) -> Int = len(parts) + len(holes)\n",
+  }
+
+fn counted(body: String) -> Source =
+  { path: "m.ply", text: "import count\n\nfn main() -> Int = " ++ body ++ "\n" }
+
+test "a literal with holes is its tag's `fill` of what `compile` answered, and of its holes" {
+  let files = [counting("Int"), counted("count\"a {1} b{2 + 3}{{}}\" + count\"{4}\"")];
+  assert_ok(in_memory(tree(files), ["check"]));
+  let ran = in_memory(tree(files), ["run"]);
+  assert_ok(ran);
+  assert(string_contains(stdout(ran), "8"), Some(said(ran)))
+}
+
+test "a text its tag refuses is a check error in that text, a brace of it one character" {
+  let v = checked([counting("Int"), counted("count\"ab {1} {{c!{2}\"")]);
+  assert_eq(codes(v), ["E0153"]);
+  assert(string_contains(str(at(diagnostic(v), "message")), "`count::compile` refuses"));
+  let label = nth(at(diagnostic(v), "labels"), 0);
+  assert_eq(str(at(label, "message")), "no `!` in a count");
+  assert_eq(str(at(label, "snippet")), "!");
+  assert_eq(int(at(at(label, "start"), "line")), 3);
+  assert_eq(int(at(at(label, "start"), "col")), 36)
+}
+
+test "markup a hole cannot stand in is refused at the hole, before any value is" {
+  let page = |body: String|
+    [
+      {
+        path: "m.ply",
+        text: "import std.html\nimport std.html (text)\n\nfn main() -> Int = len(" ++ body
+          ++ ".pieces)\n",
+      },
+    ];
+  let in_tag = checked(page("html\"<p {text(\"x\")}>\""));
+  assert_eq(codes(in_tag), ["E0153"]);
+  let label = nth(at(diagnostic(in_tag), "labels"), 0);
+  assert_eq(str(at(label, "snippet")), "{text(\"x\")}");
+  assert_eq(
+    str(at(label, "message")),
+    "a hole stands in an element's content or in an attribute's value",
+  );
+  let scripted = checked(page("html\"<a onclick='{text(\"x\")}'>go</a>\""));
+  assert_eq(codes(scripted), ["E0153"]);
+  assert_eq(str(at(nth(at(diagnostic(scripted), "labels"), 0), "snippet")), "{text(\"x\")}");
+  let open = checked(page("html\"<p>{text(\"x\")}</p><b\""));
+  assert_eq(codes(open), ["E0153"]);
+  assert_eq(str(at(nth(at(diagnostic(open), "labels"), 0), "snippet")), "\"");
+  let ran = in_memory(tree(page("html\"<p class={text(\"k\")}>{text(\"<script>\")}</p>\"")), [
+    "run",
+  ]);
+  assert_ok(ran);
+  assert(string_contains(stdout(ran), "7"), Some(said(ran)))
+}
+
+test "a hole of another type than its tag's is refused at the hole" {
+  let v = checked([counting("Int"), counted("count\"a {1} b{\"two\"}\"")]);
+  assert_eq(codes(v), ["E0201"]);
+  let label = nth(at(diagnostic(v), "labels"), 0);
+  assert_eq(str(at(label, "snippet")), "\"two\"");
+  assert_eq(int(at(at(label, "start"), "col")), 34)
+}
+
+test "a literal with holes checked before is refused once its tag takes another hole or its module binds `Ok`" {
+  let holder = counted("count\"a {1}\"");
+  let first = kept_in_memory(tree([counting("Int"), holder]), ["check", "--explain"], [], None);
+  assert_ok(first.ran);
+  let retyped = fs::mem_write(
+    first.tree,
+    "w/count.ply",
+    bytes_of_string(counting("String").text),
+  ).fs;
+  assert_eq(codes(json_of(in_memory(retyped, ["check", "--json"]))), ["E0201"]);
+  let refusing = fs::mem_write(
+    first.tree,
+    "w/m.ply",
+    bytes_of_string(counted("count\"a! {1}\"").text),
+  ).fs;
+  let second = kept_in_memory(refusing, ["check", "--json"], [], None);
+  assert_eq(codes(json_of(second.ran)), ["E0153"]);
+  assert_eq(in_memory(second.tree, ["check"]).code, 2);
+  let bound = fs::mem_write(
+    first.tree,
+    "w/m.ply",
+    bytes_of_string(holder.text ++ "\ntype Mine = | Ok(Int) | No\n"),
+  ).fs;
+  assert_eq(codes(json_of(in_memory(bound, ["check", "--json"]))), ["E0118"])
+}
+
+test "a tag with holes declares a `compile` and a `fill` a literal can call" {
+  let lone = |text: String| checked([{ path: "count.ply", text: text }, counted("count\"a {1}\"")]);
+  let compiling = "pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\n";
+  assert_eq(codes(lone("pub fn literal(text: String) -> " ++ refusal() ++ " = Ok(1)\n")), [
+    "E0101",
+  ]);
+  assert_eq(codes(lone(compiling)), ["E0101"]);
+  let misfilled = lone(compiling ++ "pub fn fill(c: String, holes: List<Int>) -> Int = 1\n");
+  assert_eq(codes(misfilled), ["E0152"]);
+  assert(string_contains(str(at(diagnostic(misfilled), "message")), "`count::fill` has type"));
+  let unplaced = lone(
+    "pub fn compile(parts: List<String>) -> " ++ refusal() ++ " = Ok(1)\n"
+      ++ "pub fn fill(c: Int, holes: List<Int>) -> Int = c\n",
+  );
+  assert_eq(codes(unplaced), ["E0152"]);
+  assert(string_contains(str(at(diagnostic(unplaced), "message")), "`count::compile` has type"));
+  let performing = lone(
+    compiling ++ "pub effect ticks { read now() -> Int }\n"
+      ++ "pub fn fill(c: Int, holes: List<Int>) -> Int / {ticks.now} = ticks.now()\n",
+  );
+  assert_eq(codes(performing), ["E0152"]);
+  assert(string_contains(str(at(diagnostic(performing), "message")), "`count::fill` performs"));
+  let generic = lone(compiling ++ "pub fn fill<a>(c: Int, holes: List<a>) -> Int = c\n");
+  assert(string_contains(str(at(diagnostic(generic), "message")), "parameters of its own"))
+}
+
+test "an artifact holds a literal with holes as it is written, and every command refuses a refused one" {
+  scratch(|| {
+    project([counting("Int"), counted("count\"a {{b}} {1}\\\"{count\"{2}\"}\"")]);
+    assert_ok(on_disk(["build", ".", "-o", "m.plyx"]));
+    let ran = on_disk(["run", "m.plyx"]);
+    assert_ok(ran);
+    assert(string_contains(stdout(ran), "5"), Some(said(ran)))
+  });
+  let files = [counting("Int"), counted("count\"a! {1}\"")];
+  fold(
+    [["run"], ["test"], ["prove"], ["build", ".", "-o", "m.plyx"]],
+    (),
+    |_: Unit, line: List<String>| {
+      let ran = in_memory(tree(files), line);
+      assert_eq(ran.code, 2);
+      assert(string_contains(said(ran), "E0153"), Some(said(ran)))
+    },
+  )
 }

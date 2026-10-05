@@ -1,0 +1,450 @@
+//! HTML as a value in which no text can be markup, and the tag that writes it.
+//!
+//! With `import std.html`, `html"<p class={kind}>{name}</p>"` is an `Html`. The literal's own text
+//! is markup, read when the program is checked as the HTML Living Standard's syntax (§13.1) reads
+//! it: a tag or a quote left open, a `<` or an `&` that begins nothing, and a hole where a value
+//! would be more than characters are refused there, inside the literal. A hole is an `Html`. In an
+//! element's content it stands as the markup it is; inside a quoted attribute value, a `title` or a
+//! `textarea` it stands as its characters; and as the whole of an attribute's value, as `class`'s
+//! is above, it is written quoted. A `String` enters only through `text`, and `render` writes it
+//! with `&`, `<`, `>`, `"` and `'` as character references, so no value opens a tag, closes an
+//! attribute or begins a reference, and none is escaped twice.
+//!
+//! A hole stands nowhere a value's characters would be read as another language: not in a tag
+//! outside an attribute's value, in a comment, a `script` or a `style`, nor in an event handler, a
+//! `style` or a `srcdoc` attribute. What a URL names is not judged: `href={text(u)}` keeps `u`
+//! inside the attribute, and whether `u` is a `javascript:` URL is the program's to say.
+
+import std.bytes (peek, is_digit, hex_value)
+import std.list (at_or, concat, flat_map)
+import std.string (join, replace)
+
+/// A part of a document: markup as it is written out, or characters that are escaped where they
+/// are written.
+pub type Piece = | Markup(String) | Chars(String)
+
+/// A fragment of a document's content, in the order it is written.
+pub type Html = new { pieces: List<Piece> }
+
+/// `s` as character data: whatever it holds is read as text, in content and in an attribute alike.
+pub fn text(s: String) -> Html = { pieces: [Chars(s)] }
+
+/// The fragments one after another, with nothing between them.
+pub fn fragment(parts: List<Html>) -> Html = { pieces: flat_map(parts, |h: Html| h.pieces) }
+
+/// `s` with `&`, `<`, `>`, `"` and `'` as character references, which is text in an element's
+/// content and in an attribute value quoted either way.
+pub fn escape(s: String) -> String / {abort.raise} =
+  fold(references(), s, |out: String, r: { raw: String, written: String }|
+    replace(out, r.raw, r.written))
+
+/// `&` first, so the `&` of a reference written for another character is not written again.
+fn references() -> List<{ raw: String, written: String }> =
+  [
+    { raw: "&", written: "&amp;" },
+    { raw: "<", written: "&lt;" },
+    { raw: ">", written: "&gt;" },
+    { raw: "\"", written: "&quot;" },
+    { raw: "'", written: "&#39;" },
+  ]
+
+/// The document text of `h`: its markup as it is, and its characters escaped.
+pub fn render(h: Html) -> String / {abort.raise} =
+  join(map(h.pieces, |piece: Piece| match piece { Markup(m) -> m, Chars(s) -> escape(s) }), "")
+
+/// What `h` is as characters: its text as given, and its markup as its source.
+fn plain(h: Html) -> String =
+  join(map(h.pieces, |piece: Piece| match piece { Markup(m) -> m, Chars(s) -> s }), "")
+
+// --- The literal --------------------------------------------------------------
+
+/// Where a hole stands: in an element's content; inside a quoted attribute value, a `title` or a
+/// `textarea`, where only characters stand; or as the whole of an attribute's value.
+pub type Place = | Content | Characters | Value
+
+/// A literal's markup once read: its texts as written, and where the hole after each stands.
+pub type Template = new { texts: List<String>, places: List<Place> }
+
+/// Why a literal's markup is refused, and at which character of which text.
+pub type Refusal = { message: String, offset: Int, part: Int }
+
+type Mode =
+  | Between
+  | Opened
+  | Closing
+  | Named
+  | EndNamed
+  | EndTail
+  | Inside
+  | AttrNamed
+  | AfterAttr
+  | Valued
+  | Quoted(Int)
+  | Bare
+  | AfterValue
+  | Slashed
+  | Banged
+  | Commented(Int)
+  | Declared
+  | Raw
+
+/// `word` is the name being read, in lower case; `element` the start tag's, which says how its
+/// content is read; `attr` the attribute whose value is being read; and `at` how many characters
+/// of the text are passed.
+type Scan = { mode: Mode, word: Bytes, element: Bytes, attr: Bytes, at: Int }
+
+fn is_space(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 12 || c == 13
+
+fn is_letter(c: Int) -> Bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+
+fn lower(c: Int) -> Bytes / {abort.raise} = byte_of_int(if c >= 65 && c <= 90 { c + 32 } else { c })
+
+fn names_tag(c: Int) -> Bool = is_letter(c) || is_digit(c) || c == 45
+
+/// A quote, `<`, `=` or a backtick: no attribute name and no unquoted value holds one.
+fn breaks(c: Int) -> Bool = c == 34 || c == 39 || c == 60 || c == 61 || c == 96
+
+/// Whether the name or the number of a character reference, and its `;`, stand at `i`.
+fn refers(text: Bytes, i: Int) -> Bool / {abort.raise} = {
+  let numbered = peek(text, i) == 35;
+  let hex = numbered && (peek(text, i + 1) == 120 || peek(text, i + 1) == 88);
+  let from = if hex { i + 2 } else if numbered { i + 1 } else { i };
+  let to = iterate(from, bytes_len(text) - from + 2, |j: Int| {
+    let c = peek(text, j);
+    let named = if hex { hex_value(c) >= 0 }
+    else if numbered { is_digit(c) }
+    else { is_letter(c) || (j > from && is_digit(c)) };
+    if named { Continue(j + 1) } else { Stop(j) }
+  });
+  to > from && peek(text, to) == 59
+}
+
+/// Whether the end tag of `element` stands at the `<` at `i`, in either case.
+fn closes(text: Bytes, i: Int, element: Bytes) -> Bool / {abort.raise} = {
+  let n = bytes_len(element);
+  let after = peek(text, i + 2 + n);
+  peek(text, i + 1) == 47 && (is_space(after) || after == 47 || after == 62)
+    && fold(range(0, n), true, |same: Bool, k: Int|
+      same && lower(max(peek(text, i + 2 + k), 0)) == bytes_slice(element, k, k + 1))
+}
+
+/// The elements whose content is text up to their end tag, which no hole stands in.
+fn coded(element: Bytes) -> Bool =
+  element == b"script" || element == b"style" || element == b"xmp" || element == b"iframe"
+    || element == b"noembed"
+    || element == b"noframes"
+    || element == b"noscript"
+
+fn lettered(element: Bytes) -> Bool = element == b"title" || element == b"textarea"
+
+/// A start tag closed: its element's content follows, which for some is not markup.
+fn opened(scan: Scan, part: Int, offset: Int) -> Result<Scan, Refusal> =
+  if scan.element == b"plaintext" {
+    Err({
+      message: "nothing after `<plaintext>` is markup, so no literal holds one",
+      offset: offset,
+      part: part,
+    })
+  } else if coded(scan.element) || lettered(scan.element) { Ok({ ..scan, mode: Raw }) }
+  else { Ok({ ..scan, mode: Between }) }
+
+/// What a `/` or a `>` does inside a start tag; `None` for any other character.
+fn tag_end(scan: Scan, c: Int, part: Int, offset: Int) -> Option<Result<Scan, Refusal>> =
+  if c == 47 { Some(Ok({ ..scan, mode: Slashed })) }
+  else if c == 62 { Some(opened(scan, part, offset)) }
+  else { None }
+
+/// The scan past the character at `i`, or why the markup cannot hold it there.
+fn step(s: Scan, text: Bytes, i: Int, part: Int) -> Result<Scan, Refusal> / {abort.raise} = {
+  let c = bytes_at(text, i);
+  let on: Scan = { ..s, at: if c & 192 == 128 { s.at } else { s.at + 1 } };
+  let to = |mode: Mode| Ok({ ..on, mode: mode });
+  let no = |message: String| Err({ message: message, offset: s.at, part: part });
+  let ended = |scan: Scan| tag_end(scan, c, part, s.at);
+  let reference = "an `&` begins a character reference: write `&amp;` for the character";
+  match s.mode {
+    Between -> if c == 60 { to(Opened) }
+    else if c == 38 && !refers(text, i + 1) { no(reference) }
+    else { Ok(on) },
+    Opened -> if is_letter(c) { Ok({ ..on, mode: Named, word: lower(c) }) }
+    else if c == 47 { to(Closing) }
+    else if c == 33 { Ok({ ..on, mode: Banged, word: b"" }) } else {
+      Err({
+        message: "a `<` opens a tag: write `&lt;` for the character",
+        offset: s.at - 1,
+        part: part,
+      })
+    },
+    Closing -> if is_letter(c) { to(EndNamed) } else { no("an end tag is `</` and a name") },
+    Named -> if names_tag(c) { Ok({ ..on, word: bytes_concat(s.word, lower(c)) }) } else {
+      let named: Scan = { ..on, element: s.word };
+      match ended(named) {
+        Some(end) -> end,
+        None -> if is_space(c) { Ok({ ..named, mode: Inside }) }
+        else { no("a tag's name is letters, digits and `-`") },
+      }
+    },
+    Inside -> match ended(on) {
+      Some(end) -> end,
+      None -> if is_space(c) { Ok(on) }
+      else if breaks(c) { no("an attribute begins with its name") }
+      else { Ok({ ..on, mode: AttrNamed, word: lower(c) }) },
+    },
+    AttrNamed -> match ended(on) {
+      Some(end) -> end,
+      None -> if is_space(c) { Ok({ ..on, mode: AfterAttr, attr: s.word }) }
+      else if c == 61 { Ok({ ..on, mode: Valued, attr: s.word }) }
+      else if breaks(c) { no("an attribute's name holds no quote and no `<`") }
+      else { Ok({ ..on, word: bytes_concat(s.word, lower(c)) }) },
+    },
+    AfterAttr -> match ended(on) {
+      Some(end) -> end,
+      None -> if is_space(c) { Ok(on) }
+      else if c == 61 { to(Valued) }
+      else if breaks(c) { no("an attribute begins with its name") }
+      else { Ok({ ..on, mode: AttrNamed, word: lower(c) }) },
+    },
+    Valued -> if is_space(c) { Ok(on) }
+    else if c == 34 || c == 39 { to(Quoted(c)) }
+    else if c == 62 { no("an attribute's value is missing") }
+    else if breaks(c) { no("an unquoted value holds no quote, `<`, `=` or backtick") }
+    else { to(Bare) },
+    Quoted(quote) -> if c == quote { to(AfterValue) }
+    else if c == 38 && !refers(text, i + 1) { no(reference) }
+    else { Ok(on) },
+    Bare -> if c == 62 { opened(on, part, s.at) }
+    else if is_space(c) { to(Inside) }
+    else if breaks(c) { no("an unquoted value holds no quote, `<`, `=` or backtick") }
+    else { Ok(on) },
+    AfterValue -> match ended(on) {
+      Some(end) -> end,
+      None -> if is_space(c) { to(Inside) } else { no("a space goes between attributes") },
+    },
+    Slashed -> if c == 62 { opened(on, part, s.at) }
+    else { no("a `/` in a tag is followed by `>`") },
+    EndNamed -> if names_tag(c) { Ok(on) }
+    else if is_space(c) { to(EndTail) }
+    else if c == 62 { to(Between) }
+    else { no("a tag's name is letters, digits and `-`") },
+    EndTail -> if is_space(c) { Ok(on) }
+    else if c == 62 { to(Between) }
+    else { no("an end tag holds only its name") },
+    Banged -> {
+      let word = bytes_concat(s.word, lower(c));
+      if word == b"--" { to(Commented(0)) }
+      else if word == b"doctype" { to(Declared) }
+      else if bytes_starts_with(b"--", word) || bytes_starts_with(b"doctype", word) {
+        Ok({ ..on, word: word })
+      } else { no("`<!` opens a comment or a doctype") }
+    },
+    Commented(dashes) -> if c == 45 { to(Commented(min(dashes + 1, 2))) }
+    else if c == 62 && dashes == 2 { to(Between) }
+    else { to(Commented(0)) },
+    Declared -> if c == 62 { to(Between) }
+    else if c == 60 { no("a doctype ends with `>`") }
+    else { Ok(on) },
+    Raw -> if c == 60 && closes(text, i, s.element) { to(Opened) } else { Ok(on) },
+  }
+}
+
+/// Where a hole stands after the text the scan has passed, and the scan past the hole.
+fn held(scan: Scan, part: Int) -> Result<{ place: Place, scan: Scan }, Refusal> / {abort.raise} = {
+  let no = |message: String| Err({ message: message, offset: scan.at, part: part });
+  let scripted = bytes_starts_with(scan.attr, b"on") || scan.attr == b"style"
+    || scan.attr == b"srcdoc";
+  let attribute = "a hole in `" ++ string_of_bytes(scan.attr)
+    ++ "` would be read as code, which no escaping makes text";
+  match scan.mode {
+    Between -> Ok({ place: Content, scan: scan }),
+    Quoted(_) -> if scripted { no(attribute) } else { Ok({ place: Characters, scan: scan }) },
+    Valued -> if scripted { no(attribute) }
+    else { Ok({ place: Value, scan: { ..scan, mode: AfterValue } }) },
+    Raw -> if lettered(scan.element) { Ok({ place: Characters, scan: scan }) }
+    else { no("a hole in `<" ++ string_of_bytes(scan.element) ++ ">` would be read as its code") },
+    Bare -> no("quote the value: a hole stands inside its quotes, or as the whole of it"),
+    Banged -> no("a comment holds no hole"),
+    Commented(_) -> no("a comment holds no hole"),
+    Declared -> no("a doctype holds no hole"),
+    _ -> no("a hole stands in an element's content or in an attribute's value"),
+  }
+}
+
+/// What the markup lacks where its last text ends, if anything.
+fn unclosed(scan: Scan) -> Option<String> / {abort.raise} =
+  match scan.mode {
+    Between -> None,
+    Raw -> Some("`<" ++ string_of_bytes(scan.element) ++ ">` is not closed in this literal"),
+    Quoted(_) -> Some("an attribute's value is not closed"),
+    Banged -> Some("a comment is not closed"),
+    Commented(_) -> Some("a comment is not closed"),
+    _ -> Some("a tag is not closed"),
+  }
+
+type Reading = { scan: Scan, places: List<Place> }
+
+/// What an `html"..."` literal with holes is checked by: the texts around its holes read as
+/// markup, or the first character, hole or end the markup cannot have where it stands. A refusal
+/// just past a text is its hole's, or the literal's end after the last.
+pub fn compile(parts: List<String>) -> Result<Template, Refusal> / {abort.raise} = {
+  let last = len(parts) - 1;
+  let read = fold(
+    range(0, len(parts)),
+    Ok({ scan: { mode: Between, word: b"", element: b"", attr: b"", at: 0 }, places: [] }),
+    |acc: Result<Reading, Refusal>, part: Int|
+      match acc {
+        Err(_) -> acc,
+        Ok(r) -> {
+          let text = bytes_of_string(at_or(parts, part, ""));
+          let passed = fold(
+            range(0, bytes_len(text)),
+            Ok({ ..r.scan, at: 0 }),
+            |s: Result<Scan, Refusal>, i: Int|
+              match s { Err(_) -> s, Ok(scan) -> step(scan, text, i, part) },
+          );
+          match passed {
+            Err(refused) -> Err(refused),
+            Ok(scan) -> if part < last {
+              match held(scan, part) {
+                Err(refused) -> Err(refused),
+                Ok(h) -> Ok({ scan: h.scan, places: push(r.places, h.place) }),
+              }
+            } else {
+              match unclosed(scan) {
+                Some(message) -> Err({ message: message, offset: scan.at, part: part }),
+                None -> Ok({ scan: scan, places: r.places }),
+              }
+            },
+          }
+        },
+      },
+  );
+  match read { Err(refused) -> Err(refused), Ok(r) -> Ok({ texts: parts, places: r.places }) }
+}
+
+/// The document a literal is with `holes` where its holes stand, each as its place reads it: markup
+/// in content, characters in an attribute's quotes, and a quoted value where it is the whole of one.
+/// A hole the list does not hold is empty.
+pub fn fill(t: Template, holes: List<Html>) -> Html =
+  {
+    pieces: fold(range(0, len(t.texts)), [], |out: List<Piece>, i: Int| {
+      let written = push(out, Markup(at_or(t.texts, i, "")));
+      let hole = match list_at(holes, i) { Some(h) -> h, None -> fragment([]) };
+      match list_at(t.places, i) {
+        None -> written,
+        Some(Content) -> concat(written, hole.pieces),
+        Some(Characters) -> push(written, Chars(plain(hole))),
+        Some(Value) -> push(push(push(written, Markup("\"")), Chars(plain(hole))), Markup("\"")),
+      }
+    }),
+  }
+
+/// What an `html"..."` literal with no hole is checked by: the text as markup, or where it is not.
+pub fn literal(text: String) -> Result<Html, { message: String, offset: Int }> / {abort.raise} =
+  match compile([text]) {
+    Ok(t) -> Ok(fill(t, [])),
+    Err(refused) -> Err({ message: refused.message, offset: refused.offset }),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn written(parts: List<String>, holes: List<Html>) -> String / {abort.raise} =
+  match compile(parts) { Ok(t) -> render(fill(t, holes)), Err(refused) -> refused.message }
+
+fn refused(parts: List<String>) -> Option<{ offset: Int, part: Int }> / {abort.raise} =
+  match compile(parts) {
+    Ok(_) -> None,
+    Err(refused) -> Some({ offset: refused.offset, part: refused.part }),
+  }
+
+test "a string in a hole is characters wherever it stands, and markup never" {
+  let attack = text("<script>alert(\"x\")</script>");
+  assert_eq(
+    written(["<p>", "</p>"], [attack]),
+    "<p>&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;</p>",
+  );
+  assert_eq(
+    written(["<a title='", "'>x</a>"], [text("' onclick='alert(1)")]),
+    "<a title='&#39; onclick=&#39;alert(1)'>x</a>",
+  );
+  assert_eq(
+    written(["<a title=", ">x</a>"], [text("a b\" onclick=\"alert(1)")]),
+    "<a title=\"a b&quot; onclick=&quot;alert(1)\">x</a>",
+  );
+  assert_eq(written(["<p>", "</p>"], [text("a &amp; b")]), "<p>a &amp;amp; b</p>");
+  assert_eq(
+    written(["<title>", "</title>"], [text("</title><script>")]),
+    "<title>&lt;/title&gt;&lt;script&gt;</title>",
+  )
+}
+
+test "markup in a hole is written as it is in content, once, and as its source in an attribute" {
+  let inner = match compile(["<b>", "</b>"]) {
+    Ok(t) -> fill(t, [text("a < b")]),
+    Err(_) -> fragment([]),
+  };
+  assert_eq(
+    written(["<p>", " and ", "</p>"], [inner, inner]),
+    "<p><b>a &lt; b</b> and <b>a &lt; b</b></p>",
+  );
+  assert_eq(render(fragment([inner, text("&"), inner])), "<b>a &lt; b</b>&amp;<b>a &lt; b</b>");
+  assert_eq(
+    written(["<i title=", "></i>"], [inner]),
+    "<i title=\"&lt;b&gt;a &lt; b&lt;/b&gt;\"></i>",
+  );
+  assert_eq(written(["<p>", "</p>"], []), "<p></p>");
+  assert_eq(written(["<i title=", "></i>"], []), "<i title=\"\"></i>")
+}
+
+test "a hole stands in content, in an attribute's value, and nowhere a value would be code" {
+  assert_eq(
+    refused(["<p class=x id='a", "b' ", ">", "</p><!-- c --><br/>"]),
+    Some({ offset: 3, part: 1 }),
+  );
+  assert_eq(refused(["<p class=", " id='a", "'>", "</p><!-- c --><br/>"]), None);
+  assert_eq(refused(["<", ">"]), Some({ offset: 1, part: 0 }));
+  assert_eq(refused(["<p ", ">"]), Some({ offset: 3, part: 0 }));
+  assert_eq(refused(["<p class=a", ">"]), Some({ offset: 10, part: 0 }));
+  assert_eq(refused(["<!-- ", " -->"]), Some({ offset: 5, part: 0 }));
+  assert_eq(refused(["<script>var x = '", "';</script>"]), Some({ offset: 17, part: 0 }));
+  assert_eq(refused(["<STYLE>p { color: ", " }</STYLE>"]), Some({ offset: 18, part: 0 }));
+  assert_eq(refused(["<a onclick='go(", ")'>"]), Some({ offset: 15, part: 0 }));
+  assert_eq(refused(["<a OnClick=", ">"]), Some({ offset: 11, part: 0 }));
+  assert_eq(refused(["<p style='color: ", "'>"]), Some({ offset: 17, part: 0 }));
+  assert_eq(refused(["<iframe srcdoc=", "></iframe>"]), Some({ offset: 15, part: 0 }));
+  assert_eq(refused(["<textarea>", "</textarea><script>x</script>"]), None)
+}
+
+test "markup that is not well formed is refused at the character that makes it so" {
+  assert_eq(
+    literal("a < b"),
+    Err({ message: "a `<` opens a tag: write `&lt;` for the character", offset: 2 }),
+  );
+  assert_eq(
+    literal("caf\u{e9} & bar"),
+    Err({
+      message: "an `&` begins a character reference: write `&amp;` for the character",
+      offset: 5,
+    }),
+  );
+  assert_eq(refused(["a &amp; b &#38; c &#x26; d"]), None);
+  assert_eq(refused(["<p title='a & b'>"]), Some({ offset: 12, part: 0 }));
+  assert_eq(refused(["<p title=>"]), Some({ offset: 9, part: 0 }));
+  assert_eq(refused(["<p title='a'id=b>"]), Some({ offset: 12, part: 0 }));
+  assert_eq(literal("<p"), Err({ message: "a tag is not closed", offset: 2 }));
+  assert_eq(
+    literal("<p title='a"),
+    Err({ message: "an attribute's value is not closed", offset: 11 }),
+  );
+  assert_eq(literal("<!-- a"), Err({ message: "a comment is not closed", offset: 6 }));
+  assert_eq(
+    literal("<script>x"),
+    Err({ message: "`<script>` is not closed in this literal", offset: 9 }),
+  );
+  assert_eq(refused(["<plaintext>"]), Some({ offset: 10, part: 0 }));
+  assert_eq(refused(["<!DOCTYPE html><p>a</p ><br />"]), None)
+}
+
+test "a literal with no hole is its text as markup" {
+  assert_eq(match literal("<br>") { Ok(h) -> render(h), Err(refused) -> refused.message }, "<br>");
+  assert_eq(escape("a & <b> \"c\" 'd'"), "a &amp; &lt;b&gt; &quot;c&quot; &#39;d&#39;")
+}

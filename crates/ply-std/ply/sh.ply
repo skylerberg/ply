@@ -1,0 +1,141 @@
+//! Argument lists written as a command line is, with no shell to read them.
+//!
+//! With `import std.sh`, `sh"-n {pattern} {file}"` is the `List<String>` a program is started with
+//! (`process.spawn`, `process.start`). The literal's text is words set apart by blanks, read when
+//! the program is checked, and it holds no character a POSIX shell reads as anything but itself
+//! (Shell Command Language §2.2 and §2.6: a quote, `\`, `$`, a backtick, `|`, `&`, `;`, `<`, `>`,
+//! `(`, `)`, `*`, `?`, `[`, `]`, `#`, `~` and a line break), so its words are the ones such a shell
+//! would hand the program and nothing of quoting has to be known to read one. A hole is a `String`
+//! and stands as characters of one word: alone it is one argument whatever it holds, an empty one
+//! included, and touching text or another hole it is part of the word they make. No hole is split,
+//! joined to another word or expanded, because no shell ever sees it.
+
+import std.list (at_or)
+import std.string (join)
+
+/// A part of a word: text as written, or the hole of that number.
+pub type Piece = | Said(String) | Held(Int)
+
+/// A literal's words once read, each as the pieces it is joined from.
+pub type Words = new { words: List<List<Piece>> }
+
+/// Why a literal's text is refused, and at which character of which text.
+pub type Refusal = { message: String, offset: Int, part: Int }
+
+type Reading = { done: List<List<Piece>>, word: List<Piece>, text: String }
+
+fn special() -> String = "'\"\\$`|&;<>()*?[]#~\n\r"
+
+/// The text read so far, as a piece of the word it is in.
+fn closed(r: Reading) -> Reading =
+  if r.text == "" { r } else { { ..r, word: push(r.word, Said(r.text)), text: "" } }
+
+/// The word read so far, ended: a blank after a blank ends nothing.
+fn broken(r: Reading) -> Reading = {
+  let c = closed(r);
+  if len(c.word) == 0 { c } else { { done: push(c.done, c.word), word: [], text: "" } }
+}
+
+fn worded(r: Reading, text: String, part: Int) -> Result<Reading, Refusal> =
+  fold(
+    string_chars(text),
+    { at: 0, read: Ok(r) },
+    |acc: { at: Int, read: Result<Reading, Refusal> }, c: Char|
+      {
+        at: acc.at + 1,
+        read: match acc.read {
+          Err(_) -> acc.read,
+          Ok(reading) -> {
+            let written = string_of_chars([c]);
+            if c == ' ' || c == '\t' { Ok(broken(reading)) }
+            else if string_contains(special(), written) {
+              Err({
+                message: "a shell would not read `" ++ written
+                  ++ "` as itself: put what is meant in a hole",
+                offset: acc.at,
+                part: part,
+              })
+            } else { Ok({ ..reading, text: reading.text ++ written }) }
+          },
+        },
+      },
+  ).read
+
+/// What an `sh"..."` literal with holes is checked by: the texts around its holes as words, each
+/// hole a piece of the word it stands in, or the first character a shell would not read as itself.
+pub fn compile(parts: List<String>) -> Result<Words, Refusal> = {
+  let last = len(parts) - 1;
+  let all = fold(
+    range(0, len(parts)),
+    Ok({ done: [], word: [], text: "" }),
+    |acc: Result<Reading, Refusal>, part: Int|
+      match acc {
+        Err(_) -> acc,
+        Ok(r) -> match worded(r, at_or(parts, part, ""), part) {
+          Err(refused) -> Err(refused),
+          Ok(after) -> if part == last { Ok(after) }
+          else { Ok({ ..closed(after), word: push(closed(after).word, Held(part)) }) },
+        },
+      },
+  );
+  match all { Err(refused) -> Err(refused), Ok(r) -> Ok({ words: broken(r).done }) }
+}
+
+/// The arguments a literal is with `holes` where its holes stand: each word its pieces joined, a
+/// hole's characters as they are. A hole the list does not hold is empty.
+pub fn fill(w: Words, holes: List<String>) -> List<String> =
+  map(w.words, |word: List<Piece>|
+    join(
+      map(word, |piece: Piece| match piece { Said(s) -> s, Held(i) -> at_or(holes, i, "") }),
+      "",
+    ))
+
+/// What an `sh"..."` literal with no hole is checked by: the text's words, or the first character
+/// a shell would not read as itself.
+pub fn literal(text: String) -> Result<List<String>, { message: String, offset: Int }> =
+  match compile([text]) {
+    Ok(w) -> Ok(fill(w, [])),
+    Err(refused) -> Err({ message: refused.message, offset: refused.offset }),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn filled(parts: List<String>, holes: List<String>) -> List<String> =
+  match compile(parts) { Ok(w) -> fill(w, holes), Err(refused) -> [refused.message] }
+
+test "a hole is one argument or a part of one, whatever it holds" {
+  assert_eq(filled(["-n ", " ", ""], ["a b; rm -rf /", "$(reboot)"]), [
+    "-n",
+    "a b; rm -rf /",
+    "$(reboot)",
+  ]);
+  assert_eq(filled(["--to=", "/", " x"], ["a b", "*"]), ["--to=a b/*", "x"]);
+  assert_eq(filled(["", ""], [""]), [""]);
+  assert_eq(filled(["-n ", "", " x"], ["", ""]), ["-n", "", "x"]);
+  assert_eq(filled(["a ", " b"], []), ["a", "", "b"])
+}
+
+test "the texts are words apart by blanks, and the pieces each word is joined from" {
+  assert_eq(
+    compile(["-l  a\t", "b ", ""]),
+    Ok({ words: [[Said("-l")], [Said("a")], [Held(0), Said("b")], [Held(1)]] }),
+  );
+  assert_eq(literal(" -l  src/main.ply "), Ok(["-l", "src/main.ply"]));
+  assert_eq(literal(""), Ok([]))
+}
+
+test "a character a shell would not read as itself is refused where it stands" {
+  let refused = |parts: List<String>|
+    match compile(parts) { Ok(_) -> None, Err(no) -> Some({ offset: no.offset, part: no.part }) };
+  assert_eq(refused(["-n 'a b'"]), Some({ offset: 3, part: 0 }));
+  assert_eq(refused(["caf\u{e9} ", " *.txt"]), Some({ offset: 1, part: 1 }));
+  assert_eq(refused(["a | b"]), Some({ offset: 2, part: 0 }));
+  assert_eq(refused(["a=b %1 {x} ! -name,x:y@z+w"]), None);
+  assert_eq(
+    literal("echo $HOME"),
+    Err({
+      message: "a shell would not read `$` as itself: put what is meant in a hole",
+      offset: 5,
+    }),
+  )
+}

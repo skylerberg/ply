@@ -169,7 +169,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
-| `uuid"6ba7b810-.."` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, below. |
+| `uuid"6ba7b810-.."`, `html"<b>{x}</b>"` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, and holes its tag is handed apart from the text, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
 | `#[1, 2]` | `Map<a, Unit>` | A set: each element a key whose value is `()`. |
@@ -198,8 +198,8 @@ one written.
 
 A tagged literal `tag"text"` is a name touching a string: `uuid"..."` is one, and `uuid "..."` a
 name and then a string. It is the call `tag::literal("text")`, where `tag` is a module binder in
-scope (§3.2) and the text a string's, escapes and all, and a load runs that call before anything
-else runs (§16):
+scope (§3.2) and the text an interpolated string's, escapes and all, with `{{` and `}}` for its
+braces, and a load runs that call before anything else runs (§16):
 
 ```ply
 import std.uuid
@@ -214,7 +214,7 @@ is `E0152`, as is one in a recursion with the definition that holds the literal;
 binds is `E0106`, and a module with no `literal`, or a private one, `E0101` or `E0107`. Where it
 answers `Ok(v)` the literal has type `T`, is `v`, and performs nothing: what the call could raise,
 the check saw it not raise. Where it answers `Err`, the literal is `E0153`, placed at character
-`offset` of the text as the source spells it, an escape being one character, or at the closing
+`offset` of the text as the source spells it, an escape or a doubled brace being one character, or at the closing
 quote for the offset just past the text, with `message` beside it. A parser that raises, or that
 makes more than ten million calls, is `E0154`.
 
@@ -225,6 +225,36 @@ literal is an expression: no pattern, label or parameter default (`E0121`) is on
 `let Ok(v) = tag::literal("text")`, so a module that binds its own `Ok` holds none (`E0118`), as
 one that binds an `Ok` or an `Err` holds no `try` (§6.8). `std.uuid`, `std.base64` and
 `std.bigint` are tags (`ply doc std.uuid.literal`).
+
+A tagged literal takes holes as an interpolated string does, each `{expr}` any expression, and
+its tag is handed the values apart from the text, so it binds, escapes or quotes each by where
+it stands and nothing a hole holds is read as text:
+
+```ply
+import std.html
+import std.html (Html, text)
+import std.sh
+
+fn row(name: String, kind: String) -> Html = html"<li class={text(kind)}>{text(name)}</li>"
+
+fn search(pattern: String, file: String) -> List<String> = sh"-n --color=never {pattern} {file}"
+```
+
+With holes it is the call `tag::fill(c, [h0, h1, ..])`, where `c` is what
+`tag::compile(["t0", "t1", ..])` answered `Ok` of for the texts around the holes, one more than
+there are holes. `compile` is a `pub fn` of one `List<String>` answering
+`Result<C, {message: String, offset: Int, part: Int}>`, and `fill` one of a `C` and a `List<H>`;
+each has no type, row or label parameter, a row that holds nothing but raises and no recursion
+with the definition that holds the literal (`E0152`). A load runs `compile` as it runs a
+`literal`, on the texts alone: its `Err` is `E0153` at character `offset` of text `part`, a brace
+written twice being one character, and the offset just past a text is the hole that follows it,
+or the closing quote after the last. Each hole is checked against `H` (`E0201` at the hole; a
+record literal in one is a `new` record where `H` is one, §4.2). The literal has the type `fill`
+answers, performs what its holes perform and raises what `fill` raises; it hashes with
+`compile`, `fill`, its texts and its holes, and runs as `let Ok(c) = tag::compile([..])` and then
+the call of `fill`. A literal with no hole calls `literal` and one with any calls `compile` and
+`fill`: a tag declares either or both, and a literal of a kind its tag does not declare is `E0101`.
+`std.html` and `std.sh` are tags with holes (`ply doc std.html`, `ply doc std.sh`).
 
 A line string is a run of lines that each start with `\\`, led only by blanks.
 Everything after the `\\` to the end of its line is text, verbatim: nothing is
@@ -2578,14 +2608,15 @@ beside the phases of a check that ran, with `filed`, whether the next check can
 take its answer back (false for a refused load, or when the entry could not be
 written).
 
-A load that checked has not yet run a tagged literal's parser (§2.3). `ply check`,
+A load that checked has not yet run a tagged literal's parser, its `literal` or the
+`compile` of one with holes (§2.3). `ply check`,
 `ply run`, `ply test`, `ply build` and `ply prove` settle the literals of the
 root package's modules before they do anything else with the load, and refuse it
 with what a parser refused (`E0153`, `E0154`): each literal is the call of its
 parser, entered on a machine of its own, lent to nothing, over a unit of the
 definitions the parsers reach, under a budget of ten million calls a literal.
-A verdict is a function of the parser and the text, so it is kept in the
-toolchain's cache (§8.6) under the hash of all the parser reaches, the text and
+A verdict is a function of the parser and the texts, so it is kept in the
+toolchain's cache (§8.6) under the hash of all the parser reaches, the texts and
 the toolchain, and a parser is entered again only for a text it has not read or
 after an edit to something it reaches; a check that touches no literal's parser
 enters nothing. A module that writes a tagged literal is read from its source
@@ -2697,7 +2728,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
 | `E0151` | an `extern fn` outside the prelude |
-| `E0152` | a tagged literal whose tag's `literal` is not a parser a check can run |
+| `E0152` | a tagged literal whose tag's `literal`, or `compile` or `fill` for one with holes, is not what a tagged literal calls |
 | `E0153` | a tagged literal its parser refuses |
 | `E0154` | a tagged literal whose parser raised or spent its budget |
 | `E0201` | type mismatch |
