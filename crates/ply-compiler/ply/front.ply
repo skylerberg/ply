@@ -33,7 +33,7 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               root_facts_bin, test_owner, cases_root, listing_ty, witness_order_bin, elaborated,
               ended, stated, elaboration_with, updated_mods, check_front_with, is_prelude_effect,
               Builtin, builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin,
-              written_counts, InstanceInfo, NumericInfo)
+              written_counts, InstanceInfo, NumericInfo, Raise, raise_bin)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of,
@@ -1422,6 +1422,8 @@ pub type KnownDefRow = {
   /// Whether its calls end and how it calls what it is handed, which a stub's blank body cannot say.
   ending: Ending,
   summary: Summary,
+  /// Where its body can raise, which a stub's blank body cannot say either.
+  raises: List<Raise>,
   /// What the emitter reads of its body, as `filed_facts` writes it.
   facts: Bytes,
 }
@@ -1462,6 +1464,7 @@ fn known_defs(
             repeats: row.repeats,
             ending: row.ending,
             summary: row.summary,
+            raises: row.raises,
             facts: row.facts,
           }),
         _ -> acc,
@@ -1635,6 +1638,7 @@ fn def_known_row(
     repeats: def_info.repeats,
     ending: def_info.ending,
     summary: def_info.summary,
+    raises: def_info.raises,
     facts: facts_filed(read, def_info.name, def_info.at.span),
   }
 
@@ -5360,6 +5364,7 @@ fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> / {abort.raise} =
           repeats: [],
           ending: Ends,
           summary: unknown_summary(),
+          raises: [],
           facts: filed_facts(no_root_facts(), { start: 0, end: 0 }),
         })
     },
@@ -5546,6 +5551,41 @@ test "a seeded ending is where its call is now, however its definitions moved" {
   let seeded = analyse_with(parse_all(moved), rows, []);
   assert_eq(seeded_of(seeded), [b"m.spin", b"m.hop", b"m.wait"]);
   assert_eq(endings(seeded), endings(analyse(parse_all(moved))))
+}
+
+/// `at` reads past a guard that holds one of the two bounds, and `walk` raises only by recursing.
+fn reading(above: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      src: bytes_concat(
+        above,
+        b"pub fn at(b: Bytes, i: Int) -> Int / {abort.raise} = if i < bytes_len(b) { bytes_at(b, i) } else { 0 }\npub fn walk(b: Bytes, i: Int) -> Int / {abort.raise} = if i < 0 || i >= bytes_len(b) { 0 } else { bytes_at(b, i) + walk(b, i + 1) }\n",
+      ),
+    },
+  ]
+
+fn raises_filed(
+  outcome: AnalysisOutcome,
+) -> List<{ name: Bytes, raises: Int, performed: Int }> / {abort.raise} =
+  match outcome {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) ->
+      map(w.checked.defs, |def_info: DefInfo|
+        { name: def_info.name, raises: len(def_info.raises), performed: len(def_info.performed) }),
+  }
+
+test "a seeded definition raises where a walk of it found, however it moved" {
+  let rows = rows_of(analysis_of(reading(b""))).defs;
+  let moved = reading(b"pub fn aside() -> Int = 3\n");
+  let seeded = analyse_with(parse_all(moved), rows, []);
+  assert_eq(seeded_of(seeded), [b"m.at", b"m.walk"]);
+  assert_eq(raises_filed(seeded), [
+    { name: b"m.aside", raises: 0, performed: 0 },
+    { name: b"m.at", raises: 1, performed: 1 },
+    { name: b"m.walk", raises: 0, performed: 0 },
+  ]);
+  assert_eq(raises_filed(seeded), raises_filed(analyse(parse_all(moved))))
 }
 
 test "a seeded check files each row under the key a fresh check of the same program does" {

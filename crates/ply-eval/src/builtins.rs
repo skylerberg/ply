@@ -100,7 +100,7 @@ builtins! { $
     I8OfInt = "i8_of_int", 1, raises;
     I16OfInt = "i16_of_int", 1, raises;
     I32OfInt = "i32_of_int", 1, raises;
-    I64OfInt = "i64_of_int", 1, raises;
+    I64OfInt = "i64_of_int", 1, ends;
     IntOfU8 = "int_of_u8", 1, ends;
     IntOfU16 = "int_of_u16", 1, ends;
     IntOfU32 = "int_of_u32", 1, ends;
@@ -190,7 +190,7 @@ builtins! { $
     SecretIsEmpty = "secret_is_empty", 1, ends;
     // Appended, so every earlier builtin keeps its cache index.
     U128OfInt = "u128_of_int", 1, raises;
-    I128OfInt = "i128_of_int", 1, raises;
+    I128OfInt = "i128_of_int", 1, ends;
     IntOfU128 = "int_of_u128", 1, raises;
     IntOfI128 = "int_of_i128", 1, raises;
     U128ToString = "u128_to_string", 1, ends;
