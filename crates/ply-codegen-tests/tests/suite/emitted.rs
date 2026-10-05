@@ -972,16 +972,11 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     }
 }
 
-/// One program importing every shipped module, so its unit offers every root they hold. Their
-/// tests compile under `ply test --std`.
+/// The standard library's own tree as one program, which reads every module whole, so its unit
+/// offers every root it holds. Its tests compile under `ply test --std`.
 #[test]
 fn the_emitter_refuses_no_body_of_the_standard_library() {
-    let importer: String = ply_machine::shipped_modules::names()
-        .iter()
-        .filter(|name| name.starts_with("std."))
-        .map(|name| format!("import {name}\n"))
-        .collect();
-    let answer = fixture::answered(&[("m", &importer)]);
+    let answer = fixture::answered(&fixture::standard_library());
     assert!(
         answer
             .front

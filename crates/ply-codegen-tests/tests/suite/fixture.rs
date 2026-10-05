@@ -15,6 +15,16 @@ pub fn made(files: &[(String, String)]) -> ply_machine::runnable::Runnable {
 }
 
 /// What the builder makes of `modules`, `(module name, text)` each, which have to check.
+/// Every module of the standard library, by name: a program of them alone is the toolchain's own
+/// tree, which a load reads whole.
+pub fn standard_library() -> Vec<(&'static str, &'static str)> {
+    ply_machine::shipped_modules::sources()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("std."))
+        .map(|(name, text)| (&*Box::leak(name.into_boxed_str()), text))
+        .collect()
+}
+
 pub fn answered(modules: &[(&str, &str)]) -> ply_machine::runnable::Runnable {
     ply_machine::builds::checked_program(&ply_machine::builds::module_files(modules))
         .unwrap_or_else(|d| panic!("the fixture checks: {d}"))
