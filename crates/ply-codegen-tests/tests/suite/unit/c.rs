@@ -310,7 +310,73 @@ fn a_units_bucket_tables_read_back_and_a_table_without_them_names_none() {
             ("m.Date".into(), "-".to_string(), "m.written".to_string()),
         ]
     );
+    assert!(read.numerics.is_empty());
     assert_eq!(read.encode(), stating);
+    // A type that states `numeric` lists its five functions after those two, in the roles' order.
+    let computing = format!("{with}instances 1\nm.N m.held - m.add m.sub m.mul ! m.of\n");
+    let read = ply_codegen::c::Exports::decode(&computing).expect("the table reads");
+    let names = ["m.add", "m.sub", "m.mul", "!", "m.of"].map(str::to_string);
+    assert_eq!(read.numerics, vec![("m.N".into(), names)]);
+    assert_eq!(read.encode(), computing);
+    assert!(
+        ply_codegen::c::Exports::decode(&format!("{with}instances 1\nm.N - - m.add\n")).is_none()
+    );
+}
+
+/// An operator at a type that states `numeric` calls the function the unit lists for it, with as
+/// many words as the operation takes: a unit that lists one of another arity is not loaded.
+#[test]
+fn a_unit_lists_the_arithmetic_a_type_states_and_calls_it() {
+    let made = fixture::answered(&[(
+        "m",
+        "type N = | N(Int)\n\
+         fn held(n: N) -> Int = match n { N(x) -> x }\n\
+         fn add(a: N, b: N) -> N = N(held(a) + held(b))\n\
+         fn neg(a: N) -> N = N(0 - held(a))\n\
+         fn of(n: Int) -> N = N(n)\n\
+         key for N by held\n\
+         numeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }\n\
+         fn total<a>(xs: List<a>) -> a where numeric(a) =\n\
+           fold(xs, numeric_of_int(0), |s: a, x: a| s + x)\n\
+         pub fn summed(n: Int) -> Int = held(total([N(n), N(1)]) + -N(n))\n\
+         pub fn nothing(n: Int) -> Int = held(total(filter([N(n)], |x: N| x < N(n))))\n",
+    )]);
+    let stated = "\"m.N m.held - m.add m.add m.add m.neg m.of\\n\"";
+    assert!(
+        made.unit.contains(stated),
+        "the unit lists `N`'s arithmetic"
+    );
+    let miscounted = made
+        .unit
+        .replace(stated, "\"m.N m.held - m.neg m.add m.add m.neg m.of\\n\"");
+    let front: &'static ply_eval::Analysis = Box::leak(Box::new(made.front.answer.clone()));
+    let source = ply_codegen::source::Source::from_analysis(front);
+    {
+        let _config = fixture::CONFIG.read().unwrap_or_else(|e| e.into_inner());
+        match ply_codegen::c::load_unit(&miscounted, Some(&source), "unit") {
+            Ok(_) => panic!("an `add` that takes one word was bound"),
+            Err(e) if e.to_string().contains("could not run") => return,
+            Err(e) => assert!(e.to_string().contains("`m.neg`"), "{e}"),
+        }
+    }
+    let Some((_, native, refused)) = fixture::loaded(made) else {
+        return;
+    };
+    assert!(refused.is_empty(), "{refused:?}");
+    // Entered as a run enters it: the unit answers for its types while the entry is on the thread.
+    let entered = |name: &str, x: i64| {
+        let entry: ply_codegen::rt::Entry = native.entry(name).expect("compiled");
+        let mut ctx = native.context();
+        ctx.begin(10_000);
+        let words = [ply_codegen::heap::imm(x)];
+        let w = unsafe { entry(&mut ctx, words.as_ptr()) };
+        let failed = ctx.failed;
+        ctx.end();
+        assert_eq!(failed, 0, "`{name}` raised");
+        ply_codegen::heap::imm_value(w)
+    };
+    assert_eq!(entered("m.summed", 5), 1);
+    assert_eq!(entered("m.nothing", 5), 0);
 }
 
 /// A stated function is called with the value alone, so a unit that states one taking more words

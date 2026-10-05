@@ -13,12 +13,13 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, is_predicate,
               deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
-              InstanceDef, InstanceKind, NKey, NShow, instance_text)
+              InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
+              NumericOp, numeric_ops, numeric_by)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
               MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered,
-              ETagged, Tagged, tagged_callee, case_at, case_identity)
+              ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at, case_identity)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -50,7 +51,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
-                NumericWitness, ConcreteWitness, ParamWitness, numeric_witness_bin, expand_tagged)
+                NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
+                expand_tagged)
 import embed (EmbedAt, embed_tables, rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -117,6 +119,9 @@ pub type InstanceInfo = {
   answers: Type,
   at: Location,
 }
+/// The arithmetic a type's module states the operators mean at it: `fns` are its functions in
+/// `numeric_ops`' order, and `ctor` one of its constructors, which a witness names it by.
+pub type NumericInfo = { type_name: Bytes, ctor: Bytes, fns: List<Bytes>, at: Location }
 pub type SpecInfo = { kind: SpecKind, index: Int, footprint: List<Atom>, span: Span }
 pub type DefInfo = {
   name: Bytes,
@@ -488,6 +493,10 @@ type Checker = {
   test_checks: List<Bytes>,
   assumed: List<Assumed>,
   instances: List<InstanceInfo>,
+  /// Filled as the declarations are collected, before any body is checked: an operator in a body
+  /// reads which types state `numeric`, and `keyed_names` which state a `key`.
+  numeric_types: List<NumericInfo>,
+  keyed_names: List<Bytes>,
 }
 
 type Inferred = { checker: Checker, ty: Type, row: Row }
@@ -3885,95 +3894,145 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
     ETagged(t) -> infer_tagged(checker, t),
   }
 
-/// What a tag's `literal` answers of a text it refuses: where in the text, in characters, and why.
-pub fn refusal_type() -> Type / {abort.raise} =
-  TyRecord(
-    fields_sorted([{ name: b"message", ty: string_type() }, { name: b"offset", ty: int_type() }]),
-  )
+/// What a tag answers of a text it refuses: why, and where in the text, in characters. Of the
+/// texts around holes it says which one too.
+fn refusal_type(holed: Bool) -> Type / {abort.raise} = {
+  let said = [{ name: b"message", ty: string_type() }, { name: b"offset", ty: int_type() }];
+  TyRecord(fields_sorted(if holed { push(said, { name: b"part", ty: int_type() }) } else { said }))
+}
 
-fn not_a_parser(checker: Checker, t: Tagged, message: Bytes, label: Bytes) -> Checker =
+fn tag_rule(t: Tagged) -> Bytes =
+  if len(t.holes) == 0 {
+    bytes_concat_all([
+      b"`",
+      t.tag.name,
+      b"\"..\"` is the call `",
+      t.tag.name,
+      b"::literal(\"..\")`, which the check runs: a function of one `String` answering `Result<T, {message: String, offset: Int}>`, with no parameters of its own and a row that holds nothing but raises",
+    ])
+  } else {
+    bytes_concat_all([
+      b"`",
+      t.tag.name,
+      b"\"..{h}..\"` is the call `",
+      t.tag.name,
+      b"::fill(c, [h])` of what `",
+      t.tag.name,
+      b"::compile([\"..\", \"..\"])` answered the check: `compile` a function of one `List<String>` answering `Result<C, {message: String, offset: Int, part: Int}>` and `fill` one of a `C` and a `List<H>`, each with no parameters of its own and a row that holds nothing but raises",
+    ])
+  }
+
+fn not_a_tag(checker: Checker, t: Tagged, callee: QName, message: Bytes, label: Bytes) -> Checker =
   report_error_at(
     checker,
     b"E0152",
     t.tag.span,
-    bytes_concat_all([b"`", t.tag.name, b"::literal` ", message]),
+    bytes_concat_all([b"`", t.tag.name, b"::", callee.name.name, b"` ", message]),
     label,
-    [
-      bytes_concat_all([
-        b"`",
-        t.tag.name,
-        b"\"..\"` is the call `",
-        t.tag.name,
-        b"::literal(\"..\")`, which the check runs: a function of one `String` answering `Result<T, {message: String, offset: Int}>`, with no parameters of its own and a row that holds nothing but raises",
-      ]),
-    ],
+    [tag_rule(t)],
   )
 
-/// `tag"text"` is the call `tag::literal("text")`, whose answer the check reads before anything
-/// runs: its value is what the call answers `Ok` of, and nothing is left for it to perform.
-fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
-  let callee = tagged_callee(t.tag);
+/// What a tagged literal calls of its tag, held to what a tag's function is: `takes` in and
+/// `answers` out, with no parameter of its own, nothing performed but raises, and no recursion
+/// with what holds the literal. `row` is what it raises, and `name` what it is declared as.
+fn tag_fn(
+  checker: Checker,
+  t: Tagged,
+  callee: QName,
+  takes: List<Type>,
+  answers: Type,
+) -> { checker: Checker, row: Row, name: Bytes } / {abort.raise} = {
   let f: Inferred = infer_var(checker, callee);
-  let value: WithTy = new_ty(called(f.checker, t.tag.span));
-  let c: Checker = value.checker;
-  let shaped: Checker = match declared_value(c, callee) {
+  let c: Checker = called(f.checker, t.tag.span);
+  match declared_value(c, callee) {
     // A name that names nothing is said by the lookup.
-    None -> c,
-    Some(name) -> if group_member(c, name) {
-      not_a_parser(
-        c,
-        t,
-        b"is in a recursion with what holds the literal",
-        b"runs before it is whole",
-      )
-    } else {
+    None -> { checker: c, row: row_empty(), name: b"" },
+    Some(name) -> {
+      let refused = |cc: Checker, message: Bytes, label: Bytes|
+        { checker: not_a_tag(cc, t, callee, message, label), row: row_empty(), name: name };
       let generic = match env_lookup(c.env, name) {
         Some(sc) -> len(sc.ty_vars) + len(sc.row_vars) + len(sc.label_vars) > 0,
         None -> false,
       };
-      match resolve(c, f.ty) {
-        TyFn(fn_) -> {
-          let unified = unify(
-            c.subst,
-            c.fresh,
-            fn_type(
-              [string_type()],
-              TyCon({ name: b"Result", args: [value.ty, refusal_type()] }),
-              fn_.effects,
+      if group_member(c, name) {
+        refused(
+          c,
+          b"is in a recursion with what holds the literal",
+          b"a tag is whole before a literal of it is checked",
+        )
+      } else {
+        match resolve(c, f.ty) {
+          TyFn(fn_) -> {
+            let unified = unify(c.subst, c.fresh, fn_type(takes, answers, fn_.effects), f.ty);
+            let u: Checker = with_unified(c, unified);
+            let row = resolve_row_in(u, fn_.effects);
+            if generic { refused(u, b"takes parameters of its own", b"a literal gives it none") }
+            else if unified.error != None {
+              refused(
+                u,
+                bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
+                b"not what a tagged literal calls",
+              )
+            } else if !row_is_pure_but_raise(row) {
+              refused(
+                u,
+                bytes_concat_all([b"performs `", row_text(row), b"`"]),
+                b"a tag's function only raises",
+              )
+            } else { { checker: u, row: row, name: name } }
+          },
+          other ->
+            refused(
+              c,
+              bytes_concat_all([b"has type `", type_text(other), b"`"]),
+              b"not what a tagged literal calls",
             ),
-            f.ty,
-          );
-          let u: Checker = with_unified(c, unified);
-          let row = resolve_row_in(u, fn_.effects);
-          if generic {
-            not_a_parser(u, t, b"takes parameters of its own", b"no call says what they are")
-          } else if unified.error != None {
-            not_a_parser(
-              u,
-              t,
-              bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
-              b"not a literal's parser",
-            )
-          } else if !row_is_pure_but_raise(row) {
-            not_a_parser(
-              u,
-              t,
-              bytes_concat_all([b"performs `", row_text(row), b"`"]),
-              b"a check cannot answer this",
-            )
-          } else { u }
-        },
-        other ->
-          not_a_parser(
-            c,
-            t,
-            bytes_concat_all([b"has type `", type_text(other), b"`"]),
-            b"not a literal's parser",
-          ),
+        }
       }
     },
-  };
-  { checker: shaped, ty: value.ty, row: row_empty() }
+  }
+}
+
+/// `tag"text"` is the call `tag::literal("text")`, whose answer the check reads before anything
+/// runs: its value is what the call answers `Ok` of, and nothing is left for it to perform. With
+/// holes it is `tag::fill` called on what `tag::compile` answers `Ok` of for the texts, and on the
+/// holes, each of the one type `fill` takes: it performs what they perform, and raises as `fill` does.
+fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
+  let holed = len(t.holes) > 0;
+  let value: WithTy = new_ty(checker);
+  let parsed = tag_fn(
+    value.checker,
+    t,
+    tagged_parser(t),
+    [if holed { list_type(string_type()) } else { string_type() }],
+    TyCon({ name: b"Result", args: [value.ty, refusal_type(holed)] }),
+  );
+  if !holed { { checker: parsed.checker, ty: value.ty, row: row_empty() } } else {
+    let hole: WithTy = new_ty(parsed.checker);
+    let answer: WithTy = new_ty(hole.checker);
+    // A tag with no parser is said once, by the lookup of the parser.
+    let filled = if parsed.name == b"" { { checker: answer.checker, row: row_empty(), name: b"" } }
+    else { tag_fn(answer.checker, t, tagged_filler(t), [value.ty, list_type(hole.ty)], answer.ty) };
+    let held: WithRow = fold(
+      t.holes,
+      { checker: filled.checker, row: row_empty() },
+      |acc: WithRow, h: Hole| {
+        let o: Inferred = infer(acc.checker, h.value, hint_of(hole.ty));
+        let met: Checker = expect_met(
+          o.checker,
+          expr_span(h.value),
+          hole.ty,
+          o.ty,
+          b"a hole of a tagged literal",
+        );
+        join(met, t.span, acc.row, o.row)
+      },
+    );
+    let recorded: Checker = fold(filled.row.atoms, held.checker, |cc: Checker, atom: Atom|
+      record_site(cc, atom, t.span, PerformVia(filled.name)));
+    let j: WithRow = join(recorded, t.span, held.row, filled.row);
+    { checker: j.checker, ty: answer.ty, row: j.row }
+  }
 }
 
 /// The branches' answers as a tuple, which is what evaluating them left to right answers.
@@ -7507,7 +7566,15 @@ fn param_names(params: List<Param>) -> List<Bytes> = map(params, |param: Param| 
 fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
   match e {
     ELit(_) -> out,
-    ETagged(t) -> { names: push(out.names, tagged_callee(t.tag)) },
+    ETagged(t) ->
+      fold(
+        t.holes,
+        {
+          names: if len(t.holes) == 0 { push(out.names, tagged_parser(t)) }
+          else { push(push(out.names, tagged_parser(t)), tagged_filler(t)) },
+        },
+        |acc: Refs, h: Hole| collect_refs(h.value, bound, acc),
+      ),
     EBad(_) -> out,
     EVar(v) -> if is_bare(v.name) && contains(bound, v.name.name.name) { out }
     else { { names: push(out.names, v.name) } },
@@ -9271,22 +9338,24 @@ fn settle_numerics(checker: Checker) -> Checker / {abort.raise} = {
     let what = if is_ordered(entry.op) { b"ordered comparison" } else { b"arithmetic" };
     match ty {
       TyVar(v) -> match map_get(c.witnessed, v) {
-        Some(w) -> if entry.op == b"div" && !w.integer {
+        Some(w) -> if (entry.op == b"div" || entry.op == b"rem") && !w.integer {
           report_error_at(
             c,
             b"E0209",
             entry.span,
             bytes_concat_all([
-              b"`/` is not defined on every `numeric` type, so not on `",
+              b"`",
+              op_text(entry.op),
+              b"` is not defined on every `numeric` type, so not on `",
               w.param,
               b"`",
             ]),
-            b"divided here",
+            if entry.op == b"div" { b"divided here" } else { b"the remainder taken here" },
             [
               bytes_concat_all([
                 b"`integer(",
                 w.param,
-                b")` admits `/`; a `Decimal` has no `/`, since its exact quotient is not a decimal",
+                b")` admits `/` and `%`; a `Decimal` has no `/`, since its exact quotient is not a decimal, and a type that states its own arithmetic has neither",
               ]),
             ],
           )
@@ -9322,11 +9391,63 @@ fn settle_numerics(checker: Checker) -> Checker / {abort.raise} = {
             ],
           )
         } else { c }
-      } else { numeric_mismatch(c, entry, ty, what) },
+      } else {
+        match numeric_of(c.numeric_types, k.name) {
+          Some(_) -> stated_operator(c, entry, ty, k.name),
+          None -> numeric_mismatch(c, entry, ty, what),
+        }
+      },
       _ -> numeric_mismatch(c, entry, ty, what),
     }
   })
 }
+
+fn numeric_of(stated: List<NumericInfo>, type_name: Bytes) -> Option<NumericInfo> =
+  fold(stated, None, |acc: Option<NumericInfo>, x: NumericInfo|
+    match acc { Some(_) -> acc, None -> if x.type_name == type_name { Some(x) } else { None } })
+
+/// An operator at a type that states `numeric`: `+`, `-` and `*` are its functions, the ordered
+/// comparisons its `key`'s where it states one, and `/` and `%` are no operator of it.
+fn stated_operator(
+  checker: Checker,
+  entry: Numeric,
+  ty: Type,
+  type_name: Bytes,
+) -> Checker / {abort.raise} =
+  if entry.op == b"add" || entry.op == b"sub" || entry.op == b"mul" { checker }
+  else if is_ordered(entry.op) {
+    if contains(checker.keyed_names, type_name) { checker } else {
+      report_error_at(
+        checker,
+        b"E0201",
+        entry.span,
+        bytes_concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
+        b"ordered comparison here",
+        [
+          bytes_concat_all([
+            b"`",
+            simple_name_of(type_name),
+            b"` states `numeric` and no `key`, and a type is ordered by its `key`",
+          ]),
+        ],
+      )
+    }
+  } else {
+    report_error_at(
+      checker,
+      b"E0201",
+      entry.span,
+      bytes_concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
+      b"arithmetic here",
+      [
+        bytes_concat_all([
+          b"a type that states `numeric` takes `+`, `-`, `*` and unary `-`; `",
+          op_text(entry.op),
+          b"` has no answer at every pair of its values, so its module has a function for it instead",
+        ]),
+      ],
+    )
+  }
 
 fn op_text(op: Bytes) -> Bytes =
   if op == b"add" { b"+" }
@@ -9352,7 +9473,9 @@ fn numeric_mismatch(
     entry.span,
     bytes_concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
     bytes_concat(what, b" here"),
-    [b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`"],
+    [
+      b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`, and a type whose module states `numeric` for it takes `+`, `-` and `*`",
+    ],
   )
 
 /// The resolved type, rendered, when the signature's generics bind every variable in it, so the author can paste it.
@@ -10955,12 +11078,22 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
 }
 
 /// What `numeric(a)` or `integer(a)` was instantiated at, as the witness the call passes.
-fn predicate_witness(site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
+fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
   match ty {
     TyCon(k) -> if len(k.args) != 0 { None }
     else if is_int_name(k.name) { Some(ConcreteWitness(k.name)) }
     else if same_deriver(site.deriver, DNumeric) && (k.name == b"Float" || k.name == b"Decimal") {
       Some(ConcreteWitness(k.name))
+    }
+    // `numeric(a)` holds the ordered comparisons, which a type takes from its `key`.
+    else if same_deriver(site.deriver, DNumeric) {
+      match numeric_of(checker.numeric_types, k.name) {
+        Some(x) -> match instance_of(checker.instances, k.name, true) {
+          Some(_) -> Some(StatedWitness(x.ctor)),
+          None -> None,
+        },
+        None -> None,
+      }
     } else { None },
     TyVar(v) -> if !contains(site.assumed, v) { None } else {
       match fold(site.params, None, |acc: Option<Bytes>, r: RigidParam|
@@ -10999,7 +11132,7 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
       )
     }
   } else {
-    match predicate_witness(site, ty) {
+    match predicate_witness(checker, site, ty) {
       Some(w) -> {
         let n = len(checker.witness_refs);
         let fresh = {
@@ -11063,13 +11196,29 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
               else { b"` is not a numeric type" },
             ]),
             bytes_concat_all([b"`", callee, b"` requires `", dv, b"(\xc2\xb7)` here"]),
-            [
-              if same_deriver(site.deriver, DInteger) {
-                b"the integer types are `Int` and the eight fixed-width integers"
-              } else {
-                b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`"
-              },
-            ],
+            if same_deriver(site.deriver, DInteger) {
+              [b"the integer types are `Int` and the eight fixed-width integers"]
+            } else {
+              concat(
+                [
+                  b"the numeric types are `Int`, the eight fixed-width integers, `Float`, `Decimal`, and a type that states `numeric` and a `key`",
+                ],
+                match ty {
+                  TyCon(k) -> match numeric_of(checker.numeric_types, k.name) {
+                    Some(_) ->
+                      [
+                        bytes_concat_all([
+                          b"`",
+                          simple_name_of(k.name),
+                          b"` states `numeric` and no `key`: `numeric(\xc2\xb7)` holds `<` and the rest, which a type takes from its `key`",
+                        ]),
+                      ],
+                    None -> [],
+                  },
+                  _ -> [],
+                },
+              )
+            },
           ),
       },
     }
@@ -11343,7 +11492,7 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
       DeclaredAlias(_) ->
         not_a_sum(
           checker,
-          def,
+          def.target,
           decl,
           bytes_concat_all([
             b"`",
@@ -11357,7 +11506,7 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
       DeclaredRecord(_) ->
         not_a_sum(
           checker,
-          def,
+          def.target,
           decl,
           bytes_concat_all([
             b"`",
@@ -11399,7 +11548,7 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
 
 fn not_a_sum(
   checker: Checker,
-  def: InstanceDef,
+  target: Ident,
   decl: TypeDecl,
   message: Bytes,
   why: Bytes,
@@ -11407,7 +11556,7 @@ fn not_a_sum(
   report_error_at_and(
     checker,
     b"E0217",
-    def.target.span,
+    target.span,
     message,
     b"this type has no constructor",
     { module: decl.owner, span: decl.span },
@@ -11416,9 +11565,9 @@ fn not_a_sum(
       why,
       bytes_concat_all([
         b"declare a sum, as `type ",
-        def.target.name,
+        target.name,
         b" = | ",
-        def.target.name,
+        target.name,
         b"(..)`, whose constructor a value carries",
       ]),
     ],
@@ -11519,6 +11668,236 @@ fn answers_over(free: Free, own: OwnParams) -> Bool =
   fold(free.tys, true, |all: Bool, v: Int| all && contains(own.params, v))
     && fold(free.rows, true, |all: Bool, v: Int| all && contains(own.rows, v))
 
+/// What a module states of its types, read before any body is: the first `numeric` each type is
+/// given, as written, and each type given a `key`. `check_instances` judges them.
+fn collect_stated(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  fold(parsed.module.items, checker, |c: Checker, item: Item|
+    match item {
+      IInstance(def) -> match def.kind {
+        NKey -> { ..c, keyed_names: push(c.keyed_names, qualify(parsed.name, def.target.name)) },
+        NShow -> c,
+      },
+      INumeric(def) -> {
+        let type_name = qualify(parsed.name, def.target.name);
+        match numeric_of(c.numeric_types, type_name) {
+          Some(_) -> c,
+          None ->
+            {
+              ..c,
+              numeric_types: push(c.numeric_types, {
+                type_name: type_name,
+                ctor: fold(c.ctors, b"", |found: Bytes, k: CtorInfo|
+                  if bytes_len(found) == 0 && k.type_name == type_name { k.name } else { found }),
+                fns: map(numeric_ops(), |op: Bytes|
+                  match numeric_by(def, op) {
+                    Some(by) -> qualify(parsed.name, by.name),
+                    None -> b"",
+                  }),
+                at: { module: c.module, span: def.span },
+              }),
+            },
+        }
+      },
+      _ -> c,
+    })
+
+/// One `numeric for T by { .. }`: the type is a sum of this module's own that takes no parameters
+/// and states it once, the record names each operation once, and each function is one of this
+/// module's that takes and answers the type alone and only answers.
+fn check_numeric(checker: Checker, m: ParsedModule, def: NumericDef) -> Checker / {abort.raise} = {
+  let type_name = qualify(m.name, def.target.name);
+  let named = |text: Bytes| bytes_concat_all([b"`", def.target.name, text]);
+  match map_get(checker.types, type_name) {
+    None ->
+      report_error_at(
+        checker,
+        b"E0208",
+        def.target.span,
+        named(b"` is not a type this module declares"),
+        b"declared in another module, or not at all",
+        [
+          b"a `numeric` may only name a type its own module declares, so that an operator means one thing wherever the type's values meet it",
+        ],
+      ),
+    Some(decl) -> match decl.declared {
+      DeclaredAlias(_) ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          named(b"` is not a sum, and a `numeric` is for one"),
+          b"an alias is the type it names, so a `numeric` for one would be for every value of that type",
+        ),
+      DeclaredRecord(_) ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          named(b"` is a `new` record, which cannot state a `numeric` yet"),
+          b"a `new` record runs as the record it is written as, so nothing in a value says which type's arithmetic an operator over it is",
+        ),
+      DeclaredSum -> if len(decl.params) + len(decl.labels) + len(decl.rows) > 0 {
+        report_error_at_and(
+          checker,
+          b"E0216",
+          def.target.span,
+          named(b"` takes parameters, and a `numeric` is for a type that takes none"),
+          b"a type with parameters",
+          { module: decl.owner, span: decl.span },
+          b"declared here",
+          [
+            b"an operator calls the type's functions with its values alone, and `numeric_of_int` with none: nothing there says what a parameter is, or fills a constraint on one",
+          ],
+        )
+      } else {
+        match numeric_of(checker.numeric_types, type_name) {
+          Some(first) -> if first.at.span != def.span {
+            report_error_at_and(
+              checker,
+              b"E0105",
+              def.span,
+              named(b"` states its `numeric` twice"),
+              b"stated again here",
+              first.at,
+              b"first stated here",
+              [b"a type has one, so that nothing has to choose between two; remove one"],
+            )
+          } else {
+            let listed: Checker = numeric_listed(checker, def);
+            if len(listed.diags) > len(checker.diags) { listed } else {
+              fold(def.ops, listed, |c: Checker, x: NumericOp|
+                numeric_fitted(c, m, def, type_name, x))
+            }
+          },
+          None -> checker,
+        }
+      },
+    },
+  }
+}
+
+/// The record names each operation once, and nothing else.
+fn numeric_listed(checker: Checker, def: NumericDef) -> Checker / {abort.raise} = {
+  let why = b"a `numeric` names a function for each of `add`, `sub`, `mul`, `neg` and `of_int`, once: `+`, binary `-`, `*`, unary `-`, and what `numeric_of_int` calls";
+  let named = fold(range(0, len(def.ops)), checker, |c: Checker, i: Int| {
+    let x = at(def.ops, i);
+    if !contains(numeric_ops(), x.op.name) {
+      report_error_at(
+        c,
+        b"E0215",
+        x.op.span,
+        bytes_concat_all([b"`", x.op.name, b"` is no operation a `numeric` states"]),
+        b"not one of the five",
+        [why],
+      )
+    } else if fold(range(0, i), false, |seen: Bool, j: Int|
+        seen || at(def.ops, j).op.name == x.op.name) {
+      report_error_at(
+        c,
+        b"E0215",
+        x.op.span,
+        bytes_concat_all([b"this `numeric` names `", x.op.name, b"` twice"]),
+        b"named again here",
+        [why],
+      )
+    } else { c }
+  });
+  let missing = filter(numeric_ops(), |op: Bytes| numeric_by(def, op) == None);
+  if len(missing) == 0 { named } else {
+    report_error_at(
+      named,
+      b"E0215",
+      def.span,
+      bytes_concat_all([
+        b"this `numeric` names no function for ",
+        bytes::join(map(missing, backticked_text), b", "),
+      ]),
+      b"an operation is missing",
+      [why],
+    )
+  }
+}
+
+/// What `x`'s function takes, and that it answers the type: `(T, T) -> T`, `(T) -> T` for `neg`,
+/// `(Int) -> T` for `of_int`.
+fn numeric_fitted(
+  checker: Checker,
+  m: ParsedModule,
+  def: NumericDef,
+  type_name: Bytes,
+  x: NumericOp,
+) -> Checker / {abort.raise} =
+  match def_of(checker, qualify(m.name, x.by.name)) {
+    None ->
+      report_error_at(
+        checker,
+        b"E0101",
+        x.by.span,
+        bytes_concat_all([b"`", x.by.name, b"` is not a function this module declares"]),
+        b"a `numeric` names functions of its type's own module",
+        [],
+      ),
+    Some(f) -> {
+      let own = named_type(type_name);
+      let takes = if x.op.name == b"of_int" { [int_type()] }
+      else if x.op.name == b"neg" { [own] }
+      else { [own, own] };
+      let unfit = |why: Bytes, note: Bytes|
+        err_labels(
+          checker,
+          b"E0218",
+          bytes_concat_all([
+            b"`",
+            x.by.name,
+            b"` cannot be the `",
+            x.op.name,
+            b"` of `",
+            def.target.name,
+            b"`",
+          ]),
+          [
+            label_at(checker.module, x.by.span, true, why),
+            label_at(f.at.module, f.at.span, false, b"the function it names"),
+          ],
+          [
+            note,
+            bytes_concat_all([
+              b"`",
+              x.op.name,
+              b"` is `",
+              type_text(TyFn({ params: takes, ret: own, effects: row_empty() })),
+              b"`",
+            ]),
+          ],
+        );
+      match resolve(checker, f.scheme.ty) {
+        TyFn(sig) -> if len(f.constraints) > 0 || len(f.scheme.ty_vars) > 0
+            || len(f.scheme.row_vars) > 0
+            || len(f.scheme.label_vars) > 0 {
+          unfit(
+            b"this function binds a parameter of its own",
+            b"an operator calls it with the values alone, so no call fills a type, a row, a label or a constraint",
+          )
+        } else if sig.params != takes || sig.ret != own {
+          unfit(
+            bytes_concat_all([
+              b"this function is `",
+              type_text(resolve(checker, f.scheme.ty)),
+              b"`",
+            ]),
+            b"an operator takes and answers the type it is at",
+          )
+        } else if !row_is_pure(sig.effects) {
+          unfit(
+            bytes_concat_all([b"this function's row is `", row_text(sig.effects), b"`"]),
+            b"an operator at a number performs nothing, cannot raise and always returns, as `+` does at `Int`, so `a + b` gains no row where the type is this one",
+          )
+        } else { checker },
+        _ -> checker,
+      }
+    },
+  }
+
 fn first_key_loop(
   tys: List<Type>,
   instances: List<InstanceInfo>,
@@ -11579,7 +11958,11 @@ fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
   let stated: Checker = fold(range(0, len(checker.modules)), checker, |c: Checker, i: Int| {
     let m = at(c.modules, i);
     fold(m.module.items, c, |cc: Checker, item: Item|
-      match item { IInstance(def) -> check_instance({ ..cc, module: i }, m, def), _ -> cc })
+      match item {
+        IInstance(def) -> check_instance({ ..cc, module: i }, m, def),
+        INumeric(def) -> check_numeric({ ..cc, module: i }, m, def),
+        _ -> cc,
+      })
   });
   if len(stated.instances) == 0 { { ..stated, module: checker.module } } else {
     let adts = algebraic_shapes(stated);
@@ -12587,6 +12970,8 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     test_checks: [],
     assumed: [],
     instances: [],
+    numeric_types: [],
+    keyed_names: [],
   })
 
 /// `ok` is `false` when the program has an *error* in it. A warning is not one: the program
@@ -12627,6 +13012,7 @@ pub type CheckOutput = {
   facts: EmitFacts,
   kept: List<KeptFacts>,
   instances: List<InstanceInfo>,
+  numeric_types: List<NumericInfo>,
 }
 
 pub fn check_front(resolved: Resolved, mods: List<ParsedModule>) -> CheckOutput / {abort.raise} =
@@ -12654,6 +13040,7 @@ pub fn check_front_with(
     facts: facts_of(out.checker),
     kept: out.checker.kept,
     instances: out.checker.instances,
+    numeric_types: out.checker.numeric_types,
   }
 }
 
@@ -13033,7 +13420,7 @@ pub fn check_program_with(
     let m = at(mods, i);
     let c1: Checker = { ..checker, module: i };
     let typed: Checker = collect_nominals(collect_effects(collect_types(c1, m), m), m);
-    check_value_namespace(collect_ctors(typed, m), m)
+    collect_stated(check_value_namespace(collect_ctors(typed, m), m), m)
   });
   let checked: Checker = fold(resolved.order, declared, |checker: Checker, i: Int| {
     let m = at(mods, i);
@@ -16362,6 +16749,64 @@ test "a row may write diverges, the atom of a call that may not return" {
   );
   // `div` names an effect set like any other name, and none is declared.
   assert_eq(check_codes(b"fn spin(n: Int) -> Int / {div} = spin(n)\n"), [b"E0114"])
+}
+
+test "a numeric names a total function of its own sum for each operation, once" {
+  let ops = b"fn add(a: N, b: N) -> N = a\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\nfn bad(a: N, b: N) -> N / {abort.raise} = panic(\"no\")\n";
+  let stated = |record: Bytes|
+    check_codes(
+      bytes_concat_all([b"type N = | N(Int)\n", ops, b"numeric for N by ", record, b"\n"]),
+    );
+  let all = b"{ add: add, sub: add, mul: add, neg: neg, of_int: of }";
+  assert_eq(stated(all), []);
+  assert_eq(stated(bytes_concat_all([all, b"\nnumeric for N by ", all])), [b"E0105"]);
+  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg }"), [b"E0215"]);
+  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg, of_int: of, div: add }"), [
+    b"E0215",
+  ]);
+  assert_eq(stated(b"{ add: add, add: add, sub: add, mul: add, neg: neg, of_int: of }"), [
+    b"E0215",
+  ]);
+  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg, of_int: gone }"), [b"E0101"]);
+  // Each operation has one shape, and a row that is empty: `a + b` gains none.
+  assert_eq(stated(b"{ add: neg, sub: add, mul: add, neg: neg, of_int: of }"), [b"E0218"]);
+  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg, of_int: neg }"), [b"E0218"]);
+  assert_eq(stated(b"{ add: bad, sub: add, mul: add, neg: neg, of_int: of }"), [b"E0218"]);
+  // The type is this module's own sum, and takes no parameter a value could not say.
+  assert_eq(check_codes(b"numeric for Option by { add: f }\n"), [b"E0208"]);
+  assert_eq(check_codes(b"type N = Int\nnumeric for N by { add: f }\n"), [b"E0217"]);
+  assert_eq(check_codes(b"type N = new { n: Int }\nnumeric for N by { add: f }\n"), [b"E0217"]);
+  assert_eq(check_codes(b"type N<a> = | N(a)\nnumeric for N by { add: f }\n"), [b"E0216"])
+}
+
+test "an operator at a type that states numeric is its function, and what it does not state is refused" {
+  let n = b"type N = | N(Int)\nfn add(a: N, b: N) -> N = a\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\nnumeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }\n";
+  let keyed = bytes_concat(n, b"fn k(a: N) -> Int = 0\nkey for N by k\n");
+  let over = |src: Bytes, body: Bytes| check_codes(bytes_concat(src, body));
+  assert_eq(over(n, b"fn f(a: N, b: N) -> N = a + b * a - -b"), []);
+  assert_eq(over(n, b"fn f(a: N, b: N) -> N / {abort.raise} = a / b"), [b"E0201"]);
+  assert_eq(over(n, b"fn f(a: N, b: N) -> N / {abort.raise} = a % b"), [b"E0201"]);
+  // A type is ordered by its `key`.
+  assert_eq(over(n, b"fn f(a: N, b: N) -> Bool = a < b"), [b"E0201"]);
+  assert_eq(over(keyed, b"fn f(a: N, b: N) -> Bool = a < b && a >= b"), []);
+  // A literal is an `Int`, and nothing converts it.
+  assert_eq(over(n, b"fn f(a: N) -> N = a + 1"), [b"E0201"]);
+  // `numeric(a)` holds the ordered comparisons, so it takes the type that states a `key` too.
+  let sum = b"fn sum<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)\n";
+  assert_eq(over(bytes_concat(keyed, sum), b"fn f(xs: List<N>) -> N = sum(xs)"), []);
+  assert_eq(over(bytes_concat(n, sum), b"fn f(xs: List<N>) -> N = sum(xs)"), [b"E0201"]);
+  assert_eq(
+    over(
+      keyed,
+      b"fn half<a>(x: a) -> a / {abort.raise} where integer(a) = x / numeric_of_int(2)\nfn f(a: N) -> N / {abort.raise} = half(a)",
+    ),
+    [b"E0201"],
+  );
+  // `%` is no operator of every numeric type, as `/` is none.
+  assert_eq(check_codes(b"fn f<a>(x: a) -> a / {abort.raise} where numeric(a) = x % x"), [
+    b"E0209",
+  ]);
+  assert_eq(check_codes(b"fn f<a>(x: a) -> a / {abort.raise} where integer(a) = x % x"), [])
 }
 
 test "a key is stated once, by its type's own module, for a sum" {

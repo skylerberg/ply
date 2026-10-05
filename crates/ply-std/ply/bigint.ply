@@ -8,8 +8,10 @@
 //!
 //! The number's order is not its limbs' (with the sign first, `-10` would sort after `-5` by
 //! magnitude), so the type states a `key`: `==`, the language's `compare`, `digest` and a `Map` take
-//! the numbers in `compare`'s order. Division truncates toward zero and a zero divisor is `None`
-//! rather than a raise.
+//! the numbers in `compare`'s order. It states `numeric` too: `a + b`, `a - b`, `a * b` and `-a` are
+//! `add`, `sub`, `mul` and `neg`, `<` and the rest read the key, and a definition over
+//! `numeric(a)`, as `std.math.sum`, takes a `BigInt`. Division is no operator: it truncates toward
+//! zero, and a zero divisor is `None` rather than a raise.
 
 import std.list (all, drop, reverse, take, at, at_or)
 import std.math
@@ -19,6 +21,8 @@ import std.math
 pub type BigInt = | BigInt(Bool, List<Int>)
 
 key for BigInt by order_key
+
+numeric for BigInt by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }
 
 derive eq for BigInt
 derive ord for BigInt
@@ -37,6 +41,11 @@ fn order_key(value: BigInt) -> (Int, Int, List<Int>) = {
 /// The bits in a limb, and the limb a power of two.
 fn word_bits() -> Int = 30
 fn word_base() -> Int = 1073741824
+
+/// What a number that is not negative leaves in its limb, and what it carries past it: a mask and
+/// a shift, which raise nothing where `%` and `/` by the base would be in the row.
+fn low(n: Int) -> Int = n & 1073741823
+fn carried(n: Int) -> Int = n >> 30
 
 /// Zero: positive, with no limbs, which is the only representation of it.
 pub fn zero() -> BigInt = BigInt(false, [])
@@ -62,12 +71,11 @@ pub fn neg(value: BigInt) -> BigInt =
   if is_zero(value) { value } else { BigInt(!is_negative(value), limbs_in(value)) }
 
 /// The `Int` as a `BigInt`, whatever its sign. The whole `i64` range is exact, `min_int` included,
-/// because a negative `Int` is read off its decimal spelling rather than negated — `0 - min_int`
-/// is not an `Int`.
-pub fn of_int(n: Int) -> BigInt / {abort.raise} =
-  if n == 0 { zero() }
-  else if n < 0 { option_at(of_string(int_to_string(n)), "an `Int` spells a decimal") }
-  else { make(false, limbs_of(n)) }
+/// whose magnitude is written out rather than negated: `0 - min_int` is not an `Int`.
+pub fn of_int(n: Int) -> BigInt =
+  if n >= 0 { make(false, limbs_of(n)) }
+  else if n == min_int() { BigInt(true, min_magnitude()) }
+  else { make(true, limbs_of(0 - n)) }
 
 /// The `Int` the value names, or `None` when it does not fit one. The limit is `i64`'s own, so
 /// `max_int` fits and `min_int` is exact — its magnitude, `2^63`, is one past `max_int` and is the
@@ -136,7 +144,7 @@ pub fn less_than(a: BigInt, b: BigInt) -> Bool = is_less(compare(a, b))
 
 /// `a + b`, with the signs handled by magnitude: alike signs add, unlike ones subtract the smaller
 /// from the larger and keep its sign.
-pub fn add(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
+pub fn add(a: BigInt, b: BigInt) -> BigInt =
   if is_zero(a) { b }
   else if is_zero(b) { a } else if is_negative(a) == is_negative(b) {
     make(is_negative(a), add_limbs(limbs_in(a), limbs_in(b)))
@@ -145,11 +153,11 @@ pub fn add(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
   } else { make(is_negative(b), sub_limbs(limbs_in(b), limbs_in(a))) }
 
 /// `a - b`.
-pub fn sub(a: BigInt, b: BigInt) -> BigInt / {abort.raise} = add(a, neg(b))
+pub fn sub(a: BigInt, b: BigInt) -> BigInt = add(a, neg(b))
 
 /// Schoolbook multiplication: every pair of limbs contributes once, at the place the two place
-/// values add up to, and each partial row carries into the next limb as it goes.
-pub fn mul(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
+/// values add up to.
+pub fn mul(a: BigInt, b: BigInt) -> BigInt =
   if is_zero(a) || is_zero(b) { zero() }
   else { make(is_negative(a) != is_negative(b), mul_limbs(limbs_in(a), limbs_in(b))) }
 
@@ -205,11 +213,8 @@ pub fn shift_right(value: BigInt, bits: Int) -> BigInt / {abort.raise} =
 
 // --- The magnitude ----------------------------------------------------------
 
-/// Reads a positive `Int` into limbs, least significant first.
-fn limbs_of(n: Int) -> List<Int> / {abort.raise} = limbs_of_from(n, [])
-
-fn limbs_of_from(n: Int, acc: List<Int>) -> List<Int> / {abort.raise} =
-  if n <= 0 { acc } else { limbs_of_from(n / word_base(), push(acc, n % word_base())) }
+/// An `Int` that is not negative as limbs, least significant first: three hold its 63 bits.
+fn limbs_of(n: Int) -> List<Int> = trim_high([low(n), low(carried(n)), carried(carried(n))])
 
 /// The magnitude of a decimal spelling: `acc * 10 + digit` for each digit, in base-2^30 limbs.
 fn limbs_of_digits(digits: String) -> List<Int> / {abort.raise} =
@@ -274,13 +279,13 @@ fn compare_from_top(a: List<Int>, b: List<Int>, i: Int) -> Ordering =
   else { compare_from_top(a, b, i - 1) }
 
 /// The sum of two magnitudes.
-fn add_limbs(a: List<Int>, b: List<Int>) -> List<Int> / {abort.raise} = {
+fn add_limbs(a: List<Int>, b: List<Int>) -> List<Int> = {
   let summed = fold(
     range(0, if len(a) > len(b) { len(a) } else { len(b) }),
     { carry: 0, out: [] },
     |acc: { carry: Int, out: List<Int> }, i: Int| {
       let sum = limb_or_zero(a, i) + limb_or_zero(b, i) + acc.carry;
-      { carry: sum / word_base(), out: push(acc.out, sum % word_base()) }
+      { carry: carried(sum), out: push(acc.out, low(sum)) }
     },
   );
   trim_high(if summed.carry == 0 { summed.out } else { push(summed.out, summed.carry) })
@@ -296,31 +301,27 @@ fn sub_from(a: List<Int>, b: List<Int>, i: Int, borrow: Int, out: List<Int>) -> 
     else { sub_from(a, b, i + 1, 0, push(out, difference)) }
   }
 
-fn mul_limbs(a: List<Int>, b: List<Int>) -> List<Int> / {abort.raise} =
-  fold(range(0, len(b)), zeros(len(a) + len(b)), |acc: List<Int>, j: Int|
-    scale_into(acc, a, at_or(b, j, 0), j, 0, 0))
-
-/// Adds `factor * a` into `acc` with its lowest limb at `shift`, carrying as it goes: a partial
-/// row of the schoolbook product, placed where the two place values put it.
-fn scale_into(
-  acc: List<Int>,
-  a: List<Int>,
-  factor: Int,
-  shift: Int,
-  i: Int,
-  carry: Int,
-) -> List<Int> / {abort.raise} =
-  if i >= len(a) { carry_into(acc, i + shift, carry) } else {
-    let sum = at_or(a, i, 0) * factor + at_or(acc, i + shift, 0) + carry;
-    scale_into(
-      list_set(acc, i + shift, sum % word_base()),
-      a,
-      factor,
-      shift,
-      i + 1,
-      sum / word_base(),
-    )
-  }
+/// The product of two magnitudes, a limb at a time: limb `k` is every `a[i] * b[k - i]` and what
+/// the limb below carried. A product is under 2^60, so its two halves are summed apart, and
+/// neither sum leaves an `Int` for any number memory holds.
+fn mul_limbs(a: List<Int>, b: List<Int>) -> List<Int> = {
+  let columns = fold(
+    range(0, len(a) + len(b)),
+    { carry: 0, out: [] },
+    |acc: { carry: Int, out: List<Int> }, k: Int| {
+      let column = fold(
+        range(if k < len(b) { 0 } else { k - len(b) + 1 }, if k < len(a) { k + 1 } else { len(a) }),
+        { lo: acc.carry, hi: 0 },
+        |c: { lo: Int, hi: Int }, i: Int| {
+          let product = at_or(a, i, 0) * at_or(b, k - i, 0);
+          { lo: c.lo + low(product), hi: c.hi + carried(product) }
+        },
+      );
+      { carry: carried(column.lo) + column.hi, out: push(acc.out, low(column.lo)) }
+    },
+  );
+  trim_high(columns.out)
+}
 
 /// Adds `carry` at `offset`, propagating across as many limbs as it takes: those `acc` holds, and
 /// past them the three a 63-bit carry fills.
@@ -572,32 +573,60 @@ test "a literal's check answers the number, or the character that is no part of 
 test "addition and subtraction follow the signs, and small answers match Int" {
   let a = of_int(5);
   let b = of_int(0 - 3);
-  assert_eq(to_string(add(a, b)), "2");
-  assert_eq(to_string(sub(a, b)), "8");
-  assert_eq(to_string(add(b, a)), "2");
-  assert_eq(to_string(sub(b, a)), "-8");
-  assert_eq(to_string(add(b, b)), "-6");
-  assert_eq(to_string(sub(b, b)), "0");
+  assert_eq(to_string(a + b), "2");
+  assert_eq(to_string(a - b), "8");
+  assert_eq(to_string(b + a), "2");
+  assert_eq(to_string(b - a), "-8");
+  assert_eq(to_string(b + b), "-6");
+  assert_eq(to_string(b - b), "0");
+  assert_eq(to_string(-a), "-5");
+  assert_eq(-zero(), zero());
   // Every pair in a small range agrees with the `Int` arithmetic it wraps.
   assert(
     all(range(0 - 60, 60), |x: Int|
       all(range(0 - 60, 60), |y: Int|
-        to_string(add(of_int(x), of_int(y))) == int_to_string(x + y)
-          && to_string(sub(of_int(x), of_int(y))) == int_to_string(x - y))),
+        of_int(x) + of_int(y) == of_int(x + y) && of_int(x) - of_int(y) == of_int(x - y)
+          && of_int(x) * of_int(y) == of_int(x * y)
+          && of_int(x) < of_int(y) == (x < y))),
   );
   // And across the limb boundary, where the carry crosses a word.
   let radix = of_int(1073741824);
-  assert_eq(to_string(add(radix, of_int(0 - 1))), "1073741823");
-  assert_eq(to_string(add(radix, of_int(1))), "1073741825");
-  assert_eq(to_string(sub(radix, of_int(1))), "1073741823")
+  assert_eq(to_string(radix + of_int(0 - 1)), "1073741823");
+  assert_eq(to_string(radix + of_int(1)), "1073741825");
+  assert_eq(to_string(radix - of_int(1)), "1073741823")
+}
+
+test "the operators are the functions, and the edges of Int are exact" {
+  let big = shift_left(one(), 200);
+  assert_eq(big + big, add(big, big));
+  assert_eq(big - one(), sub(big, one()));
+  assert_eq(big * big, mul(big, big));
+  assert_eq(-big, neg(big));
+  assert_eq(big * big, shift_left(one(), 400));
+  assert_eq(to_string(of_int(min_int())), "-9223372036854775808");
+  assert_eq(to_string(of_int(9223372036854775807) + one()), "9223372036854775808");
+  assert_eq(of_int(min_int()) + of_int(9223372036854775807), of_int(0 - 1));
+  assert(-big < zero() && zero() < big && big <= big && big > one())
+}
+
+test "a definition over a numeric type takes a BigInt" {
+  let big = shift_left(one(), 200);
+  let none: List<BigInt> = [];
+  assert_eq(math::sum([big, big, one()]), big + big + one());
+  assert_eq(math::sum(none), zero());
+  assert_eq(math::product([of_int(3), big, of_int(0 - 1)]), -(big * of_int(3)));
+  assert_eq(math::product(none), one());
+  assert_eq(math::abs(-big), big);
+  assert_eq(math::sign(-big), 0 - 1);
+  assert_eq(math::clamp(big, zero(), one()), one())
 }
 
 test "multiplication is schoolbook and the known products hold" {
-  assert_eq(to_string(mul(of_int(0), of_int(5))), "0");
-  assert_eq(to_string(mul(of_int(0 - 1), of_int(5))), "-5");
-  assert_eq(to_string(mul(of_int(0 - 1), of_int(0 - 5))), "5");
-  assert_eq(to_string(mul(of_int(999999999), of_int(999999999))), "999999998000000001");
-  assert_eq(to_string(mul(of_int(1073741824), of_int(1073741824))), "1152921504606846976");
+  assert_eq(to_string(of_int(0) * of_int(5)), "0");
+  assert_eq(to_string(of_int(0 - 1) * of_int(5)), "-5");
+  assert_eq(to_string(of_int(0 - 1) * of_int(0 - 5)), "5");
+  assert_eq(to_string(of_int(999999999) * of_int(999999999)), "999999998000000001");
+  assert_eq(to_string(of_int(1073741824) * of_int(1073741824)), "1152921504606846976");
   // 25! is past `i64`, so it is a product the wrapped arithmetic cannot hold.
   assert_eq(to_string(factorial(25)), "15511210043330985984000000");
   assert_eq(to_string(factorial(40)), "815915283247897734345611269596115894272000000000")
@@ -678,12 +707,12 @@ test "a BigInt keys a map in the numbers' order, and the language's order is com
   let keyed = fold(reverse(values), map_new(), |m: Map<BigInt, String>, v: BigInt|
     map_insert(m, v, to_string(v)));
   assert_eq(map_values(keyed), texts);
-  assert_eq(map_get(keyed, sub(of_int(5), of_int(15))), Some("-10"));
+  assert_eq(map_get(keyed, of_int(5) - of_int(15)), Some("-10"));
   assert(
     all(values, |a: BigInt|
       all(values, |b: BigInt|
         compare_values(a, b) == compare(a, b) && big_int_ord().compare(a, b) == compare(a, b))),
   );
-  assert_eq(digest(add(of_int(3), of_int(4))), digest(of_int(7)));
+  assert_eq(digest(of_int(3) + of_int(4)), digest(of_int(7)));
   assert_eq(big_int_hash().hash(of_int(7)), digest(of_int(7)))
 }

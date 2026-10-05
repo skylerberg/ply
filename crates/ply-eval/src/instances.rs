@@ -1,6 +1,7 @@
 //! What a nominal type's module states its values go through, asked of the unit an entry runs:
-//! the key two values are compared, ordered and hashed by, and what `show` writes of one. A type
-//! is found by its constructor, so every reader of a value asks here and no caller passes it.
+//! the key two values are compared, ordered and hashed by, what `show` writes of one, and the
+//! arithmetic the operators mean at it. A type is found by its constructor, so every reader of a
+//! value asks here and no caller passes it.
 
 use crate::{Symbol, Value};
 use std::cell::Cell;
@@ -16,7 +17,28 @@ pub struct Instances {
     pub key: fn(*mut (), &Value) -> Option<Value>,
     /// The text the type's `show` writes of this value; `None` as for `key`.
     pub shown: fn(*mut (), &Value) -> Option<Value>,
+    /// What the type's `numeric` answers for this role over these values of it; `None` as for
+    /// `key`.
+    pub numeric: fn(*mut (), usize, &[Value]) -> Option<Value>,
+    /// The witness a call passes for the type this constructor belongs to: [`STATED_WITNESS`]
+    /// past its place among the unit's constructors. `None` where the type states no `numeric`.
+    pub witness: fn(*mut (), &Symbol) -> Option<i64>,
+    /// The type's `of_int` at this `Int`, for the type a witness names; `None` as for `key`.
+    pub of_int: fn(*mut (), i64, i64) -> Option<Value>,
 }
+
+/// The functions a `numeric` names, in the order a unit lists them.
+pub const ADD: usize = 0;
+pub const SUB: usize = 1;
+pub const MUL: usize = 2;
+pub const NEG: usize = 3;
+pub const OF_INT: usize = 4;
+
+/// How many words each takes.
+pub const NUMERIC_WORDS: [usize; 5] = [2, 2, 2, 1, 1];
+
+/// The first witness of a type that states its own arithmetic: the builtin types' come before.
+pub const STATED_WITNESS: i64 = 13;
 
 thread_local! {
     static RUNNING: Cell<Option<Instances>> = const { Cell::new(None) };
@@ -53,4 +75,20 @@ pub(crate) fn keys(a: &Value, b: &Value) -> Option<(Value, Value)> {
 pub(crate) fn shown(v: &Value) -> Option<Value> {
     let i = running()?;
     (i.shown)(i.unit, v)
+}
+
+/// `args[0]` is a constructor's value.
+pub(crate) fn numeric(role: usize, args: &[Value]) -> Option<Value> {
+    let i = running()?;
+    (i.numeric)(i.unit, role, args)
+}
+
+pub(crate) fn witness(ctor: &Symbol) -> Option<i64> {
+    let i = running()?;
+    (i.witness)(i.unit, ctor)
+}
+
+pub(crate) fn of_int(witness: i64, n: i64) -> Option<Value> {
+    let i = running()?;
+    (i.of_int)(i.unit, witness, n)
 }

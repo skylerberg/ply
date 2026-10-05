@@ -349,6 +349,7 @@ pub fn witness_of(v: &Value) -> i64 {
             .map_or(INT_WITNESS, |i| i as i64),
         Value::Float(_) => FLOAT_WITNESS,
         Value::Decimal(_) => DECIMAL_WITNESS,
+        Value::Ctor { name, .. } => crate::instances::witness(name).unwrap_or(INT_WITNESS),
         _ => INT_WITNESS,
     }
 }
@@ -951,6 +952,10 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 });
             }
             match x {
+                Value::Ctor { .. } => {
+                    crate::instances::numeric(crate::instances::NEG, std::slice::from_ref(&x))
+                        .ok_or_else(|| crate::semantics::unstated(span, &x))
+                }
                 Value::Float(f) => Ok(Value::Float(-f)),
                 Value::Decimal(d) => Ok(Value::Decimal(-d)),
                 Value::Fixed(f) => f.checked_neg().map(Value::Fixed).ok_or_else(|| {
@@ -971,6 +976,17 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::NumericOfInt => {
             let w = args[0].as_int(span, "a witness")?;
             let n = args[1].as_int(span, "`numeric_of_int`")?;
+            if w >= crate::instances::STATED_WITNESS {
+                return crate::instances::of_int(w, n).ok_or_else(|| {
+                    Diagnostic::error(
+                        codes::RUNTIME_ERROR,
+                        format!(
+                            "`numeric_of_int({n})` did not answer at the type it was called at"
+                        ),
+                    )
+                    .primary(span, "converted here")
+                });
+            }
             match usize::try_from(w).ok().and_then(|i| INT_TYPES.get(i)) {
                 Some(t) => Fixed::of(*t, i128::from(n))
                     .map(Value::Fixed)

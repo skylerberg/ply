@@ -117,7 +117,7 @@ cases — and holds no examples: the tests and laws that name a definition are
 its examples, and `ply doc` lists them (§16). A blank line between a doc and its
 declaration does not part them, and `ply fmt` removes it. A doc comment that
 documents nothing — one inside a body, above an import, a `test`, a `law`, a
-`derive`, a `key` or a `show`, or at the end of a file, or a `//!` line below
+`derive`, a `key`, a `show` or a `numeric`, or at the end of a file, or a `//!` line below
 the head of its file — is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
 answer.
 
@@ -148,7 +148,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
-| `key`, `show`, `by` | `key for <Type> by <function>` and `show for <Type> by <function>` at item position (§4.4) |
+| `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -169,7 +169,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
-| `uuid"6ba7b810-.."` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, below. |
+| `uuid"6ba7b810-.."`, `html"<b>{x}</b>"` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, and holes its tag is handed apart from the text, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
 | `#[1, 2]` | `Map<a, Unit>` | A set: each element a key whose value is `()`. |
@@ -198,8 +198,8 @@ one written.
 
 A tagged literal `tag"text"` is a name touching a string: `uuid"..."` is one, and `uuid "..."` a
 name and then a string. It is the call `tag::literal("text")`, where `tag` is a module binder in
-scope (§3.2) and the text a string's, escapes and all, and a load runs that call before anything
-else runs (§16):
+scope (§3.2) and the text an interpolated string's, escapes and all, with `{{` and `}}` for its
+braces, and a load runs that call before anything else runs (§16):
 
 ```ply
 import std.uuid
@@ -214,7 +214,7 @@ is `E0152`, as is one in a recursion with the definition that holds the literal;
 binds is `E0106`, and a module with no `literal`, or a private one, `E0101` or `E0107`. Where it
 answers `Ok(v)` the literal has type `T`, is `v`, and performs nothing: what the call could raise,
 the check saw it not raise. Where it answers `Err`, the literal is `E0153`, placed at character
-`offset` of the text as the source spells it, an escape being one character, or at the closing
+`offset` of the text as the source spells it, an escape or a doubled brace being one character, or at the closing
 quote for the offset just past the text, with `message` beside it. A parser that raises, or that
 makes more than ten million calls, is `E0154`.
 
@@ -225,6 +225,36 @@ literal is an expression: no pattern, label or parameter default (`E0121`) is on
 `let Ok(v) = tag::literal("text")`, so a module that binds its own `Ok` holds none (`E0118`), as
 one that binds an `Ok` or an `Err` holds no `try` (§6.8). `std.uuid`, `std.base64` and
 `std.bigint` are tags (`ply doc std.uuid.literal`).
+
+A tagged literal takes holes as an interpolated string does, each `{expr}` any expression, and
+its tag is handed the values apart from the text, so it binds, escapes or quotes each by where
+it stands and nothing a hole holds is read as text:
+
+```ply
+import std.html
+import std.html (Html, text)
+import std.sh
+
+fn row(name: String, kind: String) -> Html = html"<li class={text(kind)}>{text(name)}</li>"
+
+fn search(pattern: String, file: String) -> List<String> = sh"-n --color=never {pattern} {file}"
+```
+
+With holes it is the call `tag::fill(c, [h0, h1, ..])`, where `c` is what
+`tag::compile(["t0", "t1", ..])` answered `Ok` of for the texts around the holes, one more than
+there are holes. `compile` is a `pub fn` of one `List<String>` answering
+`Result<C, {message: String, offset: Int, part: Int}>`, and `fill` one of a `C` and a `List<H>`;
+each has no type, row or label parameter, a row that holds nothing but raises and no recursion
+with the definition that holds the literal (`E0152`). A load runs `compile` as it runs a
+`literal`, on the texts alone: its `Err` is `E0153` at character `offset` of text `part`, a brace
+written twice being one character, and the offset just past a text is the hole that follows it,
+or the closing quote after the last. Each hole is checked against `H` (`E0201` at the hole; a
+record literal in one is a `new` record where `H` is one, §4.2). The literal has the type `fill`
+answers, performs what its holes perform and raises what `fill` raises; it hashes with
+`compile`, `fill`, its texts and its holes, and runs as `let Ok(c) = tag::compile([..])` and then
+the call of `fill`. A literal with no hole calls `literal` and one with any calls `compile` and
+`fill`: a tag declares either or both, and a literal of a kind its tag does not declare is `E0101`.
+`std.html` and `std.sh` are tags with holes (`ply doc std.html`, `ply doc std.sh`).
 
 A line string is a run of lines that each start with `\\`, led only by blanks.
 Everything after the `\\` to the end of its line is text, verbatim: nothing is
@@ -265,9 +295,13 @@ Loosest to tightest; all binary operators are left-associative:
 * `==`/`!=` are structural at every type except functions, and a type that
   states a `key` is compared through it (§4.4). `Float` equality is
   IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work on numeric types and on `Char`,
-  by scalar value; order anything else with `compare`. Arithmetic on a `Char` is
+  by scalar value, and on a type that states `numeric` and a `key`, by its key
+  (§4.4); order anything else with `compare`. Arithmetic on a `Char` is
   `E0201`: go through `int_of_char`.
 * Both operands have one type; there is no widening (`U8 + U16` is `E0201`).
+* `+`, `-`, `*` and prefix `-` at a sum whose module states `numeric` for it are
+  the functions it names (§4.4). They perform nothing and cannot raise, and a
+  literal beside one is still an `Int`: `a + 1` is `E0201`.
 * Arithmetic is checked. A `/` or `%` whose divisor is zero raises (§6.8), so
   either puts `abort.raise` in the row unless its divisor is a literal other
   than zero or its operands are `Float`s. Overflow and a shift count that is
@@ -287,8 +321,8 @@ Loosest to tightest; all binary operators are left-associative:
 ## 3. Modules and items
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
-`nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key` and
-`show`, in any order.
+`nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`,
+`show` and `numeric`, in any order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -661,6 +695,36 @@ where it is stated, through whatever types and keys lie between (`E0219`). A
 type's hash covers the functions it states, so a definition that can hold a
 `T` is re-checked and its tests re-run when either changes.
 
+A number type states its arithmetic the same way:
+
+```ply
+pub type BigInt = | BigInt(Bool, List<Int>)
+
+numeric for BigInt by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }
+```
+
+`a + b`, `a - b`, `a * b` and `-a` at the type are then `add`, `sub`, `mul` and
+`neg`, and `numeric_of_int(n)` there is `of_int(n)`. The record names those five
+operations, each once and nothing else (`E0215`), and each function is one the
+module declares (`E0101`): `add`, `sub` and `mul` are `(T, T) -> T`, `neg` is
+`(T) -> T` and `of_int` is `(Int) -> T`, with no parameter of its own and an
+empty row, so `a + b` gains no row where the type is this one (`E0218`). The
+type is a sum the module declares, as for a `key` (`E0208`, `E0217`), stated
+once (`E0105`), and takes no parameter: an operator has the values alone, and
+`numeric_of_int` not even one, so nothing would say what a parameter is
+(`E0216`).
+
+`/` and `%` are no operator of such a type, since they have no answer at every
+pair of values: its module has a function for each, as `std.bigint.div` answers
+an `Option`. The bit operators and the `wrap_` and `checked_` builtins stay the
+builtin integers'. A type is ordered by its `key`, so `<`, `<=`, `>` and `>=`
+work at one that states both, and compare the keys. A type that states both is
+a numeric type: it fills `numeric(a)` (§4.5), as `std.math.sum(xs)` over a
+`List<BigInt>` does. One with no `key` has its operators and fills no
+`numeric(a)`, which holds the ordered comparisons. `==`, `compare` and `digest`
+are the key's, whatever arithmetic is stated. Each of these is `E0201` where
+the type does not have it.
+
 ### 4.5 Generics
 
 `fn apply<a, b | e>(x: a, f: (a) -> b / e) -> b / e = f(x)`: type parameters are
@@ -729,11 +793,13 @@ literal is built of may perform less than `e`, as any function meeting a type
 may. A printed type shows them as written, `m.Sink<Int, [conn] | {}>`.
 
 `where numeric(a)` lets a type parameter take arithmetic and the ordered
-comparisons: `+`, `-`, `*`, `%`, unary `-`, `<` and the rest, and
-`numeric_of_int(n)` writes a constant at it. `where integer(a)` adds `/` and the
-bit operators. A call fills `a` with one of the numeric types — `Int`, the
-fixed-width integers, `Float` and `Decimal` (`integer`: the first two) — or with
-a parameter of its own the same constraint is on; any other type is `E0201`.
+comparisons: `+`, `-`, `*`, unary `-`, `<` and the rest, and
+`numeric_of_int(n)` writes a constant at it. `where integer(a)` adds `/`, `%`
+and the bit operators; either under `numeric(a)` alone is `E0209`. A call fills
+`a` with one of the numeric types — `Int`, the fixed-width integers, `Float`,
+`Decimal` and a type that states `numeric` and a `key` (§4.4; `integer`: the
+first two) — or with a parameter of its own the same constraint is on; any other
+type is `E0201`.
 Each operator fails where it fails at that type: a `/` or `%` by zero raises
 (§6.8), and a width's overflow ends the run:
 
@@ -1869,9 +1935,10 @@ it proves, and only definitions the checker reads as ending unrolled.
 
 Congruence and injectivity read `==` as what a value's constructors and fields
 say, which a `Float` (`NaN != NaN`) and a type that states a `key` (§4.4) are
-not. A claim that holds a value of either, at any depth, is never `proved`: it
-is run, over every point of a finite domain or over a sample. Under `--reach`
-the place is `float_term` or `keyed_term`.
+not, and arithmetic as the integers', which an operator at a type that states
+`numeric` is not. A claim that holds a value of any of them, at any depth, is
+never `proved`: it is run, over every point of a finite domain or over a sample.
+Under `--reach` the place is `float_term` or `keyed_term`.
 
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
@@ -2052,7 +2119,8 @@ bound are `proved`. Anything else, such as another operation, a call of a
 function value with no cost name, a group of definitions calling each other, a
 body another package keeps with no `cost` bound, an `Int` parameter the steps
 grow with, or a definition that takes, answers or builds a value of a type that
-states a `key` (§4.4), whose comparisons call it unseen, leaves the clause to
+states a `key` or a `numeric` (§4.4), whose comparisons and operators call it
+unseen, leaves the clause to
 the cost law `cost of <name>` (`#2` and on for
 later clauses): it makes each parameter of one size `n`, an `Int` being `n` and
 a list, map, string or bytes holding `n` elements made of their index, and a
@@ -2148,8 +2216,9 @@ std --show` alone every one. A load reads only the shipped modules its modules
 import, what those import in turn, and what they embed, so a change to any other
 leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
 counts and hashes only the functions the program reaches and the names its
-modules import, beside every type and effect, and none of their tests or laws;
-`--std` reads each one whole.
+modules import, beside every type and effect and the functions a type's `key`,
+`show` or `numeric` names (§4.4), and none of their tests or laws; `--std`
+reads each one whole.
 
 ## 14. The host boundary
 
@@ -2589,14 +2658,15 @@ loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 document, `front_end` carries `reused` and `key` for an answer taken back,
 beside the phases of this run, all of it read.
 
-A load that checked has not yet run a tagged literal's parser (§2.3). `ply check`,
+A load that checked has not yet run a tagged literal's parser, its `literal` or the
+`compile` of one with holes (§2.3). `ply check`,
 `ply run`, `ply test`, `ply build` and `ply prove` settle the literals of the
 root package's modules before they do anything else with the load, and refuse it
 with what a parser refused (`E0153`, `E0154`): each literal is the call of its
 parser, entered on a machine of its own, lent to nothing, over a unit of the
 definitions the parsers reach, under a budget of ten million calls a literal.
-A verdict is a function of the parser and the text, so it is kept in the
-toolchain's cache (§8.6) under the hash of all the parser reaches, the text and
+A verdict is a function of the parser and the texts, so it is kept in the
+toolchain's cache (§8.6) under the hash of all the parser reaches, the texts and
 the toolchain, and a parser is entered again only for a text it has not read or
 after an edit to something it reaches; a check that touches no literal's parser
 enters nothing. A module that writes a tagged literal is read from its source
@@ -2708,7 +2778,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
 | `E0151` | an `extern fn` outside the prelude |
-| `E0152` | a tagged literal whose tag's `literal` is not a parser a check can run |
+| `E0152` | a tagged literal whose tag's `literal`, or `compile` or `fill` for one with holes, is not what a tagged literal calls |
 | `E0153` | a tagged literal its parser refuses |
 | `E0154` | a tagged literal whose parser raised or spent its budget |
 | `E0201` | type mismatch |
@@ -2719,14 +2789,16 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case of a type hashed only through a `key` |
 | `E0207` | unknown deriver |
 | `E0208` | orphan `derive`, `key` or `show` |
-| `E0209` | `/` on `Decimal` |
+| `E0209` | `/` or `%` where no number has it: `/` on `Decimal`, either on a `numeric` type parameter |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
 | `E0212` | the alternatives of an or-pattern bind different names |
 | `E0213` | a `let` whose or-pattern can fail has no `else` |
 | `E0214` | a `new` record whose fields reach the record itself |
-| `E0217` | a `key` or a `show` for a type that is not a sum |
-| `E0218` | a `key` or a `show` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer |
+| `E0215` | a `numeric` that does not name each of `add`, `sub`, `mul`, `neg` and `of_int` once |
+| `E0216` | a `numeric` for a type that takes parameters |
+| `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum |
+| `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |

@@ -1,9 +1,11 @@
 //! Tagged literals, settled before anything runs. `tag"text"` is the call `tag::literal("text")`,
-//! and a load that checked has not yet run it: here each one the run's own modules hold is entered
-//! on a machine of its own, under a step budget, and what its parser answers is the literal's
-//! verdict. A verdict is a function of the parser and the text, so it is kept under the hash of all
-//! the parser reaches and the text, in the toolchain's cache.
+//! and one with holes the call of `tag::compile` on the texts around them, and a load that checked
+//! has not yet run either: here each one the run's own modules hold is entered on a machine of its
+//! own, under a step budget, and what its parser answers is the literal's verdict. A verdict is a
+//! function of the parser and the texts, so it is kept under the hash of all the parser reaches and
+//! the texts, in the toolchain's cache.
 
+import compiler.exprs (TaggedPart)
 import compiler.front (Analysis, TaggedSite, tagged_sites)
 import compiler.hash (closure_of, hex)
 import compiler.interface (sized)
@@ -23,20 +25,26 @@ import std.hash (blake3)
 import std.list (at, contains)
 import std.random (entropy)
 import std.time (time)
-import std.value (Value, VCtor, VInt, VRecord, VStr, render, field_named)
+import std.value (Value, VCtor, VInt, VList, VRecord, VStr, render, field_named)
 import units (emit, text_of)
 
 /// The calls a literal's parser may make before the check gives up on it.
 pub fn step_budget() -> Int = 10000000
 
-/// What a parser said of a text. `Rejected` is its own `Err`: where in the text, in characters, and
-/// why. `Raised` is a parser that raised instead of answering, and `Spent` one the budget stopped.
-pub type Verdict = | Accepted | Rejected({ offset: Int, message: String }) | Raised(String) | Spent
+/// What a parser said of its texts. `Rejected` is its own `Err`: which text, where in it in
+/// characters, and why. `Raised` is a parser that raised instead of answering, and `Spent` one the
+/// budget stopped.
+pub type Verdict =
+  | Accepted
+  | Rejected({ part: Int, offset: Int, message: String })
+  | Raised(String)
+  | Spent
 
 derive bin for Verdict
 
-/// A parser, by its program-wide name and the hash of all it reaches, and a text to hand it.
-pub type Asked = { callee: Bytes, hash: Bytes, text: Bytes }
+/// A parser, by its program-wide name and the hash of all it reaches, and what to hand it: one
+/// text as it is, or the several around a literal's holes as a list.
+pub type Asked = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
 
 /// What a command asks of its tagged literals' parsers. What answers is `settling`, which `main` runs
 /// every command under, or a handler of the asker's own. A verdict is a function of what is asked,
@@ -48,7 +56,8 @@ pub effect literal {
 
 // --- Asking -----------------------------------------------------------------------
 
-fn asked_of(site: TaggedSite) -> Asked = { callee: site.callee, hash: site.hash, text: site.text }
+fn asked_of(site: TaggedSite) -> Asked =
+  { callee: site.callee, hash: site.hash, parts: map(site.parts, |part: TaggedPart| part.text) }
 
 fn distinct(sites: List<TaggedSite>) -> List<Asked> =
   fold(sites, [], |acc: List<Asked>, site: TaggedSite|
@@ -61,9 +70,12 @@ fn verdict_for(asked: List<Asked>, verdicts: List<Verdict>, site: TaggedSite) ->
       None -> if list_at(asked, i) == Some(asked_of(site)) { list_at(verdicts, i) } else { None },
     })
 
-/// How many bytes of `src` spell the character at `i`: an escape is one character.
+/// How many bytes of `src` spell the character at `i`: an escape is one character, and so is a
+/// brace, which a tagged literal's text writes twice.
 fn spelled_width(src: Bytes, i: Int, end: Int) -> Int / {abort.raise} =
-  if bytes_at(src, i) != 92 || i + 1 >= end { utf8_len(bytes_at(src, i)) }
+  if i + 1 >= end { utf8_len(bytes_at(src, i)) }
+  else if bytes_at(src, i) == 123 || bytes_at(src, i) == 125 { 2 }
+  else if bytes_at(src, i) != 92 { utf8_len(bytes_at(src, i)) }
   else if bytes_at(src, i + 1) != 117 { 2 } else {
     iterate(i + 2, end - i, |j: Int|
       if j >= end { Stop(end - i) }
@@ -71,9 +83,9 @@ fn spelled_width(src: Bytes, i: Int, end: Int) -> Int / {abort.raise} =
       else { Continue(j + 1) })
   }
 
-/// Where character `offset` of the text a string literal spells is written: `quoted` is the literal,
-/// quotes included, and the character past the last is its closing quote. Nowhere for an offset the
-/// text does not have.
+/// Where character `offset` of a text of a tagged literal is written: `quoted` is the text with
+/// what opens and closes it, a quote or the brace of a hole, and the character past the last is
+/// what closes it. Nowhere for an offset the text does not have.
 pub fn spelled_at(src: Bytes, quoted: Span, offset: Int) -> Option<Span> / {abort.raise} = {
   let end = quoted.end - 1;
   if offset < 0 || quoted.start + 1 > end || quoted.end > bytes_len(src) { None } else {
@@ -91,18 +103,57 @@ pub fn spelled_at(src: Bytes, quoted: Span, offset: Int) -> Option<Span> / {abor
   }
 }
 
-fn spelled(site: TaggedSite) -> Bytes = bytes_concat_all([b"`", site.tag, b"::literal`"])
+fn holed(site: TaggedSite) -> Bool = len(site.parts) > 1
+
+fn spelled(site: TaggedSite) -> Bytes =
+  bytes_concat_all([b"`", site.tag, if holed(site) { b"::compile`" } else { b"::literal`" }])
 
 fn ran(site: TaggedSite) -> Bytes =
-  bytes_concat_all([
-    b"the check ran `",
-    site.callee,
-    b"` on the text, as every `",
-    site.tag,
-    b"\"..\"` here is the call `",
-    site.tag,
-    b"::literal(\"..\")`",
-  ])
+  if holed(site) {
+    bytes_concat_all([
+      b"the check ran `",
+      site.callee,
+      b"` on the texts around the holes, as every `",
+      site.tag,
+      b"\"..{h}..\"` here is `",
+      site.tag,
+      b"::fill` called on what `",
+      site.tag,
+      b"::compile([\"..\", \"..\"])` answers and on its holes",
+    ])
+  } else {
+    bytes_concat_all([
+      b"the check ran `",
+      site.callee,
+      b"` on the text, as every `",
+      site.tag,
+      b"\"..\"` here is the call `",
+      site.tag,
+      b"::literal(\"..\")`",
+    ])
+  }
+
+/// The literal's string, quotes included.
+fn string_of(site: TaggedSite) -> Span =
+  match ((list_at(site.parts, 0), list_at(site.parts, len(site.parts) - 1))) {
+    (Some(first), Some(last)) -> { start: first.quoted.start, end: last.quoted.end },
+    _ -> site.span,
+  }
+
+/// Where a parser's refusal lands: the character it names in the text it names, the whole hole
+/// for the offset just past a text a hole follows, and the whole string for a place it has not.
+fn refused_at(src: Bytes, site: TaggedSite, part: Int, offset: Int) -> Span / {abort.raise} =
+  match list_at(site.parts, part) {
+    None -> string_of(site),
+    Some(text) -> match spelled_at(src, text.quoted, offset) {
+      None -> string_of(site),
+      Some(span) -> match list_at(site.parts, part + 1) {
+        Some(next) -> if span.start != text.quoted.end - 1 { span }
+        else { { start: span.start, end: next.quoted.start + 1 } },
+        None -> span,
+      },
+    },
+  }
 
 fn refusal(
   places: List<Place>,
@@ -113,15 +164,11 @@ fn refusal(
     Accepted -> None,
     Rejected(why) -> {
       let src = match list_at(places, site.module) { Some(place) -> place.text, None -> b"" };
-      let spot = match spelled_at(src, site.quoted, why.offset) {
-        Some(span) -> span,
-        None -> site.quoted,
-      };
       Some(
         error_at(
           b"E0153",
           site.module,
-          spot,
+          refused_at(src, site, why.part, why.offset),
           bytes_concat(spelled(site), b" refuses this literal"),
           bytes_of_string(why.message),
           [ran(site)],
@@ -199,7 +246,11 @@ fn verdict_of(called: Called) -> Verdict / {abort.raise} =
               field_named(fields, "message"),
             )) {
             (Some(VInt(offset)), Some(VStr(message))) ->
-              Rejected({ offset: offset, message: message }),
+              Rejected({
+                part: match field_named(fields, "part") { Some(VInt(part)) -> part, _ -> 0 },
+                offset: offset,
+                message: message,
+              }),
             _ -> Raised("it answered " ++ render(value)),
           },
           _ -> Raised("it answered " ++ render(value)),
@@ -208,6 +259,11 @@ fn verdict_of(called: Called) -> Verdict / {abort.raise} =
       _ -> Raised("it answered " ++ render(value)),
     },
   }
+
+fn handed(a: Asked) -> Value = {
+  let texts = map(a.parts, |text: Bytes| VStr(string_of_bytes_lossy(text)));
+  match texts { [text] -> text, _ -> VList(texts) }
+}
 
 fn callees(asked: List<Asked>) -> List<Bytes> =
   fold(asked, [], |acc: List<Bytes>, a: Asked|
@@ -238,11 +294,7 @@ fn entered(
           Ok(_) ->
             Ok(
               map(asked, |a: Asked|
-                verdict_of(
-                  machine.call[literals](string_of_bytes_lossy(a.callee), [
-                    VStr(string_of_bytes_lossy(a.text)),
-                  ]),
-                )),
+                verdict_of(machine.call[literals](string_of_bytes_lossy(a.callee), [handed(a)]))),
             ),
         },
       };
@@ -253,7 +305,7 @@ fn entered(
 }
 
 /// What a verdict is a function of: the toolchain that ran the parser, the budget, the parser by
-/// the hash of all it reaches, and the text.
+/// the hash of all it reaches, and the texts.
 fn verdict_key(stamp: String, version: String, a: Asked) -> Bytes / {abort.raise} =
   hex(
     blake3(
@@ -264,7 +316,8 @@ fn verdict_key(stamp: String, version: String, a: Asked) -> Bytes / {abort.raise
         sized(bytes_of_string(version)),
         sized(bytes_of_string(int_to_string(step_budget()))),
         sized(a.hash),
-        sized(a.text),
+        sized(bytes_of_string(int_to_string(len(a.parts)))),
+        bytes_concat_all(map(a.parts, sized)),
       ]),
     ),
   )
@@ -333,9 +386,8 @@ fn a_site(text: Bytes) -> TaggedSite =
   {
     module: 0,
     span: { start: 0, end: 5 + bytes_len(text) },
-    quoted: { start: 3, end: 5 + bytes_len(text) },
     tag: b"hex",
-    text: text,
+    parts: [{ text: text, quoted: { start: 3, end: 5 + bytes_len(text) } }],
     callee: b"hex.literal",
     hash: b"h",
   }
@@ -351,7 +403,13 @@ test "a character of a literal's text is placed where its source spells it" {
   // One past the text is its closing quote, where a text that ends too soon is refused.
   assert_eq(spelled_at(src, quoted, 5), Some({ start: 16, end: 17 }));
   assert_eq(spelled_at(src, quoted, 6), None);
-  assert_eq(spelled_at(src, quoted, 0 - 1), None)
+  assert_eq(spelled_at(src, quoted, 0 - 1), None);
+  // A brace of the text is written twice, and is one character of it.
+  let braced = b"hex\"a{{}}z\"";
+  let all = { start: 3, end: bytes_len(braced) };
+  assert_eq(spelled_at(braced, all, 1), Some({ start: 5, end: 7 }));
+  assert_eq(spelled_at(braced, all, 2), Some({ start: 7, end: 9 }));
+  assert_eq(spelled_at(braced, all, 3), Some({ start: 9, end: 10 }))
 }
 
 test "a parser's answer is read as its verdict, and a spent budget is told from a raise" {
@@ -363,7 +421,19 @@ test "a parser's answer is read as its verdict, and a spent budget is told from 
         VRecord([{ name: "message", value: VStr("odd") }, { name: "offset", value: VInt(2) }]),
       ]),
     ),
-    Rejected({ offset: 2, message: "odd" }),
+    Rejected({ part: 0, offset: 2, message: "odd" }),
+  );
+  assert_eq(
+    answered(
+      VCtor("Err", [
+        VRecord([
+          { name: "message", value: VStr("odd") },
+          { name: "offset", value: VInt(2) },
+          { name: "part", value: VInt(1) },
+        ]),
+      ]),
+    ),
+    Rejected({ part: 1, offset: 2, message: "odd" }),
   );
   assert_eq(answered(VInt(1)), Raised("it answered 1"))
 }
@@ -381,19 +451,46 @@ test "a refused literal is placed inside its text, and one past it at the whole 
     };
   assert_eq(labelled(Accepted), None);
   assert_eq(
-    labelled(Rejected({ offset: 2, message: "not a hex digit" })),
+    labelled(Rejected({ part: 0, offset: 2, message: "not a hex digit" })),
     Some({ code: b"E0153", start: 6, end: 7 }),
   );
   assert_eq(
-    labelled(Rejected({ offset: 40, message: "too short" })),
+    labelled(Rejected({ part: 0, offset: 40, message: "too short" })),
     Some({ code: b"E0153", start: 3, end: 8 }),
   );
   assert_eq(labelled(Spent), Some({ code: b"E0154", start: 0, end: 8 }));
   assert_eq(labelled(Raised("boom")), Some({ code: b"E0154", start: 0, end: 8 }))
 }
 
+test "a refusal of a literal with holes is placed in the text it names, or on the hole after it" {
+  let src = b"sh\"ab {x} cd{y}\"";
+  let site = {
+    module: 0,
+    span: { start: 0, end: bytes_len(src) },
+    tag: b"sh",
+    parts: [
+      { text: b"ab ", quoted: { start: 2, end: 7 } },
+      { text: b" cd", quoted: { start: 8, end: 13 } },
+      { text: b"", quoted: { start: 14, end: 16 } },
+    ],
+    callee: b"sh.compile",
+    hash: b"h",
+  };
+  assert_eq(refused_at(src, site, 0, 1), { start: 4, end: 5 });
+  assert_eq(refused_at(src, site, 1, 2), { start: 11, end: 12 });
+  // Just past a text is the hole that follows it, braces and all, or the closing quote.
+  assert_eq(refused_at(src, site, 0, 3), { start: 6, end: 9 });
+  assert_eq(refused_at(src, site, 1, 3), { start: 12, end: 15 });
+  assert_eq(refused_at(src, site, 2, 0), { start: 15, end: 16 });
+  // A text or a character the literal has not is the whole string.
+  assert_eq(refused_at(src, site, 3, 0), { start: 2, end: 16 });
+  assert_eq(refused_at(src, site, 1, 9), { start: 2, end: 16 });
+  assert_eq(handed(asked_of(site)), VList([VStr("ab "), VStr(" cd"), VStr("")]));
+  assert_eq(handed(asked_of(a_site(b"ab"))), VStr("ab"))
+}
+
 test "verdicts kept come back in the order they were sought, the rest from what was found" {
-  let a: Asked = { callee: b"m.literal", hash: b"h", text: b"a" };
+  let a: Asked = { callee: b"m.literal", hash: b"h", parts: [b"a"] };
   let sought = [
     { asked: a, key: b"1", kept: None },
     { asked: a, key: b"2", kept: Some(Accepted) },
@@ -403,11 +500,20 @@ test "verdicts kept come back in the order they were sought, the rest from what 
 }
 
 test "a verdict is kept under the toolchain, the parser's hash and the text" {
-  let a: Asked = { callee: b"m.literal", hash: b"h", text: b"a" };
+  let a: Asked = { callee: b"m.literal", hash: b"h", parts: [b"a"] };
   let key = verdict_key("b3:a", "0.1.0", a);
   assert_eq(verdict_key("b3:a", "0.1.0", { ..a, callee: b"n.literal" }), key);
   assert(verdict_key("b3:b", "0.1.0", a) != key);
   assert(verdict_key("b3:a", "0.2.0", a) != key);
   assert(verdict_key("b3:a", "0.1.0", { ..a, hash: b"g" }) != key);
-  assert(verdict_key("b3:a", "0.1.0", { ..a, text: b"b" }) != key)
+  assert(verdict_key("b3:a", "0.1.0", { ..a, parts: [b"b"] }) != key);
+  // The texts around a hole are not the one text they would join to.
+  assert(
+    verdict_key("b3:a", "0.1.0", { ..a, parts: [b"a", b"b"] })
+      != verdict_key("b3:a", "0.1.0", { ..a, parts: [b"ab"] }),
+  );
+  assert(
+    verdict_key("b3:a", "0.1.0", { ..a, parts: [b"a", b"b"] })
+      != verdict_key("b3:a", "0.1.0", { ..a, parts: [b"ab", b""] }),
+  )
 }
