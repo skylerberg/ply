@@ -1,11 +1,35 @@
-//! What a program wants over a `Map<k, v>` and the prelude does not carry.
+//! What a program wants over a `Map<k, v>`: the prelude's `map_` builtins under the module's name
+//! (`map::get(m, key)` rather than `map_get(m, key)`), and what is written over them.
 //!
-//! The prelude has the operations as `map_`-prefixed builtins; this is those under the module's name
-//! (`map.get(m, key)` rather than `map_get(m, key)`), with the few that are a composition (`size`,
-//! `get_or`) and the names a caller reaches for (`contains`, `keys`, `entries`). Every signature
-//! carries `where derivable(ord, k)`, as the builtins do, and every answer comes back in the map's key
-//! order. The effectful folds, `map_fold` and `map_update`, stay in the prelude: a wrapper's signature
-//! closes the effect row, and a fold that could not perform an effect would not be the prelude's.
+//! A map holds its entries in the order `compare` gives its keys, so every answer here comes back
+//! in key order, two maps of the same entries are `==` however each was built, and a key of a type
+//! that states a `key` is found through it. Every signature carries `where derivable(ord, k)`, as a
+//! `Map`'s key must.
+//!
+//! `first`, `last`, `floor`, `ceiling`, `below`, `above`, `pop_first`, `pop_last`, `split` and
+//! `between` each walk one path of the map's tree, a few nodes however many entries it holds;
+//! `range` walks one path and then the entries it answers. A map nothing else holds is written
+//! where it stands, by `pop_first` and `split` as by `insert`; one something else holds is left
+//! whole, and the answer shares all of it but the path. A record still to be read is such a holder,
+//! so a loop that pops hands `rest` on as an argument of its own, or binds whatever else it keeps
+//! of the record that holds the map before it pops.
+//!
+//! `merge`, `merge_with`, `union`, `intersection` and `difference` walk the smaller of their two
+//! maps and look each of its keys up in the larger. `merge_by` and `diff` walk both.
+//!
+//! A module that imports `map`, `filter`, `fold`, `range` or `floor` from here by name hides the
+//! prelude's function of that name; reached as `map::fold` they hide nothing.
+
+import std.laws (agrees)
+import std.list as list
+
+/// One end of a range of keys: the key itself counted, the key left out, or no end at all.
+pub type Bound<k> = | Included(k) | Excluded(k) | Unbounded
+
+/// The map with no entries.
+pub fn empty<k, v>() -> Map<k, v>
+  where derivable(ord, k)
+= map_new()
 
 /// Whether the map holds no keys.
 pub fn is_empty<k, v>(m: Map<k, v>) -> Bool
@@ -42,10 +66,140 @@ pub fn remove<k, v>(m: Map<k, v>, key: k) -> Map<k, v>
   where derivable(ord, k)
 = map_remove(m, key)
 
+/// `m` with `f` of the value under `key` in its place; a key that is absent is the map itself. `f`
+/// is handed the value alone, so where nothing else holds the map it may update the value in place.
+pub fn update<k, v | e>(m: Map<k, v>, key: k, f: (v) -> v / e) -> Map<k, v> / e
+  where derivable(ord, k)
+= map_update(m, key, f)
+
+/// `m` with what `f` makes of the value under `key`: it is handed `Some` of the value, or `None`
+/// where the key is absent, and answers the value to hold, or `None` to hold none. One call
+/// inserts, replaces or removes.
+pub fn alter<k, v | e>(m: Map<k, v>, key: k, f: (Option<v>) -> Option<v> / e) -> Map<k, v> / e
+  where derivable(ord, k)
+=
+  match map_get(m, key) {
+    None -> match f(None) { Some(value) -> map_insert(m, key, value), None -> m },
+    Some(held) -> {
+      let rest = map_remove(m, key);
+      match f(Some(held)) { Some(value) -> map_insert(rest, key, value), None -> rest }
+    },
+  }
+
 /// The two maps together; a key in both takes `b`'s value.
 pub fn merge<k, v>(a: Map<k, v>, b: Map<k, v>) -> Map<k, v>
   where derivable(ord, k)
 = map_merge(a, b)
+
+/// The two maps together; a key in both holds `f` of `a`'s value and `b`'s.
+pub fn merge_with<k, v | e>(a: Map<k, v>, b: Map<k, v>, f: (v, v) -> v / e) -> Map<k, v> / e
+  where derivable(ord, k)
+=
+  if map_len(b) <= map_len(a) {
+    map_fold(b, a, |acc: Map<k, v>, key: k, theirs: v|
+      match map_get(acc, key) {
+        Some(ours) -> map_insert(acc, key, f(ours, theirs)),
+        None -> map_insert(acc, key, theirs),
+      })
+  } else {
+    map_fold(a, b, |acc: Map<k, v>, key: k, ours: v|
+      match map_get(acc, key) {
+        Some(theirs) -> map_insert(acc, key, f(ours, theirs)),
+        None -> map_insert(acc, key, ours),
+      })
+  }
+
+/// What `f` makes of every key either map holds: it is handed the key with `Some` of each map's
+/// value under it, or `None` where that map has none, and answers the value to hold, or `None` to
+/// leave the key out. The two maps may hold values of different types.
+pub fn merge_by<k, a, b, c | e>(
+  left: Map<k, a>,
+  right: Map<k, b>,
+  f: (k, Option<a>, Option<b>) -> Option<c> / e,
+) -> Map<k, c> / e
+  where derivable(ord, k)
+= map_of_entries(zipped(map_entries(left), 0, map_entries(right), 0, f, []))
+
+fn zipped<k, a, b, c | e>(
+  ls: List<{ key: k, value: a }>,
+  i: Int,
+  rs: List<{ key: k, value: b }>,
+  j: Int,
+  f: (k, Option<a>, Option<b>) -> Option<c> / e,
+  out: List<{ key: k, value: c }>,
+) -> List<{ key: k, value: c }> / e
+  where derivable(ord, k)
+=
+  match list_at(ls, i) {
+    None -> match list_at(rs, j) {
+      None -> out,
+      Some(r) -> zipped(ls, i, rs, j + 1, f, held(out, r.key, f(r.key, None, Some(r.value)))),
+    },
+    Some(l) -> match list_at(rs, j) {
+      None -> zipped(ls, i + 1, rs, j, f, held(out, l.key, f(l.key, Some(l.value), None))),
+      Some(r) -> match compare(l.key, r.key) {
+        Less -> zipped(ls, i + 1, rs, j, f, held(out, l.key, f(l.key, Some(l.value), None))),
+        Greater -> zipped(ls, i, rs, j + 1, f, held(out, r.key, f(r.key, None, Some(r.value)))),
+        Equal ->
+          zipped(ls, i + 1, rs, j + 1, f, held(out, l.key, f(l.key, Some(l.value), Some(r.value)))),
+      },
+    },
+  }
+
+fn held<k, v>(
+  out: List<{ key: k, value: v }>,
+  key: k,
+  value: Option<v>,
+) -> List<{ key: k, value: v }> =
+  match value { Some(value) -> push(out, { key: key, value: value }), None -> out }
+
+/// Every key either map holds; a key in both keeps `a`'s value.
+pub fn union<k, v>(a: Map<k, v>, b: Map<k, v>) -> Map<k, v>
+  where derivable(ord, k)
+= map_merge(b, a)
+
+/// The entries of `a` whose keys `b` holds too.
+pub fn intersection<k, v, w>(a: Map<k, v>, b: Map<k, w>) -> Map<k, v>
+  where derivable(ord, k)
+=
+  if map_len(a) <= map_len(b) { filter(a, |key: k, _value: v| map_contains(b, key)) } else {
+    map_of_entries(
+      map_fold(b, [], |acc: List<{ key: k, value: v }>, key: k, _theirs: w|
+        match map_floor(a, key) {
+          Some(ours) -> if ours.key == key { push(acc, ours) } else { acc },
+          None -> acc,
+        }),
+    )
+  }
+
+/// The entries of `a` whose keys `b` does not hold.
+pub fn difference<k, v, w>(a: Map<k, v>, b: Map<k, w>) -> Map<k, v>
+  where derivable(ord, k)
+=
+  if map_len(b) < map_len(a) {
+    map_fold(b, a, |acc: Map<k, v>, key: k, _theirs: w| map_remove(acc, key))
+  } else { filter(a, |key: k, _value: v| !map_contains(b, key)) }
+
+/// What changed from `before` to `after`: the entries only `after` holds, the entries only `before`
+/// holds, and for each key whose value differs, the two values.
+pub fn diff<k, v>(
+  before: Map<k, v>,
+  after: Map<k, v>,
+) -> { added: Map<k, v>, removed: Map<k, v>, changed: Map<k, { before: v, after: v }> }
+  where derivable(ord, k)
+=
+  {
+    added: difference(after, before),
+    removed: difference(before, after),
+    changed: merge_by(before, after, |_key: k, was: Option<v>, is: Option<v>|
+      match was {
+        None -> None,
+        Some(x) -> match is {
+          None -> None,
+          Some(y) -> if x == y { None } else { Some({ before: x, after: y }) },
+        },
+      }),
+  }
 
 /// The keys, in order.
 pub fn keys<k, v>(m: Map<k, v>) -> List<k>
@@ -67,7 +221,227 @@ pub fn from_entries<k, v>(entries: List<{ key: k, value: v }>) -> Map<k, v>
   where derivable(ord, k)
 = map_of_entries(entries)
 
+/// A map of the pairs; a key that comes again holds `f` of the value it held and the later one.
+pub fn from_entries_with<k, v | e>(
+  entries: List<{ key: k, value: v }>,
+  f: (v, v) -> v / e,
+) -> Map<k, v> / e
+  where derivable(ord, k)
+= gathered(entries, 0, map_new(), f)
+
+fn gathered<k, v | e>(
+  entries: List<{ key: k, value: v }>,
+  i: Int,
+  acc: Map<k, v>,
+  f: (v, v) -> v / e,
+) -> Map<k, v> / e
+  where derivable(ord, k)
+=
+  match list_at(entries, i) {
+    None -> acc,
+    Some(entry) ->
+      gathered(
+        entries,
+        i + 1,
+        match map_get(acc, entry.key) {
+          Some(earlier) -> map_insert(acc, entry.key, f(earlier, entry.value)),
+          None -> map_insert(acc, entry.key, entry.value),
+        },
+        f,
+      ),
+  }
+
+/// The elements of `xs` under what `key_of` answers for each, those of one key in the order they
+/// came.
+pub fn group_by<a, k | e>(xs: List<a>, key_of: (a) -> k / e) -> Map<k, List<a>> / e
+  where derivable(ord, k)
+= grouped(xs, 0, map_new(), key_of)
+
+fn grouped<a, k | e>(
+  xs: List<a>,
+  i: Int,
+  acc: Map<k, List<a>>,
+  key_of: (a) -> k / e,
+) -> Map<k, List<a>> / e
+  where derivable(ord, k)
+=
+  match list_at(xs, i) {
+    None -> acc,
+    Some(x) -> {
+      let key = key_of(x);
+      grouped(
+        xs,
+        i + 1,
+        if map_contains(acc, key) { map_update(acc, key, |group: List<a>| push(group, x)) }
+        else { map_insert(acc, key, [x]) },
+        key_of,
+      )
+    },
+  }
+
+/// What `f` makes of `init` and each entry in turn, in key order.
+pub fn fold<k, v, a | e>(m: Map<k, v>, init: a, f: (a, k, v) -> a / e) -> a / e
+  where derivable(ord, k)
+= map_fold(m, init, f)
+
+/// The map with `f` of each value under its key.
+pub fn map<k, v, w | e>(m: Map<k, v>, f: (v) -> w / e) -> Map<k, w> / e
+  where derivable(ord, k)
+=
+  map_of_entries(
+    map_fold(m, [], |acc: List<{ key: k, value: w }>, key: k, value: v|
+      push(acc, { key: key, value: f(value) })),
+  )
+
+/// The entries `keep` answers true for.
+pub fn filter<k, v | e>(m: Map<k, v>, keep: (k, v) -> Bool / e) -> Map<k, v> / e
+  where derivable(ord, k)
+=
+  map_of_entries(
+    map_fold(m, [], |acc: List<{ key: k, value: v }>, key: k, value: v|
+      if keep(key, value) { push(acc, { key: key, value: value }) } else { acc }),
+  )
+
+/// The entries `ok` answers true for, and the rest.
+pub fn partition<k, v | e>(
+  m: Map<k, v>,
+  ok: (k, v) -> Bool / e,
+) -> { yes: Map<k, v>, no: Map<k, v> } / e
+  where derivable(ord, k)
+= {
+  let parted = map_fold(
+    m,
+    { yes: [], no: [] },
+    |acc: { yes: List<{ key: k, value: v }>, no: List<{ key: k, value: v }> }, key: k, value: v|
+      if ok(key, value) { { yes: push(acc.yes, { key: key, value: value }), no: acc.no } }
+      else { { yes: acc.yes, no: push(acc.no, { key: key, value: value }) } },
+  );
+  { yes: map_of_entries(parted.yes), no: map_of_entries(parted.no) }
+}
+
+/// How many entries `ok` answers true for.
+pub fn count<k, v | e>(m: Map<k, v>, ok: (k, v) -> Bool / e) -> Int / e
+  where derivable(ord, k)
+= map_fold(m, 0, |n: Int, key: k, value: v| if ok(key, value) { n + 1 } else { n })
+
+/// Whether `ok` answers true for an entry. The empty map is `false`.
+pub fn any<k, v | e>(m: Map<k, v>, ok: (k, v) -> Bool / e) -> Bool / e
+  where derivable(ord, k)
+= map_fold(m, false, |found: Bool, key: k, value: v| found || ok(key, value))
+
+/// Whether `ok` answers true for every entry. The empty map is `true`.
+pub fn all<k, v | e>(m: Map<k, v>, ok: (k, v) -> Bool / e) -> Bool / e
+  where derivable(ord, k)
+= map_fold(m, true, |so_far: Bool, key: k, value: v| so_far && ok(key, value))
+
+/// The entry with the least key, or `None` for the empty map.
+pub fn first<k, v>(m: Map<k, v>) -> Option<{ key: k, value: v }>
+  where derivable(ord, k)
+= map_first(m)
+
+/// The entry with the greatest key, or `None` for the empty map.
+pub fn last<k, v>(m: Map<k, v>) -> Option<{ key: k, value: v }>
+  where derivable(ord, k)
+= map_last(m)
+
+/// The entry with the greatest key at or below `key`.
+pub fn floor<k, v>(m: Map<k, v>, key: k) -> Option<{ key: k, value: v }>
+  where derivable(ord, k)
+= map_floor(m, key)
+
+/// The entry with the least key at or above `key`.
+pub fn ceiling<k, v>(m: Map<k, v>, key: k) -> Option<{ key: k, value: v }>
+  where derivable(ord, k)
+= map_ceiling(m, key)
+
+/// The entry with the greatest key below `key`.
+pub fn below<k, v>(m: Map<k, v>, key: k) -> Option<{ key: k, value: v }>
+  where derivable(ord, k)
+= map_below(m, key)
+
+/// The entry with the least key above `key`.
+pub fn above<k, v>(m: Map<k, v>, key: k) -> Option<{ key: k, value: v }>
+  where derivable(ord, k)
+= map_above(m, key)
+
+/// The entry with the least key and the map without it, or `None` for the empty map.
+pub fn pop_first<k, v>(m: Map<k, v>) -> Option<{ key: k, value: v, rest: Map<k, v> }>
+  where derivable(ord, k)
+= map_pop_first(m)
+
+/// The entry with the greatest key and the map without it, or `None` for the empty map.
+pub fn pop_last<k, v>(m: Map<k, v>) -> Option<{ key: k, value: v, rest: Map<k, v> }>
+  where derivable(ord, k)
+= map_pop_last(m)
+
+/// The entries whose keys lie from `lo` to `hi`, in key order. Bounds that cross hold nothing.
+pub fn range<k, v>(m: Map<k, v>, lo: Bound<k>, hi: Bound<k>) -> List<{ key: k, value: v }>
+  where derivable(ord, k)
+= range_take(m, lo, hi, map_len(m))
+
+/// The first `limit` entries of `range(m, lo, hi)`, none where `limit` is not positive. It walks
+/// no entry past the ones it answers, so a page of a long range costs a page.
+pub fn range_take<k, v>(
+  m: Map<k, v>,
+  lo: Bound<k>,
+  hi: Bound<k>,
+  limit: Int,
+) -> List<{ key: k, value: v }>
+  where derivable(ord, k)
+= map_range(m, bound_key(lo), is_included(lo), bound_key(hi), is_included(hi), limit)
+
+fn bound_key<k>(bound: Bound<k>) -> Option<k> =
+  match bound { Included(key) -> Some(key), Excluded(key) -> Some(key), Unbounded -> None }
+
+fn is_included<k>(bound: Bound<k>) -> Bool = match bound { Included(_) -> true, _ -> false }
+
+/// The map of the entries below `key`, the value under `key`, and the map of the entries above it.
+pub fn split<k, v>(m: Map<k, v>, key: k) -> { below: Map<k, v>, at: Option<v>, above: Map<k, v> }
+  where derivable(ord, k)
+= map_split(m, key)
+
+/// The map of the entries `range(m, lo, hi)` lists. It shares what it can with `m` and walks one
+/// path of the tree for each bound, however many entries lie between them.
+pub fn between<k, v>(m: Map<k, v>, lo: Bound<k>, hi: Bound<k>) -> Map<k, v>
+  where derivable(ord, k)
+= from_bound(to_bound(m, hi), lo)
+
+fn from_bound<k, v>(m: Map<k, v>, lo: Bound<k>) -> Map<k, v>
+  where derivable(ord, k)
+=
+  match lo {
+    Unbounded -> m,
+    Excluded(key) -> map_split(m, key).above,
+    Included(key) -> match map_below(m, key) {
+      Some(under) -> map_split(m, under.key).above,
+      None -> m,
+    },
+  }
+
+fn to_bound<k, v>(m: Map<k, v>, hi: Bound<k>) -> Map<k, v>
+  where derivable(ord, k)
+=
+  match hi {
+    Unbounded -> m,
+    Excluded(key) -> map_split(m, key).below,
+    Included(key) -> match map_above(m, key) {
+      Some(over) -> map_split(m, over.key).below,
+      None -> m,
+    },
+  }
+
 // --- Tests ------------------------------------------------------------------
+
+fn counted(i: Int, n: Int, acc: Map<Int, Int>) -> Map<Int, Int> =
+  if i >= n { acc } else { counted(i + 1, n, map_insert(acc, i, i * 10)) }
+
+/// `i` under `10 * i` for every `i` from zero to below `n`.
+fn numbered(n: Int) -> Map<Int, Int> = counted(0, n, map_new())
+
+fn lettered() -> Map<String, Int> =
+  from_entries([{ key: "d", value: 4 }, { key: "b", value: 2 }, { key: "f", value: 6 }])
+
+fn joined(x: String, y: String) -> String = x ++ "+" ++ y
 
 test "a map holds what was inserted and answers in key order" {
   let m = from_entries([{ key: 2, value: "b" }, { key: 1, value: "a" }]);
@@ -100,3 +474,463 @@ test "insert replaces, remove takes away, and merge prefers the second map" {
   // A later entry for a key wins in `from_entries` too.
   assert_eq(get(from_entries([{ key: 1, value: "a" }, { key: 1, value: "z" }]), 1), Some("z"))
 }
+
+test "update rewrites a value that is there, and alter inserts, replaces or removes" {
+  let m = lettered();
+  assert_eq(get(update(m, "b", |n: Int| n + 40), "b"), Some(42));
+  assert_eq(update(m, "c", |n: Int| n + 40), m);
+  let bumped = |held: Option<Int>| Some(match held { Some(n) -> n + 1, None -> 1 });
+  assert_eq(get(alter(m, "b", bumped), "b"), Some(3));
+  assert_eq(get(alter(m, "c", bumped), "c"), Some(1));
+  assert_eq(keys(alter(m, "b", |_held: Option<Int>| None)), ["d", "f"]);
+  assert_eq(alter(m, "c", |held: Option<Int>| held), m)
+}
+
+test "merge_with hands its function the first map's value and then the second's" {
+  let small = from_entries([{ key: 2, value: "p" }, { key: 9, value: "q" }]);
+  let large = from_entries([
+    { key: 1, value: "a" },
+    { key: 2, value: "b" },
+    { key: 3, value: "c" },
+  ]);
+  assert_eq(entries(merge_with(large, small, joined)), [
+    { key: 1, value: "a" },
+    { key: 2, value: "b+p" },
+    { key: 3, value: "c" },
+    { key: 9, value: "q" },
+  ]);
+  assert_eq(entries(merge_with(small, large, joined)), [
+    { key: 1, value: "a" },
+    { key: 2, value: "p+b" },
+    { key: 3, value: "c" },
+    { key: 9, value: "q" },
+  ]);
+  assert_eq(merge_with(large, empty(), joined), large);
+  assert_eq(merge_with(empty(), large, joined), large)
+}
+
+test "merge_by is asked about a key of either map, with what each holds" {
+  let stock = from_entries([{ key: "nut", value: 3 }, { key: "bolt", value: 5 }]);
+  let prices = from_entries([{ key: "nut", value: "0.10" }, { key: "gear", value: "2.00" }]);
+  let told = merge_by(stock, prices, |name: String, n: Option<Int>, price: Option<String>|
+    match n {
+      None -> Some(name ++ ": none held"),
+      Some(n) -> match price {
+        None -> None,
+        Some(price) -> Some(int_to_string(n) ++ " at " ++ price),
+      },
+    });
+  assert_eq(entries(told), [
+    { key: "gear", value: "gear: none held" },
+    { key: "nut", value: "3 at 0.10" },
+  ])
+}
+
+test "union, intersection and difference keep the first map's values" {
+  let a = from_entries([{ key: 1, value: "a1" }, { key: 2, value: "a2" }, { key: 3, value: "a3" }]);
+  let b = from_entries([{ key: 3, value: 30 }, { key: 4, value: 40 }]);
+  let c = from_entries([{ key: 3, value: "c3" }, { key: 4, value: "c4" }]);
+  assert_eq(entries(union(a, c)), [
+    { key: 1, value: "a1" },
+    { key: 2, value: "a2" },
+    { key: 3, value: "a3" },
+    { key: 4, value: "c4" },
+  ]);
+  assert_eq(entries(intersection(a, b)), [{ key: 3, value: "a3" }]);
+  assert_eq(entries(intersection(b, a)), [{ key: 3, value: 30 }]);
+  assert_eq(entries(difference(a, b)), [{ key: 1, value: "a1" }, { key: 2, value: "a2" }]);
+  assert_eq(entries(difference(b, a)), [{ key: 4, value: 40 }]);
+  assert_eq(difference(a, a), empty());
+  assert_eq(intersection(a, a), a)
+}
+
+test "diff tells what was added, what was removed and what changed" {
+  let before = from_entries([
+    { key: "a", value: 1 },
+    { key: "b", value: 2 },
+    { key: "c", value: 3 },
+  ]);
+  let after = from_entries([
+    { key: "b", value: 2 },
+    { key: "c", value: 30 },
+    { key: "d", value: 4 },
+  ]);
+  let told = diff(before, after);
+  assert_eq(entries(told.added), [{ key: "d", value: 4 }]);
+  assert_eq(entries(told.removed), [{ key: "a", value: 1 }]);
+  assert_eq(entries(told.changed), [{ key: "c", value: { before: 3, after: 30 } }]);
+  let same = diff(before, before);
+  assert(is_empty(same.added) && is_empty(same.removed) && is_empty(same.changed))
+}
+
+test "from_entries_with combines the values of one key in the order they came, and group_by lists them" {
+  let seen = [
+    { key: "b", value: "1" },
+    { key: "a", value: "2" },
+    { key: "b", value: "3" },
+    { key: "b", value: "4" },
+  ];
+  assert_eq(entries(from_entries_with(seen, joined)), [
+    { key: "a", value: "2" },
+    { key: "b", value: "1+3+4" },
+  ]);
+  assert_eq(from_entries_with([], joined), empty());
+  assert_eq(entries(group_by([5, 12, 7, 20, 31], |n: Int| n / 10)), [
+    { key: 0, value: [5, 7] },
+    { key: 1, value: [12] },
+    { key: 2, value: [20] },
+    { key: 3, value: [31] },
+  ])
+}
+
+test "fold, map, filter, partition, count, any and all read every entry in key order" {
+  let m = lettered();
+  assert_eq(
+    fold(m, "", |acc: String, key: String, value: Int| acc ++ key ++ int_to_string(value)),
+    "b2d4f6",
+  );
+  assert_eq(entries(map(m, |n: Int| n * 10)), [
+    { key: "b", value: 20 },
+    { key: "d", value: 40 },
+    { key: "f", value: 60 },
+  ]);
+  assert_eq(keys(filter(m, |key: String, n: Int| key != "d" && n > 2)), ["f"]);
+  let parted = partition(m, |_key: String, n: Int| n < 5);
+  assert_eq(keys(parted.yes), ["b", "d"]);
+  assert_eq(keys(parted.no), ["f"]);
+  assert_eq(count(m, |_key: String, n: Int| n > 2), 2);
+  assert(any(m, |key: String, _n: Int| key == "f"));
+  assert(!any(m, |_key: String, n: Int| n > 6));
+  assert(all(m, |_key: String, n: Int| n % 2 == 0));
+  assert(!all(m, |key: String, _n: Int| key != "f"));
+  assert(!any(empty(), |_key: String, _n: Int| true));
+  assert(all(empty(), |_key: String, _n: Int| false))
+}
+
+fn positive(key: String, value: Int) -> Bool / {abort.raise} = {
+  assert(value > 0, Some(key));
+  true
+}
+
+test "a function handed to a walk may raise, as the walk then may" {
+  let m = lettered();
+  assert(all(m, positive));
+  assert(any(m, positive));
+  assert_eq(count(m, positive), 3);
+  assert_eq(size(filter(m, positive)), 3);
+  assert_eq(size(partition(m, positive).yes), 3);
+  assert_eq(
+    fold(m, 0, |sum: Int, key: String, value: Int|
+      if positive(key, value) { sum + value } else { sum }),
+    12,
+  );
+  assert_eq(values(map(m, |value: Int| if positive("", value) { value + 1 } else { value })), [
+    3,
+    5,
+    7,
+  ])
+}
+
+test "the ends and the neighbours of a key are read off the key order" {
+  let m = lettered();
+  assert_eq(first(m), Some({ key: "b", value: 2 }));
+  assert_eq(last(m), Some({ key: "f", value: 6 }));
+  assert_eq(floor(m, "d"), Some({ key: "d", value: 4 }));
+  assert_eq(floor(m, "e"), Some({ key: "d", value: 4 }));
+  assert_eq(floor(m, "a"), None);
+  assert_eq(ceiling(m, "d"), Some({ key: "d", value: 4 }));
+  assert_eq(ceiling(m, "c"), Some({ key: "d", value: 4 }));
+  assert_eq(ceiling(m, "g"), None);
+  assert_eq(below(m, "d"), Some({ key: "b", value: 2 }));
+  assert_eq(below(m, "b"), None);
+  assert_eq(above(m, "d"), Some({ key: "f", value: 6 }));
+  assert_eq(above(m, "f"), None);
+  let none: Map<String, Int> = empty();
+  assert_eq(first(none), None);
+  assert_eq(last(none), None);
+  assert_eq(floor(none, "a"), None);
+  assert_eq(above(none, "a"), None)
+}
+
+test "a pop answers an end's entry beside the map without it" {
+  let m = lettered();
+  assert_eq(pop_first(m), Some({ key: "b", value: 2, rest: remove(m, "b") }));
+  assert_eq(pop_last(m), Some({ key: "f", value: 6, rest: remove(m, "f") }));
+  let none: Map<String, Int> = empty();
+  assert_eq(pop_first(none), None);
+  assert_eq(pop_last(none), None);
+  assert_eq(
+    pop_first(from_entries([{ key: 1, value: 1 }])),
+    Some({ key: 1, value: 1, rest: empty() }),
+  )
+}
+
+test "a range counts a bound's own key or leaves it out, as the bound says" {
+  let m = numbered(10);
+  let ks = |lo: Bound<Int>, hi: Bound<Int>| keys(between(m, lo, hi));
+  assert_eq(range(m, Included(3), Included(5)), [
+    { key: 3, value: 30 },
+    { key: 4, value: 40 },
+    { key: 5, value: 50 },
+  ]);
+  assert_eq(ks(Included(3), Included(5)), [3, 4, 5]);
+  assert_eq(ks(Excluded(3), Included(5)), [4, 5]);
+  assert_eq(ks(Included(3), Excluded(5)), [3, 4]);
+  assert_eq(ks(Excluded(3), Excluded(5)), [4]);
+  assert_eq(ks(Unbounded, Excluded(2)), [0, 1]);
+  assert_eq(ks(Included(8), Unbounded), [8, 9]);
+  assert_eq(ks(Unbounded, Unbounded), keys(m));
+  assert_eq(ks(Included(5), Included(3)), []);
+  assert_eq(ks(Excluded(4), Excluded(4)), []);
+  assert_eq(ks(Included(4), Included(4)), [4]);
+  assert_eq(ks(Included(-5), Included(100)), keys(m));
+  assert_eq(ks(Included(20), Unbounded), []);
+  assert_eq(range_take(m, Excluded(3), Unbounded, 2), [
+    { key: 4, value: 40 },
+    { key: 5, value: 50 },
+  ]);
+  assert_eq(range_take(m, Unbounded, Unbounded, 0), []);
+  assert_eq(range_take(m, Unbounded, Unbounded, -3), []);
+  assert_eq(len(range_take(m, Unbounded, Unbounded, 99)), 10)
+}
+
+test "a split parts a map at a key it holds or lacks" {
+  let m = numbered(100);
+  let held = split(m, 40);
+  assert_eq(size(held.below), 40);
+  assert_eq(held.at, Some(400));
+  assert_eq(size(held.above), 59);
+  assert_eq(first(held.above), Some({ key: 41, value: 410 }));
+  assert_eq(last(held.below), Some({ key: 39, value: 390 }));
+  let lacked = split(remove(m, 40), 40);
+  assert_eq(size(lacked.below), 40);
+  assert_eq(lacked.at, None);
+  assert_eq(size(lacked.above), 59);
+  let under = split(m, -1);
+  assert(is_empty(under.below));
+  assert_eq(under.above, m);
+  let over = split(m, 100);
+  assert_eq(over.below, m);
+  assert(is_empty(over.above))
+}
+
+test "an ordered query costs the same on a map of a hundred entries and of a hundred thousand" {
+  let cost = |n: Int| {
+    let m = numbered(n);
+    let spent = metered(||
+      {
+        first: first(m),
+        last: last(m),
+        floor: floor(m, n / 2),
+        ceiling: ceiling(m, n / 2),
+        below: below(m, n / 2),
+        above: above(m, n / 2),
+        page: range_take(m, Included(n / 3), Unbounded, 10),
+      });
+    { steps: spent.steps, allocations: spent.allocations }
+  };
+  assert_eq(cost(100), cost(100000));
+  assert(cost(100).allocations <= 40, Some(int_to_string(cost(100).allocations)))
+}
+
+/// The keys popped from the front of `m`, each read once, in a loop that holds the map alone.
+fn drained(m: Map<Int, Int>, left: Int, sum: Int) -> Int =
+  if left <= 0 { sum } else {
+    match pop_first(m) {
+      None -> sum,
+      Some(popped) -> drained(popped.rest, left - 1, sum + popped.key),
+    }
+  }
+
+test "a pop of a map nothing else holds copies none of it" {
+  let cost = |n: Int| {
+    let built = metered(|| size(numbered(n))).allocations;
+    metered(|| drained(numbered(n), n, 0)).allocations - built
+  };
+  // Each pop makes its answer and nothing more: a record and its `Some`.
+  assert_eq(cost(1000), 2 * 1000);
+  assert_eq(cost(4000), 2 * 4000)
+}
+
+test "a split of a map nothing else holds makes a node for each level it cuts" {
+  let cost = |n: Int| {
+    let built = metered(|| size(numbered(n))).allocations;
+    metered(|| size(split(numbered(n), n / 2).below)).allocations - built
+  };
+  assert(cost(100) <= 8, Some(int_to_string(cost(100))));
+  assert(cost(100000) <= 12, Some(int_to_string(cost(100000))))
+}
+
+test "merge_with takes the steps of the smaller map, whichever side it is on" {
+  let small = numbered(8);
+  let steps = |n: Int| {
+    let large = numbered(n);
+    metered(|| size(merge_with(large, small, |x: Int, y: Int| x + y))).steps
+      + metered(|| size(merge_with(small, large, |x: Int, y: Int| x + y))).steps
+  };
+  assert_eq(steps(100), steps(10000))
+}
+
+/// A map and a key, each brought near zero so the key is often one the map holds.
+type Probe = { m: Map<Int, String>, key: Int }
+
+/// A map, two bounds and a limit, brought near zero as a `Probe` is.
+type Window = { m: Map<Int, String>, lo: Bound<Int>, hi: Bound<Int>, limit: Int }
+
+type Pair = { a: Map<Int, String>, b: Map<Int, String> }
+
+/// The map with each key brought within eight of zero, a later entry of a key standing.
+fn near(m: Map<Int, String>) -> Map<Int, String> =
+  map_fold(m, map_new(), |acc: Map<Int, String>, key: Int, value: String|
+    map_insert(acc, key % 8, value))
+
+fn near_bound(bound: Bound<Int>) -> Bound<Int> =
+  match bound {
+    Included(key) -> Included(key % 8),
+    Excluded(key) -> Excluded(key % 8),
+    Unbounded -> Unbounded,
+  }
+
+/// The entries whose keys `ok` keeps, by a walk of every entry.
+fn kept<v>(m: Map<Int, v>, ok: (Int) -> Bool) -> List<{ key: Int, value: v }> =
+  list::partition(map_entries(m), |entry: { key: Int, value: v }| ok(entry.key)).yes
+
+fn within(lo: Bound<Int>, hi: Bound<Int>, key: Int) -> Bool =
+  (match lo { Included(least) -> least <= key, Excluded(least) -> least < key, Unbounded -> true })
+    && (match hi { Included(most) -> key <= most, Excluded(most) -> key < most, Unbounded -> true })
+
+/// `merge_with` over association lists: each entry of `xs` with what `ys` holds under its key, then
+/// what `ys` alone holds, in key order.
+fn merged_lists(
+  xs: List<{ key: Int, value: String }>,
+  ys: List<{ key: Int, value: String }>,
+) -> List<{ key: Int, value: String }> =
+  list::sort_by(
+    list::concat(
+      list::flat_map(xs, |x: { key: Int, value: String }|
+        [
+          match list::find(ys, |y: { key: Int, value: String }| y.key == x.key) {
+            Some(y) -> { key: x.key, value: joined(x.value, y.value) },
+            None -> x,
+          },
+        ]),
+      list::partition(ys, |y: { key: Int, value: String }|
+        !list::any(xs, |x: { key: Int, value: String }| x.key == y.key)).yes,
+    ),
+    |p: { key: Int, value: String }, q: { key: Int, value: String }| p.key <= q.key,
+  )
+
+law "first is the first of the entries" =
+  agrees(|m: Map<Int, String>| first(m), |m: Map<Int, String>| list::first(entries(m)))
+
+law "last is the last of the entries" =
+  agrees(|m: Map<Int, String>| last(m), |m: Map<Int, String>| list::last(entries(m)))
+
+law "floor is the last of the entries at or below the key" =
+  agrees(|q: Probe| floor(near(q.m), q.key % 8), |q: Probe|
+    list::last(kept(near(q.m), |key: Int| key <= q.key % 8)))
+
+law "ceiling is the first of the entries at or above the key" =
+  agrees(|q: Probe| ceiling(near(q.m), q.key % 8), |q: Probe|
+    list::first(kept(near(q.m), |key: Int| key >= q.key % 8)))
+
+law "below is the last of the entries below the key" =
+  agrees(|q: Probe| below(near(q.m), q.key % 8), |q: Probe|
+    list::last(kept(near(q.m), |key: Int| key < q.key % 8)))
+
+law "above is the first of the entries above the key" =
+  agrees(|q: Probe| above(near(q.m), q.key % 8), |q: Probe|
+    list::first(kept(near(q.m), |key: Int| key > q.key % 8)))
+
+law "a range is the entries within its bounds" =
+  agrees(|w: Window| range(near(w.m), near_bound(w.lo), near_bound(w.hi)), |w: Window|
+    kept(near(w.m), |key: Int| within(near_bound(w.lo), near_bound(w.hi), key)))
+
+law "range_take is the first of the range" =
+  agrees(
+    |w: Window| range_take(near(w.m), near_bound(w.lo), near_bound(w.hi), w.limit % 8),
+    |w: Window|
+      list::take(
+        kept(near(w.m), |key: Int| within(near_bound(w.lo), near_bound(w.hi), key)),
+        w.limit % 8,
+      ),
+  )
+
+law "between is the map of the range" =
+  agrees(|w: Window| entries(between(near(w.m), near_bound(w.lo), near_bound(w.hi))), |w: Window|
+    kept(near(w.m), |key: Int| within(near_bound(w.lo), near_bound(w.hi), key)))
+
+law "a split is the entries below the key, the value under it and the entries above it" =
+  agrees(|q: Probe| split(near(q.m), q.key % 8), |q: Probe|
+    {
+      below: from_entries(kept(near(q.m), |key: Int| key < q.key % 8)),
+      at: get(near(q.m), q.key % 8),
+      above: from_entries(kept(near(q.m), |key: Int| key > q.key % 8)),
+    })
+
+law "a split joined again is the map" =
+  agrees(
+    |q: Probe| {
+      let parts = split(near(q.m), q.key % 8);
+      union(parts.below, match parts.at {
+        Some(value) -> insert(parts.above, q.key % 8, value),
+        None -> parts.above,
+      })
+    },
+    |q: Probe| near(q.m),
+  )
+
+law "pop_first is the first entry and the map with its key removed" =
+  agrees(|m: Map<Int, String>| pop_first(m), |m: Map<Int, String>|
+    match first(m) {
+      Some(entry) -> Some({ key: entry.key, value: entry.value, rest: remove(m, entry.key) }),
+      None -> None,
+    })
+
+law "pop_last is the last entry and the map with its key removed" =
+  agrees(|m: Map<Int, String>| pop_last(m), |m: Map<Int, String>|
+    match last(m) {
+      Some(entry) -> Some({ key: entry.key, value: entry.value, rest: remove(m, entry.key) }),
+      None -> None,
+    })
+
+law "merge_with is the merge of the two association lists" =
+  agrees(|p: Pair| entries(merge_with(near(p.a), near(p.b), joined)), |p: Pair|
+    merged_lists(entries(near(p.a)), entries(near(p.b))))
+
+law "merge_by answering the second map's value where it has one is merge" =
+  agrees(
+    |p: Pair|
+      merge_by(near(p.a), near(p.b), |_key: Int, ours: Option<String>, theirs: Option<String>|
+        match theirs { Some(value) -> Some(value), None -> ours }),
+    |p: Pair| merge(near(p.a), near(p.b)),
+  )
+
+law "union, intersection and difference are the entries of the first map the second map says" =
+  agrees(
+    |p: Pair|
+      {
+        union: entries(union(near(p.a), near(p.b))),
+        intersection: entries(intersection(near(p.a), near(p.b))),
+        difference: entries(difference(near(p.a), near(p.b))),
+      },
+    |p: Pair|
+      {
+        union: entries(merge(near(p.b), near(p.a))),
+        intersection: kept(near(p.a), |key: Int| contains(near(p.b), key)),
+        difference: kept(near(p.a), |key: Int| !contains(near(p.b), key)),
+      },
+  )
+
+law "filter keeps the entries a walk of them keeps" =
+  agrees(
+    |m: Map<Int, String>| entries(filter(m, |key: Int, _value: String| key % 2 == 0)),
+    |m: Map<Int, String>| kept(m, |key: Int| key % 2 == 0),
+  )
+
+law "filtering n entries, mapping them and merging them with themselves take n steps"
+  forall (n: Int) where n > 0 cost n {
+    let m = numbered(n);
+    size(filter(m, |key: Int, _value: Int| key % 2 == 0)) + size(map(m, |value: Int| value + 1))
+      + size(merge_with(m, m, |x: Int, _y: Int| x))
+  }

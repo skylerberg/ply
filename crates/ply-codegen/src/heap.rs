@@ -353,6 +353,9 @@ pub struct Layouts {
     width: usize,
     /// The shape of a `{key, value}` entry.
     entry_shape: u32,
+    /// The shapes of a `{key, value, rest}` and of a `{below, at, above}`, interned on first use.
+    popped_shape: std::sync::OnceLock<u32>,
+    split_shape: std::sync::OnceLock<u32>,
     /// Per constructor, what its type's module states its values are compared and shown through;
     /// empty for a unit that states none.
     stated: Box<[(Stated, Stated)]>,
@@ -414,6 +417,8 @@ impl Layouts {
             rows: Box::default(),
             width: 0,
             entry_shape,
+            popped_shape: std::sync::OnceLock::new(),
+            split_shape: std::sync::OnceLock::new(),
             stated: Box::default(),
             numeric: Box::default(),
         }
@@ -456,6 +461,20 @@ impl Layouts {
 
     pub fn entry_shape(&self) -> u32 {
         self.entry_shape
+    }
+
+    /// The shape of what `map_pop_first` answers: `key`, `rest`, `value`, in a record's order.
+    pub fn popped_shape(&self) -> u32 {
+        *self
+            .popped_shape
+            .get_or_init(|| self.shape(["key", "rest", "value"].map(Symbol::new).to_vec()))
+    }
+
+    /// The shape of what `map_split` answers: `above`, `at`, `below`, in a record's order.
+    pub fn split_shape(&self) -> u32 {
+        *self
+            .split_shape
+            .get_or_init(|| self.shape(["above", "at", "below"].map(Symbol::new).to_vec()))
     }
 
     pub fn index_fields(&mut self, names: &[Symbol]) {
@@ -582,7 +601,7 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
             KIND_MLEAF => (*o).layout as usize * 16,
-            KIND_MBRANCH => 2 * map::KEYS * 8,
+            KIND_MBRANCH => map::BRANCH_BYTES,
             KIND_STR | KIND_BYTES => (*o).layout as usize,
             KIND_BRIDGE => BRIDGE_BYTES,
             _ => usize::MAX,
