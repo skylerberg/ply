@@ -122,6 +122,49 @@ pub fn value_of(p: &Plain) -> PlyValue {
     }
 }
 
+/// [`value_of`] of all of `v`, but for each value whose type states a `show`: that is `VShown` of
+/// what the function writes, at whatever depth it sits.
+pub fn shown_of(v: &PlyValue) -> PlyValue {
+    let items = |xs: &mut dyn Iterator<Item = &PlyValue>| {
+        PlyValue::list(grow(|| xs.map(shown_of).collect()))
+    };
+    match v {
+        PlyValue::Ctor { name, args } => match crate::instances::shown(v) {
+            Some(text) => value_ctor("VShown", vec![text]),
+            None => value_ctor(
+                "VCtor",
+                vec![PlyValue::str(name.as_str()), items(&mut args.iter())],
+            ),
+        },
+        PlyValue::List(xs) => value_ctor("VList", vec![items(&mut xs.iter())]),
+        PlyValue::Array(xs) => value_ctor("VArray", vec![items(&mut xs.iter())]),
+        PlyValue::Record(fields) => value_ctor(
+            "VRecord",
+            vec![PlyValue::list(grow(|| {
+                fields
+                    .iter()
+                    .map(|(name, x)| {
+                        record(vec![
+                            ("name", PlyValue::str(name.as_str())),
+                            ("value", shown_of(x)),
+                        ])
+                    })
+                    .collect()
+            }))],
+        ),
+        PlyValue::Map(entries) => value_ctor(
+            "VMap",
+            vec![PlyValue::list(grow(|| {
+                entries
+                    .iter()
+                    .map(|(k, x)| record(vec![("key", shown_of(k)), ("value", shown_of(x))]))
+                    .collect()
+            }))],
+        ),
+        leaf => value_of(&Plain::of(leaf)),
+    }
+}
+
 /// The plain value a `std.value.Value` names; anything else is Ply's fault, since the program's
 /// types say it is one.
 pub fn plain_of(v: &PlyValue, span: Span) -> Result<Plain, Diagnostic> {

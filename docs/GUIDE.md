@@ -113,6 +113,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
+| `key`, `show`, `by` | `key for <Type> by <function>` and `show for <Type> by <function>` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -194,7 +195,8 @@ Loosest to tightest; all binary operators are left-associative:
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
-* `==`/`!=` are structural at every type except functions. `Float` equality is
+* `==`/`!=` are structural at every type except functions, and a type that
+  states a `key` is compared through it (§4.4). `Float` equality is
   IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work on numeric types and on `Char`,
   by scalar value; order anything else with `compare`. Arithmetic on a `Char` is
   `E0201`: go through `int_of_char`.
@@ -218,7 +220,8 @@ Loosest to tightest; all binary operators are left-associative:
 ## 3. Modules and items
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
-`nondet effect`, `effect set`, `test`, `law` and `derive`, in any order.
+`nondet effect`, `effect set`, `test`, `law`, `derive`, `key` and `show`, in any
+order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -483,6 +486,50 @@ type Level = Debug | Info | Warn | Error
 The leading `|` is optional. Constructors are values: `Circle(3)` is a call,
 `Point` a reference. `type Id = Int` (one name, no payload, no `|`) is an alias.
 Sums are the only nominal types: identical sums in two modules differ.
+
+A value is compared, ordered, digested and shown as its constructor and fields
+say, which is wrong for a type that can hold one thing two ways. The module that
+declares a sum may state what its values are read through instead:
+
+```ply
+pub type Deque<a> = | Deque(List<a>, List<a>)   // a front, and a back reversed
+
+key for Deque by to_list       // `==`, `!=`, `compare`, `min`, `max`, `digest`, a `Map`'s keys
+show for Date by written       // `show`, `display`, an interpolated string's hole
+
+pub fn to_list<a>(d: Deque<a>) -> List<a> = ..
+fn written(d: Date) -> String = ..
+```
+
+`key for T by f` names a function of the same module, `f: (T<a, ..>) -> K`. Two
+values of `T` are equal exactly when `f` answers equal keys for them, they order
+as their keys do, and a value's digest is its key's, so the three cannot
+disagree: two deques holding one sequence in different splits are `==`, share a
+`digest` and are one `Map` key. The key is read wherever a `T` sits — in a
+list, a record, a tuple, another sum, a map's key or value, the key of another
+type, or behind a type parameter — and by `assert_eq`, which tells two keyed
+values apart as wholes. `derivable(eq, T)`, `derivable(ord, T)` and
+`derivable(hash, T)` hold exactly when they hold of `K`, whatever `T`'s fields
+are, and `K` is both ordered and hashed (`E0206`). A `match` still reads the
+value as it was built. Each comparison calls `f`, so a key is worth keeping
+cheap.
+
+`show for T by g` names `g: (T<a, ..>) -> String`: `show`, `display` and a hole
+write what `g` answers wherever a `T` is shown, and `derivable(show, T)` holds
+whatever `T` holds. It decides nothing about comparison, `reflect` (§12.1) still
+answers the value as it was built, and a diagnostic prints that.
+
+Both are found by the type alone, with no search, so only the module declaring
+`T` may write them (`E0208`), `T` is a sum and not an alias (`E0217`), and it
+states each at most once (`E0105`). The function is one that module declares
+(`E0101`); it takes one `T`, at the type's own parameters and nothing narrower,
+answers a type over those parameters alone, has no `where` and binds no
+resource label, and its row is empty, since `==` and `show` perform nothing,
+cannot raise and always return (`E0218`). A key that is, or holds, a value of
+its own type would be compared by asking for its key again, and is refused
+where it is stated, through whatever types and keys lie between (`E0219`). A
+type's hash covers the functions it states, so a definition that can hold a
+`T` is re-checked and its tests re-run when either changes.
 
 ### 4.5 Generics
 
@@ -1535,6 +1582,12 @@ A kernel checks each induction from the claim alone before refuting its cases,
 whatever proposed it: the binder it names, a hypothesis strictly below the case
 it proves, and only definitions the checker reads as ending unrolled.
 
+Congruence and injectivity read `==` as what a value's constructors and fields
+say, which a `Float` (`NaN != NaN`) and a type that states a `key` (§4.4) are
+not. A claim that holds a value of either, at any depth, is never `proved`: it
+is run, over every point of a finite domain or over a sample. Under `--reach`
+the place is `float_term` or `keyed_term`.
+
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
 arguments name every binder; where a claim makes a call that fits it, the law
@@ -1668,8 +1721,10 @@ calls. The bound is read from below: the lengths of parameters (`len`,
 and `ilog2` alone or beside sizes of the one length it is of. Steps within the
 bound are `proved`. Anything else, such as another operation, a call of a
 function value with no cost name, a group of definitions calling each other, a
-body another package keeps with no `cost` bound, or an `Int` parameter the steps
-grow with, leaves the clause to the cost law `cost of <name>` (`#2` and on for
+body another package keeps with no `cost` bound, an `Int` parameter the steps
+grow with, or a definition that takes, answers or builds a value of a type that
+states a `key` (§4.4), whose comparisons call it unseen, leaves the clause to
+the cost law `cost of <name>` (`#2` and on for
 later clauses): it makes each parameter of one size `n`, an `Int` being `n` and
 a list, map, string or bytes holding `n` elements made of their index, and a
 function parameter with a cost name a closure of one step, its cost name 1, and
@@ -1731,6 +1786,11 @@ and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
 and `bin` need their module imported (`import std.json`, `import std.bin`), or
 the `derive` is `E0206`; `show` imports `std.show` itself.
 
+A type that states a `key` (§4.4) derives `eq`, `ord` and `hash` from what the
+key answers, and one that states a `show` derives `show` from that function: the
+dictionaries call `==`, `compare`, `digest` and `show`, which read them. `json`
+and `bin` encode the fields as they are.
+
 ## 12. Builtins
 
 In scope everywhere; a module may shadow any except `compare_values` and
@@ -1750,10 +1810,11 @@ authority when this page and it disagree. Only the prelude declares one; an
 | `assert(cond: Bool, message: Option<String> = None) -> Unit` | `E0501` |
 | `assert_eq<a>(actual: a, expected: a) -> Unit` | `E0501` |
 | `panic<a>(message: String) -> a` | raises `message` (§6.8); unanswered, `E0502` |
-| `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
+| `compare<a>(x: a, y: a) -> Ordering` | total order, a keyed type's by its key (§4.4); needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
-| `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
+| `digest<a>(x: a) -> Bytes` | BLAKE3 of the value's canonical encoding, 32 bytes: values `==` calls equal have one digest (`1.50m` and `1.5m`, two orders of one map, two values of a keyed type with one key), and a constructor counts by the name its module declares; needs `derivable(hash, a)` |
 | `reflect<a>(x: a) -> std.value.Value` | the value as data (§13.35); a width below 64 bits the program does not fix reads as its `Int` |
+| `shown<a>(x: a) -> std.value.Value` | as `reflect`, but a value whose type states a `show` (§4.4) is `VShown` of what that function writes, at any depth: what `std.show` renders |
 | `min<a>(a: a, b: a) -> a`, `max` | in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)` |
 | `numeric_of_int<a>(n: Int) -> a` | `n` at the `numeric` type the call is at (§4.5); raises past a width's range, which a literal in `0..=127` never is |
 | `cell_get<a>(c: Cell<a>) -> a` | |
@@ -3127,7 +3188,7 @@ row a wrapper would close.
 ### 13.32 `std.bigint`
 
 ```ply
-pub type BigInt = { negative: Bool, limbs: List<Int> }
+pub type BigInt = | BigInt(Bool, List<Int>)
 pub fn zero() -> BigInt
 pub fn one() -> BigInt
 pub fn is_zero(value: BigInt) -> Bool
@@ -3155,14 +3216,16 @@ pub fn shift_left(value: BigInt, bits: Int) -> BigInt
 pub fn shift_right(value: BigInt, bits: Int) -> BigInt
 ```
 
-Arbitrary precision, where `Int` wraps at `i64`. A value is a sign and base-2^30
-limbs, least significant first, with no high zero limb and with zero positive and
-limbless, so the representation is canonical and `derive eq` is the right
-equality. The base is a power of two so a limb boundary is a bit boundary — shifts
+Arbitrary precision, where `Int` wraps at `i64`. A value is whether it is
+negative and its base-2^30 limbs, least significant first, with no high zero limb
+and with zero positive and limbless, so each number has one representation. The
+base is a power of two so a limb boundary is a bit boundary — shifts
 and bit tests are limb arithmetic, and only the decimal conversions pay for the
-base. `ord` is deliberately **not** derived: the number's order is not the
-record's (with the sign first, `-10` would sort after `-5` by magnitude), so
-`compare` is the ordering.
+base. The numbers' order is not the limbs' (with the sign first, `-10` would sort
+after `-5` by magnitude), so the type states a `key` (§4.4): the language's
+`==`, `compare`, `min`, `max` and `digest` are the numbers', a `BigInt` keys a
+`Map` in numeric order, and `big_int_eq`, `big_int_ord` and `big_int_hash` are
+derived. `compare` is the same order, read off the limbs.
 `of_string` takes an optional sign and refuses anything else, `to_string` is its
 inverse, and `-0` is zero. Division is truncated toward zero — `q` takes the sign
 of `a * b` and `r` the sign of `a`, so `a == q * b + r` and `|r| < |b|` — and a
@@ -3226,7 +3289,7 @@ pub type Value =
   | VFixed(String, U128) | VChar(Char) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
   | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
   | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
-  | VArray(List<Value>) | VChan(Int)
+  | VArray(List<Value>) | VChan(Int) | VShown(String)
 pub type Field = { name: String, value: Value }
 pub type Entry = { key: Value, value: Value }
 pub type Fun =
@@ -3254,9 +3317,12 @@ width holds the bit pattern it reads, with nothing above the width, so `-1i8` is
 `width_of` is how many bits a fixed-width type's name names (`"U8"` is 8), and
 128 for any other name. Only
 a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
-and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
+and `VElided` marks what a diagnostic's snapshot cut short. `VShown` is the text
+a type's own `show` wrote in place of a value (§4.4), which `render` writes as
+it is; only `shown` (§12.1) makes one. `filled` puts each
 value a runtime diagnostic's text names in its place. `order` is the order the
-runtime keeps values in (by kind, then by payload), which is a map's key order,
+runtime keeps values in (by kind, then by payload), which is a map's key order
+where no key is of a type that states a `key`,
 and `map_of` builds a `VMap` in that order, a later entry for a key replacing an
 earlier one.
 
@@ -3325,7 +3391,9 @@ pub fn display<a>(x: a) -> String where derivable(show, a)
 ```
 
 `show` writes any value of a program as `std.value.render_all` does (`reflect`,
-§12.1, is the value as data), and `derive show` (§11) writes what it does.
+§12.1, is the value as data), but for a value whose type states a `show`
+(§4.4), which is written as that function writes it wherever it sits; `derive
+show` (§11) writes what `show` does.
 `display` writes a `String` or a `Char` as itself and anything else as `show`
 does: it is what an interpolated string's holes are (§2.3).
 
@@ -3892,14 +3960,17 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0203` | occurs check |
 | `E0204` | not a function |
 | `E0205` | non-exhaustive match |
-| `E0206` | not derivable, including an unordered `Map` key |
+| `E0206` | not derivable, including an unordered `Map` key and a `key` that is not ordered and hashed |
 | `E0207` | unknown deriver |
-| `E0208` | orphan `derive` |
+| `E0208` | orphan `derive`, `key` or `show` |
 | `E0209` | `/` on `Decimal` |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
 | `E0212` | the alternatives of an or-pattern bind different names |
 | `E0213` | a `let` whose or-pattern can fail has no `else` |
+| `E0217` | a `key` or a `show` for a type that is not nominal |
+| `E0218` | a `key` or a `show` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, or does not only answer |
+| `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |

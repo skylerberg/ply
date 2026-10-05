@@ -353,6 +353,20 @@ pub struct Layouts {
     width: usize,
     /// The shape of a `{key, value}` entry.
     entry_shape: u32,
+    /// Per constructor, what its type's module states its values are compared and shown through;
+    /// empty for a unit that states none.
+    stated: Box<[(Stated, Stated)]>,
+}
+
+/// A function a type's module states its values go through, as a unit holds it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stated {
+    /// The type states none.
+    No,
+    /// It states one, and the unit did not take the function.
+    Absent,
+    /// The address of the function's `(ctx, args)` entry.
+    By(usize),
 }
 
 /// No field at that index.
@@ -397,7 +411,27 @@ impl Layouts {
             rows: Box::default(),
             width: 0,
             entry_shape,
+            stated: Box::default(),
         }
+    }
+
+    /// Each constructor's `key` and `show`, by its index.
+    pub fn state(&mut self, stated: Vec<(Stated, Stated)>) {
+        let none = stated.iter().all(|s| *s == (Stated::No, Stated::No));
+        self.stated = if none { Box::default() } else { stated.into() };
+    }
+
+    /// Whether any type of the unit states a `key` or a `show`.
+    pub fn states_any(&self) -> bool {
+        !self.stated.is_empty()
+    }
+
+    pub fn key(&self, ctor: u32) -> Stated {
+        self.stated.get(ctor as usize).map_or(Stated::No, |s| s.0)
+    }
+
+    pub fn show(&self, ctor: u32) -> Stated {
+        self.stated.get(ctor as usize).map_or(Stated::No, |s| s.1)
     }
 
     pub fn ctor_index(&self, name: &Symbol) -> Option<u32> {
@@ -1128,7 +1162,16 @@ impl Heap {
                     .iter()
                     .map(|(k, v)| (self.to_word(layouts, k), self.to_word(layouts, v)))
                     .collect();
-                self.map_from_sorted(&words)
+                if layouts.states_any() {
+                    // A map made outside this unit's entry is in an order its keys do not decide.
+                    let mut m = self.map_new();
+                    for (k, v) in words {
+                        m = self.map_insert(layouts, m, k, v);
+                    }
+                    m
+                } else {
+                    self.map_from_sorted(&words)
+                }
             }
             Value::Closure(c) => match &c.kind {
                 ClosureKind::Native {
@@ -1902,6 +1945,12 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
             }
             KIND_CTOR => {
                 let (x, y) = (obj(a), obj(b));
+                if let Some((ka, kb)) = crate::rt::keys_of(layouts, a, b) {
+                    let c = cmp_words(layouts, ka, kb);
+                    dec(ka);
+                    dec(kb);
+                    return c;
+                }
                 let by_name = layouts.ctors[(*x).layout as usize]
                     .0
                     .cmp(&layouts.ctors[(*y).layout as usize].0);

@@ -2,46 +2,61 @@
 //
 // An `Int` is `i64` and wraps; this does not. A `BigInt` is a sign and as many 30-bit limbs as the
 // number needs, least significant first, with no high zero limb and with zero a positive number
-// with no limbs at all — so the representation is canonical and `derive eq` is the right equality.
+// with no limbs at all, so each number has one representation.
 // The base is 2^30 rather than 10^9 so a limb boundary is a bit boundary: shifts, bit tests and the
 // binary long division below are all limb arithmetic, and only the decimal conversions pay for the
 // base. Two limbs multiplied are at most 2^60, which is an `Int` with room for the carry.
 //
-// `ord` is deliberately not derived. The number's order is not the record's: with the sign first,
-// `-10` would sort before `-5` by magnitude, and a limb list is little-endian, so its own
-// lexicographic order is no help either. `compare` is the ordering and `derive eq` the equality,
-// which the canonical representation makes correct.
+// The number's order is not its limbs': with the sign first, `-10` would sort before `-5` by
+// magnitude, and a limb list is little-endian, so its own lexicographic order is no help either.
+// So the type states a `key`, which `==`, the language's `compare`, `digest` and a `Map` read in
+// its place, and the limbs stay as the arithmetic wants them.
 
 import std.list (all, drop, reverse, take, at, at_or)
 import std.math
 
-/// The sign, and the magnitude in base-2^30 limbs, least significant first.
-pub type BigInt = { negative: Bool, limbs: List<Int> }
+/// A whole number of any size: whether it is negative, and its magnitude in base-2^30 limbs,
+/// least significant first.
+pub type BigInt = | BigInt(Bool, List<Int>)
+
+key for BigInt by order_key
 
 derive eq for BigInt
+derive ord for BigInt
+derive hash for BigInt
+
+fn limbs_in(value: BigInt) -> List<Int> = match value { BigInt(_, limbs) -> limbs }
+
+// What orders as the numbers do: the sign, the limb count and the limbs from the most significant
+// down, a negative number's count and limbs negated.
+fn order_key(value: BigInt) -> (Int, Int, List<Int>) = {
+  let s = sign(value);
+  let high_first = reverse(limbs_in(value));
+  (s, s * len(high_first), map(high_first, |limb: Int| s * limb))
+}
 
 /// The bits in a limb, and the limb a power of two.
 fn word_bits() -> Int = 30
 fn word_base() -> Int = 1073741824
 
 /// Zero: positive, with no limbs, which is the only representation of it.
-pub fn zero() -> BigInt = { negative: false, limbs: [] }
+pub fn zero() -> BigInt = BigInt(false, [])
 
-pub fn one() -> BigInt = { negative: false, limbs: [1] }
+pub fn one() -> BigInt = BigInt(false, [1])
 
-pub fn is_zero(value: BigInt) -> Bool = len(value.limbs) == 0
+pub fn is_zero(value: BigInt) -> Bool = len(limbs_in(value)) == 0
 
-pub fn is_negative(value: BigInt) -> Bool = value.negative
+pub fn is_negative(value: BigInt) -> Bool = match value { BigInt(negative, _) -> negative }
 
 /// `-1`, `0` or `1`.
 pub fn sign(value: BigInt) -> Int =
-  if is_zero(value) { 0 } else if value.negative { 0 - 1 } else { 1 }
+  if is_zero(value) { 0 } else if is_negative(value) { 0 - 1 } else { 1 }
 
 /// The distance from zero.
-pub fn abs_value(value: BigInt) -> BigInt = { negative: false, limbs: value.limbs }
+pub fn abs_value(value: BigInt) -> BigInt = BigInt(false, limbs_in(value))
 
 pub fn neg(value: BigInt) -> BigInt =
-  if is_zero(value) { value } else { { negative: !value.negative, limbs: value.limbs } }
+  if is_zero(value) { value } else { BigInt(!is_negative(value), limbs_in(value)) }
 
 /// The `Int` as a `BigInt`, whatever its sign. The whole `i64` range is exact, `min_int` included,
 /// because a negative `Int` is read off its decimal spelling rather than negated — `0 - min_int`
@@ -55,11 +70,11 @@ pub fn of_int(n: Int) -> BigInt / {abort.raise} =
 /// `max_int` fits and `min_int` is exact — its magnitude, `2^63`, is one past `max_int` and is the
 /// one value that has to be handed back without ever being an `Int`.
 pub fn to_int(value: BigInt) -> Option<Int> =
-  if compare_limbs(value.limbs, int_limit(value.negative)) == Greater { None }
-  else if compare_limbs(value.limbs, min_magnitude()) == Equal { Some(min_int()) } else {
-    let magnitude = fold(range(0, len(value.limbs)), 0, |acc: Int, i: Int|
-      acc * word_base() + at_or(value.limbs, len(value.limbs) - 1 - i, 0));
-    Some(if value.negative { 0 - magnitude } else { magnitude })
+  if compare_limbs(limbs_in(value), int_limit(is_negative(value))) == Greater { None }
+  else if compare_limbs(limbs_in(value), min_magnitude()) == Equal { Some(min_int()) } else {
+    let magnitude = fold(range(0, len(limbs_in(value))), 0, |acc: Int, i: Int|
+      acc * word_base() + at_or(limbs_in(value), len(limbs_in(value)) - 1 - i, 0));
+    Some(if is_negative(value) { 0 - magnitude } else { magnitude })
   }
 
 /// The largest magnitude an `Int` of this sign can hold.
@@ -72,8 +87,8 @@ fn min_int() -> Int = 0 - 9223372036854775807 - 1
 
 /// The value in decimal, with a leading `-` when negative and no leading zeros otherwise.
 pub fn to_string(value: BigInt) -> String / {abort.raise} = {
-  let sign = if value.negative { "-" } else { "" };
-  sign ++ magnitude_text(value.limbs)
+  let sign = if is_negative(value) { "-" } else { "" };
+  sign ++ magnitude_text(limbs_in(value))
 }
 
 /// The value a decimal spelling names, with an optional sign; `None` for anything else. Leading
@@ -86,14 +101,14 @@ pub fn of_string(text: String) -> Option<BigInt> / {abort.raise} =
     } else { text };
     if string_len(digits) == 0 || !all_digits(digits) { None }
     else if !any_nonzero(digits) { Some(zero()) }
-    else { Some({ negative: negative, limbs: limbs_of_digits(digits) }) }
+    else { Some(BigInt(negative, limbs_of_digits(digits))) }
   }
 
 /// The order of the numbers, by sign first and then by magnitude.
 pub fn compare(a: BigInt, b: BigInt) -> Ordering =
-  if a.negative != b.negative { if a.negative { Less } else { Greater } } else {
-    let magnitude = compare_limbs(a.limbs, b.limbs);
-    if a.negative { flip(magnitude) } else { magnitude }
+  if is_negative(a) != is_negative(b) { if is_negative(a) { Less } else { Greater } } else {
+    let magnitude = compare_limbs(limbs_in(a), limbs_in(b));
+    if is_negative(a) { flip(magnitude) } else { magnitude }
   }
 
 pub fn less_than(a: BigInt, b: BigInt) -> Bool = is_less(compare(a, b))
@@ -102,11 +117,11 @@ pub fn less_than(a: BigInt, b: BigInt) -> Bool = is_less(compare(a, b))
 /// from the larger and keep its sign.
 pub fn add(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
   if is_zero(a) { b }
-  else if is_zero(b) { a }
-  else if a.negative == b.negative { make(a.negative, add_limbs(a.limbs, b.limbs)) }
-  else if compare_limbs(a.limbs, b.limbs) == Greater {
-    make(a.negative, sub_limbs(a.limbs, b.limbs))
-  } else { make(b.negative, sub_limbs(b.limbs, a.limbs)) }
+  else if is_zero(b) { a } else if is_negative(a) == is_negative(b) {
+    make(is_negative(a), add_limbs(limbs_in(a), limbs_in(b)))
+  } else if compare_limbs(limbs_in(a), limbs_in(b)) == Greater {
+    make(is_negative(a), sub_limbs(limbs_in(a), limbs_in(b)))
+  } else { make(is_negative(b), sub_limbs(limbs_in(b), limbs_in(a))) }
 
 pub fn sub(a: BigInt, b: BigInt) -> BigInt / {abort.raise} = add(a, neg(b))
 
@@ -114,14 +129,14 @@ pub fn sub(a: BigInt, b: BigInt) -> BigInt / {abort.raise} = add(a, neg(b))
 /// values add up to, and each partial row carries into the next limb as it goes.
 pub fn mul(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
   if is_zero(a) || is_zero(b) { zero() }
-  else { make(a.negative != b.negative, mul_limbs(a.limbs, b.limbs)) }
+  else { make(is_negative(a) != is_negative(b), mul_limbs(limbs_in(a), limbs_in(b))) }
 
 /// Long division, truncated toward zero: `q` carries the sign of `a * b` and `r` the sign of `a`,
 /// so `a == q * b + r` and `|r| < |b|`. A zero divisor has no quotient and answers `None`.
 pub fn div_mod(a: BigInt, b: BigInt) -> Option<{ q: BigInt, r: BigInt }> / {abort.raise} =
   if is_zero(b) { None } else {
-    let split = div_mod_limbs(a.limbs, b.limbs);
-    Some({ q: make(a.negative != b.negative, split.q), r: make(a.negative, split.r) })
+    let split = div_mod_limbs(limbs_in(a), limbs_in(b));
+    Some({ q: make(is_negative(a) != is_negative(b), split.q), r: make(is_negative(a), split.r) })
   }
 
 pub fn div(a: BigInt, b: BigInt) -> Option<BigInt> / {abort.raise} =
@@ -135,8 +150,9 @@ pub fn modulo(a: BigInt, b: BigInt) -> Option<BigInt> / {abort.raise} =
 pub fn floor_mod(a: BigInt, b: BigInt) -> Option<BigInt> / {abort.raise} =
   match div_mod(a, b) {
     None -> None,
-    Some(split) -> if split.r.negative != b.negative && !is_zero(split.r) { Some(add(split.r, b)) }
-    else { Some(split.r) },
+    Some(split) -> if is_negative(split.r) != is_negative(b) && !is_zero(split.r) {
+      Some(add(split.r, b))
+    } else { Some(split.r) },
   }
 
 /// `base` to `exponent`, by squaring. A negative exponent is one, as integer arithmetic has it.
@@ -152,16 +168,16 @@ pub fn mod_pow(base: BigInt, exponent: Int, modulus: BigInt) -> Option<BigInt> /
 
 /// The greatest common divisor, never negative; `gcd(0, 0)` is `0`.
 pub fn gcd(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
-  gcd_from(abs_value(a), abs_value(b), 2 * bits_above(b.limbs) + 2)
+  gcd_from(abs_value(a), abs_value(b), 2 * bits_above(limbs_in(b)) + 2)
 
 /// The value shifted left by `bits`; a non-positive count is the value itself.
 pub fn shift_left(value: BigInt, bits: Int) -> BigInt / {abort.raise} =
   if bits <= 0 || is_zero(value) { value }
-  else { make(value.negative, shift_limbs(value.limbs, bits)) }
+  else { make(is_negative(value), shift_limbs(limbs_in(value), bits)) }
 
 /// The value shifted right by `bits`, truncating toward zero like the division it is.
 pub fn shift_right(value: BigInt, bits: Int) -> BigInt / {abort.raise} =
-  if bits <= 0 { value } else { make(value.negative, unshift_limbs(value.limbs, bits)) }
+  if bits <= 0 { value } else { make(is_negative(value), unshift_limbs(limbs_in(value), bits)) }
 
 // --- The magnitude ----------------------------------------------------------
 
@@ -207,7 +223,7 @@ fn any_nonzero(text: String) -> Bool / {abort.raise} =
 /// and no negative zero.
 fn make(negative: Bool, limbs: List<Int>) -> BigInt = {
   let trimmed = trim_high(limbs);
-  if len(trimmed) == 0 { zero() } else { { negative: negative, limbs: trimmed } }
+  if len(trimmed) == 0 { zero() } else { BigInt(negative, trimmed) }
 }
 
 fn trim_high(limbs: List<Int>) -> List<Int> = trim_from(limbs, len(limbs))
@@ -612,4 +628,29 @@ test "shifts and bit lengths agree with powers of two" {
   assert_eq(shift_left(of_int(0), 100), zero());
   // Every shift of a power of two is the power again.
   assert(all(range(0, 64), |k: Int| shift_right(shift_left(of_int(1), k), k) == of_int(1)))
+}
+
+test "a BigInt keys a map in the numbers' order, and the language's order is compare's" {
+  let texts = [
+    "-123456789012345678901234567890",
+    "-1073741824",
+    "-10",
+    "-5",
+    "0",
+    "7",
+    "1073741824",
+    "123456789012345678901234567890",
+  ];
+  let values = map(texts, |t: String| option_at(of_string(t), "a decimal spelling"));
+  let keyed = fold(reverse(values), map_new(), |m: Map<BigInt, String>, v: BigInt|
+    map_insert(m, v, to_string(v)));
+  assert_eq(map_values(keyed), texts);
+  assert_eq(map_get(keyed, sub(of_int(5), of_int(15))), Some("-10"));
+  assert(
+    all(values, |a: BigInt|
+      all(values, |b: BigInt|
+        compare_values(a, b) == compare(a, b) && big_int_ord().compare(a, b) == compare(a, b))),
+  );
+  assert_eq(digest(add(of_int(3), of_int(4))), digest(of_int(7)));
+  assert_eq(big_int_hash().hash(of_int(7)), digest(of_int(7)))
 }

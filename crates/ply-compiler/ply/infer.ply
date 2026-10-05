@@ -11,7 +11,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
               EffectDef, OpDef, TestDef, LawDef, Binder, Constraint, Deriver, DJson, DEq, DOrd,
               DBin, DShow, DHash, DNumeric, DInteger, is_predicate, deriver_text, deriver_tag,
-              SpecKind, SRequires, SEnsures, SCost, SpecClause, Derived, DeriveDef, parse)
+              SpecKind, SRequires, SEnsures, SCost, SpecClause, Derived, DeriveDef, parse,
+              IInstance, InstanceDef, InstanceKind, NKey, NShow, instance_text)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
@@ -90,6 +91,16 @@ pub type CtorInfo = {
   at: Location,
 }
 pub type DefConstraint = { deriver: Deriver, param: Int }
+// What a type's module states its values go through: `by` is the function, and `answers` what it
+// answers over `params`, the type's own parameters as the function's signature numbers them.
+pub type InstanceInfo = {
+  type_name: Bytes,
+  kind: InstanceKind,
+  by: Bytes,
+  params: List<Int>,
+  answers: Type,
+  at: Location,
+}
 pub type SpecInfo = { kind: SpecKind, index: Int, footprint: List<Atom>, span: Span }
 pub type DefInfo = {
   name: Bytes,
@@ -439,6 +450,7 @@ type Checker = {
   checks: List<{ name: Bytes, hash: Bytes }>,
   test_checks: List<Bytes>,
   assumed: List<Assumed>,
+  instances: List<InstanceInfo>,
 }
 
 type Inferred = { checker: Checker, ty: Type, row: Row }
@@ -9675,7 +9687,7 @@ fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
     { checker: { ..checker, map_keys: [] }, seen: [] },
     |acc: { checker: Checker, seen: List<{ scope: Int, text: Bytes }> }, site: MapKeySite| {
       let key = resolve(acc.checker, site.key);
-      match derivable(DOrd, key, adts, site.assumed) {
+      match derivable(DOrd, key, instance_shapes(checker.instances, adts, DOrd), site.assumed) {
         None -> acc,
         Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
           let pr = print_ty(printer_new(), key);
@@ -9731,7 +9743,12 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
       if is_predicate(site.deriver) {
         { checker: check_predicate(acc.checker, site, ty), seen: acc.seen }
       } else {
-        match derivable(site.deriver, ty, adts, site.assumed) {
+        match derivable(
+            site.deriver,
+            ty,
+            instance_shapes(checker.instances, adts, site.deriver),
+            site.assumed,
+          ) {
           None -> acc,
           Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
             let pr = print_ty(printer_new(), ty);
@@ -9998,7 +10015,12 @@ fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
         IDerive(def) -> if !expanded_here(m, def) { cc } else {
           match derive_target({ ..cc, module: i }, m, def.target.name) {
             None -> cc,
-            Some(o) -> match derivable(def.deriver, o.ty, adts, []) {
+            Some(o) -> match derivable(
+                def.deriver,
+                o.ty,
+                instance_shapes(checker.instances, adts, def.deriver),
+                [],
+              ) {
               None -> o.checker,
               Some(blocked) -> match blocked.why {
                 Unconstrained(_) -> o.checker,
@@ -10037,6 +10059,394 @@ fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
         _ -> cc,
       })
   })
+}
+
+// --- What a type's module states of it ----------------------------------------------------------
+
+fn is_key(kind: InstanceKind) -> Bool = match kind { NKey -> true, NShow -> false }
+
+fn instance_of(instances: List<InstanceInfo>, type_name: Bytes, key: Bool) -> Option<InstanceInfo> =
+  fold(instances, None, |acc: Option<InstanceInfo>, x: InstanceInfo|
+    match acc {
+      Some(_) -> acc,
+      None -> if x.type_name == type_name && is_key(x.kind) == key { Some(x) } else { None },
+    })
+
+// The shapes `derivable` reads for one deriver. A type that states a `key` is compared, ordered and
+// hashed as what its key answers is, whatever it holds, and one that states a `show` is always shown.
+fn instance_shapes(
+  instances: List<InstanceInfo>,
+  adts: List<AlgebraicShape>,
+  deriver: Deriver,
+) -> List<AlgebraicShape> =
+  if len(instances) == 0 { adts } else {
+    let through_key = same_deriver(deriver, DEq) || same_deriver(deriver, DOrd)
+      || same_deriver(deriver, DHash);
+    if !through_key && !same_deriver(deriver, DShow) { adts } else {
+      map(adts, |shape: AlgebraicShape|
+        match instance_of(instances, shape.name, through_key) {
+          Some(x) ->
+            {
+              name: shape.name,
+              params: x.params,
+              fields: if through_key { [x.answers] } else { [] },
+            },
+          None -> shape,
+        })
+    }
+  }
+
+// The variables of `T<a, b>` when `ty` is `type_name` at parameters of its own, each once.
+fn own_params(ty: Type, type_name: Bytes) -> Option<List<Int>> =
+  match ty {
+    TyCon(c) -> if c.name != type_name { None } else {
+      fold(c.args, Some([]), |acc: Option<List<Int>>, a: Type|
+        match acc {
+          None -> None,
+          Some(vs) -> match a {
+            TyVar(v) -> if contains(vs, v) { None } else { Some(push(vs, v)) },
+            _ -> None,
+          },
+        })
+    },
+    _ -> None,
+  }
+
+fn unfit(checker: Checker, def: InstanceDef, f: DefInfo, why: Bytes, note: Bytes) -> Checker =
+  err_labels(
+    checker,
+    b"E0218",
+    bytes_concat_all([
+      b"`",
+      def.by.name,
+      b"` cannot be the `",
+      instance_text(def.kind),
+      b"` of `",
+      def.target.name,
+      b"`",
+    ]),
+    [
+      label_at(checker.module, def.by.span, true, why),
+      label_at(f.at.module, f.at.span, false, b"the function it names"),
+    ],
+    [
+      note,
+      match def.kind {
+        NKey ->
+          bytes_concat_all([
+            b"a `key` takes one `",
+            def.target.name,
+            b"` and answers what `==`, `compare`, `digest` and a `Map` read in its place",
+          ]),
+        NShow ->
+          bytes_concat_all([
+            b"a `show` takes one `",
+            def.target.name,
+            b"` and answers the `String` that `show` and an interpolated string write",
+          ]),
+      },
+    ],
+  )
+
+// One `key for T by f` or `show for T by f`: the type is this module's own and nominal, it states
+// each once, and `f` is a function of this module that takes the value alone and only answers.
+fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} = {
+  let what = instance_text(def.kind);
+  let type_name = qualify(m.name, def.target.name);
+  match map_get(checker.types, type_name) {
+    None ->
+      report_error_at(
+        checker,
+        b"E0208",
+        def.target.span,
+        bytes_concat_all([b"`", def.target.name, b"` is not a type this module declares"]),
+        b"declared in another module, or not at all",
+        [
+          bytes_concat_all([
+            b"a `",
+            what,
+            b"` may only name a type its own module declares, so that a type means one thing wherever its values are compared or shown",
+          ]),
+        ],
+      ),
+    Some(decl) -> match decl.alias {
+      Some(_) ->
+        report_error_at_and(
+          checker,
+          b"E0217",
+          def.target.span,
+          bytes_concat_all([
+            b"`",
+            def.target.name,
+            b"` is an alias, and a `",
+            what,
+            b"` is for a nominal type",
+          ]),
+          b"this names another type",
+          { module: decl.owner, span: decl.span },
+          b"declared here",
+          [
+            b"an alias is the type it names, which is compared and shown as that type is wherever it is written",
+            bytes_concat_all([
+              b"declare a sum, as `type ",
+              def.target.name,
+              b" = ",
+              def.target.name,
+              b"(..)`, and it is a type of its own",
+            ]),
+          ],
+        ),
+      None -> match instance_of(checker.instances, type_name, is_key(def.kind)) {
+        Some(first) ->
+          report_error_at_and(
+            checker,
+            b"E0105",
+            def.span,
+            bytes_concat_all([b"`", def.target.name, b"` states its `", what, b"` twice"]),
+            b"stated again here",
+            first.at,
+            b"first stated here",
+            [b"a type has one, so that nothing has to choose between two; remove one"],
+          ),
+        None -> match def_of(checker, qualify(m.name, def.by.name)) {
+          None ->
+            report_error_at(
+              checker,
+              b"E0101",
+              def.by.span,
+              bytes_concat_all([b"`", def.by.name, b"` is not a function this module declares"]),
+              bytes_concat_all([b"a `", what, b"` names a function of its type's own module"]),
+              [],
+            ),
+          Some(f) -> fitted(checker, def, type_name, f),
+        },
+      },
+    },
+  }
+}
+
+fn fitted(
+  checker: Checker,
+  def: InstanceDef,
+  type_name: Bytes,
+  f: DefInfo,
+) -> Checker / {abort.raise} =
+  match resolve(checker, f.scheme.ty) {
+    TyFn(sig) -> if len(f.constraints) > 0 || len(f.scheme.label_vars) > 0 {
+      unfit(
+        checker,
+        def,
+        f,
+        b"this function has a `where` clause or binds a resource label",
+        b"it is called with the value alone, wherever two are compared or one is shown, so no call fills either",
+      )
+    } else if len(sig.params) != 1 {
+      unfit(
+        checker,
+        def,
+        f,
+        bytes_concat_all([b"this function takes ", ascii_of_int(len(sig.params)), b" parameters"]),
+        b"it is called with the value alone",
+      )
+    } else {
+      match own_params(at(sig.params, 0), type_name) {
+        None ->
+          unfit(
+            checker,
+            def,
+            f,
+            bytes_concat_all([b"this function takes `", type_text(at(sig.params, 0)), b"`"]),
+            bytes_concat_all([
+              b"its parameter is `",
+              def.target.name,
+              b"` at the type's own parameters, so it reads every `",
+              def.target.name,
+              b"` there is",
+            ]),
+          ),
+        Some(params) -> if !row_is_pure(sig.effects) {
+          unfit(
+            checker,
+            def,
+            f,
+            bytes_concat_all([b"this function's row is `", row_text(sig.effects), b"`"]),
+            b"`==`, `compare` and `show` perform nothing, cannot raise and always return, so the function they read through does the same",
+          )
+        } else if !fold(
+            free_vars(checker.subst, sig.ret, { tys: [], rows: [] }).tys,
+            true,
+            |all: Bool, v: Int| all && contains(params, v),
+          ) {
+          unfit(
+            checker,
+            def,
+            f,
+            bytes_concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
+            b"what it answers is over the type's own parameters and no others",
+          )
+        } else if !is_key(def.kind) && sig.ret != string_type() {
+          unfit(
+            checker,
+            def,
+            f,
+            bytes_concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
+            b"what is shown is text",
+          )
+        } else {
+          {
+            ..checker,
+            instances: push(checker.instances, {
+              type_name: type_name,
+              kind: def.kind,
+              by: f.name,
+              params: params,
+              answers: sig.ret,
+              at: { module: checker.module, span: def.span },
+            }),
+          }
+        },
+      }
+    },
+    _ -> checker,
+  }
+
+fn first_key_loop(
+  tys: List<Type>,
+  instances: List<InstanceInfo>,
+  adts: List<AlgebraicShape>,
+  path: List<Bytes>,
+  room: Int,
+) -> Option<List<Bytes>> / {abort.raise} =
+  fold(tys, None, |acc: Option<List<Bytes>>, ty: Type|
+    match acc { Some(_) -> acc, None -> key_loop(ty, instances, adts, path, room) })
+
+// The declared types a comparison of `ty` reads on the way back to a keyed one it is already
+// inside: a type that states a `key` is read as what the key answers, and any other as its fields.
+// `path` is the types entered, and `room` how many more the walk may enter.
+fn key_loop(
+  ty: Type,
+  instances: List<InstanceInfo>,
+  adts: List<AlgebraicShape>,
+  path: List<Bytes>,
+  room: Int,
+) -> Option<List<Bytes>> / {abort.raise} =
+  match ty {
+    TyVar(_) -> None,
+    TyFn(_) -> None,
+    TyRecord(fs) -> first_key_loop(map(fs, |f: Field| f.ty), instances, adts, path, room),
+    TyCon(c) -> match instance_of(instances, c.name, true) {
+      Some(x) -> if contains(path, c.name) { Some(push(path, c.name)) } else {
+        if room <= 0 { None } else {
+          key_loop(
+            substitute_ty(x.answers, x.params, c.args),
+            instances,
+            adts,
+            push(path, c.name),
+            room - 1,
+          )
+        }
+      },
+      None -> match find_adt(adts, c.name) {
+        None -> first_key_loop(c.args, instances, adts, path, room),
+        Some(adt) -> if contains(path, c.name) { None } else {
+          if room <= 0 { None } else {
+            first_key_loop(
+              map(adt.fields, |f: Type| substitute_ty(f, adt.params, c.args)),
+              instances,
+              adts,
+              push(path, c.name),
+              room - 1,
+            )
+          }
+        },
+      },
+    },
+  }
+
+// Every `key` and `show` the program states. A key's type is ordered and hashed, so one function
+// decides `==`, `compare` and `digest` alike, and is not read through its own type again.
+fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
+  let stated: Checker = fold(range(0, len(checker.modules)), checker, |c: Checker, i: Int| {
+    let m = at(c.modules, i);
+    fold(m.module.items, c, |cc: Checker, item: Item|
+      match item { IInstance(def) -> check_instance({ ..cc, module: i }, m, def), _ -> cc })
+  });
+  if len(stated.instances) == 0 { { ..stated, module: checker.module } } else {
+    let adts = algebraic_shapes(stated);
+    let judged: Checker = fold(stated.instances, stated, |c: Checker, x: InstanceInfo|
+      if !is_key(x.kind) { c } else {
+        let simple = simple_name_of(x.type_name);
+        let own = TyCon({ name: x.type_name, args: map(x.params, |v: Int| TyVar(v)) });
+        match key_loop(own, stated.instances, adts, [], len(adts) + 1) {
+          Some(path) ->
+            report(
+              c,
+              error_at(
+                b"E0219",
+                x.at.module,
+                x.at.span,
+                bytes_concat_all([
+                  b"`",
+                  simple,
+                  b"` is compared through a key that holds `",
+                  simple,
+                  b"`",
+                ]),
+                bytes_concat_all([b"this key answers `", type_text(x.answers), b"`"]),
+                [
+                  bytes_concat_all([
+                    b"comparing two of them reads ",
+                    bytes::join(
+                      map(path, |n: Bytes| backticked_text(simple_name_of(n))),
+                      b", then ",
+                    ),
+                    b", and so never ends",
+                  ]),
+                  bytes_concat_all([b"answer a type that holds no `", simple, b"`"]),
+                ],
+              ),
+            ),
+          None ->
+            fold([DOrd, DHash], c, |cc: Checker, deriver: Deriver|
+              if len(cc.diags) > len(c.diags) { cc } else {
+                match derivable(
+                    deriver,
+                    x.answers,
+                    instance_shapes(stated.instances, adts, deriver),
+                    x.params,
+                  ) {
+                  None -> cc,
+                  Some(blocked) -> {
+                    let blocker = type_text(blocked.ty);
+                    report(
+                      cc,
+                      error_at(
+                        b"E0206",
+                        x.at.module,
+                        x.at.span,
+                        bytes_concat_all([
+                          b"`",
+                          blocker,
+                          b"` has no ",
+                          what_of(deriver),
+                          b", so it cannot be the key of `",
+                          simple,
+                          b"`",
+                        ]),
+                        bytes_concat_all([b"this key answers `", type_text(x.answers), b"`"]),
+                        push(
+                          why_notes_for_derive(blocked.why, deriver, blocked, blocker),
+                          b"one key decides `==`, `compare`, `digest` and a `Map`'s order, so what it answers is ordered and hashed",
+                        ),
+                      ),
+                    )
+                  },
+                }
+              }),
+        }
+      });
+    { ..judged, module: checker.module }
+  }
 }
 
 // Anything a generated definition failed on, other than a name it could not see, is Ply's fault.
@@ -10956,6 +11366,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     checks: [],
     test_checks: [],
     assumed: [],
+    instances: [],
   })
 
 /// `ok` is `false` when the program has an *error* in it. A warning is not one: the program
@@ -10995,6 +11406,7 @@ pub type CheckOutput = {
   // those rows held, so no body it lowers is walked again.
   facts: EmitFacts,
   kept: List<KeptFacts>,
+  instances: List<InstanceInfo>,
 }
 
 pub fn check_front(resolved: Resolved, mods: List<ParsedModule>) -> CheckOutput / {abort.raise} =
@@ -11021,6 +11433,7 @@ pub fn check_front_with(
     test_checks: out.checker.test_checks,
     facts: facts_of(out.checker),
     kept: out.checker.kept,
+    instances: out.checker.instances,
   }
 }
 
@@ -11386,7 +11799,9 @@ pub fn check_program_with(
   let tested: Checker = fold(range(0, len(mods)), checked, |checker: Checker, i: Int|
     check_laws(check_tests({ ..checker, module: i }, at(mods, i)), at(mods, i)));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
-  let settled: Checker = settle_bit_ops(settle_numerics(settle_concats(settle_updates(tested))));
+  let settled: Checker = settle_bit_ops(
+    settle_numerics(settle_concats(settle_updates(check_instances(tested)))),
+  );
   let constrained: Checker = check_constraints(
     check_map_keys(check_comparisons(check_label_apps(settled))),
   );
@@ -14377,4 +14792,121 @@ test "a row may write diverges, the atom of a call that may not return" {
   );
   // `div` names an effect set like any other name, and none is declared.
   assert_eq(check_codes(b"fn spin(n: Int) -> Int / {div} = spin(n)\n"), [b"E0114"])
+}
+
+test "a key is stated once, by its type's own module, for a nominal type" {
+  let box = b"type Box = | Box(Int, Int)\nfn area(b: Box) -> Int = match b { Box(w, h) -> w * h }\n";
+  assert_eq(check_codes(bytes_concat(box, b"key for Box by area\n")), []);
+  assert_eq(check_codes(bytes_concat(box, b"key for Box by area\nkey for Box by area\n")), [
+    b"E0105",
+  ]);
+  assert_eq(check_codes(bytes_concat(box, b"key for Box by size\n")), [b"E0101"]);
+  assert_eq(check_codes(b"fn f(o: Option<Int>) -> Int = 0\nkey for Option by f\n"), [b"E0208"]);
+  assert_eq(check_codes(b"fn f(n: Int) -> Int = n\ntype Id = Int\nkey for Id by f\n"), [b"E0217"]);
+  // A type takes a key and a show, each once.
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        box,
+        b"fn text(b: Box) -> String = \"box\"\nkey for Box by area\nshow for Box by text\n",
+      ),
+    ),
+    [],
+  )
+}
+
+test "the function a key or a show names takes the value alone and only answers" {
+  let over = |f: Bytes, stated: Bytes|
+    check_codes(bytes_concat_all([b"type Box<a> = | Box(a, Int)\n", f, b"\n", stated, b"\n"]));
+  assert_eq(
+    over(b"fn k<a>(b: Box<a>) -> Int = match b { Box(_, n) -> n }", b"key for Box by k"),
+    [],
+  );
+  assert_eq(
+    over(b"fn k<a>(b: Box<a>) -> List<a> = match b { Box(x, _) -> [x] }", b"key for Box by k"),
+    [],
+  );
+  assert_eq(over(b"fn k<a>(b: Box<a>, n: Int) -> Int = n", b"key for Box by k"), [b"E0218"]);
+  assert_eq(over(b"fn k(b: Box<Int>) -> Int = 0", b"key for Box by k"), [b"E0218"]);
+  assert_eq(over(b"fn k<a>(b: List<a>) -> Int = 0", b"key for Box by k"), [b"E0218"]);
+  assert_eq(over(b"fn k<a, b>(x: Box<a>) -> List<b> = []", b"key for Box by k"), [b"E0218"]);
+  assert_eq(
+    over(b"fn k<a>(b: Box<a>) -> Int / {abort.raise} = panic(\"no\")", b"key for Box by k"),
+    [b"E0218"],
+  );
+  assert_eq(over(b"fn k<a>(b: Box<a>) -> Int / {diverges} = k(b)", b"key for Box by k"), [
+    b"E0218",
+  ]);
+  assert_eq(
+    over(
+      b"fn k<a>(b: Box<a>) -> a where numeric(a) = match b { Box(x, _) -> x + x }",
+      b"key for Box by k",
+    ),
+    [b"E0218"],
+  );
+  assert_eq(over(b"fn s<a>(b: Box<a>) -> String = \"box\"", b"show for Box by s"), []);
+  assert_eq(over(b"fn s<a>(b: Box<a>) -> Int = 0", b"show for Box by s"), [b"E0218"])
+}
+
+test "a key answers a type that is ordered and hashed, and that does not hold its own" {
+  let keyed = |ret: Bytes, body: Bytes|
+    check_codes(
+      bytes_concat_all([
+        b"type T = | T(Int)\ntype Holder = | Holder(T)\nfn k(t: T) -> ",
+        ret,
+        b" = ",
+        body,
+        b"\nkey for T by k\n",
+      ]),
+    );
+  assert_eq(keyed(b"Int", b"0"), []);
+  assert_eq(keyed(b"Float", b"0.0"), [b"E0206"]);
+  assert_eq(keyed(b"(Int) -> Int", b"|n: Int| n"), [b"E0206"]);
+  assert_eq(keyed(b"T", b"t"), [b"E0219"]);
+  assert_eq(keyed(b"List<Holder>", b"[Holder(t)]"), [b"E0219"]);
+  // Through another type's key.
+  assert_eq(
+    check_codes(
+      b"type A = | A(Int)\ntype B = | B(Int)\nfn a(x: A) -> B = B(0)\nfn b(x: B) -> A = A(0)\nkey for A by a\nkey for B by b\n",
+    ),
+    [b"E0219", b"E0219"],
+  );
+  // A key that answers a keyed type is read through both, which is no loop.
+  assert_eq(
+    check_codes(
+      b"type A = | A(Int)\ntype B = | B(A)\nfn a(x: A) -> Int = 0\nfn b(x: B) -> A = A(0)\nkey for A by a\nkey for B by b\n",
+    ),
+    [],
+  )
+}
+
+test "a type that states a key is ordered, hashed and derived as its key is, whatever it holds" {
+  let held = |stated: Bytes, used: Bytes|
+    check_codes(
+      bytes_concat_all([
+        b"type Reading = | Reading(Float, Int)\nfn tick(r: Reading) -> Int = match r { Reading(_, n) -> n }\n",
+        stated,
+        b"\n",
+        used,
+        b"\n",
+      ]),
+    );
+  let keyed = b"key for Reading by tick";
+  assert_eq(held(b"", b"fn m(r: Reading) -> Map<Reading, Int> = #{r: 1}"), [b"E0206"]);
+  assert_eq(held(keyed, b"fn m(r: Reading) -> Map<Reading, Int> = #{r: 1}"), []);
+  assert_eq(held(b"", b"fn c(r: Reading) -> Ordering = compare(r, r)"), [b"E0206"]);
+  assert_eq(held(keyed, b"fn c(r: Reading) -> Ordering = compare(r, r)"), []);
+  assert_eq(held(keyed, b"fn d(r: Reading) -> Bytes = digest([Some(r)])"), []);
+  assert_eq(
+    held(keyed, b"derive ord for Reading\nderive hash for Reading\nderive eq for Reading"),
+    [],
+  );
+  // A show is no key.
+  assert_eq(
+    held(
+      b"fn text(r: Reading) -> String = \"r\"\nshow for Reading by text",
+      b"fn c(r: Reading) -> Ordering = compare(r, r)",
+    ),
+    [b"E0206"],
+  )
 }

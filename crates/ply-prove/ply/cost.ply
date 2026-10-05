@@ -15,7 +15,7 @@ import compiler.infer (Builtin, builtins)
 import compiler.parsing (dummy_span)
 import compiler.patterns (LInt)
 import compiler.types (Type, TyVar, TyCon, TyFn, TyRecord, Field)
-import context (Context, Def, claims_of, context, ctor, signature, is_recursive)
+import context (Context, Def, claims_of, context, ctor, signature, is_recursive, reaches_key)
 import domain (Ty, Fn, Con)
 import std.list (concat, contains)
 import world (world_of)
@@ -273,11 +273,42 @@ pub fn steps(cx: Context, def: String) -> Result<Poly, String> / {abort.raise} =
       )
     }
   });
-  match map_get(known, def) {
-    Some(r) -> r,
-    None -> Err("`" ++ def ++ "` reaches definitions that call each other"),
+  match holding_keyed(cx, reach) {
+    Some(n) ->
+      Err(
+        "`" ++ n
+          ++ "` holds a value compared by its type's `key`, which a comparison calls and no body shows",
+      ),
+    None -> match map_get(known, def) {
+      Some(r) -> r,
+      None -> Err("`" ++ def ++ "` reaches definitions that call each other"),
+    },
   }
 }
+
+// The first of `defs` that takes, answers or builds a value of a type that states a `key`, or
+// that holds one.
+fn holding_keyed(cx: Context, defs: List<String>) -> Option<String> =
+  if map_len(cx.keyed_types) == 0 { None } else {
+    fold(defs, None, |found: Option<String>, n: String|
+      match found {
+        Some(_) -> found,
+        None -> {
+          let signed = match signature(cx, n) { Some(s) -> reaches_key(cx, s.ty), None -> false };
+          let built = match map_get(cx.claims.defs, n) {
+            Some(d) ->
+              fold(d.refs, false, |any: Bool, r: String|
+                any
+                  || (match ctor(cx, r) {
+                    Some(c) -> map_contains(cx.keyed_types, c.decl.name),
+                    None -> false,
+                  })),
+            None -> false,
+          };
+          if signed || built { Some(n) } else { None }
+        },
+      })
+  }
 
 // Whether a value of `t` may be a function a builtin handed it calls.
 fn calls_back(t: Type) -> Bool =
@@ -1188,4 +1219,46 @@ test "another package's definition with a cost name composes by its `cost` bound
   );
   let xs = map_insert(map_new(), 0, 1);
   assert_eq(steps(cx, "app.f"), Ok([map_new(), xs, map_insert(xs, 1, 1)]))
+}
+
+// A comparison of two keyed values calls their type's `key`, which no body shows, so the steps of
+// whatever holds one are left to be measured.
+test "a definition that holds a value compared by a key leaves its steps unread" {
+  let keyed = |rest: Bytes|
+    bytes_concat(
+      b"type Bag = | Bag(List<Int>)\nkey for Bag by size\nfn size(b: Bag) -> Int = match b { Bag(xs) -> len(xs) }\n",
+      rest,
+    );
+  let unread = |r: Result<Bool, String>|
+    match r { Err(why) -> string_contains(why, "compared by its type's `key`"), Ok(_) -> false };
+  assert(
+    unread(
+      shown(
+        keyed(
+          b"fn member(bags: List<Bag>, b: Bag) -> Bool cost len(bags) = fold(bags, false, |f: Bool, x: Bag| f || x == b)",
+        ),
+        "member",
+      ),
+    ),
+  );
+  // One that builds a keyed value, and one that calls it.
+  assert(unread(shown(keyed(b"fn made(xs: List<Int>) -> Int cost 1 = size(Bag(xs))"), "made")));
+  assert(
+    unread(
+      shown(
+        keyed(
+          b"fn made(xs: List<Int>) -> Int = size(Bag(xs))\nfn outer(xs: List<Int>) -> Int cost 1 = made(xs)",
+        ),
+        "outer",
+      ),
+    ),
+  );
+  // A definition that holds none is read as before, in the same program.
+  assert_eq(
+    shown(
+      keyed(b"fn total(xs: List<Int>) -> Int cost len(xs) = fold(xs, 0, |a: Int, x: Int| a + x)"),
+      "total",
+    ),
+    Ok(true),
+  )
 }

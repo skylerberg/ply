@@ -298,6 +298,19 @@ fn a_units_bucket_tables_read_back_and_a_table_without_them_names_none() {
     assert_eq!(read.encode(), with);
     let without = ply_codegen::c::Exports::decode(tables).expect("the table reads");
     assert!(without.buckets.is_empty());
+    assert!(without.instances.is_empty());
+    // What a type's module states its values are read through follows the buckets, in a unit
+    // that holds such a type: `-` for none, `!` for a function the unit does not take.
+    let stating = format!("{with}instances 2\nm.Box m.area !\nm.Date - m.written\n");
+    let read = ply_codegen::c::Exports::decode(&stating).expect("the table reads");
+    assert_eq!(
+        read.instances,
+        vec![
+            ("m.Box".into(), "m.area".to_string(), "!".to_string()),
+            ("m.Date".into(), "-".to_string(), "m.written".to_string()),
+        ]
+    );
+    assert_eq!(read.encode(), stating);
 }
 
 /// A unit handed over is loaded once, to read what it holds; the first backend on that thread takes
