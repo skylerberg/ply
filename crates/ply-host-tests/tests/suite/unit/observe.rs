@@ -158,6 +158,23 @@ fn shipped_modules_and_the_program_are_held_at_the_binary_s_digests() {
     );
 }
 
+/// The only test that lays the shipped modules out: where they lie is the process's to set once.
+#[test]
+fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("shipped")).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    observe::laid_out(&dir.path().join("link/shipped"), Vec::new());
+    let real = real.canonicalize().unwrap();
+    let m = MachineId::next();
+    let recorder = observe::begin(m);
+    observe::read(m, Read::File, &real.join("shipped/std.list.ply"));
+    let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
+    observe::end(&recorder);
+    assert_eq!(trace, "shipped\tstd.list\tlist digest\n");
+}
+
 const VIEW: &str =
     "shipform\tstd.list\tlist digest\tform\nshipdef\tstd.list\tstd.list.take\thash\n";
 

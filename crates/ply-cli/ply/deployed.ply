@@ -4,7 +4,6 @@
 //! runnable is `shipped.runnable`'s.
 
 import builder (Refusal)
-import sources (is_std)
 import units
 import units (emit)
 import compiler.front (Dump, HashFrame, HDef, HashRow, BodyRow, DefRow, TypeRow, EffectRow,
@@ -14,7 +13,7 @@ import compiler.load (SourceFile, held, LoadedAnalysis)
 import compiler.plyx (Header, Placed, Section, decode, digest_of, digest_text, domain, word)
 import compiler.resolve (Diag, error_at)
 import compiler.unit (Helper, Runtime, compiler_roots, identity_of, shipped)
-import std.bytes (bytes_of_hex, u32_le, u32_at, u64_le, hex_of, slice_at, ascii_of_int)
+import std.bytes (bytes_of_hex, u32_le, u32_at, hex_of, slice_at, ascii_of_int)
 import std.hash (blake3)
 import std.list (take)
 import std.string (join)
@@ -50,7 +49,6 @@ pub type Opened = {
   names: List<{ name: String, hash: Bytes }>,
   closure: List<{ path: String, text: Bytes }>,
   runnable: Bytes,
-  warnings: List<Diag>,
 }
 
 /// What a build asks of its artifacts: one made from the program, an earlier one read back, and a
@@ -62,11 +60,11 @@ pub effect artifacts {
   read unit(front: LoadedAnalysis, names: List<String>) -> Result<Compiled, Refusal>
 }
 
-pub type Previous = { digest: String, names: List<Named>, warnings: List<Diag> }
+pub type Previous = { digest: String, names: List<Named> }
 
 pub fn deploying<a | e>(
   body: () -> a / {artifacts.made, artifacts.previous, artifacts.unit | e},
-) -> a / {abort.raise, emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, shipped.runnable | e} =
+) -> a / {abort.raise, emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable | e} =
   handle {
     body()
   } with {
@@ -135,40 +133,8 @@ fn helper_line(h: Helper) -> Bytes =
 pub fn runtime_of(r: Runtime) -> Bytes / {abort.raise} =
   blake3(hex(blake3(bytes_concat_all(map(r.helpers, helper_line)))))
 
-/// The standard library modules a program's `names` are defined in, each once, in name order.
-fn std_modules_of(names: List<Bytes>) -> List<String> / {abort.raise} =
-  map_keys(
-    fold(names, map_new(), |acc: Map<String, Bool>, n: Bytes| {
-      let module = string_of_bytes(module_of(n));
-      if is_std(module) { map_insert(acc, module, true) } else { acc }
-    }),
-  )
-
-/// The standard library modules `modules` as this binary ships them, each by its name and the hash
-/// of its text.
-pub fn stdlib(modules: List<String>) -> Bytes / {shipped.module, abort.raise} =
-  blake3(
-    bytes_concat_all(
-      map(modules, |n: String|
-        bytes_concat_all([
-          u64_le(string_len(n)),
-          bytes_of_string(n),
-          blake3(match shipped.module(n) { Some(t) -> t, None -> b"" }),
-        ])),
-    ),
-  )
-
-/// `names` are the program's: its standard library is the modules they are defined in.
-fn head_of(
-  entry: Bytes,
-  names: List<Bytes>,
-) -> Header / {shipped.module, shipped.definitions, shipped.runtime, abort.raise} =
-  {
-    frontend: frontend(),
-    runtime: runtime_of(shipped.runtime()),
-    stdlib: stdlib(std_modules_of(names)),
-    entry: entry,
-  }
+fn head_of(entry: Bytes) -> Header / {shipped.definitions, shipped.runtime, abort.raise} =
+  { frontend: frontend(), runtime: runtime_of(shipped.runtime()), entry: entry }
 
 // --- The closure ------------------------------------------------------------------
 
@@ -439,7 +405,7 @@ pub fn made(
   entry: String,
   startup: List<String>,
   reaches: Bool,
-) -> Result<Made, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, shipped.runnable, abort.raise} = {
+) -> Result<Made, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, abort.raise} = {
   let rows = hash_rows(front.dump);
   let roots = map(push(startup, entry), bytes_of_string);
   match filter(roots, |r: Bytes|
@@ -510,7 +476,7 @@ pub fn made(
                         entry: entry,
                         entry_hash: hex_of(entry_hash),
                         startup: startup,
-                        head: head_of(entry_hash, map(pairs, |pair: Pair| pair.name)),
+                        head: head_of(entry_hash),
                         sections: append_all([
                           [bodies_section(bodies)],
                           named_sections(pairs),
@@ -543,11 +509,10 @@ fn append_all<a>(parts: List<List<a>>) -> List<a> =
 pub fn library_unit(
   front: LoadedAnalysis,
   names: List<String>,
-) -> Result<Compiled, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, abort.raise} =
+) -> Result<Compiled, Refusal> / {emit.unit, shipped.definitions, shipped.runtime, abort.raise} =
   match units::text_of(emit.unit(front, map(names, bytes_of_string))) {
     Err(diags) -> Err(refusal(diags)),
-    Ok(unit) ->
-      Ok({ head: head_of(b"", map(names, bytes_of_string)), count: 1, payload: bytes_gzip(unit) }),
+    Ok(unit) -> Ok({ head: head_of(b""), count: 1, payload: bytes_gzip(unit) }),
   }
 
 // --- Opening one ------------------------------------------------------------------
@@ -725,17 +690,11 @@ fn noted(diag: Diag, note: Bytes) -> Diag =
   if bytes_len(note) == 0 { diag }
   else { { ..diag, notes_text: push(diag.notes_text, note), notes: diag.notes + 1 } }
 
-fn stdlib_changed(now: Bytes) -> Diag / {abort.raise} =
-  {
-    ..error_at(b"W0605", no_module(), nowhere(), b"the artifact was built against a different standard library", b"", [bytes_of_string("this `ply` ships " ++ sealed_short(now) ++ " of the modules it draws on"), b"its definitions are its own, so it runs as it was built"]),
-    severity: b"warning",
-  }
-
 /// The artifact `b` read back from `path`, and refused unless every part of it is what was built.
 pub fn opened(
   path: String,
   b: Bytes,
-) -> Result<Opened, Diag> / {shipped.names, shipped.module, shipped.definitions, shipped.runtime, abort.raise} =
+) -> Result<Opened, Diag> / {shipped.definitions, shipped.runtime, abort.raise} =
   match decode(b) {
     Err(r) -> {
       let base = if r.stale { version(path, string_of_bytes_lossy(r.message)) }
@@ -814,12 +773,6 @@ pub fn opened(
                             names: names,
                             closure: closure,
                             runnable: payload(b, r),
-                            warnings: {
-                              let now = stdlib(
-                                std_modules_of(map(names, |n: Name| bytes_of_string(n.name))),
-                              );
-                              if o.stdlib != now { [stdlib_changed(now)] } else { [] }
-                            },
                           }),
                       },
                     }
@@ -840,7 +793,7 @@ pub fn unreadable(path: String) -> Diag =
 pub fn previous(
   path: String,
   bytes: Option<Bytes>,
-) -> Result<Previous, Refusal> / {shipped.names, shipped.module, shipped.definitions, shipped.runtime, abort.raise} =
+) -> Result<Previous, Refusal> / {shipped.definitions, shipped.runtime, abort.raise} =
   match bytes {
     None -> Err(refusal([unreadable(path)])),
     Some(b) -> match opened(path, b) {
@@ -850,7 +803,6 @@ pub fn previous(
           digest: o.digest,
           names: map(o.names, |n: { name: String, hash: Bytes }|
             { name: n.name, hash: hex_of(n.hash) }),
-          warnings: o.warnings,
         }),
     },
   }
