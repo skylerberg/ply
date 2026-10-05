@@ -5,6 +5,13 @@
 //! names a program already has (for lists, and for `std.parse`), and an unqualified `map` that silently
 //! took an `Option` would be a trap. A callback may perform effects, and runs only where the value
 //! calls for it: `option_map` of `None` never calls `f`.
+//!
+//! Over a list, `option_all` answers every value or nothing and reads nothing past the first `None`.
+//! `option_traverse` maps and gathers in one pass and `option_try_fold` threads a state: neither
+//! calls its callback past the first `None`, and each is a `fold` underneath, so a definition that
+//! recurses through the callback is seen to end as it is through `fold`.
+
+import std.laws (agrees, inverse)
 
 /// The value through `f`, if there is one.
 pub fn option_map<a, b | e>(o: Option<a>, f: (a) -> b / e) -> Option<b> / e bounded =
@@ -59,6 +66,48 @@ pub fn option_map_or<a, b | e>(o: Option<a>, fallback: b, f: (a) -> b / e) -> b 
 pub fn option_zip<a, b>(o: Option<a>, p: Option<b>) -> Option<(a, b)> =
   match ((o, p)) { (Some(x), Some(y)) -> Some((x, y)), _ -> None }
 
+/// The option an option holds, and `None` where either layer is missing.
+pub fn option_flatten<a>(o: Option<Option<a>>) -> Option<a> =
+  match o { None -> None, Some(inner) -> inner }
+
+/// The layers the other way round: a missing value is a success that holds none, and a failure
+/// stays the failure. `std.result`'s `result_transpose` goes back.
+pub fn option_transpose<a, e>(o: Option<Result<a, e>>) -> Result<Option<a>, e> =
+  match o { None -> Ok(None), Some(Ok(x)) -> Ok(Some(x)), Some(Err(e)) -> Err(e) }
+
+/// A fold whose step may answer nothing: `f` of the state and each element in order, or `None`
+/// where a step answers none. `f` is not called for what follows.
+pub fn option_try_fold<a, s | e>(
+  xs: List<a>,
+  init: s,
+  f: (s, a) -> Option<s> / e cost k,
+) -> Option<s> / e
+  cost len(xs) * k
+=
+  fold(xs, Some(init), |acc: Option<s>, x: a|
+    match acc { None -> None, Some(state) -> f(state, x) })
+
+/// `f` of each element in order, or `None` where `f` answers none. `f` is not called past its
+/// first `None`.
+pub fn option_traverse<a, b | e>(xs: List<a>, f: (a) -> Option<b> / e cost k) -> Option<List<b>> / e
+  cost len(xs) * k
+=
+  option_try_fold(xs, [], |done: List<b>, x: a|
+    match f(x) { None -> None, Some(y) -> Some(push(done, y)) })
+
+/// Every value in order, or `None` where one is missing. What follows the first `None` is not
+/// read.
+pub fn option_all<a>(os: List<Option<a>>) -> Option<List<a>>
+  cost len(os)
+= all_onto(os, [])
+
+fn all_onto<a>(os: List<Option<a>>, done: List<a>) -> Option<List<a>> =
+  match os {
+    [] -> Some(done),
+    [None, ..] -> None,
+    [Some(x), ..rest] -> all_onto(rest, push(done, x)),
+  }
+
 // --- Tests ------------------------------------------------------------------
 
 test "the combinators answer the absence rather than raising" {
@@ -108,3 +157,111 @@ test "a callback may perform effects, and runs only where the value calls for it
   } };
   assert_eq(calls, 2)
 }
+
+test "a nested option flattens to its inner one, and the layers of a result swap" {
+  assert_eq(option_flatten(Some(Some(1))), Some(1));
+  let inner_missing: Option<Option<Int>> = Some(None);
+  assert_eq(option_flatten(inner_missing), None);
+  let outer_missing: Option<Option<Int>> = None;
+  assert_eq(option_flatten(outer_missing), None);
+  let found: Option<Result<Int, String>> = Some(Ok(1));
+  assert_eq(option_transpose(found), Ok(Some(1)));
+  let failed: Option<Result<Int, String>> = Some(Err("bad"));
+  assert_eq(option_transpose(failed), Err("bad"));
+  let absent: Option<Result<Int, String>> = None;
+  assert_eq(option_transpose(absent), Ok(None))
+}
+
+test "option_all keeps every value in order, or answers nothing where one is missing" {
+  assert_eq(option_all([Some(1), Some(2), Some(3)]), Some([1, 2, 3]));
+  assert_eq(option_all([Some(1), None, Some(3)]), None);
+  let none: List<Option<Int>> = [];
+  assert_eq(option_all(none), Some([]))
+}
+
+test "a traverse maps and gathers, and a fold threads its state until a step answers nothing" {
+  assert_eq(option_traverse([1, 2, 3], |x: Int| Some(x * 2)), Some([2, 4, 6]));
+  assert_eq(option_traverse([1, 2, 3], |x: Int| if x == 2 { None } else { Some(x) }), None);
+  assert_eq(option_try_fold([1, 2, 3], 10, |sum: Int, x: Int| Some(sum + x)), Some(16));
+  assert_eq(
+    option_try_fold([1, 2, 3], 0, |sum: Int, x: Int| if x > 2 { None } else { Some(sum + x) }),
+    None,
+  )
+}
+
+test "a walk calls nothing past the first element that answers none" {
+  let calls = with_cell[calls](0) { c -> {
+    let seen = |x: Int| {
+      cell_update(c, |n: Int| n + 1);
+      if x == 2 { None } else { Some(x) }
+    };
+    assert_eq(option_traverse([1, 2, 3, 4, 5], seen), None);
+    cell_get(c)
+  } };
+  assert_eq(calls, 2)
+}
+
+type Nested = | Leaf(Int) | Branch(List<Nested>)
+
+/// The leaves in order, or `None` where one is negative: a recursion through `option_traverse`.
+fn leaves(t: Nested) -> Option<List<Int>> =
+  match t {
+    Leaf(n) -> if n < 0 { None } else { Some([n]) },
+    Branch(kids) ->
+      option_map(option_traverse(kids, leaves), |found: List<List<Int>>|
+        fold(found, [], |all: List<Int>, some: List<Int>|
+          fold(some, all, |acc: List<Int>, n: Int| push(acc, n)))),
+  }
+
+test "a definition that recurses through a traverse is seen to end" {
+  assert_eq(leaves(Branch([Leaf(1), Branch([Leaf(2), Leaf(3)]), Leaf(4)])), Some([1, 2, 3, 4]));
+  assert_eq(leaves(Branch([Leaf(1), Branch([Leaf(0 - 2), Leaf(3)])])), None)
+}
+
+fn missing_first(n: Int) -> List<Option<Int>> =
+  map(range(0, n), |i: Int| if i == 0 { None } else { Some(i) })
+
+test "a missing value at the front ends the walk in the same steps whatever follows it" {
+  let short = missing_first(4);
+  let long = missing_first(4000);
+  assert_eq(metered(|| option_all(long)).steps, metered(|| option_all(short)).steps)
+}
+
+/// What `option_all` answers, by a fold that reads every element.
+fn all_by_fold(os: List<Option<Int>>) -> Option<List<Int>> =
+  fold(os, Some([]), |acc: Option<List<Int>>, o: Option<Int>|
+    match ((acc, o)) { (Some(xs), Some(x)) -> Some(push(xs, x)), _ -> None })
+
+law "option_all answers what a fold over every element does" = agrees(option_all, all_by_fold)
+
+law "a traverse is the map and then option_all"
+  forall (xs: List<Int>) {
+    option_traverse(xs, odd) == option_all(map(xs, odd))
+  }
+
+law "a fold whose step always answers is the fold"
+  forall (xs: List<Int>) {
+    option_try_fold(xs, [], |done: List<Int>, x: Int| Some(push(done, x))) == Some(xs)
+  }
+
+law "an option wrapped once more flattens to itself" =
+  inverse(|o: Option<Int>| Some(o), option_flatten)
+
+law "a zip holds both values exactly when both are there"
+  forall (o: Option<Int>, p: Option<Bool>) {
+    match option_zip(o, p) {
+      Some(pair) -> o == Some(pair._0) && p == Some(pair._1),
+      None -> o == None || p == None,
+    }
+  }
+
+law "a transpose keeps what each layer held"
+  forall (o: Option<Result<Int, Bool>>) {
+    match option_transpose(o) {
+      Ok(None) -> o == None,
+      Ok(Some(x)) -> o == Some(Ok(x)),
+      Err(e) -> o == Some(Err(e)),
+    }
+  }
+
+fn odd(x: Int) -> Option<Int> = if x % 2 == 0 { None } else { Some(x) }

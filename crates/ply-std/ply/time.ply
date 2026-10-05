@@ -11,6 +11,19 @@
 //! The prelude's `Instant` and `Duration` are nanoseconds, a reading of a clock and the span between
 //! two, and the functions here build and read them; every conversion is checked arithmetic, so one past
 //! an `Int` raises. A test handles the effect over `Ticks`.
+//!
+//! A `Duration` has two texts, each exact both ways. `render_duration` writes the compound form a
+//! flag or a configuration file names a timeout in, `1h30m15.5s`, and `read_duration` reads it;
+//! `render_iso_duration` and `read_iso_duration` are ISO 8601's, `PT1H30M15.5S`. Either reader
+//! refuses a text finer than a nanosecond or longer than a `Duration`, saying why and where, by
+//! raising `duration.refused`, and `parse_duration` and `parse_iso_duration` answer the refusal as
+//! an `Err`. Neither form has a year or a month, whose length depends on the date it is counted
+//! from: those are `std.date`'s `Period`. With `import std.duration`, `duration"1h30m"` is a span
+//! read when the program is checked.
+
+import std.bytes (int_of_ascii, repeat, scan, scan_until)
+import std.laws (round_trip)
+import std.math (pow)
 
 /// The wall clock, the monotonic clock, and a wait.
 pub nondet effect time {
@@ -90,6 +103,318 @@ pub fn after(i: Instant, d: Duration) -> Instant = Instant(nanos_at(i) + as_nano
 /// From `earlier` to `later`, negative when `later` is the earlier reading.
 pub fn between(earlier: Instant, later: Instant) -> Duration =
   Duration(nanos_at(later) - nanos_at(earlier))
+
+// --- Durations as text ------------------------------------------------------
+
+/// Why a reader refused a text. The last five are the ISO 8601 form's alone.
+pub type Why =
+  /// Nothing is written: an empty text, a sign alone, or an ISO `P` or `T` with no component after
+  /// it.
+  | Empty
+  /// No digit where a number begins, or after its point.
+  | NoNumber
+  /// A number with no unit after it.
+  | NoUnit
+  /// A unit that is none of `h`, `m`, `s`, `ms`, `us` and `ns`.
+  | UnknownUnit
+  /// A fraction finer than a nanosecond.
+  | TooFine
+  /// A span past what a `Duration` holds, about 292 years either way.
+  | TooLong
+  /// A text that does not open with `P`.
+  | Unopened
+  /// A year or a month: a calendar period, which is `std.date`'s `Period` and no span of time.
+  | Calendar
+  /// A designator that is none of `W`, `D`, `H`, `M` and `S`.
+  | UnknownDesignator
+  /// A designator out of its order, written twice, or on the wrong side of the `T`.
+  | OutOfOrder
+  /// A fraction on a component that is not the last.
+  | FractionNotLast
+
+/// A refusal, and the offset of the character it is about.
+pub type Refusal = new { why: Why, at: Int }
+
+/// What a reader of durations raises where it refuses.
+pub effect duration {
+  /// The text is not a duration of the form read.
+  raise refused(e: Refusal)
+}
+
+/// The sentence a refusal says to whoever wrote the text.
+pub fn refusal_message(refused: Refusal) -> String =
+  match refused.why {
+    Empty -> "no duration is written here",
+    NoNumber -> "a number goes here: digits, with digits after a point if it has one",
+    NoUnit -> "a number takes its unit after it",
+    UnknownUnit ->
+      "not one of the units `h`, `m`, `s`, `ms`, `us` and `ns`: a day is no fixed span",
+    TooFine -> "finer than a nanosecond, the least a `Duration` holds",
+    TooLong -> "past what a `Duration` holds, about 292 years",
+    Unopened -> "an ISO 8601 duration opens with `P`",
+    Calendar ->
+      "a year or a month is a calendar period, not a span of time: `std.date`'s `Period` reads one",
+    UnknownDesignator -> "not a designator: `W`, `D`, `H`, `M` and `S` are, in upper case",
+    OutOfOrder -> "the designators go `W`, `D`, then `T` and `H`, `M`, `S`, each at most once",
+    FractionNotLast -> "only the last component takes a fraction",
+  }
+
+/// `d` in the compound form, of which a span has this one text: hours, minutes and seconds, the
+/// largest first, each a whole number but the seconds and none written where it is zero, as
+/// `1h30m15.5s`. A span under a second is in the largest of `ms`, `us` and `ns` it fills, as
+/// `250ms` and `1.5us`; zero is `0s`, and a negative span leads with `-`.
+pub fn render_duration(d: Duration) -> String = {
+  let n = as_nanos(d);
+  let below = if n > 0 { 0 - n } else { n };
+  let sign = if n < 0 { "-" } else { "" };
+  if n == 0 { "0s" }
+  else if below > 0 - 1000 { sign ++ int_to_string(0 - below) ++ "ns" }
+  else if below > 0 - 1000000 { sign ++ pointed(0 - below / 1000, 0 - below % 1000, 3) ++ "us" }
+  else if below > 0 - 1000000000 {
+    sign ++ pointed(0 - below / 1000000, 0 - below % 1000000, 6) ++ "ms"
+  } else { sign ++ in_hours(below, "h", "m", "s") }
+}
+
+/// The span `text` writes in the compound form, or why it writes none: `read_duration` with its
+/// refusal as an `Err`.
+pub fn parse_duration(text: String) -> Result<Duration, Refusal> / {abort.raise} =
+  try { read_duration(text) }
+
+/// The span `text` writes in the compound form, raising `duration.refused` where it writes none.
+///
+/// A text is an optional `-` and then one or more terms that add up, in any order: each a number
+/// in digits, with digits after a `.` if it has one, and a unit, `h`, `m`, `s`, `ms`, `us`
+/// (also `µs`) or `ns`, with no blank anywhere. `0` alone is zero. There is no `d`: a day is not
+/// a fixed span. A term that is no whole number of nanoseconds, and a text past what a `Duration`
+/// holds, are refused, never rounded or wrapped.
+pub fn read_duration(text: String) -> Duration / {duration.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  let start = sign_width(b);
+  if start >= bytes_len(b) { refuse(b, Empty, start) }
+  else if bytes_slice(b, start, bytes_len(b)) == b"0" { Duration(0) } else {
+    signed(
+      b,
+      start,
+      iterate({ at: start, below: 0 }, bytes_len(b) + 1, |s: Reading|
+        if s.at >= bytes_len(b) { Stop(s.below) } else { Continue(term(b, s)) }),
+    )
+  }
+}
+
+/// `d` as ISO 8601 writes a duration, of which a span has this one text: `PT`, then hours,
+/// minutes and seconds as `render_duration` counts them, each before its designator, as
+/// `PT1H30M15.5S`. Zero is `PT0S`, a negative span leads with `-`, and there is never a day or a
+/// week.
+pub fn render_iso_duration(d: Duration) -> String = {
+  let n = as_nanos(d);
+  if n == 0 { "PT0S" } else {
+    (if n < 0 { "-" } else { "" }) ++ "PT" ++ in_hours(if n > 0 { 0 - n } else { n }, "H", "M", "S")
+  }
+}
+
+/// The span `text` writes as an ISO 8601 duration, or why it writes none: `read_iso_duration`
+/// with its refusal as an `Err`.
+pub fn parse_iso_duration(text: String) -> Result<Duration, Refusal> / {abort.raise} =
+  try { read_iso_duration(text) }
+
+/// The span `text` writes as an ISO 8601 duration, raising `duration.refused` where it writes
+/// none.
+///
+/// A text is an optional `-`, `P`, and then components in the order weeks, days, `T`, hours,
+/// minutes, seconds: each a number before its designator, `W`, `D`, `H`, `M` or `S`, at most once,
+/// with the `T` there exactly when a component follows it. A week is seven days and a day 24
+/// hours. The last component may have a fraction after a `.` or a `,`. A year and a month before
+/// the `T` are refused as `Calendar`, and so is whatever is no whole number of nanoseconds or is
+/// past what a `Duration` holds.
+pub fn read_iso_duration(text: String) -> Duration / {duration.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  let start = sign_width(b);
+  if start >= bytes_len(b) { refuse(b, Empty, start) }
+  else if bytes_at(b, start) != 80 { refuse(b, Unopened, start) } else {
+    let read = iterate(
+      { at: start + 1, below: 0, rank: 0, in_time: false, fraction_at: 0 - 1, bare: true },
+      bytes_len(b) + 1,
+      |s: IsoReading| if s.at >= bytes_len(b) { Stop(s) } else { Continue(iso_step(b, s)) },
+    );
+    if read.bare { refuse(b, Empty, read.at) } else { signed(b, start, read.below) }
+  }
+}
+
+/// Where a compound text stands, and the nanoseconds read so far, negated.
+type Reading = { at: Int, below: Int }
+
+/// Where an ISO text stands: the nanoseconds read so far, negated, the rank of the last
+/// designator, which side of the `T` it is on, where a component with a fraction began, and
+/// whether no component has followed the `P` or the `T`.
+type IsoReading = { at: Int, below: Int, rank: Int, in_time: Bool, fraction_at: Int, bare: Bool }
+
+/// A number as written: its digits before the point, those after it without the zeros at their
+/// end, whether a point was written, and where the text stands after it.
+type Number = { whole: Bytes, fraction: Bytes, pointed: Bool, end: Int }
+
+fn refuse<a>(b: Bytes, why: Why, at: Int) -> a / {duration.refused, abort.raise} =
+  duration.refused({ why: why, at: characters_before(b, at) })
+
+/// How many characters the first `at` bytes of a text are: the bytes that begin one.
+fn characters_before(b: Bytes, at: Int) -> Int / {abort.raise} =
+  fold(range(0, at), 0, |count: Int, i: Int|
+    if bytes_at(b, i) & 0xC0 == 0x80 { count } else { count + 1 })
+
+fn sign_width(b: Bytes) -> Int / {abort.raise} =
+  if bytes_len(b) > 0 && bytes_at(b, 0) == 45 { 1 } else { 0 }
+
+/// The span of nanoseconds read below zero, under the sign the text opened with.
+fn signed(b: Bytes, start: Int, below: Int) -> Duration / {duration.refused, abort.raise} =
+  if start == 1 { Duration(below) }
+  else { match checked_neg(below) { Some(n) -> Duration(n), None -> refuse(b, TooLong, 0) } }
+
+fn term(b: Bytes, s: Reading) -> Reading / {duration.refused, abort.raise} = {
+  let n = number_at(b, s.at, b".");
+  let unit_end = scan_until(b, n.end, b"0123456789.");
+  if unit_end == n.end { refuse(b, NoUnit, n.end) } else {
+    match unit_nanos(bytes_slice(b, n.end, unit_end)) {
+      None -> refuse(b, UnknownUnit, n.end),
+      Some(unit) -> { at: unit_end, below: with_term(b, s.below, n, unit, s.at) },
+    }
+  }
+}
+
+/// The nanoseconds in a unit of the compound form.
+fn unit_nanos(unit: Bytes) -> Option<Int> =
+  if unit == b"ns" { Some(1) }
+  // The micro sign, and the Greek mu a keyboard may type for it.
+  else if unit == b"us" || unit == b"\xc2\xb5s" || unit == b"\xce\xbcs" { Some(1000) }
+  else if unit == b"ms" { Some(1000000) }
+  else if unit == b"s" { Some(1000000000) }
+  else if unit == b"m" { Some(60000000000) }
+  else if unit == b"h" { Some(3600000000000) }
+  else { None }
+
+fn iso_step(b: Bytes, s: IsoReading) -> IsoReading / {duration.refused, abort.raise} =
+  if bytes_at(b, s.at) == 84 {
+    if s.in_time { refuse(b, OutOfOrder, s.at) }
+    else { { ..s, at: s.at + 1, in_time: true, bare: true } }
+  } else if s.fraction_at >= 0 { refuse(b, FractionNotLast, s.fraction_at) } else {
+    let n = number_at(b, s.at, b".,");
+    if n.end >= bytes_len(b) { refuse(b, NoUnit, n.end) } else {
+      let part = iso_part(b, n.end, s.in_time);
+      if part.rank <= s.rank { refuse(b, OutOfOrder, n.end) } else {
+        {
+          at: n.end + 1,
+          below: with_term(b, s.below, n, part.nanos, s.at),
+          rank: part.rank,
+          in_time: s.in_time,
+          fraction_at: if n.pointed { s.at } else { 0 - 1 },
+          bare: false,
+        }
+      }
+    }
+  }
+
+/// The designator at `at`: its place in the order, and its nanoseconds.
+fn iso_part(
+  b: Bytes,
+  at: Int,
+  in_time: Bool,
+) -> { rank: Int, nanos: Int } / {duration.refused, abort.raise} = {
+  let designator = bytes_at(b, at);
+  // `Y`, and an `M` before the `T`, which is a month.
+  if designator == 89 || (designator == 77 && !in_time) { refuse(b, Calendar, at) } else {
+    let part = if designator == 87 { { rank: 1, nanos: 604800000000000, timed: false } }
+    else if designator == 68 { { rank: 2, nanos: 86400000000000, timed: false } }
+    else if designator == 72 { { rank: 3, nanos: 3600000000000, timed: true } }
+    else if designator == 77 { { rank: 4, nanos: 60000000000, timed: true } }
+    else if designator == 83 { { rank: 5, nanos: 1000000000, timed: true } }
+    else { refuse(b, UnknownDesignator, at) };
+    if part.timed != in_time { refuse(b, OutOfOrder, at) }
+    else { { rank: part.rank, nanos: part.nanos } }
+  }
+}
+
+/// The number at `i`: digits, and digits again after one of `points`.
+fn number_at(b: Bytes, i: Int, points: Bytes) -> Number / {duration.refused, abort.raise} = {
+  let whole_end = scan(b, i, b"0123456789");
+  if whole_end == i { refuse(b, NoNumber, i) }
+  else if whole_end < bytes_len(b) && bytes_index_of_byte(points, bytes_at(b, whole_end)) != None {
+    let end = scan(b, whole_end + 1, b"0123456789");
+    if end == whole_end + 1 { refuse(b, NoNumber, end) } else {
+      {
+        whole: bytes_slice(b, i, whole_end),
+        fraction: without_trailing_zeros(bytes_slice(b, whole_end + 1, end)),
+        pointed: true,
+        end: end,
+      }
+    }
+  } else { { whole: bytes_slice(b, i, whole_end), fraction: b"", pointed: false, end: whole_end } }
+}
+
+fn without_trailing_zeros(digits: Bytes) -> Bytes / {abort.raise} =
+  bytes_slice(
+    digits,
+    0,
+    fold(range(0, bytes_len(digits)), 0, |kept: Int, i: Int|
+      if bytes_at(digits, i) == 48 { kept } else { i + 1 }),
+  )
+
+/// `below` less the nanoseconds of `n` units, for the term that began at `at`. Read below zero,
+/// because the least `Duration` has no positive twin.
+fn with_term(
+  b: Bytes,
+  below: Int,
+  n: Number,
+  unit: Int,
+  at: Int,
+) -> Int / {duration.refused, abort.raise} = {
+  let places = bytes_len(n.fraction);
+  // Past thirteen places no unit is whole nanoseconds, and eighteen fit an `Int`.
+  if places > 18 { refuse(b, TooFine, at) } else {
+    let part = i128_of_int(match int_of_ascii(n.fraction) { Some(f) -> f, None -> 0 })
+      * i128_of_int(unit);
+    let scale = i128_of_int(pow(10, places));
+    if part % scale != 0i128 { refuse(b, TooFine, at) } else {
+      let read = match int_of_ascii(b"-" ++ n.whole) {
+        None -> None,
+        Some(whole) -> match checked_mul(whole, unit) {
+          None -> None,
+          Some(scaled) -> match checked_sub(scaled, int_of_i128(part / scale)) {
+            None -> None,
+            Some(of_term) -> checked_add(below, of_term),
+          },
+        },
+      };
+      match read { Some(total) -> total, None -> refuse(b, TooLong, at) }
+    }
+  }
+}
+
+/// The hours, minutes and seconds of a span at or below zero, each before its mark and none
+/// written where it is zero.
+fn in_hours(below: Int, hour: String, minute: String, second: String) -> String = {
+  let hours = 0 - below / 3600000000000;
+  let minutes = 0 - below % 3600000000000 / 60000000000;
+  let nanos = 0 - below % 60000000000;
+  (if hours == 0 { "" } else { int_to_string(hours) ++ hour })
+    ++ (if minutes == 0 { "" } else { int_to_string(minutes) ++ minute })
+    ++ (if nanos == 0 { "" } else { pointed(nanos / 1000000000, nanos % 1000000000, 9) ++ second })
+}
+
+/// `whole`, and after a point the `places` digits of `part` without the zeros at their end; no
+/// point where `part` is zero.
+fn pointed(whole: Int, part: Int, places: Int) -> String =
+  int_to_string(whole)
+    ++ (if part == 0 { "" } else {
+      "."
+        ++ fold(
+          range(0, places),
+          { rest: part, out: "" },
+          |s: { rest: Int, out: String }, _: Int|
+            {
+              rest: s.rest / 10,
+              out: if s.out == "" && s.rest % 10 == 0 { "" }
+              else { int_to_string(s.rest % 10) ++ s.out },
+            },
+        ).out
+    })
 
 // --- The twin ---------------------------------------------------------------
 
@@ -242,4 +567,232 @@ test "an instant moved by a duration is that far from where it was" {
   assert_eq(between(start, after(start, seconds(1))), seconds(1));
   assert_eq(between(after(start, millis(5)), start), millis(-5));
   assert_eq(compare(start, after(start, nanos(1))), Less)
+}
+
+// --- Tests: durations as text -----------------------------------------------
+
+law "a duration reads back from its compound text" =
+  round_trip(render_duration, |text: String|
+    match parse_duration(text) { Ok(d) -> Some(d), Err(_) -> None })
+
+law "a duration reads back from its ISO 8601 text" =
+  round_trip(render_iso_duration, |text: String|
+    match parse_iso_duration(text) { Ok(d) -> Some(d), Err(_) -> None })
+
+law "reading a duration takes steps in its text"
+  forall (n: Int) where n > 0 cost n {
+    parse_duration(string_of_bytes(repeat(b"1ns", n)))
+  }
+
+law "reading an ISO 8601 duration takes steps in its text"
+  forall (n: Int) where n > 0 cost n {
+    parse_iso_duration(string_of_bytes(bytes_concat_all([b"PT", repeat(b"0", n), b"S"])))
+  }
+
+/// A span in nanoseconds, and the one text a renderer writes of it.
+type Written = { nanos: Int, text: String }
+
+/// A text, and the refusal a reader answers it with.
+type Refusing = { text: String, why: Why, at: Int }
+
+fn least() -> Int = 0 - 9223372036854775807 - 1
+
+test "a span has one compound text, the largest unit first and none written at zero" {
+  let texts: List<Written> = [
+    { nanos: 0, text: "0s" },
+    { nanos: 1, text: "1ns" },
+    { nanos: 999, text: "999ns" },
+    { nanos: 1000, text: "1us" },
+    { nanos: 1001, text: "1.001us" },
+    { nanos: 1500, text: "1.5us" },
+    { nanos: 250000, text: "250us" },
+    { nanos: 1500000, text: "1.5ms" },
+    { nanos: 250000000, text: "250ms" },
+    { nanos: 999999999, text: "999.999999ms" },
+    { nanos: 1000000000, text: "1s" },
+    { nanos: 1000000001, text: "1.000000001s" },
+    { nanos: 1500000000, text: "1.5s" },
+    { nanos: 60000000000, text: "1m" },
+    { nanos: 90000000000, text: "1m30s" },
+    { nanos: 3600000000000, text: "1h" },
+    { nanos: 3600500000000, text: "1h0.5s" },
+    { nanos: 5400000000000, text: "1h30m" },
+    { nanos: 5415500000000, text: "1h30m15.5s" },
+    { nanos: 86400000000000, text: "24h" },
+    { nanos: 0 - 1, text: "-1ns" },
+    { nanos: 0 - 120000000000, text: "-2m" },
+    { nanos: 9223372036854775807, text: "2562047h47m16.854775807s" },
+    { nanos: least(), text: "-2562047h47m16.854775808s" },
+  ];
+  fold(texts, (), |_: Unit, c: Written| {
+    assert_eq(render_duration(Duration(c.nanos)), c.text);
+    assert_eq(parse_duration(c.text), Ok(Duration(c.nanos)))
+  })
+}
+
+test "terms add in any order, and a fraction is read wherever it is whole nanoseconds" {
+  let read: List<Written> = [
+    { nanos: 5400000000000, text: "90m" },
+    { nanos: 5400000000000, text: "1.5h" },
+    { nanos: 5400000000000, text: "30m1h" },
+    { nanos: 3602000000000, text: "1s1h1s" },
+    { nanos: 500000000, text: "0.5s" },
+    { nanos: 1500000000, text: "1.50s" },
+    { nanos: 7000000000, text: "007s" },
+    { nanos: 0, text: "0" },
+    { nanos: 0, text: "-0" },
+    { nanos: 0, text: "-0s" },
+    { nanos: 0, text: "0h0.0s" },
+    { nanos: 1000, text: "1\u{b5}s" },
+    { nanos: 1000, text: "1\u{3bc}s" },
+    { nanos: 1, text: "0.001us" },
+    { nanos: 1, text: "0.000000001s" },
+    { nanos: 9, text: "0.0000000000025h" },
+    { nanos: 1500000000, text: "1.50000000000000000000000000000s" },
+    { nanos: 9223372036854775807, text: "9223372036854775807ns" },
+    { nanos: least(), text: "-9223372036854775808ns" },
+    { nanos: least(), text: "-9223372036s854775808ns" },
+  ];
+  fold(read, (), |_: Unit, c: Written| assert_eq(parse_duration(c.text), Ok(Duration(c.nanos))))
+}
+
+test "a compound text is refused at the character that keeps it from being a duration" {
+  let refused: List<Refusing> = [
+    { text: "", why: Empty, at: 0 },
+    { text: "-", why: Empty, at: 1 },
+    { text: "h", why: NoNumber, at: 0 },
+    { text: "+1s", why: NoNumber, at: 0 },
+    { text: ".5s", why: NoNumber, at: 0 },
+    { text: "1.s", why: NoNumber, at: 2 },
+    { text: "1h-1m", why: UnknownUnit, at: 1 },
+    { text: "1", why: NoUnit, at: 1 },
+    { text: "1.5", why: NoUnit, at: 3 },
+    { text: "1h30", why: NoUnit, at: 4 },
+    { text: "1.5.5s", why: NoUnit, at: 3 },
+    { text: "1d", why: UnknownUnit, at: 1 },
+    { text: "1w", why: UnknownUnit, at: 1 },
+    { text: "1H", why: UnknownUnit, at: 1 },
+    { text: "1min", why: UnknownUnit, at: 1 },
+    { text: "1 h", why: UnknownUnit, at: 1 },
+    { text: "1h ", why: UnknownUnit, at: 1 },
+    { text: "1\u{b5}s1x", why: UnknownUnit, at: 4 },
+    { text: "0.5ns", why: TooFine, at: 0 },
+    { text: "1h0.0000000001s", why: TooFine, at: 2 },
+    { text: "0.00000000000001h", why: TooFine, at: 0 },
+    { text: "9223372036854775808ns", why: TooLong, at: 0 },
+    { text: "2562047h47m16.854775808s", why: TooLong, at: 0 },
+    { text: "-2562047h47m16.854775809s", why: TooLong, at: 12 },
+    { text: "2562048h", why: TooLong, at: 0 },
+    { text: "99999999999999999999h", why: TooLong, at: 0 },
+  ];
+  fold(refused, (), |_: Unit, c: Refusing|
+    assert_eq(parse_duration(c.text), Err({ why: c.why, at: c.at })))
+}
+
+test "a span has one ISO 8601 text, in hours, minutes and seconds" {
+  let texts: List<Written> = [
+    { nanos: 0, text: "PT0S" },
+    { nanos: 1, text: "PT0.000000001S" },
+    { nanos: 250000, text: "PT0.00025S" },
+    { nanos: 1500000000, text: "PT1.5S" },
+    { nanos: 90000000000, text: "PT1M30S" },
+    { nanos: 5400000000000, text: "PT1H30M" },
+    { nanos: 5415500000000, text: "PT1H30M15.5S" },
+    { nanos: 129600000000000, text: "PT36H" },
+    { nanos: 0 - 120000000000, text: "-PT2M" },
+    { nanos: 9223372036854775807, text: "PT2562047H47M16.854775807S" },
+    { nanos: least(), text: "-PT2562047H47M16.854775808S" },
+  ];
+  fold(texts, (), |_: Unit, c: Written| {
+    assert_eq(render_iso_duration(Duration(c.nanos)), c.text);
+    assert_eq(parse_iso_duration(c.text), Ok(Duration(c.nanos)))
+  })
+}
+
+test "an ISO 8601 week is seven days and a day 24 hours, and the last component may be a fraction" {
+  let read: List<Written> = [
+    { nanos: 86400000000000, text: "P1D" },
+    { nanos: 604800000000000, text: "P1W" },
+    { nanos: 1483506500000000, text: "P2W3DT4H5M6.5S" },
+    { nanos: 1500000000, text: "PT1,5S" },
+    { nanos: 5400000000000, text: "PT1.5H" },
+    { nanos: 5400000000000, text: "PT90M" },
+    { nanos: 43200000000000, text: "P0.5D" },
+    { nanos: 302400000000000, text: "P0.5W" },
+    { nanos: 0, text: "P0D" },
+    { nanos: 0, text: "-PT0.0S" },
+    { nanos: 0 - 86400000000000, text: "-P1D" },
+    { nanos: 9223372036854775807, text: "P15250WT47H47M16.854775807S" },
+  ];
+  fold(read, (), |_: Unit, c: Written| assert_eq(parse_iso_duration(c.text), Ok(Duration(c.nanos))))
+}
+
+test "an ISO 8601 text is refused at the character that keeps it from being a duration" {
+  let refused: List<Refusing> = [
+    { text: "", why: Empty, at: 0 },
+    { text: "-", why: Empty, at: 1 },
+    { text: "P", why: Empty, at: 1 },
+    { text: "PT", why: Empty, at: 2 },
+    { text: "P1DT", why: Empty, at: 4 },
+    { text: "1h", why: Unopened, at: 0 },
+    { text: "p1d", why: Unopened, at: 0 },
+    { text: "+PT1S", why: Unopened, at: 0 },
+    { text: "P1Y", why: Calendar, at: 2 },
+    { text: "P1M", why: Calendar, at: 2 },
+    { text: "P1W2M", why: Calendar, at: 4 },
+    { text: "P1Y2M3DT4H", why: Calendar, at: 2 },
+    { text: "PT1Y", why: Calendar, at: 3 },
+    { text: "PT1M2H", why: OutOfOrder, at: 5 },
+    { text: "PT1H1H", why: OutOfOrder, at: 5 },
+    { text: "P1D1W", why: OutOfOrder, at: 4 },
+    { text: "P1H", why: OutOfOrder, at: 2 },
+    { text: "P1S", why: OutOfOrder, at: 2 },
+    { text: "PT1W", why: OutOfOrder, at: 3 },
+    { text: "PT1D", why: OutOfOrder, at: 3 },
+    { text: "PTT1S", why: OutOfOrder, at: 2 },
+    { text: "PT1HT1M", why: OutOfOrder, at: 4 },
+    { text: "PT1.5H30M", why: FractionNotLast, at: 2 },
+    { text: "PT1.0H30M", why: FractionNotLast, at: 2 },
+    { text: "P0.5DT1H", why: FractionNotLast, at: 1 },
+    { text: "PT1h", why: UnknownDesignator, at: 3 },
+    { text: "PT1X", why: UnknownDesignator, at: 3 },
+    { text: "PT1 S", why: UnknownDesignator, at: 3 },
+    { text: "PT1", why: NoUnit, at: 3 },
+    { text: "PT1.5", why: NoUnit, at: 5 },
+    { text: "PTS", why: NoNumber, at: 2 },
+    { text: "PT.5S", why: NoNumber, at: 2 },
+    { text: "PT1.S", why: NoNumber, at: 4 },
+    { text: "PT-1S", why: NoNumber, at: 2 },
+    { text: "PT0.0000000001S", why: TooFine, at: 2 },
+    { text: "P15251W", why: TooLong, at: 1 },
+    { text: "P106752D", why: TooLong, at: 1 },
+    { text: "PT2562047H47M16.854775808S", why: TooLong, at: 0 },
+  ];
+  fold(refused, (), |_: Unit, c: Refusing|
+    assert_eq(parse_iso_duration(c.text), Err({ why: c.why, at: c.at })))
+}
+
+test "a reader raises its refusal, and each refusal has a sentence" {
+  let raised = handle { as_nanos(read_duration("1h30")) } with { duration.refused(e) -> 0 - e.at };
+  assert_eq(raised, 0 - 4);
+  assert_eq(as_nanos(read_duration("1h30m")), 5400000000000);
+  assert_eq(as_nanos(read_iso_duration("PT1H30M")), 5400000000000);
+  let sentences = map(
+    [
+      Empty,
+      NoNumber,
+      NoUnit,
+      UnknownUnit,
+      TooFine,
+      TooLong,
+      Unopened,
+      Calendar,
+      UnknownDesignator,
+      OutOfOrder,
+      FractionNotLast,
+    ],
+    |why: Why| refusal_message({ why: why, at: 0 }),
+  );
+  assert_eq(len(filter(sentences, |s: String| s == "")), 0);
+  assert(string_contains(refusal_message({ why: Calendar, at: 0 }), "`std.date`'s `Period`"))
 }
