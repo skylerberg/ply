@@ -210,17 +210,15 @@ pub fn with_embeds(
         }
       }))
 
-/// A module `analysis` read through `through` keeps that package's stub and edges, its body here a blank;
-/// one `analysis` never reached is carried over whole, since what a package fixes of a module is its own.
+/// A module `analysis` read through `through`, or never reached, is carried over whole: what a
+/// package fixes of a module is its own, and a load that reads a shipped module for what it reaches
+/// has rows for only that, which are not the ones its stub was cut for.
 pub fn compile_package(
   sources: List<Original>,
   analysis: Analysis,
   modules: List<Bytes>,
   through: List<CompiledPackage> = [],
 ) -> CompiledPackage / {abort.raise} = {
-  let members = fold(modules, map_new(), |acc: Map<Bytes, Bool>, m: Bytes|
-    map_insert(acc, m, true));
-  let mine = |name: Bytes| map_contains(members, module_of(name));
   let read = fold(
     through,
     map_new(),
@@ -228,6 +226,9 @@ pub fn compile_package(
       fold(package.modules, acc, |a: Map<Bytes, CompiledModule>, m: CompiledModule|
         map_insert(a, m.name, m)),
   );
+  let fresh = filter(modules, |m: Bytes| !map_contains(read, m));
+  let members = fold(fresh, map_new(), |acc: Map<Bytes, Bool>, m: Bytes| map_insert(acc, m, true));
+  let mine = |name: Bytes| map_contains(members, module_of(name));
   let originals = fold(sources, map_new(), |acc: Map<Bytes, Original>, o: Original|
     map_insert(acc, o.name, o));
   let index = fold(range(0, len(analysis.mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
@@ -246,22 +247,19 @@ pub fn compile_package(
     |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash),
   );
   let cut: CompiledPackage = {
-    modules: map(modules, |name: Bytes|
-      match map_get(read, name) {
-        Some(m) -> m,
-        None -> match ((map_get(originals, name), map_get(index, name))) {
-          (Some(o), Some(i)) -> {
-            let cuts = cuts_of(at(analysis.mods, i));
-            {
-              name: name,
-              stub: stubbed(o.src, cuts),
-              key: module_key(o),
-              reaches: reached(i),
-              cuts: cuts,
-            }
-          },
-          _ -> panic("a module the package cuts is in the analysis, with its source in hand"),
+    modules: map(fresh, |name: Bytes|
+      match ((map_get(originals, name), map_get(index, name))) {
+        (Some(o), Some(i)) -> {
+          let cuts = cuts_of(at(analysis.mods, i));
+          {
+            name: name,
+            stub: stubbed(o.src, cuts),
+            key: module_key(o),
+            reaches: reached(i),
+            cuts: cuts,
+          }
         },
+        _ -> panic("a module the package cuts is in the analysis, with its source in hand"),
       }),
     // A later load reads these modules fixed, where a row is matched under the definition's hash.
     defs: map(
@@ -314,7 +312,8 @@ pub type KeptModules = {
 derive bin for KeptModules
 
 /// `own`, where it is given, keeps the root package's modules alone, each cut at its bodies with
-/// its tests and laws left standing: what a load that answers for its own tests reads back.
+/// its tests and laws left standing: what a load that answers for its own tests reads back. A module
+/// read through `through` keeps what that package fixed of it, as `compile_package` does.
 pub fn kept_modules(
   sources: List<Original>,
   analysis: Analysis,
@@ -341,6 +340,10 @@ pub fn kept_modules(
   let keyed = |name: Bytes|
     match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" };
   let embedded = embeds_reached(analysis.embeds);
+  let fresh = map_fold(members, map_new(), |acc: Map<Bytes, Bool>, name: Bytes, b: Bool|
+    if map_contains(read, name) { acc } else { map_insert(acc, name, true) });
+  let applied = fold(through, [], |acc: List<Fixed>, package: CompiledPackage|
+    concat(acc, package.fixed));
   {
     modules: map(filter(range(0, len(names)), kept), |i: Int| {
       let name = at(names, i);
@@ -361,11 +364,12 @@ pub fn kept_modules(
       }
     }),
     fixed: map(
-      fixed_nodes(
-        analysis.index,
-        analysis.hashes,
-        members,
-        fold(through, [], |acc: List<Fixed>, package: CompiledPackage| concat(acc, package.fixed)),
+      concat(
+        fixed_nodes(analysis.index, analysis.hashes, fresh, applied),
+        filter(applied, |f: Fixed| {
+          let module = module_of(f.name);
+          map_contains(members, module) && !map_contains(fresh, module)
+        }),
       ),
       |fixed: Fixed| { ..fixed, body: b"" },
     ),
@@ -409,7 +413,10 @@ pub fn standing_modules(
   let rowless = fold(valid.fixed, map_new(), |acc: Map<Bytes, Bool>, fixed: Fixed|
     if fixed.decl || map_contains(filed, fixed.name) { acc }
     else { map_insert(acc, module_of(fixed.name), true) });
-  let here = |name: Bytes| !map_contains(rowless, name);
+  let answered = answered_cuts(valid.fixed, |name: Bytes| map_contains(filed, name));
+  let unread = fold(valid.modules, rowless, |acc: Map<Bytes, Bool>, m: CompiledModule|
+    if answered(m.cuts) { acc } else { map_insert(acc, m.name, true) });
+  let here = |name: Bytes| !map_contains(unread, name);
   let modules = filter(valid.modules, |m: CompiledModule| here(m.name));
   if len(modules) == 0 { [] } else {
     let fixed = filter(valid.fixed, |f: Fixed| here(module_of(f.name)));
@@ -457,6 +464,35 @@ pub fn valid_part(
     defs: filter(package.defs, |r: KnownDefRow| here(r.name)),
     fixed: filter(package.fixed, |fixed: Fixed| here(fixed.name)),
   }
+}
+
+/// The part of `package` whose stubs blank only bodies it holds a hash and a row for: a stub is read
+/// for its functions' answers and never for a blank, so a module kept otherwise is read from source.
+pub fn answered_part(package: CompiledPackage) -> CompiledPackage / {abort.raise} = {
+  let rowed = fold(package.defs, map_new(), |acc: Map<Bytes, Bool>, r: KnownDefRow|
+    map_insert(acc, r.name, true));
+  let answered = answered_cuts(package.fixed, |name: Bytes| map_contains(rowed, name));
+  let unanswered = fold(package.modules, map_new(), |acc: Map<Bytes, Bool>, m: CompiledModule|
+    if answered(m.cuts) { acc } else { map_insert(acc, m.name, true) });
+  let here = |name: Bytes| !map_contains(unanswered, module_of(name));
+  {
+    modules: filter(package.modules, |m: CompiledModule| !map_contains(unanswered, m.name)),
+    defs: filter(package.defs, |r: KnownDefRow| here(r.name)),
+    fixed: filter(package.fixed, |f: Fixed| here(f.name)),
+  }
+}
+
+/// Whether each body a module's cuts blank belongs to a function `fixed` gives a hash and `rowed`
+/// holds a row for.
+fn answered_cuts(
+  fixed: List<Fixed>,
+  rowed: (Bytes) -> Bool,
+) -> (List<Cut>) -> Bool / {abort.raise} = {
+  let hashed = fold(fixed, map_new(), |acc: Map<Bytes, Bool>, f: Fixed|
+    if f.decl { acc } else { map_insert(acc, f.name, true) });
+  |cuts: List<Cut>|
+    fold(cuts, true, |all: Bool, c: Cut|
+      all && (!c.braced || (map_contains(hashed, c.name) && rowed(c.name))))
 }
 
 pub fn merged_interfaces(packages: List<CompiledPackage>) -> Interfaces =
@@ -881,6 +917,24 @@ test "a program read through what its last load kept answers what its source doe
   assert_eq(standing_names(standing_modules(kept, map(sources, original), another, unread)), [
     b"base",
   ])
+}
+
+test "a module whose stub blanks a body its package holds no row for is read from source" {
+  let a: Source = {
+    name: b"a",
+    src: b"pub fn one() -> Int = 1 + 0\npub fn two() -> Int = 2 + 0\n",
+  };
+  let app: Source = {
+    name: b"app",
+    src: b"import a (one, two)\npub fn three() -> Int = one() + two()\n",
+  };
+  let p = compile_package([original(a)], whole_of(analyse(parse_all([app, a]))), [b"a"]);
+  let keys = map_insert(map_new(), b"a", module_key(original(a)));
+  assert_eq(answered_part(valid_part(p, keys)), p);
+  let rowless = { ..p, defs: filter(p.defs, |r: KnownDefRow| r.name != b"a.two") };
+  assert_eq(answered_part(valid_part(rowless, keys)).modules, []);
+  let unhashed = { ..p, fixed: filter(p.fixed, |f: Fixed| f.name != b"a.two") };
+  assert_eq(answered_part(valid_part(unhashed, keys)).modules, [])
 }
 
 fn keyed_by(xs: List<{ name: Bytes, hash: Bytes }>, name: Bytes) -> Bytes =
