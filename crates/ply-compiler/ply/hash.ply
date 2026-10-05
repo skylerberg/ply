@@ -11,7 +11,8 @@ import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, L
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
-              HandleClause, ReturnClause, RecField, ETagged, tagged_callee)
+              HandleClause, ReturnClause, RecField, ETagged, Tagged, Hole, tagged_parser,
+              tagged_filler)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
@@ -464,8 +465,8 @@ fn value_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> 
   }
 
 /// The definition a tagged literal's check runs, by its program-wide name, as `module` names it.
-pub fn tagged_target(index: Index, module: Int, tag: Ident) -> Option<Bytes> / {abort.raise} =
-  match value_target(index, module, tagged_callee(tag)) {
+pub fn tagged_target(index: Index, module: Int, t: Tagged) -> Option<Bytes> / {abort.raise} =
+  match value_target(index, module, tagged_parser(t)) {
     Some(FnTarget(node)) -> Some(at(index.nodes, node).name),
     _ -> None,
   }
@@ -650,6 +651,7 @@ fn tag_e_handle() -> Int = 63
 fn tag_e_with_cell() -> Int = 64
 fn tag_e_simulate() -> Int = 65
 fn tag_e_tagged() -> Int = 66
+fn tag_e_filled() -> Int = 150
 fn tag_e_parallel() -> Int = 100
 fn tag_e_try_block() -> Int = 131
 fn tag_e_record_update() -> Int = 67
@@ -1465,8 +1467,16 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
         |acc: Encoder, x: Expr| expr(acc, x),
       ),
     // Apart from the call it stands for, which has another type and another row.
-    ETagged(t) ->
-      lit(value_ref(put_tag(encoder, tag_e_tagged()), tagged_callee(t.tag)), LStr(t.text)),
+    ETagged(t) -> if len(t.holes) == 0 {
+      lit(value_ref(put_tag(encoder, tag_e_tagged()), tagged_parser(t)), LStr(t.text))
+    } else {
+      let named: Encoder = value_ref(
+        value_ref(put_tag(encoder, tag_e_filled()), tagged_parser(t)),
+        tagged_filler(t),
+      );
+      fold(t.holes, lit(put_u32(named, len(t.holes)), LStr(t.text)), |acc: Encoder, h: Hole|
+        lit(expr(acc, h.value), LStr(h.text)))
+    },
     EBad(_) -> panic("a placeholder reached the hasher"),
     // A `try` that names no raise answers the one its body's row names, which the body settles.
     ETryBlock(t) -> {
@@ -1716,7 +1726,7 @@ pub fn is_pure(e: Expr) -> Bool =
     ETry(_) -> false,
     EBad(_) -> false,
     ELit(_) -> true,
-    ETagged(_) -> true,
+    ETagged(t) -> len(t.holes) == 0,
     EVar(_) -> true,
     EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
     EUnary(u) -> is_pure(u.operand),
@@ -1746,7 +1756,7 @@ pub fn is_pure(e: Expr) -> Bool =
 fn mentions(e: Expr, names: List<Bytes>) -> Bool =
   match e {
     ELit(_) -> false,
-    ETagged(_) -> false,
+    ETagged(t) -> fold(t.holes, false, |acc: Bool, h: Hole| acc || mentions(h.value, names)),
     EBad(_) -> false,
     EVar(v) -> is_bare(v.name) && contains(names, v.name.name.name),
     EBinary(b) -> mentions(b.lhs, names) || mentions(b.rhs, names),
@@ -3277,7 +3287,7 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
   match e {
     ELambda(l) -> lambda_rets(l.body, match l.ret { Some(t) -> push(out, t), None -> out }),
     ELit(_) -> out,
-    ETagged(_) -> out,
+    ETagged(t) -> fold(t.holes, out, |acc: List<TypeExpr>, h: Hole| lambda_rets(h.value, acc)),
     EVar(_) -> out,
     EBad(_) -> out,
     EBinary(b) -> lambda_rets(b.rhs, lambda_rets(b.lhs, out)),
@@ -3724,9 +3734,32 @@ fn qname(
   }
 }
 
+/// Whether `module` holds the body `hash` under `name`, where the module being printed may write it.
+fn names_body(
+  layout: Layout,
+  module: Bytes,
+  hash: Bytes,
+  name: Bytes,
+  own: Bytes,
+) -> Bool / {abort.raise} =
+  match map_get(layout.by_hash, hash) {
+    None -> false,
+    Some(found) ->
+      fold(found, false, |held: Bool, s: Slot| {
+        let p = at(layout.parts, s.part);
+        held || (p.module == module && at(p.names, s.class) == name && nameable(layout, s, own))
+      }),
+  }
+
 /// The binder a tagged literal is written with: one of another module that names the literal's
-/// parser `literal`, and that a string can touch without making an interpolated or a byte string.
-fn tag_binder(printer: BodyPrinter, decoded: DecodedRef) -> Decoded / {abort.raise} = {
+/// parser `named`, and its filler `fill` where it has one, and that a string can touch without
+/// making an interpolated or a byte string.
+fn tag_binder(
+  printer: BodyPrinter,
+  decoded: DecodedRef,
+  named: Bytes,
+  filler: Option<Bytes>,
+) -> Decoded / {abort.raise} = {
   let layout = printer.layout;
   let found = pick(
     layout,
@@ -3736,8 +3769,12 @@ fn tag_binder(printer: BodyPrinter, decoded: DecodedRef) -> Decoded / {abort.rai
     printer.own,
     |s: Slot| {
       let p = at(layout.parts, s.part);
-      p.module != printer.own && at(p.names, s.class) == b"literal" && p.binder != b"f"
+      p.module != printer.own && at(p.names, s.class) == named && p.binder != b"f"
         && p.binder != b"b"
+        && (match filler {
+          None -> true,
+          Some(hash) -> names_body(layout, p.module, hash, b"fill", printer.own),
+        })
     },
   );
   match found {
@@ -3946,6 +3983,20 @@ fn str_lit(s: Bytes) -> Bytes / {abort.raise} =
     bytes_concat_all(map(range(0, bytes_len(s)), |i: Int| escape(bytes_at(s, i), true))),
     b"\"",
   ])
+
+/// A text of a tagged literal between its quotes and its holes, where a brace is written twice.
+fn read_tag_text(decoder: Decoder) -> Decoded / {abort.raise} = {
+  let s = read_text(expect(decoder, tag_lit_str(), b"a tagged literal's text"));
+  {
+    decoder: s.decoder,
+    text: bytes_concat_all(
+      map(range(0, bytes_len(s.text)), |i: Int| {
+        let c = bytes_at(s.text, i);
+        if c == 123 { b"{{" } else if c == 125 { b"}}" } else { escape(c, true) }
+      }),
+    ),
+  }
+}
 
 /// A character is its literal; past ASCII it is its own UTF-8, as a string's characters are.
 fn char_lit(v: Int) -> Bytes / {abort.raise} =
@@ -4238,6 +4289,7 @@ fn is_atomic(decoder: Decoder) -> Bool / {abort.raise} = {
     || t == tag_e_list()
     || t == tag_e_perform()
     || t == tag_e_tagged()
+    || t == tag_e_filled()
 }
 
 fn is_base(decoder: Decoder) -> Bool / {abort.raise} = {
@@ -4565,9 +4617,29 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
       let body = print_block(printer, named.decoder, depth);
       { decoder: body.decoder, text: bytes_concat_all([b"try", named.text, b" ", body.text]) }
     } else if t.value == tag_e_tagged() {
-      let tag = tag_binder(printer, read_ref(printer, e));
-      let text = print_lit(tag.decoder);
-      { decoder: text.decoder, text: bytes_concat(tag.text, text.text) }
+      let tag = tag_binder(printer, read_ref(printer, e), b"literal", None);
+      let text = read_tag_text(tag.decoder);
+      { decoder: text.decoder, text: bytes_concat_all([tag.text, b"\"", text.text, b"\""]) }
+    } else if t.value == tag_e_filled() {
+      let parser = read_ref(printer, e);
+      let filler = read_ref(printer, parser.decoder);
+      let tag = tag_binder(
+        printer,
+        { ..parser, decoder: filler.decoder },
+        b"compile",
+        Some(filler.hash),
+      );
+      let n = read_count(tag.decoder);
+      let head = read_tag_text(n.decoder);
+      let rest = read_many(head.decoder, n.value, |g: Decoder| {
+        let hole = print_expr(printer, g, depth);
+        let text = read_tag_text(hole.decoder);
+        { decoder: text.decoder, text: bytes_concat_all([b"{", hole.text, b"}", text.text]) }
+      });
+      {
+        decoder: rest.decoder,
+        text: bytes_concat_all([tag.text, b"\"", head.text, bytes_concat_all(rest.texts), b"\""]),
+      }
     } else {
       panic(
         string_of_bytes(
@@ -5481,6 +5553,33 @@ test "a tagged literal hashes with its parser and its text, apart from the call 
   assert_eq(dumped_hash(renamed, b"m.f"), literal)
 }
 
+test "a tagged literal with holes hashes with its tag's `compile` and `fill`, its texts and its holes" {
+  let tag = |compiled: Bytes|
+    {
+      name: b"sh",
+      src: bytes_concat_all([
+        b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(",
+        compiled,
+        b")\npub fn fill(c: Int, holes: List<Int>) -> Int = c",
+      ]),
+    };
+  let holding = |body: Bytes|
+    { name: b"m", src: bytes_concat(b"import sh\nfn f(n: Int) -> Int = ", body) };
+  let of = |compiled: Bytes, body: Bytes|
+    dumped_hash(hash_dump([tag(compiled), holding(body)]), b"m.f");
+  let literal = of(b"1", b"sh\"a {n} b\"");
+  assert_eq(of(b"1", b"(sh\"a {n} b\")"), literal);
+  assert(of(b"1", b"sh\"a {n} c\"") != literal);
+  assert(of(b"1", b"sh\"a {n + 1} b\"") != literal);
+  assert(of(b"2", b"sh\"a {n} b\"") != literal);
+  // A hole is no text: the texts around one are not the texts around another.
+  assert(of(b"1", b"sh\"a {n}{n} b\"") != of(b"1", b"sh\"a {n} b{n}\""));
+  assert(
+    of(b"1", b"match sh::compile([\"a \", \" b\"]) { Ok(c) -> sh::fill(c, [n]), Err(_) -> 0 }")
+      != literal,
+  )
+}
+
 test "a record update of another module's record hashes stably, and follows that module's type" {
   let app = b"import shapes\npub fn bumped() -> shapes::P = { let p = shapes::mk(); {..p, a: 3} }";
   let narrow = [
@@ -5784,6 +5883,46 @@ test "a tagged literal prints back under a binder whose module names its parser 
   );
   let ms = printed_of(out, []);
   assert(bytes::contains(at(ms, 1).text, b"hex\"a\\\"b\" + hex\"\""));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a tagged literal's braces print doubled, and its holes under a binder that names `compile` and `fill`" {
+  // One body under two names: only a module that calls them `compile` and `fill` can be the tag.
+  let compiler = b"(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)";
+  let filler = b"(c: Int, holes: List<Int>) -> Int = c";
+  let parser = b"(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)";
+  let out = hash_index(
+    indexed([
+      {
+        name: b"aaa",
+        src: bytes_concat_all([b"pub fn compile", compiler, b"\npub fn stuffed", filler]),
+      },
+      {
+        name: b"sh",
+        src: bytes_concat_all([
+          b"pub fn compile",
+          compiler,
+          b"\npub fn fill",
+          filler,
+          b"\npub fn literal",
+          parser,
+        ]),
+      },
+      {
+        name: b"app",
+        src: b"import sh as s\npub fn two() -> Int = s\"a{{b}} {1 + 2}\\\"{s\"{{\"}\" + s\"}}\"",
+      },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  let spelled = b"sh\"a{{b}} {1 + 2}\\\"{sh\"{{\"}\" + sh\"}}\"";
+  assert(
+    fold(ms, false, |found: Bool, m: { module: Bytes, text: Bytes }|
+      found || bytes::contains(m.text, spelled)),
+  );
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );

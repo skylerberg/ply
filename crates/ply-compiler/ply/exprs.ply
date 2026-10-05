@@ -46,7 +46,9 @@ pub type Expr =
   | ESimulate({ span: Span, body: Expr })
   /// `parallel { a, b }`: the branches' answers as a tuple, which means evaluating them left to right.
   | EParallel({ span: Span, branches: List<Expr> })
-  /// `tag"text"`: the call `tag::literal("text")` a check ran, read as the value it answered.
+  /// `tag"text"`: the call `tag::literal("text")` a check ran, read as the value it answered. With
+  /// holes, the call of `tag::fill` on what `tag::compile` answered a check for the texts, and on
+  /// the holes.
   | ETagged(Tagged)
   | EBad({ span: Span })
   /// `try { body }`: `Ok` of what the body answers, or `Err` of what one raise in it carried. With
@@ -55,9 +57,14 @@ pub type Expr =
 
 pub type RaiseName = { eff: QName, op: Ident }
 
-/// A tagged literal as it is written: `text` is what its string reads as, and `quoted` the string
-/// itself, quotes included, which `span` outgrows inside parentheses.
-pub type Tagged = { span: Span, tag: Ident, text: Bytes, quoted: Span }
+/// A tagged literal as it is written: `text` is what its string reads as up to its first hole, and
+/// `quoted` that much of the string, from its opening quote through the `{` or the `"` that ends
+/// the text, which `span` outgrows inside parentheses.
+pub type Tagged = { span: Span, tag: Ident, text: Bytes, quoted: Span, holes: List<Hole> }
+
+/// A hole of a tagged literal and the text after it: `quoted` runs from the `}` that closes the
+/// hole through the `{` or the `"` that ends the text.
+pub type Hole = { value: Expr, text: Bytes, quoted: Span }
 
 pub type RecField = { name: Ident, value: Expr }
 
@@ -131,19 +138,51 @@ pub fn expr_span(expr: Expr) -> Span =
     ETryBlock(v) -> v.span,
   }
 
-/// The function a tagged literal's check runs, as the literal's module names it.
-pub fn tagged_callee(tag: Ident) -> QName =
-  { module: Some(tag), name: { name: b"literal", span: tag.span }, span: tag.span }
+fn tag_fn(tag: Ident, name: Bytes) -> QName =
+  { module: Some(tag), name: { name: name, span: tag.span }, span: tag.span }
 
-/// The call a tagged literal stands for.
-pub fn tagged_call(t: Tagged) -> Expr =
+/// The function a tagged literal's check runs, as the literal's module names it: `literal` over
+/// the text of one with no hole, and `compile` over the texts around the holes of one with any.
+pub fn tagged_parser(t: Tagged) -> QName =
+  tag_fn(t.tag, if len(t.holes) == 0 { b"literal" } else { b"compile" })
+
+/// The function a tagged literal's holes are handed to, with what its check answered.
+pub fn tagged_filler(t: Tagged) -> QName = tag_fn(t.tag, b"fill")
+
+/// A text of a tagged literal and where it is written.
+pub type TaggedPart = { text: Bytes, quoted: Span }
+
+/// A tagged literal's texts in order: one more than it has holes.
+pub fn tagged_parts(t: Tagged) -> List<TaggedPart> =
+  fold(t.holes, [{ text: t.text, quoted: t.quoted }], |parts: List<TaggedPart>, h: Hole|
+    push(parts, { text: h.text, quoted: h.quoted }))
+
+pub fn hole_values(t: Tagged) -> List<Expr> = map(t.holes, |h: Hole| h.value)
+
+/// The literal with `values` in its holes, in order.
+pub fn with_hole_values(t: Tagged, values: List<Expr>) -> Tagged / {abort.raise} =
+  { ..t, holes: map(range(0, len(t.holes)), |i: Int| { ..at(t.holes, i), value: at(values, i) }) }
+
+fn tag_call(t: Tagged, callee: QName, args: List<Expr>) -> Expr =
   EApp({
     span: t.span,
-    func: EVar({ span: t.tag.span, name: tagged_callee(t.tag) }),
+    func: EVar({ span: t.tag.span, name: callee }),
     named: [],
-    args: [ELit({ span: t.quoted, lit: LStr(t.text) })],
+    args: args,
     labels: [],
   })
+
+/// The call a tagged literal's check runs.
+pub fn tagged_call(t: Tagged) -> Expr = {
+  let texts = map(tagged_parts(t), |part: TaggedPart|
+    ELit({ span: part.quoted, lit: LStr(part.text) }));
+  tag_call(t, tagged_parser(t), if len(t.holes) == 0 { texts }
+  else { [EList({ span: t.span, items: texts })] })
+}
+
+/// The call that hands a tagged literal's holes to its tag, with what the check's call answered.
+pub fn tagged_fill(t: Tagged, compiled: Expr) -> Expr =
+  tag_call(t, tagged_filler(t), [compiled, EList({ span: t.span, items: hole_values(t) })])
 
 fn set_span(expr: Expr, span: Span) -> Expr =
   match expr {
@@ -638,19 +677,7 @@ fn primary_ident(
       && token_kind_at(input, parser, 1) == token_lbrace() { parallel_expr(input, parser) }
   else if name == b"try" && opens_try(input, parser) { try_expr(input, parser) } else {
     match tagged_text(input, parser) {
-      Some(text) -> {
-        let tag = current_span(input, parser);
-        let quoted = advance(input, advance(input, parser).parser);
-        Ok({
-          parser: quoted.parser,
-          node: ETagged({
-            span: span_to(tag, quoted.node),
-            tag: { name: name, span: tag },
-            text: text,
-            quoted: quoted.node,
-          }),
-        })
-      },
+      Some(head) -> tagged(input, parser, name, head),
       None -> {
         let { parser, node: q } = qname(input, parser, b"an expression")?;
         Ok({ parser: parser, node: EVar({ span: q.span, name: q }) })
@@ -658,15 +685,43 @@ fn primary_ident(
     }
   }
 
-/// The text of the string literal that touches the name the parser is at, which makes the two a
-/// tagged literal: `uuid"..."` is one, and `uuid "..."` a name and then a string.
-fn tagged_text(input: Input, parser: Parser) -> Option<Bytes> =
-  match token_kind_at(input, parser, 1) {
-    StringLiteral(text) -> if token_at(input, parser, 1).start == token_at(input, parser, 0).end {
-      Some(text)
-    } else { None },
-    _ -> None,
+/// How the string of a tagged literal opens: its text up to its first hole, if it has one.
+type TaggedHead = { text: Bytes, holed: Bool }
+
+/// The string that touches the name the parser is at, which makes the two a tagged literal:
+/// `uuid"..."` is one, and `uuid "..."` a name and then a string.
+fn tagged_text(input: Input, parser: Parser) -> Option<TaggedHead> =
+  if token_at(input, parser, 1).start != token_at(input, parser, 0).end { None } else {
+    match token_kind_at(input, parser, 1) {
+      StringLiteral(text) -> Some({ text: text, holed: false }),
+      InterpolatedHead(text) -> Some({ text: text, holed: true }),
+      _ -> None,
+    }
   }
+
+fn tagged(
+  input: Input,
+  parser: Parser,
+  name: Bytes,
+  head: TaggedHead,
+) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
+  let tag = current_span(input, parser);
+  let named = advance(input, parser).parser;
+  let quoted = current_span(input, named);
+  let { parser, node: hs } = (if head.holed { holes(input, named) }
+  else { Ok({ parser: advance(input, named).parser, node: [] }) })?;
+  let last = match list_at(hs, len(hs) - 1) { Some(h) -> h.quoted, None -> quoted };
+  Ok({
+    parser: parser,
+    node: ETagged({
+      span: span_to(tag, last),
+      tag: { name: name, span: tag },
+      text: head.text,
+      quoted: quoted,
+      holes: hs,
+    }),
+  })
+}
 
 fn primary_paren(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let saved = parser.no_brace;
@@ -795,41 +850,46 @@ fn interpolated(
   parser: Parser,
   head: Bytes,
 ) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
-  let saved = parser.no_brace;
   let first = current_span(input, parser);
-  match holes(input, with_no_brace(parser, false), first, [
-      ELit({ span: first, lit: LStr(head) }),
-    ]) {
+  let { parser, node: hs } = holes(input, parser)?;
+  let last = match list_at(hs, len(hs) - 1) { Some(h) -> h.quoted, None -> first };
+  let parts = fold(hs, [ELit({ span: first, lit: LStr(head) })], |acc: List<Expr>, h: Hole|
+    push(push(acc, displayed(h.value)), ELit({ span: h.quoted, lit: LStr(h.text) })));
+  Ok({ parser: parser, node: concatenated(span_to(first, last), parts) })
+}
+
+/// At an `InterpolatedHead`: every hole of its string and the text after each, a brace inside a
+/// hole read as an expression's.
+fn holes(input: Input, parser: Parser) -> Result<Parsed<List<Hole>>, Parser> / {abort.raise} = {
+  let saved = parser.no_brace;
+  match holes_on(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, saved)),
     Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-/// At a `InterpolatedHead` or a `InterpolatedMiddle`: the hole after it and the text that closes the
-/// hole, a round each, every round passing at least the token that opens its hole.
-fn holes(
-  input: Input,
-  parser: Parser,
-  first: Span,
-  parts: List<Expr>,
-) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
-  iterate({ parser: parser, out: parts }, input.token_count - parser.pos + 1, |s: SoFar<Expr>| {
+/// At an `InterpolatedHead` or an `InterpolatedMiddle`: the hole after it and the text that closes
+/// the hole, a round each, every round passing at least the token that opens its hole.
+fn holes_on(input: Input, parser: Parser) -> Result<Parsed<List<Hole>>, Parser> / {abort.raise} =
+  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: SoFar<Hole>| {
     let opened = advance(input, s.parser);
     match expr(input, opened.parser) {
       Err(q) -> Stop(Err(q)),
       Ok(r) -> {
-        let shown = push(s.out, displayed(r.node));
         let sp = current_span(input, r.parser);
         match token_kind(input, r.parser) {
           InterpolatedMiddle(t) ->
-            Continue({ parser: r.parser, out: push(shown, ELit({ span: sp, lit: LStr(t) })) }),
-          InterpolatedTail(t) -> {
-            let closed = advance(input, r.parser);
-            let all = push(shown, ELit({ span: sp, lit: LStr(t) }));
+            Continue({
+              parser: r.parser,
+              out: push(s.out, { value: r.node, text: t, quoted: sp }),
+            }),
+          InterpolatedTail(t) ->
             Stop(
-              Ok({ parser: closed.parser, node: concatenated(span_to(first, closed.node), all) }),
-            )
-          },
+              Ok({
+                parser: advance(input, r.parser).parser,
+                node: push(s.out, { value: r.node, text: t, quoted: sp }),
+              }),
+            ),
           _ -> Stop(Err(error_here(input, r.parser, b"`}` to close the interpolated value"))),
         }
       },
@@ -1961,7 +2021,12 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
     ESimulate(v) -> bytes_concat(dump_node(v.span, b"esim"), dump_expr(v.body)),
     EParallel(v) -> bytes_concat(dump_node(v.span, b"epar"), dump_list(v.branches, dump_expr)),
     ETagged(v) ->
-      bytes_concat_all([dump_node(v.span, b"etag"), dump_ident(v.tag), dump_lit(LStr(v.text))]),
+      bytes_concat_all([
+        dump_node(v.span, b"etag"),
+        dump_ident(v.tag),
+        dump_lit(LStr(v.text)),
+        dump_list(v.holes, |h: Hole| bytes_concat(dump_expr(h.value), dump_lit(LStr(h.text)))),
+      ]),
     EBad(v) -> dump_node(v.span, b"ebad"),
     ETryBlock(v) ->
       bytes_concat_all([
@@ -2094,7 +2159,7 @@ pub fn node_count(expr: Expr) -> Int =
     EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
     ESimulate(v) -> 1 + node_count(v.body),
     EParallel(v) -> 1 + count_all(v.branches),
-    ETagged(v) -> 1,
+    ETagged(v) -> 1 + fold(v.holes, 0, |n: Int, h: Hole| n + node_count(h.value)),
     EBad(v) -> 1,
     ETryBlock(v) -> 1 + node_count(v.body),
   }
@@ -2311,13 +2376,26 @@ test "a literal keeps its own span and its decoded value" {
 }
 
 test "a name touching a string is a tagged literal, and a postfix follows it as it follows any" {
-  assert_eq(dump_expr_of(b"hex\"a\\n\""), "0:8:etag;0:3:ident;@686578;%str;@610a;#0;");
+  assert_eq(dump_expr_of(b"hex\"a\\n\""), "0:8:etag;0:3:ident;@686578;%str;@610a;#0;#0;");
   assert_eq(
     dump_expr_of(b"hex\"\".n"),
-    "0:7:efld;0:5:etag;0:3:ident;@686578;%str;@;6:7:ident;@6e;#0;",
+    "0:7:efld;0:5:etag;0:3:ident;@686578;%str;@;#0;6:7:ident;@6e;#0;",
   );
   // A space apart they are a name and then a string, which is no one expression.
   assert_eq(dump_expr_of(b"hex \"a\""), "#1;!E0001:4:7:1:0;=4:7:1;")
+}
+
+test "a tagged literal's holes are expressions between its texts, braces of their own included" {
+  assert_eq(
+    dump_expr_of(b"sh\"a {x} {{b}}\""),
+    "0:15:etag;0:2:ident;@7368;%str;@6120;#1;6:7:evar;6:7:qname;?0;6:7:ident;@78;%str;@207b627d;#0;",
+  );
+  assert_eq(
+    dump_expr_of(b"sh\"{ {n: 1}.n }{sh\"{y}\"}\""),
+    "0:25:etag;0:2:ident;@7368;%str;@;#2;5:13:efld;5:11:erec;#1;6:7:ident;@6e;9:10:elit;%int;@31;12:13:ident;@6e;%str;@;16:23:etag;16:18:ident;@7368;%str;@;#1;20:21:evar;20:21:qname;?0;20:21:ident;@79;%str;@;%str;@;#0;",
+  );
+  // A hole that does not close is the interpolated string's diagnostic.
+  assert(string_starts_with(dump_expr_of(b"sh\"{x y}\""), "#1;!E0001"))
 }
 
 test "a float and a decimal are the source text, and no value is ever built" {

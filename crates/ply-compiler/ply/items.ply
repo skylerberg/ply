@@ -14,7 +14,7 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 dump_word, dump_bool, dump_list, dump_opt, dump_ident, dump_qname, dump_diags, Doc,
                 doc_at, module_doc, token_between, dump_doc, primary_span_of)
 import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, Keyword, Punctuation,
-              EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark)
+              EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark, follows_name)
 import type_syntax (TypeExpr, TRecord, TUnit, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead,
                     MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row,
                     row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
@@ -380,6 +380,23 @@ pub fn item_doc(item: Item) -> Option<Doc> =
     IDerive(_) -> None,
     IInstance(_) -> None,
     INumeric(_) -> None,
+  }
+
+/// The type an item states functions of, which whatever keeps the type's declaration keeps with
+/// it: a comparison, a `show` or an operator reaches them from a value, and from no body.
+pub fn stated_type(item: Item) -> Option<Ident> =
+  match item {
+    IInstance(d) -> Some(d.target),
+    INumeric(d) -> Some(d.target),
+    IFn(_) -> None,
+    IType(_) -> None,
+    IEffect(_) -> None,
+    ITest(_) -> None,
+    ILaw(_) -> None,
+    ISchema(_) -> None,
+    IDerive(_) -> None,
+    IEffectSet(_) -> None,
+    IExtern(_) -> None,
   }
 
 pub fn item_span(item: Item) -> Span =
@@ -2170,12 +2187,14 @@ fn first_cases(items: List<Item>) -> Option<Span> =
     })
 
 /// Where the module first interpolates or derives `show`, either of which calls into `std.show`.
-fn first_shown(input: Input, items: List<Item>) -> Option<Span> = {
+fn first_shown(input: Input, items: List<Item>) -> Option<Span> / {abort.raise} = {
   let hole = fold(input.tokens, None, |acc: Option<Span>, token: Token|
     match acc {
       Some(_) -> acc,
       None -> match token.kind {
-        InterpolatedHead(_) -> Some({ start: token.start, end: token.end }),
+        // A tagged literal's holes are its tag's to read, not `std.show`'s.
+        InterpolatedHead(_) -> if follows_name(input.source, token.start) { None }
+        else { Some({ start: token.start, end: token.end }) },
         _ -> None,
       },
     });
@@ -2770,7 +2789,10 @@ test "a test over cases binds a name at a type and ranges over a table, and its 
   // Its holes and its cases are read through two modules no source imports.
   assert_eq(len(r.node.imports), 2);
   assert_eq(len(filter(r.node.imports, is_written)), 0);
-  assert_eq(len(parse(b"test \"n\" { assert(true) }\n").node.imports), 0)
+  assert_eq(len(parse(b"test \"n\" { assert(true) }\n").node.imports), 0);
+  // A tagged literal's holes are its tag's to read: they bring in neither.
+  assert_eq(len(parse(b"fn f(n: Int) -> Int = sh\"a {n}\"\n").node.imports), 0);
+  assert_eq(len(parse(b"fn f(n: Int) -> Int = sh\"a {f\"{n}\"}\"\n").node.imports), 1)
 }
 
 test "a test over cases names its case's type and its table, and only a quoted label takes holes" {
@@ -2998,6 +3020,13 @@ test "`numeric for T by { .. }` is an item, and `numeric` is still a constraint'
     _ -> panic("a type, a numeric and a function"),
   };
   assert_eq(len(parse(b"fn numeric(n: Int) -> Int = n\n").parser.diags), 0);
+  // A word against a string is a tagged literal's tag, in an expression, and opens no item.
+  assert_eq(
+    len(parse(b"fn g() -> Int = key\"a\" + show\"b\" + numeric\"c\" + by\"d\"\n").parser.diags),
+    0,
+  );
+  assert(len(parse(b"numeric\"a\" for T by { add: f }\n").parser.diags) > 0);
+  assert(len(parse(b"key\"a\" for T by f\n").parser.diags) > 0);
   assert(len(parse(b"numeric for T by f\n").parser.diags) > 0);
   assert(len(parse(b"pub numeric for T by { add: f }\n").parser.diags) > 0);
   // Its functions carry the docs; a `///` above the item documents nothing.
