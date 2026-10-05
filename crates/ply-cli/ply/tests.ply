@@ -26,8 +26,9 @@ import configuration
 import surface
 import machine
 import compiler.diagnostics (parse_all)
-import compiler.front (Analysed, Refused, Analysis, analyse, analyse_pulling_std_with, ModuleSpan,
-                       test_roots, viewed_text)
+import compiler.front (Analysed, Refused, Analysis, Embedded, analyse, analyse_pulling_std_with,
+                       ModuleSpan, test_roots, viewed_text)
+import compiler.embed (EmbedWant, wants_by_item)
 import compiler.unit (codes, shipped)
 import compiler.hash (closure_of)
 import compiler.infer (DefInfo, TestInfo)
@@ -44,7 +45,7 @@ import paths
 import program (Timed, load_diagnostics, front_of, in_shipped_module, is_shipped, modules_of,
                 timed_over, timed_uncached_over, unmoved)
 import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
-import sources (Embed, Project, load_resolved)
+import sources (Embed, File, Project, load_resolved)
 import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null, parse_string)
@@ -1896,9 +1897,9 @@ pub fn iterated(
     } else { None },
     None -> None,
   };
-  match match key { Some(k) -> replayed(flags, options, k, begun), None -> None } {
+  match match key { Some(k) -> replayed(flags, options, k, project, begun), None -> None } {
     Some(answer) -> { answer: answer, held: None, embeds: project.embeds },
-    None -> {
+    None -> if flags.kept { { answer: unkept(flags), held: None, embeds: project.embeds } } else {
       let t: Timed = loaded(flags, options, held, project, started);
       over_load(flags, options, s, t, begun, match key {
         Some(k) -> if viewed_whole(t.program) {
@@ -1910,10 +1911,85 @@ pub fn iterated(
   }
 }
 
+/// What `--kept` answers where no kept answer stands: exit 4, and nothing loaded or run.
+fn unkept(flags: Flags) -> Answer =
+  {
+    json: object([
+      { key: "command", value: Str("test") },
+      { key: "ok", value: Bool(false) },
+      { key: "exit_code", value: int(unkept_code()) },
+      { key: "kept", value: Bool(false) },
+    ]),
+    lines: [],
+    errs: if flags.json { [] } else {
+      [
+        indent()
+          ++ "nothing kept answers this run: none was kept for this command line, or a pass or shipped definition it took moved",
+      ]
+    },
+    code: unkept_code(),
+  }
+
+fn unkept_code() -> Int = 4
+
 /// Where a run keeps its answer for the next run over the same command (`answers`): the key, its
 /// load's views of the shipped modules, and the keys of the passes it took. `after` is an answer
 /// selected again after the run filed its passes, which the store's warnings on opening are not in.
 type Keeping = { key: String, views: Bytes, passes: List<String>, after: Bool }
+
+/// The embeds the tests in `scope` reach, as a kept answer holds them: one asked for by a definition,
+/// test or law the tests reach, and always one a dependency asks for, one an item that declares no
+/// name asks for, and one no item of its module is found asking for.
+fn reached_embeds(
+  p: program::Program,
+  analysis: Analysis,
+  scope: Scope,
+) -> List<answers::Embedding> / {abort.raise} = {
+  let reach = closure_of(
+    analysis.hashes,
+    fold(scope.visible, [], |acc: List<Bytes>, i: Int|
+      match test_at(analysis, i) { Some(t) -> push(acc, t.key), None -> acc }),
+  );
+  let texts = fold(p.files, map_new(), |acc: Map<Bytes, Bytes>, f: File|
+    map_insert(acc, bytes_of_string(f.module), f.text));
+  let asking = fold(
+    p.embeds,
+    map_new(),
+    |acc: Map<Bytes, List<{ name: Option<Bytes>, wants: List<EmbedWant> }>>, e: Embed|
+      if e.embedded.root != p.pkgs.root || map_contains(acc, e.embedded.module) { acc } else {
+        match map_get(texts, e.embedded.module) {
+          None -> acc,
+          Some(text) -> match parse_all([{ name: e.embedded.module, src: text }]) {
+            [parsed, ..] -> map_insert(acc, e.embedded.module, wants_by_item(parsed.module.module)),
+            [] -> acc,
+          },
+        }
+      },
+  );
+  let reached = |e: Embedded|
+    e.root != p.pkgs.root
+      || (match map_get(asking, e.module) {
+        None -> true,
+        Some(items) -> {
+          let wanting = filter(items, |item: { name: Option<Bytes>, wants: List<EmbedWant> }|
+            fold(item.wants, false, |hit: Bool, w: EmbedWant|
+              hit || (w.path == e.want.path && w.dir == e.want.dir)));
+          len(wanting) == 0
+            || fold(
+              wanting,
+              false,
+              |hit: Bool, item: { name: Option<Bytes>, wants: List<EmbedWant> }|
+                hit
+                  || (match item.name {
+                    None -> true,
+                    Some(n) -> map_contains(reach, qualify(e.module, n)),
+                  }),
+            )
+        },
+      });
+  map(filter(p.embeds, |e: Embed| reached(e.embedded)), |e: Embed|
+    answers::embedding_of(e.embedded))
+}
 
 /// A run whose answer the next may take: one that consults the store, answers once and as a plain
 /// run does, and reads no configuration file the key does not cover.
@@ -1950,13 +2026,14 @@ fn unwarned(answer: Answer) -> Bool =
     _ -> false,
   }
 
-/// The answer a run kept under `key`, where it answers this one: every pass it took still stands
-/// and its load's views of the shipped modules still hold. A text run prints what that one printed
-/// before its answer.
+/// The answer a run kept under `key`, where it answers this one: every pass it took still stands,
+/// its load's views of the shipped modules still hold and each embed its tests reach in `project`
+/// reads as it did. A text run prints what that one printed before its answer.
 fn replayed(
   flags: Flags,
   options: Options,
   key: String,
+  project: Project,
   begun: Int,
 ) -> Option<Answer> / {time.elapsed_us, process.out[proc], fs.list_dir[shipped], fs.read_file[shipped], tester.configure[corpus], tester.ended[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], abort.raise} = {
   tester.configure[corpus](options);
@@ -1964,7 +2041,7 @@ fn replayed(
     match list_at(ledger.passes([key]), 0) {
       Some(Some(bytes)) -> match answers::decoded(bytes) {
         None -> None,
-        Some(k) -> {
+        Some(k) -> if !answers::embeds_stand(k.embeds, project) { None } else {
           let viewed = views::split(k.views).viewed;
           let held = ledger.passes(k.passes);
           let now = views::now_for(push(views::viewed_in(traces_of(held)), viewed));
@@ -2904,6 +2981,7 @@ fn concluded_run(
               json: to_string(answer.json),
               passes: k.passes,
               views: k.views,
+              embeds: reached_embeds(timed.program, analysis, scope),
             }),
           },
         ],
