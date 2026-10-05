@@ -2353,7 +2353,10 @@ every definition's hash, references, effects and specifications, which the
 front end takes as they are. A module whose source or package manifest moved
 since, or that embeds a file that reads otherwise, or that imports a module
 either is true of, is read from source, as is one the package
-lacks, and the package is cut again from the load's own analysis, so a package
+lacks; a shipped module that moved only by gaining definitions, every one the
+package fixed of it hashing as it did, is read from source alone, and what
+imports it still reads its stub. The package is cut again from the load's own
+analysis, so a package
 costs no analysis of its own; a project keeps one per semantics version (§15.1),
 so a `ply` that changes nothing a hash or a row means reads the one another
 kept. A registry dependency's first load reads it through the interface its
