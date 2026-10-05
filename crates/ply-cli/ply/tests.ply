@@ -1886,19 +1886,49 @@ pub fn iterated(
   let begun = time.elapsed_us();
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
-  let key = match argv {
+  let keys = match argv {
     Some(line) -> if held == None && keeps_answer(options) {
-      Some(answers::key_of(answers::program(), line, project))
+      let program = answers::program();
+      Some({
+        key: answers::key_of(program, line, project),
+        alone: map(alone_lines(line, flags.filters), |a: { filter: String, line: List<String> }|
+          { filter: a.filter, key: answers::key_of(program, a.line, project) }),
+      })
     } else { None },
     None -> None,
   };
-  match match key { Some(k) -> replayed(flags, options, k, project, begun), None -> None } {
+  match match keys { Some(k) -> replayed(flags, options, k.key, project, begun), None -> None } {
     Some(answer) -> { answer: answer, held: None, embeds: project.embeds },
-    None -> if flags.kept { { answer: unkept(flags), held: None, embeds: project.embeds } } else {
+    None -> if flags.kept {
+      let unanswered = match keys {
+        Some(k) -> if len(k.alone) == 0 { flags.filters } else {
+          map(
+            filter(k.alone, |a: { filter: String, key: String }|
+              replayed({ ..flags, json: true }, options, a.key, project, begun) == None),
+            |a: { filter: String, key: String }| a.filter,
+          )
+        },
+        None -> flags.filters,
+      };
+      {
+        answer: unkept(flags, unanswered, match keys {
+          Some(k) -> len(k.alone) > 0,
+          None -> false,
+        }),
+        held: None,
+        embeds: project.embeds,
+      }
+    } else {
       let t: Timed = loaded(flags, options, held, project, started);
-      over_load(flags, options, s, t, begun, match key {
+      over_load(flags, options, s, t, begun, match keys {
         Some(k) -> if viewed_whole(t.program) {
-          Some({ key: k, views: viewed_text(t.program.viewed), passes: [], after: false })
+          Some({
+            key: k.key,
+            views: viewed_text(t.program.viewed),
+            passes: [],
+            after: false,
+            alone: k.alone,
+          })
         } else { None },
         None -> None,
       })
@@ -1906,31 +1936,67 @@ pub fn iterated(
   }
 }
 
-/// What `--kept` answers where no kept answer stands: exit 4, and nothing loaded or run.
-fn unkept(flags: Flags) -> Answer =
+/// What `--kept` answers where no kept answer of the whole run stands. A run of several `--filter`s
+/// asked each what a run of it alone kept, and `unanswered` holds those nothing kept answers: exit 0
+/// where every one was answered. Exit 4 otherwise, and nothing loaded or run.
+fn unkept(flags: Flags, unanswered: List<String>, apart: Bool) -> Answer = {
+  let code = if apart && len(unanswered) == 0 { ok_code() } else { unkept_code() };
   {
     json: object([
       { key: "command", value: Str("test") },
-      { key: "ok", value: Bool(false) },
-      { key: "exit_code", value: int(unkept_code()) },
-      { key: "kept", value: Bool(false) },
+      { key: "ok", value: Bool(code == ok_code()) },
+      { key: "exit_code", value: int(code) },
+      { key: "kept", value: Bool(code == ok_code()) },
+      { key: "unanswered", value: strings(unanswered) },
     ]),
     lines: [],
-    errs: if flags.json { [] } else {
+    errs: if flags.json || code == ok_code() { [] } else {
       [
         indent()
-          ++ "nothing kept answers this run: none was kept for this command line, or a pass or shipped definition it took moved",
+          ++ (if apart { "nothing kept answers these filters: " ++ join(unanswered, ", ") } else {
+            "nothing kept answers this run: none was kept for this command line, or a pass or shipped definition it took moved"
+          }),
       ]
     },
-    code: unkept_code(),
+    code: code,
   }
+}
 
 fn unkept_code() -> Int = 4
 
 /// Where a run keeps its answer for the next run over the same command (`answers`): the key, its
 /// load's views of the shipped modules, and the keys of the passes it took. `after` is an answer
 /// selected again after the run filed its passes, which the store's warnings on opening are not in.
-type Keeping = { key: String, views: Bytes, passes: List<String>, after: Bool }
+/// `alone` is, for a run of several `--filter`s, each with the key a run of it alone keeps under.
+type Keeping = {
+  key: String,
+  views: Bytes,
+  passes: List<String>,
+  after: Bool,
+  alone: List<{ filter: String, key: String }>,
+}
+
+/// Each `--filter` of a run of several with the command line a run of it alone spells: every other
+/// `--filter` and its value left out.
+fn alone_lines(
+  line: List<String>,
+  filters: List<String>,
+) -> List<{ filter: String, line: List<String> }> / {abort.raise} =
+  if len(filters) < 2 { [] } else {
+    map(filters, |f: String|
+      {
+        filter: f,
+        line: fold(
+          range(0, len(line)),
+          { out: [], skip: false },
+          |acc: { out: List<String>, skip: Bool }, i: Int|
+            if acc.skip { { ..acc, skip: false } }
+            else if at_or(line, i, "") == "--filter" && at_or(line, i + 1, "") != f {
+              { ..acc, skip: true }
+            } else { { ..acc, out: push(acc.out, at_or(line, i, "")) } },
+        ).out,
+      })
+  }
 
 /// The embeds the tests in `scope` reach, as a kept answer holds them: one asked for by a definition,
 /// test or law the tests reach, and always one a dependency asks for, one an item that declares no
@@ -2557,42 +2623,52 @@ fn decided_run(
                     let again = cases_of(rows_of(analysis), search, false);
                     let settled = decide(again.cases);
                     if all_cached(settled, scope) {
-                      let next = program_of(
-                        options,
-                        { ..timed, program: { ..timed.program, cache_warnings: [] } },
-                        analysis,
-                        over.entries,
-                        root_of(flags.paths),
-                        scope,
-                        [],
-                        filed_under,
-                      );
-                      let _ = concluded_run(
-                        flags,
-                        style,
-                        options,
-                        next,
-                        timed,
-                        analysis,
-                        over.judged,
-                        scope,
-                        settled,
-                        decided_of(next, settled, search, sim_json(searching, options.sim), [], []),
-                        map_new(),
-                        {
-                          refiled: [],
-                          kept: Some({
-                            ..k,
-                            passes: answered_by(again.answering, scope),
-                            after: true,
-                          }),
-                        },
-                        searching,
-                        r.warnings,
-                        targeted,
-                        spent,
-                      );
-                      ()
+                      let kept_as = |f: Flags, o: Options, sc: Scope, key: String| {
+                        let next = program_of(
+                          o,
+                          { ..timed, program: { ..timed.program, cache_warnings: [] } },
+                          analysis,
+                          over.entries,
+                          root_of(flags.paths),
+                          sc,
+                          [],
+                          filed_under,
+                        );
+                        let _ = concluded_run(
+                          f,
+                          style,
+                          o,
+                          next,
+                          timed,
+                          analysis,
+                          over.judged,
+                          sc,
+                          settled,
+                          decided_of(next, settled, search, sim_json(searching, o.sim), [], []),
+                          map_new(),
+                          {
+                            refiled: [],
+                            kept: Some({
+                              ..k,
+                              key: key,
+                              passes: answered_by(again.answering, sc),
+                              after: true,
+                              alone: [],
+                            }),
+                          },
+                          searching,
+                          r.warnings,
+                          targeted,
+                          spent,
+                        );
+                        ()
+                      };
+                      kept_as(flags, options, scope, k.key);
+                      // Each `--filter` of several kept apart too, as a run of it alone answers.
+                      fold(k.alone, (), |u: Unit, a: { filter: String, key: String }| {
+                        let o = { ..options, filters: [a.filter] };
+                        kept_as({ ..flags, filters: [a.filter] }, o, scope_of(analysis, o), a.key)
+                      })
                     }
                   },
                   None -> (),
