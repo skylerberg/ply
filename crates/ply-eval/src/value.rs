@@ -672,6 +672,25 @@ impl Fixed {
         }
     }
 
+    /// As `checked`, with the type's least or greatest value where the exact answer leaves it:
+    /// the least where it falls below, which a sum does when it adds a negative, a difference when
+    /// it takes away anything else, and a product when the signs differ.
+    pub fn saturating(self, other: Fixed, op: FixedOp) -> Fixed {
+        self.checked(other, op).unwrap_or_else(|| {
+            let negative = |f: Fixed| f.ty.signed() && (f.bits() as i128) < 0;
+            let below = match op {
+                FixedOp::Add => negative(other),
+                FixedOp::Sub => !negative(other),
+                _ => negative(self) != negative(other),
+            };
+            if below {
+                Fixed::new(self.ty, self.ty.min() as u128)
+            } else {
+                Fixed::new(self.ty, self.ty.max())
+            }
+        })
+    }
+
     /// `None` for a signed width's least value, and for any unsigned value but zero.
     pub fn checked_neg(self) -> Option<Fixed> {
         if self.ty.signed() {

@@ -4,7 +4,7 @@ import parsing (Span, Ident, QName, span_to, dummy_span, span_key, span_bin, is_
                 starts_upper)
 import std.bin
 import std.hash (blake3)
-import std.list (at, concat, contains, drop, sort_by, take, prepend)
+import std.list (at, concat, contains, drop, push_unique, sort, sort_by, take, prepend)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
@@ -19,9 +19,10 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
               MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered,
-              ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at, case_identity)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
-                 LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
+              ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at, case_identity,
+              call_operator, written_operator)
+import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
+                 LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
               TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
               OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
@@ -3311,14 +3312,37 @@ fn settle_bit_ops(checker: Checker) -> Checker / {abort.raise} = {
 fn bits_mismatch(checker: Checker, entry: BitOp, ty: Type) -> Checker / {abort.raise} = {
   let name = type_text(ty);
   let notes = [b"`Int` and the eight fixed-width types are the integer types"];
-  report_error_at(
-    checker,
-    b"E0201",
-    entry.span,
-    bytes_concat_all([entry.what, b" is not defined on `", name, b"`"]),
-    bytes_concat_all([b"has type `", name, b"`"]),
-    if name == b"Bool" { push(notes, bool_bits_note()) } else { notes },
-  )
+  let stated = match ty {
+    TyCon(k) -> match numeric_of(checker.numeric_types, k.name) { Some(_) -> true, None -> false },
+    _ -> false,
+  };
+  if entry.builtin && stated {
+    report_error_at(
+      checker,
+      b"E0223",
+      entry.span,
+      bytes_concat_all([
+        entry.what,
+        b" is the builtin integers', and `",
+        name,
+        b"` states its own arithmetic",
+      ]),
+      bytes_concat_all([b"has type `", name, b"`"]),
+      [
+        b"wrapping, saturating and checked arithmetic and the rotations act at a width, which a type that states `numeric` has not",
+        b"its `numeric` gives it `+`, `-`, `*` and unary `-`; its module has a function for anything else",
+      ],
+    )
+  } else {
+    report_error_at(
+      checker,
+      b"E0201",
+      entry.span,
+      bytes_concat_all([entry.what, b" is not defined on `", name, b"`"]),
+      bytes_concat_all([b"has type `", name, b"`"]),
+      if name == b"Bool" { push(notes, bool_bits_note()) } else { notes },
+    )
+  }
 }
 
 fn bool_bits_note() -> Bytes = b"`Bool` has `&&`, `||` and `!`; the bit operators are integers only"
@@ -4645,7 +4669,8 @@ fn infer_app(
   match func {
     EVar(v) -> match cell_form(checker, v.name) {
       Some(form) -> infer_cell_op(fill_labels(checker, span, labels, None), span, args, form),
-      None -> infer_app_general(checker, span, func, args, labels, hint),
+      None ->
+        infer_app_general(operator_hidden(checker, func, args), span, func, args, labels, hint),
     },
     _ -> infer_app_general(checker, span, func, args, labels, hint),
   }
@@ -4896,11 +4921,55 @@ fn int_builtin_name(func: Expr) -> Bytes =
 
 fn is_int_builtin(func: Expr) -> Bool = {
   let n = int_builtin_name(func);
-  n == b"wrap_add" || n == b"wrap_sub" || n == b"wrap_mul" || n == b"rotr" || n == b"checked_add"
+  n == b"wrap_add" || n == b"wrap_sub" || n == b"wrap_mul" || n == b"rotr" || n == b"rotl"
+    || n == b"checked_add"
     || n == b"checked_sub"
     || n == b"checked_mul"
     || n == b"checked_neg"
+    || call_operator(n) != None
 }
+
+/// A call as its diagnostics name it: the operator it was written as, or the builtin called.
+fn int_builtin_text(func: Expr, args: List<Expr>) -> Bytes =
+  bytes_concat_all([
+    b"`",
+    match written_operator(func, args) { Some(o) -> o.text, None -> int_builtin_name(func) },
+    b"`",
+  ])
+
+/// An operator the parser wrote as a call of a builtin means that builtin, so a binding of the
+/// builtin's name around one is refused rather than called.
+fn operator_hidden(checker: Checker, func: Expr, args: List<Expr>) -> Checker / {abort.raise} =
+  match ((func, written_operator(func, args))) {
+    (EVar(v), Some(o)) -> match env_depth_of(checker.env, o.name) {
+      Some(depth) -> if depth == 0 { checker } else {
+        report_error_at(
+          checker,
+          b"E0105",
+          v.span,
+          bytes_concat_all([
+            b"`",
+            o.text,
+            b"` is the builtin `",
+            o.name,
+            b"`, which a binding here hides",
+          ]),
+          bytes_concat_all([b"this would call the local `", o.name, b"`"]),
+          [
+            bytes_concat_all([
+              b"`a ",
+              o.text,
+              b" b` is written in the name `",
+              o.name,
+              b"`; give the binding another name",
+            ]),
+          ],
+        )
+      },
+      None -> checker,
+    },
+    _ -> checker,
+  }
 
 /// The member of the group being walked that a call names, when it names one.
 fn group_callee(checker: Checker, src: PerformSource) -> Option<Bytes> =
@@ -5354,7 +5423,7 @@ fn infer_app_general(
           ..checked,
           bit_ops: push(checked.bit_ops, {
             span: span,
-            what: bytes_concat_all([b"`", int_builtin_name(func), b"`"]),
+            what: int_builtin_text(func, args),
             ty: at(fn_.params, 0),
             builtin: true,
           }),
@@ -5537,6 +5606,7 @@ fn bind_pattern(
         checker: expect(checker, l.span, scrutinee, lit_type(l.lit), b"pattern literal").checker,
         out: out,
       },
+    PRange(r) -> { checker: bind_range(checker, r.span, r.lo, r.hi, scrutinee), out: out },
     PCtor(c) -> {
       let n: WithName = ctor_name(checker, c.name);
       let info = match n.name { Some(q) -> ctor_of(n.checker, q), None -> None };
@@ -5775,6 +5845,84 @@ fn same_binders(
   }
 }
 
+/// The integer type a literal is of, by its name.
+fn integer_of(literal: Lit) -> Option<Bytes> / {abort.raise} =
+  match literal {
+    LInt(_) -> Some(b"Int"),
+    LFixed(ty, _) -> Some(bytes_of_string(string_upper(string_of_bytes(ty)))),
+    LWide(ty, _, _) -> Some(bytes_of_string(string_upper(string_of_bytes(ty)))),
+    _ -> None,
+  }
+
+/// `a <= b` over the 64-bit patterns two unsigned values are held as.
+fn unsigned_le(a: Int, b: Int) -> Bool = {
+  let top = 0 - 9223372036854775807 - 1;
+  a ^ top <= b ^ top
+}
+
+/// Whether one integer literal is no greater than another of its type.
+fn literal_le(ty: Bytes, lo: Lit, hi: Lit) -> Bool =
+  match ((lo, hi)) {
+    (LInt(a), LInt(b)) -> a <= b,
+    (LFixed(_, a), LFixed(_, b)) -> if ty == b"U64" { unsigned_le(a, b) } else { a <= b },
+    (LWide(_, ah, al), LWide(_, bh, bl)) -> if ah == bh { unsigned_le(al, bl) }
+    else if ty == b"U128" { unsigned_le(ah, bh) }
+    else { ah <= bh },
+    _ -> false,
+  }
+
+/// A range's bounds are two integer literals of one type, the first no greater than the second.
+fn bind_range(
+  checker: Checker,
+  span: Span,
+  lo: Lit,
+  hi: Lit,
+  scrutinee: Type,
+) -> Checker / {abort.raise} = {
+  let form = [
+    b"a range is written `lo..=hi`, as in `0..=9` or `b'a'..=b'z'`, and holds both bounds",
+  ];
+  match ((integer_of(lo), integer_of(hi))) {
+    (Some(a), Some(b)) -> if a != b {
+      report_error_at(
+        checker,
+        b"E0222",
+        span,
+        b"a range pattern's bounds are of one integer type",
+        bytes_concat_all([b"from a `", a, b"` to a `", b, b"`"]),
+        form,
+      )
+    } else {
+      let typed: Checker = expect(
+        checker,
+        span,
+        scrutinee,
+        lit_type(lo),
+        b"pattern literal",
+      ).checker;
+      if literal_le(a, lo, hi) { typed } else {
+        report_error_at(
+          typed,
+          b"E0222",
+          span,
+          b"a range pattern's first bound is greater than its second",
+          b"no value is in this range",
+          form,
+        )
+      }
+    },
+    _ ->
+      report_error_at(
+        checker,
+        b"E0222",
+        span,
+        b"a range pattern's bounds are integer literals",
+        b"one of these is not an integer",
+        form,
+      ),
+  }
+}
+
 fn binder_ty(bs: List<{ name: Bytes, ty: Type }>, name: Bytes) -> Option<Type> =
   fold(bs, None, |acc: Option<Type>, b: { name: Bytes, ty: Type }|
     match acc { Some(_) -> acc, None -> if b.name == name { Some(b.ty) } else { None } })
@@ -5837,10 +5985,13 @@ type CoveragePattern =
   | CoverNothing
   | CoverCtor({ family: Bytes, key: Bytes, name: Bytes, args: List<CoveragePattern> })
   | CoverRecord(List<{ name: Bytes, pat: CoveragePattern }>)
+  /// The integers of the type `family` names from `lo` through `hi`: a literal's one, or a range's.
+  | CoverSpan({ family: Bytes, lo: Int, hi: Int })
   /// Never a row's head inside the search: `uncovered` splits it into a row per alternative first.
   | CoverEither(List<CoveragePattern>)
 
-type CoverageCtor = { key: Bytes, name: Bytes, arity: Int }
+/// `lo` and `hi` are the integers a cell of an integer column holds, and zero for a constructor.
+type CoverageCtor = { key: Bytes, name: Bytes, arity: Int, lo: Int, hi: Int }
 
 fn check_exhaustive(checker: Checker, span: Span, arms: List<MatchArm>) -> Checker / {abort.raise} = {
   let rows = fold(arms, [], |acc: List<List<CoveragePattern>>, arm: MatchArm|
@@ -5888,8 +6039,9 @@ fn coverage_pat(checker: Checker, p: Pattern) -> CoveragePattern / {abort.raise}
         CoverCtor({ family: b"#bool", key: k, name: k, args: [] })
       },
       LUnit -> CoverCtor({ family: b"#unit", key: b"()", name: b"()", args: [] }),
-      _ -> CoverCtor({ family: b"#lit", key: b"", name: b"", args: [] }),
+      other -> cover_span(other, other),
     },
+    PRange(r) -> cover_span(r.lo, r.hi),
     PList(l) -> {
       let n = len(l.items);
       let last = match l.rest { Some(r) -> coverage_pat(checker, r), None -> list_con(b"[]", []) };
@@ -5907,38 +6059,120 @@ fn coverage_pat(checker: Checker, p: Pattern) -> CoveragePattern / {abort.raise}
     PBad(_) -> CoverAny,
   }
 
+/// The values from one literal through another. Over `U8`, `U16` or `U32` they are a span of the
+/// type; no other integer type's least and greatest values are both literals, so no list of arms
+/// exhausts one and its literals stand as any other literal does.
+fn cover_span(lo: Lit, hi: Lit) -> CoveragePattern / {abort.raise} = {
+  let literal = CoverCtor({ family: b"#lit", key: b"", name: b"", args: [] });
+  match ((lo, hi)) {
+    (LFixed(_, a), LFixed(_, b)) -> match ((integer_of(lo), integer_of(hi))) {
+      (Some(ty), Some(other)) -> if ty != other { CoverNothing }
+      else if ty != b"U8" && ty != b"U16" && ty != b"U32" { literal }
+      else if a > b { CoverNothing }
+      else { CoverSpan({ family: bytes_concat(int_family(), ty), lo: a, hi: b }) },
+      _ -> literal,
+    },
+    _ -> literal,
+  }
+}
+
+fn int_family() -> Bytes = b"#int:"
+
+/// The greatest value of the unsigned width an integer column is of; its least is zero.
+fn int_top(family: Bytes) -> Int / {abort.raise} = {
+  let ty = bytes_slice(family, bytes_len(int_family()), bytes_len(family));
+  if ty == b"U8" { 255 } else if ty == b"U16" { 65535 } else { 4294967295 }
+}
+
+/// A cell as a pattern writes it: `7u8`, `0u8..=9u8`.
+fn span_text(family: Bytes, lo: Int, hi: Int) -> Bytes / {abort.raise} = {
+  let suffix = bytes_of_string(
+    string_lower(string_of_bytes(bytes_slice(family, bytes_len(int_family()), bytes_len(family)))),
+  );
+  if lo == hi { bytes_concat(ascii_of_int(lo), suffix) }
+  else { bytes_concat_all([ascii_of_int(lo), suffix, b"..=", ascii_of_int(hi), suffix]) }
+}
+
+/// The cells an integer column's heads cut its type into, least first. Each head holds whole cells
+/// and nothing else, so the cells stand for every value of the type as its constructors do a sum's.
+fn int_cells(
+  rows: List<List<CoveragePattern>>,
+  family: Bytes,
+) -> List<CoverageCtor> / {abort.raise} = {
+  let top = int_top(family);
+  let starts = sort(
+    fold(rows, [0], |acc: List<Int>, r: List<CoveragePattern>|
+      match at(r, 0) {
+        CoverSpan(s) -> if s.family != family { acc } else {
+          let from = push_unique(acc, s.lo);
+          if s.hi < top { push_unique(from, s.hi + 1) } else { from }
+        },
+        _ -> acc,
+      }),
+  );
+  map(range(0, len(starts)), |i: Int| {
+    let lo = at(starts, i);
+    let hi = if i + 1 < len(starts) { at(starts, i + 1) - 1 } else { top };
+    let text = span_text(family, lo, hi);
+    { key: text, name: text, arity: 0, lo: lo, hi: hi }
+  })
+}
+
+/// Whether a row's head is this constructor; a span is every cell it holds.
+fn heads(pattern: CoveragePattern, family: Bytes, k: CoverageCtor) -> Bool =
+  match pattern {
+    CoverCtor(c) -> c.family == family && c.key == k.key,
+    CoverSpan(s) -> s.family == family && s.lo <= k.lo && k.hi <= s.hi,
+    _ -> false,
+  }
+
 fn list_con(key: Bytes, args: List<CoveragePattern>) -> CoveragePattern =
   CoverCtor({ family: b"#list", key: key, name: key, args: args })
 
 fn wilds(n: Int) -> List<CoveragePattern> = map(range(0, n), |_: Int| CoverAny)
 
 fn family_of(pattern: CoveragePattern) -> Bytes =
-  match pattern { CoverCtor(c) -> c.family, CoverRecord(_) -> b"#rec", _ -> b"" }
+  match pattern {
+    CoverCtor(c) -> c.family,
+    CoverSpan(s) -> s.family,
+    CoverRecord(_) -> b"#rec",
+    _ -> b"",
+  }
 
 fn heads_ctor(
   rows: List<List<CoveragePattern>>,
   family: Bytes,
-  key: Bytes,
+  k: CoverageCtor,
 ) -> Bool / {abort.raise} =
-  fold(rows, false, |b: Bool, r: List<CoveragePattern>|
-    b || (match at(r, 0) { CoverCtor(c) -> c.family == family && c.key == key, _ -> false }))
+  fold(rows, false, |b: Bool, r: List<CoveragePattern>| b || heads(at(r, 0), family, k))
 
 /// `None` for a family no list of arms exhausts: literals, and a column that names no constructor.
-fn family_ctors(checker: Checker, family: Bytes) -> Option<List<CoverageCtor>> =
-  if family == b"#bool" {
-    Some([{ key: b"true", name: b"true", arity: 0 }, { key: b"false", name: b"false", arity: 0 }])
-  } else if family == b"#unit" { Some([{ key: b"()", name: b"()", arity: 0 }]) }
-  else if family == b"#list" {
-    Some([{ key: b"[]", name: b"[]", arity: 0 }, { key: b"::", name: b"::", arity: 2 }])
-  } else if family == b"#lit" || family == b"" { None } else {
+fn family_ctors(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  family: Bytes,
+) -> Option<List<CoverageCtor>> / {abort.raise} = {
+  let named = |key: Bytes, arity: Int| { key: key, name: key, arity: arity, lo: 0, hi: 0 };
+  if family == b"#bool" { Some([named(b"true", 0), named(b"false", 0)]) }
+  else if family == b"#unit" { Some([named(b"()", 0)]) }
+  else if family == b"#list" { Some([named(b"[]", 0), named(b"::", 2)]) }
+  else if family == b"#lit" || family == b"" { None }
+  else if bytes_starts_with(family, int_family()) { Some(int_cells(rows, family)) } else {
     Some(
       map(
         filter(checker.ctors, |ctor_info: CtorInfo| ctor_info.type_name == family),
         |ctor_info: CtorInfo|
-          { key: ctor_info.name, name: ctor_info.simple_name, arity: ctor_info.arity },
+          {
+            key: ctor_info.name,
+            name: ctor_info.simple_name,
+            arity: ctor_info.arity,
+            lo: 0,
+            hi: 0,
+          },
       ),
     )
   }
+}
 
 /// Rows of values no row matches, each `n` wide; empty when the rows are exhaustive.
 fn uncovered(
@@ -5962,6 +6196,7 @@ fn brought(p: CoveragePattern, most: Int) -> Int =
     CoverAny -> 0,
     CoverNothing -> 0,
     CoverCtor(c) -> fold(c.args, most, |n: Int, a: CoveragePattern| n + brought(a, most)),
+    CoverSpan(_) -> 0,
     CoverRecord(fs) ->
       fold(fs, len(fs), |n: Int, f: { name: Bytes, pat: CoveragePattern }|
         n + brought(f.pat, most)),
@@ -6011,14 +6246,14 @@ fn uncovered_split(
     let family = fold(rows, b"", |acc: Bytes, r: List<CoveragePattern>|
       if bytes_len(acc) > 0 { acc } else { family_of(at(r, 0)) });
     if family == b"#rec" { uncovered_record(checker, rows, n, room) } else {
-      match family_ctors(checker, family) {
+      match family_ctors(checker, rows, family) {
         None ->
           map(
             uncovered_within(checker, default_rows(rows, family), n - 1, room),
             |w: List<CoveragePattern>| prepend(CoverAny, w),
           ),
         Some(all) -> if fold(all, true, |b: Bool, k: CoverageCtor|
-            b && heads_ctor(rows, family, k.key)) {
+            b && heads_ctor(rows, family, k)) {
           fold(all, [], |acc: List<List<CoveragePattern>>, k: CoverageCtor|
             concat(acc, through(checker, rows, n, family, k, room)))
         } else {
@@ -6027,7 +6262,7 @@ fn uncovered_split(
             None -> [],
             Some(w) ->
               fold(all, [], |acc: List<List<CoveragePattern>>, k: CoverageCtor|
-                if heads_ctor(rows, family, k.key) {
+                if heads_ctor(rows, family, k) {
                   concat(acc, through(checker, rows, n, family, k, room))
                 } else {
                   push(
@@ -6074,6 +6309,8 @@ fn specialize(
       else if c.key != k.key { acc }
       else if len(c.args) == k.arity { push(acc, concat(c.args, drop(patterns, 1))) }
       else { push(acc, concat(wilds(k.arity), drop(patterns, 1))) },
+      CoverSpan(s) -> if s.family == family && !heads(at(patterns, 0), family, k) { acc }
+      else { push(acc, concat(wilds(k.arity), drop(patterns, 1))) },
       _ -> push(acc, concat(wilds(k.arity), drop(patterns, 1))),
     })
 
@@ -6085,6 +6322,7 @@ fn default_rows(
     match at(patterns, 0) {
       CoverNothing -> acc,
       CoverCtor(c) -> if c.family == family { acc } else { push(acc, drop(patterns, 1)) },
+      CoverSpan(s) -> if s.family == family { acc } else { push(acc, drop(patterns, 1)) },
       _ -> push(acc, drop(patterns, 1)),
     })
 
@@ -7777,6 +8015,24 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
               [
                 b"it is the order `Map` iterates in, and `derive ord` builds a dictionary out of it \xe2\x80\x94 a module that could redefine it would give one type two orders",
                 b"`compare` is the same operation under a name you may shadow",
+              ],
+            ),
+          }
+        } else if call_operator(def.name.name) != None {
+          {
+            ..acc,
+            checker: report_error_at(
+              acc.checker,
+              b"E0105",
+              def.name.span,
+              bytes_concat_all([b"`", def.name.name, b"` is a builtin"]),
+              b"cannot be redefined",
+              [
+                bytes_concat_all([
+                  b"the operator `",
+                  match call_operator(def.name.name) { Some(o) -> o.text, None -> b"" },
+                  b"` is written in its name, so a module that redefined it would change what the operator means",
+                ]),
               ],
             ),
           }
@@ -15871,6 +16127,71 @@ test "a plain `let` whose or-pattern can fail is refused, and one that covers it
   ])
 }
 
+test "literals and ranges exhaust an unsigned width they cover, and a match names what they miss" {
+  assert_eq(
+    not_covered(b"fn f(b: U8) -> Int = match b { 0u8..=127u8 -> 0, 128u8..=255u8 -> 1 }"),
+    [],
+  );
+  assert_eq(
+    not_covered(b"fn f(b: U8) -> Int = match b { 0u8..=200u8 -> 0, 100u8..=255u8 -> 1 }"),
+    [],
+  );
+  assert_eq(not_covered(b"fn f(b: U8) -> Int = match b { 0u8..=9u8 -> 0, 20u8..=255u8 -> 1 }"), [
+    b"not covered: `10u8..=19u8`",
+  ]);
+  assert_eq(
+    not_covered(b"fn f(b: U8) -> Int = match b { 0u8..=9u8 -> 0, 10u8 -> 1, 12u8..=255u8 -> 2 }"),
+    [b"not covered: `11u8`"],
+  );
+  assert_eq(not_covered(b"fn f(c: Int) -> Int = match c { 0..=9 -> 1, 5..=20 -> 2, _ -> 0 }"), []);
+  assert_eq(
+    not_covered(b"fn f(o: Option<U8>) -> Int = match o { Some(0u8..=254u8) -> 0, None -> 1 }"),
+    [b"not covered: `Some(255u8)`"],
+  );
+  assert_eq(
+    not_covered(
+      b"fn f(p: (U8, Bool)) -> Int = match p { (0u8..=9u8, true) -> 0, (_, false) -> 1 }",
+    ),
+    [b"not covered: `(10u8..=255u8, true)`"],
+  );
+  // No other integer type's least and greatest values are both literals, so only a `_` ends one.
+  assert_eq(not_covered(b"fn f(c: Int) -> Int = match c { b'0'..=b'9' -> 1 }"), [
+    b"not covered: `_`",
+  ]);
+  assert_eq(not_covered(b"fn f(t: I8) -> Int = match t { -127i8..=127i8 -> 1 }"), [
+    b"not covered: `_`",
+  ]);
+  assert_eq(
+    not_covered(b"fn f(n: U64) -> Int = match n { 0u64..=0xFFFF_FFFF_FFFF_FFFFu64 -> 0 }"),
+    [b"not covered: `_`"],
+  )
+}
+
+test "a range pattern's bounds are integer literals of one type, the first no greater" {
+  assert_eq(check_codes(b"fn f(n: Int) -> Int = match n { 0..=9 -> 1, 7..=7 -> 2, _ -> 0 }"), []);
+  assert_eq(check_codes(b"fn f(n: Int) -> Int = match n { 9..=0 -> 1, _ -> 0 }"), [b"E0222"]);
+  assert_eq(check_codes(b"fn f(n: Int) -> Int = match n { 0..=9u8 -> 1, _ -> 0 }"), [b"E0222"]);
+  assert_eq(check_codes(b"fn f(c: Char) -> Int = match c { 'a'..='z' -> 1, _ -> 0 }"), [b"E0222"]);
+  assert_eq(check_codes(b"fn f(s: String) -> Int = match s { \"a\"..=\"z\" -> 1, _ -> 0 }"), [
+    b"E0222",
+  ]);
+  assert_eq(check_codes(b"fn f(n: U8) -> Int = match n { 0..=9 -> 1, _ -> 0 }"), [b"E0201"]);
+  assert_eq(
+    check_codes(b"fn f(n: U64) -> Int = match n { 0xFFFF_FFFF_FFFF_FFFFu64..=1u64 -> 1, _ -> 0 }"),
+    [b"E0222"],
+  );
+  assert_eq(
+    check_codes(b"fn f(n: U64) -> Int = match n { 1u64..=0xFFFF_FFFF_FFFF_FFFFu64 -> 1, _ -> 0 }"),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f(n: I128) -> Int = match n { -1i128..=1i128 -> 1, 2i128..=1i128 -> 2, _ -> 0 }",
+    ),
+    [b"E0222"],
+  )
+}
+
 test "a `let ... else` checks its `else` against its block's value, without the pattern's names" {
   assert_eq(check_codes(b"fn f(o: Option<Int>) -> Int = { let Some(v) = o else { 0 }; v }"), []);
   assert_eq(
@@ -16807,6 +17128,62 @@ test "an operator at a type that states numeric is its function, and what it doe
     b"E0209",
   ]);
   assert_eq(check_codes(b"fn f<a>(x: a) -> a / {abort.raise} where integer(a) = x % x"), [])
+}
+
+test "a wrapping or saturating operator is its builtin, over a builtin integer type and no other" {
+  assert_eq(check_codes(b"fn f(a: U8, b: U8) -> U8 = a +% b *| a -| b -% a *% b +| a"), []);
+  assert_eq(check_codes(b"fn f(a: Int, b: Int) -> Int = a +| b *% a"), []);
+  assert_eq(check_codes(b"fn f(a: U8, b: U16) -> U8 = a +% b"), [b"E0201"]);
+  assert_eq(
+    map(check_diags(b"fn f(a: Float, b: Float) -> Float = a +% b"), |diag: Diag| diag.message),
+    [b"`+%` is not defined on `Float`"],
+  );
+  assert_eq(
+    map(check_diags(b"fn f(a: Float, b: Float) -> Float = wrap_add(a, b)"), |diag: Diag|
+      diag.message),
+    [b"`wrap_add` is not defined on `Float`"],
+  );
+  // The builtin is called at a type the call settles, never at a type parameter.
+  assert_eq(check_codes(b"fn f<a>(x: a, y: a) -> a where integer(a) = x *| y"), [b"E0210"]);
+  let n = b"type N = | N(Int)\nfn add(a: N, b: N) -> N = a\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\nnumeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }\n";
+  let over = |body: Bytes| check_codes(bytes_concat(n, body));
+  assert_eq(over(b"fn f(a: N, b: N) -> N = a +% b"), [b"E0223"]);
+  assert_eq(over(b"fn f(a: N, b: N) -> N = a -| b"), [b"E0223"]);
+  assert_eq(over(b"fn f(a: N, b: N) -> N = wrap_mul(a, b)"), [b"E0223"]);
+  assert_eq(over(b"fn f(a: N, b: N) -> Option<N> = checked_add(a, b)"), [b"E0223"]);
+  assert_eq(over(b"fn f(a: N) -> N = rotl(a, 1)"), [b"E0223"]);
+  // The bit operators are no builtin's call, and stay a mismatch.
+  assert_eq(over(b"fn f(a: N, b: N) -> N = a & b"), [b"E0201", b"E0201"])
+}
+
+test "the builtins the operators are written in belong to no module and no binding around one" {
+  assert_eq(check_codes(b"fn wrap_add(a: Int, b: Int) -> Int = 0"), [b"E0105"]);
+  assert_eq(check_codes(b"fn saturating_mul(a: Int, b: Int) -> Int = 0"), [b"E0105"]);
+  assert_eq(
+    check_codes(b"fn rotl(a: Int, b: Int) -> Int = 0\nfn checked_add(a: Int) -> Int = a"),
+    [],
+  );
+  let hidden = b"fn f(wrap_add: (Int, Int) -> Int, a: Int) -> Int = ";
+  assert_eq(check_codes(bytes_concat(hidden, b"a +% a")), [b"E0105"]);
+  assert_eq(check_codes(bytes_concat(hidden, b"wrap_add(a, a)")), []);
+  assert_eq(check_codes(bytes_concat(hidden, b"a -% a")), []);
+  assert_eq(
+    check_codes(b"fn f(a: Int) -> Int = { let saturating_sub = 1; a -| saturating_sub }"),
+    [b"E0105", b"E0204"],
+  )
+}
+
+test "to_int reads any integer type, and no other" {
+  assert_eq(
+    check_codes(
+      b"fn f(a: U8, b: I128, c: Int) -> List<Option<Int>> = [to_int(a), to_int(b), to_int(c)]",
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn f<a>(x: a) -> Option<Int> where integer(a) = to_int(x)"), []);
+  assert_eq(check_codes(b"fn f(a: Float) -> Option<Int> = to_int(a)"), [b"E0201"]);
+  assert_eq(check_codes(b"fn f<a>(x: a) -> Option<Int> where numeric(a) = to_int(x)"), [b"E0201"]);
+  assert_eq(check_codes(b"fn f<a>(x: a) -> Option<Int> = to_int(x)"), [b"E0201"])
 }
 
 test "a key is stated once, by its type's own module, for a sum" {
