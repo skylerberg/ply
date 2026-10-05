@@ -10,19 +10,38 @@
 //! magnitude), so the type states a `key`: `==`, the language's `compare`, `digest` and a `Map` take
 //! the numbers in `compare`'s order. It states `numeric` too: `a + b`, `a - b`, `a * b` and `-a` are
 //! `add`, `sub`, `mul` and `neg`, `<` and the rest read the key, and a definition over
-//! `numeric(a)`, as `std.math.sum`, takes a `BigInt`. Division is no operator: it truncates toward
-//! zero, and a zero divisor is `None` rather than a raise.
+//! `numeric(a)`, as `std.math.sum`, takes a `BigInt`. Division is no operator, and a zero divisor is
+//! `None` rather than a raise. It comes in the three roundings a program meets: `div_mod`, `div` and
+//! `modulo` truncate toward zero, as `Int`'s `/` and `%` do, so the remainder has the dividend's sign;
+//! `div_floor` and `floor_mod` round toward negative infinity, so it has the divisor's; and
+//! `div_euclid` and `rem_euclid` leave a remainder that is never negative. `div_round` rounds the
+//! quotient as a `Rounding` says.
+//!
+//! The bit operations read a number as two's complement with its sign repeated forever, as Java and
+//! Python do: `not(n)` is `-n - 1`, `-1` is all ones, and `shift_right` rounds toward negative
+//! infinity. The byte forms are big-endian: `to_bytes` is the magnitude alone, `to_bytes_signed` the
+//! two's complement DER's `INTEGER` holds, and each has a form of a given length. `show` writes the
+//! decimal spelling and `to_radix` any radix from 2 to 36; `big_int_json` and `big_int_bin` are the
+//! codecs a `derive` finds for a field of this type.
+//!
+//! Multiplication is schoolbook for short numbers and Karatsuba's for long ones, division is
+//! quadratic, and so is text in any radix, each way: a decimal spelling of `n` digits costs `n * n`,
+//! so bound what a peer may send. Nothing here takes the same time for every value, so a secret
+//! exponent or modulus leaks through how long a call takes.
 
-import std.bytes (strip_leading_zeros, u64_be)
+import std.bin
+import std.bytes (digit_value, strip_leading_zeros)
 import std.gen
 import std.gen (Gen)
-import std.laws (inverse, monoid, round_trip, total_order)
+import std.json
+import std.json (Json, Str)
+import std.laws (agrees, inverse, monoid, round_trip, total_order)
 import std.list (all, drop, reverse, take, at, at_or)
 import std.math
 
 /// A whole number of any size: whether it is negative, and its magnitude in base-2^30 limbs,
 /// least significant first.
-pub type BigInt = | BigInt(Bool, List<Int>)
+pub opaque type BigInt = | BigInt(Bool, List<Int>)
 
 key for BigInt by order_key
 
@@ -112,23 +131,13 @@ fn min_magnitude() -> List<Int> = [0, 0, 8]
 fn min_int() -> Int = 0 - 9223372036854775807 - 1
 
 /// The value in decimal, with a leading `-` when negative and no leading zeros otherwise.
-pub fn to_string(value: BigInt) -> String / {abort.raise} = {
-  let sign = if is_negative(value) { "-" } else { "" };
-  sign ++ magnitude_text(limbs_in(value))
-}
+pub fn to_string(value: BigInt) -> String = text_in(value, 10)
+
+show for BigInt by to_string
 
 /// The value a decimal spelling names, with an optional sign; `None` for anything else. Leading
 /// zeros are allowed, and `-0` and `+0` are both zero.
-pub fn of_string(text: String) -> Option<BigInt> / {abort.raise} =
-  if string_len(text) == 0 { None } else {
-    let negative = string_starts_with(text, "-");
-    let digits = if negative || string_starts_with(text, "+") {
-      string_slice(text, 1, string_len(text))
-    } else { text };
-    if string_len(digits) == 0 || !all_digits(digits) { None }
-    else if !any_nonzero(digits) { Some(zero()) }
-    else { Some(BigInt(negative, limbs_of_digits(digits))) }
-  }
+pub fn of_string(text: String) -> Option<BigInt> = read_in(text, 10)
 
 /// What a `bigint"..."` literal is checked by: the value a decimal spelling names, or the first
 /// character that is no part of one.
@@ -145,33 +154,6 @@ pub fn literal(text: String) -> Result<BigInt, { message: String, offset: Int }>
         None -> { message: "a number has at least one digit", offset: n },
       })
     },
-  }
-
-/// The number big-endian octets spell, which is never negative; no octets spell zero.
-pub fn of_bytes(octets: Bytes) -> BigInt / {abort.raise} =
-  fold(range(0, (bytes_len(octets) + 6) / 7), zero(), |acc: BigInt, chunk: Int| {
-    let to = min(chunk * 7 + 7, bytes_len(octets));
-    add(
-      shift_left(acc, 8 * (to - chunk * 7)),
-      of_int(fold(range(chunk * 7, to), 0, |n: Int, i: Int| n << 8 | bytes_at(octets, i))),
-    )
-  })
-
-/// The big-endian octets of the number's distance from zero, with no leading zero octet: none for
-/// zero.
-pub fn to_bytes(value: BigInt) -> Bytes / {abort.raise} =
-  strip_leading_zeros(bytes_concat_all(reverse(sevens(abs_value(value), [], 9223372036854775807))))
-
-/// The number seven octets at a time, least significant first. `left` is only what the recursion
-/// descends by: a number in memory has fewer chunks than an `Int` counts.
-fn sevens(n: BigInt, acc: List<Bytes>, left: Int) -> List<Bytes> / {abort.raise} =
-  if is_zero(n) || left <= 0 { acc } else {
-    let rest = shift_right(n, 56);
-    let low = match to_int(sub(n, shift_left(rest, 56))) {
-      Some(v) -> v,
-      None -> panic("fifty-six bits are an Int"),
-    };
-    sevens(rest, push(acc, bytes_slice(u64_be(low), 1, 8)), left - 1)
   }
 
 /// The order of the numbers, by sign first and then by magnitude.
@@ -197,31 +179,28 @@ pub fn add(a: BigInt, b: BigInt) -> BigInt =
 /// `a - b`.
 pub fn sub(a: BigInt, b: BigInt) -> BigInt = add(a, neg(b))
 
-/// Schoolbook multiplication: every pair of limbs contributes once, at the place the two place
-/// values add up to.
+/// `a * b`: every pair of limbs contributes once, at the place the two place values add up to,
+/// and numbers long enough are split in half so that three products do the work of four.
 pub fn mul(a: BigInt, b: BigInt) -> BigInt =
   if is_zero(a) || is_zero(b) { zero() }
   else { make(is_negative(a) != is_negative(b), mul_limbs(limbs_in(a), limbs_in(b))) }
 
 /// Long division, truncated toward zero: `q` carries the sign of `a * b` and `r` the sign of `a`,
 /// so `a == q * b + r` and `|r| < |b|`. A zero divisor has no quotient and answers `None`.
-pub fn div_mod(a: BigInt, b: BigInt) -> Option<{ q: BigInt, r: BigInt }> / {abort.raise} =
-  if is_zero(b) { None } else {
-    let split = div_mod_limbs(limbs_in(a), limbs_in(b));
-    Some({ q: make(is_negative(a) != is_negative(b), split.q), r: make(is_negative(a), split.r) })
-  }
+pub fn div_mod(a: BigInt, b: BigInt) -> Option<{ q: BigInt, r: BigInt }> =
+  if is_zero(b) { None } else { Some(truncated(a, b)) }
 
 /// The quotient of `div_mod`, truncated toward zero; `None` for a zero divisor.
-pub fn div(a: BigInt, b: BigInt) -> Option<BigInt> / {abort.raise} =
+pub fn div(a: BigInt, b: BigInt) -> Option<BigInt> =
   match div_mod(a, b) { None -> None, Some(split) -> Some(split.q) }
 
 /// The remainder of `div_mod`, with the dividend's sign; `None` for a zero divisor.
-pub fn modulo(a: BigInt, b: BigInt) -> Option<BigInt> / {abort.raise} =
+pub fn modulo(a: BigInt, b: BigInt) -> Option<BigInt> =
   match div_mod(a, b) { None -> None, Some(split) -> Some(split.r) }
 
 /// The remainder with the divisor's sign rather than the dividend's, which is what a modular
 /// exponentiation wants. `None` for a zero divisor.
-pub fn floor_mod(a: BigInt, b: BigInt) -> Option<BigInt> / {abort.raise} =
+pub fn floor_mod(a: BigInt, b: BigInt) -> Option<BigInt> =
   match div_mod(a, b) {
     None -> None,
     Some(split) -> if is_negative(split.r) != is_negative(b) && !is_zero(split.r) {
@@ -233,16 +212,21 @@ pub fn floor_mod(a: BigInt, b: BigInt) -> Option<BigInt> / {abort.raise} =
 pub fn pow(base: BigInt, exponent: Int) -> BigInt / {abort.raise} =
   if exponent < 0 { one() } else { pow_from(base, exponent, one()) }
 
-/// `base ^ exponent mod modulus`, by squaring with a reduction at each step, so no intermediate
-/// value grows past the modulus. A modulus that is not positive, or a negative exponent, has no
-/// answer and is `None`.
-pub fn mod_pow(base: BigInt, exponent: Int, modulus: BigInt) -> Option<BigInt> / {abort.raise} =
-  if exponent < 0 || !is_positive(modulus) { None }
-  else { Some(mod_pow_from(reduced(base, modulus), exponent, modulus, one())) }
+/// `base ^ exponent mod modulus`, in `0..modulus`, by squaring with a reduction at each step, so no
+/// intermediate value grows past the modulus squared. A negative exponent raises the base's
+/// `mod_inverse` to its magnitude. `None` for a modulus that is not positive, and for a negative
+/// exponent of a base that has no inverse.
+pub fn mod_pow(base: BigInt, exponent: BigInt, modulus: BigInt) -> Option<BigInt> =
+  if !is_positive(modulus) { None } else if is_negative(exponent) {
+    match mod_inverse(base, modulus) {
+      None -> None,
+      Some(inverse) -> Some(mod_pow_bits(inverse, limbs_in(exponent), modulus)),
+    }
+  } else { Some(mod_pow_bits(floored(base, modulus), limbs_in(exponent), modulus)) }
 
 /// The greatest common divisor, never negative; `gcd(0, 0)` is `0`.
-pub fn gcd(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
-  gcd_from(abs_value(a), abs_value(b), 2 * bits_above(limbs_in(b)) + 2)
+pub fn gcd(a: BigInt, b: BigInt) -> BigInt =
+  make(false, gcd_limbs(limbs_in(a), limbs_in(b), 2 * bits_above(limbs_in(b)) + 2))
 
 /// How many bits the value's distance from zero is written in: none for zero.
 pub fn bit_length(value: BigInt) -> Int = bits_above(limbs_in(value))
@@ -252,36 +236,221 @@ pub fn shift_left(value: BigInt, bits: Int) -> BigInt =
   if bits <= 0 || is_zero(value) { value }
   else { make(is_negative(value), shift_limbs(limbs_in(value), bits)) }
 
-/// The value shifted right by `bits`, truncating toward zero like the division it is.
+/// The value shifted right by `bits`, rounding toward negative infinity as an arithmetic shift
+/// does: `div_floor` by that power of two. A non-positive count is the value itself.
 pub fn shift_right(value: BigInt, bits: Int) -> BigInt =
-  if bits <= 0 { value } else { make(is_negative(value), unshift_limbs(limbs_in(value), bits)) }
+  if bits <= 0 { value }
+  else if is_negative(value) { not(make(false, unshift_limbs(plain_limbs(value), bits))) }
+  else { make(false, unshift_limbs(limbs_in(value), bits)) }
+
+// --- Division by its rounding -----------------------------------------------
+
+/// The quotient rounded toward negative infinity, which `floor_mod` is the remainder of:
+/// `a == div_floor(a, b) * b + floor_mod(a, b)`. `None` for a zero divisor.
+pub fn div_floor(a: BigInt, b: BigInt) -> Option<BigInt> =
+  match div_mod(a, b) {
+    None -> None,
+    Some(split) -> if is_negative(split.r) != is_negative(b) && !is_zero(split.r) {
+      Some(sub(split.q, one()))
+    } else { Some(split.q) },
+  }
+
+/// The quotient whose remainder is `rem_euclid`'s: `a == div_euclid(a, b) * b + rem_euclid(a, b)`.
+/// `None` for a zero divisor.
+pub fn div_euclid(a: BigInt, b: BigInt) -> Option<BigInt> =
+  match div_mod(a, b) {
+    None -> None,
+    Some(split) -> if !is_negative(split.r) { Some(split.q) }
+    else if is_negative(b) { Some(add(split.q, one())) }
+    else { Some(sub(split.q, one())) },
+  }
+
+/// The remainder that is never negative, whatever the signs: in `0..|b|`. `None` for a zero
+/// divisor.
+pub fn rem_euclid(a: BigInt, b: BigInt) -> Option<BigInt> =
+  match div_mod(a, b) {
+    None -> None,
+    Some(split) -> if is_negative(split.r) { Some(add(split.r, abs_value(b))) }
+    else { Some(split.r) },
+  }
+
+/// The quotient rounded as `mode` says, which is the prelude's `Rounding` and means what it does
+/// for a `Decimal`: `Down` is `div`, `Floor` is `div_floor`, `Up` is away from zero, and the two
+/// halves go to the nearer whole number, a tie away from zero or to the even one. `None` for a zero
+/// divisor.
+pub fn div_round(a: BigInt, b: BigInt, mode: Rounding) -> Option<BigInt> =
+  if is_zero(b) { None } else {
+    let split = truncated(a, b);
+    if is_zero(split.r) { Some(split.q) } else {
+      let negative = is_negative(a) != is_negative(b);
+      let away = if negative { sub(split.q, one()) } else { add(split.q, one()) };
+      let half = compare_limbs(add_limbs(limbs_in(split.r), limbs_in(split.r)), limbs_in(b));
+      Some(match mode {
+        Down -> split.q,
+        Up -> away,
+        Floor -> if negative { away } else { split.q },
+        Ceiling -> if negative { split.q } else { away },
+        HalfUp -> if half == Less { split.q } else { away },
+        HalfEven -> if half == Greater || (half == Equal && bit_at(limbs_in(split.q), 0)) { away }
+        else { split.q },
+      })
+    }
+  }
+
+// --- Bits -------------------------------------------------------------------
+
+/// The bits both numbers have, in two's complement: negative only when both are.
+pub fn and(a: BigInt, b: BigInt) -> BigInt = bitwise(a, b, |x: Int, y: Int| x & y)
+
+/// The bits either number has, in two's complement: negative when either is.
+pub fn or(a: BigInt, b: BigInt) -> BigInt = bitwise(a, b, |x: Int, y: Int| x | y)
+
+/// The bits exactly one of the numbers has, in two's complement: negative when one is.
+pub fn xor(a: BigInt, b: BigInt) -> BigInt = bitwise(a, b, |x: Int, y: Int| x ^ y)
+
+/// Every bit flipped, in two's complement: `-value - 1`.
+pub fn not(value: BigInt) -> BigInt = sub(neg(value), one())
+
+/// Whether bit `i` of the two's complement is set, bit `0` being the lowest. A negative number has
+/// every bit set from some bit up, and no number has a bit below `0`.
+pub fn test_bit(value: BigInt, i: Int) -> Bool =
+  i >= 0 && bit_at(plain_limbs(value), i) != is_negative(value)
+
+/// The value with bit `i` set; the value itself for an `i` below `0`.
+pub fn set_bit(value: BigInt, i: Int) -> BigInt =
+  if i < 0 { value } else { or(value, shift_left(one(), i)) }
+
+/// The value with bit `i` cleared; the value itself for an `i` below `0`.
+pub fn clear_bit(value: BigInt, i: Int) -> BigInt =
+  if i < 0 { value } else { and(value, not(shift_left(one(), i))) }
+
+/// The value with bit `i` flipped; the value itself for an `i` below `0`.
+pub fn flip_bit(value: BigInt, i: Int) -> BigInt =
+  if i < 0 { value } else { xor(value, shift_left(one(), i)) }
+
+// --- Bytes ------------------------------------------------------------------
+
+/// The number big-endian bytes spell, read as unsigned: never negative, and zero for no bytes.
+pub fn of_bytes(octets: Bytes) -> BigInt = make(false, limbs_of_octets(octets, 0))
+
+/// The magnitude in the fewest big-endian bytes: none for zero. The sign is not written, so
+/// `of_bytes` reads back the distance from zero.
+pub fn to_bytes(value: BigInt) -> Bytes = {
+  let octets = octets_of(limbs_in(value));
+  bytes_of_octets(octets, len(octets), 0)
+}
+
+/// The magnitude in exactly `length` big-endian bytes, zeros leading; `None` where it needs more.
+pub fn to_bytes_fixed(value: BigInt, length: Int) -> Option<Bytes> = {
+  let octets = octets_of(limbs_in(value));
+  if len(octets) > length { None } else { Some(bytes_of_octets(octets, length, 0)) }
+}
+
+/// The number big-endian two's complement bytes spell, the first byte's top bit its sign; zero for
+/// no bytes. Bytes that only repeat the sign are read as the sign they repeat.
+pub fn of_bytes_signed(bytes: Bytes) -> BigInt =
+  if bytes_len(bytes) > 0 && byte_at(bytes, 0) >= 128 {
+    not(make(false, limbs_of_octets(bytes, 255)))
+  } else { of_bytes(bytes) }
+
+/// The value's two's complement in the fewest big-endian bytes, which is at least one: what DER's
+/// `INTEGER` and Java's `toByteArray` hold.
+pub fn to_bytes_signed(value: BigInt) -> Bytes = signed_bytes(value, signed_length(value))
+
+/// The value's two's complement in exactly `length` big-endian bytes, the sign repeated above it;
+/// `None` where the value and its sign bit need more.
+pub fn to_bytes_signed_fixed(value: BigInt, length: Int) -> Option<Bytes> =
+  if signed_length(value) > length { None } else { Some(signed_bytes(value, length)) }
+
+// --- Text in a radix --------------------------------------------------------
+
+/// The value in `radix`, digits `0` to `9` and then `a` to `z`, with a leading `-` when negative
+/// and no leading zeros otherwise. Raises for a radix outside `2..=36`.
+pub fn to_radix(value: BigInt, radix: Int) -> String / {abort.raise} =
+  if radix < 2 || radix > 36 { panic("a radix is 2 to 36") } else { text_in(value, radix) }
+
+/// The value a spelling in `radix` names, with an optional sign and letters of either case; `None`
+/// for anything else, a digit the radix does not have included. Raises for a radix outside
+/// `2..=36`.
+pub fn from_radix(text: String, radix: Int) -> Option<BigInt> / {abort.raise} =
+  if radix < 2 || radix > 36 { panic("a radix is 2 to 36") } else { read_in(text, radix) }
+
+// --- Number theory ----------------------------------------------------------
+
+/// The greatest common divisor with Bézout's coefficients: `a * x + b * y == gcd`, the `gcd`
+/// never negative, and zero only for two zeros.
+pub fn gcd_extended(a: BigInt, b: BigInt) -> { gcd: BigInt, x: BigInt, y: BigInt } = {
+  let found = bezout(a, b, one(), zero(), zero(), one(), 2 * bits_above(limbs_in(b)) + 2);
+  if is_negative(found.gcd) { { gcd: neg(found.gcd), x: neg(found.x), y: neg(found.y) } }
+  else { found }
+}
+
+/// The `x` in `0..modulus` with `a * x ≡ 1 (mod modulus)`. `None` where there is none: `a` and
+/// the modulus share a factor, or the modulus is not positive.
+pub fn mod_inverse(a: BigInt, modulus: BigInt) -> Option<BigInt> =
+  if !is_positive(modulus) { None } else {
+    let found = gcd_extended(floored(a, modulus), modulus);
+    if is_one(found.gcd) { Some(floored(found.x, modulus)) } else { None }
+  }
+
+/// The integer square root: the greatest `r` whose square is at most the value. `None` for a
+/// negative value, which has none.
+pub fn isqrt(value: BigInt) -> Option<BigInt> =
+  if is_negative(value) { None }
+  else if is_zero(value) { Some(value) } else {
+    let bits = bits_above(limbs_in(value));
+    Some(root_from(value, shift_left(one(), (bits + 1) / 2), bits + 2))
+  }
+
+// --- Codecs -----------------------------------------------------------------
+
+/// A `BigInt` as its decimal spelling in a JSON string, since parsers disagree about a JSON
+/// number past `2^53`. It reads any spelling `of_string` does, and no JSON number.
+pub fn big_int_json() -> json::JsonCodec<BigInt> =
+  {
+    encode: |n: BigInt| Str(to_string(n)),
+    decode: |j: Json|
+      match j {
+        Str(text) -> match of_string(text) {
+          Some(n) -> Ok(n),
+          None -> Err(json::decode_error("`" ++ text ++ "` is not a whole number in decimal")),
+        },
+        _ -> Err(json::expected("a whole number in a string", j)),
+      },
+  }
+
+/// A `BigInt` as its `to_bytes_signed` behind their count. One value has one encoding, so bytes
+/// that only repeat the sign are refused, as no bytes at all are.
+pub fn big_int_bin() -> bin::BinCodec<BigInt> =
+  {
+    put: |w: Bytes, n: BigInt| bin::put_bytes(w, to_bytes_signed(n)),
+    take: |d: Bytes, from: Int|
+      match bin::take_bytes(d, from) {
+        Err(e) -> Err(e),
+        Ok(taken) -> if to_bytes_signed(of_bytes_signed(taken.value)) == taken.value {
+          Ok({ value: of_bytes_signed(taken.value), at: taken.at })
+        } else { Err({ at: from, message: "a whole number not in its fewest bytes" }) },
+      },
+    shape: bin::leaf_shape("std.bigint.BigInt"),
+  }
 
 // --- The magnitude ----------------------------------------------------------
 
 /// An `Int` that is not negative as limbs, least significant first: three hold its 63 bits.
 fn limbs_of(n: Int) -> List<Int> = trim_high([low(n), low(carried(n)), carried(carried(n))])
 
-/// The magnitude of a decimal spelling: `acc * 10 + digit` for each digit, in base-2^30 limbs.
-fn limbs_of_digits(digits: String) -> List<Int> / {abort.raise} =
-  fold(range(0, string_len(digits)), [], |acc: List<Int>, i: Int|
-    add_limbs(scale_limbs(acc, 10), [digit_at(digits, i)]))
-
-/// A magnitude times a small `Int`.
-fn scale_limbs(limbs: List<Int>, factor: Int) -> List<Int> / {abort.raise} =
-  scale_limbs_from(limbs, factor, 0, [])
-
-fn scale_limbs_from(
-  limbs: List<Int>,
-  factor: Int,
-  i: Int,
-  out: List<Int>,
-) -> List<Int> / {abort.raise} =
-  if i >= len(limbs) { out }
-  else { scale_limbs_from(limbs, factor, i + 1, carry_into(out, i, at_or(limbs, i, 0) * factor)) }
-
-/// The digit `"0".."9"` at `i` as its number.
-fn digit_at(text: String, i: Int) -> Int / {abort.raise} =
-  string_find(digits_text(), string_slice(text, i, i + 1))
+/// `limbs * factor + addend`, for a factor and an addend below the base.
+fn scale_limbs(limbs: List<Int>, factor: Int, addend: Int) -> List<Int> = {
+  let scaled = fold(
+    limbs,
+    { carry: addend, out: [] },
+    |acc: { carry: Int, out: List<Int> }, limb: Int| {
+      let value = limb * factor + acc.carry;
+      { carry: carried(value), out: push(acc.out, low(value)) }
+    },
+  );
+  if scaled.carry == 0 { scaled.out } else { push(scaled.out, scaled.carry) }
+}
 
 fn digits_text() -> String = "0123456789"
 
@@ -289,9 +458,8 @@ fn all_digits(text: String) -> Bool / {abort.raise} =
   fold(range(0, string_len(text)), true, |acc: Bool, i: Int|
     acc && string_contains(digits_text(), string_slice(text, i, i + 1)))
 
-fn any_nonzero(text: String) -> Bool / {abort.raise} =
-  fold(range(0, string_len(text)), false, |acc: Bool, i: Int|
-    acc || string_slice(text, i, i + 1) != "0")
+/// `n / d` for a divisor the caller has placed above zero, which a row cannot say.
+fn quotient(n: Int, d: Int) -> Int = handle { n / d } with { abort.raise(_) -> 0 }
 
 /// A value from a sign and a magnitude, with the canonical form kept: the high zero limbs dropped,
 /// and no negative zero.
@@ -346,10 +514,50 @@ fn sub_from(a: List<Int>, b: List<Int>, i: Int, borrow: Int, out: List<Int>) -> 
     else { sub_from(a, b, i + 1, 0, push(out, difference)) }
   }
 
+/// The product of two magnitudes. `depth` is only what the recursion descends by: each level
+/// halves the longer number, so twice the bits of the lengths is more levels than there are.
+fn mul_limbs(a: List<Int>, b: List<Int>) -> List<Int> =
+  mul_halves(a, b, 2 * bits_in(len(a) + len(b)))
+
+/// Karatsuba's product: with `a = a1 * x + a0` and `b = b1 * x + b0`, the middle term
+/// `a1 * b0 + a0 * b1` is `(a0 + a1) * (b0 + b1) - a0 * b0 - a1 * b1`, so three products of half
+/// the length make the whole. A number at most half the other's length is multiplied by each half.
+fn mul_halves(a: List<Int>, b: List<Int>, depth: Int) -> List<Int> =
+  if depth <= 0 || len(a) < karatsuba_from() || len(b) < karatsuba_from() { mul_schoolbook(a, b) }
+  else {
+    let half = (max(len(a), len(b)) + 1) / 2;
+    if len(a) <= half { mul_halves(b, a, depth - 1) } else if len(b) <= half {
+      add_limbs(
+        mul_halves(trim_high(take(a, half)), b, depth - 1),
+        pad_low(half, mul_halves(drop(a, half), b, depth - 1)),
+      )
+    } else {
+      let a_low = trim_high(take(a, half));
+      let b_low = trim_high(take(b, half));
+      let low_product = mul_halves(a_low, b_low, depth - 1);
+      let high_product = mul_halves(drop(a, half), drop(b, half), depth - 1);
+      let both = mul_halves(
+        add_limbs(a_low, drop(a, half)),
+        add_limbs(b_low, drop(b, half)),
+        depth - 1,
+      );
+      add_limbs(
+        add_limbs(
+          low_product,
+          pad_low(half, sub_limbs(sub_limbs(both, low_product), high_product)),
+        ),
+        pad_low(2 * half, high_product),
+      )
+    }
+  }
+
+/// The length in limbs from which splitting a product in half beats schoolbook.
+fn karatsuba_from() -> Int = 48
+
 /// The product of two magnitudes, a limb at a time: limb `k` is every `a[i] * b[k - i]` and what
 /// the limb below carried. A product is under 2^60, so its two halves are summed apart, and
 /// neither sum leaves an `Int` for any number memory holds.
-fn mul_limbs(a: List<Int>, b: List<Int>) -> List<Int> = {
+fn mul_schoolbook(a: List<Int>, b: List<Int>) -> List<Int> = {
   let columns = fold(
     range(0, len(a) + len(b)),
     { carry: 0, out: [] },
@@ -368,47 +576,85 @@ fn mul_limbs(a: List<Int>, b: List<Int>) -> List<Int> = {
   trim_high(columns.out)
 }
 
-/// Adds `carry` at `offset`, propagating across as many limbs as it takes: those `acc` holds, and
-/// past them the three a 63-bit carry fills.
-fn carry_into(acc: List<Int>, offset: Int, carry: Int) -> List<Int> / {abort.raise} =
-  iterate(
-    { acc: acc, offset: offset, carry: carry },
-    len(acc) + 4,
-    |s: { acc: List<Int>, offset: Int, carry: Int }|
-      if s.carry <= 0 { Stop(s.acc) } else if s.offset >= len(s.acc) {
-        Continue({
-          acc: push(s.acc, s.carry % word_base()),
-          offset: s.offset + 1,
-          carry: s.carry / word_base(),
-        })
-      } else {
-        let sum = at_or(s.acc, s.offset, 0) + s.carry;
-        Continue({
-          acc: list_set(s.acc, s.offset, sum % word_base()),
-          offset: s.offset + 1,
-          carry: sum / word_base(),
-        })
-      },
-  )
+/// `a / b` truncated toward zero and what is left, for a divisor that is not zero.
+fn truncated(a: BigInt, b: BigInt) -> { q: BigInt, r: BigInt } = {
+  let split = div_mod_limbs(limbs_in(a), limbs_in(b));
+  { q: make(is_negative(a) != is_negative(b), split.q), r: make(is_negative(a), split.r) }
+}
 
-/// Binary long division: walk the dividend's bits from the top, shifting the remainder up and
-/// bringing the next bit in, and set the quotient's bit wherever the divisor fits.
-fn div_mod_limbs(num: List<Int>, den: List<Int>) -> { q: List<Int>, r: List<Int> } / {abort.raise} =
-  div_bits(num, den, bits_above(num) - 1, zeros(len(num)), [])
+/// `value` brought into `0..modulus`, for a modulus above zero.
+fn floored(value: BigInt, modulus: BigInt) -> BigInt = {
+  let rest = truncated(value, modulus).r;
+  if is_negative(rest) { add(rest, modulus) } else { rest }
+}
 
-fn div_bits(
-  num: List<Int>,
-  den: List<Int>,
-  i: Int,
-  q: List<Int>,
-  r: List<Int>,
-) -> { q: List<Int>, r: List<Int> } / {abort.raise} =
-  if i < 0 { { q: q, r: r } } else {
-    let shifted = shift_left_one(r);
-    let brought = if bit_at(num, i) == 1 { add_limbs(shifted, [1]) } else { shifted };
-    if is_less(compare_limbs(brought, den)) { div_bits(num, den, i - 1, q, brought) }
-    else { div_bits(num, den, i - 1, set_bit(q, i), sub_limbs(brought, den)) }
+/// The quotient and remainder of two magnitudes, the divisor not zero. A divisor of one limb is
+/// short division. A longer one is Knuth's algorithm D: both numbers are shifted until the
+/// divisor's top bit is set, which keeps a quotient limb guessed from the top limbs within two of
+/// the true one.
+fn div_mod_limbs(num: List<Int>, den: List<Int>) -> { q: List<Int>, r: List<Int> } =
+  if len(den) == 0 || is_less(compare_limbs(num, den)) { { q: [], r: num } } else if len(den) == 1 {
+    let split = divide_small(num, at_or(den, 0, 1));
+    { q: split.q, r: trim_high([split.r]) }
+  } else {
+    let shift = word_bits() - bits_in(at_or(den, len(den) - 1, 0));
+    let split = divide_long(shift_part(num, shift), shift_part(den, shift));
+    { q: split.q, r: trim_high(unshift_part(split.r, shift)) }
   }
+
+/// Long division by a divisor of two limbs or more whose top bit is set: the remainder is carried
+/// from the dividend's top limb down, the next limb brought in below it at each step.
+fn divide_long(num: List<Int>, den: List<Int>) -> { q: List<Int>, r: List<Int> } = {
+  let split = fold(
+    range(0, len(num)),
+    { q: [], r: [] },
+    |acc: { q: List<Int>, r: List<Int> }, k: Int| {
+      let step = quotient_limb(acc.r, at_or(num, len(num) - 1 - k, 0), den);
+      { q: push(acc.q, step.limb), r: step.r }
+    },
+  );
+  { q: trim_high(reverse(split.q)), r: split.r }
+}
+
+/// One limb of a long division: the quotient of `r * base + low_limb` by `den`, where `r` is
+/// below `den`, and what is left. The guess is taken off limb by limb, and a guess one too large
+/// shows as a borrow out of the top, which adding the divisor back once undoes.
+fn quotient_limb(r: List<Int>, low_limb: Int, den: List<Int>) -> { limb: Int, r: List<Int> } = {
+  let n = len(den);
+  let top = at_or(r, n - 1, 0) * word_base() + at_or(r, n - 2, 0);
+  let lead = at_or(den, n - 1, 1);
+  let first = min(quotient(top, lead), word_base() - 1);
+  let guess = lowered(
+    first,
+    top - first * lead,
+    lead,
+    at_or(den, n - 2, 0),
+    brought(r, low_limb, n - 2),
+  );
+  let left = fold(
+    range(0, n),
+    { carry: 0, out: [] },
+    |acc: { carry: Int, out: List<Int> }, i: Int| {
+      let taken = guess * at_or(den, i, 0) + acc.carry;
+      let rest = brought(r, low_limb, i) - low(taken);
+      if rest < 0 { { carry: carried(taken) + 1, out: push(acc.out, rest + word_base()) } }
+      else { { carry: carried(taken), out: push(acc.out, rest) } }
+    },
+  );
+  if at_or(r, n - 1, 0) < left.carry { { limb: guess - 1, r: take(add_limbs(left.out, den), n) } }
+  else { { limb: guess, r: left.out } }
+}
+
+/// Limb `i` of `r * base + low_limb`.
+fn brought(r: List<Int>, low_limb: Int, i: Int) -> Int =
+  if i == 0 { low_limb } else { at_or(r, i - 1, 0) }
+
+/// A guessed quotient limb, lowered while the divisor's second limb shows it too large: `rest` is
+/// what the guess leaves of the top two limbs, and `next` the dividend's limb below them.
+fn lowered(guess: Int, rest: Int, lead: Int, second: Int, next: Int) -> Int =
+  if guess > 0 && rest < word_base() && guess * second > rest * word_base() + next {
+    lowered(guess - 1, rest + lead, lead, second, next)
+  } else { guess }
 
 fn bits_above(limbs: List<Int>) -> Int =
   if len(limbs) == 0 { 0 }
@@ -416,28 +662,88 @@ fn bits_above(limbs: List<Int>) -> Int =
 
 fn bits_in(n: Int) -> Int = if n <= 0 { 0 } else { 1 + bits_in(n / 2) }
 
-fn bit_at(limbs: List<Int>, i: Int) -> Int / {abort.raise} =
-  if i < 0 || len(limbs) == 0 { 0 }
-  else { at_or(limbs, i / word_bits(), 0) / math::pow(2, i % word_bits()) % 2 }
+/// The limbs of a number's bits below its sign: its own, or a negative number's each flipped,
+/// which are those of `not` of it.
+fn plain_limbs(value: BigInt) -> List<Int> =
+  limbs_in(if is_negative(value) { not(value) } else { value })
 
-fn set_bit(limbs: List<Int>, i: Int) -> List<Int> / {abort.raise} = {
-  let word = i / word_bits();
-  list_set(limbs, word, at_or(limbs, word, 0) + math::pow(2, i % word_bits()))
+/// The fewest bytes that hold a value's two's complement, its sign bit included.
+fn signed_length(value: BigInt) -> Int = bits_above(plain_limbs(value)) / 8 + 1
+
+/// Whether bit `i` of a magnitude is set; no bit is below `0` or past the top.
+fn bit_at(limbs: List<Int>, i: Int) -> Bool = i >= 0 && at_or(limbs, i / 30, 0) >> i % 30 & 1 == 1
+
+/// A number as two's complement: its limbs, and the limb that repeats above them forever. A
+/// negative number's bits are those of the magnitude less one, each flipped.
+fn complement(value: BigInt) -> { limbs: List<Int>, fill: Int } =
+  if is_negative(value) {
+    {
+      limbs: map(sub_limbs(limbs_in(value), [1]), |limb: Int| limb ^ word_base() - 1),
+      fill: word_base() - 1,
+    }
+  } else { { limbs: limbs_in(value), fill: 0 } }
+
+/// The number a two's complement spells, which is negative where ones repeat above its limbs.
+fn of_complement(limbs: List<Int>, fill: Int) -> BigInt =
+  if fill == 0 { make(false, limbs) }
+  else { make(true, add_limbs(map(limbs, |limb: Int| limb ^ word_base() - 1), [1])) }
+
+/// `op` limb by limb over two numbers in two's complement, the shorter one's sign filling in.
+fn bitwise(a: BigInt, b: BigInt, op: (Int, Int) -> Int) -> BigInt = {
+  let x = complement(a);
+  let y = complement(b);
+  of_complement(
+    map(range(0, max(len(x.limbs), len(y.limbs))), |i: Int|
+      op(at_or(x.limbs, i, x.fill), at_or(y.limbs, i, y.fill))),
+    op(x.fill, y.fill),
+  )
 }
 
-fn shift_left_one(limbs: List<Int>) -> List<Int> / {abort.raise} =
-  trim_high(shift_one_from(limbs, 0, 0, []))
+/// A magnitude as bytes, least significant first, with no high zero byte: each limb's thirty
+/// bits join what the limb below left over, and every whole byte is taken off.
+fn octets_of(limbs: List<Int>) -> List<Int> = {
+  let packed = fold(
+    limbs,
+    { held: 0, bits: 0, out: [] },
+    |acc: { held: Int, bits: Int, out: List<Int> }, limb: Int|
+      spilled(acc.held | limb << acc.bits, acc.bits + 30, acc.out),
+  );
+  trim_high(push(packed.out, packed.held))
+}
 
-fn shift_one_from(
-  limbs: List<Int>,
-  i: Int,
-  carry: Int,
-  out: List<Int>,
-) -> List<Int> / {abort.raise} =
-  if i >= len(limbs) { if carry == 0 { out } else { push(out, carry) } } else {
-    let doubled = at_or(limbs, i, 0) * 2 + carry;
-    shift_one_from(limbs, i + 1, doubled / word_base(), push(out, doubled % word_base()))
-  }
+fn spilled(held: Int, bits: Int, out: List<Int>) -> { held: Int, bits: Int, out: List<Int> } =
+  if bits < 8 { { held: held, bits: bits, out: out } }
+  else { spilled(held >> 8, bits - 8, push(out, held & 255)) }
+
+/// The magnitude big-endian bytes spell, each byte flipped by `mask` first.
+fn limbs_of_octets(bytes: Bytes, mask: Int) -> List<Int> = {
+  let n = bytes_len(bytes);
+  let packed = fold(
+    range(0, n),
+    { held: 0, bits: 0, out: [] },
+    |acc: { held: Int, bits: Int, out: List<Int> }, k: Int| {
+      let held = acc.held | (byte_at(bytes, n - 1 - k) ^ mask) << acc.bits;
+      if acc.bits + 8 < 30 { { held: held, bits: acc.bits + 8, out: acc.out } }
+      else { { held: carried(held), bits: acc.bits + 8 - 30, out: push(acc.out, low(held)) } }
+    },
+  );
+  trim_high(push(packed.out, packed.held))
+}
+
+/// `length` big-endian bytes of octets held least significant first, each flipped by `mask`, which
+/// is also what fills in above them.
+fn bytes_of_octets(octets: List<Int>, length: Int, mask: Int) -> Bytes =
+  bytes_concat_all(map(range(0, length), |k: Int| byte(at_or(octets, length - 1 - k, 0) ^ mask)))
+
+/// A value's two's complement in `length` bytes, which the caller has found to hold it.
+fn signed_bytes(value: BigInt, length: Int) -> Bytes =
+  bytes_of_octets(octets_of(plain_limbs(value)), length, if is_negative(value) { 255 } else { 0 })
+
+/// `byte_of_int` of a number the caller has placed in `0..=255`, which a row cannot say.
+fn byte(n: Int) -> Bytes = handle { byte_of_int(n) } with { abort.raise(_) -> b"" }
+
+/// `bytes_at` at an index the caller has placed inside the bytes, which a row cannot say.
+fn byte_at(bytes: Bytes, i: Int) -> Int = handle { bytes_at(bytes, i) } with { abort.raise(_) -> 0 }
 
 /// The divisors are the limb's width written out, so no shift carries a raise in its row.
 fn shift_limbs(limbs: List<Int>, bits: Int) -> List<Int> = {
@@ -447,12 +753,10 @@ fn shift_limbs(limbs: List<Int>, bits: Int) -> List<Int> = {
 }
 
 /// Prepends `whole` zero limbs, which is what a shift by whole limb-widths does to a list that
-/// holds its least significant limb first.
+/// holds its least significant limb first. Zero stays no limbs.
 fn pad_low(whole: Int, limbs: List<Int>) -> List<Int> =
-  if whole <= 0 { limbs } else { pad_low(whole - 1, prepend_low(limbs)) }
-
-fn prepend_low(limbs: List<Int>) -> List<Int> =
-  fold(range(0, len(limbs)), [0], |acc: List<Int>, i: Int| push(acc, at_or(limbs, i, 0)))
+  if whole <= 0 || len(limbs) == 0 { limbs }
+  else { fold(limbs, zeros(whole), |acc: List<Int>, limb: Int| push(acc, limb)) }
 
 fn shift_part(limbs: List<Int>, part: Int) -> List<Int> =
   if part == 0 { limbs } else { shift_part_from(limbs, part, 0, 0, []) }
@@ -492,28 +796,60 @@ fn pow_from(base: BigInt, exponent: Int, acc: BigInt) -> BigInt / {abort.raise} 
   else if exponent % 2 == 0 { pow_from(mul(base, base), exponent / 2, acc) }
   else { pow_from(base, exponent - 1, mul(acc, base)) }
 
-fn mod_pow_from(
-  base: BigInt,
-  exponent: Int,
-  modulus: BigInt,
-  acc: BigInt,
-) -> BigInt / {abort.raise} =
-  if exponent <= 0 { acc } else if exponent % 2 == 0 {
-    mod_pow_from(reduced(mul(base, base), modulus), exponent / 2, modulus, acc)
-  } else { mod_pow_from(base, exponent - 1, modulus, reduced(mul(acc, base), modulus)) }
+/// `base` to the exponent whose magnitude is `exponent`, in `0..modulus`: for each of the
+/// exponent's bits from the top, the answer so far squared, and times the base where the bit is set.
+fn mod_pow_bits(base: BigInt, exponent: List<Int>, modulus: BigInt) -> BigInt =
+  mod_pow_from(base, exponent, modulus, bits_above(exponent) - 1, floored(one(), modulus))
 
-fn reduced(value: BigInt, modulus: BigInt) -> BigInt / {abort.raise} =
-  option_at(floor_mod(value, modulus), "the modulus is positive")
+fn mod_pow_from(base: BigInt, exponent: List<Int>, modulus: BigInt, i: Int, acc: BigInt) -> BigInt =
+  if i < 0 { acc } else {
+    let squared = floored(mul(acc, acc), modulus);
+    mod_pow_from(base, exponent, modulus, i - 1, if bit_at(exponent, i) {
+      floored(mul(squared, base), modulus)
+    } else { squared })
+  }
 
-/// Every second remainder is under half the one two steps before, so twice the divisor's bits
-/// bound the steps: `left`.
-fn gcd_from(a: BigInt, b: BigInt, left: Int) -> BigInt / {abort.raise} =
-  if is_zero(b) { a }
-  else if left <= 0 { panic("more steps than the divisor has bits") }
-  else { gcd_from(b, option_at(modulo(a, b), "the divisor is not zero"), left - 1) }
+/// Euclid's algorithm over magnitudes. Every second remainder is under half the one two steps
+/// before, so twice the divisor's bits bound the steps: `left`.
+fn gcd_limbs(a: List<Int>, b: List<Int>, left: Int) -> List<Int> =
+  if len(b) == 0 || left <= 0 { a } else { gcd_limbs(b, div_mod_limbs(a, b).r, left - 1) }
+
+/// Euclid's algorithm with the coefficients carried along: at each step `r` and `r_next` are
+/// `a * x + b * y` for the `x` and `y` beside them. `left` bounds the steps as `gcd_limbs`' does.
+fn bezout(
+  r: BigInt,
+  r_next: BigInt,
+  x: BigInt,
+  x_next: BigInt,
+  y: BigInt,
+  y_next: BigInt,
+  left: Int,
+) -> { gcd: BigInt, x: BigInt, y: BigInt } =
+  if is_zero(r_next) || left <= 0 { { gcd: r, x: x, y: y } } else {
+    let split = truncated(r, r_next);
+    bezout(
+      r_next,
+      split.r,
+      x_next,
+      sub(x, mul(split.q, x_next)),
+      y_next,
+      sub(y, mul(split.q, y_next)),
+      left - 1,
+    )
+  }
+
+/// Newton's step from a guess at or above the root: the guesses fall until one is the root, and
+/// from within twice the root each step squares the error, so `left`, the value's bits, is ample.
+fn root_from(value: BigInt, guess: BigInt, left: Int) -> BigInt =
+  if left <= 0 { guess } else {
+    let next = shift_right(add(guess, truncated(value, guess).q), 1);
+    if less_than(next, guess) { root_from(value, next, left - 1) } else { guess }
+  }
 
 fn is_less(o: Ordering) -> Bool = match o { Less -> true, _ -> false }
 fn is_positive(value: BigInt) -> Bool = compare(value, zero()) == Greater
+fn is_one(value: BigInt) -> Bool =
+  !is_negative(value) && len(limbs_in(value)) == 1 && at_or(limbs_in(value), 0, 0) == 1
 fn flip(o: Ordering) -> Ordering = match o { Less -> Greater, Greater -> Less, Equal -> Equal }
 
 fn limb_or_zero(limbs: List<Int>, i: Int) -> Int = at_or(limbs, i, 0)
@@ -521,47 +857,95 @@ fn limb_or_zero(limbs: List<Int>, i: Int) -> Int = at_or(limbs, i, 0)
 fn option_at<a>(o: Option<a>, why: String) -> a / {abort.raise} =
   match o { Some(x) -> x, None -> panic(why) }
 
-/// The decimal text of a magnitude, most significant run first with the rest padded to nine.
-fn magnitude_text(limbs: List<Int>) -> String / {abort.raise} =
-  if len(limbs) == 0 { "0" } else { chunks_text(limbs, [], 2 * len(limbs)) }
+/// The greatest power of a radix under the base, and how many of the radix's digits it is: what
+/// a number is divided by to take that many digits off at once.
+fn chunk_of(radix: Int) -> { digits: Int, value: Int } = chunk_from(radix, 1, radix)
 
-/// A limb holds a little more than one nine-digit chunk, so `left`, twice the limbs, is plenty.
-fn chunks_text(limbs: List<Int>, chunks: List<String>, left: Int) -> String / {abort.raise} =
-  if len(limbs) == 0 { join_text(chunks) }
-  else if left <= 0 { panic("more chunks than a magnitude holds") } else {
-    let split = divide_small(limbs, 1000000000);
-    chunks_text(split.q, push(chunks, int_to_string(split.r)), left - 1)
-  }
+fn chunk_from(radix: Int, digits: Int, value: Int) -> { digits: Int, value: Int } =
+  if digits >= 30 || value * radix >= word_base() { { digits: digits, value: value } }
+  else { chunk_from(radix, digits + 1, value * radix) }
 
-fn join_text(chunks: List<String>) -> String =
-  fold(range(0, len(chunks)), "", |acc: String, i: Int|
-    if i == 0 { at_or(chunks, len(chunks) - 1 - i, "") }
-    else { acc ++ padded(at_or(chunks, len(chunks) - 1 - i, "")) })
-
-fn padded(text: String) -> String = string_concat(repeat_text("0", 9 - string_len(text)), text)
-
-fn repeat_text(text: String, n: Int) -> String =
-  if n <= 0 { "" } else { text ++ repeat_text(text, n - 1) }
-
-/// Divides a magnitude by a small `Int`, answering the quotient's limbs and the remainder. The
-/// walk is from the top limb down, which is the direction the division runs, so the quotient comes
-/// back most significant first and is turned round once at the end.
-fn divide_small(limbs: List<Int>, divisor: Int) -> { q: List<Int>, r: Int } / {abort.raise} = {
-  let split = divide_small_from(limbs, divisor, len(limbs) - 1, [], 0);
-  { q: trim_high(reverse(split.q)), r: split.r }
+/// The value's digits in a radix of 2 to 36, with `-` first when it is negative.
+fn text_in(value: BigInt, radix: Int) -> String = {
+  let limbs = limbs_in(value);
+  let digits = if len(limbs) == 0 { ['0'] }
+  else { digits_low_first(limbs, radix, chunk_of(radix), [], 2 * len(limbs) + 1) };
+  string_of_chars(reverse(if is_negative(value) { push(digits, '-') } else { digits }))
 }
 
-fn divide_small_from(
+/// A magnitude's digits, least significant first, a chunk at a time. A chunk holds more than
+/// twenty-four bits whatever the radix, so `left`, past twice the limbs, is more chunks than there
+/// are.
+fn digits_low_first(
   limbs: List<Int>,
-  divisor: Int,
-  i: Int,
-  out: List<Int>,
-  carry: Int,
-) -> { q: List<Int>, r: Int } / {abort.raise} =
-  if i < 0 { { q: out, r: carry } } else {
-    let current = carry * word_base() + at_or(limbs, i, 0);
-    divide_small_from(limbs, divisor, i - 1, push(out, current / divisor), current % divisor)
+  radix: Int,
+  chunk: { digits: Int, value: Int },
+  out: List<Char>,
+  left: Int,
+) -> List<Char> =
+  if len(limbs) == 0 || left <= 0 { out } else {
+    let split = divide_small(limbs, chunk.value);
+    digits_low_first(
+      split.q,
+      radix,
+      chunk,
+      chunk_digits(split.r, radix, chunk.digits, len(split.q) == 0, out),
+      left - 1,
+    )
   }
+
+/// Pushes a chunk's digits, least significant first: `width` of them, or where the chunk `leads`
+/// the number only those it has.
+fn chunk_digits(n: Int, radix: Int, width: Int, leads: Bool, out: List<Char>) -> List<Char> =
+  if width <= 0 { out }
+  else if leads && n == 0 { out } else {
+    let rest = quotient(n, radix);
+    chunk_digits(rest, radix, width - 1, leads, push(out, digit_char(n - rest * radix)))
+  }
+
+fn digit_char(digit: Int) -> Char =
+  match char_of_int(if digit < 10 { 48 + digit } else { 87 + digit }) { Some(c) -> c, None -> '0' }
+
+/// The number a spelling in a radix of 2 to 36 names, with an optional sign: the digits are
+/// gathered a chunk at a time, and each chunk joins the number in one pass over its limbs.
+fn read_in(text: String, radix: Int) -> Option<BigInt> = {
+  let chars = string_chars(text);
+  let negative = list_at(chars, 0) == Some('-');
+  let digits = if negative || list_at(chars, 0) == Some('+') { drop(chars, 1) } else { chars };
+  let chunk = chunk_of(radix);
+  let read = fold(
+    digits,
+    { ok: len(digits) > 0, limbs: [], pending: 0, count: 0 },
+    |acc: { ok: Bool, limbs: List<Int>, pending: Int, count: Int }, c: Char| {
+      let digit = digit_value(int_of_char(c));
+      let pending = acc.pending * radix + digit;
+      if !acc.ok || digit < 0 || digit >= radix { { ..acc, ok: false } }
+      else if acc.count + 1 < chunk.digits { { ..acc, pending: pending, count: acc.count + 1 } }
+      else {
+        { ok: true, limbs: scale_limbs(acc.limbs, chunk.value, pending), pending: 0, count: 0 }
+      }
+    },
+  );
+  if read.ok {
+    Some(make(negative, scale_limbs(read.limbs, math::pow(radix, read.count), read.pending)))
+  } else { None }
+}
+
+/// Divides a magnitude by a small `Int` above zero, answering the quotient's limbs and the
+/// remainder. The walk is from the top limb down, which is the direction the division runs, so the
+/// quotient comes back most significant first and is turned round once at the end.
+fn divide_small(limbs: List<Int>, divisor: Int) -> { q: List<Int>, r: Int } = {
+  let split = fold(
+    range(0, len(limbs)),
+    { q: [], r: 0 },
+    |acc: { q: List<Int>, r: Int }, k: Int| {
+      let current = acc.r * word_base() + at_or(limbs, len(limbs) - 1 - k, 0);
+      let limb = quotient(current, divisor);
+      { q: push(acc.q, limb), r: current - limb * divisor }
+    },
+  );
+  { q: trim_high(reverse(split.q)), r: split.r }
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -740,13 +1124,12 @@ test "powers, gcd and modular exponentiation" {
     gcd(pow(of_int(10), 20), pow(of_int(10), 12)),
     gcd(pow(of_int(10), 12), option_at(modulo(pow(of_int(10), 20), pow(of_int(10), 12)), "m")),
   );
-  assert_eq(to_string(option_at(mod_pow(of_int(2), 10, of_int(1000)), "fits")), "24");
-  assert_eq(to_string(option_at(mod_pow(of_int(3), 100, of_int(7)), "fits")), "4");
-  assert_eq(to_string(option_at(mod_pow(of_int(2), 256, of_int(1000000007)), "fits")), "792845266");
-  assert_eq(mod_pow(of_int(2), 10, of_int(0)), None);
-  assert_eq(mod_pow(of_int(2), 0 - 1, of_int(7)), None);
+  assert_eq(mod_pow(of_int(2), of_int(10), of_int(1000)), Some(of_int(24)));
+  assert_eq(mod_pow(of_int(3), of_int(100), of_int(7)), Some(of_int(4)));
+  assert_eq(mod_pow(of_int(2), of_int(256), of_int(1000000007)), Some(of_int(792845266)));
+  assert_eq(mod_pow(of_int(2), of_int(10), of_int(0)), None);
   // A negative base reduces to a positive residue first.
-  assert_eq(to_string(option_at(mod_pow(of_int(0 - 1), 3, of_int(5)), "fits")), "4")
+  assert_eq(mod_pow(of_int(0 - 1), of_int(3), of_int(5)), Some(of_int(4)))
 }
 
 test "shifts and bit lengths agree with powers of two" {
@@ -755,7 +1138,7 @@ test "shifts and bit lengths agree with powers of two" {
   assert_eq(to_string(shift_left(of_int(1), 60)), "1152921504606846976");
   assert_eq(to_string(shift_right(shift_left(of_int(1), 100), 40)), "1152921504606846976");
   assert_eq(shift_right(of_int(5), 1), of_int(2));
-  assert_eq(shift_right(of_int(0 - 5), 1), of_int(0 - 2));
+  assert_eq(shift_right(of_int(0 - 5), 1), of_int(0 - 3));
   assert_eq(shift_left(of_int(0), 100), zero());
   assert_eq(
     map([0, 1, 0 - 1, 255, 256, 1073741823, 1073741824], |n: Int| bit_length(of_int(n))),
@@ -765,6 +1148,497 @@ test "shifts and bit lengths agree with powers of two" {
   // Every shift of a power of two is the power again.
   assert(all(range(0, 64), |k: Int| shift_right(shift_left(of_int(1), k), k) == of_int(1)))
 }
+
+/// The number a decimal spelling names, for a test that writes one.
+fn big(text: String) -> BigInt / {abort.raise} = option_at(of_string(text), "a decimal spelling")
+
+type Pair = { a: Int, b: Int }
+
+test "the three divisions differ only in how they round, and each refuses zero" {
+  let seven = of_int(7);
+  let two = of_int(2);
+  assert_eq(div(-seven, two), Some(of_int(0 - 3)));
+  assert_eq(modulo(-seven, two), Some(of_int(0 - 1)));
+  assert_eq(div_floor(-seven, two), Some(of_int(0 - 4)));
+  assert_eq(floor_mod(-seven, two), Some(of_int(1)));
+  assert_eq(div_floor(seven, -two), Some(of_int(0 - 4)));
+  assert_eq(floor_mod(seven, -two), Some(of_int(0 - 1)));
+  assert_eq(div_euclid(-seven, two), Some(of_int(0 - 4)));
+  assert_eq(rem_euclid(-seven, two), Some(of_int(1)));
+  assert_eq(div_euclid(seven, -two), Some(of_int(0 - 3)));
+  assert_eq(rem_euclid(seven, -two), Some(of_int(1)));
+  assert_eq(div_euclid(-seven, -two), Some(of_int(4)));
+  assert_eq(rem_euclid(-seven, -two), Some(of_int(1)));
+  assert_eq(div_floor(seven, zero()), None);
+  assert_eq(div_euclid(seven, zero()), None);
+  assert_eq(rem_euclid(seven, zero()), None);
+  // Where nothing is left over the three agree.
+  assert_eq(div_floor(of_int(0 - 8), two), div_euclid(of_int(0 - 8), two));
+  assert_eq(div_floor(of_int(0 - 8), two), div(of_int(0 - 8), two))
+}
+
+test "a quotient is rounded as each mode rounds a Decimal" {
+  let rounded = |a: Int, b: Int|
+    map([HalfEven, HalfUp, Down, Up, Ceiling, Floor], |mode: Rounding|
+      div_round(of_int(a), of_int(b), mode));
+  let whole = |qs: List<Int>| map(qs, |q: Int| Some(of_int(q)));
+  assert_eq(rounded(5, 2), whole([2, 3, 2, 3, 3, 2]));
+  assert_eq(rounded(0 - 5, 2), whole([0 - 2, 0 - 3, 0 - 2, 0 - 3, 0 - 2, 0 - 3]));
+  assert_eq(rounded(7, 2), whole([4, 4, 3, 4, 4, 3]));
+  assert_eq(rounded(7, 0 - 2), whole([0 - 4, 0 - 4, 0 - 3, 0 - 4, 0 - 3, 0 - 4]));
+  assert_eq(rounded(1, 3), whole([0, 0, 0, 1, 1, 0]));
+  assert_eq(rounded(0 - 2, 3), whole([0 - 1, 0 - 1, 0, 0 - 1, 0, 0 - 1]));
+  assert_eq(rounded(6, 3), whole([2, 2, 2, 2, 2, 2]));
+  assert_eq(div_round(one(), zero(), HalfEven), None)
+}
+
+type Division = { path: String, num: String, den: String, q: String, r: String }
+
+/// A dividend and a divisor for each path a quotient limb can take, found by running a model of
+/// the algorithm over limbs at the edges of their range, with the quotient and remainder Python's
+/// `divmod` answers.
+fn divisions() -> List<Division> =
+  [
+    {
+      path: "the guess is one too large and the divisor is added back",
+      num: "1856910057775148908815581185",
+      den: "1152921504606846977",
+      q: "1610612734",
+      r: "1152921504069976067",
+    },
+    {
+      path: "the guess is past a limb and is cut to one",
+      num: "2305843010287435776",
+      den: "1073741825",
+      q: "2147483647",
+      r: "1",
+    },
+    {
+      path: "the divisor's second limb lowers the guess once",
+      num: "1152921506754330624",
+      den: "1073741825",
+      q: "1073741824",
+      r: "1073741824",
+    },
+    {
+      path: "the divisor's second limb lowers the guess twice",
+      num: "618970019642690136912691199",
+      den: "2684354559",
+      q: "230584301007268740",
+      r: "2555505539",
+    },
+    {
+      path: "the divisor is one limb",
+      num: "815915283247897734345611269596115894272000000000",
+      den: "1000000007",
+      q: "815915277536490791590175728464885795017",
+      r: "799434881",
+    },
+  ]
+
+test "long division where {c.path}" for c: Division in divisions() {
+  assert_eq(div_mod(big(c.num), big(c.den)), Some({ q: big(c.q), r: big(c.r) }));
+  assert_eq(div_mod(-big(c.num), big(c.den)), Some({ q: -big(c.q), r: -big(c.r) }))
+}
+
+test "a product of long numbers is the schoolbook product, however their lengths compare" {
+  let pairs = [
+    [factorial(300), factorial(310)],
+    [factorial(600), factorial(300)],
+    [factorial(300), factorial(600)],
+    [factorial(600), factorial(610)],
+    [factorial(600), of_int(1073741823) * of_int(1073741823)],
+    [shift_left(one(), 3000), factorial(300)],
+  ];
+  assert(
+    all(pairs, |pair: List<BigInt>|
+      mul_limbs(limbs_in(at(pair, 0)), limbs_in(at(pair, 1)))
+        == mul_schoolbook(limbs_in(at(pair, 0)), limbs_in(at(pair, 1)))),
+  );
+  // (2^2000 - 1)^2, which no limb of is zero until the carries settle.
+  let ones = shift_left(one(), 2000) - one();
+  assert_eq(ones * ones, shift_left(one(), 4000) - shift_left(one(), 2001) + one())
+}
+
+test "the bit operations read a negative number as two's complement" {
+  let a = big("-123456789012345678901234567890");
+  let b = big("987654321098765432109876543210");
+  assert_eq(and(a, b), big("985710360914275162674813760554"));
+  assert_eq(or(a, b), big("-121512828827855409466171785234"));
+  assert_eq(xor(a, b), big("-1107223189742130572140985545788"));
+  assert_eq(not(a), big("123456789012345678901234567889"));
+  assert_eq(shift_right(a, 70), of_int(0 - 104571968));
+  assert_eq(shift_right(-a, 70), of_int(104571967));
+  assert_eq(shift_right(of_int(0 - 1), 1000), of_int(0 - 1));
+  assert_eq(and(of_int(0 - 1), b), b);
+  assert_eq(or(of_int(0 - 1), b), of_int(0 - 1));
+  assert_eq(xor(a, a), zero());
+  assert_eq(not(zero()), of_int(0 - 1))
+}
+
+test "a bit is read, set, cleared and flipped in two's complement" {
+  assert(test_bit(of_int(5), 0) && !test_bit(of_int(5), 1) && test_bit(of_int(5), 2));
+  assert(!test_bit(of_int(5), 0 - 1) && !test_bit(of_int(5), 4000));
+  // -6 is ...11010.
+  assert(!test_bit(of_int(0 - 6), 0) && test_bit(of_int(0 - 6), 1) && !test_bit(of_int(0 - 6), 2));
+  assert(test_bit(of_int(0 - 6), 4000) && !test_bit(of_int(0 - 6), 0 - 1));
+  assert_eq(set_bit(zero(), 100), shift_left(one(), 100));
+  assert_eq(set_bit(of_int(0 - 6), 0), of_int(0 - 5));
+  assert_eq(clear_bit(of_int(0 - 1), 100), -shift_left(one(), 100) - one());
+  assert_eq(clear_bit(of_int(5), 0), of_int(4));
+  assert_eq(flip_bit(flip_bit(of_int(5), 77), 77), of_int(5));
+  assert_eq(set_bit(of_int(5), 0 - 1), of_int(5));
+  assert_eq(clear_bit(of_int(5), 0 - 1), of_int(5));
+  assert_eq(flip_bit(of_int(5), 0 - 1), of_int(5))
+}
+
+test "bytes are big-endian: a magnitude, or two's complement in the fewest that hold the sign" {
+  let v = big("123456789012345678901234567890");
+  assert_eq(to_bytes(zero()), b"");
+  assert_eq(to_bytes(shift_left(one(), 64)), b"\x01\x00\x00\x00\x00\x00\x00\x00\x00");
+  assert_eq(to_bytes(v), b"\x01\x8e\xe9\x0f\xf6\xc3\x73\xe0\xee\x4e\x3f\x0a\xd2");
+  assert_eq(to_bytes(of_int(0 - 5)), b"\x05");
+  assert_eq(of_bytes(b"\x00\x00\x01\x00"), of_int(256));
+  assert_eq(of_bytes(b"\xff"), of_int(255));
+  assert_eq(of_bytes(b""), zero());
+  assert_eq(
+    map([0, 0 - 1, 127, 128, 0 - 128, 0 - 129, 255, 256], |n: Int| to_bytes_signed(of_int(n))),
+    [b"\x00", b"\xff", b"\x7f", b"\x00\x80", b"\x80", b"\xff\x7f", b"\x00\xff", b"\x01\x00"],
+  );
+  assert_eq(to_bytes_signed(-shift_left(one(), 64)), b"\xff\x00\x00\x00\x00\x00\x00\x00\x00");
+  assert_eq(to_bytes_signed(-v), b"\xfe\x71\x16\xf0\x09\x3c\x8c\x1f\x11\xb1\xc0\xf5\x2e");
+  assert_eq(of_bytes_signed(b"\xfe\x71\x16\xf0\x09\x3c\x8c\x1f\x11\xb1\xc0\xf5\x2e"), -v);
+  assert_eq(of_bytes_signed(b"\xff\xff\x7f"), of_int(0 - 129));
+  assert_eq(of_bytes_signed(b"\x00\x00\x80"), of_int(128));
+  assert_eq(of_bytes_signed(b"\xff"), of_int(0 - 1));
+  assert_eq(of_bytes_signed(b""), zero())
+}
+
+test "bytes of a given length pad with the sign, or refuse a value too long for them" {
+  let v = big("123456789012345678901234567890");
+  assert_eq(to_bytes_fixed(v, 13), Some(to_bytes(v)));
+  assert_eq(to_bytes_fixed(v, 12), None);
+  assert_eq(to_bytes_fixed(of_int(258), 4), Some(b"\x00\x00\x01\x02"));
+  assert_eq(to_bytes_fixed(zero(), 0), Some(b""));
+  assert_eq(to_bytes_fixed(one(), 0 - 1), None);
+  assert_eq(
+    to_bytes_signed_fixed(-v, 16),
+    Some(b"\xff\xff\xff\xfe\x71\x16\xf0\x09\x3c\x8c\x1f\x11\xb1\xc0\xf5\x2e"),
+  );
+  assert_eq(to_bytes_signed_fixed(of_int(258), 4), Some(b"\x00\x00\x01\x02"));
+  assert_eq(to_bytes_signed_fixed(of_int(0 - 128), 1), Some(b"\x80"));
+  assert_eq(to_bytes_signed_fixed(of_int(128), 1), None);
+  assert_eq(to_bytes_signed_fixed(zero(), 0), None)
+}
+
+test "text in a radix uses digits and then letters, and reads either case back" {
+  let n = shift_left(one(), 100) + of_int(12345);
+  assert_eq(
+    to_radix(n, 2),
+    "1" ++ string_of_chars(map(range(0, 86), |_i: Int| '0')) ++ "11000000111001",
+  );
+  assert_eq(to_radix(n, 7), "322653455556104044451560330542565126");
+  assert_eq(to_radix(n, 16), "10000000000000000000003039");
+  assert_eq(to_radix(n, 36), "3ewfdnca0n6ld1ggvozd");
+  assert_eq(to_radix(-pow(of_int(10), 30), 36), "-2oy99wnkl1c76diocq9s");
+  assert_eq(to_radix(zero(), 2), "0");
+  assert_eq(to_radix(of_int(35), 36), "z");
+  assert_eq(from_radix("3EWFDNCA0N6LD1GGVOZD", 36), Some(n));
+  assert_eq(from_radix("-ff", 16), Some(of_int(0 - 255)));
+  assert_eq(from_radix("+0010", 2), Some(of_int(2)));
+  assert_eq(from_radix("12", 2), None);
+  assert_eq(from_radix("g", 16), None);
+  assert_eq(from_radix("", 16), None);
+  assert_eq(from_radix("-", 16), None);
+  assert_eq(from_radix("1_000", 10), None);
+  assert_eq(handle { Some(to_radix(one(), 37)) } with { abort.raise(_) -> None }, None);
+  assert_eq(handle { from_radix("1", 1) } with { abort.raise(_) -> Some(zero()) }, Some(zero()))
+}
+
+test "a BigInt is shown as its decimal spelling" {
+  let n = -shift_left(one(), 64);
+  assert_eq(f"{n}", "-18446744073709551616");
+  assert_eq(f"{[zero(), one()]}", "[0, 1]")
+}
+
+test "the modular inverse, powers by a long exponent and the integer root" {
+  let p = shift_left(one(), 127) - one();
+  assert_eq(mod_inverse(of_int(3), of_int(11)), Some(of_int(4)));
+  assert_eq(mod_inverse(of_int(0 - 3), of_int(11)), Some(of_int(7)));
+  assert_eq(mod_inverse(of_int(6), of_int(9)), None);
+  assert_eq(mod_inverse(of_int(5), of_int(1)), Some(zero()));
+  assert_eq(mod_inverse(of_int(5), zero()), None);
+  assert_eq(mod_inverse(of_int(5), of_int(0 - 7)), None);
+  assert_eq(
+    mod_inverse(big("12345678901234567890"), p),
+    Some(big("95987530177320089548629399254220539361")),
+  );
+  // Fermat's little theorem at the Mersenne prime 2^127 - 1.
+  assert_eq(mod_pow(of_int(3), p - one(), p), Some(one()));
+  // An RSA round trip under the primes 2^89 - 1 and 2^107 - 1, the private exponent Python's.
+  let n = (shift_left(one(), 89) - one()) * (shift_left(one(), 107) - one());
+  let d = big("15499423397885381203395986760745292550657831765628692176393");
+  let message = big("123456789012345678901234567890123456789");
+  let sealed = mod_pow(message, of_int(65537), n);
+  assert_eq(sealed, Some(big("49545946855764131613096738445058846725205657494722342258170")));
+  assert_eq(mod_pow(option_at(sealed, "a modulus above zero"), d, n), Some(message));
+  // A negative exponent is the inverse's power, and has none where the base has no inverse.
+  assert_eq(mod_pow(of_int(7), of_int(0 - 3), of_int(1000000007)), Some(of_int(206997086)));
+  assert_eq(mod_pow(of_int(6), of_int(0 - 1), of_int(9)), None);
+  assert_eq(mod_pow(of_int(6), zero(), of_int(1)), Some(zero()));
+  let found = gcd_extended(of_int(240), of_int(0 - 46));
+  assert_eq(found.gcd, of_int(2));
+  assert_eq(of_int(240) * found.x + of_int(0 - 46) * found.y, of_int(2));
+  assert_eq(gcd_extended(zero(), zero()).gcd, zero());
+  assert_eq(
+    gcd(shift_left(one(), 200) - one(), shift_left(one(), 120) - one()),
+    big("1099511627775"),
+  );
+  assert_eq(isqrt(pow(of_int(10), 40)), Some(pow(of_int(10), 20)));
+  assert_eq(isqrt(pow(of_int(10), 40) - one()), Some(pow(of_int(10), 20) - one()));
+  assert_eq(isqrt(of_int(2) * pow(of_int(10), 40)), Some(big("141421356237309504880")));
+  assert_eq(
+    map(range(0, 10), |n: Int| isqrt(of_int(n))),
+    map([0, 1, 1, 1, 2, 2, 2, 2, 2, 3], |r: Int| Some(of_int(r))),
+  );
+  assert_eq(isqrt(of_int(0 - 1)), None)
+}
+
+law "and is Int's" = agrees(|p: Pair| and(of_int(p.a), of_int(p.b)), |p: Pair| of_int(p.a & p.b))
+
+law "or is Int's" = agrees(|p: Pair| or(of_int(p.a), of_int(p.b)), |p: Pair| of_int(p.a | p.b))
+
+law "xor is Int's" = agrees(|p: Pair| xor(of_int(p.a), of_int(p.b)), |p: Pair| of_int(p.a ^ p.b))
+
+law "not is Int's" = agrees(|n: Int| not(of_int(n)), |n: Int| of_int(~n))
+
+law "a shift right is Int's arithmetic one" =
+  agrees(|p: Pair| shift_right(of_int(p.a), p.b & 63), |p: Pair| of_int(p.a >> (p.b & 63)))
+
+law "a shift left is Int's wherever no bit leaves an Int" =
+  agrees(|p: Pair| shift_left(of_int(p.a >> 32), p.b & 31), |p: Pair|
+    of_int(p.a >> 32 << (p.b & 31)))
+
+law "a bit is the one Int's shift and mask read" =
+  agrees(|p: Pair| test_bit(of_int(p.a), p.b & 63), |p: Pair| p.a >> (p.b & 63) & 1 == 1)
+
+law "a bit length is the bits of an Int's distance from zero" =
+  agrees(|n: Int| bit_length(of_int(n)), |n: Int|
+    if n == min_int() { 64 } else { bits_in(if n < 0 { 0 - n } else { n }) })
+
+/// What `Int`'s `/` and `%` answer, where they answer: not for a zero divisor, and not where the
+/// quotient leaves an `Int`.
+fn int_div_mod(p: Pair) -> Option<{ q: BigInt, r: BigInt }> / {abort.raise} =
+  if p.b == 0 { None }
+  else if p.b == 0 - 1 { Some({ q: neg(of_int(p.a)), r: zero() }) }
+  else { Some({ q: of_int(p.a / p.b), r: of_int(p.a % p.b) }) }
+
+law "truncated division is Int's" = agrees(|p: Pair| div_mod(of_int(p.a), of_int(p.b)), int_div_mod)
+
+law "a truncated remainder has the dividend's sign"
+  forall (a: BigInt, b: BigInt) where !is_zero(b) {
+    is_zero(truncated(a, b).r) || is_negative(truncated(a, b).r) == is_negative(a)
+  }
+
+law "floor division leaves a remainder of the divisor's sign"
+  forall (a: BigInt, b: BigInt) where !is_zero(b) {
+    match div_floor(a, b) {
+      None -> false,
+      Some(quotient) -> match floor_mod(a, b) {
+        None -> false,
+        Some(rest) ->
+          quotient * b + rest == a && less_than(abs_value(rest), abs_value(b))
+            && (is_zero(rest) || is_negative(rest) == is_negative(b)),
+      },
+    }
+  }
+
+law "Euclidean division leaves a remainder that is never negative"
+  forall (a: BigInt, b: BigInt) where !is_zero(b) {
+    match div_euclid(a, b) {
+      None -> false,
+      Some(quotient) -> match rem_euclid(a, b) {
+        None -> false,
+        Some(rest) ->
+          quotient * b + rest == a && !is_negative(rest) && less_than(rest, abs_value(b)),
+      },
+    }
+  }
+
+law "a long product is the schoolbook one"
+  forall (x: BigInt, y: BigInt, n: Int) {
+    let a = limbs_in(pow(x, 12 + (n & 15)));
+    let b = limbs_in(pow(y, 12 + (n >> 4 & 15)));
+    mul_limbs(a, b) == mul_schoolbook(a, b)
+  }
+
+/// The fewest bytes of an `Int`'s two's complement, by its own shifts: its eight bytes without
+/// those that only repeat the sign.
+fn int_bytes(n: Int) -> Bytes / {abort.raise} = {
+  let all = map(range(0, 8), |k: Int| n >> 8 * (7 - k) & 255);
+  let from = fold(range(0, 7), 0, |lead: Int, k: Int|
+    if lead == k
+        && ((at(all, k) == 0 && at(all, k + 1) < 128)
+        || (at(all, k) == 255 && at(all, k + 1) >= 128)) { k + 1 }
+    else { lead });
+  bytes_concat_all(map(drop(all, from), |octet: Int| byte_of_int(octet)))
+}
+
+law "signed bytes are an Int's own two's complement" =
+  agrees(|n: Int| to_bytes_signed(of_int(n)), int_bytes)
+
+type Rounded = { a: Int, b: Int, mode: Rounding }
+
+/// What `decimal_div` answers at scale zero, which is the quotient rounded by the mode.
+fn decimal_quotient(c: Rounded) -> Option<BigInt> / {abort.raise} =
+  if c.b == 0 { None } else {
+    of_string(decimal_to_string(decimal_div(decimal_of_int(c.a), decimal_of_int(c.b), 0, c.mode)))
+  }
+
+law "a rounded quotient is Decimal's under every mode" =
+  agrees(|c: Rounded| div_round(of_int(c.a), of_int(c.b), c.mode), decimal_quotient)
+
+law "signed bytes read back" = inverse(to_bytes_signed, of_bytes_signed)
+
+law "bytes read back as the distance from zero" =
+  agrees(|n: BigInt| of_bytes(to_bytes(n)), abs_value)
+
+law "bytes of a given length read back, and are refused only below the fewest"
+  forall (n: BigInt, extra: Int) {
+    let fewest = bytes_len(to_bytes_signed(n));
+    let length = fewest + (extra & 7);
+    to_bytes_signed_fixed(n, fewest - 1) == None
+      && (match to_bytes_signed_fixed(n, length) {
+        Some(bytes) -> bytes_len(bytes) == length && of_bytes_signed(bytes) == n,
+        None -> false,
+      })
+      && (match to_bytes_fixed(n, length) {
+        Some(bytes) -> bytes_len(bytes) == length && of_bytes(bytes) == abs_value(n),
+        None -> false,
+      })
+  }
+
+law "text in every radix reads back"
+  forall (n: BigInt, radix: Int) {
+    let r = 2 + (radix & 1023) % 35;
+    from_radix(to_radix(n, r), r) == Some(n)
+  }
+
+law "a modular inverse times its number is one, and there is none only where they share a factor"
+  forall (a: BigInt, b: BigInt) {
+    let modulus = abs_value(b) + one();
+    match mod_inverse(a, modulus) {
+      Some(x) ->
+        floored(a * x, modulus) == floored(one(), modulus) && !is_negative(x)
+          && less_than(x, modulus),
+      None -> !is_one(gcd(a, modulus)),
+    }
+  }
+
+law "Bézout's coefficients make the greatest common divisor"
+  forall (a: BigInt, b: BigInt) {
+    let found = gcd_extended(a, b);
+    a * found.x + b * found.y == found.gcd && found.gcd == gcd(a, b)
+  }
+
+law "a modular power is the power's remainder"
+  forall (base: BigInt, b: BigInt, n: Int) {
+    let modulus = abs_value(b) + one();
+    mod_pow(base, of_int(n & 31), modulus) == Some(floored(pow(base, n & 31), modulus))
+  }
+
+law "an integer root's square is the last at or below the number"
+  forall (value: BigInt) {
+    let n = abs_value(value);
+    match isqrt(n) {
+      Some(r) -> !less_than(n, r * r) && less_than(n, (r + one()) * (r + one())),
+      None -> false,
+    }
+  }
+
+/// A record that holds a `BigInt`, whose derived codecs find `big_int_json` and `big_int_bin` by
+/// the type's name.
+type Balance = { owner: String, amount: BigInt }
+
+derive json for Balance
+derive bin for Balance
+
+test "a BigInt is a decimal string in JSON, and nothing else reads as one" {
+  let n = big("-12345678901234567890");
+  assert_eq(json::encode_string(n, big_int_json()), "\"-12345678901234567890\"");
+  assert_eq(json::decode_string("\"-12345678901234567890\"", big_int_json()), Ok(n));
+  assert_eq(json::decode_string("\"+007\"", big_int_json()), Ok(of_int(7)));
+  assert_eq(
+    json::decode_string("\"12x\"", big_int_json()),
+    Err(json::decode_error("`12x` is not a whole number in decimal")),
+  );
+  assert_eq(
+    json::decode_string("12", big_int_json()),
+    Err(json::decode_error("expected a whole number in a string, found a number")),
+  );
+  let held = { owner: "a", amount: shift_left(one(), 80) };
+  assert_eq(
+    json::encode_string(held, balance_json()),
+    "{\"amount\":\"1208925819614629174706176\",\"owner\":\"a\"}",
+  );
+  assert_eq(
+    json::decode_string(json::encode_string(held, balance_json()), balance_json()),
+    Ok(held),
+  )
+}
+
+test "a BigInt in bin is its fewest signed bytes behind their count, and no other bytes" {
+  assert_eq(bin::encode(zero(), big_int_bin()), b"\x01\x00");
+  assert_eq(bin::encode(of_int(0 - 129), big_int_bin()), b"\x02\xff\x7f");
+  assert_eq(bin::decode(b"\x02\xff\x7f", big_int_bin()), Ok(of_int(0 - 129)));
+  assert_eq(
+    bin::decode(b"\x02\x00\x7f", big_int_bin()),
+    Err({ at: 0, message: "a whole number not in its fewest bytes" }),
+  );
+  assert_eq(
+    bin::decode(b"\x00", big_int_bin()),
+    Err({ at: 0, message: "a whole number not in its fewest bytes" }),
+  );
+  assert_eq(
+    bin::decode(b"\x02\x01", big_int_bin()),
+    Err({ at: 0, message: "a count longer than the bytes left" }),
+  );
+  assert(bin::shape_digest(big_int_bin()) != bin::shape_digest(bin::bytes_bin()));
+  let held = { owner: "a", amount: -shift_left(one(), 80) };
+  assert_eq(bin::decode(bin::encode(held, balance_bin()), balance_bin()), Ok(held))
+}
+
+law "a BigInt reads back from the JSON it was written as" =
+  agrees(
+    |n: BigInt| json::decode_string(json::encode_string(n, big_int_json()), big_int_json()),
+    |n: BigInt| Ok(n),
+  )
+
+law "a BigInt reads back from the bytes it was written as" =
+  agrees(|n: BigInt| bin::decode(bin::encode(n, big_int_bin()), big_int_bin()), |n: BigInt| Ok(n))
+
+/// A number of `n` limbs, each all ones, so that every carry of a product runs its length.
+fn limbs_long(n: Int) -> BigInt = shift_left(one(), 30 * n) - one()
+
+law "a product's steps grow as Karatsuba's do: three times over for twice the limbs"
+  forall (n: Int) where n > 0 cost math::pow(3, math::ilog2(n)) {
+    limbs_long(n) * limbs_long(n)
+  }
+
+law "a division's steps grow as the dividend's limbs times the divisor's"
+  forall (n: Int) where n > 0 cost n * n {
+    div_mod(limbs_long(2 * n), limbs_long(n) - of_int(2))
+  }
+
+law "bytes are written and read in one pass over the limbs"
+  forall (n: Int) where n > 0 cost n {
+    of_bytes_signed(to_bytes_signed(of_bytes(to_bytes(limbs_long(n)))))
+  }
+
+law "a decimal spelling's steps grow as its digits squared, each way"
+  forall (n: Int) where n > 0 cost n * n {
+    of_string(to_string(limbs_long(n)))
+  }
 
 test "a BigInt keys a map in the numbers' order, and the language's order is compare's" {
   let texts = [
