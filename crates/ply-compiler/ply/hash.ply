@@ -687,6 +687,8 @@ fn tag_key() -> Int = 140
 fn tag_show() -> Int = 141
 /// One function a type's arithmetic is, after the operation it is.
 fn tag_numeric() -> Int = 142
+/// A type only its own module builds a value of.
+fn tag_opaque() -> Int = 160
 
 /// An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -1027,15 +1029,21 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
       ),
     TDNominal(t) -> type_expr(put_text(put_tag(counted, tag_type_nominal()), d.name.name), t),
   };
+  // Unlike `pub`, `opaque` refuses bodies that name nothing of the type's: a literal where a
+  // closed record is expected. Only the type's own hash reaches each of them.
+  let closed: Encoder = match d.opaque {
+    Some(_) -> put_tag(declared, tag_opaque()),
+    None -> declared,
+  };
   // What a value of the type compares and shows through is part of what the type is: each function
   // is a reference, so the type's hash moves when the function it names does.
   let stated: Encoder = match map_get(
-      at(declared.index.items, declared.module).instances,
+      at(closed.index.items, closed.module).instances,
       d.name.name,
     ) {
-    None -> declared,
+    None -> closed,
     Some(stated) ->
-      fold(stated, declared, |acc: Encoder, x: InstanceDef|
+      fold(stated, closed, |acc: Encoder, x: InstanceDef|
         value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), NShow -> tag_show() }), {
           module: None,
           name: x.by,
@@ -4771,12 +4779,13 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
     let fields = print_type(printer, read_text(k.decoder).decoder);
     { decoder: fields.decoder, text: bytes_concat(b"new ", fields.text) }
   } else { panic("a tag that does not begin a type body") };
-  let stated = instances_of(printer, body.decoder, name);
+  let closed = peek(body.decoder) == tag_opaque();
+  let stated = instances_of(printer, if closed { skip(body.decoder) } else { body.decoder }, name);
   let numeric = numeric_of(printer, stated.decoder);
   {
     decoder: numeric.decoder,
     text: bytes_concat_all([
-      b"type ",
+      if closed { b"opaque type " } else { b"type " },
       name,
       generic_list(n.value, ec.value, lc.value),
       b" = ",
@@ -6216,6 +6225,37 @@ test "a `new` record prints back as one and hashes back to what it was stored un
   );
   let ms = printed_of(out, []);
   assert(bytes::contains(at(ms, 0).text, b" = new {"));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a type's hash says whether it is opaque, what holds it moves with it, and it prints back" {
+  let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
+  let open = m(b"pub type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
+  let closed = m(b"pub opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
+  assert(map_get(open, b"m.Date") != map_get(closed, b"m.Date"));
+  assert(map_get(open, b"m.day") != map_get(closed, b"m.day"));
+  // `pub` is still no part of it.
+  let kept = m(b"opaque type Date = new { day: Int }\nfn day(d: Date) -> Int = d.day");
+  assert_eq(map_get(kept, b"m.Date"), map_get(closed, b"m.Date"));
+  let sum = m(b"pub type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
+  let closed_sum = m(b"pub opaque type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
+  assert(map_get(sum, b"m.Tok") != map_get(closed_sum, b"m.Tok"));
+  assert(map_get(sum, b"m.mk") != map_get(closed_sum, b"m.mk"));
+  let out = hash_index(
+    indexed([
+      {
+        name: b"m",
+        src: b"pub opaque type Tok = | Tok(Int)\nkey for Tok by n\nfn n(t: Tok) -> Int = match t { Tok(i) -> i }\npub opaque type Date = new { day: Int }\npub fn mk() -> Date = { day: n(Tok(1)) }",
+      },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b"pub opaque type Tok = | Tok(Int)"));
+  assert(bytes::contains(at(ms, 0).text, b"\nkey for Tok by n"));
+  assert(bytes::contains(at(ms, 0).text, b"pub opaque type Date = new {"));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );

@@ -1,0 +1,169 @@
+//! What `opaque` refuses another module: a constructor of the sum, built or matched; a literal or an
+//! update that would be the record; a `forall` that would draw one. Each is refused once, where it
+//! is written.
+
+import compiler.infer (check_dump, check_dump_known)
+import compiler.items (parse)
+import compiler.parsing (ParseDiag)
+import std.string (split, split_once)
+
+fn vault() -> String =
+  \\pub opaque type Token = | Token(String) | Blank
+  \\pub opaque type Date = new { year: Int, month: Int, day: Int }
+  \\pub fn mint(s: String) -> Token = if s == "" { Blank } else { Token(s) }
+  \\pub fn text_of(t: Token) -> String = match t { Token(s) -> s, Blank -> "" }
+  \\pub fn epoch() -> Date = { year: 1970, month: 1, day: 1 }
+  \\pub fn next_year(d: Date) -> Date = { ..d, year: d.year + 1 }
+  \\
+
+fn importing() -> Bytes =
+  b"import vault\nimport vault (Token, Date, mint, text_of, epoch, next_year)\n"
+
+/// What the checker says of `vault` and a module that imports it and holds `body`.
+fn checked(body: Bytes) -> String / {abort.raise} =
+  check_dump([
+    { name: b"vault", src: bytes_of_string(vault()) },
+    { name: b"app", src: bytes_concat(importing(), body) },
+  ])
+
+/// The code of each diagnostic a dump holds, in order.
+fn codes(dump: String) -> List<String> / {abort.raise} =
+  fold(split(dump, "!"), [], |acc: List<String>, part: String|
+    if string_starts_with(part, "E") || string_starts_with(part, "W") {
+      match split_once(part, ":") { Some(cut) -> push(acc, cut.head), None -> acc }
+    } else { acc })
+
+fn refused(body: Bytes) -> List<String> / {abort.raise} = codes(checked(body))
+
+test "another module names the type, calls its module's functions and holds what they answer" {
+  assert_eq(refused(b"fn a() -> Token = mint(\"a\")"), []);
+  assert_eq(refused(b"fn a(t: vault::Token) -> String = text_of(t)"), []);
+  assert_eq(refused(b"fn a() -> List<Date> = [epoch(), next_year(epoch())]"), []);
+  assert_eq(refused(b"fn a(t: Token) -> Int = match t { _ -> 1 }"), [])
+}
+
+test "a constructor of an opaque sum is not called, named or passed outside its module" {
+  assert_eq(refused(b"fn a() -> Token = Token(\"a\")"), ["E0107"]);
+  assert_eq(refused(b"fn a() -> Token = vault::Token(\"a\")"), ["E0107"]);
+  assert_eq(refused(b"fn a() -> Token = Blank"), ["E0107"]);
+  assert_eq(refused(b"fn a() -> List<Token> = map([\"a\"], Token)"), ["E0107"])
+}
+
+test "a constructor of an opaque sum is not matched outside its module, and that is all that is said" {
+  assert_eq(refused(b"fn a(t: Token) -> String = match t { Token(s) -> s, _ -> \"\" }"), ["E0107"]);
+  assert_eq(refused(b"fn a(t: Token) -> String = match t { vault::Token(s) -> s }"), ["E0107"]);
+  assert_eq(refused(b"fn a(t: Token) -> Bool = match t { Blank -> true, _ -> false }"), ["E0107"]);
+  assert_eq(refused(b"fn a(ts: List<Token>) -> Int = match ts { [Token(_), ..] -> 1, _ -> 0 }"), [
+    "E0107",
+  ])
+}
+
+test "an import of a constructor alone is refused as the constructor is" {
+  let named = check_dump([
+    { name: b"vault", src: bytes_of_string(vault()) },
+    { name: b"app", src: b"import vault (Blank)\nfn a() -> Int = 1" },
+  ]);
+  assert_eq(codes(named), ["E0107"])
+}
+
+test "a literal where an opaque record is expected is refused wherever the place says so" {
+  let literal = b"{ year: 1, month: 2, day: 3 }";
+  let building = |before: Bytes, after: Bytes| refused(bytes_concat_all([before, literal, after]));
+  assert_eq(building(b"fn a() -> Date = ", b""), ["E0220"]);
+  assert_eq(building(b"fn a() -> Date = next_year(", b")"), ["E0220"]);
+  assert_eq(building(b"fn a() -> List<Date> = [epoch(), ", b"]"), ["E0220"]);
+  assert_eq(building(b"fn a() -> Option<Date> = Some(", b")"), ["E0220"]);
+  assert_eq(building(b"fn a() -> Date = {\n  let d: Date = ", b";\n  d\n}"), ["E0220"]);
+  assert_eq(building(b"fn a(d: Date = ", b") -> Date = d"), ["E0220"]);
+  // Nothing more is said of the record it would make, though what its values get wrong still is.
+  assert_eq(refused(b"fn a() -> Date = { year: 1, hour: 2 }"), ["E0220"]);
+  assert_eq(refused(b"fn a() -> Date = { year: missing, month: 2, day: 3 }"), ["E0220", "E0101"])
+}
+
+test "a record of its fields is still no opaque record" {
+  let held = b"fn a() -> Date = {\n  let r = { year: 1, month: 2, day: 3 };\n  r\n}";
+  assert_eq(refused(held), ["E0201"])
+}
+
+test "an update of an opaque record is refused, when its base is known and when it is settled later" {
+  assert_eq(refused(b"fn a(d: Date) -> Date = { ..d, day: 9 }"), ["E0220"]);
+  assert_eq(refused(b"fn a() -> Date = { ..epoch(), day: 9 }"), ["E0220"]);
+  assert_eq(refused(b"fn a(d: Date) -> Date = { ..d, hour: 9 }"), ["E0220"]);
+  assert_eq(
+    refused(b"fn a() -> Date = {\n  let moved = |d| { ..d, day: 9 };\n  moved(epoch())\n}"),
+    ["E0220"],
+  )
+}
+
+test "an opaque record's fields are read and matched outside its module" {
+  assert_eq(refused(b"fn a(d: Date) -> Int = d.year + d.month"), []);
+  assert_eq(refused(b"fn a(d: Date) -> Int = match d { { day, .. } -> day }"), []);
+  assert_eq(
+    refused(b"fn a(d: Date) -> Int = {\n  let { year, month, day } = d;\n  year + month + day\n}"),
+    [],
+  )
+}
+
+test "a law does not quantify over an opaque type outside its module, at any depth" {
+  assert_eq(refused(b"law \"l\" forall (d: Date) { d.month > 0 }"), ["E0418"]);
+  assert_eq(refused(b"law \"l\" forall (ts: List<Token>) { len(ts) >= 0 }"), ["E0418"]);
+  assert_eq(
+    refused(b"type Stay = { from: Date }\nlaw \"l\" forall (s: Stay) { s.from.day > 0 }"),
+    ["E0418"],
+  );
+  let schema = b"law schema back<a, b>(f: (a) -> b, g: (b) -> a) forall (x: a) { g(f(x)) == x }\n";
+  assert_eq(refused(bytes_concat(schema, b"law \"l\" = back(text_of, mint)")), ["E0418"]);
+  assert_eq(refused(b"law \"l\" forall (s: String) { text_of(mint(s)) == s }"), [])
+}
+
+/// What the checker says of one module holding `src`.
+fn alone(src: Bytes) -> List<String> / {abort.raise} = codes(check_dump([{ name: b"m", src: src }]))
+
+test "inside its module nothing is refused, but a `pub fn`'s default that every caller would copy" {
+  let date = b"pub opaque type Date = new { day: Int }\n";
+  let token = b"pub opaque type Token = | Token(Int)\n";
+  assert_eq(alone(bytes_concat(date, b"fn a(d: Date = { day: 1 }) -> Date = { ..d, day: 2 }")), []);
+  assert_eq(alone(bytes_concat(date, b"pub fn a(d: Date = { day: 1 }) -> Date = d")), ["E0122"]);
+  assert_eq(
+    alone(bytes_concat(date, b"pub fn a(d: Option<Date> = Some({ day: 1 })) -> Int = 1")),
+    ["E0122"],
+  );
+  assert_eq(alone(bytes_concat(date, b"pub fn a(d: Option<Date> = None) -> Int = 1")), []);
+  assert_eq(alone(bytes_concat(token, b"fn a(t: Token = Token(1)) -> Token = t")), []);
+  assert_eq(alone(bytes_concat(token, b"pub fn a(t: Token = Token(1)) -> Token = t")), ["E0122"]);
+  assert_eq(alone(bytes_concat(token, b"law \"l\" forall (t: Token) { t == t }")), [])
+}
+
+test "a type need not be `pub` to be opaque, and an alias is never one" {
+  let diagnosed = |src: Bytes| map(parse(src).parser.diags, |d: ParseDiag| string_of_bytes(d.code));
+  assert_eq(diagnosed(b"opaque type Date = new { day: Int }\n"), []);
+  assert_eq(diagnosed(b"pub opaque type Token = | Token(Int)\n"), []);
+  assert_eq(diagnosed(b"pub opaque type Id = Int\n"), ["E0221"]);
+  assert_eq(diagnosed(b"opaque type Pair = { a: Int, b: Int }\n"), ["E0221"]);
+  // `opaque` is a word of its own anywhere else.
+  assert_eq(diagnosed(b"fn opaque(opaque: Int) -> Int = opaque\n"), []);
+  assert_eq(diagnosed(b"type T = { opaque: Bool }\n"), []);
+  // A private opaque record is still built by its module alone.
+  let kept = check_dump([
+    {
+      name: b"lib",
+      src: b"opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day\n",
+    },
+    { name: b"app", src: b"import lib (day)\nfn a() -> Int = day({ day: 1 })" },
+  ]);
+  assert_eq(codes(kept), ["E0220"])
+}
+
+test "a program of opaque types checked again from what it published answers the same" {
+  let program = [
+    { name: b"vault", src: bytes_of_string(vault()) },
+    {
+      name: b"app",
+      src: bytes_concat(
+        importing(),
+        b"pub fn later(d: Date) -> Int = next_year(d).year + string_len(text_of(mint(\"a\")))",
+      ),
+    },
+  ];
+  assert_eq(check_dump_known(program), check_dump(program))
+}
