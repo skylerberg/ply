@@ -3,8 +3,8 @@
 
 use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
-    KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Word, bridged, bytes_of,
-    is_unique, obj, set_word, str_of, word_at,
+    KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Stated, Word, bridged,
+    bytes_of, is_unique, obj, set_word, str_of, word_at,
 };
 use crate::map;
 use crate::stack::{Stack, switch};
@@ -582,6 +582,8 @@ pub struct Ctx {
     resumed: Option<Word>,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
     outer: (*mut Heap, *const i64),
+    /// What that entry's unit answered of its types' keys, put back with them.
+    outer_instances: Option<ply_eval::Instances>,
 }
 
 impl Ctx {
@@ -636,7 +638,22 @@ impl Ctx {
             aborting: None,
             resumed: None,
             outer: (std::ptr::null_mut(), std::ptr::null()),
+            outer_instances: None,
         }
+    }
+
+    /// This context as what reads its unit's values asks it, while it runs on this thread; `None`
+    /// for a unit none of whose types states a `key` or a `show`.
+    pub(crate) fn instances(&mut self) -> Option<ply_eval::Instances> {
+        self.tables
+            .layouts
+            .states_any()
+            .then(|| ply_eval::Instances {
+                unit: std::ptr::from_mut(self).cast(),
+                keyed: unit_keys,
+                key: key_value,
+                shown: shown_value,
+            })
     }
 
     /// A context for one branch of a `parallel` block this entry reached: its unit, host, seed and
@@ -774,6 +791,8 @@ impl Ctx {
             heap::swap_current(&mut self.heap),
             heap::poison::swap(&raw const self.site_root),
         );
+        let mine = self.instances();
+        self.outer_instances = ply_eval::instances::swap(mine);
     }
 
     /// When compiled code must call back next: the call one past the budget, the end of this
@@ -832,6 +851,7 @@ impl Ctx {
         );
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
+        ply_eval::instances::swap(self.outer_instances.take());
         self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
@@ -1565,6 +1585,130 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
     raise_error(ctx, d);
 }
 
+/// How far the base of the stack a helper runs on may sit from the one the entry's floor was
+/// taken from and still be that stack: a guard's width, and never a segment's.
+const SAME_STACK: usize = 256 * 1024;
+
+/// A `(ctx, args)` entry the unit states of a type, called with one of its values. Takes `w`;
+/// `None` when the call failed, which the context then holds. A value is compared wherever it is
+/// read, which may be in frames that grew onto a segment the entry's floor knows nothing of: the
+/// call then runs on a stack of its own.
+fn call_stated(ctx: *mut Ctx, entry: usize, w: Word) -> Option<Word> {
+    let args = [w];
+    let (floor, site) = {
+        let c = unsafe { &*ctx };
+        (c.stack_floor, (c.site_root, c.site_start, c.site_end))
+    };
+    let on_entry_stack = ply_eval::limit::stack_base()
+        .is_some_and(|base| base.abs_diff(floor.saturating_sub(STACK_MARGIN)) <= SAME_STACK);
+    let out = if on_entry_stack {
+        // SAFETY: `entry` is a taken root's address, which the unit keeps as long as its tables.
+        let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(entry) };
+        unsafe { f(ctx, args.as_ptr()) }
+    } else {
+        unsafe { rt_grow(ctx, entry as i64, args.as_ptr() as i64) }
+    };
+    let c = unsafe { &mut *ctx };
+    if c.failed != 0 {
+        return None;
+    }
+    // What reads the value fails where the body that asked stored its site, not inside this call.
+    (c.site_root, c.site_start, c.site_end) = site;
+    Some(out)
+}
+
+/// The context of the unit running on this thread, which a reader holding only its layouts asks.
+fn running_ctx() -> Option<*mut Ctx> {
+    ply_eval::instances::running().map(|i| i.unit.cast::<Ctx>())
+}
+
+/// A value read through a function its type states, where the unit running does not hold it.
+fn absent(ctx: &mut Ctx, what: &str, ctor: &Symbol) -> i64 {
+    let d = Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a `{ctor}` was read through its type's `{what}`, which this unit does not hold"),
+    )
+    .primary(Span::DUMMY, "in compiled code")
+    .note("this is Ply's fault: a unit that holds a type's values takes what the type states");
+    ctx.fail(d)
+}
+
+/// The keys two constructors' values are compared by, when their type states one: each the
+/// caller's. Reads both.
+pub(crate) fn keys_of(layouts: &Layouts, a: Word, b: Word) -> Option<(Word, Word)> {
+    if !layouts.states_any() {
+        return None;
+    }
+    let ctor = |w: Word| unsafe { (*obj(w)).layout };
+    let (ka, kb) = (layouts.key(ctor(a)), layouts.key(ctor(b)));
+    if ka == Stated::No || kb == Stated::No {
+        return None;
+    }
+    let ctx = running_ctx()?;
+    let (Stated::By(f), Stated::By(g)) = (ka, kb) else {
+        absent(
+            unsafe { &mut *ctx },
+            "key",
+            &layouts.ctors[ctor(a) as usize].0,
+        );
+        return None;
+    };
+    heap::inc(a);
+    let x = call_stated(ctx, f, a)?;
+    heap::inc(b);
+    match call_stated(ctx, g, b) {
+        Some(y) => Some((x, y)),
+        None => {
+            heap::dec(x);
+            None
+        }
+    }
+}
+
+fn unit_keys(unit: *mut (), ctor: &Symbol) -> bool {
+    let layouts = &unsafe { &*unit.cast::<Ctx>() }.tables.layouts;
+    layouts
+        .ctor_index(ctor)
+        .is_some_and(|i| layouts.key(i) != Stated::No)
+}
+
+fn stated_value(unit: *mut (), v: &Value, key: bool) -> Option<Value> {
+    let ctx = unit.cast::<Ctx>();
+    let c = unsafe { &mut *ctx };
+    let Value::Ctor { name, .. } = v else {
+        return None;
+    };
+    let index = c.tables.layouts.ctor_index(name)?;
+    let (stated, what) = if key {
+        (c.tables.layouts.key(index), "key")
+    } else {
+        (c.tables.layouts.show(index), "show")
+    };
+    match stated {
+        Stated::No => None,
+        Stated::Absent => {
+            absent(c, what, name);
+            None
+        }
+        Stated::By(entry) => {
+            let tables = Arc::clone(&c.tables);
+            let w = c.heap.to_word(&tables.layouts, v);
+            let out = call_stated(ctx, entry, w)?;
+            let answer = Heap::to_value(&tables.layouts, out);
+            heap::dec(out);
+            Some(answer)
+        }
+    }
+}
+
+fn key_value(unit: *mut (), v: &Value) -> Option<Value> {
+    stated_value(unit, v, true)
+}
+
+fn shown_value(unit: *mut (), v: &Value) -> Option<Value> {
+    stated_value(unit, v, false)
+}
+
 /// `==` beyond two `Int`s or `Bool`s, deferring to the evaluator's comparison. Reads both.
 pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     if heap::is_imm(a) && heap::is_imm(b) {
@@ -1574,6 +1718,16 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
         let (ka, kb) = (heap::kind(a), heap::kind(b));
         if ka == kb && (ka == KIND_STR || ka == KIND_BYTES) {
             return i64::from(unsafe { bytes_of(obj(a)) == bytes_of(obj(b)) });
+        }
+        // Two values of a keyed type are equal as their keys are.
+        if ka == KIND_CTOR && kb == KIND_CTOR && unsafe { &*ctx }.tables.layouts.states_any() {
+            let tables = Arc::clone(&unsafe { &*ctx }.tables);
+            if let Some((x, y)) = keys_of(&tables.layouts, a, b) {
+                let equal = unsafe { rt_equal(ctx, x, y) };
+                heap::dec(x);
+                heap::dec(y);
+                return equal;
+            }
         }
     }
     let ctx = unsafe { &mut *ctx };

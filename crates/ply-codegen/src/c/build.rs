@@ -5,7 +5,7 @@ use super::Refused;
 use super::exports::{Exports, Taken};
 use super::load::{Library, compile_and_load};
 use super::tables::{UnitTables, root_id};
-use crate::heap::{Heap, Word, mark_immortal};
+use crate::heap::{Heap, Stated, Word, mark_immortal};
 use crate::rt::Entry;
 use crate::rt::{Ctx, Root, Tables};
 use crate::source::Source;
@@ -109,6 +109,7 @@ fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -
         shapes,
         lambdas,
         buckets,
+        instances,
     } = exports;
     bind(&lib, &helpers)?;
     filled(&lib, &buckets)?;
@@ -153,6 +154,20 @@ fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -
         bail!("two roots of this unit share a site id");
     }
     let mut tables = tables_of(unit, &ctors);
+    let by = |function: &str| match function {
+        "-" => Stated::No,
+        name => entries
+            .get(name)
+            .map_or(Stated::Absent, |(entry, _)| Stated::By(*entry as usize)),
+    };
+    let mut stated = vec![(Stated::No, Stated::No); ctors.len()];
+    for (ctor, key, show) in &instances {
+        let Some(index) = tables.layouts.ctor_index(ctor) else {
+            bail!("the unit states a `key` or a `show` of `{ctor}`, which it does not hold");
+        };
+        stated[index as usize] = (by(key), by(show));
+    }
+    tables.layouts.state(stated);
     tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
     tables.memo_costs = functions
         .iter()

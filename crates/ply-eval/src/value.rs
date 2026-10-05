@@ -756,6 +756,9 @@ impl Ord for Value {
             (Value::Map(x), Value::Map(y)) => grow(|| x.iter().cmp(y.iter())),
             (Value::Record(x), Value::Record(y)) => grow(|| x.iter().cmp(y.iter())),
             (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 }) => {
+                if let Some((x, y)) = crate::instances::keys(self, other) {
+                    return grow(|| x.cmp(&y));
+                }
                 grow(|| n1.cmp(n2).then_with(|| a1.iter().cmp(a2.iter())))
             }
             (Value::Cell(x), Value::Cell(y)) => x.cmp(y),
@@ -809,6 +812,8 @@ fn is_canonical(v: &Value) -> bool {
                 .all(|(k, val)| is_canonical(k) && is_canonical(val))
         }),
         Value::Record(fields) => grow(|| fields.values().all(is_canonical)),
+        // A keyed value is ordered by its key, which reads the value as it stands.
+        Value::Ctor { name, .. } if crate::instances::keyed(name) => true,
         Value::Ctor { args, .. } => grow(|| args.iter().all(is_canonical)),
         _ => true,
     }
@@ -834,6 +839,7 @@ fn canonicalize(v: &Value) -> Value {
                     .collect(),
             ))
         }),
+        Value::Ctor { name, .. } if crate::instances::keyed(name) => v.clone(),
         Value::Ctor { name, args } => grow(|| Value::Ctor {
             name: name.clone(),
             args: Arc::new(args.iter().map(canonicalize).collect()),
@@ -954,6 +960,9 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             });
         }
         (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 }) => {
+            if let Some((x, y)) = crate::instances::keys(a, b) {
+                return descend(span, depth, || equal_at(&x, &y, span, depth + 1));
+            }
             if n1 != n2 || a1.len() != a2.len() {
                 return Ok(false);
             }
@@ -1062,8 +1071,9 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
                     .zip(e.values())
                     .find_map(|((k, x), y)| within(PathStep::Field(k.clone()), x, y, path))
             }),
+            // Two keyed values differ as wholes: their fields are not what is compared.
             (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 })
-                if n1 == n2 && a1.len() == a2.len() =>
+                if n1 == n2 && a1.len() == a2.len() && !crate::instances::keyed(n1) =>
             {
                 grow(|| {
                     a1.iter()

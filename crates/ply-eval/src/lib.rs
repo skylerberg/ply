@@ -21,6 +21,7 @@ mod footprint;
 pub mod handler;
 mod hash;
 pub mod host;
+pub mod instances;
 pub mod intty;
 pub mod limit;
 pub mod list;
@@ -64,6 +65,7 @@ pub use host::{
     HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
     ShutdownReport,
 };
+pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{

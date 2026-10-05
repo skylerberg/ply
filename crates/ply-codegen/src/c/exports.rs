@@ -85,6 +85,9 @@ pub struct Exports {
     pub lambdas: Vec<String>,
     /// Each bucket's table by the bucket's id: the unit's position of every key its C names.
     pub buckets: Vec<(u8, Vec<u32>)>,
+    /// Each constructor whose type's module states a `key` or a `show`, with the function of
+    /// each: `-` where it states none, `!` for one the unit does not take.
+    pub instances: Vec<(Symbol, String, String)>,
 }
 
 /// Whether `text` calls `helper` through its pointer, as the emitter writes a call: the name
@@ -190,6 +193,13 @@ impl Exports {
             }
             out.push('\n');
         }
+        // Written only by a unit one of whose types states a `key` or a `show`.
+        if !self.instances.is_empty() {
+            out.push_str(&format!("instances {}\n", self.instances.len()));
+            for (ctor, key, show) in &self.instances {
+                out.push_str(&format!("{ctor} {key} {show}\n"));
+            }
+        }
         out
     }
 
@@ -264,6 +274,18 @@ impl Exports {
                 .collect::<Option<Vec<u32>>>()?;
             buckets.push((id, places));
         }
+        // A unit none of whose types states a `key` or a `show` has no such table.
+        let n = if at == s.len() {
+            0
+        } else {
+            count(line(s, &mut at)?, "instances")?
+        };
+        let mut instances = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut parts = line(s, &mut at)?.split(' ');
+            let ctor = Symbol::new(parts.next()?);
+            instances.push((ctor, parts.next()?.to_string(), parts.next()?.to_string()));
+        }
         Some(Exports {
             helpers,
             ctors,
@@ -277,6 +299,7 @@ impl Exports {
             shapes: t.shapes,
             lambdas: t.lambdas,
             buckets,
+            instances,
         })
     }
 

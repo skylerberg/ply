@@ -86,10 +86,13 @@ impl Handed {
         c.stack_floor = if waiting != 0 { waiting } else { stack_floor() };
         let heap_was = heap::swap_current(&mut c.heap);
         let site_was = heap::poison::swap(&raw const c.site_root);
+        let mine = c.instances();
+        let instances_were = ply_eval::instances::swap(mine);
         branch.answer = call_value(ctx, branch.closure, &[]);
         heap::dec(branch.closure);
         // A reactor belongs to the thread that made it, and this branch is over.
         c.runtime = None;
+        ply_eval::instances::swap(instances_were);
         heap::poison::swap(site_was);
         heap::swap_current(heap_was);
     }
