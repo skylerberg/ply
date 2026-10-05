@@ -2649,8 +2649,8 @@ written).
 
 `ply test` keeps its answer for the next run over the same command line, files
 and `ply`, in the test store beside its passes: the answer of a run that ran no
-test in scope, or, for a `--json` run that ran some and passed, the one selecting
-again after it filed them gives. A later run whose key matches answers with it
+test in scope or, for a green `--json` run, the one selecting again after it
+filed its passes gives, without what the front-end cache said of itself. A later run whose key matches answers with it
 without loading the program while every pass it took still stands and every
 shipped definition its program reached hashes as it did (§13); otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
