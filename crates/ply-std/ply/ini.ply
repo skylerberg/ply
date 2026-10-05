@@ -1,0 +1,1284 @@
+//! INI: sections of `key = value` lines, read so that a file is written back with one value changed
+//! and nothing else touched.
+//!
+//! INI has no standard, so the dialect read here is the contract. A text is lines parted by line
+//! feeds. A blank is a space, a tab or a carriage return, and once the blanks that lead a line are
+//! passed over it is one of four things. It is blank where nothing is left. It is a comment where
+//! it opens with `#` or `;`, to its end. It is a section header where it opens with `[`: the name
+//! runs to the first `]`, without the blanks around it, is not empty, and only blanks or a
+//! comment follow the `]`. Names do not nest, so `[a.b]` and `[a "b"]` are the sections named
+//! `a.b` and `a "b"`. Any other line is an entry: the key is what stands before the first `=` and
+//! the value what stands after it, each without the blanks around it, and the key is not empty. A
+//! line that is none of these is refused.
+//!
+//! An entry above the first header is in the section named by the empty text. A header that
+//! names a section again reopens it, and a key may be written again: `get` answers its last value
+//! and `get_all` every one. Keys and names match as they are spelled. A value is the characters on
+//! its line: its quotes are part of it, a backslash is a backslash, a `#` or `;` in it is part of
+//! it, nothing is substituted into it, and no line continues another.
+//!
+//! git's configuration, systemd's units, Python's `configparser` and Windows' profile files read
+//! such a text differently, and `Options` holds each choice they differ in; `defaults` is the
+//! dialect above. A `Document` keeps every line as it was written, so `render` gives back the text
+//! `read` was handed, byte for byte, and `set` rewrites one value and leaves the blanks and the
+//! comment of its line, and every other line, as they were. `read`, `line`, `set` and `add` raise
+//! `ini.refused` with the line and the reason, and `decode` answers the same refusal as an `Err`.
+//! A reader takes the most bytes of text it will read.
+
+import std.bytes
+import std.bytes (peek, scan, scan_until)
+import std.laws (agrees, round_trip)
+import std.list
+import std.list (concat, drop, enumerate, first, last, take, zip)
+import std.string
+
+/// The choices INI readers differ in. `defaults` answers each as most of them do.
+pub type Options = new {
+  /// Whether `#` opens a comment.
+  hash: Bool,
+  /// Whether `;` opens a comment.
+  semicolon: Bool,
+  /// Whether a comment may follow a value, or a key with no value, on its line. It opens at the
+  /// first `#` or `;` that a blank stands before, so one no blank precedes is still part of the
+  /// value.
+  trailing_comments: Bool,
+  /// Whether `:` parts a key from its value as `=` does, whichever stands first.
+  colon: Bool,
+  /// Whether a value that opens with `"` runs to the closing `"`, keeping the blanks and the
+  /// comment characters between them, with `\\`, `\"`, `\n`, `\t` and `\r` as its escapes. Only
+  /// blanks or a comment may follow the closing quote.
+  quotes: Bool,
+  /// Whether a line with no delimiter is a key with no value, where it is otherwise refused.
+  bare_keys: Bool,
+  /// Whether a key may be written again in its section, where the second is otherwise refused.
+  repeats: Bool,
+  /// Whether keys and section names match whatever the case of their letters.
+  any_case: Bool,
+}
+
+/// The dialect the module's doc describes: `#` and `;` comments on lines of their own, `=` alone,
+/// values taken as written, a line with no `=` refused, keys that repeat, and case that matters.
+pub fn defaults() -> Options =
+  {
+    hash: true,
+    semicolon: true,
+    trailing_comments: false,
+    colon: false,
+    quotes: false,
+    bare_keys: false,
+    repeats: true,
+    any_case: false,
+  }
+
+/// A key and its value, which is `None` where the line has no delimiter.
+pub type Entry = new { key: String, value: Option<String> }
+
+/// What a line is.
+pub type What =
+  /// Nothing but blanks.
+  | Blank
+  /// A comment on a line of its own.
+  | Comment
+  /// A section header, by its name.
+  | Header(String)
+  /// A key and its value, unquoted and unescaped where the dialect quotes.
+  | Entry(Entry)
+
+/// One line: what it is, and its text as written, without its line feed.
+pub type Line = new { what: What, text: String }
+
+/// A text read: the dialect it was read in, and its lines in order. The text is the lines with a
+/// line feed between each two, so one that ends in a line feed ends in an empty line.
+pub type Document = new { options: Options, lines: List<Line> }
+
+/// Why a text is not INI in a dialect, or the dialect cannot write what was asked.
+pub type Why =
+  /// The text is longer than the limit the reader was given.
+  | TooLong
+  /// A line that is no comment and no header, with no delimiter to part a key from a value.
+  | NoDelimiter
+  /// An entry with nothing before its delimiter.
+  | NoKey
+  /// A header with no `]`, no name, or something other than blanks or a comment after its `]`.
+  | BadHeader
+  /// A quoted value with no closing quote, or with something other than blanks or a comment
+  /// after it.
+  | BadQuote
+  /// A backslash in a quoted value before a character that is no escape.
+  | BadEscape
+  /// A key written again in its section, in a dialect whose keys do not repeat.
+  | Repeated
+  /// A key, a section name or a value the dialect has no way to write so that it reads back.
+  | Unwritable
+
+/// A refusal and the line it is about, counted from one: the first for `TooLong`, and for
+/// something to write the line it would have had.
+pub type Refusal = new { line: Int, why: Why }
+
+/// What this module's readers and writers raise where they refuse.
+pub effect ini {
+  /// The text is not INI in the dialect, or the dialect cannot write what was asked.
+  raise refused(e: Refusal)
+}
+
+/// A sentence for each reason, for a message to a person.
+pub fn explain(why: Why) -> String =
+  match why {
+    TooLong -> "the text is longer than the limit the reader was given",
+    NoDelimiter ->
+      "a line is a comment, a `[section]` header, or a key and a value around a delimiter",
+    NoKey -> "an entry has a key before its delimiter",
+    BadHeader -> "a header is `[name]`, with a name, and nothing but a comment after its `]`",
+    BadQuote -> "a quoted value closes with `\"`, and nothing but a comment follows it",
+    BadEscape -> "the escapes of a quoted value are \\\\ \\\" \\n \\t and \\r",
+    Repeated -> "a key is written once in a section",
+    Unwritable ->
+      "the dialect has no way to write this key, section name or value so that it reads back",
+  }
+
+// --- Reading ----------------------------------------------------------------
+
+/// The document `text` is in the dialect `options`; a text of more than `limit` bytes is refused
+/// unread. Raises `ini.refused` where `decode` answers `Err`.
+pub fn read(text: String, options: Options, limit: Int) -> Document / {ini.refused, abort.raise} = {
+  let raw = bytes_of_string(text);
+  if bytes_len(raw) > limit { refuse(1, TooLong) } else {
+    let doc: Document = {
+      options: options,
+      lines: fold(bytes_split(raw, b"\n"), [], |lines: List<Line>, row: Bytes|
+        push(lines, {
+          what: shape(row, len(lines) + 1, options).what,
+          text: string_of_bytes(row),
+        })),
+    };
+    if options.repeats { doc } else { unrepeated(doc) }
+  }
+}
+
+/// The document `text` is, or the line it stops being INI at and why.
+pub fn decode(
+  text: String,
+  options: Options,
+  limit: Int,
+) -> Result<Document, Refusal> / {abort.raise} = try { read(text, options, limit) }
+
+/// One line read on its own, as `read` reads each line of a text, `number` being the line a
+/// refusal names. A line feed in `text` is a character like any other here, where `read` would
+/// have ended the line at it.
+pub fn line(text: String, number: Int, options: Options) -> Line / {ini.refused, abort.raise} =
+  { what: shape(bytes_of_string(text), number, options).what, text: text }
+
+/// The text of a document: every line as it stands, with a line feed between each two.
+pub fn render(doc: Document) -> String =
+  string_of_bytes_lossy(bytes::join(map(doc.lines, |l: Line| bytes_of_string(l.text)), b"\n"))
+
+/// A document of no lines but the empty one, which `render` writes as the empty text.
+pub fn empty(options: Options) -> Document = { options: options, lines: [blank_line()] }
+
+fn blank_line() -> Line = { what: Blank, text: "" }
+
+fn refuse<a>(line: Int, why: Why) -> a / {ini.refused} = ini.refused({ line: line, why: why })
+
+/// What a row is, and for an entry where its key and its value as written stand in the row:
+/// `from` and `to` bound the text a new value takes the place of.
+type Shape = { what: What, key: Int, key_end: Int, from: Int, to: Int }
+
+fn plain(what: What) -> Shape = { what: what, key: 0, key_end: 0, from: 0, to: 0 }
+
+fn blanks() -> Bytes = b" \t\r"
+
+fn is_mark(o: Options, c: Int) -> Bool = (c == 35 && o.hash) || (c == 59 && o.semicolon)
+
+fn delimiters(o: Options) -> Bytes = if o.colon { b"=:" } else { b"=" }
+
+fn shape(row: Bytes, number: Int, o: Options) -> Shape / {ini.refused, abort.raise} = {
+  let lead = scan(row, 0, blanks());
+  let c = peek(row, lead);
+  if c < 0 { plain(Blank) }
+  else if is_mark(o, c) { plain(Comment) }
+  else if c == 91 { plain(Header(header_name(row, lead, number, o))) }
+  else { entry_shape(row, lead, number, o) }
+}
+
+fn header_name(
+  row: Bytes,
+  lead: Int,
+  number: Int,
+  o: Options,
+) -> String / {ini.refused, abort.raise} = {
+  let n = bytes_len(row);
+  let close = scan_until(row, lead + 1, b"]");
+  let from = min(scan(row, lead + 1, blanks()), close);
+  let to = trimmed_end(row, from, close);
+  let after = scan(row, close + 1, blanks());
+  if close >= n || to == from || (after < n && !is_mark(o, bytes_at(row, after))) {
+    refuse(number, BadHeader)
+  } else { string_of_bytes(bytes_slice(row, from, to)) }
+}
+
+/// Where the bytes of `row` from `from` up to `to` end once the blanks they end in are dropped.
+fn trimmed_end(row: Bytes, from: Int, to: Int) -> Int / {abort.raise} =
+  if to > from && bytes_index_of_byte(blanks(), bytes_at(row, to - 1)) != None {
+    trimmed_end(row, from, to - 1)
+  } else { to }
+
+/// Where a comment after an unquoted value opens at or after `from`: the first mark a blank
+/// stands before, or the row's length where there is none or the dialect has none.
+fn comment_from(row: Bytes, from: Int, o: Options) -> Int / {abort.raise} =
+  if !o.trailing_comments { bytes_len(row) } else {
+    fold(openers(o), bytes_len(row), |first_at: Int, opener: Bytes|
+      match bytes_index_of_from(row, opener, from) {
+        Some(at) -> min(first_at, at + 1),
+        None -> first_at,
+      })
+  }
+
+/// Each blank before each mark the dialect has.
+fn openers(o: Options) -> List<Bytes> = {
+  let hashes = if o.hash { [b" #", b"\t#", b"\r#"] } else { [] };
+  let semicolons = if o.semicolon { [b" ;", b"\t;", b"\r;"] } else { [] };
+  concat(hashes, semicolons)
+}
+
+fn entry_shape(
+  row: Bytes,
+  lead: Int,
+  number: Int,
+  o: Options,
+) -> Shape / {ini.refused, abort.raise} = {
+  let cut = scan_until(row, lead, delimiters(o));
+  let note = comment_from(row, lead, o);
+  if cut >= note {
+    if !o.bare_keys { refuse(number, NoDelimiter) } else {
+      let end = trimmed_end(row, lead, note);
+      {
+        what: Entry({ key: string_of_bytes(bytes_slice(row, lead, end)), value: None }),
+        key: lead,
+        key_end: end,
+        from: end,
+        to: end,
+      }
+    }
+  } else {
+    let key_end = trimmed_end(row, lead, cut);
+    if key_end == lead { refuse(number, NoKey) } else { valued(row, lead, key_end, cut, number, o) }
+  }
+}
+
+fn valued(
+  row: Bytes,
+  lead: Int,
+  key_end: Int,
+  cut: Int,
+  number: Int,
+  o: Options,
+) -> Shape / {ini.refused, abort.raise} = {
+  let n = bytes_len(row);
+  let key = string_of_bytes(bytes_slice(row, lead, key_end));
+  let start = scan(row, cut + 1, blanks());
+  if o.quotes && peek(row, start) == 34 {
+    let q = quoted(row, start + 1, number);
+    let after = scan(row, q.end, blanks());
+    if after < n && !is_mark(o, bytes_at(row, after)) { refuse(number, BadQuote) } else {
+      {
+        what: Entry({ key: key, value: Some(string_of_bytes(q.value)) }),
+        key: lead,
+        key_end: key_end,
+        from: start,
+        to: q.end,
+      }
+    }
+  } else {
+    let end = trimmed_end(row, start, comment_from(row, cut + 1, o));
+    // An empty value before a comment is replaced right after the delimiter, so the blank the
+    // comment needs before it stays where it is.
+    let hollow = end == start && start < n;
+    {
+      what: Entry({ key: key, value: Some(string_of_bytes(bytes_slice(row, start, end))) }),
+      key: lead,
+      key_end: key_end,
+      from: if hollow { cut + 1 } else { start },
+      to: if hollow { cut + 1 } else { end },
+    }
+  }
+}
+
+/// A quoted value from the byte after its opening quote: its bytes unescaped, and the index past
+/// its closing quote.
+fn quoted(
+  row: Bytes,
+  from: Int,
+  number: Int,
+) -> { value: Bytes, end: Int } / {ini.refused, abort.raise} =
+  iterate({ at: from, read: b"" }, bytes_len(row) + 1, |s: { at: Int, read: Bytes }| {
+    let stop = scan_until(row, s.at, b"\"\\");
+    let read = bytes_concat(s.read, bytes_slice(row, s.at, stop));
+    if stop >= bytes_len(row) { refuse(number, BadQuote) }
+    else if bytes_at(row, stop) == 34 { Stop({ value: read, end: stop + 1 }) } else {
+      Continue({ at: stop + 2, read: bytes_concat(read, unescaped(peek(row, stop + 1), number)) })
+    }
+  })
+
+/// The byte an escape stands for; `c` is `-1` where the row ends at the backslash.
+fn unescaped(c: Int, number: Int) -> Bytes / {ini.refused} =
+  if c == 92 { b"\\" }
+  else if c == 34 { b"\"" }
+  else if c == 110 { b"\n" }
+  else if c == 116 { b"\t" }
+  else if c == 114 { b"\r" }
+  else if c < 0 { refuse(number, BadQuote) }
+  else { refuse(number, BadEscape) }
+
+// --- Looking up -------------------------------------------------------------
+
+/// An entry where it stands: the index of its line, and the section it is in.
+type Placed = { at: Int, section: String, entry: Entry }
+
+type Walk = { at: Int, section: String, found: List<Placed> }
+
+/// Every entry of a document in order, each with the section it stands in.
+fn placed(doc: Document) -> List<Placed> =
+  fold(doc.lines, { at: 0, section: "", found: [] }, |w: Walk, l: Line|
+    match l.what {
+      Header(name) -> { at: w.at + 1, section: name, found: w.found },
+      Entry(e) ->
+        {
+          at: w.at + 1,
+          section: w.section,
+          found: push(w.found, { at: w.at, section: w.section, entry: e }),
+        },
+      _ -> { at: w.at + 1, section: w.section, found: w.found },
+    }).found
+
+fn folded(o: Options, name: String) -> String = if o.any_case { string_lower(name) } else { name }
+
+fn same(o: Options, a: String, b: String) -> Bool = folded(o, a) == folded(o, b)
+
+fn within(doc: Document, section: String) -> List<Placed> =
+  filter(placed(doc), |p: Placed| same(doc.options, p.section, section))
+
+fn keyed(doc: Document, section: String, key: String) -> List<Placed> =
+  filter(within(doc, section), |p: Placed| same(doc.options, p.entry.key, key))
+
+/// The value of `key` in `section`, the last where it is written more than once; the empty text
+/// for a key with no value, which `entries` tells from one with an empty value. `section` is the
+/// empty text for the entries above the first header.
+pub fn get(doc: Document, section: String, key: String) -> Option<String> =
+  last(get_all(doc, section, key))
+
+/// Every value of `key` in `section`, in the order they are written.
+pub fn get_all(doc: Document, section: String, key: String) -> List<String> =
+  map(keyed(doc, section, key), |p: Placed| match p.entry.value { Some(v) -> v, None -> "" })
+
+/// Every entry of `section`, in the order they are written, wherever the section is opened.
+pub fn entries(doc: Document, section: String) -> List<Entry> =
+  map(within(doc, section), |p: Placed| p.entry)
+
+/// The keys of `section`, each once, in the order they are first written.
+pub fn keys(doc: Document, section: String) -> List<String> =
+  distinct(doc.options, map(within(doc, section), |p: Placed| p.entry.key))
+
+/// The names the document's headers give, each once, in the order they first open. The section
+/// above the first header has no name and is not among them.
+pub fn sections(doc: Document) -> List<String> =
+  distinct(
+    doc.options,
+    fold(doc.lines, [], |names: List<String>, l: Line|
+      match l.what { Header(name) -> push(names, name), _ -> names }),
+  )
+
+type Distinct = { seen: Map<String, Unit>, kept: List<String> }
+
+/// `names` without those that match an earlier one, each as it is first spelled.
+fn distinct(o: Options, names: List<String>) -> List<String> =
+  fold(names, { seen: map_new(), kept: [] }, |d: Distinct, name: String|
+    if map_contains(d.seen, folded(o, name)) { d }
+    else { { seen: map_insert(d.seen, folded(o, name), ()), kept: push(d.kept, name) } }).kept
+
+/// `doc`, refused at the line that writes a key its section already has.
+fn unrepeated(doc: Document) -> Document / {ini.refused} = {
+  let o = doc.options;
+  let _ = fold(placed(doc), map_new(), |seen: Map<List<String>, Unit>, p: Placed| {
+    let name = [folded(o, p.section), folded(o, p.entry.key)];
+    if map_contains(seen, name) { refuse(p.at + 1, Repeated) } else { map_insert(seen, name, ()) }
+  });
+  doc
+}
+
+// --- Editing ----------------------------------------------------------------
+
+/// `doc` with `key` in `section` given `value`. Where the key is written, its last entry's value
+/// is rewritten in place: in quotes where it stood in quotes or needs them, and with the line's
+/// blanks and comment, the key's spelling and every other line as they were. Where it is not
+/// written, this is `add`. Raises `ini.refused` with `Unwritable` for a value the dialect cannot
+/// write so that it reads back: without `quotes`, one that holds a line feed, begins or ends with
+/// a blank, or would open a trailing comment.
+pub fn set(
+  doc: Document,
+  section: String,
+  key: String,
+  value: String,
+) -> Document / {ini.refused, abort.raise} =
+  match last(keyed(doc, section, key)) {
+    Some(p) -> rewritten(doc, p, value),
+    None -> add(doc, section, key, value),
+  }
+
+/// `doc` with a new entry for `key` in `section`, whatever entries the key has there. The line
+/// goes after the section's last entry and is written as that one is, with its indent and the
+/// blanks around its delimiter. A section with no entry takes it after its header as
+/// `key = value`; the section above the first header takes it below the comments that open the
+/// text where a blank line follows them, and at the top otherwise; and a section the document
+/// lacks is opened at the end. The line ends as the line above it does, with a carriage return or
+/// without. Raises `ini.refused` with `Unwritable` for a key, a name or a value the dialect cannot
+/// write so that it reads back, and with `Repeated` where the dialect's keys do not repeat and
+/// the section has the key.
+pub fn add(
+  doc: Document,
+  section: String,
+  key: String,
+  value: String,
+) -> Document / {ini.refused, abort.raise} = {
+  let spot = spot_for(doc, section);
+  if !doc.options.repeats && len(keyed(doc, section, key)) > 0 { refuse(spot.at + 1, Repeated) }
+  else {
+    let end = ending(doc, spot.at);
+    let header = if spot.opens { [header_line(doc.options, section, end, spot.at + 1)] }
+    else { [] };
+    let entry = entry_line(doc.options, spot.lead ++ key ++ spot.parting, value, end, {
+      line: spot.at + len(header) + 1,
+      key: key,
+      quoted_first: false,
+    });
+    {
+      options: doc.options,
+      lines: concat(
+        concat(take(doc.lines, spot.at), push(header, entry)),
+        drop(doc.lines, spot.at),
+      ),
+    }
+  }
+}
+
+/// `doc` without the entries of `key` in `section`; every other line stays as it is.
+pub fn remove(doc: Document, section: String, key: String) -> Document = {
+  let gone = fold(keyed(doc, section, key), map_new(), |at: Map<Int, Unit>, p: Placed|
+    map_insert(at, p.at, ()));
+  {
+    options: doc.options,
+    lines: map(
+      filter(enumerate(doc.lines), |l: { index: Int, value: Line }| !map_contains(gone, l.index)),
+      |l: { index: Int, value: Line }| l.value,
+    ),
+  }
+}
+
+/// Where a new entry goes: the index its line takes, what is written before its key and between
+/// its key and its value, and whether its section's header is written above it.
+type Spot = { at: Int, lead: String, parting: String, opens: Bool }
+
+fn spot_for(doc: Document, section: String) -> Spot / {ini.refused, abort.raise} =
+  match last(within(doc, section)) {
+    Some(p) -> styled_after(doc, p.at),
+    None -> match last(headed(doc, section)) {
+      Some(at) -> { at: at + 1, lead: "", parting: " = ", opens: false },
+      None -> if section == "" { { at: top_of(doc), lead: "", parting: " = ", opens: false } }
+      else { { at: bottom_of(doc), lead: "", parting: " = ", opens: true } },
+    },
+  }
+
+/// The spot after the entry on line `at`, written as that entry is.
+fn styled_after(doc: Document, at: Int) -> Spot / {ini.refused, abort.raise} = {
+  let row = bytes_of_string(list::at(doc.lines, at).text);
+  let s = shape(row, at + 1, doc.options);
+  {
+    at: at + 1,
+    lead: string_of_bytes(bytes_slice(row, 0, s.key)),
+    parting: if s.from > s.key_end { string_of_bytes(bytes_slice(row, s.key_end, s.from)) }
+    else { " = " },
+    opens: false,
+  }
+}
+
+/// The indexes of the headers that name `section`.
+fn headed(doc: Document, section: String) -> List<Int> =
+  fold(enumerate(doc.lines), [], |found: List<Int>, l: { index: Int, value: Line }|
+    match l.value.what {
+      Header(name) -> if same(doc.options, name, section) { push(found, l.index) } else { found },
+      _ -> found,
+    })
+
+type Top = { at: Int, below: Int, open: Bool }
+
+/// Where an entry above the first header goes, there being none yet: below the comments that
+/// open the text where a blank line follows them, and at the top otherwise, so that a comment
+/// written onto the first header stays on it.
+fn top_of(doc: Document) -> Int =
+  fold(
+    enumerate(doc.lines),
+    { at: 0, below: 0, open: true },
+    |t: Top, l: { index: Int, value: Line }|
+      if !t.open { t } else {
+        match l.value.what {
+          Header(_) -> { at: t.at, below: t.below, open: false },
+          Blank -> { at: t.below, below: t.below, open: true },
+          _ -> { at: t.at, below: l.index + 1, open: true },
+        }
+      },
+  ).at
+
+/// Where a new section goes: before the empty line a text that ends in a line feed ends in, or
+/// after the last line.
+fn bottom_of(doc: Document) -> Int =
+  match last(doc.lines) {
+    Some(l) -> if l.text == "" { len(doc.lines) - 1 } else { len(doc.lines) },
+    None -> 0,
+  }
+
+/// What a line written at index `at` ends in: what the line above it does, or at the top the
+/// line below.
+fn ending(doc: Document, at: Int) -> String =
+  match list_at(doc.lines, if at > 0 { at - 1 } else { 0 }) {
+    Some(l) -> if string_ends_with(l.text, "\r") { "\r" } else { "" },
+    None -> "",
+  }
+
+/// What an entry to write is checked against: the line it takes, the key it must read back
+/// with, and whether its value is tried in quotes before it is tried bare.
+type Wanted = { line: Int, key: String, quoted_first: Bool }
+
+/// The line `head`, a value and `tail` make, the value bare or in quotes, whichever reads back as
+/// the entry wanted.
+fn entry_line(
+  o: Options,
+  head: String,
+  value: String,
+  tail: String,
+  w: Wanted,
+) -> Line / {ini.refused, abort.raise} = {
+  let what = Entry({ key: w.key, value: Some(value) });
+  let bare = head ++ value ++ tail;
+  let tried = if !o.quotes { [bare] }
+  else if w.quoted_first { [head ++ in_quotes(value) ++ tail, bare] }
+  else { [bare, head ++ in_quotes(value) ++ tail] };
+  match filter(tried, |text: String| reads_as(o, text, what)) {
+    [text, ..] -> { what: what, text: text },
+    [] -> refuse(w.line, Unwritable),
+  }
+}
+
+fn header_line(
+  o: Options,
+  name: String,
+  tail: String,
+  number: Int,
+) -> Line / {ini.refused, abort.raise} = {
+  let text = "[" ++ name ++ "]" ++ tail;
+  if reads_as(o, text, Header(name)) { { what: Header(name), text: text } }
+  else { refuse(number, Unwritable) }
+}
+
+/// Whether `text` is one line that reads as `what`.
+fn reads_as(o: Options, text: String, what: What) -> Bool / {abort.raise} = {
+  let read = try { shape(bytes_of_string(text), 0, o) };
+  !string_contains(text, "\n") && (match read { Ok(s) -> s.what == what, Err(_) -> false })
+}
+
+fn in_quotes(value: String) -> String / {abort.raise} = {
+  let raw = bytes_of_string(value);
+  let escaped = fold(
+    [
+      { from: b"\\", to: b"\\\\" },
+      { from: b"\"", to: b"\\\"" },
+      { from: b"\n", to: b"\\n" },
+      { from: b"\t", to: b"\\t" },
+      { from: b"\r", to: b"\\r" },
+    ],
+    raw,
+    |text: Bytes, e: { from: Bytes, to: Bytes }| bytes::replace(text, e.from, e.to),
+  );
+  "\"" ++ string_of_bytes(escaped) ++ "\""
+}
+
+/// `doc` with the value of the entry at `p` replaced.
+fn rewritten(doc: Document, p: Placed, value: String) -> Document / {ini.refused, abort.raise} = {
+  let row = bytes_of_string(list::at(doc.lines, p.at).text);
+  let s = shape(row, p.at + 1, doc.options);
+  let valued = p.entry.value != None;
+  let head = string_of_bytes(bytes_slice(row, 0, s.from)) ++ (if valued { "" } else { " = " });
+  let tail = string_of_bytes(bytes_slice(row, s.to, bytes_len(row)));
+  let line = entry_line(doc.options, head, value, tail, {
+    line: p.at + 1,
+    key: p.entry.key,
+    quoted_first: valued && peek(row, s.from) == 34,
+  });
+  { options: doc.options, lines: list_set(doc.lines, p.at, line) }
+}
+
+// --- Laws -------------------------------------------------------------------
+
+/// A limit no text here reaches.
+fn cap() -> Int = 1_000_000
+
+/// Every choice `defaults` turns down, taken.
+fn loose() -> Options =
+  {
+    hash: true,
+    semicolon: true,
+    trailing_comments: true,
+    colon: true,
+    quotes: true,
+    bare_keys: true,
+    repeats: true,
+    any_case: true,
+  }
+
+fn quoting() -> Options = { ..defaults(), quotes: true }
+
+/// Lines of every kind, as files written by hand and by tools hold them. Each reads in `loose`.
+fn fragments() -> List<String> =
+  [
+    "",
+    "  ",
+    "# a comment",
+    "; another",
+    "\t# indented",
+    "[core]",
+    "[ spaced ]  ; noted",
+    "[remote \"origin\"]",
+    "\t[tabbed]\r",
+    "name = value",
+    "name=value",
+    "  indented = yes",
+    "empty =",
+    "empty=",
+    "empty = ; noted",
+    "url = https://example.com/a#b",
+    "key = value # noted",
+    "key = \"quoted value\" ; noted",
+    "key = \" padded \"",
+    "key = \"a \\\"b\\\" \\\\ c\"#noted",
+    "bare",
+    "bare ; noted",
+    "path = C:\\dir\\file",
+    "colon: value",
+    "a = b = c",
+    "KEY = upper",
+    "crlf = yes\r",
+  ]
+
+/// A text of the fragments `picks` choose, a line each.
+fn sample(picks: List<Int>) -> String / {abort.raise} = {
+  let n = len(fragments());
+  string::join(map(picks, |pick: Int| list::at_or(fragments(), (pick % n + n) % n, "")), "\n")
+}
+
+law "a text that reads is written back byte for byte"
+  forall (text: String) {
+    match decode(text, loose(), cap()) { Ok(doc) -> render(doc) == text, Err(_) -> true }
+  }
+
+law "lines of every kind are written back byte for byte" =
+  agrees(|picks: List<Int>| render(read(sample(picks), loose(), cap())), sample)
+
+law "a value set is the value the text reads back" =
+  round_trip(
+    |value: String| render(set(empty(quoting()), "section", "key", value)),
+    |text: String| get(read(text, quoting(), cap()), "section", "key"),
+  )
+
+law "every value added reads back, in order" =
+  agrees(
+    |values: List<String>| get_all(read(render(all_added(values)), quoting(), cap()), "s", "k"),
+    |values: List<String>| values,
+  )
+
+fn all_added(values: List<String>) -> Document / {ini.refused, abort.raise} =
+  fold(values, empty(quoting()), |doc: Document, value: String| add(doc, "s", "k", value))
+
+law "setting a value rewrites one line, and the text reads back as the document"
+  forall (picks: List<Int>, value: String) {
+    edited_in_place(sample(picks), value)
+  }
+
+/// Whether giving the first key of `text` a value changes one line at most, to a text that reads
+/// back as the document `set` answered.
+fn edited_in_place(text: String, value: String) -> Bool / {ini.refused, abort.raise} = {
+  let before = read(text, loose(), cap());
+  match first(placed(before)) {
+    None -> true,
+    Some(p) -> {
+      let after = set(before, p.section, p.entry.key, value);
+      let changed = filter(zip(before.lines, after.lines), |z: { first: Line, second: Line }|
+        z.first != z.second);
+      len(after.lines) == len(before.lines) && len(changed) <= 1
+        && get(after, p.section, p.entry.key) == Some(value)
+        && read(render(after), loose(), cap()) == after
+    },
+  }
+}
+
+// --- Tests: reading ---------------------------------------------------------
+
+type Reading = { name: String, options: Options, text: String, what: What }
+
+fn entry(key: String, value: String) -> What = Entry({ key: key, value: Some(value) })
+
+fn readings() -> List<Reading> =
+  [
+    { name: "a line of blanks", options: defaults(), text: " \t\r", what: Blank },
+    { name: "a `#` comment", options: defaults(), text: "# key = value", what: Comment },
+    { name: "an indented `;` comment", options: defaults(), text: "  ; [core]", what: Comment },
+    { name: "a header", options: defaults(), text: "[core]", what: Header("core") },
+    {
+      name: "a header's blanks, inside and out",
+      options: defaults(),
+      text: "\t[ two words ]  \r",
+      what: Header("two words"),
+    },
+    { name: "a dotted name", options: defaults(), text: "[a.b]", what: Header("a.b") },
+    {
+      name: "a quoted subsection",
+      options: defaults(),
+      text: "[remote \"origin\"]",
+      what: Header("remote \"origin\""),
+    },
+    {
+      name: "a comment after a header",
+      options: defaults(),
+      text: "[core] ; noted",
+      what: Header("core"),
+    },
+    { name: "an entry", options: defaults(), text: "key=value", what: entry("key", "value") },
+    {
+      name: "the blanks around a key and a value",
+      options: defaults(),
+      text: "  two words\t=\tsome value  \r",
+      what: entry("two words", "some value"),
+    },
+    { name: "an empty value", options: defaults(), text: "key =", what: entry("key", "") },
+    { name: "the first `=`", options: defaults(), text: "a=b=c", what: entry("a", "b=c") },
+    {
+      name: "quotes, kept",
+      options: defaults(),
+      text: "key = \"value\"",
+      what: entry("key", "\"value\""),
+    },
+    {
+      name: "a backslash, kept",
+      options: defaults(),
+      text: "path = C:\\dir\\n",
+      what: entry("path", "C:\\dir\\n"),
+    },
+    {
+      name: "a comment character in a value, kept",
+      options: defaults(),
+      text: "key = a # b ; c",
+      what: entry("key", "a # b ; c"),
+    },
+    { name: "a colon in a key", options: defaults(), text: "a:b = c", what: entry("a:b", "c") },
+    {
+      name: "a `#` that opens no comment",
+      options: { ..defaults(), hash: false },
+      text: "#key = value",
+      what: entry("#key", "value"),
+    },
+    {
+      name: "a `;` that opens no comment",
+      options: { ..defaults(), semicolon: false },
+      text: ";key = value",
+      what: entry(";key", "value"),
+    },
+    {
+      name: "a comment after a value",
+      options: { ..defaults(), trailing_comments: true },
+      text: "key = value # noted ; twice",
+      what: entry("key", "value"),
+    },
+    {
+      name: "a mark no blank precedes",
+      options: { ..defaults(), trailing_comments: true },
+      text: "url = https://example.com/a#b;c",
+      what: entry("url", "https://example.com/a#b;c"),
+    },
+    {
+      name: "a comment after an empty value",
+      options: { ..defaults(), trailing_comments: true },
+      text: "key = # noted",
+      what: entry("key", ""),
+    },
+    {
+      name: "a mark right after the delimiter",
+      options: { ..defaults(), trailing_comments: true },
+      text: "key =# value",
+      what: entry("key", "# value"),
+    },
+    {
+      name: "a colon as a delimiter",
+      options: { ..defaults(), colon: true },
+      text: "key: a=b",
+      what: entry("key", "a=b"),
+    },
+    {
+      name: "an `=` before a colon",
+      options: { ..defaults(), colon: true },
+      text: "key = a:b",
+      what: entry("key", "a:b"),
+    },
+    {
+      name: "a quoted value's blanks",
+      options: quoting(),
+      text: "key = \"  padded  \"",
+      what: entry("key", "  padded  "),
+    },
+    {
+      name: "a quoted value's escapes",
+      options: quoting(),
+      text: "key = \"a \\\"b\\\" \\\\ \\n\\t\\r\"",
+      what: entry("key", "a \"b\" \\ \n\t\r"),
+    },
+    {
+      name: "a comment character inside quotes",
+      options: { ..loose(), colon: false },
+      text: "key = \"a # b\" # noted",
+      what: entry("key", "a # b"),
+    },
+    {
+      name: "a comment right after a closing quote",
+      options: quoting(),
+      text: "key = \"a\";noted",
+      what: entry("key", "a"),
+    },
+    {
+      name: "a quote that does not open a value",
+      options: quoting(),
+      text: "key = a \"b\"",
+      what: entry("key", "a \"b\""),
+    },
+    {
+      name: "an empty quoted value",
+      options: quoting(),
+      text: "key = \"\"",
+      what: entry("key", ""),
+    },
+    {
+      name: "a key with no value",
+      options: { ..defaults(), bare_keys: true },
+      text: "  flag  ",
+      what: Entry({ key: "flag", value: None }),
+    },
+    {
+      name: "a key with no value before a comment",
+      options: { ..loose(), colon: false },
+      text: "flag # key = value",
+      what: Entry({ key: "flag", value: None }),
+    },
+    {
+      name: "a key's case, kept",
+      options: { ..defaults(), any_case: true },
+      text: "KeY = Value",
+      what: entry("KeY", "Value"),
+    },
+  ]
+
+test "{c.name} is read" for c: Reading in readings() {
+  assert_eq(line(c.text, 1, c.options), { what: c.what, text: c.text })
+}
+
+type Refused = { name: String, options: Options, text: String, line: Int, why: Why }
+
+fn refused() -> List<Refused> =
+  [
+    {
+      name: "a line with no delimiter",
+      options: defaults(),
+      text: "a = 1\n\njust words\n",
+      line: 3,
+      why: NoDelimiter,
+    },
+    {
+      name: "a colon where only `=` parts",
+      options: defaults(),
+      text: "key: value",
+      line: 1,
+      why: NoDelimiter,
+    },
+    {
+      name: "a line after a carriage return and a line feed",
+      options: defaults(),
+      text: "a = 1\r\n\r\nwords\r\n",
+      line: 3,
+      why: NoDelimiter,
+    },
+    {
+      name: "an entry with no key",
+      options: defaults(),
+      text: "[a]\n = value",
+      line: 2,
+      why: NoKey,
+    },
+    {
+      name: "a header that never closes",
+      options: defaults(),
+      text: "[core\nkey = value",
+      line: 1,
+      why: BadHeader,
+    },
+    { name: "a header with no name", options: defaults(), text: "[  ]", line: 1, why: BadHeader },
+    {
+      name: "a header with text after it",
+      options: defaults(),
+      text: "[core] key = value",
+      line: 1,
+      why: BadHeader,
+    },
+    {
+      name: "a value in quotes that never close",
+      options: quoting(),
+      text: "key = \"value",
+      line: 1,
+      why: BadQuote,
+    },
+    {
+      name: "a value whose quotes end on a backslash",
+      options: quoting(),
+      text: "key = \"value\\",
+      line: 1,
+      why: BadQuote,
+    },
+    {
+      name: "text after a closing quote",
+      options: quoting(),
+      text: "a = \"b\"\nkey = \"value\" more",
+      line: 2,
+      why: BadQuote,
+    },
+    {
+      name: "an escape the dialect lacks",
+      options: quoting(),
+      text: "key = \"C:\\dir\"",
+      line: 1,
+      why: BadEscape,
+    },
+    {
+      name: "a key written twice where keys do not repeat",
+      options: { ..defaults(), repeats: false },
+      text: "[a]\nkey = 1\n[b]\nkey = 2\n[a]\nkey = 3\n",
+      line: 6,
+      why: Repeated,
+    },
+    {
+      name: "a key written twice in another case",
+      options: { ..defaults(), repeats: false, any_case: true },
+      text: "Key = 1\nkEY = 2",
+      line: 2,
+      why: Repeated,
+    },
+    {
+      name: "a key with no value where keys have one",
+      options: { ..defaults(), trailing_comments: true },
+      text: "flag # key = value",
+      line: 1,
+      why: NoDelimiter,
+    },
+  ]
+
+test "{c.name} is refused" for c: Refused in refused() {
+  assert_eq(decode(c.text, c.options, cap()), Err({ line: c.line, why: c.why }));
+  assert(string_len(explain(c.why)) > 0)
+}
+
+test "a text past the limit is refused unread, and one at it is read" {
+  assert_eq(decode("key = é\n", defaults(), 8), Err({ line: 1, why: TooLong }));
+  assert_eq(
+    decode("key = é\n", defaults(), 9),
+    Ok({
+      options: defaults(),
+      lines: [{ what: entry("key", "é"), text: "key = é" }, { what: Blank, text: "" }],
+    }),
+  )
+}
+
+test "a text is its lines with a line feed between, so every text is written back" {
+  let back = |text: String| render(read(text, defaults(), cap()));
+  assert_eq(len(read("", defaults(), cap()).lines), 1);
+  assert_eq(read("", defaults(), cap()), empty(defaults()));
+  assert_eq(len(read("a = 1\n", defaults(), cap()).lines), 2);
+  assert_eq(len(read("a = 1", defaults(), cap()).lines), 1);
+  assert_eq(back(""), "");
+  assert_eq(back("\n\n"), "\n\n");
+  assert_eq(back("  a  =  1  \r\n\t; c\r\n[ s ]\r\nb=2"), "  a  =  1  \r\n\t; c\r\n[ s ]\r\nb=2")
+}
+
+test "a line read alone takes a line feed as a character" {
+  assert_eq(line("key = two\nlines", 7, defaults()).what, entry("key", "two\nlines"));
+  assert_eq(try { line("words", 7, defaults()) }, Err({ line: 7, why: NoDelimiter }))
+}
+
+// --- Tests: looking up ------------------------------------------------------
+
+fn nested() -> String =
+  \\top = 1
+  \\[a]
+  \\x = 1
+  \\x = 2
+  \\flag
+  \\[b]
+  \\x = 3
+  \\[A]
+  \\y =
+  \\X = 5
+
+test "a key is looked up in its section, and its last value answers" {
+  let doc = read(nested(), { ..defaults(), bare_keys: true }, cap());
+  assert_eq(get(doc, "a", "x"), Some("2"));
+  assert_eq(get_all(doc, "a", "x"), ["1", "2"]);
+  assert_eq(get(doc, "b", "x"), Some("3"));
+  assert_eq(get(doc, "", "top"), Some("1"));
+  assert_eq(get(doc, "", "x"), None);
+  assert_eq(get(doc, "a", "top"), None);
+  assert_eq(get(doc, "c", "x"), None);
+  assert_eq(get_all(doc, "c", "x"), [])
+}
+
+test "a key with no value answers the empty text, and its entry tells it from an empty value" {
+  let doc = read(nested(), { ..defaults(), bare_keys: true }, cap());
+  assert_eq(get(doc, "a", "flag"), Some(""));
+  assert_eq(get(doc, "A", "y"), Some(""));
+  assert_eq(entries(doc, "a"), [
+    { key: "x", value: Some("1") },
+    { key: "x", value: Some("2") },
+    { key: "flag", value: None },
+  ]);
+  assert_eq(entries(doc, "A"), [{ key: "y", value: Some("") }, { key: "X", value: Some("5") }])
+}
+
+test "sections and keys are listed once each, in the order they first appear" {
+  let doc = read(nested(), { ..defaults(), bare_keys: true }, cap());
+  assert_eq(sections(doc), ["a", "b", "A"]);
+  assert_eq(keys(doc, "a"), ["x", "flag"]);
+  assert_eq(keys(doc, ""), ["top"]);
+  assert_eq(keys(doc, "c"), []);
+  assert_eq(sections(read("# nothing\n", defaults(), cap())), [])
+}
+
+test "a section opened again is one section, and case matters only where the dialect says" {
+  let folded = read(nested(), { ..defaults(), bare_keys: true, any_case: true }, cap());
+  assert_eq(sections(folded), ["a", "b"]);
+  assert_eq(keys(folded, "A"), ["x", "flag", "y"]);
+  assert_eq(get_all(folded, "a", "X"), ["1", "2", "5"]);
+  assert_eq(get(folded, "A", "x"), Some("5"));
+  let again = read("[a]\nx = 1\n[b]\n[a]\nx = 2\n", defaults(), cap());
+  assert_eq(sections(again), ["a", "b"]);
+  assert_eq(get_all(again, "a", "x"), ["1", "2"])
+}
+
+// --- Tests: editing ---------------------------------------------------------
+
+fn site() -> String =
+  \\# site.ini
+  \\name = demo
+  \\
+  \\[server]
+  \\  host = example.com   ; where it listens
+  \\  port = 8080
+  \\
+  \\[paths]
+  \\root=C:\data
+  \\
+
+fn noted() -> Options = { ..defaults(), trailing_comments: true }
+
+test "set rewrites one value and keeps its line's blanks and comment" {
+  let doc = read(site(), noted(), cap());
+  assert_eq(
+    render(set(doc, "server", "host", "example.org")),
+    string::replace(site(), "example.com", "example.org"),
+  );
+  assert_eq(
+    render(set(doc, "paths", "root", "D:\\srv")),
+    string::replace(site(), "C:\\data", "D:\\srv"),
+  );
+  assert_eq(render(set(doc, "", "name", "")), string::replace(site(), "name = demo", "name = "));
+  assert_eq(get(set(doc, "server", "host", "example.org"), "server", "host"), Some("example.org"));
+  assert_eq(render(set(doc, "server", "port", "8080")), site())
+}
+
+test "a key written more than once has its last value set" {
+  let doc = read("[a]\nx = 1\nx = 2\n[a]\nx = 3 \ny = 4\n", defaults(), cap());
+  assert_eq(render(set(doc, "a", "x", "9")), "[a]\nx = 1\nx = 2\n[a]\nx = 9 \ny = 4\n")
+}
+
+test "a new entry follows its section's last and is written as that one is" {
+  let doc = read(site(), noted(), cap());
+  assert_eq(
+    render(set(doc, "server", "tls", "on")),
+    string::replace(site(), "  port = 8080\n", "  port = 8080\n  tls = on\n"),
+  );
+  assert_eq(
+    render(set(doc, "paths", "cache", "/tmp")),
+    string::replace(site(), "root=C:\\data\n", "root=C:\\data\ncache=/tmp\n"),
+  );
+  assert_eq(
+    render(set(doc, "", "owner", "ada")),
+    string::replace(site(), "name = demo\n", "name = demo\nowner = ada\n"),
+  );
+  assert_eq(
+    render(add(doc, "server", "host", "example.net")),
+    string::replace(site(), "  port = 8080\n", "  port = 8080\n  host = example.net\n"),
+  );
+  assert_eq(
+    render(
+      add(read("[a]\nx=1\n[b]\n[a]\ny : 2\n", { ..defaults(), colon: true }, cap()), "a", "z", "3"),
+    ),
+    "[a]\nx=1\n[b]\n[a]\ny : 2\nz : 3\n",
+  )
+}
+
+test "a section with no entry takes one under its header, and a new section opens at the end" {
+  let at = |text: String, section: String|
+    render(add(read(text, defaults(), cap()), section, "k", "v"));
+  assert_eq(at("[a]\n[b]\nx=1\n", "a"), "[a]\nk = v\n[b]\nx=1\n");
+  assert_eq(at("[a]\nx=1\n", "b"), "[a]\nx=1\n[b]\nk = v\n");
+  assert_eq(at("[a]\nx=1", "b"), "[a]\nx=1\n[b]\nk = v");
+  assert_eq(at("", "b"), "[b]\nk = v\n");
+  assert_eq(at("", ""), "k = v\n");
+  assert_eq(at("# opening\n\n[a]\n", ""), "# opening\nk = v\n\n[a]\n");
+  assert_eq(at("# about a\n[a]\n", ""), "k = v\n# about a\n[a]\n");
+  assert_eq(at("# only this\n", ""), "# only this\nk = v\n")
+}
+
+test "a line written into a text of carriage returns ends in one" {
+  let doc = read("[a]\r\nx = 1\r\n", defaults(), cap());
+  assert_eq(render(set(doc, "a", "x", "2")), "[a]\r\nx = 2\r\n");
+  assert_eq(render(set(doc, "a", "y", "2")), "[a]\r\nx = 1\r\ny = 2\r\n");
+  assert_eq(render(set(doc, "b", "y", "2")), "[a]\r\nx = 1\r\n[b]\r\ny = 2\r\n");
+  assert_eq(render(set(doc, "", "y", "2")), "y = 2\r\n[a]\r\nx = 1\r\n")
+}
+
+test "a value is written in quotes where it stood in them or needs them" {
+  let doc = read("a = \"one\" ; noted\nb = two\nc = \"x\"#y\n", { ..loose(), colon: false }, cap());
+  let text = |d: Document| render(d);
+  assert_eq(text(set(doc, "", "a", "1")), "a = \"1\" ; noted\nb = two\nc = \"x\"#y\n");
+  assert_eq(text(set(doc, "", "c", "z")), "a = \"one\" ; noted\nb = two\nc = \"z\"#y\n");
+  assert_eq(text(set(doc, "", "b", "2")), "a = \"one\" ; noted\nb = 2\nc = \"x\"#y\n");
+  assert_eq(
+    text(set(doc, "", "b", " a \"b\"\n# c ")),
+    "a = \"one\" ; noted\nb = \" a \\\"b\\\"\\n# c \"\nc = \"x\"#y\n",
+  );
+  assert_eq(get(set(doc, "", "b", " a \"b\"\n# c "), "", "b"), Some(" a \"b\"\n# c "))
+}
+
+test "a key with no value gains a delimiter, and an empty value keeps its comment apart" {
+  let doc = read("flag ; noted\nempty = ; noted\nbare\n", { ..loose(), colon: false }, cap());
+  assert_eq(render(set(doc, "", "flag", "on")), "flag = on ; noted\nempty = ; noted\nbare\n");
+  assert_eq(render(set(doc, "", "bare", "on")), "flag ; noted\nempty = ; noted\nbare = on\n");
+  assert_eq(render(set(doc, "", "empty", "full")), "flag ; noted\nempty =full ; noted\nbare\n");
+  assert_eq(get(set(doc, "", "empty", "full"), "", "empty"), Some("full"))
+}
+
+test "remove takes a key's every entry and leaves the other lines" {
+  let doc = read("[a]\nx = 1\n# kept\nx = 2\ny = 3\n[b]\nx = 4\n", defaults(), cap());
+  assert_eq(render(remove(doc, "a", "x")), "[a]\n# kept\ny = 3\n[b]\nx = 4\n");
+  assert_eq(remove(doc, "a", "z"), doc);
+  assert_eq(remove(doc, "c", "x"), doc)
+}
+
+type Unwritten = { name: String, options: Options, section: String, key: String, value: String }
+
+fn unwritten() -> List<Unwritten> =
+  [
+    {
+      name: "a value of two lines",
+      options: defaults(),
+      section: "a",
+      key: "k",
+      value: "two\nlines",
+    },
+    {
+      name: "a value that opens with a blank",
+      options: defaults(),
+      section: "a",
+      key: "k",
+      value: " v",
+    },
+    {
+      name: "a value that ends in a carriage return",
+      options: defaults(),
+      section: "a",
+      key: "k",
+      value: "v\r",
+    },
+    {
+      name: "a value that would open a comment",
+      options: noted(),
+      section: "a",
+      key: "k",
+      value: "v # w",
+    },
+    {
+      name: "a key with the delimiter in it",
+      options: defaults(),
+      section: "a",
+      key: "k=l",
+      value: "v",
+    },
+    { name: "an empty key", options: defaults(), section: "a", key: "", value: "v" },
+    {
+      name: "a key that opens as a header",
+      options: defaults(),
+      section: "a",
+      key: "[k",
+      value: "v",
+    },
+    {
+      name: "a key that opens as a comment",
+      options: defaults(),
+      section: "a",
+      key: "#k",
+      value: "v",
+    },
+    {
+      name: "a key with blanks around it",
+      options: defaults(),
+      section: "a",
+      key: " k ",
+      value: "v",
+    },
+    {
+      name: "a section name with a `]` in it",
+      options: defaults(),
+      section: "b]c",
+      key: "k",
+      value: "v",
+    },
+    {
+      name: "a section name of two lines",
+      options: defaults(),
+      section: "b\nc",
+      key: "k",
+      value: "v",
+    },
+  ]
+
+test "{c.name} is not written" for c: Unwritten in unwritten() {
+  let doc = read("[a]\nx = 1\n", c.options, cap());
+  assert_eq(try { set(doc, c.section, c.key, c.value) }, Err({ line: 3, why: Unwritable }))
+}
+
+test "a value the dialect cannot write bare is refused at its own line, and written in another" {
+  let doc = read("[a]\nx = 1\ny = 2\n", defaults(), cap());
+  assert_eq(try { set(doc, "a", "x", " v") }, Err({ line: 2, why: Unwritable }));
+  assert_eq(render(set(doc, "a", "x", "v # w")), "[a]\nx = v # w\ny = 2\n");
+  let quoted = read("[a]\nx = 1\ny = 2\n", quoting(), cap());
+  assert_eq(render(set(quoted, "a", "x", " v")), "[a]\nx = \" v\"\ny = 2\n")
+}
+
+test "a key is added again only where the dialect's keys repeat" {
+  let once = read("[a]\nx = 1\n", { ..defaults(), repeats: false }, cap());
+  assert_eq(try { add(once, "a", "x", "2") }, Err({ line: 3, why: Repeated }));
+  assert_eq(render(set(once, "a", "x", "2")), "[a]\nx = 2\n");
+  assert_eq(render(add(once, "a", "y", "2")), "[a]\nx = 1\ny = 2\n");
+  let many = read("[a]\nx = 1\n", defaults(), cap());
+  assert_eq(get_all(add(many, "a", "x", "2"), "a", "x"), ["1", "2"])
+}
