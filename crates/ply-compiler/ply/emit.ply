@@ -10,7 +10,7 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
               SEnsures, SCost, FnDef, TDNominal, test_run, test_listing, IInstance, VariantDef,
-              TDSum)
+              TDSum, INumeric, NumericOp)
 import resolve (ParsedModule, Source, ResolveSucceeded, ResolveFailed, Diag, resolve_modules,
                 Resolved, Scope, Binding, ModuleBinding, PackageDeps, resolve_packaged, no_packages,
                 default_binder, find_module_binding, qualify)
@@ -31,7 +31,7 @@ import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, E
               case_identity)
 import type_syntax (Mode, MRead, MWrite, MRaise, MBad, TypeExpr, TVar, TCon, TRecord, is_raise,
                     ident_names)
-import rewrite (expand, named_program_wide)
+import rewrite (expand, named_program_wide, stated_witness_name)
 import embed (EmbedAt, embed_tables, rewritten)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import std.list
@@ -1874,6 +1874,29 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> / {abort.raise} = {
 /// A constructor's tag as the C writes it: by its name in the program's table, which a unit resolves
 /// to the position its own table gives that name, so a body reads the same in every program and does
 /// not move when a constructor is added elsewhere.
+/// The witness of a type that states its own arithmetic, which the elaboration names by one of the
+/// type's constructors: the runtime's first such witness past that constructor's tag, so the body
+/// names the tag and takes what the type states with it.
+fn stated_witness(emitter: Emitter, args: List<Code>) -> Option<WithValue> / {abort.raise} =
+  match match list_at(args, 0) {
+      Some(c) -> match c.node {
+        NLit(LStr(name)) -> ctor_index(emitter.ctors, name, b""),
+        _ -> None,
+      },
+      None -> None,
+    } {
+    None -> Some(refused(emitter, b"a witness of a type no constructor names")),
+    Some(tag) ->
+      Some({
+        emitter: emitter,
+        value: {
+          kind: KInt,
+          expr: bytes_concat_all([b"(13 + ", tag_text(emitter, tag), b")"]),
+          ty: TyOpen,
+        },
+      }),
+  }
+
 fn tag_text(emitter: Emitter, tag: Int) -> Bytes / {abort.raise} =
   match list_at(emitter.ctors, tag) {
     Some(name) -> bytes_concat_all([b"@@T", name, b"@@"]),
@@ -4762,7 +4785,8 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       // A name bound in this body holds a closure, called through the runtime; a constructor builds a tagged object.
       NVar(fv) -> match fv.slot {
         Some(_) -> call_value(emitter, a.func, a.args, params, c.span),
-        None -> if is_ctor_name(fv.name) {
+        None -> if fv.name == stated_witness_name() { stated_witness(emitter, a.args) }
+        else if is_ctor_name(fv.name) {
           match tag_of(emitter, fv.name) {
             None ->
               Some(refused(emitter, bytes_concat(b"a constructor not in the table: ", fv.name))),
@@ -8762,30 +8786,40 @@ fn stated_by_tag(mods: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
   fold(mods, map_new(), |acc: Map<Bytes, List<Bytes>>, m: ParsedModule|
     fold(m.module.items, acc, |a: Map<Bytes, List<Bytes>>, item: Item|
       match item {
-        IInstance(d) ->
-          fold(m.module.items, a, |b: Map<Bytes, List<Bytes>>, other: Item|
-            match other {
-              IType(t) -> if t.name.name != d.target.name { b } else {
-                match t.body {
-                  TDSum(variants) ->
-                    fold(variants, b, |c: Map<Bytes, List<Bytes>>, v: VariantDef| {
-                      let tag = qualify(m.name, v.name.name);
-                      map_insert(
-                        c,
-                        tag,
-                        push(
-                          match map_get(c, tag) { Some(fs) -> fs, None -> [] },
-                          qualify(m.name, d.by.name),
-                        ),
-                      )
-                    }),
-                  _ -> b,
-                }
-              },
-              _ -> b,
-            }),
+        IInstance(d) -> stating(m, a, d.target.name, [d.by.name]),
+        INumeric(d) -> stating(m, a, d.target.name, map(d.ops, |x: NumericOp| x.by.name)),
         _ -> a,
       }))
+
+/// `stated` with `fns` of module `m` under each constructor of its type `target`.
+fn stating(
+  m: ParsedModule,
+  stated: Map<Bytes, List<Bytes>>,
+  target: Bytes,
+  fns: List<Bytes>,
+) -> Map<Bytes, List<Bytes>> =
+  fold(m.module.items, stated, |b: Map<Bytes, List<Bytes>>, other: Item|
+    match other {
+      IType(t) -> if t.name.name != target { b } else {
+        match t.body {
+          TDSum(variants) ->
+            fold(variants, b, |c: Map<Bytes, List<Bytes>>, v: VariantDef| {
+              let tag = qualify(m.name, v.name.name);
+              map_insert(
+                c,
+                tag,
+                fold(
+                  fns,
+                  match map_get(c, tag) { Some(fs) -> fs, None -> [] },
+                  |fs: List<Bytes>, f: Bytes| push(fs, qualify(m.name, f)),
+                ),
+              )
+            }),
+          _ -> b,
+        }
+      },
+      _ -> b,
+    })
 
 /// The constructors a body's C names a tag of, as its placeholders spell them.
 fn tags_named(text: Bytes) -> List<Bytes> / {abort.raise} =

@@ -18,7 +18,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               constraint_written, SpecKind, SRequires, SEnsures, SCost, SpecClause, ReturnsFresh,
               ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub, TDNominal, test_listing,
               test_run, case_params, schema_of, IInstance, InstanceDef, InstanceKind, NKey, NShow,
-              instance_text)
+              instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
@@ -124,6 +124,7 @@ type ModuleItems = {
   ctors: Map<Bytes, Int>,
   // What the module states of each type it names: a type's hash covers these.
   instances: Map<Bytes, List<InstanceDef>>,
+  numerics: Map<Bytes, NumericDef>,
 }
 type ScopeIndex = {
   values: Map<Bytes, Target>,
@@ -322,6 +323,12 @@ pub fn build_index(
           effects: walked.effects.map,
           ctors: walked.ctors.map,
           instances: instances_in(module.module.items),
+          numerics: fold(
+            module.module.items,
+            map_new(),
+            |acc: Map<Bytes, NumericDef>, item: Item|
+              match item { INumeric(d) -> map_insert(acc, d.target.name, d), _ -> acc },
+          ),
         }),
       }
     },
@@ -676,6 +683,8 @@ fn tag_ty_con_over() -> Int = 121
 /// The function a type's values are compared through, and the one they are shown through.
 fn tag_key() -> Int = 140
 fn tag_show() -> Int = 141
+/// One function a type's arithmetic is, after the operation it is.
+fn tag_numeric() -> Int = 142
 
 /// An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -1018,7 +1027,10 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
   };
   // What a value of the type compares and shows through is part of what the type is: each function
   // is a reference, so the type's hash moves when the function it names does.
-  match map_get(at(declared.index.items, declared.module).instances, d.name.name) {
+  let stated: Encoder = match map_get(
+      at(declared.index.items, declared.module).instances,
+      d.name.name,
+    ) {
     None -> declared,
     Some(stated) ->
       fold(stated, declared, |acc: Encoder, x: InstanceDef|
@@ -1027,6 +1039,21 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
           name: x.by,
           span: x.by.span,
         })),
+  };
+  // In the operations' own order, so the order a module wrote them in moves nothing.
+  match map_get(at(stated.index.items, stated.module).numerics, d.name.name) {
+    None -> stated,
+    Some(numeric) ->
+      fold(numeric_ops(), stated, |acc: Encoder, op: Bytes|
+        match numeric_by(numeric, op) {
+          None -> acc,
+          Some(by) ->
+            value_ref(put_text(put_tag(acc, tag_numeric()), op), {
+              module: None,
+              name: by,
+              span: by.span,
+            }),
+        }),
   }
 }
 
@@ -4673,8 +4700,9 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
     { decoder: fields.decoder, text: bytes_concat(b"new ", fields.text) }
   } else { panic("a tag that does not begin a type body") };
   let stated = instances_of(printer, body.decoder, name);
+  let numeric = numeric_of(printer, stated.decoder);
   {
-    decoder: stated.decoder,
+    decoder: numeric.decoder,
     text: bytes_concat_all([
       b"type ",
       name,
@@ -4682,9 +4710,30 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
       b" = ",
       body.text,
       stated.text,
+      if bytes_len(numeric.text) == 0 { b"" }
+      else { bytes_concat_all([b"\nnumeric for ", name, b" by { ", numeric.text, b" }"]) },
     ]),
   }
 }
+
+/// What follows a type's `key` and `show`: each operation its `numeric` names and the function it
+/// is, as the statement's record lists them. Each one read is at least a byte.
+fn numeric_of(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
+  iterate({ decoder: d, text: b"" }, bytes_len(d.bytes) - d.pos + 1, |acc: Decoded|
+    if peek(acc.decoder) != tag_numeric() { Stop(acc) } else {
+      let op = read_text(skip(acc.decoder));
+      let by = read_value(printer, op.decoder);
+      Continue({
+        decoder: by.decoder,
+        text: bytes_concat_all([
+          acc.text,
+          if bytes_len(acc.text) == 0 { b"" } else { b", " },
+          op.text,
+          b": ",
+          by.text,
+        ]),
+      })
+    })
 
 /// What follows a type's body: the `key` and the `show` its module states of it, a line each. Each
 /// one read is at least a byte, which bounds the rounds.
@@ -6107,6 +6156,48 @@ test "a call that leaves an argument to a default naming what its module keeps h
     dumped_hash(hash_dump([{ name: b"m", src: left }]), b"m.caller"),
     dumped_hash(hash_dump([{ name: b"m", src: written }]), b"m.caller"),
   )
+}
+
+test "a type's hash covers the arithmetic it states, and prints it back" {
+  let stating = |stated: Bytes, sum: Bytes|
+    hash_index(
+      indexed([
+        {
+          name: b"m",
+          src: bytes_concat_all([
+            b"pub type N = | N(Int)\n",
+            stated,
+            b"fn add(a: N, b: N) -> N = match a { N(x) -> match b { N(y) -> N(",
+            sum,
+            b") } }\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\n",
+            b"pub fn two() -> N = of(2)\n",
+          ]),
+        },
+      ]),
+    );
+  let named = |out: HashOutput, n: Bytes| map_get(by_name(named_hashes(out)), n);
+  let all = b"numeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }\n";
+  let stated = stating(all, b"x + y");
+  // Stating it, editing a function it names and naming another all move the type and what holds it.
+  assert(named(stating(b"", b"x + y"), b"m.N") != named(stated, b"m.N"));
+  assert(named(stated, b"m.N") != named(stating(all, b"y + x"), b"m.N"));
+  assert(named(stated, b"m.two") != named(stating(all, b"y + x"), b"m.two"));
+  let other = b"numeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of, }\n";
+  // The order the record lists them in moves nothing.
+  let reordered = b"numeric for N by { of_int: of, neg: neg, mul: add, sub: add, add: add }\n";
+  assert_eq(named(stated, b"m.N"), named(stating(reordered, b"x + y"), b"m.N"));
+  assert_eq(named(stated, b"m.N"), named(stating(other, b"x + y"), b"m.N"));
+  let ms = printed_of(stated, []);
+  assert(
+    bytes::contains(
+      at(ms, 0).text,
+      b"\nnumeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }",
+    ),
+  );
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(stated)))
 }
 
 test "a type's hash covers the key and the show it states, and what hold it move with them" {
