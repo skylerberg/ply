@@ -206,6 +206,14 @@ pub type DeriveDef = { deriver: Deriver, deriver_span: Span, target: Ident, span
 /// Which `derive` generated a definition; kept beside the module rather than on the `FnDef`.
 pub type Derived = { deriver: Deriver, target: Bytes, span: Span }
 
+/// What a nominal type's own module says its values go through: `key for Deque by to_list` for
+/// `==`, `compare`, `digest` and a `Map`'s order, `show for Date by render` for `show`.
+pub type InstanceKind = | NKey | NShow
+
+pub type InstanceDef = { kind: InstanceKind, target: Ident, by: Ident, span: Span }
+
+pub fn instance_text(kind: InstanceKind) -> Bytes = match kind { NKey -> b"key", NShow -> b"show" }
+
 /// `expansion` is every atom the set stands for, as its own module writes them; the resolver fills it.
 pub type EffectSetDef = {
   name: Ident,
@@ -240,6 +248,7 @@ pub type Item =
   | IDerive(DeriveDef)
   | IEffectSet(EffectSetDef)
   | IExtern(ExternDef)
+  | IInstance(InstanceDef)
 
 pub type Module = { doc: Option<Doc>, imports: List<ImportDecl>, items: List<Item> }
 
@@ -352,6 +361,7 @@ pub fn item_doc(item: Item) -> Option<Doc> =
     ITest(_) -> None,
     ILaw(_) -> None,
     IDerive(_) -> None,
+    IInstance(_) -> None,
   }
 
 pub fn item_span(item: Item) -> Span =
@@ -365,6 +375,7 @@ pub fn item_span(item: Item) -> Span =
     IDerive(d) -> d.span,
     IEffectSet(d) -> d.span,
     IExtern(d) -> d.span,
+    IInstance(d) -> d.span,
   }
 
 // --- Schemas ----------------------------------------------------------------
@@ -414,7 +425,14 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_reuse_start(input, parser)
     || at_transparent_start(input, parser)
     || at_extern_start(input, parser)
+    || at_instance_start(input, parser)
 }
+
+/// `key` and `show` are contextual: one opens an item only before `for`, so `fn key(..)` and a field
+/// named `show` keep their meaning.
+pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
+  (at_ident_text(input, parser, b"key") || at_ident_text(input, parser, b"show"))
+    && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
 
 /// `extern` is contextual: it opens an item only when `fn` follows.
 pub fn at_extern_start(input: Input, parser: Parser) -> Bool =
@@ -1757,6 +1775,38 @@ pub fn derive_def(
   }
 }
 
+// --- `key` and `show` -----------------------------------------------------
+
+/// One `key for T by f` or `show for T by f`.
+pub fn instance_def(
+  input: Input,
+  parser: Parser,
+) -> Result<Parsed<InstanceDef>, Parser> / {abort.raise} = {
+  let kind = if at_ident_text(input, parser, b"key") { NKey } else { NShow };
+  let st = advance(input, parser);
+  let f = advance(input, st.parser);
+  let { parser, node: target } = expect_ident(input, f.parser, b"the type, after `for`")?;
+  if !at_ident_text(input, parser, b"by") {
+    Err(error_here(input, parser, b"`by` and the function the type's values go through"))
+  } else {
+    let b = advance(input, parser);
+    let { parser, node: by } = expect_ident(
+      input,
+      b.parser,
+      b"a function of this module, after `by`",
+    )?;
+    Ok({
+      parser: parser,
+      node: {
+        kind: kind,
+        target: target,
+        by: by,
+        span: span_to(st.node, previous_span(input, parser)),
+      },
+    })
+  }
+}
+
 // --- `test` -----------------------------------------------------------------
 
 fn test_nondet(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {abort.raise} = {
@@ -1943,12 +1993,20 @@ pub fn item_at(
       ]),
     )?;
     Ok({ parser: d.parser, node: IExtern(d.node) })
+  } else if at_instance_start(input, parser) {
+    let d = instance_def(
+      input,
+      no_pub(parser, unexpected(), pub_span, b"a `key` or a `show` cannot be `pub`", [
+        b"it is part of what its type is, and reaches wherever the type does",
+      ]),
+    )?;
+    Ok({ parser: d.parser, node: IInstance(d.node) })
   } else {
     Err(
       error_here(
         input,
         parser,
-        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, or `derive`",
+        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `derive`, `key`, or `show`",
       ),
     )
   }
@@ -1963,7 +2021,8 @@ pub fn item(input: Input, parser: Parser) -> Result<Parsed<Item>, Parser> / {abo
   Ok({ parser: parser, node: documented(found, doc) })
 }
 
-/// A test or a law says what it is in its name, and a `derive` is its deriver's; none takes a doc.
+/// A test or a law says what it is in its name, a `derive` is its deriver's, and a `key` or a
+/// `show` is its function's; none takes a doc.
 fn documented(item: Item, doc: Option<Doc>) -> Item =
   match item {
     IFn(d) -> IFn({ ..d, doc: doc }),
@@ -1975,6 +2034,7 @@ fn documented(item: Item, doc: Option<Doc>) -> Item =
     ITest(_) -> item,
     ILaw(_) -> item,
     IDerive(_) -> item,
+    IInstance(_) -> item,
   }
 
 // --- `run` ------------------------------------------------------------------
@@ -2362,6 +2422,14 @@ pub fn dump_extern(d: ExternDef) -> Bytes / {abort.raise} =
     dump_doc_if(d.doc),
   ])
 
+pub fn dump_instance(d: InstanceDef) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    dump_node(d.span, b"ins"),
+    dump_word(instance_text(d.kind)),
+    dump_ident(d.target),
+    dump_ident(d.by),
+  ])
+
 pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
   match item {
     IFn(d) -> dump_fn(d),
@@ -2373,6 +2441,7 @@ pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
     IDerive(d) -> dump_derive(d),
     IEffectSet(d) -> dump_effect_set(d),
     IExtern(d) -> dump_extern(d),
+    IInstance(d) -> dump_instance(d),
   }
 
 pub fn dump_module(module: Module) -> Bytes / {abort.raise} =
@@ -2819,6 +2888,38 @@ test "a `///` block documents a `law schema`, and above an instantiation it docu
     map(
       parse(
         b"law schema s(f: (Int) -> Int) { f(1) == 1 }\n\n/// stray\nlaw \"l\" = s(g)\n",
+      ).parser.diags,
+      |d: ParseDiag| d.code,
+    ),
+    [b"E0003"],
+  )
+}
+
+test "`key for T by f` and `show for T by f` are items, and neither word is reserved" {
+  let r = parse(b"type T = | T(Int)\nkey for T by f\nshow for T by g\nfn f(t: T) -> Int = 0\n");
+  assert_eq(len(r.parser.diags), 0);
+  match r.node.items {
+    [IType(_), IInstance(k), IInstance(s), IFn(_)] -> {
+      assert_eq(instance_text(k.kind), b"key");
+      assert_eq(k.target.name, b"T");
+      assert_eq(k.by.name, b"f");
+      assert_eq(k.span, { start: 18, end: 32 });
+      assert_eq(instance_text(s.kind), b"show");
+      assert_eq(s.by.name, b"g")
+    },
+    _ -> panic("a type, a key, a show and a function"),
+  };
+  assert_eq(
+    len(parse(b"fn key(show: Int, by: Int) -> { key: Int } = { key: show + by }\n").parser.diags),
+    0,
+  );
+  assert(len(parse(b"key for T f\n").parser.diags) > 0);
+  assert(len(parse(b"pub key for T by f\n").parser.diags) > 0);
+  // The function a `key` names carries the doc; a `///` above the item documents nothing.
+  assert_eq(
+    map(
+      parse(
+        b"type T = | T(Int)\n/// by its number\nkey for T by f\nfn f(t: T) -> Int = 0\n",
       ).parser.diags,
       |d: ParseDiag| d.code,
     ),

@@ -9,7 +9,8 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
              CodeReturn, Own, Borrowed, Owned, lower_fn, irrefutable)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
-              SEnsures, SCost, FnDef, TDNominal, test_run, test_listing)
+              SEnsures, SCost, FnDef, TDNominal, test_run, test_listing, IInstance, VariantDef,
+              TDSum)
 import resolve (ParsedModule, Source, ResolveSucceeded, ResolveFailed, Diag, resolve_modules,
                 Resolved, Scope, Binding, ModuleBinding, PackageDeps, resolve_packaged, no_packages,
                 default_binder, find_module_binding, qualify)
@@ -8720,6 +8721,7 @@ fn emit_program(
                   defs: defs_in(m.name, m.module, pure, with_aliases),
                   aliases: aliases_in(m.module),
                 });
+              let stated = stated_by_tag(mods);
               fold(range(0, len(mods)), [], |acc: List<Emitted>, i: Int|
                 match list_at(mods, i) {
                   None -> acc,
@@ -8742,7 +8744,7 @@ fn emit_program(
                         mods,
                       ),
                       acc,
-                      |a: List<Emitted>, e: Emitted| push(a, e),
+                      |a: List<Emitted>, e: Emitted| push(a, calling_instances(stated, e)),
                     )
                   },
                 })
@@ -8753,6 +8755,78 @@ fn emit_program(
     },
   }
 }
+
+/// Each constructor whose type's module states a `key` or a `show`, with those functions under
+/// their program-wide names.
+fn stated_by_tag(mods: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
+  fold(mods, map_new(), |acc: Map<Bytes, List<Bytes>>, m: ParsedModule|
+    fold(m.module.items, acc, |a: Map<Bytes, List<Bytes>>, item: Item|
+      match item {
+        IInstance(d) ->
+          fold(m.module.items, a, |b: Map<Bytes, List<Bytes>>, other: Item|
+            match other {
+              IType(t) -> if t.name.name != d.target.name { b } else {
+                match t.body {
+                  TDSum(variants) ->
+                    fold(variants, b, |c: Map<Bytes, List<Bytes>>, v: VariantDef| {
+                      let tag = qualify(m.name, v.name.name);
+                      map_insert(
+                        c,
+                        tag,
+                        push(
+                          match map_get(c, tag) { Some(fs) -> fs, None -> [] },
+                          qualify(m.name, d.by.name),
+                        ),
+                      )
+                    }),
+                  _ -> b,
+                }
+              },
+              _ -> b,
+            }),
+        _ -> a,
+      }))
+
+/// The constructors a body's C names a tag of, as its placeholders spell them.
+fn tags_named(text: Bytes) -> List<Bytes> / {abort.raise} =
+  iterate({ from: 0, out: [] }, bytes_len(text) + 1, |s: { from: Int, out: List<Bytes> }|
+    match bytes_index_of_from(text, b"@@", s.from) {
+      None -> Stop(s.out),
+      Some(open) -> match bytes_index_of_from(text, b"@@", open + 2) {
+        None -> Stop(s.out),
+        Some(close) ->
+          Continue({
+            from: close + 2,
+            out: if bytes_at(text, open + 2) == 84 {
+              push(s.out, bytes_slice(text, open + 3, close))
+            } else { s.out },
+          }),
+      },
+    })
+
+/// A body that names a constructor's tag holds values the runtime reads through what the type's
+/// module states of it, wherever they are compared or shown: so it calls those functions, which the
+/// unit then takes with it and a kept answer is checked against.
+fn calling_instances(stated: Map<Bytes, List<Bytes>>, e: Emitted) -> Emitted / {abort.raise} =
+  if map_len(stated) == 0 { e } else {
+    match e.why {
+      Some(_) -> e,
+      None ->
+        {
+          ..e,
+          tables: {
+            ..e.tables,
+            calls: fold(tags_named(e.text), e.tables.calls, |acc: List<Bytes>, tag: Bytes|
+              match map_get(stated, tag) {
+                None -> acc,
+                Some(fs) ->
+                  fold(fs, acc, |calls: List<Bytes>, f: Bytes|
+                    if contains(calls, f) { calls } else { push(calls, f) }),
+              }),
+          },
+        },
+    }
+  }
 
 /// One import's module as it is written and as it resolves: a dependency's sibling import is
 /// written bare and means the module of the same package, which the scope's binders name.
@@ -9713,4 +9787,30 @@ test "a builtin is called through the helper named for it, and an import that ta
     false,
     false,
   ])
+}
+
+// A value is compared and shown wherever it is read, by the runtime and not by a call a body
+// makes: the body that names its constructor is what answers for the functions being there.
+test "a body that names a constructor calls the key and the show its type states" {
+  let rest = b"fn area(b: Box) -> Int = match b { Box(w, h) -> w * h }\nfn text(b: Box) -> String = \"box\"\nfn make() -> Box = Box(1, 2)\nfn same<a>(x: a, y: a) -> Bool = x == y\n";
+  let plain = bytes_concat(b"pub type Box = | Box(Int, Int)\n", rest);
+  let stating = bytes_concat(
+    b"pub type Box = | Box(Int, Int)\nkey for Box by area\nshow for Box by text\n",
+    rest,
+  );
+  let wanted = [b"m.area", b"m.text", b"m.make", b"m.same"];
+  let calls = |src: Bytes|
+    map(answers_of([b"m"], [src], [b"m.Box"], wanted), |a: RootAnswer|
+      {
+        name: a.name,
+        calls: match a.answer { Body(b) -> b.tables.calls, Refused(_) -> [b"refused"] },
+      });
+  assert_eq(calls(stating), [
+    // The key names the tag it takes its value apart by, and so itself.
+    { name: b"m.area", calls: [b"m.area", b"m.text"] },
+    { name: b"m.text", calls: [] },
+    { name: b"m.make", calls: [b"m.area", b"m.text"] },
+    { name: b"m.same", calls: [] },
+  ]);
+  assert_eq(map(calls(plain), |c: { name: Bytes, calls: List<Bytes> }| c.calls), [[], [], [], []])
 }

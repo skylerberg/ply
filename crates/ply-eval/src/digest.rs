@@ -71,6 +71,11 @@ fn write(h: &mut blake3::Hasher, v: &Value, span: Span) -> Result<(), Diagnostic
             }
         }
         Value::Ctor { name, args } => {
+            // Values of a keyed type are equal as their keys are, so the key is what is written.
+            if let Some(key) = crate::instances::key(v) {
+                tag(h, 16);
+                return grow(|| write(h, &key, span));
+            }
             let simple = name.as_str().rsplit('.').next().unwrap_or(name.as_str());
             blob(h, 14, simple.as_bytes());
             count(h, 15, args.len());

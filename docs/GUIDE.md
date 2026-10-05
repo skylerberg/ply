@@ -116,9 +116,9 @@ signature cannot — what an answer means, when the function raises, units, edge
 cases — and holds no examples: the tests and laws that name a definition are
 its examples, and `ply doc` lists them (§16). A blank line between a doc and its
 declaration does not part them, and `ply fmt` removes it. A doc comment that
-documents nothing — one inside a body, above an import, a `test`, a `law` or a
-`derive`, or at the end of a file, or a `//!` line below the head of its file —
-is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
+documents nothing — one inside a body, above an import, a `test`, a `law`, a
+`derive`, a `key` or a `show`, or at the end of a file, or a `//!` line below
+the head of its file — is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
 answer.
 
 An identifier starts with an ASCII letter or `_` and continues with ASCII
@@ -148,6 +148,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
+| `key`, `show`, `by` | `key for <Type> by <function>` and `show for <Type> by <function>` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -261,7 +262,8 @@ Loosest to tightest; all binary operators are left-associative:
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
-* `==`/`!=` are structural at every type except functions. `Float` equality is
+* `==`/`!=` are structural at every type except functions, and a type that
+  states a `key` is compared through it (§4.4). `Float` equality is
   IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work on numeric types and on `Char`,
   by scalar value; order anything else with `compare`. Arithmetic on a `Char` is
   `E0201`: go through `int_of_char`.
@@ -285,8 +287,8 @@ Loosest to tightest; all binary operators are left-associative:
 ## 3. Modules and items
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
-`nondet effect`, `effect set`, `test`, `law`, `law schema` and `derive`, in any
-order.
+`nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key` and
+`show`, in any order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -606,6 +608,57 @@ A sum is nominal, as a `new` record is (§4.2): identical sums in two modules
 differ. A sum takes parameters as an alias does,
 `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`, and a use that fills them
 with other arguments is another type (§4.5).
+
+A value is compared, ordered, digested and shown as its constructor and fields
+say, which is wrong for a type that can hold one thing two ways. The module that
+declares a sum may state what its values are read through instead:
+
+```ply
+pub type Deque<a> = | Deque(List<a>, List<a>)   // a front, and a back reversed
+
+key for Deque by to_list       // `==`, `!=`, `compare`, `min`, `max`, `digest`, a `Map`'s keys
+show for Date by written       // `show`, `display`, an interpolated string's hole
+
+pub fn to_list<a>(d: Deque<a>) -> List<a> = ..
+fn written(d: Date) -> String = ..
+```
+
+`key for T by f` names a function of the same module, `f: (T<a, ..>) -> K`. Two
+values of `T` are equal exactly when `f` answers equal keys for them, they order
+as their keys do, and a value's digest is its key's, so the three cannot
+disagree: two deques holding one sequence in different splits are `==`, share a
+`digest` and are one `Map` key. The key is read wherever a `T` sits — in a
+list, a record, a `new` record, a tuple, another sum, a map's key or value, the key of another
+type, or behind a type parameter — and by `assert_eq`, which tells two keyed
+values apart as wholes. `derivable(eq, T)`, `derivable(ord, T)` and
+`derivable(hash, T)` hold exactly when they hold of `K`, whatever `T`'s fields
+are, and `K` is both ordered and hashed (`E0206`). A `match` still reads the
+value as it was built. Each comparison calls `f`, so a key is worth keeping
+cheap.
+
+`show for T by g` names `g: (T<a, ..>) -> String`: `show`, `display` and a hole
+write what `g` answers wherever a `T` is shown, and `derivable(show, T)` holds
+whatever `T` holds. It decides nothing about comparison, `reflect` (§12) still
+answers the value as it was built, and a diagnostic prints that.
+
+Both are found by the type alone, with no search, so only the module declaring
+`T` may write them (`E0208`), and it states each at most once (`E0105`). `T` is
+a sum: an alias is the type it names, and a `new` record (§4.2) runs as its
+plain record, with no constructor in a value to find them by, so it cannot
+state one yet (`E0217`). The function is one that module declares
+(`E0101`); it takes one `T`, at the type's own type and row parameters and
+nothing narrower (`f: (Held<a | e>) -> K` for `type Held<a | e>`), answers a type
+over those parameters alone, has no `where`, and its row is empty, with no
+raise of any kind (§6.8) and no `diverges`: `==` and `show` perform nothing,
+cannot raise and always return, and a key that raised inside a `Map` insert
+would have nowhere to go (`E0218`). It binds
+no resource label either: a value does not carry the label its type was given,
+so nothing could call the function at it, and a type that binds a label states
+neither (`E0218`). A key that is, or holds, a value of
+its own type would be compared by asking for its key again, and is refused
+where it is stated, through whatever types and keys lie between (`E0219`). A
+type's hash covers the functions it states, so a definition that can hold a
+`T` is re-checked and its tests re-run when either changes.
 
 ### 4.5 Generics
 
@@ -1501,7 +1554,11 @@ bound in the body and in the label, and a label before `for` is read as an
 interpolated string is (§2.3): each `{expr}` is a hole, `{{` and `}}` are
 braces, and a label with no hole names every case alike. A case is told from
 another by its value's `digest` (§12), so its type is `derivable(hash, ·)`
-(`E0206`) and holds no `Float`. The cases are listed before any test runs, so
+(`E0206`) and holds no `Float`. Nor does it hold a value of a type that states
+a `key` (§4.4, `E0206`): its digest is its key's, so two cases a body tells
+apart would be one, and the pass of one would stand for the other. Such a table
+ranges over what the values are built from, and the body builds each. The cases
+are listed before any test runs, so
 the table and the label may raise, by any `raise` operation (§6.8), and perform
 nothing else (`E0469`). A table that raises fails as one test, under the label
 as written, and an empty one is no test. A tagged literal (§2.3) in a table, a
@@ -1807,6 +1864,12 @@ A kernel checks each induction from the claim alone before refuting its cases,
 whatever proposed it: the binder it names, a hypothesis strictly below the case
 it proves, and only definitions the checker reads as ending unrolled.
 
+Congruence and injectivity read `==` as what a value's constructors and fields
+say, which a `Float` (`NaN != NaN`) and a type that states a `key` (§4.4) are
+not. A claim that holds a value of either, at any depth, is never `proved`: it
+is run, over every point of a finite domain or over a sample. Under `--reach`
+the place is `float_term` or `keyed_term`.
+
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
 arguments name every binder; where a claim makes a call that fits it, the law
@@ -1984,8 +2047,10 @@ calls. The bound is read from below: the lengths of parameters (`len`,
 and `ilog2` alone or beside sizes of the one length it is of. Steps within the
 bound are `proved`. Anything else, such as another operation, a call of a
 function value with no cost name, a group of definitions calling each other, a
-body another package keeps with no `cost` bound, or an `Int` parameter the steps
-grow with, leaves the clause to the cost law `cost of <name>` (`#2` and on for
+body another package keeps with no `cost` bound, an `Int` parameter the steps
+grow with, or a definition that takes, answers or builds a value of a type that
+states a `key` (§4.4), whose comparisons call it unseen, leaves the clause to
+the cost law `cost of <name>` (`#2` and on for
 later clauses): it makes each parameter of one size `n`, an `Int` being `n` and
 a list, map, string or bytes holding `n` elements made of their index, and a
 function parameter with a cost name a closure of one step, its cost name 1, and
@@ -2050,6 +2115,11 @@ the `derive` is `E0206`; `show` imports `std.show` itself. A type that binds a
 label (§4.5), or a field whose type is given one, is `E0206` too: only a function's
 row has a use for a label. A row parameter the fields leave unused is carried
 through, `tagged_eq : <a | e>({eq: ..}) -> {eq: (Tagged<a | e>, ..) -> Bool}`.
+
+A type that states a `key` (§4.4) derives `eq`, `ord` and `hash` from what the
+key answers, and one that states a `show` derives `show` from that function: the
+dictionaries call `==`, `compare`, `digest` and `show`, which read them. `json`
+and `bin` encode the fields as they are.
 
 ## 12. Builtins
 
@@ -2629,15 +2699,18 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0203` | occurs check |
 | `E0204` | not a function |
 | `E0205` | non-exhaustive match |
-| `E0206` | not derivable, including an unordered `Map` key |
+| `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case that holds a keyed value |
 | `E0207` | unknown deriver |
-| `E0208` | orphan `derive` |
+| `E0208` | orphan `derive`, `key` or `show` |
 | `E0209` | `/` on `Decimal` |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
 | `E0212` | the alternatives of an or-pattern bind different names |
 | `E0213` | a `let` whose or-pattern can fail has no `else` |
 | `E0214` | a `new` record whose fields reach the record itself |
+| `E0217` | a `key` or a `show` for a type that is not a sum |
+| `E0218` | a `key` or a `show` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer |
+| `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
