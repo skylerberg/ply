@@ -1,12 +1,16 @@
 //! `ply defs` — every definition of the program with its place, hash, signature and footprint.
 
+import compiler.front (viewed_text)
 import compiler.unit (shipped)
 import std.random (entropy)
 import std.time (time)
+import answers
 import builder (builder)
 import args (Flags, kept, no_flags, style_of)
-import program (Program, Tables, load_program, published, tables_of, location_of, place_of,
-                is_shipped, hash_of, own_of, deps_of, specs_of, short_of)
+import env (env)
+import program (Program, Tables, Timed, published, tables_of, location_of, place_of, is_shipped,
+                hash_of, own_of, deps_of, specs_of, short_of, timed_over)
+import sources (Embed, load_resolved)
 import report (Answer, schema_version, ok_code, count_of, indent, refused)
 import style (Style, bold, dim)
 import compiler.hash (no_hashes)
@@ -14,7 +18,8 @@ import compiler.infer (DefInfo)
 import compiler.termination (Ends, unknown_summary)
 import compiler.types (TyCon, TyFn, row_text, scheme_text)
 import std.fs (fs)
-import std.json (Json, Null, Str, Bool, Number, Array, object, string_or_null)
+import std.json (Json, Null, Str, Bool, Number, Array, Object, object, parse_string, string_or_null,
+                 to_string)
 
 pub fn scheme_of(def_info: DefInfo) -> String / {abort.raise} =
   string_of_bytes_lossy(scheme_text(def_info.scheme))
@@ -100,19 +105,63 @@ fn answered(
     code: ok_code(),
   }
 
+/// The listing `argv` asks for, taken back where an earlier run of the same command line kept it and
+/// it still stands, else listed from a load and kept beside its views and the embeds it read.
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
-  let loaded: Program = load_program(flags.paths);
-  match loaded.whole {
-    None -> refused(style_of(flags), "defs", loaded.diags, loaded.places),
-    Some(w) ->
-      answered(
-        style_of(flags),
-        loaded,
-        tables_of(w.hashes),
-        filter(published(w), |def_info: DefInfo| wanted(flags, def_info)),
-      ),
+  argv: List<String>,
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], env.var[sys], env.pwd[sys], time.elapsed_ms, entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
+  let started = time.elapsed_ms();
+  let project = load_resolved(flags.paths);
+  let key = answers::key_of(answers::program(), argv, project);
+  match match answers::kept_standing(flags.paths, key, project) {
+      Some(k) -> match parse_string(k.json) {
+        Ok(Object(members)) ->
+          Some({
+            json: Object(
+              map_insert(
+                members,
+                "front_end",
+                object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(key) }]),
+              ),
+            ),
+            lines: k.lines,
+            errs: k.errs,
+            code: k.code,
+          }),
+        _ -> None,
+      },
+      None -> None,
+    } {
+    Some(answer) -> answer,
+    None -> {
+      let t: Timed = timed_over(flags.paths, project, started);
+      let loaded: Program = t.program;
+      match loaded.whole {
+        None -> refused(style_of(flags), "defs", loaded.diags, loaded.places),
+        Some(w) -> {
+          let answer = answered(
+            style_of(flags),
+            loaded,
+            tables_of(w.hashes),
+            filter(published(w), |def_info: DefInfo| wanted(flags, def_info)),
+          );
+          if len(loaded.cache_warnings) == 0 && loaded.reached {
+            answers::keep(flags.paths, key, {
+              opening: [],
+              lines: answer.lines,
+              errs: answer.errs,
+              code: answer.code,
+              json: to_string(answer.json),
+              passes: [],
+              views: viewed_text(loaded.viewed),
+              embeds: map(project.embeds, |e: Embed| answers::embedding_of(e.embedded)),
+            })
+          };
+          answer
+        },
+      }
+    },
   }
 }
 

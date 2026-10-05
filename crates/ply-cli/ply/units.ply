@@ -3,13 +3,18 @@
 //! program, and the C is assembled over all of them: the runtime is handed C and compiles nothing
 //! it was not handed.
 
+import compiler.front (BakedRow)
+import compiler.hash (hex)
+import compiler.interface (sized)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.resolve (Diag)
-import compiler.unit (Dropped, Emission, Made, shipped, emitted, emitter_identity, held, read_kept,
-                      write_kept)
+import compiler.unit (Baked, Dropped, Emission, Made, shipped, emitted, emitter_identity, held,
+                      read_kept, write_kept)
 import env (env)
 import sources (under_abs)
+import std.fs
 import std.fs (fs)
+import std.hash (blake3)
 import std.process (process)
 import std.random (entropy)
 import std.time (time)
@@ -110,6 +115,62 @@ fn told(
     },
   }
 
+// --- What a build kept of a `const` definition -----------------------------------
+
+/// What a `const` definition's value is a function of, and so kept under: the runtime that
+/// evaluated and wrote it, the compiler whose code it ran as, and the hash of all it reaches, the
+/// files it embeds among them.
+pub fn baked_key(runtime: Bytes, emitter: Bytes, hash: Bytes) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      bytes_concat_all([sized(b"ply baked value 1"), sized(runtime), sized(emitter), sized(hash)]),
+    ),
+  )
+
+/// A value kept under `dir`, whole. It is kept behind its own digest, so one a full disk cut short
+/// reads as none and is evaluated again.
+pub fn kept_value<[r]>(
+  dir: String,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], fs.write[r], time.now_ms, abort.raise} =
+  match read_kept[r](dir, key) {
+    None -> None,
+    Some(bytes) -> if bytes_len(bytes) < 32 { None } else {
+      let text = bytes_slice(bytes, 32, bytes_len(bytes));
+      if blake3(text) == bytes_slice(bytes, 0, 32) { Some(text) } else { None }
+    },
+  }
+
+/// `text` kept under `dir` as `kept_value` reads it back.
+pub fn keep_value<[r]>(
+  dir: String,
+  key: Bytes,
+  text: Bytes,
+) -> Unit / {fs.write[r], entropy.next, time.now_ms, abort.raise} =
+  write_kept[r](dir, key, bytes_concat(blake3(text), text))
+
+/// The values kept of the `const` definitions among `wanted`. One with none kept is left to its
+/// body, which answers the same: a build keeps each before anything runs, and a program no build
+/// kept the values of, a mutant among them, runs without.
+fn kept_values(
+  rows: List<BakedRow>,
+  wanted: List<Bytes>,
+  runtime: Bytes,
+  emitter: Bytes,
+  dir: String,
+) -> List<Baked> / {fs.read[abs], fs.write[abs], time.now_ms, abort.raise} =
+  if len(rows) == 0 { [] } else {
+    let offered = fold(wanted, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+      map_insert(acc, n, true));
+    fold(rows, [], |acc: List<Baked>, row: BakedRow|
+      if !map_contains(offered, row.name) { acc } else {
+        match kept_value[abs](dir, baked_key(runtime, emitter, row.hash)) {
+          Some(text) -> push(acc, { name: row.name, text: text }),
+          None -> acc,
+        }
+      })
+  }
+
 /// The unit over `offered`, its C as the runtime compiles it, with the emitter's answers kept under
 /// the toolchain's cache.
 fn unit_of(
@@ -119,16 +180,18 @@ fn unit_of(
   let k = knobs();
   let wanted = narrowed(k, offered);
   let identity = emitter_identity(shipped.definitions());
+  let runtime = shipped.runtime();
   let dir = kept_dir();
   let started = time.elapsed_ms();
   let emission = emitted(
-    shipped.runtime(),
+    runtime,
     front.dump,
     texts(front),
     wanted,
     identity,
     |key: Bytes| read_kept[abs](dir, key),
     |key: Bytes, bytes: Bytes| write_kept[abs](dir, key, bytes),
+    kept_values(front.dump.baked, wanted, runtime.identity, identity, dir),
   );
   told(k, len(wanted), emission, identity, time.elapsed_ms() - started);
   emitted_of(front, wanted, emission)
@@ -183,3 +246,40 @@ fn fresh(
       |_: Bytes, _: Bytes| (),
     ),
   )
+
+// --- Tests ------------------------------------------------------------------
+
+/// What reading `key` back answers over a directory `kept` whose file for it holds `bytes`.
+fn read_back(tree: fs::MemFs, key: Bytes, bytes: Bytes) -> Option<Bytes> / {abort.raise} =
+  fs::on_mem[abs](fs::mem_write(tree, "kept/" ++ string_of_bytes(key), bytes).fs, ||
+    handle { kept_value[abs]("kept", key) } with { time.now_ms() -> 0 }).value
+
+test "a kept value reads back whole, and one cut short or altered reads as none" {
+  let key = baked_key(b"runtime", b"emitter", b"hash");
+  let kept = fs::on_mem[abs](fs::mem_empty(), ||
+    handle {
+      keep_value[abs]("kept", key, b"78da01");
+      kept_value[abs]("kept", key)
+    } with {
+      entropy.next() -> 7,
+      time.now_ms() -> 0,
+    });
+  assert_eq(kept.value, Some(b"78da01"));
+  let whole = match fs::mem_read(kept.tree, "kept/" ++ string_of_bytes(key)) {
+    Some(bytes) -> bytes,
+    None -> panic("the value is kept under its key"),
+  };
+  assert_eq(read_back(kept.tree, key, whole), Some(b"78da01"));
+  assert_eq(read_back(kept.tree, key, bytes_slice(whole, 0, bytes_len(whole) - 1)), None);
+  assert_eq(read_back(kept.tree, key, bytes_concat(whole, b"0")), None);
+  assert_eq(read_back(kept.tree, key, b""), None)
+}
+
+test "a value is kept under the runtime, the compiler and the hash of all its definition reaches" {
+  let key = baked_key(b"runtime", b"emitter", b"hash");
+  assert_eq(bytes_len(key), 64);
+  assert(baked_key(b"another", b"emitter", b"hash") != key);
+  assert(baked_key(b"runtime", b"another", b"hash") != key);
+  assert(baked_key(b"runtime", b"emitter", b"another") != key);
+  assert(baked_key(b"runtim", b"eemitter", b"hash") != key)
+}

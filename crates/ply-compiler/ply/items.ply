@@ -13,8 +13,9 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 keyword_test, keyword_import, dump_node, dump_count, dump_presence, dump_payload,
                 dump_word, dump_bool, dump_list, dump_opt, dump_ident, dump_qname, dump_diags, Doc,
                 doc_at, module_doc, token_between, dump_doc, primary_span_of)
-import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, Keyword, Punctuation,
-              EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark, follows_name)
+import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, InterpolatedTail,
+              Keyword, Punctuation, EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark,
+              follows_name)
 import type_syntax (TypeExpr, TRecord, TUnit, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead,
                     MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row,
                     row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
@@ -99,6 +100,8 @@ pub type FnDef = {
   reuse: Option<Span>,
   /// The span of a `transparent` before `fn`: its body is part of what another package reads of it.
   transparent: Option<Span>,
+  /// The span of a `const` before `fn`: a build evaluates the body and keeps its value.
+  baked: Option<Span>,
   /// `decreases n - i`: the measure its recursion descends, where the checker sees none itself.
   decreases: Option<Expr>,
   body: Expr,
@@ -307,6 +310,7 @@ pub fn no_fn() -> FnDef =
     returns: None,
     reuse: None,
     transparent: None,
+    baked: None,
     decreases: None,
     body: no_expr(),
     doc: None,
@@ -460,6 +464,7 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_derive_start(input, parser)
     || at_reuse_start(input, parser)
     || at_transparent_start(input, parser)
+    || at_const_start(input, parser)
     || at_extern_start(input, parser)
     || at_instance_start(input, parser)
     || at_numeric_start(input, parser)
@@ -505,6 +510,10 @@ pub fn at_transparent_start(input: Input, parser: Parser) -> Bool =
   at_ident_text(input, parser, b"transparent")
     && (token_kind_at(input, parser, 1) == keyword_fn()
     || at_reuse_start(input, advance(input, parser).parser))
+
+/// `const` is contextual: it opens an item only when `fn` follows.
+pub fn at_const_start(input: Input, parser: Parser) -> Bool =
+  at_ident_text(input, parser, b"const") && token_kind_at(input, parser, 1) == keyword_fn()
 
 /// `set` is contextual: only a third identifier opens a set, so `effect set { .. }` is an effect named `set`.
 pub fn at_effect_set_start(input: Input, parser: Parser) -> Bool =
@@ -920,6 +929,7 @@ pub fn fn_def(
   vis: Vis,
   reuse: Option<Span>,
   transparent: Option<Span>,
+  baked: Option<Span> = None,
 ) -> Result<Parsed<FnDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = expect_ident(input, st.parser, b"a function name after `fn`")?;
@@ -959,6 +969,7 @@ pub fn fn_def(
       returns: rt,
       reuse: reuse,
       transparent: transparent,
+      baked: baked,
       decreases: dec,
       body: body,
       doc: None,
@@ -2012,28 +2023,39 @@ pub fn no_pub(
     None -> parser,
   }
 
+fn at_fn_start(input: Input, parser: Parser) -> Bool =
+  at_transparent_start(input, parser) || at_reuse_start(input, parser)
+    || at_const_start(input, parser)
+    || at_token(input, parser, keyword_fn())
+
+/// A `fn` with whichever of `transparent`, `reuse` and `const` is written before it.
+fn written_fn(
+  input: Input,
+  parser: Parser,
+  vis: Vis,
+) -> Result<Parsed<FnDef>, Parser> / {abort.raise} =
+  if at_transparent_start(input, parser) {
+    let t = advance(input, parser);
+    if at_reuse_start(input, t.parser) {
+      let a = advance(input, t.parser);
+      fn_def(input, a.parser, vis, Some(a.node), Some(t.node))
+    } else { fn_def(input, t.parser, vis, None, Some(t.node)) }
+  } else if at_reuse_start(input, parser) {
+    let a = advance(input, parser);
+    fn_def(input, a.parser, vis, Some(a.node), None)
+  } else if at_const_start(input, parser) {
+    let a = advance(input, parser);
+    fn_def(input, a.parser, vis, None, None, Some(a.node))
+  } else { fn_def(input, parser, vis, None, None) }
+
 pub fn item_at(
   input: Input,
   parser: Parser,
   vis: Vis,
   pub_span: Option<Span>,
 ) -> Result<Parsed<Item>, Parser> / {abort.raise} =
-  if at_transparent_start(input, parser) {
-    let t = advance(input, parser);
-    if at_reuse_start(input, t.parser) {
-      let a = advance(input, t.parser);
-      let d = fn_def(input, a.parser, vis, Some(a.node), Some(t.node))?;
-      Ok({ parser: d.parser, node: IFn(d.node) })
-    } else {
-      let d = fn_def(input, t.parser, vis, None, Some(t.node))?;
-      Ok({ parser: d.parser, node: IFn(d.node) })
-    }
-  } else if at_reuse_start(input, parser) {
-    let a = advance(input, parser);
-    let d = fn_def(input, a.parser, vis, Some(a.node), None)?;
-    Ok({ parser: d.parser, node: IFn(d.node) })
-  } else if at_token(input, parser, keyword_fn()) {
-    let d = fn_def(input, parser, vis, None, None)?;
+  if at_fn_start(input, parser) {
+    let d = written_fn(input, parser, vis)?;
     Ok({ parser: d.parser, node: IFn(d.node) })
   } else if at_token(input, parser, keyword_type()) {
     let d = type_def(input, parser, vis)?;
@@ -2223,6 +2245,74 @@ fn hidden_import(module: Bytes, binder: Bytes, span: Span) -> ImportDecl =
 pub fn is_written(decl: ImportDecl) -> Bool =
   match decl.kind { IAlias(a) -> !hidden_binder(a.name), _ -> true }
 
+/// The module `src` with its imports alone, the hidden ones among them, and none of its items:
+/// what a load reads to find the modules a program pulls, without parsing a body. `None` where only
+/// a whole parse says what it imports: an `import` after an item, or a `derive`, whose expansion
+/// imports the runtime it calls.
+pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
+  let s = start(src);
+  let input = s.input;
+  let leading = imports(input, s.parser);
+  let n = input.token_count;
+  let kind = |i: Int| match list_at(input.tokens, i) { Some(t) -> t.kind, None -> EndOfInput };
+  let ident = |i: Int, text: Bytes| kind(i) == Identifier(text);
+  let whole = fold(range(leading.parser.pos, n), false, |acc: Bool, i: Int|
+    acc || kind(i) == keyword_import() || (ident(i, b"derive") && tok_is_ident(kind(i + 1))));
+  if whole { None } else {
+    let span_at = |i: Int|
+      match list_at(input.tokens, i) {
+        Some(t) -> { start: t.start, end: t.end },
+        None -> { start: 0, end: 0 },
+      };
+    // Past an interpolated string the token opens at `i`: its holes may hold strings of their own.
+    let past_string = |i: Int|
+      iterate({ at: i, depth: 0 }, n + 1, |s: { at: Int, depth: Int }|
+        match kind(s.at) {
+          InterpolatedHead(_) -> Continue({ at: s.at + 1, depth: s.depth + 1 }),
+          InterpolatedTail(_) -> if s.depth == 1 { Stop({ at: s.at + 1, depth: 0 }) }
+          else { Continue({ at: s.at + 1, depth: s.depth - 1 }) },
+          EndOfInput -> Stop(s),
+          _ -> Continue({ at: s.at + 1, depth: s.depth }),
+        }).at;
+    let shown = fold(range(0, n), None, |acc: Option<Span>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> match kind(i) {
+          InterpolatedHead(_) -> {
+            let sp = span_at(i);
+            if follows_name(input.source, sp.start) { None } else { Some(sp) }
+          },
+          _ -> None,
+        },
+      });
+    let cased = fold(range(0, n), None, |acc: Option<Span>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> if kind(i) != keyword_test() { None } else {
+          let label = if kind(i + 1) == token_slash() { i + 3 } else { i + 1 };
+          let after = match kind(label) {
+            StringLiteral(_) -> label + 1,
+            InterpolatedHead(_) -> past_string(label),
+            _ -> label,
+          };
+          if after != label && ident(after, b"for") { Some(span_at(after)) } else { None }
+        },
+      });
+    let with_shown = match shown {
+      None -> leading.node,
+      Some(sp) -> push(leading.node, hidden_import(b"show", shown_binder(), sp)),
+    };
+    Some({
+      doc: module_doc(input),
+      imports: match cased {
+        None -> with_shown,
+        Some(sp) -> push(with_shown, hidden_import(b"cases", cases_binder(), sp)),
+      },
+      items: [],
+    })
+  }
+}
+
 pub fn parse(src: Bytes) -> Parsed<Module> / {abort.raise} = {
   let s = start(src);
   let r = run(s.input, s.parser);
@@ -2382,6 +2472,7 @@ pub fn dump_fn(def: FnDef) -> Bytes / {abort.raise} =
       Some(e) -> bytes_concat(dump_word(b"decreases"), dump_expr(e)),
       None -> b"",
     },
+    match def.baked { Some(s) -> dump_node(s, b"cst"), None -> b"" },
     dump_expr(def.body),
     dump_doc_if(def.doc),
   ])
@@ -2611,6 +2702,17 @@ test "a transparent fn keeps the marker's span, before a reuse or alone, and tra
   assert(string_contains(both, ":fn;%priv;?1;12:17:reu;?1;0:11:trn;?0;21:22:ident;@66;"));
   let named = dump(b"fn transparent(x: Int) -> Int = x\n");
   assert(string_contains(named, ":fn;%priv;?0;?0;?0;3:14:ident;@7472616e73706172656e74;"))
+}
+
+test "a const fn keeps the marker's span, and const stays a name elsewhere" {
+  let marked = dump(b"pub const fn f() -> Int = 1\n");
+  assert(string_contains(marked, ":fn;%pub;?0;?0;?0;13:14:ident;@66;"));
+  assert(string_contains(marked, "4:9:cst;"));
+  let named = dump(b"fn const(x: Int) -> Int = x\n");
+  assert(string_contains(named, ":fn;%priv;?0;?0;?0;3:8:ident;@636f6e7374;"));
+  assert(!string_contains(named, ":cst;"));
+  let field = dump(b"fn f(r: { const: Int }) -> Int = r.const\n");
+  assert(!string_contains(field, ":cst;"))
 }
 
 test "a `returns` clause names `fresh` or a parameter, and naming anything else is refused" {
@@ -3069,4 +3171,17 @@ test "`key for T by f` and `show for T by f` are items, and neither word is rese
     ),
     [b"E0003"],
   )
+}
+
+test "a header holds the imports a whole parse finds, the hidden ones among them" {
+  let same = |src: Bytes|
+    match header(src) { None -> false, Some(m) -> m.imports == parse(src).node.imports };
+  assert(same(b"import std.list (at)\nimport std.json as j\nfn f() -> Int = 1\n"), None);
+  assert(same(b"fn f(n: Int) -> String = \"n is {n}\"\n"), None);
+  assert(same(b"fn f(n: Int) -> Q = q\"n is {n}\"\n"), None);
+  assert(same(b"test \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }\n"), None);
+  assert(same(b"test/nondet \"each\" for n: Int in [1] { assert(n > 0) }\n"), None);
+  assert(same(b"test \"plain\" { assert(true) }\nfn for_each() -> Int = 1\n"), None);
+  assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None);
+  assert_eq(header(b"type T = { a: Int }\nderive bin for T\n"), None)
 }

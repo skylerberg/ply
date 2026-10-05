@@ -1863,6 +1863,20 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
+/// Whether `lo <= v <= hi` as `<=` orders the three, for a range pattern over a width the words do
+/// not carry. Reads all three.
+pub unsafe extern "C" fn rt_between(ctx: *mut Ctx, v: i64, lo: i64, hi: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let (x, l, h) = (ctx.value(v), ctx.value(lo), ctx.value(hi));
+    let le = |a: &Value, b: &Value| {
+        ply_eval::strict_binary(BinOp::Le, a, b, Span::DUMMY, Span::DUMMY, Span::DUMMY)
+    };
+    match le(&l, &x).and_then(|low| Ok((low, le(&x, &h)?))) {
+        Ok(both) => i64::from(matches!(both, (Value::Bool(true), Value::Bool(true)))),
+        Err(d) => ctx.fail(d),
+    }
+}
+
 /// `++`: two strings or two byte strings append natively, answering the kind they share; anything
 /// else raises what `strict_binary` raises. Takes both.
 pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
@@ -3462,6 +3476,45 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
         tables.memoize_costing(index as usize, w, c.cost().minus(before));
     }
     w
+}
+
+/// The value a unit holds as `len` bytes of text at `text`: what a build kept of a `const`
+/// definition, read into the unit's own heap, so the entry that reads it is charged nothing.
+pub unsafe extern "C" fn rt_baked(ctx: *mut Ctx, text: i64, len: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let tables = Arc::clone(&c.tables);
+    let text = unsafe { std::slice::from_raw_parts(text as *const u8, len as usize) };
+    let read = crate::stored::read(
+        &tables.layouts,
+        &tables.nullaries,
+        &mut lock(&tables.immortals),
+        text,
+    );
+    match read {
+        Ok(w) => w,
+        Err(why) => c.fail(
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the value a build kept of a `const` definition does not read: {why}"),
+            )
+            .primary(Span::DUMMY, "in compiled code")
+            .note("this is Ply's fault: a unit holds only values this runtime wrote"),
+        ),
+    }
+}
+
+/// `w` as the text [`rt_baked`] reads back, a `Bytes`. Reads `w`.
+pub unsafe extern "C" fn rt_stored(ctx: *mut Ctx, w: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let tables = Arc::clone(&c.tables);
+    match crate::stored::text(&tables.layouts, w) {
+        Ok(text) if u32::try_from(text.len()).is_ok() => c.heap.bytes(&text),
+        Ok(text) => c.fail(error(format!(
+            "a value of {} stored bytes has no stored form",
+            text.len()
+        ))),
+        Err(what) => c.fail(error(format!("{what} has no stored form"))),
+    }
 }
 
 /// A call through a value. Takes the callee and the arguments.

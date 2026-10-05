@@ -146,7 +146,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `new` | right after the `=` of a `type` declaration |
 | `law`, `host`, `schema`, `forall`, `cost` | `law "..."`, `law/host` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
-| `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
+| `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
 | `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
@@ -169,6 +169,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
+| `b'{'`, `b'\n'`, `b'\x1f'` | `Int` | The byte `bytes_at` answers: one ASCII character or one escape. |
 | `uuid"6ba7b810-.."`, `html"<b>{x}</b>"` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, and holes its tag is handed apart from the text, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
@@ -183,6 +184,11 @@ written as a literal; use `i8_of_int(-128)`.
 String and character escapes are `\n` `\t` `\r` `\0` `\\` `\"` `\'` and `\u{...}`, one to six hex
 digits naming a Unicode scalar value (a surrogate or a value past `10FFFF` is `E0211`). Byte
 strings add `\xNN`, refuse `\u{...}` and refuse source characters above `U+007F`.
+
+A byte literal `b'x'` holds one byte, written as a byte string writes it or as `\'`, and is the
+`Int` that byte is: `b'{'` and `123` are one literal with one hash, so
+`bytes_at(src, i) == b'{'` reads as it means and a scanner is a `match` (§5.2). An empty one, one
+holding more than a byte, or one that never closes is `E0001` or `E0002`, as for a character.
 
 An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ " b"`, with
 `std.show`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
@@ -288,7 +294,9 @@ Loosest to tightest; all binary operators are left-associative:
 | 7 | `<<` `>>` `>>>` | integer; the count is `Int` |
 | 8 | `++` | `String` or `Bytes` |
 | 9 | `+` `-` | numeric |
+| 9 | `+%` `-%` `+\|` `-\|` | integer |
 | 10 | `*` `/` `%` | numeric |
+| 10 | `*%` `*\|` | integer |
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
@@ -307,7 +315,20 @@ Loosest to tightest; all binary operators are left-associative:
   than zero or its operands are `Float`s. Overflow and a shift count that is
   negative or not less than the type's width are the machine's limit, as the
   call ceiling is: they end the run (`E0502`) and are in no row. `<<` discards
-  shifted-out bits; `wrap_*` wrap and `checked_*` answer `None` (§12).
+  shifted-out bits and `checked_*` answer `None` (§12).
+* `+%`, `-%` and `*%` wrap at the operand type's width, and `+|`, `-|` and `*|`
+  saturate at it: `255u8 +% 1u8` is `0u8`, `250u8 +| 10u8` is `255u8` and
+  `3u8 -| 10u8` is `0u8`. At `Int` the width is its 64 bits and the ends its
+  least and greatest values. They perform nothing, cannot raise and never end
+  the run. Each is the call of a builtin, built at the parse, so the two
+  spellings are one definition with one hash: `a +% b` is `wrap_add(a, b)`,
+  and `wrap_sub`, `wrap_mul`, `saturating_add`, `saturating_sub` and
+  `saturating_mul` are the other five. Their operands are one builtin integer
+  type, which the call site settles: a type parameter, even under
+  `where integer(a)`, is `E0210`, any other type `E0201`, and a type that states
+  its own arithmetic (§4.4) `E0223`. A `%` or a `|` touching the `+`, `-` or
+  `*` before it is the one operator, so a lambda that is an operator's right
+  operand takes a space: `a + |x| x`.
 * `/` on `Decimal` is `E0209`; use `decimal_div`. `%` is allowed.
 * `&&`/`||` short-circuit. `&` `|` `^` `~` are integer-only and act at the
   type's own width (`~0u8` is `255u8`). `>>` is arithmetic, `>>>` logical.
@@ -511,6 +532,50 @@ path that does not exist, a directory handed to `embed`, a file handed to
 `embed_dir`, or a file that cannot be read is `E0146`, which refuses the load. A
 module that declares or imports its own `embed` or `embed_dir` calls that one.
 
+### 3.5 Constants a build keeps
+
+```ply
+type Status = { code: Int, reason: String }
+
+const fn statuses() -> Array<Status> = parsed(embed("status_codes.csv"))
+```
+
+A `const fn` is a definition a build evaluates once and keeps the value of: a
+table made from a data file is made when the program is built, and a run reads
+it. It takes no parameter, binds no type, label or row, and writes no row; its
+body may raise and performs nothing else, a call that may not return included
+(§5.10); and it answers a value that is data, so no function, `Cell`, `Task`,
+`Chan` or `Secret` at any depth. Anything else is `E0156`. Its row is empty
+whatever its body could raise, as a tagged literal's is (§2.3): the build saw it
+raise nothing. `pub const fn` publishes it; `const` goes with neither
+`transparent` nor `reuse`.
+
+`ply check`, `ply run`, `ply test`, `ply prove` and `ply build` evaluate each
+`const fn` the program holds before they do anything else with the load (§16),
+under a budget of 100000000 calls. One that raises is `E0157`, saying what it
+raised and where; one that spends the budget, or whose value takes more than
+16777216 bytes kept, is `E0158`. Each is placed at the definition, and nothing
+of the program runs. The value is kept in the toolchain's cache (§8.6) under the
+definition's hash, which covers its body, all it reaches and the bytes of every
+file it embeds (§3.4): an edit to any of those evaluates it again, and nothing
+else does but another `ply`.
+
+Every unit emitted after that holds the value as data in place of the body, a
+built artifact's among them (§15). A call of the definition reads the value,
+laid out by the run's first read of it, and enters nothing of the body:
+`metered` (§8.1) counts no step and no allocation for it. A program no build
+kept the values of, such as a mutant (§8.5) or the mixture a bisection runs
+(§8.4), evaluates the body in its place, once a run, as it does any definition
+that takes nothing; the value is the same either way, since the body is pure.
+
+A value is kept as it is laid out, so a table that is compact is one that reads
+quickly. An `Array` holds a word an element, and an `Int` within 63 bits or a
+width below 64 is held in that word: an `Array` of those is one object, kept as
+its words and read back in one piece, as a `Bytes` or a `String` is. Any other
+element is an object of its own, made when the value is read: an `Array` of
+30,000 records is 30,001 objects. A map is kept in its order and read back
+without comparing a key, and what a value shares is kept once.
+
 ## 4. Types
 
 Types are inferred by Hindley–Milner unification with row polymorphism. Written
@@ -534,7 +599,8 @@ definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
 operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
 code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12). `u32_of_int` and its
 siblings raise (§6.8) when the value does not fit (mask to truncate:
-`u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, and a 128-bit
+`u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, which `to_int`
+reads any of them as and `numeric_of_int` writes at any (§12), and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
 
@@ -716,8 +782,9 @@ once (`E0105`), and takes no parameter: an operator has the values alone, and
 
 `/` and `%` are no operator of such a type, since they have no answer at every
 pair of values: its module has a function for each, as `std.bigint.div` answers
-an `Option`. The bit operators and the `wrap_` and `checked_` builtins stay the
-builtin integers'. A type is ordered by its `key`, so `<`, `<=`, `>` and `>=`
+an `Option`. The bit operators stay the builtin integers' (`E0201`), and so do
+the wrapping, saturating and checked builtins, the operators written in them
+(§2.4) and the rotations (`E0223`). A type is ordered by its `key`, so `<`, `<=`, `>` and `>=`
 work at one that states both, and compare the keys. A type that states both is
 a numeric type: it fills `numeric(a)` (§4.5), as `std.math.sum(xs)` over a
 `List<BigInt>` does. One with no `key` has its operators and fills no
@@ -939,7 +1006,8 @@ guard: `[x, y, ..rest] if x > y -> x + len(rest),`. A `match` must be exhaustive
 | --- | --- |
 | `_` / `name` | anything; `name` binds it |
 | `Ctor`, `Ctor(p, q)`, `mod::Ctor(p)` | a constructor |
-| `42`, `-1`, `1.5`, `1.50m`, `"s"`, `b"s"`, `true`, `()` | a literal |
+| `42`, `-1`, `1.5`, `1.50m`, `"s"`, `b"s"`, `b'{'`, `true`, `()` | a literal |
+| `0..=9`, `b'a'..=b'z'`, `1u8..=9u8` | an integer from the first bound through the second |
 | `[]`, `[a, b]`, `[a, ..]`, `[a, ..rest]` | a list of exact length, or a prefix |
 | `{a, b}`, `{a: p, b: q}`, `{a, ..}` | a record; `..` allows other fields |
 | `(p, q)` | a tuple |
@@ -950,6 +1018,25 @@ once per alternative, so a guard runs again for a later alternative when an
 earlier one matched and the guard refused it. A plain `let` may use an
 or-pattern only where its alternatives cover the type, as in
 `let Ok(v) | Err(v) = r;`; one that can fail needs an `else` (`E0213`).
+
+A range's bounds are two integer literals of one type, the first no greater than
+the second and neither in parentheses (`E0222`); it binds nothing:
+
+```ply
+fn value(src: Bytes, i: Int) -> Result<Json, ParseError> / {abort.raise} =
+  match bytes_at(src, i) {
+    b'"' -> string_value(src, i),
+    b'-' | b'0'..=b'9' -> number(src, i),
+    b'{' -> object_value(src, i),
+    _ -> Err(error_at(i, "expected a value")),
+  }
+```
+
+Literals and ranges that between them hold every value of a `U8`, a `U16` or a
+`U32` exhaust it, and one they leave out is named:
+`match b { 0u8..=9u8 -> .., 20u8..=255u8 -> .. }` is `E0205`, not covered:
+`10u8..=19u8`. No other integer type's least and greatest values are both
+literals, so a match over one ends in a `_` arm.
 
 ### 5.3 Lambdas
 
@@ -1589,7 +1676,8 @@ counts them; `allocations`, the objects it built; and `performs`, each atom it
 performed with how many times, ordered by the atom's qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
-under either profile (§8.6):
+under either profile (§8.6); a `const fn` a build kept the value of costs
+nothing to read (§3.5):
 
 ```ply
 test "ten more elements cost twenty more steps: one in each closure" {
@@ -1756,7 +1844,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each tagged literal's verdict, kept under the hash of all its parser reaches and its text (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -2199,7 +2287,11 @@ compiler's prelude as an `extern fn`: a signature the runtime implements, with a
 row and a `where` like any other and no body, and a doc. Only the prelude
 declares one; an `extern fn` in a module is `E0151`. A module may shadow any
 except `compare_values` and `map_of_entries`, which the map and set literals are
-written in (`E0105`). `ply doc prelude` lists them all, each with the summary of
+written in, and the six the wrapping and saturating operators are written in
+(§2.4), which no binding around such an operator may hide either (`E0105`).
+`to_int` reads a value of any integer type as an `Int`, answering `None` past
+its range, so with `numeric_of_int` it converts between any two.
+`ply doc prelude` lists them all, each with the summary of
 its doc, and `ply doc NAME` prints one: its signature with the parameters' names,
 and its doc.
 
@@ -2286,7 +2378,8 @@ container as text.
 file (default `<entry module>.plyx`): its definitions by hash, the same
 definitions printed back to source without tests, laws, comments or anything
 unreached, and the runnable `ply run` loads — that source checked again, its
-front end's answer and its compiled unit — so a run of it runs no front end.
+front end's answer and its compiled unit, which holds the value of each
+`const fn` (§3.5) — so a run of it runs no front end and evaluates none of them.
 The BLAKE3 digest covers those and the entry point, so an edit nothing reaches
 leaves it unchanged; a failure raised by a run of it carries no line number. A
 part that does not agree with the rest — a body under a hash that does not name
@@ -2660,7 +2753,11 @@ loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 document, `front_end` carries `reused` and `key` for an answer taken back,
 beside the phases of this run, all of it read. `--kept` answers only that way:
 where no kept answer stands it loads nothing and exits 4, so a caller can tell
-which runs have work before starting them.
+which runs have work before starting them. `ply defs` keeps its listing the same
+way, beside every embed the program read, and a later listing over the same
+command line, files and `ply` takes it back while every shipped definition the
+program reached hashes as it did; its `--json` document then carries
+`front_end` with `reused` and `key`.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
@@ -2678,6 +2775,16 @@ by every check, never as its stub. A dependency's literals are its own run's
 to settle, as its tests are, and `compiler.load` settles none: there, as in any
 load nothing settled, a literal whose parser refuses it ends the run where it
 is read (`E0502`).
+
+The same commands evaluate each `const fn` the program holds (§3.5), whichever
+package declares it, on a machine of its own after the literals' and under its
+own budget: its value is kept in the toolchain's cache under the definition's
+hash and the toolchain, and a definition is entered again only after an edit to
+something it reaches or to a file it embeds. One that raises is entered by each
+load until it is mended, so its diagnostic names the place as the sources stand.
+A module that declares one is read as its stub like any other: the value is the
+definition's, wherever its body is read from. `compiler.load` evaluates none, and
+there a `const fn` is a definition that takes nothing, evaluated once a run.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements, and keeps a doc comment directly above what it
@@ -2785,6 +2892,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0152` | a tagged literal whose tag's `literal`, or `compile` or `fill` for one with holes, is not what a tagged literal calls |
 | `E0153` | a tagged literal its parser refuses |
 | `E0154` | a tagged literal whose parser raised or spent its budget |
+| `E0156` | a `const fn` that takes or binds a parameter, writes a row, performs more than a raise, may not return, or answers a value a build cannot keep |
+| `E0157` | a `const fn` that raised when the build evaluated it |
+| `E0158` | a `const fn` that spent the build's budget, in calls or in the size of its value |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -2804,6 +2914,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum |
 | `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
+| `E0222` | a range pattern whose bounds are not two integer literals of one type, the first no greater than the second |
+| `E0223` | a wrapping, saturating or checked builtin, an operator written in one, or a rotation at a type that states its own arithmetic |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
