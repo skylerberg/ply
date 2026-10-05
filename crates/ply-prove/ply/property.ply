@@ -6,21 +6,22 @@
 import std.bytes (bytes_of_hex, hex_of)
 import std.string
 import std.random (Rand, rand_keyed)
-import std.value (Value, VUnit, VBool, VInt, VStr, VBytes)
+import std.value (Value, VUnit, VBool, VInt, VStr, VBytes, VList, VRecord, VCtor)
 import decide (Static, Certified, Unwitnessed, GuardRefuted, Undecided, Settlement)
 import domain (Domain, Ty, Var, Fn, Record, Con, finite, point_at)
-import gen (Types, Generated, generate, generatable, by_name, types_of)
+import gen (Types, Generated, generate, generatable, by_name, types_of, hard_depth)
+import drawn (Draw, Made, bare, carried, crosses, each_ready, entry, ready, sampled_of, unmade)
 import obligation (Outcome, Held, Refuted, Vacuous, Unattempted, Defect, Gap, UnhandledEffect,
                    Ungeneratable, Raised, GuardNotSampled, ReachesHost, Evidence, Proof, Sampled,
                    Certificate, Cases, Instantiation, Binding, Tier, Proved, Property, Example,
                    Fitted, Vacuity, Unsatisfiable, NoCaseKept, Counter, Fault, Judged, JHeld,
-                   JFailed, JRejected, JRaised, JFaulted, JMeasured, JSpent, Measured, NotDrawn,
-                   Law, Pure, Outgrown, Unfitted, fit_tier)
+                   JFailed, JRejected, JRaised, JFaulted, JMeasured, JSpent, JDrew, Measured,
+                   NotDrawn, Law, Pure, Outgrown, Unfitted, GaveUp, fit_tier)
 import fit (Fit, sizes, size_limit, fitted, min_fit_sizes, outgrown)
 import rules (Rule, CostBound, GroundEvaluation, ExhaustiveEnumeration, ExhaustiveInterleaving)
-import shrink (Target, Falsifies, Raises, descend)
-import world (Obligation, World, Binder, Strategy, Interleave, Hosted, Static, Unhandled, Run,
-              Every, Drawn, Fitting, Points, unsettled, walks)
+import shrink (Target, Falsifies, Raises, descend_made)
+import world (Obligation, World, Binder, Generator, Strategy, Interleave, Hosted, Static, Unhandled,
+              Run, Every, Drawn, Fitting, Points, unsettled, walks)
 import sim.plan
 import sim.plan (Seed, Dpor, seed_text)
 import sim.recording (Interleaving, Step, Passed, Failed, ACell)
@@ -35,14 +36,15 @@ pub type Asked = { claim: Int, obligation: Obligation, settled: Static }
 pub type Batch = { claim: Int, points: List<List<Value>>, mode: Mode }
 
 /// The whole claim until a point settles it; the guard alone until it admits a point; the guard
-/// alone at every point until it raises; or a cost law's sizes in order, each within so many steps,
-/// until one raises or takes more.
-pub type Mode = | MWhole | MWitness | MDomain | MCost(Int)
+/// alone at every point until it raises; a cost law's sizes in order, each within so many steps,
+/// until one raises or takes more; or each point a definition's name and then its arguments,
+/// answered with what the definition answers there, which is how a stated generator draws.
+pub type Mode = | MWhole | MWitness | MDomain | MCost(Int) | MDrawn
 
 /// What a law over interleavings was searched at, as its evidence says it.
 pub type Searched =
   | SEnumerated({ domain: String, points: Int, kept: Int })
-  | SSampled({ generated: Int, kept: Int, rejected: Int, instantiations: List<Instantiation> })
+  | SSampled({ generated: Int, kept: Int, rejected: Int, discarded: Int, instantiations: List<Instantiation> })
 
 /// What a discharge asks the runtime, and what it answers: one conversation, because a function's
 /// row is one row and a discharge needs both answers. A law over interleavings is run at one of its
@@ -55,8 +57,17 @@ pub type Reply = | Judgements(List<List<Judged>>) | Interleaved(LawRun)
 /// schedule to vary.
 pub type LawRun = { interleaving: Interleaving<Judged>, observed: Bool }
 
+/// The runtime is handed each point bare: a value a generator drew, as the value it made.
 fn judge_with<| e>(ask: (Ask) -> Reply / e, batches: List<Batch>) -> List<List<Judged>> / e =
-  match ask(AskJudged(batches)) { Judgements(js) -> js, _ -> [] }
+  match ask(
+      AskJudged(
+        map(batches, |b: Batch|
+          { ..b, points: map(b.points, |point: List<Value>| map(point, bare)) }),
+      ),
+    ) {
+    Judgements(js) -> js,
+    _ -> [],
+  }
 
 /// What a run draws: the cases each root gives, the roots, the re-runs a walk may cost, and the
 /// interleavings a law over a `simulate` region is searched at.
@@ -83,7 +94,9 @@ pub fn discharged<| e>(
 ) -> List<Outcome> / {abort.raise | e} = {
   let terms = types_of_world(world);
   let normal = { ..plan, roots: normalized(plan.roots) };
-  let works = map(asked, |a: Asked| planned(a, terms, normal, host));
+  let planned_works = map(asked, |a: Asked| planned(a, terms, normal, host));
+  let works = if len(world.gens) == 0 { planned_works }
+  else { drawn_works(asked, planned_works, ask) };
   let batches = fold(range(0, len(works)), [], |acc: List<Batch>, i: Int|
     match ((list_at(works, i), list_at(asked, i))) {
       (Some(WPoints(p)), Some(a)) ->
@@ -115,7 +128,11 @@ pub fn discharged<| e>(
     })
 }
 
-pub fn types_of_world(world: World) -> Types / {abort.raise} = types_of(world.decls)
+pub fn types_of_world(world: World) -> Types / {abort.raise} =
+  types_of(
+    world.drawn,
+    map(world.gens, |g: Generator| { ty: g.ty, params: g.params, sampler: g.sampler }),
+  )
 
 fn normalized(roots: List<Int>) -> List<Int> =
   fold(roots, [], |acc: List<Int>, r: Int| {
@@ -146,6 +163,8 @@ type Pointed = {
   witness: Option<Certificate>,
   domain: Option<{ name: String, points: Int }>,
   generated: Int,
+  /// The values the generators the points were drawn through turned away.
+  discarded: Int,
 }
 
 type Work = | WDone(Outcome) | WPoints(Pointed)
@@ -156,15 +175,19 @@ fn certificate_of(s: Settlement) -> Certificate =
 fn guard_span(obligation: Obligation) -> { module: Int, start: Int, end: Int } =
   match list_at(obligation.guards, 0) { Some(g) -> g, None -> obligation.at }
 
+/// Each binder's type as a sample draws it.
 fn binder_tys(obligation: Obligation) -> List<Ty> =
-  map(obligation.binders, |binder: Binder| binder.ty)
+  map(obligation.binders, |binder: Binder| binder.drawn)
 
 /// The first binder whose type has no value to draw.
 fn ungeneratable(obligation: Obligation, types: Types) -> Option<Gap> =
   fold(obligation.binders, None, |found: Option<Gap>, binder: Binder|
     match found {
       Some(_) -> found,
-      None -> match generatable(binder.ty, types) { Ok(_) -> None, Err(_) -> Some(gap_of(binder)) },
+      None -> match generatable(binder.drawn, types) {
+        Ok(_) -> None,
+        Err(_) -> Some(gap_of(binder)),
+      },
     })
 
 fn gap_of(binder: Binder) -> Gap = Ungeneratable({ param: binder.name, ty: binder.text })
@@ -220,6 +243,7 @@ fn sized() -> Pointed = {
     witness: None,
     domain: None,
     generated: len(points),
+    discarded: 0,
   }
 }
 
@@ -263,6 +287,7 @@ fn drawn_for(
         witness: witness,
         domain: Some({ name: name, points: domain.points }),
         generated: len(walked.points),
+        discarded: 0,
       }
     },
     Drawn -> {
@@ -281,6 +306,7 @@ fn drawn_for(
         witness: witness,
         domain: None,
         generated: len(drawn.points),
+        discarded: 0,
       }
     },
   }
@@ -318,7 +344,9 @@ fn root_draws(
       },
   ).draws
 
-/// The point a draw at `root` and `case` makes from a fresh stream, as a re-draw of a proof samples one.
+/// The point a draw at `root` and `case` makes from a fresh stream, as a re-draw of a proof samples
+/// one. A binder drawn through a stated generator has no value until the runtime enters its sampler,
+/// so the point is not made here.
 pub fn redrawn(
   obligation: Obligation,
   types: Types,
@@ -332,7 +360,18 @@ pub fn redrawn(
       rand_keyed(root, bytes_of_hex(obligation.key)),
       case,
     ) {
-    Ok(t) -> Ok(t.values),
+    Ok(t) -> match fold(range(0, len(t.values)), None, |found: Option<Int>, i: Int|
+        match found {
+          Some(_) -> found,
+          None -> match list_at(t.values, i) {
+            Some(v) -> if unmade(v) { Some(i) } else { None },
+            None -> None,
+          },
+        }) {
+      None -> Ok(t.values),
+      Some(i) ->
+        Err(match list_at(obligation.binders, i) { Some(b) -> gap_of(b), None -> NotDrawn }),
+    },
     Err(g) -> Err(g),
   }
 
@@ -364,6 +403,241 @@ fn tuple_drawn(
       },
   )
 
+// --- Drawing through a stated generator ---------------------------------------------
+
+/// Why a draw was not made: the program's gap, or Ply's own failure.
+type Lost =
+  | LostGap(Gap)
+  /// The value drawn holds what the runtime cannot be handed back.
+  | LostValue
+  | LostFault({ code: String, message: String, notes: List<String>, values: List<Value> })
+
+/// One claim's points as their draws are made: the points that came through, in order, the first
+/// that did not with the binder it was lost at, and what the generators turned away.
+type Fill = {
+  claim: Int,
+  points: List<List<Value>>,
+  lost: Option<{ binder: Int, why: Lost }>,
+  discards: Int,
+}
+
+type Filling = { next: Int, lost: Option<Lost>, discards: Int }
+
+/// What a sampler answered for one draw, in its place.
+fn answered(d: Draw, st: Filling, answers: List<Judged>) -> { value: Value, state: Filling } = {
+  let unmade_at = |why: Lost|
+    {
+      value: carried(d),
+      state: {
+        ..st,
+        next: st.next + 1,
+        lost: match st.lost { Some(_) -> st.lost, None -> Some(why) },
+      },
+    };
+  match list_at(answers, st.next) {
+    Some(JDrew(answer)) -> match sampled_of(answer) {
+      Some(sample) -> match sample.value {
+        Some(v) -> if !crosses(v) { unmade_at(LostValue) } else {
+          {
+            value: carried({ ..d, state: Made({ record: sample.record, value: v }) }),
+            state: { ..st, next: st.next + 1, discards: st.discards + sample.discards },
+          }
+        },
+        None -> unmade_at(LostGap(GaveUp({ ty: d.ty, discards: sample.discards }))),
+      },
+      None ->
+        unmade_at(
+          LostFault({
+            code: "E0505",
+            message: "`" ++ d.sampler ++ "` answered what is no sample",
+            notes: [
+              "a sampler answers a `std.gen.Sample`, which the prover and `std.gen` read alike",
+            ],
+            values: [answer],
+          }),
+        ),
+    },
+    Some(JRaised(r)) ->
+      unmade_at(
+        LostGap(
+          Raised({
+            message: "in the generator of `" ++ d.ty ++ "`: " ++ r.message,
+            values: r.values,
+            bindings: [],
+          }),
+        ),
+      ),
+    Some(JFaulted(f)) -> unmade_at(LostFault(f)),
+    _ ->
+      unmade_at(
+        LostFault({
+          code: "E0505",
+          message: "the runtime answered no draw for `" ++ d.sampler ++ "`",
+          notes: [],
+          values: [],
+        }),
+      ),
+  }
+}
+
+/// One round over one claim's points: each draw that was ready, as its answer made it. The points
+/// from the first that lost a draw on are left out.
+fn filled(fill: Fill, answers: List<Judged>) -> Fill =
+  fold(
+    range(0, len(fill.points)),
+    { fill: { ..fill, points: [] }, next: 0, stopped: false },
+    |acc: { fill: Fill, next: Int, stopped: Bool }, k: Int|
+      if acc.stopped { acc } else {
+        let point = match list_at(fill.points, k) { Some(p) -> p, None -> [] };
+        let walked = fold(
+          range(0, len(point)),
+          { values: [], st: { next: acc.next, lost: None, discards: 0 }, binder: 0 },
+          |w: { values: List<Value>, st: Filling, binder: Int }, i: Int|
+            match list_at(point, i) {
+              None -> w,
+              Some(v) -> {
+                let made = each_ready(v, w.st, |d: Draw, st: Filling| answered(d, st, answers));
+                {
+                  values: push(w.values, made.value),
+                  st: made.state,
+                  binder: if w.st.lost == None && made.state.lost != None { i } else { w.binder },
+                }
+              },
+            },
+        );
+        match walked.st.lost {
+          Some(why) ->
+            {
+              fill: { ..acc.fill, lost: Some({ binder: walked.binder, why: why }) },
+              next: walked.st.next,
+              stopped: true,
+            },
+          None ->
+            {
+              fill: {
+                ..acc.fill,
+                points: push(acc.fill.points, walked.values),
+                discards: acc.fill.discards + walked.st.discards,
+              },
+              next: walked.st.next,
+              stopped: false,
+            },
+        }
+      },
+  ).fill
+
+/// Every draw in each claim's points made: a round enters the samplers of the draws that are
+/// ready, all claims' at once, and a draw whose pools held one is ready the round after.
+fn made<| e>(fills: List<Fill>, ask: (Ask) -> Reply / e) -> List<Fill> / {abort.raise | e} =
+  iterate(
+    { fills: fills, left: hard_depth() + 1 },
+    hard_depth() + 2,
+    |s: { fills: List<Fill>, left: Int }| {
+      let wanted = map(s.fills, |f: Fill|
+        fold(f.points, [], |acc: List<Draw>, point: List<Value>|
+          fold(point, acc, |inner: List<Draw>, v: Value|
+            fold(ready(v), inner, |out: List<Draw>, d: Draw| push(out, d)))));
+      let asked = filter(range(0, len(s.fills)), |i: Int|
+        match list_at(wanted, i) { Some(ds) -> len(ds) > 0, None -> false });
+      if len(asked) == 0 || s.left <= 0 { Stop(s.fills) } else {
+        let answers = judge_with(
+          ask,
+          map(asked, |i: Int|
+            {
+              claim: match list_at(s.fills, i) { Some(f) -> f.claim, None -> 0 },
+              points: map(match list_at(wanted, i) { Some(ds) -> ds, None -> [] }, entry),
+              mode: MDrawn,
+            }),
+        );
+        Continue({
+          fills: map(range(0, len(s.fills)), |i: Int| {
+            let fill = match list_at(s.fills, i) {
+              Some(f) -> f,
+              None -> { claim: 0, points: [], lost: None, discards: 0 },
+            };
+            match fold(range(0, len(asked)), None, |found: Option<Int>, k: Int|
+                if list_at(asked, k) == Some(i) { Some(k) } else { found }) {
+              None -> fill,
+              Some(k) -> filled(fill, match list_at(answers, k) { Some(js) -> js, None -> [] }),
+            }
+          }),
+          left: s.left - 1,
+        })
+      }
+    },
+  )
+
+/// One tuple with its draws made, or `None` where one was lost.
+fn made_tuple<| e>(
+  claim: Int,
+  values: List<Value>,
+  ask: (Ask) -> Reply / e,
+) -> Option<List<Value>> / {abort.raise | e} =
+  if !fold(values, false, |any: Bool, v: Value| any || unmade(v)) { Some(values) } else {
+    match list_at(made([{ claim: claim, points: [values], lost: None, discards: 0 }], ask), 0) {
+      Some(fill) -> match fill.lost { None -> list_at(fill.points, 0), Some(_) -> None },
+      None -> None,
+    }
+  }
+
+/// What losing a draw at one of a claim's binders leaves of the claim.
+fn lost_gap(obligation: Obligation, binder: Int, why: Lost) -> Result<Gap, Outcome> =
+  match why {
+    LostGap(g) -> Ok(g),
+    LostValue ->
+      Ok(match list_at(obligation.binders, binder) { Some(b) -> gap_of(b), None -> NotDrawn }),
+    LostFault(f) ->
+      Err(
+        Defect({
+          code: f.code,
+          message: f.message,
+          notes: f.notes,
+          values: f.values,
+          bindings: [],
+        }),
+      ),
+  }
+
+/// Each claim's points with the draws in them made. A claim stops where a draw was lost, as it
+/// stops where a binder has no value: the points before it are still judged.
+fn drawn_works<| e>(
+  asked: List<Asked>,
+  works: List<Work>,
+  ask: (Ask) -> Reply / e,
+) -> List<Work> / {abort.raise | e} = {
+  let fills = made(
+    map(range(0, len(works)), |i: Int|
+      {
+        claim: match list_at(asked, i) { Some(a) -> a.claim, None -> 0 },
+        points: match list_at(works, i) { Some(WPoints(p)) -> p.points, _ -> [] },
+        lost: None,
+        discards: 0,
+      }),
+    ask,
+  );
+  map(range(0, len(works)), |i: Int|
+    match ((list_at(works, i), list_at(fills, i), list_at(asked, i))) {
+      (Some(WPoints(p)), Some(fill), Some(a)) -> {
+        let kept = {
+          ..p,
+          points: fill.points,
+          at: take(p.at, len(fill.points)),
+          generated: len(fill.points),
+          discarded: fill.discards,
+        };
+        match fill.lost {
+          None -> WPoints(kept),
+          Some(l) -> match lost_gap(a.obligation, l.binder, l.why) {
+            Ok(gap) -> WPoints({ ..kept, stop: Some(gap) }),
+            Err(defect) -> WDone(defect),
+          },
+        }
+      },
+      (Some(w), _, _) -> w,
+      _ -> WDone(Unattempted(UnhandledEffect(None))),
+    })
+}
+
 // --- What the judgements came to ------------------------------------------------
 
 /// A claim after its first batch: its outcome, or what deciding it still takes.
@@ -379,7 +653,7 @@ type Judging =
 pub fn bindings(obligation: Obligation, values: List<Value>) -> List<Binding> =
   fold(range(0, min(len(obligation.binders), len(values))), [], |out: List<Binding>, i: Int|
     match ((list_at(obligation.binders, i), list_at(values, i))) {
-      (Some(b), Some(v)) -> push(out, { name: b.name, ty: b.text, value: v }),
+      (Some(b), Some(v)) -> push(out, { name: b.name, ty: b.text, value: bare(v) }),
       _ -> out,
     })
 
@@ -498,6 +772,7 @@ fn sampled(obligation: Obligation, p: Pointed, js: List<Judged>, plan: Plan) -> 
                   generated: generated,
                   kept: w.kept,
                   rejected: generated - w.kept,
+                  discarded: p.discarded,
                   roots: plan.roots,
                   instantiations: instantiations(obligation),
                 }),
@@ -680,6 +955,7 @@ fn law_kept(obligation: Obligation, p: Pointed, js: List<Judged>) -> Judging = {
           generated: p.generated,
           kept: len(w.kept),
           rejected: p.generated - len(w.kept),
+          discarded: p.discarded,
           instantiations: instantiations(obligation),
         }),
       }),
@@ -721,12 +997,18 @@ fn shrunk<| e>(
   plan: Plan,
   ask: (Ask) -> Reply / e,
 ) -> Outcome / {abort.raise | e} = {
-  let holds = |tried: List<Value>|
-    match first_judged(judge_with(ask, [{ claim: asked.claim, points: [tried], mode: MWhole }])) {
-      Some(j) -> matches(j, target),
-      None -> false,
+  // A candidate that carries a record is made first: its sampler replays the record.
+  let ran = |tried: List<Value>|
+    match made_tuple(asked.claim, tried, ask) {
+      None -> None,
+      Some(run) -> match first_judged(
+          judge_with(ask, [{ claim: asked.claim, points: [run], mode: MWhole }]),
+        ) {
+        Some(j) -> if matches(j, target) { Some(run) } else { None },
+        None -> None,
+      },
     };
-  let d = descend(values, binder_tys(asked.obligation), types, holds, plan.shrink_budget);
+  let d = descend_made(values, binder_tys(asked.obligation), types, ran, plan.shrink_budget);
   match outcome {
     Refuted(cx) ->
       Refuted({ ..cx, bindings: bindings(asked.obligation, d.values), shrinks: d.steps }),
@@ -780,7 +1062,7 @@ fn law_searched<| e>(
             Exact,
             { entered: 0, observed: true },
             |w: Watch, seed: Seed|
-              match ask(AskInterleaved(asked.claim, values, seed, sim.steps)) {
+              match ask(AskInterleaved(asked.claim, map(values, bare), seed, sim.steps)) {
                 Interleaved(r) ->
                   {
                     run: r.interleaving,
@@ -928,10 +1210,10 @@ fn law_held(
           sorts: [],
         }),
       })
-    } else { sampled_schedules(sim, t, d.points - d.kept, []) },
+    } else { sampled_schedules(sim, t, d.points - d.kept, 0, []) },
     SSampled(x) -> if x.kept == 0 {
       Vacuous({ guard: guard_span(obligation), why: NoCaseKept(x.generated) })
-    } else { sampled_schedules(sim, t, x.rejected, x.instantiations) },
+    } else { sampled_schedules(sim, t, x.rejected, x.discarded, x.instantiations) },
   }
 
 /// A search that entered no region emptied a frontier it never filled, so it proves nothing.
@@ -942,6 +1224,7 @@ fn sampled_schedules(
   sim: plan::Plan,
   t: Totals,
   rejected: Int,
+  discarded: Int,
   instantiations: List<Instantiation>,
 ) -> Outcome / {abort.raise} =
   Held({
@@ -950,6 +1233,7 @@ fn sampled_schedules(
       generated: t.evaluations,
       kept: t.evaluations,
       rejected: rejected,
+      discarded: discarded,
       roots: map(sim.roots, root_int),
       instantiations: instantiations,
     }),
@@ -1021,9 +1305,9 @@ fn witness_candidates(
       match acc {
         None -> None,
         Some(st) -> {
-          let column = match tried_at(binder.ty, lits) {
+          let column = match tried_at(binder.drawn, lits) {
             Some(col) -> Some({ col: col, rand: st.rand }),
-            None -> match generate(binder.ty, types, st.rand, 0) {
+            None -> match generate(binder.drawn, types, st.rand, 0) {
               Ok(g) -> Some({ col: [g.value], rand: g.rand }),
               Err(_) -> None,
             },
@@ -1071,7 +1355,15 @@ fn witnessed<| e>(
 ) -> Outcome / {abort.raise | e} =
   match witness_candidates(asked.obligation, types) {
     None -> vacuous,
-    Some(points) -> {
+    Some(candidates) -> {
+      // A candidate drawn through a generator is made before the guard reads it.
+      let points = match list_at(
+          made([{ claim: asked.claim, points: candidates, lost: None, discards: 0 }], ask),
+          0,
+        ) {
+        Some(fill) -> fill.points,
+        None -> [],
+      };
       let js = match list_at(
           judge_with(ask, [{ claim: asked.claim, points: points, mode: MWitness }]),
           0,
@@ -1131,13 +1423,16 @@ fn claim_of(binders: List<Binder>, strategy: Strategy) -> Obligation =
     strategy: strategy,
   }
 
-fn int_binder(name: String) -> Binder = { name: name, ty: Con("Int", []), text: "Int" }
+fn int_binder(name: String) -> Binder =
+  { name: name, ty: Con("Int", []), text: "Int", drawn: Con("Int", []) }
 
-fn bool_binder(name: String) -> Binder = { name: name, ty: Con("Bool", []), text: "Bool" }
+fn bool_binder(name: String) -> Binder =
+  { name: name, ty: Con("Bool", []), text: "Bool", drawn: Con("Bool", []) }
 
 fn sampled_claim(binders: List<Binder>) -> Obligation = claim_of(binders, Static(Run(Drawn)))
 
-fn no_world() -> World = { decls: [], signatures: [], obligations: [], measures: [], keyed: [] }
+fn no_world() -> World =
+  { decls: [], signatures: [], obligations: [], measures: [], keyed: [], gens: [], drawn: [] }
 
 fn a_plan(cases: Int) -> Plan =
   { cases: cases, roots: [0], shrink_budget: 1000, sim: plan::default_plan() }
@@ -1194,6 +1489,7 @@ test "a claim that holds at every drawn point is property evidence, and at a few
         generated: cases * len(roots),
         kept: cases * len(roots),
         rejected: 0,
+        discarded: 0,
         roots: roots,
         instantiations: [],
       }),
@@ -1315,7 +1611,10 @@ test "a settled claim asks the runtime nothing" {
     ),
     Unattempted(ReachesHost("{net.send}")),
   );
-  let unknown = claim_of([{ name: "c", ty: Con("m.Gone", []), text: "Gone" }], Static(Run(Drawn)));
+  let unknown = claim_of(
+    [{ name: "c", ty: Con("m.Gone", []), text: "Gone", drawn: Con("m.Gone", []) }],
+    Static(Run(Drawn)),
+  );
   assert_eq(
     run_one(unknown, Undecided, a_plan(10), never_asked()),
     Unattempted(Ungeneratable({ param: "c", ty: "Gone" })),
@@ -1477,7 +1776,7 @@ test "a run judges every claim's first points in one batch" {
 
 test "every variable of the binders is drawn as an Int, in the order it first appears" {
   let o = {
-    ..sampled_claim([{ name: "xs", ty: Con("List", [Var(1)]), text: "List<b>" }, { name: "y", ty: Var(0), text: "a" }]),
+    ..sampled_claim([{ name: "xs", ty: Con("List", [Var(1)]), text: "List<b>", drawn: Con("List", [Var(1)]) }, { name: "y", ty: Var(0), text: "a", drawn: Var(0) }]),
     variables: ["a", "b"],
   };
   assert_eq(instantiations(o), [{ var: "b", ty: "Int" }, { var: "a", ty: "Int" }])
@@ -1813,4 +2112,188 @@ test "a guard that keeps too few sizes leaves a cost law unfitted, and a raise i
     Unattempted(Raised(r)) -> binding_values(r.bindings) == [VInt(64)],
     _ -> false,
   })
+}
+
+// --- Drawing through a stated generator -----------------------------------------------
+
+/// A program whose `Even`, `Odd`, `Loud` and `Bag` each state a generator.
+fn a_drawing_world() -> World =
+  {
+    ..no_world(),
+    gens: map(["Even", "Odd", "Loud", "Bag"], |name: String|
+      {
+        ty: "m." ++ name,
+        params: if name == "Bag" { 1 } else { 0 },
+        sampler: "m._sample_" ++ name,
+        hash: "",
+      }),
+  }
+
+fn drawn_binder(name: String, drawn: Ty) -> Binder =
+  { name: name, ty: Record([{ name: "n", ty: Con("Int", []) }]), text: "Even", drawn: drawn }
+
+/// What a sampler answers of one draw `k`: it turned `k % 3` values away on the way.
+fn a_sample(k: Int, value: Value) -> Judged =
+  JDrew(
+    VRecord([
+      { name: "discards", value: VInt(k % 3) },
+      { name: "record", value: VList([VInt(k)]) },
+      { name: "value", value: value },
+    ]),
+  )
+
+/// What the program's samplers answer one entry. `Even`'s doubles its one draw, which fresh is 39
+/// less its place in the claim's stream; `Odd`'s gives up at 30, having discarded 1; `Loud`'s
+/// raises there; and `Bag`'s answers the pool it was handed.
+fn sampler_answer(entry: List<Value>) -> Judged / {abort.raise} = {
+  let k = match ((list_at(entry, len(entry) - 3), list_at(entry, len(entry) - 1))) {
+    (Some(VBytes(key)), Some(VCtor("None", []))) -> 39 - bytes_at(key, bytes_len(key) - 8) % 40,
+    (_, Some(VCtor("Some", [VList([VInt(n), ..])]))) -> min(n, 39),
+    _ -> 0,
+  };
+  let even = VCtor("Some", [VRecord([{ name: "n", value: VInt(2 * k) }])]);
+  match entry {
+    [VStr("m._sample_Even"), ..] -> a_sample(k, even),
+    [VStr("m._sample_Odd"), ..] -> if k == 30 { a_sample(7, VCtor("None", [])) }
+    else { a_sample(k, even) },
+    [VStr("m._sample_Loud"), ..] -> if k == 30 { JRaised({ message: "too loud", values: [] }) }
+    else { a_sample(k, even) },
+    [VStr("m._sample_Bag"), pool, ..] -> a_sample(0, VCtor("Some", [pool])),
+    _ -> panic("a sampler this program states"),
+  }
+}
+
+/// A runtime that enters the samplers above and judges every other point by `rule`.
+fn sampling<| e>(rule: (List<Value>) -> Judged / e) -> (Ask) -> Reply / {abort.raise | e} =
+  |ask: Ask|
+    match ask {
+      AskJudged(bs) ->
+        Judgements(
+          map(bs, |b: Batch|
+            match b.mode { MDrawn -> map(b.points, sampler_answer), _ -> map(b.points, rule) }),
+        ),
+      AskInterleaved(_, _, _, _) -> panic("no law here is over interleavings"),
+    }
+
+fn drawn_one<| e>(
+  binder: Binder,
+  plan: Plan,
+  ask: (Ask) -> Reply / e,
+) -> Outcome / {abort.raise | e} =
+  match list_at(
+      discharged(
+        [{ claim: 0, obligation: sampled_claim([binder]), settled: Undecided }],
+        a_drawing_world(),
+        plan,
+        false,
+        ask,
+      ),
+      0,
+    ) {
+    Some(x) -> x,
+    None -> panic("one outcome per claim"),
+  }
+
+/// The `n` of the one `Even` a point holds, as the runtime is handed it.
+fn even_of(point: List<Value>) -> Int / {abort.raise} =
+  match point {
+    [VRecord([{ name: "n", value: VInt(n) }])] -> n,
+    _ -> panic("a point is handed over bare"),
+  }
+
+test "a binder whose type states a generator is drawn by its sampler and judged as the value it made" {
+  let even = drawn_binder("e", Con("m.Even", []));
+  // Forty cases draw 39 down to 0, each doubled, and what the generator turned away is counted.
+  assert_eq(
+    drawn_one(
+      even,
+      a_plan(40),
+      sampling(|p: List<Value>| if even_of(p) % 2 == 0 { JHeld } else { JFailed }),
+    ),
+    Held({
+      tier: Property,
+      evidence: Sampled({
+        generated: 40,
+        kept: 40,
+        rejected: 0,
+        discarded: 39,
+        roots: [0],
+        instantiations: [],
+      }),
+    }),
+  );
+  // At any depth: a list of them is a list of the values their samplers made.
+  let evens = drawn_binder("es", Con("List", [Con("m.Even", [])]));
+  let all_even = |p: List<Value>|
+    match p {
+      [VList(items)] -> if fold(items, true, |ok: Bool, x: Value| ok && even_of([x]) % 2 == 0) {
+        JHeld
+      } else { JFailed },
+      _ -> JFailed,
+    };
+  match drawn_one(evens, a_plan(40), sampling(all_even)) {
+    Held(h) -> assert_eq(h.tier, Property),
+    other -> panic("a list of drawn values holds"),
+  }
+}
+
+test "a counterexample a generator drew shrinks to the least its generator makes, by its record" {
+  // The first case draws 78; the claim fails from 16 up, and 15 is nothing the generator makes.
+  match drawn_one(
+      drawn_binder("e", Con("m.Even", [])),
+      a_plan(40),
+      sampling(|p: List<Value>| if even_of(p) < 15 { JHeld } else { JFailed }),
+    ) {
+    Refuted(cx) -> {
+      assert_eq(binding_values(cx.original), [VRecord([{ name: "n", value: VInt(78) }])]);
+      assert_eq(binding_values(cx.bindings), [VRecord([{ name: "n", value: VInt(16) }])]);
+      assert(cx.shrinks > 0);
+      assert_eq((cx.root, cx.case), (0, 0))
+    },
+    other -> panic("not a refutation"),
+  }
+}
+
+test "a generator that draws no value leaves the claim unattempted, whatever held before it" {
+  let held = sampling(|p: List<Value>| JHeld);
+  // The tenth case is where it gives up; nine held, and nothing is claimed of them.
+  assert_eq(
+    drawn_one(drawn_binder("o", Con("m.Odd", [])), a_plan(40), held),
+    Unattempted(GaveUp({ ty: "m.Odd", discards: 1 })),
+  );
+  assert_eq(
+    drawn_one(drawn_binder("l", Con("m.Loud", [])), a_plan(40), held),
+    Unattempted(
+      Raised({ message: "in the generator of `m.Loud`: too loud", values: [], bindings: [] }),
+    ),
+  );
+  // A point before it that refutes the claim still does.
+  match drawn_one(
+      drawn_binder("o", Con("m.Odd", [])),
+      a_plan(40),
+      sampling(|p: List<Value>| if even_of(p) < 70 { JHeld } else { JFailed }),
+    ) {
+    Refuted(cx) ->
+      assert_eq(binding_values(cx.bindings), [VRecord([{ name: "n", value: VInt(70) }])]),
+    other -> panic("not a refutation"),
+  }
+}
+
+test "a generator's parameter is drawn first, and the generator is handed the values it made" {
+  // `Bag`'s sampler answers its pool, so the point is the pool as it was handed over.
+  let pooled = |p: List<Value>|
+    match p {
+      [VList(pool)] -> if len(pool) == 16
+          && fold(pool, true, |ok: Bool, x: Value| ok && even_of([x]) % 2 == 0) { JHeld }
+      else { JFailed },
+      _ -> JFailed,
+    };
+  match drawn_one(
+      drawn_binder("b", Con("m.Bag", [Con("m.Even", [])])),
+      a_plan(30),
+      sampling(pooled),
+    ) {
+    Held(h) -> assert_eq(h.tier, Property),
+    other -> panic("a bag of drawn values holds"),
+  }
 }
