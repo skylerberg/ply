@@ -88,6 +88,9 @@ pub struct Exports {
     /// Each constructor whose type's module states a `key` or a `show`, with the function of
     /// each: `-` where it states none, `!` for one the unit does not take.
     pub instances: Vec<(Symbol, String, String)>,
+    /// Each constructor whose type's module states a `numeric`, with its functions in the
+    /// order of [`ply_eval::instances`]' roles, spelled as the others are. Each has a row above.
+    pub numerics: Vec<(Symbol, [String; 5])>,
 }
 
 /// Whether `text` calls `helper` through its pointer, as the emitter writes a call: the name
@@ -197,7 +200,11 @@ impl Exports {
         if !self.instances.is_empty() {
             out.push_str(&format!("instances {}\n", self.instances.len()));
             for (ctor, key, show) in &self.instances {
-                out.push_str(&format!("{ctor} {key} {show}\n"));
+                out.push_str(&format!("{ctor} {key} {show}"));
+                if let Some((_, fs)) = self.numerics.iter().find(|(c, _)| c == ctor) {
+                    out.push_str(&format!(" {}", fs.join(" ")));
+                }
+                out.push('\n');
             }
         }
         out
@@ -281,10 +288,19 @@ impl Exports {
             count(line(s, &mut at)?, "instances")?
         };
         let mut instances = Vec::with_capacity(n);
+        let mut numerics = Vec::new();
         for _ in 0..n {
             let mut parts = line(s, &mut at)?.split(' ');
             let ctor = Symbol::new(parts.next()?);
-            instances.push((ctor, parts.next()?.to_string(), parts.next()?.to_string()));
+            instances.push((
+                ctor.clone(),
+                parts.next()?.to_string(),
+                parts.next()?.to_string(),
+            ));
+            let rest: Vec<String> = parts.map(str::to_string).collect();
+            if !rest.is_empty() {
+                numerics.push((ctor, <[String; 5]>::try_from(rest).ok()?));
+            }
         }
         Some(Exports {
             helpers,
@@ -300,6 +316,7 @@ impl Exports {
             lambdas: t.lambdas,
             buckets,
             instances,
+            numerics,
         })
     }
 

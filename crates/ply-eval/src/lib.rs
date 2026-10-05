@@ -76,7 +76,7 @@ pub use program::{
 pub use rc::RcStats;
 pub use region::{Interleaving, SimId, Verdict};
 pub use sched::TaskHandle;
-pub use semantics::strict_binary;
+pub use semantics::{strict_binary, unstated};
 pub use sim::{
     Access, Answer, Clock, Domain, Handlers, OpSignature, Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed,
     SimType, Sleep, StepFootprint, Stream, TaskId, Wakeup,

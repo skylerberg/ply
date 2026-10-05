@@ -356,6 +356,9 @@ pub struct Layouts {
     /// Per constructor, what its type's module states its values are compared and shown through;
     /// empty for a unit that states none.
     stated: Box<[(Stated, Stated)]>,
+    /// Per constructor, the arithmetic its type's module states, by [`ply_eval::instances`]'
+    /// roles; empty for a unit that states none.
+    numeric: Box<[[Stated; 5]]>,
 }
 
 /// A function a type's module states its values go through, as a unit holds it.
@@ -412,6 +415,7 @@ impl Layouts {
             width: 0,
             entry_shape,
             stated: Box::default(),
+            numeric: Box::default(),
         }
     }
 
@@ -421,9 +425,21 @@ impl Layouts {
         self.stated = if none { Box::default() } else { stated.into() };
     }
 
-    /// Whether any type of the unit states a `key` or a `show`.
+    /// Each constructor's arithmetic, by its index.
+    pub fn state_numeric(&mut self, numeric: Vec<[Stated; 5]>) {
+        let none = numeric.iter().all(|s| *s == [Stated::No; 5]);
+        self.numeric = if none { Box::default() } else { numeric.into() };
+    }
+
+    /// Whether any type of the unit states a `key`, a `show` or a `numeric`.
     pub fn states_any(&self) -> bool {
-        !self.stated.is_empty()
+        !self.stated.is_empty() || !self.numeric.is_empty()
+    }
+
+    pub fn numeric(&self, ctor: u32, role: usize) -> Stated {
+        self.numeric
+            .get(ctor as usize)
+            .map_or(Stated::No, |s| s[role])
     }
 
     pub fn key(&self, ctor: u32) -> Stated {

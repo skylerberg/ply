@@ -4,6 +4,16 @@ use crate::value::{Decimal, Fixed, FixedOp, Value, type_error, values_equal};
 use crate::{BinOp, Diagnostic, Span, codes};
 
 #[inline(never)]
+/// Arithmetic at a constructor's value whose type states none, or whose function failed, which
+/// the unit running it then holds as the entry's failure.
+pub fn unstated(span: Span, v: &Value) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("arithmetic on a `{}` did not answer", v.type_name()),
+    )
+    .primary(span, "computed here")
+}
+
 pub fn strict_binary(
     op: BinOp,
     l: &Value,
@@ -48,6 +58,8 @@ pub fn strict_binary(
                 (Value::Str(a), Value::Str(b)) => a.as_ref().cmp(b.as_ref()),
                 (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
                 (Value::Char(a), Value::Char(b)) => a.cmp(b),
+                // A type that states `numeric` is ordered by its `key`.
+                (Value::Ctor { .. }, Value::Ctor { .. }) => l.cmp(r),
                 (
                     Value::Int(_)
                     | Value::Fixed(_)
@@ -77,6 +89,16 @@ pub fn strict_binary(
         }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
             match (l, r) {
+                (Value::Ctor { .. }, Value::Ctor { .. }) => {
+                    let role = match op {
+                        BinOp::Add => crate::instances::ADD,
+                        BinOp::Sub => crate::instances::SUB,
+                        BinOp::Mul => crate::instances::MUL,
+                        _ => return Err(type_error(lspan, "division", "a builtin number", l)),
+                    };
+                    return crate::instances::numeric(role, &[l.clone(), r.clone()])
+                        .ok_or_else(|| unstated(span, l));
+                }
                 (Value::Float(a), Value::Float(b)) => return float_arithmetic(op, *a, *b, span),
                 (Value::Decimal(a), Value::Decimal(b)) => {
                     return decimal_arithmetic(op, *a, *b, rspan, span);
