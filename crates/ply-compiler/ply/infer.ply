@@ -8577,9 +8577,10 @@ fn check_component(
     let body_row = resolve_row_in(c, at(bodies.rows, slot));
     // An unwritten row the body overran is reported already; its callers are checked against what
     // the body performs, so one check names every row the program has to write.
+    // A `const` publishes the empty row whatever its body raises: the build saw it raise nothing.
     let overran = match def.effects {
       Some(_) -> false,
-      None -> len(body_row.atoms) > 0 || body_row.tail != None,
+      None -> def.baked == None && (len(body_row.atoms) > 0 || body_row.tail != None),
     };
     let fn_ty = if overran { fn_type(sig.params, sig.ret, body_row) } else { sig.fn_ty };
     let g: Generalized = generalize(c.subst, c.env, fn_ty);
@@ -8875,11 +8876,15 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
     },
   );
   let popped: Checker = { ..checked, env: env_pop(checked.env) };
+  let shaped: Checker = match def.baked {
+    Some(at) -> check_const_shape(popped, def, at, signature),
+    None -> popped,
+  };
   let rowed: Checker = match signature.declared {
-    Some(declared) -> check_upper_bound(popped, def, declared, body.row),
+    Some(declared) -> check_upper_bound(shaped, def, declared, body.row),
     None -> {
-      let u = unify_row(popped.subst, popped.fresh, signature.published_row, body.row);
-      let c = with_unified(popped, u);
+      let u = unify_row(shaped.subst, shaped.fresh, signature.published_row, body.row);
+      let c = with_unified(shaped, u);
       match u.error {
         Some(e) -> report_unify(c, e, expr_span(def.body), b"inferred effect row"),
         None -> c,
@@ -9162,7 +9167,10 @@ fn check_upper_bound(
   inferred: Row,
 ) -> Checker / {abort.raise} =
   match def.effects {
-    None -> check_unwritten(checker, def, inferred),
+    None -> match def.baked {
+      Some(at) -> check_const_row(checker, def, at, inferred),
+      None -> check_unwritten(checker, def, inferred),
+    },
     Some(_) -> match schema_of(at(checker.modules, checker.module).module, def) {
       None -> check_written(checker, def, declared, inferred),
       // A schema's guard and body are a law's: what they may not perform is said as it is of one.
@@ -9274,6 +9282,160 @@ fn folded(
     rest: filter(rest, |a: Atom|
       !fold(rest, false, |hit: Bool, x: Atom| hit || (x != a && atom_covers(x, a)))),
   }
+}
+
+fn const_refused(
+  checker: Checker,
+  def: FnDef,
+  at: Span,
+  what: Bytes,
+  primary: Label,
+  notes: List<Bytes>,
+) -> Checker =
+  err_labels(
+    checker,
+    b"E0156",
+    bytes_concat_all([b"`", def.name.name, b"` is `const`, and ", what]),
+    [primary, label_at(checker.module, at, false, b"a build evaluates this and keeps its value")],
+    notes,
+  )
+
+/// What a build can evaluate once and keep as data: a definition nothing is handed to, that writes
+/// no row, and answers no function, `Cell`, `Task`, `Chan` or `Secret`.
+fn check_const_shape(
+  checker: Checker,
+  def: FnDef,
+  at: Span,
+  sig: Signature,
+) -> Checker / {abort.raise} = {
+  let handed = [
+    b"a build evaluates a `const fn` once, before any call of it, so nothing can be handed to it",
+  ];
+  let binders = concat(concat(def.generics.types, def.generics.labels), def.generics.effects);
+  let bound: Checker = match list_at(binders, 0) {
+    None -> checker,
+    Some(b) ->
+      const_refused(
+        checker,
+        def,
+        at,
+        b"binds a parameter of its own",
+        label_at(checker.module, b.span, true, b"a `const fn` binds no type, label or row"),
+        handed,
+      ),
+  };
+  let taken: Checker = match list_at(def.params, 0) {
+    None -> bound,
+    Some(p) ->
+      const_refused(
+        bound,
+        def,
+        at,
+        b"takes a parameter",
+        label_at(bound.module, p.span, true, b"a `const fn` takes none"),
+        handed,
+      ),
+  };
+  let rowed: Checker = match def.effects {
+    None -> taken,
+    Some(r) ->
+      const_refused(
+        taken,
+        def,
+        at,
+        b"writes a row",
+        label_at(taken.module, r.span, true, b"a `const fn` writes none"),
+        [
+          b"a `const fn` performs nothing: what its body could raise, the build that evaluates it sees it not raise",
+        ],
+      ),
+  };
+  // A type parameter is refused above; the type it leaves open says nothing more.
+  match derivable(DBin, resolve(rowed, sig.ret), algebraic_shapes(rowed), []) {
+    None -> rowed,
+    Some(b) -> match b.why {
+      Unconstrained(_) -> rowed,
+      why ->
+        const_refused(
+          rowed,
+          def,
+          at,
+          b"answers a value a build cannot keep",
+          label_at(
+            rowed.module,
+            match def.ret { Some(t) -> ty_span(t), None -> def.name.span },
+            true,
+            bytes_concat_all([
+              b"holds `",
+              print_ty(printer_new(), b.ty).text,
+              b"`, ",
+              match why {
+                HoldsFunction -> b"a function",
+                HoldsHandle -> b"which names a location rather than a value",
+                HoldsSecret -> b"a credential",
+                _ -> b"which has no stored form",
+              },
+            ]),
+          ),
+          [
+            b"a build keeps a `const fn`'s value as data, which a function, a `Cell`, a `Task`, a `Chan` and a `Secret` are not",
+          ],
+        ),
+    },
+  }
+}
+
+/// A build evaluates a `const fn` where nothing answers an effect: its body may raise, which the
+/// build sees it not do, and performs nothing else, a call that may not return included.
+fn check_const_row(
+  unclosed: Checker,
+  def: FnDef,
+  at: Span,
+  inferred: Row,
+) -> Checker / {abort.raise} = {
+  let checker: Checker = match resolve_row_in(unclosed, inferred).tail {
+    None -> unclosed,
+    Some(v) -> {
+      let u = unify_row(unclosed.subst, unclosed.fresh, row_empty(), row_open(v));
+      match u.error { Some(_) -> unclosed, None -> with_unified(unclosed, u) }
+    },
+  };
+  fold(
+    filter(resolve_row_in(checker, inferred).atoms, |atom: Atom| !is_raise(atom.mode)),
+    checker,
+    |c: Checker, atom: Atom| {
+      let site = site_for(c, atom);
+      let (module, span) = match site {
+        Some(s) -> (s.module, s.span),
+        None -> (c.module, expr_span(def.body)),
+      };
+      if is_diverges(atom) {
+        const_refused(
+          c,
+          def,
+          at,
+          b"may not return",
+          label_at(module, span, true, b"this call may not return"),
+          [b"a build evaluates a `const fn`, so it ends: call only what ends"],
+        )
+      } else {
+        const_refused(
+          c,
+          def,
+          at,
+          bytes_concat_all([b"its body performs `", atom_text(atom), b"`"]),
+          label_at(module, span, true, match site {
+            Some(s) -> site_label([], s),
+            None -> b"performed in this body",
+          }),
+          [
+            b"a build evaluates a `const fn` before the program runs, where nothing answers an effect: its body may raise, and performs nothing else",
+            b"read a file with `embed`, and handle any other effect inside the body",
+          ],
+        )
+      }
+    },
+  )
 }
 
 /// With no `/` the row is empty: what the body performs or forwards is reported at once, with the
@@ -9436,7 +9598,24 @@ fn unwritten_divergence(
   match ending {
     Diverges(d) -> if d.through != None
         || fold(resolve_row_in(checker, sig.published_row).atoms, false, |found: Bool, a: Atom|
-          found || is_diverges(a)) { checker } else {
+          found || is_diverges(a)) { checker } else if def.baked != None {
+      const_refused(
+        checker,
+        def,
+        match def.baked { Some(at) -> at, None -> def.name.span },
+        b"may not return",
+        label_at(
+          checker.module,
+          {
+            start: start_of(d.at.caller) + d.at.span.start,
+            end: start_of(d.at.caller) + d.at.span.end,
+          },
+          true,
+          b"this call back into its group is not seen to descend",
+        ),
+        [b"a build evaluates a `const fn`, so it ends: call only what ends"],
+      )
+    } else {
       report(
         checker,
         error_with_labels(
@@ -15459,6 +15638,59 @@ test "a binder named like a definition reads the binder, so it ties no definitio
   assert_eq(
     check_codes(
       b"fn words(xs: List<String>) -> Int / {abort.raise} = match xs { [] -> 0, [w, ..rest] -> string_len(joined([string_slice(w, 0, 1)])) + words(rest) }\nfn joined(words: List<String>) -> String = fold(words, \"\", |acc: String, w: String| acc ++ w)",
+    ),
+    [],
+  )
+}
+
+test "a `const fn` takes nothing, binds nothing and writes no row" {
+  assert_eq(check_codes(b"const fn table() -> List<Int> = [1, 2]"), []);
+  assert_eq(check_codes(b"const fn table(n: Int) -> List<Int> = [n]"), [b"E0156"]);
+  assert_eq(check_codes(b"const fn table<a>() -> List<a> = []"), [b"E0156"]);
+  assert_eq(check_codes(b"const fn table() -> Int / {abort.raise} = 1"), [b"E0156"])
+}
+
+test "a `const fn` may raise, and its callers read no raise of it" {
+  let halved = |head: Bytes|
+    check_codes(
+      bytes_concat_all([
+        head,
+        b" half() -> Int = 10 / zero()\nfn zero() -> Int = 0\nfn twice() -> Int = half() + half()",
+      ]),
+    );
+  assert_eq(halved(b"const fn"), []);
+  // Written without `const`, the raise is its own to write, and its caller's.
+  assert_eq(halved(b"fn"), [b"E0302", b"E0302"])
+}
+
+test "a `const fn` performs nothing but a raise, and ends" {
+  assert_eq(
+    check_codes(
+      b"effect log { write emit(Bytes) -> Unit }\nconst fn noisy() -> Int = { log.emit(b\"x\"); 1 }",
+    ),
+    [b"E0156"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\nconst fn never() -> Int = spin(0)",
+    ),
+    [b"E0156"],
+  );
+  assert_eq(check_codes(b"const fn never() -> Int = never()"), [b"E0156"])
+}
+
+test "a `const fn` answers a value a build can keep" {
+  assert_eq(check_codes(b"const fn f() -> (Int) -> Int = |x: Int| x"), [b"E0156"]);
+  assert_eq(
+    check_codes(
+      b"type Held = | Held((Int) -> Int)\nconst fn f() -> List<Held> = [Held(|x: Int| x)]",
+    ),
+    [b"E0156"],
+  );
+  assert_eq(check_codes(b"const fn f() -> Option<Secret<String>> = None"), [b"E0156"]);
+  assert_eq(
+    check_codes(
+      b"type Row = { name: String, at: Int }\nconst fn rows() -> Array<Row> = array_of_list([{ name: \"a\", at: 1 }])",
     ),
     [],
   )

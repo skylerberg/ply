@@ -146,7 +146,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `new` | right after the `=` of a `type` declaration |
 | `law`, `host`, `schema`, `forall`, `cost` | `law "..."`, `law/host` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
-| `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
+| `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
 | `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
@@ -531,6 +531,50 @@ file reruns exactly when the file changes, and is cached while it does not. A
 path that does not exist, a directory handed to `embed`, a file handed to
 `embed_dir`, or a file that cannot be read is `E0146`, which refuses the load. A
 module that declares or imports its own `embed` or `embed_dir` calls that one.
+
+### 3.5 Constants a build keeps
+
+```ply
+type Status = { code: Int, reason: String }
+
+const fn statuses() -> Array<Status> = parsed(embed("status_codes.csv"))
+```
+
+A `const fn` is a definition a build evaluates once and keeps the value of: a
+table made from a data file is made when the program is built, and a run reads
+it. It takes no parameter, binds no type, label or row, and writes no row; its
+body may raise and performs nothing else, a call that may not return included
+(§5.10); and it answers a value that is data, so no function, `Cell`, `Task`,
+`Chan` or `Secret` at any depth. Anything else is `E0156`. Its row is empty
+whatever its body could raise, as a tagged literal's is (§2.3): the build saw it
+raise nothing. `pub const fn` publishes it; `const` goes with neither
+`transparent` nor `reuse`.
+
+`ply check`, `ply run`, `ply test`, `ply prove` and `ply build` evaluate each
+`const fn` the program holds before they do anything else with the load (§16),
+under a budget of 100000000 calls. One that raises is `E0157`, saying what it
+raised and where; one that spends the budget, or whose value takes more than
+16777216 bytes kept, is `E0158`. Each is placed at the definition, and nothing
+of the program runs. The value is kept in the toolchain's cache (§8.6) under the
+definition's hash, which covers its body, all it reaches and the bytes of every
+file it embeds (§3.4): an edit to any of those evaluates it again, and nothing
+else does but another `ply`.
+
+Every unit emitted after that holds the value as data in place of the body, a
+built artifact's among them (§15). A call of the definition reads the value,
+laid out by the run's first read of it, and enters nothing of the body:
+`metered` (§8.1) counts no step and no allocation for it. A program no build
+kept the values of, such as a mutant (§8.5) or the mixture a bisection runs
+(§8.4), evaluates the body in its place, once a run, as it does any definition
+that takes nothing; the value is the same either way, since the body is pure.
+
+A value is kept as it is laid out, so a table that is compact is one that reads
+quickly. An `Array` holds a word an element, and an `Int` within 63 bits or a
+width below 64 is held in that word: an `Array` of those is one object, kept as
+its words and read back in one piece, as a `Bytes` or a `String` is. Any other
+element is an object of its own, made when the value is read: an `Array` of
+30,000 records is 30,001 objects. A map is kept in its order and read back
+without comparing a key, and what a value shares is kept once.
 
 ## 4. Types
 
@@ -1632,7 +1676,8 @@ counts them; `allocations`, the objects it built; and `performs`, each atom it
 performed with how many times, ordered by the atom's qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
-under either profile (§8.6):
+under either profile (§8.6); a `const fn` a build kept the value of costs
+nothing to read (§3.5):
 
 ```ply
 test "ten more elements cost twenty more steps: one in each closure" {
@@ -1799,7 +1844,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each tagged literal's verdict, kept under the hash of all its parser reaches and its text (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -2332,7 +2377,8 @@ container as text.
 file (default `<entry module>.plyx`): its definitions by hash, the same
 definitions printed back to source without tests, laws, comments or anything
 unreached, and the runnable `ply run` loads — that source checked again, its
-front end's answer and its compiled unit — so a run of it runs no front end.
+front end's answer and its compiled unit, which holds the value of each
+`const fn` (§3.5) — so a run of it runs no front end and evaluates none of them.
 The BLAKE3 digest covers those and the entry point, so an edit nothing reaches
 leaves it unchanged; a failure raised by a run of it carries no line number. A
 part that does not agree with the rest — a body under a hash that does not name
@@ -2722,6 +2768,16 @@ to settle, as its tests are, and `compiler.load` settles none: there, as in any
 load nothing settled, a literal whose parser refuses it ends the run where it
 is read (`E0502`).
 
+The same commands evaluate each `const fn` the program holds (§3.5), whichever
+package declares it, on a machine of its own after the literals' and under its
+own budget: its value is kept in the toolchain's cache under the definition's
+hash and the toolchain, and a definition is entered again only after an edit to
+something it reaches or to a file it embeds. One that raises is entered by each
+load until it is mended, so its diagnostic names the place as the sources stand.
+A module that declares one is read as its stub like any other: the value is the
+definition's, wherever its body is read from. `compiler.load` evaluates none, and
+there a `const fn` is a definition that takes nothing, evaluated once a run.
+
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements, and keeps a doc comment directly above what it
 documents; it prints `formatted PATH` per file it changed
@@ -2828,6 +2884,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0152` | a tagged literal whose tag's `literal`, or `compile` or `fill` for one with holes, is not what a tagged literal calls |
 | `E0153` | a tagged literal its parser refuses |
 | `E0154` | a tagged literal whose parser raised or spent its budget |
+| `E0156` | a `const fn` that takes or binds a parameter, writes a row, performs more than a raise, may not return, or answers a value a build cannot keep |
+| `E0157` | a `const fn` that raised when the build evaluated it |
+| `E0158` | a `const fn` that spent the build's budget, in calls or in the size of its value |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
