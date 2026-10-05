@@ -1,0 +1,1668 @@
+//! Semantic Versioning 2.0.0: versions, their precedence, and the ranges Cargo writes over them.
+//!
+//! A `Version` is three counts, the identifiers of a pre-release and the identifiers of build
+//! metadata. `parse` reads exactly the specification's grammar and says where and why it refuses
+//! any other text, and it bounds what the specification leaves open: a count or a numeric
+//! identifier past what an `Int` holds is refused. `coerce` is the lenient reader, apart from it.
+//!
+//! `==`, `compare`, `digest` and a `Map`'s keys read a version through its precedence, §11 of the
+//! specification: the counts as numbers, a pre-release below its release, numeric identifiers as
+//! numbers and below alphanumeric ones, those in ASCII order, and a longer list of identifiers
+//! above its prefix. Build metadata is kept in the value and written by `render`, and is no part
+//! of precedence, so `1.0.0+a == 1.0.0+b`; `exact` and `identical` tell the two apart.
+//!
+//! A `Range` is Cargo's version requirement: comparators that must all hold, each an operator
+//! (`=`, `>`, `>=`, `<`, `<=`, `~`, `^`, or none, which is `^`) before a version whose minor and
+//! patch may be left out or written `*`. A comma parts two comparators and may be left out where
+//! blanks part them, as in `>=1.0 <2.0`. npm's `||` and hyphen ranges are refused, and a bare
+//! `1.2.3` is `^1.2.3` as Cargo reads it, not npm's `=1.2.3`. A pre-release satisfies a range only
+//! where a comparator names a pre-release of the same three counts: `1.3.0-rc.1` does not satisfy
+//! `^1.2`, and `1.2.3-rc.2` satisfies `>=1.2.3-rc.1`.
+//!
+//! With `import std.semver`, `semver"1.2.3-rc.1"` is a version checked when the program is, and
+//! with `import std.semver_range`, `semver_range">=1.2, <2"` is a range.
+//!
+//! `std.pkg`'s `Version` is not this type. A manifest's version is three counts with no
+//! pre-release, compared field by field, and a dependency asks a floor of it, not a range;
+//! `counts` and `of_counts` go between the two.
+
+import std.bytes (int_of_ascii, peek, scan)
+import std.laws (agrees, total_order)
+import std.list (all, any, concat, drop_while, flat_map, flatten)
+import std.option (option_map)
+import std.string (join, repeat, replace)
+
+/// One dot-separated part of a pre-release: digits, read as the number they write, or any other
+/// text of letters, digits and `-`.
+pub type Identifier = | Numeric(Int) | Alphanumeric(String)
+
+/// What a version is made of.
+pub type Parts = {
+  major: Int,
+  minor: Int,
+  patch: Int,
+  /// The pre-release's identifiers; none for a release.
+  pre: List<Identifier>,
+  /// The build metadata's identifiers, which precedence does not read.
+  build: List<String>,
+}
+
+/// A version. `of_parts`, `of_counts`, `parse` and `coerce` make the ones the specification
+/// writes; the constructor takes any `Parts`.
+pub type Version = | Version(Parts)
+
+key for Version by precedence_of
+
+show for Version by render
+
+/// What two versions are compared through: a release ranks above every pre-release of its counts.
+fn precedence_of(v: Version) -> (Int, Int, Int, Int, List<(Int, Int, String)>) =
+  match v { Version(p) -> (p.major, p.minor, p.patch, rank(p.pre), ordered(p.pre)) }
+
+fn rank(pre: List<Identifier>) -> Int = if len(pre) == 0 { 1 } else { 0 }
+
+/// Each identifier as what orders it: a numeric one by its number and below every other, which
+/// order as text. `compare` orders a sum's constructors by name, which is not this order.
+fn ordered(pre: List<Identifier>) -> List<(Int, Int, String)> =
+  map(pre, |i: Identifier| match i { Numeric(n) -> (0, n, ""), Alphanumeric(text) -> (1, 0, text) })
+
+fn pre_compare(a: List<Identifier>, b: List<Identifier>) -> Ordering =
+  compare((rank(a), ordered(a)), (rank(b), ordered(b)))
+
+/// The version's parts.
+pub fn parts(v: Version) -> Parts = match v { Version(p) -> p }
+
+/// The version of these parts, or `None` where the specification writes none: a negative count
+/// or numeric identifier, or an identifier that is empty, holds a character other than a letter,
+/// a digit or `-`, or is an `Alphanumeric` of digits alone.
+pub fn of_parts(p: Parts) -> Option<Version> / {abort.raise} =
+  if p.major < 0 || p.minor < 0 || p.patch < 0 { None }
+  else if all(p.pre, pre_written) && all(p.build, is_word) { Some(Version(p)) }
+  else { None }
+
+fn pre_written(i: Identifier) -> Bool / {abort.raise} =
+  match i {
+    Numeric(n) -> n >= 0,
+    Alphanumeric(text) -> is_word(text) && !all_digits(bytes_of_string(text)),
+  }
+
+fn is_word(text: String) -> Bool / {abort.raise} = {
+  let b = bytes_of_string(text);
+  bytes_len(b) > 0 && scan(b, 0, word_bytes()) == bytes_len(b)
+}
+
+fn all_digits(b: Bytes) -> Bool / {abort.raise} = scan(b, 0, digit_bytes()) == bytes_len(b)
+
+/// The three counts, which is what a `std.pkg` `Version` is.
+pub fn counts(v: Version) -> { major: Int, minor: Int, patch: Int } =
+  match v { Version(p) -> { major: p.major, minor: p.minor, patch: p.patch } }
+
+/// The release of three counts, or `None` where one is negative.
+pub fn of_counts(c: { major: Int, minor: Int, patch: Int }) -> Option<Version> =
+  if c.major < 0 || c.minor < 0 || c.patch < 0 { None }
+  else { Some(release(c.major, c.minor, c.patch)) }
+
+fn release(major: Int, minor: Int, patch: Int) -> Version =
+  Version({ major: major, minor: minor, patch: patch, pre: [], build: [] })
+
+/// Whether the version is a pre-release.
+pub fn is_prerelease(v: Version) -> Bool = match v { Version(p) -> len(p.pre) > 0 }
+
+/// A total order that tells apart every two versions written differently: precedence, and for two
+/// of one precedence their build metadata, identifier by identifier as the Rust `semver` crate
+/// orders it. Digits are the number they write and stand below any other text, which is in ASCII
+/// order; of two that write one number the one with fewer leading zeros is first, so
+/// `+9 < +10` and `+1 < +01`.
+pub fn exact(a: Version, b: Version) -> Ordering =
+  match compare(a, b) {
+    Equal -> compare(map(parts(a).build, build_order), map(parts(b).build, build_order)),
+    apart -> apart,
+  }
+
+/// What a build identifier is ordered by: digits by how many follow their leading zeros, those,
+/// and then how many there are in all.
+fn build_order(word: String) -> (Int, Int, String, Int) = {
+  let chars = string_chars(word);
+  if !all(chars, |c: Char| c >= '0' && c <= '9') { (1, 0, word, 0) } else {
+    let number = drop_while(chars, |c: Char| c == '0');
+    (0, len(number), string_of_chars(number), len(chars))
+  }
+}
+
+/// Whether two versions are written alike, build metadata included; `==` does not read it.
+pub fn identical(a: Version, b: Version) -> Bool = exact(a, b) == Equal
+
+// --- Writing ----------------------------------------------------------------
+
+/// The version as the specification writes it, which `parse` reads back.
+pub fn render(v: Version) -> String =
+  match v {
+    Version(p) ->
+      dotted_counts(p.major, Some(p.minor), Some(p.patch)) ++ pre_text(p.pre)
+        ++ (if len(p.build) == 0 { "" } else { "+" ++ join(p.build, ".") }),
+  }
+
+fn dotted_counts(major: Int, minor: Option<Int>, patch: Option<Int>) -> String =
+  int_to_string(major) ++ count_text(minor) ++ count_text(patch)
+
+fn count_text(count: Option<Int>) -> String =
+  match count { None -> "", Some(n) -> "." ++ int_to_string(n) }
+
+fn pre_text(pre: List<Identifier>) -> String =
+  if len(pre) == 0 { "" } else { "-" ++ join(map(pre, identifier_text), ".") }
+
+fn identifier_text(i: Identifier) -> String =
+  match i { Numeric(n) -> int_to_string(n), Alphanumeric(text) -> text }
+
+// --- Reading ----------------------------------------------------------------
+
+/// Why a text is refused.
+pub type Why =
+  /// A count goes here, and no digit stands here.
+  | NoCount
+  /// A count or a numeric identifier is written with a leading zero.
+  | LeadingZero
+  /// A count or a numeric identifier is past what an `Int` holds.
+  | TooLarge
+  /// A version has three counts, and the `.` before the next one is missing.
+  | NoDot
+  /// An identifier has no characters.
+  | EmptyIdentifier
+  /// A character that cannot stand here.
+  | Stray
+  /// A `*` stands for a range's first count, which only the range `*` alone has.
+  | WildcardFirst
+  /// Something other than a `*` follows a `*`.
+  | AfterWildcard
+  /// A range holds more than 32 comparators.
+  | TooMany
+
+/// A refusal, and the character of the text the reader stood at.
+pub type Refusal = { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect semver {
+  /// The text is not a version, or not a range.
+  raise refused(e: Refusal)
+}
+
+/// A refusal's reason as a sentence, which is what a literal's diagnostic says.
+pub fn reason(why: Why) -> String =
+  match why {
+    NoCount -> "a count goes here",
+    LeadingZero -> "a number is written with no leading zero",
+    TooLarge -> "this number is past what an `Int` holds",
+    NoDot -> "a `.` and the next count go here",
+    EmptyIdentifier -> "an identifier goes here",
+    Stray -> "this character cannot stand here",
+    WildcardFirst -> "a `*` for the first count is the whole range",
+    AfterWildcard -> "only a `*` follows a `*`",
+    TooMany -> "a range holds at most 32 comparators",
+  }
+
+/// The version `text` writes, or where and why it is not one.
+pub fn parse(text: String) -> Result<Version, Refusal> / {abort.raise} = try { read(text) }
+
+/// The version `text` writes, raising `semver.refused` where `parse` answers `Err`.
+pub fn read(text: String) -> Version / {semver.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  let major = count_at(b, 0, true);
+  let minor = count_at(b, past_dot(b, major.at), true);
+  let patch = count_at(b, past_dot(b, minor.at), true);
+  ended(b, major.value, minor.value, patch.value, patch.at)
+}
+
+/// What a `semver"..."` literal is checked by: the version the text writes, or the character
+/// that keeps it from being one.
+pub fn literal(text: String) -> Result<Version, { message: String, offset: Int }> / {abort.raise} =
+  match parse(text) {
+    Ok(v) -> Ok(v),
+    Err(refused) -> Err({ message: reason(refused.why), offset: refused.at }),
+  }
+
+/// A version read leniently, as a person or another tool's output writes one: blanks around it, a
+/// leading `v`, one to three counts with the missing ones zero, and leading zeros dropped, then a
+/// pre-release and build metadata as `parse` reads them. `None` for anything else.
+pub fn coerce(text: String) -> Option<Version> / {abort.raise} = {
+  let read = try { coerced(bytes_of_string(string_trim(text))) };
+  match read { Ok(v) -> Some(v), Err(_) -> None }
+}
+
+fn coerced(b: Bytes) -> Version / {semver.refused, abort.raise} = {
+  let first = peek(b, 0);
+  let major = count_at(b, if first == 118 || first == 86 { 1 } else { 0 }, false);
+  let minor = loose_count_at(b, major.at);
+  let patch = loose_count_at(b, minor.at);
+  ended(b, major.value, minor.value, patch.value, patch.at)
+}
+
+fn refuse<a>(at: Int, why: Why) -> a / {semver.refused} = semver.refused({ at: at, why: why })
+
+type Count = { value: Int, at: Int }
+
+fn digit_bytes() -> Bytes = b"0123456789"
+
+fn word_bytes() -> Bytes = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
+
+fn dotted_word_bytes() -> Bytes =
+  b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-."
+
+/// The count written from `at`; a `strict` one has no leading zero.
+fn count_at(b: Bytes, at: Int, strict: Bool) -> Count / {semver.refused, abort.raise} = {
+  let end = scan(b, at, digit_bytes());
+  if end <= at { refuse(at, NoCount) }
+  else if strict && end - at > 1 && bytes_at(b, at) == 48 { refuse(at, LeadingZero) } else {
+    match int_of_ascii(bytes_slice(b, at, end)) {
+      Some(value) -> { value: value, at: end },
+      None -> refuse(at, TooLarge),
+    }
+  }
+}
+
+/// The count after a `.` at `at`, or zero where no `.` stands there.
+fn loose_count_at(b: Bytes, at: Int) -> Count / {semver.refused, abort.raise} =
+  if peek(b, at) == 46 { count_at(b, at + 1, false) } else { { value: 0, at: at } }
+
+fn past_dot(b: Bytes, at: Int) -> Int / {semver.refused, abort.raise} =
+  if peek(b, at) == 46 { at + 1 } else { refuse(at, NoDot) }
+
+/// The version of three counts and what follows them from `at`, which is the rest of the text.
+fn ended(
+  b: Bytes,
+  major: Int,
+  minor: Int,
+  patch: Int,
+  at: Int,
+) -> Version / {semver.refused, abort.raise} = {
+  let tail = tail_at(b, at);
+  if tail.at < bytes_len(b) { refuse(tail.at, Stray) }
+  else { Version({ major: major, minor: minor, patch: patch, pre: tail.pre, build: tail.build }) }
+}
+
+type Tail = { pre: List<Identifier>, build: List<String>, at: Int }
+
+/// A pre-release and then build metadata from `at`, each of which may be absent.
+fn tail_at(b: Bytes, at: Int) -> Tail / {semver.refused, abort.raise} = {
+  let pre = if peek(b, at) == 45 { words_at(b, at + 1) } else { { words: [], at: at } };
+  let build = if peek(b, pre.at) == 43 { words_at(b, pre.at + 1) }
+  else { { words: [], at: pre.at } };
+  {
+    pre: map(pre.words, pre_identifier),
+    build: map(build.words, |w: Word| string_of_bytes(w.text)),
+    at: build.at,
+  }
+}
+
+type Word = { text: Bytes, at: Int }
+
+/// The dot-separated identifiers from `at`, each with where it starts, up to the first byte that
+/// is no part of one.
+fn words_at(b: Bytes, at: Int) -> { words: List<Word>, at: Int } / {semver.refused, abort.raise} = {
+  let end = scan(b, at, dotted_word_bytes());
+  let read = if end <= at { refuse(at, EmptyIdentifier) } else {
+    fold(
+      bytes_split(bytes_slice(b, at, end), b"."),
+      { words: [], at: at },
+      |acc: { words: List<Word>, at: Int }, text: Bytes|
+        if bytes_len(text) == 0 { refuse(acc.at, EmptyIdentifier) } else {
+          { words: push(acc.words, { text: text, at: acc.at }), at: acc.at + bytes_len(text) + 1 }
+        },
+    )
+  };
+  { words: read.words, at: end }
+}
+
+fn pre_identifier(w: Word) -> Identifier / {semver.refused, abort.raise} =
+  if !all_digits(w.text) { Alphanumeric(string_of_bytes(w.text)) }
+  else if bytes_len(w.text) > 1 && bytes_at(w.text, 0) == 48 { refuse(w.at, LeadingZero) }
+  else { match int_of_ascii(w.text) { Some(n) -> Numeric(n), None -> refuse(w.at, TooLarge) } }
+
+// --- Increments -------------------------------------------------------------
+
+/// Which count a release raises.
+pub type Level = | Major | Minor | Patch
+
+/// The next release of `level` after `v`, with no pre-release and no build metadata: the count
+/// raised by one and those below it zero. A pre-release of a version that is already such a
+/// release goes to that release, so `2.0.0-rc.1` raised by `Major` is `2.0.0`.
+pub fn increment(v: Version, level: Level) -> Version = {
+  let p = parts(v);
+  let pre = len(p.pre) > 0;
+  match level {
+    Major -> release(if pre && p.minor == 0 && p.patch == 0 { p.major } else { p.major + 1 }, 0, 0),
+    Minor -> release(p.major, if pre && p.patch == 0 { p.minor } else { p.minor + 1 }, 0),
+    Patch -> release(p.major, p.minor, if pre { p.patch } else { p.patch + 1 }),
+  }
+}
+
+// --- Ranges -----------------------------------------------------------------
+
+/// How a comparator holds a version against its own. `Wildcard` is a comparator written with a
+/// `*` and no operator, `1.2.*`.
+pub type Op = | Exactly | Above | AtLeast | Below | AtMost | Tilde | Caret | Wildcard
+
+/// One comparator of a range. A `minor` or `patch` left out or written `*` is `None`; a `patch`
+/// is written only after a `minor`, and a pre-release only after a `patch`.
+pub type Comparator = {
+  op: Op,
+  major: Int,
+  minor: Option<Int>,
+  patch: Option<Int>,
+  pre: List<Identifier>,
+}
+
+/// The comparators a version must all satisfy; none is `*`, which every release satisfies.
+pub type Range = | Range(List<Comparator>)
+
+show for Range by render_range
+
+/// The range's comparators.
+pub fn comparators(r: Range) -> List<Comparator> = match r { Range(cs) -> cs }
+
+/// The range as Cargo writes it, its comparators parted by `, `; `parse_range` reads it back.
+pub fn render_range(r: Range) -> String =
+  match r { Range(cs) -> if len(cs) == 0 { "*" } else { join(map(cs, comparator_text), ", ") } }
+
+fn comparator_text(c: Comparator) -> String =
+  match c.op {
+    Wildcard ->
+      dotted_counts(c.major, c.minor, c.patch) ++ (if c.patch == None { ".*" } else { "" }),
+    _ -> op_text(c.op) ++ dotted_counts(c.major, c.minor, c.patch) ++ pre_text(c.pre),
+  }
+
+fn op_text(op: Op) -> String =
+  match op {
+    Exactly -> "=",
+    Above -> ">",
+    AtLeast -> ">=",
+    Below -> "<",
+    AtMost -> "<=",
+    Tilde -> "~",
+    Caret -> "^",
+    Wildcard -> "",
+  }
+
+/// The range `text` writes, or where and why it is not one.
+pub fn parse_range(text: String) -> Result<Range, Refusal> / {abort.raise} =
+  try { read_range(text) }
+
+/// The range `text` writes, raising `semver.refused` where `parse_range` answers `Err`. Build
+/// metadata on a comparator is read and dropped.
+pub fn read_range(text: String) -> Range / {semver.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  let at = blanks(b, 0);
+  if is_wildcard(peek(b, at)) && blanks(b, at + 1) == bytes_len(b) { Range([]) }
+  else { Range(comparators_from(b, at)) }
+}
+
+/// `parse_range`, saying why a text is no range as a sentence: what `std.semver_range`'s tag of
+/// ranges is checked by.
+pub fn range_literal(
+  text: String,
+) -> Result<Range, { message: String, offset: Int }> / {abort.raise} =
+  match parse_range(text) {
+    Ok(r) -> Ok(r),
+    Err(refused) -> Err({ message: reason(refused.why), offset: refused.at }),
+  }
+
+fn max_comparators() -> Int = 32
+
+fn blanks(b: Bytes, at: Int) -> Int / {abort.raise} = scan(b, at, b" ")
+
+fn is_wildcard(c: Int) -> Bool = c == 42 || c == 120 || c == 88
+
+fn comparators_from(b: Bytes, at: Int) -> List<Comparator> / {semver.refused, abort.raise} =
+  iterate({ at: at, read: [] }, max_comparators() + 1, |s: { at: Int, read: List<Comparator> }|
+    if len(s.read) == max_comparators() { refuse(s.at, TooMany) } else {
+      let c = comparator_at(b, s.at);
+      let after = blanks(b, c.at);
+      let read = push(s.read, c.comparator);
+      if after == bytes_len(b) { Stop(read) }
+      else if peek(b, after) == 44 { Continue({ at: blanks(b, after + 1), read: read }) }
+      else if after > c.at { Continue({ at: after, read: read }) }
+      else { refuse(after, Stray) }
+    })
+
+type Operator = { op: Op, written: Bool, at: Int }
+
+fn op_at(b: Bytes, at: Int) -> Operator / {abort.raise} = {
+  let c = peek(b, at);
+  let equals = peek(b, at + 1) == 61;
+  if c == 61 { { op: Exactly, written: true, at: at + 1 } }
+  else if c == 62 && equals { { op: AtLeast, written: true, at: at + 2 } }
+  else if c == 62 { { op: Above, written: true, at: at + 1 } }
+  else if c == 60 && equals { { op: AtMost, written: true, at: at + 2 } }
+  else if c == 60 { { op: Below, written: true, at: at + 1 } }
+  else if c == 126 { { op: Tilde, written: true, at: at + 1 } }
+  else if c == 94 { { op: Caret, written: true, at: at + 1 } }
+  else { { op: Caret, written: false, at: at } }
+}
+
+/// A minor or a patch: absent where no `.` stands at `at`, and `wild` where a `*` follows it.
+type Place = { count: Option<Int>, wild: Bool, at: Int }
+
+fn place_at(b: Bytes, at: Int, after_wild: Bool) -> Place / {semver.refused, abort.raise} =
+  if peek(b, at) != 46 { { count: None, wild: false, at: at } }
+  else if is_wildcard(peek(b, at + 1)) { { count: None, wild: true, at: at + 2 } }
+  else if after_wild { refuse(at + 1, AfterWildcard) } else {
+    let n = count_at(b, at + 1, true);
+    { count: Some(n.value), wild: false, at: n.at }
+  }
+
+fn comparator_at(
+  b: Bytes,
+  from: Int,
+) -> { comparator: Comparator, at: Int } / {semver.refused, abort.raise} = {
+  let op = op_at(b, from);
+  let at = blanks(b, op.at);
+  if is_wildcard(peek(b, at)) { refuse(at, WildcardFirst) } else {
+    let major = count_at(b, at, true);
+    let minor = place_at(b, major.at, false);
+    let patch = place_at(b, minor.at, minor.wild);
+    let tail = if patch.count == None { { pre: [], build: [], at: patch.at } }
+    else { tail_at(b, patch.at) };
+    {
+      comparator: {
+        op: if !op.written && (minor.wild || patch.wild) { Wildcard } else { op.op },
+        major: major.value,
+        minor: minor.count,
+        patch: patch.count,
+        pre: tail.pre,
+      },
+      at: tail.at,
+    }
+  }
+}
+
+// --- Matching ---------------------------------------------------------------
+
+/// Whether `v` satisfies every comparator of `r`, and, where `v` is a pre-release, whether one of
+/// them names a pre-release of `v`'s three counts.
+pub fn satisfies(v: Version, r: Range) -> Bool = {
+  let p = parts(v);
+  let cs = comparators(r);
+  all(cs, |c: Comparator| holds(c, p))
+    && (len(p.pre) == 0 || any(cs, |c: Comparator| names_pre_of(c, p)))
+}
+
+/// The greatest of `versions` that satisfies `r`, the first of them where several are one
+/// precedence apart in build metadata alone.
+pub fn max_satisfying(versions: List<Version>, r: Range) -> Option<Version> =
+  best_satisfying(versions, r, Greater)
+
+/// The least of `versions` that satisfies `r`, the first of them where several are one precedence.
+pub fn min_satisfying(versions: List<Version>, r: Range) -> Option<Version> =
+  best_satisfying(versions, r, Less)
+
+fn best_satisfying(versions: List<Version>, r: Range, better: Ordering) -> Option<Version> =
+  fold(versions, None, |best: Option<Version>, v: Version|
+    if !satisfies(v, r) { best } else {
+      match best {
+        None -> Some(v),
+        Some(held) -> if compare(v, held) == better { Some(v) } else { best },
+      }
+    })
+
+fn names_pre_of(c: Comparator, v: Parts) -> Bool =
+  c.major == v.major && c.minor == Some(v.minor) && c.patch == Some(v.patch) && len(c.pre) > 0
+
+fn holds(c: Comparator, v: Parts) -> Bool =
+  match c.op {
+    Exactly | Wildcard -> at_version(c, v),
+    Above -> beside(c, v) == Greater,
+    AtLeast -> at_version(c, v) || beside(c, v) == Greater,
+    Below -> beside(c, v) == Less,
+    AtMost -> at_version(c, v) || beside(c, v) == Less,
+    Tilde -> tilde(c, v),
+    Caret -> caret(c, v),
+  }
+
+fn written_as(place: Option<Int>, count: Int) -> Bool =
+  match place { None -> true, Some(n) -> n == count }
+
+fn at_version(c: Comparator, v: Parts) -> Bool =
+  v.major == c.major && written_as(c.minor, v.minor) && written_as(c.patch, v.patch)
+    && v.pre == c.pre
+
+/// Where `v` stands beside the counts `c` writes: `Equal` where it is neither above nor below
+/// them, which a comparator with a count left out holds of every version that agrees on the rest.
+fn beside(c: Comparator, v: Parts) -> Ordering =
+  if v.major != c.major { compare(v.major, c.major) } else {
+    match ((c.minor, c.patch)) {
+      (Some(minor), _) if v.minor != minor -> compare(v.minor, minor),
+      (Some(_), Some(patch)) if v.patch != patch -> compare(v.patch, patch),
+      (Some(_), Some(_)) -> pre_compare(v.pre, c.pre),
+      _ -> Equal,
+    }
+  }
+
+fn tilde(c: Comparator, v: Parts) -> Bool =
+  v.major == c.major && written_as(c.minor, v.minor)
+    && (match c.patch {
+      Some(patch) if v.patch != patch -> v.patch > patch,
+      _ -> pre_compare(v.pre, c.pre) != Less,
+    })
+
+fn caret(c: Comparator, v: Parts) -> Bool =
+  if v.major != c.major { false } else {
+    match ((c.minor, c.patch)) {
+      (None, _) -> true,
+      (Some(minor), None) -> if c.major > 0 { v.minor >= minor } else { v.minor == minor },
+      (Some(minor), Some(patch)) -> if c.major > 0 && v.minor != minor { v.minor > minor }
+      else if c.major == 0 && (v.minor != minor || (minor == 0 && v.patch != patch)) { false }
+      else if v.patch != patch { v.patch > patch }
+      else { pre_compare(v.pre, c.pre) != Less },
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn version(text: String) -> Version / {abort.raise} =
+  match parse(text) { Ok(v) -> v, Err(_) -> panic("`" ++ text ++ "` is a fixture's version") }
+
+fn range(text: String) -> Range / {abort.raise} =
+  match parse_range(text) { Ok(r) -> r, Err(_) -> panic("`" ++ text ++ "` is a fixture's range") }
+
+/// semver.org's list of valid versions, the test strings its regular expressions link to, but
+/// for the one whose counts no `Int` holds, which stands in `spec_refused`.
+fn spec_versions() -> List<String> =
+  [
+    "0.0.4",
+    "1.2.3",
+    "10.20.30",
+    "1.1.2-prerelease+meta",
+    "1.1.2+meta",
+    "1.1.2+meta-valid",
+    "1.0.0-alpha",
+    "1.0.0-beta",
+    "1.0.0-alpha.beta",
+    "1.0.0-alpha.beta.1",
+    "1.0.0-alpha.1",
+    "1.0.0-alpha0.valid",
+    "1.0.0-alpha.0valid",
+    "1.0.0-alpha-a.b-c-somethinglong+build.1-aef.1-its-okay",
+    "1.0.0-rc.1+build.1",
+    "2.0.0-rc.1+build.123",
+    "1.2.3-beta",
+    "10.2.3-DEV-SNAPSHOT",
+    "1.2.3-SNAPSHOT-123",
+    "1.0.0",
+    "2.0.0",
+    "1.1.7",
+    "2.0.0+build.1848",
+    "2.0.1-alpha.1227",
+    "1.0.0-alpha+beta",
+    "1.2.3----RC-SNAPSHOT.12.9.1--.12+788",
+    "1.2.3----R-S.12.9.1--.12+meta",
+    "1.2.3----RC-SNAPSHOT.12.9.1--.12",
+    "1.0.0+0.build.1-rc.10000aaa-kk-0.1",
+    "1.0.0-0A.is.legal",
+  ]
+
+/// The greatest count and numeric identifier an `Int` holds, and node-semver's "too big", one
+/// digit past the greatest integer a JavaScript number counts by, which an `Int` holds.
+fn own_versions() -> List<String> =
+  [
+    "9223372036854775807.0.0-9223372036854775807",
+    "90071992547409910.0.0",
+    "0.90071992547409910.0",
+    "0.0.90071992547409910",
+  ]
+
+test "{text} is a version, and is written as it was read" for text: String in concat(
+    spec_versions(),
+    own_versions(),
+  ) {
+  match parse(text) {
+    Ok(v) -> {
+      assert_eq(render(v), text);
+      assert_eq(of_parts(parts(v)), Some(v));
+      assert(identical(v, version(text)))
+    },
+    Err(refused) -> panic(reason(refused.why) ++ " at " ++ int_to_string(refused.at)),
+  }
+}
+
+type Parsed = {
+  text: String,
+  major: Int,
+  minor: Int,
+  patch: Int,
+  pre: List<Identifier>,
+  build: List<String>,
+}
+
+/// What the Rust `semver` crate's `test_parse` reads each text as. It writes a pre-release as one
+/// text, which is split here as the specification reads its identifiers.
+fn crate_versions() -> List<Parsed> =
+  [
+    { text: "1.2.3", major: 1, minor: 2, patch: 3, pre: [], build: [] },
+    {
+      text: "1.2.3-alpha1",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Alphanumeric("alpha1")],
+      build: [],
+    },
+    { text: "1.2.3+build5", major: 1, minor: 2, patch: 3, pre: [], build: ["build5"] },
+    { text: "1.2.3+5build", major: 1, minor: 2, patch: 3, pre: [], build: ["5build"] },
+    {
+      text: "1.2.3-alpha1+build5",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Alphanumeric("alpha1")],
+      build: ["build5"],
+    },
+    {
+      text: "1.2.3-1.alpha1.9+build5.7.3aedf",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Numeric(1), Alphanumeric("alpha1"), Numeric(9)],
+      build: ["build5", "7", "3aedf"],
+    },
+    {
+      text: "1.2.3-0a.alpha1.9+05build.7.3aedf",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Alphanumeric("0a"), Alphanumeric("alpha1"), Numeric(9)],
+      build: ["05build", "7", "3aedf"],
+    },
+    {
+      text: "0.4.0-beta.1+0851523",
+      major: 0,
+      minor: 4,
+      patch: 0,
+      pre: [Alphanumeric("beta"), Numeric(1)],
+      build: ["0851523"],
+    },
+    {
+      text: "1.1.0-beta-10",
+      major: 1,
+      minor: 1,
+      patch: 0,
+      pre: [Alphanumeric("beta-10")],
+      build: [],
+    },
+  ]
+
+/// node-semver's `valid-versions.js`, but for `v1.2.3`, which only `coerce` reads.
+fn node_versions() -> List<Parsed> =
+  [
+    { text: "1.0.0", major: 1, minor: 0, patch: 0, pre: [], build: [] },
+    { text: "2.1.0", major: 2, minor: 1, patch: 0, pre: [], build: [] },
+    { text: "3.2.1", major: 3, minor: 2, patch: 1, pre: [], build: [] },
+    { text: "1.2.3-0", major: 1, minor: 2, patch: 3, pre: [Numeric(0)], build: [] },
+    { text: "1.2.3-123", major: 1, minor: 2, patch: 3, pre: [Numeric(123)], build: [] },
+    {
+      text: "1.2.3-1.2.3",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Numeric(1), Numeric(2), Numeric(3)],
+      build: [],
+    },
+    { text: "1.2.3-1a", major: 1, minor: 2, patch: 3, pre: [Alphanumeric("1a")], build: [] },
+    { text: "1.2.3-a1", major: 1, minor: 2, patch: 3, pre: [Alphanumeric("a1")], build: [] },
+    { text: "1.2.3-alpha", major: 1, minor: 2, patch: 3, pre: [Alphanumeric("alpha")], build: [] },
+    {
+      text: "1.2.3-alpha.1",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Alphanumeric("alpha"), Numeric(1)],
+      build: [],
+    },
+    {
+      text: "1.2.3-alpha-1",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Alphanumeric("alpha-1")],
+      build: [],
+    },
+    {
+      text: "1.2.3-alpha-.-beta",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Alphanumeric("alpha-"), Alphanumeric("-beta")],
+      build: [],
+    },
+    { text: "1.2.3+456", major: 1, minor: 2, patch: 3, pre: [], build: ["456"] },
+    { text: "1.2.3+build", major: 1, minor: 2, patch: 3, pre: [], build: ["build"] },
+    { text: "1.2.3+new-build", major: 1, minor: 2, patch: 3, pre: [], build: ["new-build"] },
+    { text: "1.2.3+build.1", major: 1, minor: 2, patch: 3, pre: [], build: ["build", "1"] },
+    { text: "1.2.3+build.1a", major: 1, minor: 2, patch: 3, pre: [], build: ["build", "1a"] },
+    { text: "1.2.3+build.a1", major: 1, minor: 2, patch: 3, pre: [], build: ["build", "a1"] },
+    { text: "1.2.3+build.alpha", major: 1, minor: 2, patch: 3, pre: [], build: ["build", "alpha"] },
+    {
+      text: "1.2.3+build.alpha.beta",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [],
+      build: ["build", "alpha", "beta"],
+    },
+    {
+      text: "1.2.3-alpha+build",
+      major: 1,
+      minor: 2,
+      patch: 3,
+      pre: [Alphanumeric("alpha")],
+      build: ["build"],
+    },
+  ]
+
+test "{c.text} reads as the parts its source says" for c: Parsed in concat(
+    crate_versions(),
+    node_versions(),
+  ) {
+  assert_eq(parts(version(c.text)), {
+    major: c.major,
+    minor: c.minor,
+    patch: c.patch,
+    pre: c.pre,
+    build: c.build,
+  });
+  assert_eq(render(version(c.text)), c.text)
+}
+
+type Refused = { text: String, at: Int, why: Why }
+
+/// semver.org's list of invalid versions, and last the one of its valid versions that an `Int`
+/// cannot hold. Where and why each is refused is this reader's to say.
+fn spec_refused() -> List<Refused> =
+  [
+    { text: "1", at: 1, why: NoDot },
+    { text: "1.2", at: 3, why: NoDot },
+    { text: "1.2.3-0123", at: 6, why: LeadingZero },
+    { text: "1.2.3-0123.0123", at: 6, why: LeadingZero },
+    { text: "1.1.2+.123", at: 6, why: EmptyIdentifier },
+    { text: "+invalid", at: 0, why: NoCount },
+    { text: "-invalid", at: 0, why: NoCount },
+    { text: "-invalid+invalid", at: 0, why: NoCount },
+    { text: "-invalid.01", at: 0, why: NoCount },
+    { text: "alpha", at: 0, why: NoCount },
+    { text: "alpha.beta", at: 0, why: NoCount },
+    { text: "alpha.beta.1", at: 0, why: NoCount },
+    { text: "alpha.1", at: 0, why: NoCount },
+    { text: "alpha+beta", at: 0, why: NoCount },
+    { text: "alpha_beta", at: 0, why: NoCount },
+    { text: "alpha.", at: 0, why: NoCount },
+    { text: "alpha..", at: 0, why: NoCount },
+    { text: "beta", at: 0, why: NoCount },
+    { text: "1.0.0-alpha_beta", at: 11, why: Stray },
+    { text: "-alpha.", at: 0, why: NoCount },
+    { text: "1.0.0-alpha..", at: 12, why: EmptyIdentifier },
+    { text: "1.0.0-alpha..1", at: 12, why: EmptyIdentifier },
+    { text: "1.0.0-alpha...1", at: 12, why: EmptyIdentifier },
+    { text: "1.0.0-alpha....1", at: 12, why: EmptyIdentifier },
+    { text: "1.0.0-alpha.....1", at: 12, why: EmptyIdentifier },
+    { text: "1.0.0-alpha......1", at: 12, why: EmptyIdentifier },
+    { text: "1.0.0-alpha.......1", at: 12, why: EmptyIdentifier },
+    { text: "01.1.1", at: 0, why: LeadingZero },
+    { text: "1.01.1", at: 2, why: LeadingZero },
+    { text: "1.1.01", at: 4, why: LeadingZero },
+    { text: "1.2.3.DEV", at: 5, why: Stray },
+    { text: "1.2-SNAPSHOT", at: 3, why: NoDot },
+    { text: "1.2.31.2.3----RC-SNAPSHOT.12.09.1--..12+788", at: 6, why: Stray },
+    { text: "1.2-RC-SNAPSHOT", at: 3, why: NoDot },
+    { text: "-1.0.3-gamma+b7718", at: 0, why: NoCount },
+    { text: "+justmeta", at: 0, why: NoCount },
+    { text: "9.8.7+meta+meta", at: 10, why: Stray },
+    { text: "9.8.7-whatever+meta+meta", at: 19, why: Stray },
+    {
+      text: "99999999999999999999999.999999999999999999.99999999999999999----RC-SNAPSHOT.12.09.1--------------------------------..12",
+      at: 0,
+      why: TooLarge,
+    },
+    { text: "99999999999999999999999.999999999999999999.99999999999999999", at: 0, why: TooLarge },
+  ]
+
+/// The texts the Rust `semver` crate's `test_parse` refuses. Its counts are `u64`s and this
+/// reader's are `Int`s; the count refused here is past both.
+fn crate_refused() -> List<Refused> =
+  [
+    { text: "", at: 0, why: NoCount },
+    { text: "  ", at: 0, why: NoCount },
+    { text: "1", at: 1, why: NoDot },
+    { text: "1.2", at: 3, why: NoDot },
+    { text: "1.2.3-", at: 6, why: EmptyIdentifier },
+    { text: "a.b.c", at: 0, why: NoCount },
+    { text: "1.2.3 abc", at: 5, why: Stray },
+    { text: "1.2.3-01", at: 6, why: LeadingZero },
+    { text: "1.2.3++", at: 6, why: EmptyIdentifier },
+    { text: "07", at: 0, why: LeadingZero },
+    { text: "111111111111111111111.0.0", at: 0, why: TooLarge },
+    { text: "8\0", at: 1, why: NoDot },
+  ]
+
+/// What node-semver's `invalid-versions.js` holds that is text: junk, and a count of more
+/// digits than node reads. Its "too big" counts are versions here, in `own_versions`. Last is
+/// `v1.2.3` of its `valid-versions.js`: node reads a leading `v`, and here only `coerce` does.
+fn node_refused() -> List<Refused> =
+  [
+    { text: "hello, world", at: 0, why: NoCount },
+    { text: "xyz", at: 0, why: NoCount },
+    { text: repeat("1", 255) ++ ".0.0", at: 0, why: TooLarge },
+    { text: "v1.2.3", at: 0, why: NoCount },
+  ]
+
+fn own_refused() -> List<Refused> =
+  [
+    { text: "1.2.3+", at: 6, why: EmptyIdentifier },
+    { text: "1.2.3-a.", at: 8, why: EmptyIdentifier },
+    { text: "1.2.3 ", at: 5, why: Stray },
+    { text: " 1.2.3", at: 0, why: NoCount },
+    { text: "1.2.3-\u{e9}", at: 6, why: EmptyIdentifier },
+    { text: "1.2.x", at: 4, why: NoCount },
+    { text: "1.2.3-9223372036854775808", at: 6, why: TooLarge },
+    { text: "9223372036854775808.0.0", at: 0, why: TooLarge },
+  ]
+
+/// A text as a label shows it: a NUL written out, which a terminal would not show.
+fn visible(text: String) -> String / {abort.raise} = replace(text, "\0", "\\0")
+
+test "`{visible(c.text)}` is refused where it stops being a version" for c: Refused in flatten([
+    spec_refused(),
+    crate_refused(),
+    node_refused(),
+    own_refused(),
+  ]) { assert_eq(parse(c.text), Err({ at: c.at, why: c.why })) }
+
+type Step = { lower: String, higher: String }
+
+fn steps(chain: List<String>) -> List<Step> =
+  fold(
+    chain,
+    { steps: [], last: None },
+    |acc: { steps: List<Step>, last: Option<String> }, v: String|
+      {
+        steps: match acc.last {
+          None -> acc.steps,
+          Some(lower) -> push(acc.steps, { lower: lower, higher: v }),
+        },
+        last: Some(v),
+      },
+  ).steps
+
+/// The three examples of the specification's item 11, each least first. The last is the Rust
+/// `semver` crate's `test_spec_order` too.
+fn spec_chains() -> List<List<String>> =
+  [
+    ["1.0.0", "2.0.0", "2.1.0", "2.1.1"],
+    ["1.0.0-alpha", "1.0.0"],
+    [
+      "1.0.0-alpha",
+      "1.0.0-alpha.1",
+      "1.0.0-alpha.beta",
+      "1.0.0-beta",
+      "1.0.0-beta.2",
+      "1.0.0-beta.11",
+      "1.0.0-rc.1",
+      "1.0.0",
+    ],
+  ]
+
+fn own_chains() -> List<List<String>> =
+  [
+    ["1.0.0-0", "1.0.0-1", "1.0.0-10", "1.0.0-A", "1.0.0-a", "1.0.0-a.0", "1.0.0-a-", "1.0.0"],
+    ["0.0.0-0", "0.0.0", "0.0.1", "0.1.0", "0.10.0", "1.0.0-0"],
+  ]
+
+test "{c.lower} precedes {c.higher}" for c: Step in flat_map(
+    concat(spec_chains(), own_chains()),
+    steps,
+  ) {
+  let lower = version(c.lower);
+  let higher = version(c.higher);
+  assert_eq(compare(lower, higher), Less);
+  assert_eq(compare(higher, lower), Greater);
+  assert(lower != higher);
+  assert_eq(exact(lower, higher), Less)
+}
+
+type Pair = { greater: String, lesser: String }
+
+fn lenient_version(text: String) -> Version / {abort.raise} =
+  match coerce(text) { Some(v) -> v, None -> panic("`" ++ text ++ "` is a fixture's version") }
+
+/// node-semver's `comparisons.js`: the first of each is the greater. A leading `v` is node's to
+/// read and `coerce`'s, so `coerce` reads these, and `parse` reads alike each that has none.
+fn node_ordered() -> List<Pair> =
+  [
+    { greater: "0.0.0", lesser: "0.0.0-foo" },
+    { greater: "0.0.1", lesser: "0.0.0" },
+    { greater: "1.0.0", lesser: "0.9.9" },
+    { greater: "0.10.0", lesser: "0.9.0" },
+    { greater: "0.99.0", lesser: "0.10.0" },
+    { greater: "2.0.0", lesser: "1.2.3" },
+    { greater: "v0.0.0", lesser: "0.0.0-foo" },
+    { greater: "v0.0.1", lesser: "0.0.0" },
+    { greater: "v1.0.0", lesser: "0.9.9" },
+    { greater: "v0.10.0", lesser: "0.9.0" },
+    { greater: "v0.99.0", lesser: "0.10.0" },
+    { greater: "v2.0.0", lesser: "1.2.3" },
+    { greater: "0.0.0", lesser: "v0.0.0-foo" },
+    { greater: "0.0.1", lesser: "v0.0.0" },
+    { greater: "1.0.0", lesser: "v0.9.9" },
+    { greater: "0.10.0", lesser: "v0.9.0" },
+    { greater: "0.99.0", lesser: "v0.10.0" },
+    { greater: "2.0.0", lesser: "v1.2.3" },
+    { greater: "1.2.3", lesser: "1.2.3-asdf" },
+    { greater: "1.2.3", lesser: "1.2.3-4" },
+    { greater: "1.2.3", lesser: "1.2.3-4-foo" },
+    { greater: "1.2.3-5-foo", lesser: "1.2.3-5" },
+    { greater: "1.2.3-5", lesser: "1.2.3-4" },
+    { greater: "1.2.3-5-foo", lesser: "1.2.3-5-Foo" },
+    { greater: "3.0.0", lesser: "2.7.2+asdf" },
+    { greater: "1.2.3-a.10", lesser: "1.2.3-a.5" },
+    { greater: "1.2.3-a.b", lesser: "1.2.3-a.5" },
+    { greater: "1.2.3-a.b", lesser: "1.2.3-a" },
+    { greater: "1.2.3-a.b.c.10.d.5", lesser: "1.2.3-a.b.c.5.d.100" },
+    { greater: "1.2.3-r2", lesser: "1.2.3-r100" },
+    { greater: "1.2.3-r100", lesser: "1.2.3-R2" },
+  ]
+
+test "{c.greater} is above {c.lesser}, as node-semver orders them" for c: Pair in node_ordered() {
+  let greater = lenient_version(c.greater);
+  let lesser = lenient_version(c.lesser);
+  assert_eq(compare(greater, lesser), Greater);
+  assert_eq(compare(lesser, greater), Less);
+  assert(greater != lesser);
+  assert(string_starts_with(c.greater, "v") || parse(c.greater) == Ok(greater));
+  assert(string_starts_with(c.lesser, "v") || parse(c.lesser) == Ok(lesser))
+}
+
+/// The rows of node-semver's `equality.js` that `coerce` reads: each two are one version.
+fn node_equal() -> List<Pair> =
+  [
+    { greater: "1.2.3", lesser: "v1.2.3" },
+    { greater: "1.2.3", lesser: " v1.2.3" },
+    { greater: "1.2.3-0", lesser: "v1.2.3-0" },
+    { greater: "1.2.3-0", lesser: " v1.2.3-0" },
+    { greater: "1.2.3-1", lesser: "v1.2.3-1" },
+    { greater: "1.2.3-1", lesser: " v1.2.3-1" },
+    { greater: "1.2.3-beta", lesser: "v1.2.3-beta" },
+    { greater: "1.2.3-beta", lesser: " v1.2.3-beta" },
+    { greater: "1.2.3-beta+build", lesser: "1.2.3-beta+otherbuild" },
+    { greater: "1.2.3+build", lesser: "1.2.3+otherbuild" },
+    { greater: "  v1.2.3+build", lesser: "1.2.3+otherbuild" },
+  ]
+
+test "{c.greater} and {c.lesser} are one version to node-semver too" for c: Pair in node_equal() {
+  assert(lenient_version(c.greater) == lenient_version(c.lesser));
+  assert_eq(compare(lenient_version(c.greater), lenient_version(c.lesser)), Equal)
+}
+
+/// The other side of the rest of `equality.js`: a `=` before a version and a blank after a
+/// `v`, which node's loose reading takes and `coerce` does not.
+fn node_loose() -> List<String> =
+  [
+    "=1.2.3",
+    "v 1.2.3",
+    "= 1.2.3",
+    " =1.2.3",
+    " v 1.2.3",
+    " = 1.2.3",
+    "=1.2.3-0",
+    "v 1.2.3-0",
+    "= 1.2.3-0",
+    " =1.2.3-0",
+    " v 1.2.3-0",
+    " = 1.2.3-0",
+    "=1.2.3-1",
+    "v 1.2.3-1",
+    "= 1.2.3-1",
+    " =1.2.3-1",
+    " v 1.2.3-1",
+    " = 1.2.3-1",
+    "=1.2.3-beta",
+    "v 1.2.3-beta",
+    "= 1.2.3-beta",
+    " =1.2.3-beta",
+    " v 1.2.3-beta",
+    " = 1.2.3-beta",
+    " = 1.2.3-beta+otherbuild",
+    " = 1.2.3+otherbuild",
+  ]
+
+test "`{text}` is a version only to node-semver read loosely" for text: String in node_loose() {
+  assert_eq(option_text(coerce(text)), "")
+}
+
+type Compared = { left: String, op: String, right: String, holds: Bool }
+
+/// Every comparison the Rust `semver` crate's `test_eq` to `test_ge` assert, and whether each
+/// holds. Its `==` and `<` read build metadata, as `identical` and `exact` do here and `==` and
+/// `compare` do not.
+fn crate_compared() -> List<Compared> =
+  [
+    { left: "1.2.3", op: "==", right: "1.2.3", holds: true },
+    { left: "1.2.3-alpha1", op: "==", right: "1.2.3-alpha1", holds: true },
+    { left: "1.2.3+build.42", op: "==", right: "1.2.3+build.42", holds: true },
+    { left: "1.2.3-alpha1+42", op: "==", right: "1.2.3-alpha1+42", holds: true },
+    { left: "0.0.0", op: "!=", right: "0.0.1", holds: true },
+    { left: "0.0.0", op: "!=", right: "0.1.0", holds: true },
+    { left: "0.0.0", op: "!=", right: "1.0.0", holds: true },
+    { left: "1.2.3-alpha", op: "!=", right: "1.2.3-beta", holds: true },
+    { left: "1.2.3+23", op: "!=", right: "1.2.3+42", holds: true },
+    { left: "0.0.0", op: "<", right: "1.2.3-alpha2", holds: true },
+    { left: "1.0.0", op: "<", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.0", op: "<", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.3-alpha1", op: "<", right: "1.2.3", holds: true },
+    { left: "1.2.3-alpha1", op: "<", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.3-alpha2", op: "<", right: "1.2.3-alpha2", holds: false },
+    { left: "1.2.3+23", op: "<", right: "1.2.3+42", holds: true },
+    { left: "0.0.0", op: "<=", right: "1.2.3-alpha2", holds: true },
+    { left: "1.0.0", op: "<=", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.0", op: "<=", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.3-alpha1", op: "<=", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.3-alpha2", op: "<=", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.3+23", op: "<=", right: "1.2.3+42", holds: true },
+    { left: "1.2.3-alpha2", op: ">", right: "0.0.0", holds: true },
+    { left: "1.2.3-alpha2", op: ">", right: "1.0.0", holds: true },
+    { left: "1.2.3-alpha2", op: ">", right: "1.2.0", holds: true },
+    { left: "1.2.3-alpha2", op: ">", right: "1.2.3-alpha1", holds: true },
+    { left: "1.2.3", op: ">", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.3-alpha2", op: ">", right: "1.2.3-alpha2", holds: false },
+    { left: "1.2.3+23", op: ">", right: "1.2.3+42", holds: false },
+    { left: "1.2.3-alpha2", op: ">=", right: "0.0.0", holds: true },
+    { left: "1.2.3-alpha2", op: ">=", right: "1.0.0", holds: true },
+    { left: "1.2.3-alpha2", op: ">=", right: "1.2.0", holds: true },
+    { left: "1.2.3-alpha2", op: ">=", right: "1.2.3-alpha1", holds: true },
+    { left: "1.2.3-alpha2", op: ">=", right: "1.2.3-alpha2", holds: true },
+    { left: "1.2.3+23", op: ">=", right: "1.2.3+42", holds: false },
+  ]
+
+test "{c.left} {c.op} {c.right} is {c.holds}, builds read" for c: Compared in crate_compared() {
+  let order = exact(version(c.left), version(c.right));
+  assert_eq(
+    if c.op == "==" { order == Equal }
+    else if c.op == "!=" { order != Equal }
+    else if c.op == "<" { order == Less }
+    else if c.op == "<=" { order != Greater }
+    else if c.op == ">" { order == Greater }
+    else { order != Less },
+    c.holds,
+  );
+  assert_eq(identical(version(c.left), version(c.right)), order == Equal)
+}
+
+test "build metadata orders as the Rust `semver` crate's source says it does" {
+  let builds = ["0", "00", "1", "01", "001", "2", "02", "002", "10"];
+  let versions = map(builds, |b: String| version("1.0.0+" ++ b));
+  assert(
+    all(steps(builds), |s: Step|
+      exact(version("1.0.0+" ++ s.lower), version("1.0.0+" ++ s.higher)) == Less),
+  );
+  assert(all(versions, |v: Version| v == version("1.0.0")));
+  assert_eq(exact(version("1.0.0+9"), version("1.0.0+10")), Less);
+  assert_eq(exact(version("1.0.0+10"), version("1.0.0+a")), Less);
+  assert_eq(exact(version("1.0.0+a"), version("1.0.0+a.0")), Less);
+  assert_eq(exact(version("1.0.0+B"), version("1.0.0+a")), Less)
+}
+
+test "build metadata is kept and written, and is no part of precedence" {
+  let a = version("1.0.0-rc.1+linux.x86");
+  let b = version("1.0.0-rc.1+darwin");
+  assert(a == b);
+  assert_eq(compare(a, b), Equal);
+  assert_eq(digest(a), digest(b));
+  assert_eq(map_len(#[a, b, version("1.0.0-rc.1")]), 1);
+  assert_eq(parts(a).build, ["linux", "x86"]);
+  assert_eq(render(a), "1.0.0-rc.1+linux.x86");
+  assert(!identical(a, b));
+  assert(identical(a, version("1.0.0-rc.1+linux.x86")));
+  assert_eq(exact(a, b), Greater);
+  assert_eq(exact(version("1.0.0"), version("1.0.0+0")), Less);
+  assert_eq(f"{a}", "1.0.0-rc.1+linux.x86")
+}
+
+test "a version is made of parts the specification writes, and of nothing else" {
+  let p: Parts = {
+    major: 1,
+    minor: 2,
+    patch: 3,
+    pre: [Alphanumeric("rc"), Numeric(1)],
+    build: ["001"],
+  };
+  assert_eq(option_text(of_parts(p)), "1.2.3-rc.1+001");
+  assert_eq(of_parts({ ..p, minor: -1 }), None);
+  assert_eq(of_parts({ ..p, pre: [Numeric(-1)] }), None);
+  assert_eq(of_parts({ ..p, pre: [Alphanumeric("")] }), None);
+  assert_eq(of_parts({ ..p, pre: [Alphanumeric("007")] }), None);
+  assert_eq(of_parts({ ..p, pre: [Alphanumeric("a.b")] }), None);
+  assert_eq(of_parts({ ..p, build: ["a+b"] }), None);
+  assert_eq(of_parts({ ..p, build: [""] }), None);
+  assert_eq(counts(version("4.5.6-rc.1+x")), { major: 4, minor: 5, patch: 6 });
+  assert_eq(option_text(of_counts({ major: 4, minor: 5, patch: 6 })), "4.5.6");
+  assert_eq(of_counts({ major: 4, minor: 5, patch: -6 }), None);
+  assert(is_prerelease(version("1.0.0-0")));
+  assert(!is_prerelease(version("1.0.0+0")))
+}
+
+fn option_text(v: Option<Version>) -> String = match v { Some(made) -> render(made), None -> "" }
+
+type Lenient = { text: String, version: String }
+
+fn lenient() -> List<Lenient> =
+  [
+    { text: "1.2.3", version: "1.2.3" },
+    { text: "v1.2.3", version: "1.2.3" },
+    { text: "V1.2", version: "1.2.0" },
+    { text: "v1", version: "1.0.0" },
+    { text: "  1.2  ", version: "1.2.0" },
+    { text: "01.002.0003", version: "1.2.3" },
+    { text: "1.2-rc.1", version: "1.2.0-rc.1" },
+    { text: "2+build.5", version: "2.0.0+build.5" },
+    { text: "v1.2.3-beta+exp.sha.5114f85", version: "1.2.3-beta+exp.sha.5114f85" },
+    { text: "", version: "" },
+    { text: "v", version: "" },
+    { text: "vv1", version: "" },
+    { text: "1.2.3.4", version: "" },
+    { text: "1..2", version: "" },
+    { text: "1.2.3-01", version: "" },
+    { text: "one", version: "" },
+    { text: "1 . 2", version: "" },
+  ]
+
+test "`{c.text}` read leniently is `{c.version}`" for c: Lenient in lenient() {
+  assert_eq(option_text(coerce(c.text)), c.version)
+}
+
+type Raised = { from: String, level: Level, to: String }
+
+/// The rows of node-semver's `increments.js` that raise a major, a minor or a patch of a version
+/// `parse` reads. Its other levels write a pre-release, which `increment` does not, and its
+/// `1.2.3tag` is a version only to node's loose reading.
+fn node_raised() -> List<Raised> =
+  [
+    { from: "1.2.3", level: Major, to: "2.0.0" },
+    { from: "1.2.3", level: Minor, to: "1.3.0" },
+    { from: "1.2.3", level: Patch, to: "1.2.4" },
+    { from: "1.2.3-tag", level: Major, to: "2.0.0" },
+    { from: "1.2.0-0", level: Patch, to: "1.2.0" },
+    { from: "1.2.3-4", level: Major, to: "2.0.0" },
+    { from: "1.2.3-4", level: Minor, to: "1.3.0" },
+    { from: "1.2.3-4", level: Patch, to: "1.2.3" },
+    { from: "1.2.3-alpha.0.beta", level: Major, to: "2.0.0" },
+    { from: "1.2.3-alpha.0.beta", level: Minor, to: "1.3.0" },
+    { from: "1.2.3-alpha.0.beta", level: Patch, to: "1.2.3" },
+    { from: "1.2.0-1", level: Minor, to: "1.2.0" },
+    { from: "1.0.0-1", level: Major, to: "1.0.0" },
+  ]
+
+fn own_raised() -> List<Raised> =
+  [
+    { from: "0.0.0", level: Patch, to: "0.0.1" },
+    { from: "1.2.3+build", level: Patch, to: "1.2.4" },
+    { from: "1.0.0-rc.1+build.4", level: Patch, to: "1.0.0" },
+  ]
+
+test "{c.from} raised is {c.to}" for c: Raised in concat(node_raised(), own_raised()) {
+  assert_eq(render(increment(version(c.from), c.level)), c.to)
+}
+
+type Matched = { range: String, written: String, all: List<String>, none: List<String> }
+
+/// Every requirement the Rust `semver` crate's `test_version_req.rs` parses, which is Cargo's
+/// reader, with the versions it says each matches and does not. How each is written back is the
+/// crate's where it asserts one and this module's rendering elsewhere. `*` also carries what
+/// `test_any` asserts of the requirement no text was parsed for.
+fn crate_matched() -> List<Matched> =
+  [
+    {
+      range: "1.0.0",
+      written: "^1.0.0",
+      all: ["1.0.0", "1.1.0", "1.0.1"],
+      none: ["0.9.9", "0.10.0", "0.1.0", "1.0.0-pre", "1.0.1-pre"],
+    },
+    {
+      range: "=1.0.0",
+      written: "=1.0.0",
+      all: ["1.0.0"],
+      none: ["1.0.1", "0.9.9", "0.10.0", "0.1.0", "1.0.0-pre"],
+    },
+    {
+      range: "=0.9.0",
+      written: "=0.9.0",
+      all: ["0.9.0"],
+      none: ["0.9.1", "1.9.0", "0.0.9", "0.9.0-pre"],
+    },
+    { range: "=0.0.2", written: "=0.0.2", all: ["0.0.2"], none: ["0.0.1", "0.0.3", "0.0.2-pre"] },
+    {
+      range: "=0.1.0-beta2.a",
+      written: "=0.1.0-beta2.a",
+      all: ["0.1.0-beta2.a"],
+      none: ["0.9.1", "0.1.0", "0.1.1-beta2.a", "0.1.0-beta2"],
+    },
+    {
+      range: "=0.1.0+meta",
+      written: "=0.1.0",
+      all: ["0.1.0", "0.1.0+meta", "0.1.0+any"],
+      none: [],
+    },
+    {
+      range: ">= 1.0.0",
+      written: ">=1.0.0",
+      all: ["1.0.0", "2.0.0"],
+      none: ["0.1.0", "0.0.1", "1.0.0-pre", "2.0.0-pre"],
+    },
+    {
+      range: ">= 2.1.0-alpha2",
+      written: ">=2.1.0-alpha2",
+      all: ["2.1.0-alpha2", "2.1.0-alpha3", "2.1.0", "3.0.0"],
+      none: ["2.0.0", "2.1.0-alpha1", "2.0.0-alpha2", "3.0.0-alpha2"],
+    },
+    {
+      range: "< 1.0.0",
+      written: "<1.0.0",
+      all: ["0.1.0", "0.0.1"],
+      none: ["1.0.0", "1.0.0-beta", "1.0.1", "0.9.9-alpha"],
+    },
+    {
+      range: "<= 2.1.0-alpha2",
+      written: "<=2.1.0-alpha2",
+      all: ["2.1.0-alpha2", "2.1.0-alpha1", "2.0.0", "1.0.0"],
+      none: ["2.1.0", "2.2.0-alpha1", "2.0.0-alpha2", "1.0.0-alpha2"],
+    },
+    {
+      range: ">1.0.0-alpha, <1.0.0",
+      written: ">1.0.0-alpha, <1.0.0",
+      all: ["1.0.0-beta"],
+      none: [],
+    },
+    { range: ">1.0.0-alpha, <1.0", written: ">1.0.0-alpha, <1.0", all: [], none: ["1.0.0-beta"] },
+    { range: ">1.0.0-alpha, <1", written: ">1.0.0-alpha, <1", all: [], none: ["1.0.0-beta"] },
+    {
+      range: "> 0.0.9, <= 2.5.3",
+      written: ">0.0.9, <=2.5.3",
+      all: ["0.0.10", "1.0.0", "2.5.3"],
+      none: ["0.0.8", "2.5.4"],
+    },
+    {
+      range: "0.3.0, 0.4.0",
+      written: "^0.3.0, ^0.4.0",
+      all: [],
+      none: ["0.0.8", "0.3.0", "0.4.0"],
+    },
+    {
+      range: "<= 0.2.0, >= 0.5.0",
+      written: "<=0.2.0, >=0.5.0",
+      all: [],
+      none: ["0.0.8", "0.3.0", "0.5.1"],
+    },
+    {
+      range: "0.1.0, 0.1.4, 0.1.6",
+      written: "^0.1.0, ^0.1.4, ^0.1.6",
+      all: ["0.1.6", "0.1.9"],
+      none: ["0.1.0", "0.1.4", "0.2.0"],
+    },
+    {
+      range: ">=0.5.1-alpha3, <0.6",
+      written: ">=0.5.1-alpha3, <0.6",
+      all: ["0.5.1-alpha3", "0.5.1-alpha4", "0.5.1-beta", "0.5.1", "0.5.5"],
+      none: ["0.5.1-alpha1", "0.5.2-alpha3", "0.5.5-pre", "0.5.0-pre", "0.6.0", "0.6.0-pre"],
+    },
+    {
+      range: "~1",
+      written: "~1",
+      all: ["1.0.0", "1.0.1", "1.1.1"],
+      none: ["0.9.1", "2.9.0", "0.0.9"],
+    },
+    { range: "~1.2", written: "~1.2", all: ["1.2.0", "1.2.1"], none: ["1.1.1", "1.3.0", "0.0.9"] },
+    {
+      range: "~1.2.2",
+      written: "~1.2.2",
+      all: ["1.2.2", "1.2.4"],
+      none: ["1.2.1", "1.9.0", "1.0.9", "2.0.1", "0.1.3"],
+    },
+    {
+      range: "~1.2.3-beta.2",
+      written: "~1.2.3-beta.2",
+      all: ["1.2.3", "1.2.4", "1.2.3-beta.2", "1.2.3-beta.4"],
+      none: ["1.3.3", "1.1.4", "1.2.3-beta.1", "1.2.4-beta.2"],
+    },
+    {
+      range: "^1",
+      written: "^1",
+      all: ["1.1.2", "1.1.0", "1.2.1", "1.0.1"],
+      none: ["0.9.1", "2.9.0", "0.1.4", "1.0.0-beta1", "0.1.0-alpha", "1.0.1-pre"],
+    },
+    {
+      range: "^1.1",
+      written: "^1.1",
+      all: ["1.1.2", "1.1.0", "1.2.1"],
+      none: ["0.9.1", "2.9.0", "1.0.1", "0.1.4"],
+    },
+    {
+      range: "^1.1.2",
+      written: "^1.1.2",
+      all: ["1.1.2", "1.1.4", "1.2.1"],
+      none: ["0.9.1", "2.9.0", "1.1.1", "0.0.1", "1.1.2-alpha1", "1.1.3-alpha1", "2.9.0-alpha1"],
+    },
+    {
+      range: "^0.1.2",
+      written: "^0.1.2",
+      all: ["0.1.2", "0.1.4"],
+      none: ["0.9.1", "2.9.0", "1.1.1", "0.0.1", "0.1.2-beta", "0.1.3-alpha", "0.2.0-pre"],
+    },
+    {
+      range: "^0.5.1-alpha3",
+      written: "^0.5.1-alpha3",
+      all: ["0.5.1-alpha3", "0.5.1-alpha4", "0.5.1-beta", "0.5.1", "0.5.5"],
+      none: ["0.5.1-alpha1", "0.5.2-alpha3", "0.5.5-pre", "0.5.0-pre", "0.6.0"],
+    },
+    {
+      range: "^0.0.2",
+      written: "^0.0.2",
+      all: ["0.0.2"],
+      none: ["0.9.1", "2.9.0", "1.1.1", "0.0.1", "0.1.4"],
+    },
+    {
+      range: "^0.0",
+      written: "^0.0",
+      all: ["0.0.2", "0.0.0"],
+      none: ["0.9.1", "2.9.0", "1.1.1", "0.1.4"],
+    },
+    { range: "^0", written: "^0", all: ["0.9.1", "0.0.2", "0.0.0"], none: ["2.9.0", "1.1.1"] },
+    {
+      range: "^1.4.2-beta.5",
+      written: "^1.4.2-beta.5",
+      all: ["1.4.2", "1.4.3", "1.4.2-beta.5", "1.4.2-beta.6", "1.4.2-c"],
+      none: ["0.9.9", "2.0.0", "1.4.2-alpha", "1.4.2-beta.4", "1.4.3-beta.5"],
+    },
+    {
+      range: "*",
+      written: "*",
+      all: ["0.9.1", "2.9.0", "0.0.9", "1.0.1", "1.1.1", "0.0.1", "0.1.0", "1.0.0"],
+      none: ["1.0.0-pre"],
+    },
+    {
+      range: "1.*",
+      written: "1.*",
+      all: ["1.2.0", "1.2.1", "1.1.1", "1.3.0"],
+      none: ["0.0.9", "1.2.0-pre"],
+    },
+    {
+      range: "1.2.*",
+      written: "1.2.*",
+      all: ["1.2.0", "1.2.2", "1.2.4"],
+      none: ["1.9.0", "1.0.9", "2.0.1", "0.1.3", "1.2.2-pre"],
+    },
+    { range: "=2.1.1-really.0", written: "=2.1.1-really.0", all: ["2.1.1-really.0"], none: [] },
+    { range: "0.*.*", written: "0.*", all: ["0.5.0"], none: [] },
+    { range: "0.0.*", written: "0.0.*", all: [], none: [] },
+  ]
+
+/// This dialect's own rows. The crate refuses the last three, where blanks alone part two
+/// comparators: it wants a comma, and the first of them is the text its
+/// `test_whitespace_delimited_comparator_sets` asserts it refuses.
+fn own_matched() -> List<Matched> =
+  [
+    { range: " x ", written: "*", all: ["0.0.1"], none: [] },
+    { range: "0.*.*", written: "0.*", all: ["0.9.9"], none: ["1.0.0", "0.5.0-pre"] },
+    { range: "0.0.*", written: "0.0.*", all: ["0.0.7"], none: ["0.1.0"] },
+    { range: ">=1.*", written: ">=1", all: ["1.0.0", "2.0.0"], none: ["0.9.9"] },
+    { range: "> 1", written: ">1", all: ["2.0.0"], none: ["1.9.9", "1.0.0"] },
+    { range: "> 1.2", written: ">1.2", all: ["1.3.0", "2.0.0"], none: ["1.2.9", "1.2.0"] },
+    { range: "<=1.2", written: "<=1.2", all: ["1.2.9", "0.1.0"], none: ["1.3.0"] },
+    { range: "<=1", written: "<=1", all: ["1.9.9"], none: ["2.0.0"] },
+    { range: "~ 1.2.3-1a+01", written: "~1.2.3-1a", all: ["1.2.3-1b"], none: ["1.2.3-1"] },
+    {
+      range: "> 0.0.9 <= 2.5.3",
+      written: ">0.0.9, <=2.5.3",
+      all: ["0.0.10", "1.0.0", "2.5.3"],
+      none: ["0.0.8", "2.5.4"],
+    },
+    {
+      range: ">=1.0 <2.0",
+      written: ">=1.0, <2.0",
+      all: ["1.0.0", "1.9.9"],
+      none: ["0.9.9", "2.0.0"],
+    },
+    {
+      range: "^1.2  ~1.2.3 , <1.2.9",
+      written: "^1.2, ~1.2.3, <1.2.9",
+      all: ["1.2.3", "1.2.8"],
+      none: ["1.2.2", "1.2.9", "1.3.0"],
+    },
+  ]
+
+type Same = { range: String, other: String }
+
+/// The texts the crate's `test_wildcard` asserts read as one requirement.
+fn crate_same() -> List<Same> =
+  [
+    { range: "*", other: "x" },
+    { range: "*", other: "X" },
+    { range: "1.*", other: "1.x" },
+    { range: "1.*", other: "1.X" },
+    { range: "1.*", other: "1.*.*" },
+    { range: "1.2.*", other: "1.2.x" },
+    { range: "1.2.*", other: "1.2.X" },
+  ]
+
+test "`{c.other}` reads as `{c.range}` does" for c: Same in crate_same() {
+  assert_eq(range(c.other), range(c.range))
+}
+
+/// How the crate's `test_comparator_parse` writes each comparator back.
+fn crate_comparators() -> List<Same> =
+  [
+    { range: "1.2.3-alpha", other: "^1.2.3-alpha" },
+    { range: "2.X", other: "2.*" },
+    { range: "2", other: "^2" },
+    { range: "2.x.x", other: "2.*" },
+  ]
+
+test "`{c.range}` is written back `{c.other}`" for c: Same in crate_comparators() {
+  assert_eq(render_range(range(c.range)), c.other);
+  assert_eq(range(c.other), range(c.range))
+}
+
+/// The crate's `test_leading_digit_in_pre_and_build`: each operator before each version, all of
+/// which it reads.
+fn leading_digits() -> List<String> =
+  flat_map(["=", ">", ">=", "<", "<=", "~", "^"], |op: String|
+    map(
+      [
+        "1.2.3-1a",
+        "1.2.3+1a",
+        "1.2.3-01a",
+        "1.2.3+01",
+        "1.2.3-1+1",
+        "1.2.3-1-1+1-1-1",
+        "1.2.3-1a+1a",
+        "1.2.3-1a-1a+1a-1a-1a",
+      ],
+      |form: String| op ++ " " ++ form,
+    ))
+
+test "`{text}` is a range, digits leading its identifiers" for text: String in leading_digits() {
+  let r = range(text);
+  assert_eq(len(comparators(r)), 1);
+  assert_eq(parse_range(render_range(r)), Ok(r))
+}
+
+test "`{c.range}` is `{c.written}`, and matches what its row says" for c: Matched in concat(
+    crate_matched(),
+    own_matched(),
+  ) {
+  let r = range(c.range);
+  assert_eq(render_range(r), c.written);
+  assert_eq(parse_range(c.written), Ok(r));
+  assert_eq(filter(c.all, |v: String| !satisfies(version(v), r)), []);
+  assert_eq(filter(c.none, |v: String| satisfies(version(v), r)), [])
+}
+
+/// The texts the crate's `test_version_req.rs` refuses, but for `> 0.0.9 <= 2.5.3`, which
+/// `own_matched` reads. Where and why each is refused is this reader's to say.
+fn crate_unranged() -> List<Refused> =
+  [
+    { text: "", at: 0, why: NoCount },
+    { text: "\0", at: 0, why: NoCount },
+    { text: "> 0.1.0,", at: 8, why: NoCount },
+    { text: "> 0.3.0, ,", at: 9, why: NoCount },
+    { text: "1.2.3 - 2.3.4", at: 6, why: NoCount },
+    { text: "=1.2.3 || =2.3.4", at: 7, why: NoCount },
+    { text: "1.1 || =1.2.3", at: 4, why: NoCount },
+    { text: "6.* || 8.* || >= 10.*", at: 4, why: NoCount },
+    { text: ">= >= 0.0.2", at: 3, why: NoCount },
+    { text: ">== 0.0.2", at: 2, why: NoCount },
+    { text: "a.0.0", at: 0, why: NoCount },
+    { text: "1.0.0-", at: 6, why: EmptyIdentifier },
+    { text: ">=", at: 2, why: NoCount },
+    { text: ">", at: 1, why: NoCount },
+    { text: "1.", at: 2, why: NoCount },
+    { text: "1.*.", at: 4, why: AfterWildcard },
+    { text: "1.2.3-01", at: 6, why: LeadingZero },
+    { text: "1.2.3+4.", at: 8, why: EmptyIdentifier },
+    { text: "1.2.3+4\u{ff}", at: 7, why: Stray },
+    { text: "*.1", at: 0, why: WildcardFirst },
+    { text: "1.*.1", at: 4, why: AfterWildcard },
+    { text: ">=1.*.1", at: 6, why: AfterWildcard },
+    { text: "*, 0.20.0-any", at: 0, why: WildcardFirst },
+    { text: "0.20.0-any, *", at: 12, why: WildcardFirst },
+    { text: "0.20.0-any, *, 1.0", at: 12, why: WildcardFirst },
+    {
+      text: ">1, >2, >3, >4, >5, >6, >7, >8, >9, >10, >11, >12, >13, >14, >15, >16, >17, >18, >19, >20, >21, >22, >23, >24, >25, >26, >27, >28, >29, >30, >31, >32, >33",
+      at: 151,
+      why: TooMany,
+    },
+  ]
+
+fn own_unranged() -> List<Refused> =
+  [
+    { text: "1.2-alpha", at: 3, why: Stray },
+    { text: "01.2", at: 0, why: LeadingZero },
+    { text: "1.2.3\t1.2.4", at: 5, why: Stray },
+    {
+      text: "1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1",
+      at: 64,
+      why: TooMany,
+    },
+  ]
+
+test "`{visible(c.text)}` is refused where it stops being a range" for c: Refused in concat(
+    crate_unranged(),
+    own_unranged(),
+  ) { assert_eq(parse_range(c.text), Err({ at: c.at, why: c.why })) }
+
+test "a requirement equals the one written like it, as the crate's `test_eq_hash` has it" {
+  assert_eq(range("^1"), range("^1"));
+  assert_eq(digest(range("^1")), digest(range("^1")));
+  assert(range("^1") != range("^2"))
+}
+
+test "a range of 32 comparators is the most one holds" {
+  let most = range("1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1");
+  assert_eq(len(comparators(most)), 32);
+  assert(satisfies(version("1.5.0"), most))
+}
+
+test "the greatest and the least of the versions a range holds" {
+  let published = map(
+    ["0.9.0", "1.2.0+a", "1.2.0+b", "1.4.0-rc.1", "1.3.5", "2.0.0", "1.0.0"],
+    version,
+  );
+  assert_eq(option_text(max_satisfying(published, range("^1"))), "1.3.5");
+  assert_eq(option_text(min_satisfying(published, range("^1"))), "1.0.0");
+  assert_eq(option_text(max_satisfying(published, range("~1.2"))), "1.2.0+a");
+  assert_eq(option_text(min_satisfying(published, range("~1.2"))), "1.2.0+a");
+  assert_eq(option_text(max_satisfying(published, range(">=1.4.0-rc.0, <2"))), "1.4.0-rc.1");
+  assert_eq(option_text(max_satisfying(published, range("*"))), "2.0.0");
+  assert_eq(max_satisfying(published, range("^3")), None);
+  assert_eq(max_satisfying([], range("*")), None)
+}
+
+test "a literal's check answers the value, or the character that keeps the text from being one" {
+  assert_eq(result_text(literal("1.2.3-rc.1+build")), "1.2.3-rc.1+build");
+  assert_eq(literal("1.2"), Err({ message: "a `.` and the next count go here", offset: 3 }));
+  assert_eq(
+    literal("1.02.3"),
+    Err({ message: "a number is written with no leading zero", offset: 2 }),
+  );
+  let r = range("1.x");
+  assert_eq(f"{r}", "1.*")
+}
+
+fn result_text(r: Result<Version, { message: String, offset: Int }>) -> String =
+  match r { Ok(v) -> render(v), Err(e) -> e.message }
+
+/// What a law draws a version from: any integers, made into counts and identifiers the
+/// specification writes.
+type Seed = { major: Int, minor: Int, patch: Int, pre: List<Int>, build: List<Int> }
+
+fn made(s: Seed) -> Version =
+  Version({
+    major: s.major & 0xFFFF,
+    minor: s.minor & 0xFF,
+    patch: s.patch & 0xFF,
+    pre: map(s.pre, |n: Int|
+      if n & 1 == 0 { Numeric(n >> 1 & 0xFF) } else { Alphanumeric(a_word(n >> 1)) }),
+    build: map(s.build, |n: Int|
+      if n & 1 == 0 { "00" ++ int_to_string(n >> 1 & 0xFF) } else { a_word(n >> 1) }),
+  })
+
+fn a_word(n: Int) -> String =
+  match n & 7 {
+    0 -> "alpha",
+    1 -> "beta",
+    2 -> "rc",
+    3 -> "x-y",
+    4 -> "0a",
+    5 -> "A",
+    6 -> "-",
+    _ -> "7z",
+  }
+
+law "a version reads back, build metadata and all, from the text written of it" =
+  agrees(
+    |s: Seed| match parse(render(made(s))) { Ok(v) -> Some(parts(v)), Err(_) -> None },
+    |s: Seed| Some(parts(made(s))),
+  )
+
+law "what is made of parts is those parts" =
+  agrees(|s: Seed| option_map(of_parts(parts(made(s))), parts), |s: Seed| Some(parts(made(s))))
+
+law "precedence is a total order" = total_order(|a: Version, b: Version| compare(a, b))
+
+law "the exact order is a total order" = total_order(exact)
+
+law "a version raised at any level is a greater one, and a release"
+  forall (s: Seed, level: Level) {
+    let next = increment(made(s), level);
+    compare(next, made(s)) == Greater && !is_prerelease(next)
+  }
+
+law "a version satisfies the caret, the tilde and the exact range written of it"
+  forall (s: Seed) {
+    let v = made(s);
+    let p = parts(v);
+    all([Caret, Tilde, Exactly, AtLeast, AtMost], |op: Op|
+      satisfies(
+        v,
+        Range([{ op: op, major: p.major, minor: Some(p.minor), patch: Some(p.patch), pre: p.pre }]),
+      ))
+  }
+
+law "the greatest a range holds satisfies it, and nothing it holds is greater"
+  forall (seeds: List<Seed>, floor: Seed) {
+    let versions = map(seeds, made);
+    let p = parts(made(floor));
+    let r = Range([
+      { op: AtLeast, major: p.major, minor: Some(p.minor), patch: Some(p.patch), pre: p.pre },
+    ]);
+    match max_satisfying(versions, r) {
+      None -> !any(versions, |v: Version| satisfies(v, r)),
+      Some(best) ->
+        satisfies(best, r)
+          && all(versions, |v: Version| !satisfies(v, r) || compare(v, best) != Greater),
+    }
+  }
