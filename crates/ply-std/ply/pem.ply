@@ -1,0 +1,1060 @@
+//! PEM, the text certificates and keys travel in, as RFC 7468 defines it.
+//!
+//! A block is a `-----BEGIN label-----` line, bytes in base64, and the `-----END label-----` line
+//! of the same label. `read` answers every block of a text in order and takes whatever stands
+//! outside them as the explanatory text a bundle carries. Inside a block it follows the RFC's
+//! standard grammar: lines of any length, any of the three line endings, blanks at a line's end and
+//! empty lines before the data are read, and nothing else is. The lines together must be
+//! canonical base64 as `std.base64` reads it, the two labels must match, and a line that opens as
+//! a boundary must be one. `write` emits the strict form: 64 columns and nothing spare.
+//!
+//! RFC 7468 permits no headers. The `Name: value` lines legacy PEM (RFC 1421) put above the data
+//! are read and written all the same, since keys written that way are still met, except the
+//! pair that says a block is encrypted, which is refused with the reason `explain` gives.
+//!
+//! A private key is answered sealed. Its bytes go into a `Secret` as padded base64 on one line,
+//! since a `Secret` holds a `String`, and nothing reads one back: a `Key` can be compared, checked
+//! against a text and handed to an operation that takes a secret, and it cannot be shown, encoded
+//! or written out again. The text it was read from is the caller's to let go of.
+//!
+//! `read` and `write` raise `pem.refused` with the line and the reason; `decode` and `encode`
+//! answer the same refusal as an `Err`. A reader takes the most bytes of text it will read.
+
+import std.base64 (base64_encode)
+import std.bytes (contains, repeat, replace, scan, scan_until)
+import std.laws (agrees, inverse)
+import std.list (at_or, flatten, take)
+import std.radix
+import std.string (unlines)
+
+/// What a block says it holds. A label is its text, however it was built: `Other("CERTIFICATE")`
+/// is `Certificate`, and each shows as the text between the hyphens.
+pub type Label =
+  /// `CERTIFICATE`: an X.509 certificate.
+  | Certificate
+  /// `X509 CRL`: a certificate revocation list.
+  | Crl
+  /// `CERTIFICATE REQUEST`: a PKCS #10 certification request.
+  | CertificateRequest
+  /// `PKCS7`: a PKCS #7 message.
+  | Pkcs7
+  /// `CMS`: a Cryptographic Message Syntax message.
+  | Cms
+  /// `PRIVATE KEY`: a PKCS #8 private key, unencrypted.
+  | PrivateKey
+  /// `ENCRYPTED PRIVATE KEY`: a PKCS #8 private key under a password.
+  | EncryptedPrivateKey
+  /// `ATTRIBUTE CERTIFICATE`: an attribute certificate.
+  | AttributeCertificate
+  /// `PUBLIC KEY`: a public key with its algorithm.
+  | PublicKey
+  /// `RSA PRIVATE KEY`: a PKCS #1 private key.
+  | RsaPrivateKey
+  /// `EC PRIVATE KEY`: a SEC 1 private key.
+  | EcPrivateKey
+  /// Any other label, by its text.
+  | Other(String)
+
+key for Label by label_text
+
+show for Label by label_text
+
+/// One `Name: value` line of the headers legacy PEM put above a block's data.
+pub type Header = new { name: String, value: String }
+
+/// A block whose bytes anyone may read.
+pub type Block = new { label: Label, headers: List<Header>, data: Bytes }
+
+/// A private key as a reader answers it: its bytes, as padded base64 on one line, in a `Secret`.
+pub type Key = new { label: Label, headers: List<Header>, material: Secret<String> }
+
+/// One block of a text read: a `Block`, or a `Key` where the label is a private key's.
+pub type Item = | Open(Block) | Sealed(Key)
+
+/// Why a text is not PEM, or a block cannot be written as it.
+pub type Why =
+  /// The text is longer than the limit the reader was given.
+  | TooLong
+  /// A line opens as a boundary and is not one: five hyphens, a label, five hyphens, then blanks.
+  | BadBoundary
+  /// An `-----END` line with no block open.
+  | Unopened
+  /// A block with no `-----END` line before the next `-----BEGIN` or the text's end.
+  | Unclosed
+  /// An `-----END` line whose label is not its `-----BEGIN` line's.
+  | Mismatched
+  /// A header that is not a name, a colon and a value, or headers with no empty line after them.
+  | BadHeader
+  /// A block encrypted the legacy way, by its `Proc-Type` header.
+  | Encrypted
+  /// A line of a block's data that is not base64 characters, or an empty line among them.
+  | BadData
+  /// Data lines that together are not canonical padded base64.
+  | NotCanonical
+  /// A block to write whose label is not one a boundary line can carry.
+  | BadLabel
+
+/// A refusal and the line it is about, counted from one: the block's `-----BEGIN` line for
+/// `Unclosed`, the first for `TooLong`, and for a block to write the line it would have had.
+pub type Refusal = new { line: Int, why: Why }
+
+/// What this module's readers and writers raise where they refuse.
+pub effect pem {
+  /// The text is not PEM, or the block cannot be written as it.
+  raise refused(e: Refusal)
+}
+
+/// The text between a boundary line's hyphens for `label`.
+pub fn label_text(label: Label) -> String =
+  match label {
+    Certificate -> "CERTIFICATE",
+    Crl -> "X509 CRL",
+    CertificateRequest -> "CERTIFICATE REQUEST",
+    Pkcs7 -> "PKCS7",
+    Cms -> "CMS",
+    PrivateKey -> "PRIVATE KEY",
+    EncryptedPrivateKey -> "ENCRYPTED PRIVATE KEY",
+    AttributeCertificate -> "ATTRIBUTE CERTIFICATE",
+    PublicKey -> "PUBLIC KEY",
+    RsaPrivateKey -> "RSA PRIVATE KEY",
+    EcPrivateKey -> "EC PRIVATE KEY",
+    Other(text) -> text,
+  }
+
+/// The label a boundary line's text names. Only the exact texts are the named labels: RFC 7468
+/// keeps `X509 CERTIFICATE` and `NEW CERTIFICATE REQUEST` apart from the labels they resemble.
+pub fn label_of(text: String) -> Label =
+  match text {
+    "CERTIFICATE" -> Certificate,
+    "X509 CRL" -> Crl,
+    "CERTIFICATE REQUEST" -> CertificateRequest,
+    "PKCS7" -> Pkcs7,
+    "CMS" -> Cms,
+    "PRIVATE KEY" -> PrivateKey,
+    "ENCRYPTED PRIVATE KEY" -> EncryptedPrivateKey,
+    "ATTRIBUTE CERTIFICATE" -> AttributeCertificate,
+    "PUBLIC KEY" -> PublicKey,
+    "RSA PRIVATE KEY" -> RsaPrivateKey,
+    "EC PRIVATE KEY" -> EcPrivateKey,
+    _ -> Other(text),
+  }
+
+/// Whether a block of this label is key material a reader seals: a label ending in
+/// `PRIVATE KEY`, other than `ENCRYPTED PRIVATE KEY`, whose bytes are already under a password.
+pub fn is_private(label: Label) -> Bool =
+  string_ends_with(label_text(label), "PRIVATE KEY") && label != EncryptedPrivateKey
+
+/// `block` with its bytes put out of reach, as a reader answers a private key.
+pub fn seal(block: Block) -> Key / {abort.raise} =
+  {
+    label: block.label,
+    headers: block.headers,
+    material: secret_of_string(base64_encode(block.data)),
+  }
+
+/// What a reader answers for `block`: the block, or its key sealed where the label is private.
+pub fn item(block: Block) -> Item / {abort.raise} =
+  if is_private(block.label) { Sealed(seal(block)) } else { Open(block) }
+
+/// A sentence for each reason, for a message to a person.
+pub fn explain(why: Why) -> String =
+  match why {
+    TooLong -> "the text is longer than the limit the reader was given",
+    BadBoundary -> "a line opens as a BEGIN or END boundary and is not one",
+    Unopened -> "an END line stands where no block is open",
+    Unclosed -> "a block has no END line of its own",
+    Mismatched -> "an END line's label is not its BEGIN line's",
+    BadHeader ->
+      "a header is a name, a colon and a value on one line, and an empty line ends the headers",
+    Encrypted ->
+      "the block is encrypted the legacy way, under a key made from its password with MD5: "
+        ++ "decrypt it with the tool that wrote it, and keep the key as PKCS #8, "
+        ++ "whose label is ENCRYPTED PRIVATE KEY",
+    BadData -> "a line of a block's data holds base64 characters only, and none is empty",
+    NotCanonical -> "a block's data lines together are not canonical padded base64",
+    BadLabel ->
+      "a label is printable ASCII, with a space or a hyphen only between two other characters",
+  }
+
+/// Every block of `text`, in order, a private key sealed; a text of more than `limit` bytes is
+/// refused unread. Raises `pem.refused` where `decode` answers `Err`.
+pub fn read(text: String, limit: Int) -> List<Item> / {pem.refused, abort.raise} = {
+  let raw = bytes_of_string(text);
+  if bytes_len(raw) > limit { refuse(1, TooLong) } else {
+    let walked = fold(rows_of(raw), { items: [], line: 0, block: None }, step);
+    match walked.block { Some(o) -> refuse(o.line, Unclosed), None -> walked.items }
+  }
+}
+
+/// The lines of `text`, ended by CRLF, CR or LF: what follows the last ending is a line only
+/// where it holds something.
+fn rows_of(text: Bytes) -> List<Bytes> / {abort.raise} = {
+  let rows = bytes_split(replace(replace(text, b"\r\n", b"\n"), b"\r", b"\n"), b"\n");
+  if list_at(rows, len(rows) - 1) == Some(b"") { take(rows, len(rows) - 1) } else { rows }
+}
+
+/// Every block of `text`, or the line it stops being PEM at and why.
+pub fn decode(text: String, limit: Int) -> Result<List<Item>, Refusal> / {abort.raise} =
+  try { read(text, limit) }
+
+/// `block` in the strict form: its boundary lines, its headers and an empty line where it has
+/// any, and its bytes in base64 at 64 columns, each line ended with a line feed. Raises
+/// `pem.refused` where `encode` answers `Err`: a label or a header no reader here would read back.
+pub fn write(block: Block) -> String / {pem.refused, abort.raise} = {
+  let label = label_text(block.label);
+  if !is_label(bytes_of_string(label)) { refuse(1, BadLabel) } else {
+    let head = fold(
+      block.headers,
+      ["-----BEGIN " ++ label ++ "-----"],
+      |lines: List<String>, h: Header| push(lines, header_line(h, len(lines) + 1)),
+    );
+    unlines(
+      flatten([
+        if len(block.headers) == 0 { head } else { push(head, "") },
+        radix::wrap(base64_encode(block.data), 64),
+        ["-----END " ++ label ++ "-----"],
+      ]),
+    )
+  }
+}
+
+/// `block` in the strict form, or why it cannot be written.
+pub fn encode(block: Block) -> Result<String, Refusal> / {abort.raise} = try { write(block) }
+
+fn refuse<a>(line: Int, why: Why) -> a / {pem.refused} = pem.refused({ line: line, why: why })
+
+/// Where a reader stands: the blocks behind it, the line it read last, and the block it is in.
+type Walk = { items: List<Item>, line: Int, block: Option<Opened> }
+
+/// A block being read: its label and `-----BEGIN` line, what may come next, and what came so
+/// far, `first` being the line its data began on.
+type Opened = {
+  label: String,
+  line: Int,
+  stage: Stage,
+  headers: List<Header>,
+  data: List<Bytes>,
+  first: Int,
+}
+
+/// What a block's next line may be: a header, an empty line or data; a header or the empty line
+/// that ends them; an empty line or data; or data.
+type Stage = | Start | Headed | Gap | Data
+
+fn step(w: Walk, raw: Bytes) -> Walk / {pem.refused, abort.raise} = {
+  let line = w.line + 1;
+  let row = bytes_slice(raw, 0, unblanked(raw, bytes_len(raw)));
+  let begins = bytes_starts_with(row, b"-----BEGIN ");
+  let ends = bytes_starts_with(row, b"-----END ");
+  match w.block {
+    None -> if begins {
+      { items: w.items, line: line, block: Some(opened(label_in(row, 11, line), line)) }
+    } else if ends {
+      let _ = label_in(row, 9, line);
+      refuse(line, Unopened)
+    } else { { items: w.items, line: line, block: None } },
+    Some(o) -> if ends {
+      { items: push(w.items, closed(o, label_in(row, 9, line), line)), line: line, block: None }
+    } else if begins { refuse(o.line, Unclosed) }
+    else { { items: w.items, line: line, block: Some(inside(o, row, line)) } },
+  }
+}
+
+fn opened(label: String, line: Int) -> Opened =
+  { label: label, line: line, stage: Start, headers: [], data: [], first: 0 }
+
+/// The length of the first `n` bytes of `row` before the spaces and tabs they end in.
+fn unblanked(row: Bytes, n: Int) -> Int / {abort.raise} =
+  if n > 0 && (bytes_at(row, n - 1) == 32 || bytes_at(row, n - 1) == 9) { unblanked(row, n - 1) }
+  else { n }
+
+/// The label of a boundary line whose opening is its first `lead` bytes.
+fn label_in(row: Bytes, lead: Int, line: Int) -> String / {pem.refused, abort.raise} = {
+  let end = bytes_len(row) - 5;
+  if end < lead || !bytes_ends_with(row, b"-----") || !is_label(bytes_slice(row, lead, end)) {
+    refuse(line, BadBoundary)
+  } else { string_of_bytes(bytes_slice(row, lead, end)) }
+}
+
+/// RFC 7468's `label`: printable ASCII, a space or a hyphen only between two other characters.
+fn is_label(text: Bytes) -> Bool / {abort.raise} =
+  fold(range(0, bytes_len(text)), true, |ok: Bool, i: Int| {
+    let c = bytes_at(text, i);
+    ok && c >= 32 && c <= 126
+      && (!joint(c) || (i > 0 && i + 1 < bytes_len(text) && !joint(bytes_at(text, i - 1))))
+  })
+
+fn joint(c: Int) -> Bool = c == 32 || c == 45
+
+fn inside(o: Opened, row: Bytes, line: Int) -> Opened / {pem.refused, abort.raise} = {
+  let empty = bytes_len(row) == 0;
+  let named = bytes_index_of_byte(row, 58) != None;
+  match o.stage {
+    Start -> if empty { { ..o, stage: Gap } }
+    else if named { header(o, row, line) }
+    else { data(o, row, line) },
+    Headed -> if empty { { ..o, stage: Gap } }
+    else if named { header(o, row, line) }
+    else { refuse(line, BadHeader) },
+    Gap -> if empty { o } else { data(o, row, line) },
+    Data -> data(o, row, line),
+  }
+}
+
+fn header(o: Opened, row: Bytes, line: Int) -> Opened / {pem.refused, abort.raise} = {
+  let colon = scan_until(row, 0, b":");
+  let name = bytes_slice(row, 0, colon);
+  let value = bytes_slice(row, scan(row, colon + 1, b" \t"), bytes_len(row));
+  if !is_name(name) { refuse(line, BadHeader) }
+  else if says_encrypted(name, value) { refuse(line, Encrypted) } else {
+    {
+      ..o,
+      stage: Headed,
+      headers: push(o.headers, { name: string_of_bytes(name), value: string_of_bytes(value) }),
+    }
+  }
+}
+
+/// A header's name: printable ASCII with no space in it, and no colon.
+fn is_name(name: Bytes) -> Bool / {abort.raise} =
+  bytes_len(name) > 0 && bytes_position(name, 0, |c: Int| c < 33 || c > 126 || c == 58) == None
+
+/// RFC 1421's `Proc-Type: 4,ENCRYPTED`, which OpenSSL's legacy key files carry.
+fn says_encrypted(name: Bytes, value: Bytes) -> Bool =
+  name == b"Proc-Type" && contains(value, b"ENCRYPTED")
+
+fn data(o: Opened, row: Bytes, line: Int) -> Opened / {pem.refused, abort.raise} =
+  if bytes_len(row) == 0 || bytes_scan(row, 0, data_bytes(), bytes_len(row)) < bytes_len(row) {
+    refuse(line, BadData)
+  } else {
+    { ..o, stage: Data, data: push(o.data, row), first: if o.first == 0 { line } else { o.first } }
+  }
+
+/// What a data line is made of: base64's letters, and its padding.
+fn data_bytes() -> Bytes = bytes_concat(radix::base64().symbols, b"=")
+
+fn closed(o: Opened, label: String, line: Int) -> Item / {pem.refused, abort.raise} =
+  if label != o.label { refuse(line, Mismatched) }
+  else if o.stage == Headed { refuse(line, BadHeader) } else {
+    match radix::parse(radix::base64(), string_of_bytes(bytes_concat_all(o.data))) {
+      Err(r) -> refuse(line_of(o, r.at), NotCanonical),
+      Ok(bytes) -> item({ label: label_of(o.label), headers: o.headers, data: bytes }),
+    }
+  }
+
+/// The line holding character `at` of a block's data taken together, its last for one past them.
+fn line_of(o: Opened, at: Int) -> Int =
+  min(
+    o.first + len(o.data) - 1,
+    fold(o.data, { line: o.first, left: at }, |s: { line: Int, left: Int }, row: Bytes|
+      if s.left < 0 { s }
+      else if s.left < bytes_len(row) { { line: s.line, left: -1 } }
+      else { { line: s.line + 1, left: s.left - bytes_len(row) } }).line,
+  )
+
+/// A header as its line, where a reader here would read it back as it is.
+fn header_line(h: Header, line: Int) -> String / {pem.refused, abort.raise} = {
+  let name = bytes_of_string(h.name);
+  let value = bytes_of_string(h.value);
+  if !is_name(name) || !is_value(value) { refuse(line, BadHeader) }
+  else if says_encrypted(name, value) { refuse(line, Encrypted) }
+  else { h.name ++ ": " ++ h.value }
+}
+
+/// A header's value as it can be written: no control character, and no space at either end.
+fn is_value(value: Bytes) -> Bool / {abort.raise} =
+  bytes_position(value, 0, |c: Int| c < 32 || c == 127) == None && !bytes_starts_with(value, b" ")
+    && !bytes_ends_with(value, b" ")
+
+// --- Tests ------------------------------------------------------------------
+
+law "a label read from its text is the label" = inverse(label_text, label_of)
+
+law "a label's text is the text it was read from" = inverse(label_of, label_text)
+
+/// Every label this module names, and one it does not.
+fn labels() -> List<Label> =
+  [
+    Certificate,
+    Crl,
+    CertificateRequest,
+    Pkcs7,
+    Cms,
+    PrivateKey,
+    EncryptedPrivateKey,
+    AttributeCertificate,
+    PublicKey,
+    RsaPrivateKey,
+    EcPrivateKey,
+    Other("TRUSTED CERTIFICATE"),
+  ]
+
+/// A block of one of `labels`, with a header for every second one.
+fn sample(c: { kind: Int, data: Bytes }) -> Block =
+  {
+    label: at_or(labels(), (c.kind % 12 + 12) % 12, Certificate),
+    headers: if c.kind % 2 == 0 { [] } else { [{ name: "Comment", value: "a b" }] },
+    data: c.data,
+  }
+
+law "what was written reads back: the block, or its key sealed" =
+  agrees(
+    |c: { kind: Int, data: Bytes }| decode(write(sample(c)), 1048576),
+    |c: { kind: Int, data: Bytes }| Ok([item(sample(c))]),
+  )
+
+/// Whether `data` is one DER sequence and nothing after it: its header's length is what follows.
+fn der_whole(data: Bytes) -> Bool / {abort.raise} = {
+  let n = bytes_len(data);
+  if n < 2 || bytes_at(data, 0) != 0x30 { false } else {
+    let first = bytes_at(data, 1);
+    if first < 0x80 { n == 2 + first }
+    else if first == 0x81 { n >= 3 && n == 3 + bytes_at(data, 2) }
+    else if first == 0x82 { n >= 4 && n == 4 + (bytes_at(data, 2) << 8 | bytes_at(data, 3)) }
+    else { false }
+  }
+}
+
+/// The base64 of a text's one block: its lines that are no boundary, joined.
+fn letters(text: String) -> String / {abort.raise} =
+  fold(string_split(text, "\n"), "", |all: String, row: String|
+    if string_starts_with(row, "-----") { all } else { all ++ row })
+
+/// One figure of RFC 7468: its number, the label it shows, the bytes its data decodes to by
+/// another decoder's count, and its text as printed.
+type Figure = { figure: Int, label: String, size: Int, text: String }
+
+test "RFC 7468 figure {c.figure}, {c.label}, reads and writes back" for c: Figure in figures() {
+  match read(c.text, 4096) {
+    [Open(b)] -> {
+      assert(!is_private(label_of(c.label)));
+      assert_eq(b.label, label_of(c.label));
+      assert_eq(b.headers, []);
+      assert_eq(bytes_len(b.data), c.size);
+      assert(der_whole(b.data));
+      assert(string_ends_with(c.text, "\n" ++ write(b)) || c.text == write(b))
+    },
+    [Sealed(k)] -> {
+      assert(is_private(label_of(c.label)));
+      assert_eq(k.label, label_of(c.label));
+      assert(secret_verify(k.material, letters(c.text)))
+    },
+    other -> assert_eq(len(other), 1),
+  }
+}
+
+test "a named label is read as its constructor, which a match tells from any other" {
+  assert_eq(
+    filter(labels(), |l: Label| match label_of(label_text(l)) { Other(_) -> true, _ -> false }),
+    [Other("TRUSTED CERTIFICATE")],
+  );
+  assert_eq(
+    map(labels(), |l: Label| match l { Other(_) -> "", _ -> label_text(label_of(label_text(l))) }),
+    [
+      "CERTIFICATE",
+      "X509 CRL",
+      "CERTIFICATE REQUEST",
+      "PKCS7",
+      "CMS",
+      "PRIVATE KEY",
+      "ENCRYPTED PRIVATE KEY",
+      "ATTRIBUTE CERTIFICATE",
+      "PUBLIC KEY",
+      "RSA PRIVATE KEY",
+      "EC PRIVATE KEY",
+      "",
+    ],
+  )
+}
+
+test "the labels RFC 7468 names are told from the ones that resemble them" {
+  assert_eq(label_of("X509 CRL"), Crl);
+  assert_eq(label_of("X509 CERTIFICATE"), Other("X509 CERTIFICATE"));
+  assert_eq(label_of("NEW CERTIFICATE REQUEST"), Other("NEW CERTIFICATE REQUEST"));
+  assert_eq(label_of("certificate"), Other("certificate"));
+  assert(label_of("CRL") != Crl)
+}
+
+test "a label is its text, however it was built" {
+  assert(Other("CERTIFICATE") == Certificate);
+  assert(Other("PRIVATE KEY") == PrivateKey);
+  assert(Other("PUBLIC KEY") != PrivateKey);
+  assert_eq(map_get(#{Certificate: 1, PublicKey: 2}, Other("PUBLIC KEY")), Some(2));
+  assert_eq(f"{Crl} and {Other("OPENSSH PRIVATE KEY")}", "X509 CRL and OPENSSH PRIVATE KEY")
+}
+
+test "a private key is every label ending so, but not one already under a password" {
+  assert_eq(filter(labels(), is_private), [PrivateKey, RsaPrivateKey, EcPrivateKey]);
+  assert(is_private(Other("OPENSSH PRIVATE KEY")));
+  assert(is_private(Other("PRIVATE KEY")));
+  assert(!is_private(Other("ENCRYPTED PRIVATE KEY")))
+}
+
+fn foobar() -> Result<List<Item>, Refusal> =
+  Ok([Open({ label: Certificate, headers: [], data: b"foobar" })])
+
+test "a reader takes any line length, any line ending, and blanks at a line's end" {
+  assert_eq(
+    decode("-----BEGIN CERTIFICATE-----\nZm9vYmFy\n-----END CERTIFICATE-----\n", 4096),
+    foobar(),
+  );
+  assert_eq(
+    decode("-----BEGIN CERTIFICATE-----\nZm9vYmFy\n-----END CERTIFICATE-----", 4096),
+    foobar(),
+  );
+  assert_eq(
+    decode("-----BEGIN CERTIFICATE-----\r\nZm9v\r\nYmFy\r\n-----END CERTIFICATE-----\r\n", 4096),
+    foobar(),
+  );
+  assert_eq(
+    decode("-----BEGIN CERTIFICATE-----\rZm9vYmFy\r-----END CERTIFICATE-----\r", 4096),
+    foobar(),
+  );
+  assert_eq(
+    decode(
+      "-----BEGIN CERTIFICATE----- \t\n\n \nZ\nm9vYm \nFy\t\n-----END CERTIFICATE-----  \n",
+      4096,
+    ),
+    foobar(),
+  )
+}
+
+test "padding may stand on a line of its own, and a block may hold no bytes" {
+  assert_eq(
+    decode("-----BEGIN CERTIFICATE-----\nZm9vYg=\n=\n-----END CERTIFICATE-----\n", 4096),
+    Ok([Open({ label: Certificate, headers: [], data: b"foob" })]),
+  );
+  assert_eq(
+    decode("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n", 4096),
+    Ok([Open({ label: Certificate, headers: [], data: b"" })]),
+  );
+  assert_eq(
+    write({ label: Certificate, headers: [], data: b"" }),
+    "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+  );
+  assert_eq(decode("", 4096), Ok([]));
+  assert_eq(decode("no block here\n", 4096), Ok([]))
+}
+
+test "a bundle is every block in order, whatever is written between them" {
+  let bundle =
+    \\# the leaf
+    \\-----BEGIN CERTIFICATE-----
+    \\Zm9v
+    \\-----END CERTIFICATE-----
+    \\
+    \\subject: the issuer, whose line holds a colon
+    \\ -----BEGIN CERTIFICATE----- an indented line is text too
+    \\-----BEGIN X509 CRL-----
+    \\YmFy
+    \\-----END X509 CRL-----
+    \\# and its key
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\Zm9vYmFy
+    \\-----END EC PRIVATE KEY-----
+    \\trailing words
+  ;
+  match decode(bundle, 4096) {
+    Ok([Open(leaf), Open(crl), Sealed(k)]) -> {
+      assert_eq(leaf, { label: Certificate, headers: [], data: b"foo" });
+      assert_eq(crl, { label: Crl, headers: [], data: b"bar" });
+      assert_eq(k.label, EcPrivateKey);
+      assert(k.material == secret_of_string("Zm9vYmFy"));
+      assert(secret_verify(k.material, "Zm9vYmFy"));
+      assert(!secret_verify(k.material, "Zm9vYmFz"))
+    },
+    other -> assert_eq(result_len(other), 3),
+  }
+}
+
+fn result_len(r: Result<List<Item>, Refusal>) -> Int =
+  match r { Ok(items) -> len(items), Err(_) -> -1 }
+
+test "a key sealed is the key a reader answers, and equal keys are equal" {
+  let block: Block = { label: PrivateKey, headers: [], data: b"foobar" };
+  assert(decode(write(block), 4096) == Ok([Sealed(seal(block))]));
+  assert(seal(block) == seal(block));
+  assert(seal(block) != seal({ label: PrivateKey, headers: [], data: b"foobaz" }));
+  assert(item(block) == Sealed(seal(block)));
+  assert(
+    item({ label: EncryptedPrivateKey, headers: [], data: b"foobar" })
+      == Open({ label: EncryptedPrivateKey, headers: [], data: b"foobar" }),
+  )
+}
+
+test "data is written at 64 columns, and headers above it with an empty line after" {
+  assert_eq(
+    write({ label: PublicKey, headers: [], data: repeat(b"\x00", 49) }),
+    \\-----BEGIN PUBLIC KEY-----
+    \\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    \\AA==
+    \\-----END PUBLIC KEY-----
+    \\
+  );
+  let headed: Block = {
+    label: Other("MESSAGE"),
+    headers: [{ name: "Comment", value: "a b: c" }, { name: "Empty", value: "" }],
+    data: b"foo",
+  };
+  let text = "-----BEGIN MESSAGE-----\nComment: a b: c\nEmpty: \n\nZm9v\n-----END MESSAGE-----\n";
+  assert_eq(write(headed), text);
+  assert_eq(decode(text, 4096), Ok([Open(headed)]));
+  assert_eq(
+    decode(
+      "-----BEGIN MESSAGE-----\nComment:a b: c  \nEmpty:\n\nZm9v\n-----END MESSAGE-----",
+      4096,
+    ),
+    Ok([Open(headed)]),
+  );
+  assert_eq(
+    decode(
+      "-----BEGIN -----\nN: v\nProc-Type: 4,MIC-ONLY\n!~: ENCRYPTED\n\nZm9v\n-----END -----\n",
+      4096,
+    ),
+    Ok([
+      Open({
+        label: Other(""),
+        headers: [
+          { name: "N", value: "v" },
+          { name: "Proc-Type", value: "4,MIC-ONLY" },
+          { name: "!~", value: "ENCRYPTED" },
+        ],
+        data: b"foo",
+      }),
+    ]),
+  )
+}
+
+type Refused = { name: String, text: String, line: Int, why: Why }
+
+fn refused() -> List<Refused> =
+  [
+    {
+      name: "an END label that is not the BEGIN's",
+      text: "-----BEGIN A-----\nAAAA\n-----END B-----\n",
+      line: 3,
+      why: Mismatched,
+    },
+    {
+      name: "a block the text ends inside",
+      text: "x\n-----BEGIN A-----\nAAAA\n",
+      line: 2,
+      why: Unclosed,
+    },
+    {
+      name: "a block opened inside another",
+      text: "-----BEGIN A-----\nAAAA\n-----BEGIN A-----\nAAAA\n-----END A-----\n",
+      line: 1,
+      why: Unclosed,
+    },
+    { name: "an END with no block open", text: "-----END A-----\n", line: 1, why: Unopened },
+    { name: "an END that is no boundary", text: "-----END A----\n", line: 1, why: BadBoundary },
+    {
+      name: "an END, outside any block, whose label opens with a hyphen",
+      text: "-----END -A-----\n",
+      line: 1,
+      why: BadBoundary,
+    },
+    {
+      name: "four hyphens after a label",
+      text: "-----BEGIN A----\nAAAA\n-----END A-----\n",
+      line: 1,
+      why: BadBoundary,
+    },
+    { name: "words after a boundary", text: "-----BEGIN A----- x\n", line: 1, why: BadBoundary },
+    { name: "a label ending in a space", text: "-----BEGIN A -----\n", line: 1, why: BadBoundary },
+    {
+      name: "a label with two spaces together",
+      text: "x\n-----BEGIN A  B-----\n",
+      line: 2,
+      why: BadBoundary,
+    },
+    {
+      name: "a label with a hyphen beside a space",
+      text: "-----BEGIN A- B-----\n",
+      line: 1,
+      why: BadBoundary,
+    },
+    {
+      name: "a character that is not base64",
+      text: "-----BEGIN A-----\nAA*A\n-----END A-----\n",
+      line: 2,
+      why: BadData,
+    },
+    {
+      name: "a blank inside a data line",
+      text: "-----BEGIN A-----\nAA AA\n-----END A-----\n",
+      line: 2,
+      why: BadData,
+    },
+    {
+      name: "a blank before a data line",
+      text: "-----BEGIN A-----\n AAAA\n-----END A-----\n",
+      line: 2,
+      why: BadData,
+    },
+    {
+      name: "an empty line between data lines",
+      text: "-----BEGIN A-----\nAAAA\n\nAAAA\n-----END A-----\n",
+      line: 3,
+      why: BadData,
+    },
+    {
+      name: "padding that opens a line before the last",
+      text: "-----BEGIN A-----\nAAAA\n=AAA\nAAAA\n-----END A-----\n",
+      line: 3,
+      why: NotCanonical,
+    },
+    {
+      name: "a header with no name",
+      text: "-----BEGIN A-----\n: v\n\nAAAA\n-----END A-----\n",
+      line: 2,
+      why: BadHeader,
+    },
+    {
+      name: "a header led by a blank",
+      text: "-----BEGIN A-----\n Name: v\n\nAAAA\n-----END A-----\n",
+      line: 2,
+      why: BadHeader,
+    },
+    {
+      name: "padding before the data's end",
+      text: "-----BEGIN A-----\nAAAA\nAA==\nAAAA\n-----END A-----\n",
+      line: 3,
+      why: NotCanonical,
+    },
+    {
+      name: "a last letter with bits no byte holds",
+      text: "-----BEGIN A-----\nAAAA\nAAAA\nAB==\n-----END A-----\n",
+      line: 4,
+      why: NotCanonical,
+    },
+    {
+      name: "data short of a group",
+      text: "-----BEGIN A-----\nAAAA\nAAA\n-----END A-----\n",
+      line: 3,
+      why: NotCanonical,
+    },
+    {
+      name: "a line among the headers that is none",
+      text: "-----BEGIN A-----\nName: v\nAAAA\n\nAAAA\n-----END A-----\n",
+      line: 3,
+      why: BadHeader,
+    },
+    {
+      name: "a header with a space in its name",
+      text: "-----BEGIN A-----\nNa me: v\n\nAAAA\n-----END A-----\n",
+      line: 2,
+      why: BadHeader,
+    },
+    {
+      name: "headers with no empty line after them",
+      text: "-----BEGIN A-----\nName: v\n-----END A-----\n",
+      line: 3,
+      why: BadHeader,
+    },
+    {
+      name: "a header after the empty line",
+      text: "-----BEGIN A-----\n\nName: v\n\nAAAA\n-----END A-----\n",
+      line: 3,
+      why: BadData,
+    },
+    {
+      name: "a key encrypted the legacy way",
+      line: 2,
+      why: Encrypted,
+      text:
+        \\-----BEGIN RSA PRIVATE KEY-----
+        \\Proc-Type: 4,ENCRYPTED
+        \\DEK-Info: AES-128-CBC,00
+        \\
+        \\AAAA
+        \\-----END RSA PRIVATE KEY-----
+        \\
+    },
+  ]
+
+test "{c.name} is refused" for c: Refused in refused() {
+  assert_eq(decode(c.text, 4096), Err({ line: c.line, why: c.why }));
+  assert(string_len(explain(c.why)) > 0)
+}
+
+test "a text past the limit is refused unread, and one at it is read" {
+  let text = "-----BEGIN A-----\nAAAA\n-----END A-----\n";
+  assert_eq(decode(text, string_len(text) - 1), Err({ line: 1, why: TooLong }));
+  assert_eq(
+    decode(text, string_len(text)),
+    Ok([Open({ label: Other("A"), headers: [], data: b"\x00\x00\x00" })]),
+  )
+}
+
+test "the refusal of legacy encryption says what to do instead" {
+  assert(string_contains(explain(Encrypted), "MD5"));
+  assert(string_contains(explain(Encrypted), "ENCRYPTED PRIVATE KEY"))
+}
+
+test "a block no reader here would read back is not written" {
+  let bytes = b"foo";
+  let labelled = |text: String| encode({ label: Other(text), headers: [], data: bytes });
+  let headed = |name: String, value: String|
+    encode({
+      label: Certificate,
+      headers: [{ name: "Ok", value: "v" }, { name: name, value: value }],
+      data: bytes,
+    });
+  assert_eq(
+    map(["A--B", "A\nB", " A", "A-", "A\u{7f}B", "Ä"], labelled),
+    map(range(0, 6), |_: Int| Err({ line: 1, why: BadLabel })),
+  );
+  assert_eq(labelled("A~ B-C"), Ok("-----BEGIN A~ B-C-----\nZm9v\n-----END A~ B-C-----\n"));
+  assert_eq(labelled("A B"), Ok("-----BEGIN A B-----\nZm9v\n-----END A B-----\n"));
+  assert_eq(
+    map(["No:colon", "No space", "", "N\u{7f}", "Né"], |name: String| headed(name, "v")),
+    map(range(0, 5), |_: Int| Err({ line: 3, why: BadHeader })),
+  );
+  assert_eq(
+    map(["two\nlines", " led", "trailed ", "a\tb", "a\u{7f}b"], |value: String|
+      headed("Name", value)),
+    map(range(0, 5), |_: Int| Err({ line: 3, why: BadHeader })),
+  );
+  assert_eq(headed("Proc-Type", "4,ENCRYPTED"), Err({ line: 3, why: Encrypted }));
+  assert_eq(
+    headed("!~", "é ~"),
+    Ok("-----BEGIN CERTIFICATE-----\nOk: v\n!~: é ~\n\nZm9v\n-----END CERTIFICATE-----\n"),
+  );
+  assert_eq(
+    encode({ label: Other(""), headers: [], data: bytes }),
+    Ok("-----BEGIN -----\nZm9v\n-----END -----\n"),
+  )
+}
+
+/// RFC 7468's examples: the figures of sections 5 to 13, and of appendix A, whose labels a
+/// reader keeps apart from the ones they resemble.
+fn figures() -> List<Figure> =
+  [
+    {
+      figure: 6,
+      label: "CERTIFICATE",
+      size: 560,
+      text:
+        \\-----BEGIN CERTIFICATE-----
+        \\MIICLDCCAdKgAwIBAgIBADAKBggqhkjOPQQDAjB9MQswCQYDVQQGEwJCRTEPMA0G
+        \\A1UEChMGR251VExTMSUwIwYDVQQLExxHbnVUTFMgY2VydGlmaWNhdGUgYXV0aG9y
+        \\aXR5MQ8wDQYDVQQIEwZMZXV2ZW4xJTAjBgNVBAMTHEdudVRMUyBjZXJ0aWZpY2F0
+        \\ZSBhdXRob3JpdHkwHhcNMTEwNTIzMjAzODIxWhcNMTIxMjIyMDc0MTUxWjB9MQsw
+        \\CQYDVQQGEwJCRTEPMA0GA1UEChMGR251VExTMSUwIwYDVQQLExxHbnVUTFMgY2Vy
+        \\dGlmaWNhdGUgYXV0aG9yaXR5MQ8wDQYDVQQIEwZMZXV2ZW4xJTAjBgNVBAMTHEdu
+        \\dVRMUyBjZXJ0aWZpY2F0ZSBhdXRob3JpdHkwWTATBgcqhkjOPQIBBggqhkjOPQMB
+        \\BwNCAARS2I0jiuNn14Y2sSALCX3IybqiIJUvxUpj+oNfzngvj/Niyv2394BWnW4X
+        \\uQ4RTEiywK87WRcWMGgJB5kX/t2no0MwQTAPBgNVHRMBAf8EBTADAQH/MA8GA1Ud
+        \\DwEB/wQFAwMHBgAwHQYDVR0OBBYEFPC0gf6YEr+1KLlkQAPLzB9mTigDMAoGCCqG
+        \\SM49BAMCA0gAMEUCIDGuwD1KPyG+hRf88MeyMQcqOFZD0TbVleF+UsAGQ4enAiEA
+        \\l4wOuDwKQa+upc8GftXE2C//4mKANBC6It01gUaTIpo=
+        \\-----END CERTIFICATE-----
+        \\
+    },
+    {
+      figure: 7,
+      label: "CERTIFICATE",
+      size: 413,
+      text:
+        \\Subject: CN=Atlantis
+        \\Issuer: CN=Atlantis
+        \\Validity: from 7/9/2012 3:10:38 AM UTC to 7/9/2013 3:10:37 AM UTC
+        \\-----BEGIN CERTIFICATE-----
+        \\MIIBmTCCAUegAwIBAgIBKjAJBgUrDgMCHQUAMBMxETAPBgNVBAMTCEF0bGFudGlz
+        \\MB4XDTEyMDcwOTAzMTAzOFoXDTEzMDcwOTAzMTAzN1owEzERMA8GA1UEAxMIQXRs
+        \\YW50aXMwXDANBgkqhkiG9w0BAQEFAANLADBIAkEAu+BXo+miabDIHHx+yquqzqNh
+        \\Ryn/XtkJIIHVcYtHvIX+S1x5ErgMoHehycpoxbErZmVR4GCq1S2diNmRFZCRtQID
+        \\AQABo4GJMIGGMAwGA1UdEwEB/wQCMAAwIAYDVR0EAQH/BBYwFDAOMAwGCisGAQQB
+        \\gjcCARUDAgeAMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDAzA1BgNVHQEE
+        \\LjAsgBA0jOnSSuIHYmnVryHAdywMoRUwEzERMA8GA1UEAxMIQXRsYW50aXOCASow
+        \\CQYFKw4DAh0FAANBAKi6HRBaNEL5R0n56nvfclQNaXiDT174uf+lojzA4lhVInc0
+        \\ILwpnZ1izL4MlI9eCSHhVQBHEp2uQdXJB+d5Byg=
+        \\-----END CERTIFICATE-----
+        \\
+    },
+    {
+      figure: 8,
+      label: "X509 CRL",
+      size: 504,
+      text:
+        \\-----BEGIN X509 CRL-----
+        \\MIIB9DCCAV8CAQEwCwYJKoZIhvcNAQEFMIIBCDEXMBUGA1UEChMOVmVyaVNpZ24s
+        \\IEluYy4xHzAdBgNVBAsTFlZlcmlTaWduIFRydXN0IE5ldHdvcmsxRjBEBgNVBAsT
+        \\PXd3dy52ZXJpc2lnbi5jb20vcmVwb3NpdG9yeS9SUEEgSW5jb3JwLiBieSBSZWYu
+        \\LExJQUIuTFREKGMpOTgxHjAcBgNVBAsTFVBlcnNvbmEgTm90IFZhbGlkYXRlZDEm
+        \\MCQGA1UECxMdRGlnaXRhbCBJRCBDbGFzcyAxIC0gTmV0c2NhcGUxGDAWBgNVBAMU
+        \\D1NpbW9uIEpvc2Vmc3NvbjEiMCAGCSqGSIb3DQEJARYTc2ltb25Aam9zZWZzc29u
+        \\Lm9yZxcNMDYxMjI3MDgwMjM0WhcNMDcwMjA3MDgwMjM1WjAjMCECEC4QNwPfRoWd
+        \\elUNpllhhTgXDTA2MTIyNzA4MDIzNFowCwYJKoZIhvcNAQEFA4GBAD0zX+J2hkcc
+        \\Nbrq1Dn5IKL8nXLgPGcHv1I/le1MNo9t1ohGQxB5HnFUkRPAY82fR6Epor4aHgVy
+        \\b+5y+neKN9Kn2mPF4iiun+a4o26CjJ0pArojCL1p8T0yyi9Xxvyc/ezaZ98HiIyP
+        \\c3DGMNR+oUmSjKZ0jIhAYmeLxaPHfQwR
+        \\-----END X509 CRL-----
+        \\
+    },
+    {
+      figure: 9,
+      label: "CERTIFICATE REQUEST",
+      size: 348,
+      text:
+        \\-----BEGIN CERTIFICATE REQUEST-----
+        \\MIIBWDCCAQcCAQAwTjELMAkGA1UEBhMCU0UxJzAlBgNVBAoTHlNpbW9uIEpvc2Vm
+        \\c3NvbiBEYXRha29uc3VsdCBBQjEWMBQGA1UEAxMNam9zZWZzc29uLm9yZzBOMBAG
+        \\ByqGSM49AgEGBSuBBAAhAzoABLLPSkuXY0l66MbxVJ3Mot5FCFuqQfn6dTs+9/CM
+        \\EOlSwVej77tj56kj9R/j9Q+LfysX8FO9I5p3oGIwYAYJKoZIhvcNAQkOMVMwUTAY
+        \\BgNVHREEETAPgg1qb3NlZnNzb24ub3JnMAwGA1UdEwEB/wQCMAAwDwYDVR0PAQH/
+        \\BAUDAwegADAWBgNVHSUBAf8EDDAKBggrBgEFBQcDATAKBggqhkjOPQQDAgM/ADA8
+        \\AhxBvfhxPFfbBbsE1NoFmCUczOFApEuQVUw3ZP69AhwWXk3dgSUsKnuwL5g/ftAY
+        \\dEQc8B8jAcnuOrfU
+        \\-----END CERTIFICATE REQUEST-----
+        \\
+    },
+    {
+      figure: 10,
+      label: "PKCS7",
+      size: 230,
+      text:
+        \\-----BEGIN PKCS7-----
+        \\MIHjBgsqhkiG9w0BCRABF6CB0zCB0AIBADFho18CAQCgGwYJKoZIhvcNAQUMMA4E
+        \\CLfrI6dr0gUWAgITiDAjBgsqhkiG9w0BCRADCTAUBggqhkiG9w0DBwQIZpECRWtz
+        \\u5kEGDCjerXY8odQ7EEEromZJvAurk/j81IrozBSBgkqhkiG9w0BBwEwMwYLKoZI
+        \\hvcNAQkQAw8wJDAUBggqhkiG9w0DBwQI0tCBcU09nxEwDAYIKwYBBQUIAQIFAIAQ
+        \\OsYGYUFdAH0RNc1p4VbKEAQUM2Xo8PMHBoYdqEcsbTodlCFAZH4=
+        \\-----END PKCS7-----
+        \\
+    },
+    {
+      figure: 11,
+      label: "CMS",
+      size: 134,
+      text:
+        \\-----BEGIN CMS-----
+        \\MIGDBgsqhkiG9w0BCRABCaB0MHICAQAwDQYLKoZIhvcNAQkQAwgwXgYJKoZIhvcN
+        \\AQcBoFEET3icc87PK0nNK9ENqSxItVIoSa0o0S/ISczMs1ZIzkgsKk4tsQ0N1nUM
+        \\dvb05OXi5XLPLEtViMwvLVLwSE0sKlFIVHAqSk3MBkkBAJv0Fx0=
+        \\-----END CMS-----
+        \\
+    },
+    {
+      figure: 12,
+      label: "PRIVATE KEY",
+      size: 135,
+      text:
+        \\-----BEGIN PRIVATE KEY-----
+        \\MIGEAgEAMBAGByqGSM49AgEGBSuBBAAKBG0wawIBAQQgVcB/UNPxalR9zDYAjQIf
+        \\jojUDiQuGnSJrFEEzZPT/92hRANCAASc7UJtgnF/abqWM60T3XNJEzBv5ez9TdwK
+        \\H0M6xpM2q+53wmsN/eYLdgtjgBd3DBmHtPilCkiFICXyaA8z9LkJ
+        \\-----END PRIVATE KEY-----
+        \\
+    },
+    {
+      figure: 13,
+      label: "ENCRYPTED PRIVATE KEY",
+      size: 208,
+      text:
+        \\-----BEGIN ENCRYPTED PRIVATE KEY-----
+        \\MIHNMEAGCSqGSIb3DQEFDTAzMBsGCSqGSIb3DQEFDDAOBAghhICA6T/51QICCAAw
+        \\FAYIKoZIhvcNAwcECBCxDgvI59i9BIGIY3CAqlMNBgaSI5QiiWVNJ3IpfLnEiEsW
+        \\Z0JIoHyRmKK/+cr9QPLnzxImm0TR9s4JrG3CilzTWvb0jIvbG3hu0zyFPraoMkap
+        \\8eRzWsIvC5SVel+CSjoS2mVS87cyjlD+txrmrXOVYDE+eTgMLbrLmsWh3QkCTRtF
+        \\QC7k0NNzUHTV9yGDwfqMbw==
+        \\-----END ENCRYPTED PRIVATE KEY-----
+        \\
+    },
+    {
+      figure: 14,
+      label: "ATTRIBUTE CERTIFICATE",
+      size: 559,
+      text:
+        \\-----BEGIN ATTRIBUTE CERTIFICATE-----
+        \\MIICKzCCAZQCAQEwgZeggZQwgYmkgYYwgYMxCzAJBgNVBAYTAlVTMREwDwYDVQQI
+        \\DAhOZXcgWW9yazEUMBIGA1UEBwwLU3RvbnkgQnJvb2sxDzANBgNVBAoMBkNTRTU5
+        \\MjE6MDgGA1UEAwwxU2NvdHQgU3RhbGxlci9lbWFpbEFkZHJlc3M9c3N0YWxsZXJA
+        \\aWMuc3VueXNiLmVkdQIGARWrgUUSoIGMMIGJpIGGMIGDMQswCQYDVQQGEwJVUzER
+        \\MA8GA1UECAwITmV3IFlvcmsxFDASBgNVBAcMC1N0b255IEJyb29rMQ8wDQYDVQQK
+        \\DAZDU0U1OTIxOjA4BgNVBAMMMVNjb3R0IFN0YWxsZXIvZW1haWxBZGRyZXNzPXNz
+        \\dGFsbGVyQGljLnN1bnlzYi5lZHUwDQYJKoZIhvcNAQEFBQACBgEVq4FFSjAiGA8z
+        \\OTA3MDIwMTA1MDAwMFoYDzM5MTEwMTMxMDUwMDAwWjArMCkGA1UYSDEiMCCGHmh0
+        \\dHA6Ly9pZGVyYXNobi5vcmcvaW5kZXguaHRtbDANBgkqhkiG9w0BAQUFAAOBgQAV
+        \\M9axFPXXozEFcer06bj9MCBBCQLtAM7ZXcZjcxyva7xCBDmtZXPYUluHf5OcWPJz
+        \\5XPus/xS9wBgtlM3fldIKNyNO8RsMp6Ocx+PGlICc7zpZiGmCYLl64lAEGPO/bsw
+        \\Smluak1aZIttePeTAHeJJs8izNJ5aR3Wcd3A5gLztQ==
+        \\-----END ATTRIBUTE CERTIFICATE-----
+        \\
+    },
+    {
+      figure: 15,
+      label: "PUBLIC KEY",
+      size: 120,
+      text:
+        \\-----BEGIN PUBLIC KEY-----
+        \\MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEn1LlwLN/KBYQRVH6HfIMTzfEqJOVztLe
+        \\kLchp2hi78cCaMY81FBlYs8J9l7krc+M4aBeCGYFjba+hiXttJWPL7ydlE+5UG4U
+        \\Nkn3Eos8EiZByi9DVsyfy9eejh+8AXgp
+        \\-----END PUBLIC KEY-----
+        \\
+    },
+    {
+      figure: 16,
+      label: "X509 CERTIFICATE",
+      size: 288,
+      text:
+        \\-----BEGIN X509 CERTIFICATE-----
+        \\MIIBHDCBxaADAgECAgIcxzAJBgcqhkjOPQQBMBAxDjAMBgNVBAMUBVBLSVghMB4X
+        \\DTE0MDkxNDA2MTU1MFoXDTI0MDkxNDA2MTU1MFowEDEOMAwGA1UEAxQFUEtJWCEw
+        \\WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATwoQSr863QrR0PoRIYQ96H7WykDePH
+        \\Wa0eVAE24bth43wCNc+U5aZ761dhGhSSJkVWRgVH5+prLIr+nzfIq+X4oxAwDjAM
+        \\BgNVHRMBAf8EAjAAMAkGByqGSM49BAEDRwAwRAIfMdKS5F63lMnWVhi7uaKJzKCs
+        \\NnY/OKgBex6MIEAv2AIhAI2GdvfL+mGvhyPZE+JxRxWChmggb5/9eHdUcmW/jkOH
+        \\-----END X509 CERTIFICATE-----
+        \\
+    },
+    {
+      figure: 17,
+      label: "X.509 CERTIFICATE",
+      size: 288,
+      text:
+        \\-----BEGIN X.509 CERTIFICATE-----
+        \\MIIBHDCBxaADAgECAgIcxzAJBgcqhkjOPQQBMBAxDjAMBgNVBAMUBVBLSVghMB4X
+        \\DTE0MDkxNDA2MTU1MFoXDTI0MDkxNDA2MTU1MFowEDEOMAwGA1UEAxQFUEtJWCEw
+        \\WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATwoQSr863QrR0PoRIYQ96H7WykDePH
+        \\Wa0eVAE24bth43wCNc+U5aZ761dhGhSSJkVWRgVH5+prLIr+nzfIq+X4oxAwDjAM
+        \\BgNVHRMBAf8EAjAAMAkGByqGSM49BAEDRwAwRAIfMdKS5F63lMnWVhi7uaKJzKCs
+        \\NnY/OKgBex6MIEAv2AIhAI2GdvfL+mGvhyPZE+JxRxWChmggb5/9eHdUcmW/jkOH
+        \\-----END X.509 CERTIFICATE-----
+        \\
+    },
+    {
+      figure: 18,
+      label: "NEW CERTIFICATE REQUEST",
+      size: 348,
+      text:
+        \\-----BEGIN NEW CERTIFICATE REQUEST-----
+        \\MIIBWDCCAQcCAQAwTjELMAkGA1UEBhMCU0UxJzAlBgNVBAoTHlNpbW9uIEpvc2Vm
+        \\c3NvbiBEYXRha29uc3VsdCBBQjEWMBQGA1UEAxMNam9zZWZzc29uLm9yZzBOMBAG
+        \\ByqGSM49AgEGBSuBBAAhAzoABLLPSkuXY0l66MbxVJ3Mot5FCFuqQfn6dTs+9/CM
+        \\EOlSwVej77tj56kj9R/j9Q+LfysX8FO9I5p3oGIwYAYJKoZIhvcNAQkOMVMwUTAY
+        \\BgNVHREEETAPgg1qb3NlZnNzb24ub3JnMAwGA1UdEwEB/wQCMAAwDwYDVR0PAQH/
+        \\BAUDAwegADAWBgNVHSUBAf8EDDAKBggrBgEFBQcDATAKBggqhkjOPQQDAgM/ADA8
+        \\AhxBvfhxPFfbBbsE1NoFmCUczOFApEuQVUw3ZP69AhwWXk3dgSUsKnuwL5g/ftAY
+        \\dEQc8B8jAcnuOrfU
+        \\-----END NEW CERTIFICATE REQUEST-----
+        \\
+    },
+    {
+      figure: 19,
+      label: "CERTIFICATE CHAIN",
+      size: 230,
+      text:
+        \\-----BEGIN CERTIFICATE CHAIN-----
+        \\MIHjBgsqhkiG9w0BCRABF6CB0zCB0AIBADFho18CAQCgGwYJKoZIhvcNAQUMMA4E
+        \\CLfrI6dr0gUWAgITiDAjBgsqhkiG9w0BCRADCTAUBggqhkiG9w0DBwQIZpECRWtz
+        \\u5kEGDCjerXY8odQ7EEEromZJvAurk/j81IrozBSBgkqhkiG9w0BBwEwMwYLKoZI
+        \\hvcNAQkQAw8wJDAUBggqhkiG9w0DBwQI0tCBcU09nxEwDAYIKwYBBQUIAQIFAIAQ
+        \\OsYGYUFdAH0RNc1p4VbKEAQUM2Xo8PMHBoYdqEcsbTodlCFAZH4=
+        \\-----END CERTIFICATE CHAIN-----
+        \\
+    },
+  ]
