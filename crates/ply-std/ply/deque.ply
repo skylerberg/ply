@@ -1,0 +1,667 @@
+//! A double-ended queue: elements enter and leave at either end, and are read by position.
+//!
+//! A `List` already appends at its back and gives up its first element by sharing the rest, so a
+//! first-in, first-out queue needs no more than `push` and a `[x, ..rest]` pattern. What a `List`
+//! lacks is the other two: an element put first and the last one taken away each copy it. A `Deque`
+//! is two lists and the part of each that is live. The back list grows by `push` and the front list
+//! holds the leading elements last first, so it grows the same way; an element leaves by moving the
+//! edge of a live part, which writes nothing. A push, a pop, a read by position, a drop and a
+//! reversal are each a constant number of steps. A list more than half dead is copied down to its
+//! live part, which the removals that emptied it have paid for. A deque held and used again copies
+//! one path of a list, as a shared `List` does, so only that copying down is paid again by each
+//! use of the deque it falls on.
+//!
+//! A deque is the elements it holds, front to back: `to_list` is its `key`, so two deques holding
+//! one sequence are `==`, share a `digest` and are one `Map` key whatever each one's lists and
+//! limit are. Every operation is specified against that list, and against `limit` where it has one.
+//!
+//! A bounded deque (`bounded`) holds at most its limit: a push at one end past it drops from the
+//! other, which is a sliding window. The limit is no part of what a deque equals.
+
+import std.laws (agrees, inverse, refines)
+import std.list (drop, first, last, prepend, slice, take)
+import std.list as list
+
+/// A sequence of `a`s open at both ends.
+///
+/// The front list and the live part of it, from an index up to another, then the back list and
+/// its live part, then the limit. The front list holds its elements last first. An index outside
+/// its list is read as the nearest one inside, and a limit below zero as zero, so every value of
+/// the type is a deque.
+pub type Deque<a> = | Deque(List<a>, Int, Int, List<a>, Int, Int, Option<Int>)
+
+key for Deque by to_list
+
+/// The deque holding nothing, with no limit.
+pub fn empty<a>() -> Deque<a>
+  ensures to_list(result) == []
+  ensures limit(result) == None
+= Deque([], 0, 0, [], 0, 0, None)
+
+/// The deque holding nothing that keeps at most `most` elements; a `most` below zero is zero.
+pub fn bounded<a>(most: Int) -> Deque<a>
+  ensures to_list(result) == []
+  ensures limit(result) == Some(max(most, 0))
+  cost 1
+= Deque([], 0, 0, [], 0, 0, Some(max(most, 0)))
+
+/// The deque of the elements of `xs`, the first at the front, with no limit.
+pub fn of_list<a>(xs: List<a>) -> Deque<a>
+  ensures to_list(result) == xs
+  ensures limit(result) == None
+  cost 1
+= Deque([], 0, 0, xs, 0, len(xs), None)
+
+/// The most elements the deque keeps, or `None` for one with no limit.
+pub fn limit<a>(d: Deque<a>) -> Option<Int> =
+  match d {
+    Deque(_, _, _, _, _, _, most) -> match most {
+      None -> None,
+      Some(n) -> if n < 0 { Some(0) } else { most },
+    },
+  }
+
+/// How many elements the deque holds.
+pub fn size<a>(d: Deque<a>) -> Int
+  ensures result == len(to_list(d))
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, _) -> {
+      let ft = max(0, min(front_to, len(front)));
+      let bt = max(0, min(back_to, len(back)));
+      ft - max(0, min(front_from, ft)) + bt - max(0, min(back_from, bt))
+    },
+  }
+
+/// Whether the deque holds nothing.
+pub fn is_empty<a>(d: Deque<a>) -> Bool
+  ensures result == (to_list(d) == [])
+= size(d) == 0
+
+/// The elements, front to back.
+pub fn to_list<a>(d: Deque<a>) -> List<a> =
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, _) -> {
+      let ft = max(0, min(front_to, len(front)));
+      let ff = max(0, min(front_from, ft));
+      let bt = max(0, min(back_to, len(back)));
+      let bf = max(0, min(back_from, bt));
+      if ft == ff && bf == 0 && bt == len(back) { back } else {
+        fold(
+          range(bf, bt),
+          fold(range(0, ft - ff), [], |acc: List<a>, i: Int|
+            match list_at(front, ft - 1 - i) { Some(x) -> push(acc, x), None -> acc }),
+          |acc: List<a>, i: Int| match list_at(back, i) { Some(x) -> push(acc, x), None -> acc },
+        )
+      }
+    },
+  }
+
+/// The element `i` places from the front, or `None` where the deque holds no such place.
+pub fn get<a>(d: Deque<a>, i: Int) -> Option<a>
+  ensures result == list_at(to_list(d), i)
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, _) -> {
+      let ft = max(0, min(front_to, len(front)));
+      let ahead = ft - max(0, min(front_from, ft));
+      let bt = max(0, min(back_to, len(back)));
+      let bf = max(0, min(back_from, bt));
+      if i < 0 { None }
+      else if i < ahead { list_at(front, ft - 1 - i) }
+      else if i - ahead < bt - bf { list_at(back, bf + i - ahead) }
+      else { None }
+    },
+  }
+
+/// The first element, or `None` for an empty deque.
+pub fn peek_front<a>(d: Deque<a>) -> Option<a>
+  ensures result == first(to_list(d))
+= get(d, 0)
+
+/// The last element, or `None` for an empty deque.
+pub fn peek_back<a>(d: Deque<a>) -> Option<a>
+  ensures result == last(to_list(d))
+= get(d, size(d) - 1)
+
+/// `d` with `x` first. A bounded deque already at its limit drops its last element for it, and
+/// one whose limit is zero stays empty.
+pub fn push_front<a>(d: Deque<a>, x: a) -> Deque<a>
+  ensures to_list(result) == kept_front(prepend(x, to_list(d)), limit(d))
+  ensures limit(result) == limit(d)
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, most) -> {
+      let to = max(0, min(front_to, len(front)));
+      let from = max(0, min(front_from, to));
+      let grown = if to == len(front) { push(front, x) } else { written(front, to, x) };
+      match most {
+        None -> Deque(grown, from, to + 1, back, back_from, back_to, most),
+        Some(_) -> held_front(Deque(grown, from, to + 1, back, back_from, back_to, most)),
+      }
+    },
+  }
+
+/// `d` with `x` last. A bounded deque already at its limit drops its first element for it, and
+/// one whose limit is zero stays empty.
+pub fn push_back<a>(d: Deque<a>, x: a) -> Deque<a>
+  ensures to_list(result) == kept_back(push(to_list(d), x), limit(d))
+  ensures limit(result) == limit(d)
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, most) -> {
+      let to = max(0, min(back_to, len(back)));
+      let from = max(0, min(back_from, to));
+      let grown = if to == len(back) { push(back, x) } else { written(back, to, x) };
+      match most {
+        None -> Deque(front, front_from, front_to, grown, from, to + 1, most),
+        Some(_) -> held_back(Deque(front, front_from, front_to, grown, from, to + 1, most)),
+      }
+    },
+  }
+
+/// The first element and the deque without it, or `None` for an empty deque.
+pub fn pop_front<a>(d: Deque<a>) -> Option<{ value: a, rest: Deque<a> }>
+  ensures match result {
+    None -> to_list(d) == [],
+    Some(popped) ->
+      to_list(d) == prepend(popped.value, to_list(popped.rest)) && limit(popped.rest) == limit(d),
+  }
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, most) -> {
+      let ft = max(0, min(front_to, len(front)));
+      let ff = max(0, min(front_from, ft));
+      let bt = max(0, min(back_to, len(back)));
+      let bf = max(0, min(back_from, bt));
+      if ft > ff {
+        match list_at(front, ft - 1) {
+          Some(x) -> Some({ value: x, rest: packed(front, ff, ft - 1, back, bf, bt, most) }),
+          None -> None,
+        }
+      } else if bt > bf {
+        match list_at(back, bf) {
+          Some(x) -> Some({ value: x, rest: packed(front, ff, ft, back, bf + 1, bt, most) }),
+          None -> None,
+        }
+      } else { None }
+    },
+  }
+
+/// The last element and the deque without it, or `None` for an empty deque.
+pub fn pop_back<a>(d: Deque<a>) -> Option<{ value: a, rest: Deque<a> }>
+  ensures match result {
+    None -> to_list(d) == [],
+    Some(popped) ->
+      to_list(d) == push(to_list(popped.rest), popped.value) && limit(popped.rest) == limit(d),
+  }
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, most) -> {
+      let ft = max(0, min(front_to, len(front)));
+      let ff = max(0, min(front_from, ft));
+      let bt = max(0, min(back_to, len(back)));
+      let bf = max(0, min(back_from, bt));
+      if bt > bf {
+        match list_at(back, bt - 1) {
+          Some(x) -> Some({ value: x, rest: packed(front, ff, ft, back, bf, bt - 1, most) }),
+          None -> None,
+        }
+      } else if ft > ff {
+        match list_at(front, ff) {
+          Some(x) -> Some({ value: x, rest: packed(front, ff + 1, ft, back, bf, bt, most) }),
+          None -> None,
+        }
+      } else { None }
+    },
+  }
+
+/// The deque without its first `n` elements. An `n` below one is the deque itself, and one past
+/// the size is the empty deque.
+pub fn drop_front<a>(d: Deque<a>, n: Int) -> Deque<a>
+  ensures to_list(result) == drop(to_list(d), n)
+  ensures limit(result) == limit(d)
+=
+  if n <= 0 { d } else {
+    match d {
+      Deque(front, front_from, front_to, back, back_from, back_to, most) -> {
+        let ft = max(0, min(front_to, len(front)));
+        let ff = max(0, min(front_from, ft));
+        let bt = max(0, min(back_to, len(back)));
+        let bf = max(0, min(back_from, bt));
+        let ahead = min(n, ft - ff);
+        packed(front, ff, ft - ahead, back, bf + min(n - ahead, bt - bf), bt, most)
+      },
+    }
+  }
+
+/// The deque without its last `n` elements. An `n` below one is the deque itself, and one past
+/// the size is the empty deque.
+pub fn drop_back<a>(d: Deque<a>, n: Int) -> Deque<a>
+  ensures to_list(result) == take(to_list(d), len(to_list(d)) - max(n, 0))
+  ensures limit(result) == limit(d)
+=
+  if n <= 0 { d } else {
+    match d {
+      Deque(front, front_from, front_to, back, back_from, back_to, most) -> {
+        let ft = max(0, min(front_to, len(front)));
+        let ff = max(0, min(front_from, ft));
+        let bt = max(0, min(back_to, len(back)));
+        let bf = max(0, min(back_from, bt));
+        let behind = min(n, bt - bf);
+        packed(front, ff + min(n - behind, ft - ff), ft, back, bf, bt - behind, most)
+      },
+    }
+  }
+
+/// The elements back to front, in a deque of the same limit. Nothing is copied.
+pub fn reverse<a>(d: Deque<a>) -> Deque<a>
+  ensures to_list(result) == list::reverse(to_list(d))
+  ensures limit(result) == limit(d)
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, most) ->
+      Deque(back, back_from, back_to, front, front_from, front_to, most),
+  }
+
+/// `d` under another limit, or none: its elements, the last `most` of them where it now has one.
+pub fn with_limit<a>(d: Deque<a>, most: Option<Int>) -> Deque<a>
+  ensures to_list(result) == kept_back(to_list(d), most)
+  ensures limit(result) == (match most { None -> None, Some(n) -> Some(max(n, 0)) })
+=
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, _) ->
+      held_back(Deque(front, front_from, front_to, back, back_from, back_to, most)),
+  }
+
+/// `a`'s elements and then `b`'s, under `a`'s limit: a bounded `a` keeps the last of them. The
+/// shorter of the two is pushed onto the other where `a` has no limit, and `b` onto `a` where it
+/// has one.
+pub fn concat<a>(a: Deque<a>, b: Deque<a>) -> Deque<a>
+  ensures to_list(result) == kept_back(list::concat(to_list(a), to_list(b)), limit(a))
+  ensures limit(result) == limit(a)
+=
+  match limit(a) {
+    None -> if size(a) < size(b) {
+      fold_back(a, with_limit(b, None), |d: Deque<a>, x: a| push_front(d, x))
+    } else { fold_front(b, a, |d: Deque<a>, x: a| push_back(d, x)) },
+    Some(_) -> held_back(fold_front(b, a, |d: Deque<a>, x: a| push_back(d, x))),
+  }
+
+/// `f` over the elements from the front, as the prelude's `fold` is over a list.
+pub fn fold_front<a, b | e>(d: Deque<a>, init: b, f: (b, a) -> b / e) -> b / e =
+  match d {
+    Deque(front, front_from, front_to, back, back_from, back_to, _) -> {
+      let ft = max(0, min(front_to, len(front)));
+      let ff = max(0, min(front_from, ft));
+      let bt = max(0, min(back_to, len(back)));
+      let bf = max(0, min(back_from, bt));
+      fold(
+        range(bf, bt),
+        fold(range(0, ft - ff), init, |acc: b, i: Int|
+          match list_at(front, ft - 1 - i) { Some(x) -> f(acc, x), None -> acc }),
+        |acc: b, i: Int| match list_at(back, i) { Some(x) -> f(acc, x), None -> acc },
+      )
+    },
+  }
+
+/// `f` over the elements from the back.
+pub fn fold_back<a, b | e>(d: Deque<a>, init: b, f: (b, a) -> b / e) -> b / e =
+  fold_front(reverse(d), init, f)
+
+/// What a deque of that limit keeps of `xs` when it fills from the back: the last `most` of them,
+/// or all of them with no limit.
+pub fn kept_back<a>(xs: List<a>, most: Option<Int>) -> List<a> =
+  match most { None -> xs, Some(n) -> drop(xs, len(xs) - max(n, 0)) }
+
+/// What a deque of that limit keeps of `xs` when it fills from the front: the first `most` of
+/// them, or all of them with no limit.
+pub fn kept_front<a>(xs: List<a>, most: Option<Int>) -> List<a> =
+  match most { None -> xs, Some(n) -> take(xs, max(n, 0)) }
+
+fn held_back<a>(d: Deque<a>) -> Deque<a> =
+  match limit(d) { None -> d, Some(most) -> drop_front(d, size(d) - most) }
+
+fn held_front<a>(d: Deque<a>) -> Deque<a> =
+  match limit(d) { None -> d, Some(most) -> drop_back(d, size(d) - most) }
+
+/// The deque of those live parts, a list at least half dead copied down to its live part.
+fn packed<a>(
+  front: List<a>,
+  front_from: Int,
+  front_to: Int,
+  back: List<a>,
+  back_from: Int,
+  back_to: Int,
+  most: Option<Int>,
+) -> Deque<a> =
+  if front_to - front_from + back_to - back_from == 0 { Deque([], 0, 0, [], 0, 0, most) } else {
+    let ahead = len(front) >= 2 * (front_to - front_from) + 32;
+    let behind = len(back) >= 2 * (back_to - back_from) + 32;
+    Deque(
+      if ahead { slice(front, front_from, front_to) } else { front },
+      if ahead { 0 } else { front_from },
+      if ahead { front_to - front_from } else { front_to },
+      if behind { slice(back, back_from, back_to) } else { back },
+      if behind { 0 } else { back_from },
+      if behind { back_to - back_from } else { back_to },
+      most,
+    )
+  }
+
+/// `list_set` at an index the caller has placed inside the list, which a row cannot say.
+fn written<a>(xs: List<a>, i: Int, x: a) -> List<a> =
+  handle { list_set(xs, i, x) } with { abort.raise(_) -> xs }
+
+// --- Tests ------------------------------------------------------------------
+
+fn numbered(n: Int) -> Deque<Int> = of_list(range(0, n))
+
+fn popped_front(d: Deque<Int>) -> Deque<Int> =
+  match pop_front(d) { Some(popped) -> popped.rest, None -> d }
+
+fn popped_back(d: Deque<Int>) -> Deque<Int> =
+  match pop_back(d) { Some(popped) -> popped.rest, None -> d }
+
+test "elements enter and leave at both ends" {
+  let d = push_front(push_back(push_back(push_front(empty(), 2), 3), 4), 1);
+  assert_eq(to_list(d), [1, 2, 3, 4]);
+  assert_eq(size(d), 4);
+  assert(!is_empty(d));
+  assert_eq(peek_front(d), Some(1));
+  assert_eq(peek_back(d), Some(4));
+  assert(pop_front(d) == Some({ value: 1, rest: of_list([2, 3, 4]) }));
+  assert(pop_back(d) == Some({ value: 4, rest: of_list([1, 2, 3]) }));
+  assert_eq(to_list(popped_back(popped_back(popped_back(d)))), [1]);
+  assert_eq(to_list(popped_front(popped_front(popped_front(d)))), [4]);
+  assert_eq(to_list(push_back(popped_back(popped_front(d)), 9)), [2, 3, 9]);
+  assert_eq(to_list(push_front(popped_front(popped_back(d)), 9)), [9, 2, 3])
+}
+
+test "an empty deque has nothing to answer" {
+  let none: Deque<Int> = empty();
+  assert(is_empty(none));
+  assert_eq(size(none), 0);
+  assert_eq(peek_front(none), None);
+  assert_eq(peek_back(none), None);
+  assert(pop_front(none) == None);
+  assert(pop_back(none) == None);
+  assert_eq(get(none, 0), None);
+  assert_eq(to_list(none), []);
+  assert(is_empty(popped_front(push_back(none, 1))))
+}
+
+test "an element is read by its place from the front" {
+  let d = push_front(push_front(numbered(3), 8), 9);
+  assert_eq(map(range(0, 5), |i: Int| get(d, i)), [Some(9), Some(8), Some(0), Some(1), Some(2)]);
+  assert_eq(get(d, 5), None);
+  assert_eq(get(d, 0 - 1), None)
+}
+
+test "reads agree with the list once every edge of both lists has moved" {
+  let ahead = popped_back(
+    popped_back(popped_front(fold(range(0, 6), empty(), |d: Deque<Int>, i: Int| push_front(d, i)))),
+  );
+  assert_eq(to_list(ahead), [4, 3, 2]);
+  assert_eq(size(ahead), 3);
+  assert_eq(map(range(0, 4), |i: Int| get(ahead, i)), [Some(4), Some(3), Some(2), None]);
+  assert_eq(peek_back(ahead), Some(2));
+  let behind = popped_back(popped_front(popped_front(numbered(6))));
+  assert_eq(to_list(behind), [2, 3, 4]);
+  assert_eq(map(range(0, 4), |i: Int| get(behind, i)), [Some(2), Some(3), Some(4), None]);
+  let both = popped_back(push_front(push_front(behind, 8), 9));
+  assert_eq(to_list(both), [9, 8, 2, 3]);
+  assert_eq(size(both), 4);
+  assert_eq(map(range(0, 5), |i: Int| get(both, i)), [Some(9), Some(8), Some(2), Some(3), None]);
+  assert_eq(fold_front(both, [], |acc: List<Int>, x: Int| push(acc, x)), [9, 8, 2, 3]);
+  assert_eq(fold_back(both, [], |acc: List<Int>, x: Int| push(acc, x)), [3, 2, 8, 9]);
+  assert_eq(to_list(drop_front(both, 3)), [3]);
+  assert_eq(to_list(drop_back(both, 3)), [9])
+}
+
+test "a stack at either end writes over what it popped" {
+  let back = popped_back(popped_back(numbered(3)));
+  assert_eq(to_list(push_back(back, 7)), [0, 7]);
+  assert_eq(to_list(push_back(push_back(push_back(back, 7), 8), 9)), [0, 7, 8, 9]);
+  let front = popped_front(
+    popped_front(fold(range(0, 3), empty(), |d: Deque<Int>, i: Int| push_front(d, i))),
+  );
+  assert_eq(to_list(push_front(front, 7)), [7, 0]);
+  assert_eq(to_list(push_front(push_front(push_front(front, 7), 8), 9)), [9, 8, 7, 0]);
+  assert_eq(to_list(push_back(with_limit(back, Some(5)), 7)), [0, 7]);
+  assert_eq(to_list(push_front(with_limit(front, Some(5)), 7)), [7, 0])
+}
+
+test "a drop past one list's live part takes the rest from the other's" {
+  let front_first = push_back(
+    push_back(
+      popped_back(
+        popped_back(fold(range(0, 4), empty(), |d: Deque<Int>, i: Int| push_front(d, i))),
+      ),
+      7,
+    ),
+    8,
+  );
+  assert_eq(to_list(front_first), [3, 2, 7, 8]);
+  assert_eq(to_list(drop_front(front_first, 3)), [8]);
+  assert_eq(to_list(drop_back(front_first, 3)), [3]);
+  let back_first = push_front(push_front(popped_front(popped_front(numbered(4))), 9), 8);
+  assert_eq(to_list(back_first), [8, 9, 2, 3]);
+  assert_eq(to_list(drop_back(back_first, 3)), [8]);
+  assert_eq(to_list(drop_front(back_first, 3)), [3])
+}
+
+test "a bounded deque is a window: a push past its limit drops from the other end" {
+  let window = fold(range(0, 10), bounded(3), |d: Deque<Int>, i: Int| push_back(d, i));
+  assert_eq(to_list(window), [7, 8, 9]);
+  assert_eq(limit(window), Some(3));
+  assert_eq(to_list(push_front(window, 0)), [0, 7, 8]);
+  assert_eq(to_list(push_back(push_back(bounded(0), 1), 2)), []);
+  assert_eq(limit(push_back(bounded(0 - 4), 1)), Some(0));
+  assert_eq(to_list(push_front(bounded(1), 5)), [5]);
+  assert_eq(to_list(push_front(push_front(bounded(1), 5), 6)), [6]);
+  assert_eq(limit(numbered(2)), None);
+  assert_eq(to_list(with_limit(numbered(5), Some(2))), [3, 4]);
+  assert_eq(limit(with_limit(window, None)), None);
+  assert_eq(to_list(push_back(with_limit(window, None), 10)), [7, 8, 9, 10])
+}
+
+test "drops, a reversal and a concatenation are the list's" {
+  let d = push_front(numbered(4), 9);
+  assert_eq(to_list(drop_front(d, 2)), [1, 2, 3]);
+  assert_eq(to_list(drop_back(d, 2)), [9, 0, 1]);
+  assert_eq(to_list(drop_front(d, 0)), [9, 0, 1, 2, 3]);
+  assert_eq(to_list(drop_back(d, 99)), []);
+  assert_eq(to_list(reverse(d)), [3, 2, 1, 0, 9]);
+  assert_eq(to_list(push_back(reverse(d), 7)), [3, 2, 1, 0, 9, 7]);
+  assert_eq(to_list(concat(d, numbered(2))), [9, 0, 1, 2, 3, 0, 1]);
+  assert_eq(to_list(concat(numbered(2), d)), [0, 1, 9, 0, 1, 2, 3]);
+  assert_eq(to_list(concat(d, empty())), to_list(d));
+  assert_eq(to_list(concat(empty(), d)), to_list(d));
+  assert_eq(to_list(concat(bounded(3), d)), [1, 2, 3]);
+  assert_eq(limit(concat(bounded(3), d)), Some(3));
+  assert_eq(limit(concat(d, bounded(3))), None)
+}
+
+test "a fold runs from either end, and its callback may perform effects" {
+  let d = push_front(numbered(3), 9);
+  assert_eq(fold_front(d, "", |acc: String, x: Int| acc ++ int_to_string(x)), "9012");
+  assert_eq(fold_back(d, "", |acc: String, x: Int| acc ++ int_to_string(x)), "2109");
+  let calls = with_cell[calls](0) { c -> {
+    let total = fold_front(d, 0, |acc: Int, x: Int| {
+      cell_update(c, |n: Int| n + 1);
+      acc + x
+    });
+    { total: total, calls: cell_get(c) }
+  } };
+  assert_eq(calls, { total: 12, calls: 4 })
+}
+
+test "two deques holding one sequence are one value, whatever their lists and limits are" {
+  let pushed_back = numbered(3);
+  let pushed_front = push_front(push_front(push_front(empty(), 2), 1), 0);
+  let window = fold(range(0 - 4, 3), bounded(3), |d: Deque<Int>, i: Int| push_back(d, i));
+  assert(pushed_back == pushed_front);
+  assert(pushed_back == window);
+  assert_eq(pushed_front, window);
+  assert_eq(digest(pushed_back), digest(pushed_front));
+  assert_eq(digest(pushed_back), digest(window));
+  assert_eq(compare(pushed_front, window), Equal);
+  assert_eq(map_len(#{pushed_back: 1, pushed_front: 2, window: 3}), 1);
+  assert(pushed_back != push_back(pushed_front, 3));
+  assert_eq(compare(pushed_back, push_back(pushed_front, 3)), Less);
+  let nested = push_back(push_back(empty(), pushed_back), empty());
+  assert(nested == push_front(push_front(empty(), empty()), window))
+}
+
+test "a deque is a value: one kept is what it was after what was made of it" {
+  let d = popped_back(numbered(40));
+  let one = push_back(d, 100);
+  let other = push_back(d, 200);
+  assert_eq(peek_back(d), Some(38));
+  assert_eq(peek_back(one), Some(100));
+  assert_eq(peek_back(other), Some(200));
+  assert_eq(size(d), 39);
+  assert_eq(to_list(d), range(0, 39));
+  let front = popped_front(push_front(d, 7));
+  assert_eq(to_list(push_front(front, 8)), list::prepend(8, range(0, 39)));
+  assert_eq(to_list(push_front(front, 9)), list::prepend(9, range(0, 39)))
+}
+
+fn lists_of(d: Deque<Int>) -> Int =
+  match d { Deque(front, _, _, back, _, _, _) -> len(front) + len(back) }
+
+test "a queue that has passed many elements holds lists no longer than its size allows" {
+  let queue = fold(range(0, 5000), numbered(10), |d: Deque<Int>, i: Int|
+    push_back(popped_front(d), i));
+  assert_eq(to_list(queue), range(4990, 5000));
+  assert(lists_of(queue) <= 2 * 10 + 32 + 1, Some(int_to_string(lists_of(queue))));
+  let window = fold(range(0, 5000), bounded(10), |d: Deque<Int>, i: Int| push_front(d, i));
+  assert_eq(to_list(window), list::reverse(range(4990, 5000)));
+  assert(lists_of(window) <= 2 * 10 + 32 + 1, Some(int_to_string(lists_of(window))));
+  assert_eq(
+    lists_of(fold(range(0, 100), numbered(100), |d: Deque<Int>, _i: Int| popped_back(d))),
+    0,
+  );
+  assert_eq(lists_of(fold(range(0, 5), numbered(5), |d: Deque<Int>, _i: Int| popped_front(d))), 0)
+}
+
+test "every value of the type is a deque: an index outside its list reads as the nearest inside" {
+  let odd = Deque([1, 2, 3], 0 - 5, 99, [4, 5], 7, 1, Some(0 - 2));
+  assert_eq(to_list(odd), [3, 2, 1]);
+  assert_eq(size(odd), 3);
+  assert_eq(limit(odd), Some(0));
+  let hollow = Deque([9, 8], 0, 0, [1, 2, 3], 1, 1, None);
+  assert(pop_front(hollow) == None);
+  assert(pop_back(hollow) == None);
+  assert_eq(peek_front(hollow), None);
+  assert_eq(get(hollow, 0), None);
+  assert_eq(to_list(push_back(Deque([1, 2, 3], 1, 2, [4, 5], 9, 9, None), 6)), [2, 6]);
+  assert_eq(to_list(push_back(Deque([1], 0, 1, [2, 3], 0, 2, Some(2)), 4)), [3, 4])
+}
+
+test "an operation at either end takes the same few steps on a deque of ten and of ten thousand" {
+  let cost = |n: Int| {
+    let d = push_front(numbered(n), 0);
+    metered(|| size(popped_front(popped_back(push_front(push_back(d, 1), 2))))).steps
+  };
+  assert_eq(cost(10), cost(10000));
+  assert(cost(10) <= 16, Some(int_to_string(cost(10))))
+}
+
+/// What a deque is to its specifications: its list and its limit.
+type Model = { items: List<Int>, most: Option<Int> }
+
+fn model(d: Deque<Int>) -> Model = { items: to_list(d), most: limit(d) }
+
+law "a push at the back refines one onto the list, within the limit" =
+  refines(model, |d: Deque<Int>, x: Int| push_back(d, x), |m: Model, x: Int|
+    { items: kept_back(push(m.items, x), m.most), most: m.most })
+
+law "a push at the front refines one before the list, within the limit" =
+  refines(model, |d: Deque<Int>, x: Int| push_front(d, x), |m: Model, x: Int|
+    { items: kept_front(prepend(x, m.items), m.most), most: m.most })
+
+law "a pop at the front refines dropping the first" =
+  refines(model, |d: Deque<Int>, _unit: Bool| popped_front(d), |m: Model, _unit: Bool|
+    { items: drop(m.items, 1), most: m.most })
+
+law "a pop at the back refines dropping the last" =
+  refines(model, |d: Deque<Int>, _unit: Bool| popped_back(d), |m: Model, _unit: Bool|
+    { items: take(m.items, len(m.items) - 1), most: m.most })
+
+law "a concatenation refines the lists', within the first deque's limit" =
+  refines(
+    model,
+    |d: Deque<Int>, other: Deque<Int>| concat(d, other),
+    |m: Model, other: Deque<Int>|
+      { items: kept_back(list::concat(m.items, to_list(other)), m.most), most: m.most },
+  )
+
+law "a list comes back from the deque made of it" = inverse(|xs: List<Int>| of_list(xs), to_list)
+
+law "a deque is the deque of its list" =
+  agrees(|d: Deque<Int>| of_list(to_list(d)), |d: Deque<Int>| d)
+
+law "a fold from the front is the list's, and one from the back the reversed list's" =
+  agrees(
+    |d: Deque<Int>|
+      {
+        front: fold_front(d, [], |acc: List<Int>, x: Int| push(acc, x)),
+        back: fold_back(d, [], |acc: List<Int>, x: Int| push(acc, x)),
+      },
+    |d: Deque<Int>| { front: to_list(d), back: list::reverse(to_list(d)) },
+  )
+
+law "n pushes at the back take n steps"
+  forall (n: Int) where n > 0 cost n {
+    fold(range(0, n), empty(), |d: Deque<Int>, i: Int| push_back(d, i))
+  }
+
+law "n pushes at the front take n steps"
+  forall (n: Int) where n > 0 cost n {
+    fold(range(0, n), empty(), |d: Deque<Int>, i: Int| push_front(d, i))
+  }
+
+law "a queue of n filled at the back and emptied at the front takes n steps"
+  forall (n: Int) where n > 0 cost n {
+    fold(range(0, n), numbered(n), |d: Deque<Int>, _i: Int| popped_front(d))
+  }
+
+law "a queue of sixteen that n elements pass through takes n steps"
+  forall (n: Int) where n > 0 cost n {
+    fold(range(0, n), numbered(16), |d: Deque<Int>, i: Int| push_back(popped_front(d), i))
+  }
+
+law "a window of sixteen slid over n elements takes n steps"
+  forall (n: Int) where n > 0 cost n {
+    fold(range(0, n), bounded(16), |d: Deque<Int>, i: Int| push_back(d, i))
+  }
+
+law "n pushes and n pops at alternate ends take n steps"
+  forall (n: Int) where n > 0 cost n {
+    fold(
+      range(0, n),
+      fold(range(0, n), empty(), |d: Deque<Int>, i: Int|
+        if i & 1 == 0 { push_front(d, i) } else { push_back(d, i) }),
+      |d: Deque<Int>, i: Int| if i & 1 == 0 { popped_back(d) } else { popped_front(d) },
+    )
+  }
+
+law "n reads by place take n steps"
+  forall (n: Int) where n > 0 cost n {
+    let d = push_front(numbered(n), 0);
+    fold(range(0, n), 0, |total: Int, i: Int|
+      match get(d, i) { Some(x) -> total + x, None -> total })
+  }
+
+law "a deque of a list, its reversal and its ends take the same steps whatever it holds"
+  forall (n: Int) where n > 0 cost 1 {
+    let d = reverse(numbered(n));
+    { first: peek_front(d), last: peek_back(d), size: size(d) }
+  }
+
+law "a concatenation takes the steps of the shorter deque"
+  forall (n: Int) where n > 0 cost 1 {
+    size(concat(numbered(n), numbered(3))) + size(concat(numbered(3), numbered(n)))
+  }
