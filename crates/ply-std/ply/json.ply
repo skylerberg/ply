@@ -4,11 +4,20 @@
 //! is canonical. A `JsonCodec<a>` pairs an encoder with a decoder; the codecs here are the ones a
 //! derived codec is made of, and `decode_bytes`, `decode_string`, `encode_bytes` and `encode_string`
 //! run one end to end.
+//!
+//! `to_bytes` writes a value with no whitespace and `pretty_bytes` writes it indented: one writer
+//! makes both, so they hold the same tokens. `parse_lines` and `lines_to_bytes` read and write JSON
+//! Lines, a value a line, and `lines_start`, `lines_step` and `lines_end` are the same reader for an
+//! input that arrives in chunks. A `Pointer` is a JSON Pointer (RFC 6901), which `resolve` follows
+//! into a value.
 
 // --- The value --------------------------------------------------------------
 
 import std.bytes
-import std.bytes (hex_value, peek, scan, scan_until)
+import std.bytes (hex_value, int_of_ascii, peek, scan, scan_until)
+import std.laws (agrees, round_trip)
+import std.list (at_or, concat, take)
+
 /// A JSON value.
 pub type Json =
   | Null
@@ -91,10 +100,14 @@ type Text = { text: String, next: Int }
 type Piece = { bytes: Bytes, next: Int }
 
 /// One JSON document: valid UTF-8, nested at most `max_depth` deep, with nothing but whitespace after
-/// its value.
+/// its value. A byte order mark is no part of one, and is refused by name.
 pub fn parse(src: Bytes) -> Result<Json, DecodeError> / {abort.raise} =
+  parse_within(src, max_depth())
+
+/// `parse`, of a document nested at most `limit` deep; a `limit` past `max_depth` is `max_depth`.
+fn parse_within(src: Bytes, limit: Int) -> Result<Json, DecodeError> / {abort.raise} =
   if !bytes_is_utf8(src) { Err(error_at(0, "a JSON document must be valid UTF-8")) } else {
-    let step = value(src, skip_ws(src, 0), 0)?;
+    let step = value(src, skip_ws(src, 0), 0, min(limit, max_depth()))?;
     parse_end(src, step)
   }
 
@@ -116,18 +129,24 @@ fn digits() -> Bytes = b"0123456789"
 fn skip_ws(src: Bytes, i: Int) -> Int / {abort.raise} = scan(src, i, ws())
 
 /// Tests are ordered by how often a payload holds them: strings and numbers first.
-fn value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} = {
+fn value(src: Bytes, i: Int, depth: Int, limit: Int) -> Result<Step, DecodeError> / {abort.raise} = {
   let c = peek(src, i);
   if c == 34 { string_value(src, i) }
   else if c == 45 || (c >= 48 && c <= 57) { number(src, i) }
-  else if c == 123 { object_value(src, i, depth) }
-  else if c == 91 { array_value(src, i, depth) }
+  else if c == 123 { object_value(src, i, depth, limit) }
+  else if c == 91 { array_value(src, i, depth, limit) }
   else if c == 116 { keyword(src, i, b"true", Bool(true)) }
   else if c == 102 { keyword(src, i, b"false", Bool(false)) }
   else if c == 110 { keyword(src, i, b"null", Null) }
   else if c < 0 { Err(error_at(i, "the input ended where a value was expected")) }
-  else { Err(error_at(i, "expected a value: `{`, `[`, `\"`, a number, `true`, `false` or `null`")) }
+  else if bytes_starts_with(bytes_slice(src, i, bytes_len(src)), byte_order_mark()) {
+    Err(error_at(i, "a byte order mark is no part of JSON: remove its three bytes"))
+  } else {
+    Err(error_at(i, "expected a value: `{`, `[`, `\"`, a number, `true`, `false` or `null`"))
+  }
 }
+
+fn byte_order_mark() -> Bytes = b"\xef\xbb\xbf"
 
 fn keyword(src: Bytes, i: Int, word: Bytes, v: Json) -> Result<Step, DecodeError> / {abort.raise} =
   if i + bytes_len(word) > bytes_len(src) {
@@ -138,31 +157,49 @@ fn keyword(src: Bytes, i: Int, word: Bytes, v: Json) -> Result<Step, DecodeError
 
 // --- The parser: arrays -----------------------------------------------------
 
-fn array_value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
-  if depth >= max_depth() {
-    Err(error_at(i, "nested deeper than " ++ int_to_string(max_depth()) ++ " levels"))
-  } else { array_start(src, skip_ws(src, i + 1), depth + 1) }
+fn array_value(
+  src: Bytes,
+  i: Int,
+  depth: Int,
+  limit: Int,
+) -> Result<Step, DecodeError> / {abort.raise} =
+  if depth >= limit { Err(too_deep_at(i, limit)) }
+  else { array_start(src, skip_ws(src, i + 1), depth + 1, limit) }
+
+fn too_deep_at(i: Int, limit: Int) -> DecodeError =
+  error_at(
+    i,
+    "nested deeper than " ++ int_to_string(max(limit, 0))
+      ++ (if limit == 1 { " level" } else { " levels" }),
+  )
 
 /// An item and its comma take two bytes at least, so the bytes left bound the items: `left`.
-fn array_start(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
+fn array_start(
+  src: Bytes,
+  i: Int,
+  depth: Int,
+  limit: Int,
+) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) == 93 { Ok({ value: Array([]), next: i + 1 }) }
-  else { array_items(src, i, depth, [], bytes_len(src) - i) }
+  else { array_items(src, i, depth, limit, [], bytes_len(src) - i) }
 
 reuse fn array_items(
   src: Bytes,
   i: Int,
   depth: Int,
+  limit: Int,
   acc: List<Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
-  let step = value(src, i, depth)?;
-  array_more(src, step, depth, push(acc, step.value), left)
+  let step = value(src, i, depth, limit)?;
+  array_more(src, step, depth, limit, push(acc, step.value), left)
 }
 
 fn array_more(
   src: Bytes,
   step: Step,
   depth: Int,
+  limit: Int,
   items: List<Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
@@ -170,45 +207,56 @@ fn array_more(
   let c = peek(src, j);
   if c == 44 {
     if left <= 0 { panic("more items than bytes") }
-    else { array_items(src, skip_ws(src, j + 1), depth, items, left - 1) }
+    else { array_items(src, skip_ws(src, j + 1), depth, limit, items, left - 1) }
   } else if c == 93 { Ok({ value: Array(items), next: j + 1 }) }
   else { Err(error_at(j, "expected `,` or `]` in an array")) }
 }
 
 // --- The parser: objects ----------------------------------------------------
 
-fn object_value(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
-  if depth >= max_depth() {
-    Err(error_at(i, "nested deeper than " ++ int_to_string(max_depth()) ++ " levels"))
-  } else { object_start(src, skip_ws(src, i + 1), depth + 1) }
+fn object_value(
+  src: Bytes,
+  i: Int,
+  depth: Int,
+  limit: Int,
+) -> Result<Step, DecodeError> / {abort.raise} =
+  if depth >= limit { Err(too_deep_at(i, limit)) }
+  else { object_start(src, skip_ws(src, i + 1), depth + 1, limit) }
 
 /// `left` as in `array_start`.
-fn object_start(src: Bytes, i: Int, depth: Int) -> Result<Step, DecodeError> / {abort.raise} =
+fn object_start(
+  src: Bytes,
+  i: Int,
+  depth: Int,
+  limit: Int,
+) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) == 125 { Ok({ value: Object(map_new()), next: i + 1 }) }
-  else { object_members(src, i, depth, map_new(), bytes_len(src) - i) }
+  else { object_members(src, i, depth, limit, map_new(), bytes_len(src) - i) }
 
 fn object_members(
   src: Bytes,
   i: Int,
   depth: Int,
+  limit: Int,
   acc: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) != 34 { Err(error_at(i, "an object key must be a quoted string")) } else {
     let key = string_body(src, i + 1)?;
-    object_colon(src, key, depth, acc, left)
+    object_colon(src, key, depth, limit, acc, left)
   }
 
 fn object_colon(
   src: Bytes,
   key: Text,
   depth: Int,
+  limit: Int,
   acc: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
   let j = skip_ws(src, key.next);
   if peek(src, j) != 58 { Err(error_at(j, "expected `:` after an object key")) }
-  else { object_member(src, key.text, skip_ws(src, j + 1), depth, acc, left) }
+  else { object_member(src, key.text, skip_ws(src, j + 1), depth, limit, acc, left) }
 }
 
 /// A repeated key keeps the last value, as every mainstream JSON parser does.
@@ -217,17 +265,19 @@ fn object_member(
   key: String,
   i: Int,
   depth: Int,
+  limit: Int,
   acc: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
-  let step = value(src, i, depth)?;
-  object_more(src, step, depth, map_insert(acc, key, step.value), left)
+  let step = value(src, i, depth, limit)?;
+  object_more(src, step, depth, limit, map_insert(acc, key, step.value), left)
 }
 
 fn object_more(
   src: Bytes,
   step: Step,
   depth: Int,
+  limit: Int,
   members: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
@@ -235,7 +285,7 @@ fn object_more(
   let c = peek(src, j);
   if c == 44 {
     if left <= 0 { panic("more members than bytes") }
-    else { object_members(src, skip_ws(src, j + 1), depth, members, left - 1) }
+    else { object_members(src, skip_ws(src, j + 1), depth, limit, members, left - 1) }
   } else if c == 125 { Ok({ value: Object(members), next: j + 1 }) }
   else { Err(error_at(j, "expected `,` or `}` in an object")) }
 }
@@ -408,7 +458,19 @@ fn number_of(src: Bytes, i: Int, end: Int) -> Result<Step, DecodeError> / {abort
 // --- The serializer ---------------------------------------------------------
 
 /// Bounded by the parser's `max_depth`, so nothing is written that `parse` would refuse.
-pub fn to_bytes(j: Json) -> Bytes / {abort.raise} = write(j, 0)
+pub fn to_bytes(j: Json) -> Bytes / {abort.raise} = write(j, 0, None)
+
+/// `j` laid out for a reader: every array element and object member on a line of its own, `indent`
+/// spaces deeper than what holds it, a space after each member's colon, and an empty array or
+/// object as `[]` or `{}`. Members stand in ascending key order, as `to_bytes` writes them, and no
+/// line feed follows the last token. An `indent` of zero or less starts every line at the margin.
+/// The tokens are `to_bytes`'s own, so the two differ in whitespace alone.
+pub fn pretty_bytes(j: Json, indent: Int) -> Bytes / {abort.raise} =
+  write(j, 0, Some(bytes::repeat(b" ", indent)))
+
+/// `pretty_bytes` as a string.
+pub fn pretty_string(j: Json, indent: Int) -> String / {abort.raise} =
+  string_of_bytes(pretty_bytes(j, indent))
 
 fn unwritable<a>() -> a / {abort.raise} =
   panic(
@@ -416,16 +478,17 @@ fn unwritable<a>() -> a / {abort.raise} =
       ++ " levels has no encoding `parse` would read back",
   )
 
-fn write(j: Json, depth: Int) -> Bytes / {abort.raise} =
+/// `pad` is what one level indents by, and `None` writes no whitespace at all.
+fn write(j: Json, depth: Int, pad: Option<Bytes>) -> Bytes / {abort.raise} =
   match j {
     Null -> b"null",
     Bool(b) -> if b { b"true" } else { b"false" },
     Number(d) -> bytes_of_string(decimal_to_string(d)),
     Str(s) -> quote(s),
     Array(items) -> if depth >= max_depth() { unwritable() }
-    else { wrap(b"[", bytes::join(map(items, |x: Json| write(x, depth + 1)), b","), b"]") },
+    else { held(b"[", map(items, |x: Json| write(x, depth + 1, pad)), b"]", depth, pad) },
     Object(m) -> if depth >= max_depth() { unwritable() } else {
-      wrap(b"{", bytes::join(map(map_entries(m), |e: Member| member(e, depth + 1)), b","), b"}")
+      held(b"{", map(map_entries(m), |e: Member| member(e, depth + 1, pad)), b"}", depth, pad)
     },
   }
 
@@ -435,8 +498,22 @@ pub fn to_string(j: Json) -> String / {abort.raise} = string_of_bytes(to_bytes(j
 /// One member of a JSON object, as `map_entries` yields it and `object` takes it.
 pub type Member = { key: String, value: Json }
 
-fn member(e: Member, depth: Int) -> Bytes / {abort.raise} =
-  bytes_concat(bytes_concat(quote(e.key), b":"), write(e.value, depth))
+fn member(e: Member, depth: Int, pad: Option<Bytes>) -> Bytes / {abort.raise} =
+  bytes_concat(
+    bytes_concat(quote(e.key), match pad { None -> b":", Some(_) -> b": " }),
+    write(e.value, depth, pad),
+  )
+
+/// What an array or an object at `depth` holds, between its brackets.
+fn held(open: Bytes, parts: List<Bytes>, close: Bytes, depth: Int, pad: Option<Bytes>) -> Bytes =
+  match pad {
+    None -> wrap(open, bytes::join(parts, b","), close),
+    Some(step) -> if len(parts) == 0 { bytes_concat(open, close) } else {
+      let outer = bytes_concat(b"\n", bytes::repeat(step, depth));
+      let inner = bytes_concat(outer, step);
+      bytes_concat_all([open, inner, bytes::join(parts, bytes_concat(b",", inner)), outer, close])
+    },
+  }
 
 fn wrap(open: Bytes, inner: Bytes, close: Bytes) -> Bytes =
   bytes_concat(open, bytes_concat(inner, close))
@@ -970,6 +1047,176 @@ pub fn encode_bytes<a>(x: a, codec: JsonCodec<a>) -> Bytes / {abort.raise} =
 pub fn encode_string<a>(x: a, codec: JsonCodec<a>) -> String / {abort.raise} =
   to_string((codec.encode)(x))
 
+// --- JSON Lines -------------------------------------------------------------
+
+/// Where a JSON Lines input stopped being one: the line, counted from one, and the error on it,
+/// whose `offset` is a byte of that line.
+pub type LineError = new { line: Int, error: DecodeError }
+
+/// `line 3: $: expected a value (at byte 0)`.
+pub fn line_error_to_string(e: LineError) -> String =
+  "line " ++ int_to_string(e.line) ++ ": " ++ error_to_string(e.error)
+
+/// A JSON Lines reader between two chunks of its input: its limits, the line it is on, counted
+/// from one, and the bytes of that line it has been handed so far.
+pub type LineReader = new { max_line: Int, max_depth: Int, line: Int, partial: Bytes }
+
+/// What a chunk completed: the values of the lines that ended in it, in order, and the reader to
+/// hand the next chunk.
+pub type LineStep = new { reader: LineReader, values: List<Json> }
+
+/// A reader at the start of an input. It refuses a line of more than `max_line` bytes, as soon as
+/// it has been handed that many with no line feed, and a value nested more than `max_depth` deep,
+/// or deeper than `parse` reads where that is less.
+pub fn lines_start(max_line: Int, max_depth: Int) -> LineReader =
+  { max_line: max_line, max_depth: max_depth, line: 1, partial: b"" }
+
+/// The reader handed the next `chunk` of its input, cut anywhere.
+///
+/// A line is the bytes up to a line feed, and holds one value as `parse` reads it, so a carriage
+/// return before the line feed is whitespace. A line of whitespace alone holds no value and is
+/// passed over, though it counts as a line; a byte order mark is refused, as `parse` refuses it.
+pub fn lines_step(reader: LineReader, chunk: Bytes) -> Result<LineStep, LineError> / {abort.raise} = {
+  let pieces = bytes_split(chunk, b"\n");
+  let ended = len(pieces) - 1;
+  let start: Result<LineStep, LineError> = Ok({ reader: reader, values: [] });
+  let step = fold(take(pieces, ended), start, line_ended)?;
+  let rest = carried(step.reader, at_or(pieces, ended, b""))?;
+  Ok({ reader: rest, values: step.values })
+}
+
+/// The value of the line the input ended on with no line feed, where it holds one.
+pub fn lines_end(reader: LineReader) -> Result<Option<Json>, LineError> / {abort.raise} =
+  line_value(reader)
+
+/// Every value of a JSON Lines text, in order, under the limits and rules of `lines_start` and
+/// `lines_step`: the whole input as one chunk. A last line needs no line feed.
+pub fn parse_lines(
+  src: Bytes,
+  max_line: Int,
+  max_depth: Int,
+) -> Result<List<Json>, LineError> / {abort.raise} = {
+  let step = lines_step(lines_start(max_line, max_depth), src)?;
+  let last = lines_end(step.reader)?;
+  Ok(match last { Some(j) -> push(step.values, j), None -> step.values })
+}
+
+/// Each value as `to_bytes` writes it, which holds no line feed, and a line feed after each one.
+pub fn lines_to_bytes(values: List<Json>) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(values, |j: Json| bytes_concat(to_bytes(j), b"\n")))
+
+fn line_ended(
+  acc: Result<LineStep, LineError>,
+  piece: Bytes,
+) -> Result<LineStep, LineError> / {abort.raise} = {
+  let step = acc?;
+  let whole = carried(step.reader, piece)?;
+  let read = line_value(whole)?;
+  Ok({
+    reader: { ..whole, line: whole.line + 1, partial: b"" },
+    values: match read { Some(j) -> push(step.values, j), None -> step.values },
+  })
+}
+
+/// The reader with `piece` added to its line, refused where that outgrows `max_line`.
+fn carried(r: LineReader, piece: Bytes) -> Result<LineReader, LineError> =
+  if bytes_len(r.partial) + bytes_len(piece) > r.max_line {
+    Err({
+      line: r.line,
+      error: error_at(
+        max(r.max_line, 0),
+        "a line is longer than the " ++ int_to_string(r.max_line) ++ " bytes this reader takes",
+      ),
+    })
+  } else { Ok({ ..r, partial: bytes_concat(r.partial, piece) }) }
+
+/// What the reader's line holds, read as a whole line.
+fn line_value(r: LineReader) -> Result<Option<Json>, LineError> / {abort.raise} =
+  if skip_ws(r.partial, 0) == bytes_len(r.partial) { Ok(None) } else {
+    match parse_within(r.partial, r.max_depth) {
+      Ok(j) -> Ok(Some(j)),
+      Err(e) -> Err({ line: r.line, error: e }),
+    }
+  }
+
+// --- Pointers ---------------------------------------------------------------
+
+/// A JSON Pointer (RFC 6901): the reference tokens that lead from a document to one value in it,
+/// each as it reads once `~1` and `~0` are unescaped. No tokens is the document itself.
+pub type Pointer = | Pointer(List<String>)
+
+show for Pointer by pointer_text
+
+/// A pointer as RFC 6901 writes it: each token after a `/`, its `~` as `~0` and its `/` as `~1`.
+pub fn pointer_text(p: Pointer) -> String =
+  match p {
+    Pointer(tokens) ->
+      fold(tokens, "", |text: String, token: String| text ++ "/" ++ escaped_token(token)),
+  }
+
+fn escaped_token(token: String) -> String =
+  fold(string_chars(token), "", |text: String, c: Char|
+    text ++ (if c == '~' { "~0" } else if c == '/' { "~1" } else { string_of_chars([c]) }))
+
+/// The pointer `text` writes; `None` for a text that is neither empty nor led by `/`, and for one
+/// holding a `~` that neither `0` nor `1` follows.
+pub fn pointer_of(text: String) -> Option<Pointer> / {abort.raise} =
+  match string_split(text, "/") {
+    [""] -> Some(Pointer([])),
+    ["", ..written] -> match tokens_of(written) {
+      Some(tokens) -> Some(Pointer(tokens)),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn tokens_of(written: List<String>) -> Option<List<String>> / {abort.raise} =
+  fold(written, Some([]), token_read)
+
+fn token_read(acc: Option<List<String>>, written: String) -> Option<List<String>> / {abort.raise} = {
+  let tokens = acc?;
+  let token = unescaped_token(written)?;
+  Some(push(tokens, token))
+}
+
+/// `~01` is `~1`, not `/`: each `~` is read once, with the character after it.
+fn unescaped_token(written: String) -> Option<String> / {abort.raise} =
+  match string_split(written, "~") {
+    [] -> Some(written),
+    [first, ..rest] ->
+      fold(rest, Some(first), |acc: Option<String>, piece: String|
+        match acc {
+          None -> None,
+          Some(text) -> if string_starts_with(piece, "0") {
+            Some(text ++ "~" ++ string_slice(piece, 1, string_len(piece)))
+          } else if string_starts_with(piece, "1") {
+            Some(text ++ "/" ++ string_slice(piece, 1, string_len(piece)))
+          } else { None },
+        }),
+  }
+
+/// The value `p` leads to in `j`, each token naming a member of an object or an element of an
+/// array. `None` where it leads nowhere: a member the object lacks, an index at or past the
+/// array's end, an index not written as RFC 6901 writes one (digits, with no leading zero), `-`,
+/// which names the element after the last, or a token left over at a value that is neither.
+pub fn resolve(j: Json, p: Pointer) -> Option<Json> / {abort.raise} =
+  match p {
+    Pointer(tokens) ->
+      fold(tokens, Some(j), |at: Option<Json>, token: String|
+        match at {
+          Some(Object(m)) -> map_get(m, token),
+          Some(Array(items)) -> element(items, token),
+          _ -> None,
+        }),
+  }
+
+fn element(items: List<Json>, token: String) -> Option<Json> / {abort.raise} = {
+  let index = bytes_of_string(token);
+  let n = bytes_len(index);
+  if n == 0 || scan(index, 0, digits()) < n || (n > 1 && bytes_at(index, 0) == 48) { None }
+  else { match int_of_ascii(index) { Some(i) -> list_at(items, i), None -> None } }
+}
+
 // --- Laws -------------------------------------------------------------------
 
 law "parsing what was rendered gives back the value"
@@ -999,6 +1246,80 @@ law "an optional field round-trips through null"
   }
 
 law "base64 round-trips" forall (b: Bytes) { base64_decode(base64_encode(b)) == Ok(b) }
+
+law "pretty text parses back to the value"
+  forall (j: Json, indent: Int) {
+    parse(pretty_bytes(j, indent % 8)) == Ok(j)
+  }
+
+law "pretty text is the compact text once the whitespace outside its strings is gone"
+  forall (j: Json, indent: Int) {
+    squeezed(pretty_bytes(j, indent % 8)) == to_bytes(j)
+  }
+
+law "a value is written on one line" forall (j: Json) { !bytes::contains(to_bytes(j), b"\n") }
+
+law "JSON Lines read back what was written" =
+  agrees(|js: List<Json>| parse_lines(lines_to_bytes(js), roomy(), max_depth()), |js: List<Json>|
+    Ok(js))
+
+law "a reader answers alike wherever its input is cut"
+  forall (js: List<Json>, cut: Int) {
+    fed(cut_in_two(lines_to_bytes(js), cut), roomy(), max_depth())
+      == parse_lines(lines_to_bytes(js), roomy(), max_depth())
+  }
+
+law "a pointer's text reads back as the pointer" = round_trip(pointer_text, pointer_of)
+
+type Squeeze = { out: Bytes, inside: Bool, escaped: Bool }
+
+/// `text` without the whitespace outside its strings.
+fn squeezed(text: Bytes) -> Bytes / {abort.raise} =
+  fold(
+    range(0, bytes_len(text)),
+    { out: b"", inside: false, escaped: false },
+    |s: Squeeze, i: Int| {
+      let c = bytes_at(text, i);
+      let kept = bytes_concat(s.out, byte_of_int(c));
+      if s.inside { { out: kept, inside: s.escaped || c != 34, escaped: !s.escaped && c == 92 } }
+      else if bytes::contains(ws(), byte_of_int(c)) { s }
+      else { { out: kept, inside: c == 34, escaped: false } }
+    },
+  ).out
+
+/// A line length no test's line reaches.
+fn roomy() -> Int = 1_000_000
+
+/// `text` as two chunks, cut at a byte `cut` picks.
+fn cut_in_two(text: Bytes, cut: Int) -> List<Bytes> / {abort.raise} = {
+  let n = bytes_len(text);
+  let at = if n == 0 { 0 } else { (cut % n + n) % n };
+  [bytes_slice(text, 0, at), bytes_slice(text, at, n)]
+}
+
+/// What a reader answers for an input handed to it as these chunks.
+fn fed(
+  chunks: List<Bytes>,
+  max_line: Int,
+  max_depth: Int,
+) -> Result<List<Json>, LineError> / {abort.raise} = {
+  let start: Result<LineStep, LineError> = Ok({
+    reader: lines_start(max_line, max_depth),
+    values: [],
+  });
+  let step = fold(chunks, start, fed_chunk)?;
+  let last = lines_end(step.reader)?;
+  Ok(match last { Some(j) -> push(step.values, j), None -> step.values })
+}
+
+fn fed_chunk(
+  acc: Result<LineStep, LineError>,
+  chunk: Bytes,
+) -> Result<LineStep, LineError> / {abort.raise} = {
+  let so_far = acc?;
+  let next = lines_step(so_far.reader, chunk)?;
+  Ok({ reader: next.reader, values: concat(so_far.values, next.values) })
+}
 
 // --- Tests: values ----------------------------------------------------------
 
@@ -1493,4 +1814,273 @@ test "rendering is canonical, so a rendered document parses to itself" {
   // Whitespace and key order round-trip through the value but not byte for byte.
   assert(!stable(b"[1, 2]"));
   assert_eq(parsed(b"[1, 2]"), parsed(b"[1,2]"))
+}
+
+// --- Tests: pretty printing -------------------------------------------------
+
+fn laid_out() -> String =
+  \\{
+  \\  "a": {},
+  \\  "b": [
+  \\    1.50,
+  \\    {
+  \\      "c": null
+  \\    },
+  \\    []
+  \\  ]
+  \\}
+
+test "pretty text is a member or an element a line, keys in order, and nothing after the last" {
+  let doc = parsed(b"{\"b\":[1.50,{\"c\":null},[]],\"a\":{}}");
+  assert_eq(pretty_string(doc, 2), laid_out());
+  assert_eq(pretty_bytes(doc, 2), bytes_of_string(laid_out()));
+  assert_eq(pretty_string(parsed(b"[1,[2]]"), 4), "[\n    1,\n    [\n        2\n    ]\n]")
+}
+
+test "a value that holds nothing is written on one line" {
+  assert_eq(pretty_string(Array([]), 2), "[]");
+  assert_eq(pretty_string(Object(map_new()), 2), "{}");
+  assert_eq(pretty_string(Null, 2), "null");
+  assert_eq(pretty_string(Str("a\nb"), 2), "\"a\\nb\"");
+  assert_eq(pretty_string(parsed(b"[[],{}]"), 1), "[\n [],\n {}\n]")
+}
+
+test "an indent of zero or less keeps the lines and starts each at the margin" {
+  let doc = parsed(b"{\"a\":[1,2]}");
+  assert_eq(pretty_string(doc, 0), "{\n\"a\": [\n1,\n2\n]\n}");
+  assert_eq(pretty_string(doc, 0 - 3), pretty_string(doc, 0))
+}
+
+test "pretty text holds the tokens the compact text does, a string's whitespace among them" {
+  let doc = parsed(b"{\"a b\":\" [1, 2] \",\"c\":\"\\\" , \\\\\"}");
+  assert_eq(squeezed(pretty_bytes(doc, 2)), to_bytes(doc));
+  assert_eq(squeezed(b" [ 1 , \" a \\\" b \" ] \r\n"), b"[1,\" a \\\" b \"]")
+}
+
+test "a value nested past the depth has no pretty text either" {
+  let deep = fold(range(0, max_depth() + 1), Null, |inner: Json, _: Int| Array([inner]));
+  let written = try[abort.raise] { pretty_bytes(deep, 2) };
+  assert(match written { Err(_) -> true, Ok(_) -> false });
+  let deepest = fold(range(0, max_depth()), Null, |inner: Json, _: Int| Array([inner]));
+  assert_eq(parse(pretty_bytes(deepest, 1)), Ok(deepest))
+}
+
+// --- Tests: JSON Lines ------------------------------------------------------
+
+test "a value a line reads in order, and a last line needs no line feed" {
+  let three = Ok([Object(map_insert(map_new(), "a", int(1))), Array([int(2)]), Str("three")]);
+  assert_eq(parse_lines(b"{\"a\":1}\n[2]\n\"three\"\n", 64, 8), three);
+  assert_eq(parse_lines(b"{\"a\":1}\n[2]\n\"three\"", 64, 8), three);
+  assert_eq(parse_lines(b"", 64, 8), Ok([]));
+  assert_eq(parse_lines(b"\n", 64, 8), Ok([]))
+}
+
+test "a blank line holds no value and still counts, and a carriage return is whitespace" {
+  assert_eq(parse_lines(b"1\n\n \t\n2\n", 64, 8), Ok([int(1), int(2)]));
+  assert_eq(parse_lines(b"1\r\n2\r\n\r\n", 64, 8), Ok([int(1), int(2)]));
+  assert_eq(
+    parse_lines(b"1\n\n \t\n?\n", 64, 8),
+    Err({
+      line: 4,
+      error: error_at(0, "expected a value: `{`, `[`, `\"`, a number, `true`, `false` or `null`"),
+    }),
+  )
+}
+
+type Unread = { name: String, text: Bytes, line: Int, offset: Int, message: String }
+
+fn unread() -> List<Unread> =
+  [
+    {
+      name: "a byte order mark",
+      text: b"\xef\xbb\xbf{}\n",
+      line: 1,
+      offset: 0,
+      message: "a byte order mark is no part of JSON: remove its three bytes",
+    },
+    {
+      name: "two values on a line",
+      text: b"1\n2 3\n",
+      line: 2,
+      offset: 2,
+      message: "the document ended here; nothing may follow the top-level value",
+    },
+    {
+      name: "a value over two lines",
+      text: b"[1,\n2]\n",
+      line: 1,
+      offset: 3,
+      message: "the input ended where a value was expected",
+    },
+    {
+      name: "a line that is not UTF-8",
+      text: b"1\n2\n\"\xff\"\n",
+      line: 3,
+      offset: 0,
+      message: "a JSON document must be valid UTF-8",
+    },
+    {
+      name: "a line past the length",
+      text: b"[1]\n[1,2,3,4,5,6,7]\n",
+      line: 2,
+      offset: 12,
+      message: "a line is longer than the 12 bytes this reader takes",
+    },
+    {
+      name: "a value past the depth",
+      text: b"[[1]]\n[[[1]]]\n",
+      line: 2,
+      offset: 2,
+      message: "nested deeper than 2 levels",
+    },
+    {
+      name: "a last line that is cut short",
+      text: b"1\n{\"a\":",
+      line: 2,
+      offset: 5,
+      message: "the input ended where a value was expected",
+    },
+  ]
+
+test "{c.name} is refused with its line" for c: Unread in unread() {
+  let refused: Result<List<Json>, LineError> = Err({
+    line: c.line,
+    error: error_at(c.offset, c.message),
+  });
+  assert_eq(parse_lines(c.text, 12, 2), refused);
+  assert_eq(fed(each_byte(c.text), 12, 2), refused)
+}
+
+fn each_byte(text: Bytes) -> List<Bytes> / {abort.raise} =
+  map(range(0, bytes_len(text)), |i: Int| bytes_slice(text, i, i + 1))
+
+test "a line may be as long as the limit, and a reader refuses a longer one before it ends" {
+  assert_eq(parse_lines(b"[1,2,3]\n", 7, 8), Ok([Array([int(1), int(2), int(3)])]));
+  assert_eq(parse_lines(b"[1,2,3]\r\n", 8, 8), Ok([Array([int(1), int(2), int(3)])]));
+  let early = lines_step(lines_start(7, 8), b"[1,2,3,4");
+  assert_eq(
+    early,
+    Err({ line: 1, error: error_at(7, "a line is longer than the 7 bytes this reader takes") }),
+  );
+  assert_eq(
+    line_error_to_string({ line: 3, error: error_at(7, "no") }),
+    "line 3: $: no (at byte 7)",
+  )
+}
+
+test "a depth past the parser's own is the parser's, and one of nothing admits no array" {
+  assert(match parse_lines(nest(b"[", b"]", max_depth()), roomy(), 1_000) {
+    Ok(_) -> true,
+    Err(_) -> false,
+  });
+  assert_eq(
+    parse_lines(nest(b"[", b"]", max_depth() + 1), roomy(), 1_000),
+    Err({ line: 1, error: error_at(max_depth(), "nested deeper than 128 levels") }),
+  );
+  assert_eq(parse_lines(b"7\n", 8, 0), Ok([int(7)]));
+  assert_eq(
+    parse_lines(b"[]\n", 8, 0 - 1),
+    Err({ line: 1, error: error_at(0, "nested deeper than 0 levels") }),
+  );
+  assert_eq(
+    parse_lines(b"[[]]\n", 8, 1),
+    Err({ line: 1, error: error_at(1, "nested deeper than 1 level") }),
+  )
+}
+
+test "a reader carries a line across chunks, cut inside a value or inside a character" {
+  let text = bytes_of_string("{\"name\":\"zoë\"}\n[1,\"😀\"]\n");
+  let whole = parse_lines(text, 64, 8);
+  assert_eq(
+    whole,
+    Ok([parsed(bytes_of_string("{\"name\":\"zoë\"}")), Array([int(1), Str("😀")])]),
+  );
+  assert_eq(fed(each_byte(text), 64, 8), whole);
+  let first = lines_step(lines_start(64, 8), bytes_slice(text, 0, 12));
+  assert_eq(
+    first,
+    Ok({
+      reader: { max_line: 64, max_depth: 8, line: 1, partial: bytes_slice(text, 0, 12) },
+      values: [],
+    }),
+  )
+}
+
+test "JSON Lines are written a value a line, with no line feed inside one" {
+  assert_eq(lines_to_bytes([]), b"");
+  assert_eq(
+    lines_to_bytes([Str("a\nb"), parsed(b"{ \"k\" : [ 1 , 2 ] }")]),
+    b"\"a\\nb\"\n{\"k\":[1,2]}\n",
+  )
+}
+
+// --- Tests: pointers --------------------------------------------------------
+
+/// The document of RFC 6901, section 5.
+fn pointed_at() -> Json / {abort.raise} =
+  parsed(
+    b"{\"foo\":[\"bar\",\"baz\"],\"\":0,\"a/b\":1,\"c%d\":2,\"e^f\":3,\"g|h\":4,\"i\\\\j\":5,\"k\\\"l\":6,\" \":7,\"m~n\":8}",
+  )
+
+type Pointed = { pointer: String, value: Bytes }
+
+fn pointed() -> List<Pointed> =
+  [
+    { pointer: "/foo", value: b"[\"bar\",\"baz\"]" },
+    { pointer: "/foo/0", value: b"\"bar\"" },
+    { pointer: "/", value: b"0" },
+    { pointer: "/a~1b", value: b"1" },
+    { pointer: "/c%d", value: b"2" },
+    { pointer: "/e^f", value: b"3" },
+    { pointer: "/g|h", value: b"4" },
+    { pointer: "/i\\j", value: b"5" },
+    { pointer: "/k\"l", value: b"6" },
+    { pointer: "/ ", value: b"7" },
+    { pointer: "/m~0n", value: b"8" },
+  ]
+
+fn pointed_by(text: String) -> Option<Json> / {abort.raise} =
+  match pointer_of(text) {
+    Some(p) -> resolve(pointed_at(), p),
+    None -> panic("not a pointer: " ++ text),
+  }
+
+test "RFC 6901 resolves `{c.pointer}`" for c: Pointed in pointed() {
+  assert_eq(pointed_by(c.pointer), Some(parsed(c.value)))
+}
+
+test "the empty pointer is the document, and a pointer leads nowhere rather than failing" {
+  assert_eq(pointed_by(""), Some(pointed_at()));
+  assert_eq(pointed_by("/nope"), None);
+  assert_eq(pointed_by("/foo/2"), None);
+  assert_eq(pointed_by("/foo/-"), None);
+  assert_eq(pointed_by("/foo/0/bar"), None);
+  assert_eq(pointed_by("/a~1b/0"), None)
+}
+
+test "an array index is digits with no leading zero" {
+  let items = parsed(b"[\"zero\",\"one\"]");
+  let at = |token: String| resolve(items, Pointer([token]));
+  assert_eq(at("1"), Some(Str("one")));
+  assert_eq(at("0"), Some(Str("zero")));
+  assert_eq(at("01"), None);
+  assert_eq(at("00"), None);
+  assert_eq(at("+1"), None);
+  assert_eq(at("-1"), None);
+  assert_eq(at("1.0"), None);
+  assert_eq(at(""), None);
+  assert_eq(at("99999999999999999999"), None)
+}
+
+test "a pointer's text is its tokens escaped, and a text that is no pointer is none" {
+  let p = Pointer(["a/b", "m~n", "", "~1"]);
+  assert_eq(pointer_text(p), "/a~1b/m~0n//~01");
+  assert_eq(f"{p}", "/a~1b/m~0n//~01");
+  assert_eq(pointer_of("/a~1b/m~0n//~01"), Some(p));
+  assert_eq(pointer_of(""), Some(Pointer([])));
+  assert_eq(pointer_of("/"), Some(Pointer([""])));
+  assert_eq(pointer_of("foo"), None);
+  assert_eq(pointer_of("foo/bar"), None);
+  assert_eq(pointer_of("/a~"), None);
+  assert_eq(pointer_of("/a~2b"), None)
 }
