@@ -3,10 +3,10 @@
 
 import parsing (Ident, Span, dummy_span, span_key, ParseDiag, qname_text)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpdate,
-             NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList,
-             CodePatternField, NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle,
-             CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm, Capture, CodeClause,
-             CodeReturn, Own, Borrowed, Owned, lower_fn, irrefutable)
+             NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxRange, PxCtor, PxRecord,
+             PxList, CodePatternField, NPerform, NLabel, NCell, NLambda, NSimulate, NParallel,
+             NHandle, CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm, Capture,
+             CodeClause, CodeReturn, Own, Borrowed, Owned, lower_fn, irrefutable)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
               SEnsures, SCost, FnDef, TDNominal, test_run, test_listing, IInstance, VariantDef,
@@ -2775,6 +2775,78 @@ fn inline_len(
 
 fn is_wrap(name: Bytes) -> Bool =
   name == b"wrap_add" || name == b"wrap_sub" || name == b"wrap_mul" || name == b"rotr"
+    || name == b"rotl"
+
+fn is_saturating(name: Bytes) -> Bool =
+  name == b"saturating_add" || name == b"saturating_sub" || name == b"saturating_mul"
+
+/// Exact in 64 bits, then held to the width's ends; only an unsigned 32-bit product needs the
+/// unsigned word, and it can only pass the greatest value.
+fn saturated(
+  emitter: Emitter,
+  name: Bytes,
+  v0: CValue,
+  v1: CValue,
+  t: Width,
+) -> WithValue / {abort.raise} = {
+  let unsigned = !t.signed && name == b"saturating_mul";
+  let wide = if unsigned { b"uint64_t" } else { b"int64_t" };
+  let op = if name == b"saturating_add" { b" + " }
+  else if name == b"saturating_sub" { b" - " }
+  else { b" * " };
+  let r = fresh(emitter);
+  let exact = line(
+    r.emitter,
+    bytes_concat_all([
+      wide,
+      b" ",
+      r.name,
+      b" = (",
+      wide,
+      b")(",
+      as_num(v0, t),
+      b")",
+      op,
+      b"(",
+      wide,
+      b")(",
+      as_num(v1, t),
+      b");",
+    ]),
+  );
+  let top = bytes_concat_all([
+    r.name,
+    b" > ",
+    if unsigned { b"(uint64_t)" } else { b"" },
+    int_lit(width_max(t)),
+    b" ? ",
+    int_lit(width_max(t)),
+    b" : ",
+    r.name,
+  ]);
+  bind(
+    exact,
+    KNum(t),
+    bytes_concat_all([
+      b"(",
+      ctype(KNum(t)),
+      b")(",
+      if unsigned { top } else {
+        bytes_concat_all([
+          r.name,
+          b" < ",
+          int_lit(width_min(t)),
+          b" ? ",
+          int_lit(width_min(t)),
+          b" : (",
+          top,
+          b")",
+        ])
+      },
+      b")",
+    ]),
+  )
+}
 
 fn is_checked(name: Bytes) -> Bool =
   name == b"checked_add" || name == b"checked_sub" || name == b"checked_mul"
@@ -2892,10 +2964,12 @@ fn int_of_width(name: Bytes) -> Option<Width> =
   else { None }
 
 fn is_width_builtin(name: Bytes) -> Bool =
-  is_wrap(name) || is_checked(name) || of_int_width(name) != None || int_of_width(name) != None
+  is_wrap(name) || is_saturating(name) || is_checked(name) || of_int_width(name) != None
+    || int_of_width(name) != None
 
 fn width_arity(name: Bytes) -> Int =
-  if is_wrap(name) || (is_checked(name) && name != b"checked_neg") { 2 } else { 1 }
+  if is_wrap(name) || is_saturating(name) || (is_checked(name) && name != b"checked_neg") { 2 }
+  else { 1 }
 
 /// A width builtin used as a value is a lambda around its own call, so the call is compiled at the
 /// type the checker settled, as a direct one is: the runtime's builtin would read the words untyped.
@@ -2994,7 +3068,7 @@ fn width_builtin(
   span: Span,
   at: Span,
 ) -> Option<WithValue> / {abort.raise} =
-  if (is_wrap(name) || is_checked(name)) && len(args) == width_arity(name) {
+  if (is_wrap(name) || is_saturating(name) || is_checked(name)) && len(args) == width_arity(name) {
     match operand_at(emitter, at) {
       None -> Some(unsettled_operator(emitter, name)),
       Some(t) -> match args_evaled(emitter, args, params, 0, []) {
@@ -3008,7 +3082,8 @@ fn width_builtin(
                 None -> None,
                 Some(v0) -> match list_at(e0.vals, 1) {
                   None -> None,
-                  Some(v1) -> Some(wrapped(e, name, v0, v1, w)),
+                  Some(v1) -> if is_saturating(name) { Some(saturated(e, name, v0, v1, w)) }
+                  else { Some(wrapped(e, name, v0, v1, w)) },
                 },
               }
             },
@@ -3070,14 +3145,19 @@ fn wrapped(
 ) -> WithValue / {abort.raise} = {
   let u = unsigned_ctype(t);
   let a = as_num(v0, t);
-  if name == b"rotr" {
+  if name == b"rotr" || name == b"rotl" {
+    // A rotation left is one right by the rest of the width.
     let k = bind(
       emitter,
       KInt,
       bytes_concat_all([
         b"((",
+        if name == b"rotl" { b"-" } else { b"" },
+        b"((",
         as_int(v1),
         b") % ",
+        ascii_of_int(t.bits),
+        b")) % ",
         ascii_of_int(t.bits),
         b" + ",
         ascii_of_int(t.bits),
@@ -6170,6 +6250,56 @@ fn int_test(subj: Bytes, n: Int) -> Bytes =
     ])
   }
 
+/// An `Int` or a carried width from `lo` through `hi`. Every word that can be in the immediate
+/// range is immediate, so bounds inside it leave a boxed word out.
+fn int_between(subj: Bytes, lo: Int, hi: Int) -> Bytes = {
+  let within = |v: Bytes|
+    bytes_concat_all([b"(", v, b" >= ", int_lit(lo), b" && ", v, b" <= ", int_lit(hi), b")"]);
+  let immediate = within(bytes_concat_all([b"ply_imm_value(", subj, b")"]));
+  if lo >= 0 - 4611686018427387904 && hi < 4611686018427387904 {
+    bytes_concat_all([b"(ply_is_imm(", subj, b") ? ", immediate, b" : 0)"])
+  } else {
+    bytes_concat_all([
+      b"(",
+      subj,
+      b" != 0 && (ply_is_imm(",
+      subj,
+      b") ? ",
+      immediate,
+      b" : ",
+      within(bytes_concat_all([b"rt_unbox_int_p(ctx, ", subj, b")"])),
+      b"))",
+    ])
+  }
+}
+
+/// A range over a width past 32 bits, whose values the runtime orders, against the unit's constants.
+fn between_test(
+  emitter: Emitter,
+  lo: Lit,
+  hi: Lit,
+  subj: CValue,
+) -> { emitter: Emitter, expr: Bytes } / {abort.raise} = {
+  let from = from_table(emitter, lo);
+  let to = from_table(from.emitter, hi);
+  let held = bind(
+    to.emitter,
+    KBool,
+    bytes_concat_all([
+      b"(",
+      subj.expr,
+      b" != 0 && rt_between_p(ctx, ",
+      subj.expr,
+      b", ",
+      from.value.expr,
+      b", ",
+      to.value.expr,
+      b"))",
+    ]),
+  );
+  { emitter: check(held.emitter), expr: held.value.expr }
+}
+
 /// As `==` compares, against the unit's constant; a zero subject is an enclosing test that failed.
 fn equal_test(
   emitter: Emitter,
@@ -6225,6 +6355,17 @@ fn pat_test(
       LUnit -> Some({ emitter: emitter, expr: b"1" }),
       LBad -> None,
       _ -> Some(equal_test(emitter, l, subj)),
+    },
+    PxRange(r) -> match ((r.lo, r.hi)) {
+      (LInt(lo), LInt(hi)) -> Some({ emitter: emitter, expr: int_between(subj.expr, lo, hi) }),
+      (LFixed(name, lo), LFixed(_, hi)) -> match width_named(name) {
+        None -> None,
+        Some(w) -> if carried(w) {
+          Some({ emitter: emitter, expr: int_between(subj.expr, lo, hi) })
+        } else { Some(between_test(emitter, r.lo, r.hi, subj)) },
+      },
+      (LWide(_, _, _), LWide(_, _, _)) -> Some(between_test(emitter, r.lo, r.hi, subj)),
+      _ -> None,
     },
     // A constructor tests its tag and width over an object; an argument with its own test is read into a local under the test so far.
     // A nested subject is zero when an enclosing test failed, and its header must not be read then.
@@ -7804,7 +7945,8 @@ pub type Tables = {
   symbols: List<Defined>,
 }
 
-fn no_tables() -> Tables =
+/// What a body that names nothing of its unit holds.
+pub fn no_tables() -> Tables =
   {
     consts: [],
     builtins: [],
@@ -9725,11 +9867,11 @@ fn zip_sources(names: List<Bytes>, srcs: List<Bytes>) -> List<Source> =
 /// code-table ranks before it alone. Every symbol ends in a length behind its mode byte, which
 /// nothing suffixed (`_entry`, `_lambda0`, `_group`) and nothing the runtime names (`ply_bind`)
 /// does, so no two names spell one symbol and no suffixed symbol is a name's own.
-fn symbol_of(full: Bytes) -> Bytes / {abort.raise} =
+pub fn symbol_of(full: Bytes) -> Bytes / {abort.raise} =
   bytes_concat(b"ply_", mangled(full, 0, 0, 46, b""))
 
 /// The symbol the loader binds a definition by, which is also its memo slot.
-fn entry_of(full: Bytes) -> Bytes / {abort.raise} = bytes_concat(symbol_of(full), b"_entry")
+pub fn entry_of(full: Bytes) -> Bytes / {abort.raise} = bytes_concat(symbol_of(full), b"_entry")
 
 /// `start` opens the piece being scanned and `delim` is the byte that opened it.
 fn mangled(name: Bytes, start: Int, at: Int, delim: Int, acc: Bytes) -> Bytes / {abort.raise} =
