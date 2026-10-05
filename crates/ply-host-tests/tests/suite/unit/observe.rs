@@ -165,15 +165,11 @@ fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_li
     let real = dir.path().join("real");
     std::fs::create_dir_all(real.join("shipped")).unwrap();
     std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
-    observe::laid_out(
-        &dir.path().join("link/shipped"),
-        vec![dir.path().join("link/cache")],
-    );
+    observe::laid_out(&dir.path().join("link/shipped"), Vec::new());
     let real = real.canonicalize().unwrap();
     let m = MachineId::next();
     let recorder = observe::begin(m);
     observe::read(m, Read::File, &real.join("shipped/std.list.ply"));
-    observe::read(m, Read::File, &real.join("cache/unit.c"));
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     observe::end(&recorder);
     assert_eq!(trace, "shipped\tstd.list\tlist digest\n");
