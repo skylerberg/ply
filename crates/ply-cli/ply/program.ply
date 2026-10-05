@@ -51,6 +51,8 @@ pub type Program = {
   embeds: List<Embed>,
   /// The shipped modules the load read, which a splice of it pulls again.
   shipping: Shipping,
+  /// Whether a shipped module was read only for what the program reaches, rather than whole.
+  reached: Bool,
 }
 
 /// Every diagnostic a load reports: what the front-end cache said of itself, then the program's.
@@ -105,6 +107,7 @@ fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List
     through: [],
     embeds: project.embeds,
     shipping: shipping,
+    reached: true,
   }
 
 /// What a load of this project is made of: its root key and manifest text, and every dependency
@@ -165,6 +168,7 @@ fn front_end(
   through: List<CompiledPackage>,
   embeds: List<Embed>,
   priors: List<Prior>,
+  reached: Bool,
 ) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(
     sources,
@@ -176,6 +180,7 @@ fn front_end(
     map(embeds, |embed: Embed| embed.embedded),
     priors,
     unread: shipping.unread,
+    reached: reached,
   )
 
 /// Seeded with what the load published, so only what the splice moved is walked again.
@@ -193,6 +198,7 @@ pub fn reanalysed(
     program.through,
     program.embeds,
     analysis.hashes.priors,
+    program.reached,
   )
 
 fn analysed(
@@ -202,10 +208,20 @@ fn analysed(
   through: List<CompiledPackage>,
   priors: List<Prior>,
   mine: interfaces::Own,
+  reached: Bool,
 ) -> Program / {abort.raise} = {
-  let first = analysed_through(project, shipping, rows, through, priors, mine);
-  if !first.starved { first.program }
-  else { analysed_through(project, shipping, rows, through, priors, interfaces::no_own()).program }
+  let first = analysed_through(project, shipping, rows, through, priors, mine, reached);
+  if !first.starved { first.program } else {
+    analysed_through(
+      project,
+      shipping,
+      rows,
+      through,
+      priors,
+      interfaces::no_own(),
+      reached,
+    ).program
+  }
 }
 
 /// A load read through `mine`, the stubs of the project's own modules. It is `starved` where a
@@ -222,6 +238,7 @@ fn analysed_through(
   through: List<CompiledPackage>,
   priors: List<Prior>,
   mine: interfaces::Own,
+  reached: Bool,
 ) -> Loaded / {abort.raise} = {
   let texts = fold(shipping.read, map_new(), |acc: Map<String, Bytes>, source: Source|
     map_insert(acc, string_of_bytes_lossy(source.name), source.src));
@@ -235,6 +252,7 @@ fn analysed_through(
     read,
     project.embeds,
     priors,
+    reached,
   );
   let shipped_places = map(pulled.pulled, |n: Bytes|
     shipped_place(texts, string_of_bytes_lossy(n)));
@@ -264,6 +282,7 @@ fn analysed_through(
             through: read,
             embeds: project.embeds,
             shipping: shipping,
+            reached: reached,
           })
         },
         missing -> loaded(broken(project, shipping, places, map(missing, undescended))),
@@ -301,13 +320,14 @@ fn assembled(
   through: List<CompiledPackage> = [],
   priors: List<Prior> = [],
   own: interfaces::Own = { through: [], names: [], warned: [] },
+  reached: Bool = true,
 ) -> Program / {abort.raise} =
   if len(project.diags) > 0 { broken(project, shipping, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
     broken(project, shipping, [], [
       nothing_here(match list_at(paths, 0) { Some(r) -> r.display, None -> "." }),
     ])
-  } else { analysed(project, shipping, rows, through, priors, own) }
+  } else { analysed(project, shipping, rows, through, priors, own, reached) }
 
 /// The toolchain's own tree: its shipped modules are its roots, not a dependency.
 fn claims_shipped_modules(project: Project, shipping: Shipping) -> Bool = {
@@ -682,7 +702,15 @@ pub fn load_program(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, rows, through, if verify { [] } else { k.priors }),
+    assembled(
+      project,
+      shipping,
+      paths,
+      rows,
+      through,
+      if verify { [] } else { k.priors },
+      reached: interfaced,
+    ),
   );
   refreshing(paths, project, shipping, stamps, interfaced, through, p);
   filed(paths, shipping, stamps, k, p)
@@ -772,7 +800,16 @@ pub fn timed_over(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, rows, through, if verify { [] } else { k.priors }, mine),
+    assembled(
+      project,
+      shipping,
+      paths,
+      rows,
+      through,
+      if verify { [] } else { k.priors },
+      mine,
+      interfaced,
+    ),
   );
   let front_done = time.elapsed_ms();
   refreshing(paths, project, shipping, stamps, interfaced, through, p);
@@ -791,9 +828,10 @@ pub fn timed_over(
 pub fn timed_uncached(
   paths: List<paths::Resolved>,
   verify: Bool = false,
+  reached: Bool = true,
 ) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, abort.raise, diverges} = {
   let started = time.elapsed_ms();
-  timed_uncached_over(paths, load_resolved(paths), started, verify)
+  timed_uncached_over(paths, load_resolved(paths), started, verify, reached)
 }
 
 /// [`timed_uncached`] over a walk already made, with the clock as it read before the walk.
@@ -802,6 +840,7 @@ pub fn timed_uncached_over(
   project: Project,
   started: Int,
   verify: Bool = false,
+  reached: Bool = true,
 ) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise} = {
   let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
   else { no_shipping() };
@@ -810,7 +849,7 @@ pub fn timed_uncached_over(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, no_rows()),
+    assembled(project, shipping, paths, no_rows(), reached: reached),
   );
   {
     program: p,
@@ -1187,6 +1226,7 @@ test "a span outside every module has no place and no location" {
     through: [],
     embeds: [],
     shipping: { read: [], unread: [] },
+    reached: true,
   };
   assert_eq(location_of(p, { module: no_module(), span: { start: 0, end: 0 } }), None);
   assert_eq(location_of(p, { module: 0, span: { start: 3, end: 4 } }), Some("m.ply:1:4"))
