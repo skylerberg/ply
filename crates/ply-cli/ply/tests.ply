@@ -44,10 +44,10 @@ import paths
 import program (Timed, load_diagnostics, front_of, in_shipped_module, is_shipped, modules_of,
                 timed_over, timed_uncached_over, unmoved)
 import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
-import sources (Embed, load_resolved)
+import sources (Embed, Project, load_resolved)
 import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
-                 string_or_null, strings, int_or_null, strings_or_null)
+                 string_or_null, strings, int_or_null, strings_or_null, parse_string)
 import style (Style, plain, bold, dim, green, red, yellow)
 import tester (tester, ledger, Chosen, Executed, InterleavingFailure, Filed, Hosted, Listed,
                Options, Unlisted, Usage, joined_trace, sum_usage, no_usage, unit_over)
@@ -55,6 +55,8 @@ import trials (Bench, Evident, Tried, diagnosed, trial, by_name)
 import trials
 import walk
 import views
+import answers
+import program
 // What a test's footprint makes it — shared, isolated or host — and the classes the tests that run
 // share are the suite's, from the atoms each row carries and the tests the binding reaches.
 import suite.schedule (Atom, Counts, Scheduled, contends_only_over_regions, counts,
@@ -1852,17 +1854,18 @@ pub type Iteration = { answer: Answer, held: Option<Timed>, embeds: List<Embed> 
 pub fn run(
   flags: Flags,
   options: Options,
+  argv: Option<List<String>>,
 ) -> Answer / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, literal.verdicts, abort.raise, diverges, shipped.reached} =
-  iterated(flags, options, None).answer
+  iterated(flags, options, None, argv).answer
 
 /// A save that changed no file's text is the last report's load again, with nothing re-derived.
 fn loaded(
   flags: Flags,
   options: Options,
   held: Option<Timed>,
-) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
-  let started = time.elapsed_ms();
-  let project = load_resolved(flags.paths);
+  project: Project,
+  started: Int,
+) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[abs], entropy.next, time.now_ms, abort.raise, shipped.reached} = {
   let reused = match held {
     Some(t) -> if unmoved(project, t.program) { Some(t) } else { None },
     None -> None,
@@ -1875,15 +1878,153 @@ fn loaded(
   }
 }
 
-/// One report over the tree as it is now; `held` is the load the last one ran against.
+/// One report over the tree as it is now; `held` is the load the last one ran against. `argv`, where
+/// it is given, is the command line a run that ran nothing keeps its answer under for the next.
 pub fn iterated(
   flags: Flags,
   options: Options,
   held: Option<Timed>,
+  argv: Option<List<String>>,
 ) -> Iteration / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, literal.verdicts, abort.raise, diverges, shipped.reached} = {
   let s: Style = style_of(flags);
   let begun = time.elapsed_us();
-  let t: Timed = loaded(flags, options, held);
+  let started = time.elapsed_ms();
+  let project = load_resolved(flags.paths);
+  let key = match argv {
+    Some(line) -> if held == None && keeps_answer(options) {
+      Some(answers::key_of(answers::program(), line, project))
+    } else { None },
+    None -> None,
+  };
+  match match key { Some(k) -> replayed(flags, options, k, begun), None -> None } {
+    Some(answer) -> { answer: answer, held: None, embeds: project.embeds },
+    None -> {
+      let t: Timed = loaded(flags, options, held, project, started);
+      over_load(flags, options, s, t, begun, match key {
+        Some(k) -> if viewed_whole(t.program) {
+          Some({ key: k, views: program::viewed_text(t.program.viewed), passes: [], after: false })
+        } else { None },
+        None -> None,
+      })
+    },
+  }
+}
+
+/// Where a run keeps its answer for the next run over the same command (`answers`): the key, its
+/// load's views of the shipped modules, and the keys of the passes it took. `after` is an answer
+/// selected again after the run filed its passes, which the store's warnings on opening are not in.
+type Keeping = { key: String, views: Bytes, passes: List<String>, after: Bool }
+
+/// A run whose answer the next may take: one that consults the store, answers once and as a plain
+/// run does, and reads no configuration file the key does not cover.
+fn keeps_answer(options: Options) -> Bool =
+  !options.no_cache && !options.watch && !options.explain && !options.coverage
+    && options.mutate == None
+    && len(options.config.files) == 0
+    && options.config.schema == None
+
+/// Whether the load read each shipped module it pulled for what the program reaches, so its views
+/// hold all the program takes of them: a load that cut gives a view of every module it pulled, and
+/// one it read only for an embed is in the hash of what embeds it.
+fn viewed_whole(p: program::Program) -> Bool =
+  p.reached && (len(p.viewed) > 0 || len(p.shipping.read) == 0)
+
+/// The keys of the passes that answer each test in scope.
+fn answered_by(answering: List<List<String>>, scope: Scope) -> List<String> =
+  fold(scope.visible, [], |acc: List<String>, i: Int|
+    concat(acc, match list_at(answering, i) { Some(ks) -> ks, None -> [] }))
+
+/// Every test in scope taken from a pass filed under its own key, or under each root's.
+fn all_cached(decisions: List<Decision>, scope: Scope) -> Bool = {
+  let visible = set_of(scope.visible);
+  fold(decisions, true, |all: Bool, d: Decision|
+    all && (!map_contains(visible, d.case.index) || d.reason == Cached))
+}
+
+fn unwarned(answer: Answer) -> Bool =
+  match answer.json {
+    Object(members) -> match map_get(members, "warnings") {
+      Some(Array(ws)) -> len(ws) == 0,
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// The answer a run kept under `key`, where it answers this one: every pass it took still stands
+/// and its load's views of the shipped modules still hold. A text run prints what that one printed
+/// before its answer.
+fn replayed(
+  flags: Flags,
+  options: Options,
+  key: String,
+  begun: Int,
+) -> Option<Answer> / {time.elapsed_us, process.out[proc], fs.list_dir[shipped], fs.read_file[shipped], tester.configure[corpus], tester.ended[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], abort.raise} = {
+  tester.configure[corpus](options);
+  let found = results::with_ledger(results::store_for(flags.paths, false), || {
+    match list_at(ledger.passes([key]), 0) {
+      Some(Some(bytes)) -> match answers::decoded(bytes) {
+        None -> None,
+        Some(k) -> {
+          let viewed = views::split(k.views).viewed;
+          let held = ledger.passes(k.passes);
+          let now = views::now_for(push(views::viewed_in(traces_of(held)), viewed));
+          let stands = views::moved(now, viewed) == None
+            && fold(held, true, |all: Bool, h: Option<Bytes>|
+              all && h != None && standing(now, h) == Some(Stands));
+          if stands { Some(k) } else { None }
+        },
+      },
+      _ -> None,
+    }
+  });
+  tester.ended[corpus]();
+  match found {
+    None -> None,
+    Some(k) -> match parse_string(k.json) {
+      Err(_) -> None,
+      Ok(json) -> {
+        if !flags.json { printed(k.opening) };
+        Some({
+          json: match json {
+            Object(members) ->
+              Object(
+                map_insert(
+                  members,
+                  "front_end",
+                  object([
+                    { key: "incremental", value: Bool(true) },
+                    {
+                      key: "phases",
+                      value: phases_json({
+                        read_us: time.elapsed_us() - begun,
+                        front_us: 0,
+                        write_back_us: 0,
+                      }),
+                    },
+                    { key: "reused", value: Bool(true) },
+                    { key: "key", value: Str(key) },
+                  ]),
+                ),
+              ),
+            other -> other,
+          },
+          lines: k.lines,
+          errs: k.errs,
+          code: k.code,
+        })
+      },
+    },
+  }
+}
+
+fn over_load(
+  flags: Flags,
+  options: Options,
+  s: Style,
+  t: Timed,
+  begun: Int,
+  keeping: Option<Keeping>,
+) -> Iteration / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise, shipped.reached, literal.verdicts, tester.cases[corpus]} =
   match t.program.whole {
     // Every diagnostic, as `check` refuses: an error is the whole answer, so the shipped-module
     // filter a successful load applies to warnings is not applied here.
@@ -1902,13 +2043,12 @@ pub fn iterated(
         },
       None ->
         {
-          answer: tests_over(flags, s, options, t, w, begun),
+          answer: tests_over(flags, s, options, t, w, begun, keeping),
           held: Some(t),
           embeds: t.program.embeds,
         },
     },
   }
-}
 
 /// How the tree stamps now, one line per `.ply` file the paths name, or `None` when the walk could
 /// not read what it was given: a walk that failed has seen nothing, and a watcher told the tree is
@@ -2147,6 +2287,7 @@ fn tests_over(
   timed: Timed,
   analysis: Analysis,
   begun: Int,
+  keeping: Option<Keeping>,
 ) -> Answer / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, literal.verdicts, abort.raise, shipped.reached} = {
   let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
     Some(query) -> match targets(analysis, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
@@ -2162,7 +2303,7 @@ fn tests_over(
       let promised_at = time.elapsed_us();
       let spent = { ..no_spent(), before_us: begun, promises_us: promised_at - loaded_at };
       if len(broken) > 0 { refused(style, "test", broken, timed.program.places) }
-      else { selected(flags, style, options, timed, analysis, targeted, spent) }
+      else { selected(flags, style, options, timed, analysis, targeted, spent, keeping) }
     },
   }
 }
@@ -2175,6 +2316,7 @@ fn selected(
   analysis: Analysis,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
+  keeping: Option<Keeping>,
 ) -> Answer / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, abort.raise, shipped.reached} = {
   let configuring = time.elapsed_us();
   tester.configure[corpus](options);
@@ -2202,6 +2344,7 @@ fn selected(
           targeted,
           { ..spent, store_us: handing - configuring, handoff_us: listing - handing },
           listing,
+          keeping,
         ),
     }
   })
@@ -2222,6 +2365,7 @@ fn decided_run(
   targeted: Option<List<DefInfo>>,
   spent: Spent,
   listing: Int,
+  keeping: Option<Keeping>,
 ) -> Answer / {process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.pwd[sys], env.vars[sys], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], tester.schema[corpus], ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed, emit.unit, abort.raise, shipped.reached} = {
   let analysis = over.analysis;
   let selecting = time.elapsed_us();
@@ -2241,7 +2385,8 @@ fn decided_run(
   // pass is filed under: the runtime answers what the store holds and does what it is told.
   let searching = machine::sim_plan_of(options.sim);
   let search = search_of(searching);
-  let first = decide(cases_of(rows_of(analysis), search, options.no_cache));
+  let asked = cases_of(rows_of(analysis), search, options.no_cache);
+  let first = decide(asked.cases);
   let building = time.elapsed_us();
   // What a test runs is the unit's to say, so a run that would execute anything emits it before
   // deciding: a test nothing answered by its own key may be answered by its code.
@@ -2313,7 +2458,13 @@ fn decided_run(
                   decisions,
                   decided,
                   keyed,
-                  answered.refiled,
+                  {
+                    refiled: answered.refiled,
+                    kept: match keeping {
+                      Some(k) -> Some({ ..k, passes: answered_by(asked.answering, scope) }),
+                      None -> None,
+                    },
+                  },
                   searching,
                   r.warnings,
                   targeted,
@@ -2324,6 +2475,53 @@ fn decided_run(
                     bind_us: bound - binding,
                   },
                 );
+                // A green run that ran tests filed their passes, so selecting again answers what
+                // the next run would: that is the answer kept for it.
+                match keeping {
+                  Some(k) -> if flags.json && len(decided.runs) > 0 && answer.code == ok_code() {
+                    let again = cases_of(rows_of(analysis), search, false);
+                    let settled = decide(again.cases);
+                    if all_cached(settled, scope) {
+                      let next = program_of(
+                        options,
+                        timed,
+                        analysis,
+                        over.entries,
+                        root_of(flags.paths),
+                        scope,
+                        [],
+                        filed_under,
+                      );
+                      let _ = concluded_run(
+                        flags,
+                        style,
+                        options,
+                        next,
+                        timed,
+                        analysis,
+                        over.judged,
+                        scope,
+                        settled,
+                        decided_of(next, settled, search, sim_json(searching, options.sim), [], []),
+                        map_new(),
+                        {
+                          refiled: [],
+                          kept: Some({
+                            ..k,
+                            passes: answered_by(again.answering, scope),
+                            after: true,
+                          }),
+                        },
+                        searching,
+                        r.warnings,
+                        targeted,
+                        spent,
+                      );
+                      ()
+                    }
+                  },
+                  None -> (),
+                };
                 tester.ended[corpus]();
                 answer
               },
@@ -2562,12 +2760,15 @@ fn concluded_run(
   decisions: List<Decision>,
   decided: Decided,
   keyed: Map<Int, String>,
-  refiled: List<Pass>,
+  // The passes refiled under their own keys, and where the run keeps its answer.
+  keeps: { refiled: List<Pass>, kept: Option<Keeping> },
   searching: plan::Plan,
   configured: List<Diag>,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
 ) -> Answer / {process.out[proc], builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed, emit.unit, abort.raise, shipped.reached} = {
+  let refiled = keeps.refiled;
+  let kept = keeps.kept;
   let asked = {
     plan: searching,
     measuring: options.sim.measure_reduction,
@@ -2578,17 +2779,16 @@ fn concluded_run(
   // progress and its first failure; the document `--json` writes waits for the whole run.
   let shown = !flags.json;
   let width = name_column(program, decided);
-  if shown {
-    printed(
-      opening_lines(
-        style,
-        flags,
-        program,
-        decided,
-        opening_of(options, program, hosted_over(program)),
-      ),
+  let opening = if shown {
+    opening_lines(
+      style,
+      flags,
+      program,
+      decided,
+      opening_of(options, program, hosted_over(program)),
     )
-  };
+  } else { [] };
+  if shown { printed(opening) };
   let started = time.elapsed_us();
   let done = flat_map(decided.classes, |group: Group| {
     let ran = ran_class(
@@ -2667,9 +2867,10 @@ fn concluded_run(
       "every verdict stands; the next bisection runs those mixtures again",
     )
   };
-  let lazily = if options.no_cache { [] } else { ledger.opened() };
+  let after = match kept { Some(k) -> k.after, None -> false };
+  let lazily = if options.no_cache || after { [] } else { ledger.opened() };
   let concluding = time.elapsed_us() - started - elapsed;
-  answered(
+  let answer = answered(
     style,
     flags,
     program,
@@ -2681,7 +2882,34 @@ fn concluded_run(
     },
     cause.faults,
     decided,
-  )
+  );
+  match kept {
+    Some(k) -> if len(decided.runs) == 0 && answer.code == ok_code() && unwarned(answer)
+        && all_cached(decisions, scope) {
+      let _ = ledger.filed({
+        passes: [
+          {
+            key: k.key,
+            trace: answers::encoded({
+              opening: opening,
+              lines: answer.lines,
+              errs: answer.errs,
+              code: answer.code,
+              json: to_string(answer.json),
+              passes: k.passes,
+              views: k.views,
+            }),
+          },
+        ],
+        codes: [],
+        records: [],
+        seen: [],
+      });
+      ()
+    },
+    None -> (),
+  };
+  answer
 }
 
 /// What writing to the store had to say, its own failure first.
@@ -3355,11 +3583,14 @@ fn judged_mutant(
 /// What the store holds for each test, asked under the keys this program computes: the key its
 /// result is filed under, and — for a seeded test whose plan is answered root by root — each
 /// root's own. A run that bypasses the cache asks nothing and finds nothing.
+/// Each test's case, and the keys whose passes answer it where one does: its own, or each root's.
+type Selection = { cases: List<select::Case>, answering: List<List<String>> }
+
 fn cases_of(
   rows: List<Row>,
   search: Search,
   bypassed: Bool,
-) -> List<select::Case> / {ledger.passes, tester.moved[corpus], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+) -> Selection / {ledger.passes, tester.moved[corpus], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let ask = |keys: List<String>|
     if bypassed { map(keys, |k: String| None) } else { ledger.passes(keys) };
   let digest = digest_of(search);
@@ -3368,12 +3599,14 @@ fn cases_of(
     fold(keys, [], |acc: List<String>, k: Option<String>|
       match k { Some(key) -> push(acc, key), None -> acc }),
   );
-  let seeded = map(rows, |r: Row|
+  let rooted = map(rows, |r: Row|
     match r.hash {
-      Some(h) -> if answers_per_root(r, search) { Some(ask(seed_keys(h, search.roots, []))) }
+      Some(h) -> if answers_per_root(r, search) { Some(seed_keys(h, search.roots, [])) }
       else { None },
       None -> None,
     });
+  let seeded = map(rooted, |ks: Option<List<String>>|
+    match ks { Some(xs) -> Some(ask(xs)), None -> None });
   let now = views::now_for(
     views::viewed_in(
       traces_of(
@@ -3393,15 +3626,30 @@ fn cases_of(
         Some(_) -> { at: st.at + 1, out: push(st.out, at_or(answers, st.at, None)) },
       },
   ).out;
-  map(range(0, len(rows)), |i: Int| {
-    let r: Row = at_or(rows, i, no_row());
-    let owed = match at_or(seeded, i, None) {
+  let owed = map(seeded, |o: Option<List<Option<Bytes>>>|
+    match o {
       Some(xs) ->
         Some(owed_roots(search.roots, map(xs, |held: Option<Bytes>| standing(now, held)))),
       None -> None,
-    };
-    select::case_of(r, at_or(keys, i, None), at_or(held, i, None), owed)
-  })
+    });
+  {
+    cases: map(range(0, len(rows)), |i: Int|
+      select::case_of(
+        at_or(rows, i, no_row()),
+        at_or(keys, i, None),
+        at_or(held, i, None),
+        at_or(owed, i, None),
+      )),
+    answering: map(range(0, len(rows)), |i: Int|
+      match ((at_or(keys, i, None), at_or(held, i, None))) {
+        (Some(key), Some(Stands)) -> [key],
+        (Some(_), None) -> match ((at_or(rooted, i, None), at_or(owed, i, None))) {
+          (Some(ks), Some([])) -> ks,
+          _ -> [],
+        },
+        _ -> [],
+      }),
+  }
 }
 
 fn traces_of(held: List<Option<Bytes>>) -> List<Bytes> =
