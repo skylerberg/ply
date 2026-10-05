@@ -1863,6 +1863,20 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
+/// Whether `lo <= v <= hi` as `<=` orders the three, for a range pattern over a width the words do
+/// not carry. Reads all three.
+pub unsafe extern "C" fn rt_between(ctx: *mut Ctx, v: i64, lo: i64, hi: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let (x, l, h) = (ctx.value(v), ctx.value(lo), ctx.value(hi));
+    let le = |a: &Value, b: &Value| {
+        ply_eval::strict_binary(BinOp::Le, a, b, Span::DUMMY, Span::DUMMY, Span::DUMMY)
+    };
+    match le(&l, &x).and_then(|low| Ok((low, le(&x, &h)?))) {
+        Ok(both) => i64::from(matches!(both, (Value::Bool(true), Value::Bool(true)))),
+        Err(d) => ctx.fail(d),
+    }
+}
+
 /// `++`: two strings or two byte strings append natively, answering the kind they share; anything
 /// else raises what `strict_binary` raises. Takes both.
 pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {

@@ -145,6 +145,7 @@ helpers![
     (rt_overflow, 1, false),
     (rt_not_that_width, 2, false),
     (rt_equal, 2, true),
+    (rt_between, 3, true),
     (rt_concat, 2, true),
     (rt_bytes_join, 2, true),
     (rt_builtin_value, 1, true),

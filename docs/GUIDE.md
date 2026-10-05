@@ -169,6 +169,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
+| `b'{'`, `b'\n'`, `b'\x1f'` | `Int` | The byte `bytes_at` answers: one ASCII character or one escape. |
 | `uuid"6ba7b810-.."`, `html"<b>{x}</b>"` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, and holes its tag is handed apart from the text, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
@@ -183,6 +184,11 @@ written as a literal; use `i8_of_int(-128)`.
 String and character escapes are `\n` `\t` `\r` `\0` `\\` `\"` `\'` and `\u{...}`, one to six hex
 digits naming a Unicode scalar value (a surrogate or a value past `10FFFF` is `E0211`). Byte
 strings add `\xNN`, refuse `\u{...}` and refuse source characters above `U+007F`.
+
+A byte literal `b'x'` holds one byte, written as a byte string writes it or as `\'`, and is the
+`Int` that byte is: `b'{'` and `123` are one literal with one hash, so
+`bytes_at(src, i) == b'{'` reads as it means and a scanner is a `match` (§5.2). An empty one, one
+holding more than a byte, or one that never closes is `E0001` or `E0002`, as for a character.
 
 An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ " b"`, with
 `std.show`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
@@ -288,7 +294,9 @@ Loosest to tightest; all binary operators are left-associative:
 | 7 | `<<` `>>` `>>>` | integer; the count is `Int` |
 | 8 | `++` | `String` or `Bytes` |
 | 9 | `+` `-` | numeric |
+| 9 | `+%` `-%` `+\|` `-\|` | integer |
 | 10 | `*` `/` `%` | numeric |
+| 10 | `*%` `*\|` | integer |
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
@@ -307,7 +315,20 @@ Loosest to tightest; all binary operators are left-associative:
   than zero or its operands are `Float`s. Overflow and a shift count that is
   negative or not less than the type's width are the machine's limit, as the
   call ceiling is: they end the run (`E0502`) and are in no row. `<<` discards
-  shifted-out bits; `wrap_*` wrap and `checked_*` answer `None` (§12).
+  shifted-out bits and `checked_*` answer `None` (§12).
+* `+%`, `-%` and `*%` wrap at the operand type's width, and `+|`, `-|` and `*|`
+  saturate at it: `255u8 +% 1u8` is `0u8`, `250u8 +| 10u8` is `255u8` and
+  `3u8 -| 10u8` is `0u8`. At `Int` the width is its 64 bits and the ends its
+  least and greatest values. They perform nothing, cannot raise and never end
+  the run. Each is the call of a builtin, built at the parse, so the two
+  spellings are one definition with one hash: `a +% b` is `wrap_add(a, b)`,
+  and `wrap_sub`, `wrap_mul`, `saturating_add`, `saturating_sub` and
+  `saturating_mul` are the other five. Their operands are one builtin integer
+  type, which the call site settles: a type parameter, even under
+  `where integer(a)`, is `E0210`, any other type `E0201`, and a type that states
+  its own arithmetic (§4.4) `E0223`. A `%` or a `|` touching the `+`, `-` or
+  `*` before it is the one operator, so a lambda that is an operator's right
+  operand takes a space: `a + |x| x`.
 * `/` on `Decimal` is `E0209`; use `decimal_div`. `%` is allowed.
 * `&&`/`||` short-circuit. `&` `|` `^` `~` are integer-only and act at the
   type's own width (`~0u8` is `255u8`). `>>` is arithmetic, `>>>` logical.
@@ -534,7 +555,8 @@ definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
 operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
 code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12). `u32_of_int` and its
 siblings raise (§6.8) when the value does not fit (mask to truncate:
-`u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, and a 128-bit
+`u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, which `to_int`
+reads any of them as and `numeric_of_int` writes at any (§12), and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
 
@@ -716,8 +738,9 @@ once (`E0105`), and takes no parameter: an operator has the values alone, and
 
 `/` and `%` are no operator of such a type, since they have no answer at every
 pair of values: its module has a function for each, as `std.bigint.div` answers
-an `Option`. The bit operators and the `wrap_` and `checked_` builtins stay the
-builtin integers'. A type is ordered by its `key`, so `<`, `<=`, `>` and `>=`
+an `Option`. The bit operators stay the builtin integers' (`E0201`), and so do
+the wrapping, saturating and checked builtins, the operators written in them
+(§2.4) and the rotations (`E0223`). A type is ordered by its `key`, so `<`, `<=`, `>` and `>=`
 work at one that states both, and compare the keys. A type that states both is
 a numeric type: it fills `numeric(a)` (§4.5), as `std.math.sum(xs)` over a
 `List<BigInt>` does. One with no `key` has its operators and fills no
@@ -939,7 +962,8 @@ guard: `[x, y, ..rest] if x > y -> x + len(rest),`. A `match` must be exhaustive
 | --- | --- |
 | `_` / `name` | anything; `name` binds it |
 | `Ctor`, `Ctor(p, q)`, `mod::Ctor(p)` | a constructor |
-| `42`, `-1`, `1.5`, `1.50m`, `"s"`, `b"s"`, `true`, `()` | a literal |
+| `42`, `-1`, `1.5`, `1.50m`, `"s"`, `b"s"`, `b'{'`, `true`, `()` | a literal |
+| `0..=9`, `b'a'..=b'z'`, `1u8..=9u8` | an integer from the first bound through the second |
 | `[]`, `[a, b]`, `[a, ..]`, `[a, ..rest]` | a list of exact length, or a prefix |
 | `{a, b}`, `{a: p, b: q}`, `{a, ..}` | a record; `..` allows other fields |
 | `(p, q)` | a tuple |
@@ -950,6 +974,25 @@ once per alternative, so a guard runs again for a later alternative when an
 earlier one matched and the guard refused it. A plain `let` may use an
 or-pattern only where its alternatives cover the type, as in
 `let Ok(v) | Err(v) = r;`; one that can fail needs an `else` (`E0213`).
+
+A range's bounds are two integer literals of one type, the first no greater than
+the second and neither in parentheses (`E0222`); it binds nothing:
+
+```ply
+fn value(src: Bytes, i: Int) -> Result<Json, ParseError> / {abort.raise} =
+  match bytes_at(src, i) {
+    b'"' -> string_value(src, i),
+    b'-' | b'0'..=b'9' -> number(src, i),
+    b'{' -> object_value(src, i),
+    _ -> Err(error_at(i, "expected a value")),
+  }
+```
+
+Literals and ranges that between them hold every value of a `U8`, a `U16` or a
+`U32` exhaust it, and one they leave out is named:
+`match b { 0u8..=9u8 -> .., 20u8..=255u8 -> .. }` is `E0205`, not covered:
+`10u8..=19u8`. No other integer type's least and greatest values are both
+literals, so a match over one ends in a `_` arm.
 
 ### 5.3 Lambdas
 
@@ -2199,7 +2242,11 @@ compiler's prelude as an `extern fn`: a signature the runtime implements, with a
 row and a `where` like any other and no body, and a doc. Only the prelude
 declares one; an `extern fn` in a module is `E0151`. A module may shadow any
 except `compare_values` and `map_of_entries`, which the map and set literals are
-written in (`E0105`). `ply doc prelude` lists them all, each with the summary of
+written in, and the six the wrapping and saturating operators are written in
+(§2.4), which no binding around such an operator may hide either (`E0105`).
+`to_int` reads a value of any integer type as an `Int`, answering `None` past
+its range, so with `numeric_of_int` it converts between any two.
+`ply doc prelude` lists them all, each with the summary of
 its doc, and `ply doc NAME` prints one: its signature with the parameters' names,
 and its doc.
 
@@ -2800,6 +2847,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum |
 | `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
+| `E0222` | a range pattern whose bounds are not two integer literals of one type, the first no greater than the second |
+| `E0223` | a wrapping, saturating or checked builtin, an operator written in one, or a rotation at a type that states its own arithmetic |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
