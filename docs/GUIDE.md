@@ -650,6 +650,12 @@ reads any of them as and `numeric_of_int` writes at any (§12), and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
 
+A `Decimal` is a 96-bit mantissa and a scale, the count of digits after its
+point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `decimal_div`
+and `decimal_round` take the scale of their answer, and answer with exactly that
+many digits after the point, the exact value rounded once by the `Rounding`
+given; they raise where 96 bits do not hold the answer at that scale.
+
 ### 4.2 Records and tuples
 
 Records are structural; `type` names an alias, not a new type, unless its body
