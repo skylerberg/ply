@@ -6,9 +6,10 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 8] = [
+const OPERATIONS: [(&str, &str); 9] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
+    ("reached", "ply_machine::shipped::reached"),
     ("version", "ply_machine::shipped::version"),
     ("stamps", "ply_machine::shipped::stamps"),
     ("runtime", "ply_machine::shipped::runtime"),
@@ -125,6 +126,12 @@ impl HostHandler for Shipped {
             }
             ("definitions", []) if self.definitions.is_none() => {
                 ply_host::observe::program(req.machine)
+            }
+            ("reached", [view, pulled]) => {
+                let view = view.as_bytes(span, "a load's view of the shipped modules")?;
+                let pulled = pulled.as_bool(span, "whether the load pulled its modules")?;
+                ply_host::observe::reached(req.machine, &String::from_utf8_lossy(view), pulled);
+                return Ok(HostAnswer::Value(PlyValue::Unit));
             }
             _ => {}
         }
