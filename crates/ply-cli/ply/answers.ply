@@ -1,19 +1,30 @@
-//! A test run's answer, kept for the next run over the same command and files: one that ran nothing
-//! answers the next exactly while every pass it took still stands and every shipped definition its
-//! program reached hashes as it did, so that run answers without loading the program. The answer is
-//! filed in the test store under a key of the `ply` program, the walk and the command line, beside
-//! the keys whose passes it took and the views its load told of the shipped modules.
+//! A command's answer, kept for the next run of it over the same command line and files: a test run
+//! that ran nothing, or a listing, answers the next exactly while every pass it took still stands,
+//! every shipped definition its program reached hashes as it did and every embed its answer reaches
+//! reads as it did, so that run answers without loading the program. The answer is filed in the
+//! package's test store under a key of the `ply` program, the walk and the command line, beside the
+//! keys whose passes it took, the views its load told of the shipped modules and those embeds.
 
+import compiler.embed (embed_key)
+import compiler.front (Embedded)
 import compiler.hash (hex)
-import compiler.interface (sized)
+import compiler.interface (read_key, sized)
+import paths
+import results
 import reused
-import sources (Project)
+import sources (Embed, Project)
 import std.bin
 import std.fs (fs)
 import std.hash (blake3)
+import std.random (entropy)
+import std.time (time)
+import env (env)
+import tester (ledger)
+import views
 
 /// What a run that ran nothing answered: the lines it printed before its answer, the answer, the
-/// keys of the passes it took, and its load's views of the shipped modules, as a trace holds them.
+/// keys of the passes it took, its load's views of the shipped modules, as a trace holds them, and
+/// the embeds its tests reach.
 pub type Kept = {
   opening: List<String>,
   lines: List<String>,
@@ -22,6 +33,29 @@ pub type Kept = {
   json: String,
   passes: List<String>,
   views: Bytes,
+  embeds: List<Embedding>,
+}
+
+/// An embed a kept answer's tests reach: what names it and the digest of what was read for it. An
+/// embed no test reaches moves nothing an answer holds.
+pub type Embedding = { id: Bytes, digest: Bytes }
+
+derive bin for Embedding
+
+/// `e` as a kept answer holds it.
+pub fn embedding_of(e: Embedded) -> Embedding / {abort.raise} =
+  {
+    id: bytes_concat_all([sized(e.root), sized(e.module), sized(embed_key(e.want))]),
+    digest: read_key(e.read),
+  }
+
+/// Whether each embed in `held` reads now as it did.
+pub fn embeds_stand(held: List<Embedding>, project: Project) -> Bool / {abort.raise} = {
+  let now = fold(project.embeds, map_new(), |acc: Map<Bytes, Bytes>, e: Embed| {
+    let x = embedding_of(e.embedded);
+    map_insert(acc, x.id, x.digest)
+  });
+  fold(held, true, |all: Bool, x: Embedding| all && map_get(now, x.id) == Some(x.digest))
 }
 
 derive bin for Kept
@@ -37,25 +71,78 @@ pub fn program() -> Bytes / {fs.read_file[shipped], abort.raise} =
   )
 
 /// The key a run's answer is kept under: the program, its whole command line, and every file its
-/// walk read. Where it ran is not in it: a path the line names relatively is in what the walk read,
-/// and a trace names what it read under the root that held it.
-pub fn key_of(program: Bytes, argv: List<String>, project: Project) -> String / {abort.raise} =
+/// walk read, each embed by what it asks for and whether it could be read, never by its bytes,
+/// which the answer holds of the embeds its tests reach. Where it ran is not in it: a path the line
+/// names relatively is in what the walk read, and a trace names what it read under the root that
+/// held it.
+pub fn key_of(program: Bytes, argv: List<String>, project: Project) -> String / {abort.raise} = {
+  let named = {
+    ..project,
+    embeds: map(project.embeds, |e: Embed|
+      {
+        ..e,
+        embedded: {
+          ..e.embedded,
+          read: match e.embedded.read { Ok(_) -> Ok([]), Err(why) -> Err(why) },
+        },
+      }),
+  };
   string_of_bytes(
     hex(
       blake3(
         bytes_concat_all([
-          sized(b"ply test answer 1"),
+          sized(b"ply kept answer 1"),
           sized(bytes_of_string(int_to_string(len(argv)))),
           bytes_concat_all(map(argv, |a: String| sized(bytes_of_string(a)))),
           sized(
             bytes_of_string(
-              reused::key_of({ stamp: string_of_bytes(hex(program)), version: "" }, project, None),
+              reused::key_of({ stamp: string_of_bytes(hex(program)), version: "" }, named, None),
             ),
           ),
         ]),
       ),
     ),
   )
+}
+
+/// The answer kept under `key` in the store of `paths` for a command that takes no pass, where it
+/// still stands: its load's views of the shipped modules hold and each embed it holds reads in
+/// `project` as it did.
+pub fn kept_standing(
+  paths: List<paths::Resolved>,
+  key: String,
+  project: Project,
+) -> Option<Kept> / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], env.var[sys], env.pwd[sys], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, abort.raise} =
+  results::with_ledger(results::store_for(paths, false), || {
+    match list_at(ledger.passes([key]), 0) {
+      Some(Some(bytes)) -> match decoded(bytes) {
+        None -> None,
+        Some(k) -> {
+          let viewed = views::split(k.views).viewed;
+          if embeds_stand(k.embeds, project)
+              && views::moved(views::now_for([viewed]), viewed) == None { Some(k) }
+          else { None }
+        },
+      },
+      _ -> None,
+    }
+  })
+
+/// `k` kept under `key` in the store of `paths`, for the next run that asks it.
+pub fn keep(
+  paths: List<paths::Resolved>,
+  key: String,
+  k: Kept,
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], env.var[sys], env.pwd[sys], fs.read_file[shipped], entropy.next, time.now_ms, abort.raise} =
+  results::with_ledger(results::store_for(paths, false), || {
+    let _ = ledger.filed({
+      passes: [{ key: key, trace: encoded(k) }],
+      codes: [],
+      records: [],
+      seen: [],
+    });
+    ()
+  })
 
 pub fn encoded(k: Kept) -> Bytes / {abort.raise} = bin::encode(k, kept_bin())
 
@@ -73,6 +160,7 @@ test "a kept answer reads back as it was written" {
     json: "{}",
     passes: ["ab", "cd"],
     views: b"shipform\tstd.list\tt\tf\n",
+    embeds: [{ id: b"m", digest: b"d" }],
   };
   assert_eq(decoded(encoded(k)), Some(k));
   assert_eq(decoded(b"not one"), None)
