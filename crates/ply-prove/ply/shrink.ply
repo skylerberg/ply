@@ -15,10 +15,12 @@ import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VS
                   VArray, VRecord, VCtor, VMap, VFn, VCell, VTask, VSecret, VElided, Field, Entry,
                   FNamed, FAnonymous, FConst, FProject, FTable, map_of, width_of)
 import std.list (at_or, slice)
+import std.result (result_traverse)
 import domain (Ty, Var, Fn, Record, Con)
 import gen
 import gen (Types, Typed, Ungeneratable, UCell, UTask, UChan, USecret, UEffectful, UUninhabited,
-            UTooDeep, by_name, fields_of, generatable, hard_depth, is_width, mask)
+            UTooDeep, by_name, fields_of, generatable, hard_depth, is_width, mask, sampler_of)
+import drawn (Made, Replay, carried, draw_of, over_pools, record_candidates, record_size)
 
 /// The property the original input had, which every accepted candidate must keep.
 pub type Target = | Falsifies | Raises
@@ -36,7 +38,25 @@ pub fn descend<| e>(
   holds: (List<Value>) -> Bool / e,
   budget: Int,
 ) -> Descent / {abort.raise | e} =
-  walk({ values: values, steps: 0, evaluations: 0 }, tys, types, holds, budget, budget + 1)
+  descend_made(
+    values,
+    tys,
+    types,
+    |tried: List<Value>| if holds(tried) { Some(tried) } else { None },
+    budget,
+  )
+
+/// The walk over a tuple that may carry values a generator drew. `ran` re-runs the claim at a
+/// tuple and answers it as it ran, each record a candidate carries replayed into the value it makes,
+/// when it still has the property.
+pub fn descend_made<| e>(
+  values: List<Value>,
+  tys: List<Ty>,
+  types: Types,
+  ran: (List<Value>) -> Option<List<Value>> / e,
+  budget: Int,
+) -> Descent / {abort.raise | e} =
+  walk({ values: values, steps: 0, evaluations: 0 }, tys, types, ran, budget, budget + 1)
 
 type Pass = { values: List<Value>, hit: Bool, stopped: Bool, evaluations: Int }
 
@@ -46,7 +66,7 @@ fn walk<| e>(
   d: Descent,
   tys: List<Ty>,
   types: Types,
-  holds: (List<Value>) -> Bool / e,
+  holds: (List<Value>) -> Option<List<Value>> / e,
   budget: Int,
   left: Int,
 ) -> Descent / {abort.raise | e} = {
@@ -71,7 +91,7 @@ fn pass_over<| e>(
   i: Int,
   tys: List<Ty>,
   types: Types,
-  holds: (List<Value>) -> Bool / e,
+  holds: (List<Value>) -> Option<List<Value>> / e,
   budget: Int,
   evaluations: Int,
 ) -> Pass / {abort.raise | e} =
@@ -105,7 +125,7 @@ fn try_alts<| e>(
   here: U128,
   alts: List<Value>,
   types: Types,
-  holds: (List<Value>) -> Bool / e,
+  holds: (List<Value>) -> Option<List<Value>> / e,
   budget: Int,
   evaluations: Int,
 ) -> Pass / {abort.raise | e} =
@@ -116,9 +136,10 @@ fn try_alts<| e>(
     } else if evaluations >= budget {
       { values: values, hit: false, stopped: true, evaluations: evaluations }
     } else {
-      let tried = list_set(values, i, alt);
-      if holds(tried) { { values: tried, hit: true, stopped: false, evaluations: evaluations + 1 } }
-      else { try_alts(values, i, here, rest, types, holds, budget, evaluations + 1) }
+      match holds(list_set(values, i, alt)) {
+        Some(ran) -> { values: ran, hit: true, stopped: false, evaluations: evaluations + 1 },
+        None -> try_alts(values, i, here, rest, types, holds, budget, evaluations + 1),
+      }
     },
   }
 
@@ -223,11 +244,22 @@ pub fn size(v: Value, types: Types) -> U128 / {abort.raise} =
         sum(entries, |e: Entry| plus(size(e.key, types), size(e.value, types))),
       ),
     VRecord(fields) -> sum(fields, |f: Field| size(f.value, types)),
-    VCtor(name, args) ->
-      plus(
-        plus(1u128, plus(wide(max(ctor_index(types, name), 0)), wide(len(args)))),
-        sum(args, |x: Value| size(x, types)),
-      ),
+    VCtor(name, args) -> match draw_of(v) {
+      // A value a generator drew is as large as the record that makes it and what it chose among.
+      Some(d) -> {
+        let pooled = over_pools(v, 0u128, |acc: U128, x: Value| plus(acc, size(x, types)));
+        match d.state {
+          Made(m) -> plus(record_size(m.record), pooled),
+          Replay(record) -> plus(record_size(record), pooled),
+          _ -> ~0u128,
+        }
+      },
+      None ->
+        plus(
+          plus(1u128, plus(wide(max(ctor_index(types, name), 0)), wide(len(args)))),
+          sum(args, |x: Value| size(x, types)),
+        ),
+    },
     VFn(fun) -> match fun {
       FConst(c) -> plus(2u128, size(c.value, types)),
       FProject(_) -> 1u128,
@@ -295,11 +327,27 @@ fn minimal_at(ty: Ty, types: Types, depth: Int) -> Result<Value, Ungeneratable> 
       else if name == "Task" { Err(UTask) }
       else if name == "Chan" { Err(UChan) }
       else if name == "Secret" { Err(USecret) } else {
-        match shallowest(types, name, args) {
-          None -> Err(UUninhabited(name)),
-          Some(v) -> match all_minimal(v.fields, types, depth + 1) {
+        match sampler_of(types, name) {
+          // What its generator makes of no draws at all, each parameter chosen from its floor.
+          Some(sampler) -> match all_minimal(args, types, depth + 1) {
             Err(e) -> Err(e),
-            Ok(vs) -> Ok(VCtor(v.name, vs)),
+            Ok(floors) ->
+              Ok(
+                carried({
+                  ty: name,
+                  sampler: sampler,
+                  pools: map(floors, |floor: Value| [floor]),
+                  size: 0,
+                  state: Replay([]),
+                }),
+              ),
+          },
+          None -> match shallowest(types, name, args) {
+            None -> Err(UUninhabited(name)),
+            Some(v) -> match all_minimal(v.fields, types, depth + 1) {
+              Err(e) -> Err(e),
+              Ok(vs) -> Ok(VCtor(v.name, vs)),
+            },
           },
         }
       },
@@ -307,11 +355,7 @@ fn minimal_at(ty: Ty, types: Types, depth: Int) -> Result<Value, Ungeneratable> 
   }
 
 fn all_minimal(tys: List<Ty>, types: Types, depth: Int) -> Result<List<Value>, Ungeneratable> =
-  fold(tys, Ok([]), |acc: Result<List<Value>, Ungeneratable>, t: Ty|
-    match acc {
-      Err(_) -> acc,
-      Ok(vs) -> match minimal_at(t, types, depth) { Err(e) -> Err(e), Ok(v) -> Ok(push(vs, v)) },
-    })
+  result_traverse(tys, |t: Ty| minimal_at(t, types, depth))
 
 /// The usable variant needing the fewest nested applications, the earlier declared on a tie.
 fn shallowest(
@@ -389,9 +433,44 @@ fn candidates_at(v: Value, t: Ty, types: Types, depth: Int) -> List<Value> / {ab
             }),
         _ -> [],
       },
-      VCtor(name, args) -> match t {
-        Con(ty_name, ty_args) -> ctor_candidates(name, args, ty_name, ty_args, t, types, depth),
-        _ -> [],
+      VCtor(name, args) -> match draw_of(v) {
+        // Its record made smaller, then each value it chose among, replayed through the generator
+        // that drew it: a candidate is what that generator makes, whatever it comes to.
+        Some(d) -> match d.state {
+          Made(m) -> {
+            let replayed = map(record_candidates(m.record), |record: List<Int>|
+              carried({ ..d, state: Replay(record) }));
+            let params = match t { Con(_, ty_args) -> ty_args, _ -> [] };
+            fold(range(0, len(d.pools)), replayed, |out: List<Value>, p: Int|
+              match ((list_at(d.pools, p), list_at(params, p))) {
+                (Some(pool), Some(elem)) ->
+                  fold(range(0, len(pool)), out, |acc: List<Value>, k: Int|
+                    match list_at(pool, k) {
+                      None -> acc,
+                      Some(x) ->
+                        fold(
+                          candidates_at(x, elem, types, depth + 1),
+                          acc,
+                          |inner: List<Value>, c: Value|
+                            push(
+                              inner,
+                              carried({
+                                ..d,
+                                pools: list_set(d.pools, p, list_set(pool, k, c)),
+                                state: Replay(m.record),
+                              }),
+                            ),
+                        ),
+                    }),
+                _ -> out,
+              })
+          },
+          _ -> [],
+        },
+        None -> match t {
+          Con(ty_name, ty_args) -> ctor_candidates(name, args, ty_name, ty_args, t, types, depth),
+          _ -> [],
+        },
       },
       // The constant function is the floor, so the size test ends the walk on the next pass.
       VFn(_) -> match t {
@@ -940,4 +1019,83 @@ test "a decimal halves exactly at its own scale, and to even past the digits a d
   );
   assert_eq(halves(12m), [6m, 3m]);
   assert_eq(halves(5m), [])
+}
+
+fn drawing_types() -> Types / {abort.raise} =
+  gen::types_of([], [
+    { ty: "m.Even", params: 0, sampler: "m._sample_Even" },
+    { ty: "m.Bag", params: 1, sampler: "m._sample_Bag" },
+  ])
+
+fn an_even(record: List<Int>) -> Value =
+  carried({
+    ty: "m.Even",
+    sampler: "m._sample_Even",
+    pools: [],
+    size: 3,
+    state: Made({ record: record, value: VInt(2 * at_or(record, 0, 0)) }),
+  })
+
+fn replays(cs: List<Value>) -> List<List<Int>> =
+  map(cs, |c: Value|
+    match draw_of(c) {
+      Some(d) -> match d.state { Replay(record) -> record, _ -> [0 - 1] },
+      None -> [0 - 1],
+    })
+
+test "a value a generator drew shrinks by replaying a smaller record, never by its parts" {
+  let types = drawing_types();
+  assert_eq(replays(candidates(an_even([2, 1]), Con("m.Even", []), types)), [
+    [],
+    [1],
+    [2],
+    [0, 1],
+    [1, 1],
+  ]);
+  assert(size(an_even([2, 1]), types) > size(an_even([2]), types));
+  assert(size(an_even([2]), types) > size(an_even([1]), types));
+  // The floor is what the generator makes of no draws at all.
+  assert_eq(replays(match minimal(Con("m.Even", []), types) { Ok(m) -> [m], Err(_) -> [] }), [[]])
+}
+
+test "the walk over a drawn value keeps what its generator makes of each record it tries" {
+  // A sampler that doubles its first draw: every value it makes is even, and so is the one the
+  // walk settles on.
+  let ran = |tried: List<Value>|
+    match tried {
+      [v] -> match draw_of(v) {
+        Some(d) -> match d.state {
+          Replay(record) -> if 2 * at_or(record, 0, 0) >= 10 { Some([an_even(record)]) }
+          else { None },
+          _ -> None,
+        },
+        None -> None,
+      },
+      _ -> None,
+    };
+  let d = descend_made([an_even([23, 9])], [Con("m.Even", [])], drawing_types(), ran, 500);
+  assert_eq(d.values, [an_even([5])]);
+  assert(d.steps > 0)
+}
+
+test "a drawn value shrinks by what it chose among too, its record replayed over them" {
+  let bag = carried({
+    ty: "m.Bag",
+    sampler: "m._sample_Bag",
+    pools: [[VInt(4), VInt(0)]],
+    size: 3,
+    state: Made({ record: [], value: VList([VInt(4)]) }),
+  });
+  let cs = candidates(bag, Con("m.Bag", [int_ty()]), drawing_types());
+  assert_eq(map(cs, |c: Value| match draw_of(c) { Some(d) -> d.pools, None -> [] }), [
+    [[VInt(0), VInt(0)]],
+    [[VInt(2), VInt(0)]],
+    [[VInt(1), VInt(0)]],
+    [[VInt(3), VInt(0)]],
+  ]);
+  assert_eq(replays(cs), [[], [], [], []]);
+  assert(
+    fold(cs, true, |ok: Bool, c: Value|
+      ok && size(c, drawing_types()) < size(bag, drawing_types())),
+  )
 }

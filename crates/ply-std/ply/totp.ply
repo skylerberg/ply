@@ -1,0 +1,826 @@
+//! One-time passwords: HOTP as RFC 4226 defines it, TOTP as RFC 6238 does, and the `otpauth://`
+//! URIs an authenticator app is provisioned with.
+//!
+//! A code is an HMAC of a counter under a shared key, cut to a few decimal digits. HOTP's counter
+//! is a count both sides keep; TOTP's is the present time in steps, which `step_at` reads off an
+//! `Instant` taken as nanoseconds from 1970-01-01T00:00:00Z, the reading `std.date` writes. The
+//! time is always an argument: nothing here reads a clock.
+//!
+//! `verify` answers the step whose code was typed, not a `Bool`, because a code is good once: the
+//! caller keeps the step it accepted for a key and hands it back as `last`, and `verify_after`
+//! then refuses that step and every one before it. That record, and counting failed attempts so a
+//! guesser is slowed, are the caller's state, and both RFCs require them.
+//!
+//! A key is `Bytes` and a provisioning URI holds it in the clear, since nothing written in Ply
+//! reads a `Secret`: keep both out of logs. A code is made for a key of any length, because an
+//! authenticator answers for the key it was given and many services give ten bytes. RFC 4226 asks
+//! for sixteen at least and recommends twenty, which is what `new_key` draws, and `uri` refuses to
+//! provision fewer than sixteen.
+//!
+//! Many authenticator apps make SHA-1 codes of six digits every thirty seconds whatever a URI
+//! asks for, so `standard` is the only form every one of them answers.
+
+import std.base32
+import std.bytes (u64_be)
+import std.hash (Hash, hmac, sha256_hash, sha512_hash, tags_match)
+import std.hash_legacy (sha1_hash)
+import std.laws (agrees)
+import std.list (last)
+import std.math (max_int, pow)
+import std.random (entropy, token_bytes)
+import std.string (int_of_string, pad_left, replace, to_upper, trim_start)
+import std.time (as_nanos, nanos_at, seconds)
+import std.url (Pair, query_parse, url_decode, url_encode)
+
+/// The hash a code's HMAC is under.
+pub type Algorithm = | Sha1 | Sha256 | Sha512
+
+/// How a code is cut from an HMAC: under which hash, and to how many decimal digits, six to ten.
+/// RFC 4226 names six, seven and eight. The cut leaves thirty-one bits, which is short of ten
+/// whole digits: a ten-digit code starts with 0, 1 or 2 and is worth those thirty-one bits.
+pub type Form = new { algorithm: Algorithm, digits: Int }
+
+/// How TOTP makes its codes: their form, how long a step lasts, and the instant steps count from.
+pub type Config = new { form: Form, step: Duration, epoch: Instant }
+
+/// How far from the present step a verifier looks: whole steps before it and after it, a count
+/// below zero being none. One step either way allows for a slow clock and a slow typist; each
+/// step more is one more code that passes.
+pub type Window = new { before: Int, after: Int }
+
+/// Whether an account's codes follow the clock or a count.
+pub type Kind =
+  /// Time-based, with how long a step lasts: whole seconds, at least one.
+  | Timed(Duration)
+  /// Counter-based, with the counter its next code is made at.
+  | Counted(Int)
+
+/// What a provisioning URI hands an authenticator: whose key it is, the key, and how its codes
+/// are made.
+pub type Provision = new {
+  kind: Kind,
+  /// Who the account is with, or empty for no one. It holds no colon.
+  issuer: String,
+  /// The account's name. It holds no colon and does not start with a space.
+  account: String,
+  key: Bytes,
+  form: Form,
+}
+
+/// Why a text is no provisioning URI.
+pub type Why =
+  /// It does not start `otpauth://`.
+  | NotOtpauth
+  /// Its type is this, which is neither `totp` nor `hotp`.
+  | UnknownKind(String)
+  /// Its label is not percent-encoded UTF-8, or holds more than one colon.
+  | BadLabel
+  /// Its query is not percent-encoded `name=value` pairs.
+  | BadQuery
+  /// It gives this parameter more than once.
+  | Twice(String)
+  /// It has no `secret`, or an empty one.
+  | NoSecret
+  /// Its `secret` is not base32.
+  | BadSecret
+  /// Its label and its `issuer` parameter name two issuers.
+  | TwoIssuers
+  /// This parameter's value is not one it can take.
+  | BadValue(String)
+  /// It is a `hotp` URI with no `counter`.
+  | NoCounter
+
+/// Why a function here refused what it was asked for, with what was asked.
+pub type Refusal =
+  /// A count of digits outside six to ten.
+  | Digits(Int)
+  /// A counter below zero.
+  | Counter(Int)
+  /// A step that is not above zero, or one a URI cannot carry because it is not whole seconds.
+  | Step(Duration)
+  /// A reading before the epoch, or further past it than an `Int` of nanoseconds.
+  | Reading(Instant)
+  /// A key to provision of this many bytes, which is under sixteen.
+  | ShortKey(Int)
+  /// An issuer or an account a label cannot carry: one holding a colon, or an account that starts
+  /// with a space.
+  | Label(String)
+  /// A text that is no provisioning URI.
+  | Malformed(Why)
+
+/// What a function of this module raises where it refuses.
+pub effect totp {
+  /// A parameter is outside what the function defines, or a text is no URI.
+  raise refused(e: Refusal)
+}
+
+/// SHA-1 codes of six digits, a step of thirty seconds, counted from the Unix epoch.
+pub fn standard() -> Config =
+  { form: { algorithm: Sha1, digits: 6 }, step: seconds(30), epoch: Instant(0) }
+
+/// Twenty bytes of the operating system's entropy: the key RFC 4226 recommends.
+pub fn new_key() -> Bytes / {entropy.next, abort.raise} = token_bytes(20)
+
+// --- Codes ------------------------------------------------------------------
+
+/// The HOTP code of `counter` under `key`: `form.digits` decimal digits, zeros leading. Raises
+/// for a count of digits outside six to ten and for a counter below zero.
+pub fn hotp(form: Form, key: Bytes, counter: Int) -> String / {totp.refused, abort.raise} =
+  if form.digits < 6 || form.digits > 10 { totp.refused(Digits(form.digits)) }
+  else if counter < 0 { totp.refused(Counter(counter)) } else {
+    let mac = hmac(hash_of(form.algorithm), key, u64_be(counter));
+    let at = bytes_at(mac, bytes_len(mac) - 1) & 0x0F;
+    let cut = (bytes_at(mac, at) & 0x7F) << 24 | bytes_at(mac, at + 1) << 16
+      | bytes_at(mac, at + 2) << 8
+      | bytes_at(mac, at + 3);
+    pad_left(int_to_string(cut % pow(10, form.digits)), form.digits, "0")
+  }
+
+/// The step `now` falls in: whole steps of `c.step` since `c.epoch`. Raises for a step that is
+/// not above zero and for a reading before the epoch.
+pub fn step_at(c: Config, now: Instant) -> Int / {totp.refused, abort.raise} = {
+  let step = as_nanos(c.step);
+  if step < 1 { totp.refused(Step(c.step)) } else {
+    match checked_sub(nanos_at(now), nanos_at(c.epoch)) {
+      Some(since) -> if since < 0 { totp.refused(Reading(now)) } else { since / step },
+      None -> totp.refused(Reading(now)),
+    }
+  }
+}
+
+/// The TOTP code at `now`: the HOTP code of the step `now` falls in. Raises as `hotp` and
+/// `step_at` do.
+pub fn code(c: Config, key: Bytes, now: Instant) -> String / {totp.refused, abort.raise} =
+  hotp(c.form, key, step_at(c, now))
+
+// --- Verifying --------------------------------------------------------------
+
+/// The step whose code `typed` is, among those of `window` around the step `now` falls in, or
+/// `None` where it is none of theirs. `typed` is the digits alone.
+///
+/// Where two steps of the window share the code, the later is answered, so keeping the answer
+/// retires every code before it. Every step of the window is computed and compared as
+/// `std.hash`'s `tags_match` compares, whichever matches, so the calls made depend on the window
+/// and on lengths and not on where a guess goes wrong. Raises as `code` does.
+pub fn verify(
+  c: Config,
+  key: Bytes,
+  typed: String,
+  now: Instant,
+  window: Window,
+) -> Option<Int> / {totp.refused, abort.raise} = verify_after(c, key, typed, now, window, None)
+
+/// `verify`, answering no step at or before `last`, the step last accepted for this key: a code
+/// used once, and any older one, is `None`. Store what this answers as the next `last`.
+pub fn verify_after(
+  c: Config,
+  key: Bytes,
+  typed: String,
+  now: Instant,
+  window: Window,
+  last: Option<Int>,
+) -> Option<Int> / {totp.refused, abort.raise} =
+  matched(c.form, key, typed, around(step_at(c, now), window), last)
+
+/// The counter whose HOTP code `typed` is, among `counter` and the `ahead` after it, or `None`.
+/// The later of two that share the code is answered, and every one is computed and compared, as
+/// in `verify`. A server keeps one past the answer as its next counter. Raises as `hotp` does.
+pub fn hotp_verify(
+  form: Form,
+  key: Bytes,
+  typed: String,
+  counter: Int,
+  ahead: Int,
+) -> Option<Int> / {totp.refused, abort.raise} =
+  matched(form, key, typed, around(counter, { before: 0, after: ahead }), None)
+
+/// The steps of a window around `at`, earliest first, without those below zero or past an `Int`.
+fn around(at: Int, window: Window) -> List<Int> =
+  fold(
+    range(0 - max(window.before, 0), max(window.after, 0) + 1),
+    [],
+    |steps: List<Int>, by: Int|
+      match checked_add(at, by) {
+        Some(step) -> if step < 0 { steps } else { push(steps, step) },
+        None -> steps,
+      },
+  )
+
+/// The last of `counters` past `last` whose code is `typed`.
+fn matched(
+  form: Form,
+  key: Bytes,
+  typed: String,
+  counters: List<Int>,
+  last: Option<Int>,
+) -> Option<Int> / {totp.refused, abort.raise} = {
+  let wanted = bytes_of_string(typed);
+  fold(counters, None, |found: Option<Int>, counter: Int| {
+    let same = tags_match(bytes_of_string(hotp(form, key, counter)), wanted);
+    let fresh = past(counter, last);
+    if same && fresh { Some(counter) } else { found }
+  })
+}
+
+fn past(counter: Int, last: Option<Int>) -> Bool =
+  match last { Some(accepted) -> counter > accepted, None -> true }
+
+fn hash_of(a: Algorithm) -> Hash =
+  match a { Sha1 -> sha1_hash(), Sha256 -> sha256_hash(), Sha512 -> sha512_hash() }
+
+// --- Provisioning URIs ------------------------------------------------------
+
+/// The `otpauth://` URI of `p`, as Google Authenticator's key URI format writes one: the type,
+/// the label `issuer:account`, and `secret` in unpadded base32, `issuer`, `algorithm`, `digits`
+/// and `period` or `counter`, each written out. Raises for a key under sixteen bytes, a count of
+/// digits outside six to ten, a step that is not whole seconds or is under one, a counter below
+/// zero, and an issuer or account the label cannot carry.
+pub fn uri(p: Provision) -> String / {totp.refused, abort.raise} =
+  if bytes_len(p.key) < 16 { totp.refused(ShortKey(bytes_len(p.key))) }
+  else if p.form.digits < 6 || p.form.digits > 10 { totp.refused(Digits(p.form.digits)) }
+  else if string_contains(p.issuer, ":") { totp.refused(Label(p.issuer)) }
+  else if string_contains(p.account, ":") || string_starts_with(p.account, " ") {
+    totp.refused(Label(p.account))
+  } else {
+    "otpauth://" ++ kind_name(p.kind) ++ "/" ++ label_of(p.issuer, p.account) ++ "?secret="
+      ++ base32::encode_unpadded(p.key)
+      ++ (if p.issuer == "" { "" } else { "&issuer=" ++ url_encode(p.issuer) })
+      ++ "&algorithm="
+      ++ algorithm_name(p.form.algorithm)
+      ++ "&digits="
+      ++ int_to_string(p.form.digits)
+      ++ kind_parameter(p.kind)
+  }
+
+/// What `text` provisions, raising `totp.refused` where `try_parse_uri` answers `Err`.
+///
+/// `algorithm`, `digits` and `period` may be left out, and are then SHA-1, six and thirty
+/// seconds. A `secret` is read as typed: in either case, with or without its padding. A parameter
+/// this format does not name is passed over, and one it does name may appear once.
+pub fn parse_uri(text: String) -> Provision / {totp.refused, abort.raise} = {
+  let scheme = "otpauth://";
+  if !string_starts_with(text, scheme) { malformed(NotOtpauth) } else {
+    let rest = string_slice(text, string_len(scheme), string_len(text));
+    let slash = if string_contains(rest, "/") { string_find(rest, "/") } else { string_len(rest) };
+    let tail = string_slice(rest, min(slash + 1, string_len(rest)), string_len(rest));
+    let mark = if string_contains(tail, "?") { string_find(tail, "?") } else { string_len(tail) };
+    let query = string_slice(tail, min(mark + 1, string_len(tail)), string_len(tail));
+    let timed = is_timed(string_slice(rest, 0, slash));
+    let named = names_of(needed(url_decode(string_slice(tail, 0, mark)), BadLabel));
+    let pairs = needed(query_parse(query), BadQuery);
+    let key = key_of(parameter(pairs, "secret"));
+    let issuer = issuer_of(named.issuer, parameter(pairs, "issuer"));
+    let algorithm = algorithm_of(parameter(pairs, "algorithm"));
+    let digits = digits_of(pairs);
+    {
+      kind: if timed { Timed(period_of(pairs)) }
+      else { Counted(needed(number(pairs, "counter", 0), NoCounter)) },
+      issuer: issuer,
+      account: named.account,
+      key: key,
+      form: { algorithm: algorithm, digits: digits },
+    }
+  }
+}
+
+/// What `text` provisions, or why it is no provisioning URI.
+pub fn try_parse_uri(text: String) -> Result<Provision, Refusal> / {abort.raise} =
+  try { parse_uri(text) }
+
+/// How a provisioned account's codes are made, for one that follows the clock from the Unix
+/// epoch; `None` for a counter-based one.
+pub fn config_of(p: Provision) -> Option<Config> =
+  match p.kind {
+    Timed(step) -> Some({ form: p.form, step: step, epoch: Instant(0) }),
+    Counted(_) -> None,
+  }
+
+fn malformed<a>(why: Why) -> a / {totp.refused} = totp.refused(Malformed(why))
+
+fn needed<a>(found: Option<a>, why: Why) -> a / {totp.refused} =
+  match found { Some(x) -> x, None -> malformed(why) }
+
+fn kind_name(k: Kind) -> String = match k { Timed(_) -> "totp", Counted(_) -> "hotp" }
+
+fn kind_parameter(k: Kind) -> String / {totp.refused} =
+  match k {
+    Timed(step) -> if as_nanos(step) < 1 || as_nanos(step) % 1000000000 != 0 {
+      totp.refused(Step(step))
+    } else { "&period=" ++ int_to_string(as_nanos(step) / 1000000000) },
+    Counted(counter) -> if counter < 0 { totp.refused(Counter(counter)) }
+    else { "&counter=" ++ int_to_string(counter) },
+  }
+
+fn algorithm_name(a: Algorithm) -> String =
+  match a { Sha1 -> "SHA1", Sha256 -> "SHA256", Sha512 -> "SHA512" }
+
+fn label_of(issuer: String, account: String) -> String / {abort.raise} =
+  if issuer == "" { url_encode(account) } else { url_encode(issuer) ++ ":" ++ url_encode(account) }
+
+/// A decoded label's two names: the issuer before its colon, if it has one, and the account
+/// after it without the spaces that may follow the colon.
+fn names_of(
+  label: String,
+) -> { issuer: Option<String>, account: String } / {totp.refused, abort.raise} =
+  match string_split(label, ":") {
+    [account] -> { issuer: None, account: account },
+    [issuer, account] ->
+      {
+        issuer: Some(issuer),
+        account: string_slice(account, spaces_from(account, 0), string_len(account)),
+      },
+    _ -> malformed(BadLabel),
+  }
+
+/// Where the spaces that start at `at` end.
+fn spaces_from(text: String, at: Int) -> Int / {abort.raise} =
+  if at >= string_len(text) { at }
+  else if string_slice(text, at, at + 1) == " " { spaces_from(text, at + 1) }
+  else { at }
+
+/// The one value `pairs` gives `name`, or `None` where they give none.
+fn parameter(pairs: List<Pair>, name: String) -> Option<String> / {totp.refused} =
+  match filter(pairs, |p: Pair| p.name == name) {
+    [] -> None,
+    [only] -> Some(only.value),
+    _ -> malformed(Twice(name)),
+  }
+
+fn issuer_of(labelled: Option<String>, given: Option<String>) -> String / {totp.refused} =
+  match labelled {
+    None -> match given { Some(issuer) -> issuer, None -> "" },
+    Some(issuer) -> match given {
+      Some(other) -> if other == issuer { issuer } else { malformed(TwoIssuers) },
+      None -> issuer,
+    },
+  }
+
+fn key_of(secret: Option<String>) -> Bytes / {totp.refused, abort.raise} = {
+  let key = needed(base32::decode_unpadded(base32::normalize(needed(secret, NoSecret))), BadSecret);
+  if bytes_len(key) == 0 { malformed(NoSecret) } else { key }
+}
+
+fn algorithm_of(given: Option<String>) -> Algorithm / {totp.refused, abort.raise} =
+  match given {
+    None -> Sha1,
+    Some(name) -> {
+      let upper = to_upper(name);
+      if upper == "SHA1" { Sha1 }
+      else if upper == "SHA256" { Sha256 }
+      else if upper == "SHA512" { Sha512 }
+      else { malformed(BadValue("algorithm")) }
+    },
+  }
+
+/// The whole number `pairs` give `name`, from `least` up; `None` where they give none.
+fn number(
+  pairs: List<Pair>,
+  name: String,
+  least: Int,
+) -> Option<Int> / {totp.refused, abort.raise} =
+  match parameter(pairs, name) {
+    None -> None,
+    Some(text) -> match int_of_string(text) {
+      Some(n) -> if n < least { malformed(BadValue(name)) } else { Some(n) },
+      None -> malformed(BadValue(name)),
+    },
+  }
+
+fn digits_of(pairs: List<Pair>) -> Int / {totp.refused, abort.raise} =
+  match number(pairs, "digits", 6) {
+    None -> 6,
+    Some(n) -> if n > 10 { malformed(BadValue("digits")) } else { n },
+  }
+
+/// Whether a URI's type is `totp`, where `hotp` is the other.
+fn is_timed(name: String) -> Bool / {totp.refused} =
+  if name == "totp" { true } else if name == "hotp" { false } else { malformed(UnknownKind(name)) }
+
+fn period_of(pairs: List<Pair>) -> Duration / {totp.refused, abort.raise} =
+  match number(pairs, "period", 1) {
+    None -> seconds(30),
+    Some(n) -> match checked_mul(n, 1000000000) {
+      Some(nanoseconds) -> Duration(nanoseconds),
+      None -> malformed(BadValue("period")),
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+/// The key of RFC 4226's vectors, and of RFC 6238's for SHA-1.
+fn rfc_key() -> Bytes = b"12345678901234567890"
+
+type CounterVector = { counter: Int, cut: Int, code: String }
+
+/// RFC 4226, appendix D: each counter's thirty-one bits and its six digits.
+fn rfc_4226() -> List<CounterVector> =
+  [
+    { counter: 0, cut: 1284755224, code: "755224" },
+    { counter: 1, cut: 1094287082, code: "287082" },
+    { counter: 2, cut: 137359152, code: "359152" },
+    { counter: 3, cut: 1726969429, code: "969429" },
+    { counter: 4, cut: 1640338314, code: "338314" },
+    { counter: 5, cut: 868254676, code: "254676" },
+    { counter: 6, cut: 1918287922, code: "287922" },
+    { counter: 7, cut: 82162583, code: "162583" },
+    { counter: 8, cut: 673399871, code: "399871" },
+    { counter: 9, cut: 645520489, code: "520489" },
+  ]
+
+test "RFC 4226's code at counter {c.counter}" for c: CounterVector in rfc_4226() {
+  assert_eq(hotp({ algorithm: Sha1, digits: 6 }, rfc_key(), c.counter), c.code);
+  // Ten digits are the whole cut, zeros leading.
+  assert_eq(
+    hotp({ algorithm: Sha1, digits: 10 }, rfc_key(), c.counter),
+    pad_left(int_to_string(c.cut), 10, "0"),
+  )
+}
+
+type TimeVector = { algorithm: Algorithm, at: Int, code: String }
+
+/// RFC 6238, appendix B: eight digits, a step of thirty seconds from the Unix epoch.
+fn rfc_6238() -> List<TimeVector> =
+  [
+    { algorithm: Sha1, at: 59, code: "94287082" },
+    { algorithm: Sha256, at: 59, code: "46119246" },
+    { algorithm: Sha512, at: 59, code: "90693936" },
+    { algorithm: Sha1, at: 1111111109, code: "07081804" },
+    { algorithm: Sha256, at: 1111111109, code: "68084774" },
+    { algorithm: Sha512, at: 1111111109, code: "25091201" },
+    { algorithm: Sha1, at: 1111111111, code: "14050471" },
+    { algorithm: Sha256, at: 1111111111, code: "67062674" },
+    { algorithm: Sha512, at: 1111111111, code: "99943326" },
+    { algorithm: Sha1, at: 1234567890, code: "89005924" },
+    { algorithm: Sha256, at: 1234567890, code: "91819424" },
+    { algorithm: Sha512, at: 1234567890, code: "93441116" },
+    { algorithm: Sha1, at: 2000000000, code: "69279037" },
+    { algorithm: Sha256, at: 2000000000, code: "90698825" },
+    { algorithm: Sha512, at: 2000000000, code: "38618901" },
+    { algorithm: Sha1, at: 20000000000, code: "65353130" },
+    { algorithm: Sha256, at: 20000000000, code: "77737706" },
+    { algorithm: Sha512, at: 20000000000, code: "47863826" },
+  ]
+
+/// The key RFC 6238's vectors use under each hash: the ASCII digits repeated to its digest's
+/// length.
+fn rfc_6238_key(a: Algorithm) -> Bytes =
+  match a {
+    Sha1 -> rfc_key(),
+    Sha256 -> b"12345678901234567890123456789012",
+    Sha512 -> b"1234567890123456789012345678901234567890123456789012345678901234",
+  }
+
+test "RFC 6238's {c.algorithm} code at {c.at} seconds" for c: TimeVector in rfc_6238() {
+  let config: Config = { ..standard(), form: { algorithm: c.algorithm, digits: 8 } };
+  let key = rfc_6238_key(c.algorithm);
+  assert_eq(hotp(config.form, key, c.at / 30), c.code);
+  // An `Instant` ends in 2262 and the last vector is in 2603, so that one has only its step.
+  if c.at <= max_int() / 1000000000 { assert_eq(code(config, key, at_second(c.at)), c.code) }
+}
+
+/// `secs` seconds past the Unix epoch.
+fn at_second(secs: Int) -> Instant = Instant(secs * 1000000000)
+
+test "a step is thirty seconds from the epoch unless the config says otherwise" {
+  assert_eq(step_at(standard(), at_second(0)), 0);
+  assert_eq(step_at(standard(), at_second(29)), 0);
+  assert_eq(step_at(standard(), at_second(30)), 1);
+  assert_eq(step_at(standard(), at_second(1111111109)), 0x23523EC);
+  let late: Config = { ..standard(), step: seconds(60), epoch: at_second(100) };
+  assert_eq(step_at(late, at_second(100)), 0);
+  assert_eq(step_at(late, at_second(220)), 2)
+}
+
+test "a form, a counter, a step or a reading outside what is defined is refused by name" {
+  let five = try { hotp({ algorithm: Sha1, digits: 5 }, rfc_key(), 0) };
+  assert_eq(five, Err(Digits(5)));
+  let eleven = try { hotp({ algorithm: Sha1, digits: 11 }, rfc_key(), 0) };
+  assert_eq(eleven, Err(Digits(11)));
+  let negative = try { hotp({ algorithm: Sha1, digits: 6 }, rfc_key(), 0 - 1) };
+  assert_eq(negative, Err(Counter(0 - 1)));
+  let still: Config = { ..standard(), step: seconds(0) };
+  assert_eq(try { step_at(still, at_second(5)) }, Err(Step(seconds(0))));
+  assert_eq(try { step_at(standard(), at_second(0 - 1)) }, Err(Reading(at_second(0 - 1))));
+  let far: Config = { ..standard(), epoch: Instant(0 - max_int()) };
+  assert_eq(try { step_at(far, Instant(max_int())) }, Err(Reading(Instant(max_int()))))
+}
+
+test "a code verifies in its window and nowhere else" {
+  let made = at_second(1111111109);
+  let typed = code(standard(), rfc_key(), made);
+  let exact: Window = { before: 0, after: 0 };
+  let either: Window = { before: 1, after: 1 };
+  assert_eq(typed, "081804");
+  assert_eq(verify(standard(), rfc_key(), typed, made, exact), Some(0x23523EC));
+  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111139), exact), None);
+  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111139), either), Some(0x23523EC));
+  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111079), either), Some(0x23523EC));
+  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111169), either), None);
+  assert_eq(verify(standard(), rfc_key(), "81804", made, either), None);
+  assert_eq(verify(standard(), rfc_key(), "", made, either), None)
+}
+
+test "a code accepted once is refused the second time, and so is an older one" {
+  let now = at_second(1111111109);
+  let either: Window = { before: 1, after: 1 };
+  let typed = code(standard(), rfc_key(), now);
+  let first = verify_after(standard(), rfc_key(), typed, now, either, None);
+  assert_eq(first, Some(0x23523EC));
+  assert_eq(verify_after(standard(), rfc_key(), typed, now, either, first), None);
+  let older = code(standard(), rfc_key(), at_second(1111111079));
+  assert_eq(verify_after(standard(), rfc_key(), older, now, either, first), None);
+  assert_eq(verify_after(standard(), rfc_key(), older, now, either, None), Some(0x23523EB))
+}
+
+test "a counter-based code verifies within the look-ahead, and the counter it was made at is answered" {
+  let form: Form = { algorithm: Sha1, digits: 6 };
+  assert_eq(hotp_verify(form, rfc_key(), "969429", 0, 5), Some(3));
+  assert_eq(hotp_verify(form, rfc_key(), "969429", 3, 0), Some(3));
+  assert_eq(hotp_verify(form, rfc_key(), "969429", 0, 2), None);
+  assert_eq(hotp_verify(form, rfc_key(), "969429", 4, 5), None)
+}
+
+test "a right code and a wrong one of its length take the same steps to judge" {
+  let now = at_second(1111111109);
+  let either: Window = { before: 1, after: 1 };
+  let right = metered(|| verify(standard(), rfc_key(), "081804", now, either));
+  let wrong = metered(|| verify(standard(), rfc_key(), "081805", now, either));
+  let other = metered(|| verify(standard(), rfc_key(), "999999", now, either));
+  assert_eq(right.value, Some(0x23523EC));
+  assert_eq(wrong.value, None);
+  assert_eq(wrong.steps, right.steps);
+  assert_eq(other.steps, right.steps)
+}
+
+test "a new key is twenty bytes of the entropy it is handed" {
+  let key = handle { new_key() } with { entropy.next() -> 0x0706_0504_0302_0100 };
+  assert_eq(bytes_len(key), 20);
+  assert_eq(bytes_slice(key, 0, 8), b"\x00\x01\x02\x03\x04\x05\x06\x00")
+}
+
+/// Google Authenticator's own example key: `Hello!` and four bytes more.
+fn hello() -> Bytes = b"Hello!\xDE\xAD\xBE\xEF"
+
+test "the key URI format's examples are read as it reads them" {
+  assert_eq(
+    try_parse_uri("otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example"),
+    Ok({
+      kind: Timed(seconds(30)),
+      issuer: "Example",
+      account: "alice@google.com",
+      key: hello(),
+      form: { algorithm: Sha1, digits: 6 },
+    }),
+  );
+  assert_eq(
+    try_parse_uri(
+      "otpauth://totp/ACME%20Co:john.doe@email.com?secret=HXDMVJECJJWSRB3HWIZR4IFUGFTMXBOZ&issuer=ACME%20Co&algorithm=SHA1&digits=6&period=30",
+    ),
+    Ok({
+      kind: Timed(seconds(30)),
+      issuer: "ACME Co",
+      account: "john.doe@email.com",
+      key: b"\x3D\xC6\xCA\xA4\x82\x4A\x6D\x28\x87\x67\xB2\x33\x1E\x20\xB4\x31\x66\xCB\x85\xD9",
+      form: { algorithm: Sha1, digits: 6 },
+    }),
+  )
+}
+
+test "a URI is read as an app reads one: its defaults, its separators and a typed secret" {
+  let read = try_parse_uri(
+    "otpauth://hotp/Big%20Co%3A%20%20bob?secret=jbsw%20y3dp-ehpk3pxp%3D%3D&digits=8&algorithm=sha512&counter=7&image=x",
+  );
+  assert_eq(
+    read,
+    Ok({
+      kind: Counted(7),
+      issuer: "Big Co",
+      account: "bob",
+      key: hello(),
+      form: { algorithm: Sha512, digits: 8 },
+    }),
+  );
+  assert_eq(
+    try_parse_uri("otpauth://totp/bob?secret=JBSWY3DPEHPK3PXP&issuer=Big%20Co&period=60"),
+    Ok({
+      kind: Timed(seconds(60)),
+      issuer: "Big Co",
+      account: "bob",
+      key: hello(),
+      form: { algorithm: Sha1, digits: 6 },
+    }),
+  )
+}
+
+type Refused = { text: String, why: Why }
+
+fn not_uris() -> List<Refused> =
+  [
+    { text: "", why: NotOtpauth },
+    { text: "https://totp/a?secret=JBSWY3DPEHPK3PXP", why: NotOtpauth },
+    { text: "otpauth://", why: UnknownKind("") },
+    { text: "otpauth://steam/a?secret=JBSWY3DPEHPK3PXP", why: UnknownKind("steam") },
+    { text: "otpauth://TOTP/a?secret=JBSWY3DPEHPK3PXP", why: UnknownKind("TOTP") },
+    { text: "otpauth://totp/a%ZZ?secret=JBSWY3DPEHPK3PXP", why: BadLabel },
+    { text: "otpauth://totp/a:b:c?secret=JBSWY3DPEHPK3PXP", why: BadLabel },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&issuer=%G1", why: BadQuery },
+    {
+      text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&secret=JBSWY3DPEHPK3PXP",
+      why: Twice("secret"),
+    },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=6&digits=8", why: Twice("digits") },
+    { text: "otpauth://totp/a", why: NoSecret },
+    { text: "otpauth://totp/a?issuer=b", why: NoSecret },
+    { text: "otpauth://totp/a?secret=", why: NoSecret },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PX1", why: BadSecret },
+    { text: "otpauth://totp/a?secret=J", why: BadSecret },
+    { text: "otpauth://totp/b:a?secret=JBSWY3DPEHPK3PXP&issuer=c", why: TwoIssuers },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&algorithm=MD5", why: BadValue("algorithm") },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=5", why: BadValue("digits") },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=11", why: BadValue("digits") },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=six", why: BadValue("digits") },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&period=0", why: BadValue("period") },
+    {
+      text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&period=9223372036854775807",
+      why: BadValue("period"),
+    },
+    { text: "otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP&counter=-1", why: BadValue("counter") },
+    { text: "otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP", why: NoCounter },
+  ]
+
+test "`{c.text}` is no provisioning URI" for c: Refused in not_uris() {
+  assert_eq(try_parse_uri(c.text), Err(Malformed(c.why)))
+}
+
+/// A provision of the standard form for `issuer` and `account`, under a twenty-byte key.
+fn provision(issuer: String, account: String) -> Provision =
+  {
+    kind: Timed(seconds(30)),
+    issuer: issuer,
+    account: account,
+    key: rfc_key(),
+    form: { algorithm: Sha1, digits: 6 },
+  }
+
+test "a URI writes every parameter, and percent-encodes its names" {
+  assert_eq(
+    uri(provision("ACME Co", "john.doe@email.com")),
+    "otpauth://totp/ACME%20Co:john.doe%40email.com?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=ACME%20Co&algorithm=SHA1&digits=6&period=30",
+  );
+  let counted: Provision = {
+    ..provision("", "bob"),
+    kind: Counted(4),
+    form: { algorithm: Sha256, digits: 8 },
+  };
+  assert_eq(
+    uri(counted),
+    "otpauth://hotp/bob?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&algorithm=SHA256&digits=8&counter=4",
+  )
+}
+
+test "what a URI cannot carry is refused by name" {
+  let short: Provision = { ..provision("a", "b"), key: b"123456789012345" };
+  assert_eq(try { uri(short) }, Err(ShortKey(15)));
+  let wide: Provision = { ..provision("a", "b"), form: { algorithm: Sha1, digits: 12 } };
+  assert_eq(try { uri(wide) }, Err(Digits(12)));
+  assert_eq(try { uri(provision("a:c", "b")) }, Err(Label("a:c")));
+  assert_eq(try { uri(provision("a", "b:c")) }, Err(Label("b:c")));
+  assert_eq(try { uri(provision("a", " b")) }, Err(Label(" b")));
+  let half: Provision = { ..provision("a", "b"), kind: Timed(Duration(1500000000)) };
+  assert_eq(try { uri(half) }, Err(Step(Duration(1500000000))));
+  let still: Provision = { ..provision("a", "b"), kind: Timed(seconds(0)) };
+  assert_eq(try { uri(still) }, Err(Step(seconds(0))));
+  let behind: Provision = { ..provision("a", "b"), kind: Counted(0 - 1) };
+  assert_eq(try { uri(behind) }, Err(Counter(0 - 1)))
+}
+
+test "a timed provision says how its codes are made, and a counted one has no clock" {
+  let fast: Provision = { ..provision("a", "b"), kind: Timed(seconds(15)) };
+  assert_eq(
+    config_of(fast),
+    Some({ form: { algorithm: Sha1, digits: 6 }, step: seconds(15), epoch: Instant(0) }),
+  );
+  let counted: Provision = { ..provision("a", "b"), kind: Counted(0) };
+  assert_eq(config_of(counted), None)
+}
+
+// --- Laws -------------------------------------------------------------------
+//
+// A `Provision`, a `Config` and a `Form` are not every value of their fields, so each law makes
+// one of what it draws.
+
+/// A reading some whole seconds past the epoch, a step or more in.
+fn reading(ticks: Int) -> Instant = at_second(1000 + (ticks & 0xFFFF_FFFF))
+
+/// A form of six to ten digits under one of the three hashes.
+fn form_of(n: Int) -> Form =
+  {
+    algorithm: match (n >>> 8 & 0xFF) % 3 { 0 -> Sha1, 1 -> Sha256, _ -> Sha512 },
+    digits: 6 + (n & 0xFF) % 5,
+  }
+
+law "a code is as many digits as its form asks"
+  forall (key: Bytes, counter: Int, n: Int) {
+    let made = hotp(form_of(n), key, counter & max_int());
+    string_len(made) == form_of(n).digits && int_of_string(made) != None
+  }
+
+law "a step holds exactly its span of time"
+  forall (ticks: Int, within: Int) {
+    let step = ticks & 0xFFF_FFFF;
+    let now = Instant(step * 30000000000 + (within & 0x3_FFFF_FFFF));
+    step_at(standard(), now) == step
+  }
+
+law "a code verifies at the time it was made"
+  forall (key: Bytes, ticks: Int, n: Int) {
+    let config: Config = { ..standard(), form: form_of(n) };
+    let now = reading(ticks);
+    verify(config, key, code(config, key, now), now, { before: 0, after: 0 })
+      == Some(step_at(config, now))
+  }
+
+law "a code verifies while its step is in the window, and its step is not answered from outside"
+  forall (key: Bytes, ticks: Int, drift: Int, before: Int, after: Int) {
+    let made = reading(ticks);
+    let by = (drift & 7) - 4;
+    let window: Window = { before: before & 3, after: after & 3 };
+    let step = step_at(standard(), made);
+    let typed = code(standard(), key, made);
+    let later = Instant(nanos_at(made) + by * 30000000000);
+    let answer = verify(standard(), key, typed, later, window);
+    if by <= window.before && 0 - by <= window.after {
+      match answer {
+        Some(found) -> found >= step && hotp(standard().form, key, found) == typed,
+        None -> false,
+      }
+    } else { answer != Some(step) }
+  }
+
+/// What `verify_after` answers, by reading the window's codes back with `==`.
+fn last_typed(
+  key: Bytes,
+  typed: String,
+  now: Instant,
+  window: Window,
+  accepted: Option<Int>,
+) -> Option<Int> / {totp.refused, abort.raise} = {
+  let at = step_at(standard(), now);
+  last(
+    filter(range(max(at - window.before, 0), at + window.after + 1), |step: Int|
+      past(step, accepted) && hotp(standard().form, key, step) == typed),
+  )
+}
+
+law "verifying answers the last step of its window, past the one accepted, whose code was typed"
+  forall (key: Bytes, ticks: Int, drift: Int, before: Int, after: Int, accepted: Int) {
+    let now = reading(ticks);
+    let window: Window = { before: before & 3, after: after & 3 };
+    let typed = code(standard(), key, Instant(nanos_at(now) + ((drift & 7) - 4) * 30000000000));
+    let last_accepted = if accepted & 1 == 0 { None }
+    else { Some(step_at(standard(), now) + (accepted >>> 1 & 7) - 4) };
+    verify_after(standard(), key, typed, now, window, last_accepted)
+      == last_typed(key, typed, now, window, last_accepted)
+  }
+
+law "a code accepted once is not accepted again"
+  forall (key: Bytes, ticks: Int, before: Int, after: Int) {
+    let now = reading(ticks);
+    let window: Window = { before: before & 3, after: after & 3 };
+    let typed = code(standard(), key, now);
+    let first = verify_after(standard(), key, typed, now, window, None);
+    first != None && verify_after(standard(), key, typed, now, window, first) == None
+  }
+
+law "a counter-based code verifies within the look-ahead and its counter is not answered past it"
+  forall (key: Bytes, start: Int, by: Int, ahead: Int) {
+    let form: Form = { algorithm: Sha1, digits: 6 };
+    let counter = start & 0xFFFF_FFFF;
+    let reach = ahead & 3;
+    let typed = hotp(form, key, counter + (by & 7));
+    let answer = hotp_verify(form, key, typed, counter, reach);
+    if by & 7 <= reach {
+      match answer {
+        Some(found) -> found >= counter + (by & 7) && hotp(form, key, found) == typed,
+        None -> false,
+      }
+    } else { answer != Some(counter + (by & 7)) }
+  }
+
+/// What a law draws for a provision: any two names, any key and a number its form and kind are
+/// read off.
+type Drawn = { issuer: String, account: String, key: Bytes, n: Int }
+
+/// A provision `uri` writes, made of what a law drew.
+fn provisioned(d: Drawn) -> Provision / {abort.raise} =
+  {
+    kind: if d.n >>> 16 & 1 == 0 { Timed(seconds(1 + (d.n >>> 17 & 0xFFF))) }
+    else { Counted(d.n >>> 17 & 0xFFFF_FFFF) },
+    issuer: replace(d.issuer, ":", ""),
+    account: trim_start(replace(d.account, ":", "")),
+    key: bytes_concat(d.key, rfc_key()),
+    form: form_of(d.n),
+  }
+
+law "a provisioning URI is read back as what it was written of" =
+  agrees(|d: Drawn| try_parse_uri(uri(provisioned(d))), |d: Drawn| Ok(provisioned(d)))

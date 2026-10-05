@@ -1,0 +1,1245 @@
+//! Checksums and the hashes that are not cryptographic: any CRC, Adler-32, FNV-1a, xxHash and
+//! SipHash.
+//!
+//! A checksum catches damage, not an adversary: none of these stands where `std.hash` does.
+//! SipHash is the keyed one, for a table whose keys a stranger chooses; a key drawn at start-up
+//! makes a hash that differs from run to run, so keep it out of anything whose order a program can
+//! observe.
+//!
+//! Each algorithm answers a whole input in one call, and `init`, `update` and `finish` answer the
+//! same over the input in pieces, however it is cut. A sum is a number, a `U32` or a `U64`; where a
+//! format stores one it says in which byte order (gzip writes its CRC-32 least significant byte
+//! first, zlib its Adler-32 most significant first).
+//!
+//! A CRC is described by the Rocksoft model, `Model`, and run by a `Crc`, which is the model with
+//! its tables built: 2048 entries, eight bytes a step. The presets are the catalogue's, each built
+//! once a run; a model of your own is built by `crc_of`, so keep the `Crc` it answers. `crc_join`
+//! sums a concatenation from the sums of its parts, which makes a CRC a monoid and lets
+//! `std.parallel.par_fold` take one over chunks.
+//!
+//! Nothing here raises or reads the world but `sip_key_drawn`.
+
+import std.bytes (repeat, u64_le)
+import std.laws (monoid)
+import std.list (at_or)
+import std.parallel (grain, par_fold)
+import std.random (entropy)
+import std.show (show)
+
+// --- Words ------------------------------------------------------------------
+
+// A 64-bit word is an `Int` read as its bits: `wrap_add`, `wrap_mul`, `^` and `>>>` are the
+// unsigned operations on it, a rotation left by `n` is `rotr` by `64 - n`, and a `U64` is made of
+// one only where a sum leaves the module.
+//
+// A byte read and a narrowing raise by their types, and here never by what they are handed: every
+// index is below a length and every value masked into its width. So the clause of each `handle`
+// in this module never answers, and what it guards is total.
+
+fn u32_of(x: Int) -> U32 = handle { u32_of_int(x & 0xFFFF_FFFF) } with { abort.raise(_) -> 0u32 }
+
+fn u64_of(x: Int) -> U64 =
+  handle {
+    u64_of_int(x >>> 32) << 32 | u64_of_int(x & 0xFFFF_FFFF)
+  } with {
+    abort.raise(_) -> 0u64,
+  }
+
+fn int_of(x: U64) -> Int =
+  handle {
+    int_of_u64(x >>> 32) << 32 | int_of_u64(x & 0xFFFF_FFFFu64)
+  } with {
+    abort.raise(_) -> 0,
+  }
+
+fn word64(b: Bytes, i: Int) -> Int / {abort.raise} =
+  int_of_u32(bytes_u32_le(b, i)) | int_of_u32(bytes_u32_le(b, i + 4)) << 32
+
+/// `pending` and then `chunk`, without a copy where nothing is pending.
+fn joined(pending: Bytes, chunk: Bytes) -> Bytes =
+  if bytes_len(pending) == 0 { chunk } else { bytes_concat(pending, chunk) }
+
+// --- CRC --------------------------------------------------------------------
+
+/// A CRC as the Rocksoft model describes one: a register of `width` bits, from 1 to 64, that
+/// starts at `init`; the generator polynomial `poly` without its top term; whether each input
+/// byte and the final register are bit-reversed; and what the result is xored with.
+pub type Model = new {
+  width: Int,
+  poly: U64,
+  init: U64,
+  reflect_in: Bool,
+  reflect_out: Bool,
+  xor_out: U64,
+}
+
+/// A model with its tables built, which is what runs. Build one with `crc_of`: one put together
+/// any other way sums to nothing a model describes.
+pub type Crc = new {
+  model: Model,
+  /// The polynomial bit-reversed in the width. The register is kept bit-reversed whatever the
+  /// model says, so one loop serves every model.
+  poly: Int,
+  /// The register before any byte.
+  start: Int,
+  /// What the last register is xored with.
+  last: Int,
+  /// What a register is multiplied by, modulo the polynomial, for each byte that follows it.
+  byte: Int,
+  /// Eight tables of 256: entry `256 * k + b` is the register a byte `b` leaves `k` bytes later.
+  table: Array<Int>,
+}
+
+/// The `Crc` that runs `model`, or `None` for a width outside 1 to 64 or a parameter wider than
+/// the width.
+pub fn crc_of(model: Model) -> Option<Crc> =
+  if model.width < 1 || model.width > 64 { None }
+  else if model.width < 64 && (model.poly | model.init | model.xor_out) >>> model.width != 0u64 {
+    None
+  } else { Some(crc_built(model)) }
+
+fn crc_built(model: Model) -> Crc = {
+  let poly = reflected(int_of(model.poly), model.width);
+  {
+    model: model,
+    poly: poly,
+    start: reflected(int_of(model.init), model.width),
+    last: int_of(model.xor_out),
+    byte: crc_entry(poly, 1 << model.width - 1),
+    table: crc_table(poly),
+  }
+}
+
+fn reversed64(x: Int) -> Int = {
+  let bytes = bits_reversed(x);
+  let pairs = bytes >>> 8 & 0x00FF_00FF_00FF_00FF | (bytes & 0x00FF_00FF_00FF_00FF) << 8;
+  let quads = pairs >>> 16 & 0x0000_FFFF_0000_FFFF | (pairs & 0x0000_FFFF_0000_FFFF) << 16;
+  quads >>> 32 | quads << 32
+}
+
+/// Each byte of `x` with its bits reversed, the bytes where they were.
+fn bits_reversed(x: Int) -> Int = {
+  let ones = x >>> 1 & 0x5555_5555_5555_5555 | (x & 0x5555_5555_5555_5555) << 1;
+  let twos = ones >>> 2 & 0x3333_3333_3333_3333 | (ones & 0x3333_3333_3333_3333) << 2;
+  twos >>> 4 & 0x0F0F_0F0F_0F0F_0F0F | (twos & 0x0F0F_0F0F_0F0F_0F0F) << 4
+}
+
+fn reflected(x: Int, width: Int) -> Int = reversed64(x) >>> 64 - width
+
+/// The register `reg` eight zero bits later.
+fn crc_entry(poly: Int, reg: Int) -> Int =
+  fold(range(0, 8), reg, |acc: Int, _: Int| if acc & 1 == 1 { poly ^ acc >>> 1 } else { acc >>> 1 })
+
+fn crc_table(poly: Int) -> Array<Int> = {
+  let first = map(range(0, 256), |n: Int| crc_entry(poly, n));
+  array_of_list(
+    fold(range(256, 2048), first, |acc: List<Int>, i: Int|
+      match list_at(acc, i - 256) {
+        None -> acc,
+        Some(before) -> match list_at(first, before & 0xFF) {
+          None -> acc,
+          Some(next) -> push(acc, next ^ before >>> 8),
+        },
+      }),
+  )
+}
+
+fn crc_words(
+  table: Array<Int>,
+  reflect: Bool,
+  reg: Int,
+  data: Bytes,
+  i: Int,
+) -> Int / {abort.raise} =
+  if i + 8 > bytes_len(data) { crc_tail(table, reflect, reg, data, i) } else {
+    let word = int_of_u32(bytes_u32_le(data, i)) | int_of_u32(bytes_u32_le(data, i + 4)) << 32;
+    let x = reg ^ (if reflect { word } else { bits_reversed(word) });
+    crc_words(
+      table,
+      reflect,
+      array_get(table, 1792 + (x & 0xFF)) ^ array_get(table, 1536 + (x >>> 8 & 0xFF))
+        ^ array_get(table, 1280 + (x >>> 16 & 0xFF))
+        ^ array_get(table, 1024 + (x >>> 24 & 0xFF))
+        ^ array_get(table, 768 + (x >>> 32 & 0xFF))
+        ^ array_get(table, 512 + (x >>> 40 & 0xFF))
+        ^ array_get(table, 256 + (x >>> 48 & 0xFF))
+        ^ array_get(table, x >>> 56),
+      data,
+      i + 8,
+    )
+  }
+
+fn crc_tail(
+  table: Array<Int>,
+  reflect: Bool,
+  reg: Int,
+  data: Bytes,
+  i: Int,
+) -> Int / {abort.raise} =
+  if i >= bytes_len(data) { reg } else {
+    let byte = if reflect { bytes_at(data, i) } else { bits_reversed(bytes_at(data, i)) };
+    crc_tail(table, reflect, array_get(table, (reg ^ byte) & 0xFF) ^ reg >>> 8, data, i + 1)
+  }
+
+fn crc_mask(width: Int) -> Int = if width >= 64 { 0 - 1 } else { (1 << width) - 1 }
+
+/// A register as the sum the model publishes.
+fn crc_out(c: Crc, reg: Int) -> Int =
+  (if c.model.reflect_out { reg } else { reflected(reg, c.model.width) }) ^ c.last
+
+/// The register a published sum was made of.
+fn crc_in(c: Crc, sum: Int) -> Int = {
+  let reg = (sum ^ c.last) & crc_mask(c.model.width);
+  if c.model.reflect_out { reg } else { reflected(reg, c.model.width) }
+}
+
+/// The product of two polynomials modulo the generator, each bit-reversed in the width.
+/// `bit` is where `a` keeps the coefficient of the power of `x` that `b` has been raised by.
+fn crc_product(poly: Int, a: Int, b: Int, bit: Int, acc: Int) -> Int =
+  if bit < 0 { acc } else {
+    crc_product(
+      poly,
+      a,
+      if b & 1 == 1 { poly ^ b >>> 1 } else { b >>> 1 },
+      bit - 1,
+      if a >>> bit & 1 == 1 { acc ^ b } else { acc },
+    )
+  }
+
+fn crc_times(c: Crc, a: Int, b: Int) -> Int = crc_product(c.poly, a, b, c.model.width - 1, 0)
+
+/// What a register is multiplied by for `n` bytes that follow it.
+fn crc_shift(c: Crc, n: Int, base: Int, acc: Int) -> Int =
+  if n <= 0 { acc } else {
+    crc_shift(c, n / 2, crc_times(c, base, base), if n % 2 == 1 { crc_times(c, acc, base) }
+    else { acc })
+  }
+
+fn crc_one(c: Crc) -> Int = 1 << c.model.width - 1
+
+fn crc_over(c: Crc, reg: Int, data: Bytes) -> Int =
+  handle { crc_words(c.table, c.model.reflect_in, reg, data, 0) } with { abort.raise(_) -> reg }
+
+/// The CRC of `data` under `c`, in the low `width` bits.
+pub fn crc(c: Crc, data: Bytes) -> U64 = u64_of(crc_out(c, crc_over(c, c.start, data)))
+
+/// A CRC of some bytes with what following them does to a CRC: `shift` is `x` to eight times
+/// their length, modulo the polynomial. Under a 64-bit model every pair of values is a part.
+pub type Part = new { sum: U64, shift: U64 }
+
+/// The part `chunk` is.
+pub fn crc_part(c: Crc, chunk: Bytes) -> Part =
+  { sum: crc(c, chunk), shift: u64_of(crc_shift(c, bytes_len(chunk), c.byte, crc_one(c))) }
+
+/// The part no bytes are: the identity of `crc_join`.
+pub fn crc_empty(c: Crc) -> Part = { sum: u64_of(crc_out(c, c.start)), shift: u64_of(crc_one(c)) }
+
+/// The part of `a`'s bytes followed by `b`'s, in a number of steps that does not grow with either.
+/// Associative, with `crc_empty` its identity.
+pub fn crc_join(c: Crc, a: Part, b: Part) -> Part = {
+  let shift = int_of(b.shift);
+  let carried = crc_times(c, crc_in(c, int_of(a.sum)) ^ c.start, shift);
+  {
+    sum: u64_of(crc_out(c, carried ^ crc_in(c, int_of(b.sum)))),
+    shift: u64_of(crc_times(c, int_of(a.shift), shift)),
+  }
+}
+
+/// The CRC of two inputs joined, from the CRC `a` of the first, the CRC `b` of the second and
+/// the second's length in bytes.
+pub fn crc_combine(c: Crc, a: U64, b: U64, len_b: Int) -> U64 =
+  crc_join(c, { sum: a, shift: 0u64 }, {
+    sum: b,
+    shift: u64_of(crc_shift(c, len_b, c.byte, crc_one(c))),
+  }).sum
+
+fn preset(width: Int, poly: U64, init: U64, reflect: Bool, xor_out: U64) -> Crc =
+  crc_built({
+    width: width,
+    poly: poly,
+    init: init,
+    reflect_in: reflect,
+    reflect_out: reflect,
+    xor_out: xor_out,
+  })
+
+/// CRC-8/SMBUS.
+pub fn crc8_smbus() -> Crc = preset(8, 0x07u64, 0u64, false, 0u64)
+
+/// CRC-16/ARC, the CRC-16 of LHA and ARC.
+pub fn crc16_arc() -> Crc = preset(16, 0x8005u64, 0u64, true, 0u64)
+
+/// CRC-16/IBM-3740, often called CCITT-FALSE.
+pub fn crc16_ibm_3740() -> Crc = preset(16, 0x1021u64, 0xFFFFu64, false, 0u64)
+
+/// CRC-16/IBM-SDLC, the frame check of HDLC, X.25 and PPP.
+pub fn crc16_ibm_sdlc() -> Crc = preset(16, 0x1021u64, 0xFFFFu64, true, 0xFFFFu64)
+
+/// CRC-16/KERMIT, the CCITT CRC as Bluetooth and Kermit run it.
+pub fn crc16_kermit() -> Crc = preset(16, 0x1021u64, 0u64, true, 0u64)
+
+/// CRC-16/MODBUS.
+pub fn crc16_modbus() -> Crc = preset(16, 0x8005u64, 0xFFFFu64, true, 0u64)
+
+/// CRC-16/USB.
+pub fn crc16_usb() -> Crc = preset(16, 0x8005u64, 0xFFFFu64, true, 0xFFFFu64)
+
+/// CRC-16/XMODEM.
+pub fn crc16_xmodem() -> Crc = preset(16, 0x1021u64, 0u64, false, 0u64)
+
+/// CRC-32/BZIP2.
+pub fn crc32_bzip2() -> Crc = preset(32, 0x04C1_1DB7u64, 0xFFFF_FFFFu64, false, 0xFFFF_FFFFu64)
+
+/// CRC-32/CKSUM, the POSIX `cksum` polynomial without the length it appends.
+pub fn crc32_cksum() -> Crc = preset(32, 0x04C1_1DB7u64, 0u64, false, 0xFFFF_FFFFu64)
+
+/// CRC-32/ISCSI, which is CRC-32C: iSCSI, SCTP, ext4 and Btrfs.
+pub fn crc32_iscsi() -> Crc = preset(32, 0x1EDC_6F41u64, 0xFFFF_FFFFu64, true, 0xFFFF_FFFFu64)
+
+/// CRC-32/ISO-HDLC, the CRC-32 of gzip, zip, PNG and Ethernet.
+pub fn crc32_iso_hdlc() -> Crc = preset(32, 0x04C1_1DB7u64, 0xFFFF_FFFFu64, true, 0xFFFF_FFFFu64)
+
+/// CRC-32/MPEG-2.
+pub fn crc32_mpeg2() -> Crc = preset(32, 0x04C1_1DB7u64, 0xFFFF_FFFFu64, false, 0u64)
+
+/// CRC-64/ECMA-182.
+pub fn crc64_ecma_182() -> Crc = preset(64, 0x42F0_E1EB_A9EA_3693u64, 0u64, false, 0u64)
+
+/// CRC-64/GO-ISO, the ISO polynomial as Go's `hash/crc64` runs it.
+pub fn crc64_go_iso() -> Crc =
+  preset(64, 0x1Bu64, 0xFFFF_FFFF_FFFF_FFFFu64, true, 0xFFFF_FFFF_FFFF_FFFFu64)
+
+/// CRC-64/NVME.
+pub fn crc64_nvme() -> Crc =
+  preset(64, 0xAD93_D235_94C9_3659u64, 0xFFFF_FFFF_FFFF_FFFFu64, true, 0xFFFF_FFFF_FFFF_FFFFu64)
+
+/// CRC-64/XZ, the CRC-64 of xz.
+pub fn crc64_xz() -> Crc =
+  preset(64, 0x42F0_E1EB_A9EA_3693u64, 0xFFFF_FFFF_FFFF_FFFFu64, true, 0xFFFF_FFFF_FFFF_FFFFu64)
+
+/// The CRC-32 of gzip, zip and PNG: CRC-32/ISO-HDLC.
+pub fn crc32(data: Bytes) -> U32
+  cost bytes_len(data)
+= u32_of(finished(update(init(Crc(crc32_iso_hdlc())), data)))
+
+/// CRC-32C: CRC-32/ISCSI.
+pub fn crc32c(data: Bytes) -> U32
+  cost bytes_len(data)
+= u32_of(finished(update(init(Crc(crc32_iscsi())), data)))
+
+/// `crc_combine` for `crc32`: the CRC-32 of two inputs joined, from the CRC-32 of each and the
+/// second's length in bytes.
+pub fn crc32_combine(a: U32, b: U32, len_b: Int) -> U32 = {
+  let wide = |x: U32| u64_of(int_of_u32(x));
+  u32_of(int_of(crc_combine(crc32_iso_hdlc(), wide(a), wide(b), len_b)))
+}
+
+// --- Adler-32 ---------------------------------------------------------------
+
+/// Eight bytes a step: the sum of the eight goes into `a`, and `b` takes `a` eight times and each
+/// byte once for itself and every byte after it.
+fn adler_words(data: Bytes, i: Int, a: Int, b: Int) -> Int / {abort.raise} =
+  if i + 8 > bytes_len(data) { adler_tail(data, i, a, b) } else {
+    let x = int_of_u32(bytes_u32_le(data, i));
+    let y = int_of_u32(bytes_u32_le(data, i + 4));
+    let d0 = x & 0xFF;
+    let d1 = x >>> 8 & 0xFF;
+    let d2 = x >>> 16 & 0xFF;
+    let d3 = x >>> 24;
+    let d4 = y & 0xFF;
+    let d5 = y >>> 8 & 0xFF;
+    let d6 = y >>> 16 & 0xFF;
+    let d7 = y >>> 24;
+    adler_words(
+      data,
+      i + 8,
+      (a + d0 + d1 + d2 + d3 + d4 + d5 + d6 + d7) % 65521,
+      (b + 8 * (a + d0) + 7 * d1 + 6 * d2 + 5 * d3 + 4 * d4 + 3 * d5 + 2 * d6 + d7) % 65521,
+    )
+  }
+
+fn adler_tail(data: Bytes, i: Int, a: Int, b: Int) -> Int / {abort.raise} =
+  if i >= bytes_len(data) { b << 16 | a } else {
+    let next = (a + bytes_at(data, i)) % 65521;
+    adler_tail(data, i + 1, next, (b + next) % 65521)
+  }
+
+/// Adler-32, the checksum of zlib (RFC 1950).
+pub fn adler32(data: Bytes) -> U32
+  cost bytes_len(data)
+= u32_of(finished(update(init(Adler32), data)))
+
+/// The Adler-32 of two inputs joined, from the Adler-32 of each and the second's length in bytes.
+pub fn adler32_combine(a: U32, b: U32, len_b: Int) -> U32 = {
+  let first = int_of_u32(a);
+  let second = int_of_u32(b);
+  // Both low halves start at one and joined they start once, so one comes off the first.
+  let low = ((first & 0xFFFF) + 65520) % 65521;
+  let sum = (low + (second & 0xFFFF)) % 65521;
+  let weighted = ((first >>> 16) + (second >>> 16) + max(len_b, 0) % 65521 * low) % 65521;
+  u32_of(weighted << 16 | sum)
+}
+
+// --- FNV-1a -----------------------------------------------------------------
+
+fn fnv32_bytes(data: Bytes, i: Int, h: Int) -> Int / {abort.raise} =
+  if i >= bytes_len(data) { h }
+  else { fnv32_bytes(data, i + 1, (h ^ bytes_at(data, i)) * 0x0100_0193 & 0xFFFF_FFFF) }
+
+fn fnv64_bytes(data: Bytes, i: Int, h: Int) -> Int / {abort.raise} =
+  if i >= bytes_len(data) { h }
+  else { fnv64_bytes(data, i + 1, wrap_mul(h ^ bytes_at(data, i), 0x0000_0100_0000_01B3)) }
+
+/// FNV-1a, 32 bits.
+pub fn fnv1a_32(data: Bytes) -> U32
+  cost bytes_len(data)
+= u32_of(finished(update(init(Fnv1a32), data)))
+
+/// FNV-1a, 64 bits.
+pub fn fnv1a_64(data: Bytes) -> U64
+  cost bytes_len(data)
+= finish(update(init(Fnv1a64), data))
+
+// --- xxHash -----------------------------------------------------------------
+
+fn prime32_1() -> Int = 0x9E37_79B1
+
+fn prime32_2() -> Int = 0x85EB_CA77
+
+fn prime32_3() -> Int = 0xC2B2_AE3D
+
+fn prime64_1() -> Int = 0x9E37_79B1_85EB_CA87
+
+fn prime64_2() -> Int = 0xC2B2_AE3D_27D4_EB4F
+
+fn prime64_3() -> Int = 0x1656_67B1_9E37_79F9
+
+fn prime64_4() -> Int = 0x85EB_CA77_C2B2_AE63
+
+fn prime64_5() -> Int = 0x27D4_EB2F_1656_67C5
+
+/// XXH64 between inputs: four lanes, the bytes short of a 32-byte stripe, and the bytes taken.
+pub type Xxh64Run = new {
+  seed: Int,
+  v1: Int,
+  v2: Int,
+  v3: Int,
+  v4: Int,
+  pending: Bytes,
+  total: Int,
+}
+
+fn xxh64_round(acc: Int, input: Int) -> Int =
+  wrap_mul(rotr(wrap_add(acc, wrap_mul(input, prime64_2())), 64 - 31), prime64_1())
+
+fn xxh64_avalanche(h: Int) -> Int = {
+  let a = wrap_mul(h ^ h >>> 33, prime64_2());
+  let b = wrap_mul(a ^ a >>> 29, prime64_3());
+  b ^ b >>> 32
+}
+
+fn xxh64_start(seed: Int) -> Xxh64Run =
+  {
+    seed: seed,
+    v1: wrap_add(seed, wrap_add(prime64_1(), prime64_2())),
+    v2: wrap_add(seed, prime64_2()),
+    v3: seed,
+    v4: wrap_sub(seed, prime64_1()),
+    pending: b"",
+    total: 0,
+  }
+
+fn xxh64_stripes(b: Bytes, i: Int, r: Xxh64Run) -> Xxh64Run / {abort.raise} =
+  if i + 32 > bytes_len(b) { { ..r, pending: bytes_slice(b, i, bytes_len(b)) } } else {
+    xxh64_stripes(b, i + 32, {
+      ..r,
+      v1: xxh64_round(r.v1, word64(b, i)),
+      v2: xxh64_round(r.v2, word64(b, i + 8)),
+      v3: xxh64_round(r.v3, word64(b, i + 16)),
+      v4: xxh64_round(r.v4, word64(b, i + 24)),
+    })
+  }
+
+fn xxh64_fed(r: Xxh64Run, chunk: Bytes) -> Xxh64Run / {abort.raise} =
+  xxh64_stripes(joined(r.pending, chunk), 0, { ..r, total: r.total + bytes_len(chunk) })
+
+fn xxh64_merged(h: Int, v: Int) -> Int =
+  wrap_add(wrap_mul(h ^ xxh64_round(0, v), prime64_1()), prime64_4())
+
+/// The bytes short of a stripe: eight at a time, then four, then one.
+fn xxh64_rest(b: Bytes, i: Int, h: Int) -> Int / {abort.raise} =
+  if i + 8 <= bytes_len(b) {
+    xxh64_rest(
+      b,
+      i + 8,
+      wrap_add(wrap_mul(rotr(h ^ xxh64_round(0, word64(b, i)), 64 - 27), prime64_1()), prime64_4()),
+    )
+  } else if i + 4 <= bytes_len(b) {
+    xxh64_rest(
+      b,
+      i + 4,
+      wrap_add(
+        wrap_mul(
+          rotr(h ^ wrap_mul(int_of_u32(bytes_u32_le(b, i)), prime64_1()), 64 - 23),
+          prime64_2(),
+        ),
+        prime64_3(),
+      ),
+    )
+  } else if i < bytes_len(b) {
+    xxh64_rest(
+      b,
+      i + 1,
+      wrap_mul(rotr(h ^ wrap_mul(bytes_at(b, i), prime64_5()), 64 - 11), prime64_1()),
+    )
+  } else { xxh64_avalanche(h) }
+
+fn xxh64_done(r: Xxh64Run) -> Int / {abort.raise} = {
+  let lanes = if r.total < 32 { wrap_add(r.seed, prime64_5()) } else {
+    fold(
+      [r.v1, r.v2, r.v3, r.v4],
+      wrap_add(
+        wrap_add(rotr(r.v1, 64 - 1), rotr(r.v2, 64 - 7)),
+        wrap_add(rotr(r.v3, 64 - 12), rotr(r.v4, 64 - 18)),
+      ),
+      xxh64_merged,
+    )
+  };
+  xxh64_rest(r.pending, 0, wrap_add(lanes, r.total))
+}
+
+/// XXH64 of `data` under `seed`.
+pub fn xxh64(data: Bytes, seed: U64) -> U64 = finish(update(init(Xxh64(seed)), data))
+
+/// XXH3 between inputs. Up to 240 bytes nothing is hashed, since a short input has a formula of
+/// its own; past that `acc` has taken every 64-byte stripe but the bytes in `pending`, of which
+/// there is always one, `stripes` of them since the last scramble, and `tail` is the last stripe
+/// taken, since the final stripe is the input's last 64 bytes wherever they fall.
+pub type Xxh3Run = new {
+  seed: Int,
+  secret: Bytes,
+  acc: List<Int>,
+  stripes: Int,
+  tail: Bytes,
+  pending: Bytes,
+  total: Int,
+}
+
+/// The 192 bytes XXH3 is keyed with where a caller gives no secret of its own.
+fn xxh3_secret() -> Bytes =
+  b"\xb8\xfe\x6c\x39\x23\xa4\x4b\xbe\x7c\x01\x81\x2c\xf7\x21\xad\x1c\xde\xd4\x6d\xe9\x83\x90\x97\xdb\x72\x40\xa4\xa4\xb7\xb3\x67\x1f\xcb\x79\xe6\x4e\xcc\xc0\xe5\x78\x82\x5a\xd0\x7d\xcc\xff\x72\x21\xb8\x08\x46\x74\xf7\x43\x24\x8e\xe0\x35\x90\xe6\x81\x3a\x26\x4c\x3c\x28\x52\xbb\x91\xc3\x00\xcb\x88\xd0\x65\x8b\x1b\x53\x2e\xa3\x71\x64\x48\x97\xa2\x0d\xf9\x4e\x38\x19\xef\x46\xa9\xde\xac\xd8\xa8\xfa\x76\x3f\xe3\x9c\x34\x3f\xf9\xdc\xbb\xc7\xc7\x0b\x4f\x1d\x8a\x51\xe0\x4b\xcd\xb4\x59\x31\xc8\x9f\x7e\xc9\xd9\x78\x73\x64\xea\xc5\xac\x83\x34\xd3\xeb\xc3\xc5\x81\xa0\xff\xfa\x13\x63\xeb\x17\x0d\xdd\x51\xb7\xf0\xda\x49\xd3\x16\x55\x26\x29\xd4\x68\x9e\x2b\x16\xbe\x58\x7d\x47\xa1\xfc\x8f\xf8\xb8\xd1\x7a\xd0\x31\xce\x45\xcb\x3a\x8f\x95\x16\x04\x28\xaf\xd7\xfb\xca\xbb\x4b\x40\x7e"
+
+/// The secret a long input is hashed with: the default with `seed` added to its even words and
+/// taken from its odd ones.
+fn xxh3_seeded(seed: Int) -> Bytes =
+  if seed == 0 { xxh3_secret() } else {
+    handle {
+      bytes_concat_all(
+        map(range(0, 24), |i: Int| {
+          let word = word64(xxh3_secret(), 8 * i);
+          u64_le(if i % 2 == 0 { wrap_add(word, seed) } else { wrap_sub(word, seed) })
+        }),
+      )
+    } with {
+      abort.raise(_) -> xxh3_secret(),
+    }
+  }
+
+fn xxh3_start(seed: Int) -> Xxh3Run =
+  {
+    seed: seed,
+    secret: xxh3_seeded(seed),
+    acc: [
+      prime32_3(),
+      prime64_1(),
+      prime64_2(),
+      prime64_3(),
+      prime64_4(),
+      prime32_2(),
+      prime64_5(),
+      prime32_1(),
+    ],
+    stripes: 0,
+    tail: b"",
+    pending: b"",
+    total: 0,
+  }
+
+/// The low 64 bits of a 128-bit product xored with its high 64.
+fn xxh3_folded(a: Int, b: Int) -> Int = {
+  let al = a & 0xFFFF_FFFF;
+  let ah = a >>> 32;
+  let bl = b & 0xFFFF_FFFF;
+  let bh = b >>> 32;
+  let lh = wrap_mul(al, bh);
+  let hl = wrap_mul(ah, bl);
+  let cross = (wrap_mul(al, bl) >>> 32) + (lh & 0xFFFF_FFFF) + (hl & 0xFFFF_FFFF);
+  let high = wrap_add(wrap_mul(ah, bh), (lh >>> 32) + (hl >>> 32) + (cross >>> 32));
+  wrap_mul(a, b) ^ high
+}
+
+fn xxh3_avalanche(h: Int) -> Int = {
+  let a = wrap_mul(h ^ h >>> 37, 0x1656_6791_9E37_79F9);
+  a ^ a >>> 32
+}
+
+fn xxh3_mix16(b: Bytes, i: Int, secret: Bytes, s: Int, seed: Int) -> Int / {abort.raise} =
+  xxh3_folded(
+    word64(b, i) ^ wrap_add(word64(secret, s), seed),
+    word64(b, i + 8) ^ wrap_sub(word64(secret, s + 8), seed),
+  )
+
+fn swapped32(x: Int) -> Int =
+  (x & 0xFF) << 24 | (x >>> 8 & 0xFF) << 16 | (x >>> 16 & 0xFF) << 8 | x >>> 24 & 0xFF
+
+fn swapped64(x: Int) -> Int = swapped32(x & 0xFFFF_FFFF) << 32 | swapped32(x >>> 32)
+
+/// An input of at most 240 bytes, whole: each range of lengths has a formula of its own.
+fn xxh3_short(b: Bytes, seed: Int) -> Int / {abort.raise} = {
+  let n = bytes_len(b);
+  let s = xxh3_secret();
+  if n == 0 { xxh64_avalanche(seed ^ word64(s, 56) ^ word64(s, 64)) } else if n <= 3 {
+    let packed = bytes_at(b, 0) << 16 | bytes_at(b, n / 2) << 24 | bytes_at(b, n - 1) | n << 8;
+    let key = int_of_u32(bytes_u32_le(s, 0)) ^ int_of_u32(bytes_u32_le(s, 4));
+    xxh64_avalanche(packed ^ wrap_add(key, seed))
+  } else if n <= 8 {
+    let mixed = seed ^ swapped32(seed & 0xFFFF_FFFF) << 32;
+    let keyed = (int_of_u32(bytes_u32_le(b, n - 4)) | int_of_u32(bytes_u32_le(b, 0)) << 32)
+      ^ wrap_sub(word64(s, 8) ^ word64(s, 16), mixed);
+    let a = wrap_mul(keyed ^ rotr(keyed, 64 - 49) ^ rotr(keyed, 64 - 24), 0x9FB2_1C65_1E98_DF25);
+    let c = wrap_mul(a ^ (a >>> 35) + n, 0x9FB2_1C65_1E98_DF25);
+    c ^ c >>> 28
+  } else if n <= 16 {
+    let low = word64(b, 0) ^ wrap_add(word64(s, 24) ^ word64(s, 32), seed);
+    let high = word64(b, n - 8) ^ wrap_sub(word64(s, 40) ^ word64(s, 48), seed);
+    xxh3_avalanche(wrap_add(wrap_add(n, swapped64(low)), wrap_add(high, xxh3_folded(low, high))))
+  } else if n <= 128 {
+    xxh3_avalanche(
+      fold(range(0, (n - 1) / 32 + 1), wrap_mul(n, prime64_1()), |acc: Int, k: Int|
+        wrap_add(
+          acc,
+          wrap_add(
+            xxh3_mix16(b, 16 * k, s, 32 * k, seed),
+            xxh3_mix16(b, n - 16 * (k + 1), s, 32 * k + 16, seed),
+          ),
+        )),
+    )
+  } else {
+    let first = fold(range(0, 8), wrap_mul(n, prime64_1()), |acc: Int, i: Int|
+      wrap_add(acc, xxh3_mix16(b, 16 * i, s, 16 * i, seed)));
+    let rest = fold(range(8, n / 16), xxh3_avalanche(first), |acc: Int, i: Int|
+      wrap_add(acc, xxh3_mix16(b, 16 * i, s, 16 * (i - 8) + 3, seed)));
+    xxh3_avalanche(wrap_add(rest, xxh3_mix16(b, n - 16, s, 119, seed)))
+  }
+}
+
+/// One 64-byte stripe at `at` into the eight lanes, keyed by the secret at `s`: each lane takes
+/// its neighbour's word, and the product of the halves of its own word xored with its key.
+fn xxh3_stripe(
+  acc: List<Int>,
+  b: Bytes,
+  at: Int,
+  secret: Bytes,
+  s: Int,
+) -> List<Int> / {abort.raise} =
+  map(range(0, 8), |i: Int| {
+    let key = word64(b, at + 8 * i) ^ word64(secret, s + 8 * i);
+    wrap_add(
+      wrap_add(at_or(acc, i, 0), word64(b, at + 8 * (i ^ 1))),
+      wrap_mul(key & 0xFFFF_FFFF, key >>> 32),
+    )
+  })
+
+fn xxh3_scrambled(acc: List<Int>, secret: Bytes) -> List<Int> / {abort.raise} =
+  map(range(0, 8), |i: Int| {
+    let lane = at_or(acc, i, 0);
+    wrap_mul(lane ^ lane >>> 47 ^ word64(secret, 128 + 8 * i), prime32_1())
+  })
+
+/// Every stripe of `b` from `i` that a byte follows, sixteen to a scramble.
+fn xxh3_stripes(b: Bytes, i: Int, r: Xxh3Run) -> Xxh3Run / {abort.raise} =
+  if i + 64 >= bytes_len(b) {
+    {
+      ..r,
+      tail: if i == 0 { r.tail } else { bytes_slice(b, i - 64, i) },
+      pending: bytes_slice(b, i, bytes_len(b)),
+    }
+  } else {
+    let acc = xxh3_stripe(r.acc, b, i, r.secret, 8 * r.stripes);
+    xxh3_stripes(b, i + 64, if r.stripes == 15 {
+      { ..r, acc: xxh3_scrambled(acc, r.secret), stripes: 0 }
+    } else { { ..r, acc: acc, stripes: r.stripes + 1 } })
+  }
+
+fn xxh3_fed(r: Xxh3Run, chunk: Bytes) -> Xxh3Run / {abort.raise} = {
+  let total = r.total + bytes_len(chunk);
+  let held = joined(r.pending, chunk);
+  if total <= 240 { { ..r, pending: held, total: total } }
+  else { xxh3_stripes(held, 0, { ..r, total: total }) }
+}
+
+fn xxh3_done(r: Xxh3Run) -> Int / {abort.raise} =
+  if r.total <= 240 { xxh3_short(r.pending, r.seed) } else {
+    let end = bytes_concat(r.tail, r.pending);
+    let acc = xxh3_stripe(r.acc, end, bytes_len(end) - 64, r.secret, 121);
+    xxh3_avalanche(
+      fold(range(0, 4), wrap_mul(r.total, prime64_1()), |sum: Int, i: Int|
+        wrap_add(
+          sum,
+          xxh3_folded(
+            at_or(acc, 2 * i, 0) ^ word64(r.secret, 11 + 16 * i),
+            at_or(acc, 2 * i + 1, 0) ^ word64(r.secret, 19 + 16 * i),
+          ),
+        )),
+    )
+  }
+
+/// XXH3, 64 bits, of `data` under `seed`; a seed of zero is the unseeded hash.
+pub fn xxh3_64(data: Bytes, seed: U64) -> U64 = finish(update(init(Xxh3(seed)), data))
+
+// --- SipHash ----------------------------------------------------------------
+
+/// A SipHash key: its sixteen bytes as two words, each least significant byte first.
+pub type SipKey = | SipKey(Int, Int)
+
+show for SipKey by sip_key_shown
+
+fn sip_key_shown(_: SipKey) -> String = "SipKey(****)"
+
+/// The key sixteen bytes are; `None` for any other length.
+pub fn sip_key(bytes: Bytes) -> Option<SipKey> =
+  if bytes_len(bytes) != 16 { None } else {
+    handle { Some(SipKey(word64(bytes, 0), word64(bytes, 8))) } with { abort.raise(_) -> None }
+  }
+
+/// A key nobody chose: three draws from the host's entropy. A hash under it differs from run to
+/// run, so it may guard a table and may not decide an order a program shows.
+pub fn sip_key_drawn() -> SipKey / {entropy.next bounded} = {
+  let spare = entropy.next();
+  SipKey(entropy.next() | (spare & 1) << 63, entropy.next() | (spare >>> 1 & 1) << 63)
+}
+
+/// The four words SipHash mixes.
+pub type Sip = new { v0: Int, v1: Int, v2: Int, v3: Int }
+
+/// SipHash between inputs: the rounds a word and the end take, the four words, the bytes short of
+/// a word, and the bytes taken.
+pub type SipRun = new { each: Int, last: Int, v: Sip, pending: Bytes, total: Int }
+
+fn sip_round(s: Sip) -> Sip = {
+  let a = wrap_add(s.v0, s.v1);
+  let b = rotr(s.v1, 64 - 13) ^ a;
+  let c = wrap_add(s.v2, s.v3);
+  let d = rotr(s.v3, 64 - 16) ^ c;
+  let e = wrap_add(rotr(a, 64 - 32), d);
+  let f = wrap_add(c, b);
+  { v0: e, v1: rotr(b, 64 - 17) ^ f, v2: rotr(f, 64 - 32), v3: rotr(d, 64 - 21) ^ e }
+}
+
+fn sip_rounds(s: Sip, n: Int) -> Sip = if n <= 0 { s } else { sip_rounds(sip_round(s), n - 1) }
+
+fn sip_word(s: Sip, word: Int, rounds: Int) -> Sip = {
+  let mixed = sip_rounds({ ..s, v3: s.v3 ^ word }, rounds);
+  { ..mixed, v0: mixed.v0 ^ word }
+}
+
+fn sip_start(key: SipKey, each: Int, last: Int) -> SipRun =
+  match key {
+    SipKey(k0, k1) ->
+      {
+        each: each,
+        last: last,
+        v: {
+          v0: k0 ^ 0x736F_6D65_7073_6575,
+          v1: k1 ^ 0x646F_7261_6E64_6F6D,
+          v2: k0 ^ 0x6C79_6765_6E65_7261,
+          v3: k1 ^ 0x7465_6462_7974_6573,
+        },
+        pending: b"",
+        total: 0,
+      },
+  }
+
+fn sip_words(b: Bytes, i: Int, r: SipRun) -> SipRun / {abort.raise} =
+  if i + 8 > bytes_len(b) { { ..r, pending: bytes_slice(b, i, bytes_len(b)) } }
+  else { sip_words(b, i + 8, { ..r, v: sip_word(r.v, word64(b, i), r.each) }) }
+
+fn sip_fed(r: SipRun, chunk: Bytes) -> SipRun / {abort.raise} =
+  sip_words(joined(r.pending, chunk), 0, { ..r, total: r.total + bytes_len(chunk) })
+
+fn sip_done(r: SipRun) -> Int / {abort.raise} = {
+  let end = fold(range(0, bytes_len(r.pending)), (r.total & 0xFF) << 56, |acc: Int, i: Int|
+    acc | bytes_at(r.pending, i) << 8 * i);
+  let mixed = sip_word(r.v, end, r.each);
+  let s = sip_rounds({ ..mixed, v2: mixed.v2 ^ 0xFF }, r.last);
+  s.v0 ^ s.v1 ^ s.v2 ^ s.v3
+}
+
+/// SipHash-1-3 of `data` under `key`: the faster of the two, and what a hash table wants.
+pub fn siphash13(key: SipKey, data: Bytes) -> U64 = finish(update(init(SipHash13(key)), data))
+
+/// SipHash-2-4 of `data` under `key`: the one the SipHash paper recommends.
+pub fn siphash24(key: SipKey, data: Bytes) -> U64 = finish(update(init(SipHash24(key)), data))
+
+// --- One shape over them all --------------------------------------------------
+
+/// Which sum to take: a CRC by the `Crc` that runs it, xxHash by its seed, SipHash by its key.
+pub type Algorithm =
+  | Crc(Crc)
+  | Adler32
+  | Fnv1a32
+  | Fnv1a64
+  | Xxh64(U64)
+  | Xxh3(U64)
+  | SipHash13(SipKey)
+  | SipHash24(SipKey)
+
+/// A sum part of the way through its input.
+pub type State =
+  | CrcState(Crc, Int)
+  | AdlerState(Int)
+  | Fnv32State(Int)
+  | Fnv64State(Int)
+  | Xxh64State(Xxh64Run)
+  | Xxh3State(Xxh3Run)
+  | SipState(SipRun)
+
+/// The state before any input.
+pub fn init(a: Algorithm) -> State =
+  match a {
+    Crc(c) -> CrcState(c, c.start),
+    Adler32 -> AdlerState(1),
+    Fnv1a32 -> Fnv32State(0x811C_9DC5),
+    Fnv1a64 -> Fnv64State(0xCBF2_9CE4_8422_2325),
+    Xxh64(seed) -> Xxh64State(xxh64_start(int_of(seed))),
+    Xxh3(seed) -> Xxh3State(xxh3_start(int_of(seed))),
+    SipHash13(key) -> SipState(sip_start(key, 1, 3)),
+    SipHash24(key) -> SipState(sip_start(key, 2, 4)),
+  }
+
+/// The state after `chunk` as well. However an input is cut into chunks, the state after the last
+/// finishes as the input whole does.
+pub fn update(s: State, chunk: Bytes) -> State =
+  handle { advanced(s, chunk) } with { abort.raise(_) -> s }
+
+fn advanced(s: State, chunk: Bytes) -> State / {abort.raise} =
+  match s {
+    CrcState(c, reg) -> CrcState(c, crc_words(c.table, c.model.reflect_in, reg, chunk, 0)),
+    AdlerState(sum) -> AdlerState(adler_words(chunk, 0, sum & 0xFFFF, sum >>> 16)),
+    Fnv32State(h) -> Fnv32State(fnv32_bytes(chunk, 0, h)),
+    Fnv64State(h) -> Fnv64State(fnv64_bytes(chunk, 0, h)),
+    Xxh64State(r) -> Xxh64State(xxh64_fed(r, chunk)),
+    Xxh3State(r) -> Xxh3State(xxh3_fed(r, chunk)),
+    SipState(r) -> SipState(sip_fed(r, chunk)),
+  }
+
+/// The sum of everything a state has taken, a narrower sum in the low bits. The state is not
+/// spent: it may take more input after.
+pub fn finish(s: State) -> U64 = u64_of(finished(s))
+
+fn finished(s: State) -> Int =
+  handle {
+    match s {
+      CrcState(c, reg) -> crc_out(c, reg),
+      AdlerState(sum) -> sum,
+      Fnv32State(h) -> h,
+      Fnv64State(h) -> h,
+      Xxh64State(r) -> xxh64_done(r),
+      Xxh3State(r) -> xxh3_done(r),
+      SipState(r) -> sip_done(r),
+    }
+  } with {
+    abort.raise(_) -> 0,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+type Check = { name: String, crc: Crc, check: U64 }
+
+/// Each preset with the sum the catalogue of parametrised CRC algorithms gives for `123456789`.
+fn catalogue() -> List<Check> =
+  [
+    { name: "CRC-8/SMBUS", crc: crc8_smbus(), check: 0xF4u64 },
+    { name: "CRC-16/ARC", crc: crc16_arc(), check: 0xBB3Du64 },
+    { name: "CRC-16/IBM-3740", crc: crc16_ibm_3740(), check: 0x29B1u64 },
+    { name: "CRC-16/IBM-SDLC", crc: crc16_ibm_sdlc(), check: 0x906Eu64 },
+    { name: "CRC-16/KERMIT", crc: crc16_kermit(), check: 0x2189u64 },
+    { name: "CRC-16/MODBUS", crc: crc16_modbus(), check: 0x4B37u64 },
+    { name: "CRC-16/USB", crc: crc16_usb(), check: 0xB4C8u64 },
+    { name: "CRC-16/XMODEM", crc: crc16_xmodem(), check: 0x31C3u64 },
+    { name: "CRC-32/BZIP2", crc: crc32_bzip2(), check: 0xFC89_1918u64 },
+    { name: "CRC-32/CKSUM", crc: crc32_cksum(), check: 0x765E_7680u64 },
+    { name: "CRC-32/ISCSI", crc: crc32_iscsi(), check: 0xE306_9283u64 },
+    { name: "CRC-32/ISO-HDLC", crc: crc32_iso_hdlc(), check: 0xCBF4_3926u64 },
+    { name: "CRC-32/MPEG-2", crc: crc32_mpeg2(), check: 0x0376_E6E7u64 },
+    { name: "CRC-64/ECMA-182", crc: crc64_ecma_182(), check: 0x6C40_DF5F_0B49_7347u64 },
+    { name: "CRC-64/GO-ISO", crc: crc64_go_iso(), check: 0xB909_56C7_75A4_1001u64 },
+    { name: "CRC-64/NVME", crc: crc64_nvme(), check: 0xAE8B_1486_0A79_9888u64 },
+    { name: "CRC-64/XZ", crc: crc64_xz(), check: 0x995D_C9BB_DF19_39FAu64 },
+  ]
+
+test "{c.name} of 123456789 is the catalogue's check value" for c: Check in catalogue() {
+  assert_eq(crc(c.crc, b"123456789"), c.check)
+}
+
+fn check_of(model: Model) -> Option<U64> =
+  match crc_of(model) { Some(c) -> Some(crc(c, b"123456789")), None -> None }
+
+fn umts() -> Model =
+  { width: 12, poly: 0x80Fu64, init: 0u64, reflect_in: false, reflect_out: true, xor_out: 0u64 }
+
+test "a model of an odd width, or one that reflects one end only, runs as the catalogue says" {
+  // CRC-12/UMTS, CRC-5/USB and CRC-7/MMC.
+  assert_eq(check_of(umts()), Some(0xDAFu64));
+  assert_eq(
+    check_of({
+      width: 5,
+      poly: 0x05u64,
+      init: 0x1Fu64,
+      reflect_in: true,
+      reflect_out: true,
+      xor_out: 0x1Fu64,
+    }),
+    Some(0x19u64),
+  );
+  assert_eq(
+    check_of({
+      width: 7,
+      poly: 0x09u64,
+      init: 0u64,
+      reflect_in: false,
+      reflect_out: false,
+      xor_out: 0u64,
+    }),
+    Some(0x75u64),
+  )
+}
+
+fn plain(width: Int, poly: U64) -> Model =
+  { width: width, poly: poly, init: 0u64, reflect_in: true, reflect_out: true, xor_out: 0u64 }
+
+test "a model with no such width, or a parameter wider than it, is no CRC" {
+  assert_eq(crc_of(plain(0, 1u64)), None);
+  assert_eq(crc_of(plain(65, 1u64)), None);
+  assert_eq(crc_of(plain(8, 0x100u64)), None);
+  assert(crc_of(plain(1, 1u64)) != None);
+  assert(crc_of(plain(64, 0xFFFF_FFFF_FFFF_FFFFu64)) != None)
+}
+
+/// `n` bytes counting up from zero, wrapping at 256.
+fn counted(n: Int) -> Bytes / {abort.raise} =
+  bytes_slice(repeat(bytes_concat_all(map(range(0, 256), byte_of_int)), n / 256 + 1), 0, n)
+
+test "CRC-32 and CRC-32C of a whole input, and RFC 3720's four vectors" {
+  assert_eq(crc32(b""), 0u32);
+  assert_eq(crc32(b"123456789"), 0xCBF4_3926u32);
+  assert_eq(crc32(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339u32);
+  assert_eq(crc32c(b"123456789"), 0xE306_9283u32);
+  assert_eq(crc32c(repeat(b"\x00", 32)), 0x8A91_36AAu32);
+  assert_eq(crc32c(repeat(b"\xff", 32)), 0x62A8_AB43u32);
+  assert_eq(crc32c(counted(32)), 0x46DD_794Eu32);
+  assert_eq(
+    crc32c(bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int(31 - i)))),
+    0x113F_DB5Cu32,
+  )
+}
+
+test "Adler-32 as zlib computes it, past where a 32-bit sum would have overflowed" {
+  assert_eq(adler32(b""), 1u32);
+  assert_eq(adler32(b"a"), 0x0062_0062u32);
+  assert_eq(adler32(b"abc"), 0x024D_0127u32);
+  assert_eq(adler32(b"Wikipedia"), 0x11E6_0398u32);
+  assert_eq(adler32(b"123456789"), 0x091E_01DEu32);
+  assert_eq(adler32(repeat(b"\xff", 6000)), 0xA497_59EAu32);
+  assert_eq(adler32(counted(10240)), 0xF475_ED1Eu32)
+}
+
+test "FNV-1a over its authors' vectors" {
+  assert_eq(fnv1a_32(b""), 0x811C_9DC5u32);
+  assert_eq(fnv1a_32(b"a"), 0xE40C_292Cu32);
+  assert_eq(fnv1a_32(b"b"), 0xE70C_2DE5u32);
+  assert_eq(fnv1a_32(b"foobar"), 0xBF9C_F968u32);
+  assert_eq(fnv1a_32(b"chongo was here!\n"), 0xD499_30D5u32);
+  assert_eq(fnv1a_64(b""), 0xCBF2_9CE4_8422_2325u64);
+  assert_eq(fnv1a_64(b"a"), 0xAF63_DC4C_8601_EC8Cu64);
+  assert_eq(fnv1a_64(b"b"), 0xAF63_DF4C_8601_F1A5u64);
+  assert_eq(fnv1a_64(b"foobar"), 0x8594_4171_F739_67E8u64);
+  assert_eq(fnv1a_64(b"chongo was here!\n"), 0x4681_0940_EFF5_F915u64)
+}
+
+/// The buffer xxHash's own sanity checks hash a prefix of.
+fn sanity(n: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    fold(
+      range(0, n),
+      { out: [], gen: 2654435761 },
+      |s: { out: List<Bytes>, gen: Int }, _: Int|
+        {
+          out: push(s.out, byte_of_int(s.gen >>> 56)),
+          gen: wrap_mul(s.gen, 0x9E37_79B1_85EB_CA8D),
+        },
+    ).out,
+  )
+
+type Sanity = { size: Int, seed: U64, sum: U64 }
+
+fn xxh64_sanity() -> List<Sanity> =
+  [
+    { size: 0, seed: 0u64, sum: 0xEF46_DB37_51D8_E999u64 },
+    { size: 0, seed: 2654435761u64, sum: 0xAC75_FDA2_929B_17EFu64 },
+    { size: 1, seed: 0u64, sum: 0xE934_A84A_DB05_2768u64 },
+    { size: 1, seed: 2654435761u64, sum: 0x5014_6076_43A9_B4C3u64 },
+    { size: 4, seed: 0u64, sum: 0x9136_A0DC_A574_57EEu64 },
+    { size: 4, seed: 2654435761u64, sum: 0xCAAB_286B_D8E9_FDB5u64 },
+    { size: 14, seed: 0u64, sum: 0x8282_DCC4_994E_35C8u64 },
+    { size: 14, seed: 2654435761u64, sum: 0xC3BD_6BF6_3DEB_6DF0u64 },
+    { size: 222, seed: 0u64, sum: 0xB641_AE8C_B691_C174u64 },
+    { size: 222, seed: 2654435761u64, sum: 0x20CB_8AB7_AE10_C14Au64 },
+  ]
+
+test "XXH64 of {c.size} sanity bytes under seed {c.seed}" for c: Sanity in xxh64_sanity() {
+  assert_eq(xxh64(sanity(c.size), c.seed), c.sum)
+}
+
+/// One size from each of XXH3's ranges of lengths, and on both sides of a stripe and a scramble.
+fn xxh3_sanity() -> List<Sanity> =
+  [
+    { size: 0, seed: 0u64, sum: 0x2D06_8005_38D3_94C2u64 },
+    { size: 0, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0xA8A6_B918_B2F0_364Au64 },
+    { size: 1, seed: 0u64, sum: 0xC44B_DFF4_074E_ECDBu64 },
+    { size: 1, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0x032B_E332_DD76_6EF8u64 },
+    { size: 6, seed: 0u64, sum: 0x27B5_6A84_CD2D_7325u64 },
+    { size: 6, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0x8458_9C11_6AB5_9AB9u64 },
+    { size: 12, seed: 0u64, sum: 0xA713_DAF0_DFBB_77E7u64 },
+    { size: 12, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0xE730_3E1B_2336_DE0Eu64 },
+    { size: 24, seed: 0u64, sum: 0xA3FE_70BF_9D35_10EBu64 },
+    { size: 24, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0x850E_80FC_35BD_D690u64 },
+    { size: 48, seed: 0u64, sum: 0x397D_A259_ECBA_1F11u64 },
+    { size: 48, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0xADC2_CBAA_44AC_C616u64 },
+    { size: 80, seed: 0u64, sum: 0xBCDE_FBBB_2C47_C90Au64 },
+    { size: 80, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0xC6DD_0CB6_9953_2E73u64 },
+    { size: 195, seed: 0u64, sum: 0xCD94_217E_E362_EC3Au64 },
+    { size: 195, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0xBA68_003D_370C_B3D9u64 },
+    { size: 403, seed: 0u64, sum: 0xCDEB_804D_65C6_DEA4u64 },
+    { size: 403, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0x6259_F6EC_FD64_43FDu64 },
+    { size: 512, seed: 0u64, sum: 0x617E_4959_9013_CB6Bu64 },
+    { size: 512, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0x3CE4_57DE_14C2_7708u64 },
+    { size: 2048, seed: 0u64, sum: 0xDD59_E2C3_A5F0_38E0u64 },
+    { size: 2048, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0x66F8_1670_669A_BABCu64 },
+    { size: 2240, seed: 0u64, sum: 0x6E73_A905_39CF_2948u64 },
+    { size: 2240, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0x757B_A848_7D1B_5247u64 },
+    { size: 2367, seed: 0u64, sum: 0xCB37_AEB9_E5D3_61EDu64 },
+    { size: 2367, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0xD2DB_3415_B942_B42Au64 },
+  ]
+
+test "XXH3 of {c.size} sanity bytes under seed {c.seed}" for c: Sanity in xxh3_sanity() {
+  assert_eq(xxh3_64(sanity(c.size), c.seed), c.sum)
+}
+
+test "xxHash of text, unseeded" {
+  assert_eq(xxh64(b"abc", 0u64), 0x44BC_2CF5_AD77_0999u64);
+  assert_eq(xxh3_64(b"abc", 0u64), 0x78AF_5F94_892F_3950u64);
+  assert_eq(xxh64(b"Nobody inspects the spammish repetition", 0u64), 0xFBCE_A83C_8A37_8BF1u64);
+  assert_eq(xxh3_64(b"Nobody inspects the spammish repetition", 0u64), 0x6CB0_0603_B5CC_47E9u64)
+}
+
+/// The key 00 to 0f the SipHash paper's vectors are under.
+fn sixteen() -> SipKey = SipKey(0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908)
+
+type SipVector = { size: Int, two_four: U64, one_three: U64 }
+
+/// Inputs of 00 upward, on both sides of a word: SipHash-2-4 as the paper's reference code lists
+/// it, and SipHash-1-3 as that code computes it.
+fn sip_vectors() -> List<SipVector> =
+  [
+    { size: 0, two_four: 0x726F_DB47_DD0E_0E31u64, one_three: 0xABAC_0158_050F_C4DCu64 },
+    { size: 1, two_four: 0x74F8_39C5_93DC_67FDu64, one_three: 0xC9F4_9BF3_7D57_CA93u64 },
+    { size: 7, two_four: 0xAB02_00F5_8B01_D137u64, one_three: 0xD392_7D98_9BB1_1140u64 },
+    { size: 8, two_four: 0x93F5_F579_9A93_2462u64, one_three: 0x3690_9511_8D29_9A8Eu64 },
+    { size: 9, two_four: 0x9E00_82DF_0BA9_E4B0u64, one_three: 0x25A4_8EB3_6C06_3DE4u64 },
+    { size: 15, two_four: 0xA129_CA61_49BE_45E5u64, one_three: 0xD320_D86D_2A51_9956u64 },
+    { size: 16, two_four: 0x3F2A_CC7F_57C2_9BDBu64, one_three: 0xCC4F_DD1A_7D90_8B66u64 },
+    { size: 63, two_four: 0x958A_324C_EB06_4572u64, one_three: 0x9D19_9062_B7BB_B3A8u64 },
+  ]
+
+test "SipHash of {c.size} bytes under the paper's key" for c: SipVector in sip_vectors() {
+  assert_eq(siphash24(sixteen(), counted(c.size)), c.two_four);
+  assert_eq(siphash13(sixteen(), counted(c.size)), c.one_three)
+}
+
+test "a key is sixteen bytes, shows as nothing, and a drawn one takes three draws" {
+  assert_eq(sip_key(counted(16)), Some(sixteen()));
+  assert_eq(sip_key(counted(15)), None);
+  assert_eq(sip_key(counted(17)), None);
+  assert_eq(show(sixteen()), "SipKey(****)");
+  assert_eq(f"{sixteen()}", "SipKey(****)");
+  let drawn = handle { sip_key_drawn() } with { entropy.next() -> 5 };
+  assert_eq(drawn, SipKey(5 | 1 << 63, 5))
+}
+
+/// One of each, with a CRC of each width and reflection.
+fn every() -> List<Algorithm> =
+  [
+    Crc(crc8_smbus()),
+    Crc(crc16_arc()),
+    Crc(crc16_xmodem()),
+    Crc(crc32_iso_hdlc()),
+    Crc(crc32_mpeg2()),
+    Crc(crc64_xz()),
+    Crc(crc64_ecma_182()),
+    Adler32,
+    Fnv1a32,
+    Fnv1a64,
+    Xxh64(0u64),
+    Xxh64(0x9E37_79B1_85EB_CA8Du64),
+    Xxh3(0u64),
+    Xxh3(0x9E37_79B1_85EB_CA8Du64),
+    SipHash13(sixteen()),
+    SipHash24(sixteen()),
+  ]
+
+fn whole(a: Algorithm, data: Bytes) -> U64 = finish(update(init(a), data))
+
+/// `data` fed in pieces of `size` bytes.
+fn pieces(a: Algorithm, data: Bytes, size: Int) -> State / {abort.raise} =
+  fold(range(0, (bytes_len(data) + size - 1) / size), init(a), |s: State, k: Int|
+    update(s, bytes_slice(data, k * size, min((k + 1) * size, bytes_len(data)))))
+
+test "an input cut in two anywhere, or fed in pieces of any size, sums as it does whole" {
+  let data = sanity(1500);
+  let cuts = [
+    0,
+    1,
+    3,
+    4,
+    7,
+    8,
+    9,
+    31,
+    32,
+    33,
+    63,
+    64,
+    65,
+    128,
+    129,
+    239,
+    240,
+    241,
+    256,
+    1023,
+    1024,
+    1025,
+    1088,
+    1089,
+    1499,
+    1500,
+  ];
+  fold(every(), (), |_: Unit, a: Algorithm| {
+    let want = whole(a, data);
+    fold(cuts, (), |_: Unit, at: Int|
+      assert_eq(
+        finish(update(update(init(a), bytes_slice(data, 0, at)), bytes_slice(data, at, 1500))),
+        want,
+      ));
+    fold([1, 7, 64, 100, 241], (), |_: Unit, size: Int|
+      assert_eq(finish(pieces(a, data, size)), want))
+  })
+}
+
+test "a state is not spent by finishing: it takes more input after" {
+  fold(every(), (), |_: Unit, a: Algorithm| {
+    let half = update(init(a), b"the first half, ");
+    assert_eq(finish(half), whole(a, b"the first half, "));
+    assert_eq(finish(update(half, b"and the second")), whole(a, b"the first half, and the second"))
+  })
+}
+
+law "a sum over an input cut in two is the sum over it whole"
+  forall (a: Bytes, b: Bytes) {
+    fold(every(), true, |ok: Bool, alg: Algorithm|
+      ok && finish(update(update(init(alg), a), b)) == whole(alg, bytes_concat(a, b)))
+  }
+
+law "a CRC-64 part is a monoid under join" =
+  monoid(|a: Part, b: Part| crc_join(crc64_xz(), a, b), crc_empty(crc64_xz()))
+
+law "the CRC-32 of two inputs joined is their CRC-32s combined"
+  forall (a: Bytes, b: Bytes) {
+    crc32_combine(crc32(a), crc32(b), bytes_len(b)) == crc32(bytes_concat(a, b))
+  }
+
+law "the Adler-32 of two inputs joined is their Adler-32s combined"
+  forall (a: Bytes, b: Bytes) {
+    adler32_combine(adler32(a), adler32(b), bytes_len(b)) == adler32(bytes_concat(a, b))
+  }
+
+fn models() -> List<Crc> =
+  [
+    crc8_smbus(),
+    crc16_arc(),
+    crc16_ibm_3740(),
+    crc16_xmodem(),
+    crc32_iso_hdlc(),
+    crc32_cksum(),
+    crc32_mpeg2(),
+    crc64_xz(),
+    crc64_ecma_182(),
+    match crc_of(umts()) { Some(c) -> c, None -> crc8_smbus() },
+  ]
+
+test "a CRC combines under every kind of model, over lengths short and long" {
+  let data = sanity(3000);
+  fold(models(), (), |_: Unit, c: Crc|
+    fold([0, 1, 7, 8, 255, 256, 1500, 2999, 3000], (), |_: Unit, at: Int| {
+      let head = bytes_slice(data, 0, at);
+      let tail = bytes_slice(data, at, 3000);
+      assert_eq(crc_combine(c, crc(c, head), crc(c, tail), 3000 - at), crc(c, data));
+      assert_eq(crc_join(c, crc_part(c, head), crc_part(c, tail)), crc_part(c, data))
+    }));
+  // A length of nothing, or less, joins nothing on.
+  assert_eq(crc32_combine(crc32(b"abc"), crc32(b""), 0), crc32(b"abc"));
+  assert_eq(crc32_combine(crc32(b"abc"), crc32(b""), 0 - 5), crc32(b"abc"));
+  assert_eq(adler32_combine(adler32(b"abc"), adler32(b""), 0 - 5), adler32(b"abc"))
+}
+
+test "a CRC over chunks folded in parallel is the CRC of them joined" {
+  let chunks = map(range(0, 3 * grain() + 5), |i: Int| sanity(i % 41));
+  let all = bytes_concat_all(chunks);
+  fold([crc32_iso_hdlc(), crc16_xmodem(), crc64_xz()], (), |_: Unit, c: Crc| {
+    let folded = par_fold(
+      chunks,
+      crc_empty(c),
+      |acc: Part, chunk: Bytes| crc_join(c, acc, crc_part(c, chunk)),
+      |a: Part, b: Part| crc_join(c, a, b),
+    );
+    assert_eq(folded.sum, crc(c, all))
+  })
+}
+
+law "XXH64 takes steps in proportion to its input"
+  forall (n: Int) cost n {
+    xxh64(counted(n), 0u64)
+  }
+
+law "XXH3 takes steps in proportion to its input"
+  forall (n: Int) cost n {
+    xxh3_64(counted(n), 0u64)
+  }
+
+law "SipHash takes steps in proportion to its input"
+  forall (n: Int) cost n {
+    siphash24(sixteen(), counted(n))
+  }
+
+law "a CRC of any model takes steps in proportion to its input"
+  forall (n: Int) cost n {
+    crc(crc16_xmodem(), counted(n))
+  }
+
+test "eight bytes are a step, so 64 KiB is a CRC in an eighth of its length in steps" {
+  let data = counted(65536);
+  let empty = metered(|| crc32(b"")).steps;
+  assert(metered(|| crc32(data)).steps - empty < 65536 / 8 + 16);
+  assert(metered(|| adler32(data)).steps - metered(|| adler32(b"")).steps < 65536 / 8 + 16)
+}

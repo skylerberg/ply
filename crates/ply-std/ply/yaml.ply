@@ -66,17 +66,23 @@
 //! A `YamlCodec<a>` pairs an encoder with a decoder, as `std.json`'s `JsonCodec` does, and the
 //! codecs here are the ones a record's codec is written of. A decode error carries the path of
 //! keys to what was wrong, and `decode_bytes` and `decode_document` add the line and column it
-//! is written at. `only_fields` refuses a key a record does not have.
+//! is written at. `only_fields` refuses a key a record does not have. A path's steps, a place
+//! and a decode error are `std.place`'s, which `std.toml` reads and answers by too.
 
 import std.bytes
 import std.bytes (hex_value, peek, scan, scan_until)
 import std.date
 import std.float (infinity, is_infinite, is_nan, nan, neg_infinity)
+import std.gen
+import std.gen (Gen)
 import std.json
-import std.laws (agrees)
+import std.laws (agrees, round_trip)
 import std.list
-import std.list (any, concat, drop, find, find_index, flat_map, prepend, reverse, take)
+import std.list (any, concat, drop, find, find_index, reverse, take)
 import std.option (option_and_then, option_expect)
+import std.place (DecodeError, Index, Key, Place, Step, decode_error, decode_fields, decode_items)
+import std.place (error_to_string, in_field, in_index, path_to_string, place_at, unknown_key)
+import std.place (spliced, utf8_end)
 import std.result (result_map, result_map_err, result_ok)
 import std.string
 import std.string (join, lines, of_code_points)
@@ -270,9 +276,6 @@ fn ends_properties(s: Scanner, c: Int) -> Bool =
 fn break_len(src: Bytes, p: Int) -> Int / {abort.raise} =
   match peek(src, p) { b'\n' -> 1, b'\r' -> if peek(src, p + 1) == b'\n' { 2 } else { 1 }, _ -> 0 }
 
-fn cut(src: Bytes, from: Int, to: Int) -> String / {abort.raise} =
-  string_of_bytes(bytes_slice(src, from, to))
-
 /// Whether `---` or `...` stands at `p` as a word.
 fn at_marker(src: Bytes, p: Int) -> Bool / {abort.raise} = {
   let c = peek(src, p);
@@ -312,21 +315,11 @@ fn control_at(src: Bytes, at: Int) -> Int / {abort.raise} = {
   else { 0xFFC0 | peek(src, at + 2) & 0x3F }
 }
 
-/// Where the first byte that is no part of a UTF-8 character stands. Each character takes a byte,
-/// so the bytes bound them: `left`.
-fn first_invalid(src: Bytes, i: Int, left: Int) -> Int / {abort.raise} = {
-  let lead = peek(src, i);
-  let width = if lead < 128 { 1 } else if lead < 224 { 2 } else if lead < 240 { 3 } else { 4 };
-  if lead < 0 || left <= 0 || i + width > bytes_len(src)
-      || !bytes_is_utf8(bytes_slice(src, i, i + width)) { i }
-  else { first_invalid(src, i + width, left - 1) }
-}
-
 /// A scanner at the start of `src`, past a byte order mark.
 fn opened(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
   let n = bytes_len(src);
   if n > limits.bytes { stop(max(limits.bytes, 0), TooLong) }
-  else if !bytes_is_utf8(src) { stop(first_invalid(src, 0, n), NotUtf8) } else {
+  else if !bytes_is_utf8(src) { stop(utf8_end(src), NotUtf8) } else {
     let bad = scan_until(src, 0, low_controls());
     if bad < n { stop(bad, Control(control_at(src, bad))) } else {
       let start = if bytes_starts_with(src, b"\xef\xbb\xbf") { 3 } else { 0 };
@@ -616,7 +609,15 @@ fn handle_directive(src: Bytes, i: Int) -> Directed / {fault.at, abort.raise} = 
     stop(i, Expected("a tag handle after %TAG, as `!`, `!!` or `!name!`"))
   } else if prefix == handle_end || end == prefix {
     stop(prefix, Expected("a prefix after the handle of %TAG"))
-  } else { { tok: TTagDirective(cut(src, i, handle_end), unescaped(src, prefix, end)), to: end } }
+  } else {
+    {
+      tok: TTagDirective(
+        string_of_bytes(bytes_slice(src, i, handle_end)),
+        unescaped(src, prefix, end),
+      ),
+      to: end,
+    }
+  }
 }
 
 /// The text from `from` to `to` with each `%XX` as the byte it names.
@@ -780,7 +781,7 @@ fn anchor(s: Scanner, alias: Bool) -> Scanner / {fault.at, abort.raise} = {
   if end == s.pos + 1 { stop(s.pos, Expected("a name after this indicator")) }
   else if !ends_properties(s, peek(s.src, end)) { stop(end, Expected("a blank after an anchor")) }
   else {
-    let name = cut(s.src, s.pos + 1, end);
+    let name = string_of_bytes(bytes_slice(s.src, s.pos + 1, end));
     printable(s.src, s.pos, end);
     past(
       with_token(keyed(s), if alias { TAlias(name) } else { TAnchor(name) }, s.pos, end),
@@ -813,7 +814,11 @@ fn shorthand(src: Bytes, from: Int) -> TagRead / {fault.at, abort.raise} = {
   if peek(src, word_end) == b'!' {
     let end = scan(src, word_end + 1, tag_chars());
     if end == word_end + 1 { stop(end, Expected("a tag's name after its handle")) } else {
-      { handle: cut(src, from, word_end + 1), suffix: unescaped(src, word_end + 1, end), to: end }
+      {
+        handle: string_of_bytes(bytes_slice(src, from, word_end + 1)),
+        suffix: unescaped(src, word_end + 1, end),
+        to: end,
+      }
     }
   } else {
     let end = scan(src, word_end, tag_chars());
@@ -1641,7 +1646,11 @@ fn with_comments(p: Parser) -> List<Event> / {abort.raise} = {
         fold(range(m.next, upto), m.out, |out: List<Event>, i: Int|
           match list_at(comments, i) {
             Some(c) ->
-              push(out, { kind: Comment(cut(src, c.from + 1, c.to)), from: c.from, to: c.to }),
+              push(out, {
+                kind: Comment(string_of_bytes(bytes_slice(src, c.from + 1, c.to))),
+                from: c.from,
+                to: c.to,
+              }),
             None -> out,
           }),
         e,
@@ -1663,21 +1672,8 @@ fn comments_before(comments: List<Span>, i: Int, at: Int) -> Int =
 
 // --- Places -----------------------------------------------------------------
 
-/// A line and a column of a text, both from 1, the column counted in characters.
-pub type Place = new { line: Int, column: Int }
-
-/// Where the byte at `offset` stands.
-fn place_of(src: Bytes, offset: Int) -> Place = {
-  let n = bytes_len(src);
-  let upto = if offset < 0 { 0 } else if offset > n { n } else { offset };
-  let before = handle { bytes_slice(src, 0, upto) } with { abort.raise(_) -> src };
-  let lines = handle { bytes_split(before, b"\n") } with { abort.raise(_) -> [before] };
-  let last = match list_at(lines, len(lines) - 1) { Some(line) -> line, None -> b"" };
-  { line: len(lines), column: string_len(string_of_bytes_lossy(last)) + 1 }
-}
-
 fn placed_at(src: Bytes, offset: Int, why: Why) -> Refusal = {
-  let stood = place_of(src, offset);
+  let stood = place_at(src, offset);
   { offset: offset, line: stood.line, column: stood.column, why: why }
 }
 
@@ -1788,13 +1784,6 @@ pub fn lookup(v: Yaml, key: Yaml) -> Option<Yaml> =
 /// `lookup` under a string key.
 pub fn get(v: Yaml, name: String) -> Option<Yaml> = lookup(v, String(name))
 
-/// One step from a value to a value inside it.
-pub type Step =
-  /// Into a mapping, by a string key.
-  | Key(String)
-  /// Into a sequence, by an index from 0.
-  | Index(Int)
-
 /// The value a path leads to from `v`, where every step of it is there.
 pub fn at(v: Yaml, path: List<Step>) -> Option<Yaml> =
   match path {
@@ -1867,34 +1856,6 @@ pub fn without(v: Yaml, path: List<Step>) -> Yaml =
       Some(child) -> match put(v, [step], without(child, rest)) { Some(made) -> made, None -> v },
     },
   }
-
-/// A path as a reader of one writes it, a key that is no plain word between quotes and an index
-/// in brackets: `servers.alpha[2]."a b"`.
-pub fn path_to_string(path: List<Step>) -> String =
-  fold(path, "", |written: String, step: Step|
-    match step {
-      Key(name) -> (if written == "" { "" } else { written ++ "." }) ++ key_text(name),
-      Index(i) -> written ++ "[" ++ int_to_string(i) ++ "]",
-    })
-
-/// A key as a path writes it: bare where it is letters, digits, `_` and `-`, and otherwise
-/// between double quotes.
-fn key_text(name: String) -> String = {
-  let raw = bytes_of_string(name);
-  let n = bytes_len(raw);
-  let bare = handle {
-    n > 0 && scan(raw, 0, b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == n
-  } with {
-    abort.raise(_) -> false,
-  };
-  if bare { name } else {
-    string_of_bytes_lossy(handle {
-      bytes_concat_all(push(put_escaped([b"\""], raw, 0, n + 1), b"\""))
-    } with {
-      abort.raise(_) -> raw,
-    })
-  }
-}
 
 // --- The core schema --------------------------------------------------------
 
@@ -1984,17 +1945,12 @@ fn shaped(b: Bytes, read: Shape, at: Int) -> Yaml / {fault.at, abort.raise} =
     AsString -> String(string_of_bytes(b)),
   }
 
-fn based_integer(b: Bytes, base: Int, at: Int) -> Yaml / {fault.at, abort.raise} = {
-  let read = fold(range(2, bytes_len(b)), Some(0), |acc: Option<Int>, i: Int|
-    match acc {
-      None -> None,
-      Some(n) -> match checked_mul(n, base) {
-        Some(scaled) -> checked_add(scaled, hex_value(peek(b, i))),
-        None -> None,
-      },
-    });
-  match read { Some(n) -> Integer(n), None -> stop(at, TooWide) }
-}
+/// An integer written in octal or hexadecimal after its two-letter prefix.
+fn based_integer(b: Bytes, base: Int, at: Int) -> Yaml / {fault.at, abort.raise} =
+  match bytes::int_of_ascii_radix(bytes_slice(b, 2, bytes_len(b)), base) {
+    Some(n) -> Integer(n),
+    None -> stop(at, TooWide),
+  }
 
 /// A float written `b`, which the core schema's table admits: a digit is put on each side of its
 /// point for the builtin that reads one.
@@ -2792,13 +2748,6 @@ fn put_pair(out: List<Bytes>, e: Entry) -> List<Bytes> / {abort.raise} = {
 
 // --- Codecs -----------------------------------------------------------------
 
-/// Why a value did not decode: the path to what was wrong, the line and column it is written at
-/// where the text was at hand, and what was wrong.
-pub type DecodeError = new { path: List<Step>, place: Option<Place>, message: String }
-
-/// An error with no path yet; the decoders around it add the steps.
-pub fn decode_error(message: String) -> DecodeError = { path: [], place: None, message: message }
-
 /// An error saying `what` was expected and naming the kind of value `found` is instead.
 pub fn expected(what: String, found: Yaml) -> DecodeError =
   decode_error("expected " ++ what ++ ", found " ++ kind_of(found))
@@ -2815,25 +2764,6 @@ pub fn kind_of(v: Yaml) -> String =
     Mapping(_) -> "a mapping",
     Tagged(tag, _) -> "a value tagged " ++ tag,
   }
-
-/// A path is built inside out: each enclosing decoder prefixes the step it took.
-pub fn in_field(name: String, e: DecodeError) -> DecodeError =
-  { path: prepend(Key(name), e.path), place: e.place, message: e.message }
-
-/// `e`, one sequence index further in.
-pub fn in_index(index: Int, e: DecodeError) -> DecodeError =
-  { path: prepend(Index(index), e.path), place: e.place, message: e.message }
-
-/// `line 4, column 8: servers.alpha.port: expected an integer, found a string`, without the place
-/// or the path where the error has none.
-pub fn error_to_string(e: DecodeError) -> String =
-  (match e.place {
-      Some(stood) ->
-        "line " ++ int_to_string(stood.line) ++ ", column " ++ int_to_string(stood.column) ++ ": ",
-      None -> "",
-    })
-    ++ (if len(e.path) == 0 { "" } else { path_to_string(e.path) ++ ": " })
-    ++ e.message
 
 /// How to write an `a` as YAML and read one back.
 pub type YamlCodec<a> = {
@@ -2874,21 +2804,19 @@ pub fn optional_field<a>(
     _ -> Err(expected("a mapping", v)),
   }
 
-/// Refuses a mapping that holds a key outside `names`, naming the first: what a record's decoder
-/// calls so a misspelt key is an error and not a default.
+/// Refuses a mapping that holds a key outside `names`, naming the first and the name it is a slip
+/// from where there is one: what a record's decoder calls so a misspelt key is an error and not a
+/// default.
 pub fn only_fields(v: Yaml, names: List<String>) -> Result<Unit, DecodeError> =
   match untagged(v) {
     Mapping(entries) ->
       fold(entries, Ok(()), |so_far: Result<Unit, DecodeError>, e: Entry|
         match so_far {
           Err(_) -> so_far,
-          Ok(_) -> if any(names, |name: String| String(name) == e.key) { so_far } else {
-            Err({
-              path: match e.key { String(name) -> [Key(name)], _ -> [] },
-              place: None,
-              message: "the key " ++ inline(e.key) ++ " is not one of "
-                ++ join(map(names, |name: String| inline(String(name))), ", "),
-            })
+          Ok(_) -> match e.key {
+            String(name) -> if any(names, |known: String| known == name) { so_far }
+            else { Err(unknown_key(name, names)) },
+            other -> Err(expected("a string for a key", other)),
           },
         }),
     _ -> Err(expected("a mapping", v)),
@@ -2981,23 +2909,9 @@ pub fn list_yaml<a>(item: YamlCodec<a>) -> YamlCodec<List<a>> =
     encode: |xs: List<a>| Sequence(map(xs, |x: a| (item.encode)(x))),
     decode: |v: Yaml|
       match v {
-        Sequence(items) -> collect(items, item, 0, []),
+        Sequence(items) -> decode_items(items, item.decode),
         _ -> Err(expected("a sequence", v)),
       },
-  }
-
-fn collect<a>(
-  items: List<Yaml>,
-  item: YamlCodec<a>,
-  index: Int,
-  acc: List<a>,
-) -> Result<List<a>, DecodeError> / {abort.raise} =
-  match items {
-    [] -> Ok(acc),
-    [x, ..rest] -> match (item.decode)(x) {
-      Err(e) -> Err(in_index(index, e)),
-      Ok(v) -> collect(rest, item, index + 1, push(acc, v)),
-    },
   }
 
 /// A map keyed by `String` is a mapping whose keys are strings, written in key order.
@@ -3010,26 +2924,28 @@ pub fn string_map_yaml<v>(value: YamlCodec<v>) -> YamlCodec<Map<String, v>> =
       ),
     decode: |v: Yaml|
       match v {
-        Mapping(entries) -> collect_entries(entries, value, map_new()),
+        Mapping(entries) -> match string_keyed(entries) {
+          Ok(named) -> decode_fields(named, value.decode),
+          Err(e) -> Err(e),
+        },
         _ -> Err(expected("a mapping", v)),
       },
   }
 
-fn collect_entries<v>(
-  entries: List<Entry>,
-  value: YamlCodec<v>,
-  acc: Map<String, v>,
-) -> Result<Map<String, v>, DecodeError> / {abort.raise} =
-  match entries {
-    [] -> Ok(acc),
-    [e, ..rest] -> match e.key {
-      String(name) -> match (value.decode)(e.value) {
-        Err(err) -> Err(in_field(name, err)),
-        Ok(v) -> collect_entries(rest, value, map_insert(acc, name, v)),
+/// The entries under their keys as strings, or the first key that is none.
+fn string_keyed(entries: List<Entry>) -> Result<List<{ key: String, value: Yaml }>, DecodeError> =
+  fold(
+    entries,
+    Ok([]),
+    |so_far: Result<List<{ key: String, value: Yaml }>, DecodeError>, e: Entry|
+      match so_far {
+        Err(_) -> so_far,
+        Ok(named) -> match e.key {
+          String(name) -> Ok(push(named, { key: name, value: e.value })),
+          other -> Err(expected("a string for a key", other)),
+        },
       },
-      other -> Err(expected("a string for a key", other)),
-    },
-  }
+  )
 
 /// The node a path leads to in a document as it is written, as far as the path is written there.
 fn node_at(node: Node, path: List<Step>) -> Node =
@@ -3071,7 +2987,7 @@ pub fn decode_bytes<a>(
       result_map_err((codec.decode)(read.value), |e: DecodeError|
         {
           path: e.path,
-          place: Some(place_of(src, start_of(node_at(read.node, e.path)))),
+          place: Some(place_at(src, start_of(node_at(read.node, e.path)))),
           message: e.message,
         }),
   }
@@ -3147,15 +3063,18 @@ fn hex_code(code: Int) -> String = {
   digit(code / 4096 % 16) ++ digit(code / 256 % 16) ++ digit(code / 16 % 16) ++ digit(code % 16)
 }
 
-/// Where the byte at `offset` of `src` stands: what places an event of `events`.
-pub fn place_at(src: Bytes, offset: Int) -> Place = place_of(src, offset)
-
 // --- Documents --------------------------------------------------------------
 
 /// A stream's one document as it was written: its bytes, where each node stands in them, the
 /// value they mean, and the limits and options it was read under, which its edits are held to
 /// as well.
-pub type Document = new { source: Bytes, value: Yaml, node: Node, limits: Limits, options: Options }
+pub opaque type Document = new {
+  source: Bytes,
+  value: Yaml,
+  node: Node,
+  limits: Limits,
+  options: Options,
+}
 
 /// The document `src` is, raising `yaml.refused` where `parse_document` answers `Err`.
 pub fn document(
@@ -3207,7 +3126,7 @@ fn found(node: Node, path: List<Step>, flow: Bool) -> Option<Found> =
 /// as one into what an alias or a merge key brings.
 pub fn place(d: Document, path: List<Step>) -> Option<Place> =
   match found(d.node, path, false) {
-    Some(f) -> Some(place_of(d.source, start_of(f.node))),
+    Some(f) -> Some(place_at(d.source, start_of(f.node))),
     None -> None,
   }
 
@@ -3225,9 +3144,6 @@ fn content_end(node: Node) -> Int =
       }
     },
   }
-
-fn spliced(src: Bytes, from: Int, to: Int, text: Bytes) -> Bytes / {abort.raise} =
-  bytes_concat_all([bytes_slice(src, 0, from), text, bytes_slice(src, to, bytes_len(src))])
 
 /// `to` moved back over the blanks and line breaks before it.
 fn back_space(src: Bytes, to: Int) -> Int / {abort.raise} =
@@ -3480,120 +3396,175 @@ pub fn decode_document<a>(
   result_map_err((codec.decode)(d.value), |e: DecodeError|
     {
       path: e.path,
-      place: Some(place_of(d.source, start_of(node_at(d.node, e.path)))),
+      place: Some(place_at(d.source, start_of(node_at(d.node, e.path)))),
       message: e.message,
     })
 
 // --- Laws -------------------------------------------------------------------
 
-/// What a law draws a value from: a `Yaml` drawn as its constructors could hold a key twice or a
-/// tag over what no reader reads under one, and the makers hold none.
-type Seed =
-  | SNull
-  | SBoolean(Bool)
-  | SInteger(Int)
-  | SFloat(Float)
-  | SString(String)
-  | SSequence(List<Seed>)
-  | SMapping(List<Sown>)
-  | STagged(String, Seed)
+gen for Yaml by yamls
 
-type Sown = { key: Seed, value: Seed }
+/// What a sampled claim draws a value from: every kind of value, nested three deep, a mapping
+/// through `mapping` and a tagged value through `tagged`, so each is one a reader answers.
+fn yamls() -> Gen<Yaml> = nested(3)
 
-fn grown(s: Seed) -> Yaml =
-  match s {
-    SNull -> Null,
-    SBoolean(b) -> Boolean(b),
-    SInteger(n) -> Integer(n),
-    SFloat(f) -> Float(f),
-    SString(text) -> String(text),
-    SSequence(items) -> Sequence(map(items, grown)),
-    SMapping(fields) -> grown_mapping(fields),
-    STagged(tag, held) -> tagged(tag, grown(held)),
+fn nested(depth: Int) -> Gen<Yaml> =
+  if depth <= 0 { scalars() } else {
+    gen::one_of([
+      scalars(),
+      gen::map(gen::list_of(nested(depth - 1), 3), |items: List<Yaml>| Sequence(items)),
+      gen::map(gen::list_of(pairs(depth - 1), 3), mapping),
+      gen::map2(gen::elements(drawn_tags()), nested(depth - 1), tagged),
+    ])
   }
 
-fn grown_mapping(fields: List<Sown>) -> Yaml =
-  mapping(map(fields, |f: Sown| { key: grown(f.key), value: grown(f.value) }))
+fn pairs(depth: Int) -> Gen<Entry> =
+  gen::map2(nested(depth), nested(depth), |key: Yaml, value: Yaml| { key: key, value: value })
 
-/// Every tag a value holds.
-fn tags_of(v: Yaml) -> List<String> =
-  match v {
-    Tagged(tag, held) -> push(tags_of(held), tag),
-    Sequence(items) -> flat_map(items, tags_of),
-    Mapping(entries) -> flat_map(entries, |e: Entry| concat(tags_of(e.key), tags_of(e.value))),
-    _ -> [],
-  }
+fn scalars() -> Gen<Yaml> =
+  gen::one_of([
+    gen::constant(Null),
+    gen::map(gen::bool(), |flag: Bool| Boolean(flag)),
+    gen::map(gen::int(), |n: Int| Integer(n)),
+    gen::map(gen::int(), |bits: Int| Float(float_of_bits(bits))),
+    gen::map(gen::list_of(gen::elements(pieces()), 4), |parts: List<String>|
+      String(join(parts, ""))),
+  ])
 
-/// More than a value a law draws reaches.
+/// What a drawn string is joined of: what a writer has to choose a style for.
+fn pieces() -> List<String> =
+  [
+    "a",
+    "key",
+    " ",
+    "\n",
+    "\t",
+    ": ",
+    " #",
+    "-",
+    ":",
+    ",",
+    "[",
+    "]",
+    "{",
+    "}",
+    "'",
+    "\"",
+    "\\",
+    "#",
+    "&",
+    "*",
+    "!",
+    "|",
+    ">",
+    "%",
+    "@",
+    "`",
+    "~",
+    "null",
+    "true",
+    "no",
+    "0",
+    "12",
+    "1.5",
+    "0x1F",
+    ".inf",
+    "---",
+    "...",
+    "<<",
+    "=",
+    "2001-12-14",
+    "é",
+    "\u{a0}",
+    "\u{85}",
+    "\u{2028}",
+    "\u{feff}",
+    "\u{7f}",
+    "\u{9f}",
+    "\u{ffff}",
+    "\u{1F600}",
+    "\r",
+    "\0",
+    "\u{1b}",
+    "?",
+  ]
+
+/// The tags a drawn value carries: a local one, one of YAML 1.1's, a URI, one that needs
+/// escapes, one with two marks, and three that say nothing and leave the value as it is.
+fn drawn_tags() -> List<String> =
+  [
+    "!a",
+    "tag:yaml.org,2002:binary",
+    "tag:example.com,2000:app/x",
+    "a b%é",
+    "!a!b",
+    "tag:yaml.org,2002:int",
+    "!",
+    "",
+  ]
+
+/// More than a value a law draws reaches, with every tag one is drawn under kept.
 fn wide() -> Limits =
   { bytes: 1073741824, depth: 512, nodes: 1073741824, scalar: 1073741824, documents: 1073741824 }
 
-fn keeping(v: Yaml) -> Options = { merge_keys: false, keep_tags: tags_of(v) }
+fn keeping() -> Options = { merge_keys: false, keep_tags: drawn_tags() }
 
 law "a value reads back from the document written of it" =
-  agrees(|s: Seed| parse(to_bytes(grown(s)), wide(), keeping(grown(s))), |s: Seed| Ok(grown(s)))
+  round_trip(to_bytes, |text: Bytes| result_ok(parse(text, wide(), keeping())))
 
 law "a value reads back from its flow text" =
-  agrees(|s: Seed| parse_string(inline(grown(s)), wide(), keeping(grown(s))), |s: Seed|
-    Ok(grown(s)))
+  round_trip(inline, |text: String| result_ok(parse_string(text, wide(), keeping())))
 
 law "a value reads back as the value of a key and as an entry of a sequence" =
-  agrees(
-    |s: Seed|
-      parse(
-        to_bytes(Mapping([entry("at", Sequence([grown(s)])), entry("after", Null)])),
-        wide(),
-        keeping(grown(s)),
-      ),
-    |s: Seed| Ok(Mapping([entry("at", Sequence([grown(s)])), entry("after", Null)])),
+  round_trip(
+    |v: Yaml| to_bytes(Mapping([entry("at", Sequence([v])), entry("after", Null)])),
+    |text: Bytes|
+      option_and_then(result_ok(parse(text, wide(), keeping())), |read: Yaml|
+        at(read, [Key("at"), Index(0)])),
   )
 
 law "the documents of a stream read back from what is written of them" =
-  agrees(
-    |seeds: List<Seed>|
-      parse_all(stream_to_bytes(map(seeds, grown)), wide(), keeping(Sequence(map(seeds, grown)))),
-    |seeds: List<Seed>| Ok(map(seeds, grown)),
-  )
+  round_trip(stream_to_bytes, |text: Bytes| result_ok(parse_all(text, wide(), keeping())))
 
-law "a mapping is the same mapping whatever the order of its keys" =
-  agrees(
-    |fields: List<Sown>|
-      match grown_mapping(fields) { Mapping(entries) -> Mapping(reverse(entries)), other -> other },
-    grown_mapping,
-  )
+law "a mapping is the same mapping whatever the order of its keys"
+  forall (entries: List<Entry>) {
+    match mapping(entries) {
+      Mapping(held) -> Mapping(reverse(held)) == mapping(entries),
+      _ -> false,
+    }
+  }
 
 law "a value put at a key is at it, and is gone without it"
-  forall (fields: List<Sown>, name: String, s: Seed) {
-    let before = grown_mapping(fields);
-    match put(before, [Key(name)], grown(s)) {
+  forall (entries: List<Entry>, name: String, v: Yaml) {
+    let before = mapping(entries);
+    match put(before, [Key(name)], v) {
       Some(after) ->
-        at(after, [Key(name)]) == Some(grown(s))
+        at(after, [Key(name)]) == Some(v)
           && without(after, [Key(name)]) == without(before, [Key(name)]),
       None -> false,
     }
   }
 
 law "a document keeps the bytes it was read from, and means what a reader reads of them"
-  forall (s: Seed) {
-    let text = to_bytes(grown(s));
-    match parse_document(text, wide(), keeping(grown(s))) {
-      Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, wide(), keeping(grown(s))),
+  forall (v: Yaml) {
+    let text = to_bytes(v);
+    match parse_document(text, wide(), keeping()) {
+      Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, wide(), keeping()),
       Err(_) -> false,
     }
   }
 
 law "a key set in a document is set in its value, and removed from both"
-  forall (fields: List<Sown>, name: String, s: Seed) {
-    let before = grown_mapping(fields);
-    let options = keeping(Sequence([before, grown(s)]));
+  forall (entries: List<Entry>, name: String, v: Yaml) {
+    let before = mapping(entries);
     let path = [Key(name)];
-    match parse_document(to_bytes(before), wide(), options) {
+    match parse_document(to_bytes(before), wide(), keeping()) {
       Err(_) -> false,
-      Ok(d) -> match try { set(d, path, grown(s)) } {
+      Ok(d) -> match try { set(d, path, v) } {
         Err(_) -> false,
         Ok(changed) -> {
           let taken = try { value(remove(changed, path)) };
-          Some(value(changed)) == put(before, path, grown(s)) && taken == Ok(without(before, path))
+          Some(value(changed)) == put(before, path, v) && taken == Ok(without(before, path))
         },
       },
     }
@@ -4880,7 +4851,9 @@ test "a decode error says the path of keys and the line and column it is written
   );
   assert_eq(
     failed("- name: web\n  port: 80\n  tags: []\n  wieght: 1\n"),
-    Err("line 4, column 11: [0].wieght: the key wieght is not one of name, port, tags, weight"),
+    Err(
+      "line 4, column 11: [0].wieght: this key is not one of name, port, tags, weight; did you mean weight?",
+    ),
   );
   assert_eq(
     failed("- name: no\n  port: 80\n  tags: []\n- name: 12\n  port: 80\n  tags: []\n"),

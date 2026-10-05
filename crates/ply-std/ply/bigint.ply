@@ -13,6 +13,10 @@
 //! `numeric(a)`, as `std.math.sum`, takes a `BigInt`. Division is no operator: it truncates toward
 //! zero, and a zero divisor is `None` rather than a raise.
 
+import std.bytes (strip_leading_zeros, u64_be)
+import std.gen
+import std.gen (Gen)
+import std.laws (inverse, monoid, round_trip, total_order)
 import std.list (all, drop, reverse, take, at, at_or)
 import std.math
 
@@ -23,6 +27,17 @@ pub type BigInt = | BigInt(Bool, List<Int>)
 key for BigInt by order_key
 
 numeric for BigInt by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }
+
+gen for BigInt by arbitrary
+
+/// A number of either sign and of up to four limbs, fewer at a small size, in its one
+/// representation.
+pub fn arbitrary() -> Gen<BigInt> =
+  gen::map2(
+    gen::bool(),
+    gen::list_of(gen::below(word_base()), 4),
+    |negative: Bool, limbs: List<Int>| make(negative, limbs),
+  )
 
 derive eq for BigInt
 derive ord for BigInt
@@ -132,6 +147,33 @@ pub fn literal(text: String) -> Result<BigInt, { message: String, offset: Int }>
     },
   }
 
+/// The number big-endian octets spell, which is never negative; no octets spell zero.
+pub fn of_bytes(octets: Bytes) -> BigInt / {abort.raise} =
+  fold(range(0, (bytes_len(octets) + 6) / 7), zero(), |acc: BigInt, chunk: Int| {
+    let to = min(chunk * 7 + 7, bytes_len(octets));
+    add(
+      shift_left(acc, 8 * (to - chunk * 7)),
+      of_int(fold(range(chunk * 7, to), 0, |n: Int, i: Int| n << 8 | bytes_at(octets, i))),
+    )
+  })
+
+/// The big-endian octets of the number's distance from zero, with no leading zero octet: none for
+/// zero.
+pub fn to_bytes(value: BigInt) -> Bytes / {abort.raise} =
+  strip_leading_zeros(bytes_concat_all(reverse(sevens(abs_value(value), [], 9223372036854775807))))
+
+/// The number seven octets at a time, least significant first. `left` is only what the recursion
+/// descends by: a number in memory has fewer chunks than an `Int` counts.
+fn sevens(n: BigInt, acc: List<Bytes>, left: Int) -> List<Bytes> / {abort.raise} =
+  if is_zero(n) || left <= 0 { acc } else {
+    let rest = shift_right(n, 56);
+    let low = match to_int(sub(n, shift_left(rest, 56))) {
+      Some(v) -> v,
+      None -> panic("fifty-six bits are an Int"),
+    };
+    sevens(rest, push(acc, bytes_slice(u64_be(low), 1, 8)), left - 1)
+  }
+
 /// The order of the numbers, by sign first and then by magnitude.
 pub fn compare(a: BigInt, b: BigInt) -> Ordering =
   if is_negative(a) != is_negative(b) { if is_negative(a) { Less } else { Greater } } else {
@@ -202,13 +244,16 @@ pub fn mod_pow(base: BigInt, exponent: Int, modulus: BigInt) -> Option<BigInt> /
 pub fn gcd(a: BigInt, b: BigInt) -> BigInt / {abort.raise} =
   gcd_from(abs_value(a), abs_value(b), 2 * bits_above(limbs_in(b)) + 2)
 
+/// How many bits the value's distance from zero is written in: none for zero.
+pub fn bit_length(value: BigInt) -> Int = bits_above(limbs_in(value))
+
 /// The value shifted left by `bits`; a non-positive count is the value itself.
-pub fn shift_left(value: BigInt, bits: Int) -> BigInt / {abort.raise} =
+pub fn shift_left(value: BigInt, bits: Int) -> BigInt =
   if bits <= 0 || is_zero(value) { value }
   else { make(is_negative(value), shift_limbs(limbs_in(value), bits)) }
 
 /// The value shifted right by `bits`, truncating toward zero like the division it is.
-pub fn shift_right(value: BigInt, bits: Int) -> BigInt / {abort.raise} =
+pub fn shift_right(value: BigInt, bits: Int) -> BigInt =
   if bits <= 0 { value } else { make(is_negative(value), unshift_limbs(limbs_in(value), bits)) }
 
 // --- The magnitude ----------------------------------------------------------
@@ -394,9 +439,10 @@ fn shift_one_from(
     shift_one_from(limbs, i + 1, doubled / word_base(), push(out, doubled % word_base()))
   }
 
-fn shift_limbs(limbs: List<Int>, bits: Int) -> List<Int> / {abort.raise} = {
-  let whole = bits / word_bits();
-  let part = bits % word_bits();
+/// The divisors are the limb's width written out, so no shift carries a raise in its row.
+fn shift_limbs(limbs: List<Int>, bits: Int) -> List<Int> = {
+  let whole = bits / 30;
+  let part = bits % 30;
   pad_low(whole, shift_part(limbs, part))
 }
 
@@ -423,9 +469,9 @@ fn shift_part_from(limbs: List<Int>, part: Int, i: Int, carry: Int, out: List<In
     )
   }
 
-fn unshift_limbs(limbs: List<Int>, bits: Int) -> List<Int> / {abort.raise} = {
-  let whole = bits / word_bits();
-  let part = bits % word_bits();
+fn unshift_limbs(limbs: List<Int>, bits: Int) -> List<Int> = {
+  let whole = bits / 30;
+  let part = bits % 30;
   unshift_part(drop(limbs, whole), part)
 }
 
@@ -518,6 +564,29 @@ fn divide_small_from(
   }
 
 // --- Tests ------------------------------------------------------------------
+
+law "a number's decimal spelling reads back as it" = round_trip(to_string, of_string)
+
+law "addition is a monoid over zero" = monoid(add, zero())
+
+law "multiplication is a monoid over one" = monoid(mul, one())
+
+law "negating twice is the number" = inverse(neg, neg)
+
+law "compare orders the numbers" = total_order(compare)
+
+law "a quotient and a remainder make the dividend, and the remainder is the smaller"
+  forall (a: BigInt, b: BigInt) where !is_zero(b) {
+    match div_mod(a, b) {
+      Some(split) -> split.q * b + split.r == a && less_than(abs_value(split.r), abs_value(b)),
+      None -> false,
+    }
+  }
+
+law "a product distributes over a sum"
+  forall (a: BigInt, b: BigInt, c: BigInt) {
+    a * (b + c) == a * b + a * c
+  }
 
 /// A factorial written with this module, which is how a value past `i64` is built without a literal
 /// for it.
@@ -688,6 +757,11 @@ test "shifts and bit lengths agree with powers of two" {
   assert_eq(shift_right(of_int(5), 1), of_int(2));
   assert_eq(shift_right(of_int(0 - 5), 1), of_int(0 - 2));
   assert_eq(shift_left(of_int(0), 100), zero());
+  assert_eq(
+    map([0, 1, 0 - 1, 255, 256, 1073741823, 1073741824], |n: Int| bit_length(of_int(n))),
+    [0, 1, 1, 8, 9, 30, 31],
+  );
+  assert_eq(bit_length(shift_left(of_int(0 - 5), 200)), 203);
   // Every shift of a power of two is the power again.
   assert(all(range(0, 64), |k: Int| shift_right(shift_left(of_int(1), k), k) == of_int(1)))
 }
@@ -716,3 +790,27 @@ test "a BigInt keys a map in the numbers' order, and the language's order is com
   assert_eq(digest(of_int(3) + of_int(4)), digest(of_int(7)));
   assert_eq(big_int_hash().hash(of_int(7)), digest(of_int(7)))
 }
+
+test "big-endian octets spell a magnitude, and a magnitude its fewest octets" {
+  assert_eq(of_bytes(b""), zero());
+  assert_eq(of_bytes(b"\x00\x00"), zero());
+  assert_eq(of_bytes(b"\x01\x00"), of_int(256));
+  assert_eq(to_string(of_bytes(b"\x01\x00\x00\x00\x00\x00\x00\x00\x00")), "18446744073709551616");
+  assert_eq(to_bytes(zero()), b"");
+  assert_eq(to_bytes(of_int(255)), b"\xff");
+  assert_eq(to_bytes(of_int(0 - 256)), b"\x01\x00");
+  assert_eq(
+    to_bytes(option_at(of_string("18446744073709551616"), "a decimal spelling")),
+    b"\x01\x00\x00\x00\x00\x00\x00\x00\x00",
+  )
+}
+
+law "a magnitude's octets spell it again"
+  forall (octets: Bytes) {
+    to_bytes(of_bytes(octets)) == strip_leading_zeros(octets)
+  }
+
+law "an Int's distance from zero reads back from its octets"
+  forall (n: Int) {
+    of_bytes(to_bytes(of_int(n))) == abs_value(of_int(n))
+  }

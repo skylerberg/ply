@@ -41,6 +41,10 @@ fn capped(n: Int) -> Int
 
 fn summed(n: Int) -> Int = fold(range(0, n), 0, |a: Int, x: Int| a + x)
 
+fn quotient(n: Int) -> Int / {abort.raise} = 12 / n
+
+law "a quotient of one is the whole" { quotient(1) == 12 }
+
 law "summing is linear" forall (n: Int) where n > 1 cost n { summed(n) }
 "#;
 
@@ -106,6 +110,7 @@ fn shown(judgements: &[Judgement]) -> Vec<String> {
             Judgement::Faulted(d) => format!("faulted {}", d.code),
             Judgement::Measured { bound, .. } => format!("measured at {bound}"),
             Judgement::Spent { limit } => format!("spent past {limit}"),
+            Judgement::Drew(value) => format!("drew {value:?}"),
         })
         .collect()
 }
@@ -232,6 +237,39 @@ fn an_ensures_calls_its_owner_for_the_result_it_states() {
     assert_eq!(
         shown(&judged(&capped(1), &ints(&[5, 11, 3]), Mode::Whole)),
         ["held", "failed"]
+    );
+}
+
+/// A draw is whatever its point names, entered at the arguments after the name. Its raise is the
+/// program's and ends nothing, since the next point is another draw.
+#[test]
+fn a_draw_enters_the_definition_its_point_names_and_answers_what_it_answered() {
+    let named = |name: &str, n: i64| vec![Value::str(name), Value::Int(n)];
+    let judgements = judged(
+        &over_an_int("m.doubling is tripling", 0),
+        &[
+            named("m.summed", 4),
+            named("m.quotient", 0),
+            named("m.quotient", 3),
+        ],
+        Mode::Drawn,
+    );
+    assert_eq!(
+        shown(&judgements),
+        [
+            "drew Int(6)".to_string(),
+            format!("raised {}", codes::RUNTIME_ERROR),
+            "drew Int(4)".to_string(),
+        ]
+    );
+    let unnamed = judged(
+        &over_an_int("m.doubling is tripling", 0),
+        &ints(&[4]),
+        Mode::Drawn,
+    );
+    assert_eq!(
+        shown(&unnamed),
+        [format!("faulted {}", codes::INTERNAL_ERROR)]
     );
 }
 

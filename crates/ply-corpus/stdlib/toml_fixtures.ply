@@ -1,0 +1,157 @@
+//! `std.toml` against `toml-test`, the suite TOML's implementations share: the cases its list for
+//! TOML 1.0.0 names, as they stood at commit `ff49d109861c1ad25af53f687f2aef19ab650600` of
+//! `github.com/toml-lang/toml-test`, with its licence beside them. A valid case is a document and
+//! the JSON that says what it means, each value tagged with its type; an invalid one is a document
+//! a reader must refuse. A shipped module embeds no file, so the tests that read files stand here.
+
+import std.bytes
+import std.date
+import std.float (infinity, nan, neg_infinity)
+import std.json
+import std.json (Json)
+import std.place
+import std.string (strip_suffix)
+import std.toml
+import std.toml (Limits, Toml)
+
+type File = { name: String, bytes: Bytes }
+
+type Valid = { name: String, toml: Bytes, json: Bytes }
+
+fn files() -> List<File> = embed_dir("toml")
+
+fn limits() -> Limits = { bytes: 65536, depth: 32 }
+
+fn valid() -> List<Valid> / {abort.raise} = {
+  let by_name = map_of_entries(map(files(), |f: File| { key: f.name, value: f.bytes }));
+  fold(files(), [], |acc: List<Valid>, f: File|
+    if string_starts_with(f.name, "valid/") && string_ends_with(f.name, ".toml") {
+      match map_get(by_name, strip_suffix(f.name, ".toml") ++ ".json") {
+        Some(json) -> push(acc, { name: f.name, toml: f.bytes, json: json }),
+        None -> panic(f"{f.name} has no .json beside it"),
+      }
+    } else { acc })
+}
+
+fn invalid() -> List<File> = filter(files(), |f: File| string_starts_with(f.name, "invalid/"))
+
+fn documents() -> List<File> = filter(files(), |f: File| string_ends_with(f.name, ".toml"))
+
+/// What is wrong with how the reader took `text`, if anything: a failure of its own answered as
+/// a refusal, a refusal placed outside the text, or a value that does not write back.
+fn mistaken(text: Bytes) -> Option<String> =
+  match toml::parse(text, limits()) {
+    Err(e) -> match e.why {
+      toml::Defect(said) -> Some(said),
+      _ -> if e.line < 1 || e.column < 1 || e.offset < 0 || e.offset > bytes_len(text) {
+        Some("a refusal placed outside the text")
+      } else { None },
+    },
+    Ok(v) -> if toml::parse(toml::to_bytes(v), limits()) == Ok(v) { None }
+    else { Some("a value that does not read back from what is written of it") },
+  }
+
+/// The value the suite's JSON says a document means: an object of a `type` and a `value`, both
+/// strings, is a value of that type, and any other object is a table.
+fn meant(j: Json) -> Toml / {abort.raise} =
+  match j {
+    json::Object(members) -> match tagged(members) {
+      Some(value) -> value,
+      None ->
+        toml::Table(
+          map(map_entries(members), |m: { key: String, value: Json }|
+            { key: m.key, value: meant(m.value) }),
+        ),
+    },
+    json::Array(items) -> toml::Array(map(items, meant)),
+    _ -> panic("the suite's JSON is objects, arrays and tagged strings"),
+  }
+
+fn tagged(members: Map<String, Json>) -> Option<Toml> / {abort.raise} =
+  if map_len(members) != 2 { None } else {
+    match map_get(members, "type") {
+      Some(json::Str(kind)) -> match map_get(members, "value") {
+        Some(json::Str(text)) -> Some(scalar(kind, text)),
+        _ -> None,
+      },
+      _ -> None,
+    }
+  }
+
+fn held<a, e>(read: Result<a, e>, text: String) -> a / {abort.raise} =
+  match read { Ok(v) -> v, Err(_) -> panic("the suite's JSON holds " ++ text) }
+
+fn scalar(kind: String, text: String) -> Toml / {abort.raise} =
+  if kind == "string" { toml::String(text) } else if kind == "integer" {
+    match bytes::int_of_ascii(bytes_of_string(text)) {
+      Some(n) -> toml::Integer(n),
+      None -> panic("the suite's JSON holds the integer " ++ text),
+    }
+  } else if kind == "float" {
+    toml::Float(if text == "nan" { nan() }
+    else if text == "inf" { infinity() }
+    else if text == "-inf" { neg_infinity() } else {
+      match float_of_string(text) {
+        Some(f) -> f,
+        None -> panic("the suite's JSON holds the float " ++ text),
+      }
+    })
+  } else if kind == "bool" { toml::Boolean(text == "true") }
+  else if kind == "datetime" { toml::OffsetDateTime(held(date::rfc3339_literal(text), text)) }
+  else if kind == "datetime-local" {
+    toml::LocalDateTime(held(date::date_time_literal(text), text))
+  } else if kind == "date-local" { toml::LocalDate(held(date::literal(text), text)) }
+  else if kind == "time-local" { toml::LocalTime(held(date::time_literal(text), text)) }
+  else { panic("the suite's JSON has no type " ++ kind) }
+
+test "{c.name} means what the suite says" for c: Valid in valid() {
+  let wanted = match json::parse(c.json) {
+    Ok(j) -> meant(j),
+    Err(e) -> panic(json::error_to_string(e)),
+  };
+  assert_eq(toml::parse(c.toml, limits()), Ok(wanted))
+}
+
+test "{c.name} is refused" for c: File in invalid() {
+  assert(match toml::parse(c.bytes, limits()) { Ok(_) -> false, Err(_) -> true })
+}
+
+test "{c.name} cut short is read, or refused for a reason" for c: File in documents() {
+  let n = bytes_len(c.bytes);
+  // At most 256 cuts: a run that answers a thousand refusals runs out of call depth.
+  let stride = n / 256 + 1;
+  assert_eq(
+    fold(range(0, n / stride + 1), [], |faults: List<String>, k: Int|
+      match mistaken(bytes_slice(c.bytes, 0, k * stride)) {
+        Some(said) -> push(faults, f"cut at {k * stride}: {said}"),
+        None -> faults,
+      }),
+    [],
+  )
+}
+
+test "{c.name} reads back from what is written of it" for c: Valid in valid() {
+  let read = toml::parse(c.toml, limits());
+  assert_eq(
+    match read { Ok(v) -> toml::parse(toml::to_bytes(v), limits()), Err(e) -> Err(e) },
+    read,
+  )
+}
+
+test "{c.name} keeps its bytes as a document, and a key set in it" for c: Valid in valid() {
+  let path = [place::Key("a key no case holds")];
+  match toml::parse_document(c.toml, limits()) {
+    Err(e) -> panic(toml::refusal_to_string(e)),
+    Ok(d) -> {
+      assert_eq(toml::source(d), c.toml);
+      assert_eq(Ok(toml::value(d)), toml::parse(c.toml, limits()));
+      match try { toml::set(d, path, toml::Integer(7)) } {
+        Err(e) -> panic(toml::refusal_to_string(e)),
+        Ok(added) -> {
+          assert_eq(toml::at(toml::value(added), path), Some(toml::Integer(7)));
+          assert_eq(try { toml::value(toml::remove(added, path)) }, Ok(toml::value(d)))
+        },
+      }
+    },
+  }
+}
