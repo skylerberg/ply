@@ -3464,6 +3464,45 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     w
 }
 
+/// The value a unit holds as `len` bytes of text at `text`: what a build kept of a `const`
+/// definition, read into the unit's own heap, so the entry that reads it is charged nothing.
+pub unsafe extern "C" fn rt_baked(ctx: *mut Ctx, text: i64, len: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let tables = Arc::clone(&c.tables);
+    let text = unsafe { std::slice::from_raw_parts(text as *const u8, len as usize) };
+    let read = crate::stored::read(
+        &tables.layouts,
+        &tables.nullaries,
+        &mut lock(&tables.immortals),
+        text,
+    );
+    match read {
+        Ok(w) => w,
+        Err(why) => c.fail(
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the value a build kept of a `const` definition does not read: {why}"),
+            )
+            .primary(Span::DUMMY, "in compiled code")
+            .note("this is Ply's fault: a unit holds only values this runtime wrote"),
+        ),
+    }
+}
+
+/// `w` as the text [`rt_baked`] reads back, a `Bytes`. Reads `w`.
+pub unsafe extern "C" fn rt_stored(ctx: *mut Ctx, w: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let tables = Arc::clone(&c.tables);
+    match crate::stored::text(&tables.layouts, w) {
+        Ok(text) if u32::try_from(text.len()).is_ok() => c.heap.bytes(&text),
+        Ok(text) => c.fail(error(format!(
+            "a value of {} stored bytes has no stored form",
+            text.len()
+        ))),
+        Err(what) => c.fail(error(format!("{what} has no stored form"))),
+    }
+}
+
 /// A call through a value. Takes the callee and the arguments.
 pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n: i64) -> i64 {
     let args = args_of(args, n);
