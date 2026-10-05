@@ -8,6 +8,7 @@
 import std.bytes (int_of_ascii, is_digit)
 import std.net (net, send_all)
 import std.list (contains)
+import std.string (ascii_lower, eq_ignore_ascii_case)
 
 // --- The message ------------------------------------------------------------
 
@@ -533,7 +534,7 @@ fn named_field(content: Bytes, colon: Int, n: Int) -> Result<Field, Refusal> / {
     // `Foo : bar` is read as `Foo` by one implementation and dropped by another.
     Err({ status: 400, reason: "whitespace between a field name and its colon" })
   } else if !is_token(raw) { Err({ status: 400, reason: "a field name must be a token" }) }
-  else { field_value(string_lower(string_of_bytes(raw)), trim_ows(content, colon + 1, n)) }
+  else { field_value(ascii_lower(string_of_bytes(raw)), trim_ows(content, colon + 1, n)) }
 }
 
 fn field_value(name: String, value: Bytes) -> Result<Field, Refusal> / {abort.raise} =
@@ -575,17 +576,17 @@ pub fn has_header(headers: Headers, name: String) -> Bool = map_contains(headers
 
 /// `headers` with every line under `name` replaced by `value`; the name is lowercased.
 pub fn set_header(headers: Headers, name: String, value: String) -> Headers =
-  map_insert(headers, string_lower(name), [value])
+  map_insert(headers, ascii_lower(name), [value])
 
 /// `headers` with `value` appended under `name`, keeping the lines already there.
 pub fn add_header(headers: Headers, name: String, value: String) -> Headers =
-  add_field(headers, string_lower(name), value)
+  add_field(headers, ascii_lower(name), value)
 
 /// A comma-separated list field, split, trimmed and lowercased.
 fn list_field(headers: Headers, name: String) -> List<String> / {abort.raise} =
   fold(header_lines(headers, name), [], |acc: List<String>, line: String|
     fold(string_split(line, ","), acc, |inner: List<String>, part: String|
-      push(inner, string_lower(string_trim(part)))))
+      push(inner, ascii_lower(string_trim(part)))))
 
 // --- Host -------------------------------------------------------------------
 
@@ -663,10 +664,9 @@ fn too_long(limits: Limits) -> Refusal =
 /// A client waiting for a `100` it never gets hangs, so any other expectation is 417.
 fn expect_of(headers: Headers) -> Result<Bool, Refusal> = {
   let lines = header_lines(headers, "expect");
+  let continues = eq_ignore_ascii_case(string_trim(first_string(lines)), "100-continue");
   if len(lines) == 0 { Ok(false) }
-  else if len(lines) == 1 && string_lower(string_trim(first_string(lines))) == "100-continue" {
-    Ok(true)
-  } else {
+  else if len(lines) == 1 && continues { Ok(true) } else {
     Err({ status: 417, reason: "the only `Expect` this server implements is `100-continue`" })
   }
 }
@@ -1002,7 +1002,7 @@ fn header_bytes(name: String, value: String) -> Bytes / {abort.raise} = {
 }
 
 fn reserved_field(name: String) -> Bool = {
-  let lower = string_lower(name);
+  let lower = ascii_lower(name);
   lower == "content-length" || lower == "transfer-encoding" || lower == "connection"
 }
 
@@ -2062,7 +2062,9 @@ test "chunked must be the final transfer coding and may be applied once" {
     400,
   );
   // Case and whitespace are not a way past it.
-  assert_eq(parsed(post(b"Transfer-Encoding:  ChUnKeD \r\n", b"0\r\n\r\n")).framing, Chunked)
+  assert_eq(parsed(post(b"Transfer-Encoding:  ChUnKeD \r\n", b"0\r\n\r\n")).framing, Chunked);
+  // The Kelvin sign is `k` in Unicode's lower case, and is no letter of `chunked`.
+  assert_eq(head_status(post(b"Transfer-Encoding: chun\xe2\x84\xaaed\r\n", b"0\r\n\r\n")), 501)
 }
 
 // `Content-Encoding` is end to end and is not a transfer coding.
@@ -2251,7 +2253,9 @@ test "keep-alive is the version's default unless Connection says otherwise" {
   assert(!parsed(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Close\r\n\r\n").keep_alive);
   assert(!parsed(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n").keep_alive);
   assert(!parsed(b"GET / HTTP/1.0\r\n\r\n").keep_alive);
-  assert(parsed(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").keep_alive)
+  assert(parsed(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").keep_alive);
+  assert(parsed(b"GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n").keep_alive);
+  assert(!parsed(b"GET / HTTP/1.0\r\nConnection: \xe2\x84\xaaeep-alive\r\n\r\n").keep_alive)
 }
 
 // --- Tests: header representation -------------------------------------------
@@ -2263,7 +2267,12 @@ test "a repeated field keeps every line in order and combines nothing" {
   // Names are lowercased on parse, so a lookup cannot depend on what the peer capitalised.
   assert(has_header(h.request.headers, "set-cookie"));
   assert(!has_header(h.request.headers, "Set-Cookie"));
-  assert_eq(header_lines(h.request.headers, "absent"), [])
+  assert_eq(header_lines(h.request.headers, "absent"), []);
+  // Only `A-Z` are folded: a name spelled with the Kelvin sign is not the one spelled with `k`.
+  let set = add_header(set_header(empty_headers(), "Set-Cookie", "a=1"), "Coo\u{212A}ie", "b=2");
+  assert_eq(header_lines(set, "set-cookie"), ["a=1"]);
+  assert(!has_header(set, "cookie"));
+  assert(has_header(set, "coo\u{212A}ie"))
 }
 
 test "a field value that is not text is refused rather than decoded lossily" {
@@ -2317,8 +2326,8 @@ fn reference_length(raw: Bytes) -> Int / {abort.raise} = {
 
 fn values_of(lines: List<String>, prefix: String) -> List<String> / {abort.raise} =
   fold(lines, [], |acc: List<String>, line: String|
-    if string_starts_with(string_lower(line), prefix) {
-      push(acc, string_lower(string_trim(string_slice(line, string_len(prefix), string_len(line)))))
+    if string_starts_with(ascii_lower(line), prefix) {
+      push(acc, ascii_lower(string_trim(string_slice(line, string_len(prefix), string_len(line)))))
     } else { acc })
 
 fn reference_int(raw: String) -> Int / {abort.raise} = {
