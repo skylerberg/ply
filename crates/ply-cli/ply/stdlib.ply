@@ -1,17 +1,17 @@
-//! `ply std` — the modules that ship with the compiler, as the shipped modules this run was bound
-//! hold them them. The digest is the binary's own fact and travels in a flag, as colour does.
+//! `ply std` — the modules that ship with the compiler and the data files they embed, as the
+//! directory this run was bound as `shipped` holds them.
 
 import builder (builder)
 import args (Flags, style_of)
 import diagnostic (all_to_json, all_to_text, errors_of, errors_text)
 import report (Answer, schema_version, ok_code, compile_error, indent, count_of)
-import sources (is_std, shipped_modules, shipped_digest_of)
+import sources (is_std, shipped_modules, shipped_data, shipped_digest_of)
 import show (source_lines)
 import doc (summary_of)
-import style (Style)
-import compiler.diagnostics (parse_all)
+import style (Style, plain)
 import compiler.hash (hex)
-import compiler.front (Analysis, Refused, Analysed, analyse, module_items)
+import compiler.front (Analysis, Refused, Analysed, ShippedData, analyse, module_items,
+                       parse_shipped, shipped_data_wanted)
 import compiler.infer (CtorInfo, TestInfo)
 import compiler.resolve (Source, ParsedModule, Diag, error_at)
 import std.fs (fs)
@@ -22,14 +22,22 @@ import std.string (join, repeat, pad_right, trim_end)
 import hosts (indented)
 import compiler.parsing (no_module)
 
-/// One shipped module: what it declares, what it tests, how big it is and the first sentence of its doc.
-pub type Row = { name: String, definitions: Int, tests: Int, bytes: Int, summary: String }
+/// A data file a shipped module embeds: the name `--show` prints it by, and its size.
+pub type Held = { name: String, bytes: Int }
+
+/// One shipped module: what it declares, what it tests, how big it is, the data files it embeds
+/// and the first sentence of its doc.
+pub type Row = {
+  name: String,
+  definitions: Int,
+  tests: Int,
+  bytes: Int,
+  data: List<Held>,
+  summary: String,
+}
 
 fn shipped() -> List<Source> / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
   filter(shipped_modules(), |src: Source| is_std(string_of_bytes_lossy(src.name)))
-
-fn std_digest() -> String / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  shipped_digest_of(shipped_modules())
 
 // --- The rows -----------------------------------------------------------------
 
@@ -46,7 +54,15 @@ fn tests_in(analysis: Analysis, name: Bytes) -> Int =
   fold(analysis.checked.tests, 0, |acc: Int, test_info: TestInfo|
     if test_info.module == name { acc + 1 } else { acc })
 
-fn row_of(analysis: Analysis, src: Source) -> Row / {abort.raise} = {
+/// The data files `src` embeds, of those the shipped modules hold.
+fn held_by(src: Source, data: List<ShippedData>) -> List<Held> / {abort.raise} =
+  fold(shipped_data_wanted(src), [], |acc: List<Held>, name: Bytes|
+    fold(data, acc, |a: List<Held>, d: ShippedData|
+      if d.name == name {
+        push(a, { name: string_of_bytes_lossy(name), bytes: bytes_len(d.bytes) })
+      } else { a }))
+
+fn row_of(analysis: Analysis, src: Source, data: List<ShippedData>) -> Row / {abort.raise} = {
   let parsed = module_named(analysis, src.name);
   let items = match parsed { Some(mo) -> len(module_items(mo)), None -> 0 };
   let ctors = ctors_in(analysis, src.name);
@@ -55,6 +71,7 @@ fn row_of(analysis: Analysis, src: Source) -> Row / {abort.raise} = {
     definitions: if items > ctors { items - ctors } else { 0 },
     tests: tests_in(analysis, src.name),
     bytes: bytes_len(src.src),
+    data: held_by(src, data),
     summary: match parsed {
       Some(mo) -> match mo.module.doc {
         Some(d) -> summary_of(map(d.lines, |l: Bytes| string_of_bytes_lossy(l))),
@@ -65,8 +82,11 @@ fn row_of(analysis: Analysis, src: Source) -> Row / {abort.raise} = {
   }
 }
 
-fn rows_of(analysis: Analysis, srcs: List<Source>) -> List<Row> / {abort.raise} =
-  map(srcs, |src: Source| row_of(analysis, src))
+fn rows_of(
+  analysis: Analysis,
+  srcs: List<Source>,
+  data: List<ShippedData>,
+) -> List<Row> / {abort.raise} = map(srcs, |src: Source| row_of(analysis, src, data))
 
 /// A shipped module the front end refuses is Ply's fault, never the user's.
 fn shipped_refused(diags: List<Diag>) -> Diag =
@@ -81,7 +101,9 @@ fn shipped_refused(diags: List<Diag>) -> Diag =
 
 // --- The listing ----------------------------------------------------------------
 
-fn headers() -> List<String> = ["MODULE", "DEFINITIONS", "TESTS", "BYTES", "SUMMARY"]
+fn headers() -> List<String> = ["MODULE", "DEFINITIONS", "TESTS", "BYTES", "DATA", "SUMMARY"]
+
+fn data_bytes(row: Row) -> Int = fold(row.data, 0, |acc: Int, held: Held| acc + held.bytes)
 
 fn cells_of(row: Row) -> List<String> =
   [
@@ -89,6 +111,7 @@ fn cells_of(row: Row) -> List<String> =
     int_to_string(row.definitions),
     int_to_string(row.tests),
     int_to_string(row.bytes),
+    int_to_string(data_bytes(row)),
     row.summary,
   ]
 
@@ -125,12 +148,23 @@ pub fn listing(rows: List<Row>, digest: String) -> List<String> / {abort.raise} 
     "",
   ];
   let body = if len(rows) == 0 { ["this build ships no stdlib module"] } else { table(rows) };
-  concat(concat(head, body), [
+  concat(concat(concat(head, body), embedded(rows)), [
     "",
-    "`import std.<name>` to use one; `ply doc std.<name>` documents it and `ply std --show <name>` prints its source",
+    "`import std.<name>` to use one; `ply doc std.<name>` documents it and `ply std --show <name>` prints its source, or a data file by its name",
     "",
     "digest: " ++ digest,
   ])
+}
+
+/// A line for each data file a module embeds, under a blank one; nothing where none embeds any.
+fn embedded(rows: List<Row>) -> List<String> / {abort.raise} = {
+  let lines = fold(rows, [], |acc: List<String>, row: Row|
+    fold(row.data, acc, |a: List<String>, held: Held|
+      push(
+        a,
+        held.name ++ " · " ++ count_of(held.bytes, "byte") ++ " · embedded by " ++ row.name,
+      )));
+  if len(lines) == 0 { [] } else { concat([""], lines) }
 }
 
 // --- The documents ----------------------------------------------------------------
@@ -141,6 +175,16 @@ fn row_json(row: Row) -> Json =
     { key: "definitions", value: Number(decimal_of_int(row.definitions)) },
     { key: "tests", value: Number(decimal_of_int(row.tests)) },
     { key: "bytes", value: Number(decimal_of_int(row.bytes)) },
+    {
+      key: "data",
+      value: Array(
+        map(row.data, |held: Held|
+          object([
+            { key: "name", value: Str(held.name) },
+            { key: "bytes", value: Number(decimal_of_int(held.bytes)) },
+          ])),
+      ),
+    },
     { key: "summary", value: Str(row.summary) },
   ])
 
@@ -178,7 +222,9 @@ fn digested(digest: String) -> Answer =
     code: ok_code(),
   }
 
-fn sourced(name: String, text: Bytes) -> Answer / {abort.raise} = {
+/// What `--show` prints of one thing the shipped modules hold: a module's source under `module`,
+/// or a data file's bytes as text under `data`.
+fn sourced(kind: String, name: String, text: Bytes) -> Answer / {abort.raise} = {
   let source = string_of_bytes_lossy(text);
   {
     json: object([
@@ -186,7 +232,7 @@ fn sourced(name: String, text: Bytes) -> Answer / {abort.raise} = {
       { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
       { key: "ok", value: Bool(true) },
       { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
-      { key: "module", value: Str(name) },
+      { key: kind, value: Str(name) },
       { key: "source", value: Str(source) },
     ]),
     lines: source_lines(source),
@@ -239,59 +285,84 @@ fn stopped(style: Style, diag: Diag) -> Answer / {abort.raise} =
 
 // --- What a run answers -------------------------------------------------------------
 
-pub fn unknown_module(query: String, names: List<String>) -> Diag =
+/// `data` names the data files the modules embed, which `--show` prints by name as it does a module.
+pub fn unknown_module(query: String, names: List<String>, data: List<String>) -> Diag = {
+  let ticked = |held: List<String>| join(map(held, |n: String| "`" ++ n ++ "`"), ", ");
+  let also = if len(data) == 0 { [] }
+  else { [bytes_of_string("and the data files its modules embed: " ++ ticked(data))] };
   error_at(
     b"E0106",
     no_module(),
     { start: 0, end: 0 },
     bytes_of_string("no module named `" ++ query ++ "` ships with this compiler"),
     b"not found",
-    [
-      bytes_of_string("the stdlib holds: " ++ join(map(names, |n: String| "`" ++ n ++ "`"), ", ")),
+    concat(concat([bytes_of_string("the stdlib holds: " ++ ticked(names))], also), [
       b"`ply std` lists them with the digest this binary was built from",
-    ],
+    ]),
   )
+}
 
-fn shown(style: Style, query: String, srcs: List<Source>) -> Answer / {abort.raise} =
-  match fold(srcs, None, |acc: Option<Source>, src: Source|
-      match acc {
-        Some(_) -> acc,
-        None -> if string_of_bytes_lossy(src.name) == query { Some(src) } else { None },
-      }) {
-    Some(src) -> sourced(query, src.src),
-    None ->
-      stopped(
-        style,
-        unknown_module(query, map(srcs, |src: Source| string_of_bytes_lossy(src.name))),
-      ),
+fn shown(
+  style: Style,
+  query: String,
+  srcs: List<Source>,
+  data: List<ShippedData>,
+) -> Answer / {abort.raise} =
+  match filter(srcs, |src: Source| string_of_bytes_lossy(src.name) == query) {
+    [src, ..] -> sourced("module", query, src.src),
+    [] -> match filter(data, |d: ShippedData| string_of_bytes_lossy(d.name) == query) {
+      [d, ..] -> sourced("data", query, d.bytes),
+      [] ->
+        stopped(
+          style,
+          unknown_module(
+            query,
+            map(srcs, |src: Source| string_of_bytes_lossy(src.name)),
+            map(data, |held: ShippedData| string_of_bytes_lossy(held.name)),
+          ),
+        ),
+    },
   }
 
-fn counted(
-  style: Style,
-  flags: Flags,
-  srcs: List<Source>,
-) -> Answer / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  match analyse(parse_all(srcs)) {
+fn counted(style: Style, srcs: List<Source>, data: List<ShippedData>) -> Answer / {abort.raise} =
+  match analyse(parse_shipped(srcs, srcs, data)) {
     Refused(ds) -> stopped(style, shipped_refused(ds)),
-    Analysed(w) -> listed(rows_of(w, srcs), std_digest()),
+    Analysed(w) -> listed(rows_of(w, srcs, data), shipped_digest_of(srcs, data)),
   }
 
 pub fn run(
   flags: Flags,
 ) -> Answer / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let s = style_of(flags);
-  if flags.digest { digested(std_digest()) }
-  else if flags.query == "*" { every_source(shipped()) }
-  else if flags.query != "" { shown(s, flags.query, shipped()) }
-  else { counted(s, flags, shipped()) }
+  let srcs = shipped();
+  if flags.query == "*" && !flags.digest { every_source(srcs) } else {
+    let data = shipped_data(srcs);
+    if flags.digest { digested(shipped_digest_of(srcs, data)) }
+    else if flags.query != "" { shown(s, flags.query, srcs, data) }
+    else { counted(s, srcs, data) }
+  }
 }
 
 // --- Tests ------------------------------------------------------------------
 
 fn two_rows() -> List<Row> =
   [
-    { name: "std.bytes", definitions: 12, tests: 4, bytes: 3100, summary: "Integers in bytes." },
-    { name: "std.json", definitions: 130, tests: 40, bytes: 29000, summary: "" },
+    {
+      name: "std.bytes",
+      definitions: 12,
+      tests: 4,
+      bytes: 3100,
+      data: [],
+      summary: "Integers in bytes.",
+    },
+    {
+      name: "std.json",
+      definitions: 130,
+      tests: 40,
+      bytes: 29000,
+      data: [{ name: "std/json/escapes.txt", bytes: 96 }, { name: "std/json/words.txt", bytes: 4 }],
+      summary: "",
+    },
   ]
 
 test "the listing opens on the tally, lays the columns out and ends on the digest" {
@@ -303,16 +374,44 @@ test "the listing opens on the tally, lays the columns out and ends on the diges
   assert_eq(match list_at(lines, 1) { Some(l) -> l, None -> "" }, "");
   assert_eq(
     match list_at(lines, 2) { Some(l) -> l, None -> "" },
-    "MODULE     DEFINITIONS  TESTS  BYTES  SUMMARY",
+    "MODULE     DEFINITIONS  TESTS  BYTES  DATA  SUMMARY",
   );
   assert_eq(
     match list_at(lines, 3) { Some(l) -> l, None -> "" },
-    "std.bytes  12           4      3100   Integers in bytes.",
+    "std.bytes  12           4      3100   0     Integers in bytes.",
+  );
+  assert_eq(
+    match list_at(lines, 4) { Some(l) -> l, None -> "" },
+    "std.json   130          40     29000  100",
   );
   assert_eq(
     match list_at(lines, len(lines) - 1) { Some(l) -> l, None -> "" },
     "digest: b3:1f2e3d4c5b6a",
   )
+}
+
+test "the listing names each data file a module embeds, and a build that embeds none names none" {
+  assert_eq(embedded(two_rows()), [
+    "",
+    "std/json/escapes.txt · 96 bytes · embedded by std.json",
+    "std/json/words.txt · 4 bytes · embedded by std.json",
+  ]);
+  assert_eq(embedded([]), [])
+}
+
+test "`--show` prints a data file by the name the listing gives it, and a module by its own" {
+  let srcs = [{ name: b"std.m", src: b"pub fn list() -> Bytes = embed(\"m/list.txt\")\n" }];
+  let data = [{ name: b"std/m/list.txt", bytes: b"one\ntwo\n" }];
+  assert_eq(shown(plain(), "std/m/list.txt", srcs, data).lines, ["one", "two"]);
+  assert_eq(shown(plain(), "std.m", srcs, data).lines, [
+    "pub fn list() -> Bytes = embed(\"m/list.txt\")",
+  ]);
+  assert_eq(shown(plain(), "std/m/gone.txt", srcs, data).code, 2);
+  let rows = match analyse(parse_shipped(srcs, srcs, data)) {
+    Analysed(w) -> rows_of(w, srcs, data),
+    Refused(_) -> [],
+  };
+  assert_eq(map(rows, |row: Row| row.data), [[{ name: "std/m/list.txt", bytes: 8 }]])
 }
 
 test "a build that ships nothing says so instead of laying out an empty table" {
@@ -345,17 +444,22 @@ test "`--show` written bare prints every source back to back, in name order" {
 }
 
 test "a module that ships with no such name is `E0106` and lists the ones that do" {
-  let d = unknown_module("std.nope", ["std.bytes", "std.json"]);
+  let d = unknown_module("std.nope", ["std.bytes", "std.json"], []);
   assert_eq(d.code, b"E0106");
   assert_eq(d.message, b"no module named `std.nope` ships with this compiler");
   assert_eq(
     match list_at(d.notes_text, 0) { Some(n) -> n, None -> b"" },
     b"the stdlib holds: `std.bytes`, `std.json`",
+  );
+  assert_eq(len(d.notes_text), 2);
+  assert_eq(
+    list_at(unknown_module("std/m/gone.txt", ["std.m"], ["std/m/list.txt"]).notes_text, 1),
+    Some(b"and the data files its modules embed: `std/m/list.txt`"),
   )
 }
 
 test "a module's source is written back as its own lines" {
-  let answer = sourced("std.m", b"pub fn one() -> Int = 1\n");
+  let answer = sourced("module", "std.m", b"pub fn one() -> Int = 1\n");
   assert_eq(answer.lines, ["pub fn one() -> Int = 1"]);
   assert_eq(answer.code, 0)
 }

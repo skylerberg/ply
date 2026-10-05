@@ -105,8 +105,8 @@ fn recorders() -> &'static Mutex<HashMap<MachineId, Arc<Recorder>>> {
 /// A `ply` started with [`TRACE_VAR`] records every machine it runs.
 static PROCESS: OnceLock<Arc<Recorder>> = OnceLock::new();
 
-/// Where the running `ply` lays its shipped modules out as files: a read there is of a module, or
-/// of the program beside them.
+/// Where the running `ply` lays its shipped modules out as files: a read there is of a module, of
+/// a data file one embeds, or of the program beside them.
 static SHIPPED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 static KEPT: OnceLock<Vec<PathBuf>> = OnceLock::new();
@@ -228,7 +228,12 @@ pub fn read(machine: MachineId, how: Read, path: &Path) {
         .get()
         .and_then(|dir| path.strip_prefix(dir).ok())
     {
-        return match rest.to_str().and_then(|n| n.strip_suffix(".ply")) {
+        // A module lies there as `<name>.ply`, and a data file one embeds below it, under its name.
+        let shipped_name = rest.to_str().and_then(|file| {
+            file.strip_suffix(".ply")
+                .or_else(|| file.contains('/').then_some(file))
+        });
+        return match shipped_name {
             Some(name) if how == Read::File => shipped(machine, name),
             _ => program(machine),
         };

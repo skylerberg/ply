@@ -76,7 +76,7 @@ pub fn identity() -> String {
             hasher.update(b"ply program 1\0");
             for part in [
                 ply_machine::builds::digest_of(&program_sources()),
-                ply_machine::builds::digest_of(&ply_machine::shipped_modules::sources()),
+                ply_machine::shipped_modules::digest(),
                 ply_codegen::c::runtime_digest().to_string(),
             ] {
                 hasher.update(part.as_bytes());
