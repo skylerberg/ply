@@ -4,7 +4,11 @@ use ply_eval::{Analysis, Provider, Symbol, Value};
 
 /// `source` as a module named `m`, and the unit the builder made of it, every root offered.
 pub fn unit(source: &str) -> (&'static Analysis, &'static Unit) {
-    let answer = fixture::answered(&[("m", source)]);
+    unit_of(&[("m", source)])
+}
+
+fn unit_of(modules: &[(&str, &str)]) -> (&'static Analysis, &'static Unit) {
+    let answer = fixture::answered(modules);
     let front: &'static Analysis = Box::leak(Box::new(answer.front.answer));
     let unit = Unit::handed(front, answer.unit).expect("this host has a C compiler");
     let _ = unit.bodies();
@@ -766,10 +770,9 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     assert!(!backend.describes(other.hashes_digest));
 }
 
-/// Over what a program that imports much of the standard library reaches of it.
 #[test]
 fn the_census_over_the_standard_library() {
-    let (front, unit) = unit(ARITHMETIC);
+    let (front, unit) = unit_of(&fixture::standard_library());
     let functions = front.emitter_roots.len();
     let mut by_construct: std::collections::BTreeMap<&str, usize> = Default::default();
     for (_, construct) in unit.refusals() {
@@ -798,13 +801,7 @@ fn the_census_over_the_standard_library() {
         "the enterable fragment fell to {} definitions",
         unit.len()
     );
-    assert!(
-        front
-            .emitter_roots
-            .iter()
-            .any(|r| r.root.as_str().starts_with("std.")),
-        "none of the {functions} functions offered is the standard library's"
-    );
+    assert!(functions > 100, "only {functions} functions were offered");
 }
 
 const CELLS: &str = "\

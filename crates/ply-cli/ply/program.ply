@@ -4,11 +4,12 @@
 //! what moved since the last one and takes the rest from its rows.
 
 import compiler.load (LoadedAnalysis)
+import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
 import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, Shipping,
-                       analyse_pulling_std_with, dump_of, embeds_now, filing, module_items,
-                       module_imports, no_rows, pins_pulling, rows_of)
+                       ShippedView, analyse_pulling_std_with, dump_of, embeds_now, filing,
+                       module_items, module_imports, no_rows, pins_pulling, rows_of)
 import compiler.pkg (PackageSources, Pinned, Supplied)
 import compiler.interface (CompiledPackage, CompiledModule, Original, merged_interfaces)
 import interfaces
@@ -53,6 +54,8 @@ pub type Program = {
   shipping: Shipping,
   /// Whether a shipped module was read only for what the program reaches, rather than whole.
   reached: Bool,
+  /// What the load read of each shipped module it pulled, which it tells whatever observes the run.
+  viewed: List<ShippedView>,
 }
 
 /// Every diagnostic a load reports: what the front-end cache said of itself, then the program's.
@@ -108,6 +111,35 @@ fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List
     embeds: project.embeds,
     shipping: shipping,
     reached: true,
+    viewed: [],
+  }
+
+/// What a load read of the shipped modules it pulled, told to whatever observes the run, a
+/// `shipform` line for each module and a `shipdef` line for each function it reached. `pulled` is
+/// whether the load read them itself, rather than re-analysing a load that did.
+pub fn tell_viewed(
+  viewed: List<ShippedView>,
+  pulled: Bool,
+) -> Unit / {shipped.reached, abort.raise} =
+  if len(viewed) == 0 { () } else {
+    let line = |parts: List<Bytes>|
+      bytes_concat(
+        fold(parts, b"", |acc: Bytes, part: Bytes|
+          if bytes_len(acc) == 0 { part } else { bytes_concat_all([acc, b"\t", part]) }),
+        b"\n",
+      );
+    shipped.reached(
+      bytes_concat_all(
+        fold(viewed, [], |acc: List<Bytes>, v: ShippedView|
+          fold(
+            v.defs,
+            push(acc, line([b"shipform", v.module, v.text, v.form])),
+            |a: List<Bytes>, d: { name: Bytes, hash: Bytes }|
+              push(a, line([b"shipdef", v.module, d.name, d.hash])),
+          )),
+      ),
+      pulled,
+    )
   }
 
 /// What a load of this project is made of: its root key and manifest text, and every dependency
@@ -264,8 +296,9 @@ fn analysed_through(
     fold(p.modules, acc, |a: Map<Bytes, Bool>, m: CompiledModule| map_insert(a, m.name, true)));
   // The check that kept a module's stub showed its measures, and its text and all it reaches stand.
   let fresh = |m: Bytes| map_contains(own, m) && !map_contains(stubbed, m);
+  let refused = |ds: List<Diag>| { ..broken(project, shipping, places, ds), viewed: pulled.viewed };
   match pulled.out {
-    Refused(ds) -> loaded(broken(project, shipping, places, ds)),
+    Refused(ds) -> loaded(refused(ds)),
     Analysed(w) -> if len(mine.through) > 0 && len(measures_in(w, fresh)) > 0 {
       { program: broken(project, shipping, places, []), starved: true }
     } else {
@@ -283,9 +316,10 @@ fn analysed_through(
             embeds: project.embeds,
             shipping: shipping,
             reached: reached,
+            viewed: pulled.viewed,
           })
         },
-        missing -> loaded(broken(project, shipping, places, map(missing, undescended))),
+        missing -> loaded(refused(map(missing, undescended))),
       }
     },
   }
@@ -690,7 +724,7 @@ pub fn load_program(
   paths: List<paths::Resolved>,
   interfaced: Bool = true,
   verify: Bool = false,
-) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges} = {
+) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
   let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
   else { no_shipping() };
@@ -712,6 +746,7 @@ pub fn load_program(
       reached: interfaced,
     ),
   );
+  tell_viewed(p.viewed, true);
   refreshing(paths, project, shipping, stamps, interfaced, through, p);
   filed(paths, shipping, stamps, k, p)
 }
@@ -741,11 +776,13 @@ pub fn pins_for(
 /// and what a command's switch off the cache asks for.
 pub fn load_uncached(
   paths: List<paths::Resolved>,
-) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, diverges} = {
+) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
   let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
   else { no_shipping() };
-  assembled(project, shipping, paths, no_rows())
+  let p = assembled(project, shipping, paths, no_rows());
+  tell_viewed(p.viewed, true);
+  p
 }
 
 /// What the load answered, for the machine to read rather than load again. The dump carries the
@@ -772,7 +809,7 @@ pub fn timed_load(
   paths: List<paths::Resolved>,
   interfaced: Bool = true,
   verify: Bool = false,
-) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges} = {
+) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   timed_over(paths, load_resolved(paths), started, interfaced, verify)
 }
@@ -787,7 +824,7 @@ pub fn timed_over(
   interfaced: Bool = true,
   verify: Bool = false,
   own: Bool = false,
-) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, shipped.reached} = {
   let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
   else { no_shipping() };
   let stamps = loads::shipped_stamps();
@@ -812,6 +849,7 @@ pub fn timed_over(
     ),
   );
   let front_done = time.elapsed_ms();
+  tell_viewed(p.viewed, true);
   refreshing(paths, project, shipping, stamps, interfaced, through, p);
   own_keeping(paths, project, shipping, stamps, own, verify, p);
   let kept: Program = filed(paths, shipping, stamps, k, p);
@@ -829,7 +867,7 @@ pub fn timed_uncached(
   paths: List<paths::Resolved>,
   verify: Bool = false,
   reached: Bool = true,
-) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, abort.raise, diverges} = {
+) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   timed_uncached_over(paths, load_resolved(paths), started, verify, reached)
 }
@@ -841,7 +879,7 @@ pub fn timed_uncached_over(
   started: Int,
   verify: Bool = false,
   reached: Bool = true,
-) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise} = {
+) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise, shipped.reached} = {
   let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
   else { no_shipping() };
   let read_done = time.elapsed_ms();
@@ -851,6 +889,7 @@ pub fn timed_uncached_over(
     verify,
     assembled(project, shipping, paths, no_rows(), reached: reached),
   );
+  tell_viewed(p.viewed, true);
   {
     program: p,
     read_ms: read_done - started,
@@ -1227,6 +1266,7 @@ test "a span outside every module has no place and no location" {
     embeds: [],
     shipping: { read: [], unread: [] },
     reached: true,
+    viewed: [],
   };
   assert_eq(location_of(p, { module: no_module(), span: { start: 0, end: 0 } }), None);
   assert_eq(location_of(p, { module: 0, span: { start: 3, end: 4 } }), Some("m.ply:1:4"))
