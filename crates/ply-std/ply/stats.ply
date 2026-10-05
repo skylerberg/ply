@@ -1,0 +1,884 @@
+//! Summaries of numeric data: where it centres, how far it spreads, where a share of it lies, and
+//! how two runs of it move together.
+//!
+//! Every answer over `Float`s is exact, rounded once. A `Float` is a whole number of some power of
+//! two, so a sum of them, of their squares or of their products is kept as a whole number with no
+//! rounding at all, and a mean, a variance, a quantile between two data or the slope of a line is
+//! the true value of its formula over the data, rounded to the nearest `Float` at the end. The
+//! order the data come in, and how a run is split and its parts merged, change no bit of an answer:
+//! a `Tally` is taken in one pass, two merge to the tally of both runs, and `merge` is associative
+//! with `empty` as its identity, so `std.parallel`'s `par_fold` reads the same summary a `fold`
+//! does. An answer past the greatest `Float` is an infinity.
+//!
+//! The data are finite numbers. A NaN or an infinity is no datum: every function here answers
+//! `None` for data holding one, as it does for no data at all, and a `Tally` counts those it was
+//! handed apart, as `flawed`. A variance is named for what it divides by: `population_variance`
+//! by the count, for data that are the whole of what they describe, and `sample_variance` by one
+//! less, for a sample of something larger.
+//!
+//! A quantile is asked for as a ratio, `quantile(xs, 99, 100)`, so the share is exact too, and is
+//! taken by one of the nine methods Hyndman and Fan numbered, which `Method` names as R does.
+//! `mode` and `modes` count any ordered values, not only numbers; a `Float` is not one, since it
+//! is no key.
+
+import std.bigint
+import std.bigint (BigInt)
+import std.float (infinity, is_finite, is_sign_negative, neg_infinity, pow2)
+import std.laws (agrees, monoid, refines)
+import std.list (all, at_or, concat, count, first, sort_by, unique, zip)
+import std.map (get_or)
+import std.math (bit_length, div_floor, even, ilog2, rem_floor, trailing_zeros)
+import std.parallel (grain, par_fold)
+
+/// How a quantile is taken where it falls between two data: Hyndman and Fan's nine types, by the
+/// numbers R gives them. With `n` data in ascending order and a share `p`, each reads the datum at
+/// a place `h`, counted from one, and what stands between two.
+pub type Method =
+  /// The inverse of the empirical distribution: the datum at `n * p`, rounded up.
+  | R1
+  /// `R1`, with the mean of the two data where `n * p` is whole.
+  | R2
+  /// The datum nearest `n * p`, the even place where two are as near.
+  | R3
+  /// Between the data either side of `n * p`.
+  | R4
+  /// Between the data either side of `n * p + 1/2`: Hazen's.
+  | R5
+  /// Between the data either side of `(n + 1) * p`: Weibull's, and Python's `exclusive`.
+  | R6
+  /// Between the data either side of `(n - 1) * p + 1`: the one R, NumPy and a spreadsheet take
+  /// unasked, and Python's `inclusive`.
+  | R7
+  /// Between the data either side of `(n + 1/3) * p + 1/3`: median-unbiased whatever the
+  /// distribution.
+  | R8
+  /// Between the data either side of `(n + 1/4) * p + 3/8`: unbiased for normal data.
+  | R9
+
+/// What a run of numbers comes to.
+pub type Summary = new {
+  /// How many numbers there are: at least one.
+  count: Int,
+  least: Float,
+  greatest: Float,
+  sum: Float,
+  mean: Float,
+  /// The mean square of the distances from the mean.
+  population_variance: Float,
+  /// The squares of the distances from the mean, over one less than the count; `None` for a
+  /// single number, which has no spread to estimate.
+  sample_variance: Option<Float>,
+}
+
+/// A run of numbers taken in one at a time, in room that does not grow with their count: how many
+/// there were, the least and the greatest, and their sum and their squares' sum held exactly.
+/// Two tallies of the same numbers are equal, whatever order and grouping took them in.
+pub type Tally = new {
+  /// How many finite numbers were taken in.
+  count: Int,
+  /// How many more were a NaN or an infinity, which leave `summary` nothing to answer.
+  flawed: Int,
+  least: Float,
+  greatest: Float,
+  sum: { units: BigInt, scale: Int },
+  squares: { units: BigInt, scale: Int },
+}
+
+/// Data counted between edges: how many fell in each bin, in the edges' order, and how many fell
+/// below the first edge and above the last.
+pub type Histogram = new { below: Int, counts: List<Int>, above: Int }
+
+/// The line `y = slope * x + intercept`.
+pub type Line = new { slope: Float, intercept: Float }
+
+// --- A tally -------------------------------------------------------------------
+
+/// The tally of no numbers: `merge`'s identity.
+pub fn empty() -> Tally =
+  {
+    count: 0,
+    flawed: 0,
+    least: infinity(),
+    greatest: neg_infinity(),
+    sum: nothing(),
+    squares: times(nothing(), nothing()),
+  }
+
+/// `t` with `x` taken in.
+pub fn push(t: Tally, x: Float) -> Tally =
+  if !is_finite(x) { { ..t, flawed: t.flawed + 1 } } else {
+    let held = exact(x);
+    {
+      count: t.count + 1,
+      flawed: t.flawed,
+      least: lower(t.least, x),
+      greatest: higher(t.greatest, x),
+      sum: plus(t.sum, held),
+      squares: plus(t.squares, times(held, held)),
+    }
+  }
+
+/// The tally of everything `a` and `b` took in: what one tally would hold had it taken in both
+/// runs. Associative, and `empty` changes nothing on either side.
+pub fn merge(a: Tally, b: Tally) -> Tally =
+  {
+    count: a.count + b.count,
+    flawed: a.flawed + b.flawed,
+    least: lower(a.least, b.least),
+    greatest: higher(a.greatest, b.greatest),
+    sum: plus(a.sum, b.sum),
+    squares: plus(a.squares, b.squares),
+  }
+
+/// The tally of `xs`, in one pass.
+pub fn tally(xs: List<Float>) -> Tally = fold(xs, empty(), push)
+
+/// What the numbers `t` took in come to; `None` where it took in none, or one that was a NaN or
+/// an infinity.
+pub fn summary(t: Tally) -> Option<Summary> / {abort.raise} =
+  if t.count == 0 || t.flawed > 0 { None } else {
+    Some({
+      count: t.count,
+      least: t.least,
+      greatest: t.greatest,
+      sum: ratio(t.sum, whole(1)),
+      mean: ratio(t.sum, whole(t.count)),
+      population_variance: ratio(spread_of(t), pairs(t.count, t.count)),
+      sample_variance: if t.count < 2 { None }
+      else { Some(ratio(spread_of(t), pairs(t.count, t.count - 1))) },
+    })
+  }
+
+/// What `xs` come to, in one pass: `summary` of their `tally`.
+pub fn summarize(xs: List<Float>) -> Option<Summary> / {abort.raise} = summary(tally(xs))
+
+/// The count times the squares' sum, less the sum's square: the count squared times the
+/// population variance, and never negative.
+fn spread_of(t: Tally) -> Exact = less(times(whole(t.count), t.squares), times(t.sum, t.sum))
+
+/// The lesser, and of the two zeros the negative one, so the answer is the same in either order.
+fn lower(a: Float, b: Float) -> Float = if b < a || (b == a && is_sign_negative(b)) { b } else { a }
+
+/// The greater, and of the two zeros the positive one.
+fn higher(a: Float, b: Float) -> Float =
+  if b > a || (b == a && !is_sign_negative(b)) { b } else { a }
+
+// --- Centre and spread ---------------------------------------------------------
+
+/// The sum of `xs`, exact and rounded once, so no order of the numbers and no cancelling among
+/// them changes it; zero for none. `None` where one is a NaN or an infinity.
+pub fn sum(xs: List<Float>) -> Option<Float> / {abort.raise} = {
+  let t = tally(xs);
+  if t.flawed > 0 { None } else { Some(ratio(t.sum, whole(1))) }
+}
+
+/// The arithmetic mean: the sum over the count.
+pub fn mean(xs: List<Float>) -> Option<Float> / {abort.raise} =
+  match usable(tally(xs), 1) { Some(t) -> Some(ratio(t.sum, whole(t.count))), None -> None }
+
+/// The mean square of the distances from the mean, for data that are all there is.
+pub fn population_variance(xs: List<Float>) -> Option<Float> / {abort.raise} =
+  match usable(tally(xs), 1) {
+    Some(t) -> Some(ratio(spread_of(t), pairs(t.count, t.count))),
+    None -> None,
+  }
+
+/// The squares of the distances from the mean over one less than the count, which estimates the
+/// variance of what `xs` is a sample of. `None` for fewer than two numbers.
+pub fn sample_variance(xs: List<Float>) -> Option<Float> / {abort.raise} =
+  match usable(tally(xs), 2) {
+    Some(t) -> Some(ratio(spread_of(t), pairs(t.count, t.count - 1))),
+    None -> None,
+  }
+
+/// The square root of `population_variance`, in the data's own unit.
+pub fn population_stdev(xs: List<Float>) -> Option<Float> / {abort.raise} =
+  match population_variance(xs) { Some(v) -> Some(sqrt(v)), None -> None }
+
+/// The square root of `sample_variance`. `None` for fewer than two numbers.
+pub fn sample_stdev(xs: List<Float>) -> Option<Float> / {abort.raise} =
+  match sample_variance(xs) { Some(v) -> Some(sqrt(v)), None -> None }
+
+/// The least of `xs`.
+pub fn least(xs: List<Float>) -> Option<Float> =
+  if clean(xs) { Some(fold(xs, infinity(), lower)) } else { None }
+
+/// The greatest of `xs`.
+pub fn greatest(xs: List<Float>) -> Option<Float> =
+  if clean(xs) { Some(fold(xs, neg_infinity(), higher)) } else { None }
+
+/// The range of `xs`: the greatest less the least.
+pub fn spread(xs: List<Float>) -> Option<Float> =
+  if clean(xs) { Some(fold(xs, neg_infinity(), higher) - fold(xs, infinity(), lower)) }
+  else { None }
+
+/// The value or values that occur most often, each once, in the order they first occur; none
+/// for no values.
+pub fn modes<a>(xs: List<a>) -> List<a>
+  where derivable(ord, a)
+= {
+  let counts = fold(xs, map_new(), |seen: Map<a, Int>, x: a|
+    map_insert(seen, x, get_or(seen, x, 0) + 1));
+  let most = map_fold(counts, 0, |best: Int, _: a, times_seen: Int| max(best, times_seen));
+  unique(filter(xs, |x: a| get_or(counts, x, 0) == most))
+}
+
+/// The value that occurs most often, the first of them where several do as often.
+pub fn mode<a>(xs: List<a>) -> Option<a>
+  where derivable(ord, a)
+= first(modes(xs))
+
+/// `t`, if it took in at least `least_count` numbers and nothing that is no number.
+fn usable(t: Tally, least_count: Int) -> Option<Tally> =
+  if t.count < least_count || t.flawed > 0 { None } else { Some(t) }
+
+/// Whether `xs` holds a number and nothing that is none.
+fn clean(xs: List<Float>) -> Bool = len(xs) > 0 && all(xs, is_finite)
+
+// --- Order ---------------------------------------------------------------------
+
+/// The middle of `xs` in order: the middle number of an odd count, and the mean of the middle
+/// two of an even one.
+pub fn median(xs: List<Float>) -> Option<Float> / {abort.raise} = quantile(xs, 1, 2, R6)
+
+/// The middle of `xs` in order, and the lower of the middle two of an even count: always one of
+/// the data.
+pub fn median_low(xs: List<Float>) -> Option<Float> / {abort.raise} = quantile(xs, 1, 2, R1)
+
+/// The middle of `xs` in order, and the higher of the middle two of an even count.
+pub fn median_high(xs: List<Float>) -> Option<Float> / {abort.raise} =
+  match ordered(xs) { Some(sorted) -> Some(placed(sorted, len(sorted) / 2 + 1)), None -> None }
+
+/// The value `part` of `parts` of the way through `xs` in order, as `method` takes it: the
+/// median is `quantile(xs, 1, 2)` and the 99.9th percentile `quantile(xs, 999, 1000)`. Where it
+/// falls between two data it is their exact weighted mean, rounded once. `None` for a `parts`
+/// below one or above `2^59`, and for a `part` below zero or above `parts`.
+pub fn quantile(
+  xs: List<Float>,
+  part: Int,
+  parts: Int,
+  method: Method = R7,
+) -> Option<Float> / {abort.raise} =
+  if parts < 1 || parts > 1 << 59 || part < 0 || part > parts { None } else {
+    match ordered(xs) { Some(sorted) -> Some(taken(sorted, part, parts, method)), None -> None }
+  }
+
+/// The value `percent` hundredths of the way through `xs` in order: `quantile(xs, percent, 100)`.
+pub fn percentile(
+  xs: List<Float>,
+  percent: Int,
+  method: Method = R7,
+) -> Option<Float> / {abort.raise} = quantile(xs, percent, 100, method)
+
+/// The `parts - 1` values that cut `xs` in order into `parts` equal shares: three quartiles for
+/// four, ninety-nine percentiles for a hundred. `None` for a `parts` below one or above `2^59`.
+pub fn quantiles(
+  xs: List<Float>,
+  parts: Int,
+  method: Method = R7,
+) -> Option<List<Float>> / {abort.raise} =
+  if parts < 1 || parts > 1 << 59 { None } else {
+    match ordered(xs) {
+      Some(sorted) -> Some(map(range(1, parts), |part: Int| taken(sorted, part, parts, method))),
+      None -> None,
+    }
+  }
+
+/// How many of `xs` fall in each bin `edges` mark: the bin from one edge up to the next holds
+/// what is at least the first and below the second, and the last bin its upper edge too. What
+/// is below the first edge or above the last is counted apart, so nothing goes uncounted. `None`
+/// for fewer than two edges, edges that do not ascend, and a NaN or an infinity among either
+/// list; no data is every count zero.
+pub fn histogram(xs: List<Float>, edges: List<Float>) -> Option<Histogram> = {
+  let bins = len(edges) - 1;
+  let ascending = all(range(0, bins), |i: Int| at_or(edges, i, 0.0) < at_or(edges, i + 1, 0.0));
+  if bins < 1 || !ascending || !all(edges, is_finite) || !all(xs, is_finite) { None } else {
+    let last = at_or(edges, bins, 0.0);
+    Some({
+      below: count(xs, |x: Float| x < at_or(edges, 0, 0.0)),
+      counts: map(range(0, bins), |i: Int|
+        count(xs, |x: Float|
+          x >= at_or(edges, i, 0.0)
+            && (x < at_or(edges, i + 1, 0.0) || (i == bins - 1 && x == last)))),
+      above: count(xs, |x: Float| x > last),
+    })
+  }
+}
+
+/// `xs` in ascending order; `None` for none, and where one is a NaN or an infinity.
+fn ordered(xs: List<Float>) -> Option<List<Float>> =
+  if clean(xs) { Some(sort_by(xs, |a: Float, b: Float| a < b)) } else { None }
+
+/// The datum at place `k` of `sorted`, counted from one; the first for a place before it and
+/// the last for one past it.
+fn placed(sorted: List<Float>, k: Int) -> Float =
+  at_or(sorted, max(1, min(k, len(sorted))) - 1, 0.0)
+
+/// The `part` of `parts` quantile of `sorted`, which holds a number.
+fn taken(sorted: List<Float>, part: Int, parts: Int, method: Method) -> Float / {abort.raise} = {
+  let place = place_of(method, len(sorted), part, parts);
+  let j = int_of_i128(div_floor(place.over, place.under));
+  let past = int_of_i128(rem_floor(place.over, place.under));
+  let under = int_of_i128(place.under);
+  let here = placed(sorted, j);
+  let next = placed(sorted, j + 1);
+  match method {
+    R1 -> if past == 0 { here } else { next },
+    R2 -> if past == 0 { ratio(plus(exact(here), exact(next)), whole(2)) } else { next },
+    R3 -> if past == 0 && even(j) { here } else { next },
+    _ -> if past == 0 { here } else {
+      ratio(
+        plus(times(exact(here), whole(under - past)), times(exact(next), whole(past))),
+        whole(under),
+      )
+    },
+  }
+}
+
+/// Where the `part` of `parts` quantile of `n` data stands among them, counted from one: the
+/// ratio `over / under`.
+fn place_of(
+  method: Method,
+  n: Int,
+  part: Int,
+  parts: Int,
+) -> { over: I128, under: I128 } / {abort.raise} = {
+  let count = i128_of_int(n);
+  let i = i128_of_int(part);
+  let of = i128_of_int(parts);
+  match method {
+    R1 | R2 | R4 -> { over: count * i, under: of },
+    R3 -> { over: 2i128 * count * i - of, under: 2i128 * of },
+    R5 -> { over: 2i128 * count * i + of, under: 2i128 * of },
+    R6 -> { over: (count + 1i128) * i, under: of },
+    R7 -> { over: (count - 1i128) * i + of, under: of },
+    R8 -> { over: (3i128 * count + 1i128) * i + of, under: 3i128 * of },
+    R9 -> { over: (8i128 * count + 2i128) * i + 3i128 * of, under: 8i128 * of },
+  }
+}
+
+// --- Two runs together ---------------------------------------------------------
+
+/// How `xs` and `ys` vary together, as a sample's: the products of their distances from their
+/// means, over one less than the count. `None` for lists of two lengths, for fewer than two
+/// pairs, and where a number is a NaN or an infinity.
+pub fn covariance(xs: List<Float>, ys: List<Float>) -> Option<Float> / {abort.raise} =
+  match paired(xs, ys) { Some(p) -> Some(ratio(p.xy, pairs(p.count, p.count - 1))), None -> None }
+
+/// Pearson's correlation of `xs` and `ys`, from `-1.0` to `1.0`: the square root of its exact
+/// square, rounded, under the covariance's sign, so data on a line are exactly one or its
+/// negative. `None` where `covariance` is, and where either list is one number repeated.
+pub fn correlation(xs: List<Float>, ys: List<Float>) -> Option<Float> / {abort.raise} =
+  match paired(xs, ys) {
+    None -> None,
+    Some(p) -> if is_nothing(p.xx) || is_nothing(p.yy) { None } else {
+      let size = sqrt(ratio(times(p.xy, p.xy), times(p.xx, p.yy)));
+      Some(if bigint::is_negative(p.xy.units) { 0.0 - size } else { size })
+    },
+  }
+
+/// The line of least squares through the points `xs` and `ys` pair up: the slope and intercept
+/// that make the squares of the `ys`' distances from it least. `None` where `covariance` is, and
+/// where the `xs` are one number repeated, which no line's slope is read from.
+pub fn linear_regression(xs: List<Float>, ys: List<Float>) -> Option<Line> / {abort.raise} =
+  match paired(xs, ys) {
+    None -> None,
+    Some(p) -> if is_nothing(p.xx) { None } else {
+      Some({
+        slope: ratio(p.xy, p.xx),
+        intercept: ratio(less(times(p.y, p.xx), times(p.xy, p.x)), times(whole(p.count), p.xx)),
+      })
+    },
+  }
+
+/// What a line through paired data is read from: the count `n`, the sums of each run, and `n`
+/// times each sum of products less the product of the sums, which is `n` squared times a
+/// population covariance.
+type Paired = { count: Int, x: Exact, y: Exact, xx: Exact, yy: Exact, xy: Exact }
+
+fn paired(xs: List<Float>, ys: List<Float>) -> Option<Paired> =
+  if len(xs) != len(ys) || len(xs) < 2 || !all(xs, is_finite) || !all(ys, is_finite) { None } else {
+    let n = whole(len(xs));
+    let x = total(xs, xs, false);
+    let y = total(ys, ys, false);
+    Some({
+      count: len(xs),
+      x: x,
+      y: y,
+      xx: less(times(n, total(xs, xs, true)), times(x, x)),
+      yy: less(times(n, total(ys, ys, true)), times(y, y)),
+      xy: less(times(n, total(xs, ys, true)), times(x, y)),
+    })
+  }
+
+/// The sum of `xs`, or with `products` of each of `xs` times its pair in `ys`.
+fn total(xs: List<Float>, ys: List<Float>, products: Bool) -> Exact =
+  fold(zip(xs, ys), nothing(), |acc: Exact, pair: { first: Float, second: Float }|
+    plus(acc, if products { times(exact(pair.first), exact(pair.second)) }
+    else { exact(pair.first) }))
+
+// --- Exact numbers -------------------------------------------------------------
+
+/// The number `units * 2^scale`, exactly. Zero is no units at a scale above every `Float`'s.
+type Exact = { units: BigInt, scale: Int }
+
+fn nothing() -> Exact = { units: bigint::zero(), scale: 1024 }
+
+fn is_nothing(a: Exact) -> Bool = bigint::is_zero(a.units)
+
+fn whole(n: Int) -> Exact = { units: bigint::of_int(n), scale: 0 }
+
+/// `a * b`, which two counts' product may be past an `Int`.
+fn pairs(a: Int, b: Int) -> Exact = times(whole(a), whole(b))
+
+/// A finite `x`, with its units odd: the one way to write it, so sums of the same numbers have
+/// the same units at the same scale.
+fn exact(x: Float) -> Exact = {
+  let bits = bits_of_float(x);
+  let biased = bits >>> 52 & 0x7FF;
+  let digits = if biased == 0 { bits & 0x000F_FFFF_FFFF_FFFF }
+  else { bits & 0x000F_FFFF_FFFF_FFFF | 0x0010_0000_0000_0000 };
+  if digits == 0 { nothing() } else {
+    let even_bits = trailing_zeros(digits);
+    let odd = digits >> even_bits;
+    {
+      units: bigint::of_int(if bits < 0 { 0 - odd } else { odd }),
+      scale: max(biased, 1) - 1075 + even_bits,
+    }
+  }
+}
+
+fn plus(a: Exact, b: Exact) -> Exact = {
+  let scale = min(a.scale, b.scale);
+  {
+    units: bigint::shift_left(a.units, a.scale - scale)
+      + bigint::shift_left(b.units, b.scale - scale),
+    scale: scale,
+  }
+}
+
+fn less(a: Exact, b: Exact) -> Exact = plus(a, { units: -b.units, scale: b.scale })
+
+fn times(a: Exact, b: Exact) -> Exact = { units: a.units * b.units, scale: a.scale + b.scale }
+
+/// `n / d` for a `d` above zero, rounded to the nearest `Float`, to the even one of two as near.
+fn ratio(n: Exact, d: Exact) -> Float / {abort.raise} =
+  if is_nothing(n) { 0.0 } else {
+    let over = bigint::abs_value(n.units);
+    // Fifty-eight or fifty-nine bits of quotient: more than a `Float` keeps, and fewer than an
+    // `Int` holds. A numerator longer than that needs is cut to it first, and whether the cut
+    // took anything is kept, so the division is of numbers no longer than the divisor asks.
+    let lift = 58 - (bigint::bit_length(over) - bigint::bit_length(d.units));
+    let cut = bigint::shift_right(over, 0 - lift);
+    let cut_nothing = lift >= 0 || bigint::shift_left(cut, 0 - lift) == over;
+    match bigint::div_mod(bigint::shift_left(cut, lift), d.units) {
+      None -> 0.0,
+      Some(s) -> {
+        let quotient = match bigint::to_int(s.q) { Some(q) -> q, None -> 0 };
+        let size = nearest(
+          quotient,
+          !(cut_nothing && bigint::is_zero(s.r)),
+          n.scale - d.scale - lift,
+        );
+        if bigint::is_negative(n.units) { 0.0 - size } else { size }
+      },
+    }
+  }
+
+/// The `Float` nearest `q * 2^scale`, or just above it where `more` says something was left below
+/// `q`'s last bit: `q`'s leading bits to the fifty-three a `Float` keeps, or the fewer a
+/// subnormal does, rounded to even on a tie.
+fn nearest(q: Int, more: Bool, scale: Int) -> Float = {
+  let width = bit_length(q);
+  let top = width - 1 + scale;
+  if top > 1023 { infinity() }
+  else if top < 0 - 1075 { 0.0 } else {
+    let kept = if top >= 0 - 1022 { 53 } else { top + 1075 };
+    let cut = width - kept;
+    let leading = q >> cut;
+    let rest = q & (1 << cut) - 1;
+    let half = 1 << cut - 1;
+    let up = rest > half || (rest == half && (more || leading & 1 == 1));
+    float_of_int(if up { leading + 1 } else { leading }) * pow2(scale + cut)
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+law "tallies merge as a monoid, whatever runs they were taken from"
+  forall (xs: List<Float>, ys: List<Float>, zs: List<Float>) {
+    monoid(merge, empty(), tally(xs), tally(ys), tally(zs))
+  }
+
+law "the tally of two runs joined is their tallies merged" =
+  refines(tally, |xs: List<Float>, ys: List<Float>| concat(xs, ys), |t: Tally, ys: List<Float>|
+    merge(t, tally(ys)))
+
+law "a tally is the same whichever end its numbers are taken from" =
+  agrees(tally, |xs: List<Float>| fold(xs, empty(), |t: Tally, x: Float| merge(tally([x]), t)))
+
+law "a mean lies from the least to the greatest"
+  forall (xs: List<Float>) {
+    match summarize(xs) {
+      None -> len(xs) == 0 || !all(xs, is_finite),
+      Some(s) ->
+        s.least <= s.mean && s.mean <= s.greatest && s.population_variance >= 0.0
+          && s.count == len(xs),
+    }
+  }
+
+law "every method's quantiles ascend from the least to the greatest"
+  forall (xs: List<Float>, pick: Int) {
+    let method = at_or([R1, R2, R3, R4, R5, R6, R7, R8, R9], rem_floor(pick, 9), R7);
+    match quantiles(xs, 8, method) {
+      None -> !clean(xs),
+      Some(cuts) ->
+        all(range(0, 6), |i: Int| at_or(cuts, i, 0.0) <= at_or(cuts, i + 1, 0.0))
+          && quantile(xs, 0, 8, method) == least(xs)
+          && quantile(xs, 8, 8, method) == greatest(xs),
+    }
+  }
+
+law "a tally takes steps in its numbers"
+  forall (n: Int) where n > 0 cost n {
+    tally(map(range(0, n), |i: Int| float_of_int(i % 97) + 0.25))
+  }
+
+law "a median takes the steps of a sort"
+  forall (n: Int) where n > 1 cost n * ilog2(n) {
+    median(map(range(0, n), |i: Int| float_of_int(i * 7919 % n)))
+  }
+
+// Python's `statistics` documentation, where each of these is an example: its answers are exact
+// too, so they are these to the last place.
+test "the examples in Python's statistics documentation hold" {
+  assert_eq(mean([1.0, 2.0, 3.0, 4.0, 4.0]), Some(2.8));
+  assert_eq(mean([0.0 - 1.0, 2.5, 3.25, 5.75]), Some(2.625));
+  assert_eq(mean([3.5, 4.0, 5.25]), Some(4.25));
+  assert_eq(median([1.0, 3.0, 5.0]), Some(3.0));
+  assert_eq(median([1.0, 3.0, 5.0, 7.0]), Some(4.0));
+  assert_eq(median_low([1.0, 3.0, 5.0]), Some(3.0));
+  assert_eq(median_low([1.0, 3.0, 5.0, 7.0]), Some(3.0));
+  assert_eq(median_high([1.0, 3.0, 5.0]), Some(3.0));
+  assert_eq(median_high([1.0, 3.0, 5.0, 7.0]), Some(5.0));
+  assert_eq(mode([1, 1, 2, 3, 3, 3, 3, 4]), Some(3));
+  assert_eq(mode(["red", "blue", "blue", "red", "green", "red", "red"]), Some("red"));
+  assert_eq(modes(string_chars("aabbbbccddddeeffffgg")), ['b', 'd', 'f']);
+  assert_eq(modes(string_chars("")), []);
+  assert_eq(population_stdev([1.5, 2.5, 2.5, 2.75, 3.25, 4.75]), Some(0.986893273527251));
+  assert_eq(population_variance([0.0, 0.25, 0.25, 1.25, 1.5, 1.75, 2.75, 3.25]), Some(1.25));
+  assert_eq(sample_stdev([1.5, 2.5, 2.5, 2.75, 3.25, 4.75]), Some(1.0810874155219827));
+  assert_eq(sample_variance([2.75, 1.75, 1.25, 0.25, 0.5, 1.25, 3.5]), Some(1.3720238095238095))
+}
+
+/// The fifty scores of the `quantiles` example in Python's `statistics` documentation.
+fn scores() -> List<Float> =
+  map(
+    [
+      105,
+      129,
+      87,
+      86,
+      111,
+      111,
+      89,
+      81,
+      108,
+      92,
+      110,
+      100,
+      75,
+      105,
+      103,
+      109,
+      76,
+      119,
+      99,
+      91,
+      103,
+      129,
+      106,
+      101,
+      84,
+      111,
+      74,
+      87,
+      86,
+      103,
+      103,
+      106,
+      86,
+      111,
+      75,
+      87,
+      102,
+      121,
+      111,
+      88,
+      89,
+      101,
+      106,
+      95,
+      103,
+      107,
+      101,
+      81,
+      109,
+      104,
+    ],
+    float_of_int,
+  )
+
+// Python's `quantiles(data, n=10)`, whose `exclusive` method is `R6`, and its
+// `quantiles(data, n=4, method='inclusive')`, which is `R7`; the 99th percentile is NumPy's
+// `percentile(data, 99)`.
+test "Python's deciles are R6's and its inclusive quartiles R7's, to the last place" {
+  assert_eq(
+    quantiles(scores(), 10, R6),
+    Some([81.0, 86.2, 89.0, 99.4, 102.5, 103.6, 106.0, 109.8, 111.0]),
+  );
+  assert_eq(quantiles(scores(), 4), Some([87.25, 102.5, 107.75]));
+  assert_eq(percentile(scores(), 99), Some(129.0));
+  assert_eq(quantiles(scores(), 1), Some([]))
+}
+
+// Python's `statistics` documentation for `covariance`, `correlation` and `linear_regression`.
+// Its Kepler correlation prints `0.9881754652909308`, one place above the square root of the
+// exactly rounded square, which is what is asserted; its regression of films on years is exact.
+test "Python's examples of two runs together hold" {
+  let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+  let y = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
+  let z = [9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+  assert_eq(covariance(x, y), Some(0.75));
+  assert_eq(covariance(x, z), Some(0.0 - 7.5));
+  assert_eq(covariance(z, x), Some(0.0 - 7.5));
+  assert_eq(correlation(x, x), Some(1.0));
+  assert_eq(correlation(x, z), Some(0.0 - 1.0));
+  assert_eq(correlation(x, y), Some(0.31622776601683794));
+  let period = [88.0, 225.0, 365.0, 687.0, 4331.0, 10756.0, 30687.0, 60190.0];
+  let distance = [58.0, 108.0, 150.0, 228.0, 778.0, 1400.0, 2900.0, 4500.0];
+  assert_eq(correlation(period, distance), Some(0.9881754652909307));
+  assert_eq(
+    linear_regression([1971.0, 1975.0, 1979.0, 1982.0, 1983.0], [1.0, 2.0, 3.0, 4.0, 5.0]),
+    Some({ slope: 0.31, intercept: 0.0 - 610.18 }),
+  );
+  assert_eq(linear_regression(x, y), Some({ slope: 0.1, intercept: 1.5 }));
+  assert_eq(linear_regression(x, z), Some({ slope: 0.0 - 1.0, intercept: 10.0 }))
+}
+
+// Exact rationals rounded once, computed with Python's `fractions`, which is also what its
+// `statistics.mean`, `variance` and `pvariance` answer. The naive float sum of the first run is
+// `0.6000000000000001` and its mean `0.20000000000000004`; the variance of the third by a float
+// sum of squares is `0.0`. Python's own regression of the last pair has `0.8750000000000002` for
+// the intercept.
+test "an answer is the exact one where float arithmetic on the way would not be" {
+  assert_eq(sum([0.1, 0.2, 0.3]), Some(0.6));
+  assert_eq(mean([0.1, 0.2, 0.3]), Some(0.2));
+  assert_eq(sample_variance([0.1, 0.2, 0.3]), Some(0.009999999999999998));
+  assert_eq(population_variance([0.1, 0.2, 0.3]), Some(0.006666666666666665));
+  let cancelling = [1.0e16, 1.0, 0.0 - 1.0e16, 1.0, 0.1, 0.2, 0.3];
+  assert_eq(sum(cancelling), Some(2.6));
+  assert_eq(mean(cancelling), Some(0.37142857142857144));
+  assert_eq(population_variance(cancelling), Some(2.8571428571428572e31));
+  assert_eq(sample_variance(cancelling), Some(3.3333333333333334e31));
+  let shifted = [1000000004.0, 1000000007.0, 1000000013.0, 1000000016.0];
+  assert_eq(population_variance(shifted), Some(22.5));
+  assert_eq(sample_variance(shifted), Some(30.0));
+  assert_eq(
+    linear_regression([0.1, 0.2, 0.4, 0.8, 1.6], [1.5, 1.25, 2.0, 2.75, 5.5]),
+    Some({ slope: 2.782258064516129, intercept: 0.875 }),
+  );
+  assert_eq(
+    covariance([0.1, 0.2, 0.4, 0.8, 1.6], [1.5, 1.25, 2.0, 2.75, 5.5]),
+    Some(1.0350000000000001),
+  )
+}
+
+// Exact rationals rounded to nearest, ties to even, computed with Python's `fractions`.
+test "an answer is rounded once to the nearest Float, at a tie, a subnormal and the top" {
+  let above_one = float_of_bits(bits_of_float(1.0) + 1);
+  let two_above = float_of_bits(bits_of_float(1.0) + 2);
+  assert_eq(mean([1.0, above_one]), Some(1.0));
+  assert_eq(mean([above_one, two_above]), Some(two_above));
+  let tiny = float_of_bits(1);
+  assert_eq(mean([tiny, float_of_bits(2)]), Some(float_of_bits(2)));
+  assert_eq(mean([tiny, 0.0]), Some(0.0));
+  assert_eq(mean([tiny, tiny, tiny, 0.0]), Some(tiny));
+  assert_eq(mean([tiny, 0.0, 0.0]), Some(0.0));
+  assert_eq(sum([tiny, tiny, tiny]), Some(float_of_bits(3)));
+  assert_eq(population_variance([tiny, tiny, tiny]), Some(0.0));
+  let top = float_of_bits(0x7FEF_FFFF_FFFF_FFFF);
+  assert_eq(mean([top, top]), Some(top));
+  assert_eq(mean([top, top, top]), Some(top));
+  assert_eq(sum([top, top]), Some(infinity()));
+  assert_eq(sum([top, top, 0.0 - top]), Some(top));
+  assert_eq(median([top, top]), Some(top));
+  assert_eq(population_variance([top, 0.0 - top]), Some(infinity()));
+  assert_eq(sum([0.0, negative_zero()]), Some(0.0))
+}
+
+fn negative_zero() -> Float = float_of_bits(0x8000_0000_0000_0000)
+
+// The eleven numbers and the six below them at each of the nine methods are NumPy's
+// `quantile(.., method=..)` at the methods it names `inverted_cdf`, `averaged_inverted_cdf`,
+// `closest_observation`, `interpolated_inverted_cdf`, `hazen`, `weibull`, `linear`,
+// `median_unbiased` and `normal_unbiased`. NumPy interpolates in floats and is within two places
+// of these, which are the exact weighted means rounded once.
+test "each of the nine methods takes its quartiles as R numbers them" {
+  let odd = [3.5, 1.25, 9.0, 4.0, 7.75, 2.5, 6.0, 8.5, 5.0, 10.25, 0.5];
+  let cuts = |method: Method| map(range(0, 5), |i: Int| quantile(odd, i, 4, method));
+  assert_eq(cuts(R1), map([0.5, 2.5, 5.0, 8.5, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R2), map([0.5, 2.5, 5.0, 8.5, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R3), map([0.5, 2.5, 5.0, 7.75, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R4), map([0.5, 2.1875, 4.5, 7.9375, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R5), map([0.5, 2.75, 5.0, 8.3125, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R6), map([0.5, 2.5, 5.0, 8.5, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R7), map([0.5, 3.0, 5.0, 8.125, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R8), map([0.5, 2.6666666666666665, 5.0, 8.375, 10.25], |x: Float| Some(x)));
+  assert_eq(cuts(R9), map([0.5, 2.6875, 5.0, 8.359375, 10.25], |x: Float| Some(x)));
+  let six = [9.0, 2.0, 4.0, 7.0, 5.0, 4.0];
+  let inner = |method: Method| quantiles(six, 4, method);
+  assert_eq(inner(R1), Some([4.0, 4.0, 7.0]));
+  assert_eq(inner(R2), Some([4.0, 4.5, 7.0]));
+  assert_eq(inner(R3), Some([4.0, 4.0, 5.0]));
+  assert_eq(inner(R4), Some([3.0, 4.0, 6.0]));
+  assert_eq(inner(R5), Some([4.0, 4.5, 7.0]));
+  assert_eq(inner(R6), Some([3.5, 4.5, 7.5]));
+  assert_eq(inner(R7), Some([4.0, 4.5, 6.5]));
+  assert_eq(inner(R8), Some([3.8333333333333335, 4.5, 7.166666666666667]));
+  assert_eq(inner(R9), Some([3.875, 4.5, 7.125]));
+  assert_eq(quantile(odd, 999, 1000), Some(10.2375));
+  assert_eq(map([0, 25, 50, 90, 99, 100], |p: Int| percentile(odd, p)), [
+    Some(0.5),
+    Some(3.0),
+    Some(5.0),
+    Some(9.0),
+    Some(10.125),
+    Some(10.25),
+  ])
+}
+
+test "no data, and data holding what is no number, have no summary" {
+  let none: List<Float> = [];
+  let nan = float_of_bits(0x7FF8_0000_0000_0000);
+  assert_eq(summarize(none), None);
+  assert_eq(sum(none), Some(0.0));
+  assert_eq(map([none, [1.0, nan], [infinity(), 1.0], [neg_infinity()]], mean), [
+    None,
+    None,
+    None,
+    None,
+  ]);
+  assert_eq(map([none, [nan], [1.0, infinity()]], median), [None, None, None]);
+  assert_eq(map([none, [nan], [1.0, infinity()]], least), [None, None, None]);
+  assert_eq(map([none, [nan], [1.0, infinity()]], greatest), [None, None, None]);
+  assert_eq(map([none, [nan], [1.0, infinity()]], spread), [None, None, None]);
+  assert_eq(sum([1.0, nan]), None);
+  assert_eq(sample_variance([1.0]), None);
+  assert_eq(population_variance([1.0]), Some(0.0));
+  assert_eq(sample_stdev([1.0]), None);
+  assert_eq(quantiles(none, 4), None);
+  assert_eq(quantile([1.0, 2.0], 1, 0), None);
+  assert_eq(quantile([1.0, 2.0], 0 - 1, 4), None);
+  assert_eq(quantile([1.0, 2.0], 5, 4), None);
+  assert_eq(percentile([1.0, 2.0], 101), None);
+  assert_eq(covariance([1.0, 2.0], [1.0]), None);
+  assert_eq(covariance([1.0], [1.0]), None);
+  assert_eq(covariance([1.0, nan], [1.0, 2.0]), None);
+  assert_eq(correlation([1.0, 1.0, 1.0], [1.0, 2.0, 3.0]), None);
+  assert_eq(correlation([1.0, 2.0, 3.0], [5.0, 5.0, 5.0]), None);
+  assert_eq(linear_regression([2.0, 2.0], [1.0, 3.0]), None);
+  assert_eq(
+    linear_regression([1.0, 2.0, 3.0], [5.0, 5.0, 5.0]),
+    Some({ slope: 0.0, intercept: 5.0 }),
+  )
+}
+
+test "a tally counts what is no number apart, and a summary is read off one in one pass" {
+  let nan = float_of_bits(0x7FF8_0000_0000_0000);
+  let run = [2.75, 1.75, 1.25, 0.25, 0.5, 1.25, 3.5];
+  assert_eq(
+    summarize(run),
+    Some({
+      count: 7,
+      least: 0.25,
+      greatest: 3.5,
+      sum: 11.25,
+      mean: 1.6071428571428572,
+      population_variance: 1.1760204081632653,
+      sample_variance: Some(1.3720238095238095),
+    }),
+  );
+  assert_eq(
+    summarize([4.0]),
+    Some({
+      count: 1,
+      least: 4.0,
+      greatest: 4.0,
+      sum: 4.0,
+      mean: 4.0,
+      population_variance: 0.0,
+      sample_variance: None,
+    }),
+  );
+  let spoiled = push(push(tally(run), nan), infinity());
+  assert_eq(spoiled.count, 7);
+  assert_eq(spoiled.flawed, 2);
+  assert_eq(summary(spoiled), None);
+  assert_eq(summary(empty()), None);
+  assert_eq(least(run), Some(0.25));
+  assert_eq(greatest(run), Some(3.5));
+  assert_eq(spread(run), Some(3.25))
+}
+
+test "a run split anywhere and merged is the run tallied whole, to the bit" {
+  let run = [1.0e16, 0.1, 0.0 - 1.0e16, 0.2, 3.0e-30, 0.3, 7.0e20, 0.0, negative_zero(), 2.5];
+  let whole_run = tally(run);
+  fold(range(0, len(run) + 1), (), |_: Unit, cut: Int| {
+    let head = map(range(0, cut), |i: Int| at_or(run, i, 0.0));
+    let tail = map(range(cut, len(run)), |i: Int| at_or(run, i, 0.0));
+    assert_eq(merge(tally(head), tally(tail)), whole_run);
+    assert_eq(merge(tally(tail), tally(head)), whole_run);
+    assert_eq(summary(merge(tally(tail), tally(head))), summary(whole_run))
+  });
+  assert_eq(merge(empty(), whole_run), whole_run);
+  assert_eq(merge(whole_run, empty()), whole_run);
+  // Of the two zeros the negative one is the least and the positive one the greatest, whichever
+  // came first.
+  let zeros = map([[0.0, negative_zero()], [negative_zero(), 0.0]], tally);
+  assert_eq(map(zeros, |t: Tally| bits_of_float(t.least)), [
+    bits_of_float(negative_zero()),
+    bits_of_float(negative_zero()),
+  ]);
+  assert_eq(map(zeros, |t: Tally| bits_of_float(t.greatest)), [0, 0])
+}
+
+test "a tally folded on every core is the tally folded in turn, and so is its summary" {
+  let data = map(range(0, 3 * grain() + 7), |i: Int| float_of_int(i * 7919 % 1013) / 7.0 + 0.1);
+  let at_once = par_fold(data, empty(), push, merge);
+  assert_eq(at_once, tally(data));
+  assert_eq(summary(at_once), summarize(data))
+}
+
+// NumPy's `histogram(.., bins=[1.0, 2.0, 3.0])` counts `[2, 3]` of these and drops the three
+// outside the edges, which are counted here.
+test "a histogram counts each number once: in a bin, below the first edge or above the last" {
+  let data = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 0.0 - 1.0, 9.0];
+  assert_eq(histogram(data, [1.0, 2.0, 3.0]), Some({ below: 2, counts: [2, 3], above: 1 }));
+  assert_eq(histogram([], [0.0, 1.0]), Some({ below: 0, counts: [0], above: 0 }));
+  assert_eq(histogram(data, [1.0]), None);
+  assert_eq(histogram(data, []), None);
+  assert_eq(histogram(data, [1.0, 1.0, 2.0]), None);
+  assert_eq(histogram(data, [2.0, 1.0]), None);
+  assert_eq(histogram(data, [0.0, infinity()]), None);
+  assert_eq(histogram([float_of_bits(0x7FF8_0000_0000_0000)], [0.0, 1.0]), None)
+}
+
+test "modes are every value that occurs most, in the order they first occur" {
+  assert_eq(modes([3, 1, 3, 1, 2]), [3, 1]);
+  assert_eq(modes([1.5m, 2.5m, 1.50m]), [1.5m]);
+  assert_eq(mode([3, 1, 3, 1, 2]), Some(3));
+  let none: List<Int> = [];
+  assert_eq(mode(none), None);
+  assert_eq(modes(map([0.5, 0.25, 0.5], bits_of_float)), [bits_of_float(0.5)])
+}
