@@ -1,8 +1,8 @@
 //! A test over cases, `test "{c.name}" for c: T in table() { .. }`, as `ply test` runs it: a test per
 //! case, each with its own label, key, pass and failure, and none of them moved by another's.
 
-import harness (Source, scratch, program, project, write, read, on_disk, tested, json_of, at, path,
-                items, str, int, truth, shown, Reached, Shipped)
+import harness (Source, scratch, program, project, write, read, on_disk, tested, selected, failed,
+                json_of, at, path, items, str, int, truth, shown, Reached, Shipped)
 import std.json (Json, Null)
 import std.string
 
@@ -32,12 +32,6 @@ fn two() -> String = row("one", 1, 2) ++ ", " ++ row("two", 2, 4)
 fn listed(report: Json) -> List<String> =
   map(items(path(report, ["selection", "tests"])), |t: Json| str(at(t, "name")))
 
-fn selected(report: Json) -> List<String> =
-  map(
-    filter(items(path(report, ["selection", "tests"])), |t: Json| truth(at(t, "selected"))),
-    |t: Json| str(at(t, "name")),
-  )
-
 fn entry(report: Json, name: String) -> Json =
   match filter(items(path(report, ["selection", "tests"])), |t: Json| str(at(t, "name")) == name) {
     [t, ..] -> t,
@@ -63,10 +57,6 @@ fn placed(report: Json) -> List<String> =
         ),
   )
 
-fn failed(report: Json) -> List<String> =
-  map(filter(items(at(report, "results")), |r: Json| str(at(r, "status")) == "failed"), |r: Json|
-    str(at(r, "name")))
-
 test "each case is a test of its own: its label names it, and it says what it is a case of" {
   scratch(|| {
     program(vectors(two(), "n + n"));
@@ -80,7 +70,7 @@ test "each case is a test of its own: its label names it, and it says what it is
     assert_eq(int(path(one, ["case", "at"])), 0);
     assert_eq(int(path(other, ["case", "at"])), 1);
     assert(str(at(one, "hash")) != str(at(other, "hash")), Some(shown(report)));
-    assert(str(path(one, ["case", "digest"])) != str(path(other, ["case", "digest"])), None);
+    assert(str(path(one, ["case", "identity"])) != str(path(other, ["case", "identity"])), None);
     // A test that ranges over nothing says nothing of a case.
     assert_eq(at(entry(report, "double of nothing is nothing"), "case"), Null)
   })
@@ -331,7 +321,7 @@ test "what a table may not be is refused where it is written" {
       \\
       \\test "is of another type {n}" for n: String in [1, 2] { assert(n == "a") }
       \\
-      \\test "has no digest {x}" for x: Float in [1.0] { assert(x > 0.0) }
+      \\test "holds a float {x}" for x: Float in [1.0] { assert(x > 0.0) }
       \\
     );
     assert_eq(placed(json_of(on_disk(["check", "--json"]))), [
@@ -343,25 +333,90 @@ test "what a table may not be is refused where it is written" {
   })
 }
 
-test "a case holds no value of a type that states a key, whose digest is its key's" {
+fn lengths() -> String =
+  \\type Length = | Metres(Int) | Millimetres(Int)
+  \\
+  \\key for Length by millimetres
+  \\
+  \\fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }
+  \\
+  \\type Cut = { name: String, length: Length }
+  \\
+  \\fn cuts() -> List<Cut> =
+  \\  [{ name: "a", length: Metres(1) }, { name: "a", length: Millimetres(1000) }]
+  \\
+  \\test "a length {l}" for l: Length in [Metres(2), Millimetres(2000)] { assert(l == Metres(2)) }
+  \\
+  \\test "a cut {c.length}" for c: Cut in cuts() { assert(c.name == "a") }
+  \\
+
+test "a case's type is read as it is built, so a keyed type is one where what it holds is data" {
+  scratch(|| {
+    program(lengths());
+    let report = tested([]);
+    assert_eq(listed(report), [
+      "a length Metres(2)",
+      "a length Millimetres(2000)",
+      "a cut Metres(1)",
+      "a cut Millimetres(1000)",
+    ]);
+    assert_eq(int(path(report, ["summary", "passed"])), 4);
+    let identity = |name: String| str(path(entry(report, name), ["case", "identity"]));
+    assert(identity("a length Metres(2)") != identity("a length Millimetres(2000)"), None);
+    assert(identity("a cut Metres(1)") != identity("a cut Millimetres(1000)"), None);
+    // A key makes a type hashed whatever it holds, and a case is told apart by what it holds.
+    write(
+      "m.ply",
+      lengths()
+        ++
+        \\
+        \\type Named = | Named(String, () -> Int)
+        \\
+        \\key for Named by name_of
+        \\
+        \\fn name_of(n: Named) -> String = match n { Named(name, _) -> name }
+        \\
+        \\fn named() -> List<Named> = [Named("a", || 1), Named("a", || 2)]
+        \\
+        \\fn hashed() -> Bytes = digest(named())
+        \\
+        \\test "named {name_of(n)}" for n: Named in named() { assert(name_of(n) == "a") }
+        \\
+        ,
+    );
+    let checked = json_of(on_disk(["check", "--json"]));
+    assert_eq(placed(checked), ["E0206 26"]);
+    assert(
+      string_contains(shown(checked), "a `key` does not stand in for the type that states it"),
+      Some(shown(checked)),
+    )
+  })
+}
+
+test "two cases `==` calls equal and built differently are two, and one's pass is not the other's" {
   scratch(|| {
     program(
-      \\type Length = | Metres(Int) | Millimetres(Int)
+      \\import std.show (show)
       \\
-      \\key for Length by millimetres
-      \\
-      \\fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }
-      \\
-      \\type Cut = { name: String, length: Length }
-      \\
-      \\test "a length {millimetres(l)}" for l: Length in [Metres(2), Millimetres(2000)] { assert(true) }
-      \\
-      \\test "a cut {c.name}" for c: Cut in [{ name: "a", length: Metres(1) }] { assert(c.name == "a") }
-      \\
-      \\test "built in the body {n}" for n: Int in [2, 2000] { assert(Metres(n) != Millimetres(n)) }
+      \\test "prints {d}" for d: Decimal in [1.5m, 1.50m] { assert_eq(show(d), "1.5") }
       \\
     );
-    assert_eq(placed(json_of(on_disk(["check", "--json"]))), ["E0206 9", "E0206 11"])
+    let first = on_disk(["test", "--json"]);
+    assert_eq(first.code, 1);
+    assert_eq(listed(json_of(first)), ["prints 1.5", "prints 1.50"]);
+    assert_eq(failed(json_of(first)), ["prints 1.50"]);
+    // The second run stands on the one pass, and the failing case fails again.
+    let second = on_disk(["test", "--json"]);
+    assert_eq(second.code, 1);
+    let report = json_of(second);
+    assert_eq(failed(report), ["prints 1.50"]);
+    assert_eq(selected(report), ["prints 1.50"]);
+    assert_eq(str(at(entry(report, "prints 1.5"), "reason")), "cached");
+    assert(
+      path(entry(report, "prints 1.5"), ["case", "identity"])
+        != path(entry(report, "prints 1.50"), ["case", "identity"]),
+      Some(shown(report)),
+    )
   })
 }
 

@@ -633,7 +633,8 @@ type, or behind a type parameter — and by `assert_eq`, which tells two keyed
 values apart as wholes. `derivable(eq, T)`, `derivable(ord, T)` and
 `derivable(hash, T)` hold exactly when they hold of `K`, whatever `T`'s fields
 are, and `K` is both ordered and hashed (`E0206`). A `match` still reads the
-value as it was built. Each comparison calls `f`, so a key is worth keeping
+value as it was built, as `reflect` does, and a test over cases tells its cases
+apart that way (§8.1). Each comparison calls `f`, so a key is worth keeping
 cheap.
 
 `show for T by g` names `g: (T<a, ..>) -> String`: `show`, `display` and a hole
@@ -1553,11 +1554,12 @@ literal in it is a `new` record where the case's type is one (§4.2). The name i
 bound in the body and in the label, and a label before `for` is read as an
 interpolated string is (§2.3): each `{expr}` is a hole, `{{` and `}}` are
 braces, and a label with no hole names every case alike. A case is told from
-another by its value's `digest` (§12), so its type is `derivable(hash, ·)`
-(`E0206`) and holds no `Float`. Nor does it hold a value of a type that states
-a `key` (§4.4, `E0206`): its digest is its key's, so two cases a body tells
-apart would be one, and the pass of one would stand for the other. Such a table
-ranges over what the values are built from, and the body builds each. The cases
+another by its value as it was built, which is finer than `==`: `1.5m` and
+`1.50m` are two cases, as are two values of a type whose `key` (§4.4) answers
+the same, so no case's pass stands for a case its body can tell from it. Two
+cases built alike are one. A case's type is `derivable(hash, ·)` read through
+no `key` (`E0206`): it holds no `Float`, function, `Cell`, `Task`, `Chan` or
+`Secret`, and neither does a keyed type in it. The cases
 are listed before any test runs, so
 the table and the label may raise, by any `raise` operation (§6.8), and perform
 nothing else (`E0469`). A table that raises fails as one test, under the label
@@ -1597,7 +1599,7 @@ cache.
 
 A case of a test over cases (§8.1) is selected as a test of its own. Its hash is
 its test's, which covers the body and the case's type and neither the table nor
-the label, taken with the case's `digest`. A case added to the table runs
+the label, taken with the case's value as built. A case added to the table runs
 alone, wherever it is added; a reordered table or a reworded label runs
 nothing; an edit to the body runs every case, and an edit to what the table is
 built from runs the cases whose values it changed. Its label is the one its
@@ -1651,7 +1653,8 @@ and on every change to what the last run embedded, keeping caches in memory.
 Each case of a test over cases (§8.1) passes, fails and is reported under its
 own label, so a failing table names every failing case. In `--json` a case's
 entry under `selection.tests` carries `case`: the key of the test it is a case
-of (`of`), its place in the table (`at`) and its `digest`. A failing case is
+of (`of`), its place in the table (`at`) and its `identity`, the BLAKE3 of its
+value as built. A failing case is
 suspected against what it runs, which leaves out its table, and is named a
 culprit when one change explains it; it is otherwise not bisected (`skipped`
 is `case`), since a mixture is printed from a test's body, which holds no case.
@@ -2699,7 +2702,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0203` | occurs check |
 | `E0204` | not a function |
 | `E0205` | non-exhaustive match |
-| `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case that holds a keyed value |
+| `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case of a type hashed only through a `key` |
 | `E0207` | unknown deriver |
 | `E0208` | orphan `derive`, `key` or `show` |
 | `E0209` | `/` on `Decimal` |

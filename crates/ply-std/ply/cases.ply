@@ -1,9 +1,14 @@
 //! What a test over cases is made of.
 //!
 //! `test "{c.name}" for c: T in table() { .. }` is a test for each element of its table, a case.
-//! A run names a case by its value's `digest`, so a case keeps its pass wherever the table moves
-//! it. `listed` is how a run learns the cases, and `chosen` how a test is entered for one. A
-//! module with such a test imports this one itself, so this module cannot hold one.
+//! A run names a case by its value as it was built, so a case keeps its pass wherever the table
+//! moves it, and two cases a body can tell apart are never one: `1.5m` and `1.50m` are two, as are
+//! two values of a type whose `key` answers the same for both. `listed` is how a run learns the
+//! cases, and `chosen` how a test is entered for one. A module with such a test imports this one
+//! itself, so this module cannot hold one.
+
+import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
+                  VArray, VRecord, VCtor, VMap, VFn, FAnonymous, Field, Entry, ctor_name)
 
 /// What a test ranges over: its cases, in the order a report lists them.
 pub type Table<a> = List<a>
@@ -12,52 +17,194 @@ pub type Table<a> = List<a>
 pub type Listed = {
   /// What its test is reported under and `--filter` reads.
   label: String,
-  /// Its value's `digest`: two cases of equal values are one.
-  digest: Bytes,
+  /// BLAKE3 of its value as built: two cases built alike are one, and two that `==` calls equal
+  /// are two where they are built differently.
+  identity: Bytes,
 }
 
 /// Each case of `table`, in the table's order, named by what `label` makes of it.
-pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / e
-  where derivable(hash, a)
-= map(table, |c: a| { label: label(c), digest: digest(c) })
-
-/// The case whose digest is `wanted`.
 ///
-/// The one at `at` where the table still holds it there, and otherwise the first of that digest
+/// `derivable(hash, a)` is read here through no `key`, since a case is told from another by what
+/// it holds. Raises on a value that holds a function, a handle or a credential.
+pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e}
+  where derivable(hash, a)
+= map(table, |c: a| { label: label(c), identity: identity(c) })
+
+/// The case whose identity is `wanted`.
+///
+/// The one at `at` where the table still holds it there, and otherwise the first of that identity
 /// wherever it stands now. Raises when the table holds it nowhere.
 pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise}
   where derivable(hash, a)
 =
   match list_at(table, at) {
-    Some(c) -> if digest(c) == wanted { c } else { moved(table, wanted) },
+    Some(c) -> if identity(c) == wanted { c } else { moved(table, wanted) },
     None -> moved(table, wanted),
   }
 
 fn moved<a>(table: List<a>, wanted: Bytes) -> a / {abort.raise}
   where derivable(hash, a)
 =
-  match filter(table, |c: a| digest(c) == wanted) {
+  match filter(table, |c: a| identity(c) == wanted) {
     [c, ..] -> c,
     [] -> panic("the table no longer holds this case"),
   }
 
-test "a listing labels each case and digests its value, in the table's order" {
+/// BLAKE3 of `c` as it was built. `digest` is coarser: it follows `==`.
+fn identity<a>(c: a) -> Bytes / {abort.raise} = bytes_blake3(written(reflect(c)))
+
+/// `v` as bytes no other value is written as, with two exceptions that tell no two cases of one
+/// type apart. A width below 64 bits is written as the `Int` it reads as, which is how compiled
+/// code holds one. A constructor is written under the name its module declares, so a module that
+/// moves keeps its cases. A `Decimal` keeps its scale, and a value of a type that states a `key`
+/// its own fields. Raises on what holds no data to write.
+fn written(v: Value) -> Bytes / {abort.raise} =
+  match v {
+    VUnit -> b"u",
+    VBool(yes) -> if yes { b"t" } else { b"f" },
+    VInt(n) -> text(b"i", int_to_string(n)),
+    VFixed(ty, bits) -> match narrow(ty, bits) {
+      Some(n) -> text(b"i", int_to_string(n)),
+      None -> text(b"w", ty ++ " " ++ u128_to_string(bits)),
+    },
+    VFloat(f) -> text(b"g", int_to_string(bits_of_float(f))),
+    VDecimal(d) -> text(b"d", decimal_to_string(d)),
+    VChar(c) -> text(b"c", string_of_chars([c])),
+    VStr(s) -> text(b"s", s),
+    VBytes(bytes) -> framed(b"b", bytes),
+    VList(items) -> counted(b"l", map(items, |x: Value| written(x))),
+    VArray(items) -> counted(b"a", map(items, |x: Value| written(x))),
+    VRecord(fields) ->
+      counted(b"r", map(fields, |f: Field| bytes_concat(text(b"n", f.name), written(f.value)))),
+    VCtor(name, args) ->
+      bytes_concat(text(b"k", ctor_name(name)), counted(b"p", map(args, |x: Value| written(x)))),
+    VMap(entries) ->
+      counted(b"m", map(entries, |e: Entry| bytes_concat(written(e.key), written(e.value)))),
+    _ ->
+      panic("a case holds a function, a handle or a credential, which no run tells from another"),
+  }
+
+/// `tag`, how long `payload` is, `:`, then `payload`: where it ends is read before it is.
+fn framed(tag: Bytes, payload: Bytes) -> Bytes =
+  bytes_concat_all([tag, bytes_of_string(int_to_string(bytes_len(payload))), b":", payload])
+
+fn text(tag: Bytes, s: String) -> Bytes = framed(tag, bytes_of_string(s))
+
+/// `tag`, how many `parts`, `:`, then each part, which says itself where it ends.
+fn counted(tag: Bytes, parts: List<Bytes>) -> Bytes =
+  bytes_concat_all([tag, bytes_of_string(int_to_string(len(parts))), b":", bytes_concat_all(parts)])
+
+/// What a width below 64 bits reads, and `None` of a wider one.
+fn narrow(ty: String, bits: U128) -> Option<Int> / {abort.raise} =
+  if ty == "U8" || ty == "U16" || ty == "U32" { Some(int_of_u128(bits)) }
+  else if ty == "I8" { Some(signed(int_of_u128(bits), 128)) }
+  else if ty == "I16" { Some(signed(int_of_u128(bits), 32768)) }
+  else if ty == "I32" { Some(signed(int_of_u128(bits), 2147483648)) }
+  else { None }
+
+/// A pattern at or past `half` its width's range reads below zero.
+fn signed(pattern: Int, half: Int) -> Int =
+  if pattern >= half { pattern - 2 * half } else { pattern }
+
+test "a listing labels each case and names it as it was built, in the table's order" {
   assert_eq(listed([3, 4], |n: Int| int_to_string(n)), [
-    { label: "3", digest: digest(3) },
-    { label: "4", digest: digest(4) },
+    { label: "3", identity: identity(3) },
+    { label: "4", identity: identity(4) },
   ]);
   assert_eq(listed([], |n: Int| int_to_string(n)), [])
 }
 
-test "a case is chosen by its digest, at its place or wherever the table now holds it" {
-  assert_eq(chosen(["a", "b"], 1, digest("b")), "b");
-  assert_eq(chosen(["new", "a", "b"], 1, digest("b")), "b");
-  assert_eq(chosen(["b"], 4, digest("b")), "b")
+test "a case is chosen by its identity, at its place or wherever the table now holds it" {
+  assert_eq(chosen(["a", "b"], 1, identity("b")), "b");
+  assert_eq(chosen(["new", "a", "b"], 1, identity("b")), "b");
+  assert_eq(chosen(["b"], 4, identity("b")), "b")
 }
 
 fn missing() -> Result<String, String> =
-  handle { Ok(chosen(["a"], 0, digest("b"))) } with { abort.raise(reason) -> Err(reason) }
+  handle { Ok(chosen(["a"], 0, identity("b"))) } with { abort.raise(reason) -> Err(reason) }
 
 test "a case the table no longer holds raises" {
   assert_eq(missing(), Err("the table no longer holds this case"))
+}
+
+test "two values `==` calls equal are two cases where they are built differently" {
+  assert(1.5m == 1.50m);
+  assert(identity(1.5m) != identity(1.50m));
+  assert(identity([{ price: 2.0m }]) != identity([{ price: 2.00m }]));
+  assert_eq(decimal_to_string(chosen([1.5m, 1.50m], 0, identity(1.50m))), "1.50");
+  assert_eq(identity([1.50m]), identity([1.50m]));
+  // A `Map` holds a key at the scale `==` picks, so there is one way to build this one.
+  assert_eq(
+    identity(map_of_entries([{ key: 1.50m, value: 0 }])),
+    identity(map_of_entries([{ key: 1.5m, value: 0 }])),
+  )
+}
+
+fn kinds() -> List<Value> =
+  [
+    VUnit,
+    VBool(true),
+    VBool(false),
+    VInt(3),
+    VFixed("U64", 3u128),
+    VFixed("I64", 3u128),
+    VFixed("U128", 3u128),
+    VFloat(3.0),
+    VDecimal(3m),
+    VDecimal(3.0m),
+    VChar('3'),
+    VStr("3"),
+    VBytes(b"3"),
+    VList([VInt(3)]),
+    VArray([VInt(3)]),
+    VCtor("m.Some", [VInt(3)]),
+    VCtor("m.Some", []),
+    VRecord([{ name: "a", value: VInt(3) }]),
+    VMap([{ key: VStr("a"), value: VInt(3) }]),
+    VList([VStr("ab")]),
+    VList([VStr("a"), VStr("b")]),
+    VList([VStr("a"), VList([VStr("b")])]),
+    VList([VList([VStr("a")]), VStr("b")]),
+    VList([VList([VStr("a"), VStr("b")])]),
+    VList([]),
+    VList([VList([])]),
+    VStr(""),
+    VBytes(b""),
+    VRecord([{ name: "a", value: VStr("b") }, { name: "c", value: VStr("d") }]),
+    VRecord([{ name: "a", value: VRecord([{ name: "c", value: VStr("d") }]) }]),
+    VMap([{ key: VStr("a"), value: VStr("b") }, { key: VStr("c"), value: VStr("d") }]),
+    VList([VStr("1:a"), VStr("b")]),
+    VList([VStr("1:as1:b")]),
+  ]
+
+test "no two values are written alike" {
+  let all = map(kinds(), |v: Value| written(v));
+  assert_eq(
+    filter(range(0, len(all)), |i: Int|
+      len(filter(all, |w: Bytes| Some(w) == list_at(all, i))) != 1),
+    [],
+  )
+}
+
+test "a narrow width is the Int it reads as, and a constructor is its module's own name" {
+  assert_eq(written(VFixed("U8", 255u128)), written(VInt(255)));
+  assert_eq(written(VFixed("I8", 255u128)), written(VInt(-1)));
+  assert_eq(written(VFixed("I16", 65535u128)), written(VInt(-1)));
+  assert_eq(written(VFixed("I32", 2147483648u128)), written(VInt(-2147483648)));
+  assert_eq(written(VFixed("U32", 4294967295u128)), written(VInt(4294967295)));
+  assert_eq(
+    written(VCtor("orders.Shipped", [VInt(2)])),
+    written(VCtor("app.models.Shipped", [VInt(2)])),
+  );
+  assert(written(VCtor("Shipped", [VInt(2)])) != written(VCtor("Held", [VInt(2)])))
+}
+
+fn unwritten() -> Result<Bytes, String> =
+  handle { Ok(written(VList([VFn(FAnonymous)]))) } with { abort.raise(reason) -> Err(reason) }
+
+test "a value that holds a function is not written" {
+  assert_eq(
+    unwritten(),
+    Err("a case holds a function, a handle or a credential, which no run tells from another"),
+  )
 }

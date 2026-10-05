@@ -260,7 +260,7 @@ pub struct Unlisted {
     pub panicked: bool,
 }
 
-/// The cases the test at `index` ranges over, listed on this thread: each one's label and digest.
+/// The cases the test at `index` ranges over, listed on this thread: each one's label and identity.
 pub fn listed(executor: &Executor<'_>, index: usize) -> Result<Value, Unlisted> {
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<Value, Diagnostic> {
         let answer = executor.machine(index)?.eval_cases(index).into_parts().0;

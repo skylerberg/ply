@@ -262,8 +262,8 @@ fn case_arg(req: &HostRequest<'_>, at: usize) -> Result<Option<ply_eval::Case>, 
         .map(|case| {
             Ok(ply_eval::Case {
                 at: field_of(case, "at", span)?.as_int(span, "a case's place")?,
-                digest: field_of(case, "digest", span)?
-                    .as_bytes(span, "a case's digest")?
+                identity: field_of(case, "identity", span)?
+                    .as_bytes(span, "a case's identity")?
                     .to_vec(),
             })
         })
