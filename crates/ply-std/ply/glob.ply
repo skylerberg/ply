@@ -7,18 +7,19 @@
 //! - `?` is one character and `*` any run of them, neither ever the separator.
 //! - `[abc]`, `[a-z]` and `[!a-z]`, which `[^a-z]` also writes, are one character of a class, as
 //!   Go's `path.Match` writes one: a class is not empty, a `]`, `-` or `\` in it is written `\]`,
-//!   `\-` or `\\`, and a range's ends stand in order. A class never matches the separator, and
-//!   there are no named classes.
+//!   `\-` or `\\`, and a range's ends stand in order of their scalar values, never a locale's. A
+//!   class never matches the separator, and there are no named classes.
 //! - `**` stands for whole segments, and only between a `/` or the pattern's start and a `/` or
 //!   its end. `**/` is no segment or any number of them, so `a/**/b` matches `a/b`; a closing
-//!   `/**` is everything under, so `a/**` matches `a/b/c` and not `a`; `**` alone matches every
-//!   path but the empty one.
-//! - `{a,b}` is either alternative. One may be empty, hold `/` and wildcards, and nest another;
-//!   a `,` outside braces is itself, and a `}` that closes nothing is refused.
+//!   `/**` is everything under, so `a/**` matches `a/b/c` and not `a`, as a `.gitignore` reads
+//!   it; `**` alone matches every path but the empty one.
+//! - `{a,b}` is either alternative, as a shell expands one. One may be empty, hold `/` and
+//!   wildcards, and nest another; a `,` outside braces is itself, and a `}` that closes nothing
+//!   is refused.
 //! - `\` makes the next character itself, and `escape` writes a text as the pattern of it alone.
-//! - A `.` that leads a segment of the path is matched only by a `.` the pattern writes:
-//!   `*.ply` does not match `.hidden.ply`, and `**` enters no `.git`. `Options.dots` lets every
-//!   wildcard match one.
+//! - A `.` that leads a segment of the path is matched only by a `.` that leads a segment of the
+//!   pattern, as `fnmatch` and the shells have it: `*.ply` matches neither `.hidden.ply` nor
+//!   `.ply`, and `**` enters no `.git`. `Options.dots` lets every wildcard match one.
 //! - Case counts unless `Options.ignore_case`, which lower-cases both sides by Unicode's tables.
 //!
 //! Nothing is normalised: `a//b` and `a/./b` are not `a/b`, and `std.path` is what makes them so.
@@ -28,7 +29,7 @@
 //! empty stand in a row. `base` and `enters` are what a walk of a directory tree prunes with.
 
 import std.laws (agrees)
-import std.list (any, enumerate, reverse, take)
+import std.list (any, at_or, concat, enumerate, reverse, take)
 import std.map (get_or)
 
 /// How a pattern reads a path.
@@ -66,8 +67,9 @@ type Symbol =
   /// Nothing: the pattern is matched here.
   | End
 
-/// One state of a compiled pattern: what it takes, and the states that may follow taking it.
-type State = { symbol: Symbol, next: List<Int> }
+/// One state of a compiled pattern: what it takes, the states that may follow taking it, and
+/// those of them that no `*` was passed over to reach.
+type State = { symbol: Symbol, next: List<Int>, first: List<Int> }
 
 /// A compiled pattern. Two are equal when their patterns and options are written alike.
 pub type Glob = new {
@@ -75,6 +77,8 @@ pub type Glob = new {
   states: Array<State>,
   /// The states a match starts in.
   start: Map<Int, Unit>,
+  /// Those of `start` that no `*` was passed over to reach.
+  first: Map<Int, Unit>,
   /// What `base` answers.
   base: String,
   /// What `exact` answers.
@@ -137,6 +141,7 @@ pub fn read(pattern: String, o: Options) -> Glob / {glob.refused, abort.raise} =
     options: o,
     states: states.states,
     start: states.start,
+    first: states.first,
     base: if prefix.cut < 0 { "" } else { string_of_chars(take(prefix.text, max(prefix.cut, 1))) },
     exact: if prefix.whole { Some(string_of_chars(prefix.text)) } else { None },
   }
@@ -186,32 +191,51 @@ pub fn enters(g: Glob, dir: String) -> Bool = {
   map_len(after(g, under)) > 0
 }
 
-type Walk = { on: Map<Int, Unit>, leads: Bool }
+/// Where a match stands in a path: the states it may be in, those of them that lead a segment of
+/// the pattern, and whether the next character leads a segment of the path.
+type Walk = { on: Map<Int, Unit>, first: Map<Int, Unit>, leads: Bool }
 
 /// The states the pattern may be in once `text` is read.
 fn after(g: Glob, text: String) -> Map<Int, Unit> =
   fold(
     string_chars(if g.options.ignore_case { string_lower(text) } else { text }),
-    { on: g.start, leads: true },
-    |w: Walk, c: Char|
-      {
-        on: stepped(g, w.on, c, w.leads && c == '.' && !g.options.dots),
-        leads: c == g.options.separator,
-      },
+    { on: g.start, first: g.first, leads: true },
+    |w: Walk, c: Char| stepped(g, w, c),
   ).on
 
-fn stepped(g: Glob, on: Map<Int, Unit>, c: Char, hidden: Bool) -> Map<Int, Unit> =
-  map_fold(on, map_new(), |next: Map<Int, Unit>, at: Int, _: Unit|
-    match array_at(g.states, at) {
-      Some(state) if takes(state.symbol, c, g.options.separator, hidden) ->
-        fold(state.next, next, |reached: Map<Int, Unit>, to: Int| map_insert(reached, to, ())),
-      _ -> next,
-    })
+fn stepped(g: Glob, w: Walk, c: Char) -> Walk = {
+  let hidden = w.leads && c == '.' && !g.options.dots;
+  let leads = c == g.options.separator;
+  map_fold(
+    w.on,
+    { on: map_new(), first: map_new(), leads: leads },
+    |next: Walk, at: Int, _: Unit|
+      match array_at(g.states, at) {
+        Some(state) if takes(
+            state.symbol,
+            c,
+            g.options.separator,
+            hidden,
+            map_contains(w.first, at),
+          ) ->
+          {
+            on: joined(next.on, state.next),
+            first: if leads { joined(next.first, state.first) } else { next.first },
+            leads: leads,
+          },
+        _ -> next,
+      },
+  )
+}
 
-/// Whether a state takes `c`; `hidden` is a `.` leading a segment, which only a `Lit` takes.
-fn takes(symbol: Symbol, c: Char, separator: Char, hidden: Bool) -> Bool =
+fn joined(set: Map<Int, Unit>, more: List<Int>) -> Map<Int, Unit> =
+  fold(more, set, |reached: Map<Int, Unit>, to: Int| map_insert(reached, to, ()))
+
+/// Whether a state takes `c`. `hidden` is a `.` leading a segment of the path, which only a
+/// `Lit` that is `first`, leading its segment of the pattern, takes.
+fn takes(symbol: Symbol, c: Char, separator: Char, hidden: Bool, first: Bool) -> Bool =
   match symbol {
-    Lit(written) -> c == written,
+    Lit(written) -> c == written && (!hidden || first),
     Sep -> c == separator,
     One | Run -> c != separator && !hidden,
     Any | Deep -> !hidden,
@@ -386,34 +410,51 @@ fn finished(p: Parsing) -> List<Inst> / {glob.refused, abort.raise} =
 fn loops(symbol: Symbol) -> Bool = symbol == Run || symbol == Deep
 
 /// Each instruction as a state, and the states a match starts in. What follows a state is every
-/// state reached from the instruction after it, or from itself where it loops, taking nothing.
-fn states_of(program: List<Inst>) -> { states: Array<State>, start: Map<Int, Unit> } = {
-  let reached = fold(
+/// state reached from the instruction after it, or from itself where it loops, taking nothing;
+/// `first` are those reached with no loop left behind untaken, which is a `*` passed over.
+fn states_of(
+  program: List<Inst>,
+) -> { states: Array<State>, start: Map<Int, Unit>, first: Map<Int, Unit> } = {
+  let reached = reaches(program, true);
+  let led = reaches(program, false);
+  {
+    states: array_of_list(
+      map(enumerate(program), |i: { index: Int, value: Inst }|
+        match i.value {
+          Take(symbol) -> {
+            let after = if loops(symbol) { i.index } else { i.index + 1 };
+            {
+              symbol: symbol,
+              next: map_keys(from(reached, after)),
+              first: map_keys(from(led, after)),
+            }
+          },
+          _ -> { symbol: End, next: [], first: [] },
+        }),
+    ),
+    start: from(reached, 0),
+    first: from(led, 0),
+  }
+}
+
+/// For each instruction, the states reached from it taking nothing. A loop goes on to what
+/// follows it only where `past_loops` says so.
+fn reaches(program: List<Inst>, past_loops: Bool) -> Map<Int, Map<Int, Unit>> =
+  fold(
     reverse(enumerate(program)),
     map_new(),
     |done: Map<Int, Map<Int, Unit>>, i: { index: Int, value: Inst }|
       map_insert(done, i.index, match i.value {
         Take(symbol) ->
-          map_insert(if loops(symbol) { from(done, i.index + 1) } else { map_new() }, i.index, ()),
+          map_insert(
+            if past_loops && loops(symbol) { from(done, i.index + 1) } else { map_new() },
+            i.index,
+            (),
+          ),
         Fork(to) -> map_merge(from(done, i.index + 1), from(done, to)),
         Jump(to) -> from(done, to),
       }),
-  );
-  {
-    states: array_of_list(
-      map(enumerate(program), |i: { index: Int, value: Inst }|
-        match i.value {
-          Take(symbol) ->
-            {
-              symbol: symbol,
-              next: map_keys(from(reached, if loops(symbol) { i.index } else { i.index + 1 })),
-            },
-          _ -> { symbol: End, next: [] },
-        }),
-    ),
-    start: from(reached, 0),
-  }
-}
+  )
 
 /// The states reached from the instruction at `at` taking nothing; none past the last.
 fn from(reached: Map<Int, Map<Int, Unit>>, at: Int) -> Map<Int, Unit> =
@@ -453,7 +494,9 @@ fn yes(pattern: String, path: String) -> Case = { pattern: pattern, path: path, 
 
 fn no(pattern: String, path: String) -> Case = { pattern: pattern, path: path, matches: false }
 
-/// The rows of Go's `path/filepath` match table that name no malformed pattern.
+/// The rows of Go's `matchTests`, which `path/filepath` and `path` both carry, that name no
+/// malformed pattern. Go has no `**`, no braces and no `!`, and its `*` matches a leading `.`,
+/// which no row here asks of it.
 fn go_matches() -> List<Case> =
   [
     yes("abc", "abc"),
@@ -588,6 +631,21 @@ fn own_matches() -> List<Case> =
     yes("{.,}*", ".a"),
     no("ABC", "abc"),
     no("[A-Z]", "a"),
+    no("*.ply", ".ply"),
+    no("*.", "."),
+    no("*\\.", "."),
+    no("/*.", "/."),
+    no("*.a", ".a"),
+    no("*.*", ".a"),
+    no("a/*.b", "a/.b"),
+    no("*{.a,b}", ".a"),
+    no("{a/,*}.b", ".b"),
+    yes("{a/,*}.b", "a/.b"),
+    yes("{*,}.a", ".a"),
+    yes("**/.a", ".a"),
+    yes("a/{.b,c}", "a/.b"),
+    yes("\\.a", ".a"),
+    yes("*.a", "b.a"),
   ]
 
 test "`{c.pattern}` and `{c.path}`, as Go's table has them" for c: Case in go_matches() {
@@ -598,10 +656,168 @@ test "`{c.pattern}` and `{c.path}`" for c: Case in own_matches() {
   assert_eq(matches(glob_of(c.pattern), c.path), c.matches)
 }
 
+/// The paths of one small tree, its directories among them.
+fn tree() -> List<String> =
+  [
+    ".git",
+    ".git/config",
+    ".hidden",
+    "a",
+    "a.b",
+    "ab",
+    "c",
+    "src",
+    "src/.cache",
+    "src/.cache/x.ply",
+    "src/README.md",
+    "src/lib",
+    "src/lib/deep",
+    "src/lib/deep/more.ply",
+    "src/lib/util.ply",
+    "src/main.ply",
+    "test",
+    "test/unit",
+    "test/unit/t.ply",
+    "x",
+    "x/a",
+    "x/a/y",
+    "x/c",
+  ]
+
+type Expanded = { pattern: String, paths: List<String> }
+
+/// What bash 3.2, zsh 5.9 and Python 3.14's `glob` each expand a pattern to over `tree`, where
+/// each that reads the pattern answers alike: bash has no `**` there and Python no braces.
+fn expanded() -> List<Expanded> =
+  [
+    { pattern: "*", paths: ["a", "a.b", "ab", "c", "src", "test", "x"] },
+    { pattern: "?", paths: ["a", "c", "x"] },
+    { pattern: "??", paths: ["ab"] },
+    { pattern: "a*", paths: ["a", "a.b", "ab"] },
+    { pattern: "*b", paths: ["a.b", "ab"] },
+    { pattern: "*.ply", paths: [] },
+    { pattern: ".*", paths: [".git", ".hidden"] },
+    { pattern: ".h*", paths: [".hidden"] },
+    { pattern: "src/*", paths: ["src/README.md", "src/lib", "src/main.ply"] },
+    { pattern: "src/*.ply", paths: ["src/main.ply"] },
+    { pattern: "src/.*", paths: ["src/.cache"] },
+    { pattern: "src/.*/*", paths: ["src/.cache/x.ply"] },
+    {
+      pattern: "*/*",
+      paths: ["src/README.md", "src/lib", "src/main.ply", "test/unit", "x/a", "x/c"],
+    },
+    { pattern: "*/*/*", paths: ["src/lib/deep", "src/lib/util.ply", "test/unit/t.ply", "x/a/y"] },
+    { pattern: "*/*/*.ply", paths: ["src/lib/util.ply", "test/unit/t.ply"] },
+    { pattern: "src/*/*.ply", paths: ["src/lib/util.ply"] },
+    { pattern: "[a-c]", paths: ["a", "c"] },
+    { pattern: "[!a-c]*", paths: ["src", "test", "x"] },
+    { pattern: "[ac]*", paths: ["a", "a.b", "ab", "c"] },
+    { pattern: "?[.b]*", paths: ["a.b", "ab"] },
+    { pattern: "{a,c}", paths: ["a", "c"] },
+    { pattern: "*.{ply,md}", paths: [] },
+    { pattern: "src/*.{ply,md}", paths: ["src/README.md", "src/main.ply"] },
+    { pattern: "{src,test/unit}/*.ply", paths: ["src/main.ply", "test/unit/t.ply"] },
+    { pattern: "a{,b}", paths: ["a", "ab"] },
+    { pattern: "a{b,.b}", paths: ["a.b", "ab"] },
+    { pattern: "{a,.hidden}", paths: [".hidden", "a"] },
+    { pattern: "{src,x}/{lib,a}/*", paths: ["src/lib/deep", "src/lib/util.ply", "x/a/y"] },
+    { pattern: "{*.b,?}", paths: ["a", "a.b", "c", "x"] },
+    {
+      pattern: "**/*.ply",
+      paths: ["src/lib/deep/more.ply", "src/lib/util.ply", "src/main.ply", "test/unit/t.ply"],
+    },
+    {
+      pattern: "src/**/*.ply",
+      paths: ["src/lib/deep/more.ply", "src/lib/util.ply", "src/main.ply"],
+    },
+    { pattern: "**/c", paths: ["c", "x/c"] },
+    { pattern: "**/a", paths: ["a", "x/a"] },
+    { pattern: "**/y", paths: ["x/a/y"] },
+    { pattern: "x/**/y", paths: ["x/a/y"] },
+    { pattern: "x/**/c", paths: ["x/c"] },
+    { pattern: "**/.git/config", paths: [".git/config"] },
+    { pattern: "**/config", paths: [] },
+    { pattern: "**/lib/**/*.ply", paths: ["src/lib/deep/more.ply", "src/lib/util.ply"] },
+    {
+      pattern: "**/*",
+      paths: [
+        "a",
+        "a.b",
+        "ab",
+        "c",
+        "src",
+        "src/README.md",
+        "src/lib",
+        "src/lib/deep",
+        "src/lib/deep/more.ply",
+        "src/lib/util.ply",
+        "src/main.ply",
+        "test",
+        "test/unit",
+        "test/unit/t.ply",
+        "x",
+        "x/a",
+        "x/a/y",
+        "x/c",
+      ],
+    },
+  ]
+
+/// A closing `**`, where those three part ways and this dialect goes a fourth: zsh reads it as
+/// `*`, and Python, as bash's `globstar` is written to, answers the directory itself too. Here
+/// it is everything under the directory and not the directory.
+fn expanded_here() -> List<Expanded> =
+  [
+    {
+      pattern: "src/**",
+      paths: [
+        "src/README.md",
+        "src/lib",
+        "src/lib/deep",
+        "src/lib/deep/more.ply",
+        "src/lib/util.ply",
+        "src/main.ply",
+      ],
+    },
+    { pattern: "x/**", paths: ["x/a", "x/a/y", "x/c"] },
+    {
+      pattern: "**",
+      paths: [
+        "a",
+        "a.b",
+        "ab",
+        "c",
+        "src",
+        "src/README.md",
+        "src/lib",
+        "src/lib/deep",
+        "src/lib/deep/more.ply",
+        "src/lib/util.ply",
+        "src/main.ply",
+        "test",
+        "test/unit",
+        "test/unit/t.ply",
+        "x",
+        "x/a",
+        "x/a/y",
+        "x/c",
+      ],
+    },
+  ]
+
+test "`{c.pattern}` over the tree is what its row lists" for c: Expanded in concat(
+    expanded(),
+    expanded_here(),
+  ) {
+  let g = glob_of(c.pattern);
+  assert_eq(filter(tree(), |path: String| matches(g, path)), c.paths)
+}
+
 type Refused = { pattern: String, at: Int, why: Why }
 
-/// The malformed patterns of Go's table, then this dialect's own.
-fn refusals() -> List<Refused> =
+/// The malformed patterns of Go's `matchTests`, each of which it reports for some text and this
+/// reader refuses for all.
+fn go_refused() -> List<Refused> =
   [
     { pattern: "[]a]", at: 0, why: EmptyClass },
     { pattern: "[-]", at: 1, why: BadRange },
@@ -614,6 +830,10 @@ fn refusals() -> List<Refused> =
     { pattern: "[^bc", at: 0, why: UnclosedClass },
     { pattern: "a[", at: 1, why: UnclosedClass },
     { pattern: "a/b[", at: 3, why: UnclosedClass },
+  ]
+
+fn own_refused() -> List<Refused> =
+  [
     { pattern: "[!]", at: 0, why: EmptyClass },
     { pattern: "[z-a]", at: 3, why: BadRange },
     { pattern: "[a--]", at: 3, why: BadRange },
@@ -634,7 +854,10 @@ fn refusals() -> List<Refused> =
     { pattern: "a/**\\/b", at: 2, why: Globstar },
   ]
 
-test "`{c.pattern}` is refused where it goes wrong" for c: Refused in refusals() {
+test "`{c.pattern}` is refused where it goes wrong" for c: Refused in concat(
+    go_refused(),
+    own_refused(),
+  ) {
   assert_eq(compile(c.pattern), Err({ at: c.at, why: c.why }));
   assert_eq(try { read(c.pattern, options()) }, Err({ at: c.at, why: c.why }))
 }
@@ -789,22 +1012,22 @@ law "an escaped text compiles, and matches that text and no other"
 /// A pattern as a law draws one: the pieces a naive matcher reads directly.
 type Piece = | Exactly(Char) | Slash | Single | Many | Dirs | Rest | Ranged(Bool, Char, Char)
 
-fn a_char(n: Int) -> Char = match n & 3 { 0 -> 'a', 1 -> 'b', 2 -> '.', _ -> 'c' }
-
 /// Pieces from any integers, with `**` only where a whole segment may stand and no `*` beside
-/// another, which would write one.
+/// another, which would write one. Few characters, and many of them dots, stars and slashes, so
+/// that a pattern drawn often matches a path drawn and often meets a leading dot.
 fn pieces_of(seeds: List<Int>) -> List<Piece> =
   fold(seeds, [], |pieces: List<Piece>, n: Int| {
     let last = list_at(pieces, len(pieces) - 1);
     let fresh = last == None || last == Some(Slash) || last == Some(Dirs);
     let star = if last == Some(Many) { Single } else { Many };
-    push(pieces, match n >> 2 & 7 {
+    push(pieces, match n & 7 {
       0 -> Slash,
       1 -> Single,
       2 -> star,
-      3 -> if fresh { Dirs } else { star },
-      4 -> Ranged(n & 32 != 0, 'a', a_char(n | 1)),
-      _ -> Exactly(a_char(n)),
+      3 -> if fresh && n & 8 != 0 { Dirs } else { star },
+      4 -> Ranged(n & 8 != 0, 'a', if n & 16 != 0 { 'b' } else { 'a' }),
+      5 | 6 -> Exactly('.'),
+      _ -> Exactly(if n & 8 != 0 { 'a' } else { 'b' }),
     })
   })
 
@@ -830,24 +1053,43 @@ fn pattern_of(pieces: List<Piece>) -> String =
       }))
 
 fn path_of(seeds: List<Int>) -> String =
-  string_of_chars(map(seeds, |n: Int| if n & 12 == 0 { '/' } else { a_char(n) }))
+  string_of_chars(
+    map(seeds, |n: Int| match n & 7 { 0 | 1 -> '/', 2 | 3 | 4 -> '.', 5 | 6 -> 'a', _ -> 'b' }),
+  )
+
+/// A path made of the pattern's own pieces, each written one of the ways it may or may not be
+/// matched, so that whether the whole matches turns on the pieces' edges.
+fn path_near(pieces: List<Piece>, choices: List<Int>) -> String =
+  fold(enumerate(pieces), "", |acc: String, p: { index: Int, value: Piece }| {
+    let choice = at_or(choices, p.index, 0) & 3;
+    acc
+      ++ (match p.value {
+        Exactly(c) -> string_of_chars([c]),
+        Slash -> "/",
+        Single | Ranged(_, _, _) -> at_or([".", "a", "b", "/"], choice, ""),
+        Many -> at_or(["", "a", ".", "a.b"], choice, ""),
+        Dirs -> at_or(["", "a/", ".a/", "a/b/"], choice, ""),
+        Rest -> at_or(["", "a", "a/.b", "a/b"], choice, ""),
+      })
+  })
 
 /// What a pattern means, read off its pieces by trying every way to match: `fresh` is whether
-/// the path stands at a segment's start.
-fn naive(pieces: List<Piece>, path: List<Char>, fresh: Bool) -> Bool =
+/// the path stands at a segment's start, and `led` whether the pattern stands at one of its own,
+/// which a `*` passed over is not.
+fn naive(pieces: List<Piece>, path: List<Char>, fresh: Bool, led: Bool) -> Bool =
   match pieces {
     [] -> len(path) == 0,
     [Many, ..rest] ->
-      naive(rest, path, fresh)
+      naive(rest, path, fresh, false)
         || (match path {
-          [c, ..more] -> inside(c, fresh) && naive(pieces, more, false),
+          [c, ..more] -> inside(c, fresh) && naive(pieces, more, false, false),
           [] -> false,
         }),
-    [Dirs, ..rest] -> naive(rest, path, fresh) || deep(rest, path, fresh),
+    [Dirs, ..rest] -> naive(rest, path, fresh, led) || deep(rest, path, fresh),
     [Rest, ..] -> len(path) > 0 && whole(path, fresh),
     [piece, ..rest] -> match path {
       [] -> false,
-      [c, ..more] -> one(piece, c, fresh) && naive(rest, more, c == '/'),
+      [c, ..more] -> one(piece, c, fresh, led) && naive(rest, more, c == '/', piece == Slash),
     },
   }
 
@@ -856,7 +1098,8 @@ fn deep(rest: List<Piece>, path: List<Char>, fresh: Bool) -> Bool =
   match path {
     [] -> false,
     [c, ..more] ->
-      (c == '/' && naive(rest, more, true)) || (shown(c, fresh) && deep(rest, more, c == '/')),
+      (c == '/' && naive(rest, more, true, true))
+        || (shown(c, fresh) && deep(rest, more, c == '/')),
   }
 
 fn whole(path: List<Char>, fresh: Bool) -> Bool =
@@ -866,9 +1109,9 @@ fn shown(c: Char, fresh: Bool) -> Bool = !(fresh && c == '.')
 
 fn inside(c: Char, fresh: Bool) -> Bool = c != '/' && shown(c, fresh)
 
-fn one(piece: Piece, c: Char, fresh: Bool) -> Bool =
+fn one(piece: Piece, c: Char, fresh: Bool, led: Bool) -> Bool =
   match piece {
-    Exactly(written) -> c == written,
+    Exactly(written) -> c == written && (led || shown(c, fresh)),
     Slash -> c == '/',
     Single -> inside(c, fresh),
     Ranged(negated, lo, hi) -> inside(c, fresh) && (c >= lo && c <= hi) != negated,
@@ -880,5 +1123,17 @@ type Drawn = { pattern: List<Int>, deep: Bool, path: List<Int> }
 law "the automaton matches what trying every way to match does" =
   agrees(
     |d: Drawn| matches(glob_of(pattern_of(closing(d.pattern, d.deep))), path_of(d.path)),
-    |d: Drawn| naive(closing(d.pattern, d.deep), string_chars(path_of(d.path)), true),
+    |d: Drawn| naive(closing(d.pattern, d.deep), string_chars(path_of(d.path)), true, true),
+  )
+
+law "the automaton and trying every way agree on paths made of the pattern's own pieces" =
+  agrees(
+    |d: Drawn| {
+      let pieces = closing(d.pattern, d.deep);
+      matches(glob_of(pattern_of(pieces)), path_near(pieces, d.path))
+    },
+    |d: Drawn| {
+      let pieces = closing(d.pattern, d.deep);
+      naive(pieces, string_chars(path_near(pieces, d.path)), true, true)
+    },
   )
