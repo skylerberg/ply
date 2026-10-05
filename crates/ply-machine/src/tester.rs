@@ -1,6 +1,7 @@
 //! What `ply test` loads, binds and runs, as `crates/ply-cli/ply/tests.ply` asks for it through the
 //! effect `tester.ply` declares: a unit per program its tests run in, the host binding over the
-//! first, and one test or one interleaving of one on whichever thread asks.
+//! first, the cases a test ranges over, and one test or one interleaving of one on whichever
+//! thread asks.
 //!
 //! A compiled unit, the host binding and a Rust unwind are not values a program can hold, so those
 //! stay here. Which tests run, the keys each result is read and filed under, what the cache keeps,

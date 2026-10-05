@@ -1,6 +1,7 @@
-//! One test, or one interleaving of one, run on whichever thread asks: a fresh machine over the
-//! unit attached to this thread, the binding it may reach, and a Rust unwind out of it caught and
-//! reported as Ply's defect at the test's source. What the run comes to is the program's to say.
+//! One test, one interleaving of one, or the cases one ranges over, run on whichever thread asks: a
+//! fresh machine over the unit attached to this thread, the binding it may reach, and a Rust unwind
+//! out of it caught and reported as Ply's defect at the test's source. What the run comes to is
+//! the program's to say.
 
 use ply_eval::host::{HostBinding, HostUse};
 use ply_eval::{Case, Diagnostic, Interleaving, Seed, Span, Value, codes};
