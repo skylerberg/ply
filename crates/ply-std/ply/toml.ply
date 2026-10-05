@@ -37,16 +37,22 @@
 //! A `TomlCodec<a>` pairs an encoder with a decoder, as `std.json`'s `JsonCodec` does, and the
 //! codecs here are the ones a record's codec is written of. A decode error carries the path of
 //! keys to what was wrong, and `decode_bytes` and `decode_document` add the line and column it is
-//! written at. `only_fields` refuses a key a record does not have.
+//! written at. `only_fields` refuses a key a record does not have. A path's steps, a place and a
+//! decode error are `std.place`'s, which `std.yaml` reads and answers by too.
 
 import std.bytes
 import std.bytes (hex_value, is_digit, peek, scan, scan_until)
 import std.date
 import std.float (infinity, is_infinite, is_nan, nan, neg_infinity)
 import std.json (escaped_byte)
-import std.laws (agrees)
-import std.list (all, any, concat, drop, prepend, reverse, take)
+import std.gen
+import std.gen (Gen)
+import std.laws (agrees, round_trip)
+import std.list (all, any, concat, drop, reverse, take)
 import std.option (option_map, option_unwrap_or)
+import std.place (DecodeError, Index, Key, Place, Step, decode_error, decode_fields, decode_items)
+import std.place (error_to_string, in_field, path_to_string, place_at, spliced, unknown_key)
+import std.place (utf8_end)
 import std.result (result_err, result_map, result_map_err, result_ok)
 import std.string
 import std.string (join)
@@ -142,13 +148,6 @@ pub fn get(t: Toml, name: String) -> Option<Toml> =
     _ -> None,
   }
 
-/// One step from a value to a value inside it.
-pub type Step =
-  /// Into a table, by a key.
-  | Key(String)
-  /// Into an array, by an index from 0.
-  | Index(Int)
-
 /// The value a path leads to from `t`, where every step of it is there.
 pub fn at(t: Toml, path: List<Step>) -> Option<Toml> =
   match path {
@@ -212,14 +211,6 @@ pub fn without(t: Toml, path: List<Step>) -> Toml =
       Some(child) -> match put(t, [step], without(child, rest)) { Some(made) -> made, None -> t },
     },
   }
-
-/// A path as a dotted key writes it, with an index in brackets: `servers.alpha[2]."a b"`.
-pub fn path_to_string(path: List<Step>) -> String =
-  fold(path, "", |written: String, step: Step|
-    match step {
-      Key(name) -> (if written == "" { "" } else { written ++ "." }) ++ key_text(name),
-      Index(i) -> written ++ "[" ++ int_to_string(i) ++ "]",
-    })
 
 // --- Refusals ---------------------------------------------------------------
 
@@ -1051,36 +1042,13 @@ fn shaped(shape: Shape) -> Toml =
 
 fn syntax(src: Bytes, limits: Limits) -> List<Item> / {fault.at, abort.raise} =
   if bytes_len(src) > limits.bytes { stop(max(limits.bytes, 0), TooLong) }
-  else if !bytes_is_utf8(src) { stop(first_invalid(src, 0, bytes_len(src)), NotUtf8) }
+  else if !bytes_is_utf8(src) { stop(utf8_end(src), NotUtf8) }
   else if bytes_starts_with(src, b"\xef\xbb\xbf") {
     stop(0, Expected("a document with no byte order mark"))
   } else { expressions(src, 0, limits.depth, 0, [], bytes_len(src) + 1) }
 
-/// Where the first byte that is no part of a UTF-8 character stands. Each character takes a byte,
-/// so the bytes bound them: `left`.
-fn first_invalid(src: Bytes, i: Int, left: Int) -> Int / {abort.raise} = {
-  let lead = peek(src, i);
-  let width = if lead < 128 { 1 } else if lead < 224 { 2 } else if lead < 240 { 3 } else { 4 };
-  if lead < 0 || left <= 0 || i + width > bytes_len(src)
-      || !bytes_is_utf8(bytes_slice(src, i, i + width)) { i }
-  else { first_invalid(src, i + width, left - 1) }
-}
-
-/// A line and a column of a text, both from 1, the column counted in characters.
-pub type Place = new { line: Int, column: Int }
-
-/// Where the byte at `offset` stands.
-fn place_of(src: Bytes, offset: Int) -> Place = {
-  let n = bytes_len(src);
-  let upto = if offset < 0 { 0 } else if offset > n { n } else { offset };
-  let before = handle { bytes_slice(src, 0, upto) } with { abort.raise(_) -> src };
-  let lines = handle { bytes_split(before, b"\n") } with { abort.raise(_) -> [before] };
-  let last = match list_at(lines, len(lines) - 1) { Some(line) -> line, None -> b"" };
-  { line: len(lines), column: string_len(string_of_bytes_lossy(last)) + 1 }
-}
-
 fn placed(src: Bytes, offset: Int, why: Why) -> Refusal = {
-  let stood = place_of(src, offset);
+  let stood = place_at(src, offset);
   { offset: offset, line: stood.line, column: stood.column, why: why }
 }
 
@@ -1195,9 +1163,6 @@ fn key_bytes(name: String) -> Bytes / {abort.raise} = {
   else { bytes_concat_all(put_string([], raw, false)) }
 }
 
-fn key_text(name: String) -> String =
-  handle { string_of_bytes(key_bytes(name)) } with { abort.raise(_) -> name }
-
 fn put_member(out: List<Bytes>, e: Entry, own_line: Bool) -> List<Bytes> / {abort.raise} =
   put_value(push(push(out, key_bytes(e.key)), b" = "), e.value, own_line)
 
@@ -1289,7 +1254,7 @@ fn put_escaped(
 /// A document as it was written: its bytes, where each key, header and value stands in them, the
 /// path of each header's table, the value they mean, and the limits it was read under, which its
 /// edits are held to as well.
-pub type Document = new {
+pub opaque type Document = new {
   source: Bytes,
   items: List<Item>,
   sections: List<List<Step>>,
@@ -1423,11 +1388,7 @@ fn position(d: Document, path: List<Step>) -> Option<Int> =
 /// a header names it, and otherwise the first line that defines something inside it; the empty
 /// path is the document's first. `None` for a path the document does not hold.
 pub fn place(d: Document, path: List<Step>) -> Option<Place> =
-  option_map(position(d, path), |offset: Int| place_of(d.source, offset))
-
-/// `src` with the bytes from `from` up to `to` replaced.
-fn spliced(src: Bytes, from: Int, to: Int, with_bytes: Bytes) -> Bytes / {abort.raise} =
-  bytes_concat_all([bytes_slice(src, 0, from), with_bytes, bytes_slice(src, to, bytes_len(src))])
+  option_map(position(d, path), |offset: Int| place_at(d.source, offset))
 
 /// Where the line holding `i` starts: past the blanks before it.
 fn line_start(src: Bytes, i: Int) -> Int / {abort.raise} =
@@ -1768,13 +1729,6 @@ fn headed_text(
 
 // --- Codecs -----------------------------------------------------------------
 
-/// Why a value did not decode: the path to what was wrong, the line and column it is written at
-/// where the text was at hand, and what was wrong.
-pub type DecodeError = new { path: List<Step>, place: Option<Place>, message: String }
-
-/// An error with no path yet; the decoders around it add the steps.
-pub fn decode_error(message: String) -> DecodeError = { path: [], place: None, message: message }
-
 /// An error saying `what` was expected and naming the kind of value `found` is instead.
 pub fn expected(what: String, found: Toml) -> DecodeError =
   decode_error("expected " ++ what ++ ", found " ++ kind_of(found))
@@ -1793,25 +1747,6 @@ pub fn kind_of(t: Toml) -> String =
     Array(_) -> "an array",
     Table(_) -> "a table",
   }
-
-/// A path is built inside out: each enclosing decoder prefixes the step it took.
-pub fn in_field(name: String, e: DecodeError) -> DecodeError =
-  { path: prepend(Key(name), e.path), place: e.place, message: e.message }
-
-/// `e`, one array index further in.
-pub fn in_index(index: Int, e: DecodeError) -> DecodeError =
-  { path: prepend(Index(index), e.path), place: e.place, message: e.message }
-
-/// `line 4, column 8: servers.alpha.port: expected an integer, found a string`, without the place
-/// or the path where the error has none.
-pub fn error_to_string(e: DecodeError) -> String =
-  (match e.place {
-      Some(stood) ->
-        "line " ++ int_to_string(stood.line) ++ ", column " ++ int_to_string(stood.column) ++ ": ",
-      None -> "",
-    })
-    ++ (if len(e.path) == 0 { "" } else { path_to_string(e.path) ++ ": " })
-    ++ e.message
 
 /// How to write an `a` as TOML and read one back.
 pub type TomlCodec<a> = {
@@ -1849,22 +1784,17 @@ pub fn optional_field<a>(
     _ -> Err(expected("a table", t)),
   }
 
-/// Refuses a table that holds a key outside `names`, naming the first: what a record's decoder
-/// calls so a misspelt key is an error and not a default.
+/// Refuses a table that holds a key outside `names`, naming the first and the name it is a slip
+/// from where there is one: what a record's decoder calls so a misspelt key is an error and not a
+/// default.
 pub fn only_fields(t: Toml, names: List<String>) -> Result<Unit, DecodeError> =
   match t {
     Table(entries) ->
       fold(entries, Ok(()), |so_far: Result<Unit, DecodeError>, e: Entry|
         match so_far {
           Err(_) -> so_far,
-          Ok(_) -> if any(names, |name: String| name == e.key) { so_far } else {
-            Err(
-              in_field(
-                e.key,
-                decode_error("this key is not one of " ++ join(map(names, key_text), ", ")),
-              ),
-            )
-          },
+          Ok(_) -> if any(names, |name: String| name == e.key) { so_far }
+          else { Err(unknown_key(e.key, names)) },
         }),
     _ -> Err(expected("a table", t)),
   }
@@ -1943,21 +1873,10 @@ pub fn list_toml<a>(item: TomlCodec<a>) -> TomlCodec<List<a>> =
   {
     encode: |xs: List<a>| Array(map(xs, |x: a| (item.encode)(x))),
     decode: |t: Toml|
-      match t { Array(items) -> collect(items, item, 0, []), _ -> Err(expected("an array", t)) },
-  }
-
-fn collect<a>(
-  items: List<Toml>,
-  item: TomlCodec<a>,
-  index: Int,
-  acc: List<a>,
-) -> Result<List<a>, DecodeError> / {abort.raise} =
-  match items {
-    [] -> Ok(acc),
-    [x, ..rest] -> match (item.decode)(x) {
-      Err(e) -> Err(in_index(index, e)),
-      Ok(v) -> collect(rest, item, index + 1, push(acc, v)),
-    },
+      match t {
+        Array(items) -> decode_items(items, item.decode),
+        _ -> Err(expected("an array", t)),
+      },
   }
 
 /// A map keyed by `String` is a table, written in key order.
@@ -1970,22 +1889,9 @@ pub fn string_map_toml<v>(value: TomlCodec<v>) -> TomlCodec<Map<String, v>> =
       ),
     decode: |t: Toml|
       match t {
-        Table(entries) -> collect_entries(entries, value, map_new()),
+        Table(entries) -> decode_fields(entries, value.decode),
         _ -> Err(expected("a table", t)),
       },
-  }
-
-fn collect_entries<v>(
-  entries: List<Entry>,
-  value: TomlCodec<v>,
-  acc: Map<String, v>,
-) -> Result<Map<String, v>, DecodeError> / {abort.raise} =
-  match entries {
-    [] -> Ok(acc),
-    [e, ..rest] -> match (value.decode)(e.value) {
-      Err(err) -> Err(in_field(e.key, err)),
-      Ok(v) -> collect_entries(rest, value, map_insert(acc, e.key, v)),
-    },
   }
 
 /// Reads a document and decodes its value with `codec`. A refusal of the text is an error at its
@@ -2038,22 +1944,6 @@ pub fn encode_string<a>(x: a, codec: TomlCodec<a>) -> String / {abort.raise} =
 
 // --- Laws -------------------------------------------------------------------
 
-/// What a law draws a value from: a `Toml` holds dates, and a date drawn as a constructor's raw
-/// count is none `std.date` makes.
-type Seed =
-  | SString(String)
-  | SInteger(Int)
-  | SFloat(Float)
-  | SBoolean(Bool)
-  | SInstant(Int, Int, Int)
-  | SDateTime(Int, Int)
-  | SDate(Int)
-  | STime(Int)
-  | SArray(List<Seed>)
-  | STable(List<Sown>)
-
-type Sown = { key: String, value: Seed }
-
 /// Any count as a day of the calendar, which has 3,652,425 of them.
 fn some_date(n: Int) -> date::Date = {
   let round = if n >= 0 { n % 3652425 } else { (n + 1) % 3652425 + 3652424 };
@@ -2075,44 +1965,100 @@ fn some_instant(days: Int, nanos: Int, minutes: Int) -> date::OffsetDateTime = {
   option_unwrap_or(date::at_offset(reading, east), date::utc(reading))
 }
 
-fn grown(s: Seed) -> Toml =
-  match s {
-    SString(text) -> String(text),
-    SInteger(n) -> Integer(n),
-    SFloat(f) -> Float(f),
-    SBoolean(b) -> Boolean(b),
-    SInstant(days, nanos, minutes) -> OffsetDateTime(some_instant(days, nanos, minutes)),
-    SDateTime(days, nanos) -> LocalDateTime(date::at(some_date(days), some_time(nanos))),
-    SDate(days) -> LocalDate(some_date(days)),
-    STime(nanos) -> LocalTime(some_time(nanos)),
-    SArray(items) -> Array(map(items, grown)),
-    STable(fields) -> grown_table(fields),
+gen for Toml by tomls
+
+/// What a sampled claim draws a value from: every kind of value, nested three deep, a date and
+/// a time through `std.date`'s makers and a table through `table`, so each is one a reader
+/// answers.
+fn tomls() -> Gen<Toml> = drawn(3)
+
+fn drawn(depth: Int) -> Gen<Toml> =
+  if depth <= 0 { drawn_leaves() } else {
+    gen::one_of([
+      drawn_leaves(),
+      gen::map(gen::list_of(drawn(depth - 1), 3), |items: List<Toml>| Array(items)),
+      gen::map(gen::list_of(drawn_entries(depth - 1), 3), table),
+    ])
   }
 
-fn grown_table(fields: List<Sown>) -> Toml =
-  table(map(fields, |f: Sown| { key: f.key, value: grown(f.value) }))
+fn drawn_entries(depth: Int) -> Gen<Entry> = gen::map2(drawn_text(), drawn(depth), entry)
+
+fn drawn_leaves() -> Gen<Toml> =
+  gen::one_of([
+    gen::map(drawn_text(), |text: String| String(text)),
+    gen::map(gen::int(), |n: Int| Integer(n)),
+    gen::map(gen::int(), |bits: Int| Float(float_of_bits(bits))),
+    gen::map(gen::bool(), |flag: Bool| Boolean(flag)),
+    gen::map(gen::int(), |days: Int| LocalDate(some_date(days))),
+    gen::map(gen::int(), |nanos: Int| LocalTime(some_time(nanos))),
+    gen::map2(gen::int(), gen::int(), |days: Int, nanos: Int|
+      LocalDateTime(date::at(some_date(days), some_time(nanos)))),
+    gen::map2(
+      gen::map2(gen::int(), gen::int(), |days: Int, nanos: Int| (days, nanos)),
+      gen::int(),
+      |reading: (Int, Int), minutes: Int|
+        OffsetDateTime(some_instant(reading._0, reading._1, minutes)),
+    ),
+  ])
+
+/// A string joined of what a writer has to choose a spelling for.
+fn drawn_text() -> Gen<String> =
+  gen::map(
+    gen::list_of(
+      gen::elements([
+        "a",
+        "key",
+        " ",
+        ".",
+        "=",
+        "#",
+        "[",
+        "]",
+        "{",
+        "}",
+        ",",
+        "'",
+        "\"",
+        "\\",
+        "\n",
+        "\r",
+        "\t",
+        "-",
+        "_",
+        "1",
+        "true",
+        "é",
+        "\u{1F600}",
+        "\0",
+        "\u{7f}",
+        "\u{1b}",
+        "\"\"\"",
+        "'''",
+      ]),
+      4,
+    ),
+    |parts: List<String>| join(parts, ""),
+  )
 
 /// More than a value a law draws reaches.
 fn wide() -> Limits = { bytes: 1073741824, depth: 512 }
 
 law "a document reads back from what was written of it" =
-  agrees(|fields: List<Sown>| parse(to_bytes(grown_table(fields)), wide()), |fields: List<Sown>|
-    Ok(grown_table(fields)))
+  agrees(|entries: List<Entry>| parse(to_bytes(table(entries)), wide()), |entries: List<Entry>|
+    Ok(table(entries)))
 
 law "a value reads back from its inline text" =
-  agrees(|s: Seed| parse_string("v = " ++ inline(grown(s)), wide()), |s: Seed|
-    Ok(Table([{ key: "v", value: grown(s) }])))
+  round_trip(|t: Toml| "v = " ++ inline(t), |text: String|
+    match parse_string(text, wide()) { Ok(read) -> get(read, "v"), Err(_) -> None })
 
-law "a table is the same table whatever the order of its keys" =
-  agrees(
-    |fields: List<Sown>|
-      match grown_table(fields) { Table(entries) -> Table(reverse(entries)), other -> other },
-    grown_table,
-  )
+law "a table is the same table whatever the order of its keys"
+  forall (entries: List<Entry>) {
+    match table(entries) { Table(held) -> Table(reverse(held)) == table(entries), _ -> false }
+  }
 
 law "a document keeps the bytes it was read from, and means what a reader reads of them"
-  forall (fields: List<Sown>) {
-    let text = to_bytes(grown_table(fields));
+  forall (entries: List<Entry>) {
+    let text = to_bytes(table(entries));
     match parse_document(text, wide()) {
       Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, wide()),
       Err(_) -> false,
@@ -2120,16 +2066,16 @@ law "a document keeps the bytes it was read from, and means what a reader reads 
   }
 
 law "a key set in a document is set in its value, and removed from both"
-  forall (fields: List<Sown>, key: String, s: Seed) {
-    let before = grown_table(fields);
+  forall (entries: List<Entry>, key: String, v: Toml) {
+    let before = table(entries);
     let path = [Key(key)];
     match parse_document(to_bytes(before), wide()) {
       Err(_) -> false,
-      Ok(d) -> match try { set(d, path, grown(s)) } {
+      Ok(d) -> match try { set(d, path, v) } {
         Err(_) -> false,
         Ok(changed) -> {
           let taken = try { value(remove(changed, path)) };
-          Some(value(changed)) == put(before, path, grown(s)) && taken == Ok(without(before, path))
+          Some(value(changed)) == put(before, path, v) && taken == Ok(without(before, path))
         },
       },
     }
@@ -3366,7 +3312,7 @@ test "a decode error says the path of keys and the line and column it is written
   );
   assert_eq(
     decode_failure(string::replace(fleet_text(), "tags = []", "tags = []\nprot = 1")),
-    "line 11, column 8: server[1].prot: this key is not one of host, port, tags, since",
+    "line 11, column 8: server[1].prot: this key is not one of host, port, tags, since; did you mean port?",
   );
   assert_eq(
     decode_failure("server = 1"),

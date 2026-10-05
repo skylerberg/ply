@@ -3,7 +3,11 @@ use ply_host::observe::{self, Binary, Read, World};
 use std::path::{Path, PathBuf};
 
 fn module(name: &str) -> Option<String> {
-    (name == "std.list").then(|| "list digest".to_string())
+    match name {
+        "std.list" => Some("list digest".to_string()),
+        "std/words/list.txt" => Some("words digest".to_string()),
+        _ => None,
+    }
 }
 
 fn world<'a>(roots: &'a [(String, PathBuf)], binding: &str) -> World<'a> {
@@ -171,8 +175,23 @@ fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_li
     let recorder = observe::begin(m);
     observe::read(m, Read::File, &real.join("shipped/std.list.ply"));
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    observe::end(&recorder);
     assert_eq!(trace, "shipped\tstd.list\tlist digest\n");
+    // A data file a module embeds lies below them under its name, and no view stands for it.
+    observe::read(m, Read::File, &real.join("shipped/std/words/list.txt"));
+    observe::reached(m, VIEW, true);
+    let embedding = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
+    assert_eq!(
+        embedding,
+        "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd/words/list.txt\twords digest\n"
+    );
+    // What lies beside them is the program's.
+    observe::read(m, Read::File, &real.join("shipped/stamps"));
+    let stamped = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
+    observe::end(&recorder);
+    assert!(
+        stamped.starts_with("program\tprogram digest\n"),
+        "{stamped}"
+    );
 }
 
 const VIEW: &str =

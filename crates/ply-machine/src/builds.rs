@@ -54,8 +54,8 @@ pub fn digest_of<T: AsRef<str>>(modules: &[(String, T)]) -> String {
     h.finalize().to_hex()[..16].to_string()
 }
 
-/// What a builder is a function of: the shipped modules it is built from, the compiler among them, and the
-/// runtime its unit is compiled against.
+/// What a builder is a function of: the shipped modules it is built from, the compiler among them
+/// and the data files they embed, and the runtime its unit is compiled against.
 pub fn identity() -> String {
     static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     IDENTITY
@@ -63,8 +63,8 @@ pub fn identity() -> String {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"ply builder 1\0");
             // A stage's name: what it holds is a product of it, so reading it is no test's input.
-            let shipped = ply_pack::unrecorded(crate::shipped_modules::sources);
-            hasher.update(digest_of(&shipped).as_bytes());
+            let shipped = ply_pack::unrecorded(crate::shipped_modules::digest);
+            hasher.update(shipped.as_bytes());
             hasher.update(&[0]);
             hasher.update(ply_codegen::c::runtime_digest().as_bytes());
             hasher.finalize().to_hex()[..16].to_string()
