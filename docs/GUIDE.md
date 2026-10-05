@@ -555,7 +555,7 @@ types, values and patterns, accessed as `t._0`. `(A)` only groups; `()` is
 `Unit`.
 
 An alias may take parameters and name a type that constrains them, as
-`type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
+`std.set`'s `type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
 constraint: each signature that uses it promises what its expansion needs,
 `where derivable(ord, a)` here, and one that does not is `E0206` where it names
 the alias. It may take label and row parameters too (§4.5):
@@ -621,7 +621,7 @@ compared, ordered and derived element by element, and has no literal: build it
 with `array_new` or `array_of_list` (§12). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
-written `#[a, b]`. It iterates in `compare` order. Its key type
+written `#[a, b]`, and `std.set` names its type `Set<a>`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
 `Task` and `Chan` are refused (`E0206`).
 
