@@ -44,19 +44,12 @@ jobs:
     name: CI tables and cache keys are total, and the ucontext probe
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    outputs:
-      partitions: ${{ steps.tables.outputs.partitions }}
-      nextest: ${{ steps.tables.outputs.nextest }}
-      corpus: ${{ steps.tables.outputs.corpus }}
-      shards: ${{ steps.cut.outputs.shards }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # What the last run's test jobs measured, this branch's own or main's. A first run, an evicted
-      # entry or a fork with no access leaves nothing here: the shards are then sliced by test count
-      # and the corpus runs dealt round robin.
+      # What the last run's test jobs measured, which `verify` holds the shards to.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/ply-test-timings
@@ -73,40 +66,6 @@ jobs:
 
       - name: ./probes/ucontext/run.sh
         run: ./probes/ucontext/run.sh
-
-      # One job cuts the shards, and every partition runs the cut it left: two that cut their own
-      # from tables a run apart could agree on no test at all.
-      - name: The shards those durations cut
-        id: cut
-        run: |
-          set -euo pipefail
-          rc=0
-          .github/ci-shards.sh shard-configs /tmp/ply-shards || rc=$?
-          case "$rc" in
-            0) echo "shards=true" >> "$GITHUB_OUTPUT" ;;
-            3) echo "shards=false" >> "$GITHUB_OUTPUT" ;;
-            *) exit "$rc" ;;
-          esac
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.cut.outputs.shards == 'true'
-        with:
-          path: /tmp/ply-shards
-          key: test-shards-${{ github.run_id }}
-      # A save that cannot reserve its key only warns; fail here rather than in every job that reads it.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.cut.outputs.shards == 'true'
-        with:
-          path: /tmp/ply-shards
-          key: test-shards-${{ github.run_id }}
-          lookup-only: true
-          fail-on-cache-miss: true
-
-      - name: Emit the matrices
-        id: tables
-        run: |
-          echo "partitions=$(.github/ci-shards.sh partitions)" >> "$GITHUB_OUTPUT"
-          echo "nextest=$(.github/ci-shards.sh nextest-shards)" >> "$GITHUB_OUTPUT"
-          echo "corpus=$(.github/ci-shards.sh corpus-matrix)" >> "$GITHUB_OUTPUT"
 
   clippy:
     name: cargo fmt --all --check and cargo clippy --workspace --all-targets
@@ -235,10 +194,54 @@ jobs:
       RUSTC_WRAPPER: sccache
     outputs:
       built: ${{ steps.stage-cache.outputs.cache-hit != 'true' && steps.shared.outputs.found != 'true' }}
+      shards: ${{ steps.cut.outputs.shards }}
+      nextest: ${{ steps.cut.outputs.nextest }}
+      partitions: ${{ steps.selected.outputs.partitions }}
+      lanes: ${{ steps.selected.outputs.lanes }}
+      corpus: ${{ steps.selected.outputs.corpus }}
+      solo: ${{ steps.selected.outputs.solo }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # What the last run's test jobs measured, this branch's own or main's. A first run, an evicted
+      # entry or a fork with no access leaves nothing here: the shards are then sliced by test count
+      # and the corpus runs dealt round robin.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/ply-test-timings
+          key: test-timings-${{ github.run_id }}
+          restore-keys: test-timings-
+      # One job cuts the shards, and every partition runs the cut it left: two that cut their own
+      # from tables a run apart could agree on no test at all. This one, since it asks what each
+      # partition of the cut has left to run before any starts.
+      - name: The shards those durations cut
+        id: cut
+        run: |
+          set -euo pipefail
+          rc=0
+          .github/ci-shards.sh shard-configs /tmp/ply-shards || rc=$?
+          case "$rc" in
+            0) echo "shards=true" >> "$GITHUB_OUTPUT" ;;
+            3) echo "shards=false" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+          echo "nextest=$(.github/ci-shards.sh nextest-shards)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.cut.outputs.shards == 'true'
+        with:
+          path: /tmp/ply-shards
+          key: test-shards-${{ github.run_id }}
+      # A save that cannot reserve its key only warns; fail here rather than in every job that reads it.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.cut.outputs.shards == 'true'
+        with:
+          path: /tmp/ply-shards
+          key: test-shards-${{ github.run_id }}
+          lookup-only: true
+          fail-on-cache-miss: true
+
       - uses: ./.github/actions/rust-key
         id: rust
       # The runtime alone, before any pack: what the Rust key is a key of.
@@ -367,6 +370,25 @@ jobs:
       # program never asks for: without this, every later job's first compiles built it again.
       - name: The emitter, for every job after this one
         run: .github/ci-warm.sh target/release/ply
+      # What earlier runs kept of each Ply run: the passes its tests took and the answer it kept.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/ply-upstream
+          key: ply-upstream-${{ github.run_id }}
+          restore-keys: ply-upstream-
+      # The partitions and corpus jobs to start: those holding a run no kept answer stands for. Each
+      # is asked as its job asks it, by the `ply` the suite jobs run at the path their grants name.
+      - name: The Ply runs left to run
+        id: selected
+        env:
+          SHARDS: ${{ steps.cut.outputs.shards }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/debug
+          cp target/release/ply target/debug/ply
+          cut=
+          if [ "$SHARDS" = true ]; then cut=/tmp/ply-shards; fi
+          .github/ci-corpus.sh select "$cut" | tee -a "$GITHUB_OUTPUT"
       # Every job restores what this one saves, so it saves what this job's `ply`s read and wrote.
       - name: The stage, cut to what this job used
         if: steps.stage-cache.outputs.cache-hit != 'true'
@@ -413,13 +435,13 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.nextest) }}
+      matrix: ${{ fromJSON(needs.build-ply.outputs.nextest) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: needs.plan.outputs.shards == 'true'
+        if: needs.build-ply.outputs.shards == 'true'
         with:
           path: /tmp/ply-shards
           key: test-shards-${{ github.run_id }}
@@ -450,7 +472,7 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           OF: ${{ matrix.of }}
-          SHARDS: ${{ needs.plan.outputs.shards }}
+          SHARDS: ${{ needs.build-ply.outputs.shards }}
           PLY_TEST_TRACES: /tmp/ply-rust-traces-new
         run: |
           set -euo pipefail
@@ -528,24 +550,26 @@ jobs:
           path: /tmp/ply-c-nextest
           key: ply-c-nextest-${{ matrix.shard }}-${{ github.run_id }}
 
-  # The corpus runs a partition takes, each lane a process beside the others.
+  # The corpus runs a partition takes, each lane a process beside the others: only a partition
+  # `build-ply` found a run no kept answer stands for.
   lanes:
     name: lanes ${{ matrix.shard }}/${{ matrix.of }}
     # After `build-ply`, whose stage it restores: a run that changed the compiler would otherwise
     # have each lane emit the emitter's stage itself. On a pull request, where `refresh` does not
     # run, this is the run's critical path.
     needs: [plan, build, build-ply]
+    if: needs.build-ply.outputs.lanes == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.partitions) }}
+      matrix: ${{ fromJSON(needs.build-ply.outputs.partitions) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: needs.plan.outputs.shards == 'true'
+        if: needs.build-ply.outputs.shards == 'true'
         with:
           path: /tmp/ply-shards
           key: test-shards-${{ github.run_id }}
@@ -603,7 +627,7 @@ jobs:
       - name: The corpus runs this partition takes
         env:
           SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ needs.plan.outputs.shards }}
+          SHARDS: ${{ needs.build-ply.outputs.shards }}
         run: |
           set -euo pipefail
           plan=()
@@ -762,20 +786,20 @@ jobs:
       # not report. A pull request writes one too, into its own cache: a branch cuts by what its own
       # tree measured, and main is never cut by a branch's.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: needs.nextest.result == 'success' && needs.lanes.result == 'success' && needs.corpus.result == 'success'
+        if: needs.nextest.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
         with:
           path: /tmp/ply-test-timings
           key: test-timings-${{ github.run_id }}
           restore-keys: test-timings-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.nextest.result == 'success' && needs.lanes.result == 'success' && needs.corpus.result == 'success'
+        if: needs.nextest.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
         with:
           pattern: timings-*
           merge-multiple: true
           path: /tmp/ply-timings-parts
       - name: One duration per test
         id: timings
-        if: needs.nextest.result == 'success' && needs.lanes.result == 'success' && needs.corpus.result == 'success'
+        if: needs.nextest.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
         run: |
           set -euo pipefail
           before=/tmp/ply-timings-before.tsv
@@ -1028,15 +1052,17 @@ jobs:
   # the corpus's checks that start desks under load, cut by duration over the `desks-<k>` runners,
   # which spawn this run's `ply` over desks and floors with the grants `benches/corpus.sh` gives the
   # program, and the CLI suite's `cli-` runs that take every core, a runner each. Postgres beside them
-  # holds the desk's schema, and the database checks are handed its URL as `CORPUS_DB`.
+  # holds the desk's schema, and the database checks are handed its URL as `CORPUS_DB`. Only the ones
+  # `build-ply` found a run no kept answer stands for start.
   corpus:
     name: test corpus ${{ matrix.id }}
     needs: [plan, build, build-ply]
+    if: needs.build-ply.outputs.solo == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.corpus) }}
+      matrix: ${{ fromJSON(needs.build-ply.outputs.corpus) }}
     services:
       postgres:
         image: postgres:17
@@ -1055,7 +1081,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: needs.plan.outputs.shards == 'true' && startsWith(matrix.id, 'desks-')
+        if: needs.build-ply.outputs.shards == 'true' && startsWith(matrix.id, 'desks-')
         with:
           path: /tmp/ply-shards
           key: test-shards-${{ github.run_id }}
@@ -1119,7 +1145,7 @@ jobs:
       - name: ply test
         env:
           ID: ${{ matrix.id }}
-          SHARDS: ${{ needs.plan.outputs.shards }}
+          SHARDS: ${{ needs.build-ply.outputs.shards }}
         run: |
           set -euo pipefail
           case "$ID" in
@@ -1127,9 +1153,7 @@ jobs:
             desks-*)
               cut=
               if [ "$SHARDS" = true ]; then cut=/tmp/ply-shards; fi
-              .github/ci-corpus.sh desks "${ID#desks-}" "/tmp/timings-$ID.tsv" "$cut" \
-                --exec "http_floor=$PWD/target/http-floor" --exec "pg_floor=$PWD/target/pg-floor" \
-                --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk ;;
+              .github/ci-corpus.sh desks "${ID#desks-}" "/tmp/timings-$ID.tsv" "$cut" ;;
             *) echo "no corpus job runs '$ID'" >&2; exit 1 ;;
           esac
       # What the next run cuts the desk runners from.
@@ -1209,12 +1233,14 @@ jobs:
           set -euo pipefail
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
-          # `refresh` runs on main only.
+          # `refresh` runs on main only, and `build-ply` starts no partition or corpus job whose runs
+          # what earlier runs kept answers.
           not_ok=$(jq -r --arg event "$EVENT" '
             to_entries[]
             | select(.value.result != "success")
             | select(($event == "pull_request" and .value.result == "skipped"
                 and .key == "refresh") | not)
+            | select((.value.result == "skipped" and (.key == "lanes" or .key == "corpus")) | not)
             | "\(.key) = \(.value.result)"
           ' /tmp/needs.json)
           if [ -n "$not_ok" ]; then
