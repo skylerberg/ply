@@ -1,0 +1,413 @@
+//! Tagged literals, settled before anything runs. `tag"text"` is the call `tag::literal("text")`,
+//! and a load that checked has not yet run it: here each one the run's own modules hold is entered
+//! on a machine of its own, under a step budget, and what its parser answers is the literal's
+//! verdict. A verdict is a function of the parser and the text, so it is kept under the hash of all
+//! the parser reaches and the text, in the toolchain's cache.
+
+import compiler.front (Analysis, TaggedSite, tagged_sites)
+import compiler.hash (closure_of, hex)
+import compiler.interface (sized)
+import compiler.lexer (utf8_len)
+import compiler.load (every_root)
+import compiler.parsing (Span)
+import compiler.resolve (Diag, error_at)
+import compiler.unit (read_kept, write_kept)
+import diagnostic (Place, shown)
+import env (env)
+import machine (machine, Called, default_options, unconfigured)
+import program (Timed, front_of)
+import sources (under_abs)
+import std.bin
+import std.fs (fs)
+import std.hash (blake3)
+import std.list (at, contains)
+import std.random (entropy)
+import std.time (time)
+import std.value (Value, VCtor, VInt, VRecord, VStr, render, field_named)
+import units (emit, text_of)
+
+/// The calls a literal's parser may make before the check gives up on it.
+pub fn step_budget() -> Int = 10000000
+
+/// What a parser said of a text. `Rejected` is its own `Err`: where in the text, in characters, and
+/// why. `Raised` is a parser that raised instead of answering, and `Spent` one the budget stopped.
+pub type Verdict = | Accepted | Rejected({ offset: Int, message: String }) | Raised(String) | Spent
+
+derive bin for Verdict
+
+/// A parser, by its program-wide name and the hash of all it reaches, and a text to hand it.
+pub type Asked = { callee: Bytes, hash: Bytes, text: Bytes }
+
+/// What a command asks of its tagged literals' parsers. What answers is `settling`, which `main` runs
+/// every command under, or a handler of the asker's own. A verdict is a function of what is asked,
+/// so the effect is a deterministic one, whatever the answering keeps.
+pub effect literal {
+  /// In `asked`'s order; or what kept the parsers from being entered at all.
+  read verdicts(timed: Timed, analysis: Analysis, root: String, asked: List<Asked>) -> Result<List<Verdict>, List<Diag>>
+}
+
+// --- Asking -----------------------------------------------------------------------
+
+fn asked_of(site: TaggedSite) -> Asked = { callee: site.callee, hash: site.hash, text: site.text }
+
+fn distinct(sites: List<TaggedSite>) -> List<Asked> =
+  fold(sites, [], |acc: List<Asked>, site: TaggedSite|
+    if contains(acc, asked_of(site)) { acc } else { push(acc, asked_of(site)) })
+
+fn verdict_for(asked: List<Asked>, verdicts: List<Verdict>, site: TaggedSite) -> Option<Verdict> =
+  fold(range(0, len(asked)), None, |found: Option<Verdict>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> if list_at(asked, i) == Some(asked_of(site)) { list_at(verdicts, i) } else { None },
+    })
+
+/// How many bytes of `src` spell the character at `i`: an escape is one character.
+fn spelled_width(src: Bytes, i: Int, end: Int) -> Int / {abort.raise} =
+  if bytes_at(src, i) != 92 || i + 1 >= end { utf8_len(bytes_at(src, i)) }
+  else if bytes_at(src, i + 1) != 117 { 2 } else {
+    iterate(i + 2, end - i, |j: Int|
+      if j >= end { Stop(end - i) }
+      else if bytes_at(src, j) == 125 { Stop(j + 1 - i) }
+      else { Continue(j + 1) })
+  }
+
+/// Where character `offset` of the text a string literal spells is written: `quoted` is the literal,
+/// quotes included, and the character past the last is its closing quote. Nowhere for an offset the
+/// text does not have.
+pub fn spelled_at(src: Bytes, quoted: Span, offset: Int) -> Option<Span> / {abort.raise} = {
+  let end = quoted.end - 1;
+  if offset < 0 || quoted.start + 1 > end || quoted.end > bytes_len(src) { None } else {
+    iterate(
+      { i: quoted.start + 1, left: offset },
+      end - quoted.start + 1,
+      |s: { i: Int, left: Int }|
+        if s.i >= end { Stop(if s.left == 0 { Some({ start: end, end: end + 1 }) } else { None }) }
+        else {
+          let width = spelled_width(src, s.i, end);
+          if s.left == 0 { Stop(Some({ start: s.i, end: s.i + width })) }
+          else { Continue({ i: s.i + width, left: s.left - 1 }) }
+        },
+    )
+  }
+}
+
+fn spelled(site: TaggedSite) -> Bytes = bytes_concat_all([b"`", site.tag, b"::literal`"])
+
+fn ran(site: TaggedSite) -> Bytes =
+  bytes_concat_all([
+    b"the check ran `",
+    site.callee,
+    b"` on the text, as every `",
+    site.tag,
+    b"\"..\"` here is the call `",
+    site.tag,
+    b"::literal(\"..\")`",
+  ])
+
+fn refusal(
+  places: List<Place>,
+  site: TaggedSite,
+  verdict: Verdict,
+) -> Option<Diag> / {abort.raise} =
+  match verdict {
+    Accepted -> None,
+    Rejected(why) -> {
+      let src = match list_at(places, site.module) { Some(place) -> place.text, None -> b"" };
+      let spot = match spelled_at(src, site.quoted, why.offset) {
+        Some(span) -> span,
+        None -> site.quoted,
+      };
+      Some(
+        error_at(
+          b"E0153",
+          site.module,
+          spot,
+          bytes_concat(spelled(site), b" refuses this literal"),
+          bytes_of_string(why.message),
+          [ran(site)],
+        ),
+      )
+    },
+    Raised(message) ->
+      Some(
+        error_at(
+          b"E0154",
+          site.module,
+          site.span,
+          bytes_concat_all([spelled(site), b" raised on this literal: ", bytes_of_string(message)]),
+          b"its parser gave no answer",
+          [ran(site), b"a parser answers `Err` of a text it refuses, saying where and why"],
+        ),
+      ),
+    Spent ->
+      Some(
+        error_at(
+          b"E0154",
+          site.module,
+          site.span,
+          bytes_concat_all([
+            spelled(site),
+            b" did not answer this literal within ",
+            bytes_of_string(int_to_string(step_budget())),
+            b" calls",
+          ]),
+          b"its parser gave no answer",
+          [ran(site), b"that is the budget a check gives each literal"],
+        ),
+      ),
+  }
+
+/// What refuses the run's own tagged literals: each one its parser does not accept, at the place in
+/// its text the parser names. Nothing at all, and nothing asked, where the run's modules write none.
+pub fn refused_literals(
+  timed: Timed,
+  analysis: Analysis,
+  root: String,
+) -> List<Diag> / {literal.verdicts, abort.raise} = {
+  let sites = filter(tagged_sites(analysis), |site: TaggedSite|
+    site.module < len(timed.program.files));
+  if len(sites) == 0 { [] } else {
+    let asked = distinct(sites);
+    match literal.verdicts(timed, analysis, root, asked) {
+      Err(diags) -> diags,
+      Ok(verdicts) ->
+        fold(sites, [], |acc: List<Diag>, site: TaggedSite|
+          match verdict_for(asked, verdicts, site) {
+            None -> acc,
+            Some(verdict) -> match refusal(timed.program.places, site, verdict) {
+              Some(diag) -> push(acc, diag),
+              None -> acc,
+            },
+          }),
+    }
+  }
+}
+
+// --- Answering --------------------------------------------------------------------
+
+fn verdict_of(called: Called) -> Verdict / {abort.raise} =
+  match called.answer {
+    Err(raised) -> {
+      let diag = shown(raised);
+      if diag.code == b"E0503" { Spent } else { Raised(string_of_bytes_lossy(diag.message)) }
+    },
+    Ok(value) -> match value {
+      VCtor(name, args) -> if name == "Ok" { Accepted } else {
+        match list_at(args, 0) {
+          Some(VRecord(fields)) -> match ((
+              field_named(fields, "offset"),
+              field_named(fields, "message"),
+            )) {
+            (Some(VInt(offset)), Some(VStr(message))) ->
+              Rejected({ offset: offset, message: message }),
+            _ -> Raised("it answered " ++ render(value)),
+          },
+          _ -> Raised("it answered " ++ render(value)),
+        }
+      },
+      _ -> Raised("it answered " ++ render(value)),
+    },
+  }
+
+fn callees(asked: List<Asked>) -> List<Bytes> =
+  fold(asked, [], |acc: List<Bytes>, a: Asked|
+    if contains(acc, a.callee) { acc } else { push(acc, a.callee) })
+
+/// The parsers entered on a machine loaded for them alone: a unit of the definitions they reach,
+/// each call under the budget.
+fn entered(
+  timed: Timed,
+  analysis: Analysis,
+  root: String,
+  asked: List<Asked>,
+) -> Result<List<Verdict>, List<Diag>> / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], abort.raise} = {
+  let front = front_of(timed, analysis);
+  let names = callees(asked);
+  let reached = closure_of(analysis.hashes, names);
+  match text_of(emit.unit(front, filter(every_root(front), |n: Bytes| map_contains(reached, n)))) {
+    Err(diags) -> Err(diags),
+    Ok(unit) -> {
+      machine.configure[literals]({ ..default_options(), steps: step_budget() });
+      let answered = match machine.load[literals](root, front, unit) {
+        Err(refused) -> Err(refused.diags),
+        Ok(_) -> match machine.bound[literals](
+            string_of_bytes_lossy(at(names, 0)),
+            unconfigured(),
+          ) {
+          Err(refused) -> Err(refused.diags),
+          Ok(_) ->
+            Ok(
+              map(asked, |a: Asked|
+                verdict_of(
+                  machine.call[literals](string_of_bytes_lossy(a.callee), [
+                    VStr(string_of_bytes_lossy(a.text)),
+                  ]),
+                )),
+            ),
+        },
+      };
+      machine.drop[literals]();
+      answered
+    },
+  }
+}
+
+/// What a verdict is a function of: the toolchain that ran the parser, the budget, the parser by
+/// the hash of all it reaches, and the text.
+fn verdict_key(stamp: String, version: String, a: Asked) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      bytes_concat_all([
+        sized(b"ply literal verdict 1"),
+        sized(hex(bin::shape_digest(verdict_bin()))),
+        sized(bytes_of_string(stamp)),
+        sized(bytes_of_string(version)),
+        sized(bytes_of_string(int_to_string(step_budget()))),
+        sized(a.hash),
+        sized(a.text),
+      ]),
+    ),
+  )
+
+type Sought = { asked: Asked, key: Bytes, kept: Option<Verdict> }
+
+/// `body` with every verdict it asks for read from the toolchain's cache, and the parsers of the
+/// rest entered once and their verdicts kept there.
+pub fn settling<a | e>(
+  body: () -> a / {literal.verdicts | e},
+) -> a / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], env.bodies[sys], env.shipped_digest[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
+  handle {
+    body()
+  } with {
+    literal.verdicts(timed, analysis, root, asked) -> {
+      let dir = under_abs(env.bodies[sys]());
+      let stamp = env.shipped_digest[sys]();
+      let version = env.binary_version[sys]();
+      let sought = map(asked, |a: Asked| {
+        let key = verdict_key(stamp, version, a);
+        {
+          asked: a,
+          key: key,
+          kept: match read_kept[abs](dir, key) {
+            None -> None,
+            Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
+              Ok(v) -> Some(v),
+              Err(_) -> None,
+            },
+          },
+        }
+      });
+      let unsettled = filter(sought, |s: Sought| s.kept == None);
+      if len(unsettled) == 0 { Ok(settled(sought, [])) } else {
+        match entered(timed, analysis, root, map(unsettled, |s: Sought| s.asked)) {
+          Err(diags) -> Err(diags),
+          Ok(found) -> {
+            fold(range(0, len(unsettled)), (), |_: Unit, i: Int|
+              match list_at(found, i) {
+                Some(v) ->
+                  write_kept[abs](dir, at(unsettled, i).key, bin::encode(v, verdict_bin())),
+                None -> (),
+              });
+            Ok(settled(sought, found))
+          },
+        }
+      }
+    },
+  }
+
+/// Each verdict sought, in order: the one kept, or the next of `found`, which holds the rest's.
+fn settled(sought: List<Sought>, found: List<Verdict>) -> List<Verdict> =
+  fold(sought, { out: [], next: 0 }, |acc: { out: List<Verdict>, next: Int }, s: Sought|
+    match s.kept {
+      Some(v) -> { out: push(acc.out, v), next: acc.next },
+      None ->
+        {
+          out: match list_at(found, acc.next) { Some(v) -> push(acc.out, v), None -> acc.out },
+          next: acc.next + 1,
+        },
+    }).out
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_site(text: Bytes) -> TaggedSite =
+  {
+    module: 0,
+    span: { start: 0, end: 5 + bytes_len(text) },
+    quoted: { start: 3, end: 5 + bytes_len(text) },
+    tag: b"hex",
+    text: text,
+    callee: b"hex.literal",
+    hash: b"h",
+  }
+
+test "a character of a literal's text is placed where its source spells it" {
+  let src = b"hex\"a\\n\\u{e9}\xc3\xa9z\"";
+  let quoted = { start: 3, end: bytes_len(src) };
+  assert_eq(spelled_at(src, quoted, 0), Some({ start: 4, end: 5 }));
+  assert_eq(spelled_at(src, quoted, 1), Some({ start: 5, end: 7 }));
+  assert_eq(spelled_at(src, quoted, 2), Some({ start: 7, end: 13 }));
+  assert_eq(spelled_at(src, quoted, 3), Some({ start: 13, end: 15 }));
+  assert_eq(spelled_at(src, quoted, 4), Some({ start: 15, end: 16 }));
+  // One past the text is its closing quote, where a text that ends too soon is refused.
+  assert_eq(spelled_at(src, quoted, 5), Some({ start: 16, end: 17 }));
+  assert_eq(spelled_at(src, quoted, 6), None);
+  assert_eq(spelled_at(src, quoted, 0 - 1), None)
+}
+
+test "a parser's answer is read as its verdict, and a spent budget is told from a raise" {
+  let answered = |v: Value| verdict_of({ answer: Ok(v), warnings: [] });
+  assert_eq(answered(VCtor("Ok", [VInt(1)])), Accepted);
+  assert_eq(
+    answered(
+      VCtor("Err", [
+        VRecord([{ name: "message", value: VStr("odd") }, { name: "offset", value: VInt(2) }]),
+      ]),
+    ),
+    Rejected({ offset: 2, message: "odd" }),
+  );
+  assert_eq(answered(VInt(1)), Raised("it answered 1"))
+}
+
+test "a refused literal is placed inside its text, and one past it at the whole literal" {
+  let site = a_site(b"abz");
+  let places = [{ path: "main.ply", text: b"hex\"abz\"" }];
+  let labelled = |verdict: Verdict|
+    match refusal(places, site, verdict) {
+      Some(d) -> match list_at(d.labels, 0) {
+        Some(l) -> Some({ code: d.code, start: l.start, end: l.end }),
+        None -> None,
+      },
+      None -> None,
+    };
+  assert_eq(labelled(Accepted), None);
+  assert_eq(
+    labelled(Rejected({ offset: 2, message: "not a hex digit" })),
+    Some({ code: b"E0153", start: 6, end: 7 }),
+  );
+  assert_eq(
+    labelled(Rejected({ offset: 40, message: "too short" })),
+    Some({ code: b"E0153", start: 3, end: 8 }),
+  );
+  assert_eq(labelled(Spent), Some({ code: b"E0154", start: 0, end: 8 }));
+  assert_eq(labelled(Raised("boom")), Some({ code: b"E0154", start: 0, end: 8 }))
+}
+
+test "verdicts kept come back in the order they were sought, the rest from what was found" {
+  let a: Asked = { callee: b"m.literal", hash: b"h", text: b"a" };
+  let sought = [
+    { asked: a, key: b"1", kept: None },
+    { asked: a, key: b"2", kept: Some(Accepted) },
+    { asked: a, key: b"3", kept: None },
+  ];
+  assert_eq(settled(sought, [Spent, Raised("x")]), [Spent, Accepted, Raised("x")])
+}
+
+test "a verdict is kept under the toolchain, the parser's hash and the text" {
+  let a: Asked = { callee: b"m.literal", hash: b"h", text: b"a" };
+  let key = verdict_key("b3:a", "0.1.0", a);
+  assert_eq(verdict_key("b3:a", "0.1.0", { ..a, callee: b"n.literal" }), key);
+  assert(verdict_key("b3:b", "0.1.0", a) != key);
+  assert(verdict_key("b3:a", "0.2.0", a) != key);
+  assert(verdict_key("b3:a", "0.1.0", { ..a, hash: b"g" }) != key);
+  assert(verdict_key("b3:a", "0.1.0", { ..a, text: b"b" }) != key)
+}

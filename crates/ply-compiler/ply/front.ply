@@ -8,7 +8,8 @@ import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, Variant
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, Param, Stmt, SLet, SLetElse, SExpr, MatchArm, RecField, expr_span)
+              EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, MatchArm, RecField,
+              expr_span, ETagged, Tagged)
 import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, CodeField,
@@ -17,13 +18,14 @@ import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecor
 import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
               atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
               print_ty, Field, canonical_atoms, canonical_scheme, canonical_type, bool_type,
-              int_type, unit_type, named_type)
+              int_type, unit_type, named_type, TyNominal)
 import resolve (Source, ParsedModule, Diag, Resolved, ResolveSucceeded, ResolveFailed, Namespace,
                 ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find, error_at,
                 backticked, import_module_name, path_span)
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, Prior, Rehash, Rehashed,
-             rehash_index, by_name, closure_of, LawNode, Node, NodeFn, NodeType, NodeEffect)
+             rehash_index, by_name, tagged_target, closure_of, LawNode, Node, NodeFn, NodeType,
+             NodeEffect)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, facts_by_owner, filed_facts, foreign_facts, no_root_facts,
@@ -40,7 +42,7 @@ import std.hash (blake3)
 import std.pkg (Manifest)
 import std.list (at, concat, contains, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
-import rewrite (fn_has_update)
+import rewrite (fn_has_update, tagged_in)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_key, embed_tables, embedded,
               rewritten, wants_of, want_of_key)
 import items (parse)
@@ -152,6 +154,7 @@ fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
   match expr {
     ELit(v) -> lit_text(acc, v.lit),
     EVar(_) -> acc,
+    ETagged(_) -> acc,
     EBad(_) -> acc,
     EBinary(v) -> lits(lits(acc, v.rhs), v.lhs),
     EUnary(v) -> lits(if v.op == b"neg" { neg_lit(acc, v.operand) } else { acc }, v.operand),
@@ -191,6 +194,7 @@ fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
     EWithCell(v) -> lits(lits(acc, v.body), v.init),
     ESimulate(v) -> lits(acc, v.body),
     EParallel(v) -> backwards(acc, v.branches),
+    ETryBlock(v) -> lits(acc, v.body),
   }
 }
 
@@ -933,6 +937,8 @@ fn reaches_width(t: Type, held: List<Bytes>) -> Bool =
         || fold(c.args, false, |b: Bool, a: Type| b || reaches_width(a, held)),
     TyFn(_) -> false,
     TyRecord(fs) -> fold(fs, false, |b: Bool, field: Field| b || reaches_width(field.ty, held)),
+    TyNominal(n) ->
+      fold(n.fields, false, |b: Bool, field: Field| b || reaches_width(field.ty, held)),
   }
 
 fn is_plain(carry: Carry) -> Bool = match carry { CPlain -> true, _ -> false }
@@ -964,12 +970,16 @@ fn carry(cr: Carrier, vars: List<Int>, ty: Type) -> Carry / {abort.raise} =
       if is_plain(ret) && fold(params, true, |b: Bool, p: Carry| b && is_plain(p)) { CPlain }
       else { CFn(params, ret) }
     },
-    TyRecord(fs) -> {
-      let fields = map(fs, |f: Field| { name: f.name, carry: carry(cr, vars, f.ty) });
-      if fold(fields, true, |b: Bool, f: CarriedField| b && is_plain(f.carry)) { CPlain }
-      else { CRecord(fields) }
-    },
+    TyRecord(fs) -> carry_fields(cr, vars, fs),
+    // What is read is the record a `new` record is at run time.
+    TyNominal(n) -> carry_fields(cr, vars, n.fields),
   }
+
+fn carry_fields(cr: Carrier, vars: List<Int>, fs: List<Field>) -> Carry / {abort.raise} = {
+  let fields = map(fs, |f: Field| { name: f.name, carry: carry(cr, vars, f.ty) });
+  if fold(fields, true, |b: Bool, f: CarriedField| b && is_plain(f.carry)) { CPlain }
+  else { CRecord(fields) }
+}
 
 fn carries(cr: Carrier, vars: List<Int>, tys: List<Type>) -> List<Carry> / {abort.raise} =
   map(tys, |ty: Type| carry(cr, vars, ty))
@@ -1016,6 +1026,7 @@ fn vars_of(seen: List<Int>, ty: Type) -> List<Int> =
     TyCon(c) -> fold(c.args, seen, vars_of),
     TyFn(f) -> vars_of(fold(f.params, seen, vars_of), f.ret),
     TyRecord(fs) -> fold(fs, seen, |acc: List<Int>, f: Field| vars_of(acc, f.ty)),
+    TyNominal(n) -> fold(n.args, seen, vars_of),
   }
 
 fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
@@ -1286,6 +1297,41 @@ pub type Analysis = {
 
 /// A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
 pub type AnalysisOutcome = | Refused(List<Diag>) | Analysed(Analysis)
+
+/// A tagged literal of a checked program: where it is, its string as written and as it reads, and
+/// the definition its check runs, under the hash of all that definition reaches.
+pub type TaggedSite = {
+  module: Int,
+  span: Span,
+  quoted: Span,
+  tag: Bytes,
+  text: Bytes,
+  callee: Bytes,
+  hash: Bytes,
+}
+
+/// Every tagged literal the root package's modules hold. A module read as its stub holds none: one
+/// that writes a tagged literal is never kept as one.
+pub fn tagged_sites(analysis: Analysis) -> List<TaggedSite> / {abort.raise} = {
+  let hashes = by_name(analysis.hashes.defs);
+  fold(range(0, len(analysis.mods)), [], |acc: List<TaggedSite>, i: Int|
+    if list_at(analysis.module_packages, i) != Some(0) { acc } else {
+      fold(tagged_in(at(analysis.mods, i).module), acc, |sites: List<TaggedSite>, t: Tagged|
+        match tagged_target(analysis.index, i, t.tag) {
+          None -> sites,
+          Some(callee) ->
+            push(sites, {
+              module: i,
+              span: t.span,
+              quoted: t.quoted,
+              tag: t.tag.name,
+              text: t.text,
+              callee: callee,
+              hash: match map_get(hashes, callee) { Some(h) -> h, None -> b"" },
+            }),
+        })
+    })
+}
 
 /// A definition's or a test's published rows as the last answer wrote them, under the check key it
 /// had then: the checker takes them wherever the item's own form and what it reads of the rest of
