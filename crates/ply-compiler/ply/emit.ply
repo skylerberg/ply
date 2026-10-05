@@ -9,14 +9,14 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
              CodeReturn, Own, Borrowed, Owned, lower_fn, irrefutable)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
-              SEnsures, SCost, FnDef)
+              SEnsures, SCost, FnDef, TDNominal)
 import resolve (ParsedModule, Source, ResolveSucceeded, ResolveFailed, Diag, resolve_modules,
                 Resolved, Scope, Binding, ModuleBinding, PackageDeps, resolve_packaged, no_packages,
                 default_binder, find_module_binding, qualify)
 import derive (expand_derives)
 import infer (LabelSite, OperandSite, expanded_mods, sccs, prelude_effects, EffectInfo, OpInfo,
-              EmitFacts, RootFacts, UpdateShape, WitnessOp, WitnessRef, WitnessOrder, facts_at,
-              test_owner)
+              EmitFacts, RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder,
+              facts_at, test_owner)
 import front
 import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with,
               analyse_pulling_std_with, dump_of, no_interfaces, WalkedFacts, walked_facts_bin)
@@ -25,10 +25,11 @@ import std.list (at, concat, contains)
 import diagnostics (parse_all)
 import interface (stub_module)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
-              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EWithCell, HandleClause,
-              MatchArm, RecField, Stmt, SLet, SLetElse, SExpr, is_arithmetic)
-import type_syntax (MWrite, TypeExpr, TVar, TCon, TRecord, ident_names)
-import rewrite (expand)
+              ERecord, ERecordUpdate, ETry, ETryBlock, EField, EList, EPerform, EWithCell,
+              HandleClause, MatchArm, RecField, Stmt, SLet, SLetElse, SExpr, is_arithmetic)
+import type_syntax (Mode, MRead, MWrite, MRaise, MBad, TypeExpr, TVar, TCon, TRecord, is_raise,
+                    ident_names)
+import rewrite (expand, named_program_wide)
 import embed (EmbedAt, embed_tables, rewritten)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import std.list
@@ -211,7 +212,7 @@ pub type CountLocal = { name: Bytes, indent: Int }
 
 pub type EffectName = { written: Bytes, global: Bytes, ops: List<OpMode> }
 
-pub type OpMode = { name: Bytes, write: Bool }
+pub type OpMode = { name: Bytes, mode: Mode }
 
 pub type Unboxed = { slot: Int, kind: Kind, expr: Bytes, ty: Ty }
 
@@ -5241,7 +5242,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 None -> match res { Some(r) -> field_ref(r.i), None -> b"-1" },
               },
               b", ",
-              if op_writes(en, p.op) { b"1" } else { b"0" },
+              mode_code(op_mode(en, p.op)),
               b", (Word)(intptr_t)",
               arr.name,
               b", ",
@@ -5368,17 +5369,24 @@ fn scheduled_ops() -> List<Bytes> =
 fn field_ref(i: Int) -> Bytes = bytes_concat_all([b"@@f", ascii_of_int(i), b"@@"])
 
 /// `None` for a name the module's scope does not bind.
-fn effect_global(emitter: Emitter, written: Bytes) -> Option<Bytes> =
+fn effect_global(emitter: Emitter, written: Bytes) -> Option<Bytes> / {abort.raise} =
   match effect_named(emitter, written) { Some(e) -> Some(e.global), None -> None }
 
-fn effect_named(emitter: Emitter, written: Bytes) -> Option<EffectName> =
-  match fold(emitter.effects, None, |acc: Option<EffectName>, e: EffectName|
-      if e.written == written { Some(e) } else { acc }) {
-    Some(e) -> Some(e),
-    // The prelude's effects are declared nowhere and known program-wide by their bare names.
-    None ->
-      fold(prelude_effects_here(), None, |acc: Option<EffectName>, e: EffectName|
-        if e.written == written { Some(e) } else { acc }),
+fn effect_named(emitter: Emitter, written: Bytes) -> Option<EffectName> / {abort.raise} =
+  effect_among(emitter.effects, written)
+
+/// A `try`'s clause names its effect program-wide, and only a raise is answered by one.
+fn effect_among(effects: List<EffectName>, written: Bytes) -> Option<EffectName> / {abort.raise} =
+  match named_program_wide(written) {
+    Some(global) -> Some({ written: written, global: global, ops: [] }),
+    None -> match fold(effects, None, |acc: Option<EffectName>, e: EffectName|
+        if e.written == written { Some(e) } else { acc }) {
+      Some(e) -> Some(e),
+      // The prelude's effects are declared nowhere and known program-wide by their bare names.
+      None ->
+        fold(prelude_effects_here(), None, |acc: Option<EffectName>, e: EffectName|
+          if e.written == written { Some(e) } else { acc }),
+    },
   }
 
 fn prelude_effects_here() -> List<EffectName> =
@@ -5386,13 +5394,24 @@ fn prelude_effects_here() -> List<EffectName> =
     {
       written: effect_info.name,
       global: effect_info.name,
-      ops: map(effect_info.ops, |op_info: OpInfo|
-        { name: op_info.name, write: match op_info.mode { MWrite -> true, _ -> false } }),
+      ops: map(effect_info.ops, |op_info: OpInfo| { name: op_info.name, mode: op_info.mode }),
     })
 
-/// Whether an operation writes: a `perform`'s recorded atom carries its mode.
-fn op_writes(e: EffectName, op: Bytes) -> Bool =
-  fold(e.ops, false, |acc: Bool, o: OpMode| if o.name == op { o.write } else { acc })
+/// An operation's declared mode: a `perform`'s recorded atom carries it.
+fn op_mode(e: EffectName, op: Bytes) -> Mode =
+  fold(e.ops, MRead, |acc: Mode, o: OpMode| if o.name == op { o.mode } else { acc })
+
+/// As the runtime reads it.
+fn mode_code(mode: Mode) -> Bytes =
+  match mode { MRead -> b"0", MWrite -> b"1", MRaise -> b"2", MBad -> b"0" }
+
+/// A clause for a raise is run once its `handle`'s body is abandoned, and no task inherits it.
+fn clause_raises(emitter: Emitter, clause: CodeClause) -> Bool / {abort.raise} =
+  named_program_wide(clause.effect) != None
+    || (match effect_named(emitter, clause.effect) {
+      Some(e) -> is_raise(op_mode(e, clause.op)),
+      None -> false,
+    })
 
 /// Every effect name a module's scope binds, bare or through a module binder, with its program-wide name.
 fn effects_in(resolved: Resolved, i: Int, mods: List<ParsedModule>) -> List<EffectName> =
@@ -5422,8 +5441,7 @@ fn ops_of(mods: List<ParsedModule>, owner: Int, name: Bytes) -> List<OpMode> =
       fold(m.module.items, [], |acc: List<OpMode>, item: Item|
         match item {
           IEffect(e) -> if e.name.name == name {
-            map(e.ops, |op: OpDef|
-              { name: op.name.name, write: match op.mode { MWrite -> true, _ -> false } })
+            map(e.ops, |op: OpDef| { name: op.name.name, mode: op.mode })
           } else { acc },
           _ -> acc,
         }),
@@ -5524,7 +5542,8 @@ fn handle_site(
                           b", ",
                           held.value.expr,
                           b", ",
-                          if !clause.resume { b"0" }
+                          if clause_raises(emitter, clause) { b"3" }
+                          else if !clause.resume { b"0" }
                           else if resume_in_tail_only(clause.body, clause.params) { b"1" }
                           else { b"2" },
                           b", ",
@@ -8169,6 +8188,9 @@ fn aliases_in(module: Module) -> List<Alias> =
       IType(t) -> match t.body {
         TDAlias(u) ->
           push(acc, { name: t.name.name, params: ident_names(t.generics.types), ty: u }),
+        // At run time a `new` record is the record it is written as.
+        TDNominal(u) ->
+          push(acc, { name: t.name.name, params: ident_names(t.generics.types), ty: u }),
         _ -> acc,
       },
       _ -> acc,
@@ -8506,6 +8528,7 @@ fn gathered(
               ops: concat(g.facts.ops, f.ops),
               refs: concat(g.facts.refs, f.refs),
               operands: concat(g.facts.operands, f.operands),
+              tries: concat(g.facts.tries, f.tries),
             },
           },
       },
@@ -8546,6 +8569,8 @@ fn facts_read(
         refs: fold(w.loose.refs, [], |acc: List<WitnessRef>, x: WitnessRef|
           match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
         operands: fold(w.loose.operands, [], |acc: List<OperandSite>, x: OperandSite|
+          match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+        tries: fold(w.loose.tries, [], |acc: List<TrySite>, x: TrySite|
           match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
       };
       let lowered = lowered_modules(wanted);
@@ -8602,6 +8627,7 @@ fn facts_read(
                   Some(j) -> push(acc, { ..x, module: j }),
                   None -> acc,
                 }),
+              tries: read.facts.tries,
             },
             operands: read.facts.operands,
           }),
@@ -8822,15 +8848,7 @@ fn emit_module(
       if md.module == path { md.defs } else { acc });
   let others = others_of(x.module, program);
   let imports = resolved_imports(resolved, index, mods, x_module, defs_of);
-  let aliases = fold(x.module.items, [], |acc: List<Alias>, item: Item|
-    match item {
-      IType(t) -> match t.body {
-        TDAlias(u) ->
-          push(acc, { name: t.name.name, params: ident_names(t.generics.types), ty: u }),
-        _ -> acc,
-      },
-      _ -> acc,
-    });
+  let aliases = aliases_in(x.module);
   let here = fold(x.module.items, [], |acc: List<Def>, item: Item|
     match item {
       IFn(d) ->
@@ -9412,8 +9430,20 @@ fn clause_roots(
 fn concat_effects(a: List<EffectName>, b: List<EffectName>) -> List<EffectName> =
   fold(b, a, |acc: List<EffectName>, x: EffectName| push(acc, x))
 
+/// The effect a clause names, program-wide: one a `try` wrote, the scope's, or the prelude's.
+fn handled_effect(effects: List<EffectName>, written: Bytes) -> Option<Bytes> / {abort.raise} =
+  match named_program_wide(written) {
+    Some(global) -> Some(global),
+    None ->
+      fold(
+        concat_effects(effects, prelude_effects_here()),
+        None,
+        |f: Option<Bytes>, en: EffectName| if en.written == written { Some(en.global) } else { f },
+      ),
+  }
+
 /// The operations a body handles, read off its source, so a body the lowering did not reach still names them.
-fn ast_handles(e: Expr, effects: List<EffectName>) -> List<Bytes> = {
+fn ast_handles(e: Expr, effects: List<EffectName>) -> List<Bytes> / {abort.raise} = {
   let here = |acc: List<Bytes>, x: Expr| concat(acc, ast_handles(x, effects));
   let all = |exprs: List<Expr>| fold(exprs, [], here);
   match e {
@@ -9423,12 +9453,7 @@ fn ast_handles(e: Expr, effects: List<EffectName>) -> List<Bytes> = {
         ast_handles(h.body, effects),
         |acc: List<Bytes>, clause: HandleClause|
           concat(
-            match fold(
-                concat_effects(effects, prelude_effects_here()),
-                None,
-                |f: Option<Bytes>, en: EffectName|
-                  if en.written == qname_text(clause.eff) { Some(en.global) } else { f },
-              ) {
+            match handled_effect(effects, qname_text(clause.eff)) {
               Some(g) -> push(acc, bytes_concat_all([g, b"#", clause.op.name])),
               None -> acc,
             },
@@ -9462,22 +9487,18 @@ fn ast_handles(e: Expr, effects: List<EffectName>) -> List<Bytes> = {
     EList(x) -> all(x.items),
     EPerform(x) -> all(x.args),
     EWithCell(x) -> all([x.init, x.body]),
+    ETryBlock(x) -> ast_handles(x.body, effects),
     _ -> [],
   }
 }
 
-fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
+fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> / {abort.raise} = {
   let here = |acc: List<Bytes>, x: Code| concat(acc, walk_handles(x, effects));
   match c.node {
     NHandle(h) ->
       fold(h.clauses, walk_handles(h.body, effects), |acc: List<Bytes>, clause: CodeClause|
         concat(
-          match fold(
-              concat_effects(effects, prelude_effects_here()),
-              None,
-              |f: Option<Bytes>, e: EffectName|
-                if e.written == clause.effect { Some(e.global) } else { f },
-            ) {
+          match handled_effect(effects, clause.effect) {
             Some(g) -> push(acc, bytes_concat_all([g, b"#", clause.op])),
             None -> acc,
           },

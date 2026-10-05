@@ -140,7 +140,9 @@ These are keywords only in the position shown and identifiers elsewhere:
 | --- | --- |
 | `as` | in an `import`, after the module path |
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
+| `raise` | opening an operation declaration (§6.8) |
 | `set` | `effect set X = {..}` |
+| `new` | right after the `=` of a `type` declaration |
 | `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
@@ -150,6 +152,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
 | `with_cell` | before `[` |
 | `simulate` | before `{` where an expression can start |
+| `try` | before `{`, or before `[` and an operation's name, where an expression can start (§6.8) |
 
 ### 2.3 Literals
 
@@ -163,6 +166,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
+| `uuid"6ba7b810-.."` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
 | `#[1, 2]` | `Map<a, Unit>` | A set: each element a key whose value is `()`. |
@@ -188,6 +192,36 @@ write, so `std.show` and the modules it imports cannot interpolate.
 A map literal is the call `map_of_entries([{key: k, value: v}, ..])` and a set literal the same
 with `()` for each value, so either spelling is one definition with one hash; `ply fmt` keeps the
 one written.
+
+A tagged literal `tag"text"` is a name touching a string: `uuid"..."` is one, and `uuid "..."` a
+name and then a string. It is the call `tag::literal("text")`, where `tag` is a module binder in
+scope (§3.2) and the text a string's, escapes and all, and a load runs that call before anything
+else runs (§16):
+
+```ply
+import std.uuid
+import std.uuid (Uuid)
+
+fn dns() -> Uuid = uuid"6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+```
+
+`literal` is a `pub fn` of one `String` answering `Result<T, {message: String, offset: Int}>`,
+with no type, row or label parameter and a row that holds nothing but raises (§6.8); anything else
+is `E0152`, as is one in a recursion with the definition that holds the literal; a tag no import
+binds is `E0106`, and a module with no `literal`, or a private one, `E0101` or `E0107`. Where it
+answers `Ok(v)` the literal has type `T`, is `v`, and performs nothing: what the call could raise,
+the check saw it not raise. Where it answers `Err`, the literal is `E0153`, placed at character
+`offset` of the text as the source spells it, an escape being one character, or at the closing
+quote for the offset just past the text, with `message` beside it. A parser that raises, or that
+makes more than ten million calls, is `E0154`.
+
+The literal hashes with its parser and its text, so an edit to anything the parser reaches moves
+every definition that writes the tag, and apart from the call written out, which has another type
+and another row. `f` and `b` are no tags, since `f"` and `b"` open the two strings above. A tagged
+literal is an expression: no pattern, label or parameter default (`E0121`) is one. It runs as
+`let Ok(v) = tag::literal("text")`, so a module that binds its own `Ok` holds none (`E0118`), as
+one that binds an `Ok` or an `Err` holds no `try` (§6.8). `std.uuid`, `std.base64` and
+`std.bigint` are tags (`ply doc std.uuid.literal`).
 
 A line string is a run of lines that each start with `\\`, led only by blanks.
 Everything after the `\\` to the end of its line is text, verbatim: nothing is
@@ -467,8 +501,8 @@ value past `Int` through its decimal text (`u128_of_string`).
 
 ### 4.2 Records and tuples
 
-Records are structural; `type` names an alias, not a new type. Field order does
-not matter.
+Records are structural; `type` names an alias, not a new type, unless its body
+opens with `new` (below). Field order does not matter.
 
 ```ply
 fn f(a: Account) -> Int = a.balance
@@ -488,6 +522,56 @@ constraint: each signature that uses it promises what its expansion needs,
 the alias. It may take label and row parameters too (§4.5):
 `type Step<a | e> = () -> Option<a> / e` is the function type it expands to, with
 the row a use gives it in place of `e`.
+
+`type T = new { .. }` declares a record of its own, with at least one field:
+
+```ply
+pub type Date = new { year: Int, month: Int, day: Int }
+
+fn epoch() -> Date = { year: 1970, month: 1, day: 1 }
+fn next(d: Date) -> Date = { ..d, year: d.year + 1 }
+fn held() -> Date = {
+  let r = { year: 1970, month: 1, day: 1 };   // a `{day: Int, month: Int, year: Int}`
+  r                                           // E0201: not a `Date`
+}
+```
+
+It is read (`d.year`), updated and matched as any record is, and it is no other
+type: not a record of the same fields, and not another declaration of them
+(`E0201`). A record literal is one where the place it is written in says so
+before the literal is checked:
+
+* the body of a `fn`, and of a lambda whose return type is written or expected;
+  a `let` with a written type; a parameter's default;
+* an argument of a call or an operation, at its parameter's type. A type
+  parameter of the callee is what the arguments before this one, and the type
+  the call is itself expected at, make it, so `assert_eq(d, {..})`,
+  `push(days, {..})` and a `Some({..})` answering `Option<Date>` each take one;
+* a field of a literal that is itself expected, and a field an update writes;
+* an element of a list, a branch of an `if` and an arm of a `match`, at the type
+  expected of the whole or of the elements, branches and arms before it; the
+  right side of an operator, at its left's;
+* a block's tail, a `let ... else` block, and the body of a `handle` (its
+  `return` clause, where it has one), a `with_cell` or a `simulate`, where the
+  whole is expected; the body of a `try`, where a `Result` of it is; a handler
+  clause, at what it answers: the operation's result, or the `handle`'s value
+  for a raise and for a clause that binds `resume`.
+
+Such a literal names every field (`E0201`) and no other (`E0101`). A record
+bound without its type is a plain record wherever it goes next.
+
+The declaration is closed, and judged where it is written: a field names only
+the declaration's own type, label and row parameters (§4.5), holds no `Cell`,
+`Task` or `Chan` (`E0446`, §4.6), and does not reach the record itself except
+through a sum (`E0214`), since whatever reads a record's shape reads its fields
+whole. A `Map` key it leaves to a parameter is promised where a value is built,
+as a constructor's is, not by each signature that names the type.
+
+At run time a `new` record is the record it is written as. `==`, `compare`,
+`digest`, `show`, `reflect` and every derived codec (§11) read its fields as
+they read a plain record's, so two `new` records of the same fields print,
+encode and digest alike, and only the checker tells them apart. A definition's
+hash does tell them apart: a `new` record is hashed with its name, as a sum is.
 
 ### 4.3 Lists, arrays and maps
 
@@ -515,16 +599,18 @@ type Level = Debug | Info | Warn | Error
 
 The leading `|` is optional. Constructors are values: `Circle(3)` is a call,
 `Point` a reference. `type Id = Int` (one name, no payload, no `|`) is an alias.
-Sums are the only nominal types: identical sums in two modules differ. A sum
-takes parameters as an alias does, `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`,
-and a use that fills them with other arguments is another type (§4.5).
+A sum is nominal, as a `new` record is (§4.2): identical sums in two modules
+differ. A sum takes parameters as an alias does,
+`type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`, and a use that fills them
+with other arguments is another type (§4.5).
 
 ### 4.5 Generics
 
 `fn apply<a, b | e>(x: a, f: (a) -> b / e) -> b / e = f(x)`: type parameters are
 lowercase names in `<...>`, and row parameters follow `|` (`<| e>` if there are
 no type parameters); a row variable among the type parameters is `E0301`.
-Aliases may be parameterized: `pub type Route<a> = { ... endpoint: a }`.
+Aliases may be parameterized, `pub type Route<a> = { ... endpoint: a }`, and so
+may `new` records, `type Pair<a> = new { first: a, second: a }`.
 
 A bracketed name binds a resource label:
 `fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)`. Binders sit
@@ -556,13 +642,14 @@ need the callee's type parameter at another type is polymorphic recursion, which
 Ply does not infer. That is `E0308` as well: break the cycle so the callee is
 checked on its own before the call, or monomorphise it.
 
-A `type` binds all three kinds where a `fn` does, on an alias and on a sum, and
-a use fills them in the same places:
+A `type` binds all three kinds where a `fn` does, on an alias, a sum and a `new`
+record, and a use fills them in the same places:
 
 ```ply
 type Step<a | e> = () -> Option<{ value: a, next: Seq<a | e> }> / e
 type Seq<a | e>  = | Seq(Step<a | e>)
 type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e}) | Quiet
+type Stepper<a | e> = new { step: () -> Option<a> / e }
 
 fn next<a | e>(s: Seq<a | e>) -> Option<{ value: a, next: Seq<a | e> }> / e =
   match s { Seq(step) -> step() }
@@ -578,9 +665,11 @@ row parameter has no short form that leaves it out. A declared type is closed: a
 row variable in it is one of its own row parameters (`E0301`), and a label in it is
 one of its own label parameters or the resource of that name, never a binder of
 the definition that uses the type. An alias's arguments are written into its
-expansion, so `Step<Int | {}>` is `() -> Option<..>`. A sum's arguments are part
-of which type it is, so a `Seq<Int | {}>` is not a `Seq<Int | {fs.read_at[src]}>`
-(§6.2). A printed type shows them as written, `m.Sink<Int, [conn] | {}>`.
+expansion, so `Step<Int | {}>` is `() -> Option<..>`. A sum's arguments, and a
+`new` record's, are part of which type it is, so a `Seq<Int | {}>` is not a
+`Seq<Int | {fs.read_at[src]}>` (§6.2), though a function a `Stepper<Int | e>`
+literal is built of may perform less than `e`, as any function meeting a type
+may. A printed type shows them as written, `m.Sink<Int, [conn] | {}>`.
 
 `where numeric(a)` lets a type parameter take arithmetic and the ordered
 comparisons: `+`, `-`, `*`, `%`, unary `-`, `<` and the rest, and
@@ -622,7 +711,9 @@ nanoseconds; they are separate types so a deadline cannot be added to a byte
 count. `std.time` builds and reads them.
 
 A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
-`None` loses `?`; one that declares its own `Stop` loses `iterate`.
+`None` loses `?`; one that binds its own `Ok` or `Err` loses `try` (§6.8), and
+tagged literals with its own `Ok` (§2.3), each `E0118`; one that declares its
+own `Stop` loses `iterate`.
 
 **`Secret<a>`** is made by `secret_of_string` and observed only by
 `secret_verify`, `secret_is_empty` and `==`. It cannot be rendered, encoded or
@@ -631,13 +722,16 @@ allows it (`E0439`).
 
 **`Cell<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are branded by their
 region and cannot outlive it; the brand prints as `Cell[users]<Int>`. A
-declaration is outside every region, so a variant's field or an operation's
-parameter or result that mentions any of them, at any depth, is `E0446`. Take it as a type parameter instead,
+declaration is outside every region, so a variant's field, a `new` record's
+field or an operation's parameter or result that mentions any of them, at any
+depth, is `E0446`. Take it as a type parameter instead,
 `type Held<t> = Held(t)`: the type argument carries the brand where the escape
 checks see it. A sum hides the rows its fields write, so a field whose function
 names `cell`, or joins a task or works a channel, in its row is `E0446` as well:
 take the row as a row parameter, `type Held<| e> = Held(() -> Int / e)`, and a
 closure that reaches a region is seen leaving it in the row the type is given.
+A `new` record's fields are read wherever it goes, so a row one of them writes
+is seen leaving a region as a plain record's is.
 
 ### 4.7 Function types, and what is written
 
@@ -768,6 +862,8 @@ a field path, or one call (the call runs once); its fields come from the type
 the checker infers for it, wherever that type was declared — another module's
 `type` included. A base whose type nothing in the program determines is
 `E0116`, and so is one that is not a record. A field the base lacks is `E0117`.
+An update of a `new` record (§4.2) answers that record, so a field it writes
+keeps its declared type (`E0201`).
 
 ### 5.6 Lists
 
@@ -861,7 +957,7 @@ it and the function's result and everything evaluated before it is pure:
 `let x = e?;`, or `parse_or_more(parse_and(ts)?)`.
 
 * It converts no errors: `Result<_, E1>` inside `-> Result<_, E2>` is `E0201`.
-* `E0118`: inside a `handle`, `with_cell` or `simulate`; inside a
+* `E0118`: inside a `handle`, `try`, `with_cell` or `simulate`; inside a
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
@@ -992,12 +1088,19 @@ effect db {
 nondet effect clock {
   read now() -> Int
 }
+
+effect toml {
+  raise syntax(e: SyntaxError)
+}
 ```
 
-Each operation is `read` or `write`. `[r]` makes it resource-parameterized: a
-perform must supply a label (`E0304`). `nondet` marks results that are not a
-function of program state (§8.3). Effects are nominal. `task`, `clock`,
-`random`, `sim`, `abort`, `diverges` and `cell` are taken (`E0105`).
+Each operation is `read`, `write` or `raise`. A `read` or a `write` answers
+where it was performed; a `raise` does not come back, so it writes a name and
+its parameters and no result (§6.8). `[r]` makes a `read` or a `write`
+resource-parameterized: a perform must supply a label (`E0304`). `nondet` marks
+results that are not a function of program state (§8.3). Effects are nominal.
+`task`, `clock`, `random`, `sim`, `abort`, `diverges` and `cell` are taken
+(`E0105`).
 
 An operation's type parameters sit just before its parameters,
 `read take[r]<a>(key: Int) -> a`, and are its only type variables: its
@@ -1013,8 +1116,10 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `/ {store::db.read[users]}`. An atom may instead name an operation,
 `net.send[conn]`, which the mode atom of the same effect and resource
 (`net.write[conn]`) covers; naming an operation the effect does not declare is
-`E0104`. `diverges`, written bare, is the atom of a call that may not return
-(§5.10); it names no operation, and nothing handles it.
+`E0104`. No mode atom stands for a `raise`: a row names each one, `toml.syntax`,
+so a row is the set of ways a call can fail (§6.8). `diverges`, written bare,
+is the atom of a call that may not return (§5.10); it names no operation, and
+nothing handles it.
 
 An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
 a call adds the callee's row as written (a mode atom stays a mode atom), and a
@@ -1075,8 +1180,8 @@ label and talk upstream under another, over one serve loop and one writer
 (`std.net`, `std.http`).
 
 Two atoms **conflict** iff they name the same resource of the same effect and
-one is a `write`. A label parameter or `[*]` may be any label, so it conflicts
-with every label of its effect. `parallel` (§5.9) and the test scheduler (§8.4)
+one is a `write`; a `raise` conflicts with nothing. A label parameter or `[*]`
+may be any label, so it conflicts with every label of its effect. `parallel` (§5.9) and the test scheduler (§8.4)
 both decide by this.
 
 A row also counts. Each atom a call performs runs a `bounded` number of times,
@@ -1202,7 +1307,7 @@ by its type.
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
-except a clause for `abort.raise` (§6.8).
+except a clause for a `raise` operation (§6.8).
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it
@@ -1224,39 +1329,73 @@ reached the host boundary with nothing bound — pass `--host` or handle it
 ### 6.8 Raising
 
 ```ply
-fn digit(b: Int) -> Int / {abort.raise} =
-  if b >= 48 && b <= 57 { b - 48 } else { abort.raise("not a digit") }
+type SyntaxError = { line: Int, why: String }
+
+effect toml {
+  raise syntax(e: SyntaxError)
+}
+
+fn digit(b: Int, line: Int) -> Int / {toml.syntax} =
+  if b >= 48 && b <= 57 { b - 48 } else { toml.syntax({ line: line, why: "not a digit" }) }
 
 fn digit_or(b: Int, fallback: Int) -> Int / {} =
-  handle { digit(b) } with { abort.raise(reason) -> fallback }
+  handle { digit(b, 1) } with { toml.syntax(e) -> fallback }
+
+fn checked(b: Int) -> Result<Int, SyntaxError> = try { digit(b, 1) }
 ```
 
-The prelude declares `effect abort { read raise<a>(message: String) -> a }`.
-`abort.raise(m)` puts `abort.raise` in the row as any perform does, and does not
-come back. So does everything else that can fail on a value it is given: `panic`,
-`assert` and `assert_eq`, a builtin outside what it is defined for (§12), a `/`
-or `%` by zero (§2.4), a `let` whose pattern misses (§5.1), an `iterate` past
-its budget, a `task.join` of a cancelled task, a `task.channel` of a negative
-capacity and a `random.below` of a bound below one (§9). What a literal argument
-settles does not raise: a divisor other than zero, a capacity or bound in range,
-and a narrowing such as `u8_of_int(200)` of a value its type holds. A signature
-that leaves `abort.raise` out of its row where its body can raise is `E0302`,
-which names the operation and offers the row to write. Overflow, the call
-ceiling and a spent step budget end the run whatever the row says.
+A `raise` operation does not come back to where it was performed. Its perform
+has whatever type is asked of it and puts the operation in the row, as any
+perform does, so a row names each way a call can fail: inference unions them,
+and they pass through a row variable, so `map(lines, parse_line)` raises what
+`parse_line` raises. A declaration is the name and its parameters; it writes no
+result, and takes no resource label and no type parameters (`E0001`).
 
-A clause for `abort.raise` has the `handle`'s type: its value is the `handle`'s,
+A clause for a raise has the `handle`'s type: its value is the `handle`'s,
 `return` is not applied to it, and it cannot bind `resume` (`E0201`). Its
-parameter is the message: `panic`'s argument, or what the run would otherwise
-have reported, a value it names told by its kind. The clause runs outside its
-`handle`, once the body is abandoned and the regions the body opened are closed,
-so a raise in another clause goes to a `handle` further out than the one whose
-clause raised. A raise no clause answers ends the run: `E0501` for an assertion
-and `E0502` for anything else.
+parameters are what the raise carried. The clause runs outside its `handle`,
+once the body is abandoned and the regions the body opened are closed, so a
+raise in another clause goes to a `handle` further out than the one whose
+clause raised. A clause answers the raise it names and leaves the effect's
+others to pass. A raise no clause answers ends the run with `E0502`, naming the
+operation and what it carried; a test's is its failure, which is why a raise is
+in no footprint (§8.4).
 
-A `parallel` branch's raise is answered around the block. A task's raise goes
-to the task's own `handle`s and then to those around its `simulate` region,
-never to the copies its spawn inherited (§9); outside `simulate` it ends the
-run. A `cell_update` whose function raised leaves the cell as it was.
+`try { body }` answers `Ok` of what `body` answers, or `Err` of what a raise in
+it carried: the value for a raise of one parameter, `()` for one of none, and
+the tuple for one of several. It answers the one `raise` operation the body's
+row names, `abort.raise` aside, and takes that atom out of the row; a body that
+names none is `E0311`, and one that names several is `E0312`, where
+`try[toml.syntax] { body }` says which and lets the others pass. Naming an
+operation that is not a `raise` is `E0313`. A `try` is the `handle` with that
+one clause and `return v -> Ok(v)`, so what holds of a `handle` holds of it: a
+recursive group with one in a member's body nests (§5.7), a `?` inside one is
+`E0118`, and so is a `try` in a module that binds an `Ok` or an `Err` of its
+own. An `Err` goes back to its raise through a function:
+`result_unwrap_or_else(r, |e: SyntaxError| toml.syntax(e))` (`ply doc std.result`).
+
+The prelude declares `effect abort { raise raise(message: String) }`.
+`abort.raise(m)` is that raise, and so is everything else that can fail on a
+value it is given: `panic`, `assert` and `assert_eq`, a builtin outside what it
+is defined for (§12), a `/` or `%` by zero (§2.4), a `let` whose pattern misses
+(§5.1), an `iterate` past its budget, a `task.join` of a cancelled task, a
+`task.channel` of a negative capacity and a `random.below` of a bound below one
+(§9). What a literal argument settles does not raise: a divisor other than
+zero, a capacity or bound in range, and a narrowing such as `u8_of_int(200)` of
+a value its type holds. A signature that leaves `abort.raise` out of its row
+where its body can raise is `E0302`, which names the operation and offers the
+row to write. Overflow, the call ceiling and a spent step budget end the run
+whatever the row says. A clause for `abort.raise` is handed the message:
+`panic`'s argument, or what the run would otherwise have reported, a value it
+names told by its kind. Unanswered, it is `E0501` for an assertion and `E0502`
+for anything else. Nearly every body can raise it, so a `try` answers it only
+by name: `try[abort.raise] { body }`.
+
+A `parallel` branch's raise is answered around the block. A task may raise:
+its raise goes to the task's own `handle`s and then to those around its
+`simulate` region, never to the copies its spawn inherited (§9); outside
+`simulate` it ends the run. A `cell_update` whose function raised leaves the
+cell as it was.
 
 ## 7. Cells and regions
 
@@ -1439,7 +1578,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, and the cost checker's report on a program, kept under the checker's hash and the program's text (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each tagged literal's verdict, kept under the hash of all its parser reaches and its text (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -1487,7 +1626,8 @@ effect sim           { read  seed() -> Int }
   wall clock.
 * A task performs against the handlers around its `task.spawn`, so a clause it
   reaches touches only the cells the task itself may (§7); a clause that binds
-  `resume` is unreachable from a task (`E0502`).
+  `resume` is unreachable from a task (`E0502`), and a clause for a raise is
+  not among them (§6.8).
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
   inside a value, or inside a closure that captured it. A closure's type shows a
   captured task only as the `task.join`, `task.await` or `task.cancel` in its
@@ -1796,7 +1936,8 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 ```
 
 `where derivable(D, p)` goes after the row and before any `requires`. Codecs are
-plain values: `json::decode_bytes(body, order_json())`.
+plain values: `json::decode_bytes(body, order_json())`. A `new` record (§4.2)
+derives as an alias of its fields does: the same documents, bytes and shape.
 
 A `json` or `bin` codec whose type reaches itself, directly or through the
 other types the module derives, is two definitions: `tree_json()` starts
@@ -2265,6 +2406,22 @@ beside the phases of a check that ran, with `filed`, whether the next check can
 take its answer back (false for a refused load, or when the entry could not be
 written).
 
+A load that checked has not yet run a tagged literal's parser (§2.3). `ply check`,
+`ply run`, `ply test`, `ply build` and `ply prove` settle the literals of the
+root package's modules before they do anything else with the load, and refuse it
+with what a parser refused (`E0153`, `E0154`): each literal is the call of its
+parser, entered on a machine of its own, lent to nothing, over a unit of the
+definitions the parsers reach, under a budget of ten million calls a literal.
+A verdict is a function of the parser and the text, so it is kept in the
+toolchain's cache (§8.6) under the hash of all the parser reaches, the text and
+the toolchain, and a parser is entered again only for a text it has not read or
+after an edit to something it reaches; a check that touches no literal's parser
+enters nothing. A module that writes a tagged literal is read from its source
+by every check, never as its stub. A dependency's literals are its own run's
+to settle, as its tests are, and `compiler.load` settles none: there, as in any
+load nothing settled, a literal whose parser refuses it ends the run where it
+is read (`E0502`).
+
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements, and keeps a doc comment directly above what it
 documents; it prints `formatted PATH` per file it changed
@@ -2335,7 +2492,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0115` | `effect set` cycle |
 | `E0116` | record update base that is not a record of a known type |
 | `E0117` | record update naming a field the base lacks |
-| `E0118` | `?` with no written `Result`/`Option` return type to exit through |
+| `E0118` | `?` with no written `Result`/`Option` return type to exit through, or a `try` or a tagged literal where `Ok` or `Err` is rebound |
 | `E0119` | `?` where its early exit would change what runs or drop an annotation |
 | `E0120` | parameter default on a lambda, operation or handler clause |
 | `E0121` | parameter default that is not a pure, closed value |
@@ -2368,6 +2525,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
 | `E0151` | an `extern fn` outside the prelude |
+| `E0152` | a tagged literal whose tag's `literal` is not a parser a check can run |
+| `E0153` | a tagged literal its parser refuses |
+| `E0154` | a tagged literal whose parser raised or spent its budget |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -2381,6 +2541,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0211` | integer literal out of range for its fixed width |
 | `E0212` | the alternatives of an or-pattern bind different names |
 | `E0213` | a `let` whose or-pattern can fail has no `else` |
+| `E0214` | a `new` record whose fields reach the record itself |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
@@ -2391,6 +2552,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, a parameter its signature never mentions, or a call from another member of its recursive group |
+| `E0311` | `try` whose body's row names no `raise` operation to answer |
+| `E0312` | `try` whose body's row names several `raise` operations, and it names none |
+| `E0313` | `try` naming an operation that is not a `raise` |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` or `Chan` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
@@ -2440,7 +2604,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0501` | assertion failed |
-| `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
+| `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
 | `E0505` | Ply broke one of its own invariants |
 | `W0601` | cache unreadable |
@@ -2457,8 +2621,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 
 ## 18. What Ply does not have
 
-* No loops, `break` or `return` (`?` is the only early exit, and `abort.raise`
-  the only one past the caller, §6.8); no mutable variables; no exceptions
+* No loops, `break` or `return` (`?` is the only early exit, and a raise the
+  only one past the caller, §6.8); no mutable variables; no exceptions
   outside the row; no typeclasses, implicits or method syntax; no
   modules-as-values or first-class effects; no `unsafe` or FFI: what a program
   reaches outside itself is an effect a handler answers, and the builtins are the

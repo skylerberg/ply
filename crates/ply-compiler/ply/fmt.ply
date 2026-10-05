@@ -9,13 +9,14 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder, Deriver, deriver_text,
               Constraint, SpecClause, SpecKind, SRequires, SEnsures, SCost, ReturnsFresh,
               ReturnsParam, Vis, VPub, VPriv, item_span, item_doc, parse, dump_module, is_written,
-              constraint_written, is_pub, spec_kind_text)
+              constraint_written, is_pub, spec_kind_text, TDNominal)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span, mode_text, angled, generics_text, ident_names)
+                    MWrite, MBad, ty_span, mode_text, is_raise, angled, generics_text, ident_names)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, RecField, NamedArg, Param, Stmt, SLet, SLetElse, SExpr, MatchArm,
-              HandleClause, ReturnClause, expr_span, is_block_like)
+              EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt, SLet,
+              SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
+              ETagged, Tagged)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
 import std.list (at)
@@ -499,6 +500,10 @@ fn line_string(printer: Printer, value: Bytes, indent: Int, cont: Int) -> Printe
   { ..printed, closed: indent }
 }
 
+/// A tagged literal as written: its tag, touching its string.
+fn tagged_text(input: PrintInput, t: Tagged) -> Bytes / {abort.raise} =
+  bytes_concat(t.tag.name, bytes_slice(input.source, t.quoted.start, t.quoted.end))
+
 fn lit_text(input: PrintInput, span: Span, literal: Lit) -> Bytes / {abort.raise} =
   match literal {
     LInt(_) -> strip_blanks(unparen(input, span)),
@@ -625,6 +630,7 @@ fn runs_on(expr: Expr) -> Bool =
     EHandle(_) -> true,
     EWithCell(_) -> true,
     ESimulate(_) -> true,
+    ETryBlock(_) -> true,
     _ -> false,
   }
 
@@ -646,6 +652,7 @@ fn parens_unary(expr: Expr) -> Bool =
 fn parens_postfix(expr: Expr) -> Bool =
   match expr {
     ELit(_) -> false,
+    ETagged(_) -> false,
     EVar(_) -> false,
     EApp(_) -> false,
     EField(_) -> false,
@@ -727,6 +734,12 @@ fn param_head(input: PrintInput, param: Param) -> Bytes / {abort.raise} =
 
 fn perform_head(eff: QName, ident: Ident, r: Option<Ident>) -> Bytes =
   bytes_concat_all([qname_text(eff), b".", ident.name, resource_text(r)])
+
+fn try_head(raise: Option<RaiseName>) -> Bytes =
+  match raise {
+    None -> b"try ",
+    Some(r) -> bytes_concat_all([b"try[", qname_text(r.eff), b".", r.op.name, b"] "]),
+  }
 
 fn clause_head(clause: HandleClause) -> Bytes / {abort.raise} =
   bytes_concat_all([
@@ -867,6 +880,7 @@ fn flat_expr(p: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
 fn flat_node(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
   match e {
     ELit(v) -> if is_lines(input, e) { None } else { Some(lit_text(input, v.span, v.lit)) },
+    ETagged(v) -> Some(tagged_text(input, v)),
     EVar(v) -> Some(qname_text(v.name)),
     EBinary(v) ->
       cat([
@@ -967,6 +981,7 @@ fn flat_node(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
         Some(b" }"),
       ]),
     ESimulate(v) -> cat([Some(b"simulate "), flat_expr(input, v.body)]),
+    ETryBlock(v) -> cat([Some(try_head(v.raise)), flat_expr(input, v.body)]),
     EParallel(v) ->
       cat([
         Some(b"parallel { "),
@@ -1099,6 +1114,7 @@ fn broken_node(
       else { emit(printer, lit_text(input, v.span, v.lit)) },
       _ -> emit(printer, lit_text(input, v.span, v.lit)),
     },
+    ETagged(v) -> emit(printer, tagged_text(input, v)),
     EVar(v) -> emit(printer, qname_text(v.name)),
     EBinary(v) -> chain(input, printer, v.lhs, v.op, v.rhs, cont, after),
     EUnary(v) ->
@@ -1162,6 +1178,7 @@ fn broken_node(
     EHandle(v) -> handle_expr(input, printer, v.body, v.clauses, v.ret, v.span, indent),
     EWithCell(v) -> cell_expr(input, printer, v.resource, v.init, v.binder, v.body, v.span, indent),
     ESimulate(v) -> block(input, emit(printer, b"simulate "), v.body, indent),
+    ETryBlock(v) -> block(input, emit(printer, try_head(v.raise)), v.body, indent),
     // Trailing comments are read from the end of the keyword, where the braces' own span would start.
     EParallel(v) ->
       elements(
@@ -1910,6 +1927,18 @@ fn record_type(
   close(input, s2, span.end, indent, b"}")
 }
 
+/// The type a declaration writes after its `=`: a record that does not fit goes one field to a line.
+fn written_type(input: PrintInput, printer: Printer, t: TypeExpr) -> Printer / {abort.raise} =
+  match t {
+    TRecord(r) -> if is_ty_tuple(r.fields) { emit(printer, type_text(input, t)) } else {
+      match try_flat(input, printer, Some(type_text(input, t)), r.span.end, 0) {
+        Some(f) -> emit(printer, f),
+        None -> record_type(input, printer, r.fields, r.span, 0),
+      }
+    },
+    _ -> emit(printer, type_text(input, t)),
+  }
+
 fn type_def(input: PrintInput, printer: Printer, d: TypeDef) -> Printer / {abort.raise} = {
   let params = generics_text(d.generics);
   let s1 = emit(
@@ -1917,15 +1946,8 @@ fn type_def(input: PrintInput, printer: Printer, d: TypeDef) -> Printer / {abort
     bytes_concat_all([vis_text(d.vis), b"type ", d.name.name, params, b" = "]),
   );
   match d.body {
-    TDAlias(t) -> match t {
-      TRecord(r) -> if is_ty_tuple(r.fields) { emit(s1, type_text(input, t)) } else {
-        match try_flat(input, s1, Some(type_text(input, t)), r.span.end, 0) {
-          Some(f) -> emit(s1, f),
-          None -> record_type(input, s1, r.fields, r.span, 0),
-        }
-      },
-      _ -> emit(s1, type_text(input, t)),
-    },
+    TDAlias(t) -> written_type(input, s1, t),
+    TDNominal(t) -> written_type(input, emit(s1, b"new "), t),
     TDSum(vs) -> {
       let flat = bytes_concat(
         b"| ",
@@ -2009,8 +2031,8 @@ fn op_decl_text(input: PrintInput, op: OpDef) -> Bytes / {abort.raise} = {
     generics_text({ types: op.ty_params, effects: [], labels: [] }),
     b"(",
     join(ps, b", "),
-    b") -> ",
-    type_text(input, op.ret),
+    b")",
+    if is_raise(op.mode) { b"" } else { bytes_concat(b" -> ", type_text(input, op.ret)) },
   ])
 }
 
@@ -2696,6 +2718,17 @@ test "every item kind prints back to the same tree" {
   assert(string_contains(string_of_bytes(formatted(src)), "read get[r](key: Int) -> Option<Int>"))
 }
 
+test "a `new` record prints `new` before its fields, one to a line where they do not fit" {
+  lays_out(
+    b"pub   type Date=new{year:Int,month:Int}\n",
+    b"pub type Date = new { year: Int, month: Int }\n",
+  );
+  lays_out(
+    b"type Pair<a> = new { the_first_of_the_two_values_it_holds: a, the_second_of_the_two_values_it_holds: a }\n",
+    b"type Pair<a> = new {\n  the_first_of_the_two_values_it_holds: a,\n  the_second_of_the_two_values_it_holds: a,\n}\n",
+  )
+}
+
 test "a cost law prints its bound after its guard, on the head's line while it fits" {
   lays_out(
     b"law \"linear\"   forall (n: Int) where n>0 cost 2*n { range(0,n) }\n",
@@ -2721,6 +2754,34 @@ test "a `cost` clause prints on its own line among the spec clauses, in the orde
 test "an operation's type parameters print between its resource and its parameters" {
   let src = b"effect box {\n  read take[k]<a>() -> a\n  write put<a, b>(x: a, y: b) -> Unit\n}\n";
   assert_eq(formatted(src), src)
+}
+
+test "a `raise` operation prints its name and parameters, and no result" {
+  lays_out(
+    b"effect toml {\n  raise   syntax(e: SyntaxError)\n  raise eof( )\n  read peek() -> Int\n}\n",
+    b"effect toml {\n  raise syntax(e: SyntaxError)\n  raise eof()\n  read peek() -> Int\n}\n",
+  )
+}
+
+test "a `try` prints the raise it names, stands as a scrutinee, and is bracketed as an operand" {
+  lays_out(
+    b"fn f(b: Int) -> Result<Int, Int> = try   { digit(b) }\n",
+    b"fn f(b: Int) -> Result<Int, Int> = try { digit(b) }\n",
+  );
+  lays_out(
+    b"fn f(b: Int) -> Result<Int, Int> = try[ m::toml.syntax ]\n  { digit(b) }\n",
+    b"fn f(b: Int) -> Result<Int, Int> = try[m::toml.syntax] { digit(b) }\n",
+  );
+  let scrutinee = b"fn f(b: Int) -> Int = match try { digit(b) } { Ok(v) -> v, Err(e) -> e }\n";
+  assert_eq(formatted(scrutinee), scrutinee);
+  let operand = b"fn f(b: Int) -> Bool = (try { digit(b) }) == Ok(1)\n";
+  assert_eq(formatted(operand), operand);
+  let long = bytes_concat_all([
+    b"fn f(b: Int) -> Result<Int, Int> = try[toml.syntax] { let first = digit(b); ",
+    b"let second = digit(b + 1); let third = digit(b + 2); first + second + third }\n",
+  ]);
+  assert(stable(long));
+  assert(string_contains(string_of_bytes(formatted(long)), "\n  try[toml.syntax] {\n"))
 }
 
 test "a row naming operations prints them back, and a `let` bound to a `handle` keeps its shape" {
@@ -2807,6 +2868,12 @@ test "an interpolated string keeps its text as written and prints each hole flat
     formatted(src),
     b"fn h(x: Int) -> String = f\"x = {x + 1} {{y}} \\n {f\"in {x}\"}\"\nfn k(a: Int, b: Int) -> String = f\"{a}\" ++ f\"{b}\"\n",
   );
+  assert(stable(src))
+}
+
+test "a tagged literal is kept as written, its tag touching its string" {
+  let src = b"fn f() -> Int =   len((hex\"de\\u{61}d\").nibbles)   +   len( [ uuid\"\" ] )\n";
+  assert_eq(formatted(src), b"fn f() -> Int = len(hex\"de\\u{61}d\".nibbles) + len([uuid\"\"])\n");
   assert(stable(src))
 }
 

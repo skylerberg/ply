@@ -449,9 +449,8 @@ extern "C" fn entry(arg: usize) {
         && let Some(f) = frame.as_mut()
     {
         c.failed = 0;
-        let closure = f.take_abort_clause();
-        let message = c.word(&ply_eval::Value::str(a.message));
-        r = call_value(ctx, closure, &[message]);
+        let closure = f.take_clause(a.clause);
+        r = call_value(ctx, closure, &a.args);
         heap::dec(closure);
         answered = true;
     }

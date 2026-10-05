@@ -15,9 +15,9 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 doc_at, module_doc, token_between, dump_doc, primary_span_of)
 import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, Keyword, Punctuation,
               EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark)
-import type_syntax (TypeExpr, TRecord, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead, MWrite,
-                    RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row, row_member, no_generics,
-                    dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
+import type_syntax (TypeExpr, TRecord, TUnit, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead,
+                    MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row,
+                    row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import exprs (Expr, Param, expr, scrutinee, block_expr, expr_span, no_expr, fn_param, param,
               dump_expr, dump_param, shown_binder)
@@ -122,7 +122,8 @@ pub type LawDef = {
 
 pub type VariantDef = { name: Ident, fields: List<TypeExpr>, doc: Option<Doc>, span: Span }
 
-pub type TypeDefBody = | TDAlias(TypeExpr) | TDSum(List<VariantDef>)
+/// `TDNominal` holds the record type written after `new`.
+pub type TypeDefBody = | TDAlias(TypeExpr) | TDSum(List<VariantDef>) | TDNominal(TypeExpr)
 
 /// A field of the record a `type` declares, with the doc above it.
 pub type FieldDoc = { name: Bytes, doc: Doc }
@@ -1093,8 +1094,31 @@ pub fn type_params(
     Ok({ parser: parser, node: ns })
   }
 
+/// `new`, then the record's fields. A record with none has no literal to be built by.
+fn nominal_body(
+  input: Input,
+  parser: Parser,
+) -> Result<Parsed<TypeDefBody>, Parser> / {abort.raise} = {
+  let opened = advance(input, parser).parser;
+  if !at_token(input, opened, token_lbrace()) {
+    Err(error_here(input, opened, b"`{` to open a nominal record's fields after `new`"))
+  } else if token_kind_at(input, opened, 1) == token_rbrace() {
+    Err(
+      error_here(
+        input,
+        advance(input, opened).parser,
+        b"a field: a nominal record has at least one",
+      ),
+    )
+  } else {
+    let t = ty(input, opened)?;
+    Ok({ parser: t.parser, node: TDNominal(t.node) })
+  }
+}
+
 fn type_body(input: Input, parser: Parser) -> Result<Parsed<TypeDefBody>, Parser> / {abort.raise} =
-  if looks_like_variants(input, parser) {
+  if at_ident_text(input, parser, b"new") { nominal_body(input, parser) }
+  else if looks_like_variants(input, parser) {
     let v = variants(input, parser)?;
     Ok({ parser: v.parser, node: TDSum(v.node) })
   } else {
@@ -1129,17 +1153,21 @@ pub fn type_def(
 /// The docs above the fields of a record written in braces; a tuple's fields are positions.
 fn field_docs(input: Input, body: TypeDefBody) -> List<FieldDoc> / {abort.raise} =
   match body {
-    TDAlias(t) -> match t {
-      TRecord(r) -> if bytes_at(input.source, r.span.start) != 123 { [] } else {
-        fold(r.fields, [], |acc: List<FieldDoc>, f: { name: Ident, ty: TypeExpr }|
-          match doc_at(input, f.name.span.start) {
-            Some(d) -> push(acc, { name: f.name.name, doc: d }),
-            None -> acc,
-          })
-      },
-      _ -> [],
-    },
+    TDAlias(t) -> record_docs(input, t),
+    TDNominal(t) -> record_docs(input, t),
     TDSum(_) -> [],
+  }
+
+fn record_docs(input: Input, t: TypeExpr) -> List<FieldDoc> / {abort.raise} =
+  match t {
+    TRecord(r) -> if bytes_at(input.source, r.span.start) != 123 { [] } else {
+      fold(r.fields, [], |acc: List<FieldDoc>, f: { name: Ident, ty: TypeExpr }|
+        match doc_at(input, f.name.span.start) {
+          Some(d) -> push(acc, { name: f.name.name, doc: d }),
+          None -> acc,
+        })
+    },
+    _ -> [],
   }
 
 // --- `effect` ---------------------------------------------------------------
@@ -1160,7 +1188,88 @@ fn op_resource_param(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parse
     Ok({ parser: parser, node: true })
   }
 
-pub fn op_def(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
+fn raise_refuses(input: Input, parser: Parser, label: Bytes, note: Bytes) -> Parser =
+  push_diag(
+    parser,
+    error_at(
+      unexpected(),
+      current_span(input, parser),
+      b"a `raise` operation is a name and its parameters",
+      label,
+      [note],
+    ),
+  )
+
+/// A raise answers nothing, so it writes no result: `ret` is `Unit` there, and nothing reads it.
+fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let { parser, node: name } = expect_ident(input, st.parser, b"an operation name")?;
+  if at_token(input, parser, token_lbracket()) {
+    Err(
+      raise_refuses(
+        input,
+        parser,
+        b"a raise takes no resource",
+        b"a label says which performs conflict, and a raise conflicts with nothing",
+      ),
+    )
+  } else if at_token(input, parser, token_lt()) {
+    Err(
+      raise_refuses(
+        input,
+        parser,
+        b"a raise takes no type parameters",
+        b"its clause is handed the payload, so the payload's type is written out",
+      ),
+    )
+  } else {
+    let { parser, node: o } = expect(
+      input,
+      parser,
+      token_lparen(),
+      b"`(` to start the operation parameters",
+    )?;
+    let { parser, node: ps } = comma_list(input, parser, token_rparen(), op_param)?;
+    let { parser, node: cl } = expect_close(
+      input,
+      parser,
+      token_rparen(),
+      o,
+      b"`)` to close the operation parameters",
+    )?;
+    if at_token(input, parser, token_arrow()) {
+      Err(
+        raise_refuses(
+          input,
+          parser,
+          b"a raise writes no result",
+          b"a raise does not come back, so its perform has whatever type is asked of it",
+        ),
+      )
+    } else {
+      Ok({
+        parser: parser,
+        node: {
+          name: name,
+          mode: MRaise,
+          resource_param: false,
+          ty_params: [],
+          params: ps,
+          ret: TUnit({ span: cl }),
+          doc: doc_at(input, st.node.start),
+          span: span_to(st.node, cl),
+        },
+      })
+    }
+  }
+}
+
+/// One operation of an effect. `raise` is contextual, as `read` and `write` are.
+pub fn op_def(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} =
+  if at_ident_text(input, parser, b"raise") { raise_op(input, parser) }
+  else { moded_op(input, parser) }
+
+fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
   let start = current_span(input, parser);
   let { parser, node: m } = mode(input, parser)?;
   let { parser, node: name } = expect_ident(input, parser, b"an operation name")?;
@@ -1612,6 +1721,7 @@ fn item_docs(item: Item) -> List<Doc> = {
         fold(vs, [], |acc: List<Doc>, v: VariantDef|
           match v.doc { Some(x) -> push(acc, x), None -> acc }),
       TDAlias(_) -> map(d.field_docs, |f: FieldDoc| f.doc),
+      TDNominal(_) -> map(d.field_docs, |f: FieldDoc| f.doc),
     },
     IEffect(d) ->
       fold(d.ops, [], |acc: List<Doc>, o: OpDef|
@@ -1782,6 +1892,7 @@ pub fn dump_type_body(b: TypeDefBody) -> Bytes / {abort.raise} =
   match b {
     TDAlias(t) -> bytes_concat(dump_word(b"alias"), dump_ty(t)),
     TDSum(vs) -> bytes_concat(dump_word(b"sum"), dump_list(vs, dump_variant)),
+    TDNominal(t) -> bytes_concat(dump_word(b"new"), dump_ty(t)),
   }
 
 pub fn dump_type(type_def: TypeDef) -> Bytes / {abort.raise} =
@@ -1956,6 +2067,18 @@ test "a type with one uppercase name and no payload is an alias, not a sum" {
   )
 }
 
+test "`new` after the `=` opens a nominal record, which names at least one field" {
+  assert_eq(
+    dump(b"type T = new { a: A }\n"),
+    "#0;#1;0:21:ty;%priv;5:6:ident;@54;%gen;#0;#0;#0;%new;13:21:trec;#1;15:16:ident;@61;18:19:tcon;18:19:qname;?0;18:19:ident;@41;#0;#0;",
+  );
+  let refused = |src: Bytes| len(parse(src).parser.diags);
+  assert_eq(refused(b"type T = new {}\n"), 1);
+  assert_eq(refused(b"type T = new Int\n"), 1);
+  assert_eq(refused(b"type T<new> = List<new>\n"), 0);
+  assert_eq(refused(b"type T<a, [l] | e> = new { f: (a) -> Unit / {net.send[l] | e} }\n"), 0)
+}
+
 test "`type Pair<a>= a` splits the `>=` into `>` and `=`" {
   assert_eq(
     dump(b"type Pair<a>= a\n"),
@@ -2054,6 +2177,15 @@ test "an import that selects names may not then rename the module" {
   assert_eq(dump(b"import a (b) as c\n"), "#0;#0;#1;!E0001:13:15:1:1;=13:15:1;")
 }
 
+test "a `raise` operation declares a name and its parameters, and nothing else" {
+  let declared = dump(b"effect E {\n  raise bad(at: Int)\n  raise eof()\n}\n");
+  assert(string_contains(declared, "13:31:op;19:22:ident;@626164;%raise;%false;#0;#1;"));
+  assert(string_contains(declared, "@656f66;%raise;%false;#0;#0;"));
+  assert(string_contains(dump(b"effect E { raise bad[r](at: Int) }"), "!E0001:"));
+  assert(string_contains(dump(b"effect E { raise bad<a>(at: a) }"), "!E0001:"));
+  assert(string_contains(dump(b"effect E { raise bad(at: Int) -> Int }"), "!E0001:"))
+}
+
 test "a line string is an expression, and never a pattern or a test's label" {
   let first = |src: Bytes|
     match list_at(parse(src).parser.diags, 0) { Some(d) -> Some(d.message), None -> None };
@@ -2131,7 +2263,7 @@ test "a `///` block documents the declaration below it and `//!` lines the modul
       match d.body {
         TDSum(vs) ->
           assert_eq(map(vs, |v: VariantDef| doc_lines(v.doc)), [[b"The first."], [b"The second."]]),
-        TDAlias(_) -> panic("`T` is a sum"),
+        _ -> panic("`T` is a sum"),
       }
     },
     _ -> panic("the second item is `T`"),

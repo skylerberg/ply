@@ -1,0 +1,155 @@
+//! A `raise` operation does not come back, as `abort.raise` does not: the innermost `handle` with a
+//! clause for it answers in place of the whole body, and the clause is handed what was raised.
+
+type Bad = { at: Int, why: String }
+
+effect parse {
+  raise bad(e: Bad)
+  raise missing(key: String, line: Int)
+  raise eof()
+  read peek() -> Int
+}
+
+fn digit(b: Int) -> Int / {parse.bad} =
+  if b >= 48 && b <= 57 { b - 48 } else { parse.bad({ at: b, why: "not a digit" }) }
+
+fn checked(b: Int) -> Result<Int, Bad> / {} =
+  handle { digit(b) } with { parse.bad(e) -> Err(e), return v -> Ok(v) }
+
+test "a raise is answered by its clause, and a value by return" {
+  assert_eq(checked(53), Ok(5));
+  assert_eq(checked(1), Err({ at: 1, why: "not a digit" }))
+}
+
+test "a perform of a raise has whatever type is asked of it" {
+  let n: Int = handle { parse.eof() } with { parse.eof() -> 1 };
+  let s: String = handle { parse.eof() } with { parse.eof() -> "end" };
+  assert_eq((n, s), (1, "end"))
+}
+
+test "a clause is handed every value the raise carried" {
+  let r = handle { parse.missing("port", 3) } with { parse.missing(key, line) -> (key, line) };
+  assert_eq(r, ("port", 3))
+}
+
+test "the innermost handle answers" {
+  let r = handle { handle { digit(1) } with { parse.bad(e) -> 10 } } with { parse.bad(e) -> 20 };
+  assert_eq(r, 10)
+}
+
+test "a raise in a clause goes past the handles inside the one whose clause raised" {
+  let r = handle {
+    handle { handle { parse.peek() } with { parse.bad(e) -> 1 } } with { parse.peek() -> digit(0) }
+  } with {
+    parse.bad(e) -> 2,
+  };
+  assert_eq(r, 2)
+}
+
+fn peeked() -> Int / {parse.peek, parse.bad} = digit(parse.peek())
+
+test "a clause for a read leaves the effect's raises to pass, and a clause for one raise the others" {
+  let r = handle {
+    handle { peeked() } with { parse.peek() -> 7 }
+  } with {
+    parse.bad(e) -> 0 - e.at,
+  };
+  assert_eq(r, 0 - 7);
+  let s = handle {
+    handle { if digit(1) > 0 { parse.eof() } else { 0 } } with { parse.eof() -> 1 }
+  } with {
+    parse.bad(e) -> 2,
+  };
+  assert_eq(s, 2)
+}
+
+test "a raise closes the regions its body opened" {
+  let r = handle {
+    with_cell[inner](1) { c -> {
+      cell_set(c, 2);
+      digit(1)
+    } }
+  } with {
+    parse.bad(e) -> 9,
+  };
+  assert_eq(r, 9)
+}
+
+test "a cell keeps its contents across an update a raise abandoned" {
+  with_cell[r](5) { c -> {
+    handle {
+      cell_update(c, |x: Int| if x > 0 { digit(1) } else { x })
+    } with {
+      parse.bad(e) -> (),
+    };
+    assert_eq(cell_get(c), 5)
+  } }
+}
+
+test "a bracket releases what it holds when a raise unwinds through it" {
+  with_cell[held](0) { c -> {
+    let r = handle {
+      bracket(|| 1, |h: Int| cell_set(c, cell_get(c) + h), |h: Int| digit(h))
+    } with {
+      parse.bad(e) -> 0 - 1,
+    };
+    assert_eq((r, cell_get(c)), (0 - 1, 1))
+  } }
+}
+
+test "a raise in a parallel branch is answered around the block" {
+  let r = handle {
+    let (a, b) = parallel { 1, digit(2) };
+    a + b
+  } with {
+    parse.bad(e) -> e.at,
+  };
+  assert_eq(r, 2)
+}
+
+test "a task may raise, and its raise is answered around its simulate region" {
+  let r = handle {
+    simulate {
+      let t = task.spawn(|| digit(3));
+      task.join(t)
+    }
+  } with {
+    parse.bad(e) -> 0 - e.at,
+  };
+  assert_eq(r, 0 - 3)
+}
+
+test "a task answers its own raise" {
+  let r = simulate {
+    let t = task.spawn(|| checked(4));
+    task.join(t)
+  };
+  assert_eq(r, Err({ at: 4, why: "not a digit" }))
+}
+
+effect amb {
+  read flip() -> Bool
+}
+
+fn risky() -> Int / {amb.flip, parse.bad} = if amb.flip() { digit(6) } else { 3 }
+
+test "a raise in a body that resumes off the tail is answered by its own handle" {
+  let r = handle {
+    risky()
+  } with {
+    amb.flip() resume k -> k(true) + k(false),
+    parse.bad(e) -> 1000,
+    return v -> v * 10,
+  };
+  assert_eq(r, 1030)
+}
+
+fn deep(n: Int) -> Int / {parse.bad} = if n <= 0 { digit(0) } else { 1 + deep(n - 1) }
+
+fn each(bs: List<Int>) -> List<Int> / {parse.bad} = map(bs, digit)
+
+test "a raise unwinds every call between it and its handle, a builtin's among them" {
+  assert_eq(handle { deep(5000) } with { parse.bad(e) -> 0 - 1 }, 0 - 1);
+  assert_eq(handle { each([48, 49]) } with { parse.bad(e) -> [] }, [0, 1]);
+  assert_eq(handle { each([48, 1, 2]) } with { parse.bad(e) -> [e.at] }, [1])
+}
