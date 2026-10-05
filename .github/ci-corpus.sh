@@ -198,6 +198,34 @@ run_modules() {
     filters+=("$filter")
     args+=(--filter "$filter")
   done
+  # What an earlier run kept answers each run of several apart, whichever runs it was batched with:
+  # only the ones it does not answer are run.
+  if ((!selecting)) && [ "${#ids[@]}" -gt 1 ]; then
+    local asking=0 left kept_ids=() kept_filters=() answered=()
+    out=$(mktemp)
+    tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} --kept > "$out" || asking=$?
+    left=$(jq -r '.unanswered[]?' "$out" 2>/dev/null)
+    rm -f "$out"
+    if [ "$asking" -eq 0 ]; then
+      echo "answered by what earlier runs kept: ${ids[*]}"
+      return 0
+    fi
+    if [ "$asking" -eq 4 ] && [ -n "$left" ]; then
+      args=()
+      for i in "${!ids[@]}"; do
+        if grep -qxF -- "${filters[$i]}" <<< "$left"; then
+          kept_ids+=("${ids[$i]}")
+          kept_filters+=("${filters[$i]}")
+          args+=(--filter "${filters[$i]}")
+        else
+          answered+=("${ids[$i]}")
+        fi
+      done
+      [ "${#answered[@]}" -eq 0 ] || echo "answered by what earlier runs kept: ${answered[*]}"
+      ids=("${kept_ids[@]}")
+      filters=("${kept_filters[@]}")
+    fi
+  fi
   out=$(mktemp)
   started=$(date +%s%3N)
   tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} > "$out" || status=$?

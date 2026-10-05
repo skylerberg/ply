@@ -19,7 +19,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               constraint_written, SpecKind, SRequires, SEnsures, SCost, SpecClause, ReturnsFresh,
               ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub, TDNominal, test_listing,
               test_run, case_params, schema_of, IInstance, InstanceDef, InstanceKind, NKey, NShow,
-              instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
+              NGen, instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
@@ -27,7 +27,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, Module
 import derive (Expansion, expand_derives)
 import std.bytes (u32_at, is_digit, replace, ascii_of_int, u32_le, u64_le)
 import std.hash (blake3)
-import std.list (at, concat, contains, take, push_unique)
+import std.list (at, concat, contains, take, push_unique, reverse)
+import std.graph
 import std.bytes
 
 // --- Bytes ------------------------------------------------------------------------------------
@@ -363,16 +364,18 @@ pub fn build_index(
   { index: { ..index, effect_sketches: sketch_effects(index) }, diags: built.diags }
 }
 
-/// Each type's `key` before its `show`, whatever order the module wrote them in.
+/// Each type's `key` before its `show`, whatever order the module wrote them in. A `gen` is no part
+/// of what its type is: it decides what a sample draws and nothing a program computes.
 fn instances_in(items: List<Item>) -> Map<Bytes, List<InstanceDef>> =
   fold(items, map_new(), |acc: Map<Bytes, List<InstanceDef>>, item: Item|
     match item {
       IInstance(d) -> {
         let held = match map_get(acc, d.target.name) { Some(xs) -> xs, None -> [] };
-        map_insert(acc, d.target.name, match d.kind {
-          NKey -> concat([d], held),
-          NShow -> push(held, d),
-        })
+        match d.kind {
+          NKey -> map_insert(acc, d.target.name, concat([d], held)),
+          NShow -> map_insert(acc, d.target.name, push(held, d)),
+          NGen -> acc,
+        }
       },
       _ -> acc,
     })
@@ -503,91 +506,6 @@ fn effect_target(index: Index, module: Int, qname: QName) -> Option<Int> / {abor
       exported(index, qualifier(qname), module, map_get(at(index.items, t.owner).effects, t.name)),
   }
 
-/// Tarjan's components, iterative: completion order, each component's members as they left the stack.
-type Tarjan = {
-  index: List<Int>,
-  low: List<Int>,
-  on_stack: List<Bool>,
-  stack: List<Int>,
-  call: List<{ v: Int, edge: Int }>,
-  out: List<List<Int>>,
-  next: Int,
-}
-
-pub fn tarjan(n: Int, edges: List<List<Int>>) -> List<List<Int>> / {abort.raise} = {
-  let unvisited = 0 - 1;
-  let start = {
-    index: map(range(0, n), |i: Int| unvisited),
-    low: map(range(0, n), |i: Int| 0),
-    on_stack: map(range(0, n), |i: Int| false),
-    stack: [],
-    call: [],
-    out: [],
-    next: 0,
-  };
-  let total = fold(edges, 0, |acc: Int, es: List<Int>| acc + len(es));
-  let done = fold(range(0, n), start, |t: Tarjan, root: Int|
-    if at(t.index, root) != unvisited { t } else {
-      let opened: Tarjan = {
-        ..t,
-        index: list_set(t.index, root, t.next),
-        low: list_set(t.low, root, t.next),
-        next: t.next + 1,
-        stack: push(t.stack, root),
-        on_stack: list_set(t.on_stack, root, true),
-        call: [{ v: root, edge: 0 }],
-      };
-      iterate(opened, 2 * (n + total) + 4, |x: Tarjan|
-        if len(x.call) == 0 { Stop(x) } else { Continue(tarjan_step(n, edges, x)) })
-    });
-  done.out
-}
-
-fn tarjan_step(n: Int, edges: List<List<Int>>, t: Tarjan) -> Tarjan / {abort.raise} = {
-  let top = at(t.call, len(t.call) - 1);
-  let rest = take(t.call, len(t.call) - 1);
-  let out = at(edges, top.v);
-  if top.edge < len(out) {
-    let again = push(rest, { v: top.v, edge: top.edge + 1 });
-    let w = at(out, top.edge);
-    if w >= n { { ..t, call: again } } else if at(t.index, w) == 0 - 1 {
-      {
-        ..t,
-        index: list_set(t.index, w, t.next),
-        low: list_set(t.low, w, t.next),
-        next: t.next + 1,
-        stack: push(t.stack, w),
-        on_stack: list_set(t.on_stack, w, true),
-        call: push(again, { v: w, edge: 0 }),
-      }
-    } else if at(t.on_stack, w) {
-      { ..t, low: list_set(t.low, top.v, min(at(t.low, top.v), at(t.index, w))), call: again }
-    } else { { ..t, call: again } }
-  } else {
-    let lowered: Tarjan = if len(rest) > 0 {
-      let parent = at(rest, len(rest) - 1).v;
-      { ..t, low: list_set(t.low, parent, min(at(t.low, parent), at(t.low, top.v))) }
-    } else { t };
-    let popped: Tarjan = if at(lowered.low, top.v) == at(lowered.index, top.v) {
-      let split = iterate(
-        { stack: lowered.stack, on: lowered.on_stack, comp: [] },
-        len(lowered.stack) + 1,
-        |s: { stack: List<Int>, on: List<Bool>, comp: List<Int> }| {
-          let w = at(s.stack, len(s.stack) - 1);
-          let next = {
-            stack: take(s.stack, len(s.stack) - 1),
-            on: list_set(s.on, w, false),
-            comp: push(s.comp, w),
-          };
-          if w == top.v { Stop(next) } else { Continue(next) }
-        },
-      );
-      { ..lowered, stack: split.stack, on_stack: split.on, out: push(lowered.out, split.comp) }
-    } else { lowered };
-    { ..popped, call: rest }
-  }
-}
-
 fn is_cyclic(component: List<Int>, edges: List<List<Int>>) -> Bool / {abort.raise} =
   if len(component) != 1 { true } else {
     let only = at(component, 0);
@@ -689,6 +607,8 @@ fn tag_key() -> Int = 140
 fn tag_show() -> Int = 141
 /// One function a type's arithmetic is, after the operation it is.
 fn tag_numeric() -> Int = 142
+/// A type only its own module builds a value of.
+fn tag_opaque() -> Int = 161
 
 /// An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -1034,16 +954,22 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
       ),
     TDNominal(t) -> type_expr(put_text(put_tag(counted, tag_type_nominal()), d.name.name), t),
   };
+  // Unlike `pub`, `opaque` refuses bodies that name nothing of the type's: a literal where a
+  // closed record is expected. Only the type's own hash reaches each of them.
+  let closed: Encoder = match d.opaque {
+    Some(_) -> put_tag(declared, tag_opaque()),
+    None -> declared,
+  };
   // What a value of the type compares and shows through is part of what the type is: each function
   // is a reference, so the type's hash moves when the function it names does.
   let stated: Encoder = match map_get(
-      at(declared.index.items, declared.module).instances,
+      at(closed.index.items, closed.module).instances,
       d.name.name,
     ) {
-    None -> declared,
+    None -> closed,
     Some(stated) ->
-      fold(stated, declared, |acc: Encoder, x: InstanceDef|
-        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), NShow -> tag_show() }), {
+      fold(stated, closed, |acc: Encoder, x: InstanceDef|
+        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), _ -> tag_show() }), {
           module: None,
           name: x.by,
           span: x.by.span,
@@ -2196,7 +2122,8 @@ fn graph_with(
   let edges = map(range(0, n), |v: Int|
     match map_get(extra, v) { Some(es) -> es, None -> at(first, v).refs });
   let sketches = map(first, |f: Finished| f.bytes);
-  let components = tarjan(n, edges);
+  // A cycle's members last met first: the order the keys below are taken in.
+  let components = map(graph::components({ out: edges }), |c: List<Int>| reverse(c));
   let component_of = fold(
     range(0, len(components)),
     map(range(0, n), |i: Int| 0 - 1),
@@ -4816,12 +4743,13 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
     let fields = print_type(printer, read_text(k.decoder).decoder);
     { decoder: fields.decoder, text: bytes_concat(b"new ", fields.text) }
   } else { panic("a tag that does not begin a type body") };
-  let stated = instances_of(printer, body.decoder, name);
+  let closed = peek(body.decoder) == tag_opaque();
+  let stated = instances_of(printer, if closed { skip(body.decoder) } else { body.decoder }, name);
   let numeric = numeric_of(printer, stated.decoder);
   {
     decoder: numeric.decoder,
     text: bytes_concat_all([
-      b"type ",
+      if closed { b"opaque type " } else { b"type " },
       name,
       generic_list(n.value, ec.value, lc.value),
       b" = ",
@@ -6337,6 +6265,37 @@ test "a `new` record prints back as one and hashes back to what it was stored un
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
+test "a type's hash says whether it is opaque, what holds it moves with it, and it prints back" {
+  let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
+  let open = m(b"pub type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
+  let closed = m(b"pub opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
+  assert(map_get(open, b"m.Date") != map_get(closed, b"m.Date"));
+  assert(map_get(open, b"m.day") != map_get(closed, b"m.day"));
+  // `pub` is still no part of it.
+  let kept = m(b"opaque type Date = new { day: Int }\nfn day(d: Date) -> Int = d.day");
+  assert_eq(map_get(kept, b"m.Date"), map_get(closed, b"m.Date"));
+  let sum = m(b"pub type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
+  let closed_sum = m(b"pub opaque type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
+  assert(map_get(sum, b"m.Tok") != map_get(closed_sum, b"m.Tok"));
+  assert(map_get(sum, b"m.mk") != map_get(closed_sum, b"m.mk"));
+  let out = hash_index(
+    indexed([
+      {
+        name: b"m",
+        src: b"pub opaque type Tok = | Tok(Int)\nkey for Tok by n\nfn n(t: Tok) -> Int = match t { Tok(i) -> i }\npub opaque type Date = new { day: Int }\npub fn mk() -> Date = { day: n(Tok(1)) }",
+      },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b"pub opaque type Tok = | Tok(Int)"));
+  assert(bytes::contains(at(ms, 0).text, b"\nkey for Tok by n"));
+  assert(bytes::contains(at(ms, 0).text, b"pub opaque type Date = new {"));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
 test "an alias is transparent, so its name is no part of it" {
   let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
   // `conv_type` expands an alias in place, so these two declare one type and use it alike.
@@ -6509,4 +6468,42 @@ test "a key and a show print back after their type and hash back to what they we
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a gen is no part of its type's hash, and its sampler's covers the generator" {
+  let stating = |stated: Bytes, drawn: Bytes|
+    by_name(
+      named_hashes(
+        hash_index(
+          indexed([
+            {
+              name: b"m",
+              src: bytes_concat_all([
+                b"import std.gen (Gen, constant)\npub type Box = | Box(Int)\n",
+                stated,
+                b"pub fn boxes() -> Gen<Box> = constant(Box(",
+                drawn,
+                b"))\npub fn make() -> Box = Box(1)\n",
+              ]),
+            },
+            {
+              name: b"std.gen",
+              src: b"pub type Gen<a> = | Gen((Int) -> Option<a>)\npub type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\npub fn sample<a>(g: Gen<a>, root: Int, key: Bytes, size: Int, replay: Option<List<Int>>) -> Sample<a> = match g { Gen(f) -> { value: f(root), record: [], discards: 0 } }\npub fn elements<a>(xs: List<a>) -> Gen<a> = Gen(|i: Int| list_at(xs, i))\npub fn constant<a>(x: a) -> Gen<a> = Gen(|_i: Int| Some(x))\n",
+            },
+          ]),
+        ),
+      ),
+    );
+  let plain = stating(b"", b"1");
+  let stated = stating(b"gen for Box by boxes\n", b"1");
+  let edited = stating(b"gen for Box by boxes\n", b"2");
+  let named = |m: Map<Bytes, Bytes>, n: Bytes| map_get(m, n);
+  // Stating one, and editing it, leave the type and what can hold it where they were.
+  assert_eq(named(plain, b"m.Box"), named(stated, b"m.Box"));
+  assert_eq(named(stated, b"m.Box"), named(edited, b"m.Box"));
+  assert_eq(named(plain, b"m.make"), named(edited, b"m.make"));
+  // The sampler is a definition beside the statement, and moves with the generator it samples.
+  assert_eq(named(plain, b"m._sample_Box"), None);
+  assert(named(stated, b"m._sample_Box") != None);
+  assert(named(stated, b"m._sample_Box") != named(edited, b"m._sample_Box"))
 }

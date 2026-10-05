@@ -50,6 +50,7 @@ pub const MARSHALLED: &[(&str, &str, &[&str])] = &[(
         "JFaulted",
         "JMeasured",
         "JSpent",
+        "JDrew",
     ],
 )];
 
@@ -243,6 +244,7 @@ fn batches_of(value: &PlyValue, span: Span) -> Result<Vec<Batch>, Diagnostic> {
                 "MWhole" => Mode::Whole,
                 "MWitness" => Mode::Witness,
                 "MDomain" => Mode::Domain,
+                "MDrawn" => Mode::Drawn,
                 "MCost" => match args {
                     [limit] => Mode::Cost {
                         limit: limit.as_int(span, "the steps one size may take")?,
@@ -849,6 +851,7 @@ fn judged_value(judgement: &Judgement) -> PlyValue {
             ])],
         ),
         Judgement::Spent { limit } => case("Judged", "JSpent", vec![PlyValue::Int(*limit)]),
+        Judgement::Drew(plain) => case("Judged", "JDrew", vec![ply_eval::reflect::value_of(plain)]),
     }
 }
 

@@ -5,7 +5,8 @@ import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_lab
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet, TDSum,
               VariantDef, SpecClause, SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis,
               VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub,
-              spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow, stated_type)
+              spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow, NGen,
+              stated_type, sampler_of, item_span)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -422,10 +423,16 @@ derive bin for Cut
 fn keeps_body(def: FnDef) -> Bool =
   len(def.generics.labels) > 0 || (match def.transparent { Some(_) -> true, None -> false })
 
-/// A generated definition carries its `derive` item's span, and the item regenerates it.
+/// A generated definition carries the span of the item that regenerates it: its `derive`, or the
+/// `gen` its sampler is beside.
 pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
-  let generated = fold(parsed.derived, map_new(), |acc: Map<Bytes, Bool>, d: Derived|
+  let derived = fold(parsed.derived, map_new(), |acc: Map<Bytes, Bool>, d: Derived|
     map_insert(acc, span_key(d.span), true));
+  let generated = fold(parsed.module.items, derived, |acc: Map<Bytes, Bool>, item: Item|
+    match sampler_of(item) {
+      Some(_) -> map_insert(acc, span_key(item_span(item)), true),
+      None -> acc,
+    });
   fold(parsed.module.items, [], |acc: List<Cut>, item: Item|
     match item {
       IFn(d) -> if map_contains(generated, span_key(d.span)) || keeps_body(d) { acc } else {
@@ -914,8 +921,9 @@ fn emitter_ctors_of(
     concat(acc, filter(checked.ctors, |ctor_info: CtorInfo| ctor_info.module == parsed.name)));
   let through = |type_name: Bytes, key: Bool|
     fold(checked.instances, None, |acc: Option<Bytes>, x: InstanceInfo|
-      if x.type_name == type_name && (match x.kind { NKey -> key, NShow -> !key }) { Some(x.by) }
-      else { acc });
+      if x.type_name == type_name && (match x.kind { NKey -> key, NShow -> !key, NGen -> false }) {
+        Some(x.by)
+      } else { acc });
   map(concat(prelude, rest), |ctor_info: CtorInfo|
     {
       name: ctor_info.name,
@@ -3733,11 +3741,16 @@ fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
         _ -> a,
       }));
   // Every type a shipped module declares is read, reached or not, and so is what the module states
-  // of it: the type's node holds those functions.
+  // of it: the type's node holds those functions, and a `gen`'s sampler is what a prover enters.
   let stated = fold(range(first, len(h.mods)), [], |acc: List<Bytes>, i: Int| {
     let m = at(h.mods, i);
-    fold(m.module.items, acc, |a: List<Bytes>, item: Item|
-      match stated_type(item) { Some(target) -> push(a, qualify(m.name, target.name)), None -> a })
+    fold(m.module.items, acc, |a: List<Bytes>, item: Item| {
+      let typed = match stated_type(item) {
+        Some(target) -> push(a, qualify(m.name, target.name)),
+        None -> a,
+      };
+      match sampler_of(item) { Some(name) -> push(typed, qualify(m.name, name)), None -> typed }
+    })
   });
   specified_closure_of(
     h.index,
@@ -5099,6 +5112,43 @@ test "a shipped type is read with what its module states of it, though the progr
     [],
   );
   assert_eq(def_names(used), def_names(idle))
+}
+
+test "a shipped type's sampler is read with its generator, though the program reaches neither" {
+  let stating = [
+    {
+      name: b"std.n",
+      src: b"import std.gen (Gen, constant)\npub type N = new { n: Int }\ngen for N by drawn\nfn drawn() -> Gen<N> = constant({ n: 1 })\npub fn unused() -> Int = 2\n",
+    },
+    {
+      name: b"std.gen",
+      src: b"pub type Gen<a> = | Gen((Int) -> Option<a>)\npub type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\npub fn sample<a>(g: Gen<a>, root: Int, key: Bytes, size: Int, replay: Option<List<Int>>) -> Sample<a> = match g { Gen(f) -> { value: f(root), record: [], discards: 0 } }\npub fn elements<a>(xs: List<a>) -> Gen<a> = Gen(|i: Int| list_at(xs, i))\npub fn constant<a>(x: a) -> Gen<a> = Gen(|_i: Int| Some(x))\n",
+    },
+  ];
+  let idle = analyse_pulling_std_with(
+    [{ name: b"m", src: b"import std.n\npub fn f() -> Int = 1\n" }],
+    stating,
+    [],
+    [],
+  );
+  assert_eq(
+    match idle.out { Analysed(_) -> [], Refused(diags) -> map(diags, |d: Diag| d.code) },
+    [],
+  );
+  // A prover enters the sampler by name, so it stands wherever its type's module is read.
+  assert_eq(def_names(idle), [
+    b"m.f",
+    b"std.gen.constant",
+    b"std.gen.sample",
+    b"std.n._sample_N",
+    b"std.n.drawn",
+  ])
+}
+
+test "a stub keeps a gen's statement whole: its sampler has no body there to blank" {
+  let src = b"import std.gen (Gen, constant)\npub type N = new { n: Int }\ngen for N by drawn\nfn drawn() -> Gen<N> = { constant({ n: 1 }) }\n";
+  let cuts = cuts_of(parse_at(0, { name: b"m", src: src }).module);
+  assert_eq(map(cuts, |c: Cut| c.name), [b"m.drawn"])
 }
 
 test "a shipped compiler module's bare sibling import keeps only what the program reaches" {
