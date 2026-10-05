@@ -103,18 +103,14 @@ fn entered_with(
         },
     )
     .executing(executables);
-    let hosts = match crate::hosts::Hosts::open_stopping(
+    let hosts = match crate::hosts::Hosts::open_built(
         &opened.front.check,
-        true,
         &crate::options::TlsOptions {
             tls: Vec::new(),
             trust,
         },
         &roots,
-        crate::config::Configuration::default(),
-        &crate::trace::TraceOptions::default(),
-        None,
-        Some(process),
+        process,
         lent,
     ) {
         Ok(hosts) => hosts,

@@ -59,6 +59,10 @@ operations! {
     ReadLink = "read_link" / 1,
     Walk = "walk" / 1,
     SetModified = "set_modified" / 2,
+    Open = "open" / 2,
+    ReadChunk = "read_chunk" / 2,
+    WriteChunk = "write_chunk" / 2,
+    Close = "close" / 1,
 }
 
 impl Op {
@@ -91,6 +95,10 @@ impl Op {
             Op::ReadLink => "fs-read-link",
             Op::Walk => "fs-walk",
             Op::SetModified => "fs-set-modified",
+            Op::Open => "fs-open",
+            Op::ReadChunk => "fs-read-chunk",
+            Op::WriteChunk => "fs-write-chunk",
+            Op::Close => "fs-close",
         }
     }
 
@@ -205,11 +213,35 @@ impl Roots {
     }
 }
 
+/// How `fs.open` opens a file, as `std.fs.Opening` names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Opening {
+    Read,
+    Write,
+    Append,
+}
+
+/// A file a run holds open, under the root it was opened under.
+struct OpenFile {
+    root: PathBuf,
+    file: File,
+    how: Opening,
+}
+
+/// The files a run holds open, each under the descriptor `fs.open` answered. A descriptor is never
+/// answered twice, so one that was closed names nothing afterwards.
+#[derive(Default)]
+struct Descriptors {
+    last: i64,
+    open: BTreeMap<i64, OpenFile>,
+}
+
 pub struct FsHost {
     roots: Roots,
     pool: Pool,
     /// The lock files this run took and has not released; a lock it did not take it cannot release.
     held: Arc<Mutex<BTreeSet<PathBuf>>>,
+    descriptors: Arc<Mutex<Descriptors>>,
 }
 
 impl FsHost {
@@ -218,6 +250,7 @@ impl FsHost {
             roots,
             pool: Pool::new(FS_FIRST_TOKEN),
             held: Arc::new(Mutex::new(BTreeSet::new())),
+            descriptors: Arc::new(Mutex::new(Descriptors::default())),
         }
     }
 
@@ -302,9 +335,21 @@ impl HostHandler for Operation {
             Some(root) => root.to_path_buf(),
             None => return Err(unbound(self.op, at, span)),
         };
+        if let Some(work) = self.on_descriptor(req)? {
+            let descriptors = Arc::clone(&self.fs.descriptors);
+            let descriptor = req.args[0].as_int(span, "a file descriptor")?;
+            let pending = self.fs.pool.submit(
+                span,
+                self.op.label(),
+                self.op.what(),
+                Box::new(move || on_open_file(&descriptors, &root, descriptor, work)),
+            )?;
+            return Ok(HostAnswer::Pending(pending));
+        }
 
         let first = req.args[0].as_str(span, "a path")?.to_string();
         let second = match self.op {
+            Op::Open => Second::Opening(opening(&req.args[1], span)?),
             Op::WriteFile | Op::Append => {
                 Second::Body(Arc::clone(req.args[1].as_bytes(span, "a body")?))
             }
@@ -336,13 +381,14 @@ impl HostHandler for Operation {
 
         let op = self.op;
         let held = Arc::clone(&self.fs.held);
+        let descriptors = Arc::clone(&self.fs.descriptors);
         let machine = req.machine;
         let pending = self.fs.pool.submit(
             span,
             op.label(),
             op.what(),
             Box::new(move || {
-                let done = run(op, &root, &first, second, &held, span);
+                let done = run(op, &root, &first, second, &held, &descriptors, span);
                 observed(op, &root, &first, &done, machine, span);
                 done
             }),
@@ -351,8 +397,119 @@ impl HostHandler for Operation {
     }
 }
 
+impl Operation {
+    /// What an operation on an open file asks of it; `None` for an operation on a path.
+    fn on_descriptor(&self, req: &HostRequest<'_>) -> Result<Option<Chunk>, Diagnostic> {
+        let span = req.span;
+        Ok(Some(match self.op {
+            Op::ReadChunk => {
+                let max = req.args[1].as_int(span, "a length")?;
+                if max < 0 {
+                    return Err(negative_chunk(max, span));
+                }
+                if max as u64 > MAX_READ_BYTES {
+                    return Err(chunk_too_large(max as u64, span));
+                }
+                Chunk::Read(max as u64)
+            }
+            Op::WriteChunk => Chunk::Write(Arc::clone(req.args[1].as_bytes(span, "a body")?)),
+            Op::Close => Chunk::Close,
+            _ => return Ok(None),
+        }))
+    }
+}
+
+/// What is asked of an open file.
+enum Chunk {
+    Read(u64),
+    Write(Arc<[u8]>),
+    Close,
+}
+
+/// One operation on an open file. A descriptor another root opened is not open under this one, and
+/// neither is one opened the other way: each answers as a descriptor that names nothing does.
+fn on_open_file(descriptors: &Mutex<Descriptors>, root: &Path, id: i64, work: Chunk) -> JobOutput {
+    let mut held = descriptors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let open = held.open.get_mut(&id).filter(|open| open.root == root);
+    match work {
+        Chunk::Read(max) => JobOutput::MaybeBytes(
+            open.filter(|open| open.how == Opening::Read)
+                .and_then(|open| {
+                    let mut out = Vec::new();
+                    (&open.file).take(max).read_to_end(&mut out).ok()?;
+                    Some(out)
+                }),
+        ),
+        Chunk::Write(body) => JobOutput::Bool(
+            open.filter(|open| open.how != Opening::Read)
+                .is_some_and(|open| open.file.write_all(&body).is_ok()),
+        ),
+        Chunk::Close => {
+            let there = open.is_some();
+            if there {
+                held.open.remove(&id);
+            }
+            JobOutput::Bool(there)
+        }
+    }
+}
+
+/// The file at `target` opened as `how` asks, under the next descriptor, or the `std.fs.Refused`
+/// that says why not.
+fn open_file(
+    descriptors: &Mutex<Descriptors>,
+    root: &Path,
+    target: &Path,
+    how: Opening,
+) -> Result<i64, &'static str> {
+    // A directory opens for reading, and only its first read says it is one.
+    if std::fs::metadata(target).is_ok_and(|meta| !meta.is_file()) {
+        return Err("std.fs.NotAFile");
+    }
+    let mut options = OpenOptions::new();
+    match how {
+        Opening::Read => options.read(true),
+        Opening::Write => options.write(true).create(true).truncate(true),
+        Opening::Append => options.append(true).create(true),
+    };
+    let file = options.open(target).map_err(|e| match e.kind() {
+        ErrorKind::NotFound => "std.fs.NotFound",
+        ErrorKind::PermissionDenied => "std.fs.Denied",
+        _ => "std.fs.Unopened",
+    })?;
+    let mut held = descriptors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.last += 1;
+    let id = held.last;
+    held.open.insert(
+        id,
+        OpenFile {
+            root: root.to_path_buf(),
+            file,
+            how,
+        },
+    );
+    Ok(id)
+}
+
+fn opening(how: &Value, span: Span) -> Result<Opening, Diagnostic> {
+    match how {
+        Value::Ctor { name, .. } => match name.as_str().rsplit('.').next() {
+            Some("ToRead") => Ok(Opening::Read),
+            Some("ToWrite") => Ok(Opening::Write),
+            Some("ToAppend") => Ok(Opening::Append),
+            _ => Err(not_an_opening(span)),
+        },
+        _ => Err(not_an_opening(span)),
+    }
+}
+
 enum Second {
     None,
+    Opening(Opening),
     Body(Arc<[u8]>),
     Path(String),
     Target(String),
@@ -368,6 +525,7 @@ fn run(
     path: &str,
     second: Second,
     held: &Mutex<BTreeSet<PathBuf>>,
+    descriptors: &Mutex<Descriptors>,
     span: Span,
 ) -> JobOutput {
     let target = match confine(root, path, span) {
@@ -375,6 +533,16 @@ fn run(
         Err(refusal) => return JobOutput::Refused(refusal),
     };
     match op {
+        Op::Open => match second {
+            Second::Opening(how) => JobOutput::Opened(
+                open_file(descriptors, root, &target, how),
+                how != Opening::Read,
+            ),
+            _ => JobOutput::Failed("an open that does not say how reached the pool".into()),
+        },
+        Op::ReadChunk | Op::WriteChunk | Op::Close => JobOutput::Failed(
+            "an operation on an open file reached the pool as one on a path".into(),
+        ),
         Op::ReadFile => match std::fs::metadata(&target) {
             Err(_) => JobOutput::MaybeBytes(None),
             Ok(meta) if !meta.is_file() => JobOutput::MaybeBytes(None),
@@ -520,6 +688,12 @@ fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineI
         Op::Kind | Op::Resolved | Op::Exists | Op::Canonical => read(machine, Read::Kind, &target),
         // A stamp is when, not what; a sync and a lock change nothing a read answers.
         Op::ModifiedMs | Op::Sync | Op::Lock | Op::Unlock => {}
+        // What an open file is read or written through is recorded when it opens.
+        Op::Open => match done {
+            JobOutput::Opened(_, true) => wrote(machine, &target),
+            _ => read(machine, Read::File, &target),
+        },
+        Op::ReadChunk | Op::WriteChunk | Op::Close => {}
         Op::WriteFile
         | Op::Append
         | Op::CreateDir
@@ -958,6 +1132,37 @@ fn negative_range(offset: i64, len: i64, span: Span) -> Diagnostic {
     )
     .primary(span, "neither an offset nor a length can be negative")
     .note("a range running past the end of a file is answered short, because a file can shrink between the call that measured it and the call that reads it; a negative one is arithmetic that went wrong, which no file can answer")
+}
+
+#[cold]
+fn negative_chunk(max: i64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`fs.read_chunk` was asked for {max} bytes"),
+    )
+    .primary(span, "a chunk's length cannot be negative")
+}
+
+#[cold]
+fn chunk_too_large(max: u64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::FS_FILE_TOO_LARGE,
+        format!("`fs.read_chunk` was asked for {max} bytes"),
+    )
+    .primary(span, "this is more than one read answers")
+    .note(format!(
+        "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+    ))
+    .note("ask for a smaller chunk: a read costs at most the chunk it asks for, whatever the file holds")
+}
+
+#[cold]
+fn not_an_opening(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        "`fs.open` was not told how to open the file",
+    )
+    .primary(span, "this is none of `ToRead`, `ToWrite` and `ToAppend`")
 }
 
 #[cold]

@@ -10,9 +10,9 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, LawDef,
               OfSchema, schema_named, schema_guard_name, parse, dump_module, is_pub, TDNominal)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm,
-              HandleClause, ReturnClause, RecField, expr_span, ETagged, Hole)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
+              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
+              MatchArm, HandleClause, ReturnClause, RecField, expr_span, ETagged, Hole)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad)
 import std.list (at, concat, contains, take, drop)
 import std.bin
@@ -970,6 +970,7 @@ fn is_default_expr(expr: Expr) -> Bool / {abort.raise} =
     EPerform(_) -> false,
     EHandle(_) -> false,
     EWithCell(_) -> false,
+    EWithHold(_) -> false,
     ESimulate(_) -> false,
     EParallel(_) -> false,
     ETry(_) -> false,
@@ -1097,6 +1098,13 @@ fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) 
     EPerform(p) -> fold(p.args, out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
     EHandle(h) -> mentions(h.body, params, bound, out),
     EWithCell(c) -> mentions(c.body, params, bound, out),
+    EWithHold(c) ->
+      mentions(
+        c.body,
+        params,
+        bound,
+        mentions(c.release, params, bound, mentions(c.acquire, params, bound, out)),
+      ),
     ESimulate(s) -> mentions(s.body, params, bound, out),
     ETryBlock(t) -> mentions(t.body, params, bound, out),
     EParallel(v) ->
@@ -1321,6 +1329,12 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
           body: o.e,
         }),
       }
+    },
+    EWithHold(c) -> {
+      let a: Qualified = qualify_expr(resolved, qualifier, c.acquire);
+      let r: Qualified = qualify_expr(resolved, a.q, c.release);
+      let o: Qualified = qualify_expr(resolved, r.q, c.body);
+      { q: o.q, e: EWithHold({ ..c, acquire: a.e, release: r.e, body: o.e }) }
     },
     ESimulate(s) -> {
       let o: Qualified = qualify_expr(resolved, qualifier, s.body);
@@ -2236,6 +2250,12 @@ fn rows_expr(
         }),
       }
     },
+    EWithHold(c) -> {
+      let a = rows_expr(expander, c.acquire);
+      let r = rows_expr(a.expander, c.release);
+      let b = rows_expr(r.expander, c.body);
+      { expander: b.expander, e: EWithHold({ ..c, acquire: a.e, release: r.e, body: b.e }) }
+    },
     ESimulate(x) -> {
       let o = rows_expr(expander, x.body);
       { expander: o.expander, e: ESimulate({ span: x.span, body: o.e }) }
@@ -2987,6 +3007,20 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
           binder: c.binder,
           body: o.expr,
         }),
+      }
+    },
+    EWithHold(c) -> {
+      let acquire: Filled = fill_expr(f, filler, c.acquire);
+      let release: Filled = fill_expr(f, acquire.filler, c.release);
+      let mark = len(release.filler.scope);
+      let o: Filled = fill_expr(
+        f,
+        { ..release.filler, scope: push(release.filler.scope, c.binder.name) },
+        c.body,
+      );
+      {
+        filler: { ..o.filler, scope: take(o.filler.scope, mark) },
+        expr: EWithHold({ ..c, acquire: acquire.expr, release: release.expr, body: o.expr }),
       }
     },
     ESimulate(s) -> {

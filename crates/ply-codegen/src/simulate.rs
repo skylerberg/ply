@@ -683,8 +683,8 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::{Builtin, Mode};
     let mode = match b {
-        Builtin::CellGet => Mode::Read,
-        Builtin::CellSet | Builtin::CellUpdate => Mode::Write,
+        Builtin::CellGet | Builtin::HoldGet => Mode::Read,
+        Builtin::CellSet | Builtin::CellUpdate | Builtin::HoldTake => Mode::Write,
         _ => return None,
     };
     let Value::Cell(slot) = ctx.value(*args.first()?) else {
