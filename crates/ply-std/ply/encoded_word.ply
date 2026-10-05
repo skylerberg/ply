@@ -1,0 +1,528 @@
+//! Text outside ASCII in a header field: RFC 2047's encoded words, and RFC 8187's extended
+//! parameter values.
+//!
+//! An encoded word is `=?charset?coding?text?=`: a charset's name, `Q` or `B`, and bytes written
+//! in that coding. `Q` is quoted-printable cut down to what every header position takes, with `_`
+//! for a space, and `B` is base64. `encode` leaves printable ASCII that holds no `=?` as it is and
+//! writes any other text as UTF-8 words of at most 75 characters with a space between them, never
+//! splitting a character. `read` gives back the text of a field's value: each encoded word is
+//! decoded wherever it stands, blanks between two of them are dropped, and everything else is kept
+//! as written. Whatever has the shape of an encoded word must be one, so a charset or a coding
+//! this module does not know, encoded text that is not its coding's and bytes that are no text in
+//! the charset each raise a `Refusal`, which `decode` answers as an `Err`; a word longer than 75
+//! characters is read all the same.
+//!
+//! An extended value is `charset'language'text`, with the text's bytes percent-encoded: what a
+//! parameter named with a trailing `*`, `filename*=UTF-8''na%C3%AFve.txt`, carries. The language is
+//! read and dropped.
+//!
+//! Three charsets are read and written: UTF-8, US-ASCII and ISO-8859-1. Any other is refused by
+//! name.
+
+import std.base64 (base64_decode, base64_encode)
+import std.bytes (peek, replace, scan, scan_until)
+import std.laws (round_trip)
+import std.quoted_printable (escape, unescape)
+import std.result (result_ok)
+import std.string (code_points, join, of_code_points)
+import std.url (url_encode)
+
+/// A character set this module reads and writes.
+pub type Charset = | Utf8 | UsAscii | Latin1
+
+/// How an encoded word writes its bytes.
+pub type Coding =
+  /// Printable ASCII as itself, `_` for a space, and `=` with two hex digits for any other byte.
+  | Q
+  /// Base64.
+  | B
+
+/// Why a text is refused.
+pub type Why =
+  /// A charset this module does not read, with its name as written.
+  | UnknownCharset(String)
+  /// An encoded word whose coding is neither `Q` nor `B`, with the coding as written.
+  | UnknownCoding(String)
+  /// Encoded text that is not its coding's: a stray `=` in `Q`, base64 that is not canonical, or in
+  /// an extended value a `%` without two hex digits or a character that must be escaped.
+  | BadText
+  /// Bytes that are no text in the charset named.
+  | BadBytes
+  /// An extended value without the two `'` that end its charset and its language.
+  | NoCharset
+
+/// A refusal, and the byte of the text's UTF-8 it was found at.
+pub type Refusal = { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect encoded_word {
+  /// The text holds an encoded word or an extended value that cannot be read.
+  raise refused(e: Refusal)
+}
+
+fn refuse<a>(at: Int, why: Why) -> a / {encoded_word.refused} =
+  encoded_word.refused({ at: at, why: why })
+
+// --- Charsets ---------------------------------------------------------------
+
+/// The charset a name means, in any case: `utf-8` and `utf8`; `us-ascii` and `ascii`;
+/// `iso-8859-1`, `iso8859-1`, `iso_8859-1`, `latin1` and `l1`.
+pub fn charset_named(name: String) -> Option<Charset> =
+  match string_lower(name) {
+    "utf-8" | "utf8" -> Some(Utf8),
+    "us-ascii" | "ascii" -> Some(UsAscii),
+    "iso-8859-1" | "iso8859-1" | "iso_8859-1" | "latin1" | "l1" -> Some(Latin1),
+    _ -> None,
+  }
+
+/// The name a charset is registered under.
+pub fn charset_name(c: Charset) -> String =
+  match c { Utf8 -> "UTF-8", UsAscii -> "US-ASCII", Latin1 -> "ISO-8859-1" }
+
+/// The text `data` is in a charset; `None` where it is none: bytes that are not UTF-8, or one
+/// past 127 in US-ASCII. Every byte is a character of ISO-8859-1.
+pub fn text_of(c: Charset, data: Bytes) -> Option<String> / {abort.raise} =
+  match c {
+    Utf8 -> if bytes_is_utf8(data) { Some(string_of_bytes(data)) } else { None },
+    UsAscii -> if is_ascii(data) { Some(string_of_bytes(data)) } else { None },
+    Latin1 -> of_code_points(map(range(0, bytes_len(data)), |i: Int| bytes_at(data, i))),
+  }
+
+/// `text` in a charset; `None` where it holds a character the charset does not.
+pub fn bytes_of(c: Charset, text: String) -> Option<Bytes> / {abort.raise} =
+  match c {
+    Utf8 -> Some(bytes_of_string(text)),
+    UsAscii -> if is_ascii(bytes_of_string(text)) { Some(bytes_of_string(text)) } else { None },
+    Latin1 -> {
+      let points = code_points(text);
+      if fold(points, true, |ok: Bool, p: Int| ok && p < 256) {
+        Some(bytes_concat_all(map(points, byte_of_int)))
+      } else { None }
+    },
+  }
+
+fn is_ascii(data: Bytes) -> Bool / {abort.raise} = bytes_position(data, 0, |c: Int| c > 127) == None
+
+// --- Encoded words ----------------------------------------------------------
+
+/// `text` as a header field carries it: itself where it is printable ASCII holding no `=?`, and
+/// otherwise UTF-8 encoded words in `coding`, each at most 75 characters and holding whole
+/// characters, with a space between them.
+pub fn encode(text: String, coding: Coding) -> String / {abort.raise} =
+  if is_plain(text) { text }
+  else { join(map(chunks(text, coding), |chunk: Bytes| word(chunk, coding)), " ") }
+
+/// The text of a field's value with each encoded word in it decoded, raising
+/// `encoded_word.refused` where `decode` answers `Err`.
+pub fn read(text: String) -> String / {encoded_word.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  string_of_bytes(bytes_concat_all(words(b, { at: 0, out: [], joined: false }, bytes_len(b) + 1)))
+}
+
+/// The text of a field's value with each encoded word in it decoded, or where one cannot be read
+/// and why.
+pub fn decode(text: String) -> Result<String, Refusal> / {abort.raise} = try { read(text) }
+
+fn printable() -> Bytes =
+  b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+/// What `Q` writes as itself: the characters every header position takes.
+fn q_safe() -> Bytes = b"!*+-/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+fn is_plain(text: String) -> Bool / {abort.raise} = {
+  let b = bytes_of_string(text);
+  !string_contains(text, "=?") && scan(b, 0, printable()) == bytes_len(b)
+}
+
+/// The most of a word's 75 characters its text may take, in what `width` counts: `=?UTF-8?Q?` and
+/// `?=` take twelve, and base64 writes three bytes as four characters.
+fn room_of(coding: Coding) -> Int = match coding { Q -> 63, B -> 45 }
+
+/// What a character's bytes take of a word's room.
+fn width(bytes: Bytes, coding: Coding) -> Int / {abort.raise} =
+  match coding {
+    B -> bytes_len(bytes),
+    Q ->
+      fold(range(0, bytes_len(bytes)), 0, |sum: Int, i: Int|
+        sum + bytes_len(q_written(bytes_at(bytes, i)))),
+  }
+
+fn q_written(c: Int) -> Bytes / {abort.raise} =
+  if c == b' ' { b"_" }
+  else if scan(byte_of_int(c), 0, q_safe()) == 1 { byte_of_int(c) }
+  else { escape(c) }
+
+type Chunking = { done: List<Bytes>, held: List<Bytes>, room: Int }
+
+/// The UTF-8 of `text` cut between characters into stretches that each fit one word.
+fn chunks(text: String, coding: Coding) -> List<Bytes> / {abort.raise} = {
+  let cut = fold(
+    string_chars(text),
+    { done: [], held: [], room: room_of(coding) },
+    |c: Chunking, char: Char| {
+      let bytes = bytes_of_string(string_of_chars([char]));
+      let wide = width(bytes, coding);
+      if wide > c.room {
+        {
+          done: push(c.done, bytes_concat_all(c.held)),
+          held: [bytes],
+          room: room_of(coding) - wide,
+        }
+      } else { { done: c.done, held: push(c.held, bytes), room: c.room - wide } }
+    },
+  );
+  if len(cut.held) == 0 { cut.done } else { push(cut.done, bytes_concat_all(cut.held)) }
+}
+
+fn word(chunk: Bytes, coding: Coding) -> String / {abort.raise} =
+  match coding {
+    B -> "=?UTF-8?B?" ++ base64_encode(chunk) ++ "?=",
+    Q ->
+      "=?UTF-8?Q?"
+        ++ string_of_bytes(
+          bytes_concat_all(map(range(0, bytes_len(chunk)), |i: Int| q_written(bytes_at(chunk, i)))),
+        )
+        ++ "?=",
+  }
+
+type Scan = { at: Int, out: List<Bytes>, joined: Bool }
+
+/// The pieces of the text from `s.at` on. `joined` says an encoded word ended at `s.at`, so blanks
+/// before the next one are dropped. `left` bounds the rounds: each takes a `=?`.
+fn words(b: Bytes, s: Scan, left: Int) -> List<Bytes> / {encoded_word.refused, abort.raise} =
+  if left <= 0 { s.out } else {
+    match bytes_index_of_from(b, b"=?", s.at) {
+      None -> push(s.out, bytes_slice(b, s.at, bytes_len(b))),
+      Some(open) -> match word_at(b, open) {
+        None ->
+          words(
+            b,
+            { at: open + 2, out: push(s.out, bytes_slice(b, s.at, open + 2)), joined: false },
+            left - 1,
+          ),
+        Some(w) -> {
+          let gap = bytes_slice(b, s.at, open);
+          let kept = if s.joined && scan(gap, 0, b" \t\r\n") == bytes_len(gap) { s.out }
+          else { push(s.out, gap) };
+          words(
+            b,
+            { at: w.end, out: push(kept, bytes_of_string(word_text(b, w))), joined: true },
+            left - 1,
+          )
+        },
+      },
+    }
+  }
+
+/// Where the pieces of an encoded word stand.
+type Word = { charset_at: Int, coding_at: Int, text_at: Int, text_end: Int, end: Int }
+
+/// The encoded word whose `=?` is at `open`, if what follows has the shape of one.
+fn word_at(b: Bytes, open: Int) -> Option<Word> / {abort.raise} = {
+  let stops = b"? \t\r\n";
+  let charset_end = scan_until(b, open + 2, stops);
+  let coding_end = scan_until(b, charset_end + 1, stops);
+  let text_end = scan_until(b, coding_end + 1, stops);
+  if charset_end == open + 2 || coding_end == charset_end + 1 { None }
+  else if peek(b, charset_end) != b'?' || peek(b, coding_end) != b'?' { None }
+  else if peek(b, text_end) != b'?' || peek(b, text_end + 1) != b'=' { None } else {
+    Some({
+      charset_at: open + 2,
+      coding_at: charset_end + 1,
+      text_at: coding_end + 1,
+      text_end: text_end,
+      end: text_end + 2,
+    })
+  }
+}
+
+fn word_text(b: Bytes, w: Word) -> String / {encoded_word.refused, abort.raise} = {
+  let named = string_of_bytes(bytes_slice(b, w.charset_at, w.coding_at - 1));
+  // RFC 2231 lets a language follow the charset after a `*`.
+  let name = match string_split(named, "*") { [first, ..] -> first, [] -> named };
+  let coding = string_of_bytes(bytes_slice(b, w.coding_at, w.text_at - 1));
+  let coded = bytes_slice(b, w.text_at, w.text_end);
+  let charset = match charset_named(name) {
+    Some(c) -> c,
+    None -> refuse(w.charset_at, UnknownCharset(name)),
+  };
+  let bytes = match string_lower(coding) {
+    "q" -> result_ok(unescape(replace(coded, b"_", b" "), b'=', printable())),
+    "b" -> base64_decode(string_of_bytes(coded)),
+    _ -> refuse(w.coding_at, UnknownCoding(coding)),
+  };
+  match bytes {
+    None -> refuse(w.text_at, BadText),
+    Some(found) -> match text_of(charset, found) {
+      Some(text) -> text,
+      None -> refuse(w.text_at, BadBytes),
+    },
+  }
+}
+
+// --- Extended values --------------------------------------------------------
+
+/// `text` as an extended parameter value: `UTF-8''` and its bytes percent-encoded.
+pub fn encode_extended(text: String) -> String / {abort.raise} = "UTF-8''" ++ url_encode(text)
+
+/// The text an extended parameter value carries, raising `encoded_word.refused` where
+/// `decode_extended` answers `Err`.
+pub fn read_extended(value: String) -> String / {encoded_word.refused, abort.raise} = {
+  let b = bytes_of_string(value);
+  let n = bytes_len(b);
+  let first = scan_until(b, 0, b"'");
+  let second = scan_until(b, first + 1, b"'");
+  if second >= n { refuse(n, NoCharset) } else {
+    let name = string_of_bytes(bytes_slice(b, 0, first));
+    let charset = match charset_named(name) {
+      Some(c) -> c,
+      None -> refuse(0, UnknownCharset(name)),
+    };
+    match unescape(bytes_slice(b, second + 1, n), b'%', attr_chars()) {
+      Err(i) -> refuse(second + 1 + i, BadText),
+      Ok(found) -> match text_of(charset, found) {
+        Some(text) -> text,
+        None -> refuse(second + 1, BadBytes),
+      },
+    }
+  }
+}
+
+/// The text an extended parameter value carries, or where it cannot be read and why.
+pub fn decode_extended(value: String) -> Result<String, Refusal> / {abort.raise} =
+  try { read_extended(value) }
+
+/// RFC 8187's `attr-char`: what an extended value writes without a `%`.
+fn attr_chars() -> Bytes =
+  b"!#$&+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// --- Tests ------------------------------------------------------------------
+
+law "a decode of Q words is the text encoded" =
+  round_trip(|text: String| encode(text, Q), |field: String| result_ok(decode(field)))
+
+law "a decode of B words is the text encoded" =
+  round_trip(|text: String| encode(text, B), |field: String| result_ok(decode(field)))
+
+law "a decode of an extended value is the text encoded" =
+  round_trip(encode_extended, |value: String| result_ok(decode_extended(value)))
+
+law "an encoding is ASCII, and each of its words at most 75 characters"
+  forall (text: String) {
+    is_plain(text)
+      || fold([Q, B], true, |ok: Bool, coding: Coding|
+        ok && is_ascii(bytes_of_string(encode(text, coding)))
+          && fold(string_split(encode(text, coding), " "), true, |short: Bool, w: String|
+            short && string_len(w) <= 75 && string_starts_with(w, "=?UTF-8?")
+              && string_ends_with(w, "?=")))
+  }
+
+law "every byte string is ISO-8859-1 text, which writes back as it"
+  forall (data: Bytes) {
+    match text_of(Latin1, data) {
+      Some(text) -> bytes_of(Latin1, text) == Some(data),
+      None -> false,
+    }
+  }
+
+law "a text is its UTF-8, and its ASCII or ISO-8859-1 only where it reads back"
+  forall (text: String) {
+    fold([Utf8, UsAscii, Latin1], true, |ok: Bool, c: Charset|
+      ok
+        && (match bytes_of(c, text) {
+          Some(data) -> text_of(c, data) == Some(text),
+          None -> c != Utf8,
+        }))
+  }
+
+type Vector = { field: String, text: String }
+
+/// Field values and the text they carry. The first six are fields of RFC 2047 §8's messages and
+/// the next six rows of its table of what a reader displays; those in charsets this module does
+/// not read are among `refused`.
+fn vectors() -> List<Vector> =
+  [
+    {
+      field: "=?US-ASCII?Q?Keith_Moore?= <moore@cs.utk.edu>",
+      text: "Keith Moore <moore@cs.utk.edu>",
+    },
+    {
+      field: "=?ISO-8859-1?Q?Keld_J=F8rn_Simonsen?= <keld@dkuug.dk>",
+      text: "Keld J\u{f8}rn Simonsen <keld@dkuug.dk>",
+    },
+    {
+      field: "=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>",
+      text: "Andr\u{e9} Pirard <PIRARD@vm1.ulg.ac.be>",
+    },
+    { field: "=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?=", text: "If you can read this yo" },
+    {
+      field: "=?ISO-8859-1?Q?Olle_J=E4rnefors?= <ojarnef@admin.kth.se>",
+      text: "Olle J\u{e4}rnefors <ojarnef@admin.kth.se>",
+    },
+    {
+      field: "=?ISO-8859-1?Q?Patrik_F=E4ltstr=F6m?= <paf@nada.kth.se>",
+      text: "Patrik F\u{e4}ltstr\u{f6}m <paf@nada.kth.se>",
+    },
+    { field: "(=?ISO-8859-1?Q?a?=)", text: "(a)" },
+    { field: "(=?ISO-8859-1?Q?a?= b)", text: "(a b)" },
+    { field: "(=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?=)", text: "(ab)" },
+    { field: "(=?ISO-8859-1?Q?a?=  =?ISO-8859-1?Q?b?=)", text: "(ab)" },
+    { field: "(=?ISO-8859-1?Q?a?=\r\n    =?ISO-8859-1?Q?b?=)", text: "(ab)" },
+    { field: "(=?ISO-8859-1?Q?a_b?=)", text: "(a b)" },
+    { field: "(=?ISO-8859-1?Q?a?= =?US-ASCII?Q?_b?=)", text: "(a b)" },
+    {
+      field: "Nathaniel Borenstein <nsb@thumper.bellcore.com>",
+      text: "Nathaniel Borenstein <nsb@thumper.bellcore.com>",
+    },
+    { field: "=?utf-8?q?caf=c3=a9?=", text: "caf\u{e9}" },
+    { field: "=?UTF-8*fr?B?Y2Fmw6k=?=", text: "caf\u{e9}" },
+    { field: "=?UTF-8?Q??=", text: "" },
+    { field: "a =?UTF-8?Q?b?= c =?UTF-8?Q?d?=", text: "a b c d" },
+    { field: "=? not a word ?= and =?half?", text: "=? not a word ?= and =?half?" },
+    { field: "1 + 1 =?", text: "1 + 1 =?" },
+    { field: "=? =?UTF-8?Q?a?=", text: "=? a" },
+    { field: "=?UTF-8?Q?a?=x =?UTF-8?Q?b?=", text: "ax b" },
+    { field: "=??Q?a?=", text: "=??Q?a?=" },
+    { field: "=??Q?a?b?=", text: "=??Q?a?b?=" },
+    { field: "=?UTF-8??a?=", text: "=?UTF-8??a?=" },
+    { field: "=?UTF-8??a?b?=", text: "=?UTF-8??a?b?=" },
+    { field: "=?UTF-8 Q?a?=", text: "=?UTF-8 Q?a?=" },
+    { field: "=?UTF-8?Q a?=", text: "=?UTF-8?Q a?=" },
+    { field: "=?UTF-8?B?Y2Fm?w6k=?=", text: "=?UTF-8?B?Y2Fm?w6k=?=" },
+    { field: "", text: "" },
+  ]
+
+test "reads {c.field}" for c: Vector in vectors() { assert_eq(decode(c.field), Ok(c.text)) }
+
+type Refused = { field: String, at: Int, why: Why }
+
+/// Field values that cannot be read. The first three are RFC 2047 §8's in the charsets of Hebrew
+/// and of central Europe.
+fn refused() -> List<Refused> =
+  [
+    { field: "=?iso-8859-8?b?7eXs+SDv4SDp7Oj08A==?=", at: 2, why: UnknownCharset("iso-8859-8") },
+    {
+      field: "=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?= =?ISO-8859-2?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?=",
+      at: 52,
+      why: UnknownCharset("ISO-8859-2"),
+    },
+    {
+      field: "(=?ISO-8859-1?Q?a?= =?ISO-8859-2?Q?_b?=)",
+      at: 22,
+      why: UnknownCharset("ISO-8859-2"),
+    },
+    { field: "=?UTF-8?X?abc?=", at: 8, why: UnknownCoding("X") },
+    { field: "=?UTF-8?Q?a=ZZ?=", at: 10, why: BadText },
+    { field: "=?UTF-8?Q?a=4?=", at: 10, why: BadText },
+    { field: "=?UTF-8?B?abc?=", at: 10, why: BadText },
+    { field: "=?UTF-8?Q?=FF?=", at: 10, why: BadBytes },
+    { field: "=?US-ASCII?Q?caf=E9?=", at: 13, why: BadBytes },
+    { field: "ok =?UTF-8?Q?a?= =?KOI8-R?Q?b?=", at: 19, why: UnknownCharset("KOI8-R") },
+  ]
+
+test "refuses {c.field}" for c: Refused in refused() {
+  assert_eq(decode(c.field), Err({ at: c.at, why: c.why }))
+}
+
+test "the raising readers raise what the others answer" {
+  assert_eq(try { read("=?x?q?a?=") }, Err({ at: 2, why: UnknownCharset("x") }));
+  assert_eq(try { read_extended("UTF-8'%41") }, Err({ at: 9, why: NoCharset }))
+}
+
+test "plain text is left alone, and anything else is words in the coding asked for" {
+  assert_eq(encode("Hello, world", Q), "Hello, world");
+  assert_eq(encode("", B), "");
+  assert_eq(encode("caf\u{e9} au lait", Q), "=?UTF-8?Q?caf=C3=A9_au_lait?=");
+  assert_eq(encode("caf\u{e9}", B), "=?UTF-8?B?Y2Fmw6k=?=");
+  assert_eq(encode("a=?b", Q), "=?UTF-8?Q?a=3D=3Fb?=");
+  assert_eq(encode("tab\there", Q), "=?UTF-8?Q?tab=09here?=");
+  assert_eq(encode("\tx", Q), "=?UTF-8?Q?=09x?=");
+  assert_eq(encode("\u{e9}", Q), "=?UTF-8?Q?=C3=A9?=");
+  assert_eq(encode("under_score \u{20ac}", Q), "=?UTF-8?Q?under=5Fscore_=E2=82=AC?=")
+}
+
+test "a long text is cut between characters into words of at most 75" {
+  let euros = string_of_chars(map(range(0, 20), |_: Int| '\u{20ac}'));
+  assert_eq(string_split(encode(euros, Q), " "), [
+    "=?UTF-8?Q?=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC?=",
+    "=?UTF-8?Q?=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC?=",
+    "=?UTF-8?Q?=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC=E2=82=AC?=",
+  ]);
+  assert_eq(string_split(encode(euros, B), " "), [
+    "=?UTF-8?B?4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs4oKs?=",
+    "=?UTF-8?B?4oKs4oKs4oKs4oKs4oKs?=",
+  ]);
+  assert_eq(decode(encode(euros, Q)), Ok(euros));
+  assert_eq(decode(encode(euros, B)), Ok(euros));
+  let letters = |n: Int| "\u{e9}" ++ string_of_chars(map(range(0, n), |_: Int| 'a'));
+  assert_eq(map(string_split(encode(letters(57), Q), " "), string_len), [75]);
+  assert_eq(map(string_split(encode(letters(58), Q), " "), string_len), [75, 13]);
+  assert_eq(map(string_split(encode(letters(43), B), " "), string_len), [72]);
+  assert_eq(map(string_split(encode(letters(44), B), " "), string_len), [72, 16])
+}
+
+type Extended = { value: String, text: String }
+
+/// Extended values and their text: RFC 8187 §3.2.3's two, RFC 6266 §5's, and what the grammar
+/// leaves to a reader.
+fn extended() -> List<Extended> =
+  [
+    { value: "iso-8859-1'en'%A3%20rates", text: "\u{a3} rates" },
+    { value: "UTF-8''%c2%a3%20and%20%e2%82%ac%20rates", text: "\u{a3} and \u{20ac} rates" },
+    { value: "UTF-8''%e2%82%ac%20rates", text: "\u{20ac} rates" },
+    { value: "utf-8'en-GB'plain.txt", text: "plain.txt" },
+    { value: "US-ASCII''", text: "" },
+  ]
+
+test "reads the extended value {c.value}" for c: Extended in extended() {
+  assert_eq(decode_extended(c.value), Ok(c.text))
+}
+
+fn unreadable() -> List<Refused> =
+  [
+    { field: "plain.txt", at: 9, why: NoCharset },
+    { field: "UTF-8'plain.txt", at: 15, why: NoCharset },
+    { field: "''plain.txt", at: 0, why: UnknownCharset("") },
+    { field: "windows-1252''plain.txt", at: 0, why: UnknownCharset("windows-1252") },
+    { field: "UTF-8''two words", at: 10, why: BadText },
+    { field: "UTF-8''100%", at: 10, why: BadText },
+    { field: "UTF-8''a%2", at: 8, why: BadText },
+    { field: "UTF-8''caf\u{e9}", at: 10, why: BadText },
+    { field: "UTF-8''%FF", at: 7, why: BadBytes },
+    { field: "US-ASCII'en'%E2%82%AC", at: 12, why: BadBytes },
+  ]
+
+test "refuses the extended value {c.field}" for c: Refused in unreadable() {
+  assert_eq(decode_extended(c.field), Err({ at: c.at, why: c.why }))
+}
+
+test "an extended value is written as UTF-8 with everything but the unreserved escaped" {
+  assert_eq(encode_extended("\u{20ac} rates.txt"), "UTF-8''%E2%82%AC%20rates.txt");
+  assert_eq(encode_extended(""), "UTF-8''")
+}
+
+test "a charset is named in any case, and holds only its own characters" {
+  assert_eq(
+    map(["UTF-8", "utf8", "US-ASCII", "ascii", "ISO-8859-1", "Latin1", "l1"], charset_named),
+    [
+      Some(Utf8),
+      Some(Utf8),
+      Some(UsAscii),
+      Some(UsAscii),
+      Some(Latin1),
+      Some(Latin1),
+      Some(Latin1),
+    ],
+  );
+  assert_eq(charset_named("iso-8859-15"), None);
+  assert_eq(map([Utf8, UsAscii, Latin1], charset_name), ["UTF-8", "US-ASCII", "ISO-8859-1"]);
+  assert_eq(text_of(Latin1, b"caf\xe9"), Some("caf\u{e9}"));
+  assert_eq(text_of(Utf8, b"caf\xe9"), None);
+  assert_eq(text_of(UsAscii, b"caf\xe9"), None);
+  assert_eq(bytes_of(Latin1, "caf\u{e9}"), Some(b"caf\xe9"));
+  assert_eq(bytes_of(Latin1, "\u{20ac}"), None);
+  assert_eq(bytes_of(Latin1, "\u{100}"), None);
+  assert_eq(bytes_of(Latin1, "\u{ff}"), Some(b"\xff"));
+  assert_eq(bytes_of(UsAscii, "caf\u{e9}"), None);
+  assert_eq(bytes_of(Utf8, "\u{20ac}"), Some(b"\xe2\x82\xac"))
+}

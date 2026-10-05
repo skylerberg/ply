@@ -1,0 +1,307 @@
+//! Quoted-printable, the transfer encoding of RFC 2045 §6.7 that leaves ASCII text readable.
+//!
+//! `encode` writes any bytes: a printable ASCII character other than `=` as itself and every other
+//! byte as `=` and two upper-case hex digits, in lines of at most 76 characters, each but the last
+//! ended by a soft line break, `=` before a CRLF, which stands for nothing. A space or a tab is
+//! written as itself except where it would end a line. `encode_text` is the same for text whose
+//! lines matter: each line break of the text, a line feed with or without a carriage return before
+//! it, is a CRLF of the encoding, so the lines stay lines to a reader that knows nothing of it.
+//!
+//! `read` raises a `Refusal` saying where a text stops being quoted-printable and why, and
+//! `decode` answers it as an `Err`. It reads what the standard asks a robust reader to: hex digits
+//! in either case, a line of any length, a line break as CRLF or a line feed alone, each kept as
+//! written, blanks at the end of a line dropped as padding a transport added, and a soft line
+//! break at the end of the text. It refuses a `=` that neither two hex digits nor the end of its
+//! line follows, and a byte the encoding never writes bare: a control character, or one past `~`.
+
+import std.bytes (hex_of, hex_value, peek, repeat, replace)
+import std.laws (round_trip)
+import std.pem (unblanked)
+import std.result (result_ok)
+
+/// Why a text is not quoted-printable.
+pub type Why =
+  /// A `=` that neither two hex digits nor the end of its line follows.
+  | BadEscape
+  /// A byte that is written only as an escape, with the byte.
+  | BadByte(Int)
+
+/// A refusal, and the byte of the text's UTF-8 it was found at.
+pub type Refusal = { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect quoted_printable {
+  /// The text is not quoted-printable.
+  raise refused(e: Refusal)
+}
+
+// --- Writing ----------------------------------------------------------------
+
+/// `data` in quoted-printable, a line break in it written as the bytes it is: what `read` reads
+/// back exactly.
+pub fn encode(data: Bytes) -> String / {abort.raise} = encoded(data, false)
+
+/// `text` in quoted-printable with its line breaks kept as line breaks, each written as CRLF.
+/// A carriage return that no line feed follows is a byte like any other.
+pub fn encode_text(text: String) -> String / {abort.raise} = encoded(bytes_of_string(text), true)
+
+/// `=` and the two upper-case hex digits of the byte `c`.
+pub fn escape(c: Int) -> Bytes / {abort.raise} =
+  bytes_of_string("=" ++ string_upper(hex_of(byte_of_int(c))))
+
+type Line = { out: List<Bytes>, column: Int }
+
+fn encoded(data: Bytes, lines: Bool) -> String / {abort.raise} =
+  string_of_bytes(
+    bytes_concat_all(
+      fold(range(0, bytes_len(data)), { out: [], column: 0 }, |l: Line, i: Int| {
+        let c = bytes_at(data, i);
+        if lines && c == b'\n' { { out: push(l.out, b"\r\n"), column: 0 } }
+        else if lines && c == b'\r' && peek(data, i + 1) == b'\n' { l }
+        else { put(l, written(c, ends_line(data, i + 1, lines))) }
+      }).out,
+    ),
+  )
+
+/// Whether a line of the encoding ends before the byte at `next`.
+fn ends_line(data: Bytes, next: Int, lines: Bool) -> Bool / {abort.raise} = {
+  let c = peek(data, next);
+  c < 0 || (lines && (c == b'\n' || (c == b'\r' && peek(data, next + 1) == b'\n')))
+}
+
+fn written(c: Int, last: Bool) -> Bytes / {abort.raise} =
+  if (c > b' ' && c <= b'~' && c != b'=') || ((c == b' ' || c == b'\t') && !last) { byte_of_int(c) }
+  else { escape(c) }
+
+/// A soft line break comes before the piece that would take its line past 75 characters, which
+/// leaves room for the break's own `=`.
+fn put(l: Line, piece: Bytes) -> Line = {
+  let width = bytes_len(piece);
+  if l.column + width > 75 { { out: push(push(l.out, b"=\r\n"), piece), column: width } }
+  else { { out: push(l.out, piece), column: l.column + width } }
+}
+
+// --- Reading ----------------------------------------------------------------
+
+/// The bytes `text` encodes, raising `quoted_printable.refused` where `decode` answers `Err`.
+pub fn read(text: String) -> Bytes / {quoted_printable.refused, abort.raise} = {
+  let lines = bytes_split(bytes_of_string(text), b"\n");
+  let last = len(lines) - 1;
+  bytes_concat_all(
+    fold(range(0, len(lines)), { out: [], at: 0 }, |r: Reading, i: Int|
+      match list_at(lines, i) { Some(line) -> line_read(r, line, i == last), None -> r }).out,
+  )
+}
+
+/// The bytes `text` encodes, or where it stops being quoted-printable and why.
+pub fn decode(text: String) -> Result<Bytes, Refusal> / {abort.raise} = try { read(text) }
+
+type Reading = { out: List<Bytes>, at: Int }
+
+fn printable() -> Bytes =
+  b"\t !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+/// One line of the text, which starts at `r.at` and stands before a line feed unless it is the
+/// `last`: its bytes, and its line break as written unless a soft one ends it.
+fn line_read(
+  r: Reading,
+  line: Bytes,
+  last: Bool,
+) -> Reading / {quoted_printable.refused, abort.raise} = {
+  let n = bytes_len(line);
+  let crlf = !last && peek(line, n - 1) == b'\r';
+  let end = unblanked(line, if crlf { n - 1 } else { n });
+  let soft = peek(line, end - 1) == b'=';
+  let held = bytes_slice(line, 0, if soft { end - 1 } else { end });
+  let bytes = match unescape(held, b'=', printable()) {
+    Ok(found) -> found,
+    Err(i) ->
+      quoted_printable.refused({
+        at: r.at + i,
+        why: if bytes_at(held, i) == b'=' { BadEscape } else { BadByte(bytes_at(held, i)) },
+      }),
+  };
+  {
+    out: push(push(r.out, bytes), if soft || last { b"" } else if crlf { b"\r\n" } else { b"\n" }),
+    at: r.at + n + 1,
+  }
+}
+
+type Unescaping = { out: List<Bytes>, at: Int, bad: Int }
+
+/// The bytes `text` stands for where the byte `marker` and the two hex digits after it, in either
+/// case, are one byte and every other byte, which must be one of `plain`, is itself; or the index
+/// of the first byte that is neither.
+pub fn unescape(text: Bytes, marker: Int, plain: Bytes) -> Result<Bytes, Int> / {abort.raise} = {
+  let pieces = bytes_split(text, byte_of_int(marker));
+  let done = fold(range(0, len(pieces)), { out: [], at: 0, bad: -1 }, |u: Unescaping, i: Int|
+    match list_at(pieces, i) {
+      Some(piece) -> if u.bad >= 0 { u } else { unescaped(u, piece, i > 0, plain) },
+      None -> u,
+    });
+  if done.bad >= 0 { Err(done.bad) } else { Ok(bytes_concat_all(done.out)) }
+}
+
+/// One stretch between markers, which starts at `u.at`: after a marker, two hex digits and then
+/// plain bytes.
+fn unescaped(
+  u: Unescaping,
+  piece: Bytes,
+  escaped: Bool,
+  plain: Bytes,
+) -> Unescaping / {abort.raise} = {
+  let n = bytes_len(piece);
+  let from = if escaped { 2 } else { 0 };
+  let value = if escaped { hex_value(peek(piece, 0)) * 16 + hex_value(peek(piece, 1)) } else { 0 };
+  if escaped && (hex_value(peek(piece, 0)) < 0 || hex_value(peek(piece, 1)) < 0) {
+    { ..u, bad: u.at - 1 }
+  } else {
+    let stop = if from >= n { n } else { bytes_scan(piece, from, plain, n - from) };
+    if stop < n { { ..u, bad: u.at + stop } } else {
+      {
+        out: push(
+          if escaped { push(u.out, byte_of_int(value)) } else { u.out },
+          bytes_slice(piece, from, n),
+        ),
+        at: u.at + n + 1,
+        bad: -1,
+      }
+    }
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+law "a decode of an encode is the bytes encoded" =
+  round_trip(encode, |text: String| result_ok(decode(text)))
+
+/// `data` with each of its line breaks a CRLF.
+fn crlf(data: Bytes) -> Bytes / {abort.raise} =
+  replace(replace(data, b"\r\n", b"\n"), b"\n", b"\r\n")
+
+law "a decode of encoded text is the text with each line break a CRLF"
+  forall (text: String) {
+    decode(encode_text(text)) == Ok(crlf(bytes_of_string(text)))
+  }
+
+fn longest_line(text: String) -> Int / {abort.raise} =
+  fold(string_split(text, "\r\n"), 0, |most: Int, line: String| max(most, string_len(line)))
+
+law "no encoded line is longer than 76 characters"
+  forall (data: Bytes) {
+    longest_line(encode(data)) <= 76 && longest_line(encode_text(string_of_bytes_lossy(data))) <= 76
+  }
+
+law "an encoding is printable ASCII and line breaks, with no blank ending a line"
+  forall (data: Bytes) {
+    let text = bytes_of_string(encode(data));
+    bytes_scan(text, 0, b"\r\n" ++ printable(), bytes_len(text) + 1) >= bytes_len(text)
+      && !string_contains(encode(data), " \r\n")
+      && !string_contains(encode(data), "\t\r\n")
+      && !string_ends_with(encode(data), " ")
+      && !string_ends_with(encode(data), "\t")
+  }
+
+type Vector = { what: String, encoded: String, decoded: Bytes }
+
+/// Texts and the bytes they stand for. The first is RFC 2045 §6.7's soft line breaks, the second
+/// RFC 7578 §4.5's field, and the rest are what the section asks of a robust reader.
+fn vectors() -> List<Vector> =
+  [
+    {
+      what: "soft line breaks",
+      encoded: "Now's the time =\r\nfor all folk to come=\r\n to the aid of their country.",
+      decoded: b"Now's the time for all folk to come to the aid of their country.",
+    },
+    {
+      what: "a euro sign",
+      encoded: "Joe owes =E2=82=AC100.",
+      decoded: b"Joe owes \xe2\x82\xac100.",
+    },
+    { what: "nothing", encoded: "", decoded: b"" },
+    { what: "an escaped `=`", encoded: "a=3Db", decoded: b"a=b" },
+    { what: "hex digits in lower case", encoded: "a=3db=c3=A9", decoded: b"a=b\xc3\xa9" },
+    { what: "CRLF line breaks", encoded: "one\r\ntwo\r\n", decoded: b"one\r\ntwo\r\n" },
+    { what: "bare line feeds", encoded: "one\ntwo\n", decoded: b"one\ntwo\n" },
+    {
+      what: "blanks a transport added",
+      encoded: "padded \t \r\nline  ",
+      decoded: b"padded\r\nline",
+    },
+    { what: "a padded soft line break", encoded: "soft= \t\r\nbreak", decoded: b"softbreak" },
+    { what: "a soft line break ending the text", encoded: "soft=\nbreak=", decoded: b"softbreak" },
+    { what: "an escaped blank ending a line", encoded: "kept =20\r\n", decoded: b"kept  \r\n" },
+    { what: "escaped bytes of every kind", encoded: "=00=FF=0D=0A", decoded: b"\x00\xff\r\n" },
+    { what: "a tab", encoded: "tab\there", decoded: b"tab\there" },
+    { what: "lines of nothing", encoded: "a\n\nb\r\n\r\nc", decoded: b"a\n\nb\r\n\r\nc" },
+    { what: "a line that is a soft line break", encoded: "a=\r\n=\r\nb", decoded: b"ab" },
+  ]
+
+test "decodes {c.what}" for c: Vector in vectors() { assert_eq(decode(c.encoded), Ok(c.decoded)) }
+
+type Refused = { what: String, encoded: String, at: Int, why: Why }
+
+fn refused() -> List<Refused> =
+  [
+    { what: "a `=` before a letter that is no hex digit", encoded: "a=zz", at: 1, why: BadEscape },
+    { what: "a `=` before one hex digit", encoded: "a=3", at: 1, why: BadEscape },
+    { what: "a `=` before a hex digit and a letter", encoded: "a=3G", at: 1, why: BadEscape },
+    { what: "two `=` in a row", encoded: "ok\r\na==41", at: 5, why: BadEscape },
+    { what: "a `=` before a blank inside a line", encoded: "a= b", at: 1, why: BadEscape },
+    { what: "a byte past `~`", encoded: "caf\u{e9}", at: 3, why: BadByte(0xC3) },
+    { what: "a NUL", encoded: "nul\0", at: 3, why: BadByte(0) },
+    { what: "a carriage return inside a line", encoded: "bare\rreturn", at: 4, why: BadByte(13) },
+    { what: "a carriage return ending the text", encoded: "ends\r", at: 4, why: BadByte(13) },
+    { what: "a DEL on a later line", encoded: "one\r\ntwo\u{7f}", at: 8, why: BadByte(127) },
+  ]
+
+test "refuses {c.what}" for c: Refused in refused() {
+  assert_eq(decode(c.encoded), Err({ at: c.at, why: c.why }))
+}
+
+test "the raising reader raises what the other answers" {
+  assert_eq(try { read("a=zz") }, Err({ at: 1, why: BadEscape }))
+}
+
+test "an encoding escapes what is not printable, a line's last blank and `=`" {
+  assert_eq(encode(b"plain text"), "plain text");
+  assert_eq(encode(b"!~\x7f"), "!~=7F");
+  assert_eq(encode(b"a=b"), "a=3Db");
+  assert_eq(encode(b"caf\xc3\xa9"), "caf=C3=A9");
+  assert_eq(encode(b"ends in a space "), "ends in a space=20");
+  assert_eq(encode(b"ends in a tab\t"), "ends in a tab=09");
+  assert_eq(encode(b"two\r\nlines"), "two=0D=0Alines");
+  assert_eq(encode(b"a \x00"), "a =00");
+  assert_eq(encode(b""), "");
+  assert_eq(escape(0), b"=00");
+  assert_eq(escape(255), b"=FF")
+}
+
+test "encoded text keeps its lines, each ended by CRLF, and no blank ends one" {
+  assert_eq(encode_text("one\ntwo\r\nthree"), "one\r\ntwo\r\nthree");
+  assert_eq(encode_text("blank \nthen\t\r\nend "), "blank=20\r\nthen=09\r\nend=20");
+  assert_eq(encode_text("a\rb"), "a=0Db");
+  assert_eq(encode_text("a \rb c\nd"), "a =0Db c\r\nd");
+  let full = string_of_bytes(repeat(b"x", 75));
+  assert_eq(encode_text("a\n" ++ full), "a\r\n" ++ full);
+  assert_eq(encode_text("\n\n"), "\r\n\r\n");
+  assert_eq(encode_text("Joe owes \u{20ac}100."), "Joe owes =E2=82=AC100.")
+}
+
+test "a long line breaks softly before its 76th character, and never inside an escape" {
+  let line = encode(repeat(b"x", 100));
+  assert_eq(string_split(line, "=\r\n"), [string_slice(line, 0, 75), string_slice(line, 78, 103)]);
+  let escapes = encode(repeat(b"\xff", 30));
+  assert_eq(map(string_split(escapes, "=\r\n"), string_len), [75, 15]);
+  assert_eq(decode(escapes), Ok(repeat(b"\xff", 30)))
+}
+
+test "unescape reads a marker's hex pairs and refuses the first byte that is neither" {
+  assert_eq(unescape(b"a%20b%2fc", b'%', b"abc"), Ok(b"a b/c"));
+  assert_eq(unescape(b"", b'%', b"abc"), Ok(b""));
+  assert_eq(unescape(b"%41", b'%', b""), Ok(b"A"));
+  assert_eq(unescape(b"ab d", b'%', b"abcd"), Err(2));
+  assert_eq(unescape(b"ab%4", b'%', b"abcd"), Err(2));
+  assert_eq(unescape(b"ab%", b'%', b"abcd"), Err(2));
+  assert_eq(unescape(b"%%41", b'%', b"abcd"), Err(0))
+}
