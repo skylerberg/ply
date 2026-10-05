@@ -1,7 +1,9 @@
 //! What a test read of the world while it ran: the files and directories its handlers read, what
 //! they wrote, the shipped modules it asked for, and what any `ply` it started read in turn, keyed
 //! by the machine that asked. A test's pass is filed with what this comes to, and stands only while
-//! every read still answers as it did.
+//! every read still answers as it did. A load that read a shipped module for only what its program
+//! reaches says so in a view: the module's form and each function reached, with its hash, stand in
+//! for that read of the whole module.
 //!
 //! A machine is observed when the tester begins it; one run on its behalf (a nested machine a
 //! command drives) is adopted into the same record. What the test writes is its own: a read under a
@@ -65,11 +67,20 @@ impl Read {
     }
 }
 
+/// How often a record read a shipped module whole, and how many of those reads a view stands for.
+#[derive(Default)]
+struct Reads {
+    read: usize,
+    viewed: usize,
+}
+
 #[derive(Default)]
 struct Observed {
     reads: BTreeSet<(Read, PathBuf)>,
     writes: BTreeSet<PathBuf>,
-    shipped: BTreeSet<String>,
+    shipped: BTreeMap<String, Reads>,
+    /// The `shipform` and `shipdef` lines of the views that stand for reads of shipped modules.
+    viewed: BTreeMap<String, String>,
     /// Whether the record asked what `ply` program ran.
     program: bool,
     /// Lines a `ply` this record started digested against its own binary, which may not be ours.
@@ -224,7 +235,47 @@ pub fn process_wrote(path: &Path) {
 
 pub fn shipped(machine: MachineId, name: &str) {
     with(machine, |o| {
-        o.shipped.insert(name.to_string());
+        o.shipped.entry(name.to_string()).or_default().read += 1;
+    });
+}
+
+/// What a load said it read of the shipped modules it pulled: per module, a
+/// `shipform\t<module>\t<text digest>\t<form>` line and a `shipdef\t<module>\t<name>\t<hash>` line
+/// for each function its program reached. A view `pulled` its modules stands for one whole read of
+/// each that the record has not yet had a view for; one made again of a load already read, as a
+/// splice re-analyses it, adds to what such a view holds. A module the record never read of the
+/// binary, one a caller handed the load in its place, is left out.
+pub fn reached(machine: MachineId, view: &str, pulled: bool) {
+    let mut modules: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    for line in view.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if let [kind @ ("shipform" | "shipdef"), module, at, digest] = fields.as_slice() {
+            modules
+                .entry(module)
+                .or_default()
+                .push((format!("{kind}\t{module}\t{at}"), digest.to_string()));
+        }
+    }
+    with(machine, |o| {
+        for (module, lines) in modules {
+            let Some(reads) = o.shipped.get_mut(module) else {
+                continue;
+            };
+            let stands_for = if pulled {
+                reads.read > reads.viewed
+            } else {
+                reads.read > 0
+            };
+            if !stands_for {
+                continue;
+            }
+            if pulled {
+                reads.viewed += 1;
+            }
+            for (line, digest) in lines {
+                settle(&mut o.viewed, line, digest);
+            }
+        }
     });
 }
 
@@ -271,7 +322,14 @@ pub fn absorb(machine: MachineId, inner: &Recorder) {
 fn merge(into: &mut Observed, from: &Observed) {
     into.reads.extend(from.reads.iter().cloned());
     into.writes.extend(from.writes.iter().cloned());
-    into.shipped.extend(from.shipped.iter().cloned());
+    for (name, reads) in &from.shipped {
+        let into = into.shipped.entry(name.clone()).or_default();
+        into.read += reads.read;
+        into.viewed += reads.viewed;
+    }
+    for (line, digest) in &from.viewed {
+        settle(&mut into.viewed, line.clone(), digest.clone());
+    }
     into.program |= from.program;
     for (line, digest) in &from.digested {
         settle(&mut into.digested, line.clone(), digest.clone());
@@ -299,12 +357,17 @@ pub struct Binary<'a> {
 }
 
 /// Each `shipped` and `program` line of `o`, digested against `binary` unless a `ply` it started
-/// already digested it against its own.
+/// already digested it against its own, and the views that stand for the rest of its reads.
 fn digested(o: &Observed, binary: &Binary<'_>) -> BTreeMap<String, String> {
     let mut lines = o.digested.clone();
-    for name in &o.shipped {
-        let digest = (binary.shipped)(name).unwrap_or_else(|| "none".to_string());
-        settle(&mut lines, format!("shipped\t{name}"), digest);
+    for (name, reads) in &o.shipped {
+        if reads.read > reads.viewed {
+            let digest = (binary.shipped)(name).unwrap_or_else(|| "none".to_string());
+            settle(&mut lines, format!("shipped\t{name}"), digest);
+        }
+    }
+    for (line, digest) in &o.viewed {
+        settle(&mut lines, line.clone(), digest.clone());
     }
     if o.program {
         settle(&mut lines, "program".to_string(), binary.program.clone());
@@ -367,6 +430,11 @@ fn fold_children(o: &mut Observed) {
                 ["program", digest] => {
                     settle(&mut o.digested, "program".to_string(), digest.to_string())
                 }
+                [kind @ ("shipform" | "shipdef"), module, at, digest] => settle(
+                    &mut o.viewed,
+                    format!("{kind}\t{module}\t{at}"),
+                    digest.to_string(),
+                ),
                 ["opaque", why] => o.opaque.push(why.to_string()),
                 _ => {}
             }
@@ -496,8 +564,9 @@ pub struct World<'a> {
 
 /// A trace: one line a read, sorted — `<how>\t<root>\t<path>\t<own>\t<digest>`, the root empty for
 /// a path no root of the run holds and `own` the paths below it the read leaves out;
-/// `shipped\t<module>\t<digest>`; `program\t<digest>`; and `binding\t<digest>` for a run that
-/// reached a host handler, whose verdict is the binding's.
+/// `shipped\t<module>\t<digest>`; a view's `shipform` and `shipdef` lines ([`reached`]);
+/// `program\t<digest>`; and `binding\t<digest>` for a run that reached a host handler, whose verdict
+/// is the binding's.
 pub type Trace = String;
 
 /// What `recorder` came to, read against `world`; `None` when something it did no trace can stand
@@ -560,7 +629,8 @@ fn own_below(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Vec<PathBuf>
 
 /// The first read `trace` holds that no longer answers as it did, read against `world` now, as a
 /// person reads it; `None` when every one still does. Each read checked is entered into whatever
-/// observes `machine`, since what it decides rests on them.
+/// observes `machine`, since what it decides rests on them. A view stands here while its module's
+/// text does; what can hash the module again holds its form and functions instead.
 pub fn moved(trace: &str, world: &World<'_>, machine: MachineId) -> Option<String> {
     trace.lines().find_map(|line| {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -569,6 +639,11 @@ pub fn moved(trace: &str, world: &World<'_>, machine: MachineId) -> Option<Strin
                 shipped(machine, name);
                 (world.binary.shipped)(name).unwrap_or_else(|| "none".to_string()) == *digest
             }
+            ["shipform", name, text, _] => {
+                shipped(machine, name);
+                (world.binary.shipped)(name).as_deref() == Some(*text)
+            }
+            ["shipdef", ..] => true,
             ["program", digest] => {
                 program(machine);
                 world.binary.program == *digest
@@ -599,7 +674,8 @@ pub fn moved(trace: &str, world: &World<'_>, machine: MachineId) -> Option<Strin
 fn said(fields: &[&str]) -> String {
     match fields {
         ["shipped", "", _] => "the list of shipped modules".to_string(),
-        ["shipped", name, _] => format!("the shipped module `{name}`"),
+        ["shipped", name, _] | ["shipform", name, ..] => format!("the shipped module `{name}`"),
+        ["shipdef", _, name, _] => format!("the shipped definition `{name}`"),
         ["program", _] => "the `ply` program".to_string(),
         ["binding", _] => "the binding".to_string(),
         [how, "", rest, ..] => format!("the {how} `{rest}`"),

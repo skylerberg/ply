@@ -1,0 +1,198 @@
+//! What a trace's views of the shipped modules say now. A load that read a shipped module for
+//! what its program reaches tells the recorder so (`program.tell_viewed`), and the trace then holds
+//! a `shipform` line for the module and a `shipdef` line for each function reached, in place of the
+//! whole module. A view stands while its module's text does; where the text moved, while the
+//! module's form and each of those functions hash as they did, so a function nothing reached moves
+//! nothing.
+
+import compiler.front (ShippedView, shipped_viewer, shipped_views)
+import compiler.hash (hex)
+import sources (shipping_for)
+import std.fs (fs)
+import std.hash (blake3)
+
+pub type Form = { module: Bytes, text: Bytes, form: Bytes }
+
+pub type Reached = { module: Bytes, name: Bytes, hash: Bytes }
+
+pub type Viewed = { forms: List<Form>, defs: List<Reached> }
+
+/// A trace as the recorder reads it again, without its views, and the views.
+pub type Split = { rest: Bytes, viewed: Viewed }
+
+pub fn split(trace: Bytes) -> Split / {abort.raise} = {
+  let parted = fold(
+    bytes_split(trace, b"\n"),
+    { rest: [], forms: [], defs: [] },
+    |acc: { rest: List<Bytes>, forms: List<Form>, defs: List<Reached> }, line: Bytes|
+      match bytes_split(line, b"\t") {
+        [b"shipform", module, text, form] ->
+          { ..acc, forms: push(acc.forms, { module: module, text: text, form: form }) },
+        [b"shipdef", module, name, hash] ->
+          { ..acc, defs: push(acc.defs, { module: module, name: name, hash: hash }) },
+        _ -> if bytes_len(line) == 0 { acc }
+        else { { ..acc, rest: push(push(acc.rest, line), b"\n") } },
+      },
+  );
+  { rest: bytes_concat_all(parted.rest), viewed: { forms: parted.forms, defs: parted.defs } }
+}
+
+/// The shipped modules as they stand now, for a set of views: each named module's text digest, none
+/// for one this binary does not ship; and each module whose text moved since a view of it, with what
+/// it pulls, read whole, or none where reading it whole was refused.
+pub type Now = { texts: Map<Bytes, Option<Bytes>>, whole: Option<Map<Bytes, Whole>> }
+
+/// A module read whole: its form and each of its functions' hashes by name.
+pub type Whole = { form: Bytes, hashes: Map<Bytes, Bytes> }
+
+pub fn now_for(
+  viewed: List<Viewed>,
+) -> Now / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let named = fold(viewed, map_new(), |acc: Map<Bytes, Bool>, v: Viewed|
+    fold(v.forms, acc, |a: Map<Bytes, Bool>, f: Form| map_insert(a, f.module, true)));
+  let texts = map_fold(
+    named,
+    map_new(),
+    |acc: Map<Bytes, Option<Bytes>>, module: Bytes, b: Bool|
+      map_insert(
+        acc,
+        module,
+        match fs.read_file[shipped](string_of_bytes_lossy(module) ++ ".ply") {
+          Some(text) -> Some(hex(blake3(text))),
+          None -> None,
+        },
+      ),
+  );
+  let moved = fold(viewed, map_new(), |acc: Map<Bytes, Bool>, v: Viewed|
+    fold(v.forms, acc, |a: Map<Bytes, Bool>, f: Form|
+      match map_get(texts, f.module) {
+        Some(Some(now)) -> if now == f.text { a } else { map_insert(a, f.module, true) },
+        _ -> a,
+      }));
+  let modules = map_keys(moved);
+  if len(modules) == 0 { { texts: texts, whole: Some(map_new()) } } else {
+    let shipping = shipping_for([shipped_viewer(modules)], {
+      root: b"",
+      manifest: None,
+      supplied: [],
+    });
+    {
+      texts: texts,
+      whole: match shipped_views(modules, shipping.read, shipping.unread) {
+        Err(_) -> None,
+        Ok(views) ->
+          Some(
+            fold(views, map_new(), |acc: Map<Bytes, Whole>, v: ShippedView|
+              map_insert(acc, v.module, {
+                form: v.form,
+                hashes: fold(
+                  v.defs,
+                  map_new(),
+                  |h: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
+                    map_insert(h, d.name, d.hash),
+                ),
+              })),
+          ),
+      },
+    }
+  }
+}
+
+/// The views of every trace in `traces`.
+pub fn viewed_in(traces: List<Bytes>) -> List<Viewed> / {abort.raise} =
+  map(traces, |t: Bytes| split(t).viewed)
+
+/// The first view in `viewed` that no longer stands, as a person reads it; `None` when all do.
+pub fn moved(now: Now, viewed: Viewed) -> Option<String> / {abort.raise} = {
+  let module = |m: Bytes| Some("the shipped module `" ++ string_of_bytes_lossy(m) ++ "`");
+  // Each module whose text stands, and each whose text moved but whose form stands, read whole.
+  let held = fold(
+    viewed.forms,
+    { why: None, same: map_new(), read: map_new() },
+    |acc: { why: Option<String>, same: Map<Bytes, Bool>, read: Map<Bytes, Whole> }, f: Form|
+      if acc.why != None { acc } else {
+        match map_get(now.texts, f.module) {
+          Some(Some(text)) -> if text == f.text {
+            { ..acc, same: map_insert(acc.same, f.module, true) }
+          } else {
+            match match now.whole { Some(whole) -> map_get(whole, f.module), None -> None } {
+              Some(w) -> if w.form == f.form { { ..acc, read: map_insert(acc.read, f.module, w) } }
+              else { { ..acc, why: module(f.module) } },
+              None -> { ..acc, why: module(f.module) },
+            }
+          },
+          _ -> { ..acc, why: module(f.module) },
+        }
+      },
+  );
+  if held.why != None { held.why } else {
+    fold(viewed.defs, None, |acc: Option<String>, d: Reached|
+      if acc != None { acc } else {
+        match map_get(held.read, d.module) {
+          Some(w) -> if map_get(w.hashes, d.name) == Some(d.hash) { None }
+          else { Some("the shipped definition `" ++ string_of_bytes_lossy(d.name) ++ "`") },
+          None -> if map_contains(held.same, d.module) { None } else { module(d.module) },
+        }
+      })
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+test "a trace's views are split from the reads the recorder holds" {
+  let s = split(
+    b"file\tcwd\ta.ply\t\tabc\nshipform\tstd.list\tt1\tf1\nshipdef\tstd.list\tstd.list.take\th1\nshipped\t\td0\n",
+  );
+  assert_eq(s.rest, b"file\tcwd\ta.ply\t\tabc\nshipped\t\td0\n");
+  assert_eq(s.viewed.forms, [{ module: b"std.list", text: b"t1", form: b"f1" }]);
+  assert_eq(s.viewed.defs, [{ module: b"std.list", name: b"std.list.take", hash: b"h1" }])
+}
+
+test "a view stands while its text does, and otherwise while its form and functions do" {
+  let viewed = {
+    forms: [{ module: b"std.list", text: b"t1", form: b"f1" }],
+    defs: [{ module: b"std.list", name: b"std.list.take", hash: b"h1" }],
+  };
+  let whole = |form: Bytes, defs: List<{ name: Bytes, hash: Bytes }>|
+    Some(
+      map_insert(map_new(), b"std.list", {
+        form: form,
+        hashes: fold(defs, map_new(), |h: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
+          map_insert(h, d.name, d.hash)),
+      }),
+    );
+  let texts = |t: Option<Bytes>| map_insert(map_new(), b"std.list", t);
+  assert_eq(moved({ texts: texts(Some(b"t1")), whole: None }, viewed), None);
+  let added = whole(b"f1", [
+    { name: b"std.list.take", hash: b"h1" },
+    { name: b"std.list.later", hash: b"h9" },
+  ]);
+  assert_eq(moved({ texts: texts(Some(b"t2")), whole: added }, viewed), None);
+  assert_eq(
+    moved(
+      { texts: texts(Some(b"t2")), whole: whole(b"f1", [{ name: b"std.list.take", hash: b"h2" }]) },
+      viewed,
+    ),
+    Some("the shipped definition `std.list.take`"),
+  );
+  assert_eq(
+    moved(
+      { texts: texts(Some(b"t2")), whole: whole(b"f2", [{ name: b"std.list.take", hash: b"h1" }]) },
+      viewed,
+    ),
+    Some("the shipped module `std.list`"),
+  );
+  assert_eq(
+    moved({ texts: texts(None), whole: Some(map_new()) }, viewed),
+    Some("the shipped module `std.list`"),
+  );
+  assert_eq(
+    moved({ texts: texts(Some(b"t2")), whole: None }, viewed),
+    Some("the shipped module `std.list`"),
+  );
+  // A function whose module the view gives no form for holds nothing.
+  assert_eq(
+    moved({ texts: texts(Some(b"t1")), whole: None }, { ..viewed, forms: [] }),
+    Some("the shipped module `std.list`"),
+  )
+}

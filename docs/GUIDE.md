@@ -1348,15 +1348,17 @@ recorded pass that still stands, so renames and comment edits run nothing, and n
 or a new `ply` that compiles a test to the same code; the selection line counts those `by code`
 (`by_code` in `--json`, reason `same code`). `ply hash` prints the hashes.
 
-A pass is filed with what its run read of the world: each file and directory a handler read under
-a root (by the root's name, so a pass reads the same from another checkout), each shipped module it
+A pass is filed with what its run read of the world: each file and directory a handler read under a
+root (by the root's name, so a pass reads the same from another checkout), each shipped module it
 asked for, and what every `ply` it started read in turn, that `ply`'s own program and shipped
 modules included; and for a run that reached a host handler, the binding it ran under (whether
-`--host`, and the names `--fs`, `--exec` and `--allow` lend). It stands while each of those still
-answers as it did, and otherwise the test runs again (reason `changed`). A read of something the
-test wrote first is not an input, and neither is the clock, the network, a program other than
-`ply`, or what a run keeps for the next (`PLY_C_CACHE`, `PLY_C_STAGE`). A `ply` that ended before
-reporting what it read files no pass.
+`--host`, and the names `--fs`, `--exec` and `--allow` lend). A load that read a shipped module for
+what its program reaches (§13) files the module's types, effects and imports and each function the
+program reached, by hash, in place of the module, so an edit to a function no program of the test
+reached runs nothing. It stands while each of those still answers as it did, and otherwise the test
+runs again (reason `changed`). A read of something the test wrote first is not an input, and neither
+is the clock, the network, a program other than `ply`, or what a run keeps for the next
+(`PLY_C_CACHE`, `PLY_C_STAGE`). A `ply` that ended before reporting what it read files no pass.
 `--explain` says why each test was selected, naming for a `changed` one the read that moved
 (`moved` in `--json`), what a pass is filed under (the test's hash and the runtime stamp,
 `filed_under` in `--json`, and the code it ran), and where the run's time went, phase by phase
@@ -1868,7 +1870,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
