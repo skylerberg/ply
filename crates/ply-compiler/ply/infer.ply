@@ -6,7 +6,7 @@ import std.bin
 import std.hash (blake3)
 import std.list (at, concat, contains, drop, sort_by, take, prepend)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span, mode_text)
+                    MWrite, MBad, ty_span, mode_text, ident_names)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
               ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
               EffectDef, OpDef, TestDef, LawDef, Binder, Constraint, Deriver, DJson, DEq, DOrd,
@@ -35,7 +35,7 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               env_locals, instantiate_with, instantiate, rename_scheme, generalize, region_prefix,
               region_of, label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
               scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
-              print_row)
+              print_row, applied_args, at_arguments, over_arg)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin)
@@ -60,7 +60,14 @@ import std.bytes (ascii_of_int)
 
 // A prelude item's `at` is `{ module: 0, span: dummy_span() }`.
 pub type Location = { module: Int, span: Span }
-type TypeDecl = { params: List<Bytes>, alias: Option<TypeExpr>, owner: Int, span: Span }
+type TypeDecl = {
+  params: List<Bytes>,
+  labels: List<Bytes>,
+  rows: List<Bytes>,
+  alias: Option<TypeExpr>,
+  owner: Int,
+  span: Span,
+}
 pub type OpInfo = {
   name: Bytes,
   mode: Mode,
@@ -384,8 +391,7 @@ type Checker = {
   group_rows: List<Int>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
-  // Each parameterless alias as an expansion made it where no label or row parameter was in scope,
-  // and the `Map` keys that expansion noted.
+  // Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
   aliases: Map<Bytes, { t: Type, keys: List<MapKeySite> }>,
   refused_atoms: List<Location>,
   performs: List<PerformSite>,
@@ -881,12 +887,12 @@ fn simulated_atoms() -> List<Atom> / {abort.raise} =
 // --- The prelude's functions -------------------------------------------------------------------
 
 // A function the prelude declares: its scheme, the names its declaration gives its parameters, the
-// comment above it, and what a call must show of the types it fixes.
+// lines of its doc, and what a call must show of the types it fixes.
 pub type Builtin = {
   name: Bytes,
   scheme: Scheme,
   params: List<Bytes>,
-  note: Bytes,
+  doc: List<Bytes>,
   constraints: List<DefConstraint>,
 }
 
@@ -994,28 +1000,7 @@ fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
       _ -> acc,
     })
 
-// Where the line holding byte `at` starts.
-fn line_start(text: Bytes, at: Int) -> Int / {abort.raise} =
-  if at <= 0 { 0 } else if bytes_at(text, at - 1) == 10 { at } else { line_start(text, at - 1) }
-
-// The `//` lines directly above the line at `at`, joined: the note a declaration carries. Each round
-// starts a line further up, so `at` bounds the rounds.
-fn note_above(text: Bytes, at: Int, below: Bytes) -> Bytes / {abort.raise} =
-  iterate({ at: at, below: below }, at + 1, |s: { at: Int, below: Bytes }|
-    if s.at <= 0 { Stop(s.below) } else {
-      let start = line_start(text, s.at - 1);
-      let line = bytes_slice(text, start, s.at - 1);
-      if !bytes_starts_with(line, b"// ") { Stop(s.below) } else {
-        let words = bytes_slice(line, 3, bytes_len(line));
-        Continue({
-          at: start,
-          below: if bytes_len(s.below) == 0 { words }
-          else { bytes_concat_all([words, b" ", s.below]) },
-        })
-      }
-    })
-
-fn declared(imported: Map<Bytes, Bytes>, text: Bytes, def: ExternDef) -> Builtin / {abort.raise} = {
+fn declared(imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.raise} = {
   let tys = fold(
     def.generics.types,
     { fresh: fresh_new(), tys: map_new() },
@@ -1056,7 +1041,7 @@ fn declared(imported: Map<Bytes, Bytes>, text: Bytes, def: ExternDef) -> Builtin
       ty: fn_type(params.tys, ret.ty, declared_row(ret.d, def.effects)),
     },
     params: map(def.params, |p: Param| p.name.name),
-    note: note_above(text, def.span.start, b""),
+    doc: match def.doc { Some(d) -> d.lines, None -> [] },
     constraints: dedup_constraints(found),
   }
 }
@@ -1064,12 +1049,11 @@ fn declared(imported: Map<Bytes, Bytes>, text: Bytes, def: ExternDef) -> Builtin
 // Every function the prelude declares, in its order. Pure and nullary, so the runtime reads the
 // prelude once.
 pub fn builtins() -> List<Builtin> / {abort.raise} = {
-  let text = prelude_source::text();
-  let parsed = parse(text);
+  let parsed = parse(prelude_source::text());
   if len(parsed.parser.diags) > 0 { panic("the prelude does not parse") } else {
     let imported = prelude_imports(parsed.node.imports);
     fold(parsed.node.items, [], |acc: List<Builtin>, item: Item|
-      match item { IExtern(def) -> push(acc, declared(imported, text, def)), _ -> acc })
+      match item { IExtern(def) -> push(acc, declared(imported, def)), _ -> acc })
   }
 }
 
@@ -1596,8 +1580,70 @@ fn conv_within(
       };
       { checker: eff.checker, ty: fn_type(ps.tys, r.ty, eff.row) }
     },
-    TCon(c) -> conv_con(checker, c.name, c.args, c.span, room),
+    TCon(c) -> conv_con(checker, c.name, c.args, c.labels, c.rows, c.span, room),
   }
+
+// The label and row arguments a use of a declared type writes.
+type Over = { labels: List<Type>, rows: List<Row> }
+
+fn conv_over(
+  checker: Checker,
+  labels: List<Ident>,
+  rows: List<RowExpr>,
+) -> { checker: Checker, over: Over } / {abort.raise} = {
+  let converted = fold(
+    rows,
+    { checker: checker, rows: [] },
+    |acc: { checker: Checker, rows: List<Row> }, row: RowExpr| {
+      let o = conv_row(acc.checker, row);
+      { checker: o.checker, rows: push(acc.rows, o.row) }
+    },
+  );
+  {
+    checker: converted.checker,
+    over: {
+      // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
+      labels: map(labels, |label: Ident|
+        match map_get(checker.label_params, label.name) {
+          Some(v) -> TyVar(v),
+          None -> label_type(label.name),
+        }),
+      rows: converted.rows,
+    },
+  }
+}
+
+// A declaration's own label and row binders, each a fresh variable, in place of whatever was in
+// scope: a declared type is closed, so nothing in it names a parameter of the signature using it.
+fn bind_own(
+  checker: Checker,
+  decl: TypeDecl,
+) -> { checker: Checker, labels: List<Int>, rows: List<Int> } = {
+  let closed: Checker = { ..checker, label_params: map_new(), row_params: map_new() };
+  let labels = fold(
+    decl.labels,
+    { checker: closed, vars: [] },
+    |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
+      let o: WithVar = new_ty_var(acc.checker);
+      {
+        checker: { ..o.checker, label_params: map_insert(o.checker.label_params, name, o.var) },
+        vars: push(acc.vars, o.var),
+      }
+    },
+  );
+  let rows = fold(
+    decl.rows,
+    { checker: labels.checker, vars: [] },
+    |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
+      let o: WithVar = new_row_var(acc.checker);
+      {
+        checker: { ..o.checker, row_params: map_insert(o.checker.row_params, name, o.var) },
+        vars: push(acc.vars, o.var),
+      }
+    },
+  );
+  { checker: rows.checker, labels: labels.vars, rows: rows.vars }
+}
 
 fn conv_types(
   checker: Checker,
@@ -1627,6 +1673,7 @@ fn arity_error(
   expected: Int,
   found: Int,
   what: Bytes,
+  notes: List<Bytes>,
 ) -> Checker / {abort.raise} = {
   let w = if expected == 1 { bytes_slice(what, 0, bytes_len(what) - 1) } else { what };
   report_error_at(
@@ -1644,28 +1691,56 @@ fn arity_error(
       supplied(found),
     ]),
     bytes_concat_all([b"expected ", ascii_of_int(expected), b", found ", ascii_of_int(found)]),
-    [],
+    notes,
   )
 }
+
+// A use whose label or row arguments are not as many as the declaration binds, told of the first.
+fn over_refused(
+  checker: Checker,
+  span: Span,
+  name: Bytes,
+  labels: Int,
+  rows: Int,
+  over: Over,
+) -> Checker / {abort.raise} =
+  if len(over.labels) != labels {
+    arity_error(checker, span, name, labels, len(over.labels), b"label arguments", [
+      b"a label argument is bracketed among the type arguments, where a binder writes `[l]`: `T<a, [conn]>`",
+    ])
+  } else {
+    arity_error(checker, span, name, rows, len(over.rows), b"row arguments", [
+      b"a row argument follows `|`, where a binder writes its row parameter: `T<a | {}>` holds functions that perform nothing",
+    ])
+  }
 
 fn conv_con(
   checker: Checker,
   name: QName,
   args: List<TypeExpr>,
+  labels: List<Ident>,
+  rows: List<RowExpr>,
   span: Span,
   room: Int,
 ) -> { checker: Checker, ty: Type } / {abort.raise} =
-  if is_bare(name) && len(args) == 0 && map_contains(checker.ty_params, name.name.name) {
+  if is_bare(name) && len(args) == 0 && len(labels) == 0 && len(rows) == 0
+      && map_contains(checker.ty_params, name.name.name) {
     {
       checker: checker,
       ty: match map_get(checker.ty_params, name.name.name) { Some(t) -> t, None -> unit_type() },
     }
   } else {
     let converted: WithTys = conv_all_within(checker, args, room);
-    let c: Checker = converted.checker;
+    let written = conv_over(converted.checker, labels, rows);
+    let c: Checker = written.checker;
+    let over: Over = written.over;
     match if is_bare(name) { builtin_type_arity(name.name.name) } else { None } {
       Some(arity) -> if len(converted.tys) != arity {
-        new_ty(arity_error(c, span, name.name.name, arity, len(converted.tys), b"type arguments"))
+        new_ty(
+          arity_error(c, span, name.name.name, arity, len(converted.tys), b"type arguments", []),
+        )
+      } else if len(labels) > 0 || len(rows) > 0 {
+        new_ty(over_refused(c, span, name.name.name, 0, 0, over))
       } else if name.name.name == b"Cell" {
         let region: WithTy = new_ty(c);
         {
@@ -1692,11 +1767,30 @@ fn conv_con(
                   len(decl.params),
                   len(converted.tys),
                   b"type arguments",
+                  [],
+                ),
+              )
+            } else if len(over.labels) != len(decl.labels) || len(over.rows) != len(decl.rows) {
+              new_ty(
+                over_refused(
+                  g.checker,
+                  span,
+                  name.name.name,
+                  len(decl.labels),
+                  len(decl.rows),
+                  over,
                 ),
               )
             } else {
               match decl.alias {
-                None -> { checker: g.checker, ty: TyCon({ name: qualified, args: converted.tys }) },
+                None ->
+                  {
+                    checker: g.checker,
+                    ty: TyCon({
+                      name: qualified,
+                      args: applied_args(converted.tys, over.labels, over.rows),
+                    }),
+                  },
                 Some(alias) -> if contains(g.checker.alias_stack, qualified) {
                   new_ty(
                     report_error_at(
@@ -1716,9 +1810,7 @@ fn conv_con(
                     if outermost {
                       relocated_keys(sites, before, g.checker.module, span, name.name.name)
                     } else { sites };
-                  // An atom's label and a row's tail name the using definition's parameters.
-                  let memo = len(decl.params) == 0 && map_len(g.checker.label_params) == 0
-                    && map_len(g.checker.row_params) == 0;
+                  let memo = len(decl.params) == 0 && len(decl.labels) == 0 && len(decl.rows) == 0;
                   match if memo { map_get(g.checker.aliases, qualified) } else { None } {
                     Some(m) -> {
                       let assumed = assumed_for(g.checker, DOrd);
@@ -1740,13 +1832,27 @@ fn conv_con(
                         |m: Map<Bytes, Type>, i: Int|
                           map_insert(m, at(decl.params, i), at(converted.tys, i)),
                       );
-                      let inner: Checker = {
-                        ..g.checker,
-                        ty_params: bound,
-                        alias_stack: push(g.checker.alias_stack, qualified),
-                        module: decl.owner,
+                      let own = bind_own(
+                        {
+                          ..g.checker,
+                          ty_params: bound,
+                          alias_stack: push(g.checker.alias_stack, qualified),
+                          module: decl.owner,
+                        },
+                        decl,
+                      );
+                      let body: WithTy = conv_within(own.checker, alias, room - 1);
+                      let o: WithTy = if len(own.labels) == 0 && len(own.rows) == 0 { body } else {
+                        {
+                          checker: body.checker,
+                          ty: at_arguments(
+                            body.ty,
+                            own.labels,
+                            own.rows,
+                            applied_args([], over.labels, over.rows),
+                          ),
+                        }
                       };
-                      let o: WithTy = conv_within(inner, alias, room - 1);
                       // Kept only when the expansion touched nothing but the keys it noted: a
                       // fresh variable, a diagnostic or a refused atom belongs to the one use.
                       let kept = memo && o.checker.fresh == g.checker.fresh
@@ -1756,6 +1862,8 @@ fn conv_con(
                         checker: {
                           ..o.checker,
                           ty_params: saved,
+                          row_params: g.checker.row_params,
+                          label_params: g.checker.label_params,
                           alias_stack: take(o.checker.alias_stack, len(o.checker.alias_stack) - 1),
                           module: g.checker.module,
                           map_keys: placed(o.checker.map_keys),
@@ -1827,11 +1935,9 @@ fn row_param(checker: Checker, ident: Ident) -> { checker: Checker, v: Option<In
           b"not declared",
           [
             bytes_concat_all([
-              b"declare it in the generic list, e.g. `fn f<| ",
+              b"declare it after `|` in the generic list of the `fn` or `type` that writes this row: `<| ",
               ident.name,
-              b">(..) / {| ",
-              ident.name,
-              b"}`",
+              b">`",
             ]),
           ],
         ),
@@ -2135,7 +2241,9 @@ fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker 
         {
           ..checker,
           types: map_insert(checker.types, name, {
-            params: map(def.params, |ident: Ident| ident.name),
+            params: ident_names(def.generics.types),
+            labels: ident_names(def.generics.labels),
+            rows: ident_names(def.generics.effects),
             alias: alias,
             owner: checker.module,
             span: def.span,
@@ -2192,6 +2300,51 @@ fn reject_declared_brand(
             brand,
             b"` as a type parameter instead, so it stays in the type argument, where the escape check can see it",
           ]),
+        ],
+      ),
+  }
+
+// What the row of a function in `ty` reaches of a region: a cell, or a task or a channel.
+fn region_reach(ty: Type) -> Option<Bytes> =
+  match ty {
+    TyVar(_) -> None,
+    TyCon(c) -> first_reason(c.args, region_reach),
+    TyRecord(fs) -> first_reason(fs, |f: Field| region_reach(f.ty)),
+    TyFn(f) -> if fold(f.effects.atoms, false, |b: Bool, atom: Atom| b || atom.effect == cell()) {
+      Some(b"`Cell`")
+    } else if row_brands(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
+      match first_reason(f.params, region_reach) { Some(b) -> Some(b), None -> region_reach(f.ret) }
+    },
+  }
+
+// A sum type hides the rows of the functions it holds, so one that reaches a region would leave it
+// unseen: only a row the type takes as an argument is where the escape checks look.
+fn reject_declared_reach(
+  checker: Checker,
+  ty: Type,
+  span: Span,
+  owner: Bytes,
+  field: Int,
+) -> Checker / {abort.raise} =
+  match region_reach(ty) {
+    None -> checker,
+    Some(reached) ->
+      report_error_at(
+        checker,
+        b"E0446",
+        span,
+        bytes_concat_all([
+          b"`",
+          owner,
+          b"`'s field ",
+          ascii_of_int(field),
+          b" holds a function whose row reaches a ",
+          reached,
+        ]),
+        b"a declaration is outside every region there is",
+        [
+          b"a declared type hides the rows of the functions it holds, so no later check could tell that this one had outlived the region it reaches",
+          b"take the row as a row parameter instead, `type T<| e> = ..`, so it stays in the type argument, where the escape check can see it",
         ],
       ),
   }
@@ -2321,8 +2474,16 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
                   }
                 },
               );
-              let c1: Checker = { ..vars.checker, ty_params: vars.params };
-              let result = TyCon({ name: type_name, args: map(vars.vars, |v: Int| TyVar(v)) });
+              let own = bind_own({ ..vars.checker, ty_params: vars.params }, decl);
+              let c1: Checker = own.checker;
+              let result = TyCon({
+                name: type_name,
+                args: applied_args(
+                  map(vars.vars, |v: Int| TyVar(v)),
+                  map(own.labels, |v: Int| TyVar(v)),
+                  map(own.rows, row_open),
+                ),
+              });
               let walked: Checker = fold(range(0, len(variants)), c1, |cc: Checker, index: Int| {
                 let variant = at(variants, index);
                 let ctor = qualify(parsed.name, variant.name.name);
@@ -2334,17 +2495,28 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
                       range(0, len(fs.tys)),
                       fs.checker,
                       |c3: Checker, i: Int|
-                        reject_declared_brand(
-                          c3,
+                        reject_declared_reach(
+                          reject_declared_brand(
+                            c3,
+                            at(fs.tys, i),
+                            ty_span(at(variant.fields, i)),
+                            variant.name.name,
+                            bytes_concat(b"field ", ascii_of_int(i + 1)),
+                          ),
                           at(fs.tys, i),
                           ty_span(at(variant.fields, i)),
                           variant.name.name,
-                          bytes_concat(b"field ", ascii_of_int(i + 1)),
+                          i + 1,
                         ),
                     );
                     let ty = if len(fs.tys) == 0 { result }
                     else { fn_type(fs.tys, result, row_empty()) };
-                    let sc = { ty_vars: vars.vars, row_vars: [], label_vars: [], ty: ty };
+                    let sc = {
+                      ty_vars: vars.vars,
+                      row_vars: own.rows,
+                      label_vars: own.labels,
+                      ty: ty,
+                    };
                     add_ctor({ ..checked, env: env_bind_global(checked.env, ctor, sc) }, {
                       name: ctor,
                       module: parsed.name,
@@ -2359,7 +2531,7 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
                   },
                 }
               });
-              { ..walked, ty_params: map_new() }
+              { ..walked, ty_params: map_new(), row_params: map_new(), label_params: map_new() }
             },
           }
         },
@@ -3564,7 +3736,10 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             }
           };
           let group = group_label_vars(noted, key.name);
-          let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) } else { inst.labels };
+          // A constructor's labels are its type's arguments, which no call fills.
+          let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) }
+          else if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
+          else { inst.labels };
           { checker: note_labels(noted, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
         },
         None -> {
@@ -4618,7 +4793,7 @@ fn infer_cell_op(
   let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_all(checker, args, span);
   if len(args) != expected {
     let o: WithTy = new_ty(
-      arity_error(as_.checker, span, cell_form_name(form), expected, len(args), b"arguments"),
+      arity_error(as_.checker, span, cell_form_name(form), expected, len(args), b"arguments", []),
     );
     { checker: o.checker, ty: o.ty, row: as_.row }
   } else {
@@ -8900,35 +9075,39 @@ fn first_reason<a | e>(xs: List<a>, f: (a) -> Option<Bytes> / e) -> Option<Bytes
 
 fn raises(atom: AtomExpr) -> Bool = is_bare(atom.eff) && atom.eff.name.name == b"abort"
 
+// A function's row, or the row a declared type is given for the functions it holds.
+fn law_row_reason(row: RowExpr) -> Option<Bytes> =
+  match row.tail {
+    Some(_) ->
+      Some(
+        b"an effect variable has no binder here, and a law quantifies over values rather than over rows",
+      ),
+    None -> match list_at(filter(row.atoms, |a: AtomExpr| !raises(a)), 0) {
+      Some(a) ->
+        Some(
+          bytes_concat_all([
+            b"applying this inside the body would perform `",
+            qname_text(a.eff),
+            b"`, and a law body is pure",
+          ]),
+        ),
+      None -> None,
+    },
+  }
+
 fn written_row_reason(ty: TypeExpr) -> Option<Bytes> =
   match ty {
     TVar(_) -> None,
     TUnit(_) -> None,
     TBad(_) -> None,
-    TCon(c) -> first_reason(c.args, written_row_reason),
+    TCon(c) -> match first_reason(c.rows, law_row_reason) {
+      Some(r) -> Some(r),
+      None -> first_reason(c.args, written_row_reason),
+    },
     TRecord(r) ->
       first_reason(r.fields, |f: { name: Ident, ty: TypeExpr }| written_row_reason(f.ty)),
     TFn(f) -> {
-      let own = match f.effects {
-        Some(row) -> match row.tail {
-          Some(_) ->
-            Some(
-              b"an effect variable has no binder here, and a law quantifies over values rather than over rows",
-            ),
-          None -> match list_at(filter(row.atoms, |a: AtomExpr| !raises(a)), 0) {
-            Some(a) ->
-              Some(
-                bytes_concat_all([
-                  b"applying this inside the body would perform `",
-                  qname_text(a.eff),
-                  b"`, and a law body is pure",
-                ]),
-              ),
-            None -> None,
-          },
-        },
-        None -> None,
-      };
+      let own = match f.effects { Some(row) -> law_row_reason(row), None -> None };
       match own {
         Some(_) -> own,
         None -> match first_reason(f.params, written_row_reason) {
@@ -8977,7 +9156,12 @@ fn ungeneratable_within(
         },
       }
     },
-    TyFn(f) -> if !row_is_pure_but_raise(f.effects) {
+    // A binder writes no row variable, so one here is a declared type's own row parameter.
+    TyFn(f) -> if f.effects.tail != None {
+      Some(
+        b"a function a declared type holds under its row parameter is not generated, whatever row the type is given",
+      )
+    } else if !row_is_pure_but_raise(f.effects) {
       Some(
         bytes_concat_all([
           b"a function with row ",
@@ -9327,7 +9511,9 @@ fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
 // The one predicate a `where` clause, a `Map` key type and a `derive` ask.
 
 type Blocked = { ty: Type, why: DeriveRefusal }
-type AlgebraicShape = { name: Bytes, params: List<Int>, fields: List<Type> }
+// `params` are the type's type and label variables and `rows` its row variables, in the order a
+// use's arguments ride.
+type AlgebraicShape = { name: Bytes, params: List<Int>, rows: List<Int>, fields: List<Type> }
 
 // Every sum type this run declared, flattened: its parameters and every field of every variant.
 fn algebraic_shapes(checker: Checker) -> List<AlgebraicShape> / {abort.raise} =
@@ -9335,43 +9521,23 @@ fn algebraic_shapes(checker: Checker) -> List<AlgebraicShape> / {abort.raise} =
     let i = fold(range(0, len(acc)), 0 - 1, |p: Int, j: Int|
       if p >= 0 { p } else if at(acc, j).name == ctor_info.type_name { j } else { p });
     if i < 0 {
+      let scheme = ctor_info.scheme;
       push(acc, {
         name: ctor_info.type_name,
-        params: ctor_info.scheme.ty_vars,
+        params: if len(scheme.label_vars) == 0 { scheme.ty_vars }
+        else { concat(scheme.ty_vars, scheme.label_vars) },
+        rows: scheme.row_vars,
         fields: ctor_info.fields,
       })
     } else {
       let a = at(acc, i);
-      list_set(acc, i, {
-        name: a.name,
-        params: a.params,
-        fields: concat(a.fields, ctor_info.fields),
-      })
+      list_set(acc, i, { ..a, fields: concat(a.fields, ctor_info.fields) })
     }
   })
 
 fn find_adt(adts: List<AlgebraicShape>, name: Bytes) -> Option<AlgebraicShape> =
   fold(adts, None, |acc: Option<AlgebraicShape>, a: AlgebraicShape|
     match acc { Some(_) -> acc, None -> if a.name == name { Some(a) } else { None } })
-
-fn substitute_ty(t: Type, params: List<Int>, args: List<Type>) -> Type / {abort.raise} =
-  match t {
-    TyVar(v) -> {
-      let i = fold(range(0, len(params)), 0 - 1, |p: Int, j: Int|
-        if p >= 0 { p } else if at(params, j) == v { j } else { p });
-      if i < 0 || i >= len(args) { t } else { at(args, i) }
-    },
-    TyCon(c) ->
-      TyCon({ name: c.name, args: map(c.args, |a: Type| substitute_ty(a, params, args)) }),
-    TyFn(f) ->
-      TyFn({
-        params: map(f.params, |p: Type| substitute_ty(p, params, args)),
-        ret: substitute_ty(f.ret, params, args),
-        effects: f.effects,
-      }),
-    TyRecord(fs) ->
-      TyRecord(map(fs, |f: Field| { name: f.name, ty: substitute_ty(f.ty, params, args) })),
-  }
 
 fn json_null_encoded(ty: Type) -> Bool =
   match ty { TyCon(c) -> null_encoded_name(c.name), _ -> false }
@@ -9423,7 +9589,7 @@ fn derivable_within(
             Some(adt) -> if room <= 0 { panic("a type entered twice on one path") } else {
               first_blocked(
                 deriver,
-                map(adt.fields, |f: Type| substitute_ty(f, adt.params, c.args)),
+                map(adt.fields, |f: Type| at_arguments(f, adt.params, adt.rows, c.args)),
                 adts,
                 assumed,
                 push(visiting, c.name),
@@ -9934,7 +10100,8 @@ fn derive_target(
   let qualified = qualify(parsed.name, target);
   match map_get(checker.types, qualified) {
     None -> None,
-    Some(decl) -> if len(decl.params) > 0 { None } else {
+    Some(decl) -> if len(decl.params) > 0 || len(decl.labels) > 0 || len(decl.rows) > 0 { None }
+    else {
       match decl.alias {
         None -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
         Some(alias) -> {
@@ -9942,6 +10109,8 @@ fn derive_target(
           let inner: Checker = {
             ..checker,
             ty_params: map_new(),
+            row_params: map_new(),
+            label_params: map_new(),
             alias_stack: push(checker.alias_stack, qualified),
             module: decl.owner,
           };
@@ -9950,6 +10119,8 @@ fn derive_target(
             checker: {
               ..o.checker,
               ty_params: checker.ty_params,
+              row_params: checker.row_params,
+              label_params: checker.label_params,
               alias_stack: checker.alias_stack,
               module: checker.module,
               diags: take(o.checker.diags, mark),
@@ -10081,9 +10252,10 @@ fn attribute_generated(checker: Checker) -> Checker / {abort.raise} = {
 
 // --- Comparisons, simulations and regions, once the module is solved ------------------------------
 
+// A row a declared type is given is no function: the ones it holds are its fields'.
 fn contains_fn(t: Type) -> Bool =
   match t {
-    TyFn(_) -> true,
+    TyFn(_) -> !over_arg(t),
     TyCon(c) -> fold(c.args, false, |b: Bool, a: Type| b || contains_fn(a)),
     TyRecord(fs) -> fold(fs, false, |b: Bool, field: Field| b || contains_fn(field.ty)),
     TyVar(_) -> false,
@@ -11333,7 +11505,7 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
             bytes_concat_all([
               b"write it at the call, as `",
               simple_name_of(a.callee),
-              b"[<label>](..)`, or pass an argument whose row names it",
+              b"[<label>](..)`, or pass an argument whose row or type names it",
             ]),
           ],
         )
@@ -12133,22 +12305,160 @@ fn check_diags(src: Bytes) -> List<Diag> / {abort.raise} = {
 fn check_codes(src: Bytes) -> List<Bytes> / {abort.raise} =
   map(check_diags(src), |diag: Diag| diag.code)
 
-test "a parameterless alias reads as if written out at each use, a label in it the user's own" {
-  let uses = |t: Bytes|
+test "a declared type is closed: a label in it is its own parameter or a resource, never a user's binder" {
+  let uses = |decl: Bytes, t: Bytes|
     bytes_concat_all([
-      b"effect net { write send[r](Bytes) -> Unit }\ntype Sender = (Bytes) -> Unit / {net.send[l]}\n",
-      b"pub fn plain(f: ",
+      b"effect net { write send[r](Bytes) -> Unit }\n",
+      decl,
+      b"\npub fn plain(f: ",
       t,
       b") -> Int = 1\npub fn relay<[l]>(f: ",
       t,
-      b") -> Int = 1\npub fn again(f: ",
-      t,
       b") -> Int = 1",
     ]);
+  // Under `relay`'s binder the alias still names the resource `l`, so the binder prints apart from it.
   assert_eq(
-    check_dump([{ name: b"m", src: uses(b"Sender") }]),
-    check_dump([{ name: b"m", src: uses(b"(Bytes) -> Unit / {net.send[l]}") }]),
+    check_dump([
+      { name: b"m", src: uses(b"type Sender = (Bytes) -> Unit / {net.send[l]}", b"Sender") },
+    ]),
+    "K;1;F;m.plain;((Bytes) -> Unit / {m.net.send[l]}) -> Int;;;;"
+      ++ "F;m.relay;<[m]>((Bytes) -> Unit / {m.net.send[l]}) -> Int;;;;"
+      ++ "E;m.net;0;send:write:1:Bytes:Unit;",
+  );
+  let own = check_dump([
+    {
+      name: b"m",
+      src: uses(b"type Sender<[k]> = (Bytes) -> Unit / {net.send[k]}", b"Sender<[l]>"),
+    },
+  ]);
+  assert(string_contains(own, "F;m.plain;((Bytes) -> Unit / {m.net.send[l]}) -> Int;"));
+  assert(string_contains(own, "F;m.relay;<[l]>((Bytes) -> Unit / {m.net.send[l]}) -> Int;"));
+  // A row variable has no resource to fall back on.
+  assert_eq(check_codes(b"type Cb = () -> Unit / e\nfn run<| e>(c: Cb) -> Unit / e = c()"), [
+    b"E0301",
+  ])
+}
+
+test "a sum is printed with the labels and rows it is given, and its constructor binds them" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"effect net { write send[r](Bytes) -> Unit }\npub type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e})\npub fn held<[l] | e>(s: Sink<Int, [l] | {net.send[conn] | e}>) -> Sink<Int, [l] | {net.send[conn] | e}> = s\npub fn kept(s: Sink<Int, [conn] | {}>) -> Sink<Int, [conn] | {}> = s",
+    },
+  ]);
+  assert(
+    string_contains(
+      dump,
+      "F;m.held;<[l] | e>(m.Sink<Int, [l] | {m.net.send[conn] | e}>) -> m.Sink<Int, [l] | {m.net.send[conn] | e}>;;;;",
+    ),
+  );
+  assert(
+    string_contains(dump, "F;m.kept;(m.Sink<Int, [conn] | {}>) -> m.Sink<Int, [conn] | {}>;;;;"),
+  );
+  assert(
+    string_contains(
+      dump,
+      "C;m.Sink;m.Sink;0;1;<a, [l] | e>((a) -> Unit / {m.net.send[l] | e}) -> m.Sink<a, [l] | e>;",
+    ),
   )
+}
+
+test "a sum's row argument is exact, and an alias's lands in a function type a narrower one meets" {
+  let net = b"effect net { write send[s](p: Bytes) -> Unit\n write recv[s](n: Int) -> Bytes }\n";
+  let boxed = |made: Bytes|
+    bytes_concat_all([
+      net,
+      b"type Box<| e> = | Box(() -> Unit / e)\n",
+      b"fn open(b: Box<| {net.write[x]}>) -> Unit / {net.write[x]} = match b { Box(f) -> f() }\n",
+      b"fn go(f: () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = ",
+      made,
+    ]);
+  assert_eq(check_codes(boxed(b"open(Box(f))")), [b"E0302"]);
+  // The annotation is where the narrower function meets the row the sum is given.
+  assert_eq(check_codes(boxed(b"{ let g: () -> Unit / {net.write[x]} = f; open(Box(g)) }")), []);
+  let aliased = bytes_concat_all([
+    net,
+    b"type Thunk<| e> = () -> Unit / e\n",
+    b"fn open(f: Thunk<| {net.write[x]}>) -> Unit / {net.write[x]} = f()\n",
+    b"fn go(f: Thunk<| {net.send[x]}>) -> Unit / {net.write[x]} = open(f)",
+  ]);
+  assert_eq(check_codes(aliased), []);
+  // Two labels are two types, as two rows are.
+  let labelled = bytes_concat_all([
+    net,
+    b"type Sink<[l]> = | Sink((Bytes) -> Unit / {net.send[l]})\n",
+    b"fn to(s: Sink<[a]>) -> Int = 1\n",
+    b"fn go(s: Sink<[b]>) -> Int = to(s)",
+  ]);
+  assert_eq(map(check_diags(labelled), |diag: Diag| { code: diag.code, text: diag.text }), [
+    { code: b"E0201", text: b"argument type|[a]|[b]" },
+  ])
+}
+
+test "a use fills as many labels and rows as its type binds, and a declaration's row variable is its own" {
+  let decls = b"effect net { write send[s](p: Bytes) -> Unit }\ntype Box<| e> = | Box(() -> Unit / e)\ntype Sink<[l]> = | Sink(() -> Unit / {net.send[l]})\ntype Thunk<| e> = () -> Unit / e\n";
+  let used = |ty: Bytes| bytes_concat_all([decls, b"fn f(x: ", ty, b") -> Int = 1"]);
+  let messages = |ty: Bytes| map(check_diags(used(ty)), |diag: Diag| diag.message);
+  assert_eq(messages(b"Box"), [b"`Box` takes 1 row argument, but 0 were supplied"]);
+  assert_eq(messages(b"Thunk"), [b"`Thunk` takes 1 row argument, but 0 were supplied"]);
+  assert_eq(messages(b"Box<| {}, {}>"), [b"`Box` takes 1 row argument, but 2 were supplied"]);
+  assert_eq(messages(b"Sink"), [b"`Sink` takes 1 label argument, but 0 were supplied"]);
+  assert_eq(messages(b"Sink<[a, b]>"), [b"`Sink` takes 1 label argument, but 2 were supplied"]);
+  assert_eq(messages(b"List<Int | {}>"), [b"`List` takes 0 row arguments, but 1 was supplied"]);
+  assert_eq(check_codes(used(b"Box<| {}, {}>")), [b"E0202"]);
+  assert_eq(check_codes(used(b"Box<| {net.send[x] | e}>")), [b"E0301"]);
+  assert_eq(check_codes(b"type Bad<a> = | Bad((a) -> Unit / e)"), [b"E0301"]);
+  // Among the type parameters a name binds a type, so the row that names it is still unbound.
+  assert_eq(check_codes(b"type Bad<a, e> = | Bad((a) -> Unit / e)"), [b"E0301"]);
+  assert_eq(check_codes(used(b"Box<| {net.send[x] bounded}>")), [b"E0466"])
+}
+
+test "a row a declared field writes may not reach a region, and one the type is given is seen leaving" {
+  let hidden = check_diags(b"type Hidden = | Hidden(Int, () -> Int / {cell.read[work]})");
+  assert_eq(map(hidden, |diag: Diag| [diag.code, diag.message]), [
+    [b"E0446", b"`Hidden`'s field 2 holds a function whose row reaches a `Cell`"],
+  ]);
+  assert_eq(check_codes(b"type Joined<| e> = | Joined(() -> Int / {task.join | e})"), [b"E0446"]);
+  assert_eq(
+    check_codes(
+      b"type Box<| e> = | Box(() -> Int / e)\ntype Hidden = | Hidden(Box<| {cell.write[work]}>)",
+    ),
+    [b"E0446"],
+  );
+  let given = b"type Box<| e> = | Box(() -> Int / e)\n";
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        given,
+        b"fn leak() -> Box<| {cell.read[work]}> = with_cell[work](7) { c -> Box(|| cell_get(c)) }",
+      ),
+    ),
+    [b"E0201"],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        given,
+        b"fn kept() -> Int = with_cell[work](7) { c -> match Box(|| cell_get(c)) { Box(f) -> f() } }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a law does not quantify over a sum whose function performs the type's row parameter" {
+  let src = |binder: Bytes|
+    bytes_concat_all([
+      b"type Box<| e> = | Box(() -> Int / e)\ntype Thunk<| e> = () -> Int / e\n",
+      b"effect log { write note() -> Unit }\n",
+      b"law \"held\" forall (b: ",
+      binder,
+      b") { true }",
+    ]);
+  assert_eq(check_codes(src(b"Box<| {}>")), [b"E0418"]);
+  assert_eq(check_codes(src(b"Box<| {log.note}>")), [b"E0418"]);
+  assert_eq(check_codes(src(b"Thunk<| {log.note}>")), [b"E0418"]);
+  assert_eq(check_codes(src(b"Thunk<| {}>")), [])
 }
 
 test "a `Map` key an alias leaves unordered is refused at every signature naming the alias" {
@@ -13975,22 +14285,21 @@ fn declared_as(name: Bytes) -> Builtin / {abort.raise} =
     None -> panic("the prelude declares `" ++ string_of_bytes(name) ++ "`"),
   }
 
-test "a builtin is what the prelude declares: its scheme, its parameters' names and the comment above it" {
+test "a builtin is what the prelude declares: its scheme, its parameters' names and its doc" {
   let slice = declared_as(b"bytes_slice");
   assert_eq(slice.params, [b"b", b"start", b"end"]);
-  assert_eq(slice.note, b"raises out of range");
+  assert_eq(slice.doc, [b"raises out of range"]);
   assert_eq(slice.scheme, {
     ty_vars: [],
     row_vars: [],
     label_vars: [],
     ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
   });
-  assert_eq(declared_as(b"len").note, b"");
-  // A note over several lines reads as one.
-  assert_eq(
-    declared_as(b"reflect").note,
-    b"the value as a `std.value.Value`; a width below 64 bits the program does not fix reads as its `Int`",
-  )
+  assert_eq(declared_as(b"len").doc, []);
+  assert_eq(declared_as(b"reflect").doc, [
+    b"the value as a `std.value.Value`; a width below 64 bits the program does not fix reads as its",
+    b"`Int`",
+  ])
 }
 
 test "a declaration's generic list is its scheme's variables, numbered from zero" {
