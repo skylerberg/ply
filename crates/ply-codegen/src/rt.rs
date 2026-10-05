@@ -10,7 +10,7 @@ use crate::map;
 use crate::stack::{Stack, switch};
 use crate::{array, list};
 use ply_eval::arena::{Owner, RegionId, Slot};
-use ply_eval::builtins::{cell_in_update, no_such_cell};
+use ply_eval::builtins::{cell_in_update, hold_released, no_such_cell};
 use ply_eval::region::StepSite;
 use ply_eval::sim::Access;
 use ply_eval::{
@@ -2137,6 +2137,35 @@ fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
     }
 }
 
+/// What a hold holds, as a count of its own. A hold is a cell of its region, and one let go holds
+/// the null word, which no value is.
+fn hold_read(ctx: &Ctx, slot: Slot) -> Result<Word, Diagnostic> {
+    match ctx.cells.arena().get(slot) {
+        Some(held) if held.0 != 0 => {
+            heap::inc(held.0);
+            Ok(held.0)
+        }
+        Some(_) => Err(hold_released(ctx.site(), "read")),
+        None => Err(no_such_cell(ctx.site(), slot)),
+    }
+}
+
+/// A hold's contents moved out for its release, leaving the null word: a second release finds it
+/// and is refused, so nothing is released twice.
+fn hold_take(ctx: &mut Ctx, slot: Slot) -> Result<Word, Diagnostic> {
+    let site = ctx.site();
+    match ctx.cells.arena().get(slot) {
+        Some(held) if held.0 != 0 => {}
+        Some(_) => return Err(hold_released(site, "let go")),
+        None => return Err(no_such_cell(site, slot)),
+    }
+    let Some(current) = ctx.cells.arena_mut().take(slot) else {
+        return Err(no_such_cell(site, slot));
+    };
+    ctx.cells.arena_mut().put_back(slot, HeldWord(0));
+    Ok(current.into_word())
+}
+
 /// The builtins answered over native words; `None` answers the call over values instead.
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
@@ -2202,6 +2231,24 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*c);
             Some(if ctx.failed != 0 { 0 } else { heap::unit() })
         }
+        (Builtin::HoldGet, [h]) => {
+            let slot = cell_of(*h)?;
+            let answer = match hold_read(ctx, slot) {
+                Ok(w) => w,
+                Err(d) => ctx.fail(d),
+            };
+            heap::dec(*h);
+            Some(answer)
+        }
+        (Builtin::HoldTake, [h]) => {
+            let slot = cell_of(*h)?;
+            let answer = match hold_take(ctx, slot) {
+                Ok(w) => w,
+                Err(d) => ctx.fail(d),
+            };
+            heap::dec(*h);
+            Some(answer)
+        }
         // Only compiled code can enter a closure, so these answer whatever they are given.
         (Builtin::Map, [xs, f]) => Some(unsafe { rt_map(std::ptr::from_mut(ctx), *xs, *f) }),
         (Builtin::Filter, [xs, p]) => Some(unsafe { rt_filter(std::ptr::from_mut(ctx), *xs, *p) }),
@@ -2214,7 +2261,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Iterate, [seed, budget, f]) => {
             Some(unsafe { rt_iterate(std::ptr::from_mut(ctx), *seed, *budget, *f) })
         }
-        (Builtin::Bracket, [acquire, release, body]) => Some(rt_bracket(
+        (Builtin::Bracket | Builtin::HoldBracket, [acquire, release, body]) => Some(rt_bracket(
             std::ptr::from_mut(ctx),
             *acquire,
             *release,
