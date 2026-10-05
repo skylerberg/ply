@@ -217,6 +217,7 @@ fn token_at(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise}
   else if c == 102 && peek(src, start + 1) == 34 {
     interpolated_piece(src, scanner, start, start + 2, true)
   } else if is_ident_start(c) { ident(src, scanner, start) }
+  else if c == 34 && labels_test(scanner.tokens) { label(src, scanner, start) }
   else if c == 34 { string_lit(src, scanner, start) }
   else if c == 92 && peek(src, start + 1) == 92 { line_string(src, scanner, start) }
   else if c == 39 { char_lit(src, scanner, start) } else if c >= 128 {
@@ -996,6 +997,69 @@ fn interpolated_run(
   }
 }
 
+// --- A test's label ---------------------------------------------------------
+
+fn keyword_back(tokens: List<Token>, back: Int, word: Bytes) -> Bool =
+  match list_at(tokens, len(tokens) - back) {
+    Some(t) -> match t.kind { Keyword(k) -> k == word, _ -> false },
+    None -> false,
+  }
+
+/// Whether the next token is a test's label: `test` or `test/nondet` came just before it.
+fn labels_test(tokens: List<Token>) -> Bool =
+  keyword_back(tokens, 1, b"test")
+    || (keyword_back(tokens, 1, b"nondet") && keyword_back(tokens, 3, b"test")
+    && (match list_at(tokens, len(tokens) - 2) {
+      Some(t) -> t.kind == Punctuation(b"slash"),
+      None -> false,
+    }))
+
+fn ranges(src: Bytes, i: Int) -> Bool / {abort.raise} = {
+  let j = skip_trivia(src, i);
+  peek(src, j) == 102 && peek(src, j + 1) == 111 && peek(src, j + 2) == 114
+    && !is_ident_continue(peek(src, j + 3))
+}
+
+/// What stands open at `i`, innermost last: `-1` a template's text, `-2` a string's, and a hole by
+/// the braces open inside it.
+type Closing = { i: Int, open: List<Int> }
+
+/// Past the quote of a character literal that opens at `i`.
+fn char_end(src: Bytes, i: Int) -> Int / {abort.raise} =
+  scan_until(src, if peek(src, i + 1) == 92 { i + 3 } else { i + 2 }, b"'\n") + 1
+
+/// Where the label opening at `start` would close were it a template: an interpolated string's
+/// text, each hole counted through the strings, characters and braces it holds, all on one line.
+fn template_end(src: Bytes, start: Int) -> Option<Int> / {abort.raise} = {
+  let line = scan_until(src, start, b"\n");
+  iterate({ i: start + 1, open: [-1] }, line - start + 2, |s: Closing| {
+    let c = peek(src, s.i);
+    let top = match list_at(s.open, len(s.open) - 1) { Some(k) -> k, None -> -1 };
+    let rest = drop_last(s.open);
+    if s.i >= line { Stop(None) } else if top < 0 {
+      if c == 92 { Continue({ i: s.i + 2, open: s.open }) } else if c == 34 {
+        if len(rest) == 0 { Stop(Some(s.i + 1)) } else { Continue({ i: s.i + 1, open: rest }) }
+      } else if top == -1 && c == 123 && peek(src, s.i + 1) == 123 {
+        Continue({ i: s.i + 2, open: s.open })
+      } else if top == -1 && c == 123 { Continue({ i: s.i + 1, open: push(s.open, 0) }) }
+      else { Continue({ i: s.i + 1, open: s.open }) }
+    } else if c == 34 { Continue({ i: s.i + 1, open: push(s.open, -2) }) }
+    else if c == 102 && peek(src, s.i + 1) == 34 && !is_ident_continue(peek(src, s.i - 1)) {
+      Continue({ i: s.i + 2, open: push(s.open, -1) })
+    } else if c == 39 { Continue({ i: char_end(src, s.i), open: s.open }) }
+    else if c == 123 { Continue({ i: s.i + 1, open: push(rest, top + 1) }) } else if c == 125 {
+      Continue({ i: s.i + 1, open: if top == 0 { rest } else { push(rest, top - 1) } })
+    } else { Continue({ i: s.i + 1, open: s.open }) }
+  })
+}
+
+/// A label before `for` is a template, its holes an interpolated string's; any other is a string.
+fn label(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
+  let templated = match template_end(src, start) { Some(fin) -> ranges(src, fin), None -> false };
+  if templated { interpolated_piece(src, scanner, start, start + 1, true) }
+  else { string_lit(src, scanner, start) }
+}
+
 /// A brace opened or closed inside the innermost hole; outside every hole there is nothing to count.
 fn nest_hole(scanner: Scanner, d: Int) -> Scanner =
   match list_at(scanner.holes, len(scanner.holes) - 1) {
@@ -1712,6 +1776,33 @@ test "a brace inside a hole nests, and only the one that balances the hole close
 test "a lone closing brace and a hole never closed are reported" {
   assert_eq(dump(b"f\"a}b\""), "0:6:s:6162;6:6:e;3:4:!:E0001;");
   assert_eq(dump(b"f\"{x"), "0:3:F:;3:4:i:x;4:4:e;4:4:!:E0002;")
+}
+
+test "a test's label is a template before `for`, and a string before anything else" {
+  assert_eq(
+    dump(b"test \"a {x}\" for"),
+    "0:4:k:test;5:9:F:6120;9:10:i:x;10:12:T:;13:16:i:for;16:16:e;",
+  );
+  assert_eq(dump(b"test \"a {x}\" {"), "0:4:k:test;5:12:s:61207b787d;13:14:p:lbrace;14:14:e;");
+  // A name that only begins with `for` ranges over nothing.
+  assert_eq(dump(b"test \"a {x}\" form"), "0:4:k:test;5:12:s:61207b787d;13:17:i:form;17:17:e;");
+  // Any other string keeps its braces, whatever follows it.
+  assert_eq(
+    dump(b"f(\"a {x}\") for"),
+    "0:1:i:f;1:2:p:lparen;2:9:s:61207b787d;9:10:p:rparen;11:14:i:for;14:14:e;",
+  )
+}
+
+test "a template's doubled braces are single, and a hole holds strings and braces of its own" {
+  assert_eq(dump(b"test \"a {{b}}\" for"), "0:4:k:test;5:14:s:61207b627d;15:18:i:for;18:18:e;");
+  assert_eq(
+    dump(b"test \"a {{b}}\" {"),
+    "0:4:k:test;5:14:s:61207b7b627d7d;15:16:p:lbrace;16:16:e;",
+  );
+  assert_eq(
+    dump(b"test/nondet \"{f(\"}\")}\" for"),
+    "0:4:k:test;4:5:p:slash;5:11:k:nondet;12:14:F:;14:15:i:f;15:16:p:lparen;16:19:s:7d;19:20:p:rparen;20:22:T:;23:26:i:for;26:26:e;",
+  )
 }
 
 test "a string's \\u escape writes its character as UTF-8" {

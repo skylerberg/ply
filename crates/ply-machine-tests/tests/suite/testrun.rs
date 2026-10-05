@@ -102,7 +102,7 @@ fn run(compiled: &Compiled, index: usize, hosting: &Hosting, seeds: &Seeds) -> R
         provider: compiled.unit,
     };
     if !compiled.seeded(index) {
-        let e = testrun::executed(&executor, index);
+        let e = testrun::executed(&executor, index, None);
         return Ran {
             status: testrun::status_word(e.failure.as_ref(), e.panicked),
             failure: e.failure,
@@ -122,7 +122,7 @@ fn run(compiled: &Compiled, index: usize, hosting: &Hosting, seeds: &Seeds) -> R
     };
     for &root in &seeds.roots {
         let seed = Seed::at(root, seeds.path.clone());
-        let one = testrun::interleaved(&executor, index, &seed, 100_000, seeds.re_executed);
+        let one = testrun::interleaved(&executor, index, None, &seed, 100_000, seeds.re_executed);
         ran.host |= one.usage.host;
         ran.performs += one.usage.performs;
         ran.teardown.extend(one.usage.teardown);
