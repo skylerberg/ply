@@ -158,6 +158,81 @@ fn shipped_modules_and_the_program_are_held_at_the_binary_s_digests() {
     );
 }
 
+const VIEW: &str =
+    "shipform\tstd.list\tlist digest\tform\nshipdef\tstd.list\tstd.list.take\thash\n";
+
+#[test]
+fn a_view_stands_for_one_whole_read_of_the_modules_it_names() {
+    let m = MachineId::next();
+    let recorder = observe::begin(m);
+    observe::shipped(m, "std.list");
+    observe::shipped(m, "std.list");
+    observe::reached(m, VIEW, true);
+    // Never read of the binary: a caller handed the load its own text.
+    observe::reached(m, "shipform\tstd.handed\tt\tf\n", true);
+    let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
+    // The second read had no view of its own, so it holds the whole module.
+    assert_eq!(
+        trace,
+        "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd.list\tlist digest\n"
+    );
+    observe::reached(m, VIEW, true);
+    let viewed = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
+    observe::end(&recorder);
+    assert!(!viewed.contains("shipped\t"));
+}
+
+#[test]
+fn a_view_of_a_load_already_read_adds_to_what_its_view_holds() {
+    let m = MachineId::next();
+    let recorder = observe::begin(m);
+    observe::shipped(m, "std.list");
+    observe::reached(m, VIEW, true);
+    observe::reached(
+        m,
+        "shipform\tstd.list\tlist digest\tform\nshipdef\tstd.list\tstd.list.drop\thash\n",
+        false,
+    );
+    let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
+    observe::end(&recorder);
+    assert_eq!(
+        lines(&trace),
+        [
+            "shipdef\tstd.list\tstd.list.drop",
+            "shipdef\tstd.list\tstd.list.take",
+            "shipform\tstd.list\tlist digest",
+        ]
+    );
+}
+
+#[test]
+fn a_view_stands_here_while_its_module_s_text_does() {
+    let m = MachineId::next();
+    assert!(stands(VIEW, &world(&[], "b"), m));
+    let moved_list = VIEW.replace("list digest", "another digest");
+    assert_eq!(
+        observe::moved(&moved_list, &world(&[], "b"), m),
+        Some("the shipped module `std.list`".to_string())
+    );
+}
+
+#[test]
+fn a_ply_it_started_reports_its_views() {
+    let m = MachineId::next();
+    let recorder = observe::begin(m);
+    let file = observe::child_trace(m).unwrap();
+    std::fs::write(&file, format!("{VIEW}end\n")).unwrap();
+    let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
+    observe::end(&recorder);
+    assert_eq!(
+        trace,
+        VIEW.lines()
+            .rev()
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
+    );
+}
+
 #[test]
 fn an_adopted_machine_is_observed_into_its_parent_until_the_record_ends() {
     let dir = tempfile::tempdir().unwrap();
