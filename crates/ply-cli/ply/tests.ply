@@ -87,7 +87,8 @@ import sim.recording (Interleaving)
 import sim.search
 import sim.search (Exact, Exploration, Failure, Diverged, Unscheduled)
 import std.string (join, pad_right, repeat, pad_left)
-import std.math (pow)
+import std.fmt (fixed_point)
+import std.text (shell_join)
 import claims (located)
 import signature (atom_texts)
 import surface (parsed)
@@ -537,29 +538,19 @@ fn no_culprit() -> Culprit = { names: [], at: None }
 
 // --- Fixed point ------------------------------------------------------------
 
-fn zeroed(text: String, width: Int) -> String =
-  if string_len(text) >= width { text } else { repeat("0", width - string_len(text)) ++ text }
+fn ms_tenths(us: Int) -> String / {abort.raise} = fixed_point((us + 50) / 100, 1)
 
-fn fixed(scaled: Int, digits: Int) -> String / {abort.raise} = {
-  let unit = pow(10, digits);
-  let whole = scaled / unit;
-  if digits == 0 { int_to_string(whole) }
-  else { int_to_string(whole) ++ "." ++ zeroed(int_to_string(scaled - whole * unit), digits) }
-}
+fn ms_hundredths(us: Int) -> String / {abort.raise} = fixed_point((us + 5) / 10, 2)
 
-fn ms_tenths(us: Int) -> String / {abort.raise} = fixed((us + 50) / 100, 1)
+fn ms_thousandths(us: Int) -> String / {abort.raise} = fixed_point(us, 3)
 
-fn ms_hundredths(us: Int) -> String / {abort.raise} = fixed((us + 5) / 10, 2)
+fn secs_hundredths(us: Int) -> String / {abort.raise} = fixed_point((us + 5000) / 10000, 2)
 
-fn ms_thousandths(us: Int) -> String / {abort.raise} = fixed(us, 3)
-
-fn secs_hundredths(us: Int) -> String / {abort.raise} = fixed((us + 5000) / 10000, 2)
-
-fn ns_as_ms_tenths(ns: Int) -> String / {abort.raise} = fixed((ns + 50000) / 100000, 1)
+fn ns_as_ms_tenths(ns: Int) -> String / {abort.raise} = fixed_point((ns + 50000) / 100000, 1)
 
 /// Per mille is tenths of a percent, so one division answers both digits.
 fn share(part: Int, total: Int) -> String / {abort.raise} =
-  pad_left(fixed(if total == 0 { 0 } else { part * 1000 / total }, 1), 5, " ") ++ "%"
+  pad_left(fixed_point(if total == 0 { 0 } else { part * 1000 / total }, 1), 5, " ") ++ "%"
 
 fn millis(us: Int) -> Json / {abort.raise} =
   Number(option_unwrap_or(decimal_of_string(ms_thousandths(us)), decimal_of_int(0)))
@@ -1118,7 +1109,10 @@ fn reduction_part(e: Explored, naive: Cost) -> List<String> / {abort.raise} =
   match e.reduction_tenths {
     None -> [],
     Some(tenths) ->
-      [(if naive.bounded { ">= " } else { "" }) ++ fixed((tenths + 5) / 10, 0) ++ "× reduction"],
+      [
+        (if naive.bounded { ">= " } else { "" }) ++ fixed_point((tenths + 5) / 10, 0)
+          ++ "× reduction",
+      ],
   }
 
 /// What one test's search did, under its result line.
@@ -1457,7 +1451,8 @@ fn search_json(e: Explored) -> Json / {abort.raise} =
     {
       key: "reduction",
       value: match e.reduction_tenths {
-        Some(t) -> Number(option_unwrap_or(decimal_of_string(fixed(t, 1)), decimal_of_int(0))),
+        Some(t) ->
+          Number(option_unwrap_or(decimal_of_string(fixed_point(t, 1)), decimal_of_int(0))),
         None -> Null,
       },
     },
@@ -1891,19 +1886,49 @@ pub fn iterated(
   let begun = time.elapsed_us();
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
-  let key = match argv {
+  let keys = match argv {
     Some(line) -> if held == None && keeps_answer(options) {
-      Some(answers::key_of(answers::program(), line, project))
+      let program = answers::program();
+      Some({
+        key: answers::key_of(program, line, project),
+        alone: map(alone_lines(line, flags.filters), |a: { filter: String, line: List<String> }|
+          { filter: a.filter, key: answers::key_of(program, a.line, project) }),
+      })
     } else { None },
     None -> None,
   };
-  match match key { Some(k) -> replayed(flags, options, k, project, begun), None -> None } {
+  match match keys { Some(k) -> replayed(flags, options, k.key, project, begun), None -> None } {
     Some(answer) -> { answer: answer, held: None, embeds: project.embeds },
-    None -> if flags.kept { { answer: unkept(flags), held: None, embeds: project.embeds } } else {
+    None -> if flags.kept {
+      let unanswered = match keys {
+        Some(k) -> if len(k.alone) == 0 { flags.filters } else {
+          map(
+            filter(k.alone, |a: { filter: String, key: String }|
+              replayed({ ..flags, json: true }, options, a.key, project, begun) == None),
+            |a: { filter: String, key: String }| a.filter,
+          )
+        },
+        None -> flags.filters,
+      };
+      {
+        answer: unkept(flags, unanswered, match keys {
+          Some(k) -> len(k.alone) > 0,
+          None -> false,
+        }),
+        held: None,
+        embeds: project.embeds,
+      }
+    } else {
       let t: Timed = loaded(flags, options, held, project, started);
-      over_load(flags, options, s, t, begun, match key {
+      over_load(flags, options, s, t, begun, match keys {
         Some(k) -> if viewed_whole(t.program) {
-          Some({ key: k, views: viewed_text(t.program.viewed), passes: [], after: false })
+          Some({
+            key: k.key,
+            views: viewed_text(t.program.viewed),
+            passes: [],
+            after: false,
+            alone: k.alone,
+          })
         } else { None },
         None -> None,
       })
@@ -1911,31 +1936,67 @@ pub fn iterated(
   }
 }
 
-/// What `--kept` answers where no kept answer stands: exit 4, and nothing loaded or run.
-fn unkept(flags: Flags) -> Answer =
+/// What `--kept` answers where no kept answer of the whole run stands. A run of several `--filter`s
+/// asked each what a run of it alone kept, and `unanswered` holds those nothing kept answers: exit 0
+/// where every one was answered. Exit 4 otherwise, and nothing loaded or run.
+fn unkept(flags: Flags, unanswered: List<String>, apart: Bool) -> Answer = {
+  let code = if apart && len(unanswered) == 0 { ok_code() } else { unkept_code() };
   {
     json: object([
       { key: "command", value: Str("test") },
-      { key: "ok", value: Bool(false) },
-      { key: "exit_code", value: int(unkept_code()) },
-      { key: "kept", value: Bool(false) },
+      { key: "ok", value: Bool(code == ok_code()) },
+      { key: "exit_code", value: int(code) },
+      { key: "kept", value: Bool(code == ok_code()) },
+      { key: "unanswered", value: strings(unanswered) },
     ]),
     lines: [],
-    errs: if flags.json { [] } else {
+    errs: if flags.json || code == ok_code() { [] } else {
       [
         indent()
-          ++ "nothing kept answers this run: none was kept for this command line, or a pass or shipped definition it took moved",
+          ++ (if apart { "nothing kept answers these filters: " ++ join(unanswered, ", ") } else {
+            "nothing kept answers this run: none was kept for this command line, or a pass or shipped definition it took moved"
+          }),
       ]
     },
-    code: unkept_code(),
+    code: code,
   }
+}
 
 fn unkept_code() -> Int = 4
 
 /// Where a run keeps its answer for the next run over the same command (`answers`): the key, its
 /// load's views of the shipped modules, and the keys of the passes it took. `after` is an answer
 /// selected again after the run filed its passes, which the store's warnings on opening are not in.
-type Keeping = { key: String, views: Bytes, passes: List<String>, after: Bool }
+/// `alone` is, for a run of several `--filter`s, each with the key a run of it alone keeps under.
+type Keeping = {
+  key: String,
+  views: Bytes,
+  passes: List<String>,
+  after: Bool,
+  alone: List<{ filter: String, key: String }>,
+}
+
+/// Each `--filter` of a run of several with the command line a run of it alone spells: every other
+/// `--filter` and its value left out.
+fn alone_lines(
+  line: List<String>,
+  filters: List<String>,
+) -> List<{ filter: String, line: List<String> }> / {abort.raise} =
+  if len(filters) < 2 { [] } else {
+    map(filters, |f: String|
+      {
+        filter: f,
+        line: fold(
+          range(0, len(line)),
+          { out: [], skip: false },
+          |acc: { out: List<String>, skip: Bool }, i: Int|
+            if acc.skip { { ..acc, skip: false } }
+            else if at_or(line, i, "") == "--filter" && at_or(line, i + 1, "") != f {
+              { ..acc, skip: true }
+            } else { { ..acc, out: push(acc.out, at_or(line, i, "")) } },
+        ).out,
+      })
+  }
 
 /// The embeds the tests in `scope` reach, as a kept answer holds them: one asked for by a definition,
 /// test or law the tests reach, and always one a dependency asks for, one an item that declares no
@@ -2562,42 +2623,52 @@ fn decided_run(
                     let again = cases_of(rows_of(analysis), search, false);
                     let settled = decide(again.cases);
                     if all_cached(settled, scope) {
-                      let next = program_of(
-                        options,
-                        { ..timed, program: { ..timed.program, cache_warnings: [] } },
-                        analysis,
-                        over.entries,
-                        root_of(flags.paths),
-                        scope,
-                        [],
-                        filed_under,
-                      );
-                      let _ = concluded_run(
-                        flags,
-                        style,
-                        options,
-                        next,
-                        timed,
-                        analysis,
-                        over.judged,
-                        scope,
-                        settled,
-                        decided_of(next, settled, search, sim_json(searching, options.sim), [], []),
-                        map_new(),
-                        {
-                          refiled: [],
-                          kept: Some({
-                            ..k,
-                            passes: answered_by(again.answering, scope),
-                            after: true,
-                          }),
-                        },
-                        searching,
-                        r.warnings,
-                        targeted,
-                        spent,
-                      );
-                      ()
+                      let kept_as = |f: Flags, o: Options, sc: Scope, key: String| {
+                        let next = program_of(
+                          o,
+                          { ..timed, program: { ..timed.program, cache_warnings: [] } },
+                          analysis,
+                          over.entries,
+                          root_of(flags.paths),
+                          sc,
+                          [],
+                          filed_under,
+                        );
+                        let _ = concluded_run(
+                          f,
+                          style,
+                          o,
+                          next,
+                          timed,
+                          analysis,
+                          over.judged,
+                          sc,
+                          settled,
+                          decided_of(next, settled, search, sim_json(searching, o.sim), [], []),
+                          map_new(),
+                          {
+                            refiled: [],
+                            kept: Some({
+                              ..k,
+                              key: key,
+                              passes: answered_by(again.answering, sc),
+                              after: true,
+                              alone: [],
+                            }),
+                          },
+                          searching,
+                          r.warnings,
+                          targeted,
+                          spent,
+                        );
+                        ()
+                      };
+                      kept_as(flags, options, scope, k.key);
+                      // Each `--filter` of several kept apart too, as a run of it alone answers.
+                      fold(k.alone, (), |u: Unit, a: { filter: String, key: String }| {
+                        let o = { ..options, filters: [a.filter] };
+                        kept_as({ ..flags, filters: [a.filter] }, o, scope_of(analysis, o), a.key)
+                      })
                     }
                   },
                   None -> (),
@@ -3890,7 +3961,7 @@ fn fault_of<| e>(
     unchanged: failed.unchanged,
     seed: failed.seed,
     race: failed.race,
-    replay: match failed.seed { Some(seed) -> Some(replay_of(seed, failed.name)), None -> None },
+    replay: match failed.seed { Some(seed) -> replay_of(seed, failed.name), None -> None },
     module: failed.module,
     test_hash: failed.test_hash,
     nondet: failed.nondet,
@@ -3899,9 +3970,10 @@ fn fault_of<| e>(
   }
 }
 
-/// The command that replays one interleaving of one test.
-fn replay_of(seed: String, name: String) -> String =
-  "ply test --seed " ++ seed ++ " --filter \"" ++ name ++ "\""
+/// The command that replays one interleaving of one test, spelled for a shell to read back as
+/// these words; none for a name no shell word can carry.
+fn replay_of(seed: String, name: String) -> Option<String> =
+  shell_join(["ply", "test", "--seed", seed, "--filter", name])
 
 /// A mixture's pass is filed under the test as it is now and as it last passed, the definitions
 /// taken, and the interleaving the failure took.
@@ -4475,7 +4547,7 @@ test "a failure's artifact says what failed, how to replay it, and what caused i
   let raced = {
     ..a_fault(),
     seed: Some("0:1.0"),
-    replay: Some(replay_of("0:1.0", "two is two")),
+    replay: replay_of("0:1.0", "two is two"),
     race: Some({ left: site, right: { ..site, task: "t2" }, step: 3 }),
     suspects: [{ ..a_suspect("m.bump"), change: Some(Edited), culprit: true }],
   };
@@ -4486,7 +4558,7 @@ test "a failure's artifact says what failed, how to replay it, and what caused i
   assert(string_contains(text, "\"module\":\"m\""));
   assert(string_contains(text, "\"status\":\"failed\""));
   assert(string_contains(text, "\"nondet\":false"));
-  assert(string_contains(text, "\"replay\":\"ply test --seed 0:1.0 --filter \\\"two is two\\\"\""));
+  assert(string_contains(text, "\"replay\":\"ply test --seed 0:1.0 --filter 'two is two'\""));
   assert(string_contains(text, "\"at\":3"));
   assert(string_contains(text, "\"task\":\"t2\""));
   assert(string_contains(text, "\"change\":\"edited\""));
@@ -4527,15 +4599,20 @@ test "a suspect is named with what changed" {
 }
 
 test "the repro is a seed and the command that replays it" {
-  let f = {
-    ..a_fault(),
-    seed: Some("0:0.1.0.2"),
-    replay: Some(replay_of("0:0.1.0.2", "two is two")),
-  };
+  let f = { ..a_fault(), seed: Some("0:0.1.0.2"), replay: replay_of("0:0.1.0.2", "two is two") };
   assert_eq(seed_lines(plain(), a_place(), f), [
     "  seed: 0:0.1.0.2",
-    "  replay: ply test --seed 0:0.1.0.2 --filter \"two is two\"",
+    "  replay: ply test --seed 0:0.1.0.2 --filter 'two is two'",
   ])
+}
+
+test "a replay is one command whatever the test is called" {
+  assert_eq(
+    replay_of("0:1", "it's \"$HOME\" `now`"),
+    Some("ply test --seed 0:1 --filter 'it'\\''s \"$HOME\" `now`'"),
+  );
+  assert_eq(replay_of("0:1", "plain"), Some("ply test --seed 0:1 --filter plain"));
+  assert_eq(replay_of("0:1", "a\0b"), None)
 }
 
 test "a search says what it explored and what a blind and an unpruned one would have cost" {

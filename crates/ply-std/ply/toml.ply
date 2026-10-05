@@ -1,0 +1,3478 @@
+//! TOML 1.0.0: the value, a reader, a writer, a document that keeps its layout, and codecs.
+//!
+//! A `Toml` is what a document means. A table is its entries in the order they were written,
+//! which is what a writer and a reader that walks them need; a `Map` beside the list would be a
+//! second copy to keep in step. `==` reads through a key instead: two tables of the same keys are
+//! one whatever their order, a key written twice means its last value, a `nan` is `nan` and `0.0`
+//! is not `-0.0`. Whether a table was written inline or under a header, and an array in brackets or
+//! as `[[headers]]`, is no part of the value. The four kinds of date and time are `std.date`'s
+//! four types.
+//!
+//! `read` raises `toml.refused` and `parse` answers it as an `Err`: the line, the column counted
+//! in characters, and why. A reader takes its `Limits`, and there is none without; its steps grow
+//! in proportion to its input. It reads the 1.0.0 grammar and nothing more, so a byte order mark,
+//! a time without seconds and a `\x` escape are refused, and it holds a document to the rules that
+//! are no grammar: a key or a table defined twice, a table a header defines added to by a dotted
+//! key or the other way round, an inline table or an array in brackets added to from outside, and
+//! a key that passes through a value that is no table. A table a header only implied (`a` in
+//! `[a.b]`) may be added to by dotted keys under its parent's header, and is then defined there.
+//! An integer past 64 bits and a float past the largest double are refused; a fraction of a second
+//! is kept to nine digits and the rest dropped; a newline in a multi-line string is a line feed
+//! however the file ends its lines. A second of `60` is read as `std.date` reads one: with an
+//! offset, at the end of a UTC month, as `59`. An instant that falls outside the years 0000 to
+//! 9999 in UTC is refused, which the grammar admits at the calendar's two ends.
+//!
+//! `to_bytes` writes a table as a document: its plain keys, then each table under a header, a
+//! parent before its children, and an array whose every element is a table as `[[headers]]`. A
+//! string is written between `'` where that saves an escape, on lines of its own between `"""`
+//! where it holds a line feed and stands alone on a key's line, and otherwise between `"`. A float
+//! is the shortest text that reads back. What is written reads back equal.
+//!
+//! A `Document` is the text as well as the value, read by the same reader: `source` is the bytes
+//! it was read from, and `set` and `remove` change one path and leave every other byte, comments
+//! and layout included, where it stood. An edit is read back before it is answered, so it means
+//! what `put` or `without` means of the value, or it is refused. `place` says where a path is
+//! written.
+//!
+//! A `TomlCodec<a>` pairs an encoder with a decoder, as `std.json`'s `JsonCodec` does, and the
+//! codecs here are the ones a record's codec is written of. A decode error carries the path of
+//! keys to what was wrong, and `decode_bytes` and `decode_document` add the line and column it is
+//! written at. `only_fields` refuses a key a record does not have.
+
+import std.bytes
+import std.bytes (hex_value, is_digit, peek, scan, scan_until)
+import std.date
+import std.float (infinity, is_infinite, is_nan, nan, neg_infinity)
+import std.json (escaped_byte)
+import std.laws (agrees)
+import std.list (all, any, concat, drop, prepend, reverse, take)
+import std.option (option_map, option_unwrap_or)
+import std.result (result_err, result_map, result_map_err, result_ok)
+import std.string
+import std.string (join)
+
+// --- The value --------------------------------------------------------------
+
+/// A TOML value.
+pub type Toml =
+  | String(String)
+  | Integer(Int)
+  /// `inf`, `-inf` and `nan` among them.
+  | Float(Float)
+  | Boolean(Bool)
+  /// A date and time with an offset: an instant.
+  | OffsetDateTime(date::OffsetDateTime)
+  /// A date and time with no offset.
+  | LocalDateTime(date::DateTime)
+  | LocalDate(date::Date)
+  | LocalTime(date::Time)
+  | Array(List<Toml>)
+  /// The entries in the order they were written. A key written twice means its last value.
+  | Table(List<Entry>)
+
+/// One key of a table and its value.
+pub type Entry = { key: String, value: Toml }
+
+/// A value with every table sorted and every float as its bits, which is what `==` compares.
+type Canon =
+  | CString(String)
+  | CInteger(Int)
+  | CFloat(Int)
+  | CBoolean(Bool)
+  | COffsetDateTime(date::OffsetDateTime)
+  | CLocalDateTime(date::DateTime)
+  | CLocalDate(date::Date)
+  | CLocalTime(date::Time)
+  | CArray(List<Canon>)
+  | CTable(Map<String, Canon>)
+
+key for Toml by canonical
+
+show for Toml by inline
+
+fn canonical(t: Toml) -> Canon =
+  match t {
+    String(s) -> CString(s),
+    Integer(n) -> CInteger(n),
+    Float(f) -> CFloat(bits_of_float(if is_nan(f) { nan() } else { f })),
+    Boolean(b) -> CBoolean(b),
+    OffsetDateTime(o) -> COffsetDateTime(o),
+    LocalDateTime(dt) -> CLocalDateTime(dt),
+    LocalDate(d) -> CLocalDate(d),
+    LocalTime(time) -> CLocalTime(time),
+    Array(items) -> CArray(map(items, canonical)),
+    Table(entries) ->
+      CTable(map_of_entries(map(entries, |e: Entry| { key: e.key, value: canonical(e.value) }))),
+  }
+
+/// A table of these entries, a later entry for a key replacing an earlier one where that stood.
+pub fn table(entries: List<Entry>) -> Toml = Table(unique(entries))
+
+/// An entry of a table.
+pub fn entry(key: String, value: Toml) -> Entry = { key: key, value: value }
+
+type Seen = { seen: Map<String, Unit>, kept: List<Entry> }
+
+/// The entries with one for each key: its last value, where the key first stood.
+fn unique(entries: List<Entry>) -> List<Entry> = {
+  let last = map_of_entries(entries);
+  if map_len(last) == len(entries) { entries } else {
+    fold(entries, { seen: map_new(), kept: [] }, |s: Seen, e: Entry| {
+      let { seen, kept } = s;
+      if map_contains(seen, e.key) { { seen: seen, kept: kept } } else {
+        {
+          seen: map_insert(seen, e.key, ()),
+          kept: push(kept, {
+            key: e.key,
+            value: match map_get(last, e.key) { Some(v) -> v, None -> e.value },
+          }),
+        }
+      }
+    }).kept
+  }
+}
+
+/// A table's value under `name`; `None` for an absent key and for any value that is no table.
+/// Each call walks the table's entries.
+pub fn get(t: Toml, name: String) -> Option<Toml> =
+  match t {
+    Table(entries) ->
+      fold(entries, None, |found: Option<Toml>, e: Entry|
+        if e.key == name { Some(e.value) } else { found }),
+    _ -> None,
+  }
+
+/// One step from a value to a value inside it.
+pub type Step =
+  /// Into a table, by a key.
+  | Key(String)
+  /// Into an array, by an index from 0.
+  | Index(Int)
+
+/// The value a path leads to from `t`, where every step of it is there.
+pub fn at(t: Toml, path: List<Step>) -> Option<Toml> =
+  match path {
+    [] -> Some(t),
+    [Key(name), ..rest] -> match get(t, name) { Some(v) -> at(v, rest), None -> None },
+    [Index(i), ..rest] -> match t {
+      Array(items) -> match list_at(items, i) { Some(v) -> at(v, rest), None -> None },
+      _ -> None,
+    },
+  }
+
+/// `t` with `v` where the path leads, in place of what stood there or as a new last key.
+///
+/// A table the path names and `t` lacks is made. `None` where the path passes through a value
+/// that is no table, or names an index its array does not have.
+pub fn put(t: Toml, path: List<Step>, v: Toml) -> Option<Toml> =
+  match path {
+    [] -> Some(v),
+    [Key(name), ..rest] -> match t {
+      Table(entries) -> {
+        let held = unique(entries);
+        let child = match get(t, name) { Some(found) -> found, None -> Table([]) };
+        match put(child, rest, v) {
+          None -> None,
+          Some(made) ->
+            Some(
+              Table(if any(held, |e: Entry| e.key == name) {
+                map(held, |e: Entry| if e.key == name { { key: name, value: made } } else { e })
+              } else { push(held, { key: name, value: made }) }),
+            ),
+        }
+      },
+      _ -> None,
+    },
+    [Index(i), ..rest] -> match t {
+      Array(items) -> match list_at(items, i) {
+        None -> None,
+        Some(child) -> match put(child, rest, v) {
+          None -> None,
+          Some(made) -> Some(Array(concat(push(take(items, i), made), drop(items, i + 1)))),
+        },
+      },
+      _ -> None,
+    },
+  }
+
+/// `t` without what the path leads to; `t` itself where it leads nowhere.
+pub fn without(t: Toml, path: List<Step>) -> Toml =
+  match path {
+    [] -> t,
+    [Key(name)] -> match t {
+      Table(entries) -> Table(filter(entries, |e: Entry| e.key != name)),
+      _ -> t,
+    },
+    [Index(i)] -> match t {
+      Array(items) -> if i < 0 { t } else { Array(concat(take(items, i), drop(items, i + 1))) },
+      _ -> t,
+    },
+    [step, ..rest] -> match at(t, [step]) {
+      None -> t,
+      Some(child) -> match put(t, [step], without(child, rest)) { Some(made) -> made, None -> t },
+    },
+  }
+
+/// A path as a dotted key writes it, with an index in brackets: `servers.alpha[2]."a b"`.
+pub fn path_to_string(path: List<Step>) -> String =
+  fold(path, "", |written: String, step: Step|
+    match step {
+      Key(name) -> (if written == "" { "" } else { written ++ "." }) ++ key_text(name),
+      Index(i) -> written ++ "[" ++ int_to_string(i) ++ "]",
+    })
+
+// --- Refusals ---------------------------------------------------------------
+
+/// Why a reader refused.
+pub type Why =
+  /// The document is longer than the limit's `bytes`.
+  | TooLong
+  /// A value sits inside more tables and arrays than the limit's `depth`.
+  | TooDeep
+  /// The bytes are not UTF-8.
+  | NotUtf8
+  /// The grammar wants something else here, which the text names: `a value`.
+  | Expected(String)
+  /// A control character, by its code, where none may be written: in a comment, raw in a string,
+  /// or a carriage return with no line feed after it.
+  | Control(Int)
+  /// A backslash that starts no escape of TOML 1.0.0, or a `\u` or `\U` that names no Unicode
+  /// scalar value.
+  | Escape
+  /// An integer past 64 bits, or a float past the largest double.
+  | TooWide
+  /// A date or a time that is none, with what `std.date` said of it.
+  | NoSuchTime(String)
+  /// The key, or the table a header names, is already defined: its path from the root.
+  | Duplicate(List<Step>)
+  /// The path from the root to what a key, a header or an edit cannot add to or pass through: a
+  /// value that is no table, an inline table, an array in brackets, or a table defined elsewhere.
+  | Closed(List<Step>)
+  /// This module failed, with what it said: its own defect, which no document or edit should
+  /// meet, answered as a refusal so that a reader raises nothing else.
+  | Defect(String)
+
+/// A refusal: the byte the reader stood at, its line and its column in characters, both from 1,
+/// and why.
+pub type Refusal = new { offset: Int, line: Int, column: Int, why: Why }
+
+/// What a reader holds a document to: how many bytes it may be, and how many tables and arrays a
+/// value may sit inside, each part of its header and of its key before the last counted as one.
+/// Every walk of a value nests a few calls for each level, so a depth in the thousands lets a
+/// document run a program into its call ceiling.
+pub type Limits = new { bytes: Int, depth: Int }
+
+/// What a reader or an edit of this module raises where it refuses.
+pub effect toml {
+  /// The input is no TOML 1.0.0 document within the limits, or the edit has no place in it.
+  raise refused(e: Refusal)
+}
+
+/// A refusal as a sentence: `line 3, column 8: expected a value`.
+pub fn refusal_to_string(r: Refusal) -> String =
+  "line " ++ int_to_string(r.line) ++ ", column " ++ int_to_string(r.column) ++ ": "
+    ++ why_to_string(r.why)
+
+fn why_to_string(why: Why) -> String =
+  match why {
+    TooLong -> "the document is longer than its limit",
+    TooDeep -> "this is nested deeper than the limit",
+    NotUtf8 -> "these bytes are not UTF-8",
+    Expected(what) -> "expected " ++ what,
+    Control(code) -> "the control character U+00" ++ two_hex(code) ++ " may not be written here",
+    Escape ->
+      "the escapes are \\b \\t \\n \\f \\r \\\" \\\\ \\uXXXX and \\UXXXXXXXX, of a Unicode scalar value",
+    TooWide -> "this number is past what an `Int` or a `Float` holds",
+    NoSuchTime(said) -> said,
+    Duplicate(path) -> "`" ++ path_to_string(path) ++ "` is defined twice",
+    Closed(path) ->
+      "`" ++ path_to_string(path)
+        ++ "` cannot be added to here: it is no table, or it is defined elsewhere",
+    Defect(said) -> "std.toml failed, which is its defect and no fault of the text: " ++ said,
+  }
+
+fn two_hex(code: Int) -> String = {
+  let digit = |n: Int|
+    match list_at(
+        ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"],
+        n,
+      ) {
+      Some(d) -> d,
+      None -> "?",
+    };
+  digit(code / 16 % 16) ++ digit(code % 16)
+}
+
+/// Where the reader stands, or what it found there. The entries place it in the text.
+effect fault {
+  raise at(offset: Int, why: Why)
+}
+
+fn stop<a>(offset: Int, why: Why) -> a / {fault.at} = fault.at(offset, why)
+
+// --- Syntax -----------------------------------------------------------------
+
+/// One name of a key, and the bytes it is written in.
+type Part = { name: String, from: Int, to: Int }
+
+/// A value as it is written, with the bytes it stands in.
+type Node = | Leaf(Toml, Int, Int) | Elements(List<Node>, Int, Int) | Members(List<Pair>, Int, Int)
+
+type Pair = { key: List<Part>, value: Node }
+
+/// A line of a document that says something: a key and its value, or a header, which is an array
+/// of tables' where the flag is set.
+type Item = | Assign(Pair) | Section(List<Part>, Bool, Int, Int)
+
+type Text = { text: String, next: Int }
+
+type Piece = { bytes: Bytes, next: Int }
+
+type Header = { parts: List<Part>, array: Bool, to: Int }
+
+fn blank() -> Bytes = b" \t"
+
+fn bare() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+/// What a number, a boolean, a date or a time is written of.
+fn word() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-_.:"
+
+fn digits() -> Bytes = b"0123456789"
+
+/// Every control character but the tab.
+fn controls() -> Bytes =
+  b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+fn basic_stops() -> Bytes =
+  b"\"\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+fn literal_stops() -> Bytes =
+  b"'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+/// A multi-line string holds a line feed as it holds a tab.
+fn long_basic_stops() -> Bytes =
+  b"\"\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+fn long_literal_stops() -> Bytes =
+  b"'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+fn blanks(src: Bytes, i: Int) -> Int / {abort.raise} = scan(src, i, blank())
+
+fn cut(src: Bytes, from: Int, to: Int) -> String / {abort.raise} =
+  string_of_bytes(bytes_slice(src, from, to))
+
+fn start_of(node: Node) -> Int =
+  match node { Leaf(_, from, _) -> from, Elements(_, from, _) -> from, Members(_, from, _) -> from }
+
+fn end_of(node: Node) -> Int =
+  match node { Leaf(_, _, to) -> to, Elements(_, _, to) -> to, Members(_, _, to) -> to }
+
+/// The items of a document from `i`. `under` is how many parts the header above has. Each line
+/// takes a byte at least, so the bytes bound them: `left`.
+fn expressions(
+  src: Bytes,
+  i: Int,
+  depth: Int,
+  under: Int,
+  acc: List<Item>,
+  left: Int,
+) -> List<Item> / {fault.at, abort.raise} = {
+  let at = blanks(src, i);
+  let c = peek(src, at);
+  if c < 0 { acc }
+  else if left <= 0 { panic("more lines than bytes") }
+  else if c == 10 { expressions(src, at + 1, depth, under, acc, left - 1) }
+  else if c == 13 || c == 35 { expressions(src, line_end(src, at), depth, under, acc, left - 1) }
+  else if c == 91 {
+    let head = header(src, at, depth);
+    expressions(
+      src,
+      line_end(src, head.to),
+      depth,
+      len(head.parts),
+      push(acc, Section(head.parts, head.array, at, head.to)),
+      left - 1,
+    )
+  } else {
+    let made = pair(src, at, depth - under, []);
+    expressions(
+      src,
+      line_end(src, end_of(made.value)),
+      depth,
+      under,
+      push(acc, Assign(made)),
+      left - 1,
+    )
+  }
+}
+
+/// Past what may end a line: blanks, a comment, and the newline. The end of the input ends one too.
+fn line_end(src: Bytes, i: Int) -> Int / {fault.at, abort.raise} = {
+  let at = blanks(src, i);
+  let end = if peek(src, at) == 35 { comment_end(src, at) } else { at };
+  let c = peek(src, end);
+  if c < 0 { end }
+  else if c == 10 { end + 1 }
+  else if c == 13 { if peek(src, end + 1) == 10 { end + 2 } else { stop(end, Control(13)) } }
+  else { stop(end, Expected("the line to end here")) }
+}
+
+/// Where the comment starting at `i` ends, which is where its line does.
+fn comment_end(src: Bytes, i: Int) -> Int / {fault.at, abort.raise} = {
+  let end = scan_until(src, i + 1, controls());
+  let c = peek(src, end);
+  if c < 0 || c == 10 || (c == 13 && peek(src, end + 1) == 10) { end }
+  else { stop(end, Control(c)) }
+}
+
+fn header(src: Bytes, i: Int, depth: Int) -> Header / {fault.at, abort.raise} = {
+  let array = peek(src, i + 1) == 91;
+  let named = header_parts(src, blanks(src, if array { i + 2 } else { i + 1 }), depth, []);
+  let close = blanks(src, named.next);
+  if peek(src, close) != 93 { stop(close, Expected("`]` to close a table's header")) }
+  else if !array { { parts: named.parts, array: false, to: close + 1 } }
+  else if peek(src, close + 1) != 93 {
+    stop(close + 1, Expected("`]]` to close the header of an array of tables"))
+  } else { { parts: named.parts, array: true, to: close + 2 } }
+}
+
+type Named = { parts: List<Part>, next: Int }
+
+/// A header's key. `room` is how many more parts it may have.
+fn header_parts(src: Bytes, i: Int, room: Int, acc: List<Part>) -> Named / {fault.at, abort.raise} =
+  if room <= 0 { stop(i, TooDeep) } else {
+    let p = part(src, i);
+    let dot = blanks(src, p.to);
+    if peek(src, dot) == 46 { header_parts(src, blanks(src, dot + 1), room - 1, push(acc, p)) }
+    else { { parts: push(acc, p), next: p.to } }
+  }
+
+fn part(src: Bytes, i: Int) -> Part / {fault.at, abort.raise} = {
+  let c = peek(src, i);
+  if c == 34 {
+    let read = basic(src, i + 1);
+    { name: read.text, from: i, to: read.next }
+  } else if c == 39 {
+    let read = literal(src, i + 1);
+    { name: read.text, from: i, to: read.next }
+  } else {
+    let end = scan(src, i, bare());
+    if end == i { stop(i, Expected("a key")) } else { { name: cut(src, i, end), from: i, to: end } }
+  }
+}
+
+/// A key, `=` and a value. `room` is how many more tables and arrays the value may sit inside, and
+/// each part of the key before its last is one.
+fn pair(src: Bytes, i: Int, room: Int, acc: List<Part>) -> Pair / {fault.at, abort.raise} = {
+  let p = part(src, i);
+  let after = blanks(src, p.to);
+  let c = peek(src, after);
+  if c == 46 {
+    if room <= 0 { stop(after, TooDeep) }
+    else { pair(src, blanks(src, after + 1), room - 1, push(acc, p)) }
+  } else if c == 61 { { key: push(acc, p), value: node(src, blanks(src, after + 1), room) } }
+  else { stop(after, Expected("`=` after a key")) }
+}
+
+fn node(src: Bytes, i: Int, room: Int) -> Node / {fault.at, abort.raise} = {
+  let c = peek(src, i);
+  if c == 34 {
+    let read = if peek(src, i + 1) == 34 && peek(src, i + 2) == 34 { long_basic(src, i + 3) }
+    else { basic(src, i + 1) };
+    Leaf(String(read.text), i, read.next)
+  } else if c == 39 {
+    let read = if peek(src, i + 1) == 39 && peek(src, i + 2) == 39 { long_literal(src, i + 3) }
+    else { literal(src, i + 1) };
+    Leaf(String(read.text), i, read.next)
+  } else if c == 91 {
+    if room <= 0 { stop(i, TooDeep) }
+    else { elements(src, i, gap(src, i + 1, bytes_len(src) - i), room - 1, [], bytes_len(src) - i) }
+  } else if c == 123 {
+    if room <= 0 { stop(i, TooDeep) } else {
+      let first = blanks(src, i + 1);
+      if peek(src, first) == 125 { Members([], i, first + 1) }
+      else { members(src, i, first, room - 1, [], bytes_len(src) - i) }
+    }
+  } else { scalar(src, i) }
+}
+
+/// Past the blanks, newlines and comments that may stand between an array's values. Each comment
+/// and each carriage return takes a byte, so the bytes bound them: `left`.
+fn gap(src: Bytes, i: Int, left: Int) -> Int / {fault.at, abort.raise} = {
+  let at = scan(src, i, b" \t\n");
+  let c = peek(src, at);
+  if left <= 0 { panic("more comments than bytes") }
+  else if c == 35 { gap(src, comment_end(src, at), left - 1) } else if c == 13 {
+    if peek(src, at + 1) == 10 { gap(src, at + 2, left - 1) } else { stop(at, Control(13)) }
+  } else { at }
+}
+
+/// An array's values from `i`, the first or the one after a comma. `left` as in `expressions`.
+fn elements(
+  src: Bytes,
+  open: Int,
+  i: Int,
+  room: Int,
+  acc: List<Node>,
+  left: Int,
+) -> Node / {fault.at, abort.raise} =
+  if peek(src, i) == 93 { Elements(acc, open, i + 1) }
+  else if left <= 0 { panic("more values than bytes") } else {
+    let read = node(src, i, room);
+    let after = gap(src, end_of(read), bytes_len(src) - i);
+    let c = peek(src, after);
+    if c == 44 {
+      elements(src, open, gap(src, after + 1, bytes_len(src) - i), room, push(acc, read), left - 1)
+    } else if c == 93 { Elements(push(acc, read), open, after + 1) }
+    else { stop(after, Expected("`,` or `]` in an array")) }
+  }
+
+/// An inline table's keys from `i`, the first or the one after a comma.
+fn members(
+  src: Bytes,
+  open: Int,
+  i: Int,
+  room: Int,
+  acc: List<Pair>,
+  left: Int,
+) -> Node / {fault.at, abort.raise} =
+  if left <= 0 { panic("more keys than bytes") } else {
+    let made = pair(src, i, room, []);
+    let after = blanks(src, end_of(made.value));
+    let c = peek(src, after);
+    if c == 44 { members(src, open, blanks(src, after + 1), room, push(acc, made), left - 1) }
+    else if c == 125 { Members(push(acc, made), open, after + 1) }
+    else { stop(after, Expected("`,` or `}` in an inline table")) }
+  }
+
+// --- Syntax: strings --------------------------------------------------------
+
+/// A basic string from its first byte to its closing quote: one slice where it has no escape.
+fn basic(src: Bytes, i: Int) -> Text / {fault.at, abort.raise} = {
+  let at = scan_until(src, i, basic_stops());
+  if peek(src, at) == 34 { { text: cut(src, i, at), next: at + 1 } }
+  else { basic_pieces(src, i, [], bytes_len(src) - i) }
+}
+
+/// One scan to each escape, which takes two bytes at least, so the bytes bound them: `left`.
+fn basic_pieces(src: Bytes, i: Int, acc: List<Bytes>, left: Int) -> Text / {fault.at, abort.raise} = {
+  let at = scan_until(src, i, basic_stops());
+  let c = peek(src, at);
+  let so_far = push(acc, bytes_slice(src, i, at));
+  if c == 34 { { text: string_of_bytes(bytes_concat_all(so_far)), next: at + 1 } } else if c == 92 {
+    if left <= 0 { panic("more escapes than bytes") } else {
+      let escaped = escape(src, at + 1);
+      basic_pieces(src, escaped.next, push(so_far, escaped.bytes), left - 1)
+    }
+  } else if c < 0 || c == 10 || c == 13 { stop(at, Expected("`\"` to close a string on its line")) }
+  else { stop(at, Control(c)) }
+}
+
+fn literal(src: Bytes, i: Int) -> Text / {fault.at, abort.raise} = {
+  let at = scan_until(src, i, literal_stops());
+  let c = peek(src, at);
+  if c == 39 { { text: cut(src, i, at), next: at + 1 } }
+  else if c < 0 || c == 10 || c == 13 { stop(at, Expected("`'` to close a string on its line")) }
+  else { stop(at, Control(c)) }
+}
+
+/// Past the newline a multi-line string may open with, which is no part of it.
+fn opened(src: Bytes, i: Int) -> Int / {abort.raise} = {
+  let c = peek(src, i);
+  if c == 10 { i + 1 } else if c == 13 && peek(src, i + 1) == 10 { i + 2 } else { i }
+}
+
+fn long_basic(src: Bytes, i: Int) -> Text / {fault.at, abort.raise} =
+  long_basic_pieces(src, opened(src, i), [], bytes_len(src) - i + 1)
+
+/// A run of quotes shorter than three is text, and the first three of a longer one close the
+/// string after at most two of its own. Each piece before the last takes a byte at least, so the
+/// bytes and one more bound them: `left`.
+fn long_basic_pieces(
+  src: Bytes,
+  i: Int,
+  acc: List<Bytes>,
+  left: Int,
+) -> Text / {fault.at, abort.raise} = {
+  let at = scan_until(src, i, long_basic_stops());
+  let c = peek(src, at);
+  let so_far = push(acc, bytes_slice(src, i, at));
+  if left <= 0 { panic("more pieces than bytes") } else if c == 34 {
+    let run = scan(src, at, b"\"") - at;
+    if run < 3 {
+      long_basic_pieces(src, at + run, push(so_far, bytes_slice(src, at, at + run)), left - 1)
+    } else {
+      let kept = min(run, 5) - 3;
+      {
+        text: string_of_bytes(bytes_concat_all(push(so_far, bytes_slice(src, at, at + kept)))),
+        next: at + kept + 3,
+      }
+    }
+  } else if c == 92 {
+    let after = blanks(src, at + 1);
+    let d = peek(src, after);
+    if d == 10 || (d == 13 && peek(src, after + 1) == 10) {
+      long_basic_pieces(src, blank_lines(src, after, bytes_len(src) - after), so_far, left - 1)
+    } else {
+      let escaped = escape(src, at + 1);
+      long_basic_pieces(src, escaped.next, push(so_far, escaped.bytes), left - 1)
+    }
+  } else if c == 13 {
+    if peek(src, at + 1) == 10 { long_basic_pieces(src, at + 2, push(so_far, b"\n"), left - 1) }
+    else { stop(at, Control(13)) }
+  } else if c < 0 { stop(at, Expected("`\"\"\"` to close a string")) }
+  else { stop(at, Control(c)) }
+}
+
+/// Past the blanks and newlines a backslash at a line's end swallows.
+fn blank_lines(src: Bytes, i: Int, left: Int) -> Int / {abort.raise} = {
+  let at = scan(src, i, b" \t\n");
+  if left > 0 && peek(src, at) == 13 && peek(src, at + 1) == 10 {
+    blank_lines(src, at + 2, left - 1)
+  } else { at }
+}
+
+fn long_literal(src: Bytes, i: Int) -> Text / {fault.at, abort.raise} =
+  long_literal_pieces(src, opened(src, i), [], bytes_len(src) - i + 1)
+
+fn long_literal_pieces(
+  src: Bytes,
+  i: Int,
+  acc: List<Bytes>,
+  left: Int,
+) -> Text / {fault.at, abort.raise} = {
+  let at = scan_until(src, i, long_literal_stops());
+  let c = peek(src, at);
+  let so_far = push(acc, bytes_slice(src, i, at));
+  if left <= 0 { panic("more pieces than bytes") } else if c == 39 {
+    let run = scan(src, at, b"'") - at;
+    if run < 3 {
+      long_literal_pieces(src, at + run, push(so_far, bytes_slice(src, at, at + run)), left - 1)
+    } else {
+      let kept = min(run, 5) - 3;
+      {
+        text: string_of_bytes(bytes_concat_all(push(so_far, bytes_slice(src, at, at + kept)))),
+        next: at + kept + 3,
+      }
+    }
+  } else if c == 13 {
+    if peek(src, at + 1) == 10 { long_literal_pieces(src, at + 2, push(so_far, b"\n"), left - 1) }
+    else { stop(at, Control(13)) }
+  } else if c < 0 { stop(at, Expected("`'''` to close a string")) }
+  else { stop(at, Control(c)) }
+}
+
+/// The bytes an escape stands for; `i` is the byte after its backslash.
+fn escape(src: Bytes, i: Int) -> Piece / {fault.at, abort.raise} = {
+  let c = peek(src, i);
+  if c == 34 { { bytes: b"\"", next: i + 1 } }
+  else if c == 92 { { bytes: b"\\", next: i + 1 } }
+  else if c == 98 { { bytes: b"\x08", next: i + 1 } }
+  else if c == 102 { { bytes: b"\x0c", next: i + 1 } }
+  else if c == 110 { { bytes: b"\n", next: i + 1 } }
+  else if c == 114 { { bytes: b"\r", next: i + 1 } }
+  else if c == 116 { { bytes: b"\t", next: i + 1 } }
+  else if c == 117 { scalar_escape(src, i + 1, 4) }
+  else if c == 85 { scalar_escape(src, i + 1, 8) }
+  else { stop(i - 1, Escape) }
+}
+
+fn scalar_escape(src: Bytes, i: Int, count: Int) -> Piece / {fault.at, abort.raise} = {
+  let point = fold(range(i, i + count), 0, |so_far: Int, at: Int| {
+    let digit = hex_value(peek(src, at));
+    if so_far < 0 || digit < 0 { -1 } else { so_far * 16 + digit }
+  });
+  match char_of_int(point) {
+    Some(c) -> { bytes: bytes_of_string(string_of_chars([c])), next: i + count },
+    None -> stop(i - 2, Escape),
+  }
+}
+
+// --- Syntax: numbers, booleans, dates and times -----------------------------
+
+/// A value written of `word`'s bytes, and a date and a time with a space between them.
+fn scalar(src: Bytes, i: Int) -> Node / {fault.at, abort.raise} = {
+  let end = scan(src, i, word());
+  if end == i { stop(i, Expected("a value")) }
+  else if end - i == 10 && is_dated(src, i) && peek(src, end) == 32
+      && is_digit(peek(src, end + 1)) {
+    let time_end = scan(src, end + 1, word());
+    Leaf(
+      moment(
+        bytes_concat_all([bytes_slice(src, i, end), b"T", bytes_slice(src, end + 1, time_end)]),
+        i,
+      ),
+      i,
+      time_end,
+    )
+  } else {
+    let written = bytes_slice(src, i, end);
+    Leaf(
+      if written == b"true" { Boolean(true) }
+      else if written == b"false" { Boolean(false) }
+      else if is_dated(src, i) { moment(written, i) }
+      else if end - i >= 3 && bytes_at(written, 2) == 58 { time_of_day(written, i) }
+      else { number(written, i) },
+      i,
+      end,
+    )
+  }
+}
+
+/// Whether four digits and a `-` stand at `i`, as a date opens.
+fn is_dated(src: Bytes, i: Int) -> Bool / {abort.raise} =
+  scan(src, i, digits()) == i + 4 && peek(src, i + 4) == 45
+
+/// `written` with the digits of a fraction past its ninth dropped; the `.` would stand at `at`.
+fn to_nanos(written: Bytes, at: Int) -> Bytes / {abort.raise} =
+  if peek(written, at) != 46 { written } else {
+    let end = scan(written, at + 1, digits());
+    if end - at - 1 <= 9 { written } else {
+      bytes_concat(bytes_slice(written, 0, at + 10), bytes_slice(written, end, bytes_len(written)))
+    }
+  }
+
+fn dated<a>(read: Result<a, date::Refusal>, at: Int, make: (a) -> Toml) -> Toml / {fault.at} =
+  match read { Ok(made) -> make(made), Err(e) -> stop(at + e.offset, NoSuchTime(e.message)) }
+
+/// A date, or a date and a time with a `T` between them and an offset or none.
+fn moment(written: Bytes, at: Int) -> Toml / {fault.at, abort.raise} =
+  if bytes_len(written) == 10 {
+    dated(date::literal(string_of_bytes(written)), at, |d: date::Date| LocalDate(d))
+  } else {
+    let kept = to_nanos(written, 19);
+    let text = string_of_bytes(kept);
+    if scan_until(kept, min(19, bytes_len(kept)), b"Zz+-") < bytes_len(kept) {
+      dated(date::rfc3339_literal(text), at, |o: date::OffsetDateTime| OffsetDateTime(o))
+    } else { dated(date::date_time_literal(text), at, |dt: date::DateTime| LocalDateTime(dt)) }
+  }
+
+fn time_of_day(written: Bytes, at: Int) -> Toml / {fault.at, abort.raise} =
+  dated(date::time_literal(string_of_bytes(to_nanos(written, 8))), at, |time: date::Time|
+    LocalTime(time))
+
+fn number(written: Bytes, at: Int) -> Toml / {fault.at, abort.raise} = {
+  let first = bytes_at(written, 0);
+  let signed = first == 43 || first == 45;
+  let body = if signed { bytes_slice(written, 1, bytes_len(written)) } else { written };
+  if body == b"inf" { Float(if first == 45 { neg_infinity() } else { infinity() }) }
+  else if body == b"nan" { Float(nan()) }
+  else if bytes_starts_with(written, b"0x") { based(written, at, 16, b"0123456789abcdefABCDEF_") }
+  else if bytes_starts_with(written, b"0o") { based(written, at, 8, b"01234567_") }
+  else if bytes_starts_with(written, b"0b") { based(written, at, 2, b"01_") }
+  else if signed || is_digit(first) { decimal(written, body, first == 45, at) }
+  else { stop(at, Expected("a value")) }
+}
+
+/// Whether the digits are grouped as TOML allows: a digit on either side of each `_`.
+fn is_grouped(group: Bytes) -> Bool =
+  bytes_len(group) > 0 && !bytes_starts_with(group, b"_") && !bytes_ends_with(group, b"_")
+    && !bytes::contains(group, b"__")
+
+fn misspelt<a>(at: Int) -> a / {fault.at} =
+  stop(at, Expected("a number with no leading zero and a digit on each side of every `_` and `.`"))
+
+/// An integer in hexadecimal, octal or binary, which has no sign.
+fn based(written: Bytes, at: Int, base: Int, allowed: Bytes) -> Toml / {fault.at, abort.raise} = {
+  let n = bytes_len(written);
+  if scan(written, 2, allowed) != n || !is_grouped(bytes_slice(written, 2, n)) { misspelt(at) }
+  else {
+    let read = fold(range(2, n), Some(0), |so_far: Option<Int>, i: Int|
+      if bytes_at(written, i) == 95 { so_far } else {
+        match so_far {
+          None -> None,
+          Some(v) -> match checked_mul(v, base) {
+            Some(scaled) -> checked_add(scaled, hex_value(bytes_at(written, i))),
+            None -> None,
+          },
+        }
+      });
+    match read { Some(v) -> Integer(v), None -> stop(at, TooWide) }
+  }
+}
+
+/// A decimal integer, or a float: `body` is `written` without its sign.
+fn decimal(written: Bytes, body: Bytes, negative: Bool, at: Int) -> Toml / {fault.at, abort.raise} = {
+  let n = bytes_len(body);
+  let whole_end = scan(body, 0, b"0123456789_");
+  let whole = bytes_slice(body, 0, whole_end);
+  if !is_grouped(whole) || (whole_end > 1 && bytes_at(body, 0) == 48) { misspelt(at) }
+  else if whole_end == n {
+    let plain = bytes::replace(whole, b"_", b"");
+    match bytes::int_of_ascii(if negative { bytes_concat(b"-", plain) } else { plain }) {
+      Some(v) -> Integer(v),
+      None -> stop(at, TooWide),
+    }
+  } else {
+    let fraction_end = if peek(body, whole_end) == 46 { scan(body, whole_end + 1, b"0123456789_") }
+    else { whole_end };
+    let e = peek(body, fraction_end);
+    let sign = peek(body, fraction_end + 1);
+    let exponent_from = if e != 101 && e != 69 { fraction_end }
+    else if sign == 43 || sign == 45 { fraction_end + 2 }
+    else { fraction_end + 1 };
+    let exponent_end = if exponent_from == fraction_end { fraction_end }
+    else { scan(body, exponent_from, b"0123456789_") };
+    if exponent_end != n
+        || (fraction_end > whole_end && !is_grouped(bytes_slice(body, whole_end + 1, fraction_end)))
+        || (exponent_from > fraction_end
+        && !is_grouped(bytes_slice(body, exponent_from, exponent_end))) { misspelt(at) } else {
+      match float_of_string(string_of_bytes(bytes::replace(written, b"_", b""))) {
+        Some(f) -> if is_infinite(f) { stop(at, TooWide) } else { Float(f) },
+        None -> misspelt(at),
+      }
+    }
+  }
+}
+
+// --- Meaning ----------------------------------------------------------------
+
+/// How a table came to be: named by a header, implied by a longer header, or made by a dotted key.
+type How = | Headed | Implied | Dotted
+
+/// A table while its document is read: its keys, and the order they came in.
+type Building = { how: How, keys: Map<String, Shape>, order: List<String> }
+
+type Shape =
+  /// A value no later line may add to.
+  | Done(Toml)
+  | Open(Building)
+  /// An array of tables: the ones a later `[[header]]` has closed, and the last, which a header
+  /// below it reads and adds to.
+  | Rows(List<Building>, Building)
+
+fn fresh(how: How) -> Building = { how: how, keys: map_new(), order: [] }
+
+/// `b` with a key it does not hold yet. The record is taken apart first, so each append is to a
+/// list and a map nothing else holds.
+fn with_new(b: Building, name: String, shape: Shape) -> Building = {
+  let { how, keys, order } = b;
+  { how: how, keys: map_insert(keys, name, shape), order: push(order, name) }
+}
+
+/// `b` with what a key it holds stands for changed, in place.
+fn with_changed<| e>(b: Building, name: String, change: (Shape) -> Shape / e) -> Building / e = {
+  let { how, keys, order } = b;
+  { how: how, keys: map_update(keys, name, change), order: order }
+}
+
+/// What the items read so far define: the tables, the names and the path of the table the last
+/// header opened, and the path of each header's table in the order the headers came.
+type Reading = {
+  root: Building,
+  section: List<String>,
+  address: List<Step>,
+  sections: List<List<Step>>,
+}
+
+type Meaning = { value: Toml, sections: List<List<Step>> }
+
+/// The value the items define, each held to what the items before it defined, and the path of
+/// each header's table.
+fn meaning(items: List<Item>) -> Meaning / {fault.at, abort.raise} = {
+  let read = fold(
+    items,
+    { root: fresh(Headed), section: [], address: [], sections: [] },
+    |r: Reading, item: Item| {
+      let { root, section, address, sections } = r;
+      match item {
+        Assign(made) ->
+          {
+            root: assigned(root, section, address, made),
+            section: section,
+            address: address,
+            sections: sections,
+          },
+        Section(parts, array, _, _) -> {
+          let opened = headed(root, parts, array, []);
+          let names = map(parts, |p: Part| p.name);
+          let reached = address_of(opened, names, []);
+          { root: opened, section: names, address: reached, sections: push(sections, reached) }
+        },
+      }
+    },
+  );
+  { value: frozen(read.root), sections: read.sections }
+}
+
+/// The path to the table the names lead to, an array of tables read at its last element.
+fn address_of(b: Building, names: List<String>, above: List<Step>) -> List<Step> =
+  match names {
+    [] -> above,
+    [name, ..rest] -> match map_get(b.keys, name) {
+      Some(Open(child)) -> address_of(child, rest, push(above, Key(name))),
+      Some(Rows(earlier, last)) ->
+        address_of(last, rest, push(push(above, Key(name)), Index(len(earlier)))),
+      _ -> push(above, Key(name)),
+    },
+  }
+
+/// The path from `above` through the parts of `key` up to the one that starts at `upto`.
+fn steps_to(above: List<Step>, key: List<Part>, upto: Int) -> List<Step> =
+  fold(key, above, |acc: List<Step>, p: Part|
+    if p.from <= upto { push(acc, Key(p.name)) } else { acc })
+
+/// `b` with the pair defined in the table `down` leads to, which is the section's, at `address`.
+fn assigned(
+  b: Building,
+  down: List<String>,
+  address: List<Step>,
+  made: Pair,
+) -> Building / {fault.at, abort.raise} =
+  match down {
+    [] -> defined(b, made.key, made, address),
+    [name, ..rest] ->
+      with_changed(b, name, |shape: Shape|
+        match shape {
+          Open(child) -> Open(assigned(child, rest, address, made)),
+          Rows(earlier, last) -> Rows(earlier, assigned(last, rest, address, made)),
+          Done(v) -> Done(v),
+        }),
+  }
+
+/// `b` with the pair's value under its key. A part before the last makes its table, or adds to
+/// one only dotted keys of this section have made or a header has only implied. `above` is the
+/// path to the table the key is written in.
+fn defined(
+  b: Building,
+  parts: List<Part>,
+  made: Pair,
+  above: List<Step>,
+) -> Building / {fault.at, abort.raise} =
+  match parts {
+    [] -> b,
+    [last] -> if map_contains(b.keys, last.name) {
+      stop(last.from, Duplicate(steps_to(above, made.key, last.from)))
+    } else {
+      with_new(
+        b,
+        last.name,
+        Done(match made.value {
+          Leaf(v, _, _) -> v,
+          held -> settled(held, steps_to(above, made.key, last.from)),
+        }),
+      )
+    },
+    [p, ..rest] -> if !map_contains(b.keys, p.name) {
+      with_new(b, p.name, Open(defined(fresh(Dotted), rest, made, above)))
+    } else {
+      with_changed(b, p.name, |shape: Shape|
+        match shape {
+          Open({ how, keys, order }) -> if how == Headed {
+            stop(p.from, Closed(steps_to(above, made.key, p.from)))
+          } else { Open(defined({ how: Dotted, keys: keys, order: order }, rest, made, above)) },
+          _ -> stop(p.from, Closed(steps_to(above, made.key, p.from))),
+        })
+    },
+  }
+
+/// `b` with the table a header names opened: made, or defined where it was only implied, or one
+/// more of its array. `above` is the path to `b`.
+fn headed(
+  b: Building,
+  parts: List<Part>,
+  array: Bool,
+  above: List<Step>,
+) -> Building / {fault.at, abort.raise} =
+  match parts {
+    [] -> b,
+    [last] -> if !map_contains(b.keys, last.name) {
+      with_new(b, last.name, if array { Rows([], fresh(Headed)) } else { Open(fresh(Headed)) })
+    } else {
+      with_changed(b, last.name, |shape: Shape|
+        match shape {
+          Open({ how, keys, order }) -> if !array && how == Implied {
+            Open({ how: Headed, keys: keys, order: order })
+          } else { stop(last.from, Duplicate(push(above, Key(last.name)))) },
+          Rows(earlier, row) -> if array { Rows(push(earlier, row), fresh(Headed)) }
+          else { stop(last.from, Duplicate(push(above, Key(last.name)))) },
+          Done(v) ->
+            stop(last.from, match v {
+              Table(_) -> Closed(push(above, Key(last.name))),
+              Array(_) -> Closed(push(above, Key(last.name))),
+              _ -> Duplicate(push(above, Key(last.name))),
+            }),
+        })
+    },
+    [p, ..rest] -> if !map_contains(b.keys, p.name) {
+      with_new(b, p.name, Open(headed(fresh(Implied), rest, array, push(above, Key(p.name)))))
+    } else {
+      with_changed(b, p.name, |shape: Shape|
+        match shape {
+          Open(child) -> Open(headed(child, rest, array, push(above, Key(p.name)))),
+          Rows(earlier, row) ->
+            Rows(
+              earlier,
+              headed(row, rest, array, push(push(above, Key(p.name)), Index(len(earlier)))),
+            ),
+          Done(_) -> stop(p.from, Closed(push(above, Key(p.name)))),
+        })
+    },
+  }
+
+/// The value a written array or inline table means, the table held to the rules a section is.
+/// `above` is the path to it.
+fn settled(written: Node, above: List<Step>) -> Toml / {fault.at, abort.raise} =
+  match written {
+    Leaf(v, _, _) -> v,
+    Elements(nodes, _, _) ->
+      Array(
+        fold(nodes, [], |acc: List<Toml>, each: Node| {
+          let meant = match each {
+            Leaf(v, _, _) -> v,
+            held -> settled(held, push(above, Index(len(acc)))),
+          };
+          push(acc, meant)
+        }),
+      ),
+    Members(pairs, _, _) ->
+      frozen(
+        fold(pairs, fresh(Headed), |b: Building, made: Pair| defined(b, made.key, made, above)),
+      ),
+  }
+
+fn frozen(b: Building) -> Toml =
+  Table(
+    fold(b.order, [], |acc: List<Entry>, name: String|
+      match map_get(b.keys, name) {
+        Some(shape) -> push(acc, { key: name, value: shaped(shape) }),
+        None -> acc,
+      }),
+  )
+
+fn shaped(shape: Shape) -> Toml =
+  match shape {
+    Done(v) -> v,
+    Open(b) -> frozen(b),
+    Rows(earlier, last) -> Array(push(map(earlier, frozen), frozen(last))),
+  }
+
+// --- Reading ----------------------------------------------------------------
+
+fn syntax(src: Bytes, limits: Limits) -> List<Item> / {fault.at, abort.raise} =
+  if bytes_len(src) > limits.bytes { stop(max(limits.bytes, 0), TooLong) }
+  else if !bytes_is_utf8(src) { stop(first_invalid(src, 0, bytes_len(src)), NotUtf8) }
+  else if bytes_starts_with(src, b"\xef\xbb\xbf") {
+    stop(0, Expected("a document with no byte order mark"))
+  } else { expressions(src, 0, limits.depth, 0, [], bytes_len(src) + 1) }
+
+/// Where the first byte that is no part of a UTF-8 character stands. Each character takes a byte,
+/// so the bytes bound them: `left`.
+fn first_invalid(src: Bytes, i: Int, left: Int) -> Int / {abort.raise} = {
+  let lead = peek(src, i);
+  let width = if lead < 128 { 1 } else if lead < 224 { 2 } else if lead < 240 { 3 } else { 4 };
+  if lead < 0 || left <= 0 || i + width > bytes_len(src)
+      || !bytes_is_utf8(bytes_slice(src, i, i + width)) { i }
+  else { first_invalid(src, i + width, left - 1) }
+}
+
+/// A line and a column of a text, both from 1, the column counted in characters.
+pub type Place = new { line: Int, column: Int }
+
+/// Where the byte at `offset` stands.
+fn place_of(src: Bytes, offset: Int) -> Place = {
+  let n = bytes_len(src);
+  let upto = if offset < 0 { 0 } else if offset > n { n } else { offset };
+  let before = handle { bytes_slice(src, 0, upto) } with { abort.raise(_) -> src };
+  let lines = handle { bytes_split(before, b"\n") } with { abort.raise(_) -> [before] };
+  let last = match list_at(lines, len(lines) - 1) { Some(line) -> line, None -> b"" };
+  { line: len(lines), column: string_len(string_of_bytes_lossy(last)) + 1 }
+}
+
+fn placed(src: Bytes, offset: Int, why: Why) -> Refusal = {
+  let stood = place_of(src, offset);
+  { offset: offset, line: stood.line, column: stood.column, why: why }
+}
+
+fn defect(said: String) -> Refusal = { offset: 0, line: 1, column: 1, why: Defect(said) }
+
+/// The value a document holds, raising `toml.refused` where `parse` answers `Err`.
+pub fn read(src: Bytes, limits: Limits) -> Toml / {toml.refused} = document(src, limits).value
+
+/// The value a document holds, or why it is none within the limits.
+pub fn parse(src: Bytes, limits: Limits) -> Result<Toml, Refusal> = try { read(src, limits) }
+
+/// `parse` over a string's bytes.
+pub fn parse_string(src: String, limits: Limits) -> Result<Toml, Refusal> =
+  parse(bytes_of_string(src), limits)
+
+// --- Writing ----------------------------------------------------------------
+
+/// The value as TOML writes it: a table as a document, and any other value as it stands to the
+/// right of a `=`.
+pub fn to_bytes(t: Toml) -> Bytes =
+  handle {
+    bytes_concat_all(match once_keyed(t) {
+      Table(entries) -> put_table([], b"", entries),
+      plain -> put_value([], plain, false),
+    })
+  } with {
+    abort.raise(_) -> b"",
+  }
+
+/// Whether no table in the value holds a key twice.
+fn is_once_keyed(t: Toml) -> Bool =
+  match t {
+    Table(entries) ->
+      map_len(map_of_entries(entries)) == len(entries)
+        && all(entries, |e: Entry| is_once_keyed(e.value)),
+    Array(items) -> all(items, is_once_keyed),
+    _ -> true,
+  }
+
+/// The value with each table's keys held once, which is what a writer may write.
+fn once_keyed(t: Toml) -> Toml = if is_once_keyed(t) { t } else { each_unique(t) }
+
+fn each_unique(t: Toml) -> Toml =
+  match t {
+    Table(entries) ->
+      Table(unique(map(entries, |e: Entry| { key: e.key, value: each_unique(e.value) }))),
+    Array(items) -> Array(map(items, each_unique)),
+    _ -> t,
+  }
+
+/// `to_bytes` as a string.
+pub fn to_string(t: Toml) -> String = string_of_bytes_lossy(to_bytes(t))
+
+/// The value as it stands to the right of a `=`, on one line: a table as an inline table.
+pub fn inline(t: Toml) -> String = string_of_bytes_lossy(inline_bytes(t))
+
+fn inline_bytes(t: Toml) -> Bytes =
+  handle { bytes_concat_all(put_value([], once_keyed(t), false)) } with { abort.raise(_) -> b"" }
+
+fn is_table(t: Toml) -> Bool = match t { Table(_) -> true, _ -> false }
+
+/// Whether the value is written under headers: a table, or an array of nothing but tables.
+fn is_section(t: Toml) -> Bool =
+  match t { Table(_) -> true, Array(items) -> len(items) > 0 && all(items, is_table), _ -> false }
+
+/// A table's own keys, then the sections under it. `name` is its header's, empty at the root.
+fn put_table(out: List<Bytes>, name: Bytes, entries: List<Entry>) -> List<Bytes> / {abort.raise} = {
+  let plain = fold(entries, out, |o: List<Bytes>, e: Entry|
+    if is_section(e.value) { o } else { push(put_member(o, e, true), b"\n") });
+  fold(entries, plain, |o: List<Bytes>, e: Entry| put_sections(o, name, e))
+}
+
+fn put_sections(out: List<Bytes>, parent: Bytes, e: Entry) -> List<Bytes> / {abort.raise} =
+  match e.value {
+    Table(entries) -> put_section(out, header_name(parent, e.key), false, entries),
+    Array(items) -> if is_section(e.value) {
+      let name = header_name(parent, e.key);
+      fold(items, out, |o: List<Bytes>, item: Toml|
+        match item { Table(entries) -> put_section(o, name, true, entries), _ -> o })
+    } else { out },
+    _ -> out,
+  }
+
+/// A table under its header, which is left out where the headers of the tables inside it imply it.
+fn put_section(
+  out: List<Bytes>,
+  name: Bytes,
+  array: Bool,
+  entries: List<Entry>,
+) -> List<Bytes> / {abort.raise} = {
+  let stated = array || len(entries) == 0 || any(entries, |e: Entry| !is_section(e.value));
+  put_table(
+    if !stated { out } else {
+      push(
+        if len(out) == 0 { out } else { push(out, b"\n") },
+        bytes_concat_all(if array { [b"[[", name, b"]]\n"] } else { [b"[", name, b"]\n"] }),
+      )
+    },
+    name,
+    entries,
+  )
+}
+
+fn header_name(parent: Bytes, key: String) -> Bytes / {abort.raise} =
+  if bytes_len(parent) == 0 { key_bytes(key) }
+  else { bytes_concat_all([parent, b".", key_bytes(key)]) }
+
+/// A key bare where it can be, and otherwise as a string on one line.
+fn key_bytes(name: String) -> Bytes / {abort.raise} = {
+  let raw = bytes_of_string(name);
+  if bytes_len(raw) > 0 && scan(raw, 0, bare()) == bytes_len(raw) { raw }
+  else { bytes_concat_all(put_string([], raw, false)) }
+}
+
+fn key_text(name: String) -> String =
+  handle { string_of_bytes(key_bytes(name)) } with { abort.raise(_) -> name }
+
+fn put_member(out: List<Bytes>, e: Entry, own_line: Bool) -> List<Bytes> / {abort.raise} =
+  put_value(push(push(out, key_bytes(e.key)), b" = "), e.value, own_line)
+
+/// A value to the right of a `=`. `own_line` is whether it ends its line, where a string may be
+/// written on several.
+fn put_value(out: List<Bytes>, v: Toml, own_line: Bool) -> List<Bytes> / {abort.raise} =
+  match v {
+    String(s) -> put_string(out, bytes_of_string(s), own_line),
+    Integer(n) -> push(out, bytes_of_string(int_to_string(n))),
+    Float(f) -> push(out, bytes_of_string(float_text(f))),
+    Boolean(b) -> push(out, if b { b"true" } else { b"false" }),
+    OffsetDateTime(o) -> push(out, bytes_of_string(date::rfc3339(o))),
+    LocalDateTime(dt) -> push(out, bytes_of_string(date::date_time_text(dt))),
+    LocalDate(d) -> push(out, bytes_of_string(date::text(d))),
+    LocalTime(time) -> push(out, bytes_of_string(date::time_text(time))),
+    Array(items) -> match items {
+      [] -> push(out, b"[]"),
+      [first, ..rest] ->
+        push(
+          fold(rest, put_value(push(out, b"["), first, false), |o: List<Bytes>, item: Toml|
+            put_value(push(o, b", "), item, false)),
+          b"]",
+        ),
+    },
+    Table(entries) -> match entries {
+      [] -> push(out, b"{}"),
+      [first, ..rest] ->
+        push(
+          fold(rest, put_member(push(out, b"{ "), first, false), |o: List<Bytes>, e: Entry|
+            put_member(push(o, b", "), e, false)),
+          b" }",
+        ),
+    },
+  }
+
+fn float_text(f: Float) -> String =
+  if is_nan(f) { "nan" }
+  else if f == infinity() { "inf" }
+  else if f == neg_infinity() { "-inf" }
+  else { float_to_string(f) }
+
+/// What a basic string on one line writes as an escape: a quote, a backslash and every control
+/// character, the tab among them so that it shows.
+fn basic_escapes() -> Bytes =
+  b"\"\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+/// What keeps a string from being written between `'`.
+fn literal_escapes() -> Bytes =
+  b"'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+/// What a multi-line string writes as an escape where its quotes can stand bare.
+fn long_escapes() -> Bytes =
+  b"\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+/// A string: on lines of its own between `"""` where it holds a line feed and ends its line,
+/// between `'` where that saves an escape and it holds nothing a literal string cannot, and
+/// otherwise between `"`. A multi-line string's quotes stand bare unless it holds three in a row
+/// or ends in one, and then each is escaped.
+fn put_string(out: List<Bytes>, raw: Bytes, own_line: Bool) -> List<Bytes> / {abort.raise} = {
+  let n = bytes_len(raw);
+  if own_line && scan_until(raw, 0, b"\n") < n {
+    let stops = if bytes::contains(raw, b"\"\"\"") || bytes_ends_with(raw, b"\"") {
+      long_basic_stops()
+    } else { long_escapes() };
+    push(put_escaped(push(out, b"\"\"\"\n"), raw, 0, stops, n), b"\"\"\"")
+  } else if scan_until(raw, 0, b"\"\\") < n && scan_until(raw, 0, literal_escapes()) == n {
+    push(push(push(out, b"'"), raw), b"'")
+  } else { push(put_escaped(push(out, b"\""), raw, 0, basic_escapes(), n), b"\"") }
+}
+
+/// `raw` from `i` with each byte in `stops` as its escape: one scan to each, so the bytes bound
+/// them: `left`.
+fn put_escaped(
+  out: List<Bytes>,
+  raw: Bytes,
+  i: Int,
+  stops: Bytes,
+  left: Int,
+) -> List<Bytes> / {abort.raise} = {
+  let at = scan_until(raw, i, stops);
+  let run = push(out, bytes_slice(raw, i, at));
+  if at >= bytes_len(raw) { run }
+  else if left <= 0 { panic("more escapes than bytes") }
+  else { put_escaped(push(run, escaped_byte(bytes_at(raw, at))), raw, at + 1, stops, left - 1) }
+}
+
+// --- Documents --------------------------------------------------------------
+
+/// A document as it was written: its bytes, where each key, header and value stands in them, the
+/// path of each header's table, the value they mean, and the limits it was read under, which its
+/// edits are held to as well.
+pub type Document = new {
+  source: Bytes,
+  items: List<Item>,
+  sections: List<List<Step>>,
+  value: Toml,
+  limits: Limits,
+}
+
+/// The document `src` is, raising `toml.refused` where `parse_document` answers `Err`.
+pub fn document(src: Bytes, limits: Limits) -> Document / {toml.refused} =
+  handle {
+    handle {
+      let items = syntax(src, limits);
+      let meant = meaning(items);
+      { source: src, items: items, sections: meant.sections, value: meant.value, limits: limits }
+    } with {
+      fault.at(offset, why) -> toml.refused(placed(src, offset, why)),
+    }
+  } with {
+    abort.raise(said) -> toml.refused(defect(said)),
+  }
+
+/// The document `src` is, or why it is none within the limits.
+pub fn parse_document(src: Bytes, limits: Limits) -> Result<Document, Refusal> =
+  try { document(src, limits) }
+
+/// The document's bytes: what it was read from, changed only where an edit changed them.
+pub fn source(d: Document) -> Bytes = d.source
+
+/// The value the document means.
+pub fn value(d: Document) -> Toml = d.value
+
+/// An item, and the path to what it defines: a pair's value, or a header's table.
+type Addressed = { address: List<Step>, item: Item }
+
+type Walk = { section: List<Step>, coming: List<List<Step>>, found: List<Addressed> }
+
+/// Every item of the document with its address.
+fn addressed(d: Document) -> List<Addressed> =
+  fold(d.items, { section: [], coming: d.sections, found: [] }, |w: Walk, item: Item| {
+    let { section, coming, found } = w;
+    match item {
+      Assign(made) ->
+        {
+          section: section,
+          coming: coming,
+          found: push(found, { address: concat(section, keys_of(made.key)), item: item }),
+        },
+      Section(_, _, _, _) -> match coming {
+        [address, ..later] ->
+          { section: address, coming: later, found: push(found, { address: address, item: item }) },
+        [] -> { section: section, coming: coming, found: found },
+      },
+    }
+  }).found
+
+fn keys_of(parts: List<Part>) -> List<Step> = map(parts, |p: Part| Key(p.name))
+
+fn starts_with(whole: List<Step>, prefix: List<Step>) -> Bool = take(whole, len(prefix)) == prefix
+
+/// A pair whose value the path leads to or into, and the path's steps inside that value.
+type Through = { address: List<Step>, made: Pair, rest: List<Step> }
+
+fn pair_through(found: List<Addressed>, path: List<Step>) -> Option<Through> =
+  fold(found, None, |hit: Option<Through>, a: Addressed|
+    match hit {
+      Some(_) -> hit,
+      None -> match a.item {
+        Assign(made) -> if starts_with(path, a.address) {
+          Some({ address: a.address, made: made, rest: drop(path, len(a.address)) })
+        } else { None },
+        Section(_, _, _, _) -> None,
+      },
+    })
+
+/// The written value `rest` leads to inside `written`. `room` bounds the steps.
+fn inside(written: Node, rest: List<Step>, room: Int) -> Option<Node> =
+  if room <= 0 { None } else {
+    match rest {
+      [] -> Some(written),
+      [Index(i), ..deeper] -> match written {
+        Elements(nodes, _, _) -> match list_at(nodes, i) {
+          Some(child) -> inside(child, deeper, room - 1),
+          None -> None,
+        },
+        _ -> None,
+      },
+      [Key(_), ..] -> match written {
+        Members(pairs, _, _) ->
+          fold(pairs, None, |hit: Option<Node>, made: Pair|
+            match hit {
+              Some(_) -> hit,
+              None -> if starts_with(rest, keys_of(made.key)) {
+                inside(made.value, drop(rest, len(made.key)), room - 1)
+              } else { None },
+            }),
+        _ -> None,
+      },
+    }
+  }
+
+fn item_start(item: Item) -> Int =
+  match item {
+    Assign(made) -> match made.key { [first, ..] -> first.from, [] -> start_of(made.value) },
+    Section(_, _, from, _) -> from,
+  }
+
+fn item_end(item: Item) -> Int =
+  match item { Assign(made) -> end_of(made.value), Section(_, _, _, to) -> to }
+
+/// Where the path is written: its value where a key holds one, its header where a header names
+/// it, and otherwise the first line that defines something inside it. The root is written where
+/// the document starts.
+fn position(d: Document, path: List<Step>) -> Option<Int> =
+  if len(path) == 0 { Some(0) } else {
+    let found = addressed(d);
+    match pair_through(found, path) {
+      Some(hit) -> option_map(inside(hit.made.value, hit.rest, len(path) + 1), start_of),
+      None ->
+        fold(found, None, |at: Option<Int>, a: Addressed|
+          match a.item {
+            Section(_, _, from, _) -> if a.address == path { Some(from) }
+            else if at == None && starts_with(a.address, path) { Some(from) }
+            else { at },
+            Assign(_) -> if at == None && starts_with(a.address, path) { Some(item_start(a.item)) }
+            else { at },
+          }),
+    }
+  }
+
+/// The line and column the path is written at: its value where a key holds one, its header where
+/// a header names it, and otherwise the first line that defines something inside it; the empty
+/// path is the document's first. `None` for a path the document does not hold.
+pub fn place(d: Document, path: List<Step>) -> Option<Place> =
+  option_map(position(d, path), |offset: Int| place_of(d.source, offset))
+
+/// `src` with the bytes from `from` up to `to` replaced.
+fn spliced(src: Bytes, from: Int, to: Int, with_bytes: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([bytes_slice(src, 0, from), with_bytes, bytes_slice(src, to, bytes_len(src))])
+
+/// Where the line holding `i` starts: past the blanks before it.
+fn line_start(src: Bytes, i: Int) -> Int / {abort.raise} =
+  if i <= 0 { 0 } else {
+    let c = bytes_at(src, i - 1);
+    if c == 32 || c == 9 { line_start(src, i - 1) } else { i }
+  }
+
+/// Just past the newline that ends the line holding `i`, or the end of the bytes.
+fn line_stop(src: Bytes, i: Int) -> Int / {abort.raise} = {
+  let at = scan_until(src, i, b"\n");
+  if at < bytes_len(src) { at + 1 } else { at }
+}
+
+/// The first of `texts` that reads as a document meaning one of `wanted`. Where none does, the
+/// refusal of a text past the limits, or the path as closed at the deepest part of it that is
+/// written.
+fn first_fit(
+  d: Document,
+  path: List<Step>,
+  texts: List<Bytes>,
+  wanted: List<Toml>,
+) -> Document / {toml.refused} = {
+  let tried = fold(texts, Err(None), |so_far: Result<Document, Option<Refusal>>, text: Bytes|
+    match so_far {
+      Ok(_) -> so_far,
+      Err(reason) -> match parse_document(text, d.limits) {
+        Ok(edited) -> if any(wanted, |t: Toml| t == edited.value) { Ok(edited) }
+        else { Err(reason) },
+        Err(r) -> if r.why == TooLong || r.why == TooDeep { Err(Some(r)) } else { Err(reason) },
+      },
+    });
+  match tried { Ok(edited) -> edited, Err(Some(r)) -> toml.refused(r), Err(None) -> shut(d, path) }
+}
+
+fn shut<a>(d: Document, path: List<Step>) -> a / {toml.refused} =
+  toml.refused(
+    placed(
+      d.source,
+      fold(range(0, len(path) + 1), 0, |at: Int, n: Int|
+        match position(d, take(path, n)) { Some(found) -> found, None -> at }),
+      Closed(path),
+    ),
+  )
+
+/// The document with `v` at the path, and every byte that does not write that value as it was.
+///
+/// A value the path already holds is replaced where it stands. A new key goes on a line after
+/// the last key of its table, a table with no header of its own is given one at the end, or a
+/// dotted key where a header cannot name it, and a key inside an inline table or an array has
+/// that one value written again. The edited text is read back, and the edit raises
+/// `toml.refused` unless it means `put(value(d), path, v)`: for a path through a value that is no
+/// table, an index its array does not have, the empty path, or a text past the limits.
+pub fn set(d: Document, path: List<Step>, v: Toml) -> Document / {toml.refused} =
+  match put(d.value, path, v) {
+    None -> shut(d, path),
+    Some(wanted) ->
+      first_fit(
+        d,
+        path,
+        handle { set_texts(d, path, v) } with { abort.raise(said) -> toml.refused(defect(said)) },
+        [wanted],
+      ),
+  }
+
+/// The document without the path, and every other line as it was.
+///
+/// The lines that define the path or anything inside it go, with the comments that end them; a
+/// key inside an inline table or an array has that one value written again. A table that only
+/// the removed lines implied goes with them. A path the document does not hold changes nothing,
+/// and the empty path is refused.
+pub fn remove(d: Document, path: List<Step>) -> Document / {toml.refused} =
+  match at(d.value, path) {
+    None -> d,
+    Some(_) ->
+      first_fit(
+        d,
+        path,
+        handle { [removed(d, path)] } with { abort.raise(said) -> toml.refused(defect(said)) },
+        pruned(without(d.value, path), path),
+      ),
+  }
+
+/// What a document may mean once the path is removed: the value without it, and that value
+/// without each table or array above the path that the removal emptied.
+fn pruned(t: Toml, path: List<Step>) -> List<Toml> = pruned_above(t, path, len(path) - 1, [t])
+
+fn pruned_above(t: Toml, path: List<Step>, n: Int, acc: List<Toml>) -> List<Toml> =
+  if n <= 0 { acc } else {
+    let above = take(path, n);
+    let emptied = match at(t, above) {
+      Some(Table([])) -> true,
+      Some(Array([])) -> true,
+      _ -> false,
+    };
+    if !emptied { acc } else {
+      let less = without(t, above);
+      pruned_above(less, path, n - 1, push(acc, less))
+    }
+  }
+
+/// The document's bytes without the path.
+fn removed(d: Document, path: List<Step>) -> Bytes / {abort.raise} = {
+  let found = addressed(d);
+  match pair_through(found, path) {
+    Some(hit) -> if len(hit.rest) == 0 { without_items(d.source, found, path) } else {
+      match at(d.value, hit.address) {
+        Some(held) ->
+          spliced(
+            d.source,
+            start_of(hit.made.value),
+            end_of(hit.made.value),
+            inline_bytes(without(held, hit.rest)),
+          ),
+        None -> d.source,
+      }
+    },
+    None -> without_items(d.source, found, path),
+  }
+}
+
+type Cut = { kept: List<Bytes>, from: Int }
+
+/// `src` without the lines of every item whose address is the path or inside it.
+fn without_items(src: Bytes, found: List<Addressed>, path: List<Step>) -> Bytes / {abort.raise} = {
+  let { kept, from } = fold(found, { kept: [], from: 0 }, |c: Cut, a: Addressed| {
+    let { kept, from } = c;
+    if !starts_with(a.address, path) { { kept: kept, from: from } } else {
+      let start = line_start(src, item_start(a.item));
+      {
+        kept: push(kept, bytes_slice(src, min(from, start), start)),
+        from: line_stop(src, item_end(a.item)),
+      }
+    }
+  });
+  bytes_concat_all(push(kept, bytes_slice(src, from, bytes_len(src))))
+}
+
+/// The texts an edit may be written as, the likeliest first.
+fn set_texts(d: Document, path: List<Step>, v: Toml) -> List<Bytes> / {abort.raise} = {
+  let found = addressed(d);
+  match pair_through(found, path) {
+    Some(hit) -> match inside(hit.made.value, hit.rest, len(path) + 1) {
+      Some(written) -> [spliced(d.source, start_of(written), end_of(written), inline_bytes(v))],
+      None -> match at(d.value, hit.address) {
+        None -> [],
+        Some(held) -> match put(held, hit.rest, v) {
+          None -> [],
+          Some(made) ->
+            [
+              spliced(
+                d.source,
+                start_of(hit.made.value),
+                end_of(hit.made.value),
+                inline_bytes(made),
+              ),
+            ],
+        },
+      },
+    },
+    None -> if any(found, |a: Addressed| starts_with(a.address, path)) {
+      match parse_document(without_items(d.source, found, path), d.limits) {
+        Ok(cleared) -> added_texts(cleared, path, v),
+        Err(_) -> [],
+      }
+    } else { added_texts(d, path, v) },
+  }
+}
+
+/// The texts that add a key the document does not write: on a line of the deepest table above
+/// it that has lines of its own, and before that under a new header where its table has none.
+fn added_texts(d: Document, path: List<Step>, v: Toml) -> List<Bytes> / {abort.raise} = {
+  let found = addressed(d);
+  let parent = take(path, len(path) - 1);
+  let home = fold(found, [], |deepest: List<Step>, a: Addressed|
+    match a.item {
+      Section(_, _, _, _) -> if len(a.address) > len(deepest) && starts_with(parent, a.address) {
+        a.address
+      } else { deepest },
+      Assign(_) -> deepest,
+    });
+  let dotted = lined(d, found, home, drop(path, len(home)), v);
+  if home == parent { dotted }
+  else { concat(headed_text(d, parent, drop(path, len(parent)), v), dotted) }
+}
+
+/// The names of a path that is keys alone.
+fn key_names(path: List<Step>) -> Option<List<String>> =
+  fold(path, Some([]), |names: Option<List<String>>, step: Step|
+    match names {
+      None -> None,
+      Some(so_far) -> match step { Key(name) -> Some(push(so_far, name)), Index(_) -> None },
+    })
+
+fn dotted_key(names: List<String>) -> Bytes / {abort.raise} =
+  bytes::join(map(names, key_bytes), b".")
+
+/// How the document ends its lines, which is how a line added to it ends.
+fn newline_of(src: Bytes) -> Bytes = if bytes::contains(src, b"\r\n") { b"\r\n" } else { b"\n" }
+
+/// `src` ending its last line, which a line added after it needs.
+fn ended(src: Bytes) -> Bytes =
+  if bytes_len(src) == 0 || bytes_ends_with(src, b"\n") { src }
+  else { bytes_concat(src, newline_of(src)) }
+
+/// Where a line goes: `inside` while the fold stands in the section, `spaced` where a blank line
+/// follows the new one, and `seen` once an item has stood before the place.
+type Block = { inside: Bool, at: Int, indent: Bytes, spaced: Bool, seen: Bool }
+
+/// The document with `rest = v` on a line after the last line of the section at `home`: after
+/// its header where it has no key yet. Where the root has none, the line and a blank one go
+/// before the first header and the comments that stand on it.
+fn lined(
+  d: Document,
+  found: List<Addressed>,
+  home: List<Step>,
+  rest: List<Step>,
+  v: Toml,
+) -> List<Bytes> / {abort.raise} =
+  match key_names(rest) {
+    None -> [],
+    Some([]) -> [],
+    Some(names) -> {
+      let src = ended(d.source);
+      let newline = newline_of(src);
+      let block = fold(
+        found,
+        { inside: len(home) == 0, at: bytes_len(src), indent: b"", spaced: false, seen: false },
+        |b: Block, a: Addressed|
+          match a.item {
+            Section(_, _, from, to) -> if a.address == home {
+              { inside: true, at: line_stop(src, to), indent: b"", spaced: false, seen: true }
+            } else if !b.inside { b } else if b.seen {
+              { inside: false, at: b.at, indent: b.indent, spaced: false, seen: true }
+            } else {
+              {
+                inside: false,
+                at: comments_start(src, line_start(src, from)),
+                indent: b"",
+                spaced: true,
+                seen: true,
+              }
+            },
+            Assign(made) -> if !b.inside { b } else {
+              let start = item_start(a.item);
+              {
+                inside: true,
+                at: line_stop(src, end_of(made.value)),
+                indent: bytes_slice(src, line_start(src, start), start),
+                spaced: false,
+                seen: true,
+              }
+            },
+          },
+      );
+      [
+        spliced(
+          src,
+          block.at,
+          block.at,
+          bytes_concat_all([
+            block.indent,
+            dotted_key(names),
+            b" = ",
+            inline_bytes(v),
+            newline,
+            if block.spaced { newline } else { b"" },
+          ]),
+        ),
+      ]
+    },
+  }
+
+type Lines = { at: Int, start: Int }
+
+/// Where the comment lines that end at `upto` start, in a stretch of comments and blank lines:
+/// after its last blank line.
+fn comments_start(src: Bytes, upto: Int) -> Int / {abort.raise} =
+  fold(
+    bytes_split(bytes_slice(src, 0, upto), b"\n"),
+    { at: 0, start: 0 },
+    |l: Lines, line: Bytes| {
+      let next = l.at + bytes_len(line) + 1;
+      {
+        at: next,
+        start: if next <= upto && scan(line, 0, b" \t\r") == bytes_len(line) { next }
+        else { l.start },
+      }
+    },
+  ).start
+
+/// The document with a header for `parent` at its end and `rest = v` under it, where a header
+/// can name that table: every array on the way is at its last element.
+fn headed_text(
+  d: Document,
+  parent: List<Step>,
+  rest: List<Step>,
+  v: Toml,
+) -> List<Bytes> / {abort.raise} = {
+  let last_rows = fold(range(0, len(parent)), true, |ok: Bool, n: Int|
+    match list_at(parent, n) {
+      Some(Index(i)) ->
+        ok
+          && (match at(d.value, take(parent, n)) {
+            Some(Array(items)) -> i == len(items) - 1,
+            _ -> false,
+          }),
+      _ -> ok,
+    });
+  let names = key_names(
+    filter(parent, |step: Step| match step { Key(_) -> true, Index(_) -> false }),
+  );
+  match key_names(rest) {
+    Some([name]) -> match names {
+      Some(header) -> if !last_rows || len(header) == 0 { [] } else {
+        let src = ended(d.source);
+        let newline = newline_of(src);
+        [
+          bytes_concat_all([
+            src,
+            if bytes_len(src) == 0 { b"" } else { newline },
+            b"[",
+            dotted_key(header),
+            b"]",
+            newline,
+            key_bytes(name),
+            b" = ",
+            inline_bytes(v),
+            newline,
+          ]),
+        ]
+      },
+      None -> [],
+    },
+    _ -> [],
+  }
+}
+
+// --- Codecs -----------------------------------------------------------------
+
+/// Why a value did not decode: the path to what was wrong, the line and column it is written at
+/// where the text was at hand, and what was wrong.
+pub type DecodeError = new { path: List<Step>, place: Option<Place>, message: String }
+
+/// An error with no path yet; the decoders around it add the steps.
+pub fn decode_error(message: String) -> DecodeError = { path: [], place: None, message: message }
+
+/// An error saying `what` was expected and naming the kind of value `found` is instead.
+pub fn expected(what: String, found: Toml) -> DecodeError =
+  decode_error("expected " ++ what ++ ", found " ++ kind_of(found))
+
+/// What a value is, as an error names it: `an integer`, `a table`.
+pub fn kind_of(t: Toml) -> String =
+  match t {
+    String(_) -> "a string",
+    Integer(_) -> "an integer",
+    Float(_) -> "a float",
+    Boolean(_) -> "a boolean",
+    OffsetDateTime(_) -> "an offset date-time",
+    LocalDateTime(_) -> "a local date-time",
+    LocalDate(_) -> "a local date",
+    LocalTime(_) -> "a local time",
+    Array(_) -> "an array",
+    Table(_) -> "a table",
+  }
+
+/// A path is built inside out: each enclosing decoder prefixes the step it took.
+pub fn in_field(name: String, e: DecodeError) -> DecodeError =
+  { path: prepend(Key(name), e.path), place: e.place, message: e.message }
+
+/// `e`, one array index further in.
+pub fn in_index(index: Int, e: DecodeError) -> DecodeError =
+  { path: prepend(Index(index), e.path), place: e.place, message: e.message }
+
+/// `line 4, column 8: servers.alpha.port: expected an integer, found a string`, without the place
+/// or the path where the error has none.
+pub fn error_to_string(e: DecodeError) -> String =
+  (match e.place {
+      Some(stood) ->
+        "line " ++ int_to_string(stood.line) ++ ", column " ++ int_to_string(stood.column) ++ ": ",
+      None -> "",
+    })
+    ++ (if len(e.path) == 0 { "" } else { path_to_string(e.path) ++ ": " })
+    ++ e.message
+
+/// How to write an `a` as TOML and read one back.
+pub type TomlCodec<a> = {
+  encode: (a) -> Toml / {abort.raise},
+  decode: (Toml) -> Result<a, DecodeError> / {abort.raise},
+}
+
+/// What a record's decoder calls for each key it must have.
+pub fn field<a>(
+  t: Toml,
+  name: String,
+  codec: TomlCodec<a>,
+) -> Result<a, DecodeError> / {abort.raise} =
+  match t {
+    Table(_) -> match get(t, name) {
+      Some(v) -> result_map_err((codec.decode)(v), |e: DecodeError| in_field(name, e)),
+      None -> Err(in_field(name, decode_error("this key is missing"))),
+    },
+    _ -> Err(expected("a table", t)),
+  }
+
+/// What a record's decoder calls for a key it may lack: TOML has no null, so absent is `None`.
+pub fn optional_field<a>(
+  t: Toml,
+  name: String,
+  codec: TomlCodec<a>,
+) -> Result<Option<a>, DecodeError> / {abort.raise} =
+  match t {
+    Table(_) -> match get(t, name) {
+      Some(v) ->
+        result_map(result_map_err((codec.decode)(v), |e: DecodeError| in_field(name, e)), |x: a|
+          Some(x)),
+      None -> Ok(None),
+    },
+    _ -> Err(expected("a table", t)),
+  }
+
+/// Refuses a table that holds a key outside `names`, naming the first: what a record's decoder
+/// calls so a misspelt key is an error and not a default.
+pub fn only_fields(t: Toml, names: List<String>) -> Result<Unit, DecodeError> =
+  match t {
+    Table(entries) ->
+      fold(entries, Ok(()), |so_far: Result<Unit, DecodeError>, e: Entry|
+        match so_far {
+          Err(_) -> so_far,
+          Ok(_) -> if any(names, |name: String| name == e.key) { so_far } else {
+            Err(
+              in_field(
+                e.key,
+                decode_error("this key is not one of " ++ join(map(names, key_text), ", ")),
+              ),
+            )
+          },
+        }),
+    _ -> Err(expected("a table", t)),
+  }
+
+/// The value itself.
+pub fn toml_toml() -> TomlCodec<Toml> = { encode: |t: Toml| t, decode: |t: Toml| Ok(t) }
+
+/// A boolean.
+pub fn bool_toml() -> TomlCodec<Bool> =
+  {
+    encode: |b: Bool| Boolean(b),
+    decode: |t: Toml| match t { Boolean(b) -> Ok(b), _ -> Err(expected("a boolean", t)) },
+  }
+
+/// A string.
+pub fn string_toml() -> TomlCodec<String> =
+  {
+    encode: |s: String| String(s),
+    decode: |t: Toml| match t { String(s) -> Ok(s), _ -> Err(expected("a string", t)) },
+  }
+
+/// An integer.
+pub fn int_toml() -> TomlCodec<Int> =
+  {
+    encode: |n: Int| Integer(n),
+    decode: |t: Toml| match t { Integer(n) -> Ok(n), _ -> Err(expected("an integer", t)) },
+  }
+
+/// A float, read from an integer too where the integer is one a `Float` holds exactly, up to
+/// `2^53` either side of zero.
+pub fn float_toml() -> TomlCodec<Float> =
+  {
+    encode: |f: Float| Float(f),
+    decode: |t: Toml|
+      match t {
+        Float(f) -> Ok(f),
+        Integer(n) -> if n >= -9007199254740992 && n <= 9007199254740992 { Ok(float_of_int(n)) }
+        else { Err(decode_error("this integer is past what a float holds exactly")) },
+        _ -> Err(expected("a float", t)),
+      },
+  }
+
+/// A date and time with an offset.
+pub fn offset_date_time_toml() -> TomlCodec<date::OffsetDateTime> =
+  {
+    encode: |o: date::OffsetDateTime| OffsetDateTime(o),
+    decode: |t: Toml|
+      match t { OffsetDateTime(o) -> Ok(o), _ -> Err(expected("an offset date-time", t)) },
+  }
+
+/// A date and time with no offset.
+pub fn date_time_toml() -> TomlCodec<date::DateTime> =
+  {
+    encode: |dt: date::DateTime| LocalDateTime(dt),
+    decode: |t: Toml|
+      match t { LocalDateTime(dt) -> Ok(dt), _ -> Err(expected("a local date-time", t)) },
+  }
+
+/// A date.
+pub fn date_toml() -> TomlCodec<date::Date> =
+  {
+    encode: |d: date::Date| LocalDate(d),
+    decode: |t: Toml| match t { LocalDate(d) -> Ok(d), _ -> Err(expected("a local date", t)) },
+  }
+
+/// A time of day.
+pub fn time_toml() -> TomlCodec<date::Time> =
+  {
+    encode: |time: date::Time| LocalTime(time),
+    decode: |t: Toml|
+      match t { LocalTime(time) -> Ok(time), _ -> Err(expected("a local time", t)) },
+  }
+
+/// An array of items.
+pub fn list_toml<a>(item: TomlCodec<a>) -> TomlCodec<List<a>> =
+  {
+    encode: |xs: List<a>| Array(map(xs, |x: a| (item.encode)(x))),
+    decode: |t: Toml|
+      match t { Array(items) -> collect(items, item, 0, []), _ -> Err(expected("an array", t)) },
+  }
+
+fn collect<a>(
+  items: List<Toml>,
+  item: TomlCodec<a>,
+  index: Int,
+  acc: List<a>,
+) -> Result<List<a>, DecodeError> / {abort.raise} =
+  match items {
+    [] -> Ok(acc),
+    [x, ..rest] -> match (item.decode)(x) {
+      Err(e) -> Err(in_index(index, e)),
+      Ok(v) -> collect(rest, item, index + 1, push(acc, v)),
+    },
+  }
+
+/// A map keyed by `String` is a table, written in key order.
+pub fn string_map_toml<v>(value: TomlCodec<v>) -> TomlCodec<Map<String, v>> =
+  {
+    encode: |m: Map<String, v>|
+      Table(
+        map(map_entries(m), |e: { key: String, value: v }|
+          { key: e.key, value: (value.encode)(e.value) }),
+      ),
+    decode: |t: Toml|
+      match t {
+        Table(entries) -> collect_entries(entries, value, map_new()),
+        _ -> Err(expected("a table", t)),
+      },
+  }
+
+fn collect_entries<v>(
+  entries: List<Entry>,
+  value: TomlCodec<v>,
+  acc: Map<String, v>,
+) -> Result<Map<String, v>, DecodeError> / {abort.raise} =
+  match entries {
+    [] -> Ok(acc),
+    [e, ..rest] -> match (value.decode)(e.value) {
+      Err(err) -> Err(in_field(e.key, err)),
+      Ok(v) -> collect_entries(rest, value, map_insert(acc, e.key, v)),
+    },
+  }
+
+/// Reads a document and decodes its value with `codec`. A refusal of the text is an error at its
+/// line and column, and an error of the codec's is given the place its path is written at.
+pub fn decode_bytes<a>(
+  src: Bytes,
+  limits: Limits,
+  codec: TomlCodec<a>,
+) -> Result<a, DecodeError> / {abort.raise} =
+  match parse_document(src, limits) {
+    Err(r) ->
+      Err({
+        path: [],
+        place: Some({ line: r.line, column: r.column }),
+        message: why_to_string(r.why),
+      }),
+    Ok(d) -> decode_document(d, codec),
+  }
+
+/// Decodes a document's value with `codec`, an error given the place its path is written at: of
+/// the deepest part of the path that is written, since a missing key has none of its own.
+pub fn decode_document<a>(
+  d: Document,
+  codec: TomlCodec<a>,
+) -> Result<a, DecodeError> / {abort.raise} =
+  result_map_err((codec.decode)(d.value), |e: DecodeError| located(d, e))
+
+fn located(d: Document, e: DecodeError) -> DecodeError =
+  {
+    path: e.path,
+    place: fold(range(0, len(e.path) + 1), e.place, |stood: Option<Place>, n: Int|
+      match place(d, take(e.path, n)) { Some(found) -> Some(found), None -> stood }),
+    message: e.message,
+  }
+
+/// `decode_bytes` over a string's bytes.
+pub fn decode_string<a>(
+  src: String,
+  limits: Limits,
+  codec: TomlCodec<a>,
+) -> Result<a, DecodeError> / {abort.raise} = decode_bytes(bytes_of_string(src), limits, codec)
+
+/// `x` written with `codec`, as `to_bytes` writes a value.
+pub fn encode_bytes<a>(x: a, codec: TomlCodec<a>) -> Bytes / {abort.raise} =
+  to_bytes((codec.encode)(x))
+
+/// `x` written with `codec`, as a string.
+pub fn encode_string<a>(x: a, codec: TomlCodec<a>) -> String / {abort.raise} =
+  to_string((codec.encode)(x))
+
+// --- Laws -------------------------------------------------------------------
+
+/// What a law draws a value from: a `Toml` holds dates, and a date drawn as a constructor's raw
+/// count is none `std.date` makes.
+type Seed =
+  | SString(String)
+  | SInteger(Int)
+  | SFloat(Float)
+  | SBoolean(Bool)
+  | SInstant(Int, Int, Int)
+  | SDateTime(Int, Int)
+  | SDate(Int)
+  | STime(Int)
+  | SArray(List<Seed>)
+  | STable(List<Sown>)
+
+type Sown = { key: String, value: Seed }
+
+/// Any count as a day of the calendar, which has 3,652,425 of them.
+fn some_date(n: Int) -> date::Date = {
+  let round = if n >= 0 { n % 3652425 } else { (n + 1) % 3652425 + 3652424 };
+  option_unwrap_or(date::of_unix_days(date::unix_days(date::earliest()) + round), date::earliest())
+}
+
+fn some_time(n: Int) -> date::Time =
+  option_unwrap_or(
+    date::time_of_nanos(if n >= 0 { n % 86400000000000 }
+    else { (n + 1) % 86400000000000 + 86399999999999 }),
+    date::midnight(),
+  )
+
+/// Any three counts as an instant: at UTC where the offset would read it past an end of the
+/// calendar.
+fn some_instant(days: Int, nanos: Int, minutes: Int) -> date::OffsetDateTime = {
+  let reading = date::at(some_date(days), some_time(nanos));
+  let east = (if minutes >= 0 { minutes % 2879 } else { (minutes + 1) % 2879 + 2878 }) - 1439;
+  option_unwrap_or(date::at_offset(reading, east), date::utc(reading))
+}
+
+fn grown(s: Seed) -> Toml =
+  match s {
+    SString(text) -> String(text),
+    SInteger(n) -> Integer(n),
+    SFloat(f) -> Float(f),
+    SBoolean(b) -> Boolean(b),
+    SInstant(days, nanos, minutes) -> OffsetDateTime(some_instant(days, nanos, minutes)),
+    SDateTime(days, nanos) -> LocalDateTime(date::at(some_date(days), some_time(nanos))),
+    SDate(days) -> LocalDate(some_date(days)),
+    STime(nanos) -> LocalTime(some_time(nanos)),
+    SArray(items) -> Array(map(items, grown)),
+    STable(fields) -> grown_table(fields),
+  }
+
+fn grown_table(fields: List<Sown>) -> Toml =
+  table(map(fields, |f: Sown| { key: f.key, value: grown(f.value) }))
+
+/// More than a value a law draws reaches.
+fn wide() -> Limits = { bytes: 1073741824, depth: 512 }
+
+law "a document reads back from what was written of it" =
+  agrees(|fields: List<Sown>| parse(to_bytes(grown_table(fields)), wide()), |fields: List<Sown>|
+    Ok(grown_table(fields)))
+
+law "a value reads back from its inline text" =
+  agrees(|s: Seed| parse_string("v = " ++ inline(grown(s)), wide()), |s: Seed|
+    Ok(Table([{ key: "v", value: grown(s) }])))
+
+law "a table is the same table whatever the order of its keys" =
+  agrees(
+    |fields: List<Sown>|
+      match grown_table(fields) { Table(entries) -> Table(reverse(entries)), other -> other },
+    grown_table,
+  )
+
+law "a document keeps the bytes it was read from, and means what a reader reads of them"
+  forall (fields: List<Sown>) {
+    let text = to_bytes(grown_table(fields));
+    match parse_document(text, wide()) {
+      Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, wide()),
+      Err(_) -> false,
+    }
+  }
+
+law "a key set in a document is set in its value, and removed from both"
+  forall (fields: List<Sown>, key: String, s: Seed) {
+    let before = grown_table(fields);
+    let path = [Key(key)];
+    match parse_document(to_bytes(before), wide()) {
+      Err(_) -> false,
+      Ok(d) -> match try { set(d, path, grown(s)) } {
+        Err(_) -> false,
+        Ok(changed) -> {
+          let taken = try { value(remove(changed, path)) };
+          Some(value(changed)) == put(before, path, grown(s)) && taken == Ok(without(before, path))
+        },
+      },
+    }
+  }
+
+fn pairs_text(n: Int) -> Bytes =
+  bytes_concat_all(
+    map(range(0, n), |i: Int|
+      bytes_of_string(
+        "key-" ++ int_to_string(i) ++ " = \"the value " ++ int_to_string(i) ++ "\"\n",
+      )),
+  )
+
+fn rows_text(n: Int) -> Bytes =
+  bytes_concat_all(
+    map(range(0, n), |i: Int|
+      bytes_of_string(
+        "[[package]]\nname = \"p" ++ int_to_string(i)
+          ++ "\"\nrequires = [\"a\", 'b', 1.5, 2026-10-05]\nat.x = { y = "
+          ++ int_to_string(i)
+          ++ " }\n\n",
+      )),
+  )
+
+fn tables_text(n: Int) -> Bytes =
+  bytes_concat_all(
+    map(range(0, n), |i: Int|
+      bytes_of_string(
+        "[servers.s" ++ int_to_string(i) ++ "]\nport = " ++ int_to_string(i) ++ "\n",
+      )),
+  )
+
+fn array_text(n: Int) -> Bytes =
+  bytes_concat_all([
+    b"v = [",
+    bytes_concat_all(map(range(0, n), |i: Int| bytes_of_string(int_to_string(i) ++ ", # one\n"))),
+    b"]\n",
+  ])
+
+fn escapes_text(n: Int) -> Bytes =
+  bytes_concat_all([
+    b"v = \"\"\"\n",
+    bytes_concat_all(map(range(0, n), |_: Int| b"a \\t line \\u00e9 \"quoted\" \\\n   \n")),
+    b"\"\"\"\n",
+  ])
+
+law "reading the keys of one table takes steps in proportion to them"
+  forall (n: Int) where n > 0 cost n {
+    parse(pairs_text(n), wide())
+  }
+
+law "reading an array of tables takes steps in proportion to its tables"
+  forall (n: Int) where n > 0 cost n {
+    parse(rows_text(n), wide())
+  }
+
+law "reading tables under one table takes steps in proportion to them"
+  forall (n: Int) where n > 0 cost n {
+    parse(tables_text(n), wide())
+  }
+
+law "reading an array takes steps in proportion to its values and comments"
+  forall (n: Int) where n > 0 cost n {
+    parse(array_text(n), wide())
+  }
+
+law "reading a string takes steps in proportion to its escapes"
+  forall (n: Int) where n > 0 cost n {
+    parse(escapes_text(n), wide())
+  }
+
+law "writing a document takes steps in proportion to what it holds"
+  forall (n: Int) where n > 0 cost n {
+    to_bytes(
+      Table(
+        map(range(0, n), |i: Int|
+          {
+            key: int_to_string(i),
+            value: Table([{ key: "at", value: Array([Integer(i), String("a\tb\\c")]) }]),
+          }),
+      ),
+    )
+  }
+
+law "setting a key takes steps in proportion to the document"
+  forall (n: Int) where n > 0 cost n {
+    match parse_document(rows_text(n), wide()) {
+      Ok(d) -> try { set(d, [Key("package"), Index(n / 2), Key("name")], String("renamed")) },
+      Err(e) -> Err(e),
+    }
+  }
+
+// --- Tests: values ----------------------------------------------------------
+
+fn limited() -> Limits = { bytes: 65536, depth: 16 }
+
+fn the(text: String) -> Toml / {abort.raise} =
+  match parse_string(text, limited()) { Ok(t) -> t, Err(e) -> panic(refusal_to_string(e)) }
+
+/// What a value written after `v = ` reads as.
+fn valued(text: String) -> Option<Toml> =
+  match parse_string("v = " ++ text, limited()) { Ok(t) -> get(t, "v"), Err(_) -> None }
+
+fn why_not(text: String) -> Option<Why> =
+  match parse_string(text, limited()) { Ok(_) -> None, Err(e) -> Some(e.why) }
+
+fn misspelt_number() -> Why =
+  Expected("a number with no leading zero and a digit on each side of every `_` and `.`")
+
+test "a table is its keys whatever their order, and a key written twice is its last value" {
+  let ab = Table([entry("a", Integer(1)), entry("b", Integer(2))]);
+  assert_eq(Table([entry("b", Integer(2)), entry("a", Integer(1))]), ab);
+  assert_eq(Table([entry("a", Integer(9)), entry("b", Integer(2)), entry("a", Integer(1))]), ab);
+  assert(Table([entry("a", Integer(1))]) != ab);
+  assert_eq(table([entry("a", Integer(9)), entry("b", Integer(2)), entry("a", Integer(1))]), ab);
+  assert(match table([entry("a", Integer(9)), entry("b", Integer(2)), entry("a", Integer(1))]) {
+    Table([first, second]) -> first.key == "a" && second.key == "b",
+    _ -> false,
+  });
+  assert_eq(get(Table([entry("a", Integer(9)), entry("a", Integer(1))]), "a"), Some(Integer(1)));
+  assert_eq(get(ab, "c"), None);
+  assert_eq(get(Integer(1), "a"), None)
+}
+
+test "a float is the float its bits are, so nan is nan and zero has a sign" {
+  assert_eq(Float(nan()), Float(0.0 / 0.0));
+  assert(Float(0.0) != Float(-0.0));
+  assert(Float(1.0) != Integer(1));
+  assert_eq(valued("-nan"), Some(Float(nan())));
+  assert_eq(valued("-0.0"), Some(Float(-0.0)));
+  assert(valued("0.0") != Some(Float(-0.0)))
+}
+
+test "a value shows as it is written inline" {
+  assert_eq(f"{Integer(3)} {String("a b")} {Boolean(true)}", "3 \"a b\" true");
+  assert_eq(f"{Table([entry("at", Array([Float(1.5), Table([])]))])}", "{ at = [1.5, {}] }")
+}
+
+test "a path leads to a value, puts one and takes one away" {
+  let doc = the("[[bin]]\nname = 'a'\n[[bin]]\nname = 'b'\n[lib]\npath = 'src'\n");
+  assert_eq(at(doc, [Key("bin"), Index(1), Key("name")]), Some(String("b")));
+  assert_eq(at(doc, [Key("bin"), Index(2)]), None);
+  assert_eq(at(doc, [Key("lib"), Key("path"), Key("deeper")]), None);
+  assert_eq(
+    put(doc, [Key("bin"), Index(0), Key("name")], String("c")),
+    Some(the("[[bin]]\nname = 'c'\n[[bin]]\nname = 'b'\n[lib]\npath = 'src'\n")),
+  );
+  assert_eq(put(the("a = 1"), [Key("b"), Key("c")], Boolean(true)), Some(the("a = 1\nb.c = true")));
+  assert_eq(put(the("a = 1"), [Key("a"), Key("c")], Boolean(true)), None);
+  assert_eq(put(doc, [Key("bin"), Index(2)], Integer(0)), None);
+  assert_eq(
+    without(doc, [Key("bin"), Index(0)]),
+    the("[[bin]]\nname = 'b'\n[lib]\npath = 'src'\n"),
+  );
+  assert_eq(
+    without(doc, [Key("lib"), Key("path")]),
+    the("bin = [{name = 'a'}, {name = 'b'}]\n[lib]"),
+  );
+  assert_eq(without(doc, [Key("none"), Key("here")]), doc);
+  assert_eq(
+    path_to_string([Key("servers"), Key("a b"), Index(2), Key("port")]),
+    "servers.\"a b\"[2].port",
+  )
+}
+
+// --- Tests: reading ---------------------------------------------------------
+
+test "every kind of value reads" {
+  assert_eq(valued("\"text\""), Some(String("text")));
+  assert_eq(valued("42"), Some(Integer(42)));
+  assert_eq(valued("4.5"), Some(Float(4.5)));
+  assert_eq(valued("true"), Some(Boolean(true)));
+  assert_eq(valued("false"), Some(Boolean(false)));
+  assert_eq(
+    valued("[1, 'two', [3.0]]"),
+    Some(Array([Integer(1), String("two"), Array([Float(3.0)])])),
+  );
+  assert_eq(
+    valued("{ a = 1, b.c = 'd' }"),
+    Some(Table([entry("a", Integer(1)), entry("b", Table([entry("c", String("d"))]))])),
+  );
+  assert_eq(parse(b"", limited()), Ok(Table([])));
+  assert_eq(parse(b"# only a comment", limited()), Ok(Table([])))
+}
+
+type Whole = { text: String, value: Int }
+
+fn integers() -> List<Whole> =
+  [
+    { text: "0", value: 0 },
+    { text: "+99", value: 99 },
+    { text: "-17", value: -17 },
+    { text: "-0", value: 0 },
+    { text: "1_000_000", value: 1000000 },
+    { text: "0xDEAD_beef", value: 3735928559 },
+    { text: "0o755", value: 493 },
+    { text: "0b1101_0110", value: 214 },
+    { text: "9223372036854775807", value: 9223372036854775807 },
+    { text: "-9223372036854775808", value: -9223372036854775807 - 1 },
+    { text: "0x7fff_ffff_ffff_ffff", value: 9223372036854775807 },
+    { text: "0o0", value: 0 },
+  ]
+
+test "the integer {c.text} reads" for c: Whole in integers() {
+  assert_eq(valued(c.text), Some(Integer(c.value)))
+}
+
+test "floats read in every spelling, the infinities and nan among them" {
+  assert_eq(valued("+1.0"), Some(Float(1.0)));
+  assert_eq(valued("3.1415"), Some(Float(3.1415)));
+  assert_eq(valued("-0.01"), Some(Float(-0.01)));
+  assert_eq(valued("5e+22"), Some(Float(5e22)));
+  assert_eq(valued("1e06"), Some(Float(1000000.0)));
+  assert_eq(valued("-2E-2"), Some(Float(-0.02)));
+  assert_eq(valued("6.626e-34"), Some(Float(6.626e-34)));
+  assert_eq(valued("224_617.445_991_228"), Some(Float(224617.445991228)));
+  assert_eq(valued("0e0"), Some(Float(0.0)));
+  assert_eq(valued("inf"), Some(Float(infinity())));
+  assert_eq(valued("+inf"), Some(Float(infinity())));
+  assert_eq(valued("-inf"), Some(Float(neg_infinity())));
+  assert_eq(valued("nan"), Some(Float(nan())))
+}
+
+fn misspelt_numbers() -> List<String> =
+  [
+    "01",
+    "-01",
+    "+00",
+    "1__0",
+    "1_",
+    "0x",
+    "0x_1",
+    "0xg",
+    "0b2",
+    "0o8",
+    "+0x1",
+    "-0b1",
+    "1.",
+    "1.e3",
+    "1e",
+    "1e+",
+    "1_.5",
+    "1._5",
+    "1e_5",
+    "1.5.2",
+    "03.14",
+    "1e5.2",
+    "+",
+    "-",
+  ]
+
+test "{c} is no number" for c: String in misspelt_numbers() {
+  assert_eq(why_not("v = " ++ c), Some(misspelt_number()))
+}
+
+fn no_values() -> List<String> =
+  [".5", "_1", "Inf", "NaN", "True", "FALSE", "null", "", "=", "infinity"]
+
+test "{c} is no value" for c: String in no_values() {
+  assert_eq(why_not("v = " ++ c), Some(Expected("a value")))
+}
+
+test "a number past what its type holds is refused, not rounded into it" {
+  assert_eq(why_not("v = 9223372036854775808"), Some(TooWide));
+  assert_eq(why_not("v = -9223372036854775809"), Some(TooWide));
+  assert_eq(why_not("v = 0x8000_0000_0000_0000"), Some(TooWide));
+  assert_eq(why_not("v = 0b1" ++ join(map(range(0, 63), |_: Int| "0"), "")), Some(TooWide));
+  assert_eq(why_not("v = 1e400"), Some(TooWide));
+  assert_eq(why_not("v = -1e400"), Some(TooWide));
+  assert_eq(valued("1e-400"), Some(Float(0.0)));
+  assert_eq(valued("1.7976931348623157e308"), Some(Float(1.7976931348623157e308)))
+}
+
+fn day(text: String) -> Option<date::Date> = date::parse(text)
+
+test "the four kinds of date and time read as std.date's four types" {
+  assert_eq(
+    valued("1979-05-27T07:32:00Z"),
+    option_map(date::parse_rfc3339("1979-05-27T07:32:00Z"), |o: date::OffsetDateTime|
+      OffsetDateTime(o)),
+  );
+  assert_eq(
+    valued("1979-05-27T00:32:00.999999-07:00"),
+    option_map(
+      date::parse_rfc3339("1979-05-27T00:32:00.999999-07:00"),
+      |o: date::OffsetDateTime| OffsetDateTime(o),
+    ),
+  );
+  assert_eq(
+    valued("1979-05-27T07:32:00"),
+    option_map(date::parse_date_time("1979-05-27T07:32:00"), |dt: date::DateTime|
+      LocalDateTime(dt)),
+  );
+  assert_eq(valued("1979-05-27"), option_map(day("1979-05-27"), |d: date::Date| LocalDate(d)));
+  assert_eq(
+    valued("07:32:00.5"),
+    option_map(date::time(7, 32, 0, 500000000), |time: date::Time| LocalTime(time)),
+  );
+  assert(valued("1979-05-27T07:32:00Z") != valued("1979-05-27T07:32:00"));
+  assert(valued("1979-05-27T07:32:00Z") != valued("1979-05-27T08:32:00+01:00"))
+}
+
+test "a space may stand for the T, in either case, and a fraction is kept to nine digits" {
+  assert_eq(valued("1979-05-27 07:32:00Z"), valued("1979-05-27T07:32:00Z"));
+  assert_eq(valued("1979-05-27t07:32:00z"), valued("1979-05-27T07:32:00Z"));
+  assert_eq(valued("1979-05-27 07:32:00"), valued("1979-05-27T07:32:00"));
+  assert_eq(valued("07:32:00.1234567899999"), valued("07:32:00.123456789"));
+  assert_eq(
+    valued("1979-05-27T07:32:00.1234567899999+01:00"),
+    valued("1979-05-27T07:32:00.123456789+01:00"),
+  );
+  assert_eq(valued("1979-05-27T07:32:00.1234567899999"), valued("1979-05-27T07:32:00.123456789"));
+  // A date, then a comment: the space is no part of it.
+  assert_eq(
+    parse_string("v = 1979-05-27 # 07:32:00", limited()),
+    parse_string("v = 1979-05-27", limited()),
+  )
+}
+
+type Mistimed = { text: String, column: Int }
+
+fn mistimed() -> List<Mistimed> =
+  [
+    { text: "2021-02-29", column: 13 },
+    { text: "2021-13-01", column: 10 },
+    { text: "2021-1-01", column: 11 },
+    { text: "1979-05-27T07:32", column: 21 },
+    { text: "1979-05-27T07:32:00+1:00", column: 26 },
+    { text: "1979-05-27T25:00:00", column: 16 },
+    { text: "1979-05-27 07:32:00.", column: 25 },
+    { text: "24:00:00", column: 5 },
+    { text: "07:32", column: 10 },
+    { text: "07:32:60", column: 11 },
+    { text: "1979-05-27T07:32:60Z", column: 22 },
+    { text: "0000-01-01T00:00:00+01:00", column: 5 },
+  ]
+
+test "{c.text} is no date or time" for c: Mistimed in mistimed() {
+  assert_eq(
+    result_map_err(parse_string("v = " ++ c.text, limited()), |e: Refusal|
+      (match e.why { NoSuchTime(_) -> "no such time", _ -> "another refusal" }, e.column)),
+    Err(("no such time", c.column)),
+  )
+}
+
+test "a date or a time that is none is refused in std.date's words" {
+  let said = |refused: Option<date::Refusal>|
+    option_map(refused, |r: date::Refusal| NoSuchTime(r.message));
+  assert_eq(why_not("v = 2021-02-29"), said(result_err(date::literal("2021-02-29"))));
+  assert_eq(why_not("v = 07:32"), said(result_err(date::time_literal("07:32"))));
+  assert_eq(
+    why_not("v = 1979-05-27 25:00:00"),
+    said(result_err(date::date_time_literal("1979-05-27T25:00:00"))),
+  );
+  assert_eq(
+    why_not("v = 1979-05-27T07:32:00+1:00"),
+    said(result_err(date::rfc3339_literal("1979-05-27T07:32:00+1:00"))),
+  )
+}
+
+test "a second of 60 is read where std.date reads one" {
+  assert_eq(valued("2016-12-31T23:59:60Z"), valued("2016-12-31T23:59:59Z"));
+  assert_eq(valued("2016-12-31T23:59:60.5Z"), valued("2016-12-31T23:59:59.5Z"))
+}
+
+test "a basic string's escapes are read, and a literal string has none" {
+  assert_eq(
+    valued("\"a\\tb\\n\\\"c\\\" \\\\ \\u00e9 \\U0001F600\""),
+    Some(String("a\tb\n\"c\" \\ é 😀")),
+  );
+  assert_eq(valued("\"\\b\\f\\r\""), Some(String(string_of_bytes_lossy(b"\x08\x0c\r"))));
+  assert_eq(valued("'C:\\dir\\n'"), Some(String("C:\\dir\\n")));
+  assert_eq(valued("\"\""), Some(String("")));
+  assert_eq(valued("''"), Some(String("")));
+  assert_eq(valued("\"tab\there\""), Some(String("tab\there")));
+  assert_eq(valued("\"é😀\""), Some(String("é😀")))
+}
+
+test "a multi-line string drops its first newline and joins a line a backslash ends" {
+  assert_eq(valued("\"\"\"\nRoses\nViolets\"\"\""), Some(String("Roses\nViolets")));
+  assert_eq(valued("\"\"\"\n\nRoses\"\"\""), Some(String("\nRoses")));
+  assert_eq(valued("\"\"\"a \\\n   \n  b\"\"\""), Some(String("a b")));
+  assert_eq(valued("\"\"\"a \\  \n  b\"\"\""), Some(String("a b")));
+  assert_eq(valued("\"\"\"two \"\" quotes\"\"\""), Some(String("two \"\" quotes")));
+  assert_eq(valued("\"\"\"ends in two\"\"\"\"\""), Some(String("ends in two\"\"")));
+  assert_eq(valued("\"\"\"\"one\"\"\""), Some(String("\"one")));
+  assert_eq(valued("\"\"\"\\\"\"\"\"\"\""), Some(String("\"\"\"")));
+  assert_eq(valued("'''\nraw \\n ''\n'''"), Some(String("raw \\n ''\n")));
+  assert_eq(valued("'''it''s'''''"), Some(String("it''s''")));
+  assert_eq(why_not("v = \"\"\"a\"\"\"\"\"\""), Some(Expected("the line to end here")));
+  assert_eq(why_not("v = \"\"\"a \\ b\"\"\""), Some(Escape))
+}
+
+test "a newline in a multi-line string is a line feed however the file ends its lines" {
+  assert_eq(valued("\"\"\"\r\na\r\nb\"\"\"\r\n"), Some(String("a\nb")));
+  assert_eq(valued("'''\r\na\r\nb'''\r\n"), Some(String("a\nb")));
+  assert_eq(valued("\"\"\"a \\\r\n   b\"\"\"\r\n"), Some(String("a b")));
+  assert_eq(valued("\"\"\"a\\r\\nb\"\"\""), Some(String("a\r\nb")));
+  assert_eq(parse(b"a = 1\r\nb = 2\r\n", limited()), parse(b"a = 1\nb = 2\n", limited()))
+}
+
+type Unread = { text: String, why: Why }
+
+fn unread_texts() -> List<Unread> =
+  [
+    { text: "v = \"a\\qb\"", why: Escape },
+    { text: "v = \"\\x41\"", why: Escape },
+    { text: "v = \"\\u12\"", why: Escape },
+    { text: "v = \"\\ud800\"", why: Escape },
+    { text: "v = \"\\U00110000\"", why: Escape },
+    { text: "v = \"\\e\"", why: Escape },
+    { text: "v = \"no end", why: Expected("`\"` to close a string on its line") },
+    { text: "v = \"a\nb\"", why: Expected("`\"` to close a string on its line") },
+    { text: "v = 'a\nb'", why: Expected("`'` to close a string on its line") },
+    { text: "v = \"\"\"no end\"\"", why: Expected("`\"\"\"` to close a string") },
+    { text: "v = '''no end''", why: Expected("`'''` to close a string") },
+    { text: "v = \"\"\"", why: Expected("`\"\"\"` to close a string") },
+    { text: "v = \"\"\"\n", why: Expected("`\"\"\"` to close a string") },
+    { text: "v = '''", why: Expected("`'''` to close a string") },
+    { text: "v = \"", why: Expected("`\"` to close a string on its line") },
+    { text: "v = \"\\", why: Escape },
+    { text: "v = \"\"\"\\", why: Escape },
+    { text: "v = [", why: Expected("a value") },
+    { text: "v = {", why: Expected("a key") },
+    { text: "v = [1, #", why: Expected("a value") },
+    { text: "v = \"a\0b\"", why: Control(0) },
+    { text: "v = 'a\0b'", why: Control(0) },
+    { text: "v = \"\"\"a\rb\"\"\"", why: Control(13) },
+    { text: "v = '''a\0b'''", why: Control(0) },
+    { text: "# a\0comment", why: Control(0) },
+    { text: "a = 1\rb = 2", why: Control(13) },
+    { text: "v = [1,\r2]", why: Control(13) },
+  ]
+
+test "{inline(String(c.text))} is refused" for c: Unread in unread_texts() {
+  assert_eq(why_not(c.text), Some(c.why))
+}
+
+test "the delete character is a control character too, and a tab is not" {
+  assert_eq(why_not(string_of_bytes_lossy(b"v = \"a\x7fb\"")), Some(Control(127)));
+  assert_eq(why_not(string_of_bytes_lossy(b"# a\x7fb")), Some(Control(127)));
+  assert_eq(why_not(string_of_bytes_lossy(b"v = 'a\x1fb'")), Some(Control(31)));
+  assert_eq(valued("'a\tb' # a\tcomment"), Some(String("a\tb")))
+}
+
+test "keys are bare, quoted or dotted, and a quoted key is the same key" {
+  assert_eq(the("a-b_1 = 1"), Table([entry("a-b_1", Integer(1))]));
+  assert_eq(
+    the("\"a b\" = 1\n'c.d' = 2\n\"\" = 3"),
+    Table([entry("a b", Integer(1)), entry("c.d", Integer(2)), entry("", Integer(3))]),
+  );
+  assert_eq(the("a . \"b c\" . d = 1"), the("[a.\"b c\"]\nd = 1"));
+  assert_eq(
+    the("1234 = 1\n1.5 = 2"),
+    Table([entry("1234", Integer(1)), entry("1", Table([entry("5", Integer(2))]))]),
+  );
+  assert_eq(why_not("a = 1\n\"a\" = 2"), Some(Duplicate([Key("a")])));
+  assert_eq(why_not("= 1"), Some(Expected("a key")));
+  assert_eq(why_not("a..b = 1"), Some(Expected("a key")));
+  assert_eq(why_not("a. = 1"), Some(Expected("a key")));
+  assert_eq(why_not("a b = 1"), Some(Expected("`=` after a key")));
+  assert_eq(why_not("a"), Some(Expected("`=` after a key")));
+  assert_eq(why_not("\"\"\"a\"\"\" = 1"), Some(Expected("`=` after a key")));
+  assert_eq(why_not("é = 1"), Some(Expected("a key")))
+}
+
+test "an array takes newlines, comments and a last comma, and an inline table none of them" {
+  assert_eq(valued("[\n  1, # one\n  2,\n]"), Some(Array([Integer(1), Integer(2)])));
+  assert_eq(valued("[]"), Some(Array([])));
+  assert_eq(valued("[ [ ] , { } ]"), Some(Array([Array([]), Table([])])));
+  assert_eq(why_not("v = [1 2]"), Some(Expected("`,` or `]` in an array")));
+  assert_eq(why_not("v = [,]"), Some(Expected("a value")));
+  assert_eq(why_not("v = [1,,]"), Some(Expected("a value")));
+  assert_eq(why_not("v = [1"), Some(Expected("`,` or `]` in an array")));
+  assert_eq(why_not("v = { a = 1, }"), Some(Expected("a key")));
+  assert_eq(why_not("v = { a = 1\n}"), Some(Expected("`,` or `}` in an inline table")));
+  assert_eq(why_not("v = { a = 1 # no\n}"), Some(Expected("`,` or `}` in an inline table")));
+  assert_eq(why_not("v = { a = 1"), Some(Expected("`,` or `}` in an inline table")))
+}
+
+test "a line holds one thing, and a header closes as it opened" {
+  assert_eq(why_not("a = 1 b = 2"), Some(Expected("the line to end here")));
+  assert_eq(why_not("[a] b = 2"), Some(Expected("the line to end here")));
+  assert_eq(why_not("[a"), Some(Expected("`]` to close a table's header")));
+  assert_eq(why_not("[[a]"), Some(Expected("`]]` to close the header of an array of tables")));
+  assert_eq(why_not("[[a] ]"), Some(Expected("`]]` to close the header of an array of tables")));
+  assert_eq(why_not("[ [a]]"), Some(Expected("a key")));
+  assert_eq(why_not("[]"), Some(Expected("a key")));
+  assert_eq(
+    the("[ a . b ]\n[[ c ]]"),
+    Table([entry("a", Table([entry("b", Table([]))])), entry("c", Array([Table([])]))]),
+  )
+}
+
+// --- Tests: what a document may define --------------------------------------
+
+type Broken = { text: String, line: Int, column: Int, why: Why }
+
+fn broken_rules() -> List<Broken> =
+  [
+    { text: "a = 1\na = 2", line: 2, column: 1, why: Duplicate([Key("a")]) },
+    { text: "[a]\nb = 1\n[a]", line: 3, column: 2, why: Duplicate([Key("a")]) },
+    { text: "a.b = 1\na.b = 2", line: 2, column: 3, why: Duplicate([Key("a"), Key("b")]) },
+    { text: "a.b = 1\n[a]", line: 2, column: 2, why: Duplicate([Key("a")]) },
+    { text: "[a]\nb.c = 1\n[a.b]", line: 3, column: 4, why: Duplicate([Key("a"), Key("b")]) },
+    { text: "[a.b]\n[a]\nb.c = 1", line: 3, column: 1, why: Closed([Key("a"), Key("b")]) },
+    {
+      text: "[a.b.c]\n[a]\nb.c.d = 1",
+      line: 3,
+      column: 3,
+      why: Closed([Key("a"), Key("b"), Key("c")]),
+    },
+    {
+      text: "[a.b.c]\n[a]\nb.x = 1\n[a.b]",
+      line: 4,
+      column: 4,
+      why: Duplicate([Key("a"), Key("b")]),
+    },
+    { text: "a = { b = 1 }\na.c = 2", line: 2, column: 1, why: Closed([Key("a")]) },
+    { text: "a = { b = 1 }\n[a]", line: 2, column: 2, why: Closed([Key("a")]) },
+    { text: "a = { b = 1 }\n[a.c]", line: 2, column: 2, why: Closed([Key("a")]) },
+    { text: "a = [1]\n[[a]]", line: 2, column: 3, why: Closed([Key("a")]) },
+    { text: "a = [{ b = 1 }]\n[a.c]", line: 2, column: 2, why: Closed([Key("a")]) },
+    { text: "a = 1\na.b = 2", line: 2, column: 1, why: Closed([Key("a")]) },
+    { text: "a = 1\n[a.b]", line: 2, column: 2, why: Closed([Key("a")]) },
+    { text: "a = 1\n[a]", line: 2, column: 2, why: Duplicate([Key("a")]) },
+    { text: "[[a]]\n[a]", line: 2, column: 2, why: Duplicate([Key("a")]) },
+    { text: "[a]\n[[a]]", line: 2, column: 3, why: Duplicate([Key("a")]) },
+    { text: "[[a.b]]\n[a]\nb.c = 1", line: 3, column: 1, why: Closed([Key("a"), Key("b")]) },
+    {
+      text: "[[a]]\nb = 1\n[[a]]\nb = 1\nb = 2",
+      line: 5,
+      column: 1,
+      why: Duplicate([Key("a"), Index(1), Key("b")]),
+    },
+    {
+      text: "[[a]]\n[a.b]\n[[a]]\n[a.b]\n[a.b]",
+      line: 5,
+      column: 4,
+      why: Duplicate([Key("a"), Index(1), Key("b")]),
+    },
+    { text: "v = { a = 1, a = 2 }", line: 1, column: 14, why: Duplicate([Key("v"), Key("a")]) },
+    { text: "v = { a.b = 1, a = 2 }", line: 1, column: 16, why: Duplicate([Key("v"), Key("a")]) },
+    {
+      text: "v = { a = { b = 1 }, a.c = 2 }",
+      line: 1,
+      column: 22,
+      why: Closed([Key("v"), Key("a")]),
+    },
+    {
+      text: "v = [1, { a = 1, a = 2 }]",
+      line: 1,
+      column: 18,
+      why: Duplicate([Key("v"), Index(1), Key("a")]),
+    },
+  ]
+
+test "{inline(String(c.text))} breaks a rule" for c: Broken in broken_rules() {
+  assert_eq(
+    result_map_err(parse_string(c.text, limited()), |e: Refusal| (e.line, e.column, e.why)),
+    Err((c.line, c.column, c.why)),
+  )
+}
+
+test "a table may be defined after its children, and added to by headers below it" {
+  assert_eq(the("[a.b]\nx = 1\n[a]\ny = 2"), the("a = { y = 2, b = { x = 1 } }"));
+  assert_eq(
+    the("[a]\nb.c = 1\nb.d = 2\n[a.b.e]\nf = 3"),
+    the("a.b = { c = 1, d = 2, e = { f = 3 } }"),
+  );
+  assert_eq(the("a.b.c = 1\na.d = 2\na.b.e = 3"), the("a = { b = { c = 1, e = 3 }, d = 2 }"));
+  assert_eq(
+    the("[[a]]\nx = 1\n[a.b]\ny = 2\n[[a.c]]\n[[a.c]]\n[[a]]\nx = 3"),
+    the("a = [{ x = 1, b = { y = 2 }, c = [{}, {}] }, { x = 3 }]"),
+  );
+  // A table a longer header only implied takes dotted keys under its parent's header.
+  assert_eq(the("[a.b.c]\n[a]\nb.x = 1"), the("a.b = { c = {}, x = 1 }"))
+}
+
+test "a table keeps its keys in the order they were written" {
+  assert(match the("z = 1\na = 2\n[m]\n[b]\n") {
+    Table([z, a, m, b]) -> [z.key, a.key, m.key, b.key] == ["z", "a", "m", "b"],
+    _ -> false,
+  })
+}
+
+// --- Tests: refusals --------------------------------------------------------
+
+test "a refusal says the byte, the line and the column in characters" {
+  assert_eq(
+    parse_string("a = 1\nb = \"é\" x\n", limited()),
+    Err({ offset: 15, line: 2, column: 9, why: Expected("the line to end here") }),
+  );
+  assert_eq(
+    parse_string("a = 1\r\n\r\n  b = ?", limited()),
+    Err({ offset: 15, line: 3, column: 7, why: Expected("a value") }),
+  );
+  assert_eq(
+    result_map_err(parse_string("a = 1\nb = \"é\" x\n", limited()), refusal_to_string),
+    Err("line 2, column 9: expected the line to end here"),
+  );
+  assert_eq(
+    result_map_err(parse_string("[a]\n[b.\"c d\"]\n[b.\"c d\"]", limited()), refusal_to_string),
+    Err("line 3, column 4: `b.\"c d\"` is defined twice"),
+  );
+  assert_eq(
+    result_map_err(parse_string("a = 1\rb = 2", limited()), refusal_to_string),
+    Err("line 1, column 6: the control character U+000D may not be written here"),
+  );
+  assert_eq(
+    result_map_err(parse_string("[[a]]\nb = {}\n[a.b.c]", limited()), refusal_to_string),
+    Err(
+      "line 3, column 4: `a[0].b` cannot be added to here: it is no table, or it is defined elsewhere",
+    ),
+  )
+}
+
+test "bytes that are not UTF-8 are refused where they stop being it, and a byte order mark too" {
+  assert_eq(
+    parse(b"a = 1\nb = \"\xc3\xa9\xff\"", limited()),
+    Err({ offset: 13, line: 2, column: 7, why: NotUtf8 }),
+  );
+  assert_eq(
+    parse(b"# \xed\xa0\x80", limited()),
+    Err({ offset: 2, line: 1, column: 3, why: NotUtf8 }),
+  );
+  assert_eq(
+    parse(b"a = '\xe2\x82'", limited()),
+    Err({ offset: 5, line: 1, column: 6, why: NotUtf8 }),
+  );
+  assert_eq(
+    parse(b"\xef\xbb\xbfa = 1", limited()),
+    Err({ offset: 0, line: 1, column: 1, why: Expected("a document with no byte order mark") }),
+  )
+}
+
+test "a document is held to the bytes and the depth its reader is given" {
+  let small: Limits = { bytes: 10, depth: 2 };
+  assert_eq(parse(b"a = 123456", small), Ok(Table([entry("a", Integer(123456))])));
+  assert_eq(parse(b"a = 1234567", small), Err({ offset: 10, line: 1, column: 11, why: TooLong }));
+  let shallow = |text: String|
+    result_map_err(parse_string(text, { bytes: 100, depth: 2 }), |e: Refusal| (e.column, e.why));
+  assert_eq(shallow("a.b.c = 1"), Ok(the("a.b.c = 1")));
+  assert_eq(shallow("a = [[1]]"), Ok(the("a = [[1]]")));
+  assert_eq(shallow("a.b = [1]"), Ok(the("a.b = [1]")));
+  assert_eq(shallow("[a.b]\nc = 1"), Ok(the("a.b.c = 1")));
+  assert_eq(shallow("[a]\nb = { c = 1 }"), Ok(the("a.b.c = 1")));
+  assert_eq(shallow("a.b.c.d = 1"), Err((6, TooDeep)));
+  assert_eq(shallow("a = [[[1]]]"), Err((7, TooDeep)));
+  assert_eq(shallow("a.b = [[1]]"), Err((8, TooDeep)));
+  assert_eq(shallow("[a.b.c]"), Err((6, TooDeep)));
+  assert_eq(shallow("[a.b]\nc = [1]"), Err((5, TooDeep)));
+  assert_eq(shallow("[a.b]\nc.d = 1"), Err((2, TooDeep)));
+  assert_eq(shallow("a = { b = { c = {} } }"), Err((17, TooDeep)));
+  assert_eq(shallow("a = [{ b.c = 1 }]"), Err((9, TooDeep)));
+  let nested = |levels: Int|
+    bytes_concat_all([b"v = ", bytes::repeat(b"[", levels), bytes::repeat(b"]", levels)]);
+  assert(match parse(nested(16), limited()) { Ok(_) -> true, Err(_) -> false });
+  assert_eq(
+    result_map_err(parse(nested(17), limited()), |e: Refusal| (e.offset, e.why)),
+    Err((20, TooDeep)),
+  );
+  assert_eq(
+    result_map_err(
+      parse(bytes_concat(b"v = ", bytes::repeat(b"[", 60000)), limited()),
+      |e: Refusal| e.why,
+    ),
+    Err(TooDeep),
+  )
+}
+
+test "the raising reader raises what the other answers, and a task may perform it" {
+  assert_eq(
+    try { read(b"a = ", limited()) },
+    Err({ offset: 4, line: 1, column: 5, why: Expected("a value") }),
+  );
+  let read_in_task = simulate {
+    let t = task.spawn(|| try { read(b"a = 1\na = 2", limited()) });
+    task.join(t)
+  };
+  assert_eq(read_in_task, Err({ offset: 6, line: 2, column: 1, why: Duplicate([Key("a")]) }))
+}
+
+// --- Tests: writing ---------------------------------------------------------
+
+fn sample() -> Toml =
+  table([
+    entry("title", String("an example")),
+    entry("owner", table([entry("name", String("Tom")), entry("born", Integer(1979))])),
+    entry("ports", Array([Integer(8000), Integer(8001)])),
+    entry(
+      "servers",
+      table([
+        entry("alpha", table([entry("ip", String("10.0.0.1"))])),
+        entry("beta", table([entry("ip", String("10.0.0.2"))])),
+      ]),
+    ),
+    entry("enabled", Boolean(true)),
+    entry("rows", Array([table([entry("n", Integer(1))]), table([])])),
+    entry("mixed", Array([Integer(1), table([entry("n", Float(2.0))])])),
+    entry("none", table([])),
+  ])
+
+test "a table is written before the tables inside it, and an array of tables under headers" {
+  assert_eq(
+    to_string(sample()),
+    \\title = "an example"
+    \\ports = [8000, 8001]
+    \\enabled = true
+    \\mixed = [1, { n = 2.0 }]
+    \\
+    \\[owner]
+    \\name = "Tom"
+    \\born = 1979
+    \\
+    \\[servers.alpha]
+    \\ip = "10.0.0.1"
+    \\
+    \\[servers.beta]
+    \\ip = "10.0.0.2"
+    \\
+    \\[[rows]]
+    \\n = 1
+    \\
+    \\[[rows]]
+    \\
+    \\[none]
+    \\
+  );
+  assert_eq(parse(to_bytes(sample()), limited()), Ok(sample()));
+  assert_eq(to_string(Table([])), "");
+  assert_eq(to_string(Integer(3)), "3");
+  assert_eq(to_string(Array([String("a")])), "[\"a\"]")
+}
+
+test "an array of tables inside one, and a table inside an element, keep their places" {
+  let nested = the("[[a]]\nx = 1\n[a.b]\ny = 2\n[[a.c]]\nz = 3\n[[a.c]]\n[[a]]\nx = 4");
+  assert_eq(
+    to_string(nested),
+    \\[[a]]
+    \\x = 1
+    \\
+    \\[a.b]
+    \\y = 2
+    \\
+    \\[[a.c]]
+    \\z = 3
+    \\
+    \\[[a.c]]
+    \\
+    \\[[a]]
+    \\x = 4
+    \\
+  );
+  assert_eq(parse(to_bytes(nested), limited()), Ok(nested))
+}
+
+type Spelt = { text: String, written: String }
+
+fn spellings() -> List<Spelt> =
+  [
+    { text: "plain", written: "\"plain\"" },
+    { text: "", written: "\"\"" },
+    { text: "it's", written: "\"it's\"" },
+    { text: "C:\\dir\\file", written: "'C:\\dir\\file'" },
+    { text: "say \"hi\"", written: "'say \"hi\"'" },
+    { text: "it's \"both\"", written: "\"it's \\\"both\\\"\"" },
+    { text: "a\tb", written: "\"a\\tb\"" },
+    { text: "a\\\tb", written: "\"a\\\\\\tb\"" },
+    { text: "é😀", written: "\"é😀\"" },
+    { text: "nul\0", written: "\"nul\\u0000\"" },
+    { text: "one\ntwo", written: "\"\"\"\none\ntwo\"\"\"" },
+    { text: "\nleads", written: "\"\"\"\n\nleads\"\"\"" },
+    { text: "a \"\"\" b\n", written: "\"\"\"\na \\\"\\\"\\\" b\n\"\"\"" },
+    { text: "ends\n\"", written: "\"\"\"\nends\n\\\"\"\"\"" },
+    { text: "two \"\" stay\n", written: "\"\"\"\ntwo \"\" stay\n\"\"\"" },
+    { text: "cr\r\nlf\\", written: "\"\"\"\ncr\\r\nlf\\\\\"\"\"" },
+    { text: "tab\tstays\n", written: "\"\"\"\ntab\tstays\n\"\"\"" },
+  ]
+
+test "{inline(String(c.text))} is written by its rule and reads back" for c: Spelt in spellings() {
+  assert_eq(to_string(Table([entry("v", String(c.text))])), "v = " ++ c.written ++ "\n");
+  assert_eq(valued(c.written), Some(String(c.text)))
+}
+
+test "a string inside an array or an inline table stays on its line, and so does a key" {
+  assert_eq(inline(Array([String("one\ntwo")])), "[\"one\\ntwo\"]");
+  assert_eq(inline(table([entry("a\nb", String("c\nd"))])), "{ \"a\\nb\" = \"c\\nd\" }");
+  assert_eq(
+    to_string(table([entry("a b", table([entry("c.d", table([entry("'", Integer(1))]))]))])),
+    "[\"a b\".\"c.d\"]\n\"'\" = 1\n",
+  );
+  assert_eq(
+    to_string(table([entry("", Integer(1)), entry("C:\\", Integer(2))])),
+    "\"\" = 1\n'C:\\' = 2\n",
+  )
+}
+
+test "every control character and every kind of quote survives being written" {
+  let all = string_of_bytes_lossy(bytes_concat_all(map(range(0, 128), |c: Int| byte_of_int(c))));
+  assert_eq(valued(inline(String(all))), Some(String(all)));
+  assert_eq(
+    parse(to_bytes(Table([entry(all, String(all))])), limited()),
+    Ok(Table([entry(all, String(all))])),
+  )
+}
+
+test "numbers, dates and times are written as they are read" {
+  assert_eq(inline(Integer(-9223372036854775807 - 1)), "-9223372036854775808");
+  assert_eq(inline(Float(1.0)), "1.0");
+  assert_eq(inline(Float(-0.0)), "-0.0");
+  assert_eq(inline(Float(1e22)), "1e22");
+  assert_eq(inline(Float(0.1)), "0.1");
+  assert_eq(inline(Float(5e-324)), "5e-324");
+  assert_eq(inline(Float(infinity())), "inf");
+  assert_eq(inline(Float(neg_infinity())), "-inf");
+  assert_eq(inline(Float(nan())), "nan");
+  let written = |text: String| option_map(valued(text), inline);
+  assert_eq(written("1979-05-27 07:32:00.500z"), Some("1979-05-27T07:32:00.5Z"));
+  assert_eq(written("1979-05-27T07:32:00-07:00"), Some("1979-05-27T07:32:00-07:00"));
+  assert_eq(written("1979-05-27t07:32:00.000000001"), Some("1979-05-27T07:32:00.000000001"));
+  assert_eq(written("1979-05-27"), Some("1979-05-27"));
+  assert_eq(written("07:32:00.250"), Some("07:32:00.25"))
+}
+
+test "a key held twice is written once, with its last value" {
+  let twice = Table([
+    entry("a", Integer(1)),
+    entry("b", Table([entry("c", Integer(2)), entry("c", Integer(3))])),
+    entry("a", Integer(4)),
+  ]);
+  assert_eq(to_string(twice), "a = 4\n\n[b]\nc = 3\n");
+  assert_eq(inline(twice), "{ a = 4, b = { c = 3 } }");
+  assert_eq(parse(to_bytes(twice), limited()), Ok(twice))
+}
+
+// --- Tests: documents -------------------------------------------------------
+
+fn manifest() -> String =
+  \\# The package.
+  \\name = "demo"   # as published
+  \\version = "0.1.0"
+  \\
+  \\[dependencies]
+  \\  serde = { version = "1", features = ["derive"] }
+  \\  # pinned for the old compiler
+  \\  rand = "0.8"
+  \\
+  \\[[bin]]
+  \\name = "a"
+  \\
+  \\[[bin]]
+  \\name = "b"
+  \\path = 'src\b.rs'
+  \\
+  \\[profile.release]
+  \\opt = 3
+  \\
+
+fn manifest_document() -> Document / {abort.raise} =
+  match parse_document(bytes_of_string(manifest()), limited()) {
+    Ok(d) -> d,
+    Err(e) -> panic(refusal_to_string(e)),
+  }
+
+fn edit_text(edit: Result<Document, Refusal>) -> String =
+  match edit { Ok(d) -> string_of_bytes_lossy(source(d)), Err(e) -> refusal_to_string(e) }
+
+test "a document is its bytes and its value" {
+  let d = manifest_document();
+  assert_eq(source(d), bytes_of_string(manifest()));
+  assert_eq(Ok(value(d)), parse_string(manifest(), limited()));
+  assert_eq(
+    parse_document(b"a = 1\na = 2", limited()),
+    Err({ offset: 6, line: 2, column: 1, why: Duplicate([Key("a")]) }),
+  )
+}
+
+test "a path's place is where its value, its header or its first line is written" {
+  let d = manifest_document();
+  assert_eq(place(d, [Key("version")]), Some({ line: 3, column: 11 }));
+  assert_eq(place(d, [Key("dependencies")]), Some({ line: 5, column: 1 }));
+  assert_eq(
+    place(d, [Key("dependencies"), Key("serde"), Key("features"), Index(0)]),
+    Some({ line: 6, column: 40 }),
+  );
+  assert_eq(place(d, [Key("bin")]), Some({ line: 10, column: 1 }));
+  assert_eq(place(d, [Key("bin"), Index(1)]), Some({ line: 13, column: 1 }));
+  assert_eq(place(d, [Key("bin"), Index(1), Key("path")]), Some({ line: 15, column: 8 }));
+  assert_eq(place(d, [Key("profile")]), Some({ line: 17, column: 1 }));
+  assert_eq(place(d, [Key("profile"), Key("release"), Key("opt")]), Some({ line: 18, column: 7 }));
+  assert_eq(place(d, [Key("profile"), Key("dev")]), None);
+  assert_eq(place(d, [Key("bin"), Index(2)]), None)
+}
+
+test "setting a value that is written changes those bytes and no others" {
+  let d = manifest_document();
+  assert_eq(
+    edit_text(try { set(d, [Key("version")], String("0.2.0")) }),
+    string::replace(manifest(), "\"0.1.0\"", "\"0.2.0\""),
+  );
+  assert_eq(
+    edit_text(try {
+      set(d, [Key("dependencies"), Key("serde"), Key("features"), Index(0)], String("std"))
+    }),
+    string::replace(manifest(), "\"derive\"", "\"std\""),
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("bin"), Index(1), Key("path")], Array([Integer(1)])) }),
+    string::replace(manifest(), "'src\\b.rs'", "[1]"),
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("dependencies"), Key("serde")], String("1")) }),
+    string::replace(manifest(), "{ version = \"1\", features = [\"derive\"] }", "\"1\""),
+  )
+}
+
+test "a new key goes after its table's last line, as that line is indented" {
+  let d = manifest_document();
+  assert_eq(
+    edit_text(try { set(d, [Key("dependencies"), Key("log")], String("0.4")) }),
+    string::replace(manifest(), "  rand = \"0.8\"\n", "  rand = \"0.8\"\n  log = \"0.4\"\n"),
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("edition")], String("2021")) }),
+    string::replace(
+      manifest(),
+      "version = \"0.1.0\"\n",
+      "version = \"0.1.0\"\nedition = \"2021\"\n",
+    ),
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("bin"), Index(0), Key("path")], String("a.rs")) }),
+    string::replace_first(manifest(), "name = \"a\"\n", "name = \"a\"\npath = \"a.rs\"\n"),
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("profile"), Key("release"), Key("debug")], Boolean(true)) }),
+    manifest() ++ "debug = true\n",
+  )
+}
+
+test "a key in a table with no lines of its own gets a header, or a dotted key" {
+  let d = manifest_document();
+  assert_eq(
+    edit_text(try { set(d, [Key("profile"), Key("dev"), Key("opt")], Integer(0)) }),
+    manifest() ++ "\n[profile.dev]\nopt = 0\n",
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("bin"), Index(1), Key("build"), Key("jobs")], Integer(2)) }),
+    manifest() ++ "\n[bin.build]\njobs = 2\n",
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("bin"), Index(0), Key("build"), Key("jobs")], Integer(2)) }),
+    string::replace_first(manifest(), "name = \"a\"\n", "name = \"a\"\nbuild.jobs = 2\n"),
+  );
+  assert_eq(
+    edit_text(try { set(d, [Key("profile"), Key("opt")], Integer(1)) }),
+    manifest() ++ "\n[profile]\nopt = 1\n",
+  );
+  assert_eq(edit_text(parse_document(b"a.b = 1\n\n[c]\n", limited())), "a.b = 1\n\n[c]\n");
+  assert_eq(
+    edit_text(match parse_document(b"a.b = 1\n\n[c]\n", limited()) {
+      Ok(dotted) -> try { set(dotted, [Key("a"), Key("d")], Integer(2)) },
+      Err(e) -> Err(e),
+    }),
+    "a.b = 1\na.d = 2\n\n[c]\n",
+  );
+  assert_eq(
+    edit_text(match parse_document(b"# a file\n\n# about c\n  # and more\n[c]", limited()) {
+      Ok(bare_root) -> try { set(set(bare_root, [Key("a")], Integer(1)), [Key("b")], Integer(2)) },
+      Err(e) -> Err(e),
+    }),
+    "# a file\n\na = 1\nb = 2\n\n# about c\n  # and more\n[c]\n",
+  );
+  assert_eq(
+    edit_text(match parse_document(b"# about c\n[c]\n", limited()) {
+      Ok(bare_root) -> try { set(bare_root, [Key("a")], Integer(1)) },
+      Err(e) -> Err(e),
+    }),
+    "a = 1\n\n# about c\n[c]\n",
+  );
+  assert_eq(
+    edit_text(match parse_document(b"", limited()) {
+      Ok(empty) -> try { set(empty, [Key("a"), Key("b")], Integer(1)) },
+      Err(e) -> Err(e),
+    }),
+    "[a]\nb = 1\n",
+  )
+}
+
+test "a key inside an inline table or an array has that one value written again" {
+  let d = manifest_document();
+  assert_eq(
+    edit_text(try { set(d, [Key("dependencies"), Key("serde"), Key("optional")], Boolean(true)) }),
+    string::replace(
+      manifest(),
+      "{ version = \"1\", features = [\"derive\"] }",
+      "{ version = \"1\", features = [\"derive\"], optional = true }",
+    ),
+  );
+  assert_eq(
+    edit_text(try { remove(d, [Key("dependencies"), Key("serde"), Key("features")]) }),
+    string::replace(
+      manifest(),
+      "{ version = \"1\", features = [\"derive\"] }",
+      "{ version = \"1\" }",
+    ),
+  )
+}
+
+test "setting a value where a table stood takes the table's lines away" {
+  let d = manifest_document();
+  assert_eq(
+    edit_text(try { set(d, [Key("bin")], Array([])) }),
+    string::replace(
+      string::replace(
+        string::replace(manifest(), "[[bin]]\nname = \"a\"\n", ""),
+        "[[bin]]\nname = \"b\"\npath = 'src\\b.rs'\n",
+        "",
+      ),
+      "version = \"0.1.0\"\n",
+      "version = \"0.1.0\"\nbin = []\n",
+    ),
+  )
+}
+
+test "removing a path takes its lines and leaves the rest, comments among it" {
+  let d = manifest_document();
+  assert_eq(
+    edit_text(try { remove(d, [Key("name")]) }),
+    string::replace(manifest(), "name = \"demo\"   # as published\n", ""),
+  );
+  assert_eq(
+    edit_text(try { remove(d, [Key("dependencies"), Key("rand")]) }),
+    string::replace(manifest(), "  rand = \"0.8\"\n", ""),
+  );
+  assert_eq(
+    edit_text(try { remove(d, [Key("bin"), Index(0)]) }),
+    string::replace_first(manifest(), "[[bin]]\nname = \"a\"\n", ""),
+  );
+  assert_eq(
+    edit_text(try { remove(d, [Key("profile")]) }),
+    string::replace(manifest(), "[profile.release]\nopt = 3\n", ""),
+  );
+  assert_eq(edit_text(try { remove(d, [Key("nothing"), Key("here")]) }), manifest());
+  assert_eq(
+    option_map(
+      result_ok(try { remove(remove(d, [Key("bin"), Index(1)]), [Key("bin"), Index(0)]) }),
+      |emptied: Document| at(value(emptied), [Key("bin")]),
+    ),
+    Some(None),
+  )
+}
+
+fn set_in(text: String, path: List<Step>, v: Toml) -> String =
+  edit_text(match parse_document(bytes_of_string(text), limited()) {
+    Ok(d) -> try { set(d, path, v) },
+    Err(e) -> Err(e),
+  })
+
+test "a line added to a document ends as its lines do" {
+  assert_eq(
+    set_in("a = 1\r\n[b]\r\nc = 2", [Key("d")], Integer(3)),
+    "a = 1\r\nd = 3\r\n[b]\r\nc = 2\r\n",
+  );
+  assert_eq(
+    set_in("[b]\r\nc = 2\r\n", [Key("e"), Key("f")], Integer(3)),
+    "[b]\r\nc = 2\r\n\r\n[e]\r\nf = 3\r\n",
+  );
+  assert_eq(set_in("# c\r\n[b]\r\n", [Key("a")], Integer(1)), "a = 1\r\n\r\n# c\r\n[b]\r\n");
+  assert_eq(set_in("a = 1", [Key("b")], Integer(2)), "a = 1\nb = 2\n")
+}
+
+test "a key goes where the lines that define its table allow" {
+  // A table of dotted keys under a header takes another, and no header of its own.
+  assert_eq(
+    set_in("[a]\nb.c = 1\n", [Key("a"), Key("b"), Key("d")], Integer(2)),
+    "[a]\nb.c = 1\nb.d = 2\n",
+  );
+  // A table a longer header implied is given its header.
+  assert_eq(
+    set_in("[a.b]\nx = 1\n", [Key("a"), Key("y")], Integer(2)),
+    "[a.b]\nx = 1\n\n[a]\ny = 2\n",
+  );
+  // After a value of several lines, and before the comments that follow the table's last key.
+  assert_eq(
+    set_in("a = \"\"\"\none\ntwo\"\"\" # ends here\n# after\n[t]\n", [Key("b")], Integer(2)),
+    "a = \"\"\"\none\ntwo\"\"\" # ends here\nb = 2\n# after\n[t]\n",
+  );
+  assert_eq(set_in("a = [\n  1,\n]\n", [Key("b")], Integer(2)), "a = [\n  1,\n]\nb = 2\n");
+  // Inside an array of inline tables, a value that is written is replaced where it stands.
+  assert_eq(
+    set_in("a = [{ x = 1 }, { x = 2 }] # two", [Key("a"), Index(1), Key("x")], Integer(3)),
+    "a = [{ x = 1 }, { x = 3 }] # two",
+  );
+  assert_eq(
+    set_in("a = 1\n", [Key("a b"), Key("c.d")], Boolean(true)),
+    "a = 1\n\n[\"a b\"]\n\"c.d\" = true\n",
+  );
+  assert_eq(set_in("[a]\nx = 1\n[a.b]\ny = 2\n[c]\n", [Key("a")], Integer(5)), "a = 5\n\n[c]\n")
+}
+
+test "an edit the document has no place for is refused where the path stops" {
+  let d = manifest_document();
+  assert_eq(
+    try { set(d, [Key("name"), Key("first")], String("x")) },
+    Err({ offset: 22, line: 2, column: 8, why: Closed([Key("name"), Key("first")]) }),
+  );
+  assert_eq(
+    result_map_err(
+      try { set(d, [Key("bin"), Index(2), Key("name")], String("c")) },
+      |e: Refusal| (e.line, e.why),
+    ),
+    Err((10, Closed([Key("bin"), Index(2), Key("name")]))),
+  );
+  assert_eq(result_map_err(try { set(d, [], Integer(1)) }, |e: Refusal| e.why), Err(Closed([])));
+  let tight = match parse_document(b"a = 1\n", { bytes: 8, depth: 4 }) {
+    Ok(held) -> try { set(held, [Key("b")], Integer(2)) },
+    Err(e) -> Err(e),
+  };
+  assert_eq(result_map_err(tight, |e: Refusal| e.why), Err(TooLong))
+}
+
+// --- Tests: codecs ----------------------------------------------------------
+
+type Server = { host: String, port: Int, tags: List<String>, since: Option<date::Date> }
+
+fn server_toml() -> TomlCodec<Server> =
+  {
+    encode: |s: Server|
+      table(
+        concat(
+          [
+            entry("host", String(s.host)),
+            entry("port", Integer(s.port)),
+            entry("tags", list_toml(string_toml()).encode(s.tags)),
+          ],
+          match s.since { Some(d) -> [entry("since", LocalDate(d))], None -> [] },
+        ),
+      ),
+    decode: |t: Toml| -> Result<Server, DecodeError> {
+      let host = field(t, "host", string_toml())?;
+      let port = field(t, "port", int_toml())?;
+      let tags = field(t, "tags", list_toml(string_toml()))?;
+      let since = optional_field(t, "since", date_toml())?;
+      let _ = only_fields(t, ["host", "port", "tags", "since"])?;
+      Ok({ host: host, port: port, tags: tags, since: since })
+    },
+  }
+
+type Fleet = { servers: List<Server> }
+
+fn fleet_toml() -> TomlCodec<Fleet> =
+  {
+    encode: |f: Fleet| table([entry("server", list_toml(server_toml()).encode(f.servers))]),
+    decode: |t: Toml| -> Result<Fleet, DecodeError> {
+      let servers = field(t, "server", list_toml(server_toml()))?;
+      Ok({ servers: servers })
+    },
+  }
+
+fn fleet() -> Fleet =
+  {
+    servers: [
+      { host: "a.example", port: 80, tags: ["edge"], since: day("2026-10-05") },
+      { host: "b.example", port: 8080, tags: [], since: None },
+    ],
+  }
+
+fn fleet_text() -> String =
+  \\[[server]]
+  \\host = "a.example"
+  \\port = 80
+  \\tags = ["edge"]
+  \\since = 2026-10-05
+  \\
+  \\[[server]]
+  \\host = "b.example"
+  \\port = 8080
+  \\tags = []
+  \\
+
+fn decode_failure(text: String) -> String / {abort.raise} =
+  match decode_string(text, limited(), fleet_toml()) {
+    Ok(_) -> "decoded",
+    Err(e) -> error_to_string(e),
+  }
+
+test "a record's codec writes a document and reads it back" {
+  assert_eq(encode_string(fleet(), fleet_toml()), fleet_text());
+  assert_eq(decode_string(fleet_text(), limited(), fleet_toml()), Ok(fleet()));
+  assert_eq(decode_bytes(encode_bytes(fleet(), fleet_toml()), limited(), fleet_toml()), Ok(fleet()))
+}
+
+test "a document decodes as it stands, and again after an edit" {
+  match parse_document(bytes_of_string(fleet_text()), limited()) {
+    Err(e) -> panic(refusal_to_string(e)),
+    Ok(d) -> {
+      assert_eq(decode_document(d, fleet_toml()), Ok(fleet()));
+      let port = [Key("server"), Index(0), Key("port")];
+      assert_eq(
+        result_map(try { set(d, port, String("http")) }, |changed: Document|
+          result_map_err(decode_document(changed, fleet_toml()), error_to_string)),
+        Ok(Err("line 3, column 8: server[0].port: expected an integer, found a string")),
+      )
+    },
+  }
+}
+
+test "a decode error says the path of keys and the line and column it is written at" {
+  assert_eq(
+    decode_string(string::replace(fleet_text(), "8080", "\"http\""), limited(), fleet_toml()),
+    Err({
+      path: [Key("server"), Index(1), Key("port")],
+      place: Some({ line: 9, column: 8 }),
+      message: "expected an integer, found a string",
+    }),
+  );
+  assert_eq(
+    decode_failure(string::replace(fleet_text(), "8080", "\"http\"")),
+    "line 9, column 8: server[1].port: expected an integer, found a string",
+  );
+  assert_eq(
+    decode_failure(string::replace(fleet_text(), "tags = [\"edge\"]", "tags = [\"edge\", 2]")),
+    "line 4, column 17: server[0].tags[1]: expected a string, found an integer",
+  );
+  assert_eq(
+    decode_failure(string::replace(fleet_text(), "tags = []\n", "")),
+    "line 7, column 1: server[1].tags: this key is missing",
+  );
+  assert_eq(
+    decode_failure(string::replace(fleet_text(), "port = 8080", "prot = 8080")),
+    "line 7, column 1: server[1].port: this key is missing",
+  );
+  assert_eq(
+    decode_failure(string::replace(fleet_text(), "tags = []", "tags = []\nprot = 1")),
+    "line 11, column 8: server[1].prot: this key is not one of host, port, tags, since",
+  );
+  assert_eq(
+    decode_failure("server = 1"),
+    "line 1, column 10: server: expected an array, found an integer",
+  );
+  assert_eq(
+    decode_failure("# a fleet\n\nother = 1"),
+    "line 1, column 1: server: this key is missing",
+  );
+  assert_eq(decode_failure("server = [1"), "line 1, column 12: expected `,` or `]` in an array")
+}
+
+test "a codec over a value alone gives the path and no place" {
+  assert_eq(
+    fleet_toml().decode(the("server = [{ host = 1 }]")),
+    Err({
+      path: [Key("server"), Index(0), Key("host")],
+      place: None,
+      message: "expected a string, found an integer",
+    }),
+  );
+  assert_eq(
+    field(Integer(1), "a", int_toml()),
+    Err(decode_error("expected a table, found an integer")),
+  );
+  assert_eq(optional_field(the("a = 1"), "b", int_toml()), Ok(None));
+  assert_eq(optional_field(the("a = 1"), "a", int_toml()), Ok(Some(1)));
+  assert_eq(only_fields(the("a = 1\nb = 2"), ["a", "b", "c"]), Ok(()));
+  assert_eq(
+    only_fields(the("a = 1\n\"b c\" = 2"), ["a"]),
+    Err(in_field("b c", decode_error("this key is not one of a"))),
+  )
+}
+
+test "the leaf codecs read their own kind and say what they found of another" {
+  assert_eq(bool_toml().decode(Boolean(true)), Ok(true));
+  assert_eq(string_toml().decode(String("s")), Ok("s"));
+  assert_eq(int_toml().decode(Integer(7)), Ok(7));
+  assert_eq(float_toml().decode(Float(1.5)), Ok(1.5));
+  assert_eq(float_toml().decode(Integer(3)), Ok(3.0));
+  assert_eq(
+    float_toml().decode(Integer(9007199254740993)),
+    Err(decode_error("this integer is past what a float holds exactly")),
+  );
+  assert_eq(int_toml().decode(Float(1.0)), Err(decode_error("expected an integer, found a float")));
+  assert_eq(
+    bool_toml().decode(String("true")),
+    Err(decode_error("expected a boolean, found a string")),
+  );
+  assert_eq(toml_toml().decode(Array([])), Ok(Array([])));
+  assert_eq(
+    list_toml(int_toml()).decode(Table([])),
+    Err(decode_error("expected an array, found a table")),
+  );
+  assert_eq(
+    map(
+      [
+        valued("1979-05-27T07:32:00Z"),
+        valued("1979-05-27T07:32:00"),
+        valued("1979-05-27"),
+        valued("07:32:00"),
+      ],
+      |v: Option<Toml>| option_map(v, kind_of),
+    ),
+    [
+      Some("an offset date-time"),
+      Some("a local date-time"),
+      Some("a local date"),
+      Some("a local time"),
+    ],
+  )
+}
+
+test "the date and time codecs carry std.date's types" {
+  let today = day("2026-10-05");
+  assert_eq(
+    option_map(today, |d: date::Date| date_toml().decode(date_toml().encode(d))),
+    option_map(today, |d: date::Date| Ok(d)),
+  );
+  assert_eq(
+    option_map(valued("07:32:00"), |v: Toml| result_map(time_toml().decode(v), date::time_text)),
+    Some(Ok("07:32:00")),
+  );
+  assert_eq(
+    option_map(valued("1979-05-27T07:32:00"), |v: Toml|
+      result_map(date_time_toml().decode(v), date::date_time_text)),
+    Some(Ok("1979-05-27T07:32:00")),
+  );
+  assert_eq(
+    option_map(valued("1979-05-27T07:32:00+01:00"), |v: Toml|
+      result_map(offset_date_time_toml().decode(v), date::rfc3339)),
+    Some(Ok("1979-05-27T07:32:00+01:00")),
+  );
+  assert_eq(
+    option_map(valued("1979-05-27"), |v: Toml| offset_date_time_toml().decode(v)),
+    Some(Err(decode_error("expected an offset date-time, found a local date"))),
+  )
+}
+
+test "a string-keyed map is a table" {
+  let ports = map_insert(map_insert(map_new(), "b", 2), "a", 1);
+  let codec = string_map_toml(int_toml());
+  assert_eq(encode_string(ports, codec), "a = 1\nb = 2\n");
+  assert_eq(decode_string("b = 2\na = 1", limited(), codec), Ok(ports));
+  assert_eq(
+    result_map_err(decode_string("a = 1\nb = 'x'", limited(), codec), error_to_string),
+    Err("line 2, column 5: b: expected an integer, found a string"),
+  )
+}

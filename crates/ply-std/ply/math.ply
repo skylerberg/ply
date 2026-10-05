@@ -1,8 +1,16 @@
 //! The arithmetic a program wants and the operators are not.
 //!
 //! `min` and `max` are prelude builtins and stay there. `abs`, `sign`, `clamp`, `sum` and `product`
-//! take any numeric type and never raise, though overflow ends the run (`abs(min_int())` does); the
-//! rest is `Int`.
+//! take any numeric type and never raise, though overflow ends the run (`abs(min_int())` does). The
+//! named divisions, `midpoint` and `abs_diff` take any integer type: `/` and `%` round toward zero,
+//! and `div_floor`, `div_euclid` and `div_ceil` say which other way a call means. The rest is
+//! `Int`: the bits of its 64-bit pattern, powers, roots and logarithms, arithmetic to a modulus,
+//! and an `Int` as text in any radix from 2 to 36.
+//!
+//! The wrapping and checked forms of `+`, `-` and `*`, and the rotations, are the language's.
+
+import std.bytes (int_of_ascii_radix)
+import std.laws (agrees, inverse, round_trip)
 
 /// The bound of an `Int`, asked of the compiler rather than written out, so the two cannot drift.
 pub fn min_int() -> Int = 0 - max_int() - 1
@@ -48,50 +56,408 @@ pub fn even(n: Int) -> Bool = n % 2 == 0
 /// Whether `n` is not divisible by two.
 pub fn odd(n: Int) -> Bool = n % 2 != 0
 
-/// The greatest common divisor, never negative; `gcd(0, 0)` is `0`.
-pub fn gcd(a: Int, b: Int) -> Int / {abort.raise} = gcd_from(abs(a), abs(b))
+// --- Division ---------------------------------------------------------------
 
-/// The least common multiple, never negative; either addend zero makes it `0`.
+/// The quotient rounded toward negative infinity, where `/` rounds toward zero: the two differ by
+/// one where the operands' signs differ and the division is inexact. Raises on a zero divisor, and
+/// the one quotient past a signed type, its least value by `-1`, ends the run as `/` does.
+pub fn div_floor<a>(a: a, b: a) -> a / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let quotient = a / b;
+  if a % b != zero && a < zero != (b < zero) { quotient - numeric_of_int(1) } else { quotient }
+}
+
+/// What `div_floor` leaves, `a - b * div_floor(a, b)`: zero, or of the divisor's sign and nearer
+/// zero than it. Raises on a zero divisor; every other pair has an answer.
+pub fn rem_floor<a>(a: a, b: a) -> a / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let left = remainder(a, b);
+  if left != zero && left < zero != (b < zero) { left + b } else { left }
+}
+
+/// The quotient whose remainder is never negative: `div_floor` for a positive divisor, and the
+/// quotient rounded up for a negative one. Raises on a zero divisor, and the one quotient past a
+/// signed type, its least value by `-1`, ends the run as `/` does.
+pub fn div_euclid<a>(a: a, b: a) -> a / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let quotient = a / b;
+  if a % b < zero {
+    if b < zero { quotient + numeric_of_int(1) } else { quotient - numeric_of_int(1) }
+  } else { quotient }
+}
+
+/// What `div_euclid` leaves, `a - b * div_euclid(a, b)`: at least zero and below the divisor's
+/// distance from zero, whatever either sign is. Raises on a zero divisor; every other pair has an
+/// answer.
+pub fn rem_euclid<a>(a: a, b: a) -> a / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let left = remainder(a, b);
+  if left < zero { if b < zero { left - b } else { left + b } } else { left }
+}
+
+/// The quotient rounded toward positive infinity: how many groups of `b` hold `a` things. Raises on
+/// a zero divisor, and the one quotient past a signed type, its least value by `-1`, ends the run
+/// as `/` does.
+pub fn div_ceil<a>(a: a, b: a) -> a / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let quotient = a / b;
+  if a % b != zero && a < zero == (b < zero) { quotient + numeric_of_int(1) } else { quotient }
+}
+
+/// `div_floor` and `rem_floor` of one pair, as Python's `divmod` answers them. Raises and ends the
+/// run where `div_floor` does.
+pub fn div_mod<a>(a: a, b: a) -> { quotient: a, remainder: a } / {abort.raise}
+  where integer(a)
+= { quotient: div_floor(a, b), remainder: rem_floor(a, b) }
+
+/// The value halfway from `a` to `b`, rounded toward negative infinity, at every pair: the sum the
+/// plain average takes on the way is never formed, so it cannot leave the type.
+pub fn midpoint<a>(a: a, b: a) -> a
+  where integer(a)
+= (a & b) + ((a ^ b) >> 1)
+
+/// The distance between `a` and `b`, or `None` where it is past the type, as a signed type's ends
+/// are from each other.
+pub fn abs_diff<a>(a: a, b: a) -> Option<a>
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let low = if a < b { a } else { b };
+  let high = if a < b { b } else { a };
+  // `~zero >>> 1` is a signed type's greatest value, and no unsigned `low` is below zero.
+  if low < zero && high >= zero && high > low + (~zero >>> 1) { None } else { Some(high - low) }
+}
+
+/// `a % b`, and zero where `b` is a signed type's `-1`: every `a` leaves nothing there, and `%`
+/// ends the run at the type's least value.
+fn remainder<a>(a: a, b: a) -> a / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  if b < zero && b == ~zero { zero } else { a % b }
+}
+
+// --- Bits -------------------------------------------------------------------
+
+/// How many bits of `n`'s 64-bit pattern are set: `64` for `-1`.
+pub fn popcount(n: Int) -> Int = ones_of_word(n & 0xFFFF_FFFF) + ones_of_word(n >>> 32)
+
+/// How many bits reach from the lowest to the highest set bit of `n`'s 64-bit pattern: `0` for
+/// zero, `64` for every negative `n`, and one more than `ilog2(n)` for a positive one.
+pub fn bit_length(n: Int) -> Int = {
+  let a = if n >>> 32 != 0 { 32 } else { 0 };
+  let b = a + (if n >>> a + 16 != 0 { 16 } else { 0 });
+  let c = b + (if n >>> b + 8 != 0 { 8 } else { 0 });
+  let d = c + (if n >>> c + 4 != 0 { 4 } else { 0 });
+  let e = d + (if n >>> d + 2 != 0 { 2 } else { 0 });
+  let f = e + (if n >>> e + 1 != 0 { 1 } else { 0 });
+  if n == 0 { 0 } else { f + 1 }
+}
+
+/// The zero bits above the highest set bit of `n`'s 64-bit pattern: `64` for zero and `0` for
+/// every negative `n`.
+pub fn leading_zeros(n: Int) -> Int = 64 - bit_length(n)
+
+/// The zero bits below the lowest set bit of `n`'s 64-bit pattern: `64` for zero, and `63` for
+/// `min_int()`.
+pub fn trailing_zeros(n: Int) -> Int =
+  if n == 0 { 64 } else {
+    let a = if n & 0xFFFF_FFFF == 0 { 32 } else { 0 };
+    let b = a + (if n >>> a & 0xFFFF == 0 { 16 } else { 0 });
+    let c = b + (if n >>> b & 0xFF == 0 { 8 } else { 0 });
+    let d = c + (if n >>> c & 0xF == 0 { 4 } else { 0 });
+    let e = d + (if n >>> d & 3 == 0 { 2 } else { 0 });
+    e + (if n >>> e & 1 == 0 { 1 } else { 0 })
+  }
+
+/// Whether `n` is `2^k` for some `k` from 0 to 62. Zero and every negative `n` are not, `min_int()`
+/// among them, though its pattern has one bit set.
+pub fn is_power_of_two(n: Int) -> Bool = n > 0 && n & n - 1 == 0
+
+/// The least power of two at or above `n`, which is `1` for every `n` below two; `None` above
+/// `2^62`, the greatest an `Int` holds.
+pub fn next_power_of_two(n: Int) -> Option<Int> =
+  if n <= 1 { Some(1) } else if n > 1 << 62 { None } else { Some(1 << bit_length(n - 1)) }
+
+/// The eight bytes of `n`'s 64-bit pattern in the opposite order.
+pub fn byte_swap(n: Int) -> Int = {
+  let pairs = n >>> 8 & 0x00FF_00FF_00FF_00FF | (n & 0x00FF_00FF_00FF_00FF) << 8;
+  let quads = pairs >>> 16 & 0x0000_FFFF_0000_FFFF | (pairs & 0x0000_FFFF_0000_FFFF) << 16;
+  quads >>> 32 | quads << 32
+}
+
+/// The sixty-four bits of `n`'s pattern in the opposite order.
+pub fn bit_reverse(n: Int) -> Int = {
+  let ones = n >>> 1 & 0x5555_5555_5555_5555 | (n & 0x5555_5555_5555_5555) << 1;
+  let twos = ones >>> 2 & 0x3333_3333_3333_3333 | (ones & 0x3333_3333_3333_3333) << 2;
+  byte_swap(twos >>> 4 & 0x0F0F_0F0F_0F0F_0F0F | (twos & 0x0F0F_0F0F_0F0F_0F0F) << 4)
+}
+
+/// The set bits of a value below `2^32`, summed in fields of two, four and eight bits.
+fn ones_of_word(x: Int) -> Int = {
+  let pairs = x - (x >>> 1 & 0x5555_5555);
+  let nibbles = (pairs & 0x3333_3333) + (pairs >>> 2 & 0x3333_3333);
+  (nibbles + (nibbles >>> 4) & 0x0F0F_0F0F) * 0x0101_0101 >>> 24 & 0xFF
+}
+
+// --- Divisors ---------------------------------------------------------------
+
+/// The greatest common divisor, never negative; `gcd(0, 0)` is `0`. The one answer past an `Int`
+/// is `2^63`, which `min_int()` has with itself and with zero, and it ends the run.
+pub fn gcd(a: Int, b: Int) -> Int = {
+  let u = below_zero(a);
+  let v = below_zero(b);
+  if u == 0 { 0 - v }
+  else if v == 0 { 0 - u } else {
+    let twos = trailing_zeros(u | v);
+    0 - (odd_gcd(u >> trailing_zeros(u), v, 128) << twos)
+  }
+}
+
+/// The least common multiple, never negative; either addend zero makes it `0`. One past an `Int`
+/// ends the run.
 pub fn lcm(a: Int, b: Int) -> Int / {abort.raise} =
   if a == 0 || b == 0 { 0 } else { abs(a / gcd(a, b) * b) }
 
+/// The greatest common divisor `g` of `a` and `b`, never negative, and the coefficients Euclid's
+/// algorithm makes it of them with: `a * x + b * y == g`. Ends the run where `gcd` does.
+pub fn gcd_extended(a: Int, b: Int) -> { gcd: Int, x: Int, y: Int } / {abort.raise} = {
+  let found = bezout({ r: a, x: 1, y: 0 }, { r: b, x: 0, y: 1 }, 128);
+  if found.r < 0 { { gcd: 0 - found.r, x: 0 - found.x, y: 0 - found.y } }
+  else { { gcd: found.r, x: found.x, y: found.y } }
+}
+
+/// The `x` in `0..modulus` with `a * x` one more than a multiple of `modulus`; `None` where `a` and
+/// `modulus` share a divisor above one, or `modulus` is below one.
+pub fn mod_inverse(a: Int, modulus: Int) -> Option<Int> / {abort.raise} =
+  if modulus < 1 { None } else {
+    let found = gcd_extended(rem_euclid(a, modulus), modulus);
+    if found.gcd == 1 { Some(rem_euclid(found.x, modulus)) } else { None }
+  }
+
+/// `n` as its distance from zero, negated: the one form every `Int` has.
+fn below_zero(n: Int) -> Int = if n > 0 { 0 - n } else { n }
+
+/// The greatest common divisor of an odd `u` and any `v`, each below zero or zero, negated. Each
+/// round takes a bit off `v`, so `room` rounds are more than two 64-bit values have.
+fn odd_gcd(u: Int, v: Int, room: Int) -> Int =
+  if v == 0 || room <= 0 { u } else {
+    let odd = v >> trailing_zeros(v);
+    if u < odd { odd_gcd(odd, u - odd, room - 1) } else { odd_gcd(u, odd - u, room - 1) }
+  }
+
+/// A remainder of Euclid's algorithm, and the coefficients that make it of the two inputs.
+type Step = { r: Int, x: Int, y: Int }
+
+/// Euclid's algorithm from two of its steps to its last. A divisor of `-1` ends it there, since
+/// it divides everything and `/` cannot divide the least `Int` by it.
+fn bezout(earlier: Step, later: Step, room: Int) -> Step / {abort.raise} =
+  if later.r == 0 || room <= 0 { earlier }
+  else if later.r == 0 - 1 { later } else {
+    let q = earlier.r / later.r;
+    let left = earlier.r - q * later.r;
+    // The coefficients of a zero remainder are the inputs over their divisor, which may be past
+    // an `Int`, and nothing reads them.
+    if left == 0 { later } else {
+      bezout(later, { r: left, x: earlier.x - q * later.x, y: earlier.y - q * later.y }, room - 1)
+    }
+  }
+
+// --- Powers, roots and logarithms -------------------------------------------
+
 /// `base` to `exponent`, by squaring. A negative exponent is `1`, as integer arithmetic has it,
-/// and an overflow wraps at `Int`'s width.
+/// and a power past an `Int` ends the run; `checked_pow` answers `None` for one.
 pub fn pow(base: Int, exponent: Int) -> Int =
   if exponent < 0 { 1 } else { pow_from(base, exponent, 1) }
 
-/// Whether `n` is prime. Zero, one and every negative number are not.
-pub fn is_prime(n: Int) -> Bool / {abort.raise} = if n < 2 { false } else { has_no_divisor(n, 2) }
+/// `pow(base, exponent)`, or `None` where the power is past an `Int`.
+pub fn checked_pow(base: Int, exponent: Int) -> Option<Int> =
+  if exponent < 0 { Some(1) } else { checked_pow_from(base, exponent, 1) }
 
-/// `n!`. A negative `n` is `1`, and the product wraps at `Int`'s width.
+/// `base` to `exponent`, less the multiples of `modulus` in it: a value in `0..modulus`, by
+/// squaring, with no product past an `Int` on the way. A negative exponent is the power of the
+/// inverse. `None` where `modulus` is below one, or the exponent is negative and `base` has no
+/// inverse.
+pub fn mod_pow(base: Int, exponent: Int, modulus: Int) -> Option<Int> / {abort.raise} =
+  if modulus < 1 { None } else if exponent >= 0 {
+    Some(mod_pow_from(rem_euclid(base, modulus), exponent, modulus, 1 % modulus))
+  } else {
+    match mod_inverse(base, modulus) {
+      None -> None,
+      // One power short and one more product, since the least exponent has no positive twin.
+      Some(inverse) ->
+        Some(
+          mod_mul(
+            mod_pow_from(inverse, 0 - (exponent + 1), modulus, 1 % modulus),
+            inverse,
+            modulus,
+          ),
+        ),
+    }
+  }
+
+/// Whether `n` is prime. Zero, one and every negative number are not. The answer is exact over
+/// the whole range and takes steps in the bits of `n`, not in its square root.
+pub fn is_prime(n: Int) -> Bool / {abort.raise} =
+  if n < 2 { false } else {
+    match divisor_among(n, witnesses()) {
+      Some(p) -> n == p,
+      None ->
+        n < 1681
+          || {
+            let twos = trailing_zeros(n - 1);
+            fold(witnesses(), true, |prime: Bool, a: Int|
+              prime && passes(n, a, n - 1 >> twos, twos))
+          },
+    }
+  }
+
+/// `n!`. A negative `n` is `1`, and one past `20`, whose factorial is past an `Int`, ends the run.
 pub fn factorial(n: Int) -> Int = if n <= 1 { 1 } else { n * factorial(n - 1) }
 
 /// The integer square root: the greatest `r` whose square is at most `n`. A negative `n` has none
 /// and answers `0`.
-pub fn isqrt(n: Int) -> Int / {abort.raise} = if n <= 0 { 0 } else { isqrt_from(n, n / 2 + 1) }
+pub fn isqrt(n: Int) -> Int =
+  if n <= 0 { 0 } else {
+    fold(range(0, 32), 0, |root: Int, i: Int| {
+      let raised = root | 1 << 31 - i;
+      match checked_mul(raised, raised) {
+        Some(square) -> if square <= n { raised } else { root },
+        None -> root,
+      }
+    })
+  }
+
+/// The integer `k`th root: the greatest `r` whose `k`th power is at most `n`. A negative `n` and a
+/// `k` below one have none and answer `0`.
+pub fn iroot(n: Int, k: Int) -> Int =
+  if n <= 0 || k < 1 { 0 } else {
+    fold(range(0, 63), 0, |root: Int, i: Int| {
+      let raised = root | 1 << 62 - i;
+      match checked_pow(raised, k) {
+        Some(power) -> if power <= n { raised } else { root },
+        None -> root,
+      }
+    })
+  }
 
 /// The integer logarithm: the greatest `k` whose power of two is at most `n`, so `ilog2(1024)` is
 /// `10`. A non-positive `n` has none and answers `0`, as `1` does.
-pub fn ilog2(n: Int) -> Int = if n <= 1 { 0 } else { 1 + ilog2(n / 2) }
+pub fn ilog2(n: Int) -> Int = if n <= 1 { 0 } else { bit_length(n) - 1 }
 
-fn gcd_from(a: Int, b: Int) -> Int / {abort.raise} = if b <= 0 { a } else { gcd_from(b, a % b) }
+/// The greatest `k` whose power of ten is at most `n`: one less than the digits `n` is written
+/// in. A non-positive `n` has none and answers `0`.
+pub fn ilog10(n: Int) -> Int = ilog(n, 10)
+
+/// The greatest `k` with `base` to the `k` at most `n`. A non-positive `n` and a `base` below two
+/// have none and answer `0`.
+pub fn ilog(n: Int, base: Int) -> Int = if n < 1 || base < 2 { 0 } else { ilog_from(n, base, 1, 0) }
 
 fn pow_from(base: Int, exponent: Int, acc: Int) -> Int =
   if exponent <= 0 { acc }
   else if even(exponent) { pow_from(base * base, exponent / 2, acc) }
   else { pow_from(base, exponent - 1, acc * base) }
 
-fn has_no_divisor(n: Int, d: Int) -> Bool / {abort.raise} =
-  if d > n || d * d > n { true } else if n % d == 0 { false } else { has_no_divisor(n, d + 1) }
+/// A square is taken only while the exponent left is two or more, so one past an `Int` means the
+/// power is too.
+fn checked_pow_from(base: Int, exponent: Int, acc: Int) -> Option<Int> =
+  if exponent <= 0 { Some(acc) } else if even(exponent) {
+    match checked_mul(base, base) {
+      Some(square) -> checked_pow_from(square, exponent / 2, acc),
+      None -> None,
+    }
+  } else {
+    match checked_mul(acc, base) {
+      Some(next) -> checked_pow_from(base, exponent - 1, next),
+      None -> None,
+    }
+  }
 
-/// Newton's guesses fall strictly until they stop, and never below the root, which is at least one.
-/// Newton's step from above: past twice the root a guess shrinks to 5/8 of itself or less, and near it
-/// a few steps settle, so 136 steps are ample for any `Int`.
-fn isqrt_from(n: Int, guess: Int) -> Int / {abort.raise} =
-  iterate(guess, 136, |g: Int| {
-    let next = (g + n / g) / 2;
-    if next >= g { Stop(g) } else { Continue(next) }
-  })
+/// `base` and `acc` are in `0..modulus`.
+fn mod_pow_from(base: Int, exponent: Int, modulus: Int, acc: Int) -> Int / {abort.raise} =
+  if exponent <= 0 { acc }
+  else if even(exponent) { mod_pow_from(mod_mul(base, base, modulus), exponent / 2, modulus, acc) }
+  else { mod_pow_from(base, exponent - 1, modulus, mod_mul(acc, base, modulus)) }
+
+/// The product of two values in `0..modulus`, in `0..modulus`, formed at 128 bits.
+fn mod_mul(a: Int, b: Int, modulus: Int) -> Int / {abort.raise} =
+  int_of_i128(i128_of_int(a) * i128_of_int(b) % i128_of_int(modulus))
+
+/// The primes to 37: as bases of the strong test they tell every composite below `2^64` from a
+/// prime, and as divisors they settle every `n` below `41 * 41`.
+fn witnesses() -> List<Int> = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+
+fn divisor_among(n: Int, primes: List<Int>) -> Option<Int> / {abort.raise} =
+  fold(primes, None, |found: Option<Int>, p: Int|
+    if found == None && n % p == 0 { Some(p) } else { found })
+
+/// Whether the odd `n` passes Miller and Rabin's strong test to base `a`, where `n - 1` is `d`
+/// times two to the `twos`: `a` to the `d` is one, or squares to `n - 1` within `twos` squarings.
+fn passes(n: Int, a: Int, d: Int, twos: Int) -> Bool / {abort.raise} = {
+  let x = mod_pow_from(a % n, d, n, 1);
+  x == 1 || x == n - 1
+    || fold(range(1, twos), { x: x, found: false }, |s: { x: Int, found: Bool }, _: Int|
+      if s.found { s } else {
+        let squared = mod_mul(s.x, s.x, n);
+        { x: squared, found: squared == n - 1 }
+      }).found
+}
+
+fn ilog_from(n: Int, base: Int, power: Int, k: Int) -> Int =
+  if k >= 63 { k } else {
+    match checked_mul(power, base) {
+      Some(next) -> if next <= n { ilog_from(n, base, next, k + 1) } else { k },
+      None -> k,
+    }
+  }
+
+// --- An Int as text ---------------------------------------------------------
+
+/// `n` written in `radix`: a `-` where it is negative, then its digits from `0-9a-z`, the most
+/// significant first, with no prefix and no leading zero. Raises for a radix outside `2..=36`.
+pub fn to_radix(n: Int, radix: Int) -> String / {abort.raise} = to_radix_padded(n, radix, 1)
+
+/// `to_radix` with zeros on the left of the digits, after any `-`, until there are `width` of
+/// them. Raises for a radix outside `2..=36`.
+pub fn to_radix_padded(n: Int, radix: Int, width: Int) -> String / {abort.raise} =
+  if radix < 2 || radix > 36 { panic("a radix is 2 to 36") } else {
+    let written = digits_below(below_zero(n), radix, b"", 64);
+    string_of_bytes(
+      bytes_concat_all([
+        if n < 0 { b"-" } else { b"" },
+        bytes_concat_all(map(range(bytes_len(written), max(width, 1)), |_: Int| b"0")),
+        written,
+      ]),
+    )
+  }
+
+/// The `Int` that `text` writes in `radix`: an optional `-`, then one or more digits, each `0-9`,
+/// `a-z` or `A-Z` and below the radix, and nothing else: no `+`, no prefix such as `0x`, no
+/// separator and no blank. `None` for any other text, and for a number past what an `Int` holds.
+/// Raises for a radix outside `2..=36`. `std.bytes`'s `int_of_ascii_radix` is this over `Bytes`.
+pub fn from_radix(text: String, radix: Int) -> Option<Int> / {abort.raise} =
+  int_of_ascii_radix(bytes_of_string(text), radix)
+
+/// The digit of each value below 36.
+fn digits() -> Bytes = b"0123456789abcdefghijklmnopqrstuvwxyz"
+
+/// The digits of `0 - n` before `acc`, for an `n` at or below zero; none for zero. Sixty-four is
+/// the most an `Int` has, in radix two.
+fn digits_below(n: Int, radix: Int, acc: Bytes, room: Int) -> Bytes / {abort.raise} =
+  if n == 0 || room <= 0 { acc } else {
+    let v = 0 - n % radix;
+    digits_below(n / radix, radix, bytes_concat(bytes_slice(digits(), v, v + 1), acc), room - 1)
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -124,15 +490,427 @@ test "the numeric functions take every numeric type, and a width's own bounds" {
   assert_eq(product([]), 1.0)
 }
 
+// --- Tests: division --------------------------------------------------------
+
+/// `b * q + r` at 128 bits, which no three `Int`s leave.
+fn recomposed(b: Int, q: Int, r: Int) -> I128 / {abort.raise} =
+  i128_of_int(b) * i128_of_int(q) + i128_of_int(r)
+
+/// Whether an `Int` is the quotient: of every pair but a zero divisor and the least `Int` by `-1`.
+fn divides(a: Int, b: Int) -> Bool = b != 0 && (a != min_int() || b != 0 - 1)
+
+law "a floor quotient and its remainder make the dividend"
+  forall (a: Int, b: Int) where divides(a, b) {
+    recomposed(b, div_floor(a, b), rem_floor(a, b)) == i128_of_int(a)
+  }
+
+law "a floor remainder is zero or of the divisor's sign, and nearer zero than it"
+  forall (a: Int, b: Int) where b != 0 {
+    let r = rem_floor(a, b);
+    if b > 0 { r >= 0 && r < b } else { r <= 0 && r > b }
+  }
+
+law "a Euclidean quotient and its remainder make the dividend"
+  forall (a: Int, b: Int) where divides(a, b) {
+    recomposed(b, div_euclid(a, b), rem_euclid(a, b)) == i128_of_int(a)
+  }
+
+law "a Euclidean remainder is never negative, and below the divisor's distance from zero"
+  forall (a: Int, b: Int) where b != 0 {
+    let r = rem_euclid(a, b);
+    r >= 0 && (if b > 0 { r < b } else { r + b < 0 })
+  }
+
+law "a Euclidean quotient is `/`, one further from zero where `%` is negative"
+  forall (a: Int, b: Int) where divides(a, b) {
+    div_euclid(a, b) == a / b - (if a % b < 0 { sign(b) } else { 0 })
+  }
+
+law "where neither operand is negative, the floor and Euclidean pairs are `/` and `%`"
+  forall (a: Int, b: Int) where a >= 0 && b > 0 {
+    div_floor(a, b) == a / b && div_euclid(a, b) == a / b && rem_floor(a, b) == a % b
+      && rem_euclid(a, b) == a % b
+  }
+
+law "a ceiling quotient overshoots the dividend by less than a divisor"
+  forall (a: Int, b: Int) where divides(a, b) {
+    let short = i128_of_int(a) - i128_of_int(b) * i128_of_int(div_ceil(a, b));
+    if b > 0 { short <= 0i128 && short > 0i128 - i128_of_int(b) }
+    else { short >= 0i128 && short < 0i128 - i128_of_int(b) }
+  }
+
+law "a midpoint is the floor of half the sum"
+  forall (a: Int, b: Int) {
+    i128_of_int(midpoint(a, b)) == div_floor(i128_of_int(a) + i128_of_int(b), 2i128)
+  }
+
+law "a distance is the difference at 128 bits, where an Int holds it"
+  forall (a: Int, b: Int) {
+    let apart = abs(i128_of_int(a) - i128_of_int(b));
+    match abs_diff(a, b) {
+      Some(d) -> i128_of_int(d) == apart,
+      None -> apart > i128_of_int(max_int()),
+    }
+  }
+
+/// What the named divisions answer at a signed type's two ends.
+fn signed_ends_hold<a>(low: a, high: a) -> Bool / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let one: a = numeric_of_int(1);
+  let two = one + one;
+  div_floor(low, high) == zero - two && rem_floor(low, high) == high - one
+    && div_euclid(low, high) == zero - two
+    && rem_euclid(low, high) == high - one
+    && div_ceil(low, high) == zero - one
+    && div_floor(high, low) == zero - one
+    && rem_floor(high, low) == zero - one
+    && div_euclid(high, low) == zero
+    && rem_euclid(high, low) == high
+    && div_ceil(high, low) == zero
+    && rem_floor(low, zero - one) == zero
+    && rem_euclid(low, zero - one) == zero
+    && div_floor(low, one) == low
+    && div_floor(low, two) == low / two
+    && div_ceil(high, two) == high / two + one
+    && div_mod(low, high) == { quotient: zero - two, remainder: high - one }
+    && midpoint(low, high) == zero - one
+    && midpoint(high, low) == zero - one
+    && midpoint(low, low) == low
+    && midpoint(high, high) == high
+    && abs_diff(low, high) == None
+    && abs_diff(low, zero - one) == Some(high)
+    && abs_diff(zero, high) == Some(high)
+}
+
+/// What they answer at an unsigned type's greatest value.
+fn unsigned_end_holds<a>(high: a) -> Bool / {abort.raise}
+  where integer(a)
+= {
+  let zero: a = numeric_of_int(0);
+  let one: a = numeric_of_int(1);
+  let two = one + one;
+  div_floor(high, two) == high / two && div_euclid(high, two) == high / two
+    && div_ceil(high, two) == high / two + one
+    && rem_floor(high, two) == one
+    && rem_euclid(high, two) == one
+    && rem_floor(high - one, high) == high - one
+    && rem_euclid(high - one, high) == high - one
+    && div_floor(high, high) == one
+    && div_ceil(high - one, high) == one
+    && midpoint(zero, high) == high / two
+    && midpoint(high, one) == high / two + one
+    && midpoint(high, high) == high
+    && abs_diff(zero, high) == Some(high)
+    && abs_diff(high, zero) == Some(high)
+}
+
+test "the named divisions hold at each width's ends" {
+  let widest = 170141183460469231731687303715884105727i128;
+  assert(signed_ends_hold(min_int(), max_int()));
+  assert(signed_ends_hold(i8_of_int(0 - 128), 127i8));
+  assert(signed_ends_hold(i16_of_int(0 - 32768), 32767i16));
+  assert(signed_ends_hold(i32_of_int(0 - 2147483648), 2147483647i32));
+  assert(signed_ends_hold(i64_of_int(min_int()), i64_of_int(max_int())));
+  assert(signed_ends_hold(0i128 - widest - 1i128, widest));
+  assert(unsigned_end_holds(255u8));
+  assert(unsigned_end_holds(65535u16));
+  assert(unsigned_end_holds(4294967295u32));
+  assert(unsigned_end_holds(18446744073709551615u64));
+  assert(unsigned_end_holds(340282366920938463463374607431768211455u128))
+}
+
+/// The real quotient rounded by `mode`, which a `Float` holds exactly for operands this small.
+fn real_quotient(a: Int, b: Int, mode: Rounding) -> Int / {abort.raise} =
+  match int_of_float(float_of_int(a) / float_of_int(b), mode) {
+    Some(q) -> q,
+    None -> panic("a quotient of two bytes is an Int"),
+  }
+
+test "every pair of I8s divides as the real quotient rounds" {
+  fold(range(0 - 128, 128), (), |_: Unit, a: Int|
+    fold(range(0 - 128, 128), (), |_: Unit, b: Int|
+      if b == 0 || (a == 0 - 128 && b == 0 - 1) { () } else {
+        let x = i8_of_int(a);
+        let y = i8_of_int(b);
+        let floor = real_quotient(a, b, Floor);
+        let ceiling = real_quotient(a, b, Ceiling);
+        let euclid = if b > 0 { floor } else { ceiling };
+        assert_eq(int_of_i8(div_floor(x, y)), floor);
+        assert_eq(int_of_i8(rem_floor(x, y)), a - b * floor);
+        assert_eq(int_of_i8(div_ceil(x, y)), ceiling);
+        assert_eq(int_of_i8(div_euclid(x, y)), euclid);
+        assert_eq(int_of_i8(rem_euclid(x, y)), a - b * euclid)
+      }))
+}
+
+test "the rounding a division names is the one it does" {
+  assert_eq(div_floor(7, 2), 3);
+  assert_eq(div_floor(0 - 7, 2), 0 - 4);
+  assert_eq(div_floor(7, 0 - 2), 0 - 4);
+  assert_eq(div_floor(0 - 7, 0 - 2), 3);
+  assert_eq(rem_floor(0 - 7, 2), 1);
+  assert_eq(rem_floor(7, 0 - 2), 0 - 1);
+  assert_eq(div_euclid(0 - 7, 2), 0 - 4);
+  assert_eq(div_euclid(7, 0 - 2), 0 - 3);
+  assert_eq(div_euclid(0 - 7, 0 - 2), 4);
+  assert_eq(rem_euclid(0 - 7, 2), 1);
+  assert_eq(rem_euclid(7, 0 - 2), 1);
+  assert_eq(rem_euclid(0 - 7, 0 - 2), 1);
+  assert_eq(div_ceil(7, 2), 4);
+  assert_eq(div_ceil(0 - 7, 2), 0 - 3);
+  assert_eq(div_ceil(6, 2), 3);
+  assert_eq(div_mod(0 - 7, 2), { quotient: 0 - 4, remainder: 1 });
+  assert_eq(midpoint(7, 10), 8);
+  assert_eq(midpoint(0 - 7, 0 - 10), 0 - 9);
+  assert_eq(abs_diff(0 - 3, 4), Some(7));
+  assert_eq(abs_diff(4, 0 - 3), Some(7))
+}
+
+test "a zero divisor raises as `/` does, and the least Int by -1 leaves nothing" {
+  let none = 1 - 1;
+  let by_operator = try[abort.raise] { 1 / none };
+  assert(by_operator != Ok(0));
+  assert_eq(try[abort.raise] { div_floor(1, none) }, by_operator);
+  assert_eq(try[abort.raise] { div_euclid(1, none) }, by_operator);
+  assert_eq(try[abort.raise] { div_ceil(1, none) }, by_operator);
+  assert_eq(try[abort.raise] { rem_floor(1, none) }, try[abort.raise] { 1 % none });
+  assert_eq(try[abort.raise] { rem_euclid(1, none) }, try[abort.raise] { 1 % none });
+  assert_eq(rem_floor(min_int(), 0 - 1), 0);
+  assert_eq(rem_euclid(min_int(), 0 - 1), 0);
+  assert_eq(rem_floor(min_int(), max_int()), max_int() - 1);
+  assert_eq(div_floor(min_int(), max_int()), 0 - 2);
+  assert_eq(div_euclid(max_int(), min_int()), 0);
+  assert_eq(rem_euclid(max_int(), min_int()), max_int())
+}
+
+// --- Tests: bits ------------------------------------------------------------
+
+fn bit_at(n: Int, i: Int) -> Int = n >>> i & 1
+
+fn ones_counted(n: Int) -> Int = fold(range(0, 64), 0, |ones: Int, i: Int| ones + bit_at(n, i))
+
+/// The zero bits before the first set one, reading bit `first` and then each `step` from it.
+fn zeros_from(n: Int, first: Int, step: Int) -> Int =
+  fold(range(0, 64), 0, |zeros: Int, i: Int|
+    if zeros == i && bit_at(n, first + step * i) == 0 { zeros + 1 } else { zeros })
+
+fn mirrored(n: Int) -> Int = fold(range(0, 64), 0, |out: Int, i: Int| out | bit_at(n, i) << 63 - i)
+
+law "popcount is the set bits counted one at a time" = agrees(popcount, ones_counted)
+
+law "leading_zeros is the zeros counted from the top bit down" =
+  agrees(leading_zeros, |n: Int| zeros_from(n, 63, 0 - 1))
+
+law "trailing_zeros is the zeros counted from the low bit up" =
+  agrees(trailing_zeros, |n: Int| zeros_from(n, 0, 1))
+
+law "bit_reverse is each bit moved to its mirror" = agrees(bit_reverse, mirrored)
+
+law "a byte swap undoes itself" = inverse(byte_swap, byte_swap)
+
+law "a bit reversal undoes itself" = inverse(bit_reverse, bit_reverse)
+
+test "a single bit is counted once, and found where it is from either end" {
+  fold(range(0, 64), (), |_: Unit, i: Int| {
+    let bit = 1 << i;
+    assert_eq(popcount(bit), 1);
+    assert_eq(popcount(~bit), 63);
+    assert_eq(trailing_zeros(bit), i);
+    assert_eq(leading_zeros(bit), 63 - i);
+    assert_eq(bit_length(bit), i + 1);
+    assert_eq(bit_reverse(bit), 1 << 63 - i);
+    assert_eq(is_power_of_two(bit), i < 63)
+  })
+}
+
+test "the bit functions read an Int as its 64-bit pattern, at both its ends" {
+  assert_eq(map([0, 0 - 1, min_int(), max_int()], popcount), [0, 64, 1, 63]);
+  assert_eq(map([0, 0 - 1, min_int(), max_int(), 1], leading_zeros), [64, 0, 0, 1, 63]);
+  assert_eq(map([0, 0 - 1, min_int(), max_int(), 0 - 2], trailing_zeros), [64, 0, 63, 0, 1]);
+  assert_eq(map([0, 1, 255, 256, max_int(), min_int(), 0 - 1], bit_length), [
+    0,
+    1,
+    8,
+    9,
+    63,
+    64,
+    64,
+  ]);
+  assert_eq(map([0, 1, 6, 1 << 62, min_int(), 0 - 4], is_power_of_two), [
+    false,
+    true,
+    false,
+    true,
+    false,
+    false,
+  ]);
+  assert_eq(byte_swap(0x0102_0304_0506_0708), 0x0807_0605_0403_0201);
+  assert_eq(byte_swap(min_int()), 0x80);
+  assert_eq(byte_swap(0xFF), 0xFF00_0000_0000_0000);
+  assert_eq(bit_reverse(min_int()), 1);
+  assert_eq(bit_reverse(0 - 1), 0 - 1);
+  assert_eq(bit_reverse(0x0F), 0xF000_0000_0000_0000)
+}
+
+test "the next power of two is answered up to the greatest an Int holds" {
+  assert_eq(map([min_int(), 0 - 5, 0, 1, 2, 3, 4, 5, 1000], next_power_of_two), [
+    Some(1),
+    Some(1),
+    Some(1),
+    Some(1),
+    Some(2),
+    Some(4),
+    Some(4),
+    Some(8),
+    Some(1024),
+  ]);
+  assert_eq(next_power_of_two((1 << 62) - 1), Some(1 << 62));
+  assert_eq(next_power_of_two(1 << 62), Some(1 << 62));
+  assert_eq(next_power_of_two((1 << 62) + 1), None);
+  assert_eq(next_power_of_two(max_int()), None)
+}
+
+// --- Tests: divisors --------------------------------------------------------
+
+/// Euclid's algorithm over two values that are not negative.
+fn euclid(a: Int, b: Int) -> Int / {abort.raise} = if b <= 0 { a } else { euclid(b, a % b) }
+
+/// Whether the greatest common divisor is `2^63`, the one past an `Int`.
+fn past_int(a: Int, b: Int) -> Bool =
+  (a == 0 || a == min_int()) && (b == 0 || b == min_int()) && (a != 0 || b != 0)
+
+law "gcd is what Euclid's algorithm answers of the two distances from zero"
+  forall (a: Int, b: Int) where a != min_int() && b != min_int() {
+    gcd(a, b) == euclid(abs(a), abs(b))
+  }
+
+law "the coefficients gcd_extended answers make the divisor of the two numbers"
+  forall (a: Int, b: Int) where !past_int(a, b) {
+    let found = gcd_extended(a, b);
+    found.gcd == gcd(a, b)
+      && i128_of_int(a) * i128_of_int(found.x) + i128_of_int(b) * i128_of_int(found.y)
+      == i128_of_int(found.gcd)
+  }
+
+law "an inverse times its number is one more than a multiple of the modulus"
+  forall (a: Int, modulus: Int) where modulus > 0 {
+    match mod_inverse(a, modulus) {
+      Some(x) ->
+        x >= 0 && x < modulus
+          && (i128_of_int(a) * i128_of_int(x) - 1i128) % i128_of_int(modulus) == 0i128,
+      None -> gcd(a, modulus) != 1,
+    }
+  }
+
 test "gcd and lcm are non-negative, and zero is answered rather than refused" {
   assert_eq(gcd(12, 18), 6);
   assert_eq(gcd(0 - 12, 18), 6);
+  assert_eq(gcd(0 - 12, 0 - 18), 6);
   assert_eq(gcd(0, 5), 5);
+  assert_eq(gcd(5, 0), 5);
   assert_eq(gcd(0, 0), 0);
+  assert_eq(gcd(17, 5), 1);
+  assert_eq(gcd(max_int(), 3577), 3577);
   assert_eq(lcm(4, 6), 12);
   assert_eq(lcm(0, 6), 0);
   assert_eq(lcm(7, 1), 7)
 }
+
+test "the least Int has a divisor in common with everything, and a coefficient for it" {
+  assert_eq(gcd(min_int(), 6), 2);
+  assert_eq(gcd(6, min_int()), 2);
+  assert_eq(gcd(min_int(), max_int()), 1);
+  assert_eq(gcd(min_int(), 1 << 62), 1 << 62);
+  assert_eq(gcd(min_int(), 0 - 1), 1);
+  assert_eq(gcd(min_int(), min_int() + 2), 2);
+  assert_eq(gcd_extended(min_int(), 0 - 1), { gcd: 1, x: 0, y: 0 - 1 });
+  assert_eq(gcd_extended(0 - 1, min_int()), { gcd: 1, x: 0 - 1, y: 0 });
+  assert_eq(gcd_extended(1, min_int()), { gcd: 1, x: 1, y: 0 });
+  assert_eq(gcd_extended(min_int(), 2), { gcd: 2, x: 0, y: 1 });
+  assert_eq(gcd_extended(240, 46), { gcd: 2, x: 0 - 9, y: 47 });
+  assert_eq(gcd_extended(0, 0), { gcd: 0, x: 1, y: 0 });
+  assert_eq(gcd_extended(0, 0 - 5), { gcd: 5, x: 0, y: 0 - 1 })
+}
+
+test "an inverse is in the modulus's range, and there is none where a divisor is shared" {
+  assert_eq(mod_inverse(3, 7), Some(5));
+  assert_eq(mod_inverse(0 - 3, 7), Some(2));
+  assert_eq(mod_inverse(10, 7), Some(5));
+  assert_eq(mod_inverse(2, 4), None);
+  assert_eq(mod_inverse(0, 7), None);
+  assert_eq(mod_inverse(5, 1), Some(0));
+  assert_eq(mod_inverse(5, 0), None);
+  assert_eq(mod_inverse(5, 0 - 7), None);
+  assert_eq(mod_inverse(min_int(), max_int()), Some(max_int() - 1));
+  assert_eq(mod_inverse(2, max_int()), Some(1 << 62))
+}
+
+// --- Tests: powers, roots and logarithms ------------------------------------
+
+/// `base` multiplied in `exponent` times, `None` from the first product past an `Int`.
+fn stepwise_pow(base: Int, exponent: Int) -> Option<Int> =
+  fold(range(0, exponent), Some(1), |acc: Option<Int>, _: Int|
+    match acc { Some(power) -> checked_mul(power, base), None -> None })
+
+law "checked_pow is the product taken a factor at a time, None where that leaves an Int"
+  forall (base: Int, exponent: Int) where exponent < 200 {
+    checked_pow(base, exponent) == stepwise_pow(base, exponent)
+  }
+
+law "pow is checked_pow wherever the power is an Int"
+  forall (base: Int, exponent: Int) where exponent < 200 {
+    match checked_pow(base, exponent) { Some(power) -> pow(base, exponent) == power, None -> true }
+  }
+
+law "mod_pow is the product taken a factor at a time, each reduced"
+  forall (base: Int, times: Int, size: Int) {
+    let exponent = rem_euclid(times, 200);
+    let modulus = 1 + rem_euclid(size, max_int());
+    mod_pow(base, exponent, modulus)
+      == Some(
+        fold(range(0, exponent), 1 % modulus, |acc: Int, _: Int|
+          mod_mul(acc, rem_euclid(base, modulus), modulus)),
+      )
+  }
+
+law "isqrt is the greatest root whose square is at most the number"
+  forall (n: Int) where n >= 0 {
+    let root = i128_of_int(isqrt(n));
+    root >= 0i128 && root * root <= i128_of_int(n)
+      && (root + 1i128) * (root + 1i128) > i128_of_int(n)
+  }
+
+law "the second root is the square root" = agrees(isqrt, |n: Int| iroot(n, 2))
+
+law "iroot is the greatest root whose power is at most the number"
+  forall (n: Int, degree: Int) where n >= 0 && n < max_int() {
+    let k = 1 + rem_euclid(degree, 64);
+    let root = iroot(n, k);
+    (match checked_pow(root, k) { Some(power) -> power <= n, None -> false })
+      && (match checked_pow(root + 1, k) { Some(power) -> power > n, None -> true })
+  }
+
+law "ilog is the greatest exponent whose power is at most the number"
+  forall (n: Int, pick: Int) where n >= 1 {
+    let base = 2 + rem_euclid(pick, 35);
+    let k = ilog(n, base);
+    (match checked_pow(base, k) { Some(power) -> power <= n, None -> false })
+      && (match checked_pow(base, k + 1) { Some(power) -> power > n, None -> true })
+  }
+
+law "ilog2 is the logarithm to base two" = agrees(ilog2, |n: Int| ilog(n, 2))
+
+law "a power takes steps in the bits of its exponent"
+  forall (n: Int) where n > 1 cost ilog2(n) {
+    checked_pow(1, n) == Some(pow(1, n))
+  }
+
+law "a modular power takes steps in the bits of its exponent"
+  forall (n: Int) where n > 1 cost ilog2(n) {
+    mod_pow(3, n, 1000000007)
+  }
 
 test "pow is by squaring, and the bounds are the compiler's" {
   assert_eq(pow(2, 10), 1024);
@@ -140,10 +918,98 @@ test "pow is by squaring, and the bounds are the compiler's" {
   assert_eq(pow(0, 0), 1);
   assert_eq(pow(2, 0 - 1), 1);
   assert_eq(pow(0 - 2, 3), 0 - 8);
+  assert_eq(pow(0 - 2, 63), min_int());
   assert_eq(min_int() + 1, 0 - max_int());
   assert(even(2));
   assert(odd(3));
   assert(even(0))
+}
+
+test "a power past an Int is None, and one that just fits is answered" {
+  assert_eq(checked_pow(2, 62), Some(1 << 62));
+  assert_eq(checked_pow(2, 63), None);
+  assert_eq(checked_pow(0 - 2, 63), Some(min_int()));
+  assert_eq(checked_pow(0 - 2, 64), None);
+  assert_eq(checked_pow(3, 39), Some(4052555153018976267));
+  assert_eq(checked_pow(3, 40), None);
+  assert_eq(checked_pow(10, 18), Some(1000000000000000000));
+  assert_eq(checked_pow(10, 19), None);
+  assert_eq(checked_pow(max_int(), 1), Some(max_int()));
+  assert_eq(checked_pow(min_int(), 1), Some(min_int()));
+  assert_eq(checked_pow(min_int(), 2), None);
+  assert_eq(checked_pow(0, 0), Some(1));
+  assert_eq(checked_pow(1, max_int()), Some(1));
+  assert_eq(checked_pow(0 - 1, max_int()), Some(0 - 1));
+  assert_eq(checked_pow(0, max_int()), Some(0));
+  assert_eq(checked_pow(7, min_int()), Some(1))
+}
+
+test "mod_pow is the power's remainder, with no product past an Int on the way" {
+  assert_eq(mod_pow(2, 10, 1000), Some(24));
+  assert_eq(mod_pow(3, 200, 13), Some(9));
+  assert_eq(mod_pow(0 - 7, 5, 13), Some(2));
+  assert_eq(mod_pow(5, 0, 1), Some(0));
+  assert_eq(mod_pow(5, 3, 0), None);
+  assert_eq(mod_pow(5, 3, 0 - 7), None);
+  assert_eq(mod_pow(max_int() - 1, 2, max_int()), Some(1));
+  assert_eq(mod_pow(2, 1 << 62, max_int() - 24), Some(8192));
+  assert_eq(mod_pow(max_int(), max_int(), max_int() - 24), Some(86762353606963200))
+}
+
+test "a negative exponent is a power of the inverse, where there is one" {
+  assert_eq(mod_pow(2, 0 - 1, 7), Some(4));
+  assert_eq(mod_pow(7, 0 - 3, 1000000007), Some(206997086));
+  assert_eq(mod_pow(3, min_int(), 7), Some(4));
+  assert_eq(mod_pow(2, 0 - 1, 4), None);
+  assert_eq(mod_pow(0, 0 - 1, 7), None)
+}
+
+/// Trial division: every candidate from `d` whose square is at most `n`.
+fn prime_by_trial(n: Int, d: Int) -> Bool / {abort.raise} =
+  if d > n || d * d > n { n >= 2 } else if n % d == 0 { false } else { prime_by_trial(n, d + 1) }
+
+law "is_prime is what trial division answers"
+  forall (n: Int) where n < 1000000 {
+    is_prime(n) == prime_by_trial(n, 2)
+  }
+
+test "is_prime agrees with trial division across the divisors it tries first" {
+  assert_eq(filter(range(0 - 3, 60), is_prime), [
+    2,
+    3,
+    5,
+    7,
+    11,
+    13,
+    17,
+    19,
+    23,
+    29,
+    31,
+    37,
+    41,
+    43,
+    47,
+    53,
+    59,
+  ]);
+  assert_eq(
+    filter(range(1600, 1800), is_prime),
+    filter(range(1600, 1800), |n: Int| prime_by_trial(n, 2)),
+  );
+  assert_eq(len(filter(range(0, 10000), is_prime)), 1229)
+}
+
+test "is_prime is exact at the top of an Int, where trial division would not end" {
+  assert(is_prime(2147483647));
+  assert(is_prime(2305843009213693951));
+  assert(is_prime(max_int() - 24));
+  assert(!is_prime(max_int()));
+  assert(!is_prime(min_int()));
+  // Composites that pass the strong test to every base up to 2, to 7, to 17 and to 23.
+  assert_eq(filter([2047, 3215031751, 341550071728321, 3825123056546413051], is_prime), []);
+  // Carmichael numbers, which pass Fermat's test to every base.
+  assert_eq(filter([561, 1105, 1729, 294409], is_prime), [])
 }
 
 test "prime, factorial and isqrt are total over the whole range" {
@@ -158,6 +1024,7 @@ test "prime, factorial and isqrt are total over the whole range" {
   assert_eq(factorial(5), 120);
   assert_eq(factorial(0), 1);
   assert_eq(factorial(0 - 3), 1);
+  assert_eq(factorial(20), 2432902008176640000);
   assert_eq(isqrt(0), 0);
   assert_eq(isqrt(1), 1);
   assert_eq(isqrt(2), 1);
@@ -165,11 +1032,143 @@ test "prime, factorial and isqrt are total over the whole range" {
   assert_eq(isqrt(99), 9);
   assert_eq(isqrt(100), 10);
   assert_eq(isqrt(0 - 4), 0);
+  assert_eq(isqrt(max_int()), 3037000499);
+  assert_eq(isqrt(min_int()), 0);
   assert_eq(ilog2(1), 0);
   assert_eq(ilog2(2), 1);
   assert_eq(ilog2(1023), 9);
   assert_eq(ilog2(1024), 10);
   assert_eq(ilog2(max_int()), 62);
   assert_eq(ilog2(0), 0);
-  assert_eq(ilog2(0 - 8), 0)
+  assert_eq(ilog2(0 - 8), 0);
+  assert_eq(ilog2(min_int()), 0)
+}
+
+test "a root and a logarithm are answered to the top of an Int" {
+  assert_eq(map([1, 2, 3, 5, 62, 63, 64], |k: Int| iroot(max_int(), k)), [
+    max_int(),
+    3037000499,
+    2097151,
+    6208,
+    2,
+    1,
+    1,
+  ]);
+  assert_eq(map([26, 27, 0, 0 - 27, min_int()], |n: Int| iroot(n, 3)), [2, 3, 0, 0, 0]);
+  assert_eq(iroot(27, 0), 0);
+  assert_eq(map([0, 1, 9, 10, 99, 100, 999999999999999999, 1000000000000000000], ilog10), [
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    17,
+    18,
+  ]);
+  assert_eq(ilog10(max_int()), 18);
+  assert_eq(ilog10(min_int()), 0);
+  assert_eq(ilog(max_int(), 3), 39);
+  assert_eq(ilog(max_int(), 2), 62);
+  assert_eq(ilog(max_int(), max_int()), 1);
+  assert_eq(ilog(8, 2), 3);
+  assert_eq(ilog(8, 1), 0);
+  assert_eq(ilog(0, 2), 0)
+}
+
+// --- Tests: an Int as text --------------------------------------------------
+
+law "an Int reads back from its text in every radix"
+  forall (n: Int, pick: Int) {
+    let radix = 2 + rem_euclid(pick, 35);
+    from_radix(to_radix(n, radix), radix) == Some(n)
+  }
+
+law "an Int reads back from its decimal text" =
+  round_trip(|n: Int| to_radix(n, 10), |text: String| from_radix(text, 10))
+
+law "an Int reads back from its hex text in upper case" =
+  round_trip(|n: Int| string_upper(to_radix(n, 16)), |text: String| from_radix(text, 16))
+
+law "an Int reads back from its bits padded to their width" =
+  round_trip(|n: Int| to_radix_padded(n, 2, 64), |text: String| from_radix(text, 2))
+
+law "decimal text is what int_to_string writes" =
+  agrees(|n: Int| to_radix(n, 10), |n: Int| int_to_string(n))
+
+law "an Int is read in steps in its digits"
+  forall (n: Int) where n > 0 cost n {
+    from_radix(to_radix_padded(0, 10, n), 10)
+  }
+
+test "an Int is written in any radix from two to thirty-six, its ends included" {
+  assert_eq(to_radix(255, 16), "ff");
+  assert_eq(to_radix(0 - 255, 16), "-ff");
+  assert_eq(to_radix(0, 2), "0");
+  assert_eq(to_radix(5, 2), "101");
+  assert_eq(to_radix(35, 36), "z");
+  assert_eq(to_radix(max_int(), 36), "1y2p0ij32e8e7");
+  assert_eq(to_radix(min_int(), 36), "-1y2p0ij32e8e8");
+  assert_eq(to_radix(min_int(), 35), "-2pijmikexrxp8");
+  assert_eq(to_radix(max_int(), 7), "22341010611245052052300");
+  assert_eq(to_radix(min_int(), 16), "-8000000000000000");
+  assert_eq(to_radix(min_int(), 10), "-9223372036854775808");
+  assert_eq(to_radix(min_int(), 2), "-1" ++ to_radix_padded(0, 2, 63));
+  assert_eq(string_len(to_radix(max_int(), 2)), 63)
+}
+
+test "every radix reads both ends of an Int back from what it wrote" {
+  fold(range(2, 37), (), |_: Unit, radix: Int|
+    fold([min_int(), max_int(), 0, 1, 0 - 1, radix, 0 - radix], (), |_: Unit, n: Int|
+      assert_eq(from_radix(to_radix(n, radix), radix), Some(n))))
+}
+
+test "a text is a minus and then digits below the radix, in either case, and nothing else" {
+  assert_eq(from_radix("ff", 16), Some(255));
+  assert_eq(from_radix("FF", 16), Some(255));
+  assert_eq(from_radix("-Ff", 16), Some(0 - 255));
+  assert_eq(from_radix("z", 36), Some(35));
+  assert_eq(from_radix("Z", 36), Some(35));
+  assert_eq(from_radix("007", 10), Some(7));
+  assert_eq(from_radix("-0", 10), Some(0));
+  assert_eq(from_radix("-101", 2), Some(0 - 5));
+  assert_eq(
+    map(
+      ["z", "g", "12", "", "-", "--7", "+1", "0x10", "1_000", " 7", "7 ", "7.5", "\u{e9}"],
+      |text: String| from_radix(text, if text == "z" { 35 } else if text == "12" { 2 } else { 16 }),
+    ),
+    map(range(0, 13), |_: Int| None),
+  )
+}
+
+test "a number past an Int is None in any radix, and the least Int reads" {
+  assert_eq(from_radix("7fffffffffffffff", 16), Some(max_int()));
+  assert_eq(from_radix("8000000000000000", 16), None);
+  assert_eq(from_radix("-8000000000000000", 16), Some(min_int()));
+  assert_eq(from_radix("-8000000000000001", 16), None);
+  assert_eq(from_radix("1y2p0ij32e8e7", 36), Some(max_int()));
+  assert_eq(from_radix("1y2p0ij32e8e8", 36), None);
+  assert_eq(from_radix("-1y2p0ij32e8e8", 36), Some(min_int()));
+  assert_eq(from_radix("9223372036854775808", 10), None);
+  assert_eq(from_radix("-9223372036854775809", 10), None);
+  assert_eq(from_radix("zzzzzzzzzzzzzzzzzzzzzzzz", 36), None)
+}
+
+test "padding puts zeros after the sign, and never cuts a digit" {
+  assert_eq(to_radix_padded(255, 16, 4), "00ff");
+  assert_eq(to_radix_padded(0 - 255, 16, 4), "-00ff");
+  assert_eq(to_radix_padded(0, 2, 8), "00000000");
+  assert_eq(to_radix_padded(255, 16, 1), "ff");
+  assert_eq(to_radix_padded(255, 16, 0), "ff");
+  assert_eq(to_radix_padded(0, 10, 0), "0");
+  assert_eq(to_radix_padded(0, 10, 0 - 3), "0")
+}
+
+test "a radix outside two to thirty-six raises, in either direction" {
+  let wrote = |radix: Int| try[abort.raise] { to_radix(7, radix) };
+  let read = |radix: Int| try[abort.raise] { from_radix("7", radix) };
+  assert_eq(map([1, 37, 0, 0 - 2], wrote), map(range(0, 4), |_: Int| Err("a radix is 2 to 36")));
+  assert_eq(map([1, 37, 0, 0 - 2], read), map(range(0, 4), |_: Int| Err("a radix is 2 to 36")));
+  assert_eq(wrote(2), Ok("111"));
+  assert_eq(read(36), Ok(Some(7)))
 }
