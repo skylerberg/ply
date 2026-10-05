@@ -5,7 +5,7 @@ import parsing (Span, Ident, QName, is_bare, starts_upper)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad)
+                    MWrite, MBad, angled)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
@@ -640,6 +640,9 @@ fn tag_returns_fresh() -> Int = 101
 fn tag_returns_param() -> Int = 102
 fn tag_bounded() -> Int = 103
 fn tag_decreases() -> Int = 104
+// A type that binds, and one applied to, labels or rows beside its types.
+fn tag_type_over() -> Int = 120
+fn tag_ty_con_over() -> Int = 121
 
 // An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -949,12 +952,21 @@ fn insert_pair(
 // in place, so two aliases of one expansion are one type there and must be one type here. The name
 // is the simple one: a module path is no part of an identity, so vendoring a module moves nothing.
 fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
-  let tagged: Encoder = put_tag(encoder, tag_type());
-  let bound: Encoder = {
-    ..tagged,
-    ty_params: concat(tagged.ty_params, map(d.params, |ident: Ident| ident.name)),
+  let g = d.generics;
+  // Only a declaration that binds a row or a label writes their counts, under a tag of its own.
+  let over = len(g.effects) > 0 || len(g.labels) > 0;
+  let tagged: Encoder = put_u32(
+    put_tag(encoder, if over { tag_type_over() } else { tag_type() }),
+    len(g.types),
+  );
+  let headed: Encoder = if over { put_u32(put_u32(tagged, len(g.effects)), len(g.labels)) }
+  else { tagged };
+  let counted: Encoder = {
+    ..headed,
+    ty_params: concat(headed.ty_params, map(g.types, |ident: Ident| ident.name)),
+    row_params: concat(headed.row_params, map(g.effects, |ident: Ident| ident.name)),
+    label_params: concat(headed.label_params, map(g.labels, |ident: Ident| ident.name)),
   };
-  let counted: Encoder = put_u32(bound, len(d.params));
   match d.body {
     TDAlias(t) -> type_expr(put_tag(counted, tag_type_alias()), t),
     TDSum(variants) ->
@@ -1084,15 +1096,29 @@ pub fn spec_clause(encoder: Encoder, owner: FnDef, clause: SpecClause) -> Encode
 fn type_expr(encoder: Encoder, t: TypeExpr) -> Encoder / {abort.raise} =
   match t {
     TVar(name) -> put_u32(type_ref(put_tag(encoder, tag_ty_con()), None, name.name), 0),
-    TCon(c) ->
-      fold(
+    TCon(c) -> {
+      // Only a use that fills a label or a row writes them, under a tag of its own.
+      let over = len(c.labels) > 0 || len(c.rows) > 0;
+      let applied: Encoder = fold(
         c.args,
         put_u32(
-          type_ref(put_tag(encoder, tag_ty_con()), qualifier(c.name), c.name.name.name),
+          type_ref(
+            put_tag(encoder, if over { tag_ty_con_over() } else { tag_ty_con() }),
+            qualifier(c.name),
+            c.name.name.name,
+          ),
           len(c.args),
         ),
         |acc: Encoder, a: TypeExpr| type_expr(acc, a),
-      ),
+      );
+      if !over { applied } else {
+        fold(
+          c.rows,
+          put_u32(fold(c.labels, put_u32(applied, len(c.labels)), label_ref), len(c.rows)),
+          row_expr,
+        )
+      }
+    },
     TFn(f) ->
       opt_row(
         type_expr(
@@ -3604,6 +3630,19 @@ fn print_type(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
           } else { name.text },
         }
       }
+    } else if t.value == tag_ty_con_over() {
+      let name = if is_free(t.decoder) { read_free(t.decoder) }
+      else { qname(printer, read_ref(printer, t.decoder), None) };
+      let n = read_count(name.decoder);
+      let args = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
+      let lc = read_count(args.decoder);
+      let labels = read_many(lc.decoder, lc.value, read_label);
+      let rc = read_count(labels.decoder);
+      let rows = read_many(rc.decoder, rc.value, |e: Decoder| print_row(printer, e));
+      {
+        decoder: rows.decoder,
+        text: bytes_concat(name.text, angled(args.texts, labels.texts, rows.texts)),
+      }
     } else if t.value == tag_ty_fn() {
       let n = read_count(t.decoder);
       let ps = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
@@ -4362,21 +4401,7 @@ fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.r
   let tc = read_binders(expect(d, tag_fn(), b"a function"));
   let ec: DecodedInt = read_binders(tc.decoder);
   let lc: DecodedInt = read_binders(ec.decoder);
-  let generics = if tc.value == 0 && ec.value == 0 && lc.value == 0 { b"" } else {
-    bytes_concat_all([
-      b"<",
-      joined(
-        concat(
-          map(range(0, tc.value), type_var_name),
-          map(range(0, lc.value), |i: Int| bytes_concat_all([b"[", label_name(i), b"]"])),
-        ),
-        b", ",
-      ),
-      if ec.value > 0 { bytes_concat(b" | ", joined(map(range(0, ec.value), row_var_name), b", ")) }
-      else { b"" },
-      b">",
-    ])
-  };
+  let generics = generic_list(tc.value, ec.value, lc.value);
   let n = read_count({ ..lc.decoder, types: tc.value, rows: ec.value, labels: lc.value });
   let ps = read_many(n.decoder, n.value, |g: Decoder| print_param_slot(printer, g));
   let ret = read_opt(ps.decoder, |g: Decoder| print_ret(printer, g));
@@ -4410,14 +4435,26 @@ fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.r
   }
 }
 
-fn type_binders(count: Int) -> Bytes / {abort.raise} =
-  if count > 0 {
-    bytes_concat_all([b"<", joined(map(range(0, count), type_var_name), b", "), b">"])
-  } else { b"" }
+fn type_binders(count: Int) -> Bytes / {abort.raise} = generic_list(count, 0, 0)
+
+// A generic list of that many type, row and label binders, each named by its level.
+fn generic_list(types: Int, rows: Int, labels: Int) -> Bytes / {abort.raise} =
+  angled(
+    map(range(0, types), type_var_name),
+    map(range(0, labels), label_name),
+    map(range(0, rows), row_var_name),
+  )
 
 fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
-  let n: DecodedInt = read_binders(expect(d, tag_type(), b"a type"));
-  let k = read_u8({ ..n.decoder, types: n.value });
+  let over = peek(d) == tag_type_over();
+  let n: DecodedInt = read_binders(
+    expect(d, if over { tag_type_over() } else { tag_type() }, b"a type"),
+  );
+  let ec: DecodedInt = if over { read_binders(n.decoder) }
+  else { { decoder: n.decoder, value: 0 } };
+  let lc: DecodedInt = if over { read_binders(ec.decoder) }
+  else { { decoder: ec.decoder, value: 0 } };
+  let k = read_u8({ ..lc.decoder, types: n.value, rows: ec.value, labels: lc.value });
   // Every variant keeps its `|`: a single-variant sum without one reads as an alias.
   let body: Decoded = if k.value == tag_type_alias() { print_type(printer, k.decoder) }
   else if k.value == tag_type_sum() {
@@ -4443,7 +4480,13 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
   } else { panic("a tag that does not begin a type body") };
   {
     decoder: body.decoder,
-    text: bytes_concat_all([b"type ", name, type_binders(n.value), b" = ", body.text]),
+    text: bytes_concat_all([
+      b"type ",
+      name,
+      generic_list(n.value, ec.value, lc.value),
+      b" = ",
+      body.text,
+    ]),
   }
 }
 
@@ -4495,7 +4538,7 @@ fn print_item(unsized: BodyPrinter, decoder: Decoder, name: Bytes) -> Decoded / 
   let printer = { ..unsized, room: bytes_len(decoder.bytes) };
   let t = peek(decoder);
   let g = if t == tag_fn() { print_fn(printer, decoder, name) }
-  else if t == tag_type() { print_type_def(printer, decoder, name) }
+  else if t == tag_type() || t == tag_type_over() { print_type_def(printer, decoder, name) }
   else if t == tag_effect() { print_effect(printer, decoder, name) }
   else { panic("a tag that does not begin a definition") };
   if g.decoder.pos != bytes_len(g.decoder.bytes) { panic("bytes remain after the definition") }
@@ -5494,6 +5537,46 @@ test "renaming an operation's type parameter does not move a hash, and it prints
   assert(bytes::contains(at(ms, 0).text, b"read take[r]<_t0>(List<_t0>) -> _t0"));
   let again = hash_index(indexed([{ name: b"m", src: at(ms, 0).text }]));
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a type's label and row binders are levels, what it is applied to is hashed, and both print back" {
+  let held = |row: Bytes, label: Bytes, given: Bytes|
+    bytes_concat_all([
+      b"pub effect net { write send[c](x: Int) -> Int }\n",
+      b"pub type Sink<a, [",
+      label,
+      b"] | ",
+      row,
+      b"> = | Sink(a, (Int) -> Int / {net.send[",
+      label,
+      b"] | ",
+      row,
+      b"})\npub type Step<| ",
+      row,
+      b"> = () -> Int / ",
+      row,
+      b"\npub fn held(s: Sink<Int, [",
+      given,
+      b"] | {}>, f: Step<| {net.send[",
+      given,
+      b"]}>) -> Int = 1",
+    ]);
+  let hashed = |src: Bytes| hash_index(indexed([{ name: b"m", src: src }]));
+  let out = hashed(held(b"e", b"l", b"conn"));
+  let named = by_name(named_hashes(out));
+  assert_eq(by_name(named_hashes(hashed(held(b"f", b"k", b"conn")))), named);
+  assert(
+    map_get(by_name(named_hashes(hashed(held(b"e", b"l", b"sock")))), b"m.held")
+      != map_get(named, b"m.held"),
+  );
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b"type Sink<_t0, [_r0] | _e0> = "));
+  assert(bytes::contains(at(ms, 0).text, b"(Int) -> Int / {net.send[_r0] | _e0}"));
+  assert(bytes::contains(at(ms, 0).text, b"type Step<| _e0> = () -> Int / _e0"));
+  assert(bytes::contains(at(ms, 0).text, b"Sink<Int, [conn] | {}>"));
+  assert(bytes::contains(at(ms, 0).text, b"Step<| {net.send[conn]}>"));
+  let again = hashed(at(ms, 0).text);
+  assert_eq(by_name(named_hashes(again)), named)
 }
 
 test "two effects that differ only in their names are two declarations" {
