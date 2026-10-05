@@ -2217,8 +2217,9 @@ import, what those import in turn, and what they embed, so a change to any other
 leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
-`show` or `numeric` names (§4.4), and none of their tests or laws; `--std`
-reads each one whole.
+`show` or `numeric` names (§4.4), and none of their tests or laws; a function
+it reaches is read with what its specifications name (§10), which a dependent's
+proof is owed; `--std` reads each one whole.
 
 ## 14. The host boundary
 
