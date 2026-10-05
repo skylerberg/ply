@@ -766,6 +766,7 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     assert!(!backend.describes(other.hashes_digest));
 }
 
+/// Over what a program that imports much of the standard library reaches of it.
 #[test]
 fn the_census_over_the_standard_library() {
     let (front, unit) = unit(ARITHMETIC);
@@ -797,7 +798,13 @@ fn the_census_over_the_standard_library() {
         "the enterable fragment fell to {} definitions",
         unit.len()
     );
-    assert!(functions > 100, "only {functions} functions were offered");
+    assert!(
+        front
+            .emitter_roots
+            .iter()
+            .any(|r| r.root.as_str().starts_with("std.")),
+        "none of the {functions} functions offered is the standard library's"
+    );
 }
 
 const CELLS: &str = "\
