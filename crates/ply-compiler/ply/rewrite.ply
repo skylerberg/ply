@@ -2,7 +2,7 @@
 // record update, which needs the checker's answer for its base and so runs after the check.
 
 import std.bin
-import std.list (at, concat, drop, take)
+import std.list (at, concat, contains, drop, take)
 import parsing (Span, Ident, QName, ParseDiag, Label, span_to, dummy_span, bare, span_key, error_at,
                 error_at_and, parse_diag, parse_label, dump_diags, is_bare, positional)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
@@ -14,7 +14,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm,
-              HandleClause, ReturnClause, RecField, expr_span)
+              HandleClause, ReturnClause, RecField, expr_span, ETagged, Tagged, tagged_call)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt, LStr,
                  LBool)
 import std.bytes (ascii_of_int)
@@ -50,6 +50,7 @@ pub fn is_pure(e: Expr) -> Bool =
     ETry(_) -> false,
     ETryBlock(_) -> false,
     ELit(_) -> true,
+    ETagged(_) -> true,
     EVar(_) -> true,
     EBad(_) -> true,
     EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
@@ -249,6 +250,114 @@ pub fn expand_record_updates(module: Module, shapes: Map<Bytes, List<Bytes>>) ->
         map_item(item, |expr: Expr| expanded_update(shapes, expr))),
     }
   }
+
+// --- Tagged literals -----------------------------------------------------------------------
+// `tag"text"` runs as its call read through `Ok`, which the check that ran the call saw it answer.
+
+fn settled(expr: Expr) -> Expr =
+  match expr {
+    ETagged(t) -> {
+      let held = { name: b"?literal", span: t.span };
+      EBlock({
+        span: t.span,
+        tail: Some(var_of(held)),
+        stmts: [
+          SLet({
+            span: t.span,
+            pat: ctor_pattern(b"Ok", [var_pattern(held)], t.span),
+            ty: None,
+            value: tagged_call(t),
+          }),
+        ],
+      })
+    },
+    _ -> expr,
+  }
+
+fn is_tagged(expr: Expr) -> Bool = match expr { ETagged(_) -> true, _ -> false }
+
+pub fn has_tagged(module: Module) -> Bool = len(picked_in(module, is_tagged)) > 0
+
+// Every tagged literal a module's definitions, tests and laws hold, in the order they are written.
+pub fn tagged_in(module: Module) -> List<Tagged> =
+  fold(picked_in(module, is_tagged), [], |acc: List<Tagged>, e: Expr|
+    match e { ETagged(t) -> push(acc, t), _ -> acc })
+
+// Every expression `wanted` picks among those a module's definitions, tests and laws hold, in the
+// order they are written, one that holds another before it.
+fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> =
+  fold(module.items, [], |acc: List<Expr>, item: Item|
+    match item {
+      IFn(d) ->
+        fold(d.spec, picked(d.body, wanted, acc), |out: List<Expr>, clause: SpecClause|
+          picked(clause.expr, wanted, out)),
+      ITest(d) -> picked(d.body, wanted, acc),
+      ILaw(d) -> {
+        let guarded = match d.guard { None -> acc, Some(g) -> picked(g, wanted, acc) };
+        picked(d.body, wanted, guarded)
+      },
+      _ -> acc,
+    })
+
+fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
+  let out = if wanted(e) { push(found, e) } else { found };
+  let all = |es: List<Expr>, acc: List<Expr>|
+    fold(es, acc, |a: List<Expr>, x: Expr| picked(x, wanted, a));
+  let maybe = |o: Option<Expr>, acc: List<Expr>|
+    match o { None -> acc, Some(x) -> picked(x, wanted, acc) };
+  let fields = |fs: List<RecField>, acc: List<Expr>|
+    fold(fs, acc, |a: List<Expr>, f: RecField| picked(f.value, wanted, a));
+  match e {
+    EBinary(b) -> picked(b.rhs, wanted, picked(b.lhs, wanted, out)),
+    EUnary(u) -> picked(u.operand, wanted, out),
+    ELambda(l) -> picked(l.body, wanted, out),
+    EApp(a) ->
+      fold(a.named, all(a.args, picked(a.func, wanted, out)), |acc: List<Expr>, arg: NamedArg|
+        picked(arg.value, wanted, acc)),
+    EIf(i) ->
+      picked(i.else_branch, wanted, picked(i.then_branch, wanted, picked(i.cond, wanted, out))),
+    EMatch(m) ->
+      fold(m.arms, picked(m.scrutinee, wanted, out), |acc: List<Expr>, arm: MatchArm|
+        picked(arm.body, wanted, maybe(arm.guard, acc))),
+    EBlock(b) ->
+      maybe(
+        b.tail,
+        fold(b.stmts, out, |acc: List<Expr>, stmt: Stmt|
+          match stmt {
+            SLet(l) -> picked(l.value, wanted, acc),
+            SLetElse(l) -> picked(l.fallback, wanted, picked(l.value, wanted, acc)),
+            SExpr(x) -> picked(x, wanted, acc),
+          }),
+      ),
+    ERecord(r) -> fields(r.fields, out),
+    ERecordUpdate(r) -> fields(r.fields, picked(r.base, wanted, out)),
+    ETry(t) -> picked(t.operand, wanted, out),
+    EField(f) -> picked(f.base, wanted, out),
+    EList(l) -> all(l.items, out),
+    EPerform(x) -> all(x.args, out),
+    EHandle(h) -> {
+      let clauses = fold(
+        h.clauses,
+        picked(h.body, wanted, out),
+        |acc: List<Expr>, c: HandleClause| picked(c.body, wanted, acc),
+      );
+      match h.ret { None -> clauses, Some(rc) -> picked(rc.body, wanted, clauses) }
+    },
+    EWithCell(c) -> picked(c.body, wanted, picked(c.init, wanted, out)),
+    ESimulate(x) -> picked(x.body, wanted, out),
+    EParallel(x) -> all(x.branches, out),
+    ETryBlock(t) -> picked(t.body, wanted, out),
+    ETagged(_) -> out,
+    ELit(_) -> out,
+    EVar(_) -> out,
+    EBad(_) -> out,
+  }
+}
+
+// Every tagged literal of a checked module replaced by what it runs as.
+pub fn expand_tagged(module: Module) -> Module =
+  if !has_tagged(module) { module }
+  else { { ..module, items: map(module.items, |item: Item| map_item(item, settled)) } }
 
 // --- Witnesses -----------------------------------------------------------------------------
 // A definition with `numeric(a)` or `integer(a)` takes, ahead of its written parameters, an `Int`
@@ -509,6 +618,108 @@ pub fn expand_try_blocks(module: Module, answered: Map<Bytes, Answered>) -> Modu
     }
   }
 
+// --- What `Ok` and `Err` name ----------------------------------------------------------------
+// A `try` is written out as a `handle` that answers `Ok` and `Err`, a tagged literal as a `let`
+// read through `Ok`, and `?` as a `match` on either pair. In a module that binds one of those names
+// for itself, what is written out would name the module's own, so the form is refused here, with
+// the grammar: a body taken from its rows is not checked again, and would run as the other thing.
+
+type Rebound = { name: Bytes, imported: Bool }
+
+// The first of `names` the module binds for itself: one it imports by name, else a variant or a
+// function it declares.
+fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
+  let imported = fold(module.imports, None, |acc: Option<Rebound>, d: ImportDecl|
+    match acc {
+      Some(_) -> acc,
+      None -> match d.kind {
+        INames(ns) ->
+          fold(ns, None, |b: Option<Rebound>, ident: Ident|
+            match b {
+              Some(_) -> b,
+              None -> if contains(names, ident.name) { Some({ name: ident.name, imported: true }) }
+              else { None },
+            }),
+        _ -> None,
+      },
+    });
+  match imported {
+    Some(_) -> imported,
+    None ->
+      fold(module.items, None, |acc: Option<Rebound>, item: Item|
+        match acc {
+          Some(_) -> acc,
+          None -> match item {
+            IType(d) -> match d.body {
+              TDSum(vs) ->
+                fold(vs, None, |b: Option<Rebound>, variant: VariantDef|
+                  match b {
+                    Some(_) -> b,
+                    None -> if contains(names, variant.name.name) {
+                      Some({ name: variant.name.name, imported: false })
+                    } else { None },
+                  }),
+              _ -> None,
+            },
+            IFn(d) -> if contains(names, d.name.name) {
+              Some({ name: d.name.name, imported: false })
+            } else { None },
+            _ -> None,
+          },
+        }),
+  }
+}
+
+fn uncaptured(span: Span, form: Bytes, lacks: Bytes, own: Rebound, answers: Bytes) -> ParseDiag =
+  error_at(
+    b"E0118",
+    span,
+    bytes_concat_all([b"this file gives ", form, b" no meaning here"]),
+    lacks,
+    [
+      bytes_concat_all([
+        b"this module binds its own `",
+        own.name,
+        b"`, which would capture ",
+        answers,
+      ]),
+    ],
+  )
+
+// Every `try` and every tagged literal of a module that binds what it would be written out with.
+fn rebound(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> = {
+  let tried = match bound_among(module, [b"Ok", b"Err"]) {
+    None -> diags,
+    Some(own) ->
+      fold(picked_in(module, is_try_block), diags, |acc: List<ParseDiag>, e: Expr|
+        push(
+          acc,
+          uncaptured(
+            expr_span(e),
+            b"`try`",
+            b"no `Result` to answer with",
+            own,
+            b"the `Ok` and `Err` a `try` answers with; rename it or qualify it, or write the `handle` out",
+          ),
+        )),
+  };
+  match bound_among(module, [b"Ok"]) {
+    None -> tried,
+    Some(own) ->
+      fold(tagged_in(module), tried, |acc: List<ParseDiag>, t: Tagged|
+        push(
+          acc,
+          uncaptured(
+            t.span,
+            b"a tagged literal",
+            b"no `Ok` to read it through",
+            own,
+            b"the `Ok` a tagged literal is read through; rename it or qualify it, or call `literal` and match on what it answers",
+          ),
+        )),
+  }
+}
+
 // --- The try operator ------------------------------------------------------------------------
 
 type TryMode = | TryResult | TryOption
@@ -527,60 +738,24 @@ type Scan = | ScanFound(Lift) | ScanPure | ScanImpure
 type Scanned = { state: TryState, scan: Scan, expr: Expr }
 type TryOut = { state: TryState, expr: Expr }
 
-fn is_expansion_name(name: Bytes) -> Bool =
-  name == b"Ok" || name == b"Err" || name == b"Some" || name == b"None"
-
-fn shadowing_ctor(module: Module) -> Option<Bytes> = {
-  let imported = fold(module.imports, None, |acc: Option<Bytes>, d: ImportDecl|
-    match acc {
-      Some(_) -> acc,
-      None -> match d.kind {
-        INames(ns) ->
-          fold(ns, None, |b: Option<Bytes>, ident: Ident|
-            match b {
-              Some(_) -> b,
-              None -> if is_expansion_name(ident.name) {
-                Some(
-                  bytes_concat_all([
-                    b"this module imports `",
-                    ident.name,
-                    b"` unqualified, which would capture the `match` `?` expands to; import the module instead and qualify the name, or write the `match` out",
-                  ]),
-                )
-              } else { None },
-            }),
-        _ -> None,
-      },
-    });
-  match imported {
-    Some(_) -> imported,
-    None ->
-      fold(module.items, None, |acc: Option<Bytes>, item: Item|
-        match acc {
-          Some(_) -> acc,
-          None -> match item {
-            IType(d) -> match d.body {
-              TDSum(vs) ->
-                fold(vs, None, |b: Option<Bytes>, variant: VariantDef|
-                  match b {
-                    Some(_) -> b,
-                    None -> if is_expansion_name(variant.name.name) {
-                      Some(
-                        bytes_concat_all([
-                          b"this module declares its own `",
-                          variant.name.name,
-                          b"`, which would capture the `match` `?` expands to; rename it, or write the `match` out",
-                        ]),
-                      )
-                    } else { None },
-                  }),
-              _ -> None,
-            },
-            _ -> None,
-          },
-        }),
+fn shadowing_ctor(module: Module) -> Option<Bytes> =
+  match bound_among(module, [b"Ok", b"Err", b"Some", b"None"]) {
+    None -> None,
+    Some(own) ->
+      Some(if own.imported {
+        bytes_concat_all([
+          b"this module imports `",
+          own.name,
+          b"` unqualified, which would capture the `match` `?` expands to; import the module instead and qualify the name, or write the `match` out",
+        ])
+      } else {
+        bytes_concat_all([
+          b"this module declares its own `",
+          own.name,
+          b"`, which would capture the `match` `?` expands to; rename it, or write the `match` out",
+        ])
+      }),
   }
-}
 
 fn unreadable() -> Bytes =
   b"the return type has no head constructor this file can read: a type parameter and a generic alias have none until they are applied"
@@ -1853,7 +2028,8 @@ pub fn expand(
   let tried = if has_try(module) { expand_try(module, diags) }
   else { { module: module, diags: diags } };
   let measured = measured_laws(tried.module, tried.diags);
-  cost_laws(measured.module, measured.diags)
+  let costed = cost_laws(measured.module, measured.diags);
+  { module: costed.module, diags: rebound(costed.module, costed.diags) }
 }
 
 // --- The cost clause ---------------------------------------------------------------------------
@@ -2180,6 +2356,23 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
 test "a `?` inside a `try` is refused, as one inside a `handle` is" {
   let out = dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let r = try { g(n)? }; Ok(1) }");
   assert(string_contains(out, "!E0118"))
+}
+
+test "a `try` and a tagged literal are refused where the module binds what they are written out with" {
+  let refused = |src: Bytes| string_contains(dump_expanded(src), "!E0118");
+  let tried = b"fn f(b: Int) -> Int = match try { digit(b) } { _ -> 1 }";
+  let tagged = b"fn f() -> Int = hex\"00\"";
+  assert(!refused(tried));
+  assert(!refused(tagged));
+  assert(refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tried)));
+  assert(refused(bytes_concat(b"import m (Ok)\n", tried)));
+  assert(refused(bytes_concat(b"type Mine = | Ok(Int) | Fine\n", tagged)));
+  assert(refused(bytes_concat(b"import m (Ok)\n", tagged)));
+  assert(refused(bytes_concat(b"fn Ok(n: Int) -> Int = n\n", tagged)));
+  // A tagged literal is read through `Ok` alone.
+  assert(!refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tagged)));
+  // A type imported by name brings no constructor with it.
+  assert(!refused(bytes_concat(b"import m (Mine)\n", tried)))
 }
 
 test "a `try` the checker read is written out as its `handle`, and one it did not is left" {

@@ -16,7 +16,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered)
+              MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered,
+              ETagged, Tagged, tagged_callee)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -47,7 +48,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
-                NumericWitness, ConcreteWitness, ParamWitness, numeric_witness_bin)
+                NumericWitness, ConcreteWitness, ParamWitness, numeric_witness_bin, expand_tagged)
 import embed (EmbedAt, embed_tables, rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -3850,7 +3851,99 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
     ESimulate(s) -> infer_simulate(checker, s.span, s.body, hint),
     EParallel(v) -> infer_parallel(checker, v.span, v.branches),
     ETryBlock(t) -> infer_try_block(checker, t.span, t.raise, t.body, hint),
+    ETagged(t) -> infer_tagged(checker, t),
   }
+
+// What a tag's `literal` answers of a text it refuses: where in the text, in characters, and why.
+pub fn refusal_type() -> Type / {abort.raise} =
+  TyRecord(
+    fields_sorted([{ name: b"message", ty: string_type() }, { name: b"offset", ty: int_type() }]),
+  )
+
+fn not_a_parser(checker: Checker, t: Tagged, message: Bytes, label: Bytes) -> Checker =
+  report_error_at(
+    checker,
+    b"E0152",
+    t.tag.span,
+    bytes_concat_all([b"`", t.tag.name, b"::literal` ", message]),
+    label,
+    [
+      bytes_concat_all([
+        b"`",
+        t.tag.name,
+        b"\"..\"` is the call `",
+        t.tag.name,
+        b"::literal(\"..\")`, which the check runs: a function of one `String` answering `Result<T, {message: String, offset: Int}>`, with no parameters of its own and a row that holds nothing but raises",
+      ]),
+    ],
+  )
+
+// `tag"text"` is the call `tag::literal("text")`, whose answer the check reads before anything
+// runs: its value is what the call answers `Ok` of, and nothing is left for it to perform.
+fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
+  let callee = tagged_callee(t.tag);
+  let f: Inferred = infer_var(checker, callee);
+  let value: WithTy = new_ty(called(f.checker, t.tag.span));
+  let c: Checker = value.checker;
+  let shaped: Checker = match declared_value(c, callee) {
+    // A name that names nothing is said by the lookup.
+    None -> c,
+    Some(name) -> if group_member(c, name) {
+      not_a_parser(
+        c,
+        t,
+        b"is in a recursion with what holds the literal",
+        b"runs before it is whole",
+      )
+    } else {
+      let generic = match env_lookup(c.env, name) {
+        Some(sc) -> len(sc.ty_vars) + len(sc.row_vars) + len(sc.label_vars) > 0,
+        None -> false,
+      };
+      match resolve(c, f.ty) {
+        TyFn(fn_) -> {
+          let unified = unify(
+            c.subst,
+            c.fresh,
+            fn_type(
+              [string_type()],
+              TyCon({ name: b"Result", args: [value.ty, refusal_type()] }),
+              fn_.effects,
+            ),
+            f.ty,
+          );
+          let u: Checker = with_unified(c, unified);
+          let row = resolve_row_in(u, fn_.effects);
+          if generic {
+            not_a_parser(u, t, b"takes parameters of its own", b"no call says what they are")
+          } else if unified.error != None {
+            not_a_parser(
+              u,
+              t,
+              bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
+              b"not a literal's parser",
+            )
+          } else if !row_is_pure_but_raise(row) {
+            not_a_parser(
+              u,
+              t,
+              bytes_concat_all([b"performs `", row_text(row), b"`"]),
+              b"a check cannot answer this",
+            )
+          } else { u }
+        },
+        other ->
+          not_a_parser(
+            c,
+            t,
+            bytes_concat_all([b"has type `", type_text(other), b"`"]),
+            b"not a literal's parser",
+          ),
+      }
+    },
+  };
+  { checker: shaped, ty: value.ty, row: row_empty() }
+}
 
 // The branches' answers as a tuple, which is what evaluating them left to right answers.
 fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferred / {abort.raise} = {
@@ -6698,34 +6791,6 @@ fn infer_handle(
   { checker: solved, ty: returned.ty, row: j2.row }
 }
 
-// `Ok` and `Err` are written into the `handle` a `try` stands for, where a module's own would
-// capture them.
-fn try_captured(checker: Checker, span: Span) -> Checker / {abort.raise} = {
-  let bound = scope_of(checker).bound;
-  match fold([b"Ok", b"Err"], None, |acc: Option<Bytes>, name: Bytes|
-      match acc {
-        Some(_) -> acc,
-        None -> match lookup(bound, ValueSpace, name) { Some(_) -> Some(name), None -> None },
-      }) {
-    None -> checker,
-    Some(name) ->
-      report_error_at(
-        checker,
-        b"E0118",
-        span,
-        b"this file gives `try` no meaning here",
-        b"no `Result` to answer with",
-        [
-          bytes_concat_all([
-            b"this module binds its own `",
-            name,
-            b"`, which would capture the `Ok` and `Err` a `try` answers with; rename it or qualify it, or write the `handle` out",
-          ]),
-        ],
-      ),
-  }
-}
-
 // The raise a `try` names.
 fn named_raise(checker: Checker, name: RaiseName) -> WithHit / {abort.raise} = {
   let r: WithHit = resolve_op(checker, name.eff, name.op);
@@ -6875,10 +6940,9 @@ fn infer_try_block(
   let b: Inferred = infer(checker, body, answer);
   let body_mark = len(b.checker.performs);
   let body_row = resolve_row_in(b.checker, b.row);
-  let free: Checker = try_captured(b.checker, span);
   let chosen: WithHit = match raise {
-    Some(name) -> named_raise(free, name),
-    None -> one_raise(free, span, body_row),
+    Some(name) -> named_raise(b.checker, name),
+    None -> one_raise(b.checker, span, body_row),
   };
   match chosen.hit {
     // A `try` that could not say which raise it answers takes each it might have, so the refusal
@@ -7412,6 +7476,7 @@ fn param_names(params: List<Param>) -> List<Bytes> = map(params, |param: Param| 
 fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
   match e {
     ELit(_) -> out,
+    ETagged(t) -> { names: push(out.names, tagged_callee(t.tag)) },
     EBad(_) -> out,
     EVar(v) -> if is_bare(v.name) && contains(bound, v.name.name.name) { out }
     else { { names: push(out.names, v.name) } },
@@ -12177,9 +12242,17 @@ fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
     if s.module != module { acc }
     else { map_insert(acc, span_key(s.span), { effect: s.effect, op: s.op, arity: s.arity }) })
 
-// The modules with every record update written out as the literal it stands for, every `try` as
-// its `handle`, and every `numeric` or `integer` parameter's witness passed and read: what the
-// emitter lowers, and what only the checker knows.
+// A module with every tagged literal written out as the call it runs as, every record update as
+// the literal it stands for, and every `try` as its `handle`. The tagged literals go first: they
+// need nothing of the checker, and what they become is forms the other two already walk.
+fn written_out(module: Module, elaboration: Elaboration, i: Int) -> Module =
+  expand_try_blocks(
+    expand_record_updates(expand_tagged(module), shapes_in(elaboration.updates, i)),
+    answered_in(elaboration.tries, i),
+  )
+
+// The modules written out, and every `numeric` or `integer` parameter's witness passed and read:
+// what the emitter lowers, and what only the checker knows.
 pub fn expanded_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
@@ -12189,10 +12262,7 @@ pub fn expanded_mods(
     {
       name: m.name,
       module: expand_witnesses(
-        expand_try_blocks(
-          expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
-          answered_in(elaboration.tries, i),
-        ),
+        written_out(m.module, elaboration, i),
         ops_in(elaboration.ops, i),
         refs_in(elaboration.refs, i),
         orders_in(elaboration.orders, i),
@@ -12201,22 +12271,15 @@ pub fn expanded_mods(
     }
   })
 
-// The modules with every record update written out and no witness passed: what a claim lowers,
-// since the prover draws every type parameter as `Int` and reads an operator over one as `Int`'s.
+// The modules written out and no witness passed: what a claim lowers, since the prover draws every
+// type parameter as `Int` and reads an operator over one as `Int`'s.
 pub fn updated_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
 ) -> List<ParsedModule> / {abort.raise} =
   map(range(0, len(mods)), |i: Int| {
     let m: ParsedModule = at(mods, i);
-    {
-      name: m.name,
-      module: expand_try_blocks(
-        expand_record_updates(m.module, shapes_in(elaboration.updates, i)),
-        answered_in(elaboration.tries, i),
-      ),
-      derived: m.derived,
-    }
+    { name: m.name, module: written_out(m.module, elaboration, i), derived: m.derived }
   })
 
 fn ops_in(all: List<WitnessOp>, module: Int) -> Map<Bytes, Bytes> =
@@ -13889,15 +13952,6 @@ test "a `try` over several raises names the one it answers, and the others stay 
   ]);
   assert_eq(raising(b"fn f() -> Result<Int, Int> / {p.get} = try[p.get] { p.get() }"), [b"E0313"]);
   assert_eq(raising(b"fn f() -> Result<Int, Int> / {} = try[p.nope] { 1 }"), [b"E0104"])
-}
-
-test "a `try` is refused where its `Ok` and `Err` would be a module's own" {
-  assert_eq(
-    raising(
-      b"type Mine = | Err(Int) | Fine\nfn f(b: Int) -> Int / {} = match try { digit(b) } { _ -> 1 }",
-    ),
-    [b"E0118"],
-  )
 }
 
 test "the lowering reads which raise a `try` answers, by its effect's program-wide name" {
