@@ -24,8 +24,8 @@ nondet effect tester {
   read moved[r](trace: Bytes) -> Option<String>
 }
 
-type Listed = { label: String, digest: Bytes }
-type Chosen = { at: Int, digest: Bytes }
+type Listed = { label: String, identity: Bytes }
+type Chosen = { at: Int, identity: Bytes }
 type Unlisted = { status: String, failure: Raised }
 
 type Configured = {
@@ -144,11 +144,11 @@ fn main(root: String, front: LoadedAnalysis, unit: Bytes) -> String / {
                 None -> said,
                 Some(c) ->
                   said ++ " " ++ c.label ++ " "
-                    ++ tester.executed[r](u, 3, Some({ at: at, digest: c.digest })).status,
+                    ++ tester.executed[r](u, 3, Some({ at: at, identity: c.identity })).status,
               }),
         };
         // A case the table does not hold is a failure of the run that asked for it.
-        let gone = tester.executed[r](u, 3, Some({ at: 0, digest: b"none" })).status;
+        let gone = tester.executed[r](u, 3, Some({ at: 0, identity: b"none" })).status;
         let h = tester.hosted[r]();
         tester.ended[r]();
         adds.status ++ " " ++ wrong.status ++ " " ++ peeks.status ++ " "

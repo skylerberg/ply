@@ -38,12 +38,12 @@ pub struct Machine<'a> {
     re_executed: bool,
 }
 
-/// One case of a test over cases, as a run names it: its place in the table, and its value's
-/// digest, which is what the root holds the table to.
+/// One case of a test over cases, as a run names it: its place in the table, and the identity
+/// its listing gave it, which is what the root holds the table to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Case {
     pub at: i64,
-    pub digest: Vec<u8>,
+    pub identity: Vec<u8>,
 }
 
 /// How one entry ended: its answer, and what the host runtime warned of as it ended, such as the
@@ -196,7 +196,7 @@ impl<'a> Machine<'a> {
     }
 
     /// One case of the test at `index`, which ranges over a table: its root is entered with the
-    /// case's place and digest.
+    /// case's place and identity.
     pub fn eval_case(&mut self, index: usize, case: &Case) -> Ended<()> {
         let (root, span) = match self.test_root(index) {
             Ok(found) => found,
@@ -205,13 +205,13 @@ impl<'a> Machine<'a> {
         self.begin_entry();
         self.compiled.set_machine(self.id);
         self.compiled.set_seed(self.seed.clone(), self.sim_steps);
-        let args = [Value::Int(case.at), Value::bytes(&case.digest)];
+        let args = [Value::Int(case.at), Value::bytes(&case.identity)];
         let entered = self.compiled.enter_whole(&root, &args, self.max_calls);
         self.passed(&root, span, entered)
     }
 
     /// The cases the test at `index` ranges over, as the root beside its own lists them: each
-    /// one's label and digest, in the table's order.
+    /// one's label and identity, in the table's order.
     pub fn eval_cases(&mut self, index: usize) -> Ended<Value> {
         let (root, span) = match self.test_root(index) {
             Ok(found) => found,

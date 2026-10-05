@@ -18,7 +18,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
               MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered,
-              ETagged, Tagged, tagged_callee, case_at, case_digest)
+              ETagged, Tagged, tagged_callee, case_at, case_identity)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -381,12 +381,15 @@ pub fn test_owner(module: Bytes, position: Int) -> Bytes =
 /// The root a test over cases lists its cases by, beside the root that runs one.
 pub fn cases_root(owner: Bytes) -> Bytes = bytes_concat(owner, b".cases")
 
-/// What the listing root of a test over cases answers: each case's label and digest, in the
+/// What the listing root of a test over cases answers: each case's label and identity, in the
 /// table's order.
 pub fn listing_ty() -> Type / {abort.raise} =
   list_type(
     TyRecord(
-      fields_sorted([{ name: b"digest", ty: bytes_type() }, { name: b"label", ty: string_type() }]),
+      fields_sorted([
+        { name: b"identity", ty: bytes_type() },
+        { name: b"label", ty: string_type() },
+      ]),
     ),
   )
 /// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own,
@@ -9465,7 +9468,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                     ..pushed,
                     env: env_bind(
                       env_bind(pushed.env, case_at(), monomorphic(int_type())),
-                      case_digest(),
+                      case_identity(),
                       monomorphic(bytes_type()),
                     ),
                   },
@@ -10864,6 +10867,10 @@ fn alias_noted(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
     )
   }
 
+/// A case is told from another by what it holds, so its type is read through no `key`.
+fn of_case(site: ConstraintSite) -> Bool =
+  site.callee == b"std.cases.listed" || site.callee == b"std.cases.chosen"
+
 fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   let adts = algebraic_shapes(checker);
   let walked = fold(
@@ -10871,29 +10878,14 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
     { checker: { ..checker, constrained_uses: [] }, seen: [] },
     |acc: { checker: Checker, seen: List<{ span: Span, text: Bytes, tag: Int }> }, site: ConstraintSite| {
       let ty = resolve(acc.checker, site.ty);
-      let keyed = if site.callee != b"std.cases.listed" && site.callee != b"std.cases.chosen" {
-        None
-      } else { keyed_in(ty, checker.instances, adts, [], len(adts) + 1) };
       if is_predicate(site.deriver) {
         { checker: check_predicate(acc.checker, site, ty), seen: acc.seen }
-      } else if keyed != None {
-        let rendered = type_text(ty);
-        let tag = deriver_tag(site.deriver);
-        if fold(acc.seen, false, |b: Bool, s: { span: Span, text: Bytes, tag: Int }|
-            b || (s.span == site.span && s.text == rendered && s.tag == tag)) { acc } else {
-          {
-            checker: keyed_case(acc.checker, site, rendered, match keyed {
-              Some(k) -> k,
-              None -> b"",
-            }),
-            seen: push(acc.seen, { span: site.span, text: rendered, tag: tag }),
-          }
-        }
       } else {
+        let through = instance_shapes(checker.instances, adts, site.deriver);
         match derivable(
             site.deriver,
             ty,
-            instance_shapes(checker.instances, adts, site.deriver),
+            if of_case(site) { adts } else { through },
             site.assumed,
           ) {
           None -> acc,
@@ -10936,12 +10928,19 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                       ]),
                     ),
                   ],
-                  why_notes_for_constraint(
-                    blocked.why,
-                    site.deriver,
-                    blocked,
-                    blocker,
-                    site.params,
+                  concat(
+                    why_notes_for_constraint(
+                      blocked.why,
+                      site.deriver,
+                      blocked,
+                      blocker,
+                      site.params,
+                    ),
+                    if of_case(site) && derivable(site.deriver, ty, through, site.assumed) == None {
+                      [
+                        b"a case is told from another by what it holds, so a `key` does not stand in for the type that states it",
+                      ]
+                    } else { [] },
                   ),
                 ),
                 seen: push(acc.seen, { span: site.span, text: rendered, tag: tag }),
@@ -11573,81 +11572,6 @@ fn key_loop(
       },
     },
   }
-
-fn first_keyed(
-  tys: List<Type>,
-  instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
-  visiting: List<Bytes>,
-  room: Int,
-) -> Option<Bytes> / {abort.raise} =
-  fold(tys, None, |acc: Option<Bytes>, ty: Type|
-    match acc { Some(_) -> acc, None -> keyed_in(ty, instances, adts, visiting, room) })
-
-/// The first type that states a `key` among those a value of `ty` holds, `ty` itself included.
-/// `visiting` is the declared types entered, and `room` how many more the walk may enter.
-fn keyed_in(
-  ty: Type,
-  instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
-  visiting: List<Bytes>,
-  room: Int,
-) -> Option<Bytes> / {abort.raise} =
-  match ty {
-    TyVar(_) -> None,
-    TyFn(_) -> None,
-    TyRecord(fs) -> first_keyed(map(fs, |f: Field| f.ty), instances, adts, visiting, room),
-    TyNominal(n) -> first_keyed(map(n.fields, |f: Field| f.ty), instances, adts, visiting, room),
-    TyCon(c) -> match instance_of(instances, c.name, true) {
-      Some(_) -> Some(c.name),
-      None -> match find_adt(adts, c.name) {
-        None -> first_keyed(c.args, instances, adts, visiting, room),
-        Some(adt) -> if contains(visiting, c.name) { None } else {
-          if room <= 0 { None } else {
-            first_keyed(
-              map(adt.fields, |f: Type| at_arguments(f, adt.params, adt.rows, c.args)),
-              instances,
-              adts,
-              push(visiting, c.name),
-              room - 1,
-            )
-          }
-        },
-      },
-    },
-  }
-
-/// A case is told from another by its digest, which a key decides for its type: two cases a body
-/// tells apart would be one to a run, and one's pass would stand for the other.
-fn keyed_case(
-  checker: Checker,
-  site: ConstraintSite,
-  rendered: Bytes,
-  keyed: Bytes,
-) -> Checker / {abort.raise} = {
-  let simple = simple_name_of(keyed);
-  err_labels(
-    checker,
-    b"E0206",
-    bytes_concat_all([b"`", rendered, b"` cannot be a test's case"]),
-    [
-      label_at(
-        site.module,
-        site.span,
-        true,
-        bytes_concat_all([b"a case that holds a `", simple, b"`, which states a `key`"]),
-      ),
-    ],
-    [
-      bytes_concat_all([
-        b"a case is told from another by its value's `digest`, and a `",
-        simple,
-        b"`'s is its key's: two cases the body tells apart would be one to a run, and one's pass would stand for the other",
-      ]),
-      b"range over what the values are built from, and build each in the body",
-    ],
-  )
-}
 
 /// Every `key` and `show` the program states. A key's type is ordered and hashed, so one function
 /// decides `==`, `compare` and `digest` alike, and is not read through its own type again.
