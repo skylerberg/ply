@@ -7,12 +7,12 @@ import std.hash (blake3)
 import std.list (at, concat, contains, drop, sort_by, take, prepend)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names)
-import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
-              ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
-              EffectDef, OpDef, TestDef, Cases, LawDef, Binder, Constraint, Deriver, DJson, DEq,
-              DOrd, DBin, DShow, DHash, DNumeric, DInteger, is_predicate, deriver_text, deriver_tag,
-              SpecKind, SRequires, SEnsures, SCost, SpecClause, Derived, DeriveDef, parse,
-              TDNominal, test_run, test_listing)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
+              FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum,
+              VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder, Constraint,
+              Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, is_predicate,
+              deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost,
+              SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
@@ -8528,7 +8528,11 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
     expr_span(def.body),
     signature.ret,
     body.ty,
-    b"function body type",
+    match schema_of(at(bound.modules, bound.module).module, def) {
+      Some(schema) -> if def.name.name == schema.name.name { b"a law states a proposition" }
+      else { b"a `where` guard states a proposition" },
+      None -> b"function body type",
+    },
   );
   let popped: Checker = { ..checked, env: env_pop(checked.env) };
   let rowed: Checker = match signature.declared {
@@ -8819,7 +8823,25 @@ fn check_upper_bound(
 ) -> Checker / {abort.raise} =
   match def.effects {
     None -> check_unwritten(checker, def, inferred),
-    Some(_) -> check_written(checker, def, declared, inferred),
+    Some(_) -> match schema_of(at(checker.modules, checker.module).module, def) {
+      None -> check_written(checker, def, declared, inferred),
+      // A schema's guard and body are a law's: what they may not perform is said as it is of one.
+      Some(schema) -> {
+        let row = resolve_row_in(checker, inferred);
+        check_written(
+          check_spec_purity(
+            checker,
+            if def.name.name == schema.name.name { InSchemaBody } else { InWhere },
+            [],
+            expr_span(def.body),
+            { atoms: row.atoms, tail: None },
+          ),
+          def,
+          declared,
+          { atoms: [], tail: row.tail },
+        )
+      },
+    },
   }
 
 /// The name a forwarded row variable is written under: the signature's own row parameter.
@@ -9744,7 +9766,8 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     def.binders,
     { checker: checker, tys: [] },
     |acc: { checker: Checker, tys: List<Type> }, b: Binder| {
-      let o: WithTy = law_binder(acc.checker, b);
+      // An instantiation's binders are typed by what its schema's definitions take them at.
+      let o: WithTy = if def.of != None { new_ty(acc.checker) } else { law_binder(acc.checker, b) };
       { checker: o.checker, tys: push(acc.tys, o.ty) }
     },
   );
@@ -9759,19 +9782,23 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
   let guarded: Checker = match def.guard {
     Some(g) -> {
       let o: Inferred = infer({ ..bound, performs: [] }, g);
-      let c: Checker = expect(
-        o.checker,
-        expr_span(g),
-        bool_type(),
-        o.ty,
-        b"a `where` guard states a proposition",
-      ).checker;
+      let c: Checker = unfilled(
+        expect(
+          o.checker,
+          expr_span(g),
+          bool_type(),
+          o.ty,
+          b"a `where` guard states a proposition",
+        ).checker,
+        def,
+        o.row,
+      );
       check_spec_purity(c, InWhere, [], expr_span(g), resolve_row_in(c, o.row))
     },
     None -> bound,
   };
   let body: Inferred = infer({ ..guarded, performs: [] }, def.body);
-  let c2: Checker = match def.cost {
+  let stated: Checker = match def.cost {
     None ->
       expect(
         body.checker,
@@ -9793,6 +9820,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
         map(types.tys, |ty: Type| resolve(body.checker, ty)),
       ),
   };
+  let c2: Checker = unfilled(stated, def, body.row);
   let row = resolve_row_in(c2, body.row);
   // A law a `cost` clause made is held to its definition's row there.
   let c3: Checker = if def.host || def.costs != None { c2 }
@@ -9808,11 +9836,21 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
       ],
     )
   } else { check_spec_purity(c2, InLawBody, [seed_atom()], expr_span(def.body), row) };
-  let popped: Checker = { ..c3, env: env_pop(c3.env) };
-  let binders = map(range(0, len(def.binders)), |i: Int| {
-    let b = at(def.binders, i);
-    { name: b.name.name, ty: resolve(popped, at(types.tys, i)), span: b.span }
-  });
+  let closed: Checker = { ..c3, env: env_pop(c3.env) };
+  let shown = |i: Int|
+    match def.of {
+      Some(u) -> match list_at(u.shown, i) { Some(n) -> n, None -> at(def.binders, i).name.name },
+      None -> at(def.binders, i).name.name,
+    };
+  let popped: Checker = match def.of {
+    None -> closed,
+    Some(u) -> if len(closed.diags) != len(outer.diags) { closed } else {
+      fold(range(0, len(def.binders)), closed, |c: Checker, i: Int|
+        instantiable(c, u, shown(i), resolve(c, at(types.tys, i))))
+    },
+  };
+  let binders = map(range(0, len(def.binders)), |i: Int|
+    { name: shown(i), ty: resolve(popped, at(types.tys, i)), span: at(def.binders, i).span });
   {
     ..popped,
     ty_params: map_new(),
@@ -9831,6 +9869,73 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     }),
   }
 }
+
+/// A schema's row parameter that nothing an instantiation gave it fills is empty there: a law
+/// names no row of its own, so it states what its arguments raise and no more.
+fn unfilled(checker: Checker, def: LawDef, row: Row) -> Checker / {abort.raise} =
+  match ((def.of, resolve_row_in(checker, row).tail)) {
+    (Some(_), Some(v)) -> {
+      let u = unify_row(checker.subst, checker.fresh, row_empty(), row_open(v));
+      match u.error { Some(_) -> checker, None -> with_unified(checker, u) }
+    },
+    _ -> checker,
+  }
+
+/// A schema's binder at the type an instantiation gives it, which the generator must inhabit as it
+/// must a written binder's.
+fn instantiable(
+  checker: Checker,
+  of: OfSchema,
+  binder: Bytes,
+  ty: Type,
+) -> Checker / {abort.raise} =
+  match ungeneratable(checker, ty) {
+    None -> checker,
+    Some(reason) ->
+      report_error_at(
+        checker,
+        b"E0418",
+        of.span,
+        bytes_concat_all([b"`forall` cannot quantify over `", binder, b"`"]),
+        reason,
+        [
+          bytes_concat_all([
+            b"the schema `",
+            of.schema.name.name,
+            b"` binds `",
+            binder,
+            b"`, which is a `",
+            type_text(ty),
+            b"` here",
+          ]),
+          b"a law over a type nothing can produce is a claim nothing can ever check, so it is refused here rather than reported as a gap at discharge time",
+        ],
+      ),
+  }
+
+/// A schema's binders are quantified as a law's are. What else is wrong with a binder's type is said
+/// of the definitions made of the schema.
+fn check_schemas(outer: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  fold(parsed.module.items, outer, |acc: Checker, item: Item|
+    match item {
+      ISchema(d) -> {
+        let typed: Checker = fold(
+          d.binders,
+          { ..acc, ty_params: map_new(), auto_ty_params: true },
+          |c: Checker, b: Binder| law_binder(c, b).checker,
+        );
+        {
+          ..typed,
+          ty_params: acc.ty_params,
+          auto_ty_params: acc.auto_ty_params,
+          diags: concat(
+            acc.diags,
+            filter(drop(typed.diags, len(acc.diags)), |diag: Diag| diag.code == b"E0418"),
+          ),
+        }
+      },
+      _ -> acc,
+    })
 
 /// A binder's type must be one the generator can inhabit: no handler, written row beyond a raise,
 /// `Cell`, `Task` or `Secret`.
@@ -10031,7 +10136,7 @@ fn ungeneratable_within(
       first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
   }
 
-type SpecSite = | InRequires | InEnsures | InCost | SSDecreases | InWhere | InLawBody
+type SpecSite = | InRequires | InEnsures | InCost | SSDecreases | InWhere | InLawBody | InSchemaBody
 
 fn site_phrase(s: SpecSite) -> Bytes =
   match s {
@@ -10041,6 +10146,7 @@ fn site_phrase(s: SpecSite) -> Bytes =
     SSDecreases -> b"a `decreases` measure",
     InWhere -> b"a `where` guard",
     InLawBody -> b"a law body",
+    InSchemaBody -> b"a law schema's body",
   }
 
 fn site_short(s: SpecSite) -> Bytes =
@@ -10051,6 +10157,7 @@ fn site_short(s: SpecSite) -> Bytes =
     SSDecreases -> b"`decreases` measure",
     InWhere -> b"`where` guard",
     InLawBody -> b"law body",
+    InSchemaBody -> b"schema body",
   }
 
 /// Every atom past the allowed set is `E0417`, and an open row too.
@@ -12449,7 +12556,10 @@ pub fn check_program_with(
     check_specs(check_fns({ ..checker, module: i }, m), m)
   });
   let tested: Checker = fold(range(0, len(mods)), checked, |checker: Checker, i: Int|
-    check_laws(check_tests({ ..checker, module: i }, at(mods, i)), at(mods, i)));
+    check_laws(
+      check_schemas(check_tests({ ..checker, module: i }, at(mods, i)), at(mods, i)),
+      at(mods, i),
+    ));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
   let settled: Checker = settle_bit_ops(settle_numerics(settle_concats(settle_updates(tested))));
   let constrained: Checker = check_constraints(
@@ -13516,6 +13626,106 @@ test "a law binder naming a type nothing declares is refused, and a lowercase on
     { code: b"E0102", message: b"unknown type `Acount`", on_name: true },
   ]);
   assert_eq(check_codes(b"law \"l\" forall (x: a, y: List<a>) { true }"), [])
+}
+
+test "an instantiation is checked where it is written: what it is given, and what its schema quantifies there" {
+  let over = |law: Bytes|
+    bytes_concat(
+      b"law schema same<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\nfn id(n: Int) -> Int = n\nfn show(n: Int) -> String = int_to_string(n)\nfn held(c: Cell<Int>) -> Cell<Int> = c\nfn x(n: Int) -> Int = n\n",
+      law,
+    );
+  assert_eq(check_codes(over(b"law \"l\" = same(id)")), []);
+  // A binder no argument settles stays a variable, and a definition named as a binder is not it.
+  assert_eq(check_codes(over(b"law \"l\" = same(|v| v)")), []);
+  assert_eq(check_codes(over(b"law \"l\" = same(x)")), []);
+  assert_eq(check_codes(over(b"law \"l\" = same(show)")), [b"E0201"]);
+  assert_eq(refused_at(over(b"law \"l\" = same(held)"), b"same(held)"), [
+    { code: b"E0418", message: b"`forall` cannot quantify over `x`", on_name: true },
+  ]);
+  assert_eq(list_at(check_codes(over(b"law \"l\" = sam(id)")), 0), Some(b"E0101"))
+}
+
+test "a schema's guard and body are a law's: pure but for a raise, over binders a law could quantify" {
+  let logged = |schema: Bytes|
+    bytes_concat(
+      b"effect log { write emit(Bytes) -> Unit }\nfn noisy(n: Int) -> Int / {log.write} = { log.emit(b\"x\"); n }\nfn spin(n: Int) -> Int / {diverges} = spin(n + 1)\n",
+      schema,
+    );
+  let messages = |src: Bytes| map(check_diags(src), |diag: Diag| diag.message);
+  assert_eq(
+    messages(logged(b"law schema s(f: (Int) -> Int) forall (x: Int) { noisy(f(x)) == x }")),
+    [b"a law schema's body cannot perform an effect"],
+  );
+  assert_eq(
+    messages(
+      logged(b"law schema s(f: (Int) -> Int) forall (x: Int) where noisy(x) > 0 { f(x) == x }"),
+    ),
+    [b"a `where` guard cannot perform an effect"],
+  );
+  assert_eq(
+    check_codes(
+      logged(b"law schema s(f: (Int) -> Int / {log.write}) forall (x: Int) { f(x) == x }"),
+    ),
+    [b"E0417"],
+  );
+  assert_eq(
+    check_codes(
+      logged(
+        b"law schema s(f: (Int) -> Int / {abort.raise}) forall (x: Int) { f(x) / x == spin(x) }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"law schema s(f: (Int) -> Int) forall (c: Cell<Int>) { f(1) == 1 }"), [
+    b"E0418",
+  ]);
+  assert_eq(messages(b"law schema s(f: (Int) -> Int) forall (x: Int) { f(x) }"), [
+    b"type mismatch: a law states a proposition",
+  ])
+}
+
+test "a schema's row parameter is what it is given may raise: any raise fills it, and nothing else" {
+  let over = |law: Bytes|
+    bytes_concat(
+      b"effect reader { raise refused(at: Int) }\neffect log { write emit(Bytes) -> Unit }\nlaw schema settles<a | e>(f: (a) -> a / e) forall (x: a) { f(f(x)) == f(x) }\nfn digit(n: Int) -> Int / {reader.refused} = if n < 0 { reader.refused(n) } else { n % 10 }\nfn half(n: Int) -> Int / {abort.raise} = 10 / n\nfn noisy(n: Int) -> Int / {log.emit} = { log.emit(b\"x\"); n }\nfn clamp(n: Int) -> Int = if n > 9 { 9 } else { n }\n",
+      law,
+    );
+  assert_eq(check_codes(over(b"law \"l\" = settles(clamp)")), []);
+  assert_eq(check_codes(over(b"law \"l\" = settles(half)")), []);
+  assert_eq(check_codes(over(b"law \"l\" = settles(digit)")), []);
+  assert_eq(refused_at(over(b"law \"l\" = settles(noisy)"), b"settles(noisy)"), [
+    { code: b"E0417", message: b"a law body cannot perform an effect", on_name: true },
+  ]);
+  // A parameter whose row writes a raise takes that raise and no other.
+  let fixed = |law: Bytes|
+    over(
+      bytes_concat(
+        b"law schema reads(f: (Int) -> Int / {reader.refused}) forall (x: Int) { f(x) == f(x) }\n",
+        law,
+      ),
+    );
+  assert_eq(check_codes(fixed(b"law \"l\" = reads(digit)")), []);
+  assert_eq(check_codes(fixed(b"law \"l\" = reads(half)")), [b"E0302"]);
+  // A row parameter no argument fills is empty where the schema is instantiated.
+  assert_eq(
+    check_codes(
+      b"law schema fixed<a | e>(unit: a) forall (x: a) where x == unit { x == unit }\nlaw \"l\" = fixed(0)",
+    ),
+    [],
+  )
+}
+
+test "an instantiation's binder settles to the `new` record what it is given takes" {
+  let src = b"type Sign = new { negative: Bool }\ntype Bare = { negative: Bool }\nfn shown(s: Sign) -> String = if s.negative { \"-\" } else { \"+\" }\nfn read(t: String) -> Option<Sign> = if t == \"-\" { Some({ negative: true }) } else { Some({ negative: false }) }\nfn plain(t: String) -> Option<Bare> = Some({ negative: t == \"-\" })\nlaw schema reads_back<a>(f: (a) -> String, g: (String) -> Option<a>) forall (x: a) { g(f(x)) == Some(x) }\n";
+  let c = checked_cx(bytes_concat(src, b"law \"l\" = reads_back(shown, read)"));
+  assert_eq(c.diags, []);
+  assert_eq(
+    map(c.laws, |l: LawInfo|
+      map(l.binders, |b: LawBinder| match b.ty { TyNominal(n) -> n.name, _ -> b"" })),
+    [[b"m.Sign"]],
+  );
+  // A record of the same fields is not the `new` one.
+  assert_eq(check_codes(bytes_concat(src, b"law \"l\" = reads_back(shown, plain)")), [b"E0201"])
 }
 
 test "a handle must have a clause for every operation its body performs on an atom it handles" {

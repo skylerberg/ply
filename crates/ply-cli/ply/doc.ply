@@ -1,8 +1,8 @@
 //! `ply doc` — what a name documents, as an agent reads it. A definition: its signature with the
 //! parameter names the source wrote, its doc and clauses, its place, hash and footprint, and the
-//! tests and laws that name it. A type, an effect or a module: its doc and its members'. A builtin:
-//! what the prelude declares. A name the program does not hold is looked for among the builtins,
-//! then the shipped modules.
+//! tests and laws that name it. A law schema: the same, under the schema as it is written. A type,
+//! an effect or a module: its doc and its members'. A builtin: what the prelude declares. A name
+//! the program does not hold is looked for among the builtins, then the shipped modules.
 
 import std.random (entropy)
 import std.time (time)
@@ -20,7 +20,8 @@ import compiler.infer (DefInfo, TestInfo, LawInfo, Builtin, builtin_named, built
 import compiler.prelude_source
 import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, FnDef, TypeDef, TDAlias, TDSum,
                        VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc, SpecClause, ImportDecl,
-                       ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, TDNominal)
+                       ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, TDNominal, SchemaDef,
+                       schema_of)
 import compiler.exprs (Param)
 import compiler.parsing (Doc, Ident, Span)
 import compiler.resolve (ParsedModule, Diag, Source, qualify)
@@ -394,18 +395,23 @@ fn named_by(shelf: Shelf, tables: Tables, name: Bytes) -> Naming = {
   }
 }
 
+/// A schema as it is written: its parameters, its binders and guard, and the body it claims.
+fn schema_signature(shelf: Shelf, module: Int, d: SchemaDef) -> String / {abort.raise} =
+  visibility(d.vis) ++ sliced(shelf, module, d.span)
+
+/// A definition a schema declares is documented as the schema: what it is written as, and the laws
+/// that instantiate it.
 fn definition_page(shelf: Shelf, tables: Tables, def_info: DefInfo) -> Page / {abort.raise} = {
   let module = def_info.at.module;
-  let found = match list_at(shelf.analysis.mods, module) {
-    Some(parsed) -> fn_named(parsed, def_info.name),
-    None -> None,
-  };
+  let parsed = list_at(shelf.analysis.mods, module);
+  let found = match parsed { Some(m) -> fn_named(m, def_info.name), None -> None };
+  let schema = match ((parsed, found)) { (Some(m), Some(d)) -> schema_of(m.module, d), _ -> None };
   let signed: Signed = fn_signature(def_info, found);
   let naming = named_by(shelf, tables, def_info.name);
   {
-    kind: "definition",
+    kind: match schema { Some(_) -> "law schema", None -> "definition" },
     name: string_of_bytes_lossy(def_info.name),
-    signature: signed.text,
+    signature: match schema { Some(d) -> schema_signature(shelf, module, d), None -> signed.text },
     ty: string_of_bytes_lossy(scheme_text(def_info.scheme)),
     params: signed.params,
     doc: match found { Some(d) -> lines_of(d.doc), None -> [] },
@@ -510,15 +516,27 @@ fn module_members(shelf: Shelf, module: Int, parsed: ParsedModule) -> List<Membe
     match it {
       IFn(d) -> match d.vis {
         VPriv -> acc,
-        VPub -> match map_get(defs, qualify(parsed.name, d.name.name)) {
-          None -> acc,
-          Some(def_info) ->
+        VPub -> match ((
+            map_get(defs, qualify(parsed.name, d.name.name)),
+            schema_of(parsed.module, d),
+          )) {
+          (None, _) -> acc,
+          (Some(def_info), None) ->
             push(acc, {
               kind: "definition",
               name: string_of_bytes_lossy(d.name.name),
               signature: fn_signature(def_info, Some(d)).text,
               doc: lines_of(d.doc),
             }),
+          // A schema is listed once, as itself, and not again as the definition its guard is.
+          (Some(_), Some(schema)) -> if schema.name.name != d.name.name { acc } else {
+            push(acc, {
+              kind: "law schema",
+              name: string_of_bytes_lossy(d.name.name),
+              signature: schema_signature(shelf, module, schema),
+              doc: lines_of(d.doc),
+            })
+          },
         },
       },
       IType(d) -> match d.vis {
