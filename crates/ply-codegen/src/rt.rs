@@ -676,6 +676,9 @@ impl Ctx {
                 keyed: unit_keys,
                 key: key_value,
                 shown: shown_value,
+                numeric: numeric_value,
+                witness: stated_witness,
+                of_int: of_int_value,
             })
     }
 
@@ -1314,6 +1317,16 @@ pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let vals = values_taken(c, &[a]);
     let answer = match &vals[0] {
+        v @ Value::Ctor { .. } => {
+            match numeric_value(
+                ctx.cast(),
+                ply_eval::instances::NEG,
+                std::slice::from_ref(v),
+            ) {
+                Some(n) => n,
+                None => return unsafe { &mut *ctx }.fail(ply_eval::unstated(Span::DUMMY, v)),
+            }
+        }
         Value::Float(f) => Value::Float(-f),
         Value::Decimal(d) => Value::Decimal(-*d),
         Value::Fixed(f) => match f.checked_neg() {
@@ -1652,7 +1665,11 @@ const SAME_STACK: usize = 256 * 1024;
 /// read, which may be in frames that grew onto a segment the entry's floor knows nothing of: the
 /// call then runs on a stack of its own.
 fn call_stated(ctx: *mut Ctx, entry: usize, w: Word) -> Option<Word> {
-    let args = [w];
+    call_stated_over(ctx, entry, &[w])
+}
+
+/// [`call_stated`] for an entry of any number of words. Takes each.
+fn call_stated_over(ctx: *mut Ctx, entry: usize, args: &[Word]) -> Option<Word> {
     let (floor, site) = {
         let c = unsafe { &*ctx };
         (c.stack_floor, (c.site_root, c.site_start, c.site_end))
@@ -1761,6 +1778,56 @@ fn stated_value(unit: *mut (), v: &Value, key: bool) -> Option<Value> {
 
 fn key_value(unit: *mut (), v: &Value) -> Option<Value> {
     stated_value(unit, v, true)
+}
+
+/// One of a `numeric`'s functions, for this constructor, called over `args`.
+fn numeric_call(ctx: *mut Ctx, ctor: u32, role: usize, args: &[Value]) -> Option<Value> {
+    let c = unsafe { &mut *ctx };
+    match c.tables.layouts.numeric(ctor, role) {
+        Stated::No => None,
+        Stated::Absent => {
+            let name = c.tables.layouts.ctors[ctor as usize].0.clone();
+            absent(c, "numeric", &name);
+            None
+        }
+        Stated::By(entry) => {
+            let tables = Arc::clone(&c.tables);
+            let words: Vec<Word> = args
+                .iter()
+                .map(|v| c.heap.to_word(&tables.layouts, v))
+                .collect();
+            let out = call_stated_over(ctx, entry, &words)?;
+            let answer = Heap::to_value(&tables.layouts, out);
+            heap::dec(out);
+            Some(answer)
+        }
+    }
+}
+
+fn numeric_value(unit: *mut (), role: usize, args: &[Value]) -> Option<Value> {
+    let ctx = unit.cast::<Ctx>();
+    let Some(Value::Ctor { name, .. }) = args.first() else {
+        return None;
+    };
+    let ctor = unsafe { &*ctx }.tables.layouts.ctor_index(name)?;
+    numeric_call(ctx, ctor, role, args)
+}
+
+fn stated_witness(unit: *mut (), ctor: &Symbol) -> Option<i64> {
+    let layouts = &unsafe { &*unit.cast::<Ctx>() }.tables.layouts;
+    let index = layouts.ctor_index(ctor)?;
+    (layouts.numeric(index, ply_eval::instances::OF_INT) != Stated::No)
+        .then(|| ply_eval::instances::STATED_WITNESS + i64::from(index))
+}
+
+fn of_int_value(unit: *mut (), witness: i64, n: i64) -> Option<Value> {
+    let ctor = u32::try_from(witness - ply_eval::instances::STATED_WITNESS).ok()?;
+    numeric_call(
+        unit.cast::<Ctx>(),
+        ctor,
+        ply_eval::instances::OF_INT,
+        &[Value::Int(n)],
+    )
 }
 
 fn shown_value(unit: *mut (), v: &Value) -> Option<Value> {

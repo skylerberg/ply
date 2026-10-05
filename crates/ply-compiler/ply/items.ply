@@ -14,7 +14,7 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 dump_word, dump_bool, dump_list, dump_opt, dump_ident, dump_qname, dump_diags, Doc,
                 doc_at, module_doc, token_between, dump_doc, primary_span_of)
 import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, Keyword, Punctuation,
-              EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark)
+              EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark, follows_name)
 import type_syntax (TypeExpr, TRecord, TUnit, RowExpr, AtomExpr, Mode, Generics, RowMember, MRead,
                     MWrite, MRaise, RMAtom, RMSet, ty, ty_span, no_ty, mode, generics, row,
                     row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
@@ -214,6 +214,22 @@ pub type InstanceDef = { kind: InstanceKind, target: Ident, by: Ident, span: Spa
 
 pub fn instance_text(kind: InstanceKind) -> Bytes = match kind { NKey -> b"key", NShow -> b"show" }
 
+/// One function a `numeric` names, and the operation it names it for.
+pub type NumericOp = { op: Ident, by: Ident }
+
+/// The arithmetic a nominal type's own module states the operators mean at it:
+/// `numeric for BigInt by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }`.
+pub type NumericDef = { target: Ident, ops: List<NumericOp>, span: Span }
+
+/// The operations a `numeric` names a function for, each once, in the order a unit lists them:
+/// `+`, binary `-`, `*`, unary `-`, and what `numeric_of_int` calls.
+pub fn numeric_ops() -> List<Bytes> = [b"add", b"sub", b"mul", b"neg", b"of_int"]
+
+/// The function `d` names for `op`.
+pub fn numeric_by(d: NumericDef, op: Bytes) -> Option<Ident> =
+  fold(d.ops, None, |acc: Option<Ident>, x: NumericOp|
+    match acc { Some(_) -> acc, None -> if x.op.name == op { Some(x.by) } else { None } })
+
 /// `expansion` is every atom the set stands for, as its own module writes them; the resolver fills it.
 pub type EffectSetDef = {
   name: Ident,
@@ -249,6 +265,7 @@ pub type Item =
   | IEffectSet(EffectSetDef)
   | IExtern(ExternDef)
   | IInstance(InstanceDef)
+  | INumeric(NumericDef)
 
 pub type Module = { doc: Option<Doc>, imports: List<ImportDecl>, items: List<Item> }
 
@@ -362,6 +379,24 @@ pub fn item_doc(item: Item) -> Option<Doc> =
     ILaw(_) -> None,
     IDerive(_) -> None,
     IInstance(_) -> None,
+    INumeric(_) -> None,
+  }
+
+/// The type an item states functions of, which whatever keeps the type's declaration keeps with
+/// it: a comparison, a `show` or an operator reaches them from a value, and from no body.
+pub fn stated_type(item: Item) -> Option<Ident> =
+  match item {
+    IInstance(d) -> Some(d.target),
+    INumeric(d) -> Some(d.target),
+    IFn(_) -> None,
+    IType(_) -> None,
+    IEffect(_) -> None,
+    ITest(_) -> None,
+    ILaw(_) -> None,
+    ISchema(_) -> None,
+    IDerive(_) -> None,
+    IEffectSet(_) -> None,
+    IExtern(_) -> None,
   }
 
 pub fn item_span(item: Item) -> Span =
@@ -376,6 +411,7 @@ pub fn item_span(item: Item) -> Span =
     IEffectSet(d) -> d.span,
     IExtern(d) -> d.span,
     IInstance(d) -> d.span,
+    INumeric(d) -> d.span,
   }
 
 // --- Schemas ----------------------------------------------------------------
@@ -426,12 +462,19 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_transparent_start(input, parser)
     || at_extern_start(input, parser)
     || at_instance_start(input, parser)
+    || at_numeric_start(input, parser)
 }
 
 /// `key` and `show` are contextual: one opens an item only before `for`, so `fn key(..)` and a field
 /// named `show` keep their meaning.
 pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
   (at_ident_text(input, parser, b"key") || at_ident_text(input, parser, b"show"))
+    && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
+
+/// `numeric` is contextual as `key` is: a constraint `numeric(a)` and a definition of that name
+/// keep their meaning.
+pub fn at_numeric_start(input: Input, parser: Parser) -> Bool =
+  at_ident_text(input, parser, b"numeric")
     && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
 
 /// `extern` is contextual: it opens an item only when `fn` follows.
@@ -1807,6 +1850,49 @@ pub fn instance_def(
   }
 }
 
+fn numeric_op(input: Input, parser: Parser) -> Result<Parsed<NumericOp>, Parser> / {abort.raise} = {
+  let { parser, node: op } = expect_ident(
+    input,
+    parser,
+    b"an operation: `add`, `sub`, `mul`, `neg` or `of_int`",
+  )?;
+  let { parser, .. } = expect(
+    input,
+    parser,
+    token_colon(),
+    b"`:` and the function this operation is",
+  )?;
+  let { parser, node: by } = expect_ident(input, parser, b"a function of this module, after `:`")?;
+  Ok({ parser: parser, node: { op: op, by: by } })
+}
+
+/// One `numeric for T by { add: f, sub: g, mul: h, neg: n, of_int: o }`.
+pub fn numeric_def(
+  input: Input,
+  parser: Parser,
+) -> Result<Parsed<NumericDef>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let f = advance(input, st.parser);
+  let { parser, node: target } = expect_ident(input, f.parser, b"the type, after `for`")?;
+  if !at_ident_text(input, parser, b"by") {
+    Err(error_here(input, parser, b"`by` and the functions the operators are at this type"))
+  } else {
+    let b = advance(input, parser);
+    let { parser, .. } = expect(
+      input,
+      b.parser,
+      token_lbrace(),
+      b"`{` and each operation's function, as `{ add: f, .. }`",
+    )?;
+    let { parser, node: ops } = comma_list(input, parser, token_rbrace(), numeric_op)?;
+    let { parser, .. } = expect(input, parser, token_rbrace(), b"`}` to close the operations")?;
+    Ok({
+      parser: parser,
+      node: { target: target, ops: ops, span: span_to(st.node, previous_span(input, parser)) },
+    })
+  }
+}
+
 // --- `test` -----------------------------------------------------------------
 
 fn test_nondet(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {abort.raise} = {
@@ -2001,6 +2087,14 @@ pub fn item_at(
       ]),
     )?;
     Ok({ parser: d.parser, node: IInstance(d.node) })
+  } else if at_numeric_start(input, parser) {
+    let d = numeric_def(
+      input,
+      no_pub(parser, unexpected(), pub_span, b"a `numeric` cannot be `pub`", [
+        b"it is part of what its type is, and reaches wherever the type does",
+      ]),
+    )?;
+    Ok({ parser: d.parser, node: INumeric(d.node) })
   } else {
     Err(
       error_here(
@@ -2021,8 +2115,8 @@ pub fn item(input: Input, parser: Parser) -> Result<Parsed<Item>, Parser> / {abo
   Ok({ parser: parser, node: documented(found, doc) })
 }
 
-/// A test or a law says what it is in its name, a `derive` is its deriver's, and a `key` or a
-/// `show` is its function's; none takes a doc.
+/// A test or a law says what it is in its name, a `derive` is its deriver's, and a `key`, a `show`
+/// or a `numeric` is its functions'; none takes a doc.
 fn documented(item: Item, doc: Option<Doc>) -> Item =
   match item {
     IFn(d) -> IFn({ ..d, doc: doc }),
@@ -2035,6 +2129,7 @@ fn documented(item: Item, doc: Option<Doc>) -> Item =
     ILaw(_) -> item,
     IDerive(_) -> item,
     IInstance(_) -> item,
+    INumeric(_) -> item,
   }
 
 // --- `run` ------------------------------------------------------------------
@@ -2092,12 +2187,14 @@ fn first_cases(items: List<Item>) -> Option<Span> =
     })
 
 /// Where the module first interpolates or derives `show`, either of which calls into `std.show`.
-fn first_shown(input: Input, items: List<Item>) -> Option<Span> = {
+fn first_shown(input: Input, items: List<Item>) -> Option<Span> / {abort.raise} = {
   let hole = fold(input.tokens, None, |acc: Option<Span>, token: Token|
     match acc {
       Some(_) -> acc,
       None -> match token.kind {
-        InterpolatedHead(_) -> Some({ start: token.start, end: token.end }),
+        // A tagged literal's holes are its tag's to read, not `std.show`'s.
+        InterpolatedHead(_) -> if follows_name(input.source, token.start) { None }
+        else { Some({ start: token.start, end: token.end }) },
         _ -> None,
       },
     });
@@ -2430,6 +2527,13 @@ pub fn dump_instance(d: InstanceDef) -> Bytes / {abort.raise} =
     dump_ident(d.by),
   ])
 
+pub fn dump_numeric(d: NumericDef) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    dump_node(d.span, b"num"),
+    dump_ident(d.target),
+    dump_list(d.ops, |x: NumericOp| bytes_concat(dump_ident(x.op), dump_ident(x.by))),
+  ])
+
 pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
   match item {
     IFn(d) -> dump_fn(d),
@@ -2442,6 +2546,7 @@ pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
     IEffectSet(d) -> dump_effect_set(d),
     IExtern(d) -> dump_extern(d),
     IInstance(d) -> dump_instance(d),
+    INumeric(d) -> dump_numeric(d),
   }
 
 pub fn dump_module(module: Module) -> Bytes / {abort.raise} =
@@ -2684,7 +2789,10 @@ test "a test over cases binds a name at a type and ranges over a table, and its 
   // Its holes and its cases are read through two modules no source imports.
   assert_eq(len(r.node.imports), 2);
   assert_eq(len(filter(r.node.imports, is_written)), 0);
-  assert_eq(len(parse(b"test \"n\" { assert(true) }\n").node.imports), 0)
+  assert_eq(len(parse(b"test \"n\" { assert(true) }\n").node.imports), 0);
+  // A tagged literal's holes are its tag's to read: they bring in neither.
+  assert_eq(len(parse(b"fn f(n: Int) -> Int = sh\"a {n}\"\n").node.imports), 0);
+  assert_eq(len(parse(b"fn f(n: Int) -> Int = sh\"a {f\"{n}\"}\"\n").node.imports), 1)
 }
 
 test "a test over cases names its case's type and its table, and only a quoted label takes holes" {
@@ -2889,6 +2997,42 @@ test "a `///` block documents a `law schema`, and above an instantiation it docu
       parse(
         b"law schema s(f: (Int) -> Int) { f(1) == 1 }\n\n/// stray\nlaw \"l\" = s(g)\n",
       ).parser.diags,
+      |d: ParseDiag| d.code,
+    ),
+    [b"E0003"],
+  )
+}
+
+test "`numeric for T by { .. }` is an item, and `numeric` is still a constraint's name" {
+  let r = parse(
+    b"type T = | T(Int)\nnumeric for T by { add: f, of_int: g }\nfn h<a>(x: a) -> a where numeric(a) = x\n",
+  );
+  assert_eq(len(r.parser.diags), 0);
+  match r.node.items {
+    [IType(_), INumeric(d), IFn(_)] -> {
+      assert_eq(d.target.name, b"T");
+      assert_eq(map(d.ops, |x: NumericOp| (x.op.name, x.by.name)), [
+        (b"add", b"f"),
+        (b"of_int", b"g"),
+      ]);
+      assert(numeric_by(d, b"of_int") != None && numeric_by(d, b"mul") == None)
+    },
+    _ -> panic("a type, a numeric and a function"),
+  };
+  assert_eq(len(parse(b"fn numeric(n: Int) -> Int = n\n").parser.diags), 0);
+  // A word against a string is a tagged literal's tag, in an expression, and opens no item.
+  assert_eq(
+    len(parse(b"fn g() -> Int = key\"a\" + show\"b\" + numeric\"c\" + by\"d\"\n").parser.diags),
+    0,
+  );
+  assert(len(parse(b"numeric\"a\" for T by { add: f }\n").parser.diags) > 0);
+  assert(len(parse(b"key\"a\" for T by f\n").parser.diags) > 0);
+  assert(len(parse(b"numeric for T by f\n").parser.diags) > 0);
+  assert(len(parse(b"pub numeric for T by { add: f }\n").parser.diags) > 0);
+  // Its functions carry the docs; a `///` above the item documents nothing.
+  assert_eq(
+    map(
+      parse(b"type T = | T(Int)\n/// its arithmetic\nnumeric for T by { add: f }\n").parser.diags,
       |d: ParseDiag| d.code,
     ),
     [b"E0003"],

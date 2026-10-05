@@ -10,14 +10,14 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               deriver_text, Constraint, SpecClause, SpecKind, SRequires, SEnsures, SCost,
               ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, item_span, item_doc, parse, dump_module,
               is_written, constraint_written, is_pub, spec_kind_text, TDNominal, IInstance,
-              instance_text)
+              instance_text, INumeric, NumericOp)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, ty_span, mode_text, is_raise, angled, generics_text, ident_names)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt, SLet,
               SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
-              ETagged, Tagged)
+              ETagged, Tagged, Hole)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
 import std.list (at)
@@ -501,9 +501,34 @@ fn line_string(printer: Printer, value: Bytes, indent: Int, cont: Int) -> Printe
   { ..printed, closed: indent }
 }
 
-/// A tagged literal as written: its tag, touching its string.
-fn tagged_text(input: PrintInput, t: Tagged) -> Bytes / {abort.raise} =
-  bytes_concat(t.tag.name, bytes_slice(input.source, t.quoted.start, t.quoted.end))
+/// A hole between its braces, set off by a space where it begins with a brace of its own, which
+/// beside the hole's would read as a brace of the text.
+fn hole_text(flat: Bytes) -> Bytes =
+  if bytes_starts_with(flat, b"{") { bytes_concat_all([b"{ ", flat, b" }"]) }
+  else { bytes_concat_all([b"{", flat, b"}"]) }
+
+/// A tagged literal as written: its tag touching its string, each text kept and each hole printed
+/// flat, or kept too where it has no flat form.
+fn tagged_text(input: PrintInput, t: Tagged) -> Bytes / {abort.raise} = {
+  let text = |quoted: Span| bytes_slice(input.source, quoted.start + 1, quoted.end - 1);
+  let filled = fold(
+    t.holes,
+    { out: text(t.quoted), from: t.quoted.end },
+    |acc: { out: Bytes, from: Int }, h: Hole|
+      {
+        out: bytes_concat_all([
+          acc.out,
+          match flat_expr(input, h.value) {
+            Some(flat) -> hole_text(flat),
+            None -> bytes_slice(input.source, acc.from - 1, h.quoted.start + 1),
+          },
+          text(h.quoted),
+        ]),
+        from: h.quoted.end,
+      },
+  );
+  bytes_concat_all([t.tag.name, b"\"", filled.out, b"\""])
+}
 
 fn lit_text(input: PrintInput, span: Span, literal: Lit) -> Bytes / {abort.raise} =
   match literal {
@@ -869,7 +894,7 @@ fn piece(input: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
       Some(bytes_slice(input.source, v.span.start + lead, v.span.end - 1))
     },
     EApp(v) -> match v.args {
-      [x] -> cat([Some(b"{"), flat_expr(input, x), Some(b"}")]),
+      [x] -> match flat_expr(input, x) { Some(flat) -> Some(hole_text(flat)), None -> None },
       _ -> None,
     },
     _ -> None,
@@ -1774,6 +1799,17 @@ fn item(input: PrintInput, printer: Printer, it: Item) -> Printer / {abort.raise
         s1,
         bytes_concat_all([instance_text(d.kind), b" for ", d.target.name, b" by ", d.by.name]),
       ),
+    INumeric(d) ->
+      emit(
+        s1,
+        bytes_concat_all([
+          b"numeric for ",
+          d.target.name,
+          b" by { ",
+          join(map(d.ops, |x: NumericOp| bytes_concat_all([x.op.name, b": ", x.by.name])), b", "),
+          b" }",
+        ]),
+      ),
   };
   trail(input, set_prev(absorb(input, s2, sp.end), sp.end), sp.end)
 }
@@ -2230,6 +2266,7 @@ fn item_kind(item: Item) -> Bytes =
     IEffectSet(_) -> b"effect set",
     IExtern(_) -> b"extern fn",
     IInstance(d) -> instance_text(d.kind),
+    INumeric(_) -> b"numeric",
   }
 
 /// A test, a law or a derive has no identifier to be found by.
@@ -3000,6 +3037,19 @@ test "a tagged literal is kept as written, its tag touching its string" {
   assert(stable(src))
 }
 
+test "a tagged literal's texts are kept as written and its holes printed flat" {
+  let src = b"fn f(x: Int) -> Int =   sh\"a {{b}} \\n {x   +   1}{ sh\"in {x}\" } z\"\n";
+  assert_eq(formatted(src), b"fn f(x: Int) -> Int = sh\"a {{b}} \\n {x + 1}{sh\"in {x}\"} z\"\n");
+  assert(stable(src));
+  // A hole that opens with a brace of its own keeps a space beside the hole's.
+  let braced = b"fn g() -> Int = sh\"{ {n: 1}.n }{  {n: 2}  }\" + len(f\"{ {n: 3}.n } { {n: 4} }\")\n";
+  assert_eq(
+    formatted(braced),
+    b"fn g() -> Int = sh\"{ { n: 1 }.n }{ { n: 2 } }\" + len(f\"{ { n: 3 }.n } { { n: 4 } }\")\n",
+  );
+  assert(stable(braced))
+}
+
 test "a file that does not parse is refused with the first diagnostic, and never rewritten" {
   match fmt_source(b"fn f( = 1\n") {
     Ok(_) -> assert(false),
@@ -3164,6 +3214,13 @@ test "an `extern fn` prints as its declaration, a `where` on a line of its own" 
   lays_out(
     b"// kept\nextern   fn len<a>(xs:List<a>)->Int\n\nextern fn compare<a>(x: a, y: a) -> Ordering where derivable(ord, a)\n",
     b"// kept\nextern fn len<a>(xs: List<a>) -> Int\n\nextern fn compare<a>(x: a, y: a) -> Ordering\n  where derivable(ord, a)\n",
+  )
+}
+
+test "a `numeric` prints on one line, its operations in the order written" {
+  lays_out(
+    b"type T = | T(Int)\nnumeric   for T by {of_int:g,\n  add : f ,}\n",
+    b"type T = | T(Int)\nnumeric for T by { of_int: g, add: f }\n",
   )
 }
 

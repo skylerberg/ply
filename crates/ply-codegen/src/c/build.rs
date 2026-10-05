@@ -110,6 +110,7 @@ fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -
         lambdas,
         buckets,
         instances,
+        numerics,
     } = exports;
     bind(&lib, &helpers)?;
     filled(&lib, &buckets)?;
@@ -154,14 +155,15 @@ fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -
         bail!("two roots of this unit share a site id");
     }
     let mut tables = tables_of(unit, &ctors);
-    let by = |function: &str| match (function, entries.get(function)) {
+    let taking = |function: &str, takes: usize| match (function, entries.get(function)) {
         ("-", _) => Ok(Stated::No),
         (_, None) => Ok(Stated::Absent),
-        (_, Some((entry, 1))) => Ok(Stated::By(*entry as usize)),
+        (_, Some((entry, words))) if *words == takes => Ok(Stated::By(*entry as usize)),
         (name, Some((_, words))) => bail!(
-            "`{name}` is stated as a `key` or a `show` and takes {words} words, where it is called with the value alone"
+            "`{name}` is stated of a type and takes {words} words, where it is called with {takes}"
         ),
     };
+    let by = |function: &str| taking(function, 1);
     let mut stated = vec![(Stated::No, Stated::No); ctors.len()];
     for (ctor, key, show) in &instances {
         let Some(index) = tables.layouts.ctor_index(ctor) else {
@@ -170,6 +172,17 @@ fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -
         stated[index as usize] = (by(key)?, by(show)?);
     }
     tables.layouts.state(stated);
+    let mut stated = vec![[Stated::No; 5]; ctors.len()];
+    for (ctor, functions) in &numerics {
+        let Some(index) = tables.layouts.ctor_index(ctor) else {
+            bail!("the unit states a `numeric` of `{ctor}`, which it does not hold");
+        };
+        for (role, function) in functions.iter().enumerate() {
+            let takes = ply_eval::instances::NUMERIC_WORDS[role];
+            stated[index as usize][role] = taking(function, takes)?;
+        }
+    }
+    tables.layouts.state_numeric(stated);
     tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
     tables.memo_costs = functions
         .iter()
