@@ -1,0 +1,332 @@
+//! `const fn` as a load settles it: a build evaluates the definition before anything runs, keeps
+//! its value under the hash of all the definition reaches, and every unit it emits after holds the
+//! value in place of the body. One that cannot be evaluated is refused at its definition by every
+//! command that would otherwise run it.
+
+import harness (Ran, Source, in_memory, kept_in_memory, tree, scratch, project, on_disk, json_of,
+                at, nth, items, str, int, codes, diagnostic, stdout, said, assert_ok, file_of,
+                manifest, dep, Hermetic, Shipped)
+import std.fs
+import std.fs (MemFs)
+import std.json (Json)
+import std.string
+
+/// A module that reads the numbers a text holds, one a line, as their squares.
+fn squares() -> Source =
+  {
+    path: "squares.ply",
+    text:
+      \\import std.string (int_of_string)
+      \\
+      \\pub fn parsed(text: Bytes) -> Array<Int> / {abort.raise} =
+      \\  array_of_list(
+      \\    map(filter(string_split(string_of_bytes(text), "\n"), |line: String| line != ""), square),
+      \\  )
+      \\
+      \\fn square(line: String) -> Int / {abort.raise} =
+      \\  match int_of_string(line) { Some(n) -> n * n, None -> panic("no number in `" ++ line ++ "`") }
+      \\
+  }
+
+/// A program whose table is a `const fn` over `numbers.txt`: `main` answers the sum of the table,
+/// and its tests hold a read of the table to what its body makes and to what the body costs.
+fn holding() -> Source =
+  {
+    path: "m.ply",
+    text:
+      \\import squares (parsed)
+      \\
+      \\const fn table() -> Array<Int> = parsed(embed("numbers.txt"))
+      \\
+      \\fn computed() -> Array<Int> / {abort.raise} = parsed(embed("numbers.txt"))
+      \\
+      \\fn main() -> Int / {abort.raise} =
+      \\  fold(range(0, array_len(table())), 0, |sum: Int, i: Int| sum + array_get(table(), i))
+      \\
+      \\test "the table read is the table its body makes" { assert_eq(table(), computed()) }
+      \\
+      \\test "a read of the table enters nothing of its body" {
+      \\  let read = metered(|| table());
+      \\  let nothing = metered(|| 0);
+      \\  assert_eq(read.steps, nothing.steps);
+      \\  assert_eq(read.allocations, nothing.allocations);
+      \\  assert(metered(|| computed()).steps > read.steps)
+      \\}
+      \\
+  }
+
+fn numbers(text: String) -> Source = { path: "numbers.txt", text: text }
+
+fn program(text: String) -> List<Source> = [squares(), holding(), numbers(text)]
+
+fn written(t: MemFs, source: Source) -> MemFs / {abort.raise} =
+  fs::mem_write(t, "w/" ++ source.path, bytes_of_string(source.text)).fs
+
+fn passed(ran: Ran) -> Int / {abort.raise} = int(at(at(json_of(ran), "summary"), "passed"))
+
+test "a `const fn` is evaluated by the build, and a run reads its value at no cost" {
+  let files = program("1\n2\n3\n");
+  assert_ok(in_memory(tree(files), ["check"]));
+  let ran = in_memory(tree(files), ["run"]);
+  assert_ok(ran);
+  assert(string_contains(stdout(ran), "14"), Some(said(ran)));
+  let tested = in_memory(tree(files), ["test", "--json", "--no-cache"]);
+  assert_ok(tested);
+  assert_eq(passed(tested), 2)
+}
+
+test "a `const fn` performs nothing where it is called, whatever its body could raise" {
+  let types = stdout(in_memory(tree(program("1\n")), ["check", "--types"]));
+  match string::split_once(types, "   m m.ply") {
+    None -> panic("no heading for `m` in:\n" ++ types),
+    // No row follows `table`'s type, where one follows `computed`'s.
+    Some(cut) -> {
+      assert(
+        string_contains(cut.tail, "table    : () -> Array<Int>\n     computed : "),
+        Some(types),
+      );
+      assert(
+        string_contains(cut.tail, "computed : () -> Array<Int>\n                / {abort.raise"),
+        Some(types),
+      )
+    },
+  }
+}
+
+test "a value is evaluated again when its body, what it reaches or a file it embeds moves" {
+  let first = kept_in_memory(tree(program("1\n2\n3\n")), ["run"], [], None);
+  assert(string_contains(stdout(first.ran), "14"), Some(said(first.ran)));
+  // The file it embeds.
+  let longer = kept_in_memory(written(first.tree, numbers("1\n2\n3\n4\n")), ["run"], [], None);
+  assert(string_contains(stdout(longer.ran), "30"), Some(said(longer.ran)));
+  // What it reaches, in another module.
+  let cubed = {
+    path: "squares.ply",
+    text: string::replace(squares().text, "Some(n) -> n * n", "Some(n) -> n * n * n"),
+  };
+  let reached = kept_in_memory(written(longer.tree, cubed), ["run"], [], None);
+  assert(string_contains(stdout(reached.ran), "100"), Some(said(reached.ran)));
+  // Its own body.
+  let doubled = {
+    path: "m.ply",
+    text: string::replace(
+      holding().text,
+      "const fn table() -> Array<Int> = parsed(embed(\"numbers.txt\"))",
+      "const fn table() -> Array<Int> = parsed(bytes_concat(embed(\"numbers.txt\"), b\"5\\n\"))",
+    ),
+  };
+  let own = kept_in_memory(written(reached.tree, doubled), ["run"], [], None);
+  assert(string_contains(stdout(own.ran), "225"), Some(said(own.ran)));
+  // Back where it was, the value kept then answers again.
+  let back = in_memory(written(written(own.tree, squares()), holding()), ["run"]);
+  assert(string_contains(stdout(back), "30"), Some(said(back)))
+}
+
+test "a `const fn` that raises is refused at its definition, where it raised beside it" {
+  let ran = in_memory(tree(program("1\ntwo\n")), ["check", "--json"]);
+  assert_eq(ran.code, 2);
+  let v = json_of(ran);
+  assert_eq(codes(v), ["E0157"]);
+  assert(
+    string_contains(str(at(diagnostic(v), "message")), "`m.table` is `const`, and raised"),
+    Some(said(ran)),
+  );
+  assert(string_contains(str(at(diagnostic(v), "message")), "no number in `two`"), Some(said(ran)));
+  let labels = items(at(diagnostic(v), "labels"));
+  assert_eq(map(labels, |l: Json| str(at(l, "file"))), ["m.ply", "squares.ply"]);
+  assert_eq(int(at(at(nth(at(diagnostic(v), "labels"), 0), "start"), "line")), 3);
+  assert_eq(str(at(nth(at(diagnostic(v), "labels"), 1), "message")), "raised here")
+}
+
+test "every command that would run a `const fn` refuses the one a build cannot evaluate" {
+  let files = program("1\ntwo\n");
+  fold(
+    [["run"], ["test"], ["prove"], ["build", ".", "-o", "m.plyx"]],
+    (),
+    |_: Unit, line: List<String>| {
+      let ran = in_memory(tree(files), line);
+      assert_eq(ran.code, 2);
+      assert(string_contains(said(ran), "E0157"), Some(said(ran)))
+    },
+  )
+}
+
+test "a refused `const fn` is refused again by a check that reads its module's stub, and mended by its file" {
+  let first = kept_in_memory(tree(program("1\ntwo\n")), ["check", "--explain"], [], None);
+  assert_eq(first.ran.code, 2);
+  let second = kept_in_memory(first.tree, ["check", "--explain"], [], None);
+  assert_eq(second.ran.code, 2);
+  assert(string_contains(said(second.ran), "E0157"), Some(said(second.ran)));
+  let mended = kept_in_memory(
+    written(second.tree, numbers("1\n2\n")),
+    ["check", "--explain"],
+    [],
+    None,
+  );
+  assert_ok(mended.ran);
+  // A warm check and a warm run answer what the cold ones did.
+  assert_ok(in_memory(mended.tree, ["check", "--explain"]));
+  let ran = in_memory(mended.tree, ["run"]);
+  assert(string_contains(stdout(ran), "5"), Some(said(ran)))
+}
+
+test "a `const fn` that does not end within the build's budget is refused" {
+  let counting =
+    \\const fn slow() -> Int = count(200000000, 0)
+    \\
+    \\fn count(n: Int, counted: Int) -> Int = if n <= 0 { counted } else { count(n - 1, counted + 1) }
+    \\
+    \\fn main() -> Int = slow()
+    \\
+  ;
+  let ran = in_memory(tree([{ path: "m.ply", text: counting }]), ["check", "--json"]);
+  let v = json_of(ran);
+  assert_eq(codes(v), ["E0158"]);
+  assert(
+    string_contains(str(at(diagnostic(v), "message")), "within 100000000 calls"),
+    Some(said(ran)),
+  )
+}
+
+test "a `const fn` is what a build can evaluate and keep, or the check says which it is not" {
+  let refused = |text: String|
+    codes(json_of(in_memory(tree([{ path: "m.ply", text: text }]), ["check", "--json"])));
+  assert_eq(refused("const fn f(n: Int) -> Int = n\n"), ["E0156"]);
+  assert_eq(refused("const fn f<a>() -> List<a> = []\n"), ["E0156"]);
+  assert_eq(refused("const fn f() -> Int / {abort.raise} = 1\n"), ["E0156"]);
+  assert_eq(refused("const fn f() -> Int = f()\n"), ["E0156"]);
+  assert_eq(refused("const fn f() -> (Int) -> Int = |x: Int| x\n"), ["E0156"]);
+  assert_eq(
+    refused("effect ticks { read now() -> Int }\n\nconst fn f() -> Int = ticks.now()\n"),
+    ["E0156"],
+  );
+  // `const` is a name wherever no `fn` follows it.
+  assert_eq(
+    refused(
+      "const fn f() -> Int = 1\n\nfn const(const: Int) -> Int = const + f()\n\nfn main() -> Int = const(2)\n",
+    ),
+    [],
+  )
+}
+
+/// A program that answers the sum of its table a thousandfold, and beside it the calls a read of the
+/// table makes past those of reading nothing: none where the unit holds the value.
+fn measuring() -> Source =
+  {
+    path: "m.ply",
+    text:
+      \\import squares (parsed)
+      \\
+      \\const fn table() -> Array<Int> = parsed(embed("numbers.txt"))
+      \\
+      \\fn main() -> Int / {abort.raise} = {
+      \\  let read = metered(|| table());
+      \\  let nothing = metered(|| 0);
+      \\  let sum = fold(array_to_list(read.value), 0, |acc: Int, n: Int| acc + n);
+      \\  sum * 1000 + read.steps - nothing.steps
+      \\}
+      \\
+  }
+
+test "an artifact holds the value, and a run of it evaluates nothing" {
+  scratch(|| {
+    project([squares(), measuring(), numbers("1\n2\n3\n")]);
+    assert_ok(on_disk(["build", ".", "-o", "m.plyx"]));
+    let ran = on_disk(["run", "m.plyx"]);
+    assert_ok(ran);
+    assert(string_contains(stdout(ran), "14000"), Some(said(ran)))
+  })
+}
+
+/// A package `lib` whose table is a `const fn`, and an `app` that reads it.
+fn depending(table: String) -> List<Source> =
+  [
+    { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+    {
+      path: "app/main.ply",
+      text:
+        \\import lib.table
+        \\
+        \\fn main() -> Int = {
+        \\  let read = metered(|| table::squares());
+        \\  let nothing = metered(|| 0);
+        \\  array_len(read.value) * 1000 + read.steps - nothing.steps
+        \\}
+        \\
+    },
+    { path: "lib/ply.pkg", text: manifest("lib", "") },
+    { path: "lib/table.ply", text: table },
+  ]
+
+test "a dependency's `const fn` is evaluated for the program that reaches it, warm as cold" {
+  let table =
+    \\pub const fn squares() -> Array<Int> = array_of_list(map(range(0, 5), |i: Int| i * i))
+    \\
+    \\pub const fn unread() -> Int = 7
+    \\
+  ;
+  let cold = kept_in_memory(tree(depending(table)), ["run", "app"], [], None);
+  assert_ok(cold.ran);
+  assert(string_contains(stdout(cold.ran), "5000"), Some(said(cold.ran)));
+  let checked = kept_in_memory(cold.tree, ["check", "app", "--explain"], [], None);
+  assert_ok(checked.ran);
+  let warm = kept_in_memory(checked.tree, ["check", "app", "--explain"], [], None);
+  assert_ok(warm.ran);
+  let again = in_memory(warm.tree, ["run", "app"]);
+  assert(string_contains(stdout(again), "5000"), Some(said(again)))
+}
+
+test "a dependency's `const fn` that raises refuses the program that holds it, where it is written" {
+  let table =
+    \\pub const fn squares() -> Array<Int> = array_of_list([1 / none()])
+    \\
+    \\fn none() -> Int = 0
+    \\
+  ;
+  let first = kept_in_memory(tree(depending(table)), ["check", "app", "--json"], [], None);
+  let v = json_of(first.ran);
+  assert_eq(codes(v), ["E0157"]);
+  assert(
+    string_ends_with(str(at(nth(at(diagnostic(v), "labels"), 0), "file")), "lib/table.ply"),
+    Some(said(first.ran)),
+  );
+  // Read through its package's stub by the next check, it is refused the same.
+  assert_eq(codes(json_of(in_memory(first.tree, ["check", "app", "--json"]))), ["E0157"])
+}
+
+test "a mutant of what a `const fn` reaches runs its body, never the value kept of the original" {
+  let source =
+    \\fn bump(n: Int) -> Int = n + 1
+    \\
+    \\const fn table() -> List<Int> = map(range(0, 3), bump)
+    \\
+    \\test "the table holds each number bumped" { assert_eq(table(), [1, 2, 3]) }
+    \\
+  ;
+  let first = kept_in_memory(tree([{ path: "m.ply", text: source }]), ["test"], [], None);
+  assert_ok(first.ran);
+  let mutated = in_memory(first.tree, ["test", "--mutate", "m.bump", "--json"]);
+  let m = at(json_of(mutated), "mutants");
+  assert(int(at(m, "killed")) >= 1, Some(said(mutated)));
+  assert_eq(int(at(m, "survived")), 0)
+}
+
+test "a `const fn` nothing calls is evaluated with the rest, in the program's own modules" {
+  let unused = {
+    path: "m.ply",
+    text: "const fn broken() -> Int = 1 / none()\n\nfn none() -> Int = 0\n\nfn main() -> Int = 7\n",
+  };
+  assert_eq(codes(json_of(in_memory(tree([unused]), ["check", "--json"]))), ["E0157"])
+}
+
+test "a `const fn` is printed as it is written, and documented as one" {
+  let source = "/// The answer.\npub   const   fn answer( ) -> Int = 42\n";
+  let formatted = kept_in_memory(tree([{ path: "m.ply", text: source }]), ["fmt"], [], None);
+  assert_ok(formatted.ran);
+  assert_eq(
+    file_of(formatted.tree, "m.ply"),
+    Some("/// The answer.\npub const fn answer() -> Int = 42\n"),
+  );
+  let doc = stdout(in_memory(formatted.tree, ["doc", "m.answer"]));
+  assert(string_contains(doc, "pub const fn answer() -> Int"), Some(doc))
+}
