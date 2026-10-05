@@ -92,6 +92,11 @@ builtins! { $
     /// The low thirty-two bits of an `Int`, rotated right.
     Rotr32 = "rotr32", 2, ends;
     Rotr = "rotr", 2, ends;
+    Rotl = "rotl", 2, ends;
+    /// Over any integer type: the exact answer, or the type's nearest value where it leaves it.
+    SaturatingAdd = "saturating_add", 2, ends;
+    SaturatingSub = "saturating_sub", 2, ends;
+    SaturatingMul = "saturating_mul", 2, ends;
     // Field-less rather than carrying an `IntTy`: the enum is cast to a per-builtin cache index.
     U8OfInt = "u8_of_int", 1, raises;
     U16OfInt = "u16_of_int", 1, raises;
@@ -232,6 +237,8 @@ builtins! { $
     NumericUnary = "?numeric_unary", 3, ends;
     /// `numeric_of_int(n)`, called with the witness the elaboration passes first.
     NumericOfInt = "numeric_of_int", 2, raises;
+    /// `to_int(x)`, called with the witness the elaboration passes first.
+    ToInt = "to_int", 2, ends;
     FloatOfInt = "float_of_int", 1, ends;
     /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
     IntOfFloat = "int_of_float", 2, ends;
@@ -505,11 +512,17 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             )))
         }
 
-        Builtin::Rotr => {
-            let n = args[1].as_int(span, "`rotr`")?;
+        // A rotation left is one right by the rest of the width.
+        Builtin::Rotr | Builtin::Rotl => {
+            let what = format!("`{}`", b.name());
+            let n = args[1].as_int(span, &what)?;
+            let right = |turn: i64, w: u32| {
+                let k = turn.rem_euclid(i64::from(w)) as u32;
+                if b == Builtin::Rotl { (w - k) % w } else { k }
+            };
             if let Value::Fixed(f) = &args[0] {
                 let w = f.ty.bits();
-                let k = n.rem_euclid(i64::from(w)) as u32;
+                let k = right(n, w);
                 let raw = f.raw();
                 let bits = if k == 0 {
                     raw
@@ -518,10 +531,29 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 };
                 return Ok(Value::Fixed(Fixed::new(f.ty, bits)));
             }
-            let x = args[0].as_int(span, "`rotr`")?;
-            Ok(Value::Int(
-                (x as u64).rotate_right(n.rem_euclid(64) as u32) as i64
-            ))
+            let x = args[0].as_int(span, &what)?;
+            Ok(Value::Int((x as u64).rotate_right(right(n, 64)) as i64))
+        }
+
+        Builtin::SaturatingAdd | Builtin::SaturatingSub | Builtin::SaturatingMul => {
+            let what = format!("`{}`", b.name());
+            if let (Value::Fixed(x), Value::Fixed(y)) = (&args[0], &args[1])
+                && x.ty == y.ty
+            {
+                let op = match b {
+                    Builtin::SaturatingAdd => FixedOp::Add,
+                    Builtin::SaturatingSub => FixedOp::Sub,
+                    _ => FixedOp::Mul,
+                };
+                return Ok(Value::Fixed(x.saturating(*y, op)));
+            }
+            let x = args[0].as_int(span, &what)?;
+            let y = args[1].as_int(span, &what)?;
+            Ok(Value::Int(match b {
+                Builtin::SaturatingAdd => x.saturating_add(y),
+                Builtin::SaturatingSub => x.saturating_sub(y),
+                _ => x.saturating_mul(y),
+            }))
         }
 
         Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul => {
@@ -1004,6 +1036,14 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 }),
             }
         }
+        // A width the words carry is read as its `Int` already.
+        Builtin::ToInt => Ok(option(match &args[1] {
+            Value::Fixed(f) => f
+                .to_i128()
+                .and_then(|v| i64::try_from(v).ok())
+                .map(Value::Int),
+            other => Some(Value::Int(other.as_int(span, "`to_int`")?)),
+        })),
         Builtin::FloatOfInt => Ok(Value::Float(args[0].as_int(span, "`float_of_int`")? as f64)),
         Builtin::IntOfFloat => {
             let x = args[0].as_float(span, "`int_of_float`")?;
