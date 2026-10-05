@@ -454,7 +454,9 @@ An alias may take parameters and name a type that constrains them, as
 `type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
 constraint: each signature that uses it promises what its expansion needs,
 `where derivable(ord, a)` here, and one that does not is `E0206` where it names
-the alias.
+the alias. It may take label and row parameters too (§4.5):
+`type Step<a | e> = () -> Option<a> / e` is the function type it expands to, with
+the row a use gives it in place of `e`.
 
 ### 4.3 Lists, arrays and maps
 
@@ -482,7 +484,9 @@ type Level = Debug | Info | Warn | Error
 
 The leading `|` is optional. Constructors are values: `Circle(3)` is a call,
 `Point` a reference. `type Id = Int` (one name, no payload, no `|`) is an alias.
-Sums are the only nominal types: identical sums in two modules differ.
+Sums are the only nominal types: identical sums in two modules differ. A sum
+takes parameters as an alias does, `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`,
+and a use that fills them with other arguments is another type (§4.5).
 
 ### 4.5 Generics
 
@@ -496,7 +500,7 @@ A bracketed name binds a resource label:
 among the type parameters and before the `|` — `fn serve<a, [l], [k] | e>(..)` —
 and one bracket may hold several, so `<[l, k]>` is `<[l], [k]>`. A call fills
 them left to right, either written, `relay[conn](b)`, or from an argument whose
-row names one (§6.2). A call inside a recursive group — to the definition itself
+row or type names one (§6.2). A call inside a recursive group — to the definition itself
 or to one it is mutually recursive with — keeps the labels the group was called
 with: it writes none, or names this definition's own binders in order, and any
 other label there is `E0306`. The members of such a group are checked with one
@@ -520,6 +524,32 @@ shared — each definition keeps its own — so a call inside a group that would
 need the callee's type parameter at another type is polymorphic recursion, which
 Ply does not infer. That is `E0308` as well: break the cycle so the callee is
 checked on its own before the call, or monomorphise it.
+
+A `type` binds all three kinds where a `fn` does, on an alias and on a sum, and
+a use fills them in the same places:
+
+```ply
+type Step<a | e> = () -> Option<{ value: a, next: Seq<a | e> }> / e
+type Seq<a | e>  = | Seq(Step<a | e>)
+type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e}) | Quiet
+
+fn next<a | e>(s: Seq<a | e>) -> Option<{ value: a, next: Seq<a | e> }> / e =
+  match s { Seq(step) -> step() }
+fn chunks<[l]>(path: String) -> Seq<Bytes | {fs.read_at[l], diverges}> / {diverges} = ..
+fn quiet() -> Sink<Int, [conn] | {}> = Quiet
+```
+
+A row argument is a row as §6.2 writes one, `{fs.read_at[src]}`, `{log.write | e}`,
+a bare `e`, or `{}` for functions that perform nothing; a label argument is a
+resource or a binder in scope. A use fills every parameter the type binds, and one
+that fills another number of types, labels or rows is `E0202`: a type with a
+row parameter has no short form that leaves it out. A declared type is closed: a
+row variable in it is one of its own row parameters (`E0301`), and a label in it is
+one of its own label parameters or the resource of that name, never a binder of
+the definition that uses the type. An alias's arguments are written into its
+expansion, so `Step<Int | {}>` is `() -> Option<..>`. A sum's arguments are part
+of which type it is, so a `Seq<Int | {}>` is not a `Seq<Int | {fs.read_at[src]}>`
+(§6.2). A printed type shows them as written, `m.Sink<Int, [conn] | {}>`.
 
 `where numeric(a)` lets a type parameter take arithmetic and the ordered
 comparisons: `+`, `-`, `*`, `%`, unary `-`, `<` and the rest, and
@@ -573,7 +603,10 @@ region and cannot outlive it; the brand prints as `Cell[users]<Int>`. A
 declaration is outside every region, so a variant's field or an operation's
 parameter or result that mentions any of them, at any depth, is `E0446`. Take it as a type parameter instead,
 `type Held<t> = Held(t)`: the type argument carries the brand where the escape
-checks see it.
+checks see it. A sum hides the rows its fields write, so a field whose function
+names `cell`, or joins a task or works a channel, in its row is `E0446` as well:
+take the row as a row parameter, `type Held<| e> = Held(() -> Int / e)`, and a
+closure that reaches a region is seen leaving it in the row the type is given.
 
 ### 4.7 Function types, and what is written
 
@@ -983,6 +1016,17 @@ handed what its own type does not admit: a parameter typed
 `() -> Unit / {net.send[conn]}` is not one typed `() -> Unit / {net.write[conn]}`,
 in either direction.
 
+The row a sum is given (§4.5) is an argument, not a bound, and is held the same
+way: a `Seq<Int | {net.send[conn]}>` is not a `Seq<Int | {net.write[conn]}>`, nor
+a `Seq<Int | {}>` one that performs. A constructor gives the sum exactly the row
+of the function it is handed, so `Seq(|| None)` is a `Seq<a | {}>`; a function
+that performs less than the sum's row should say is given the wider type first,
+by a `let` annotation, which is one of the places a narrower function is
+admitted. An alias's row argument is written into its expansion, and is held as
+the place it lands in holds any row: `fn both<| e>(f: Thunk<| e>, g: Thunk<| e>)`
+over `type Thunk<| e> = () -> Unit / e` takes two callbacks that perform
+different things, as it does written out.
+
 Resource labels are global — two modules writing `[users]` name one resource —
 and a definition may be generic over one (§4.5). Its binder shadows that global
 namespace inside the body: under `fn relay<[l]>`, the `[l]` of a row, of a
@@ -991,7 +1035,8 @@ nested call `inner[l](..)` is that parameter, while a label no binder holds is
 the global one of that name. A call fills it with a label it writes,
 `relay[conn](b)`, or with the one an argument's row names: a parameter typed
 `() -> Unit / {net.send[l]}` given an argument whose row is `{net.send[conn]}`
-fills `l` with `conn`. A label left unfilled is `E0306`.
+fills `l` with `conn`, and one typed `Sink<[l]>` given a `Sink<[conn]>` does the
+same. A label left unfilled is `E0306`.
 
 The standard library is generic over its labels: `std.net` and `std.http` name
 no resource of their own, so a program may answer its connections under one
@@ -1224,9 +1269,10 @@ it while that cell can hold one (`E0413`, §9).
 * `E0446`: a value branded by the region outlives it (stored in an older
   binding, handed to an operation, or reached by a task whose scheduler is
   older than the region, through the closure it runs or a handler around its
-  spawn), a task is stored in a cell older than its `simulate` region, or a
+  spawn), a task is stored in a cell older than its `simulate` region, a
   declared type's field or an operation's signature mentions a `Cell`, a
-  `Task` or a `Chan` (§4.6).
+  `Task` or a `Chan`, or a variant's field holds a function whose written row
+  reaches one (§4.6).
 * `E0449`: a region handle (a cell, a task, a channel, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
@@ -1499,8 +1545,9 @@ law "a credit and a matching debit leave an account exactly as it was"
   does `cost` (below); `result` is bound in `ensures`. `requires` restricts the domain of its
   `ensures`; it is not checked at call sites and laws do not inherit it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
-  be quantified), an optional `where` guard, an optional `cost` bound (below)
-  and a block body.
+  be quantified, as a sum whose function performs the type's row parameter
+  cannot, whatever row it is given), an optional `where` guard, an optional
+  `cost` bound (below) and a block body.
 * Specs, guards and law bodies must be pure (`E0417`), except that they may
   raise (§6.8) or may not return (§5.10), and a law body may be a `simulate`
   region; a proposition that raises, or runs past its steps, is a gap in the
@@ -1729,7 +1776,10 @@ encode panics. `json`'s bound is 128 levels, as deep as `parse` reads, and
 and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
 `bin`, `show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json`
 and `bin` need their module imported (`import std.json`, `import std.bin`), or
-the `derive` is `E0206`; `show` imports `std.show` itself.
+the `derive` is `E0206`; `show` imports `std.show` itself. A type that binds a
+label (§4.5), or a field whose type is given one, is `E0206` too: only a function's
+row has a use for a label. A row parameter the fields leave unused is carried
+through, `tagged_eq : <a | e>({eq: ..}) -> {eq: (Tagged<a | e>, ..) -> Bool}`.
 
 ## 12. Builtins
 
