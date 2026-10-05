@@ -183,6 +183,8 @@ helpers![
     (rt_dec_shared, 1, false),
     (rt_parallel, 2, false),
     (rt_array_lookup, 2, true),
+    (rt_baked, 2, true),
+    (rt_stored, 1, true),
 ];
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since

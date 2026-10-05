@@ -1,0 +1,67 @@
+//! A `const fn` is evaluated by a build, which keeps its value: a run reads the table and never
+//! parses the file it was made from. The table here is the HTTP status codes the IANA registry
+//! assigns, in code order, so a code is found by halving.
+
+import std.string (int_of_string, split_once)
+
+type Status = { code: Int, reason: String }
+
+fn row(line: String) -> Status / {abort.raise} =
+  match split_once(line, ",") {
+    None -> panic("no description in `" ++ line ++ "`"),
+    Some(cut) -> match int_of_string(cut.head) {
+      Some(code) -> { code: code, reason: cut.tail },
+      None -> panic("no value in `" ++ line ++ "`"),
+    },
+  }
+
+/// The registry's rows below its heading.
+fn parsed(text: Bytes) -> Array<Status> / {abort.raise} =
+  match filter(string_split(string_of_bytes(text), "\n"), |line: String| line != "") {
+    [_, ..rows] -> array_of_list(map(rows, row)),
+    [] -> panic("the registry has a heading"),
+  }
+
+const fn statuses() -> Array<Status> = parsed(embed("status_codes.csv"))
+
+fn computed() -> Array<Status> / {abort.raise} = parsed(embed("status_codes.csv"))
+
+/// A table of 2^62 rows is found in 62 halvings.
+fn reason_in(table: Array<Status>, code: Int) -> Option<String> / {abort.raise} =
+  iterate({ lo: 0, hi: array_len(table) }, 64, |s: { lo: Int, hi: Int }|
+    if s.lo >= s.hi { Stop(None) } else {
+      let mid = s.lo + (s.hi - s.lo) / 2;
+      let at = array_get(table, mid);
+      if at.code == code { Stop(Some(at.reason)) }
+      else if at.code < code { Continue({ lo: mid + 1, hi: s.hi }) }
+      else { Continue({ lo: s.lo, hi: mid }) }
+    })
+
+fn reason(code: Int) -> Option<String> / {abort.raise} = reason_in(statuses(), code)
+
+test "a code is found in the table by halving" {
+  assert_eq(reason(200), Some("OK"));
+  assert_eq(reason(100), Some("Continue"));
+  assert_eq(reason(511), Some("Network Authentication Required"));
+  assert_eq(reason(418), None);
+  assert_eq(reason(99), None);
+  assert_eq(reason(600), None);
+  assert_eq(array_len(statuses()), 60)
+}
+
+test "a run reads the table and enters nothing of its body" {
+  let read = metered(|| statuses());
+  let nothing = metered(|| 0);
+  let made = metered(|| computed());
+  assert_eq(read.steps, nothing.steps);
+  assert_eq(read.allocations, nothing.allocations);
+  assert(made.steps > 100 + read.steps);
+  assert_eq(read.value, made.value)
+}
+
+test "every code the table holds is found in it" {
+  fold(array_to_list(statuses()), (), |_: Unit, s: Status|
+    assert_eq(reason(s.code), Some(s.reason)))
+}
+
+law "the table a build kept is the table its body makes" { statuses() == computed() }
