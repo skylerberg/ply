@@ -100,6 +100,8 @@ pub type FnDef = {
   reuse: Option<Span>,
   /// The span of a `transparent` before `fn`: its body is part of what another package reads of it.
   transparent: Option<Span>,
+  /// The span of a `const` before `fn`: a build evaluates the body and keeps its value.
+  baked: Option<Span>,
   /// `decreases n - i`: the measure its recursion descends, where the checker sees none itself.
   decreases: Option<Expr>,
   body: Expr,
@@ -308,6 +310,7 @@ pub fn no_fn() -> FnDef =
     returns: None,
     reuse: None,
     transparent: None,
+    baked: None,
     decreases: None,
     body: no_expr(),
     doc: None,
@@ -461,6 +464,7 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_derive_start(input, parser)
     || at_reuse_start(input, parser)
     || at_transparent_start(input, parser)
+    || at_const_start(input, parser)
     || at_extern_start(input, parser)
     || at_instance_start(input, parser)
     || at_numeric_start(input, parser)
@@ -506,6 +510,10 @@ pub fn at_transparent_start(input: Input, parser: Parser) -> Bool =
   at_ident_text(input, parser, b"transparent")
     && (token_kind_at(input, parser, 1) == keyword_fn()
     || at_reuse_start(input, advance(input, parser).parser))
+
+/// `const` is contextual: it opens an item only when `fn` follows.
+pub fn at_const_start(input: Input, parser: Parser) -> Bool =
+  at_ident_text(input, parser, b"const") && token_kind_at(input, parser, 1) == keyword_fn()
 
 /// `set` is contextual: only a third identifier opens a set, so `effect set { .. }` is an effect named `set`.
 pub fn at_effect_set_start(input: Input, parser: Parser) -> Bool =
@@ -921,6 +929,7 @@ pub fn fn_def(
   vis: Vis,
   reuse: Option<Span>,
   transparent: Option<Span>,
+  baked: Option<Span> = None,
 ) -> Result<Parsed<FnDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = expect_ident(input, st.parser, b"a function name after `fn`")?;
@@ -960,6 +969,7 @@ pub fn fn_def(
       returns: rt,
       reuse: reuse,
       transparent: transparent,
+      baked: baked,
       decreases: dec,
       body: body,
       doc: None,
@@ -2013,28 +2023,39 @@ pub fn no_pub(
     None -> parser,
   }
 
+fn at_fn_start(input: Input, parser: Parser) -> Bool =
+  at_transparent_start(input, parser) || at_reuse_start(input, parser)
+    || at_const_start(input, parser)
+    || at_token(input, parser, keyword_fn())
+
+/// A `fn` with whichever of `transparent`, `reuse` and `const` is written before it.
+fn written_fn(
+  input: Input,
+  parser: Parser,
+  vis: Vis,
+) -> Result<Parsed<FnDef>, Parser> / {abort.raise} =
+  if at_transparent_start(input, parser) {
+    let t = advance(input, parser);
+    if at_reuse_start(input, t.parser) {
+      let a = advance(input, t.parser);
+      fn_def(input, a.parser, vis, Some(a.node), Some(t.node))
+    } else { fn_def(input, t.parser, vis, None, Some(t.node)) }
+  } else if at_reuse_start(input, parser) {
+    let a = advance(input, parser);
+    fn_def(input, a.parser, vis, Some(a.node), None)
+  } else if at_const_start(input, parser) {
+    let a = advance(input, parser);
+    fn_def(input, a.parser, vis, None, None, Some(a.node))
+  } else { fn_def(input, parser, vis, None, None) }
+
 pub fn item_at(
   input: Input,
   parser: Parser,
   vis: Vis,
   pub_span: Option<Span>,
 ) -> Result<Parsed<Item>, Parser> / {abort.raise} =
-  if at_transparent_start(input, parser) {
-    let t = advance(input, parser);
-    if at_reuse_start(input, t.parser) {
-      let a = advance(input, t.parser);
-      let d = fn_def(input, a.parser, vis, Some(a.node), Some(t.node))?;
-      Ok({ parser: d.parser, node: IFn(d.node) })
-    } else {
-      let d = fn_def(input, t.parser, vis, None, Some(t.node))?;
-      Ok({ parser: d.parser, node: IFn(d.node) })
-    }
-  } else if at_reuse_start(input, parser) {
-    let a = advance(input, parser);
-    let d = fn_def(input, a.parser, vis, Some(a.node), None)?;
-    Ok({ parser: d.parser, node: IFn(d.node) })
-  } else if at_token(input, parser, keyword_fn()) {
-    let d = fn_def(input, parser, vis, None, None)?;
+  if at_fn_start(input, parser) {
+    let d = written_fn(input, parser, vis)?;
     Ok({ parser: d.parser, node: IFn(d.node) })
   } else if at_token(input, parser, keyword_type()) {
     let d = type_def(input, parser, vis)?;
@@ -2451,6 +2472,7 @@ pub fn dump_fn(def: FnDef) -> Bytes / {abort.raise} =
       Some(e) -> bytes_concat(dump_word(b"decreases"), dump_expr(e)),
       None -> b"",
     },
+    match def.baked { Some(s) -> dump_node(s, b"cst"), None -> b"" },
     dump_expr(def.body),
     dump_doc_if(def.doc),
   ])
@@ -2680,6 +2702,17 @@ test "a transparent fn keeps the marker's span, before a reuse or alone, and tra
   assert(string_contains(both, ":fn;%priv;?1;12:17:reu;?1;0:11:trn;?0;21:22:ident;@66;"));
   let named = dump(b"fn transparent(x: Int) -> Int = x\n");
   assert(string_contains(named, ":fn;%priv;?0;?0;?0;3:14:ident;@7472616e73706172656e74;"))
+}
+
+test "a const fn keeps the marker's span, and const stays a name elsewhere" {
+  let marked = dump(b"pub const fn f() -> Int = 1\n");
+  assert(string_contains(marked, ":fn;%pub;?0;?0;?0;13:14:ident;@66;"));
+  assert(string_contains(marked, "4:9:cst;"));
+  let named = dump(b"fn const(x: Int) -> Int = x\n");
+  assert(string_contains(named, ":fn;%priv;?0;?0;?0;3:8:ident;@636f6e7374;"));
+  assert(!string_contains(named, ":cst;"));
+  let field = dump(b"fn f(r: { const: Int }) -> Int = r.const\n");
+  assert(!string_contains(field, ":cst;"))
 }
 
 test "a `returns` clause names `fresh` or a parameter, and naming anything else is refused" {

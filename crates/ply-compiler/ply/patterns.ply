@@ -7,9 +7,10 @@ import parsing (positional, Span, Ident, QName, Input, Parser, Parsed, Eaten, So
                 token_at, expect, expect_close, expect_ident, expect_field_name,
                 keyword_pun_refusal, too_deep, qname, comma_list, parsed_or, failed, token_lparen,
                 token_rparen, token_lbrace, token_rbrace, token_lbracket, token_rbracket,
-                token_comma, token_colon, token_dotdot, token_minus, token_pipe, token_underscore,
-                keyword_true, keyword_false, dump_node, dump_count, dump_presence, dump_payload,
-                dump_word, dump_list, dump_opt, dump_ident, dump_qname, dump_diags, start, is_bare)
+                token_comma, token_colon, token_dotdot, token_dotdoteq, token_minus, token_pipe,
+                token_underscore, keyword_true, keyword_false, dump_node, dump_count, dump_presence,
+                dump_payload, dump_word, dump_list, dump_opt, dump_ident, dump_qname, dump_diags,
+                start, is_bare)
 import lexer (TokenKind, Token, Identifier, IntLiteral, FixedLiteral, WideLiteral, FloatLiteral,
               DecimalLiteral, StringLiteral, BytesLiteral, CharLiteral, Keyword, Punctuation,
               EndOfInput, Width, width_named, width_normalize)
@@ -65,6 +66,8 @@ pub type Pattern =
   | PWild({ span: Span })
   | PVar({ span: Span, name: Ident })
   | PLit({ span: Span, lit: Lit })
+  /// `lo..=hi`: every integer from `lo` through `hi`, both literals of one integer type.
+  | PRange({ span: Span, lo: Lit, hi: Lit })
   | PCtor({ span: Span, name: QName, args: List<Pattern> })
   | PRecord({ span: Span, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> })
   | PList({ span: Span, rest: Option<Pattern>, items: List<Pattern> })
@@ -78,6 +81,7 @@ pub fn pat_span(pattern: Pattern) -> Span =
     PWild(v) -> v.span,
     PVar(v) -> v.span,
     PLit(v) -> v.span,
+    PRange(v) -> v.span,
     PCtor(v) -> v.span,
     PRecord(v) -> v.span,
     PList(v) -> v.span,
@@ -90,6 +94,7 @@ fn set_pat_span(pattern: Pattern, span: Span) -> Pattern =
     PWild(v) -> PWild({ span: span }),
     PVar(v) -> PVar({ span: span, name: v.name }),
     PLit(v) -> PLit({ span: span, lit: v.lit }),
+    PRange(v) -> PRange({ ..v, span: span }),
     PCtor(v) -> PCtor({ span: span, name: v.name, args: v.args }),
     PRecord(v) -> PRecord({ span: span, rest: v.rest, fields: v.fields }),
     PList(v) -> PList({ span: span, rest: v.rest, items: v.items }),
@@ -111,6 +116,7 @@ pub fn has_or(x: Pattern) -> Bool =
     PWild(_) -> false,
     PVar(_) -> false,
     PLit(_) -> false,
+    PRange(_) -> false,
     PBad(_) -> false,
   }
 
@@ -215,7 +221,43 @@ fn is_num_tok(kind: TokenKind) -> Bool =
     _ -> false,
   }
 
+/// A literal, `..=` and another are the range between the two.
 fn pattern_body(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+  let first = pattern_atom(input, parser)?;
+  if !at_token(input, first.parser, token_dotdoteq()) { Ok(first) } else {
+    let dots = advance(input, first.parser);
+    let last = pattern_atom(input, dots.parser)?;
+    let span = span_to(pat_span(first.node), pat_span(last.node));
+    // A bound in parentheses is refused: the range's source is its two literals and the dots.
+    let bound = |p: Pattern|
+      match p {
+        PLit(l) -> if bytes_at(input.source, l.span.start) == 40 { None } else { Some(l.lit) },
+        _ -> None,
+      };
+    match ((bound(first.node), bound(last.node))) {
+      (Some(lo), Some(hi)) ->
+        Ok({ parser: last.parser, node: PRange({ span: span, lo: lo, hi: hi }) }),
+      _ ->
+        Ok({
+          parser: push_diag(
+            last.parser,
+            error_at(
+              range_bounds(),
+              span,
+              b"a range pattern's bounds are integer literals",
+              b"one of these is not a literal",
+              [b"a range is written `lo..=hi`, as in `0..=9` or `b'a'..=b'z'`, and binds nothing"],
+            ),
+          ),
+          node: PWild({ span: span }),
+        }),
+    }
+  }
+}
+
+pub fn range_bounds() -> Bytes = b"E0222"
+
+fn pattern_atom(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
   let st = current_span(input, parser);
   match token_kind(input, parser) {
     IntLiteral(v) -> lit_pat(input, parser, LInt(v)),
@@ -508,6 +550,7 @@ pub fn dump_pattern(pattern: Pattern) -> Bytes / {abort.raise} =
     PWild(v) -> dump_node(v.span, b"pwld"),
     PVar(v) -> bytes_concat(dump_node(v.span, b"pvar"), dump_ident(v.name)),
     PLit(v) -> bytes_concat(dump_node(v.span, b"plit"), dump_lit(v.lit)),
+    PRange(v) -> bytes_concat_all([dump_node(v.span, b"prng"), dump_lit(v.lo), dump_lit(v.hi)]),
     PCtor(v) ->
       bytes_concat_all([
         dump_node(v.span, b"pctr"),
@@ -570,6 +613,23 @@ test "literal patterns" {
   assert_eq(dump_pattern_of(b"false"), "0:5:plit;%bool;@30;#0;");
   assert_eq(dump_pattern_of(b"\"hi\""), "0:4:plit;%str;@6869;#0;");
   assert_eq(dump_pattern_of(b"b\"GET \""), "0:7:plit;%bytes;@47455420;#0;")
+}
+
+test "a range pattern is its two literals, a byte literal the Int it names" {
+  assert_eq(dump_pattern_of(b"0..=9"), "0:5:prng;%int;@30;%int;@39;#0;");
+  assert_eq(dump_pattern_of(b"b'a'..=b'z'"), "0:11:prng;%int;@3937;%int;@313232;#0;");
+  assert_eq(dump_pattern_of(b"-5..=-1"), "0:7:prng;%int;@2d35;%int;@2d31;#0;");
+  assert_eq(dump_pattern_of(b"1u8..=9u8"), "0:9:prng;%fixed;@55383a31;%fixed;@55383a39;#0;");
+  assert_eq(
+    dump_pattern_of(b"b'-' | b'0'..=b'9'"),
+    "0:18:por;#2;0:4:plit;%int;@3435;7:18:prng;%int;@3438;%int;@3537;#0;",
+  )
+}
+
+test "a range pattern whose bound is a name, or stands in parentheses, is one diagnostic" {
+  assert_eq(dump_pattern_of(b"x..=9"), "0:5:pwld;#1;!E0222:0:5:1:1;=0:5:1;");
+  assert_eq(dump_pattern_of(b"(0)..=9"), "0:7:pwld;#1;!E0222:0:7:1:1;=0:7:1;");
+  assert_eq(dump_pattern_of(b"(0..=9)"), "0:7:prng;%int;@30;%int;@39;#0;")
 }
 
 test "a float or decimal pattern carries the source bytes over its own span" {
@@ -643,6 +703,7 @@ fn shape(pattern: Pattern) -> Bytes =
     PWild(_) -> b"_",
     PVar(v) -> v.name.name,
     PLit(_) -> b"#",
+    PRange(_) -> b"#..=#",
     PCtor(v) -> if len(v.args) == 0 { v.name.name.name }
     else { bytes_concat_all([v.name.name.name, b"(", join_shapes(v.args), b")"]) },
     PRecord(v) ->
