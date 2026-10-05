@@ -1,4 +1,4 @@
-// The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
+//! The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
 import parsing (Span, Ident, QName, span_to, dummy_span, span_key, span_bin, is_bare, qname_text,
                 starts_upper)
@@ -6,7 +6,7 @@ import std.bin
 import std.hash (blake3)
 import std.list (at, concat, contains, drop, sort_by, take, prepend)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-                    MWrite, MBad, ty_span, mode_text)
+                    MWrite, MBad, ty_span, mode_text, ident_names)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
               ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
               EffectDef, OpDef, TestDef, Cases, LawDef, Binder, Constraint, Deriver, DJson, DEq,
@@ -36,7 +36,7 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               env_locals, instantiate_with, instantiate, rename_scheme, generalize, region_prefix,
               region_of, label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
               scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
-              print_row)
+              print_row, applied_args, at_arguments, over_arg)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin)
@@ -59,9 +59,16 @@ import std.bytes (ascii_of_int)
 
 // --- What the checker keeps ----------------------------------------------------------
 
-// A prelude item's `at` is `{ module: 0, span: dummy_span() }`.
+/// A prelude item's `at` is `{ module: 0, span: dummy_span() }`.
 pub type Location = { module: Int, span: Span }
-type TypeDecl = { params: List<Bytes>, alias: Option<TypeExpr>, owner: Int, span: Span }
+type TypeDecl = {
+  params: List<Bytes>,
+  labels: List<Bytes>,
+  rows: List<Bytes>,
+  alias: Option<TypeExpr>,
+  owner: Int,
+  span: Span,
+}
 pub type OpInfo = {
   name: Bytes,
   mode: Mode,
@@ -99,16 +106,16 @@ pub type DefInfo = {
   scheme: Scheme,
   footprint: List<Atom>,
   performed: List<Atom>,
-  // The atoms of `footprint` performed a number of times that grows with the input, and the
-  // parameters whose functions are called so.
+  /// The atoms of `footprint` performed a number of times that grows with the input, and the
+  /// parameters whose functions are called so.
   scaling: List<Atom>,
   repeats: List<Int>,
-  // What the written row promises bounded, which is all a caller in another package reads.
+  /// What the written row promises bounded, which is all a caller in another package reads.
   bounded: List<Atom>,
   tail_bounded: Bool,
-  // Whether its calls are known to return (`diverges` where they may not).
+  /// Whether its calls are known to return (`diverges` where they may not).
   ending: Ending,
-  // How it calls the functions it is handed and what it answers, which callers' endings read.
+  /// How it calls the functions it is handed and what it answers, which callers' endings read.
   summary: Summary,
   row_aliases: List<Bytes>,
   constraints: List<DefConstraint>,
@@ -121,9 +128,9 @@ pub type TestInfo = {
   key: Bytes,
   index: Int,
   nondet: Bool,
-  // Over cases: `name` is its label's template, and a run makes a test of each case it lists.
+  /// Over cases: `name` is its label's template, and a run makes a test of each case it lists.
   cases: Bool,
-  // What a run of it must be given: no raise, which fails it, and no `diverges`, which its steps bound.
+  /// What a run of it must be given: no raise, which fails it, and no `diverges`, which its steps bound.
   footprint: List<Atom>,
   at: Location,
 }
@@ -136,17 +143,17 @@ pub type LawInfo = {
   binders: List<LawBinder>,
   has_guard: Bool,
   host: Bool,
-  // A cost law: its body answers the steps it took beside its bound.
+  /// A cost law: its body answers the steps it took beside its bound.
   cost: Bool,
-  // As a test's: a discharge answers a raise as a gap.
+  /// As a test's: a discharge answers a raise as a gap.
   footprint: List<Atom>,
   at: Location,
 }
-// Where an atom entered a body's row: an operation performed here, a named definition's row,
-// arguments alone (a builtin or constructor), or a function value.
+/// Where an atom entered a body's row: an operation performed here, a named definition's row,
+/// arguments alone (a builtin or constructor), or a function value.
 type PerformSource = | DirectPerform | PerformVia(Bytes) | PerformThroughArgs | OpaquePerform
-// `over` is the iteration the site repeats with: a call that runs it once per element of its input,
-// or a recursive call; `None` where it runs a number of times no input decides.
+/// `over` is the iteration the site repeats with: a call that runs it once per element of its input,
+/// or a recursive call; `None` where it runs a number of times no input decides.
 type PerformSite = {
   atom: Atom,
   module: Int,
@@ -156,15 +163,15 @@ type PerformSite = {
 }
 type OpKey = { effect: Bytes, op: Bytes, resource: Resource }
 type Numeric = { span: Span, op: Bytes, ty: Type }
-// A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
+/// A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
 type BitOp = { span: Span, what: Bytes, ty: Type, builtin: Bool }
-// A type parameter a `numeric` or `integer` constraint makes the witness of: a hidden argument each
-// call fills with the type it instantiates the parameter at.
+/// A type parameter a `numeric` or `integer` constraint makes the witness of: a hidden argument each
+/// call fills with the type it instantiates the parameter at.
 type Witnessed = { param: Bytes, integer: Bool }
-// An operator over a witnessed parameter, which the elaboration rewrites to read the witness.
+/// An operator over a witnessed parameter, which the elaboration rewrites to read the witness.
 pub type WitnessOp = { module: Int, span: Span, param: Bytes, owner: Bytes }
-// `params` are the callee's type parameters the witnesses are for, so one constrained twice is
-// passed once.
+/// `params` are the callee's type parameters the witnesses are for, so one constrained twice is
+/// passed once.
 pub type WitnessRef = {
   module: Int,
   span: Span,
@@ -172,17 +179,17 @@ pub type WitnessRef = {
   params: List<Int>,
   owner: Bytes,
 }
-// A definition's witnessed type parameters in its scheme's order, which is the order a call passes
-// their witnesses in.
+/// A definition's witnessed type parameters in its scheme's order, which is the order a call passes
+/// their witnesses in.
 pub type WitnessOrder = { module: Int, name: Bytes, params: List<Bytes> }
-// A reference to a member of the group being walked, whose witnesses are known once the group is;
-// `caller` is the member whose body holds it.
+/// A reference to a member of the group being walked, whose witnesses are known once the group is;
+/// `caller` is the member whose body holds it.
 type GroupRef = { module: Int, span: Span, callee: Bytes, caller: Bytes, called: Bool }
-// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
+/// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
 type ConcatSite = { module: Int, span: Span, ty: Type }
-// A written field of `{..b, f: e}` with the type its value inferred to.
+/// A written field of `{..b, f: e}` with the type its value inferred to.
 type UpdateField = { name: Bytes, span: Span, ty: Type }
-// An update whose base was still a variable where it was written; `result` is what the site answered.
+/// An update whose base was still a variable where it was written; `result` is what the site answered.
 type UpdateSite = {
   module: Int,
   span: Span,
@@ -192,7 +199,7 @@ type UpdateSite = {
   result: Type,
   owner: Bytes,
 }
-// What the lowering needs: the field list of the record an update copies, in the record's own order.
+/// What the lowering needs: the field list of the record an update copies, in the record's own order.
 pub type UpdateShape = { module: Int, span: Span, names: List<Bytes>, owner: Bytes }
 type Signature = {
   ty_params: Map<Bytes, Type>,
@@ -203,13 +210,13 @@ type Signature = {
   ret: Type,
   declared: Option<Row>,
   published_row: Row,
-  // The written row's atoms marked `bounded`, and whether its variable is.
+  /// The written row's atoms marked `bounded`, and whether its variable is.
   bounded: List<Atom>,
   tail_bounded: Bool,
   scope: Int,
 }
-// One use of a label-generic definition: `vars` are the variables its label parameters became,
-// `called` is false while it is still only a value, and `written` records `f[conn](..)`.
+/// One use of a label-generic definition: `vars` are the variables its label parameters became,
+/// `called` is false while it is still only a value, and `written` records `f[conn](..)`.
 type LabelApplication = {
   module: Int,
   span: Span,
@@ -219,16 +226,16 @@ type LabelApplication = {
   called: Bool,
   owner: Bytes,
 }
-// What the emitter needs: the labels a call fills, in declaration order.
+/// What the emitter needs: the labels a call fills, in declaration order.
 pub type LabelSite = { module: Int, span: Span, labels: List<Bytes>, owner: Bytes }
-// The type an operator reads its operands at, which is all its meaning turns on: the name of a
-// type with no arguments, `""` for any other. A wrapping builtin's site is its name.
+/// The type an operator reads its operands at, which is all its meaning turns on: the name of a
+/// type with no arguments, `""` for any other. A wrapping builtin's site is its name.
 pub type OperandSite = { module: Int, span: Span, ty: Bytes, owner: Bytes }
 type OperandAt = { module: Int, span: Span, ty: Type, owner: Bytes }
 type Assumed = { deriver: Deriver, vars: List<Int> }
-// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
+/// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
 type ClauseSite = { span: Span, op: Atom, ty: Type }
-// `around` holds the clauses of every `handle` between the spawn and the region's open.
+/// `around` holds the clauses of every `handle` between the spawn and the region's open.
 type SpawnSite = { span: Span, ty: Type, around: List<ClauseSite> }
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
 type OpenRegion = {
@@ -250,13 +257,13 @@ type RegionSite = {
   spawns: List<SpawnSite>,
   handoffs: List<HandoffSite>,
 }
-// What may not outlive a region: a `with_cell[r]` region's cells, a `simulate` region's tasks.
+/// What may not outlive a region: a `with_cell[r]` region's cells, a `simulate` region's tasks.
 type Brand = | CellsOf(Bytes) | Tasks
 type Opened = { name: Bytes, span: Span }
-// A local bound outside the innermost `simulate` region, named inside it.
+/// A local bound outside the innermost `simulate` region, named inside it.
 type Crossing = { name: Bytes, span: Span }
 type CellAccess = { span: Span, region: Bytes }
-// `cells` hold a cell at the open, `writes` and `reads` reach `older` regions' cells, `entering` brings a task.
+/// `cells` hold a cell at the open, `writes` and `reads` reach `older` regions' cells, `entering` brings a task.
 type Simulation = {
   module: Int,
   span: Span,
@@ -270,11 +277,11 @@ type Simulation = {
   reads: List<CellAccess>,
   entering: List<{ name: Bytes, span: Span, ty: Type }>,
 }
-// A `parallel` block's branches and what each performs, judged once the module is solved.
+/// A `parallel` block's branches and what each performs, judged once the module is solved.
 type ParallelSite = { module: Int, span: Span, branches: List<{ span: Span, row: Row }> }
-// `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
+/// `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
 type RigidParam = { name: Bytes, var: Int }
-// `via` is the alias a use named when the `Map` came from its expansion, else empty.
+/// `via` is the alias a use named when the `Map` came from its expansion, else empty.
 type MapKeySite = {
   module: Int,
   span: Span,
@@ -304,15 +311,15 @@ type SpecEnv = {
   params: List<Type>,
   ret: Type,
 }
-// A member of the recursive group being walked, with the variables its binders took.
+/// A member of the recursive group being walked, with the variables its binders took.
 type GroupDef = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
 type GroupOwner = { owner: Bytes, name: Bytes }
-// The label and row variables one recursive group is checked with, taken by every member in order.
+/// The label and row variables one recursive group is checked with, taken by every member in order.
 type Shared = { labels: List<Int>, rows: List<Int> }
 
-// The rows the driver hands in for a definition, under the check key they were filed with; no key
-// for rows that came with this program's own text, which are taken as they are. The rest of a
-// published interface is the written signature, which is on hand.
+/// The rows the driver hands in for a definition, under the check key they were filed with; no key
+/// for rows that came with this program's own text, which are taken as they are. The rest of a
+/// published interface is the written signature, which is on hand.
 pub type KnownDef = {
   key: Option<Bytes>,
   footprint: List<Atom>,
@@ -321,15 +328,15 @@ pub type KnownDef = {
   repeats: List<Int>,
   ending: Ending,
   summary: Summary,
-  // What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
+  /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
   facts: Bytes,
 }
 pub type KnownTest = { key: Option<Bytes>, footprint: List<Atom>, facts: Bytes }
-// What a check key is made of besides what the checker publishes: each definition's own form and
-// the text it is written as, each test's in the order they are checked, the names each
-// references, and what a name's declaration and written signature say. A body is walked again
-// only when one of these moved, or when what a definition it references published did. The text
-// is in the key because what the emitter reads of a body is filed by where in that text it is.
+/// What a check key is made of besides what the checker publishes: each definition's own form and
+/// the text it is written as, each test's in the order they are checked, the names each
+/// references, and what a name's declaration and written signature say. A body is walked again
+/// only when one of these moved, or when what a definition it references published did. The text
+/// is in the key because what the emitter reads of a body is filed by where in that text it is.
 pub type Keying = {
   own: Map<Bytes, Bytes>,
   test_own: List<Bytes>,
@@ -337,31 +344,32 @@ pub type Keying = {
   test_layout: List<Bytes>,
   reads: Map<Bytes, List<Bytes>>,
   said: Map<Bytes, Bytes>,
-  // The modules read as stubs: a blank body names nothing, so the order its module's definitions
-  // are taken in comes from `reads`.
+  /// The modules read as stubs: a blank body names nothing, so the order its module's definitions
+  /// are taken in comes from `reads`.
   blank: Map<Bytes, Bool>,
 }
-// What the emitter reads of one body published from its rows: `name` is the definition, or a test
-// as `test_owner` names it.
+/// What the emitter reads of one body published from its rows: `name` is the definition, or a test
+/// as `test_owner` names it.
 pub type KeptFacts = { name: Bytes, facts: Bytes }
 
-// The name a test's sites are filed under: its module and its place among the module's tests,
-// since two tests may share a label and a test may share a definition's name.
+/// The name a test's sites are filed under: its module and its place among the module's tests,
+/// since two tests may share a label and a test may share a definition's name.
 pub fn test_owner(module: Bytes, position: Int) -> Bytes =
   bytes_concat_all([module, b".test#", ascii_of_int(position)])
 
-// The root a test over cases lists its cases by, beside the root that runs one.
+/// The root a test over cases lists its cases by, beside the root that runs one.
 pub fn cases_root(owner: Bytes) -> Bytes = bytes_concat(owner, b".cases")
 
-// What that root answers: each case's label and digest, in the table's order.
+/// What the listing root of a test over cases answers: each case's label and digest, in the
+/// table's order.
 pub fn listing_ty() -> Type / {abort.raise} =
   list_type(
     TyRecord(
       fields_sorted([{ name: b"digest", ty: bytes_type() }, { name: b"label", ty: string_type() }]),
     ),
   )
-// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own,
-// whose promises are checked here; a dependency's were checked when its package was.
+/// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own,
+/// whose promises are checked here; a dependency's were checked when its package was.
 pub type Known = {
   defs: Map<Bytes, KnownDef>,
   tests: Map<Bytes, List<Option<KnownTest>>>,
@@ -393,23 +401,22 @@ type Checker = {
   label_params: Map<Bytes, Int>,
   label_apps: List<LabelApplication>,
   label_sites: List<LabelSite>,
-  // The group being walked: recursion there is monomorphic, so a call reuses these.
+  /// The group being walked: recursion there is monomorphic, so a call reuses these.
   group_defs: List<GroupDef>,
   group_rows: List<Int>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
-  // Each parameterless alias as an expansion made it where no label or row parameter was in scope,
-  // and the `Map` keys that expansion noted.
+  /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
   aliases: Map<Bytes, { t: Type, keys: List<MapKeySite> }>,
   refused_atoms: List<Location>,
   performs: List<PerformSite>,
-  // The iteration around the expression being inferred, as `PerformSite.over` reads.
+  /// The iteration around the expression being inferred, as `PerformSite.over` reads.
   over: Option<Span>,
-  // Each row variable a body performs under an iteration.
+  /// Each row variable a body performs under an iteration.
   repeated_vars: List<{ var: Int, over: Span }>,
-  // The first call into the group being walked: a recursive body performs all it does again there.
+  /// The first call into the group being walked: a recursive body performs all it does again there.
   recursed: Option<Span>,
-  // The written row of the definition being checked; empty when it wrote none, or for a test or law.
+  /// The written row of the definition being checked; empty when it wrote none, or for a test or law.
   declared_atoms: List<Atom>,
   comparisons: List<{ module: Int, span: Span, ty: Type }>,
   scope: Int,
@@ -421,13 +428,13 @@ type Checker = {
   witness_refs: List<WitnessRef>,
   witness_orders: List<WitnessOrder>,
   group_refs: List<GroupRef>,
-  // How each definition checked so far calls the functions it is handed, and what it answers.
+  /// How each definition checked so far calls the functions it is handed, and what it answers.
   summaries: Map<Bytes, Summary>,
   concats: List<ConcatSite>,
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
   simulate_depth: Int,
-  // The scopes open around the innermost `simulate` body, and the locals of those it names.
+  /// The scopes open around the innermost `simulate` body, and the locals of those it names.
   sim_scope: Int,
   crossings: List<Crossing>,
   open_regions: List<OpenRegion>,
@@ -441,14 +448,14 @@ type Checker = {
   derived: Option<Derived>,
   known: Known,
   seeded: List<Bytes>,
-  // The tests published from the rows handed in, by key.
+  /// The tests published from the rows handed in, by key.
   seeded_tests: List<Bytes>,
-  // The definition or test whose body is being walked, which every site the walk records is
-  // filed under; empty for a clause or a law, which are walked afresh each time.
+  /// The definition or test whose body is being walked, which every site the walk records is
+  /// filed under; empty for a clause or a law, which are walked afresh each time.
   walking: Bytes,
-  // What the rows handed in say the emitter reads of each body published from them.
+  /// What the rows handed in say the emitter reads of each body published from them.
   kept: List<KeptFacts>,
-  // What each definition published says to a caller beyond its written signature, as a digest.
+  /// What each definition published says to a caller beyond its written signature, as a digest.
   published: Map<Bytes, Bytes>,
   checks: List<{ name: Bytes, hash: Bytes }>,
   test_checks: List<Bytes>,
@@ -469,8 +476,8 @@ type WithHit = { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }>
 type WithResource = { checker: Checker, resource: Option<Resource> }
 type WithBodyRow = { checker: Checker, row: Row }
 
-// A group's bodies as its members are taken in turn: each one's row and counts, and the rows it was
-// published from where its body was not walked.
+/// A group's bodies as its members are taken in turn: each one's row and counts, and the rows it was
+/// published from where its body was not walked.
 type Walked = {
   checker: Checker,
   rows: List<Row>,
@@ -478,8 +485,8 @@ type Walked = {
   filed: List<Option<KnownDef>>,
 }
 
-// What a group member performs a number of times that grows with its input: its atoms, the sites a
-// walk of its body found them at, and the parameters it calls so.
+/// What a group member performs a number of times that grows with its input: its atoms, the sites a
+/// walk of its body found them at, and the parameters it calls so.
 type Count = {
   scaling: List<Atom>,
   sites: List<PerformSite>,
@@ -488,8 +495,8 @@ type Count = {
   recursed: Option<Span>,
 }
 
-// A body's row, and of its atoms and its parameters, what it performs or calls a number of times that
-// grows with its input, each with the site and the iteration that make it so.
+/// A body's row, and of its atoms and its parameters, what it performs or calls a number of times that
+/// grows with its input, each with the site and the iteration that make it so.
 type Counted = {
   checker: Checker,
   row: Row,
@@ -611,8 +618,8 @@ fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
 fn is_abort(effect_info: EffectInfo) -> Bool =
   effect_info.name == b"abort" && effect_info.module == b""
 
-// A raise does not come back, so a clause for it answers for the whole `handle`, as one that binds
-// `resume` does.
+/// A raise does not come back, so a clause for it answers for the whole `handle`, as one that binds
+/// `resume` does.
 fn answers_abort(clause: HandleClause) -> Bool =
   is_bare(clause.eff) && clause.eff.name.name == b"abort"
 
@@ -659,14 +666,14 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Duration", arity: 0 },
   ]
 
-// Pure and nullary, so the runtime builds it once and each type conversion only looks a name up.
+/// Pure and nullary, so the runtime builds it once and each type conversion only looks a name up.
 fn builtin_type_arity_map() -> Map<Bytes, Int> =
   fold(builtin_type_arities(), map_new(), |acc: Map<Bytes, Int>, x: { name: Bytes, arity: Int }|
     if map_contains(acc, x.name) { acc } else { map_insert(acc, x.name, x.arity) })
 
 fn builtin_type_arity(name: Bytes) -> Option<Int> = map_get(builtin_type_arity_map(), name)
 
-// A field names one of `params`, or else a builtin type.
+/// A field names one of `params`, or else a builtin type.
 type AlgebraicType = {
   name: Bytes,
   params: List<Bytes>,
@@ -894,18 +901,18 @@ fn simulated_atoms() -> List<Atom> / {abort.raise} =
 
 // --- The prelude's functions -------------------------------------------------------------------
 
-// A function the prelude declares: its scheme, the names its declaration gives its parameters, the
-// comment above it, and what a call must show of the types it fixes.
+/// A function the prelude declares: its scheme, the names its declaration gives its parameters, the
+/// lines of its doc, and what a call must show of the types it fixes.
 pub type Builtin = {
   name: Bytes,
   scheme: Scheme,
   params: List<Bytes>,
-  note: Bytes,
+  doc: List<Bytes>,
   constraints: List<DefConstraint>,
 }
 
-// What a declaration's types are read against: the variables its generic list binds, and the types
-// the prelude imports, each under the name its module declares it by.
+/// What a declaration's types are read against: the variables its generic list binds, and the types
+/// the prelude imports, each under the name its module declares it by.
 type Declaring = {
   fresh: Fresh,
   tys: Map<Bytes, Type>,
@@ -925,8 +932,8 @@ fn declared_types(
     { d: o.d, tys: push(acc.tys, o.ty) }
   })
 
-// A type as a declaration writes it. Only the language's own types and the prelude's imports are
-// in reach of one, and a cell's region is the call's to fix, so a declaration is generic over it.
+/// A type as a declaration writes it. Only the language's own types and the prelude's imports are
+/// in reach of one, and a cell's region is the call's to fix, so a declaration is generic over it.
 fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {abort.raise} =
   match ty {
     TVar(id) -> match map_get(d.tys, id.name) {
@@ -974,7 +981,7 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
     },
   }
 
-// A declaration's row: `abort.raise`, a row variable, both or neither.
+/// A declaration's row: `abort.raise`, a row variable, both or neither.
 fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
@@ -995,7 +1002,7 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
       },
   }
 
-// Each type the prelude imports by name, under the name its module declares it by.
+/// Each type the prelude imports by name, under the name its module declares it by.
 fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
   fold(imports, map_new(), |acc: Map<Bytes, Bytes>, decl: ImportDecl|
     match decl.kind {
@@ -1008,28 +1015,7 @@ fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
       _ -> acc,
     })
 
-// Where the line holding byte `at` starts.
-fn line_start(text: Bytes, at: Int) -> Int / {abort.raise} =
-  if at <= 0 { 0 } else if bytes_at(text, at - 1) == 10 { at } else { line_start(text, at - 1) }
-
-// The `//` lines directly above the line at `at`, joined: the note a declaration carries. Each round
-// starts a line further up, so `at` bounds the rounds.
-fn note_above(text: Bytes, at: Int, below: Bytes) -> Bytes / {abort.raise} =
-  iterate({ at: at, below: below }, at + 1, |s: { at: Int, below: Bytes }|
-    if s.at <= 0 { Stop(s.below) } else {
-      let start = line_start(text, s.at - 1);
-      let line = bytes_slice(text, start, s.at - 1);
-      if !bytes_starts_with(line, b"// ") { Stop(s.below) } else {
-        let words = bytes_slice(line, 3, bytes_len(line));
-        Continue({
-          at: start,
-          below: if bytes_len(s.below) == 0 { words }
-          else { bytes_concat_all([words, b" ", s.below]) },
-        })
-      }
-    })
-
-fn declared(imported: Map<Bytes, Bytes>, text: Bytes, def: ExternDef) -> Builtin / {abort.raise} = {
+fn declared(imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.raise} = {
   let tys = fold(
     def.generics.types,
     { fresh: fresh_new(), tys: map_new() },
@@ -1070,20 +1056,19 @@ fn declared(imported: Map<Bytes, Bytes>, text: Bytes, def: ExternDef) -> Builtin
       ty: fn_type(params.tys, ret.ty, declared_row(ret.d, def.effects)),
     },
     params: map(def.params, |p: Param| p.name.name),
-    note: note_above(text, def.span.start, b""),
+    doc: match def.doc { Some(d) -> d.lines, None -> [] },
     constraints: dedup_constraints(found),
   }
 }
 
-// Every function the prelude declares, in its order. Pure and nullary, so the runtime reads the
-// prelude once.
+/// Every function the prelude declares, in its order. Pure and nullary, so the runtime reads the
+/// prelude once.
 pub fn builtins() -> List<Builtin> / {abort.raise} = {
-  let text = prelude_source::text();
-  let parsed = parse(text);
+  let parsed = parse(prelude_source::text());
   if len(parsed.parser.diags) > 0 { panic("the prelude does not parse") } else {
     let imported = prelude_imports(parsed.node.imports);
     fold(parsed.node.items, [], |acc: List<Builtin>, item: Item|
-      match item { IExtern(def) -> push(acc, declared(imported, text, def)), _ -> acc })
+      match item { IExtern(def) -> push(acc, declared(imported, def)), _ -> acc })
   }
 }
 
@@ -1091,7 +1076,7 @@ pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
   fold(builtins(), None, |acc: Option<Builtin>, b: Builtin|
     match acc { Some(_) -> acc, None -> if b.name == name { Some(b) } else { None } })
 
-// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
+/// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
 fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
   let checker = install_prelude_adts(bare);
   let bound: Checker = fold(builtins(), checker, |c: Checker, b: Builtin|
@@ -1108,10 +1093,10 @@ fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
   fold(prelude_effects(), bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
 }
 
-// The name the shipped modules hold the prelude under, which no project's module can take.
+/// The name the shipped modules hold the prelude under, which no project's module can take.
 fn prelude_module() -> Bytes = b"compiler.prelude"
 
-// Only the prelude declares what the runtime implements.
+/// Only the prelude declares what the runtime implements.
 fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
   fold(
     if parsed.name == prelude_module() { [] } else { parsed.module.items },
@@ -1142,7 +1127,7 @@ fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
 
 type ValueKey = { name: Bytes, prelude: Bool }
 
-// A bare name through this module's scope, a qualified one through the resolver.
+/// A bare name through this module's scope, a qualified one through the resolver.
 fn global(
   checker: Checker,
   namespace: Namespace,
@@ -1171,7 +1156,7 @@ fn global(
     }
   }
 
-// A name a generated body cannot see is the field type's missing `derive`, not the user's bug.
+/// A name a generated body cannot see is the field type's missing `derive`, not the user's bug.
 fn unresolved_in_derived(checker: Checker, qname: QName, what: Bytes) -> Checker / {abort.raise} = {
   let d = match checker.derived {
     Some(d) -> d,
@@ -1446,7 +1431,7 @@ fn ctor_name(
 fn covered_ctor(checker: Checker, qname: QName) -> Option<Bytes> / {abort.raise} =
   match declared_value(checker, qname) { Some(n) -> Some(n), None -> prelude_ctor(checker, qname) }
 
-// Another module that declares `name` publicly in `namespace`.
+/// Another module that declares `name` publicly in `namespace`.
 fn exporter(checker: Checker, namespace: Namespace, name: Bytes) -> Option<Int> / {abort.raise} =
   fold(range(0, len(checker.resolved.declarations)), None, |acc: Option<Int>, i: Int|
     match acc {
@@ -1577,8 +1562,8 @@ fn type_param(checker: Checker, ident: Ident) -> { checker: Checker, ty: Type } 
 fn conv_type(checker: Checker, ty: TypeExpr) -> { checker: Checker, ty: Type } / {abort.raise} =
   conv_within(checker, ty, alias_room(checker))
 
-// How many more aliases a conversion may expand inside one another: an alias already being
-// expanded is refused, so each is a declared alias not yet on the stack.
+/// How many more aliases a conversion may expand inside one another: an alias already being
+/// expanded is refused, so each is a declared alias not yet on the stack.
 fn alias_room(checker: Checker) -> Int = map_len(checker.types) - len(checker.alias_stack)
 
 fn conv_within(
@@ -1610,8 +1595,70 @@ fn conv_within(
       };
       { checker: eff.checker, ty: fn_type(ps.tys, r.ty, eff.row) }
     },
-    TCon(c) -> conv_con(checker, c.name, c.args, c.span, room),
+    TCon(c) -> conv_con(checker, c.name, c.args, c.labels, c.rows, c.span, room),
   }
+
+/// The label and row arguments a use of a declared type writes.
+type Over = { labels: List<Type>, rows: List<Row> }
+
+fn conv_over(
+  checker: Checker,
+  labels: List<Ident>,
+  rows: List<RowExpr>,
+) -> { checker: Checker, over: Over } / {abort.raise} = {
+  let converted = fold(
+    rows,
+    { checker: checker, rows: [] },
+    |acc: { checker: Checker, rows: List<Row> }, row: RowExpr| {
+      let o = conv_row(acc.checker, row);
+      { checker: o.checker, rows: push(acc.rows, o.row) }
+    },
+  );
+  {
+    checker: converted.checker,
+    over: {
+      // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
+      labels: map(labels, |label: Ident|
+        match map_get(checker.label_params, label.name) {
+          Some(v) -> TyVar(v),
+          None -> label_type(label.name),
+        }),
+      rows: converted.rows,
+    },
+  }
+}
+
+/// A declaration's own label and row binders, each a fresh variable, in place of whatever was in
+/// scope: a declared type is closed, so nothing in it names a parameter of the signature using it.
+fn bind_own(
+  checker: Checker,
+  decl: TypeDecl,
+) -> { checker: Checker, labels: List<Int>, rows: List<Int> } = {
+  let closed: Checker = { ..checker, label_params: map_new(), row_params: map_new() };
+  let labels = fold(
+    decl.labels,
+    { checker: closed, vars: [] },
+    |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
+      let o: WithVar = new_ty_var(acc.checker);
+      {
+        checker: { ..o.checker, label_params: map_insert(o.checker.label_params, name, o.var) },
+        vars: push(acc.vars, o.var),
+      }
+    },
+  );
+  let rows = fold(
+    decl.rows,
+    { checker: labels.checker, vars: [] },
+    |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
+      let o: WithVar = new_row_var(acc.checker);
+      {
+        checker: { ..o.checker, row_params: map_insert(o.checker.row_params, name, o.var) },
+        vars: push(acc.vars, o.var),
+      }
+    },
+  );
+  { checker: rows.checker, labels: labels.vars, rows: rows.vars }
+}
 
 fn conv_types(
   checker: Checker,
@@ -1633,7 +1680,7 @@ fn conv_all_within(
     },
   )
 
-// `what` loses its `s` when one was expected.
+/// `what` loses its `s` when one was expected.
 fn arity_error(
   checker: Checker,
   span: Span,
@@ -1641,6 +1688,7 @@ fn arity_error(
   expected: Int,
   found: Int,
   what: Bytes,
+  notes: List<Bytes>,
 ) -> Checker / {abort.raise} = {
   let w = if expected == 1 { bytes_slice(what, 0, bytes_len(what) - 1) } else { what };
   report_error_at(
@@ -1658,28 +1706,56 @@ fn arity_error(
       supplied(found),
     ]),
     bytes_concat_all([b"expected ", ascii_of_int(expected), b", found ", ascii_of_int(found)]),
-    [],
+    notes,
   )
 }
+
+/// A use whose label or row arguments are not as many as the declaration binds, told of the first.
+fn over_refused(
+  checker: Checker,
+  span: Span,
+  name: Bytes,
+  labels: Int,
+  rows: Int,
+  over: Over,
+) -> Checker / {abort.raise} =
+  if len(over.labels) != labels {
+    arity_error(checker, span, name, labels, len(over.labels), b"label arguments", [
+      b"a label argument is bracketed among the type arguments, where a binder writes `[l]`: `T<a, [conn]>`",
+    ])
+  } else {
+    arity_error(checker, span, name, rows, len(over.rows), b"row arguments", [
+      b"a row argument follows `|`, where a binder writes its row parameter: `T<a | {}>` holds functions that perform nothing",
+    ])
+  }
 
 fn conv_con(
   checker: Checker,
   name: QName,
   args: List<TypeExpr>,
+  labels: List<Ident>,
+  rows: List<RowExpr>,
   span: Span,
   room: Int,
 ) -> { checker: Checker, ty: Type } / {abort.raise} =
-  if is_bare(name) && len(args) == 0 && map_contains(checker.ty_params, name.name.name) {
+  if is_bare(name) && len(args) == 0 && len(labels) == 0 && len(rows) == 0
+      && map_contains(checker.ty_params, name.name.name) {
     {
       checker: checker,
       ty: match map_get(checker.ty_params, name.name.name) { Some(t) -> t, None -> unit_type() },
     }
   } else {
     let converted: WithTys = conv_all_within(checker, args, room);
-    let c: Checker = converted.checker;
+    let written = conv_over(converted.checker, labels, rows);
+    let c: Checker = written.checker;
+    let over: Over = written.over;
     match if is_bare(name) { builtin_type_arity(name.name.name) } else { None } {
       Some(arity) -> if len(converted.tys) != arity {
-        new_ty(arity_error(c, span, name.name.name, arity, len(converted.tys), b"type arguments"))
+        new_ty(
+          arity_error(c, span, name.name.name, arity, len(converted.tys), b"type arguments", []),
+        )
+      } else if len(labels) > 0 || len(rows) > 0 {
+        new_ty(over_refused(c, span, name.name.name, 0, 0, over))
       } else if name.name.name == b"Cell" {
         let region: WithTy = new_ty(c);
         {
@@ -1706,11 +1782,30 @@ fn conv_con(
                   len(decl.params),
                   len(converted.tys),
                   b"type arguments",
+                  [],
+                ),
+              )
+            } else if len(over.labels) != len(decl.labels) || len(over.rows) != len(decl.rows) {
+              new_ty(
+                over_refused(
+                  g.checker,
+                  span,
+                  name.name.name,
+                  len(decl.labels),
+                  len(decl.rows),
+                  over,
                 ),
               )
             } else {
               match decl.alias {
-                None -> { checker: g.checker, ty: TyCon({ name: qualified, args: converted.tys }) },
+                None ->
+                  {
+                    checker: g.checker,
+                    ty: TyCon({
+                      name: qualified,
+                      args: applied_args(converted.tys, over.labels, over.rows),
+                    }),
+                  },
                 Some(alias) -> if contains(g.checker.alias_stack, qualified) {
                   new_ty(
                     report_error_at(
@@ -1730,9 +1825,7 @@ fn conv_con(
                     if outermost {
                       relocated_keys(sites, before, g.checker.module, span, name.name.name)
                     } else { sites };
-                  // An atom's label and a row's tail name the using definition's parameters.
-                  let memo = len(decl.params) == 0 && map_len(g.checker.label_params) == 0
-                    && map_len(g.checker.row_params) == 0;
+                  let memo = len(decl.params) == 0 && len(decl.labels) == 0 && len(decl.rows) == 0;
                   match if memo { map_get(g.checker.aliases, qualified) } else { None } {
                     Some(m) -> {
                       let assumed = assumed_for(g.checker, DOrd);
@@ -1754,13 +1847,27 @@ fn conv_con(
                         |m: Map<Bytes, Type>, i: Int|
                           map_insert(m, at(decl.params, i), at(converted.tys, i)),
                       );
-                      let inner: Checker = {
-                        ..g.checker,
-                        ty_params: bound,
-                        alias_stack: push(g.checker.alias_stack, qualified),
-                        module: decl.owner,
+                      let own = bind_own(
+                        {
+                          ..g.checker,
+                          ty_params: bound,
+                          alias_stack: push(g.checker.alias_stack, qualified),
+                          module: decl.owner,
+                        },
+                        decl,
+                      );
+                      let body: WithTy = conv_within(own.checker, alias, room - 1);
+                      let o: WithTy = if len(own.labels) == 0 && len(own.rows) == 0 { body } else {
+                        {
+                          checker: body.checker,
+                          ty: at_arguments(
+                            body.ty,
+                            own.labels,
+                            own.rows,
+                            applied_args([], over.labels, over.rows),
+                          ),
+                        }
                       };
-                      let o: WithTy = conv_within(inner, alias, room - 1);
                       // Kept only when the expansion touched nothing but the keys it noted: a
                       // fresh variable, a diagnostic or a refused atom belongs to the one use.
                       let kept = memo && o.checker.fresh == g.checker.fresh
@@ -1770,6 +1877,8 @@ fn conv_con(
                         checker: {
                           ..o.checker,
                           ty_params: saved,
+                          row_params: g.checker.row_params,
+                          label_params: g.checker.label_params,
                           alias_stack: take(o.checker.alias_stack, len(o.checker.alias_stack) - 1),
                           module: g.checker.module,
                           map_keys: placed(o.checker.map_keys),
@@ -1841,11 +1950,9 @@ fn row_param(checker: Checker, ident: Ident) -> { checker: Checker, v: Option<In
           b"not declared",
           [
             bytes_concat_all([
-              b"declare it in the generic list, e.g. `fn f<| ",
+              b"declare it after `|` in the generic list of the `fn` or `type` that writes this row: `<| ",
               ident.name,
-              b">(..) / {| ",
-              ident.name,
-              b"}`",
+              b">`",
             ]),
           ],
         ),
@@ -1858,7 +1965,7 @@ fn conv_row(checker: Checker, row: RowExpr) -> { checker: Checker, row: Row } / 
   { checker: refuse_marks(o.checker, row), row: o.r }
 }
 
-// A row with the atoms it marks `bounded`.
+/// A row with the atoms it marks `bounded`.
 fn conv_marked(
   checker: Checker,
   row: RowExpr,
@@ -1886,7 +1993,7 @@ fn conv_marked(
   { checker: tail.checker, r: { atoms: atoms.atoms, tail: tail.v }, bounded: atoms.bounded }
 }
 
-// `bounded` is a promise a definition makes of its own row; a function type's row makes none.
+/// `bounded` is a promise a definition makes of its own row; a function type's row makes none.
 fn refuse_marks(checker: Checker, row: RowExpr) -> Checker = {
   let marked = fold(row.atoms, checker, |c: Checker, atom: AtomExpr|
     if atom.bounded { refuse_mark(c, atom.span) } else { c });
@@ -1912,8 +2019,8 @@ fn refused(checker: Checker, s: Span) -> Bool =
 fn refusing(checker: Checker, s: Span) -> Checker =
   { ..checker, refused_atoms: push(checker.refused_atoms, { module: checker.module, span: s }) }
 
-// `[*]` on an operation declared without a label names nothing: the atom is refused where it is
-// written, and dropped so the row does not carry a label the operation has no room for.
+/// `[*]` on an operation declared without a label names nothing: the atom is refused where it is
+/// written, and dropped so the row does not carry a label the operation has no room for.
 fn refuse_every(
   checker: Checker,
   span: Span,
@@ -2149,7 +2256,9 @@ fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker 
         {
           ..checker,
           types: map_insert(checker.types, name, {
-            params: map(def.params, |ident: Ident| ident.name),
+            params: ident_names(def.generics.types),
+            labels: ident_names(def.generics.labels),
+            rows: ident_names(def.generics.effects),
             alias: alias,
             owner: checker.module,
             span: def.span,
@@ -2164,7 +2273,7 @@ fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker =
   fold(parsed.module.items, checker, |c: Checker, item: Item|
     match item { IType(d) -> record_type(c, parsed, d), _ -> c })
 
-// The first `Cell`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
+/// The first `Cell`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
 fn region_brand(ty: Type) -> Option<Bytes> =
   match ty {
     TyCon(c) -> if c.name == b"Cell" || scheduler_handle(c.name) { Some(c.name) }
@@ -2206,6 +2315,51 @@ fn reject_declared_brand(
             brand,
             b"` as a type parameter instead, so it stays in the type argument, where the escape check can see it",
           ]),
+        ],
+      ),
+  }
+
+/// What the row of a function in `ty` reaches of a region: a cell, or a task or a channel.
+fn region_reach(ty: Type) -> Option<Bytes> =
+  match ty {
+    TyVar(_) -> None,
+    TyCon(c) -> first_reason(c.args, region_reach),
+    TyRecord(fs) -> first_reason(fs, |f: Field| region_reach(f.ty)),
+    TyFn(f) -> if fold(f.effects.atoms, false, |b: Bool, atom: Atom| b || atom.effect == cell()) {
+      Some(b"`Cell`")
+    } else if row_brands(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
+      match first_reason(f.params, region_reach) { Some(b) -> Some(b), None -> region_reach(f.ret) }
+    },
+  }
+
+/// A sum type hides the rows of the functions it holds, so one that reaches a region would leave it
+/// unseen: only a row the type takes as an argument is where the escape checks look.
+fn reject_declared_reach(
+  checker: Checker,
+  ty: Type,
+  span: Span,
+  owner: Bytes,
+  field: Int,
+) -> Checker / {abort.raise} =
+  match region_reach(ty) {
+    None -> checker,
+    Some(reached) ->
+      report_error_at(
+        checker,
+        b"E0446",
+        span,
+        bytes_concat_all([
+          b"`",
+          owner,
+          b"`'s field ",
+          ascii_of_int(field),
+          b" holds a function whose row reaches a ",
+          reached,
+        ]),
+        b"a declaration is outside every region there is",
+        [
+          b"a declared type hides the rows of the functions it holds, so no later check could tell that this one had outlived the region it reaches",
+          b"take the row as a row parameter instead, `type T<| e> = ..`, so it stays in the type argument, where the escape check can see it",
         ],
       ),
   }
@@ -2335,8 +2489,16 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
                   }
                 },
               );
-              let c1: Checker = { ..vars.checker, ty_params: vars.params };
-              let result = TyCon({ name: type_name, args: map(vars.vars, |v: Int| TyVar(v)) });
+              let own = bind_own({ ..vars.checker, ty_params: vars.params }, decl);
+              let c1: Checker = own.checker;
+              let result = TyCon({
+                name: type_name,
+                args: applied_args(
+                  map(vars.vars, |v: Int| TyVar(v)),
+                  map(own.labels, |v: Int| TyVar(v)),
+                  map(own.rows, row_open),
+                ),
+              });
               let walked: Checker = fold(range(0, len(variants)), c1, |cc: Checker, index: Int| {
                 let variant = at(variants, index);
                 let ctor = qualify(parsed.name, variant.name.name);
@@ -2348,17 +2510,28 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
                       range(0, len(fs.tys)),
                       fs.checker,
                       |c3: Checker, i: Int|
-                        reject_declared_brand(
-                          c3,
+                        reject_declared_reach(
+                          reject_declared_brand(
+                            c3,
+                            at(fs.tys, i),
+                            ty_span(at(variant.fields, i)),
+                            variant.name.name,
+                            bytes_concat(b"field ", ascii_of_int(i + 1)),
+                          ),
                           at(fs.tys, i),
                           ty_span(at(variant.fields, i)),
                           variant.name.name,
-                          bytes_concat(b"field ", ascii_of_int(i + 1)),
+                          i + 1,
                         ),
                     );
                     let ty = if len(fs.tys) == 0 { result }
                     else { fn_type(fs.tys, result, row_empty()) };
-                    let sc = { ty_vars: vars.vars, row_vars: [], label_vars: [], ty: ty };
+                    let sc = {
+                      ty_vars: vars.vars,
+                      row_vars: own.rows,
+                      label_vars: own.labels,
+                      ty: ty,
+                    };
                     add_ctor({ ..checked, env: env_bind_global(checked.env, ctor, sc) }, {
                       name: ctor,
                       module: parsed.name,
@@ -2373,7 +2546,7 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
                   },
                 }
               });
-              { ..walked, ty_params: map_new() }
+              { ..walked, ty_params: map_new(), row_params: map_new(), label_params: map_new() }
             },
           }
         },
@@ -2381,7 +2554,7 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
       _ -> c,
     })
 
-// A function and a constructor of one name in one module.
+/// A function and a constructor of one name in one module.
 fn check_value_namespace(checker: Checker, parsed: ParsedModule) -> Checker = {
   let walked = fold(
     parsed.module.items,
@@ -2488,7 +2661,7 @@ fn check_where(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
       )
     })
 
-// A signature's type parameters: only these names are type variables in it, each rigid.
+/// A signature's type parameters: only these names are type variables in it, each rigid.
 fn bind_ty_params(checker: Checker, names: List<Ident>) -> Checker =
   fold(names, checker, |c: Checker, ident: Ident| {
     let o: WithVar = new_ty_var(c);
@@ -2499,8 +2672,8 @@ fn bind_ty_params(checker: Checker, names: List<Ident>) -> Checker =
     }
   })
 
-// `shared` holds the label and row variables the recursive group is checked with: a member's
-// binders take them in order, so a call inside the group passes the caller's along.
+/// `shared` holds the label and row variables the recursive group is checked with: a member's
+/// binders take them in order, so a call inside the group passes the caller's along.
 fn signature_sharing(
   outer: Checker,
   def: FnDef,
@@ -2659,7 +2832,7 @@ fn callee_source(checker: Checker, func: Expr) -> PerformSource / {abort.raise} 
     _ -> OpaquePerform,
   }
 
-// Drops the sites recorded from `mark` to `until` whose atom `handled` covers.
+/// Drops the sites recorded from `mark` to `until` whose atom `handled` covers.
 fn discharge(
   checker: Checker,
   mark: Int,
@@ -2674,14 +2847,14 @@ fn discharge(
   }
 }
 
-// The clause's resource covers the performed one: `[*]` is a clause for every label.
+/// The clause's resource covers the performed one: `[*]` is a clause for every label.
 fn key_named(keys: List<OpKey>, atom: Atom) -> Bool =
   fold(keys, false, |acc: Bool, k: OpKey|
     acc
       || (k.effect == atom.effect && resource_covers(k.resource, atom.resource)
       && Some(k.op) == atom.op))
 
-// The operation atoms a mode atom stands for: the effect's operations of that mode, under the atom's resource.
+/// The operation atoms a mode atom stands for: the effect's operations of that mode, under the atom's resource.
 fn mode_ops(checker: Checker, atom: Atom) -> List<Atom> / {abort.raise} = {
   let named = match atom.resource {
     RNamed(_) -> true,
@@ -2704,8 +2877,8 @@ fn mode_ops(checker: Checker, atom: Atom) -> List<Atom> / {abort.raise} = {
   }
 }
 
-// A clause discharges the operation it names; a mode atom is discharged by a clause for each of its operations.
-// `handled` holds the clauses' mode atoms, and a clause written `[*]` covers every label.
+/// A clause discharges the operation it names; a mode atom is discharged by a clause for each of its operations.
+/// `handled` holds the clauses' mode atoms, and a clause written `[*]` covers every label.
 fn clause_discharges(
   checker: Checker,
   handled: List<Atom>,
@@ -2754,7 +2927,7 @@ fn join(
     None -> { checker: checker, row: row_union(a, b) },
   }
 
-// The message and both sides of the primary label are what dedup compares, so both go into `text`.
+/// The message and both sides of the primary label are what dedup compares, so both go into `text`.
 fn report_unify(
   checker: Checker,
   error: UnifyError,
@@ -2879,14 +3052,14 @@ fn expect(
   }
 }
 
-// A bit operand's type is often still a variable here, so the obligation waits for `settle_bit_ops`.
+/// A bit operand's type is often still a variable here, so the obligation waits for `settle_bit_ops`.
 fn note_bits(checker: Checker, span: Span, found: Type, what: Bytes) -> Checker =
   {
     ..checker,
     bit_ops: push(checker.bit_ops, { span: span, what: what, ty: found, builtin: false }),
   }
 
-// Resolved once the whole program is checked, so a variable here is read as what it settled to.
+/// Resolved once the whole program is checked, so a variable here is read as what it settled to.
 fn note_operand(checker: Checker, span: Span, ty: Type) -> Checker =
   {
     ..checker,
@@ -2949,7 +3122,7 @@ fn bits_mismatch(checker: Checker, entry: BitOp, ty: Type) -> Checker / {abort.r
 
 fn bool_bits_note() -> Bytes = b"`Bool` has `&&`, `||` and `!`; the bit operators are integers only"
 
-// Both sides of a `++` are one type by then; which of the two joinable ones it is waits for `settle_concats`.
+/// Both sides of a `++` are one type by then; which of the two joinable ones it is waits for `settle_concats`.
 fn settle_concats(checker: Checker) -> Checker / {abort.raise} = {
   let entries = checker.concats;
   fold(entries, { ..checker, concats: [] }, |c: Checker, entry: ConcatSite| {
@@ -2989,8 +3162,8 @@ fn bind_all(
   fold(bindings, checker, |c: Checker, b: { name: Bytes, ty: Type }|
     { ..c, env: env_bind(c.env, b.name, monomorphic(b.ty)) })
 
-// A call's arguments; a lambda the callee calls once per element of its input is inferred under the
-// call, which is the iteration its body repeats with.
+/// A call's arguments; a lambda the callee calls once per element of its input is inferred under the
+/// call, which is the iteration its body repeats with.
 fn infer_args(
   checker: Checker,
   exprs: List<Expr>,
@@ -3012,9 +3185,9 @@ fn infer_args(
     },
   )
 
-// The parameters a callee calls a number of times that grows with its input. A builtin's count is
-// fixed when the argument it iterates over is written out; a function value's is unknown, so each
-// of its parameters is taken to.
+/// The parameters a callee calls a number of times that grows with its input. A builtin's count is
+/// fixed when the argument it iterates over is written out; a function value's is unknown, so each
+/// of its parameters is taken to.
 fn callee_repeats(checker: Checker, func: Expr, args: List<Expr>) -> List<Int> / {abort.raise} = {
   let builtin = prelude_named(checker, func);
   if builtin != b"" {
@@ -3032,7 +3205,7 @@ fn callee_repeats(checker: Checker, func: Expr, args: List<Expr>) -> List<Int> /
   }
 }
 
-// The parameters a builtin calls once per element of its argument at `over`.
+/// The parameters a builtin calls once per element of its argument at `over`.
 fn builtin_repeats(name: Bytes) -> { params: List<Int>, over: Int } =
   if name == b"map" || name == b"filter" { { params: [1], over: 0 } }
   else if name == b"fold" || name == b"map_fold" || name == b"bytes_position" {
@@ -3040,7 +3213,7 @@ fn builtin_repeats(name: Bytes) -> { params: List<Int>, over: Int } =
   } else if name == b"iterate" { { params: [2], over: 1 } }
   else { { params: [], over: 0 } }
 
-// A literal, a list literal, or a `range` between two literals: a size the text fixes.
+/// A literal, a list literal, or a `range` between two literals: a size the text fixes.
 fn fixed_size(checker: Checker, e: Expr) -> Bool / {abort.raise} =
   match e {
     ELit(_) -> true,
@@ -3051,7 +3224,7 @@ fn fixed_size(checker: Checker, e: Expr) -> Bool / {abort.raise} =
     _ -> false,
   }
 
-// Every row a repeated parameter's type holds: what its functions perform, once per call.
+/// Every row a repeated parameter's type holds: what its functions perform, once per call.
 fn repeated_rows(
   checker: Checker,
   params: List<Type>,
@@ -3094,14 +3267,14 @@ fn rows_of(
     TyVar(_) -> acc,
   }
 
-// A callee's own scaling atom, as its call performs it: a label variable stands for any label.
+/// A callee's own scaling atom, as its call performs it: a label variable stands for any label.
 fn scales_like(scales: List<Atom>, a: Atom) -> Bool =
   fold(scales, false, |found: Bool, s: Atom|
     found
       || (s.effect == a.effect && mode_eq(s.mode, a.mode) && s.op == a.op
       && (s.resource == a.resource || (match s.resource { RVar(_) -> true, _ -> false }))))
 
-// A row variable a call performs under an iteration: the callee's own, or the one around the call.
+/// A row variable a call performs under an iteration: the callee's own, or the one around the call.
 fn repeat_tail(checker: Checker, tail: Option<Int>, vars: List<Int>, span: Span) -> Checker =
   match tail {
     None -> checker,
@@ -3360,7 +3533,7 @@ fn infer(checker: Checker, expr: Expr) -> Inferred / {abort.raise} =
     EParallel(v) -> infer_parallel(checker, v.span, v.branches),
   }
 
-// The branches' answers as a tuple, which is what evaluating them left to right answers.
+/// The branches' answers as a tuple, which is what evaluating them left to right answers.
 fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferred / {abort.raise} = {
   let out = fold(
     range(0, len(branches)),
@@ -3385,9 +3558,9 @@ fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferre
   }
 }
 
-// `{..b, f: e}` answers the base's own record type with the written fields replaced, and publishes the
-// base's field list for the lowering. A base whose type the substitution does not hold yet waits for
-// `settle_updates`, so a lambda parameter the callee only types later still has a shape.
+/// `{..b, f: e}` answers the base's own record type with the written fields replaced, and publishes the
+/// base's field list for the lowering. A base whose type the substitution does not hold yet waits for
+/// `settle_updates`, so a lambda parameter the callee only types later still has a shape.
 fn infer_record_update(
   checker: Checker,
   span: Span,
@@ -3437,7 +3610,7 @@ fn infer_record_update(
   }
 }
 
-// The type an update answers, and the field list the lowering copies from, once the base's type is known.
+/// The type an update answers, and the field list the lowering copies from, once the base's type is known.
 fn update_shape(
   checker: Checker,
   span: Span,
@@ -3510,7 +3683,7 @@ fn update_shape(
       ),
   }
 
-// An update whose base was still a variable where it stood: the substitution is complete here.
+/// An update whose base was still a variable where it stood: the substitution is complete here.
 fn settle_updates(checker: Checker) -> Checker / {abort.raise} = {
   let entries = checker.updates;
   fold(entries, { ..checker, updates: [] }, |c: Checker, entry: UpdateSite| {
@@ -3578,7 +3751,10 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             }
           };
           let group = group_label_vars(noted, key.name);
-          let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) } else { inst.labels };
+          // A constructor's labels are its type's arguments, which no call fills.
+          let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) }
+          else if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
+          else { inst.labels };
           { checker: note_labels(noted, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
         },
         None -> {
@@ -3600,7 +3776,7 @@ fn crossed(checker: Checker, name: Bytes, span: Span) -> Checker / {abort.raise}
     }
   }
 
-// `Int` and the eight widths are the integer types; the bit operators are defined at those nine only.
+/// `Int` and the eight widths are the integer types; the bit operators are defined at those nine only.
 fn is_int_name(n: Bytes) -> Bool =
   n == b"Int" || n == b"U8" || n == b"U16" || n == b"U32" || n == b"U64" || n == b"I8"
     || n == b"I16"
@@ -3609,8 +3785,8 @@ fn is_int_name(n: Bytes) -> Bool =
     || n == b"U128"
     || n == b"I128"
 
-// Whether a `/` or `%` can meet a zero divisor: a `Float` answers one, and a literal other than zero
-// is never one. An operand type not settled yet may still be an integer's.
+/// Whether a `/` or `%` can meet a zero divisor: a `Float` answers one, and a literal other than zero
+/// is never one. An operand type not settled yet may still be an integer's.
 fn divides_by_zero(checker: Checker, op: Bytes, ty: Type, divisor: Expr) -> Bool / {abort.raise} =
   (op == b"div" || op == b"rem") && !nonzero_literal(divisor)
     && (match resolve(checker, ty) { TyCon(k) -> k.name != b"Float", _ -> true })
@@ -3631,7 +3807,7 @@ fn is_bits(op: Bytes) -> Bool =
   op == b"bitand" || op == b"bitor" || op == b"bitxor" || op == b"shl" || op == b"shr"
     || op == b"ushr"
 
-// The two types `++` joins, when the substitution already says which one this is.
+/// The two types `++` joins, when the substitution already says which one this is.
 fn concat_name(ty: Type) -> Option<Bytes> =
   match ty {
     TyCon(k) -> if len(k.args) == 0 && (k.name == b"String" || k.name == b"Bytes") { Some(k.name) }
@@ -3639,7 +3815,7 @@ fn concat_name(ty: Type) -> Option<Bytes> =
     _ -> None,
   }
 
-// `String ++ Bytes` names both sides rather than reporting one against the other; there is no coercion.
+/// `String ++ Bytes` names both sides rather than reporting one against the other; there is no coercion.
 fn mixed_concat(checker: Checker, lspan: Span, lt: Type, rspan: Span, rt: Type) -> Option<Checker> =
   match concat_name(lt) {
     None -> None,
@@ -3771,7 +3947,7 @@ fn infer_binary(
   }
 }
 
-// A `let ... else` block, whose value the enclosing block's tail must agree with.
+/// A `let ... else` block, whose value the enclosing block's tail must agree with.
 type Fallback = { span: Span, ty: Type }
 
 type StmtOut = { checker: Checker, row: Row, fallback: Option<Fallback> }
@@ -3812,7 +3988,7 @@ type LetBound = { checker: Checker, row: Row, out: List<{ name: Bytes, ty: Type 
 fn refutable(checker: Checker, pat: Pattern) -> Bool / {abort.raise} =
   len(uncovered(checker, [[coverage_pat(checker, pat)]], 1)) > 0
 
-// Its alternatives are the arms of the `match` it becomes, and a plain `let` has no arm to spare.
+/// Its alternatives are the arms of the `match` it becomes, and a plain `let` has no arm to spare.
 fn or_let_covers(checker: Checker, pat: Pattern) -> Checker / {abort.raise} =
   if !has_or(pat) { checker } else {
     let missing = uncovered(checker, [[coverage_pat(checker, pat)]], 1);
@@ -3836,7 +4012,7 @@ fn or_let_covers(checker: Checker, pat: Pattern) -> Checker / {abort.raise} =
     }
   }
 
-// The initializer, its annotation and what the pattern binds, not yet in scope.
+/// The initializer, its annotation and what the pattern binds, not yet in scope.
 fn let_bound(
   checker: Checker,
   pat: Pattern,
@@ -3873,8 +4049,8 @@ fn infer_app(
     _ -> infer_app_general(checker, span, func, args, labels),
   }
 
-// The prelude name a bare callee resolves to, or nothing for one the program declares.
-// A narrowing of a literal its type holds cannot fail, so it raises nothing.
+/// The prelude name a bare callee resolves to, or nothing for one the program declares.
+/// A narrowing of a literal its type holds cannot fail, so it raises nothing.
 fn narrows_a_literal_it_holds(
   checker: Checker,
   func: Expr,
@@ -3896,7 +4072,7 @@ fn literal_value(e: Expr) -> Option<Int> =
     _ -> None,
   }
 
-// `numeric_of_int` holds what every numeric type holds.
+/// `numeric_of_int` holds what every numeric type holds.
 fn literal_fits(name: Bytes, v: Int) -> Bool =
   if name == b"u8_of_int" || name == b"byte_of_int" { v >= 0 && v <= 255 }
   else if name == b"u16_of_int" { v >= 0 && v <= 65535 }
@@ -3920,8 +4096,8 @@ fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
     _ -> b"",
   }
 
-// The closures `bracket` is handed run as one, so each is taken to perform what all of them do: a
-// body generic over its caller's row still admits the release's operations.
+/// The closures `bracket` is handed run as one, so each is taken to perform what all of them do: a
+/// body generic over its caller's row still admits the release's operations.
 fn joined_callbacks(
   checker: Checker,
   span: Span,
@@ -3946,8 +4122,8 @@ fn group_label_vars(checker: Checker, name: Bytes) -> List<Int> =
 fn group_member(checker: Checker, name: Bytes) -> Bool =
   fold(checker.group_defs, false, |acc: Bool, g: GroupDef| acc || g.name == name)
 
-// Every use of a label-generic definition, so a call can fill its labels and a settled component
-// can say which ones it filled them with.
+/// Every use of a label-generic definition, so a call can fill its labels and a settled component
+/// can say which ones it filled them with.
 fn note_labels(checker: Checker, span: Span, callee: Bytes, labels: List<Type>) -> Checker =
   if len(labels) == 0 { checker } else {
     {
@@ -3964,14 +4140,14 @@ fn note_labels(checker: Checker, span: Span, callee: Bytes, labels: List<Type>) 
     }
   }
 
-// The use recorded for the name this call applies, when the callee is label-generic.
+/// The use recorded for the name this call applies, when the callee is label-generic.
 fn callee_labels(checker: Checker, span: Span) -> Option<LabelApplication> =
   match list_at(checker.label_apps, len(checker.label_apps) - 1) {
     Some(a) -> if a.module == checker.module && a.span == span { Some(a) } else { None },
     None -> None,
   }
 
-// The labels written at a call fill the callee's label parameters left to right.
+/// The labels written at a call fill the callee's label parameters left to right.
 fn fill_labels(
   checker: Checker,
   span: Span,
@@ -4015,11 +4191,11 @@ fn fill_labels(
     },
   }
 
-// A callee checked in the same recursive group as the body calling it: its labels are the group's.
+/// A callee checked in the same recursive group as the body calling it: its labels are the group's.
 fn is_sibling(checker: Checker, name: Bytes) -> Bool = len(group_label_vars(checker, name)) > 0
 
-// A call inside a recursive group keeps the labels the group was called with, so a label written
-// there names the caller's own binder in that place, and anything else is refused.
+/// A call inside a recursive group keeps the labels the group was called with, so a label written
+/// there names the caller's own binder in that place, and anything else is refused.
 fn group_labels_written(
   checker: Checker,
   a: LabelApplication,
@@ -4113,7 +4289,7 @@ fn wrong_labels(
   }
 }
 
-// Builtins whose first parameter must be an integer type, checked per call: a scheme cannot say "an integer".
+/// Builtins whose first parameter must be an integer type, checked per call: a scheme cannot say "an integer".
 fn int_builtin_name(func: Expr) -> Bytes =
   match func { EVar(v) -> if is_bare(v.name) { v.name.name.name } else { b"" }, _ -> b"" }
 
@@ -4125,7 +4301,7 @@ fn is_int_builtin(func: Expr) -> Bool = {
     || n == b"checked_neg"
 }
 
-// The member of the group being walked that a call names, when it names one.
+/// The member of the group being walked that a call names, when it names one.
 fn group_callee(checker: Checker, src: PerformSource) -> Option<Bytes> =
   match src {
     PerformVia(name) -> if group_member(checker, name) { Some(name) } else { None },
@@ -4135,7 +4311,7 @@ fn group_callee(checker: Checker, src: PerformSource) -> Option<Bytes> =
 fn group_row_tail(checker: Checker, tail: Option<Int>) -> Bool =
   match tail { Some(v) -> contains(checker.group_rows, v), None -> false }
 
-// The group member whose signature wrote this type parameter, when one did.
+/// The group member whose signature wrote this type parameter, when one did.
 fn group_owner(checker: Checker, ty: Type) -> Option<GroupOwner> =
   match ty {
     TyVar(v) ->
@@ -4152,20 +4328,20 @@ fn group_owner(checker: Checker, ty: Type) -> Option<GroupOwner> =
     _ -> None,
   }
 
-// The callee's own type parameter a mismatch landed on, under the name its signature wrote.
+/// The callee's own type parameter a mismatch landed on, under the name its signature wrote.
 fn group_ty_param(checker: Checker, callee: Bytes, ty: Type) -> Option<Bytes> =
   match group_owner(checker, ty) {
     Some(o) -> if o.owner == callee { Some(o.name) } else { None },
     None -> None,
   }
 
-// A printer naming the group's type parameters as their signatures wrote them.
+/// A printer naming the group's type parameters as their signatures wrote them.
 fn group_printer(checker: Checker) -> Printer =
   fold(checker.group_defs, printer_new(), |acc: Printer, g: GroupDef|
     fold(g.types, acc, |printer: Printer, x: RigidParam| printer_naming(printer, x.var, x.name)))
 
-// What a refusal calls a type: a member's own parameter as that member wrote it, else the type
-// printed with those names in place.
+/// What a refusal calls a type: a member's own parameter as that member wrote it, else the type
+/// printed with those names in place.
 fn group_ty_text(checker: Checker, callee: Bytes, ty: Type) -> Bytes / {abort.raise} =
   match group_owner(checker, ty) {
     Some(o) -> if o.owner == callee { bytes_concat_all([b"`", o.name, b"`"]) }
@@ -4181,7 +4357,7 @@ type Items<a> = { checker: Checker, items: List<a>, tails: List<Int> }
 
 fn unwidened(checker: Checker, ty: Type) -> Widened = { checker: checker, ty: ty, tails: [] }
 
-// `g`'s closed row given a fresh tail, after its result came back widened as `r`.
+/// `g`'s closed row given a fresh tail, after its result came back widened as `r`.
 fn widen_fn(
   r: Widened,
   ty: Type,
@@ -4202,11 +4378,11 @@ fn widen_fn(
   }
 }
 
-// A fresh tail on each closed row of a function the value holds where a narrower one may stand.
+/// A fresh tail on each closed row of a function the value holds where a narrower one may stand.
 fn open_rows(checker: Checker, ty: Type) -> Widened / {abort.raise} =
   opened(checker, ty, map_len(checker.subst.ty))
 
-// `room` as in `types::resolved_ty`: opening binds no type, so the bindings stay as they were.
+/// `room` as in `types::resolved_ty`: opening binds no type, so the bindings stay as they were.
 fn opened(checker: Checker, ty: Type, room: Int) -> Widened / {abort.raise} =
   match ty {
     TyVar(v) -> match map_get(checker.subst.ty, v) {
@@ -4256,7 +4432,7 @@ fn opened(checker: Checker, ty: Type, room: Int) -> Widened / {abort.raise} =
     },
   }
 
-// What will not meet its type as written meets it again widened, which costs a walk, so only then.
+/// What will not meet its type as written meets it again widened, which costs a walk, so only then.
 fn expect_met(
   checker: Checker,
   span: Span,
@@ -4280,7 +4456,7 @@ fn expect_met(
 
 type Joined = { checker: Checker, ty: Type, tails: List<Int> }
 
-// List elements or `match` arms: as written while they agree, else widened with the join so far.
+/// List elements or `match` arms: as written while they agree, else widened with the join so far.
 fn join_next(acc: Joined, span: Span, found: Type, context: Bytes) -> Joined / {abort.raise} = {
   let u = unify(acc.checker.subst, acc.checker.fresh, acc.ty, found);
   match u.error {
@@ -4324,7 +4500,7 @@ fn agree(
   { checker: close_tails(j.checker, j.tails), ty: j.ty }
 }
 
-// As written; a refusal retries the call with every argument widened, and stands if that fails.
+/// As written; a refusal retries the call with every argument widened, and stands if that fails.
 fn expect_arguments<| e>(
   checker: Checker,
   params: List<Type>,
@@ -4361,7 +4537,7 @@ fn arguments_widened(
   match m { None -> None, Some(a) -> Some(close_tails(a.checker, a.tails)) }
 }
 
-// After everything that must agree has met, so a row the values share holds just their union.
+/// After everything that must agree has met, so a row the values share holds just their union.
 fn close_tails(checker: Checker, tails: List<Int>) -> Checker / {abort.raise} =
   fold(tails, checker, close_tail)
 
@@ -4373,8 +4549,8 @@ fn close_tail(checker: Checker, tail: Int) -> Checker / {abort.raise} =
     None -> checker,
   }
 
-// An argument against its parameter, where a call inside the group being walked is monomorphic:
-// a mismatch on the group's row, or on the callee's own type parameter, is refused as that.
+/// An argument against its parameter, where a call inside the group being walked is monomorphic:
+/// a mismatch on the group's row, or on the callee's own type parameter, is refused as that.
 fn expect_argument(
   checker: Checker,
   span: Span,
@@ -4416,7 +4592,7 @@ fn group_argument_refused(
     _ -> report_unify(checker, error, span, b"argument type"),
   }
 
-// The group's row binders are one allocation, so a call inside it cannot ask for another row.
+/// The group's row binders are one allocation, so a call inside it cannot ask for another row.
 fn group_row_refused(
   checker: Checker,
   span: Span,
@@ -4443,8 +4619,8 @@ fn group_row_refused(
   )
 }
 
-// Type parameters are per definition, so a call inside a group cannot instantiate the callee's at
-// another type: that is polymorphic recursion, which inference cannot decide.
+/// Type parameters are per definition, so a call inside a group cannot instantiate the callee's at
+/// another type: that is polymorphic recursion, which inference cannot decide.
 fn group_type_refused(
   checker: Checker,
   span: Span,
@@ -4632,7 +4808,7 @@ fn infer_cell_op(
   let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_all(checker, args, span);
   if len(args) != expected {
     let o: WithTy = new_ty(
-      arity_error(as_.checker, span, cell_form_name(form), expected, len(args), b"arguments"),
+      arity_error(as_.checker, span, cell_form_name(form), expected, len(args), b"arguments", []),
     );
     { checker: o.checker, ty: o.ty, row: as_.row }
   } else {
@@ -4929,7 +5105,7 @@ fn bind_pattern(
     },
   }
 
-// An alternative binds the first one's names, each at the type the first gives it.
+/// An alternative binds the first one's names, each at the type the first gives it.
 fn same_binders(
   checker: Checker,
   span: Span,
@@ -5032,13 +5208,13 @@ fn infer_match(
 
 // --- Exhaustiveness: usefulness over a matrix with one row per unguarded arm ---------------------
 
-// `CoverNothing` is a constructor that does not resolve: it matches nothing, so its arm covers nothing.
+/// `CoverNothing` is a constructor that does not resolve: it matches nothing, so its arm covers nothing.
 type CoveragePattern =
   | CoverAny
   | CoverNothing
   | CoverCtor({ family: Bytes, key: Bytes, name: Bytes, args: List<CoveragePattern> })
   | CoverRecord(List<{ name: Bytes, pat: CoveragePattern }>)
-  // Never a row's head inside the search: `uncovered` splits it into a row per alternative first.
+  /// Never a row's head inside the search: `uncovered` splits it into a row per alternative first.
   | CoverEither(List<CoveragePattern>)
 
 type CoverageCtor = { key: Bytes, name: Bytes, arity: Int }
@@ -5124,7 +5300,7 @@ fn heads_ctor(
   fold(rows, false, |b: Bool, r: List<CoveragePattern>|
     b || (match at(r, 0) { CoverCtor(c) -> c.family == family && c.key == key, _ -> false }))
 
-// `None` for a family no list of arms exhausts: literals, and a column that names no constructor.
+/// `None` for a family no list of arms exhausts: literals, and a column that names no constructor.
 fn family_ctors(checker: Checker, family: Bytes) -> Option<List<CoverageCtor>> =
   if family == b"#bool" {
     Some([{ key: b"true", name: b"true", arity: 0 }, { key: b"false", name: b"false", arity: 0 }])
@@ -5141,7 +5317,7 @@ fn family_ctors(checker: Checker, family: Bytes) -> Option<List<CoverageCtor>> =
     )
   }
 
-// Rows of values no row matches, each `n` wide; empty when the rows are exhaustive.
+/// Rows of values no row matches, each `n` wide; empty when the rows are exhaustive.
 fn uncovered(
   checker: Checker,
   rows: List<List<CoveragePattern>>,
@@ -5149,9 +5325,9 @@ fn uncovered(
 ) -> List<List<CoveragePattern>> / {abort.raise} =
   uncovered_within(checker, rows, n, search_room(checker, rows, n))
 
-// Each step of the search puts the columns of what heads the first column in its place, and a path
-// steps through each place once: so the columns there are, and those each pattern can bring (a
-// constructor at most as many as any has), are room enough.
+/// Each step of the search puts the columns of what heads the first column in its place, and a path
+/// steps through each place once: so the columns there are, and those each pattern can bring (a
+/// constructor at most as many as any has), are room enough.
 fn search_room(checker: Checker, rows: List<List<CoveragePattern>>, n: Int) -> Int = {
   let most = fold(checker.ctors, 2, |m: Int, c: CtorInfo| if c.arity > m { c.arity } else { m });
   fold(rows, n + 1, |acc: Int, r: List<CoveragePattern>|
@@ -5185,7 +5361,7 @@ fn uncovered_within(
     )
   }
 
-// A row headed by an or-pattern is one row per alternative, nested ones included.
+/// A row headed by an or-pattern is one row per alternative, nested ones included.
 fn split_or(patterns: List<CoveragePattern>) -> List<List<CoveragePattern>> / {abort.raise} =
   match patterns {
     [CoverEither(alts), ..rest] ->
@@ -5262,7 +5438,7 @@ fn through(
       ),
   )
 
-// A head of another family, or of the wrong arity, counts as a wildcard: its error is already reported.
+/// A head of another family, or of the wrong arity, counts as a wildcard: its error is already reported.
 fn specialize(
   rows: List<List<CoveragePattern>>,
   family: Bytes,
@@ -5289,7 +5465,7 @@ fn default_rows(
       _ -> push(acc, drop(patterns, 1)),
     })
 
-// A record is one constructor over every field some arm names; the rest are wildcards everywhere.
+/// A record is one constructor over every field some arm names; the rest are wildcards everywhere.
 fn uncovered_record(
   checker: Checker,
   rows: List<List<CoveragePattern>>,
@@ -5344,7 +5520,7 @@ fn shown_list(pattern: CoveragePattern, items: List<Bytes>) -> Bytes / {abort.ra
     _ -> bytes_concat_all([b"[", bytes::join(push(items, b".."), b", "), b"]"]),
   }
 
-// A tuple is the record `{_0, _1, ..}` and is shown as one; a record's other fields may be unnamed, so it ends in `..`.
+/// A tuple is the record `{_0, _1, ..}` and is shown as one; a record's other fields may be unnamed, so it ends in `..`.
 fn shown_record(fs: List<{ name: Bytes, pat: CoveragePattern }>) -> Bytes / {abort.raise} = {
   let parts = map(fs, |f: { name: Bytes, pat: CoveragePattern }| shown(f.pat));
   let tuple = len(fs) > 1
@@ -5430,9 +5606,9 @@ fn resolve_op(
   }
 }
 
-// The effect as this module can write it, so a suggestion parses.
-// How this module's source names an effect: by its imported name or through a module binder; none
-// when it names it neither way, and a row it writes must import it first.
+/// The effect as this module can write it, so a suggestion parses.
+/// How this module's source names an effect: by its imported name or through a module binder; none
+/// when it names it neither way, and a row it writes must import it first.
 fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise} =
   if is_prelude_effect(eff) || eff == cell() { Some(eff) } else {
     let scope = scope_of(checker);
@@ -5462,8 +5638,8 @@ fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise} =
     }
   }
 
-// A binder an import wrote; one the resolver added for a spliced default or an expanded set has no
-// span, and no source can spell it.
+/// A binder an import wrote; one the resolver added for a spliced default or an expanded set has no
+/// span, and no source can spell it.
 fn written_binder(binding: ModuleBinding) -> Bool = binding.span.end > binding.span.start
 
 fn as_written(checker: Checker, eff: Bytes) -> Bytes / {abort.raise} =
@@ -5548,9 +5724,9 @@ fn resource_for(
     } else { { checker: checker, resource: Some(RSingleton) } },
   }
 
-// A clause's resource: a written label, or `RAny` when the clause is written `[*]` and so
-// answers the operation on every label. A clause that names no label at all and a `[*]` clause
-// are different things, which is why the caller passes the clause rather than its `resource`.
+/// A clause's resource: a written label, or `RAny` when the clause is written `[*]` and so
+/// answers the operation on every label. A clause that names no label at all and a `[*]` clause
+/// are different things, which is why the caller passes the clause rather than its `resource`.
 fn clause_resource_for(
   checker: Checker,
   info: EffectInfo,
@@ -5745,7 +5921,7 @@ fn infer_perform(
   }
 }
 
-// A channel's capacity below zero and a draw's bound below one raise, unless a literal says not.
+/// A channel's capacity below zero and a draw's bound below one raise, unless a literal says not.
 fn out_of_range(info: EffectInfo, op: OpInfo, args: List<Expr>) -> Bool =
   info.module == b""
     && (match list_at(args, 0) {
@@ -6058,7 +6234,7 @@ fn reach_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise} = {
   }
 }
 
-// `E0305`: the operations named, and for a mode atom the operations it stands for, each with the clause to add.
+/// `E0305`: the operations named, and for a mode atom the operations it stands for, each with the clause to add.
 fn incomplete(
   checker: Checker,
   span: Span,
@@ -6136,7 +6312,7 @@ fn incomplete(
   report(checker, fixed)
 }
 
-// A clause for the operation that checks as it is and raises where the operation was skipped before.
+/// A clause for the operation that checks as it is and raises where the operation was skipped before.
 fn clause_for(checker: Checker, atom: Atom) -> Bytes / {abort.raise} = {
   let written = atom_written(checker, atom);
   let params = match effect_of(checker, atom.effect) {
@@ -6163,7 +6339,7 @@ fn simple_name_of(name: Bytes) -> Bytes / {abort.raise} =
     None -> name,
   }
 
-// The mismatch just reported gains a secondary at the declaration and three notes.
+/// The mismatch just reported gains a secondary at the declaration and three notes.
 fn note_universal_clause(
   checker: Checker,
   info: EffectInfo,
@@ -6240,7 +6416,7 @@ fn close_region(checker: Checker) -> ClosedRegion / {abort.raise} = {
 fn sites_of(args: List<Expr>, tys: List<Type>) -> List<SpawnSite> / {abort.raise} =
   map(range(0, len(args)), |i: Int| { span: expr_span(at(args, i)), ty: at(tys, i), around: [] })
 
-// The spawns each open region filed while a `handle`'s body ran perform against its clauses.
+/// The spawns each open region filed while a `handle`'s body ran perform against its clauses.
 fn spawned_under(
   checker: Checker,
   before: List<Int>,
@@ -6264,8 +6440,8 @@ fn spawned_under(
     }
   }
 
-// A `task.spawn` argument is filed against every open region with no `simulate` of its own between
-// the open and the spawn: that scheduler outlives the region, so its task can run past the close.
+/// A `task.spawn` argument is filed against every open region with no `simulate` of its own between
+/// the open and the spawn: that scheduler outlives the region, so its task can run past the close.
 fn note_spawn(
   checker: Checker,
   info: EffectInfo,
@@ -6282,7 +6458,7 @@ fn note_spawn(
     }
   }
 
-// Every argument of a user-declared operation, against every open region: its handler can be installed anywhere.
+/// Every argument of a user-declared operation, against every open region: its handler can be installed anywhere.
 fn note_handoff(
   checker: Checker,
   info: EffectInfo,
@@ -6301,7 +6477,7 @@ fn note_handoff(
     }
   }
 
-// What is in scope when a region opens, paired with where its body first names each.
+/// What is in scope when a region opens, paired with where its body first names each.
 fn outer_bindings(checker: Checker, body: Expr) -> List<OuterBinding> / {abort.raise} = {
   let kept = fold(
     env_locals(checker.env),
@@ -6410,7 +6586,7 @@ fn holds_cell(t: Type) -> Bool =
     TyVar(_) -> false,
   }
 
-// Every perform site of `mode` on a cell of a region in `older`, the direct and the called alike.
+/// Every perform site of `mode` on a cell of a region in `older`, the direct and the called alike.
 fn older_cells(
   checker: Checker,
   sites: List<PerformSite>,
@@ -6428,7 +6604,7 @@ fn older_cells(
     }
   })
 
-// By the types at the open: a binding whose type mentions a task only inside the region holds none.
+/// By the types at the open: a binding whose type mentions a task only inside the region holds none.
 fn task_carriers(checker: Checker) -> List<{ name: Bytes, ty: Type }> / {abort.raise} =
   fold(
     env_locals(checker.env),
@@ -6446,7 +6622,7 @@ fn task_carriers(checker: Checker) -> List<{ name: Bytes, ty: Type }> / {abort.r
       },
   )
 
-// A name the body takes from outside is the innermost binding of it, the one the open saw.
+/// A name the body takes from outside is the innermost binding of it, the one the open saw.
 fn carried_in(
   xs: List<Crossing>,
   carriers: List<{ name: Bytes, ty: Type }>,
@@ -6519,8 +6695,8 @@ fn infer_simulate(checker: Checker, span: Span, body: Expr) -> Inferred / {abort
 
 type Refs = { names: List<QName> }
 
-// Every name a body reads that no binder inside it shadows: a parameter or a `let` named like a
-// top-level definition reads the binder, not the definition.
+/// Every name a body reads that no binder inside it shadows: a parameter or a `let` named like a
+/// top-level definition reads the binder, not the definition.
 fn refs_of(expr: Expr, bound: List<Bytes>) -> Refs = collect_refs(expr, bound, { names: [] })
 
 fn param_names(params: List<Param>) -> List<Bytes> = map(params, |param: Param| param.name.name)
@@ -6596,7 +6772,7 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
     EParallel(v) -> fold(v.branches, out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
   }
 
-// Tarjan's components in completion order, so the checker solves a callee before its callers.
+/// Tarjan's components in completion order, so the checker solves a callee before its callers.
 type Tarjan = {
   index: List<Int>,
   low: List<Int>,
@@ -6793,7 +6969,7 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
     check_component(c, parsed, fns, comp))
 }
 
-// What was handed in for a test, where it came with no key or under the one it has now.
+/// What was handed in for a test, where it came with no key or under the one it has now.
 fn known_test(
   checker: Checker,
   module: Bytes,
@@ -6811,7 +6987,7 @@ fn known_test(
     },
   }
 
-// An operation atom's mode is its declaration's; a row read back from text does not carry it.
+/// An operation atom's mode is its declaration's; a row read back from text does not carry it.
 fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
   match atom.op {
     None -> atom,
@@ -6831,9 +7007,9 @@ fn check_domain() -> Bytes = b"ply.check.1\0"
 
 fn framed(b: Bytes) -> Bytes = bytes_concat_all([ascii_of_int(bytes_len(b)), b":", b])
 
-// What a caller reads of a definition beyond its written signature: how its calls end, how it calls
-// what it is handed, and what it performs a growing number of times. The row it published is here
-// for a definition that overran an unwritten one, whose callers are checked against the overrun.
+/// What a caller reads of a definition beyond its written signature: how its calls end, how it calls
+/// what it is handed, and what it performs a growing number of times. The row it published is here
+/// for a definition that overran an unwritten one, whose callers are checked against the overrun.
 fn published_digest(info: DefInfo) -> Bytes / {abort.raise} =
   blake3(
     bytes_concat_all([
@@ -6857,8 +7033,8 @@ fn publishing(checker: Checker, name: Bytes) -> Checker / {abort.raise} =
     _ -> checker,
   }
 
-// Everything `names` reference outside `inside`, in the order they mention it, each with what its
-// declaration and written signature say and what it published.
+/// Everything `names` reference outside `inside`, in the order they mention it, each with what its
+/// declaration and written signature say and what it published.
 fn reads_digest(
   checker: Checker,
   keying: Keying,
@@ -6890,8 +7066,8 @@ fn reads_digest(
     ).out,
   )
 
-// The key each member of a group's rows are filed under: its own form, every member's, and what
-// the group reads of everything outside it. None where the driver handed in nothing to key by.
+/// The key each member of a group's rows are filed under: its own form, every member's, and what
+/// the group reads of everything outside it. None where the driver handed in nothing to key by.
 fn group_checks(checker: Checker, members: List<Bytes>) -> List<Option<Bytes>> / {abort.raise} =
   match checker.known.keying {
     None -> map(members, |m: Bytes| None),
@@ -6928,7 +7104,7 @@ fn group_checks(checker: Checker, members: List<Bytes>) -> List<Option<Bytes>> /
     },
   }
 
-// A test's key: its own form and what it reads, which a definition named as the test is among.
+/// A test's key: its own form and what it reads, which a definition named as the test is among.
 fn test_check(checker: Checker, key: Bytes) -> Option<Bytes> / {abort.raise} =
   match checker.known.keying {
     None -> None,
@@ -6949,7 +7125,7 @@ fn test_check(checker: Checker, key: Bytes) -> Option<Bytes> / {abort.raise} =
     },
   }
 
-// The rows handed in for a definition, where they came with no key or under the one it has now.
+/// The rows handed in for a definition, where they came with no key or under the one it has now.
 fn seeded_rows(checker: Checker, name: Bytes, check: Option<Bytes>) -> Option<KnownDef> =
   match map_get(checker.known.defs, name) {
     None -> None,
@@ -6997,8 +7173,8 @@ fn binders_differ(
     ],
   )
 
-// The label and row variables a recursive group is checked with: the first member's binders, taken
-// by every member in order. A member that binds another number of either is refused.
+/// The label and row variables a recursive group is checked with: the first member's binders, taken
+/// by every member in order. A member that binds another number of either is refused.
 fn component_params(
   checker: Checker,
   fns: List<FnDef>,
@@ -7060,7 +7236,7 @@ fn component_params(
   { checker: rows.checker, shared: { labels: labels.vars, rows: rows.vars } }
 }
 
-// What a name the termination walk leaves free refers to.
+/// What a name the termination walk leaves free refers to.
 fn group_callee_kind(
   checker: Checker,
   qualified: List<Bytes>,
@@ -7338,8 +7514,8 @@ fn check_component(
   group_witnesses(keyed)
 }
 
-// A call to a member of the group just walked passes the witnesses the member now has an order
-// for, which only its own body holds: a recursive call passes its caller's own.
+/// A call to a member of the group just walked passes the witnesses the member now has an order
+/// for, which only its own body holds: a recursive call passes its caller's own.
 fn group_witnesses(checker: Checker) -> Checker / {abort.raise} =
   fold(checker.group_refs, { ..checker, group_refs: [] }, |c: Checker, g: GroupRef| {
     let callee = simple_name_of(g.callee);
@@ -7399,8 +7575,8 @@ fn group_witnesses(checker: Checker) -> Checker / {abort.raise} =
     }
   })
 
-// The signature's label parameters generalize among the type variables; they belong in their own
-// list, in the order the generic list wrote them, and a phantom one is still a parameter.
+/// The signature's label parameters generalize among the type variables; they belong in their own
+/// list, in the order the generic list wrote them, and a phantom one is still a parameter.
 fn split_labels(scheme: Scheme, def: FnDef, signature: Signature) -> Scheme = {
   let ids = fold(def.generics.labels, [], |acc: List<Int>, ident: Ident|
     match map_get(signature.label_params, ident.name) { Some(v) -> push(acc, v), None -> acc });
@@ -7414,7 +7590,7 @@ fn split_labels(scheme: Scheme, def: FnDef, signature: Signature) -> Scheme = {
   }
 }
 
-// A generated definition carries its `derive` item's span and nothing hand-written does.
+/// A generated definition carries its `derive` item's span and nothing hand-written does.
 fn derived_of(parsed: ParsedModule, def: FnDef) -> Option<Derived> =
   fold(parsed.derived, None, |acc: Option<Derived>, d: Derived|
     match acc { Some(_) -> acc, None -> if d.span == def.span { Some(d) } else { None } })
@@ -7438,8 +7614,8 @@ fn published_constraints(
   )
 }
 
-// The parameters a definition's `numeric` and `integer` constraints are about, in its scheme's
-// order. One its signature never mentions is refused: no call fixes it, so none could pass it.
+/// The parameters a definition's `numeric` and `integer` constraints are about, in its scheme's
+/// order. One its signature never mentions is refused: no call fixes it, so none could pass it.
 fn witness_order(checker: Checker, def: FnDef, scheme: Scheme) -> Checker / {abort.raise} = {
   let found = fold(
     def.constraints,
@@ -7596,9 +7772,9 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
   }
 }
 
-// What a body performs a number of times that grows with its input: what it performs under an
-// iteration, or everything, when it calls back into its own group. A parameter is called so when a
-// row variable its type holds is.
+/// What a body performs a number of times that grows with its input: what it performs under an
+/// iteration, or everything, when it calls back into its own group. A parameter is called so when a
+/// row variable its type holds is.
 fn counts_of(
   checker: Checker,
   signature: Signature,
@@ -7654,8 +7830,8 @@ fn counts_of(
   { scaling: scaling, repeats: repeats, tail_over: tail_over }
 }
 
-// A written row's `bounded` atoms and variable, held to what the body performs: an atom that grows
-// with the input is refused where it is performed, naming the iteration that repeats it.
+/// A written row's `bounded` atoms and variable, held to what the body performs: an atom that grows
+/// with the input is refused where it is performed, naming the iteration that repeats it.
 fn kept_promises(checker: Checker, signature: Signature, count: Count) -> Checker / {abort.raise} = {
   let bounded = map(signature.bounded, |a: Atom| resolve_atom(checker.subst, a));
   let atoms: Checker = fold(bounded, checker, |c: Checker, w: Atom|
@@ -7699,8 +7875,8 @@ fn kept_promises(checker: Checker, signature: Signature, count: Count) -> Checke
 
 fn no_atom() -> Atom = { effect: b"", resource: RSingleton, mode: MRead, op: None }
 
-// What a signature alone says of its counts: an atom not promised `bounded` may grow with the input,
-// and each parameter holding a function is called so unless the row variable is promised.
+/// What a signature alone says of its counts: an atom not promised `bounded` may grow with the input,
+/// and each parameter holding a function is called so unless the row variable is promised.
 pub fn written_counts(
   fn_ty: Type,
   footprint: List<Atom>,
@@ -7727,8 +7903,8 @@ fn holds_fn(t: Type) -> Bool =
     TyVar(_) -> false,
   }
 
-// Where the promise breaks: the operation, and the iteration that repeats it, which is the call
-// itself when the callee iterates.
+/// Where the promise breaks: the operation, and the iteration that repeats it, which is the call
+/// itself when the callee iterates.
 fn broken_promise(
   checker: Checker,
   what: Bytes,
@@ -7771,17 +7947,17 @@ fn broken_promise(
 
 type Offence = { atom: Atom, site: Option<PerformSite> }
 
-// Each inferred atom the written row does not cover, with the first site that contributed it.
+/// Each inferred atom the written row does not cover, with the first site that contributed it.
 fn offences(checker: Checker, dec: List<Atom>, inf: List<Atom>) -> List<Offence> / {abort.raise} =
   fold(inf, [], |acc: List<Offence>, atom: Atom|
     if atoms_covered(dec, atom) { acc }
     else { push(acc, { atom: atom, site: site_for(checker, atom) }) })
 
-// The written atoms of the same effect and resource as `a`.
+/// The written atoms of the same effect and resource as `a`.
 fn named_for(dec: List<Atom>, a: Atom) -> List<Atom> =
   filter(dec, |d: Atom| d.effect == a.effect && d.resource == a.resource)
 
-// A mode atom reached through a call, where the row names operations of its effect: the callee may perform any of them.
+/// A mode atom reached through a call, where the row names operations of its effect: the callee may perform any of them.
 fn narrowed_site(dec: List<Atom>, site: PerformSite) -> Bool =
   !is_direct(site)
     && (match site.atom.op { None -> len(named_for(dec, site.atom)) > 0, Some(_) -> false })
@@ -7822,8 +7998,8 @@ fn atom_written(checker: Checker, atom: Atom) -> Bytes / {abort.raise} =
     ])
   }
 
-// Where an atom joins a written row: before `}`, after `{` when a tail follows, or braces around a
-// bare variable, its `bounded` inside them.
+/// Where an atom joins a written row: before `}`, after `{` when a tail follows, or braces around a
+/// bare variable, its `bounded` inside them.
 fn row_edit(checker: Checker, row: RowExpr, text: Bytes) -> Edit =
   match row.tail {
     None ->
@@ -7857,15 +8033,15 @@ fn check_upper_bound(
     Some(_) -> check_written(checker, def, declared, inferred),
   }
 
-// The name a forwarded row variable is written under: the signature's own row parameter.
+/// The name a forwarded row variable is written under: the signature's own row parameter.
 fn row_param_named(checker: Checker, v: Int) -> Option<Bytes> =
   map_fold(checker.row_params, None, |found: Option<Bytes>, name: Bytes, w: Int|
     match found { Some(_) -> found, None -> if w == v { Some(name) } else { None } })
 
-// A set this module can name, as it names it, and the atoms it stands for.
+/// A set this module can name, as it names it, and the atoms it stands for.
 type Nameable = { name: Bytes, atoms: List<Atom> }
 
-// The atoms of `owner`'s set `name`, resolved where they were written; none when one does not resolve.
+/// The atoms of `owner`'s set `name`, resolved where they were written; none when one does not resolve.
 fn set_atoms_of(checker: Checker, owner: Int, name: Bytes) -> Option<List<Atom>> / {abort.raise} =
   match list_at(checker.modules, owner) {
     None -> None,
@@ -7890,8 +8066,8 @@ fn set_atoms_of(checker: Checker, owner: Int, name: Bytes) -> Option<List<Atom>>
         }),
   }
 
-// Every set this module names: its own and those it imports by name, then those of each module it
-// imports, through the binder.
+/// Every set this module names: its own and those it imports by name, then those of each module it
+/// imports, through the binder.
 fn nameable_sets(checker: Checker) -> List<Nameable> / {abort.raise} = {
   let scope = scope_of(checker);
   let bound = fold(scope.bound.sets, [], |acc: List<Nameable>, b: Binding|
@@ -7919,9 +8095,9 @@ fn set_before(a: Nameable, b: Nameable) -> Bool =
     || (len(a.atoms) == len(b.atoms)
     && (match compare(a.name, b.name) { Less -> true, _ -> false }))
 
-// The sets a written row can name in place of `atoms`: each set every atom of which the row holds,
-// the largest first, and one only when it holds an atom no earlier one does; and the atoms nothing
-// else written covers.
+/// The sets a written row can name in place of `atoms`: each set every atom of which the row holds,
+/// the largest first, and one only when it holds an atom no earlier one does; and the atoms nothing
+/// else written covers.
 fn folded(
   checker: Checker,
   atoms: List<Atom>,
@@ -7949,8 +8125,8 @@ fn folded(
   }
 }
 
-// With no `/` the row is empty: what the body performs or forwards is reported at once, with the
-// row that would write it, naming a set wherever the module can.
+/// With no `/` the row is empty: what the body performs or forwards is reported at once, with the
+/// row that would write it, naming a set wherever the module can.
 fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {abort.raise} = {
   let unclosed_row = resolve_row_in(unclosed, inferred);
   // A tail nothing constrains closes on the empty row; only a row parameter is forwarded.
@@ -8045,9 +8221,9 @@ fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {a
   }
 }
 
-// A bound on the steps a call takes says the call ends, which a row writing `diverges` denies; and
-// it is measured by running the call, which a handler of anything but a raise could change. A row
-// variable is what a function parameter performs, whose steps its cost name stands for.
+/// A bound on the steps a call takes says the call ends, which a row writing `diverges` denies; and
+/// it is measured by running the call, which a handler of anything but a raise could change. A row
+/// variable is what a function parameter performs, whose steps its cost name stands for.
 fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort.raise} = {
   let row = resolve_row_in(checker, sig.published_row);
   let diverges = fold(row.atoms, false, |found: Bool, a: Atom| found || is_diverges(a));
@@ -8097,8 +8273,8 @@ fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort
   )
 }
 
-// A definition whose own recursion is not seen to descend may not return, which its row has to say.
-// Nothing is offered to write: the fix is usually a recursion that descends.
+/// A definition whose own recursion is not seen to descend may not return, which its row has to say.
+/// Nothing is offered to write: the fix is usually a recursion that descends.
 fn unwritten_divergence(
   checker: Checker,
   def: FnDef,
@@ -8351,7 +8527,7 @@ fn numeric_mismatch(
     [b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`"],
   )
 
-// The resolved type, rendered, when the signature's generics bind every variable in it, so the author can paste it.
+/// The resolved type, rendered, when the signature's generics bind every variable in it, so the author can paste it.
 fn writable(checker: Checker, signature: Signature, t: Type) -> Option<Bytes> / {abort.raise} = {
   let resolved = resolve(checker, t);
   let bound = map_fold(signature.ty_params, [], |acc: List<Int>, k: Bytes, p: Type|
@@ -8425,7 +8601,7 @@ fn close_unreachable_row(checker: Checker, signature: Signature) -> Checker / {a
 
 // --- Tests and laws --------------------------------------------------------------------------------
 
-// A cached footprint carries the determinism verdict: an effect's `nondet` marker is part of its declaration's hash.
+/// A cached footprint carries the determinism verdict: an effect's `nondet` marker is part of its declaration's hash.
 fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let walked = fold(
     parsed.module.items,
@@ -8542,8 +8718,8 @@ fn check_test_answer(checker: Checker, def: TestDef, ty: Type) -> Checker / {abo
 fn tail_value(expr: Expr) -> Expr =
   match expr { EBlock(b) -> match b.tail { Some(t) -> tail_value(t), None -> expr }, _ -> expr }
 
-// A test's cases are listed before any of them runs, where nothing answers an effect: the table
-// and the label may raise, and perform nothing else.
+/// A test's cases are listed before any of them runs, where nothing answers an effect: the table
+/// and the label may raise, and perform nothing else.
 fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abort.raise} = {
   let o: Inferred = infer(checker, test_listing(cases));
   let c = o.checker;
@@ -8631,7 +8807,7 @@ fn check_determinism(
       },
     })
 
-// A clause the reader could paste, for the operation the atom names.
+/// A clause the reader could paste, for the operation the atom names.
 fn example_clause(checker: Checker, info: EffectInfo, atom: Atom) -> Bytes / {abort.raise} = {
   let written = as_written(checker, info.name);
   let named = match atom.resource {
@@ -8706,8 +8882,8 @@ fn check_laws(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise}
   walked.checker
 }
 
-// A law a `cost` clause made repeats the clause, which was checked first with the definition's
-// header: what it finds wrong is already said there, or is that it cannot be made of the parameters.
+/// A law a `cost` clause made repeats the clause, which was checked first with the definition's
+/// header: what it finds wrong is already said there, or is that it cannot be made of the parameters.
 fn made_of_clause(before: Checker, after: Checker, def: LawDef) -> Checker =
   if def.costs == None || len(after.diags) == len(before.diags) { after } else {
     // From the definition's name to the clause: its parameters and their cost names among it.
@@ -8730,7 +8906,7 @@ fn made_of_clause(before: Checker, after: Checker, def: LawDef) -> Checker =
     }
   }
 
-// `{:?}` over a label: quoted, with `"` and `\` escaped.
+/// `{:?}` over a label: quoted, with `"` and `\` escaped.
 fn debug_quoted(s: Bytes) -> Bytes / {abort.raise} =
   bytes_concat_all([
     b"\"",
@@ -8747,12 +8923,12 @@ fn debug_quoted(s: Bytes) -> Bytes / {abort.raise} =
     b"\"",
   ])
 
-// What a cost law's body answers at each size: the steps it took, beside its bound there.
+/// What a cost law's body answers at each size: the steps it took, beside its bound there.
 pub fn measure_ty() -> Type / {abort.raise} =
   TyRecord(fields_sorted([{ name: b"bound", ty: int_type() }, { name: b"steps", ty: int_type() }]))
 
-// A cost law is run at sizes its one `Int` binder takes, so it binds exactly one, and measures what
-// the program does, never what a host does.
+/// A cost law is run at sizes its one `Int` binder takes, so it binds exactly one, and measures what
+/// the program does, never what a host does.
 fn sized(checker: Checker, def: LawDef, tys: List<Type>) -> Checker = {
   let refuse = |why: Bytes|
     report_error_at(checker, b"E0463", def.name_span, why, b"a cost law ranges over one size", [
@@ -8867,8 +9043,8 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
   }
 }
 
-// A binder's type must be one the generator can inhabit: no handler, written row beyond a raise,
-// `Cell`, `Task` or `Secret`.
+/// A binder's type must be one the generator can inhabit: no handler, written row beyond a raise,
+/// `Cell`, `Task` or `Secret`.
 fn law_binder(checker: Checker, binder: Binder) -> { checker: Checker, ty: Type } / {abort.raise} =
   match handler_mention(checker, binder.ty) {
     Some(span) ->
@@ -8910,7 +9086,7 @@ fn unquantifiable(checker: Checker, binder: Binder, reason: Bytes) -> Checker =
     ],
   )
 
-// The raw variable, not the printer's letter.
+/// The raw variable, not the printer's letter.
 fn row_display(row: Row) -> Bytes / {abort.raise} = {
   let atoms = bytes::join(map(row.atoms, atom_text), b", ");
   match row.tail {
@@ -8961,35 +9137,39 @@ fn first_reason<a | e>(xs: List<a>, f: (a) -> Option<Bytes> / e) -> Option<Bytes
 
 fn raises(atom: AtomExpr) -> Bool = is_bare(atom.eff) && atom.eff.name.name == b"abort"
 
+/// A function's row, or the row a declared type is given for the functions it holds.
+fn law_row_reason(row: RowExpr) -> Option<Bytes> =
+  match row.tail {
+    Some(_) ->
+      Some(
+        b"an effect variable has no binder here, and a law quantifies over values rather than over rows",
+      ),
+    None -> match list_at(filter(row.atoms, |a: AtomExpr| !raises(a)), 0) {
+      Some(a) ->
+        Some(
+          bytes_concat_all([
+            b"applying this inside the body would perform `",
+            qname_text(a.eff),
+            b"`, and a law body is pure",
+          ]),
+        ),
+      None -> None,
+    },
+  }
+
 fn written_row_reason(ty: TypeExpr) -> Option<Bytes> =
   match ty {
     TVar(_) -> None,
     TUnit(_) -> None,
     TBad(_) -> None,
-    TCon(c) -> first_reason(c.args, written_row_reason),
+    TCon(c) -> match first_reason(c.rows, law_row_reason) {
+      Some(r) -> Some(r),
+      None -> first_reason(c.args, written_row_reason),
+    },
     TRecord(r) ->
       first_reason(r.fields, |f: { name: Ident, ty: TypeExpr }| written_row_reason(f.ty)),
     TFn(f) -> {
-      let own = match f.effects {
-        Some(row) -> match row.tail {
-          Some(_) ->
-            Some(
-              b"an effect variable has no binder here, and a law quantifies over values rather than over rows",
-            ),
-          None -> match list_at(filter(row.atoms, |a: AtomExpr| !raises(a)), 0) {
-            Some(a) ->
-              Some(
-                bytes_concat_all([
-                  b"applying this inside the body would perform `",
-                  qname_text(a.eff),
-                  b"`, and a law body is pure",
-                ]),
-              ),
-            None -> None,
-          },
-        },
-        None -> None,
-      };
+      let own = match f.effects { Some(row) -> law_row_reason(row), None -> None };
       match own {
         Some(_) -> own,
         None -> match first_reason(f.params, written_row_reason) {
@@ -9003,8 +9183,8 @@ fn written_row_reason(ty: TypeExpr) -> Option<Bytes> =
 fn ungeneratable(checker: Checker, ty: Type) -> Option<Bytes> / {abort.raise} =
   ungeneratable_within(checker, ty, [], len(checker.ctors))
 
-// `room` is how many more declared types the walk may enter: a path enters each one once, and each
-// has a constructor.
+/// `room` is how many more declared types the walk may enter: a path enters each one once, and each
+/// has a constructor.
 fn ungeneratable_within(
   checker: Checker,
   ty: Type,
@@ -9038,7 +9218,12 @@ fn ungeneratable_within(
         },
       }
     },
-    TyFn(f) -> if !row_is_pure_but_raise(f.effects) {
+    // A binder writes no row variable, so one here is a declared type's own row parameter.
+    TyFn(f) -> if f.effects.tail != None {
+      Some(
+        b"a function a declared type holds under its row parameter is not generated, whatever row the type is given",
+      )
+    } else if !row_is_pure_but_raise(f.effects) {
       Some(
         bytes_concat_all([
           b"a function with row ",
@@ -9077,7 +9262,7 @@ fn site_short(s: SpecSite) -> Bytes =
     InLawBody -> b"law body",
   }
 
-// Every atom past the allowed set is `E0417`, and an open row too.
+/// Every atom past the allowed set is `E0417`, and an open row too.
 fn check_spec_purity(
   checker: Checker,
   site: SpecSite,
@@ -9233,7 +9418,7 @@ fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
   { ..walked, ty_params: map_new(), row_params: map_new() }
 }
 
-// A clause's scope: the parameters, and what the body assumes, its definition's constraints.
+/// A clause's scope: the parameters, and what the body assumes, its definition's constraints.
 fn spec_scope(checker: Checker, def: FnDef, env: SpecEnv) -> Checker / {abort.raise} = {
   let c0: Checker = {
     ..checker,
@@ -9329,7 +9514,7 @@ fn check_clause(
   }
 }
 
-// A cost name is introduced beside the parameters, so one named like a parameter or another is reported.
+/// A cost name is introduced beside the parameters, so one named like a parameter or another is reported.
 fn check_cost_names(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
   fold(range(0, len(def.params)), checker, |c: Checker, i: Int|
     match at(def.params, i).cost {
@@ -9360,7 +9545,7 @@ fn check_cost_names(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
       },
     })
 
-// `result` is introduced beside the parameters, so a definition that has both is reported.
+/// `result` is introduced beside the parameters, so a definition that has both is reported.
 fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
   match fold(def.spec, None, |acc: Option<Span>, c: SpecClause|
       match acc {
@@ -9388,51 +9573,33 @@ fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
 // The one predicate a `where` clause, a `Map` key type and a `derive` ask.
 
 type Blocked = { ty: Type, why: DeriveRefusal }
-type AlgebraicShape = { name: Bytes, params: List<Int>, fields: List<Type> }
+/// `params` are the type's type and label variables and `rows` its row variables, in the order a
+/// use's arguments ride.
+type AlgebraicShape = { name: Bytes, params: List<Int>, rows: List<Int>, fields: List<Type> }
 
-// Every sum type this run declared, flattened: its parameters and every field of every variant.
+/// Every sum type this run declared, flattened: its parameters and every field of every variant.
 fn algebraic_shapes(checker: Checker) -> List<AlgebraicShape> / {abort.raise} =
   fold(checker.ctors, [], |acc: List<AlgebraicShape>, ctor_info: CtorInfo| {
     let i = fold(range(0, len(acc)), 0 - 1, |p: Int, j: Int|
       if p >= 0 { p } else if at(acc, j).name == ctor_info.type_name { j } else { p });
     if i < 0 {
+      let scheme = ctor_info.scheme;
       push(acc, {
         name: ctor_info.type_name,
-        params: ctor_info.scheme.ty_vars,
+        params: if len(scheme.label_vars) == 0 { scheme.ty_vars }
+        else { concat(scheme.ty_vars, scheme.label_vars) },
+        rows: scheme.row_vars,
         fields: ctor_info.fields,
       })
     } else {
       let a = at(acc, i);
-      list_set(acc, i, {
-        name: a.name,
-        params: a.params,
-        fields: concat(a.fields, ctor_info.fields),
-      })
+      list_set(acc, i, { ..a, fields: concat(a.fields, ctor_info.fields) })
     }
   })
 
 fn find_adt(adts: List<AlgebraicShape>, name: Bytes) -> Option<AlgebraicShape> =
   fold(adts, None, |acc: Option<AlgebraicShape>, a: AlgebraicShape|
     match acc { Some(_) -> acc, None -> if a.name == name { Some(a) } else { None } })
-
-fn substitute_ty(t: Type, params: List<Int>, args: List<Type>) -> Type / {abort.raise} =
-  match t {
-    TyVar(v) -> {
-      let i = fold(range(0, len(params)), 0 - 1, |p: Int, j: Int|
-        if p >= 0 { p } else if at(params, j) == v { j } else { p });
-      if i < 0 || i >= len(args) { t } else { at(args, i) }
-    },
-    TyCon(c) ->
-      TyCon({ name: c.name, args: map(c.args, |a: Type| substitute_ty(a, params, args)) }),
-    TyFn(f) ->
-      TyFn({
-        params: map(f.params, |p: Type| substitute_ty(p, params, args)),
-        ret: substitute_ty(f.ret, params, args),
-        effects: f.effects,
-      }),
-    TyRecord(fs) ->
-      TyRecord(map(fs, |f: Field| { name: f.name, ty: substitute_ty(f.ty, params, args) })),
-  }
 
 fn json_null_encoded(ty: Type) -> Bool =
   match ty { TyCon(c) -> null_encoded_name(c.name), _ -> false }
@@ -9458,7 +9625,7 @@ fn first_blocked(
       None -> derivable_within(deriver, ty, adts, assumed, visiting, room),
     })
 
-// `room` is how many more declared types the walk may enter: a path enters each one once.
+/// `room` is how many more declared types the walk may enter: a path enters each one once.
 fn derivable_within(
   deriver: Deriver,
   ty: Type,
@@ -9484,7 +9651,7 @@ fn derivable_within(
             Some(adt) -> if room <= 0 { panic("a type entered twice on one path") } else {
               first_blocked(
                 deriver,
-                map(adt.fields, |f: Type| substitute_ty(f, adt.params, c.args)),
+                map(adt.fields, |f: Type| at_arguments(f, adt.params, adt.rows, c.args)),
                 adts,
                 assumed,
                 push(visiting, c.name),
@@ -9496,7 +9663,7 @@ fn derivable_within(
     },
   }
 
-// A flexible variable is a type argument nothing pinned rather than one that is wrong.
+/// A flexible variable is a type argument nothing pinned rather than one that is wrong.
 fn skipped_flexible(checker: Checker, b: Blocked) -> Bool =
   match b.why { Unconstrained(v) -> !is_rigid_ty(checker.subst, v), _ -> false }
 
@@ -9506,10 +9673,10 @@ fn secret_notes(deriver: Deriver) -> List<Bytes> =
     None -> [secret_reason(deriver)],
   }
 
-// The simple name of the handle type a `HoldsHandle` refused: `Cell` or `Task`.
+/// The simple name of the handle type a `HoldsHandle` refused: `Cell` or `Task`.
 fn handle_what(ty: Type) -> Bytes = match ty { TyCon(c) -> c.name, _ -> b"" }
 
-// The parameter name a refused rigid variable was declared under, else the rendered variable.
+/// The parameter name a refused rigid variable was declared under, else the rendered variable.
 fn param_name(params: List<RigidParam>, v: Int, fallback: Bytes) -> Bytes =
   fold(params, fallback, |acc: Bytes, p: RigidParam| if p.var == v { p.name } else { acc })
 
@@ -9594,7 +9761,7 @@ fn rigid_params(checker: Checker) -> List<RigidParam> =
   map_fold(checker.ty_params, [], |acc: List<RigidParam>, k: Bytes, ty: Type|
     match ty { TyVar(v) -> push(acc, { name: k, var: v }), _ -> acc })
 
-// `integer(a)` implies `numeric(a)`, so a numeric obligation also holds of an integer parameter.
+/// `integer(a)` implies `numeric(a)`, so a numeric obligation also holds of an integer parameter.
 fn assumed_for(checker: Checker, deriver: Deriver) -> List<Int> / {abort.raise} =
   fold(checker.assumed, [], |acc: List<Int>, a: Assumed|
     if same_deriver(a.deriver, deriver)
@@ -9614,7 +9781,7 @@ fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
     TyVar(_) -> out,
   }
 
-// Every `Map` in a type as it was written or instantiated, judged once the module is solved.
+/// Every `Map` in a type as it was written or instantiated, judged once the module is solved.
 fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} = {
   let found = map_key_types(ty, []);
   if len(found) == 0 { checker } else {
@@ -9642,7 +9809,7 @@ fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.rai
 fn from_index(sites: List<MapKeySite>, from: Int) -> List<MapKeySite> / {abort.raise} =
   fold(range(from, len(sites)), [], |acc: List<MapKeySite>, i: Int| push(acc, at(sites, i)))
 
-// The sites an alias expansion recorded from `from` on, moved to where the alias was named.
+/// The sites an alias expansion recorded from `from` on, moved to where the alias was named.
 fn relocated_keys(
   sites: List<MapKeySite>,
   from: Int,
@@ -9655,7 +9822,7 @@ fn relocated_keys(
     list_set(acc, i, { ..s, module: module, span: span, via: alias })
   })
 
-// A reference that instantiated a parameter its callee constrained.
+/// A reference that instantiated a parameter its callee constrained.
 fn note_constraints(
   checker: Checker,
   span: Span,
@@ -9690,8 +9857,8 @@ fn note_constraints(
     },
   }
 
-// The reference a call applies was a call, not a value: its constraint sites, the last ones
-// recorded, say so.
+/// The reference a call applies was a call, not a value: its constraint sites, the last ones
+/// recorded, say so.
 fn called(checker: Checker, span: Span) -> Checker / {abort.raise} = {
   let n = len(checker.constrained_uses);
   let marked = iterate(
@@ -9715,7 +9882,7 @@ fn called(checker: Checker, span: Span) -> Checker / {abort.raise} = {
   { ..checker, constrained_uses: marked.uses, group_refs: refs }
 }
 
-// The type parameters a definition's `numeric` and `integer` constraints make witnesses of.
+/// The type parameters a definition's `numeric` and `integer` constraints make witnesses of.
 fn witnessing(checker: Checker, cs: List<Constraint>) -> Checker =
   fold(cs, checker, |c: Checker, k: Constraint|
     if !is_predicate(k.deriver) { c } else {
@@ -9852,7 +10019,7 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   walked.checker
 }
 
-// What `numeric(a)` or `integer(a)` was instantiated at, as the witness the call passes.
+/// What `numeric(a)` or `integer(a)` was instantiated at, as the witness the call passes.
 fn predicate_witness(site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
   match ty {
     TyCon(k) -> if len(k.args) != 0 { None }
@@ -9870,8 +10037,8 @@ fn predicate_witness(site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
     _ -> None,
   }
 
-// A predicate's site: the callee is called, the type admits the predicate, and the witness it
-// passes joins the others the same call passes, in the callee's order and once per parameter.
+/// A predicate's site: the callee is called, the type admits the predicate, and the witness it
+/// passes joins the others the same call passes, in the callee's order and once per parameter.
 fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker / {abort.raise} = {
   let callee = default_binder(site.callee);
   let dv = deriver_text(site.deriver);
@@ -9986,7 +10153,7 @@ fn expanded_here(parsed: ParsedModule, def: DeriveDef) -> Bool =
   fold(parsed.derived, false, |acc: Bool, d: Derived|
     acc || (same_deriver(d.deriver, def.deriver) && d.target == def.target.name))
 
-// The target as a solved type when it has no parameters; an alias's reports are dropped, already made at its declaration.
+/// The target as a solved type when it has no parameters; an alias's reports are dropped, already made at its declaration.
 fn derive_target(
   checker: Checker,
   parsed: ParsedModule,
@@ -9995,7 +10162,8 @@ fn derive_target(
   let qualified = qualify(parsed.name, target);
   match map_get(checker.types, qualified) {
     None -> None,
-    Some(decl) -> if len(decl.params) > 0 { None } else {
+    Some(decl) -> if len(decl.params) > 0 || len(decl.labels) > 0 || len(decl.rows) > 0 { None }
+    else {
       match decl.alias {
         None -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
         Some(alias) -> {
@@ -10003,6 +10171,8 @@ fn derive_target(
           let inner: Checker = {
             ..checker,
             ty_params: map_new(),
+            row_params: map_new(),
+            label_params: map_new(),
             alias_stack: push(checker.alias_stack, qualified),
             module: decl.owner,
           };
@@ -10011,6 +10181,8 @@ fn derive_target(
             checker: {
               ..o.checker,
               ty_params: checker.ty_params,
+              row_params: checker.row_params,
+              label_params: checker.label_params,
               alias_stack: checker.alias_stack,
               module: checker.module,
               diags: take(o.checker.diags, mark),
@@ -10049,7 +10221,7 @@ fn why_notes_for_derive(
     Unconstrained(_) -> [],
   }
 
-// `derivable(D, T)` over each `derive`'s target as a solved type.
+/// `derivable(D, T)` over each `derive`'s target as a solved type.
 fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
   let adts = algebraic_shapes(checker);
   fold(range(0, len(checker.modules)), checker, |c: Checker, i: Int| {
@@ -10100,7 +10272,7 @@ fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
-// Anything a generated definition failed on, other than a name it could not see, is Ply's fault.
+/// Anything a generated definition failed on, other than a name it could not see, is Ply's fault.
 fn attribute_generated(checker: Checker) -> Checker / {abort.raise} = {
   let spans = fold(range(0, len(checker.modules)), [], |acc: List<Label>, i: Int|
     fold(at(checker.modules, i).derived, acc, |labels: List<Label>, d: Derived|
@@ -10142,9 +10314,10 @@ fn attribute_generated(checker: Checker) -> Checker / {abort.raise} = {
 
 // --- Comparisons, simulations and regions, once the module is solved ------------------------------
 
+/// A row a declared type is given is no function: the ones it holds are its fields'.
 fn contains_fn(t: Type) -> Bool =
   match t {
-    TyFn(_) -> true,
+    TyFn(_) -> !over_arg(t),
     TyCon(c) -> fold(c.args, false, |b: Bool, a: Type| b || contains_fn(a)),
     TyRecord(fs) -> fold(fs, false, |b: Bool, field: Field| b || contains_fn(field.ty)),
     TyVar(_) -> false,
@@ -10180,8 +10353,8 @@ fn is_dummy(span: Span) -> Bool = span.start == 0 && span.end == 0
 fn encloses(outer: Span, inner: Span) -> Bool =
   !is_dummy(outer) && !is_dummy(inner) && outer.start <= inner.start && inner.end <= outer.end
 
-// Branches run at once, so no two may touch one resource where either writes. A label parameter or
-// `[*]` may be any label, and a row variable any row.
+/// Branches run at once, so no two may touch one resource where either writes. A label parameter or
+/// `[*]` may be any label, and a row variable any row.
 fn check_parallels(checker: Checker) -> Checker / {abort.raise} =
   fold(checker.parallels, { ..checker, parallels: [] }, |c: Checker, site: ParallelSite| {
     let rows = map(site.branches, |b: { span: Span, row: Row }|
@@ -10206,8 +10379,8 @@ type Refusal = {
   notes: List<Bytes>,
 }
 
-// What keeps a block's branches from running at once: a region's schedule, a task's scheduler, or
-// a resource two of them touch.
+/// What keeps a block's branches from running at once: a region's schedule, a task's scheduler, or
+/// a resource two of them touch.
 fn refusal(rows: List<Branch>) -> Option<Refusal> / {abort.raise} = {
   let seed = seed_atom();
   let performing = |pick: (Atom) -> Bool|
@@ -10332,10 +10505,10 @@ fn check_simulations(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
-// A task and a channel are keys into the scheduler of the region that made them.
+/// A task and a channel are keys into the scheduler of the region that made them.
 fn scheduler_handle(name: Bytes) -> Bool = name == b"Task" || name == b"Chan"
 
-// A closure's captures are not in its type, and a cell's contents enter a region only when read.
+/// A closure's captures are not in its type, and a cell's contents enter a region only when read.
 fn holds_task(t: Type) -> Bool =
   match t {
     TyCon(c) ->
@@ -10346,7 +10519,7 @@ fn holds_task(t: Type) -> Bool =
     TyVar(_) -> false,
   }
 
-// What a refusal says of the scheduler key `t` holds: a task, or else a channel.
+/// What a refusal says of the scheduler key `t` holds: a task, or else a channel.
 type Keyed = { noun: Bytes, made: Bytes, numbered: Bytes, kept: Bytes }
 
 fn keyed(ty: Type) -> Keyed =
@@ -10366,7 +10539,7 @@ fn keyed(ty: Type) -> Keyed =
     }
   }
 
-// Whether `t` holds a `name`, in its shape or as the operations a closure's row shows for one.
+/// Whether `t` holds a `name`, in its shape or as the operations a closure's row shows for one.
 fn holds_con(t: Type, name: Bytes) -> Bool =
   match t {
     TyCon(c) -> c.name == name || fold(c.args, false, |b: Bool, a: Type| b || holds_con(a, name)),
@@ -10430,7 +10603,7 @@ fn check_entering(checker: Checker, site: Simulation) -> Checker / {abort.raise}
       ],
     ))
 
-// A region that also writes the cell is refused for the write, whose remedy covers the read.
+/// A region that also writes the cell is refused for the write, whose remedy covers the read.
 fn check_older_reads(checker: Checker, site: Simulation) -> Checker / {abort.raise} =
   fold(site.older, checker, |c: Checker, opened: Opened|
     match first_access(site.reads, opened.name) {
@@ -10510,7 +10683,7 @@ fn check_simulation_exits(checker: Checker, site: Simulation) -> Checker / {abor
   }
 }
 
-// `Task` is written in types, so a store into a cell typed to hold one shows only as the write.
+/// `Task` is written in types, so a store into a cell typed to hold one shows only as the write.
 fn check_older_writes(checker: Checker, site: Simulation) -> Checker / {abort.raise} =
   fold(site.older, checker, |c: Checker, opened: Opened|
     match first_access(site.writes, opened.name) {
@@ -10654,8 +10827,8 @@ fn nested_simulation(checker: Checker, site: Simulation, sites: List<Simulation>
 fn task_op(op: Bytes) -> Atom =
   { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(op) }
 
-// A cell is reached by atoms naming its region; a task only by a join, an await or a cancel, a
-// channel by a send, a receive or a close, and either by a `simulate` around one.
+/// A cell is reached by atoms naming its region; a task only by a join, an await or a cancel, a
+/// channel by a send, a receive or a close, and either by a `simulate` around one.
 fn row_brands(row: Row, brand: Brand) -> Bool =
   match brand {
     CellsOf(r) ->
@@ -10669,7 +10842,7 @@ fn row_brands(row: Row, brand: Brand) -> Bool =
       ),
   }
 
-// Whether a resolved type carries a region's brand, by either route a brand travels.
+/// Whether a resolved type carries a region's brand, by either route a brand travels.
 fn brand_in(t: Type, brand: Brand) -> Bool / {abort.raise} =
   match t {
     TyVar(_) -> false,
@@ -10683,7 +10856,7 @@ fn brand_in(t: Type, brand: Brand) -> Bool / {abort.raise} =
     TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || brand_in(f.ty, brand)),
   }
 
-// Whether the brand reached this type through a function's row rather than through its shape.
+/// Whether the brand reached this type through a function's row rather than through its shape.
 fn carries_brand_in_row(t: Type, brand: Brand) -> Bool =
   match t {
     TyVar(_) -> false,
@@ -10702,7 +10875,7 @@ fn check_regions(checker: Checker) -> Checker / {abort.raise} =
       site,
     ))
 
-// The value the region evaluates to; a `with_cell` reports the escape as `E0201`.
+/// The value the region evaluates to; a `with_cell` reports the escape as `E0201`.
 fn check_region_exits(checker: Checker, site: RegionSite) -> Checker / {abort.raise} = {
   let ty = resolve(checker, site.body_ty);
   let n = site.name;
@@ -10872,7 +11045,7 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
     }
   })
 
-// The first clause around a spawn that its task can perform against and that reaches region `n`.
+/// The first clause around a spawn that its task can perform against and that reaches region `n`.
 fn reaching_clause(
   checker: Checker,
   task: Type,
@@ -10887,7 +11060,7 @@ fn reaching_clause(
       } else { None },
     })
 
-// On any label: an open row may perform anything.
+/// On any label: an open row may perform anything.
 fn may_perform(task: Type, op: Atom) -> Bool =
   match task {
     TyFn(f) ->
@@ -11026,7 +11199,7 @@ type Checked = { checker: Checker, ok: Bool }
 pub fn check_program(resolved: Resolved, mods: List<ParsedModule>) -> Checked / {abort.raise} =
   check_program_with(resolved, mods, no_known())
 
-// Every diagnostic, deduplicated, when any is an error; a warning alone is not one.
+/// Every diagnostic, deduplicated, when any is an error; a warning alone is not one.
 pub fn check_diagnostics(
   resolved: Resolved,
   mods: List<ParsedModule>,
@@ -11035,7 +11208,7 @@ pub fn check_diagnostics(
   if has_error(out.checker.diags) { dedup_diags(out.checker.diags) } else { [] }
 }
 
-// What `check_program` publishes, prelude entries included, or the diagnostics when any is an error.
+/// What `check_program` publishes, prelude entries included, or the diagnostics when any is an error.
 pub type CheckOutput = {
   ok: Bool,
   diags: List<Diag>,
@@ -11044,16 +11217,16 @@ pub type CheckOutput = {
   laws: List<LawInfo>,
   effects: List<EffectInfo>,
   ctors: List<CtorInfo>,
-  // The definitions published from the rows handed in rather than from a walk of their bodies.
+  /// The definitions published from the rows handed in rather than from a walk of their bodies.
   seeded: List<Bytes>,
-  // The same for tests, by key.
+  /// The same for tests, by key.
   seeded_tests: List<Bytes>,
-  // The check key of each definition the driver handed a keying for, and of each test in `tests`'
-  // order: what its rows are filed under.
+  /// The check key of each definition the driver handed a keying for, and of each test in `tests`'
+  /// order: what its rows are filed under.
   checks: List<{ name: Bytes, hash: Bytes }>,
   test_checks: List<Bytes>,
-  // What the emitter reads of the bodies walked, and of each body published from its rows what
-  // those rows held, so no body it lowers is walked again.
+  /// What the emitter reads of the bodies walked, and of each body published from its rows what
+  /// those rows held, so no body it lowers is walked again.
   facts: EmitFacts,
   kept: List<KeptFacts>,
 }
@@ -11085,12 +11258,12 @@ pub fn check_front_with(
   }
 }
 
-// The one purity the root keys, the emitter's constant table and the seam's memo all read.
+/// The one purity the root keys, the emitter's constant table and the seam's memo all read.
 pub fn published_pure(def_info: DefInfo) -> Bool =
   len(without_abort(def_info.footprint)) == 0 && len(def_info.constraints) == 0
 
-// What the emitter needs from the checker: the definitions published pure, for its constant table,
-// the labels every call fills, the shape of every record update, and every operator's operand type.
+/// What the emitter needs from the checker: the definitions published pure, for its constant table,
+/// the labels every call fills, the shape of every record update, and every operator's operand type.
 pub type EmitFacts = {
   pure: List<Bytes>,
   label_sites: List<LabelSite>,
@@ -11098,8 +11271,8 @@ pub type EmitFacts = {
   operands: List<OperandSite>,
 }
 
-// What lowering reads that only the checker knows: the shape of every record update, and where a
-// `numeric` or `integer` parameter's witness is read and what each call passes for it.
+/// What lowering reads that only the checker knows: the shape of every record update, and where a
+/// `numeric` or `integer` parameter's witness is read and what each call passes for it.
 pub type Elaboration = {
   updates: List<UpdateShape>,
   ops: List<WitnessOp>,
@@ -11133,7 +11306,7 @@ derive bin for WitnessOrder
 derive bin for Elaboration
 derive bin for EmitFacts
 
-// What the emitter reads of one body: the sites a walk of it recorded.
+/// What the emitter reads of one body: the sites a walk of it recorded.
 pub type RootFacts = {
   label_sites: List<LabelSite>,
   updates: List<UpdateShape>,
@@ -11150,8 +11323,8 @@ pub fn no_root_facts() -> RootFacts =
 fn owned(m: Map<Bytes, RootFacts>, owner: Bytes) -> RootFacts =
   match map_get(m, owner) { Some(f) -> f, None -> no_root_facts() }
 
-// Every site a walk recorded, under the definition or test whose body it was walking; a clause's
-// and a law's are under the empty name.
+/// Every site a walk recorded, under the definition or test whose body it was walking; a clause's
+/// and a law's are under the empty name.
 pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
   let labelled = fold(facts.label_sites, map_new(), |m: Map<Bytes, RootFacts>, x: LabelSite| {
     let f = owned(m, x.owner);
@@ -11185,7 +11358,7 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
 
 fn moved_span(span: Span, by: Int) -> Span = { start: span.start + by, end: span.end + by }
 
-// `facts` with every span moved by `by` and filed under `owner` in `module`.
+/// `facts` with every span moved by `by` and filed under `owner` in `module`.
 fn placed_facts(facts: RootFacts, module: Int, by: Int, owner: Bytes) -> RootFacts =
   {
     label_sites: map(facts.label_sites, |x: LabelSite|
@@ -11209,22 +11382,22 @@ fn all_within(facts: RootFacts, at: Span) -> Bool =
     && fold(facts.refs, true, |b: Bool, x: WitnessRef| b && within(x.span, at))
     && fold(facts.operands, true, |b: Bool, x: OperandSite| b && within(x.span, at))
 
-// One body's sites as its row files them, behind a byte that says how. Each span is counted from
-// where the body's definition starts, so they hold wherever the definition moves to. A site
-// outside the definition's own text is foreign: a default argument is written at its callee's
-// positions and stands in the caller's body at those. A body that holds one is filed as it
-// stands, and holds only while neither module's text moves.
+/// One body's sites as its row files them, behind a byte that says how. Each span is counted from
+/// where the body's definition starts, so they hold wherever the definition moves to. A site
+/// outside the definition's own text is foreign: a default argument is written at its callee's
+/// positions and stands in the caller's body at those. A body that holds one is filed as it
+/// stands, and holds only while neither module's text moves.
 pub fn filed_facts(facts: RootFacts, at: Span) -> Bytes / {abort.raise} =
   if all_within(facts, at) {
     bytes_concat(b"\x00", bin::encode(placed_facts(facts, 0, 0 - at.start, b""), root_facts_bin()))
   } else { bytes_concat(b"\x01", bin::encode(placed_facts(facts, 0, 0, b""), root_facts_bin())) }
 
-// Whether a row's facts are of a body that holds a foreign site, or are no facts at all.
+/// Whether a row's facts are of a body that holds a foreign site, or are no facts at all.
 pub fn foreign_facts(filed: Bytes) -> Bool / {abort.raise} =
   bytes_len(filed) == 0 || bytes_at(filed, 0) != 0
 
-// A row's facts read back for the definition that now starts at `start` in `module`; none for
-// bytes that are no facts.
+/// A row's facts read back for the definition that now starts at `start` in `module`; none for
+/// bytes that are no facts.
 pub fn facts_at(
   filed: Bytes,
   module: Int,
@@ -11252,7 +11425,7 @@ fn facts_of(checker: Checker) -> EmitFacts / {abort.raise} =
 fn operand_name(ty: Type) -> Bytes =
   match ty { TyCon(k) -> if len(k.args) == 0 { k.name } else { b"" }, _ -> b"" }
 
-// The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
+/// The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
 pub fn elaboration(
   resolved: Resolved,
   mods: List<ParsedModule>,
@@ -11261,8 +11434,8 @@ pub fn elaboration(
   if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
 }
 
-// The elaboration, and the definitions whose calls the checker saw end, which are the recursive
-// ones a proof may unroll.
+/// The elaboration, and the definitions whose calls the checker saw end, which are the recursive
+/// ones a proof may unroll.
 pub type Elaborated = { elaboration: Elaboration, ends: Map<Bytes, Bool>, stated: Map<Bytes, Bool> }
 
 pub fn elaborated(
@@ -11283,13 +11456,13 @@ pub fn ended(defs: List<DefInfo>) -> Map<Bytes, Bool> =
   fold(defs, map_new(), |acc: Map<Bytes, Bool>, def_info: DefInfo|
     match def_info.ending { Ends -> map_insert(acc, def_info.name, true), _ -> acc })
 
-// The ones whose group descends only once the measures it states are counted: a proof owes those.
+/// The ones whose group descends only once the measures it states are counted: a proof owes those.
 pub fn stated(defs: List<DefInfo>) -> Map<Bytes, Bool> =
   fold(defs, map_new(), |acc: Map<Bytes, Bool>, def_info: DefInfo|
     match def_info.ending { Stated -> map_insert(acc, def_info.name, true), _ -> acc })
 
-// The same, with the definitions `known` holds rows for published from them rather than walked: only
-// a walked body's updates are shaped.
+/// The same, with the definitions `known` holds rows for published from them rather than walked: only
+/// a walked body's updates are shaped.
 pub fn elaboration_with(
   resolved: Resolved,
   mods: List<ParsedModule>,
@@ -11299,14 +11472,14 @@ pub fn elaboration_with(
   if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
 }
 
-// One module's shapes, keyed by the update's span, as `expand_record_updates` reads them.
+/// One module's shapes, keyed by the update's span, as `expand_record_updates` reads them.
 fn shapes_in(all: List<UpdateShape>, module: Int) -> Map<Bytes, List<Bytes>> =
   fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, s: UpdateShape|
     if s.module != module { acc } else { map_insert(acc, span_key(s.span), s.names) })
 
-// The modules with every record update written out as the literal it stands for, and every
-// `numeric` or `integer` parameter's witness passed and read: what the emitter lowers, and what
-// only the checker knows.
+/// The modules with every record update written out as the literal it stands for, and every
+/// `numeric` or `integer` parameter's witness passed and read: what the emitter lowers, and what
+/// only the checker knows.
 pub fn expanded_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
@@ -11325,8 +11498,8 @@ pub fn expanded_mods(
     }
   })
 
-// The modules with every record update written out and no witness passed: what a claim lowers,
-// since the prover draws every type parameter as `Int` and reads an operator over one as `Int`'s.
+/// The modules with every record update written out and no witness passed: what a claim lowers,
+/// since the prover draws every type parameter as `Int` and reads an operator over one as `Int`'s.
 pub fn updated_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
@@ -11344,7 +11517,7 @@ fn ops_in(all: List<WitnessOp>, module: Int) -> Map<Bytes, Bytes> =
   fold(all, map_new(), |acc: Map<Bytes, Bytes>, o: WitnessOp|
     if o.module != module { acc } else { map_insert(acc, span_key(o.span), o.param) })
 
-// A call's witnesses in its callee's scheme order, the order its witness parameters take.
+/// A call's witnesses in its callee's scheme order, the order its witness parameters take.
 fn refs_in(all: List<WitnessRef>, module: Int) -> Map<Bytes, List<NumericWitness>> / {abort.raise} =
   fold(all, map_new(), |acc: Map<Bytes, List<NumericWitness>>, r: WitnessRef|
     if r.module != module { acc } else {
@@ -11361,7 +11534,7 @@ fn orders_in(all: List<WitnessOrder>, module: Int) -> Map<Bytes, List<Bytes>> =
   fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, o: WitnessOrder|
     if o.module != module { acc } else { map_insert(acc, o.name, o.params) })
 
-// Every use of a label-generic definition is a call, and every call fills its labels.
+/// Every use of a label-generic definition is a call, and every call fills its labels.
 fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
   let out: Checker = fold(checker.label_apps, checker, |c: Checker, a: LabelApplication| {
     let in_module: Checker = { ..c, module: a.module };
@@ -11394,7 +11567,7 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
             bytes_concat_all([
               b"write it at the call, as `",
               simple_name_of(a.callee),
-              b"[<label>](..)`, or pass an argument whose row names it",
+              b"[<label>](..)`, or pass an argument whose row or type names it",
             ]),
           ],
         )
@@ -11415,7 +11588,7 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
   { ..out, module: checker.module }
 }
 
-// A settled label is the resource it names, or the enclosing definition's own label parameter.
+/// A settled label is the resource it names, or the enclosing definition's own label parameter.
 fn label_named(checker: Checker, a: LabelApplication, v: Int) -> Option<Bytes> / {abort.raise} =
   if v < 0 { None } else {
     let t = shallow(checker.subst, TyVar(v));
@@ -11565,7 +11738,7 @@ fn dump_checked(checker: Checker) -> Bytes / {abort.raise} =
     ),
   ])
 
-// The first of each diagnostic that would render alike: the same code, labels and note count.
+/// The first of each diagnostic that would render alike: the same code, labels and note count.
 fn dedup_diags(diags: List<Diag>) -> List<Diag> =
   fold(
     diags,
@@ -11577,8 +11750,8 @@ fn dedup_diags(diags: List<Diag>) -> List<Diag> =
 
 type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
 
-// Each source parsed with the rewrites, every `derive` expanded, and what a driver read for its
-// embeds written out.
+/// Each source parsed with the rewrites, every `derive` expanded, and what a driver read for its
+/// embeds written out.
 fn parsed_all(sources: List<Source>, embeds: List<EmbedAt>) -> List<Parsed> / {abort.raise} = {
   let tables = embed_tables(embeds);
   map(range(0, len(sources)), |i: Int| {
@@ -11595,7 +11768,7 @@ fn parsed_all(sources: List<Source>, embeds: List<EmbedAt>) -> List<Parsed> / {a
   })
 }
 
-// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. A reporting expansion stops there.
+/// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. A reporting expansion stops there.
 pub fn check_dump(sources: List<Source>, embeds: List<EmbedAt> = []) -> String / {abort.raise} = {
   let parsed = parsed_all(sources, embeds);
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| concat(acc, p.diags));
@@ -11614,7 +11787,7 @@ fn dump_outcome(out: Checked) -> Bytes / {abort.raise} =
   if out.ok { dump_checked(out.checker) }
   else { bytes_concat(b"X;", dump_diags(dedup_diags(out.checker.diags))) }
 
-// What a checked program publishes, as the interfaces a second check of it would be handed.
+/// What a checked program publishes, as the interfaces a second check of it would be handed.
 fn known_of(checker: Checker) -> Known / {abort.raise} = {
   let defs = fold(checker.defs, map_new(), |acc: Map<Bytes, KnownDef>, def_info: DefInfo|
     map_insert(acc, def_info.name, {
@@ -11654,7 +11827,7 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
   { defs: defs, tests: walked.tests, root: checker.known.root, keying: None }
 }
 
-// The program checked twice, the second time from what the first published.
+/// The program checked twice, the second time from what the first published.
 pub fn check_dump_known(
   sources: List<Source>,
   embeds: List<EmbedAt> = [],
@@ -12147,7 +12320,7 @@ test "a definition's witnesses take its scheme's order, which its calls pass the
   assert(fold(passed, false, |b: Bool, ws: List<NumericWitness>| b || ws == [ParamWitness(b"a")]))
 }
 
-// A one-module program as the checker leaves it.
+/// A one-module program as the checker leaves it.
 fn checked_cx(src: Bytes) -> Checker / {abort.raise} = {
   let r = parse(src);
   let x = expand(r.node, r.parser.diags);
@@ -12180,7 +12353,7 @@ test "a bracket's closures run as one, so a body generic over its row admits the
   )
 }
 
-// A one-module program's diagnostics, in order; empty when it checks.
+/// A one-module program's diagnostics, in order; empty when it checks.
 fn check_diags(src: Bytes) -> List<Diag> / {abort.raise} = {
   let r = parse(src);
   let x = expand(r.node, r.parser.diags);
@@ -12194,22 +12367,160 @@ fn check_diags(src: Bytes) -> List<Diag> / {abort.raise} = {
 fn check_codes(src: Bytes) -> List<Bytes> / {abort.raise} =
   map(check_diags(src), |diag: Diag| diag.code)
 
-test "a parameterless alias reads as if written out at each use, a label in it the user's own" {
-  let uses = |t: Bytes|
+test "a declared type is closed: a label in it is its own parameter or a resource, never a user's binder" {
+  let uses = |decl: Bytes, t: Bytes|
     bytes_concat_all([
-      b"effect net { write send[r](Bytes) -> Unit }\ntype Sender = (Bytes) -> Unit / {net.send[l]}\n",
-      b"pub fn plain(f: ",
+      b"effect net { write send[r](Bytes) -> Unit }\n",
+      decl,
+      b"\npub fn plain(f: ",
       t,
       b") -> Int = 1\npub fn relay<[l]>(f: ",
       t,
-      b") -> Int = 1\npub fn again(f: ",
-      t,
       b") -> Int = 1",
     ]);
+  // Under `relay`'s binder the alias still names the resource `l`, so the binder prints apart from it.
   assert_eq(
-    check_dump([{ name: b"m", src: uses(b"Sender") }]),
-    check_dump([{ name: b"m", src: uses(b"(Bytes) -> Unit / {net.send[l]}") }]),
+    check_dump([
+      { name: b"m", src: uses(b"type Sender = (Bytes) -> Unit / {net.send[l]}", b"Sender") },
+    ]),
+    "K;1;F;m.plain;((Bytes) -> Unit / {m.net.send[l]}) -> Int;;;;"
+      ++ "F;m.relay;<[m]>((Bytes) -> Unit / {m.net.send[l]}) -> Int;;;;"
+      ++ "E;m.net;0;send:write:1:Bytes:Unit;",
+  );
+  let own = check_dump([
+    {
+      name: b"m",
+      src: uses(b"type Sender<[k]> = (Bytes) -> Unit / {net.send[k]}", b"Sender<[l]>"),
+    },
+  ]);
+  assert(string_contains(own, "F;m.plain;((Bytes) -> Unit / {m.net.send[l]}) -> Int;"));
+  assert(string_contains(own, "F;m.relay;<[l]>((Bytes) -> Unit / {m.net.send[l]}) -> Int;"));
+  // A row variable has no resource to fall back on.
+  assert_eq(check_codes(b"type Cb = () -> Unit / e\nfn run<| e>(c: Cb) -> Unit / e = c()"), [
+    b"E0301",
+  ])
+}
+
+test "a sum is printed with the labels and rows it is given, and its constructor binds them" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"effect net { write send[r](Bytes) -> Unit }\npub type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e})\npub fn held<[l] | e>(s: Sink<Int, [l] | {net.send[conn] | e}>) -> Sink<Int, [l] | {net.send[conn] | e}> = s\npub fn kept(s: Sink<Int, [conn] | {}>) -> Sink<Int, [conn] | {}> = s",
+    },
+  ]);
+  assert(
+    string_contains(
+      dump,
+      "F;m.held;<[l] | e>(m.Sink<Int, [l] | {m.net.send[conn] | e}>) -> m.Sink<Int, [l] | {m.net.send[conn] | e}>;;;;",
+    ),
+  );
+  assert(
+    string_contains(dump, "F;m.kept;(m.Sink<Int, [conn] | {}>) -> m.Sink<Int, [conn] | {}>;;;;"),
+  );
+  assert(
+    string_contains(
+      dump,
+      "C;m.Sink;m.Sink;0;1;<a, [l] | e>((a) -> Unit / {m.net.send[l] | e}) -> m.Sink<a, [l] | e>;",
+    ),
   )
+}
+
+test "a sum's row argument is exact, and an alias's lands in a function type a narrower one meets" {
+  let net = b"effect net { write send[s](p: Bytes) -> Unit\n write recv[s](n: Int) -> Bytes }\n";
+  let boxed = |made: Bytes|
+    bytes_concat_all([
+      net,
+      b"type Box<| e> = | Box(() -> Unit / e)\n",
+      b"fn open(b: Box<| {net.write[x]}>) -> Unit / {net.write[x]} = match b { Box(f) -> f() }\n",
+      b"fn go(f: () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = ",
+      made,
+    ]);
+  assert_eq(check_codes(boxed(b"open(Box(f))")), [b"E0302"]);
+  // The annotation is where the narrower function meets the row the sum is given.
+  assert_eq(check_codes(boxed(b"{ let g: () -> Unit / {net.write[x]} = f; open(Box(g)) }")), []);
+  let aliased = bytes_concat_all([
+    net,
+    b"type Thunk<| e> = () -> Unit / e\n",
+    b"fn open(f: Thunk<| {net.write[x]}>) -> Unit / {net.write[x]} = f()\n",
+    b"fn go(f: Thunk<| {net.send[x]}>) -> Unit / {net.write[x]} = open(f)",
+  ]);
+  assert_eq(check_codes(aliased), []);
+  // Two labels are two types, as two rows are.
+  let labelled = bytes_concat_all([
+    net,
+    b"type Sink<[l]> = | Sink((Bytes) -> Unit / {net.send[l]})\n",
+    b"fn to(s: Sink<[a]>) -> Int = 1\n",
+    b"fn go(s: Sink<[b]>) -> Int = to(s)",
+  ]);
+  assert_eq(map(check_diags(labelled), |diag: Diag| { code: diag.code, text: diag.text }), [
+    { code: b"E0201", text: b"argument type|[a]|[b]" },
+  ])
+}
+
+test "a use fills as many labels and rows as its type binds, and a declaration's row variable is its own" {
+  let decls = b"effect net { write send[s](p: Bytes) -> Unit }\ntype Box<| e> = | Box(() -> Unit / e)\ntype Sink<[l]> = | Sink(() -> Unit / {net.send[l]})\ntype Thunk<| e> = () -> Unit / e\n";
+  let used = |ty: Bytes| bytes_concat_all([decls, b"fn f(x: ", ty, b") -> Int = 1"]);
+  let messages = |ty: Bytes| map(check_diags(used(ty)), |diag: Diag| diag.message);
+  assert_eq(messages(b"Box"), [b"`Box` takes 1 row argument, but 0 were supplied"]);
+  assert_eq(messages(b"Thunk"), [b"`Thunk` takes 1 row argument, but 0 were supplied"]);
+  assert_eq(messages(b"Box<| {}, {}>"), [b"`Box` takes 1 row argument, but 2 were supplied"]);
+  assert_eq(messages(b"Sink"), [b"`Sink` takes 1 label argument, but 0 were supplied"]);
+  assert_eq(messages(b"Sink<[a, b]>"), [b"`Sink` takes 1 label argument, but 2 were supplied"]);
+  assert_eq(messages(b"List<Int | {}>"), [b"`List` takes 0 row arguments, but 1 was supplied"]);
+  assert_eq(check_codes(used(b"Box<| {}, {}>")), [b"E0202"]);
+  assert_eq(check_codes(used(b"Box<| {net.send[x] | e}>")), [b"E0301"]);
+  assert_eq(check_codes(b"type Bad<a> = | Bad((a) -> Unit / e)"), [b"E0301"]);
+  // Among the type parameters a name binds a type, so the row that names it is still unbound.
+  assert_eq(check_codes(b"type Bad<a, e> = | Bad((a) -> Unit / e)"), [b"E0301"]);
+  assert_eq(check_codes(used(b"Box<| {net.send[x] bounded}>")), [b"E0466"])
+}
+
+test "a row a declared field writes may not reach a region, and one the type is given is seen leaving" {
+  let hidden = check_diags(b"type Hidden = | Hidden(Int, () -> Int / {cell.read[work]})");
+  assert_eq(map(hidden, |diag: Diag| [diag.code, diag.message]), [
+    [b"E0446", b"`Hidden`'s field 2 holds a function whose row reaches a `Cell`"],
+  ]);
+  assert_eq(check_codes(b"type Joined<| e> = | Joined(() -> Int / {task.join | e})"), [b"E0446"]);
+  assert_eq(
+    check_codes(
+      b"type Box<| e> = | Box(() -> Int / e)\ntype Hidden = | Hidden(Box<| {cell.write[work]}>)",
+    ),
+    [b"E0446"],
+  );
+  let given = b"type Box<| e> = | Box(() -> Int / e)\n";
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        given,
+        b"fn leak() -> Box<| {cell.read[work]}> = with_cell[work](7) { c -> Box(|| cell_get(c)) }",
+      ),
+    ),
+    [b"E0201"],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        given,
+        b"fn kept() -> Int = with_cell[work](7) { c -> match Box(|| cell_get(c)) { Box(f) -> f() } }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a law does not quantify over a sum whose function performs the type's row parameter" {
+  let src = |binder: Bytes|
+    bytes_concat_all([
+      b"type Box<| e> = | Box(() -> Int / e)\ntype Thunk<| e> = () -> Int / e\n",
+      b"effect log { write note() -> Unit }\n",
+      b"law \"held\" forall (b: ",
+      binder,
+      b") { true }",
+    ]);
+  assert_eq(check_codes(src(b"Box<| {}>")), [b"E0418"]);
+  assert_eq(check_codes(src(b"Box<| {log.note}>")), [b"E0418"]);
+  assert_eq(check_codes(src(b"Thunk<| {log.note}>")), [b"E0418"]);
+  assert_eq(check_codes(src(b"Thunk<| {}>")), [])
 }
 
 test "a `Map` key an alias leaves unordered is refused at every signature naming the alias" {
@@ -12223,7 +12534,7 @@ test "a `Map` key an alias leaves unordered is refused at every signature naming
 fn fixes_of(diags: List<Diag>) -> List<Fix> =
   fold(diags, [], |acc: List<Fix>, diag: Diag| concat(acc, diag.fixes))
 
-// Last edit first, so each offset still points where it did.
+/// Last edit first, so each offset still points where it did.
 fn fixed_by(src: Bytes, fix: Fix) -> Bytes / {abort.raise} = {
   let n = len(fix.edits);
   fold(range(0, n), src, |s: Bytes, i: Int| {
@@ -12278,8 +12589,8 @@ fn net_src(rest: Bytes) -> Bytes =
     rest,
   )
 
-// Each diagnostic a one-module program draws: its code, its message, and whether its first label
-// spans the first place `src` writes `name`.
+/// Each diagnostic a one-module program draws: its code, its message, and whether its first label
+/// spans the first place `src` writes `name`.
 fn refused_at(
   src: Bytes,
   name: Bytes,
@@ -13045,7 +13356,7 @@ test "a cell reaches a task only where the scheduler cannot outlive the region" 
   )
 }
 
-// Each diagnostic as its code, its message and the source its primary label covers.
+/// Each diagnostic as its code, its message and the source its primary label covers.
 fn refusals(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
   map(check_diags(src), |diag: Diag|
     [
@@ -13321,7 +13632,7 @@ test "a call instantiating a constrained parameter with a function is refused at
   assert_eq(dump, "K;1;X;D;1;!E0206:0:78:82:2:1;=0:78:82:1;=0:0:56:0;")
 }
 
-// Each error a program raises, in the order the checker reports them.
+/// Each error a program raises, in the order the checker reports them.
 fn errors_across(sources: List<Source>) -> List<Diag> / {abort.raise} = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
@@ -13478,7 +13789,7 @@ test "`++` joins two Strings or two Bytes, and refuses one of each" {
   ])
 }
 
-// The label of each `E0205` a one-module program raises.
+/// The label of each `E0205` a one-module program raises.
 fn not_covered(src: Bytes) -> List<Bytes> / {abort.raise} = {
   let r = parse(src);
   let x = expand(r.node, r.parser.diags);
@@ -13493,7 +13804,7 @@ fn not_covered(src: Bytes) -> List<Bytes> / {abort.raise} = {
   }
 }
 
-// The first label of each diagnostic of `code` a one-module program raises.
+/// The first label of each diagnostic of `code` a one-module program raises.
 fn labels_of(src: Bytes, code: Bytes) -> List<Bytes> / {abort.raise} =
   map(filter(check_diags(src), |diag: Diag| diag.code == code), |diag: Diag|
     at(diag.labels, 0).text)
@@ -13787,7 +14098,7 @@ fn db_source(body: Bytes) -> Bytes =
     body,
   )
 
-// Whether `name`'s row names its atoms as growing with the input, and which callbacks it calls so.
+/// Whether `name`'s row names its atoms as growing with the input, and which callbacks it calls so.
 fn counted(src: Bytes, name: Bytes) -> { scaling: Bool, repeats: List<Int> } / {abort.raise} =
   match def_of(checked_cx(src), bytes_concat(b"m.", name)) {
     Some(d) -> { scaling: len(d.scaling) > 0, repeats: d.repeats },
@@ -14036,22 +14347,25 @@ fn declared_as(name: Bytes) -> Builtin / {abort.raise} =
     None -> panic("the prelude declares `" ++ string_of_bytes(name) ++ "`"),
   }
 
-test "a builtin is what the prelude declares: its scheme, its parameters' names and the comment above it" {
+test "a builtin is what the prelude declares: its scheme, its parameters' names and its doc" {
   let slice = declared_as(b"bytes_slice");
   assert_eq(slice.params, [b"b", b"start", b"end"]);
-  assert_eq(slice.note, b"raises out of range");
+  assert_eq(slice.doc, [b"Raises out of range."]);
   assert_eq(slice.scheme, {
     ty_vars: [],
     row_vars: [],
     label_vars: [],
     ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
   });
-  assert_eq(declared_as(b"len").note, b"");
-  // A note over several lines reads as one.
-  assert_eq(
-    declared_as(b"reflect").note,
-    b"the value as a `std.value.Value`; a width below 64 bits the program does not fix reads as its `Int`",
-  )
+  assert_eq(declared_as(b"len").doc, [b"How many items the list holds."]);
+  assert_eq(declared_as(b"reflect").doc, [
+    b"The value as a `std.value.Value`; a width below 64 bits the program does not fix reads as its",
+    b"`Int`.",
+  ])
+}
+
+test "every function the prelude declares has a doc" {
+  assert_eq(map(filter(builtins(), |b: Builtin| len(b.doc) == 0), |b: Builtin| b.name), [])
 }
 
 test "a declaration's generic list is its scheme's variables, numbered from zero" {
@@ -14176,14 +14490,14 @@ test "a list written of parts, pushed or filtered or mapped to parts, is made of
   assert(diverges(walked(b"again", b"Many(xs) -> any(push(xs, t)), _ -> false"), b"again"))
 }
 
-// Where a site's call is in the source the checker read, as an offset.
+/// Where a site's call is in the source the checker read, as an offset.
 fn offset_of(cx: Checker, s: Site) -> Int / {abort.raise} =
   match def_of(cx, s.caller) {
     Some(d) -> d.at.span.start + s.span.start,
     None -> panic("the definition the site names"),
   }
 
-// Where the call is by which a definition of `src` may not return, as an offset.
+/// Where the call is by which a definition of `src` may not return, as an offset.
 fn diverging_at(src: Bytes, name: Bytes) -> Option<Int> / {abort.raise} = {
   let cx = checked_cx(src);
   match def_of(cx, bytes_concat(b"m.", name)) {

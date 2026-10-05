@@ -1,0 +1,105 @@
+// A `type` binds what a `fn` binds, in the same places: type parameters, bracketed label
+// parameters among them, and row parameters after `|`. A use fills them in those places.
+
+effect log {
+  write note[l](line: String) -> Unit
+  read level[l]() -> Int
+}
+
+effect set Logging = {log.note[app], log.level[app]}
+
+// A sum over a label: which log a sink writes is the type's argument, not the declaration's.
+type Sink<[l]> = | Sink((String) -> Unit / {log.note[l]}) | Quiet
+
+// Every kind at once, each row beside the atoms the declaration writes itself.
+type Pipe<a, b, [l], [k] | e, f> =
+  | Pipe((a) -> b / {log.note[l] | e}, (b) -> Unit / {log.note[k] | f})
+
+// An alias expands where it is used, with its arguments in place of its parameters.
+type Noter<[l]> = (String) -> Unit / {log.note[l]}
+
+type Thunk<a | e> = () -> a / e
+
+// A row parameter the fields never name: the type holds no function, and derives as one that
+// takes none.
+type Tagged<a | e> = | Tagged(a)
+
+derive eq for Tagged
+
+fn to<[l]>(s: Sink<[l]>, line: String) -> Unit / {log.note[l]} =
+  match s { Sink(f) -> f(line), Quiet -> () }
+
+fn app_sink() -> Sink<[app]> = Sink(|line: String| log.note[app](line))
+
+// The label a call fills comes from the argument's type as it comes from an argument's row.
+fn greet() -> Unit / {log.note[app]} = to(app_sink(), "hello")
+
+// A value that holds no function says nothing of its label, so the call writes it.
+fn hush() -> Unit / {log.note[app]} = to[app](Quiet, "unheard")
+
+// A row has one variable, so the two rows the pipe takes are filled with the one this performs.
+fn through<a, b, [l], [k] | e>(
+  p: Pipe<a, b, [l], [k] | e, e>,
+  x: a,
+) -> Unit / {log.note[l], log.note[k] | e} = match p { Pipe(turn, sink) -> sink(turn(x)) }
+
+fn said<[l]>(n: Noter<[l]>) -> Unit / {log.note[l]} = n("said")
+
+// Two thunks that perform different things fill one row with both, as two bare function types do:
+// an alias's row argument lands in a function type, which a narrower function may meet.
+fn both<| e>(first: Thunk<Unit | e>, second: Thunk<Unit | e>) -> Unit / e = {
+  first();
+  second()
+}
+
+// An effect set stands for its atoms in a row argument as it does in a row.
+fn leveled(t: Thunk<Int | {Logging}>) -> Int / {Logging} = t()
+
+// The lines each run notes, by the log it notes them on.
+fn noted<| e>(body: () -> Unit / {log.note[app], log.note[db] | e}) -> List<String> / e =
+  with_cell[lines]([]) { c -> {
+    handle {
+      body()
+    } with {
+      log.note[app](line) -> cell_set(c, push(cell_get(c), "app " ++ line)),
+      log.note[db](line) -> cell_set(c, push(cell_get(c), "db " ++ line)),
+    };
+    cell_get(c)
+  } }
+
+test "a sum's label argument is the label its function performs under" {
+  assert_eq(noted(|| greet()), ["app hello"]);
+  assert_eq(noted(|| hush()), []);
+  let db: Sink<[db]> = Sink(|line: String| log.note[db](line));
+  assert_eq(noted(|| to(db, "stored")), ["db stored"])
+}
+
+test "a type of every kind of parameter is filled in the places it binds them" {
+  let p: Pipe<Int, String, [app], [db] | {}, {}> = Pipe(
+    |n: Int| {
+      log.note[app]("turning");
+      int_to_string(n + 1)
+    },
+    |s: String| log.note[db](s),
+  );
+  assert_eq(noted(|| through(p, 41)), ["app turning", "db 42"])
+}
+
+test "an alias's label and row arguments are written into its expansion" {
+  assert_eq(noted(|| said(|line: String| log.note[db](line))), ["db said"]);
+  assert_eq(noted(|| both(|| log.note[app]("one"), || log.note[db]("two"))), ["app one", "db two"]);
+  let level = handle {
+    leveled(|| log.level[app]() + 1)
+  } with {
+    log.level[app]() -> 6,
+    log.note[app](_line) -> (),
+  };
+  assert_eq(level, 7)
+}
+
+test "a type that only names a row parameter derives and compares as one that names none" {
+  let x: Tagged<Int | {}> = Tagged(1);
+  let y: Tagged<Int | {}> = Tagged(1);
+  assert(x == y);
+  assert(tagged_eq({ eq: |a: Int, b: Int| a == b }).eq(x, y))
+}
