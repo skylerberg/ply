@@ -1,0 +1,265 @@
+// A test over cases, `test "{c.name}" for c: T in table() { .. }`, as `ply test` runs it: a test per
+// case, each with its own label, key, pass and failure, and none of them moved by another's.
+
+import harness (scratch, program, write, read, on_disk, tested, json_of, at, path, items, str, int,
+                truth, shown, Reached, Shipped)
+import std.json (Json, Null)
+import std.string
+
+fn vectors(rows: String, double: String) -> String =
+  \\type Vector = { name: String, input: Int, want: Int }
+  \\
+    ++ "\nfn vectors() -> List<Vector> = ["
+    ++ rows
+    ++ "]\n\nfn double(n: Int) -> Int = "
+    ++ double
+    ++ "\n\n"
+    ++
+    \\test "doubles {v.name}" for v: Vector in vectors() {
+    \\  assert_eq(double(v.input), v.want)
+    \\}
+    \\
+    \\test "double of nothing is nothing" { assert_eq(double(0), 0) }
+    \\
+
+fn row(name: String, input: Int, want: Int) -> String =
+  "{ name: \"" ++ name ++ "\", input: " ++ int_to_string(input) ++ ", want: " ++ int_to_string(want)
+    ++ " }"
+
+fn two() -> String = row("one", 1, 2) ++ ", " ++ row("two", 2, 4)
+
+// Every test the run reports on, ran or not, in the order it lists them.
+fn listed(report: Json) -> List<String> =
+  map(items(path(report, ["selection", "tests"])), |t: Json| str(at(t, "name")))
+
+fn selected(report: Json) -> List<String> =
+  map(
+    filter(items(path(report, ["selection", "tests"])), |t: Json| truth(at(t, "selected"))),
+    |t: Json| str(at(t, "name")),
+  )
+
+fn entry(report: Json, name: String) -> Json =
+  match filter(items(path(report, ["selection", "tests"])), |t: Json| str(at(t, "name")) == name) {
+    [t, ..] -> t,
+    [] -> Null,
+  }
+
+fn failed(report: Json) -> List<String> =
+  map(filter(items(at(report, "results")), |r: Json| str(at(r, "status")) == "failed"), |r: Json|
+    str(at(r, "name")))
+
+test "each case is a test of its own: its label names it, and it says what it is a case of" {
+  scratch(|| {
+    program(vectors(two(), "n + n"));
+    let report = tested([]);
+    assert_eq(listed(report), ["doubles one", "doubles two", "double of nothing is nothing"]);
+    assert_eq(int(path(report, ["summary", "passed"])), 3);
+    let one = entry(report, "doubles one");
+    let other = entry(report, "doubles two");
+    assert_eq(str(at(one, "key")), "m.doubles one");
+    assert_eq(str(path(one, ["case", "of"])), "m.doubles {v.name}");
+    assert_eq(int(path(one, ["case", "at"])), 0);
+    assert_eq(int(path(other, ["case", "at"])), 1);
+    assert(str(at(one, "hash")) != str(at(other, "hash")), Some(shown(report)));
+    assert(str(path(one, ["case", "digest"])) != str(path(other, ["case", "digest"])), None);
+    // A test that ranges over nothing says nothing of a case.
+    assert_eq(at(entry(report, "double of nothing is nothing"), "case"), Null)
+  })
+}
+
+test "a case added to the table runs alone, wherever it is added, and the rest stand on their passes" {
+  scratch(|| {
+    program(vectors(two(), "n + n"));
+    let _ = tested([]);
+    write(
+      "m.ply",
+      vectors(row("zero", 0, 0) ++ ", " ++ two() ++ ", " ++ row("three", 3, 6), "n + n"),
+    );
+    let report = tested([]);
+    assert_eq(selected(report), ["doubles zero", "doubles three"]);
+    assert_eq(int(path(report, ["summary", "cached"])), 3);
+    assert_eq(str(at(entry(report, "doubles one"), "reason")), "cached");
+    // The case kept its key though its place in the table moved.
+    assert_eq(int(path(entry(report, "doubles one"), ["case", "at"])), 1)
+  })
+}
+
+test "a label rewritten and a table reordered move no case's key, and the body moves every one" {
+  scratch(|| {
+    program(vectors(two(), "n + n"));
+    let _ = tested([]);
+    let relabelled = string::replace(
+      vectors(row("two", 2, 4) ++ ", " ++ row("one", 1, 2), "n + n"),
+      "\"doubles {v.name}\"",
+      "\"{v.input} doubled is {v.want}\"",
+    );
+    write("m.ply", relabelled);
+    let report = tested([]);
+    assert_eq(selected(report), []);
+    assert_eq(listed(report), ["2 doubled is 4", "1 doubled is 2", "double of nothing is nothing"]);
+    write(
+      "m.ply",
+      string::replace(
+        relabelled,
+        "assert_eq(double(v.input), v.want)",
+        "assert_eq(v.want, double(v.input))",
+      ),
+    );
+    assert_eq(selected(tested([])), ["2 doubled is 4", "1 doubled is 2"])
+  })
+}
+
+test "every failing case is reported, each with its own failure, and the passing ones are filed" {
+  scratch(|| {
+    program(vectors(two() ++ ", " ++ row("three", 3, 6), "if n > 1 { n + n + 1 } else { n + n }"));
+    let ran = on_disk(["test", "--json"]);
+    assert_eq(ran.code, 1);
+    let report = json_of(ran);
+    assert_eq(failed(report), ["doubles two", "doubles three"]);
+    assert_eq(map(items(at(report, "failures")), |f: Json| str(at(f, "name"))), [
+      "doubles two",
+      "doubles three",
+    ]);
+    // Only the failures run again.
+    assert_eq(selected(tested([])), ["doubles two", "doubles three"])
+  })
+}
+
+test "`--filter` reads a case's label" {
+  scratch(|| {
+    program(vectors(two() ++ ", " ++ row("three", 3, 6), "n + n"));
+    let report = tested(["--filter", "doubles t"]);
+    assert_eq(listed(report), ["doubles two", "doubles three"]);
+    assert_eq(int(path(report, ["selection", "filtered_out"])), 2)
+  })
+}
+
+test "a table that raises fails its test as one, under the label it was written with" {
+  scratch(|| {
+    program(
+      \\fn table() -> List<Int> / {abort.raise} = [1, 2 / len(range(0, 0))]
+      \\
+      \\test "holds {n}" for n: Int in table() { assert(n > 0) }
+      \\
+      \\test "a plain test beside it" { assert(true) }
+      \\
+    );
+    let ran = on_disk(["test", "--json"]);
+    assert_eq(ran.code, 1);
+    let report = json_of(ran);
+    assert_eq(failed(report), ["holds {n}"]);
+    assert_eq(int(path(report, ["summary", "passed"])), 1);
+    assert(
+      string_contains(shown(at(report, "failures")), "division by zero"),
+      Some(shown(at(report, "failures"))),
+    )
+  })
+}
+
+test "an empty table is no test, and equal cases are one key" {
+  scratch(|| {
+    program(
+      \\fn none() -> List<Int> = []
+      \\
+      \\test "nothing {n}" for n: Int in none() { assert(n > 0) }
+      \\
+      \\test "twice {n}" for n: Int in [7, 7] { assert_eq(n, 7) }
+      \\
+    );
+    let report = tested([]);
+    assert_eq(listed(report), ["twice 7", "twice 7"]);
+    let hashes = map(items(path(report, ["selection", "tests"])), |t: Json| str(at(t, "hash")));
+    assert_eq(list_at(hashes, 0), list_at(hashes, 1))
+  })
+}
+
+test "a case's failure names what it runs as its suspect, and never its table" {
+  scratch(|| {
+    program(vectors(two() ++ ", " ++ row("three", 3, 6), "n + n"));
+    let _ = tested([]);
+    write(
+      "m.ply",
+      vectors(
+        row("zero", 0, 0) ++ ", " ++ two() ++ ", " ++ row("three", 3, 6),
+        "if n > 2 { n + n + 1 } else { n + n }",
+      ),
+    );
+    let report = json_of(on_disk(["test", "--json"]));
+    assert_eq(failed(report), ["doubles three"]);
+    let failure = match items(at(report, "failures")) { [f, ..] -> f, [] -> Null };
+    assert_eq(map(items(at(failure, "suspects")), |s: Json| str(at(s, "name"))), ["m.double"]);
+    // One change, so it is the culprit with no mixture run; a case is never bisected by one.
+    assert_eq(str(path(failure, ["culprit", "verdict"])), "sole");
+    assert_eq(map(items(path(failure, ["culprit", "definitions"])), str), ["m.double"])
+  })
+}
+
+test "a seeded case is searched, and a mutant of what the cases run is killed by them" {
+  scratch(|| {
+    program(
+      \\fn next(n: Int) -> Int = n + 1
+      \\
+      \\test "joined {n}" for n: Int in [1, 2] {
+      \\  simulate {
+      \\    let t = task.spawn(|| next(n));
+      \\    assert_eq(task.join(t), n + 1)
+      \\  }
+      \\}
+      \\
+    );
+    let report = tested(["--mutate", "next"]);
+    assert_eq(int(path(report, ["simulation", "simulated"])), 2);
+    assert_eq(int(path(report, ["mutants", "killed"])), 2);
+    assert_eq(int(path(report, ["mutants", "survived"])), 0)
+  })
+}
+
+test "what a table may not be is refused where it is written" {
+  scratch(|| {
+    program(
+      \\effect clock { read now() -> Int }
+      \\
+      \\fn ticking() -> List<Int> / {clock.now} = [clock.now()]
+      \\
+      \\test "performs {n}" for n: Int in ticking() { assert(n > 0) }
+      \\
+      \\test "is no list {n}" for n: Int in 3 { assert(n > 0) }
+      \\
+      \\test "is of another type {n}" for n: String in [1, 2] { assert(n == "a") }
+      \\
+      \\test "has no digest {x}" for x: Float in [1.0] { assert(x > 0.0) }
+      \\
+    );
+    let report = json_of(on_disk(["check", "--json"]));
+    let said = map(
+      filter(items(at(report, "diagnostics")), |d: Json| str(at(d, "severity")) == "error"),
+      |d: Json|
+        str(at(d, "code")) ++ " "
+          ++ int_to_string(
+            int(
+              path(
+                match filter(items(at(d, "labels")), |l: Json| truth(at(l, "primary"))) {
+                  [l, ..] -> l,
+                  [] -> Null,
+                },
+                ["start", "line"],
+              ),
+            ),
+          ),
+    );
+    assert_eq(said, ["E0469 5", "E0201 7", "E0201 9", "E0206 11"])
+  })
+}
+
+test "`ply fmt` lays out a test over cases and keeps its label as written, which is its name" {
+  scratch(|| {
+    write("m.ply", "test   \"n { n+1 } of {{3}}\"   for  n :Int  in  [1,2]   { assert(n > 0) }\n");
+    assert_eq(on_disk(["fmt", "m.ply"]).code, 0);
+    assert_eq(on_disk(["fmt", "--check", "m.ply"]).code, 0);
+    assert_eq(
+      read("m.ply"),
+      Some("test \"n { n+1 } of {{3}}\" for n: Int in [1, 2] { assert(n > 0) }\n"),
+    );
+    assert_eq(listed(tested([])), ["n 2 of {3}", "n 3 of {3}"])
+  })
+}

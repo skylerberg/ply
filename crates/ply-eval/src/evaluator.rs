@@ -7,9 +7,7 @@ use crate::limit::DEFAULT_MAX_CALLS;
 use crate::sim::{DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::Value;
-use crate::{
-    Analysis, DefHash, Diagnostic, EffectAtom, Footprint, ModuleName, Span, Symbol, codes, region,
-};
+use crate::{Analysis, DefHash, Diagnostic, EffectAtom, Footprint, Span, Symbol, codes, region};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -38,6 +36,14 @@ pub struct Machine<'a> {
     host_ops: u64,
     declared: Option<Footprint>,
     re_executed: bool,
+}
+
+/// One case of a test over cases, as a run names it: its place in the table, and its value's
+/// digest, which is what the root holds the table to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Case {
+    pub at: i64,
+    pub digest: Vec<u8>,
 }
 
 /// How one entry ended: its answer, and what the host runtime warned of as it ended, such as the
@@ -178,35 +184,67 @@ impl<'a> Machine<'a> {
 
     /// `index` into the front's tests: load order, then source order.
     pub fn eval_test(&mut self, index: usize) -> Ended<()> {
-        let front = self.front;
-        let tests = &front.check.tests;
+        let (root, span) = match self.test_root(index) {
+            Ok(found) => found,
+            Err(refused) => return Ended::refused(refused),
+        };
+        self.begin_entry();
+        self.compiled.set_machine(self.id);
+        self.compiled.set_seed(self.seed.clone(), self.sim_steps);
+        let entered = self.compiled.enter_test(&root, self.max_calls);
+        self.passed(&root, span, entered)
+    }
+
+    /// One case of the test at `index`, which ranges over a table: its root is entered with the
+    /// case's place and digest.
+    pub fn eval_case(&mut self, index: usize, case: &Case) -> Ended<()> {
+        let (root, span) = match self.test_root(index) {
+            Ok(found) => found,
+            Err(refused) => return Ended::refused(refused),
+        };
+        self.begin_entry();
+        self.compiled.set_machine(self.id);
+        self.compiled.set_seed(self.seed.clone(), self.sim_steps);
+        let args = [Value::Int(case.at), Value::bytes(&case.digest)];
+        let entered = self.compiled.enter_whole(&root, &args, self.max_calls);
+        self.passed(&root, span, entered)
+    }
+
+    /// The cases the test at `index` ranges over, as the root beside its own lists them: each
+    /// one's label and digest, in the table's order.
+    pub fn eval_cases(&mut self, index: usize) -> Ended<Value> {
+        let (root, span) = match self.test_root(index) {
+            Ok(found) => found,
+            Err(refused) => return Ended::refused(refused),
+        };
+        self.begin_entry();
+        self.compiled_call(&Symbol::new(format!("{root}.cases")), Vec::new(), span)
+    }
+
+    /// A test's root, named by its place among its module's tests, and where the test is written.
+    fn test_root(&self, index: usize) -> Result<(Symbol, Span), Diagnostic> {
+        let tests = &self.front.check.tests;
         let Some(test) = tests.get(index) else {
-            return Ended::refused(
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    format!(
-                        "no test at index {index}; the program defines {}",
-                        tests.len()
-                    ),
-                )
-                .primary(Span::DUMMY, "requested test does not exist"),
-            );
+            return Err(Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "no test at index {index}; the program defines {}",
+                    tests.len()
+                ),
+            )
+            .primary(Span::DUMMY, "requested test does not exist"));
         };
         let ordinal = tests[..index]
             .iter()
             .filter(|t| t.module == test.module)
             .count();
-        self.begin_entry();
-        self.compiled_test(&test.module, ordinal, test.span)
+        let root = test.module.qualify(&Symbol::new(format!("test#{ordinal}")));
+        Ok((root, test.span))
     }
 
     /// The compiled front end is the authority: unit passes, a raise fails, and a missing body or
     /// any other answer is Ply's defect.
-    fn compiled_test(&mut self, module: &ModuleName, ordinal: usize, span: Span) -> Ended<()> {
-        let root = module.qualify(&Symbol::new(format!("test#{ordinal}")));
-        self.compiled.set_machine(self.id);
-        self.compiled.set_seed(self.seed.clone(), self.sim_steps);
-        let entered = self.compiled.enter_test(&root, self.max_calls);
+    fn passed(&mut self, root: &Symbol, span: Span, entered: Entered) -> Ended<()> {
         self.record_compiled_atoms();
         self.record = self.compiled.simulated();
         let answer = match entered {
@@ -216,11 +254,11 @@ impl<'a> Machine<'a> {
             }
             Entered::Answered(value) => {
                 self.compiled_entries += 1;
-                Err(err_test_answered(&root, &value, span))
+                Err(err_test_answered(root, &value, span))
             }
             Entered::Declined => {
                 self.compiled_declines += 1;
-                Err(err_not_compiled(&root, span))
+                Err(err_not_compiled(root, span))
             }
             Entered::Raised(raised) => {
                 self.compiled_entries += 1;

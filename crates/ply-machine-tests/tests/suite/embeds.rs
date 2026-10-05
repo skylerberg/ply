@@ -29,7 +29,7 @@ fn a_program_loaded_from_nothing_runs_what_it_embedded() {
         hosting: Hosting::default(),
         provider: backend(&loaded),
     };
-    let ran = testrun::executed(&executor, 0);
+    let ran = testrun::executed(&executor, 0, None);
     assert!(ran.failure.is_none(), "the test passes: {:?}", ran.failure);
 }
 

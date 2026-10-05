@@ -16,7 +16,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
               constraint_written, SpecKind, SRequires, SEnsures, SCost, SpecClause, ReturnsFresh,
-              ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub)
+              ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub, test_listing, test_run,
+              case_params)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
@@ -640,6 +641,7 @@ fn tag_returns_fresh() -> Int = 101
 fn tag_returns_param() -> Int = 102
 fn tag_bounded() -> Int = 103
 fn tag_decreases() -> Int = 104
+fn tag_cases() -> Int = 105
 
 // An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -1027,8 +1029,35 @@ fn op_def(encoder: Encoder, op: OpDef) -> Encoder / {abort.raise} = {
   { ..encoded, ty_params: encoder.ty_params }
 }
 
-pub fn test_def(encoder: Encoder, d: TestDef) -> Encoder / {abort.raise} =
-  expr(put_bool(put_tag(encoder, tag_test()), d.is_nondet), d.body)
+// A test over cases hashes as what one case runs: the case's type and the body over it. Its table
+// and its label are no part of that, so a case added to the table moves no other case's hash.
+pub fn test_def(encoder: Encoder, d: TestDef) -> Encoder / {abort.raise} = {
+  let headed: Encoder = put_bool(put_tag(encoder, tag_test()), d.is_nondet);
+  match d.cases {
+    None -> expr(headed, d.body),
+    Some(c) -> {
+      let typed: Encoder = type_expr(put_tag(headed, tag_cases()), c.ty);
+      let inner: Encoder = expr({ ..typed, values: push(typed.values, c.binder.name) }, d.body);
+      { ..inner, values: typed.values }
+    },
+  }
+}
+
+// What a test references: what its hash is taken over and, over cases, what its two roots run,
+// its table and its label among it.
+fn test_refs(index: Index, t: TestNode, hashed: List<Int>) -> List<Int> / {abort.raise} =
+  match t.def.cases {
+    None -> hashed,
+    Some(c) ->
+      fold(
+        refs_of(index, t.module, |encoder: Encoder| {
+          let listed: Encoder = expr(encoder, test_listing(c));
+          expr({ ..listed, values: concat(listed.values, case_params()) }, test_run(t.def))
+        }),
+        hashed,
+        |acc: List<Int>, r: Int| push_unique(acc, r),
+      ),
+  }
 
 // A law's binder types are part of its identity; their names are levels like any other binder.
 pub fn law_def(encoder: Encoder, d: LawDef) -> Encoder / {abort.raise} = {
@@ -1731,8 +1760,14 @@ pub type HashOutput = {
 
 // Each node's name and what it references, by index, and where a walk from a name or a key starts:
 // a name at every node it names, a test's or law's key at what that item references. A closure is
-// walked over these when it is asked for.
-pub type Refs = { names: List<Bytes>, edges: List<List<Int>>, starts: Map<Bytes, List<Int>> }
+// walked over these when it is asked for. `cases` is, by the key of each test over cases, where one
+// of its cases starts: what its hash is taken over, which leaves out its table and its label.
+pub type Refs = {
+  names: List<Bytes>,
+  edges: List<List<Int>>,
+  starts: Map<Bytes, List<Int>>,
+  cases: Map<Bytes, List<Int>>,
+}
 
 // What hashing no program answers.
 pub fn no_hashes() -> HashOutput =
@@ -1746,7 +1781,7 @@ pub fn no_hashes() -> HashOutput =
     spec_texts: [],
     law_texts: [],
     deps: [],
-    refs: { names: [], edges: [], starts: map_new() },
+    refs: { names: [], edges: [], starts: map_new(), cases: map_new() },
     bodies: [],
     test_bodies: [],
     test_texts: [],
@@ -1979,6 +2014,8 @@ type Hashed = {
   test_bodies: List<Bytes>,
   test_texts: List<Bytes>,
   test_refs: List<List<Int>>,
+  // What each test's hash is taken over references: all a case of a test over cases runs.
+  test_runs: List<List<Int>>,
   laws: List<Bytes>,
   law_refs: List<List<Int>>,
   law_texts: List<Bytes>,
@@ -1996,6 +2033,7 @@ type TestForms = {
   bodies: List<Bytes>,
   texts: List<Bytes>,
   refs: List<List<Int>>,
+  runs: List<List<Int>>,
 }
 
 // `hashes` is the table references are written from; `fresh` is what each body hashed to under it.
@@ -2421,7 +2459,7 @@ fn hashed_over(
     });
   let tests = fold(
     index.tests,
-    { hashes: [], bodies: [], texts: [], refs: [] },
+    { hashes: [], bodies: [], texts: [], refs: [], runs: [] },
     |acc: TestForms, t: TestNode| {
       let body = |encoder: Encoder| test_def(encoder, t.def);
       let effects = slots_of(index, t.module, scc, body);
@@ -2431,7 +2469,8 @@ fn hashed_over(
         hashes: push(acc.hashes, blake3(f.bytes)),
         bodies: push(acc.bodies, solo_body(f.bytes)),
         texts: push(acc.texts, own_hash(text.bytes)),
-        refs: push(acc.refs, f.refs),
+        refs: push(acc.refs, test_refs(index, t, f.refs)),
+        runs: push(acc.runs, f.refs),
       }
     },
   );
@@ -2488,6 +2527,7 @@ fn hashed_over(
     test_bodies: tests.bodies,
     test_texts: tests.texts,
     test_refs: tests.refs,
+    test_runs: tests.runs,
     laws: laws.hashes,
     law_refs: laws.refs,
     law_texts: laws.texts,
@@ -2907,7 +2947,15 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
     spec_texts: h.spec_texts,
     law_texts: h.law_texts,
     deps: [],
-    refs: { names: map(index.nodes, |node: Node| node.name), edges: edges, starts: starts },
+    refs: {
+      names: map(index.nodes, |node: Node| node.name),
+      edges: edges,
+      starts: starts,
+      cases: fold(range(0, len(index.tests)), map_new(), |acc: Map<Bytes, List<Int>>, i: Int| {
+        let t = at(index.tests, i);
+        if t.def.cases == None { acc } else { started(acc, t.key, at(h.test_runs, i)) }
+      }),
+    },
     bodies: [],
     test_bodies: h.test_bodies,
     test_texts: h.test_texts,
@@ -3053,8 +3101,14 @@ fn unused_over(
   let own = filter(range(0, n), |v: Int| is_root(index, at(index.nodes, v)));
   let tested = fold(index.tests, own, |acc: List<Int>, t: TestNode|
     concat(
-      concat(acc, refs_of(index, t.module, |encoder: Encoder| test_def(encoder, t.def))),
-      ret_refs(index, t.module, [t.def.body]),
+      concat(
+        acc,
+        test_refs(index, t, refs_of(index, t.module, |encoder: Encoder| test_def(encoder, t.def))),
+      ),
+      ret_refs(index, t.module, match t.def.cases {
+        Some(c) -> [t.def.body, c.table, c.label],
+        None -> [t.def.body],
+      }),
     ));
   let roots = fold(index.laws, tested, |acc: List<Int>, l: LawNode| {
     let exprs = match l.def.guard { Some(g) -> [g, l.def.body], None -> [l.def.body] };
@@ -5227,6 +5281,51 @@ test "a closure is what a name reaches, the name included, and a test's what the
   assert_eq(closure_of(h, [b"m.nothing"]), map_new());
   assert_eq(map_keys(reaching(h, one_set([b"m.leaf"]))), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
   assert_eq(map_keys(reaching(h, one_set([b"m.other"]))), [b"m.other"])
+}
+
+fn over_cases(label: Bytes, ty: Bytes, table: Bytes, body: Bytes) -> HashOutput / {abort.raise} =
+  hash_index(
+    indexed([
+      { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" },
+      {
+        name: b"std.cases",
+        src: b"pub type Table<a> = List<a>\npub fn listed<a>(t: List<a>, l: (a) -> String) -> List<String> = map(t, l)\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a = panic(\"\")",
+      },
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"pub fn few() -> List<Int> = [1]\npub fn more() -> List<Int> = [1, 2]\npub fn held(n: Int) -> Bool = n > 0\ntest \"",
+          label,
+          b"\" for n: ",
+          ty,
+          b" in ",
+          table,
+          b" { ",
+          body,
+          b" }",
+        ]),
+      },
+    ]),
+  )
+
+test "a test over cases hashes as what one case runs: its table and its label move nothing, its body and its case's type do" {
+  let base = over_cases(b"n {n}", b"Int", b"few()", b"assert(held(n))");
+  let hashed = |h: HashOutput| at(h.tests, 0);
+  assert_eq(hashed(over_cases(b"n {n}", b"Int", b"more()", b"assert(held(n))")), hashed(base));
+  assert_eq(hashed(over_cases(b"another", b"Int", b"few()", b"assert(held(n))")), hashed(base));
+  assert(hashed(over_cases(b"n {n}", b"Int", b"few()", b"assert(!held(n))")) != hashed(base));
+  assert(hashed(over_cases(b"n {n}", b"Bool", b"few()", b"assert(held(n))")) != hashed(base));
+  // The test reaches its table and what lists and chooses its cases; one case, only what it runs.
+  let reached = closure_of(base, [b"m.n {n}"]);
+  assert(map_contains(reached, b"m.few") && map_contains(reached, b"m.held"));
+  assert(map_contains(reached, b"std.cases.listed") && map_contains(reached, b"std.cases.chosen"));
+  assert_eq(
+    match map_get(base.refs.cases, b"m.n {n}") {
+      Some(runs) -> map(runs, |v: Int| at(base.refs.names, v)),
+      None -> [],
+    },
+    [b"m.held"],
+  )
 }
 
 // A function and an effect may share a name: the name reaches what either does, and a reference to

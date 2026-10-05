@@ -18,8 +18,10 @@ import type_syntax (TypeExpr, RowExpr, AtomExpr, Mode, Generics, RowMember, MRea
                     RMSet, ty, ty_span, no_ty, mode, generics, row, row_member, no_generics,
                     dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
-import exprs (Expr, Param, expr, scrutinee, block_expr, expr_span, no_expr, fn_param, param,
-              dump_expr, dump_param, shown_binder)
+import exprs (Expr, ELit, Param, expr, scrutinee, block_expr, expr_span, no_expr, fn_param, param,
+              dump_expr, dump_param, shown_binder, cases_binder, hidden_binder, case_at,
+              case_digest, case_body, listing)
+import patterns (LStr)
 
 // --- The tree ---------------------------------------------------------------
 
@@ -137,7 +139,25 @@ pub type OpDef = {
 // `is_nondet` because `nondet` is a keyword and cannot be a field name.
 pub type EffectDef = { vis: Vis, name: Ident, is_nondet: Bool, ops: List<OpDef>, span: Span }
 
-pub type TestDef = { name: Bytes, name_span: Span, is_nondet: Bool, body: Expr, span: Span }
+// `for c: T in table`: the test is one test per element of `table`, a case, each labelled by
+// `label` over `c`. The spans are the two words', which place what no source wrote.
+pub type Cases = {
+  binder: Ident,
+  ty: TypeExpr,
+  table: Expr,
+  label: Expr,
+  for_span: Span,
+  in_span: Span,
+}
+
+pub type TestDef = {
+  name: Bytes,
+  name_span: Span,
+  is_nondet: Bool,
+  cases: Option<Cases>,
+  body: Expr,
+  span: Span,
+}
 
 pub type DeriveDef = { deriver: Deriver, deriver_span: Span, target: Ident, span: Span }
 
@@ -227,7 +247,14 @@ pub fn no_effect_def() -> EffectDef =
   { vis: VPriv, name: no_ident(), is_nondet: false, ops: [], span: dummy_span() }
 
 pub fn no_test_def() -> TestDef =
-  { name: b"", name_span: dummy_span(), is_nondet: false, body: no_expr(), span: dummy_span() }
+  {
+    name: b"",
+    name_span: dummy_span(),
+    is_nondet: false,
+    cases: None,
+    body: no_expr(),
+    span: dummy_span(),
+  }
 
 pub fn no_law_def() -> LawDef =
   {
@@ -1304,22 +1331,99 @@ fn test_nondet(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {
   }
 }
 
+type Labelled = { parser: Parser, name: Bytes, span: Span, label: Expr }
+
+// A label is text, or before `for` a template: the lexer reads that one as an interpolated string,
+// and its name is the template as written.
+fn test_label(input: Input, parser: Parser) -> Result<Labelled, Parser> / {abort.raise} =
+  match token_kind(input, parser) {
+    StringLiteral(s) -> {
+      let sp = current_span(input, parser);
+      Ok({
+        parser: bump(input, parser),
+        name: s,
+        span: sp,
+        label: ELit({ span: sp, lit: LStr(s) }),
+      })
+    },
+    InterpolatedHead(_) -> if bytes_at(input.source, current_span(input, parser).start) != 34 {
+      Err(error_here(input, parser, b"a quoted test name"))
+    } else {
+      let l = expr(input, parser)?;
+      let sp = expr_span(l.node);
+      Ok({
+        parser: l.parser,
+        name: bytes_slice(input.source, sp.start + 1, sp.end - 1),
+        span: sp,
+        label: l.node,
+      })
+    },
+    _ -> Err(error_here(input, parser, b"a quoted test name")),
+  }
+
+// `for c: T in table`, between a test's label and its body.
+fn test_cases(
+  input: Input,
+  parser: Parser,
+  label: Expr,
+) -> Result<Parsed<Option<Cases>>, Parser> / {abort.raise} =
+  if !at_ident_text(input, parser, b"for") { Ok({ parser: parser, node: None }) } else {
+    let opened = advance(input, parser);
+    let binder = expect_ident(input, opened.parser, b"a name for the case after `for`")?;
+    let { parser, .. } = expect(
+      input,
+      binder.parser,
+      token_colon(),
+      b"`:` and the case's type after its name",
+    )?;
+    let { parser, node: written } = ty(input, parser)?;
+    if !at_ident_text(input, parser, b"in") {
+      Err(error_here(input, parser, b"`in` and the table of cases"))
+    } else {
+      let sep = advance(input, parser);
+      let { parser, node: table } = scrutinee(input, sep.parser)?;
+      Ok({
+        parser: parser,
+        node: Some({
+          binder: binder.node,
+          ty: written,
+          table: table,
+          label: label,
+          for_span: opened.node,
+          in_span: sep.node,
+        }),
+      })
+    }
+  }
+
 pub fn test_def(input: Input, parser: Parser) -> Result<Parsed<TestDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: nd } = test_nondet(input, st.parser)?;
-  let nm = quoted(input, parser, b"a quoted test name")?;
-  let { parser, node: body } = block_expr(input, nm.parser)?;
+  let nm = test_label(input, parser)?;
+  let { parser, node: cases } = test_cases(input, nm.parser, nm.label)?;
+  let { parser, node: body } = block_expr(input, parser)?;
   Ok({
     parser: parser,
     node: {
       name: nm.name,
       name_span: nm.span,
       is_nondet: nd,
+      cases: cases,
       body: body,
       span: span_to(st.node, expr_span(body)),
     },
   })
 }
+
+// What a test's root runs: its body, or over cases the body with the case it is entered for bound.
+pub fn test_run(d: TestDef) -> Expr =
+  match d.cases { None -> d.body, Some(c) -> case_body(c.binder, c.ty, c.table, c.in_span, d.body) }
+
+// What a test over cases answers its cases by: each one's label and digest.
+pub fn test_listing(c: Cases) -> Expr = listing(c.binder, c.ty, c.table, c.label, c.for_span)
+
+// The names a test over cases is entered with, in the order its root takes them.
+pub fn case_params() -> List<Bytes> = [case_at(), case_digest()]
 
 // --- `item` -----------------------------------------------------------------
 
@@ -1450,10 +1554,25 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
   );
   let shown = match first_shown(input, done.items) {
     None -> done.imports,
-    Some(sp) -> push(done.imports, shown_import(sp)),
+    Some(sp) -> push(done.imports, hidden_import(b"show", shown_binder(), sp)),
   };
-  { parser: done.parser, node: { imports: shown, items: done.items } }
+  let ranged = match first_cases(done.items) {
+    None -> shown,
+    Some(sp) -> push(shown, hidden_import(b"cases", cases_binder(), sp)),
+  };
+  { parser: done.parser, node: { imports: ranged, items: done.items } }
 }
+
+// Where the module's first test over cases says `for`: listing and choosing a case call `std.cases`.
+fn first_cases(items: List<Item>) -> Option<Span> =
+  fold(items, None, |acc: Option<Span>, item: Item|
+    match acc {
+      Some(_) -> acc,
+      None -> match item {
+        ITest(d) -> match d.cases { Some(c) -> Some(c.for_span), None -> None },
+        _ -> None,
+      },
+    })
 
 // Where the module first interpolates or derives `show`, either of which calls into `std.show`.
 fn first_shown(input: Input, items: List<Item>) -> Option<Span> = {
@@ -1480,15 +1599,15 @@ fn first_shown(input: Input, items: List<Item>) -> Option<Span> = {
 }
 
 // An import no source can write, so it is never printed and never collides with a binder.
-fn shown_import(span: Span) -> ImportDecl =
+fn hidden_import(module: Bytes, binder: Bytes, span: Span) -> ImportDecl =
   {
-    path: [{ name: b"std", span: span }, { name: b"show", span: span }],
-    kind: IAlias({ name: shown_binder(), span: span }),
+    path: [{ name: b"std", span: span }, { name: module, span: span }],
+    kind: IAlias({ name: binder, span: span }),
     span: span,
   }
 
 pub fn is_written(decl: ImportDecl) -> Bool =
-  match decl.kind { IAlias(a) -> a.name != shown_binder(), _ -> true }
+  match decl.kind { IAlias(a) -> !hidden_binder(a.name), _ -> true }
 
 pub fn parse(src: Bytes) -> Parsed<Module> / {abort.raise} = {
   let s = start(src);
@@ -1633,6 +1752,17 @@ pub fn dump_test(test_def: TestDef) -> Bytes / {abort.raise} =
     dump_payload(test_def.name),
     dump_bool(test_def.is_nondet),
     dump_expr(test_def.body),
+    match test_def.cases {
+      Some(c) ->
+        bytes_concat_all([
+          dump_word(b"for"),
+          dump_ident(c.binder),
+          dump_ty(c.ty),
+          dump_expr(c.table),
+          dump_expr(c.label),
+        ]),
+      None -> b"",
+    },
   ])
 
 pub fn dump_derive(d: DeriveDef) -> Bytes / {abort.raise} =
@@ -1853,6 +1983,49 @@ test "a line string is an expression, and never a pattern or a test's label" {
   assert_eq(
     first(b"test\n  \\\\t\n{ 1 }\n"),
     Some(b"expected a quoted test name, found line string"),
+  )
+}
+
+test "a test over cases binds a name at a type and ranges over a table, and its name is its label as written" {
+  let r = parse(b"test/nondet \"n {c.n}\" for c: Row in rows() { assert(c.ok) }\n");
+  assert_eq(len(r.parser.diags), 0);
+  match r.node.items {
+    [ITest(d)] -> {
+      assert_eq(d.name, b"n {c.n}");
+      assert_eq(d.name_span, { start: 12, end: 21 });
+      assert(d.is_nondet);
+      match d.cases {
+        Some(c) -> {
+          assert_eq(c.binder.name, b"c");
+          assert_eq(ty_span(c.ty), { start: 29, end: 32 });
+          assert_eq(expr_span(c.table), { start: 36, end: 42 })
+        },
+        None -> panic("a test over cases"),
+      }
+    },
+    _ -> panic("one test"),
+  };
+  // Its holes and its cases are read through two modules no source imports.
+  assert_eq(len(r.node.imports), 2);
+  assert_eq(len(filter(r.node.imports, is_written)), 0);
+  assert_eq(len(parse(b"test \"n\" { assert(true) }\n").node.imports), 0)
+}
+
+test "a test over cases names its case's type and its table, and only a quoted label takes holes" {
+  let first = |src: Bytes|
+    match list_at(parse(src).parser.diags, 0) { Some(d) -> Some(d.message), None -> None };
+  assert_eq(first(b"test \"n\" for c: Int in [1] { assert(c > 0) }\n"), None);
+  assert_eq(
+    first(b"test \"n {c}\" for c in [1] { assert(c > 0) }\n"),
+    Some(b"expected `:` and the case's type after its name, found identifier `in`"),
+  );
+  assert_eq(
+    first(b"test \"n {c}\" for c: Int [1] { assert(c > 0) }\n"),
+    Some(b"expected `in` and the table of cases, found `[`"),
+  );
+  assert_eq(
+    first(b"test f\"n {c}\" { assert(true) }\n"),
+    Some(b"expected a quoted test name, found interpolated string"),
   )
 }
 

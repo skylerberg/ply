@@ -19,9 +19,14 @@ nondet effect tester {
   write bound[r](config: Configured) -> Result<Unit, List<Diag>>
   read hosted[r]() -> Hosted
   write ended[r]() -> Unit
-  read executed[r](unit: Int, index: Int) -> Executed
+  read cases[r](unit: Int, index: Int) -> Result<List<Listed>, Unlisted>
+  read executed[r](unit: Int, index: Int, case: Option<Chosen>) -> Executed
   read moved[r](trace: Bytes) -> Option<String>
 }
+
+type Listed = { label: String, digest: Bytes }
+type Chosen = { at: Int, digest: Bytes }
+type Unlisted = { status: String, failure: Raised }
 
 type Configured = {
   values: List<{ key: String, value: String, secret: Bool }>,
@@ -120,7 +125,7 @@ fn options(root: String) -> Options =
 const ONE_RUN: &str = r#"
 fn main(root: String, front: LoadedAnalysis, unit: Bytes) -> String / {
   tester.configure[r], tester.unit[r], tester.bound[r], tester.hosted[r], tester.ended[r],
-  tester.executed[r],
+  tester.cases[r], tester.executed[r],
 } = {
   tester.configure[r](options(root));
   match tester.unit[r](front, Some(unit), true) {
@@ -128,14 +133,28 @@ fn main(root: String, front: LoadedAnalysis, unit: Bytes) -> String / {
     Ok(u) -> match tester.bound[r]({ values: [], schema: None, opened: false }) {
       Err(_) -> "unbound",
       Ok(_) -> {
-        let adds = tester.executed[r](u, 0);
-        let wrong = tester.executed[r](u, 1);
-        let peeks = tester.executed[r](u, 2);
+        let adds = tester.executed[r](u, 0, None);
+        let wrong = tester.executed[r](u, 1, None);
+        let peeks = tester.executed[r](u, 2, None);
+        let sums = match tester.cases[r](u, 3) {
+          Err(why) -> why.status,
+          Ok(listed) ->
+            fold(range(0, len(listed)), "", |said: String, at: Int|
+              match list_at(listed, at) {
+                None -> said,
+                Some(c) ->
+                  said ++ " " ++ c.label ++ " "
+                    ++ tester.executed[r](u, 3, Some({ at: at, digest: c.digest })).status,
+              }),
+        };
+        // A case the table does not hold is a failure of the run that asked for it.
+        let gone = tester.executed[r](u, 3, Some({ at: 0, digest: b"none" })).status;
         let h = tester.hosted[r]();
         tester.ended[r]();
         adds.status ++ " " ++ wrong.status ++ " " ++ peeks.status ++ " "
           ++ int_to_string(peeks.usage.performs) ++ " " ++ int_to_string(adds.usage.performs) ++ " "
           ++ h.label ++ " " ++ (if h.backend.fragment > 0 { "compiled" } else { "empty" })
+          ++ " |" ++ sums ++ " | " ++ gone
       },
     },
   }
@@ -150,7 +169,7 @@ fn first_of(root: String, front: LoadedAnalysis, unit: Bytes) -> String / {
   tester.configure[r](options(root));
   match tester.unit[r](front, Some(unit), false) {
     Err(_) -> "no unit",
-    Ok(u) -> int_to_string(u) ++ " " ++ tester.executed[r](u, 0).status,
+    Ok(u) -> int_to_string(u) ++ " " ++ tester.executed[r](u, 0, None).status,
   }
 }
 
@@ -185,6 +204,13 @@ test "peeks" {
   };
   assert_eq(n, 6)
 }
+
+test "sums to {c.sum}" for c: { a: Int, b: Int, sum: Int } in [
+    { a: 1, b: 2, sum: 3 },
+    { a: 2, b: 2, sum: 5 },
+  ] {
+  assert_eq(add(c.a, c.b), c.sum)
+}
 "#;
 
 /// A machine over `DECLARED` and `main`, bound to the tester operations the program declares.
@@ -196,7 +222,7 @@ fn driving(main: &str) -> Machine<'static> {
     // Only what this program declares: a family's operation the program does not declare is a
     // registration the binding refuses.
     for (op, handler) in ply_machine::tester::Session::new().lent() {
-        if op.op.as_str() != "interleaved" {
+        if op.op.as_str() != "interleaved" && (op.op.as_str() != "cases" || main == ONE_RUN) {
             registry.register(op, handler);
         }
     }
@@ -226,10 +252,13 @@ fn a_program_runs_its_tests_through_the_family_and_files_what_it_decided() {
     let project = crate::fixture::project(PROJECT);
     let answer = answer_of(&mut driving(ONE_RUN), root_and_front(&project).to_vec());
     // The runtime runs exactly what it is asked and says how each ended; a handled operation is
-    // performed all the same, and a test's count starts over with it.
+    // performed all the same, and a test's count starts over with it. A test over cases lists
+    // them and runs the one it is asked for.
     assert_eq!(
         answer,
-        Value::str("passed failed passed 3 0 hermetic compiled"),
+        Value::str(
+            "passed failed passed 3 0 hermetic compiled | sums to 3 passed sums to 5 failed | failed"
+        ),
         "the program saw: {answer:?}"
     );
 }
