@@ -2463,7 +2463,7 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
-| 4 | `ply test --kept`: no answer a run kept stands |
+| 4 | `ply test --kept`: what earlier runs kept does not answer the run |
 | *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
@@ -2658,8 +2658,12 @@ shipped definition its program reached hashes as it did (§13); otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 `--no-cache` and a configuration file or schema always load. In the `--json`
 document, `front_end` carries `reused` and `key` for an answer taken back,
-beside the phases of this run, all of it read. `--kept` answers only that way:
-where no kept answer stands it loads nothing and exits 4, so a caller can tell
+beside the phases of this run, all of it read. A `--json` run of several
+`--filter`s also keeps, for each, the answer a run of it alone gives. `--kept`
+answers only from what was kept: where no kept answer of the whole command line
+stands, a run of several filters asks each what a run of it alone kept, exits 0
+where every one is answered and otherwise lists the rest under `unanswered`;
+exit 4 is a run nothing kept answers, with nothing loaded, so a caller can tell
 which runs have work before starting them. `ply defs` keeps its listing the same
 way, beside every embed the program read, and a later listing over the same
 command line, files and `ply` takes it back while every shipped definition the
