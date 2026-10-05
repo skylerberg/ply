@@ -661,16 +661,21 @@ impl<K, B> Scheduler<K, B> {
             return Err(err_foreign_task(span, target.id()));
         }
         let target = target.id();
-        let done = match self.tasks.get(&target).map(|t| &t.state) {
+        let settled = match self.tasks.get(&target).map(|t| &t.state) {
             None => return Err(err_unknown_task(span, target)),
-            Some(TaskState::Done(value)) => Some(value.clone()),
-            Some(TaskState::Cancelled) => return Err(err_joined_cancelled(span, target)),
+            Some(TaskState::Done(value)) => Some(Ok(value.clone())),
+            Some(TaskState::Cancelled) => Some(Err(err_joined_cancelled(span, target))),
             Some(_) => None,
         };
-        match done {
-            Some(value) => {
+        match settled {
+            Some(answer) => {
                 self.absorb(task, target);
-                self.make_ready(task, Resumption::Resume { k, value });
+                let resumption = match answer {
+                    Ok(value) => Resumption::Resume { k, value },
+                    // A raise in the joiner, as it is when the task is cancelled under its join.
+                    Err(failure) => Resumption::Raise { k, failure },
+                };
+                self.make_ready(task, resumption);
             }
             None => {
                 self.task_mut(target)?.joiners.push(task);
