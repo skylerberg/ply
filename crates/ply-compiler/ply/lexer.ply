@@ -215,6 +215,7 @@ fn token_at(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise}
   let c = bytes_at(src, start);
   if is_digit(c) { number(src, scanner, start) }
   else if c == 98 && peek(src, start + 1) == 34 { bytes_lit(src, scanner, start) }
+  else if c == 98 && peek(src, start + 1) == 39 { byte_lit(src, scanner, start) }
   else if c == 102 && peek(src, start + 1) == 34 {
     interpolated_piece(src, scanner, start, start + 2, true)
   } else if is_ident_start(c) { ident(src, scanner, start) }
@@ -1148,16 +1149,19 @@ fn unicode_escape(src: Bytes, i: Int) -> Escape / {abort.raise} =
     }
   }
 
+/// What a one-letter escape names inside single quotes, or `-1` for any other letter.
+fn letter_escape(c: Int) -> Int =
+  if c == 110 { 10 }
+  else if c == 116 { 9 }
+  else if c == 114 { 13 }
+  else if c == 48 { 0 }
+  else if c == 92 || c == 39 || c == 34 { c }
+  else { 0 - 1 }
+
 /// The escape at the backslash `i` inside a character literal.
 fn char_escape(src: Bytes, i: Int) -> Escape / {abort.raise} = {
   let c = peek(src, i + 1);
-  if c == 110 { escape_at(10, i + 2) }
-  else if c == 116 { escape_at(9, i + 2) }
-  else if c == 114 { escape_at(13, i + 2) }
-  else if c == 48 { escape_at(0, i + 2) }
-  else if c == 92 { escape_at(92, i + 2) }
-  else if c == 39 { escape_at(39, i + 2) }
-  else if c == 34 { escape_at(34, i + 2) }
+  if letter_escape(c) >= 0 { escape_at(letter_escape(c), i + 2) }
   else if c == 117 { unicode_escape(src, i) } else if c < 0 || c == 10 {
     bad_escape(i + 1, unterminated(), b"unterminated character literal", b"add a closing `'`")
   } else {
@@ -1205,7 +1209,8 @@ fn utf8_point(src: Bytes, i: Int, w: Int) -> Int / {abort.raise} =
 /// `'a'`, `'\n'` or `'\u{1F600}'`: exactly one character between single quotes.
 fn char_lit(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} = {
   let c = peek(src, open + 1);
-  if c < 0 || c == 10 { unterminated_char(scanner, open, open + 1, 0) } else if c == 39 {
+  if c < 0 || c == 10 { unterminated_char(scanner, open, open + 1, CharLiteral(0)) }
+  else if c == 39 {
     push_token(
       push_error(
         scanner,
@@ -1221,55 +1226,145 @@ fn char_lit(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} 
     )
   } else if c == 92 {
     let e = char_escape(src, open + 1);
-    if e.point < 0 { char_close(src, refused(scanner, open + 1, e), open, e.end, 0) }
-    else { char_close(src, scanner, open, e.end, e.point) }
+    if e.point < 0 { char_close(src, refused(scanner, open + 1, e), open, e.end, CharLiteral(0)) }
+    else { char_close(src, scanner, open, e.end, CharLiteral(e.point)) }
   } else {
     let w = utf8_len(c);
-    char_close(src, scanner, open, open + 1 + w, utf8_point(src, open + 1, w))
+    char_close(src, scanner, open, open + 1 + w, CharLiteral(utf8_point(src, open + 1, w)))
   }
 }
 
-/// The closing quote after the one character; more before it is refused, and so is none on the line.
+/// What a single-quoted literal holds one of, for its refusals: a byte literal lexes as an `Int`.
+fn quoted_unit(kind: TokenKind) -> Bytes =
+  match kind { CharLiteral(_) -> b"character", _ -> b"byte" }
+
+/// The closing quote after the one character or byte, the literal opening at `start`; more before
+/// it is refused, and so is none on the line.
 fn char_close(
   src: Bytes,
   scanner: Scanner,
-  open: Int,
+  start: Int,
   i: Int,
-  point: Int,
+  kind: TokenKind,
 ) -> Scanner / {abort.raise} =
-  if peek(src, i) == 39 { push_token(scanner, open, i + 1, CharLiteral(point)) } else {
+  if peek(src, i) == 39 { push_token(scanner, start, i + 1, kind) } else {
     let close = scan_until(src, i, b"'\n");
     if peek(src, close) == 39 {
       push_token(
         push_error(
           scanner,
-          open,
+          start,
           close + 1,
           unexpected(),
-          b"a character literal holds one character",
-          b"write a string, `\"...\"`, for more than one",
+          bytes_concat_all([b"a ", quoted_unit(kind), b" literal holds one ", quoted_unit(kind)]),
+          match kind {
+            CharLiteral(_) -> b"write a string, `\"...\"`, for more than one",
+            _ -> b"write a byte string, `b\"...\"`, for more than one",
+          },
         ),
-        open,
+        start,
         close + 1,
-        CharLiteral(point),
+        kind,
       )
-    } else { unterminated_char(scanner, open, close, point) }
+    } else { unterminated_char(scanner, start, close, kind) }
   }
 
-fn unterminated_char(scanner: Scanner, open: Int, stop: Int, point: Int) -> Scanner =
+fn unterminated_char(scanner: Scanner, start: Int, stop: Int, kind: TokenKind) -> Scanner =
   push_token(
     push_error(
       scanner,
-      open,
+      start,
       stop,
       unterminated(),
-      b"unterminated character literal",
+      bytes_concat_all([b"unterminated ", quoted_unit(kind), b" literal"]),
       b"add a closing `'`",
     ),
-    open,
+    start,
     stop,
-    CharLiteral(point),
+    kind,
   )
+
+// --- Byte literals ----------------------------------------------------------
+
+/// `b'a'`, `b'\n'` or `b'\x1f'`: one ASCII character or one escape between single quotes, lexed as
+/// the `Int` that byte is.
+fn byte_lit(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
+  let at = start + 2;
+  let c = peek(src, at);
+  if c < 0 || c == 10 { unterminated_char(scanner, start, at, IntLiteral(0)) } else if c == 39 {
+    push_token(
+      push_error(
+        scanner,
+        start,
+        at + 1,
+        unexpected(),
+        b"an empty byte literal",
+        b"a byte literal holds exactly one byte",
+      ),
+      start,
+      at + 1,
+      IntLiteral(0),
+    )
+  } else if c == 92 {
+    let e = byte_escape(src, at);
+    if e.point < 0 { char_close(src, refused(scanner, at, e), start, e.end, IntLiteral(0)) }
+    else { char_close(src, scanner, start, e.end, IntLiteral(e.point)) }
+  } else if c >= 128 {
+    let w = utf8_len(c);
+    char_close(
+      src,
+      push_error(
+        scanner,
+        at,
+        at + w,
+        unexpected(),
+        bytes_concat_all([
+          b"`",
+          bytes_slice(src, at, at + w),
+          b"` is not an ASCII character, so it has no place in `b'...'`",
+        ]),
+        b"a byte literal holds one byte: write it as `\\xNN`",
+      ),
+      start,
+      at + w,
+      IntLiteral(0),
+    )
+  } else { char_close(src, scanner, start, at + 1, IntLiteral(c)) }
+}
+
+/// The escape at the backslash `i` inside a byte literal: a byte string's, and `\'`.
+fn byte_escape(src: Bytes, i: Int) -> Escape / {abort.raise} = {
+  let c = peek(src, i + 1);
+  if letter_escape(c) >= 0 { escape_at(letter_escape(c), i + 2) } else if c == 120 {
+    let hi = hex_value(peek(src, i + 2));
+    let lo = hex_value(peek(src, i + 3));
+    if hi >= 0 && lo >= 0 { escape_at(hi * 16 + lo, i + 4) } else {
+      bad_escape(
+        if hi >= 0 { i + 3 } else { i + 2 },
+        unexpected(),
+        b"`\\x` needs exactly two hex digits",
+        b"write two hex digits, as in `\\x0d`",
+      )
+    }
+  } else if c == 117 {
+    bad_escape(
+      unicode_escape(src, i).end,
+      unexpected(),
+      b"`\\u{...}` names a character, and a byte literal holds a byte",
+      b"write one of the character's UTF-8 bytes as `\\xNN`",
+    )
+  } else if c < 0 || c == 10 {
+    bad_escape(i + 1, unterminated(), b"unterminated byte literal", b"add a closing `'`")
+  } else {
+    let w = utf8_len(c);
+    bad_escape(
+      i + 1 + w,
+      unexpected(),
+      bytes_concat_all([b"unknown escape sequence `\\", bytes_slice(src, i + 1, i + 1 + w), b"`"]),
+      b"valid escapes are \\n \\t \\r \\0 \\\\ \\' \\\" and \\xNN",
+    )
+  }
+}
 
 // --- Line strings -----------------------------------------------------------
 
@@ -1497,15 +1592,23 @@ fn punct(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abort.r
   else if c == 93 { push_token(scanner, start, start + 1, Punctuation(b"rbracket")) }
   else if c == 44 { push_token(scanner, start, start + 1, Punctuation(b"comma")) }
   else if c == 59 { push_token(scanner, start, start + 1, Punctuation(b"semi")) }
-  else if c == 58 { punct_pair(scanner, src, start, 58, b"coloncolon", b"colon") }
-  else if c == 46 { punct_pair(scanner, src, start, 46, b"dotdot", b"dot") }
+  else { operator(src, scanner, start, c) }
+
+/// What `punct` reads past the brackets and separators.
+fn operator(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abort.raise} =
+  if c == 58 { punct_pair(scanner, src, start, 58, b"coloncolon", b"colon") }
+  else if c == 46 && peek(src, start + 1) == 46 && peek(src, start + 2) == 61 {
+    push_token(scanner, start, start + 3, Punctuation(b"dotdoteq"))
+  } else if c == 46 { punct_pair(scanner, src, start, 46, b"dotdot", b"dot") }
   else if c == 61 { punct_pair(scanner, src, start, 61, b"eqeq", b"eq") }
   else if c == 33 { punct_pair(scanner, src, start, 61, b"bangeq", b"bang") }
   else if c == 60 { punct_pair(scanner, src, start, 61, b"le", b"lt") }
   else if c == 62 { punct_pair(scanner, src, start, 61, b"ge", b"gt") }
-  else if c == 43 { punct_pair(scanner, src, start, 43, b"plusplus", b"plus") }
-  else if c == 45 { punct_pair(scanner, src, start, 62, b"arrow", b"minus") }
-  else if c == 42 { push_token(scanner, start, start + 1, Punctuation(b"star")) }
+  else if c == 43 && peek(src, start + 1) != 43 { arithmetic(scanner, src, start, b"plus") }
+  else if c == 43 { push_token(scanner, start, start + 2, Punctuation(b"plusplus")) }
+  else if c == 45 && peek(src, start + 1) != 62 { arithmetic(scanner, src, start, b"minus") }
+  else if c == 45 { push_token(scanner, start, start + 2, Punctuation(b"arrow")) }
+  else if c == 42 { arithmetic(scanner, src, start, b"star") }
   else if c == 47 { push_token(scanner, start, start + 1, Punctuation(b"slash")) }
   else if c == 37 { push_token(scanner, start, start + 1, Punctuation(b"percent")) }
   else if c == 63 { push_token(scanner, start, start + 1, Punctuation(b"question")) }
@@ -1537,6 +1640,17 @@ fn punct(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abort.r
       b"this character has no meaning in Ply source",
     )
   }
+
+/// `+`, `-` or `*`, and with a `%` or a `|` touching it the operator that wraps or saturates:
+/// `+%` is `pluspercent` and `+|` is `pluspipe`.
+fn arithmetic(scanner: Scanner, src: Bytes, start: Int, single: Bytes) -> Scanner / {abort.raise} = {
+  let next = peek(src, start + 1);
+  if next == 37 {
+    push_token(scanner, start, start + 2, Punctuation(bytes_concat(single, b"percent")))
+  } else if next == 124 {
+    push_token(scanner, start, start + 2, Punctuation(bytes_concat(single, b"pipe")))
+  } else { push_token(scanner, start, start + 1, Punctuation(single)) }
+}
 
 fn punct_pair(
   scanner: Scanner,
@@ -1776,6 +1890,59 @@ test "a character literal holds exactly one character" {
   assert_eq(dump(b"''"), "0:2:c:0;2:2:e;0:2:!:E0001;");
   assert_eq(dump(b"'ab'"), "0:4:c:97;4:4:e;0:4:!:E0001;");
   assert_eq(dump(b"'a"), "0:2:c:97;2:2:e;0:2:!:E0002;")
+}
+
+test "a byte literal is the Int its one byte is, with a byte string's escapes" {
+  assert_eq(dump(b"b'a'"), "0:4:n:97;4:4:e;");
+  assert_eq(dump(b"b'{' b'\"' b' '"), "0:4:n:123;5:9:n:34;10:14:n:32;14:14:e;");
+  assert_eq(
+    dump(b"b'\\n' b'\\'' b'\\\"' b'\\\\' b'\\0' b'\\x1f' b'\\xFF'"),
+    "0:5:n:10;6:11:n:39;12:17:n:34;18:23:n:92;24:29:n:0;30:37:n:31;38:45:n:255;45:45:e;",
+  )
+}
+
+test "a name that ends in b before a quote is a name and a character" {
+  assert_eq(dump(b"ab 'c'"), "0:2:i:ab;3:6:c:99;6:6:e;");
+  assert_eq(dump(b"b 'c'"), "0:1:i:b;2:5:c:99;5:5:e;")
+}
+
+test "a byte literal holds exactly one ASCII byte" {
+  assert_eq(dump(b"b''"), "0:3:n:0;3:3:e;0:3:!:E0001;");
+  assert_eq(dump(b"b'ab'"), "0:5:n:97;5:5:e;0:5:!:E0001;");
+  assert_eq(dump(b"b'a"), "0:3:n:97;3:3:e;0:3:!:E0002;");
+  assert_eq(dump(b"b'\xc3\xa9'"), "0:5:n:0;5:5:e;2:4:!:E0001;");
+  assert_eq(dump(b"b'\\u{e9}'"), "0:9:n:0;9:9:e;2:8:!:E0001;");
+  assert_eq(dump(b"b'\\x1'"), "0:6:n:0;6:6:e;2:5:!:E0001;");
+  assert_eq(dump(b"b'\\q'"), "0:5:n:0;5:5:e;2:4:!:E0001;")
+}
+
+test "an arithmetic operator with a `%` or a `|` touching it is one token" {
+  assert_eq(
+    dump(b"a +% b -% c *% d"),
+    "0:1:i:a;2:4:p:pluspercent;5:6:i:b;7:9:p:minuspercent;10:11:i:c;12:14:p:starpercent;15:16:i:d;16:16:e;",
+  );
+  assert_eq(
+    dump(b"a +| b -| c *| d"),
+    "0:1:i:a;2:4:p:pluspipe;5:6:i:b;7:9:p:minuspipe;10:11:i:c;12:14:p:starpipe;15:16:i:d;16:16:e;",
+  );
+  assert_eq(dump(b"a ++ b"), "0:1:i:a;2:4:p:plusplus;5:6:i:b;6:6:e;");
+  assert_eq(dump(b"a -> b"), "0:1:i:a;2:4:p:arrow;5:6:i:b;6:6:e;")
+}
+
+test "a `|` or a `%` apart from the operator before it is its own token" {
+  assert_eq(dump(b"a + |x| x"), "0:1:i:a;2:3:p:plus;4:5:p:pipe;5:6:i:x;6:7:p:pipe;8:9:i:x;9:9:e;");
+  assert_eq(dump(b"-1 | -2"), "0:1:p:minus;1:2:n:1;3:4:p:pipe;5:6:p:minus;6:7:n:2;7:7:e;");
+  assert_eq(dump(b"-1|-2"), "0:1:p:minus;1:2:n:1;2:3:p:pipe;3:4:p:minus;4:5:n:2;5:5:e;");
+  assert_eq(dump(b"a * b % c"), "0:1:i:a;2:3:p:star;4:5:i:b;6:7:p:percent;8:9:i:c;9:9:e;");
+  assert_eq(dump(b"<a | e>"), "0:1:p:lt;1:2:i:a;3:4:p:pipe;5:6:i:e;6:7:p:gt;7:7:e;")
+}
+
+test "`..=` is one token, and `..` before anything else is its own" {
+  assert_eq(dump(b"0..=9"), "0:1:n:0;1:4:p:dotdoteq;4:5:n:9;5:5:e;");
+  assert_eq(
+    dump(b"[a, ..]"),
+    "0:1:p:lbracket;1:2:i:a;2:3:p:comma;4:6:p:dotdot;6:7:p:rbracket;7:7:e;",
+  )
 }
 
 test "an interpolated string is its text pieces around the tokens of each hole" {
