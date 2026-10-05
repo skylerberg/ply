@@ -1,0 +1,664 @@
+//! A priority queue: values under priorities, the least priority leaving first.
+//!
+//! The priority stands apart from the value, so nothing is wrapped to be ordered, and entries of
+//! one priority leave in the order they came, so a scheduler built on a heap is deterministic. The
+//! order is the priorities' own `compare` (`empty`), or a caller's comparison as `sort_by` takes
+//! one (`empty_by`); for the greatest first, hand `empty_by` the comparison turned round.
+//!
+//! A `Heap` is a leftist tree. `push`, `pop_min` and `merge` each walk one path of it, which is
+//! logarithmic in its size whether or not anything else holds the heap, so a heap kept and used
+//! again costs what a new one does. `of_list` builds one in linear steps.
+//!
+//! A heap is what it would pop: `to_list` is its `key`, so two heaps holding the same entries are
+//! `==`, share a `digest` and are one `Map` key however each was built. A key function is called
+//! with the heap alone, which is why the heap holds its order as a function. Each comparison
+//! lists both heaps, a pop for every entry.
+
+import std.laws (agrees, refines)
+import std.list (drop, flatten, sort, sort_by, take)
+import std.list as list
+import std.math (ilog2)
+
+/// A value and the priority it was pushed under.
+pub type Entry<p, a> = { priority: p, value: a }
+
+/// A priority queue of `a`s under priorities `p`.
+///
+/// The order, whether that order is the priorities' own `compare`, the tree, how many entries it
+/// holds, and the sequence number the next push takes.
+pub type Heap<p, a> = | Heap((p, p) -> Ordering, Bool, Tree<p, a>, Int, Int)
+
+key for Heap by to_list
+
+/// A leftist tree, the entry that leaves first at its root.
+type Tree<p, a> =
+  | Leaf
+  /// The rank (one more than the right child's), a shift, the priority, the sequence number, the
+  /// value, and the two children, the left of no lower rank than the right. A sequence number
+  /// counts for itself plus the shift of its node and of every node above it, which is what lets
+  /// `merge` put a whole heap behind another by writing one number.
+  | Node(Int, Int, p, Int, a, Tree<p, a>, Tree<p, a>)
+
+/// The heap holding nothing, in the priorities' own order: the least by `compare` leaves first.
+pub fn empty<p, a>() -> Heap<p, a>
+  where derivable(ord, p)
+= Heap(|x: p, y: p| compare(x, y), true, Leaf, 0, 0)
+
+/// The heap holding nothing, ordered by `before`, which says whether its first argument is to
+/// leave first, as `sort_by`'s does. Two priorities neither of which is before the other, or each
+/// of which is, are equal: their entries leave in the order they came.
+pub fn empty_by<p, a>(before: (p, p) -> Bool) -> Heap<p, a> =
+  Heap(ordering(before), false, Leaf, 0, 0)
+
+/// The heap of `entries` in the priorities' own order, an earlier entry leaving before a later
+/// one of its priority. Linear in their number.
+pub fn of_list<p, a>(entries: List<Entry<p, a>>) -> Heap<p, a>
+  where derivable(ord, p)
+= built(|x: p, y: p| compare(x, y), true, entries)
+
+/// The heap of `entries` ordered by `before`, as `empty_by` reads it.
+pub fn of_list_by<p, a>(entries: List<Entry<p, a>>, before: (p, p) -> Bool) -> Heap<p, a> =
+  built(ordering(before), false, entries)
+
+/// How many entries the heap holds.
+pub fn size<p, a>(h: Heap<p, a>) -> Int = match h { Heap(_, _, _, n, _) -> n }
+
+/// Whether the heap holds nothing.
+pub fn is_empty<p, a>(h: Heap<p, a>) -> Bool =
+  match h { Heap(_, _, tree, _, _) -> match tree { Leaf -> true, _ -> false } }
+
+/// `h` with `x` under `priority`, behind every entry of that priority it already holds.
+pub fn push<p, a>(h: Heap<p, a>, priority: p, x: a) -> Heap<p, a> =
+  match h {
+    Heap(order, natural, tree, n, next) ->
+      Heap(
+        order,
+        natural,
+        joined(order, tree, 0, Node(1, 0, priority, next, x, Leaf, Leaf), 0),
+        n + 1,
+        next + 1,
+      ),
+  }
+
+/// The entry `pop_min` would take, or `None` for an empty heap.
+pub fn peek_min<p, a>(h: Heap<p, a>) -> Option<Entry<p, a>> =
+  match h {
+    Heap(_, _, tree, _, _) -> match tree {
+      Leaf -> None,
+      Node(_, _, priority, _, value, _, _) -> Some({ priority: priority, value: value }),
+    },
+  }
+
+/// The entry that leaves first, the earliest pushed of the least priority, and the heap without
+/// it; `None` for an empty heap.
+pub fn pop_min<p, a>(h: Heap<p, a>) -> Option<{ priority: p, value: a, rest: Heap<p, a> }> =
+  match h {
+    Heap(order, natural, tree, n, next) -> match tree {
+      Leaf -> None,
+      Node(_, shift, priority, _, value, left, right) ->
+        Some({
+          priority: priority,
+          value: value,
+          rest: match joined(order, left, shift, right, shift) {
+            Leaf -> Heap(order, natural, Leaf, 0, 0),
+            rest -> Heap(order, natural, rest, n - 1, next),
+          },
+        }),
+    },
+  }
+
+/// Every entry of both, in `a`'s order, `a`'s leaving before `b`'s of the same priority.
+///
+/// Two heaps in the priorities' own order are joined along one path of each. One made by
+/// `empty_by` or `of_list_by` may be ordered otherwise than `a`, so `b`'s entries are then pushed
+/// onto `a` one by one.
+pub fn merge<p, a>(a: Heap<p, a>, b: Heap<p, a>) -> Heap<p, a> =
+  match a {
+    Heap(order, natural, tree, n, next) -> match b {
+      Heap(_, also_natural, other, m, other_next) -> if !(natural && also_natural) {
+        fold(to_list(b), a, |h: Heap<p, a>, e: Entry<p, a>| push(h, e.priority, e.value))
+      } else if other_next <= most_numbered() - next {
+        Heap(order, natural, joined(order, tree, 0, other, next), n + m, next + other_next)
+      } else { built(order, natural, list::concat(to_list(a), to_list(b))) },
+    },
+  }
+
+/// The entries in the order `pop_min` would answer them, which is what a heap is compared,
+/// ordered and digested by.
+pub fn to_list<p, a>(h: Heap<p, a>) -> List<Entry<p, a>> =
+  match h { Heap(order, _, tree, n, _) -> listed(order, tree, n, []) }
+
+/// The first `k` entries `pop_min` would answer, or all of them where the heap holds fewer.
+pub fn top_k<p, a>(h: Heap<p, a>, k: Int) -> List<Entry<p, a>> =
+  match h { Heap(order, _, tree, n, _) -> listed(order, tree, min(k, n), []) }
+
+/// The elements of every run in ascending order, each run being ascending already: a merge of
+/// `k` runs holding `n` elements between them takes `n log k` comparisons. Equal elements keep
+/// the order of their runs, and within a run their own.
+pub fn merge_sorted<a>(runs: List<List<a>>) -> List<a>
+  where derivable(ord, a)
+= merge_sorted_by(runs, |x: a, y: a| compare(x, y) == Less)
+
+/// `merge_sorted` for runs each ordered by `before`, as `sort_by` orders one.
+pub fn merge_sorted_by<a>(runs: List<List<a>>, before: (a, a) -> Bool) -> List<a> = {
+  let order = ordering(before);
+  let by_head = |x: Head<a>, y: Head<a>|
+    match order(x.head, y.head) { Equal -> compare(x.run, y.run), decided -> decided };
+  let heads = fold(
+    range(0, len(runs)),
+    Heap(by_head, false, Leaf, 0, 0),
+    |h: Heap<Head<a>, List<a>>, i: Int|
+      match list_at(runs, i) { Some(run) -> entered(h, i, run), None -> h },
+  );
+  fold(
+    range(0, fold(runs, 0, |n: Int, run: List<a>| n + len(run))),
+    { rest: heads, out: [] },
+    |s: { rest: Heap<Head<a>, List<a>>, out: List<a> }, _i: Int|
+      match pop_min(s.rest) {
+        None -> s,
+        Some(top) ->
+          {
+            rest: entered(top.rest, top.priority.run, top.value),
+            out: list::concat(s.out, [top.priority.head]),
+          },
+      },
+  ).out
+}
+
+/// A run's next element and which run it is of.
+type Head<a> = { head: a, run: Int }
+
+fn entered<a>(h: Heap<Head<a>, List<a>>, run: Int, xs: List<a>) -> Heap<Head<a>, List<a>> =
+  match xs { [] -> h, [x, ..rest] -> push(h, { head: x, run: run }, rest) }
+
+fn ordering<p>(before: (p, p) -> Bool) -> (p, p) -> Ordering =
+  |x: p, y: p|
+    if before(x, y) { if before(y, x) { Equal } else { Less } }
+    else if before(y, x) { Greater }
+    else { Equal }
+
+/// Sequence numbers stay below this, so adding two of them cannot leave an `Int`.
+fn most_numbered() -> Int = 4611686018427387904
+
+fn built<p, a>(order: (p, p) -> Ordering, natural: Bool, entries: List<Entry<p, a>>) -> Heap<p, a> = {
+  let n = len(entries);
+  let singles = map(range(0, n), |i: Int|
+    match list_at(entries, i) {
+      Some(e) -> Node(1, 0, e.priority, i, e.value, Leaf, Leaf),
+      None -> Leaf,
+    });
+  // Each round joins neighbours, halving the trees: 64 rounds take any list to one.
+  let rounds = fold(range(0, 64), singles, |trees: List<Tree<p, a>>, _round: Int|
+    if len(trees) <= 1 { trees } else {
+      map(range(0, (len(trees) + 1) / 2), |i: Int|
+        match list_at(trees, 2 * i) {
+          None -> Leaf,
+          Some(left) -> match list_at(trees, 2 * i + 1) {
+            None -> left,
+            Some(right) -> joined(order, left, 0, right, 0),
+          },
+        })
+    });
+  Heap(order, natural, match rounds { [tree, ..] -> tree, [] -> Leaf }, n, n)
+}
+
+fn listed<p, a>(
+  order: (p, p) -> Ordering,
+  tree: Tree<p, a>,
+  k: Int,
+  out: List<Entry<p, a>>,
+) -> List<Entry<p, a>> =
+  if k <= 0 { out } else {
+    match tree {
+      Leaf -> out,
+      Node(_, shift, priority, _, value, left, right) ->
+        listed(
+          order,
+          joined(order, left, shift, right, shift),
+          k - 1,
+          list::concat(out, [{ priority: priority, value: value }]),
+        ),
+    }
+  }
+
+/// The two trees as one, `x` under the shift `dx` and `y` under `dy`: the result's sequence
+/// numbers count for themselves. Equal priorities are told apart by sequence number.
+fn joined<p, a>(
+  order: (p, p) -> Ordering,
+  x: Tree<p, a>,
+  dx: Int,
+  y: Tree<p, a>,
+  dy: Int,
+) -> Tree<p, a> =
+  match x {
+    Leaf -> if dy == 0 { y } else { shifted(y, dy) },
+    Node(_, sx, px, qx, vx, lx, rx) -> match y {
+      Leaf -> if dx == 0 { x } else { shifted(x, dx) },
+      Node(_, sy, py, qy, vy, ly, ry) -> {
+        let cx = dx + sx;
+        let cy = dy + sy;
+        if match order(px, py) { Less -> true, Greater -> false, Equal -> qx + cx < qy + cy } {
+          made(
+            px,
+            qx + cx,
+            vx,
+            if cx == 0 { lx } else { shifted(lx, cx) },
+            joined(order, rx, cx, y, dy),
+          )
+        } else {
+          made(
+            py,
+            qy + cy,
+            vy,
+            if cy == 0 { ly } else { shifted(ly, cy) },
+            joined(order, x, dx, ry, cy),
+          )
+        }
+      },
+    },
+  }
+
+fn shifted<p, a>(tree: Tree<p, a>, by: Int) -> Tree<p, a> =
+  match tree {
+    Leaf -> Leaf,
+    Node(rank, shift, priority, seq, value, left, right) ->
+      Node(rank, shift + by, priority, seq, value, left, right),
+  }
+
+fn made<p, a>(priority: p, seq: Int, value: a, left: Tree<p, a>, right: Tree<p, a>) -> Tree<p, a> =
+  match left {
+    Leaf -> Node(1, 0, priority, seq, value, right, Leaf),
+    Node(l, _, _, _, _, _, _) -> match right {
+      Leaf -> Node(1, 0, priority, seq, value, left, Leaf),
+      Node(r, _, _, _, _, _, _) -> if l >= r { Node(r + 1, 0, priority, seq, value, left, right) }
+      else { Node(l + 1, 0, priority, seq, value, right, left) },
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn letters() -> Heap<Int, String> = push(push(push(push(empty(), 2, "b"), 1, "a"), 2, "c"), 1, "d")
+
+test "entries leave least priority first, and equal priorities in the order they came" {
+  let h = letters();
+  assert_eq(size(h), 4);
+  assert(!is_empty(h));
+  assert_eq(to_list(h), [
+    { priority: 1, value: "a" },
+    { priority: 1, value: "d" },
+    { priority: 2, value: "b" },
+    { priority: 2, value: "c" },
+  ]);
+  assert_eq(peek_min(h), Some({ priority: 1, value: "a" }));
+  match pop_min(h) {
+    None -> assert(false),
+    Some(top) -> {
+      assert_eq({ priority: top.priority, value: top.value }, { priority: 1, value: "a" });
+      assert_eq(size(top.rest), 3);
+      assert_eq(peek_min(top.rest), Some({ priority: 1, value: "d" }))
+    },
+  }
+}
+
+test "an empty heap has nothing to answer" {
+  let none: Heap<Int, String> = empty();
+  assert(is_empty(none));
+  assert_eq(size(none), 0);
+  assert_eq(peek_min(none), None);
+  assert(pop_min(none) == None);
+  assert_eq(to_list(none), []);
+  assert_eq(top_k(none, 3), [])
+}
+
+test "a heap emptied and filled again keeps the order of the new pushes" {
+  let once = match pop_min(push(empty(), 1, "a")) { Some(top) -> top.rest, None -> empty() };
+  assert(is_empty(once));
+  assert_eq(size(once), 0);
+  assert_eq(to_list(push(push(once, 5, "x"), 5, "y")), [
+    { priority: 5, value: "x" },
+    { priority: 5, value: "y" },
+  ])
+}
+
+test "a caller's comparison orders the heap, and equals still leave as they came" {
+  let most_first = |entries: List<Entry<Int, String>>|
+    to_list(of_list_by(entries, |x: Int, y: Int| x > y));
+  let entries = [
+    { priority: 1, value: "a" },
+    { priority: 3, value: "b" },
+    { priority: 3, value: "c" },
+    { priority: 2, value: "d" },
+  ];
+  let expected = [
+    { priority: 3, value: "b" },
+    { priority: 3, value: "c" },
+    { priority: 2, value: "d" },
+    { priority: 1, value: "a" },
+  ];
+  assert_eq(most_first(entries), expected);
+  // A comparison that holds of equals too is still read as equal both ways.
+  assert_eq(to_list(of_list_by(entries, |x: Int, y: Int| x >= y)), expected);
+  assert_eq(
+    to_list(
+      push(
+        push(push(empty_by(|x: String, y: String| string_len(x) < string_len(y)), "bb", 1), "a", 2),
+        "cc",
+        3,
+      ),
+    ),
+    [{ priority: "a", value: 2 }, { priority: "bb", value: 1 }, { priority: "cc", value: 3 }],
+  )
+}
+
+test "a merge keeps both orders and puts the first heap's entries before the second's equals" {
+  let a = of_list([{ priority: 1, value: "a1" }, { priority: 1, value: "a2" }]);
+  let b = of_list([{ priority: 1, value: "b1" }, { priority: 0, value: "b0" }]);
+  let both = merge(a, b);
+  assert_eq(size(both), 4);
+  assert_eq(map(to_list(both), |e: Entry<Int, String>| e.value), ["b0", "a1", "a2", "b1"]);
+  // What was merged in stands behind, and a later push behind that.
+  let again = push(merge(both, a), 1, "z");
+  assert_eq(map(to_list(again), |e: Entry<Int, String>| e.value), [
+    "b0",
+    "a1",
+    "a2",
+    "b1",
+    "a1",
+    "a2",
+    "z",
+  ]);
+  assert_eq(map(to_list(merge(b, merge(a, b))), |e: Entry<Int, String>| e.value), [
+    "b0",
+    "b0",
+    "b1",
+    "a1",
+    "a2",
+    "b1",
+  ]);
+  assert_eq(to_list(merge(a, empty())), to_list(a));
+  assert_eq(to_list(merge(empty(), a)), to_list(a))
+}
+
+test "merges, pushes and pops between them keep every entry behind its earlier equals" {
+  let named = |names: List<String>|
+    of_list(map(names, |name: String| { priority: 1, value: name }));
+  let values = |h: Heap<Int, String>| map(to_list(h), |e: Entry<Int, String>| e.value);
+  let a = named(["a1", "a2", "a3"]);
+  let b = push(named(["b1", "b2", "b3"]), 0, "b0");
+  let both = merge(a, b);
+  assert_eq(values(both), ["b0", "a1", "a2", "a3", "b1", "b2", "b3"]);
+  let twice = merge(both, push(both, 1, "z"));
+  assert_eq(values(twice), [
+    "b0",
+    "b0",
+    "a1",
+    "a2",
+    "a3",
+    "b1",
+    "b2",
+    "b3",
+    "a1",
+    "a2",
+    "a3",
+    "b1",
+    "b2",
+    "b3",
+    "z",
+  ]);
+  let later = match pop_min(twice) {
+    Some(first) -> match pop_min(first.rest) {
+      Some(second) -> match pop_min(second.rest) { Some(third) -> third.rest, None -> second.rest },
+      None -> first.rest,
+    },
+    None -> twice,
+  };
+  assert_eq(values(merge(push(later, 1, "y"), b)), [
+    "b0",
+    "a2",
+    "a3",
+    "b1",
+    "b2",
+    "b3",
+    "a1",
+    "a2",
+    "a3",
+    "b1",
+    "b2",
+    "b3",
+    "z",
+    "y",
+    "b1",
+    "b2",
+    "b3",
+  ])
+}
+
+test "a merge of heaps under a caller's order takes the first heap's order" {
+  let down = of_list_by(
+    [{ priority: 1, value: "a" }, { priority: 3, value: "b" }],
+    |x: Int, y: Int| x > y,
+  );
+  let up = of_list([{ priority: 2, value: "c" }, { priority: 3, value: "d" }]);
+  assert_eq(map(to_list(merge(down, up)), |e: Entry<Int, String>| e.value), ["b", "d", "c", "a"]);
+  assert_eq(map(to_list(merge(up, down)), |e: Entry<Int, String>| e.value), ["a", "c", "d", "b"])
+}
+
+test "two heaps holding the same entries are one value, however each was built" {
+  let pushed = push(push(push(empty(), 3, "c"), 1, "a"), 2, "b");
+  let listed = of_list([
+    { priority: 1, value: "a" },
+    { priority: 2, value: "b" },
+    { priority: 3, value: "c" },
+  ]);
+  let merged = merge(push(empty(), 2, "b"), push(push(empty(), 3, "c"), 1, "a"));
+  assert(pushed == listed);
+  assert(pushed == merged);
+  assert_eq(digest(pushed), digest(listed));
+  assert_eq(digest(pushed), digest(merged));
+  assert_eq(compare(pushed, merged), Equal);
+  assert_eq(map_len(#{pushed: 1, listed: 2, merged: 3}), 1);
+  assert(pushed != push(listed, 0, "z"));
+  assert_eq(compare(push(listed, 0, "z"), pushed), Less);
+  // Entries of one priority in another order are another heap.
+  assert(push(push(empty(), 1, "a"), 1, "b") != push(push(empty(), 1, "b"), 1, "a"))
+}
+
+test "a heap is a value: one kept is what it was after pushes and pops made of it" {
+  let h = letters();
+  let grown = push(h, 0, "z");
+  let shrunk = match pop_min(h) { Some(top) -> top.rest, None -> h };
+  assert_eq(size(h), 4);
+  assert_eq(peek_min(h), Some({ priority: 1, value: "a" }));
+  assert_eq(peek_min(grown), Some({ priority: 0, value: "z" }));
+  assert_eq(peek_min(shrunk), Some({ priority: 1, value: "d" }));
+  assert_eq(size(merge(h, h)), 8);
+  assert_eq(size(h), 4)
+}
+
+test "top_k answers the first k, and no more than there are" {
+  let h = letters();
+  assert_eq(top_k(h, 2), [{ priority: 1, value: "a" }, { priority: 1, value: "d" }]);
+  assert_eq(top_k(h, 0), []);
+  assert_eq(top_k(h, 0 - 1), []);
+  assert_eq(top_k(h, 99), to_list(h))
+}
+
+test "merge_sorted merges the runs, an earlier run first among equals" {
+  assert_eq(merge_sorted([[1, 3, 5], [2, 3, 4], [], [3]]), [1, 2, 3, 3, 3, 4, 5]);
+  assert_eq(merge_sorted([[1, 2]]), [1, 2]);
+  let none: List<List<Int>> = [];
+  assert_eq(merge_sorted(none), []);
+  assert_eq(
+    merge_sorted_by(
+      [
+        [{ priority: 1, value: "a" }, { priority: 1, value: "b" }, { priority: 2, value: "c" }],
+        [{ priority: 1, value: "d" }, { priority: 2, value: "e" }],
+      ],
+      |x: Entry<Int, String>, y: Entry<Int, String>| x.priority < y.priority,
+    ),
+    [
+      { priority: 1, value: "a" },
+      { priority: 1, value: "b" },
+      { priority: 1, value: "d" },
+      { priority: 2, value: "c" },
+      { priority: 2, value: "e" },
+    ],
+  );
+  assert_eq(merge_sorted_by([[3, 1], [2]], |x: Int, y: Int| x > y), [3, 2, 1])
+}
+
+test "a push and a pop walk one path, whether or not the heap is held elsewhere" {
+  let h = of_list(scattered(1024));
+  let pushed = metered(|| size(push(h, 512, 0)));
+  let popped = metered(|| match pop_min(h) { Some(top) -> size(top.rest), None -> 0 });
+  assert_eq(pushed.value, 1025);
+  assert_eq(popped.value, 1023);
+  assert(pushed.steps <= 3 * 11 + 4, Some(int_to_string(pushed.steps)));
+  assert(popped.steps <= 2 * 3 * 11 + 4, Some(int_to_string(popped.steps)));
+  // The heap is still held here, so nothing was written in place.
+  assert_eq(size(h), 1024)
+}
+
+/// Few priorities, so that most entries meet an equal.
+fn tied(entries: List<Entry<Int, Int>>) -> List<Entry<Int, Int>> =
+  map(entries, |e: Entry<Int, Int>| { priority: e.priority & 3, value: e.value })
+
+/// The model: a stable sort by priority.
+fn by_priority(entries: List<Entry<Int, Int>>) -> List<Entry<Int, Int>> =
+  sort_by(entries, |x: Entry<Int, Int>, y: Entry<Int, Int>| x.priority < y.priority)
+
+fn pushed_all(entries: List<Entry<Int, Int>>) -> Heap<Int, Int> =
+  fold(entries, empty(), |h: Heap<Int, Int>, e: Entry<Int, Int>| push(h, e.priority, e.value))
+
+/// What is done to a heap, so that a law ranges over heaps as the operations make them.
+type Step = | Pushed(Int, Int) | Popped | Merged(List<Entry<Int, Int>>)
+
+fn made_by(steps: List<Step>) -> Heap<Int, Int> =
+  fold(steps, empty(), |h: Heap<Int, Int>, step: Step|
+    match step {
+      Pushed(priority, x) -> push(h, priority & 3, x),
+      Popped -> match pop_min(h) { Some(top) -> top.rest, None -> h },
+      Merged(entries) -> merge(h, of_list(tied(entries))),
+    })
+
+fn listed_of(steps: List<Step>) -> List<Entry<Int, Int>> = to_list(made_by(steps))
+
+law "popping everything answers the stable sort of what was pushed" =
+  agrees(
+    |entries: List<Entry<Int, Int>>| to_list(pushed_all(tied(entries))),
+    |entries: List<Entry<Int, Int>>| by_priority(tied(entries)),
+  )
+
+law "a heap built at once is the heap pushed one by one" =
+  agrees(
+    |entries: List<Entry<Int, Int>>| of_list(tied(entries)),
+    |entries: List<Entry<Int, Int>>| pushed_all(tied(entries)),
+  )
+
+law "a push refines an insertion behind the entries of its priority" =
+  refines(
+    listed_of,
+    |steps: List<Step>, e: Entry<Int, Int>| list::concat(steps, [Pushed(e.priority, e.value)]),
+    |model: List<Entry<Int, Int>>, e: Entry<Int, Int>| by_priority(list::concat(model, tied([e]))),
+  )
+
+law "a pop refines dropping the first" =
+  refines(
+    listed_of,
+    |steps: List<Step>, _unit: Bool| list::concat(steps, [Popped]),
+    |model: List<Entry<Int, Int>>, _unit: Bool| drop(model, 1),
+  )
+
+law "a merge refines the stable merge of the two lists" =
+  refines(
+    listed_of,
+    |steps: List<Step>, entries: List<Entry<Int, Int>>| list::concat(steps, [Merged(entries)]),
+    |model: List<Entry<Int, Int>>, entries: List<Entry<Int, Int>>|
+      by_priority(list::concat(model, by_priority(tied(entries)))),
+  )
+
+law "the size, the first entry and the first k are the list's" =
+  agrees(
+    |c: { steps: List<Step>, k: Int }| {
+      let h = made_by(c.steps);
+      { size: size(h), empty: is_empty(h), first: peek_min(h), top: top_k(h, c.k) }
+    },
+    |c: { steps: List<Step>, k: Int }| {
+      let model = listed_of(c.steps);
+      { size: len(model), empty: len(model) == 0, first: list_at(model, 0), top: take(model, c.k) }
+    },
+  )
+
+law "a pop answers the first entry and the heap of the rest" =
+  agrees(
+    |steps: List<Step>|
+      match pop_min(made_by(steps)) {
+        None -> [],
+        Some(top) -> list::prepend({ priority: top.priority, value: top.value }, to_list(top.rest)),
+      },
+    listed_of,
+  )
+
+law "a caller's comparison, the greatest first, is the stable sort by it" =
+  agrees(
+    |entries: List<Entry<Int, Int>>| to_list(of_list_by(tied(entries), |x: Int, y: Int| x > y)),
+    |entries: List<Entry<Int, Int>>|
+      sort_by(tied(entries), |x: Entry<Int, Int>, y: Entry<Int, Int>| x.priority > y.priority),
+  )
+
+law "merging sorted runs is sorting them together" =
+  agrees(
+    |runs: List<List<Int>>| merge_sorted(map(runs, |run: List<Int>| sort(run))),
+    |runs: List<List<Int>>| sort(flatten(runs)),
+  )
+
+law "merging sorted runs keeps equal elements in the order of their runs" =
+  agrees(
+    |runs: List<List<Entry<Int, Int>>>|
+      merge_sorted_by(
+        map(runs, |run: List<Entry<Int, Int>>| by_priority(tied(run))),
+        |x: Entry<Int, Int>, y: Entry<Int, Int>| x.priority < y.priority,
+      ),
+    |runs: List<List<Entry<Int, Int>>>|
+      by_priority(flatten(map(runs, |run: List<Entry<Int, Int>>| by_priority(tied(run))))),
+  )
+
+/// `n` entries whose priorities are spread over `0..n`.
+fn scattered(n: Int) -> List<Entry<Int, Int>> / {abort.raise} =
+  map(range(0, n), |i: Int| { priority: i * 7919 % n, value: i })
+
+law "n pushes take n log n steps"
+  forall (n: Int) where n > 1 cost n * ilog2(n) {
+    pushed_all(scattered(n))
+  }
+
+law "n pushes and n pops take n log n steps"
+  forall (n: Int) where n > 1 cost n * ilog2(n) {
+    to_list(pushed_all(scattered(n)))
+  }
+
+law "a heap of a list takes linear steps"
+  forall (n: Int) where n > 0 cost n {
+    of_list(scattered(n))
+  }
+
+law "the first sixteen of n entries take linear steps"
+  forall (n: Int) where n > 0 cost n {
+    top_k(of_list(scattered(n)), 16)
+  }
+
+law "n merges of a heap of n take n log n steps"
+  forall (n: Int) where n > 1 cost n * ilog2(n) {
+    let h = of_list(scattered(n));
+    fold(range(0, n), 0, |total: Int, i: Int| total + size(merge(h, h)))
+  }
+
+law "merging n runs of one element takes n log n steps"
+  forall (n: Int) where n > 1 cost n * ilog2(n) {
+    merge_sorted(map(range(0, n), |i: Int| [i * 7919 % n]))
+  }
+
+law "merging eight runs takes steps linear in their elements"
+  forall (n: Int) where n > 0 cost n {
+    merge_sorted(map(range(0, 8), |run: Int| map(range(0, n), |i: Int| i * 8 + run)))
+  }
