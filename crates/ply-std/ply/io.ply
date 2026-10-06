@@ -10,6 +10,11 @@
 //! shorter than was asked is not the end; an empty one is. Every loop here is told the most bytes it
 //! may read in all and raises `io.too_long` past them, so none runs without a bound.
 //!
+//! `chunks` and `lines` are a source as a `std.seq` sequence, for `seq::map`, `seq::filter` and the
+//! rest: each pull is one read, the sequence's row says it reads a hold, so it is consumed inside
+//! the region that opened the source, and its consumer's budget is the bound. A decoder with state
+//! of its own is a step function threaded through `seq::unfold` over `read` or `fill`.
+//!
 //! Code written against a root runs over `std.fs`'s twin unchanged (`fs::on_mem`), and over
 //! `fs::mem_short_reads` it is handed the short reads a file on a disk seldom gives.
 
@@ -17,9 +22,12 @@ import std.fs
 import std.fs (fs, Refused, ToRead, ToWrite, ToAppend)
 import std.laws (agrees)
 import std.list (at, concat, take)
+import std.seq
+import std.seq (Seq, seq)
 
 /// Where bytes are read from. `pull(max)` answers what comes next, at most `max` bytes and none at
-/// the end; `close` lets the source go.
+/// the end; `close` lets the source go. It is a value, so `hold_get` hands out a copy that may
+/// leave the region its hold may not: one pulled after `close` raises and never reads as ended.
 pub type Source<| e> = { pull: (Int) -> Bytes / e, close: () -> Unit / e }
 
 /// Where bytes are written to. `push(bytes)` takes all of them or answers `false`; `close` lets the
@@ -34,16 +42,19 @@ pub effect io {
   raise too_long(limit: Int)
   /// A sink did not take what was written to it.
   raise unwritten()
+  /// A source was read after it was let go.
+  raise closed()
 }
 
 /// The file at `path` under the root `l`, open to be read from its start.
 pub fn reading<[l]>(
   path: String,
-) -> Source<| {fs.read_chunk[l], fs.close[l]}> / {fs.open[l], io.refused} =
+) -> Source<| {fs.read_chunk[l], fs.close[l], io.closed}> / {fs.open[l], io.refused} =
   match fs.open[l](path, ToRead) {
     Ok(file) ->
       {
-        pull: |max: Int| match fs.read_chunk[l](file, max) { Some(bytes) -> bytes, None -> b"" },
+        pull: |size: Int|
+          match fs.read_chunk[l](file, size) { Some(bytes) -> bytes, None -> io.closed() },
         close: || {
           fs.close[l](file);
           ()
@@ -191,6 +202,52 @@ pub fn copy<| e>(
     }
   })
 
+/// The next `n` bytes of the source, fewer only where it ends: it reads until it has them, however
+/// short each read comes back.
+pub fn fill<| e>(source: Hold<Source<| e>>, n: Int) -> Bytes / {hold.read, abort.raise | e} =
+  bytes_concat_all(
+    iterate({ parts: [], got: 0 }, max(n, 0) + 1, |s: { parts: List<Bytes>, got: Int }|
+      if s.got >= n { Stop(s.parts) } else {
+        let bytes = read(source, n - s.got);
+        if bytes_len(bytes) == 0 { Stop(s.parts) }
+        else { Continue({ parts: push(s.parts, bytes), got: s.got + bytes_len(bytes) }) }
+      }),
+  )
+
+/// The chunks of a source as a sequence, each at most `size` bytes, ending where the source does.
+/// A pull is one read, so a consumer with a budget of `b` reads at most `b + 1` chunks. It reads
+/// the source as it is pulled: pulled again from its start, it goes on from where the source
+/// stands.
+pub fn chunks<| e>(source: Hold<Source<| e>>, size: Int) -> Seq<Bytes | {hold.read | e}> =
+  seq::unfold((), |u: Unit| {
+    let bytes = read(source, size);
+    if bytes_len(bytes) == 0 { None } else { Some({ value: bytes, next: () }) }
+  })
+
+/// The lines of a source as a sequence, each without its `\n`, as `fold_lines` reads them. A pull
+/// reads at most one chunk of `chunk` bytes, and skips where that chunk completed no line. It is
+/// pulled through once, as `chunks` is.
+pub fn lines<| e>(
+  source: Hold<Source<| e>>,
+  chunk: Int,
+) -> Seq<Bytes | {hold.read, abort.raise | e}> =
+  seq::flat_map(
+    seq::unfold(Some(b""), |left: Option<Bytes>|
+      match left {
+        None -> None,
+        Some(rest) -> {
+          let bytes = read(source, chunk);
+          if bytes_len(bytes) == 0 {
+            Some({ value: if bytes_len(rest) == 0 { [] } else { [rest] }, next: None })
+          } else {
+            let split = split_lines(rest, bytes);
+            Some({ value: split.lines, next: Some(split.rest) })
+          }
+        },
+      }),
+    |ready: List<Bytes>| seq::of_list(ready),
+  )
+
 type Halves = { head: List<Int>, tail: List<Int> }
 
 /// A text of `a`s and newlines, one byte for each of `picks`.
@@ -215,7 +272,7 @@ fn tree() -> fs::MemFs / {abort.raise} =
 fn lines_of(
   path: String,
   chunk: Int,
-) -> List<Bytes> / {fs.open[data], fs.read_chunk[data], fs.close[data], io.refused, io.too_long, abort.raise} =
+) -> List<Bytes> / {fs.open[data], fs.read_chunk[data], fs.close[data], io.refused, io.too_long, io.closed, abort.raise} =
   with_hold[file](
     reading[data](path),
     shut,
@@ -266,6 +323,18 @@ test "a source that holds more than its reader may read is refused, and still cl
   });
   assert_eq(over.value, [Err(12), Ok(b"one\ntwo\nthree")]);
   assert_eq(map_len(over.tree.opened), 0)
+}
+
+test "a source read out of its hold and pulled after the region let it go raises, and does not read as ended" {
+  let over = fs::on_mem[data](tree(), || {
+    let escaped = with_hold[file](
+      reading[data]("notes/poem.txt"),
+      shut,
+    ) { source -> hold_get(source) };
+    let late: Result<Bytes, Unit> = try[io.closed] { (escaped.pull)(4) };
+    late
+  });
+  assert_eq(over.value, Err(()))
 }
 
 test "a file that does not open says why, and nothing is held" {
@@ -332,4 +401,56 @@ test "a reader a raise unwinds through still closes its file" {
   });
   assert_eq(over.value, Err(3));
   assert_eq(map_len(over.tree.opened), 0)
+}
+
+test "a fill reads until it has what it asked for, however short the reads, and less only at the end" {
+  let over = fs::on_mem[data](fs::mem_short_reads(tree(), 2), ||
+    with_hold[file](
+      reading[data]("notes/poem.txt"),
+      shut,
+    ) { source -> [fill(source, 5), fill(source, 0), fill(source, 100), fill(source, 3)] });
+  assert_eq(over.value, [b"one\nt", b"", b"wo\nthree", b""])
+}
+
+test "the chunks of a source are a sequence that ends where the source does" {
+  let over = fs::on_mem[data](tree(), ||
+    with_hold[file](
+      reading[data]("notes/poem.txt"),
+      shut,
+    ) { source -> seq::to_list(seq::map(chunks(source, 5), bytes_len), 8) });
+  assert_eq(over.value, [5, 5, 3]);
+  assert_eq(map_len(over.tree.opened), 0)
+}
+
+test "the lines of a source are one sequence whatever the chunk and whatever short reads it gives" for c: { chunk: Int, short: Int } in [
+    { chunk: 1, short: 0 },
+    { chunk: 4, short: 0 },
+    { chunk: 5, short: 0 },
+    { chunk: 64, short: 0 },
+    { chunk: 64, short: 3 },
+    { chunk: 7, short: 5 },
+  ] {
+  let read = fs::on_mem[data](fs::mem_short_reads(tree(), c.short), ||
+    with_hold[file](
+      reading[data]("notes/poem.txt"),
+      shut,
+    ) { source -> seq::to_list(lines(source, c.chunk), 64) });
+  assert_eq(read.value, [b"one", b"two", b"three"])
+}
+
+test "a sequence over a source reads as it is pulled, and a budget of one pull reads two chunks" {
+  let over = fs::on_mem[data](tree(), ||
+    with_hold[file](
+      reading[data]("notes/poem.txt"),
+      shut,
+    ) { source -> {
+      let pulled = chunks(source, 4);
+      let first = seq::to_list(seq::take(pulled, 1), 4);
+      let spent: Result<List<Bytes>, Int> = try[seq.spent] { seq::to_list(pulled, 1) };
+      { first: first, spent: spent, left: read(source, 100) }
+    } });
+  assert_eq(over.value.first, [b"one\n"]);
+  // The pull past the budget read `thre` to learn the sequence had not ended.
+  assert_eq(over.value.spent, Err(1));
+  assert_eq(over.value.left, b"e")
 }

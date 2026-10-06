@@ -12,7 +12,9 @@ import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VS
                   VArray, VRecord, VCtor, VFn, Field, Entry, FConst, FProject, FTable, map_of,
                   width_of)
 import std.list (at)
+import std.bytes (u64_le)
 import domain (Ty, Var, Fn, Record, Con, Decl, Variant, name_order)
+import drawn (Draw, Fresh, carried, draw_of)
 
 /// Why a type has no value to draw.
 pub type Ungeneratable =
@@ -27,10 +29,19 @@ pub type Ungeneratable =
   | UTooDeep
 
 /// The declared types, each with how many nested constructor applications a value of it needs, and
-/// each variant with the same: `None` when nothing finite inhabits it.
+/// each variant with the same: `None` when nothing finite inhabits it. A type that states a
+/// generator has the definition that samples it, and is drawn through it and no other way.
 pub type Types = Map<String, Typed>
 
-pub type Typed = { decl: Decl, depth: Option<Int>, depths: List<Option<Int>> }
+pub type Typed = {
+  decl: Decl,
+  depth: Option<Int>,
+  depths: List<Option<Int>>,
+  sampler: Option<String>,
+}
+
+/// A type that states a generator: its name, how many parameters it takes, and its sampler.
+pub type Stated = { ty: String, params: Int, sampler: String }
 
 /// Case indices below this draw their type's edge values rather than a sample.
 pub fn edge_cases() -> Int = 5
@@ -42,6 +53,9 @@ pub fn gen_depth() -> Int = 4
 pub fn hard_depth() -> Int = 64
 
 fn max_len() -> Int = 16
+
+/// How many values a stated generator is handed to choose among for each of its type's parameters.
+pub fn pool_size() -> Int = 16
 
 fn max_entries() -> Int = 8
 
@@ -67,17 +81,37 @@ fn is_scalar(name: String) -> Bool =
 // --- The declared types -------------------------------------------------------
 
 /// Every declaration with its depths solved: a variant needs one more application than its deepest
-/// field, and a type as few as its shallowest variant. Each round settles at least one type.
-pub fn types_of(decls: List<Decl>) -> Types / {abort.raise} = {
-  let start = fold(decls, map_new(), |acc: Types, d: Decl|
-    map_insert(acc, d.name, { decl: d, depth: None, depths: map(d.variants, |_v: Variant| None) }));
+/// field, and a type as few as its shallowest variant. Each round settles at least one type. A
+/// value a generator draws is made whole, whatever its type declares.
+pub fn types_of(decls: List<Decl>, stated: List<Stated> = []) -> Types / {abort.raise} = {
+  let declared = fold(decls, map_new(), |acc: Types, d: Decl|
+    map_insert(acc, d.name, {
+      decl: d,
+      depth: None,
+      depths: map(d.variants, |_v: Variant| None),
+      sampler: None,
+    }));
+  let start = fold(stated, declared, |acc: Types, g: Stated|
+    map_insert(acc, g.ty, {
+      decl: match map_get(acc, g.ty) {
+        Some(t) -> t.decl,
+        None -> { name: g.ty, params: g.params, variants: [] },
+      },
+      depth: Some(0),
+      depths: [],
+      sampler: Some(g.sampler),
+    }));
   iterate(start, len(decls) + 2, |types: Types| {
-    let next = map_fold(types, types, |acc: Types, name: String, t: Typed| {
-      let depths = map(t.decl.variants, |v: Variant| variant_depth(acc, v.fields));
-      let best = fold(depths, None, |m: Option<Int>, d: Option<Int>|
-        match d { None -> m, Some(x) -> match m { None -> Some(x), Some(y) -> Some(min(x, y)) } });
-      map_insert(acc, name, { ..t, depth: best, depths: depths })
-    });
+    let next = map_fold(types, types, |acc: Types, name: String, t: Typed|
+      if t.sampler != None { acc } else {
+        let depths = map(t.decl.variants, |v: Variant| variant_depth(acc, v.fields));
+        let best = fold(depths, None, |m: Option<Int>, d: Option<Int>|
+          match d {
+            None -> m,
+            Some(x) -> match m { None -> Some(x), Some(y) -> Some(min(x, y)) },
+          });
+        map_insert(acc, name, { ..t, depth: best, depths: depths })
+      });
     if next == types { Stop(types) } else { Continue(next) }
   })
 }
@@ -546,7 +580,69 @@ pub fn usable(
     },
   }
 
+/// Where a value of a type that states its generator goes: the values each of the type's parameters
+/// is chosen among, drawn here, and a stream of its own, so what the sampler takes of it moves no
+/// draw that follows.
+fn through(
+  gen: Gen,
+  name: String,
+  sampler: String,
+  args: List<Ty>,
+  rand: Rand,
+  depth: Int,
+) -> Result<Generated, Ungeneratable> / {abort.raise} = {
+  // Pools are sampled, not each type's one edge value sixteen times over.
+  let sampled = { ..gen, edge: None };
+  let pools = fold(
+    args,
+    Ok({ pools: [], rand: rand }),
+    |acc: Result<{ pools: List<List<Value>>, rand: Rand }, Ungeneratable>, arg: Ty|
+      match acc {
+        Err(_) -> acc,
+        Ok(so_far) -> match several(sampled, arg, pool_size(), so_far.rand, depth + 1) {
+          Err(e) -> Err(e),
+          Ok(items) -> Ok({ pools: push(so_far.pools, items.values), rand: items.rand }),
+        },
+      },
+  );
+  match pools {
+    Err(e) -> Err(e),
+    Ok(p) ->
+      Ok({
+        value: carried({
+          ty: name,
+          sampler: sampler,
+          pools: p.pools,
+          size: gen.size,
+          state: Fresh({
+            root: p.rand.root,
+            key: bytes_concat(p.rand.key, u64_le(p.rand.counter)),
+          }),
+        }),
+        rand: { ..p.rand, counter: p.rand.counter + 1 },
+      }),
+  }
+}
+
+/// The definition that samples `name`, when its module states a generator for it.
+pub fn sampler_of(types: Types, name: String) -> Option<String> =
+  match map_get(types, name) { Some(typed) -> typed.sampler, None -> None }
+
 fn adt(
+  gen: Gen,
+  name: String,
+  args: List<Ty>,
+  rand: Rand,
+  depth: Int,
+) -> Result<Generated, Ungeneratable> / {abort.raise} =
+  if depth >= hard_depth() { Err(UTooDeep) } else {
+    match sampler_of(gen.types, name) {
+      Some(sampler) -> through(gen, name, sampler, args, rand, depth),
+      None -> structural(gen, name, args, rand, depth),
+    }
+  }
+
+fn structural(
   gen: Gen,
   name: String,
   args: List<Ty>,
@@ -766,4 +862,76 @@ test "a draw is a function of its root, its key and its case" {
     fold(range(10, 20), false, |differs: Bool, c: Int|
       differs || drawn_at(t, 7, c) != drawn_at(t, 8, c)),
   )
+}
+
+fn stated_types() -> Types / {abort.raise} =
+  types_of(shapes(), [
+    { ty: "m.Shape", params: 0, sampler: "m._sample_Shape" },
+    { ty: "m.Bag", params: 1, sampler: "m._sample_Bag" },
+  ])
+
+fn draw_at(ty: Ty, case: Int) -> Draw / {abort.raise} =
+  match generate(ty, stated_types(), random::rand_keyed(4, b"key"), case) {
+    Ok(g) -> match draw_of(g.value) { Some(d) -> d, None -> panic("a place for a draw") },
+    Err(_) -> panic("the type draws"),
+  }
+
+test "a type that states a generator draws as a place for its sampler's value, on a stream of its own" {
+  assert_eq(draw_at(Con("m.Shape", []), 9), {
+    ty: "m.Shape",
+    sampler: "m._sample_Shape",
+    pools: [],
+    size: 9,
+    state: Fresh({ root: 4, key: bytes_concat(b"key", u64_le(0)) }),
+  });
+  // What the sampler takes of its stream moves no later draw: the claim's stream goes on by one.
+  match generate(
+      Con("List", [Con("m.Shape", [])]),
+      stated_types(),
+      random::rand_keyed(4, b"key"),
+      40,
+    ) {
+    Ok(g) -> match g.value {
+      VList(items) -> {
+        let keys = fold(items, [], |acc: List<Bytes>, x: Value|
+          match draw_of(x) {
+            Some(d) -> match d.state { Fresh(f) -> push(acc, f.key), _ -> acc },
+            None -> acc,
+          });
+        assert(len(items) > 1);
+        assert_eq(len(keys), len(items));
+        // The length took two draws, and each value one.
+        assert_eq(keys, map(range(0, len(items)), |i: Int| bytes_concat(b"key", u64_le(2 + i))));
+        assert_eq(g.rand.counter, 2 + len(items))
+      },
+      _ -> panic("a list"),
+    },
+    Err(_) -> panic("a list of them draws"),
+  }
+}
+
+test "a stated generator is handed values to choose among for each of its type's parameters" {
+  // A type no declaration describes is one too: a `new` record is known by its name alone.
+  let bag = draw_at(Con("m.Bag", [int_t()]), 0);
+  assert_eq(map(bag.pools, |pool: List<Value>| len(pool)), [pool_size()]);
+  // They are sampled even in an edge case, where every `Int` drawn alone is the same edge.
+  assert(
+    fold(
+      match list_at(bag.pools, 0) { Some(pool) -> pool, None -> [] },
+      false,
+      |any: Bool, x: Value| any || x != VInt(0),
+    ),
+  );
+  // A parameter that states its own is drawn through its own, to be made first.
+  let nested = draw_at(Con("m.Bag", [Con("m.Shape", [])]), 12);
+  assert_eq(
+    map(match list_at(nested.pools, 0) { Some(pool) -> pool, None -> [] }, |x: Value|
+      match draw_of(x) { Some(d) -> d.sampler, None -> "" }),
+    map(range(0, pool_size()), |_i: Int| "m._sample_Shape"),
+  );
+  let types = stated_types();
+  assert_eq(generatable(Con("m.Bag", [int_t()]), types), Ok(()));
+  assert_eq(generatable(Con("m.Bag", [Con("m.Loop", [])]), types), Err(UUninhabited("m.Loop")));
+  assert_eq(sampler_of(types, "m.Bag"), Some("m._sample_Bag"));
+  assert_eq(sampler_of(types, "m.Tree"), None)
 }

@@ -13,11 +13,10 @@ use std::path::{Path, PathBuf};
 /// The front end and emitter recurse once per node on the native stack.
 const STACK: usize = 256 << 20;
 
-/// What a launched program is: the runnable it is entered from, the shipped modules it reads as
-/// files, the root its `cwd` names, and the binary's version for the environment it may ask about.
+/// What a launched program is: the runnable it is entered from and the binary's version for the
+/// environment it may ask about. It reads the pack's shipped modules as files.
 pub struct Program {
     pub runnable: Runnable,
-    pub shipped_modules: Vec<(String, String)>,
     /// The stage's identity: the shipped modules land under it, beside the C cache.
     pub stage: String,
     pub version: String,
@@ -98,8 +97,9 @@ pub fn stamps() -> String {
     )
 }
 
-/// The shipped modules as files, with the stamps and definitions beside them. Each file lands by a
-/// rename and the marker last, so a run that finds the marker finds it whole.
+/// The shipped modules as files, `<dotted name>.ply` each, the data files they embed below them by
+/// name, and the stamps and definitions beside them. Each file lands by a rename and the marker
+/// last, so a run that finds the marker finds it whole, and reads nothing of the pack for it.
 pub fn shipped_modules(program: &Program, definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
     let mut laid = blake3::Hasher::new();
@@ -112,7 +112,7 @@ pub fn shipped_modules(program: &Program, definitions: &str) -> Result<PathBuf, 
         ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(&program.stage));
         return Ok(dir);
     }
-    lay_out(&dir, &program.shipped_modules, &stamps, definitions).map_err(|e| {
+    lay_out(&dir, &stamps, definitions).map_err(|e| {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!(
@@ -128,16 +128,20 @@ pub fn shipped_modules(program: &Program, definitions: &str) -> Result<PathBuf, 
     Ok(dir)
 }
 
-fn lay_out(
-    dir: &Path,
-    sources: &[(String, String)],
-    stamps: &str,
-    definitions: &str,
-) -> std::io::Result<()> {
+fn lay_out(dir: &Path, stamps: &str, definitions: &str) -> std::io::Result<()> {
     use ply_eval::files::write_atomically;
+    use ply_machine::shipped_modules;
     std::fs::create_dir_all(dir)?;
-    for (name, text) in sources {
+    for (name, text) in shipped_modules::sources() {
         write_atomically(&dir.join(format!("{name}.ply")), text.as_bytes())?;
+    }
+    for name in shipped_modules::data_names() {
+        let at = dir.join(&name);
+        if let Some(parent) = at.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = shipped_modules::data(&name).expect("a listed data file is carried");
+        write_atomically(&at, bytes)?;
     }
     write_atomically(&dir.join(STAMPS), stamps.as_bytes())?;
     write_atomically(&dir.join(DEFINITIONS), definitions.as_bytes())?;

@@ -8,7 +8,8 @@ import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode,
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, Cases,
               TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, SCost, Binder, Vis, VPub, VPriv,
               ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, LawDef,
-              OfSchema, schema_named, schema_guard_name, parse, dump_module, is_pub, TDNominal)
+              OfSchema, schema_named, schema_guard_name, parse, dump_module, is_pub, TDNominal,
+              Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
@@ -369,10 +370,13 @@ fn declarations_of(parsed: ParsedModule) -> Decls =
       IType(t) -> {
         let d2 = declare(decls, TypeSpace, parsed.name, t.name, t.vis);
         match t.body {
-          // A constructor is as public as its type: a type you cannot match on is not a useful export.
+          // A constructor is as public as its type, unless the type is `opaque`: its module keeps them.
           TDSum(vs) ->
             fold(vs, d2, |acc: Decls, variant: VariantDef|
-              declare(acc, ValueSpace, parsed.name, variant.name, t.vis)),
+              declare(acc, ValueSpace, parsed.name, variant.name, match t.opaque {
+                Some(_) -> VPriv,
+                None -> t.vis,
+              })),
           TDAlias(_) -> d2,
           TDNominal(_) -> d2,
         }
@@ -670,10 +674,10 @@ fn bind_name(w: World, i: Int, builder: Builder, t: Int, name: Ident) -> Builder
       };
       {
         ..builder,
-        diags: push(
-          builder.diags,
-          private_name(i, name.span, t, declared.span, at(found, 0), name.name, module),
-        ),
+        diags: push(builder.diags, match closed_ctor(w.mods, i, name.span, t, name.name) {
+          Some(closed) -> closed,
+          None -> private_name(i, name.span, t, declared.span, at(found, 0), name.name, module),
+        }),
       }
     } else {
       fold(public, builder, |acc: Builder, namespace: Namespace|
@@ -713,6 +717,70 @@ pub fn private_name(
       b"items are private by default",
     ],
   )
+
+/// What `module` publishes for a type it declares `opaque`, which is all another module has of it.
+pub fn closed_notes(module: Bytes, opaque: Opaque) -> List<Bytes> / {abort.raise} = {
+  let answered = if len(opaque.answer) == 0 { [] }
+  else { [bytes_concat_all([b"`", module, b"` answers one from ", list_names(opaque.answer)])] };
+  if len(opaque.take) == 0 {
+    if len(answered) > 0 { answered } else {
+      [bytes_concat_all([b"`", module, b"` publishes no function that answers or takes one"])]
+    }
+  } else {
+    push(answered, bytes_concat_all([b"`", module, b"` reads one with ", list_names(opaque.take)]))
+  }
+}
+
+/// The `opaque` sum of `module` that declares the constructor `name`, and what it publishes for it.
+fn closed_sum(module: Module, name: Bytes) -> Option<{ name: Bytes, opaque: Opaque }> =
+  fold(module.items, None, |found: Option<{ name: Bytes, opaque: Opaque }>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item {
+        IType(d) -> match ((d.opaque, d.body)) {
+          (Some(o), TDSum(vs)) -> if fold(vs, false, |held: Bool, v: VariantDef|
+              held || v.name.name == name) { Some({ name: d.name.name, opaque: o }) }
+          else { None },
+          _ -> None,
+        },
+        _ -> None,
+      },
+    })
+
+/// `name` as a constructor of an `opaque` sum of module `owner`, named from module `m`: the type's
+/// module keeps it, and what that module publishes for the type is what `m` has.
+pub fn closed_ctor(
+  mods: List<ParsedModule>,
+  m: Int,
+  span: Span,
+  owner: Int,
+  name: Bytes,
+) -> Option<Diag> / {abort.raise} = {
+  let parsed = at(mods, owner);
+  match closed_sum(parsed.module, name) {
+    None -> None,
+    Some(closed) ->
+      Some(
+        error_at_and(
+          b"E0107",
+          m,
+          span,
+          bytes_concat_all([
+            b"`",
+            name,
+            b"` is a constructor of the opaque type `",
+            qualify(parsed.name, closed.name),
+            b"`",
+          ]),
+          bytes_concat_all([b"only `", parsed.name, b"` builds or matches one"]),
+          owner,
+          closed.opaque.span,
+          b"declared `opaque` here",
+          closed_notes(parsed.name, closed.opaque),
+        ),
+      ),
+  }
+}
 
 fn bind_one(
   w: World,
@@ -3860,6 +3928,26 @@ test "an imported name is refused when its module keeps or lacks it, the importe
     ]),
     [b"E0110"],
   )
+}
+
+test "an opaque sum's constructors stay with its module: the type is imported, and they are not" {
+  let lib = b"pub opaque type Tok = | Mint(Int) | Tok\npub fn mint() -> Tok = Mint(1)\npub fn spent(t: Tok) -> Bool = match t { Tok -> true, Mint(_) -> false }";
+  let named = match resolve(lib_and_app(lib, b"import lib (Mint)\nfn f() -> Int = 1")) {
+    ResolveSucceeded(_) -> [],
+    ResolveFailed(ds) -> ds,
+  };
+  assert_eq(map(named, |diag: Diag| { code: diag.code, notes: diag.notes_text }), [
+    { code: b"E0107", notes: [b"`lib` answers one from `mint`", b"`lib` reads one with `spent`"] },
+  ]);
+  // The type's name is public, and one it shares with a constructor binds the type alone.
+  match resolve(lib_and_app(lib, b"import lib (Tok, mint)\nfn f() -> Tok = mint()")) {
+    ResolveSucceeded(x) -> {
+      let bound = at(x.r.scopes, 1).bound;
+      assert(lookup(bound, TypeSpace, b"Tok") != None);
+      assert_eq(lookup(bound, ValueSpace, b"Tok"), None)
+    },
+    ResolveFailed(ds) -> panic("a public type is imported"),
+  }
 }
 
 test "a module imported whole and by name resolves both ways, its type bringing the constructors" {
