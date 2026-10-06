@@ -3157,15 +3157,26 @@ type Round = { wanted: Map<Bytes, Bytes>, diags: List<Diag> }
 
 type Wanted = { names: Map<Bytes, Bool>, diags: List<Diag> }
 
-/// The shipped modules `parsed` imports and does not hold yet, by name. A user module names one by its
-/// root; a shipped one names its siblings in the compiler package bare. `listed` is every shipped
-/// module there is, read or not.
-fn wanted(users: Int, listed: List<Bytes>, parsed: List<ParsedSource>) -> Wanted / {abort.raise} = {
+/// The shipped modules `parsed` imports and does not hold yet, by name, and each of `asked` it does
+/// not hold. A user module names one by its root; a shipped one names its siblings in the compiler
+/// package bare. `listed` is every shipped module there is, read or not.
+fn wanted(
+  users: Int,
+  listed: List<Bytes>,
+  parsed: List<ParsedSource>,
+  asked: List<Bytes>,
+) -> Wanted / {abort.raise} = {
   let has = fold(listed, map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
     map_insert(acc, name, true));
   let present = fold(parsed, map_new(), |acc: Map<Bytes, Bool>, p: ParsedSource|
     map_insert(acc, p.name, true));
-  fold(range(0, len(parsed)), { names: map_new(), diags: [] }, |acc: Wanted, i: Int| {
+  let named: Wanted = {
+    names: fold(asked, map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
+      if map_contains(has, name) && !map_contains(present, name) { map_insert(acc, name, true) }
+      else { acc }),
+    diags: [],
+  };
+  fold(range(0, len(parsed)), named, |acc: Wanted, i: Int| {
     let p = at(parsed, i);
     let imports = p.module.module.imports;
     let ships = i >= users;
@@ -3198,8 +3209,9 @@ fn pull_round(
   shipped: Map<Bytes, Bytes>,
   listed: List<Bytes>,
   parsed: List<ParsedSource>,
+  asked: List<Bytes>,
 ) -> Round / {abort.raise} = {
-  let w = wanted(users, listed, parsed);
+  let w = wanted(users, listed, parsed, asked);
   map_fold(w.names, { wanted: map_new(), diags: w.diags }, |r: Round, name: Bytes, _: Bool|
     match map_get(shipped, name) {
       Some(src) -> { ..r, wanted: map_insert(r.wanted, name, src) },
@@ -3221,20 +3233,26 @@ fn unread_shipped(name: Bytes) -> Diag =
 /// place below its package's root (`std/oid/names.txt`), and its bytes.
 pub type ShippedData = { name: Bytes, bytes: Bytes }
 
-/// The shipped modules a load reads, the names of the rest, of which it reads none, and the data
-/// files the read ones embed.
-pub type Shipping = { read: List<Source>, unread: List<Bytes>, data: List<ShippedData> }
+/// The shipped modules a load reads, the names of the rest, of which it reads none, the data files
+/// the read ones embed, and the ones it pulls whatever its modules import.
+pub type Shipping = {
+  read: List<Source>,
+  unread: List<Bytes>,
+  data: List<ShippedData>,
+  asked: List<Bytes>,
+}
 
 /// What a load of `user` and its package closure pulls, each module read once through `read`: what
-/// they import, what those import in turn, and what any of them embeds beside itself, a data file
-/// read once through `read_data`. Handed the read ones, and the rest as `unread`, the front end
-/// pulls what it would have pulled from every shipped module.
+/// they import and each of `asked`, what those import in turn, and what any of them embeds beside
+/// itself, a data file read once through `read_data`. Handed the read ones, the rest as `unread`
+/// and `asked`, the front end pulls what it would have pulled from every shipped module.
 pub fn shipped_pulled<| e>(
   user: List<Source>,
   pkgs: PackageSources,
   listed: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
   read_data: (Bytes) -> Option<Bytes> / e,
+  asked: List<Bytes> = [],
 ) -> Shipping / {abort.raise | e} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let own = concat(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
@@ -3246,6 +3264,7 @@ pub fn shipped_pulled<| e>(
     read_data,
     { parsed: parsed, found: [], data: [], tried: map_new() },
     len(listed) + 1,
+    asked,
   );
   let held = fold(needed.found, map_new(), |acc: Map<Bytes, Bool>, s: Source|
     map_insert(acc, s.name, true));
@@ -3253,6 +3272,7 @@ pub fn shipped_pulled<| e>(
     read: needed.found,
     unread: filter(listed, |name: Bytes| !map_contains(held, name)),
     data: needed.data,
+    asked: asked,
   }
 }
 
@@ -3272,8 +3292,9 @@ fn needing<| e>(
   read_data: (Bytes) -> Option<Bytes> / e,
   x: Needed,
   room: Int,
+  asked: List<Bytes>,
 ) -> Needed / {abort.raise | e} = {
-  let names = filter(map_keys(wanted(users, listed, x.parsed).names), |name: Bytes|
+  let names = filter(map_keys(wanted(users, listed, x.parsed, asked).names), |name: Bytes|
     !map_contains(x.tried, name));
   if len(names) == 0 || room <= 0 { x } else {
     needing(
@@ -3299,6 +3320,7 @@ fn needing<| e>(
         }
       }),
       room - 1,
+      asked,
     )
   }
 }
@@ -3457,7 +3479,8 @@ fn untested(p: ParsedSource) -> ParsedSource =
 
 /// `shipped` is each shipped module as the analysis reads it, a stub where it has one, `whole` the
 /// shipped modules as they stand and `data` the data files they embed. `room` is how many more
-/// rounds may pull: each pulls a shipped module not pulled before.
+/// rounds may pull: each pulls a shipped module not pulled before. `asked` are pulled whatever the
+/// modules import.
 fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
@@ -3468,10 +3491,11 @@ fn pulling(
   tested: Bool,
   x: Pull,
   room: Int,
+  asked: List<Bytes>,
 ) -> Pull / {abort.raise} = {
   let early = fold(x.parsed, [], |acc: List<Diag>, parsed: ParsedSource| concat(acc, parsed.diags));
   if len(early) > 0 { { ..x, diags: early } } else {
-    let r = pull_round(users, shipped, listed, x.parsed);
+    let r = pull_round(users, shipped, listed, x.parsed, asked);
     if len(r.diags) > 0 { { ..x, diags: r.diags } }
     else if map_len(r.wanted) == 0 { x }
     else if room <= 0 { panic("a shipped module pulled twice") } else {
@@ -3494,6 +3518,7 @@ fn pulling(
           }
         }),
         room - 1,
+        asked,
       )
     }
   }
@@ -3646,6 +3671,9 @@ pub fn staged_pulling_std_with(
   reached: Bool = true,
   // The data files the modules of `shipped` embed (`shipped_pulled`).
   data: List<ShippedData> = [],
+  // Shipped modules pulled whatever the program imports: `ply test --std` asks for every module of
+  // the standard library.
+  asked: List<Bytes> = [],
 ) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
@@ -3687,6 +3715,7 @@ pub fn staged_pulling_std_with(
     tested,
     { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, diags: [] },
     map_len(texts),
+    asked,
   );
   let hashed = |parsed: List<ParsedSource>|
     hashed_closure(
@@ -3975,6 +4004,7 @@ pub fn analyse_pulling_std_with(
   unread: List<Bytes> = [],
   reached: Bool = true,
   data: List<ShippedData> = [],
+  asked: List<Bytes> = [],
 ) -> Pulled / {abort.raise} =
   checked_staged(
     staged_pulling_std_with(
@@ -3987,6 +4017,7 @@ pub fn analyse_pulling_std_with(
       unread: unread,
       reached: reached,
       data: data,
+      asked: asked,
     ),
     defs,
     tests,
@@ -5269,7 +5300,11 @@ fn shipped_text(name: Bytes) -> Option<Bytes> =
   fold(shipped_modules(), None, |acc: Option<Bytes>, s: Source|
     if s.name == name { Some(s.src) } else { acc })
 
-fn pulled_by(user: List<Source>) -> { shipping: Shipping, asked: List<Bytes> } / {abort.raise} =
+/// What a load of `user` that pulls `named` whatever it imports reads, and each read it asked for.
+fn pulled_by(
+  user: List<Source>,
+  named: List<Bytes> = [],
+) -> { shipping: Shipping, asked: List<Bytes> } / {abort.raise} =
   with_cell[asked]([]) { c -> {
     let shipping = shipped_pulled(
       user,
@@ -5280,6 +5315,7 @@ fn pulled_by(user: List<Source>) -> { shipping: Shipping, asked: List<Bytes> } /
         shipped_text(name)
       },
       |name: Bytes| None,
+      named,
     );
     { shipping: shipping, asked: cell_get(c) }
   } }
@@ -5289,6 +5325,61 @@ test "a load reads the shipped modules it imports and what those import, and no 
   assert_eq(p.asked, [b"std.a", b"std.c"]);
   assert_eq(map(p.shipping.read, |s: Source| s.name), [b"std.a", b"std.c"]);
   assert_eq(p.shipping.unread, [b"std.b", b"std.d"])
+}
+
+test "a load asked for a shipped module reads and pulls it, and what it imports, though nothing imports it" {
+  let user = [{ name: b"m", src: b"import std.b\npub fn f() -> Int = 1" }];
+  let p = pulled_by(user, [b"std.d", b"std.a", b"std.b", b"std.nowhere"]);
+  assert_eq(p.asked, [b"std.a", b"std.b", b"std.d", b"std.c"]);
+  assert_eq(p.shipping.unread, []);
+  let pulling = |asked: List<Bytes>|
+    analyse_pulling_std_with(
+      user,
+      p.shipping.read,
+      [],
+      [],
+      unread: p.shipping.unread,
+      reached: false,
+      asked: asked,
+    );
+  assert_eq(pulling(p.shipping.asked).pulled, [b"std.a", b"std.b", b"std.d", b"std.c"]);
+  assert_eq(pulling([]).pulled, [b"std.b"])
+}
+
+test "an asked module's tests are in a load that reads it whole, and in none that only imports another" {
+  let user = [{ name: b"m", src: b"pub fn f() -> Int = 1\n" }];
+  let tests_of = |p: Pulled|
+    match p.out {
+      Analysed(w) -> map(w.checked.tests, |t: TestInfo| t.key),
+      Refused(diags) -> map(diags, |d: Diag| d.message),
+    };
+  let asked = analyse_pulling_std_with(
+    user,
+    reached_fixture(),
+    [],
+    [],
+    reached: false,
+    asked: [b"std.r"],
+  );
+  assert_eq(asked.pulled, [b"std.r", b"std.s"]);
+  assert_eq(tests_of(asked), [b"std.r.r holds"]);
+  let plain = analyse_pulling_std_with(user, reached_fixture(), [], [], reached: false);
+  assert_eq(plain.pulled, []);
+  assert_eq(tests_of(plain), [])
+}
+
+test "an asked module the load never read is refused as the front end's own fault" {
+  let lazy = analyse_pulling_std_with(
+    [{ name: b"m", src: b"pub fn f() -> Int = 1\n" }],
+    [],
+    [],
+    [],
+    unread: [b"std.a"],
+    asked: [b"std.a"],
+  );
+  assert_eq(match lazy.out { Analysed(_) -> [], Refused(diags) -> map(diags, |d: Diag| d.code) }, [
+    b"E0505",
+  ])
 }
 
 test "a load reads a compiler module's bare sibling imports and what it embeds beside its package" {
@@ -5323,6 +5414,7 @@ test "a load reads a compiler module's bare sibling imports and what it embeds b
 /// another, with what a load asked for of each kind.
 fn data_pulled_by(
   user: List<Source>,
+  named: List<Bytes> = [],
 ) -> { shipping: Shipping, modules: List<Bytes>, data: List<Bytes> } / {abort.raise} = {
   let texts = [
     {
@@ -5347,10 +5439,19 @@ fn data_pulled_by(
           { ..a, data: push(a.data, name) });
         if name == b"std/words/list.txt" { Some(b"one\ntwo\n") } else { None }
       },
+      named,
     );
     let asked = cell_get(c);
     { shipping: shipping, modules: asked.modules, data: asked.data }
   } }
+}
+
+test "a load asked for a shipped module reads the data file it embeds, though nothing imports it" {
+  let p = data_pulled_by([{ name: b"m", src: b"pub fn f() -> Int = 1" }], [b"std.words"]);
+  assert_eq(p.modules, [b"std.words"]);
+  assert_eq(p.data, [b"std/words/list.txt"]);
+  assert_eq(p.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\ntwo\n" }]);
+  assert_eq(p.shipping.unread, [b"std.idle"])
 }
 
 test "a load reads the data files the shipped modules it pulls embed, each once, and no other's" {
