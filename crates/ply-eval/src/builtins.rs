@@ -305,6 +305,10 @@ builtins! { $
     /// `acquire` answered into the hold inside the bracket's own acquire, where a cancel takes no
     /// answer.
     HoldPut = "?hold_put", 2, ends;
+    /// `sqlite_run(image, sql, params, reads_only, strict, limits)`: one statement over the
+    /// database an image holds, answering the image it leaves.
+    SqliteRun = "sqlite_run", 6, ends;
+    SqliteFunctions = "sqlite_functions", 0, ends;
 }
 
 impl Builtin {
@@ -1384,6 +1388,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::CryptoSign => crate::crypto::sign(&args[0], &args[1], &args[2], span),
         Builtin::CryptoVerify => crate::crypto::verify(args, span),
         Builtin::CryptoAgree => crate::crypto::agree(&args[0], &args[1], &args[2], span),
+        Builtin::SqliteRun => crate::sqlite::run_image(args, span),
+        Builtin::SqliteFunctions => Ok(crate::sqlite::functions()),
     }
 }
 
