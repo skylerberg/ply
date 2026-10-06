@@ -5,16 +5,21 @@
 //! maker or a reader, so none holds a line break, a control character or an `@` that is not its
 //! one separator: a text that reads as two addresses to one reader and one to another is refused,
 //! never repaired. Two addresses are `==` when their local parts are the same text, case and all,
-//! and their domains differ at most in the case of ASCII letters. `read_address_list` is the one
+//! and their domains are one name: they differ at most in the case of ASCII letters and in
+//! whether an internationalized label is written in its script or as its A-label, so
+//! `user@b\u{fc}cher.example` is `user@xn--bcher-kva.example`. `read_address_list` is the one
 //! parser of RFC 5322 §3.4: display names as atoms, quoted strings and encoded words, angle
 //! addresses, groups, comments wherever the grammar admits them, which are read and dropped,
 //! quoted local parts and domain literals, whose text is kept as written. Under `Obsolete` it also
 //! takes §4's syntax, which a reader of mail must: a route in an angle address is read and
 //! dropped, and empty list elements, periods in a display name and blanks around the dots of an
-//! address are passed over. A domain is host names' letters, digits and hyphens, so an A-label
-//! passes as any label does; UTF-8 in a local part, a domain or a display name (RFC 6531, RFC
-//! 6532) is read and written only under `Utf8` and refused by reason otherwise, and a U-label is
-//! kept as written, never converted. With `import std.email`, `email"jdoe@example.org"` is an
+//! address are passed over. A domain is host names' letters, digits and hyphens; UTF-8 in a local
+//! part, a domain or a display name (RFC 6531, RFC 6532) is read only under `Utf8` and refused
+//! by reason otherwise. A domain with a label outside ASCII, or one that opens `xn--`, is a
+//! domain name as `std.idna` reads one or is refused with what it found wrong. An address keeps
+//! its domain as written, and `show` writes it so; `ascii_domain` is its A-labels, which is what
+//! a writer under `Ascii` writes and what a path without `SMTPUTF8` carries, so only a local
+//! part outside ASCII needs `Utf8`. With `import std.email`, `email"jdoe@example.org"` is an
 //! `Address` checked with the program.
 //!
 //! A `Message` is header fields in the order written and a body, and holds the bytes it was read
@@ -51,6 +56,7 @@ import std.encoded_word
 import std.encoded_word (Literal, Piece, Word, encode_words, is_blank, pieces)
 import std.gen
 import std.gen (Gen)
+import std.idna
 import std.list
 import std.list (all, any, concat, enumerate, find, first, flat_map, last, prepend, push_unique,
                  sort_by)
@@ -97,6 +103,9 @@ pub type Why =
   | BadLocalPart
   /// A domain that is neither host labels between single dots nor a literal in brackets.
   | BadDomain
+  /// A domain with a label outside ASCII, or one that opens `xn--`, that is no domain name:
+  /// each thing `std.idna` finds wrong with it, by its label.
+  | BadIdna(List<idna::Problem>)
   /// A quoted string that never closes.
   | Unclosed
   /// A comment that never closes.
@@ -204,6 +213,9 @@ pub fn explain(why: Why) -> String =
     BadLocalPart -> "a local part is atoms between single dots, or a quoted string",
     BadDomain ->
       "a domain is labels of letters, digits and hyphens between single dots, or a literal in brackets",
+    BadIdna(problems) ->
+      "no internationalized domain name: "
+        ++ (match problems { [found, ..] -> idna::reason(found.why), [] -> "it converts to none" }),
     Unclosed -> "the quoted string never closes",
     UnclosedComment -> "the comment never closes",
     UnclosedAngle -> "a `>` is expected here",
@@ -444,14 +456,45 @@ fn local_checked(local: String, utf8: Bool, at: Int) -> String / {email.refused,
   else { local }
 }
 
-/// The domain that starts at `start`, and where the text stands right after it.
-fn domain_from(cx: Cx, start: Int) -> Text / {email.refused, abort.raise} =
-  if peek(cx.b, start) == b'[' { bracketed(cx, start) } else {
+/// A domain as written, what every spelling of it shares, and where the text stands after it.
+type Domain = { text: String, key: String, at: Int }
+
+/// The checks a mail domain is held to where `std.idna` reads it: a host name's, the hyphens
+/// third and fourth apart, which a label in ASCII alone is not held to either.
+fn host_checks() -> idna::Options =
+  {
+    check_hyphens: false,
+    check_bidi: true,
+    check_joiners: true,
+    use_std3_ascii_rules: true,
+    verify_dns_length: true,
+  }
+
+/// What every spelling of the name `labels` join to shares, which addresses are compared by:
+/// the name in lower case where it is ASCII, and the A-labels `std.idna` makes of one with a
+/// label outside ASCII or one that opens `xn--`. Raises `email.refused` at `at` where it makes
+/// none.
+fn name_key(labels: List<String>, name: String, at: Int) -> String / {email.refused, abort.raise} = {
+  let coded = any(labels, |l: String| string_starts_with(ascii_lower(l), "xn--"));
+  if string::is_ascii(name) && !coded { ascii_lower(name) } else {
+    match idna::to_ascii(name, host_checks()) {
+      Ok(wire) -> wire,
+      Err(problems) -> refuse(at, BadIdna(problems)),
+    }
+  }
+}
+
+/// The domain that starts at `start`.
+fn domain_from(cx: Cx, start: Int) -> Domain / {email.refused, abort.raise} =
+  if peek(cx.b, start) == b'[' {
+    let literal = bracketed(cx, start);
+    { text: literal.text, key: ascii_lower(literal.text), at: literal.at }
+  } else {
     let read = labels(cx, { at: start, held: [] }, bytes_len(cx.b) - start + 1);
     let name = join(read.held, ".");
     if !all(read.held, is_label) { refuse(start, BadDomain) }
     else if bytes_len(bytes_of_string(name)) > 255 { refuse(start, TooLong) }
-    else { { text: name, at: read.at } }
+    else { { text: name, key: name_key(read.held, name, start), at: read.at } }
   }
 
 type Labels = { at: Int, held: List<String> }
@@ -493,9 +536,9 @@ fn bracketed(cx: Cx, at: Int) -> Text / {email.refused, abort.raise} = {
 }
 
 /// The domain after the `@` at `at - 1`, with the blanks and comments around it passed over.
-fn domain_at(cx: Cx, at: Int) -> Text / {email.refused, abort.raise} = {
+fn domain_at(cx: Cx, at: Int) -> Domain / {email.refused, abort.raise} = {
   let d = domain_from(cx, cfws(cx, at));
-  { text: d.text, at: cfws(cx, d.at) }
+  { text: d.text, key: d.key, at: cfws(cx, d.at) }
 }
 
 type Spec = { address: Address, at: Int }
@@ -505,7 +548,7 @@ type Spec = { address: Address, at: Int }
 fn spec(cx: Cx, r: Run, from: Int) -> Spec / {email.refused, abort.raise} = {
   let local = local_of(cx, r.toks, from);
   let d = domain_at(cx, r.at + 1);
-  { address: Address(local, d.text), at: d.at }
+  { address: Address(local, d.text, d.key), at: d.at }
 }
 
 /// The address in the angle brackets that open at `at`, and where the text stands after its `>`
@@ -770,9 +813,11 @@ fn element(cx: Cx, r: Run, from: Int) -> Element / {email.refused, abort.raise} 
 /// 5322 admits one in quotes: an address has one `@`, and what follows it is its domain however
 /// a reader splits it. The domain is host labels between dots, or a literal in its brackets
 /// (`[192.0.2.1]`), at most 255 octets. Two addresses are `==` when their local parts are the
-/// same text, case and all, and their domains differ at most in the case of ASCII letters;
-/// `show` writes `local@domain`, the local part quoted where it must be.
-pub opaque type Address = | Address(String, String)
+/// same text, case and all, and their domains are one name: in any case of ASCII letters, and
+/// with an internationalized label in its script or as its A-label, since `std.idna` makes one
+/// name of both. `show` writes `local@domain` as the address was written, the local part
+/// quoted where it must be.
+pub opaque type Address = | Address(String, String, String)
 
 key for Address by address_key
 
@@ -783,7 +828,7 @@ gen for Address by addresses
 type AddressKey = { domain: String, local: String }
 
 fn address_key(a: Address) -> AddressKey =
-  match a { Address(local, domain) -> { domain: ascii_lower(domain), local: local } }
+  match a { Address(local, _, shared) -> { domain: shared, local: local } }
 
 /// The address of this local part and this domain, raising `email.refused` where either is not
 /// one an address has, at the byte of the argument that is not. The local part is given as its
@@ -797,14 +842,25 @@ pub fn address(
   let cx = cx_of(domain, repertoire, Current);
   let d = domain_from(cx, 0);
   if d.at < bytes_len(cx.b) { refuse(d.at, unfit(cx, d.at, BadDomain)) }
-  else { Address(local_checked(local, cx.utf8, 0), d.text) }
+  else { Address(local_checked(local, cx.utf8, 0), d.text, d.key) }
 }
 
 /// An address's local part, as text: `john doe` of `"john doe"@example.org`.
-pub fn local_part(a: Address) -> String = match a { Address(local, _) -> local }
+pub fn local_part(a: Address) -> String = match a { Address(local, _, _) -> local }
 
 /// An address's domain as written: host labels between dots, or a literal with its brackets.
-pub fn domain(a: Address) -> String = match a { Address(_, domain) -> domain }
+pub fn domain(a: Address) -> String = match a { Address(_, domain, _) -> domain }
+
+/// An address's domain in ASCII: as written where it is, and the A-labels of a name written
+/// outside it, in lower case. It is what DNS is asked for and what a path without `SMTPUTF8`
+/// carries.
+pub fn ascii_domain(a: Address) -> String =
+  match a { Address(_, domain, shared) -> if string::is_ascii(domain) { domain } else { shared } }
+
+/// The address in ASCII, its domain as `ascii_domain` writes it: what a writer under `Ascii`
+/// writes. `None` where the local part is outside ASCII, which nothing spells in ASCII.
+pub fn ascii_text(a: Address) -> Option<String> =
+  if is_ascii(a) { Some(local_text(local_part(a)) ++ "@" ++ ascii_domain(a)) } else { None }
 
 /// What stands between the brackets of an address whose domain is a literal, `192.0.2.1` or
 /// `IPv6:2001:db8::1`; `None` for a domain that is a name. The text is kept as written and is
@@ -814,10 +870,10 @@ pub fn domain_literal(a: Address) -> Option<String> / {abort.raise} = {
   if string_starts_with(d, "[") { Some(string_slice(d, 1, string_len(d) - 1)) } else { None }
 }
 
-/// Whether an address holds ASCII alone, so that a message need not be sent under `SMTPUTF8`
-/// for it.
-pub fn is_ascii(a: Address) -> Bool =
-  fold(string_chars(address_text(a)), true, |ok: Bool, c: Char| ok && int_of_char(c) < 128)
+/// Whether an address can be written in ASCII alone, so that a message need not be sent under
+/// `SMTPUTF8` for it: its local part holds ASCII alone. A domain always can be, as its
+/// A-labels.
+pub fn is_ascii(a: Address) -> Bool = string::is_ascii(local_part(a))
 
 /// The address `text` is, raising `email.refused` where `parse_address` answers `Err`: a local
 /// part, `@` and a domain in RFC 5322's current syntax, with no blank and no comment anywhere.
@@ -838,7 +894,7 @@ pub fn read_address(
     let d = domain_from(cx, r.at + 1);
     if d.at < bytes_len(cx.b) { refuse(d.at, stray(cx, d.at)) }
     else if bytes_len(bytes_of_string(d.text)) != d.at - r.at - 1 { refuse(r.at + 1, Unexpected) }
-    else { Address(local, d.text) }
+    else { Address(local, d.text, d.key) }
   }
 }
 
@@ -861,7 +917,7 @@ pub fn literal(text: String) -> Result<Address, { message: String, offset: Int }
   }
 
 fn address_text(a: Address) -> String =
-  match a { Address(local, domain) -> local_text(local) ++ "@" ++ domain }
+  match a { Address(local, domain, _) -> local_text(local) ++ "@" ++ domain }
 
 fn local_text(local: String) -> String = if is_dot_atom(local) { local } else { quote(local) }
 
@@ -1065,24 +1121,30 @@ fn drawn_label() -> Gen<String> =
   gen::map2(drawn("abcXYZ019", 1, 4), drawn("abc019-", 0, 3), |head: String, tail: String|
     head ++ tail ++ "z")
 
-fn drawn_domain() -> Gen<String> =
+/// A domain as written, and what its spellings share.
+type Drawn = { text: String, shared: String }
+
+fn drawn_domain() -> Gen<Drawn> =
   gen::one_of([
-    several(drawn_label(), "."),
+    gen::map(several(drawn_label(), "."), |name: String| { text: name, shared: ascii_lower(name) }),
     gen::elements([
-      "example.org",
-      "EXAMPLE.org",
-      "[192.0.2.1]",
-      "[IPv6:2001:db8::1]",
-      "xn--bcher-kva.example",
-      "b\u{fc}cher.example",
-      "\u{4f8b}\u{3048}.jp",
+      { text: "example.org", shared: "example.org" },
+      { text: "EXAMPLE.org", shared: "example.org" },
+      { text: "[192.0.2.1]", shared: "[192.0.2.1]" },
+      { text: "[IPv6:2001:db8::1]", shared: "[ipv6:2001:db8::1]" },
+      { text: "xn--bcher-kva.example", shared: "xn--bcher-kva.example" },
+      { text: "b\u{fc}cher.example", shared: "xn--bcher-kva.example" },
+      { text: "B\u{dc}CHER.Example", shared: "xn--bcher-kva.example" },
+      { text: "\u{4f8b}\u{3048}.jp", shared: "xn--r8jz45g.jp" },
+      { text: "\u{5d0}\u{5d1}.xn--4dbc", shared: "xn--4dbc.xn--4dbc" },
     ]),
   ])
 
-/// Addresses of every kind a reader answers: plain and quoted local parts, UTF-8 ones, names and
-/// literals for domains.
+/// Addresses of every kind a reader answers: plain and quoted local parts, UTF-8 ones, and for
+/// domains names, literals and internationalized names in their script and as A-labels.
 pub fn addresses() -> Gen<Address> =
-  gen::map2(drawn_local(), drawn_domain(), |local: String, domain: String| Address(local, domain))
+  gen::map2(drawn_local(), drawn_domain(), |local: String, d: Drawn|
+    Address(local, d.text, d.shared))
 
 fn drawn_name() -> Gen<String> =
   gen::one_of([
@@ -2699,8 +2761,11 @@ fn mailbox_stretches(m: Mailbox, utf8: Bool) -> List<String> / {email.unwritable
       push(name_stretches(name, utf8), " <" ++ wire_address(a, utf8) ++ ">"),
   }
 
+/// An address as a field carries it: as written under `Utf8`, and in ASCII otherwise, a domain
+/// written outside it as its A-labels.
 fn wire_address(a: Address, utf8: Bool) -> String / {email.unwritable} =
-  if !utf8 && !is_ascii(a) { email.unwritable(NeedsUtf8) } else { address_text(a) }
+  if utf8 { address_text(a) }
+  else { match ascii_text(a) { Some(text) -> text, None -> email.unwritable(NeedsUtf8) } }
 
 /// The stretches that carry a display name: its words where it is atoms with one space between
 /// them, a quoted string where it is printable, and encoded words otherwise.
@@ -3026,13 +3091,13 @@ pub type Envelope = new {
   sender: Address,
   /// Every address it goes to, once each.
   recipients: List<Address>,
-  /// Whether an address here is outside ASCII, so that only a path offering `SMTPUTF8` takes
-  /// it.
+  /// Whether a local part here is outside ASCII, so that only a path offering `SMTPUTF8` takes
+  /// it. Any other path is handed each address as `ascii_text` writes it.
   utf8: Bool,
 }
 
 /// Every address a draft goes to: those of `To`, `Cc` and `Bcc` in that order, the members of a
-/// group among them, each once however it is cased in its domain.
+/// group among them, each once however its domain is cased or spelled.
 pub fn recipients(d: Draft) -> List<Address> =
   fold(
     map(mailboxes_of(concat(concat(d.to, d.cc), d.bcc)), address_of),
@@ -3604,11 +3669,67 @@ test "addresses are equal by their local part as written and their domain in any
     result_map(try { address("jdoe", "EXAMPLE.Org") }, digest),
     result_map(try { jdoe() }, digest),
   );
-  // The fold is ASCII's: the Kelvin sign is no `k`.
-  assert(
-    (try { address("a", "\u{212a}.example", Utf8) }) != (try { address("a", "k.example", Utf8) }),
-  );
   assert_eq(result_map(try { address("jdoe", "EXAMPLE.Org") }, domain), Ok("EXAMPLE.Org"))
+}
+
+test "addresses are equal whether a label of their domain is written in its script or as its A-label" {
+  let written = try { address("user", "b\u{fc}cher.example", Utf8) };
+  let coded = parse_address("user@xn--bcher-kva.example");
+  assert_eq(written, coded);
+  assert_eq(result_map(written, digest), result_map(coded, digest));
+  assert_eq(
+    try { address("user", "B\u{dc}CHER.Example", Utf8) },
+    parse_address("user@XN--Bcher-KVA.example"),
+  );
+  assert_eq(try { address("user", "bu\u{308}cher.example", Utf8) }, coded);
+  assert((try { address("user", "bucher.example") }) != coded);
+  assert((try { address("User", "b\u{fc}cher.example", Utf8) }) != coded);
+  // The name is `std.idna`'s, which reads the Kelvin sign as the `k` it maps to.
+  assert_eq(try { address("a", "\u{212a}.example", Utf8) }, try { address("a", "k.example") });
+  assert_eq(result_map(written, domain), Ok("b\u{fc}cher.example"));
+  assert_eq(result_map(written, ascii_domain), Ok("xn--bcher-kva.example"));
+  assert_eq(result_map(written, |a: Address| show(a)), Ok("user@b\u{fc}cher.example"));
+  assert_eq(result_map(written, ascii_text), Ok(Some("user@xn--bcher-kva.example")));
+  assert_eq(result_map(written, is_ascii), Ok(true));
+  assert_eq(
+    result_map(try { address("j\u{fc}rgen", "b\u{fc}cher.example", Utf8) }, ascii_text),
+    Ok(None),
+  );
+  assert_eq(
+    result_map(try { address("a b", "EXAMPLE.Org") }, ascii_text),
+    Ok(Some("\"a b\"@EXAMPLE.Org")),
+  );
+  assert_eq(
+    result_map(try { address("a", "[IPv6:2001:DB8::1]") }, ascii_domain),
+    Ok("[IPv6:2001:DB8::1]"),
+  )
+}
+
+test "a domain with a label outside ASCII or an A-label is a domain name, or is refused with what is wrong" {
+  let wrong = |domain: String, label: Int, why: idna::Why|
+    assert_eq(
+      try { address("a", domain, Utf8) },
+      Err({ at: 0, why: BadIdna([{ label: label, why: why }]) }),
+    );
+  wrong("xn--a.example", 0, idna::Disallowed);
+  wrong("example.xn--0", 1, idna::Punycode);
+  wrong("a.\u{200d}b.example", 1, idna::Joiner);
+  wrong("\u{5d0}a.example", 0, idna::Bidi);
+  wrong("b\u{ff20}c.example", 0, idna::Disallowed);
+  wrong("\u{301}a.example", 0, idna::LeadingMark);
+  wrong("\u{fc}" ++ string::repeat("a", 58) ++ ".example", 0, idna::LongLabel);
+  assert_eq(
+    parse_address("a@xn--a.example"),
+    Err({ at: 2, why: BadIdna([{ label: 0, why: idna::Disallowed }]) }),
+  );
+  assert_eq(parse_address("a@b\u{fc}cher.example"), Err({ at: 3, why: NonAscii }));
+  assert(result_is_ok(try { address("a", "ab--c.example") }));
+  assert(result_is_ok(try { address("a", "ab--c.b\u{fc}cher.example", Utf8) }));
+  assert(result_is_ok(try { address("a", "axn--b.example") }));
+  assert_eq(
+    explain(BadIdna([{ label: 0, why: idna::Bidi }])),
+    "no internationalized domain name: a name with a right-to-left label keeps the Bidi rule in every label",
+  )
 }
 
 test "a domain literal is kept as written between its brackets" {
@@ -3672,6 +3793,14 @@ test "the literal's check answers the address, or the character the text stops b
 law "an address's text reads back as it"
   forall (a: Address) {
     parse_address(show(a), Utf8) == Ok(a)
+  }
+
+law "an address is written in ASCII unless its local part is outside it, and reads back as it from that"
+  forall (a: Address) {
+    match ascii_text(a) {
+      Some(text) -> is_ascii(a) && string::is_ascii(text) && parse_address(text) == Ok(a),
+      None -> !is_ascii(a),
+    }
   }
 
 law "an address is the one its maker makes of its parts, however its domain is cased"
@@ -5404,6 +5533,23 @@ test "a blind copy is in the envelope, and in the bytes only where it is asked f
   assert_eq(envelope(far).utf8, true)
 }
 
+test "a domain outside ASCII is written as its A-labels unless UTF-8 is asked for, and needs no `SMTPUTF8`" {
+  let a = address("a", "b\u{fc}cher.example", Utf8);
+  let written = |utf8: Bool| result_map(try { addressed("To", [one(mailbox(a))], utf8) }, value_of);
+  assert_eq(
+    result_map(written(false), |v: String| string_contains(v, "a@xn--bcher-kva.example")),
+    Ok(true),
+  );
+  assert_eq(
+    result_map(written(true), |v: String| string_contains(v, "a@b\u{fc}cher.example")),
+    Ok(true),
+  );
+  let d = with_sender(with_text(plain_draft(), "text\n"), mailbox(a));
+  assert_eq(envelope(d).utf8, false);
+  assert_eq(map(prepend(envelope(d).sender, []), ascii_text), [Some("a@xn--bcher-kva.example")]);
+  assert(result_is_ok(build(d, "x")))
+}
+
 type Unwritten = { what: String, draft: Draft, boundary: String, why: Unwritable }
 
 fn unwritten() -> List<Unwritten> / {email.refused, abort.raise} = {
@@ -5422,8 +5568,8 @@ fn unwritten() -> List<Unwritten> / {email.refused, abort.raise} = {
       why: NeedsUtf8,
     },
     {
-      what: "a domain outside ASCII",
-      draft: with_sender(d, mailbox(address("a", "b\u{fc}cher.example", Utf8))),
+      what: "a local part outside ASCII beside a domain outside it",
+      draft: with_sender(d, mailbox(address("\u{e4}", "b\u{fc}cher.example", Utf8))),
       boundary: "x",
       why: NeedsUtf8,
     },

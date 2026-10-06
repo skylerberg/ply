@@ -69,8 +69,8 @@ pub enum JobOutput {
 
 type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 
-/// Rung by every pool it is handed to whenever one of their operations finishes, so one wait can
-/// cover several pools: separate condition variables cannot be waited on together.
+/// Rung by every pool it is handed to whenever one of their operations finishes, and by a stop, so
+/// one wait can cover them all: separate condition variables cannot be waited on together.
 #[derive(Default)]
 pub struct Bell {
     rung: Mutex<u64>,
@@ -92,7 +92,15 @@ impl Bell {
         }
     }
 
-    fn ring(&self) {
+    /// The same, for at most `bound`.
+    pub fn wait_past_for(&self, seen: u64, bound: Duration) {
+        let rung = lock(&self.rung);
+        if *rung == seen {
+            drop(wait_timeout(&self.heard, rung, bound));
+        }
+    }
+
+    pub(crate) fn ring(&self) {
         *lock(&self.rung) += 1;
         self.heard.notify_all();
     }
