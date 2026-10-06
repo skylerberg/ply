@@ -2,12 +2,16 @@
 //! children it starts, and that none of them outlives the run. What a program writes goes to the
 //! process's own streams, so every run here is one.
 
-import harness (scratch, Ran, Server, program, on_disk, spawned, spawned_reading, speaking,
-                next_line, signal_to, ended, environment, said, stdout, stderr, json_of, at, str,
-                int, truth, shown, Here, Spawned)
+import harness (scratch, Ran, Server, program, on_disk, spawned, spawned_reading, spawned_fed,
+                spawned_into, this_ply, speaking, next_line, signal_to, ended, environment, said,
+                stdout, stderr, json_of, at, str, int, truth, shown, items, finished, stop, Here,
+                Spawned, Shell)
+import std.bytes
 import std.config (config)
 import std.json (Json, Null)
-import std.process (process, Exited, Signalled, Terminate)
+import std.list (contains)
+import std.process (process, Finished, Signal, Exited, Signalled, Terminate, Hangup, User1, User2,
+                    WindowChange)
 import std.string
 import std.time (time)
 
@@ -274,4 +278,408 @@ test/nondet "a drain that runs out of time ends the children with the run" {
   let s = stopped(["--drain-ms", "200"], 1);
   assert(s.code == 3, Some("an expired drain exits 3"));
   assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the drain"))
+}
+
+// --- The streams as bytes ---------------------------------------------------
+
+fn exit_of(f: Finished) -> Int = match f.ended { Exited(c) -> c, Signalled(n) -> 128 + n }
+
+/// `cat`: standard input to standard output through `std.io`, then an exit, so no value follows.
+fn cat() -> String =
+  \\import std.io
+  \\import std.io (io)
+  \\import std.process (process, pipe)
+  \\
+  \\fn main() -> Unit / {process.read[proc], process.write[proc], pipe.broken, io.too_long, io.unwritten, abort.raise} = {
+  \\  let copied = with_hold[input](io::stdin[proc](), io::shut) { from ->
+  \\    with_hold[output](io::stdout[proc](), io::shut_sink) { to ->
+  \\      io::copy(from, to, 8192, 1073741824)
+  \\    }
+  \\  };
+  \\  process.exit[proc](if copied >= 0 { 0 } else { 1 })
+  \\}
+  \\
+
+/// Every byte there is, over and over: more than standard output's buffer holds, with a NUL,
+/// newlines and bytes that are no UTF-8 among them.
+fn every_byte() -> Bytes / {abort.raise} =
+  bytes::repeat(bytes_concat_all(map(range(0, 256), byte_of_int)), 300)
+
+/// Whether `text` is lines that each start with the three blanks the run's own lines do.
+fn only_the_runs_own(text: Bytes) -> Bool / {abort.raise} = {
+  let lines = bytes_split(text, b"\n");
+  fold(
+    range(0, len(lines) - 1),
+    bytes_ends_with(text, b"\n") || bytes_len(text) == 0,
+    |ok: Bool, i: Int|
+      ok && (match list_at(lines, i) { Some(l) -> bytes_starts_with(l, b"   "), None -> false }),
+  )
+}
+
+test/nondet "a Ply cat copies its input to its output byte for byte" {
+  program(cat());
+  let input = every_byte();
+  let f = spawned_fed(["run", "m.ply", "--host"], [], input);
+  assert(exit_of(f) == 0, Some(said(finished(f))));
+  let before = bytes_len(f.out) - bytes_len(input);
+  assert(
+    before >= 0 && bytes_ends_with(f.out, input),
+    Some(
+      "standard output ends with " ++ int_to_string(bytes_len(input))
+        ++ " bytes that are the input, and held "
+        ++ int_to_string(bytes_len(f.out)),
+    ),
+  );
+  assert(
+    only_the_runs_own(bytes_slice(f.out, 0, before)),
+    Some("only the run's own lines come before what the program wrote"),
+  )
+}
+
+test/nondet "under json the bytes a program writes go to stderr, where its lines go" {
+  program(cat());
+  let input = every_byte();
+  let f = spawned_fed(["run", "m.ply", "--host", "--json"], [], input);
+  assert(exit_of(f) == 0, Some(string_of_bytes_lossy(f.out)));
+  assert(
+    f.err == input,
+    Some(
+      "stderr held " ++ int_to_string(bytes_len(f.err)) ++ " bytes, and the input is "
+        ++ int_to_string(bytes_len(input)),
+    ),
+  );
+  assert(str(at(json_of(finished(f)), "command")) == "run", Some(string_of_bytes_lossy(f.out)))
+}
+
+fn prompts() -> String =
+  \\import std.process
+  \\import std.process (process, pipe)
+  \\
+  \\fn main() -> Unit / {process.read[proc], process.write[proc], pipe.broken} = {
+  \\  process::write_out[proc](b"name: ");
+  \\  let name = match process.line[proc]() { Some(line) -> line, None -> "nobody" };
+  \\  let rest = process.in_bytes[proc](100);
+  \\  process.out[proc]("hello " ++ name ++ ", and " ++ int_to_string(bytes_len(rest)) ++ " bytes follow");
+  \\  process.exit[proc](0)
+  \\}
+  \\
+
+test/nondet "a prompt and its answer share a line, and bytes read after a line start where it ended" {
+  program(prompts());
+  let r = spawned_reading(["run", "m.ply", "--host"], [], "ada\r\nrest of it");
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "name: hello ada, and 10 bytes follow"), Some(stdout(r)))
+}
+
+/// Writes part of a line and never flushes it, then ends as `ENDING` says.
+fn half_a_line() -> String =
+  \\import std.process
+  \\import std.process (process, pipe)
+  \\
+  \\fn main() -> Unit / {process.write[proc], pipe.broken, abort.raise} = {
+  \\  process::write_out[proc](b"half a line");
+  \\  ENDING
+  \\}
+  \\
+
+test/nondet "what a program wrote and never flushed is written however it ends" {
+  fold(
+    [
+      { ending: "()", code: 0 },
+      { ending: "process.exit[proc](3)", code: 3 },
+      { ending: "panic(\"the program gave up\")", code: 1 },
+    ],
+    (),
+    |u: Unit, c: { ending: String, code: Int }| {
+      program(string::replace(half_a_line(), "ENDING", c.ending));
+      let r = spawned(["run", "m.ply", "--host"], []);
+      assert(r.code == c.code, Some("ended by `" ++ c.ending ++ "`\n" ++ said(r)));
+      assert(
+        string_contains(stdout(r), "half a line"),
+        Some("ended by `" ++ c.ending ++ "`, the bytes were lost:\n" ++ stdout(r)),
+      )
+    },
+  )
+}
+
+/// A program that writes far more than `head -1` reads, as `WRITES` writes it.
+fn writes_into_head() -> String =
+  \\import std.process
+  \\import std.process (process, pipe)
+  \\
+  \\fn lines(n: Int) -> Unit / {process.out[proc]} =
+  \\  if n <= 0 { () } else {
+  \\    process.out[proc]("line " ++ int_to_string(n));
+  \\    lines(n - 1)
+  \\  }
+  \\
+  \\fn bytes(n: Int) -> Unit / {process.out_bytes[proc], process.flush[proc], pipe.broken} =
+  \\  if n <= 0 { () } else {
+  \\    process::write_out[proc](b"0123456789abcdef\n");
+  \\    process::flush_out[proc]();
+  \\    bytes(n - 1)
+  \\  }
+  \\
+  \\fn main() -> Unit / {process.write[proc], pipe.broken} = {
+  \\  WRITES;
+  \\  process.err[proc]("wrote it all")
+  \\}
+  \\
+
+fn answers_the_pipe() -> String =
+  \\{
+  \\    let wrote: Result<Unit, process::Stream> = try[pipe.broken] { bytes(200000) };
+  \\    match wrote {
+  \\      Ok(_) -> (),
+  \\      Err(_) -> {
+  \\        process.err[proc]("the reader left");
+  \\        process.exit[proc](7)
+  \\      },
+  \\    }
+  \\  }
+
+/// What `ply run m.ply --host` leaves when the reader of its output takes three lines and goes,
+/// as `head` does: the third line, which is the program's first after the run's own two, and on
+/// stderr what the run said and then `status` and the code it exited with. The reader is a
+/// shell's own `read`, which takes a line and not a byte past it, so the pipe closes on the
+/// program and never on the two lines the run writes before it.
+fn into_head() -> Finished / {Shell, abort.raise} =
+  spawned_into(["run", "m.ply", "--host"], "{ read a; read b; read c; echo \"$c\"; }")
+
+test/nondet "a program writing into a pipe whose reader left exits quietly, as a closed pipe ends one" {
+  fold(
+    [
+      { writes: "lines(200000)", first: b"line 200000\n" },
+      { writes: "bytes(200000)", first: b"0123456789abcdef\n" },
+    ],
+    (),
+    |u: Unit, c: { writes: String, first: Bytes }| {
+      program(string::replace(writes_into_head(), "WRITES", c.writes));
+      let f = into_head();
+      let err = string_of_bytes_lossy(f.err);
+      assert(
+        string_contains(err, "status 141"),
+        Some("`" ++ c.writes ++ "` into a pipe:\n" ++ err),
+      );
+      assert(
+        !string_contains(err, "E0502") && !string_contains(err, "Broken pipe")
+          && !string_contains(err, "wrote it all"),
+        Some("a closed pipe is no failure to report, and nothing runs after it:\n" ++ err),
+      );
+      assert(f.out == c.first, Some(string_of_bytes_lossy(f.out)))
+    },
+  )
+}
+
+test/nondet "a program that answers the closed pipe goes on, and ends as it chooses" {
+  program(string::replace(writes_into_head(), "WRITES", answers_the_pipe()));
+  let err = string_of_bytes_lossy(into_head().err);
+  assert(string_contains(err, "the reader left"), Some(err));
+  assert(string_contains(err, "status 7"), Some(err))
+}
+
+// --- Signals ----------------------------------------------------------------
+
+/// Asks about each signal once, says it is ready, then says which arrive until it is stopped.
+fn listens() -> String =
+  \\import std.process (process)
+  \\import std.signal (signal)
+  \\
+  \\fn told(name: String, arrived: Bool) -> Unit / {process.out[proc]} =
+  \\  if arrived { process.out[proc]("got " ++ name) } else { () }
+  \\
+  \\fn watch(turns: Int) -> Unit / {signal.read, signal.write, process.out[proc], clock.sleep} =
+  \\  if turns <= 0 || signal.stopping() { () } else {
+  \\    told("hangup", signal.hangup());
+  \\    told("user1", signal.user1());
+  \\    told("user2", signal.user2());
+  \\    told("resized", signal.resized());
+  \\    clock.sleep(Duration(10000000));
+  \\    watch(turns - 1)
+  \\  }
+  \\
+  \\fn main() -> Unit / {signal.read, signal.write, process.out[proc], clock.sleep} = {
+  \\  let asked = [signal.hangup(), signal.user1(), signal.user2(), signal.resized()];
+  \\  process.out[proc](if len(filter(asked, |a: Bool| a)) == 0 { "ready" } else { "early" });
+  \\  watch(12000)
+  \\}
+  \\
+
+/// Says it is ready and waits, asking about no signal.
+fn asks_nothing() -> String =
+  \\import std.process (process)
+  \\
+  \\fn main() -> Unit / {process.out[proc], clock.sleep} = {
+  \\  process.out[proc]("ready");
+  \\  clock.sleep(Duration(120000000000))
+  \\}
+  \\
+
+/// The run's lines up to the one that is `wanted`, or the test fails with what came instead.
+fn until_said(run: Server, wanted: String, tries: Int) -> Unit / {Spawned, abort.raise} =
+  if tries <= 0 { panic("the run never said `" ++ wanted ++ "`") } else {
+    match next_line(run, 120000) {
+      Some(line) -> if line == wanted { () } else { until_said(run, wanted, tries - 1) },
+      None -> {
+        stop(run);
+        panic("the run fell silent before it said `" ++ wanted ++ "`")
+      },
+    }
+  }
+
+test/nondet "a program that asked about a signal is told when it arrives, and goes on" {
+  program(listens());
+  let run = speaking(["run", "m.ply", "--host"], []);
+  until_said(run, "ready", 20);
+  fold(
+    [
+      { signal: Hangup, said: "got hangup" },
+      { signal: User1, said: "got user1" },
+      { signal: User2, said: "got user2" },
+      { signal: WindowChange, said: "got resized" },
+      { signal: Hangup, said: "got hangup" },
+    ],
+    (),
+    |u: Unit, c: { signal: Signal, said: String }| {
+      signal_to(run, c.signal);
+      until_said(run, c.said, 1)
+    },
+  );
+  signal_to(run, Terminate);
+  let f = ended(run, 60000, "the run was still going a minute after it was asked to stop");
+  assert(
+    f.ended == Exited(0),
+    Some("a stop ends a program that polls for it: " ++ said(finished(f))),
+  )
+}
+
+test/nondet "a hangup nobody asked about ends the process, as the platform has it" {
+  program(asks_nothing());
+  let run = speaking(["run", "m.ply", "--host"], []);
+  until_said(run, "ready", 20);
+  signal_to(run, Hangup);
+  let f = ended(run, 60000, "the run outlived a hangup it never asked about");
+  assert(f.ended == Signalled(1), Some("ended as " ++ int_to_string(exit_of(f))))
+}
+
+// --- The machine ------------------------------------------------------------
+
+fn describes_the_machine() -> String =
+  \\import std.os
+  \\import std.os (os)
+  \\import std.process (process)
+  \\
+  \\fn main() -> Unit / {os.read, process.out[proc]} = {
+  \\  process.out[proc]("family " ++ os::family_name(os.family()));
+  \\  process.out[proc]("name " ++ os.name());
+  \\  process.out[proc]("arch " ++ os::arch_name(os.arch()));
+  \\  process.out[proc]("cpus " ++ (if os.cpus() >= 1 { "some" } else { "none" }));
+  \\  process.out[proc]("host " ++ os.hostname());
+  \\  process.out[proc]("user " ++ int_to_string(os.user().id));
+  \\  process.out[proc]("pid " ++ (if os.pid() > 1 { "its own" } else { "none" }));
+  \\  process.out[proc]("executable " ++ (match os.executable() { Some(path) -> path, None -> "" }));
+  \\  process.out[proc]("endian " ++ (match os.endian() { os::Little -> "little", os::Big -> "big" }));
+  \\  process.out[proc]("pointer " ++ int_to_string(os.pointer_bits()))
+  \\}
+  \\
+
+/// One line a shell command writes, without its ending.
+fn sh_says(command: String) -> String / {process.spawn[sh], config.get[env]} =
+  string::ascii_trim(
+    string_of_bytes_lossy(process.spawn[sh](["-c", command], "", environment([])).out),
+  )
+
+test/nondet "a program is told the machine it runs on, as the system's own tools tell it" {
+  program(describes_the_machine());
+  let r = spawned(["run", "m.ply", "--host"], []);
+  assert(r.code == 0, Some(said(r)));
+  let has = |line: String|
+    assert(contains(r.out, line), Some("no line `" ++ line ++ "` in:\n" ++ stdout(r)));
+  has(
+    "family "
+      ++ (if sh_says("uname -s") == "Darwin" { "macos" }
+      else { string::ascii_lower(sh_says("uname -s")) }),
+  );
+  has("name " ++ sh_says("uname -sr"));
+  has("arch " ++ (if sh_says("uname -m") == "arm64" { "aarch64" } else { sh_says("uname -m") }));
+  has("cpus some");
+  has("host " ++ sh_says("uname -n"));
+  has("user " ++ sh_says("id -u"));
+  has("pid its own");
+  has("executable " ++ this_ply());
+  assert(contains(r.out, "endian little") || contains(r.out, "endian big"), Some(stdout(r)));
+  has("pointer " ++ sh_says("getconf LONG_BIT"))
+}
+
+test "ply hosts lists every operation of std.os a program performs" {
+  scratch(|| {
+    program(describes_the_machine());
+    let r = on_disk(["hosts", "--host", "--json"]);
+    assert(r.code == 0, Some(said(r)));
+    let triples = map(items(at(json_of(r), "hosts")), |row: Json| str(at(row, "triple")));
+    fold(
+      [
+        "family",
+        "name",
+        "arch",
+        "cpus",
+        "hostname",
+        "user",
+        "pid",
+        "executable",
+        "endian",
+        "pointer_bits",
+      ],
+      (),
+      |u: Unit, op: String|
+        assert(
+          contains(triples, "std.os.os." ++ op),
+          Some("`os." ++ op ++ "` is not listed:\n" ++ said(r)),
+        ),
+    )
+  })
+}
+
+test "a `const fn` cannot ask the machine anything, so no build keeps one machine's answer" {
+  scratch(|| {
+    program(
+      "import std.os (os)\n\nconst fn workers() -> Int = os.cpus()\n\nfn main() -> Int = workers()\n",
+    );
+    let r = on_disk(["check"]);
+    assert(r.code != 0, Some(said(r)));
+    assert(string_contains(said(r), "E0156"), Some(said(r)))
+  })
+}
+
+test/nondet "ply test withholds the terminal, the streams as bytes and the signals a program asks about" {
+  fold(
+    [
+      {
+        program: "import std.term (term)\n\ntest/nondet \"asks\" {\n  assert(term.size() == None)\n}\n",
+        handler: "ply_host::term::size",
+      },
+      {
+        program: "import std.process (process)\n\ntest/nondet \"asks\" {\n  assert(process.out_bytes[proc](b\"x\"))\n}\n",
+        handler: "ply_host::process::out_bytes",
+      },
+      {
+        program: "import std.process (process)\n\ntest/nondet \"asks\" {\n  assert(process.in_bytes[proc](1) == b\"\")\n}\n",
+        handler: "ply_host::process::in_bytes",
+      },
+      {
+        program: "import std.signal (signal)\n\ntest/nondet \"asks\" {\n  assert(!signal.hangup())\n}\n",
+        handler: "ply_host::signal::hangup",
+      },
+    ],
+    (),
+    |u: Unit, c: { program: String, handler: String }| {
+      program(c.program);
+      let r = spawned(["test", "--host", "--json"], []);
+      assert(
+        string_contains(said(r), "E0424"),
+        Some("`" ++ c.handler ++ "` was not withheld\n\n" ++ said(r)),
+      );
+      assert(string_contains(said(r), c.handler), Some(said(r)))
+    },
+  )
 }
