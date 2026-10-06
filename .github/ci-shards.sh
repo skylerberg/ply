@@ -71,7 +71,8 @@ CORPUS_PROGRAM=crates/ply-corpus/ply
 # The programs the corpus program runs, each a `ply test` of its own whose tests must pass.
 CORPUS_FIXTURES=crates/ply-corpus/fixtures
 CORPUS_CHECKS=crates/ply-corpus/checks
-# A program importing every standard library module, whose tests and laws run under `--std`.
+# The fixtures the standard library's tests read, as a project: `--std` over it runs the tests and
+# laws of every module the binary ships beside its own, so no file here lists the modules.
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 CLI_SUITE=crates/ply-cli-tests/ply
 # The checks that start desks under load and drive them over postgres: a test at a time, cut by
@@ -130,7 +131,7 @@ GATES_ALONE=(
 CLI_TREE_CHECKS=(
   "copies:no two modules define the same function"
   "fixture_list:every fixture is listed"
-  "fmt:the standard library is committed formatted"
+  "fmt:{path} is committed formatted"
   "fmt:the compiler is committed formatted"
   "fmt:the CLI is committed formatted"
   "fmt:the CLI's suite is committed formatted"

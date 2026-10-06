@@ -1,0 +1,522 @@
+//! Every file the standard library ships under `crates/ply-std/ply/ucd/`, derived: each is a
+//! function of the published files `ucd_files` reads, and a test holds the shipped file to what
+//! that function writes, byte for byte, so the tree holds no table the database does not produce.
+//!
+//! Moving to another version of Unicode is replacing the published files, running `main` here,
+//! which is this program's entry and writes what they derive into the directory the run lends as
+//! `ucd` (`ply run crates/ply-corpus/stdlib --host --fs ucd=crates/ply-std/ply/ucd`), and naming
+//! the version in `std.ucd`. A new table is a derivation here, a name in `names`, and the same
+//! run.
+
+import std.bytes (join)
+import std.fs (fs)
+import std.list (at, contains, drop, flatten, slice, sort_by, take)
+import std.snapshot
+import std.snapshot (Change, Same, Stored)
+import ucd_files
+import ucd_files (Row, rows_under, unicode_data)
+
+/// A property of every code point as the runs it is constant over: each run's first code point
+/// under the value a table writes for the run.
+type Layer = Map<Int, Bytes>
+
+/// The runs so far, and the first code point no row has covered.
+type Laying = { runs: List<{ key: Int, value: Bytes }>, next: Int }
+
+/// The layer of `rows`, which rise and do not meet: what `value` writes of each, and `missing`
+/// for the code points between them.
+fn layer<| e>(
+  rows: List<Row>,
+  missing: Bytes,
+  value: (Row) -> Bytes / e,
+) -> Layer / {abort.raise | e} = {
+  let laid = fold(rows, { runs: [], next: 0 }, |so_far: Laying, row: Row|
+    if row.first < so_far.next { panic("rows that do not rise") } else {
+      let before = if row.first > so_far.next {
+        push(so_far.runs, { key: so_far.next, value: missing })
+      } else { so_far.runs };
+      { runs: push(before, { key: row.first, value: value(row) }), next: row.last + 1 }
+    });
+  map_of_entries(if laid.next > 0x10FFFF { laid.runs }
+  else { push(laid.runs, { key: laid.next, value: missing }) })
+}
+
+/// The layer that writes `letter` for the code points `file` lists under `under`, a binary
+/// property's name or a property's and one of its values, and nothing for the rest.
+fn flag(file: Bytes, under: List<String>, letter: Bytes) -> Layer / {abort.raise} =
+  layer(sort_by(rows_under(file, under), |a: Row, b: Row| a.first < b.first), b"", |_: Row| letter)
+
+fn value_at(of: Layer, cp: Int) -> Bytes =
+  match map_floor(of, cp) { Some(run) -> run.value, None -> b"" }
+
+/// `line`, which is `count` fields, without the `;` after each field at its end that is empty.
+fn unpadded(line: Bytes, count: Int) -> Bytes / {abort.raise} =
+  fold(range(0, count), line, |kept: Bytes, _: Int|
+    if bytes_ends_with(kept, b";") { bytes_slice(kept, 0, bytes_len(kept) - 1) } else { kept })
+
+/// A maximal run of code points a table writes one value for, by its first.
+type Run = { first: Int, value: Bytes }
+
+/// The runs of a table whose fields are each the values of some layers written one after
+/// another, with `;` between the fields and none after the last that is not empty.
+fn runs(fields: List<List<Layer>>) -> List<Run> / {abort.raise} = {
+  let starts = map_keys(
+    fold(flatten(fields), map_new(), |all: Layer, one: Layer| map_merge(all, one)),
+  );
+  fold(starts, [], |found: List<Run>, start: Int| {
+    let value = unpadded(
+      join(
+        map(fields, |layers: List<Layer>|
+          bytes_concat_all(map(layers, |of: Layer| value_at(of, start)))),
+        b";",
+      ),
+      len(fields),
+    );
+    match list_at(found, len(found) - 1) {
+      Some(last) -> if last.value == value { found }
+      else { push(found, { first: start, value: value }) },
+      None -> push(found, { first: start, value: value }),
+    }
+  })
+}
+
+/// `cp` as a table writes a code point: hexadecimal in capitals, four digits or more.
+fn written(cp: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    map(
+      filter([20, 16, 12, 8, 4, 0], |shift: Int| shift <= 12 || cp >> shift != 0),
+      |shift: Int| bytes_slice(b"0123456789ABCDEF", cp >> shift & 15, (cp >> shift & 15) + 1),
+    ),
+  )
+
+/// A table's text: the version of `published`, the lines of `about` and the database's copyright
+/// line as comments, then a line for each run of `fields` whose value is not `missing`.
+fn table(
+  published: Bytes,
+  about: List<String>,
+  fields: List<List<Layer>>,
+  missing: Bytes,
+) -> String / {abort.raise} = {
+  let found = runs(fields);
+  let comments = flatten([
+    [f"Unicode {ucd_files::version_of(published)}"],
+    about,
+    [
+      f"{ucd_files::notice_of(published)} Distributed under the Unicode License v3, in LICENSE beside this file.",
+    ],
+  ]);
+  let lines = fold(range(0, len(found)), [], |text: List<Bytes>, i: Int| {
+    let run = at(found, i);
+    let last = match list_at(found, i + 1) { Some(next) -> next.first - 1, None -> 0x10FFFF };
+    if run.value == missing { text } else {
+      push(
+        text,
+        bytes_concat_all([
+          written(run.first),
+          if last == run.first { b"" } else { bytes_concat(b"..", written(last)) },
+          b";",
+          run.value,
+          b"\n",
+        ]),
+      )
+    }
+  });
+  string_of_bytes(
+    bytes_concat_all(
+      flatten([map(comments, |line: String| bytes_of_string(f"# {line}\n")), lines]),
+    ),
+  )
+}
+
+/// The value a field of `UnicodeData.txt` gives every code point it lists.
+fn unicode_data_field(index: Int, missing: Bytes) -> Layer / {abort.raise} =
+  layer(unicode_data(), missing, |row: Row| at(row.fields, index))
+
+/// `ucd/classes.txt`.
+fn classes() -> String / {abort.raise} = {
+  let core = ucd_files::derived_core_properties();
+  table(
+    core,
+    [
+      "The General_Category, six binary properties and the decimal digit value of every code point,",
+      "from UnicodeData.txt, DerivedCoreProperties.txt and PropList.txt of the Unicode Character",
+      "Database. A line is a run of code points that share them all:",
+      "`first[..last];category[;flags[;digit]]`, the flags being A Alphabetic, L Lowercase,",
+      "U Uppercase, W White_Space, S XID_Start and C XID_Continue. A code point in no line is Cn,",
+      "unassigned, with no flag and no digit.",
+    ],
+    [
+      [unicode_data_field(2, b"Cn")],
+      [
+        flag(core, ["Alphabetic"], b"A"),
+        flag(core, ["Lowercase"], b"L"),
+        flag(core, ["Uppercase"], b"U"),
+        flag(ucd_files::prop_list(), ["White_Space"], b"W"),
+        flag(core, ["XID_Start"], b"S"),
+        flag(core, ["XID_Continue"], b"C"),
+      ],
+      [unicode_data_field(6, b"")],
+    ],
+    b"Cn",
+  )
+}
+
+/// How far the mapping a field of `UnicodeData.txt` names lies from each code point: `0` where
+/// the field is empty, as it is for every code point of a range.
+fn distance(index: Int) -> Layer / {abort.raise} =
+  layer(unicode_data(), b"0", |row: Row| {
+    let mapped = at(row.fields, index);
+    if bytes_len(mapped) == 0 { b"0" }
+    else { bytes_of_string(int_to_string(ucd_files::hex(mapped) - row.first)) }
+  })
+
+/// `ucd/simple_case.txt`.
+fn simple_case() -> String / {abort.raise} =
+  table(
+    ucd_files::derived_core_properties(),
+    [
+      "The simple case mappings of every code point that has one, from UnicodeData.txt of the Unicode",
+      "Character Database. A line is a run of code points that move alike: `first[..last];upper;lower;title`,",
+      "each how far its uppercase, lowercase and titlecase mapping lies from a code point of the run,",
+      "`0` for one that maps to itself. A code point in no line maps to itself all three ways.",
+    ],
+    [[distance(12)], [distance(13)], [distance(14)]],
+    b"0;0;0",
+  )
+
+/// A Decomposition_Mapping as a table writes it: the code points, after `~` where the database
+/// tags the mapping as a compatibility one.
+fn decomposition(mapping: Bytes) -> Bytes / {abort.raise} =
+  if !bytes_starts_with(mapping, b"<") { mapping } else {
+    match bytes_index_of(mapping, b"> ") {
+      Some(i) -> bytes_concat(b"~", bytes_slice(mapping, i + 2, bytes_len(mapping))),
+      None -> panic("a tag with no mapping after it"),
+    }
+  }
+
+/// `ucd/normalization.txt`.
+fn normalization() -> String / {abort.raise} = {
+  let quick = ucd_files::derived_normalization_props();
+  table(
+    quick,
+    [
+      "What normalization reads of every code point, from UnicodeData.txt and",
+      "DerivedNormalizationProps.txt of the Unicode Character Database:",
+      "`first[..last];class;decomposition;quick`. The class is the Canonical_Combining_Class, left",
+      "out where it is 0. The decomposition is one step of the Decomposition_Mapping, after `~` where",
+      "it is a compatibility mapping. The quick checks are C where NFC_Quick_Check is No and c where",
+      "it is Maybe, and K and k for NFKC_Quick_Check. A code point in no line has class 0, no",
+      "decomposition and Yes for both; a Hangul syllable is in none, its decomposition being arithmetic.",
+    ],
+    [
+      [
+        layer(unicode_data(), b"", |row: Row|
+          if at(row.fields, 3) == b"0" { b"" } else { at(row.fields, 3) }),
+      ],
+      [layer(unicode_data(), b"", |row: Row| decomposition(at(row.fields, 5)))],
+      [
+        flag(quick, ["NFC_QC", "N"], b"C"),
+        flag(quick, ["NFC_QC", "M"], b"c"),
+        flag(quick, ["NFKC_QC", "N"], b"K"),
+        flag(quick, ["NFKC_QC", "M"], b"k"),
+      ],
+    ],
+    b"",
+  )
+}
+
+/// The layer of `rows`, in whatever order a file lists them.
+fn layer_of<| e>(
+  rows: List<Row>,
+  missing: Bytes,
+  value: (Row) -> Bytes / e,
+) -> Layer / {abort.raise | e} =
+  layer(sort_by(rows, |a: Row, b: Row| a.first < b.first), missing, value)
+
+/// The full mapping `SpecialCasing.txt` gives in its column `column`, in the rows that hold under
+/// no condition, left out where it is the simple mapping field `simple` of `UnicodeData.txt`
+/// gives, or the code point itself where that gives none.
+fn special(column: Int, simple: Int) -> Layer / {abort.raise} = {
+  let singly = fold(unicode_data(), map_new(), |known: Map<Int, Bytes>, row: Row|
+    if bytes_len(at(row.fields, simple)) == 0 { known }
+    else { map_insert(known, row.first, at(row.fields, simple)) });
+  layer_of(
+    filter(ucd_files::rows(ucd_files::special_casing()), |row: Row| len(row.fields) == 4),
+    b"",
+    |row: Row| {
+      let full = at(row.fields, column);
+      let one = match map_get(singly, row.first) {
+        Some(mapped) -> mapped,
+        None -> written(row.first),
+      };
+      if full == one { b"" } else { full }
+    },
+  )
+}
+
+/// `ucd/casing.txt`.
+fn casing() -> String / {abort.raise} = {
+  let folding = ucd_files::case_folding();
+  let folds = ucd_files::rows(folding);
+  let statused = |statuses: List<Bytes>|
+    filter(folds, |row: Row| contains(statuses, at(row.fields, 0)));
+  table(
+    folding,
+    [
+      "Case folding and the case mappings that are not one character to one, from CaseFolding.txt,",
+      "SpecialCasing.txt, DerivedCoreProperties.txt and PropList.txt of the Unicode Character",
+      "Database: `first[..last];fold;full fold;lower;title;upper;flags`. The fold is how far the",
+      "simple case folding (statuses C and S) lies from a code point of the run, and the full fold",
+      "the code points of status F. Lower, title and upper are SpecialCasing's mappings that hold",
+      "under no condition, each left out where it is the simple mapping. The flags are what the",
+      "conditions of the others read: c for Cased, i for Case_Ignorable, s for Soft_Dotted, a for a",
+      "Canonical_Combining_Class of 230 and b for any other but 0. A code point in no line folds and",
+      "maps as its simple mappings say and has no flag.",
+    ],
+    [
+      [
+        layer_of(statused([b"C", b"S"]), b"", |row: Row|
+          bytes_of_string(int_to_string(ucd_files::hex(at(row.fields, 1)) - row.first))),
+      ],
+      [layer_of(statused([b"F"]), b"", |row: Row| at(row.fields, 1))],
+      [special(0, 13)],
+      [special(1, 14)],
+      [special(2, 12)],
+      [
+        flag(ucd_files::derived_core_properties(), ["Cased"], b"c"),
+        flag(ucd_files::derived_core_properties(), ["Case_Ignorable"], b"i"),
+        flag(ucd_files::prop_list(), ["Soft_Dotted"], b"s"),
+        layer(unicode_data(), b"", |row: Row|
+          if at(row.fields, 3) == b"230" { b"a" }
+          else if at(row.fields, 3) == b"0" { b"" }
+          else { b"b" }),
+      ],
+    ],
+    b"",
+  )
+}
+
+/// The value of the property `file` lists, for every code point it lists under one.
+fn property(file: Bytes) -> Layer / {abort.raise} =
+  layer_of(ucd_files::rows(file), b"", |row: Row| at(row.fields, 0))
+
+/// `ucd/breaks.txt`.
+fn breaks() -> String / {abort.raise} = {
+  let graphemes = ucd_files::grapheme_break_property();
+  let core = ucd_files::derived_core_properties();
+  table(
+    graphemes,
+    [
+      "What text segmentation reads of every code point, from GraphemeBreakProperty.txt,",
+      "WordBreakProperty.txt, emoji-data.txt and DerivedCoreProperties.txt of the Unicode Character",
+      "Database: `first[..last];grapheme;word;flags`, the Grapheme_Cluster_Break and the Word_Break",
+      "under the names the database gives their values, left out where they are Other, and the",
+      "flags P for Extended_Pictographic and C, E and L for an Indic_Conjunct_Break of Consonant,",
+      "Extend and Linker. A code point in no line is Other in both and has no flag.",
+    ],
+    [
+      [property(graphemes)],
+      [property(ucd_files::word_break_property())],
+      [
+        flag(ucd_files::emoji_data(), ["Extended_Pictographic"], b"P"),
+        flag(core, ["InCB", "Consonant"], b"C"),
+        flag(core, ["InCB", "Extend"], b"E"),
+        flag(core, ["InCB", "Linker"], b"L"),
+      ],
+    ],
+    b"",
+  )
+}
+
+/// The layer that holds, for every code point, what `mix` makes of `layers`' values for it.
+fn mixed<| e>(layers: List<Layer>, mix: (List<Bytes>) -> Bytes / e) -> Layer / e =
+  map_of_entries(
+    map(
+      map_keys(fold(layers, map_new(), |all: Layer, one: Layer| map_merge(all, one))),
+      |start: Int| { key: start, value: mix(map(layers, |of: Layer| value_at(of, start))) },
+    ),
+  )
+
+/// The layer that writes `value` for the code points whose General_Category is one of
+/// `categories`.
+fn categorized(categories: List<Bytes>, value: Bytes) -> Layer / {abort.raise} =
+  layer(unicode_data(), b"", |row: Row|
+    if contains(categories, at(row.fields, 2)) { value } else { b"" })
+
+/// `ucd/width.txt`.
+fn width() -> String / {abort.raise} = {
+  let east = ucd_files::east_asian_width();
+  let core = ucd_files::derived_core_properties();
+  let graphemes = ucd_files::grapheme_break_property();
+  let emoji = ucd_files::emoji_data();
+  // Format characters by category that a terminal still gives a cell.
+  let drawn = [
+    layer(
+      [{ first: 0xAD, last: 0xAD, fields: [] }, { first: 0x115F, last: 0x115F, fields: [] }],
+      b"",
+      |_: Row| b"1",
+    ),
+    flag(ucd_files::prop_list(), ["Prepended_Concatenation_Mark"], b"1"),
+  ];
+  let unseen = [
+    categorized([b"Mn", b"Me", b"Cf", b"Cc", b"Zl", b"Zp"], b"0"),
+    flag(core, ["Default_Ignorable_Code_Point"], b"0"),
+    flag(graphemes, ["V"], b"0"),
+    flag(graphemes, ["T"], b"0"),
+  ];
+  let wide = [flag(east, ["W"], b"2"), flag(east, ["F"], b"2"), flag(east, ["A"], b"A")];
+  table(
+    east,
+    [
+      "How many columns a terminal gives every code point, from EastAsianWidth.txt, UnicodeData.txt,",
+      "DerivedCoreProperties.txt, PropList.txt, GraphemeBreakProperty.txt and emoji-data.txt of the",
+      "Unicode Character Database: `first[..last];columns;flags`. The columns are 0 for a code point",
+      "that is not drawn in a column of its own: a General_Category of Mn, Me, Cf, Cc, Zl or Zp, a",
+      "Default_Ignorable_Code_Point, and a conjoining Hangul vowel or trailing consonant; but not",
+      "U+00AD, U+115F or a Prepended_Concatenation_Mark. Of the rest they are 2 for an",
+      "East_Asian_Width of W or F, A for one of A, and left out for one column. The flags are e for",
+      "Emoji, p for Emoji_Presentation and m for Emoji_Modifier. A code point in no line takes one",
+      "column and has no flag.",
+    ],
+    [
+      [
+        mixed(flatten([drawn, unseen, wide]), |values: List<Bytes>| {
+          let said = |some: List<Bytes>| bytes_concat_all(some);
+          if said(take(values, len(drawn))) == b""
+              && said(slice(values, len(drawn), len(drawn) + len(unseen))) != b"" { b"0" }
+          else { said(drop(values, len(drawn) + len(unseen))) }
+        }),
+      ],
+      [
+        flag(emoji, ["Emoji"], b"e"),
+        flag(emoji, ["Emoji_Presentation"], b"p"),
+        flag(emoji, ["Emoji_Modifier"], b"m"),
+      ],
+    ],
+    b"",
+  )
+}
+
+/// `of`, kept for the code points `statuses` calls valid or a deviation, which are the ones a
+/// label may hold.
+fn in_labels(statuses: Layer, of: Layer) -> Layer =
+  mixed([statuses, of], |values: List<Bytes>|
+    match values {
+      [status, value] -> if status == b"v" || status == b"d" { value } else { b"" },
+      _ -> b"",
+    })
+
+/// `ucd/idna.txt`.
+fn idna() -> String / {abort.raise} = {
+  let mapping = ucd_files::idna_mapping_table();
+  let rows = ucd_files::rows(mapping);
+  let statuses = layer(rows, b"", |row: Row|
+    match at(row.fields, 0) {
+      b"valid" -> b"v",
+      b"deviation" -> b"d",
+      b"ignored" -> b"i",
+      b"mapped" -> b"m",
+      b"disallowed" -> b"",
+      _ -> panic("a status UTS #46 does not have"),
+    });
+  let joining = ucd_files::derived_joining_type();
+  table(
+    ucd_files::derived_joining_type(),
+    [
+      "What UTS #46 reads of every code point, from idna/IdnaMappingTable.txt, UnicodeData.txt and",
+      "extracted/DerivedJoiningType.txt of the Unicode Character Database:",
+      "`first[..last];status;mapping;bidi;joining`. The status is v for valid, d for deviation, i for",
+      "ignored and m for mapped, and left out for disallowed. The mapping of a mapped code point is",
+      "the code points it maps to, or, where that is one code point, how far it lies from a code",
+      "point of the run, with its sign. A valid or deviation code point has its Bidi_Class, and its",
+      "Joining_Type where that is D, L, R or T, with v after it for a Canonical_Combining_Class of 9.",
+      "A code point in no line is disallowed.",
+    ],
+    [
+      [statuses],
+      [
+        layer(rows, b"", |row: Row|
+          if at(row.fields, 0) != b"mapped" { b"" } else {
+            match ucd_files::hexes(at(row.fields, 1)) {
+              [one] -> if row.first != row.last { at(row.fields, 1) } else {
+                let far = one - row.first;
+                bytes_of_string((if far >= 0 { "+" } else { "" }) ++ int_to_string(far))
+              },
+              _ -> at(row.fields, 1),
+            }
+          }),
+      ],
+      [in_labels(statuses, unicode_data_field(4, b""))],
+      [
+        in_labels(statuses, flag(joining, ["D"], b"D")),
+        in_labels(statuses, flag(joining, ["L"], b"L")),
+        in_labels(statuses, flag(joining, ["R"], b"R")),
+        in_labels(statuses, flag(joining, ["T"], b"T")),
+        in_labels(
+          statuses,
+          layer(unicode_data(), b"", |row: Row| if at(row.fields, 3) == b"9" { b"v" } else { b"" }),
+        ),
+      ],
+    ],
+    b"",
+  )
+}
+
+/// The files `crates/ply-std/ply/ucd/` holds, each derived here.
+fn names() -> List<String> =
+  [
+    "LICENSE",
+    "breaks.txt",
+    "casing.txt",
+    "classes.txt",
+    "idna.txt",
+    "normalization.txt",
+    "simple_case.txt",
+    "width.txt",
+  ]
+
+/// What the published files make of the shipped file `name`.
+fn derived(name: String) -> String / {abort.raise} =
+  match name {
+    "LICENSE" -> string_of_bytes(ucd_files::license()),
+    "breaks.txt" -> breaks(),
+    "casing.txt" -> casing(),
+    "classes.txt" -> classes(),
+    "idna.txt" -> idna(),
+    "normalization.txt" -> normalization(),
+    "simple_case.txt" -> simple_case(),
+    "width.txt" -> width(),
+    _ -> panic(f"nothing derives `{name}`"),
+  }
+
+/// The files the standard library ships beside `std.ucd`, as the tree holds them.
+fn shipped() -> Stored = { dir: "../../ply-std/ply/ucd", files: embed_dir("../../ply-std/ply/ucd") }
+
+test "the shipped {name} is, byte for byte, what the published files derive" for name: String in names(
+  ) {
+  let now = snapshot::compare(shipped(), name, derived(name));
+  let patch = match now {
+    snapshot::Absent(diff) -> diff,
+    snapshot::Changed(diff) -> diff,
+    Same -> "",
+  };
+  assert(
+    now == Same,
+    Some(
+      f"`crates/ply-std/ply/ucd/{name}` is not what the published files in `crates/ply-corpus/stdlib/ucd/` derive; `{writing()}` writes what they do, as this diff does:\n{patch}",
+    ),
+  )
+}
+
+/// The run that writes every derived file where the standard library ships it.
+fn writing() -> String = "ply run crates/ply-corpus/stdlib --host --fs ucd=crates/ply-std/ply/ucd"
+
+test "the standard library ships no file under ucd/ that nothing here derives" {
+  assert_eq(snapshot::unused(shipped(), names()), [])
+}
+
+/// Writes every derived file into the directory the run lends as `ucd`, and answers what each
+/// took.
+fn main() -> List<{ name: String, change: Change }> / {fs.read_file[ucd], fs.create_dir[ucd], fs.write_file[ucd], snapshot::snapshot.unwritten, abort.raise} =
+  map(names(), |name: String|
+    { name: name, change: snapshot::accept[ucd]("", name, derived(name)) })
