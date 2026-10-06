@@ -2367,10 +2367,19 @@ fn hidden_import(module: Bytes, binder: Bytes, span: Span) -> ImportDecl =
 pub fn is_written(decl: ImportDecl) -> Bool =
   match decl.kind { IAlias(a) -> !hidden_binder(a.name), _ -> true }
 
+/// Where `header`'s walk over a module's tokens stands, and the first of each hidden import it found.
+type HeaderScan = {
+  at: Int,
+  whole: Bool,
+  shown: Option<Span>,
+  cased: Option<Span>,
+  drawn: Option<Span>,
+}
+
 /// The module `src` with its imports alone, the hidden ones among them, and none of its items:
 /// what a load reads to find the modules a program pulls, without parsing a body. `None` where only
-/// a whole parse says what it imports: an `import` after an item, or a `derive`, whose expansion
-/// imports the runtime it calls.
+/// a whole parse says what it imports: an `import` after an item. A `derive` pulls nothing more, as
+/// the runtime its expansion calls is one the module must import already.
 pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
   let s = start(src);
   let input = s.input;
@@ -2378,67 +2387,76 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
   let n = input.token_count;
   let kind = |i: Int| match list_at(input.tokens, i) { Some(t) -> t.kind, None -> EndOfInput };
   let ident = |i: Int, text: Bytes| kind(i) == Identifier(text);
-  let whole = fold(range(leading.parser.pos, n), false, |acc: Bool, i: Int|
-    acc || kind(i) == keyword_import() || (ident(i, b"derive") && tok_is_ident(kind(i + 1))));
-  if whole { None } else {
-    let span_at = |i: Int|
-      match list_at(input.tokens, i) {
-        Some(t) -> { start: t.start, end: t.end },
-        None -> { start: 0, end: 0 },
-      };
-    // Past an interpolated string the token opens at `i`: its holes may hold strings of their own.
-    let past_string = |i: Int|
-      iterate({ at: i, depth: 0 }, n + 1, |s: { at: Int, depth: Int }|
-        match kind(s.at) {
-          InterpolatedHead(_) -> Continue({ at: s.at + 1, depth: s.depth + 1 }),
-          InterpolatedTail(_) -> if s.depth == 1 { Stop({ at: s.at + 1, depth: 0 }) }
-          else { Continue({ at: s.at + 1, depth: s.depth - 1 }) },
-          EndOfInput -> Stop(s),
-          _ -> Continue({ at: s.at + 1, depth: s.depth }),
-        }).at;
-    let shown = fold(range(0, n), None, |acc: Option<Span>, i: Int|
-      match acc {
-        Some(_) -> acc,
-        None -> match kind(i) {
-          InterpolatedHead(_) -> {
-            let sp = span_at(i);
-            if follows_name(input.source, sp.start) { None } else { Some(sp) }
+  let span_at = |i: Int|
+    match list_at(input.tokens, i) {
+      Some(t) -> { start: t.start, end: t.end },
+      None -> { start: 0, end: 0 },
+    };
+  // Past an interpolated string the token opens at `i`: its holes may hold strings of their own.
+  let past_string = |i: Int|
+    iterate({ at: i, depth: 0 }, n + 1, |p: { at: Int, depth: Int }|
+      match kind(p.at) {
+        InterpolatedHead(_) -> Continue({ at: p.at + 1, depth: p.depth + 1 }),
+        InterpolatedTail(_) -> if p.depth == 1 { Stop({ at: p.at + 1, depth: 0 }) }
+        else { Continue({ at: p.at + 1, depth: p.depth - 1 }) },
+        EndOfInput -> Stop(p),
+        _ -> Continue({ at: p.at + 1, depth: p.depth }),
+      }).at;
+  // One walk over the tokens, which stops where only a whole parse can say what the module imports.
+  let scanned = iterate(
+    { at: 0, whole: false, shown: None, cased: None, drawn: None },
+    n + 1,
+    |h: HeaderScan|
+      if h.whole || h.at >= n { Stop(h) } else {
+        let i = h.at;
+        let k = kind(i);
+        Continue({
+          at: i + 1,
+          whole: i >= leading.parser.pos && k == keyword_import(),
+          shown: match h.shown {
+            Some(_) -> h.shown,
+            None -> match k {
+              InterpolatedHead(_) -> {
+                let sp = span_at(i);
+                if follows_name(input.source, sp.start) { None } else { Some(sp) }
+              },
+              _ -> None,
+            },
           },
-          _ -> None,
-        },
-      });
-    let cased = fold(range(0, n), None, |acc: Option<Span>, i: Int|
-      match acc {
-        Some(_) -> acc,
-        None -> if kind(i) != keyword_test() { None } else {
-          let label = if kind(i + 1) == token_slash() { i + 3 } else { i + 1 };
-          let after = match kind(label) {
-            StringLiteral(_) -> label + 1,
-            InterpolatedHead(_) -> past_string(label),
-            _ -> label,
-          };
-          if after != label && ident(after, b"for") { Some(span_at(after)) } else { None }
-        },
-      });
-    // A `gen for T by f` is five tokens, and the span of the statement is its import's.
-    let drawn = fold(range(0, n), None, |acc: Option<Span>, i: Int|
-      match acc {
-        Some(_) -> acc,
-        None -> if ident(i, b"gen") && ident(i + 1, b"for") {
-          Some({ start: span_at(i).start, end: span_at(i + 4).end })
-        } else { None },
-      });
-    let with_shown = match shown {
+          cased: match h.cased {
+            Some(_) -> h.cased,
+            None -> if k != keyword_test() { None } else {
+              let label = if kind(i + 1) == token_slash() { i + 3 } else { i + 1 };
+              let after = match kind(label) {
+                StringLiteral(_) -> label + 1,
+                InterpolatedHead(_) -> past_string(label),
+                _ -> label,
+              };
+              if after != label && ident(after, b"for") { Some(span_at(after)) } else { None }
+            },
+          },
+          // A `gen for T by f` is five tokens, and the span of the statement is its import's.
+          drawn: match h.drawn {
+            Some(_) -> h.drawn,
+            None -> if ident(i, b"gen") && ident(i + 1, b"for") {
+              Some({ start: span_at(i).start, end: span_at(i + 4).end })
+            } else { None },
+          },
+        })
+      },
+  );
+  if scanned.whole { None } else {
+    let with_shown = match scanned.shown {
       None -> leading.node,
       Some(sp) -> push(leading.node, hidden_import(b"show", shown_binder(), sp)),
     };
-    let with_cased = match cased {
+    let with_cased = match scanned.cased {
       None -> with_shown,
       Some(sp) -> push(with_shown, hidden_import(b"cases", cases_binder(), sp)),
     };
     Some({
       doc: module_doc(input),
-      imports: match drawn {
+      imports: match scanned.drawn {
         None -> with_cased,
         Some(sp) -> push(with_cased, hidden_import(b"gen", gen_binder(), sp)),
       },
@@ -3363,8 +3381,8 @@ test "a header holds the imports a whole parse finds, the hidden ones among them
   assert(same(b"test \"plain\" { assert(true) }\nfn for_each() -> Int = 1\n"), None);
   assert(same(b"type T = | T(Int)\ngen for T by f\nfn f() -> Int = 0\n"), None);
   assert(same(b"type T = | T(Int)\nkey for T by gen\nfn gen(t: T) -> Int = 0\n"), None);
-  assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None);
-  assert_eq(header(b"type T = { a: Int }\nderive bin for T\n"), None)
+  assert(same(b"import std.bin\ntype T = { a: Int }\nderive bin for T\n"), None);
+  assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None)
 }
 
 test "`gen for T by f` is an item that brings `std.gen` under a name no source writes" {

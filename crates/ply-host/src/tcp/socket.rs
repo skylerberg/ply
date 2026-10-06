@@ -6,7 +6,7 @@ use super::{
     not_a_stream, not_upgradable, unknown_handle,
 };
 use crate::fs;
-use crate::pool::{Bell, Inbox, JobOutput, NET_FIRST_TOKEN, Pool};
+use crate::pool::{Inbox, JobOutput, Pool, Pooled};
 use crate::tls::{self, Credentials as TlsCredentials, Handshakes};
 use ply_eval::{
     Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Symbol, Value, codes,
@@ -277,7 +277,7 @@ impl TcpHost {
                 open: Mutex::new(BTreeMap::new()),
                 handles: Handles::new(),
             }),
-            pool: Pool::new(NET_FIRST_TOKEN),
+            pool: Pool::new(),
             credentials,
             handshakes: Arc::new(Handshakes::default()),
             roots: Mutex::new(fs::Roots::new()),
@@ -307,38 +307,6 @@ impl TcpHost {
             Some(Socket::Listener(Listening::Tcp(l, _))) => l.local_addr().ok(),
             _ => None,
         }
-    }
-
-    pub fn owns(&self, pending: &Pending) -> bool {
-        self.pool.owns(pending)
-    }
-
-    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
-        self.pool.watch(pending, inbox)
-    }
-
-    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.pool.collect(inbox)
-    }
-
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.pool.poll(pending)
-    }
-
-    pub fn outstanding(&self) -> usize {
-        self.pool.outstanding()
-    }
-
-    pub fn ready(&self) -> bool {
-        self.pool.ready()
-    }
-
-    pub fn ring(&self, bell: &Arc<Bell>) {
-        self.pool.ring(bell);
-    }
-
-    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
-        self.pool.park_until(bound)
     }
 
     /// A datagram socket put in this host's table under `at`, answering its handle.
@@ -401,17 +369,18 @@ impl TcpHost {
     }
 }
 
-/// A job's answer built where the `Value` will live.
-fn made(make: impl FnOnce() -> Value + Send + 'static) -> JobOutput {
-    JobOutput::Made(Box::new(make))
-}
-
 fn answered(value: Value) -> Result<HostAnswer, Diagnostic> {
     Ok(HostAnswer::Value(value))
 }
 
 fn refused(refusal: Refusal) -> Result<HostAnswer, Diagnostic> {
     answered(wire::err(&refusal))
+}
+
+impl Pooled for TcpHost {
+    fn pool(&self) -> &Pool {
+        &self.pool
+    }
 }
 
 impl Net for TcpHost {
@@ -577,7 +546,7 @@ impl Net for TcpHost {
             let reached = reach_to(&to, &options, timeout).map(|stream| {
                 sockets.insert(Some(&at), Socket::Stream(Plain::Tcp(Arc::new(stream))))
             });
-            made(move || match reached {
+            JobOutput::built(move || match reached {
                 Ok(handle) => wire::ok(Value::Int(handle)),
                 Err(refusal) => wire::err(&refusal),
             })
@@ -600,7 +569,7 @@ impl Net for TcpHost {
             let reached = reach_unix(&path, timeout).map(|stream| {
                 sockets.insert(Some(&at), Socket::Stream(Plain::Unix(Arc::new(stream))))
             });
-            made(move || match reached {
+            JobOutput::built(move || match reached {
                 Ok(handle) => wire::ok(Value::Int(handle)),
                 Err(refusal) => wire::err(&refusal),
             })
@@ -681,7 +650,7 @@ impl Net for TcpHost {
         self.waiting(span, "start_tls", Op::StartTls.what(), move || {
             if tls::plaintext_waiting(&stream) {
                 session.refuse(tls::REASON_INJECTED);
-                return made(|| wire::err(&Refusal::Injected));
+                return JobOutput::built(|| wire::err(&Refusal::Injected));
             }
             settled(&session, upgrade.timeout)
         })
@@ -904,7 +873,7 @@ fn settled(session: &tls::Session, timeout: Duration) -> JobOutput {
         tls::Unsettled::Refused(tls::REASON_GONE) => Refusal::Reset,
         tls::Unsettled::Refused(reason) => Refusal::Handshake(reason.to_string()),
     });
-    made(move || match outcome {
+    JobOutput::built(move || match outcome {
         Ok(protocol) => wire::ok(wire::secured(protocol)),
         Err(refusal) => wire::err(&refusal),
     })
