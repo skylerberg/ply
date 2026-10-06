@@ -10,14 +10,13 @@ import show (source_lines)
 import doc (summary_of)
 import style (Style, plain)
 import compiler.hash (hex)
-import compiler.front (Analysis, Refused, Analysed, ShippedData, analyse, module_items,
-                       parse_shipped, shipped_data_wanted)
-import compiler.infer (CtorInfo, TestInfo)
+import compiler.front (ShippedData, parse_shipped, shipped_data_wanted)
+import compiler.items (Item, IFn, IType, IEffect, ITest)
 import compiler.resolve (Source, ParsedModule, Diag, error_at)
 import std.fs (fs)
 import std.hash (blake3)
 import std.json (Json, Str, Bool, Number, Array, object)
-import std.list (concat)
+import std.list (at, concat)
 import std.string (join, repeat)
 import std.text
 import hosts (indented)
@@ -42,18 +41,13 @@ fn shipped() -> List<Source> / {builder.git[vcs], fs.list_dir[shipped], fs.read_
 
 // --- The rows -----------------------------------------------------------------
 
-fn module_named(analysis: Analysis, name: Bytes) -> Option<ParsedModule> =
-  fold(analysis.mods, None, |acc: Option<ParsedModule>, parsed: ParsedModule|
-    match acc { Some(_) -> acc, None -> if parsed.name == name { Some(parsed) } else { None } })
+/// What a module declares on its own, a constructor being reached through its type.
+fn declared(parsed: ParsedModule) -> Int =
+  fold(parsed.module.items, 0, |n: Int, item: Item|
+    match item { IFn(_) -> n + 1, IType(_) -> n + 1, IEffect(_) -> n + 1, _ -> n })
 
-/// A constructor is reached through its type rather than declared on its own.
-fn ctors_in(analysis: Analysis, name: Bytes) -> Int =
-  fold(analysis.checked.ctors, 0, |acc: Int, c: CtorInfo|
-    if c.module == name { acc + 1 } else { acc })
-
-fn tests_in(analysis: Analysis, name: Bytes) -> Int =
-  fold(analysis.checked.tests, 0, |acc: Int, test_info: TestInfo|
-    if test_info.module == name { acc + 1 } else { acc })
+fn tested(parsed: ParsedModule) -> Int =
+  fold(parsed.module.items, 0, |n: Int, item: Item| match item { ITest(_) -> n + 1, _ -> n })
 
 /// The data files `src` embeds, of those the shipped modules hold.
 fn held_by(src: Source, data: List<ShippedData>) -> List<Held> / {abort.raise} =
@@ -63,42 +57,24 @@ fn held_by(src: Source, data: List<ShippedData>) -> List<Held> / {abort.raise} =
         push(a, { name: string_of_bytes_lossy(name), bytes: bytes_len(d.bytes) })
       } else { a }))
 
-fn row_of(analysis: Analysis, src: Source, data: List<ShippedData>) -> Row / {abort.raise} = {
-  let parsed = module_named(analysis, src.name);
-  let items = match parsed { Some(mo) -> len(module_items(mo)), None -> 0 };
-  let ctors = ctors_in(analysis, src.name);
+fn row_of(parsed: ParsedModule, src: Source, data: List<ShippedData>) -> Row / {abort.raise} =
   {
     name: string_of_bytes_lossy(src.name),
-    definitions: if items > ctors { items - ctors } else { 0 },
-    tests: tests_in(analysis, src.name),
+    definitions: declared(parsed),
+    tests: tested(parsed),
     bytes: bytes_len(src.src),
     data: held_by(src, data),
-    summary: match parsed {
-      Some(mo) -> match mo.module.doc {
-        Some(d) -> summary_of(map(d.lines, |l: Bytes| string_of_bytes_lossy(l))),
-        None -> "",
-      },
+    summary: match parsed.module.doc {
+      Some(d) -> summary_of(map(d.lines, |l: Bytes| string_of_bytes_lossy(l))),
       None -> "",
     },
   }
+
+/// Each module's row, read off its parse: nothing the listing says needs the modules checked.
+fn rows_of(srcs: List<Source>, data: List<ShippedData>) -> List<Row> / {abort.raise} = {
+  let parsed = parse_shipped(srcs, srcs, data);
+  map(range(0, len(srcs)), |i: Int| row_of(at(parsed, i).module, at(srcs, i), data))
 }
-
-fn rows_of(
-  analysis: Analysis,
-  srcs: List<Source>,
-  data: List<ShippedData>,
-) -> List<Row> / {abort.raise} = map(srcs, |src: Source| row_of(analysis, src, data))
-
-/// A shipped module the front end refuses is Ply's fault, never the user's.
-fn shipped_refused(diags: List<Diag>) -> Diag =
-  error_at(
-    b"E0505",
-    no_module(),
-    { start: 0, end: 0 },
-    bytes_of_string("the shipped modules do not compile: " ++ errors_text(diags)),
-    b"this is a defect in the compiler's own sources, not in this program",
-    [b"please report it with the version of `ply` that produced it"],
-  )
 
 // --- The listing ----------------------------------------------------------------
 
@@ -308,11 +284,8 @@ fn shown(
     },
   }
 
-fn counted(style: Style, srcs: List<Source>, data: List<ShippedData>) -> Answer / {abort.raise} =
-  match analyse(parse_shipped(srcs, srcs, data)) {
-    Refused(ds) -> stopped(style, shipped_refused(ds)),
-    Analysed(w) -> listed(rows_of(w, srcs, data), shipped_digest_of(srcs, data)),
-  }
+fn counted(srcs: List<Source>, data: List<ShippedData>) -> Answer / {abort.raise} =
+  listed(rows_of(srcs, data), shipped_digest_of(srcs, data))
 
 pub fn run(
   flags: Flags,
@@ -323,7 +296,7 @@ pub fn run(
     let data = shipped_data(srcs);
     if flags.digest { digested(shipped_digest_of(srcs, data)) }
     else if flags.query != "" { shown(s, flags.query, srcs, data) }
-    else { counted(s, srcs, data) }
+    else { counted(srcs, data) }
   }
 }
 
@@ -391,11 +364,7 @@ test "`--show` prints a data file by the name the listing gives it, and a module
     "pub fn list() -> Bytes = embed(\"m/list.txt\")",
   ]);
   assert_eq(shown(plain(), "std/m/gone.txt", srcs, data).code, 2);
-  let rows = match analyse(parse_shipped(srcs, srcs, data)) {
-    Analysed(w) -> rows_of(w, srcs, data),
-    Refused(_) -> [],
-  };
-  assert_eq(map(rows, |row: Row| row.data), [[{ name: "std/m/list.txt", bytes: 8 }]])
+  assert_eq(map(rows_of(srcs, data), |row: Row| row.data), [[{ name: "std/m/list.txt", bytes: 8 }]])
 }
 
 test "a build that ships nothing says so instead of laying out an empty table" {
