@@ -1,0 +1,139 @@
+//! `std.url`'s internationalized hosts against the web-platform-tests: every case of
+//! `toascii.json`, and the cases of `urltestdata.json` whose host is written with an escape or a
+//! character outside ASCII. The URL Standard repairs what RFC 3986 refuses, so the two readers
+//! are not held equal. They are held never to read one text as two hosts: where the standard
+//! fails this reader refuses, where both read they name one host, and what this reader alone
+//! refuses is counted by its reason.
+
+import std.bytes (scan_until)
+import std.ip
+import std.json
+import std.json (Json)
+import std.list (at_or)
+import std.string
+import std.url
+import std.url (Name, Url, V4, V6, url_host, url_normalized, url_parse, url_render)
+
+/// A text and the host the URL Standard reads in it, or `None` where it fails.
+type Case = { text: String, host: Option<String> }
+
+fn items(file: Bytes) -> List<Json> / {abort.raise} =
+  match json::parse(file) {
+    Ok(json::Array(all)) -> all,
+    _ -> panic("the file is an array of cases"),
+  }
+
+fn text_of(j: Json, name: String) -> Option<String> =
+  match json::get(j, name) { Some(json::Str(text)) -> Some(text), _ -> None }
+
+/// Every case of `toascii.json`, its input the host of a URL.
+fn to_ascii_cases() -> List<Case> / {abort.raise} =
+  fold(items(embed("wpt_url/toascii.json")), [], |found: List<Case>, j: Json|
+    match text_of(j, "input") {
+      Some(input) -> push(found, { text: "https://" ++ input ++ "/x", host: text_of(j, "output") }),
+      None -> found,
+    })
+
+/// Whether `input` is an `http` or `https` URL whose host holds an escape or a character
+/// outside ASCII.
+fn internationalized(input: String) -> Bool / {abort.raise} = {
+  let b = bytes_of_string(input);
+  let from = if bytes_starts_with(b, b"http://") { 7 }
+  else if bytes_starts_with(b, b"https://") { 8 }
+  else { 0 };
+  let pieces = bytes_split(bytes_slice(b, from, scan_until(b, from, b"/?#")), b"@");
+  let host = at_or(pieces, len(pieces) - 1, b"");
+  from > 0
+    && fold(range(0, bytes_len(host)), false, |found: Bool, i: Int|
+      found || bytes_at(host, i) == b'%' || bytes_at(host, i) >= 128)
+}
+
+/// The cases of `urltestdata.json` that write such a host, which no base they are read against
+/// changes.
+fn url_cases() -> List<Case> / {abort.raise} =
+  fold(items(embed("wpt_url/urltestdata.json")), [], |found: List<Case>, j: Json|
+    match text_of(j, "input") {
+      Some(input) -> if !internationalized(input) { found } else {
+        push(found, {
+          text: input,
+          host: if json::get(j, "failure") == Some(json::Bool(true)) { None }
+          else { text_of(j, "hostname") },
+        })
+      },
+      None -> found,
+    })
+
+fn host_text(u: Url) -> String =
+  match url_host(u) {
+    Some(Name(name)) -> name,
+    Some(V4(four)) -> ip::render_v4(four),
+    Some(V6(six)) -> "[" ++ ip::render_v6(six) ++ "]",
+    None -> "",
+  }
+
+fn named(why: url::Why) -> String =
+  match why {
+    url::NotAscii -> "NotAscii",
+    url::Forbidden -> "Forbidden",
+    url::BadEscape -> "BadEscape",
+    url::EncodedHost -> "EncodedHost",
+    url::NumericHost -> "NumericHost",
+    url::Idna(_) -> "Idna",
+    url::Stray -> "Stray",
+    _ -> "other",
+  }
+
+/// How the cases fall: both read one host, both refuse, this reader alone refuses (by its
+/// reason), and the texts the two read apart, which is none.
+type Tally = { read: Int, refused: Int, stricter: Map<String, Int>, apart: List<String> }
+
+fn tallied(cases: List<Case>) -> Tally / {abort.raise} =
+  fold(cases, { read: 0, refused: 0, stricter: map_new(), apart: [] }, |t: Tally, c: Case|
+    match ((url_parse(c.text), c.host)) {
+      (Err(_), None) -> { ..t, refused: t.refused + 1 },
+      (Err(no), Some(_)) -> {
+        let reason = named(no.why);
+        let so_far = match map_get(t.stricter, reason) { Some(n) -> n, None -> 0 };
+        { ..t, stricter: map_insert(t.stricter, reason, so_far + 1) }
+      },
+      (Ok(u), Some(host)) -> if host_text(u) == host && host_text(url_normalized(u)) == host {
+        { ..t, read: t.read + 1 }
+      } else {
+        { ..t, apart: push(t.apart, c.text ++ " is " ++ host_text(u) ++ ", not " ++ host) }
+      },
+      (Ok(u), None) -> { ..t, apart: push(t.apart, c.text ++ " is read as " ++ host_text(u)) },
+    })
+
+test "no case of toascii.json is read as a host the URL Standard does not read" {
+  let t = tallied(to_ascii_cases());
+  assert_eq(t.apart, []);
+  assert_eq({ read: t.read, refused: t.refused, stricter: map_entries(t.stricter) }, {
+    read: 64,
+    refused: 19,
+    stricter: [{ key: "Forbidden", value: 4 }],
+  })
+}
+
+test "no internationalized host of urltestdata.json is read as one the URL Standard does not read" {
+  let t = tallied(url_cases());
+  assert_eq(t.apart, []);
+  assert_eq({ read: t.read, refused: t.refused, stricter: map_entries(t.stricter) }, {
+    read: 7,
+    refused: 70,
+    stricter: [
+      { key: "EncodedHost", value: 2 },
+      { key: "NotAscii", value: 1 },
+      { key: "NumericHost", value: 1 },
+    ],
+  })
+}
+
+test "a text of either file that is read is written back as it was, and in ASCII once normalized" {
+  let all = fold(url_cases(), to_ascii_cases(), |cases: List<Case>, c: Case| push(cases, c));
+  let moved = filter(all, |c: Case|
+    match url_parse(c.text) {
+      Ok(u) -> url_render(u) != c.text || !string::is_ascii(url_render(url_normalized(u))),
+      Err(_) -> false,
+    });
+  assert_eq(map(moved, |c: Case| c.text), [])
+}

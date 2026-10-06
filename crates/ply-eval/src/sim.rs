@@ -324,7 +324,7 @@ pub fn signature(effect: &str, op: &str) -> Option<&'static OpSignature> {
 
 /// Answered by the scheduler, not [`Handlers`]: they are polymorphic and use scheduler state.
 pub const TASK_OPS: &[&str] = &[
-    "spawn", "join", "yield", "cancel", "await", "channel", "send", "recv", "close",
+    "spawn", "join", "yield", "cancel", "await", "channel", "send", "recv", "close", "select",
 ];
 
 /// What a cancel writes and every step of the cancelled task reads, so the search sees that
@@ -334,6 +334,17 @@ pub fn liveness(task: TaskId, mode: Mode) -> Access {
         effect: Symbol::new("task.alive"),
         resource: crate::footprint::Resource::Named(Symbol::new(format!("@{}", task.0))),
         mode,
+        op: None,
+    })
+}
+
+/// What a task's last step writes, and a cancel that lets go of a join on it: which goes first
+/// decides whether the joiner had its answer.
+pub fn ended(task: TaskId) -> Access {
+    Access::Atom(EffectAtom {
+        effect: Symbol::new("task.end"),
+        resource: crate::footprint::Resource::Named(Symbol::new(format!("@{}", task.0))),
+        mode: Mode::Write,
         op: None,
     })
 }

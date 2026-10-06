@@ -203,6 +203,41 @@ fn category_at(number: Int) -> Category =
 /// Every category, in the order the Unicode Character Database lists them.
 pub fn categories() -> List<Category> = map(range(0, 30), category_at)
 
+/// The category's name as the standard writes it out: `Uppercase_Letter` for `Lu`.
+pub fn name(category: Category) -> String =
+  match category {
+    UppercaseLetter -> "Uppercase_Letter",
+    LowercaseLetter -> "Lowercase_Letter",
+    TitlecaseLetter -> "Titlecase_Letter",
+    ModifierLetter -> "Modifier_Letter",
+    OtherLetter -> "Other_Letter",
+    NonspacingMark -> "Nonspacing_Mark",
+    SpacingMark -> "Spacing_Mark",
+    EnclosingMark -> "Enclosing_Mark",
+    DecimalNumber -> "Decimal_Number",
+    LetterNumber -> "Letter_Number",
+    OtherNumber -> "Other_Number",
+    ConnectorPunctuation -> "Connector_Punctuation",
+    DashPunctuation -> "Dash_Punctuation",
+    OpenPunctuation -> "Open_Punctuation",
+    ClosePunctuation -> "Close_Punctuation",
+    InitialPunctuation -> "Initial_Punctuation",
+    FinalPunctuation -> "Final_Punctuation",
+    OtherPunctuation -> "Other_Punctuation",
+    MathSymbol -> "Math_Symbol",
+    CurrencySymbol -> "Currency_Symbol",
+    ModifierSymbol -> "Modifier_Symbol",
+    OtherSymbol -> "Other_Symbol",
+    SpaceSeparator -> "Space_Separator",
+    LineSeparator -> "Line_Separator",
+    ParagraphSeparator -> "Paragraph_Separator",
+    Control -> "Control",
+    Format -> "Format",
+    Surrogate -> "Surrogate",
+    PrivateUse -> "Private_Use",
+    Unassigned -> "Unassigned",
+  }
+
 /// The category `text` abbreviates, as `Lu` does `UppercaseLetter`; `None` for any other text,
 /// one that differs only in case among them.
 pub fn category_named(text: String) -> Option<Category> =
@@ -270,19 +305,12 @@ fn class_of(c: Char) -> Int = ucd::lookup(classes(), int_of_char(c))
 
 fn holds(c: Char, property: Int) -> Bool = class_of(c) & property != 0
 
-/// A distance of a case mapping in twenty bits, two's complement.
-fn distance(text: Bytes) -> Int / {abort.raise} =
-  match int_of_ascii(text) {
-    Some(d) -> if d < -0x80000 || d > 0x7FFFF { panic("a case mapping lies within 2^19") }
-    else { d & 0xFFFFF },
-    None -> panic("a case mapping's distance is a number"),
-  }
-
 /// The case word of one line of `ucd/simple_case.txt`, `upper;lower;title`: the three distances,
 /// the uppercase one highest.
 fn case_word(fields: List<Bytes>) -> Int / {abort.raise} =
   match fields {
-    [upper, lower, title] -> distance(upper) << 40 | distance(lower) << 20 | distance(title),
+    [upper, lower, title] ->
+      ucd::distance(upper) << 40 | ucd::distance(lower) << 20 | ucd::distance(title),
     _ -> panic("a case mapping is three distances"),
   }
 
@@ -290,10 +318,11 @@ fn case_word(fields: List<Bytes>) -> Int / {abort.raise} =
 const fn cases() -> Table = ucd::table(embed("ucd/simple_case.txt"), 0, case_word)
 
 /// The character `c` maps to by the distance its case word holds `shift` bits up.
-fn mapped(c: Char, shift: Int) -> Char = {
-  let field = ucd::lookup(cases(), int_of_char(c)) >> shift & 0xFFFFF;
-  match char_of_int(int_of_char(c) + (field ^ 0x80000) - 0x80000) { Some(to) -> to, None -> c }
-}
+fn mapped(c: Char, shift: Int) -> Char =
+  match char_of_int(ucd::away(int_of_char(c), ucd::lookup(cases(), int_of_char(c)) >> shift)) {
+    Some(to) -> to,
+    None -> c,
+  }
 
 // --- ASCII ------------------------------------------------------------------------
 
@@ -492,6 +521,14 @@ pub fn code_point(c: Char) -> Int = int_of_char(c)
 /// negative number and one past `0x10FFFF`.
 pub fn of_code_point(n: Int) -> Option<Char> = char_of_int(n)
 
+/// The character whose scalar value is `n`, and `U+FFFD`, the replacement character, where
+/// `of_code_point` answers none.
+pub fn of_code_point_lossy(n: Int) -> Char =
+  match char_of_int(n) { Some(c) -> c, None -> '\u{FFFD}' }
+
+/// The text whose characters are at `points`, in order, each as `of_code_point_lossy` answers it.
+pub fn text_of(points: List<Int>) -> String = string_of_chars(map(points, of_code_point_lossy))
+
 /// How many bytes `c` takes in UTF-8: one to four.
 pub fn utf8_len(c: Char) -> Int =
   if c < '\u{80}' { 1 } else if c < '\u{800}' { 2 } else if c < '\u{10000}' { 3 } else { 4 }
@@ -500,10 +537,98 @@ pub fn utf8_len(c: Char) -> Int =
 /// written as a surrogate pair, and one for any other.
 pub fn utf16_len(c: Char) -> Int = if c < '\u{10000}' { 1 } else { 2 }
 
-// --- Drawing characters -----------------------------------------------------------
+// --- A property's code points -----------------------------------------------------
 
-/// The character at `n`, and `U+FFFD` where `n` is a surrogate or no code point.
-fn scalar(n: Int) -> Char = match char_of_int(n) { Some(c) -> c, None -> '\u{FFFD}' }
+/// Code points in a row, `first` through `last`.
+pub type Stretch = { first: Int, last: Int }
+
+/// Something this module's table says of every code point.
+pub type Property =
+  /// Its general category is this one.
+  | Of(Category)
+  /// Its general category is of this major class.
+  | OfMajor(Major)
+  /// `is_alphabetic` holds of it.
+  | Alphabetic
+  /// `is_lowercase` holds of it.
+  | Lowercase
+  /// `is_uppercase` holds of it.
+  | Uppercase
+  /// `is_whitespace` holds of it.
+  | WhiteSpace
+  /// `is_xid_start` holds of it.
+  | XidStart
+  /// `is_xid_continue` holds of it.
+  | XidContinue
+
+/// The table as its runs: the first code point of each run of one word and then the word, a
+/// pair a run.
+const fn class_runs() -> Array<Int> = {
+  let table = classes();
+  array_of_list(
+    fold(
+      range(0, 0x110000),
+      { runs: [], last: -1 },
+      |so_far: { runs: List<Int>, last: Int }, cp: Int| {
+        let word = ucd::lookup(table, cp);
+        if word == so_far.last { so_far }
+        else { { runs: push(push(so_far.runs, cp), word), last: word } }
+      },
+    ).runs,
+  )
+}
+
+/// Whether `property` holds where the table's word is `word`; `number` is its category's.
+fn said(word: Int, property: Property, number: Int) -> Bool =
+  match property {
+    Of(_) -> word & 31 == number,
+    OfMajor(class) -> major(category_at(word & 31)) == class,
+    Alphabetic -> word & alphabetic() != 0,
+    Lowercase -> word & lowercase() != 0,
+    Uppercase -> word & uppercase() != 0,
+    WhiteSpace -> word & white_space() != 0,
+    XidStart -> word & xid_start() != 0,
+    XidContinue -> word & xid_continue() != 0,
+  }
+
+/// Every code point `property` holds of, as stretches that rise and neither touch nor overlap:
+/// what a matcher makes a class of, read off the table's runs and not a code point at a time. A
+/// surrogate, which is no `Char`, is in the stretches of its category.
+pub fn stretches(property: Property) -> List<Stretch> = {
+  let runs = class_runs();
+  let number = match property {
+    Of(category) ->
+      fold(range(0, 30), 29, |found: Int, n: Int|
+        if category_at(n) == category { n } else { found }),
+    _ -> 0,
+  };
+  let walked = fold(
+    range(0, array_len(runs) / 2),
+    { done: [], open: None },
+    |so_far: { done: List<Stretch>, open: Option<Stretch> }, i: Int|
+      match ((array_at(runs, 2 * i), array_at(runs, 2 * i + 1), so_far.open)) {
+        (Some(first), Some(word), open) -> if said(word, property, number) {
+          match open {
+            Some(_) -> so_far,
+            None -> { done: so_far.done, open: Some({ first: first, last: first }) },
+          }
+        } else {
+          match open {
+            Some(stretch) ->
+              { done: push(so_far.done, { first: stretch.first, last: first - 1 }), open: None },
+            None -> so_far,
+          }
+        },
+        _ -> so_far,
+      },
+  );
+  match walked.open {
+    Some(stretch) -> push(walked.done, { first: stretch.first, last: 0x10FFFF }),
+    None -> walked.done,
+  }
+}
+
+// --- Drawing characters -----------------------------------------------------------
 
 /// The characters a claim most easily gets wrong: either side of each change in a character's
 /// encoded length and of the surrogates, the first and last code point of every plane, and the
@@ -513,7 +638,8 @@ fn edges() -> List<Char> =
     string_chars(
       "\u{7F}\u{80}\u{7FF}\u{800}\u{D7FF}\u{E000}\u{DF}\u{130}\u{131}\u{17F}\u{1C5}\u{345}\u{3C2}\u{3F4}\u{10D0}\u{1E9E}\u{1F88}\u{2126}\u{212A}\u{24B6}\u{A7AE}\u{10400}\u{1E922}",
     ),
-    flat_map(range(0, 17), |plane: Int| [scalar(plane << 16), scalar(plane << 16 | 0xFFFF)]),
+    flat_map(range(0, 17), |plane: Int|
+      [of_code_point_lossy(plane << 16), of_code_point_lossy(plane << 16 | 0xFFFF)]),
   )
 
 /// A character from anywhere in Unicode, for a claim over characters: an ASCII one, one of the
@@ -523,21 +649,88 @@ fn edges() -> List<Char> =
 /// shrinks toward ASCII.
 pub fn arbitrary() -> Gen<Char> =
   gen::one_of([
-    gen::map(gen::int_between(0, 0x7F), scalar),
-    gen::map(gen::int_between(0x80, 0x2FFF), scalar),
+    gen::map(gen::int_between(0, 0x7F), of_code_point_lossy),
+    gen::map(gen::int_between(0x80, 0x2FFF), of_code_point_lossy),
     gen::elements(edges()),
     gen::map2(gen::below(17), gen::below(0x10000), |plane: Int, low: Int|
-      scalar(plane << 16 | low)),
+      of_code_point_lossy(plane << 16 | low)),
   ])
 
-/// The character `arbitrary` draws for `seed`, which is how this module's laws draw one: a `Char`
-/// drawn by its type alone is an ASCII letter nearly every time, and a type stating the generator
-/// would hand it to every program that imports this module.
-fn drawn(seed: Int) -> Char / {abort.raise} =
-  match gen::sample(arbitrary(), 0, bytes_of_string(int_to_string(seed)), 32, None).value {
-    Some(c) -> c,
+/// Short texts that the rules over text read as one thing or read specially: an emoji joined of
+/// others, one with a modifier, a flag, a keycap, a syllable of conjoining letters, a conjunct,
+/// letters whose cases are several characters or depend on what follows, marks out of their
+/// order, an iota subscript before another mark and a capital `I` before its dot, which fold
+/// apart from their other spellings, a line break of two characters, and the punctuation of a
+/// domain name.
+fn knots() -> List<String> =
+  [
+    "\u{1FB3}\u{313}",
+    "a\u{345}\u{35D}",
+    "I\u{307}",
+    "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+    "\u{1F44D}\u{1F3FD}",
+    "\u{1F1E9}\u{1F1EA}",
+    "\u{2764}\u{FE0F}",
+    "1\u{FE0F}\u{20E3}",
+    "\u{1100}\u{1161}\u{11A8}",
+    "\u{D4DB}",
+    "\u{915}\u{94D}\u{937}",
+    "\u{DF}",
+    "\u{130}",
+    "\u{3A3}",
+    "\u{FB03}",
+    "\u{1E9B}\u{323}",
+    "a\u{301}\u{323}",
+    "\u{5D0}\u{5D1}",
+    "\u{628}\u{200C}",
+    "\r\n",
+    ".",
+    "-",
+    "xn--",
+    " ",
+    "9",
+  ]
+
+/// A text for a claim over texts: up to twelve pieces, each a character `arbitrary` draws, a
+/// word of ASCII letters, a combining mark, a Hangul syllable or one of its letters, or one of
+/// the short texts the rules over text read specially. It shrinks toward the empty text.
+pub fn arbitrary_text() -> Gen<String> =
+  gen::map(
+    gen::list_of(
+      gen::one_of([
+        gen::map(gen::list_of(gen::int_between(0x61, 0x7A), 6), text_of),
+        gen::map(arbitrary(), |c: Char| string_of_chars([c])),
+        gen::elements(knots()),
+        gen::map(
+          gen::one_of([
+            gen::int_between(0x300, 0x36F),
+            gen::int_between(0xAC00, 0xD7A3),
+            gen::int_between(0x1100, 0x11FF),
+            gen::int_between(0x391, 0x3C9),
+            gen::int_between(0x1F600, 0x1F64F),
+          ]),
+          |cp: Int| text_of([cp]),
+        ),
+      ]),
+      12,
+    ),
+    |pieces: List<String>| fold(pieces, "", |text: String, piece: String| text ++ piece),
+  )
+
+/// The value `g` draws for `seed`.
+fn drawn_of<a>(g: Gen<a>, seed: Int) -> a / {abort.raise} =
+  match gen::sample(g, 0, bytes_of_string(int_to_string(seed)), 32, None).value {
+    Some(value) -> value,
     None -> panic("the generator gave up"),
   }
+
+/// The character `arbitrary` draws for `seed`: how a law over whole numbers ranges over
+/// characters. A `Char` drawn by its type alone is an ASCII letter nearly every time, and a type
+/// that stated the generator would hand it to every program that imports this module.
+pub fn drawn(seed: Int) -> Char / {abort.raise} = drawn_of(arbitrary(), seed)
+
+/// The text `arbitrary_text` draws for `seed`: how a law over whole numbers ranges over texts.
+pub fn drawn_text(seed: Int) -> String / {abort.raise} = drawn_of(arbitrary_text(), seed)
 
 // --- Laws -------------------------------------------------------------------------
 
@@ -546,6 +739,12 @@ law "a category's abbreviation names it" = round_trip(abbreviation, category_nam
 law "a character is the character of its code point"
   forall (seed: Int) {
     of_code_point(code_point(drawn(seed))) == Some(drawn(seed))
+      && of_code_point_lossy(code_point(drawn(seed))) == drawn(seed)
+  }
+
+law "a text is the text of its characters' code points"
+  forall (seed: Int) {
+    text_of(map(string_chars(drawn_text(seed)), code_point)) == drawn_text(seed)
   }
 
 law "is_ascii_alphabetic is is_alphabetic kept to ASCII" =
@@ -690,6 +889,22 @@ law "string_upper and string_lower, where they answer one character for one, ans
       && (string_len(lower) != 1 || lower == string_of_chars([to_lowercase(c)]))
   }
 
+fn among(found: List<Stretch>, c: Char) -> Bool =
+  count(found, |s: Stretch| s.first <= code_point(c) && code_point(c) <= s.last) == 1
+
+law "a character lies in a property's stretches, once, exactly when the property holds of it"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    among(stretches(Of(general_category(c))), c)
+      && among(stretches(OfMajor(major(general_category(c)))), c)
+      && among(stretches(Alphabetic), c) == is_alphabetic(c)
+      && among(stretches(Lowercase), c) == is_lowercase(c)
+      && among(stretches(Uppercase), c) == is_uppercase(c)
+      && among(stretches(WhiteSpace), c) == is_whitespace(c)
+      && among(stretches(XidStart), c) == is_xid_start(c)
+      && among(stretches(XidContinue), c) == is_xid_continue(c)
+  }
+
 law "utf8_len is the bytes a character takes" =
   agrees(|seed: Int| utf8_len(drawn(seed)), |seed: Int|
     bytes_len(bytes_of_string(string_of_chars([drawn(seed)]))))
@@ -697,7 +912,7 @@ law "utf8_len is the bytes a character takes" =
 // A size is a code point past ASCII, from `U+010F` to plane sixteen: a table is read at each.
 law "a character is classified in the same steps wherever its code point lies"
   forall (n: Int) where n > 0 cost 1 {
-    let c = scalar(n * 271);
+    let c = of_code_point_lossy(n * 271);
     {
       category: general_category(c),
       major: [is_letter(c), is_mark(c), is_numeric(c), is_punctuation(c), is_symbol(c)],
@@ -710,7 +925,7 @@ law "a character is classified in the same steps wherever its code point lies"
 
 law "a character is mapped to each case in the same steps wherever its code point lies"
   forall (n: Int) where n > 0 cost 1 {
-    let c = scalar(n * 271);
+    let c = of_code_point_lossy(n * 271);
     [to_uppercase(c), to_lowercase(c), to_titlecase(c)]
   }
 
@@ -785,7 +1000,7 @@ test "every category but the surrogates' is some character's, and each is listed
 }
 
 /// Every ASCII character.
-fn ascii() -> List<Char> = map(range(0, 128), scalar)
+fn ascii() -> List<Char> = map(range(0, 128), of_code_point_lossy)
 
 // An ASCII character never reaches a table, so its answers are written twice: here they are held
 // to what the tables say of it.
@@ -963,6 +1178,63 @@ test "a code point is a character's unless it is a surrogate or past the last" {
   assert_eq(map([-1, 0xD800, 0xDFFF, 0x110000], of_code_point), [None, None, None, None])
 }
 
+test "a category's name is the standard's, and no two categories share one" {
+  assert_eq(name(UppercaseLetter), "Uppercase_Letter");
+  assert_eq(name(DecimalNumber), "Decimal_Number");
+  assert_eq(name(PrivateUse), "Private_Use");
+  assert_eq(name(Control), "Control");
+  assert_eq(
+    count(categories(), |a: Category| count(categories(), |b: Category| name(a) == name(b)) != 1),
+    0,
+  )
+}
+
+test "the categories' stretches rise, touch nothing of their own, and share out every code point" {
+  let sizes = map(categories(), |category: Category| {
+    let found = stretches(Of(category));
+    let rising = fold(
+      found,
+      { ok: true, past: -2 },
+      |so_far: { ok: Bool, past: Int }, s: Stretch|
+        { ok: so_far.ok && s.first > so_far.past + 1 && s.last >= s.first, past: s.last },
+    );
+    assert(rising.ok, Some(abbreviation(category)));
+    fold(found, 0, |sum: Int, s: Stretch| sum + s.last - s.first + 1)
+  });
+  assert_eq(fold(sizes, 0, |sum: Int, n: Int| sum + n), 0x110000);
+  assert_eq(list_at(stretches(Of(DecimalNumber)), 0), Some({ first: 0x30, last: 0x39 }));
+  assert_eq(stretches(Of(Surrogate)), [{ first: 0xD800, last: 0xDFFF }]);
+  assert_eq(list_at(stretches(WhiteSpace), 0), Some({ first: 9, last: 13 }));
+  let letters = fold(stretches(OfMajor(Letter)), 0, |sum: Int, s: Stretch|
+    sum + s.last - s.first + 1);
+  assert_eq(
+    letters,
+    fold(
+      [UppercaseLetter, LowercaseLetter, TitlecaseLetter, ModifierLetter, OtherLetter],
+      0,
+      |sum: Int, category: Category|
+        sum + fold(stretches(Of(category)), 0, |n: Int, s: Stretch| n + s.last - s.first + 1),
+    ),
+  )
+}
+
+test "a number that is no character's reads as U+FFFD, alone and in a text" {
+  assert_eq(map([0x41, 0xD7FF, 0xE000, 0x10FFFF], of_code_point_lossy), [
+    'A',
+    '\u{D7FF}',
+    '\u{E000}',
+    '\u{10FFFF}',
+  ]);
+  assert_eq(map([-1, 0xD800, 0xDFFF, 0x110000], of_code_point_lossy), [
+    '\u{FFFD}',
+    '\u{FFFD}',
+    '\u{FFFD}',
+    '\u{FFFD}',
+  ]);
+  assert_eq(text_of([0x68, 0xD800, 0x1F600, 0x69]), "h\u{FFFD}\u{1F600}i");
+  assert_eq(text_of([]), "")
+}
+
 // A table a build did not keep is made where it is read, and `metered` charges that to each read:
 // an ASCII character's count is the same either way only because it reads none.
 test "an ASCII character is classified and mapped in a few calls, whatever it is" {
@@ -986,7 +1258,7 @@ test "a character past ASCII takes a few calls and one read of a table, wherever
   assert_eq(metered(|| general_category('\u{E9}')).steps - read, 5);
   assert_eq(metered(|| decimal_value('\u{663}')).steps - read, 4);
   assert_eq(metered(|| is_numeric('\u{BD}')).steps - read, 7);
-  assert_eq(metered(|| to_uppercase('\u{E9}')).steps - metered(|| cases()).steps, 4)
+  assert_eq(metered(|| to_uppercase('\u{E9}')).steps - metered(|| cases()).steps, 5)
 }
 
 test "the generator draws ASCII, every plane, every edge and many cased letters" {
@@ -998,4 +1270,14 @@ test "the generator draws ASCII, every plane, every edge and many cased letters"
   assert_eq(filter(edges(), |edge: Char| count(seen, |c: Char| c == edge) == 0), []);
   assert(count(seen, is_ascii) > 800);
   assert(count(seen, |c: Char| to_uppercase(c) != c || to_lowercase(c) != c) > 400)
+}
+
+test "the text generator draws the empty text, long texts and each of the texts read specially" {
+  let seen = map(range(0, 3000), drawn_text);
+  assert(count(seen, |text: String| text == "") > 0);
+  assert(count(seen, |text: String| string_len(text) > 20) > 0);
+  assert_eq(
+    filter(knots(), |knot: String| count(seen, |text: String| string_contains(text, knot)) == 0),
+    [],
+  )
 }

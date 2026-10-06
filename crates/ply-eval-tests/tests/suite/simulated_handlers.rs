@@ -233,6 +233,10 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// The one generator the evaluator names, once: `ring`'s RSA signing takes one for a PSS salt, and
+/// PKCS #1 v1.5, the only padding signed there, never reads it.
+const UNREAD_GENERATOR: (&str, &str) = ("crypto.rs", "&ring::rand::SystemRandom::new(),");
+
 #[test]
 fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-eval/src");
@@ -250,6 +254,11 @@ fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
         }
         let whole = std::fs::read_to_string(&path).expect("a readable source");
         let text = whole.split("#[cfg(test)]").next().unwrap_or(&whole);
+        let text = if path.file_name().is_some_and(|n| n == UNREAD_GENERATOR.0) {
+            text.replacen(UNREAD_GENERATOR.1, "", 1)
+        } else {
+            text.to_string()
+        };
         for banned in [
             "SystemTime",
             "Instant::now",
