@@ -112,3 +112,67 @@ test "the list update raises hold" { raises_hold("lists_raise") }
 test "a raise nothing answers fails its test with what it carried" {
   raises_hold("unanswered_raise")
 }
+
+test "a `?` does not leave a function through a hold's region" {
+  let source =
+    \\fn free(x: Int) -> Unit = ()
+    \\
+    \\fn positive(n: Int) -> Option<Int> = if n > 0 { Some(n) } else { None }
+    \\
+    \\pub fn held(n: Int) -> Option<Int> =
+    \\  with_hold[r](1, free) { h -> Some(positive(n)? + hold_get(h)) }
+    \\
+  ;
+  let report = json_of(in_memory(one(source), ["check", "--json"]));
+  assert_eq(map(items(at(report, "diagnostics")), |d: Json| str(at(d, "code"))), ["E0118"])
+}
+
+// Each inner test resumes one continuation twice through a `with_hold`. The first resumption ends
+// the body, so the hold is let go once, which the clause asserts before it resumes again; the
+// second finds the hold gone, where it reads it or where the region would let it go again.
+test "a continuation resumed after a hold's release is refused, and nothing is released twice" {
+  let source =
+    \\effect amb { write flip() -> Bool }
+    \\effect log { write note(s: String) -> Unit }
+    \\
+    \\fn read_after() -> Int / {amb.flip, log.note} =
+    \\  with_hold[file]("a", |name: String| log.note("close " ++ name)) { h -> {
+    \\    let heads = amb.flip();
+    \\    if heads { 1 } else { string_len(hold_get(h)) }
+    \\  } }
+    \\
+    \\fn ended_after() -> Int / {amb.flip, log.note} =
+    \\  with_hold[file]("a", |name: String| log.note("close " ++ name)) { h -> {
+    \\    let heads = amb.flip();
+    \\    if heads { 1 } else { 2 }
+    \\  } }
+    \\
+    \\fn both(chosen: () -> Int / {amb.flip, log.note}) -> Int / {abort.raise} =
+    \\  with_cell[seen]([]) { c ->
+    \\    handle {
+    \\      handle { chosen() } with {
+    \\        amb.flip() resume k -> {
+    \\          let first = k(true);
+    \\          assert_eq(cell_get(c), ["close a"]);
+    \\          first + k(false)
+    \\        },
+    \\      }
+    \\    } with {
+    \\      log.note(s) -> cell_set(c, push(cell_get(c), s)),
+    \\    } }
+    \\
+    \\test "a hold read by a second resumption" { assert_eq(both(read_after), 2) }
+    \\
+    \\test "a hold let go by a second resumption" { assert_eq(both(ended_after), 3) }
+    \\
+  ;
+  let ran = in_memory(one(source), ["test", "--json", "--no-cache"]);
+  let failed = items(at(json_of(ran), "failures"));
+  assert(len(failed) == 2, Some(said(ran)));
+  fold(failed, (), |u: Unit, f: Json| {
+    let d = at(f, "diagnostic");
+    assert(str(at(d, "code")) == "E0331", Some(shown(d)))
+  });
+  assert(string_contains(said(ran), "a hold is read after"), Some(said(ran)));
+  assert(string_contains(said(ran), "a hold is let go after"), Some(said(ran)))
+}

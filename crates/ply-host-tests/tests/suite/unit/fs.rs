@@ -815,3 +815,123 @@ fn every_operation_that_names_a_second_path_confines_it_too() {
         assert_eq!(refused.code, codes::RUNTIME_ERROR, "{}", op.name());
     }
 }
+
+// --- Open files ---
+
+fn opened(fs: &Arc<FsHost>, label: &str, path: &str, how: &str) -> Result<i64, String> {
+    let how = Value::ctor(format!("std.fs.{how}"), Vec::new());
+    match &done(perform(fs, Op::Open, label, &[Value::str(path), how])) {
+        Value::Ctor { name, args } if name.as_str() == "Ok" => match &args[0] {
+            Value::Int(descriptor) => Ok(*descriptor),
+            other => panic!("not a descriptor: {}", other.type_name()),
+        },
+        Value::Ctor { name, args } if name.as_str() == "Err" => Err(ctor_name(&args[0])),
+        other => panic!("not a `Result`: {}", other.type_name()),
+    }
+}
+
+fn chunk(fs: &Arc<FsHost>, label: &str, descriptor: i64, max: i64) -> Option<Vec<u8>> {
+    maybe_bytes(&done(perform(
+        fs,
+        Op::ReadChunk,
+        label,
+        &[Value::Int(descriptor), Value::Int(max)],
+    )))
+}
+
+fn closed(fs: &Arc<FsHost>, label: &str, descriptor: i64) -> bool {
+    boolean(&done(perform(
+        fs,
+        Op::Close,
+        label,
+        &[Value::Int(descriptor)],
+    )))
+}
+
+#[test]
+fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
+    let (here, there) = (root(), root());
+    std::fs::write(here.path().join("log"), b"abcdef").unwrap();
+    let mut roots = Roots::new();
+    roots.bind("cache", here.path(), span()).unwrap();
+    roots.bind("other", there.path(), span()).unwrap();
+    let fs = Arc::new(FsHost::new(roots));
+
+    let first = opened(&fs, "cache", "log", "ToRead").expect("the file opens");
+    assert_eq!(chunk(&fs, "cache", first, 4), Some(b"abcd".to_vec()));
+    // Another root's label reaches nothing this root opened: not to read it, not to close it.
+    assert_eq!(chunk(&fs, "other", first, 4), None);
+    assert!(!closed(&fs, "other", first));
+    assert_eq!(chunk(&fs, "cache", first, 4), Some(b"ef".to_vec()));
+    assert_eq!(chunk(&fs, "cache", first, 4), Some(Vec::new()));
+
+    assert!(closed(&fs, "cache", first));
+    assert!(!closed(&fs, "cache", first));
+    assert_eq!(chunk(&fs, "cache", first, 4), None);
+    // A descriptor names one open, so the next open answers another.
+    let second = opened(&fs, "cache", "log", "ToRead").expect("the file opens again");
+    assert_ne!(second, first);
+}
+
+#[test]
+fn an_open_says_why_a_file_did_not_open_and_is_confined_like_every_other() {
+    let dir = root();
+    let fs = rooted(dir.path());
+    std::fs::create_dir(dir.path().join("d")).unwrap();
+    assert_eq!(
+        opened(&fs, "cache", "absent", "ToRead"),
+        Err("std.fs.NotFound".into())
+    );
+    for how in ["ToRead", "ToWrite", "ToAppend"] {
+        assert_eq!(
+            opened(&fs, "cache", "d", how),
+            Err("std.fs.NotAFile".into())
+        );
+    }
+    assert_eq!(
+        opened(&fs, "cache", "no/f", "ToWrite"),
+        Err("std.fs.NotFound".into())
+    );
+
+    let how = Value::ctor("std.fs.ToRead", Vec::new());
+    let refused = perform(
+        &fs,
+        Op::Open,
+        "cache",
+        &[Value::str("../escape"), how.clone()],
+    )
+    .expect_err("it leaves the root");
+    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
+    let refused = perform(&fs, Op::Open, "elsewhere", &[Value::str("a"), how])
+        .expect_err("`elsewhere` has no root");
+    assert_eq!(refused.code, codes::FS_ROOT_UNBOUND);
+}
+
+#[test]
+fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
+    let dir = root();
+    let fs = rooted(dir.path());
+    std::fs::write(dir.path().join("log"), vec![7u8; 4096]).unwrap();
+    let file = opened(&fs, "cache", "log", "ToRead").expect("the file opens");
+    assert_eq!(chunk(&fs, "cache", file, 0), Some(Vec::new()));
+    assert_eq!(chunk(&fs, "cache", file, 100).map(|b| b.len()), Some(100));
+
+    let over = perform(
+        &fs,
+        Op::ReadChunk,
+        "cache",
+        &[Value::Int(file), Value::Int(MAX_READ_BYTES as i64 + 1)],
+    )
+    .expect_err("more than one read answers");
+    assert_eq!(over.code, codes::FS_FILE_TOO_LARGE);
+    let negative = perform(
+        &fs,
+        Op::ReadChunk,
+        "cache",
+        &[Value::Int(file), Value::Int(-1)],
+    )
+    .expect_err("a negative length");
+    assert_eq!(negative.code, codes::RUNTIME_ERROR);
+    // Neither refusal moved the descriptor.
+    assert_eq!(chunk(&fs, "cache", file, 4096).map(|b| b.len()), Some(3996));
+}

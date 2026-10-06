@@ -117,6 +117,57 @@ impl Hosts {
         process: Option<ply_host::process::ProcessHost>,
         lent: Vec<LentOp>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
+        Hosts::open_over(
+            check,
+            host,
+            credentials,
+            roots,
+            config,
+            trace,
+            shutdown,
+            process,
+            lent,
+            false,
+        )
+    }
+
+    /// The hosts of a program a runnable holds, which was built against the effects of its day:
+    /// an operation one of them has gained since is not that program's to perform, so it is
+    /// bound to the operations it declares.
+    pub fn open_built(
+        check: &CheckOutput,
+        credentials: &crate::options::TlsOptions,
+        roots: &[ply_host::fs::RootSpec],
+        process: ply_host::process::ProcessHost,
+        lent: Vec<LentOp>,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
+        Hosts::open_over(
+            check,
+            true,
+            credentials,
+            roots,
+            Configuration::default(),
+            &crate::trace::TraceOptions::default(),
+            None,
+            Some(process),
+            lent,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_over(
+        check: &CheckOutput,
+        host: bool,
+        credentials: &crate::options::TlsOptions,
+        roots: &[ply_host::fs::RootSpec],
+        config: Configuration,
+        trace: &crate::trace::TraceOptions,
+        shutdown: Option<Arc<ply_host::signal::Shutdown>>,
+        process: Option<ply_host::process::ProcessHost>,
+        lent: Vec<LentOp>,
+        declared_only: bool,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
             let mut registry = registry_for(None);
             for (op, handler) in lent {
@@ -150,6 +201,9 @@ impl Hosts {
         let mut registry = facilities.registry();
         for (op, handler) in lent {
             registry.register(op, handler);
+        }
+        if declared_only {
+            registry.retain_declared(check);
         }
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
