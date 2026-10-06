@@ -1,0 +1,1835 @@
+//! Templates: text with places for data, read once and filled without running anything.
+//!
+//! A template is text in which `{{ ... }}` is an action. `read` parses one into a `Template`, or
+//! refuses with the place and the reason, and `fill` writes it over data: a `std.value` `Value`,
+//! which `reflect(x)` makes of any value and `of_json` of a JSON document. Whatever keeps a
+//! template from being filled is a typed failure and never an empty place in the output: a path
+//! with nothing at it, a value of the wrong kind for its use, a template `include` cannot find.
+//! Filling performs nothing, so a template read from anywhere can only compute, and `Limits`
+//! bounds how much.
+//!
+//! The actions:
+//!
+//! - `{{ user.name }}` writes a value. A path's first name is a loop's variable, or else a field
+//!   of the data, and each name after it a field of a record or a key of a map; `.` is the data
+//!   itself and `.name` a field of it whatever a loop has bound. A `Some` is read as what it
+//!   holds. A text, a number, a boolean and a character are written; any other value is no text;
+//!   and a path nothing stands at, or a `None` there, is missing.
+//! - `{{ name | upper }}` passes the value through pipes, left to right. `html` and `url` escape
+//!   it, as `std.html`'s `escape` and `std.url`'s `url_encode` do; `json` writes it as JSON;
+//!   `upper` and `lower` fold ASCII letters; `length` counts a text's characters or the entries
+//!   of a list or a map; `join ", "` joins a list of texts; and `default "none"` stands in where
+//!   the value is missing. A pipe's argument is a path or a value written out: `"text"`, `12`,
+//!   `true`.
+//! - `{{ if paid }} ... {{ else if due }} ... {{ else }} ... {{ end }}` writes the first branch
+//!   whose condition holds. A boolean holds as it says; a `None`, an empty text, an empty list
+//!   and an empty map do not; every other value does.
+//! - `{{ for item in items }} ... {{ else }} ... {{ end }}` writes its body for each element of a
+//!   list, in order, or each value of a map, in the order of its keys, and the `else` branch
+//!   where there is none. `{{ for i, item in items }}` also binds a list's index, from 0, or a
+//!   map's key.
+//! - `{{ include "row" item }}` writes the template handed to `fill` under that name, filled from
+//!   the value given, or from `.` where none is given.
+//! - `{{! a comment }}` writes nothing. `{{-` and `-}}` open and close any action and also drop
+//!   the blanks and line ends that touch it on that side.
+//!
+//! `read_html` reads the same language where the text is HTML, with `std.html`'s reader, and
+//! writes each value by where it stands. In an element's content and in a quoted attribute value
+//! it is characters, escaped; as the whole of an unquoted value it is written quoted. In an
+//! attribute that holds a URL (`href`, `src`, `action`, `formaction` and the like) it is
+//! percent-encoded as that part of a URL, and one that would give the URL a scheme other than
+//! `http`, `https`, `mailto` or `tel` fails the filling unless it is a `TrustedUrl`. A value
+//! that is an `Html` is markup already and is written as it is, which is the one way a value is
+//! not escaped; an HTML template's own filling is one (`fill_html`), and an `include` writes
+//! another HTML template's so. A template that would write a value where no escaping makes it
+//! text is refused when it is read: in a tag outside an attribute's value, in an unquoted value
+//! it is only part of, in a comment, a `script` or a `style`, in an event handler, a `style` or
+//! a `srcdoc` attribute, and in a URL whose scheme its text wrote otherwise. So is one whose
+//! branches leave the markup at different places, as an `if` that opens a tag its `else` does
+//! not, and one that ends an action on the `html` pipe, or on `url` in a URL, where the value
+//! would be escaped twice.
+
+import std.bytes (int_of_ascii, is_digit, is_letter, peek, scan, scan_until)
+import std.gen
+import std.gen (Gen)
+import std.html
+import std.html (Html)
+import std.json
+import std.json (Json)
+import std.laws (agrees)
+import std.list (at_or, enumerate, find, find_last, last, take, zip_with)
+import std.string
+import std.string (join, to_lower, to_upper)
+import std.url (url_encode)
+import std.value
+import std.value (Entry, Field, VArray, VBool, VBytes, VChar, VCtor, VDecimal, VFixed, VFloat, VInt,
+                  VList, VMap, VRecord, VShown, VStr, VUnit, Value)
+
+// --- What is read and what is refused -----------------------------------------
+
+/// Why a template is refused where it is read, or why it has no filling.
+pub type Why =
+  /// A `{{` that no `}}` closes.
+  | Unclosed
+  /// An action that is none of the language's, with what was expected there: `a path`.
+  | Expected(String)
+  /// A pipe this module has none of, by the name written.
+  | UnknownPipe(String)
+  /// An `else` or an `end`, as written, with no `if` or `for` open.
+  | Unopened(String)
+  /// An `if` or a `for`, as written, that no `end` closes.
+  | Unended(String)
+  /// Blocks nested deeper than `deepest`.
+  | Nested
+  /// As HTML: markup `std.html`'s reader refuses, with what it said.
+  | Markup(String)
+  /// As HTML: a value where no escaping would make it text, with what `std.html` said of the place.
+  | Misplaced(String)
+  /// As HTML: the branches of an `if`, or one pass of a `for` and the next, leave the markup at
+  /// different places.
+  | Uneven
+  /// As HTML: the escape pipe named, where the template escapes the value itself.
+  | EscapedTwice(String)
+  /// Nothing stands at the path written: no variable, field or key of that name, or a `None`.
+  | Missing(String)
+  /// A value of the wrong kind for its use: what the use takes, then what it was given.
+  | WrongKind(String, String)
+  /// No template was handed to the filling under the name an `include` names.
+  | NoPartial(String)
+  /// As HTML: a value that would give a URL the scheme carried.
+  | UnsafeUrl(String)
+  /// The output is past the limit's `output`.
+  | TooLong
+  /// More passes of loops and includes than the limit's `iterations`.
+  | TooManyPasses
+  /// Includes inside includes deeper than the limit's `depth`.
+  | TooDeep
+  /// This module failed, with what it said: its own defect, answered as a refusal so that
+  /// reading and filling raise nothing else.
+  | Defect(String)
+
+/// A template refused: the character of its text the reader stood at, that character's line and
+/// column, both from 1, and why.
+pub type Refusal = new { offset: Int, line: Int, column: Int, why: Why }
+
+/// A filling that failed: the template it failed in, `None` for the one being filled and the
+/// name of an included one otherwise; the character of that template's text its action starts
+/// at; and why.
+pub type Failure = new { partial: Option<String>, offset: Int, why: Why }
+
+/// What a filling is held to: how many bytes it may write, counted before a value's characters
+/// are escaped; how many passes its loops and includes may make between them; and how deep an
+/// include may stand inside others, which is never deeper than `deepest()` whatever is asked.
+pub type Limits = new { output: Int, iterations: Int, depth: Int }
+
+/// Limits for a page: a mebibyte of output, ten thousand passes, and includes sixteen deep.
+pub fn default_limits() -> Limits = { output: 1048576, iterations: 10000, depth: 16 }
+
+/// How deep the blocks of a template may nest, and its includes: each level nests a few calls of
+/// the program that fills it, and this many of both stay well inside what calls may nest.
+pub fn deepest() -> Int = 32
+
+/// What reading and filling raise where they refuse.
+pub effect template {
+  /// The text is no template, or as HTML none that writes every value as text.
+  raise refused(e: Refusal)
+  /// The template has no filling from this data within these limits.
+  raise failed(e: Failure)
+}
+
+/// A reason as a sentence.
+pub fn explain(why: Why) -> String =
+  match why {
+    Unclosed -> "this `{{` is not closed by a `}}`",
+    Expected(what) -> "expected " ++ what,
+    UnknownPipe(name) ->
+      "there is no pipe `" ++ name
+        ++ "`: the pipes are html, url, json, upper, lower, length, join and default",
+    Unopened(word) -> "this `" ++ word ++ "` has no `if` or `for` open before it",
+    Unended(word) -> "this `" ++ word ++ "` is not closed by an `end`",
+    Nested -> "blocks are nested deeper than a template may nest them",
+    Markup(said) -> said,
+    Misplaced(said) -> said,
+    Uneven -> "the branches here leave the markup at different places",
+    EscapedTwice(pipe) ->
+      "the template escapes this value where it stands, so `" ++ pipe ++ "` would escape it twice",
+    Missing(path) -> "nothing stands at `" ++ path ++ "`",
+    WrongKind(taken, given) -> "this takes " ++ taken ++ " and was given " ++ given,
+    NoPartial(name) -> "no template named `" ++ name ++ "` was handed to the filling",
+    UnsafeUrl(scheme) -> "a value here would give the URL the scheme `" ++ scheme ++ "`",
+    TooLong -> "the output is past its limit",
+    TooManyPasses -> "the loops and includes made more passes than their limit",
+    TooDeep -> "includes are nested deeper than their limit",
+    Defect(said) ->
+      "std.template failed, which is its defect and no fault of the template: " ++ said,
+  }
+
+/// The line and the column, both from 1, of the character at `offset` of `source`: where a
+/// refusal's or a failure's offset stands in its template's text.
+pub fn position(source: String, offset: Int) -> { line: Int, column: Int } / {abort.raise} = {
+  let lines = string_split(string_slice(source, 0, min(max(offset, 0), string_len(source))), "\n");
+  { line: len(lines), column: string_len(at_or(lines, len(lines) - 1, "")) + 1 }
+}
+
+// --- Syntax -----------------------------------------------------------------
+
+type Token = | Word(String) | Quote(String) | Number(Int) | Dot | Bar | Comma
+
+/// What an action reads: the value at a path, from the data alone where the flag is set and else
+/// from a loop's variable of the first name where there is one; or a value written out.
+type Operand = | Path(Bool, List<String>) | Written(Value)
+
+type Pipe = | AsHtml | AsUrl | AsJson | Upper | Lower | Length | Default(Operand) | Join(Operand)
+
+type Expr = { from: Operand, pipes: List<Pipe> }
+
+type Action =
+  | Shows(Expr)
+  | If(Expr)
+  | ElseIf(Expr)
+  | Else
+  | End
+  | For(Option<String>, String, Expr)
+  | Includes(String, Expr)
+
+/// A template's own text: as it is where the template is text, and as `std.html` read it where
+/// it is HTML.
+type Chunk = | Plain(String) | Read(html::Run)
+
+/// Where a value is written: anywhere in a text, and in the hole `std.html` read in markup.
+type Spot = | Anywhere | In(html::Hole)
+
+type Lit = { chunk: Chunk, size: Int, at: Int }
+
+type Shown = { value: Expr, spot: Spot, at: Int }
+
+type Arm = { cond: Expr, at: Int, body: List<Node> }
+
+type Loop = {
+  key: Option<String>,
+  item: String,
+  over: Expr,
+  at: Int,
+  body: List<Node>,
+  empty: List<Node>,
+}
+
+type Included = { name: String, data: Expr, spot: Spot, at: Int }
+
+type Node = | Text(Lit) | Show(Shown) | When(List<Arm>, List<Node>) | Each(Loop) | Include(Included)
+
+/// A template once read. Only this module's readers answer one, so an HTML template's every
+/// value has a place `std.html` read for it.
+pub opaque type Template = new { markup: Bool, nodes: List<Node> }
+
+/// Where the reader stands, in characters, or what it found there.
+effect fault {
+  raise at(offset: Int, why: Why)
+}
+
+fn stop<a>(src: Bytes, byte: Int, why: Why) -> a / {fault.at, abort.raise} =
+  fault.at(string_len(string_of_bytes_lossy(bytes_slice(src, 0, byte))), why)
+
+fn blank() -> Bytes = b" \t\r\n"
+
+fn naming() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+
+/// An action's tokens, where the text goes on after its `}}`, and whether a `-` before that
+/// drops the blanks that follow.
+type Tokens = { tokens: List<Token>, next: Int, trim: Bool }
+
+type Tokening = { at: Int, tokens: List<Token> }
+
+type Quoted = { text: String, next: Int }
+
+type Quoting = { at: Int, parts: List<Bytes> }
+
+fn escaped(c: Int) -> Option<Bytes> =
+  match c {
+    b'\\' -> Some(b"\\"),
+    b'"' -> Some(b"\""),
+    b'n' -> Some(b"\n"),
+    b't' -> Some(b"\t"),
+    _ -> None,
+  }
+
+/// The text written between the `"` before `from` and the next one.
+fn quoted(src: Bytes, from: Int, open: Int) -> Quoted / {fault.at, abort.raise} =
+  iterate({ at: from, parts: [] }, bytes_len(src) - from + 2, |s: Quoting| {
+    let to = scan_until(src, s.at, b"\"\\");
+    let kept = push(s.parts, bytes_slice(src, s.at, to));
+    if peek(src, to) < 0 { stop(src, open, Unclosed) } else if peek(src, to) == b'"' {
+      Stop({ text: string_of_bytes(bytes_concat_all(kept)), next: to + 1 })
+    } else {
+      match escaped(peek(src, to + 1)) {
+        Some(written) -> Continue({ at: to + 2, parts: push(kept, written) }),
+        None -> stop(src, to, Expected("`\\\\`, `\\\"`, `\\n` or `\\t` after a `\\`")),
+      }
+    }
+  })
+
+fn number(src: Bytes, at: Int) -> { value: Int, next: Int } / {fault.at, abort.raise} = {
+  let negative = peek(src, at) == b'-';
+  let from = if negative { at + 1 } else { at };
+  let to = scan(src, from, b"0123456789");
+  match int_of_ascii(bytes_slice(src, from, to)) {
+    Some(n) -> { value: if negative { 0 - n } else { n }, next: to },
+    None -> stop(src, at, Expected("a number an `Int` holds")),
+  }
+}
+
+/// The tokens of the action that opened at `open`, read from `from`.
+fn tokens(src: Bytes, from: Int, open: Int) -> Tokens / {fault.at, abort.raise} =
+  iterate({ at: from, tokens: [] }, bytes_len(src) - from + 2, |s: Tokening| {
+    let at = scan(src, s.at, blank());
+    let c = peek(src, at);
+    let one = |token: Token, next: Int| Continue({ at: next, tokens: push(s.tokens, token) });
+    if c < 0 { stop(src, open, Unclosed) } else if c == b'}' && peek(src, at + 1) == b'}' {
+      Stop({ tokens: s.tokens, next: at + 2, trim: false })
+    } else if c == b'-' && peek(src, at + 1) == b'}' && peek(src, at + 2) == b'}' {
+      Stop({ tokens: s.tokens, next: at + 3, trim: true })
+    } else if c == b'"' {
+      let read = quoted(src, at + 1, open);
+      one(Quote(read.text), read.next)
+    } else if is_digit(c) || (c == b'-' && is_digit(peek(src, at + 1))) {
+      let read = number(src, at);
+      one(Number(read.value), read.next)
+    } else if is_letter(c) || c == b'_' {
+      let to = scan(src, at, naming());
+      one(Word(string_of_bytes(bytes_slice(src, at, to))), to)
+    } else if c == b'.' { one(Dot, at + 1) }
+    else if c == b'|' { one(Bar, at + 1) }
+    else if c == b',' { one(Comma, at + 1) }
+    else { stop(src, at, Expected("a name, a value written out, `.`, `|`, `,` or `}}`")) }
+  })
+
+/// A comment's end, read from its `!`.
+fn commented(src: Bytes, from: Int, open: Int) -> Tokens / {fault.at, abort.raise} =
+  match bytes_index_of_from(src, b"}}", from) {
+    None -> stop(src, open, Unclosed),
+    Some(close) -> { tokens: [], next: close + 2, trim: peek(src, close - 1) == b'-' },
+  }
+
+type Operated = { operand: Operand, rest: List<Token> }
+
+fn dotted(tokens: List<Token>, rooted: Bool, names: List<String>) -> Result<Operated, Why> =
+  match tokens {
+    [Dot, Word(name), ..rest] -> dotted(rest, rooted, push(names, name)),
+    [Dot, ..] -> Err(Expected("a name after `.`")),
+    _ -> Ok({ operand: Path(rooted, names), rest: tokens }),
+  }
+
+fn operand(tokens: List<Token>) -> Result<Operated, Why> =
+  match tokens {
+    [Quote(text), ..rest] -> Ok({ operand: Written(VStr(text)), rest: rest }),
+    [Number(n), ..rest] -> Ok({ operand: Written(VInt(n)), rest: rest }),
+    [Word("true"), ..rest] -> Ok({ operand: Written(VBool(true)), rest: rest }),
+    [Word("false"), ..rest] -> Ok({ operand: Written(VBool(false)), rest: rest }),
+    [Dot, Word(name), ..rest] -> dotted(rest, true, [name]),
+    [Dot, ..rest] -> Ok({ operand: Path(true, []), rest: rest }),
+    [Word(name), ..rest] -> dotted(rest, false, [name]),
+    _ -> Err(Expected("a path, `.` or a value written out")),
+  }
+
+type Piped = { pipe: Pipe, rest: List<Token> }
+
+fn pipe(name: String, tokens: List<Token>) -> Result<Piped, Why> = {
+  let plain = |p: Pipe| Ok({ pipe: p, rest: tokens });
+  let taking = |made: (Operand) -> Pipe|
+    match operand(tokens) {
+      Err(why) -> Err(why),
+      Ok(read) -> Ok({ pipe: made(read.operand), rest: read.rest }),
+    };
+  match name {
+    "html" -> plain(AsHtml),
+    "url" -> plain(AsUrl),
+    "json" -> plain(AsJson),
+    "upper" -> plain(Upper),
+    "lower" -> plain(Lower),
+    "length" -> plain(Length),
+    "default" -> taking(|spare: Operand| Default(spare)),
+    "join" -> taking(|between: Operand| Join(between)),
+    _ -> Err(UnknownPipe(name)),
+  }
+}
+
+type Piping = { rest: List<Token>, pipes: List<Pipe> }
+
+fn expression(tokens: List<Token>) -> Result<Expr, Why> / {abort.raise} =
+  match operand(tokens) {
+    Err(why) -> Err(why),
+    Ok(read) ->
+      iterate({ rest: read.rest, pipes: [] }, len(tokens) + 1, |s: Piping|
+        match s.rest {
+          [] -> Stop(Ok({ from: read.operand, pipes: s.pipes })),
+          [Bar, Word(name), ..rest] -> match pipe(name, rest) {
+            Err(why) -> Stop(Err(why)),
+            Ok(piped) -> Continue({ rest: piped.rest, pipes: push(s.pipes, piped.pipe) }),
+          },
+          _ -> Stop(Err(Expected("`|` and a pipe's name, or the end of the action"))),
+        }),
+  }
+
+fn action(tokens: List<Token>) -> Result<Action, Why> / {abort.raise} = {
+  let of = |rest: List<Token>, made: (Expr) -> Action|
+    match expression(rest) { Err(why) -> Err(why), Ok(e) -> Ok(made(e)) };
+  match tokens {
+    [] -> Err(Expected("an action between `{{` and `}}`")),
+    [Word("end")] -> Ok(End),
+    [Word("else")] -> Ok(Else),
+    [Word("else"), Word("if"), ..rest] -> of(rest, |e: Expr| ElseIf(e)),
+    [Word("if"), ..rest] -> of(rest, |e: Expr| If(e)),
+    [Word("for"), Word(item), Word("in"), ..rest] -> of(rest, |e: Expr| For(None, item, e)),
+    [Word("for"), Word(key), Comma, Word(item), Word("in"), ..rest] ->
+      of(rest, |e: Expr| For(Some(key), item, e)),
+    [Word("for"), ..] -> Err(Expected("`for item in list` or `for key, item in map`")),
+    [Word("include"), Quote(name)] -> Ok(Includes(name, { from: Path(true, []), pipes: [] })),
+    [Word("include"), Quote(name), ..rest] -> of(rest, |e: Expr| Includes(name, e)),
+    [Word("include"), ..] -> Err(Expected("`include`, a template's name in quotes, and its data")),
+    [Word("end"), ..] | [Word("else"), ..] -> Err(Expected("`}}` after this word")),
+    _ -> of(tokens, |e: Expr| Shows(e)),
+  }
+}
+
+/// A template's text between two actions, or an action, each with the character it starts at.
+type Piece = | Raw(String, Int) | Act(Action, Int)
+
+type Lexing = { at: Int, chars: Int, trim: Bool, pieces: List<Piece> }
+
+/// `chunk` without the blanks at its start where `left` and at its end where `right`, and how
+/// many characters were dropped before it.
+fn trimmed(chunk: Bytes, left: Bool, right: Bool) -> { text: Bytes, dropped: Int } / {abort.raise} = {
+  let n = bytes_len(chunk);
+  let from = if left { scan(chunk, 0, blank()) } else { 0 };
+  let to = if !right { n } else {
+    iterate(n, n + 1, |i: Int|
+      if i > from && bytes_index_of_byte(blank(), bytes_at(chunk, i - 1)) != None {
+        Continue(i - 1)
+      } else { Stop(i) })
+  };
+  { text: bytes_slice(chunk, from, to), dropped: from }
+}
+
+/// The lexing past the text that runs to `to`, where an action opens or the template ends.
+fn texted(src: Bytes, s: Lexing, to: Int, right: Bool) -> Lexing / {abort.raise} = {
+  let chunk = bytes_slice(src, s.at, to);
+  let kept = trimmed(chunk, s.trim, right);
+  {
+    at: to,
+    chars: s.chars + string_len(string_of_bytes(chunk)),
+    trim: false,
+    pieces: if bytes_len(kept.text) == 0 { s.pieces }
+    else { push(s.pieces, Raw(string_of_bytes(kept.text), s.chars + kept.dropped)) },
+  }
+}
+
+fn pieces(src: Bytes) -> List<Piece> / {fault.at, abort.raise} =
+  iterate({ at: 0, chars: 0, trim: false, pieces: [] }, bytes_len(src) + 2, |s: Lexing|
+    match bytes_index_of_from(src, b"{{", s.at) {
+      None -> Stop(texted(src, s, bytes_len(src), false).pieces),
+      Some(open) -> {
+        let trims = peek(src, open + 2) == b'-';
+        let before = texted(src, s, open, trims);
+        let from = if trims { open + 3 } else { open + 2 };
+        let comment = peek(src, from) == b'!';
+        let read = if comment { commented(src, from, open) } else { tokens(src, from, open) };
+        Continue({
+          at: read.next,
+          chars: before.chars + string_len(string_of_bytes(bytes_slice(src, open, read.next))),
+          trim: read.trim,
+          pieces: if comment { before.pieces } else {
+            match action(read.tokens) {
+              Ok(a) -> push(before.pieces, Act(a, before.chars)),
+              Err(why) -> fault.at(before.chars, why),
+            }
+          },
+        })
+      },
+    })
+
+// --- Blocks ---------------------------------------------------------------------
+
+/// What a block being read is: the template itself; an `if`, with its finished arms, and the
+/// condition of the one being read and where it is written; an `if`'s `else`; a `for`'s body; and
+/// a `for`'s `else`.
+type Frame =
+  | Top
+  | Iffing(List<Arm>, Expr, Int)
+  | Elsing(List<Arm>)
+  | Looping(Loop)
+  | Emptying(Loop)
+
+type Open = { frame: Frame, at: Int, nodes: List<Node> }
+
+type Building = { below: List<Open>, top: Open }
+
+fn added(b: Building, n: Node) -> Building = { ..b, top: { ..b.top, nodes: push(b.top.nodes, n) } }
+
+fn opened(b: Building, frame: Frame, at: Int) -> Building / {fault.at} =
+  if len(b.below) >= deepest() { fault.at(at, Nested) }
+  else { { below: push(b.below, b.top), top: { frame: frame, at: at, nodes: [] } } }
+
+fn closed(b: Building, n: Node, at: Int) -> Building / {fault.at} =
+  match last(b.below) {
+    None -> fault.at(at, Unopened("end")),
+    Some(under) ->
+      { below: take(b.below, len(b.below) - 1), top: { ..under, nodes: push(under.nodes, n) } },
+  }
+
+fn acted(b: Building, action: Action, at: Int) -> Building / {fault.at} = {
+  let top = b.top;
+  let arms = |done: List<Arm>, cond: Expr, cond_at: Int|
+    push(done, { cond: cond, at: cond_at, body: top.nodes });
+  let turned = |frame: Frame| { ..b, top: { ..top, frame: frame, nodes: [] } };
+  match action {
+    Shows(e) -> added(b, Show({ value: e, spot: Anywhere, at: at })),
+    Includes(name, e) -> added(b, Include({ name: name, data: e, spot: Anywhere, at: at })),
+    If(e) -> opened(b, Iffing([], e, at), at),
+    For(key, item, over) ->
+      opened(b, Looping({ key: key, item: item, over: over, at: at, body: [], empty: [] }), at),
+    ElseIf(e) -> match top.frame {
+      Iffing(done, cond, cond_at) -> turned(Iffing(arms(done, cond, cond_at), e, at)),
+      _ -> fault.at(at, Unopened("else if")),
+    },
+    Else -> match top.frame {
+      Iffing(done, cond, cond_at) -> turned(Elsing(arms(done, cond, cond_at))),
+      Looping(l) -> turned(Emptying({ ..l, body: top.nodes })),
+      _ -> fault.at(at, Unopened("else")),
+    },
+    End -> match top.frame {
+      Top -> fault.at(at, Unopened("end")),
+      Iffing(done, cond, cond_at) -> closed(b, When(arms(done, cond, cond_at), []), at),
+      Elsing(done) -> closed(b, When(done, top.nodes), at),
+      Looping(l) -> closed(b, Each({ ..l, body: top.nodes }), at),
+      Emptying(l) -> closed(b, Each({ ..l, empty: top.nodes }), at),
+    },
+  }
+}
+
+fn built(pieces: List<Piece>) -> List<Node> / {fault.at} = {
+  let end = fold(
+    pieces,
+    { below: [], top: { frame: Top, at: 0, nodes: [] } },
+    |b: Building, p: Piece|
+      match p {
+        Raw(text, at) ->
+          added(b, Text({ chunk: Plain(text), size: bytes_len(bytes_of_string(text)), at: at })),
+        Act(a, at) -> acted(b, a, at),
+      },
+  );
+  match end.top.frame {
+    Top -> end.top.nodes,
+    Looping(_) | Emptying(_) -> fault.at(end.top.at, Unended("for")),
+    Iffing(_, _, _) | Elsing(_) -> fault.at(end.top.at, Unended("if")),
+  }
+}
+
+// --- As HTML --------------------------------------------------------------------
+
+/// Nodes with their text read as markup and their values placed, and where the reader stands
+/// after them.
+type Settled = { nodes: List<Node>, at: html::Context }
+
+type One = { node: Node, at: html::Context }
+
+/// The hole a value stands in at `from`, or the refusal of a value there.
+fn held(from: html::Context, value: Expr, at: Int) -> html::Hole / {fault.at, abort.raise} =
+  match html::hole(from) {
+    Err(said) -> fault.at(at, Misplaced(said)),
+    Ok(h) -> match last(value.pipes) {
+      Some(AsHtml) -> fault.at(at, EscapedTwice("html")),
+      Some(AsUrl) -> if h.url == None { h } else { fault.at(at, EscapedTwice("url")) },
+      _ -> h,
+    },
+  }
+
+fn settled(nodes: List<Node>, from: html::Context) -> Settled / {fault.at, abort.raise} =
+  fold(nodes, { nodes: [], at: from }, |s: Settled, n: Node| {
+    let one = settled_node(n, s.at);
+    { nodes: push(s.nodes, one.node), at: one.at }
+  })
+
+fn settled_node(n: Node, from: html::Context) -> One / {fault.at, abort.raise} =
+  match n {
+    Text(lit) -> match lit.chunk {
+      Read(r) -> { node: n, at: r.to },
+      Plain(text) -> match html::run(from, text) {
+        Err(stray) -> fault.at(lit.at + stray.offset, Markup(stray.message)),
+        Ok(r) -> { node: Text({ ..lit, chunk: Read(r) }), at: r.to },
+      },
+    },
+    Show(shown) -> {
+      let h = held(from, shown.value, shown.at);
+      { node: Show({ ..shown, spot: In(h) }), at: h.to }
+    },
+    Include(inc) -> {
+      let h = held(from, inc.data, inc.at);
+      { node: Include({ ..inc, spot: In(h) }), at: h.to }
+    },
+    When(arms, otherwise) -> {
+      let bodies = map(arms, |arm: Arm| settled(arm.body, from));
+      let other = settled(otherwise, from);
+      let end = fold(bodies, Some(other.at), |both: Option<html::Context>, s: Settled|
+        match both { None -> None, Some(c) -> html::joined(c, s.at) });
+      match end {
+        None -> fault.at(match arms { [first, ..] -> first.at, [] -> 0 }, Uneven),
+        Some(c) ->
+          {
+            node: When(
+              zip_with(arms, bodies, |arm: Arm, s: Settled| { ..arm, body: s.nodes }),
+              other.nodes,
+            ),
+            at: c,
+          },
+      }
+    },
+    Each(l) -> {
+      let none = settled(l.empty, from);
+      let pass = passed(l, from);
+      match html::joined(pass.at, none.at) {
+        None -> fault.at(l.at, Uneven),
+        Some(end) -> { node: Each({ ..l, body: pass.nodes, empty: none.nodes }), at: end },
+      }
+    },
+  }
+
+/// A loop's body read from a place that is both where the loop starts and where a pass ends,
+/// since a pass is written after either, and that place. The body is read again only where its
+/// first reading ended somewhere its start does not cover, which a second reading then does.
+fn passed(l: Loop, from: html::Context) -> Settled / {fault.at, abort.raise} = {
+  let covers = |around: html::Context, s: Settled|
+    if html::joined(s.at, around) == Some(around) { { nodes: s.nodes, at: around } }
+    else { fault.at(l.at, Uneven) };
+  match html::joined(from, from) {
+    None -> fault.at(l.at, Uneven),
+    Some(start) -> {
+      let once = settled(l.body, start);
+      match html::joined(start, once.at) {
+        None -> fault.at(l.at, Uneven),
+        Some(around) -> if around == start { covers(around, once) }
+        else { covers(around, settled(l.body, around)) },
+      }
+    },
+  }
+}
+
+// --- Reading --------------------------------------------------------------------
+
+fn made(source: String, markup: Bool) -> Template / {fault.at, abort.raise} = {
+  let nodes = built(pieces(bytes_of_string(source)));
+  if !markup { { markup: false, nodes: nodes } } else {
+    let read = settled(nodes, html::reader(true));
+    match html::unfinished(read.at) {
+      Some(said) -> fault.at(string_len(source), Markup(said)),
+      None -> { markup: true, nodes: read.nodes },
+    }
+  }
+}
+
+fn read_as(source: String, markup: Bool) -> Template / {template.refused} =
+  handle {
+    handle {
+      made(source, markup)
+    } with {
+      fault.at(offset, why) -> {
+        let stood = position(source, offset);
+        template.refused({ offset: offset, line: stood.line, column: stood.column, why: why })
+      },
+    }
+  } with {
+    abort.raise(said) -> template.refused({ offset: 0, line: 1, column: 1, why: Defect(said) }),
+  }
+
+/// The template `source` is as text, raising `template.refused` where `parse` answers `Err`.
+pub fn read(source: String) -> Template / {template.refused} = read_as(source, false)
+
+/// The template `source` is as text, or the first place it is none: an action left open, one
+/// that is none of the language's, or a block with no `end`.
+pub fn parse(source: String) -> Result<Template, Refusal> = try { read(source) }
+
+/// The template `source` is as HTML, raising `template.refused` where `parse_html` answers `Err`.
+pub fn read_html(source: String) -> Template / {template.refused} = read_as(source, true)
+
+/// The template `source` is as HTML, or the first place it is none: where `parse` refuses, where
+/// its text is no markup, where a value would stand where no escaping makes it text, and where
+/// branches leave the markup at different places.
+pub fn parse_html(source: String) -> Result<Template, Refusal> = try { read_html(source) }
+
+// --- Data -----------------------------------------------------------------------
+
+/// A URL the program vouches for: written into an HTML template's URL, it may give the URL any
+/// scheme. It is still percent-encoded, and anywhere else it is its text.
+pub opaque type TrustedUrl = | TrustedUrl(String)
+
+/// `url` as one the program vouches for: one it wrote or has checked, never text that reached it
+/// from outside as it came.
+pub fn trusted_url(url: String) -> TrustedUrl = TrustedUrl(url)
+
+/// The data a JSON document is: an object as a map of its members, an array as a list, a whole
+/// number as an `Int` and any other as a `Decimal`, and `null` as `None`.
+pub fn of_json(j: Json) -> Value =
+  match j {
+    json::Null -> VCtor("None", []),
+    json::Bool(b) -> VBool(b),
+    json::Number(d) -> match int_of_decimal(d, Down) {
+      Some(n) -> if decimal_of_int(n) == d { VInt(n) } else { VDecimal(d) },
+      None -> VDecimal(d),
+    },
+    json::Str(s) -> VStr(s),
+    json::Array(items) -> VList(map(items, of_json)),
+    json::Object(members) ->
+      VMap(
+        map(map_entries(members), |m: { key: String, value: Json }|
+          { key: VStr(m.key), value: of_json(m.value) }),
+      ),
+  }
+
+/// What a path finds: a value; a `None`; or nothing of that name.
+type Looked = | Held(Value) | Vacant | Unknown
+
+type Bound = { name: String, value: Value }
+
+type Scope = { data: Value, bound: List<Bound> }
+
+fn present(v: Value) -> Looked =
+  match v { VCtor("Some", [held]) -> present(held), VCtor("None", []) -> Vacant, _ -> Held(v) }
+
+fn member(of: Looked, name: String) -> Looked =
+  match of {
+    Held(VRecord(fields)) -> match value::field_named(fields, name) {
+      Some(v) -> present(v),
+      None -> Unknown,
+    },
+    Held(VMap(entries)) -> match find(entries, |e: Entry|
+        match e.key { VStr(key) -> key == name, _ -> false }) {
+      Some(e) -> present(e.value),
+      None -> Unknown,
+    },
+    Held(_) -> Unknown,
+    _ -> of,
+  }
+
+fn looked(scope: Scope, operand: Operand) -> Looked =
+  match operand {
+    Written(v) -> Held(v),
+    Path(_, []) -> present(scope.data),
+    Path(rooted, [first, ..rest]) -> match if rooted { None }
+      else { find_last(scope.bound, |b: Bound| b.name == first) } {
+      Some(b) -> fold(rest, present(b.value), member),
+      None -> fold(rest, member(present(scope.data), first), member),
+    },
+  }
+
+fn spelled(operand: Operand) -> String =
+  match operand {
+    Written(v) -> value::render(v),
+    Path(rooted, names) -> (if rooted || len(names) == 0 { "." } else { "" }) ++ join(names, "."),
+  }
+
+fn kind(v: Value) -> String =
+  match v {
+    VStr(_) | VShown(_) | VChar(_) -> "a text",
+    VInt(_) | VDecimal(_) | VFloat(_) | VFixed(_, _) -> "a number",
+    VBool(_) -> "a boolean",
+    VList(_) | VArray(_) -> "a list",
+    VMap(_) -> "a map",
+    VRecord(_) -> if html::reflected(v) == None { "a record" } else { "markup" },
+    VCtor(name, _) -> "a `" ++ value::ctor_name(name) ++ "`",
+    VBytes(_) -> "bytes",
+    VUnit -> "`()`",
+    _ -> "a value no template writes",
+  }
+
+/// What a value is written as, or `None` for one that is no text.
+fn text(v: Value) -> Option<String> =
+  match v {
+    VStr(s) | VShown(s) -> Some(s),
+    VInt(n) -> Some(int_to_string(n)),
+    VBool(b) -> Some(if b { "true" } else { "false" }),
+    VDecimal(d) -> Some(decimal_to_string(d)),
+    VFloat(f) -> Some(float_to_string(f)),
+    VChar(c) -> Some(string_of_chars([c])),
+    VCtor("std.template.TrustedUrl", [VStr(url)]) -> Some(url),
+    _ -> None,
+  }
+
+// --- Filling ----------------------------------------------------------------
+
+type Env = { partials: Map<String, Template>, limits: Limits, partial: Option<String> }
+
+/// What is written to: the pieces of a text, or the draft of a page.
+type Sink = | Words(List<Bytes>) | Page(html::Draft)
+
+type Filling = { out: Sink, size: Int, passes: Int }
+
+/// What an action writes: characters, or markup.
+type Wrote = | Characters(String) | Fragment(Html)
+
+fn fail<a>(env: Env, at: Int, why: Why) -> a / {template.failed} =
+  template.failed({ partial: env.partial, offset: at, why: why })
+
+fn crossed<a>(env: Env, at: Int) -> a / {template.failed} =
+  fail(env, at, Defect("a template was written where it was not read to be"))
+
+fn needed(l: Looked, e: Expr, env: Env, at: Int) -> Value / {template.failed} =
+  match l { Held(v) -> v, _ -> fail(env, at, Missing(spelled(e.from))) }
+
+fn text_of(v: Value, env: Env, at: Int) -> String / {template.failed} =
+  match text(v) { Some(s) -> s, None -> fail(env, at, WrongKind("a text", kind(v))) }
+
+fn json_of(v: Value, env: Env, at: Int) -> Json / {template.failed} =
+  match v {
+    VStr(s) | VShown(s) -> json::Str(s),
+    VChar(c) -> json::Str(string_of_chars([c])),
+    VInt(n) -> json::int(n),
+    VDecimal(d) -> json::Number(d),
+    VBool(b) -> json::Bool(b),
+    VFloat(f) -> match decimal_of_float(f) {
+      Some(d) -> json::Number(d),
+      None -> fail(env, at, WrongKind("a number JSON writes", "one that is not finite")),
+    },
+    VList(items) | VArray(items) -> json::Array(map(items, |x: Value| json_of(x, env, at))),
+    VRecord(fields) ->
+      json::object(map(fields, |f: Field| { key: f.name, value: json_of(f.value, env, at) })),
+    VMap(entries) ->
+      json::object(
+        map(entries, |e: Entry|
+          {
+            key: match e.key {
+              VStr(key) -> key,
+              other -> fail(env, at, WrongKind("a text for a JSON object's key", kind(other))),
+            },
+            value: json_of(e.value, env, at),
+          }),
+      ),
+    VCtor("Some", [held]) -> json_of(held, env, at),
+    VCtor("None", []) -> json::Null,
+    VCtor("std.template.TrustedUrl", [VStr(url)]) -> json::Str(url),
+    _ -> fail(env, at, WrongKind("data JSON writes", kind(v))),
+  }
+
+fn piped(
+  l: Looked,
+  p: Pipe,
+  e: Expr,
+  scope: Scope,
+  env: Env,
+  at: Int,
+) -> Looked / {template.failed, abort.raise} = {
+  let texted = |v: Value| text_of(v, env, at);
+  let given = |from: Looked| needed(from, e, env, at);
+  match p {
+    Default(spare) -> match l { Held(_) -> l, _ -> looked(scope, spare) },
+    AsHtml -> Held(VStr(html::escape(texted(given(l))))),
+    AsUrl -> Held(VStr(url_encode(texted(given(l))))),
+    AsJson -> match l {
+      Vacant -> Held(VStr("null")),
+      _ -> Held(VStr(json::to_string(json_of(given(l), env, at)))),
+    },
+    Upper -> Held(VStr(to_upper(texted(given(l))))),
+    Lower -> Held(VStr(to_lower(texted(given(l))))),
+    Length -> match given(l) {
+      VStr(s) -> Held(VInt(string_len(s))),
+      VList(items) | VArray(items) -> Held(VInt(len(items))),
+      VMap(entries) -> Held(VInt(len(entries))),
+      other -> fail(env, at, WrongKind("a text, a list or a map", kind(other))),
+    },
+    Join(between) -> match given(l) {
+      VList(items) | VArray(items) ->
+        Held(
+          VStr(
+            join(
+              map(items, |x: Value| texted(given(present(x)))),
+              texted(given(looked(scope, between))),
+            ),
+          ),
+        ),
+      other -> fail(env, at, WrongKind("a list", kind(other))),
+    },
+  }
+}
+
+fn valued(e: Expr, scope: Scope, env: Env, at: Int) -> Looked / {template.failed, abort.raise} =
+  fold(e.pipes, looked(scope, e.from), |l: Looked, p: Pipe| piped(l, p, e, scope, env, at))
+
+fn holds(l: Looked, e: Expr, env: Env, at: Int) -> Bool / {template.failed} =
+  match l {
+    Unknown -> fail(env, at, Missing(spelled(e.from))),
+    Vacant -> false,
+    Held(VBool(b)) -> b,
+    Held(VStr("")) | Held(VList([])) | Held(VArray([])) | Held(VMap([])) -> false,
+    Held(_) -> true,
+  }
+
+type Pass = { key: Value, item: Value }
+
+fn passes(l: Looked, e: Expr, env: Env, at: Int) -> List<Pass> / {template.failed} =
+  match needed(l, e, env, at) {
+    VList(items) | VArray(items) ->
+      map(enumerate(items), |x: { index: Int, value: Value }|
+        { key: VInt(x.index), item: x.value }),
+    VMap(entries) -> map(entries, |x: Entry| { key: x.key, item: x.value }),
+    other -> fail(env, at, WrongKind("a list or a map", kind(other))),
+  }
+
+fn bound(scope: Scope, l: Loop, p: Pass) -> Scope = {
+  let keyed = match l.key {
+    Some(name) -> push(scope.bound, { name: name, value: p.key }),
+    None -> scope.bound,
+  };
+  { ..scope, bound: push(keyed, { name: l.item, value: p.item }) }
+}
+
+fn counted(f: Filling, more: Int, env: Env, at: Int) -> Filling / {template.failed} =
+  if f.size + more > env.limits.output { fail(env, at, TooLong) }
+  else { { ..f, size: f.size + more } }
+
+fn stepped(f: Filling, env: Env, at: Int) -> Filling / {template.failed} =
+  if f.passes >= env.limits.iterations { fail(env, at, TooManyPasses) }
+  else { { ..f, passes: f.passes + 1 } }
+
+fn sink(markup: Bool) -> Sink = if markup { Page(html::draft(true)) } else { Words([]) }
+
+fn finished(out: Sink, env: Env, at: Int) -> Wrote / {template.failed, abort.raise} =
+  match out {
+    Words(parts) -> Characters(string_of_bytes(bytes_concat_all(parts))),
+    Page(d) -> match html::finish(d) { Some(page) -> Fragment(page), None -> crossed(env, at) },
+  }
+
+fn literal(lit: Lit, f: Filling, env: Env) -> Filling / {template.failed} = {
+  let room = counted(f, lit.size, env, lit.at);
+  match ((lit.chunk, room.out)) {
+    (Plain(written), Words(parts)) -> { ..room, out: Words(push(parts, bytes_of_string(written))) },
+    (Read(r), Page(d)) -> match html::write(d, r) {
+      Some(next) -> { ..room, out: Page(next) },
+      None -> crossed(env, lit.at),
+    },
+    _ -> crossed(env, lit.at),
+  }
+}
+
+/// `w` written at `spot`: into a text as it is, and into a page as its hole reads it, a URL's
+/// part percent-encoded and refused where it would name a scheme no value may.
+fn put(
+  w: Wrote,
+  trusted: Bool,
+  spot: Spot,
+  f: Filling,
+  env: Env,
+  at: Int,
+) -> Filling / {template.failed, abort.raise} =
+  match f.out {
+    Words(parts) ->
+      {
+        ..f,
+        out: Words(
+          push(
+            parts,
+            bytes_of_string(match w { Characters(s) -> s, Fragment(page) -> html::render(page) }),
+          ),
+        ),
+      },
+    Page(d) -> match spot {
+      Anywhere -> crossed(env, at),
+      In(h) -> {
+        let value = match ((h.url, w)) {
+          (None, Characters(s)) -> html::text(s),
+          (None, Fragment(page)) -> page,
+          (Some(_), Fragment(_)) -> fail(env, at, WrongKind("the text of a URL", "markup")),
+          (Some(part), Characters(s)) -> match html::url_value(part, s, trusted) {
+            Ok(url) -> html::text(url),
+            Err(scheme) -> fail(env, at, UnsafeUrl(scheme)),
+          },
+        };
+        match html::place(d, h, value) {
+          Some(next) -> { ..f, out: Page(next) },
+          None -> crossed(env, at),
+        }
+      },
+    },
+  }
+
+/// A value as an action writes it: an `Html` as the markup it is, and anything else as its text.
+fn shown(
+  v: Value,
+  spot: Spot,
+  f: Filling,
+  env: Env,
+  at: Int,
+) -> Filling / {template.failed, abort.raise} =
+  match html::reflected(v) {
+    Some(page) -> put(Fragment(page), false, spot, counted(f, html::size(page), env, at), env, at),
+    None -> {
+      let written = text_of(v, env, at);
+      let trusted = match v { VCtor("std.template.TrustedUrl", _) -> true, _ -> false };
+      put(
+        Characters(written),
+        trusted,
+        spot,
+        counted(f, bytes_len(bytes_of_string(written)), env, at),
+        env,
+        at,
+      )
+    },
+  }
+
+type Choosing = { done: Bool, filling: Filling }
+
+fn filled(
+  n: Node,
+  scope: Scope,
+  env: Env,
+  depth: Int,
+  f: Filling,
+) -> Filling / {template.failed, abort.raise} =
+  match n {
+    Text(lit) -> literal(lit, f, env),
+    Show(s) ->
+      shown(needed(valued(s.value, scope, env, s.at), s.value, env, s.at), s.spot, f, env, s.at),
+    When(arms, otherwise) -> {
+      let chosen = fold(arms, { done: false, filling: f }, |c: Choosing, arm: Arm|
+        if c.done || !holds(valued(arm.cond, scope, env, arm.at), arm.cond, env, arm.at) { c }
+        else {
+          {
+            done: true,
+            filling: fold(arm.body, c.filling, |a: Filling, m: Node|
+              filled(m, scope, env, depth, a)),
+          }
+        });
+      if chosen.done { chosen.filling }
+      else { fold(otherwise, f, |a: Filling, m: Node| filled(m, scope, env, depth, a)) }
+    },
+    Each(l) -> match passes(valued(l.over, scope, env, l.at), l.over, env, l.at) {
+      [] -> fold(l.empty, f, |a: Filling, m: Node| filled(m, scope, env, depth, a)),
+      each ->
+        fold(each, f, |a: Filling, p: Pass| {
+          let inner = bound(scope, l, p);
+          fold(l.body, stepped(a, env, l.at), |b: Filling, m: Node| filled(m, inner, env, depth, b))
+        }),
+    },
+    Include(inc) -> if depth <= 0 { fail(env, inc.at, TooDeep) } else {
+      match map_get(env.partials, inc.name) {
+        None -> fail(env, inc.at, NoPartial(inc.name)),
+        Some(t) -> {
+          let data = needed(valued(inc.data, scope, env, inc.at), inc.data, env, inc.at);
+          let within: Env = { ..env, partial: Some(inc.name) };
+          let inner = fold(
+            t.nodes,
+            { ..stepped(f, env, inc.at), out: sink(t.markup) },
+            |a: Filling, m: Node| filled(m, { data: data, bound: [] }, within, depth - 1, a),
+          );
+          put(
+            finished(inner.out, env, inc.at),
+            false,
+            inc.spot,
+            { ..inner, out: f.out },
+            env,
+            inc.at,
+          )
+        },
+      }
+    },
+  }
+
+fn written(
+  t: Template,
+  data: Value,
+  partials: Map<String, Template>,
+  limits: Limits,
+) -> Wrote / {template.failed, abort.raise} = {
+  let env: Env = { partials: partials, limits: limits, partial: None };
+  let end = fold(t.nodes, { out: sink(t.markup), size: 0, passes: 0 }, |f: Filling, n: Node|
+    filled(n, { data: data, bound: [] }, env, min(limits.depth, deepest()), f));
+  finished(end.out, env, 0)
+}
+
+fn broken(said: String) -> Failure = { partial: None, offset: 0, why: Defect(said) }
+
+/// The text `t` is with `data` in its places and each `include` filled from `partials`, raising
+/// `template.failed` where `render` answers `Err`. An HTML template's text is its document's.
+pub fn fill(
+  t: Template,
+  data: Value,
+  partials: Map<String, Template>,
+  limits: Limits,
+) -> String / {template.failed} =
+  handle {
+    match written(t, data, partials, limits) {
+      Characters(s) -> s,
+      Fragment(page) -> html::render(page),
+    }
+  } with {
+    abort.raise(said) -> template.failed(broken(said)),
+  }
+
+/// The text `t` is with `data` in its places, or why it has none: a path nothing stands at, a
+/// value of the wrong kind for its use, an `include` of no template handed in, a value that
+/// would name a URL's scheme, or a limit passed.
+pub fn render(
+  t: Template,
+  data: Value,
+  partials: Map<String, Template>,
+  limits: Limits,
+) -> Result<String, Failure> = try { fill(t, data, partials, limits) }
+
+/// The markup `t` is with `data` in its places, raising `template.failed` where `render_html`
+/// answers `Err`. A template read as text is all characters: its filling, escaped.
+pub fn fill_html(
+  t: Template,
+  data: Value,
+  partials: Map<String, Template>,
+  limits: Limits,
+) -> Html / {template.failed} =
+  handle {
+    match written(t, data, partials, limits) {
+      Characters(s) -> html::text(s),
+      Fragment(page) -> page,
+    }
+  } with {
+    abort.raise(said) -> template.failed(broken(said)),
+  }
+
+/// The markup `t` is with `data` in its places, or why it has none, on `render`'s terms.
+pub fn render_html(
+  t: Template,
+  data: Value,
+  partials: Map<String, Template>,
+  limits: Limits,
+) -> Result<Html, Failure> = try { fill_html(t, data, partials, limits) }
+
+// --- Tests ------------------------------------------------------------------
+
+type Line = { sku: String, qty: Int, note: Option<String> }
+
+type Order = {
+  id: Int,
+  customer: String,
+  lines: List<Line>,
+  paid: Bool,
+  due: Bool,
+  tags: List<String>,
+  none: List<String>,
+  totals: Map<String, Int>,
+  vip: Option<String>,
+  rate: Decimal,
+}
+
+fn order() -> Value = {
+  let o: Order = {
+    id: 7,
+    customer: "Ann & Bob",
+    lines: [{ sku: "a1", qty: 2, note: Some("gift") }, { sku: "b2", qty: 1, note: None }],
+    paid: true,
+    due: false,
+    tags: ["x", "y"],
+    none: [],
+    totals: #{"tax": 2, "net": 10},
+    vip: None,
+    rate: 1.50m,
+  };
+  reflect(o)
+}
+
+/// The templates an `include` in these tests may name.
+fn partials() -> Map<String, Template> / {abort.raise} = {
+  let named = |name: String, source: String|
+    {
+      key: name,
+      value: match parse(source) { Ok(t) -> t, Err(r) -> panic(name ++ ": " ++ explain(r.why)) },
+    };
+  map_of_entries([
+    named("line", "{{ sku }}({{ qty }})"),
+    named("who", "{{ customer }}"),
+    named("word", "[{{ . }}]"),
+    named("again", "x{{ include \"again\" }}"),
+  ])
+}
+
+fn over(source: String, data: Value) -> Result<String, Failure> / {abort.raise} =
+  match parse(source) {
+    Ok(t) -> render(t, data, partials(), default_limits()),
+    Err(r) -> panic("refused: " ++ explain(r.why)),
+  }
+
+type Filled = { source: String, text: String }
+
+fn fillings() -> List<Filled> =
+  [
+    { source: "Hello, {{ customer }}!", text: "Hello, Ann & Bob!" },
+    { source: "{{id}} {{ paid }} {{ rate }} {{ .id }}", text: "7 true 1.50 7" },
+    { source: "{{ lines | length }} {{ customer | length }} {{ totals | length }}", text: "2 9 2" },
+    { source: "{{ for l in lines }}{{ l.sku }}x{{ l.qty }};{{ end }}", text: "a1x2;b2x1;" },
+    { source: "{{ for i, l in lines }}{{ i }}:{{ l.sku }} {{ end }}", text: "0:a1 1:b2 " },
+    { source: "{{ for k, v in totals }}{{ k }}={{ v }},{{ end }}", text: "net=10,tax=2," },
+    { source: "{{ for v in totals }}{{ v }} {{ end }}", text: "10 2 " },
+    { source: "{{ for t in none }}x{{ else }}nothing{{ end }}", text: "nothing" },
+    { source: "{{ for t in tags }}{{ t }}{{ else }}nothing{{ end }}", text: "xy" },
+    { source: "{{ if paid }}yes{{ else }}no{{ end }}", text: "yes" },
+    { source: "{{ if due }}yes{{ end }}|{{ if due }}yes{{ else }}no{{ end }}", text: "|no" },
+    { source: "{{ if vip }}vip{{ else if paid }}paid{{ else }}-{{ end }}", text: "paid" },
+    {
+      source: "{{ if none }}some{{ else }}none{{ end }} {{ if tags }}some{{ end }}",
+      text: "none some",
+    },
+    { source: "{{ if id }}id{{ end }}{{ if customer }} named{{ end }}", text: "id named" },
+    { source: "{{ if \"\" }}a{{ else if 0 }}b{{ end }}", text: "b" },
+    { source: "{{ vip | default \"no\" }} {{ nope | default id }}", text: "no 7" },
+    { source: "{{ if nope | default false }}a{{ else }}b{{ end }}", text: "b" },
+    { source: "{{ tags | join \", \" }}|{{ none | join \",\" }}", text: "x, y|" },
+    { source: "{{ customer | upper }} {{ customer | lower }}", text: "ANN & BOB ann & bob" },
+    { source: "{{ customer | html }} {{ customer | url }}", text: "Ann &amp; Bob Ann%20%26%20Bob" },
+    {
+      source: "{{ totals | json }} {{ tags | json }} {{ vip | json }}",
+      text: "{\"net\":10,\"tax\":2} [\"x\",\"y\"] null",
+    },
+    {
+      source: "{{ lines | json }}",
+      text: "[{\"note\":\"gift\",\"qty\":2,\"sku\":\"a1\"},{\"note\":null,\"qty\":1,\"sku\":\"b2\"}]",
+    },
+    {
+      source: "{{ \"{{\" }} {{ 12 }} {{ true }} {{ -3 }} {{ \"a\\\"b\\\\\\n\" }}",
+      text: "{{ 12 true -3 a\"b\\\n",
+    },
+    { source: "a \n {{- id -}} \n b", text: "a7b" },
+    { source: "a {{ id -}}  b {{- id }} c", text: "a 7b7 c" },
+    { source: "{{! a note }}x{{! }} y {{-! gone -}} z", text: "x yz" },
+    {
+      source: "{{ for l in lines }}{{ for t in tags }}{{ l.sku }}{{ t }} {{ end }}{{ end }}",
+      text: "a1x a1y b2x b2y ",
+    },
+    { source: "{{ for id in tags }}{{ id }}{{ .id }} {{ end }}{{ id }}", text: "x7 y7 7" },
+    {
+      source: "{{ for l in lines }}{{ l.note | default \"-\" }}{{ if l.note }}!{{ end }} {{ end }}",
+      text: "gift! - ",
+    },
+    {
+      source: "{{ for l in lines }}{{ include \"line\" l }} {{ end }}{{ include \"who\" }}",
+      text: "a1(2) b2(1) Ann & Bob",
+    },
+    {
+      source: "{{ include \"word\" customer | upper }}{{ include \"word\" 3 }}",
+      text: "[ANN & BOB][3]",
+    },
+    { source: "no action } here { at all }}", text: "no action } here { at all }}" },
+    { source: "", text: "" },
+  ]
+
+test "`{c.source}` is filled as the language says" for c: Filled in fillings() {
+  assert_eq(over(c.source, order()), Ok(c.text))
+}
+
+type Failed = { source: String, offset: Int, why: Why }
+
+fn failings() -> List<Failed> =
+  [
+    { source: "{{ nope }}", offset: 0, why: Missing("nope") },
+    { source: "ab{{ customer.first }}", offset: 2, why: Missing("customer.first") },
+    { source: "\u{e9}{{ .lines.sku }}", offset: 1, why: Missing(".lines.sku") },
+    { source: "{{ vip }}", offset: 0, why: Missing("vip") },
+    { source: "{{ vip | upper }}", offset: 0, why: Missing("vip") },
+    { source: "{{ nope | default gone }}", offset: 0, why: Missing("nope") },
+    { source: "{{ lines }}", offset: 0, why: WrongKind("a text", "a list") },
+    { source: "{{ totals }}", offset: 0, why: WrongKind("a text", "a map") },
+    { source: "{{ . }}", offset: 0, why: WrongKind("a text", "a record") },
+    {
+      source: "{{ for c in customer }}{{ end }}",
+      offset: 0,
+      why: WrongKind("a list or a map", "a text"),
+    },
+    {
+      source: "{{ for c in . }}{{ end }}",
+      offset: 0,
+      why: WrongKind("a list or a map", "a record"),
+    },
+    { source: "{{ for c in nope }}{{ end }}", offset: 0, why: Missing("nope") },
+    { source: "{{ for c in vip }}{{ else }}{{ end }}", offset: 0, why: Missing("vip") },
+    { source: "x{{ if nope }}x{{ end }}", offset: 1, why: Missing("nope") },
+    { source: "{{ if due }}{{ else if nope }}{{ end }}", offset: 12, why: Missing("nope") },
+    { source: "{{ include \"gone\" }}", offset: 0, why: NoPartial("gone") },
+    { source: "{{ include \"who\" nope }}", offset: 0, why: Missing("nope") },
+    { source: "{{ tags | upper }}", offset: 0, why: WrongKind("a text", "a list") },
+    { source: "{{ id | join \",\" }}", offset: 0, why: WrongKind("a list", "a number") },
+    { source: "{{ lines | join \",\" }}", offset: 0, why: WrongKind("a text", "a record") },
+    {
+      source: "{{ id | length }}",
+      offset: 0,
+      why: WrongKind("a text, a list or a map", "a number"),
+    },
+    { source: "{{ include \"again\" }}", offset: 1, why: TooDeep },
+  ]
+
+test "`{c.source}` has no filling, and says why" for c: Failed in failings() {
+  let failed = over(c.source, order());
+  assert_eq(
+    failed,
+    Err({
+      partial: match failed { Err(f) -> f.partial, Ok(_) -> None },
+      offset: c.offset,
+      why: c.why,
+    }),
+  )
+}
+
+test "a failure in an included template names it, and where in its own text" {
+  assert_eq(
+    over("{{ for l in lines }}{{ include \"line\" l.note }}{{ end }}", order()),
+    Err({ partial: Some("line"), offset: 0, why: Missing("sku") }),
+  );
+  assert_eq(
+    over("{{ include \"again\" }}", order()),
+    Err({ partial: Some("again"), offset: 1, why: TooDeep }),
+  )
+}
+
+test "a filling stops at each of its limits" {
+  let t = match parse("{{ for a in tags }}{{ for b in tags }}ab{{ end }}{{ end }}") {
+    Ok(t) -> t,
+    Err(_) -> panic("refused"),
+  };
+  let within = |limits: Limits|
+    match render(t, order(), partials(), limits) { Ok(text) -> Ok(text), Err(f) -> Err(f.why) };
+  assert_eq(within({ output: 8, iterations: 6, depth: 0 }), Ok("abababab"));
+  assert_eq(within({ output: 7, iterations: 6, depth: 0 }), Err(TooLong));
+  assert_eq(within({ output: 8, iterations: 5, depth: 0 }), Err(TooManyPasses));
+  let looping = match parse("{{ include \"who\" }}{{ include \"who\" }}") {
+    Ok(t) -> t,
+    Err(_) -> panic("refused"),
+  };
+  let included = |limits: Limits|
+    match render(looping, order(), partials(), limits) {
+      Ok(text) -> Ok(text),
+      Err(f) -> Err(f.why),
+    };
+  assert_eq(included({ output: 18, iterations: 2, depth: 1 }), Ok("Ann & BobAnn & Bob"));
+  assert_eq(included({ output: 17, iterations: 2, depth: 1 }), Err(TooLong));
+  assert_eq(included({ output: 18, iterations: 1, depth: 1 }), Err(TooManyPasses));
+  assert_eq(included({ output: 18, iterations: 2, depth: 0 }), Err(TooDeep));
+  // A template that includes itself ends at the deepest an include stands, whatever was asked.
+  assert_eq(
+    match parse("{{ include \"again\" }}") {
+      Ok(endless) ->
+        render(endless, order(), partials(), { output: 1000, iterations: 1000, depth: 1000000 }),
+      Err(_) -> panic("refused"),
+    },
+    Err({ partial: Some("again"), offset: 1, why: TooDeep }),
+  )
+}
+
+type Refused = { source: String, offset: Int, why: Why }
+
+fn refusals() -> List<Refused> =
+  [
+    { source: "a {{ b", offset: 2, why: Unclosed },
+    { source: "a {{ \"b }}", offset: 2, why: Unclosed },
+    { source: "{{! b", offset: 0, why: Unclosed },
+    { source: "{{ }}", offset: 0, why: Expected("an action between `{{` and `}}`") },
+    { source: "{{-  -}}", offset: 0, why: Expected("an action between `{{` and `}}`") },
+    { source: "{{ a | nope }}", offset: 0, why: UnknownPipe("nope") },
+    { source: "x{{ end }}", offset: 1, why: Unopened("end") },
+    { source: "{{ else }}", offset: 0, why: Unopened("else") },
+    { source: "{{ for a in b }}{{ else if c }}{{ end }}", offset: 16, why: Unopened("else if") },
+    { source: "{{ if a }}{{ else }}{{ else }}{{ end }}", offset: 20, why: Unopened("else") },
+    { source: "{{ if a }}x", offset: 0, why: Unended("if") },
+    { source: "{{ if a }}{{ for b in c }}{{ else }}", offset: 10, why: Unended("for") },
+    { source: "{{ if a }}{{ else }}", offset: 0, why: Unended("if") },
+    {
+      source: "{{ for a b }}",
+      offset: 0,
+      why: Expected("`for item in list` or `for key, item in map`"),
+    },
+    {
+      source: "{{ a b }}",
+      offset: 0,
+      why: Expected("`|` and a pipe's name, or the end of the action"),
+    },
+    { source: "{{ a. }}", offset: 0, why: Expected("a name after `.`") },
+    { source: "{{ a | default }}", offset: 0, why: Expected("a path, `.` or a value written out") },
+    { source: "{{ | upper }}", offset: 0, why: Expected("a path, `.` or a value written out") },
+    { source: "{{ end x }}", offset: 0, why: Expected("`}}` after this word") },
+    {
+      source: "{{ include who }}",
+      offset: 0,
+      why: Expected("`include`, a template's name in quotes, and its data"),
+    },
+    {
+      source: "\u{e9}{{ a $ }}",
+      offset: 6,
+      why: Expected("a name, a value written out, `.`, `|`, `,` or `}}`"),
+    },
+    {
+      source: "{{ \"a\\q\" }}",
+      offset: 5,
+      why: Expected("`\\\\`, `\\\"`, `\\n` or `\\t` after a `\\`"),
+    },
+    { source: "{{ 99999999999999999999 }}", offset: 3, why: Expected("a number an `Int` holds") },
+  ]
+
+test "`{c.source}` is refused where it is no template" for c: Refused in refusals() {
+  let place = position(c.source, c.offset);
+  assert_eq(
+    parse(c.source),
+    Err({ offset: c.offset, line: place.line, column: place.column, why: c.why }),
+  );
+  assert(match parse_html(c.source) { Err(_) -> true, Ok(_) -> false })
+}
+
+test "a refusal stands at a line and a column of the template's text" {
+  assert_eq(
+    parse("line one\n  {{ end }}"),
+    Err({ offset: 11, line: 2, column: 3, why: Unopened("end") }),
+  );
+  assert_eq(position("a\n\u{e9}b\nc", 5), { line: 3, column: 1 });
+  assert_eq(position("abc", 99), { line: 1, column: 4 });
+  assert_eq(position("", 0), { line: 1, column: 1 });
+  let nested = |n: Int|
+    join(map(range(0, n), |_: Int| "{{ if a }}"), "")
+      ++ join(map(range(0, n), |_: Int| "{{ end }}"), "");
+  assert(match parse(nested(deepest())) { Ok(_) -> true, Err(_) -> false });
+  assert_eq(
+    parse(nested(deepest() + 1)),
+    Err({ offset: 10 * deepest(), line: 1, column: 10 * deepest() + 1, why: Nested }),
+  )
+}
+
+test "a JSON document is data: its objects maps, its arrays lists and its null a `None`" {
+  let data = match json::parse_string(
+      "{\"name\":\"Ann\",\"n\":3,\"half\":0.5,\"on\":true,\"gone\":null,\"tags\":[\"x\",\"y\"],\"at\":{\"city\":\"Oslo\"}}",
+    ) {
+    Ok(j) -> of_json(j),
+    Err(_) -> panic("no JSON"),
+  };
+  assert_eq(
+    over(
+      "{{ name }} {{ n }} {{ half }} {{ on }} {{ gone | default \"-\" }} {{ at.city }} {{ tags | join \"+\" }}",
+      data,
+    ),
+    Ok("Ann 3 0.5 true - Oslo x+y"),
+  );
+  assert_eq(over("{{ for k, v in at }}{{ k }}:{{ v }}{{ end }}", data), Ok("city:Oslo"));
+  assert_eq(over("{{ if gone }}a{{ else }}b{{ end }}", data), Ok("b"));
+  assert_eq(over("{{ . | json }}", of_json(json::int(3))), Ok("3"));
+  assert_eq(of_json(json::Null), reflect(vacant()));
+  assert_eq(
+    over("{{ pieces }}", of_json(json::object([{ key: "pieces", value: json::Str("<b>") }]))),
+    Ok("<b>"),
+  )
+}
+
+fn vacant() -> Option<Int> = None
+
+law "a text with no action is its own filling" =
+  agrees(|h: html::Hostile| over(without_actions(h), VUnit), |h: html::Hostile|
+    Ok(without_actions(h)))
+
+fn without_actions(h: html::Hostile) -> String / {abort.raise} =
+  string::replace(html::hostile_text(h), "{", "(")
+
+// --- Tests as HTML ------------------------------------------------------------
+
+type Link = { label: String, kind: String }
+
+type Page = {
+  name: String,
+  url: String,
+  q: String,
+  js: String,
+  vouched: TrustedUrl,
+  safe: Html,
+  n: Int,
+  on: Bool,
+  off: Bool,
+  links: List<Link>,
+}
+
+fn page() -> Value = {
+  let p: Page = {
+    name: "<b>O'Neil & \"Co\"</b>",
+    url: "/a b?c=d&e",
+    q: "a b&c=/",
+    js: "JavaScript:alert(1)",
+    vouched: trusted_url("javascript:void(0)"),
+    safe: html::fragment([html::text("1 < 2")]),
+    n: 3,
+    on: true,
+    off: false,
+    links: [{ label: "A&B", kind: "x\" onclick=\"y" }, { label: "<C>", kind: "z" }],
+  };
+  reflect(p)
+}
+
+fn page_over(source: String, data: Value) -> Result<String, Failure> / {abort.raise} =
+  match parse_html(source) {
+    Ok(t) -> render(t, data, html_partials(), default_limits()),
+    Err(r) -> panic("refused: " ++ explain(r.why)),
+  }
+
+fn html_partials() -> Map<String, Template> / {abort.raise} =
+  map_of_entries([
+    {
+      key: "link",
+      value: match parse_html("<a class=\"{{ kind }}\">{{ label }}</a>") {
+        Ok(t) -> t,
+        Err(r) -> panic(explain(r.why)),
+      },
+    },
+    {
+      key: "plain",
+      value: match parse("<{{ label }}>") { Ok(t) -> t, Err(r) -> panic(explain(r.why)) },
+    },
+  ])
+
+/// The places a value stands in, after the contexts Go's `html/template` tells apart, each with
+/// what this module writes there.
+fn placings() -> List<Filled> =
+  [
+    {
+      source: "<p>{{ name }}</p>",
+      text: "<p>&lt;b&gt;O&#39;Neil &amp; &quot;Co&quot;&lt;/b&gt;</p>",
+    },
+    {
+      source: "<p title=\"{{ name }}\">x</p>",
+      text: "<p title=\"&lt;b&gt;O&#39;Neil &amp; &quot;Co&quot;&lt;/b&gt;\">x</p>",
+    },
+    {
+      source: "<p title='a {{ name }} b'>x</p>",
+      text: "<p title='a &lt;b&gt;O&#39;Neil &amp; &quot;Co&quot;&lt;/b&gt; b'>x</p>",
+    },
+    {
+      source: "<p title={{ name }} id={{ n }}>x</p>",
+      text: "<p title=\"&lt;b&gt;O&#39;Neil &amp; &quot;Co&quot;&lt;/b&gt;\" id=\"3\">x</p>",
+    },
+    {
+      source: "<textarea>{{ name }}</textarea><title>{{ name }}</title>",
+      text: "<textarea>&lt;b&gt;O&#39;Neil &amp; &quot;Co&quot;&lt;/b&gt;</textarea><title>&lt;b&gt;O&#39;Neil &amp; &quot;Co&quot;&lt;/b&gt;</title>",
+    },
+    { source: "<a href=\"{{ url }}\">x</a>", text: "<a href=\"/a%20b?c=d&amp;e\">x</a>" },
+    { source: "<a href={{ url }}>x</a>", text: "<a href=\"/a%20b?c=d&amp;e\">x</a>" },
+    { source: "<a href='/u/{{ q }}/x'>x</a>", text: "<a href='/u/a%20b&amp;c=//x'>x</a>" },
+    {
+      source: "<a href=\"/s?q={{ q }}&amp;n={{ n }}\">x</a>",
+      text: "<a href=\"/s?q=a%20b%26c%3D%2F&amp;n=3\">x</a>",
+    },
+    { source: "<a href=\"#{{ q }}\">x</a>", text: "<a href=\"#a%20b%26c%3D%2F\">x</a>" },
+    {
+      source: "<a href=\"https://example.com/{{ q }}\">x</a>",
+      text: "<a href=\"https://example.com/a%20b&amp;c=/\">x</a>",
+    },
+    {
+      source: "<a href=\"mailto:{{ name }}\">x</a>",
+      text: "<a href=\"mailto:%3Cb%3EO&#39;Neil%20&amp;%20%22Co%22%3C/b%3E\">x</a>",
+    },
+    { source: "<a href=\"p{{ n }}.html\">x</a>", text: "<a href=\"p3.html\">x</a>" },
+    {
+      source: "<img src=\"{{ url }}\"><form action=\"{{ url }}\"></form>",
+      text: "<img src=\"/a%20b?c=d&amp;e\"><form action=\"/a%20b?c=d&amp;e\"></form>",
+    },
+    {
+      source: "<a href=\"{{ vouched }}\">{{ vouched }}</a>",
+      text: "<a href=\"javascript:void(0)\">javascript:void(0)</a>",
+    },
+    {
+      source: "<a title=\"{{ js }}\">{{ js }}</a>",
+      text: "<a title=\"JavaScript:alert(1)\">JavaScript:alert(1)</a>",
+    },
+    {
+      source: "<p>{{ safe }}</p><p title=\"{{ safe }}\"></p>",
+      text: "<p>1 &lt; 2</p><p title=\"1 &lt; 2\"></p>",
+    },
+    {
+      source: "<p>{{ q | url }} {{ name | upper | length }}</p>",
+      text: "<p>a%20b%26c%3D%2F 20</p>",
+    },
+    {
+      source: "<ul>{{ for l in links }}<li class=\"{{ l.kind }}\">{{ l.label }}</li>{{ else }}<li>none</li>{{ end }}</ul>",
+      text: "<ul><li class=\"x&quot; onclick=&quot;y\">A&amp;B</li><li class=\"z\">&lt;C&gt;</li></ul>",
+    },
+    {
+      source: "<input type=\"checkbox\"{{ if on }} checked{{ end }}{{ if off }} disabled{{ end }}>",
+      text: "<input type=\"checkbox\" checked>",
+    },
+    {
+      source: "<a{{ if url }} href=\"{{ url }}\"{{ end }} {{ if off }}hidden {{ end }}id=\"a\">x</a>",
+      text: "<a href=\"/a%20b?c=d&amp;e\" id=\"a\">x</a>",
+    },
+    {
+      source: "<p{{ for l in links }} data-{{! none }}k=\"{{ l.label }}\"{{ end }}>x</p>",
+      text: "<p data-k=\"A&amp;B\" data-k=\"&lt;C&gt;\">x</p>",
+    },
+    {
+      source: "{{ if on }}<b>{{ else }}<i>{{ end }}{{ n }}{{ if on }}</b>{{ else }}</i>{{ end }}",
+      text: "<b>3</b>",
+    },
+    {
+      source: "<a href=\"{{ if on }}/on{{ else }}/off/{{ end }}{{ n }}\" title=\"{{ if off }}a{{ end }}{{ n }}\">x</a>",
+      text: "<a href=\"/on3\" title=\"3\">x</a>",
+    },
+    {
+      source: "<p>{{ for l in links }}{{ include \"link\" l }}{{ include \"plain\" l }}{{ end }}</p>",
+      text: "<p><a class=\"x&quot; onclick=&quot;y\">A&amp;B</a>&lt;A&amp;B&gt;<a class=\"z\">&lt;C&gt;</a>&lt;&lt;C&gt;&gt;</p>",
+    },
+    {
+      source: "<p title=\"{{ for l in links }}{{ include \"link\" l }}{{ end }}\">x</p>",
+      text: "<p title=\"&lt;a class=&quot;x&quot; onclick=&quot;y&quot;&gt;A&amp;B&lt;/a&gt;&lt;a class=&quot;z&quot;&gt;&lt;C&gt;&lt;/a&gt;\">x</p>",
+    },
+    { source: "<!DOCTYPE html>\n<p>\n  {{- n -}}\n</p>", text: "<!DOCTYPE html>\n<p>3</p>" },
+    {
+      source: "<a href=\"/x{{ if on }}?q={{ q }}{{ end }}#{{ n }}\">x</a>",
+      text: "<a href=\"/x?q=a%20b%26c%3D%2F#3\">x</a>",
+    },
+  ]
+
+test "as HTML, `{c.source}` writes each value as its place reads it" for c: Filled in placings() {
+  assert_eq(page_over(c.source, page()), Ok(c.text))
+}
+
+fn unplaceable() -> List<Refused> =
+  [
+    {
+      source: "<script>var n = {{ n }};</script>",
+      offset: 16,
+      why: Misplaced("a hole in `<script>` would be read as its code"),
+    },
+    {
+      source: "<style>p { width: {{ n }}px }</style>",
+      offset: 18,
+      why: Misplaced("a hole in `<style>` would be read as its code"),
+    },
+    {
+      source: "<a onclick=\"go({{ n }})\">x</a>",
+      offset: 15,
+      why: Misplaced("a hole in `onclick` would be read as code, which no escaping makes text"),
+    },
+    {
+      source: "<p style=\"width: {{ n }}px\">x</p>",
+      offset: 17,
+      why: Misplaced("a hole in `style` would be read as code, which no escaping makes text"),
+    },
+    {
+      source: "<p {{ name }}>x</p>",
+      offset: 3,
+      why: Misplaced("a hole stands in an element's content or in an attribute's value"),
+    },
+    {
+      source: "<{{ name }}>x",
+      offset: 1,
+      why: Misplaced("a hole stands in an element's content or in an attribute's value"),
+    },
+    {
+      source: "<p class=a{{ name }}>x</p>",
+      offset: 10,
+      why: Misplaced("quote the value: a hole stands inside its quotes, or as the whole of it"),
+    },
+    { source: "<!-- {{ name }} -->", offset: 5, why: Misplaced("a comment holds no hole") },
+    {
+      source: "<a href=\"javascript:go({{ n }})\">x</a>",
+      offset: 23,
+      why: Misplaced(
+        "a hole stands in a URL with no scheme, or with `http`, `https`, `mailto` or `tel`: this one's is `javascript`",
+      ),
+    },
+    {
+      source: "<a href=\"{{ if on }}/a{{ else }}?{{ end }}{{ n }}\">x</a>",
+      offset: 42,
+      why: Misplaced("the markup before this hole leaves its URL at more than one part"),
+    },
+    {
+      source: "<a href=\"{{ name }}://example.com\">x</a>",
+      offset: 19,
+      why: Markup(
+        "a `:` here makes the value before it the URL's scheme: write the scheme out, or let one hole hold the whole URL",
+      ),
+    },
+    {
+      source: "a < b",
+      offset: 2,
+      why: Markup("a `<` opens a tag: write `&lt;` for the character"),
+    },
+    { source: "<p>{{ n }}</p", offset: 13, why: Markup("a tag is not closed") },
+    { source: "<p title=\"{{ n }}", offset: 17, why: Markup("an attribute's value is not closed") },
+    { source: "{{ if on }}<p{{ end }}>x</p>", offset: 0, why: Uneven },
+    { source: "<p{{ if on }} title=\"{{ else }}>{{ end }}", offset: 2, why: Uneven },
+    { source: "<p title=\"{{ for l in links }}\"{{ end }}>", offset: 10, why: Uneven },
+    { source: "{{ for l in links }}<p {{ end }}>", offset: 0, why: Uneven },
+    { source: "<p>{{ for l in links }}<b{{ else }}<i>{{ end }}</p>", offset: 3, why: Uneven },
+    { source: "<p>{{ name | html }}</p>", offset: 3, why: EscapedTwice("html") },
+    { source: "<a href=\"/s?q={{ q | url }}\">x</a>", offset: 14, why: EscapedTwice("url") },
+    { source: "<p>{{ include \"link\" . | html }}</p>", offset: 3, why: EscapedTwice("html") },
+  ]
+
+test "as HTML, `{c.source}` is refused where it is read" for c: Refused in unplaceable() {
+  let place = position(c.source, c.offset);
+  assert_eq(
+    parse_html(c.source),
+    Err({ offset: c.offset, line: place.line, column: place.column, why: c.why }),
+  )
+}
+
+test "a loop inside loops is read as HTML in steps that grow with the loops, not double with each" {
+  let nested = |n: Int|
+    "<a href=\"" ++ join(map(range(0, n), |_: Int| "{{ for x in xs }}"), "") ++ "/x"
+      ++ join(map(range(0, n), |_: Int| "{{ end }}"), "")
+      ++ "\">x</a>";
+  let steps = |n: Int| metered(|| parse_html(nested(n))).steps;
+  assert(match parse_html(nested(30)) { Ok(_) -> true, Err(_) -> false });
+  assert(steps(30) < 20 * steps(10))
+}
+
+test "a value that would name a URL's scheme fails the filling, unless it is vouched for" {
+  let why = |source: String|
+    match page_over(source, page()) { Ok(text) -> Ok(text), Err(f) -> Err(f.why) };
+  assert_eq(why("<a href=\"{{ js }}\">x</a>"), Err(UnsafeUrl("JavaScript")));
+  assert_eq(why("<a href={{ js }}>x</a>"), Err(UnsafeUrl("JavaScript")));
+  assert_eq(why("<a href=\"x{{ js }}\">x</a>"), Err(UnsafeUrl("JavaScript")));
+  assert_eq(why("<a href=\"{{ n }}{{ js }}\">x</a>"), Err(UnsafeUrl("JavaScript")));
+  assert_eq(why("<a href=\"/{{ js }}\">x</a>"), Ok("<a href=\"/JavaScript:alert(1)\">x</a>"));
+  assert_eq(
+    why("<a href=\"?u={{ js }}\">x</a>"),
+    Ok("<a href=\"?u=JavaScript%3Aalert%281%29\">x</a>"),
+  );
+  assert_eq(why("<a href=\"x{{ vouched }}\">x</a>"), Ok("<a href=\"xjavascript:void(0)\">x</a>"));
+  assert_eq(why("<a href=\"{{ vouched | lower }}\">x</a>"), Err(UnsafeUrl("javascript")));
+  assert_eq(why("<a href=\"{{ safe }}\">x</a>"), Err(WrongKind("the text of a URL", "markup")));
+  assert_eq(why("<a href=\"{{ links }}\">x</a>"), Err(WrongKind("a text", "a list")))
+}
+
+test "a template's filling is markup or text, whichever way it was read" {
+  let markup = match parse_html("<b>{{ name }}</b>") { Ok(t) -> t, Err(_) -> panic("refused") };
+  let words = match parse("<b>{{ name }}</b>") { Ok(t) -> t, Err(_) -> panic("refused") };
+  let data = reflect({ name: "a<b" });
+  let filled_as = |t: Template|
+    match render_html(t, data, map_new(), default_limits()) {
+      Ok(page) -> html::render(page),
+      Err(f) -> explain(f.why),
+    };
+  assert_eq(filled_as(markup), "<b>a&lt;b</b>");
+  assert_eq(filled_as(words), "&lt;b&gt;a&lt;b&lt;/b&gt;");
+  assert_eq(render(words, data, map_new(), default_limits()), Ok("<b>a<b</b>"));
+  // What an HTML template wrote is markup to the next one, and text to a template of text.
+  let inner = match render_html(markup, data, map_new(), default_limits()) {
+    Ok(page) -> reflect({ name: page }),
+    Err(_) -> panic("failed"),
+  };
+  assert_eq(filled_as(markup), "<b>a&lt;b</b>");
+  assert_eq(render(markup, inner, map_new(), default_limits()), Ok("<b><b>a&lt;b</b></b>"));
+  assert_eq(render(words, inner, map_new(), default_limits()), Ok("<b><b>a&lt;b</b></b>"))
+}
+
+/// What the browser reads the one `href` of a page as: its value with its references read.
+fn href_of(page: String) -> String / {abort.raise} =
+  match string_split(page, "href=\"") {
+    [_, after, ..] -> match string_split(after, "\"") {
+      [value, ..] -> html::unescape_attribute(value),
+      [] -> "",
+    },
+    _ -> "",
+  }
+
+fn url_sources() -> List<String> =
+  [
+    "<a href=\"{{ u }}\">x</a>",
+    "<a href={{ u }}>x</a>",
+    "<a href=\" {{ u }}\">x</a>",
+    "<a href=\"{{ u }}{{ u }}\">x</a>",
+    "<a href=\"x{{ u }}\">x</a>",
+    "<a href=\"{{ u }}/{{ u }}\">x</a>",
+    "<a href=\"{{ u }}?{{ u }}\">x</a>",
+    "<a href=\"{{ if on }}{{ u }}{{ end }}\">x</a>",
+    "<a href=\"{{ if on }}{{ u }}{{ else }}/b{{ end }}?{{ u }}\">x</a>",
+    "<a href=\"/a{{ if on }}?x={{ u }}{{ end }}#{{ u }}\">x</a>",
+  ]
+
+law "a value written into a URL never gives it a scheme but `http`, `https`, `mailto` or `tel`"
+  forall (h: html::Hostile, n: Int) {
+    let source = at_or(url_sources(), n & 15, "<a href=\"{{ u }}\">x</a>");
+    let data = reflect({ u: html::hostile_text(h), on: true });
+    match page_over(source, data) {
+      Err(f) -> match f.why { UnsafeUrl(_) -> true, _ -> false },
+      Ok(text) -> match html::browser_scheme(href_of(text)) {
+        None -> true,
+        Some(scheme) ->
+          scheme == "http" || scheme == "https" || scheme == "mailto" || scheme == "tel",
+      },
+    }
+  }
+
+/// A template made of the pieces a template is written of, in any order.
+type Sketch = | Sketch(String)
+
+gen for Sketch by sketches
+
+fn sketches() -> Gen<Sketch> =
+  gen::map(gen::list_of(gen::elements(sketch_parts()), 10), |parts: List<String>|
+    Sketch(join(parts, "")))
+
+fn sketch_parts() -> List<String> =
+  [
+    "x",
+    " ",
+    "{{ s }}",
+    "<p>{{ s }}</p>",
+    "<p title=\"{{ s }}\" id={{ n }}>",
+    "</p>",
+    "<a href=\"{{ s }}\">",
+    "<a href='/{{ s }}?q={{ s }}#{{ n }}'>",
+    "</a>",
+    "<textarea>{{ s }}</textarea>",
+    "<!-- {{! c }} -->",
+    "{{ include \"p\" }}",
+    "{{ if on }}<b>{{ else }}<i>{{ end }}",
+    "<p{{ if on }} title=\"{{ s }}\"{{ end }}{{ if off }} hidden{{ end }}>",
+    "<ul>{{ for x in xs }}<li class='{{ x }}'>{{- x -}}</li>{{ else }}{{ n }}{{ end }}</ul>",
+    "<a href=\"{{ if off }}/a{{ else }}/b/{{ end }}{{ n }}\">",
+    "<p{{ for x in xs }} data-x=\"{{ x }}\"{{ end }}>",
+    "{{ if on }}",
+    "{{ if off }}",
+    "{{ else }}",
+    "{{ end }}",
+    "{{ for x in xs }}",
+    "{{ x }}",
+    "<p",
+    ">",
+    " title=\"",
+    " href=\"",
+    " class='",
+    " id=",
+    "\"",
+    "'",
+    "/",
+    "?",
+    ":",
+    "&amp;",
+    "<textarea>",
+    "</textarea>",
+  ]
+
+fn sketch_data() -> Value =
+  reflect({ s: "\"'><script>&:/?#", n: 1, on: true, off: false, xs: ["a b", "'\"", ""] })
+
+fn sketch_partials() -> Map<String, Template> / {abort.raise} =
+  match parse_html("<i>{{ s }}</i>") { Ok(t) -> #{"p": t}, Err(r) -> panic(explain(r.why)) }
+
+law "a template read as HTML fills to markup `std.html` reads again, and by no defect"
+  forall (k: Sketch) {
+    match k {
+      Sketch(source) -> match parse_html(source) {
+        Err(r) -> match r.why { Defect(_) -> false, _ -> true },
+        Ok(t) -> match render(t, sketch_data(), sketch_partials(), default_limits()) {
+          Err(f) -> match f.why { Defect(_) -> false, _ -> true },
+          Ok(text) -> match html::literal(text) { Ok(_) -> true, Err(_) -> false },
+        },
+      },
+    }
+  }
+
+law "a template read as text is filled or fails, and by no defect"
+  forall (k: Sketch) {
+    match k {
+      Sketch(source) -> match parse(source) {
+        Err(r) -> match r.why { Defect(_) -> false, _ -> true },
+        Ok(t) -> match render(t, sketch_data(), sketch_partials(), default_limits()) {
+          Err(f) -> match f.why { Defect(_) -> false, _ -> true },
+          Ok(_) -> true,
+        },
+      },
+    }
+  }
