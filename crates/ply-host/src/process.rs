@@ -4,14 +4,15 @@
 mod children;
 
 pub(crate) use children::{Children, Io, Output, Signal};
+pub use children::{Ended, Finished, Heard};
 
-use crate::pool::{Bell, Finished, Inbox, JobOutput, PROCESS_FIRST_TOKEN, Pool};
+use crate::pool::{JobOutput, Pool, Pooled, option};
 use crate::stdio;
 use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::{HostRegistry, MachineId};
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
-    HostRuntime, Linearity, Pending, Plain, Resource, Span, Symbol, Value, codes, slot,
+    HostRuntime, Linearity, Plain, Resource, Span, Symbol, Value, codes, slot,
 };
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -242,7 +243,7 @@ impl ProcessHost {
             sink: Arc::new(sink),
             exit: Mutex::new(None),
             executables: Executables::new(),
-            pool: Pool::new(PROCESS_FIRST_TOKEN),
+            pool: Pool::new(),
             children: Arc::new(Children::new()),
             whole: true,
         }
@@ -276,46 +277,6 @@ impl ProcessHost {
         }
     }
 
-    pub fn owns(&self, pending: &Pending) -> bool {
-        self.pool.owns(pending)
-    }
-
-    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
-        self.pool.watch(pending, inbox)
-    }
-
-    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.pool.collect(inbox)
-    }
-
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.pool.poll(pending)
-    }
-
-    pub fn park(&self) -> Result<(), Diagnostic> {
-        self.pool.park()
-    }
-
-    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
-        self.pool.park_until(bound)
-    }
-
-    pub fn outstanding(&self) -> usize {
-        self.pool.outstanding()
-    }
-
-    pub fn ready(&self) -> bool {
-        self.pool.ready()
-    }
-
-    pub fn ring(&self, bell: &Arc<Bell>) {
-        self.pool.ring(bell);
-    }
-
-    pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        self.pool.block_on(pending)
-    }
-
     pub fn argv(&self) -> &[String] {
         &self.argv
     }
@@ -337,18 +298,6 @@ impl ProcessHost {
     /// Whether this host is the run's own process, and its streams the process's own.
     fn owns_the_streams(&self) -> bool {
         self.whole && self.sink.is_real()
-    }
-
-    /// A job on this host's pool, for an operation of another effect that waits on the process's
-    /// own streams.
-    pub(crate) fn waiting(
-        &self,
-        span: Span,
-        label: &'static str,
-        what: &'static str,
-        job: Box<dyn FnOnce() -> JobOutput + Send + 'static>,
-    ) -> Result<Pending, Diagnostic> {
-        self.pool.submit(span, label, what, job)
     }
 
     /// Leaves the process's streams as a program that ended leaves them: standard output's
@@ -384,6 +333,12 @@ impl ProcessHost {
     /// Kills and reaps every child `process.start` launched that is still running.
     pub fn end_children(&self) {
         self.children.end_all();
+    }
+}
+
+impl Pooled for ProcessHost {
+    fn pool(&self) -> &Pool {
+        &self.pool
     }
 }
 
@@ -669,7 +624,7 @@ impl HostHandler for Operation {
                     "process-wait",
                     Op::Wait.what(),
                     Box::new(move || match child.wait(deadline) {
-                        Ok(exit) => JobOutput::MaybeFinished(exit),
+                        Ok(exit) => JobOutput::built(move || option(exit.map(Finished::value))),
                         Err(refusal) => refused(Op::Wait, handle, &child, refusal, span),
                     }),
                 )?;
@@ -707,7 +662,7 @@ impl HostHandler for Operation {
                     "process-output-line",
                     Op::OutputLine.what(),
                     Box::new(move || match child.next_line(deadline) {
-                        Ok(heard) => JobOutput::Heard(heard),
+                        Ok(heard) => JobOutput::built(move || heard.value()),
                         Err(refusal) => refused(Op::OutputLine, handle, &child, refusal, span),
                     }),
                 )?;
@@ -922,11 +877,12 @@ fn run_to_end(
                     span,
                 ));
             }
-            JobOutput::Finished(Finished {
+            let exit = Finished {
                 ended: children::ending(&done.status),
                 out: done.stdout,
                 err: done.stderr,
-            })
+            };
+            JobOutput::built(move || exit.value())
         }
     }
 }
