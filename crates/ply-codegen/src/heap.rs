@@ -553,8 +553,9 @@ pub struct Heap {
     persistent: bool,
     /// The bytes the first chunk takes, which each next one doubles.
     first: usize,
-    /// Objects allocated since the last reset, and the same by kind.
+    /// Objects allocated since the last reset, the bytes they took, and the objects by kind.
     count: usize,
+    bytes: usize,
     by_kind: [usize; 16],
     /// Under `PLY_HEAP_CENSUS`, allocations by kind and layout or power-of-two length.
     by_layout: HashMap<(u8, u32), usize>,
@@ -667,6 +668,7 @@ impl Heap {
             persistent: false,
             first: FIRST_CHUNK,
             count: 0,
+            bytes: 0,
             by_kind: [0; 16],
             by_layout: HashMap::new(),
             recycled: 0,
@@ -736,6 +738,7 @@ impl Heap {
         }
         self.delayed.extend(other.delayed.drain(..));
         self.count += other.count;
+        self.bytes += other.bytes;
         for (mine, theirs) in self.by_kind.iter_mut().zip(other.by_kind) {
             *mine += theirs;
         }
@@ -794,6 +797,12 @@ impl Heap {
     /// Objects allocated since the last reset.
     pub fn allocated(&self) -> usize {
         self.count
+    }
+
+    /// The bytes the objects allocated since the last reset took, headers included: what an
+    /// update that copies spends and one in place does not.
+    pub fn allocated_bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Allocations by kind, indexed by the `KIND_*` constants.
@@ -928,6 +937,7 @@ impl Heap {
             });
         }
         self.count += 1;
+        self.bytes += size;
         self.by_kind[kind as usize & 15] += 1;
         if self.census {
             let key = match kind {
@@ -1131,6 +1141,7 @@ impl Heap {
         }
         self.chunk = 0;
         self.count = 0;
+        self.bytes = 0;
         self.by_kind = [0; 16];
         self.by_layout.clear();
         self.recycled = 0;
