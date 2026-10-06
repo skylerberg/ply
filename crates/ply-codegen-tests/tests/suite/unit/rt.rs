@@ -268,6 +268,62 @@ pub fn joined(n: Int, spin: Int) -> Int / {sim.read, diverges} =
     });
     ended(sum, spin)
   }
+
+fn nothing(n: Int) -> List<Int> = filter([n], |v: Int| v < 0)
+
+fn fails(which: Int, n: Int) -> Int / {abort.raise} =
+  if which == 0 { int_of_u8(u8_of_int(256 + n)) }
+  else if which == 1 { bytes_at(b"ab", 2 + n) }
+  else if which == 2 { array_get(array_new(2, 0), 2 + n) }
+  else if which == 3 { n / (n - n) }
+  else if which == 4 { iterate(n, 3, |i: Int| if i < 0 { Stop(i) } else { Continue(i + 1) }) }
+  else if which == 5 {
+    let [x, ..] = nothing(n);
+    x
+  } else { len(string_split("a b", string_slice("a b", 1, 1 + n - n))) }
+
+fn falls(which: Int, n: Int, depth: Int) -> Int / {abort.raise} =
+  if depth <= 0 { fails(which, n) } else { 1 + falls(which, n, depth - 1) }
+
+pub fn refused(n: Int, spin: Int) -> Int / {diverges} =
+  ended(
+    fold(range(0, n), 0, |acc: Int, i: Int|
+      acc + (handle { falls(i % 7, i, 120) } with { abort.raise(m) -> i })),
+    spin,
+  )
+
+fn here(which: Int, n: Int) -> Int =
+  if which == 0 { handle { int_of_u8(u8_of_int(256 + n)) } with { abort.raise(m) -> n } }
+  else if which == 1 { handle { bytes_at(b"ab", 2 + n) } with { abort.raise(m) -> n } }
+  else if which == 2 { handle { array_get(array_new(2, 0), 2 + n) } with { abort.raise(m) -> n } }
+  else if which == 3 { handle { n / (n - n) } with { abort.raise(m) -> n } }
+  else if which == 4 {
+    handle {
+      iterate(n, 3, |i: Int| if i < 0 { Stop(i) } else { Continue(i + 1) })
+    } with { abort.raise(m) -> n }
+  } else if which == 5 {
+    handle {
+      let [x, ..] = nothing(n);
+      x
+    } with { abort.raise(m) -> n }
+  } else {
+    handle {
+      len(string_split("a b", string_slice("a b", 1, 1 + n - n)))
+    } with { abort.raise(m) -> n }
+  }
+
+pub fn refused_here(n: Int, spin: Int) -> Int / {diverges} =
+  ended(fold(range(0, n), 0, |acc: Int, i: Int| acc + here(i % 7, i)), spin)
+
+pub fn refused_held(n: Int, spin: Int) -> Int / {diverges} =
+  ended(
+    fold(range(0, n), 0, |acc: Int, i: Int|
+      acc
+        + (handle {
+          with_hold[slot](i, |held: Int| ()) { h -> falls(hold_get(h) % 7, hold_get(h), 100) }
+        } with { abort.raise(m) -> i })),
+    spin,
+  )
 "#;
 
 /// The nested calls an entry below is allowed. The rounds leave through far more frames than
@@ -383,6 +439,10 @@ const WAYS: &[Way] = &[
     ("m.cancelled", |n| n),
     ("m.outside", |n| n),
     ("m.joined", |n| n),
+    // What a builtin raises, by each of them in turn: far down, and in the `handle`'s own body.
+    ("m.refused", triangle),
+    ("m.refused_here", triangle),
+    ("m.refused_held", triangle),
 ];
 
 /// A frame a failure returns through gives its call back where the failure is caught, and a body

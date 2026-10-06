@@ -2,6 +2,7 @@ use ply_eval::{
     Bound, CheckOutput, Diagnostic, EffectAtom, HostAnswer, HostBinding, HostRequest, HostRuntime,
     Linearity, Mode, Pending, Resource, Span, Symbol, Value, codes,
 };
+use ply_host::pool::Pooled;
 use ply_host::tcp::*;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -549,7 +550,11 @@ fn a_loopback_connection_is_served_end_to_end() {
     close(&binding, net.as_ref(), listener, "listener");
 
     assert_eq!(peer.join().expect("the peer finished"), RESPONSE);
-    assert_eq!(net.outstanding(), 0, "every blocking operation was reaped");
+    assert_eq!(
+        net.pool().outstanding(),
+        0,
+        "every blocking operation was reaped"
+    );
 }
 
 #[test]
@@ -776,8 +781,9 @@ fn a_token_the_runtime_did_not_mint_is_loud_rather_than_lost() {
         token: 4096,
         label: "recv",
     };
-    assert!(!net.owns(&foreign));
+    assert!(!net.pool().owns(&foreign));
     let polled = net
+        .pool()
         .poll(&foreign)
         .expect_err("this token is someone else's");
     assert_eq!(polled.code, codes::INTERNAL_ERROR);
@@ -930,7 +936,11 @@ fn an_outbound_connection_is_made_and_served_end_to_end() {
     assert_eq!(read_to_end(&binding, net.as_ref(), conn), RESPONSE);
     close(&binding, net.as_ref(), conn, "conn");
     assert_eq!(peer.join().expect("the peer finished"), REQUEST);
-    assert_eq!(net.outstanding(), 0, "every blocking operation was reaped");
+    assert_eq!(
+        net.pool().outstanding(),
+        0,
+        "every blocking operation was reaped"
+    );
 }
 
 #[test]
@@ -975,7 +985,7 @@ fn a_host_that_cannot_be_reached_is_none_rather_than_a_failure() {
         matches!(&answer, Value::Ctor { name, .. } if name.as_str() == "None"),
         "{answer:?}"
     );
-    assert_eq!(net.outstanding(), 0);
+    assert_eq!(net.pool().outstanding(), 0);
 }
 
 fn speak(addr: SocketAddr) -> std::thread::JoinHandle<Vec<u8>> {

@@ -1,0 +1,123 @@
+//! What `std.x509` builds, under each kind of key `std.crypto` signs with. The module's own tests
+//! build under Ed25519 alone: an RSA key is a document, and a shipped module embeds none. The keys
+//! here are the two `asn1/` holds, made for this suite and protecting nothing.
+
+import std.bytes (repeat)
+import std.crypto
+import std.crypto (Der, Raw, Sha256, Sha384, Sha512)
+import std.date
+import std.date (OffsetDateTime)
+import std.oid
+import std.show (show)
+import std.x509
+import std.x509 (x509, Certificate)
+
+fn rsa_document() -> Bytes = embed("asn1/rsa_key.der")
+
+fn ec_document() -> Bytes = embed("asn1/ec_key.der")
+
+/// A kind of signing key, and how a certificate says it is signed by one.
+type Kind = { key: String, algorithm: String }
+
+fn kinds() -> List<Kind> =
+  [
+    { key: "Ed25519", algorithm: "Ed25519" },
+    { key: "P-256, DER", algorithm: "Ecdsa(Sha256)" },
+    { key: "P-256, r and s", algorithm: "Ecdsa(Sha256)" },
+    { key: "RSA, SHA-256", algorithm: "RsaPkcs1(Sha256)" },
+    { key: "RSA, SHA-384", algorithm: "RsaPkcs1(Sha384)" },
+    { key: "RSA, SHA-512", algorithm: "RsaPkcs1(Sha512)" },
+  ]
+
+fn ed25519(seed: Bytes) -> Option<crypto::SigningKey> =
+  crypto::ed25519_signing(secret_of_bytes(repeat(seed, 32)))
+
+fn signer(kind: String) -> crypto::SigningKey / {abort.raise} = {
+  let scalar = match crypto::private_key_of_der(secret_of_bytes(ec_document())) {
+    Some(crypto::P256Private(s)) -> s,
+    _ -> panic("a P-256 key"),
+  };
+  let rsa = secret_of_bytes(rsa_document());
+  let made = match kind {
+    "Ed25519" -> ed25519(b"\x05"),
+    "P-256, DER" -> crypto::ecdsa_p256_signing(scalar, Der),
+    "P-256, r and s" -> crypto::ecdsa_p256_signing(scalar, Raw),
+    "RSA, SHA-256" -> crypto::rsa_pkcs1_signing(rsa, Sha256),
+    "RSA, SHA-384" -> crypto::rsa_pkcs1_signing(rsa, Sha384),
+    "RSA, SHA-512" -> crypto::rsa_pkcs1_signing(rsa, Sha512),
+    _ -> None,
+  };
+  match made { Some(key) -> key, None -> panic(f"no key {kind}") }
+}
+
+fn day(n: Int) -> OffsetDateTime / {abort.raise} =
+  match date::of_unix_seconds(n * 86400) { Some(t) -> t, None -> panic("a day") }
+
+fn called(name: String) -> List<x509::Attribute> = [{ id: oid::common_name(), value: name }]
+
+type Built = { root: Certificate, leaf: Certificate, asked: x509::Request }
+
+/// A root under `key`, a leaf for `localhost` that the root signs, and a request `key` signs.
+fn built(key: crypto::SigningKey) -> Built / {x509.refused, abort.raise} = {
+  let authority = {
+    ..x509::draft(),
+    subject: called("A root"),
+    ca: Some(None),
+    usages: [x509::KeyCertSign, x509::CrlSign],
+  };
+  let host = {
+    ..x509::draft(),
+    subject: called("localhost"),
+    alt_names: [x509::Dns("localhost")],
+    usages: [x509::DigitalSignature],
+    purposes: [x509::server_auth()],
+  };
+  let other = match ed25519(b"\x06") { Some(k) -> k, None -> panic("a seed") };
+  let root = x509::self_signed(authority, b"\x01", day(100), day(900), key);
+  {
+    root: root,
+    leaf: x509::certificate(
+      host,
+      crypto::verifying_key(other),
+      b"\x02",
+      day(200),
+      day(800),
+      Some(root),
+      key,
+    ),
+    asked: x509::read_request(x509::request(host, key), x509::limits()),
+  }
+}
+
+test "a root, a leaf and a request built under {c.key} read back, and the chain verifies" for c: Kind in kinds(
+  ) {
+  match try { built(signer(c.key)) } {
+    Err(refusal) -> panic(show(refusal)),
+    Ok(b) -> {
+      assert_eq(show(x509::info(b.root).algorithm), c.algorithm);
+      assert_eq(show(x509::info(b.leaf).algorithm), c.algorithm);
+      assert_eq(x509::request_key(b.asked), x509::info(b.root).key);
+      assert_eq(x509::info(b.leaf).issuer, x509::info(b.root).subject);
+      let at = |n: Int| Instant(n * 86400000000000);
+      let checked = |on: Int|
+        match x509::verify(
+            b.leaf,
+            [],
+            [b.root],
+            at(on),
+            x509::Host("localhost"),
+            x509::ServerAuth,
+            x509::strict(),
+          ) {
+          Ok(path) -> Ok(path),
+          Err(failure) -> Err(failure.why),
+        };
+      assert_eq(checked(500), Ok([b.leaf, b.root]));
+      assert_eq(checked(801), Err(x509::Expired));
+      assert_eq(
+        try { x509::read_pem(x509::write_pem([b.leaf, b.root]), x509::limits(), x509::Strict) },
+        Ok([b.leaf, b.root]),
+      )
+    },
+  }
+}
