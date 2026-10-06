@@ -1,9 +1,10 @@
 //! Where an update (`push`, `list_set`, `array_set`) copies, before the program runs: `ply check
 //! --costs` reads it out, and a `reuse fn` whose body copies is refused with it.
 
-import compiler.costs (Report, Costed, Site, Unkept, costs, report_bin)
+import compiler.costs (Report, Costed, Site, Unkept, Priced, Costing, costs, cost_keys, priced_of,
+                       report_bin)
 import compiler.embed (EmbedAt, EmbedFile)
-import compiler.front (Analysis, Rows, WalkedFacts, rows_of, walked_facts)
+import compiler.front (Analysis)
 import compiler.hash (hex)
 import compiler.items (Item, IFn)
 import compiler.resolve (Source, ParsedModule, Diag, PackageDeps, error_at, error_at_and)
@@ -28,26 +29,21 @@ fn location_width() -> Int = 22
 
 /// A command asks for the cost checker's report on a program; what answers is `pricing`'s, which
 /// `main` runs every command under, or a handler of the asker's own. The report is a function of the
-/// program's text, of the checker, and of the front end, whose check read `rows` and `walked`; so the
-/// effect is a deterministic one, whatever the answering keeps.
+/// program's text, of the checker, and of the front end, whose analysis it reads; so the effect is a
+/// deterministic one, whatever the answering keeps. What the answering walked and lowered to make it
+/// is the answering's, and holds nothing to keep.
 pub effect priced {
-  read report(names: List<Bytes>, srcs: List<Bytes>, pkgs: List<PackageDeps>, module_packages: List<Int>, shipped: Int, rows: Rows, walked: WalkedFacts, embeds: List<EmbedAt>) -> Report
+  read report(p: Priced) -> Costing
 }
 
 /// Only the run's own updates: a dependency's are costed when it is the package checked.
-pub fn costs_of(program: Program, analysis: Analysis) -> Report / {priced.report, abort.raise} = {
+pub fn costs_of(program: Program, analysis: Analysis) -> Costing / {priced.report, abort.raise} = {
   let srcs: List<Source> = sourced(program, analysis);
-  let r = priced.report(
-    map(srcs, |source: Source| source.name),
-    map(srcs, |source: Source| source.src),
-    analysis.packages,
-    analysis.module_packages,
-    len(analysis.packages),
-    rows_of(analysis),
-    walked_facts(analysis),
-    analysis.embeds,
-  );
-  { ..r, defs: filter(r.defs, |d: Costed| d.module < len(program.files)) }
+  let c = priced.report(priced_of(analysis, map(srcs, |source: Source| source.src)));
+  {
+    ..c,
+    report: { ..c.report, defs: filter(c.report.defs, |d: Costed| d.module < len(program.files)) },
+  }
 }
 
 /// A `reuse fn` whose promise the cost checker cannot show, and a `returns` clause it cannot show of
@@ -58,14 +54,15 @@ pub fn broken_promises(
   analysis: Analysis,
 ) -> List<Diag> / {priced.report, abort.raise} =
   if !promised(program, analysis) { [] } else {
-    let r = costs_of(program, analysis);
+    let r = costs_of(program, analysis).report;
     if !r.ok { [unresolved()] }
     else { fold(r.unkept, promises(r), |acc: List<Diag>, u: Unkept| push(acc, unkept_returns(u))) }
   }
 
 /// The definitions a report is a function of besides the program: the checker's entry, and the
 /// front end's, whose check read the facts the checker costs bodies by.
-fn checker_roots() -> List<Bytes> = [b"costs.costs", b"front.analyse_pulling_std_with"]
+fn checker_roots() -> List<Bytes> =
+  [b"costs.costs", b"costs.cost_keys", b"front.analyse_pulling_std_with"]
 
 /// What a report is a function of beyond the checker, `identity`: every module's name and text, the
 /// packages and which each module is in, and what each module embeds.
@@ -128,34 +125,49 @@ fn costs_key(
 }
 
 /// `body` with every cost report it asks for kept under the toolchain's cache, as the emitter's
-/// answers are.
+/// answers are: a program whose every text stands takes its report whole, and any other has each of
+/// its modules' walks taken back as `costs` finds them still answering.
 pub fn pricing<a | e>(
   body: () -> a / {priced.report | e},
 ) -> a / {abort.raise, shipped.definitions, env.bodies[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
   handle {
     body()
   } with {
-    priced.report(names, srcs, pkgs, module_packages, shipped, rows, walked, embeds) -> {
+    priced.report(p) -> {
       let dir = under_abs(env.bodies[sys]());
+      let identity = identity_of(shipped.definitions(), checker_roots());
+      let a = p.analysis;
       let key = costs_key(
-        identity_of(shipped.definitions(), checker_roots()),
-        names,
-        srcs,
-        pkgs,
-        module_packages,
-        shipped,
-        embeds,
+        identity,
+        map(a.mods, |m: ParsedModule| m.name),
+        p.srcs,
+        a.packages,
+        a.module_packages,
+        len(a.packages),
+        a.embeds,
       );
       let kept = match read_kept[abs](dir, key) {
         Some(bytes) -> match bin::decode(bytes, report_bin()) { Ok(r) -> Some(r), Err(_) -> None },
         None -> None,
       };
       match kept {
-        Some(r) -> r,
+        Some(r) -> { report: r, kept: [], walked: 0, lowered: 0 },
         None -> {
-          let r = costs(names, srcs, pkgs, module_packages, shipped, rows, walked, embeds);
-          write_kept[abs](dir, key, bin::encode(r, report_bin()));
-          r
+          let keys = cost_keys(p, identity);
+          let c = costs(
+            p,
+            map(keys, |k: Bytes| if bytes_len(k) == 0 { None } else { read_kept[abs](dir, k) }),
+          );
+          fold(range(0, len(keys)), (), |_: Unit, i: Int|
+            match list_at(c.kept, i) {
+              Some(Some(bytes)) -> match list_at(keys, i) {
+                Some(k) -> write_kept[abs](dir, k, bytes),
+                None -> (),
+              },
+              _ -> (),
+            });
+          write_kept[abs](dir, key, bin::encode(c.report, report_bin()));
+          { ..c, kept: [] }
         },
       }
     },
@@ -164,12 +176,7 @@ pub fn pricing<a | e>(
 /// `body` with every cost report worked out afresh and kept nowhere: for a program that drives
 /// another and has no toolchain cache of its own.
 pub fn pricing_fresh<a | e>(body: () -> a / {priced.report | e}) -> a / {abort.raise | e} =
-  handle {
-    body()
-  } with {
-    priced.report(names, srcs, pkgs, module_packages, shipped, rows, walked, embeds) ->
-      costs(names, srcs, pkgs, module_packages, shipped, rows, walked, embeds),
-  }
+  handle { body() } with { priced.report(p) -> { ..costs(p), kept: [] } }
 
 /// Whether one of the run's own modules writes a `reuse fn` or a `returns` clause, so the promise
 /// check can be skipped.
