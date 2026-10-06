@@ -37,7 +37,12 @@
 //! transfer encoding is chosen from its bytes, and a value that holds a line break is refused
 //! where it is set, so no value can add a field. The date, the id and the boundary are
 //! arguments; `compose` and `write_fresh` take them from `time` and `entropy`. `write` leaves
-//! `Bcc` out unless asked, and `envelope` answers who the message goes to.
+//! `Bcc` out unless asked, and `repertoire_for` says whether a draft can be written in ASCII.
+//!
+//! An `Envelope` is what a transport is handed beside the bytes: a reverse path, which is an
+//! address or the null path a bounce travels under, and every address the message goes to, once
+//! each. `envelope` answers a draft's and `message_envelope` that of a message read, whose
+//! `Bcc` lines `without` takes out before it is sent on.
 //!
 //! `canonical_field` and `canonical_body` are RFC 6376's `simple` and `relaxed` forms, which a
 //! DKIM signature is taken over; the signature itself is not here.
@@ -1637,6 +1642,12 @@ fn field_defects(raw: Bytes, at: Int, utf8: Bool) -> List<Refusal> / {abort.rais
 /// past 998 octets it met, each below zero until it meets one.
 type Lining = { at: Int, start: Int, feed: Int, ret: Int, long: Int }
 
+/// What keeps `data` from being lines as a message has them, each ending with CRLF and holding
+/// at most 998 octets: the first line feed with no carriage return before it, the first carriage
+/// return with no line feed after it and the first line too long, in that order, each at its
+/// byte. What a transport asks before it sends bytes it did not write.
+pub fn line_flaws(data: Bytes) -> List<Refusal> / {abort.raise} = line_defects(data, 0)
+
 /// What is wrong with the lines of `b`, which stands at `origin`: the first of each kind.
 fn line_defects(b: Bytes, origin: Int) -> List<Refusal> / {abort.raise} = {
   let seen = lines_from(b, { at: 0, start: 0, feed: -1, ret: -1, long: -1 }, bytes_len(b) + 2);
@@ -2594,9 +2605,11 @@ pub type Bcc =
 /// `text/html`, or `multipart/alternative` of the two; the HTML with its inline parts is
 /// `multipart/related`; and with attachments the whole is `multipart/mixed`. Each part's transfer
 /// encoding is chosen from its bytes: `7bit` where they are lines of ASCII, `quoted-printable`
-/// where few of them need an escape, and `base64` otherwise. `boundary` sets the outermost
-/// multipart body's parts apart, and a body within that one has `2-` or `3-` before it, so a
-/// boundary is at most 68 of RFC 2046's characters where bodies nest.
+/// where few of them need an escape, and `base64` otherwise. The message ends with a line
+/// break, as a transport needs: a body that is the whole message and has none at its end is
+/// written in an encoding that adds one without adding it to the text. `boundary` sets the
+/// outermost multipart body's parts apart, and a body within that one has `2-` or `3-` before
+/// it, so a boundary is at most 68 of RFC 2046's characters where bodies nest.
 pub fn write(
   d: Draft,
   boundary: String,
@@ -2744,9 +2757,11 @@ fn core_part(
   match d.text {
     None -> page_part(d, boundary, level),
     Some(plain) -> match page_part(d, boundary, level + 1) {
-      None -> Some(text_part(plain, "plain")),
+      None -> Some(text_part(plain, "plain", level == 1)),
       Some(page) ->
-        Some(multi("alternative", [text_part(plain, "plain"), page], nested(boundary, level))),
+        Some(
+          multi("alternative", [text_part(plain, "plain", false), page], nested(boundary, level)),
+        ),
     },
   }
 
@@ -2758,12 +2773,12 @@ fn page_part(
 ) -> Option<Written> / {email.unwritable, abort.raise} =
   match d.html {
     None -> if len(d.inline) > 0 { email.unwritable(NoHtml) } else { None },
-    Some(html) -> if len(d.inline) == 0 { Some(text_part(html, "html")) } else {
+    Some(html) -> if len(d.inline) == 0 { Some(text_part(html, "html", level == 1)) } else {
       Some(
         multi(
           "related",
           prepend(
-            text_part(html, "html"),
+            text_part(html, "html", false),
             map(enumerate(d.inline), |a: { index: Int, value: Attachment }|
               file_part(a.value, a.index, "inline")),
           ),
@@ -2806,28 +2821,41 @@ type Coded = { encoding: String, data: Bytes }
 
 /// `wire`, a body as it would be transferred as it is, encoded where it must be. `text` is the
 /// body's text where its line breaks are to stay line breaks.
-fn coded(wire: Bytes, text: Option<String>) -> Coded / {abort.raise} =
-  if scan(wire, 0, seven_bit()) == bytes_len(wire) && len(line_defects(wire, 0)) == 0 {
+///
+/// A `whole` body is a message's last bytes, and a message ends with a line break, since a
+/// transport's lone dot follows one: a body that does not end with a line break is then written
+/// in an encoding whose last line break is no part of what it carries, a soft one under
+/// quoted-printable.
+fn coded(wire: Bytes, text: Option<String>, whole: Bool) -> Coded / {abort.raise} = {
+  let size = bytes_len(wire);
+  let ended = !whole || size == 0 || bytes_slice(wire, max(size - 2, 0), size) == b"\r\n";
+  if ended && scan(wire, 0, seven_bit()) == size && len(line_defects(wire, 0)) == 0 {
     { encoding: "7bit", data: wire }
   } else if mostly(wire, qp_plain()) {
+    let quoted = match text {
+      Some(lines) -> quoted_printable::encode_text(lines),
+      None -> quoted_printable::encode(wire),
+    };
     {
       encoding: "quoted-printable",
-      data: bytes_of_string(match text {
-        Some(lines) -> quoted_printable::encode_text(lines),
-        None -> quoted_printable::encode(wire),
-      }),
+      data: bytes_of_string(if !whole || string_ends_with(quoted, "\r\n") { quoted }
+      else { quoted ++ "=\r\n" }),
     }
   } else {
     let letters = bytes_of_string(base64_encode(wire));
     let n = bytes_len(letters);
     {
       encoding: "base64",
-      data: bytes::join(
-        map(range(0, (n + 75) / 76), |i: Int| bytes_slice(letters, i * 76, min(n, i * 76 + 76))),
-        b"\r\n",
+      data: bytes_concat(
+        bytes::join(
+          map(range(0, (n + 75) / 76), |i: Int| bytes_slice(letters, i * 76, min(n, i * 76 + 76))),
+          b"\r\n",
+        ),
+        if whole { b"\r\n" } else { b"" },
       ),
     }
   }
+}
 
 /// Every byte a `7bit` body may hold: ASCII but NUL.
 const fn seven_bit() -> Bytes = bytes_concat_all(map(range(1, 128), byte_of_int))
@@ -2836,10 +2864,10 @@ const fn seven_bit() -> Bytes = bytes_concat_all(map(range(1, 128), byte_of_int)
 fn qp_plain() -> Bytes =
   b"\t\r\n !\"#$%&'()*+,-./0123456789:;<>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
-fn text_part(text: String, subtype: String) -> Written / {abort.raise} = {
+fn text_part(text: String, subtype: String, whole: Bool) -> Written / {abort.raise} = {
   let wire = replace(bytes_of_string(text), b"\n", b"\r\n");
   let ascii = scan_until(wire, 0, high()) >= bytes_len(wire);
-  let body = coded(wire, Some(text));
+  let body = coded(wire, Some(text), whole);
   {
     head: bytes_of_string(
       "Content-Type: text/" ++ subtype ++ "; charset=" ++ (if ascii { "us-ascii" } else { "utf-8" })
@@ -2860,7 +2888,7 @@ fn file_part(a: Attachment, index: Int, kind: String) -> Written / {email.unwrit
     && all(held, |p: Param|
       is_token(p.name) && !string_contains(p.name, "*") && string_len(p.name) <= 40);
   if !fit { email.unwritable(UnfitAttachment(index)) } else {
-    let body = coded(a.data, None);
+    let body = coded(a.data, None, false);
     {
       head: bytes_concat_all([
         folded(
@@ -3020,10 +3048,19 @@ fn drafted_head(
 
 // --- Who a message goes to ----------------------------------------------------
 
-/// What a transport is handed beside a message's bytes.
-pub type Envelope = new {
-  /// Who the message is sent as: a draft's `Sender`, or else the first of its authors.
-  sender: Address,
+/// Where word that a message could not be delivered goes: RFC 5321's reverse path.
+pub type ReversePath =
+  /// Nowhere. The message is itself such word, a bounce or a delivery report, and none is sent
+  /// about it, so that two servers never answer each other's reports for ever.
+  | NullPath
+  /// To this address.
+  | ReturnTo(Address)
+
+/// What a transport is handed beside a message's bytes. It is built only here, so `utf8` is
+/// what its addresses say.
+pub opaque type Envelope = new {
+  /// Where a report of failure goes.
+  sender: ReversePath,
   /// Every address it goes to, once each.
   recipients: List<Address>,
   /// Whether an address here is outside ASCII, so that only a path offering `SMTPUTF8` takes
@@ -3031,27 +3068,110 @@ pub type Envelope = new {
   utf8: Bool,
 }
 
+gen for Envelope by envelopes
+
+/// The envelope of a reverse path and the addresses a message goes to, each of them once
+/// however it is cased in its domain.
+pub fn enveloped(path: ReversePath, to_all: List<Address>) -> Envelope = {
+  let once = fold(to_all, [], |acc: List<Address>, a: Address| push_unique(acc, a));
+  {
+    sender: path,
+    recipients: once,
+    utf8: !all(once, is_ascii) || (match path { ReturnTo(a) -> !is_ascii(a), NullPath -> false }),
+  }
+}
+
+/// Envelopes with and without a reverse path, to none, one and several addresses.
+pub fn envelopes() -> Gen<Envelope> =
+  gen::map2(
+    gen::option_of(addresses()),
+    gen::list_of(addresses(), 4),
+    |from: Option<Address>, to_all: List<Address>|
+      enveloped(match from { Some(a) -> ReturnTo(a), None -> NullPath }, to_all),
+  )
+
 /// Every address a draft goes to: those of `To`, `Cc` and `Bcc` in that order, the members of a
 /// group among them, each once however it is cased in its domain.
 pub fn recipients(d: Draft) -> List<Address> =
-  fold(
-    map(mailboxes_of(concat(concat(d.to, d.cc), d.bcc)), address_of),
-    [],
-    |acc: List<Address>, a: Address| push_unique(acc, a),
+  enveloped(NullPath, map(mailboxes_of(concat(concat(d.to, d.cc), d.bcc)), address_of)).recipients
+
+/// What a transport is handed beside the bytes `write` writes: a report of failure goes to the
+/// draft's `Sender`, or else the first of its authors, and the draft to everyone `recipients`
+/// answers, the `Bcc` recipients `write` leaves out among them.
+pub fn envelope(d: Draft) -> Envelope / {abort.raise} =
+  enveloped(
+    ReturnTo(match d.sender {
+      Some(s) -> address_of(s),
+      None -> match first(d.from) {
+        Some(m) -> address_of(m),
+        None -> panic("a draft has an author"),
+      },
+    }),
+    recipients(d),
   )
 
-/// What a transport is handed beside the bytes `write` writes: who the draft is sent as, and who
-/// it goes to, the `Bcc` recipients `write` leaves out among them.
-pub fn envelope(d: Draft) -> Envelope / {abort.raise} = {
-  let sent_as = match d.sender {
-    Some(s) -> address_of(s),
-    None -> match first(d.from) {
-      Some(m) -> address_of(m),
-      None -> panic("a draft has an author"),
+/// The repertoire a draft has to be written under: `Utf8` where an address of it, or a field
+/// `with_field` gave it, holds a character outside ASCII, which no encoding carries in an ASCII
+/// header; `Ascii` otherwise, where `write` puts every name and subject outside ASCII in encoded
+/// words. A message written under `Utf8` travels only where `SMTPUTF8` is offered.
+pub fn repertoire_for(d: Draft) -> Repertoire / {abort.raise} = {
+  let named_in = concat(
+    concat(concat(each(d.from), d.reply_to), match d.sender { Some(s) -> [One(s)], None -> [] }),
+    concat(concat(d.to, d.cc), d.bcc),
+  );
+  if all(mailboxes_of(named_in), |m: Mailbox| is_ascii(address_of(m)))
+      && all(d.fields, |f: Field| scan_until(f.raw, 0, high()) >= bytes_len(f.raw)) { Ascii }
+  else { Utf8 }
+}
+
+/// A message without its fields named `dropped`, in any case: `render` leaves their lines out
+/// and answers every other byte as it was read. What a relay does to `Bcc` before the message
+/// goes to anyone.
+pub fn without(m: Message, dropped: String) -> Message =
+  match m {
+    Message(h, children) ->
+      Message(
+        { ..h, fields: filter(h.fields, |f: Field| ascii_lower(f.name) != ascii_lower(dropped)) },
+        children,
+      ),
+  }
+
+/// The envelope a message read travels under when it is sent on: a report of failure goes to
+/// its `Sender`, or else the first of its authors, and the message to every address of its
+/// `To`, `Cc` and `Bcc` fields. A message that was resent (RFC 5322 §3.6.6) travels under its
+/// `Resent-` fields instead, which name who sent it on and to whom.
+///
+/// Raises `email.refused`: `Missing` where no field names a sender, `Repeated` for a message
+/// resent more than once, whose fields do not say which addresses belong to which resending,
+/// and, at the byte of a field's value, whatever keeps that field from being read, since a
+/// field half read is mail that goes to fewer people than it says.
+pub fn message_envelope(m: Message) -> Envelope / {email.refused, abort.raise} = {
+  let held_fields = held(m).fields;
+  let resent = any(held_fields, |f: Field| string_starts_with(ascii_lower(f.name), "resent-"));
+  let stem = if resent { "resent-" } else { "" };
+  let repertoire = repertoire_of(m);
+  let listed = |lower: String|
+    flat_map(fields_named(held_fields, stem ++ lower), |f: Field|
+      if f.value == "" { [] }
+      else { mailboxes_of(read_address_list(f.value, repertoire, Obsolete)) });
+  let twice = find(["resent-from", "resent-date"], |lower: String|
+    len(fields_named(held_fields, lower)) > 1);
+  match twice {
+    Some(lower) -> refuse(0, Repeated(lower)),
+    None -> {
+      let sent_as = match first(fields_named(held_fields, stem ++ "sender")) {
+        Some(f) -> read_mailbox(f.value, repertoire, Obsolete),
+        None -> match first(listed("from")) {
+          Some(author) -> author,
+          None -> refuse(0, Missing(stem ++ "from")),
+        },
+      };
+      enveloped(
+        ReturnTo(address_of(sent_as)),
+        map(concat(concat(listed("to"), listed("cc")), listed("bcc")), address_of),
+      )
     },
-  };
-  let to_all = recipients(d);
-  { sender: sent_as, recipients: to_all, utf8: !is_ascii(sent_as) || !all(to_all, is_ascii) }
+  }
 }
 
 // --- Canonical forms ----------------------------------------------------------
@@ -5384,9 +5504,10 @@ test "a blind copy is in the envelope, and in the bytes only where it is asked f
     "frank@example.org",
   ]);
   let e = envelope(d);
-  assert_eq(show(e.sender), "jdoe@machine.example");
+  assert_eq(e.sender, ReturnTo(address("jdoe", "machine.example")));
   assert_eq(e.recipients, recipients(d));
   assert_eq(e.utf8, false);
+  assert_eq(repertoire_for(d), Ascii);
   let dropped = read(write(d, "unused"), default_limits());
   assert_eq(bcc(dropped), []);
   assert_eq(header(dropped, "bcc"), None);
@@ -5399,9 +5520,163 @@ test "a blind copy is in the envelope, and in the bytes only where it is asked f
   assert_eq(drafted(kept), Some(d));
   assert_eq(drafted(dropped), Some(with_bcc(d, [])));
   let sender = named("Michael Jones", address("mjones", "machine.example"));
-  assert_eq(show(envelope(with_sender(d, sender)).sender), "mjones@machine.example");
+  assert_eq(show(envelope(with_sender(d, sender)).sender), "ReturnTo(mjones@machine.example)");
   let far = with_to(d, [one(mailbox(address("\u{7528}\u{6237}", "example.org", Utf8)))]);
-  assert_eq(envelope(far).utf8, true)
+  assert_eq(envelope(far).utf8, true);
+  assert_eq(repertoire_for(far), Utf8)
+}
+
+test "an envelope holds each address once, and says whether one of them is outside ASCII" {
+  let far = address("\u{7528}\u{6237}", "example.org", Utf8);
+  let mary = address("mary", "example.net");
+  let bounce = enveloped(NullPath, [jdoe(), address("jdoe", "EXAMPLE.ORG"), mary]);
+  assert_eq(bounce.sender, NullPath);
+  assert_eq(bounce.recipients, [jdoe(), mary]);
+  assert_eq(bounce.utf8, false);
+  assert_eq(enveloped(ReturnTo(far), [jdoe()]).utf8, true);
+  assert_eq(enveloped(NullPath, [jdoe(), far]).utf8, true);
+  assert_eq(enveloped(NullPath, []).recipients, [])
+}
+
+type Relayed = { what: String, message: String, expect: Result<String, Refusal> }
+
+fn relayed() -> List<Relayed> =
+  [
+    {
+      what: "a sender, and every address of To, Cc and Bcc, a group's among them",
+      message:
+        \\From: John Doe <jdoe@machine.example>, Ann <ann@example.org>
+        \\Sender: Michael Jones <mjones@machine.example>
+        \\To: Mary Smith <mary@example.net>, Team: a@example.org, b@example.org;
+        \\Cc: <boss@nil.test>, MARY@EXAMPLE.NET
+        \\Bcc: eve@example.org
+        \\Date: Fri, 21 Nov 1997 09:55:06 -0600
+        \\
+        \\Hi.
+      ,
+      expect: Ok(
+        "mjones@machine.example > mary@example.net a@example.org b@example.org boss@nil.test MARY@EXAMPLE.NET eve@example.org",
+      ),
+    },
+    {
+      what: "the first author where no sender is named, and an empty blind copy field",
+      message:
+        \\From: jdoe@machine.example, ann@example.org
+        \\To: mary@example.net
+        \\Bcc:
+        \\
+        \\Hi.
+      ,
+      expect: Ok("jdoe@machine.example > mary@example.net"),
+    },
+    {
+      what: "a message resent travels under its Resent- fields",
+      message:
+        \\Resent-From: Mary Smith <mary@example.net>
+        \\Resent-To: Jane Brown <j-brown@other.example>
+        \\Resent-Bcc: eve@example.org
+        \\Resent-Date: Mon, 24 Nov 1997 14:22:01 -0800
+        \\From: John Doe <jdoe@machine.example>
+        \\To: Mary Smith <mary@example.net>
+        \\Cc: boss@nil.test
+        \\
+        \\Hi.
+      ,
+      expect: Ok("mary@example.net > j-brown@other.example eve@example.org"),
+    },
+    {
+      what: "a message resent twice does not say whose addresses are whose",
+      message:
+        \\Resent-From: a@example.org
+        \\Resent-To: b@example.org
+        \\Resent-From: mary@example.net
+        \\Resent-To: c@example.org
+        \\From: jdoe@machine.example
+        \\
+        \\Hi.
+      ,
+      expect: Err({ at: 0, why: Repeated("resent-from") }),
+    },
+    {
+      what: "no author",
+      message:
+        \\To: mary@example.net
+        \\
+        \\Hi.
+      ,
+      expect: Err({ at: 0, why: Missing("from") }),
+    },
+    {
+      what: "a resent message with no one who resent it",
+      message:
+        \\Resent-To: b@example.org
+        \\From: jdoe@machine.example
+        \\
+        \\Hi.
+      ,
+      expect: Err({ at: 0, why: Missing("resent-from") }),
+    },
+    {
+      what: "a recipient field that does not read is refused, never passed over",
+      message:
+        \\From: jdoe@machine.example
+        \\To: mary@example.net, broken@
+        \\
+        \\Hi.
+      ,
+      expect: Err({ at: 25, why: BadDomain }),
+    },
+    {
+      what: "no recipient at all is an envelope to no one",
+      message:
+        \\From: jdoe@machine.example
+        \\
+        \\Hi.
+      ,
+      expect: Ok("jdoe@machine.example >"),
+    },
+  ]
+
+test "a message read travels under the envelope its fields name" for r: Relayed in relayed() {
+  let m = read_tolerant(sent(r.message), default_limits()).message;
+  let named_by = try { message_envelope(m) };
+  assert_eq(
+    result_map(named_by, |e: Envelope|
+      join(
+        prepend(
+          match e.sender { ReturnTo(a) -> show(a) ++ " >", NullPath -> "<>" },
+          map(e.recipients, |a: Address| show(a)),
+        ),
+        " ",
+      )),
+    r.expect,
+  )
+}
+
+test "a message without a field is rendered as it was read, those lines aside" {
+  let data = sent(
+    \\From: jdoe@machine.example
+    \\bcc: eve@example.org,
+    \\ frank@example.org
+    \\To: mary@example.net
+    \\Bcc: grace@example.org
+    \\
+    \\Bcc: this line is the body's
+  );
+  let m = read_tolerant(data, default_limits()).message;
+  assert_eq(
+    render(without(m, "Bcc")),
+    sent(
+      \\From: jdoe@machine.example
+      \\To: mary@example.net
+      \\
+      \\Bcc: this line is the body's
+    ),
+  );
+  assert_eq(render(without(m, "resent-bcc")), data);
+  assert_eq(bcc(without(m, "BCC")), []);
+  assert_eq(len(message_envelope(m).recipients), 4);
+  assert_eq(len(message_envelope(without(m, "bcc")).recipients), 1)
 }
 
 type Unwritten = { what: String, draft: Draft, boundary: String, why: Unwritable }
@@ -5506,7 +5781,7 @@ test "under UTF-8 a draft is written as it is, and read back" {
   let data = write(d, "unused", Utf8);
   assert_eq(
     string_of_bytes(data),
-    "Date: Fri, 21 Nov 1997 09:55:06 -0600\r\nFrom: J\u{fc}rgen M\u{fc}ller <j\u{fc}rgen@b\u{fc}cher.example>\r\nTo: \u{7528}\u{6237}@\u{4f8b}\u{3048}.jp\r\nSubject: Gr\u{fc}\u{df}e\r\nMessage-ID: <1@example.org>\r\nX-Note: caf\u{e9}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nR3LDvMOfZQ0K",
+    "Date: Fri, 21 Nov 1997 09:55:06 -0600\r\nFrom: J\u{fc}rgen M\u{fc}ller <j\u{fc}rgen@b\u{fc}cher.example>\r\nTo: \u{7528}\u{6237}@\u{4f8b}\u{3048}.jp\r\nSubject: Gr\u{fc}\u{df}e\r\nMessage-ID: <1@example.org>\r\nX-Note: caf\u{e9}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nR3LDvMOfZQ0K\r\n",
   );
   assert_eq(drafted(read(data, default_limits(), Utf8)), Some(d));
   assert_eq(envelope(d).utf8, true)
@@ -5580,19 +5855,92 @@ law "a draft written and read strictly is the draft, and what was read is render
     }
   }
 
-law "a draft written in ASCII is read back without its blind copies, or holds an address or a field outside ASCII"
+law "a draft written in ASCII is read back without its blind copies, or is one that has to be written in UTF-8"
   forall (d: Draft) {
     match build(d, "boundary") {
-      Err(why) ->
-        why == NeedsUtf8
-          && (!all(push(envelope(d).recipients, envelope(d).sender), is_ascii)
-          || !all(mailboxes_of(concat(each(d.from), d.reply_to)), |m: Mailbox|
-            is_ascii(address_of(m)))
-          || any(d.fields, |f: Field| scan_until(f.raw, 0, high()) < bytes_len(f.raw))),
+      Err(why) -> why == NeedsUtf8 && repertoire_for(d) == Utf8,
       Ok(data) -> match parse(data, roomy()) {
         Ok(m) ->
           drafted(m) == Some(with_bcc(d, [])) && scan_until(data, 0, high()) >= bytes_len(data),
         Err(_) -> false,
+      },
+    }
+  }
+
+law "a draft is written under the repertoire it needs, in ASCII exactly where that is ASCII, and its envelope needs no more"
+  forall (d: Draft) {
+    result_is_ok(build(d, "boundary", repertoire_for(d), Kept))
+      && result_is_ok(build(d, "boundary", Ascii, Kept)) == (repertoire_for(d) == Ascii)
+      && (!envelope(d).utf8 || repertoire_for(d) == Utf8)
+  }
+
+law "a draft is written as lines a transport takes: each ends with CRLF, the last among them, and none is past 998 octets"
+  forall (d: Draft) {
+    all([Dropped, Kept], |blind: Bcc|
+      match build(d, "boundary", repertoire_for(d), blind) {
+        Err(_) -> false,
+        Ok(data) -> {
+          let n = bytes_len(data);
+          len(line_flaws(data)) == 0 && bytes_slice(data, max(n - 2, 0), n) == b"\r\n"
+        },
+      })
+  }
+
+test "a body with no line break at its end is written with one that is no part of it" {
+  let texts = [
+    "Hello",
+    "Hello\nagain",
+    "caf\u{e9}",
+    "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}",
+    "a=b",
+    "",
+    "x\n",
+  ];
+  assert_eq(
+    map(texts, |body: String| {
+      let d = with_text(plain_draft(), body);
+      let data = write(d, "unused");
+      let m = read(data, default_limits());
+      {
+        ended: string_ends_with(string_of_bytes(data), "\r\n"),
+        encoding: header(m, "content-transfer-encoding"),
+        read: text_body(m) == Some(Text(body)),
+        same: drafted(m) == Some(d),
+      }
+    }),
+    map(
+      ["quoted-printable", "quoted-printable", "base64", "base64", "base64", "7bit", "7bit"],
+      |encoding: String| { ended: true, encoding: Some(encoding), read: true, same: true },
+    ),
+  );
+  assert(
+    string_ends_with(
+      string_of_bytes(write(with_text(plain_draft(), "Hello"), "unused")),
+      "\r\n\r\nHello=\r\n",
+    ),
+  )
+}
+
+law "an envelope holds each address once, and says UTF-8 exactly where one of them is outside ASCII"
+  forall (e: Envelope) {
+    let held_here = match e.sender {
+      ReturnTo(a) -> push(e.recipients, a),
+      NullPath -> e.recipients,
+    };
+    enveloped(e.sender, concat(e.recipients, e.recipients)) == e
+      && e.utf8 == !all(held_here, is_ascii)
+  }
+
+law "the envelope of a draft written with its blind copies is the envelope of the message read back"
+  forall (d: Draft) {
+    match build(d, "boundary", Utf8, Kept) {
+      Err(_) -> false,
+      Ok(data) -> match parse(data, roomy(), Utf8) {
+        Err(_) -> false,
+        Ok(m) ->
+          (try { message_envelope(m) }) == Ok(envelope(d))
+            && render(without(m, "Bcc"))
+            == (match build(d, "boundary", Utf8) { Ok(dropped) -> dropped, Err(_) -> b"" }),
       },
     }
   }
