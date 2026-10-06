@@ -23,12 +23,13 @@ import std.bin
 import std.hash (blake3)
 import report (Answer, ok_code, count_of, indent, refused, warning_lines)
 import signature (SetLine, counted_lines, effect_sets, provenance, provenance_lines, set_lines,
-                  atom_texts)
-import style (Style, bold, dim, green)
+                  atom_texts, raise_text, raise_kind)
+import std.term (Style, bold, dim, green, plain)
 import compiler.costs (Report)
 import compiler.termination (Ends, Stated, Diverges, Site)
 import compiler.front (Analysis, effect_sets_of)
-import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag)
+import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag, Raise, Unshown,
+                       Unguarded, Calls)
 import compiler.resolve (Diag)
 import compiler.types (Atom, Type, printer_new, print_atom_list, scheme_text, row_text, type_text,
                        atom_text)
@@ -228,11 +229,46 @@ fn def_block(
   );
   if !explain { said } else {
     fold(
-      provenance_lines(provenance(def_info), types_indent()),
+      concat(
+        provenance_lines(provenance(def_info), types_indent()),
+        map(def_info.raises, |r: Raise|
+          "  raises"
+            ++ (match raise_at(program, def_info, r) { Some(p) -> " at " ++ p, None -> "" })
+            ++ ": "
+            ++ raise_text(r.why)),
+      ),
       said,
       |acc: List<String>, l: String| push(acc, under() ++ dim(style, l)),
     )
   }
+}
+
+/// Where a raise is: in its definition's body, where that body is now.
+fn raise_at(program: Program, def_info: DefInfo, r: Raise) -> Option<String> / {abort.raise} = {
+  let start = def_info.at.span.start;
+  location_of(program, {
+    module: def_info.at.module,
+    span: { start: start + r.span.start, end: start + r.span.end },
+  })
+}
+
+fn raise_json(program: Program, def_info: DefInfo, r: Raise) -> Json / {abort.raise} = {
+  let named = |name: Bytes| Str(string_of_bytes_lossy(name));
+  let said: List<Member> = [
+    { key: "at", value: match raise_at(program, def_info, r) { Some(p) -> Str(p), None -> Null } },
+    { key: "kind", value: Str(raise_kind(r.why)) },
+    { key: "why", value: Str(raise_text(r.why)) },
+  ];
+  object(match r.why {
+    Unshown(u) ->
+      push(push(said, { key: "callee", value: named(u.callee) }), {
+        key: "requires",
+        value: named(u.needs),
+      }),
+    Unguarded(name) -> push(said, { key: "callee", value: named(name) }),
+    Calls(name) -> push(said, { key: "callee", value: named(name) }),
+    _ -> said,
+  })
 }
 
 /// Each definition's location, by its qualified name.
@@ -359,7 +395,7 @@ fn module_json(
   object(fields)
 }
 
-fn provenance_fields(def_info: DefInfo) -> List<Member> / {abort.raise} =
+fn provenance_fields(program: Program, def_info: DefInfo) -> List<Member> / {abort.raise} =
   [
     {
       key: "written_as",
@@ -372,6 +408,10 @@ fn provenance_fields(def_info: DefInfo) -> List<Member> / {abort.raise} =
       ),
     },
     { key: "declared_not_performed", value: Array(json_strings(provenance(def_info).unperformed)) },
+    {
+      key: "raises",
+      value: Array(map(def_info.raises, |r: Raise| raise_json(program, def_info, r))),
+    },
   ]
 
 fn definition_json(
@@ -391,8 +431,9 @@ fn definition_json(
     { key: "repeats", value: Array(map(def_info.repeats, |i: Int| int(i))) },
     { key: "ending", value: ending_json(program, located, def_info) },
   ];
-  let fields: List<Member> = if !explain { named }
-  else { fold(provenance_fields(def_info), named, |acc: List<Member>, f: Member| push(acc, f)) };
+  let fields: List<Member> = if !explain { named } else {
+    fold(provenance_fields(program, def_info), named, |acc: List<Member>, f: Member| push(acc, f))
+  };
   object(fields)
 }
 
@@ -742,8 +783,6 @@ pub fn run(
 }
 
 // --- Tests ------------------------------------------------------------------
-
-fn plain() -> Style = { styled: false }
 
 fn a_project(path: String, main: Bytes) -> Project =
   {

@@ -1,8 +1,8 @@
 //! Children that run beside the program: started, fed, read, signalled and reaped by handle.
 
 use super::{MAX_CAPTURE_BYTES, OutputSink, Stream};
-use crate::pool::{Ended, Finished, Heard};
-use ply_eval::Resource;
+use crate::pool::record;
+use ply_eval::{Resource, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -16,6 +16,54 @@ const CHUNK: usize = 64 * 1024;
 
 /// How soon a watcher looks again at a child that changed state without ending.
 const RECHECK: Duration = Duration::from_millis(10);
+
+/// How a spawned process ended: its own code, or the signal that killed it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ended {
+    Exited(i64),
+    Signalled(i64),
+}
+
+/// A `std.process.Finished`: how a child ended and what it left in each stream.
+pub struct Finished {
+    pub ended: Ended,
+    pub out: Vec<u8>,
+    pub err: Vec<u8>,
+}
+
+impl Finished {
+    pub(super) fn value(self) -> Value {
+        let ended = match self.ended {
+            Ended::Exited(code) => Value::ctor("std.process.Exited", vec![Value::Int(code)]),
+            Ended::Signalled(signal) => {
+                Value::ctor("std.process.Signalled", vec![Value::Int(signal)])
+            }
+        };
+        record([
+            ("ended", ended),
+            ("err", Value::bytes(self.err)),
+            ("out", Value::bytes(self.out)),
+        ])
+    }
+}
+
+/// A `std.process.Heard`: what `process.output_line` answers.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Heard {
+    Said(String),
+    Quiet,
+    Closed,
+}
+
+impl Heard {
+    pub(super) fn value(self) -> Value {
+        match self {
+            Heard::Said(line) => Value::ctor("std.process.Said", vec![Value::str(line)]),
+            Heard::Quiet => Value::ctor("std.process.Quiet", Vec::new()),
+            Heard::Closed => Value::ctor("std.process.Closed", Vec::new()),
+        }
+    }
+}
 
 /// `std.process.Output`: where one of a child's output streams goes.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -42,6 +90,9 @@ pub enum Signal {
     Interrupt,
     Terminate,
     Kill,
+    User1,
+    User2,
+    WindowChange,
 }
 
 /// What one `process.start` asked for, with the executable its label resolved to.
@@ -513,7 +564,7 @@ fn text_of(line: &[u8]) -> String {
 
 /// A sink that refuses a line has nowhere else to put it, and the child is not the one to tell.
 fn forward(sink: &OutputSink, to: Stream, line: &[u8]) {
-    let _ = sink.write(to, &text_of(line));
+    let _ = sink.line(to, &text_of(line));
 }
 
 struct Destination {
@@ -686,6 +737,9 @@ fn deliver(_: &mut std::process::Child, pid: u32, signal: Signal) -> std::io::Re
         Signal::Interrupt => libc::SIGINT,
         Signal::Terminate => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
+        Signal::User1 => libc::SIGUSR1,
+        Signal::User2 => libc::SIGUSR2,
+        Signal::WindowChange => libc::SIGWINCH,
     };
     // SAFETY: a plain system call; the child is unreaped, so its pid names no other process.
     if unsafe { libc::kill(pid as libc::pid_t, number) } == 0 {

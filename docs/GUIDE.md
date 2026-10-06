@@ -312,8 +312,9 @@ Loosest to tightest; all binary operators are left-associative:
   the functions it names (§4.4). They perform nothing and cannot raise, and a
   literal beside one is still an `Int`: `a + 1` is `E0201`.
 * Arithmetic is checked. A `/` or `%` whose divisor is zero raises (§6.8), so
-  either puts `abort.raise` in the row unless its divisor is a literal other
-  than zero or its operands are `Float`s. Overflow and a shift count that is
+  either puts `abort.raise` in the row unless its operands are `Float`s, its
+  divisor is a literal other than zero, or the conditions on the way to it show
+  an `Int` divisor is not zero. Overflow and a shift count that is
   negative or not less than the type's width are the machine's limit, as the
   call ceiling is: they end the run (`E0502`) and are in no row. `<<` discards
   shifted-out bits and `checked_*` answer `None` (§12).
@@ -656,6 +657,8 @@ point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `decimal_div`
 and `decimal_round` take the scale of their answer, and answer with exactly that
 many digits after the point, the exact value rounded once by the `Rounding`
 given; they raise where 96 bits do not hold the answer at that scale.
+`decimal_scale` reads the scale a value has, and a `decimal_round` to no more
+digits than that only drops digits, so it cannot raise.
 
 ### 4.2 Records and tuples
 
@@ -1027,9 +1030,10 @@ secret: each is one-way in the key.
 
 A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
 a `forall`, and reaches a host operation only if that operation's registration
-allows it (`E0439`). No operation `ply` ships takes one, so a secret has no way
-out of a program: key material that is to be written down, as `ply keygen`'s
-is, is written by whoever drew it, before it is sealed.
+allows it (`E0439`). The operations `ply` ships that take one are
+`std.password`'s, which hash a password and answer the hash, one-way in it; so
+a secret has no way out of a program: key material that is to be written down,
+as `ply keygen`'s is, is written by whoever drew it, before it is sealed.
 
 **`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
 branded by their region and cannot outlive it; the brand prints as
@@ -1703,7 +1707,9 @@ raise in another clause goes to a `handle` further out than the one whose
 clause raised. A clause answers the raise it names and leaves the effect's
 others to pass. A raise no clause answers ends the run with `E0502`, naming the
 operation and what it carried; a test's is its failure, which is why a raise is
-in no footprint (§8.4).
+in no footprint (§8.4). One raise is the host's own under `ply run --host`:
+`std.process`'s `pipe.broken`, unanswered, ends the run as the closed pipe it
+reports would have, with nothing written and status 141 (§16).
 
 `try { body }` answers `Ok` of what `body` answers, or `Err` of what a raise in
 it carried: the value for a raise of one parameter, `()` for one of none, and
@@ -1724,16 +1730,74 @@ value it is given: `panic`, `assert` and `assert_eq`, a builtin outside what it
 is defined for (§12), a `/` or `%` by zero (§2.4), a `let` whose pattern misses
 (§5.1), an `iterate` past its budget, a `task.join` of a cancelled task, a
 `task.channel` of a negative capacity and a `random.below` of a bound below one
-(§9). What a literal argument settles does not raise: a divisor other than
-zero, a capacity or bound in range, and a narrowing such as `u8_of_int(200)` of
-a value its type holds. A signature that leaves `abort.raise` out of its row
-where its body can raise is `E0302`, which names the operation and offers the
-row to write. Overflow, the call ceiling and a spent step budget end the run
-whatever the row says. A clause for `abort.raise` is handed the message:
-`panic`'s argument, or what the run would otherwise have reported, a value it
-names told by its kind. Unanswered, it is `E0501` for an assertion and `E0502`
-for anything else. Nearly every body can raise it, so a `try` answers it only
-by name: `try[abort.raise] { body }`.
+(§9). A signature that leaves `abort.raise` out of its row where its body can
+raise is `E0302`, which names the operation and offers the row to write.
+Overflow, the call ceiling and a spent step budget end the run whatever the row
+says. A clause for `abort.raise` is handed the message: `panic`'s argument, or
+what the run would otherwise have reported, a value it names told by its kind.
+Unanswered, it is `E0501` for an assertion and `E0502` for anything else. A
+`try` answers it only by name: `try[abort.raise] { body }`.
+
+```ply
+fn peek(b: Bytes, i: Int) -> Int = if i < 0 || i >= bytes_len(b) { -1 } else { bytes_at(b, i) }
+
+fn hex(b: Bytes) -> String =
+  fold(range(0, bytes_len(b)), "", |acc: String, i: Int| {
+    let n = bytes_at(b, i);
+    acc ++ string_slice("0123456789abcdef", n / 16, n / 16 + 1)
+      ++ string_slice("0123456789abcdef", n % 16, n % 16 + 1)
+  })
+```
+
+A call that cannot fail where it stands adds no `abort.raise`, so neither of
+these writes a row. A builtin that can raise states where it cannot, as a
+`requires` over its parameters (`bytes_at`: `0 <= i && i < bytes_len(b)`), and
+a call adds no `abort.raise` when the conditions on the way to it show every
+clause; so does a `/` or `%` whose `Int` divisor they show is not zero, and a
+`task.channel` or `random.below` whose capacity or bound they show in range. A
+condition is one the body passed on its way to the call: an `if`, the left of
+`&&` (which held) or of `||` (which did not), a `match` arm's guard, a literal
+pattern an integer or a condition matched or an earlier arm's did not, a range
+pattern an integer matched (`b'0'..=b'9'` holds it between the two, and
+alternatives hold it between the least and the greatest of them), a list
+pattern of so many items, `list_at` or `array_at` answering `Some` in a `match`
+or a `let ... else`, and, inside a lambda `map`, `filter` or `fold` is handed
+beside a `range(lo, hi)`, that its last parameter lies in the range. A `let`
+of one name is what its value is, and a field read through records is one value
+wherever it is read.
+
+What is read is linear `Int` arithmetic: literals, bindings, fields, `+`, `-`,
+a product with a literal, and what a builtin answers, by its `ensures`
+(`bytes_at` answers `0..=255`, a length is not negative, `min` answers no more
+than either argument, `bytes_scan` answers between `from` and the end). A
+quotient or remainder by a literal, a value masked with `&`, an `|` or `^` of
+two values in `0..2^n`, a shift right by a literal and a remainder by a divisor
+held above zero are each bounded as the operator bounds them, so `n & 0xFF` and
+a byte's `n / 16` are in range for `byte_of_int` and for an index into sixteen
+digits. A string or bytes literal has the length it is written with. Nothing
+else is read: a call of a definition is a value nothing is known of, whatever
+its body, and a width other than `Int` is read only where `int_of_u8` and the
+like answer one. What a call that can raise ensures holds only past the call.
+
+The check is the checker's own and sees only the body it is in, so a row never
+depends on another body. It decides by elimination over the integers, within a
+bound; where a clause is not shown, by a miss of the method or because it does
+not hold, the call keeps its `abort.raise`, and nothing is refused. So an index
+loop that recurses on `i + 1` past `i >= bytes_len(b)` alone still raises, at
+a negative `i`: guard both ends, or fold over a `range`. A definition's own
+`requires` is not read (§10): it is not checked at its callers, so nothing in
+its body may lean on it.
+
+`ply check --types --explain` lists under a definition each place its body can
+raise `abort.raise` and why: the clause of a builtin's `requires` nothing on
+the way shows, a divisor not shown other than zero, a `let` that can miss, a
+builtin that states no `requires` (`panic`, `string_of_bytes`), a definition
+whose row names the raise (once, where it is first called), or a function
+value whose type does. A row that names a raise no place in the body makes
+prints as `declared, not performed`, and so does one whose only raise is the
+definition's own recursion; under `--json` each definition carries both, as
+`raises` (each with its `at`, `kind`, `why` and, for a builtin, `callee` and
+`requires`) and `declared_not_performed`.
 
 A `parallel` branch's raise is answered around the block. A task may raise:
 its raise goes to the task's own `handle`s and then to those around its
@@ -2554,7 +2618,25 @@ written in, and the six the wrapping and saturating operators are written in
 its range, so with `numeric_of_int` it converts between any two.
 `ply doc prelude` lists them all, each with the summary of
 its doc, and `ply doc NAME` prints one: its signature with the parameters' names,
-and its doc.
+its doc, and its clauses.
+
+A builtin whose row names `abort.raise` may state a `requires`: a condition on
+its arguments under which a call cannot raise. For most it is the whole of where
+one cannot; `decimal_round`'s is the part arithmetic can say, since past it a
+call raises only where the zeros it fills do not fit. A call that shows the
+clause adds no `abort.raise` (§6.8). An `ensures` says
+what a call answers, as `result`, which is what the checker knows of that value
+when it reads a later clause. One with no `requires` raises on something its
+arguments' values do not say in arithmetic: `panic`, a failed `assert`,
+`string_of_bytes` of bytes that are not UTF-8, `string_find` of an absent
+needle, an `iterate` past its budget, `int_of_u64` of a value past an `Int`.
+
+```
+   bytes_at(b: Bytes, i: Int) -> Int / {abort.raise}
+      `0..=255`; raises out of range.
+      requires 0 <= i && i < bytes_len(b)
+      ensures 0 <= result && result <= 255
+```
 
 ## 13. The standard library
 
@@ -2587,10 +2669,11 @@ Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound
 nondeterministic handler is cached with what it read and the binding it ran
 under (§8.2), so its pass never answers for a hermetic run; one that reaches only
-deterministic handlers, whose answers are a function of what they are handed, is
-cached like any other. An operation performed inside a `simulate`
+deterministic handlers, whose answers are a function of what they are handed, as
+`std.password`'s hashes are, is cached like any other. An operation performed
+inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
-once per interleaving. `std.signal` and `std.process` are bound only
+once per interleaving. `std.signal`, `std.process` and `std.term` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
 test run binds `process.bound`, `process.spawn`, `process.start` and the
 operations on a started child, which reach only the programs `--exec` names. All
@@ -2619,9 +2702,9 @@ checked against that declaration, so it performs none of it.
 
 | flag | meaning |
 | --- | --- |
-| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
-| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
-| `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below; `E0454` if not a directory |
+| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`; `E0430` if it does not load, `E0429` if unnamed |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
+| `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
@@ -2783,7 +2866,7 @@ machine. Each package's token is the configuration key `token.<name>` — one ex
 name per key, so a `--config` file of `token.orders=...` lines is the whole of
 who may publish what. It serves one connection at a time, and takes a package's
 lock around every write, so two registries over one store never interleave one.
-Like every Ply listener it binds `127.0.0.1`: another machine reaches it through a
+Like every Ply listener it binds loopback, here `127.0.0.1`: another machine reaches it through a
 proxy in front of it, one that passes TLS through to a `--tls` registry or
 terminates it for a plain one.
 
@@ -2820,11 +2903,17 @@ not hold, is `E0461`.
 ## 16. The `ply` command
 
 `ply [--color auto|always|never] <command> [path] [options]`. `--color` is
-global; `auto` colours only a terminal with `NO_COLOR` unset. The path defaults
+global and outranks the environment; `auto` decides as `std.term`'s `decide`
+does (`ply doc std.term`), each variable counting where it is set and not
+empty, whatever its value: colour where `FORCE_COLOR` is set (force-color.org);
+else none where `NO_COLOR` is set (no-color.org); else colour where
+`CLICOLOR_FORCE` is set (bixense.com/clicolors); else colour only on a terminal
+whose `TERM` is not `dumb`. The path defaults
 to `.`. Every command takes `--json` and then prints exactly one JSON object on
 stdout, compact and with its keys sorted.
 
-The command reads its own environment: `NO_COLOR`, `PLY_CACHE_UPSTREAM` (§1),
+The command reads its own environment: `NO_COLOR`, `FORCE_COLOR`,
+`CLICOLOR_FORCE`, `TERM`, `COLORTERM`, `PLY_CACHE_UPSTREAM` (§1),
 `PLY_REGISTRY` and `PLY_REGISTRY_TOKEN` (§15.1), the backend's `PLY_C_*`
 (§8.6), and `PLY_TRUST` — PEM files, colon-separated, whose certificates the
 command's own HTTPS connections (a registry's, for `ply publish`, `ply yank` and
@@ -2840,6 +2929,7 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 3 | the drain deadline expired with requests in flight |
 | 4 | `ply test --kept`: what earlier runs kept does not answer the run |
 | *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
+| 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run --host` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
 and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
@@ -2849,7 +2939,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets and provenance), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |

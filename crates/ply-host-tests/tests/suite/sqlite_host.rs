@@ -334,10 +334,13 @@ fn a_database_is_never_opened_through_a_symbolic_link() {
             "{inside}"
         );
     }
-    let out = rooted
-        .call("m.opens", vec![Value::str("out.db")])
-        .expect_err("a link out of the root");
-    assert_eq!(out.code, codes::FS_PATH_ESCAPES_ROOT);
+    std::os::unix::fs::symlink(outside.join("gone.db"), root.join("gone.db")).unwrap();
+    for leaving in ["out.db", "gone.db"] {
+        let out = rooted
+            .call("m.opens", vec![Value::str(leaving)])
+            .expect_err("a link out of the root");
+        assert_eq!(out.code, codes::FS_PATH_ESCAPES_ROOT, "{leaving}");
+    }
 
     // The journal and the write-ahead log the engine would open beside a database, each a link
     // to a file outside the root.
@@ -360,13 +363,23 @@ fn a_database_is_never_opened_through_a_symbolic_link() {
     assert_eq!(std::fs::read(outside.join("out.db")).unwrap(), b"");
     assert_eq!(files(&outside), ["out.db"]);
 
-    // A backup is written to a new file, never through a link that is already there.
+    // A backup is written to a new file, never through a link that is already there, and a link
+    // to where nothing is outside the root leaves it whether or not anything is there.
     rooted.answered("m.round_trip", vec![]);
-    std::os::unix::fs::symlink(outside.join("copied.db"), root.join("copy.db")).unwrap();
+    std::os::unix::fs::symlink(root.join("missing.db"), root.join("copy.db")).unwrap();
     assert_eq!(
         rooted.answered("m.backs_up", vec![Value::str("copy.db")]),
         Value::str("refused")
     );
+    assert!(
+        !root.join("missing.db").exists(),
+        "the backup went through the link"
+    );
+    std::os::unix::fs::symlink(outside.join("copied.db"), root.join("away.db")).unwrap();
+    let away = rooted
+        .call("m.backs_up", vec![Value::str("away.db")])
+        .expect_err("a link out of the root");
+    assert_eq!(away.code, codes::FS_PATH_ESCAPES_ROOT);
     assert_eq!(
         rooted.answered("m.backs_up", vec![Value::str("kept.db")]),
         Value::str("ran")
