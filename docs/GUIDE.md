@@ -1858,7 +1858,7 @@ A test may range over a table, and is then a test for each of its elements, a
 type Resolution = { reference: String, target: String }
 
 test "resolves {c.reference}" for c: Resolution in resolutions() {
-  assert_eq(url_resolve(base(), c.reference), c.target)
+  assert_eq(url_join(base(), c.reference), url_parse(c.target))
 }
 ```
 
