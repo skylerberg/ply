@@ -1,14 +1,14 @@
 //! The `ply` command line as one declaration: every command, flag, positional and refusal rule, as
-//! a `cmdline` spec. The parser and help renderer are `cmdline`'s; this module is the data, the
-//! value shapes (`--seed`, `--tls`, `--fs`, `--exec`), and the one cross-rule a flag cannot say
-//! alone (`--sim random` against `--sim-budget`).
+//! a `std.cli` spec. The parser and help renderer are `std.cli`'s; this module is the data, the
+//! value shapes (`--seed`, `--tls`, `--fs`, `--exec`, `--sim-roots`), and the one cross-rule a flag
+//! cannot say alone (`--sim random` against `--sim-budget`).
 
-import cmdline (Choice, Command, Flag, Help, Nat, Outcome, Parsed, Pos, Positional, Refused, Run,
-                Spec, Switch, Text, Version, bare, body, checking, command, conflicting, defaulted,
-                excused, has, many, parse, parse_nat, path_of, positional, range_of, repeated,
-                requiring, switch, value, valued, values_of, with_default, with_extra,
-                with_positionals, with_short, with_subs, with_trailing)
 import sim.plan
+import std.cli (Choice, Command, Flag, Help, Nat, Outcome, Parsed, Pos, Positional, Refused, Run,
+                Spec, Text, Version, bare, body, checking, command, conflicting, defaulted, excused,
+                faults, has, help, many, parse, parse_nat, positional, refusal_text, repeated,
+                requiring, switch, value, valued, values_of, version_line, with_default, with_extra,
+                with_positionals, with_short, with_subs, with_trailing)
 import std.string (split_once)
 
 // --- The value shapes -----------------------------------------------------------
@@ -150,6 +150,19 @@ fn simulation_flags() -> List<Flag> =
       "Also run the search twice more, unpruned and blind to the order spawns and joins impose, and report what each cost.",
     ),
   ]
+
+/// `FROM..TO`: the naturals from FROM up to but not including TO, and never none of them.
+pub fn range_of(text: String) -> Option<{ from: Int, to: Int }> / {abort.raise} =
+  match split_once(text, "..") {
+    None -> None,
+    Some(cut) -> match parse_nat(cut.head) {
+      None -> None,
+      Some(from) -> match parse_nat(cut.tail) {
+        None -> None,
+        Some(to) -> if from < to { Some({ from: from, to: to }) } else { None },
+      },
+    },
+  }
 
 fn sim_roots_ok(text: String) -> Result<Unit, String> / {abort.raise} =
   match range_of(text) {
@@ -836,7 +849,7 @@ fn std_cmd() -> Command =
         "show",
         "MODULE",
         Text,
-        "Print each module's source instead of listing it; written bare, prints every one.",
+        "Print a module's source, or a data file one embeds by the name the listing gives it; written bare, prints every module's source.",
       ),
       "*",
     ),
@@ -1137,21 +1150,40 @@ pub fn parsed(argv: List<String>) -> Parsed / {abort.raise} =
 
 // --- Tests ----------------------------------------------------------------------
 
-fn ply_parse(argv: List<String>) -> Outcome / {abort.raise} = parse(spec("0.0.0-test"), argv)
+fn ply_parse(argv: List<String>) -> Outcome<Parsed> / {abort.raise} =
+  parse(spec("0.0.0-test"), argv)
 
 fn ran(argv: List<String>) -> Parsed / {abort.raise} =
   match ply_parse(argv) { Run(p) -> p, _ -> panic("the line was refused, not run") }
 
 fn refusal(argv: List<String>) -> String / {abort.raise} =
   match ply_parse(argv) {
-    Refused(text) -> text,
+    Refused(refused) -> refusal_text(spec("0.0.0-test"), refused),
     Run(p) -> panic("the line ran"),
     Help(_) -> panic("the line was help"),
-    Version(_) -> panic("the line was the version"),
+    Version -> panic("the line was the version"),
   }
+
+/// The first positional, or the path a command defaults to.
+fn path_of(parsed: Parsed) -> String =
+  match list_at(parsed.positionals, 0) { Some(first) -> first, None -> "." }
 
 test "the spec declares every top-level command" {
   assert_eq(len(body(spec("0.0.0-test").root).subs), 27)
+}
+
+test "the surface declares nothing its own parser cannot read" {
+  assert_eq(faults(spec("0.0.0-test")), [])
+}
+
+test "a range of seeds is two naturals, the first below the second" {
+  assert_eq(range_of("5..6"), Some({ from: 5, to: 6 }));
+  assert_eq(range_of("0..64"), Some({ from: 0, to: 64 }));
+  assert_eq(range_of("6..5"), None);
+  assert_eq(range_of("5..5"), None);
+  assert_eq(range_of("5"), None);
+  assert_eq(range_of("-1..5"), None);
+  assert_eq(range_of("a..b"), None)
 }
 
 test "the path defaults to the current directory" {
@@ -1341,7 +1373,8 @@ fn for_help(cmds: List<String>) -> Unit / {abort.raise} =
     [] -> (),
     [cmd, ..rest] -> {
       match ply_parse([cmd, "--help"]) {
-        Help(text) -> {
+        Help(path) -> {
+          let text = help(spec("0.0.0-test"), path);
           assert(string_contains(text, "Usage: ply " ++ cmd ++ " "));
           assert(string_contains(text, "Print help"))
         },
@@ -1352,19 +1385,15 @@ fn for_help(cmds: List<String>) -> Unit / {abort.raise} =
   }
 
 test "the version answers at the top and under a command" {
-  match ply_parse(["--version"]) {
-    Version(text) -> assert_eq(text, "ply 0.0.0-test"),
-    _ -> panic("--version is the version"),
-  };
-  match ply_parse(["cache", "stats", "--version"]) {
-    Version(_) -> (),
-    _ -> panic("a command's --version is the version"),
-  }
+  assert_eq(ply_parse(["--version"]), Version);
+  assert_eq(ply_parse(["cache", "stats", "--version"]), Version);
+  assert_eq(version_line(spec("0.0.0-test")), "ply 0.0.0-test")
 }
 
 test "the top help names every command, the about, and the global flag" {
   match ply_parse(["--help"]) {
-    Help(text) -> {
+    Help(path) -> {
+      let text = help(spec("0.0.0-test"), path);
       assert(
         string_contains(
           text,

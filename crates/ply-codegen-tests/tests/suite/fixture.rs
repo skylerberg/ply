@@ -14,17 +14,31 @@ pub fn made(files: &[(String, String)]) -> ply_machine::runnable::Runnable {
         .unwrap_or_else(|d| panic!("the builder answers: {d}"))
 }
 
-/// What the builder makes of `modules`, `(module name, text)` each, which have to check.
-/// Every module of the standard library, by name: a program of them alone is the toolchain's own
-/// tree, which a load reads whole.
-pub fn standard_library() -> Vec<(&'static str, &'static str)> {
-    ply_machine::shipped_modules::sources()
+/// What the builder makes of the standard library's own tree, which a load reads whole: every
+/// module at the path its name spells, and each data file one embeds at its name, which is its
+/// place beside them.
+pub fn standard_library() -> ply_machine::runnable::Runnable {
+    use ply_machine::shipped_modules;
+    let modules: Vec<(String, &str)> = shipped_modules::sources()
         .into_iter()
         .filter(|(name, _)| name.starts_with("std."))
-        .map(|(name, text)| (&*Box::leak(name.into_boxed_str()), text))
-        .collect()
+        .collect();
+    let named: Vec<(&str, &str)> = modules
+        .iter()
+        .map(|(n, text)| (n.as_str(), *text))
+        .collect();
+    let mut files = ply_machine::builds::module_files(&named);
+    for name in shipped_modules::data_names() {
+        let bytes = shipped_modules::data(&name).expect("a listed data file is carried");
+        let text = std::str::from_utf8(bytes)
+            .unwrap_or_else(|e| panic!("`{name}` is not the text a tree held in memory is: {e}"));
+        files.push((name, text.to_string()));
+    }
+    ply_machine::builds::checked_program(&files)
+        .unwrap_or_else(|d| panic!("the standard library checks: {d}"))
 }
 
+/// What the builder makes of `modules`, `(module name, text)` each, which have to check.
 pub fn answered(modules: &[(&str, &str)]) -> ply_machine::runnable::Runnable {
     ply_machine::builds::checked_program(&ply_machine::builds::module_files(modules))
         .unwrap_or_else(|d| panic!("the fixture checks: {d}"))

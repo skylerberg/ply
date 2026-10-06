@@ -259,6 +259,20 @@ builtins! { $
     Atan = "atan", 1, ends;
     Atan2 = "atan2", 2, ends;
     Hypot = "hypot", 2, ends;
+    /// The entry at an end of a map's key order, as `Some({key, value})`.
+    MapFirst = "map_first", 1, ends;
+    MapLast = "map_last", 1, ends;
+    /// The entry nearest a key from one side, the key's own counted or not.
+    MapFloor = "map_floor", 2, ends;
+    MapCeiling = "map_ceiling", 2, ends;
+    MapBelow = "map_below", 2, ends;
+    MapAbove = "map_above", 2, ends;
+    /// An end's entry with the map that is left, in place while the map has one holder.
+    MapPopFirst = "map_pop_first", 1, ends;
+    MapPopLast = "map_pop_last", 1, ends;
+    /// `map_range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
+    MapRange = "map_range", 6, ends;
+    MapSplit = "map_split", 2, ends;
 }
 
 impl Builtin {
@@ -1180,6 +1194,16 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::MapEntries => Ok(map::entries(&args[0], span)?),
         Builtin::MapOfEntries => Ok(map::of_entries(&args[0], span)?),
         Builtin::MapMerge => Ok(map::merge(&args[0], &args[1], span)?),
+        Builtin::MapFirst | Builtin::MapLast => Ok(map::end(&args[0], b, span)?),
+        Builtin::MapFloor | Builtin::MapCeiling | Builtin::MapBelow | Builtin::MapAbove => {
+            Ok(map::beside(&args[0], &args[1], b, span)?)
+        }
+        Builtin::MapPopFirst | Builtin::MapPopLast => Ok(map::pop(args.remove(0), b, span)?),
+        Builtin::MapRange => Ok(map::range(args, span)?),
+        Builtin::MapSplit => {
+            let k = args.remove(1);
+            Ok(map::split(args.remove(0), &k, span)?)
+        }
 
         Builtin::DecimalDiv => {
             let a = args[0].as_decimal(span, "`decimal_div`")?;
@@ -1189,17 +1213,18 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             if b.is_zero() {
                 return Err(crate::semantics::err_zero_divisor(span, "`decimal_div`"));
             }
-            let quotient = a
-                .checked_div(b)
-                .ok_or_else(|| decimal_overflow(span, "division"))?;
-            Ok(Value::Decimal(quotient.round_dp_with_strategy(scale, mode)))
+            decimal_quotient(a, b, scale, mode)
+                .map(Value::Decimal)
+                .ok_or_else(|| decimal_overflow(span, "division"))
         }
 
         Builtin::DecimalRound => {
             let d = args[0].as_decimal(span, "`decimal_round`")?;
             let scale = decimal_scale(&args[1], span, "decimal_round")?;
             let mode = rounding(&args[2], span, "decimal_round")?;
-            Ok(Value::Decimal(d.round_dp_with_strategy(scale, mode)))
+            decimal_quotient(d, Decimal::ONE, scale, mode)
+                .map(Value::Decimal)
+                .ok_or_else(|| decimal_overflow(span, "rounding"))
         }
 
         Builtin::DecimalOfInt => Ok(Value::Decimal(Decimal::from(
@@ -1410,6 +1435,54 @@ fn decimal_scale(v: &Value, span: Span, what: &str) -> Result<u32, Diagnostic> {
             )
             .primary(span, "`Decimal` holds at most 28 decimal places")
         })
+}
+
+/// `a / b`, for a `b` that is not zero, with exactly `scale` digits after the point: the exact
+/// quotient rounded once, there, by `mode`. `None` where that mantissa is past 96 bits.
+///
+/// The mantissas are divided as whole numbers, a digit at a time, so no digit past the last one
+/// kept is rounded before `mode` reads what is left over.
+fn decimal_quotient(a: Decimal, b: Decimal, scale: u32, mode: RoundingStrategy) -> Option<Decimal> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    const LIMIT: u128 = 1 << 96;
+    let negative = a.is_sign_negative() != b.is_sign_negative();
+    let (dividend, divisor) = (a.mantissa().unsigned_abs(), b.mantissa().unsigned_abs());
+    // The answer's mantissa is `dividend * 10^shift / divisor`.
+    let shift = i64::from(scale) + i64::from(b.scale()) - i64::from(a.scale());
+    let (mut quotient, mut rest) = (dividend / divisor, dividend % divisor);
+    // What the quotient leaves out, against half a unit of its last digit.
+    let (exact, half) = if shift >= 0 {
+        for _ in 0..shift {
+            // `rest` is below `divisor`, which is below 2^96, so neither product wraps.
+            rest *= 10;
+            quotient = quotient * 10 + rest / divisor;
+            rest %= divisor;
+            if quotient >= LIMIT {
+                return None;
+            }
+        }
+        (rest == 0, (rest * 2).cmp(&divisor))
+    } else {
+        let unit = 10u128.pow(u32::try_from(-shift).ok()?);
+        let dropped = quotient % unit;
+        quotient /= unit;
+        let half = match dropped.cmp(&(unit / 2)) {
+            Equal if rest > 0 => Greater,
+            other => other,
+        };
+        (dropped == 0 && rest == 0, half)
+    };
+    let away = !exact
+        && match mode {
+            RoundingStrategy::ToZero => false,
+            RoundingStrategy::AwayFromZero => true,
+            RoundingStrategy::ToPositiveInfinity => !negative,
+            RoundingStrategy::ToNegativeInfinity => negative,
+            RoundingStrategy::MidpointAwayFromZero => half != Less,
+            _ => half == Greater || (half == Equal && quotient % 2 == 1),
+        };
+    let mantissa = i128::try_from(quotient + u128::from(away)).ok()?;
+    Decimal::try_from_i128_with_scale(if negative { -mantissa } else { mantissa }, scale).ok()
 }
 
 fn decimal_overflow(span: Span, what: &str) -> Diagnostic {

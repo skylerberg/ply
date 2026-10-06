@@ -388,8 +388,8 @@ Reach through a binder with `::` (`orders::place(...)`). `as` and a name list
 cannot be combined; write two imports. Imports precede every item.
 
 The first segment of a module path may be a package: a dependency declared in
-`ply.pkg` (§3.3) grants its own prefix, and `import cli.cmdline` reaches the
-`cmdline` module of the package `cli`. A path whose first segment is neither a
+`ply.pkg` (§3.3) grants its own prefix, and `import cli.surface` reaches the
+`surface` module of the package `cli`. A path whose first segment is neither a
 module of this package, the root of one, nor a granted prefix is `E0106`; a
 dependency's prefix used without the manifest declaring it is `E0132`. A bare
 import is always this package's own: inside a dependency, `import fmt` names
@@ -476,7 +476,7 @@ may be imported. A package's own modules answer to its sibling names:
 
 ```ply
 import store.orders        // a module of this package, as before
-import cli.cmdline         // a module of the declared dependency `cli`
+import cli.surface         // a module of the declared dependency `cli`
 ```
 
 A dependency is another package root: `Path("../cli")` names the directory
@@ -603,8 +603,9 @@ raised and where; one that spends the budget, or whose value takes more than
 16777216 bytes kept, is `E0158`. Each is placed at the definition, and nothing
 of the program runs. The value is kept in the toolchain's cache (§8.6) under the
 definition's hash, which covers its body, all it reaches and the bytes of every
-file it embeds (§3.4): an edit to any of those evaluates it again, and nothing
-else does but another `ply`.
+file it embeds (§3.4), and under the names of what it reaches, which a value
+names its constructors by: an edit to any of those evaluates it again, and
+nothing else does but another `ply`.
 
 Every unit emitted after that holds the value as data in place of the body, a
 built artifact's among them (§15). A call of the definition reads the value,
@@ -649,6 +650,12 @@ siblings raise (§6.8) when the value does not fit (mask to truncate:
 reads any of them as and `numeric_of_int` writes at any (§12), and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
+
+A `Decimal` is a 96-bit mantissa and a scale, the count of digits after its
+point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `decimal_div`
+and `decimal_round` take the scale of their answer, and answer with exactly that
+many digits after the point, the exact value rounded once by the `Rounding`
+given; they raise where 96 bits do not hold the answer at that scale.
 
 ### 4.2 Records and tuples
 
@@ -1225,6 +1232,9 @@ a `handle` in a member's body is compiled definition by definition and nests.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_cell` or a lambda, and a call of another function.
+The depth is each task's own (§9): a task nests from where its region stands,
+whatever the tasks beside it hold, and so does the body of a `handle` whose
+clause resumes anywhere but its tail.
 Depth and work are two bounds: one entry may also make only so many calls — a
 billion by default, and none under `ply run`, where an entry that serves forever
 is a program — and a loop that never ends fails with `E0503` when that budget is
@@ -1815,6 +1825,28 @@ A module with a test over cases imports `std.cases` itself, under a name
 no source can write, so `std.cases` cannot hold one. A doc comment above a test
 over cases documents nothing, as above any `test` (`E0003`, §2.1).
 
+A test may hold a rendering to a file the package stores, a *snapshot*, read
+with `embed_dir` (§3.4), so the test performs nothing, is cached, and runs
+again when a stored file changes:
+
+```ply
+import std.snapshot
+import std.snapshot (Stored)
+
+fn stored() -> Stored = { dir: "snapshots", files: embed_dir("snapshots") }
+
+test "an order renders as stored" {
+  snapshot::check(stored(), "order.txt", snapshot::render(order()))
+}
+```
+
+`check` fails with the unified diff from the stored text to the rendering, or
+with the diff that creates a file nothing stores yet, and never writes one.
+Storing is `snapshot::accept`, which writes through `std.fs`: an entry calls
+it, and a person runs that entry with the directory lent, as
+`ply run . --host --fs snapshots=snapshots` lends it (§14). `ply doc
+std.snapshot` has the rest.
+
 ### 8.2 Selection
 
 A definition's hash covers its normalized form: names, comments, formatting,
@@ -1936,7 +1968,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches and the names that spells (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -2418,7 +2450,11 @@ Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
 publishes, `ply doc std.json.parse` one definition, `ply doc fs.read_at` one
 operation of an effect; and `ply std --show std.json` prints one source, `ply
-std --show` alone every one. A load reads only the shipped modules its modules
+std --show` alone every one. A shipped module embeds (§3.4) data files `ply`
+ships beside it, each named by its place below the library (`std/oid/names.txt`):
+`ply std` lists them with the module that embeds each, `ply std --show
+std/oid/names.txt` prints one, and the digest `ply std` prints covers them. A
+load reads only the shipped modules its modules
 import, what those import in turn, and what they embed, so a change to any other
 leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
 counts and hashes only the functions the program reaches and the names its
@@ -2688,7 +2724,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
-| `ply std` | `--show [MODULE]`, `--digest`; no path |
+| `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
@@ -2705,7 +2741,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; the runnable's unit holds what the program reaches of the files its modules embed, a shipped module's data among them, so a binary that enters it reads none; the digest covers every data file the binary ships, and the report says how many bytes the modules embed; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
@@ -3145,6 +3181,8 @@ In `examples/`: `clock.ply` (a `nondet` effect, a handler, `test/nondet`);
 and `timeout.ply` (simulation, a race and its fix, a virtual clock); `echo.ply`
 and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 `relay.ply` (one forwarder generic over the label it writes under);
+`shout.ply` (a command line declared with `std.cli`, read into the program's
+own type);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
 answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose
