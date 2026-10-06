@@ -1,0 +1,245 @@
+//! Punycode (RFC 3492): any text written in ASCII letters, digits and hyphens, as the labels of
+//! an internationalized domain name are written on the wire.
+//!
+//! The ASCII characters of a text are written first, as they are, then a hyphen if there were
+//! any, then a run of letters and digits that says where each other character goes and which it
+//! is. `encode` writes that form without the `xn--` a domain name's label puts before it, and in
+//! small letters; `decode` reads it in either case. Nothing here knows of domain names:
+//! `std.idna` maps, checks and converts one.
+
+import std.laws (round_trip)
+import std.list (concat, drop, take)
+
+/// The value of the digit at place `k`, counted in thirty-sixes, below which a number ends.
+fn threshold(k: Int, bias: Int) -> Int =
+  if k <= bias { 1 } else if k >= bias + 26 { 26 } else { k - bias }
+
+/// The bias for the next number, after one of `delta` among `points` characters: section 6.1.
+fn adapted(delta: Int, points: Int, first: Bool) -> Int / {abort.raise} = {
+  let scaled = if first { delta / 700 } else { delta / 2 };
+  settled(scaled + scaled / points, 0)
+}
+
+fn settled(delta: Int, k: Int) -> Int / {abort.raise} =
+  if delta > 455 { settled(delta / 35, k + 36) } else { k + 36 * delta / (delta + 38) }
+
+/// The digit whose value is `d`: `a` to `z` for 0 to 25, then `0` to `9`.
+fn digit(d: Int) -> Char =
+  match char_of_int(if d < 26 { 97 + d } else { 22 + d }) { Some(c) -> c, None -> '0' }
+
+/// `out` and then `q` as a number of the variable length section 3.3 describes, its next digit
+/// at place `k`. `room` bounds the digits, which a 63-bit number never fills.
+fn written(out: List<Char>, q: Int, k: Int, bias: Int, room: Int) -> List<Char> / {abort.raise} = {
+  let t = threshold(k, bias);
+  if q < t || room <= 0 { push(out, digit(q)) } else {
+    written(push(out, digit(t + (q - t) % (36 - t))), (q - t) / (36 - t), k + 36, bias, room - 1)
+  }
+}
+
+/// What is written so far, the least code point not yet handled, the count since the last one
+/// written, the bias, and how many characters are handled.
+type Encoding = { out: List<Char>, n: Int, delta: Int, bias: Int, handled: Int }
+
+/// `text` in Punycode: ASCII letters, digits and hyphens, and whatever other ASCII `text`
+/// holds, which is kept as it is. A text that is all ASCII is itself and a hyphen.
+pub fn encode(text: String) -> String / {abort.raise} = {
+  let points = map(string_chars(text), int_of_char);
+  let basic = filter(string_chars(text), |c: Char| c < '\u{80}');
+  let others = map_keys(
+    fold(points, map_new(), |seen: Map<Int, Unit>, cp: Int|
+      if cp < 128 { seen } else { map_insert(seen, cp, ()) }),
+  );
+  let start = {
+    out: if len(basic) > 0 { push(basic, '-') } else { basic },
+    n: 128,
+    delta: 0,
+    bias: 72,
+    handled: len(basic),
+  };
+  let done = fold(others, start, |e: Encoding, m: Int| {
+    let risen = {
+      out: e.out,
+      n: m,
+      delta: e.delta + (m - e.n) * (e.handled + 1),
+      bias: e.bias,
+      handled: e.handled,
+    };
+    let passed = fold(points, risen, |s: Encoding, cp: Int|
+      if cp < m { { out: s.out, n: s.n, delta: s.delta + 1, bias: s.bias, handled: s.handled } }
+      else if cp == m {
+        {
+          out: written(s.out, s.delta, 36, s.bias, 20),
+          n: s.n,
+          delta: 0,
+          bias: adapted(s.delta, s.handled + 1, s.handled == len(basic)),
+          handled: s.handled + 1,
+        }
+      } else { s });
+    {
+      out: passed.out,
+      n: m + 1,
+      delta: passed.delta + 1,
+      bias: passed.bias,
+      handled: passed.handled,
+    }
+  });
+  string_of_chars(done.out)
+}
+
+/// The value of a digit in either case, or `-1`.
+fn value(c: Int) -> Int =
+  if c >= 97 && c <= 122 { c - 97 }
+  else if c >= 65 && c <= 90 { c - 65 }
+  else if c >= 48 && c <= 57 { c - 22 }
+  else { -1 }
+
+/// A number read: its value added to what `i` was, and where its digits end.
+type Number = { i: Int, next: Int }
+
+/// The number whose digits start at `at`, added to `i` with weight `w`: `None` where the digits
+/// run out, one is no digit, or the number is past what an `Int` holds.
+fn number(digits: Array<Int>, at: Int, i: Int, w: Int, k: Int, bias: Int) -> Option<Number> =
+  match array_at(digits, at) {
+    None -> None,
+    Some(c) -> {
+      let d = value(c);
+      let t = threshold(k, bias);
+      if d < 0 { None } else {
+        match checked_mul(d, w) {
+          None -> None,
+          Some(scaled) -> match checked_add(i, scaled) {
+            None -> None,
+            Some(sum) -> if d < t { Some({ i: sum, next: at + 1 }) } else {
+              match checked_mul(w, 36 - t) {
+                None -> None,
+                Some(heavier) -> number(digits, at + 1, sum, heavier, k + 36, bias),
+              }
+            },
+          },
+        }
+      }
+    },
+  }
+
+/// The text read so far as code points, the code point and place the next number counts from,
+/// the bias, and where the next number's digits start.
+type Decoding = { out: List<Int>, n: Int, i: Int, bias: Int, next: Int }
+
+/// The text `encoded` is the Punycode of, or `None` where it is none: a character that is not
+/// ASCII, a number that is cut short or is no number, or one that names no character. `most`
+/// bounds the characters of the answer, and a text of more is `None` too.
+pub fn decode(encoded: String, most: Int) -> Option<String> / {abort.raise} = {
+  let chars = map(string_chars(encoded), int_of_char);
+  let hyphen = fold(range(0, len(chars)), -1, |last: Int, i: Int|
+    if list_at(chars, i) == Some(45) { i } else { last });
+  let basic = if hyphen > 0 { take(chars, hyphen) } else { [] };
+  let digits = array_of_list(if hyphen > 0 { drop(chars, hyphen + 1) } else { chars });
+  if len(filter(chars, |c: Int| c >= 128)) > 0 || len(basic) > most { None } else {
+    iterate({ out: basic, n: 128, i: 0, bias: 72, next: 0 }, array_len(digits) + 1, |d: Decoding|
+      if d.next >= array_len(digits) {
+        Stop(
+          Some(
+            string_of_chars(
+              map(d.out, |cp: Int| match char_of_int(cp) { Some(c) -> c, None -> '\u{FFFD}' }),
+            ),
+          ),
+        )
+      } else {
+        match number(digits, d.next, d.i, 1, 36, d.bias) {
+          None -> Stop(None),
+          Some(read) -> {
+            let count = len(d.out) + 1;
+            match checked_add(d.n, read.i / count) {
+              None -> Stop(None),
+              Some(n) -> if count > most || char_of_int(n) == None { Stop(None) } else {
+                let at = read.i % count;
+                Continue({
+                  out: concat(push(take(d.out, at), n), drop(d.out, at)),
+                  n: n,
+                  i: at + 1,
+                  bias: adapted(read.i - d.i, count, d.i == 0),
+                  next: read.next,
+                })
+              },
+            }
+          },
+        }
+      })
+  }
+}
+
+// --- Laws -------------------------------------------------------------------------
+
+law "a text's Punycode reads back as the text" =
+  round_trip(encode, |encoded: String| decode(encoded, string_len(encoded)))
+
+law "reading any text as Punycode answers, and what it reads writes back in small letters"
+  forall (text: String) {
+    match decode(text, string_len(text)) {
+      None -> true,
+      Some(read) ->
+        string_len(read) <= string_len(text)
+          && decode(encode(read), string_len(text)) == Some(read),
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------------
+
+type Sample = { text: String, encoded: String }
+
+/// The sample strings of RFC 3492 section 7.1 whose Punycode is in one case, and a few more.
+fn samples() -> List<Sample> =
+  [
+    {
+      text: "\u{644}\u{64A}\u{647}\u{645}\u{627}\u{628}\u{62A}\u{643}\u{644}\u{645}\u{648}\u{634}\u{639}\u{631}\u{628}\u{64A}\u{61F}",
+      encoded: "egbpdaj6bu4bxfgehfvwxn",
+    },
+    {
+      text: "\u{4ED6}\u{4EEC}\u{4E3A}\u{4EC0}\u{4E48}\u{4E0D}\u{8BF4}\u{4E2D}\u{6587}",
+      encoded: "ihqwcrb4cv8a8dqg056pqjye",
+    },
+    {
+      text: "\u{5DC}\u{5DE}\u{5D4}\u{5D4}\u{5DD}\u{5E4}\u{5E9}\u{5D5}\u{5D8}\u{5DC}\u{5D0}\u{5DE}\u{5D3}\u{5D1}\u{5E8}\u{5D9}\u{5DD}\u{5E2}\u{5D1}\u{5E8}\u{5D9}\u{5EA}",
+      encoded: "4dbcagdahymbxekheh6e0a7fei0b",
+    },
+    {
+      text: "3\u{5E74}B\u{7D44}\u{91D1}\u{516B}\u{5148}\u{751F}",
+      encoded: "3B-ww4c5e180e575a65lsy2b",
+    },
+    { text: "-> $1.00 <-", encoded: "-> $1.00 <--" },
+    { text: "b\u{FC}cher", encoded: "bcher-kva" },
+    { text: "\u{FC}", encoded: "tda" },
+    { text: "a", encoded: "a-" },
+    { text: "", encoded: "" },
+    { text: "\u{1F600}", encoded: "e28h" },
+    { text: "a\u{10FFFF}", encoded: "a-h023p" },
+    { text: "a-b", encoded: "a-b-" },
+  ]
+
+test "{c.encoded} is the Punycode of its text, and reads back as it" for c: Sample in samples() {
+  assert_eq(encode(c.text), c.encoded);
+  assert_eq(decode(c.encoded, 64), Some(c.text))
+}
+
+test "Punycode is read in either case, and written in small letters" {
+  assert_eq(decode("BCHER-KVA", 64), Some("B\u{FC}CHER"));
+  assert_eq(decode("bcher-KVA", 64), Some("b\u{FC}cher"));
+  assert_eq(decode("E1AOEDXV", 64), Some("\u{43F}\u{43E}\u{447}\u{435}\u{43C}\u{443}"));
+  assert_eq(encode("\u{43F}\u{43E}\u{447}\u{435}\u{43C}\u{443}"), "e1aoedxv")
+}
+
+test "{text} is no Punycode and is refused" for text: String in [
+    "-",
+    "\u{FC}",
+    "bcher-kv",
+    "!",
+    "99999999999999999999a",
+    "a-\u{20AC}",
+  ] { assert_eq(decode(text, 64), None) }
+
+test "a text of more characters than asked for is refused" {
+  assert_eq(decode("bcher-kva", 6), Some("b\u{FC}cher"));
+  assert_eq(decode("bcher-kva", 5), None);
+  assert_eq(decode("abcdef-", 5), None);
+  assert_eq(decode("abcdef-", 6), Some("abcdef"))
+}

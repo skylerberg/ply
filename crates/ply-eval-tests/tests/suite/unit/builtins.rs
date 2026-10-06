@@ -797,6 +797,29 @@ fn a_decimal_that_does_not_fit_at_the_scale_asked_for_is_refused_and_never_cut_s
     }
 }
 
+#[test]
+fn a_decimal_scale_is_the_digits_after_its_point_zeros_included() {
+    for (d, want) in [
+        ("7", 0),
+        ("1.5", 1),
+        ("1.50", 2),
+        ("0.00", 2),
+        ("-3.125", 3),
+        ("0.0000000000000000000000000001", 28),
+    ] {
+        assert_eq!(
+            found(Builtin::DecimalScale, vec![decimal(d)]),
+            Value::Int(want),
+            "`decimal_scale({d})`"
+        );
+    }
+    let filled = found(
+        Builtin::DecimalRound,
+        vec![decimal("1.5"), Value::Int(3), mode("Down")],
+    );
+    assert_eq!(found(Builtin::DecimalScale, vec![filled]), Value::Int(3));
+}
+
 /// A divisor whose only prime factors are two and five has a quotient that ends, which
 /// `rust_decimal` divides exactly: there its own rounding is the answer to agree with.
 #[test]

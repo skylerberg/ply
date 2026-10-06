@@ -30,6 +30,11 @@
 //!   `-` first or last are themselves. `\d`, `\w` and `\s` are a digit, a word's character
 //!   and white space, `\D`, `\W` and `\S` every other character, and `[[:alpha:]]` and
 //!   `[[:^alpha:]]` the POSIX classes, all of them in or out of a class.
+//! - `\pL` and `\p{Greek}` are a character with a Unicode property, and `\PL`, `\P{Greek}` and
+//!   `\p{^Greek}` one without it, in or out of a class, over text only: a general category by
+//!   its abbreviation or its name (`Lu`, `Uppercase_Letter`), a major class (`L`, `Letter`),
+//!   `LC`, a script by its name in the database (`Greek`, `Old_Italic`), `Alphabetic`,
+//!   `Lowercase`, `Uppercase`, `White_Space`, `XID_Start`, `XID_Continue`, and `Any`.
 //! - `^` and `$` are the subject's start and its very end, never the place before a last line
 //!   feed, and `\A` and `\z` are those whatever the flags; `\b` is a word's edge and `\B` any
 //!   other place.
@@ -40,21 +45,28 @@
 //! - `(x)` is a group, numbered from 1 by where its `(` stands, `(?P<name>x)` or `(?<name>x)` one
 //!   with a name, and `(?:x)` no group at all.
 //! - `(?i)` ignores case, `(?m)` makes `^` and `$` a line's start and end, `(?s)` lets `.` be a
-//!   line feed and `(?U)` swaps which repetitions take little: each to the end of the group it
-//!   is written in, `(?i:x)` for `x` alone, and `(?-i)` to end one.
+//!   line feed, `(?U)` swaps which repetitions take little and `(?u)` makes `\d`, `\w`, `\s`
+//!   and `\b` Unicode's: each to the end of the group it is written in, `(?i:x)` for `x` alone,
+//!   and `(?-i)` to end one.
 //!
 //! What is refused, by name: a backreference (`\1`, `\k<name>`, `(?P=name)`) and lookahead or
 //! lookbehind, either of which would cost more than linear steps; a repetition of a repetition,
-//! which a possessive `a*+` writes; `\C`; and a Unicode property (`\pL`, `\p{Greek}`), which
-//! needs tables `std.unicode` is to carry. An octal escape opens with `\0`, so that `\1` to
-//! `\9` are always the backreferences they are elsewhere.
+//! which a possessive `a*+` writes; `\C`; and a `\p` that names no property read here. An octal
+//! escape opens with `\0`, so that `\1` to `\9` are always the backreferences they are
+//! elsewhere.
 //!
 //! Unicode. A character is a code point: `.`, a class written out and a negated class are over
 //! all of them, and a match never ends inside one. `\d`, `\w`, `\s`, `\b` and the POSIX
-//! classes are ASCII's, as they are in RE2. `(?i)` folds the ASCII letters alone, where RE2
-//! folds every letter Unicode pairs: when `std.unicode` carries the tables, `\p{...}` will be
-//! read, and `(?i)` will fold as Unicode's simple case folding does, so that `(?i)k` also
-//! matches the Kelvin sign and an accented letter its other case. Nothing else changes then.
+//! classes are ASCII's unless `(?u)` is written, as they are in RE2: a pattern is most often
+//! over a protocol's text, where a digit is one of ten and a word's edge must not move with
+//! the Unicode version. Under `(?u)`, `\d` is `\p{Nd}`, `\s` is `\p{White_Space}`, `\w` is
+//! UTS #18's word character (alphabetic, a mark, a decimal digit, connector punctuation or a
+//! joiner), and `\b` is an edge of a run of those; a search for a pattern with such a `\b`
+//! always follows every state at once. `(?i)` folds as Unicode's simple case folding does, so
+//! `(?i)k` also matches the Kelvin sign, `(?i)σ` every sigma and an accented letter its other
+//! case; a character whose other case is several characters, as `ß` and `SS`, is not paired
+//! with them. A pattern over bytes folds ASCII's letters alone, and reads no `\p` and no
+//! `(?u)`. The tables are of the Unicode version `std.ucd` names.
 //!
 //! Which match. Of the matches that start leftmost, the one a search that tried each
 //! alternative in order, and each repetition's more before its less, would find first, as Perl
@@ -73,10 +85,14 @@
 //! rather than spans is a parser's: `std.parse` builds one from smaller ones.
 
 import std.bytes (hex_value, is_digit, is_letter)
+import std.char
+import std.char (Stretch)
 import std.laws (agrees)
-import std.list (at_or, enumerate, index_of, reverse, sort, sort_by, take, unique)
+import std.list (at_or, enumerate, flatten, index_of, reverse, sort, sort_by, take, unique)
 import std.math (ilog2)
+import std.show (show)
 import std.string (code_points, join)
+import std.ucd
 
 // --- What a pattern is refused for --------------------------------------------
 
@@ -112,7 +128,7 @@ pub type Why =
   | Backreference
   /// `(?=`, `(?!`, `(?<=` or `(?<!`.
   | Lookaround
-  /// `\p` or `\P`.
+  /// A `\p` or `\P` that names no property this module reads, or one in a pattern over bytes.
   | UnicodeProperty
   /// `\C` in a pattern over text.
   | HalfCharacter
@@ -154,13 +170,13 @@ pub fn reason(why: Why) -> String =
       "a repetition repeats an operand, not another repetition: group the first as `(?:...)`, and possessive repetition is not supported",
     BadRepeat -> "a count is at most 1000, and the first of two is the lesser",
     BadGroup ->
-      "`(?` opens `(?:...)`, `(?P<name>...)`, `(?<name>...)` or the flags `i`, `m`, `s` and `U`",
+      "`(?` opens `(?:...)`, `(?P<name>...)`, `(?<name>...)` or the flags `i`, `m`, `s`, `U` and, over text, `u`",
     BadGroupName -> "a group's name is letters, digits and `_`, and at least one of them",
     DuplicateName -> "another group has this name",
     Backreference -> "backreferences are not supported: matching would no longer be linear",
     Lookaround -> "lookahead and lookbehind are not supported: matching would no longer be linear",
     UnicodeProperty ->
-      "Unicode properties are not supported: they need the tables `std.unicode` will carry",
+      "no property has this name: `\\p` reads a general category, a script, `Alphabetic`, `Lowercase`, `Uppercase`, `White_Space`, `XID_Start`, `XID_Continue` and `Any`, and a pattern over bytes reads none",
     HalfCharacter -> "`\\C` is not supported over text: it would match part of a character",
     NotAByte -> "a pattern over bytes holds no character past U+00FF: write a byte as `\\xNN`",
     TooLarge -> "the pattern compiles to more instructions than its limit allows",
@@ -178,7 +194,16 @@ fn refuse<a>(at: Int, why: Why) -> a / {regex.refused} = regex.refused({ at: at,
 type Interval = { lo: Int, hi: Int }
 
 /// A place a pattern asks about without taking a character.
-type Look = | LineStart | LineEnd | TextStart | TextEnd | WordEdge | NotWordEdge
+type Look =
+  | LineStart
+  | LineEnd
+  | TextStart
+  | TextEnd
+  | WordEdge
+  | NotWordEdge
+  /// The edge of a word of any script, and any other place: `\b` and `\B` under `(?u)`.
+  | WideWordEdge
+  | NotWideWordEdge
 
 /// A parsed pattern, every flag already acted on.
 type Node =
@@ -254,6 +279,9 @@ fn dot_all(flags: Int) -> Bool = flags & 4 != 0
 
 fn swaps(flags: Int) -> Bool = flags & 8 != 0
 
+/// Whether `\d`, `\w`, `\s` and `\b` are Unicode's: `(?u)`.
+fn wide(flags: Int) -> Bool = flags & 16 != 0
+
 fn iv(lo: Int, hi: Int) -> Interval = { lo: lo, hi: hi }
 
 /// Intervals in order, with those that touch or overlap made one.
@@ -283,8 +311,9 @@ fn complement(set: List<Interval>, most: Int) -> List<Interval> = {
   if walked.next <= most { push(walked.out, iv(walked.next, most)) } else { walked.out }
 }
 
-/// The intervals with the other case of each ASCII letter among them.
-fn folded(items: List<Interval>) -> List<Interval> =
+/// The intervals with the other case of each ASCII letter among them, which is how a pattern
+/// over bytes ignores case.
+fn folded_ascii(items: List<Interval>) -> List<Interval> =
   fold(items, items, |acc: List<Interval>, i: Interval| {
     let lower = if i.lo <= 122 && i.hi >= 97 {
       push(acc, iv(max(i.lo, 97) - 32, min(i.hi, 122) - 32))
@@ -293,20 +322,149 @@ fn folded(items: List<Interval>) -> List<Interval> =
     else { lower }
   })
 
+/// Simple case folding's orbits, from `ucd/fold.txt`: three numbers a run, its first and last
+/// code point and how far another member of each one's orbit lies, as `ucd::away` reads it. A
+/// run whose code points have several other members stands once for each. The runs rise.
+const fn orbits() -> Array<Int> =
+  array_of_list(
+    fold(ucd::runs(embed("ucd/fold.txt")), [], |held: List<Int>, run: ucd::Run|
+      fold(
+        bytes_split(match list_at(run.fields, 0) { Some(far) -> far, None -> b"" }, b","),
+        held,
+        |so_far: List<Int>, far: Bytes|
+          push(push(push(so_far, run.first), run.last), ucd::distance(far)),
+      )),
+  )
+
+/// The intervals with every other member of each code point's case orbit among them: a pattern
+/// over text ignores case as Unicode's simple case folding pairs characters, so `k` is also `K`
+/// and the Kelvin sign.
+fn folded_wide(items: List<Interval>) -> List<Interval> / {abort.raise} = {
+  let runs = orbits();
+  let count = array_len(runs) / 3;
+  fold(items, items, |acc: List<Interval>, i: Interval| {
+    let from = iterate({ low: 0, high: count }, 32, |s: { low: Int, high: Int }|
+      if s.low >= s.high { Stop(s) } else {
+        let mid = (s.low + s.high) / 2;
+        match array_at(runs, 3 * mid + 1) {
+          Some(last) if last < i.lo -> Continue({ low: mid + 1, high: s.high }),
+          _ -> Continue({ low: s.low, high: mid }),
+        }
+      }).low;
+    iterate({ at: from, out: acc }, count + 1, |s: { at: Int, out: List<Interval> }|
+      match ((
+          array_at(runs, 3 * s.at),
+          array_at(runs, 3 * s.at + 1),
+          array_at(runs, 3 * s.at + 2),
+        )) {
+        (Some(first), Some(last), Some(far)) -> if first > i.hi { Stop(s) } else {
+          Continue({
+            at: s.at + 1,
+            out: push(s.out, iv(ucd::away(max(first, i.lo), far), ucd::away(min(last, i.hi), far))),
+          })
+        },
+        _ -> Stop(s),
+      }).out
+  })
+}
+
+fn folded(items: List<Interval>, bytes: Bool) -> List<Interval> / {abort.raise} =
+  if bytes { folded_ascii(items) } else { folded_wide(items) }
+
 fn digits() -> List<Interval> = [iv(48, 57)]
 
 fn word() -> List<Interval> = [iv(48, 57), iv(65, 90), iv(95, 95), iv(97, 122)]
 
 fn space() -> List<Interval> = [iv(9, 10), iv(12, 13), iv(32, 32)]
 
-/// The class a Perl escape letter names, in either case, before any negation.
-fn perl(letter: Int) -> Option<List<Interval>> =
+/// The code points a property of `std.char` holds of.
+fn of_property(property: char::Property) -> List<Interval> =
+  map(char::stretches(property), |s: Stretch| iv(s.first, s.last))
+
+const fn wide_digits() -> List<Interval> = of_property(char::Of(char::DecimalNumber))
+
+const fn wide_space() -> List<Interval> = of_property(char::WhiteSpace)
+
+/// UTS #18's word characters: the alphabetic ones, marks, decimal digits, connector
+/// punctuation and the two joiners.
+const fn wide_word() -> List<Interval> =
+  canonical(
+    flatten([
+      of_property(char::Alphabetic),
+      of_property(char::OfMajor(char::Mark)),
+      wide_digits(),
+      of_property(char::Of(char::ConnectorPunctuation)),
+      [iv(0x200C, 0x200D)],
+    ]),
+  )
+
+/// The class a Perl escape letter names, in either case, before any negation: ASCII's, or
+/// under `(?u)` Unicode's.
+fn perl(letter: Int, flags: Int) -> Option<List<Interval>> =
   match letter {
-    b'd' | b'D' -> Some(digits()),
-    b'w' | b'W' -> Some(word()),
-    b's' | b'S' -> Some(space()),
+    b'd' | b'D' -> Some(if wide(flags) { wide_digits() } else { digits() }),
+    b'w' | b'W' -> Some(if wide(flags) { wide_word() } else { word() }),
+    b's' | b'S' -> Some(if wide(flags) { wide_space() } else { space() }),
     _ -> None,
   }
+
+/// Each script's code points by its name in `ucd/scripts.txt`, which is Scripts.txt's.
+const fn scripts() -> Map<String, List<Interval>> =
+  fold(
+    ucd::runs(embed("ucd/scripts.txt")),
+    map_new(),
+    |held: Map<String, List<Interval>>, run: ucd::Run| {
+      let name = string_of_bytes(match list_at(run.fields, 0) {
+        Some(script) -> script,
+        None -> b"",
+      });
+      let so_far = match map_get(held, name) { Some(found) -> found, None -> [] };
+      map_insert(held, name, push(so_far, iv(run.first, run.last)))
+    },
+  )
+
+/// The code points a `\p` names by `name`: a general category by its abbreviation or its long
+/// name, a major class by its letter or its name, `LC`, a binary property, a script, or `Any`.
+fn named_property(name: String) -> Option<List<Interval>> / {abort.raise} = {
+  let categories = filter(char::categories(), |c: char::Category|
+    char::abbreviation(c) == name || char::name(c) == name);
+  let majors = filter(
+    [
+      { short: "L", major: char::Letter },
+      { short: "M", major: char::Mark },
+      { short: "N", major: char::Number },
+      { short: "P", major: char::Punctuation },
+      { short: "S", major: char::Symbol },
+      { short: "Z", major: char::Separator },
+      { short: "C", major: char::Other },
+    ],
+    |m: { short: String, major: char::Major }| m.short == name || show(m.major) == name,
+  );
+  match ((categories, majors)) {
+    ([category, ..], _) -> Some(of_property(char::Of(category))),
+    (_, [found, ..]) -> Some(of_property(char::OfMajor(found.major))),
+    _ -> match name {
+      "Any" -> Some([iv(0, 0x10FFFF)]),
+      "LC" | "Cased_Letter" ->
+        Some(
+          canonical(
+            flatten([
+              of_property(char::Of(char::UppercaseLetter)),
+              of_property(char::Of(char::LowercaseLetter)),
+              of_property(char::Of(char::TitlecaseLetter)),
+            ]),
+          ),
+        ),
+      "Alphabetic" -> Some(of_property(char::Alphabetic)),
+      "Lowercase" -> Some(of_property(char::Lowercase)),
+      "Uppercase" -> Some(of_property(char::Uppercase)),
+      "White_Space" -> Some(of_property(char::WhiteSpace)),
+      "XID_Start" -> Some(of_property(char::XidStart)),
+      "XID_Continue" -> Some(of_property(char::XidContinue)),
+      _ -> map_get(scripts(), name),
+    },
+  }
+}
 
 fn posix(name: String) -> Option<List<Interval>> =
   match name {
@@ -337,8 +495,35 @@ fn grouped(
   flags: Int,
   negated: Bool,
 ) -> List<Interval> / {abort.raise} = {
-  let cased = if folds(flags) { canonical(folded(set)) } else { set };
+  let cased = if folds(flags) { canonical(folded(set, s.bytes)) } else { set };
   if negated { complement(cased, top(s)) } else { cased }
+}
+
+/// The class a `\p` or `\P` at `at` names, and where the pattern goes on: `\pL`, `\p{Greek}`,
+/// and `\p{^Greek}` for every other code point, which `\P` turns about again.
+fn property(
+  s: Source,
+  at: Int,
+  flags: Int,
+) -> { items: List<Interval>, at: Int } / {regex.refused, abort.raise} = {
+  let outside = code(s, at + 1) == b'P';
+  let braced = code(s, at + 2) == b'{';
+  let inside = braced && code(s, at + 3) == b'^';
+  let from = if inside { at + 4 } else if braced { at + 3 } else { at + 2 };
+  let end = if braced { name_end(s.text, from) }
+  else if is_letter(code(s, from)) { from + 1 }
+  else { from };
+  if s.bytes || end == from || (braced && code(s, end) != b'}') { refuse(at, UnicodeProperty) }
+  else {
+    match named_property(name_text(s.text, from, end)) {
+      Some(set) ->
+        {
+          items: grouped(s, set, flags, outside != inside),
+          at: if braced { end + 1 } else { end },
+        },
+      None -> refuse(at, UnicodeProperty),
+    }
+  }
 }
 
 fn nullable(node: Node) -> Bool =
@@ -494,11 +679,16 @@ fn piece(
 fn any(s: Source, flags: Int) -> List<Interval> =
   if dot_all(flags) { [iv(0, top(s))] } else { [iv(0, 9), iv(11, top(s))] }
 
-/// The node of one literal character, which is a class of two where its case is ignored.
-fn character(s: Source, at: Int, c: Int, flags: Int) -> Node / {regex.refused} =
+/// The node of one literal character, which is the class of its case orbit where case is
+/// ignored and it has another case.
+fn character(s: Source, at: Int, c: Int, flags: Int) -> Node / {regex.refused, abort.raise} =
   if s.bytes && c > 0xFF { refuse(at, NotAByte) }
-  else if folds(flags) && is_letter(c) { Class([iv(c & 0x5F, c & 0x5F), iv(c | 0x20, c | 0x20)]) }
-  else { Literal(c) }
+  else if !folds(flags) { Literal(c) } else {
+    match canonical(folded([iv(c, c)], s.bytes)) {
+      [only] if only.lo == only.hi -> Literal(c),
+      orbit -> Class(orbit),
+    }
+  }
 
 /// A count read from just past a `{`: `n}`, `n,}` or `n,m}`, with `-1` for no upper end, and
 /// 1001 for any count past 1000. `None` where the text is no count, which leaves the `{` a
@@ -624,13 +814,24 @@ fn escaped(
   match c {
     b'A' -> leaf(s, Looking(TextStart), at + 2, flags, groups),
     b'z' -> leaf(s, Looking(TextEnd), at + 2, flags, groups),
-    b'b' -> leaf(s, Looking(WordEdge), at + 2, flags, groups),
-    b'B' -> leaf(s, Looking(NotWordEdge), at + 2, flags, groups),
-    b'p' | b'P' -> refuse(at, UnicodeProperty),
+    b'b' ->
+      leaf(s, Looking(if wide(flags) { WideWordEdge } else { WordEdge }), at + 2, flags, groups),
+    b'B' ->
+      leaf(
+        s,
+        Looking(if wide(flags) { NotWideWordEdge } else { NotWordEdge }),
+        at + 2,
+        flags,
+        groups,
+      ),
+    b'p' | b'P' -> {
+      let named = property(s, at, flags);
+      leaf(s, Class(canonical(named.items)), named.at, flags, groups)
+    },
     b'k' -> refuse(at, Backreference),
     b'C' -> if s.bytes { leaf(s, Class([iv(0, 0xFF)]), at + 2, flags, groups) }
     else { refuse(at, HalfCharacter) },
-    _ -> match perl(c) {
+    _ -> match perl(c, flags) {
       Some(set) -> leaf(s, Class(grouped(s, set, 0, c < 97)), at + 2, flags, groups),
       None -> {
         let one = escape_code(s, at);
@@ -775,7 +976,14 @@ fn flagged(
 ) -> Parse / {regex.refused, abort.raise} =
   if at >= array_len(s.text) { refuse(open, UnclosedGroup) } else {
     let c = code(s, at);
-    let bit = match c { b'i' -> 1, b'm' -> 2, b's' -> 4, b'U' -> 8, _ -> 0 };
+    let bit = match c {
+      b'i' -> 1,
+      b'm' -> 2,
+      b's' -> 4,
+      b'U' -> 8,
+      b'u' -> if s.bytes { 0 } else { 16 },
+      _ -> 0,
+    };
     if bit != 0 {
       flagged(
         s,
@@ -865,8 +1073,8 @@ fn member(
   if c == b'[' && next == b':' {
     match posix_at(s, at, flags) { Some(found) -> found, None -> ranged(s, at, flags) }
   } else if c == b'\\' {
-    if next == b'p' || next == b'P' { refuse(at, UnicodeProperty) } else {
-      match perl(next) {
+    if next == b'p' || next == b'P' { property(s, at, flags) } else {
+      match perl(next, flags) {
         Some(set) -> { items: grouped(s, set, flags, next < 97), at: at + 2 },
         None -> ranged(s, at, flags),
       }
@@ -927,6 +1135,8 @@ fn written(node: Node, level: Int, bytes: Bool) -> String / {abort.raise} =
       TextEnd -> "\\z",
       WordEdge -> "\\b",
       NotWordEdge -> "\\B",
+      WideWordEdge -> "(?u:\\b)",
+      NotWideWordEdge -> "(?u:\\B)",
     },
     Concat(items) -> bracketed(join(map(items, |n: Node| written(n, 1, bytes)), ""), level >= 2),
     Alternate(items) ->
@@ -1276,6 +1486,8 @@ fn look_bits(look: Look, reversed: Bool) -> Int =
     TextEnd -> if reversed { 4 } else { 8 },
     WordEdge -> 16,
     NotWordEdge -> 32,
+    WideWordEdge -> 64,
+    NotWideWordEdge -> 128,
   }
 
 /// Instructions for `node` that go on to `next`, written after those already there. `depth`
@@ -1636,6 +1848,9 @@ type Compiled = {
   finder: Automaton,
   stretcher: Automaton,
   tracer: Automaton,
+  /// Whether a look asks about a word of any script. A search by states steps a byte at a time
+  /// and cannot answer it, so such a pattern is always followed by every state at once.
+  wide: Bool,
 }
 
 fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.refused, abort.raise} = {
@@ -1704,6 +1919,7 @@ fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.refus
         entry: behind.entry,
         first_wins: false,
       },
+      wide: looks & 192 != 0,
     }
   }
 }
@@ -1712,19 +1928,62 @@ fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.refus
 
 /// What a run that follows every state at once is given: the program, the subject, where the
 /// run takes no further byte, how many slots it keeps, and whether it wants the longest match.
-type Run = { insts: Array<Inst>, hay: Bytes, stop: Int, slots: Int, longest: Bool }
+type Run = {
+  insts: Array<Inst>,
+  hay: Bytes,
+  stop: Int,
+  slots: Int,
+  longest: Bool,
+  /// Whether the program asks about words of any script, so that a look reads characters.
+  wide: Bool,
+}
 
 fn is_word(b: Int) -> Bool =
   (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || b == 95 || (b >= 97 && b <= 122)
 
-/// The looks that hold at `at`, as a set of bits.
-fn looks_at(hay: Bytes, at: Int) -> Int / {abort.raise} = {
+/// Whether the character of text `hay` that starts at `at` is one of a word of any script, as
+/// `wide_word` lists them; none starts at the end.
+fn wide_word_from(hay: Bytes, at: Int) -> Bool / {abort.raise} =
+  if at >= bytes_len(hay) { false } else {
+    let b = bytes_at(hay, at);
+    let next = |i: Int| if at + i < bytes_len(hay) { bytes_at(hay, at + i) & 0x3F } else { 0 };
+    let cp = if b < 0x80 { b }
+    else if b < 0xE0 { (b & 0x1F) << 6 | next(1) }
+    else if b < 0xF0 { (b & 0x0F) << 12 | next(1) << 6 | next(2) }
+    else { (b & 0x07) << 18 | next(1) << 12 | next(2) << 6 | next(3) };
+    if cp < 0x80 { is_word(cp) } else {
+      match char_of_int(cp) {
+        None -> false,
+        Some(c) ->
+          char::is_alphabetic(c) || char::is_mark(c) || char::is_digit(c)
+            || char::general_category(c) == char::ConnectorPunctuation
+            || cp == 0x200C
+            || cp == 0x200D,
+      }
+    }
+  }
+
+/// Whether the character of text `hay` that ends at `at` is one of a word of any script.
+fn wide_word_until(hay: Bytes, at: Int) -> Bool / {abort.raise} =
+  at > 0
+    && wide_word_from(
+      hay,
+      fold([1, 2, 3], at - 1, |start: Int, _: Int|
+        if start > 0 && bytes_at(hay, start) & 0xC0 == 0x80 { start - 1 } else { start }),
+    )
+
+/// The looks that hold at `at`, as a set of bits; with `wide`, the edges of words of any script
+/// among them.
+fn looks_at(hay: Bytes, at: Int, wide: Bool) -> Int / {abort.raise} = {
   let n = bytes_len(hay);
   let before = if at > 0 { bytes_at(hay, at - 1) } else { -1 };
   let after = if at < n { bytes_at(hay, at) } else { -1 };
   (if at == 0 { 5 } else if before == 10 { 1 } else { 0 })
     | (if at == n { 10 } else if after == 10 { 2 } else { 0 })
     | (if is_word(before) != is_word(after) { 16 } else { 32 })
+    | (if !wide { 0 }
+    else if wide_word_until(hay, at) != wide_word_from(hay, at) { 64 }
+    else { 128 })
 }
 
 /// The slots of the match a run from `entry` at `from` finds, or no slots at all where there is
@@ -1976,7 +2235,7 @@ fn threads_add(
             nn,
             best,
           ),
-        Check(looks, to) -> if looks & ~looks_at(r.hay, pos + 1) == 0 {
+        Check(looks, to) -> if looks & ~looks_at(r.hay, pos + 1, r.wide) == 0 {
           threads_add(
             r,
             fuel - 1,
@@ -2698,7 +2957,8 @@ fn search(
     }
   } else if unheld(re, hay, from) {
     { table: table, seen: seen, stack: stack, book: book, slots: array_of_list([]) }
-  } else if book.spent || re.options.state_limit <= 0 || bytes_len(hay) - from <= re.options.short {
+  } else if book.spent || re.wide || re.options.state_limit <= 0
+      || bytes_len(hay) - from <= re.options.short {
     by_threads(re, hay, from, table, seen, stack, book, want)
   } else if array_len(table) > 0 { by_states(re, hay, from, table, seen, stack, book, want) } else {
     let rows = room_for(re, hay) + 2;
@@ -2747,7 +3007,14 @@ fn by_threads(
     stack: stack,
     book: book,
     slots: run(
-      { insts: re.insts, hay: hay, stop: bytes_len(hay), slots: want, longest: re.options.longest },
+      {
+        insts: re.insts,
+        hay: hay,
+        stop: bytes_len(hay),
+        slots: want,
+        longest: re.options.longest,
+        wide: re.wide,
+      },
       re.search,
       from,
     ),
@@ -2773,7 +3040,14 @@ fn pinned(
     book: book,
     slots: if want <= 2 || len(re.names) == 1 { array_of_list([start, end]) } else {
       run(
-        { insts: re.insts, hay: hay, stop: end, slots: want, longest: re.options.longest },
+        {
+          insts: re.insts,
+          hay: hay,
+          stop: end,
+          slots: want,
+          longest: re.options.longest,
+          wide: re.wide,
+        },
         re.start,
         start,
       )
@@ -2939,7 +3213,7 @@ fn matching(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
 /// one state at a time, or by every state at once where the subject is short or the states
 /// run out.
 fn read_through(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
-  if re.options.state_limit <= 0 || bytes_len(hay) <= re.options.short {
+  if re.wide || re.options.state_limit <= 0 || bytes_len(hay) <= re.options.short {
     matching_by_threads(re, hay)
   } else {
     let a = re.finder;
@@ -2980,7 +3254,14 @@ fn read_through(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
 fn matching_by_threads(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
   array_len(
       run(
-        { insts: re.insts, hay: hay, stop: bytes_len(hay), slots: 2, longest: false },
+        {
+          insts: re.insts,
+          hay: hay,
+          stop: bytes_len(hay),
+          slots: 2,
+          longest: false,
+          wide: re.wide,
+        },
         re.search,
         0,
       ),
@@ -3567,7 +3848,21 @@ fn rewrites() -> List<Written> =
     w("(?i:a)b", "[Aa]b"),
     w("a(?i)b|c", "a[Bb]|[Cc]"),
     w("(?i)a(?-i)b", "[Aa]b"),
-    w("(?i)\u{e9}k", "\u{e9}[Kk]"),
+    w("(?i)\u{e9}k", "[\u{c9}\u{e9}][Kk\u{212a}]"),
+    w("(?i)\u{3c3}", "[\u{3a3}\u{3c2}-\u{3c3}]"),
+    w("(?i)\u{df}1", "[\u{df}\u{1e9e}]1"),
+    w("(?i)\u{101}", "[\u{100}-\u{101}]"),
+    w("(?i)\u{4e2d}", "\u{4e2d}"),
+    w("(?u)\\bx\\B", "(?u:\\b)x(?u:\\B)"),
+    w(
+      "(?u)\\s",
+      "[\\x{9}-\\x{D} \u{85}\u{a0}\u{1680}\u{2000}-\u{200a}\u{2028}-\u{2029}\u{202f}\u{205f}\u{3000}]",
+    ),
+    w("\\p{Zl}\\P{^Zp}", "[\u{2028}][\u{2029}]"),
+    w(
+      "[\\p{Line_Separator}\\pZ]",
+      "[ \u{a0}\u{1680}\u{2000}-\u{200a}\u{2028}-\u{2029}\u{202f}\u{205f}\u{3000}]",
+    ),
     w(".", "[^\\x{A}]"),
     w("(?s).", "(?s:.)"),
     w("^a$", "\\Aa\\z"),
@@ -3590,8 +3885,8 @@ fn rewrites() -> List<Written> =
     w("[[:alpha:][:^digit:]]", "[^0-9]"),
     w("[[:word:]]", "[0-9A-Z_a-z]"),
     w("[[:alpha]", "[:\\[ahlp]"),
-    w("(?i)[k-m]", "[K-Mk-m]"),
-    w("(?i)[^k]", "[^Kk]"),
+    w("(?i)[k-m]", "[K-Mk-m\u{212a}]"),
+    w("(?i)[^k]", "[^Kk\u{212a}]"),
     w("a{", "a\\{"),
     w("a{1", "a\\{1"),
     w("a{,2}", "a\\{,2\\}"),
@@ -3689,9 +3984,15 @@ fn refusals() -> List<Refused> =
     no("a(?!b)", 1, Lookaround),
     no("(?<=a)b", 0, Lookaround),
     no("(?<!a)b", 0, Lookaround),
-    no("\\pL", 0, UnicodeProperty),
-    no("\\P{Greek}", 0, UnicodeProperty),
-    no("[\\pN]", 1, UnicodeProperty),
+    no("\\p{Klingon}", 0, UnicodeProperty),
+    no("a\\P{greek}", 1, UnicodeProperty),
+    no("\\pX", 0, UnicodeProperty),
+    no("\\p", 0, UnicodeProperty),
+    no("\\p{L", 0, UnicodeProperty),
+    no("\\p{}", 0, UnicodeProperty),
+    no("\\p{^}", 0, UnicodeProperty),
+    no("\\p\u{e9}", 0, UnicodeProperty),
+    no("[\\p{Nope}]", 1, UnicodeProperty),
     no("a\\C", 1, HalfCharacter),
     no("(a{1000}){1000}", 9, TooLarge),
     no("((((((((((a{10}){10}){10}){10}){10}){10}){10}){10}){10}){10})", 31, TooLarge),
@@ -3785,7 +4086,31 @@ fn samples() -> List<Sample> =
     sample("(a)|(b)", "b", [0, 1, -1, -1, 0, 1]),
     sample("(a){0}b", "ab", [1, 2, -1, -1]),
     sample("(?i)straSSe", "STRASSE", [0, 7]),
-    sample("(?i)k", "\u{212a}K", [3, 4]),
+    sample("(?i)k", "\u{212a}K", [0, 3]),
+    sample("(?i)\u{3c3}+", "o\u{3a3}\u{3c2}\u{3c3}s", [1, 7]),
+    sample("(?i)stra\u{df}e", "STRA\u{1e9e}E", [0, 8]),
+    sample("\\p{Greek}+", "ab\u{3b1}\u{3b2}c", [2, 6]),
+    sample("\\P{Greek}+", "\u{3b1}bc\u{3b2}", [2, 4]),
+    sample("\\p{^Greek}", "\u{3b1}b", [2, 3]),
+    sample("\\P{^Greek}", "b\u{3b1}", [1, 3]),
+    sample("\\pL\\p{Nd}", "-\u{e9}\u{663}", [1, 5]),
+    sample("[\\p{Lu}\\d]+", "a\u{c9}7Bc", [1, 5]),
+    sample("(?i)\\p{Lu}+", "a\u{e9}1", [0, 3]),
+    sample("\\p{Any}", "\u{1f600}", [0, 4]),
+    sample("\\w+", "na\u{ef}ve", [0, 2]),
+    sample("(?u)\\w+", "na\u{ef}ve", [0, 6]),
+    sample("(?u)\\d+", "x\u{663}\u{664}y", [1, 5]),
+    sample("\\d+", "x\u{663}4y", [3, 4]),
+    sample("(?u)\\s", "a\u{3000}b", [1, 4]),
+    sample("(?u)\\W", "\u{e9}-", [2, 3]),
+    sample("\\b\\w+\\b", "\u{e9}t\u{e9} ok", [2, 3]),
+    sample("(?u)\\b\\w+\\b", "\u{e9}t\u{e9} ok", [0, 5]),
+    sample("(?u)\\b", "\u{e9}", [0, 0]),
+    sample("(?u)\\B", "\u{e9}", []),
+    sample("(?u)a\\B.", "a\u{e9}", [0, 3]),
+    sample("(?u)a\\b.", "a\u{e9}", []),
+    sample("a\\b.", "a\u{e9}", [0, 3]),
+    sample("(?u:\\w)\\w", "\u{e9}a\u{e9}", [0, 3]),
     sample("foo|bar|baz", "xx baz", [3, 6]),
     sample("", "abc", [0, 0]),
     sample("$", "abc", [3, 3]),
@@ -3957,7 +4282,8 @@ test "a search skips to where a match can start, and a pattern that is plain tex
   assert_eq(inner(must("a*b")).opening.first, b"ab");
   assert_eq(inner(must("a*")).opening.first, b"");
   assert_eq(inner(must("\\ba")).opening.first, b"");
-  assert_eq(inner(must("(?i)k")).opening.first, b"Kk");
+  assert_eq(inner(must("(?i)k")).opening.first, b"Kk\xe2");
+  assert_eq(inner(must("(?i)x")).opening.first, b"Xx");
   assert_eq(bytes_len(inner(must(".")).opening.first), 178);
   assert_eq(inner(must("\\w+@example\\.com")).opening.held, b"@example.com");
   assert_eq(inner(must("(\\d+)(?:ab)+\u{e9}|x")).opening.held, b"");
@@ -4140,6 +4466,84 @@ fn tricky(seeds: List<Int>) -> String =
     "",
   )
 
+/// A run of `n` letters of three scripts, with no digit among them.
+fn run_of_letters(n: Int) -> String =
+  string_of_chars(
+    map(range(0, n), |i: Int| match i % 3 { 0 -> 'a', 1 -> '\u{3b1}', _ -> '\u{4e2d}' }),
+  )
+
+law "a search for `\\p{L}+\\d` reads a run of letters of three scripts and finds nothing in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    is_match(must("\\p{L}+\\d"), run_of_letters(n))
+  }
+
+law "a search for `(?u)\\b\\w+\\b\\d`, which goes by every state at once, reads a run of letters in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    is_match(must("(?u)\\b\\w+\\b\\d"), run_of_letters(n))
+  }
+
+law "under `(?u)` a word's edge stands exactly where one side is `\\w` and the other is not"
+  forall (seed: Int) {
+    let text = char::drawn_text(seed);
+    let wordy = must("(?u)^\\w$");
+    let chars = array_of_list(string_chars(text));
+    let is_wordy = |i: Int|
+      match array_at(chars, i) { Some(c) -> is_match(wordy, string_of_chars([c])), None -> false };
+    map(find_all(must("(?u)\\b"), text), |s: Span| s.start)
+      == filter(range(0, array_len(chars) + 1), |i: Int| is_wordy(i - 1) != is_wordy(i))
+  }
+
+test "a property's class is searched one state at a time as by every state at once, however little room there is" {
+  let text = join(
+    map(range(0, 60), |_: Int| "na\u{ef}ve \u{391}\u{3b2}\u{3b3}\u{663}7 \u{4e2d}\u{6587}_x9\n"),
+    "",
+  );
+  let found = |pattern: String, o: Options| find_all(must_with(pattern, o), text);
+  fold(
+    [
+      "\\p{L}+",
+      "(?i)\\p{Lu}\\p{Greek}*",
+      "[\\p{L}\\p{Nd}_]+ ",
+      "(?u)\\w+\\s\\d?",
+      "\\P{L}+",
+      "(?u)\\b\\w",
+      "\\p{Han}{2}",
+      "(?i)\\x{3a3}?\\x{3b1}",
+    ],
+    (),
+    |_: Unit, pattern: String| {
+      let by_threads = found(pattern, threads_only());
+      assert(len(by_threads) >= 60, Some(pattern));
+      assert_eq(found(pattern, states_always()), by_threads);
+      assert_eq(found(pattern, states_cramped()), by_threads);
+      assert_eq(found(pattern, options()), by_threads)
+    },
+  )
+}
+
+test "a property's class compiles to a program within the limit, and is refused past one" {
+  let size = |pattern: String| array_len(inner(must(pattern)).insts);
+  let refused = |pattern: String, o: Options|
+    match compile_with(pattern, o) { Err(no) -> Some(no), Ok(_) -> None };
+  assert(size("\\p{L}") > 300 && size("\\p{L}") < 4000, Some(int_to_string(size("\\p{L}"))));
+  assert(size("(?u)\\w") < 4000, Some(int_to_string(size("(?u)\\w"))));
+  assert(size("\\p{Greek}") < 200, Some(int_to_string(size("\\p{Greek}"))));
+  assert(size("\\p{L}{20}") < options().size_limit);
+  assert_eq(refused("\\p{L}", { ..options(), size_limit: 100 }), Some({ at: 0, why: TooLarge }));
+  assert_eq(refused("\\p{L}{1000}", options()), Some({ at: 5, why: TooLarge }));
+  assert_eq(refused("\\p{L}{1000}", { ..options(), size_limit: 10000000 }), None)
+}
+
+test "a pattern over bytes reads no property and no `(?u)`, and ignores the case of ASCII's letters alone" {
+  let refused = |pattern: String|
+    match compile_bytes(pattern) { Err(no) -> Some(no), Ok(_) -> None };
+  assert_eq(refused("\\pL"), Some({ at: 0, why: UnicodeProperty }));
+  assert_eq(refused("[\\p{Greek}]"), Some({ at: 1, why: UnicodeProperty }));
+  assert_eq(refused("(?u)\\w"), Some({ at: 2, why: BadGroup }));
+  assert_eq(find_bytes(must_bytes("(?i)k"), b"\xe2\x84\xaaK"), Some({ start: 3, end: 4 }));
+  assert_eq(find(must("(?i)k"), "\u{212a}K"), Some({ start: 0, end: 1 }))
+}
+
 law "an escaped text compiles, and matches that text and no other" =
   agrees(
     |d: { text: List<Int>, other: List<Int> }| {
@@ -4262,7 +4666,7 @@ fn accepted(
           && fold(set, false, |within: Bool, i: Interval|
             within || (bytes_at(hay, at) >= i.lo && bytes_at(hay, at) <= i.hi))
           && then(at + 1),
-      Looking(look) -> look_bits(look, false) & ~looks_at(hay, at) == 0 && then(at),
+      Looking(look) -> look_bits(look, false) & ~looks_at(hay, at, true) == 0 && then(at),
       Concat(items) -> in_a_row(items, 0, hay, at, fuel - 1, then),
       Alternate(items) ->
         fold(items, false, |any: Bool, n: Node| any || accepted(n, hay, at, fuel - 1, then)),

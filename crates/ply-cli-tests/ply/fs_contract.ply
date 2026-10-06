@@ -1,8 +1,14 @@
 //! Every deterministic test of this suite runs over `MemFs`, so it must answer as the disk does.
 
-import harness (fresh)
+import harness (fresh, in_memory, one, json_of, codes)
 import std.fs
-import std.fs (fs, Entry)
+import std.fs (fs, files, Entry, Seen)
+import std.io
+import std.io (io, Sink)
+import std.random (entropy)
+import std.tar
+import std.tar (tar)
+import std.time (millis, nanos_at, time)
 
 fn shown_bool(b: Bool) -> String = if b { "true" } else { "false" }
 
@@ -155,5 +161,722 @@ test/nondet "the filesystem's twin answers every operation as the disk does" {
   fresh();
   let disk = script();
   let twin = fs::on_mem(fs::mem_empty(), || script()).value;
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+/// The host's own error number is the platform's, so only that there is one is compared.
+fn shown_refused(why: fs::Refused) -> String =
+  match why {
+    fs::NotFound -> "not found",
+    fs::Denied -> "denied",
+    fs::NotAFile -> "not a file",
+    fs::NotADirectory -> "not a directory",
+    fs::Exists -> "exists",
+    fs::NoSpace -> "no space",
+    fs::CrossesRoot -> "crosses root",
+    fs::TooMuch -> "too much",
+    fs::Other(code, text) -> if code == 0 { "failed " ++ text } else { "the host's own" },
+  }
+
+/// A descriptor is the run's own number, so only whether there is one is compared.
+fn shown_opened(o: Result<Int, fs::Refused>) -> String =
+  match o { Ok(_) -> "open", Err(why) -> shown_refused(why) }
+
+fn through<| e>(o: Result<Int, fs::Refused>, f: (Int) -> String / e) -> String / e =
+  match o { Ok(file) -> f(file), Err(_) -> "no descriptor" }
+
+/// The operations on an open file, under `s/`.
+fn streamed() -> List<String> / {fs.read[cwd], fs.write[cwd]} = {
+  let made = fs.create_dir[cwd]("s");
+  let out = fs.open[cwd]("s/f", fs::ToWrite);
+  let wrote = through(out, |d: Int|
+    shown_bool(fs.write_chunk[cwd](d, b"hello ") && fs.write_chunk[cwd](d, b"world")));
+  let unread = through(out, |d: Int| shown_opt_text(fs.read_chunk[cwd](d, 4)));
+  let closed = through(out, |d: Int| shown_bool(fs.close[cwd](d)));
+  let again = through(out, |d: Int| shown_bool(fs.close[cwd](d)));
+  let late = through(out, |d: Int| shown_bool(fs.write_chunk[cwd](d, b"!")));
+  let more = fs.open[cwd]("s/f", fs::ToAppend);
+  let appended = through(more, |d: Int|
+    shown_bool(fs.write_chunk[cwd](d, b"!") && fs.close[cwd](d)));
+  let source = fs.open[cwd]("s/f", fs::ToRead);
+  let chunks = through(source, |d: Int|
+    shown_opt_text(fs.read_chunk[cwd](d, 5)) ++ " " ++ shown_opt_text(fs.read_chunk[cwd](d, 100))
+      ++ " "
+      ++ shown_opt_text(fs.read_chunk[cwd](d, 100))
+      ++ " "
+      ++ shown_opt_text(fs.read_chunk[cwd](d, 0)));
+  let unwritten = through(source, |d: Int| shown_bool(fs.write_chunk[cwd](d, b"x")));
+  let shut = through(source, |d: Int| shown_bool(fs.close[cwd](d)));
+  let after = through(source, |d: Int| shown_opt_text(fs.read_chunk[cwd](d, 1)));
+  [
+    "create_dir s -> " ++ shown_bool(made),
+    "open s/f to write -> " ++ shown_opened(out),
+    "write_chunk twice -> " ++ wrote,
+    "read_chunk of a file open to write -> " ++ unread,
+    "close -> " ++ closed,
+    "close again -> " ++ again,
+    "write_chunk after close -> " ++ late,
+    "open s/f to append -> " ++ shown_opened(more),
+    "write_chunk and close -> " ++ appended,
+    "open s/f to read -> " ++ shown_opened(source),
+    "read_chunk 5, 100, 100, 0 -> " ++ chunks,
+    "write_chunk of a file open to read -> " ++ unwritten,
+    "close -> " ++ shut,
+    "read_chunk after close -> " ++ after,
+    "open s/nope to read -> " ++ shown_opened(fs.open[cwd]("s/nope", fs::ToRead)),
+    "open s to read -> " ++ shown_opened(fs.open[cwd]("s", fs::ToRead)),
+    "open s to write -> " ++ shown_opened(fs.open[cwd]("s", fs::ToWrite)),
+    "open s/no/f to write -> " ++ shown_opened(fs.open[cwd]("s/no/f", fs::ToWrite)),
+    "read_file s/f -> " ++ shown_opt_text(fs.read_file[cwd]("s/f")),
+    "remove_tree s -> " ++ shown_bool(fs.remove_tree[cwd]("s")),
+  ]
+}
+
+test/nondet "the twin answers every operation on an open file as the disk does" {
+  fresh();
+  let disk = streamed();
+  let twin = fs::on_mem(fs::mem_empty(), || streamed()).value;
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+fn mebibyte() -> Int = 1048576
+
+/// One read answers at most 64 MiB (`E0453`), so this file is a mebibyte past what `read_file`
+/// would answer: written and read back through a descriptor, a chunk at a time.
+fn over_the_bound() -> List<String> / {fs.read[cwd], fs.write[cwd], abort.raise} = {
+  let block = fold(range(0, 16), b"0123456789abcdef", |b: Bytes, i: Int| bytes_concat(b, b));
+  let blocks = 65;
+  let out = fs.open[cwd]("large", fs::ToWrite);
+  let wrote = through(out, |d: Int|
+    shown_bool(
+      fold(range(0, blocks), true, |ok: Bool, i: Int| ok && fs.write_chunk[cwd](d, block))
+        && fs.close[cwd](d),
+    ));
+  let size = fs.file_size[cwd]("large");
+  let source = fs.open[cwd]("large", fs::ToRead);
+  let read = through(source, |d: Int| {
+    let total = iterate({ bytes: 0, chunks: 0 }, blocks + 2, |s: { bytes: Int, chunks: Int }|
+      match fs.read_chunk[cwd](d, 8 * mebibyte()) {
+        Some(chunk) -> if bytes_len(chunk) == 0 { Stop(s) }
+        else { Continue({ bytes: s.bytes + bytes_len(chunk), chunks: s.chunks + 1 }) },
+        None -> Stop(s),
+      });
+    let closed = fs.close[cwd](d);
+    int_to_string(total.bytes) ++ " bytes in " ++ int_to_string(total.chunks) ++ " chunks, closed "
+      ++ shown_bool(closed)
+  });
+  assert(size == Some(blocks * mebibyte()) && blocks * mebibyte() > 64 * mebibyte());
+  [
+    "write 65 MiB -> " ++ wrote,
+    "file_size large -> " ++ shown_opt_int(size),
+    "read in 8 MiB chunks -> " ++ read,
+    "remove large -> " ++ shown_bool(fs.remove[cwd]("large")),
+  ]
+}
+
+test/nondet "a file over the bound of one read is read in chunks, on the disk and over the twin" {
+  fresh();
+  let disk = over_the_bound();
+  let twin = fs::on_mem(fs::mem_empty(), || over_the_bound()).value;
+  assert_eq(
+    list_at(disk, 2),
+    Some("read in 8 MiB chunks -> 68157440 bytes in 9 chunks, closed true"),
+  );
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+// A descriptor has a place in its file that every read moves, so reading through one is a write
+// of its root: two under one root may not run at once, and two under two roots may.
+test "two open files under one root contend, and under two roots do not" {
+  let both = |row: String, other: String|
+    "import std.fs (fs)\n\npub fn both(a: Int, b: Int) -> (Option<Bytes>, Option<Bytes>) / {" ++ row
+      ++ "} =\n  parallel { fs.read_chunk[left](a, 1), fs.read_chunk["
+      ++ other
+      ++ "](b, 1) }\n";
+  let checked = |source: String| codes(json_of(in_memory(one(source), ["check", "--json"])));
+  assert_eq(checked(both("fs.read_chunk[left]", "left")), ["E0309"]);
+  assert_eq(checked(both("fs.read_chunk[left], fs.read_chunk[right]", "right")), [])
+}
+
+// --- Looks, second names, exclusive creates and room --------------------------------
+
+/// A fresh mode is the umask's on a disk, so a mode is compared only where a script set it.
+fn shown_stat(found: Option<fs::Stat>) -> String =
+  match found {
+    Some(s) -> shown_kind(s.kind) ++ "," ++ int_to_string(s.size) ++ ",x" ++ int_to_string(s.links),
+    None -> "none",
+  }
+
+fn shown_seen(seen: Option<List<Seen>>) -> String =
+  match seen {
+    Some(entries) ->
+      fold(entries, "", |acc: String, s: Seen|
+        acc ++ (if acc == "" { "" } else { " " }) ++ s.path ++ "=" ++ shown_stat(Some(s.stat))),
+    None -> "none",
+  }
+
+fn shown_linked(made: Result<Unit, fs::Refused>) -> String =
+  match made { Ok(_) -> "linked", Err(why) -> shown_refused(why) }
+
+/// A file's id is its file system's own number, so only whether two paths share one is compared.
+fn one_file(a: String, b: String) -> String / {fs.stat[cwd]} =
+  match fs.stat[cwd](a) {
+    Some(x) -> match fs.stat[cwd](b) {
+      Some(y) -> shown_bool(x.device == y.device && x.id == y.id),
+      None -> "none",
+    },
+    None -> "none",
+  }
+
+fn shown_nanos(found: Option<fs::Stat>) -> String =
+  match found { Some(s) -> int_to_string(nanos_at(s.modified)), None -> "none" }
+
+/// Only that a file system has room is the same on a disk and in a twin.
+fn shown_space(room: Option<fs::Space>) -> String =
+  match room {
+    Some(r) -> shown_bool(r.total > 0 && r.available <= r.free && r.free <= r.total),
+    None -> "none",
+  }
+
+/// Under `n/`.
+fn named() -> List<String> / {fs.read[cwd], fs.write[cwd]} = {
+  let made = fs.create_dir[cwd]("n/d");
+  let wrote = fs.write_file[cwd]("n/d/a.txt", b"one");
+  let pointed = fs.symlink[cwd]("n/l", "d/a.txt");
+  let twin = fs.link[cwd]("n/twin", "n/d/a.txt");
+  let both = fs.write_file[cwd]("n/twin", b"both");
+  let closed = fs.set_mode[cwd]("n/d/a.txt", owner_only());
+  let stamped = fs.set_modified[cwd]("n/twin", 1700000000123);
+  let created = fs.open[cwd]("n/new", fs::ToCreate);
+  let filled = through(created, |d: Int|
+    shown_bool(fs.write_chunk[cwd](d, b"mine") && fs.close[cwd](d)));
+  [
+    "create_dir n/d -> " ++ shown_bool(made),
+    "write_file n/d/a.txt -> " ++ shown_bool(wrote),
+    "symlink n/l -> " ++ shown_bool(pointed),
+    "link n/twin n/d/a.txt -> " ++ shown_linked(twin),
+    "write_file n/twin -> " ++ shown_bool(both),
+    "read_file n/d/a.txt -> " ++ shown_opt_text(fs.read_file[cwd]("n/d/a.txt")),
+    "set_mode n/d/a.txt -> " ++ shown_bool(closed),
+    "mode n/twin -> " ++ shown_mode(fs.mode[cwd]("n/twin")),
+    "set_modified n/twin -> " ++ shown_bool(stamped),
+    "modified_ms n/d/a.txt -> " ++ shown_opt_int(fs.modified_ms[cwd]("n/d/a.txt")),
+    "stat n/d/a.txt -> " ++ shown_stat(fs.stat[cwd]("n/d/a.txt")),
+    "stat n/d/a.txt modified -> " ++ shown_nanos(fs.stat[cwd]("n/d/a.txt")),
+    "stat n/twin -> " ++ shown_stat(fs.stat[cwd]("n/twin")),
+    "stat n/d -> " ++ shown_stat(fs.stat[cwd]("n/d")),
+    "stat n/l -> " ++ shown_stat(fs.stat[cwd]("n/l")),
+    "stat n/l mode -> "
+      ++ shown_mode(match fs.stat[cwd]("n/l") { Some(s) -> Some(s.mode), None -> None }),
+    "stat n/absent -> " ++ shown_stat(fs.stat[cwd]("n/absent")),
+    "stat n/d/a.txt/under -> " ++ shown_stat(fs.stat[cwd]("n/d/a.txt/under")),
+    "one file n/twin n/d/a.txt -> " ++ one_file("n/twin", "n/d/a.txt"),
+    "one file n/l n/d/a.txt -> " ++ one_file("n/l", "n/d/a.txt"),
+    "link n/x n/absent -> " ++ shown_linked(fs.link[cwd]("n/x", "n/absent")),
+    "link n/x n/d -> " ++ shown_linked(fs.link[cwd]("n/x", "n/d")),
+    "link n/x n/l -> " ++ shown_linked(fs.link[cwd]("n/x", "n/l")),
+    "link n/l n/d/a.txt -> " ++ shown_linked(fs.link[cwd]("n/l", "n/d/a.txt")),
+    "link n/twin n/d/a.txt -> " ++ shown_linked(fs.link[cwd]("n/twin", "n/d/a.txt")),
+    "link n/no/x n/d/a.txt -> " ++ shown_linked(fs.link[cwd]("n/no/x", "n/d/a.txt")),
+    "link n/d/a.txt/x n/d/a.txt -> " ++ shown_linked(fs.link[cwd]("n/d/a.txt/x", "n/d/a.txt")),
+    "exists n/x -> " ++ shown_bool(fs.exists[cwd]("n/x")),
+    "copy n/twin onto n/d/a.txt -> " ++ shown_bool(fs.copy[cwd]("n/twin", "n/d/a.txt")),
+    "copy n/d/a.txt onto itself -> " ++ shown_bool(fs.copy[cwd]("n/d/a.txt", "n/d/a.txt")),
+    "read_file n/d/a.txt -> " ++ shown_opt_text(fs.read_file[cwd]("n/d/a.txt")),
+    "rename n/twin onto n/d/a.txt -> " ++ shown_bool(fs.rename[cwd]("n/twin", "n/d/a.txt")),
+    "exists n/twin -> " ++ shown_bool(fs.exists[cwd]("n/twin")),
+    "rename n/twin n/moved -> " ++ shown_bool(fs.rename[cwd]("n/twin", "n/moved")),
+    "modified_ms n/moved -> " ++ shown_opt_int(fs.modified_ms[cwd]("n/moved")),
+    "remove n/d/a.txt -> " ++ shown_bool(fs.remove[cwd]("n/d/a.txt")),
+    "stat n/moved -> " ++ shown_stat(fs.stat[cwd]("n/moved")),
+    "read_file n/moved -> " ++ shown_opt_text(fs.read_file[cwd]("n/moved")),
+    "open n/new to create -> " ++ shown_opened(created),
+    "write_chunk and close -> " ++ filled,
+    "mode n/new -> " ++ shown_mode(fs.mode[cwd]("n/new")),
+    "open n/new to create again -> " ++ shown_opened(fs.open[cwd]("n/new", fs::ToCreate)),
+    "open n/d to create -> " ++ shown_opened(fs.open[cwd]("n/d", fs::ToCreate)),
+    "open n/l to create -> " ++ shown_opened(fs.open[cwd]("n/l", fs::ToCreate)),
+    "exists n/d/a.txt -> " ++ shown_bool(fs.exists[cwd]("n/d/a.txt")),
+    "open n/no/new to create -> " ++ shown_opened(fs.open[cwd]("n/no/new", fs::ToCreate)),
+    "open n/moved/new to create -> " ++ shown_opened(fs.open[cwd]("n/moved/new", fs::ToCreate)),
+    "open n/moved/new to write -> " ++ shown_opened(fs.open[cwd]("n/moved/new", fs::ToWrite)),
+    "scan n deep -> " ++ shown_seen(fs.scan[cwd]("n", true)),
+    "scan n -> " ++ shown_seen(fs.scan[cwd]("./n/", false)),
+    "scan n/moved -> " ++ shown_seen(fs.scan[cwd]("n/moved", true)),
+    "scan n/absent -> " ++ shown_seen(fs.scan[cwd]("n/absent", false)),
+    "space n -> " ++ shown_space(fs.space[cwd]("n")),
+    "space n/moved -> " ++ shown_space(fs.space[cwd]("n/moved")),
+    "space n/absent -> " ++ shown_space(fs.space[cwd]("n/absent")),
+    "remove_tree n -> " ++ shown_bool(fs.remove_tree[cwd]("n")),
+  ]
+}
+
+test/nondet "the twin looks at a path, names a file twice and makes one exclusively as the disk does" {
+  fresh();
+  let disk = named();
+  let twin = fs::on_mem(fs::mem_empty(), || named()).value;
+  assert_eq(list_at(disk, 10), Some("stat n/d/a.txt -> file,4,x2"));
+  assert_eq(list_at(disk, 11), Some("stat n/d/a.txt modified -> 1700000000123000000"));
+  assert_eq(list_at(disk, 30), Some("read_file n/d/a.txt -> \"both\""));
+  assert_eq(list_at(disk, 34), Some("modified_ms n/moved -> 1700000000123"));
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+// --- Atomic writes ---------------------------------------------------------------
+
+fn bits(n: Int) -> fs::Mode = fs::mode_of_bits(n)
+
+/// What an atomic write of `path` came to: `written`, or where it stopped and why. A temporary
+/// file's name is the run's own, so a refusal there is told by its directory.
+fn atomically(
+  path: String,
+  body: Bytes,
+  durability: fs::Durability,
+  mode: Option<fs::Mode>,
+) -> String / {fs.read[cwd], fs.write[cwd], entropy.next, abort.raise} = {
+  let wrote: Result<Unit, (String, fs::Refused)> = try[files.refused] {
+    fs::write_atomic[cwd](path, body, durability, mode)
+  };
+  match wrote {
+    Ok(_) -> "written",
+    Err((at, why)) ->
+      (if string_contains(at, ".tmp-") { "beside " ++ path } else { "at " ++ at }) ++ ": "
+        ++ shown_refused(why),
+  }
+}
+
+/// A file replaced through a sink in two chunks, where `fail` raises between them.
+fn replaced(
+  path: String,
+  fail: Bool,
+) -> String / {fs.read[cwd], fs.write[cwd], files.refused, entropy.next, abort.raise} = {
+  let wrote: Result<Unit, Int> = try[io.too_long] {
+    io::replacing[cwd](path, fs::Durable, None, |sink: Sink<| {fs.write_chunk[cwd]}>| {
+      let first = (sink.push)(b"str");
+      if fail { io.too_long(3) } else { () };
+      if first && (sink.push)(b"eamed") { () } else { panic("the sink took nothing") }
+    })
+  };
+  match wrote { Ok(_) -> "replaced", Err(n) -> "raised after " ++ int_to_string(n) }
+}
+
+/// Under `w/`.
+fn atomic() -> List<String> / {fs.read[cwd], fs.write[cwd], files.refused, entropy.next, abort.raise} = {
+  let made = fs.create_dir[cwd]("w/dir");
+  let old = fs.write_file[cwd]("w/cfg", b"old") && fs.set_mode[cwd]("w/cfg", bits(416));
+  let pointed = fs.symlink[cwd]("w/link", "cfg");
+  [
+    "create_dir w/dir -> " ++ shown_bool(made),
+    "write_file and set_mode w/cfg rw-r----- -> " ++ shown_bool(old),
+    "symlink w/link cfg -> " ++ shown_bool(pointed),
+    "write_atomic w/cfg durable -> " ++ atomically("w/cfg", b"new", fs::Durable, None),
+    "read_file w/cfg -> " ++ shown_opt_text(fs.read_file[cwd]("w/cfg")),
+    "mode w/cfg -> " ++ shown_mode(fs.mode[cwd]("w/cfg")),
+    "write_atomic w/fresh fast -> " ++ atomically("w/fresh", b"f", fs::Fast, None),
+    "mode w/fresh -> " ++ shown_mode(fs.mode[cwd]("w/fresh")),
+    "write_atomic w/tool rwx------ -> " ++ atomically("w/tool", b"t", fs::Fast, Some(bits(448))),
+    "mode w/tool -> " ++ shown_mode(fs.mode[cwd]("w/tool")),
+    "write_atomic w/link -> " ++ atomically("w/link", b"direct", fs::Durable, None),
+    "kind w/link -> " ++ shown_kind(fs.kind[cwd]("w/link")),
+    "read_file w/link -> " ++ shown_opt_text(fs.read_file[cwd]("w/link")),
+    "read_file w/cfg -> " ++ shown_opt_text(fs.read_file[cwd]("w/cfg")),
+    "write_atomic w/no/cfg -> " ++ atomically("w/no/cfg", b"x", fs::Durable, None),
+    "write_atomic w/cfg/under -> " ++ atomically("w/cfg/under", b"x", fs::Durable, None),
+    "write_atomic w/dir -> " ++ atomically("w/dir", b"x", fs::Durable, None),
+    "kind w/dir -> " ++ shown_kind(fs.kind[cwd]("w/dir")),
+    "replacing w/cfg -> " ++ replaced("w/cfg", false),
+    "read_file w/cfg -> " ++ shown_opt_text(fs.read_file[cwd]("w/cfg")),
+    "mode w/cfg -> " ++ shown_mode(fs.mode[cwd]("w/cfg")),
+    "replacing w/cfg, raising -> " ++ replaced("w/cfg", true),
+    "read_file w/cfg -> " ++ shown_opt_text(fs.read_file[cwd]("w/cfg")),
+    "list_dir w -> " ++ shown_names(fs.list_dir[cwd]("w")),
+    "remove_tree w -> " ++ shown_bool(fs.remove_tree[cwd]("w")),
+  ]
+}
+
+test/nondet "the twin writes a file whole or not at all as the disk does, and neither leaves a temporary" {
+  fresh();
+  let disk = atomic();
+  let twin = fs::on_mem(fs::mem_empty(), || atomic()).value;
+  assert_eq(list_at(disk, 23), Some("list_dir w -> [cfg dir fresh link tool]"));
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+// --- Copies of trees ---------------------------------------------------------------
+
+/// Every entry under `dir` a line apart: what a look reads of it, a link's target, a file's bytes,
+/// and the mode and the milliseconds a script set on a file or a directory.
+fn shown_tree(dir: String) -> String / {fs.read[cwd]} =
+  match fs.scan[cwd](dir, true) {
+    None -> "none",
+    Some(entries) ->
+      fold(entries, "", |acc: String, s: Seen|
+        acc ++ "\n    " ++ s.path ++ "=" ++ shown_stat(Some(s.stat))
+          ++ (match s.stat.kind {
+            fs::Symlink -> " to " ++ shown_opt_string(fs.read_link[cwd](s.path)),
+            fs::File ->
+              " " ++ shown_opt_text(fs.read_file[cwd](s.path)) ++ " " ++ fs::mode_text(s.stat.mode)
+                ++ " at "
+                ++ int_to_string(nanos_at(s.stat.modified) / 1000000),
+            _ ->
+              " " ++ fs::mode_text(s.stat.mode) ++ " at "
+                ++ int_to_string(nanos_at(s.stat.modified) / 1000000),
+          })),
+  }
+
+/// A tree at `top` with a mode and a time set on every file and directory in it: a file of each
+/// mode, a directory in a directory and an empty one, a link, and a file with two names.
+fn planted(top: String) -> Bool / {fs.write[cwd]} = {
+  let at = |rest: String| top ++ "/" ++ rest;
+  let made = fs.create_dir[cwd](at("sub")) && fs.create_dir[cwd](at("empty"))
+    && fs.write_file[cwd](at("a.txt"), b"alpha")
+    && fs.write_file[cwd](at("sub/b.sh"), b"#!/bin/sh\n")
+    && fs.symlink[cwd](at("l"), "sub/b.sh");
+  let twin = fs.link[cwd](at("sub/twin.txt"), at("a.txt"));
+  let moded = fs.set_mode[cwd](at("a.txt"), bits(416))
+    && fs.set_mode[cwd](at("sub/b.sh"), bits(488))
+    && fs.set_mode[cwd](at("sub"), bits(493))
+    && fs.set_mode[cwd](at("empty"), bits(448))
+    && fs.set_mode[cwd](top, bits(493));
+  let dated = fs.set_modified[cwd](at("a.txt"), 1600000000000)
+    && fs.set_modified[cwd](at("sub/b.sh"), 1600000001000)
+    && fs.set_modified[cwd](at("sub"), 1600000002000)
+    && fs.set_modified[cwd](at("empty"), 1600000003000)
+    && fs.set_modified[cwd](top, 1600000004000);
+  made && twin == Ok(()) && moded && dated
+}
+
+fn copying(existing: fs::Existing, outside: fs::Outside) -> fs::Copying =
+  { existing: existing, outside: outside, entries: 100, bytes: 100000 }
+
+fn shown_copied(copied: Result<fs::Copied<Int>, (String, fs::Refused)>) -> String =
+  match copied {
+    Ok(c) ->
+      int_to_string(c.entries) ++ " entries, " ++ int_to_string(c.bytes) ++ " bytes, told "
+        ++ int_to_string(c.value)
+        ++ ", skipped "
+        ++ shown_names(Some(c.skipped))
+        ++ (if c.stopped { ", stopped" } else { "" }),
+    Err((at, why)) -> "at " ++ at ++ ": " ++ shown_refused(why),
+  }
+
+fn copy_within(
+  from: String,
+  to: String,
+  how: fs::Copying,
+) -> String / {fs.read[cwd], fs.write[cwd], abort.raise} = {
+  let copied: Result<fs::Copied<Int>, (String, fs::Refused)> = try[files.refused] {
+    fs::copy_tree[cwd](from, to, how, 0, |n: Int, _told: fs::Progress| Continue(n + 1))
+  };
+  shown_copied(copied)
+}
+
+fn copy_across(
+  from: String,
+  to: String,
+  how: fs::Copying,
+) -> String / {fs.read[cwd], fs.write[cwd], abort.raise} = {
+  let copied: Result<fs::Copied<Int>, (String, fs::Refused)> = try[files.refused] {
+    fs::copy_tree_across[cwd, cwd](from, to, how, 0, |n: Int, told: fs::Progress|
+      if told.path == to ++ "/l" { Stop(n + 1) } else { Continue(n + 1) })
+  };
+  shown_copied(copied)
+}
+
+/// Under `t/`.
+fn copied() -> List<String> / {fs.read[cwd], fs.write[cwd], abort.raise} = {
+  let grown = planted("t/src");
+  let stood = fs.create_dir[cwd]("t/merged/sub") && fs.write_file[cwd]("t/merged/a.txt", b"old")
+    && fs.write_file[cwd]("t/merged/kept.txt", b"kept")
+    && fs.set_mode[cwd]("t/merged/kept.txt", bits(420))
+    && fs.set_modified[cwd]("t/merged/kept.txt", 1500000000000)
+    && fs.symlink[cwd]("t/merged/empty", "kept.txt");
+  let tight = copying(fs::Refuse, fs::RefuseLink);
+  let climbing = fs.create_dir[cwd]("t/up") && fs.write_file[cwd]("t/up/f", b"f")
+    && fs.symlink[cwd]("t/up/out", "../../t");
+  [
+    "a tree is planted -> " ++ shown_bool(grown),
+    "the tree -> " ++ shown_tree("t/src"),
+    "copy_tree t/src t/out -> "
+      ++ copy_within("t/src", "t/out", copying(fs::Refuse, fs::RefuseLink)),
+    "the copy -> " ++ shown_tree("t/out"),
+    "one file t/out/a.txt t/out/sub/twin.txt -> " ++ one_file("t/out/a.txt", "t/out/sub/twin.txt"),
+    "one file t/out/a.txt t/src/a.txt -> " ++ one_file("t/out/a.txt", "t/src/a.txt"),
+    "mode t/out -> " ++ shown_mode(fs.mode[cwd]("t/out")),
+    "modified_ms t/out -> " ++ shown_opt_int(fs.modified_ms[cwd]("t/out")),
+    "copy_tree again, refusing -> "
+      ++ copy_within("t/src", "t/out", copying(fs::Refuse, fs::RefuseLink)),
+    "something stands at t/merged -> " ++ shown_bool(stood),
+    "copy_tree, merging -> "
+      ++ copy_within("t/src", "t/merged", copying(fs::Merge, fs::RefuseLink)),
+    "the merged -> " ++ shown_tree("t/merged"),
+    "copy_tree, replacing -> "
+      ++ copy_within("t/src", "t/merged", copying(fs::Replace, fs::RefuseLink)),
+    "list_dir t/merged -> " ++ shown_names(fs.list_dir[cwd]("t/merged")),
+    "copy_tree a file over a directory, merging -> "
+      ++ copy_within("t/src/a.txt", "t/merged/sub", copying(fs::Merge, fs::RefuseLink)),
+    "copy_tree of nothing -> "
+      ++ copy_within("t/absent", "t/nowhere", copying(fs::Refuse, fs::RefuseLink)),
+    "copy_tree past its bound -> " ++ copy_within("t/src", "t/nowhere", { ..tight, bytes: 19 }),
+    "exists t/nowhere -> " ++ shown_bool(fs.exists[cwd]("t/nowhere")),
+    "a link climbs -> " ++ shown_bool(climbing),
+    "copy_tree t/up to the root, refusing the link -> "
+      ++ copy_within("t/up", "", copying(fs::Merge, fs::RefuseLink)),
+    "copy_tree t/up to the root, skipping the link -> "
+      ++ copy_within("t/up", "", copying(fs::Merge, fs::SkipLink)),
+    "read_file f -> " ++ shown_opt_text(fs.read_file[cwd]("f")),
+    "exists out -> " ++ shown_bool(fs.exists[cwd]("out")),
+    "remove f -> " ++ shown_bool(fs.remove[cwd]("f")),
+    "copy_tree_across, stopping at the link -> "
+      ++ copy_across("t/src", "t/over", copying(fs::Refuse, fs::RefuseLink)),
+    "the copy across -> " ++ shown_tree("t/over"),
+    "remove_tree t -> " ++ shown_bool(fs.remove_tree[cwd]("t")),
+  ]
+}
+
+test/nondet "the twin copies a tree, its modes, times and links, as the disk does" {
+  fresh();
+  let disk = copied();
+  let twin = fs::on_mem(fs::mem_empty(), || copied()).value;
+  assert_eq(
+    list_at(disk, 2),
+    Some("copy_tree t/src t/out -> 7 entries, 20 bytes, told 7, skipped []"),
+  );
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+// --- Watches ---------------------------------------------------------------------
+
+fn shown_changes(changes: List<fs::Change>) -> String =
+  "["
+    ++ fold(changes, "", |acc: String, c: fs::Change|
+      acc ++ (if acc == "" { "" } else { ", " })
+        ++ (match c {
+          fs::Created(p) -> "created " ++ p,
+          fs::Modified(p) -> "modified " ++ p,
+          fs::Removed(p) -> "removed " ++ p,
+          fs::Renamed(from, to) -> "renamed " ++ from ++ " to " ++ to,
+          fs::Rescan -> "rescan",
+        }))
+    ++ "]"
+
+/// Under `v/`. Each change either moves a file's size or stamps a time on it, so a disk whose
+/// clock is coarse tells it as a twin does.
+fn watched() -> List<String> / {fs.read[cwd], fs.write[cwd], time.sleep_ms, abort.raise} = {
+  let made = fs.create_dir[cwd]("v/d") && fs.write_file[cwd]("v/d/a.txt", b"a")
+    && fs.set_modified[cwd]("v/d/a.txt", 1600000000000);
+  let begun = fs::watch[cwd]("v/d", true, 10);
+  let quiet = fs::poll[cwd](begun);
+  let wrote = fs.write_file[cwd]("v/d/n.txt", b"n") && fs.write_file[cwd]("v/elsewhere", b"e");
+  let first = fs::poll[cwd](quiet.watch);
+  let grew = fs.write_file[cwd]("v/d/a.txt", b"aa");
+  let second = fs::poll[cwd](first.watch);
+  let stamped = fs.set_modified[cwd]("v/d/a.txt", 1600000001000);
+  let third = fs::poll[cwd](second.watch);
+  let renamed = fs.rename[cwd]("v/d/n.txt", "v/d/m.txt");
+  let fourth = fs::poll[cwd](third.watch);
+  let nested = fs.create_dir[cwd]("v/d/sub") && fs.write_file[cwd]("v/d/sub/x", b"x");
+  let fifth = fs::poll[cwd](fourth.watch);
+  let moved = fs.rename[cwd]("v/d/sub", "v/d/bus");
+  let sixth = fs::poll[cwd](fifth.watch);
+  let saved = fs.write_file[cwd]("v/d/m.tmp", b"saved") && fs.rename[cwd]("v/d/m.tmp", "v/d/m.txt");
+  let seventh = fs::poll[cwd](sixth.watch);
+  let closed = fs.set_mode[cwd]("v/d/bus", bits(457)) && fs.remove[cwd]("v/d/a.txt");
+  let eighth = fs::poll[cwd](seventh.watch);
+  let still = fs::await_changes[cwd](eighth.watch, millis(2), 3);
+  let narrow = fs::watch[cwd]("v/d", false, 1);
+  let flooded = fs.write_file[cwd]("v/d/one", b"1") && fs.write_file[cwd]("v/d/two", b"2");
+  let ninth = fs::poll[cwd](narrow);
+  let gone = fs.remove_tree[cwd]("v/d");
+  let tenth = fs::poll[cwd](ninth.watch);
+  let eleventh = fs::poll[cwd](tenth.watch);
+  let back = fs.create_dir[cwd]("v/d");
+  let twelfth = fs::poll[cwd](eleventh.watch);
+  [
+    "a directory to watch -> " ++ shown_bool(made),
+    "poll, nothing changed -> " ++ shown_changes(quiet.changes),
+    "a file is made, and one elsewhere -> " ++ shown_bool(wrote),
+    "poll -> " ++ shown_changes(first.changes),
+    "a file grows -> " ++ shown_bool(grew),
+    "poll -> " ++ shown_changes(second.changes),
+    "a file is stamped -> " ++ shown_bool(stamped),
+    "poll -> " ++ shown_changes(third.changes),
+    "a file is renamed -> " ++ shown_bool(renamed),
+    "poll -> " ++ shown_changes(fourth.changes),
+    "a directory is made with a file in it -> " ++ shown_bool(nested),
+    "poll -> " ++ shown_changes(fifth.changes),
+    "the directory is renamed -> " ++ shown_bool(moved),
+    "poll -> " ++ shown_changes(sixth.changes),
+    "a file is saved by renaming another over it -> " ++ shown_bool(saved),
+    "poll -> " ++ shown_changes(seventh.changes),
+    "a directory's mode is set and a file removed -> " ++ shown_bool(closed),
+    "poll -> " ++ shown_changes(eighth.changes),
+    "await_changes, nothing changing -> " ++ shown_changes(still.changes),
+    "two files are made under a watch that lists one change -> " ++ shown_bool(flooded),
+    "poll -> " ++ shown_changes(ninth.changes),
+    "the directory is removed -> " ++ shown_bool(gone),
+    "poll -> " ++ shown_changes(tenth.changes),
+    "poll again -> " ++ shown_changes(eleventh.changes),
+    "the directory is made again -> " ++ shown_bool(back),
+    "poll -> " ++ shown_changes(twelfth.changes),
+    "remove_tree v -> " ++ shown_bool(fs.remove_tree[cwd]("v")),
+  ]
+}
+
+test/nondet "a watch over the twin tells what a watch over the disk tells" {
+  fresh();
+  let disk = watched();
+  let twin = fs::on_mem(fs::mem_empty(), || watched()).value;
+  assert_eq(list_at(disk, 13), Some("poll -> [renamed v/d/sub to v/d/bus]"));
+  assert_eq(list_at(disk, 15), Some("poll -> [modified v/d/m.txt]"));
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+// --- Archives ---------------------------------------------------------------------
+
+fn limits() -> tar::Limits = { entries: 1000, total: 1000000, size: 1000000, path: 4096 }
+
+fn shown_outcome(o: tar::Outcome) -> String =
+  match o {
+    tar::Extracted -> "extracted",
+    tar::Barred(tar::ThroughLink) -> "barred through a link",
+    tar::Barred(tar::Replaces) -> "barred from replacing",
+    tar::Barred(tar::LinkMissing) -> "barred, no file to name",
+    tar::Barred(_) -> "barred",
+    tar::Failed(why) -> shown_refused(why),
+  }
+
+fn shown_carried(carried: List<tar::Carried>) -> String =
+  fold(carried, "", |acc: String, c: tar::Carried|
+    acc ++ (if acc == "" { "" } else { ", " }) ++ c.path ++ " " ++ shown_outcome(c.outcome))
+
+fn packed(
+  dir: String,
+  to: String,
+  how: tar::Packing,
+) -> String / {fs.read[cwd], fs.write[cwd], io.closed, io.unwritten, files.refused, tar.unwritable, abort.raise} = {
+  let refused: Result<tar::Packed, (String, fs::Refused)> = try[io.refused] {
+    with_hold[out](
+      io::writing[cwd](to),
+      io::shut_sink,
+    ) { sink -> tar::pack[cwd](dir, [""], sink, how) }
+  };
+  match refused {
+    Ok(p) -> int_to_string(p.entries) ++ " entries in " ++ int_to_string(p.bytes) ++ " bytes",
+    Err((at, why)) -> "at " ++ at ++ ": " ++ shown_refused(why),
+  }
+}
+
+/// What unpacking the archive at `from` into `into`, which it makes first, came to.
+fn unpacked(
+  from: String,
+  into: String,
+) -> String / {fs.read[cwd], fs.write[cwd], io.refused, io.closed, abort.raise} = {
+  let made = fs.create_dir[cwd](into);
+  let refused: Result<Result<List<tar::Carried>, tar::Unsafe>, tar::Refusal> = try[tar.refused] {
+    let unsafe: Result<List<tar::Carried>, tar::Unsafe> = try[tar.unsafe] {
+      tar::unpack[cwd, cwd](from, into, limits(), 4096)
+    };
+    unsafe
+  };
+  if !made { "no directory to unpack into" } else {
+    match refused {
+      Ok(Ok(carried)) -> shown_carried(carried),
+      Ok(Err(e)) ->
+        "entry " ++ int_to_string(e.index) ++ " (" ++ e.path ++ ") may not be extracted",
+      Err(e) -> "no archive at byte " ++ int_to_string(e.at),
+    }
+  }
+}
+
+fn archive_of(entries: List<tar::Entry>) -> Bytes / {abort.raise} =
+  match tar::encode(entries) { Ok(bytes) -> bytes, Err(_) -> panic("the entries have headers") }
+
+/// Under `x/`.
+fn archived() -> List<String> / {fs.read[cwd], fs.write[cwd], io.refused, io.closed, io.unwritten, files.refused, tar.unwritable, abort.raise} = {
+  let grown = planted("x/src");
+  let absent: Result<String, (String, fs::Refused)> = try[io.refused] {
+    unpacked("x/absent.tar", "x/nowhere")
+  };
+  let plain: tar::Packing = { times: false, modes: false, entries: 100, bytes: 100000, chunk: 7 };
+  let kept: tar::Packing = { times: true, modes: true, entries: 100, bytes: 100000, chunk: 4096 };
+  let climbs = fs.write_file[cwd](
+    "x/climbs.tar",
+    archive_of([tar::file("ok", b"1"), tar::file("../escaped", b"x")]),
+  );
+  let through = fs.write_file[cwd](
+    "x/through.tar",
+    archive_of([tar::file("ok", b"1"), tar::symlink("l", "../../outside"), tar::file("l/f", b"x")]),
+  );
+  let cut = fs.write_file[cwd](
+    "x/cut.tar",
+    bytes_slice(archive_of([tar::file("ok", b"1"), tar::file("late", b"22")]), 0, 1100),
+  );
+  let swapped = fs.create_dir[cwd]("x/swapped") && fs.create_dir[cwd]("x/elsewhere")
+    && fs.symlink[cwd]("x/swapped/sub", "../elsewhere")
+    && fs.symlink[cwd]("x/swapped/aimed", "../elsewhere/secret")
+    && fs.write_file[cwd]("x/elsewhere/secret", b"kept");
+  let steps = match tar::plan([
+      tar::file("sub/f", b"x"),
+      tar::file("aimed", b"y"),
+      tar::file("fine", b"z"),
+    ]) {
+    Ok(planned) -> planned,
+    Err(_) -> panic("the entries are safe to extract"),
+  };
+  [
+    "a tree is planted -> " ++ shown_bool(grown),
+    "pack x/src, without times and modes -> " ++ packed("x/src", "x/plain.tar", plain),
+    "file_size x/plain.tar -> " ++ shown_opt_int(fs.file_size[cwd]("x/plain.tar")),
+    "unpack x/plain.tar -> " ++ unpacked("x/plain.tar", "x/plain"),
+    "the unpacked -> " ++ shown_tree("x/plain"),
+    "one file x/plain/a.txt x/plain/sub/twin.txt -> "
+      ++ one_file("x/plain/a.txt", "x/plain/sub/twin.txt"),
+    "pack x/src, with them -> " ++ packed("x/src", "x/kept.tar", kept),
+    "unpack x/kept.tar -> " ++ unpacked("x/kept.tar", "x/kept"),
+    "the unpacked -> " ++ shown_tree("x/kept"),
+    "the tree -> " ++ shown_tree("x/src"),
+    "an archive that climbs out -> " ++ shown_bool(climbs),
+    "unpack it -> " ++ unpacked("x/climbs.tar", "x/out"),
+    "list_dir x/out -> " ++ shown_names(fs.list_dir[cwd]("x/out")),
+    "exists x/escaped -> " ++ shown_bool(fs.exists[cwd]("x/escaped")),
+    "an archive that writes through its own link -> " ++ shown_bool(through),
+    "unpack it -> " ++ unpacked("x/through.tar", "x/out"),
+    "list_dir x/out -> " ++ shown_names(fs.list_dir[cwd]("x/out")),
+    "an archive cut short -> " ++ shown_bool(cut),
+    "unpack it -> " ++ unpacked("x/cut.tar", "x/out"),
+    "list_dir x/out -> " ++ shown_names(fs.list_dir[cwd]("x/out")),
+    "unpack what is not there -> "
+      ++ (match absent {
+        Ok(said) -> said,
+        Err((at, why)) -> "at " ++ at ++ ": " ++ shown_refused(why),
+      }),
+    "a directory whose entries are links out of it -> " ++ shown_bool(swapped),
+    "extract a plan into it -> "
+      ++ fold(tar::extract[cwd](steps, "x/swapped"), "", |acc: String, o: tar::Outcome|
+        acc ++ (if acc == "" { "" } else { ", " }) ++ shown_outcome(o)),
+    "list_dir x/elsewhere -> " ++ shown_names(fs.list_dir[cwd]("x/elsewhere")),
+    "read_file x/elsewhere/secret -> " ++ shown_opt_text(fs.read_file[cwd]("x/elsewhere/secret")),
+    "read_file x/swapped/fine -> " ++ shown_opt_text(fs.read_file[cwd]("x/swapped/fine")),
+    "remove_tree x -> " ++ shown_bool(fs.remove_tree[cwd]("x")),
+  ]
+}
+
+test/nondet "an archive is packed from and extracted onto the twin as onto the disk, and one that leaves its directory extracts nothing" {
+  fresh();
+  let disk = archived();
+  let twin = fs::on_mem(fs::mem_empty(), || archived()).value;
+  assert_eq(list_at(disk, 11), Some("unpack it -> entry 1 (../escaped) may not be extracted"));
+  assert_eq(list_at(disk, 12), Some("list_dir x/out -> []"));
+  assert_eq(list_at(disk, 13), Some("exists x/escaped -> false"));
+  assert_eq(list_at(disk, 15), Some("unpack it -> entry 1 (l) may not be extracted"));
+  assert_eq(list_at(disk, 16), Some("list_dir x/out -> []"));
+  assert_eq(
+    list_at(disk, 22),
+    Some(
+      "extract a plan into it -> barred from replacing, barred through a link, barred from replacing, extracted",
+    ),
+  );
+  assert_eq(list_at(disk, 23), Some("list_dir x/elsewhere -> [secret]"));
   match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
 }

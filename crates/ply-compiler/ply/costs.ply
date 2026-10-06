@@ -12,7 +12,9 @@ import embed (EmbedAt, embed_tables, rewritten)
 import derive (expand_derives)
 import resolve (ParsedModule, Resolved, ResolveSucceeded, ResolveFailed, ValueSpace, PackageDeps,
                 resolve_packaged, no_packages, qualify, find)
-import infer (Builtin, builtins, elaboration, expanded_mods)
+import infer (Builtin, builtins, expanded_mods, test_owner)
+import front (Rows, WalkedFacts, Analysed, Refused, analyse, facts_read, rows_of, walked_facts)
+import diagnostics (parse_all)
 import std.bin
 import std.list (at)
 import std.bytes (ascii_of_int)
@@ -513,6 +515,8 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
         CCell,
         b"`cell_get` answers a clone the region's arena still holds \xe2\x80\x94 the append cannot be in place however the call is written; `cell_update` is the fix",
       )
+    } else if b == b"hold_get" {
+      blocked(CElement, b"`hold_get` answers a clone the hold still holds")
     } else if b == b"map_get" || reads_entries(b) {
       blocked(CMapEntry, bytes_concat_all([b"`", b, b"` answers a clone the map still holds"]))
     } else if b == b"map_pop_first" || b == b"map_pop_last" || b == b"map_split" {
@@ -991,6 +995,8 @@ fn program_of(
   pkgs: List<PackageDeps>,
   module_packages: List<Int>,
   shipped: Int,
+  rows: Rows,
+  walked: WalkedFacts,
   embeds: List<EmbedAt>,
 ) -> Option<Program> / {abort.raise} = {
   let tables = embed_tables(embeds);
@@ -1026,47 +1032,76 @@ fn program_of(
         packaged.shipped,
       ) {
       ResolveFailed(_) -> None,
-      // A record update stands for a literal only once the checker has the base's shape, and a body
-      // that does not lower has no cost to read.
-      ResolveSucceeded(x) -> match elaboration(x.r, x.mods) {
-        None -> None,
-        Some(shapes) -> {
-          let mods = expanded_mods(x.mods, shapes);
-          // The root package's: the one the program's own appends and promises are in.
-          let own = |i: Int|
-            match list_at(packaged.module_packages, i) { Some(k) -> k == 0, None -> true };
-          let defs = fold(range(0, len(mods)), [], |acc: List<Def>, i: Int| {
-            let m: ParsedModule = at(mods, i);
-            fold(m.module.items, acc, |a: List<Def>, item: Item|
-              match item { IFn(d) -> push(a, def_of_fn(m.name, i, own(i), d)), _ -> a })
-          });
-          let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int|
-            map_insert(acc, at(defs, i).name, i));
-          Some({
-            r: x.r,
-            index: index,
-            defs: defs,
-            bodies: bodies_of(mods, index, own),
-            builtins: fold(builtin_names(), map_new(), |acc: Map<Bytes, Bool>, b: Bytes|
-              map_insert(acc, b, true)),
-          })
-        },
+      // A record update stands for a literal only once the checker has the base's shape, which is
+      // what the front end's check read of each body costed here; a body that does not lower has no
+      // cost to read.
+      ResolveSucceeded(x) -> {
+        // The root package's: the one the program's own appends and promises are in.
+        let own = |i: Int|
+          match list_at(packaged.module_packages, i) { Some(k) -> k == 0, None -> true };
+        match facts_read(rows, walked, Some(owned_roots(x.mods, own)), x.mods) {
+          Err(_) -> None,
+          Ok(facts) -> {
+            let mods = expanded_mods(x.mods, facts.elaboration);
+            let defs = fold(range(0, len(mods)), [], |acc: List<Def>, i: Int| {
+              let m: ParsedModule = at(mods, i);
+              fold(m.module.items, acc, |a: List<Def>, item: Item|
+                match item { IFn(d) -> push(a, def_of_fn(m.name, i, own(i), d)), _ -> a })
+            });
+            let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+              map_insert(acc, at(defs, i).name, i));
+            Some({
+              r: x.r,
+              index: index,
+              defs: defs,
+              bodies: bodies_of(mods, index, own),
+              builtins: fold(builtin_names(), map_new(), |acc: Map<Bytes, Bool>, b: Bytes|
+                map_insert(acc, b, true)),
+            })
+          },
+        }
       },
     }
   }
 }
 
-/// Every update of the program with its verdict; `embeds` is what the front end's answer says it
-/// embedded.
+/// Every body costed: each definition and test of the modules `own` holds, by the root the front
+/// end's answer files its facts under.
+fn owned_roots(mods: List<ParsedModule>, own: (Int) -> Bool) -> Map<Bytes, Bool> / {abort.raise} =
+  fold(range(0, len(mods)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
+    if !own(i) { acc } else {
+      let m: ParsedModule = at(mods, i);
+      fold(
+        m.module.items,
+        { roots: acc, position: 0 },
+        |a: { roots: Map<Bytes, Bool>, position: Int }, item: Item|
+          match item {
+            IFn(d) -> { ..a, roots: map_insert(a.roots, qualify(m.name, d.name.name), true) },
+            ITest(_) ->
+              {
+                roots: map_insert(a.roots, test_owner(m.name, a.position), true),
+                position: a.position + 1,
+              },
+            _ -> a,
+          },
+      ).roots
+    })
+
+/// Every update of the program with its verdict. `rows` and `walked` are what the front end's check
+/// of the program read, which holds the facts of every body of the root package, and `embeds` what
+/// its answer says it embedded. A body of the root package they hold no facts for leaves the
+/// report not `ok`.
 pub fn costs(
   names: List<Bytes>,
   srcs: List<Bytes>,
   pkgs: List<PackageDeps>,
   module_packages: List<Int>,
   shipped: Int,
+  rows: Rows,
+  walked: WalkedFacts,
   embeds: List<EmbedAt> = [],
 ) -> Report / {abort.raise} =
-  match program_of(names, srcs, pkgs, module_packages, shipped, embeds) {
+  match program_of(names, srcs, pkgs, module_packages, shipped, rows, walked, embeds) {
     None -> { ok: false, rounds: 0, defs: [], unkept: [] },
     Some(p) -> {
       let settled = fixpoint(p, start_tables(p.defs), 0);
@@ -1095,9 +1130,27 @@ pub fn costs(
     },
   }
 
+// --- Tests ------------------------------------------------------------------
+
+/// The report on a program the front end checked as one package, as a driver hands it what that
+/// check read.
+fn reported(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  pkgs: List<PackageDeps> = [],
+  module_packages: List<Int> = [],
+  shipped: Int = 0,
+) -> Report / {abort.raise} =
+  match analyse(
+      parse_all(map(range(0, len(names)), |i: Int| { name: at(names, i), src: at(srcs, i) })),
+    ) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> costs(names, srcs, pkgs, module_packages, shipped, rows_of(w), walked_facts(w)),
+  }
+
 test "an update comes back with its place, its verdict, why, and the edit that would remove a copy" {
   let src = b"reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n  match map_get(m, 0) { Some(xs) -> push(xs, n), None -> [] }\n";
-  let r = costs([b"m"], [src], [], [], 0);
+  let r = reported([b"m"], [src]);
   assert(r.ok);
   assert_eq(len(r.defs), 1);
   let d = at(r.defs, 0);
@@ -1115,7 +1168,7 @@ test "an update comes back with its place, its verdict, why, and the edit that w
 
 test "an entry read off a map is a clone, and one popped from it is owned as the map was" {
   let src = b"fn peek(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_first(m) { Some(e) -> push(e.value, n), None -> [] }\nfn near(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_floor(m, n) { Some(e) -> push(e.value, n), None -> [] }\nfn take(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_pop_first(m) { Some(p) -> push(p.value, n), None -> [] }\nfn cut(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_split(m, n).at { Some(xs) -> push(xs, n), None -> [] }\ntest \"fresh\" { assert_eq(take(map_insert(map_new(), 1, [1]), 2), [1, 2]); assert_eq(cut(map_insert(map_new(), 1, [1]), 1), [1, 1]) }\n";
-  let r = costs([b"m"], [src], [], [], 0);
+  let r = reported([b"m"], [src]);
   assert(r.ok);
   let site_of = |name: Bytes| at(at(filter(r.defs, |d: Costed| d.name == name), 0).sites, 0);
   let peeked = site_of(b"peek");
@@ -1138,7 +1191,7 @@ test "an entry read off a map is a clone, and one popped from it is owned as the
 
 test "an array or list element replaced in place is an update, and one read out first is a copy" {
   let src = b"fn fill(xs: Array<Int>, i: Int) -> Array<Int> / {abort.raise} = if i <= 0 { xs } else { fill(array_set(xs, i - 1, i), i - 1) }\nfn twice(xs: Array<Int>) -> Array<Int> / {abort.raise} = { let n = array_get(xs, 0) + array_len(xs); array_set(xs, 0, n) }\nfn again(xs: Array<Int>) -> Array<Int> / {abort.raise} = array_set(xs, 0, array_len(xs))\nfn first(ys: List<Array<Int>>) -> Array<Int> / {abort.raise} = match list_at(ys, 0) { Some(a) -> array_set(a, 0, 1), None -> array_new(1, 0) }\nfn bump(zs: List<Int>) -> List<Int> / {abort.raise} = list_set(zs, 0, 1)\ntest \"fresh\" { assert_eq(array_len(fill(array_new(3, 0), 3)), 3); assert_eq(bump([0]), [1]) }\n";
-  let r = costs([b"m"], [src], [], [], 0);
+  let r = reported([b"m"], [src]);
   assert(r.ok);
   let site_of = |name: Bytes| at(at(filter(r.defs, |d: Costed| d.name == name), 0).sites, 0);
   let filled = site_of(b"fill");
@@ -1165,6 +1218,22 @@ test "an array or list element replaced in place is an update, and one read out 
   assert_eq([bumped.op, bumped.verdict], [b"list_set", b"reuses"])
 }
 
+// A region and its release are calls the reader cannot name, so what they answer has no known owner.
+test "a hold answers a clone, and what its region answers or hands its release is owned by no one known" {
+  let src = b"fn read(xs: List<Int>, n: Int) -> List<Int> = with_hold[r](xs, |l: List<Int>| ()) { h -> push(hold_get(h), n) }\nfn answered(xs: List<Int>, n: Int) -> List<Int> = push(with_hold[r](n, |k: Int| ()) { h -> xs }, n)\nfn released(xs: List<Int>, n: Int) -> Int = with_hold[r](xs, |l: List<Int>| { let grown = push(l, n); () }) { h -> n }\n";
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  let site_of = |name: Bytes| at(at(filter(r.defs, |d: Costed| d.name == name), 0).sites, 0);
+  let read = site_of(b"read");
+  assert_eq([read.verdict, read.reason, read.fix], [
+    b"copies",
+    b"`hold_get` answers a clone the hold still holds",
+    b"",
+  ]);
+  assert_eq(site_of(b"answered").verdict, b"unknown");
+  assert_eq(site_of(b"released").verdict, b"unknown")
+}
+
 fn verdicts(r: Report) -> List<Bytes> =
   fold(r.defs, [], |acc: List<Bytes>, d: Costed|
     fold(d.sites, acc, |a: List<Bytes>, s: Site|
@@ -1177,7 +1246,7 @@ test "a `returns` clause is shown of its body, and one the body does not keep is
     b"fn same(xs: List<Int>) -> List<Int> returns xs = xs\n",
     b"fn folded(xs: List<Int>) -> List<Int> returns fresh = fold(xs, [], |acc: List<Int>, x: Int| push(acc, x))\n",
   ]);
-  let r = costs([b"m"], [src], [], [], 0);
+  let r = reported([b"m"], [src]);
   assert(r.ok);
   assert_eq(map(r.unkept, |u: Unkept| (u.name, u.said, u.answers)), [
     (b"m.pick", b"its parameter `ys`", b"its parameter `xs`"),
@@ -1198,7 +1267,7 @@ test "another package's definition answers what its `returns` clause says, its b
     { prefix: b"std", deps: [] },
     { prefix: b"compiler", deps: [] },
   ];
-  let r = costs([b"app", b"lib.more"], [app, lib], pkgs, [0, 1], 4);
+  let r = reported([b"app", b"lib.more"], [app, lib], pkgs, [0, 1], 4);
   assert(r.ok);
   assert_eq(verdicts(r), [b"grow reuses", b"other unknown"]);
   // The dependency's clause is its own run's to show.

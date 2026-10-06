@@ -33,25 +33,29 @@
 //!
 //! A `Session` is an engine on a `std.net` connection, under the caller's label: `open_tls`
 //! over TLS from the first byte (port 465), `open` over a connection that starts in the clear
-//! (ports 587 and 25), `with_session_tls` and `with_session` closing theirs however the body
-//! ends. A wait for a reply lasts what `Timeouts` gives its phase, by default RFC 5321
-//! §4.5.3.2's, and is bounded as `std.http`'s client bounds its own: by reads of a slice of that
-//! time each. `std.net` has no operation that starts TLS on an open connection, so `open`
-//! reaches a server only where no upgrade is asked for.
+//! (ports 587 and 25) and is upgraded by `net.start_tls`, which verifies the server as the host
+//! named; `with_session_tls` and `with_session` hold theirs for the body alone and close it
+//! however the body ends. A wait for a reply lasts what `Timeouts` gives its phase, by default
+//! RFC 5321 §4.5.3.2's, as one deadline on the clock that each read is given what is left of,
+//! held to `std.task`'s deadline around the call where that is earlier: a `task::timeout`
+//! around a session bounds it whole, and a caller with none says so with `task::unbounded`.
 //!
 //! A queue with its retries, a domain's mail servers, DKIM signatures and `BDAT` are not here.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes
 import std.bytes (int_of_ascii, peek)
+import std.dns
 import std.email
 import std.email (Address, Draft, Envelope, Message, NullPath, ReturnTo, email)
 import std.gen
 import std.gen (Gen)
-import std.http (max_reads, read_budget, read_size, slice_ms)
+import std.http (max_reads, read_size)
+import std.ip
 import std.laws (inverse, round_trip)
 import std.list
 import std.list (all, any, concat, contains, find, first)
+import std.net
 import std.net (net, send_all)
 import std.random (entropy, nonce)
 import std.result (result_is_ok, result_map, result_ok)
@@ -60,7 +64,8 @@ import std.sasl (Credential, Exchange, Mechanism, sasl)
 import std.show (show)
 import std.string
 import std.string (ascii_trim, ascii_upper, join)
-import std.time (time)
+import std.task
+import std.time (after, millis, time)
 
 // --- Reply codes --------------------------------------------------------------
 
@@ -413,8 +418,9 @@ pub type Refusal =
   | Unexpected(Phase, Reply)
   /// TLS is required and the server does not offer `STARTTLS`.
   | NoTls
-  /// The TLS handshake failed: the server is not the one named, or the two agree on nothing.
-  | HandshakeFailed
+  /// The TLS handshake failed, for the reason `std.net` gives: the server is not the one named,
+  /// the two agree on nothing, or it went away.
+  | HandshakeFailed(net::Refusal)
   /// The server offers no mechanism the credential and the configuration both take, or no
   /// `AUTH` at all.
   | NoMechanism
@@ -745,11 +751,16 @@ pub fn xtext(text: String) -> String / {abort.raise} = {
 /// The two upper-case hex digits of a byte.
 fn upper_hex(b: Int) -> String / {abort.raise} = ascii_upper(bytes::hex_of(byte_of_int(b)))
 
+/// An address as the envelope carries it: in ASCII, its domain's A-labels, wherever its local
+/// part is ASCII, so that only a local part outside ASCII needs `SMTPUTF8`.
+fn path_text(a: Address) -> String =
+  match email::ascii_text(a) { Some(text) -> text, None -> show(a) }
+
 /// An address as `ORCPT` names it: `rfc822;` and its text in `xtext`, or under RFC 6533
 /// `utf-8;` and its text with `\x{..}` for what a parameter cannot hold, where it is outside
 /// ASCII.
 fn original_of(a: Address) -> String / {abort.raise} =
-  if email::is_ascii(a) { "rfc822;" ++ xtext(show(a)) } else {
+  if email::is_ascii(a) { "rfc822;" ++ xtext(path_text(a)) } else {
     "utf-8;"
       ++ join(
         map(string_chars(show(a)), |c: Char|
@@ -1556,7 +1567,7 @@ fn steps_of(
   again: Bool,
 ) -> List<Step> / {abort.raise} = {
   let from_words = "MAIL FROM:<"
-    ++ (match envelope.sender { ReturnTo(a) -> show(a), NullPath -> "" })
+    ++ (match envelope.sender { ReturnTo(a) -> path_text(a), NullPath -> "" })
     ++ ">"
     ++ (if c.size == Unsaid { "" } else { " SIZE=" ++ int_to_string(shape.size) })
     ++ (if shape.eight_bit { " BODY=8BITMIME" } else { "" })
@@ -1568,7 +1579,7 @@ fn steps_of(
     ]),
     push(
       map(envelope.recipients, |a: Address|
-        { words: "RCPT TO:<" ++ show(a) ++ ">" ++ rcpt_asks(asked, a), expect: ForRcpt(a) }),
+        { words: "RCPT TO:<" ++ path_text(a) ++ ">" ++ rcpt_asks(asked, a), expect: ForRcpt(a) }),
       { words: "DATA", expect: ForData },
     ),
   )
@@ -1603,38 +1614,62 @@ pub type Sent = { session: Session, deliveries: List<Delivery> }
 /// What a session was driven to: its engine, and the lines exchanged on the way.
 type Driven = { engine: Engine, said: List<Line> }
 
-/// What one read of a wait answered: the bytes that came, an empty read where the server closed
-/// and `None` where the wait ran out, and the reads the wait has left.
-type Waited = { chunk: Option<Bytes>, reads: Int }
+/// The instant a wait of `ms` from now ends, or the deadline around the call where that is
+/// earlier, as `std.net`'s `dial` holds its own: an outer `task::timeout` bounds a session whole.
+fn ending(ms: Int) -> Instant / {clock.read, task::deadline.at} = {
+  let own = after(clock.now(), millis(ms));
+  match task::earliest(Some(own), task::deadline.at()) { Some(earlier) -> earlier, None -> own }
+}
 
-/// One read within a wait of `ms` for a phase's answer, as `std.http`'s client waits: a read
-/// lasts a slice of `ms`, and the wait is over once `reads` of them have come back, so it lasts
-/// `ms` and no longer however the answer trickles in. A wait begins with `read_budget(ms)`.
-fn read_within<[l]>(h: Int, most: Int, ms: Int, reads: Int) -> Waited / {net.recv[l], abort.raise} =
-  if reads <= 0 { { chunk: None, reads: 0 } } else {
-    match net.recv[l](h, most, slice_ms(ms)) {
-      None -> read_within[l](h, most, ms, reads - 1),
-      Some(chunk) -> { chunk: Some(chunk), reads: reads - 1 },
-    }
+/// One read of what the server sends, waiting until `end` and no longer: `None` once it passed.
+fn read_by<[l]>(h: Int, most: Int, end: Instant) -> Option<Bytes> / {net.recv[l], clock.read} =
+  match net::ms_left(end) { None -> None, Some(ms) -> net.recv[l](h, most, ms) }
+
+/// Every byte of `payload` written by `end`; `false` where the connection stopped taking them.
+fn sent_by<[l]>(
+  h: Int,
+  payload: Bytes,
+  end: Instant,
+) -> Bool / {net.send[l], clock.read, abort.raise} =
+  match net::ms_left(end) { None -> false, Some(ms) -> send_all[l](h, payload, ms) }
+
+/// The connection `h` secured as its client by `net.start_tls`, verifying the server as `host`,
+/// within `ms`: `None` where it is, and why where it is not. Plaintext that waited at the
+/// upgrade, in `unread` or on the socket, is `Injected`, as the engine's own check calls it.
+fn upgrade<[l]>(
+  h: Int,
+  host: String,
+  unread: Bytes,
+  ms: Int,
+) -> Option<Refusal> / {net.start_tls[l], clock.read, task::deadline.at} =
+  match net::ms_left(ending(ms)) {
+    None -> Some(TimedOut(Handshake)),
+    Some(left) -> match net.start_tls[l](h, host, [], unread, left) {
+      Ok(_) -> None,
+      Err(net::Injected) -> Some(Injected),
+      Err(net::TimedOut) -> Some(TimedOut(Handshake)),
+      Err(why) -> Some(HandshakeFailed(why)),
+    },
   }
 
-/// Writes what `t` says and does what it says next, until the engine is ready or over. The wait
-/// for a reply begins when the command was written or the reply before it ended, and `reads` is
-/// what is left of it while a reply is half read; `secure` starts TLS and answers why it could
-/// not, or nothing. `left` bounds the rounds: each takes what one read brought, or starts TLS.
+/// Writes what `t` says and does what it says next, until the engine is ready or over. A wait
+/// for a reply ends at an instant: `ending` the phase's time from when the command was written
+/// or the reply before it ended, and `end` while a reply is half read, so a reply that trickles
+/// in is held to one wait. `secure` starts TLS and answers why it could not, or nothing. `left`
+/// bounds the rounds: each takes what one read brought, or starts TLS.
 fn drive<[l] | e>(
   h: Int,
   t: Turn,
   said: List<Line>,
-  reads: Option<Int>,
+  end: Option<Instant>,
   secure: (Int, Bytes) -> Option<Refusal> / e,
   left: Int,
-) -> Driven / {net.send[l], net.recv[l], smtp.refused, abort.raise | e} = {
+) -> Driven / {net.send[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} = {
   let waits = config_of(t.engine).timeouts;
   let payload = wire_bytes(t.out);
   let all_said = concat(said, t.said);
   let wrote = bytes_len(payload) > 0;
-  if wrote && !send_all[l](h, payload, waits.block_ms) {
+  if wrote && !sent_by[l](h, payload, ending(waits.block_ms)) {
     smtp.refused(NotSent(match t.next { Await(p) -> p, _ -> Quit }))
   } else {
     match t.next {
@@ -1647,18 +1682,17 @@ fn drive<[l] | e>(
         }
       },
       Await(p) -> {
-        let ms = timeout(waits, p);
-        let got = read_within[l](h, min(read_size(), room(t.engine)), ms, match reads {
+        let until = match end {
           Some(kept) if !wrote && t.answered == 0 -> kept,
-          _ -> read_budget(ms),
-        });
-        match got.chunk {
+          _ -> ending(timeout(waits, p)),
+        };
+        match read_by[l](h, min(read_size(), room(t.engine)), until) {
           Some(chunk) if left > 0 ->
             drive[l](
               h,
               if bytes_len(chunk) == 0 { closed(t.engine) } else { feed(t.engine, chunk) },
               all_said,
-              Some(got.reads),
+              Some(until),
               secure,
               left - 1,
             ),
@@ -1682,7 +1716,7 @@ fn established<[l] | e>(
   c: Config,
   link: Link,
   secure: (Int, Bytes) -> Option<Refusal> / e,
-) -> Session / {net.send[l], net.recv[l], net.close[l], smtp.refused, abort.raise | e} =
+) -> Session / {net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} =
   match try[smtp.refused] { drive[l](h, start(c, link), [], None, secure, 16 * max_reads()) } {
     Ok(d) -> { handle: h, engine: d.engine, kept: kept_of(c.limits, [], d.said) },
     Err(why) -> {
@@ -1691,61 +1725,68 @@ fn established<[l] | e>(
     },
   }
 
+/// A connection to `host` at `port` within `Timeouts.connect_ms`; raises `Unreachable`.
+fn connected<[l]>(
+  host: String,
+  port: Int,
+  c: Config,
+) -> Int / {net.connect[l], clock.read, task::deadline.at, smtp.refused} =
+  match net::ms_left(ending(c.timeouts.connect_ms)) {
+    None -> smtp.refused(Unreachable),
+    Some(ms) -> match net.connect[l](host, port, ms) {
+      Some(h) -> h,
+      None -> smtp.refused(Unreachable),
+    },
+  }
+
 /// A session with the server at `host` and `port` over TLS from its first byte, as port 465
-/// serves it (RFC 8314): the server is verified as `host`, greeted, and given `c`'s credential
-/// where it has one.
+/// serves it (RFC 8314): the handshake completed and the server verified as `host` before it
+/// is greeted, and then `c`'s credential given where it has one.
 ///
-/// Raises `smtp.refused`, with the connection closed: `Unreachable`, `HandshakeFailed` for a
-/// server that is not `host` or agrees on no TLS, and whatever `feed` raises of the greeting,
-/// of what the server offers and of the credential.
+/// Raises `smtp.refused`, with the connection closed: `Unreachable`, `HandshakeFailed` with
+/// `std.net`'s reason for a server that is not `host` or agrees on no TLS, and whatever `feed`
+/// raises of the greeting, of what the server offers and of the credential.
 pub fn open_tls<[l]>(
   host: String,
   port: Int,
   c: Config,
-) -> Session / {net.connect_tls[l] bounded, net.handshake[l] bounded, net.send[l], net.recv[l], net.close[l], entropy.next bounded, smtp.refused, abort.raise} =
-  match net.connect_tls[l](host, port, c.timeouts.connect_ms) {
-    None -> smtp.refused(Unreachable),
-    Some(h) -> {
-      let link: Link = { host: host, port: port, secure: true, nonce: nonce() };
-      match try[smtp.refused] {
-          drive[l](h, start(c, link), [], None, |_: Int, _: Bytes| Some(NotReady), 16 * max_reads())
-        } {
-        Ok(d) -> { handle: h, engine: d.engine, kept: kept_of(c.limits, [], d.said) },
-        Err(why) -> {
-          // A handshake that failed reads as a server that closed before it said anything.
-          let failed = why == Closed(Greeting) && net.handshake[l](h) == None;
-          net.close[l](h);
-          smtp.refused(if failed { HandshakeFailed } else { why })
-        },
-      }
+) -> Session / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
+  let h = connected[l](host, port, c);
+  match upgrade[l](h, host, b"", c.timeouts.connect_ms) {
+    Some(why) -> {
+      net.close[l](h);
+      smtp.refused(why)
     },
+    None ->
+      established[l](
+        h,
+        c,
+        { host: host, port: port, secure: true, nonce: nonce() },
+        |_: Int, _: Bytes| Some(NotReady),
+      ),
   }
+}
 
 /// A session with the server at `host` and `port` over a connection that starts in the clear,
-/// as ports 587 and 25 serve it: greeted, upgraded to TLS by `STARTTLS` as `c` requires, and
-/// given `c`'s credential where it has one.
-///
-/// `std.net` cannot start TLS on an open connection, so the upgrade fails with
-/// `HandshakeFailed`: this reaches a server only under `Plain`, or under `Opportunistic` where
-/// the server offers no `STARTTLS`.
+/// as ports 587 and 25 serve it: greeted, upgraded by `STARTTLS` as `c` requires, the server
+/// verified as `host`, and given `c`'s credential where it has one.
 ///
 /// Raises `smtp.refused`, with the connection closed: `Unreachable`, `NoTls` where TLS is
-/// required and not offered, and whatever `feed` raises.
+/// required and not offered, `Injected` for bytes the server sent between its leave to start
+/// TLS and the handshake, `HandshakeFailed` with `std.net`'s reason, and whatever `feed` raises.
 pub fn open<[l]>(
   host: String,
   port: Int,
   c: Config,
-) -> Session / {net.connect[l] bounded, net.send[l], net.recv[l], net.close[l], entropy.next bounded, smtp.refused, abort.raise} =
-  match net.connect[l](host, port, c.timeouts.connect_ms) {
-    None -> smtp.refused(Unreachable),
-    Some(h) ->
-      established[l](
-        h,
-        c,
-        { host: host, port: port, secure: false, nonce: nonce() },
-        |_: Int, _: Bytes| Some(HandshakeFailed),
-      ),
-  }
+) -> Session / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
+  let h = connected[l](host, port, c);
+  established[l](
+    h,
+    c,
+    { host: host, port: port, secure: false, nonce: nonce() },
+    |at: Int, unread: Bytes| upgrade[l](at, host, unread, c.timeouts.connect_ms),
+  )
+}
 
 /// Sends `data` under `envelope` and answers what became of it for each recipient, never a
 /// bare success: a recipient the server refused, or told to try later, is in the answer with
@@ -1759,7 +1800,7 @@ pub fn submit<[l]>(
   envelope: Envelope,
   data: Bytes,
   asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
-) -> Sent / {net.send[l], net.recv[l], smtp.refused, abort.raise} = {
+) -> Sent / {net.send[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} = {
   let d = drive[l](
     s.handle,
     mail(s.engine, envelope, data, asked),
@@ -1786,7 +1827,7 @@ pub fn send<[l]>(
   s: Session,
   d: Draft,
   asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
-) -> Sent / {net.send[l], net.recv[l], entropy.next bounded, smtp.refused, abort.raise} =
+) -> Sent / {net.send[l], net.recv[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} =
   match try[email.unwritable] { email::write_fresh(d, email::repertoire_for(d)) } {
     Ok(data) -> submit[l](s, email::envelope(d), data, asked),
     Err(why) -> smtp.refused(Unwritable(why)),
@@ -1799,7 +1840,7 @@ pub fn relay<[l]>(
   s: Session,
   m: Message,
   asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
-) -> Sent / {net.send[l], net.recv[l], smtp.refused, abort.raise} =
+) -> Sent / {net.send[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
   match try[email.refused] { email::message_envelope(m) } {
     Ok(envelope) ->
       submit[l](
@@ -1813,7 +1854,9 @@ pub fn relay<[l]>(
 
 /// Says `QUIT` and waits for the server's answer, for as long as `Timeouts.quit_ms` allows. A
 /// server that does not answer, or a session that is over, is left as it is.
-fn farewell<[l]>(s: Session) -> Unit / {net.send[l], net.recv[l], abort.raise} =
+fn farewell<[l]>(
+  s: Session,
+) -> Unit / {net.send[l], net.recv[l], clock.read, task::deadline.at, abort.raise} =
   match try[smtp.refused] {
       drive[l](s.handle, leave(s.engine), [], None, |_: Int, _: Bytes| Some(NotReady), max_reads())
     } {
@@ -1823,7 +1866,9 @@ fn farewell<[l]>(s: Session) -> Unit / {net.send[l], net.recv[l], abort.raise} =
 
 /// Ends a session: `QUIT`, the server's answer where it gives one in time, and the connection
 /// closed.
-pub fn quit<[l]>(s: Session) -> Unit / {net.send[l], net.recv[l], net.close[l], abort.raise} = {
+pub fn quit<[l]>(
+  s: Session,
+) -> Unit / {net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, abort.raise} = {
   farewell[l](s);
   net.close[l](s.handle)
 }
@@ -1833,19 +1878,20 @@ pub fn quit<[l]>(s: Session) -> Unit / {net.send[l], net.recv[l], net.close[l], 
 pub fn close<[l]>(s: Session) -> Unit / {net.close[l]} = net.close[l](s.handle)
 
 /// What `body` answers over a TLS session with the server at `host` and `port`, opened as
-/// `open_tls` opens one, told `QUIT` when `body` answers, and closed however `body` ends.
-/// `body` neither quits nor closes the session it is given.
+/// `open_tls` opens one and held for `body` alone: told `QUIT` when `body` answers, and closed
+/// however `body` ends. `body` neither quits nor closes the session it is given.
 pub fn with_session_tls<a, [l] | e>(
   host: String,
   port: Int,
   c: Config,
   body: (Session) -> a / e,
-) -> a / {net.connect_tls[l] bounded, net.handshake[l] bounded, net.send[l], net.recv[l], net.close[l], entropy.next bounded, smtp.refused, abort.raise | e} =
-  bracket(|| open_tls[l](host, port, c), |s: Session| close[l](s), |s: Session| {
+) -> a / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
+  with_hold[session](open_tls[l](host, port, c), |s: Session| close[l](s)) { held -> {
+    let s = hold_get(held);
     let answer_of = body(s);
     farewell[l](s);
     answer_of
-  })
+  } }
 
 /// `with_session_tls` over a connection that starts in the clear, opened as `open` opens one.
 pub fn with_session<a, [l] | e>(
@@ -1853,12 +1899,13 @@ pub fn with_session<a, [l] | e>(
   port: Int,
   c: Config,
   body: (Session) -> a / e,
-) -> a / {net.connect[l] bounded, net.send[l], net.recv[l], net.close[l], entropy.next bounded, smtp.refused, abort.raise | e} =
-  bracket(|| open[l](host, port, c), |s: Session| close[l](s), |s: Session| {
+) -> a / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
+  with_hold[session](open[l](host, port, c), |s: Session| close[l](s)) { held -> {
+    let s = hold_get(held);
     let answer_of = body(s);
     farewell[l](s);
     answer_of
-  })
+  } }
 
 /// What the server offered when the session was opened.
 pub fn offered_to(s: Session) -> Option<Capabilities> = offered(s.engine)
@@ -2354,7 +2401,7 @@ fn onward(t: Turn, beats: List<Beat>, acts: List<Act>, here: Tale) -> Moved / {a
           ..here,
           lines: concat(here.lines, marked("S:", chunk)),
         }),
-      _ -> Halt(Err(HandshakeFailed)),
+      _ -> Halt(Err(HandshakeFailed(net::Reset))),
     },
     Await(p) -> match beats {
       [Says(chunk), ..later] ->
@@ -2456,9 +2503,66 @@ fn tim() -> Credential / {sasl.refused} = sasl::password("tim", "tanstaaftanstaa
 
 fn pencil() -> Credential / {sasl.refused} = sasl::password("user", "pencil")
 
+/// The credential a case gives a client, by name: a credential cannot be a case, since a case is
+/// hashed and a hash of one is something to test guesses against.
+type Held = | Nobody | Tim | Pencil | Bearer(String)
+
+/// A client's configuration as a case holds it.
+type Setup = {
+  name: String,
+  tls: Tls,
+  held: Held,
+  mechanisms: Option<List<Mechanism>>,
+  exposure: Exposure,
+  helo: Bool,
+}
+
+fn setup() -> Setup =
+  {
+    name: "client.example",
+    tls: RequireTls,
+    held: Nobody,
+    mechanisms: None,
+    exposure: Protected,
+    helo: false,
+  }
+
+fn named_as(name: String) -> Setup = { ..setup(), name: name }
+
+fn tls_as(s: Setup, policy: Tls) -> Setup = { ..s, tls: policy }
+
+fn given(s: Setup, h: Held) -> Setup = { ..s, held: h }
+
+fn mechs(s: Setup, order: List<Mechanism>) -> Setup = { ..s, mechanisms: Some(order) }
+
+fn exposed(s: Setup) -> Setup = { ..s, exposure: PasswordInClear }
+
+fn helo(s: Setup) -> Setup = { ..s, helo: true }
+
+fn configured(s: Setup) -> Config / {abort.raise} = {
+  let held = match s.held {
+    Nobody -> Ok(None),
+    Tim -> try[sasl.refused] { Some(tim()) },
+    Pencil -> try[sasl.refused] { Some(pencil()) },
+    Bearer(token) -> try[sasl.refused] { Some(sasl::bearer("tim", token)) },
+  };
+  match ((try[smtp.refused] { config(s.name, default_limits()) }, held)) {
+    (Ok(bare), Ok(credential)) -> {
+      let c = with_exposure(with_tls(bare, s.tls), s.exposure);
+      let given = match credential { Some(k) -> with_credential(c, k), None -> c };
+      let ordered = match s.mechanisms {
+        Some(order) -> with_mechanisms(given, order),
+        None -> given,
+      };
+      if s.helo { with_helo_fallback(ordered) } else { ordered }
+    },
+    _ -> panic("a case's client does not configure"),
+  }
+}
+
 type Recorded = {
   what: String,
-  client: Config,
+  client: Setup,
   secure: Bool,
   acts: List<Act>,
   exchange: String,
@@ -2469,7 +2573,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
   [
     {
       what: "RFC 5321 D.1: three recipients, of whom one has no mailbox",
-      client: with_tls(config("bar.com", default_limits()), Plain),
+      client: tls_as(named_as("bar.com"), Plain),
       secure: false,
       acts: [deliver(["Jones", "Green", "Brown"]), Bye],
       exchange:
@@ -2505,7 +2609,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "STARTTLS, a second EHLO, AUTH PLAIN, and two messages in pipelined commands with a RSET between",
-      client: with_credential(client(), tim()),
+      client: given(setup(), Tim),
       secure: false,
       acts: [deliver(["Jones", "Green"]), deliver(["Brown"]), Bye],
       exchange:
@@ -2562,7 +2666,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a sender told to come back later: every recipient may be tried again",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Jones", "Brown"]), Bye],
       exchange:
@@ -2580,7 +2684,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that says HELO only, to a client asked to fall back, and a recipient forwarded",
-      client: with_helo_fallback(with_tls(client(), Plain)),
+      client: helo(tls_as(setup(), Plain)),
       secure: false,
       acts: [deliver(["Jones"])],
       exchange:
@@ -2604,7 +2708,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "too many recipients for one message is a reason to send the rest again, and no DATA follows none taken",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Jones", "Green"]), Bye],
       exchange:
@@ -2624,7 +2728,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a pipelined DATA given leave with no recipient taken is answered with no message",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Green"]), deliver(["Jones"])],
       exchange:
@@ -2653,7 +2757,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a message refused once it was read, for good and then for now",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Jones", "Brown"]), deliver(["Jones"])],
       exchange:
@@ -2694,7 +2798,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server closing down in the middle of a message: everyone is tried again, and the session is over",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Jones", "Brown"]), deliver(["Green"])],
       exchange:
@@ -2714,7 +2818,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a message past the size the server takes is refused before a byte of it is sent, and the session goes on",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [
         deliver(["Jones"]),
@@ -2739,7 +2843,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "addresses and bytes outside ASCII go only to a server that takes them, and are declared",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [
         Deliver(
@@ -2813,7 +2917,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that takes neither is sent neither, and the session goes on",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [
         Deliver(
@@ -2855,7 +2959,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "RFC 3461's requests for reports, a bounce's null reverse path, and a local part that needs its quotes",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [
         Deliver(
@@ -2926,7 +3030,7 @@ fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
 
 test "a message is sent as recorded, and what became of it is answered for each recipient" for r: Recorded in sendings(
   ) {
-  let got = replayed(r.client, r.secure, r.acts, r.exchange);
+  let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
   assert_eq(got.exchange, r.exchange);
   assert_eq(got.ended, r.ended)
 }
@@ -2935,7 +3039,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
   [
     {
       what: "CVE-2011-0411: what is read with the leave to start TLS is not kept for after it",
-      client: client(),
+      client: setup(),
       secure: false,
       acts: [],
       exchange:
@@ -2952,7 +3056,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that drops the connection after the message was sent",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Jones"])],
       exchange:
@@ -2974,7 +3078,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that drops the connection before it gave leave to send",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Jones"])],
       exchange:
@@ -2992,7 +3096,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that offers nothing, where TLS is required",
-      client: client(),
+      client: setup(),
       secure: false,
       acts: [deliver(["Jones"])],
       exchange:
@@ -3004,7 +3108,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that offers nothing, to a client with a credential to prove",
-      client: with_credential(client(), tim()),
+      client: given(setup(), Tim),
       secure: true,
       acts: [deliver(["Jones"])],
       exchange:
@@ -3016,7 +3120,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that refuses EHLO, to a client not asked to fall back",
-      client: with_tls(client(), Plain),
+      client: tls_as(setup(), Plain),
       secure: false,
       acts: [],
       exchange:
@@ -3028,7 +3132,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that does not take mail",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [],
       exchange:
@@ -3038,7 +3142,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that says more than it was asked",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [],
       exchange:
@@ -3049,7 +3153,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that offers STARTTLS and then refuses it, where TLS is required",
-      client: client(),
+      client: setup(),
       secure: false,
       acts: [],
       exchange:
@@ -3066,7 +3170,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "the same server, to a client that takes TLS where it is to be had",
-      client: with_tls(client(), Opportunistic),
+      client: tls_as(setup(), Opportunistic),
       secure: false,
       acts: [Bye],
       exchange:
@@ -3083,7 +3187,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a client asked for no TLS does not ask the server for it",
-      client: with_tls(client(), Plain),
+      client: tls_as(setup(), Plain),
       secure: false,
       acts: [Bye],
       exchange:
@@ -3098,7 +3202,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a password is not sent in the clear",
-      client: with_credential(with_tls(client(), Opportunistic), tim()),
+      client: given(tls_as(setup(), Opportunistic), Tim),
       secure: false,
       acts: [],
       exchange:
@@ -3111,7 +3215,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "unless the caller says so by name",
-      client: with_exposure(with_credential(with_tls(client(), Plain), tim()), PasswordInClear),
+      client: exposed(given(tls_as(setup(), Plain), Tim)),
       secure: false,
       acts: [],
       exchange:
@@ -3126,7 +3230,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "RFC 7677's exchange: SCRAM proves a password in the clear without sending it, and holds the server to its proof",
-      client: with_credential(with_tls(client(), Opportunistic), pencil()),
+      client: given(tls_as(setup(), Opportunistic), Pencil),
       secure: false,
       acts: [],
       exchange:
@@ -3145,7 +3249,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a SCRAM server that says welcome before it has proved it knows the password",
-      client: with_credential(client(), pencil()),
+      client: given(setup(), Pencil),
       secure: true,
       acts: [],
       exchange:
@@ -3162,7 +3266,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a SCRAM server whose proof is not the password's",
-      client: with_credential(client(), pencil()),
+      client: given(setup(), Pencil),
       secure: true,
       acts: [],
       exchange:
@@ -3179,7 +3283,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "LOGIN, asked for alone, and a credential the server does not take",
-      client: with_mechanisms(with_credential(client(), tim()), [sasl::Login]),
+      client: mechs(given(setup(), Tim), [sasl::Login]),
       secure: true,
       acts: [],
       exchange:
@@ -3198,7 +3302,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "RFC 7628: a token refused is explained, answered with one byte, and then refused",
-      client: with_credential(client(), sasl::bearer("tim", "ya29.token")),
+      client: given(setup(), Bearer("ya29.token")),
       secure: true,
       acts: [],
       exchange:
@@ -3215,7 +3319,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a token too long for the command's line is sent on a line of its own, once the server asks",
-      client: with_credential(client(), sasl::bearer("tim", "ya29." ++ string::repeat("x", 600))),
+      client: given(setup(), Bearer("ya29." ++ string::repeat("x", 600))),
       secure: true,
       acts: [Bye],
       exchange:
@@ -3234,7 +3338,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a challenge that is no base64",
-      client: with_mechanisms(with_credential(client(), tim()), [sasl::Login]),
+      client: mechs(given(setup(), Tim), [sasl::Login]),
       secure: true,
       acts: [],
       exchange:
@@ -3249,7 +3353,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
     },
     {
       what: "a server that answers a command with a code no command of the kind has",
-      client: client(),
+      client: setup(),
       secure: true,
       acts: [deliver(["Jones"])],
       exchange:
@@ -3265,7 +3369,7 @@ fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, ab
 
 test "an exchange that goes wrong is refused where it does, and for the reason it does" for r: Recorded in failings(
   ) {
-  let got = replayed(r.client, r.secure, r.acts, r.exchange);
+  let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
   assert_eq(got.exchange, r.exchange);
   assert_eq(got.ended, r.ended)
 }
@@ -3285,10 +3389,10 @@ fn recut(beats: List<Beat>, size: Int) -> List<Beat> / {abort.raise} =
 test "however the server's bytes are cut into reads, the client says the same and ends the same" {
   let cases = filter(concat(sendings(), failings()), |r: Recorded| r.ended != Err(Unsolicited));
   let differing = list::flat_map(cases, |r: Recorded| {
-    let whole = replayed(r.client, r.secure, r.acts, r.exchange);
+    let whole = replayed(configured(r.client), r.secure, r.acts, r.exchange);
     map(
       filter([1, 2, 3, 5, 7, 64], |size: Int| {
-        let cut = played(r.client, r.secure, r.acts, recut(beats_of(r.exchange), size));
+        let cut = played(configured(r.client), r.secure, r.acts, recut(beats_of(r.exchange), size));
         cut.wire != whole.wire || cut.ended != whole.ended
       }),
       |size: Int| r.what ++ ", in reads of " ++ int_to_string(size),
@@ -3303,7 +3407,7 @@ test "however the server's bytes are cut into reads, the client says the same an
 /// sent all the same.
 type Proven = {
   what: String,
-  client: Config,
+  client: Setup,
   secure: Bool,
   exchange: String,
   hidden: List<String>,
@@ -3314,7 +3418,7 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
   [
     {
       what: "PLAIN: RFC 4616's message, in base64",
-      client: with_credential(client(), tim()),
+      client: given(setup(), Tim),
       secure: true,
       exchange:
         \\S: 220 mx.example ESMTP
@@ -3329,7 +3433,7 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
     },
     {
       what: "LOGIN: the name and then the password",
-      client: with_mechanisms(with_credential(client(), tim()), [sasl::Login]),
+      client: mechs(given(setup(), Tim), [sasl::Login]),
       secure: true,
       exchange:
         \\S: 220 mx.example ESMTP
@@ -3348,7 +3452,7 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
     },
     {
       what: "SCRAM-SHA-256: RFC 7677's messages, and an empty line once the server has proved itself",
-      client: with_credential(client(), pencil()),
+      client: given(setup(), Pencil),
       secure: true,
       exchange:
         \\S: 220 mx.example ESMTP
@@ -3369,7 +3473,7 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
     },
     {
       what: "OAUTHBEARER: RFC 7628's message, and its one byte to a refusal",
-      client: with_credential(client(), sasl::bearer("tim", "ya29.token")),
+      client: given(setup(), Bearer("ya29.token")),
       secure: true,
       exchange:
         \\S: 220 mx.example ESMTP
@@ -3391,7 +3495,7 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
     },
     {
       what: "XOAUTH2, on a line of its own where it is too long for the command's",
-      client: with_credential(client(), sasl::bearer("tim", "ya29." ++ string::repeat("x", 600))),
+      client: given(setup(), Bearer("ya29." ++ string::repeat("x", 600))),
       secure: true,
       exchange:
         \\S: 220 mx.example ESMTP
@@ -3410,7 +3514,7 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
 
 test "a credential goes to the server and nowhere else: not into a refusal, a turn as it shows, or the lines a session keeps" for p: Proven in provings(
   ) {
-  let got = replayed(p.client, p.secure, [], p.exchange);
+  let got = replayed(configured(p.client), p.secure, [], p.exchange);
   let wire = string_of_bytes_lossy(got.wire);
   assert_eq(got.exchange, p.exchange);
   assert(all(p.sent, |part: String| string_contains(wire, part)));
@@ -3419,7 +3523,7 @@ test "a credential goes to the server and nowhere else: not into a refusal, a tu
       !string_contains(got.exchange, part) && !string_contains(got.shown, part)
         && !string_contains(show(got.ended), part)
         && !string_contains(show(got.engine), part)
-        && !string_contains(show(p.client), part)),
+        && !string_contains(show(configured(p.client)), part)),
   )
 }
 
@@ -3460,7 +3564,7 @@ law "what a server offered before TLS is forgotten: after it the client knows th
           Starts,
           Says(offering(after.lines)),
         ]);
-        asked.ended == Err(HandshakeFailed) && !secured(asked.engine)
+        asked.ended == Err(HandshakeFailed(net::Reset)) && !secured(asked.engine)
           && offered(asked.engine)
           == Some(capabilities({ code: Code(250), lines: push(before.lines, "STARTTLS") }))
           && got.ended == Ok([])
@@ -3655,114 +3759,78 @@ test "the scripts a law draws take a client through every part of a session" {
   assert(some("QUIT\r\n"))
 }
 
-// --- Tests: sessions over the network twin ------------------------------------
+// --- Tests: sessions over the in-memory network --------------------------------
 
-/// A network that is a recording. `recv` answers the server's next run of lines, in pieces no
-/// longer than asked for, a close as an empty read, and nothing once the recording has no more
-/// for it, as a deadline does, and keeps how long each read was told to wait; `send` keeps what
-/// it is given; and `handshake` starts TLS where the recording has it start.
-type Twin = {
-  beats: List<Beat>,
-  sent: Bytes,
-  closed: List<Int>,
-  waits: List<Int>,
-  dialled: List<String>,
-  /// How many bytes had been written when TLS started; below zero until it does.
-  secured_after: Int,
-  reachable: Bool,
-  deaf: Bool,
-  handshakes: Bool,
-}
+/// A network where `mx.example` is a server at `port` that answers each connection with the
+/// next of `scripts`.
+fn serving(port: Int, scripts: List<List<net::Step>>) -> net::MemNet / {abort.raise} =
+  net::mem_serving(
+    net::mem_resolving(
+      net::mem_empty(),
+      dns::with_name(dns::table(), "mx.example", [ip::loopback_v4()]),
+    ),
+    ip::socket_at(ip::loopback_v4(), port),
+    scripts,
+  )
 
-fn twin_of(beats: List<Beat>) -> Twin =
-  {
-    beats: beats,
-    sent: b"",
-    closed: [],
-    waits: [],
-    dialled: [],
-    secured_after: -1,
-    reachable: true,
-    deaf: false,
-    handshakes: true,
-  }
+/// A recording's server side as a scripted peer: what it says, an upgrade where the connection
+/// became TLS, and its going away where it closed.
+fn script_of(beats: List<Beat>) -> List<net::Step> =
+  map(beats, |b: Beat|
+    match b { Says(chunk) -> net::Says(chunk), Starts -> net::Upgrades, Hangs -> net::Leaves })
 
-fn twin(exchange: String) -> Twin / {abort.raise} = twin_of(beats_of(exchange))
+/// A recording of a session over TLS from its first byte, as a scripted peer.
+fn implicit(exchange: String) -> List<net::Step> / {abort.raise} =
+  list::prepend(net::Upgrades, script_of(beats_of(exchange)))
 
-type Received = { twin: Twin, answer: Option<Bytes> }
-
-fn received(w: Twin, most: Int, wait: Int) -> Received / {abort.raise} = {
-  let waited: Twin = { ..w, waits: push(w.waits, wait) };
-  match w.beats {
-    [Says(chunk), ..later] -> if bytes_len(chunk) <= most {
-      { twin: { ..waited, beats: later }, answer: Some(chunk) }
-    } else {
-      {
-        twin: {
-          ..waited,
-          beats: list::prepend(Says(bytes_slice(chunk, most, bytes_len(chunk))), later),
-        },
-        answer: Some(bytes_slice(chunk, 0, most)),
-      }
+/// A recording with no credential in it as a peer that also hears each line the client said
+/// there before it goes on, so that a client that says anything else fails where it says it.
+fn scripted(exchange: String) -> List<net::Step> / {abort.raise} = {
+  let grouped = fold(
+    string_split(exchange, "\n"),
+    { steps: [], mark: "", run: [] },
+    |g: Grouped, line: String| {
+      let mark = string_slice(line, 0, min(2, string_len(line)));
+      if line == "*: TLS" { { steps: push(flushed(g), net::Upgrades), mark: "", run: [] } }
+      else if line == "*: closed" { { steps: push(flushed(g), net::Leaves), mark: "", run: [] } }
+      else if mark == g.mark { { ..g, run: push(g.run, line) } }
+      else { { steps: flushed(g), mark: mark, run: [line] } }
     },
-    [Hangs, ..later] -> { twin: { ..waited, beats: later }, answer: Some(b"") },
-    _ -> { twin: waited, answer: None },
-  }
+  );
+  flushed(grouped)
 }
 
-fn dialled(w: Twin, how: String, host: String, port: Int) -> Twin =
-  { ..w, dialled: push(w.dialled, how ++ " " ++ host ++ ":" ++ int_to_string(port)) }
+/// A run of a recording's lines, all the server's or all the client's, and the steps before it.
+type Grouped = { steps: List<net::Step>, mark: String, run: List<String> }
 
-type Ran<a> = { answer: a, twin: Twin }
+fn flushed(g: Grouped) -> List<net::Step> / {abort.raise} =
+  if g.run == [] { g.steps } else {
+    let said = bytes_of_string(
+      join(
+          map(g.run, |line: String| string_slice(line, min(3, string_len(line)), string_len(line))),
+          "\r\n",
+        )
+        ++ "\r\n",
+    );
+    push(g.steps, if g.mark == "S:" { net::Says(said) } else { net::Hears(said) })
+  }
 
-/// What `body` answers over the twin `began`, and the twin as `body` left it.
-fn on_twin<a, [l]>(
-  began: Twin,
-  body: () -> a / {net.connect[l], net.connect_tls[l], net.handshake[l], net.send[l], net.recv[l], net.close[l], time.now_ms, entropy.next, abort.raise},
-) -> Ran<a> / {abort.raise} =
-  with_cell[wire](began) { wire -> {
-    let answer = handle {
-      body()
-    } with {
-      net.connect[l](host, port, t) -> {
-        cell_set(wire, dialled(cell_get(wire), "tcp", host, port));
-        if cell_get(wire).reachable { Some(7) } else { None }
-      },
-      net.connect_tls[l](host, port, t) -> {
-        cell_set(wire, dialled(cell_get(wire), "tls", host, port));
-        if cell_get(wire).reachable { Some(7) } else { None }
-      },
-      net.handshake[l](c) -> {
-        let w = cell_get(wire);
-        match w.beats {
-          [Starts, ..later] -> {
-            cell_set(wire, { ..w, beats: later, secured_after: bytes_len(w.sent) });
-            Some(1)
-          },
-          _ -> if w.handshakes { Some(1) } else { None },
-        }
-      },
-      net.recv[l](c, most, t) -> {
-        let got = received(cell_get(wire), most, t);
-        cell_set(wire, got.twin);
-        got.answer
-      },
-      net.send[l](c, payload, t) -> {
-        let w = cell_get(wire);
-        if w.deaf { Some(0) } else {
-          cell_set(wire, { ..w, sent: bytes_concat(w.sent, payload) });
-          Some(bytes_len(payload))
-        }
-      },
-      net.close[l](c) -> {
-        let w = cell_get(wire);
-        cell_set(wire, { ..w, closed: push(w.closed, c) })
-      },
-      time.now_ms() -> 880127706123,
-      entropy.next() -> 7,
-    };
-    { answer: answer, twin: cell_get(wire) }
-  } }
+/// What `go` answered over `world`, in a simulated run with no deadline above it, its nonces
+/// and its clock's date fixed.
+fn on_mx<a>(
+  world: net::MemNet,
+  go: () -> a / {net.write[mail], clock.read, clock.write, task::deadline.at, entropy.next, time.now_ms, smtp.refused, abort.raise},
+) -> net::Over<Result<a, Refusal>> / {sim.read, abort.raise} =
+  net::on_mem(world, ||
+    simulate {
+      task::unbounded(||
+        handle {
+          try[smtp.refused] { go() }
+        } with {
+          entropy.next() -> 7,
+          time.now_ms() -> 880127706123,
+        })
+    })
 
 fn submission() -> String =
   \\S: 220 mx.example ESMTP
@@ -3788,185 +3856,280 @@ fn submission() -> String =
   \\C: QUIT
   \\S: 221 2.0.0 Bye
 
-test "a session over TLS writes what the engine says, waits each phase's time, and is closed once" {
+test "a session over TLS from its first byte is verified as its host, writes what the engine says, waits each phase's time, and is closed once" {
   let c = with_credential(client(), tim());
   let envelope = email::enveloped(ReturnTo(smith()), at_foo(["Jones", "Green"]));
-  let ran = on_twin[conn](twin(submission()), ||
-    try[smtp.refused] {
-      let s = open_tls[conn]("mx.example", 465, c);
-      let sent = submit[conn](s, envelope, blah());
-      quit[conn](sent.session);
-      map(sent.deliveries, told)
-    });
-  assert_eq(ran.answer, Ok(["Jones@foo.com accepted 250", "Green@foo.com permanent RCPT 550"]));
+  let ran = on_mx(serving(465, [implicit(submission())]), || {
+    let s = open_tls[mail]("mx.example", 465, c);
+    let sent = submit[mail](s, envelope, blah());
+    quit[mail](sent.session);
+    map(sent.deliveries, told)
+  });
+  assert_eq(ran.value, Ok(["Jones@foo.com accepted 250", "Green@foo.com permanent RCPT 550"]));
   assert_eq(
-    ran.twin.sent,
+    net::mem_sent(ran.net, 1),
     replayed(c, true, [deliver(["Jones", "Green"]), Bye], submission()).wire,
   );
-  assert_eq(ran.twin.dialled, ["tls mx.example:465"]);
-  assert_eq(ran.twin.waits, [146, 146, 146, 146, 292, 14]);
-  assert_eq(ran.twin.closed, [7]);
-  assert_eq(ran.twin.beats, []);
-  assert_eq(ran.twin.secured_after, -1)
+  assert_eq(net::mem_secured(ran.net, 1), Some("mx.example"));
+  assert_eq(net::mem_deadlines(ran.net, 1), [300000, 300000, 300000, 300000, 600000, 30000]);
+  assert_eq(net::mem_unmet(ran.net, 1), []);
+  assert_eq(ran.net.closed, [1])
 }
 
-/// What starts TLS over the twin, as the operation `std.net` is to have does over a host:
-/// refused where bytes were read past the server's leave, and failed where the handshake is.
-fn twin_secure<[l]>(h: Int, unread: Bytes) -> Option<Refusal> / {net.handshake[l]} =
-  if bytes_len(unread) > 0 { Some(Injected) }
-  else if net.handshake[l](h) == None { Some(HandshakeFailed) }
-  else { None }
-
-test "STARTTLS over a connection: only EHLO and STARTTLS are written before TLS starts, and the credential after" {
+test "STARTTLS over a connection: only EHLO and STARTTLS cross it in the clear, and the credential after the upgrade" {
   let r = list::at(sendings(), 1);
   let jones = email::enveloped(ReturnTo(smith()), at_foo(["Jones", "Green"]));
   let brown = email::enveloped(ReturnTo(smith()), at_foo(["Brown"]));
-  let ran = on_twin[conn](twin(r.exchange), ||
-    try[smtp.refused] {
-      let s = established[conn](7, r.client, link(false), |h: Int, unread: Bytes|
-        twin_secure[conn](h, unread));
-      let first_sent = submit[conn](s, jones, blah());
-      let second_sent = submit[conn](first_sent.session, brown, blah());
-      quit[conn](second_sent.session);
-      map(concat(first_sent.deliveries, second_sent.deliveries), told)
-    });
-  assert_eq(ran.answer, r.ended);
-  assert_eq(ran.twin.sent, replayed(r.client, false, r.acts, r.exchange).wire);
+  let in_clear = [
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Hears(b"EHLO client.example\r\n"),
+    net::Says(b"250-mx.example\r\n250-PIPELINING\r\n250-AUTH PLAIN LOGIN\r\n250 STARTTLS\r\n"),
+    net::Hears(b"STARTTLS\r\n"),
+    net::Says(b"220 2.0.0 Ready to start TLS\r\n"),
+    net::Upgrades,
+  ];
+  let script = concat(in_clear, list::drop(script_of(beats_of(r.exchange)), 4));
+  let ran = on_mx(serving(587, [script]), || {
+    let s = open[mail]("mx.example", 587, configured(r.client));
+    let first_sent = submit[mail](s, jones, blah());
+    let second_sent = submit[mail](first_sent.session, brown, blah());
+    quit[mail](second_sent.session);
+    map(concat(first_sent.deliveries, second_sent.deliveries), told)
+  });
+  assert_eq(ran.value, r.ended);
   assert_eq(
-    bytes_slice(ran.twin.sent, 0, ran.twin.secured_after),
-    b"EHLO client.example\r\nSTARTTLS\r\n",
+    net::mem_sent(ran.net, 1),
+    replayed(configured(r.client), false, r.acts, r.exchange).wire,
   );
-  assert_eq(ran.twin.closed, [7]);
-  assert_eq(ran.twin.beats, [])
+  assert_eq(net::mem_secured(ran.net, 1), Some("mx.example"));
+  assert_eq(net::mem_unmet(ran.net, 1), []);
+  assert_eq(ran.net.closed, [1])
 }
 
-test "bytes read with the leave to start TLS end the session before TLS, and nothing more is written" {
-  let r = list::at(failings(), 0);
-  let ran = on_twin[conn](twin(r.exchange), ||
-    try[smtp.refused] {
-      let s = established[conn](7, r.client, link(false), |h: Int, unread: Bytes|
-        twin_secure[conn](h, unread));
-      authenticated(s.engine)
-    });
-  assert_eq(ran.answer, Err(Injected));
-  assert_eq(ran.twin.sent, b"EHLO client.example\r\nSTARTTLS\r\n");
-  assert_eq(ran.twin.secured_after, -1);
-  assert_eq(ran.twin.closed, [7])
+/// What a session does with `acts` until it is over: each message submitted, a refusal of one
+/// before any of it was sent kept as what became of it, and `QUIT` said where asked.
+fn acted<[l]>(
+  s: Session,
+  acts: List<Act>,
+) -> List<String> / {net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
+  fold(
+    acts,
+    { session: s, outcomes: [] },
+    |done: { session: Session, outcomes: List<String> }, act: Act|
+      if state(done.session.engine).over { done } else {
+        match act {
+          Bye -> {
+            quit[l](done.session);
+            done
+          },
+          Deliver(envelope, data, asked) -> match try[smtp.refused] {
+              submit[l](done.session, envelope, data, asked)
+            } {
+            Ok(sent) ->
+              {
+                session: sent.session,
+                outcomes: concat(done.outcomes, map(sent.deliveries, told)),
+              },
+            Err(why) -> if usable(why) {
+              { ..done, outcomes: push(done.outcomes, "refused: " ++ show(why)) }
+            } else { smtp.refused(why) },
+          },
+        }
+      },
+  ).outcomes
+
+test "every recording with no credential in it, played by a server that hears each line the client says, ends over a connection as it does in the engine" {
+  let cases = filter(concat(sendings(), failings()), |r: Recorded|
+    !string_contains(r.exchange, "****"));
+  let differing = filter(cases, |r: Recorded| {
+    let port = if r.secure { 465 } else { 587 };
+    let script = if r.secure { list::prepend(net::Upgrades, scripted(r.exchange)) }
+    else { scripted(r.exchange) };
+    let c = configured(r.client);
+    let ran = on_mx(serving(port, [script]), ||
+      acted[mail](
+        if r.secure { open_tls[mail]("mx.example", port, c) }
+        else { open[mail]("mx.example", port, c) },
+        r.acts,
+      ));
+    ran.value != r.ended
+      || net::mem_sent(ran.net, 1) != replayed(c, r.secure, r.acts, r.exchange).wire
+  });
+  assert_eq(map(differing, |r: Recorded| r.what), [])
 }
 
-test "a connection that starts in the clear is refused where TLS is required, and used where it is not" {
-  let offer =
-    \\S: 220 mx.example ESMTP
-    \\C: EHLO client.example
-    \\S: 250-mx.example
-    \\S: 250 STARTTLS
-    \\C: STARTTLS
-    \\S: 220 2.0.0 Ready to start TLS
-    \\*: TLS
-  ;
-  let required = on_twin[conn](twin(offer), ||
-    try[smtp.refused] { secured(open[conn]("mx.example", 587, client()).engine) });
-  assert_eq(required.answer, Err(HandshakeFailed));
-  assert_eq(required.twin.dialled, ["tcp mx.example:587"]);
-  assert_eq(required.twin.closed, [7]);
-  let local =
-    \\S: 220 localhost ESMTP
-    \\C: EHLO client.example
-    \\S: 250-localhost
-    \\S: 250 STARTTLS
-    \\C: QUIT
-    \\S: 221 Bye
-  ;
-  let plain = on_twin[conn](twin(local), ||
-    try[smtp.refused] {
-      let s = open[conn]("localhost", 25, with_tls(client(), Plain));
-      quit[conn](s);
+test "plaintext waiting at the upgrade is refused before TLS, whether the client read it or the socket holds it" {
+  let offered = [
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250-mx.example\r\n250 STARTTLS\r\n"),
+  ];
+  // CVE-2011-0411: the injected reply arrives with the leave to start TLS, in one read.
+  let read_with = on_mx(
+    serving(587, [
+      concat(offered, [
+        net::Says(b"220 2.0.0 Go ahead\r\n250-mx.example\r\n250 AUTH PLAIN\r\n"),
+        net::Upgrades,
+      ]),
+    ]),
+    || secured(open[mail]("mx.example", 587, client()).engine),
+  );
+  // It arrives after it, so that it is on the socket when the handshake is to begin.
+  let held_back = on_mx(
+    serving(587, [
+      concat(offered, [
+        net::Says(b"220 2.0.0 Go ahead\r\n"),
+        net::Says(b"250-mx.example\r\n250 AUTH PLAIN\r\n"),
+        net::Upgrades,
+      ]),
+    ]),
+    || secured(open[mail]("mx.example", 587, client()).engine),
+  );
+  assert_eq([read_with.value, held_back.value], [Err(Injected), Err(Injected)]);
+  assert(
+    all([read_with.net, held_back.net], |n: net::MemNet|
+      net::mem_sent(n, 1) == b"EHLO client.example\r\nSTARTTLS\r\n"
+        && net::mem_secured(n, 1) == None
+        && n.closed == [1]),
+  )
+}
+
+test "a connection that starts in the clear is refused where its server is not verified, and used as it is where no TLS is asked for" {
+  let offer = [
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250-mx.example\r\n250 STARTTLS\r\n"),
+    net::Says(b"220 2.0.0 Ready to start TLS\r\n"),
+  ];
+  let untrusted = on_mx(serving(587, [push(offer, net::Refuses(net::Untrusted))]), ||
+    secured(open[mail]("mx.example", 587, client()).engine));
+  assert_eq(untrusted.value, Err(HandshakeFailed(net::Untrusted)));
+  assert_eq(untrusted.net.closed, [1]);
+  let plain = on_mx(
+    serving(25, [
+      [
+        net::Says(b"220 mx.example ESMTP\r\n"),
+        net::Says(b"250-mx.example\r\n250 STARTTLS\r\n"),
+        net::Says(b"221 Bye\r\n"),
+      ],
+    ]),
+    || {
+      let s = open[mail]("mx.example", 25, with_tls(client(), Plain));
+      quit[mail](s);
       secured(s.engine)
-    });
-  assert_eq(plain.answer, Ok(false));
-  assert_eq(plain.twin.sent, b"EHLO client.example\r\nQUIT\r\n");
-  assert_eq(plain.twin.closed, [7])
+    },
+  );
+  assert_eq(plain.value, Ok(false));
+  assert_eq(net::mem_sent(plain.net, 1), b"EHLO client.example\r\nQUIT\r\n");
+  assert_eq(net::mem_secured(plain.net, 1), None);
+  assert_eq(plain.net.closed, [1])
 }
 
-test "a server that cannot be reached, will not shake hands, or hangs up at once" {
-  let gone = on_twin[conn]({ ..twin_of([]), reachable: false }, ||
-    try[smtp.refused] { secured(open_tls[conn]("mx.example", 465, client()).engine) });
-  assert_eq(gone.answer, Err(Unreachable));
-  assert_eq(gone.twin.closed, []);
-  let untrusted = on_twin[conn]({ ..twin_of([Hangs]), handshakes: false }, ||
-    try[smtp.refused] { secured(open_tls[conn]("mx.example", 465, client()).engine) });
-  assert_eq(untrusted.answer, Err(HandshakeFailed));
-  assert_eq(untrusted.twin.closed, [7]);
-  let hung = on_twin[conn](twin_of([Hangs]), ||
-    try[smtp.refused] { secured(open_tls[conn]("mx.example", 465, client()).engine) });
-  assert_eq(hung.answer, Err(Closed(Greeting)));
-  assert_eq(hung.twin.closed, [7])
+test "a server that cannot be reached, is not the one named, or hangs up at once" {
+  let open_one = || secured(open_tls[mail]("mx.example", 465, client()).engine);
+  let gone = on_mx(serving(25, []), open_one);
+  assert_eq(gone.value, Err(Unreachable));
+  assert_eq(gone.net.closed, []);
+  let untrusted = on_mx(serving(465, [[net::Refuses(net::Untrusted)]]), open_one);
+  assert_eq(untrusted.value, Err(HandshakeFailed(net::Untrusted)));
+  assert_eq(untrusted.net.closed, [1]);
+  let hung = on_mx(serving(465, [[net::Upgrades, net::Leaves]]), open_one);
+  assert_eq(hung.value, Err(Closed(Greeting)));
+  assert_eq(hung.net.closed, [1])
 }
 
-test "a wait is reads of a slice of its phase's time, and is over once they are spent, however the answer trickles in" {
-  let silent = on_twin[conn](twin_of([]), ||
-    try[smtp.refused] { secured(open_tls[conn]("mx.example", 465, client()).engine) });
-  assert_eq(silent.answer, Err(TimedOut(Greeting)));
-  assert_eq(len(silent.twin.waits), 2048);
-  assert(all(silent.twin.waits, |wait: Int| wait == 146));
-  assert_eq(silent.twin.closed, [7]);
+/// `go` with each read of what `mail`'s servers send coming `ms` milliseconds after it was
+/// asked for.
+fn slowly<a>(
+  ms: Int,
+  go: () -> a / {net.write[mail], clock.read, task::deadline.at, entropy.next, time.now_ms, smtp.refused, abort.raise},
+) -> a / {net.write[mail], clock.read, clock.write, task::deadline.at, entropy.next, time.now_ms, smtp.refused, abort.raise} =
+  handle {
+    go()
+  } with {
+    net.recv[mail](c, most, t) -> {
+      clock.sleep(millis(ms));
+      net.recv[mail](c, most, t)
+    },
+  }
+
+test "a wait is one deadline that each read is given what is left of, however the answer trickles in" {
+  let silent = on_mx(serving(465, [[net::Upgrades, net::Silent]]), ||
+    secured(open_tls[mail]("mx.example", 465, client()).engine));
+  assert_eq(silent.value, Err(TimedOut(Greeting)));
+  assert_eq(net::mem_deadlines(silent.net, 1), [300000]);
+  assert_eq(silent.net.closed, [1]);
   let trickling = [
-    Says(b"220 mx.example ESMTP\r\n"),
-    Says(b"250-mx.exa"),
-    Says(b"mple\r\n"),
-    Says(b"250-PIPE"),
-    Says(b"LINING\r\n250 HELP\r\n"),
+    net::Upgrades,
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250-mx.exa"),
+    net::Says(b"mple\r\n"),
+    net::Says(b"250-PIPE"),
+    net::Says(b"LINING\r\n250 HELP\r\n"),
   ];
   let within = |ms: Int| {
     let waits: Timeouts = { ..default_timeouts(), other_ms: ms };
-    on_twin[conn](twin_of(trickling), ||
-      try[smtp.refused] {
-        secured(open_tls[conn]("mx.example", 465, with_timeouts(client(), waits)).engine)
-      })
+    on_mx(serving(465, [trickling]), ||
+      slowly(20, ||
+        secured(open_tls[mail]("mx.example", 465, with_timeouts(client(), waits)).engine)))
   };
-  let short = within(3);
-  assert_eq(short.answer, Err(TimedOut(Hello)));
-  assert_eq(short.twin.waits, [146, 1, 1, 1]);
-  assert_eq(short.twin.beats, [Says(b"LINING\r\n250 HELP\r\n")]);
-  assert_eq(short.twin.closed, [7]);
-  let long = within(4);
-  assert_eq(long.answer, Ok(true));
-  assert_eq(long.twin.waits, [146, 1, 1, 1, 1]);
-  assert_eq(long.twin.closed, [])
+  let short = within(60);
+  assert_eq(short.value, Err(TimedOut(Hello)));
+  assert_eq(net::mem_deadlines(short.net, 1), [300000, 60, 40, 20]);
+  assert_eq(net::mem_unmet(short.net, 1), [net::Says(b"LINING\r\n250 HELP\r\n")]);
+  assert_eq(short.net.closed, [1]);
+  let long = within(80);
+  assert_eq(long.value, Ok(true));
+  assert_eq(net::mem_deadlines(long.net, 1), [300000, 80, 60, 40, 20]);
+  assert_eq(long.net.closed, [])
+}
+
+test "a session is held to the deadline around it, which bounds its every wait" {
+  let ran = net::on_mem(serving(465, [[net::Upgrades, net::Silent]]), ||
+    simulate {
+      task::unbounded(||
+        task::timeout(millis(250), ||
+          handle {
+            try[smtp.refused] { secured(open_tls[mail]("mx.example", 465, client()).engine) }
+          } with {
+            entropy.next() -> 7,
+          }))
+    });
+  assert_eq(ran.value, task::Done(Err(TimedOut(Greeting))));
+  assert_eq(net::mem_deadlines(ran.net, 1), [250])
 }
 
 test "a server that stops taking bytes is told nothing more" {
-  let ran = on_twin[conn]({ ..twin_of([Says(b"220 mx.example ESMTP\r\n")]), deaf: true }, ||
-    try[smtp.refused] { secured(open_tls[conn]("mx.example", 465, client()).engine) });
-  assert_eq(ran.answer, Err(NotSent(Hello)));
-  assert_eq(ran.twin.sent, b"");
-  assert_eq(ran.twin.closed, [7])
+  let ran = on_mx(
+    serving(465, [[net::Upgrades, net::Says(b"220 mx.example ESMTP\r\n"), net::Leaves]]),
+    || secured(open_tls[mail]("mx.example", 465, client()).engine),
+  );
+  assert_eq(ran.value, Err(NotSent(Hello)));
+  assert_eq(net::mem_sent(ran.net, 1), b"");
+  assert_eq(ran.net.closed, [1])
 }
 
 test "a session is told goodbye when its user is done, and closed however its user ends" {
   let envelope = email::enveloped(ReturnTo(smith()), at_foo(["Jones", "Green"]));
   let c = with_credential(client(), tim());
-  let done = on_twin[conn](twin(submission()), ||
-    try[smtp.refused] {
-      with_session_tls[conn]("mx.example", 465, c, |s: Session|
-        len(submit[conn](s, envelope, blah()).deliveries))
-    });
-  assert_eq(done.answer, Ok(2));
+  let done = on_mx(serving(465, [implicit(submission())]), ||
+    with_session_tls[mail]("mx.example", 465, c, |s: Session|
+      len(submit[mail](s, envelope, blah()).deliveries)));
+  assert_eq(done.value, Ok(2));
   assert_eq(
-    done.twin.sent,
+    net::mem_sent(done.net, 1),
     replayed(c, true, [deliver(["Jones", "Green"]), Bye], submission()).wire,
   );
-  assert_eq(done.twin.closed, [7]);
+  assert_eq(done.net.closed, [1]);
   let dropped = list::at(failings(), 1);
   let jones = email::enveloped(ReturnTo(smith()), at_foo(["Jones"]));
-  let cut = on_twin[conn](twin(dropped.exchange), ||
-    try[smtp.refused] {
-      with_session_tls[conn]("mx.example", 465, dropped.client, |s: Session|
-        len(submit[conn](s, jones, blah()).deliveries))
-    });
-  assert_eq(cut.answer, Err(Closed(Body)));
-  assert_eq(cut.twin.sent, replayed(dropped.client, true, dropped.acts, dropped.exchange).wire);
-  assert_eq(cut.twin.closed, [7])
+  let cut = on_mx(serving(465, [list::prepend(net::Upgrades, scripted(dropped.exchange))]), ||
+    with_session_tls[mail]("mx.example", 465, configured(dropped.client), |s: Session|
+      len(submit[mail](s, jones, blah()).deliveries)));
+  assert_eq(cut.value, Err(Closed(Body)));
+  assert_eq(
+    net::mem_sent(cut.net, 1),
+    replayed(configured(dropped.client), true, dropped.acts, dropped.exchange).wire,
+  );
+  assert_eq(cut.net.closed, [1])
 }
 
 /// What the server was sent between `DATA` and the lone dot, as it would keep it.
@@ -3981,102 +4144,91 @@ fn delivered(sent: Bytes) -> Bytes / {abort.raise} =
 
 /// A server's answers to a message for two recipients, each a read of its own: it takes the
 /// sender, both recipients and the message.
-fn taking() -> List<Beat> =
+fn taking() -> List<net::Step> =
   [
-    Says(b"250 OK\r\n"),
-    Says(b"250 OK\r\n"),
-    Says(b"250 OK\r\n"),
-    Says(b"354 Go ahead\r\n"),
-    Says(b"250 OK\r\n"),
+    net::Says(b"250 OK\r\n"),
+    net::Says(b"250 OK\r\n"),
+    net::Says(b"250 OK\r\n"),
+    net::Says(b"354 Go ahead\r\n"),
+    net::Says(b"250 OK\r\n"),
   ]
 
+fn hello_draft() -> Draft / {time.now_ms, entropy.next, email.refused, abort.raise} =
+  email::with_bcc(
+    email::with_text(
+      email::compose(
+        email::named("John Doe", email::address("jdoe", "machine.example")),
+        [email::mailbox(email::address("mary", "example.net"))],
+        "Gr\u{fc}\u{df}e",
+      ),
+      "Hello.\n.A line that opens with a dot.\n..\n",
+    ),
+    [email::one(email::mailbox(email::address("eve", "example.org")))],
+  )
+
 test "a draft is sent to everyone it goes to, its blind copies among them, as the bytes std.email writes without them" {
-  let ran = on_twin[conn](
-    twin_of(
+  let d = match handle {
+      try[email.refused] { hello_draft() }
+    } with {
+      entropy.next() -> 7,
+      time.now_ms() -> 880127706123,
+    } {
+    Ok(made) -> made,
+    Err(_) -> panic("the draft was refused"),
+  };
+  let ran = on_mx(
+    serving(465, [
       concat(
-        [Says(b"220 mx.example ESMTP\r\n"), Says(b"250-mx.example\r\n250 SMTPUTF8\r\n")],
+        [
+          net::Upgrades,
+          net::Says(b"220 mx.example ESMTP\r\n"),
+          net::Says(b"250-mx.example\r\n250 SMTPUTF8\r\n"),
+        ],
         taking(),
       ),
-    ),
-    ||
-      try[smtp.refused] {
-        match try[email.refused] {
-            email::with_bcc(
-              email::with_text(
-                email::compose(
-                  email::named("John Doe", email::address("jdoe", "machine.example")),
-                  [email::mailbox(email::address("mary", "example.net"))],
-                  "Gr\u{fc}\u{df}e",
-                ),
-                "Hello.\n.A line that opens with a dot.\n..\n",
-              ),
-              [email::one(email::mailbox(email::address("eve", "example.org")))],
-            )
-          } {
-          Err(_) -> panic("the draft was refused"),
-          Ok(d) -> {
-            let s = open_tls[conn]("mx.example", 465, client());
-            let sent = send[conn](s, d);
-            {
-              told: map(sent.deliveries, told),
-              written: match email::build(d, "unused") { Ok(data) -> data, Err(_) -> b"" },
-              repertoire: email::repertoire_for(d),
-            }
-          },
-        }
-      },
+    ]),
+    || map(send[mail](open_tls[mail]("mx.example", 465, client()), d).deliveries, told),
   );
-  match ran.answer {
-    Err(why) -> panic("the draft was not sent: " ++ show(why)),
-    Ok(got) -> {
-      let wire = string_of_bytes_lossy(ran.twin.sent);
-      assert_eq(got.told, ["mary@example.net accepted 250", "eve@example.org accepted 250"]);
-      assert_eq(got.repertoire, email::Ascii);
-      assert(bytes_len(got.written) > 0);
-      assert_eq(delivered(ran.twin.sent), got.written);
-      assert(
-        string_contains(
-          wire,
-          "MAIL FROM:<jdoe@machine.example>\r\nRCPT TO:<mary@example.net>\r\nRCPT TO:<eve@example.org>\r\nDATA\r\n",
-        ),
-      );
-      assert(string_contains(wire, "\r\n..A line that opens with a dot.\r\n...\r\n.\r\n"));
-      assert(!string_contains(wire, "Bcc"));
-      assert(!string_contains(string_of_bytes_lossy(got.written), "eve@example.org"))
-    },
-  }
+  let written = match email::build(d, "boundary-7-7") { Ok(data) -> data, Err(_) -> b"" };
+  let wire = string_of_bytes_lossy(net::mem_sent(ran.net, 1));
+  assert_eq(ran.value, Ok(["mary@example.net accepted 250", "eve@example.org accepted 250"]));
+  assert_eq(email::repertoire_for(d), email::Ascii);
+  assert(bytes_len(written) > 0);
+  assert_eq(delivered(net::mem_sent(ran.net, 1)), written);
+  assert(
+    string_contains(
+      wire,
+      "MAIL FROM:<jdoe@machine.example>\r\nRCPT TO:<mary@example.net>\r\nRCPT TO:<eve@example.org>\r\nDATA\r\n",
+    ),
+  );
+  assert(string_contains(wire, "\r\n..A line that opens with a dot.\r\n...\r\n.\r\n"));
+  assert(!string_contains(wire, "Bcc"));
+  assert(!string_contains(string_of_bytes_lossy(written), "eve@example.org"))
 }
 
 test "a message read is sent on as the bytes it was read from, to everyone it names, without its blind copies' lines" {
   let data = b"From: John Doe <jdoe@machine.example>\r\nTo: Mary Smith <mary@example.net>\r\nBcc: eve@example.org\r\nSubject: Saying Hello\r\nX-Odd:   kept \t as it was\r\n\r\n.Hello.\r\n";
   let m = email::read_tolerant(data, email::default_limits()).message;
-  let ran = on_twin[conn](
-    twin_of(concat([Says(b"220 mx.example ESMTP\r\n"), Says(b"250 mx.example\r\n")], taking())),
-    ||
-      try[smtp.refused] {
-        let s = open_tls[conn]("mx.example", 465, client());
-        map(relay[conn](s, m).deliveries, told)
-      },
-  );
-  assert_eq(ran.answer, Ok(["mary@example.net accepted 250", "eve@example.org accepted 250"]));
+  let greeted = [
+    net::Upgrades,
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250 mx.example\r\n"),
+  ];
+  let ran = on_mx(serving(465, [concat(greeted, taking())]), ||
+    map(relay[mail](open_tls[mail]("mx.example", 465, client()), m).deliveries, told));
+  assert_eq(ran.value, Ok(["mary@example.net accepted 250", "eve@example.org accepted 250"]));
   assert_eq(
-    delivered(ran.twin.sent),
+    delivered(net::mem_sent(ran.net, 1)),
     b"From: John Doe <jdoe@machine.example>\r\nTo: Mary Smith <mary@example.net>\r\nSubject: Saying Hello\r\nX-Odd:   kept \t as it was\r\n\r\n.Hello.\r\n",
   );
   let nameless = email::read_tolerant(
     b"Subject: no one\r\n\r\nHi.\r\n",
     email::default_limits(),
   ).message;
-  let refused = on_twin[conn](
-    twin_of([Says(b"220 mx.example ESMTP\r\n"), Says(b"250 mx.example\r\n")]),
-    ||
-      try[smtp.refused] {
-        let s = open_tls[conn]("mx.example", 465, client());
-        len(relay[conn](s, nameless).deliveries)
-      },
-  );
-  assert_eq(refused.answer, Err(Unreadable({ at: 0, why: email::Missing("from") })));
-  assert_eq(refused.twin.sent, b"EHLO client.example\r\n")
+  let refused = on_mx(serving(465, [greeted]), ||
+    len(relay[mail](open_tls[mail]("mx.example", 465, client()), nameless).deliveries));
+  assert_eq(refused.value, Err(Unreadable({ at: 0, why: email::Missing("from") })));
+  assert_eq(net::mem_sent(refused.net, 1), b"EHLO client.example\r\n")
 }
 
 test "a session keeps the newest lines of its exchange, and no credential among them" {
@@ -4084,11 +4236,10 @@ test "a session keeps the newest lines of its exchange, and no credential among 
   let kept = |most: Int| {
     let limits: Limits = { ..default_limits(), transcript: most };
     let c = with_credential(config("client.example", limits), tim());
-    on_twin[conn](twin(submission()), ||
-      try[smtp.refused] {
-        let s = open_tls[conn]("mx.example", 465, c);
-        transcript_text(transcript(submit[conn](s, envelope, blah()).session))
-      }).answer
+    on_mx(serving(465, [implicit(submission())]), || {
+      let s = open_tls[mail]("mx.example", 465, c);
+      transcript_text(transcript(submit[mail](s, envelope, blah()).session))
+    }).value
   };
   assert_eq(
     kept(100),
