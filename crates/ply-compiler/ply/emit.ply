@@ -28,8 +28,8 @@ import diagnostics (parse_all)
 import interface (stub_module)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
               ERecord, ERecordUpdate, ETry, ETryBlock, EField, EList, EPerform, EWithCell,
-              HandleClause, MatchArm, RecField, Stmt, SLet, SLetElse, SExpr, is_arithmetic, case_at,
-              case_identity)
+              EWithHold, HandleClause, MatchArm, RecField, Stmt, SLet, SLetElse, SExpr,
+              is_arithmetic, case_at, case_identity)
 import type_syntax (Mode, MRead, MWrite, MRaise, MBad, TypeExpr, TVar, TCon, TRecord, is_raise,
                     ident_names)
 import rewrite (expand, named_program_wide, stated_witness_name)
@@ -626,7 +626,7 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
           b");",
         ]),
       );
-      let o6 = line(outdent(line(o5, b"if (ctx->failed) return 0;")), b"}");
+      let o6 = line(outdent(check(o5)), b"}");
       let o7 = fold(range(0, len(d.words)), o6, |acc: Emitter, at: Int|
         line(
           acc,
@@ -989,7 +989,7 @@ fn built_now(
       b"@@;",
     ]),
   );
-  let made = line(
+  let made = check(
     line(
       indent(line(outdent(took), b"} else {")),
       bytes_concat_all([
@@ -1003,7 +1003,6 @@ fn built_now(
         b");",
       ]),
     ),
-    b"if (ctx->failed) return 0;",
   );
   let closed = line(outdent(made), b"}");
   let stored = fold(range(0, n), closed, |acc: Emitter, at: Int|
@@ -1523,11 +1522,12 @@ fn position_of(xs: List<Bytes>, x: Bytes) -> Option<Int> =
     match acc { Some(_) -> acc, None -> if list_at(xs, i) == Some(x) { Some(i) } else { None } })
 
 fn check(emitter: Emitter) -> Emitter =
-  match emitter.landing {
-    None -> line(emitter, b"if (ctx->failed) return 0;"),
-    // Inside a `handle` body a failure jumps to the handle, which pops its frame.
-    Some(l) -> line(emitter, bytes_concat_all([b"if (ctx->failed) goto ", l, b";"])),
-  }
+  line(emitter, bytes_concat(b"if (ctx->failed) ", leaving(emitter)))
+
+/// The statement a body leaves by once the context has failed. Inside a `handle` body it jumps to the handle,
+/// which pops its frame and answers a raise bound for it; a `return` there would leave both undone.
+fn leaving(emitter: Emitter) -> Bytes =
+  match emitter.landing { None -> b"return 0;", Some(l) -> bytes_concat_all([b"goto ", l, b";"]) }
 
 fn as_int(value: CValue) -> Bytes =
   match value.kind {
@@ -2076,7 +2076,9 @@ fn position_call(
                                 bytes_concat_all([b"ply_imm(", from.value.expr, b")"]),
                                 po.value.expr,
                               ]),
-                              b"; return 0; }",
+                              b"; ",
+                              leaving(po.emitter),
+                              b" }",
                             ]),
                           );
                           let ans = fresh(guard);
@@ -2251,7 +2253,9 @@ fn fused_iterate(
                         bud,
                         b") < 1 ? 0 : 1, ",
                         bud,
-                        b"); return 0; }",
+                        b"); ",
+                        leaving(opened),
+                        b" }",
                       ]),
                     ),
                     bytes_concat_all([left.name, b" -= 1;"]),
@@ -2393,7 +2397,8 @@ fn fused_iterate(
                               bytes_concat_all([
                                 b"rt_iterate_bad_p(ctx, 2, ",
                                 sa.value.expr,
-                                b"); return 0;",
+                                b"); ",
+                                leaving(t5),
                               ]),
                             );
                             Some(line(outdent(t6), b"}"))
@@ -3118,7 +3123,9 @@ fn width_builtin(
                   ascii_of_int(width_index(t)),
                   b", ",
                   held.value.expr,
-                  b"); return 0; }",
+                  b"); ",
+                  leaving(held.emitter),
+                  b" }",
                 ]),
               );
               Some(
@@ -3269,7 +3276,7 @@ fn kind_tested(
         ]),
       );
       line(
-        line(
+        check(
           line(
             line(indent(opened), bytes_concat_all([b"ply_inc(", t.value.expr, b");"])),
             bytes_concat_all([
@@ -3289,7 +3296,6 @@ fn kind_tested(
               b";",
             ]),
           ),
-          b"if (ctx->failed) return 0;",
         ),
         bytes_concat_all([out.name, b" = ply_imm_value(r);"]),
       )
@@ -3308,12 +3314,11 @@ fn kind_tested(
         ]),
       );
       line(
-        line(
+        check(
           line(
             line(indent(opened), bytes_concat_all([b"ply_inc(", t.value.expr, b");"])),
             bytes_concat_all([b"Word r = ", builtin_call_over(name, [t.value.expr]), b";"]),
           ),
-          b"if (ctx->failed) return 0;",
         ),
         bytes_concat_all([out.name, b" = ply_imm_value(r);"]),
       )
@@ -3410,7 +3415,9 @@ fn inline_at(
                       t.value.expr,
                       bytes_concat_all([b"ply_imm(", idx.value.expr, b")"]),
                     ]),
-                    b"; return 0; }",
+                    b"; ",
+                    leaving(idx.emitter),
+                    b" }",
                   ]),
                 );
                 if wide {
@@ -3502,7 +3509,9 @@ fn inline_get(
                       b"))",
                     ]),
                   ]),
-                  b"; return 0; }",
+                  b"; ",
+                  leaving(idx.emitter),
+                  b" }",
                 ]),
               );
               let r = fresh(g);
@@ -5755,7 +5764,10 @@ fn handle_site(
             else { mark.emitter };
             match expr(notail(with_landing(opened, Some(label))), body, params) {
               None -> None,
-              Some(b) -> {
+              Some(emitted) -> {
+                let b = if leaves_unlanded(opened.out, emitted.emitter.out) {
+                  refused(emitted.emitter, b"a `handle` body that leaves without landing")
+                } else { emitted };
                 let bw = owned(b.emitter, b.value);
                 let set = line(
                   bw.emitter,
@@ -5790,6 +5802,15 @@ fn handle_site(
       },
     }
   }
+}
+
+/// Whether what a `handle` body emitted past `opened` holds a `return`, which would leave the frame
+/// installed and a raise bound for it unanswered: a body that fails leaves by `leaving` alone.
+fn leaves_unlanded(opened: List<Bytes>, body: List<Bytes>) -> Bool / {abort.raise} = {
+  let before = bytes_join(opened, b"");
+  let after = bytes_join(body, b"");
+  bytes_starts_with(after, before)
+    && bytes_index_of(bytes_slice(after, bytes_len(before), bytes_len(after)), b"return ") != None
 }
 
 fn dedup(xs: List<Int>) -> List<Int> =
@@ -5925,7 +5946,9 @@ fn stmts(
                       bytes_concat_all([
                         b"if (!(",
                         t.expr,
-                        b")) { rt_let_no_match_p(ctx); return 0; }",
+                        b")) { rt_let_no_match_p(ctx); ",
+                        leaving(t.emitter),
+                        b" }",
                       ]),
                     ),
                   ),
@@ -6145,7 +6168,13 @@ fn match_arms(
       Some(
         line(
           site(after, span),
-          bytes_concat_all([b"if (!", flag.name, b") { rt_no_match_p(ctx); return 0; }"]),
+          bytes_concat_all([
+            b"if (!",
+            flag.name,
+            b") { rt_no_match_p(ctx); ",
+            leaving(after),
+            b" }",
+          ]),
         ),
       ),
   }
@@ -6845,7 +6874,9 @@ fn narrow(wide: WithValue, width: Width, code: Int) -> Option<WithValue> / {abor
       int_lit(width_max(width)),
       b") { rt_overflow_p(ctx, ",
       ascii_of_int(code),
-      b"); return 0; }",
+      b"); ",
+      leaving(wide.emitter),
+      b" }",
     ]),
   );
   Some(bind(g, KNum(width), bytes_concat_all([b"(", ctype(KNum(width)), b")", wide.value.expr])))
@@ -6876,7 +6907,9 @@ fn negated(
           a,
           b" == INT64_MIN) { rt_overflow_p(ctx, ",
           ascii_of_int(overflow_code(b"neg")),
-          b"); return 0; }",
+          b"); ",
+          leaving(emitter),
+          b" }",
         ]),
       );
       Some(bind(g, KInt, bytes_concat_all([b"-(", a, b")"])))
@@ -6931,7 +6964,9 @@ fn shift(
       count.value.expr,
       b", ",
       which,
-      b"); return 0; }",
+      b"); ",
+      leaving(emitter),
+      b" }",
     ]),
   );
   match width {
@@ -7123,7 +7158,9 @@ fn arithmetic(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> WithValue / 
         f.name,
         b")) { rt_overflow_p(ctx, ",
         ascii_of_int(overflow_code(op)),
-        b"); return 0; }",
+        b"); ",
+        leaving(emitter),
+        b" }",
       ]),
     );
     { emitter: e2, value: { kind: KInt, expr: f.name, ty: TyOpen } }
@@ -8265,6 +8302,54 @@ test "a cycle whose member holds a handle, or whose calls are not in tail positi
     map(out, |e: Emitted| bytes_index_of(e.text, b"_group(PlyCtx *ctx, int which") != None),
     [false, false, false, false],
   )
+}
+
+/// The C between a `handle`'s push and its landing label, for a unit whose first definition holds one.
+fn handled_body(src: Bytes, release: Bool) -> Bytes / {abort.raise} = {
+  let out = emit_all_program(
+    [{ name: b"m", src: src }],
+    [],
+    [b"u8_of_int", b"int_of_u8", b"bytes_at", b"array_get"],
+    release,
+  );
+  match list_at(out, 0) {
+    None -> b"nothing was emitted",
+    Some(e) -> match e.why {
+      Some(why) -> why,
+      None -> match bytes_index_of(e.text, b"rt_handle_push_p") {
+        None -> b"no handle was pushed",
+        Some(pushed) -> match bytes_index_of(e.text, b":;\n") {
+          None -> b"no handle lands",
+          Some(landed) -> bytes_slice(e.text, pushed, landed),
+        },
+      },
+    },
+  }
+}
+
+test "a body that fails inside a `handle` leaves through the handle's landing, whatever failed" {
+  let src = bytes_concat_all([
+    b"fn f(vs: List<Int>, b: Bytes, xs: Array<Int>, n: Int) -> Int =\n",
+    b"  handle {\n",
+    b"    let [x, ..] = vs;\n",
+    b"    x + int_of_u8(u8_of_int(n)) + bytes_at(b, n) + array_get(xs, n) + (0 - n) * (n << 3)\n",
+    b"  } with { abort.raise(m) -> 0 }\n",
+  ]);
+  let bodies = map([false, true], |release: Bool| handled_body(src, release));
+  let leaves = |raised: Bytes| map(bodies, |body: Bytes| bytes_index_of(body, raised) != None);
+  assert_eq(leaves(b"rt_let_no_match_p(ctx); goto land_"), [true, true]);
+  assert_eq(leaves(b"rt_not_that_width_p(ctx, "), [true, true]);
+  assert_eq(leaves(b"builtin_bytes_at_p(ctx, "), [true, true]);
+  assert_eq(map(bodies, |body: Bytes| bytes_index_of(body, b"return")), [None, None])
+}
+
+test "a `return` a `handle` body emitted is seen, however its lines were joined since" {
+  let failing = b"  if (ctx->failed) return 0;\n";
+  assert(leaves_unlanded([b"  x;\n"], [b"  x;\n", failing]));
+  assert(leaves_unlanded([b"  x;\n", b"  y;\n"], [bytes_concat_all([b"  x;\n  y;\n", failing])]));
+  // One before the `handle` is the function's own, and a callee may spell the word.
+  assert(!leaves_unlanded([failing], [failing, b"  if (ctx->failed) goto land_3;\n"]));
+  assert(!leaves_unlanded([b"  x;\n"], [b"  x;\n", b"  Word t1 = ply_m_1returned_1(ctx);\n"]))
 }
 
 test "a form this port does not reach is refused" {
@@ -9750,6 +9835,7 @@ fn ast_handles(e: Expr, effects: List<EffectName>) -> List<Bytes> / {abort.raise
     EList(x) -> all(x.items),
     EPerform(x) -> all(x.args),
     EWithCell(x) -> all([x.init, x.body]),
+    EWithHold(x) -> all([x.acquire, x.release, x.body]),
     ETryBlock(x) -> ast_handles(x.body, effects),
     _ -> [],
   }

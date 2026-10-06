@@ -9,8 +9,8 @@ import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, At
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
+              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
               HandleClause, ReturnClause, RecField, ETagged, Tagged, Hole, tagged_parser,
               tagged_filler)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
@@ -30,6 +30,7 @@ import std.hash (blake3)
 import std.list (at, concat, contains, take, push_unique, reverse)
 import std.graph
 import std.bytes
+import std.string (ascii_lower)
 
 // --- Bytes ------------------------------------------------------------------------------------
 
@@ -40,7 +41,7 @@ fn rposition(xs: List<Bytes>, v: Bytes) -> Option<Int> / {abort.raise} =
 
 /// The width's position in `lexer::widths`: the discriminant the encoding writes.
 fn width_index(ty: Bytes) -> Bytes / {abort.raise} = {
-  let want = bytes_of_string(string_lower(string_of_bytes(ty)));
+  let want = bytes_of_string(ascii_lower(string_of_bytes(ty)));
   byte_of_int(
     fold(range(0, len(widths())), 0, |at: Int, i: Int|
       match list_at(widths(), i) { Some(w) -> if w.name == want { i } else { at }, None -> at }),
@@ -567,6 +568,7 @@ fn tag_e_list() -> Int = 61
 fn tag_e_perform() -> Int = 62
 fn tag_e_handle() -> Int = 63
 fn tag_e_with_cell() -> Int = 64
+fn tag_e_with_hold() -> Int = 170
 fn tag_e_simulate() -> Int = 65
 fn tag_e_tagged() -> Int = 66
 fn tag_e_filled() -> Int = 150
@@ -1392,6 +1394,14 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
       let inner: Encoder = expr({ ..head, values: push(head.values, c.binder.name) }, c.body);
       { ..inner, values: head.values }
     },
+    EWithHold(c) -> {
+      let head: Encoder = expr(
+        expr(put_text(put_tag(encoder, tag_e_with_hold()), c.resource.name), c.acquire),
+        c.release,
+      );
+      let inner: Encoder = expr({ ..head, values: push(head.values, c.binder.name) }, c.body);
+      { ..inner, values: head.values }
+    },
     ESimulate(s) -> expr(put_tag(encoder, tag_e_simulate()), s.body),
     EParallel(v) ->
       fold(
@@ -1655,6 +1665,7 @@ pub fn is_pure(e: Expr) -> Bool =
     EPerform(_) -> false,
     EHandle(_) -> false,
     EWithCell(_) -> false,
+    EWithHold(_) -> false,
     ESimulate(_) -> false,
     ETryBlock(_) -> false,
     EParallel(v) -> fold(v.branches, true, |acc: Bool, x: Expr| acc && is_pure(x)),
@@ -1740,6 +1751,9 @@ fn mentions(e: Expr, names: List<Bytes>) -> Bool =
         }),
     EWithCell(c) ->
       contains(names, c.binder.name) || mentions(c.init, names) || mentions(c.body, names),
+    EWithHold(c) ->
+      contains(names, c.binder.name) || mentions(c.acquire, names) || mentions(c.release, names)
+        || mentions(c.body, names),
     ESimulate(s) -> mentions(s.body, names),
     ETryBlock(t) -> mentions(t.body, names),
     EParallel(v) -> fold(v.branches, false, |acc: Bool, x: Expr| acc || mentions(x, names)),
@@ -3113,20 +3127,26 @@ fn walked(
 pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} =
   closure_over(hashes.refs, hashes.refs.edges, keys)
 
-/// `closure_of` with a definition's specification clauses reached with it: what a `requires`, an
-/// `ensures` or a `cost` of a reached definition names is reached, and what that reaches in turn.
-/// `index` is the one `hashes` was made of.
-pub fn specified_closure_of(
+/// The functions `keys` reach, each by name, a definition's specification clauses reached with it:
+/// what a `requires`, an `ensures` or a `cost` of a reached definition names is reached, and what
+/// that reaches in turn. A name is answered only where a function of that name is reached: a type
+/// or an effect that shares it is another definition, and reaching one reaches nothing the function
+/// does. A key that is a name starts from every definition of that name. `index` is the one
+/// `hashes` was made of.
+pub fn reached_functions(
   index: Index,
   hashes: HashOutput,
   keys: List<Bytes>,
 ) -> Map<Bytes, Bool> / {abort.raise} = {
   let r = hashes.refs;
-  closure_over(
-    r,
-    map(range(0, len(r.edges)), |v: Int| with_spec_refs(index, at(index.nodes, v), at(r.edges, v))),
-    keys,
-  )
+  let edges = map(range(0, len(r.edges)), |v: Int|
+    with_spec_refs(index, at(index.nodes, v), at(r.edges, v)));
+  let from = fold(keys, [], |acc: List<Int>, k: Bytes|
+    concat(acc, match map_get(r.starts, k) { Some(vs) -> vs, None -> [] }));
+  fold(walked(edges, from).all, map_new(), |acc: Map<Bytes, Bool>, v: Int| {
+    let node = at(index.nodes, v);
+    if is_decl(node) { acc } else { map_insert(acc, node.name, true) }
+  })
 }
 
 fn closure_over(
@@ -3291,6 +3311,7 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
       match h.ret { Some(rc) -> lambda_rets(rc.body, clauses), None -> clauses }
     },
     EWithCell(c) -> lambda_rets(c.body, lambda_rets(c.init, out)),
+    EWithHold(c) -> lambda_rets(c.body, lambda_rets(c.release, lambda_rets(c.acquire, out))),
     ESimulate(s) -> lambda_rets(s.body, out),
     ETryBlock(t) -> lambda_rets(t.body, out),
     EParallel(v) -> fold(v.branches, out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
@@ -4569,6 +4590,30 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
           b"}",
         ]),
       }
+    } else if t.value == tag_e_with_hold() {
+      let r = read_text(e);
+      let acquire: Decoded = print_expr(printer, r.decoder, depth);
+      let release: Decoded = print_expr(printer, acquire.decoder, depth);
+      let level = release.decoder.values;
+      let body: Decoded = print_expr(printer, { ..release.decoder, values: level + 1 }, inner);
+      {
+        decoder: { ..body.decoder, values: level },
+        text: bytes_concat_all([
+          b"with_hold[",
+          r.text,
+          b"](",
+          acquire.text,
+          b", ",
+          release.text,
+          b") {",
+          line_break(inner),
+          local_name(level),
+          b" -> ",
+          body.text,
+          line_break(depth),
+          b"}",
+        ]),
+      }
     } else if t.value == tag_e_simulate() {
       let body = print_block(printer, e, depth);
       { decoder: body.decoder, text: bytes_concat(b"simulate ", body.text) }
@@ -5673,7 +5718,7 @@ test "a closure is what a name reaches, the name included, and a test's what the
   assert_eq(map_keys(reaching(h, one_set([b"m.other"]))), [b"m.other"])
 }
 
-test "a specified closure reaches what a reached definition's clauses name, and what that reaches" {
+test "the functions reached hold what a reached definition's clauses name, and what that reaches" {
   let index = indexed([
     {
       name: b"m",
@@ -5682,13 +5727,34 @@ test "a specified closure reaches what a reached definition's clauses name, and 
   ]);
   let h = hash_index(index);
   assert_eq(map_keys(closure_of(h, [b"m.f"])), [b"m.f"]);
-  assert_eq(map_keys(specified_closure_of(index, h, [b"m.f"])), [
+  assert_eq(map_keys(reached_functions(index, h, [b"m.f"])), [
     b"m.f",
     b"m.floor",
     b"m.model",
     b"m.under",
   ]);
-  assert_eq(map_keys(specified_closure_of(index, h, [b"m.other"])), [b"m.other"])
+  assert_eq(map_keys(reached_functions(index, h, [b"m.other"])), [b"m.other"])
+}
+
+test "a function is reached through itself, never through a type or an effect of its name" {
+  let index = indexed([
+    {
+      name: b"m",
+      src: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)\npub type Box = | Box(Int)\neffect Box { read held() -> Box }\npub fn boxed() -> Box / {Box.read} = Box.held()\npub fn caller() -> Int = log()",
+    },
+  ]);
+  let h = hash_index(index);
+  // `user` performs the effect `log` and `boxed` names the type and the effect `Box`: no function.
+  assert_eq(map_keys(reached_functions(index, h, [b"m.user"])), [b"m.user"]);
+  assert_eq(map_keys(reached_functions(index, h, [b"m.boxed"])), [b"m.boxed"]);
+  assert_eq(map_keys(reached_functions(index, h, [b"m.caller"])), [
+    b"m.caller",
+    b"m.helper",
+    b"m.log",
+  ]);
+  // A key is a name, which starts from each definition behind it.
+  assert_eq(map_keys(reached_functions(index, h, [b"m.log"])), [b"m.helper", b"m.log"]);
+  assert_eq(map_keys(reached_functions(index, h, [b"m.Box"])), [])
 }
 
 fn over_cases(label: Bytes, ty: Bytes, table: Bytes, body: Bytes) -> HashOutput / {abort.raise} =
@@ -5887,6 +5953,31 @@ test "a parallel block prints back as written and hashes back to what it was sto
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a `with_hold` prints back as written and hashes back to what it was stored under" {
+  let src = |region: Bytes|
+    bytes_concat_all([
+      b"pub effect io { write close(n: Int) -> Unit }\n",
+      b"pub fn held(n: Int) -> Int / {io.close} = with_hold[",
+      region,
+      b"](n + 1, |x: Int| io.close(x)) { h -> hold_get(h) }",
+    ]);
+  let hash_of = |out: HashOutput| {
+    match map_get(by_name(named_hashes(out)), b"app.held") {
+      Some(h) -> h,
+      None -> panic("the index names held"),
+    }
+  };
+  let out = hash_index(indexed([{ name: b"app", src: src(b"file") }]));
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b"with_hold[file]("));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
+  // The region is part of what a hold is typed as, so its name is hashed.
+  assert(hash_of(hash_index(indexed([{ name: b"app", src: src(b"other") }]))) != hash_of(out))
 }
 
 test "a `try` and a `raise` operation print back as written and hash back to what they were stored under" {

@@ -6,9 +6,9 @@ import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, At
                     ident_names)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm,
-              HandleClause, ReturnClause, RecField, hidden_binder, ETagged, Hole)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
+              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
+              MatchArm, HandleClause, ReturnClause, RecField, hidden_binder, ETagged, Hole)
 import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TDAlias, TDSum,
               VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric,
               DInteger, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias, INames,
@@ -18,6 +18,7 @@ import rewrite (expand, find_type)
 import resolve (Diag, Source, error_at, error_at_and, dump_diags, path_span)
 import std.list (at, concat, contains)
 import std.bytes (join, ascii_of_int)
+import std.string (eq_ignore_ascii_case)
 import std.text
 
 // --- Rules ---------------------------------------------------------------------------------------
@@ -45,8 +46,9 @@ pub fn constructor_shape(deriver: Deriver, name: Bytes) -> ConstructorShape =
       || name == b"Duration" { Structural }
   else if same_deriver(deriver, DBin) && is_fixed_width(name) { Leaf }
   else if same_deriver(deriver, DBin) && name == b"Iter" { Structural }
-  else if name == b"Cell" || name == b"Task" || name == b"Chan" { Refused(HoldsHandle) }
-  else if name == b"Secret" { match deriver { DEq -> Leaf, _ -> Refused(HoldsSecret) } }
+  else if name == b"Cell" || name == b"Hold" || name == b"Task" || name == b"Chan" {
+    Refused(HoldsHandle)
+  } else if name == b"Secret" { match deriver { DEq -> Leaf, _ -> Refused(HoldsSecret) } }
   else { Nominal }
 
 /// Whether a type constructor's JSON encoding can be the document `null`.
@@ -78,9 +80,6 @@ fn runtime_path(deriver: Deriver) -> List<Bytes> =
     DShow -> [b"std", b"show"],
     _ -> [],
   }
-
-fn is_upper_byte(c: Int) -> Bool = c >= 65 && c <= 90
-fn lower_byte(c: Int) -> Int = if is_upper_byte(c) { c + 32 } else { c }
 
 /// The name a type's derived functions start with: `std.text`'s, so the two cannot disagree.
 pub fn snake_case(name: Bytes) -> Bytes =
@@ -1215,6 +1214,15 @@ fn retarget_expr(e: Expr, span: Span) -> Expr =
         binder: ident_at(c.binder, span),
         body: retarget_expr(c.body, span),
       }),
+    EWithHold(c) ->
+      EWithHold({
+        span: span,
+        resource: ident_at(c.resource, span),
+        acquire: retarget_expr(c.acquire, span),
+        release: retarget_expr(c.release, span),
+        binder: ident_at(c.binder, span),
+        body: retarget_expr(c.body, span),
+      }),
     ESimulate(x) -> ESimulate({ span: span, body: retarget_expr(x.body, span) }),
     EParallel(x) ->
       EParallel({ span: span, branches: map(x.branches, |b: Expr| retarget_expr(b, span)) }),
@@ -1314,9 +1322,7 @@ fn import_binder(decl: ImportDecl) -> Option<Bytes> / {abort.raise} =
   }
 
 fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
-  bytes_len(a) == bytes_len(b)
-    && fold(range(0, bytes_len(a)), true, |acc: Bool, i: Int|
-      acc && lower_byte(bytes_at(a, i)) == lower_byte(bytes_at(b, i)))
+  eq_ignore_ascii_case(string_of_bytes(a), string_of_bytes(b))
 
 /// Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
 fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {

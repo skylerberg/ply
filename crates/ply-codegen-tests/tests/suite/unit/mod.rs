@@ -9,6 +9,7 @@ mod heap;
 mod list;
 mod map;
 mod parallel;
+mod rt;
 mod simulate;
 mod stack;
 mod stored;

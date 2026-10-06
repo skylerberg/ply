@@ -273,6 +273,13 @@ builtins! { $
     /// `map_range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
     MapRange = "map_range", 6, ends;
     MapSplit = "map_split", 2, ends;
+    /// What a hold holds, while its region has not let it go.
+    HoldGet = "hold_get", 1, ends;
+    /// A hold's contents moved out for its release, so the next read finds them gone. No source
+    /// can spell it; the lowering of `with_hold` writes it.
+    HoldTake = "?hold_take", 1, ends;
+    /// [`Builtin::Bracket`] under a name no module rebinds, for the lowering of `with_hold`.
+    HoldBracket = "?hold_bracket", 3, ends;
 }
 
 impl Builtin {
@@ -488,7 +495,10 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::CellGet
         | Builtin::CellSet
         | Builtin::CellUpdate
-        | Builtin::Bracket => Err(answered_by_the_backend(b, span)),
+        | Builtin::Bracket
+        | Builtin::HoldGet
+        | Builtin::HoldTake
+        | Builtin::HoldBracket => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
@@ -1213,17 +1223,18 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             if b.is_zero() {
                 return Err(crate::semantics::err_zero_divisor(span, "`decimal_div`"));
             }
-            let quotient = a
-                .checked_div(b)
-                .ok_or_else(|| decimal_overflow(span, "division"))?;
-            Ok(Value::Decimal(quotient.round_dp_with_strategy(scale, mode)))
+            decimal_quotient(a, b, scale, mode)
+                .map(Value::Decimal)
+                .ok_or_else(|| decimal_overflow(span, "division"))
         }
 
         Builtin::DecimalRound => {
             let d = args[0].as_decimal(span, "`decimal_round`")?;
             let scale = decimal_scale(&args[1], span, "decimal_round")?;
             let mode = rounding(&args[2], span, "decimal_round")?;
-            Ok(Value::Decimal(d.round_dp_with_strategy(scale, mode)))
+            decimal_quotient(d, Decimal::ONE, scale, mode)
+                .map(Value::Decimal)
+                .ok_or_else(|| decimal_overflow(span, "rounding"))
         }
 
         Builtin::DecimalOfInt => Ok(Value::Decimal(Decimal::from(
@@ -1434,6 +1445,54 @@ fn decimal_scale(v: &Value, span: Span, what: &str) -> Result<u32, Diagnostic> {
             )
             .primary(span, "`Decimal` holds at most 28 decimal places")
         })
+}
+
+/// `a / b`, for a `b` that is not zero, with exactly `scale` digits after the point: the exact
+/// quotient rounded once, there, by `mode`. `None` where that mantissa is past 96 bits.
+///
+/// The mantissas are divided as whole numbers, a digit at a time, so no digit past the last one
+/// kept is rounded before `mode` reads what is left over.
+fn decimal_quotient(a: Decimal, b: Decimal, scale: u32, mode: RoundingStrategy) -> Option<Decimal> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    const LIMIT: u128 = 1 << 96;
+    let negative = a.is_sign_negative() != b.is_sign_negative();
+    let (dividend, divisor) = (a.mantissa().unsigned_abs(), b.mantissa().unsigned_abs());
+    // The answer's mantissa is `dividend * 10^shift / divisor`.
+    let shift = i64::from(scale) + i64::from(b.scale()) - i64::from(a.scale());
+    let (mut quotient, mut rest) = (dividend / divisor, dividend % divisor);
+    // What the quotient leaves out, against half a unit of its last digit.
+    let (exact, half) = if shift >= 0 {
+        for _ in 0..shift {
+            // `rest` is below `divisor`, which is below 2^96, so neither product wraps.
+            rest *= 10;
+            quotient = quotient * 10 + rest / divisor;
+            rest %= divisor;
+            if quotient >= LIMIT {
+                return None;
+            }
+        }
+        (rest == 0, (rest * 2).cmp(&divisor))
+    } else {
+        let unit = 10u128.pow(u32::try_from(-shift).ok()?);
+        let dropped = quotient % unit;
+        quotient /= unit;
+        let half = match dropped.cmp(&(unit / 2)) {
+            Equal if rest > 0 => Greater,
+            other => other,
+        };
+        (dropped == 0 && rest == 0, half)
+    };
+    let away = !exact
+        && match mode {
+            RoundingStrategy::ToZero => false,
+            RoundingStrategy::AwayFromZero => true,
+            RoundingStrategy::ToPositiveInfinity => !negative,
+            RoundingStrategy::ToNegativeInfinity => negative,
+            RoundingStrategy::MidpointAwayFromZero => half != Less,
+            _ => half == Greater || (half == Equal && quotient % 2 == 1),
+        };
+    let mantissa = i128::try_from(quotient + u128::from(away)).ok()?;
+    Decimal::try_from_i128_with_scale(if negative { -mantissa } else { mantissa }, scale).ok()
 }
 
 fn decimal_overflow(span: Span, what: &str) -> Diagnostic {
@@ -1773,6 +1832,19 @@ pub fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     )
     .primary(span, "this cell was made by a different run")
     .note("please report this: a cell value escaped the region that allocated it")
+}
+
+/// A hold reached after its region let it go, which only a continuation captured inside the region
+/// and resumed after the release can do.
+#[cold]
+pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOLD_RELEASED,
+        format!("a hold is {doing} after its region released what it held"),
+    )
+    .primary(span, "the hold holds nothing now")
+    .note("a `with_hold` releases what it holds once, when its body first ends; a continuation captured inside the body and resumed after that runs the rest of the body against a hold already let go")
+    .note("resume a continuation captured inside a `with_hold` at most once, or open the `with_hold` after the choice the continuation replays")
 }
 
 /// The C backend answers every builtin that calls back into the program or reads a cell.

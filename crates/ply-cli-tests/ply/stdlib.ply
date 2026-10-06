@@ -9,6 +9,7 @@ import harness (scratch, Ran, Source, project, program, write, read, shipped_sou
 import compiler.front (shipped_data_wanted)
 import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, ISchema, OpDef, TDAlias,
                        is_pub)
+import compiler.lexer (lex, Identifier, Token)
 import compiler.parsing (Doc, Ident)
 import compiler.type_syntax (TypeExpr, TRecord)
 import compiler.unit (shipped)
@@ -282,6 +283,44 @@ test "a warm check agrees with a cold one over a program that imports std" {
     assert(
       has_named(at(warm, "definitions"), "std.net.drain"),
       Some("the shipped module is part of the answer: " ++ shown(warm)),
+    )
+  })
+}
+
+/// A project of one module, checked beside an empty cache and again beside what that check filed,
+/// each time answering what a check of the same sources in memory does: the seeded answer.
+fn checked_cold_and_warm(
+  text: String,
+) -> Json / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
+  project([{ path: "app.ply", text: text }]);
+  let _ = warm_agrees("cold");
+  warm_agrees("warm")
+}
+
+// `std.gzip` declares `effect gzip` beside `fn gzip`, and its readers raise through the effect.
+test "a program importing only a reader of std.gzip loads the reader and no writer" {
+  scratch(|| {
+    let answer = checked_cold_and_warm(
+      "import std.gzip (try_gunzip)\n\npub fn opens(data: Bytes) -> Bool / {abort.raise} =\n  match try_gunzip(data, 64) { Ok(_) -> true, Err(_) -> false }\n",
+    );
+    let loaded = at(answer, "definitions");
+    assert(
+      has_named(loaded, "std.gzip.try_gunzip") && !has_named(loaded, "std.gzip.deflate"),
+      Some(shown(loaded)),
+    )
+  })
+}
+
+test "a program importing only std.gzip's writer loads it with what it calls" {
+  scratch(|| {
+    let answer = checked_cold_and_warm(
+      "import std.gzip (gzip)\n\npub fn packed(data: Bytes) -> Bytes / {abort.raise} = gzip(data)\n",
+    );
+    let loaded = at(answer, "definitions");
+    assert(
+      has_named(loaded, "std.gzip.gzip") && has_named(loaded, "std.gzip.deflate")
+        && !has_named(loaded, "std.gzip.try_gunzip"),
+      Some(shown(loaded)),
     )
   })
 }
@@ -1079,14 +1118,66 @@ fn undocumented(module: String, src: Bytes) -> List<String> / {abort.raise} =
 
 fn bare(doc: Option<Doc>) -> Bool = match doc { None -> true, Some(_) -> false }
 
-test "every name the standard library publishes is documented" {
-  let missing = fold(std_tree(), [], |acc: List<String>, f: { name: String, bytes: Bytes }|
+/// A standard library module under its name in a program.
+type Published = { module: String, src: Bytes }
+
+fn std_modules() -> List<Published> / {abort.raise} =
+  fold(std_tree(), [], |acc: List<Published>, f: { name: String, bytes: Bytes }|
     if !string_ends_with(f.name, ".ply") { acc } else {
-      let module = "std." ++ string_slice(f.name, 0, string_len(f.name) - 4);
-      fold(undocumented(module, f.bytes), acc, push)
-    });
+      push(acc, { module: "std." ++ string_slice(f.name, 0, string_len(f.name) - 4), src: f.bytes })
+    })
+
+test "every name {m.module} publishes is documented" for m: Published in std_modules() {
+  let missing = undocumented(m.module, m.src);
   assert(
     len(missing) == 0,
     Some("these are published without a `///` doc:\n" ++ string::join(missing, "\n")),
+  )
+}
+
+/// The shipped modules that fold case or trim by Unicode's tables, each with the text of a
+/// person's it reads that way. Every other one compares names and tokens, which take
+/// `std.string`'s `ascii_lower`, `ascii_upper` and `ascii_trim`.
+fn unicode_readers() -> List<{ module: String, why: String }> =
+  [
+    { module: "char", why: "its simple mappings are held to the prelude's full ones" },
+    { module: "cli", why: "a manual page's title is the program's name in capitals" },
+    { module: "glob", why: "`ignore_case` matches names as a file system that folds case does" },
+    { module: "ini", why: "`any_case` matches a key as Python's `configparser` folds one" },
+    { module: "semver", why: "`coerce` reads a version out of text a person typed" },
+    { module: "string", why: "the ASCII forms are stated against the prelude's" },
+    { module: "tar", why: "paths are compared as a file system that folds case compares them" },
+    { module: "text", why: "a shell line is refused at white space of any script" },
+    { module: "unicode", why: "its full mappings are held to the prelude's" },
+  ]
+
+/// Whether a source names `string_lower`, `string_upper` or `string_trim` outside its comments
+/// and its literals.
+fn reads_unicode(src: Bytes) -> Bool / {abort.raise} =
+  fold(lex(src).tokens, false, |found: Bool, t: Token|
+    found
+      || (match t.kind {
+        Identifier(name) ->
+          name == b"string_lower" || name == b"string_upper" || name == b"string_trim",
+        _ -> false,
+      }))
+
+test "a shipped module folds case and trims by ASCII, unless it is listed as reading a person's text" {
+  let found = sort(
+    fold(std_tree(), [], |acc: List<String>, f: { name: String, bytes: Bytes }|
+      if string_ends_with(f.name, ".ply") && reads_unicode(f.bytes) {
+        push(acc, string_slice(f.name, 0, string_len(f.name) - 4))
+      } else { acc }),
+  );
+  let listed = map(unicode_readers(), |r: { module: String, why: String }| r.module);
+  assert(
+    found == listed,
+    Some(
+      "the modules that call `string_lower`, `string_upper` or `string_trim`:\n  "
+        ++ string::join(found, " ")
+        ++ "\nthe ones listed as reading a person's text:\n  "
+        ++ string::join(listed, " ")
+        ++ "\na name or a token takes `std.string`'s `ascii_lower`, `ascii_upper` or `ascii_trim`",
+    ),
   )
 }

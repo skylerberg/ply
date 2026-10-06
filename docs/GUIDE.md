@@ -154,7 +154,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
-| `with_cell` | before `[` |
+| `with_cell`, `with_hold` | before `[` |
 | `simulate` | before `{` where an expression can start |
 | `try` | before `{`, or before `[` and an operation's name, where an expression can start (§6.8) |
 
@@ -388,8 +388,8 @@ Reach through a binder with `::` (`orders::place(...)`). `as` and a name list
 cannot be combined; write two imports. Imports precede every item.
 
 The first segment of a module path may be a package: a dependency declared in
-`ply.pkg` (§3.3) grants its own prefix, and `import cli.cmdline` reaches the
-`cmdline` module of the package `cli`. A path whose first segment is neither a
+`ply.pkg` (§3.3) grants its own prefix, and `import cli.surface` reaches the
+`surface` module of the package `cli`. A path whose first segment is neither a
 module of this package, the root of one, nor a granted prefix is `E0106`; a
 dependency's prefix used without the manifest declaring it is `E0132`. A bare
 import is always this package's own: inside a dependency, `import fmt` names
@@ -476,7 +476,7 @@ may be imported. A package's own modules answer to its sibling names:
 
 ```ply
 import store.orders        // a module of this package, as before
-import cli.cmdline         // a module of the declared dependency `cli`
+import cli.surface         // a module of the declared dependency `cli`
 ```
 
 A dependency is another package root: `Path("../cli")` names the directory
@@ -651,6 +651,12 @@ reads any of them as and `numeric_of_int` writes at any (§12), and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
 
+A `Decimal` is a 96-bit mantissa and a scale, the count of digits after its
+point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `decimal_div`
+and `decimal_round` take the scale of their answer, and answer with exactly that
+many digits after the point, the exact value rounded once by the `Rounding`
+given; they raise where 96 bits do not hold the answer at that scale.
+
 ### 4.2 Records and tuples
 
 Records are structural; `type` names an alias, not a new type, unless its body
@@ -704,7 +710,7 @@ before the literal is checked:
   expected of the whole or of the elements, branches and arms before it; the
   right side of an operator, at its left's;
 * a block's tail, a `let ... else` block, and the body of a `handle` (its
-  `return` clause, where it has one), a `with_cell` or a `simulate`, where the
+  `return` clause, where it has one), a `with_cell`, a `with_hold` or a `simulate`, where the
   whole is expected; the body of a `try`, where a `Result` of it is; a handler
   clause, at what it answers: the operation's result, or the `handle`'s value
   for a raise and for a clause that binds `resume`.
@@ -1002,14 +1008,17 @@ own `Stop` loses `iterate`.
 ordered, and reaches a host operation only if that operation's registration
 allows it (`E0439`).
 
-**`Cell<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are branded by their
-region and cannot outlive it; the brand prints as `Cell[users]<Int>`. A
+**`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
+branded by their region and cannot outlive it; the brand prints as
+`Cell[users]<Int>`. A `Hold` is not data: it is not compared or ordered
+(`E0201`), nor hashed, derived over or made a `Map` key (`E0206`), and `reflect`
+answers the cell it is (`VCell`), never what it holds. A
 declaration is outside every region, so a variant's field, a `new` record's
 field or an operation's parameter or result that mentions any of them, at any
 depth, is `E0446`. Take it as a type parameter instead,
 `type Held<t> = Held(t)`: the type argument carries the brand where the escape
 checks see it. A sum hides the rows its fields write, so a field whose function
-names `cell`, or joins a task or works a channel, in its row is `E0446` as well:
+names `cell` or `hold`, or joins a task or works a channel, in its row is `E0446` as well:
 take the row as a row parameter, `type Held<| e> = Held(() -> Int / e)`, and a
 closure that reaches a region is seen leaving it in the row the type is given.
 A `new` record's fields are read wherever it goes, so a row one of them writes
@@ -1049,7 +1058,7 @@ a run of operators of one precedence are each one level, however long.
 A block `{ statements... tail }` has its tail's value, or `Unit` with no tail.
 `let <pattern> [: Type] = <expr>;` binds once (the `;` is required) and may
 shadow. An expression statement needs `;` unless it is the tail or block-like
-(`if`, `match`, `handle`, a block, `with_cell`, `simulate`).
+(`if`, `match`, `handle`, a block, `with_cell`, `with_hold`, `simulate`).
 
 A `let` pattern can take apart a record, which is how a function returns several
 values:
@@ -1225,7 +1234,10 @@ each other, so `even`/`odd` mutual recursion does not nest either. A group with
 a `handle` in a member's body is compiled definition by definition and nests.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
-call inside `handle`, `with_cell` or a lambda, and a call of another function.
+call inside `handle`, `with_cell`, `with_hold` or a lambda, and a call of another function.
+The depth is each task's own (§9): a task nests from where its region stands,
+whatever the tasks beside it hold, and so does the body of a `handle` whose
+clause resumes anywhere but its tail.
 Depth and work are two bounds: one entry may also make only so many calls — a
 billion by default, and none under `ply run`, where an entry that serves forever
 is a program — and a loop that never ends fails with `E0503` when that budget is
@@ -1260,7 +1272,7 @@ it and the function's result and everything evaluated before it is pure:
 `let x = e?;`, or `parse_or_more(parse_and(ts)?)`.
 
 * It converts no errors: `Result<_, E1>` inside `-> Result<_, E2>` is `E0201`.
-* `E0118`: inside a `handle`, `try`, `with_cell` or `simulate`; inside a
+* `E0118`: inside a `handle`, `try`, `with_cell`, `with_hold` or `simulate`; inside a
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
@@ -1441,8 +1453,8 @@ A function value may perform less than the type it meets says, though not more
 written return type or a `let` annotation, and as one of the elements of a list
 or the branches of an `if`, a `match` or a `let ... else`, which meet each
 other; so does any function such a value holds in a record, a tuple, a `List`,
-an `Array`, an `Option`, a `Result`, a `Map` or an `Iter`, and the function a
-function returns. So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`,
+an `Array`, an `Option`, a `Result`, a `Map`, an `Iter` or a `Hold` (§7), and
+the function a function returns. So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`,
 a callback whose row names `net.send[conn]` is one a row written
 `/ {net.write[conn]}` admits, and two callbacks fill one row variable with both
 their rows: given `fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e`,
@@ -1618,7 +1630,11 @@ go anyway: `release` runs on what `acquire` answered when `body` returns, when a
 clause unwinds through it this way or a raise does (§6.8), and when its task is
 cancelled (§9), where the bracket stands and with the handlers around it. A `release` that fails
 replaces whatever was unwinding. A runtime failure ends the run, so nothing more
-runs then, `release` included. Nested brackets release innermost first.
+runs then, `release` included. Nested brackets release innermost first. The body
+is handed what `acquire` answered as it is, a value that may be kept past the
+release, and a continuation captured inside the body and resumed twice releases
+twice; `with_hold` (§7) is the bracket whose body cannot keep what it holds and
+which releases once.
 
 ### 6.7 Unhandled effects
 
@@ -1738,14 +1754,67 @@ it whose value holds a `Task` or a `Chan` (a parameter, or a local, whether the
 body or a closure inside it names it), nor read a cell of a region opened around
 it while that cell can hold one (`E0413`, §9).
 
+```ply
+fn first_byte(path: String) -> Bytes / {fs.open[repo], fs.read_chunk[repo], fs.close[repo], io.refused, io.closed} =
+  with_hold[file](io::reading[repo](path), io::shut) { source -> io::read(source, 1) }
+```
+
+`with_hold[r](acquire, release) { h -> body }` is the bracket of a resource:
+`body` runs with `h` bound to a **hold** on what `acquire` answered, a
+`Hold[r]<a>`, and at the region's `}` `release` is called on what was acquired.
+`release` is any function of it, `(a) -> Unit / e`, read when the hold is let
+go, so one form serves every resource a library can open and close: a library
+exports the pair (`std.io`'s `reading` and `shut`), and no resource has a form
+of its own. The region's row is `acquire`'s, `release`'s and the body's.
+`release` runs once, where the region stands and with the handlers around it,
+however the body ends: it returned; a raise, or a clause that did not resume,
+unwound through it (before the clause that answers the raise runs, §6.8); or
+its task was cancelled (§9). An `acquire` that raised holds nothing, so nothing
+is released; a `release` that raises replaces what was unwinding; holds nested
+in one another are let go innermost first; a runtime failure ends the run and
+releases nothing.
+
+`hold_get(h)` reads what a hold holds, and puts `hold.read` in the row of
+whatever calls it: a function handed a hold says `/ {hold.read}`, a closure that
+reads one carries it in its type, and a `with_hold` answers it for its body, as
+`with_cell` answers `cell.read[r]`. `hold` is the language's effect, as `cell`
+is (`E0105`, `E0103`). So a hold passes to functions and into the closures of
+`map`, `fold` and `iterate`, and the checker still sees every way out of the
+region: the hold itself by its type, and a closure that could read one by its
+row. A row does not say which hold it reads, so a closure that reads any hold
+may not leave any `with_hold` (`E0446`). A hold is let go at the `}` of its own
+region, so that region is the hold's alone: a `with_hold[r]` inside a region
+named `r`, or a `with_cell[r]` inside a `with_hold[r]`, is `E0330`.
+
+What `hold_get` answers is a value like any other, and a copy of it may leave
+the region the hold may not. So a library keeps what is held useless without
+its hold: its functions take the `Hold`, and what they find released they
+refuse, as a `std.io` source pulled after its close raises `io.closed`. A lazy
+`Seq` (`std.seq`) whose steps read a hold carries `hold.read` in its row, so it
+is built and consumed inside the region and is `E0446` leaving it.
+
+A continuation captured inside a `with_hold` body and resumed after the hold was
+let go (a clause that resumes twice, §6.6) finds the hold gone: its first
+`hold_get`, or else the region's own `}`, ends the run with `E0331`, and
+`release` does not run again. Where what was acquired is a host's, an
+at-most-once operation on it refuses the second resumption first (`E0426`).
+
+At run time a hold is a cell of its region, so `E0449` and a failure that names
+its type call it a `Cell`.
+
 * `E0201`: the cell escapes its `with_cell[r]` region.
-* `E0446`: a value branded by the region outlives it (stored in an older
-  binding, handed to an operation, or reached by a task whose scheduler is
-  older than the region, through the closure it runs or a handler around its
-  spawn), a task is stored in a cell older than its `simulate` region, a
-  declared type's field or an operation's signature mentions a `Cell`, a
-  `Task` or a `Chan`, or a variant's field holds a function whose written row
-  reaches one (§4.6).
+* `E0330`: a `with_hold` names a region that is open, or a `with_cell` a
+  `with_hold`'s.
+* `E0331`: a hold is read or let go after its region released what it held (at
+  run time).
+* `E0446`: a hold, or a closure whose row reads one, escapes its `with_hold[r]`
+  region, at the expression that would carry it out; a value branded by a
+  region outlives it (stored in an older binding, handed to an operation, or
+  reached by a task whose scheduler is older than the region, through the
+  closure it runs or a handler around its spawn), a task is stored in a cell
+  older than its `simulate` region, a declared type's field or an operation's
+  signature mentions a `Cell`, a `Hold`, a `Task` or a `Chan`, or a variant's
+  field holds a function whose written row reaches one (§4.6).
 * `E0449`: a region handle (a cell, a task, a channel, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
@@ -1789,7 +1858,7 @@ A test may range over a table, and is then a test for each of its elements, a
 type Resolution = { reference: String, target: String }
 
 test "resolves {c.reference}" for c: Resolution in resolutions() {
-  assert_eq(url_resolve(base(), c.reference), c.target)
+  assert_eq(url_join(base(), c.reference), url_parse(c.target))
 }
 ```
 
@@ -3076,6 +3145,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0311` | `try` whose body's row names no `raise` operation to answer |
 | `E0312` | `try` whose body's row names several `raise` operations, and it names none |
 | `E0313` | `try` naming an operation that is not a `raise` |
+| `E0330` | `with_hold` naming a region already open, or a `with_cell` naming a `with_hold`'s |
+| `E0331` | hold read or let go after its region released what it held |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` or `Chan` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
@@ -3172,6 +3243,8 @@ In `examples/`: `clock.ply` (a `nondet` effect, a handler, `test/nondet`);
 and `timeout.ply` (simulation, a race and its fix, a virtual clock); `echo.ply`
 and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 `relay.ply` (one forwarder generic over the label it writes under);
+`shout.ply` (a command line declared with `std.cli`, read into the program's
+own type);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
 answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose
