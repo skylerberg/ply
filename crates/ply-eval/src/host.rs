@@ -233,6 +233,29 @@ impl HostRegistry {
         self.entries.is_empty()
     }
 
+    /// Drops each registration for an operation that an effect `check` declares does not hold: a
+    /// program built before an operation joined its effect performs none of it.
+    pub fn retain_declared(&mut self, check: &CheckOutput) {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        let mut withheld = BTreeMap::new();
+        for (index, (op, handler)) in std::mem::take(&mut self.entries).into_iter().enumerate() {
+            let mut declared = check
+                .effects
+                .values()
+                .filter(|e| registration_names(&op.effect, &e.name, &e.simple_name))
+                .peekable();
+            if declared.peek().is_some() && !declared.any(|e| e.ops.contains_key(&op.op)) {
+                continue;
+            }
+            if let Some(served) = self.withheld.get(&index) {
+                withheld.insert(entries.len(), *served);
+            }
+            entries.push((op, handler));
+        }
+        self.entries = entries;
+        self.withheld = withheld;
+    }
+
     pub fn ops(&self) -> impl Iterator<Item = &HostOp> {
         self.entries.iter().map(|(op, _)| op)
     }
