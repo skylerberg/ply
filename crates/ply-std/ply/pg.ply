@@ -17,7 +17,9 @@ import std.bytes (u16_be, u32_be, i32_be, u16_be_at, u32_be_at, i32_be_at, slice
                   int_of_ascii)
 import std.hash (sha256, hmac_sha256, pbkdf2_sha256, tags_match)
 import std.json (base64_decode, base64_encode)
-import std.net (net, send_all)
+import std.ip
+import std.net
+import std.net (Says, net, send_all)
 import std.list (concat)
 
 // --- Kinds --------------------------------------------------------------------
@@ -1177,39 +1179,34 @@ test "the mechanisms an authentication message offers" {
 fn t_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
   bytes_concat(byte_of_int(kind), counted(body))
 
-fn t_session() -> Session =
-  { conn: 1, buffer: b"", user: "ply", database: "ply", settings: [], status: Idle }
+fn t_session(conn: Int) -> Session =
+  { conn: conn, buffer: b"", user: "ply", database: "ply", settings: [], status: Idle }
 
 /// Simple queries over a scripted connection: each `recv` takes the next chunk, and once they run
 /// out the server has hung up.
 fn t_queries(
   chunks: List<Bytes>,
   sqls: List<String>,
-) -> List<Result<Reply, ClientError>> / {abort.raise, diverges} =
-  with_cell[inbox](chunks) { inbox ->
-    handle {
-      fold(
-        sqls,
-        { session: t_session(), answers: [] },
-        |acc: { session: Session, answers: List<Result<Reply, ClientError>> }, sql: String| {
-          let answer = simple_query[conn](acc.session, sql, default_client());
-          let next = match answer {
-            Ok(r) -> r.session,
-            Err(Rejected(s, _)) -> s,
-            Err(_) -> acc.session,
-          };
-          { session: next, answers: push(acc.answers, answer) }
-        },
-      ).answers
-    } with {
-      net.send[conn](c, payload, timeout_ms) -> Some(bytes_len(payload)),
-      net.recv[conn](c, max, timeout_ms) -> {
-        let queued = cell_get(inbox);
-        cell_set(inbox, match queued { [_, ..rest] -> rest, [] -> [] });
-        match queued { [first, ..] -> Some(first), [] -> Some(b"") }
+) -> List<Result<Reply, ClientError>> / {net::socket.refused, abort.raise, diverges} = {
+  let server = ip::socket_at(ip::loopback_v4(), 5432);
+  let scripted = net::mem_serving(net::mem_empty(), server, [
+    map(chunks, |chunk: Bytes| Says(chunk)),
+  ]);
+  net::on_mem(scripted, ||
+    fold(
+      sqls,
+      { session: t_session(net::dial_address[conn](server, [], 1000)), answers: [] },
+      |acc: { session: Session, answers: List<Result<Reply, ClientError>> }, sql: String| {
+        let answer = simple_query[conn](acc.session, sql, default_client());
+        let next = match answer {
+          Ok(r) -> r.session,
+          Err(Rejected(s, _)) -> s,
+          Err(_) -> acc.session,
+        };
+        { session: next, answers: push(acc.answers, answer) }
       },
-    }
-  }
+    ).answers).value
+}
 
 test "a refusal carries its SQLSTATE, the constraint it names and its detail" {
   let body = bytes_concat_all([

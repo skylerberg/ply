@@ -37,9 +37,10 @@
 #   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
 #   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
-#   ci-shards.sh rust-answered DIR
-#                                the filterset of the tests whose traces in DIR
-#                                still stand against this checkout
+#   ci-shards.sh rust-answered DIR OUT [SHARD]
+#                                a tool config at OUT leaving out the tests whose
+#                                traces in DIR still stand against this checkout,
+#                                and `<profile> <count>` of it
 #   ci-shards.sh rust-kept NEW JUNIT OUT
 #                                the traces in NEW of the tests JUNIT says passed,
 #                                copied into OUT
@@ -405,21 +406,34 @@ cmd_tree_check_filter() {
 cmd_gate_filter() { cmd_tree_check_filter; }
 
 # A Rust test is answered by its trace when nothing it read of the pack or the checkout has moved:
-# the trace store is keyed by the Rust key, so a test binary that changed answers nothing.
+# the trace store is keyed by the Rust key, so a test binary that changed answers nothing. The
+# answered tests are left out through a profile's `default-filter` in the tool config written to
+# OUT, never on the command line, where they outgrow the length of one argument: SHARD's profile
+# with its filter narrowed, or else `answered`. Prints `<profile> <tests answered>`.
 cmd_rust_answered() {
-  local dir=${1:?a directory of traces} pack=${PLY_PACK:-$root/target/debug/ply-pack} answered
+  local dir=${1:?a directory of traces} out=${2:?a tool config to write} shard=${3:-}
+  local pack=${PLY_PACK:-$root/target/debug/ply-pack} answered excluded count profile base
   answered=$([ -d "$dir" ] && (cd "$root" && "$pack" --answered "$dir") || true)
   if [ -z "$answered" ]; then
-    printf 'none()\n'
-    return 0
+    excluded='none()'
+    count=0
+  else
+    excluded=$(printf '%s\n' "$answered" | grouped_filter)
+    count=$(printf '%s\n' "$answered" | grep -c .)
   fi
-  local binary test first=1
-  while IFS=$'\t' read -r binary test; do
-    ((first)) || printf ' | '
-    first=0
-    printf '(binary_id(=%s) & test(=%s))' "$binary" "$test"
-  done <<< "$answered"
-  printf '\n'
+  if [ -n "$shard" ]; then
+    profile=$(sed -n 's/^\[profile\.\(shard[0-9]*\)\]$/\1/p' "$shard" | head -n 1)
+    base=$(sed -n "s/^default-filter = '''\(.*\)'''\$/\1/p" "$shard" | head -n 1)
+    if [ -z "$profile" ] || [ -z "$base" ]; then
+      echo "FAIL: $shard declares no shard profile with a default-filter" >&2
+      return 1
+    fi
+    printf "[profile.%s]\ndefault-filter = '''(%s) and not (%s)'''\n" "$profile" "$base" "$excluded" > "$out"
+  else
+    profile=answered
+    printf "[profile.%s]\ndefault-filter = '''not (%s)'''\n" "$profile" "$excluded" > "$out"
+  fi
+  printf '%s %s\n' "$profile" "$count"
 }
 
 # Only a pass is kept: a trace whose test failed, or that the report does not name, is dropped.
@@ -1664,7 +1678,7 @@ case "${1:-}" in
   corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
-  rust-answered) cmd_rust_answered "${2:-}" ;;
+  rust-answered) cmd_rust_answered "${2:-}" "${3:-}" "${4:-}" ;;
   rust-kept) cmd_rust_kept "${2:-}" "${3:-}" "${4:-}" ;;
   host-filter) cmd_host_filter ;;
   tree-checks) cmd_tree_checks ;;
