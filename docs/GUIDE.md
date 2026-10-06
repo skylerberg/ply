@@ -312,8 +312,9 @@ Loosest to tightest; all binary operators are left-associative:
   the functions it names (§4.4). They perform nothing and cannot raise, and a
   literal beside one is still an `Int`: `a + 1` is `E0201`.
 * Arithmetic is checked. A `/` or `%` whose divisor is zero raises (§6.8), so
-  either puts `abort.raise` in the row unless its divisor is a literal other
-  than zero or its operands are `Float`s. Overflow and a shift count that is
+  either puts `abort.raise` in the row unless its operands are `Float`s, its
+  divisor is a literal other than zero, or the conditions on the way to it show
+  an `Int` divisor is not zero. Overflow and a shift count that is
   negative or not less than the type's width are the machine's limit, as the
   call ceiling is: they end the run (`E0502`) and are in no row. `<<` discards
   shifted-out bits and `checked_*` answer `None` (§12).
@@ -656,6 +657,8 @@ point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `decimal_div`
 and `decimal_round` take the scale of their answer, and answer with exactly that
 many digits after the point, the exact value rounded once by the `Rounding`
 given; they raise where 96 bits do not hold the answer at that scale.
+`decimal_scale` reads the scale a value has, and a `decimal_round` to no more
+digits than that only drops digits, so it cannot raise.
 
 ### 4.2 Records and tuples
 
@@ -1003,10 +1006,34 @@ A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
 tagged literals with its own `Ok` (§2.3), each `E0118`; one that declares its
 own `Stop` loses `iterate`.
 
-**`Secret<a>`** is made by `secret_of_string` and observed only by
-`secret_verify`, `secret_is_empty` and `==`. It cannot be rendered, encoded or
-ordered, and reaches a host operation only if that operation's registration
-allows it (`E0439`).
+**`Secret<a>`** holds a credential, a `String` or `Bytes`, that nothing written
+in Ply reads. `secret_of_string` and `secret_of_bytes` seal a value the program
+already holds, and `config.secret` (`std.config`) answers one it never held.
+These make a secret of a secret without opening it: `secret_bytes` (a string's
+UTF-8), `secret_concat`, `secret_decode` (the bytes a secret text encodes in
+hex, base64 or base32, under the names `std.hex`, `std.base64` and `std.base32`
+give it), `secret_private_key` (the key a DER document holds) and the
+derivations `std.hash` names, `hkdf` and `pbkdf2`. None answers a part of a
+secret: a slice of one, compared with `==` against each of 256 guesses, would
+read it a byte at a time, so two keys out of one derivation are two `hkdf`
+calls under two `info`s.
+
+A secret is observed four ways: `==` and `!=` between two of them,
+`secret_verify` against a string, `secret_is_empty` and `secret_len`. A
+comparison takes time that follows the two lengths and never where the values
+first differ, and it says one thing, so a secret is read only by guessing it
+whole; a length is not kept secret. What a secret is used for is the runtime's
+to compute, in time that is no function of it: a MAC (`std.hash`), and a
+signature, a public key, a sealed or opened message and a key agreement
+(`std.crypto`). What those answer, a tag, a signature, a public key, is no
+secret: each is one-way in the key.
+
+A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
+a `forall`, and reaches a host operation only if that operation's registration
+allows it (`E0439`). The operations `ply` ships that take one are
+`std.password`'s, which hash a password and answer the hash, one-way in it; so
+a secret has no way out of a program: key material that is to be written down,
+as `ply keygen`'s is, is written by whoever drew it, before it is sealed.
 
 **`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
 branded by their region and cannot outlive it; the brand prints as
@@ -1630,7 +1657,9 @@ go anyway: `release` runs on what `acquire` answered when `body` returns, when a
 clause unwinds through it this way or a raise does (§6.8), and when its task is
 cancelled (§9), where the bracket stands and with the handlers around it. A `release` that fails
 replaces whatever was unwinding. A runtime failure ends the run, so nothing more
-runs then, `release` included. Nested brackets release innermost first. The body
+runs then, `release` included. Nested brackets release innermost first. A cancel
+takes no answer from an `acquire` and no wait from a `release`: it lands when
+that one returns (§9), so what was acquired is released, and wholly. The body
 is handed what `acquire` answered as it is, a value that may be kept past the
 release, and a continuation captured inside the body and resumed twice releases
 twice; `with_hold` (§7) is the bracket whose body cannot keep what it holds and
@@ -1699,16 +1728,74 @@ value it is given: `panic`, `assert` and `assert_eq`, a builtin outside what it
 is defined for (§12), a `/` or `%` by zero (§2.4), a `let` whose pattern misses
 (§5.1), an `iterate` past its budget, a `task.join` of a cancelled task, a
 `task.channel` of a negative capacity and a `random.below` of a bound below one
-(§9). What a literal argument settles does not raise: a divisor other than
-zero, a capacity or bound in range, and a narrowing such as `u8_of_int(200)` of
-a value its type holds. A signature that leaves `abort.raise` out of its row
-where its body can raise is `E0302`, which names the operation and offers the
-row to write. Overflow, the call ceiling and a spent step budget end the run
-whatever the row says. A clause for `abort.raise` is handed the message:
-`panic`'s argument, or what the run would otherwise have reported, a value it
-names told by its kind. Unanswered, it is `E0501` for an assertion and `E0502`
-for anything else. Nearly every body can raise it, so a `try` answers it only
-by name: `try[abort.raise] { body }`.
+(§9). A signature that leaves `abort.raise` out of its row where its body can
+raise is `E0302`, which names the operation and offers the row to write.
+Overflow, the call ceiling and a spent step budget end the run whatever the row
+says. A clause for `abort.raise` is handed the message: `panic`'s argument, or
+what the run would otherwise have reported, a value it names told by its kind.
+Unanswered, it is `E0501` for an assertion and `E0502` for anything else. A
+`try` answers it only by name: `try[abort.raise] { body }`.
+
+```ply
+fn peek(b: Bytes, i: Int) -> Int = if i < 0 || i >= bytes_len(b) { -1 } else { bytes_at(b, i) }
+
+fn hex(b: Bytes) -> String =
+  fold(range(0, bytes_len(b)), "", |acc: String, i: Int| {
+    let n = bytes_at(b, i);
+    acc ++ string_slice("0123456789abcdef", n / 16, n / 16 + 1)
+      ++ string_slice("0123456789abcdef", n % 16, n % 16 + 1)
+  })
+```
+
+A call that cannot fail where it stands adds no `abort.raise`, so neither of
+these writes a row. A builtin that can raise states where it cannot, as a
+`requires` over its parameters (`bytes_at`: `0 <= i && i < bytes_len(b)`), and
+a call adds no `abort.raise` when the conditions on the way to it show every
+clause; so does a `/` or `%` whose `Int` divisor they show is not zero, and a
+`task.channel` or `random.below` whose capacity or bound they show in range. A
+condition is one the body passed on its way to the call: an `if`, the left of
+`&&` (which held) or of `||` (which did not), a `match` arm's guard, a literal
+pattern an integer or a condition matched or an earlier arm's did not, a range
+pattern an integer matched (`b'0'..=b'9'` holds it between the two, and
+alternatives hold it between the least and the greatest of them), a list
+pattern of so many items, `list_at` or `array_at` answering `Some` in a `match`
+or a `let ... else`, and, inside a lambda `map`, `filter` or `fold` is handed
+beside a `range(lo, hi)`, that its last parameter lies in the range. A `let`
+of one name is what its value is, and a field read through records is one value
+wherever it is read.
+
+What is read is linear `Int` arithmetic: literals, bindings, fields, `+`, `-`,
+a product with a literal, and what a builtin answers, by its `ensures`
+(`bytes_at` answers `0..=255`, a length is not negative, `min` answers no more
+than either argument, `bytes_scan` answers between `from` and the end). A
+quotient or remainder by a literal, a value masked with `&`, an `|` or `^` of
+two values in `0..2^n`, a shift right by a literal and a remainder by a divisor
+held above zero are each bounded as the operator bounds them, so `n & 0xFF` and
+a byte's `n / 16` are in range for `byte_of_int` and for an index into sixteen
+digits. A string or bytes literal has the length it is written with. Nothing
+else is read: a call of a definition is a value nothing is known of, whatever
+its body, and a width other than `Int` is read only where `int_of_u8` and the
+like answer one. What a call that can raise ensures holds only past the call.
+
+The check is the checker's own and sees only the body it is in, so a row never
+depends on another body. It decides by elimination over the integers, within a
+bound; where a clause is not shown, by a miss of the method or because it does
+not hold, the call keeps its `abort.raise`, and nothing is refused. So an index
+loop that recurses on `i + 1` past `i >= bytes_len(b)` alone still raises, at
+a negative `i`: guard both ends, or fold over a `range`. A definition's own
+`requires` is not read (§10): it is not checked at its callers, so nothing in
+its body may lean on it.
+
+`ply check --types --explain` lists under a definition each place its body can
+raise `abort.raise` and why: the clause of a builtin's `requires` nothing on
+the way shows, a divisor not shown other than zero, a `let` that can miss, a
+builtin that states no `requires` (`panic`, `string_of_bytes`), a definition
+whose row names the raise (once, where it is first called), or a function
+value whose type does. A row that names a raise no place in the body makes
+prints as `declared, not performed`, and so does one whose only raise is the
+definition's own recursion; under `--json` each definition carries both, as
+`raises` (each with its `at`, `kind`, `why` and, for a builtin, `callee` and
+`requires`) and `declared_not_performed`.
 
 A `parallel` branch's raise is answered around the block. A task may raise:
 its raise goes to the task's own `handle`s and then to those around its
@@ -1769,7 +1856,9 @@ of its own. The region's row is `acquire`'s, `release`'s and the body's.
 `release` runs once, where the region stands and with the handlers around it,
 however the body ends: it returned; a raise, or a clause that did not resume,
 unwound through it (before the clause that answers the raise runs, §6.8); or
-its task was cancelled (§9). An `acquire` that raised holds nothing, so nothing
+its task was cancelled (§9). `acquire` and `release` are a bracket's (§6.6): a
+cancel takes no answer from the one and no wait from the other, so what was
+acquired is released. An `acquire` that raised holds nothing, so nothing
 is released; a `release` that raises replaces what was unwinding; holds nested
 in one another are let go innermost first; a runtime failure ends the run and
 releases nothing.
@@ -2063,7 +2152,9 @@ nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write channel<a>(capacity: Int) -> Chan<a>
                        write send<a>(c: Chan<a>, x: a) -> Bool
                        write recv<a>(c: Chan<a>) -> Option<a>
-                       write close<a>(c: Chan<a>) -> Unit }
+                       write close<a>(c: Chan<a>) -> Unit
+                       write select<a>(arms: List<(Chan<a>, Option<a>)>, wait: Bool)
+                         -> Option<(Int, Option<a>)> }
 nondet effect clock  { read  now() -> Instant
                        write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
@@ -2073,7 +2164,7 @@ effect sim           { read  seed() -> Int }
 
 * The region's row gains `sim.read`, which a deterministic test may carry.
 * Virtual time advances only when no task is enabled, so `clock.sleep` costs no
-  wall clock.
+  wall clock. Outside a region `task` and `clock` are the host's (§14).
 * A task performs against the handlers around its `task.spawn`, so a clause it
   reaches touches only the cells the task itself may (§7); a clause that binds
   `resume` is unreachable from a task (`E0502`), and a clause for a raise is
@@ -2081,7 +2172,8 @@ effect sim           { read  seed() -> Int }
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
   inside a value, or inside a closure that captured it. A closure's type shows a
   captured task only as the `task.join`, `task.await` or `task.cancel` in its
-  row, a captured channel as its `task.send`, `task.recv` or `task.close`, and
+  row, a captured channel as its `task.send`, `task.recv`, `task.close` or
+  `task.select`, and
   either as the `sim.read` of a `simulate` it opens to use one, so a function
   whose row carries any of these may not leave the region. A task or channel
   from outside may not come in either: the region may not name a binding from
@@ -2098,16 +2190,25 @@ effect sim           { read  seed() -> Int }
   scheduler sees nothing of it. A branch may not open a region (`E0309`): a
   region's schedule is drawn from its entry's seed in the order regions open.
 
-`task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
-it waits on is let go, and it performs nothing more but the `release` of each
-`bracket` it stands in (§6.6). When it next runs it only unwinds, releasing what
-it holds. The cancel answers `false` for a task that had
-already ended and leaves its answer alone. `task.await(t)` is a join that answers
-`Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
-cancelled task has nothing to answer and raises (§6.8). A task cannot cancel
-itself or the region's body. A deadline is the two together: one task sleeps and
-cancels the other, which a third awaits. Every step a cancelled task took is read
-against the cancel, so the search tries cancelling it earlier and later.
+`task.cancel(t)` stops `t` where it stands: a sleep, a join, a channel or a host
+operation it waits on is let go, an operation that was answered and that it has
+not yet run on loses its answer, and it performs nothing more but the `release`
+of each `bracket` it stands in (§6.6). When it next runs it only unwinds,
+releasing what it holds. A bracket is where an answer is kept. Inside an
+`acquire` a cancel lets go of a wait and takes no answer: the `acquire` runs on,
+an operation that answers at once still answering and one that would wait
+ending it, and the cancel lands when it returns, with what it answered released.
+Inside a `release` a cancel lets go of nothing, and lands when the `release`
+returns. The cancel answers `false` for a task that had already ended, whose
+answer it leaves alone, and for one a cancel has already reached. `task.await(t)`
+is a join that answers `Some` of what `t` answered, or `None` once it was
+cancelled; `task.join` of a cancelled task has nothing to answer and raises
+(§6.8). A task cannot cancel itself or the region's body. A deadline is the two
+together: one task sleeps and cancels the other, which a third awaits. A cancel
+is read against the step its task took last and each step the task takes after
+it, and a task cancelled before it ran takes a step that runs nothing, so the
+search tries the cancel a step earlier and a step later, and from each of those
+runs the next, until it has landed everywhere it could.
 
 `task.channel(n)` makes a channel holding up to `n` values no receiver has taken;
 `0` is a rendezvous, where a send waits for the receive that takes it. A send
@@ -2117,11 +2218,27 @@ sent. `task.close(c)` ends sending: a waiting receiver hears `None` and a waitin
 sender `false`, a later send answers `false` without sending, and receives take
 what was queued before the close, then `None`. Closing twice changes nothing,
 and a negative capacity raises (§6.8). Cancelling a task that waits on a
-channel lets go of its wait, and a value it was sending is dropped. Every
+channel lets go of its wait, and a value it was sending is dropped; a value a
+receive was answered goes with a receiver cancelled before it ran on it, unless
+the receive is a bracket's `acquire`. Every
 operation on one channel is ordered against every other on it, so the search
 tries each order two senders or two receivers could take. A race is one channel:
 each worker sends what it answers, the first receive wins, and cancelling the
 others stops them.
+
+`task.select(arms, wait)` goes on one of several channel operations. An arm is a
+channel beside `None`, to receive from it, or `Some(x)`, to send `x` to it. The
+first arm, in the order given, that can go without waiting goes, and the select
+answers `Some((i, got))`: the arm's index, and `Some` of the value it received
+or sent, or `None` where its channel was closed, a receive finding it closed and
+empty and a send being refused. When no arm can go, `wait: false` answers `None`
+at once, and `wait: true` waits on every arm, standing in each channel's queue
+where a send or a receive would, and goes on the first another task makes ready,
+leaving the others as if it had not waited. The order of the arms is the only
+priority, so a caller that wants a later arm to have its turn rotates them, as
+`std.chan` does. The arms carry one type: channels of different types are
+selected over as channels of one sum. A select is ordered against every
+operation on each of its arms' channels.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -2499,13 +2616,33 @@ written in, and the six the wrapping and saturating operators are written in
 its range, so with `numeric_of_int` it converts between any two.
 `ply doc prelude` lists them all, each with the summary of
 its doc, and `ply doc NAME` prints one: its signature with the parameters' names,
-and its doc.
+its doc, and its clauses.
+
+A builtin whose row names `abort.raise` may state a `requires`: a condition on
+its arguments under which a call cannot raise. For most it is the whole of where
+one cannot; `decimal_round`'s is the part arithmetic can say, since past it a
+call raises only where the zeros it fills do not fit. A call that shows the
+clause adds no `abort.raise` (§6.8). An `ensures` says
+what a call answers, as `result`, which is what the checker knows of that value
+when it reads a later clause. One with no `requires` raises on something its
+arguments' values do not say in arithmetic: `panic`, a failed `assert`,
+`string_of_bytes` of bytes that are not UTF-8, `string_find` of an absent
+needle, an `iterate` past its budget, `int_of_u64` of a value past an `Int`.
+
+```
+   bytes_at(b: Bytes, i: Int) -> Int / {abort.raise}
+      `0..=255`; raises out of range.
+      requires 0 <= i && i < bytes_len(b)
+      ensures 0 <= result && result <= 255
+```
 
 ## 13. The standard library
 
 The built-in package, shipped inside `ply` and pre-seeded for every load — an
 implicit dependency of every package, no declaration needed: `import
-std.<name>`. Its tests and obligations are skipped unless you pass `--std`.
+std.<name>`. Its tests and obligations are no project's: `ply test`, `ply prove`
+and `ply review` skip them unless you pass `--std`, which adds those of every
+module `ply std` lists, whichever of them the project imports.
 Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
 publishes, `ply doc std.json.parse` one definition, `ply doc fs.read_at` one
@@ -2521,7 +2658,8 @@ counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
 `show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
 function it reaches is read with what its specifications name (§10), which a
-dependent's proof is owed; `--std` reads each one whole.
+dependent's proof is owed; `--std` reads every module of the library, each one
+whole.
 
 ## 14. The host boundary
 
@@ -2529,8 +2667,9 @@ Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound
 nondeterministic handler is cached with what it read and the binding it ran
 under (§8.2), so its pass never answers for a hermetic run; one that reaches only
-deterministic handlers, whose answers are a function of what they are handed, is
-cached like any other. An operation performed inside a `simulate`
+deterministic handlers, whose answers are a function of what they are handed, as
+`std.password`'s hashes are, is cached like any other. An operation performed
+inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
@@ -2538,13 +2677,26 @@ test run binds `process.bound`, `process.spawn`, `process.start` and the
 operations on a started child, which reach only the programs `--exec` names. All
 flags below require `--host`.
 
+Outside a `simulate` region, `--host` answers the language's `task` and `clock`
+as well. Tasks run in turn on the thread that spawned them, and one that waits,
+on a join, a channel, a host operation or a sleep, is parked alone while the
+others run. `clock.now` reads the run's monotonic clock, in nanoseconds since
+the run began, and `clock.sleep` is a deadline on it: the task wakes once the
+clock has reached it, and a cancel lets go of the sleep as it does in a region
+(§9), so a deadline one task holds another to fires while the rest of the
+program works. `std.time`'s `time.sleep_ms` is the thread's wait instead, and
+every task waits with it.
+
 `ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
 operation and label some row of the program names, where a written mode atom
 names every operation of its mode) with its handler, determinism,
 `at-most-once`/`repeatable`, blocking and `Secret` permission, plus the run's
 TLS, filesystem, database, configuration, tracing and shutdown settings;
-`--digest` prints one `b3:` line. A handler for something undeclared is `E0421`,
-two for one atom `E0422`, and a determinism mismatch `E0423`.
+`--digest` prints one `b3:` line. A handler for an effect the program does not
+declare, or for a resource it never performs, is `E0421`, two for one atom
+`E0422`, and a determinism mismatch `E0423`. A handler for an operation the
+program's own declaration of the effect lacks binds nothing: the program was
+checked against that declaration, so it performs none of it.
 
 | flag | meaning |
 | --- | --- |
@@ -2728,7 +2880,8 @@ $ ply build . -o app.plyx --verify             # compare, write nothing
 `ply keygen PATH` writes an Ed25519 key pair (`std.ed25519`): the secret key at `PATH`,
 readable by its owner alone, and the public key at `PATH.pub`, each one line
 naming what it holds and 64 hex digits. It never writes over a file, and a key
-file that cannot be read, decoded or written is `E0462`.
+file that cannot be read, decoded or written is `E0462`. A secret key read back
+from its file is a `Secret` (§4.6) from then on.
 
 `ply build --sign KEY` signs what it writes, a program or a library, in
 `<artifact>.sig` beside it. A signature is detached, so the artifact's digest
@@ -2777,7 +2930,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets and provenance), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, and the modules a compiled package stood for; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
@@ -2801,7 +2954,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; the runnable's unit holds what the program reaches of the files its modules embed, a shipped module's data among them, so a binary that enters it reads none; the digest covers every data file the binary ships, and the report says how many bytes the modules embed; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; the runnable's unit holds what the program reaches of the files its modules embed, a shipped module's data among them, so a binary that enters it reads none, and the value of each `const fn` the program holds (§3.5), evaluated as `ply build` evaluates them; the digest covers every data file the binary ships, and the report says how many bytes the modules embed; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 

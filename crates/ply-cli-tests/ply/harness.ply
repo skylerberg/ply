@@ -24,7 +24,7 @@ import cli.tester (tester, hermetic_tester)
 import std.bytes (hex_of)
 import std.config (config)
 import std.fs
-import std.fs (fs, MemFs, Entry, File)
+import std.fs (fs, MemFs, Entry, File, Seen)
 import std.json
 import std.json (Json, Null, Number, Str, Array, Object)
 import std.list (sort_by, concat, contains)
@@ -210,6 +210,10 @@ pub fn copy_from_repo(from: String, to: String) -> Unit / {Here, Repo, abort.rai
 
 /// The repository's examples, each file by its path below `examples/`.
 pub fn example_files() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../../examples")
+
+/// The language corpus, each file by its path below `tests/lang/`. Embedded, so a test over it is
+/// cached until a file in it changes.
+pub fn lang_corpus() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../../tests/lang")
 
 /// What `embed_dir` read, as sources under `dir`.
 pub fn embedded(
@@ -566,6 +570,10 @@ pub fn over_tree<a | e>(
         cell_set(disk, c.fs);
         c.bytes
       };
+      let linked = |l: fs::Linked| {
+        cell_set(disk, l.fs);
+        l.done
+      };
       handle {
         let value = body();
         { value: value, tree: cell_get(disk) }
@@ -607,8 +615,8 @@ pub fn over_tree<a | e>(
         fs.walk[abs](p) -> fs::mem_walk(cell_get(disk), p),
         fs.append[cwd](p, body) -> appended(fs::mem_append(cell_get(disk), in_w(p), body)),
         fs.append[abs](p, body) -> appended(fs::mem_append(cell_get(disk), p, body)),
-        fs.sync[cwd](p) -> fs::mem_sync(cell_get(disk), in_w(p)),
-        fs.sync[abs](p) -> fs::mem_sync(cell_get(disk), p),
+        fs.sync[cwd](p) -> kept(fs::mem_sync(cell_get(disk), in_w(p))),
+        fs.sync[abs](p) -> kept(fs::mem_sync(cell_get(disk), p)),
         fs.lock[cwd](p) -> kept(fs::mem_lock(cell_get(disk), in_w(p))),
         fs.lock[abs](p) -> kept(fs::mem_lock(cell_get(disk), p)),
         fs.unlock[cwd](p) -> kept(fs::mem_unlock(cell_get(disk), in_w(p))),
@@ -634,6 +642,17 @@ pub fn over_tree<a | e>(
         fs.write_chunk[abs](file, body) -> kept(fs::mem_write_chunk(cell_get(disk), file, body)),
         fs.close[cwd](file) -> kept(fs::mem_close(cell_get(disk), file)),
         fs.close[abs](file) -> kept(fs::mem_close(cell_get(disk), file)),
+        fs.stat[cwd](p) -> fs::mem_stat(cell_get(disk), in_w(p)),
+        fs.stat[abs](p) -> fs::mem_stat(cell_get(disk), p),
+        fs.scan[cwd](p, deep) -> match fs::mem_scan(cell_get(disk), in_w(p), deep) {
+          Some(seen) -> Some(map(seen, |s: Seen| { ..s, path: out_of_w(s.path) })),
+          None -> None,
+        },
+        fs.scan[abs](p, deep) -> fs::mem_scan(cell_get(disk), p, deep),
+        fs.space[cwd](p) -> fs::mem_space(cell_get(disk), in_w(p)),
+        fs.space[abs](p) -> fs::mem_space(cell_get(disk), p),
+        fs.link[cwd](p, to) -> linked(fs::mem_link(cell_get(disk), in_w(p), in_w(to))),
+        fs.link[abs](p, to) -> linked(fs::mem_link(cell_get(disk), p, to)),
         entropy.next() -> {
           let n = cell_get(drawn);
           cell_set(drawn, n + 1);
@@ -749,11 +768,20 @@ pub fn on_disk_shipping(
   shipped: List<Source>,
 ) -> Ran / {Reached, Shipped, abort.raise, diverges} = on_disk_over(argv, [], None, shipped)
 
+/// `ply` handed `shipped` as every module it ships and every data file one of them embeds: what a
+/// compiler that shipped those and no other would have run, so a run over all of them costs what
+/// they cost.
+pub fn on_disk_shipping_only(
+  argv: List<String>,
+  shipped: List<Source>,
+) -> Ran / {Reached, Shipped, abort.raise, diverges} = on_disk_over(argv, [], None, shipped, true)
+
 fn on_disk_over(
   argv: List<String>,
   vars: List<Var>,
   stdin: Option<String>,
   shipped: List<Source>,
+  only: Bool = false,
 ) -> Ran / {Reached, Shipped, abort.raise, diverges} = {
   // Tests share the machine they are lent, so a command starts and ends with the label empty.
   machine.drop[run]();
@@ -782,7 +810,14 @@ fn on_disk_over(
         cell_set(io, read.captured);
         read.line
       },
-      fs.list_dir[shipped](_) -> shipped_names_with(shipped),
+      fs.list_dir[shipped](_) -> if only {
+        Some(
+          map(
+            filter(shipped, |source: Source| !string_contains(source.path, "/")),
+            |source: Source| source.path,
+          ),
+        )
+      } else { shipped_names_with(shipped) },
       fs.read_file[shipped](name) -> match filter(shipped, |source: Source| source.path == name) {
         [source, ..] -> Some(bytes_of_string(source.text)),
         [] -> shipped_file(name),

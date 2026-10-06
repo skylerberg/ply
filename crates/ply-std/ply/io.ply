@@ -19,9 +19,10 @@
 //! `fs::mem_short_reads` it is handed the short reads a file on a disk seldom gives.
 
 import std.fs
-import std.fs (fs, Refused, ToRead, ToWrite, ToAppend)
+import std.fs (fs, files, Refused, ToRead, ToWrite, ToAppend)
 import std.laws (agrees)
 import std.list (at, concat, take)
+import std.random (entropy, rand, with_rand)
 import std.seq
 import std.seq (Seq, seq)
 
@@ -89,6 +90,35 @@ fn written_through<[l]>(file: Int) -> Sink<| {fs.write_chunk[l], fs.close[l]}> =
       ()
     },
   }
+
+/// `body` writing the file at `path` under the root `l` through a sink, whole or not at all, as
+/// `fs::write_atomic` writes one from bytes it holds: what `body` writes goes to a temporary file
+/// beside the path, and once `body` answers the temporary is renamed over it, so a file of any
+/// size is replaced in the memory of one chunk. A raise that unwinds through `body`, or its task's
+/// cancelling, removes the temporary and leaves the path holding what it held. `durability` and
+/// `mode` are `fs::commit_atomic`'s.
+///
+/// The sink is handed to `body` as a value, which a hold of this function's own could not be: its
+/// `close` does nothing, so `body` writes through its `push`, or holds it itself,
+/// `with_hold[out](sink, shut_sink) { .. }`, to write with `write` and `copy`. Once `body` has
+/// answered the sink takes nothing more.
+pub fn replacing<a, [l] | e>(
+  path: String,
+  durability: fs::Durability,
+  mode: Option<fs::Mode>,
+  body: (Sink<| {fs.write_chunk[l]}>) -> a / e,
+) -> a / {fs.open[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.refused, entropy.next, abort.raise | e} =
+  with_hold[pending](fs::begin_atomic[l](path), |p: fs::Pending|
+    fs::abandon_atomic[l](p)) { held -> {
+    let p = hold_get(held);
+    let value = body(unclosed[l](p.file));
+    fs::commit_atomic[l](p, mode, durability);
+    value
+  } }
+
+/// A sink on a descriptor that something else closes.
+fn unclosed<[l]>(file: Int) -> Sink<| {fs.write_chunk[l]}> =
+  { push: |bytes: Bytes| fs.write_chunk[l](file, bytes), close: || () }
 
 /// Lets a source go: what a `with_hold` over one releases it with.
 pub fn shut<| e>(source: Source<| e>) -> Unit / e = (source.close)()
@@ -453,4 +483,43 @@ test "a sequence over a source reads as it is pulled, and a budget of one pull r
   // The pull past the budget read `thre` to learn the sequence had not ended.
   assert_eq(over.value.spent, Err(1));
   assert_eq(over.value.left, b"e")
+}
+
+test "a file replaced through a sink holds what it held until its body answers, and then every chunk" {
+  let over = fs::on_mem[data](tree(), ||
+    with_rand(rand(0), ||
+      replacing[data](
+        "notes/poem.txt",
+        fs::Durable,
+        None,
+        |sink: Sink<| {fs.write_chunk[data]}>|
+          with_hold[out](
+            sink,
+            shut_sink,
+          ) { out -> {
+            write(out, b"uno\n");
+            let during = fs.read_file[data]("notes/poem.txt");
+            write(out, b"dos");
+            during
+          } },
+      )).value);
+  assert_eq(over.value, Some(b"one\ntwo\nthree"));
+  assert_eq(fs::mem_read(over.tree, "notes/poem.txt"), Some(b"uno\ndos"));
+  assert_eq(fs::mem_list(over.tree, "notes"), Some(["poem.txt"]));
+  assert_eq(map_len(over.tree.opened), 0)
+}
+
+test "a body that raises leaves the file it was replacing as it was, and no temporary beside it" {
+  let over = fs::on_mem[data](tree(), ||
+    with_rand(rand(0), || {
+      let wrote: Result<Unit, Int> = try[io.too_long] {
+        replacing[data]("notes/poem.txt", fs::Fast, None, |sink: Sink<| {fs.write_chunk[data]}>|
+          if (sink.push)(b"half") { io.too_long(4) } else { () })
+      };
+      wrote
+    }).value);
+  assert_eq(over.value, Err(4));
+  assert_eq(fs::mem_read(over.tree, "notes/poem.txt"), Some(b"one\ntwo\nthree"));
+  assert_eq(fs::mem_list(over.tree, "notes"), Some(["poem.txt"]));
+  assert_eq(map_len(over.tree.opened), 0)
 }

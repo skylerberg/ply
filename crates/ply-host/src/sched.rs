@@ -41,6 +41,7 @@ fn path_of(op: &str) -> &'static str {
         "send" => "ply_host::sched::send",
         "recv" => "ply_host::sched::recv",
         "close" => "ply_host::sched::close",
+        "select" => "ply_host::sched::select",
         _ => "ply_host::sched::yield",
     }
 }
