@@ -3,8 +3,8 @@
 
 import harness (scratch, Ran, Source, project, program, write, read, shipped_sources, in_memory,
                 one, tree, on_disk, warm_agrees, seeding, said, stdout, stderr, json_of, at, path,
-                nth, items, first, str, int, truth, shown, Hermetic, Reached, Repo, Shipped,
-                inspected, reader_source, repo_file, std_tree, std_data, on_disk_shipping,
+                nth, items, first, str, int, truth, shown, Hermetic, Reached, Shipped, inspected,
+                reader_source, std_tree, std_data, on_disk_shipping, on_disk_shipping_only,
                 over_tree, spawned, assert_ok, codes)
 import compiler.front (shipped_data_wanted)
 import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, ISchema, OpDef, TDAlias,
@@ -12,7 +12,6 @@ import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, ISchema, Op
 import compiler.lexer (lex, Identifier, Token)
 import compiler.parsing (Doc, Ident)
 import compiler.type_syntax (TypeExpr, TRecord)
-import compiler.unit (shipped)
 import std.fs (MemFs)
 import std.json (Json, Null)
 import std.json
@@ -336,25 +335,85 @@ test "renaming a project definition that calls std moves no hash" {
   assert(tests_hashed(before) == tests_hashed(after), Some("a test re-runs"))
 }
 
-test "a shipped module's tests are not a project's" {
+/// A standard library of two modules, each stating a test and a law, and the data file one of them
+/// embeds: a compiler that shipped only these runs every one of them in the time two modules take.
+fn two_shipped() -> List<Source> =
+  [
+    {
+      path: "std.idle.ply",
+      text:
+        \\//! A module no program here imports, and the file beside it.
+        \\
+        \\/// Twice `n`.
+        \\pub fn twice(n: Int) -> Int ensures result == n + n = n * 2
+        \\
+        \\/// What the file beside this module holds.
+        \\pub fn words() -> Bytes = embed("idle/words.txt")
+        \\
+        \\test "twice two is four" { assert_eq(twice(2), 4) }
+        \\
+        \\test "the words are the file's" { assert_eq(words(), b"one\n") }
+        \\
+        \\law "twice is a sum" forall (n: Int) where n > 0 && n < 9 { twice(n) == n + n }
+        \\
+    },
+    { path: "std/idle/words.txt", text: "one\n" },
+    {
+      path: "std.kept.ply",
+      text:
+        \\//! A module the program imports.
+        \\
+        \\/// One.
+        \\pub fn one() -> Int = 1
+        \\
+        \\test "one is one" { assert_eq(one(), 1) }
+        \\
+        \\law "one is the least of them" forall (n: Int) where n > 0 && n < 9 { one() <= n }
+        \\
+    },
+  ]
+
+/// A program that imports `std.kept` of `two_shipped` and states a test and a claim of its own.
+fn keeping() -> String =
+  \\import std.kept
+  \\
+  \\pub fn held(n: Int) -> Int ensures result == n + 1 = n + kept::one()
+  \\
+  \\test "mine" { assert_eq(held(1), 2) }
+  \\
+
+// CI runs the standard library's own tests as `ply test --std` over a project that imports a few of
+// its modules: every shipped module's are in the run, whatever the project imports.
+test "a shipped module's tests are not a project's, and `--std` runs every shipped module's" {
   scratch(|| {
-    let shipped = fold(
-      items(at(json_of(in_memory(app(importer()), ["std", "--json"])), "modules")),
-      0,
-      |n: Int, m: Json| if str(at(m, "module")) == "std.net" { int(at(m, "tests")) } else { n },
+    let listed = items(
+      at(json_of(on_disk_shipping_only(["std", "--json"], two_shipped())), "modules"),
     );
-    assert(shipped > 0, Some("the fixture needs a shipped test to hide"));
-    program(importer());
-    let v = json_of(on_disk(["test", "--json"]));
+    assert_eq(map(listed, |m: Json| str(at(m, "module"))), ["std.idle", "std.kept"]);
+    let shipped = fold(listed, 0, |n: Int, m: Json| n + int(at(m, "tests")));
+    assert(shipped == 3, Some("the fixture ships three tests to hide"));
+    program(keeping());
+    let v = json_of(on_disk_shipping_only(["test", "--json"], two_shipped()));
     assert(int(path(v, ["selection", "total"])) == 1, Some(shown(v)));
     // A shipped test was never in this project's denominator, so it is not "filtered out" either.
     assert(int(path(v, ["selection", "filtered_out"])) == 0, Some(shown(v)));
-    let all = json_of(on_disk(["test", "--std", "--json"]));
+    let all = json_of(on_disk_shipping_only(["test", "--std", "--json"], two_shipped()));
     assert(int(path(all, ["selection", "total"])) == 1 + shipped, Some(shown(all)));
     assert(int(at(all, "exit_code")) == 0, Some(shown(all)));
-    // The run wrote nothing about the shipped test, so `--std` still has work to do.
+    // The run wrote nothing about the shipped tests, so `--std` still has work to do.
     assert(int(path(all, ["selection", "cached"])) == 1, Some(shown(all)));
-    assert(int(path(all, ["selection", "selected"])) == shipped, Some(shown(all)))
+    assert(int(path(all, ["selection", "selected"])) == shipped, Some(shown(all)));
+    // Nothing imports `std.idle`: its tests are in the run, the one that reads its data file too.
+    assert_eq(sort(map(items(path(all, ["selection", "tests"])), |t: Json| str(at(t, "key")))), [
+      "m.mine",
+      "std.idle.the words are the file's",
+      "std.idle.twice two is four",
+      "std.kept.one is one",
+    ]);
+    // Run once, every one of them is answered by its own pass.
+    let again = json_of(on_disk_shipping_only(["test", "--std", "--json"], two_shipped()));
+    assert(int(path(again, ["selection", "cached"])) == 1 + shipped, Some(shown(again)));
+    assert(int(path(again, ["selection", "by_code"])) == 0, Some(shown(again)))
   })
 }
 
@@ -531,28 +590,6 @@ test "programs that reach different functions of one shipped module share what a
   })
 }
 
-// CI runs the standard library's own tests and laws as `ply test --std` and `ply prove --std` over
-// the corpus program that imports every module of it, each answered by its own key.
-test/nondet "the corpus program that runs the standard library's own tests imports every module" {
-  let imported = sort(
-    fold(
-      string::split(repo_file("crates/ply-corpus/stdlib/stdlib.ply"), "\n"),
-      [],
-      |acc: List<String>, line: String|
-        if string_starts_with(line, "import ") {
-          push(acc, string_slice(line, 7, string_len(line)))
-        } else { acc },
-    ),
-  );
-  let shipped_std = sort(filter(shipped.names(), |n: String| string_starts_with(n, "std.")));
-  assert(
-    imported == shipped_std,
-    Some("imported: " ++ shown_names(imported) ++ "\nshipped: " ++ shown_names(shipped_std)),
-  )
-}
-
-fn shown_names(names: List<String>) -> String = string::join(names, " ")
-
 /// Words a shell reads into, or takes for its own where a command's name stands.
 fn hostile_words() -> List<String> =
   [
@@ -616,18 +653,26 @@ test/nondet "sh reads back every word std.text quotes for it, and takes none for
   )
 }
 
-test "a shipped module's laws are not a project's" {
+// And its laws as `ply prove --std` over the same project.
+test "a shipped module's laws are not a project's, and `--std` proves every shipped module's" {
   scratch(|| {
-    program("import std.json\npub fn twice(n: Int) -> Int ensures result == n + n = n * 2\n");
-    let mine = json_of(on_disk(["prove", "--json"]));
-    let all = json_of(on_disk(["prove", "--std", "--json"]));
+    program(keeping());
+    let mine = json_of(on_disk_shipping_only(["prove", "--json"], two_shipped()));
+    let all = json_of(on_disk_shipping_only(["prove", "--std", "--json"], two_shipped()));
     assert(int(at(mine, "exit_code")) == 0, Some(shown(mine)));
-    let owners = map(items(at(mine, "obligations")), |o: Json| str(at(o, "owner")));
-    assert(owners == ["app.twice"] || owners == ["m.twice"], Some(shown(mine)));
-    assert(len(items(at(all, "obligations"))) > len(owners), Some("`--std` adds nothing"));
+    assert(int(at(all, "exit_code")) == 0, Some(shown(all)));
+    let owed = |v: Json, module: String|
+      len(
+        filter(items(at(v, "obligations")), |o: Json|
+          string_starts_with(str(at(o, "owner")), module ++ ".")),
+      );
+    assert(owed(mine, "m") == 1 && owed(mine, "std") == 0, Some(shown(mine)));
+    assert(owed(all, "m") == 1 && owed(all, "std.kept") == 1, Some(shown(all)));
+    // Nothing imports `std.idle`, and its claim and its law are owed all the same.
+    assert(owed(all, "std.idle") == 2, Some(shown(all)));
     // The coverage denominator is the project's definitions, not the stdlib's.
     assert(int(path(mine, ["coverage", "definitions"])) == 1, Some(shown(mine)));
-    assert(int(path(all, ["coverage", "definitions"])) > 100, Some(shown(at(all, "coverage"))))
+    assert(int(path(all, ["coverage", "definitions"])) == 4, Some(shown(at(all, "coverage"))))
   })
 }
 
