@@ -53,6 +53,35 @@ impl ShutdownSignal {
     }
 }
 
+/// A signal a program asks about. Asking is what installs its handler: one nobody asked about
+/// does what the platform does with it, which for all but `WindowChange` is to end the process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Asked {
+    Hangup,
+    User1,
+    User2,
+    WindowChange,
+}
+
+impl Asked {
+    pub fn name(self) -> &'static str {
+        match self {
+            Asked::Hangup => "HUP",
+            Asked::User1 => "USR1",
+            Asked::User2 => "USR2",
+            Asked::WindowChange => "WINCH",
+        }
+    }
+}
+
+/// One signal a program may ask about: whether its handler is installed, and whether it has
+/// arrived since it was last asked about.
+#[derive(Default)]
+struct Watch {
+    installed: Mutex<bool>,
+    arrived: Arc<AtomicBool>,
+}
+
 /// `--drain-lead-ms` and `--drain-ms`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Bounds {
@@ -106,6 +135,8 @@ pub struct Shutdown {
     net: Mutex<Option<Arc<dyn Accepting>>>,
     /// Weak, so the children still go when their host does.
     children: Mutex<Option<Weak<Children>>>,
+    /// Indexed by [`Asked`].
+    watches: [Watch; 4],
 }
 
 impl Shutdown {
@@ -120,7 +151,20 @@ impl Shutdown {
             signals: signals_of_this_platform(),
             net: Mutex::new(None),
             children: Mutex::new(None),
+            watches: Default::default(),
         })
+    }
+
+    /// Whether `which` has arrived since it was last asked about, however many times it did:
+    /// arrivals are not counted. The first ask installs the handler and answers `false`.
+    pub fn arrived(&self, which: Asked) -> std::io::Result<bool> {
+        let watch = &self.watches[which as usize];
+        let mut installed = lock(&watch.installed);
+        if !*installed {
+            watch_for(which, Arc::clone(&watch.arrived))?;
+            *installed = true;
+        }
+        Ok(watch.arrived.swap(false, Ordering::AcqRel))
     }
 
     pub fn bounds(&self) -> Bounds {
@@ -355,6 +399,60 @@ fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
     });
 }
 
+/// Installs the handler for `which` before it returns, on a thread of its own that marks each
+/// arrival.
+#[cfg(unix)]
+fn watch_for(which: Asked, arrived: Arc<AtomicBool>) -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (installed, told) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name(format!("ply-host-signal-{}", which.name().to_lowercase()))
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    let _ = installed.send(Err(e));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let kind = match which {
+                    Asked::Hangup => SignalKind::hangup(),
+                    Asked::User1 => SignalKind::user_defined1(),
+                    Asked::User2 => SignalKind::user_defined2(),
+                    Asked::WindowChange => SignalKind::window_change(),
+                };
+                let mut stream = match signal(kind) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let _ = installed.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = installed.send(Ok(()));
+                while stream.recv().await.is_some() {
+                    arrived.store(true, Ordering::Release);
+                }
+            });
+        })?;
+    told.recv().unwrap_or_else(|_| {
+        Err(std::io::Error::other(
+            "the thread that listens for it ended before it listened",
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn watch_for(which: Asked, _: Arc<AtomicBool>) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("this platform has no SIG{}", which.name()),
+    ))
+}
+
 fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
     let connections = lock(&shutdown.net)
         .as_ref()
@@ -364,6 +462,7 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
         if connections == 1 { "" } else { "s" },
     );
     shutdown.end_children();
+    crate::stdio::settle();
     crate::observe::exiting();
     std::process::exit(which.exit_code());
 }
@@ -395,16 +494,35 @@ operations! {
     path "signal";
     Stopping = "stopping",
     DeadlineMs = "deadline_ms",
+    Hangup = "hangup",
+    User1 = "user1",
+    User2 = "user2",
+    Resized = "resized",
 }
 
 impl Op {
+    /// The signal an operation asks about, which the stop's two readings do not.
+    pub fn asks(self) -> Option<Asked> {
+        match self {
+            Op::Stopping | Op::DeadlineMs => None,
+            Op::Hangup => Some(Asked::Hangup),
+            Op::User1 => Some(Asked::User1),
+            Op::User2 => Some(Asked::User2),
+            Op::Resized => Some(Asked::WindowChange),
+        }
+    }
+
     pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            linearity: Linearity::Repeatable,
+            // An ask takes the arrival it answers, so a second one answers otherwise.
+            linearity: match self.asks() {
+                None => Linearity::Repeatable,
+                Some(_) => Linearity::AtMostOnce,
+            },
             blocking: false,
             secrets: false,
             path: self.path(),
@@ -435,11 +553,26 @@ impl HostHandler for Operation {
             .note("`ply test` registers `signal` withheld, and a withheld registration is in no binding index")
             .note("this is a defect in Ply's host dispatch rather than in the program"));
         };
-        Ok(HostAnswer::Value(match self.op {
-            Op::Stopping => Value::Bool(shutdown.stopping()),
-            Op::DeadlineMs => Value::Int(shutdown.deadline_ms()),
+        Ok(HostAnswer::Value(match (self.op, self.op.asks()) {
+            (_, Some(which)) => Value::Bool(
+                shutdown
+                    .arrived(which)
+                    .map_err(|e| unheard(self.op, which, &e, req.span))?,
+            ),
+            (Op::DeadlineMs, None) => Value::Int(shutdown.deadline_ms()),
+            (_, None) => Value::Bool(shutdown.stopping()),
         }))
     }
+}
+
+#[cold]
+fn unheard(op: Op, which: Asked, e: &std::io::Error, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("{} could not listen for SIG{}: {e}", op.what(), which.name()),
+    )
+    .primary(span, "asking about a signal installs its handler")
+    .note("without the handler the signal would do what the platform does with it, so the ask is refused rather than answered `false`")
 }
 
 #[cold]

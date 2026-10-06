@@ -190,6 +190,12 @@ pub trait HostRuntime {
     fn shutdown(&self) -> ShutdownReport {
         ShutdownReport::default()
     }
+
+    /// Called with a raise no clause answers, before the entry fails with it: a host whose own
+    /// the raise is may end the run its way here and never return.
+    fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+        let _ = (effect, op);
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]

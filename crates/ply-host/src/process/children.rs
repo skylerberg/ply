@@ -42,6 +42,9 @@ pub enum Signal {
     Interrupt,
     Terminate,
     Kill,
+    User1,
+    User2,
+    WindowChange,
 }
 
 /// What one `process.start` asked for, with the executable its label resolved to.
@@ -513,7 +516,7 @@ fn text_of(line: &[u8]) -> String {
 
 /// A sink that refuses a line has nowhere else to put it, and the child is not the one to tell.
 fn forward(sink: &OutputSink, to: Stream, line: &[u8]) {
-    let _ = sink.write(to, &text_of(line));
+    let _ = sink.line(to, &text_of(line));
 }
 
 struct Destination {
@@ -686,6 +689,9 @@ fn deliver(_: &mut std::process::Child, pid: u32, signal: Signal) -> std::io::Re
         Signal::Interrupt => libc::SIGINT,
         Signal::Terminate => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
+        Signal::User1 => libc::SIGUSR1,
+        Signal::User2 => libc::SIGUSR2,
+        Signal::WindowChange => libc::SIGWINCH,
     };
     // SAFETY: a plain system call; the child is unreaped, so its pid names no other process.
     if unsafe { libc::kill(pid as libc::pid_t, number) } == 0 {

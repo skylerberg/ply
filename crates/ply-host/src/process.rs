@@ -6,6 +6,7 @@ mod children;
 pub(crate) use children::{Children, Io, Output, Signal};
 
 use crate::pool::{Bell, Finished, Inbox, JobOutput, PROCESS_FIRST_TOKEN, Pool};
+use crate::stdio;
 use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::{HostRegistry, MachineId};
 use ply_eval::{
@@ -13,7 +14,6 @@ use ply_eval::{
     HostRuntime, Linearity, Pending, Plain, Resource, Span, Symbol, Value, codes, slot,
 };
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 pub const MODULE: &str = "std.process";
 
 pub const EFFECT: &str = "std.process.process";
+
+/// The effect whose raise says a standard stream's reader went away, and that raise.
+pub const PIPE_EFFECT: &str = "std.process.pipe";
+pub const PIPE_BROKEN: &str = "broken";
 
 /// What `process.exit` accepts; above it the shell reports a signal or its own failure.
 pub const EXIT_RANGE: RangeInclusive<i64> = 0..=125;
@@ -42,7 +46,7 @@ pub enum OutputSink {
     Real {
         out: Stream,
     },
-    Captured(Mutex<Vec<(Stream, String)>>),
+    Captured(Mutex<Vec<(Stream, Vec<u8>)>>),
 }
 
 impl OutputSink {
@@ -50,30 +54,51 @@ impl OutputSink {
         OutputSink::Captured(Mutex::new(Vec::new()))
     }
 
-    fn write(&self, stream: Stream, text: &str) -> std::io::Result<()> {
+    /// Whether what is written leaves the process, where a reader can go away.
+    fn is_real(&self) -> bool {
+        matches!(self, OutputSink::Real { .. })
+    }
+
+    /// Standard output is buffered only where it is the process's own: redirected onto standard
+    /// error it is written as that stream is, at once.
+    fn write(&self, stream: Stream, bytes: &[u8]) -> std::io::Result<()> {
         match self {
-            OutputSink::Real { out } => {
-                let stream = match stream {
-                    Stream::Out => *out,
-                    Stream::Err => Stream::Err,
-                };
-                match stream {
-                    Stream::Out => {
-                        let mut handle = std::io::stdout().lock();
-                        writeln!(handle, "{text}")?;
-                        handle.flush()
-                    }
-                    Stream::Err => {
-                        let mut handle = std::io::stderr().lock();
-                        writeln!(handle, "{text}")?;
-                        handle.flush()
-                    }
-                }
-            }
-            OutputSink::Captured(lines) => {
-                lock(lines).push((stream, text.to_string()));
+            OutputSink::Real { out } => match (stream, out) {
+                (Stream::Out, Stream::Out) => stdio::write_out(bytes),
+                _ => stdio::write_err(bytes),
+            },
+            OutputSink::Captured(writes) => {
+                lock(writes).push((stream, bytes.to_vec()));
                 Ok(())
             }
+        }
+    }
+
+    /// One line, and with it everything its stream's buffer held.
+    pub(crate) fn line(&self, stream: Stream, text: &str) -> std::io::Result<()> {
+        let mut line = Vec::with_capacity(text.len() + 1);
+        line.extend_from_slice(text.as_bytes());
+        line.push(b'\n');
+        self.write(stream, &line)?;
+        match stream {
+            Stream::Out => self.flush(),
+            Stream::Err => Ok(()),
+        }
+    }
+
+    /// Writes what the program's standard output holds back, which is nothing where it is
+    /// redirected onto standard error or captured.
+    fn flush(&self) -> std::io::Result<()> {
+        match self {
+            OutputSink::Real { out: Stream::Out } => stdio::flush_out(),
+            OutputSink::Real { out: Stream::Err } | OutputSink::Captured(_) => Ok(()),
+        }
+    }
+
+    /// Writes what standard output holds back ahead of something else that writes the stream.
+    fn make_way(&self) {
+        if self.is_real() {
+            stdio::make_way();
         }
     }
 }
@@ -234,6 +259,11 @@ impl ProcessHost {
         .executing(executables)
     }
 
+    /// Whether the run is a process of its own, with arguments, streams and a terminal.
+    pub fn is_whole(&self) -> bool {
+        self.whole
+    }
+
     /// Whether this host serves `op`, rather than leaving it withheld.
     pub fn serves(&self, op: Op) -> bool {
         self.whole || op.names_an_executable()
@@ -295,11 +325,55 @@ impl ProcessHost {
         *lock(&self.exit)
     }
 
-    /// Every line a captured sink took, in order; a real sink keeps nothing.
-    pub fn captured(&self) -> Vec<(Stream, String)> {
+    /// Every write a captured sink took, in order, a line with its newline; a real sink keeps
+    /// nothing.
+    pub fn captured(&self) -> Vec<(Stream, Vec<u8>)> {
         match &*self.sink {
-            OutputSink::Captured(lines) => lock(lines).clone(),
+            OutputSink::Captured(writes) => lock(writes).clone(),
             OutputSink::Real { .. } => Vec::new(),
+        }
+    }
+
+    /// Whether this host is the run's own process, and its streams the process's own.
+    fn owns_the_streams(&self) -> bool {
+        self.whole && self.sink.is_real()
+    }
+
+    /// A job on this host's pool, for an operation of another effect that waits on the process's
+    /// own streams.
+    pub(crate) fn waiting(
+        &self,
+        span: Span,
+        label: &'static str,
+        what: &'static str,
+        job: Box<dyn FnOnce() -> JobOutput + Send + 'static>,
+    ) -> Result<Pending, Diagnostic> {
+        self.pool.submit(span, label, what, job)
+    }
+
+    /// Leaves the process's streams as a program that ended leaves them: standard output's
+    /// buffer written and the terminal as it was found. A buffer whose reader has gone ends the
+    /// process as [`ProcessHost::end_of_broken_pipe`] does.
+    pub fn settle(&self) {
+        if self.owns_the_streams() && stdio::settle() {
+            self.end_of_broken_pipe();
+        }
+    }
+
+    /// Ends the process where it stands, as a closed pipe ends one that did not ask to be told:
+    /// nothing more is written, and the status is the one a shell reports for `SIGPIPE`.
+    pub fn end_of_broken_pipe(&self) -> ! {
+        self.children.end_all();
+        stdio::settle();
+        crate::observe::exiting();
+        std::process::exit(stdio::BROKEN_PIPE_STATUS);
+    }
+
+    /// What this host makes of a raise no clause answered: an unanswered `pipe.broken` ends the
+    /// process as the closed pipe would have.
+    pub fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+        if self.owns_the_streams() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
+            self.end_of_broken_pipe();
         }
     }
 
@@ -358,7 +432,11 @@ operations! {
     Bound = "bound" / 0,
     Out = "out" / 1,
     Err = "err" / 1,
+    OutBytes = "out_bytes" / 1,
+    ErrBytes = "err_bytes" / 1,
+    Flush = "flush" / 0,
     Line = "line" / 0,
+    InBytes = "in_bytes" / 1,
     Exit = "exit" / 1,
     Spawn = "spawn" / 3,
     Start = "start" / 4,
@@ -370,6 +448,14 @@ operations! {
 }
 
 impl Op {
+    /// The stream an operation that writes one writes to.
+    fn stream(self) -> Stream {
+        match self {
+            Op::Err | Op::ErrBytes => Stream::Err,
+            _ => Stream::Out,
+        }
+    }
+
     /// Labelled by the program `--exec` bound rather than by the run's own process.
     pub fn names_an_executable(self) -> bool {
         match self {
@@ -381,18 +467,29 @@ impl Op {
             | Op::Input
             | Op::EndInput
             | Op::OutputLine => true,
-            Op::Args | Op::Out | Op::Err | Op::Line | Op::Exit => false,
+            Op::Args
+            | Op::Out
+            | Op::Err
+            | Op::OutBytes
+            | Op::ErrBytes
+            | Op::Flush
+            | Op::Line
+            | Op::InBytes
+            | Op::Exit => false,
         }
     }
 
     /// Waits for another process, for a person, or on a pipe a child drains at its own pace.
     pub fn waits(self) -> bool {
         match self {
-            Op::Spawn | Op::Line | Op::Wait | Op::Input | Op::OutputLine => true,
+            Op::Spawn | Op::Line | Op::InBytes | Op::Wait | Op::Input | Op::OutputLine => true,
             Op::Args
             | Op::Bound
             | Op::Out
             | Op::Err
+            | Op::OutBytes
+            | Op::ErrBytes
+            | Op::Flush
             | Op::Exit
             | Op::Start
             | Op::Signal
@@ -412,7 +509,11 @@ impl Op {
                 Op::Args | Op::Bound => Linearity::Repeatable,
                 Op::Out
                 | Op::Err
+                | Op::OutBytes
+                | Op::ErrBytes
+                | Op::Flush
                 | Op::Line
+                | Op::InBytes
                 | Op::Exit
                 | Op::Spawn
                 | Op::Start
@@ -463,19 +564,40 @@ impl HostHandler for Operation {
             ))),
             Op::Out | Op::Err => {
                 let text = req.args[0].as_str(span, "the text to write")?;
-                let stream = match self.op {
-                    Op::Out => Stream::Out,
-                    _ => Stream::Err,
-                };
-                host.sink
-                    .write(stream, text)
-                    .map_err(|e| err_write(self.op, &e, span))?;
-                Ok(HostAnswer::Value(Value::Unit))
+                match host.sink.line(self.op.stream(), text) {
+                    Ok(()) => Ok(HostAnswer::Value(Value::Unit)),
+                    // A line answers nothing, so its writer cannot be told: the pipe ends it.
+                    Err(e) if stdio::reader_gone(&e) => host.end_of_broken_pipe(),
+                    Err(e) => Err(err_write(self.op, &e, span)),
+                }
             }
+            Op::OutBytes | Op::ErrBytes => {
+                let bytes = req.args[0].as_bytes(span, "the bytes to write")?;
+                taken(self.op, host.sink.write(self.op.stream(), bytes), span)
+            }
+            Op::Flush => taken(self.op, host.sink.flush(), span),
             Op::Line => {
                 let pending =
                     host.pool
                         .submit(span, "process-line", Op::Line.what(), Box::new(read_line))?;
+                Ok(HostAnswer::Pending(pending))
+            }
+            Op::InBytes => {
+                let max = req.args[0].as_int(span, "a length")?;
+                let Ok(max) = usize::try_from(max) else {
+                    return Err(negative_read(max, span));
+                };
+                let pending = host.pool.submit(
+                    span,
+                    "process-in-bytes",
+                    Op::InBytes.what(),
+                    Box::new(move || match stdio::read(max) {
+                        Ok(bytes) => JobOutput::Bytes(bytes),
+                        Err(e) => {
+                            JobOutput::Failed(format!("standard input could not be read: {e}"))
+                        }
+                    }),
+                )?;
                 Ok(HostAnswer::Pending(pending))
             }
             Op::Exit => {
@@ -514,6 +636,10 @@ impl HostHandler for Operation {
                 let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
                 let io = io_of(&req.args[3], span)?;
                 let dir = req.args[1].as_str(span, "a working directory")?;
+                // What the program wrote before the child comes before what the child writes.
+                if io.out == Output::Inherit || io.err == Output::Inherit {
+                    host.sink.make_way();
+                }
                 let launch = Launch {
                     label: &req.atom.resource,
                     program,
@@ -696,6 +822,9 @@ fn signal_of(value: &Value, span: Span) -> Result<Signal, Diagnostic> {
         Some(("Interrupt", [])) => Signal::Interrupt,
         Some(("Terminate", [])) => Signal::Terminate,
         Some(("Kill", [])) => Signal::Kill,
+        Some(("User1", [])) => Signal::User1,
+        Some(("User2", [])) => Signal::User2,
+        Some(("WindowChange", [])) => Signal::WindowChange,
         _ => {
             return Err(malformed_argument(
                 Op::Signal,
@@ -741,16 +870,19 @@ fn refused(op: Op, handle: i64, child: &Child, refusal: Refusal, span: Span) -> 
 /// One line of this process's standard input, without its ending; `None` at end of input. Read in
 /// the pool, because a console waits for a person.
 fn read_line() -> JobOutput {
-    let mut text = String::new();
-    match std::io::stdin().read_line(&mut text) {
-        Ok(0) => JobOutput::MaybeString(None),
-        Ok(_) => {
-            while text.ends_with('\n') || text.ends_with('\r') {
-                text.pop();
-            }
-            JobOutput::MaybeString(Some(text))
-        }
+    match stdio::read_line() {
+        Ok(line) => JobOutput::MaybeString(line),
         Err(e) => JobOutput::Failed(format!("standard input could not be read: {e}")),
+    }
+}
+
+/// Whether a write of bytes reached its stream: `false` once the stream's reader has gone away,
+/// which the program is told rather than ended by.
+fn taken(op: Op, wrote: std::io::Result<()>, span: Span) -> Result<HostAnswer, Diagnostic> {
+    match wrote {
+        Ok(()) => Ok(HostAnswer::Value(Value::Bool(true))),
+        Err(e) if stdio::reader_gone(&e) => Ok(HostAnswer::Value(Value::Bool(false))),
+        Err(e) => Err(err_write(op, &e, span)),
     }
 }
 
@@ -932,8 +1064,17 @@ fn err_write(op: Op, e: &std::io::Error, span: Span) -> Diagnostic {
         codes::RUNTIME_ERROR,
         format!("{} could not write: {e}", op.what()),
     )
-    .primary(span, "the stream refused the line")
-    .note("the reader of this process's output went away, or the descriptor is closed")
+    .primary(span, "the stream refused what was written")
+    .note("the descriptor is closed, or what it is open on took nothing")
+}
+
+#[cold]
+fn negative_read(max: i64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`process.in_bytes` was asked for {max} bytes"),
+    )
+    .primary(span, "a read's length cannot be negative")
 }
 
 #[cold]
