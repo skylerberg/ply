@@ -71,6 +71,8 @@ pub const ARTIFACT_INVALID: &str = "E0443";
 pub const ARTIFACT_VERSION: &str = "E0444";
 /// `trace.exit` naming a span not open on the performing task's stack.
 pub const SPAN_UNBALANCED: &str = "E0445";
+/// A hold read or let go after its region released what it held.
+pub const HOLD_RELEASED: &str = "E0331";
 /// A value branded with a region's name would outlive the region.
 pub const REGION_ESCAPE: &str = "E0446";
 /// A definition the program reaches that the C backend cannot compile.
