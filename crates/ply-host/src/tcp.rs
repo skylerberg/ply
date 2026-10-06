@@ -7,6 +7,7 @@ pub use crate::pool::MAX_BLOCKING_OPERATIONS;
 pub use sim::SimNet;
 pub use socket::TcpHost;
 
+use ply_eval::crypto::Framing;
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Resource, Span, Symbol, codes,
@@ -15,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 pub const MODULE: &str = "std.net";
 
@@ -35,13 +37,20 @@ operations! {
     Send = "send" / 3,
     Close = "close" / 1,
     LocalPort = "local_port" / 1,
+    SendSecret = "send_secret" / 6,
 }
 
 impl Op {
     fn waits(self) -> bool {
         matches!(
             self,
-            Op::Connect | Op::ConnectTls | Op::Handshake | Op::Accept | Op::Recv | Op::Send
+            Op::Connect
+                | Op::ConnectTls
+                | Op::Handshake
+                | Op::Accept
+                | Op::Recv
+                | Op::Send
+                | Op::SendSecret
         )
     }
 
@@ -62,11 +71,14 @@ impl Op {
                 | Op::Accept
                 | Op::Recv
                 | Op::Send
+                | Op::SendSecret
                 | Op::Close => Linearity::AtMostOnce,
             },
             blocking: self.waits() && net.waits(),
-            // No expression turns a `Secret` into the `Bytes` a socket write takes.
-            secrets: false,
+            // `send_secret`'s credential is encoded into one buffer that is wiped once written, and
+            // what it answers says only whether every byte went. No other operation takes one: no
+            // expression turns a `Secret` into the `Bytes` a socket write takes.
+            secrets: matches!(self, Op::SendSecret),
             path: net.path(self),
         }
     }
@@ -123,6 +135,17 @@ pub trait Net: Send + Sync {
         at: &Resource,
         conn: i64,
         payload: &[u8],
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// Every byte of `payload` or none answered as written: `true` once the peer took them all,
+    /// `false` for a deadline or a peer gone before it did. The payload holds a credential, and is
+    /// wiped when it is dropped.
+    fn send_secret(
+        &self,
+        at: &Resource,
+        conn: i64,
+        payload: Zeroizing<Vec<u8>>,
         timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
@@ -273,6 +296,22 @@ impl HostHandler for Operation {
                 }
                 self.net.send(at, conn, &payload, timeout, span)
             }
+            Op::SendSecret => {
+                let conn = req.args[0].as_int(span, "a socket handle")?;
+                let before = req.args[1].as_bytes(span, "the bytes before the secret")?;
+                let ply_eval::Value::Secret(held) = &req.args[2] else {
+                    return Err(not_sealed(&req.args[2], span));
+                };
+                let encoding = req.args[3].as_str(span, "an encoding")?;
+                let framing = Framing::named(encoding, self.op.what(), span)?;
+                let after = req.args[4].as_bytes(span, "the bytes after the secret")?;
+                let timeout = deadline(self.op, req.args[5].as_int(span, "a timeout")?, span)?;
+                let payload = framing.framed(before, held.bytes(), after);
+                if payload.is_empty() {
+                    return Err(empty_payload(span));
+                }
+                self.net.send_secret(at, conn, payload, timeout, span)
+            }
             Op::Close => {
                 let socket = req.args[0].as_int(span, "a socket handle")?;
                 self.net.close(at, socket, span)
@@ -307,6 +346,19 @@ fn empty_payload(span: Span) -> Diagnostic {
     )
     .primary(span, "there is nothing to write")
     .note("`send` answers `Some(0)` when the peer is gone, so an empty payload would be indistinguishable from one")
+}
+
+#[cold]
+fn not_sealed(got: &ply_eval::Value, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!(
+            "`net.send_secret` was handed a {} where its credential is a `Secret`",
+            got.type_name()
+        ),
+    )
+    .primary(span, "performed here")
+    .note("inference checks a perform's arguments, so reaching this means the evaluator was handed a module that was never checked")
 }
 
 fn port(op: Op, port: i64, span: Span) -> Result<u16, Diagnostic> {

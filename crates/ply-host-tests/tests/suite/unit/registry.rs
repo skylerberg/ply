@@ -89,7 +89,7 @@ const REPEATABLE: &Rows = &[
     // `--exec` is resolved once, before anything runs, so what it bound is read the same twice.
     ("std.process.process", &["args", "bound"]),
     // Every draw is independent of every other, so a run may take as many as it likes.
-    ("std.random.entropy", &["below", "next"]),
+    ("std.random.entropy", &["below", "next", "secret"]),
     ("std.signal.signal", &["deadline_ms", "stopping"]),
     // Asking what a stream is, or how large the terminal is, changes neither.
     ("std.term.term", &["is_terminal", "size"]),

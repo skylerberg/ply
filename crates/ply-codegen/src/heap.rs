@@ -1504,7 +1504,6 @@ pub fn share(words: &[Word]) -> bool {
 fn crosses_threads(v: &Value) -> bool {
     match v {
         Value::Cell(_) | Value::Task(_) | Value::Chan(_) => false,
-        Value::Secret(inner) => crosses_threads(inner),
         Value::Closure(c) => match &c.kind {
             ClosureKind::Native { captured, .. } => captured.iter().all(crosses_threads),
             _ => true,
@@ -1524,6 +1523,7 @@ fn crosses_threads(v: &Value) -> bool {
         | Value::Decimal(_)
         | Value::Str(_)
         | Value::Bytes(_)
+        | Value::Secret(_)
         | Value::Unit => true,
     }
 }

@@ -89,6 +89,6 @@ pub use span::{
 pub use task_regions::{Fixture, TaskRegions};
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, PathStep, Synth, Value,
-    constant_time_eq, first_difference, values_equal,
+    Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, PathStep, Sealed,
+    Synth, Value, constant_time_eq, first_difference, values_equal,
 };

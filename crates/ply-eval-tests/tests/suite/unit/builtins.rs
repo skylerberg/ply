@@ -1179,7 +1179,7 @@ fn a_digest_agrees_with_equality_and_refuses_what_has_no_hash() {
         "where a module stands is no part of a value"
     );
     assert_ne!(digest(ints(&[1, 2])), digest(ints(&[2, 1])));
-    for v in [Value::Float(1.0), Value::secret(Value::str("pw"))] {
+    for v in [Value::Float(1.0), Value::secret_text("pw")] {
         let d = done(Builtin::Digest, vec![v]).unwrap_err();
         assert_eq!(d.code, codes::RUNTIME_ERROR);
     }

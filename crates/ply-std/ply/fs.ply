@@ -208,6 +208,19 @@ pub nondet effect fs {
   /// removed. Only a file takes a second name (`NotAFile`, for a link too, which is never
   /// followed), and `path` must name nothing yet (`Exists`).
   write link[r](path: String, to: String) -> Result<Unit, Refused>
+  /// Writes `before`, then `secret` in `encoding`, then `after`, as the whole of a file its owner
+  /// alone may read or write (`rw-------`): a file already there is made so before it is emptied,
+  /// so no byte of the secret is ever readable by anyone else. This is how a key a program draws
+  /// or makes is written down without ever being a plain value of it. `encoding` is `"raw"`, the
+  /// bytes themselves, or `"hex"`, `"base64"`, `"base64url"` or `"base32"`, written as
+  /// `secret_encode` writes them; any other is a runtime error. `false` where the file could not
+  /// be written.
+  write write_secret[r](path: String, before: Bytes, secret: Secret<Bytes>, encoding: String, after: Bytes) -> Bool
+  /// The secret a file holds between `before` and `after`, read back in `encoding`, never a plain
+  /// value: what `write_secret` wrote, given the same three. `None` for a file that does not open
+  /// with `before` and close with `after`, holds between them no text `encoding` writes, or is not
+  /// there to read, as `read_file` answers it; a file above 64 MiB is `E0453`.
+  read read_secret[r](path: String, before: Bytes, encoding: String, after: Bytes) -> Option<Secret<Bytes>>
 }
 
 /// What the functions of this module raise.
@@ -261,10 +274,10 @@ pub fn mode_of_bits(bits: Int) -> Mode = {
 /// closed, and `short` is the most bytes one `read_chunk` answers, zero for as many as it is asked.
 /// `ids` says which file, directory or link each path names, `born` is the next one, and `shared`
 /// counts the names of each file that has more than one. `space` is what `space` answers. `synced`
-/// holds each file's bytes as last synced and `durable` the files a synced directory named, which
+/// holds each file's body as last synced and `durable` the files a synced directory named, which
 /// is what `mem_crashed` keeps.
 pub type MemFs = {
-  files: Map<String, Bytes>,
+  files: Map<String, Body>,
   dirs: Map<String, Int>,
   links: Map<String, String>,
   modes: Map<String, Mode>,
@@ -277,8 +290,67 @@ pub type MemFs = {
   born: Int,
   shared: Map<Int, Int>,
   space: Space,
-  synced: Map<Int, Bytes>,
+  synced: Map<Int, Body>,
   durable: Map<String, Int>,
+}
+
+/// What a file of the twin holds: its bytes, or what `fs.write_secret` wrote, kept as it was
+/// handed over. Nothing written in Ply opens a secret, so the twin cannot answer a sealed file's
+/// bytes where the host would: `mem_read`, `read_at` and `read_chunk` answer it as unreadable,
+/// `fs.read_secret` reads it back only between the bytes and in the encoding it was written with,
+/// and `mem_sealed` answers what it holds.
+pub type Body = | Plain(Bytes) | Sealed(Framed)
+
+/// A secret as `fs.write_secret` writes one: `before`, then `secret` in `encoding`, then `after`.
+pub type Framed = { before: Bytes, secret: Secret<Bytes>, encoding: String, after: Bytes }
+
+/// Raises, as the host does, for an encoding a secret is not written or read in.
+fn framed_in(encoding: String) -> Unit / {abort.raise} =
+  if encoding == "raw" { () } else {
+    let _ = secret_encode(encoding, secret_of_bytes(b""));
+    ()
+  }
+
+/// The bytes `n` bytes take in an encoding `framed_in` accepts, as `secret_encode` writes them.
+fn encoded_size(n: Int, encoding: String) -> Int =
+  if encoding == "hex" { 2 * n }
+  else if encoding == "base64" { (n + 2) / 3 * 4 }
+  else if encoding == "base64url" { (4 * n + 2) / 3 }
+  else if encoding == "base32" { (n + 4) / 5 * 8 }
+  else { n }
+
+fn body_size(body: Body) -> Int =
+  match body {
+    Plain(bytes) -> bytes_len(bytes),
+    Sealed(f) ->
+      bytes_len(f.before) + encoded_size(secret_len(f.secret), f.encoding) + bytes_len(f.after),
+  }
+
+/// `body` with `more` after it: a sealed file stays sealed.
+fn appended(body: Body, more: Bytes) -> Body / {abort.raise} =
+  match body {
+    Plain(bytes) -> Plain(bytes_concat(bytes, more)),
+    Sealed(f) -> Sealed({ ..f, after: bytes_concat(f.after, more) }),
+  }
+
+/// The secret plain `bytes` hold between `before` and `after` in `encoding`, as the host reads one.
+fn unframed(
+  bytes: Bytes,
+  before: Bytes,
+  encoding: String,
+  after: Bytes,
+) -> Option<Secret<Bytes>> / {abort.raise} = {
+  let size = bytes_len(bytes);
+  let inner = bytes_len(before);
+  let outer = size - bytes_len(after);
+  if size < inner + bytes_len(after) || bytes_slice(bytes, 0, inner) != before
+      || bytes_slice(bytes, outer, size) != after { None }
+  else if encoding == "raw" { Some(secret_of_bytes(bytes_slice(bytes, inner, outer))) } else {
+    secret_decode(
+      encoding,
+      secret_of_string(string_of_bytes_lossy(bytes_slice(bytes, inner, outer))),
+    )
+  }
 }
 
 /// A file a tree holds open: the key it was opened at, how, and how far into it the descriptor
@@ -341,10 +413,41 @@ pub fn mem_of(files: List<{ path: String, body: Bytes }>) -> MemFs / {abort.rais
 pub fn mem_confined(path: String) -> Bool / {abort.raise} =
   !string_starts_with(path, "/") && len(filter(string_split(path, "/"), |s: String| s == "..")) == 0
 
-/// What `fs.read_file` answers over the tree.
+/// What `fs.read_file` answers over the tree; `None` for a sealed file too.
 pub fn mem_read(tree: MemFs, path: String) -> Option<Bytes> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
-  if readable(tree, key) { map_get(tree.files, key) } else { None }
+  match map_get(tree.files, key) {
+    Some(Plain(bytes)) -> if readable(tree, key) { Some(bytes) } else { None },
+    _ -> None,
+  }
+}
+
+/// What a file `fs.write_secret` wrote holds; `None` for any other path.
+pub fn mem_sealed(tree: MemFs, path: String) -> Option<Framed> / {abort.raise} = {
+  let key = key_of(tree, path, true)?;
+  match map_get(tree.files, key) { Some(Sealed(f)) -> Some(f), _ -> None }
+}
+
+/// What `fs.read_secret` answers over the tree: the secret a plain file holds in its frame, or a
+/// sealed file's when asked for in the frame it was written in.
+pub fn mem_read_secret(
+  tree: MemFs,
+  path: String,
+  before: Bytes,
+  encoding: String,
+  after: Bytes,
+) -> Option<Secret<Bytes>> / {abort.raise} = {
+  framed_in(encoding);
+  let key = key_of(tree, path, true)?;
+  if !readable(tree, key) { None } else {
+    match map_get(tree.files, key) {
+      Some(Sealed(f)) -> if f.before == before && f.encoding == encoding && f.after == after {
+        Some(f.secret)
+      } else { None },
+      Some(Plain(bytes)) -> unframed(bytes, before, encoding, after),
+      None -> None,
+    }
+  }
 }
 
 /// What `fs.exists` answers over the tree.
@@ -355,7 +458,7 @@ pub fn mem_exists(f: MemFs, path: String) -> Bool / {abort.raise} =
 pub fn mem_size(tree: MemFs, path: String) -> Option<Int> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
   let body = map_get(tree.files, key)?;
-  Some(bytes_len(body))
+  Some(body_size(body))
 }
 
 /// What is there, which may be less than was asked for: a file can end before the range does, and
@@ -428,18 +531,30 @@ fn walked(
 /// `false` when the parent is missing, a directory occupies the path, or the path leaves the root.
 pub fn mem_write(tree: MemFs, path: String, body: Bytes) -> Written / {abort.raise} =
   match key_of(tree, path, true) {
-    Some(key) -> if writes_file(tree, key) { { fs: stored(tree, key, body), ok: true } }
+    Some(key) -> if writes_file(tree, key) { { fs: stored(tree, key, Plain(body)), ok: true } }
     else { { fs: tree, ok: false } },
     None -> { fs: tree, ok: false },
   }
+
+/// What `fs.write_secret` does to the tree: the file holds `framed` sealed, and its owner alone
+/// may read or write it. `false` where `mem_write` would be.
+pub fn mem_write_secret(tree: MemFs, path: String, framed: Framed) -> Written / {abort.raise} = {
+  framed_in(framed.encoding);
+  match key_of(tree, path, true) {
+    Some(key) -> if writes_file(tree, key) {
+      { fs: with_mode(stored(tree, key, Sealed(framed)), key, owner_only()), ok: true }
+    } else { { fs: tree, ok: false } },
+    None -> { fs: tree, ok: false },
+  }
+}
 
 /// Costs what is new rather than what is there, and creates the file, so a log's first frame needs
 /// no write before it. `None` is what `mem_write` refuses for, and the offset is where it landed.
 pub fn mem_append(tree: MemFs, path: String, body: Bytes) -> Appended / {abort.raise} =
   match key_of(tree, path, true) {
     Some(key) -> if writes_file(tree, key) {
-      let had = match map_get(tree.files, key) { Some(b) -> b, None -> b"" };
-      { fs: stored(tree, key, bytes_concat(had, body)), at: Some(bytes_len(had)) }
+      let had = match map_get(tree.files, key) { Some(b) -> b, None -> Plain(b"") };
+      { fs: stored(tree, key, appended(had, body)), at: Some(body_size(had)) }
     } else { { fs: tree, at: None } },
     None -> { fs: tree, at: None },
   }
@@ -489,7 +604,7 @@ fn kept_names(tree: MemFs, dir: String) -> MemFs / {abort.raise} = {
     if parent_of(key) == dir && !map_contains(tree.files, key) { map_remove(m, key) } else { m });
   {
     ..tree,
-    durable: map_fold(tree.files, left, |m: Map<String, Int>, key: String, _body: Bytes|
+    durable: map_fold(tree.files, left, |m: Map<String, Int>, key: String, _body: Body|
       if parent_of(key) != dir { m }
       else { match map_get(tree.ids, key) { Some(id) -> map_insert(m, key, id), None -> m } }),
   }
@@ -501,7 +616,7 @@ pub fn mem_settled(tree: MemFs) -> MemFs =
   map_fold(
     tree.files,
     { ..tree, synced: map_new(), durable: map_new() },
-    |t: MemFs, key: String, body: Bytes| {
+    |t: MemFs, key: String, body: Body| {
       let named = identified(t, key);
       match map_get(named.ids, key) {
         Some(id) ->
@@ -531,8 +646,11 @@ pub fn mem_crashed(tree: MemFs) -> MemFs / {abort.raise} = {
     map_insert(n, id, match map_get(n, id) { Some(names) -> names + 1, None -> 1 }));
   mem_settled({
     ..tree,
-    files: map_fold(kept, map_new(), |m: Map<String, Bytes>, key: String, id: Int|
-      map_insert(m, key, match map_get(tree.synced, id) { Some(body) -> body, None -> b"" })),
+    files: map_fold(kept, map_new(), |m: Map<String, Body>, key: String, id: Int|
+      map_insert(m, key, match map_get(tree.synced, id) {
+        Some(body) -> body,
+        None -> Plain(b""),
+      })),
     ids: map_fold(tree.ids, kept, |m: Map<String, Int>, key: String, id: Int|
       if map_contains(tree.files, key) || map_contains(m, key) { m }
       else { map_insert(m, key, id) }),
@@ -666,7 +784,7 @@ fn moved(f: MemFs, src: String, dst: String) -> MemFs / {abort.raise} = {
 pub fn mem_lock(tree: MemFs, path: String) -> Written / {abort.raise} =
   match key_of(tree, path, false) {
     Some(key) -> if kind_at(tree, key) == Missing && placeable(tree, key) {
-      let made = stored(tree, key, b"");
+      let made = stored(tree, key, Plain(b""));
       { fs: { ..made, locks: map_insert(made.locks, key, tree.clock) }, ok: true }
     } else { { fs: tree, ok: false } },
     None -> { fs: tree, ok: false },
@@ -778,7 +896,7 @@ fn stat_at(tree: MemFs, key: String) -> Option<Stat> = {
   if kind == Missing { None } else {
     Some({
       kind: kind,
-      size: match map_get(tree.files, key) { Some(body) -> bytes_len(body), None -> 0 },
+      size: match map_get(tree.files, key) { Some(body) -> body_size(body), None -> 0 },
       modified: Instant(stamp *| 1000000),
       mode: if kind == Symlink { open_mode() } else { mode_at(tree, key) },
       links: match map_get(tree.shared, id) { Some(names) -> names, None -> 1 },
@@ -872,14 +990,14 @@ fn readied(tree: MemFs, key: String, how: Opening) -> Result<MemFs, Refused> / {
   else if kind == Dir { Err(NotAFile) } else if kind == File {
     if how == ToRead { if readable(tree, key) { Ok(tree) } else { Err(Denied) } }
     else if !writable(tree, key) { Err(Denied) }
-    else if how == ToWrite { Ok(stored(tree, key, b"")) }
+    else if how == ToWrite { Ok(stored(tree, key, Plain(b""))) }
     else { Ok(tree) }
   } else if how == ToRead { Err(NotFound) } else {
     match unplaced(tree, key) {
       Some(why) -> Err(why),
       None ->
-        Ok(if how == ToCreate { with_mode(stored(tree, key, b""), key, owner_only()) }
-        else { stored(tree, key, b"") }),
+        Ok(if how == ToCreate { with_mode(stored(tree, key, Plain(b"")), key, owner_only()) }
+        else { stored(tree, key, Plain(b"")) }),
     }
   }
 }
@@ -911,8 +1029,9 @@ fn descriptor(tree: MemFs, key: String, how: Opening) -> Opened =
 pub fn mem_read_chunk(tree: MemFs, file: Int, max: Int) -> Chunk / {abort.raise} =
   if max < 0 { panic("a chunk's length cannot be negative") } else {
     match map_get(tree.opened, file) {
-      Some(o) -> if o.how != ToRead { { fs: tree, bytes: None } } else {
-        let body = match map_get(tree.files, o.key) { Some(b) -> b, None -> b"" };
+      Some(o) -> if o.how != ToRead || holds_sealed(tree, o.key) { { fs: tree, bytes: None } }
+      else {
+        let body = match map_get(tree.files, o.key) { Some(Plain(b)) -> b, _ -> b"" };
         let size = bytes_len(body);
         let from = at_most(o.at, size);
         let wanted = if tree.short > 0 { at_most(max, tree.short) } else { max };
@@ -927,29 +1046,44 @@ pub fn mem_read_chunk(tree: MemFs, file: Int, max: Int) -> Chunk / {abort.raise}
   }
 
 /// What `fs.write_chunk` does to the tree: `body` where the descriptor stands, which is the file's
-/// end for one opened `ToAppend`.
+/// end for one opened `ToAppend`. A sealed file takes bytes only at its end, which the twin can
+/// join to it without opening it.
 pub fn mem_write_chunk(tree: MemFs, file: Int, body: Bytes) -> Written / {abort.raise} =
   match map_get(tree.opened, file) {
-    Some(o) -> match map_get(tree.files, o.key) {
-      Some(had) -> if o.how == ToRead { { fs: tree, ok: false } } else {
-        let size = bytes_len(had);
-        let from = if o.how == ToAppend { size } else { at_most(o.at, size) };
-        let to = from + bytes_len(body);
-        let put = stored(
-          tree,
-          o.key,
-          bytes_concat_all([
-            bytes_slice(had, 0, from),
-            body,
-            bytes_slice(had, at_most(to, size), size),
-          ]),
-        );
-        { fs: { ..put, opened: map_insert(put.opened, file, { ..o, at: to }) }, ok: true }
-      },
-      None -> { fs: tree, ok: false },
+    Some(o) -> if o.how == ToRead { { fs: tree, ok: false } } else {
+      match map_get(tree.files, o.key) {
+        Some(Plain(had)) -> {
+          let size = bytes_len(had);
+          let from = if o.how == ToAppend { size } else { at_most(o.at, size) };
+          let to = from + bytes_len(body);
+          let put = stored(
+            tree,
+            o.key,
+            Plain(
+              bytes_concat_all([
+                bytes_slice(had, 0, from),
+                body,
+                bytes_slice(had, at_most(to, size), size),
+              ]),
+            ),
+          );
+          { fs: { ..put, opened: map_insert(put.opened, file, { ..o, at: to }) }, ok: true }
+        },
+        Some(Sealed(had)) -> if o.how != ToAppend && o.at != body_size(Sealed(had)) {
+          { fs: tree, ok: false }
+        } else {
+          let put = stored(tree, o.key, appended(Sealed(had), body));
+          let to = body_size(Sealed(had)) + bytes_len(body);
+          { fs: { ..put, opened: map_insert(put.opened, file, { ..o, at: to }) }, ok: true }
+        },
+        None -> { fs: tree, ok: false },
+      }
     },
     None -> { fs: tree, ok: false },
   }
+
+fn holds_sealed(tree: MemFs, key: String) -> Bool =
+  match map_get(tree.files, key) { Some(Sealed(_)) -> true, _ -> false }
 
 /// What `fs.close` does to the tree.
 pub fn mem_close(tree: MemFs, file: Int) -> Written =
@@ -1018,6 +1152,17 @@ fn over_mem<a, [l] | e>(
       fs.file_size[l](p) -> mem_size(now(), p),
       fs.modified_ms[l](p) -> mem_modified(now(), p),
       fs.write_file[l](p, body) -> kept(mem_write(now(), p, body)),
+      fs.write_secret[l](p, before, secret, encoding, after) ->
+        kept(
+          mem_write_secret(now(), p, {
+            before: before,
+            secret: secret,
+            encoding: encoding,
+            after: after,
+          }),
+        ),
+      fs.read_secret[l](p, before, encoding, after) ->
+        mem_read_secret(now(), p, before, encoding, after),
       fs.append[l](p, body) -> {
         let a = mem_append(now(), p, body);
         if taken() {
@@ -1774,13 +1919,13 @@ fn names_of(tree: MemFs, key: String) -> List<String> =
     None -> [key],
   }
 
-/// The tree with `body` the bytes of the file at `key` under every name it has, stamped now.
-fn stored(tree: MemFs, key: String, body: Bytes) -> MemFs = {
+/// The tree with `body` what the file at `key` holds under every name it has, stamped now.
+fn stored(tree: MemFs, key: String, body: Body) -> MemFs = {
   let named = identified(tree, key);
   let names = names_of(named, key);
   {
     ..named,
-    files: fold(names, named.files, |m: Map<String, Bytes>, k: String| map_insert(m, k, body)),
+    files: fold(names, named.files, |m: Map<String, Body>, k: String| map_insert(m, k, body)),
     modified: fold(names, named.modified, |m: Map<String, Int>, k: String|
       map_insert(m, k, named.clock)),
     clock: named.clock + 1,
@@ -2045,6 +2190,53 @@ test "an append creates the file it is given and says where the bytes landed" {
   assert_eq(mem_append(mem_empty(), "cache/frontend.dat", b"x").at, None);
   assert_eq(mem_append(dir.fs, "cache", b"x").at, None);
   assert_eq(raised(|| mem_append(dir.fs, "../escape.dat", b"x")), escapes("../escape.dat"))
+}
+
+test "a secret written to the twin stays sealed and its owner's alone, whatever was there before" {
+  let key = secret_of_bytes(b"\x01\x23\x45\x67");
+  let tree = mem_of([
+    { path: "keys/old", body: b"plain" },
+    { path: "keys/typed", body: b"key 01234567\n" },
+  ]);
+  let ran = on_mem[k](tree, || {
+    let fresh = fs.write_secret[k]("keys/new", b"key ", key, "hex", b"\n");
+    let over = fs.write_secret[k]("keys/old", b"", key, "raw", b"");
+    let nowhere = fs.write_secret[k]("missing/key", b"", key, "raw", b"");
+    {
+      fresh: fresh,
+      over: over,
+      nowhere: nowhere,
+      read: fs.read_file[k]("keys/new"),
+      back: fs.read_secret[k]("keys/new", b"key ", "hex", b"\n"),
+      elsewise: fs.read_secret[k]("keys/new", b"key ", "hex", b""),
+      typed: fs.read_secret[k]("keys/typed", b"key ", "hex", b"\n"),
+      none: fs.read_secret[k]("keys/none", b"", "raw", b""),
+    }
+  });
+  assert(ran.value.fresh && ran.value.over && !ran.value.nowhere);
+  assert_eq(ran.value.read, None);
+  assert(ran.value.back == Some(key) && ran.value.typed == Some(key));
+  assert(ran.value.elsewise == None && ran.value.none == None);
+  // A plain file reads back in every frame it fits, and in no other.
+  assert(mem_read_secret(tree, "keys/old", b"", "raw", b"") == Some(secret_of_bytes(b"plain")));
+  assert(mem_read_secret(tree, "keys/old", b"pl", "raw", b"n") == Some(secret_of_bytes(b"ai")));
+  assert(mem_read_secret(tree, "keys/old", b"", "hex", b"") == None);
+  assert(mem_read_secret(tree, "keys/typed", b"key ", "hex", b"") == None);
+  let held = |path: String, size: Int|
+    mem_size(ran.tree, path) == Some(size) && mem_mode(ran.tree, path) == Some(owner_only());
+  assert(held("keys/new", 13) && held("keys/old", 4));
+  assert(
+    mem_sealed(ran.tree, "keys/new")
+      == Some({ before: b"key ", secret: key, encoding: "hex", after: b"\n" }),
+  );
+  assert(mem_sealed(tree, "keys/old") == None);
+  // Bytes after a sealed file's end stay sealed with it, and a plain write unseals it.
+  let grown = mem_append(ran.tree, "keys/new", b"!").fs;
+  assert(mem_read_secret(grown, "keys/new", b"key ", "hex", b"\n!") == Some(key));
+  assert_eq(mem_size(grown, "keys/new"), Some(14));
+  let plain = mem_write(grown, "keys/new", b"open").fs;
+  assert(mem_sealed(plain, "keys/new") == None);
+  assert_eq(mem_read(plain, "keys/new"), Some(b"open"))
 }
 
 test "appends to two logs under one root do not see each other" {

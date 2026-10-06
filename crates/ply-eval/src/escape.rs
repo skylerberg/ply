@@ -255,6 +255,7 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
         | Value::Decimal(_)
         | Value::Str(_)
         | Value::Bytes(_)
+        | Value::Secret(_)
         | Value::Unit => None,
 
         Value::List(items) => grow(|| {
@@ -299,14 +300,6 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
                 route.push(format!("`{name}`'s argument {}", i + 1));
                 Some(handle)
             })
-        }),
-
-        // Descended into, because a credential is not a place to hide a handle.
-        Value::Secret(inner) => grow(|| {
-            let handle = find(inner, route)?;
-            route.clear();
-            route.push("a `Secret`'s payload".to_string());
-            Some(handle)
         }),
 
         Value::Closure(closure) => grow(|| match &closure.kind {

@@ -12,6 +12,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 enum Socket {
     /// `None` for plaintext; otherwise the config every accepted connection is terminated with.
@@ -170,6 +171,7 @@ impl Net for TcpHost {
             Op::Send => "ply_host::tcp::send",
             Op::Close => "ply_host::tcp::close",
             Op::LocalPort => "ply_host::tcp::local_port",
+            Op::SendSecret => "ply_host::tcp::send_secret",
         }
     }
 
@@ -358,6 +360,29 @@ impl Net for TcpHost {
                 session.deadline(timeout);
                 JobOutput::MaybeInt(Some(session.write(&payload) as i64))
             }
+        })
+    }
+
+    fn send_secret(
+        &self,
+        at: &Resource,
+        conn: i64,
+        payload: Zeroizing<Vec<u8>>,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        let conn = self.sockets.stream(conn, at, span)?;
+        self.waiting(span, "send-secret", Op::SendSecret.what(), move || {
+            JobOutput::Bool(match conn {
+                Connection::Plain(stream) => {
+                    let _ = stream.set_write_timeout(Some(timeout));
+                    (&*stream).write_all(&payload).is_ok()
+                }
+                Connection::Tls(session) => {
+                    session.deadline(timeout);
+                    session.write(&payload) == payload.len()
+                }
+            })
         })
     }
 
