@@ -1,66 +1,37 @@
-//! `std.char` against the Unicode Character Database's own files, over every code point there is.
-//! `char/` holds `UnicodeData.txt`, `DerivedCoreProperties.txt` and `PropList.txt` as the Unicode
-//! Consortium published them for the version `std.ucd` names, with its licence beside them: the
-//! files the tables `std.char` ships were made from, read here by another reader, so a table that
-//! was made wrong, of another version or read wrong answers unlike them.
+//! `std.char` against the Unicode Character Database's own files, over every code point there is:
+//! the published files `ucd_files` reads, asked here what they say of each code point, so a table
+//! that was made wrong, of another version or read wrong answers unlike them.
 
-import std.bytes (int_of_ascii, int_of_ascii_radix)
+import std.bytes (int_of_ascii)
 import std.char
 import std.list (at)
 import std.ucd
+import ucd_files
+import ucd_files (Row, Stretch, hex, rows_under, unicode_data, unlike)
 
-/// What the database says of a row of code points, `first` to `last`: their category, the decimal
-/// digit a single one is, and how far its three case mappings lie from it.
-type Said = {
-  first: Int,
-  last: Int,
-  category: String,
-  digit: Option<Int>,
-  upper: Int,
-  lower: Int,
-  title: Int,
-}
-
-fn hex(text: Bytes) -> Int / {abort.raise} =
-  match int_of_ascii_radix(text, 16) { Some(n) -> n, None -> panic("no code point") }
+/// What the database says of a code point: its category, the decimal digit it is, and how far
+/// its three case mappings lie from it.
+type Said = { category: String, digit: Option<Int>, upper: Int, lower: Int, title: Int }
 
 /// How far the mapping a field of `UnicodeData.txt` names lies from `cp`: nowhere where it is empty.
 fn away(field: Bytes, cp: Int) -> Int / {abort.raise} =
   if bytes_len(field) == 0 { 0 } else { hex(field) - cp }
 
-/// The line read, with the code point a `First>` line opened a range at.
-type Reading = { said: List<Said>, opened: Int }
+fn said(row: Row) -> Stretch<Said> / {abort.raise} =
+  {
+    first: row.first,
+    last: row.last,
+    said: {
+      category: string_of_bytes(at(row.fields, 2)),
+      digit: int_of_ascii(at(row.fields, 6)),
+      upper: away(at(row.fields, 12), row.last),
+      lower: away(at(row.fields, 13), row.last),
+      title: away(at(row.fields, 14), row.last),
+    },
+  }
 
-/// Every line of `UnicodeData.txt`, a `First>` and `Last>` pair being one row.
-fn unicode_data() -> List<Said> / {abort.raise} =
-  fold(
-    bytes_split(embed("char/UnicodeData.txt"), b"\n"),
-    { said: [], opened: 0 },
-    |read: Reading, line: Bytes|
-      if bytes_len(line) == 0 { read } else {
-        let fields = bytes_split(line, b";");
-        let cp = hex(at(fields, 0));
-        if bytes_ends_with(at(fields, 1), b", First>") { { said: read.said, opened: cp } } else {
-          let ranged = bytes_ends_with(at(fields, 1), b", Last>");
-          {
-            said: push(read.said, {
-              first: if ranged { read.opened } else { cp },
-              last: cp,
-              category: string_of_bytes(at(fields, 2)),
-              digit: int_of_ascii(at(fields, 6)),
-              upper: away(at(fields, 12), cp),
-              lower: away(at(fields, 13), cp),
-              title: away(at(fields, 14), cp),
-            }),
-            opened: 0,
-          }
-        }
-      },
-  ).said
-
-/// What the database says of code points it lists nowhere.
-fn unlisted(first: Int, last: Int) -> Said =
-  { first: first, last: last, category: "Cn", digit: None, upper: 0, lower: 0, title: 0 }
+/// What the database says of a code point it lists nowhere.
+fn unlisted() -> Said = { category: "Cn", digit: None, upper: 0, lower: 0, title: 0 }
 
 /// Whether `std.char` answers for the code point `cp` as `said` does. A surrogate is no `Char`,
 /// so there is nothing to ask of one.
@@ -75,65 +46,27 @@ fn answers(cp: Int, said: Said) -> Bool =
         && char::code_point(char::to_titlecase(c)) == cp + said.title,
   }
 
-/// The first few code points of `first` to `last` that `ok` refuses, after those in `wrong`.
-fn refused<| e>(wrong: List<Int>, first: Int, last: Int, ok: (Int) -> Bool / e) -> List<Int> / e =
-  fold(range(first, last + 1), wrong, |found: List<Int>, cp: Int|
-    if len(found) >= 8 || ok(cp) { found } else { push(found, cp) })
-
-/// The walk so far: the code points answered wrong, and the next one no row has covered.
-type Walk = { wrong: List<Int>, next: Int }
-
 test "every code point has the category, decimal digit and case mappings UnicodeData.txt gives it" {
-  let walked = fold(unicode_data(), { wrong: [], next: 0 }, |walk: Walk, said: Said| {
-    let between = unlisted(walk.next, said.first - 1);
-    let before = refused(walk.wrong, between.first, between.last, |cp: Int| answers(cp, between));
-    {
-      wrong: refused(before, said.first, said.last, |cp: Int| answers(cp, said)),
-      next: said.last + 1,
-    }
-  });
-  let after = unlisted(walked.next, 0x10FFFF);
-  assert_eq(refused(walked.wrong, after.first, after.last, |cp: Int| answers(cp, after)), [])
+  let wrong = unlike(map(unicode_data(), said), |cp: Int, listed: Option<Said>|
+    answers(cp, match listed { Some(s) -> s, None -> unlisted() }));
+  assert_eq(wrong, [])
 }
 
 /// A property a file of the database lists the code points of, and the predicate that is it.
 type Property = { file: Bytes, holds: (Char) -> Bool }
 
-fn derived() -> Bytes = embed("char/DerivedCoreProperties.txt")
-
-fn property(name: String) -> Property / {abort.raise} =
+fn property(name: String) -> Property / {abort.raise} = {
+  let core = ucd_files::derived_core_properties();
   match name {
-    "Alphabetic" -> { file: derived(), holds: char::is_alphabetic },
-    "Lowercase" -> { file: derived(), holds: char::is_lowercase },
-    "Uppercase" -> { file: derived(), holds: char::is_uppercase },
-    "XID_Start" -> { file: derived(), holds: char::is_xid_start },
-    "XID_Continue" -> { file: derived(), holds: char::is_xid_continue },
-    "White_Space" -> { file: embed("char/PropList.txt"), holds: char::is_whitespace },
+    "Alphabetic" -> { file: core, holds: char::is_alphabetic },
+    "Lowercase" -> { file: core, holds: char::is_lowercase },
+    "Uppercase" -> { file: core, holds: char::is_uppercase },
+    "XID_Start" -> { file: core, holds: char::is_xid_start },
+    "XID_Continue" -> { file: core, holds: char::is_xid_continue },
+    "White_Space" -> { file: ucd_files::prop_list(), holds: char::is_whitespace },
     _ -> panic(f"no predicate is {name}"),
   }
-
-/// The rows of code points `file` lists under the binary property `name`, as `first` and `last`.
-fn listed(file: Bytes, name: String) -> List<{ first: Int, last: Int }> / {abort.raise} =
-  fold(bytes_split(file, b"\n"), [], |rows: List<{ first: Int, last: Int }>, line: Bytes| {
-    let data = match bytes_index_of_byte(line, b'#') {
-      Some(i) -> bytes_slice(line, 0, i),
-      None -> line,
-    };
-    match map(bytes_split(data, b";"), |part: Bytes| string_trim(string_of_bytes(part))) {
-      [span, property] -> if property != name { rows } else {
-        match bytes_split(bytes_of_string(span), b"..") {
-          [one] -> push(rows, { first: hex(one), last: hex(one) }),
-          [first, last] -> push(rows, { first: hex(first), last: hex(last) }),
-          _ -> panic(f"`{span}` is no row of code points"),
-        }
-      },
-      _ -> rows,
-    }
-  })
-
-/// Whether the predicate answers `expected` of the code point `cp`, a surrogate apart.
-fn tells(holds: (Char) -> Bool, cp: Int, expected: Bool) -> Bool =
-  match char::of_code_point(cp) { Some(c) -> holds(c) == expected, None -> true }
+}
 
 test "{name} holds of the code points the database lists for it and of no other" for name: String in [
     "Alphabetic",
@@ -144,23 +77,18 @@ test "{name} holds of the code points the database lists for it and of no other"
     "XID_Continue",
   ] {
   let p = property(name);
-  let rows = listed(p.file, name);
+  let rows = map(rows_under(p.file, [name]), |row: Row|
+    { first: row.first, last: row.last, said: () });
   assert(len(rows) > 0);
-  let walked = fold(rows, { wrong: [], next: 0 }, |walk: Walk, row: { first: Int, last: Int }| {
-    let before = refused(walk.wrong, walk.next, row.first - 1, |cp: Int| tells(p.holds, cp, false));
-    {
-      wrong: refused(before, row.first, row.last, |cp: Int| tells(p.holds, cp, true)),
-      next: row.last + 1,
-    }
-  });
-  assert_eq(refused(walked.wrong, walked.next, 0x10FFFF, |cp: Int| tells(p.holds, cp, false)), [])
+  // A surrogate is no `Char`, so there is nothing to ask of one.
+  let wrong = unlike(rows, |cp: Int, listed: Option<Unit>|
+    match char::of_code_point(cp) { Some(c) -> (p.holds)(c) == (listed != None), None -> true });
+  assert_eq(wrong, [])
 }
 
 test "the files are the database's of the version std.ucd names" {
   let v = ucd::version();
-  let named = |file: Bytes, name: String|
-    bytes_starts_with(file, bytes_of_string(f"# {name}-{v.major}.{v.minor}.{v.update}.txt\n"));
-  assert(named(derived(), "DerivedCoreProperties"));
-  assert(named(embed("char/PropList.txt"), "PropList"));
-  assert_eq(string_of_bytes(embed("char/LICENSE")), ucd::license())
+  let version = f"{v.major}.{v.minor}.{v.update}";
+  assert_eq(ucd_files::version_of(ucd_files::derived_core_properties()), version);
+  assert_eq(ucd_files::version_of(ucd_files::prop_list()), version)
 }

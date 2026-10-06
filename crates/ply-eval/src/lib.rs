@@ -12,6 +12,7 @@ mod carry;
 pub mod codec;
 pub mod codes;
 pub mod compiled;
+pub mod crypto;
 pub mod decode;
 pub mod digest;
 pub mod escape;

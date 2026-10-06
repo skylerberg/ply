@@ -8,33 +8,43 @@
 //! reference. Only this module builds either, by reading text.
 //!
 //! The grammar is RFC 3986's, exactly, and not the WHATWG URL Standard's, which is what browsers
-//! do: this reader repairs nothing. A backslash, a tab, a newline, a space, a byte outside ASCII
-//! and a `%` that is no escape are refused wherever they stand, a second `@` is refused, and
-//! nothing is trimmed, so a text is read one way or not at all. The two standards differ where
-//! a validator and a fetcher that read one text two ways are led to different hosts, which is
-//! how server-side request forgery and open redirects happen. A refusal says where and why:
-//! `url_parse` answers it as an `Err` and `url_read` raises it.
+//! do: this reader repairs nothing. A backslash, a tab, a newline, a space, a character outside
+//! ASCII anywhere but in a host's name and a `%` that is no escape are refused wherever they
+//! stand, a second `@` is refused, and nothing is trimmed, so a text is read one way or not at
+//! all. The two standards differ where a validator and a fetcher that read one text two ways are
+//! led to different hosts, which is how server-side request forgery and open redirects happen. A
+//! refusal says where and why: `url_parse` answers it as an `Err` and `url_read` raises it.
 //!
 //! A host is typed: a `Name`, an IPv4 address or an IPv6 address, the last two `std.ip`'s and
 //! read by its strict readers. RFC 3986 takes any host that is not four decimal octets for a
 //! registered name, and other readers take `127.1`, `0x7f.0.0.1` and `2130706433` for
 //! addresses; a host whose last label is a number is therefore an address or refused
-//! (`NumericHost`), never a name. A percent-encoded host is refused (`EncodedHost`), and so is
-//! one outside ASCII: an internationalized name is read once `std.unicode` can make its
-//! A-labels, and until then a caller writes them (`xn--...`). A zone in brackets and an address
-//! of a future version are refused. `[::ffff:127.0.0.1]` is the IPv6 address it writes;
-//! `std.ip`'s classifiers read it as the IPv4 address it maps.
+//! (`NumericHost`), never a name. A zone in brackets and an address of a future version are
+//! refused. `[::ffff:127.0.0.1]` is the IPv6 address it writes; `std.ip`'s classifiers read it
+//! as the IPv4 address it maps.
+//!
+//! An internationalized name is read however it is written: as its A-labels (`xn--...`), in
+//! its own script, or as the escaped UTF-8 RFC 3986 §3.2.2 asks for. The last two are converted
+//! by `std.idna` under the checks the URL Standard gives a host, so `url_host` answers the
+//! A-labels a resolver is asked for whichever spelling was read, and a name that conversion
+//! refuses, or makes a number or a delimiter of, is no host (`Idna`, `NumericHost`).
+//! `url_display_host` is the name in Unicode. A name written in ASCII is only put in lower
+//! case, as a browser reads one and as DNS holds one: a label that opens `xn--` is not checked
+//! to be Punycode. An escape in a host spells only what needs one: one that hides an ASCII
+//! character, a digit or a dot of `%31%32%37.0.0.1` say, is refused (`EncodedHost`).
 //!
 //! A `Url` keeps its text: `url_render` of what `url_parse` read is the text read, to the
 //! character, and two URLs are equal, and order, as their texts do. So a program that checks a
 //! URL and hands it on hands on what it checked. The accessors answer what comparing spellings
-//! gets wrong: `url_scheme` is in lower case, `url_host` is typed with its name in lower case,
-//! and `url_port` is a number. `url_normalized` is the URL RFC 3986 §6.2.2 and §6.2.3 call
-//! equivalent: scheme and host in lower case, escapes in upper case, escaped unreserved
-//! characters written plain, dot segments removed, an empty path beside an authority made `/`,
-//! and a port that is empty or its scheme's default (`http`, `https`, `ws`, `wss`, `ftp`)
-//! dropped. Nothing normalizes unasked, since what is equivalent depends on the scheme; compare
-//! `url_normalized` of each to ask whether two URLs are.
+//! gets wrong: `url_scheme` is in lower case, `url_host` is typed with its name in lower case
+//! and in ASCII, and `url_port` is a number. `url_normalized` is the URL RFC 3986 §6.2.2 and
+//! §6.2.3 call equivalent: scheme and host in lower case, a name as its A-labels, escapes in
+//! upper case, escaped unreserved characters written plain, dot segments removed, an empty path
+//! beside an authority made `/`, and a port that is empty or its scheme's default (`http`,
+//! `https`, `ws`, `wss`, `ftp`) dropped. A normalized URL is ASCII, which is what a protocol
+//! carries; a text read with a name in its own script is not until it is normalized. Nothing
+//! normalizes unasked, since what is equivalent depends on the scheme; compare `url_normalized`
+//! of each to ask whether two URLs are.
 //!
 //! `show`, and so an interpolated string, writes `url_redacted`: the text with a password in
 //! the userinfo hidden, as §3.2.1 asks. `url_render` writes it.
@@ -55,6 +65,7 @@
 import std.bytes (peek, scan, scan_until, starts_at)
 import std.gen
 import std.gen (Gen)
+import std.idna
 import std.ip
 import std.ip (Ipv4, Ipv6)
 import std.laws (idempotent, round_trip)
@@ -69,8 +80,9 @@ pub type Pair = { name: String, value: String }
 
 /// What a URL's authority names.
 pub type Host =
-  /// A registered name in lower case, never empty: usually a DNS name, though any text of RFC
-  /// 3986's unreserved characters and sub-delimiters is one.
+  /// A registered name in lower case and in ASCII, never empty: usually a DNS name, an
+  /// internationalized one as its A-labels, though any text of RFC 3986's unreserved characters
+  /// and sub-delimiters is one.
   | Name(String)
   /// An IPv4 address, written as four decimal octets.
   | V4(Ipv4)
@@ -230,8 +242,7 @@ fn hex_value(c: Int) -> Int =
 
 /// Why a text is refused.
 pub type Why =
-  /// A byte outside ASCII. A URL writes one percent-encoded, and an internationalized host as
-  /// its A-labels.
+  /// A character outside ASCII anywhere but in a host's name. A URL writes one percent-encoded.
   | NotAscii
   /// A control character, a space, or one of `"<>\^{|}` and the backquote, which no part of a
   /// URL holds unencoded.
@@ -255,8 +266,13 @@ pub type Why =
   /// The host's last label is a number and the host is not four decimal octets: other readers
   /// take `127.1`, `0x7f.1` and `2130706433` for addresses.
   | NumericHost
-  /// A `%` in the host. An internationalized name is written as its A-labels.
+  /// An escape in the host that is no part of the UTF-8 of a character outside ASCII: a host's
+  /// ASCII is written plain, so an escape cannot hide a dot, a digit or a letter.
   | EncodedHost
+  /// The host is a name outside ASCII that is no domain name, and `std.idna` says why, each
+  /// problem by its label: UTS #46 refuses it under the checks the URL Standard gives a host,
+  /// or converts it to nothing or to a character no registered name holds.
+  | Idna(List<idna::Problem>)
   /// The port holds something other than decimal digits.
   | BadPort
   /// The port is past 65535.
@@ -265,8 +281,7 @@ pub type Why =
   /// `#` in a fragment.
   | Stray
 
-/// A refusal, and the offset in the text the reader stood at. Nothing outside ASCII is passed
-/// over, so the offset counts bytes and characters alike.
+/// A refusal, and the offset in the text the reader stood at, counted in characters.
 pub type Refusal = { at: Int, why: Why }
 
 /// What a reader of this module raises where it refuses.
@@ -278,7 +293,7 @@ pub effect url {
 /// A refusal's reason as a sentence, which is what a literal's diagnostic says.
 pub fn url_reason(why: Why) -> String =
   match why {
-    NotAscii -> "a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+    NotAscii -> "outside a host's name a URL is ASCII: write this percent-encoded",
     Forbidden -> "no part of a URL holds this character unencoded",
     BadEscape -> "two hex digits follow a `%`",
     NoScheme -> "a URL starts with a scheme and a `:`",
@@ -288,7 +303,10 @@ pub fn url_reason(why: Why) -> String =
     FutureAddress -> "an address of a future version is not read",
     Address(inner) -> "the host is no address: " ++ ip::reason(inner),
     NumericHost -> "a host that ends in a number is four decimal octets",
-    EncodedHost -> "a host holds no percent-encoding",
+    EncodedHost -> "an escape in a host spells a character outside ASCII and nothing else",
+    Idna(problems) ->
+      "the host is no domain name: "
+        ++ (match problems { [first, ..] -> idna::reason(first.why), [] -> "it is empty" }),
     BadPort -> "a port is decimal digits",
     PortRange -> "a port is at most 65535",
     Stray -> "this character cannot stand here unencoded",
@@ -301,7 +319,7 @@ pub fn url_parse(text: String) -> Result<Url, Refusal> / {abort.raise} = try { u
 
 /// The URL `text` writes, raising `url.refused` where `url_parse` answers `Err`.
 pub fn url_read(text: String) -> Url / {url.refused, abort.raise} = {
-  let parts = sectioned(text);
+  let parts = placed(text);
   match parts.scheme { Some(_) -> Url(text, parts), None -> refuse(0, NoScheme) }
 }
 
@@ -311,7 +329,21 @@ pub fn reference_parse(text: String) -> Result<Reference, Refusal> / {abort.rais
 
 /// The reference `text` writes, raising `url.refused` where `reference_parse` answers `Err`.
 pub fn reference_read(text: String) -> Reference / {url.refused, abort.raise} =
-  Reference(text, sectioned(text))
+  Reference(text, placed(text))
+
+/// The parts of `text`, a refusal's place counted in characters where the reader counts bytes.
+fn placed(text: String) -> Parts / {url.refused, abort.raise} =
+  match try { sectioned(text) } {
+    Ok(parts) -> parts,
+    Err(refused) -> {
+      let b = bytes_of_string(text);
+      refuse(
+        if string_len(text) == bytes_len(b) { refused.at }
+        else { string_len(string_of_bytes_lossy(bytes_slice(b, 0, refused.at))) },
+        refused.why,
+      )
+    },
+  }
 
 /// What a `url"..."` literal is checked by: the URL the text writes, or the character that keeps
 /// it from being one.
@@ -341,7 +373,9 @@ fn url_bytes() -> Bytes = bytes_concat(query_bytes(), b"#[]")
 
 /// The parts of a URL or a relative reference, each checked against its own grammar.
 fn sectioned(text: String) -> Parts / {url.refused, abort.raise} = {
-  let b = vetted(bytes_of_string(text));
+  let raw = bytes_of_string(text);
+  let name = name_span(raw);
+  let b = vetted(raw, name.from, name.to);
   let n = bytes_len(b);
   let hier = scheme_end(b);
   let slashed = bytes_starts_with(bytes_slice(b, hier, n), b"//");
@@ -360,10 +394,30 @@ fn sectioned(text: String) -> Parts / {url.refused, abort.raise} = {
   }
 }
 
-/// `b`, refusing the first byte no URL holds and the first `%` that is no escape.
-fn vetted(b: Bytes) -> Bytes / {url.refused, abort.raise} = {
+/// Where a host's name stands in `b`, the one place a character outside ASCII is read: after the
+/// userinfo and before the port. Empty where there is no authority or the host opens a bracket.
+fn name_span(b: Bytes) -> { from: Int, to: Int } / {abort.raise} = {
+  let stop = scan_until(b, 0, b":/?#");
+  let hier = if peek(b, stop) == b':' { stop + 1 } else { 0 };
+  if !starts_at(b, hier, b"//") { { from: 0, to: 0 } } else {
+    let end = scan_until(b, hier + 2, b"/?#");
+    let at = scan_until(b, hier + 2, b"@");
+    let from = if at < end { at + 1 } else { hier + 2 };
+    if peek(b, from) == b'[' { { from: 0, to: 0 } }
+    else { { from: from, to: min(end, scan_until(b, from, b":")) } }
+  }
+}
+
+/// `b`, refusing the first byte no URL holds, a byte outside ASCII from `open` to `close`
+/// apart, and the first `%` that is no escape.
+fn vetted(b: Bytes, open: Int, close: Int) -> Bytes / {url.refused, abort.raise} = {
   let n = bytes_len(b);
-  let stop = scan(b, 0, url_bytes());
+  let held = url_bytes();
+  let stop = iterate(0, n + 1, |at: Int| {
+    let next = scan(b, at, held);
+    if next < n && next >= open && next < close && bytes_at(b, next) >= 128 { Continue(next + 1) }
+    else { Stop(next) }
+  });
   if stop < n { refuse(stop, if bytes_at(b, stop) >= 128 { NotAscii } else { Forbidden }) } else {
     let bad = iterate(0, n + 1, |at: Int| {
       let mark = scan_until(b, at, b"%");
@@ -442,19 +496,74 @@ fn bracketed(inside: Bytes, base: Int) -> Ipv6 / {url.refused, abort.raise} =
 
 /// The host a text with no brackets names: four decimal octets, or a registered name no reader
 /// takes for a number.
-fn named_host(h: Bytes, base: Int) -> Host / {url.refused, abort.raise} = {
-  let n = bytes_len(h);
-  let stop = scan(h, 0, name_bytes());
-  if stop < n { refuse(base + stop, if bytes_at(h, stop) == b'%' { EncodedHost } else { Stray }) }
-  else {
+fn named_host(h: Bytes, base: Int) -> Host / {url.refused, abort.raise} =
+  if scan(h, 0, name_bytes()) < bytes_len(h) { international_host(h, base) } else {
     match ip::parse_v4(string_of_bytes(h)) {
       Ok(four) -> V4(four),
-      Err(refused) -> if scan(h, 0, b"0123456789.") >= n {
+      Err(refused) -> if scan(h, 0, b"0123456789.") >= bytes_len(h) {
         refuse(base + refused.at, Address(refused.why))
       } else if ends_in_number(h) { refuse(base, NumericHost) }
       else { Name(string::ascii_lower(string_of_bytes(h))) },
     }
   }
+
+/// The name a host with an escape or a character outside ASCII spells, as its A-labels.
+fn international_host(h: Bytes, base: Int) -> Host / {url.refused, abort.raise} = {
+  let n = bytes_len(h);
+  let held = bytes_concat(name_bytes(), b"%");
+  let stray = iterate(0, n + 1, |at: Int| {
+    let next = scan(h, at, held);
+    if next < n && bytes_at(h, next) >= 128 { Continue(next + 1) } else { Stop(next) }
+  });
+  if stray < n { refuse(base + stray, Stray) } else {
+    let spelled = unescaped_name(h, base);
+    if !bytes_is_utf8(spelled) { refuse(base + scan_until(h, 0, b"%"), EncodedHost) } else {
+      match idna::to_ascii(string_of_bytes(spelled), idna::web()) {
+        Err(problems) -> refuse(base, Idna(problems)),
+        Ok(name) -> registered(name, base),
+      }
+    }
+  }
+}
+
+/// The bytes so far, and where the next escape stands in the host.
+type Unescaping = { out: Bytes, at: Int }
+
+/// The bytes a host's name spells once its escapes are read, each one a byte past ASCII.
+fn unescaped_name(h: Bytes, base: Int) -> Bytes / {url.refused, abort.raise} = {
+  let pieces = bytes_split(h, b"%");
+  let plain = at_or(pieces, 0, b"");
+  fold(
+    drop(pieces, 1),
+    { out: plain, at: bytes_len(plain) },
+    |so_far: Unescaping, piece: Bytes| {
+      let byte = hex_value(bytes_at(piece, 0)) * 16 + hex_value(bytes_at(piece, 1));
+      if byte < 128 { refuse(base + so_far.at, EncodedHost) } else {
+        {
+          out: bytes_concat_all([
+            so_far.out,
+            byte_of_int(byte),
+            bytes_slice(piece, 2, bytes_len(piece)),
+          ]),
+          at: so_far.at + 1 + bytes_len(piece),
+        }
+      }
+    },
+  ).out
+}
+
+/// The host `name` is, `std.idna` having made it: a name, unless it is empty, holds a character
+/// no registered name holds, as the delimiters some compatibility characters map to, or is one
+/// a reader takes for a number.
+fn registered(name: String, base: Int) -> Host / {url.refused, abort.raise} = {
+  let b = bytes_of_string(name);
+  let n = bytes_len(b);
+  let stop = scan(b, 0, name_bytes());
+  if n == 0 { refuse(base, Idna([{ label: 0, why: idna::EmptyLabel }])) } else if stop < n {
+    let label = len(bytes_split(bytes_slice(b, 0, stop), b".")) - 1;
+    refuse(base, Idna([{ label: label, why: idna::Disallowed }]))
+  } else if scan(b, 0, b"0123456789.") >= n || ends_in_number(b) { refuse(base, NumericHost) }
+  else { Name(name) }
 }
 
 /// Whether the host's last label, a final `.` aside, is decimal digits or `0x` and hex digits.
@@ -555,8 +664,24 @@ pub fn url_userinfo(u: Url) -> Option<String> =
 pub fn url_host(u: Url) -> Option<Host> =
   match parts_of(u).authority { Some(a) -> a.named, None -> None }
 
-/// The host and port as written, without userinfo: what an HTTP `Host` field carries. `None`
-/// where the URL has no authority.
+/// The host as a person reads it: a name with each label that is an A-label in Unicode, as
+/// `idna::to_unicode` shows it under the checks the URL Standard gives a host, and an address as
+/// `url_normalized` writes one. A label that opens `xn--` and is no A-label is shown as written.
+/// `None` where `url_host` is. Nothing here judges whether a name is safe to show: telling
+/// lookalikes apart is a display policy's.
+pub fn url_display_host(u: Url) -> Option<String> / {abort.raise} =
+  match url_host(u) {
+    None -> None,
+    Some(Name(name)) -> if !string_contains(name, "xn--") { Some(name) } else {
+      let shown = idna::to_unicode(name, idna::web());
+      Some(if len(shown.problems) == 0 { shown.name } else { name })
+    },
+    Some(V4(four)) -> Some(ip::render_v4(four)),
+    Some(V6(six)) -> Some("[" ++ ip::render_v6(six) ++ "]"),
+  }
+
+/// The host and port as written, without userinfo. `None` where the URL has no authority. What
+/// an HTTP `Host` field carries is this of the normalized URL, which is ASCII.
 pub fn url_host_port(u: Url) -> Option<String> =
   match parts_of(u).authority {
     Some(a) -> Some(a.host ++ (match a.port { Some(port) -> ":" ++ port, None -> "" })),
@@ -917,6 +1042,12 @@ fn host_text_gen() -> Gen<String> / {abort.raise} =
       "a",
       "localhost",
       "xn--bcher-kva.example",
+      "B\u{FC}cher.example",
+      "b%C3%BCcher.Example",
+      "\u{4F8B}\u{3048}\u{3002}jp",
+      "fa\u{DF}.de.",
+      "xn--a",
+      "\u{5D0}\u{5D1}.xn--4dbc",
       "a-b.c_d",
       "sub.Example.ORG.",
       "1.2.3.4.example",
@@ -1073,6 +1204,40 @@ law "a normalized URL is sound, and normalizing it again changes nothing"
   }
 
 law "normalizing twice is normalizing once" = idempotent(url_normalized)
+
+law "a normalized URL is ASCII, and so is a name however it was written"
+  forall (u: Url) {
+    string::is_ascii(url_render(url_normalized(u)))
+      && (match url_host(u) { Some(Name(name)) -> string::is_ascii(name), _ -> true })
+  }
+
+law "a name is what `std.idna` makes of it as written, an `xn--` label written in ASCII apart"
+  forall (u: Url) {
+    match parts_of(u).authority {
+      None -> true,
+      Some(a) -> match a.named {
+        Some(Name(name)) -> if string::is_ascii(a.host) && string_contains(name, "xn--") { true }
+        else {
+          match url_decode(a.host) {
+            Some(spelled) -> idna::to_ascii(spelled, idna::web()) == Ok(name),
+            None -> false,
+          }
+        },
+        _ -> true,
+      },
+    }
+  }
+
+law "a host shown reads back as the host it shows"
+  forall (u: Url) {
+    match url_display_host(u) {
+      None -> url_host(u) == None,
+      Some(shown) -> match url_parse("x://" ++ shown) {
+        Ok(again) -> url_host(again) == url_host(u),
+        Err(_) -> false,
+      },
+    }
+  }
 
 fn dot_free(path: String) -> Bool / {abort.raise} =
   !any(string_split(path, "/"), |segment: String| segment == "." || segment == "..")
@@ -1599,8 +1764,30 @@ fn refused_urls() -> List<Refused> =
     { text: "http://a/\0", at: 9, why: Forbidden },
     { text: "http://a/\u{7F}", at: 9, why: Forbidden },
     { text: "http://a/\u{E9}", at: 9, why: NotAscii },
-    { text: "http://b\u{FC}cher.example/", at: 8, why: NotAscii },
-    { text: "http://\u{4F8B}\u{3048}.jp/", at: 7, why: NotAscii },
+    { text: "http://b\u{FC}cher.example/\u{E9}", at: 22, why: NotAscii },
+    { text: "http://\u{E9}@b\u{FC}cher.example/", at: 7, why: NotAscii },
+    { text: "http://b\u{FC}cher.example:\u{661}/", at: 22, why: NotAscii },
+    { text: "http://[\u{E9}]/", at: 8, why: NotAscii },
+    { text: "\u{E9}://a/", at: 0, why: NotAscii },
+    { text: "http://b\u{FC}cher.example:x/", at: 22, why: BadPort },
+    { text: "http://\u{FFFD}.example/", at: 7, why: Idna([{ label: 0, why: idna::Disallowed }]) },
+    { text: "http://a.\u{200D}b.example/", at: 7, why: Idna([{ label: 1, why: idna::Joiner }]) },
+    { text: "http://\u{5D0}a.b\u{FC}cher/", at: 7, why: Idna([{ label: 0, why: idna::Bidi }]) },
+    { text: "http://xn--a.b\u{FC}cher/", at: 7, why: Idna([{ label: 0, why: idna::Disallowed }]) },
+    { text: "http://\u{AD}/", at: 7, why: Idna([{ label: 0, why: idna::EmptyLabel }]) },
+    {
+      text: "http://a.b\u{FF0F}c.\u{E9}/",
+      at: 7,
+      why: Idna([{ label: 1, why: idna::Disallowed }]),
+    },
+    { text: "http://\u{FF05}41.\u{E9}/", at: 7, why: Idna([{ label: 0, why: idna::Disallowed }]) },
+    { text: "http://\u{FF11}\u{FF12}\u{FF17}.0.0.1/", at: 7, why: NumericHost },
+    { text: "http://\u{E9}.\u{FF10}x7f/", at: 7, why: NumericHost },
+    { text: "http://\u{3002}/", at: 7, why: NumericHost },
+    { text: "http://b%C3%BCcher.ex%61mple/", at: 21, why: EncodedHost },
+    { text: "http://b%FCcher.example/", at: 8, why: EncodedHost },
+    { text: "http://b\u{FC}%C3.example/", at: 9, why: EncodedHost },
+    { text: "http://b\u{FC}cher[.example/", at: 13, why: Stray },
     { text: "http://a/%", at: 9, why: BadEscape },
     { text: "http://a/%2", at: 9, why: BadEscape },
     { text: "http://a/%zz", at: 9, why: BadEscape },
@@ -1642,7 +1829,7 @@ fn refused_urls() -> List<Refused> =
     { text: "http://1.2.3.04a.5/", at: 7, why: NumericHost },
     { text: "http://ex%61mple.com/", at: 9, why: EncodedHost },
     { text: "http://%31%32%37.0.0.1/", at: 7, why: EncodedHost },
-    { text: "http://%E4%BE%8B.jp/", at: 7, why: EncodedHost },
+    { text: "http://example%2Ecom/", at: 14, why: EncodedHost },
     { text: "http://a:b/", at: 9, why: BadPort },
     { text: "http://a:80:443/", at: 11, why: BadPort },
     { text: "http://a:-1/", at: 9, why: BadPort },
@@ -1842,17 +2029,11 @@ fn confusions() -> List<Answer> =
       text: "http://example.com/ ",
       answer: "refused at 19: no part of a URL holds this character unencoded",
     },
-    {
-      text: "http://ex\u{AD}ample.com/",
-      answer: "refused at 9: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
-    },
-    {
-      text: "http://\u{FF45}xample.com/",
-      answer: "refused at 7: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
-    },
+    { text: "http://ex\u{AD}ample.com/", answer: "name example.com, path /" },
+    { text: "http://\u{FF45}xample.com/", answer: "name example.com, path /" },
     {
       text: "http://example.com\u{FF0F}@evil.com/",
-      answer: "refused at 18: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+      answer: "refused at 18: outside a host's name a URL is ASCII: write this percent-encoded",
     },
     {
       text: "http://1.1.1.1 &@2.2.2.2# @3.3.3.3/",
@@ -1873,6 +2054,25 @@ fn confusions() -> List<Answer> =
     { text: "http://example.com.:80/", answer: "name example.com., path /" },
     { text: "http://EXAMPLE.com/", answer: "name example.com, path /" },
     { text: "http://xn--bcher-kva.example/", answer: "name xn--bcher-kva.example, path /" },
+    { text: "http://B\u{FC}cher.example/", answer: "name xn--bcher-kva.example, path /" },
+    { text: "http://b%C3%BCcher.example/", answer: "name xn--bcher-kva.example, path /" },
+    { text: "http://bu\u{308}cher.example/", answer: "name xn--bcher-kva.example, path /" },
+    { text: "http://\u{4F8B}\u{3048}\u{3002}jp/", answer: "name xn--r8jz45g.jp, path /" },
+    { text: "http://fa\u{DF}.de/", answer: "name xn--fa-hia.de, path /" },
+    { text: "http://xn--a/", answer: "name xn--a, path /" },
+    { text: "http://XN--BCHER-KVA.example/", answer: "name xn--bcher-kva.example, path /" },
+    {
+      text: "http://a\u{FF20}evil.\u{E9}/",
+      answer: "refused at 7: the host is no domain name: a label holds a character no domain name holds",
+    },
+    {
+      text: "http://evil.com\u{FF0F}@example.com/",
+      answer: "refused at 15: outside a host's name a URL is ASCII: write this percent-encoded",
+    },
+    {
+      text: "http://example.com\u{FF03}@evil.com/",
+      answer: "refused at 18: outside a host's name a URL is ASCII: write this percent-encoded",
+    },
   ]
 
 test "`{visible(c.text)}` is {c.answer}" for c: Answer in confusions() {
@@ -1916,6 +2116,13 @@ fn normals() -> List<Normal> =
     { text: "http://h?", normal: "http://h/?" },
     { text: "http://@h", normal: "http://@h/" },
     { text: "http://h/a+b%20c?d+e%20f", normal: "http://h/a+b%20c?d+e%20f" },
+    { text: "http://B\u{FC}cher.example", normal: "http://xn--bcher-kva.example/" },
+    { text: "HTTP://b%c3%bccher.EXAMPLE:80/", normal: "http://xn--bcher-kva.example/" },
+    { text: "http://XN--Bcher-KVA.example/", normal: "http://xn--bcher-kva.example/" },
+    {
+      text: "https://u@\u{4F8B}\u{3048}\u{FF0E}jp:8443/%7e",
+      normal: "https://u@xn--r8jz45g.jp:8443/~",
+    },
   ]
 
 test "`{c.text}` normalizes to `{c.normal}`" for c: Normal in normals() {
@@ -1929,6 +2136,20 @@ test "URLs are equal as their texts are, and equivalent as their normal forms ar
     url_normalized(read("http://example.com/")),
     url_normalized(read("HTTP://EXAMPLE.COM:80/")),
   );
+  let spellings = map(
+    ["http://b\u{FC}cher.example/", "http://b%C3%BCcher.example/", "http://xn--bcher-kva.example/"],
+    read,
+  );
+  assert_eq(map(spellings, url_render), [
+    "http://b\u{FC}cher.example/",
+    "http://b%C3%BCcher.example/",
+    "http://xn--bcher-kva.example/",
+  ]);
+  assert_eq(map(spellings, url_host), map(spellings, |_: Url| Some(Name("xn--bcher-kva.example"))));
+  assert_eq(
+    map(spellings, url_normalized),
+    map(spellings, |_: Url| read("http://xn--bcher-kva.example/")),
+  );
   assert_eq(compare(read("http://a/"), read("http://b/")), Less);
   let seen: Map<Url, Int> = map_insert(
     map_insert(map_new(), read("http://b/"), 2),
@@ -1936,6 +2157,24 @@ test "URLs are equal as their texts are, and equivalent as their normal forms ar
     1,
   );
   assert_eq(map(map_keys(seen), url_render), ["http://a/", "http://b/"])
+}
+
+test "a host is shown in Unicode where its labels are A-labels, and as written where they are not" {
+  let shown = |text: String| url_display_host(read(text));
+  assert_eq(shown("http://xn--bcher-kva.example/"), Some("b\u{FC}cher.example"));
+  assert_eq(shown("http://B\u{FC}CHER.example:80/"), Some("b\u{FC}cher.example"));
+  assert_eq(shown("http://%E4%BE%8B%E3%81%88.JP/"), Some("\u{4F8B}\u{3048}.jp"));
+  assert_eq(shown("http://xn--fa-hia.de/"), Some("fa\u{DF}.de"));
+  assert_eq(shown("http://EXAMPLE.com/"), Some("example.com"));
+  assert_eq(shown("http://xn--a.example/"), Some("xn--a.example"));
+  assert_eq(shown("http://xn--abc-.example/"), Some("xn--abc-.example"));
+  assert_eq(shown("http://192.0.2.1/"), Some("192.0.2.1"));
+  assert_eq(shown("http://[2001:DB8::1]/"), Some("[2001:db8::1]"));
+  assert_eq(shown("mailto:a@example.com"), None);
+  assert_eq(
+    url_host_port(url_normalized(read("http://B\u{FC}cher.example:8080/"))),
+    Some("xn--bcher-kva.example:8080"),
+  )
 }
 
 test "a URL is shown with its password hidden, and rendered with it" {
