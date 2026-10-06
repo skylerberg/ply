@@ -4,12 +4,15 @@
 //! library's own.
 
 import std.asn1
-import std.asn1 (asn1, Bits, Read, Reader, Text, Time, Value)
+import std.asn1 (asn1, Bits, Read, Reader, Text, Value)
 import std.bigint
 import std.bytes (bytes_of_hex)
+import std.date
+import std.date (OffsetDateTime)
 import std.list (flatten)
 import std.oid
 import std.oid (Oid)
+import std.timestamp
 
 type Fixture = { name: String, bytes: Bytes }
 
@@ -34,8 +37,8 @@ type Body = {
   serial: Bytes,
   signed_with: Algorithm,
   issuer: List<Attribute>,
-  not_before: Time,
-  not_after: Time,
+  not_before: OffsetDateTime,
+  not_after: OffsetDateTime,
   subject: List<Attribute>,
   key_algorithm: Algorithm,
   key: Bits,
@@ -129,9 +132,6 @@ fn certificate(r: Reader) -> Read<Certificate> / {asn1.refused, abort.raise} =
     }
   })
 
-fn at_midnight(year: Int, month: Int, day: Int) -> Time =
-  { year: year, month: month, day: day, hour: 0, minute: 0, second: 0, nanosecond: 0 }
-
 fn value_of(extensions: List<Extension>, id: Oid) -> Bytes / {abort.raise} =
   match filter(extensions, |e: Extension| e.id == id) {
     [found, ..] -> found.value,
@@ -155,8 +155,8 @@ test "a certificate's fields are what openssl printed of it" {
   assert_eq(c.algorithm, c.body.signed_with);
   assert_eq(c.body.issuer, names);
   assert_eq(c.body.subject, names);
-  assert_eq(c.body.not_before, at_midnight(2026, 1, 1));
-  assert_eq(c.body.not_after, at_midnight(2036, 1, 1));
+  assert_eq(c.body.not_before, timestamp"2026-01-01T00:00:00Z");
+  assert_eq(c.body.not_after, timestamp"2036-01-01T00:00:00Z");
   assert_eq(c.body.key_algorithm.id, oid::rsa_encryption());
   assert_eq(map(c.body.extensions, |e: Extension| { id: f"{e.id}", critical: e.critical }), [
     { id: "2.5.29.14", critical: false },
@@ -167,6 +167,30 @@ test "a certificate's fields are what openssl printed of it" {
   ]);
   assert_eq((c.signature.unused, bytes_len(c.signature.bytes)), (0, 256));
   assert_eq(bytes_len(c.signed), 639)
+}
+
+type Validity = { certificate: String, not_before: Int, not_after: Int }
+
+/// Each certificate's validity in Unix seconds: the dates `openssl x509 -dates` prints of the
+/// files, counted from 1970 by another program.
+fn validities() -> List<Validity> =
+  [
+    { certificate: "rsa_certificate.der", not_before: 1767225600, not_after: 2082758400 },
+    { certificate: "ec_certificate.der", not_before: 2524607999, not_after: 2840140800 },
+  ]
+
+test "{v.certificate} is valid between its two instants" for v: Validity in validities() {
+  let whole = |seconds: Int|
+    match date::of_unix_seconds(seconds) { Some(t) -> t, None -> panic("an instant") };
+  let read = match filter(fixtures(), |f: Fixture| f.name == v.certificate) {
+    [f, ..] -> asn1::read_with(f.bytes, 12, certificate).body,
+    [] -> panic(f"no fixture {v.certificate}"),
+  };
+  assert_eq(read.not_before, whole(v.not_before));
+  assert_eq(read.not_after, whole(v.not_after));
+  assert_eq(date::instant(read.not_before), Some(Instant(v.not_before * 1000000000)));
+  assert_eq(date::instant(read.not_after), Some(Instant(v.not_after * 1000000000)));
+  assert_eq(date::offset_minutes(read.not_before), 0)
 }
 
 test "a certificate's extensions are DER inside an OCTET STRING" {
@@ -299,16 +323,8 @@ test "an RSA key's primes multiply to the modulus its certificate carries" {
 
 test "a certificate past 2049 writes its time the other way, and its key is its signer's" {
   let c = asn1::read_with(ec_certificate(), 12, certificate);
-  assert_eq(c.body.not_before, {
-    year: 2049,
-    month: 12,
-    day: 31,
-    hour: 23,
-    minute: 59,
-    second: 59,
-    nanosecond: 0,
-  });
-  assert_eq(c.body.not_after, at_midnight(2060, 1, 1));
+  assert_eq(c.body.not_before, timestamp"2049-12-31T23:59:59Z");
+  assert_eq(c.body.not_after, timestamp"2060-01-01T00:00:00Z");
   assert_eq(asn1::time(c.body.not_before), b"\x17\x0d491231235959Z");
   assert_eq(asn1::time(c.body.not_after), b"\x18\x0f20600101000000Z");
   assert_eq(c.body.key_algorithm, {
