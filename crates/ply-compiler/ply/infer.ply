@@ -17,11 +17,11 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               InstanceDef, InstanceKind, NKey, NShow, NGen, instance_text, INumeric, NumericDef,
               NumericOp, numeric_ops, numeric_by, is_pub, Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered,
-              ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at, case_identity,
-              call_operator, written_operator)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
+              ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
+              NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic,
+              is_ordered, ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at,
+              case_identity, call_operator, written_operator)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -37,12 +37,12 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row,
               is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
               solve_continuation_row, free_vars, unify, unify_row, covariant_con, env_new, env_push,
-              env_pop, env_bind, env_bind_global, env_remove_global, env_lookup, env_depth_of,
-              env_locals, instantiate_with, instantiate, rename_scheme, generalize, region_prefix,
-              region_of, label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
-              scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
-              print_row, applied_args, at_arguments, over_arg, TyNominal, record_fields, arg_label,
-              arg_row)
+              env_pop, env_bind, env_bind_global, env_remove_global, env_lookup, env_local,
+              env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme, generalize,
+              region_prefix, region_of, label_type, label_of, resolve_atom, atom_text, atoms_text,
+              resource_text, scheme_text, type_text, row_text, Printer, printer_new, printer_naming,
+              print_ty, print_row, applied_args, at_arguments, over_arg, TyNominal, record_fields,
+              arg_label, arg_row)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin)
@@ -55,7 +55,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find_module_binding)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
-                expand_tagged, takes_gen)
+                expand_tagged, expand_holds, takes_gen)
 import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -67,6 +67,8 @@ import std.bytes (ascii_of_int)
 import std.option (option_traverse)
 import std.string (ascii_lower, ascii_upper)
 import std.text (closest)
+import guards
+import guards (Guards, Contract, Clause, Reader, Local, Elsewhere)
 
 // --- What the checker keeps ----------------------------------------------------------
 
@@ -149,11 +151,38 @@ pub type DefInfo = {
   ending: Ending,
   /// How it calls the functions it is handed and what it answers, which callers' endings read.
   summary: Summary,
+  /// Where its body can raise `abort.raise`, and why nothing there rules the raise out.
+  raises: List<Raise>,
   row_aliases: List<Bytes>,
   constraints: List<DefConstraint>,
   spec: List<SpecInfo>,
   at: Location,
 }
+/// Why a place in a body can raise `abort.raise`.
+pub type RaiseWhy =
+  /// A builtin called where `needs`, a clause of its `requires` as the prelude writes it, is not
+  /// shown.
+  | Unshown({ callee: Bytes, needs: Bytes })
+  /// A builtin that states no `requires`: nothing a call shows rules its raise out.
+  | Unguarded(Bytes)
+  /// A definition whose row names the raise.
+  | Calls(Bytes)
+  /// A `/` or `%` whose divisor nothing shows is other than zero.
+  | ZeroDivisor
+  /// A `let` whose pattern can miss.
+  | Misses
+  /// An operation that raises it, performed.
+  | Performed
+  /// A function value whose type says it may.
+  | Handed
+/// `span` counts from where the definition starts, so a raise filed for a definition is where it
+/// is wherever the definition moves to.
+pub type Raise = { span: Span, why: RaiseWhy }
+
+derive bin for RaiseWhy
+derive bin for Raise
+
+type RaiseNote = { span: Span, why: RaiseWhy }
 pub type TestInfo = {
   name: Bytes,
   module: Bytes,
@@ -272,9 +301,11 @@ type ClauseSite = { span: Span, op: Atom, ty: Type }
 /// `around` holds the clauses of every `handle` between the spawn and the region's open.
 type SpawnSite = { span: Span, ty: Type, around: List<ClauseSite> }
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
+/// `hold`: a `with_hold` opened it, which no other region of its name may nest in.
 type OpenRegion = {
   name: Bytes,
   span: Span,
+  hold: Bool,
   simulate_depth: Int,
   spawns: List<SpawnSite>,
   handoffs: List<HandoffSite>,
@@ -284,6 +315,7 @@ type RegionSite = {
   module: Int,
   name: Bytes,
   span: Span,
+  hold: Bool,
   body_span: Span,
   body_ty: Type,
   exits: List<Span>,
@@ -291,8 +323,9 @@ type RegionSite = {
   spawns: List<SpawnSite>,
   handoffs: List<HandoffSite>,
 }
-/// What may not outlive a region: a `with_cell[r]` region's cells, a `simulate` region's tasks.
-type Brand = | CellsOf(Bytes) | Tasks
+/// What may not outlive a region: a `with_cell[r]` region's cells, a `with_hold[r]` region's hold
+/// and every function that reads a hold, a `simulate` region's tasks.
+type Brand = | CellsOf(Bytes) | HoldsOf(Bytes) | Tasks
 type Opened = { name: Bytes, span: Span }
 /// A local bound outside the innermost `simulate` region, named inside it.
 type Crossing = { name: Bytes, span: Span }
@@ -362,6 +395,7 @@ pub type KnownDef = {
   repeats: List<Int>,
   ending: Ending,
   summary: Summary,
+  raises: List<Raise>,
   /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
   facts: Bytes,
 }
@@ -457,6 +491,12 @@ type Checker = {
   recursed: Option<Span>,
   /// The written row of the definition being checked; empty when it wrote none, or for a test or law.
   declared_atoms: List<Atom>,
+  /// What the conditions on the way to the expression being inferred hold.
+  guards: Guards,
+  /// What the prelude states of each builtin.
+  contracts: Map<Bytes, Contract>,
+  /// Why a raise recorded in `performs` was kept, by where it is.
+  raise_notes: List<RaiseNote>,
   comparisons: List<{ module: Int, span: Span, ty: Type }>,
   scope: Int,
   constraints: Map<Bytes, List<DefConstraint>>,
@@ -542,6 +582,7 @@ type Count = {
   repeats: List<Int>,
   tail_over: Option<Span>,
   recursed: Option<Span>,
+  raises: List<Raise>,
 }
 
 /// A body's row, and of its atoms and its parameters, what it performs or calls a number of times that
@@ -552,10 +593,22 @@ type Counted = {
   scaling: List<PerformSite>,
   repeats: List<Int>,
   tail_over: Option<Span>,
+  raises: List<Raise>,
 }
 type Generalized = { env: TypeEnv, scheme: Scheme }
 
 fn cell() -> Bytes = b"cell"
+
+/// The effect of reading a hold, which a `with_hold` region answers.
+fn hold() -> Bytes = b"hold"
+
+fn hold_atom() -> Atom = { effect: hold(), resource: RSingleton, mode: MRead, op: None }
+
+/// The effects a region answers and nothing declares.
+fn is_region_effect(name: Bytes) -> Bool = name == cell() || name == hold()
+
+/// A cell or a hold: each carries the region that made it as a first, unwritten argument.
+fn is_region_type(name: Bytes) -> Bool = name == b"Cell" || name == b"Hold"
 fn compare_values_name() -> Bytes = b"compare_values"
 fn result_name() -> Bytes = b"result"
 
@@ -695,6 +748,7 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Array", arity: 1 },
     { name: b"Map", arity: 2 },
     { name: b"Cell", arity: 1 },
+    { name: b"Hold", arity: 1 },
     { name: b"Secret", arity: 1 },
     { name: b"Task", arity: 1 },
     { name: b"Chan", arity: 1 },
@@ -855,6 +909,12 @@ fn prelude_op(
     }),
   }
 
+fn pair_type(first: Type, second: Type) -> Type =
+  TyRecord([{ name: b"_0", ty: first }, { name: b"_1", ty: second }])
+
+/// The operations whose place in a closure's row shows a channel it captured.
+fn channel_ops() -> List<Bytes> = [b"send", b"recv", b"close", b"select"]
+
 pub fn prelude_effects() -> List<EffectInfo> = {
   let ta = TyVar(0);
   let body = fn_type([], ta, row_open(0));
@@ -883,6 +943,17 @@ pub fn prelude_effects() -> List<EffectInfo> = {
         // `None` once the channel is closed and empty.
         prelude_op(b"recv", MWrite, [0], [], [chan], option_type(ta), row_empty()),
         prelude_op(b"close", MWrite, [0], [], [chan], unit_type(), row_empty()),
+        // An arm is a channel beside `Some` of what to send on it, or `None` to receive; the
+        // answer is the arm that went beside what it took or sent, `None` for a closed channel.
+        prelude_op(
+          b"select",
+          MWrite,
+          [0],
+          [],
+          [list_type(pair_type(chan, option_type(ta))), bool_type()],
+          option_type(pair_type(int_type(), option_type(ta))),
+          row_empty(),
+        ),
       ],
     },
     {
@@ -950,6 +1021,10 @@ pub type Builtin = {
   params: List<Bytes>,
   doc: List<Bytes>,
   constraints: List<DefConstraint>,
+  /// Each `requires` and `ensures` as the prelude writes it.
+  clauses: List<Bytes>,
+  /// The same as the checker reads them, a `requires` for each condition `&&` joins.
+  contract: Contract,
 }
 
 /// What a declaration's types are read against: the variables its generic list binds, and the types
@@ -1009,7 +1084,7 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
             let args = declared_types(d, c.args);
             if builtin_type_arity(name) != Some(len(args.tys)) {
               panic(misdeclared(b"names a type that is not the language's own at that arity", name))
-            } else if name == b"Cell" {
+            } else if is_region_type(name) {
               let region = fresh_ty(args.d.fresh);
               {
                 d: { ..args.d, fresh: region.fresh },
@@ -1022,7 +1097,7 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
     },
   }
 
-/// A declaration's row: `abort.raise`, a row variable, both or neither.
+/// A declaration's row: `abort.raise`, `hold.read`, a row variable, or none of them.
 fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
@@ -1032,7 +1107,12 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
           if is_bare(a.eff) && a.eff.name.name == b"abort"
               && (match a.op { Some(op) -> op.name == b"raise", None -> false }) {
             atoms_insert(acc, abort_atom())
-          } else { panic(misdeclared(b"performs more than `abort.raise`", a.eff.name.name)) }),
+          } else if is_bare(a.eff) && a.eff.name.name == hold()
+              && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, MRead) }) {
+            atoms_insert(acc, hold_atom())
+          } else {
+            panic(misdeclared(b"performs more than `abort.raise` and `hold.read`", a.eff.name.name))
+          }),
         tail: match r.tail {
           None -> None,
           Some(v) -> match map_get(d.rows, v.name) {
@@ -1056,7 +1136,56 @@ fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
       _ -> acc,
     })
 
-fn declared(imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.raise} = {
+/// The conditions `&&` joins, each with the text it is written as.
+fn conjuncts(source: Bytes, e: Expr) -> List<Clause> / {abort.raise} =
+  match e {
+    EBinary(b) -> if b.op != b"and" { [written_clause(source, e)] }
+    else { concat(conjuncts(source, b.lhs), conjuncts(source, b.rhs)) },
+    _ -> [written_clause(source, e)],
+  }
+
+fn written_clause(source: Bytes, e: Expr) -> Clause / {abort.raise} = {
+  let span = expr_span(e);
+  { holds: e, text: bytes_slice(source, span.start, span.end) }
+}
+
+/// What a call's answer is a function of: no parameter is a function or a cell.
+fn answers_by_value(params: List<Type>) -> Bool =
+  fold(params, true, |ok: Bool, ty: Type|
+    ok && (match ty { TyFn(_) -> false, TyCon(c) -> c.name != b"Cell", _ -> true }))
+
+fn contract_of(
+  source: Bytes,
+  def: ExternDef,
+  params: List<Type>,
+  ret: Type,
+  row: Row,
+) -> Contract / {abort.raise} =
+  {
+    params: map(def.params, |p: Param| p.name.name),
+    requires: fold(def.spec, [], |acc: List<Clause>, c: SpecClause|
+      match c.kind {
+        SRequires -> concat(acc, conjuncts(source, c.expr)),
+        SEnsures -> acc,
+        SCost -> panic(misdeclared(b"states a `cost`", def.name.name)),
+      }),
+    ensures: fold(def.spec, [], |acc: List<Clause>, c: SpecClause|
+      match c.kind { SEnsures -> push(acc, written_clause(source, c.expr)), _ -> acc }),
+    raises: contains(row.atoms, abort_atom()),
+    pure: answers_by_value(params),
+    number: ret == int_type(),
+    like: match ret {
+      TyVar(v) ->
+        fold(range(0, len(params)), None, |acc: Option<Int>, i: Int|
+          match acc {
+            Some(_) -> acc,
+            None -> if at(params, i) == TyVar(v) { Some(i) } else { None },
+          }),
+      _ -> None,
+    },
+  }
+
+fn declared(source: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.raise} = {
   let tys = fold(
     def.generics.types,
     { fresh: fresh_new(), tys: map_new() },
@@ -1082,6 +1211,7 @@ fn declared(imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.rai
       }),
   );
   let ret = declared_type(params.d, def.ret);
+  let row = declared_row(ret.d, def.effects);
   let found = fold(def.constraints, [], |acc: List<DefConstraint>, c: Constraint| {
     let param = fold(range(0, len(def.generics.types)), 0 - 1, |p: Int, i: Int|
       if p >= 0 { p } else if at(def.generics.types, i).name == c.param.name { i } else { p });
@@ -1094,22 +1224,25 @@ fn declared(imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.rai
       ty_vars: range(0, ret.d.fresh.next_ty),
       row_vars: range(0, ret.d.fresh.next_row),
       label_vars: [],
-      ty: fn_type(params.tys, ret.ty, declared_row(ret.d, def.effects)),
+      ty: fn_type(params.tys, ret.ty, row),
     },
     params: map(def.params, |p: Param| p.name.name),
     doc: match def.doc { Some(d) -> d.lines, None -> [] },
     constraints: dedup_constraints(found),
+    clauses: map(def.spec, |c: SpecClause| bytes_slice(source, c.span.start, c.span.end)),
+    contract: contract_of(source, def, params.tys, ret.ty, row),
   }
 }
 
 /// Every function the prelude declares, in its order. Pure and nullary, so the runtime reads the
 /// prelude once.
 pub fn builtins() -> List<Builtin> / {abort.raise} = {
-  let parsed = parse(prelude_source::text());
+  let source = prelude_source::text();
+  let parsed = parse(source);
   if len(parsed.parser.diags) > 0 { panic("the prelude does not parse") } else {
     let imported = prelude_imports(parsed.node.imports);
     fold(parsed.node.items, [], |acc: List<Builtin>, item: Item|
-      match item { IExtern(def) -> push(acc, declared(imported, def)), _ -> acc })
+      match item { IExtern(def) -> push(acc, declared(source, imported, def)), _ -> acc })
   }
 }
 
@@ -1126,6 +1259,7 @@ fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
       env: env_bind_global(c.env, b.name, b.scheme),
       constraints: if len(b.constraints) == 0 { c.constraints }
       else { map_insert(c.constraints, b.name, b.constraints) },
+      contracts: map_insert(c.contracts, b.name, b.contract),
       fresh: {
         next_ty: max(c.fresh.next_ty, len(b.scheme.ty_vars)),
         next_row: max(c.fresh.next_row, len(b.scheme.row_vars)),
@@ -1821,11 +1955,11 @@ fn conv_con(
         )
       } else if len(labels) > 0 || len(rows) > 0 {
         new_ty(over_refused(c, span, name.name.name, 0, 0, over))
-      } else if name.name.name == b"Cell" {
+      } else if is_region_type(name.name.name) {
         let region: WithTy = new_ty(c);
         {
           checker: region.checker,
-          ty: TyCon({ name: b"Cell", args: [region.ty, at(converted.tys, 0)] }),
+          ty: TyCon({ name: name.name.name, args: [region.ty, at(converted.tys, 0)] }),
         }
       } else {
         let built = TyCon({ name: name.name.name, args: converted.tys });
@@ -2375,7 +2509,9 @@ fn effect_name(
   checker: Checker,
   qname: QName,
 ) -> { checker: Checker, name: Option<Bytes> } / {abort.raise} =
-  if is_bare(qname) && qname.name.name == cell() { { checker: checker, name: Some(cell()) } } else {
+  if is_bare(qname) && is_region_effect(qname.name.name) {
+    { checker: checker, name: Some(qname.name.name) }
+  } else {
     let g: WithName = global(checker, EffectSpace, qname);
     match g.name {
       Some(n) -> match effect_of(g.checker, n) {
@@ -2484,10 +2620,10 @@ fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker =
   fold(parsed.module.items, checker, |c: Checker, item: Item|
     match item { IType(d) -> record_type(c, parsed, d), _ -> c })
 
-/// The first `Cell`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
+/// The first `Cell`, `Hold`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
 fn region_brand(ty: Type) -> Option<Bytes> =
   match ty {
-    TyCon(c) -> if c.name == b"Cell" || scheduler_handle(c.name) { Some(c.name) }
+    TyCon(c) -> if is_region_type(c.name) || scheduler_handle(c.name) { Some(c.name) }
     else { first_reason(c.args, region_brand) },
     TyFn(f) -> match first_reason(f.params, region_brand) {
       Some(b) -> Some(b),
@@ -2540,6 +2676,8 @@ fn region_reach(ty: Type) -> Option<Bytes> =
     TyNominal(n) -> first_reason(n.fields, |f: Field| region_reach(f.ty)),
     TyFn(f) -> if fold(f.effects.atoms, false, |b: Bool, atom: Atom| b || atom.effect == cell()) {
       Some(b"`Cell`")
+    } else if fold(f.effects.atoms, false, |b: Bool, atom: Atom| b || atom.effect == hold()) {
+      Some(b"`Hold`")
     } else if row_brands(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
       match first_reason(f.params, region_reach) { Some(b) -> Some(b), None -> region_reach(f.ret) }
     },
@@ -2582,13 +2720,13 @@ fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
     match item {
       IEffect(def) -> {
         let name = qualify(parsed.name, def.name.name);
-        if def.name.name == cell() {
+        if is_region_effect(def.name.name) {
           report_error_at(
             c,
             b"E0105",
             def.name.span,
-            b"`cell` is a builtin effect",
-            b"reserved for `with_cell` regions",
+            bytes_concat_all([b"`", def.name.name, b"` is a builtin effect"]),
+            bytes_concat_all([b"reserved for `with_", def.name.name, b"` regions"]),
             [b"rename this effect"],
           )
         } else if is_prelude_effect(name) {
@@ -3027,6 +3165,92 @@ fn record_over(
   }
 
 fn is_direct(site: PerformSite) -> Bool = match site.source { DirectPerform -> true, _ -> false }
+
+// --- What the conditions on the way hold -----------------------------------------------------------
+
+fn reader_of(checker: Checker) -> Reader =
+  {
+    name: |q: QName|
+      if !is_bare(q) { Elsewhere } else {
+        match env_local(checker.env, q.name.name) {
+          Some(b) -> Local({ stamp: b.stamp, ty: b.scheme.ty }),
+          None -> Elsewhere,
+        }
+      },
+    head: |ty: Type| shallow(checker.subst, ty),
+    builtin: |f: Expr| prelude_named(checker, f),
+    contract: |name: Bytes| map_get(checker.contracts, name),
+  }
+
+fn assuming(checker: Checker, cond: Expr, truth: Bool) -> Checker / {abort.raise} =
+  { ..checker, guards: guards::assume(reader_of(checker), checker.guards, cond, truth) }
+
+fn leaving(checker: Checker, before: Guards) -> Checker =
+  { ..checker, guards: guards::left(checker.guards, before) }
+
+/// A `let` of one name is known as what its value reads as where the value was written.
+fn known_as(before: Checker, bound: Checker, pat: Pattern, value: Expr) -> Checker / {abort.raise} =
+  match pat {
+    PVar(v) -> match env_local(bound.env, v.name.name) {
+      None -> bound,
+      Some(b) -> {
+        let r = guards::read(reader_of(before), bound.guards, value);
+        { ..bound, guards: guards::bind(r.g, b.stamp, r.value) }
+      },
+    },
+    _ -> bound,
+  }
+
+/// The lambda `map`, `filter` or `fold` calls with each element of a `range` it is handed, by its
+/// place among the arguments, and the range's bounds.
+type Ranged = { at: Int, lo: Expr, hi: Expr }
+
+fn ranged_lambda(
+  checker: Checker,
+  builtin: Bytes,
+  args: List<Expr>,
+) -> Option<Ranged> / {abort.raise} = {
+  let place = if builtin == b"map" || builtin == b"filter" { 1 }
+  else if builtin == b"fold" { 2 }
+  else { 0 - 1 };
+  if place < 0 { None } else {
+    match list_at(args, 0) {
+      Some(EApp(r)) -> match r.args {
+        [lo, hi] -> if prelude_named(checker, r.func) != b"range" { None }
+        else { Some({ at: place, lo: lo, hi: hi }) },
+        _ -> None,
+      },
+      _ -> None,
+    }
+  }
+}
+
+fn note_raise(checker: Checker, span: Span, why: RaiseWhy) -> Checker =
+  { ..checker, raise_notes: push(checker.raise_notes, { span: span, why: why }) }
+
+/// Whether a call of a builtin shows every clause of its `requires`, so that it cannot raise; one
+/// that does not is noted with the clause it misses.
+fn requires_shown(
+  checker: Checker,
+  builtin: Bytes,
+  args: List<Expr>,
+  span: Span,
+) -> { checker: Checker, shown: Bool } / {abort.raise} =
+  match map_get(checker.contracts, builtin) {
+    None -> { checker: checker, shown: false },
+    Some(st) -> if len(st.requires) == 0 { { checker: checker, shown: false } } else {
+      let o = guards::unshown(reader_of(checker), checker.guards, st, args);
+      let read: Checker = { ..checker, guards: o.g };
+      match o.needs {
+        None -> { checker: read, shown: true },
+        Some(needs) ->
+          {
+            checker: note_raise(read, span, Unshown({ callee: builtin, needs: needs })),
+            shown: false,
+          },
+      }
+    },
+  }
 
 fn callee_source(checker: Checker, func: Expr) -> PerformSource / {abort.raise} =
   match func {
@@ -3569,7 +3793,8 @@ fn field_hint(fields: List<Field>, name: Bytes, met: Meetings) -> Option<Hint> =
 
 /// A call's arguments; a lambda the callee calls once per element of its input is inferred under the
 /// call, which is the iteration its body repeats with. Each is expected at its parameter's type:
-/// `params` are the callee's, and `met` what its answer has met.
+/// `params` are the callee's, and `met` what its answer has met. `ranged` is the lambda called
+/// with each element of a `range`.
 fn infer_args(
   checker: Checker,
   exprs: List<Expr>,
@@ -3577,6 +3802,7 @@ fn infer_args(
   repeats: List<Int>,
   params: List<Type>,
   met: Meetings,
+  ranged: Option<Ranged>,
 ) -> { checker: Checker, tys: List<Type>, row: Row } / {abort.raise} = {
   let walked = fold(
     range(0, len(exprs)),
@@ -3585,11 +3811,21 @@ fn infer_args(
       let x = at(exprs, i);
       let param = list_at(params, i);
       let hint = match param { Some(p) -> Some({ ty: p, met: acc.met }), None -> None };
-      let looped = contains(repeats, i) && (match x { ELambda(_) -> true, _ -> false });
+      let lambda = match x { ELambda(_) -> true, _ -> false };
+      let looped = contains(repeats, i) && lambda;
+      let ranging: Checker = match ranged {
+        Some(r) -> if r.at != i || !lambda { acc.checker } else {
+          {
+            ..acc.checker,
+            guards: guards::over_range(reader_of(acc.checker), acc.checker.guards, r.lo, r.hi),
+          }
+        },
+        None -> acc.checker,
+      };
       let o: Inferred = if looped {
-        let inner: Inferred = infer({ ..acc.checker, over: Some(span) }, x, hint);
+        let inner: Inferred = infer({ ..ranging, over: Some(span) }, x, hint);
         { ..inner, checker: { ..inner.checker, over: acc.checker.over } }
-      } else { infer(acc.checker, x, hint) };
+      } else { infer(ranging, x, hint) };
       let j: WithRow = join(o.checker, span, acc.row, o.row);
       {
         checker: j.checker,
@@ -3800,12 +4036,29 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
           }
         },
       );
+      let entered: Checker = match ps.checker.guards.ranged {
+        None -> ps.checker,
+        Some(_) -> {
+          let reader = reader_of(ps.checker);
+          {
+            ..ps.checker,
+            guards: guards::entered(
+              reader,
+              ps.checker.guards,
+              match list_at(l.params, len(l.params) - 1) {
+                Some(p) -> (reader.name)({ module: None, name: p.name, span: p.name.span }),
+                None -> Elsewhere,
+              },
+            ),
+          }
+        },
+      };
       let written: { checker: Checker, ty: Option<Type> } = match l.ret {
         Some(te) -> {
-          let w: WithTy = conv_type(ps.checker, te);
+          let w: WithTy = conv_type(entered, te);
           { checker: w.checker, ty: Some(w.ty) }
         },
-        None -> { checker: ps.checker, ty: None },
+        None -> { checker: entered, ty: None },
       };
       let answer = match written.ty {
         Some(t) -> hint_of(t),
@@ -3827,7 +4080,7 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
         None -> body.checker,
       };
       {
-        checker: { ..checked, env: env_pop(checked.env) },
+        checker: leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
         ty: fn_type(ps.tys, body.ty, body.row),
         row: row_empty(),
       }
@@ -3842,10 +4095,14 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
         c.ty,
         b"condition of `if`",
       ).checker;
-      let t: Inferred = infer(cc, i.then_branch, hint);
-      let el: Inferred = infer(t.checker, i.else_branch, hint_after(hint, t.ty));
+      let t: Inferred = infer(assuming(cc, i.cond, true), i.then_branch, hint);
+      let el: Inferred = infer(
+        assuming(leaving(t.checker, cc.guards), i.cond, false),
+        i.else_branch,
+        hint_after(hint, t.ty),
+      );
       let agreed: { checker: Checker, ty: Type } = agree(
-        el.checker,
+        leaving(el.checker, cc.guards),
         expr_span(i.else_branch),
         t.ty,
         el.ty,
@@ -3889,7 +4146,11 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
           join_next(acc, f.span, f.ty, b"the `else` of a `let ... else` is its block's value"),
       );
       let closed: Checker = close_tails(agreed.checker, agreed.tails);
-      { checker: { ..closed, env: env_pop(closed.env) }, ty: agreed.ty, row: tail.row }
+      {
+        checker: leaving({ ..closed, env: env_pop(closed.env) }, checker.guards),
+        ty: agreed.ty,
+        row: tail.row,
+      }
     },
     ERecord(r) -> {
       let met = met_of(hint);
@@ -3992,6 +4253,8 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
     EPerform(p) -> infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args),
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
     EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body, hint),
+    EWithHold(c) ->
+      infer_with_hold(checker, c.span, c.resource, c.acquire, c.release, c.binder, c.body, hint),
     ESimulate(s) -> infer_simulate(checker, s.span, s.body, hint),
     EParallel(v) -> infer_parallel(checker, v.span, v.branches),
     ETryBlock(t) -> infer_try_block(checker, t.span, t.raise, t.body, hint),
@@ -4596,7 +4859,11 @@ fn infer_binary(
   rhs: Expr,
 ) -> Inferred / {abort.raise} = {
   let l: Inferred = infer(checker, lhs);
-  let r: Inferred = infer(l.checker, rhs, hint_of(l.ty));
+  // The right of `&&` runs where the left held, and the right of `||` where it did not.
+  let r: Inferred = if op == b"and" || op == b"or" {
+    let o: Inferred = infer(assuming(l.checker, lhs, op == b"and"), rhs, hint_of(l.ty));
+    { ..o, checker: leaving(o.checker, l.checker.guards) }
+  } else { infer(l.checker, rhs, hint_of(l.ty)) };
   let j: WithRow = join(r.checker, span, l.row, r.row);
   // A shift's operand is its left; every other operator here reads both sides at one type.
   let c: Checker = if op == b"and" || op == b"or" || op == b"concat" { j.checker }
@@ -4612,14 +4879,29 @@ fn infer_binary(
     let noted: Checker = if x.ok {
       { ..x.checker, numerics: push(x.checker.numerics, { span: span, op: op, ty: l.ty }) }
     } else { x.checker };
-    if divides_by_zero(noted, op, l.ty, rhs) {
+    let divisor: { checker: Checker, zero: Bool } = if !divides_by_zero(noted, op, l.ty, rhs) {
+      { checker: noted, zero: false }
+    } else {
+      let o = guards::nonzero(reader_of(noted), noted.guards, rhs);
+      { checker: { ..noted, guards: o.g }, zero: !o.ok }
+    };
+    if divisor.zero {
       {
-        checker: record_site(noted, abort_atom(), span, DirectPerform),
+        checker: record_site(
+          note_raise(divisor.checker, span, ZeroDivisor),
+          abort_atom(),
+          span,
+          DirectPerform,
+        ),
         ty: l.ty,
         row: { ..j.row, atoms: atoms_insert(j.row.atoms, abort_atom()) },
       }
     } else {
-      { checker: noted, ty: if is_arithmetic(op) { l.ty } else { bool_type() }, row: j.row }
+      {
+        checker: divisor.checker,
+        ty: if is_arithmetic(op) { l.ty } else { bool_type() },
+        row: j.row,
+      }
     }
   } else if is_bits(op) {
     // A shift's right operand is a count: an `Int` whatever the word is.
@@ -4711,11 +4993,25 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
     },
     SLet(l) -> {
       let b: LetBound = let_bound(checker, l.pat, l.ty, l.value);
-      let bound: Checker = bind_all(or_let_covers(b.checker, l.pat), b.out);
-      // A pattern that can miss raises where it does.
+      let bound: Checker = known_as(
+        b.checker,
+        bind_all(or_let_covers(b.checker, l.pat), b.out),
+        l.pat,
+        l.value,
+      );
+      // A pattern that can miss raises where it does, and past it the pattern matched.
       if refutable(b.checker, l.pat) {
+        let matched: Checker = {
+          ..bound,
+          guards: guards::matched(reader_of(b.checker), bound.guards, l.value, l.pat),
+        };
         {
-          checker: record_site(bound, abort_atom(), pat_span(l.pat), DirectPerform),
+          checker: record_site(
+            note_raise(matched, pat_span(l.pat), Misses),
+            abort_atom(),
+            pat_span(l.pat),
+            DirectPerform,
+          ),
           row: { ..b.row, atoms: atoms_insert(b.row.atoms, abort_atom()) },
           fallback: None,
         }
@@ -4726,8 +5022,12 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
       let b: LetBound = let_bound(checker, l.pat, l.ty, l.value);
       let f: Inferred = infer(b.checker, l.fallback, hint);
       let j: WithRow = join(f.checker, expr_span(l.fallback), b.row, f.row);
+      let bound: Checker = bind_all(j.checker, b.out);
       {
-        checker: bind_all(j.checker, b.out),
+        checker: {
+          ..bound,
+          guards: guards::matched(reader_of(b.checker), bound.guards, l.value, l.pat),
+        },
         row: j.row,
         fallback: Some({ span: expr_span(l.fallback), ty: f.ty }),
       }
@@ -4807,41 +5107,6 @@ fn infer_app(
   }
 
 /// The prelude name a bare callee resolves to, or nothing for one the program declares.
-/// A narrowing of a literal its type holds cannot fail, so it raises nothing.
-fn narrows_a_literal_it_holds(
-  checker: Checker,
-  func: Expr,
-  args: List<Expr>,
-) -> Bool / {abort.raise} =
-  match args {
-    [a] -> match literal_value(a) {
-      Some(v) -> literal_fits(prelude_named(checker, func), v),
-      None -> false,
-    },
-    _ -> false,
-  }
-
-fn literal_value(e: Expr) -> Option<Int> =
-  match e {
-    ELit(l) -> match l.lit { LInt(v) -> Some(v), _ -> None },
-    EUnary(u) -> if u.op != b"neg" { None }
-    else { match literal_value(u.operand) { Some(v) -> Some(0 - v), None -> None } },
-    _ -> None,
-  }
-
-/// `numeric_of_int` holds what every numeric type holds.
-fn literal_fits(name: Bytes, v: Int) -> Bool =
-  if name == b"u8_of_int" || name == b"byte_of_int" { v >= 0 && v <= 255 }
-  else if name == b"u16_of_int" { v >= 0 && v <= 65535 }
-  else if name == b"u32_of_int" { v >= 0 && v <= 4294967295 }
-  else if name == b"u64_of_int" || name == b"u128_of_int" { v >= 0 }
-  else if name == b"i8_of_int" { v >= 0 - 128 && v <= 127 }
-  else if name == b"i16_of_int" { v >= 0 - 32768 && v <= 32767 }
-  else if name == b"i32_of_int" { v >= 0 - 2147483648 && v <= 2147483647 }
-  else if name == b"i64_of_int" || name == b"i128_of_int" { true }
-  else if name == b"numeric_of_int" { v >= 0 && v <= 127 }
-  else { false }
-
 fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
   match func {
     EVar(v) -> if !is_bare(v.name) { b"" } else {
@@ -5498,6 +5763,7 @@ fn infer_app_general(
       },
     _ -> { params: [], met: NothingMet },
   };
+  let builtin = prelude_named(f.checker, func);
   let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
     f.checker,
     args,
@@ -5505,6 +5771,7 @@ fn infer_app_general(
     repeats,
     called.params,
     called.met,
+    ranged_lambda(f.checker, builtin, args),
   );
   let j0: WithRow = join(as_.checker, span, f.row, as_.row);
   let c: Checker = j0.checker;
@@ -5538,7 +5805,7 @@ fn infer_app_general(
     } else {
       let source = callee_source(c, func);
       let callee: Option<Bytes> = group_callee(c, source);
-      let handed: { checker: Checker, tys: List<Type> } = if prelude_named(c, func) == b"bracket" {
+      let handed: { checker: Checker, tys: List<Type> } = if builtin == b"bracket" {
         joined_callbacks(c, span, as_.tys)
       } else { { checker: c, tys: as_.tys } };
       let checked: Checker = expect_arguments(
@@ -5549,7 +5816,7 @@ fn infer_app_general(
           expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(handed.tys, i), callee),
       );
       // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
-      let obliged: Checker = if is_int_builtin(func) && len(fn_.params) > 0 {
+      let noted: Checker = if is_int_builtin(func) && len(fn_.params) > 0 {
         {
           ..checked,
           bit_ops: push(checked.bit_ops, {
@@ -5560,10 +5827,13 @@ fn infer_app_general(
           }),
         }
       } else { checked };
-      let resolved = resolve_row_in(obliged, fn_.effects);
-      let effects = if narrows_a_literal_it_holds(obliged, func, args) {
-        { ..resolved, atoms: without_raises(resolved.atoms) }
-      } else { resolved };
+      let resolved = resolve_row_in(noted, fn_.effects);
+      let required: { checker: Checker, shown: Bool } = if builtin == b""
+          || !contains(resolved.atoms, abort_atom()) { { checker: noted, shown: false } }
+      else { requires_shown(noted, builtin, args, span) };
+      let obliged: Checker = required.checker;
+      let effects = if required.shown { { ..resolved, atoms: without_raises(resolved.atoms) } }
+      else { resolved };
       let scaled = repeated_rows(obliged, fn_.params, repeats);
       let scales = match source {
         PerformVia(name) -> match def_of(obliged, name) { Some(d) -> d.scaling, None -> [] },
@@ -6088,16 +6358,22 @@ fn infer_match(
 ) -> Inferred / {abort.raise} = {
   let s: Inferred = infer(checker, scrutinee);
   let result: WithTy = new_ty(s.checker);
+  // An arm is reached past every arm before it: `acc.checker`'s guards hold what those missing says.
   let walked: { checker: Checker, row: Row, ty: Type, tails: List<Int> } = fold(
     arms,
     { checker: result.checker, row: s.row, ty: result.ty, tails: [] },
     |acc: { checker: Checker, row: Row, ty: Type, tails: List<Int> }, arm: MatchArm| {
+      let outside = reader_of(acc.checker);
       let pushed: Checker = { ..acc.checker, env: env_push(acc.checker.env) };
       let b: Bound = bind_pattern(pushed, arm.pat, s.ty, []);
       let bound: Checker = bind_all(b.checker, b.out);
+      let inside: Checker = {
+        ..bound,
+        guards: guards::matched(outside, bound.guards, scrutinee, arm.pat),
+      };
       let guarded: WithBodyRow = match arm.guard {
         Some(g) -> {
-          let o: Inferred = infer(bound, g);
+          let o: Inferred = infer(inside, g);
           let c: Checker = expect(
             o.checker,
             expr_span(g),
@@ -6106,13 +6382,18 @@ fn infer_match(
             b"match guard",
           ).checker;
           let j: WithRow = join(c, span, acc.row, o.row);
-          { checker: j.checker, row: j.row }
+          { checker: assuming(j.checker, g, true), row: j.row }
         },
-        None -> { checker: bound, row: acc.row },
+        None -> { checker: inside, row: acc.row },
       };
       let body: Inferred = infer(guarded.checker, arm.body, hint_after(hint, acc.ty));
       let j: WithRow = join(body.checker, span, guarded.row, body.row);
-      let popped: Checker = { ..j.checker, env: env_pop(j.checker.env) };
+      let left: Checker = leaving(j.checker, acc.checker.guards);
+      let missed: Checker = match arm.guard {
+        None -> { ..left, guards: guards::unmatched(outside, left.guards, scrutinee, arm.pat) },
+        Some(_) -> left,
+      };
+      let popped: Checker = { ..missed, env: env_pop(missed.env) };
       let n: Joined = join_next(
         { checker: popped, ty: acc.ty, tails: acc.tails },
         expr_span(arm.body),
@@ -6123,7 +6404,11 @@ fn infer_match(
     },
   );
   {
-    checker: check_exhaustive(close_tails(walked.checker, walked.tails), span, arms),
+    checker: check_exhaustive(
+      close_tails(leaving(walked.checker, s.checker.guards), walked.tails),
+      span,
+      arms,
+    ),
     ty: walked.ty,
     row: walked.row,
   }
@@ -6579,6 +6864,20 @@ fn resolve_op(
           ),
           hit: None,
         }
+      } else if name == hold() {
+        {
+          checker: report_error_at(
+            e.checker,
+            b"E0103",
+            eff.span,
+            b"`hold` is a builtin effect and cannot be performed directly",
+            b"not a declared effect",
+            [
+              b"read what a hold holds with `hold_get(h)`, inside `with_hold[r](..) { h -> .. }` or in a function it hands the hold to",
+            ],
+          ),
+          hit: None,
+        }
       } else { { checker: e.checker, hit: None } },
       Some(info) -> match op_named(info, ident.name) {
         Some(o) -> { checker: e.checker, hit: Some({ info: info, op: o }) },
@@ -6624,7 +6923,7 @@ fn resolve_op(
 /// How this module's source names an effect: by its imported name or through a module binder; none
 /// when it names it neither way, and a row it writes must import it first.
 fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise} =
-  if is_prelude_effect(eff) || eff == cell() { Some(eff) } else {
+  if is_prelude_effect(eff) || is_region_effect(eff) { Some(eff) } else {
     let scope = scope_of(checker);
     match fold(scope.bound.effects, None, |acc: Option<Bytes>, b: Binding|
         match acc {
@@ -6849,6 +7148,7 @@ fn infer_perform(
     [],
     wanted,
     NothingMet,
+    None,
   );
   let r: WithHit = resolve_op(as_.checker, eff, ident);
   match r.hit {
@@ -6930,13 +7230,23 @@ fn infer_perform(
               record_site(c, a, span, PerformThroughArgs));
             let j1: WithRow = join(c2, span, as_.row, op_row);
             let j2: WithRow = join(j1.checker, span, j1.row, row_singleton(atom));
-            if out_of_range(hit.info, hit.op, args) {
+            let taken: { checker: Checker, short: Bool } = match ((
+                least_taken(hit.info, hit.op),
+                list_at(args, 0),
+              )) {
+              (Some(least), Some(a)) -> {
+                let o = guards::at_least(reader_of(j2.checker), j2.checker.guards, a, least);
+                { checker: { ..j2.checker, guards: o.g }, short: !o.ok }
+              },
+              _ -> { checker: j2.checker, short: false },
+            };
+            if taken.short {
               {
-                checker: record_site(j2.checker, abort_atom(), span, DirectPerform),
+                checker: record_site(taken.checker, abort_atom(), span, DirectPerform),
                 ty: shape.ret,
                 row: { ..j2.row, atoms: atoms_insert(j2.row.atoms, abort_atom()) },
               }
-            } else { { checker: j2.checker, ty: shape.ret, row: j2.row } }
+            } else { { checker: taken.checker, ty: shape.ret, row: j2.row } }
           }
         },
       }
@@ -6944,18 +7254,12 @@ fn infer_perform(
   }
 }
 
-/// A channel's capacity below zero and a draw's bound below one raise, unless a literal says not.
-fn out_of_range(info: EffectInfo, op: OpInfo, args: List<Expr>) -> Bool =
-  info.module == b""
-    && (match list_at(args, 0) {
-      Some(a) ->
-        (info.name == b"task" && op.name == b"channel" && !literal_at_least(a, 0))
-          || (info.name == b"random" && op.name == b"below" && !literal_at_least(a, 1)),
-      None -> false,
-    })
-
-fn literal_at_least(e: Expr, least: Int) -> Bool =
-  match e { ELit(l) -> match l.lit { LInt(v) -> v >= least, _ -> false }, _ -> false }
+/// The least a channel's capacity and a draw's bound may be: below it the operation raises.
+fn least_taken(info: EffectInfo, op: OpInfo) -> Option<Int> =
+  if info.module != b"" { None }
+  else if info.name == b"task" && op.name == b"channel" { Some(0) }
+  else if info.name == b"random" && op.name == b"below" { Some(1) }
+  else { None }
 
 type HandleAcc = {
   checker: Checker,
@@ -7634,12 +7938,48 @@ fn cell_atoms(resource: Bytes) -> List<Atom> =
 fn region_is_open(checker: Checker, name: Bytes) -> Bool =
   fold(checker.open_regions, false, |acc: Bool, region: OpenRegion| acc || region.name == name)
 
-fn open_region(checker: Checker, name: Bytes, span: Span) -> Checker =
+/// The open region of this name, when there is one.
+fn open_region_named(checker: Checker, name: Bytes) -> Option<OpenRegion> =
+  fold(checker.open_regions, None, |acc: Option<OpenRegion>, region: OpenRegion|
+    if region.name == name { Some(region) } else { acc })
+
+/// A hold is let go at its own region's `}`, so that region is the one that brands it: a region
+/// of the name already open would brand it instead, and let it outlive its release.
+fn region_reopened(checker: Checker, resource: Ident, outer: OpenRegion, form: Bytes) -> Checker =
+  err_labels(
+    checker,
+    b"E0330",
+    bytes_concat_all([
+      b"`",
+      form,
+      b"[",
+      resource.name,
+      b"]` opens a region named `",
+      resource.name,
+      b"` inside one of that name",
+    ]),
+    [
+      label_at(checker.module, resource.span, true, b"this name is already a region's"),
+      label_at(
+        checker.module,
+        outer.span,
+        false,
+        bytes_concat_all([b"`", resource.name, b"` opens here and is still open"]),
+      ),
+    ],
+    [
+      b"a hold is let go at the `}` of the `with_hold` that made it, so the region that brands it has to be that one and no other",
+      b"give this region a name no region around it has",
+    ],
+  )
+
+fn open_region(checker: Checker, name: Bytes, span: Span, hold: Bool) -> Checker =
   {
     ..checker,
     open_regions: push(checker.open_regions, {
       name: name,
       span: span,
+      hold: hold,
       simulate_depth: checker.simulate_depth,
       spawns: [],
       handoffs: [],
@@ -7759,6 +8099,7 @@ fn region_exits(expr: Expr, out: List<Span>) -> List<Span> =
     EIf(i) -> region_exits(i.else_branch, region_exits(i.then_branch, out)),
     EMatch(m) -> fold(m.arms, out, |acc: List<Span>, arm: MatchArm| region_exits(arm.body, acc)),
     EWithCell(c) -> region_exits(c.body, out),
+    EWithHold(c) -> region_exits(c.body, out),
     ESimulate(s) -> region_exits(s.body, out),
     EHandle(h) -> {
       let through = match h.ret {
@@ -7783,16 +8124,21 @@ fn infer_with_cell(
   let i: Inferred = infer(checker, init);
   let cell_ty = TyCon({ name: b"Cell", args: [region_type(resource.name), i.ty] });
   if region_is_open(i.checker, resource.name) {
+    let nested: Checker = match open_region_named(i.checker, resource.name) {
+      Some(outer) -> if outer.hold { region_reopened(i.checker, resource, outer, b"with_cell") }
+      else { i.checker },
+      None -> i.checker,
+    };
     let pushed: Checker = {
-      ..i.checker,
-      env: env_bind(env_push(i.checker.env), binder.name, monomorphic(cell_ty)),
+      ..nested,
+      env: env_bind(env_push(nested.env), binder.name, monomorphic(cell_ty)),
     };
     let b: Inferred = infer(pushed, body, hint);
     let j: WithRow = join({ ..b.checker, env: env_pop(b.checker.env) }, span, i.row, b.row);
     { checker: j.checker, ty: b.ty, row: j.row }
   } else {
     let outer = outer_bindings(i.checker, body);
-    let opened: Checker = open_region(i.checker, resource.name, resource.span);
+    let opened: Checker = open_region(i.checker, resource.name, resource.span, false);
     let mark = len(opened.performs);
     let pushed: Checker = {
       ..opened,
@@ -7811,6 +8157,7 @@ fn infer_with_cell(
       module: discharged.module,
       name: resource.name,
       span: resource.span,
+      hold: false,
       body_span: expr_span(body),
       body_ty: b.ty,
       exits: region_exits(body, []),
@@ -7821,6 +8168,92 @@ fn infer_with_cell(
     let recorded: Checker = { ..discharged, regions: push(discharged.regions, site) };
     let j: WithRow = join(recorded, span, i.row, row_without(b.row, handled));
     { checker: j.checker, ty: b.ty, row: j.row }
+  }
+}
+
+/// `release` is read as a value: a function of what `acquire` answered, whose row the form performs
+/// when it lets the hold go. The body's reads of a hold end at the region's `}`.
+fn infer_with_hold(
+  checker: Checker,
+  span: Span,
+  resource: Ident,
+  acquire: Expr,
+  release: Expr,
+  binder: Ident,
+  body: Expr,
+  hint: Option<Hint>,
+) -> Inferred / {abort.raise} = {
+  let a: Inferred = infer(checker, acquire);
+  let r: Inferred = infer(a.checker, release);
+  let eff: WithRow = new_row(r.checker);
+  let typed: Checker = expect(
+    eff.checker,
+    expr_span(release),
+    fn_type([a.ty], unit_type(), eff.row),
+    r.ty,
+    b"function that releases what the hold acquired",
+  ).checker;
+  let let_go = resolve_row_in(typed, eff.row);
+  let source = callee_source(typed, release);
+  let performed: Checker = fold(let_go.atoms, typed, |c: Checker, atom: Atom|
+    record_site(c, atom, expr_span(release), source));
+  let before: WithRow = join(performed, span, a.row, r.row);
+  let entering: WithRow = join(before.checker, span, before.row, let_go);
+  let hold_ty = TyCon({ name: b"Hold", args: [region_type(resource.name), a.ty] });
+  match open_region_named(entering.checker, resource.name) {
+    Some(around) -> {
+      let refused: Checker = region_reopened(entering.checker, resource, around, b"with_hold");
+      let b: Inferred = infer(
+        { ..refused, env: env_bind(env_push(refused.env), binder.name, monomorphic(hold_ty)) },
+        body,
+        hint,
+      );
+      let j: WithRow = join(
+        { ..b.checker, env: env_pop(b.checker.env) },
+        span,
+        entering.row,
+        b.row,
+      );
+      { checker: j.checker, ty: b.ty, row: j.row }
+    },
+    None -> {
+      let outer = outer_bindings(entering.checker, body);
+      let opened: Checker = open_region(entering.checker, resource.name, resource.span, true);
+      let mark = len(opened.performs);
+      let b: Inferred = infer(
+        { ..opened, env: env_bind(env_push(opened.env), binder.name, monomorphic(hold_ty)) },
+        body,
+        hint,
+      );
+      let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
+      let handled = [hold_atom()];
+      let discharged: Checker = discharge(
+        closed.checker,
+        mark,
+        len(closed.checker.performs),
+        handled,
+      );
+      let site: RegionSite = {
+        module: discharged.module,
+        name: resource.name,
+        span: resource.span,
+        hold: true,
+        body_span: expr_span(body),
+        body_ty: b.ty,
+        exits: region_exits(body, []),
+        outer: outer,
+        spawns: closed.spawns,
+        handoffs: closed.handoffs,
+      };
+      let recorded: Checker = { ..discharged, regions: push(discharged.regions, site) };
+      let j: WithRow = join(
+        recorded,
+        span,
+        entering.row,
+        row_without_covered(resolve_row_in(recorded, b.row), handled),
+      );
+      { checker: j.checker, ty: b.ty, row: j.row }
+    },
   }
 }
 
@@ -8030,6 +8463,12 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
     },
     EWithCell(c) ->
       collect_refs(c.body, push(bound, c.binder.name), collect_refs(c.init, bound, out)),
+    EWithHold(c) ->
+      collect_refs(
+        c.body,
+        push(bound, c.binder.name),
+        collect_refs(c.release, bound, collect_refs(c.acquire, bound, out)),
+      ),
     ESimulate(s) -> collect_refs(s.body, bound, out),
     EParallel(v) -> fold(v.branches, out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
     ETryBlock(t) -> collect_refs(t.body, bound, out),
@@ -8530,6 +8969,7 @@ fn check_component(
                     repeats: rows.repeats,
                     tail_over: None,
                     recursed: None,
+                    raises: rows.raises,
                   },
                 })
               },
@@ -8567,6 +9007,7 @@ fn check_component(
               repeats: o.repeats,
               tail_over: o.tail_over,
               recursed: o.checker.recursed,
+              raises: o.raises,
             },
           }
         },
@@ -8642,6 +9083,11 @@ fn check_component(
     close_unreachable_row(c, s));
   let removed: Checker = fold(qualified, closed, |c: Checker, name: Bytes|
     { ..c, env: env_remove_global(c.env, name) });
+  // A group whose every raise is a call back into it has no place a raise starts.
+  let raised_inside = fold(bodies.counts, false, |any: Bool, count: Count|
+      any || len(count.raises) > 0)
+    && fold(bodies.counts, true, |inside: Bool, count: Count|
+      inside && fold(count.raises, true, |ok: Bool, r: Raise| ok && raised_within(qualified, r)));
   let published: Checker = fold(range(0, len(comp)), removed, |c: Checker, slot: Int| {
     let def = at(fns, at(comp, slot));
     let sig = at(sigs.sigs, slot);
@@ -8658,6 +9104,8 @@ fn check_component(
     let sc: Scheme = split_labels(g.scheme, def, sig);
     let row = if overran { body_row } else { resolve_row_in(c, sig.published_row) };
     let count = at(bodies.counts, slot);
+    // A `const` raised nothing when the build evaluated it, so no place in it is one to guard.
+    let raises = if raised_inside || def.baked != None { [] } else { count.raises };
     let bounded = map(sig.bounded, |a: Atom| resolve_atom(c.subst, a));
     // Another package's definition is read by what its row writes, whatever its body does.
     let counted = if c.module >= c.known.root {
@@ -8690,13 +9138,15 @@ fn check_component(
         simple_name: def.name.name,
         scheme: sc,
         footprint: row.atoms,
-        performed: body_row.atoms,
+        performed: if raised_inside { filter(body_row.atoms, |a: Atom| !is_abort(a)) }
+        else { body_row.atoms },
         scaling: counted.scaling,
         repeats: counted.repeats,
         bounded: bounded,
         tail_bounded: sig.tail_bounded,
         ending: ending_of(slot),
         summary: summary_of(slot),
+        raises: raises,
         row_aliases: row_aliases(def),
         constraints: constraints,
         spec: [],
@@ -8915,6 +9365,8 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       Some(r) -> resolve_row_in(outer, r).atoms,
       None -> [],
     },
+    guards: guards::none(),
+    raise_notes: [],
   };
   let assumed: Checker = witnessing(
     { ..checker, assumed: constraints_in_force(checker, def.constraints) },
@@ -8982,13 +9434,81 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       assumed: [],
       over: None,
       repeated_vars: [],
+      guards: guards::none(),
+      raise_notes: [],
     },
     row: body.row,
     scaling: counted.scaling,
     repeats: counted.repeats,
     tail_over: counted.tail_over,
+    raises: raises_of(rowed, def.span.start),
   }
 }
+
+fn is_abort(a: Atom) -> Bool = a.effect == b"abort" && a.op == Some(b"raise")
+
+/// Why a call of `name` raises: by its own row, or, where that names no raise, by a function it
+/// was handed.
+fn raise_through(checker: Checker, name: Bytes) -> RaiseWhy / {abort.raise} =
+  if group_member(checker, name) { Calls(name) } else {
+    match map_get(checker.contracts, name) {
+      Some(c) -> if c.raises { Unguarded(name) } else { Handed },
+      None -> match def_of(checker, name) {
+        Some(d) -> if fold(d.footprint, false, |any: Bool, a: Atom| any || is_abort(a)) {
+          Calls(name)
+        } else { Handed },
+        None -> Calls(name),
+      },
+    }
+  }
+
+/// Where the body just walked can raise `abort.raise`, each place counted from `start`: every
+/// place it is performed, a definition whose row names it once, where it is first called, and a
+/// call that raises only as a function it is handed does where no raise inside it says more.
+fn raises_of(checker: Checker, start: Int) -> List<Raise> / {abort.raise} = {
+  let found = fold(
+    checker.performs,
+    { out: [], called: [] },
+    |acc: { out: List<Raise>, called: List<Bytes> }, site: PerformSite|
+      if !is_abort(site.atom) || site.module != checker.module { acc } else {
+        let noted = fold(checker.raise_notes, None, |known: Option<RaiseWhy>, n: RaiseNote|
+          match known {
+            Some(_) -> known,
+            None -> if n.span == site.span { Some(n.why) } else { None },
+          });
+        let why = match noted {
+          Some(w) -> w,
+          None -> match site.source {
+            PerformVia(name) -> raise_through(checker, name),
+            DirectPerform -> Performed,
+            _ -> Handed,
+          },
+        };
+        let raise = {
+          span: { start: site.span.start - start, end: site.span.end - start },
+          why: why,
+        };
+        match why {
+          Calls(name) -> if contains(acc.called, name) { acc }
+          else { { out: push(acc.out, raise), called: push(acc.called, name) } },
+          _ -> { ..acc, out: push(acc.out, raise) },
+        }
+      },
+  ).out;
+  filter(found, |r: Raise|
+    match r.why {
+      Handed ->
+        !fold(found, false, |inside: Bool, other: Raise|
+          inside
+            || (other.span != r.span && other.span.start >= r.span.start
+            && other.span.end <= r.span.end)),
+      _ -> true,
+    })
+}
+
+/// Whether a raise is only a call back into the group `names`.
+fn raised_within(names: List<Bytes>, raise: Raise) -> Bool =
+  match raise.why { Calls(name) -> contains(names, name), _ -> false }
 
 /// What a body performs a number of times that grows with its input: what it performs under an
 /// iteration, or everything, when it calls back into its own group. A parameter is called so when a
@@ -10090,6 +10610,8 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                 label_params: map_new(),
                 performs: [],
                 declared_atoms: [],
+                guards: guards::none(),
+                raise_notes: [],
                 walking: owner,
               };
               let pushed: Checker = { ..c1, env: env_push(c1.env) };
@@ -10409,6 +10931,8 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     label_params: map_new(),
     performs: [],
     declared_atoms: [],
+    guards: guards::none(),
+    raise_notes: [],
     auto_ty_params: true,
   };
   let types: WithTys = fold(
@@ -10738,6 +11262,8 @@ fn ungeneratable_within(
     TyVar(_) -> None,
     TyCon(c) -> if c.name == b"Cell" {
       Some(b"a `Cell` is created by `with_cell` and exists only inside its region")
+    } else if c.name == b"Hold" {
+      Some(b"a `Hold` is created by `with_hold` and exists only inside its region")
     } else if c.name == b"Task" {
       Some(b"a `Task` is a key into the scheduler of the `simulate` region that spawned it")
     } else if c.name == b"Chan" {
@@ -11003,6 +11529,8 @@ fn spec_scope(checker: Checker, def: FnDef, env: SpecEnv) -> Checker / {abort.ra
     row_params: env.row_params,
     performs: [],
     declared_atoms: [],
+    guards: guards::none(),
+    raise_notes: [],
   };
   let assumed: Checker = witnessing(
     { ..c0, assumed: constraints_in_force(c0, def.constraints) },
@@ -11154,29 +11682,28 @@ type Blocked = { ty: Type, why: DeriveRefusal }
 /// use's arguments ride.
 type AlgebraicShape = { name: Bytes, params: List<Int>, rows: List<Int>, fields: List<Type> }
 
-/// Every sum type this run declared, flattened: its parameters and every field of every variant.
-fn algebraic_shapes(checker: Checker) -> List<AlgebraicShape> / {abort.raise} =
-  fold(checker.ctors, [], |acc: List<AlgebraicShape>, ctor_info: CtorInfo| {
-    let i = fold(range(0, len(acc)), 0 - 1, |p: Int, j: Int|
-      if p >= 0 { p } else if at(acc, j).name == ctor_info.type_name { j } else { p });
-    if i < 0 {
-      let scheme = ctor_info.scheme;
-      push(acc, {
-        name: ctor_info.type_name,
-        params: if len(scheme.label_vars) == 0 { scheme.ty_vars }
-        else { concat(scheme.ty_vars, scheme.label_vars) },
-        rows: scheme.row_vars,
-        fields: ctor_info.fields,
-      })
-    } else {
-      let a = at(acc, i);
-      list_set(acc, i, { ..a, fields: concat(a.fields, ctor_info.fields) })
-    }
-  })
+/// Each sum type's shape by the type's name.
+type Shapes = Map<Bytes, AlgebraicShape>
 
-fn find_adt(adts: List<AlgebraicShape>, name: Bytes) -> Option<AlgebraicShape> =
-  fold(adts, None, |acc: Option<AlgebraicShape>, a: AlgebraicShape|
-    match acc { Some(_) -> acc, None -> if a.name == name { Some(a) } else { None } })
+/// Every sum type this run declared, flattened: its parameters and every field of every variant.
+fn algebraic_shapes(checker: Checker) -> Shapes / {abort.raise} =
+  fold(checker.ctors, map_new(), |acc: Shapes, ctor_info: CtorInfo|
+    match map_get(acc, ctor_info.type_name) {
+      None -> {
+        let scheme = ctor_info.scheme;
+        map_insert(acc, ctor_info.type_name, {
+          name: ctor_info.type_name,
+          params: if len(scheme.label_vars) == 0 { scheme.ty_vars }
+          else { concat(scheme.ty_vars, scheme.label_vars) },
+          rows: scheme.row_vars,
+          fields: ctor_info.fields,
+        })
+      },
+      Some(a) ->
+        map_insert(acc, ctor_info.type_name, { ..a, fields: concat(a.fields, ctor_info.fields) }),
+    })
+
+fn find_adt(adts: Shapes, name: Bytes) -> Option<AlgebraicShape> = map_get(adts, name)
 
 fn json_null_encoded(ty: Type) -> Bool =
   match ty { TyCon(c) -> null_encoded_name(c.name), _ -> false }
@@ -11184,14 +11711,15 @@ fn json_null_encoded(ty: Type) -> Bool =
 fn derivable(
   deriver: Deriver,
   ty: Type,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   assumed: List<Int>,
-) -> Option<Blocked> / {abort.raise} = derivable_within(deriver, ty, adts, assumed, [], len(adts))
+) -> Option<Blocked> / {abort.raise} =
+  derivable_within(deriver, ty, adts, assumed, [], map_len(adts))
 
 fn first_blocked(
   deriver: Deriver,
   tys: List<Type>,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
@@ -11206,7 +11734,7 @@ fn first_blocked(
 fn derivable_within(
   deriver: Deriver,
   ty: Type,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
@@ -11477,13 +12005,13 @@ fn witnessing(checker: Checker, cs: List<Constraint>) -> Checker =
     })
 
 fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
-  let adts = algebraic_shapes(checker);
+  let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), DOrd);
   let walked = fold(
     checker.map_keys,
     { checker: { ..checker, map_keys: [] }, seen: [] },
     |acc: { checker: Checker, seen: List<{ scope: Int, text: Bytes }> }, site: MapKeySite| {
       let key = resolve(acc.checker, site.key);
-      match derivable(DOrd, key, instance_shapes(checker.instances, adts, DOrd), site.assumed) {
+      match derivable(DOrd, key, ordered, site.assumed) {
         None -> acc,
         Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
           let pr = print_ty(printer_new(), key);
@@ -11535,6 +12063,7 @@ fn of_case(site: ConstraintSite) -> Bool =
 
 fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   let adts = algebraic_shapes(checker);
+  let shapes = deriver_shapes(checker.instances, adts);
   let walked = fold(
     checker.constrained_uses,
     { checker: { ..checker, constrained_uses: [] }, seen: [] },
@@ -11543,7 +12072,7 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
       if is_predicate(site.deriver) {
         { checker: check_predicate(acc.checker, site, ty), seen: acc.seen }
       } else {
-        let through = instance_shapes(checker.instances, adts, site.deriver);
+        let through = shapes_for(shapes, site.deriver);
         match derivable(
             site.deriver,
             ty,
@@ -11850,7 +12379,7 @@ fn why_notes_for_derive(
 
 /// `derivable(D, T)` over each `derive`'s target as a solved type.
 fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
-  let adts = algebraic_shapes(checker);
+  let shapes = deriver_shapes(checker.instances, algebraic_shapes(checker));
   fold(range(0, len(checker.modules)), checker, |c: Checker, i: Int| {
     let m = at(c.modules, i);
     fold(m.module.items, c, |cc: Checker, item: Item|
@@ -11858,12 +12387,7 @@ fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
         IDerive(def) -> if !expanded_here(m, def) { cc } else {
           match derive_target({ ..cc, module: i }, m, def.target.name) {
             None -> cc,
-            Some(o) -> match derivable(
-                def.deriver,
-                o.ty,
-                instance_shapes(checker.instances, adts, def.deriver),
-                [],
-              ) {
+            Some(o) -> match derivable(def.deriver, o.ty, shapes_for(shapes, def.deriver), []) {
               None -> o.checker,
               Some(blocked) -> match blocked.why {
                 Unconstrained(_) -> o.checker,
@@ -11915,30 +12439,52 @@ fn instance_of(instances: List<InstanceInfo>, type_name: Bytes, key: Bool) -> Op
       None -> if x.type_name == type_name && is_key(x.kind) == key { Some(x) } else { None },
     })
 
+/// Whether a type that states a `key` is read through it for `deriver`: compared, ordered and hashed
+/// as what its key answers is, whatever it holds.
+fn through_key(deriver: Deriver) -> Bool =
+  same_deriver(deriver, DEq) || same_deriver(deriver, DOrd) || same_deriver(deriver, DHash)
+
+/// Each type's first statement of one kind, by the type's name.
+fn stated_by_type(instances: List<InstanceInfo>, key: Bool) -> Map<Bytes, InstanceInfo> =
+  fold(instances, map_new(), |acc: Map<Bytes, InstanceInfo>, x: InstanceInfo|
+    if is_key(x.kind) != key || map_contains(acc, x.type_name) { acc }
+    else { map_insert(acc, x.type_name, x) })
+
 /// The shapes `derivable` reads for one deriver. A type that states a `key` is compared, ordered and
 /// hashed as what its key answers is, whatever it holds, and one that states a `show` is always shown.
-fn instance_shapes(
-  instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
-  deriver: Deriver,
-) -> List<AlgebraicShape> =
+fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver) -> Shapes =
   if len(instances) == 0 { adts } else {
-    let through_key = same_deriver(deriver, DEq) || same_deriver(deriver, DOrd)
-      || same_deriver(deriver, DHash);
-    if !through_key && !same_deriver(deriver, DShow) { adts } else {
-      map(adts, |shape: AlgebraicShape|
-        match instance_of(instances, shape.name, through_key) {
+    let keyed = through_key(deriver);
+    if !keyed && !same_deriver(deriver, DShow) { adts } else {
+      let stated = stated_by_type(instances, keyed);
+      map_fold(adts, adts, |acc: Shapes, name: Bytes, shape: AlgebraicShape|
+        match map_get(stated, name) {
           Some(x) ->
-            {
+            map_insert(acc, name, {
               name: shape.name,
               params: x.params,
               rows: x.rows,
-              fields: if through_key { [x.answers] } else { [] },
-            },
-          None -> shape,
+              fields: if keyed { [x.answers] } else { [] },
+            }),
+          None -> acc,
         })
     }
   }
+
+/// The shapes each deriver reads, worked out once for a pass that asks `derivable` of many sites.
+type DeriverShapes = { plain: Shapes, keyed: Shapes, shown: Shapes }
+
+fn deriver_shapes(instances: List<InstanceInfo>, adts: Shapes) -> DeriverShapes =
+  {
+    plain: adts,
+    keyed: instance_shapes(instances, adts, DEq),
+    shown: instance_shapes(instances, adts, DShow),
+  }
+
+fn shapes_for(shapes: DeriverShapes, deriver: Deriver) -> Shapes =
+  if through_key(deriver) { shapes.keyed }
+  else if same_deriver(deriver, DShow) { shapes.shown }
+  else { shapes.plain }
 
 type OwnParams = { params: List<Int>, rows: List<Int> }
 
@@ -12515,7 +13061,7 @@ fn numeric_fitted(
 fn first_key_loop(
   tys: List<Type>,
   instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   path: List<Bytes>,
   room: Int,
 ) -> Option<List<Bytes>> / {abort.raise} =
@@ -12528,7 +13074,7 @@ fn first_key_loop(
 fn key_loop(
   ty: Type,
   instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   path: List<Bytes>,
   room: Int,
 ) -> Option<List<Bytes>> / {abort.raise} =
@@ -12580,10 +13126,11 @@ fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
   });
   if len(stated.instances) == 0 { { ..stated, module: checker.module } } else {
     let adts = algebraic_shapes(stated);
+    let shapes = deriver_shapes(stated.instances, adts);
     let judged: Checker = fold(stated.instances, stated, |c: Checker, x: InstanceInfo|
       if !is_key(x.kind) { c } else {
         let simple = simple_name_of(x.type_name);
-        match key_loop(x.answers, stated.instances, adts, [x.type_name], len(adts) + 1) {
+        match key_loop(x.answers, stated.instances, adts, [x.type_name], map_len(adts) + 1) {
           Some(path) ->
             report(
               c,
@@ -12615,12 +13162,7 @@ fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
           None ->
             fold([DOrd, DHash], c, |cc: Checker, deriver: Deriver|
               if len(cc.diags) > len(c.diags) { cc } else {
-                match derivable(
-                    deriver,
-                    x.answers,
-                    instance_shapes(stated.instances, adts, deriver),
-                    x.params,
-                  ) {
+                match derivable(deriver, x.answers, shapes_for(shapes, deriver), x.params) {
                   None -> cc,
                   Some(blocked) -> {
                     let blocker = type_text(blocked.ty);
@@ -12844,6 +13386,20 @@ fn check_comparisons(checker: Checker) -> Checker / {abort.raise} =
             [b"compare the results of calling them instead"],
           ),
         )
+      } else if holds_con(resolved, b"Hold") {
+        report(
+          c,
+          error_at(
+            b"E0201",
+            site.module,
+            site.span,
+            b"a hold cannot be compared for equality",
+            bytes_concat_all([b"both sides have type `", type_text(resolved), b"`"]),
+            [
+              b"a hold is a key to what its region will release, not a value: compare what `hold_get` reads of each instead",
+            ],
+          ),
+        )
       } else { c }
     },
   )
@@ -13048,7 +13604,7 @@ fn holds_con(t: Type, name: Bytes) -> Bool =
     TyNominal(n) -> fold(n.fields, false, |b: Bool, f: Field| b || holds_con(f.ty, name)),
     TyFn(f) ->
       fold(
-        if name == b"Task" { [b"join", b"await", b"cancel"] } else { [b"send", b"recv", b"close"] },
+        if name == b"Task" { [b"join", b"await", b"cancel"] } else { channel_ops() },
         fold(f.params, holds_con(f.ret, name), |b: Bool, p: Type| b || holds_con(p, name)),
         |b: Bool, op: Bytes| b || atoms_covered(f.effects.atoms, task_op(op)),
       ),
@@ -13332,15 +13888,17 @@ fn task_op(op: Bytes) -> Atom =
   { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(op) }
 
 /// A cell is reached by atoms naming its region; a task only by a join, an await or a cancel, a
-/// channel by a send, a receive or a close, and either by a `simulate` around one.
+/// channel by a send, a receive, a close or a select, and either by a `simulate` around one.
 fn row_brands(row: Row, brand: Brand) -> Bool =
   match brand {
     CellsOf(r) ->
       fold(row.atoms, false, |b: Bool, atom: Atom|
         b || (atom.effect == cell() && atom.resource == RNamed(r))),
+    // A row does not say which hold it reads, so one that reads any may read this region's.
+    HoldsOf(_) -> fold(row.atoms, false, |b: Bool, atom: Atom| b || atom.effect == hold()),
     Tasks ->
       fold(
-        [b"join", b"await", b"cancel", b"send", b"recv", b"close"],
+        concat([b"join", b"await", b"cancel"], channel_ops()),
         atoms_covered(row.atoms, seed_atom()),
         |b: Bool, op: Bytes| b || atoms_covered(row.atoms, task_op(op)),
       ),
@@ -13351,7 +13909,11 @@ fn brand_in(t: Type, brand: Brand) -> Bool / {abort.raise} =
   match t {
     TyVar(_) -> false,
     TyCon(c) ->
-      (match brand { CellsOf(r) -> region_of(t) == Some(r), Tasks -> scheduler_handle(c.name) })
+      (match brand {
+          CellsOf(r) -> region_of(t) == Some(r),
+          HoldsOf(r) -> region_of(t) == Some(r),
+          Tasks -> scheduler_handle(c.name),
+        })
         || fold(c.args, false, |b: Bool, a: Type| b || brand_in(a, brand)),
     TyFn(f) ->
       row_brands(f.effects, brand)
@@ -13382,11 +13944,36 @@ fn check_regions(checker: Checker) -> Checker / {abort.raise} =
       site,
     ))
 
+fn brand_of(site: RegionSite) -> Brand =
+  if site.hold { HoldsOf(site.name) } else { CellsOf(site.name) }
+
+fn region_form(site: RegionSite) -> Bytes = if site.hold { b"with_hold" } else { b"with_cell" }
+
 /// The value the region evaluates to; a `with_cell` reports the escape as `E0201`.
 fn check_region_exits(checker: Checker, site: RegionSite) -> Checker / {abort.raise} = {
   let ty = resolve(checker, site.body_ty);
   let n = site.name;
-  if !brand_in(ty, CellsOf(n)) { checker } else {
+  if !brand_in(ty, brand_of(site)) { checker } else if site.hold {
+    err_labels(
+      checker,
+      b"E0446",
+      bytes_concat_all([b"a hold escapes its `with_hold[", n, b"]` region"]),
+      exit_labels(site.module, site.exits, site.body_span, ty),
+      if carries_brand_in_row(ty, brand_of(site)) {
+        [
+          b"the closure's row still carries `hold.read`, so calling it after the region reads a hold the region has let go",
+          b"call the closure inside the region and return what it answers instead",
+        ]
+      } else {
+        [
+          bytes_concat_all([
+            b"the region releases what the hold holds at its `}`, so the hold names nothing after it",
+          ]),
+          b"read the hold inside the region and return what the body made of it instead",
+        ]
+      },
+    )
+  } else {
     let carries = if carries_brand_in_row(ty, CellsOf(n)) {
       [
         bytes_concat_all([
@@ -13414,7 +14001,7 @@ fn opens_here(n: Bytes) -> Bytes =
 fn check_region_stores(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
   fold(site.outer, checker, |c: Checker, b: OuterBinding| {
     let ty = resolve(c, b.ty);
-    if brand_in(ty, CellsOf(site.name)) {
+    if brand_in(ty, brand_of(site)) {
       err_labels(
         c,
         b"E0446",
@@ -13462,7 +14049,7 @@ fn outlived() -> List<Bytes> =
 fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
   fold(site.spawns, checker, |c: Checker, s: SpawnSite| {
     let ty = resolve(c, s.ty);
-    if brand_in(ty, CellsOf(site.name)) {
+    if brand_in(ty, brand_of(site)) {
       err_labels(
         c,
         b"E0446",
@@ -13483,7 +14070,9 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
         push(
           outlived(),
           bytes_concat_all([
-            b"open the `simulate` region inside `with_cell[",
+            b"open the `simulate` region inside `",
+            region_form(site),
+            b"[",
             site.name,
             b"]`, or pass the task something that does not mention `",
             site.name,
@@ -13492,7 +14081,7 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
         ),
       )
     } else {
-      match reaching_clause(c, ty, s.around, site.name) {
+      match reaching_clause(c, ty, s.around, brand_of(site)) {
         None -> c,
         Some(cl) -> {
           let op = backticked_text(
@@ -13536,7 +14125,9 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
               push(
                 outlived(),
                 bytes_concat_all([
-                  b"open the `simulate` region inside `with_cell[",
+                  b"open the `simulate` region inside `",
+                  region_form(site),
+                  b"[",
                   site.name,
                   b"]`, or answer ",
                   op,
@@ -13552,19 +14143,18 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
     }
   })
 
-/// The first clause around a spawn that its task can perform against and that reaches region `n`.
+/// The first clause around a spawn that its task can perform against and that reaches the region.
 fn reaching_clause(
   checker: Checker,
   task: Type,
   around: List<ClauseSite>,
-  n: Bytes,
+  brand: Brand,
 ) -> Option<ClauseSite> / {abort.raise} =
   fold(around, None, |acc: Option<ClauseSite>, cl: ClauseSite|
     match acc {
       Some(_) -> acc,
-      None -> if may_perform(task, cl.op) && brand_in(resolve(checker, cl.ty), CellsOf(n)) {
-        Some(cl)
-      } else { None },
+      None -> if may_perform(task, cl.op) && brand_in(resolve(checker, cl.ty), brand) { Some(cl) }
+      else { None },
     })
 
 /// On any label: an open row may perform anything.
@@ -13582,9 +14172,15 @@ fn may_perform(task: Type, op: Atom) -> Bool =
 fn check_region_handoffs(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
   fold(site.handoffs, checker, |c: Checker, h: HandoffSite| {
     let ty = resolve(c, h.ty);
-    if !brand_in(ty, CellsOf(site.name)) { c } else {
+    if !brand_in(ty, brand_of(site)) { c } else {
       let n = site.name;
-      let carries = if carries_brand_in_row(ty, CellsOf(n)) {
+      let carries = if site.hold {
+        if carries_brand_in_row(ty, brand_of(site)) {
+          [
+            b"the closure's row still carries `hold.read`, so whoever handles the operation can read a hold the region has let go",
+          ]
+        } else { [] }
+      } else if carries_brand_in_row(ty, CellsOf(n)) {
         [
           bytes_concat_all([
             b"the closure's row still carries `cell.read[",
@@ -13663,6 +14259,9 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     repeated_vars: [],
     recursed: None,
     declared_atoms: [],
+    guards: guards::none(),
+    contracts: map_new(),
+    raise_notes: [],
     comparisons: [],
     scope: 0,
     constraints: map_new(),
@@ -13955,15 +14554,6 @@ fn facts_of(checker: Checker) -> EmitFacts / {abort.raise} =
 fn operand_name(ty: Type) -> Bytes =
   match ty { TyCon(k) -> if len(k.args) == 0 { k.name } else { b"" }, _ -> b"" }
 
-/// The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
-pub fn elaboration(
-  resolved: Resolved,
-  mods: List<ParsedModule>,
-) -> Option<Elaboration> / {abort.raise} = {
-  let out = check_program(resolved, mods);
-  if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
-}
-
 /// The elaboration, and the definitions whose calls the checker saw end, which are the recursive
 /// ones a proof may unroll.
 pub type Elaborated = { elaboration: Elaboration, ends: Map<Bytes, Bool>, stated: Map<Bytes, Bool> }
@@ -14017,9 +14607,11 @@ fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
 /// the literal it stands for, and every `try` as its `handle`. The tagged literals go first: they
 /// need nothing of the checker, and what they become is forms the other two already walk.
 fn written_out(module: Module, elaboration: Elaboration, i: Int) -> Module =
-  expand_try_blocks(
-    expand_record_updates(expand_tagged(module), shapes_in(elaboration.updates, i)),
-    answered_in(elaboration.tries, i),
+  expand_holds(
+    expand_try_blocks(
+      expand_record_updates(expand_tagged(module), shapes_in(elaboration.updates, i)),
+      answered_in(elaboration.tries, i),
+    ),
   )
 
 /// The modules written out, and every `numeric` or `integer` parameter's witness passed and read:
@@ -14354,6 +14946,7 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
       repeats: def_info.repeats,
       ending: def_info.ending,
       summary: def_info.summary,
+      raises: def_info.raises,
       facts: b"",
     }));
   // Tests are in load order, then source order, so each `test` item takes the next entry.
@@ -14900,6 +15493,118 @@ fn checked_cx(src: Bytes) -> Checker / {abort.raise} = {
     ResolveFailed(_) -> panic("a source the test wrote does not resolve"),
     ResolveSucceeded(y) -> check_program(y.r, y.mods).checker,
   }
+}
+
+fn held_io(body: Bytes) -> Bytes =
+  bytes_concat(
+    b"effect io {\n  write open(n: Int) -> Int\n  write close(h: Int) -> Unit\n  write pull(h: Int) -> Int\n}\n",
+    body,
+  )
+
+test "a hold is read inside its region, whose row is its acquire's, its release's and its body's" {
+  assert_eq(
+    check_codes(
+      held_io(
+        b"fn f() -> Int / {io.open, io.close, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(hold_get(h)) }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      held_io(
+        b"fn f() -> Int / {io.open, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(hold_get(h)) }",
+      ),
+    ),
+    [b"E0302"],
+  );
+  // The release is a function of what was acquired, answering nothing.
+  assert_eq(
+    check_codes(b"fn f() -> Int = with_hold[file](1, |h: String| ()) { h -> hold_get(h) }"),
+    [b"E0201"],
+  );
+  assert_eq(check_codes(b"fn f() -> Int = with_hold[file](1, |h: Int| h) { h -> hold_get(h) }"), [
+    b"E0201",
+  ])
+}
+
+test "a function handed a hold reads it under `hold.read`, which the region answers" {
+  assert_eq(
+    check_codes(
+      b"fn peek(h: Hold<Int>) -> Int / {hold.read} = hold_get(h)\nfn f() -> Int = with_hold[r](1, |x: Int| ()) { h -> peek(h) + peek(h) }",
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn peek(h: Hold<Int>) -> Int = hold_get(h)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn f() -> Unit / {hold.read} = hold.read()"), [b"E0103"]);
+  assert_eq(check_codes(b"effect hold { read get() -> Int }"), [b"E0105"])
+}
+
+test "a hold that leaves its region is refused where it leaves" {
+  assert_eq(refusals(b"fn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> h }; 0 }"), [
+    [b"E0446", b"a hold escapes its `with_hold[r]` region", b"h"],
+  ]);
+  assert_eq(
+    refusals(
+      b"fn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> || hold_get(h) }; 0 }",
+    ),
+    [[b"E0446", b"a hold escapes its `with_hold[r]` region", b"|| hold_get(h)"]],
+  );
+  // A function that answers a closure over a hold says `hold.read` in the closure's row.
+  assert_eq(
+    check_codes(
+      b"fn later(h: Hold<Int>) -> () -> Int / {hold.read} = || hold_get(h)\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(check_codes(b"fn later(h: Hold<Int>) -> () -> Int = || hold_get(h)"), [b"E0302"])
+}
+
+test "a hold kept in an older cell, handed to an operation, or given an older scheduler's task is refused" {
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int = with_cell[o](None) { c -> { with_hold[r](1, |x: Int| ()) { h -> cell_set(c, Some(h)) }; 0 } }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(
+    check_codes(
+      b"effect box { write put<a>(x: a) -> Unit }\nfn f() -> Unit / {box.put} = with_hold[r](1, |x: Int| ()) { h -> box.put(h) }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int / {task.spawn} = with_hold[r](1, |x: Int| ()) { h -> { let t = task.spawn(|| hold_get(h)); 0 } }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int / {sim.read, abort.raise} = with_hold[r](1, |x: Int| ()) { h -> simulate { task.join(task.spawn(|| hold_get(h))) } }",
+    ),
+    [],
+  )
+}
+
+test "a hold's region is its own: neither it nor a cell's reuses a name that is open" {
+  let nested = |outer: Bytes, inner: Bytes|
+    check_codes(
+      bytes_concat_all([b"fn f() -> Int = ", outer, b" { a -> ", inner, b" { b -> 0 } }"]),
+    );
+  assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_hold[r](2, |x: Int| ())"), [b"E0330"]);
+  assert_eq(nested(b"with_cell[r](1)", b"with_hold[r](2, |x: Int| ())"), [b"E0330"]);
+  assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_cell[r](2)"), [b"E0330"]);
+  assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_hold[s](2, |x: Int| ())"), []);
+  assert_eq(nested(b"with_cell[r](1)", b"with_cell[r](2)"), [])
+}
+
+test "a declaration that mentions a `Hold`, or a function that reads one, is refused" {
+  assert_eq(refusals(b"type Kept = Kept(Hold<Int>)"), [
+    [b"E0446", b"`Kept`'s field 1 mentions a `Hold`", b"Hold<Int>"],
+  ]);
+  assert_eq(check_codes(b"effect io { write put(h: Hold<Int>) -> Unit }"), [b"E0446"]);
+  assert_eq(check_codes(b"type Hidden = Hidden(() -> Int / {hold.read})"), [b"E0446"])
 }
 
 test "a bracket's closures run as one, so a body generic over its row admits the release's" {
@@ -15902,7 +16607,308 @@ test "a narrowing of a literal its type holds does not raise, and one of any oth
   ])
 }
 
-test "a channel's capacity and a draw's bound raise, unless a literal is in range" {
+/// Whether each of `bodies`, a function over `b: Bytes`, `s: String`, `xs: List<Int>`,
+/// `a: Array<Int>` and `i`, `j`, `n: Int`, checks with a row that names nothing.
+fn total(bodies: List<Bytes>) -> List<Bool> / {abort.raise} =
+  map(bodies, |body: Bytes|
+    check_codes(
+        bytes_concat(
+          b"fn f(b: Bytes, s: String, xs: List<Int>, a: Array<Int>, i: Int, j: Int, n: Int) -> Int / {} = ",
+          body,
+        ),
+      )
+      == [])
+
+test "an indexed read on the far side of both of its bounds does not raise" {
+  assert_eq(
+    total([
+      b"if i < 0 || i >= bytes_len(b) { 0 } else { bytes_at(b, i) }",
+      b"if i >= 0 && i < bytes_len(b) { bytes_at(b, i) } else { 0 }",
+      b"if 0 <= i && i + 3 < bytes_len(b) { bytes_at(b, i) + bytes_at(b, i + 3) } else { 0 }",
+      b"if i < 0 || i > bytes_len(b) - 4 { 0 } else { int_of_u32(bytes_u32_le(b, i)) }",
+      b"if 0 <= i && i < array_len(a) { array_get(a, i) } else { 0 }",
+      b"if 0 <= i && i < array_len(a) { array_len(array_set(a, i, 1)) } else { 0 }",
+      b"if 0 <= i && i < len(xs) { len(list_set(xs, i, 1)) } else { 0 }",
+      b"{ let size = bytes_len(b); if i >= 0 && i < size { bytes_at(b, i) } else { 0 } }",
+      b"match i { k if k >= 0 && k < bytes_len(b) -> bytes_at(b, k), _ -> 0 }",
+      b"if (0 <= i && i < bytes_len(b)) && bytes_at(b, i) == 0 { 1 } else { 0 }",
+      b"if i < 0 || i >= bytes_len(b) || bytes_at(b, i) == 0 { 1 } else { 0 }",
+    ]),
+    [true, true, true, true, true, true, true, true, true, true, true],
+  );
+  assert_eq(
+    total([
+      b"bytes_at(b, i)",
+      b"if i < bytes_len(b) { bytes_at(b, i) } else { 0 }",
+      b"if i >= 0 { bytes_at(b, i) } else { 0 }",
+      b"if i >= 0 && i <= bytes_len(b) { bytes_at(b, i) } else { 0 }",
+      b"if i >= 0 && i < bytes_len(b) { bytes_at(b, i + 1) } else { 0 }",
+      b"if i >= 0 && i < bytes_len(b) { 0 } else { bytes_at(b, i) }",
+      b"if i >= 0 && i < string_len(s) { bytes_at(b, i) } else { 0 }",
+      b"if i >= 0 || i < bytes_len(b) { bytes_at(b, i) } else { 0 }",
+      b"if 0 <= i && i < array_len(a) { array_get(a, j) } else { 0 }",
+      b"if 0 <= i && i < len(xs) { len(list_set(xs, i + n, 1)) } else { 0 }",
+      b"{ let ok = if i >= 0 && i < bytes_len(b) { 1 } else { 0 }; bytes_at(b, i) + ok }",
+    ]),
+    [false, false, false, false, false, false, false, false, false, false, false],
+  )
+}
+
+test "a slice whose ends a condition holds in order and inside the value does not raise" {
+  assert_eq(
+    total([
+      b"if i < 0 || n < 0 || i > bytes_len(b) || n > bytes_len(b) - i { 0 } else { bytes_len(bytes_slice(b, i, i + n)) }",
+      b"if 0 <= i && i <= j && j <= string_len(s) { string_len(string_slice(s, i, j)) } else { 0 }",
+      b"{ let size = string_len(s); if size == 0 { 0 } else { string_len(string_slice(s, size - 1, size)) } }",
+      b"if n < 0 || n > 15 { 0 } else { string_len(string_slice(\"0123456789abcdef\", n, n + 1)) }",
+      b"{ let digits = b\"0123456789\"; if 0 <= n && n < 10 { bytes_len(bytes_slice(digits, n, n + 1)) } else { 0 } }",
+      b"if 0 <= i && i <= bytes_len(b) { bytes_len(bytes_slice(b, bytes_scan(b, i, b\" \", bytes_len(b)), bytes_len(b))) } else { 0 }",
+      b"len(string_split(s, \",\")) + len(bytes_split(b, b\"\\r\\n\"))",
+    ]),
+    [true, true, true, true, true, true, true],
+  );
+  assert_eq(
+    total([
+      b"string_len(string_slice(s, i, j))",
+      b"if 0 <= i && j <= string_len(s) { string_len(string_slice(s, i, j)) } else { 0 }",
+      b"if n < 0 || n > 16 { 0 } else { string_len(string_slice(\"0123456789abcdef\", n, n + 1)) }",
+      b"bytes_len(bytes_slice(b, bytes_scan(b, i, b\" \", bytes_len(b)), bytes_len(b)))",
+      b"len(string_split(s, s))",
+      b"len(bytes_split(b, b\"\"))",
+    ]),
+    [false, false, false, false, false, false],
+  )
+}
+
+test "a lambda called with each element of a range reads within the range's bounds" {
+  assert_eq(
+    total([
+      b"fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
+      b"len(map(range(0, bytes_len(b)), |k: Int| bytes_at(b, k)))",
+      b"len(filter(range(0, array_len(a)), |k: Int| array_get(a, k) > 0))",
+      b"fold(range(0, bytes_len(b) / 4), 0, |acc: Int, k: Int| acc + bytes_at(b, k * 4 + 3))",
+      b"fold(range(0, min(bytes_len(b), n)), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
+      b"fold(range(1, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, k - 1))",
+    ]),
+    [true, true, true, true, true, true],
+  );
+  assert_eq(
+    total([
+      b"fold(range(0, n), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
+      b"fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, acc))",
+      b"fold(range(0, bytes_len(b) + 1), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
+      b"fold(range(0 - 1, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
+      b"fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| fold([k + 1], acc, |x: Int, k: Int| x + bytes_at(b, k)))",
+      b"fold(xs, 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
+    ]),
+    [false, false, false, false, false, false],
+  )
+}
+
+test "a narrowing of a value its type is shown to hold does not raise" {
+  assert_eq(
+    total([
+      b"bytes_len(byte_of_int(n & 0xFF))",
+      b"bytes_len(byte_of_int(n >>> 24 & 0xFF))",
+      b"bytes_len(byte_of_int(n >>> 56))",
+      b"int_of_u16(u16_of_int(n & 0xFFFF)) + int_of_u32(u32_of_int(n & 0xFFFF_FFFF))",
+      b"if 0 <= n && n < 256 { int_of_u8(u8_of_int(n)) } else { 0 }",
+      b"if i < 0 || i >= bytes_len(b) { 0 } else { bytes_len(byte_of_int(bytes_at(b, i))) }",
+      b"if 0 <= i && i < bytes_len(b) && 0 <= j && j < bytes_len(b) { bytes_len(byte_of_int(bytes_at(b, i) ^ bytes_at(b, j))) } else { 0 }",
+      b"if n < 0 { 0 } else { bytes_len(byte_of_int(n % 256)) + bytes_len(byte_of_int(128 + n % 64)) }",
+      b"if 0 <= n && n < 2048 { bytes_len(byte_of_int(192 + n / 64)) } else { 0 }",
+      b"int_of_i8(i8_of_int(-128)) + bytes_len(byte_of_int(int_of_u8(u8_of_int(7))))",
+    ]),
+    [true, true, true, true, true, true, true, true, true, true],
+  );
+  assert_eq(
+    total([
+      b"bytes_len(byte_of_int(n))",
+      b"bytes_len(byte_of_int(n & 0x1FF))",
+      b"bytes_len(byte_of_int(n >>> 55))",
+      b"bytes_len(byte_of_int(n >> 56))",
+      b"bytes_len(byte_of_int(n % 256))",
+      b"if 0 <= n && n <= 256 { int_of_u8(u8_of_int(n)) } else { 0 }",
+      b"if 0 <= i && i < bytes_len(b) { bytes_len(byte_of_int(bytes_at(b, i) ^ n)) } else { 0 }",
+      b"if 0 <= n && n < 2048 { bytes_len(byte_of_int(225 + n / 64)) } else { 0 }",
+      b"int_of_u64(u64_of_int(n))",
+    ]),
+    [false, false, false, false, false, false, false, false, false],
+  )
+}
+
+test "a division by a divisor a condition holds off zero does not raise" {
+  assert_eq(
+    total([
+      b"if n == 0 { 0 } else { i / n }",
+      b"if n != 0 { i % n } else { 0 }",
+      b"if n > 0 { i / n + i % n } else { 0 }",
+      b"match n { 0 -> 0, _ -> i / n }",
+      b"if len(xs) == 0 { 0 } else { i / len(xs) }",
+      b"match xs { [] -> 0, _ -> i % len(xs) }",
+      b"i / (bytes_len(b) + 1)",
+      b"if 0 <= i && len(xs) > 0 { len(list_set(xs, i % len(xs), 0)) } else { 0 }",
+      b"if i < 0 || len(xs) == 0 { 0 } else { len(list_set(xs, i % len(xs), 0)) }",
+    ]),
+    [true, true, true, true, true, true, true, true, true],
+  );
+  assert_eq(
+    total([
+      b"i / n",
+      b"if i != 0 { i / n } else { 0 }",
+      b"if n >= 0 { i / n } else { 0 }",
+      b"match n { 1 -> 0, _ -> i / n }",
+      b"i / bytes_len(b)",
+      b"if len(xs) > 0 { len(list_set(xs, i % len(xs), 0)) } else { 0 }",
+    ]),
+    [false, false, false, false, false, false],
+  )
+}
+
+test "a pattern that matched says what a condition would" {
+  assert_eq(
+    total([
+      b"match list_at(xs, i) { Some(_) -> len(list_set(xs, i, 0)), None -> 0 }",
+      b"match array_at(a, i) { Some(_) -> array_get(a, i), None -> 0 }",
+      b"match xs { [_, _, ..] -> len(list_set(xs, 1, 0)), _ -> 0 }",
+      b"match xs { [] -> 0, _ -> len(list_set(xs, 0, 0)) }",
+      b"match i >= 0 && i < bytes_len(b) { true -> bytes_at(b, i), false -> 0 }",
+      b"{ let Some(_) = list_at(xs, i) else { 0 }; len(list_set(xs, i, 0)) }",
+    ]),
+    [true, true, true, true, true, true],
+  );
+  assert_eq(
+    total([
+      b"match list_at(xs, i) { Some(_) -> len(list_set(xs, i + 1, 0)), None -> 0 }",
+      b"match list_at(xs, i) { Some(_) -> 0, None -> len(list_set(xs, i, 0)) }",
+      b"match xs { [_, ..] -> len(list_set(xs, 1, 0)), _ -> 0 }",
+      b"match xs { [_] -> 0, _ -> len(list_set(xs, 0, 0)) }",
+      b"match i >= 0 && i < bytes_len(b) { true -> 0, false -> bytes_at(b, i) }",
+      b"{ let _ = { let Some(_) = list_at(xs, i) else { 0 }; 1 }; len(list_set(xs, i, 0)) }",
+    ]),
+    [false, false, false, false, false, false],
+  )
+}
+
+test "a range pattern holds an integer between its ends, and alternatives between the least and greatest" {
+  assert_eq(
+    total([
+      b"match n { 0..=9 -> bytes_len(byte_of_int(n + 48)), _ -> 0 }",
+      b"match n { b'0'..=b'9' -> string_len(string_slice(\"0123456789\", n - 48, n - 47)), _ -> 0 }",
+      b"match n { b'a'..=b'f' | b'A'..=b'F' -> bytes_len(byte_of_int(n)), _ -> 0 }",
+      b"match n { b'-' | b'0'..=b'9' -> 255 / n, _ -> 0 }",
+      b"if i < 0 || i >= bytes_len(b) { 0 } else { match bytes_at(b, i) { b'a'..=b'z' -> bytes_len(byte_of_int(bytes_at(b, i) - 32)), _ -> 0 } }",
+      b"if n < 0 { 0 } else { match n { 0..=9 -> 0, _ -> 100 / (n - 9) } }",
+      b"if n > 9 { 0 } else { match n { 0..=9 -> 0, _ -> 100 / n } }",
+      b"match n { 0 | 1 -> 0, _ -> 10 / n + 10 / (n - 1) }",
+    ]),
+    [true, true, true, true, true, true, true, true],
+  );
+  assert_eq(
+    total([
+      b"match n { 0..=9 -> bytes_len(byte_of_int(n + 247)), _ -> 0 }",
+      b"match n { b'0'..=b'9' -> 0, _ -> bytes_len(byte_of_int(n)) }",
+      b"match n { b'a'..=b'f' | b'A'..=b'F' -> bytes_len(byte_of_int(n + 154)), _ -> 0 }",
+      b"match n { 0..=9 -> 0, _ -> 100 / (n - 9) }",
+      b"match n { 0 | 2 -> 0, _ -> 10 / (n - 1) }",
+      b"match i { 0..=9 -> bytes_len(byte_of_int(n)), _ -> 0 }",
+    ]),
+    [false, false, false, false, false, false],
+  )
+}
+
+test "a name bound again is not the one a condition read" {
+  assert_eq(
+    total([
+      b"if i >= 0 && i < bytes_len(b) { let i = i + 1; bytes_at(b, i) } else { 0 }",
+      b"if i >= 0 && i < bytes_len(b) { len(map([j], |i: Int| bytes_at(b, i))) } else { 0 }",
+      b"if i >= 0 && i < bytes_len(b) { match j { i -> bytes_at(b, i) } } else { 0 }",
+      b"if i >= 0 && i < bytes_len(b) { let b = b\"\"; bytes_at(b, i) } else { 0 }",
+      b"if i >= 0 && i < bytes_len(b) { handle { 0 } with { return i -> bytes_at(b, i) } } else { 0 }",
+      b"{ let k = i; let i = j; if k >= 0 && k < bytes_len(b) { bytes_at(b, i) } else { 0 } }",
+    ]),
+    [false, false, false, false, false, false],
+  );
+  assert_eq(
+    total([
+      b"{ let k = i; if k >= 0 && k < bytes_len(b) { bytes_at(b, i) } else { 0 } }",
+      b"{ let c = b; if i >= 0 && i < bytes_len(c) { bytes_at(b, i) } else { 0 } }",
+      b"if i >= 0 && i < bytes_len(b) { let i = i; bytes_at(b, i) } else { 0 }",
+    ]),
+    [true, true, true],
+  )
+}
+
+test "a field read through records is one value wherever it is read" {
+  let over = |body: Bytes|
+    check_codes(
+      bytes_concat(
+        b"type Cursor = { src: Bytes, at: Int }\nfn f(c: Cursor, d: Cursor) -> Int / {} = ",
+        body,
+      ),
+    );
+  assert_eq(
+    over(b"if c.at >= 0 && c.at < bytes_len(c.src) { bytes_at(c.src, c.at) } else { 0 }"),
+    [],
+  );
+  assert_eq(
+    over(b"if c.at >= 0 && c.at < bytes_len(c.src) { bytes_at(d.src, c.at) } else { 0 }"),
+    [b"E0302"],
+  );
+  assert_eq(
+    over(b"if c.at >= 0 && c.at < bytes_len(c.src) { bytes_at(c.src, d.at) } else { 0 }"),
+    [b"E0302"],
+  )
+}
+
+test "what a call that can raise ensures of its answer holds only past the call" {
+  let unshown = |body: Bytes|
+    match def_of(
+        checked_cx(bytes_concat(b"fn f(b: Bytes, i: Int, n: Int) -> Int / {abort.raise} = ", body)),
+        b"m.f",
+      ) {
+      Some(d) -> map(d.raises, |r: Raise| r.why),
+      None -> [],
+    };
+  // A scan that answered started inside the bytes, which says nothing where it never ran.
+  assert_eq(
+    unshown(
+      b"if n > 0 { let stop = bytes_scan(b, i, b\" \", 0); stop } else if i >= 0 { bytes_len(bytes_slice(b, i, bytes_len(b))) } else { 0 }",
+    ),
+    [
+      Unshown({ callee: b"bytes_scan", needs: b"0 <= from" }),
+      Unshown({ callee: b"bytes_slice", needs: b"start <= end" }),
+    ],
+  );
+  assert_eq(
+    unshown(
+      b"if i < 0 { 0 } else { let stop = bytes_scan(b, i, b\" \", 0); bytes_len(bytes_slice(b, i, stop)) + bytes_len(bytes_slice(b, i, bytes_len(b))) }",
+    ),
+    [Unshown({ callee: b"bytes_scan", needs: b"from <= bytes_len(hay)" })],
+  )
+}
+
+test "a body's raises are filed with why each was kept, and a group that raises only by recursing has none" {
+  let out = checked_cx(
+    b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = if i < bytes_len(b) { bytes_at(b, i) } else { 0 }\nfn both(b: Bytes, n: Int) -> Int / {abort.raise} = at(b, n) + at(b, 0) + 7 / n + panic(\"no\")\nfn walk(b: Bytes, i: Int) -> Int / {abort.raise} = if i < 0 || i >= bytes_len(b) { 0 } else { bytes_at(b, i) + walk(b, i + 1) }\nfn each(b: Bytes, f: (Int) -> Int / {abort.raise}) -> Int / {abort.raise} = fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| acc + f(bytes_at(b, k)))\n",
+  );
+  let raises = |name: Bytes|
+    match def_of(out, name) { Some(d) -> map(d.raises, |r: Raise| r.why), None -> [] };
+  assert_eq(raises(b"m.at"), [Unshown({ callee: b"bytes_at", needs: b"0 <= i" })]);
+  assert_eq(raises(b"m.both"), [Calls(b"m.at"), ZeroDivisor, Unguarded(b"panic")]);
+  assert_eq(raises(b"m.walk"), []);
+  assert_eq(raises(b"m.each"), [Handed]);
+  let performed = |name: Bytes|
+    match def_of(out, name) { Some(d) -> len(d.performed), None -> 0 - 1 };
+  assert_eq(performed(b"m.walk"), 0);
+  assert_eq(performed(b"m.at"), 1);
+  match def_of(out, b"m.at") {
+    Some(d) -> assert_eq(map(d.raises, |r: Raise| r.span), [{ start: 71, end: 85 }]),
+    None -> panic("`at` is defined"),
+  }
+}
+
+test "a channel's capacity and a draw's bound raise, unless a literal or a condition holds them in range" {
   assert_eq(
     check_codes(b"fn f(n: Int) -> Int / {sim.read} = simulate { let _ = task.channel(n); 0 }"),
     [b"E0302"],
@@ -15915,7 +16921,19 @@ test "a channel's capacity and a draw's bound raise, unless a literal is in rang
     b"E0302",
   ]);
   assert_eq(check_codes(b"fn f() -> Int / {sim.read} = simulate { random.below(0) }"), [b"E0302"]);
-  assert_eq(check_codes(b"fn f() -> Int / {sim.read} = simulate { random.below(6) }"), [])
+  assert_eq(check_codes(b"fn f() -> Int / {sim.read} = simulate { random.below(6) }"), []);
+  assert_eq(
+    check_codes(
+      b"fn f(n: Int) -> Int / {sim.read} = simulate { if n > 0 { random.below(n) } else { 0 } }",
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f(n: Int) -> Int / {sim.read} = simulate { if n >= 0 { random.below(n) } else { 0 } }",
+    ),
+    [b"E0302"],
+  )
 }
 
 test "what cannot fail does not raise, and overflow is the machine's limit" {
@@ -15983,6 +17001,15 @@ test "a `const fn` may raise, and its callers read no raise of it" {
   assert_eq(halved(b"const fn"), []);
   // Written without `const`, the raise is its own to write, and its caller's.
   assert_eq(halved(b"fn"), [b"E0302", b"E0302"])
+}
+
+test "a `const fn` files no place it can raise" {
+  let out = checked_cx(
+    b"const fn third() -> Int = 10 / zero()\nfn zero() -> Int = 3\nfn plain() -> Int / {abort.raise} = 10 / zero()",
+  );
+  let raises = |name: Bytes| match def_of(out, name) { Some(d) -> len(d.raises), None -> 0 - 1 };
+  assert_eq(raises(b"m.third"), 0);
+  assert_eq(raises(b"m.plain"), 1)
 }
 
 test "a `const fn` performs nothing but a raise, and ends" {
@@ -18033,4 +19060,59 @@ test "a `forall` over an opaque type another module declares draws through the g
   // What the generator is handed for a parameter is still drawn where the law is.
   assert_eq(over(stated, b"law \"l\" forall (p: Purse<Int>) { p == p }"), []);
   assert_eq(over(stated, b"law \"l\" forall (p: Purse<Token>) { p == p }"), [b"E0418"])
+}
+
+test "a `Hold` is never drawn: not by a `forall`, not as what a stated generator is handed, and no `gen` is its own" {
+  assert_eq(check_codes(b"law \"l\" forall (h: Hold<Int>) { true }"), [b"E0418"]);
+  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int>>) { len(hs) >= 0 }"), [b"E0418"]);
+  assert_eq(
+    check_codes(b"type Kept<t> = | Kept(t)\nlaw \"l\" forall (k: Kept<Hold<Int>>) { true }"),
+    [b"E0418"],
+  );
+  let purse = b"type Purse<a> = | Purse(List<a>)\nfn purses<a>(g: Gen<a>) -> Gen<Purse<a>> = constant(Purse([]))\ngen for Purse by purses\n";
+  assert_eq(gen_codes(bytes_concat(purse, b"law \"l\" forall (p: Purse<Int>) { p == p }")), []);
+  assert_eq(gen_codes(bytes_concat(purse, b"law \"l\" forall (p: Purse<Hold<Int>>) { true }")), [
+    b"E0418",
+  ]);
+  // A generator answers values, and a hold is one only inside the region that made it.
+  assert(
+    len(
+        gen_codes(
+          b"fn holds() -> Gen<Hold<Int>> = constant(with_hold[r](1, |x: Int| ()) { h -> h })",
+        ),
+      )
+      > 0,
+  )
+}
+
+test "a hold of an opaque value is read where the value's module is called, and released by it" {
+  let over = |app: Bytes|
+    map(
+      gen_checked([
+        {
+          name: b"vault",
+          src: b"pub opaque type Token = | Token(Int)\npub fn mint(n: Int) -> Token = Token(n)\npub fn spend(t: Token) -> Unit = ()\npub fn worth(t: Token) -> Int = match t { Token(n) -> n }\n",
+        },
+        { name: b"app", src: bytes_concat(b"import vault (Token, mint, spend, worth)\n", app) },
+      ]),
+      |d: Diag| d.code,
+    );
+  assert_eq(
+    over(b"fn spent(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> worth(hold_get(h)) }"),
+    [],
+  );
+  assert_eq(over(b"fn peek(h: Hold<Token>) -> Int / {hold.read} = worth(hold_get(h))"), []);
+  // Holding one opens nothing: its constructor is still its module's alone.
+  assert_eq(
+    over(
+      b"fn opened(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> match hold_get(h) { Token(k) -> k } }",
+    ),
+    [b"E0107"],
+  );
+  // What `hold_get` answers is a value like any other, so it may leave where the hold may not: a
+  // module that must not see its value used after the release keeps the value's uses to itself.
+  assert_eq(
+    over(b"fn kept(n: Int) -> Token = with_hold[t](mint(n), spend) { h -> hold_get(h) }"),
+    [],
+  )
 }

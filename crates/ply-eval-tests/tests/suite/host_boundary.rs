@@ -752,6 +752,80 @@ test/nondet "waits" {
     assert_eq!(machine.host_ops(), 1);
 }
 
+/// A runtime that keeps each raise it is told nothing answered.
+struct Told {
+    raises: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl HostRuntime for Told {
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Ok(Value::Unit)
+    }
+
+    fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+        let mut raises = self.raises.lock().unwrap_or_else(|e| e.into_inner());
+        raises.push(format!("{effect}.{op}"));
+    }
+}
+
+/// The host may end a run its own way over a raise that is its own, so it is told of each one
+/// nothing answers, and of none a clause takes.
+#[test]
+fn the_runtime_is_told_of_a_raise_nothing_answers_and_of_no_other() {
+    let compiled = Compiled::named(
+        "t",
+        r#"
+effect pipe {
+  raise broken(stream: Int)
+}
+
+fn written(n: Int) -> Int / {pipe.broken} = if n > 0 { n } else { pipe.broken(n) }
+
+test "a raise a clause takes" {
+  let wrote: Result<Int, Int> = try { written(0) };
+  assert_eq(wrote, Err(0))
+}
+
+test "a raise nothing answers" {
+  assert_eq(written(0), 1)
+}
+"#,
+    );
+    let raises = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = Arc::clone(&raises);
+    let mut machine = compiled.machine_on_backend();
+    machine.set_host_runtime(Arc::new(move || {
+        std::rc::Rc::new(Told {
+            raises: Arc::clone(&kept),
+        }) as std::rc::Rc<dyn ply_eval::HostRuntime>
+    }));
+    let told = || raises.lock().expect("no test panicked").clone();
+
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the clause answers the raise");
+    assert!(told().is_empty(), "{:?}", told());
+
+    let d = diagnostic(machine.eval_test(1));
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert!(d.message.contains("nothing answers it"), "{}", d.message);
+    assert_eq!(told(), ["t.pipe.broken"]);
+}
+
 /// A binding with no reactor is a legitimate configuration, so this is not a panic.
 #[test]
 fn a_pending_answer_with_no_runtime_is_a_diagnostic() {

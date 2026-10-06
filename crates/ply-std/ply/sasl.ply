@@ -8,13 +8,16 @@
 //! so is the most work a server may ask of it.
 //!
 //! A `Credential` is built here and written nowhere: `show` writes its user and stars, and an
-//! `Exchange` and a `Response` show nothing of what they hold. A credential keeps a password or
-//! a token as the text given, since nothing written in Ply reads a `Secret`; `plain_message`,
-//! `login_secret`, `scram_final` and `bearer_message` are the four places one is read, and
-//! `wire` the one place a response's bytes leave it. `reveals` says whether a mechanism sends
-//! the credential itself, which a protocol lets it do only where no one else reads the
-//! connection. A name and a password are taken as their UTF-8 bytes: RFC 4013's preparation is
-//! not applied, so only ASCII ones are sure to be what a server stored.
+//! `Exchange` and a `Response` show nothing of what they hold. SCRAM takes the password as a
+//! `Secret<Bytes>`, which the runtime stretches and keys without the program opening it, so a
+//! password `sealed` from `std.config` proves itself that way. A mechanism that sends the
+//! credential itself needs its bytes, and no host operation writes a `Secret` to a connection,
+//! so for PLAIN, LOGIN and the token mechanisms a credential keeps the text given:
+//! `plain_message`, `login_secret` and `bearer_message` are the three places that text is read,
+//! and `wire` the one place a response's bytes leave this module. `reveals` says whether a
+//! mechanism sends the credential itself, which a protocol lets it do only where no one else
+//! reads the connection. A name and a password are taken as their UTF-8 bytes: RFC 4013's
+//! preparation is not applied, so only ASCII ones are sure to be what a server stored.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes (int_of_ascii, xor)
@@ -89,14 +92,19 @@ pub effect sasl {
 
 // --- Credentials --------------------------------------------------------------
 
-/// What a client proves itself with: a name and a password, or a name and a bearer token.
-pub opaque type Credential = | Password(String, String) | Token(String, String)
+/// What a client proves itself with: a name and a password, given as text or sealed, or a name
+/// and a bearer token.
+pub opaque type Credential =
+  | Password(String, String)
+  | Sealed(String, Secret<Bytes>)
+  | Token(String, String)
 
 show for Credential by starred
 
 fn starred(c: Credential) -> String =
   match c {
     Password(user, _) -> "password(" ++ show(user) ++ ", ****)",
+    Sealed(user, _) -> "sealed(" ++ show(user) ++ ", ****)",
     Token(user, _) -> "bearer(" ++ show(user) ++ ", ****)",
   }
 
@@ -105,6 +113,17 @@ fn starred(c: Credential) -> String =
 pub fn password(user: String, secret: String) -> Credential / {sasl.refused} =
   if !is_name(user) || secret == "" || string_contains(secret, "\0") { sasl.refused(BadCredential) }
   else { Password(user, secret) }
+
+/// The name `user` with its password as a `Secret`, as `std.config` answers one: its UTF-8
+/// bytes. Raises `sasl.refused(BadCredential)` for an empty name or password, or a control
+/// character in the name.
+///
+/// Only SCRAM, which proves a password without sending it, serves a sealed password: nothing
+/// written in Ply opens a `Secret`, and no host operation writes one to a connection, so PLAIN
+/// and LOGIN, which send the password itself, have no way to send this one.
+pub fn sealed(user: String, secret: Secret<Bytes>) -> Credential / {sasl.refused} =
+  if !is_name(user) || secret_is_empty(secret) { sasl.refused(BadCredential) }
+  else { Sealed(user, secret) }
 
 /// The name `user` with an OAuth 2.0 bearer token (RFC 6750) issued to it. Raises
 /// `sasl.refused(BadCredential)` for an empty name or token, a control character in the name,
@@ -120,13 +139,14 @@ fn is_name(user: String) -> Bool =
 
 /// The name a credential is for.
 pub fn user_of(c: Credential) -> String =
-  match c { Password(user, _) -> user, Token(user, _) -> user }
+  match c { Password(user, _) -> user, Sealed(user, _) -> user, Token(user, _) -> user }
 
 /// Whether a credential is the kind a mechanism takes: a password for PLAIN, LOGIN and SCRAM, a
-/// token for OAUTHBEARER and XOAUTH2.
+/// sealed one for SCRAM alone, a token for OAUTHBEARER and XOAUTH2.
 pub fn serves(c: Credential, m: Mechanism) -> Bool =
   match c {
     Password(_, _) -> m == Plain || m == Login || m == ScramSha256,
+    Sealed(_, _) -> m == ScramSha256,
     Token(_, _) -> m == OAuthBearer || m == XOAuth2,
   }
 
@@ -149,7 +169,7 @@ pub opaque type Exchange =
   | Settled(Bool)
   | LoginName(String, String)
   | LoginSecret(String)
-  | ScramFirst(String, String, Int)
+  | ScramFirst(Secret<Bytes>, String, Int)
   | ScramLast(Bytes)
   | BearerSent(Mechanism)
 
@@ -183,17 +203,26 @@ pub fn begin(m: Mechanism, c: Credential, s: Setting) -> Begun / {sasl.refused, 
     Password(user, secret) -> match m {
       Plain -> { exchange: Settled(true), first: Some(Response(plain_message(user, secret))) },
       Login -> { exchange: LoginName(user, secret), first: None },
-      ScramSha256 -> if !is_nonce(s.nonce) { sasl.refused(BadNonce) } else {
-        let bare = scram_first_bare(user, s.nonce);
-        {
-          exchange: ScramFirst(secret, bare, s.most_iterations),
-          first: Some(Response(bytes_of_string("n,," ++ bare))),
-        }
-      },
+      ScramSha256 -> scram_begun(user, secret_bytes(secret_of_string(secret)), s),
       _ -> sasl.refused(Unserved),
     },
+    Sealed(user, secret) -> if m != ScramSha256 { sasl.refused(Unserved) }
+    else { scram_begun(user, secret, s) },
     Token(user, token) -> if m != OAuthBearer && m != XOAuth2 { sasl.refused(Unserved) }
     else { { exchange: BearerSent(m), first: Some(Response(bearer_message(m, user, token, s))) } },
+  }
+
+fn scram_begun(
+  user: String,
+  secret: Secret<Bytes>,
+  s: Setting,
+) -> Begun / {sasl.refused, abort.raise} =
+  if !is_nonce(s.nonce) { sasl.refused(BadNonce) } else {
+    let bare = scram_first_bare(user, s.nonce);
+    {
+      exchange: ScramFirst(secret, bare, s.most_iterations),
+      first: Some(Response(bytes_of_string("n,," ++ bare))),
+    }
   }
 
 /// What the client says to `challenge`. Raises `sasl.refused`: `BadChallenge` where the
@@ -273,15 +302,14 @@ fn bearer_message(m: Mechanism, user: String, token: String, s: Setting) -> Byte
 
 /// SCRAM's first message: a GS2 header saying no channel binding is in use, then the bare
 /// message.
-pub fn scram_first(user: String, nonce: String) -> String / {abort.raise} =
-  "n,," ++ scram_first_bare(user, nonce)
+pub fn scram_first(user: String, nonce: String) -> String = "n,," ++ scram_first_bare(user, nonce)
 
 /// The client's first message without its GS2 header, which the signatures cover: the user and
 /// the client's nonce. `=` and `,` in the name are escaped, because they separate the fields.
-pub fn scram_first_bare(user: String, nonce: String) -> String / {abort.raise} =
+pub fn scram_first_bare(user: String, nonce: String) -> String =
   "n=" ++ scram_name(user) ++ ",r=" ++ nonce
 
-fn scram_name(user: String) -> String / {abort.raise} =
+fn scram_name(user: String) -> String =
   fold(range(0, string_len(user)), "", |acc: String, i: Int| {
     let c = string_slice(user, i, i + 1);
     if c == "=" { acc ++ "=3D" } else if c == "," { acc ++ "=2C" } else { acc ++ c }
@@ -332,14 +360,15 @@ pub fn scram_challenge(server_first: String) -> Option<Challenge> / {abort.raise
 /// server is about to prove itself with.
 pub type Proof = { reply: String, expected: Bytes }
 
-/// The client's last message and the signature to hold the server to; `None` where the
+/// The client's last message and the signature to hold the server to, out of the password's
+/// UTF-8 bytes, which the runtime stretches and keys without opening; `None` where the
 /// challenge's nonce does not open with the client's own, which a server that saw the first
 /// message always sends back.
 ///
 /// Both sides sign the client's bare message, the server's first message, and the final message
 /// without its proof, joined by commas.
 pub fn scram_final(
-  secret: String,
+  password: Secret<Bytes>,
   first_bare: String,
   server_first: String,
   challenge: Challenge,
@@ -348,13 +377,13 @@ pub fn scram_final(
     None -> None,
     Some(own) -> if own == "" || !string_starts_with(challenge.nonce, own) { None } else {
       let without_proof = "c=biws,r=" ++ challenge.nonce;
-      let signed = first_bare ++ "," ++ server_first ++ "," ++ without_proof;
-      let salted = pbkdf2_sha256(bytes_of_string(secret), challenge.salt, challenge.iterations);
+      let signed = bytes_of_string(first_bare ++ "," ++ server_first ++ "," ++ without_proof);
+      let salted = pbkdf2_sha256(password, challenge.salt, challenge.iterations);
       let client_key = hmac_sha256(salted, b"Client Key");
-      let signature = hmac_sha256(sha256(client_key), bytes_of_string(signed));
+      let signature = hmac_sha256(secret_of_bytes(sha256(client_key)), signed);
       Some({
         reply: without_proof ++ ",p=" ++ base64_encode(xor(client_key, signature)),
-        expected: hmac_sha256(hmac_sha256(salted, b"Server Key"), bytes_of_string(signed)),
+        expected: hmac_sha256(secret_of_bytes(hmac_sha256(salted, b"Server Key")), signed),
       })
     },
   }
@@ -491,7 +520,7 @@ test "scram, against the example RFC 7677 works out" {
     Some(challenge) -> {
       assert_eq(challenge.iterations, 4096);
       assert_eq(bytes_len(challenge.salt), 16);
-      match scram_final("pencil", first_bare, server_first, challenge) {
+      match scram_final(secret_of_bytes(b"pencil"), first_bare, server_first, challenge) {
         None -> panic("the example's nonce is not the client's"),
         Some(proof) -> {
           assert_eq(
@@ -562,6 +591,37 @@ test "a SCRAM server is held to the client's nonce, a bound on its work, and mes
   assert_eq(begun(ScramSha256, pencil(), setting("")), Err(BadNonce))
 }
 
+fn sealed_pencil() -> Result<Credential, Why> =
+  try { sealed("user", secret_bytes(secret_of_string("pencil"))) }
+
+test "a sealed password proves itself by SCRAM as the same password given as text does, and by nothing else" {
+  let proofs = map([pencil(), sealed_pencil()], |c: Result<Credential, Why>|
+    result_map_response(
+      answered(begun(ScramSha256, c, setting("rOprNGfwEbeRWgbNEkqO")), [
+        example_first(),
+        b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
+      ]),
+    ));
+  assert_eq(proofs, [Ok(true), Ok(true)]);
+  assert_eq(
+    first_of(begun(ScramSha256, sealed_pencil(), setting("rOprNGfwEbeRWgbNEkqO"))),
+    Some(b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO"),
+  );
+  assert(
+    all(mechanisms(), |m: Mechanism|
+      match sealed_pencil() {
+        Ok(c) ->
+          serves(c, m) == (m == ScramSha256)
+            && serves(c, m) == result_is_begun(begun(m, sealed_pencil(), setting("n"))),
+        Err(_) -> false,
+      }),
+  );
+  assert_eq(show(sealed_pencil()), "Ok(sealed(\"user\", ****))")
+}
+
+fn result_map_response(a: Result<Answered, Why>) -> Result<Bool, Why> =
+  match a { Ok(done) -> Ok(proven(done.exchange)), Err(why) -> Err(why) }
+
 test "a scram user name escapes what separates fields" {
   assert_eq(scram_first_bare("a=b,c", "n"), "n=a=3Db=2Cc,r=n");
   assert_eq(scram_first("user", "n1"), "n,,n=user,r=n1")
@@ -576,28 +636,39 @@ test "a challenge that is not one is refused rather than defaulted" {
   assert_eq(scram_challenge("m=x,r=abc,s=AAAA,i=1"), None)
 }
 
-type Maker = { made: Result<Credential, Why>, expect: Option<String> }
+/// A maker's answer, by the user of the credential it made: a credential cannot be a case,
+/// since a case is hashed and a hash of one is something to test guesses against.
+type Maker = { made: Result<String, Why>, expect: Option<String> }
+
+fn made(c: Result<Credential, Why>) -> Result<String, Why> =
+  match c { Ok(held) -> Ok(user_of(held)), Err(why) -> Err(why) }
 
 fn makers() -> List<Maker> / {abort.raise} =
   [
-    { made: try { password("tim", "x") }, expect: Some("tim") },
-    { made: try { password("", "x") }, expect: None },
-    { made: try { password("tim", "") }, expect: None },
-    { made: try { password("ti\0m", "x") }, expect: None },
-    { made: try { password("ti\nm", "x") }, expect: None },
-    { made: try { password("tim", "a\0b") }, expect: None },
-    { made: try { password("j\u{fc}rgen", "p\u{e4}ss wort\n") }, expect: Some("j\u{fc}rgen") },
-    { made: try { bearer("tim", "ya29.a-b_c~d+e/f=") }, expect: Some("tim") },
-    { made: try { bearer("tim", "") }, expect: None },
-    { made: try { bearer("tim", "a b") }, expect: None },
-    { made: try { bearer("tim", "a\u{1}b") }, expect: None },
-    { made: try { bearer("", "abc") }, expect: None },
+    { made: made(try { password("tim", "x") }), expect: Some("tim") },
+    { made: made(try { password("", "x") }), expect: None },
+    { made: made(try { password("tim", "") }), expect: None },
+    { made: made(try { password("ti\0m", "x") }), expect: None },
+    { made: made(try { password("ti\nm", "x") }), expect: None },
+    { made: made(try { password("tim", "a\0b") }), expect: None },
+    {
+      made: made(try { password("j\u{fc}rgen", "p\u{e4}ss wort\n") }),
+      expect: Some("j\u{fc}rgen"),
+    },
+    { made: made(try { sealed("tim", secret_of_bytes(b"x")) }), expect: Some("tim") },
+    { made: made(try { sealed("tim", secret_of_bytes(b"")) }), expect: None },
+    { made: made(try { sealed("ti\rm", secret_of_bytes(b"x")) }), expect: None },
+    { made: made(try { bearer("tim", "ya29.a-b_c~d+e/f=") }), expect: Some("tim") },
+    { made: made(try { bearer("tim", "") }), expect: None },
+    { made: made(try { bearer("tim", "a b") }), expect: None },
+    { made: made(try { bearer("tim", "a\u{1}b") }), expect: None },
+    { made: made(try { bearer("", "abc") }), expect: None },
   ]
 
 test "a credential is made of what a mechanism carries, or refused" for m: Maker in makers() {
   assert_eq(
     match m.made {
-      Ok(c) -> Some(user_of(c)),
+      Ok(user) -> Some(user),
       Err(why) -> if why == BadCredential { None } else { Some("") },
     },
     m.expect,
@@ -677,11 +748,12 @@ fn served(
   signed: String,
   proof: Bytes,
 ) -> Option<Bytes> / {abort.raise} = {
-  let salted = pbkdf2_sha256(bytes_of_string(secret), salt, iterations);
+  let salted = pbkdf2_sha256(secret_bytes(secret_of_string(secret)), salt, iterations);
   let stored = sha256(hmac_sha256(salted, b"Client Key"));
-  let client_key = xor(proof, hmac_sha256(stored, bytes_of_string(signed)));
-  if !tags_match(sha256(client_key), stored) { None }
-  else { Some(hmac_sha256(hmac_sha256(salted, b"Server Key"), bytes_of_string(signed))) }
+  let client_key = xor(proof, hmac_sha256(secret_of_bytes(stored), bytes_of_string(signed)));
+  if !tags_match(sha256(client_key), stored) { None } else {
+    Some(hmac_sha256(secret_of_bytes(hmac_sha256(salted, b"Server Key")), bytes_of_string(signed)))
+  }
 }
 
 law "a server that holds a password's verifier takes the client's proof, and the client takes that server's"
@@ -691,7 +763,12 @@ law "a server that holds a password's verifier takes the client's proof, and the
       ++ ",i=2";
     match scram_challenge(server_first) {
       None -> false,
-      Some(challenge) -> match scram_final(secret, first_bare, server_first, challenge) {
+      Some(challenge) -> match scram_final(
+          secret_bytes(secret_of_string(secret)),
+          first_bare,
+          server_first,
+          challenge,
+        ) {
         None -> false,
         Some(proof) -> {
           let signed = first_bare ++ "," ++ server_first ++ ",c=biws,r=" ++ challenge.nonce;

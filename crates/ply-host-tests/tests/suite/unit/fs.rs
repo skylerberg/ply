@@ -4,6 +4,7 @@ use ply_eval::{
     Value, codes,
 };
 use ply_host::fs::*;
+use ply_host::pool::Pooled;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -232,7 +233,7 @@ fn perform(fs: &Arc<FsHost>, op: Op, label: &str, args: &[Value]) -> Result<Valu
         },
     )?;
     match answer {
-        HostAnswer::Pending(pending) => fs.block_on(pending),
+        HostAnswer::Pending(pending) => fs.pool().block_on(pending),
         HostAnswer::Value(v) => Ok(v),
     }
 }
@@ -813,5 +814,428 @@ fn every_operation_that_names_a_second_path_confines_it_too() {
         let refused =
             perform(&fs, op, "cache", &[Value::str("a.txt")]).expect_err("it takes two arguments");
         assert_eq!(refused.code, codes::RUNTIME_ERROR, "{}", op.name());
+    }
+}
+
+// --- Open files ---
+
+fn opened(fs: &Arc<FsHost>, label: &str, path: &str, how: &str) -> Result<i64, String> {
+    let how = Value::ctor(format!("std.fs.{how}"), Vec::new());
+    match &done(perform(fs, Op::Open, label, &[Value::str(path), how])) {
+        Value::Ctor { name, args } if name.as_str() == "Ok" => match &args[0] {
+            Value::Int(descriptor) => Ok(*descriptor),
+            other => panic!("not a descriptor: {}", other.type_name()),
+        },
+        Value::Ctor { name, args } if name.as_str() == "Err" => Err(ctor_name(&args[0])),
+        other => panic!("not a `Result`: {}", other.type_name()),
+    }
+}
+
+fn chunk(fs: &Arc<FsHost>, label: &str, descriptor: i64, max: i64) -> Option<Vec<u8>> {
+    maybe_bytes(&done(perform(
+        fs,
+        Op::ReadChunk,
+        label,
+        &[Value::Int(descriptor), Value::Int(max)],
+    )))
+}
+
+fn closed(fs: &Arc<FsHost>, label: &str, descriptor: i64) -> bool {
+    boolean(&done(perform(
+        fs,
+        Op::Close,
+        label,
+        &[Value::Int(descriptor)],
+    )))
+}
+
+#[test]
+fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
+    let (here, there) = (root(), root());
+    std::fs::write(here.path().join("log"), b"abcdef").unwrap();
+    let mut roots = Roots::new();
+    roots.bind("cache", here.path(), span()).unwrap();
+    roots.bind("other", there.path(), span()).unwrap();
+    let fs = Arc::new(FsHost::new(roots));
+
+    let first = opened(&fs, "cache", "log", "ToRead").expect("the file opens");
+    assert_eq!(chunk(&fs, "cache", first, 4), Some(b"abcd".to_vec()));
+    // Another root's label reaches nothing this root opened: not to read it, not to close it.
+    assert_eq!(chunk(&fs, "other", first, 4), None);
+    assert!(!closed(&fs, "other", first));
+    assert_eq!(chunk(&fs, "cache", first, 4), Some(b"ef".to_vec()));
+    assert_eq!(chunk(&fs, "cache", first, 4), Some(Vec::new()));
+
+    assert!(closed(&fs, "cache", first));
+    assert!(!closed(&fs, "cache", first));
+    assert_eq!(chunk(&fs, "cache", first, 4), None);
+    // A descriptor names one open, so the next open answers another.
+    let second = opened(&fs, "cache", "log", "ToRead").expect("the file opens again");
+    assert_ne!(second, first);
+}
+
+#[test]
+fn an_open_says_why_a_file_did_not_open_and_is_confined_like_every_other() {
+    let dir = root();
+    let fs = rooted(dir.path());
+    std::fs::create_dir(dir.path().join("d")).unwrap();
+    assert_eq!(
+        opened(&fs, "cache", "absent", "ToRead"),
+        Err("std.fs.NotFound".into())
+    );
+    for how in ["ToRead", "ToWrite", "ToAppend"] {
+        assert_eq!(
+            opened(&fs, "cache", "d", how),
+            Err("std.fs.NotAFile".into())
+        );
+    }
+    assert_eq!(
+        opened(&fs, "cache", "no/f", "ToWrite"),
+        Err("std.fs.NotFound".into())
+    );
+
+    let how = Value::ctor("std.fs.ToRead", Vec::new());
+    let refused = perform(
+        &fs,
+        Op::Open,
+        "cache",
+        &[Value::str("../escape"), how.clone()],
+    )
+    .expect_err("it leaves the root");
+    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
+    let refused = perform(&fs, Op::Open, "elsewhere", &[Value::str("a"), how])
+        .expect_err("`elsewhere` has no root");
+    assert_eq!(refused.code, codes::FS_ROOT_UNBOUND);
+}
+
+#[test]
+fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
+    let dir = root();
+    let fs = rooted(dir.path());
+    std::fs::write(dir.path().join("log"), vec![7u8; 4096]).unwrap();
+    let file = opened(&fs, "cache", "log", "ToRead").expect("the file opens");
+    assert_eq!(chunk(&fs, "cache", file, 0), Some(Vec::new()));
+    assert_eq!(chunk(&fs, "cache", file, 100).map(|b| b.len()), Some(100));
+
+    let over = perform(
+        &fs,
+        Op::ReadChunk,
+        "cache",
+        &[Value::Int(file), Value::Int(MAX_READ_BYTES as i64 + 1)],
+    )
+    .expect_err("more than one read answers");
+    assert_eq!(over.code, codes::FS_FILE_TOO_LARGE);
+    let negative = perform(
+        &fs,
+        Op::ReadChunk,
+        "cache",
+        &[Value::Int(file), Value::Int(-1)],
+    )
+    .expect_err("a negative length");
+    assert_eq!(negative.code, codes::RUNTIME_ERROR);
+    // Neither refusal moved the descriptor.
+    assert_eq!(chunk(&fs, "cache", file, 4096).map(|b| b.len()), Some(3996));
+}
+
+// --- Exclusive creates, looks, scans, names and room ---
+
+#[test]
+fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir(real.join("d")).unwrap();
+    std::fs::write(real.join("d/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink("nowhere", real.join("d/l")).unwrap();
+
+    let made = opened(&fs, "cache", "d/new", "ToCreate").expect("nothing is there");
+    assert!(boolean(&on(
+        &fs,
+        Op::WriteChunk,
+        &[Value::Int(made), Value::bytes(b"mine")]
+    )));
+    assert!(closed(&fs, "cache", made));
+    assert_eq!(std::fs::read(real.join("d/new")).unwrap(), b"mine");
+    assert_eq!(file_mode(&real.join("d/new")), 0o600);
+
+    for there in ["d/new", "d/a.txt", "d", "d/l"] {
+        assert_eq!(
+            opened(&fs, "cache", there, "ToCreate"),
+            Err("std.fs.Exists".into()),
+            "{there}"
+        );
+    }
+    // The link was refused as itself: nothing was made where it points.
+    assert!(!real.join("d/nowhere").exists());
+    assert_eq!(
+        opened(&fs, "cache", "no/new", "ToCreate"),
+        Err("std.fs.NotFound".into())
+    );
+    assert_eq!(
+        opened(&fs, "cache", "d/a.txt/new", "ToCreate"),
+        Err("std.fs.NotADirectory".into())
+    );
+}
+
+/// A `std.fs.Stat`, as a test reads one.
+#[derive(Debug, PartialEq)]
+struct Looked {
+    kind: String,
+    size: i64,
+    modified: i64,
+    mode: u32,
+    links: i64,
+    device: i64,
+    id: i64,
+}
+
+fn looked(v: &Value) -> Looked {
+    let Value::Record(fields) = v else {
+        panic!("not a stat: {}", v.type_name())
+    };
+    let int = |name: &str| match fields.named(name) {
+        Some(Value::Int(n)) => *n,
+        _ => panic!("no `{name}`"),
+    };
+    let modified = match fields.named("modified") {
+        Some(Value::Ctor { name, args }) if name.as_str() == "Instant" => match args.as_slice() {
+            [Value::Int(nanos)] => *nanos,
+            _ => panic!("an `Instant` holds one `Int`"),
+        },
+        _ => panic!("no `modified`"),
+    };
+    Looked {
+        kind: ctor_name(fields.named("kind").expect("a kind")),
+        size: int("size"),
+        modified,
+        mode: mode_bits_of(fields.named("mode").expect("a mode")),
+        links: int("links"),
+        device: int("device"),
+        id: int("id"),
+    }
+}
+
+fn stat(fs: &Arc<FsHost>, path: &str) -> Option<Looked> {
+    option(&on(fs, Op::Stat, &[Value::str(path)])).map(looked)
+}
+
+fn linked(fs: &Arc<FsHost>, path: &str, to: &str) -> Result<(), String> {
+    match &on(fs, Op::Link, &[Value::str(path), Value::str(to)]) {
+        Value::Ctor { name, args } if name.as_str() == "Ok" => {
+            assert!(matches!(args.as_slice(), [Value::Unit]));
+            Ok(())
+        }
+        Value::Ctor { name, args } if name.as_str() == "Err" => Err(ctor_name(&args[0])),
+        other => panic!("not a `Result`: {}", other.type_name()),
+    }
+}
+
+#[test]
+fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir(real.join("d")).unwrap();
+    std::fs::write(real.join("d/a.txt"), b"abc").unwrap();
+    std::fs::set_permissions(real.join("d/a.txt"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::os::unix::fs::symlink("a.txt", real.join("d/l")).unwrap();
+
+    let meta = std::fs::metadata(real.join("d/a.txt")).unwrap();
+    let file = stat(&fs, "d/a.txt").expect("a file is there");
+    assert_eq!(
+        file,
+        Looked {
+            kind: "std.fs.File".into(),
+            size: 3,
+            modified: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            mode: 0o640,
+            links: 1,
+            device: meta.dev() as i64,
+            id: meta.ino() as i64,
+        }
+    );
+
+    let folder = stat(&fs, "d").expect("a directory is there");
+    assert_eq!(
+        (folder.kind.as_str(), folder.size, folder.links),
+        ("std.fs.Dir", 0, 1)
+    );
+    assert_eq!(folder.mode, file_mode(&real.join("d")));
+
+    // The link is read, not followed: it is no file, and it is not the file it points at.
+    let link = stat(&fs, "d/l").expect("a link is there");
+    assert_eq!(
+        (link.kind.as_str(), link.size, link.mode, link.links),
+        ("std.fs.Symlink", 0, 0o777, 1)
+    );
+    assert_ne!(link.id, file.id);
+
+    assert_eq!(stat(&fs, "d/absent"), None);
+    let refused =
+        perform(&fs, Op::Stat, "cache", &[Value::str("../d")]).expect_err("it leaves the root");
+    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
+}
+
+#[test]
+fn a_scan_is_a_walk_with_a_look_at_each_entry_and_goes_below_only_when_asked() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir_all(real.join("a/z")).unwrap();
+    std::fs::write(real.join("a/b.txt"), b"b").unwrap();
+    std::fs::write(real.join("a/z/y.txt"), b"yy").unwrap();
+    std::fs::write(real.join("a-c.txt"), b"").unwrap();
+    std::os::unix::fs::symlink("a", real.join("link")).unwrap();
+
+    let scan = |path: &str, deep: bool| -> Option<Vec<(String, String, i64)>> {
+        option(&on(&fs, Op::Scan, &[Value::str(path), Value::Bool(deep)])).map(|entries| {
+            let Value::List(entries) = entries else {
+                panic!("not a list")
+            };
+            entries
+                .iter()
+                .map(|e| {
+                    let Value::Record(fields) = e else {
+                        panic!("not a record")
+                    };
+                    let path = match fields.named("path") {
+                        Some(Value::Str(s)) => s.to_string(),
+                        _ => panic!("no path"),
+                    };
+                    let found = looked(fields.named("stat").expect("a stat"));
+                    (path, found.kind, found.size)
+                })
+                .collect()
+        })
+    };
+    let entry = |p: &str, k: &str, size: i64| (p.to_string(), format!("std.fs.{k}"), size);
+    assert_eq!(
+        scan("", true),
+        Some(vec![
+            entry("a", "Dir", 0),
+            entry("a/b.txt", "File", 1),
+            entry("a/z", "Dir", 0),
+            entry("a/z/y.txt", "File", 2),
+            entry("a-c.txt", "File", 0),
+            entry("link", "Symlink", 0),
+        ])
+    );
+    assert_eq!(
+        scan("", false),
+        Some(vec![
+            entry("a", "Dir", 0),
+            entry("a-c.txt", "File", 0),
+            entry("link", "Symlink", 0),
+        ])
+    );
+    assert_eq!(
+        scan("./a/", false),
+        Some(vec![entry("a/b.txt", "File", 1), entry("a/z", "Dir", 0)])
+    );
+    assert_eq!(scan("a/b.txt", true), None);
+    assert_eq!(scan("absent", true), None);
+}
+
+#[test]
+fn a_file_takes_a_second_name_and_nothing_else_does() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir(real.join("d")).unwrap();
+    std::fs::write(real.join("d/a.txt"), b"one").unwrap();
+    std::os::unix::fs::symlink("d/a.txt", real.join("l")).unwrap();
+
+    assert_eq!(linked(&fs, "twin.txt", "d/a.txt"), Ok(()));
+    std::fs::write(real.join("twin.txt"), b"both").unwrap();
+    assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"both");
+    let (first, second) = (
+        stat(&fs, "d/a.txt").expect("the file"),
+        stat(&fs, "twin.txt").expect("its second name"),
+    );
+    assert_eq!((first.links, second.links), (2, 2));
+    assert_eq!((first.device, first.id), (second.device, second.id));
+
+    // A copy onto the file itself, by either name, would empty it before reading it.
+    for (from, to) in [("twin.txt", "d/a.txt"), ("d/a.txt", "d/a.txt")] {
+        assert!(
+            boolean(&on(&fs, Op::Copy, &[Value::str(from), Value::str(to)])),
+            "{from} -> {to}"
+        );
+        assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"both");
+    }
+
+    let refused = |path: &str, to: &str, why: &str| {
+        assert_eq!(
+            linked(&fs, path, to),
+            Err(format!("std.fs.{why}")),
+            "{path} -> {to}"
+        );
+    };
+    refused("n", "absent", "NotFound");
+    refused("n", "d", "NotAFile");
+    refused("n", "l", "NotAFile");
+    refused("l", "d/a.txt", "Exists");
+    refused("twin.txt", "d/a.txt", "Exists");
+    refused("no/n", "d/a.txt", "NotFound");
+    refused("d/a.txt/n", "d/a.txt", "NotADirectory");
+    assert!(!real.join("n").exists());
+
+    for (path, to) in [("../n", "d/a.txt"), ("n", "/d/a.txt")] {
+        let refused = perform(&fs, Op::Link, "cache", &[Value::str(path), Value::str(to)])
+            .expect_err("it leaves the root");
+        assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{path} -> {to}");
+    }
+}
+
+#[test]
+fn the_room_of_a_file_system_is_answered_for_a_path_that_names_something() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::write(real.join("a.txt"), b"x").unwrap();
+
+    let room = |path: &str| -> Option<[i64; 5]> {
+        option(&on(&fs, Op::Space, &[Value::str(path)])).map(|space| {
+            let Value::Record(fields) = space else {
+                panic!("not a record")
+            };
+            ["total", "free", "available", "inodes", "inodes_free"].map(|name| {
+                match fields.named(name) {
+                    Some(Value::Int(n)) => *n,
+                    _ => panic!("no `{name}`"),
+                }
+            })
+        })
+    };
+    let [total, free, available, inodes, inodes_free] = room("").expect("the root is there");
+    assert!(total > 0 && free <= total && available <= free);
+    assert!(inodes_free <= inodes);
+    // One file system holds the root and the file in it.
+    assert_eq!(room("a.txt").map(|r| r[0]), Some(total));
+    assert_eq!(room("absent"), None);
+}
+
+#[test]
+fn a_look_a_scan_the_room_and_a_second_name_are_registered_and_wait_in_the_pool() {
+    let dir = root();
+    let fs = rooted(dir.path());
+    let handlers = registrations(&fs);
+    for (op, name, arity) in [
+        (Op::Stat, "stat", 1),
+        (Op::Scan, "scan", 2),
+        (Op::Space, "space", 1),
+        (Op::Link, "link", 2),
+    ] {
+        assert_eq!((op.name(), op.arity()), (name, arity));
+        let (declaration, _) = handlers
+            .iter()
+            .find(|(d, _)| d.op.as_str() == name)
+            .unwrap_or_else(|| panic!("`{name}` is not registered"));
+        assert!(declaration.blocking, "{name}");
+        assert_eq!(declaration.path, format!("ply_host::fs::{name}"));
+        let refused = perform(&fs, op, "elsewhere", &vec![Value::str("a"); arity])
+            .expect_err("`elsewhere` has no root");
+        assert_eq!(refused.code, codes::FS_ROOT_UNBOUND, "{name}");
     }
 }

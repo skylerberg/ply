@@ -1,0 +1,2270 @@
+//! IP addresses and networks: IPv4, IPv6, either family, and CIDR prefixes.
+//!
+//! An `Ipv4` is 32 bits and an `Ipv6` is 128; an `Ip` is one or the other, and a `Prefix` is a
+//! network: an address and how many of its leading bits name the network, with every bit after
+//! them zero. Only this module builds one, so holding a value means its text was read by the
+//! readers here, and a filter written over these types cannot disagree with a connector about
+//! what a string names.
+//!
+//! Reading is strict. IPv4 is four decimal octets and nothing else: a leading zero
+//! (`010.1.1.1`, octal to `inet_aton`), hex (`0x7f.0.0.1`), fewer than four parts (`127.1`,
+//! `2130706433`) and anything around the address are refused, each with its reason, since a
+//! filter and a connector that read such a text two ways is how a filter is bypassed. IPv6 is
+//! RFC 4291 §2.2: eight groups of one to four hex digits in either case, one `::` standing for
+//! one or more zero groups, and dotted octets for the last 32 bits. A zone (`fe80::1%eth0`) is
+//! no part of an address: `read_v6`, `read` and `read_prefix` refuse one, and `read_scoped`
+//! answers the address and the zone apart. Brackets and ports belong to what holds an address,
+//! not to it, and are refused. `parse` and its siblings answer a refusal as an `Err` saying where
+//! and why; `read` and its siblings raise it. Nothing here looks a name up.
+//!
+//! Writing is RFC 5952's canonical form: lower-case hex with no leading zeros, `::` for the
+//! longest run of two or more zero groups and for the leftmost of equal runs, and an
+//! IPv4-mapped address with its last 32 bits dotted (`::ffff:192.0.2.1`). No other address is
+//! written with dotted octets. `show` writes the same text, and with `import std.ip`,
+//! `ip"192.0.2.1"` is an address checked when the program is; with `import std.cidr`,
+//! `cidr"10.0.0.0/8"` is a prefix.
+//!
+//! Addresses order as numbers within a family, and every IPv4 address before every IPv6 one, so
+//! an address keys a `Map`. `V6` of the IPv4-mapped `::ffff:192.0.2.1` and `V4` of `192.0.2.1`
+//! are two addresses; `to_canonical` makes the first the second. A prefix orders by its network
+//! address and then its length, so a network sorts before every network inside it: the greatest
+//! key at or below an address's own host prefix in an ordered map is where a longest-match
+//! lookup starts.
+//!
+//! Every classifier reads an IPv4-mapped IPv6 address as the IPv4 address it holds, because
+//! that is the host a socket given one reaches: `is_loopback` holds of `::ffff:127.0.0.1`, and
+//! `is_global` of `::ffff:8.8.8.8`. No other embedding is unwrapped. A NAT64 address
+//! (`64:ff9b::/96`), a 6to4 one (`2002::/16`) and a Teredo one hold an IPv4 address that a
+//! translator may reach, and are classed as the IPv6 addresses they are.
+//!
+//! `is_global` holds of an address that is not multicast, not reserved, and that IANA's
+//! special-purpose registry for its family does not mark unreachable: one in none of the
+//! registry's blocks, or whose smallest block there is marked globally reachable. A block the
+//! registry answers "N/A" or nothing for (6to4, Teredo, the deprecated relay blocks) is not
+//! global. `special_purpose` answers the registry's row for an address, and
+//! `special_purpose_blocks` is both registries. For IPv6, reserved is the space IANA's address
+//! space registry marks "Reserved by IETF", outside every special-purpose block.
+//!
+//! A network's `size` is an `Int` that stops at the greatest one: an IPv6 network of 65 bits or
+//! fewer holds more addresses than an `Int` counts, and `host_bits` says how many exactly, as a
+//! power of two. `subnets` and `hosts` list at most as many as their caller asks for.
+
+import std.bytes (peek, scan, scan_until, u16_be, u32_be, u32_be_at)
+import std.gen
+import std.gen (Gen)
+import std.laws (idempotent, round_trip, total_order)
+import std.list
+import std.list (all, any, at_or, concat, replicate, slice, sort, take)
+import std.result (result_ok)
+import std.show (show)
+import std.string (join, replace)
+
+/// An IPv4 address.
+pub opaque type Ipv4 = | Ipv4(Int)
+
+/// An IPv6 address, which holds no zone.
+pub opaque type Ipv6 = | Ipv6(U128)
+
+/// An address of either family.
+pub type Ip =
+  /// An IPv4 address.
+  | V4(Ipv4)
+  /// An IPv6 address, an IPv4-mapped one included.
+  | V6(Ipv6)
+
+/// A network: its first address and how many leading bits every address in it shares. Every bit
+/// past the length is zero.
+pub opaque type Prefix = | Prefix(Ip, Int)
+
+/// One end of a socket: an address, a port in `0..=65535`, and for an IPv6 address the zone that
+/// names the interface it is reached through, where there is one. An IPv4 address has no zone.
+pub opaque type SocketAddress = | SocketAddress(Ip, Int, Option<String>)
+
+key for Ip by order_key
+
+key for SocketAddress by socket_order
+
+show for SocketAddress by render_socket
+
+gen for SocketAddress by arbitrary_socket
+
+show for Ipv4 by render_v4
+
+show for Ipv6 by render_v6
+
+show for Ip by render
+
+show for Prefix by render_prefix
+
+gen for Ipv4 by arbitrary_v4
+
+gen for Ipv6 by arbitrary_v6
+
+gen for Ip by arbitrary
+
+gen for Prefix by arbitrary_prefix
+
+/// What addresses order by: the family, then the address as a number.
+fn order_key(a: Ip) -> (Int, Int, U128) =
+  match a { V4(Ipv4(n)) -> (4, n, 0u128), V6(Ipv6(v)) -> (6, 0, v) }
+
+/// What socket addresses order by: the address, then the port, then the zone, none before any.
+fn socket_order(a: SocketAddress) -> ((Int, Int, U128), Int, String) =
+  match a {
+    SocketAddress(address, port, zone) ->
+      (order_key(address), port, match zone { Some(name) -> name, None -> "" }),
+  }
+
+// --- Bits -------------------------------------------------------------------
+
+/// `n`, which is not negative, at 128 bits.
+fn widened(n: Int) -> U128 = handle { u128_of_int(n) } with { abort.raise(_) -> 0u128 }
+
+/// `v`, which an `Int` holds.
+fn narrowed(v: U128) -> Int = match to_int(v) { Some(n) -> n, None -> 0 }
+
+/// The low `n` bits set.
+fn low_ones(n: Int) -> U128 =
+  if n <= 0 { 0u128 } else if n >= 128 { ~0u128 } else { (1u128 << n) - 1u128 }
+
+fn shifted(v: U128, by: Int) -> U128 = if by >= 128 { 0u128 } else { v << by }
+
+/// How many bits an address of `a`'s family holds: 32 or 128.
+pub fn bit_width(a: Ip) -> Int = match a { V4(_) -> 32, V6(_) -> 128 }
+
+/// The address as a number of 128 bits, an IPv4 one in the low 32.
+fn wide(a: Ip) -> U128 = match a { V4(Ipv4(n)) -> widened(n), V6(Ipv6(v)) -> v }
+
+/// The address of `like`'s family that the number `v` is.
+fn of_wide(like: Ip, v: U128) -> Ip =
+  match like { V4(_) -> V4(Ipv4(narrowed(v & 0xFFFF_FFFFu128))), V6(_) -> V6(Ipv6(v)) }
+
+fn joined(groups: List<Int>) -> U128 =
+  fold(groups, 0u128, |acc: U128, g: Int| acc << 16 | widened(g))
+
+// --- Making and reading -----------------------------------------------------
+
+/// The address of four octets, or `None` where one is outside `0..=255`.
+pub fn ipv4(a: Int, b: Int, c: Int, d: Int) -> Option<Ipv4> =
+  if all([a, b, c, d], |octet: Int| octet >= 0 && octet <= 255) {
+    Some(Ipv4(a << 24 | b << 16 | c << 8 | d))
+  } else { None }
+
+/// The four octets, first to last.
+pub fn octets(a: Ipv4) -> List<Int> =
+  match a { Ipv4(n) -> [n >> 24, n >> 16 & 255, n >> 8 & 255, n & 255] }
+
+/// The address as a number from `0` to `4294967295`, its first octet the most significant.
+pub fn v4_to_int(a: Ipv4) -> Int = match a { Ipv4(n) -> n }
+
+/// The address a number from `0` to `4294967295` is, or `None` outside that.
+pub fn v4_of_int(n: Int) -> Option<Ipv4> =
+  if n >= 0 && n <= 0xFFFF_FFFF { Some(Ipv4(n)) } else { None }
+
+/// The address of eight 16-bit groups, the most significant first, or `None` unless there are
+/// eight, each in `0..=65535`.
+pub fn ipv6(groups: List<Int>) -> Option<Ipv6> =
+  if len(groups) == 8 && all(groups, |g: Int| g >= 0 && g <= 0xFFFF) { Some(Ipv6(joined(groups))) }
+  else { None }
+
+/// The eight 16-bit groups, the most significant first.
+pub fn groups(a: Ipv6) -> List<Int> =
+  match a { Ipv6(v) -> map(range(0, 8), |i: Int| narrowed(v >>> 112 - 16 * i & 0xFFFFu128)) }
+
+/// The address as a number of 128 bits.
+pub fn v6_to_u128(a: Ipv6) -> U128 = match a { Ipv6(v) -> v }
+
+/// The address a number of 128 bits is.
+pub fn v6_of_u128(v: U128) -> Ipv6 = Ipv6(v)
+
+/// The four octets in network order, as a socket address holds them.
+pub fn v4_to_bytes(a: Ipv4) -> Bytes / {abort.raise} = u32_be(v4_to_int(a))
+
+/// The address four octets in network order are, or `None` for any other number of them.
+pub fn v4_of_bytes(b: Bytes) -> Option<Ipv4> / {abort.raise} =
+  if bytes_len(b) != 4 { None }
+  else { match u32_be_at(b, 0) { Some(n) -> Some(Ipv4(n)), None -> None } }
+
+/// The sixteen octets in network order, as a socket address holds them.
+pub fn v6_to_bytes(a: Ipv6) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(groups(a), |g: Int| u16_be(g)))
+
+/// The address sixteen octets in network order are, or `None` for any other number of them.
+pub fn v6_of_bytes(b: Bytes) -> Option<Ipv6> / {abort.raise} =
+  if bytes_len(b) != 16 { None } else {
+    Some(Ipv6(fold(range(0, 16), 0u128, |acc: U128, i: Int| acc << 8 | widened(bytes_at(b, i)))))
+  }
+
+/// The address in network order: four octets for IPv4 and sixteen for IPv6.
+pub fn to_bytes(a: Ip) -> Bytes / {abort.raise} =
+  match a { V4(four) -> v4_to_bytes(four), V6(six) -> v6_to_bytes(six) }
+
+/// The IPv4 address four octets are or the IPv6 address sixteen are, or `None` for any other
+/// number of them.
+pub fn of_bytes(b: Bytes) -> Option<Ip> / {abort.raise} =
+  if bytes_len(b) == 4 { match v4_of_bytes(b) { Some(four) -> Some(V4(four)), None -> None } }
+  else { match v6_of_bytes(b) { Some(six) -> Some(V6(six)), None -> None } }
+
+/// The IPv4 address an IPv4-mapped address (`::ffff:a.b.c.d`, RFC 4291 §2.5.5.2) holds, or
+/// `None` for any other address.
+pub fn to_ipv4_mapped(a: Ipv6) -> Option<Ipv4> =
+  match a {
+    Ipv6(v) -> if v >>> 32 == 0xFFFFu128 { Some(Ipv4(narrowed(v & 0xFFFF_FFFFu128))) }
+    else { None },
+  }
+
+/// The IPv4-mapped IPv6 address that holds `a`: `::ffff:a.b.c.d`.
+pub fn to_ipv6_mapped(a: Ipv4) -> Ipv6 =
+  match a { Ipv4(n) -> Ipv6(0xFFFF_0000_0000u128 | widened(n)) }
+
+/// The address a socket given `a` reaches: the IPv4 address an IPv4-mapped IPv6 address holds,
+/// and any other address itself.
+pub fn to_canonical(a: Ip) -> Ip =
+  match a { V4(_) -> a, V6(six) -> match to_ipv4_mapped(six) { Some(four) -> V4(four), None -> a } }
+
+// --- Writing ----------------------------------------------------------------
+
+/// Dotted decimal: four octets, none with a leading zero.
+pub fn render_v4(a: Ipv4) -> String = join(map(octets(a), |octet: Int| int_to_string(octet)), ".")
+
+/// RFC 5952's canonical text: lower-case hex with no leading zeros, `::` for the longest run of
+/// two or more zero groups, the leftmost of equal runs, and an IPv4-mapped address with its
+/// last 32 bits dotted.
+pub fn render_v6(a: Ipv6) -> String =
+  match to_ipv4_mapped(a) {
+    Some(four) -> "::ffff:" ++ render_v4(four),
+    None -> {
+      let gs = groups(a);
+      let run = longest_zero_run(gs);
+      if run.length < 2 { hex_groups(gs) } else {
+        hex_groups(slice(gs, 0, run.start)) ++ "::"
+          ++ hex_groups(slice(gs, run.start + run.length, 8))
+      }
+    },
+  }
+
+/// The address as its family writes it: `render_v4` or `render_v6`.
+pub fn render(a: Ip) -> String = match a { V4(four) -> render_v4(four), V6(six) -> render_v6(six) }
+
+/// The network's address, `/` and its length.
+pub fn render_prefix(p: Prefix) -> String =
+  match p { Prefix(net, length) -> render(net) ++ "/" ++ int_to_string(length) }
+
+/// The address, `:` and the port, an IPv6 address in brackets with its zone after a `%`:
+/// `192.0.2.1:80`, `[::1]:80`, `[fe80::1%eth0]:80`.
+pub fn render_socket(a: SocketAddress) -> String =
+  match a {
+    SocketAddress(V4(four), port, _) -> render_v4(four) ++ ":" ++ int_to_string(port),
+    SocketAddress(V6(six), port, zone) ->
+      "[" ++ render_v6(six) ++ (match zone { Some(name) -> "%" ++ name, None -> "" }) ++ "]:"
+        ++ int_to_string(port),
+  }
+
+/// The socket address of `address` and `port`, or `None` for a port outside `0..=65535`.
+pub fn socket_address(address: Ip, port: Int) -> Option<SocketAddress> =
+  if port < 0 || port > 65535 { None } else { Some(SocketAddress(address, port, None)) }
+
+/// The socket address of `address` and `port`, raising for a port outside `0..=65535`: for a
+/// port the caller already holds to that range.
+pub fn socket_at(address: Ip, port: Int) -> SocketAddress / {abort.raise} =
+  match socket_address(address, port) {
+    Some(at) -> at,
+    None -> panic("port " ++ int_to_string(port) ++ " is not a port"),
+  }
+
+/// IPv4's loopback address, `127.0.0.1`.
+pub fn loopback_v4() -> Ip = V4(Ipv4(0x7F00_0001))
+
+/// IPv6's loopback address, `::1`.
+pub fn loopback_v6() -> Ip = V6(Ipv6(1u128))
+
+/// The loopback address of `a`'s family.
+pub fn loopback_like(a: Ip) -> Ip = match a { V4(_) -> loopback_v4(), V6(_) -> loopback_v6() }
+
+/// The unspecified address of `a`'s family, `0.0.0.0` or `::`: what a socket that leaves its
+/// address to the host is bound at.
+pub fn unspecified_like(a: Ip) -> Ip = match a { V4(_) -> V4(Ipv4(0)), V6(_) -> V6(Ipv6(0u128)) }
+
+/// `a` reached through the interface `zone` names, or `None` where `a` is an IPv4 address or
+/// `zone` is not one or more letters, digits, `-`, `.`, `_` and `~`.
+pub fn in_zone(a: SocketAddress, zone: String) -> Option<SocketAddress> / {abort.raise} =
+  match a {
+    SocketAddress(V6(six), port, _) -> {
+      let b = bytes_of_string(zone);
+      if bytes_len(b) > 0 && scan(b, 0, zone_bytes()) == bytes_len(b) {
+        Some(SocketAddress(V6(six), port, Some(zone)))
+      } else { None }
+    },
+    SocketAddress(V4(_), _, _) -> None,
+  }
+
+/// The address of a socket address.
+pub fn socket_ip(a: SocketAddress) -> Ip = match a { SocketAddress(address, _, _) -> address }
+
+/// The port of a socket address.
+pub fn socket_port(a: SocketAddress) -> Int = match a { SocketAddress(_, port, _) -> port }
+
+/// The zone of a socket address, which only an IPv6 one may have.
+pub fn socket_zone(a: SocketAddress) -> Option<String> =
+  match a { SocketAddress(_, _, zone) -> zone }
+
+type Run = { start: Int, length: Int }
+
+/// The longest run of zero groups, and the leftmost of equal ones.
+fn longest_zero_run(gs: List<Int>) -> Run = {
+  let none: Run = { start: 0, length: 0 };
+  fold(range(0, len(gs)), { best: none, open: none }, |s: { best: Run, open: Run }, i: Int|
+    if at_or(gs, i, 0) != 0 { { best: s.best, open: { start: i + 1, length: 0 } } } else {
+      let open: Run = { start: s.open.start, length: s.open.length + 1 };
+      { best: if open.length > s.best.length { open } else { s.best }, open: open }
+    }).best
+}
+
+fn hex_groups(gs: List<Int>) -> String = join(map(gs, hex_group), ":")
+
+fn hex_group(g: Int) -> String =
+  if g < 16 { at_or(hex_letters(), g, "") }
+  else { hex_group(g / 16) ++ at_or(hex_letters(), g % 16, "") }
+
+fn hex_letters() -> List<String> =
+  ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+
+// --- Reading ----------------------------------------------------------------
+
+/// Why a text is refused.
+pub type Why =
+  /// Nothing stands where an address goes.
+  | Empty
+  /// An octet's digits go here.
+  | NoOctet
+  /// A number is written with a leading zero, which other readers take for octal.
+  | LeadingZero
+  /// An octet is above 255.
+  | OctetRange
+  /// An IPv4 address ends before its fourth octet: the short forms `127.1` and `2130706433` are
+  /// not read.
+  | FewOctets
+  /// A fifth octet.
+  | ManyOctets
+  /// A group's hex digits go here.
+  | NoGroup
+  /// A group holds more than four hex digits.
+  | LongGroup
+  /// An IPv6 address ends before its eighth group, with no `::` to stand for the rest.
+  | FewGroups
+  /// More groups than an address holds, or eight beside a `::`, which stands for at least one.
+  | ManyGroups
+  /// A second `::`.
+  | SecondCompression
+  /// A `:` begins or ends the address and is no part of a `::`.
+  | LoneColon
+  /// A zone follows the address, where an address alone is read.
+  | Zone
+  /// A `%` with no zone after it.
+  | NoZone
+  /// A prefix has no `/` and length, or no digits after its `/`.
+  | NoLength
+  /// A prefix length is past its family's bits: 32 for IPv4 and 128 for IPv6.
+  | LengthRange
+  /// A bit past the prefix length is set, so the text names a host in the network and not the
+  /// network.
+  | HostBits
+  /// A socket address has no `:` and port after its address.
+  | NoPort
+  /// A port is above 65535.
+  | PortRange
+  /// An IPv6 address in a socket address stands in brackets, and one is missing or not closed.
+  | NoBracket
+  /// A character that cannot stand here.
+  | Stray
+
+/// A refusal, and the offset in the text the reader stood at. An address is ASCII, so the offset
+/// counts bytes and characters alike up to the first character that is not.
+pub type Refusal = { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect ip {
+  /// The text is not an address, or not a prefix.
+  raise refused(e: Refusal)
+}
+
+/// A refusal's reason as a sentence, which is what a literal's diagnostic says.
+pub fn reason(why: Why) -> String =
+  match why {
+    Empty -> "an address goes here",
+    NoOctet -> "an octet's decimal digits go here",
+    LeadingZero -> "a number is written with no leading zero",
+    OctetRange -> "an octet is at most 255",
+    FewOctets -> "an IPv4 address is four octets",
+    ManyOctets -> "an IPv4 address is four octets and no more",
+    NoGroup -> "a group's hex digits go here",
+    LongGroup -> "a group is at most four hex digits",
+    FewGroups -> "an IPv6 address is eight groups, or fewer around one `::`",
+    ManyGroups -> "an IPv6 address is eight groups, a `::` standing for at least one",
+    SecondCompression -> "an address holds at most one `::`",
+    LoneColon -> "a `:` stands between two groups, or doubled",
+    Zone -> "a zone is no part of an address",
+    NoZone -> "a zone goes after the `%`",
+    NoLength -> "a `/` and a prefix length go here",
+    LengthRange -> "a prefix length is at most 32 for IPv4 and 128 for IPv6",
+    HostBits -> "a bit past the prefix length is set",
+    NoPort -> "a `:` and a port go here",
+    PortRange -> "a port is at most 65535",
+    NoBracket -> "an IPv6 address stands between `[` and `]` before its port",
+    Stray -> "this character cannot stand here",
+  }
+
+fn refuse<a>(at: Int, why: Why) -> a / {ip.refused} = ip.refused({ at: at, why: why })
+
+/// The IPv4 address dotted decimal `text` writes, or where and why it is not one.
+pub fn parse_v4(text: String) -> Result<Ipv4, Refusal> / {abort.raise} = try { read_v4(text) }
+
+/// The IPv4 address dotted decimal `text` writes, raising `ip.refused` where `parse_v4` answers
+/// `Err`.
+pub fn read_v4(text: String) -> Ipv4 / {ip.refused, abort.raise} =
+  Ipv4(dotted(bytes_of_string(text), 0))
+
+/// The IPv6 address `text` writes, or where and why it is not one.
+pub fn parse_v6(text: String) -> Result<Ipv6, Refusal> / {abort.raise} = try { read_v6(text) }
+
+/// The IPv6 address `text` writes, raising `ip.refused` where `parse_v6` answers `Err`.
+pub fn read_v6(text: String) -> Ipv6 / {ip.refused, abort.raise} =
+  Ipv6(unzoned(bytes_of_string(text)))
+
+/// The address `text` writes, IPv6 where it holds a `:` and IPv4 otherwise, or where and why it
+/// is neither.
+pub fn parse(text: String) -> Result<Ip, Refusal> / {abort.raise} = try { read(text) }
+
+/// The address `text` writes, raising `ip.refused` where `parse` answers `Err`.
+pub fn read(text: String) -> Ip / {ip.refused, abort.raise} = address_of(bytes_of_string(text))
+
+/// An IPv6 address and the zone written after it, which names an interface on the host that
+/// reads it and nothing to any other.
+pub type Scoped = { address: Ipv6, zone: Option<String> }
+
+/// The IPv6 address `text` writes and the zone after its `%`, if it writes one, or where and why
+/// it is neither. A zone is one or more letters, digits, `-`, `.`, `_` and `~`.
+pub fn parse_scoped(text: String) -> Result<Scoped, Refusal> / {abort.raise} =
+  try { read_scoped(text) }
+
+/// The IPv6 address and zone `text` writes, raising `ip.refused` where `parse_scoped` answers
+/// `Err`.
+pub fn read_scoped(text: String) -> Scoped / {ip.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  let cut = scan_until(b, 0, b"%");
+  let address = Ipv6(colons(bytes_slice(b, 0, cut)));
+  if cut >= bytes_len(b) { { address: address, zone: None } } else {
+    let end = scan(b, cut + 1, zone_bytes());
+    if cut + 1 >= bytes_len(b) { refuse(cut + 1, NoZone) }
+    else if end < bytes_len(b) { refuse(end, Stray) }
+    else { { address: address, zone: Some(string_of_bytes(bytes_slice(b, cut + 1, end))) } }
+  }
+}
+
+/// The network `text` writes, an address, `/` and a length, or where and why it is not one. A
+/// text with a bit past the length set is refused (`HostBits`); `parse_interface` reads one.
+pub fn parse_prefix(text: String) -> Result<Prefix, Refusal> / {abort.raise} =
+  try { read_prefix(text) }
+
+/// The network `text` writes, raising `ip.refused` where `parse_prefix` answers `Err`.
+pub fn read_prefix(text: String) -> Prefix / {ip.refused, abort.raise} = {
+  let read = slashed(bytes_of_string(text));
+  if wide(read.address) & host_mask(read.address, read.length) != 0u128 {
+    refuse(read.at, HostBits)
+  } else { Prefix(read.address, read.length) }
+}
+
+/// An address and the network it is in, as an interface is configured: `192.0.2.7/24`.
+pub type Interface = { address: Ip, network: Prefix }
+
+/// The address `text` writes before its `/`, and the network of the length after it that holds
+/// that address, or where and why the text is not an address, `/` and a length.
+pub fn parse_interface(text: String) -> Result<Interface, Refusal> / {abort.raise} =
+  try { read_interface(text) }
+
+/// The address and network `text` writes, raising `ip.refused` where `parse_interface` answers
+/// `Err`.
+pub fn read_interface(text: String) -> Interface / {ip.refused, abort.raise} = {
+  let read = slashed(bytes_of_string(text));
+  { address: read.address, network: masked(read.address, read.length) }
+}
+
+/// The socket address `text` writes, or where and why it is not one. An IPv4 address is followed
+/// by `:` and its port, `192.0.2.1:80`; an IPv6 address stands in brackets, with its zone after
+/// a `%` where it has one, `[::1]:80` and `[fe80::1%eth0]:80`. A port is decimal digits with no
+/// leading zero, at most 65535.
+pub fn parse_socket(text: String) -> Result<SocketAddress, Refusal> / {abort.raise} =
+  try { read_socket(text) }
+
+/// The socket address `text` writes, raising `ip.refused` where `parse_socket` answers `Err`.
+pub fn read_socket(text: String) -> SocketAddress / {ip.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  if peek(b, 0) == b'[' { bracketed(b) } else {
+    let colon = scan_until(b, 0, b":");
+    if colon < bytes_len(b) && scan_until(b, colon + 1, b":") < bytes_len(b) {
+      refuse(0, NoBracket)
+    } else {
+      let four = Ipv4(dotted(bytes_slice(b, 0, colon), 0));
+      SocketAddress(V4(four), port_from(b, colon), None)
+    }
+  }
+}
+
+/// The socket address `b` writes from its `[`.
+fn bracketed(b: Bytes) -> SocketAddress / {ip.refused, abort.raise} = {
+  let close = scan_until(b, 1, b"]");
+  if close >= bytes_len(b) { refuse(close, NoBracket) } else {
+    let inner = string_of_bytes(bytes_slice(b, 1, close));
+    let scoped = handle { read_scoped(inner) } with { ip.refused(e) -> refuse(e.at + 1, e.why) };
+    SocketAddress(V6(scoped.address), port_from(b, close + 1), scoped.zone)
+  }
+}
+
+/// The port after the `:` at `at`, which ends the text.
+fn port_from(b: Bytes, at: Int) -> Int / {ip.refused, abort.raise} =
+  if at >= bytes_len(b) || bytes_at(b, at) != b':' { refuse(at, NoPort) } else {
+    let from = at + 1;
+    let end = scan(b, from, decimal_digits());
+    if end == from { refuse(from, if from >= bytes_len(b) { NoPort } else { Stray }) }
+    else if end < bytes_len(b) { refuse(end, Stray) }
+    else if end - from > 1 && bytes_at(b, from) == b'0' { refuse(from, LeadingZero) }
+    else if end - from > 5 || decimal_between(b, from, end) > 65535 { refuse(from, PortRange) }
+    else { decimal_between(b, from, end) }
+  }
+
+/// What an `ip"..."` literal is checked by: the address the text writes, or the character that
+/// keeps it from being one.
+pub fn literal(text: String) -> Result<Ip, { message: String, offset: Int }> / {abort.raise} =
+  match parse(text) {
+    Ok(a) -> Ok(a),
+    Err(refused) -> Err({ message: reason(refused.why), offset: refused.at }),
+  }
+
+/// What a `cidr"..."` literal is checked by: the network the text writes, or the character that
+/// keeps it from being one.
+pub fn prefix_literal(
+  text: String,
+) -> Result<Prefix, { message: String, offset: Int }> / {abort.raise} =
+  match parse_prefix(text) {
+    Ok(p) -> Ok(p),
+    Err(refused) -> Err({ message: reason(refused.why), offset: refused.at }),
+  }
+
+fn decimal_digits() -> Bytes = b"0123456789"
+
+fn hex_digits() -> Bytes = b"0123456789abcdefABCDEF"
+
+fn zone_bytes() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+
+fn address_of(b: Bytes) -> Ip / {ip.refused, abort.raise} =
+  if scan_until(b, 0, b":") < bytes_len(b) { V6(Ipv6(unzoned(b))) } else { V4(Ipv4(dotted(b, 0))) }
+
+/// The number the four octets from `at` to the end of `b` write.
+fn dotted(b: Bytes, at: Int) -> Int / {ip.refused, abort.raise} =
+  if at >= bytes_len(b) { refuse(at, Empty) } else { octets_from(b, at, 0, 0) }
+
+fn octets_from(b: Bytes, at: Int, seen: Int, above: Int) -> Int / {ip.refused, abort.raise} = {
+  let end = scan(b, at, decimal_digits());
+  let value = above << 8 | octet_between(b, at, end);
+  if seen >= 3 {
+    if end >= bytes_len(b) { value }
+    else { refuse(end, if bytes_at(b, end) == b'.' { ManyOctets } else { Stray }) }
+  } else if end >= bytes_len(b) { refuse(end, FewOctets) }
+  else if bytes_at(b, end) == b'.' { octets_from(b, end + 1, seen + 1, value) }
+  else { refuse(end, Stray) }
+}
+
+fn octet_between(b: Bytes, from: Int, to: Int) -> Int / {ip.refused, abort.raise} =
+  if to == from { refuse(from, NoOctet) }
+  else if to - from > 1 && bytes_at(b, from) == b'0' { refuse(from, LeadingZero) }
+  else if to - from > 3 || decimal_between(b, from, to) > 255 { refuse(from, OctetRange) }
+  else { decimal_between(b, from, to) }
+
+fn decimal_between(b: Bytes, from: Int, to: Int) -> Int / {abort.raise} =
+  fold(range(from, to), 0, |acc: Int, i: Int| acc * 10 + bytes_at(b, i) - b'0')
+
+/// The address `b` writes, refusing a zone once the address before it reads.
+fn unzoned(b: Bytes) -> U128 / {ip.refused, abort.raise} = {
+  let cut = scan_until(b, 0, b"%");
+  let address = colons(bytes_slice(b, 0, cut));
+  if cut < bytes_len(b) { refuse(cut, Zone) } else { address }
+}
+
+/// The groups read so far: those before a `::`, and those after it once one is read.
+type Groups = { head: List<Int>, tail: Option<List<Int>> }
+
+fn colons(b: Bytes) -> U128 / {ip.refused, abort.raise} =
+  if bytes_len(b) == 0 { refuse(0, Empty) }
+  else if bytes_starts_with(b, b"::") { groups_from(b, 2, 0, { head: [], tail: Some([]) }) }
+  else if bytes_at(b, 0) == b':' { refuse(0, LoneColon) }
+  else { groups_from(b, 0, 0, { head: [], tail: None }) }
+
+/// From `at`, where a group or the end of an address that ended in `::` stands.
+fn groups_from(b: Bytes, at: Int, seen: Int, gs: Groups) -> U128 / {ip.refused, abort.raise} =
+  if at >= bytes_len(b) { assembled(gs, at) }
+  else if seen >= 8 { refuse(at, ManyGroups) } else {
+    let end = scan(b, at, hex_digits());
+    if peek(b, end) == b'.' { ending_dotted(b, at, seen, gs) }
+    else if end == at { refuse(at, if bytes_at(b, at) == b':' { LoneColon } else { NoGroup }) }
+    else if end - at > 4 { refuse(at, LongGroup) }
+    else { after_group(b, end, seen + 1, with_group(gs, hex_between(b, at, end))) }
+  }
+
+/// From `at`, just past a group: the end, a `:` and the next group, or a `::`.
+fn after_group(b: Bytes, at: Int, seen: Int, gs: Groups) -> U128 / {ip.refused, abort.raise} =
+  if at >= bytes_len(b) { assembled(gs, at) }
+  else if bytes_at(b, at) != b':' { refuse(at, Stray) } else if peek(b, at + 1) == b':' {
+    match gs.tail {
+      Some(_) -> refuse(at, SecondCompression),
+      None -> groups_from(b, at + 2, seen, { head: gs.head, tail: Some([]) }),
+    }
+  } else if at + 1 >= bytes_len(b) { refuse(at, LoneColon) }
+  else { groups_from(b, at + 1, seen, gs) }
+
+/// The address whose last 32 bits are the dotted octets from `at` to the end of `b`.
+fn ending_dotted(b: Bytes, at: Int, seen: Int, gs: Groups) -> U128 / {ip.refused, abort.raise} =
+  if seen > 6 { refuse(at, ManyGroups) } else {
+    let low = dotted(b, at);
+    assembled(with_group(with_group(gs, low >> 16), low & 0xFFFF), bytes_len(b))
+  }
+
+fn with_group(gs: Groups, g: Int) -> Groups =
+  match gs.tail {
+    Some(tail) -> { head: gs.head, tail: Some(push(tail, g)) },
+    None -> { head: push(gs.head, g), tail: None },
+  }
+
+fn hex_between(b: Bytes, from: Int, to: Int) -> Int / {abort.raise} =
+  fold(range(from, to), 0, |acc: Int, i: Int| acc * 16 + hex_value(bytes_at(b, i)))
+
+fn hex_value(c: Int) -> Int = if c <= b'9' { c - b'0' } else { (c | 32) - b'a' + 10 }
+
+fn assembled(gs: Groups, at: Int) -> U128 / {ip.refused} =
+  match gs.tail {
+    None -> if len(gs.head) == 8 { joined(gs.head) } else { refuse(at, FewGroups) },
+    Some(tail) -> {
+      let zeros = 8 - len(gs.head) - len(tail);
+      if zeros < 1 { refuse(at, ManyGroups) }
+      else { joined(concat(concat(gs.head, replicate(0, zeros)), tail)) }
+    },
+  }
+
+type Slashed = { address: Ip, length: Int, at: Int }
+
+/// An address, `/` and a length, with where the length stands.
+fn slashed(b: Bytes) -> Slashed / {ip.refused, abort.raise} = {
+  let slash = scan_until(b, 0, b"/");
+  let address = address_of(bytes_slice(b, 0, slash));
+  if slash >= bytes_len(b) { refuse(slash, NoLength) } else {
+    { address: address, length: length_from(b, slash + 1, bit_width(address)), at: slash + 1 }
+  }
+}
+
+fn length_from(b: Bytes, at: Int, most: Int) -> Int / {ip.refused, abort.raise} = {
+  let end = scan(b, at, decimal_digits());
+  if end == at { refuse(at, if at >= bytes_len(b) { NoLength } else { Stray }) }
+  else if end < bytes_len(b) { refuse(end, Stray) }
+  else if end - at > 1 && bytes_at(b, at) == b'0' { refuse(at, LeadingZero) }
+  else if end - at > 3 || decimal_between(b, at, end) > most { refuse(at, LengthRange) }
+  else { decimal_between(b, at, end) }
+}
+
+// --- Classes ----------------------------------------------------------------
+
+/// Whether the address is `0.0.0.0`.
+pub fn is_unspecified_v4(a: Ipv4) -> Bool = match a { Ipv4(n) -> n == 0 }
+
+/// Whether the address is in `127.0.0.0/8`.
+pub fn is_loopback_v4(a: Ipv4) -> Bool = match a { Ipv4(n) -> n >> 24 == 127 }
+
+/// Whether the address is in RFC 1918's `10.0.0.0/8`, `172.16.0.0/12` or `192.168.0.0/16`.
+pub fn is_private_v4(a: Ipv4) -> Bool =
+  match a { Ipv4(n) -> n >> 24 == 10 || n >> 20 == 0xAC1 || n >> 16 == 0xC0A8 }
+
+/// Whether the address is in `169.254.0.0/16`.
+pub fn is_link_local_v4(a: Ipv4) -> Bool = match a { Ipv4(n) -> n >> 16 == 0xA9FE }
+
+/// Whether the address is in `224.0.0.0/4`.
+pub fn is_multicast_v4(a: Ipv4) -> Bool = match a { Ipv4(n) -> n >> 28 == 0xE }
+
+/// Whether the address is in RFC 5737's `192.0.2.0/24`, `198.51.100.0/24` or `203.0.113.0/24`.
+pub fn is_documentation_v4(a: Ipv4) -> Bool =
+  match a { Ipv4(n) -> n >> 8 == 0xC0_0002 || n >> 8 == 0xC6_3364 || n >> 8 == 0xCB_0071 }
+
+/// Whether the address is in RFC 6598's shared address space, `100.64.0.0/10`.
+pub fn is_shared_v4(a: Ipv4) -> Bool = match a { Ipv4(n) -> n >> 22 == 0x191 }
+
+/// Whether the address is in RFC 2544's `198.18.0.0/15`.
+pub fn is_benchmarking_v4(a: Ipv4) -> Bool = match a { Ipv4(n) -> n >> 17 == 0x6309 }
+
+/// Whether the address is in `240.0.0.0/4`, the limited broadcast address `255.255.255.255`
+/// included.
+pub fn is_reserved_v4(a: Ipv4) -> Bool = match a { Ipv4(n) -> n >> 28 == 0xF }
+
+/// Whether the address is globally reachable: not multicast, and in no block of IANA's IPv4
+/// special-purpose registry but one it marks globally reachable.
+pub fn is_global_v4(a: Ipv4) -> Bool =
+  match a {
+    Ipv4(n) ->
+      !(n >> 24 == 0 || n >> 28 >= 0xE || n >> 8 == 0xC0_5863 || unassigned_protocol_v4(n)
+        || is_private_v4(a)
+        || is_shared_v4(a)
+        || is_loopback_v4(a)
+        || is_link_local_v4(a)
+        || is_documentation_v4(a)
+        || is_benchmarking_v4(a)),
+  }
+
+/// `192.0.0.0/24` but its two anycast addresses the registry marks reachable.
+fn unassigned_protocol_v4(n: Int) -> Bool =
+  n >> 8 == 0xC0_0000 && n != 0xC000_0009 && n != 0xC000_000A
+
+fn unique_local(v: U128) -> Bool = v >>> 121 == 0x7Eu128
+
+fn link_local(v: U128) -> Bool = v >>> 118 == 0x3FAu128
+
+fn multicast(v: U128) -> Bool = v >>> 120 == 0xFFu128
+
+fn documentation(v: U128) -> Bool = v >>> 96 == 0x2001_0DB8u128 || v >>> 108 == 0x3_FFF0u128
+
+fn benchmarking(v: U128) -> Bool = v >>> 80 == 0x2001_0002_0000u128
+
+/// The special-purpose blocks that lie in space the address space registry reserves.
+fn special_in_reserved(v: U128) -> Bool =
+  v <= 1u128 || v >>> 32 == 0xFFFFu128 || v >>> 32 == 0x0064_FF9B_0000_0000_0000_0000u128
+    || v >>> 80 == 0x0064_FF9B_0001u128
+    || v >>> 65 == 0x0080_0000_0000_0000u128
+    || v >>> 112 == 0x5F00u128
+
+fn reserved(v: U128) -> Bool =
+  !(v >>> 125 == 1u128 || unique_local(v) || link_local(v) || multicast(v)
+    || special_in_reserved(v))
+
+/// The addresses of `2001::/23` the registry marks reachable.
+fn assigned_protocol(v: U128) -> Bool =
+  v >>> 96 == 0x2001_0003u128 || v >>> 80 == 0x2001_0004_0112u128 || v >>> 100 == 0x200_1002u128
+    || v >>> 100 == 0x200_1003u128
+    || (v >= 0x2001_0001_0000_0000_0000_0000_0000_0001u128
+    && v <= 0x2001_0001_0000_0000_0000_0000_0000_0003u128)
+
+fn global(v: U128) -> Bool =
+  !(multicast(v) || reserved(v) || unique_local(v) || link_local(v) || documentation(v)
+    || v <= 1u128
+    || v >>> 80 == 0x0064_FF9B_0001u128
+    || v >>> 65 == 0x0080_0000_0000_0000u128
+    || v >>> 112 == 0x5F00u128
+    || v >>> 112 == 0x2002u128
+    || (v >>> 105 == 0x10_0080u128 && !assigned_protocol(v)))
+
+/// `four` of the IPv4 address an IPv4-mapped address holds, and `six` of any other address.
+fn classed(a: Ipv6, four: (Ipv4) -> Bool, six: (U128) -> Bool) -> Bool =
+  match to_ipv4_mapped(a) { Some(mapped) -> four(mapped), None -> six(v6_to_u128(a)) }
+
+/// Whether the address is `::`, or IPv4-mapped `0.0.0.0`.
+pub fn is_unspecified_v6(a: Ipv6) -> Bool = classed(a, is_unspecified_v4, |v: U128| v == 0u128)
+
+/// Whether the address is `::1`, or an IPv4-mapped loopback address.
+pub fn is_loopback_v6(a: Ipv6) -> Bool = classed(a, is_loopback_v4, |v: U128| v == 1u128)
+
+/// Whether the address is unique local, `fc00::/7`, or an IPv4-mapped private address.
+pub fn is_private_v6(a: Ipv6) -> Bool = classed(a, is_private_v4, unique_local)
+
+/// Whether the address is link-local unicast, `fe80::/10`, or an IPv4-mapped link-local address.
+pub fn is_link_local_v6(a: Ipv6) -> Bool = classed(a, is_link_local_v4, link_local)
+
+/// Whether the address is in `ff00::/8`, or an IPv4-mapped multicast address.
+pub fn is_multicast_v6(a: Ipv6) -> Bool = classed(a, is_multicast_v4, multicast)
+
+/// Whether the address is in `2001:db8::/32` or `3fff::/20`, or an IPv4-mapped documentation
+/// address.
+pub fn is_documentation_v6(a: Ipv6) -> Bool = classed(a, is_documentation_v4, documentation)
+
+/// Whether the address is an IPv4-mapped address in the shared address space, which IPv6 has
+/// none of.
+pub fn is_shared_v6(a: Ipv6) -> Bool = classed(a, is_shared_v4, |_: U128| false)
+
+/// Whether the address is in `2001:2::/48`, or an IPv4-mapped benchmarking address.
+pub fn is_benchmarking_v6(a: Ipv6) -> Bool = classed(a, is_benchmarking_v4, benchmarking)
+
+/// Whether the address is in space IANA's IPv6 address space registry marks "Reserved by IETF"
+/// and in no special-purpose block, or is an IPv4-mapped reserved address.
+pub fn is_reserved_v6(a: Ipv6) -> Bool = classed(a, is_reserved_v4, reserved)
+
+/// Whether the address is globally reachable: not multicast, not reserved, and in no block of
+/// IANA's IPv6 special-purpose registry but one it marks globally reachable; or an IPv4-mapped
+/// address `is_global_v4` holds of.
+pub fn is_global_v6(a: Ipv6) -> Bool = classed(a, is_global_v4, global)
+
+fn either(a: Ip, four: (Ipv4) -> Bool, six: (Ipv6) -> Bool) -> Bool =
+  match a { V4(x) -> four(x), V6(x) -> six(x) }
+
+/// Whether the address is its family's unspecified one: `is_unspecified_v4` or
+/// `is_unspecified_v6`.
+pub fn is_unspecified(a: Ip) -> Bool = either(a, is_unspecified_v4, is_unspecified_v6)
+
+/// Whether the address is a loopback one: `is_loopback_v4` or `is_loopback_v6`.
+pub fn is_loopback(a: Ip) -> Bool = either(a, is_loopback_v4, is_loopback_v6)
+
+/// Whether the address is private: `is_private_v4` or `is_private_v6`.
+pub fn is_private(a: Ip) -> Bool = either(a, is_private_v4, is_private_v6)
+
+/// Whether the address is link-local: `is_link_local_v4` or `is_link_local_v6`.
+pub fn is_link_local(a: Ip) -> Bool = either(a, is_link_local_v4, is_link_local_v6)
+
+/// Whether the address is multicast: `is_multicast_v4` or `is_multicast_v6`.
+pub fn is_multicast(a: Ip) -> Bool = either(a, is_multicast_v4, is_multicast_v6)
+
+/// Whether the address is set aside for documentation: `is_documentation_v4` or
+/// `is_documentation_v6`.
+pub fn is_documentation(a: Ip) -> Bool = either(a, is_documentation_v4, is_documentation_v6)
+
+/// Whether the address is in the shared address space: `is_shared_v4` or `is_shared_v6`.
+pub fn is_shared(a: Ip) -> Bool = either(a, is_shared_v4, is_shared_v6)
+
+/// Whether the address is set aside for benchmarking: `is_benchmarking_v4` or
+/// `is_benchmarking_v6`.
+pub fn is_benchmarking(a: Ip) -> Bool = either(a, is_benchmarking_v4, is_benchmarking_v6)
+
+/// Whether the address is reserved: `is_reserved_v4` or `is_reserved_v6`.
+pub fn is_reserved(a: Ip) -> Bool = either(a, is_reserved_v4, is_reserved_v6)
+
+/// Whether the address is globally reachable: `is_global_v4` or `is_global_v6`.
+pub fn is_global(a: Ip) -> Bool = either(a, is_global_v4, is_global_v6)
+
+/// One row of IANA's IPv4 or IPv6 Special-Purpose Address Registry.
+pub type Block = {
+  /// The addresses the row is about.
+  prefix: Prefix,
+  /// The row's name, as the registry writes it.
+  name: String,
+  /// The row's "Globally Reachable" column, false where the registry answers "N/A" or nothing.
+  global: Bool,
+}
+
+/// Every row of IANA's IPv4 and IPv6 Special-Purpose Address Registries, a row of two blocks as
+/// two.
+pub fn special_purpose_blocks() -> List<Block> / {abort.raise} =
+  map(registry_rows(), |row: (String, String, Bool)|
+    { prefix: block_of(row._0), name: row._1, global: row._2 })
+
+/// The registry's row for `a`: of the blocks that hold it, the smallest. The address is read as
+/// given, so an IPv4-mapped one is in the registry's IPv4-mapped block; `to_canonical` first
+/// asks about the IPv4 address it holds, as the classifiers do.
+pub fn special_purpose(a: Ip) -> Option<Block> / {abort.raise} =
+  fold(special_purpose_blocks(), None, |best: Option<Block>, block: Block|
+    if !contains(block.prefix, a) { best } else {
+      match best {
+        Some(held) -> if bits(held.prefix) >= bits(block.prefix) { best } else { Some(block) },
+        None -> Some(block),
+      }
+    })
+
+fn block_of(text: String) -> Prefix / {abort.raise} =
+  match parse_prefix(text) { Ok(p) -> p, Err(_) -> panic("not a prefix: " ++ text) }
+
+fn registry_rows() -> List<(String, String, Bool)> =
+  [
+    ("0.0.0.0/8", "\"This network\"", false),
+    ("0.0.0.0/32", "\"This host on this network\"", false),
+    ("10.0.0.0/8", "Private-Use", false),
+    ("100.64.0.0/10", "Shared Address Space", false),
+    ("127.0.0.0/8", "Loopback", false),
+    ("169.254.0.0/16", "Link Local", false),
+    ("172.16.0.0/12", "Private-Use", false),
+    ("192.0.0.0/24", "IETF Protocol Assignments", false),
+    ("192.0.0.0/29", "IPv4 Service Continuity Prefix", false),
+    ("192.0.0.8/32", "IPv4 dummy address", false),
+    ("192.0.0.9/32", "Port Control Protocol Anycast", true),
+    ("192.0.0.10/32", "Traversal Using Relays around NAT Anycast", true),
+    ("192.0.0.170/32", "NAT64/DNS64 Discovery", false),
+    ("192.0.0.171/32", "NAT64/DNS64 Discovery", false),
+    ("192.0.2.0/24", "Documentation (TEST-NET-1)", false),
+    ("192.31.196.0/24", "AS112-v4", true),
+    ("192.52.193.0/24", "AMT", true),
+    ("192.88.99.0/24", "Deprecated (6to4 Relay Anycast)", false),
+    ("192.88.99.2/32", "6a44-relay anycast address", false),
+    ("192.168.0.0/16", "Private-Use", false),
+    ("192.175.48.0/24", "Direct Delegation AS112 Service", true),
+    ("198.18.0.0/15", "Benchmarking", false),
+    ("198.51.100.0/24", "Documentation (TEST-NET-2)", false),
+    ("203.0.113.0/24", "Documentation (TEST-NET-3)", false),
+    ("240.0.0.0/4", "Reserved", false),
+    ("255.255.255.255/32", "Limited Broadcast", false),
+    ("::1/128", "Loopback Address", false),
+    ("::/128", "Unspecified Address", false),
+    ("::ffff:0:0/96", "IPv4-mapped Address", false),
+    ("64:ff9b::/96", "IPv4-IPv6 Translat.", true),
+    ("64:ff9b:1::/48", "IPv4-IPv6 Translat.", false),
+    ("100::/64", "Discard-Only Address Block", false),
+    ("100:0:0:1::/64", "Dummy IPv6 Prefix", false),
+    ("2001::/23", "IETF Protocol Assignments", false),
+    ("2001::/32", "TEREDO", false),
+    ("2001:1::1/128", "Port Control Protocol Anycast", true),
+    ("2001:1::2/128", "Traversal Using Relays around NAT Anycast", true),
+    ("2001:1::3/128", "DNS-SD Service Registration Protocol Anycast", true),
+    ("2001:2::/48", "Benchmarking", false),
+    ("2001:3::/32", "AMT", true),
+    ("2001:4:112::/48", "AS112-v6", true),
+    ("2001:10::/28", "Deprecated (previously ORCHID)", false),
+    ("2001:20::/28", "ORCHIDv2", true),
+    ("2001:30::/28", "Drone Remote ID Protocol Entity Tags (DETs) Prefix", true),
+    ("2001:db8::/32", "Documentation", false),
+    ("2002::/16", "6to4", false),
+    ("2620:4f:8000::/48", "Direct Delegation AS112 Service", true),
+    ("3fff::/20", "Documentation", false),
+    ("5f00::/16", "Segment Routing (SRv6) SIDs", false),
+    ("fc00::/7", "Unique-Local", false),
+    ("fe80::/10", "Link-Local Unicast", false),
+  ]
+
+/// The multicast blocks, and the blocks IANA's IPv6 address space registry marks "Reserved by
+/// IETF": what the classifiers read beside the special-purpose registries.
+fn unassigned_rows() -> List<(String, String)> =
+  [
+    ("224.0.0.0/4", "Multicast"),
+    ("ff00::/8", "Multicast"),
+    ("::/8", "Reserved by IETF"),
+    ("100::/8", "Reserved by IETF"),
+    ("200::/7", "Reserved by IETF"),
+    ("400::/6", "Reserved by IETF"),
+    ("800::/5", "Reserved by IETF"),
+    ("1000::/4", "Reserved by IETF"),
+    ("4000::/3", "Reserved by IETF"),
+    ("6000::/3", "Reserved by IETF"),
+    ("8000::/3", "Reserved by IETF"),
+    ("a000::/3", "Reserved by IETF"),
+    ("c000::/3", "Reserved by IETF"),
+    ("e000::/4", "Reserved by IETF"),
+    ("f000::/5", "Reserved by IETF"),
+    ("f800::/6", "Reserved by IETF"),
+    ("fe00::/9", "Reserved by IETF"),
+    ("fec0::/10", "Reserved by IETF"),
+  ]
+
+// --- Networks ---------------------------------------------------------------
+
+/// The bits of an address past a prefix of `length`.
+fn host_mask(address: Ip, length: Int) -> U128 = low_ones(bit_width(address) - length)
+
+/// The network of `length` leading bits that holds `address`, where the length is the family's.
+fn masked(address: Ip, length: Int) -> Prefix =
+  Prefix(of_wide(address, wide(address) & ~host_mask(address, length)), length)
+
+/// The network that is `address` and its `length` leading bits, or why there is none:
+/// `LengthRange` for a length outside `0..=32` for IPv4 or `0..=128` for IPv6, and `HostBits`
+/// where a bit of the address past the length is set.
+pub fn prefix(address: Ip, length: Int) -> Result<Prefix, Why> =
+  if length < 0 || length > bit_width(address) { Err(LengthRange) }
+  else if wide(address) & host_mask(address, length) != 0u128 { Err(HostBits) }
+  else { Ok(Prefix(address, length)) }
+
+/// The network of `length` leading bits that holds `address`, the address's bits past the
+/// length cleared. `None` for a length outside `0..=32` for IPv4 or `0..=128` for IPv6.
+pub fn prefix_holding(address: Ip, length: Int) -> Option<Prefix> =
+  if length < 0 || length > bit_width(address) { None } else { Some(masked(address, length)) }
+
+/// The network that is one address: `/32` for IPv4 and `/128` for IPv6.
+pub fn host_prefix(address: Ip) -> Prefix = Prefix(address, bit_width(address))
+
+/// The network's first address, which names it.
+pub fn network(p: Prefix) -> Ip = match p { Prefix(net, _) -> net }
+
+/// How many leading bits every address in the network shares.
+pub fn bits(p: Prefix) -> Int = match p { Prefix(_, length) -> length }
+
+/// The network's last address.
+pub fn last(p: Prefix) -> Ip =
+  match p { Prefix(net, length) -> of_wide(net, wide(net) | host_mask(net, length)) }
+
+/// The address every host of an IPv4 network hears: its last. `None` for an IPv6 network, which
+/// has none, and for a `/31` and a `/32`, whose every address is a host (RFC 3021).
+pub fn broadcast(p: Prefix) -> Option<Ipv4> =
+  match last(p) { V4(four) -> if bits(p) <= 30 { Some(four) } else { None }, V6(_) -> None }
+
+/// The mask with a one for each bit of the prefix, as an address: `255.255.255.0` for a `/24`.
+pub fn netmask(p: Prefix) -> Ip =
+  match p {
+    Prefix(net, length) -> of_wide(net, low_ones(bit_width(net)) & ~host_mask(net, length)),
+  }
+
+/// The mask with a one for each bit past the prefix, as an address: `0.0.0.255` for a `/24`.
+pub fn hostmask(p: Prefix) -> Ip =
+  match p { Prefix(net, length) -> of_wide(net, host_mask(net, length)) }
+
+/// How many bits of an address the network leaves to its hosts: its family's bits less its
+/// length.
+pub fn host_bits(p: Prefix) -> Int = match p { Prefix(net, length) -> bit_width(net) - length }
+
+/// How many addresses the network holds, two to the power of `host_bits`, or the greatest `Int`
+/// where that is past it, as it is for an IPv6 network of 65 bits or fewer.
+pub fn size(p: Prefix) -> Int =
+  if host_bits(p) >= 63 { 9223372036854775807 } else { 1 << host_bits(p) }
+
+/// Whether `a` is in the network: an address of the network's family whose leading bits are
+/// the network's. An IPv4 network holds no IPv6 address, an IPv4-mapped one included.
+pub fn contains(p: Prefix, a: Ip) -> Bool =
+  match p {
+    Prefix(net, length) ->
+      bit_width(net) == bit_width(a) && wide(a) & ~host_mask(net, length) == wide(net),
+  }
+
+/// Whether every address of `inner` is in `outer`.
+pub fn covers(outer: Prefix, inner: Prefix) -> Bool =
+  bits(outer) <= bits(inner) && contains(outer, network(inner))
+
+/// Whether the two networks share an address, which is whether one covers the other.
+pub fn overlaps(p: Prefix, q: Prefix) -> Bool = covers(p, q) || covers(q, p)
+
+/// The network one bit shorter that holds `p`, or `None` for a `/0`.
+pub fn supernet(p: Prefix) -> Option<Prefix> =
+  match p { Prefix(net, length) -> if length == 0 { None } else { Some(masked(net, length - 1)) } }
+
+/// The networks of `length` bits that `p` divides into, in order, and no more than the first
+/// `most` of them: there are two to the power of the bits `length` adds. None where `length` is
+/// shorter than `p`'s or past the family's.
+pub fn subnets(p: Prefix, length: Int, most: Int) -> List<Prefix> =
+  match p {
+    Prefix(net, own) -> if length < own || length > bit_width(net) { [] } else {
+      map(range(0, doubled(length - own, most)), |i: Int|
+        Prefix(of_wide(net, wide(net) | shifted(widened(i), bit_width(net) - length)), length))
+    },
+  }
+
+/// Two to the power of `doublings`, or `most` where that is less.
+fn doubled(doublings: Int, most: Int) -> Int =
+  if doublings >= 62 { max(most, 0) } else { min(1 << doublings, max(most, 0)) }
+
+/// The addresses of the network a host may have, in order, and no more than the first `most` of
+/// them. An IPv4 network has every address but its first and its last, the network's own and its
+/// broadcast; an IPv6 network every address but its first, the subnet-router anycast address
+/// (RFC 4291 §2.6.1). A network of one or two addresses has them all (RFC 3021, RFC 6164).
+pub fn hosts(p: Prefix, most: Int) -> List<Ip> =
+  match p {
+    Prefix(net, length) -> {
+      let spare = bit_width(net) - length;
+      let from = if spare >= 2 { wide(net) + 1u128 } else { wide(net) };
+      let to = if spare >= 2 && bit_width(net) == 32 { wide(last(p)) - 1u128 }
+      else { wide(last(p)) };
+      let count = if to - from >= widened(max(most, 0)) { max(most, 0) }
+      else { narrowed(to - from) + 1 };
+      map(range(0, count), |i: Int| of_wide(net, from + widened(i)))
+    },
+  }
+
+/// The address `by` after `a`, or before it for a negative `by`; `None` past either end of the
+/// family's addresses.
+pub fn offset(a: Ip, by: Int) -> Option<Ip> = {
+  let moved = if by >= 0 { checked_add(wide(a), widened(by)) }
+  else { checked_sub(wide(a), below_zero(by)) };
+  match moved {
+    Some(v) -> if v <= low_ones(bit_width(a)) { Some(of_wide(a, v)) } else { None },
+    None -> None,
+  }
+}
+
+/// How far below zero `n` is.
+fn below_zero(n: Int) -> U128 =
+  match checked_neg(n) { Some(distance) -> widened(distance), None -> 1u128 << 63 }
+
+/// The fewest networks that hold exactly the addresses `ps` hold between them, in order: one
+/// that another covers is dropped, and the two halves of a network become it.
+pub fn aggregate(ps: List<Prefix>) -> List<Prefix> =
+  fold(sort(ps), [], |kept: List<Prefix>, p: Prefix|
+    match list_at(kept, len(kept) - 1) {
+      None -> [p],
+      Some(top) -> if covers(top, p) { kept } else { halves_joined(push(kept, p), 128) },
+    })
+
+/// `kept` with its last two networks made the one they are the halves of, for as long as they
+/// are.
+fn halves_joined(kept: List<Prefix>, room: Int) -> List<Prefix> =
+  if room <= 0 { kept } else {
+    match whole_of(list_at(kept, len(kept) - 2), list_at(kept, len(kept) - 1)) {
+      None -> kept,
+      Some(whole) -> halves_joined(push(take(kept, len(kept) - 2), whole), room - 1),
+    }
+  }
+
+/// The network two networks are the two halves of, if they are.
+fn whole_of(low: Option<Prefix>, high: Option<Prefix>) -> Option<Prefix> =
+  match low {
+    None -> None,
+    Some(p) -> match high {
+      None -> None,
+      Some(q) -> if p != q && supernet(p) == supernet(q) { supernet(p) } else { None },
+    },
+  }
+
+/// The longest network among `table`'s keys that holds `a`, with its value: the route a
+/// forwarding table takes, and the rule an allow-list applies. A `std.set` of networks is such a
+/// table, its values `()`. One lookup for each length the family has. The address is read as
+/// given, so an IPv4-mapped one matches IPv6 networks only; `to_canonical` first matches it as
+/// the IPv4 address it holds.
+pub fn longest_match<v>(table: Map<Prefix, v>, a: Ip) -> Option<{ prefix: Prefix, value: v }> =
+  matched_from(table, a, bit_width(a))
+
+fn matched_from<v>(
+  table: Map<Prefix, v>,
+  a: Ip,
+  length: Int,
+) -> Option<{ prefix: Prefix, value: v }> =
+  if length < 0 { None } else {
+    match map_get(table, masked(a, length)) {
+      Some(value) -> Some({ prefix: masked(a, length), value: value }),
+      None -> matched_from(table, a, length - 1),
+    }
+  }
+
+// --- Generators -------------------------------------------------------------
+
+/// Any IPv4 address: one drawn evenly, one inside a block the registries name, or one at or
+/// beside a block's first or last address, where a classifier's answer changes.
+pub fn arbitrary_v4() -> Gen<Ipv4> / {abort.raise} =
+  gen::one_of([
+    gen::map(gen::below(0x1_0000_0000), |n: Int| Ipv4(n)),
+    gen::map(near(landmarks(32)), |a: Ip| match a { V4(four) -> four, V6(_) -> Ipv4(0) }),
+  ])
+
+/// Any IPv6 address: one of mostly zero groups, an IPv4-mapped one, one inside a block the
+/// registries name, or one at or beside a block's first or last address.
+pub fn arbitrary_v6() -> Gen<Ipv6> / {abort.raise} =
+  gen::one_of([
+    gen::map(gen::list_of_length(sparse_group(), 8), |gs: List<Int>| Ipv6(joined(gs))),
+    gen::map(arbitrary_v4(), to_ipv6_mapped),
+    gen::map(near(landmarks(128)), |a: Ip| match a { V6(six) -> six, V4(_) -> Ipv6(0u128) }),
+  ])
+
+/// Any address of either family.
+pub fn arbitrary() -> Gen<Ip> / {abort.raise} =
+  gen::one_of([
+    gen::map(arbitrary_v4(), |a: Ipv4| V4(a)),
+    gen::map(arbitrary_v6(), |a: Ipv6| V6(a)),
+  ])
+
+/// Any network: the one of any length that holds any address.
+pub fn arbitrary_prefix() -> Gen<Prefix> / {abort.raise} =
+  gen::and_then(arbitrary(), |a: Ip|
+    gen::map(gen::int_between(0, bit_width(a)), |length: Int| masked(a, length)))
+
+/// Any socket address: any address at any port, an IPv6 one in a zone one time in four.
+pub fn arbitrary_socket() -> Gen<SocketAddress> / {abort.raise} =
+  gen::and_then(arbitrary(), |a: Ip|
+    gen::map2(gen::int_between(0, 65535), gen::below(4), |port: Int, zoned: Int|
+      SocketAddress(a, port, match a {
+        V6(_) -> if zoned == 0 { Some("eth0") } else { None },
+        V4(_) -> None,
+      })))
+
+/// A group that is zero two times in three, so runs of zeros are common.
+fn sparse_group() -> Gen<Int> =
+  gen::map2(gen::below(3), gen::below(0x1_0000), |kind: Int, g: Int| if kind == 0 { g } else { 0 })
+
+/// The blocks of `width` bits a classifier reads.
+fn landmarks(width: Int) -> List<Prefix> / {abort.raise} =
+  filter(
+    concat(
+      map(special_purpose_blocks(), |b: Block| b.prefix),
+      map(unassigned_rows(), |row: (String, String)| block_of(row._0)),
+    ),
+    |p: Prefix| bit_width(network(p)) == width,
+  )
+
+/// An address in one of `blocks`, or at most two from a block's first or last address.
+fn near(blocks: List<Prefix>) -> Gen<Ip> =
+  gen::and_then(gen::below(3), |kind: Int|
+    if kind == 0 {
+      gen::map2(gen::elements(blocks), wide_bits(), |p: Prefix, v: U128|
+        of_wide(network(p), wide(network(p)) | v & host_mask(network(p), bits(p))))
+    } else {
+      gen::map2(gen::elements(blocks), gen::int_between(-2, 2), |p: Prefix, by: Int|
+        beside(if kind == 1 { network(p) } else { last(p) }, by))
+    })
+
+fn beside(a: Ip, by: Int) -> Ip = match offset(a, by) { Some(moved) -> moved, None -> a }
+
+fn wide_bits() -> Gen<U128> = gen::map(gen::list_of_length(gen::below(0x1_0000), 8), joined)
+
+// --- Tests ------------------------------------------------------------------
+
+fn v4(text: String) -> Ipv4 / {abort.raise} =
+  match parse_v4(text) { Ok(a) -> a, Err(_) -> panic("not an IPv4 address: " ++ text) }
+
+fn v6(text: String) -> Ipv6 / {abort.raise} =
+  match parse_v6(text) { Ok(a) -> a, Err(_) -> panic("not an IPv6 address: " ++ text) }
+
+fn addr(text: String) -> Ip / {abort.raise} =
+  match parse(text) { Ok(a) -> a, Err(_) -> panic("not an address: " ++ text) }
+
+fn cidr(text: String) -> Prefix / {abort.raise} = block_of(text)
+
+law "an IPv4 address reads back from its text" =
+  round_trip(render_v4, |text: String| result_ok(parse_v4(text)))
+
+law "an IPv6 address reads back from its text" =
+  round_trip(render_v6, |text: String| result_ok(parse_v6(text)))
+
+law "an address reads back from its text" =
+  round_trip(render, |text: String| result_ok(parse(text)))
+
+law "a network reads back from its text" =
+  round_trip(render_prefix, |text: String| result_ok(parse_prefix(text)))
+
+law "a socket address reads back from its text" =
+  round_trip(render_socket, |text: String| result_ok(parse_socket(text)))
+
+test "a socket address is written `{c.text}`" for c: { text: String, address: String, port: Int, zone: Option<String> } in [
+    { text: "192.0.2.1:80", address: "192.0.2.1", port: 80, zone: None },
+    { text: "0.0.0.0:0", address: "0.0.0.0", port: 0, zone: None },
+    { text: "[::1]:65535", address: "::1", port: 65535, zone: None },
+    { text: "[fe80::1%eth0]:443", address: "fe80::1", port: 443, zone: Some("eth0") },
+    { text: "[::ffff:192.0.2.1]:8080", address: "::ffff:192.0.2.1", port: 8080, zone: None },
+  ] {
+  let read = match parse_socket(c.text) {
+    Ok(a) -> a,
+    Err(_) -> panic("not a socket address: " ++ c.text),
+  };
+  assert_eq(render(socket_ip(read)), c.address);
+  assert_eq(socket_port(read), c.port);
+  assert_eq(socket_zone(read), c.zone);
+  assert_eq(render_socket(read), c.text);
+  assert_eq(show(read), c.text)
+}
+
+test "`{c.text}` is no socket address" for c: { text: String, at: Int, why: Why } in [
+    { text: "", at: 0, why: Empty },
+    { text: "192.0.2.1", at: 9, why: NoPort },
+    { text: "192.0.2.1:", at: 10, why: NoPort },
+    { text: "192.0.2.1:080", at: 10, why: LeadingZero },
+    { text: "192.0.2.1:65536", at: 10, why: PortRange },
+    { text: "192.0.2.1:80 ", at: 12, why: Stray },
+    { text: "192.0.2.1:http", at: 10, why: Stray },
+    { text: "::1:80", at: 0, why: NoBracket },
+    { text: "[::1", at: 4, why: NoBracket },
+    { text: "[::1]", at: 5, why: NoPort },
+    { text: "[::1]80", at: 5, why: NoPort },
+    { text: "[192.0.2.1]:80", at: 10, why: FewGroups },
+    { text: "[fe80::1%]:80", at: 9, why: NoZone },
+    { text: "[::g]:80", at: 3, why: NoGroup },
+  ] { assert_eq(parse_socket(c.text), Err({ at: c.at, why: c.why })) }
+
+test "a socket address keeps a port in range and a zone only on an IPv6 address" {
+  assert_eq(socket_address(addr("192.0.2.1"), 65536), None);
+  assert_eq(socket_address(addr("192.0.2.1"), -1), None);
+  let four = match socket_address(addr("192.0.2.1"), 80) {
+    Some(a) -> a,
+    None -> panic("in range"),
+  };
+  let six = match socket_address(addr("fe80::1"), 80) { Some(a) -> a, None -> panic("in range") };
+  assert_eq(in_zone(four, "eth0"), None);
+  assert_eq(in_zone(six, ""), None);
+  assert_eq(in_zone(six, "eth 0"), None);
+  assert_eq(
+    match in_zone(six, "eth0") { Some(a) -> render_socket(a), None -> "" },
+    "[fe80::1%eth0]:80",
+  )
+}
+
+test "socket addresses order by address, then port, then zone" {
+  let sorted = sort(
+    map(["[::1]:1", "10.0.0.2:1", "10.0.0.1:9", "10.0.0.1:2"], |t: String|
+      match parse_socket(t) { Ok(a) -> a, Err(_) -> panic(t) }),
+  );
+  assert_eq(map(sorted, render_socket), ["10.0.0.1:2", "10.0.0.1:9", "10.0.0.2:1", "[::1]:1"])
+}
+
+law "an IPv4 address is the one its four octets make" = round_trip(v4_to_bytes, v4_of_bytes)
+
+law "an IPv6 address is the one its sixteen octets make" = round_trip(v6_to_bytes, v6_of_bytes)
+
+law "an address is the one its octets make" = round_trip(to_bytes, of_bytes)
+
+law "an IPv4 address is the one its number makes" = round_trip(v4_to_int, v4_of_int)
+
+law "an IPv6 address is the one its groups make" = round_trip(groups, ipv6)
+
+law "an IPv4 address is the one its mapped address holds" =
+  round_trip(to_ipv6_mapped, to_ipv4_mapped)
+
+law "the canonical address of a canonical address is itself" = idempotent(to_canonical)
+
+law "addresses are in a total order" = total_order(|a: Ip, b: Ip| compare(a, b))
+
+law "networks are in a total order" = total_order(|p: Prefix, q: Prefix| compare(p, q))
+
+law "addresses order as numbers within a family, and IPv4 before IPv6"
+  forall (a: Ipv4, b: Ipv4, c: Ipv6, d: Ipv6) {
+    compare(V4(a), V4(b)) == compare(v4_to_int(a), v4_to_int(b))
+      && compare(V6(c), V6(d)) == compare(v6_to_u128(c), v6_to_u128(d))
+      && compare(V4(a), V6(c)) == Less
+  }
+
+law "an IPv6 address reads from its eight groups written in full and in upper case"
+  forall (a: Ipv6) {
+    parse_v6(join(map(groups(a), full_upper), ":")) == Ok(a)
+  }
+
+fn full_upper(g: Int) -> String / {abort.raise} =
+  fold([12, 8, 4, 0], "", |acc: String, shift: Int|
+    acc ++ string_slice("0123456789ABCDEF", g >> shift & 15, (g >> shift & 15) + 1))
+
+law "a canonical IPv6 text is lower case, holds one `::` at most, and no group it could shorten"
+  forall (a: Ipv6) where to_ipv4_mapped(a) == None {
+    let text = render_v6(a);
+    len(string_split(text, "::")) <= 2 && !any(string_chars(text), |c: Char| c >= 'A' && c <= 'F')
+      && all(string_split(text, ":"), |g: String| string_len(g) <= 1 || !string_starts_with(g, "0"))
+      && (string_contains(text, "::") || !string_contains(":" ++ text ++ ":", ":0:0:"))
+  }
+
+fn bounded(p: Prefix, a: Ip) -> Bool =
+  bit_width(a) == bit_width(network(p)) && compare(network(p), a) != Greater
+    && compare(a, last(p)) != Greater
+
+law "a network holds exactly the addresses from its first to its last"
+  forall (p: Prefix, a: Ip, n: Int) {
+    contains(p, a) == bounded(p, a)
+      && all([beside(network(p), (n & 7) - 3), beside(last(p), (n & 7) - 3)], |edge: Ip|
+        contains(p, edge) == bounded(p, edge))
+  }
+
+law "a network made strictly is the one that holds its own address"
+  forall (a: Ip, n: Int) {
+    let length = (n & 255) % 131 - 1;
+    match prefix_holding(a, length) {
+      None -> (length < 0 || length > bit_width(a)) && prefix(a, length) == Err(LengthRange),
+      Some(p) ->
+        prefix(network(p), length) == Ok(p) && contains(p, a) && bits(p) == length
+          && prefix(a, length) == Ok(p) == (network(p) == a)
+          && prefix(a, length) == Err(HostBits) == (network(p) != a),
+    }
+  }
+
+law "a network's subnets follow one another from its first address to its last"
+  forall (p: Prefix, n: Int) {
+    let extra = (n & 7) % 6;
+    let parts = subnets(p, bits(p) + extra, 32);
+    if bits(p) + extra > bit_width(network(p)) { parts == [] } else {
+      len(parts) == 1 << extra
+        && fold(range(0, len(parts)), true, |ok: Bool, i: Int|
+          match list_at(parts, i) {
+            None -> false,
+            Some(part) ->
+              ok && covers(p, part) && bits(part) == bits(p) + extra
+                && Some(network(part))
+                == (if i == 0 { Some(network(p)) } else { following(list_at(parts, i - 1)) })
+                && (i < len(parts) - 1 || last(part) == last(p)),
+          })
+    }
+  }
+
+fn following(p: Option<Prefix>) -> Option<Ip> =
+  match p { Some(before) -> offset(last(before), 1), None -> None }
+
+law "a network is one of the two halves of the network one bit shorter"
+  forall (p: Prefix) {
+    match supernet(p) {
+      None -> bits(p) == 0,
+      Some(whole) ->
+        covers(whole, p) && bits(whole) == bits(p) - 1
+          && any(subnets(whole, bits(p), 2), |half: Prefix| half == p),
+    }
+  }
+
+law "a network's size is one more than the distance from its first address to its last, or the greatest Int"
+  forall (p: Prefix) {
+    if host_bits(p) >= 63 { size(p) == 9223372036854775807 }
+    else { offset(network(p), size(p) - 1) == Some(last(p)) && size(p) == 1 << host_bits(p) }
+  }
+
+law "a network's hosts are addresses in it, in order, and never its own address beside others"
+  forall (p: Prefix) {
+    let listed = hosts(p, 8);
+    let spare = bit_width(network(p)) - bits(p);
+    all(listed, |a: Ip| contains(p, a)) && list::is_sorted(listed)
+      && len(listed) == (if spare >= 4 { 8 } else { len(hosts(p, 64)) })
+      && (spare < 2 || !any(hosts(p, 64), |a: Ip| a == network(p)))
+      && (spare < 2 || bit_width(network(p)) == 128 || !any(hosts(p, 64), |a: Ip| a == last(p)))
+  }
+
+law "an address moved and moved back is itself"
+  forall (a: Ip, n: Int) {
+    let by = n % 1000000;
+    match offset(a, by) {
+      None -> true,
+      Some(moved) -> offset(moved, 0 - by) == Some(a) && compare(a, moved) == compare(0, by),
+    }
+  }
+
+fn held(ps: List<Prefix>, a: Ip) -> Bool = any(ps, |p: Prefix| contains(p, a))
+
+law "aggregated networks hold the addresses the networks held, and aggregate no further"
+  forall (ps: List<Prefix>, n: Int) {
+    let by = (n & 7) - 3;
+    let fewer = aggregate(ps);
+    aggregate(fewer) == fewer && len(fewer) <= len(ps) && list::is_sorted(fewer)
+      && all(ps, |p: Prefix|
+        all([beside(network(p), by), beside(last(p), by)], |edge: Ip|
+          held(ps, edge) == held(fewer, edge)))
+      && all(fewer, |p: Prefix| !any(fewer, |q: Prefix| p != q && overlaps(p, q)))
+  }
+
+fn longest_scanned(ps: List<Prefix>, a: Ip) -> Option<Prefix> =
+  fold(ps, None, |best: Option<Prefix>, p: Prefix|
+    if !contains(p, a) { best } else {
+      match best {
+        Some(found) -> if bits(found) >= bits(p) { best } else { Some(p) },
+        None -> Some(p),
+      }
+    })
+
+law "the longest match is the longest network of the table that holds the address"
+  forall (ps: List<Prefix>, a: Ip, n: Int) {
+    let table = fold(ps, map_new(), |m: Map<Prefix, Int>, p: Prefix| map_insert(m, p, bits(p)));
+    let inside = match list_at(ps, (n & 255) % (len(ps) + 1)) { Some(p) -> last(p), None -> a };
+    all([a, inside], |probe: Ip|
+      match longest_match(table, probe) {
+        None -> longest_scanned(ps, probe) == None,
+        Some(found) ->
+          longest_scanned(ps, probe) == Some(found.prefix) && found.value == bits(found.prefix),
+      })
+  }
+
+fn named(a: Ip, names: List<String>) -> Bool / {abort.raise} =
+  any(special_purpose_blocks(), |b: Block|
+    contains(b.prefix, a) && any(names, |name: String| name == b.name))
+
+fn unassigned(a: Ip, name: String) -> Bool / {abort.raise} =
+  any(unassigned_rows(), |row: (String, String)| row._1 == name && contains(block_of(row._0), a))
+
+/// What the registries say of reaching `a`: its smallest special-purpose block's word, or where
+/// it is in none, that it is neither multicast nor reserved.
+fn reachable(a: Ip) -> Bool / {abort.raise} =
+  match special_purpose(a) {
+    Some(block) -> block.global,
+    None -> !unassigned(a, "Multicast") && !unassigned(a, "Reserved by IETF"),
+  }
+
+fn classed_as_named_v4(a: Ipv4) -> Bool / {abort.raise} = {
+  let ip = V4(a);
+  is_unspecified_v4(a) == named(ip, ["\"This host on this network\""])
+    && is_loopback_v4(a) == named(ip, ["Loopback"])
+    && is_private_v4(a) == named(ip, ["Private-Use"])
+    && is_link_local_v4(a) == named(ip, ["Link Local"])
+    && is_multicast_v4(a) == unassigned(ip, "Multicast")
+    && is_documentation_v4(a)
+    == named(ip, [
+      "Documentation (TEST-NET-1)",
+      "Documentation (TEST-NET-2)",
+      "Documentation (TEST-NET-3)",
+    ])
+    && is_shared_v4(a) == named(ip, ["Shared Address Space"])
+    && is_benchmarking_v4(a) == named(ip, ["Benchmarking"])
+    && is_reserved_v4(a) == named(ip, ["Reserved"])
+    && is_global_v4(a) == reachable(ip)
+}
+
+fn classed_as_named_v6(a: Ipv6) -> Bool / {abort.raise} = {
+  let ip = V6(a);
+  is_unspecified_v6(a) == named(ip, ["Unspecified Address"])
+    && is_loopback_v6(a) == named(ip, ["Loopback Address"])
+    && is_private_v6(a) == named(ip, ["Unique-Local"])
+    && is_link_local_v6(a) == named(ip, ["Link-Local Unicast"])
+    && is_multicast_v6(a) == unassigned(ip, "Multicast")
+    && is_documentation_v6(a) == named(ip, ["Documentation"])
+    && !is_shared_v6(a)
+    && is_benchmarking_v6(a) == named(ip, ["Benchmarking"])
+    && is_reserved_v6(a) == (unassigned(ip, "Reserved by IETF") && special_purpose(ip) == None)
+    && is_global_v6(a) == reachable(ip)
+}
+
+law "an IPv4 address is classed as the registry's blocks that hold it are named"
+  forall (a: Ipv4) {
+    classed_as_named_v4(a)
+  }
+
+law "an IPv6 address that is not IPv4-mapped is classed as the registries' blocks that hold it are named"
+  forall (a: Ipv6) where to_ipv4_mapped(a) == None {
+    classed_as_named_v6(a)
+  }
+
+test "at each end of every block the registries name, and beside it, an address is classed as the blocks that hold it are named" {
+  let ends = list::flat_map(concat(landmarks(32), landmarks(128)), |p: Prefix|
+    list::flat_map([network(p), last(p)], |end: Ip| map(range(-2, 3), |by: Int| beside(end, by))));
+  let astray = filter(ends, |a: Ip|
+    match a {
+      V4(four) -> !classed_as_named_v4(four),
+      V6(six) -> to_ipv4_mapped(six) == None && !classed_as_named_v6(six),
+    });
+  assert(len(ends) > 600);
+  assert_eq(map(astray, render), [])
+}
+
+law "an IPv4-mapped address is classed as the IPv4 address it holds"
+  forall (a: Ipv4) {
+    let mapped = to_ipv6_mapped(a);
+    is_unspecified_v6(mapped) == is_unspecified_v4(a) && is_loopback_v6(mapped) == is_loopback_v4(a)
+      && is_private_v6(mapped) == is_private_v4(a)
+      && is_link_local_v6(mapped) == is_link_local_v4(a)
+      && is_multicast_v6(mapped) == is_multicast_v4(a)
+      && is_documentation_v6(mapped) == is_documentation_v4(a)
+      && is_shared_v6(mapped) == is_shared_v4(a)
+      && is_benchmarking_v6(mapped) == is_benchmarking_v4(a)
+      && is_reserved_v6(mapped) == is_reserved_v4(a)
+      && is_global_v6(mapped) == is_global_v4(a)
+  }
+
+law "an address of either family is classed as its canonical address is in its own"
+  forall (a: Ip) {
+    let plain = match to_canonical(a) {
+      V4(four) ->
+        [
+          is_unspecified_v4(four),
+          is_loopback_v4(four),
+          is_private_v4(four),
+          is_link_local_v4(four),
+          is_multicast_v4(four),
+          is_documentation_v4(four),
+          is_shared_v4(four),
+          is_benchmarking_v4(four),
+          is_reserved_v4(four),
+          is_global_v4(four),
+        ],
+      V6(six) ->
+        [
+          is_unspecified_v6(six),
+          is_loopback_v6(six),
+          is_private_v6(six),
+          is_link_local_v6(six),
+          is_multicast_v6(six),
+          is_documentation_v6(six),
+          is_shared_v6(six),
+          is_benchmarking_v6(six),
+          is_reserved_v6(six),
+          is_global_v6(six),
+        ],
+    };
+    plain
+      == [
+        is_unspecified(a),
+        is_loopback(a),
+        is_private(a),
+        is_link_local(a),
+        is_multicast(a),
+        is_documentation(a),
+        is_shared(a),
+        is_benchmarking(a),
+        is_reserved(a),
+        is_global(a),
+      ]
+  }
+
+type Written = { text: String, canonical: String }
+
+fn same(texts: List<String>, canonical: String) -> List<Written> =
+  map(texts, |text: String| { text: text, canonical: canonical })
+
+/// RFC 5952 §1, §2 and §4, and RFC 4291 §2.2: each way the RFCs write an address, and the one
+/// way RFC 5952 has it written.
+fn rfc_written() -> List<Written> =
+  list::flatten([
+    same(
+      [
+        "2001:db8:0:0:1:0:0:1",
+        "2001:0db8:0:0:1:0:0:1",
+        "2001:db8::1:0:0:1",
+        "2001:db8::0:1:0:0:1",
+        "2001:0db8::1:0:0:1",
+        "2001:db8:0:0:1::1",
+        "2001:db8:0000:0:1::1",
+        "2001:DB8:0:0:1::1",
+      ],
+      "2001:db8::1:0:0:1",
+    ),
+    same(
+      [
+        "2001:db8:aaaa:bbbb:cccc:dddd:eeee:0001",
+        "2001:db8:aaaa:bbbb:cccc:dddd:eeee:001",
+        "2001:db8:aaaa:bbbb:cccc:dddd:eeee:01",
+        "2001:db8:aaaa:bbbb:cccc:dddd:eeee:1",
+      ],
+      "2001:db8:aaaa:bbbb:cccc:dddd:eeee:1",
+    ),
+    same(
+      ["2001:db8:aaaa:bbbb:cccc:dddd::1", "2001:db8:aaaa:bbbb:cccc:dddd:0:1"],
+      "2001:db8:aaaa:bbbb:cccc:dddd:0:1",
+    ),
+    same(
+      ["2001:db8:0:0:0::1", "2001:db8:0:0::1", "2001:db8:0::1", "2001:db8::1", "2001:0db8::0001"],
+      "2001:db8::1",
+    ),
+    same(["2001:db8::aaaa:0:0:1", "2001:db8:0:0:aaaa::1"], "2001:db8::aaaa:0:0:1"),
+    same(
+      [
+        "2001:db8:aaaa:bbbb:cccc:dddd:eeee:aaaa",
+        "2001:db8:aaaa:bbbb:cccc:dddd:eeee:AAAA",
+        "2001:db8:aaaa:bbbb:cccc:dddd:eeee:AaAa",
+      ],
+      "2001:db8:aaaa:bbbb:cccc:dddd:eeee:aaaa",
+    ),
+    same(["2001:db8:0:0:0:0:2:1", "2001:db8::2:1"], "2001:db8::2:1"),
+    same(["2001:db8:0:1:1:1:1:1", "2001:db8::1:1:1:1:1"], "2001:db8:0:1:1:1:1:1"),
+    same(["2001:0:0:1:0:0:0:1", "2001:0:0:1::1"], "2001:0:0:1::1"),
+    same(
+      ["::ffff:192.0.2.1", "0:0:0:0:0:ffff:192.0.2.1", "::ffff:c000:201", "::FFFF:192.0.2.1"],
+      "::ffff:192.0.2.1",
+    ),
+    same(["ABCD:EF01:2345:6789:ABCD:EF01:2345:6789"], "abcd:ef01:2345:6789:abcd:ef01:2345:6789"),
+    same(
+      ["2001:DB8:0:0:8:800:200C:417A", "2001:DB8::8:800:200C:417A"],
+      "2001:db8::8:800:200c:417a",
+    ),
+    same(["FF01:0:0:0:0:0:0:101", "FF01::101"], "ff01::101"),
+    same(["0:0:0:0:0:0:0:1", "::1"], "::1"),
+    same(["0:0:0:0:0:0:0:0", "::"], "::"),
+    same(["0:0:0:0:0:0:13.1.68.3", "::13.1.68.3"], "::d01:4403"),
+    same(["0:0:0:0:0:FFFF:129.144.52.38", "::FFFF:129.144.52.38"], "::ffff:129.144.52.38"),
+    same(["1:2:3:4:5:6:7::", "1:2:3:4:5:6:7:0"], "1:2:3:4:5:6:7:0"),
+    same(["::2:3:4:5:6:7:8", "0:2:3:4:5:6:7:8"], "0:2:3:4:5:6:7:8"),
+    same(["1::", "1:0:0:0:0:0:0:0"], "1::"),
+    same(["0:0:1::", "::1:0:0:0:0:0"], "0:0:1::"),
+    same(["64:ff9b::192.0.2.33"], "64:ff9b::c000:221"),
+  ])
+
+test "`{c.text}` is written `{c.canonical}`" for c: Written in rfc_written() {
+  assert_eq(render_v6(v6(c.text)), c.canonical);
+  assert_eq(parse(c.text), Ok(V6(v6(c.canonical))))
+}
+
+type Refused = { text: String, at: Int, why: Why }
+
+fn refused_v4() -> List<Refused> =
+  [
+    { text: "", at: 0, why: Empty },
+    { text: "010.1.1.1", at: 0, why: LeadingZero },
+    { text: "0177.0.0.1", at: 0, why: LeadingZero },
+    { text: "127.0.0.01", at: 8, why: LeadingZero },
+    { text: "00.0.0.0", at: 0, why: LeadingZero },
+    { text: "1.1", at: 3, why: FewOctets },
+    { text: "127.1", at: 5, why: FewOctets },
+    { text: "127", at: 3, why: FewOctets },
+    { text: "1.2.3", at: 5, why: FewOctets },
+    { text: "2130706433", at: 0, why: OctetRange },
+    { text: "256.0.0.1", at: 0, why: OctetRange },
+    { text: "1.2.3.999", at: 6, why: OctetRange },
+    { text: "0x7f.0.0.1", at: 1, why: Stray },
+    { text: "0x7f000001", at: 1, why: Stray },
+    { text: "1.2.3.4.5", at: 7, why: ManyOctets },
+    { text: "1.2.3.4.", at: 7, why: ManyOctets },
+    { text: "1.2.3.", at: 6, why: NoOctet },
+    { text: "1..2.3", at: 2, why: NoOctet },
+    { text: ".1.2.3", at: 0, why: NoOctet },
+    { text: " 1.2.3.4", at: 0, why: NoOctet },
+    { text: "+1.2.3.4", at: 0, why: NoOctet },
+    { text: "-1.2.3.4", at: 0, why: NoOctet },
+    { text: "a.b.c.d", at: 0, why: NoOctet },
+    { text: "localhost", at: 0, why: NoOctet },
+    { text: "\u{FF11}.2.3.4", at: 0, why: NoOctet },
+    { text: "1.2.3.4 ", at: 7, why: Stray },
+    { text: "1.2.3.4\n", at: 7, why: Stray },
+    { text: "1.2.3.4/8", at: 7, why: Stray },
+    { text: "1.2.3.4%eth0", at: 7, why: Stray },
+    { text: "1.2.3.4e0", at: 7, why: Stray },
+    { text: "1.2.3.\u{0664}", at: 6, why: NoOctet },
+  ]
+
+fn refused_v6() -> List<Refused> =
+  [
+    { text: ":", at: 0, why: LoneColon },
+    { text: ":::", at: 2, why: LoneColon },
+    { text: ":1:2:3:4:5:6:7", at: 0, why: LoneColon },
+    { text: "1:2:3:4:5:6:7:", at: 13, why: LoneColon },
+    { text: "1:2:3:4:5:6:7:8:", at: 15, why: LoneColon },
+    { text: "1::2::3", at: 4, why: SecondCompression },
+    { text: "::1::", at: 3, why: SecondCompression },
+    { text: "1:2:3:4:5:6:7", at: 13, why: FewGroups },
+    { text: "1:2:3:4:5:6:7:8:9", at: 16, why: ManyGroups },
+    { text: "1:2:3:4:5:6:7:8::", at: 17, why: ManyGroups },
+    { text: "::1:2:3:4:5:6:7:8", at: 17, why: ManyGroups },
+    { text: "1:2:3:4::5:6:7:8", at: 16, why: ManyGroups },
+    { text: "1:2:3:4:5:6:7:1.2.3.4", at: 14, why: ManyGroups },
+    { text: "12345::", at: 0, why: LongGroup },
+    { text: "::00001", at: 2, why: LongGroup },
+    { text: "::g", at: 2, why: NoGroup },
+    { text: "[::1]", at: 0, why: NoGroup },
+    { text: " ::1", at: 0, why: NoGroup },
+    { text: "::1 ", at: 3, why: Stray },
+    { text: "::1/128", at: 3, why: Stray },
+    { text: "::1%eth0", at: 3, why: Zone },
+    { text: "fe80::1%", at: 7, why: Zone },
+    { text: "fe80::%1", at: 6, why: Zone },
+    { text: "fe80:%eth0", at: 4, why: LoneColon },
+    { text: "1:2:3:4:5:1.2.3.4", at: 17, why: FewGroups },
+    { text: "1.2.3.4::", at: 7, why: Stray },
+    { text: "::1.2.3.4:5", at: 9, why: Stray },
+    { text: "::ffff:1.2.3", at: 12, why: FewOctets },
+    { text: "::ffff:01.2.3.4", at: 7, why: LeadingZero },
+    { text: "::ffff:1.2.3.256", at: 13, why: OctetRange },
+    { text: "::ffff:0x7f.0.0.1", at: 8, why: Stray },
+    { text: "::a.1.2.3", at: 2, why: NoOctet },
+    { text: "::1.2.3.4.5", at: 9, why: ManyOctets },
+  ]
+
+fn visible(text: String) -> String / {abort.raise} = replace(text, "\n", "\\n")
+
+test "`{visible(c.text)}` is no IPv4 address" for c: Refused in refused_v4() {
+  assert_eq(parse_v4(c.text), Err({ at: c.at, why: c.why }));
+  assert_eq(parse(c.text), Err({ at: c.at, why: c.why }))
+}
+
+test "`{c.text}` is no IPv6 address" for c: Refused in refused_v6() {
+  assert_eq(parse_v6(c.text), Err({ at: c.at, why: c.why }));
+  assert_eq(parse(c.text), Err({ at: c.at, why: c.why }))
+}
+
+test "an empty text is no address of either family" {
+  assert_eq(parse_v6(""), Err({ at: 0, why: Empty }));
+  assert_eq(parse_prefix(""), Err({ at: 0, why: Empty }));
+  assert_eq(parse_v6("1.2.3.4"), Err({ at: 7, why: FewGroups }));
+  assert_eq(parse_v6("1"), Err({ at: 1, why: FewGroups }));
+  assert_eq(parse_v4("::1"), Err({ at: 0, why: NoOctet }))
+}
+
+test "dotted decimal is four octets, each read as the number it writes" {
+  assert_eq(parse_v4("192.0.2.1"), Ok(Ipv4(0xC000_0201)));
+  assert_eq(parse_v4("0.0.0.0"), Ok(Ipv4(0)));
+  assert_eq(parse_v4("255.255.255.255"), Ok(Ipv4(0xFFFF_FFFF)));
+  assert_eq(ipv4(192, 0, 2, 1), Some(v4("192.0.2.1")));
+  assert_eq(ipv4(192, 0, 2, 256), None);
+  assert_eq(ipv4(-1, 0, 2, 1), None);
+  assert_eq(octets(v4("203.0.113.9")), [203, 0, 113, 9]);
+  assert_eq(v4_of_int(-1), None);
+  assert_eq(v4_of_int(0x1_0000_0000), None);
+  assert_eq(render_v4(v4("10.20.30.40")), "10.20.30.40")
+}
+
+test "an address is shown as its canonical text" {
+  assert_eq(show(v4("192.0.2.1")), "192.0.2.1");
+  assert_eq(show(addr("2001:DB8::0:1")), "2001:db8::1");
+  assert_eq(show(cidr("10.0.0.0/8")), "10.0.0.0/8");
+  assert_eq(
+    f"{addr("::FFFF:192.0.2.1")} in {cidr("::ffff:0:0/96")}",
+    "::ffff:192.0.2.1 in ::ffff:0.0.0.0/96",
+  )
+}
+
+test "an IPv6 address is eight groups, and its octets are theirs in network order" {
+  assert_eq(groups(v6("2001:db8::8:800:200c:417a")), [
+    0x2001,
+    0xdb8,
+    0,
+    0,
+    8,
+    0x800,
+    0x200c,
+    0x417a,
+  ]);
+  assert_eq(ipv6([0, 0, 0, 0, 0, 0, 0, 1]), Some(v6("::1")));
+  assert_eq(ipv6([0, 0, 0, 0, 0, 0, 1]), None);
+  assert_eq(ipv6([0, 0, 0, 0, 0, 0, 0, 0x1_0000]), None);
+  assert_eq(
+    v6_to_bytes(v6("2001:db8::1")),
+    b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+  );
+  assert_eq(v4_to_bytes(v4("192.0.2.1")), b"\xc0\x00\x02\x01");
+  assert_eq(of_bytes(b"\xc0\x00\x02\x01"), Some(addr("192.0.2.1")));
+  assert_eq(of_bytes(b"\xc0\x00\x02"), None);
+  assert_eq(v4_of_bytes(b"\xc0\x00\x02\x01\x00"), None);
+  assert_eq(v6_of_bytes(b"\xc0\x00\x02\x01"), None)
+}
+
+test "an IPv4-mapped address and the IPv4 address it holds are two addresses, and one canonical" {
+  let mapped = addr("::ffff:127.0.0.1");
+  assert(mapped != addr("127.0.0.1"));
+  assert_eq(to_canonical(mapped), addr("127.0.0.1"));
+  assert_eq(to_canonical(addr("::1")), addr("::1"));
+  assert_eq(to_ipv4_mapped(v6("::ffff:10.1.2.3")), Some(v4("10.1.2.3")));
+  assert_eq(to_ipv4_mapped(v6("::10.1.2.3")), None);
+  assert_eq(to_ipv4_mapped(v6("64:ff9b::10.1.2.3")), None);
+  assert_eq(render_v6(to_ipv6_mapped(v4("10.1.2.3"))), "::ffff:10.1.2.3");
+  assert(!contains(cidr("127.0.0.0/8"), mapped));
+  assert(contains(cidr("127.0.0.0/8"), to_canonical(mapped)))
+}
+
+test "a zone is read apart from its address, and only where one is asked for" {
+  assert_eq(parse_scoped("fe80::1%eth0"), Ok({ address: v6("fe80::1"), zone: Some("eth0") }));
+  assert_eq(parse_scoped("fe80::1%3"), Ok({ address: v6("fe80::1"), zone: Some("3") }));
+  assert_eq(parse_scoped("fe80::1"), Ok({ address: v6("fe80::1"), zone: None }));
+  assert_eq(parse_scoped("fe80::1%"), Err({ at: 8, why: NoZone }));
+  assert_eq(parse_scoped("fe80::1%eth0/64"), Err({ at: 12, why: Stray }));
+  assert_eq(parse_scoped("fe80::1%25eth0"), Ok({ address: v6("fe80::1"), zone: Some("25eth0") }));
+  assert_eq(parse_scoped("fe80::1%eth 0"), Err({ at: 11, why: Stray }));
+  assert_eq(parse_scoped("fe80::g%eth0"), Err({ at: 6, why: NoGroup }));
+  assert_eq(parse_prefix("fe80::1%eth0/64"), Err({ at: 7, why: Zone }))
+}
+
+type Classed = { text: String, classes: List<String> }
+
+/// Addresses and every class each is in, from the registries' rows and their edges.
+fn classed_cases() -> List<Classed> =
+  [
+    { text: "0.0.0.0", classes: ["unspecified"] },
+    { text: "0.1.2.3", classes: [] },
+    { text: "1.1.1.1", classes: ["global"] },
+    { text: "9.255.255.255", classes: ["global"] },
+    { text: "10.0.0.0", classes: ["private"] },
+    { text: "10.255.255.255", classes: ["private"] },
+    { text: "11.0.0.0", classes: ["global"] },
+    { text: "100.63.255.255", classes: ["global"] },
+    { text: "100.64.0.0", classes: ["shared"] },
+    { text: "100.127.255.255", classes: ["shared"] },
+    { text: "100.128.0.0", classes: ["global"] },
+    { text: "127.0.0.1", classes: ["loopback"] },
+    { text: "127.255.255.255", classes: ["loopback"] },
+    { text: "128.0.0.0", classes: ["global"] },
+    { text: "169.254.0.1", classes: ["link-local"] },
+    { text: "169.255.0.0", classes: ["global"] },
+    { text: "172.15.255.255", classes: ["global"] },
+    { text: "172.16.0.0", classes: ["private"] },
+    { text: "172.31.255.255", classes: ["private"] },
+    { text: "172.32.0.0", classes: ["global"] },
+    { text: "192.0.0.1", classes: [] },
+    { text: "192.0.0.8", classes: [] },
+    { text: "192.0.0.9", classes: ["global"] },
+    { text: "192.0.0.10", classes: ["global"] },
+    { text: "192.0.0.11", classes: [] },
+    { text: "192.0.0.170", classes: [] },
+    { text: "192.0.1.0", classes: ["global"] },
+    { text: "192.0.2.1", classes: ["documentation"] },
+    { text: "192.31.196.1", classes: ["global"] },
+    { text: "192.52.193.1", classes: ["global"] },
+    { text: "192.88.99.1", classes: [] },
+    { text: "192.88.99.2", classes: [] },
+    { text: "192.168.0.1", classes: ["private"] },
+    { text: "192.169.0.0", classes: ["global"] },
+    { text: "192.175.48.1", classes: ["global"] },
+    { text: "198.17.255.255", classes: ["global"] },
+    { text: "198.18.0.0", classes: ["benchmarking"] },
+    { text: "198.19.255.255", classes: ["benchmarking"] },
+    { text: "198.20.0.0", classes: ["global"] },
+    { text: "198.51.100.7", classes: ["documentation"] },
+    { text: "203.0.113.7", classes: ["documentation"] },
+    { text: "223.255.255.255", classes: ["global"] },
+    { text: "224.0.0.1", classes: ["multicast"] },
+    { text: "239.255.255.255", classes: ["multicast"] },
+    { text: "240.0.0.0", classes: ["reserved"] },
+    { text: "255.255.255.255", classes: ["reserved"] },
+    { text: "::", classes: ["unspecified"] },
+    { text: "::1", classes: ["loopback"] },
+    { text: "::2", classes: ["reserved"] },
+    { text: "::ffff:0.0.0.0", classes: ["unspecified"] },
+    { text: "::ffff:127.0.0.1", classes: ["loopback"] },
+    { text: "::ffff:10.0.0.1", classes: ["private"] },
+    { text: "::ffff:169.254.169.254", classes: ["link-local"] },
+    { text: "::ffff:100.64.0.1", classes: ["shared"] },
+    { text: "::ffff:224.0.0.1", classes: ["multicast"] },
+    { text: "::ffff:192.0.2.1", classes: ["documentation"] },
+    { text: "::ffff:198.18.0.1", classes: ["benchmarking"] },
+    { text: "::ffff:240.0.0.1", classes: ["reserved"] },
+    { text: "::ffff:8.8.8.8", classes: ["global"] },
+    { text: "::127.0.0.1", classes: ["reserved"] },
+    { text: "64:ff9b::7f00:1", classes: ["global"] },
+    { text: "64:ff9b:1::1", classes: [] },
+    { text: "64:ff9b:2::1", classes: ["reserved"] },
+    { text: "100::1", classes: [] },
+    { text: "100:0:0:1::1", classes: [] },
+    { text: "100:0:0:2::1", classes: ["reserved"] },
+    { text: "2001::1", classes: [] },
+    { text: "2001:1::1", classes: ["global"] },
+    { text: "2001:1::2", classes: ["global"] },
+    { text: "2001:1::3", classes: ["global"] },
+    { text: "2001:1::4", classes: [] },
+    { text: "2001:2::1", classes: ["benchmarking"] },
+    { text: "2001:2:1::1", classes: [] },
+    { text: "2001:3::1", classes: ["global"] },
+    { text: "2001:4:112::1", classes: ["global"] },
+    { text: "2001:10::1", classes: [] },
+    { text: "2001:20::1", classes: ["global"] },
+    { text: "2001:30::1", classes: ["global"] },
+    { text: "2001:40::1", classes: [] },
+    { text: "2001:1ff:ffff::1", classes: [] },
+    { text: "2001:200::1", classes: ["global"] },
+    { text: "2001:db8::1", classes: ["documentation"] },
+    { text: "2001:db9::1", classes: ["global"] },
+    { text: "2002:7f00:1::", classes: [] },
+    { text: "2606:4700:4700::1111", classes: ["global"] },
+    { text: "2620:4f:8000::1", classes: ["global"] },
+    { text: "3fff:fff:ffff::1", classes: ["documentation"] },
+    { text: "3fff:1000::1", classes: ["global"] },
+    { text: "4000::1", classes: ["reserved"] },
+    { text: "5f00::1", classes: [] },
+    { text: "fbff::1", classes: ["reserved"] },
+    { text: "fc00::1", classes: ["private"] },
+    { text: "fdff:ffff::1", classes: ["private"] },
+    { text: "fe00::1", classes: ["reserved"] },
+    { text: "fe80::1", classes: ["link-local"] },
+    { text: "febf::1", classes: ["link-local"] },
+    { text: "fec0::1", classes: ["reserved"] },
+    { text: "ff02::1", classes: ["multicast"] },
+    { text: "ff0e::1", classes: ["multicast"] },
+  ]
+
+fn classes_of(a: Ip) -> List<String> =
+  map(
+    filter(
+      [
+        ("unspecified", is_unspecified(a)),
+        ("loopback", is_loopback(a)),
+        ("private", is_private(a)),
+        ("link-local", is_link_local(a)),
+        ("multicast", is_multicast(a)),
+        ("documentation", is_documentation(a)),
+        ("shared", is_shared(a)),
+        ("benchmarking", is_benchmarking(a)),
+        ("reserved", is_reserved(a)),
+        ("global", is_global(a)),
+      ],
+      |class: (String, Bool)| class._1,
+    ),
+    |class: (String, Bool)| class._0,
+  )
+
+test "{c.text} is {c.classes}" for c: Classed in classed_cases() {
+  assert_eq(classes_of(addr(c.text)), c.classes)
+}
+
+test "the registry's row for an address is its smallest block" {
+  let name = |text: String| match special_purpose(addr(text)) { Some(b) -> b.name, None -> "" };
+  assert_eq(name("192.0.0.9"), "Port Control Protocol Anycast");
+  assert_eq(name("192.0.0.1"), "IPv4 Service Continuity Prefix");
+  assert_eq(name("192.0.0.99"), "IETF Protocol Assignments");
+  assert_eq(name("0.0.0.0"), "\"This host on this network\"");
+  assert_eq(name("255.255.255.255"), "Limited Broadcast");
+  assert_eq(name("2001::1"), "TEREDO");
+  assert_eq(name("2001:1::1"), "Port Control Protocol Anycast");
+  assert_eq(name("::ffff:127.0.0.1"), "IPv4-mapped Address");
+  assert_eq(name("127.0.0.1"), "Loopback");
+  assert_eq(special_purpose(addr("8.8.8.8")), None);
+  assert_eq(len(special_purpose_blocks()), 51)
+}
+
+type Network = { text: String, first: String, last: String, mask: String, size: Int }
+
+fn networks() -> List<Network> =
+  [
+    {
+      text: "10.0.0.0/8",
+      first: "10.0.0.0",
+      last: "10.255.255.255",
+      mask: "255.0.0.0",
+      size: 16777216,
+    },
+    {
+      text: "192.0.2.0/24",
+      first: "192.0.2.0",
+      last: "192.0.2.255",
+      mask: "255.255.255.0",
+      size: 256,
+    },
+    {
+      text: "192.0.2.128/25",
+      first: "192.0.2.128",
+      last: "192.0.2.255",
+      mask: "255.255.255.128",
+      size: 128,
+    },
+    {
+      text: "192.0.2.4/31",
+      first: "192.0.2.4",
+      last: "192.0.2.5",
+      mask: "255.255.255.254",
+      size: 2,
+    },
+    {
+      text: "192.0.2.7/32",
+      first: "192.0.2.7",
+      last: "192.0.2.7",
+      mask: "255.255.255.255",
+      size: 1,
+    },
+    {
+      text: "0.0.0.0/0",
+      first: "0.0.0.0",
+      last: "255.255.255.255",
+      mask: "0.0.0.0",
+      size: 4294967296,
+    },
+    {
+      text: "2001:db8::/32",
+      first: "2001:db8::",
+      last: "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff",
+      mask: "ffff:ffff::",
+      size: 9223372036854775807,
+    },
+    {
+      text: "2001:db8:0:cd30::/60",
+      first: "2001:db8:0:cd30::",
+      last: "2001:db8:0:cd3f:ffff:ffff:ffff:ffff",
+      mask: "ffff:ffff:ffff:fff0::",
+      size: 9223372036854775807,
+    },
+    {
+      text: "::1/128",
+      first: "::1",
+      last: "::1",
+      mask: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+      size: 1,
+    },
+    {
+      text: "::/0",
+      first: "::",
+      last: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+      mask: "::",
+      size: 9223372036854775807,
+    },
+    {
+      text: "2001:db8::/65",
+      first: "2001:db8::",
+      last: "2001:db8::7fff:ffff:ffff:ffff",
+      mask: "ffff:ffff:ffff:ffff:8000::",
+      size: 9223372036854775807,
+    },
+    {
+      text: "2001:db8::/66",
+      first: "2001:db8::",
+      last: "2001:db8::3fff:ffff:ffff:ffff",
+      mask: "ffff:ffff:ffff:ffff:c000::",
+      size: 4611686018427387904,
+    },
+  ]
+
+test "{c.text} runs from {c.first} to {c.last}" for c: Network in networks() {
+  let p = cidr(c.text);
+  assert_eq(render(network(p)), c.first);
+  assert_eq(render(last(p)), c.last);
+  assert_eq(render(netmask(p)), c.mask);
+  assert_eq(size(p), c.size);
+  assert_eq(host_bits(p), bit_width(network(p)) - bits(p));
+  assert_eq(render_prefix(p), c.text);
+  assert(contains(p, addr(c.first)) && contains(p, addr(c.last)))
+}
+
+test "a prefix is written with its host bits clear, and an interface with any" {
+  assert_eq(parse_prefix("192.0.2.7/24"), Err({ at: 10, why: HostBits }));
+  assert_eq(parse_prefix("2001:0DB8::CD30/60"), Err({ at: 16, why: HostBits }));
+  assert_eq(parse_prefix("2001:0DB8:0:CD30::/60"), Ok(cidr("2001:db8:0:cd30::/60")));
+  assert_eq(parse_prefix("2001:0DB8::CD30:0:0:0:0/60"), Ok(cidr("2001:db8:0:cd30::/60")));
+  assert_eq(
+    parse_prefix("2001:0DB8:0000:CD30:0000:0000:0000:0000/60"),
+    Ok(cidr("2001:db8:0:cd30::/60")),
+  );
+  assert_eq(parse_prefix("2001:0DB8:0:CD3/60"), Err({ at: 15, why: FewGroups }));
+  assert_eq(
+    parse_interface("2001:0DB8:0:CD30:123:4567:89AB:CDEF/60"),
+    Ok({
+      address: addr("2001:db8:0:cd30:123:4567:89ab:cdef"),
+      network: cidr("2001:db8:0:cd30::/60"),
+    }),
+  );
+  assert_eq(
+    parse_interface("192.0.2.7/24"),
+    Ok({ address: addr("192.0.2.7"), network: cidr("192.0.2.0/24") }),
+  );
+  assert_eq(prefix(addr("192.0.2.7"), 24), Err(HostBits));
+  assert_eq(prefix(addr("192.0.2.0"), 24), Ok(cidr("192.0.2.0/24")));
+  assert_eq(prefix(addr("192.0.2.0"), 33), Err(LengthRange));
+  assert_eq(prefix(addr("::"), 129), Err(LengthRange));
+  assert_eq(prefix(addr("::"), -1), Err(LengthRange));
+  assert_eq(prefix_holding(addr("192.0.2.7"), 24), Some(cidr("192.0.2.0/24")));
+  assert_eq(prefix_holding(addr("192.0.2.7"), 33), None);
+  assert_eq(host_prefix(addr("192.0.2.7")), cidr("192.0.2.7/32"));
+  assert_eq(host_prefix(addr("::1")), cidr("::1/128"))
+}
+
+fn refused_prefixes() -> List<Refused> =
+  [
+    { text: "10.0.0.0", at: 8, why: NoLength },
+    { text: "10.0.0.0/", at: 9, why: NoLength },
+    { text: "10.0.0.0/33", at: 9, why: LengthRange },
+    { text: "10.0.0.0/008", at: 9, why: LeadingZero },
+    { text: "10.0.0.0/08", at: 9, why: LeadingZero },
+    { text: "10.0.0.0/+8", at: 9, why: Stray },
+    { text: "10.0.0.0/-1", at: 9, why: Stray },
+    { text: "10.0.0.0/8 ", at: 10, why: Stray },
+    { text: "10.0.0.0/255.0.0.0", at: 12, why: Stray },
+    { text: "10.0.0.0/8/8", at: 10, why: Stray },
+    { text: "10.0.0/8", at: 6, why: FewOctets },
+    { text: "010.0.0.0/8", at: 0, why: LeadingZero },
+    { text: "::/129", at: 3, why: LengthRange },
+    { text: "::/1000", at: 3, why: LengthRange },
+    { text: "::1/127", at: 4, why: HostBits },
+    { text: "/8", at: 0, why: Empty },
+  ]
+
+test "`{c.text}` is no prefix" for c: Refused in refused_prefixes() {
+  assert_eq(parse_prefix(c.text), Err({ at: c.at, why: c.why }))
+}
+
+test "a network covers what is inside it, and overlaps only what it covers or is covered by" {
+  let ten = cidr("10.0.0.0/8");
+  assert(covers(ten, cidr("10.1.0.0/16")) && !covers(cidr("10.1.0.0/16"), ten));
+  assert(covers(ten, ten));
+  assert(overlaps(cidr("10.1.0.0/16"), ten));
+  assert(!overlaps(cidr("10.1.0.0/16"), cidr("10.2.0.0/16")));
+  assert(!covers(cidr("::/0"), ten) && !overlaps(cidr("0.0.0.0/0"), cidr("::/0")));
+  assert(!contains(cidr("::/0"), addr("10.0.0.1")));
+  assert_eq(supernet(cidr("10.1.0.0/16")), Some(cidr("10.0.0.0/15")));
+  assert_eq(supernet(cidr("0.0.0.0/0")), None);
+  assert_eq(subnets(cidr("192.0.2.0/24"), 26, 8), [
+    cidr("192.0.2.0/26"),
+    cidr("192.0.2.64/26"),
+    cidr("192.0.2.128/26"),
+    cidr("192.0.2.192/26"),
+  ]);
+  assert_eq(subnets(cidr("192.0.2.0/24"), 26, 2), [cidr("192.0.2.0/26"), cidr("192.0.2.64/26")]);
+  assert_eq(subnets(cidr("192.0.2.0/24"), 24, 8), [cidr("192.0.2.0/24")]);
+  assert_eq(subnets(cidr("192.0.2.0/24"), 23, 8), []);
+  assert_eq(subnets(cidr("192.0.2.0/24"), 33, 8), []);
+  assert_eq(subnets(cidr("192.0.2.0/24"), 26, -1), []);
+  assert_eq(subnets(cidr("::/0"), 128, 3), [cidr("::/128"), cidr("::1/128"), cidr("::2/128")]);
+  assert_eq(subnets(cidr("2001:db8::/32"), 33, 9), [
+    cidr("2001:db8::/33"),
+    cidr("2001:db8:8000::/33"),
+  ])
+}
+
+test "a network's hosts leave out what no host has, and its broadcast is an IPv4 network's last" {
+  let texts = |as: List<Ip>| map(as, render);
+  assert_eq(texts(hosts(cidr("192.0.2.0/30"), 9)), ["192.0.2.1", "192.0.2.2"]);
+  assert_eq(texts(hosts(cidr("192.0.2.4/31"), 9)), ["192.0.2.4", "192.0.2.5"]);
+  assert_eq(texts(hosts(cidr("192.0.2.7/32"), 9)), ["192.0.2.7"]);
+  assert_eq(texts(hosts(cidr("192.0.2.0/24"), 3)), ["192.0.2.1", "192.0.2.2", "192.0.2.3"]);
+  assert_eq(len(hosts(cidr("192.0.2.0/24"), 1000)), 254);
+  assert_eq(hosts(cidr("192.0.2.0/24"), 0), []);
+  assert_eq(hosts(cidr("192.0.2.0/24"), -5), []);
+  assert_eq(texts(hosts(cidr("2001:db8::/126"), 9)), ["2001:db8::1", "2001:db8::2", "2001:db8::3"]);
+  assert_eq(texts(hosts(cidr("2001:db8::/127"), 9)), ["2001:db8::", "2001:db8::1"]);
+  assert_eq(texts(hosts(cidr("2001:db8::5/128"), 9)), ["2001:db8::5"]);
+  assert_eq(texts(hosts(cidr("::/0"), 2)), ["::1", "::2"]);
+  assert_eq(broadcast(cidr("192.0.2.0/24")), Some(v4("192.0.2.255")));
+  assert_eq(broadcast(cidr("192.0.2.4/31")), None);
+  assert_eq(broadcast(cidr("192.0.2.7/32")), None);
+  assert_eq(broadcast(cidr("2001:db8::/64")), None);
+  assert_eq(render(hostmask(cidr("192.0.2.0/24"))), "0.0.0.255")
+}
+
+test "an address moves by a count, and nowhere past the ends of its family" {
+  assert_eq(offset(addr("192.0.2.255"), 1), Some(addr("192.0.3.0")));
+  assert_eq(offset(addr("192.0.3.0"), -1), Some(addr("192.0.2.255")));
+  assert_eq(offset(addr("255.255.255.255"), 1), None);
+  assert_eq(offset(addr("0.0.0.0"), -1), None);
+  assert_eq(offset(addr("::"), -1), None);
+  assert_eq(offset(addr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), 1), None);
+  assert_eq(offset(addr("::ffff:ffff:ffff:ffff"), 1), Some(addr("0:0:0:1::")));
+  assert_eq(offset(addr("0.0.0.0"), 0x1_0000_0000), None);
+  assert_eq(
+    offset(addr("8000::"), 0 - 9223372036854775807 - 1),
+    Some(addr("7fff:ffff:ffff:ffff:8000::")),
+  )
+}
+
+test "networks aggregate to the fewest that hold the same addresses" {
+  let texts = |ps: List<Prefix>| map(ps, render_prefix);
+  assert_eq(texts(aggregate([cidr("192.0.2.128/25"), cidr("192.0.2.0/25")])), ["192.0.2.0/24"]);
+  assert_eq(
+    texts(
+      aggregate([
+        cidr("10.0.0.0/24"),
+        cidr("10.0.1.0/24"),
+        cidr("10.0.2.0/24"),
+        cidr("10.0.3.0/24"),
+        cidr("10.0.4.0/24"),
+      ]),
+    ),
+    ["10.0.0.0/22", "10.0.4.0/24"],
+  );
+  assert_eq(
+    texts(
+      aggregate([cidr("10.0.0.0/8"), cidr("10.1.0.0/16"), cidr("10.0.0.0/8"), cidr("::1/128")]),
+    ),
+    ["10.0.0.0/8", "::1/128"],
+  );
+  assert_eq(texts(aggregate([cidr("10.0.1.0/24"), cidr("10.0.2.0/24")])), [
+    "10.0.1.0/24",
+    "10.0.2.0/24",
+  ]);
+  assert_eq(texts(aggregate([cidr("0.0.0.0/1"), cidr("128.0.0.0/1")])), ["0.0.0.0/0"]);
+  assert_eq(texts(aggregate([cidr("::/1"), cidr("8000::/1"), cidr("0.0.0.0/0")])), [
+    "0.0.0.0/0",
+    "::/0",
+  ]);
+  assert_eq(aggregate([]), [])
+}
+
+test "a table answers the longest network that holds an address" {
+  let table: Map<Prefix, String> = map_of_entries([
+    { key: cidr("0.0.0.0/0"), value: "default" },
+    { key: cidr("10.0.0.0/8"), value: "ten" },
+    { key: cidr("10.1.0.0/16"), value: "ten-one" },
+    { key: cidr("10.1.2.3/32"), value: "host" },
+    { key: cidr("2001:db8::/32"), value: "docs" },
+  ]);
+  let route = |text: String|
+    match longest_match(table, addr(text)) { Some(found) -> found.value, None -> "" };
+  assert_eq(route("10.1.2.3"), "host");
+  assert_eq(route("10.1.2.4"), "ten-one");
+  assert_eq(route("10.2.0.1"), "ten");
+  assert_eq(route("192.0.2.1"), "default");
+  assert_eq(route("2001:db8::1"), "docs");
+  assert_eq(route("2001:db9::1"), "");
+  assert_eq(route("::ffff:10.1.2.3"), "");
+  assert_eq(
+    longest_match(table, addr("10.1.9.9")),
+    Some({ prefix: cidr("10.1.0.0/16"), value: "ten-one" }),
+  );
+  assert_eq(
+    map_keys(table),
+    map(["0.0.0.0/0", "10.0.0.0/8", "10.1.0.0/16", "10.1.2.3/32", "2001:db8::/32"], cidr),
+  )
+}
+
+test "addresses and networks sort as numbers, IPv4 first, a network before what is inside it" {
+  assert_eq(
+    map(
+      sort(
+        map(
+          ["::1", "10.0.0.2", "9.255.255.255", "::", "255.255.255.255", "10.0.0.10", "ffff::"],
+          addr,
+        ),
+      ),
+      render,
+    ),
+    ["9.255.255.255", "10.0.0.2", "10.0.0.10", "255.255.255.255", "::", "::1", "ffff::"],
+  );
+  assert_eq(
+    map(
+      sort(
+        map(["10.1.0.0/16", "10.0.0.0/8", "::/0", "10.0.0.0/16", "9.0.0.0/8", "0.0.0.0/0"], cidr),
+      ),
+      render_prefix,
+    ),
+    ["0.0.0.0/0", "9.0.0.0/8", "10.0.0.0/8", "10.0.0.0/16", "10.1.0.0/16", "::/0"],
+  )
+}
+
+test "a literal's check answers the value, or the character that keeps the text from being one" {
+  assert_eq(literal("192.0.2.1"), Ok(addr("192.0.2.1")));
+  assert_eq(literal("2001:DB8::1"), Ok(addr("2001:db8::1")));
+  assert_eq(
+    literal("010.0.0.1"),
+    Err({ message: "a number is written with no leading zero", offset: 0 }),
+  );
+  assert_eq(literal("127.1"), Err({ message: "an IPv4 address is four octets", offset: 5 }));
+  assert_eq(
+    literal("fe80::1%eth0"),
+    Err({ message: "a zone is no part of an address", offset: 7 }),
+  );
+  assert_eq(prefix_literal("10.0.0.0/8"), Ok(cidr("10.0.0.0/8")));
+  assert_eq(
+    prefix_literal("10.0.0.1/8"),
+    Err({ message: "a bit past the prefix length is set", offset: 9 }),
+  )
+}

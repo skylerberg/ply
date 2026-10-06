@@ -10,8 +10,9 @@ use crate::map;
 use crate::stack::{Stack, switch};
 use crate::{array, list};
 use ply_eval::arena::{Owner, RegionId, Slot};
-use ply_eval::builtins::{cell_in_update, no_such_cell};
+use ply_eval::builtins::{cell_in_update, hold_released, no_such_cell};
 use ply_eval::region::StepSite;
+use ply_eval::sched::Shield;
 use ply_eval::sim::Access;
 use ply_eval::{
     BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Plain, Resource, Span,
@@ -1955,6 +1956,18 @@ macro_rules! builtin_helper {
             builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d])
         }
     };
+    ($variant:ident 5) => {
+        pub unsafe extern "C" fn $variant(
+            ctx: *mut Ctx,
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+        ) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d, e])
+        }
+    };
     ($variant:ident 6) => {
         pub unsafe extern "C" fn $variant(
             ctx: *mut Ctx,
@@ -2183,6 +2196,35 @@ fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
     }
 }
 
+/// What a hold holds, as a count of its own. A hold is a cell of its region, and one let go holds
+/// the null word, which no value is.
+fn hold_read(ctx: &Ctx, slot: Slot) -> Result<Word, Diagnostic> {
+    match ctx.cells.arena().get(slot) {
+        Some(held) if held.0 != 0 => {
+            heap::inc(held.0);
+            Ok(held.0)
+        }
+        Some(_) => Err(hold_released(ctx.site(), "read")),
+        None => Err(no_such_cell(ctx.site(), slot)),
+    }
+}
+
+/// A hold's contents moved out for its release, leaving the null word: a second release finds it
+/// and is refused, so nothing is released twice.
+fn hold_take(ctx: &mut Ctx, slot: Slot) -> Result<Word, Diagnostic> {
+    let site = ctx.site();
+    match ctx.cells.arena().get(slot) {
+        Some(held) if held.0 != 0 => {}
+        Some(_) => return Err(hold_released(site, "let go")),
+        None => return Err(no_such_cell(site, slot)),
+    }
+    let Some(current) = ctx.cells.arena_mut().take(slot) else {
+        return Err(no_such_cell(site, slot));
+    };
+    ctx.cells.arena_mut().put_back(slot, HeldWord(0));
+    Ok(current.into_word())
+}
+
 /// The builtins answered over native words; `None` answers the call over values instead.
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
@@ -2204,7 +2246,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*c);
             Some(answer)
         }
-        (Builtin::CellSet, [c, v]) => {
+        (Builtin::CellSet | Builtin::HoldPut, [c, v]) => {
             let slot = cell_of(*c)?;
             let site = ctx.site();
             if ctx.cells.arena().is_taken(slot) {
@@ -2248,6 +2290,24 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*c);
             Some(if ctx.failed != 0 { 0 } else { heap::unit() })
         }
+        (Builtin::HoldGet, [h]) => {
+            let slot = cell_of(*h)?;
+            let answer = match hold_read(ctx, slot) {
+                Ok(w) => w,
+                Err(d) => ctx.fail(d),
+            };
+            heap::dec(*h);
+            Some(answer)
+        }
+        (Builtin::HoldTake, [h]) => {
+            let slot = cell_of(*h)?;
+            let answer = match hold_take(ctx, slot) {
+                Ok(w) => w,
+                Err(d) => ctx.fail(d),
+            };
+            heap::dec(*h);
+            Some(answer)
+        }
         // Only compiled code can enter a closure, so these answer whatever they are given.
         (Builtin::Map, [xs, f]) => Some(unsafe { rt_map(std::ptr::from_mut(ctx), *xs, *f) }),
         (Builtin::Filter, [xs, p]) => Some(unsafe { rt_filter(std::ptr::from_mut(ctx), *xs, *p) }),
@@ -2260,7 +2320,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Iterate, [seed, budget, f]) => {
             Some(unsafe { rt_iterate(std::ptr::from_mut(ctx), *seed, *budget, *f) })
         }
-        (Builtin::Bracket, [acquire, release, body]) => Some(rt_bracket(
+        (Builtin::Bracket | Builtin::HoldBracket, [acquire, release, body]) => Some(rt_bracket(
             std::ptr::from_mut(ctx),
             *acquire,
             *release,
@@ -3412,6 +3472,9 @@ fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]) 
     } else if at.is_some() {
         Diagnostic::error(codes::RUNTIME_ERROR, format!("`{effect}.{op}` was raised"))
     } else {
+        if let Some(runtime) = c.host_runtime() {
+            runtime.unanswered(effect, op);
+        }
         // Only a raise nothing answers is shown what it carried: one a clause takes is not read.
         let carried: Vec<Plain> = args.iter().map(|w| Plain::shown(&c.value(*w))).collect();
         let slots: Vec<String> = (0..carried.len()).map(ply_eval::slot).collect();
@@ -4063,19 +4126,30 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
 /// `release` run on it however `body` ends: by returning, by a raise or a clause that did not
 /// resume it unwinding through, or by a cancel. It runs where the bracket stands, with the
 /// handlers around it, and a failure in it replaces whatever was unwinding. A runtime failure ends
-/// the entry, so nothing more runs then.
+/// the entry, so nothing more runs then. A cancel takes no answer from `acquire` and no wait from
+/// `release`: it lands when that one returns, so what was acquired is released, and wholly.
 fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
+    let entered = crate::simulate::shield(unsafe { &mut *ctx }, Shield::Acquire);
     let held = call_value(ctx, acquire, &[]);
     heap::dec(acquire);
     let c = unsafe { &mut *ctx };
+    let cancelled = crate::simulate::unshield(c, entered);
     if c.failed != 0 {
+        if cancelled {
+            cancel_here(c);
+        }
         heap::dec(release);
         heap::dec(body);
         return 0;
     }
-    heap::inc(held);
     let standing = c.fuel;
-    let answer = call_value(ctx, body, &[held]);
+    let answer = if cancelled {
+        c.failed = FAILED_CANCELLED;
+        0
+    } else {
+        heap::inc(held);
+        call_value(ctx, body, &[held])
+    };
     heap::dec(body);
     let c = unsafe { &mut *ctx };
     // `release` runs as deep as the bracket stands, however deep the body was when it ended.
@@ -4093,10 +4167,12 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     let unwinding = c.unwind.take();
     let raising = c.aborting.take();
     c.failed = 0;
+    let entered = crate::simulate::shield(c, Shield::Release);
     let released = call_value(ctx, release, &[held]);
     heap::dec(release);
     let c = unsafe { &mut *ctx };
-    if c.failed != 0 {
+    let cancelled = crate::simulate::unshield(c, entered);
+    if c.failed != 0 || cancelled {
         if let Some((_, _, carried)) = unwinding {
             heap::dec(carried);
         }
@@ -4104,6 +4180,12 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
             raise.into_failure();
         }
         heap::dec(answer);
+        if c.failed == 0 {
+            heap::dec(released);
+            c.failed = FAILED_CANCELLED;
+        } else if cancelled {
+            cancel_here(c);
+        }
         return 0;
     }
     heap::dec(released);
@@ -4111,6 +4193,21 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     c.unwind = unwinding;
     c.aborting = raising;
     answer
+}
+
+/// A cancel held back until now lands on a task a raise or a clause is unwinding: the task unwinds
+/// as cancelled from here, since a handler that answered the other would let it run on.
+fn cancel_here(c: &mut Ctx) {
+    if c.failed != FAILED_UNWIND && c.failed != FAILED_ABORT {
+        return;
+    }
+    if let Some((_, _, carried)) = c.unwind.take() {
+        heap::dec(carried);
+    }
+    if let Some(raise) = c.aborting.take() {
+        raise.into_failure();
+    }
+    c.failed = FAILED_CANCELLED;
 }
 
 /// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a bad step

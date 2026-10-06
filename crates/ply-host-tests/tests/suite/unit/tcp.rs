@@ -2,6 +2,7 @@ use ply_eval::{
     Bound, CheckOutput, Diagnostic, EffectAtom, HostAnswer, HostBinding, HostRequest, HostRuntime,
     Linearity, Mode, Pending, Resource, Span, Symbol, Value, codes,
 };
+use ply_host::pool::Pooled;
 use ply_host::tcp::*;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -168,22 +169,38 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.accept[listener] ply_host::tcp::accept",
             "std.net.net.close[conn] ply_host::tcp::close",
             "std.net.net.close[listener] ply_host::tcp::close",
+            "std.net.net.close_write[conn] ply_host::tcp::close_write",
+            "std.net.net.close_write[listener] ply_host::tcp::close_write",
             "std.net.net.connect[conn] ply_host::tcp::connect",
             "std.net.net.connect[listener] ply_host::tcp::connect",
             "std.net.net.connect_tls[conn] ply_host::tls::connect",
             "std.net.net.connect_tls[listener] ply_host::tls::connect",
+            "std.net.net.connect_to[conn] ply_host::tcp::connect_to",
+            "std.net.net.connect_to[listener] ply_host::tcp::connect_to",
+            "std.net.net.connect_unix[conn] ply_host::tcp::connect_unix",
+            "std.net.net.connect_unix[listener] ply_host::tcp::connect_unix",
             "std.net.net.handshake[conn] ply_host::tls::handshake",
             "std.net.net.handshake[listener] ply_host::tls::handshake",
             "std.net.net.listen[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] ply_host::tcp::listen",
+            "std.net.net.listen_on[conn] ply_host::tcp::listen_on",
+            "std.net.net.listen_on[listener] ply_host::tcp::listen_on",
             "std.net.net.listen_tls[conn] ply_host::tls::listen",
             "std.net.net.listen_tls[listener] ply_host::tls::listen",
+            "std.net.net.listen_unix[conn] ply_host::tcp::listen_unix",
+            "std.net.net.listen_unix[listener] ply_host::tcp::listen_unix",
             "std.net.net.local_port[conn] ply_host::tcp::local_port",
             "std.net.net.local_port[listener] ply_host::tcp::local_port",
             "std.net.net.recv[conn] ply_host::tcp::recv",
             "std.net.net.recv[listener] ply_host::tcp::recv",
             "std.net.net.send[conn] ply_host::tcp::send",
             "std.net.net.send[listener] ply_host::tcp::send",
+            "std.net.net.serve_tls[conn] ply_host::tls::serve",
+            "std.net.net.serve_tls[listener] ply_host::tls::serve",
+            "std.net.net.set_option[conn] ply_host::tcp::set_option",
+            "std.net.net.set_option[listener] ply_host::tcp::set_option",
+            "std.net.net.start_tls[conn] ply_host::tls::start",
+            "std.net.net.start_tls[listener] ply_host::tls::start",
         ]
     );
 }
@@ -214,15 +231,22 @@ fn the_twin_declares_the_same_signature_and_differs_only_where_it_must() {
     assert!(script.listing().rows.iter().all(|r| !r.blocking));
 }
 
-/// Reading a socket's port changes nothing; every other operation opens, moves or closes bytes.
+/// Reading what a socket is changes nothing; every other operation opens, moves, tunes or closes.
 #[test]
-fn only_reading_a_port_is_repeatable() {
+fn only_reading_what_a_socket_is_is_repeatable() {
+    let reads = [
+        Op::LocalPort,
+        Op::LocalAddress,
+        Op::PeerAddress,
+        Op::PeerCredentials,
+        Op::Options,
+    ];
     for net in [
         Arc::new(TcpHost::new()) as Arc<dyn Net>,
         Arc::new(SimNet::new(Vec::new())),
     ] {
         for op in Op::ALL {
-            let expected = if op == Op::LocalPort {
+            let expected = if reads.contains(&op) {
                 Linearity::Repeatable
             } else {
                 Linearity::AtMostOnce
@@ -248,8 +272,11 @@ fn a_declaration_without_nondet_refuses_the_handler() {
     );
 }
 
+/// A declaration that lacks an operation the host registers is a program checked before the
+/// operation was added, or after it was renamed: either way it performs none of it, and the rest
+/// binds. That the registry names only what this tree declares is `unit::registry`'s to hold.
 #[test]
-fn an_operation_renamed_in_the_declaration_is_refused_at_bind_time() {
+fn an_operation_the_declaration_lacks_binds_nothing_and_the_rest_binds() {
     let mut renamed = check(&fixture());
     let net = declared(&mut renamed);
     let recv = net
@@ -257,16 +284,17 @@ fn an_operation_renamed_in_the_declaration_is_refused_at_bind_time() {
         .shift_remove(&Symbol::new("recv"))
         .expect("`net.recv` is declared");
     net.ops.insert(Symbol::new("read_bytes"), recv);
-    let diagnostics = registry(Arc::new(TcpHost::new()))
+    let binding = registry(Arc::new(TcpHost::new()))
         .bind(&renamed)
-        .expect_err("`net.recv` is no longer declared");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.code == codes::HOST_OPERATION_UNKNOWN),
-        "{:?}",
-        diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
-    );
+        .expect("what the declaration still holds binds");
+    let served: Vec<&str> = binding
+        .listing()
+        .rows
+        .iter()
+        .map(|r| r.op.as_str())
+        .collect();
+    assert!(served.contains(&"send"), "{served:?}");
+    assert!(!served.contains(&"recv"), "{served:?}");
 }
 
 #[test]
@@ -545,7 +573,11 @@ fn a_loopback_connection_is_served_end_to_end() {
     close(&binding, net.as_ref(), listener, "listener");
 
     assert_eq!(peer.join().expect("the peer finished"), RESPONSE);
-    assert_eq!(net.outstanding(), 0, "every blocking operation was reaped");
+    assert_eq!(
+        net.pool().outstanding(),
+        0,
+        "every blocking operation was reaped"
+    );
 }
 
 #[test]
@@ -772,8 +804,9 @@ fn a_token_the_runtime_did_not_mint_is_loud_rather_than_lost() {
         token: 4096,
         label: "recv",
     };
-    assert!(!net.owns(&foreign));
+    assert!(!net.pool().owns(&foreign));
     let polled = net
+        .pool()
         .poll(&foreign)
         .expect_err("this token is someone else's");
     assert_eq!(polled.code, codes::INTERNAL_ERROR);
@@ -926,7 +959,11 @@ fn an_outbound_connection_is_made_and_served_end_to_end() {
     assert_eq!(read_to_end(&binding, net.as_ref(), conn), RESPONSE);
     close(&binding, net.as_ref(), conn, "conn");
     assert_eq!(peer.join().expect("the peer finished"), REQUEST);
-    assert_eq!(net.outstanding(), 0, "every blocking operation was reaped");
+    assert_eq!(
+        net.pool().outstanding(),
+        0,
+        "every blocking operation was reaped"
+    );
 }
 
 #[test]
@@ -971,7 +1008,7 @@ fn a_host_that_cannot_be_reached_is_none_rather_than_a_failure() {
         matches!(&answer, Value::Ctor { name, .. } if name.as_str() == "None"),
         "{answer:?}"
     );
-    assert_eq!(net.outstanding(), 0);
+    assert_eq!(net.pool().outstanding(), 0);
 }
 
 fn speak(addr: SocketAddr) -> std::thread::JoinHandle<Vec<u8>> {

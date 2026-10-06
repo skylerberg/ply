@@ -68,19 +68,26 @@ macro_rules! operations {
 }
 
 pub mod certgen;
+pub mod clock;
 pub mod config;
+pub mod dns;
 pub mod fs;
 pub mod observe;
+pub mod os;
+pub mod password;
 pub mod pool;
 pub mod process;
 pub mod random;
 pub mod registry;
 pub mod sched;
 pub mod signal;
+pub mod stdio;
 pub mod tcp;
+pub mod term;
 pub mod time;
 pub mod tls;
 pub mod trace;
+pub mod udp;
 
 pub use registry::{Host, registry, registry_over};
 pub use tls::{CredentialSpec, Credentials, HandshakeCounts};

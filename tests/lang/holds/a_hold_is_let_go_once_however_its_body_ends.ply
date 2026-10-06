@@ -1,0 +1,262 @@
+//! `with_hold[r](acquire, release) { h -> body }` runs `body` on a hold of what `acquire` answered,
+//! then `release` on that, once, however `body` ends: by returning, by a raise or a clause that does
+//! not resume unwinding through it, or by a cancel. Nothing is released when `acquire` did not
+//! answer.
+
+import std.value (VCell)
+
+effect log {
+  write note(s: String) -> Unit
+}
+
+effect stop {
+  write now() -> Unit
+}
+
+effect door {
+  raise shut(why: String)
+}
+
+fn opened(name: String) -> String / {log.note} = {
+  log.note("open " ++ name);
+  name
+}
+
+fn closed(name: String) -> Unit / {log.note} = log.note("close " ++ name)
+
+/// What `go` noted, in order.
+fn noted<| e>(go: () -> Unit / {log.note | e}) -> List<String> / e =
+  with_cell[seen]([]) { c -> {
+    handle { go() } with { log.note(s) -> cell_set(c, push(cell_get(c), s)) };
+    cell_get(c)
+  } }
+
+test "release runs after a body that returns, and the body's answer is the region's" {
+  let seen = noted(|| {
+    let n = with_hold[file](
+      opened("a"),
+      closed,
+    ) { h -> {
+      log.note("use " ++ hold_get(h));
+      string_len(hold_get(h))
+    } };
+    assert_eq(n, 1)
+  });
+  assert_eq(seen, ["open a", "use a", "close a"])
+}
+
+test "release runs when a clause that does not resume unwinds through the body" {
+  let seen = noted(|| {
+    let answered = handle {
+      with_hold[file](
+        opened("a"),
+        closed,
+      ) { h -> {
+        stop.now();
+        log.note("never");
+        1
+      } }
+    } with {
+      stop.now() resume k -> 0,
+    };
+    assert_eq(answered, 0)
+  });
+  assert_eq(seen, ["open a", "close a"])
+}
+
+test "release runs when a raise unwinds through the body, before the clause that answers it" {
+  let seen = noted(|| {
+    let answered = handle {
+      with_hold[file](
+        opened("a"),
+        closed,
+      ) { h -> {
+        door.shut("gone");
+        log.note("never");
+        1
+      } }
+    } with {
+      door.shut(why) -> {
+        log.note("caught " ++ why);
+        string_len(why)
+      },
+    };
+    assert_eq(answered, 4)
+  });
+  assert_eq(seen, ["open a", "close a", "caught gone"])
+}
+
+test "nothing is released when the acquire raised" {
+  let seen = noted(|| {
+    let answered: Result<Int, String> = try {
+      with_hold[file](door.shut("no such file"), closed) { h -> string_len(hold_get(h)) }
+    };
+    assert_eq(answered, Err("no such file"))
+  });
+  assert_eq(seen, [])
+}
+
+test "holds nest, and the inner one is let go first" {
+  let seen = noted(||
+    handle {
+      with_hold[outer](
+        opened("outer"),
+        closed,
+      ) { o ->
+        with_hold[inner](
+          opened("inner"),
+          closed,
+        ) { i -> {
+          log.note("use " ++ hold_get(o) ++ " and " ++ hold_get(i));
+          stop.now()
+        } }
+      }
+    } with {
+      stop.now() resume k -> (),
+    });
+  assert_eq(seen, ["open outer", "open inner", "use outer and inner", "close inner", "close outer"])
+}
+
+test "release runs with the handlers around the region, not those inside its body" {
+  let seen = noted(||
+    with_hold[file](
+      opened("a"),
+      closed,
+    ) { h -> handle { log.note("muted") } with { log.note(s) -> () } });
+  assert_eq(seen, ["open a", "close a"])
+}
+
+test "a release that raises replaces what was unwinding" {
+  let answered: Result<Int, String> = try {
+    with_hold[file](1, |n: Int| door.shut("release")) { h -> {
+      door.shut("body");
+      hold_get(h)
+    } }
+  };
+  assert_eq(answered, Err("release"))
+}
+
+test "a cancelled task lets go of what it holds, in every interleaving" {
+  let seen = noted(||
+    simulate {
+      let t = task.spawn(||
+        with_hold[file](
+          opened("a"),
+          closed,
+        ) { h -> {
+          clock.sleep(Duration(10));
+          log.note("done");
+          hold_get(h)
+        } });
+      clock.sleep(Duration(5));
+      assert(task.cancel(t));
+      assert_eq(task.await(t), None)
+    });
+  assert_eq(seen, ["open a", "close a"])
+}
+
+fn with_token(tokens: Chan<Unit>) -> Unit / {task.write} =
+  with_hold[token](task.recv(tokens), |held: Option<Unit>| {
+    task.send(tokens, ());
+    ()
+  }) { h -> task.yield() }
+
+test "a cancel takes no answer from a hold's acquire, so the token it took goes back, in every interleaving" {
+  simulate {
+    let tokens = task.channel(1);
+    assert(task.send(tokens, ()));
+    let holder = task.spawn(|| with_token(tokens));
+    task.cancel(holder);
+    task.await(holder);
+    assert_eq(task.recv(tokens), Some(()))
+  }
+}
+
+test "a cancel lets go of a wait a hold's acquire stands in, and nothing is released" {
+  let seen = noted(||
+    simulate {
+      let never: Chan<String> = task.channel(0);
+      let t = task.spawn(||
+        with_hold[file](task.recv(never), |held: Option<String>| closed("a")) { h -> () });
+      clock.sleep(Duration(1));
+      assert(task.cancel(t));
+      assert_eq(task.await(t), None)
+    });
+  assert_eq(seen, [])
+}
+
+test "a cancel does not stop a hold's release: it lands when the release returns" {
+  let seen = noted(||
+    simulate {
+      let gate = task.channel(0);
+      let t = task.spawn(||
+        with_hold[file]((), |u: Unit| {
+          task.recv(gate);
+          log.note("released")
+        }) { h -> () });
+      clock.sleep(Duration(1));
+      assert(task.cancel(t));
+      assert(!task.cancel(t));
+      log.note("cancelled");
+      assert(task.send(gate, 1));
+      assert_eq(task.await(t), None)
+    });
+  assert_eq(seen, ["cancelled", "released"])
+}
+
+fn doubled(h: Hold<Int>) -> Int / {hold.read} = hold_get(h) * 2
+
+test "a hold is read by the functions and the closures its region hands it to" {
+  let total = with_hold[n](21, |x: Int| ()) { h ->
+    fold([1, 2, 3], doubled(h), |acc: Int, i: Int| acc + i * hold_get(h))
+  };
+  assert_eq(total, 42 + 6 * 21)
+}
+
+test "a region of tasks inside a hold's region shares the hold" {
+  let both = with_hold[n](20, |x: Int| ()) { h ->
+    simulate {
+      let a = task.spawn(|| hold_get(h) + 1);
+      let b = task.spawn(|| doubled(h));
+      task.join(a) + task.join(b)
+    }
+  };
+  assert_eq(both, 61)
+}
+
+test "the release is written outside the hold's binder, so a name they share is the one around" {
+  let h = "outer";
+  let seen = noted(||
+    with_hold[file](opened("a"), |name: String|
+      log.note("close " ++ name ++ " beside " ++ h)) { h -> log.note("use " ++ hold_get(h)) });
+  assert_eq(seen, ["open a", "use a", "close a beside outer"])
+}
+
+test "a hold reflects as the cell it is, never as what it holds" {
+  let seen = with_hold[n](42, |x: Int| ()) { h ->
+    match reflect(h) { VCell(_) -> "a cell", _ -> "what it holds" }
+  };
+  assert_eq(seen, "a cell")
+}
+
+fn sunk(depth: Int) -> Int / {door.shut} =
+  if depth <= 0 { door.shut("deep") } else { 1 + sunk(depth - 1) }
+
+// Each raise leaves fifty calls deep, so a raise that kept the depth it unwound through would end
+// this entry at the call ceiling within a few hundred turns.
+test "a hold raised through from deep in its body and caught, turn after turn in one entry, is let go every time" {
+  let turns = 300000;
+  let let_go = with_cell[count](0) { c -> {
+    iterate(0, turns + 1, |turn: Int|
+      if turn >= turns { Stop(()) } else {
+        let caught: Result<Int, String> = try {
+          with_hold[file](turn, |x: Int| cell_set(c, cell_get(c) + 1)) { h ->
+            sunk(50) + hold_get(h)
+          }
+        };
+        if caught == Err("deep") { Continue(turn + 1) } else { panic("the raise was not caught") }
+      });
+    cell_get(c)
+  } };
+  assert_eq(let_go, turns)
+}

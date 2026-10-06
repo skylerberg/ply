@@ -9,10 +9,10 @@ use crate::rt::{
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
 use ply_eval::sched::{
-    ChanHandle, HostPolicy, Policy, ROOT, Resumption, Scheduler, TaskHandle, Turn,
+    ChanHandle, HostPolicy, LetGo, Policy, ROOT, Resumption, Scheduler, Shield, TaskHandle, Turn,
 };
 use ply_eval::sim::{
-    Access, Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, liveness,
+    Access, Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, ended, liveness,
     signature,
 };
 use ply_eval::{Diagnostic, Mode, SimId, Span, Symbol, Unbound, Value, codes};
@@ -62,9 +62,13 @@ enum Request {
     Send(ChanHandle, Value),
     Recv(ChanHandle),
     Close(ChanHandle),
+    /// Each arm's channel beside what it sends, and whether to wait when none can go.
+    Select(Vec<(ChanHandle, Option<Value>)>, bool),
     Yield,
     Seeded(&'static OpSignature, Vec<Value>),
     Park(Pending),
+    /// The nanoseconds a production task waits on the host's clock.
+    Sleep(i64),
     Finished(Word),
     Failed,
     /// The task unwound after a cancel.
@@ -372,20 +376,26 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             };
             match sim.sched.cancel(k, &target, site, clock) {
                 Err(d) => Err(d),
-                Ok(unstarted) => {
+                Ok(stopped) => {
                     let region = target.region();
                     let id = target.id();
                     let records = sim.sched.records_steps();
-                    if let Some(body) = unstarted {
+                    if let Some(body) = stopped.unstarted {
                         heap::dec(body);
                         release(c, id);
                         recycle(c, id);
                     }
-                    // A cancel writes the task's liveness and each step it took reads it, so the
-                    // search tries cancelling earlier and later.
-                    if records {
+                    // A cancel of a task that had ended read only that, which the task's last
+                    // step wrote. Any other writes the task's liveness, which the step it took
+                    // last and each it takes from here read, so the search tries cancelling a
+                    // step earlier and a step later.
+                    if records && stopped.ended {
+                        c.record_access(ended(id));
+                    } else if records {
                         c.record_access(liveness(id, Mode::Write));
-                        c.trail.mark_steps_of(region, id, liveness(id, Mode::Read));
+                        c.trail
+                            .mark_last_step_of(region, id, liveness(id, Mode::Read));
+                        record_let_go(c, stopped.let_go);
                     }
                     Ok(())
                 }
@@ -423,10 +433,26 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             }
             applied
         }
+        Request::Select(arms, wait) => {
+            let records = sim.sched.records_steps();
+            let chans: Vec<_> = arms.iter().map(|(chan, _)| chan.id).collect();
+            let applied = sim.sched.select(k, arms, wait, site);
+            // It reads every arm's channel, whichever it goes on.
+            if records {
+                for chan in chans {
+                    c.record_access(channel_access(chan));
+                }
+            }
+            applied
+        }
         Request::Yield => sim.sched.suspend(k, Value::Unit),
         Request::Park(pending) => match &runtime {
             Some(rt) => sim.sched.park_on_host(k, pending, site, rt.as_ref()),
             None => sim.sched.park_on_host(k, pending, site, &Unbound),
+        },
+        Request::Sleep(nanos) => match &runtime {
+            Some(rt) => sim.sched.sleep_on_host(k, nanos, site, rt.as_ref()),
+            None => sim.sched.sleep_on_host(k, nanos, site, &Unbound),
         },
         Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, site) {
             Ok(Answer::Value(value)) => sim.sched.suspend(k, value),
@@ -434,16 +460,24 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             Err(d) => Err(d),
         },
         Request::Finished(word) => {
+            let records = sim.sched.records_steps();
             release(c, task);
             recycle(c, task);
+            if records {
+                c.record_access(ended(task));
+            }
             let value = c.value(word);
             heap::dec(word);
             let sim = c.sims.last_mut().expect("a region is running");
             sim.sched.finish(value)
         }
         Request::Cancelled => {
+            let records = sim.sched.records_steps();
             release(c, task);
             recycle(c, task);
+            if records {
+                c.record_access(ended(task));
+            }
             c.failed = 0;
             let sim = c.sims.last_mut().expect("a region is running");
             sim.sched.finish_cancelled()
@@ -464,7 +498,62 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             return Err(Some(failure));
         }
     };
-    applied.map_err(Some)
+    applied.map_err(Some)?;
+    let c = unsafe { &mut *ctx };
+    let sim = c.sims.last_mut().expect("a region is running");
+    let clock = match sim.policy {
+        Policy::Seeded => Some(sim.handlers.clock_mut()),
+        Policy::Host => None,
+    };
+    let let_go = sim.sched.refuse_wait(task, clock);
+    if sim.sched.records_steps() {
+        record_let_go(c, let_go);
+    }
+    Ok(())
+}
+
+/// What a cancel took a task off, which a step on it by another task is ordered against.
+fn record_let_go(c: &mut Ctx, let_go: LetGo) {
+    match let_go {
+        LetGo::Nothing => {}
+        LetGo::Task(on) => c.record_access(ended(on)),
+        LetGo::Chans(chans) => {
+            for chan in chans {
+                c.record_access(channel_access(chan));
+            }
+        }
+    }
+}
+
+/// A `bracket`'s `acquire` or `release` the running task of the innermost region stands in.
+pub(crate) struct Shielded {
+    regions: usize,
+    task: TaskId,
+    shield: Shield,
+}
+
+/// Enters `shield` for the running task, where a region is running one.
+pub(crate) fn shield(c: &mut Ctx, shield: Shield) -> Option<Shielded> {
+    let regions = c.sims.len();
+    let task = c.sims.last_mut()?.sched.shield(shield)?;
+    Some(Shielded {
+        regions,
+        task,
+        shield,
+    })
+}
+
+/// Leaves what [`shield`] entered. Answers whether a cancel was held back and lands now.
+pub(crate) fn unshield(c: &mut Ctx, entered: Option<Shielded>) -> bool {
+    let Some(entered) = entered else {
+        return false;
+    };
+    if c.sims.len() != entered.regions {
+        return false;
+    }
+    c.sims
+        .last_mut()
+        .is_some_and(|sim| sim.sched.unshield(entered.task, entered.shield))
 }
 
 /// Copies of the handlers around a spawn on `from`, outermost first, short of the region's own.
@@ -604,7 +693,28 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
                 Err(d) => return c.fail(d),
             }
         }
+        ("task", "select") => {
+            let arms = c.value(args[0]);
+            heap::dec(args[0]);
+            let wait = c.value(args[1]);
+            heap::dec(args[1]);
+            let read = ply_eval::sched::select_arms(&arms, c.site())
+                .and_then(|arms| Ok((arms, wait.as_bool(c.site(), "`task.select`")?)));
+            match read {
+                Ok((arms, wait)) => Request::Select(arms, wait),
+                Err(d) => return c.fail(d),
+            }
+        }
         ("task", "yield") => Request::Yield,
+        // A seeded region's sleep is its virtual clock's, below.
+        ("clock", "sleep") if c.sims.last().is_some_and(|sim| sim.is_production()) => {
+            let span = c.value(args[0]);
+            heap::dec(args[0]);
+            match ply_eval::sim::nanos_of(&span, c.site(), "`clock.sleep`") {
+                Ok(nanos) => Request::Sleep(nanos),
+                Err(d) => return c.fail(d),
+            }
+        }
         _ => {
             let Some(sig) = signature(effect.as_str(), op.as_str()) else {
                 let d = Diagnostic::error(
@@ -685,8 +795,10 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::{Builtin, Mode};
     let mode = match b {
-        Builtin::CellGet => Mode::Read,
-        Builtin::CellSet | Builtin::CellUpdate => Mode::Write,
+        Builtin::CellGet | Builtin::HoldGet => Mode::Read,
+        Builtin::CellSet | Builtin::CellUpdate | Builtin::HoldTake | Builtin::HoldPut => {
+            Mode::Write
+        }
         _ => return None,
     };
     let Value::Cell(slot) = ctx.value(*args.first()?) else {

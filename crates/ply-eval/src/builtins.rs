@@ -105,7 +105,7 @@ builtins! { $
     I8OfInt = "i8_of_int", 1, raises;
     I16OfInt = "i16_of_int", 1, raises;
     I32OfInt = "i32_of_int", 1, raises;
-    I64OfInt = "i64_of_int", 1, raises;
+    I64OfInt = "i64_of_int", 1, ends;
     IntOfU8 = "int_of_u8", 1, ends;
     IntOfU16 = "int_of_u16", 1, ends;
     IntOfU32 = "int_of_u32", 1, ends;
@@ -176,6 +176,7 @@ builtins! { $
     /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
     FloatOfString = "float_of_string", 1, ends;
     DecimalToString = "decimal_to_string", 1, ends;
+    DecimalScale = "decimal_scale", 1, ends;
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
     BitsOfFloat = "bits_of_float", 1, ends;
     FloatOfBits = "float_of_bits", 1, ends;
@@ -189,13 +190,12 @@ builtins! { $
     Panic = "panic", 1, raises;
     /// The identity a benchmark pins a measured value with: opaque, so it is not optimized away.
     Observe = "observe", 1, ends;
-    /// The only introduction of a [`Value::Secret`].
     SecretOfString = "secret_of_string", 1, ends;
     SecretVerify = "secret_verify", 2, ends;
     SecretIsEmpty = "secret_is_empty", 1, ends;
     // Appended, so every earlier builtin keeps its cache index.
     U128OfInt = "u128_of_int", 1, raises;
-    I128OfInt = "i128_of_int", 1, raises;
+    I128OfInt = "i128_of_int", 1, ends;
     IntOfU128 = "int_of_u128", 1, raises;
     IntOfI128 = "int_of_i128", 1, raises;
     U128ToString = "u128_to_string", 1, ends;
@@ -273,6 +273,38 @@ builtins! { $
     /// `map_range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
     MapRange = "map_range", 6, ends;
     MapSplit = "map_split", 2, ends;
+    /// What a hold holds, while its region has not let it go.
+    HoldGet = "hold_get", 1, ends;
+    /// A hold's contents moved out for its release, so the next read finds them gone. No source
+    /// can spell it; the lowering of `with_hold` writes it.
+    HoldTake = "?hold_take", 1, ends;
+    /// [`Builtin::Bracket`] under a name no module rebinds, for the lowering of `with_hold`.
+    HoldBracket = "?hold_bracket", 3, ends;
+    /// Bytes as a credential, and what is made of one without opening it.
+    SecretOfBytes = "secret_of_bytes", 1, ends;
+    SecretBytes = "secret_bytes", 1, ends;
+    SecretLen = "secret_len", 1, ends;
+    SecretConcat = "secret_concat", 2, ends;
+    /// `secret_decode(encoding, text)`: `None` for a text the encoding does not write.
+    SecretDecode = "secret_decode", 2, raises;
+    /// The private key a DER document holds, with the scheme it is a key of.
+    SecretPrivateKey = "secret_private_key", 1, ends;
+    /// Keyed hashing under a credential; `None` for a hash the runtime does not key.
+    SecretHmac = "secret_hmac", 3, ends;
+    SecretHkdfExtract = "secret_hkdf_extract", 3, ends;
+    SecretHkdfExpand = "secret_hkdf_expand", 4, ends;
+    SecretPbkdf2 = "secret_pbkdf2", 5, ends;
+    /// `crypto_seal(cipher, key, nonce, associated, plaintext)` and its inverse.
+    CryptoSeal = "crypto_seal", 5, raises;
+    CryptoOpen = "crypto_open", 5, raises;
+    CryptoPublic = "crypto_public", 2, raises;
+    CryptoSign = "crypto_sign", 3, raises;
+    CryptoVerify = "crypto_verify", 4, raises;
+    CryptoAgree = "crypto_agree", 3, raises;
+    /// [`Builtin::CellSet`] under a name no module rebinds: the lowering of `with_hold` puts what
+    /// `acquire` answered into the hold inside the bracket's own acquire, where a cancel takes no
+    /// answer.
+    HoldPut = "?hold_put", 2, ends;
 }
 
 impl Builtin {
@@ -488,7 +520,11 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::CellGet
         | Builtin::CellSet
         | Builtin::CellUpdate
-        | Builtin::Bracket => Err(answered_by_the_backend(b, span)),
+        | Builtin::Bracket
+        | Builtin::HoldGet
+        | Builtin::HoldTake
+        | Builtin::HoldBracket
+        | Builtin::HoldPut => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
@@ -1265,6 +1301,11 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::str(d.to_string()))
         }
 
+        Builtin::DecimalScale => {
+            let d = args[0].as_decimal(span, "`decimal_scale`")?;
+            Ok(Value::Int(i64::from(d.scale())))
+        }
+
         Builtin::BitsOfFloat => {
             let f = args[0].as_float(span, "`bits_of_float`")?;
             Ok(Value::Int(f.to_bits() as i64))
@@ -1318,10 +1359,31 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::Bool(match &**held {
                 Value::Str(s) => s.is_empty(),
                 Value::Bytes(b) => b.is_empty(),
-                // Only strings are constructible; `false` reports a credential as present.
+                // Only strings and bytes are constructible; `false` reports a credential as present.
                 _ => false,
             }))
         }
+
+        Builtin::SecretOfBytes => crate::crypto::of_bytes(&args[0], span),
+        Builtin::SecretBytes => crate::crypto::utf8(&args[0], span),
+        Builtin::SecretLen => crate::crypto::len(&args[0], span),
+        Builtin::SecretConcat => crate::crypto::concat(&args[0], &args[1], span),
+        Builtin::SecretDecode => crate::crypto::decode(&args[0], &args[1], span),
+        Builtin::SecretPrivateKey => crate::crypto::private_key(&args[0], span),
+        Builtin::SecretHmac => crate::crypto::hmac(&args[0], &args[1], &args[2], span),
+        Builtin::SecretHkdfExtract => {
+            crate::crypto::hkdf_extract(&args[0], &args[1], &args[2], span)
+        }
+        Builtin::SecretHkdfExpand => {
+            crate::crypto::hkdf_expand(&args[0], &args[1], &args[2], &args[3], span)
+        }
+        Builtin::SecretPbkdf2 => crate::crypto::pbkdf2(args, span),
+        Builtin::CryptoSeal => crate::crypto::seal(args, span),
+        Builtin::CryptoOpen => crate::crypto::open(args, span),
+        Builtin::CryptoPublic => crate::crypto::public(&args[0], &args[1], span),
+        Builtin::CryptoSign => crate::crypto::sign(&args[0], &args[1], &args[2], span),
+        Builtin::CryptoVerify => crate::crypto::verify(args, span),
+        Builtin::CryptoAgree => crate::crypto::agree(&args[0], &args[1], &args[2], span),
     }
 }
 
@@ -1822,6 +1884,19 @@ pub fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     )
     .primary(span, "this cell was made by a different run")
     .note("please report this: a cell value escaped the region that allocated it")
+}
+
+/// A hold reached after its region let it go, which only a continuation captured inside the region
+/// and resumed after the release can do.
+#[cold]
+pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOLD_RELEASED,
+        format!("a hold is {doing} after its region released what it held"),
+    )
+    .primary(span, "the hold holds nothing now")
+    .note("a `with_hold` releases what it holds once, when its body first ends; a continuation captured inside the body and resumed after that runs the rest of the body against a hold already let go")
+    .note("resume a continuation captured inside a `with_hold` at most once, or open the `with_hold` after the choice the continuation replays")
 }
 
 /// The C backend answers every builtin that calls back into the program or reads a cell.
