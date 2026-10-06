@@ -5,6 +5,7 @@
 use crate::certgen;
 use crate::clock;
 use crate::config;
+use crate::dns;
 use crate::fs;
 use crate::os;
 use crate::password;
@@ -17,6 +18,7 @@ use crate::tcp;
 use crate::term;
 use crate::time;
 use crate::trace;
+use crate::udp;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_eval::{Diagnostic, Span, Symbol, TaskId, Value, codes};
 use std::rc::Rc;
@@ -83,6 +85,7 @@ impl Host {
     }
 
     pub fn rooted(self, roots: fs::Roots) -> Host {
+        self.net.rooted(roots.clone());
         Host {
             fs: Arc::new(fs::FsHost::new(roots)),
             ..self
@@ -136,6 +139,7 @@ impl Host {
         certgen::register(&mut registry);
         clock::register(&mut registry, Arc::clone(&self.time));
         config::register(&mut registry, Arc::clone(&self.config));
+        dns::register(&mut registry, Arc::clone(&self.net));
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
         os::register(&mut registry);
@@ -148,6 +152,7 @@ impl Host {
         term::register(&mut registry, self.process.as_ref());
         time::register(&mut registry, Arc::clone(&self.time));
         trace::register(&mut registry, Arc::clone(&self.trace));
+        udp::register(&mut registry, Arc::clone(&self.net));
         registry
     }
 

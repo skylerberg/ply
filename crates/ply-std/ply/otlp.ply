@@ -35,8 +35,10 @@ import std.json (Json, Null, Number, Str)
 import std.protobuf
 import std.protobuf (Field, Message, protobuf)
 import std.http
+import std.ip
 import std.list (any, concat, contains, drop, find, last, reverse, take)
-import std.net (net)
+import std.net
+import std.net (Says, net)
 import std.random (entropy, rand, with_rand)
 import std.show (show)
 import std.string (ascii_lower, ascii_trim)
@@ -3232,35 +3234,19 @@ fn receive(
   }
 }
 
-type Loop = { unread: Bytes, answer: Bytes }
-
-/// What `std.http`'s serve loop writes back for the bytes one connection's client wrote.
-fn answered<| e>(
+/// What `receive` under `std.http`'s serve loop writes back for the bytes one connection's client
+/// wrote.
+fn answered(
   written: Bytes,
-  app: (http::Request) -> http::Response / e,
-) -> Bytes / {abort.raise | e} =
-  with_cell[loopback]({ unread: written, answer: b"" }) { io -> {
-    handle {
-      http::serve_connection[inner](1, http::default_limits(), app)
-    } with {
-      net.recv[inner](c, most, t) -> {
-        let held: Loop = cell_get(io);
-        let n = min(most, bytes_len(held.unread));
-        cell_set(io, {
-          unread: bytes_slice(held.unread, n, bytes_len(held.unread)),
-          answer: held.answer,
-        });
-        Some(bytes_slice(held.unread, 0, n))
-      },
-      net.send[inner](c, payload, t) -> {
-        let held: Loop = cell_get(io);
-        cell_set(io, { unread: held.unread, answer: bytes_concat(held.answer, payload) });
-        Some(bytes_len(payload))
-      },
-      net.close[inner](c) -> (),
-    };
-    cell_get(io).answer
-  } }
+) -> Bytes / {collector.next, collector.took_traces, collector.took_metrics, abort.raise} = {
+  let client = ip::socket_at(ip::loopback_v4(), 49152);
+  let ran = net::on_mem(net::mem_calling(net::mem_empty(), client, [Says(written)]), || {
+    let conn = net.accept[listener](net.listen[listener](0));
+    http::serve_connection[inner](conn, http::default_limits(), receive);
+    conn
+  });
+  net::mem_sent(ran.net, ran.value)
+}
 
 type Ran<a> = { value: a, seen: Collector }
 
@@ -3329,11 +3315,7 @@ fn collected<a | e>(
             None -> Some(b""),
             Some(c) -> {
               let ready = if c.served { c } else {
-                let out: Conn = {
-                  written: c.written,
-                  answer: answered(c.written, receive),
-                  served: true,
-                };
+                let out: Conn = { written: c.written, answer: answered(c.written), served: true };
                 out
               };
               let n = min(most, bytes_len(ready.answer));
