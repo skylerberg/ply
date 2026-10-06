@@ -4,7 +4,7 @@
 use crate::heap::{self, Word};
 use crate::rt::{
     Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_UNWIND, Frames, HandlerFrame, call_value,
-    drop_frame, inherit_frames, raise_error, values_taken,
+    drop_frame, inherit_frames, raise_error, switch_keeping, values_taken,
 };
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
@@ -206,7 +206,7 @@ pub unsafe fn finish_root(ctx: *mut Ctx, value: Word) -> Word {
     ));
     let to = sim.scheduler_sp;
     let from = &mut sim.slot(ROOT).sp as *mut usize;
-    unsafe { switch(&mut *from, to) };
+    unsafe { switch_keeping(ctx, from, to) };
     let c = unsafe { &mut *ctx };
     let mut sim = end(c);
     let root = sim.slot(ROOT);
@@ -316,6 +316,8 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
             }
             Resumption::Raise { k, failure } => {
                 let message = failure.message.clone();
+                // Bound from the task's own stack: its handles answer before the region's.
+                c.current = sim.slot(task).frames;
                 c.raise(failure, message);
                 k
             }
@@ -327,7 +329,7 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
         c.current = slot.frames;
         sim.running = Some(task);
         let from = &mut sim.scheduler_sp as *mut usize;
-        unsafe { switch(&mut *from, sp) };
+        unsafe { switch_keeping(ctx, from, sp) };
 
         let c = unsafe { &mut *ctx };
         let yielded = c.step_site();
@@ -633,7 +635,7 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
     sim.request = Some((task, request));
     let from = &mut sim.slot(task).sp as *mut usize;
     let to = sim.scheduler_sp;
-    unsafe { switch(&mut *from, to) };
+    unsafe { switch_keeping(ctx, from, to) };
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
     if sim.loop_done {
@@ -656,7 +658,7 @@ pub unsafe fn park(ctx: *mut Ctx, pending: Pending) -> Word {
     sim.request = Some((task, Request::Park(pending)));
     let from = &mut sim.slot(task).sp as *mut usize;
     let to = sim.scheduler_sp;
-    unsafe { switch(&mut *from, to) };
+    unsafe { switch_keeping(ctx, from, to) };
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
     if sim.loop_done {
@@ -683,8 +685,8 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::{Builtin, Mode};
     let mode = match b {
-        Builtin::CellGet => Mode::Read,
-        Builtin::CellSet | Builtin::CellUpdate => Mode::Write,
+        Builtin::CellGet | Builtin::HoldGet => Mode::Read,
+        Builtin::CellSet | Builtin::CellUpdate | Builtin::HoldTake => Mode::Write,
         _ => return None,
     };
     let Value::Cell(slot) = ctx.value(*args.first()?) else {

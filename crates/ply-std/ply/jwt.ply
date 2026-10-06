@@ -1,0 +1,1588 @@
+//! JSON Web Tokens: claims a key vouches for, signed and verified as RFC 7519 and RFC 7515 define
+//! them, with the mistakes RFC 8725 lists kept out by what the functions take.
+//!
+//! A token is three base64url texts joined by dots: a header naming how it was signed, a payload,
+//! and a signature over the first two as written. `sign` makes one of a `Claims`. `verify` answers
+//! a `Verified` only where the key it was handed made the signature and the claims meet the
+//! `Policy` it was handed, at the instant it was handed; `Verified` is opaque, so a function that
+//! takes one cannot be given claims nobody checked. `peek` reads a token without checking it, to
+//! choose a key by what the token says of itself, and answers an `Unverified`. `sign_bytes` and
+//! `verify_bytes` are the same signature over a payload that is not claims.
+//!
+//! A `Key` names its one algorithm, and a token whose header names another is refused before any
+//! signature is computed. So the token never chooses how it is judged: `none` is no algorithm a
+//! key can name, and a public key is never read as an HMAC secret. The algorithms are HMAC with
+//! SHA-256, SHA-384 and SHA-512, and EdDSA over Ed25519. The library has no RSA or ECDSA, so
+//! `RS256`, `PS256`, `ES256` and their kin are refused as `Unsupported`; a key for one of them
+//! will be one more variant of `Key`. An HMAC secret shorter than its hash's digest is refused by
+//! `sign` and by `verify` alike (RFC 7518 §3.2), since a verifier under a guessable secret
+//! admits whoever guesses it. Key material is `Bytes`, since nothing written in Ply reads a
+//! `Secret`: keep it out of logs.
+//!
+//! Reading is strict. A token longer than the limit its reader names is refused unread. Its
+//! parts are unpadded base64url with no stray character and no loose bits; its header and its
+//! claims are JSON objects that name each member once; a `crit` header, `b64` set false and the
+//! five parts of an encrypted token are refused by name. A header that points at a key (`jku`,
+//! `x5u`, `jwk`) is never followed: nothing here performs anything, so no token makes a verifier
+//! fetch. An HMAC is compared as `std.hash`'s `tags_match` compares, and the payload is not
+//! parsed until the signature holds.
+//!
+//! A `Policy` has no default: its writer says how long a token may be, how far two clocks may
+//! differ, whether a token must expire, and what `iss`, `aud`, `sub` and `typ` must be, or `Any`
+//! for each one it does not look at. `exp` and `nbf` are judged against the `Instant` the caller
+//! passes, never a clock read here. `iat` and `jti` are answered and not judged: a verifier that
+//! bounds a token's age, or refuses one used twice, keeps that state itself.
+//!
+//! `jwk` and `jwks` read the keys of RFC 7517 this module can use, `oct` and `OKP` over Ed25519,
+//! and `key_for` picks the one a peeked header names.
+
+import std.base64 (base64url_decode, base64url_encode)
+import std.decimal
+import std.ed25519
+import std.gen
+import std.gen (Gen)
+import std.hash (hmac, hmac_verify, sha256_hash, sha384_hash, sha512_hash)
+import std.json
+import std.json (Array, DecodeError, Json, JsonCodec, Member, Number, Object, Str)
+import std.list (any, concat, contains, enumerate, find, flat_map, somes)
+import std.math (max_int, min_int)
+import std.option (option_expect, option_map)
+import std.result (result_expect)
+import std.string (join, repeat)
+import std.time (after, as_nanos, nanos_at, seconds)
+
+// --- Keys -------------------------------------------------------------------
+
+/// A key, which names the one algorithm it signs or verifies under.
+pub type Key =
+  /// `HS256`: HMAC with SHA-256 under a shared secret of thirty-two bytes or more.
+  | HmacSha256(Bytes)
+  /// `HS384`: HMAC with SHA-384 under a shared secret of forty-eight bytes or more.
+  | HmacSha384(Bytes)
+  /// `HS512`: HMAC with SHA-512 under a shared secret of sixty-four bytes or more.
+  | HmacSha512(Bytes)
+  /// `EdDSA` over Ed25519, to verify with: the thirty-two bytes of a public key.
+  | Ed25519(Bytes)
+  /// `EdDSA` over Ed25519, to sign with: the thirty-two bytes of a seed, which is the private
+  /// key. It verifies what it signed.
+  | Ed25519Seed(Bytes)
+
+gen for Key by signing_keys
+
+/// An HMAC key of each of the three hashes: a secret of its digest's length or up to sixteen
+/// bytes more. No Ed25519 key is drawn: `std.ed25519` signs and verifies slowly enough that a
+/// sampled claim over one would run for minutes, so EdDSA is held to RFC 8037's vectors.
+pub fn signing_keys() -> Gen<Key> =
+  gen::and_then(gen::below(3), |hash: Int|
+    gen::and_then(gen::below(17), |more: Int|
+      gen::map(gen::bytes_of(32 + 16 * hash + more), |secret: Bytes|
+        if hash == 0 { HmacSha256(secret) }
+        else if hash == 1 { HmacSha384(secret) }
+        else { HmacSha512(secret) })))
+
+/// The `alg` a token signed with `key` names.
+pub fn algorithm(key: Key) -> String =
+  match key {
+    HmacSha256(_) -> "HS256",
+    HmacSha384(_) -> "HS384",
+    HmacSha512(_) -> "HS512",
+    Ed25519(_) -> "EdDSA",
+    Ed25519Seed(_) -> "EdDSA",
+  }
+
+/// The key a verifier holds for what `key` signs: the public key of an Ed25519 seed, and an HMAC
+/// secret itself, which both sides share. Raises for a key `sign` would refuse.
+pub fn verifying(key: Key) -> Key / {jwt.refused, abort.raise} =
+  match usable(key) { Ed25519Seed(seed) -> Ed25519(ed25519::public_key(seed)), shared -> shared }
+
+/// `key`, refused where its algorithm cannot use it.
+fn usable(key: Key) -> Key / {jwt.refused} =
+  match key {
+    HmacSha256(secret) -> if bytes_len(secret) < 32 { short(secret) } else { key },
+    HmacSha384(secret) -> if bytes_len(secret) < 48 { short(secret) } else { key },
+    HmacSha512(secret) -> if bytes_len(secret) < 64 { short(secret) } else { key },
+    Ed25519(public) -> if bytes_len(public) != 32 { odd(public) } else { key },
+    Ed25519Seed(seed) -> if bytes_len(seed) != 32 { odd(seed) } else { key },
+  }
+
+fn short<a>(secret: Bytes) -> a / {jwt.refused} = jwt.refused(ShortKey(bytes_len(secret)))
+
+fn odd<a>(key: Bytes) -> a / {jwt.refused} = jwt.refused(KeyLength(bytes_len(key)))
+
+fn signature(key: Key, input: Bytes) -> Bytes / {jwt.refused, abort.raise} =
+  match key {
+    HmacSha256(secret) -> hmac(sha256_hash(), secret, input),
+    HmacSha384(secret) -> hmac(sha384_hash(), secret, input),
+    HmacSha512(secret) -> hmac(sha512_hash(), secret, input),
+    Ed25519Seed(seed) -> ed25519::sign(seed, input),
+    Ed25519(_) -> jwt.refused(CannotSign),
+  }
+
+fn signed_by(key: Key, input: Bytes, signature: Bytes) -> Bool / {abort.raise} =
+  match key {
+    HmacSha256(secret) -> hmac_verify(sha256_hash(), secret, input, signature),
+    HmacSha384(secret) -> hmac_verify(sha384_hash(), secret, input, signature),
+    HmacSha512(secret) -> hmac_verify(sha512_hash(), secret, input, signature),
+    Ed25519(public) -> ed25519::verify(public, input, signature),
+    Ed25519Seed(seed) -> ed25519::verify(ed25519::public_key(seed), input, signature),
+  }
+
+// --- Tokens -----------------------------------------------------------------
+
+/// What a signer writes in a token's header beside `alg`, which is its key's.
+pub type Marks = new {
+  /// `typ`: what kind of token this is, as `JWT` or `at+jwt`, for a verifier that is sent more
+  /// than one kind.
+  typ: Option<String>,
+  /// `kid`: which of the signer's keys this is, for a verifier that holds several.
+  kid: Option<String>,
+}
+
+/// A token's header as it was read.
+pub type Header = new {
+  /// `alg`, as the token spells it.
+  alg: String,
+  /// `typ`, where it has one.
+  typ: Option<String>,
+  /// `kid`, where it has one.
+  kid: Option<String>,
+  /// Every member, those above among them.
+  members: Map<String, Json>,
+}
+
+/// A token's claims: the seven RFC 7519 registers, and every other by name.
+pub type Claims = new {
+  /// `iss`: who issued the token.
+  issuer: Option<String>,
+  /// `sub`: whom it is about.
+  subject: Option<String>,
+  /// `aud`: whom it is for. A token that names one audience as a string names a list of one,
+  /// and one that names none an empty list.
+  audience: List<String>,
+  /// `exp`: the instant it stops being valid.
+  expires: Option<Instant>,
+  /// `nbf`: the instant it starts being valid.
+  not_before: Option<Instant>,
+  /// `iat`: when it was issued.
+  issued_at: Option<Instant>,
+  /// `jti`: a name the issuer gives no two tokens, for a verifier that refuses one used twice
+  /// to remember.
+  id: Option<String>,
+  /// Every other member. It holds none of the seven names above.
+  other: Map<String, Json>,
+}
+
+/// No claims at all, for a record update to state some of.
+pub fn claims() -> Claims =
+  {
+    issuer: None,
+    subject: None,
+    audience: [],
+    expires: None,
+    not_before: None,
+    issued_at: None,
+    id: None,
+    other: map_new(),
+  }
+
+/// What a verifier requires one claim, or the header's `typ`, to say.
+pub type Expect =
+  /// Nothing: the verifier does not look, and a token with none passes.
+  | Any
+  /// This string, as written. Of `aud`, which may list several, this one among them.
+  | Exactly(String)
+  /// One of these strings.
+  | OneOf(List<String>)
+
+/// What a verifier requires of a token. It has no default: each field is written out.
+pub type Policy = new {
+  /// The longest token read, in bytes.
+  max_bytes: Int,
+  /// How far the issuer's clock may be from the verifier's: `exp` and `nbf` are judged this
+  /// much in the token's favour. Below zero is zero.
+  leeway: Duration,
+  /// Whether a token with no `exp` is refused.
+  must_expire: Bool,
+  /// What `iss` must be.
+  issuer: Expect,
+  /// What `aud` must hold: the name this verifier answers to.
+  audience: Expect,
+  /// What `sub` must be.
+  subject: Expect,
+  /// What the header's `typ` must be, compared as written: capitals and an `application/` prefix
+  /// count.
+  typ: Expect,
+}
+
+/// Claims a key the verifier held signed and a policy the verifier wrote admitted. Only `verify`
+/// makes one.
+pub opaque type Verified = new { header: Header, claims: Claims }
+
+/// A payload a key the verifier held signed. Only `verify_bytes` makes one.
+pub opaque type Signed = new { header: Header, payload: Bytes }
+
+/// What a token says of itself, with nothing checked: fit to choose a key by, and for nothing
+/// that trusts it.
+pub type Unverified = new { header: Header, claims: Claims }
+
+/// Which part of a token, or a key set.
+pub type Part = | InHeader | InPayload | InSignature | InKeys
+
+/// Why a token, a key or a signing was refused.
+pub type Refusal =
+  /// The token, or the key set, is this many bytes, which is past the limit its reader named.
+  | TooLong(Int)
+  /// It is this many parts between dots, where a signed token is three.
+  | Parts(Int)
+  /// It is five parts: an encrypted token (JWE), which this module does not read.
+  | Encrypted
+  /// This part is not unpadded base64url as RFC 4648 §5 writes it: it holds a character outside
+  /// the alphabet, padding or whitespace among them, or a last character with bits no byte
+  /// holds.
+  | Encoding(Part)
+  /// This part is not a JSON object that names each member once, and why.
+  | Malformed(Part, DecodeError)
+  /// The header has no `alg`, or one that is not a string.
+  | NoAlgorithm
+  /// The header's `alg` is `none`, in these capitals: nobody signed the token.
+  | Unsecured(String)
+  /// The header's `alg`, or a key's type, is this, which JOSE defines and this module does not
+  /// implement.
+  | Unsupported(String)
+  /// The header's `alg` is the first and the key is for the second.
+  | WrongAlgorithm(String, String)
+  /// The header's `crit` lists these: extensions a reader accepts a token only by understanding,
+  /// and this module understands none.
+  | Critical(List<String>)
+  /// The header sets `b64` false: a payload that is not base64url (RFC 7797).
+  | Unencoded
+  /// The signature is not the key's over this header and payload.
+  | BadSignature
+  /// An HMAC secret of this many bytes, fewer than its hash's digest.
+  | ShortKey(Int)
+  /// An Ed25519 key of this many bytes, where a public key and a seed are thirty-two.
+  | KeyLength(Int)
+  /// A public key was asked to sign.
+  | CannotSign
+  /// This member is not of the type its definition gives it.
+  | Mistyped(String)
+  /// `other` holds this name, which is a registered claim's and has a field of its own.
+  | Reserved(String)
+  /// The token expired at this instant, the leeway or more before now.
+  | Expired(Instant)
+  /// The token is not valid before this instant, more than the leeway after now.
+  | NotYet(Instant)
+  /// This member is required and absent.
+  | Missing(String)
+  /// This member is these, which is not what was required.
+  | Unexpected(String, List<String>)
+
+/// What a function of this module raises where it refuses.
+pub effect jwt {
+  /// A token, a key or a set of claims is not one the function takes.
+  raise refused(e: Refusal)
+}
+
+/// The sentence a refusal says to whoever reads a log.
+pub fn refusal_to_string(r: Refusal) -> String =
+  match r {
+    TooLong(size) -> "it is " ++ int_to_string(size) ++ " bytes, past the limit",
+    Parts(count) ->
+      "a signed token is three parts joined by dots, and this is " ++ int_to_string(count),
+    Encrypted -> "five parts are an encrypted token (JWE), which is not read here",
+    Encoding(part) -> part_name(part) ++ " is not unpadded base64url",
+    Malformed(part, e) ->
+      part_name(part) ++ " is not a JSON object naming each member once: "
+        ++ json::error_to_string(e),
+    NoAlgorithm -> "the header names no `alg`",
+    Unsecured(alg) -> "the header's `alg` is `" ++ alg ++ "`: nobody signed this token",
+    Unsupported(name) ->
+      "`" ++ name
+        ++ "` is not implemented: this module has HS256, HS384, HS512 and EdDSA over Ed25519, and no RSA or ECDSA",
+    WrongAlgorithm(found, wanted) ->
+      "the header's `alg` is `" ++ found ++ "` and the key is for `" ++ wanted ++ "`",
+    Critical(names) ->
+      "the header marks critical what is not understood here: " ++ join(names, ", "),
+    Unencoded -> "the header sets `b64` false, and a payload that is not base64url is not read",
+    BadSignature -> "the signature is not this key's over this header and payload",
+    ShortKey(size) ->
+      "an HMAC secret of " ++ int_to_string(size) ++ " bytes is shorter than its hash's digest",
+    KeyLength(size) -> "an Ed25519 key is 32 bytes, and this is " ++ int_to_string(size),
+    CannotSign -> "a public key signs nothing",
+    Mistyped(name) -> "`" ++ name ++ "` is not of the type its definition gives it",
+    Reserved(name) -> "`" ++ name ++ "` is a registered claim, which has a field of its own",
+    Expired(at) -> "the token expired at " ++ seconds_text(at),
+    NotYet(at) -> "the token is not valid before " ++ seconds_text(at),
+    Missing(name) -> "`" ++ name ++ "` is required and absent",
+    Unexpected(name, found) ->
+      "`" ++ name ++ "` is " ++ join(found, ", ") ++ ", which is not what is required",
+  }
+
+fn part_name(part: Part) -> String =
+  match part {
+    InHeader -> "the header",
+    InPayload -> "the payload",
+    InSignature -> "the signature",
+    InKeys -> "the key set",
+  }
+
+fn seconds_text(at: Instant) -> String =
+  int_to_string(nanos_at(at) / 1000000000) ++ " seconds from 1970-01-01T00:00:00Z"
+
+// --- Signing ----------------------------------------------------------------
+
+/// A token of `claims` signed with `key`, its header naming the key's `alg` and what `marks`
+/// states. The same claims, key and marks always make the same token: both objects are written
+/// with no whitespace and their members in ascending order.
+///
+/// Raises for a key that cannot sign, as `sign_bytes` does, and for a registered claim's name in
+/// `claims.other`.
+pub fn sign(claims: Claims, key: Key, marks: Marks) -> String / {jwt.refused, abort.raise} =
+  sign_bytes(json::to_bytes(claims_json(claims)), key, marks)
+
+/// A token whose payload is `payload`, signed with `key`: the compact form of RFC 7515.
+///
+/// Raises for an HMAC secret shorter than its hash's digest, an Ed25519 seed that is not
+/// thirty-two bytes, and a public key.
+pub fn sign_bytes(payload: Bytes, key: Key, marks: Marks) -> String / {jwt.refused, abort.raise} = {
+  let signer = usable(key);
+  let header = json::to_bytes(header_json(algorithm(signer), marks));
+  let input = base64url_encode(header) ++ "." ++ base64url_encode(payload);
+  input ++ "." ++ base64url_encode(signature(signer, bytes_of_string(input)))
+}
+
+fn header_json(alg: String, marks: Marks) -> Json =
+  json::object(
+    somes([
+      text_member("alg", Some(alg)),
+      text_member("typ", marks.typ),
+      text_member("kid", marks.kid),
+    ]),
+  )
+
+fn text_member(name: String, text: Option<String>) -> Option<Member> =
+  option_map(text, |s: String| { key: name, value: Str(s) })
+
+// --- Verifying --------------------------------------------------------------
+
+/// The claims of `token`, where `key` signed it and they meet `policy` at `now`.
+///
+/// Refusals come in this order. The key is one `sign` would refuse. The token is longer than
+/// `policy.max_bytes`, is not three parts, or its header is not base64url of a JSON object with
+/// a string `alg`. The `alg` is `none`, is not the key's, or the header sets `b64` false or
+/// lists anything in `crit`. The signature is not base64url, or is not the key's. The payload is
+/// not base64url of a JSON object, or a registered claim in it has the wrong type. Then the
+/// policy: `typ`; `exp`, which is past once `now` is `exp` plus the leeway or later; `nbf`, which
+/// is ahead while `now` is before `nbf` less the leeway; `iss`; `aud`; and `sub`.
+pub fn verify(
+  token: String,
+  key: Key,
+  policy: Policy,
+  now: Instant,
+) -> Verified / {jwt.refused, abort.raise} = {
+  let signed = verify_bytes(token, key, policy.max_bytes);
+  let claims = claims_of_members(members_of(InPayload, signed.payload));
+  admitted(signed.header, claims, policy, now);
+  { header: signed.header, claims: claims }
+}
+
+/// `verify`, with its refusal as an `Err`.
+pub fn try_verify(
+  token: String,
+  key: Key,
+  policy: Policy,
+  now: Instant,
+) -> Result<Verified, Refusal> / {abort.raise} = try { verify(token, key, policy, now) }
+
+/// The payload of `token`, where `key` signed it: `verify` up to the signature, for a payload
+/// that is not claims. `max_bytes` is the longest token read.
+pub fn verify_bytes(
+  token: String,
+  key: Key,
+  max_bytes: Int,
+) -> Signed / {jwt.refused, abort.raise} = {
+  let verifier = usable(key);
+  let parts = parts_of(token, max_bytes);
+  let header = header_of(parts.header);
+  accepted(header, verifier);
+  let stated = decoded(InSignature, parts.signature);
+  if !signed_by(verifier, bytes_of_string(parts.header ++ "." ++ parts.payload), stated) {
+    jwt.refused(BadSignature)
+  } else { { header: header, payload: decoded(InPayload, parts.payload) } }
+}
+
+/// What `token` says of itself, with nothing checked: neither its signature, nor its `alg`, nor
+/// a claim. For choosing the key to verify it with, by its `kid` or its issuer. `max_bytes` is
+/// the longest token read.
+pub fn peek(token: String, max_bytes: Int) -> Unverified / {jwt.refused, abort.raise} = {
+  let parts = parts_of(token, max_bytes);
+  let header = header_of(parts.header);
+  {
+    header: header,
+    claims: claims_of_members(members_of(InPayload, decoded(InPayload, parts.payload))),
+  }
+}
+
+type Parts = { header: String, payload: String, signature: String }
+
+fn parts_of(token: String, max_bytes: Int) -> Parts / {jwt.refused, abort.raise} = {
+  let size = bytes_len(bytes_of_string(token));
+  if size > max_bytes { jwt.refused(TooLong(size)) } else {
+    match string_split(token, ".") {
+      [header, payload, signature] -> { header: header, payload: payload, signature: signature },
+      parts -> if len(parts) == 5 { jwt.refused(Encrypted) }
+      else { jwt.refused(Parts(len(parts))) },
+    }
+  }
+}
+
+fn decoded(part: Part, text: String) -> Bytes / {jwt.refused, abort.raise} =
+  match base64url_decode(text) { Some(raw) -> raw, None -> jwt.refused(Encoding(part)) }
+
+fn members_of(part: Part, raw: Bytes) -> Map<String, Json> / {jwt.refused, abort.raise} =
+  match json::parse_unique(raw) {
+    Ok(Object(members)) -> members,
+    Ok(other) -> jwt.refused(Malformed(part, json::expected("an object", other))),
+    Err(e) -> jwt.refused(Malformed(part, e)),
+  }
+
+fn header_of(text: String) -> Header / {jwt.refused, abort.raise} = {
+  let members = members_of(InHeader, decoded(InHeader, text));
+  match map_get(members, "alg") {
+    Some(Str(alg)) ->
+      { alg: alg, typ: text_of(members, "typ"), kid: text_of(members, "kid"), members: members },
+    _ -> jwt.refused(NoAlgorithm),
+  }
+}
+
+/// Whether a header is one `key` may judge: the algorithm first, so nothing is computed for a
+/// token that names another.
+fn accepted(header: Header, key: Key) -> Unit / {jwt.refused} =
+  if spells_none(header.alg) { jwt.refused(Unsecured(header.alg)) }
+  else if header.alg != algorithm(key) {
+    if contains(unimplemented(), header.alg) { jwt.refused(Unsupported(header.alg)) }
+    else { jwt.refused(WrongAlgorithm(header.alg, algorithm(key))) }
+  } else if map_get(header.members, "b64") == Some(json::Bool(false)) { jwt.refused(Unencoded) }
+  else {
+    match map_get(header.members, "crit") {
+      Some(listed) -> jwt.refused(Critical(strings_in(listed))),
+      None -> (),
+    }
+  }
+
+/// Whether `alg` is `none` in any capitals: an ASCII letter is its lower case with bit five set.
+fn spells_none(alg: String) -> Bool =
+  map(string_chars(alg), |c: Char| int_of_char(c) | 0x20) == [110, 111, 110, 101]
+
+/// The signature algorithms the JOSE registry names that need RSA or ECDSA.
+fn unimplemented() -> List<String> =
+  ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "ES256K"]
+
+fn strings_in(j: Json) -> List<String> =
+  match j {
+    Array(items) -> somes(map(items, |item: Json| match item { Str(s) -> Some(s), _ -> None })),
+    _ -> [],
+  }
+
+// --- Claims -----------------------------------------------------------------
+
+fn registered() -> List<String> = ["iss", "sub", "aud", "exp", "nbf", "iat", "jti"]
+
+/// The claims object a token of `c` carries: each registered claim that is stated, an audience
+/// of one as a string, each time as a NumericDate, and the members of `c.other`. Raises for a
+/// registered claim's name in `c.other`.
+pub fn claims_json(c: Claims) -> Json / {jwt.refused, abort.raise} =
+  match find(registered(), |name: String| map_contains(c.other, name)) {
+    Some(name) -> jwt.refused(Reserved(name)),
+    None ->
+      Object(
+        fold(stated(c), c.other, |members: Map<String, Json>, m: Member|
+          map_insert(members, m.key, m.value)),
+      ),
+  }
+
+/// The claims a JSON object states. Raises `Malformed` for a value that is no object, and
+/// `Mistyped` for a registered claim of the wrong type: `iss`, `sub` and `jti` are strings,
+/// `aud` a string or an array of them, and `exp`, `nbf` and `iat` numbers.
+///
+/// A time finer than a nanosecond is read to the nanosecond that favours no token: `exp` and
+/// `iat` toward the earlier, `nbf` toward the later. One past what an `Instant` holds, as the
+/// `exp` of a token meant never to expire, is the last instant it holds, or the first.
+pub fn claims_of_json(j: Json) -> Claims / {jwt.refused, abort.raise} =
+  match j {
+    Object(members) -> claims_of_members(members),
+    other -> jwt.refused(Malformed(InPayload, json::expected("an object", other))),
+  }
+
+/// The claim `name` among `c.other`, read through `codec`; an `Err` where there is none or it is
+/// not what the codec reads. A codec of a whole record reads `Object(c.other)`.
+pub fn claim<a>(
+  c: Claims,
+  name: String,
+  codec: JsonCodec<a>,
+) -> Result<a, DecodeError> / {abort.raise} = json::field(Object(c.other), name, codec)
+
+fn stated(c: Claims) -> List<Member> / {abort.raise} =
+  somes([
+    text_member("iss", c.issuer),
+    text_member("sub", c.subject),
+    audience_member(c.audience),
+    time_member("exp", c.expires),
+    time_member("nbf", c.not_before),
+    time_member("iat", c.issued_at),
+    text_member("jti", c.id),
+  ])
+
+fn audience_member(audience: List<String>) -> Option<Member> =
+  match audience {
+    [] -> None,
+    [one] -> Some({ key: "aud", value: Str(one) }),
+    several -> Some({ key: "aud", value: json::strings(several) }),
+  }
+
+fn time_member(name: String, at: Option<Instant>) -> Option<Member> / {abort.raise} =
+  option_map(at, |t: Instant| { key: name, value: numeric_date(t) })
+
+/// A NumericDate (RFC 7519 §2): seconds from 1970-01-01T00:00:00Z, written whole where they are.
+fn numeric_date(at: Instant) -> Json / {abort.raise} =
+  Number(decimal::normalize(decimal_div(decimal_of_int(nanos_at(at)), 1000000000m, 9, Down)))
+
+fn claims_of_members(members: Map<String, Json>) -> Claims / {jwt.refused, abort.raise} =
+  {
+    issuer: text_of(members, "iss"),
+    subject: text_of(members, "sub"),
+    audience: audience_of(members),
+    expires: time_of(members, "exp", Floor),
+    not_before: time_of(members, "nbf", Ceiling),
+    issued_at: time_of(members, "iat", Floor),
+    id: text_of(members, "jti"),
+    other: fold(registered(), members, |rest: Map<String, Json>, name: String|
+      map_remove(rest, name)),
+  }
+
+fn text_of(members: Map<String, Json>, name: String) -> Option<String> / {jwt.refused} =
+  match map_get(members, name) {
+    None -> None,
+    Some(Str(text)) -> Some(text),
+    Some(_) -> jwt.refused(Mistyped(name)),
+  }
+
+fn audience_of(members: Map<String, Json>) -> List<String> / {jwt.refused} =
+  match map_get(members, "aud") {
+    None -> [],
+    Some(Str(one)) -> [one],
+    Some(Array(items)) ->
+      map(items, |item: Json| match item { Str(s) -> s, _ -> jwt.refused(Mistyped("aud")) }),
+    Some(_) -> jwt.refused(Mistyped("aud")),
+  }
+
+fn time_of(
+  members: Map<String, Json>,
+  name: String,
+  toward: Rounding,
+) -> Option<Instant> / {jwt.refused, abort.raise} =
+  match map_get(members, name) {
+    None -> None,
+    Some(Number(seconds)) -> Some(instant_of(seconds, toward)),
+    Some(_) -> jwt.refused(Mistyped(name)),
+  }
+
+/// The instant a NumericDate names, to the nanosecond `toward` picks; one past what an `Instant`
+/// holds is the last it holds, or the first.
+fn instant_of(seconds: Decimal, toward: Rounding) -> Instant / {abort.raise} =
+  if seconds >= 9223372037m { Instant(max_int()) }
+  else if seconds <= -9223372037m { Instant(min_int()) } else {
+    match int_of_decimal(decimal_round(seconds, 9, toward) * 1000000000m, toward) {
+      Some(nanos) -> Instant(nanos),
+      None -> Instant(if seconds > 0m { max_int() } else { min_int() }),
+    }
+  }
+
+fn admitted(header: Header, c: Claims, policy: Policy, now: Instant) -> Unit / {jwt.refused} = {
+  held("typ", policy.typ, listed(header.typ));
+  in_time(c, policy, now);
+  held("iss", policy.issuer, listed(c.issuer));
+  held("aud", policy.audience, c.audience);
+  held("sub", policy.subject, listed(c.subject))
+}
+
+fn in_time(c: Claims, policy: Policy, now: Instant) -> Unit / {jwt.refused} = {
+  let leeway = max(as_nanos(policy.leeway), 0);
+  let at = nanos_at(now);
+  match c.expires {
+    Some(expires) -> if at >= nanos_at(expires) +| leeway { jwt.refused(Expired(expires)) },
+    None -> if policy.must_expire { jwt.refused(Missing("exp")) },
+  };
+  match c.not_before {
+    Some(start) -> if at < nanos_at(start) -| leeway { jwt.refused(NotYet(start)) },
+    None -> (),
+  }
+}
+
+fn held(name: String, expect: Expect, found: List<String>) -> Unit / {jwt.refused} =
+  if admits(expect, found) { () }
+  else if len(found) == 0 { jwt.refused(Missing(name)) }
+  else { jwt.refused(Unexpected(name, found)) }
+
+fn admits(expect: Expect, found: List<String>) -> Bool =
+  match expect {
+    Any -> true,
+    Exactly(wanted) -> contains(found, wanted),
+    OneOf(wanted) -> any(found, |value: String| contains(wanted, value)),
+  }
+
+fn listed(text: Option<String>) -> List<String> = match text { Some(t) -> [t], None -> [] }
+
+// --- Key sets ---------------------------------------------------------------
+
+/// A key as a JSON Web Key (RFC 7517) states it, under the `kid` its set knows it by.
+pub type Jwk = new { kid: Option<String>, key: Key }
+
+/// The key a JWK states: an `oct` key whose `alg` is `HS256`, `HS384` or `HS512`, or an `OKP` key
+/// on `Ed25519`, a public one or, with `d`, a seed.
+///
+/// An `oct` key with no `alg` is refused as `Missing`, since a `Key` names its algorithm and
+/// the bytes alone do not: build it from the bytes with the constructor meant. Raises
+/// `Unsupported` for any other `kty`, curve or `alg`, `Unexpected` for a `use` other than `sig`
+/// and for a `d` that is not the seed of `x`, and `Mistyped` for a member of the wrong type or
+/// not base64url.
+pub fn jwk(j: Json) -> Jwk / {jwt.refused, abort.raise} =
+  match j {
+    Object(members) -> {
+      where_stated("use", text_of(members, "use"), "sig");
+      let alg = text_of(members, "alg");
+      let key = match needed(members, "kty") {
+        "oct" -> shared_key(alg, octets(members, "k")),
+        "OKP" -> edwards_key(members, alg),
+        kind -> jwt.refused(Unsupported(kind)),
+      };
+      { kid: text_of(members, "kid"), key: usable(key) }
+    },
+    other -> jwt.refused(Malformed(InKeys, json::expected("an object", other))),
+  }
+
+/// The keys of a JWK Set this module can use, in its order. A key `jwk` would refuse is passed
+/// over, as RFC 7517 §5 asks, so a set that also holds RSA keys reads as its others. Raises for
+/// a text longer than `max_bytes`, or one that is not a JSON object with an array `keys`.
+pub fn jwks(src: Bytes, max_bytes: Int) -> List<Jwk> / {jwt.refused, abort.raise} =
+  if bytes_len(src) > max_bytes { jwt.refused(TooLong(bytes_len(src))) } else {
+    match map_get(members_of(InKeys, src), "keys") {
+      Some(Array(items)) -> somes(map(items, |item: Json| usable_jwk(item))),
+      Some(_) -> jwt.refused(Mistyped("keys")),
+      None -> jwt.refused(Missing("keys")),
+    }
+  }
+
+fn usable_jwk(j: Json) -> Option<Jwk> / {abort.raise} =
+  match try { jwk(j) } { Ok(k) -> Some(k), Err(_) -> None }
+
+/// The key among `keys` for a token with this header: the one of the header's algorithm, and of
+/// its `kid` where it names one. `None` where there is none, or more than one.
+pub fn key_for(keys: List<Jwk>, header: Header) -> Option<Key> =
+  match filter(keys, |k: Jwk|
+      algorithm(k.key) == header.alg && (header.kid == None || k.kid == header.kid)) {
+    [only] -> Some(only.key),
+    _ -> None,
+  }
+
+fn needed(members: Map<String, Json>, name: String) -> String / {jwt.refused} =
+  match text_of(members, name) { Some(text) -> text, None -> jwt.refused(Missing(name)) }
+
+fn octets(members: Map<String, Json>, name: String) -> Bytes / {jwt.refused, abort.raise} =
+  match base64url_decode(needed(members, name)) {
+    Some(raw) -> raw,
+    None -> jwt.refused(Mistyped(name)),
+  }
+
+fn shared_key(alg: Option<String>, secret: Bytes) -> Key / {jwt.refused} =
+  match alg {
+    Some("HS256") -> HmacSha256(secret),
+    Some("HS384") -> HmacSha384(secret),
+    Some("HS512") -> HmacSha512(secret),
+    Some(other) -> jwt.refused(Unsupported(other)),
+    None -> jwt.refused(Missing("alg")),
+  }
+
+fn edwards_key(
+  members: Map<String, Json>,
+  alg: Option<String>,
+) -> Key / {jwt.refused, abort.raise} = {
+  where_stated("alg", alg, "EdDSA");
+  let curve = needed(members, "crv");
+  if curve != "Ed25519" { jwt.refused(Unsupported(curve)) } else {
+    let public = usable(Ed25519(octets(members, "x")));
+    if !map_contains(members, "d") { public } else {
+      let seed = usable(Ed25519Seed(octets(members, "d")));
+      if verifying(seed) == public { seed }
+      else { jwt.refused(Unexpected("x", [needed(members, "x")])) }
+    }
+  }
+}
+
+/// A member that may be left out, and must be `wanted` where it is not.
+fn where_stated(name: String, stated: Option<String>, wanted: String) -> Unit / {jwt.refused} =
+  match stated {
+    Some(value) -> if value != wanted { jwt.refused(Unexpected(name, [value])) },
+    None -> (),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn the_bytes(text: String) -> Bytes / {abort.raise} = option_expect(base64url_decode(text), text)
+
+fn b64(text: String) -> String / {abort.raise} = base64url_encode(bytes_of_string(text))
+
+fn at_second(secs: Int) -> Instant = after(Instant(0), seconds(secs))
+
+/// The bytes `0`, `1`, `2` and on: the keys the Python cross-checks were made with.
+fn counting(n: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(range(0, n), |i: Int| byte_of_int(i)))
+
+/// A policy that looks at the signature and the times and nothing else.
+fn lax() -> Policy =
+  {
+    max_bytes: 4096,
+    leeway: seconds(0),
+    must_expire: false,
+    issuer: Any,
+    audience: Any,
+    subject: Any,
+    typ: Any,
+  }
+
+fn as_jwt() -> Marks = { typ: Some("JWT"), kid: None }
+
+fn unmarked() -> Marks = { typ: None, kid: None }
+
+/// A token of this header and payload, signed by `key` whatever the header says.
+fn forged(header: String, payload: String, key: Key) -> String / {jwt.refused, abort.raise} =
+  resigned(b64(header) ++ "." ++ b64(payload), key)
+
+/// These two parts as written, with `key`'s signature over them.
+fn resigned(input: String, key: Key) -> String / {jwt.refused, abort.raise} =
+  input ++ "." ++ base64url_encode(signature(key, bytes_of_string(input)))
+
+/// The key of RFC 7515 appendix A.1, whose token RFC 7519 §3.1 shows again.
+fn rfc_key() -> Key / {abort.raise} =
+  HmacSha256(
+    the_bytes(
+      "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow",
+    ),
+  )
+
+fn rfc_claims_part() -> String =
+  "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ"
+
+fn rfc_token() -> String =
+  "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9." ++ rfc_claims_part()
+    ++ ".dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+test "RFC 7519's example token verifies under its key, and its claims are the RFC's" {
+  let v = verify(rfc_token(), rfc_key(), lax(), at_second(1300819379));
+  assert_eq(v.header.alg, "HS256");
+  assert_eq(v.header.typ, Some("JWT"));
+  assert_eq(v.header.kid, None);
+  assert_eq(v.claims, {
+    ..claims(),
+    issuer: Some("joe"),
+    expires: Some(at_second(1300819380)),
+    other: #{"http://example.com/is_root": json::Bool(true)},
+  });
+  // The token is good until its `exp` and not at it.
+  assert_eq(
+    try_verify(rfc_token(), rfc_key(), lax(), at_second(1300819380)),
+    Err(Expired(at_second(1300819380))),
+  )
+}
+
+/// The seed of RFC 8037 appendix A's Ed25519 key.
+fn rfc_seed() -> Bytes / {abort.raise} = the_bytes("nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A")
+
+fn rfc_public() -> Bytes / {abort.raise} = the_bytes("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo")
+
+fn rfc_edwards_token() -> String =
+  "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc.hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg"
+
+test "RFC 8037's Ed25519 example is what its seed signs" {
+  assert_eq(
+    sign_bytes(b"Example of Ed25519 signing", Ed25519Seed(rfc_seed()), unmarked()),
+    rfc_edwards_token(),
+  );
+  let asked = try { sign_bytes(b"x", Ed25519(rfc_public()), unmarked()) };
+  assert_eq(asked, Err(CannotSign))
+}
+
+type Published = { name: String, token: String, key: Key, alg: String, payload: Bytes }
+
+/// The signed tokens the RFCs publish under an algorithm this module has, each with its key and
+/// the octets it signs.
+fn published() -> List<Published> / {abort.raise} =
+  [
+    {
+      name: "RFC 7515 appendix A.1",
+      token: rfc_token(),
+      key: rfc_key(),
+      alg: "HS256",
+      payload: b"{\"iss\":\"joe\",\r\n \"exp\":1300819380,\r\n \"http://example.com/is_root\":true}",
+    },
+    {
+      name: "RFC 8037 appendix A.4",
+      token: rfc_edwards_token(),
+      key: Ed25519(rfc_public()),
+      alg: "EdDSA",
+      payload: b"Example of Ed25519 signing",
+    },
+  ]
+
+test "the token of {c.name} is its key's over its payload" for c: Published in published() {
+  let signed = verify_bytes(c.token, c.key, 4096);
+  assert_eq(signed.payload, c.payload);
+  assert_eq(signed.header.alg, c.alg)
+}
+
+test "RFC 8037's keys read as the seed and the public key they are" {
+  let private = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"d\":\"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}";
+  let public = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}";
+  // Reading a seed checks it against its `x`, which is `verifying` of it.
+  assert_eq(jwk(document(private)), { kid: None, key: Ed25519Seed(rfc_seed()) });
+  assert_eq(jwk(document(public)), { kid: None, key: Ed25519(rfc_public()) })
+}
+
+fn document(text: String) -> Json / {abort.raise} = result_expect(json::parse_string(text), text)
+
+/// The claims the cross-checks sign: Python's `hmac` and `cryptography` over the same header and
+/// claims, each object written with sorted keys and no whitespace.
+fn sample() -> Claims =
+  {
+    issuer: Some("https://issuer.example"),
+    subject: Some("user-17"),
+    audience: ["api", "billing"],
+    expires: Some(at_second(2000000000)),
+    not_before: Some(at_second(1700000000)),
+    issued_at: Some(Instant(1700000000500000000)),
+    id: Some("a1b2"),
+    other: #{"role": Str("admin"), "n": json::int(3)},
+  }
+
+fn sample_part() -> String =
+  "eyJhdWQiOlsiYXBpIiwiYmlsbGluZyJdLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMC41LCJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwianRpIjoiYTFiMiIsIm4iOjMsIm5iZiI6MTcwMDAwMDAwMCwicm9sZSI6ImFkbWluIiwic3ViIjoidXNlci0xNyJ9"
+
+/// The HS256 token of `sample`, which most refusals below start from.
+fn good() -> String =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." ++ sample_part()
+    ++ ".KUdvKNCD6zaE2hd1zWnynapMmo8MgtTvVbbWH272D0s"
+
+fn good_key() -> Key / {abort.raise} = HmacSha256(counting(32))
+
+/// An instant `sample` is valid at.
+fn in_time_of_sample() -> Instant = at_second(1800000000)
+
+type Crossed = { alg: String, claims: Claims, key: Key, marks: Marks, token: String }
+
+fn crossed() -> List<Crossed> / {abort.raise} =
+  [
+    { alg: "HS256", claims: sample(), key: good_key(), marks: as_jwt(), token: good() },
+    {
+      alg: "HS384",
+      claims: sample(),
+      key: HmacSha384(counting(48)),
+      marks: as_jwt(),
+      token: "eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9." ++ sample_part()
+        ++ ".Y4t3-IYBKMn6swto-jODAjZKztGn32fZkxpuPco2HgJd5lNevQ_QamsEUo1Y0XGy",
+    },
+    {
+      alg: "HS512",
+      claims: sample(),
+      key: HmacSha512(counting(64)),
+      marks: { typ: Some("JWT"), kid: Some("k-2") },
+      token: "eyJhbGciOiJIUzUxMiIsImtpZCI6ImstMiIsInR5cCI6IkpXVCJ9." ++ sample_part()
+        ++ ".ZCuPIqXqELMF3OePZmXR2REHroW8gwMLTOpzAK2hS4baDIuoRWREJ83iyHFBGNSH8_5FydfHoCKaIlLR-3XR6A",
+    },
+    {
+      alg: "HS384 with one audience and no marks",
+      claims: { ..claims(), audience: ["api"], subject: Some("x") },
+      key: HmacSha384(counting(48)),
+      marks: unmarked(),
+      token: "eyJhbGciOiJIUzM4NCJ9.eyJhdWQiOiJhcGkiLCJzdWIiOiJ4In0.jniQIj2uwwBO66S0_GrW3GyAqeaL22gVcX7SwvfUo9Il2otYa_e5sNEMlxCwo1bX",
+    },
+  ]
+
+/// `sample` under RFC 8037's seed, with `kid` `ed-1`, as Python's `cryptography` signs it.
+fn crossed_edwards_token() -> String =
+  "eyJhbGciOiJFZERTQSIsImtpZCI6ImVkLTEiLCJ0eXAiOiJKV1QifQ." ++ sample_part()
+    ++ ".csmT3VGLM6WQjyCqxzRHOVTbl8eUkwfE1P9p0IOYa-ebI19PV-0o7053vItcsJ4H9MJ9Lec0GIqvH08GrlGyCw"
+
+test "{c.alg} signs the token Python signs, and verifies it" for c: Crossed in crossed() {
+  assert_eq(sign(c.claims, c.key, c.marks), c.token);
+  let v = verify(c.token, c.key, lax(), in_time_of_sample());
+  assert_eq(v.claims, c.claims);
+  assert_eq(v.header.typ, c.marks.typ);
+  assert_eq(v.header.kid, c.marks.kid);
+  assert_eq(peek(c.token, 4096), { header: v.header, claims: v.claims })
+}
+
+// --- Tests: refusals --------------------------------------------------------
+
+type Attack = {
+  name: String,
+  token: String,
+  key: Key,
+  policy: Policy,
+  now: Instant,
+  refusal: Refusal,
+}
+
+/// A token `good_key` is asked to verify under `lax`, while `sample` is valid.
+fn attack(name: String, token: String, refusal: Refusal) -> Attack / {abort.raise} =
+  {
+    name: name,
+    token: token,
+    key: good_key(),
+    policy: lax(),
+    now: in_time_of_sample(),
+    refusal: refusal,
+  }
+
+/// `word` with the letters `mask` has a bit for in upper case.
+fn capitalized(word: String, mask: Int) -> String =
+  string_of_chars(
+    map(enumerate(string_chars(word)), |c: { index: Int, value: Char }|
+      if mask >> c.index & 1 == 0 { c.value } else {
+        match char_of_int(int_of_char(c.value) - 32) { Some(upper) -> upper, None -> c.value }
+      }),
+  )
+
+/// `none` in each of its sixteen capitalizations, each as a token nobody signed and as one that
+/// kept a good token's signature.
+fn unsigned() -> List<Attack> / {abort.raise} =
+  flat_map(range(0, 16), |mask: Int| {
+    let alg = capitalized("none", mask);
+    let input = b64("{\"alg\":\"" ++ alg ++ "\",\"typ\":\"JWT\"}") ++ "." ++ sample_part();
+    [
+      attack("an unsigned token whose alg is " ++ alg, input ++ ".", Unsecured(alg)),
+      attack(
+        "a token whose alg is " ++ alg ++ " over a signature",
+        input ++ ".KUdvKNCD6zaE2hd1zWnynapMmo8MgtTvVbbWH272D0s",
+        Unsecured(alg),
+      ),
+    ]
+  })
+
+fn hs256_header() -> String = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+
+/// `[`, `depth` deep, around a `1`.
+fn nested(depth: Int) -> String = repeat("[", depth) ++ "1" ++ repeat("]", depth)
+
+fn parse_failure(text: String) -> DecodeError / {abort.raise} =
+  match json::parse_string(text) { Err(e) -> e, Ok(_) -> panic("this text parses: " ++ text) }
+
+fn malformed() -> List<Attack> / {jwt.refused, abort.raise} =
+  [
+    attack(
+      "RFC 7519's own unsecured token",
+      "eyJhbGciOiJub25lIn0." ++ rfc_claims_part() ++ ".",
+      Unsecured("none"),
+    ),
+    attack(
+      "a token with its signature stripped",
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." ++ sample_part() ++ ".",
+      BadSignature,
+    ),
+    attack(
+      "a token cut to its first two parts",
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." ++ sample_part(),
+      Parts(2),
+    ),
+    attack("a token of four parts", good() ++ ".e30", Parts(4)),
+    attack("an empty token", "", Parts(1)),
+    attack(
+      "an encrypted token's five parts",
+      "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.a.b.c.d",
+      Encrypted,
+    ),
+    attack(
+      "a token whose payload was swapped for another",
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." ++ b64("{\"sub\":\"admin\"}")
+        ++ ".KUdvKNCD6zaE2hd1zWnynapMmo8MgtTvVbbWH272D0s",
+      BadSignature,
+    ),
+    attack(
+      "a token signed under another secret",
+      sign(sample(), HmacSha256(counting(33)), as_jwt()),
+      BadSignature,
+    ),
+    attack(
+      "a header that names alg twice, the key's first",
+      forged("{\"alg\":\"HS256\",\"alg\":\"none\"}", "{}", good_key()),
+      Malformed(InHeader, json::error_at(15, "this object already has a member named `alg`")),
+    ),
+    attack(
+      "a header that names alg twice, the key's last",
+      forged("{\"alg\":\"none\",\"alg\":\"HS256\"}", "{}", good_key()),
+      Malformed(InHeader, json::error_at(14, "this object already has a member named `alg`")),
+    ),
+    attack(
+      "a claims object that names sub twice",
+      forged(hs256_header(), "{\"sub\":\"a\",\"sub\":\"b\"}", good_key()),
+      Malformed(InPayload, json::error_at(11, "this object already has a member named `sub`")),
+    ),
+    attack(
+      "a header marking a member critical",
+      forged("{\"alg\":\"HS256\",\"crit\":[\"exp\"],\"exp\":1800000000}", "{}", good_key()),
+      Critical(["exp"]),
+    ),
+    attack(
+      "a header whose crit is no list of names",
+      forged("{\"alg\":\"HS256\",\"crit\":true}", "{}", good_key()),
+      Critical([]),
+    ),
+    attack(
+      "a payload that is not base64url, said by b64 and crit",
+      forged("{\"alg\":\"HS256\",\"b64\":false,\"crit\":[\"b64\"]}", "{}", good_key()),
+      Unencoded,
+    ),
+    attack(
+      "a payload that is not base64url, said by b64 alone",
+      forged("{\"alg\":\"HS256\",\"b64\":false}", "{}", good_key()),
+      Unencoded,
+    ),
+    attack(
+      "claims nested past what JSON is read to",
+      forged(hs256_header(), nested(129), good_key()),
+      Malformed(InPayload, json::error_at(128, "nested deeper than 128 levels")),
+    ),
+    attack(
+      "a header nested past what JSON is read to",
+      forged("{\"alg\":\"HS256\",\"x\":" ++ nested(128) ++ "}", "{}", good_key()),
+      Malformed(InHeader, json::error_at(146, "nested deeper than 128 levels")),
+    ),
+    attack("a padded signature", good() ++ "=", Encoding(InSignature)),
+    attack("a line feed after the token", good() ++ "\n", Encoding(InSignature)),
+    attack("a space before the token", " " ++ good(), Encoding(InHeader)),
+    attack(
+      "a signature whose last letter holds bits no byte does",
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." ++ sample_part()
+        ++ ".KUdvKNCD6zaE2hd1zWnynapMmo8MgtTvVbbWH272D0t",
+      Encoding(InSignature),
+    ),
+    attack(
+      "a padded payload under a signature that covers the padding",
+      resigned(b64(hs256_header()) ++ ".e30=", good_key()),
+      Encoding(InPayload),
+    ),
+    attack(
+      "a header that is not base64url",
+      "!!!." ++ sample_part() ++ ".AAAA",
+      Encoding(InHeader),
+    ),
+    attack(
+      "a header that is not JSON",
+      forged("alg=HS256", "{}", good_key()),
+      Malformed(InHeader, parse_failure("alg=HS256")),
+    ),
+    attack(
+      "a header that is an array",
+      forged("[\"HS256\"]", "{}", good_key()),
+      Malformed(InHeader, json::expected("an object", Array([Str("HS256")]))),
+    ),
+    attack(
+      "claims that are an array",
+      forged(hs256_header(), "[1]", good_key()),
+      Malformed(InPayload, json::expected("an object", Array([json::int(1)]))),
+    ),
+    attack("a header with no alg", forged("{\"typ\":\"JWT\"}", "{}", good_key()), NoAlgorithm),
+    attack(
+      "a header whose alg is a list",
+      forged("{\"alg\":[\"HS256\"]}", "{}", good_key()),
+      NoAlgorithm,
+    ),
+    attack(
+      "a header whose typ is a number",
+      forged("{\"alg\":\"HS256\",\"typ\":7}", "{}", good_key()),
+      Mistyped("typ"),
+    ),
+    attack(
+      "RFC 7515's ES256 example",
+      "eyJhbGciOiJFUzI1NiJ9." ++ rfc_claims_part()
+        ++ ".DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q",
+      Unsupported("ES256"),
+    ),
+    attack("an RS256 token", b64("{\"alg\":\"RS256\"}") ++ ".e30.AAAA", Unsupported("RS256")),
+    attack("a PS256 token", b64("{\"alg\":\"PS256\"}") ++ ".e30.AAAA", Unsupported("PS256")),
+    attack(
+      "an algorithm nobody defines",
+      forged("{\"alg\":\"HS999\"}", "{}", good_key()),
+      WrongAlgorithm("HS999", "HS256"),
+    ),
+    attack(
+      "an HS384 token under an HS256 key",
+      sign(sample(), HmacSha384(counting(48)), as_jwt()),
+      WrongAlgorithm("HS384", "HS256"),
+    ),
+    attack(
+      "an alg in other capitals than the key's",
+      forged("{\"alg\":\"hs256\"}", "{}", good_key()),
+      WrongAlgorithm("hs256", "HS256"),
+    ),
+    attack(
+      "an exp that is a string",
+      forged(hs256_header(), "{\"exp\":\"2000000000\"}", good_key()),
+      Mistyped("exp"),
+    ),
+    attack(
+      "an aud that is a number",
+      forged(hs256_header(), "{\"aud\":7}", good_key()),
+      Mistyped("aud"),
+    ),
+    attack(
+      "an aud that lists a number",
+      forged(hs256_header(), "{\"aud\":[\"api\",7]}", good_key()),
+      Mistyped("aud"),
+    ),
+    attack(
+      "an iss that is null",
+      forged(hs256_header(), "{\"iss\":null}", good_key()),
+      Mistyped("iss"),
+    ),
+  ]
+
+/// Refusals that turn on the verifier's key, policy or clock.
+fn judged() -> List<Attack> / {jwt.refused, abort.raise} =
+  [
+    {
+      ..attack("an HS256 token made with a public key's bytes as its secret", forged(hs256_header(), "{\"sub\":\"admin\"}", HmacSha256(rfc_public())), WrongAlgorithm("HS256", "EdDSA")),
+      key: Ed25519(rfc_public()),
+    },
+    {
+      ..attack("an Ed25519 token under another public key", rfc_edwards_token(), BadSignature),
+      key: other_public(),
+    },
+    {
+      ..attack("a secret a byte short of its digest", good(), ShortKey(31)),
+      key: HmacSha256(counting(31)),
+    },
+    {
+      ..attack("an HS512 secret of an HS256 secret's length", good(), ShortKey(32)),
+      key: HmacSha512(counting(32)),
+    },
+    { ..attack("a public key a byte short", good(), KeyLength(31)), key: Ed25519(counting(31)) },
+    {
+      ..attack("a token longer than the verifier reads", good(), TooLong(string_len(good()))),
+      policy: { ..lax(), max_bytes: string_len(good()) - 1 },
+    },
+    {
+      ..attack("a token before its nbf", good(), NotYet(at_second(1700000000))),
+      now: Instant(1699999999999999999),
+    },
+    {
+      ..attack("a token before its nbf less the leeway", good(), NotYet(at_second(1700000000))),
+      policy: { ..lax(), leeway: seconds(60) },
+      now: Instant(1699999939999999999),
+    },
+    {
+      ..attack("a token at its exp", good(), Expired(at_second(2000000000))),
+      now: at_second(2000000000),
+    },
+    {
+      ..attack("a token at its exp and the leeway", good(), Expired(at_second(2000000000))),
+      policy: { ..lax(), leeway: seconds(60) },
+      now: at_second(2000000060),
+    },
+    {
+      ..attack("a token that never expires, where it must", forged(hs256_header(), "{\"sub\":\"x\"}", good_key()), Missing("exp")),
+      policy: { ..lax(), must_expire: true },
+    },
+    {
+      ..attack("another issuer's token", good(), Unexpected("iss", ["https://issuer.example"])),
+      policy: { ..lax(), issuer: Exactly("https://other.example") },
+    },
+    {
+      ..attack("an issuer outside the list", good(), Unexpected("iss", ["https://issuer.example"])),
+      policy: { ..lax(), issuer: OneOf(["https://a.example", "https://b.example"]) },
+    },
+    {
+      ..attack("a token for other audiences", good(), Unexpected("aud", ["api", "billing"])),
+      policy: { ..lax(), audience: Exactly("admin") },
+    },
+    {
+      ..attack("a token about someone else", good(), Unexpected("sub", ["user-17"])),
+      policy: { ..lax(), subject: Exactly("user-18") },
+    },
+    {
+      ..attack("a token of another kind", good(), Unexpected("typ", ["JWT"])),
+      policy: { ..lax(), typ: Exactly("at+jwt") },
+    },
+    {
+      ..attack("a typ in other capitals", good(), Unexpected("typ", ["JWT"])),
+      policy: { ..lax(), typ: Exactly("jwt") },
+    },
+    {
+      ..attack("a token with no issuer, where one is required", forged(hs256_header(), "{\"sub\":\"x\"}", good_key()), Missing("iss")),
+      policy: { ..lax(), issuer: Exactly("https://issuer.example") },
+    },
+    {
+      ..attack("a token for nobody, where an audience is required", forged(hs256_header(), "{\"aud\":[]}", good_key()), Missing("aud")),
+      policy: { ..lax(), audience: Exactly("api") },
+    },
+    {
+      ..attack("a token of no stated kind, where one is required", forged("{\"alg\":\"HS256\"}", "{}", good_key()), Missing("typ")),
+      policy: { ..lax(), typ: Exactly("JWT") },
+    },
+  ]
+
+fn attacks() -> List<Attack> / {jwt.refused, abort.raise} =
+  concat(unsigned(), concat(malformed(), judged()))
+
+test "{c.name} is refused" for c: Attack in attacks() {
+  assert_eq(try_verify(c.token, c.key, c.policy, c.now), Err(c.refusal))
+}
+
+test "a refusal says what it refused" {
+  assert_eq(
+    refusal_to_string(Unsupported("RS256")),
+    "`RS256` is not implemented: this module has HS256, HS384, HS512 and EdDSA over Ed25519, and no RSA or ECDSA",
+  );
+  assert_eq(
+    refusal_to_string(
+      Malformed(InHeader, json::error_at(14, "this object already has a member named `alg`")),
+    ),
+    "the header is not a JSON object naming each member once: $: this object already has a member named `alg` (at byte 14)",
+  );
+  assert_eq(
+    refusal_to_string(Expired(at_second(2000000000))),
+    "the token expired at 2000000000 seconds from 1970-01-01T00:00:00Z",
+  );
+  assert_eq(
+    refusal_to_string(Unexpected("aud", ["api", "billing"])),
+    "`aud` is api, billing, which is not what is required",
+  )
+}
+
+// --- Tests: what a policy admits --------------------------------------------
+
+test "a token is good from its nbf less the leeway until its exp and the leeway" {
+  let minute: Policy = { ..lax(), leeway: seconds(60) };
+  assert_eq(verify(good(), good_key(), lax(), at_second(1700000000)).claims, sample());
+  assert_eq(verify(good(), good_key(), lax(), Instant(1999999999999999999)).claims, sample());
+  assert_eq(verify(good(), good_key(), minute, at_second(1699999940)).claims, sample());
+  assert_eq(verify(good(), good_key(), minute, Instant(2000000059999999999)).claims, sample());
+  // A leeway below zero is none.
+  let tight: Policy = { ..lax(), leeway: seconds(0 - 60) };
+  assert_eq(verify(good(), good_key(), tight, at_second(1700000000)).claims, sample())
+}
+
+test "a policy admits the issuer, audience, subject and kind it names" {
+  let strict: Policy = {
+    max_bytes: 4096,
+    leeway: seconds(0),
+    must_expire: true,
+    issuer: Exactly("https://issuer.example"),
+    audience: Exactly("billing"),
+    subject: OneOf(["user-16", "user-17"]),
+    typ: Exactly("JWT"),
+  };
+  let v = verify(good(), good_key(), strict, in_time_of_sample());
+  assert_eq(v.claims.subject, Some("user-17"));
+  assert_eq(v.claims.id, Some("a1b2"));
+  let either: Policy = { ..strict, audience: OneOf(["admin", "api"]) };
+  assert_eq(verify(good(), good_key(), either, in_time_of_sample()), v);
+  // A token as long as the limit is read.
+  let exact: Policy = { ..strict, max_bytes: string_len(good()) };
+  assert_eq(verify(good(), good_key(), exact, in_time_of_sample()), v);
+  // A header member nobody marked critical is passed over.
+  let extra = forged(
+    "{\"alg\":\"HS256\",\"b64\":true,\"jku\":\"https://evil.example/keys\"}",
+    "{}",
+    good_key(),
+  );
+  assert_eq(verify(extra, good_key(), lax(), in_time_of_sample()).claims, claims())
+}
+
+test "a time is read to the nanosecond that favours no token, and one past an Instant as its end" {
+  let read = |payload: String|
+    verify(forged(hs256_header(), payload, good_key()), good_key(), lax(), Instant(0)).claims;
+  assert_eq(read("{\"exp\":1.9999999999}").expires, Some(Instant(1999999999)));
+  assert_eq(read("{\"nbf\":-0.9999999991}").not_before, Some(Instant(0 - 999999999)));
+  assert_eq(read("{\"iat\":1e3}").issued_at, Some(at_second(1000)));
+  assert_eq(read("{\"exp\":9999999999}").expires, Some(Instant(max_int())));
+  assert_eq(read("{\"exp\":9223372036.854775807}").expires, Some(Instant(max_int())));
+  assert_eq(read("{\"exp\":9223372036.854775806}").expires, Some(Instant(max_int() - 1)));
+  assert_eq(read("{\"exp\":1e28}").expires, Some(Instant(max_int())));
+  assert_eq(read("{\"nbf\":-1e28}").not_before, Some(Instant(min_int())));
+  // As many digits as a number holds are read, not raised on.
+  assert_eq(read("{\"exp\":1.0000000000000000000000000001}").expires, Some(at_second(1)));
+  assert_eq(read("{\"nbf\":-1.0000000000000000000000000001}").not_before, Some(at_second(0 - 1)))
+}
+
+test "claims are written as their JSON object and read back from it" {
+  assert_eq(
+    json::to_string(claims_json(sample())),
+    "{\"aud\":[\"api\",\"billing\"],\"exp\":2000000000,\"iat\":1700000000.5,\"iss\":\"https://issuer.example\",\"jti\":\"a1b2\",\"n\":3,\"nbf\":1700000000,\"role\":\"admin\",\"sub\":\"user-17\"}",
+  );
+  assert_eq(claims_of_json(claims_json(sample())), sample());
+  assert_eq(json::to_string(claims_json(claims())), "{}");
+  let reserved: Claims = { ..claims(), other: #{"exp": json::int(1)} };
+  assert_eq(try { claims_json(reserved) }, Err(Reserved("exp")));
+  assert_eq(try { sign(reserved, good_key(), as_jwt()) }, Err(Reserved("exp")));
+  assert_eq(
+    try { claims_of_json(Str("x")) },
+    Err(Malformed(InPayload, json::expected("an object", Str("x")))),
+  )
+}
+
+test "a claim outside the registered seven is read through a codec" {
+  assert_eq(claim(sample(), "role", json::string_json()), Ok("admin"));
+  assert_eq(claim(sample(), "n", json::int_json()), Ok(3));
+  assert_eq(
+    claim(sample(), "role", json::int_json()),
+    Err(json::in_field("role", json::expected("a number", Str("admin")))),
+  );
+  assert_eq(
+    claim(sample(), "scope", json::string_json()),
+    Err(json::in_field("scope", json::decode_error("this field is missing"))),
+  );
+  // A registered claim is its field, and no member of `other`.
+  assert_eq(
+    claim(sample(), "iss", json::string_json()),
+    Err(json::in_field("iss", json::decode_error("this field is missing"))),
+  )
+}
+
+test "signing refuses a key its algorithm cannot use" {
+  assert_eq(try { sign(sample(), HmacSha256(counting(31)), as_jwt()) }, Err(ShortKey(31)));
+  assert_eq(try { sign(sample(), HmacSha384(counting(47)), as_jwt()) }, Err(ShortKey(47)));
+  assert_eq(try { sign(sample(), HmacSha512(counting(63)), as_jwt()) }, Err(ShortKey(63)));
+  assert_eq(try { sign(sample(), Ed25519Seed(counting(33)), as_jwt()) }, Err(KeyLength(33)));
+  assert_eq(try { verifying(Ed25519Seed(counting(31))) }, Err(KeyLength(31)))
+}
+
+// --- Tests: key sets --------------------------------------------------------
+
+/// A set as an issuer publishes one: an RSA key and a P-256 key, which are passed over, RFC
+/// 8037's Ed25519 key and another, RFC 7515's HMAC key, and keys that are for something else.
+fn key_set() -> Bytes =
+  bytes_of_string(
+    \\{"keys": [
+    \\  {"kty": "RSA", "kid": "rsa-1", "use": "sig", "alg": "RS256", "n": "AQAB", "e": "AQAB"},
+    \\  {"kty": "EC", "kid": "ec-1", "crv": "P-256", "x": "AA", "y": "AA"},
+    \\  {"kty": "OKP", "kid": "ed-1", "use": "sig", "alg": "EdDSA", "crv": "Ed25519",
+    \\   "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"},
+    \\  {"kty": "OKP", "kid": "ed-2", "crv": "Ed25519",
+    \\   "x": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"},
+    \\  {"kty": "oct", "kid": "mac-1", "alg": "HS256",
+    \\   "k": "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow"},
+    \\  {"kty": "oct", "kid": "wrap-1", "alg": "A128KW", "k": "GawgguFyGrWKav7AX4VKUg"},
+    \\  {"kty": "oct", "kid": "mac-unnamed",
+    \\   "k": "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow"},
+    \\  {"kty": "oct", "kid": "mac-short", "alg": "HS256", "k": "c2VjcmV0"},
+    \\  {"kty": "OKP", "kid": "x-1", "crv": "X25519",
+    \\   "x": "3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrfx-FG-IK08"},
+    \\  {"kty": "OKP", "kid": "ed-enc", "use": "enc", "crv": "Ed25519",
+    \\   "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}
+    \\]}
+  )
+
+test "a key set reads as the keys this module can use, and a header picks its own among them" {
+  let keys = jwks(key_set(), 4096);
+  assert_eq(keys, [
+    { kid: Some("ed-1"), key: Ed25519(rfc_public()) },
+    { kid: Some("ed-2"), key: other_public() },
+    { kid: Some("mac-1"), key: rfc_key() },
+  ]);
+  let seen = peek(crossed_edwards_token(), 4096);
+  assert_eq(seen.header.kid, Some("ed-1"));
+  assert_eq(key_for(keys, seen.header), Some(Ed25519(rfc_public())));
+  assert_eq(
+    option_map(key_for(keys, seen.header), |key: Key|
+      verify(crossed_edwards_token(), key, lax(), in_time_of_sample()).claims),
+    Some(sample()),
+  );
+  // RFC 7519's token names no key: one key is of its algorithm, and two are of EdDSA.
+  assert_eq(key_for(keys, peek(rfc_token(), 4096).header), Some(rfc_key()));
+  assert_eq(key_for(keys, peek(rfc_edwards_header() ++ ".e30.", 4096).header), None);
+  let named = |alg: String, kid: String|
+    key_for(
+      keys,
+      peek(b64("{\"alg\":\"" ++ alg ++ "\",\"kid\":\"" ++ kid ++ "\"}") ++ ".e30.", 4096).header,
+    );
+  assert_eq(named("EdDSA", "ed-2"), Some(other_public()));
+  assert_eq(named("EdDSA", "ed-3"), None);
+  // A name is its algorithm's: `mac-1` is no EdDSA key.
+  assert_eq(named("EdDSA", "mac-1"), None);
+  assert_eq(named("HS256", "mac-1"), Some(rfc_key()))
+}
+
+fn rfc_edwards_header() -> String = "eyJhbGciOiJFZERTQSJ9"
+
+/// The public key of RFC 8032's second test: one that did not sign RFC 8037's example.
+fn other_public() -> Key / {abort.raise} =
+  Ed25519(the_bytes("PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"))
+
+type Unread = { name: String, key: String, refusal: Refusal }
+
+fn unread() -> List<Unread> =
+  [
+    {
+      name: "an RSA key",
+      key: "{\"kty\":\"RSA\",\"n\":\"AQAB\",\"e\":\"AQAB\"}",
+      refusal: Unsupported("RSA"),
+    },
+    {
+      name: "an X25519 key",
+      key: "{\"kty\":\"OKP\",\"crv\":\"X25519\",\"x\":\"3p7bfXt9wbTTW2HC7OQ1Nz-DQ8hbeGdNrfx-FG-IK08\"}",
+      refusal: Unsupported("X25519"),
+    },
+    {
+      name: "a key-wrapping key",
+      key: "{\"kty\":\"oct\",\"alg\":\"A128KW\",\"k\":\"GawgguFyGrWKav7AX4VKUg\"}",
+      refusal: Unsupported("A128KW"),
+    },
+    {
+      name: "an oct key that names no algorithm",
+      key: "{\"kty\":\"oct\",\"k\":\"AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow\"}",
+      refusal: Missing("alg"),
+    },
+    {
+      name: "an HMAC key shorter than its digest",
+      key: "{\"kty\":\"oct\",\"alg\":\"HS256\",\"k\":\"c2VjcmV0\"}",
+      refusal: ShortKey(6),
+    },
+    {
+      name: "an encryption key",
+      key: "{\"kty\":\"OKP\",\"use\":\"enc\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}",
+      refusal: Unexpected("use", ["enc"]),
+    },
+    {
+      name: "an Ed25519 key said to be for another algorithm",
+      key: "{\"kty\":\"OKP\",\"alg\":\"ES256\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}",
+      refusal: Unexpected("alg", ["ES256"]),
+    },
+    {
+      name: "a seed that is not its public key's",
+      key: "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"d\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}",
+      refusal: Unexpected("x", ["11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"]),
+    },
+    {
+      name: "a public key of the wrong length",
+      key: "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"AAECAw\"}",
+      refusal: KeyLength(4),
+    },
+    {
+      name: "a padded key",
+      key: "{\"kty\":\"oct\",\"alg\":\"HS256\",\"k\":\"c2VjcmV0cw==\"}",
+      refusal: Mistyped("k"),
+    },
+    { name: "a key of no type", key: "{\"k\":\"c2VjcmV0\"}", refusal: Missing("kty") },
+    {
+      name: "a key with no bytes",
+      key: "{\"kty\":\"oct\",\"alg\":\"HS256\"}",
+      refusal: Missing("k"),
+    },
+    {
+      name: "a key whose kid is a number",
+      key: "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":7,\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}",
+      refusal: Mistyped("kid"),
+    },
+  ]
+
+test "{c.name} is not read" for c: Unread in unread() {
+  assert_eq(try { jwk(document(c.key)) }, Err(c.refusal))
+}
+
+test "a key set is a bounded JSON object with a list of keys" {
+  assert_eq(try { jwks(key_set(), 100) }, Err(TooLong(bytes_len(key_set()))));
+  assert_eq(try { jwks(b"{\"keys\":{}}", 100) }, Err(Mistyped("keys")));
+  assert_eq(try { jwks(b"{}", 100) }, Err(Missing("keys")));
+  assert_eq(
+    try { jwks(b"[]", 100) },
+    Err(Malformed(InKeys, json::expected("an object", Array([])))),
+  );
+  assert_eq(jwks(b"{\"keys\":[]}", 100), []);
+  assert_eq(jwks(b"{\"keys\":[7,null,{\"kty\":\"RSA\"}]}", 100), [])
+}
+
+// --- Laws -------------------------------------------------------------------
+
+/// A policy that looks at nothing, for a law about the signature.
+fn roomy() -> Policy = { ..lax(), max_bytes: 1 << 30 }
+
+fn signable(c: Claims) -> Bool = !any(registered(), |name: String| map_contains(c.other, name))
+
+fn timely(c: Claims, now: Instant) -> Bool =
+  (match c.expires { Some(expires) -> nanos_at(now) < nanos_at(expires), None -> true })
+    && (match c.not_before { Some(start) -> nanos_at(now) >= nanos_at(start), None -> true })
+
+fn untimed(c: Claims) -> Claims = { ..c, expires: None, not_before: None }
+
+fn refuses(token: String, key: Key) -> Bool / {abort.raise} =
+  match try_verify(token, key, roomy(), Instant(0)) { Err(_) -> true, Ok(_) -> false }
+
+/// `raw` with one bit flipped: the bit `at` counts to, round its length.
+fn flipped(raw: Bytes, at: Int) -> Bytes / {abort.raise} = {
+  let bits = 8 * bytes_len(raw);
+  let bit = (at % bits + bits) % bits;
+  bytes_concat_all([
+    bytes_slice(raw, 0, bit / 8),
+    byte_of_int(bytes_at(raw, bit / 8) ^ 1 << bit % 8),
+    bytes_slice(raw, bit / 8 + 1, bytes_len(raw)),
+  ])
+}
+
+law "verify answers the claims sign was given, in their time"
+  forall (c: Claims, key: Key, now: Instant) where signable(c) && timely(c, now) {
+    verify(sign(c, key, as_jwt()), verifying(key), roomy(), now).claims == c
+  }
+
+law "claims read back from the object they are written as"
+  forall (c: Claims) where signable(c) {
+    claims_of_json(claims_json(c)) == c
+  }
+
+law "a token is refused under every key but its own"
+  forall (c: Claims, key: Key, other: Key) where signable(c) && key != other {
+    match try_verify(sign(untimed(c), key, as_jwt()), verifying(other), roomy(), Instant(0)) {
+      Err(BadSignature) -> algorithm(key) == algorithm(other),
+      Err(WrongAlgorithm(found, wanted)) -> found == algorithm(key) && wanted == algorithm(other),
+      _ -> false,
+    }
+  }
+
+law "a token with any one bit flipped is refused"
+  forall (c: Claims, key: Key, at: Int) where signable(c) {
+    let token = sign(untimed(c), key, as_jwt());
+    let other = string_of_bytes_lossy(flipped(bytes_of_string(token), at));
+    !refuses(token, verifying(key)) && refuses(other, verifying(key))
+  }
+
+type Place = { token: String, key: Key, from: Int, to: Int }
+
+/// Every bit of the HS256 token, eight bytes a case. Of the Ed25519 token, whose signature
+/// takes a second to check, every bit of the header and one of the payload and of each half of
+/// the signature.
+fn places() -> List<Place> / {abort.raise} = {
+  let bits = 8 * string_len(good());
+  concat(
+    map(range(0, (bits + 63) / 64), |i: Int|
+      { token: good(), key: good_key(), from: 64 * i, to: min(64 * i + 64, bits) }),
+    [
+      edwards_place(0, 160),
+      edwards_place(240, 241),
+      edwards_place(480, 481),
+      edwards_place(962, 963),
+    ],
+  )
+}
+
+fn edwards_place(from: Int, to: Int) -> Place / {abort.raise} =
+  { token: rfc_edwards_token(), key: Ed25519(rfc_public()), from: from, to: to }
+
+test "{algorithm(c.key)} refuses a flip of any bit from {c.from} to {c.to}" for c: Place in places(
+  ) {
+  let raw = bytes_of_string(c.token);
+  let admitted = filter(range(c.from, c.to), |bit: Int|
+    match try { verify_bytes(string_of_bytes_lossy(flipped(raw, bit)), c.key, 4096) } {
+      Ok(_) -> true,
+      Err(_) -> false,
+    });
+  assert_eq(admitted, [])
+}

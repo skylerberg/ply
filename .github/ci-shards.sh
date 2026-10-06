@@ -130,7 +130,7 @@ GATES_ALONE=(
 CLI_TREE_CHECKS=(
   "copies:no two modules define the same function"
   "fixture_list:every fixture is listed"
-  "fmt:the standard library is committed formatted"
+  "fmt:{path} is committed formatted"
   "fmt:the compiler is committed formatted"
   "fmt:the CLI is committed formatted"
   "fmt:the CLI's suite is committed formatted"
