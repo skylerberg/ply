@@ -1,0 +1,95 @@
+//! `std.xz` against files the reference tool wrote. `xz/` holds what `xz` 5.8.2 made of the
+//! samples `packed_samples` makes, each named for its sample and how it was packed: at presets 0,
+//! 2, 6 and 9 extreme, with each check the format defines a sum for (`--check=none`, `crc32`,
+//! `sha256`, and CRC-64 where none is named), in blocks of 40000 bytes (`--block-size`) and by
+//! two threads, with a dictionary of 4 KiB and with every literal and position setting LZMA has
+//! (`lc`, `lp`, `pb`), with the longest match (`nice=273`), and, as files a reader names and
+//! refuses, through the x86, ARM64 and delta filters. A shipped module embeds no file, so the
+//! tests that read files stand here.
+
+import packed_samples (sample)
+import std.seq
+import std.seq (seq)
+import std.xz
+import std.xz (xz, Limits, Refusal)
+
+type File = { name: String, bytes: Bytes }
+
+fn files() -> List<File> = embed_dir("xz")
+
+fn file(name: String) -> Bytes / {abort.raise} =
+  match filter(files(), |f: File| f.name == name) {
+    [found, ..] -> found.bytes,
+    [] -> panic(f"no file {name}"),
+  }
+
+/// The sample a packed file was made of, which its name opens with.
+fn plain_of(name: String) -> Bytes / {abort.raise} =
+  match string_split(name, ".") { [stem, ..] -> sample(stem), [] -> panic("no name") }
+
+fn packed() -> List<File> = filter(files(), |f: File| string_ends_with(f.name, ".xz"))
+
+/// Room for the 64 MiB dictionary the ninth preset asks for.
+fn roomy() -> Limits = { output: 1000000, window: 67108864 }
+
+fn outcome(got: Result<Bytes, Refusal>, want: Bytes) -> String =
+  match got {
+    Ok(b) -> if b == want { "same" }
+    else { f"differs: {bytes_len(b)} bytes for {bytes_len(want)}" },
+    Err(r) -> f"refused at {r.at}: {reflect(r.why)}",
+  }
+
+test "{f.name} unpacks to its sample" for f: File in packed() {
+  assert_eq(outcome(xz::try_decompress(f.bytes, roomy()), plain_of(f.name)), "same")
+}
+
+/// What `packed` unpacks to, read `size` bytes at a time.
+fn streamed(
+  packed: Bytes,
+  size: Int,
+  limits: Limits,
+) -> Bytes / {xz.refused, seq.spent, abort.raise} =
+  bytes_concat_all(seq::to_list(xz::decoded(seq::slices(packed, size), limits), 10000000))
+
+test "{f.name} unpacks the same a chunk at a time, whatever the chunk" for f: File in packed() {
+  let whole = plain_of(f.name);
+  assert(streamed(f.bytes, 100000, roomy()) == whole);
+  assert(streamed(f.bytes, 4099, roomy()) == whole);
+  assert(bytes_len(f.bytes) > 3000 || streamed(f.bytes, 1, roomy()) == whole)
+}
+
+test "streams one after another are one file, with zeros in fours between and after them" {
+  let both = bytes_concat(sample("brief"), sample("one"));
+  let a = file("brief.l6.xz");
+  let b = file("one.l6.xz");
+  let n = bytes_len(a);
+  assert_eq(outcome(xz::try_decompress(bytes_concat(a, b), roomy()), both), "same");
+  let padded = bytes_concat_all([a, b"\x00\x00\x00\x00", b, b"\x00\x00\x00\x00\x00\x00\x00\x00"]);
+  assert_eq(outcome(xz::try_decompress(padded, roomy()), both), "same");
+  assert(streamed(padded, 3, roomy()) == both);
+  assert_eq(
+    xz::try_decompress(bytes_concat_all([a, b"\x00\x00\x00", b]), roomy()),
+    Err({ at: n, why: xz::Trailing }),
+  );
+  let first = xz::first(bytes_concat(a, b"more"), roomy());
+  assert_eq(first.plain, sample("brief"));
+  assert_eq(first.used, n)
+}
+
+test "{c.name} is refused by its filter's number" for c: { name: String, why: xz::Why } in [
+    { name: "records.x86.refused", why: xz::Filter(4) },
+    { name: "records.delta.refused", why: xz::Filter(3) },
+    { name: "records.arm64.refused", why: xz::Filter(10) },
+  ] { assert_eq(xz::try_decompress(file(c.name), roomy()), Err({ at: 12, why: c.why })) }
+
+test "a dictionary past the window is refused before a chunk is read, and an output past the limit where it would be passed" {
+  let asks = file("prose.l9sha.xz");
+  let got = metered(|| xz::try_decompress(asks, { output: 1000000, window: 67108863 }));
+  assert_eq(got.value, Err({ at: 12, why: xz::Window }));
+  // Two CRC-32s of a few bytes, each charged the table it reads.
+  assert(got.steps < 10000, Some(int_to_string(got.steps)));
+  assert(match xz::try_decompress(file("long.blocks.xz"), { output: 149999, window: 67108864 }) {
+    Err(r) -> r.why == xz::OverLimit,
+    Ok(_) -> false,
+  })
+}
