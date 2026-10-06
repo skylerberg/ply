@@ -1,0 +1,134 @@
+//! `std.zstd` against frames the reference tool wrote. `zstd/` holds what `zstd` 1.5.7 made of the
+//! samples `packed_samples` makes, each named for its sample and how it was packed: at levels 1,
+//! 3 and 19 and at `--fast=5`, without a checksum (`--no-check`), from a pipe, which gives a frame
+//! a window and no length, with a window of 1 KiB (`--zstd=wlog=10`) and with one declared as
+//! 1 GiB (`--long=30`), and with a dictionary: `prose.dict`, which `zstd --train` made of 400
+//! pieces of prose, and the first 5000 bytes of the prose sample as they are. A shipped module
+//! embeds no file, so the tests that read files stand here.
+
+import packed_samples (names, sample)
+import std.seq
+import std.seq (seq)
+import std.zstd
+import std.zstd (zstd, Limits, Refusal)
+
+type File = { name: String, bytes: Bytes }
+
+fn files() -> List<File> = embed_dir("zstd")
+
+fn file(name: String) -> Bytes / {abort.raise} =
+  match filter(files(), |f: File| f.name == name) {
+    [found, ..] -> found.bytes,
+    [] -> panic(f"no file {name}"),
+  }
+
+/// The sample a packed file was made of, which its name opens with.
+fn plain_of(name: String) -> Bytes / {abort.raise} =
+  match string_split(name, ".") { [stem, ..] -> sample(stem), [] -> panic("no name") }
+
+/// The frames a reader takes with no dictionary and a window of 8 MiB.
+fn frames() -> List<File> =
+  filter(files(), |f: File|
+    string_ends_with(f.name, ".zst") && !string_contains(f.name, "dict")
+      && !string_contains(f.name, "declares30"))
+
+fn roomy() -> Limits = { output: 1000000, window: 8388608 }
+
+fn outcome(got: Result<Bytes, Refusal>, want: Bytes) -> String =
+  match got {
+    Ok(b) -> if b == want { "same" }
+    else { f"differs: {bytes_len(b)} bytes for {bytes_len(want)}" },
+    Err(r) -> f"refused at {r.at}: {reflect(r.why)}",
+  }
+
+test "{f.name} unpacks to its sample" for f: File in frames() {
+  assert_eq(outcome(zstd::try_decompress(f.bytes, roomy()), plain_of(f.name)), "same")
+}
+
+/// What `packed` unpacks to, read `size` bytes at a time.
+fn streamed(
+  packed: Bytes,
+  size: Int,
+  limits: Limits,
+) -> Bytes / {zstd.refused, seq.spent, abort.raise} =
+  bytes_concat_all(seq::to_list(zstd::decoded(seq::slices(packed, size), limits), 10000000))
+
+test "{f.name} unpacks the same a chunk at a time, whatever the chunk" for f: File in frames() {
+  let whole = plain_of(f.name);
+  assert(streamed(f.bytes, 100000, roomy()) == whole);
+  assert(streamed(f.bytes, 4099, roomy()) == whole);
+  assert(bytes_len(f.bytes) > 3000 || streamed(f.bytes, 1, roomy()) == whole)
+}
+
+test "{name} survives the writer, whole and a chunk at a time" for name: String in names() {
+  let plain = sample(name);
+  let fast = zstd::compress(plain, zstd::Fast);
+  assert_eq(outcome(zstd::try_decompress(fast, roomy()), plain), "same");
+  assert_eq(
+    outcome(zstd::try_decompress(zstd::compress(plain, zstd::Stored), roomy()), plain),
+    "same",
+  );
+  let chunked = bytes_concat_all(
+    seq::to_list(zstd::encoded(seq::slices(plain, 50000), zstd::Fast), 100000),
+  );
+  assert_eq(outcome(zstd::try_decompress(chunked, roomy()), plain), "same");
+  assert(bytes_len(fast) <= bytes_len(plain) + 16)
+}
+
+test "frames one after another are one stream, and skippable frames among them are passed" {
+  let both = bytes_concat(sample("brief"), sample("one"));
+  let skip = b"\x50\x2A\x4D\x18\x04\x00\x00\x00skip";
+  let none = b"\x5F\x2A\x4D\x18\x00\x00\x00\x00";
+  let a = file("brief.l3.zst");
+  let b = file("one.l3.zst");
+  assert_eq(outcome(zstd::try_decompress(bytes_concat(a, b), roomy()), both), "same");
+  let mixed = bytes_concat_all([skip, a, none, skip, b, none]);
+  assert_eq(outcome(zstd::try_decompress(mixed, roomy()), both), "same");
+  assert(streamed(mixed, 5, roomy()) == both);
+  let first = zstd::first(mixed, roomy());
+  assert_eq(first.plain, sample("brief"));
+  assert_eq(first.used, bytes_len(skip) + bytes_len(a));
+  assert_eq(
+    zstd::try_decompress(bytes_concat(a, b"junk"), roomy()),
+    Err({ at: bytes_len(a), why: zstd::Trailing }),
+  )
+}
+
+test "a frame written with a dictionary is read with it, and refused without it or with another" {
+  let trained = zstd::dictionary(file("prose.dict"));
+  let raw = zstd::dictionary(bytes_slice(sample("prose"), 0, 5000));
+  let brief = file("brief.dict.zst");
+  assert(zstd::decompress_with(brief, trained, roomy()) == sample("brief"));
+  assert(zstd::decompress_with(file("prose.dict.zst"), trained, roomy()) == sample("prose"));
+  assert(zstd::decompress_with(file("brief.rawdict.zst"), raw, roomy()) == sample("brief"));
+  let refused = |got: Result<Bytes, Refusal>|
+    match got { Err(r) -> r.why == zstd::Dictionary, Ok(_) -> false };
+  assert(refused(zstd::try_decompress(brief, roomy())));
+  assert(refused(try { zstd::decompress_with(brief, raw, roomy()) }));
+  let chunks = zstd::decoded_with(seq::slices(file("prose.dict.zst"), 777), trained, roomy());
+  assert(bytes_concat_all(seq::to_list(chunks, 1000000)) == sample("prose"));
+  let twice = bytes_concat(brief, brief);
+  assert(
+    zstd::decompress_with(twice, trained, roomy())
+      == bytes_concat(sample("brief"), sample("brief")),
+  )
+}
+
+test "a frame that declares a window past the limit is refused before a block is read" {
+  let far = file("brief.declares30.zst");
+  let got = metered(|| zstd::try_decompress(far, roomy()));
+  assert_eq(got.value, Err({ at: 0, why: zstd::Window }));
+  assert(got.steps < 40, Some(int_to_string(got.steps)));
+  assert_eq(
+    zstd::try_decompress(far, { output: 1000000, window: 1073741824 }),
+    Ok(sample("brief")),
+  );
+  assert_eq(
+    zstd::try_decompress(file("long.wlog10.zst"), { output: 1000000, window: 1023 }),
+    Err({ at: 0, why: zstd::Window }),
+  );
+  assert(match zstd::try_decompress(file("long.l1.zst"), { output: 149999, window: 8388608 }) {
+    Err(r) -> r.why == zstd::OverLimit && r.at == 0,
+    Ok(_) -> false,
+  })
+}

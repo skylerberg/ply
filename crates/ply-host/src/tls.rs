@@ -24,6 +24,12 @@ pub const CONNECT_HANDLER: &str = "ply_host::tls::connect";
 /// The Rust path `ply hosts` prints for `net.handshake`; it must name [`Session::handshake`].
 pub const HANDSHAKE_HANDLER: &str = "ply_host::tls::handshake";
 
+/// The Rust path `ply hosts` prints for `net.start_tls`, the client's end of an upgrade.
+pub const START_HANDLER: &str = "ply_host::tls::start";
+
+/// The Rust path `ply hosts` prints for `net.serve_tls`, the server's end of an upgrade.
+pub const SERVE_HANDLER: &str = "ply_host::tls::serve";
+
 pub const LIBRARY: &str = "rustls";
 pub const VERSION: &str = "0.23.43";
 
@@ -334,6 +340,50 @@ impl Stream {
             Stream::Client(s) => s.conn.send_close_notify(),
         }
     }
+
+    /// The application protocol the handshake agreed on.
+    fn protocol(&self) -> Option<String> {
+        let agreed = match self {
+            Stream::Server(s) => s.conn.alpn_protocol(),
+            Stream::Client(s) => s.conn.alpn_protocol(),
+        };
+        agreed.map(|p| String::from_utf8_lossy(p).into_owned())
+    }
+}
+
+/// Why a handshake asked to complete within a deadline did not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unsettled {
+    Expired,
+    /// One of the `REASON_` strings.
+    Refused(&'static str),
+}
+
+/// The configuration `config` with `alpn` as the protocols it offers, none when `alpn` is empty.
+pub fn client_offering(config: &ClientConfig, alpn: &[String]) -> Arc<ClientConfig> {
+    let mut config = config.clone();
+    config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+    Arc::new(config)
+}
+
+/// The configuration `config` with `alpn` as the protocols it accepts; empty accepts a client
+/// whatever it offers and agrees on none.
+pub fn server_accepting(config: &ServerConfig, alpn: &[String]) -> Arc<ServerConfig> {
+    let mut config = config.clone();
+    config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+    Arc::new(config)
+}
+
+/// Whether bytes are waiting to be read on a connection that is about to start a handshake as the
+/// client, where the server never speaks first: plaintext sent behind a go-ahead.
+pub fn plaintext_waiting(socket: &TcpStream) -> bool {
+    if socket.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let waiting = matches!(socket.peek(&mut byte), Ok(n) if n > 0);
+    let _ = socket.set_nonblocking(false);
+    waiting
 }
 
 impl Read for Stream {
@@ -400,13 +450,29 @@ impl Session {
         socket: Arc<TcpStream>,
         handshakes: Arc<Handshakes>,
     ) -> Session {
-        if started.is_none() {
-            handshakes.refused(REASON_CONFIGURATION);
-            let _ = socket.shutdown(Shutdown::Both);
+        match started {
+            Some(stream) => Session {
+                socket,
+                session: Mutex::new(Some(stream)),
+                handshakes,
+                took: Mutex::new(None),
+            },
+            None => Session::refused(socket, handshakes, REASON_CONFIGURATION),
         }
+    }
+
+    /// A session that never starts: the connection is ended, counted under `reason`, and reads as
+    /// a peer done sending.
+    pub fn refused(
+        socket: Arc<TcpStream>,
+        handshakes: Arc<Handshakes>,
+        reason: &'static str,
+    ) -> Session {
+        handshakes.refused(reason);
+        let _ = socket.shutdown(Shutdown::Both);
         Session {
             socket,
-            session: Mutex::new(started),
+            session: Mutex::new(None),
             handshakes,
             took: Mutex::new(None),
         }
@@ -415,6 +481,76 @@ impl Session {
     /// This end's address, which the session shares with the socket it runs over.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
+
+    /// The socket the session runs over, for the options that are the socket's.
+    pub fn socket(&self) -> &TcpStream {
+        &self.socket
+    }
+
+    /// The handshake, completed within `timeout` in all, answering the application protocol it
+    /// agreed on. A handshake that does not complete ends the connection, a deadline included:
+    /// an upgrade that timed out has left bytes of a handshake on the wire.
+    pub fn settle_within(&self, timeout: Duration) -> Result<Option<String>, Unsettled> {
+        let began = Instant::now();
+        let mut guard = lock(&self.session);
+        let Some(stream) = guard.as_mut() else {
+            return Err(Unsettled::Refused(REASON_CONFIGURATION));
+        };
+        loop {
+            if !stream.is_handshaking() {
+                let took = began.elapsed().as_micros() as u64;
+                lock(&self.took).get_or_insert(took);
+                self.handshakes.completed();
+                return Ok(stream.protocol());
+            }
+            let Some(left) = timeout
+                .checked_sub(began.elapsed())
+                .filter(|d| !d.is_zero())
+            else {
+                self.finish(&mut guard, Some(REASON_SLOW));
+                return Err(Unsettled::Expired);
+            };
+            let _ = self.socket.set_read_timeout(Some(left));
+            let _ = self.socket.set_write_timeout(Some(left));
+            match stream.complete_io() {
+                Ok((0, 0)) if stream.is_handshaking() => {
+                    self.finish(&mut guard, Some(REASON_GONE));
+                    return Err(Unsettled::Refused(REASON_GONE));
+                }
+                Ok(_) => {}
+                Err(e) if expired(&e) => {
+                    self.finish(&mut guard, Some(REASON_SLOW));
+                    return Err(Unsettled::Expired);
+                }
+                Err(e) => {
+                    let why = reason(true, &e);
+                    self.finish(&mut guard, Some(why));
+                    return Err(Unsettled::Refused(why));
+                }
+            }
+        }
+    }
+
+    /// Ends a session that will not be handshaken, counted under `reason`.
+    pub fn refuse(&self, reason: &'static str) {
+        let mut guard = lock(&self.session);
+        self.finish(&mut guard, Some(reason));
+    }
+
+    /// Ends this end's sending: `close_notify`, then the socket's write half. Reads go on until the
+    /// peer ends its own.
+    pub fn close_write(&self) {
+        let mut guard = lock(&self.session);
+        if let Some(stream) = guard.as_mut() {
+            stream.send_close_notify();
+            let _ = stream.flush();
+        }
+        let _ = self.socket.shutdown(Shutdown::Write);
     }
 
     /// The handshake, completed now rather than when a request needs it, answering what it took in
@@ -550,6 +686,10 @@ pub const REASON_MISBEHAVED: &str = "the peer sent a TLS message the protocol do
 pub const REASON_CERTIFICATE: &str = "the peer's certificate was refused";
 pub const REASON_GONE: &str = "the peer went away mid-handshake";
 pub const REASON_TRANSPORT: &str = "the connection failed mid-handshake";
+pub const REASON_SLOW: &str = "the handshake did not complete before its deadline";
+pub const REASON_INJECTED: &str = "plaintext was waiting when the handshake was to begin";
+pub const REASON_NAME: &str =
+    "the name is neither a DNS name nor an IP address, so no certificate can be verified as it";
 pub const REASON_OTHER: &str = "the TLS session failed";
 
 /// A deadline that expired, which is not an ending.
