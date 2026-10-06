@@ -1,0 +1,88 @@
+//! `std.tz` against another reader of the same release, and its tag written in source.
+//!
+//! `tz/zoneinfo.txt` holds, for every zone and link of tzdata 2026e, what CPython's `zoneinfo`
+//! reads of the files that release's own `zic` compiles from it. A line is a name and then
+//! probes, tabs between them. `@ <second> <offset> <abbreviation> <daylight>` is what the clocks
+//! stand at at a second of Unix time. `U <reading> <second>`, `G <reading> <before> <after>` and
+//! `O <reading> <earlier> <later>` are what a wall-clock reading, as the second a clock that never
+//! changes would read it at, names: one instant, a gap or an overlap. A zone's probes are the
+//! second before its first change and the second of it, the same of its last change before
+//! October 2026 with a reading that change skips or repeats, a second drawn from 1700 to 2262,
+//! and the last second an `Instant` holds; a link's is one second of July 2026. The database's
+//! notice is beside the file.
+//!
+//! A module cannot write its own tag, so the tests that write `tz"..."` stand here too.
+
+import std.bytes (int_of_ascii)
+import std.date
+import std.date (DateTime)
+import std.list (at_or)
+import std.tz
+import std.tz (Gap, Offset, Overlap, Resolution, Unique, Zone)
+
+type Vector = { zone: String, probes: List<Bytes> }
+
+fn vectors() -> List<Vector> / {abort.raise} =
+  fold(bytes_split(embed("tz/zoneinfo.txt"), b"\n"), [], |found: List<Vector>, line: Bytes|
+    match bytes_split(line, b"\t") {
+      [name, ..probes] -> if bytes_len(name) == 0 { found }
+      else { push(found, { zone: string_of_bytes(name), probes: probes }) },
+      [] -> found,
+    })
+
+fn number(parts: List<Bytes>, i: Int) -> Int / {abort.raise} =
+  match int_of_ascii(at_or(parts, i, b"")) {
+    Some(n) -> n,
+    None -> panic("a probe's field " ++ int_to_string(i) ++ " is no number"),
+  }
+
+fn instant(parts: List<Bytes>, i: Int) -> Instant / {abort.raise} =
+  Instant(number(parts, i) * 1000000000)
+
+fn reading(parts: List<Bytes>) -> DateTime / {abort.raise} =
+  match date::of_unix_seconds(number(parts, 1)) {
+    Some(read) -> date::local(read),
+    None -> panic("a probe's reading is outside the calendar"),
+  }
+
+fn probed(z: Zone, probe: Bytes) -> Unit / {abort.raise} = {
+  let parts = bytes_split(probe, b" ");
+  let kind = at_or(parts, 0, b"");
+  if kind == b"@" {
+    let stands: Offset = {
+      seconds: number(parts, 2),
+      abbreviation: string_of_bytes(at_or(parts, 3, b"")),
+      daylight: at_or(parts, 4, b"") == b"1",
+    };
+    assert_eq(tz::offset_at(z, instant(parts, 1)), stands)
+  } else {
+    let names: Resolution = if kind == b"U" { Unique(instant(parts, 2)) }
+    else if kind == b"G" { Gap({ before: instant(parts, 2), after: instant(parts, 3) }) }
+    else { Overlap({ earlier: instant(parts, 2), later: instant(parts, 3) }) };
+    assert_eq(tz::resolve(z, reading(parts)), Some(names))
+  }
+}
+
+test "the vectors are of every zone and link the database has" {
+  assert_eq(len(vectors()), len(tz::names()) + len(tz::links()));
+  assert_eq(fold(vectors(), 0, |n: Int, v: Vector| n + len(v.probes)), 2482)
+}
+
+test "{c.zone} reads as `zoneinfo` reads what `zic` makes of the release" for c: Vector in vectors(
+  ) {
+  match tz::parse(c.zone) {
+    Ok(z) -> fold(c.probes, (), |_: Unit, probe: Bytes| probed(z, probe)),
+    Err(refused) -> panic(tz::refusal_message(refused)),
+  }
+}
+
+fn paris() -> Zone = tz"Europe/Paris"
+
+test "a zone written in source is the zone its name names" {
+  assert_eq(Ok(paris()), tz::parse("Europe/Paris"));
+  assert_eq(tz::name(tz"US/Pacific"), "America/Los_Angeles");
+  assert_eq(Some(tz"+05:30"), tz::fixed(19800));
+  assert_eq(tz"Etc/UTC", tz::utc());
+  assert_eq(f"{tz"Asia/Kolkata"} and {tz"-03:30"}", "Asia/Kolkata and -03:30");
+  assert_eq(tz::offset_at(paris(), Instant(1791158400000000000)).abbreviation, "CEST")
+}
