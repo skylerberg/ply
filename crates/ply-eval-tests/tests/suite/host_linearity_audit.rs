@@ -113,10 +113,7 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
         op("net", "send", linearity),
         counter.clone() as Arc<dyn HostHandler>,
     )]);
-    // Registered only where declared: registering an operation the program lacks is `E0421`.
-    if source.contains("accept[s]") {
-        registry.register(op("net", "accept", linearity), Arc::new(Waits));
-    }
+    registry.register(op("net", "accept", linearity), Arc::new(Waits));
     if tasks {
         registry = with_tasks(registry, counter.clone());
     }
