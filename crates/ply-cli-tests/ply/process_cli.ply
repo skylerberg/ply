@@ -2,16 +2,16 @@
 //! children it starts, and that none of them outlives the run. What a program writes goes to the
 //! process's own streams, so every run here is one.
 
-import harness (scratch, Ran, Server, program, on_disk, spawned, spawned_reading, speaking,
-                next_line, signal_to, ended, environment, said, stdout, stderr, json_of, at, str,
-                int, truth, shown, items, finished, stop, Here, Spawned)
+import harness (scratch, Ran, Server, program, on_disk, spawned, spawned_reading, spawned_fed,
+                spawned_into, this_ply, speaking, next_line, signal_to, ended, environment, said,
+                stdout, stderr, json_of, at, str, int, truth, shown, items, finished, stop, Here,
+                Spawned, Shell)
 import std.bytes
 import std.config (config)
 import std.json (Json, Null)
-import std.list (concat, contains)
-import std.os (os)
+import std.list (contains)
 import std.process (process, Finished, Signal, Exited, Signalled, Terminate, Hangup, User1, User2,
-                    WindowChange, Keep, var)
+                    WindowChange)
 import std.string
 import std.time (time)
 
@@ -282,25 +282,6 @@ test/nondet "a drain that runs out of time ends the children with the run" {
 
 // --- The streams as bytes ---------------------------------------------------
 
-/// A `ply` run as `spawned` runs one, fed `input` and then the end of its input: how it ended,
-/// and each stream as it wrote it.
-fn fed(argv: List<String>, input: Bytes) -> Finished / {Spawned, abort.raise} =
-  match process.start[ply](concat(["--color", "never"], argv), "", environment([]), {
-      input: true,
-      out: Keep,
-      err: Keep,
-    }) {
-    Err(why) -> panic("`ply` did not start: " ++ why),
-    Ok(child) -> {
-      let _ = process.input[ply](child, input);
-      process.end_input[ply](child);
-      match process.wait[ply](child, -1) {
-        Some(f) -> f,
-        None -> panic("a wait with no timeout came back with nothing"),
-      }
-    },
-  }
-
 fn exit_of(f: Finished) -> Int = match f.ended { Exited(c) -> c, Signalled(n) -> 128 + n }
 
 /// `cat`: standard input to standard output through `std.io`, then an exit, so no value follows.
@@ -338,7 +319,7 @@ fn only_the_runs_own(text: Bytes) -> Bool / {abort.raise} = {
 test/nondet "a Ply cat copies its input to its output byte for byte" {
   program(cat());
   let input = every_byte();
-  let f = fed(["run", "m.ply", "--host"], input);
+  let f = spawned_fed(["run", "m.ply", "--host"], [], input);
   assert(exit_of(f) == 0, Some(said(finished(f))));
   let before = bytes_len(f.out) - bytes_len(input);
   assert(
@@ -358,7 +339,7 @@ test/nondet "a Ply cat copies its input to its output byte for byte" {
 test/nondet "under json the bytes a program writes go to stderr, where its lines go" {
   program(cat());
   let input = every_byte();
-  let f = fed(["run", "m.ply", "--host", "--json"], input);
+  let f = spawned_fed(["run", "m.ply", "--host", "--json"], [], input);
   assert(exit_of(f) == 0, Some(string_of_bytes_lossy(f.out)));
   assert(
     f.err == input,
@@ -457,22 +438,13 @@ fn answers_the_pipe() -> String =
   \\    }
   \\  }
 
-/// The `ply` this run is, which every run of the suite also names `--exec ply`.
-fn this_ply() -> String / {os.executable, abort.raise} =
-  match os.executable() { Some(path) -> path, None -> panic("this `ply` has no path") }
-
 /// What `ply run m.ply --host` leaves when the reader of its output takes three lines and goes,
 /// as `head` does: the third line, which is the program's first after the run's own two, and on
-/// stderr what the run said and then `status` and the code it exited with.
-fn into_head() -> Finished / {process.spawn[sh], config.get[env], os.executable, abort.raise} =
-  process.spawn[sh](
-    [
-      "-c",
-      "{ \"$PLY\" --color never run m.ply --host; echo \"status $?\" >&2; } | { read a; read b; read c; echo \"$c\"; }",
-    ],
-    "",
-    push(environment([]), var("PLY", this_ply())),
-  )
+/// stderr what the run said and then `status` and the code it exited with. The reader is a
+/// shell's own `read`, which takes a line and not a byte past it, so the pipe closes on the
+/// program and never on the two lines the run writes before it.
+fn into_head() -> Finished / {Shell, abort.raise} =
+  spawned_into(["run", "m.ply", "--host"], "{ read a; read b; read c; echo \"$c\"; }")
 
 test/nondet "a program writing into a pipe whose reader left exits quietly, as a closed pipe ends one" {
   fold(
@@ -512,22 +484,21 @@ test/nondet "a program that answers the closed pipe goes on, and ends as it choo
 fn listens() -> String =
   \\import std.process (process)
   \\import std.signal (signal)
-  \\import std.time (time)
   \\
   \\fn told(name: String, arrived: Bool) -> Unit / {process.out[proc]} =
   \\  if arrived { process.out[proc]("got " ++ name) } else { () }
   \\
-  \\fn watch(turns: Int) -> Unit / {signal.read, signal.write, process.out[proc], time.sleep_ms} =
+  \\fn watch(turns: Int) -> Unit / {signal.read, signal.write, process.out[proc], clock.sleep} =
   \\  if turns <= 0 || signal.stopping() { () } else {
   \\    told("hangup", signal.hangup());
   \\    told("user1", signal.user1());
   \\    told("user2", signal.user2());
   \\    told("resized", signal.resized());
-  \\    time.sleep_ms(10);
+  \\    clock.sleep(Duration(10000000));
   \\    watch(turns - 1)
   \\  }
   \\
-  \\fn main() -> Unit / {signal.read, signal.write, process.out[proc], time.sleep_ms} = {
+  \\fn main() -> Unit / {signal.read, signal.write, process.out[proc], clock.sleep} = {
   \\  let asked = [signal.hangup(), signal.user1(), signal.user2(), signal.resized()];
   \\  process.out[proc](if len(filter(asked, |a: Bool| a)) == 0 { "ready" } else { "early" });
   \\  watch(12000)
@@ -537,11 +508,10 @@ fn listens() -> String =
 /// Says it is ready and waits, asking about no signal.
 fn asks_nothing() -> String =
   \\import std.process (process)
-  \\import std.time (time)
   \\
-  \\fn main() -> Unit / {process.out[proc], time.sleep_ms} = {
+  \\fn main() -> Unit / {process.out[proc], clock.sleep} = {
   \\  process.out[proc]("ready");
-  \\  time.sleep_ms(120000)
+  \\  clock.sleep(Duration(120000000000))
   \\}
   \\
 
@@ -633,12 +603,12 @@ test/nondet "a program is told the machine it runs on, as the system's own tools
   has("name " ++ sh_says("uname -sr"));
   has("arch " ++ (if sh_says("uname -m") == "arm64" { "aarch64" } else { sh_says("uname -m") }));
   has("cpus some");
-  has("host " ++ sh_says("hostname"));
+  has("host " ++ sh_says("uname -n"));
   has("user " ++ sh_says("id -u"));
   has("pid its own");
   has("executable " ++ this_ply());
-  has("endian little");
-  has("pointer 64")
+  assert(contains(r.out, "endian little") || contains(r.out, "endian big"), Some(stdout(r)));
+  has("pointer " ++ sh_says("getconf LONG_BIT"))
 }
 
 test "ply hosts lists every operation of std.os a program performs" {

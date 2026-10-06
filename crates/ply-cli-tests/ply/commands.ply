@@ -584,6 +584,67 @@ test/nondet "a task under --host performs against the handlers around its spawn"
   assert(last_line(r) == "41", Some(stdout(r)))
 }
 
+// A sleep parks the task that performs it: the thirty seconds the body sleeps for are cut at its
+// deadline, and the ten ticks beside it end before that.
+test/nondet "a deadline under --host fires on time while the task beside it keeps sleeping and waking" {
+  program(
+    \\import std.task
+    \\import std.task (Done, TimedOut)
+    \\import std.time
+    \\
+    \\fn ticked(n: Int) -> Instant / {clock.read, clock.write} = {
+    \\  fold(range(0, n), (), |_done: Unit, _i: Int| clock.sleep(time::millis(10)));
+    \\  clock.now()
+    \\}
+    \\
+    \\fn main() -> Int / {task.write, clock.read, clock.write, abort.raise} =
+    \\  task::unbounded(|| {
+    \\    let started = clock.now();
+    \\    let beside = task.spawn(|| ticked(10));
+    \\    let ended = task::timeout(time::millis(300), || {
+    \\      clock.sleep(time::seconds(30));
+    \\      0
+    \\    });
+    \\    let fired = time::as_millis(time::between(started, clock.now()));
+    \\    let ticks = time::as_millis(time::between(started, task.join(beside)));
+    \\    match ended {
+    \\      Done(_) -> abort.raise("the body outran its deadline"),
+    \\      TimedOut -> (),
+    \\    };
+    \\    assert(ticks >= 100 && ticks < fired, Some("ten ticks ended at " ++ int_to_string(ticks) ++ "ms"));
+    \\    fired
+    \\  })
+    \\
+  );
+  let r = on_disk(["run", "--host"]);
+  assert(r.code == 0, Some(said(r)));
+  let fired = match string::int_of_string(last_line(r)) { Some(ms) -> ms, None -> 0 - 1 };
+  assert(fired >= 300 && fired < 10000, Some("a 300ms deadline fired at " ++ stdout(r)))
+}
+
+test/nondet "the clock outside `simulate` is the host's, and a hermetic run says so" {
+  program(
+    \\fn main() -> Int / {clock.read, clock.write} = {
+    \\  let before = match clock.now() { Instant(at) -> at };
+    \\  clock.sleep(Duration(20000000));
+    \\  let after = match clock.now() { Instant(at) -> at };
+    \\  (after - before) / 1000000
+    \\}
+    \\
+  );
+  let hermetic = on_disk(["run"]);
+  assert(hermetic.code == 1, Some(said(hermetic)));
+  assert(
+    string_contains(stderr(hermetic), "E0424")
+      && string_contains(stderr(hermetic), "ply_host::clock::now"),
+    Some(stderr(hermetic)),
+  );
+  let bound = on_disk(["run", "--host"]);
+  assert(bound.code == 0, Some(said(bound)));
+  let waited = match string::int_of_string(last_line(bound)) { Some(ms) -> ms, None -> 0 - 1 };
+  assert(waited >= 20 && waited < 10000, Some("a 20ms sleep took " ++ stdout(bound)))
+}
+
 // Spawned, since what this guards against is the process going down with the task.
 test/nondet "a task that fails under --host is reported rather than aborting the process" {
   program(

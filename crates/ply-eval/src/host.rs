@@ -166,6 +166,18 @@ pub trait HostRuntime {
     fn park(&self) -> Result<(), Diagnostic>;
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
 
+    /// Nanoseconds the host's monotonic clock reads, which a production region's sleeps are
+    /// deadlines on; only the difference of two readings means anything.
+    fn now(&self) -> Result<i64, Diagnostic> {
+        Err(err_no_clock("read the clock"))
+    }
+
+    /// Waits until a watched token resolves or the clock reads `deadline`, whichever is first.
+    fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
+        let _ = deadline;
+        Err(err_no_clock("wait on the clock"))
+    }
+
     /// Called on every exit path from an entry point, before the machine resets; answers what its
     /// ending warns of.
     fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
@@ -346,8 +358,9 @@ fn resolve(
             }
         };
         let name = &effect.name;
+        // The program was checked against its own declaration of the effect, so an operation that
+        // declaration lacks is one it cannot perform, and the registration binds nothing.
         let Some(decl) = effect.ops.get(&op.op) else {
-            diagnostics.push(err_unknown_op(op, effect));
             continue;
         };
         if op.determinism == Determinism::Nondeterministic && !effect.nondet {
@@ -427,9 +440,15 @@ pub fn is_std(name: &str) -> bool {
     name == "std" || name.starts_with("std.")
 }
 
-/// Reserved std effects match by program-wide name; others by their declared name.
-fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: &Symbol) -> bool {
-    if is_std(registered.as_str()) {
+/// The effects the language declares itself. A module may declare one under the same name, which
+/// hides the language's there, and a registration by the name is for the language's alone.
+pub const LANGUAGE_EFFECTS: &[&str] = &["task", "clock", "random", "sim", "abort", "diverges"];
+
+/// Whether a registration for `registered` is for the effect a program knows as `program_wide`
+/// and a module declared as `declared`: reserved std effects and the language's own match by
+/// program-wide name, others by their declared name.
+pub fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: &Symbol) -> bool {
+    if is_std(registered.as_str()) || LANGUAGE_EFFECTS.contains(&registered.as_str()) {
         registered == program_wide
     } else {
         registered == declared
@@ -796,6 +815,16 @@ pub fn err_blocking_answered_inline(span: Span, operation: &str, path: &'static 
 
 #[cold]
 #[inline(never)]
+fn err_no_clock(what: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a task slept, and this run's host runtime cannot {what}"),
+    )
+    .note("a production region's sleeps are deadlines on the clock its `HostRuntime` reads, so a runtime that keeps none runs no sleeping task")
+}
+
+#[cold]
+#[inline(never)]
 pub fn err_hermetic(span: Span, operation: &str, path: &'static str) -> Diagnostic {
     Diagnostic::error(
         codes::HERMETIC_BOUNDARY,
@@ -896,27 +925,6 @@ fn err_ambiguous_effect(op: &HostOp, declarations: &[&EffectInfo]) -> Diagnostic
     diagnostic
         .note("effects are nominal, so these are different effects that share a spelling, and one host handler cannot be both")
         .note("rename one declaration, or keep a single one and import it where it is used")
-}
-
-#[cold]
-#[inline(never)]
-fn err_unknown_op(op: &HostOp, effect: &EffectInfo) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(
-        codes::HOST_OPERATION_UNKNOWN,
-        format!(
-            "`{}` registers for `{op}`, but effect `{}` has no operation `{}`",
-            op.path, op.effect, op.op
-        ),
-    );
-    if !effect.span.is_dummy() {
-        diagnostic = diagnostic.secondary(effect.span, "declared here");
-    }
-    let declared: Vec<String> = effect.ops.keys().map(|k| format!("`{k}`")).collect();
-    if declared.is_empty() {
-        diagnostic.note("this effect declares no operations at all")
-    } else {
-        diagnostic.note(format!("it declares {}", declared.join(", ")))
-    }
 }
 
 #[cold]

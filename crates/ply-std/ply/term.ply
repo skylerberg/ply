@@ -17,23 +17,36 @@
 //! stream is a terminal, and five variables of the environment, which `style_for` reads through
 //! `std.config`. In order, the first that applies:
 //!
-//! 1. `Never` is no styling and `Always` is styling, whatever follows: a flag outranks the
-//!    environment.
-//! 2. `NO_COLOR` set and not empty is no styling.
-//! 3. `FORCE_COLOR` or `CLICOLOR_FORCE` set, not empty and not `0`, is styling even where the
-//!    stream is no terminal. `FORCE_COLOR=2` asks for 256 colours and `FORCE_COLOR=3` for all
-//!    of them.
-//! 4. A stream that is no terminal is not styled, nor is a terminal whose `TERM` is `dumb`.
-//! 5. A terminal is styled, with the colours it says it has: all of them where `COLORTERM` is
+//! 1. `Never` is no styling and `Always` is styling, whatever follows. no-color.org has a
+//!    command line outrank `NO_COLOR`, and here it outranks every variable.
+//! 2. `FORCE_COLOR` set and not empty, whatever its value, is styling, even where the stream is
+//!    no terminal (force-color.org).
+//! 3. `NO_COLOR` set and not empty, whatever its value, is no styling (no-color.org).
+//! 4. `CLICOLOR_FORCE` set and not empty is styling, even where the stream is no terminal
+//!    (bixense.com/clicolors).
+//! 5. A stream that is no terminal is not styled, nor is a terminal whose `TERM` is `dumb`,
+//!    terminfo's name for one that takes no sequences.
+//! 6. A terminal is styled, with the colours it says it has: all of them where `COLORTERM` is
 //!    `truecolor` or `24bit` or `TERM` ends `-direct`, 256 where `TERM` holds `256color`, and
 //!    sixteen otherwise.
+//!
+//! The pages do not agree on `NO_COLOR` against a variable that forces, so each variable has the
+//! rank its own page gives it. bixense says in words that `CLICOLOR_FORCE` counts only where
+//! `NO_COLOR` is unset. force-color.org's reference code reads `NO_COLOR` and then `FORCE_COLOR`,
+//! which so has the last word: `NO_COLOR` is what a person exports once for every program, and
+//! `FORCE_COLOR` what is set for the one pipeline no flag can reach. That code also reads
+//! `FORCE_COLOR` after the command line; here a flag is still first, being the narrowest thing
+//! said. bixense's `CLICOLOR`, which asks for colour on a terminal, asks for what a terminal gets
+//! without it, and is not read.
 //!
 //! A colour past what the style takes is painted as the nearest one it does take: a
 //! `Rgb` as one of the 256 and either as one of the sixteen.
 //!
 //! `strip` takes the styling back out, and `visible_width` counts the columns what is left
 //! prints in. A character is one column unless a `std.text` `Measure` says otherwise: a wide or
-//! a combining character needs one that knows it, passed in.
+//! a combining character needs one that knows it, passed in, as `std.width`'s `char_columns`
+//! does. This module does not import `std.width`, whose tables every program that paints a
+//! line would then load.
 //!
 //! What a terminal sends is bytes, and `decode` reads them as `Event`s: keys with the modifiers
 //! held, a bracketed paste as one event, focus and size reports. A terminal sends a key's whole
@@ -55,7 +68,7 @@ import std.process (process, pipe, Stream, Stdin, Stdout, Stderr, write_err)
 import std.string (ascii_lower, repeat)
 import std.text
 import std.text (Measure)
-import std.time (time)
+import std.time (as_nanos, nanos_at)
 
 /// The terminal the process's streams are, if they are one.
 pub nondet effect term {
@@ -162,10 +175,9 @@ pub fn environment<[k]>() -> Environment / {config.get[k]} =
 pub fn style_for<[k]>(choice: Choice, stream: Stream) -> Style / {term.is_terminal, config.get[k]} =
   decide(choice, term.is_terminal(stream), environment[k]())
 
+/// Whether a variable is set and not empty: each of the three conventions reads an empty one
+/// as unset and no further into its value.
 fn given(variable: Option<String>) -> Bool = match variable { Some(v) -> v != "", None -> false }
-
-fn forces(variable: Option<String>) -> Bool =
-  match variable { Some(v) -> v != "" && v != "0", None -> false }
 
 /// The colours a terminal says it has.
 fn stated(env: Environment) -> Colors = {
@@ -183,14 +195,10 @@ pub fn decide(choice: Choice, terminal: Bool, env: Environment) -> Style =
   match choice {
     Never -> plain(),
     Always -> style_of(stated(env)),
-    Auto -> if given(env.no_color) { plain() }
-    else if forces(env.force_color) || forces(env.clicolor_force) {
-      match env.force_color {
-        Some("2") -> style_of(Ansi256),
-        Some("3") -> style_of(TrueColor),
-        _ -> style_of(stated(env)),
-      }
-    } else if !terminal || env.term == Some("dumb") { plain() }
+    Auto -> if given(env.force_color) { style_of(stated(env)) }
+    else if given(env.no_color) { plain() }
+    else if given(env.clicolor_force) { style_of(stated(env)) }
+    else if !terminal || env.term == Some("dumb") { plain() }
     else { style_of(stated(env)) },
   }
 
@@ -832,12 +840,12 @@ pub type Writer = {
   live: Bool,
   /// The columns a status may take.
   columns: Int,
-  /// The least milliseconds between two writes of a status.
-  every_ms: Int,
+  /// The least time between two writes of a status.
+  every: Duration,
   /// The columns each character of a status prints in, one where there is none.
   measure: Measure,
   /// The clock's reading when a status was last written.
-  wrote_ms: Option<Int>,
+  wrote: Option<Instant>,
   /// The status last asked for.
   status: String,
   /// Whether that status is still to be written: the interval kept it back.
@@ -847,15 +855,15 @@ pub type Writer = {
 }
 
 /// A writer for a stream that is `live` where it is a terminal, `columns` wide, writing a status
-/// no more often than every `every_ms` milliseconds. A status is measured a column a character
-/// unless `measure` says otherwise.
-pub fn writer(live: Bool, columns: Int, every_ms: Int, measure: Measure = None) -> Writer =
+/// no more often than once every `every`. A status is measured a column a character unless
+/// `measure` says otherwise.
+pub fn writer(live: Bool, columns: Int, every: Duration, measure: Measure = None) -> Writer =
   {
     live: live,
     columns: columns,
-    every_ms: every_ms,
+    every: every,
     measure: measure,
-    wrote_ms: None,
+    wrote: None,
     status: "",
     unsaid: false,
     shown: false,
@@ -876,18 +884,18 @@ fn drawn(w: Writer) -> String / {abort.raise} = {
     else { text::truncate(strip(w.status), room, "", w.measure) })
 }
 
-fn due(w: Writer, now_ms: Int) -> Bool =
-  match w.wrote_ms { None -> true, Some(at) -> now_ms -| at >= w.every_ms }
+fn due(w: Writer, now: Instant) -> Bool =
+  match w.wrote { None -> true, Some(at) -> nanos_at(now) -| nanos_at(at) >= as_nanos(w.every) }
 
-/// The status becomes `status` at `now_ms` on the caller's clock. It is written if none was
-/// written within the writer's interval, and is otherwise kept for the next step that may write:
-/// redrawn in place on a terminal, cut to its width, and as a line of its own anywhere else. A
-/// status that is already written is not written again.
-pub fn status_step(w: Writer, now_ms: Int, status: String) -> Step / {abort.raise} = {
+/// The status becomes `status` at `now`, a reading of the caller's clock. It is written if none
+/// was written within the writer's interval, and is otherwise kept for the next step that may
+/// write: redrawn in place on a terminal, cut to its width, and as a line of its own anywhere
+/// else. A status that is already written is not written again.
+pub fn status_step(w: Writer, now: Instant, status: String) -> Step / {abort.raise} = {
   let asked = { ..w, status: status, unsaid: w.unsaid || status != w.status };
-  if !asked.unsaid || !due(w, now_ms) { { writer: asked, bytes: b"" } } else {
+  if !asked.unsaid || !due(w, now) { { writer: asked, bytes: b"" } } else {
     {
-      writer: { ..asked, unsaid: false, wrote_ms: Some(now_ms), shown: w.live },
+      writer: { ..asked, unsaid: false, wrote: Some(now), shown: w.live },
       bytes: bytes_of_string(if w.live { drawn(asked) } else { lined(status) }),
     }
   }
@@ -916,13 +924,13 @@ pub fn finish_step(w: Writer) -> Step = {
 /// A writer for standard error as the run finds it: live where it is a terminal, as wide as the
 /// terminal is, or 80 columns where it does not say.
 pub fn stderr_writer(
-  every_ms: Int,
+  every: Duration,
   measure: Measure = None,
 ) -> Writer / {term.is_terminal, term.size} =
   writer(
     term.is_terminal(Stderr),
     match term.size() { Some(size) -> size.columns, None -> 80 },
-    every_ms,
+    every,
     measure,
   )
 
@@ -931,12 +939,13 @@ fn stepped<[p]>(step: Step) -> Writer / {process.err_bytes[p], pipe.broken} = {
   step.writer
 }
 
-/// Shows `status`, as `status_step` does at the clock's reading.
+/// Shows `status`, as `status_step` does at the reading of the language's `clock`: the run's
+/// own under `ply run --host`, and a region's virtual one inside `simulate`.
 pub fn status<[p]>(
   w: Writer,
   text: String,
-) -> Writer / {process.err_bytes[p], pipe.broken, time.elapsed_ms, abort.raise} =
-  stepped[p](status_step(w, time.elapsed_ms(), text))
+) -> Writer / {process.err_bytes[p], pipe.broken, clock.now, abort.raise} =
+  stepped[p](status_step(w, clock.now(), text))
 
 /// Writes a line of the program's own, as `line_step` does.
 pub fn say<[p]>(
@@ -1053,10 +1062,31 @@ fn decisions() -> List<Decision> =
       colors: Ansi16,
     },
     {
-      why: "NO_COLOR outranks FORCE_COLOR",
+      why: "FORCE_COLOR outranks NO_COLOR, as force-color.org's code has it",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), no_color: Some("1"), force_color: Some("1") },
+      colors: Ansi16,
+    },
+    {
+      why: "NO_COLOR outranks CLICOLOR_FORCE, as bixense has it",
       choice: Auto,
       terminal: true,
-      env: { ..on_xterm(), no_color: Some("1"), force_color: Some("1") },
+      env: { ..on_xterm(), no_color: Some("1"), clicolor_force: Some("1") },
+      colors: NoColors,
+    },
+    {
+      why: "FORCE_COLOR set to nothing is not set",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), force_color: Some("") },
+      colors: NoColors,
+    },
+    {
+      why: "CLICOLOR_FORCE set to nothing is not set",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), clicolor_force: Some("") },
       colors: NoColors,
     },
     {
@@ -1088,32 +1118,25 @@ fn decisions() -> List<Decision> =
       colors: Ansi16,
     },
     {
-      why: "CLICOLOR_FORCE of 0 forces nothing",
+      why: "CLICOLOR_FORCE forces whatever it is set to",
       choice: Auto,
       terminal: false,
       env: { ..on_xterm(), clicolor_force: Some("0") },
-      colors: NoColors,
+      colors: Ansi16,
     },
     {
-      why: "FORCE_COLOR of 0 forces nothing",
+      why: "FORCE_COLOR forces whatever it is set to",
       choice: Auto,
       terminal: false,
       env: { ..on_xterm(), force_color: Some("0") },
-      colors: NoColors,
+      colors: Ansi16,
     },
     {
-      why: "FORCE_COLOR of 2 asks for 256 colours",
+      why: "a forced pipe is styled at what TERM says a terminal would have",
       choice: Auto,
       terminal: false,
-      env: { ..on_xterm(), force_color: Some("2") },
+      env: { ..silent_environment(), term: Some("xterm-256color"), force_color: Some("3") },
       colors: Ansi256,
-    },
-    {
-      why: "FORCE_COLOR of 3 asks for every colour",
-      choice: Auto,
-      terminal: false,
-      env: { ..on_xterm(), force_color: Some("3") },
-      colors: TrueColor,
     },
     {
       why: "a dumb terminal is not styled",
@@ -1647,11 +1670,11 @@ test "a bar fills with its share, and a spinner turns" {
 fn said(steps: List<Step>) -> List<Bytes> = map(steps, |s: Step| s.bytes)
 
 test "on a terminal a status is one line redrawn in place, no more often than its interval" {
-  let w = writer(true, 12, 100);
-  let first = status_step(w, 1000, "copying 1/3");
-  let early = status_step(first.writer, 1050, "copying 2/3");
-  let later = status_step(early.writer, 1100, "copying 3/3 of them all");
-  let same = status_step(later.writer, 1300, "copying 3/3 of them all");
+  let w = writer(true, 12, Duration(100));
+  let first = status_step(w, Instant(1000), "copying 1/3");
+  let early = status_step(first.writer, Instant(1050), "copying 2/3");
+  let later = status_step(early.writer, Instant(1100), "copying 3/3 of them all");
+  let same = status_step(later.writer, Instant(1300), "copying 3/3 of them all");
   assert_eq(said([first, early, later, same]), [
     b"\r\x1b[Kcopying 1/3",
     b"",
@@ -1667,11 +1690,11 @@ test "on a terminal a status is one line redrawn in place, no more often than it
 }
 
 test "off a terminal a status is a line of its own, as seldom, and the last one is not lost" {
-  let w = writer(false, 80, 1000);
-  let first = status_step(w, 0, "1 of 3");
-  let early = status_step(first.writer, 10, "2 of 3");
+  let w = writer(false, 80, Duration(1000));
+  let first = status_step(w, Instant(0), "1 of 3");
+  let early = status_step(first.writer, Instant(10), "2 of 3");
   let line = line_step(early.writer, "wrote a.txt");
-  let later = status_step(line.writer, 1000, "3 of 3");
+  let later = status_step(line.writer, Instant(1000), "3 of 3");
   let done = finish_step(later.writer);
   assert_eq(said([first, early, line, later, done]), [
     b"1 of 3\n",
@@ -1680,39 +1703,47 @@ test "off a terminal a status is a line of its own, as seldom, and the last one 
     b"3 of 3\n",
     b"",
   ]);
-  let quick = finish_step(writer(false, 80, 1000));
+  let quick = finish_step(writer(false, 80, Duration(1000)));
   assert_eq(quick.bytes, b"");
   assert_eq(finish_step(early.writer).bytes, b"2 of 3\n");
-  assert_eq(status_step(w, 0, "").bytes, b"")
+  assert_eq(status_step(w, Instant(0), "").bytes, b"")
 }
 
 test "a status too wide for the terminal is cut to it, by what is seen, and one that fits keeps its styling" {
-  let w = writer(true, 8, 0);
-  assert_eq(status_step(w, 0, green(ansi(), "copying")).bytes, b"\r\x1b[K\x1b[32mcopying\x1b[0m");
-  assert_eq(status_step(w, 0, green(ansi(), "copying it")).bytes, b"\r\x1b[Kcopying");
-  let wide = writer(true, 8, 0, Some(|c: Char| if int_of_char(c) > 0x2e80 { 2 } else { 1 }));
+  let w = writer(true, 8, Duration(0));
   assert_eq(
-    status_step(wide, 0, "\u{4e16}\u{754c}\u{4e16}\u{754c}").bytes,
+    status_step(w, Instant(0), green(ansi(), "copying")).bytes,
+    b"\r\x1b[K\x1b[32mcopying\x1b[0m",
+  );
+  assert_eq(status_step(w, Instant(0), green(ansi(), "copying it")).bytes, b"\r\x1b[Kcopying");
+  let wide = writer(
+    true,
+    8,
+    Duration(0),
+    Some(|c: Char| if int_of_char(c) > 0x2e80 { 2 } else { 1 }),
+  );
+  assert_eq(
+    status_step(wide, Instant(0), "\u{4e16}\u{754c}\u{4e16}\u{754c}").bytes,
     bytes_of_string("\r\u{1b}[K\u{4e16}\u{754c}\u{4e16}"),
   );
-  assert_eq(status_step(writer(true, 0, 0), 0, "anything").bytes, b"\r\x1b[K")
+  assert_eq(status_step(writer(true, 0, Duration(0)), Instant(0), "anything").bytes, b"\r\x1b[K")
 }
 
-test "progress is written to standard error through one writer, on the host's clock" {
+test "progress is written to standard error through one writer, by the clock's reading" {
   let ran = process::over[proc](process::captured([]), ||
     over(screen(40, 10), ||
-      with_cell[ticks](0) { clock ->
+      with_cell[ticks](0) { ticked ->
         handle {
-          let w = stderr_writer(100);
+          let w = stderr_writer(Duration(100));
           let one = status[proc](w, bar(1, 2, 17));
           let two = say[proc](one, "half way");
           let three = status[proc](two, bar(2, 2, 17));
           let ended = finish[proc](three);
           ended.shown
         } with {
-          time.elapsed_ms() -> {
-            cell_set(clock, cell_get(clock) + 100);
-            cell_get(clock)
+          clock.now() -> {
+            cell_set(ticked, cell_get(ticked) + 100);
+            Instant(cell_get(ticked))
           },
         }
       }));
@@ -1731,7 +1762,7 @@ test "progress is written to standard error through one writer, on the host's cl
 test "a stream that is no terminal gets its progress as lines" {
   let ran = process::over[proc](process::captured([]), ||
     over(no_screen(), || {
-      let w = stderr_writer(0);
+      let w = stderr_writer(Duration(0));
       w.live || w.columns != 80
     }));
   assert_eq(ran.value, Some({ value: false, screen: no_screen() }))
