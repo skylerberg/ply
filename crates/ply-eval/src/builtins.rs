@@ -105,7 +105,7 @@ builtins! { $
     I8OfInt = "i8_of_int", 1, raises;
     I16OfInt = "i16_of_int", 1, raises;
     I32OfInt = "i32_of_int", 1, raises;
-    I64OfInt = "i64_of_int", 1, raises;
+    I64OfInt = "i64_of_int", 1, ends;
     IntOfU8 = "int_of_u8", 1, ends;
     IntOfU16 = "int_of_u16", 1, ends;
     IntOfU32 = "int_of_u32", 1, ends;
@@ -176,6 +176,7 @@ builtins! { $
     /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
     FloatOfString = "float_of_string", 1, ends;
     DecimalToString = "decimal_to_string", 1, ends;
+    DecimalScale = "decimal_scale", 1, ends;
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
     BitsOfFloat = "bits_of_float", 1, ends;
     FloatOfBits = "float_of_bits", 1, ends;
@@ -194,7 +195,7 @@ builtins! { $
     SecretIsEmpty = "secret_is_empty", 1, ends;
     // Appended, so every earlier builtin keeps its cache index.
     U128OfInt = "u128_of_int", 1, raises;
-    I128OfInt = "i128_of_int", 1, raises;
+    I128OfInt = "i128_of_int", 1, ends;
     IntOfU128 = "int_of_u128", 1, raises;
     IntOfI128 = "int_of_i128", 1, raises;
     U128ToString = "u128_to_string", 1, ends;
@@ -1298,6 +1299,11 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::DecimalToString => {
             let d = args[0].as_decimal(span, "`decimal_to_string`")?;
             Ok(Value::str(d.to_string()))
+        }
+
+        Builtin::DecimalScale => {
+            let d = args[0].as_decimal(span, "`decimal_scale`")?;
+            Ok(Value::Int(i64::from(d.scale())))
         }
 
         Builtin::BitsOfFloat => {
