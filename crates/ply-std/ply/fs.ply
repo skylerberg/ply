@@ -1,13 +1,23 @@
 //! The filesystem, as an effect whose label is a root the run binds with `--fs NAME=PATH`.
 //!
-//! An unbound label is `E0451`, and a path escaping its root (`..`, absolute, or through a symlink that
-//! leads outside) is `E0452`, refused before any operation runs, so following a symlink can never leave
-//! the root. Different roots never conflict. `kind`, `exists`, `stat`, `scan`, `remove`, `remove_tree`,
-//! `rename`, `symlink`, `link` and `read_link` act on a link itself; every other operation follows
-//! one. `E0453` bounds one call rather than a file: `read_file`, `read_at`, `read_chunk`, `walk` and
-//! `scan` refuse an answer above 64 MiB, so a larger file is read a range or a chunk at a time and a
-//! larger tree a directory at a time. A path is text: a name on a disk that is not UTF-8 is listed
-//! with U+FFFD where its bytes are none, and no operation reaches it.
+//! An unbound label is `E0451`, and a path that leaves its root (`..`, absolute, or through a link
+//! that leads outside) is `E0452`, refused before any operation runs. Different roots never
+//! conflict. `kind`, `exists`, `stat`, `scan`, `remove`, `remove_tree`, `rename`, `symlink`, `link`,
+//! `read_link`, `lock`, `unlock` and an `open` that is `ToCreate` act on a link itself; every other
+//! operation follows one. `E0453` bounds one call rather than a file: `read_file`, `read_at`,
+//! `read_chunk`, `walk` and `scan` refuse an answer above 64 MiB, so a larger file is read a range
+//! or a chunk at a time and a larger tree a directory at a time. A path is text: a name on a disk
+//! that is not UTF-8 is listed with U+FFFD where its bytes are none, and no operation reaches it.
+//!
+//! The host follows a path's links itself, at most forty of them, and hands the system the path
+//! they lead to, so a link is held to the root by where it leads whether or not anything is there:
+//! one that leads out to a path that does not exist is refused like any other, and nothing is made
+//! there. An operation that acts on a link itself is held by the directory the link is in and
+//! never looks where the link leads, so a link that leads out is still read, renamed and removed.
+//! What remains is the moment between that look and the system's own: a program that can write
+//! under the root can put a link in the place of a directory of the path, and the operation then
+//! goes where that link leads. A link put in the place of a file the path ends in is refused
+//! rather than followed, except by `copy`, `set_mode` and `space`, which hand the system the name.
 //!
 //! `append` and `read_at` are what make a file a log rather than a value, and `sync` and `lock` what
 //! make a paired cache honest: sync the data file before the index that names it, and serialise a
@@ -703,14 +713,15 @@ pub fn mem_set_mode(tree: MemFs, path: String, mode: Mode) -> Written / {abort.r
     None -> { fs: tree, ok: false },
   }
 
-/// A target that names its own root or climbs out of the tree is refused, as the host refuses it.
+/// A target that names its own root or climbs out of the tree, read from the directory the link
+/// is made in, is refused in the host's words.
 pub fn mem_symlink(tree: MemFs, path: String, target: String) -> Written / {abort.raise} =
   match key_of(tree, path, false) {
     Some(key) -> match lexical(segments(parent_of(key)), target) {
       Some(_) -> if target != "" && kind_at(tree, key) == Missing && placeable(tree, key) {
         { fs: identified({ ..tree, links: map_insert(tree.links, key, target) }, key), ok: true }
       } else { { fs: tree, ok: false } },
-      None -> { fs: tree, ok: false },
+      None -> panic(leaving(target)),
     },
     None -> { fs: tree, ok: false },
   }
@@ -1662,14 +1673,18 @@ fn altered(old: Stat, new: Stat) -> Bool =
 fn link_hops() -> Int = 40
 
 /// The key a path names with every link along it followed, the last one too when `last` is set;
-/// `None` for a loop. A path that leaves the tree is refused in the host's words, so a twin run
-/// fails where a host run would.
+/// `None` for a loop. A path that leaves the tree, as it is spelled or through a link whose target
+/// does, is refused in the host's words, so a twin run fails where a host run would.
 fn key_of(tree: MemFs, path: String, last: Bool) -> Option<String> / {abort.raise} =
-  if mem_confined(path) { followed(tree, segments(path), last, 0) }
-  else { panic("`" ++ path ++ "` leaves the root it was given") }
+  if mem_confined(path) { followed(tree, path, segments(path), last, 0) }
+  else { panic(leaving(path)) }
+
+/// What the host says of a path, or of a link's target, that leaves its root.
+fn leaving(what: String) -> String = "`" ++ what ++ "` leaves the root it was given"
 
 fn followed(
   tree: MemFs,
+  path: String,
   segs: List<String>,
   last: Bool,
   hops: Int,
@@ -1682,8 +1697,10 @@ fn followed(
   if hit < 0 { Some(joined(segs)) }
   else if hops >= link_hops() { None } else {
     let target = map_get(tree.links, joined(take(segs, hit + 1)))?;
-    let base = lexical(take(segs, hit), target)?;
-    followed(tree, concat(base, drop(segs, hit + 1)), last, hops + 1)
+    match lexical(take(segs, hit), target) {
+      Some(base) -> followed(tree, path, concat(base, drop(segs, hit + 1)), last, hops + 1),
+      None -> panic(leaving(path)),
+    }
   }
 }
 
@@ -2261,14 +2278,37 @@ test "a link is followed by what reads through it and kept by what names it" {
 
 test "a link out of the tree is refused, and a loop resolves to nothing" {
   let fixture = mem_create_dir(mem_empty(), "d").fs;
-  assert(!mem_symlink(fixture, "out", "../elsewhere").ok);
-  assert(!mem_symlink(fixture, "d/out", "../../x").ok);
-  assert(!mem_symlink(fixture, "abs", "/etc").ok);
+  assert_eq(raised(|| mem_symlink(fixture, "out", "../elsewhere")), escapes("../elsewhere"));
+  assert_eq(raised(|| mem_symlink(fixture, "d/out", "../../x")), escapes("../../x"));
+  assert_eq(raised(|| mem_symlink(fixture, "abs", "/etc")), escapes("/etc"));
   assert(mem_symlink(fixture, "d/up", "../d").ok);
+  let back = mem_symlink(fixture, "d/back", "..").fs;
+  assert_eq(raised(|| mem_symlink(back, "d/back/out", "../x")), escapes("../x"));
   let looped = mem_symlink(mem_symlink(fixture, "a", "b").fs, "b", "a").fs;
   assert_eq(mem_kind(looped, "a"), Symlink);
   assert_eq(mem_resolved(looped, "a"), Missing);
   assert_eq(mem_read(looped, "a"), None)
+}
+
+test "a link moved to where it leads out of the tree is refused by what follows it and kept by what names it" {
+  let fixture = mem_create_dir(mem_of([{ path: "plain", body: b"p" }]), "d").fs;
+  let moved = mem_rename(mem_symlink(fixture, "d/gone", "../out/gone").fs, "d/gone", "gone");
+  assert(moved.ok);
+  let tree = moved.fs;
+  assert_eq(raised(|| mem_read(tree, "gone")), escapes("gone"));
+  assert_eq(raised(|| mem_write(tree, "gone", b"x")), escapes("gone"));
+  assert_eq(raised(|| mem_append(tree, "gone", b"x")), escapes("gone"));
+  assert_eq(raised(|| mem_open(tree, "gone", ToWrite)), escapes("gone"));
+  assert_eq(raised(|| mem_copy(tree, "plain", "gone")), escapes("gone"));
+  assert_eq(raised(|| mem_create_dir(tree, "gone/below")), escapes("gone/below"));
+  assert_eq(raised(|| mem_kind(tree, "gone/below")), escapes("gone/below"));
+  assert_eq(mem_kind(tree, "gone"), Symlink);
+  assert_eq(mem_read_link(tree, "gone"), Some("../out/gone"));
+  assert_eq(mem_open(tree, "gone", ToCreate).file, Err(Exists));
+  assert(mem_rename(tree, "plain", "gone").ok);
+  let removed = mem_remove(tree, "gone");
+  assert(removed.ok);
+  assert_eq(mem_kind(removed.fs, "gone"), Missing)
 }
 
 test "a walk is depth first in name order and lists a link without following it" {
