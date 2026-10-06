@@ -1,0 +1,228 @@
+//! Stored bodies printed back to source, as the commands that print them meet it: `ply build` prints
+//! an entry point's closure into its artifact and checks it again, and a bisection prints every
+//! mixture it runs. Each program here is written in forms a body is stored in and was once not
+//! printed back from, or was printed as a program that did not check.
+
+import harness (Source, scratch, program, project, write, on_disk, said, stdout, json_of, at, path,
+                items, str, truth, shown, assert_ok, manifest, dep, Reached, Shipped)
+import std.json (Str)
+import std.list (contains)
+import std.string
+
+/// The program at `dir` run and built: its source answers `answer`, and so does its artifact.
+fn built_answers(dir: String, answer: String) -> Unit / {Reached, Shipped, abort.raise, diverges} = {
+  let from_source = json_of(on_disk(["run", dir, "--json"]));
+  assert(truth(at(from_source, "ok")), Some(shown(from_source)));
+  assert(at(from_source, "value") == Str(answer), Some(shown(from_source)));
+  assert_ok(on_disk(["build", dir, "-o", "built.plyx"]));
+  let from_artifact = json_of(on_disk(["run", "built.plyx", "--json"]));
+  assert(at(from_artifact, "value") == Str(answer), Some(shown(from_artifact)))
+}
+
+test "an artifact of a program with or-patterns answers what its source does" {
+  scratch(|| {
+    program(
+      \\type T = | A(Int, Int) | B(Int, Int) | C
+      \\
+      \\fn small(n: Int) -> Int = match n { 1 | 2 | 3 -> 10, 4 | (5 | 6) -> 20, _ -> 0 }
+      \\
+      \\fn swapped(t: T) -> Int = match t { A(x, y) | B(y, x) -> x * 10 + y, C -> 0 }
+      \\
+      \\fn guarded(t: T) -> Int = match t { A(x, y) | B(y, x) if x > y -> x, _ -> 0 - 1 }
+      \\
+      \\fn nested(ts: List<T>) -> Int =
+      \\  match ts {
+      \\    [(A(x, _) | B(_, x)), ..rest] | [C, A(x, _), ..rest] -> x + len(rest),
+      \\    _ -> 0,
+      \\  }
+      \\
+      \\fn fields(p: { a: Int, b: Int }) -> Int =
+      \\  match p { { a: 0, b: v } | { a: v, b: 0 } -> v, _ -> 0 - 1 }
+      \\
+      \\fn left(t: T) -> Int = {
+      \\  let A(n, _) | B(_, n) = t else { 0 - 5 };
+      \\  n
+      \\}
+      \\
+      \\fn both(r: Result<Int, Int>) -> Int = {
+      \\  let Ok(v) | Err(v) = r;
+      \\  v
+      \\}
+      \\
+      \\fn main() -> Int =
+      \\  small(2) + small(5) + small(9) + swapped(A(1, 2)) + swapped(B(1, 2)) + guarded(A(5, 1))
+      \\    + guarded(B(5, 1))
+      \\    + nested([B(0, 7), C])
+      \\    + nested([C, A(3, 0), C, C])
+      \\    + fields({ a: 0, b: 4 })
+      \\    + fields({ a: 6, b: 0 })
+      \\    + left(B(0, 9))
+      \\    + left(C)
+      \\    + both(Ok(1))
+      \\    + both(Err(2))
+      \\
+    );
+    built_answers(".", "97")
+  })
+}
+
+test "an artifact of a program with a `let else`, a `returns` clause and a `bounded` row answers what its source does" {
+  scratch(|| {
+    program(
+      \\effect log { write emit(n: Int) -> Unit }
+      \\
+      \\fn first(xs: List<Int>) -> Int = {
+      \\  let [x, ..] = xs else { 0 - 1 };
+      \\  x
+      \\}
+      \\
+      \\fn kept(n: Int, xs: List<Int>) -> List<Int>
+      \\  returns xs
+      \\= if n > 0 { xs } else { [] }
+      \\
+      \\fn made(n: Int) -> List<Int>
+      \\  returns fresh
+      \\= [n, n]
+      \\
+      \\fn noted<| e>(n: Int, f: (Int) -> Int / e) -> Int / {log.write bounded | e bounded} = {
+      \\  log.emit(n);
+      \\  f(n)
+      \\}
+      \\
+      \\fn digit(b: Int) -> Int = match b { b'0'..=b'9' -> b - b'0', _ -> 0 - 1 }
+      \\
+      \\fn main() -> Int =
+      \\  first(made(7)) + first([]) + len(kept(1, [1, 2])) + digit(b'4') * 10
+      \\    + handle { noted(3, |n: Int| n * 100) } with { log.emit(n) -> () }
+      \\
+    );
+    built_answers(".", "348")
+  })
+}
+
+/// A package `lib` whose module holds or-patterns, one of them in a body another package reads, and
+/// an `app` that calls it.
+fn depending() -> List<Source> =
+  [
+    { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+    {
+      path: "app/main.ply",
+      text:
+        \\import lib.shapes
+        \\import lib.shapes (A, B, C)
+        \\
+        \\fn main() -> Int =
+        \\  shapes::pick(A(1, 2)) + shapes::pick(B(1, 2)) + shapes::pick(C)
+        \\    + (if shapes::small(2) { 100 } else { 0 })
+        \\    + shapes::first([5])
+        \\
+    },
+    { path: "lib/ply.pkg", text: manifest("lib", "") },
+    {
+      path: "lib/shapes.ply",
+      text:
+        \\pub type T = | A(Int, Int) | B(Int, Int) | C
+        \\
+        \\pub fn pick(t: T) -> Int = match t { A(x, y) | B(y, x) -> x * 10 + y, C -> 0 }
+        \\
+        \\pub transparent fn small(n: Int) -> Bool = match n { 1 | 2 | 3 -> true, _ -> false }
+        \\
+        \\pub fn first(xs: List<Int>) -> Int = {
+        \\  let [x, ..] | [_, x, ..] = xs else { 0 - 1 };
+        \\  x
+        \\}
+        \\
+    },
+  ]
+
+test "a path dependency that holds or-patterns checks from its stub, and its artifact answers what its source does" {
+  scratch(|| {
+    project(depending());
+    assert_ok(on_disk(["check", "app"]));
+    let warm = json_of(on_disk(["check", "app", "--json", "--explain"]));
+    assert(truth(at(warm, "ok")), Some(shown(warm)));
+    assert(
+      contains(map(items(path(warm, ["front_end", "stubbed"])), str), "lib.shapes"),
+      Some(shown(at(warm, "front_end"))),
+    );
+    built_answers("app", "138")
+  })
+}
+
+fn ledger() -> String =
+  \\import std.option (option_unwrap_or_else)
+  \\
+  \\type T = | A(Int, Int) | B(Int, Int) | C
+  \\
+  \\fn normal_sign(t: T) -> Int =
+  \\  match t { A(n, _) | B(_, n) -> if n < 0 { 0 - 1 } else { 1 }, C -> 1 }
+  \\
+  \\fn balance(a: Int, b: Int, c: Int) -> Int = (a + b) + c
+  \\
+  \\fn first(xs: List<Int>) -> Int = {
+  \\  let [x, ..] = xs else { 0 };
+  \\  x
+  \\}
+  \\
+  \\fn presented(a: Int, b: Int, c: Int) -> Int =
+  \\  balance(first([a]), option_unwrap_or_else(Some(b), || 0), c) * normal_sign(B(0, a))
+  \\
+  \\test "balance never goes negative" { assert_eq(presented(1, 2, 3), 6) }
+  \\
+
+/// `source` tested green and then as `edited`, whose failure names `culprit`.
+fn blamed(
+  source: String,
+  edited: String,
+  culprit: String,
+) -> Unit / {Reached, Shipped, abort.raise, diverges} = {
+  program(source);
+  assert_ok(on_disk(["test"]));
+  assert(edited != source, Some("the edits did not apply"));
+  write("m.ply", edited);
+  let r = on_disk(["test"]);
+  assert(r.code == 1, Some(said(r)));
+  assert(string_contains(stdout(r), "culprit: " ++ culprit), Some(said(r)))
+}
+
+// A mixture prints the library's bodies it reaches too: here one whose row is promised `bounded`.
+test "a bisection names its culprit among definitions written with an or-pattern and a `let else`" {
+  scratch(||
+    blamed(
+      ledger(),
+      string::replace(
+        string::replace(ledger(), "else { 1 }, C", "else { 0 - 1 }, C"),
+        "(a + b) + c",
+        "a + (b + c)",
+      ),
+      "m.normal_sign",
+    ))
+}
+
+fn vault() -> String =
+  \\pub opaque type Money = | Money(Int)
+  \\
+  \\pub fn cents(m: Money) -> Int = match m { Money(c) -> c }
+  \\
+  \\fn doubled(m: Money) -> Money = Money(cents(m) * 2)
+  \\
+  \\fn sign(n: Int) -> Int = if n < 0 { 0 - 1 } else { 1 }
+  \\
+  \\test "money built here is read here" {
+  \\  assert_eq(match doubled(Money(2)) { Money(c) -> c * sign(c) }, 4)
+  \\}
+  \\
+
+// A mixture sets each body in a module of its own, where only an open type could be built.
+test "a bisection names its culprit among definitions that build and match an opaque type" {
+  scratch(||
+    blamed(
+      vault(),
+      string::replace(
+        string::replace(vault(), "else { 1 }", "else { 0 - 1 }"),
+        "cents(m) * 2",
+        "2 * cents(m)",
+      ),
+      "m.sign",
+    ))
+}
