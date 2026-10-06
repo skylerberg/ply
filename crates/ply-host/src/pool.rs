@@ -43,6 +43,43 @@ pub enum Heard {
     Closed,
 }
 
+/// A `std.fs.Refused`: why the file system would not do what an operation asked.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Refusal {
+    NotFound,
+    Denied,
+    NotAFile,
+    NotADirectory,
+    Exists,
+    NoSpace,
+    /// The host's error number and its words for it.
+    Other(i64, String),
+}
+
+/// A `std.fs.Stat`: what one look at a path reads of it, a link as itself.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Stat {
+    /// The `std.fs.Kind` constructor the path names.
+    pub kind: &'static str,
+    pub size: i64,
+    /// Nanoseconds since the Unix epoch.
+    pub modified: i64,
+    pub mode: u32,
+    pub links: i64,
+    pub device: i64,
+    pub id: i64,
+}
+
+/// A `std.fs.Space`: the room in the file system that holds a path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Space {
+    pub total: i64,
+    pub free: i64,
+    pub available: i64,
+    pub inodes: i64,
+    pub inodes_free: i64,
+}
+
 pub enum JobOutput {
     Int(i64),
     /// Whether a write happened; a filesystem's state is not the program's error.
@@ -60,9 +97,14 @@ pub enum JobOutput {
     MaybeMode(Option<u32>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
-    /// A file's descriptor, or the `std.fs.Refused` that says why it did not open; and whether
-    /// it was opened to be written.
-    Opened(Result<i64, &'static str>, bool),
+    /// A file's descriptor, or why it did not open; and whether it was opened to be written.
+    Opened(Result<i64, Refusal>, bool),
+    /// That the file system did what was asked, or why it did not.
+    Done(Result<(), Refusal>),
+    MaybeStat(Option<Stat>),
+    /// A scan's entries, each a path and what one look read of it; `None` for no directory.
+    MaybeScan(Option<Vec<(String, Stat)>>),
+    MaybeSpace(Option<Space>),
     Finished(Finished),
     /// `None` when the child was still running at the deadline.
     MaybeFinished(Option<Finished>),
@@ -505,9 +547,22 @@ fn take(state: &mut State, token: u64) -> Taken {
         JobOutput::MaybeMode(bits) => Ok(option(bits.map(mode))),
         JobOutput::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
         JobOutput::Opened(Ok(descriptor), _) => Ok(Value::ctor("Ok", vec![Value::Int(descriptor)])),
-        JobOutput::Opened(Err(why), _) => {
-            Ok(Value::ctor("Err", vec![Value::ctor(why, Vec::new())]))
+        JobOutput::Opened(Err(why), _) | JobOutput::Done(Err(why)) => {
+            Ok(Value::ctor("Err", vec![refusal(why)]))
         }
+        JobOutput::Done(Ok(())) => Ok(Value::ctor("Ok", vec![Value::Unit])),
+        JobOutput::MaybeStat(found) => Ok(option(found.map(stat))),
+        JobOutput::MaybeScan(entries) => Ok(option(entries.map(|entries| {
+            Value::list(
+                entries
+                    .into_iter()
+                    .map(|(path, found)| {
+                        record([("path", Value::str(path)), ("stat", stat(found))])
+                    })
+                    .collect(),
+            )
+        }))),
+        JobOutput::MaybeSpace(room) => Ok(option(room.map(space))),
         JobOutput::Finished(exit) => Ok(finished(exit)),
         JobOutput::MaybeFinished(exit) => Ok(option(exit.map(finished))),
         JobOutput::Heard(heard) => Ok(heard_value(heard)),
@@ -555,6 +610,49 @@ fn mode(bits: u32) -> Value {
         ("group", access(bits >> 3 & 7)),
         ("other", access(bits & 7)),
         ("owner", access(bits >> 6 & 7)),
+    ])
+}
+
+/// The constructor of `std.fs.Refused` that `why` is.
+fn refusal(why: Refusal) -> Value {
+    let named = |name: &str| Value::ctor(name, Vec::new());
+    match why {
+        Refusal::NotFound => named("std.fs.NotFound"),
+        Refusal::Denied => named("std.fs.Denied"),
+        Refusal::NotAFile => named("std.fs.NotAFile"),
+        Refusal::NotADirectory => named("std.fs.NotADirectory"),
+        Refusal::Exists => named("std.fs.Exists"),
+        Refusal::NoSpace => named("std.fs.NoSpace"),
+        Refusal::Other(code, text) => {
+            Value::ctor("std.fs.Other", vec![Value::Int(code), Value::str(text)])
+        }
+    }
+}
+
+/// The record `std.fs.Stat` names, its time the prelude's `Instant`.
+fn stat(found: Stat) -> Value {
+    record([
+        ("device", Value::Int(found.device)),
+        ("id", Value::Int(found.id)),
+        ("kind", Value::ctor(found.kind, Vec::new())),
+        ("links", Value::Int(found.links)),
+        ("mode", mode(found.mode)),
+        (
+            "modified",
+            Value::ctor("Instant", vec![Value::Int(found.modified)]),
+        ),
+        ("size", Value::Int(found.size)),
+    ])
+}
+
+/// The record `std.fs.Space` names.
+fn space(room: Space) -> Value {
+    record([
+        ("available", Value::Int(room.available)),
+        ("free", Value::Int(room.free)),
+        ("inodes", Value::Int(room.inodes)),
+        ("inodes_free", Value::Int(room.inodes_free)),
+        ("total", Value::Int(room.total)),
     ])
 }
 
